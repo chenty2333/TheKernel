@@ -1031,3 +1031,9 @@ log-only DDI port printing remain framework diagnostics and are not copied.
 `kernel/src/drm/intel/fastboot.rs` consumes `intel_bios_init()` for the N305
 route and AFC override; general DDI cold-start admission still needs broader
 platform integration.
+
+`crates/ax/tk-intel-display/src/power_domains.rs` also translates
+`intel_display_power_domain_str()` from `intel_display_power.c` (MIT, Copyright
+© 2022 Intel), and `power_map.rs` now exposes the full source domain enum,
+including display-core, eDP/DSI transcoder, DDI lane A/F, port-other, GMBUS,
+and GT-IRQ identifiers.

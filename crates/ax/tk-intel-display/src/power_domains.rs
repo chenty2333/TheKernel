@@ -14,6 +14,89 @@ use crate::{
     power_map::{DomainList, PowerDomain, PowerWellGroup, PowerWellInstance},
 };
 
+/// Return the source-compatible diagnostic name for a display power domain.
+// upstream: intel_display_power.c intel_display_power_domain_str()
+pub const fn power_domain_name(domain: PowerDomain) -> &'static str {
+    match domain {
+        PowerDomain::DisplayCore => "DISPLAY_CORE",
+        PowerDomain::PipeA => "PIPE_A",
+        PowerDomain::PipeB => "PIPE_B",
+        PowerDomain::PipeC => "PIPE_C",
+        PowerDomain::PipeD => "PIPE_D",
+        PowerDomain::PipePanelFitterA => "PIPE_PANEL_FITTER_A",
+        PowerDomain::PipePanelFitterB => "PIPE_PANEL_FITTER_B",
+        PowerDomain::PipePanelFitterC => "PIPE_PANEL_FITTER_C",
+        PowerDomain::PipePanelFitterD => "PIPE_PANEL_FITTER_D",
+        PowerDomain::TranscoderA => "TRANSCODER_A",
+        PowerDomain::TranscoderB => "TRANSCODER_B",
+        PowerDomain::TranscoderC => "TRANSCODER_C",
+        PowerDomain::TranscoderD => "TRANSCODER_D",
+        PowerDomain::TranscoderEdp => "TRANSCODER_EDP",
+        PowerDomain::TranscoderDsiA => "TRANSCODER_DSI_A",
+        PowerDomain::TranscoderDsiC => "TRANSCODER_DSI_C",
+        PowerDomain::TranscoderVdscPw2 => "TRANSCODER_VDSC_PW2",
+        PowerDomain::PortDdiLanesA => "PORT_DDI_LANES_A",
+        PowerDomain::PortDdiLanesB => "PORT_DDI_LANES_B",
+        PowerDomain::PortDdiLanesC => "PORT_DDI_LANES_C",
+        PowerDomain::PortDdiLanesD => "PORT_DDI_LANES_D",
+        PowerDomain::PortDdiLanesE => "PORT_DDI_LANES_E",
+        PowerDomain::PortDdiLanesF => "PORT_DDI_LANES_F",
+        PowerDomain::PortDdiLanesTc1 => "PORT_DDI_LANES_TC1",
+        PowerDomain::PortDdiLanesTc2 => "PORT_DDI_LANES_TC2",
+        PowerDomain::PortDdiLanesTc3 => "PORT_DDI_LANES_TC3",
+        PowerDomain::PortDdiLanesTc4 => "PORT_DDI_LANES_TC4",
+        PowerDomain::PortDdiLanesTc5 => "PORT_DDI_LANES_TC5",
+        PowerDomain::PortDdiLanesTc6 => "PORT_DDI_LANES_TC6",
+        PowerDomain::PortDdiIoA => "PORT_DDI_IO_A",
+        PowerDomain::PortDdiIoB => "PORT_DDI_IO_B",
+        PowerDomain::PortDdiIoC => "PORT_DDI_IO_C",
+        PowerDomain::PortDdiIoD => "PORT_DDI_IO_D",
+        PowerDomain::PortDdiIoE => "PORT_DDI_IO_E",
+        PowerDomain::PortDdiIoF => "PORT_DDI_IO_F",
+        PowerDomain::PortDdiIoTc1 => "PORT_DDI_IO_TC1",
+        PowerDomain::PortDdiIoTc2 => "PORT_DDI_IO_TC2",
+        PowerDomain::PortDdiIoTc3 => "PORT_DDI_IO_TC3",
+        PowerDomain::PortDdiIoTc4 => "PORT_DDI_IO_TC4",
+        PowerDomain::PortDdiIoTc5 => "PORT_DDI_IO_TC5",
+        PowerDomain::PortDdiIoTc6 => "PORT_DDI_IO_TC6",
+        PowerDomain::PortDsi => "PORT_DSI",
+        PowerDomain::PortCrt => "PORT_CRT",
+        PowerDomain::PortOther => "PORT_OTHER",
+        PowerDomain::Vga => "VGA",
+        PowerDomain::AudioMmio => "AUDIO_MMIO",
+        PowerDomain::AudioPlayback => "AUDIO_PLAYBACK",
+        PowerDomain::AuxIoA => "AUX_IO_A",
+        PowerDomain::AuxIoB => "AUX_IO_B",
+        PowerDomain::AuxIoC => "AUX_IO_C",
+        PowerDomain::AuxIoD => "AUX_IO_D",
+        PowerDomain::AuxIoE => "AUX_IO_E",
+        PowerDomain::AuxIoF => "AUX_IO_F",
+        PowerDomain::AuxA => "AUX_A",
+        PowerDomain::AuxB => "AUX_B",
+        PowerDomain::AuxC => "AUX_C",
+        PowerDomain::AuxD => "AUX_D",
+        PowerDomain::AuxE => "AUX_E",
+        PowerDomain::AuxF => "AUX_F",
+        PowerDomain::AuxUsbc1 => "AUX_USBC1",
+        PowerDomain::AuxUsbc2 => "AUX_USBC2",
+        PowerDomain::AuxUsbc3 => "AUX_USBC3",
+        PowerDomain::AuxUsbc4 => "AUX_USBC4",
+        PowerDomain::AuxUsbc5 => "AUX_USBC5",
+        PowerDomain::AuxUsbc6 => "AUX_USBC6",
+        PowerDomain::AuxTbt1 => "AUX_TBT1",
+        PowerDomain::AuxTbt2 => "AUX_TBT2",
+        PowerDomain::AuxTbt3 => "AUX_TBT3",
+        PowerDomain::AuxTbt4 => "AUX_TBT4",
+        PowerDomain::AuxTbt5 => "AUX_TBT5",
+        PowerDomain::AuxTbt6 => "AUX_TBT6",
+        PowerDomain::Gmbus => "GMBUS",
+        PowerDomain::GtIrq => "GT_IRQ",
+        PowerDomain::DcOff => "DC_OFF",
+        PowerDomain::TcColdOff => "TC_COLD_OFF",
+        PowerDomain::Init => "INIT",
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PowerDomainError {
     MapChanged,
@@ -185,14 +268,15 @@ impl PowerDomainState {
                                 processed.into_iter().rev()
                             {
                                 self.well_counts[previous_flat] -= 1;
-                                if was_zero
-                                    && let Err(rollback) =
+                                if was_zero {
+                                    if let Err(rollback) =
                                         io.disable_well(previous_group, previous_instance)
-                                {
-                                    return Err(PowerDomainError::RollbackFailed {
-                                        operation: error,
-                                        rollback,
-                                    });
+                                    {
+                                        return Err(PowerDomainError::RollbackFailed {
+                                            operation: error,
+                                            rollback,
+                                        });
+                                    }
                                 }
                             }
                             return Err(PowerDomainError::Backend(error));
@@ -287,6 +371,15 @@ mod tests {
 
     use super::*;
     use crate::{dmc::DmcPlatform, power_map::power_wells};
+
+    #[test]
+    fn domain_diagnostic_names_match_i915() {
+        assert_eq!(power_domain_name(PowerDomain::DisplayCore), "DISPLAY_CORE");
+        assert_eq!(power_domain_name(PowerDomain::PortOther), "PORT_OTHER");
+        assert_eq!(power_domain_name(PowerDomain::Gmbus), "GMBUS");
+        assert_eq!(power_domain_name(PowerDomain::GtIrq), "GT_IRQ");
+        assert_eq!(power_domain_name(PowerDomain::TcColdOff), "TC_COLD_OFF");
+    }
 
     #[derive(Default)]
     struct FakePower {

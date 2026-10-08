@@ -11,8 +11,10 @@ use crate::dmc::DmcPlatform;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PowerDomain {
+    DisplayCore,
     Init,
     DcOff,
+    TcColdOff,
     PipeA,
     PipeB,
     PipeC,
@@ -25,11 +27,16 @@ pub enum PowerDomain {
     TranscoderB,
     TranscoderC,
     TranscoderD,
+    TranscoderEdp,
+    TranscoderDsiA,
+    TranscoderDsiC,
     TranscoderVdscPw2,
+    PortDdiLanesA,
     PortDdiLanesB,
     PortDdiLanesC,
     PortDdiLanesD,
     PortDdiLanesE,
+    PortDdiLanesF,
     PortDdiLanesTc1,
     PortDdiLanesTc2,
     PortDdiLanesTc3,
@@ -50,6 +57,7 @@ pub enum PowerDomain {
     PortDdiIoTc6,
     PortDsi,
     PortCrt,
+    PortOther,
     Vga,
     AudioMmio,
     AudioPlayback,
@@ -77,6 +85,8 @@ pub enum PowerDomain {
     AuxTbt4,
     AuxTbt5,
     AuxTbt6,
+    Gmbus,
+    GtIrq,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

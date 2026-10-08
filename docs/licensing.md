@@ -566,3 +566,8 @@ The MIT `intel_display_power_well.c` DC mask/write-retry functions and
 are translated in `tk-intel-display/src/dc_state.rs` (Copyright © 2022 Intel).
 The kernel uses the source retry loop for initial disable; DMC-controlled
 DC5/6/9 transitions and runtime lifecycle are not included.
+
+The MIT `intel_display_power_domain_str()` diagnostic name mapping and full
+power-domain identifier set from `intel_display_power.c` are translated in
+`tk-intel-display/src/power_domains.rs` and `power_map.rs` (Copyright © 2022
+Intel).
