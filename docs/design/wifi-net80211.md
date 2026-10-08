@@ -22,3 +22,6 @@ The regulatory adapter translates OpenBSD's country/domain name and band map
 lookups into static Rust tables used by the later `REG_GET` nl80211 response.
 It deliberately retains the upstream domain flags and 2/5 GHz decision range;
 actual channel admission remains driven by the selected wireless-regdb payload.
+The channel helper module translates OpenBSD MHz/channel conversions and its
+channel-array index/ANY sentinel mapping, using safe indexes in place of
+`ieee80211_channel *` pointers.

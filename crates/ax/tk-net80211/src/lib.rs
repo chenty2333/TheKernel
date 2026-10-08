@@ -6,12 +6,16 @@
 
 extern crate alloc;
 
+mod channel;
 mod frame;
 mod ra;
 mod regdomain;
 mod rsn;
 mod rssadapt;
 
+pub use channel::{
+    CHAN_2GHZ, CHAN_5GHZ, ChannelRef, channel_ref_to_ieee, ieee_to_mhz, mhz_to_ieee,
+};
 pub use frame::{DecapError, EthernetFrame, MacAddress, decap_data, encap_station};
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,
