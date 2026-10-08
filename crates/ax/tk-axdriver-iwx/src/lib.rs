@@ -10,4 +10,6 @@ mod config;
 mod firmware;
 
 pub use config::{DeviceConfig, FirmwareConfig, RuntimeConfig, lookup_config};
-pub use firmware::{FirmwareError, FirmwareImage, FirmwareSection, SectionType};
+pub use firmware::{
+    FirmwareError, FirmwareImage, FirmwareSection, PnvmImage, SectionType, select_pnvm,
+};

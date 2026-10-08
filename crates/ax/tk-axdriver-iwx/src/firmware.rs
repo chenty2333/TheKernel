@@ -30,6 +30,9 @@ const TLV_N_SCAN_CHANNELS: u32 = 31;
 const TLV_SEC_RT_USNIFFER: u32 = 34;
 const TLV_FW_VERSION: u32 = 36;
 const TLV_PNVM_DATA: u32 = 74;
+const TLV_HW_TYPE: u32 = 58;
+const TLV_PNVM_VERSION: u32 = 62;
+const TLV_PNVM_SKU: u32 = 64;
 const TLV_CSCHEME: u32 = 28;
 const TLV_NUM_OF_CPU: u32 = 27;
 const TLV_PAGING: u32 = 32;
@@ -67,6 +70,13 @@ pub struct FirmwareImage {
     pub enabled_capabilities: [u32; 5],
     pub pnvm: Option<Vec<u8>>,
     pub iml: Option<Vec<u8>>,
+}
+
+/// The selected PNVM SKU and firmware segments for a hardware RF identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PnvmImage {
+    pub version: u32,
+    pub segments: Vec<Vec<u8>>,
 }
 
 /// Firmware parser failure corresponding to the driver's invalid-image path.
@@ -239,6 +249,148 @@ impl FirmwareImage {
     }
 }
 
+/// Select the PNVM subsection matching the device SKU and runtime MAC/RF type.
+// upstream: if_iwx.c iwx_pnvm_parse()
+pub fn select_pnvm(
+    bytes: &[u8],
+    sku_id: [u32; 3],
+    mac_type: u16,
+    rf_type: u16,
+) -> Result<Option<PnvmImage>, FirmwareError> {
+    let mut cursor = 0usize;
+    while bytes.len().saturating_sub(cursor) >= 8 {
+        let kind = read_u32(bytes, cursor)?;
+        let len = read_u32(bytes, cursor + 4)? as usize;
+        let data = cursor.checked_add(8).ok_or(FirmwareError::InvalidImage)?;
+        let end = data.checked_add(len).ok_or(FirmwareError::InvalidImage)?;
+        if end > bytes.len() {
+            return Err(FirmwareError::InvalidImage);
+        }
+        let padded = len.checked_add(3).ok_or(FirmwareError::InvalidImage)? & !3;
+        let next = data
+            .checked_add(padded)
+            .ok_or(FirmwareError::InvalidImage)?;
+        if next > bytes.len() {
+            return Err(FirmwareError::InvalidImage);
+        }
+        if kind == TLV_PNVM_SKU {
+            if len != 12 {
+                return Err(FirmwareError::InvalidImage);
+            }
+            let found = [
+                read_u32(bytes, data)?,
+                read_u32(bytes, data + 4)?,
+                read_u32(bytes, data + 8)?,
+            ];
+            let section_start = next;
+            cursor = next;
+            if found == sku_id {
+                let mut selected = PnvmImage {
+                    version: 0,
+                    segments: Vec::new(),
+                };
+                let mut hw_match = false;
+                while bytes.len().saturating_sub(cursor) >= 8 {
+                    let sub_kind = read_u32(bytes, cursor)?;
+                    if sub_kind == TLV_PNVM_SKU {
+                        break;
+                    }
+                    let sub_len = read_u32(bytes, cursor + 4)? as usize;
+                    let sub_data = cursor.checked_add(8).ok_or(FirmwareError::InvalidImage)?;
+                    let sub_end = sub_data
+                        .checked_add(sub_len)
+                        .ok_or(FirmwareError::InvalidImage)?;
+                    if sub_end > bytes.len() {
+                        return Err(FirmwareError::InvalidImage);
+                    }
+                    let sub_padded =
+                        sub_len.checked_add(3).ok_or(FirmwareError::InvalidImage)? & !3;
+                    let sub_next = sub_data
+                        .checked_add(sub_padded)
+                        .ok_or(FirmwareError::InvalidImage)?;
+                    if sub_next > bytes.len() {
+                        return Err(FirmwareError::InvalidImage);
+                    }
+                    match sub_kind {
+                        TLV_PNVM_VERSION if sub_len >= 4 => {
+                            selected.version = read_u32(bytes, sub_data)?;
+                        }
+                        TLV_HW_TYPE if sub_len >= 4 && !hw_match => {
+                            let found_mac = read_u16(bytes, sub_data)?;
+                            let found_rf = read_u16(bytes, sub_data + 2)?;
+                            hw_match = found_mac == mac_type && found_rf == rf_type;
+                        }
+                        TLV_SEC_RT => {
+                            if sub_len < 4 {
+                                return Err(FirmwareError::InvalidImage);
+                            }
+                            if read_u32(bytes, sub_data)? != 0xdddd_eeee {
+                                if selected.segments.len() >= 64 {
+                                    return Err(FirmwareError::TooManySections);
+                                }
+                                selected
+                                    .segments
+                                    .push(bytes[sub_data + 4..sub_end].to_vec());
+                            }
+                        }
+                        _ => {}
+                    }
+                    cursor = sub_next;
+                }
+                if hw_match && !selected.segments.is_empty() {
+                    return Ok(Some(selected));
+                }
+                // If the matching SKU had no matching hardware, continue at
+                // its next SKU header, not at the end of the file.
+                cursor = section_start;
+                while bytes.len().saturating_sub(cursor) >= 8 {
+                    let sub_kind = read_u32(bytes, cursor)?;
+                    if sub_kind == TLV_PNVM_SKU {
+                        break;
+                    }
+                    let sub_len = read_u32(bytes, cursor + 4)? as usize;
+                    let sub_data = cursor.checked_add(8).ok_or(FirmwareError::InvalidImage)?;
+                    let sub_padded =
+                        sub_len.checked_add(3).ok_or(FirmwareError::InvalidImage)? & !3;
+                    cursor = sub_data
+                        .checked_add(sub_padded)
+                        .ok_or(FirmwareError::InvalidImage)?;
+                    if cursor > bytes.len() {
+                        return Err(FirmwareError::InvalidImage);
+                    }
+                }
+            } else {
+                cursor = next;
+                while bytes.len().saturating_sub(cursor) >= 8 {
+                    if read_u32(bytes, cursor)? == TLV_PNVM_SKU {
+                        break;
+                    }
+                    let sub_len = read_u32(bytes, cursor + 4)? as usize;
+                    let sub_data = cursor.checked_add(8).ok_or(FirmwareError::InvalidImage)?;
+                    cursor = sub_data
+                        .checked_add(
+                            sub_len.checked_add(3).ok_or(FirmwareError::InvalidImage)? & !3,
+                        )
+                        .ok_or(FirmwareError::InvalidImage)?;
+                    if cursor > bytes.len() {
+                        return Err(FirmwareError::InvalidImage);
+                    }
+                }
+            }
+        } else {
+            cursor = next;
+        }
+    }
+    Ok(None)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, FirmwareError> {
+    let raw = bytes
+        .get(offset..offset.checked_add(2).ok_or(FirmwareError::InvalidImage)?)
+        .ok_or(FirmwareError::InvalidImage)?;
+    Ok(u16::from_le_bytes([raw[0], raw[1]]))
+}
+
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, FirmwareError> {
     let raw = bytes
         .get(offset..offset.checked_add(4).ok_or(FirmwareError::InvalidImage)?)
@@ -321,6 +473,41 @@ mod tests {
         assert_eq!(image.sections[0].bytes, [1, 2, 3]);
         assert_eq!(image.capability_flags, 0x1234);
         assert_eq!(image.pnvm.as_deref(), Some(&[9, 8, 7][..]));
+    }
+
+    #[test]
+    fn selects_pnvm_by_sku_and_hardware() {
+        fn tlv(kind: u32, data: &[u8], out: &mut Vec<u8>) {
+            out.extend_from_slice(&kind.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(data);
+            while !out.len().is_multiple_of(4) {
+                out.push(0);
+            }
+        }
+        let mut pnvm = Vec::new();
+        let sku = [4u32, 5, 6]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        tlv(TLV_PNVM_SKU, &sku, &mut pnvm);
+        let mut hw = 0x43u16.to_le_bytes().to_vec();
+        hw.extend_from_slice(&0x10du16.to_le_bytes());
+        tlv(TLV_HW_TYPE, &hw, &mut pnvm);
+        tlv(TLV_PNVM_VERSION, &12u32.to_le_bytes(), &mut pnvm);
+        let mut section = 0xddddeeeeu32.to_le_bytes().to_vec();
+        tlv(TLV_SEC_RT, &section, &mut pnvm); // Deprecated delimiter is ignored.
+        section = 0x1000u32.to_le_bytes().to_vec();
+        section.extend_from_slice(&[8, 9]);
+        tlv(TLV_SEC_RT, &section, &mut pnvm);
+        assert_eq!(
+            select_pnvm(&pnvm, [4, 5, 6], 0x43, 0x10d).unwrap(),
+            Some(PnvmImage {
+                version: 12,
+                segments: vec![vec![8, 9]]
+            })
+        );
+        assert_eq!(select_pnvm(&pnvm, [0, 0, 0], 0x43, 0x10d).unwrap(), None);
     }
 
     #[test]
