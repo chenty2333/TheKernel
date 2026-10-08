@@ -17,6 +17,7 @@ mod gem;
 pub(crate) mod intel;
 mod ioctl;
 mod kms;
+mod mode_config_full;
 pub(crate) mod linear;
 pub mod modes;
 mod property;
