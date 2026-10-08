@@ -2475,7 +2475,7 @@ fn execute_user_context(
 fn prepare_user_engine(owner: &mut super::Owner, render: bool) -> Result<bool, Error> {
     owner.bus.assert_media_idle()?;
     if owner.bus.read(0xc000)? & 1 == 0 {
-        if owner.ct_memory.as_ref().is_none_or(|ct| !ct.enabled) {
+        if owner.ct_memory.as_ref().is_none_or(|ct| !ct.enabled) || owner.ads_memory.is_none() {
             return Err(Error::Refused);
         }
         return Ok(true);
