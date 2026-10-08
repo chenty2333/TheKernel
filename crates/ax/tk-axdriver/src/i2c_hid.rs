@@ -223,6 +223,9 @@ impl I2cInput {
                     info.slots = u16::try_from(max_contacts).unwrap_or(32).min(32);
                 }
             }
+            if let Err(error) = info.set_input_mode(&mut device, &parser, 3) {
+                warn!("i2c-hid: failed to select multitouch input mode: {error:?}");
+            }
             parser.set_mt_slot_limit(info.slots);
         }
         let mut input = Vec::new();
@@ -392,9 +395,7 @@ impl BaseDriverOps for I2cInput {
     // upstream: hmt.c hmt_probe() / hidbus.c hidbus_probe()
     fn device_name(&self) -> &str {
         let state = self.state.lock();
-        if let Some(hmt) = state.hmt
-            && hmt.advertises_type()
-        {
+        if let Some(hmt) = state.hmt {
             match hmt.kind {
                 crate::hmt::Type::Touchpad => return "I2C HID multitouch touchpad",
                 crate::hmt::Type::Touchscreen => return "I2C HID multitouch touchscreen",

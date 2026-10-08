@@ -1,6 +1,10 @@
 //! FreeBSD `sys/dev/hid/hmt.c` multitouch mapping policy.
 //! HID field decoding and Linux ABS_MT code conversion are shared with USB HID.
 
+use alloc::vec::Vec;
+
+use tk_i2c_hid::{Device, Error as HidError, Transport};
+
 use crate::hid_report::Report;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,10 +53,49 @@ impl MultiTouch {
         Some(Self { kind, slots })
     }
 
-    // upstream: hmt.c hmt_set_input_mode()
-    pub(super) const fn advertises_type(self) -> bool {
-        true
+    // upstream: hmt.c hmt_set_input_mode() / hconf.c hconf_set_feature_control()
+    pub(super) fn set_input_mode<T: Transport>(
+        self,
+        device: &mut Device<T>,
+        report: &Report,
+        mode: u8,
+    ) -> Result<(), HidError> {
+        if self.kind != Type::Touchpad {
+            return Ok(());
+        }
+        let (report_id, feature) = input_mode_feature_report(report, mode)?;
+        device.set_report(3, report_id, &feature)
     }
+}
+
+fn input_mode_feature_report(report: &Report, mode: u8) -> Result<(u8, Vec<u8>), HidError> {
+    let mode_location = report
+        .locate_usage(crate::hid_report::ReportKind::Feature, 0x0d, 0x52, 0)
+        .filter(|location| location.flags & 2 != 0 && location.flags & 4 == 0)
+        .ok_or(HidError::Unsupported)?;
+    let report_id = mode_location.report_id;
+    let report_length = report.report_size(crate::hid_report::ReportKind::Feature, report_id);
+    if report_length <= 1 {
+        return Err(HidError::Unsupported);
+    }
+    let mut feature = Vec::new();
+    feature
+        .try_reserve_exact(report_length)
+        .map_err(|_| HidError::PacketTooLarge)?;
+    feature.resize(report_length, 0);
+    feature[0] = report_id;
+    for (usage, value) in [(0x52, u32::from(mode)), (0x57, 1), (0x58, 1)] {
+        if let Some(location) =
+            report.locate_usage(crate::hid_report::ReportKind::Feature, 0x0d, usage, 0)
+            && location.report_id == report_id
+            && location.flags & 2 != 0
+            && location.flags & 4 == 0
+            && !crate::hid_report::put_hid_udata(&mut feature, location, value)
+        {
+            return Err(HidError::InvalidPacket);
+        }
+    }
+    Ok((report_id, feature))
 }
 
 #[cfg(test)]
@@ -106,5 +149,18 @@ mod tests {
             .map(|event| (event.event_type, event.code, event.value as i32))
             .collect();
         assert!(triples.contains(&(3, 0x39, -1)));
+    }
+
+    #[test]
+    fn hconf_input_mode_writes_shared_feature_controls() {
+        let descriptor = [
+            0x05, 0x0d, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x01, 0x09, 0x52, 0x15, 0, 0x25, 3, 0x75, 2,
+            0x95, 1, 0xb1, 2, 0x09, 0x57, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0xb1, 2, 0x09, 0x58,
+            0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0xb1, 2, 0xc0,
+        ];
+        let report = Report::parse(&descriptor).unwrap();
+        let (report_id, feature) = input_mode_feature_report(&report, 3).unwrap();
+        assert_eq!(report_id, 1);
+        assert_eq!(feature, [1, 0x0f]);
     }
 }
