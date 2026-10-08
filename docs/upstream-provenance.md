@@ -1013,3 +1013,5 @@ retain the latest Intel inventory, with no scanner exemptions.
 - Intel/FreeBSD `e1000_phy.c` coverage update: 20 of 98 source functions now have direct Rust counterparts, including bounded MDIC and I2C/SFP register operations plus PHY autoneg advertisement; per-generation PHY access paths remain in progress. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
 
 - Intel/FreeBSD `e1000_phy.c` coverage update: 35 of 98 source functions now have direct Rust counterparts, including locked/paged IGP/M88, Kumeran access, sticky-status polling, and bounded autoneg wait. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
+
+- Intel/FreeBSD `e1000_phy.c` coverage update: 37 of 98 source functions now have direct Rust counterparts, including MII copper-autoneg restart and master/slave policy. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.

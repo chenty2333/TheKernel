@@ -33,6 +33,11 @@ const ADVERTISE_1000_HALF: u16 = 0x0010;
 const ADVERTISE_1000_FULL: u16 = 0x0020;
 const MII_AUTONEG_ADV: u8 = 0x04;
 const MII_1000T_CTRL: u8 = 0x09;
+const PHY_CONTROL: u8 = 0x00;
+const MII_CR_AUTO_NEG_EN: u16 = 0x1000;
+const MII_CR_RESTART_AUTO_NEG: u16 = 0x0200;
+const CR_1000T_MS_ENABLE: u16 = 0x1000;
+const CR_1000T_MS_VALUE: u16 = 0x0800;
 const PHY_STATUS: u8 = 0x01;
 const PHY_AUTO_NEG_LIMIT: usize = 45;
 const MII_SR_LINK_STATUS: u16 = 0x0004;
@@ -300,6 +305,38 @@ pub struct AutonegConfig {
     pub flow_control: FlowControlMode,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MasterSlaveMode {
+    Auto,
+    ForceMaster,
+    ForceSlave,
+}
+
+/// upstream: e1000_phy.c e1000_set_master_slave_mode()
+pub fn set_master_slave_mode<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    requested: MasterSlaveMode,
+) -> DevResult<MasterSlaveMode> {
+    let mut control = io.read_phy_register(MII_1000T_CTRL)?;
+    let original = if control & CR_1000T_MS_ENABLE == 0 {
+        MasterSlaveMode::Auto
+    } else if control & CR_1000T_MS_VALUE != 0 {
+        MasterSlaveMode::ForceMaster
+    } else {
+        MasterSlaveMode::ForceSlave
+    };
+    match requested {
+        MasterSlaveMode::ForceMaster => control |= CR_1000T_MS_ENABLE | CR_1000T_MS_VALUE,
+        MasterSlaveMode::ForceSlave => {
+            control |= CR_1000T_MS_ENABLE;
+            control &= !CR_1000T_MS_VALUE;
+        }
+        MasterSlaveMode::Auto => control &= !CR_1000T_MS_ENABLE,
+    }
+    io.write_phy_register(MII_1000T_CTRL, control)?;
+    Ok(original)
+}
+
 pub trait E1000PhyMdicOps: E1000RegisterIo {
     fn read_mdic(&mut self, offset: u32) -> DevResult<u16>;
     fn write_mdic(&mut self, offset: u32, data: u16) -> DevResult;
@@ -556,6 +593,31 @@ pub fn phy_setup_autoneg<I: E1000PhyRegisterIo>(
     if config.mask & ADVERTISE_1000_FULL != 0 {
         io.write_phy_register(MII_1000T_CTRL, gigabit_control)?;
     }
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_copper_link_autoneg()
+pub fn copper_link_autoneg<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    config: &mut AutonegConfig,
+    wait_to_complete: bool,
+    read_callback_installed: bool,
+    link_status_pending: &mut bool,
+) -> DevResult {
+    config.advertised &= config.mask;
+    if config.advertised == 0 {
+        config.advertised = config.mask;
+    }
+    phy_setup_autoneg(io, config)?;
+    let control = io.read_phy_register(PHY_CONTROL)?;
+    io.write_phy_register(
+        PHY_CONTROL,
+        control | MII_CR_AUTO_NEG_EN | MII_CR_RESTART_AUTO_NEG,
+    )?;
+    if wait_to_complete {
+        wait_autoneg(io, read_callback_installed)?;
+    }
+    *link_status_pending = true;
     Ok(())
 }
 
@@ -964,5 +1026,36 @@ mod tests {
         assert_eq!(down.delay, 20);
         wait_autoneg(&mut down, true).unwrap();
         assert_eq!(down.delay, 4_500_020);
+    }
+
+    #[test]
+    fn generic_copper_autoneg_and_master_slave_setup_preserve_register_policy() {
+        let mut io = Io::default();
+        io.phy[MII_AUTONEG_ADV as usize] = 0xffff;
+        io.phy[PHY_CONTROL as usize] = 0x8000;
+        let mut config = AutonegConfig {
+            advertised: 0,
+            mask: ADVERTISE_10_HALF,
+            flow_control: FlowControlMode::None,
+        };
+        let mut pending = false;
+        copper_link_autoneg(&mut io, &mut config, true, true, &mut pending).unwrap();
+        assert_eq!(config.advertised, ADVERTISE_10_HALF);
+        assert!(pending);
+        assert_eq!(
+            io.phy_writes.last(),
+            Some(&(
+                PHY_CONTROL,
+                0x8000 | MII_CR_AUTO_NEG_EN | MII_CR_RESTART_AUTO_NEG
+            ))
+        );
+
+        io.phy[MII_1000T_CTRL as usize] = CR_1000T_MS_ENABLE | CR_1000T_MS_VALUE;
+        let original = set_master_slave_mode(&mut io, MasterSlaveMode::ForceSlave).unwrap();
+        assert_eq!(original, MasterSlaveMode::ForceMaster);
+        assert_eq!(
+            io.phy_writes.last(),
+            Some(&(MII_1000T_CTRL, CR_1000T_MS_ENABLE))
+        );
     }
 }
