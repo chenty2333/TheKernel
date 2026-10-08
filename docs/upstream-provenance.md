@@ -1178,3 +1178,9 @@ function-control generation from Linux 7.2.3
 `drivers/gpu/drm/i915/display/intel_ddi.c` (MIT, Copyright © 2012 Intel).
 See `docs/design/intel-ddi.md` for the implemented subset and the ports still
 refused.
+
+`kernel/src/drm/intel/ddi.rs` adapts the platform-generated combo DPCLKA RMW
+plan to typed MMIO with a serialized two-write enable and one-write disable.
+`kernel/src/drm/intel/output.rs::program()` now consumes it for the supported
+N305 A/B output path; the sequence follows `_icl_ddi_enable_clock()` and
+`_icl_ddi_disable_clock()` from the same MIT `intel_ddi.c` source.

@@ -455,10 +455,13 @@ fn the_clock_select_and_the_clock_off_clear_are_separate_writes() {
         .collect();
     assert_eq!(
         writes[0],
-        plan.dpclka_select | (1 << 10),
+        plan.ddi_clock_plan.selector_value | (1 << 10),
         "select, gate still set"
     );
-    assert_eq!(writes[1], plan.dpclka_select, "gate cleared, select kept");
+    assert_eq!(
+        writes[1], plan.ddi_clock_plan.selector_value,
+        "gate cleared, select kept"
+    );
 }
 
 /// The DDI-IO well is enabled through `power.rs`'s handshake: the request bit
@@ -1091,14 +1094,25 @@ fn the_dpll1_lock_poll_retries() {
 fn the_clock_select_field_carries_the_pll_id_for_each_phy() {
     let a = target_plan();
     let b = OutputProgram::plan(&hdmi_request(Ddi::B), STRAP_38_4).unwrap();
-    assert_eq!(a.dpclka_select, 0, "PHY A selects DPLL0, whose id is 0");
     assert_eq!(
-        b.dpclka_select,
+        a.ddi_clock_plan.selector_value, 0,
+        "PHY A selects DPLL0, whose id is 0"
+    );
+    assert_eq!(
+        b.ddi_clock_plan.selector_value,
         1 << 2,
         "PHY B selects DPLL1, id 1, at phy*2"
     );
-    assert_eq!(a.dpclka_clock_off, 1 << 10, "DDI A's clock-off bit");
-    assert_eq!(b.dpclka_clock_off, 1 << 11, "DDI B's clock-off bit");
+    assert_eq!(
+        a.ddi_clock_plan.clock_off_mask,
+        1 << 10,
+        "DDI A's clock-off bit"
+    );
+    assert_eq!(
+        b.ddi_clock_plan.clock_off_mask,
+        1 << 11,
+        "DDI B's clock-off bit"
+    );
 
     // On the wire, with the other PHY's field and the gate bit as firmware
     // could have left them.

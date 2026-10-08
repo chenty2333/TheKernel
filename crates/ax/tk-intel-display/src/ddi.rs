@@ -308,6 +308,128 @@ fn ddi_port_width(lane_count: u8) -> Result<u32, Error> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DdiClockPlatform {
+    Icl,
+    TigerLake,
+    RocketLake,
+    AlderLakeS,
+    AlderLakeP,
+    AlderLakeN,
+    Dg1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DdiClockPlan {
+    pub register: u32,
+    pub selector_mask: u32,
+    pub selector_value: u32,
+    pub clock_off_mask: u32,
+}
+
+/// The two distinct RMWs `_icl_ddi_enable_clock()` performs under the shared
+/// DPLL lock: first select the PLL, then clear the DDI clock-off gate.
+pub const fn ddi_clock_enable_writes(plan: DdiClockPlan) -> [(u32, u32, u32); 2] {
+    [
+        (plan.register, plan.selector_mask, plan.selector_value),
+        (plan.register, plan.clock_off_mask, 0),
+    ]
+}
+
+/// One RMW to gate the DDI port clock, matching `_icl_ddi_disable_clock()`.
+pub const fn ddi_clock_disable_write(plan: DdiClockPlan) -> (u32, u32, u32) {
+    (plan.register, 0, plan.clock_off_mask)
+}
+
+/// Construct the platform-specific DPCLKA register and field layout.
+// upstream: intel_ddi.c adls_ddi_get_pll()/rkl_ddi_get_pll()/dg1_ddi_get_pll()/icl_ddi_combo_get_pll()
+pub fn ddi_combo_clock_plan(
+    platform: DdiClockPlatform,
+    phy: u8,
+    pll_id: u8,
+) -> Result<DdiClockPlan, Error> {
+    if phy > 4 {
+        return Err(Error::Refused);
+    }
+    let (register, shift, clock_off_bit, encoded_pll) = match platform {
+        DdiClockPlatform::Icl
+        | DdiClockPlatform::TigerLake
+        | DdiClockPlatform::AlderLakeP
+        | DdiClockPlatform::AlderLakeN => {
+            if pll_id > 1 {
+                return Err(Error::Refused);
+            }
+            (0x164280, phy * 2, icl_ddi_clock_off_bit(phy)?, pll_id)
+        }
+        DdiClockPlatform::RocketLake => {
+            if phy > 3 || pll_id > 2 {
+                return Err(Error::Refused);
+            }
+            let shift = match phy {
+                0 => 0,
+                1 => 2,
+                2 => 4,
+                3 => 27,
+                _ => return Err(Error::Refused),
+            };
+            (0x164280, shift, icl_ddi_clock_off_bit(phy)?, pll_id)
+        }
+        DdiClockPlatform::AlderLakeS => {
+            if pll_id > 3 {
+                return Err(Error::Refused);
+            }
+            (
+                if phy < 3 { 0x164280 } else { 0x1642bc },
+                (phy % 3) * 2,
+                icl_ddi_clock_off_bit(phy)?,
+                pll_id,
+            )
+        }
+        DdiClockPlatform::Dg1 => {
+            if phy > 3 || pll_id > 3 {
+                return Err(Error::Refused);
+            }
+            let local_phy = phy % 2;
+            (
+                if phy < 2 { 0x164280 } else { 0x16c280 },
+                local_phy * 2,
+                (1 << (local_phy + 10)),
+                pll_id % 2,
+            )
+        }
+    };
+    let selector_mask = 3 << shift;
+    Ok(DdiClockPlan {
+        register,
+        selector_mask,
+        selector_value: u32::from(encoded_pll) << shift,
+        clock_off_mask: clock_off_bit,
+    })
+}
+
+fn icl_ddi_clock_off_bit(phy: u8) -> Result<u32, Error> {
+    match phy {
+        0 => Ok(1 << 10),
+        1 => Ok(1 << 11),
+        2 => Ok(1 << 24),
+        3 => Ok(1 << 4),
+        4 => Ok(1 << 5),
+        _ => Err(Error::Refused),
+    }
+}
+
+/// Decode the selected PLL ID from a DPCLKA register image.
+// upstream: intel_ddi.c _icl_ddi_get_pll()/dg1_ddi_get_pll()
+pub fn ddi_combo_clock_pll_id(platform: DdiClockPlatform, phy: u8, raw: u32) -> Result<u8, Error> {
+    let plan = ddi_combo_clock_plan(platform, phy, 0)?;
+    let encoded = ((raw & plan.selector_mask) >> plan.selector_mask.trailing_zeros()) as u8;
+    Ok(if platform == DdiClockPlatform::Dg1 && phy >= 2 {
+        encoded + 2
+    } else {
+        encoded
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DdiMode {
     Hdmi,
     Dvi,
@@ -603,5 +725,52 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn combo_phy_clock_mux_uses_platform_registers_and_two_write_order() {
+        assert_eq!(
+            ddi_combo_clock_plan(DdiClockPlatform::AlderLakeN, 0, 0).unwrap(),
+            ddi_combo_clock_plan(DdiClockPlatform::Icl, 0, 0).unwrap()
+        );
+        let icl = ddi_combo_clock_plan(DdiClockPlatform::TigerLake, 1, 1).unwrap();
+        assert_eq!(
+            icl,
+            DdiClockPlan {
+                register: 0x164280,
+                selector_mask: 3 << 2,
+                selector_value: 1 << 2,
+                clock_off_mask: 1 << 11,
+            }
+        );
+        assert_eq!(
+            ddi_clock_enable_writes(icl),
+            [(0x164280, 3 << 2, 1 << 2), (0x164280, 1 << 11, 0)]
+        );
+        assert_eq!(ddi_clock_disable_write(icl), (0x164280, 0, 1 << 11));
+        assert_eq!(
+            ddi_combo_clock_pll_id(DdiClockPlatform::TigerLake, 1, 1 << 2),
+            Ok(1)
+        );
+
+        let adls = ddi_combo_clock_plan(DdiClockPlatform::AlderLakeS, 3, 3).unwrap();
+        assert_eq!(
+            adls,
+            DdiClockPlan {
+                register: 0x1642bc,
+                selector_mask: 3,
+                selector_value: 3,
+                clock_off_mask: 1 << 4,
+            }
+        );
+        let rkl = ddi_combo_clock_plan(DdiClockPlatform::RocketLake, 3, 2).unwrap();
+        assert_eq!(rkl.selector_value, 2 << 27);
+        let dg1 = ddi_combo_clock_plan(DdiClockPlatform::Dg1, 2, 3).unwrap();
+        assert_eq!(
+            (dg1.register, dg1.selector_value, dg1.clock_off_mask),
+            (0x16c280, 1, 1 << 10)
+        );
+        assert_eq!(ddi_combo_clock_pll_id(DdiClockPlatform::Dg1, 2, 1), Ok(3));
+        assert!(ddi_combo_clock_plan(DdiClockPlatform::RocketLake, 4, 0).is_err());
     }
 }

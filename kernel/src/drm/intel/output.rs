@@ -806,15 +806,6 @@ const fn ddi_io_well(phy: ComboPhy) -> Well {
     }
 }
 
-/// The `DDI_CLK_SEL` field mask for a PHY in `ICL_DPCLKA_CFGCR0`.
-///
-/// The field is two bits wide at `phy * 2` (§6.3 routing step 1); it is a mask
-/// rather than a value because the write is a read-modify-write and the other
-/// PHY's field is next to it.
-const fn ddi_clock_select_mask(phy: ComboPhy) -> u32 {
-    0b11 << phy.ddi_clock_select_shift()
-}
-
 /// Which combo PHY a DDI is on, or a refusal.
 ///
 /// Split out because both [`OutputProgram::plan`] and [`program`] check it: the
@@ -887,10 +878,8 @@ pub(crate) struct OutputProgram {
     pub(crate) swing: SwingProgram,
     /// The `PHY_LINK_RATE` field and its provenance.
     pub(crate) link_rate: LinkRate,
-    /// The `DDI_CLK_SEL` field value for `ICL_DPCLKA_CFGCR0`.
-    pub(crate) dpclka_select: u32,
-    /// The bit `ICL_DPCLKA_CFGCR0`'s second write clears.
-    pub(crate) dpclka_clock_off: u32,
+    /// The platform-mapped DPCLKA field and the separate clock-off write.
+    pub(crate) ddi_clock_plan: intel_display::ddi::DdiClockPlan,
     /// `TRANS_CLK_SEL(A)`.
     pub(crate) trans_clk_sel: u32,
     /// `TRANS_DDI_FUNC_CTL(A)`.
@@ -1019,6 +1008,15 @@ impl OutputProgram {
             | request.width.width_field()
             | request.width.four_lane_bit();
 
+        let ddi_clock_plan = intel_display::ddi::ddi_combo_clock_plan(
+            intel_display::ddi::DdiClockPlatform::AlderLakeN,
+            phy_index(phy) as u8,
+            request.pll_id,
+        )
+        .map_err(|_| OutputError::ComboPllIndex {
+            index: request.pll_id,
+        })?;
+
         Ok(Self {
             pll_id: request.pll_id,
             ddi: request.ddi,
@@ -1034,8 +1032,7 @@ impl OutputProgram {
             ddi_io_well: ddi_io_well(phy),
             swing,
             link_rate: request.link_rate,
-            dpclka_select: u32::from(request.pll_id) << (phy_index(phy) * 2),
-            dpclka_clock_off: phy.ddi_clock_off_bit(),
+            ddi_clock_plan,
             trans_clk_sel,
             trans_ddi_func_ctl,
             transconf,
@@ -1091,7 +1088,7 @@ impl OutputProgram {
         out.push_str(&format!(
             "intel-output: ICL_DPCLKA_CFGCR0: DDI_CLK_SEL = {:#x}, then the DDI_CLK_OFF bit {:#x} \
              cleared in a separate write\n",
-            self.dpclka_select, self.dpclka_clock_off,
+            self.ddi_clock_plan.selector_value, self.ddi_clock_plan.clock_off_mask,
         ));
         out.push_str(&format!(
             "intel-output: voltage-swing level {} from {} ({}) , DW2 per lane {:#010x?}, DW4 per \
@@ -1324,13 +1321,15 @@ pub(crate) fn program(
     // clear "must be done with separate register writes".  They are two `rmw`
     // calls, and a test asserts on the write count, because merging them is the
     // kind of change a later cleanup makes innocently.
-    rmw(
-        regs,
-        dpll::ICL_DPCLKA_CFGCR0,
-        ddi_clock_select_mask(phy),
-        plan.dpclka_select,
-    )?;
-    rmw(regs, dpll::ICL_DPCLKA_CFGCR0, plan.dpclka_clock_off, 0)?;
+    super::ddi::enable_combo_clock(regs, plan.ddi_clock_plan).map_err(|error| match error {
+        super::ddi::DdiClockError::Unreadable => OutputError::Unreadable {
+            register: dpll::ICL_DPCLKA_CFGCR0.name(),
+        },
+        super::ddi::DdiClockError::WriteRefused => OutputError::WriteRefused {
+            register: dpll::ICL_DPCLKA_CFGCR0.name(),
+        },
+        super::ddi::DdiClockError::Unsupported => OutputError::ComboPllIndex { index: plan.pll_id },
+    })?;
 
     // §8.6 step 5 -- the port's DDI-IO power, before anything drives a lane.
     // This is `power.rs`'s handshake, with its own rollback: a well that never

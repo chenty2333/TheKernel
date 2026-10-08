@@ -102,6 +102,7 @@ mod i915_port;
 mod id;
 mod irq;
 mod modeset;
+mod ddi;
 mod output;
 mod pattern;
 mod pci;
