@@ -1,7 +1,7 @@
 //! Station data-frame conversion from OpenBSD net80211.
 //!
 //! Upstream: OpenBSD `sys/net80211/ieee80211_output.c` revision 1.148,
-//! `ieee80211_encap()` station-mode path, and `ieee80211_input.c` revision
+//! station-mode `ieee80211_encap()` path, and `ieee80211_input.c` revision
 //! 1.263, `ieee80211_decap()`. Both files use the BSD-3-Clause license.
 //! Copyright (c) 2001 Atsushi Onoe
 //! Copyright (c) 2002, 2003 Sam Leffler, Errno Consulting
@@ -190,7 +190,7 @@ pub fn decap_amsdu(
 /// `sequence` is the 12-bit non-QoS sequence number; a caller that negotiated
 /// QoS can maintain the per-TID counters and use the corresponding upstream
 /// QoS data path instead. The `protected` flag selects hardware encryption.
-// upstream: ieee80211_output.c ieee80211_encap() station path
+// upstream: ieee80211_output.c ieee80211_encap()
 pub fn encap_station(
     ethernet: &[u8],
     bssid: MacAddress,
