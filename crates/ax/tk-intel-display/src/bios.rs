@@ -24,6 +24,7 @@ impl<'a> Vbt<'a> {
     /// unrelated malformed OEM tail does not discard an earlier valid block. No packed references or unaligned integer loads.
     /// Like i915, a bad checksum is not automatically a parse failure; admission
     /// policy can inspect checksum_valid without changing parser semantics.
+    // upstream: intel_bios.c intel_bios_is_valid_vbt()
     pub fn parse(data: &'a [u8]) -> Result<Self, Error> {
         bytes(data, 0, 48)?;
         if &data[..4] != b"$VBT" {
@@ -63,11 +64,13 @@ impl<'a> Vbt<'a> {
     pub fn checksum_valid(&self) -> bool {
         self.data.iter().fold(0u8, |a, b| a.wrapping_add(*b)) == 0
     }
+    // upstream: intel_bios.c get_blocksize()
     pub fn sections(&self) -> Sections<'a> {
         Sections {
             remaining: &self.bdb[self.header_size..],
         }
     }
+    // upstream: intel_bios.c find_raw_section()
     pub fn find_raw_section(&self, id: u8) -> Result<Option<&'a [u8]>, Error> {
         for section in self.sections() {
             let (current, data) = section?;
@@ -80,6 +83,7 @@ impl<'a> Vbt<'a> {
     /// The display-13 DKL PLL's board-provided AFC startup override, as
     /// interpreted by i915's `parse_general_features`. Missing/short legacy
     /// feature blocks mean no override; the VBT version gates the 249+ field.
+    // upstream: intel_bios.c parse_general_features()
     pub fn afc_startup_override(&self) -> Result<Option<u8>, Error> {
         if self.version < 249 {
             return Ok(None);
@@ -96,6 +100,7 @@ impl<'a> Vbt<'a> {
             _ => Some(7),
         })
     }
+    // upstream: intel_bios.c parse_general_definitions()
     pub fn parse_general_definitions(&self) -> Result<GeneralDefinitions<'a>, Error> {
         if !(216..=264).contains(&self.version) {
             return Err(Error::UnsupportedVersion);
@@ -122,6 +127,7 @@ pub struct Sections<'a> {
 }
 impl<'a> Iterator for Sections<'a> {
     type Item = Result<(u8, &'a [u8]), Error>;
+    // upstream: intel_bios.c get_blocksize()
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining.is_empty() {
             return None;
@@ -144,6 +150,7 @@ impl<'a> Iterator for Sections<'a> {
         Some(result)
     }
 }
+// upstream: intel_bios.c child_device_expected_size()
 fn child_device_expected_size(version: u16) -> usize {
     if version >= 263 {
         44
@@ -164,6 +171,7 @@ pub struct GeneralDefinitions<'a> {
 impl GeneralDefinitions<'_> {
     /// Empty child records are omitted, in upstream list order. Unknown ports
     /// remain visible as None; parsing is not a claim that the PHY is present.
+    // upstream: intel_bios.c parse_general_definitions()
     pub fn children(&self) -> impl Iterator<Item = ChildDevice> + '_ {
         self.children
             .chunks_exact(self.record_size)
@@ -232,24 +240,30 @@ pub struct ChildDevice {
     pub dynamic_port_over_tc: bool,
 }
 impl ChildDevice {
+    // upstream: intel_bios.c intel_bios_encoder_supports_dvi()
     pub const fn supports_dvi(self) -> bool {
         self.device_type & (1 << 4) != 0
     }
+    // upstream: intel_bios.c intel_bios_encoder_supports_hdmi()
     pub const fn supports_hdmi(self) -> bool {
         self.supports_dvi() && self.device_type & (1 << 11) == 0
     }
+    // upstream: intel_bios.c intel_bios_encoder_supports_dp()
     pub const fn supports_dp(self) -> bool {
         self.device_type & (1 << 2) != 0
     }
+    // upstream: intel_bios.c intel_bios_encoder_supports_edp()
     pub const fn supports_edp(self) -> bool {
         self.supports_dp() && self.device_type & (1 << 12) != 0
     }
+    // upstream: intel_bios.c map_ddc_pin()
     pub const fn gmbus_pin(self) -> Option<u8> {
         map_ddc_pin(self.ddc_pin)
     }
 }
 
 /// Display 13 XELPD mapping, not the old pre-display-13 port-letter mapping.
+// upstream: intel_bios.c dvo_port_type()
 pub const fn dvo_port_to_port(dvo: u8) -> Option<Port> {
     match dvo {
         0 | 10 => Some(Port::A),
@@ -265,6 +279,7 @@ pub const fn dvo_port_to_port(dvo: u8) -> Option<Port> {
     }
 }
 /// ADL-P BIOS DDC bus 3 is GMBUS 9 (TC1), never GMBUS 3 (combo C).
+// upstream: intel_bios.c map_ddc_pin()
 pub const fn map_ddc_pin(vbt_pin: u8) -> Option<u8> {
     match vbt_pin {
         1 => Some(1),
@@ -276,6 +291,7 @@ pub const fn map_ddc_pin(vbt_pin: u8) -> Option<u8> {
         _ => None,
     }
 }
+// upstream: intel_bios.c intel_bios_hdmi_max_tmds_clock()
 pub const fn hdmi_max_tmds_clock(rate: u8) -> u32 {
     match rate {
         1 => 297000,
