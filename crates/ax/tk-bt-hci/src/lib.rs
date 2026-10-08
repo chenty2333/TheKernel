@@ -218,17 +218,26 @@ impl<T: UsbTransport> Adapter<T> {
         if !self.up {
             return Err(Error::NotUp);
         }
-        Packet::parse(kind, bytes)?;
+        if let Err(error) = Packet::parse(kind, bytes) {
+            self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+            return Err(error);
+        }
         match kind {
             PacketType::Command => {
-                self.transport.control_command(bytes)?;
+                if let Err(error) = self.transport.control_command(bytes) {
+                    self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+                    return Err(error);
+                }
                 self.queue_monitor(2, bytes);
                 self.stats.cmd_tx = self.stats.cmd_tx.saturating_add(1);
                 self.stats.byte_tx = self.stats.byte_tx.saturating_add(bytes.len() as u32);
                 Ok(())
             }
             PacketType::Acl => {
-                self.transport.bulk_acl_out(bytes)?;
+                if let Err(error) = self.transport.bulk_acl_out(bytes) {
+                    self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+                    return Err(error);
+                }
                 self.queue_monitor(4, bytes);
                 self.stats.acl_tx = self.stats.acl_tx.saturating_add(1);
                 self.stats.byte_tx = self.stats.byte_tx.saturating_add(bytes.len() as u32);
@@ -240,7 +249,10 @@ impl<T: UsbTransport> Adapter<T> {
     /// HCI event capture is copied to monitor observers with a leading packet
     /// type byte. This bounded queue drops the oldest packet on overflow.
     pub fn receive_event(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        Packet::parse(PacketType::Event, bytes)?;
+        if let Err(error) = Packet::parse(PacketType::Event, bytes) {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+            return Err(error);
+        }
         self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
         self.stats.byte_rx = self.stats.byte_rx.saturating_add(bytes.len() as u32);
         if self.monitor_users != 0 {
@@ -249,7 +261,10 @@ impl<T: UsbTransport> Adapter<T> {
         Ok(())
     }
     pub fn receive_acl(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        Packet::parse(PacketType::Acl, bytes)?;
+        if let Err(error) = Packet::parse(PacketType::Acl, bytes) {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+            return Err(error);
+        }
         self.stats.acl_rx = self.stats.acl_rx.saturating_add(1);
         self.stats.byte_rx = self.stats.byte_rx.saturating_add(bytes.len() as u32);
         if self.monitor_users != 0 {
@@ -279,10 +294,22 @@ impl<T: UsbTransport> Adapter<T> {
         !self.monitor.is_empty()
     }
     pub fn read_event(&mut self, out: &mut [u8]) -> Result<usize, Error> {
-        self.transport.read_interrupt_event(out)
+        match self.transport.read_interrupt_event(out) {
+            Ok(length) => Ok(length),
+            Err(error) => {
+                self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                Err(error)
+            }
+        }
     }
     pub fn read_acl(&mut self, out: &mut [u8]) -> Result<usize, Error> {
-        self.transport.read_bulk_acl(out)
+        match self.transport.read_bulk_acl(out) {
+            Ok(length) => Ok(length),
+            Err(error) => {
+                self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                Err(error)
+            }
+        }
     }
     // upstream: iwmbt_hw.c iwmbt_hci_command()
     /// Send an HCI command and read its matching Command Complete event. This
@@ -692,6 +719,11 @@ mod tests {
         assert_eq!(a.open(Channel::User), Ok(()));
         assert_eq!(a.open(Channel::User), Err(Error::Busy));
         a.set_up(true).unwrap();
+        assert_eq!(
+            a.submit(Channel::User, PacketType::Command, &[1, 0, 2, 0xaa]),
+            Err(Error::InvalidLength)
+        );
+        assert_eq!(a.receive_event(&[0x0e, 1]), Err(Error::InvalidLength));
         a.submit(Channel::User, PacketType::Command, &[1, 0, 1, 0xaa])
             .unwrap();
         a.receive_event(&[0x0e, 0]).unwrap();
@@ -702,6 +734,8 @@ mod tests {
         assert_eq!(
             a.statistics(),
             Statistics {
+                err_rx: 1,
+                err_tx: 1,
                 cmd_tx: 1,
                 evt_rx: 2,
                 byte_rx: 4,
