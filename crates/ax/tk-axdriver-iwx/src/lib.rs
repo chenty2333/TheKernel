@@ -13,6 +13,7 @@ mod dma;
 mod firmware;
 mod firmware_bundle;
 mod interrupts;
+mod rate;
 mod registers;
 mod rings;
 mod rx;
@@ -46,6 +47,11 @@ pub use firmware_bundle::{
 pub use interrupts::{
     InterruptMasks, enable_firmware_load_interrupts, enable_interrupts, enable_rfkill_interrupts,
     hardware_rfkill,
+};
+pub use rate::{
+    MCS_TO_RATE_INDEX, RATES, Rate, TX_FLAG_COMMAND_RATE, TX_FLAG_HIGH_PRIORITY, TxRateError,
+    TxRateInput, TxRateSelection, fw_rate_index_cck, fw_rate_index_ofdm, rate_value_to_index,
+    select_tx_rate,
 };
 pub use registers::{CsrAccess, DeviceFamily, IoBarrier, IwxRegisters, RegisterError};
 pub use rings::{

@@ -994,3 +994,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): command-group compatibility, wide command headers, split payload TFDs, response storage and bounds, command ACK lifetime/generation handling, and command-ring publication translated in `tk-axdriver-iwx/src/command.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): RF-kill, firmware-load, and normal CSR/MSI-X interrupt-mask transitions and hardware RF-kill state reads translated in `tk-axdriver-iwx/src/interrupts.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): generation-specific MPDU antenna-energy offsets and beacon-silence noise averaging translated in `tk-axdriver-iwx/src/rx.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): source-ordered legacy/HT rate table, MCS/rate index conversions, and generation-specific management/multicast TX rate flags translated in `tk-axdriver-iwx/src/rate.rs`.
