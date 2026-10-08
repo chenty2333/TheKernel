@@ -110,3 +110,12 @@ The remaining routines are FreeBSD VM/sf_buf and bus topology wrappers, x86
 IOMMU vtable dispatch, IRQ/MSI resource management, sysctl registration, and
 DDB output; page storage, DMA clients, QI, and interrupt routes map to existing
 TheKernel-owned seams instead of importing those frameworks.
+
+Final `intel_iommu=on` QEMU split-irqchip acceptance was rerun after the
+FreeBSD source adapters were added. The runner confirmed the Multiboot command
+line carried `intel_iommu=on` and attached `intel-iommu,intremap=on`, but QEMU
+timed out at 180 seconds before the guest acceptance commands ran. The serial
+log stopped immediately after BSP CPU feature/enable messages; no VT-d-stage
+log or guest marker was observed, so the exact stall point is unknown. The
+identity-by-default fallback remains in place; translated DMA and interrupt
+remapping are not accepted and must not be enabled by default.
