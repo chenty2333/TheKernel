@@ -802,6 +802,7 @@ pub struct SdhciHost<I: SdhciIo> {
     capabilities2: u32,
     version: u8,
     base_clock_hz: u32,
+    timeout_clock_khz: u32,
     clock_hz: u32,
     power: u32,
     quirks: u32,
@@ -824,12 +825,25 @@ impl<I: SdhciIo> SdhciHost<I> {
         quirks: u32,
     ) -> Self {
         let base_mhz = (capabilities & SDHCI_CLOCK_V3_BASE_MASK) >> SDHCI_CLOCK_BASE_SHIFT;
+        let timeout_clock_khz = if quirks & SDHCI_QUIRK_DATA_TIMEOUT_USES_SDCLK != 0 {
+            base_mhz.saturating_mul(1000)
+        } else if quirks & SDHCI_QUIRK_DATA_TIMEOUT_1MHZ != 0 {
+            1000
+        } else {
+            let raw = (capabilities & SDHCI_TIMEOUT_CLK_MASK) >> SDHCI_TIMEOUT_CLK_SHIFT;
+            if capabilities & SDHCI_TIMEOUT_CLK_UNIT != 0 {
+                raw.saturating_mul(1000)
+            } else {
+                raw
+            }
+        };
         Self {
             io,
             capabilities,
             capabilities2,
             version,
             base_clock_hz: base_mhz * 1_000_000,
+            timeout_clock_khz,
             clock_hz: 0,
             power: 0,
             quirks,
@@ -1022,18 +1036,6 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.power_up().inspect_err(|error| {
             log::warn!("sdhci: initial 400kHz clock failed: {error:?}");
         })?;
-        // Use the largest host timeout exponent unless a future platform
-        // integration provides the per-card timeout derived from CSD/EXT_CSD.
-        let timeout = if self.quirks
-            & (SDHCI_QUIRK_INCR_TIMEOUT_CONTROL | SDHCI_QUIRK_BROKEN_TIMEOUT_VAL)
-            != 0
-        {
-            0x0f
-        } else {
-            0x0e
-        };
-        self.io
-            .write8(SDHCI_TIMEOUT_CONTROL as usize, timeout as u8);
         self.init_registers();
         Ok(())
     }
@@ -1626,6 +1628,10 @@ impl<I: SdhciIo> SdhciHost<I> {
         use_adma2: bool,
     ) -> Result<(), SdhciError> {
         let data_len = buffer.len();
+        self.io.write8(
+            SDHCI_TIMEOUT_CONTROL as usize,
+            calculate_data_timeout(self.timeout_clock_khz, self.quirks),
+        );
         if use_sdma || use_adma2 {
             let dma = self.dma.as_ref().expect("DMA predicate checked allocation");
             let payload = if use_adma2 {
@@ -1781,6 +1787,23 @@ fn calculate_clock_divider(base_hz: u32, target_hz: u32, version: u8) -> (u32, u
         divisor = divisor.min(SDHCI_200_MAX_DIVIDER);
         (divisor, divisor >> 1)
     }
+}
+
+// upstream: sdhci.c sdhci_start_data() 1-second timeout exponent
+fn calculate_data_timeout(timeout_clock_khz: u32, quirks: u32) -> u8 {
+    if timeout_clock_khz == 0 || quirks & SDHCI_QUIRK_BROKEN_TIMEOUT_VAL != 0 {
+        return 0x0e;
+    }
+    let mut timeout_us = (1u64 << 13) * 1000 / u64::from(timeout_clock_khz);
+    let mut exponent = 0u8;
+    while timeout_us < 1_000_000 && exponent < 0x0e {
+        exponent += 1;
+        timeout_us <<= 1;
+    }
+    if exponent < 0x0e && quirks & SDHCI_QUIRK_INCR_TIMEOUT_CONTROL != 0 {
+        exponent += 1;
+    }
+    exponent
 }
 
 // upstream: sdhci.c sdhci_cmd_irq()
@@ -2817,6 +2840,38 @@ mod tests {
         assert_eq!(
             v3.minimum_frequency_hz(),
             50_000_000 / SDHCI_300_MAX_DIVIDER
+        );
+    }
+
+    #[test]
+    fn data_timeout_exponent_uses_host_clock_and_quirks() {
+        assert_eq!(calculate_data_timeout(1_000, 0), 7);
+        assert_eq!(
+            calculate_data_timeout(1_000, SDHCI_QUIRK_INCR_TIMEOUT_CONTROL),
+            8
+        );
+        assert_eq!(calculate_data_timeout(0, 0), 0x0e);
+        assert_eq!(
+            calculate_data_timeout(1_000, SDHCI_QUIRK_BROKEN_TIMEOUT_VAL),
+            0x0e
+        );
+        let capabilities = (50 << SDHCI_CLOCK_BASE_SHIFT)
+            | (40 << SDHCI_TIMEOUT_CLK_SHIFT)
+            | SDHCI_TIMEOUT_CLK_UNIT;
+        assert_eq!(
+            SdhciHost::new(MockIo::default(), capabilities, 0, 3).timeout_clock_khz,
+            40_000
+        );
+        assert_eq!(
+            SdhciHost::new_with_quirks(
+                MockIo::default(),
+                50 << SDHCI_CLOCK_BASE_SHIFT,
+                0,
+                3,
+                SDHCI_QUIRK_DATA_TIMEOUT_USES_SDCLK,
+            )
+            .timeout_clock_khz,
+            50_000
         );
     }
 

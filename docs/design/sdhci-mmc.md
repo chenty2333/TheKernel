@@ -43,6 +43,10 @@ boot area writes follow the same default-read-only policy for Intel eMMC. RPMB
 metadata is decoded but its authenticated key/frame protocol is not exposed as a
 generic block device, preventing unauthenticated writes.
 
+Each data command programs the FreeBSD-derived 1-second timeout exponent from
+the capability timeout clock (or the SDCLK/1 MHz quirks); missing/broken timeout
+clocks select the maximum exponent, and the increment-timeout quirk is retained.
+
 QEMU `1b36:0007` advertises DMA but fails SD CMD17 with the SDMA transfer setup
 used here, so that virtual model is assigned a local broken-DMA quirk and
 single-block PIO fallback. This is separate from the FreeBSD upstream PCI
