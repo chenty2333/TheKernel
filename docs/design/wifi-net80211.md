@@ -296,6 +296,10 @@ OpenBSD iwx hardware key offload covers CCMP/IGTK while upstream falls back to
 net80211 software crypto for other data ciphers; these software helpers are not
 yet wired through the Ethernet driver/key-control path. The explicit PAE files
 remain with wpa_supplicant.
+The common net80211 cipher dispatcher and pairwise/group RX/TX key selectors
+now choose the translated cipher contexts; the iwx control path still must
+populate these keys from nl80211 and route protected Ethernet frames through
+these helpers.
 See the function-count snapshot in progress-W.md for per-file marker totals.
 
 RSN-node leave cleanup is represented as explicit effects: initialize state,

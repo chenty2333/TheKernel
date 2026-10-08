@@ -1,6 +1,6 @@
 //! Software WEP frame crypto from OpenBSD net80211.
 //!
-//! Translated from `sys/net80211/ieee80211_crypto_wep.c` rev 1.13 (ISC) and
+//! Translated from `sys/net80211/ieee80211_crypto_wep.c` rev 1.17 (ISC) and
 //! `ieee80211.h` rev 1.137 (BSD-3-Clause). Copyright (c) 2001 Atsushi Onoe;
 //! Copyright (c) 2002, 2003 Sam Leffler, Errno Consulting.
 

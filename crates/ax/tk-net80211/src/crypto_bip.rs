@@ -1,6 +1,6 @@
 //! Software BIP management-frame integrity from OpenBSD net80211.
 //!
-//! Translated from `sys/net80211/ieee80211_crypto_bip.c` rev 1.17 (ISC) and
+//! Translated from `sys/net80211/ieee80211_crypto_bip.c` rev 1.10 (ISC) and
 //! `ieee80211.h` rev 1.137 (BSD-3-Clause). Copyright (c) 2008 Damien Bergamini
 //! <damien.bergamini@free.fr>.
 

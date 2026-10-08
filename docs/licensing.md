@@ -559,3 +559,6 @@ used by the kernel. No AES implementation source was copied into this crate.
 The OpenBSD BIP, WEP, and station TKIP translations in `tk-net80211` use the
 same retained `OpenBSD-ISC.txt` grant; the AP-only TKIP callbacks are omitted
 because this driver port is station-only.
+The shared key dispatch from OpenBSD `ieee80211_crypto.c` also carries its ISC
+grant in that same package license file; its source revision and translated
+function boundary are listed in `docs/upstream-provenance.md`.

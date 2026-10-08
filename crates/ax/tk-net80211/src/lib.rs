@@ -12,6 +12,7 @@ mod ba_rx;
 mod ba_tx;
 mod beacon;
 mod channel;
+mod crypto;
 mod crypto_bip;
 mod crypto_ccmp;
 mod crypto_tkip;
@@ -61,6 +62,10 @@ pub use channel::{
     NET_CHAN_X_160MHZ, NET_CHAN_X_HE, NET_FLAG_QOS, NetChannel, channel_ref_to_ieee,
     configure_ampdu_tx, find_rate, ieee_to_mhz, initialize_channels, mhz_to_ieee, next_scan_mode,
     select_mode,
+};
+pub use crypto::{
+    KeySelection, SoftwareCryptoError, SoftwareKey, cipher_key_length, decrypt_software,
+    delete_software_key, encrypt_software, select_rx_key, select_tx_key, set_software_key,
 };
 pub use crypto_bip::{BipError, BipKey, bip_decap, bip_encap};
 pub use crypto_ccmp::{CcmpError, CcmpKey, decrypt_ccmp, encrypt_ccmp};
