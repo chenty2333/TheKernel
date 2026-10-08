@@ -204,4 +204,8 @@ An additional bounded guest diagnostic showed the VirtIO-net route's vector 54
 (ACPI GSI 22) increment from absent to 1 across the ping attempt. Thus the
 route delivered at least one interrupt during the attempt, but the available
 counters do not identify whether it was TX completion or RX; the missing reply
-remains unresolved.
+remains unresolved. A separate identity-DMA control with the same modern-only
+VirtIO/`iommu_platform=on` QEMU topology also failed the ping while block
+enumeration passed. This means the current failure is not isolated to dynamic
+second-level mappings; modern VirtIO-net feature/receive behavior under this
+topology is also implicated, but the exact fault is still unknown.
