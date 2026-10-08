@@ -29,6 +29,19 @@ pub const SCAN_GEN_NOTIFY_ITER_COMPLETE: u16 = 1 << 2;
 pub const SCAN_GEN_ADAPTIVE_DWELL: u16 = 1 << 7;
 pub const SCAN_GEN_FORCE_PASSIVE: u16 = 1 << 11;
 pub const SCAN_MAX_CHANNELS: usize = 67;
+pub const SCAN_ACTIVE_DWELL: u8 = 10;
+pub const SCAN_PASSIVE_DWELL: u8 = 110;
+pub const SCAN_FRAGMENTED_LMAC_1: u16 = 1 << 3;
+pub const SCAN_FRAGMENTED_LMAC_2: u16 = 1 << 4;
+const ADWELL_MAX_BUDGET_FULL: u16 = 300;
+const ADWELL_MAX_BUDGET_DIRECTED: u16 = 100;
+const ADWELL_DEFAULT_SOCIAL: u8 = 10;
+const ADWELL_DEFAULT_2GHZ: u8 = 2;
+const ADWELL_DEFAULT_5GHZ: u8 = 8;
+const ADWELL_OVERRIDE_GO_FRIENDLY: u8 = 10;
+const ADWELL_OVERRIDE_SOCIAL: u8 = 2;
+const LMAC_LOW_BAND: usize = 0;
+const LMAC_HIGH_BAND: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UmacScanVersion {
@@ -54,8 +67,134 @@ pub struct UmacScanConfig<'a> {
 pub enum UmacScanError {
     TooManySsids,
     AllocationFailed,
+    InvalidParameterBuffer,
     Probe(ProbeRequestError),
     Command(CommandError),
+}
+
+/// Construct passive/pass-all/adaptive dwell policy for UMAC scan v2 flags.
+// upstream: if_iwx.c iwx_scan_umac_flags_v2()
+pub const fn scan_umac_flags_v2(desired_ssid_empty: bool) -> u16 {
+    SCAN_GEN_PASS_ALL
+        | SCAN_GEN_NOTIFY_ITER_COMPLETE
+        | SCAN_GEN_ADAPTIVE_DWELL
+        | if desired_ssid_empty {
+            SCAN_GEN_FORCE_PASSIVE
+        } else {
+            0
+        }
+}
+
+fn scan_umac_dwell_common(general: &mut [u8], background: bool) -> Result<(), UmacScanError> {
+    if general.len() < 36 {
+        return Err(UmacScanError::InvalidParameterBuffer);
+    }
+    general[4] = SCAN_ACTIVE_DWELL;
+    general[5] = SCAN_ACTIVE_DWELL;
+    general[6] = ADWELL_DEFAULT_2GHZ;
+    general[7] = ADWELL_DEFAULT_5GHZ;
+    general[8] = ADWELL_DEFAULT_SOCIAL;
+    put_u16(
+        general,
+        10,
+        if background {
+            ADWELL_MAX_BUDGET_DIRECTED
+        } else {
+            ADWELL_MAX_BUDGET_FULL
+        },
+    );
+    let max_out_of_time = if background { 120u32 } else { 0 };
+    for lmac in [LMAC_LOW_BAND, LMAC_HIGH_BAND] {
+        put_u32(general, 12 + lmac * 4, max_out_of_time);
+        put_u32(general, 20 + lmac * 4, max_out_of_time);
+        general[32 + lmac] = SCAN_PASSIVE_DWELL;
+    }
+    put_u32(general, 28, SCAN_PRIORITY_EXT_6);
+    Ok(())
+}
+
+/// Fill common dwell defaults for Scan General Params v10.
+// upstream: if_iwx.c iwx_scan_umac_dwell_v10()
+pub fn scan_umac_dwell_v10(general: &mut [u8], background: bool) -> Result<(), UmacScanError> {
+    scan_umac_dwell_common(general, background)
+}
+
+/// Fill common dwell defaults for Scan General Params v11.
+// upstream: if_iwx.c iwx_scan_umac_dwell_v11()
+pub fn scan_umac_dwell_v11(general: &mut [u8], background: bool) -> Result<(), UmacScanError> {
+    scan_umac_dwell_common(general, background)
+}
+
+/// Fill v10 flags, fragmented scan counts, and default start MAC id.
+// upstream: if_iwx.c iwx_scan_umac_fill_general_p_v10()
+pub fn scan_umac_fill_general_p_v10(
+    general: &mut [u8],
+    gen_flags: u16,
+    background: bool,
+) -> Result<(), UmacScanError> {
+    scan_umac_dwell_v10(general, background)?;
+    put_u16(general, 0, gen_flags);
+    general[3] = 0;
+    if gen_flags & SCAN_FRAGMENTED_LMAC_1 != 0 {
+        general[34] = 3;
+    }
+    if gen_flags & SCAN_FRAGMENTED_LMAC_2 != 0 {
+        general[35] = 3;
+    }
+    Ok(())
+}
+
+/// Fill v11 flags, fragmented scan counts, and default start MAC/link id.
+// upstream: if_iwx.c iwx_scan_umac_fill_general_p_v11()
+pub fn scan_umac_fill_general_p_v11(
+    general: &mut [u8],
+    gen_flags: u16,
+    background: bool,
+) -> Result<(), UmacScanError> {
+    scan_umac_dwell_v11(general, background)?;
+    put_u16(general, 0, gen_flags);
+    general[3] = 0;
+    if gen_flags & SCAN_FRAGMENTED_LMAC_1 != 0 {
+        general[34] = 3;
+    }
+    if gen_flags & SCAN_FRAGMENTED_LMAC_2 != 0 {
+        general[35] = 3;
+    }
+    Ok(())
+}
+
+/// Fill v6 channel parameters and copy its API v1-v4 channel array.
+// upstream: if_iwx.c iwx_scan_umac_fill_ch_p_v6()
+pub fn scan_umac_fill_ch_p_v6(
+    output: &mut [u8],
+    channels: &[ScanChannelConfig],
+) -> Result<(), UmacScanError> {
+    if output.len() < 4 + SCAN_MAX_CHANNELS * 8 || channels.len() > SCAN_MAX_CHANNELS {
+        return Err(UmacScanError::InvalidParameterBuffer);
+    }
+    output[0] = SCAN_ENABLE_CHANNEL_ORDER;
+    output[1] = channels.len() as u8;
+    output[2] = ADWELL_OVERRIDE_GO_FRIENDLY;
+    output[3] = ADWELL_OVERRIDE_SOCIAL;
+    write_v1_v4_channels(output, 4, channels);
+    Ok(())
+}
+
+/// Fill v7 channel parameters and copy its v5 channel array.
+// upstream: if_iwx.c iwx_scan_umac_fill_ch_p_v7()
+pub fn scan_umac_fill_ch_p_v7(
+    output: &mut [u8],
+    channels: &[ScanChannelConfigV5],
+) -> Result<(), UmacScanError> {
+    if output.len() < 4 + SCAN_MAX_CHANNELS * 8 || channels.len() > SCAN_MAX_CHANNELS {
+        return Err(UmacScanError::InvalidParameterBuffer);
+    }
+    output[0] = SCAN_ENABLE_CHANNEL_ORDER;
+    output[1] = channels.len() as u8;
+    output[2] = ADWELL_OVERRIDE_GO_FRIENDLY;
+    output[3] = ADWELL_OVERRIDE_SOCIAL;
+    write_v5_channels(output, 4, channels);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,37 +379,17 @@ pub fn build_umac_scan_request(
     put_u32(&mut payload, 4, SCAN_PRIORITY_EXT_6);
     let general = 8;
     let force_passive = config.desired_ssid.is_empty();
-    let gen_flags = SCAN_GEN_PASS_ALL
-        | SCAN_GEN_NOTIFY_ITER_COMPLETE
-        | SCAN_GEN_ADAPTIVE_DWELL
-        | if force_passive {
-            SCAN_GEN_FORCE_PASSIVE
-        } else {
-            0
-        };
-    put_u16(&mut payload, general, gen_flags);
-    payload[general + 4] = 10;
-    payload[general + 5] = 10;
-    payload[general + 6] = 2;
-    payload[general + 7] = 8;
-    payload[general + 8] = 10;
-    put_u16(
-        &mut payload,
-        general + 10,
-        if config.background { 100 } else { 300 },
-    );
-    let max_out_of_time = if config.background { 120u32 } else { 0 };
-    for lmac in 0..2 {
-        put_u32(&mut payload, general + 12 + lmac * 4, max_out_of_time);
-        put_u32(&mut payload, general + 20 + lmac * 4, max_out_of_time);
-        payload[general + 32 + lmac] = 110;
+    let gen_flags = scan_umac_flags_v2(force_passive);
+    let general_params = &mut payload[general..general + 36];
+    match config.version {
+        UmacScanVersion::V14 => {
+            scan_umac_fill_general_p_v10(general_params, gen_flags, config.background)?;
+        }
+        UmacScanVersion::V17 => {
+            scan_umac_fill_general_p_v11(general_params, gen_flags, config.background)?;
+        }
     }
-    put_u32(&mut payload, general + 28, SCAN_PRIORITY_EXT_6);
     let channel_params = general + 36;
-    payload[channel_params] = SCAN_ENABLE_CHANNEL_ORDER;
-    payload[channel_params + 1] = channels as u8;
-    payload[channel_params + 2] = 10;
-    payload[channel_params + 3] = 2;
     match config.version {
         UmacScanVersion::V14 => {
             let channel_configs = fill_umac_scan_channels(
@@ -280,7 +399,10 @@ pub fn build_umac_scan_request(
                 config.extended_channel_version,
                 config.channel_flags | u32::from(!config.desired_ssid.is_empty()),
             );
-            write_v1_v4_channels(&mut payload, channel_params + 4, &channel_configs);
+            scan_umac_fill_ch_p_v6(
+                &mut payload[channel_params..channel_params + 540],
+                &channel_configs,
+            )?;
         }
         UmacScanVersion::V17 => {
             let channel_configs = fill_umac_scan_channels_v5(
@@ -289,7 +411,10 @@ pub fn build_umac_scan_request(
                 config.firmware_channel_limit,
                 config.channel_flags | u32::from(!config.desired_ssid.is_empty()),
             );
-            write_v5_channels(&mut payload, channel_params + 4, &channel_configs);
+            scan_umac_fill_ch_p_v7(
+                &mut payload[channel_params..channel_params + 540],
+                &channel_configs,
+            )?;
         }
     }
     let periodic = channel_params + 540;
@@ -473,6 +598,66 @@ mod tests {
 
     use super::*;
     use crate::{CHAN_A, PROBE_REQUEST_WIRE_BYTES};
+
+    #[test]
+    fn scan_v10_v11_dwell_and_general_fields_match_source_helpers() {
+        assert_eq!(
+            scan_umac_flags_v2(false),
+            SCAN_GEN_PASS_ALL | SCAN_GEN_NOTIFY_ITER_COMPLETE | SCAN_GEN_ADAPTIVE_DWELL
+        );
+        assert_eq!(
+            scan_umac_flags_v2(true),
+            scan_umac_flags_v2(false) | SCAN_GEN_FORCE_PASSIVE
+        );
+        let flags = scan_umac_flags_v2(true) | SCAN_FRAGMENTED_LMAC_1;
+        let mut v10 = [0; 36];
+        scan_umac_fill_general_p_v10(&mut v10, flags, true).unwrap();
+        assert_eq!(u16::from_le_bytes([v10[0], v10[1]]), flags);
+        assert_eq!(v10[4..6], [SCAN_ACTIVE_DWELL; 2]);
+        assert_eq!(v10[6..9], [2, 8, 10]);
+        assert_eq!(u16::from_le_bytes([v10[10], v10[11]]), 100);
+        assert_eq!(u32::from_le_bytes(v10[12..16].try_into().unwrap()), 120);
+        assert_eq!(u32::from_le_bytes(v10[20..24].try_into().unwrap()), 120);
+        assert_eq!(u32::from_le_bytes(v10[28..32].try_into().unwrap()), 6);
+        assert_eq!(v10[32..34], [SCAN_PASSIVE_DWELL; 2]);
+        assert_eq!(v10[34], 3);
+        assert_eq!(v10[35], 0);
+
+        let mut v11 = [0; 36];
+        scan_umac_fill_general_p_v11(&mut v11, flags | SCAN_FRAGMENTED_LMAC_2, false).unwrap();
+        assert_eq!(v11[3], 0);
+        assert_eq!(u16::from_le_bytes([v11[10], v11[11]]), 300);
+        assert_eq!(u32::from_le_bytes(v11[12..16].try_into().unwrap()), 0);
+        assert_eq!(v11[34..36], [3, 3]);
+    }
+
+    #[test]
+    fn scan_v6_v7_channel_helpers_set_order_and_adaptive_overrides() {
+        let v6 = [ScanChannelConfig {
+            flags: 0x1234_5678,
+            channel_num: 6,
+            band: Some(SCAN_BAND_24GHZ),
+            iter_count: 1,
+            iter_interval: 2,
+        }];
+        let mut bytes = alloc::vec![0; 540];
+        scan_umac_fill_ch_p_v6(&mut bytes, &v6).unwrap();
+        assert_eq!(bytes[..4], [SCAN_ENABLE_CHANNEL_ORDER, 1, 10, 2]);
+        assert_eq!(&bytes[4..8], &0x1234_5678u32.to_le_bytes());
+        assert_eq!(bytes[8..12], [6, SCAN_BAND_24GHZ, 1, 2]);
+
+        let v7 = [ScanChannelConfigV5 {
+            flags: 0xaabb_ccdd,
+            channel_num: 36,
+            psd_20: SCAN_PASSIVE_MAX_PSD,
+            iter_count: 1,
+            iter_interval: 0,
+        }];
+        scan_umac_fill_ch_p_v7(&mut bytes, &v7).unwrap();
+        assert_eq!(bytes[..4], [SCAN_ENABLE_CHANNEL_ORDER, 1, 10, 2]);
+        assert_eq!(&bytes[4..8], &0xaabb_ccddu32.to_le_bytes());
+        assert_eq!(bytes[8..12], [36, SCAN_PASSIVE_MAX_PSD, 1, 0]);
+    }
 
     #[test]
     fn scan_abort_command_has_source_wide_id_and_zero_payload() {
