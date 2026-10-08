@@ -1086,7 +1086,6 @@ pub fn i965_load_lut_10p6<I: ColorIo>(
 // upstream: intel_color.c i965_load_luts()
 pub fn i965_load_luts<I: ColorIo>(
     io: &mut I,
-    dsb: bool,
     regs: GammaLutRegisters,
     state: &ColorState,
 ) {
@@ -1497,12 +1496,11 @@ pub fn vlv_load_luts<I: ColorIo>(
     state: &ColorState,
     regs: GammaLutRegisters,
     wgc_regs: [u32; 6],
-    dsb: bool,
 ) {
     if state.wgc_enable {
         vlv_load_wgc_csc(io, wgc_regs, &state.csc);
     }
-    i965_load_luts(io, dsb, regs, state);
+    i965_load_luts(io, regs, state);
 }
 
 // upstream: intel_color.c chv_cgm_degamma_ldw()
@@ -1556,7 +1554,6 @@ pub fn chv_load_luts<I: ColorIo>(
     degamma_base: u32,
     gamma_base: u32,
     mode_reg: u32,
-    dsb: bool,
 ) {
     if state.cgm_mode & CGM_PIPE_MODE_CSC != 0 {
         chv_load_cgm_csc(io, csc_regs, &state.csc);
@@ -1571,7 +1568,7 @@ pub fn chv_load_luts<I: ColorIo>(
             chv_load_cgm_gamma(io, gamma_base, &lut.entries);
         }
     } else {
-        i965_load_luts(io, dsb, regs, state);
+        i965_load_luts(io, regs, state);
     }
     io.dsb_write(mode_reg, state.cgm_mode);
 }
@@ -2700,7 +2697,6 @@ pub fn chv_get_config<I: ColorIo>(
     io: &mut I,
     state: &mut ColorState,
     cgm_mode_reg: u32,
-    regs: CommitRegisters,
     plane_control: u32,
     gamma_mask: u32,
     csc_mask: u32,
