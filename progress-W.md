@@ -6,4 +6,5 @@
 - RX metadata and command lifetimes: signal/noise processing committed (`b1cf7ef7`); bounded command response storage, ACK completion and generation reset committed (`5bd1bb53`); source-order legacy/HT rate selection committed (`dfe2819f`); Gen2/Gen3 frame TX command/TFD serialization now implemented.
 - Firmware path: ordered NIC/start interrupt phase committed (`1720012e`); PNVM contiguous/fragmented DMA staging and Gen3 scratch link now implemented.
 - APM/NIC readiness and interrupt topology: 10-tries preparation, hardware-ready handshake, software reset, APM init/stop, AX power gating, and single-vector MSI-X routing/snapshot implemented; see `bf466bea` and current segment.
+- Firmware start path: init command payloads (`fec20b0d`), APM/persistence/MSI-X setup (`bf466bea`, `3a04a94b`, `ae19f8f1`), ALIVE/Init MVM sequencing (`f351c60e`), and NIC config/RX startup functions just added.
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.

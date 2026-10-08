@@ -16,6 +16,7 @@ mod firmware;
 mod firmware_bundle;
 mod init_cmd;
 mod interrupts;
+mod nic;
 mod rate;
 mod registers;
 mod rings;
@@ -65,6 +66,7 @@ pub use interrupts::{
     enable_interrupts, enable_rfkill_interrupts, hardware_rfkill, initialize_msix_hardware,
     start_firmware,
 };
+pub use nic::{configure_nic, initialize_nic, initialize_rx};
 pub use rate::{
     MCS_TO_RATE_INDEX, RATES, Rate, TX_FLAG_COMMAND_RATE, TX_FLAG_HIGH_PRIORITY, TxRateError,
     TxRateInput, TxRateSelection, fw_rate_index_cck, fw_rate_index_ofdm, rate_value_to_index,
