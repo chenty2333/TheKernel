@@ -368,6 +368,7 @@ impl SdhciDmaRegion {
 }
 
 impl Drop for SdhciDmaRegion {
+    // upstream: sdhci.c sdhci_dma_free()
     fn drop(&mut self) {
         if let Some(release) = self.release {
             // SAFETY: host destruction follows DMA quiescence.

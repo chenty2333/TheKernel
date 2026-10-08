@@ -187,6 +187,7 @@ fn decode_slot_info(slot_info: u8) -> (usize, u8) {
     )
 }
 
+// upstream: sdhci.c sdhci_dma_alloc()
 fn allocate_dma_buffer() -> Option<SdhciDmaRegion> {
     let virtual_address = global_allocator()
         .alloc_pages(SDMA_BUFFER_PAGES, SDMA_BUFFER_BYTES, UsageKind::Dma)
@@ -291,6 +292,7 @@ impl SdhciIo for SdhciWindow {
     fn write32(&mut self, offset: usize, value: u32) {
         self.write(offset, value)
     }
+    // upstream: mmc.c mmc_ms_delay()
     fn delay_us(&mut self, micros: u32) {
         axhal::time::busy_wait(core::time::Duration::from_micros(u64::from(micros)));
     }
