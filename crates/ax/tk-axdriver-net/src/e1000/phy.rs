@@ -54,6 +54,18 @@ const IGP02E1000_AGC_LENGTH_SHIFT: u32 = 9;
 const IGP02E1000_AGC_LENGTH_MASK: u16 = 0x7f;
 const IGP02E1000_AGC_RANGE: u16 = 15;
 const IGP02E1000_PHY_AGC_REGS: [u32; 4] = [0x11b1, 0x12b1, 0x14b1, 0x18b1];
+const I210_PHY_ID: u32 = 0x0141_0c00;
+const M88E1543_PHY_ID: u32 = 0x0141_0ea0;
+const M88E1512_PHY_ID: u32 = 0x0141_0dd0;
+const M88E1340M_PHY_ID: u32 = 0x0141_0df0;
+const I347AT4_PHY_ID: u32 = 0x0141_0dc0;
+const M88E1112_PHY_ID: u32 = 0x0141_0c90;
+const I347AT4_PCDL: u32 = 0x10;
+const I347AT4_PCDC: u32 = 0x15;
+const I347AT4_PAGE_SELECT: u32 = 0x16;
+const I347AT4_PCDC_CABLE_LENGTH_UNIT: u16 = 0x0400;
+const M88E1112_VCT_DSP_DISTANCE: u32 = 0x1a;
+const GS40G_PAGE_SHIFT: u32 = 16;
 const IGP01E1000_PHY_PORT_STATUS: u32 = 0x11;
 const IGP01E1000_PHY_PCS_INIT_REG: u32 = 0x00b4;
 const IGP01E1000_PSSR_SPEED_MASK: u16 = 0xc000;
@@ -597,6 +609,68 @@ where
     diagnostics.min_cable_length = agc_sum.saturating_sub(IGP02E1000_AGC_RANGE);
     diagnostics.max_cable_length = agc_sum + IGP02E1000_AGC_RANGE;
     diagnostics.cable_length = (diagnostics.min_cable_length + diagnostics.max_cable_length) / 2;
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_get_cable_length_m88_gen2()
+pub fn get_cable_length_m88_gen2<R, W>(
+    mut read_phy: R,
+    mut write_phy: W,
+    phy_id: u32,
+    phy_address: u8,
+    diagnostics: &mut PhyDiagnostics,
+) -> DevResult
+where
+    R: FnMut(u32) -> DevResult<u16>,
+    W: FnMut(u32, u16) -> DevResult,
+{
+    const M88_TABLE: [u16; 7] = [0, 50, 80, 110, 140, 140, CABLE_LENGTH_UNDEFINED];
+    match phy_id {
+        I210_PHY_ID => {
+            let length_reg = (0x7 << GS40G_PAGE_SHIFT) | (I347AT4_PCDL + u32::from(phy_address));
+            let length = read_phy(length_reg)?;
+            let control = read_phy((0x7 << GS40G_PAGE_SHIFT) | I347AT4_PCDC)?;
+            let meters = if control & I347AT4_PCDC_CABLE_LENGTH_UNIT == 0 {
+                length / 100
+            } else {
+                length
+            };
+            diagnostics.min_cable_length = meters;
+            diagnostics.max_cable_length = meters;
+            diagnostics.cable_length = meters;
+        }
+        M88E1543_PHY_ID | M88E1512_PHY_ID | M88E1340M_PHY_ID | I347AT4_PHY_ID => {
+            let original_page = read_phy(I347AT4_PAGE_SELECT)?;
+            write_phy(I347AT4_PAGE_SELECT, 7)?;
+            let length = read_phy(I347AT4_PCDL + u32::from(phy_address))?;
+            let control = read_phy(I347AT4_PCDC)?;
+            let meters = if control & I347AT4_PCDC_CABLE_LENGTH_UNIT == 0 {
+                length / 100
+            } else {
+                length
+            };
+            diagnostics.min_cable_length = meters;
+            diagnostics.max_cable_length = meters;
+            diagnostics.cable_length = meters;
+            write_phy(I347AT4_PAGE_SELECT, original_page)?;
+        }
+        M88E1112_PHY_ID => {
+            let original_page = read_phy(I347AT4_PAGE_SELECT)?;
+            write_phy(I347AT4_PAGE_SELECT, 5)?;
+            let status = read_phy(M88E1112_VCT_DSP_DISTANCE)?;
+            let index = ((status & M88E1000_PSSR_CABLE_LENGTH) >> M88E1000_PSSR_CABLE_LENGTH_SHIFT)
+                as usize;
+            if index >= M88_TABLE.len() - 1 {
+                return Err(DevError::Io);
+            }
+            diagnostics.min_cable_length = M88_TABLE[index];
+            diagnostics.max_cable_length = M88_TABLE[index + 1];
+            diagnostics.cable_length =
+                (diagnostics.min_cable_length + diagnostics.max_cable_length) / 2;
+            write_phy(I347AT4_PAGE_SELECT, original_page)?;
+        }
+        _ => return Err(DevError::Unsupported),
+    }
     Ok(())
 }
 
@@ -1469,5 +1543,77 @@ mod tests {
             (33, 63, 48)
         );
         assert!(get_cable_length_igp_2(|_| Ok(0), &mut diagnostics).is_err());
+    }
+
+    #[test]
+    fn generic_m88_gen2_cable_length_supports_i210_meters_and_paged_legacy() {
+        let mut diagnostics = PhyDiagnostics::default();
+        let mut writes = alloc::vec::Vec::new();
+        get_cable_length_m88_gen2(
+            |register| {
+                Ok(
+                    if register == ((0x7 << GS40G_PAGE_SHIFT) | (I347AT4_PCDL + 1)) {
+                        250
+                    } else {
+                        0
+                    },
+                )
+            },
+            |register, value| {
+                writes.push((register, value));
+                Ok(())
+            },
+            I210_PHY_ID,
+            1,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            (diagnostics.min_cable_length, diagnostics.max_cable_length),
+            (2, 2)
+        );
+
+        writes.clear();
+        get_cable_length_m88_gen2(
+            |register| {
+                Ok(match register {
+                    I347AT4_PAGE_SELECT => 3,
+                    value if value == I347AT4_PCDL + 2 => 25,
+                    I347AT4_PCDC => I347AT4_PCDC_CABLE_LENGTH_UNIT,
+                    _ => 0,
+                })
+            },
+            |register, value| {
+                writes.push((register, value));
+                Ok(())
+            },
+            M88E1543_PHY_ID,
+            2,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(diagnostics.cable_length, 25);
+        assert_eq!(writes, [(I347AT4_PAGE_SELECT, 7), (I347AT4_PAGE_SELECT, 3)]);
+
+        writes.clear();
+        get_cable_length_m88_gen2(
+            |register| {
+                Ok(if register == I347AT4_PAGE_SELECT {
+                    4
+                } else {
+                    3 << M88E1000_PSSR_CABLE_LENGTH_SHIFT
+                })
+            },
+            |register, value| {
+                writes.push((register, value));
+                Ok(())
+            },
+            M88E1112_PHY_ID,
+            0,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(diagnostics.cable_length, 125);
+        assert_eq!(writes, [(I347AT4_PAGE_SELECT, 5), (I347AT4_PAGE_SELECT, 4)]);
     }
 }
