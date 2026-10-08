@@ -1,22 +1,25 @@
 # i915 shared DPLL manager source translation
 
-`crates/ax/tk-intel-display/src/intel_dpll_mgr_full.rs` translates Linux 7.2.3
+`crates/ax/tk-intel-display/src/intel_dpll_mgr_full.rs` and
+`intel_dpll_mgr_remainder.rs` together translate Linux 7.2.3
 `drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT, Copyright © 2006–2016
-Intel). Ctags reports 175 functions; 83 are translated in exact source order
-for display 12/13 plus the generic fallback functions i915 reuses when a
-platform has no shared manager. The remaining 92 are exclusively outside this
-port's display-version scope, grouped below; no debugfs/sysfs-only function is
-omitted. `IntelDpllHooks` carries atomic DRM, platform selection, MMIO, power,
-and indexed PHY operations as explicit backend dependencies.
+Intel). Ctags reports 175 functions: 83 are in the first module in exact
+source order for display 12/13 and generic i9xx fallback, and the remainder
+module adds the other 92 functions in its exact source order. The combined
+coverage has one marker for every ctags function, with no omitted functions.
+`IntelDpllHooks` and the generation-specific remainder hook traits carry atomic
+DRM, platform selection, MMIO, power, and indexed PHY operations as explicit
+backend dependencies.
 
-The module is exported and compiled by `cargo check -p tk-intel-display --lib`
-and `cargo test -p tk-intel-display --lib` (150 tests pass). The active N305
-HDMI planner now consumes the translated `icl_calc_wrpll()` and
-`icl_calc_dpll_state()` values. The broader `IntelDpllHooks` backend, shared
-resource reservation/enable/disable sequence in current modeset, Type-C/MG PHY
-runtime path, and DP/Thunderbolt output call sites are not yet connected.
+Both modules are exported and compiled by `cargo check -p tk-intel-display
+--lib`; the full crate suite previously passed 150 tests before the remainder
+module was added. The active N305 HDMI planner consumes the translated
+`icl_calc_wrpll()` and `icl_calc_dpll_state()` values. The separate
+kernel-side ADL-N shared-DPLL adapter is in progress; current atomic modeset
+does not yet use the translated reservation/enable/disable lifecycle. Type-C/MG
+PHY runtime paths and DP/Thunderbolt output call sites are also not connected.
 
-## Functions excluded by generation
+## Added remainder grouped by generation
 
 - BXT/Gen9 (14): `bxt_compare_hw_state`, `bxt_compute_dpll`,
   `bxt_ddi_dp_pll_dividers`, `bxt_ddi_dp_set_dpll_hw_state`,
@@ -58,6 +61,8 @@ runtime path, and DP/Thunderbolt output call sites are not yet connected.
   `xe3plpd_dump_hw_state`, `xe3plpd_pll_disable`, `xe3plpd_pll_enable`,
   `xe3plpd_pll_get_freq`, `xe3plpd_pll_get_hw_state`.
 
-The generic i9xx dump/compare fallback functions are included because DG2 uses
-them when no shared manager is installed; this is source reachability, not a
-claim that DG2 is a target platform.
+The generic i9xx dump/compare fallback functions in the first module are
+included because DG2 uses them when no shared manager is installed; this is
+source reachability, not a claim that DG2 is a target platform. All generation
+groups above are translated through explicit backend traits, not evidence that
+the kernel currently drives those generations.
