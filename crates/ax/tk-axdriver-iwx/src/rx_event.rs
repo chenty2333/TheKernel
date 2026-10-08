@@ -199,7 +199,7 @@ pub struct FirmwarePolicyState {
 }
 
 /// Apply the state changes and deferred work caused by non-packet firmware notifications.
-// upstream: if_iwx.c iwx_rx_pkt() notification handlers
+// upstream: if_iwx.c iwx_rx_pkt()
 pub fn apply_event_policy(
     event: DriverFirmwareEvent<'_>,
     state: &mut FirmwarePolicyState,
@@ -266,7 +266,7 @@ pub fn apply_event_policy(
 }
 
 /// Classify every event branch in iwx_rx_pkt(), including lifecycle notifications.
-// upstream: if_iwx.c iwx_rx_pkt() notification switch
+// upstream: if_iwx.c iwx_rx_pkt()
 pub fn decode_driver_event<'a>(packet: &'a RxPacket<'a>) -> DriverFirmwareEvent<'a> {
     let id = packet.command_id();
     match id {
@@ -301,7 +301,7 @@ pub fn decode_driver_event<'a>(packet: &'a RxPacket<'a>) -> DriverFirmwareEvent<
 }
 
 /// Classify the command switch entries that affect RX, firmware, scans or command waiters.
-// upstream: if_iwx.c iwx_rx_pkt() notification switch
+// upstream: if_iwx.c iwx_rx_pkt()
 pub fn decode_firmware_event<'a>(packet: &'a RxPacket<'a>) -> FirmwareEvent<'a> {
     match packet.command_id() {
         RX_PHY => FirmwareEvent::RxPhy(packet.payload),
@@ -321,7 +321,7 @@ pub fn decode_firmware_event<'a>(packet: &'a RxPacket<'a>) -> FirmwareEvent<'a> 
 }
 
 /// Store a known command reply and retire its descriptor if the event is a response.
-// upstream: if_iwx.c iwx_rx_pkt() response copy and iwx_cmd_done() dispatch
+// upstream: if_iwx.c iwx_rx_pkt()
 pub fn process_command_response(
     packet: &RxPacket<'_>,
     generation: u32,

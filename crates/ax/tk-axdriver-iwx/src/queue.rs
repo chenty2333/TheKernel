@@ -227,7 +227,7 @@ pub enum TxQueueError<E> {
 }
 
 /// Check the firmware's response queue and initial hardware write pointer.
-// upstream: if_iwx.c iwx_enable_txq() response validation
+// upstream: if_iwx.c iwx_enable_txq()
 pub fn validate_enable_response(
     response: &[u8],
     expected_queue: u8,

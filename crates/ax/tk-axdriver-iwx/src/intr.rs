@@ -165,7 +165,7 @@ pub struct LegacyInterruptWork {
 }
 
 /// Translate host/FH status into legacy ISR actions, preserving early-outs.
-// upstream: if_iwx.c iwx_intr() status/cause handling
+// upstream: if_iwx.c iwx_intr()
 pub fn plan_legacy_interrupt(
     mut host_status: u32,
     flow_status: u32,
@@ -306,7 +306,7 @@ pub fn plan_msix_interrupt(
 }
 
 /// Read/ack causes, apply work policy, and perform legacy periodic/mask writes.
-// upstream: if_iwx.c iwx_intr() register read/ack/restore sequence
+// upstream: if_iwx.c iwx_intr()
 pub fn service_legacy_interrupt<B: CsrAccess, R: DmaRegion>(
     registers: &mut IwxRegisters<B>,
     masks: &InterruptMasks,
@@ -347,7 +347,7 @@ pub fn service_legacy_interrupt<B: CsrAccess, R: DmaRegion>(
 }
 
 /// Read/ack cause registers and re-enable the automasked vector when nonfatal.
-// upstream: if_iwx.c iwx_intr_msix() register read/ack/automask sequence
+// upstream: if_iwx.c iwx_intr_msix()
 pub fn service_msix_interrupt<B: CsrAccess>(
     registers: &mut IwxRegisters<B>,
     masks: &InterruptMasks,

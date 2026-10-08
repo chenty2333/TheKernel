@@ -93,7 +93,7 @@ pub fn begin_system_statistics_clear(wait: &mut SystemStatisticsWait) {
 }
 
 /// Record SYSTEM_STATISTICS_END_NOTIF, waking the waiting clear operation.
-// upstream: if_iwx.c iwx_rx_pkt() SYSTEM_STATISTICS_END_NOTIF case
+// upstream: if_iwx.c iwx_rx_pkt()
 pub fn system_statistics_end_notification(wait: &mut SystemStatisticsWait) {
     wait.cleared = true;
 }

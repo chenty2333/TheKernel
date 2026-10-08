@@ -138,7 +138,6 @@ impl<B: CsrAccess> IwxRegisters<B> {
     }
 
     /// Publish a TX queue producer index to the hardware doorbell.
-    // upstream: if_iwx.c iwx_tx() / iwx_send_cmd() queue write-pointer publication
     pub fn kick_tx_queue(&mut self, queue_id: u16, write_index: usize) {
         self.bus.write32(
             HBUS_TARG_WRPTR,

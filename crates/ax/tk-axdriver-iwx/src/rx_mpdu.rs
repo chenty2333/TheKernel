@@ -186,7 +186,7 @@ pub enum RxMpduProcessError {
 }
 
 /// Apply the source RX_MPDU stages through hardware decrypt, CCMP replay, and duplicate filters.
-// upstream: if_iwx.c iwx_rx_mpdu_mq() / iwx_rx_hwdecrypt() / iwx_detect_duplicate()
+// upstream: if_iwx.c iwx_rx_mpdu_mq()
 pub fn process_rx_mpdu(
     payload: &[u8],
     family: DeviceFamily,

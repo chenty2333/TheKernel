@@ -67,7 +67,7 @@ pub enum NvmFetchError<E> {
 }
 
 /// Encode an NVM request, permitting it while hardware RF-kill is active.
-// upstream: if_iwx.c iwx_nvm_get() host command setup
+// upstream: if_iwx.c iwx_nvm_get()
 pub fn nvm_get_command(
     regulatory_v4: bool,
     slot: u8,

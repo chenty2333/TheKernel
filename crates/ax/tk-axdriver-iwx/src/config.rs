@@ -271,7 +271,7 @@ pub struct AttachProfile {
 }
 
 /// Initialize per-product hardware defaults, then apply the reverse-row runtime config override.
-// upstream: if_iwx.c iwx_attach() / iwx_find_device_cfg()
+// upstream: if_iwx.c iwx_find_device_cfg()
 pub fn attach_profile(runtime: RuntimeConfig) -> Result<AttachProfile, AttachProfileError> {
     let (family, integrated, ltr_delay, low_latency, latency, imr) = match runtime.device {
         0x2723 => (crate::DeviceFamily::Family22000, false, 0, false, 0, false),

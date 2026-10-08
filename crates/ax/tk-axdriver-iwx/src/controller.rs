@@ -119,7 +119,7 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
     }
 
     /// Start APM/NIC hardware and retain the active-low RF-kill state.
-    // upstream: if_iwx.c iwx_start_hw() / iwx_nic_init()
+    // upstream: if_iwx.c iwx_start_hw()
     pub fn start_hardware(&mut self, integrated_22000: bool) -> Result<bool, ApmError> {
         self.hardware_rfkill = crate::start_hardware(
             &mut self.registers,
@@ -159,6 +159,7 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
     }
 
     /// Apply firmware/stepping NIC setup before firmware DMA publication.
+    // upstream: if_iwx.c iwx_nic_init()
     // upstream: if_iwx.c iwx_nic_init()
     pub fn initialize_nic(
         &mut self,
@@ -220,7 +221,7 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
     }
 
     /// Drain completed FH RX buffers, retain command replies, and dispatch firmware/data packets.
-    // upstream: if_iwx.c iwx_notif_intr() / iwx_rx_pkt()
+    // upstream: if_iwx.c iwx_notif_intr()
     pub fn process_rx_notifications<E>(
         &mut self,
         mut dispatch: impl FnMut(&crate::RxPacket<'_>, crate::RxMbufPlan) -> Result<bool, E>,
@@ -483,7 +484,7 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
     }
 
     /// Decode an RX_MPDU descriptor and apply the source decrypt/replay/duplicate gates.
-    // upstream: if_iwx.c iwx_rx_mpdu_mq() / iwx_rx_hwdecrypt() / iwx_detect_duplicate()
+    // upstream: if_iwx.c iwx_rx_mpdu_mq()
     pub fn process_rx_mpdu(
         &mut self,
         payload: &[u8],
@@ -501,7 +502,7 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
     }
 
     /// Apply BAID/TID matching, duplicate/old-sequence decisions, buffering and NSSN release.
-    // upstream: if_iwx.c iwx_rx_reorder() / iwx_release_frames()
+    // upstream: if_iwx.c iwx_rx_reorder()
     pub fn reorder_rx_mpdu(
         &mut self,
         frame: ProcessedRxMpdu,
@@ -643,7 +644,7 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
     }
 
     /// Stage the SKU-matched platform NVM and ring the PNVM doorbell until completion.
-    // upstream: if_iwx.c iwx_load_pnvm() / iwx_ctxt_info_gen3_set_pnvm()
+    // upstream: if_iwx.c iwx_load_pnvm()
     pub fn load_pnvm<E>(
         &mut self,
         firmware: &FirmwareImage,

@@ -27,7 +27,7 @@ pub enum AliveError {
 }
 
 /// Decode ALIVE v4/v5/v6/v7 payloads, preserving version-specific size checks.
-// upstream: if_iwx.c iwx_rx_pkt() IWX_ALIVE case
+// upstream: if_iwx.c iwx_rx_pkt()
 pub fn parse_alive(notification_version: u8, payload: &[u8]) -> Result<AliveInfo, AliveError> {
     let (required, has_sku) = match notification_version {
         6 | 7 => (ALIVE_V6_BYTES, true),

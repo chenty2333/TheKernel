@@ -604,7 +604,7 @@ fn set_default_calibration(image: &mut FirmwareImage, data: &[u8]) -> Result<(),
     Ok(())
 }
 
-// upstream: if_iwx.c iwx_read_firmware() API_CHANGES_SET and ENABLED_CAPABILITIES cases
+// upstream: if_iwx.c iwx_read_firmware()
 fn set_bitmap<const N: usize>(bitmap: &mut [u32; N], data: &[u8]) -> Result<(), FirmwareError> {
     if data.len() != 8 {
         return Err(FirmwareError::InvalidCapabilities);

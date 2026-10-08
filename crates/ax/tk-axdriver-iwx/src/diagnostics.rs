@@ -20,7 +20,7 @@ pub enum ErrorLogError {
 }
 
 /// Select the source address floor for LMAC/UMAC error-table reads.
-// upstream: if_iwx.c iwx_nic_error() / iwx_nic_umac_error()
+// upstream: if_iwx.c iwx_nic_error()
 pub fn validate_error_table_address(base: u32, bz_or_newer: bool) -> Result<u32, ErrorLogError> {
     let minimum = if bz_or_newer {
         BZ_ERROR_TABLE_MIN

@@ -53,7 +53,7 @@ impl RxPacket<'_> {
 }
 
 /// Validate FH length/invalid marker and decode the OpenBSD command header.
-// upstream: if_iwx.c iwx_rx_pkt_valid() and initial iwx_rx_pkt() framing
+// upstream: if_iwx.c iwx_rx_pkt_valid()
 pub fn parse_rx_packet(
     buffer: &[u8],
     narrow_compatibility: bool,
