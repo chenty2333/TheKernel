@@ -527,7 +527,7 @@ mod tests {
 
     #[cfg(feature = "irq")]
     #[test]
-    fn shared_dispatcher_registration_keeps_one_owner() {
+    fn shared_dispatcher_registration_accepts_bounded_multiple_owners() {
         fn first(_: usize) -> bool {
             true
         }
@@ -536,7 +536,8 @@ mod tests {
         }
         assert!(super::register_shared_dispatcher(first));
         assert!(super::register_shared_dispatcher(first));
-        assert!(!super::register_shared_dispatcher(second));
+        assert!(super::register_shared_dispatcher(second));
+        assert!(super::register_shared_dispatcher(second));
     }
 
     #[test]
@@ -622,17 +623,30 @@ mod irq_impl {
 
     static IRQ_HANDLER_TABLE: HandlerTable<MAX_IRQ_COUNT> = HandlerTable::new();
 
-    static SHARED_DISPATCHER: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(0);
+    /// Bounded no-allocation registry: block, virtio, and other PCI INTx
+    /// consumers each need an acknowledgment pass before direct IRQ handlers.
+    const SHARED_DISPATCHER_COUNT: usize = 16;
+    static SHARED_DISPATCHERS: [core::sync::atomic::AtomicUsize; SHARED_DISPATCHER_COUNT] =
+        [const { core::sync::atomic::AtomicUsize::new(0) }; SHARED_DISPATCHER_COUNT];
 
     /// Install the shared-source acknowledgement pass, before direct handlers.
     pub fn register_shared_dispatcher(dispatcher: fn(usize) -> bool) -> bool {
         use core::sync::atomic::Ordering;
         let address = dispatcher as usize;
-        match SHARED_DISPATCHER.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => true,
-            Err(existing) => existing == address,
+        for slot in &SHARED_DISPATCHERS {
+            let existing = slot.load(Ordering::Acquire);
+            if existing == address {
+                return true;
+            }
+            if existing == 0 {
+                match slot.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => return true,
+                    Err(actual) if actual == address => return true,
+                    Err(_) => continue,
+                }
+            }
         }
+        false
     }
 
     /// Reserve a message vector outside every implemented IOAPIC pin and
@@ -690,15 +704,16 @@ mod irq_impl {
         /// also acknowledges the interrupt controller after handling.
         fn handle(vector: usize) -> Option<usize> {
             trace!("IRQ {}", vector);
-            let address = SHARED_DISPATCHER.load(core::sync::atomic::Ordering::Acquire);
-            let shared_handled = if address != 0 {
-                // SAFETY: registration publishes only an immutable function pointer.
-                let dispatcher =
-                    unsafe { core::mem::transmute::<usize, fn(usize) -> bool>(address) };
-                dispatcher(vector)
-            } else {
-                false
-            };
+            let mut shared_handled = false;
+            for slot in &SHARED_DISPATCHERS {
+                let address = slot.load(core::sync::atomic::Ordering::Acquire);
+                if address != 0 {
+                    // SAFETY: registration publishes only an immutable function pointer.
+                    let dispatcher =
+                        unsafe { core::mem::transmute::<usize, fn(usize) -> bool>(address) };
+                    shared_handled |= dispatcher(vector);
+                }
+            }
             // Do not short-circuit: direct handlers consume the ISR state latched
             // by the shared pass. All sources must be acknowledged before EOI.
             let direct_handled = IRQ_HANDLER_TABLE.handle(vector);
