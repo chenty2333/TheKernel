@@ -156,14 +156,15 @@ pub use queue::{
     queue_cb_size, scheduler_queue_command, validate_enable_response,
 };
 pub use rate::{
-    HtRateSet, MCS_TO_RATE_INDEX, RATES, Rate, TLC_CHAIN_A, TLC_CHAIN_B, TLC_CONFIG_COMMAND,
-    TLC_CONFIG_GROUP, TLC_FLAG_STBC, TLC_MODE_HT, TLC_MODE_NON_HT, TLC_MODE_VHT, TLC_SGI_20,
-    TLC_SGI_40, TLC_SGI_80, TLC_SGI_160, TLC_WIDTH_20, TLC_WIDTH_40, TLC_WIDTH_80, TLC_WIDTH_160,
+    HtRateSet, MCS_TO_RATE_INDEX, PeerTxRateState, RATES, Rate, TLC_CHAIN_A, TLC_CHAIN_B,
+    TLC_CONFIG_COMMAND, TLC_CONFIG_GROUP, TLC_FLAG_STBC, TLC_MODE_HT, TLC_MODE_NON_HT,
+    TLC_MODE_VHT, TLC_RATE_STATION_ID, TLC_RATE_UPDATE_FLAG, TLC_SGI_20, TLC_SGI_40, TLC_SGI_80,
+    TLC_SGI_160, TLC_UPDATE_NOTIFICATION, TLC_WIDTH_20, TLC_WIDTH_40, TLC_WIDTH_80, TLC_WIDTH_160,
     TX_FLAG_COMMAND_RATE, TX_FLAG_HIGH_PRIORITY, TlRateConfig, TlRateConfigError, TxRateError,
-    TxRateInput, TxRateSelection, ack_rate_masks, fw_rate_index_cck, fw_rate_index_ofdm,
-    init_rate_command, legacy_rate_index, rate_index_to_peer_rate, rate_value_to_index,
-    rateset_11g_index, rateset_ht_bitmap, rateset_vht_bitmap, select_tx_rate, tlc_rate_command_v3,
-    tlc_rate_command_v4,
+    TxRateInput, TxRateSelection, ack_rate_masks, apply_tlc_rate_update, fw_rate_index_cck,
+    fw_rate_index_ofdm, init_rate_command, legacy_rate_index, rate_index_to_peer_rate,
+    rate_value_to_index, rateset_11g_index, rateset_ht_bitmap, rateset_vht_bitmap, select_tx_rate,
+    tlc_rate_command_v3, tlc_rate_command_v4,
 };
 pub use registers::{CsrAccess, DeviceFamily, IoBarrier, IwxRegisters, RegisterError};
 pub use rings::{

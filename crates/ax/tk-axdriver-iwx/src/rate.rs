@@ -332,6 +332,78 @@ pub fn init_rate_command(
     }
 }
 
+pub const TLC_RATE_UPDATE_FLAG: u32 = 1;
+pub const TLC_UPDATE_NOTIFICATION: u8 = 0xf7;
+pub const TLC_RATE_STATION_ID: u8 = 0;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerTxRateState {
+    pub tx_rate_index: u8,
+    pub tx_mcs: u8,
+    pub vht_spatial_streams: u8,
+}
+
+/// Apply a TLC initial-rate notification to the associated peer's TX-rate state.
+// upstream: if_iwx.c iwx_rs_update()
+pub fn apply_tlc_rate_update(
+    current: &mut PeerTxRateState,
+    peer_rates: &[u8],
+    station_id: u8,
+    flags: u32,
+    rate_n_flags: u32,
+    notification_version: u8,
+) -> bool {
+    if station_id != TLC_RATE_STATION_ID || flags & TLC_RATE_UPDATE_FLAG == 0 {
+        return false;
+    }
+    if notification_version != 99 && notification_version >= 3 {
+        match rate_n_flags & (0x7 << 8) {
+            0x300 => {
+                current.tx_mcs = (rate_n_flags & 0xf) as u8;
+                current.vht_spatial_streams = (((rate_n_flags >> 4) & 1) + 1) as u8;
+                return true;
+            }
+            0x200 => {
+                current.tx_mcs = (((rate_n_flags & (1 << 4)) >> 1) | (rate_n_flags & 0x7)) as u8;
+                return true;
+            }
+            _ => {}
+        }
+    } else {
+        if rate_n_flags & (1 << 26) != 0 {
+            current.tx_mcs = (rate_n_flags & 0xf) as u8;
+            current.vht_spatial_streams = (((rate_n_flags >> 4) & 0x3) + 1) as u8;
+            return true;
+        }
+        if rate_n_flags & (1 << 8) != 0 {
+            current.tx_mcs = (rate_n_flags & 0x1f) as u8;
+            return true;
+        }
+    }
+    let rate_value = if notification_version != 99 && notification_version >= 3 {
+        let rate_index = (rate_n_flags & 0x7) as usize;
+        let rates: &[u8] = if rate_n_flags & (1 << 8) != 0 {
+            &[12, 18, 24, 36, 48, 72, 96, 108]
+        } else {
+            &[2, 4, 11, 22]
+        };
+        rates.get(rate_index).copied().unwrap_or(0)
+    } else {
+        let plcp = (rate_n_flags & 0xff) as u8;
+        RATES
+            .iter()
+            .find(|rate| rate.legacy_plcp == Some(plcp))
+            .map_or(0, |rate| rate.value as u8)
+    };
+    if rate_value != 0 {
+        if let Some(index) = peer_rates.iter().position(|peer| peer & 0x7f == rate_value) {
+            current.tx_rate_index = index as u8;
+            return true;
+        }
+    }
+    false
+}
+
 fn sgi_bitmap(config: TlRateConfig<'_>) -> u8 {
     (if config.ht && config.ht_sgi20 {
         TLC_SGI_20
@@ -675,6 +747,53 @@ mod tests {
         assert_eq!(u16::from_le_bytes(p4[18..20].try_into().unwrap()), 0x03ff);
         assert_eq!(u16::from_le_bytes(p4[24..26].try_into().unwrap()), 3895);
         assert_eq!(init_rate_command(config, 99, 1).unwrap().bytes, v3.bytes);
+    }
+
+    #[test]
+    fn tlc_notifications_decode_versioned_mcs_and_legacy_rate_fields() {
+        let mut peer = PeerTxRateState::default();
+        assert!(!apply_tlc_rate_update(&mut peer, &[12], 1, 1, 0x123, 3));
+        assert!(!apply_tlc_rate_update(&mut peer, &[12], 0, 0, 0x123, 3));
+        assert!(apply_tlc_rate_update(
+            &mut peer,
+            &[12],
+            0,
+            1,
+            (3 << 8) | (1 << 4) | 9,
+            3
+        ));
+        assert_eq!(peer.tx_mcs, 9);
+        assert_eq!(peer.vht_spatial_streams, 2);
+        assert!(apply_tlc_rate_update(
+            &mut peer,
+            &[2, 12, 24],
+            0,
+            1,
+            (2 << 8) | 0x13,
+            3
+        ));
+        assert_eq!(peer.tx_mcs, 11);
+        assert!(apply_tlc_rate_update(
+            &mut peer,
+            &[2, 4, 12, 24],
+            0,
+            1,
+            (1 << 8) | 2,
+            3
+        ));
+        assert_eq!(peer.tx_rate_index, 3);
+        assert!(apply_tlc_rate_update(&mut peer, &[2, 4, 12], 0, 1, 13, 99));
+        assert_eq!(peer.tx_rate_index, 2);
+        assert!(apply_tlc_rate_update(
+            &mut peer,
+            &[2, 4, 12],
+            0,
+            1,
+            (1 << 26) | (1 << 4) | 7,
+            2
+        ));
+        assert_eq!(peer.tx_mcs, 7);
+        assert_eq!(peer.vht_spatial_streams, 2);
     }
 
     #[test]

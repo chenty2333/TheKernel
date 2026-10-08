@@ -49,3 +49,7 @@ The station TLC rate command now serializes v3/v4 wire layouts separately,
 including legacy basic-rate indexing, HT/VHT MCS maps, width, antenna chains,
 STBC and short-guard-interval capabilities. The surrounding 802.11 peer
 capability discovery remains a net80211 input.
+
+Rate-update notifications decode legacy/HT/VHT initial-rate formats by the
+firmware notification version and update peer MCS, stream count, or legacy
+rate index only for the driver's station ID and rate-update event.
