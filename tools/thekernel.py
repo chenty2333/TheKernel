@@ -273,6 +273,7 @@ def kernel_features(artifacts: Artifacts) -> str:
     # virtualized machines.
     features = [PRODUCT_FEATURE]
     features.append("nvme")
+    features.append("ahci")
     features.append("intel-hda")
     features.append("watchdog-itco")
     if variant.usb_dbc:
