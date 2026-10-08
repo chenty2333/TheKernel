@@ -28,6 +28,12 @@ backend revalidates held source-mapped power requests, D0,
 DC-state, and refclk on every hook/access; logical DPLL power cookies never
 manufacture `PowerState` reference counts or change wells.
 
+The source manager's all-PLL readout is intentionally not called with this
+single-port pin: it enumerates both DKL PLLs, while the fastboot pin proves
+only the selected port's DDI-I/O/AUX domains. Admission therefore asks for
+only the selected TC1/TC2 `get_hw_state`; enumerating another port requires a
+separately held and verified power context, not an assumed inactive route.
+
 This adapter is compiled by `cargo check -p tk-kernel --tests --features
 'intel-hda nvme watchdog-itco bpf'`; that command also type-checks its unit
 tests but does not execute them. The focused test binary compiles but is not
