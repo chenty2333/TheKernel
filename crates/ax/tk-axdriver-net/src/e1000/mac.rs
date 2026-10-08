@@ -22,6 +22,7 @@ const PCIE_LINK_STATUS: u32 = 0x12;
 const PCIE_LINK_SPEED_MASK: u16 = 0x000f;
 const PCIE_LINK_WIDTH_MASK: u16 = 0x03f0;
 const PCIE_LINK_WIDTH_SHIFT: u32 = 4;
+const AUTO_READ_DONE_TIMEOUT_MS: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum E1000BusType {
@@ -151,6 +152,38 @@ pub fn config_collision_dist_generic<I: E1000RegisterIo>(io: &mut I) -> DevResul
     io.write_register(E1000_TCTL, control)?;
     let _ = io.read_register(E1000_STATUS)?;
     Ok(())
+}
+
+/// upstream: e1000_mac.c e1000_get_speed_and_duplex_copper_generic()
+pub fn get_speed_and_duplex_copper_generic<I: E1000RegisterIo>(
+    io: &mut I,
+) -> DevResult<(u16, u16)> {
+    let status = io.read_register(E1000_STATUS)?;
+    let speed = if status & E1000_STATUS_SPEED_1000 != 0 {
+        1000
+    } else if status & E1000_STATUS_SPEED_100 != 0 {
+        100
+    } else {
+        10
+    };
+    let duplex = if status & E1000_STATUS_FD != 0 { 2 } else { 1 };
+    Ok((speed, duplex))
+}
+
+/// upstream: e1000_mac.c e1000_get_speed_and_duplex_fiber_serdes_generic()
+pub const fn get_speed_and_duplex_fiber_serdes_generic() -> (u16, u16) {
+    (1000, 2)
+}
+
+/// upstream: e1000_mac.c e1000_get_auto_rd_done_generic()
+pub fn get_auto_rd_done_generic<I: E1000RegisterIo>(io: &mut I) -> DevResult {
+    for _ in 0..AUTO_READ_DONE_TIMEOUT_MS {
+        if io.read_register(E1000_EECD)? & E1000_EECD_AUTO_RD != 0 {
+            return Ok(());
+        }
+        io.delay_us(1000);
+    }
+    Err(DevError::Io)
 }
 
 /// upstream: e1000_mac.c e1000_null_ops_generic()
@@ -310,11 +343,15 @@ mod tests {
     struct Registers {
         writes: alloc::vec::Vec<(u32, u32)>,
         status: u32,
+        eecd: u32,
+        delays: usize,
     }
     impl E1000RegisterIo for Registers {
         fn read_register(&mut self, register: u32) -> DevResult<u32> {
             Ok(if register == E1000_STATUS {
                 self.status
+            } else if register == E1000_EECD {
+                self.eecd
             } else {
                 0
             })
@@ -323,7 +360,9 @@ mod tests {
             self.writes.push((register, value));
             Ok(())
         }
-        fn delay_us(&mut self, _: u32) {}
+        fn delay_us(&mut self, _: u32) {
+            self.delays += 1;
+        }
         fn invalid_tail_write(&mut self, _: &'static str) {}
     }
 
@@ -422,6 +461,24 @@ mod tests {
             io.writes,
             [(E1000_TCTL, E1000_COLLISION_DISTANCE << E1000_COLD_SHIFT)]
         );
+    }
+
+    #[test]
+    fn generic_link_speed_and_autoread_match_source_defaults_and_bounds() {
+        let mut io = Registers {
+            status: E1000_STATUS_SPEED_100 | E1000_STATUS_FD,
+            eecd: E1000_EECD_AUTO_RD,
+            ..Registers::default()
+        };
+        assert_eq!(
+            get_speed_and_duplex_copper_generic(&mut io).unwrap(),
+            (100, 2)
+        );
+        assert_eq!(get_speed_and_duplex_fiber_serdes_generic(), (1000, 2));
+        assert!(get_auto_rd_done_generic(&mut io).is_ok());
+        let mut not_ready = Registers::default();
+        assert!(get_auto_rd_done_generic(&mut not_ready).is_err());
+        assert_eq!(not_ready.delays, AUTO_READ_DONE_TIMEOUT_MS);
     }
 
     #[test]
