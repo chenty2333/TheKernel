@@ -1027,3 +1027,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): DTIM-dependent power management command serialization, U-APSD timeout, keep-alive and beacon-abort order translated in `tk-axdriver-iwx/src/power.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): beacon filtering defaults, disable behavior and beacon-abort state update translated in `tk-axdriver-iwx/src/power.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): ADD_STA station initialization/update payload fields and status validation translated in `tk-axdriver-iwx/src/station.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): REMOVE_STA command and station removal ordering across drain/flush, queue removal, BA cleanup and DELBA callbacks translated in `tk-axdriver-iwx/src/station.rs`.

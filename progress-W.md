@@ -36,4 +36,5 @@
 - `iwx_set_pslevel()` now builds the source DTIM/level power-table pair, U-APSD fields, keep-alive and beacon-abort policy in command order (`e9b21037`).
 - Beacon-filter defaults/disable payloads and enable/disable/beacon-abort state transitions are translated (`03415339`).
 - `iwx_add_sta_cmd()` now builds source ADD_STA station-type, address, HT/VHT, MIMO, aggregation-density, maximum aggregate-size, and U-APSD fields (`c85c910a`).
+- REMOVE_STA and ordered station removal/queue disable/BA teardown state cleanup are translated (pending commit).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.

@@ -22,6 +22,8 @@ pub const STA_ID_LINK: u8 = 0;
 pub const STA_ID_MONITOR: u8 = 2;
 pub const STA_TYPE_LINK: u8 = 0;
 pub const STA_TYPE_GENERAL_PURPOSE: u8 = 1;
+pub const REMOVE_STA_COMMAND: u32 = 0x19;
+pub const FW_COMMAND_VERSION_UNKNOWN: u8 = 99;
 pub const STA_FLAG_MAX_AGG_SIZE_SHIFT: u32 = 19;
 pub const STA_FLAG_MAX_AGG_SIZE_MASK: u32 = 0xf << STA_FLAG_MAX_AGG_SIZE_SHIFT;
 pub const STA_FLAG_AGG_DENSITY_SHIFT: u32 = 23;
@@ -159,6 +161,113 @@ pub fn validate_station_add_status(response: &[u8]) -> Result<(), StationError> 
         Ok(())
     } else {
         Err(StationError::InvalidResponse)
+    }
+}
+
+/// Serialize the four-byte legacy REMOVE_STA command.
+// upstream: if_iwx.c iwx_rm_sta_cmd()
+pub fn remove_station_command(
+    monitor_mode: bool,
+    slot: u8,
+    queue: u8,
+) -> Result<EncodedCommand, CommandError> {
+    let mut payload = [0u8; 4];
+    payload[0] = if monitor_mode {
+        STA_ID_MONITOR
+    } else {
+        STA_ID_LINK
+    };
+    let command = HostCommand {
+        id: REMOVE_STA_COMMAND,
+        flags: 0,
+        response_capacity: 0,
+        parts: &[&payload],
+    };
+    EncodedCommand::encode(&command, slot, queue)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StationQueue {
+    pub queue_id: u16,
+    pub tid: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StationRemoveState {
+    pub active: bool,
+    pub mld: bool,
+    pub qenable_mask: u32,
+    pub rx_ba_sessions: u8,
+    pub rx_ba_start_mask: u16,
+    pub rx_ba_stop_mask: u16,
+    pub tx_ba_start_mask: u16,
+    pub tx_ba_stop_mask: u16,
+    pub agg_queue_by_tid: [u8; 8],
+    pub agreed_tx_ba_mask: u16,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum StationRemoveError<E> {
+    Inactive,
+    Flush(E),
+    DisableManagement(E),
+    DisableAggregation(E),
+    Remove(E),
+}
+
+impl StationRemoveState {
+    /// Flush traffic, remove DQA queues when required, remove station/link, then
+    /// reset BA and queue state and issue DELBA callbacks.
+    // upstream: if_iwx.c iwx_rm_sta()
+    pub fn remove<E>(
+        &mut self,
+        command_version: u8,
+        first_aggregate_queue: u16,
+        queues: &[StationQueue],
+        mut flush: impl FnMut() -> Result<(), E>,
+        mut disable_management: impl FnMut() -> Result<(), E>,
+        mut disable_queue: impl FnMut(u16, u8) -> Result<(), E>,
+        mut remove_firmware_station: impl FnMut(bool) -> Result<(), E>,
+        mut send_delba: impl FnMut(u8),
+    ) -> Result<(), StationRemoveError<E>> {
+        if !self.active {
+            return Err(StationRemoveError::Inactive);
+        }
+        flush().map_err(StationRemoveError::Flush)?;
+        if !self.mld && command_version != 0 && command_version != FW_COMMAND_VERSION_UNKNOWN {
+            disable_management().map_err(StationRemoveError::DisableManagement)?;
+            for queue in queues {
+                let qid = usize::from(queue.queue_id);
+                if queue.queue_id < first_aggregate_queue || qid >= 32 {
+                    continue;
+                }
+                if self.qenable_mask & (1 << qid) != 0 {
+                    disable_queue(queue.queue_id, queue.tid)
+                        .map_err(StationRemoveError::DisableAggregation)?;
+                }
+            }
+        }
+        remove_firmware_station(self.mld).map_err(StationRemoveError::Remove)?;
+
+        self.active = false;
+        self.rx_ba_sessions = 0;
+        self.rx_ba_start_mask = 0;
+        self.rx_ba_stop_mask = 0;
+        self.tx_ba_start_mask = 0;
+        self.tx_ba_stop_mask = 0;
+        self.agg_queue_by_tid = [0; 8];
+        for queue in queues {
+            if queue.queue_id < 32 {
+                self.qenable_mask &= !(1 << queue.queue_id);
+            }
+        }
+        for tid in 0..8 {
+            if self.agreed_tx_ba_mask & (1 << tid) != 0 {
+                send_delba(tid as u8);
+            }
+        }
+        self.agreed_tx_ba_mask = 0;
+        Ok(())
     }
 }
 
@@ -434,5 +543,68 @@ mod tests {
             validate_station_add_status(&2u32.to_le_bytes()),
             Err(StationError::InvalidResponse)
         );
+    }
+
+    #[test]
+    fn remove_station_orders_flush_queue_removal_cleanup_and_delba() {
+        use core::cell::RefCell;
+        let mut state = StationRemoveState {
+            active: true,
+            mld: false,
+            qenable_mask: (1 << 1) | (1 << 2) | (1 << 3),
+            rx_ba_sessions: 2,
+            rx_ba_start_mask: 1,
+            rx_ba_stop_mask: 2,
+            tx_ba_start_mask: 4,
+            tx_ba_stop_mask: 8,
+            agg_queue_by_tid: [2, 3, 0, 0, 0, 0, 0, 0],
+            agreed_tx_ba_mask: 1 | (1 << 3),
+        };
+        let queues = [
+            StationQueue {
+                queue_id: 1,
+                tid: 0,
+            },
+            StationQueue {
+                queue_id: 2,
+                tid: 0,
+            },
+            StationQueue {
+                queue_id: 3,
+                tid: 1,
+            },
+        ];
+        let events = RefCell::new(Vec::new());
+        state
+            .remove(
+                3,
+                2,
+                &queues,
+                || {
+                    events.borrow_mut().push(0);
+                    Ok::<_, ()>(())
+                },
+                || {
+                    events.borrow_mut().push(1);
+                    Ok(())
+                },
+                |qid, tid| {
+                    events.borrow_mut().push(10 + qid as u8 + tid);
+                    Ok(())
+                },
+                |mld| {
+                    assert!(!mld);
+                    events.borrow_mut().push(2);
+                    Ok(())
+                },
+                |tid| events.borrow_mut().push(20 + tid),
+            )
+            .unwrap();
+        assert_eq!(*events.borrow(), [0, 1, 12, 14, 2, 20, 23]);
+        assert!(!state.active);
+        assert_eq!(state.qenable_mask, 0);
+        assert_eq!(state.rx_ba_sessions, 0);
+        assert_eq!(state.agg_queue_by_tid, [0; 8]);
+        assert_eq!(state.agreed_tx_ba_mask, 0);
     }
 }

@@ -171,14 +171,15 @@ pub use scan::{
     scan_abort_command,
 };
 pub use station::{
-    ADD_STA_COMMAND, FlushedQueue, STA_FLAG_AGG_DENSITY_MASK, STA_FLAG_AGG_DENSITY_SHIFT,
-    STA_FLAG_FAT_MASK, STA_FLAG_FAT_SHIFT, STA_FLAG_MAX_AGG_SIZE_MASK, STA_FLAG_MAX_AGG_SIZE_SHIFT,
-    STA_FLAG_MIMO_MASK, STA_FLAG_MIMO_SHIFT, STA_FLG_DRAIN_FLOW, STA_ID_LINK, STA_ID_MONITOR,
-    STA_MODE_MODIFY, STA_MODIFY_ADD_BA_TID, STA_MODIFY_UAPSD_ACS, STA_TYPE_GENERAL_PURPOSE,
-    STA_TYPE_LINK, StationAddConfig, StationError, TX_FLUSH_QUEUE_INFO_BYTES, TX_FLUSH_QUEUE_LIMIT,
+    ADD_STA_COMMAND, FlushedQueue, REMOVE_STA_COMMAND, STA_FLAG_AGG_DENSITY_MASK,
+    STA_FLAG_AGG_DENSITY_SHIFT, STA_FLAG_FAT_MASK, STA_FLAG_FAT_SHIFT, STA_FLAG_MAX_AGG_SIZE_MASK,
+    STA_FLAG_MAX_AGG_SIZE_SHIFT, STA_FLAG_MIMO_MASK, STA_FLAG_MIMO_SHIFT, STA_FLG_DRAIN_FLOW,
+    STA_ID_LINK, STA_ID_MONITOR, STA_MODE_MODIFY, STA_MODIFY_ADD_BA_TID, STA_MODIFY_UAPSD_ACS,
+    STA_TYPE_GENERAL_PURPOSE, STA_TYPE_LINK, StationAddConfig, StationError, StationQueue,
+    StationRemoveError, StationRemoveState, TX_FLUSH_QUEUE_INFO_BYTES, TX_FLUSH_QUEUE_LIMIT,
     TX_FLUSH_RESPONSE_BYTES, TX_PATH_FLUSH_COMMAND, TxFlushResponse, drain_station_command,
-    flush_station, parse_tx_flush_response, station_add_command, tx_path_flush_command,
-    validate_station_add_status,
+    flush_station, parse_tx_flush_response, remove_station_command, station_add_command,
+    tx_path_flush_command, validate_station_add_status,
 };
 pub use tx::{EncodedTxFrame, TxError, TxFrame, encode_tx_frame, submit_tx_frame};
 pub use tx_completion::{
