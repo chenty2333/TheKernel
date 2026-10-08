@@ -543,6 +543,13 @@ impl<I: AhciIo> AhciDisk<I> {
                 .checked_add(segment.len.div_ceil(AHCI_PRD_MAX))
                 .ok_or(AhciDiskError::InvalidRequest)?;
         }
+        if bytes
+            != usize::from(attributes.sectors)
+                .checked_mul(self.geometry.block_size)
+                .ok_or(AhciDiskError::InvalidRequest)?
+        {
+            return Err(AhciDiskError::InvalidRequest);
+        }
         let table = &self.workspace().command_table;
         let table_capacity = table.len.saturating_sub(COMMAND_TABLE_HEADER_BYTES) / PRD_BYTES;
         if prd_count == 0 || prd_count > table_capacity {
@@ -593,7 +600,6 @@ impl<I: AhciIo> AhciDisk<I> {
             ptr::write_unaligned(header.add(4) as *mut u32, 0);
             ptr::write_unaligned(header.add(8) as *mut u64, ws.command_table.bus);
         }
-        debug_assert_eq!(bytes % self.geometry.block_size, 0);
         let base = self.port.register_base();
         self.controller.io_mut().write32(base + AHCI_P_IS, u32::MAX);
         self.controller
