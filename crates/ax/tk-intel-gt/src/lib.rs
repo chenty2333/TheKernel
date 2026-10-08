@@ -4,6 +4,7 @@
 //! firmware load or userspace command stream. Kernel intel.gt=1 owns invocation.
 #![no_std]
 #![forbid(unsafe_code)]
+extern crate alloc;
 #[cfg(test)]
 extern crate std;
 pub mod bcs;

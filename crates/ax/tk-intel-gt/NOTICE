@@ -146,6 +146,8 @@ intel_gtt.c tgl_setup_private_ppat, Intel2020. All64+32+8 ADL-N entries,
 source unused-index2 semantics; not TGL's deprecated index1. MIT grants retained.
 
 src/uc.rs: Linux 7.2.3 gt/uc/intel_uc_fw.c __uc_fw_auto_select firmware
-filename/version selection table for TGL, RKL, ADL-S and ADL-P (MIT).
-Copyright © 2016-2019 Intel Corporation. ADL-N shares ADL-S firmware table per
-upstream platform classification. Metadata only; no firmware parsing/upload.
+filename/version selection table and __check_ccs_header CSS-size checks for
+TGL, RKL, ADL-S and ADL-P (MIT). Copyright © 2016-2019 Intel Corporation.
+ADL-N shares ADL-S firmware table per upstream platform classification. Rust
+rootfs callback uses the existing firmware API; device DMA/MMIO upload remains
+unimplemented.

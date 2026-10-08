@@ -10,6 +10,9 @@ use axsync::Mutex;
 use intel_gt::{Error, GtIo};
 
 #[cfg(target_os = "none")]
+use intel_gt::uc::{self, FirmwareImage, Kind, Platform};
+
+#[cfg(target_os = "none")]
 use super::pci;
 use super::{
     gmbus::{MonotonicTimer, PollTimer},
@@ -207,6 +210,68 @@ pub(super) fn registered() -> bool {
 }
 static OWNER: Mutex<Option<Owner>> = Mutex::new(None);
 
+#[cfg(target_os = "none")]
+#[derive(Default)]
+struct UcFirmware {
+    guc: Option<FirmwareImage>,
+    huc: Option<FirmwareImage>,
+}
+
+#[cfg(target_os = "none")]
+static UC_FIRMWARE: Mutex<UcFirmware> = Mutex::new(UcFirmware {
+    guc: None,
+    huc: None,
+});
+
+/// Runs after the rootfs reader is installed; no probe-time filesystem access.
+#[cfg(target_os = "none")]
+fn load_uc_firmware() {
+    const MAX_UC_BYTES: usize = 2 * 1024 * 1024;
+    const WOPCM_BYTES: usize = 2 * 1024 * 1024;
+    let mut request = |path: &str, max_len: usize| {
+        axdriver::prelude::firmware::request(&alloc::format!("/lib/firmware/{path}"), max_len)
+    };
+    let guc = uc::load(
+        Platform::AlderLakeN,
+        Kind::GuC,
+        MAX_UC_BYTES,
+        WOPCM_BYTES,
+        &mut request,
+    );
+    let huc = uc::load(
+        Platform::AlderLakeN,
+        Kind::HuC,
+        MAX_UC_BYTES,
+        WOPCM_BYTES,
+        &mut request,
+    );
+    let mut state = UC_FIRMWARE.lock();
+    match guc {
+        Ok(image) => {
+            axlog::info!(
+                "intel-gt: GuC firmware {} selected, {:?} CSS, {} bytes",
+                image.blob.path,
+                image.css.version,
+                image.bytes.len()
+            );
+            state.guc = Some(image);
+        }
+        Err(error) => axlog::warn!("intel-gt: GuC firmware unavailable: {error:?}"),
+    }
+    match huc {
+        Ok(image) => {
+            axlog::info!(
+                "intel-gt: HuC firmware {} selected, {:?} CSS, {} bytes",
+                image.blob.path,
+                image.css.version,
+                image.bytes.len()
+            );
+            state.huc = Some(image);
+        }
+        Err(error) => axlog::warn!("intel-gt: HuC firmware unavailable: {error:?}"),
+    }
+}
+
 /// Task-context coordination only, not proof of firmware interrupt masks.
 /// The display IRQ owner separately reads every Gen11/12 GT class ENABLE and
 /// the shared master before it changes PCI/MSI or display interrupt state.
@@ -304,6 +369,11 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
     if (info.vendor_id, info.device_id, info.revision) != (0x8086, 0x46d0, 0) {
         return Err(String::from(
             "GT requires exact N305 Gen12/media A0; no writes",
+        ));
+    }
+    if !axdriver::prelude::firmware::on_rootfs_ready(load_uc_firmware) {
+        return Err(String::from(
+            "GT rootfs firmware callback table is full; no GuC/HuC firmware access",
         ));
     }
     let bus = Bus {

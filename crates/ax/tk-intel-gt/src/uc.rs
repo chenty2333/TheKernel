@@ -8,6 +8,8 @@
 //! This is only the platform selection data from `intel_uc_fw.c`; it does not
 //! parse or upload the firmware and does not claim that a uC is running.
 
+use alloc::vec::Vec;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Platform {
     TigerLake,
@@ -49,7 +51,41 @@ pub struct CssInfo {
     pub private_data_bytes: usize,
 }
 
-/// upstream: intel_uc_fw.c __check_ccs_header()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirmwareError {
+    Missing,
+    Css(CssError),
+}
+
+pub struct FirmwareImage {
+    pub blob: Blob,
+    pub css: CssInfo,
+    pub bytes: Vec<u8>,
+}
+
+/// Requests candidate files in table order and validates the first file found.
+pub fn load(
+    platform: Platform,
+    kind: Kind,
+    max_bytes: usize,
+    wopcm_bytes: usize,
+    mut request: impl FnMut(&str, usize) -> Option<Vec<u8>>,
+) -> Result<FirmwareImage, FirmwareError> {
+    for blob in candidates(platform, kind) {
+        let Some(bytes) = request(blob.path, max_bytes) else {
+            continue;
+        };
+        let css = parse_css(&bytes, wopcm_bytes).map_err(FirmwareError::Css)?;
+        return Ok(FirmwareImage {
+            blob: *blob,
+            css,
+            bytes,
+        });
+    }
+    Err(FirmwareError::Missing)
+}
+
+// upstream: intel_uc_fw.c __check_ccs_header()
 /// Validate the CSS sizes before a caller allocates DMA memory or writes MMIO.
 pub fn parse_css(data: &[u8], wopcm_bytes: usize) -> Result<CssInfo, CssError> {
     const HEADER_BYTES: usize = 128;
@@ -166,7 +202,7 @@ const ADL_HUC: &[Blob] = &[
     },
 ];
 
-/// upstream: intel_uc_fw.c __uc_fw_auto_select()
+// upstream: intel_uc_fw.c __uc_fw_auto_select()
 pub fn candidates(platform: Platform, kind: Kind) -> &'static [Blob] {
     match (platform, kind) {
         (Platform::TigerLake | Platform::RocketLake, Kind::GuC) => TGL_GUC,
@@ -240,5 +276,30 @@ mod tests {
         let mut underflow = image;
         underflow[24..28].copy_from_slice(&1u32.to_le_bytes());
         assert_eq!(parse_css(&underflow, 4096), Err(CssError::InvalidHeader));
+    }
+
+    #[test]
+    fn loader_requests_files_in_upstream_preference_order_and_retains_image() {
+        let mut image = css_image(64, 128);
+        image[64..68].copy_from_slice(&(70u32 << 16 | 1 << 8 | 1).to_le_bytes());
+        let mut requested = std::vec::Vec::new();
+        let loaded = load(
+            Platform::AlderLakeN,
+            Kind::GuC,
+            1024 * 1024,
+            2 * 1024 * 1024,
+            |path, max| {
+                requested.push(std::string::String::from(path));
+                assert_eq!(max, 1024 * 1024);
+                (path == "i915/tgl_guc_70.1.1.bin").then(|| image.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(requested.len(), 2);
+        assert_eq!(requested[0], "i915/tgl_guc_70.bin");
+        assert_eq!(requested[1], "i915/tgl_guc_70.1.1.bin");
+        assert_eq!(loaded.blob.path, "i915/tgl_guc_70.1.1.bin");
+        assert_eq!(loaded.bytes, image);
+        assert_eq!(loaded.css.version, (70, 1, 1));
     }
 }
