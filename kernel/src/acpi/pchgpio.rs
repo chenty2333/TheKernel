@@ -1397,10 +1397,34 @@ pub fn init(engine: &Engine, nodes: &[Node]) -> usize {
     attached
 }
 
+/// Snapshot every attached controller before the platform enters S3. This is
+/// the GPIO half of the ACPI suspend lifecycle; the caller must invoke
+/// [`restore_all`] after firmware resumes and before child drivers use pins.
+#[cfg(target_os = "none")]
+pub fn save_all() {
+    for provider in PROVIDERS.lock().iter_mut() {
+        provider.controller.save();
+    }
+}
+
+/// Restore saved pad configuration and interrupt enables after S3 resume.
+#[cfg(target_os = "none")]
+pub fn restore_all() {
+    for provider in PROVIDERS.lock().iter() {
+        provider.controller.restore();
+    }
+}
+
 #[cfg(not(target_os = "none"))]
 pub fn init(_engine: &tk_acpica::Engine, _nodes: &[tk_acpica::Node]) -> usize {
     0
 }
+
+#[cfg(not(target_os = "none"))]
+pub fn save_all() {}
+
+#[cfg(not(target_os = "none"))]
+pub fn restore_all() {}
 
 struct GpioServices;
 #[crate_interface::impl_interface]

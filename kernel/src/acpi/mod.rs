@@ -128,6 +128,19 @@ fn notify(path: &str, value: u32) {
         axhal::acpi::button_event();
     }
 }
+
+/// Preserve GPIO pad state at the entry boundary of a future ACPI S3 path.
+/// S3 entry itself is not yet enabled by this kernel, so this hook is not
+/// presently called by a system suspend operation.
+pub fn prepare_s3_gpio() {
+    pchgpio::save_all();
+}
+
+/// Restore GPIO pads before devices resume after ACPI S3.
+pub fn resume_s3_gpio() {
+    pchgpio::restore_all();
+}
+
 #[cfg(target_os = "none")]
 fn power_off() -> bool {
     // Panic/IRQ paths must not execute AML or wait on an interpreter mutex.

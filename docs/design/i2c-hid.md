@@ -109,3 +109,10 @@ quirk selection remain open. The shared parser already handles HID global/local
 state, push/pop, collection/report IDs, arrays, variables, and report sizes,
 but does not expose FreeBSD's item-at-a-time iterator or its dynamic quirk
 registry.
+
+2026-10-09 GPIO S3 handoff: `pchgpio::save_all()` / `restore_all()` now walk
+attached providers and preserve/restore each pad's two config dwords plus GPI
+interrupt-enable bit. ACPI exports `prepare_s3_gpio()` and `resume_s3_gpio()` at
+the corresponding entry/return boundaries. The kernel still has no ACPI S3
+entry mechanism, so these lifecycle hooks are compile-checked but cannot yet be
+invoked by a real suspend/resume cycle; this does not claim S3 acceptance.
