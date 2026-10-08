@@ -51,11 +51,12 @@ use super::{
     bringup::StationAddress,
     desc::{
         BufferPool, DESCRIPTOR_BYTES, DescriptorMemory, MAX_FRAME_BYTES, RX_BUFFER_BYTES,
-        RX_HEADER_BYTES, RingError, RxRing, TxRing,
+        RX_HEADER_BYTES, RxRing, TxRing,
     },
     txrx::{
         RxRingState, TxChecksum, TxIpType, TxPacketInfo, TxProtocol, TxRingState, TxRxError,
-        TxSegment, igc_isc_rxd_refill, igc_isc_txd_encap,
+        TxRxIo, TxSegment, igc_isc_rxd_available, igc_isc_rxd_pkt_get, igc_isc_rxd_refill,
+        igc_isc_rxd_available_from, igc_isc_txd_encap,
     },
     regs::{
         self, QueueControl, ReceiveControl, RingBase, RingLength, SplitReceiveControl,
@@ -75,6 +76,19 @@ pub const DEVICE_NAME: &str = "igc";
 /// `SplitReceiveControl::one_buffer` divides down to.
 const RX_PACKET_BYTES: u32 = RX_BUFFER_BYTES as u32;
 
+/// The translated packet parser only needs notification hooks for metadata
+/// callbacks; this interface cannot export those values, and the descriptor
+/// tail is still published by `IgcNic` after it has safely re-armed buffers.
+struct RxMetadataSink;
+
+impl TxRxIo for RxMetadataSink {
+    fn write_tdt(&mut self, _queue: u16, _index: usize) {}
+    fn write_rdt(&mut self, _queue: u16, _index: usize) {}
+    fn aim_publish_tx(&mut self, _queue: u16) {}
+    fn aim_publish_rx(&mut self, _queue: u16) {}
+    fn note_drop(&mut self) {}
+}
+
 /// Counters, for the report and for the tests.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Stats {
@@ -93,8 +107,6 @@ pub struct Stats {
     /// Receive descriptors discarded because they did not describe a usable
     /// frame.
     pub rx_dropped: u64,
-    /// Receive descriptors whose length was set but whose done bit was not.
-    pub rx_without_done: u64,
     /// Calls refused because a pointer did not belong to this driver.
     pub foreign_buffers: u64,
     /// Calls refused because the transmit ring had no room.
@@ -109,7 +121,7 @@ impl Stats {
     pub fn describe(&self) -> alloc::string::String {
         alloc::format!(
             "tx {} frames/{} bytes, rx {} frames/{} bytes, recycled tx {} rx {}, dropped {} \
-             (length without done bit {}, foreign pointers {}, transmit ring full {}, register \
+             (foreign pointers {}, transmit ring full {}, register \
              writes refused {})",
             self.transmitted,
             self.transmitted_bytes,
@@ -118,7 +130,6 @@ impl Stats {
             self.tx_recycled,
             self.rx_recycled,
             self.rx_dropped,
-            self.rx_without_done,
             self.foreign_buffers,
             self.tx_full,
             self.register_refused,
@@ -278,15 +289,18 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
 
     /// Whether the receive ring has a frame waiting.
     ///
-    /// This reads one descriptor, which is the whole cost of the check, and it
-    /// is what the stack's `can_receive` becomes.
+    /// This reads one descriptor and applies the upstream done/EOP predicate;
+    /// it is what the stack's `can_receive` becomes for the single-buffer path.
     pub fn receive_pending(&self) -> bool {
         if self.rx_ring.outstanding() == 0 {
             return false;
         }
-        self.rx_memory
-            .rx_length(self.rx_ring.next_to_clean())
-            .is_some_and(|length| length != 0)
+        igc_isc_rxd_available_from(
+            QS,
+            self.rx_ring.next_to_clean(),
+            0,
+            |index| self.rx_memory.rx_status_error(index).unwrap_or(0),
+        ) != 0
     }
 
     /// Whether a frame can be handed to the hardware right now.
@@ -383,20 +397,28 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
         Ok(NetBufPtr::new(pointer, pointer, length))
     }
 
-    /// Discard the descriptor at the receive ring's cursor and give its buffer
-    /// back.
-    ///
-    /// A descriptor that reports an impossible frame still has to be reclaimed:
-    /// leaving it would stall the ring, and the buffer it names is the driver's
-    /// again either way.
-    fn discard_receive_descriptor(&mut self) {
-        let index = self.rx_ring.next_to_clean();
-        let slot = self.rx_owner[index];
-        self.rx_free.push(slot);
-        let _ = self.rx_ring.discard();
+    /// Drop every descriptor through the next EOP and immediately return its
+    /// buffers to the receive ring. This is used for source-reported RX errors
+    /// and multi-fragment packets, which the current NetDriverOps buffer API
+    /// cannot hand to the stack as a single packet.
+    fn discard_receive_packet(&mut self) {
+        let mut consumed = 0;
+        while self.rx_ring.outstanding() > 0 && consumed < QS {
+            let index = self.rx_ring.next_to_clean();
+            let status = self.rx_memory.rx_status_error(index).unwrap_or(0);
+            self.rx_free.push(self.rx_owner[index]);
+            if self.rx_ring.discard().is_err() {
+                break;
+            }
+            consumed += 1;
+            if status & regs::bits::RXD_STAT_EOP != 0 {
+                break;
+            }
+        }
+        if consumed == 0 {
+            return;
+        }
         self.stats.rx_dropped += 1;
-        // The buffer is the driver's again, so it goes straight back into the
-        // ring at the tail: a dropped frame must not cost the ring a slot.
         let before = self.rx_ring.tail();
         self.fill_receive_ring();
         if self.rx_ring.tail() != before {
@@ -556,27 +578,53 @@ impl<H: IgcHal, const QS: usize> NetDriverOps for IgcNic<H, QS> {
 
     fn receive(&mut self) -> DevResult<NetBufPtr> {
         loop {
-            match self.rx_ring.take(&self.rx_memory) {
-                Ok((index, frame)) => {
-                    if !frame.done {
-                        self.stats.rx_without_done += 1;
-                    }
-                    let slot = self.rx_owner[index];
-                    self.rx_in_flight[slot] = true;
-                    self.stats.received += 1;
-                    self.stats.received_bytes += frame.length as u64;
-                    return self.buffer_for(&self.rx_pool, slot, frame.length);
-                }
-                Err(RingError::NotReady(_)) | Err(RingError::Empty(_)) => {
-                    return Err(DevError::Again);
-                }
-                Err(_) => {
-                    // A descriptor that cannot describe a usable frame is
-                    // dropped and the ring moves on; the interface does not
-                    // fail because one packet was malformed.
-                    self.discard_receive_descriptor();
-                }
+            let start = self.rx_ring.next_to_clean();
+            if self.rx_ring.outstanding() == 0 {
+                return Err(DevError::Again);
             }
+            for offset in 0..self.rx_ring.outstanding() {
+                let index = (start + offset) % QS;
+                let status = self.rx_memory.rx_status_error(index).unwrap_or(0);
+                let length = u32::from(self.rx_memory.rx_length(index).unwrap_or(0));
+                let vlan = u32::from(self.rx_memory.rx_vlan(index).unwrap_or(0));
+                self.rx_source_state.desc[index][0] =
+                    self.rx_memory.rx_writeback_word(index, 0).unwrap_or(0);
+                self.rx_source_state.desc[index][1] =
+                    self.rx_memory.rx_writeback_word(index, 1).unwrap_or(0);
+                self.rx_source_state.desc[index][2] = status;
+                self.rx_source_state.desc[index][3] = length | (vlan << 16);
+            }
+            if igc_isc_rxd_available(&self.rx_source_state, start, 0) == 0 {
+                return Err(DevError::Again);
+            }
+            let parsed = {
+                let mut sink = RxMetadataSink;
+                igc_isc_rxd_pkt_get(&mut sink, &mut self.rx_source_state, start, true)
+            };
+            match parsed {
+                Ok((metadata, fragments)) if fragments.len() == 1 => {
+                    match self.rx_ring.take(&self.rx_memory) {
+                        Ok((index, frame)) if index == fragments[0].index => {
+                            let slot = self.rx_owner[index];
+                            self.rx_in_flight[slot] = true;
+                            self.stats.received += 1;
+                            self.stats.received_bytes += u64::from(metadata.len);
+                            debug_assert_eq!(metadata.len as usize, frame.length);
+                            return self.buffer_for(&self.rx_pool, slot, frame.length);
+                        }
+                        _ => {
+                            self.discard_receive_packet();
+                            continue;
+                        }
+                    }
+                }
+                Ok(_) | Err(_) => self.discard_receive_packet(),
+            }
+
+            // Continue past malformed or unsupported packets. The translated
+            // parser has consumed the status in its shadow; the DMA descriptor
+            // cursor is advanced here, not by that pure parser.
+            continue;
         }
     }
 }
@@ -1191,37 +1239,53 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_receive_descriptor_is_dropped_and_the_ring_moves_on() {
+    fn an_incomplete_receive_descriptor_waits_for_end_of_packet() {
         let mut harness = Harness::new();
         let (_, rx_descriptors, ..) = harness.regions();
-        // A length with no end-of-packet bit: this driver's single-buffer
-        // receive path cannot assemble a split packet, so the descriptor is
-        // dropped rather than handed to the stack as a fragment.
+        // A descriptor without EOP can be the first fragment of an upstream
+        // multi-descriptor packet, so wait rather than consuming it early.
         harness.receive_frame(0, 64, bits::RXD_STAT_DD);
         assert!(matches!(harness.nic.receive(), Err(DevError::Again)));
-        assert_eq!(harness.nic.stats().rx_dropped, 1);
+        assert_eq!(harness.nic.stats().rx_dropped, 0);
         assert!(!harness.nic.can_receive());
-        // The descriptor was given back to the ring: its buffer is armed in
-        // the descriptor at the tail, and the tail moved.
-        assert_eq!(harness.nic.stats().rx_recycled, 0);
-        assert_eq!(
-            harness.descriptor_address(rx_descriptors, QS - 1),
-            harness.regions().3.as_ptr() as u64,
+        assert_eq!(harness.register("IGC_RDT(0)"), (QS - 1) as u32);
+        assert_ne!(harness.descriptor_address(rx_descriptors, 0), 0);
+    }
+
+    #[test]
+    fn unsupported_multi_descriptor_packet_is_dropped_as_one_packet() {
+        let mut harness = Harness::new();
+        harness.receive_frame(0, 32, bits::RXD_STAT_DD);
+        harness.receive_frame(1, 32, bits::RXD_STAT_DD | bits::RXD_STAT_EOP);
+        assert!(harness.nic.can_receive());
+        assert!(matches!(harness.nic.receive(), Err(DevError::Again)));
+        assert_eq!(harness.nic.stats().rx_dropped, 1);
+        assert_eq!(harness.nic.stats().received, 0);
+        assert_eq!(harness.register("IGC_RDT(0)"), 1);
+    }
+
+    #[test]
+    fn source_reported_receive_error_is_reclaimed_without_delivery() {
+        let mut harness = Harness::new();
+        harness.receive_frame(
+            0,
+            60,
+            bits::RXD_STAT_DD | bits::RXD_STAT_EOP | 0x8000_0000,
         );
+        assert!(harness.nic.can_receive());
+        assert!(matches!(harness.nic.receive(), Err(DevError::Again)));
+        assert_eq!(harness.nic.stats().rx_dropped, 1);
+        assert_eq!(harness.nic.stats().received, 0);
         assert_eq!(harness.register("IGC_RDT(0)"), 0);
     }
 
     #[test]
-    fn a_length_without_the_done_bit_is_still_received_and_counted() {
-        // The vendor driver's hot path treats a non-zero length as "written
-        // back" and never looks at the done bit; this driver does the same and
-        // reports the difference, so that a part which does not set it is
-        // visible rather than a ring that never delivers anything.
+    fn a_length_without_the_done_bit_is_not_available_to_the_source_packet_parser() {
         let mut harness = Harness::new();
         harness.receive_frame(0, 60, bits::RXD_STAT_EOP);
-        let received = harness.nic.receive().expect("a frame");
-        assert_eq!(received.packet_len(), 60);
-        assert_eq!(harness.nic.stats().rx_without_done, 1);
+        assert!(!harness.nic.can_receive());
+        assert!(matches!(harness.nic.receive(), Err(DevError::Again)));
+        assert_eq!(harness.nic.stats().received, 0);
     }
 
     #[test]

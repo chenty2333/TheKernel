@@ -395,13 +395,27 @@ pub fn igc_isc_rxd_flush<I: TxRxIo>(io: &mut I, rx: &RxRingState, pidx: usize) {
 
 // upstream: igc_txrx.c igc_isc_rxd_available()
 pub fn igc_isc_rxd_available(rx: &RxRingState, idx: usize, budget: usize) -> usize {
-    let n = rx.desc.len();
+    igc_isc_rxd_available_from(rx.desc.len(), idx, budget, |index| rx.desc[index][2])
+}
+
+/// Run the translated availability scan over a read-only descriptor source.
+/// This keeps the live `NetDriverOps::can_receive` path allocation-free while
+/// retaining the upstream done/EOP/budget walk.
+pub fn igc_isc_rxd_available_from<F>(
+    n: usize,
+    idx: usize,
+    budget: usize,
+    mut status_at: F,
+) -> usize
+where
+    F: FnMut(usize) -> u32,
+{
     if n == 0 {
         return 0;
     }
     let (mut cnt, mut i) = (0, idx % n);
     while cnt < n && cnt <= budget {
-        let stat = rx.desc[i][2];
+        let stat = status_at(i);
         if stat & RXD_STAT_DD == 0 {
             break;
         }
