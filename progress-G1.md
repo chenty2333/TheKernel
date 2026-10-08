@@ -18,4 +18,4 @@
 3k. DPLL platform inventories | 部分完成 | f78ba138 | 翻译 i915 TGL/RKL/DG1/ADL-S/ADL-P/N/EHL/JSL DPLL descriptor arrays and source ordering；6 targeted tests pass.
 3l. Intel DPLL CRTC hook selection | 部分完成 | 9761878d | 翻译 `intel_dpll_init_clock_hook` 和 HSW `hsw_crtc_compute_clock` (display 12/13→HSW shared manager)；5 dpll tests pass.
 4. DDI transcoder/buffer helpers | 部分完成 | f1082fd6 | 从 `intel_ddi.c` 批量翻译 TBT/MG selector、DP buffer link/stagger、idle/active wait和display12/13 FUNC_CTL builder；5 ddi tests pass.
-4a. Combo DDI clock mux integration | 部分完成 | pending | 平台DPCLKA计划支持ICL/TGL/RKL/ADLS/ADLP/N/DG1并由kernel locked adapter在`output::program`里分两次RMW应用；kernel tests compile-check。
+4a. Combo DDI clock mux integration | 部分完成 | dc98de75 | 平台DPCLKA计划支持ICL/TGL/RKL/ADLS/ADLP/N/DG1并由kernel locked adapter在`output::program`里分两次RMW应用；kernel tests compile-check。
