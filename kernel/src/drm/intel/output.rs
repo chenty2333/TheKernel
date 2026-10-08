@@ -1017,7 +1017,45 @@ impl OutputProgram {
         // §6.3 works through; that is what `ddi_pll_dividers` is for.
         let dividers = pll::ddi_pll_dividers(request.mode.clock_khz, platform_ref_khz, phy)?;
         let fraction_workaround = DcoFractionWorkaround::for_adl_p_n(platform_ref_khz);
-        let pll_registers = dividers.registers(request.encoding, fraction_workaround)?;
+        // The active Gen12 path takes the parameters from the translated
+        // `icl_calc_wrpll()` / `icl_calc_dpll_state()` implementation rather
+        // than merely keeping a second local copy of the same search. Keep
+        // the old `PllFieldEncoding::Executed` variant available for the
+        // explicit encoding-comparison tests, but the production/default
+        // `Named` path is the i915 display-12/13 code path.
+        let pll_registers = match request.encoding {
+            PllFieldEncoding::Named => {
+                let params = intel_display::dpll_mgr::icl_calc_wrpll(
+                    request.mode.clock_khz,
+                    platform_ref_khz,
+                )
+                .map_err(|_| {
+                    OutputError::Pll(PllError::NoLegalDividerSet {
+                        symbol_rate_khz: request.mode.clock_khz,
+                        ref_khz: platform_ref_khz,
+                    })
+                })?;
+                let state = intel_display::dpll_mgr::icl_calc_dpll_state(
+                    params,
+                    13,
+                    platform_ref_khz,
+                    None,
+                )
+                .map_err(|_| {
+                    OutputError::Pll(PllError::NoLegalDividerSet {
+                        symbol_rate_khz: request.mode.clock_khz,
+                        ref_khz: platform_ref_khz,
+                    })
+                })?;
+                PllRegisters {
+                    cfgcr0: state.cfgcr0,
+                    cfgcr1: state.cfgcr1,
+                }
+            }
+            PllFieldEncoding::Executed => {
+                dividers.registers(request.encoding, fraction_workaround)?
+            }
+        };
 
         // The two encoder-side selects are keyed by different things, which
         // §11's phase 5 prints as if they were one rule.  `TRANS_CLK_SEL` takes

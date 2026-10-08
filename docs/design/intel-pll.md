@@ -582,3 +582,7 @@ order for TGL, RKL, DG1, ADL-S, ADL-P/N and EHL/JSL. The shared numeric IDs are
 platform scoped (for example ID 2 is TBT on TGL/ADL-P and DPLL4 on RKL), so the
 descriptor's kind and platform are required when resolving an ID; it is not a
 global enum.
+The default N305 combo-PHY output plan now uses the source-translated
+`icl_calc_wrpll()` and `icl_calc_dpll_state()` values for the CFGCR writes;
+`DdiPllDividers` remains the diagnostic/readback report. The alternate
+Skylake-style encoding remains only for the explicit comparison test.

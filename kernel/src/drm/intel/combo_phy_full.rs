@@ -197,6 +197,17 @@ fn push_diagnostic(
     diagnostics.push(ComboPhyDiagnostic { level, message });
 }
 
+fn procmon_index(value: u32) -> Option<ProcmonIndex> {
+    match value & (PROCESS_INFO_MASK | VOLTAGE_INFO_MASK) {
+        x if x == (VOLTAGE_INFO_0_85V | PROCESS_INFO_DOT_0) => Some(ProcmonIndex::V0_85Dot0),
+        x if x == (VOLTAGE_INFO_0_95V | PROCESS_INFO_DOT_0) => Some(ProcmonIndex::V0_95Dot0),
+        x if x == (VOLTAGE_INFO_0_95V | PROCESS_INFO_DOT_1) => Some(ProcmonIndex::V0_95Dot1),
+        x if x == (VOLTAGE_INFO_1_05V | PROCESS_INFO_DOT_0) => Some(ProcmonIndex::V1_05Dot0),
+        x if x == (VOLTAGE_INFO_1_05V | PROCESS_INFO_DOT_1) => Some(ProcmonIndex::V1_05Dot1),
+        _ => None,
+    }
+}
+
 // upstream: intel_combo_phy.c icl_get_procmon_ref_values()
 fn icl_get_procmon_ref_values<'a>(
     regs: &impl Registers,
@@ -204,13 +215,9 @@ fn icl_get_procmon_ref_values<'a>(
     diagnostics: &mut Vec<ComboPhyDiagnostic>,
 ) -> Result<&'a ProcmonValues, ComboPhyIoError> {
     let val = de_read(regs, phy.registers.comp_dw3)?;
-    let index = match val & (PROCESS_INFO_MASK | VOLTAGE_INFO_MASK) {
-        VOLTAGE_INFO_0_85V | PROCESS_INFO_DOT_0 => ProcmonIndex::V0_85Dot0,
-        VOLTAGE_INFO_0_95V | PROCESS_INFO_DOT_0 => ProcmonIndex::V0_95Dot0,
-        VOLTAGE_INFO_0_95V | PROCESS_INFO_DOT_1 => ProcmonIndex::V0_95Dot1,
-        VOLTAGE_INFO_1_05V | PROCESS_INFO_DOT_0 => ProcmonIndex::V1_05Dot0,
-        VOLTAGE_INFO_1_05V | PROCESS_INFO_DOT_1 => ProcmonIndex::V1_05Dot1,
-        _ => {
+    let index = match procmon_index(val) {
+        Some(index) => index,
+        None => {
             push_diagnostic(
                 diagnostics,
                 DiagnosticLevel::MissingCase,
@@ -221,6 +228,33 @@ fn icl_get_procmon_ref_values<'a>(
     };
     // The array is static and every `ProcmonIndex` is a valid slot.
     Ok(&ICL_PROCMON_VALUES[index as usize])
+}
+
+#[cfg(test)]
+mod procmon_tests {
+    use super::*;
+
+    #[test]
+    fn procmon_voltage_and_process_fields_are_combined_as_bitfields() {
+        assert_eq!(procmon_index(0), Some(ProcmonIndex::V0_85Dot0));
+        assert_eq!(
+            procmon_index(VOLTAGE_INFO_0_95V),
+            Some(ProcmonIndex::V0_95Dot0)
+        );
+        assert_eq!(
+            procmon_index(VOLTAGE_INFO_0_95V | PROCESS_INFO_DOT_1),
+            Some(ProcmonIndex::V0_95Dot1)
+        );
+        assert_eq!(
+            procmon_index(VOLTAGE_INFO_1_05V),
+            Some(ProcmonIndex::V1_05Dot0)
+        );
+        assert_eq!(
+            procmon_index(VOLTAGE_INFO_1_05V | PROCESS_INFO_DOT_1),
+            Some(ProcmonIndex::V1_05Dot1)
+        );
+        assert_eq!(procmon_index(PROCESS_INFO_DOT_1), None);
+    }
 }
 
 // upstream: intel_combo_phy.c icl_set_procmon_ref_values()

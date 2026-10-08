@@ -25,6 +25,15 @@ asks for `ref`, `(P, Q, K)` and the resulting symbol rate to be **printed before
 wrong clock is a monitor that says "out of range" and a bug nobody can find; `OutputProgram::render`
 is that print, and a failure part-way through the sequence still leaves the whole program in the log.
 
+For the default `PllFieldEncoding::Named` path, `OutputProgram::plan` now
+consumes the translated `tk-intel-display::dpll_mgr::icl_calc_wrpll()` and
+`icl_calc_dpll_state()` results for the CFGCR words. The adjacent
+`DdiPllDividers` value is retained for the existing human-readable diagnostic
+and verification fields; the separate `Executed` encoding remains only for
+the test that compares the Skylake convention against Gen12's named fields.
+The 38.4-MHz reference workaround remains in the translated state builder,
+and the worked-example test pins its `CFGCR0/1` output.
+
 The order inside `program` is §8.6's enable sequence, steps 3 to 14, restricted to the output half
 (the timing registers, the plane and the watermarks belong to the pipe workstream and happen between
 step 8 and step 11):
