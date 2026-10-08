@@ -5,6 +5,7 @@
 //! and translates UAPI requests into these typed operations.
 
 mod atomic;
+mod atomic_uapi_full;
 mod color_mgmt_full;
 mod device;
 mod dmabuf;
