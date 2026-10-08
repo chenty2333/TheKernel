@@ -24,6 +24,16 @@ pub enum ControllerError<E> {
     FirmwareNotAlive,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum RxServiceError<E> {
+    Notifications(crate::NotificationRingError),
+    Ring(crate::RingError),
+    Dma(DmaError),
+    Command(crate::CommandError),
+    Dispatch(E),
+    AllocationFailed,
+}
+
 /// Owned state shared by firmware commands, interrupt dispatch, and network datapath.
 pub struct IwxController<B: CsrAccess, A: DmaAllocator> {
     pub registers: IwxRegisters<B>,
@@ -88,6 +98,84 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
             command,
             external,
         )
+    }
+
+    /// Drain completed FH RX buffers, retain command replies, and dispatch firmware/data packets.
+    // upstream: if_iwx.c iwx_notif_intr() / iwx_rx_pkt()
+    pub fn process_rx_notifications<E>(
+        &mut self,
+        mut dispatch: impl FnMut(&crate::RxPacket<'_>, crate::RxMbufPlan) -> Result<bool, E>,
+    ) -> Result<usize, RxServiceError<E>> {
+        use core::cell::RefCell;
+
+        let batch = crate::drain_rx_notifications(&mut self.resources.rx_queue, self.family)
+            .map_err(RxServiceError::Notifications)?;
+        self.registers
+            .write_csr(batch.return_register, batch.return_value);
+        let completion_count = batch.completions.len();
+        for completion in batch.completions {
+            if completion.fragmented {
+                continue;
+            }
+            let mut buffer = alloc::vec::Vec::new();
+            buffer
+                .try_reserve_exact(crate::RX_BUFFER_SIZE)
+                .map_err(|_| RxServiceError::AllocationFailed)?;
+            buffer.resize(crate::RX_BUFFER_SIZE, 0);
+            self.resources
+                .rx_queue
+                .read_buffer(completion.buffer_id, 0, &mut buffer)
+                .map_err(RxServiceError::Ring)?;
+
+            let generation = self.generation;
+            let family = self.family;
+            let (rx_queue, allocator, command_slots) = (
+                &mut self.resources.rx_queue,
+                &mut self.allocator,
+                &mut self.command_slots,
+            );
+            let command_slots = RefCell::new(command_slots);
+            crate::process_rx_buffer(
+                &buffer,
+                family >= DeviceFamily::Ax210,
+                completion.buffer_id,
+                |_, _| false,
+                |index| rx_queue.refill_buffer(allocator, index).is_ok(),
+                |packet, plan| {
+                    if matches!(
+                        crate::decode_firmware_event(packet),
+                        crate::FirmwareEvent::CommandResponse(_)
+                    ) {
+                        match command_slots.borrow_mut().receive_response(
+                            packet.command_queue_id(),
+                            usize::from(packet.index),
+                            generation,
+                            packet.payload,
+                            packet.command_failed,
+                        ) {
+                            Ok(())
+                            | Err(crate::CommandError::NoResponseSlot)
+                            | Err(crate::CommandError::InvalidResponse) => {}
+                            Err(error) => return Err(RxServiceError::Command(error)),
+                        }
+                        return Ok(true);
+                    }
+                    dispatch(packet, plan).map_err(RxServiceError::Dispatch)
+                },
+                |queue, index, _code| {
+                    command_slots
+                        .borrow_mut()
+                        .command_done(queue, usize::from(index), generation)
+                        .map_err(RxServiceError::Command)
+                        .map(|_| ())
+                },
+            )
+            .map_err(|error| match error {
+                crate::RxBufferError::Dispatch(error)
+                | crate::RxBufferError::CommandDone(error) => error,
+            })?;
+        }
+        Ok(completion_count)
     }
 
     /// Publish Init/regular firmware context and wait for the matching ALIVE event.
@@ -213,5 +301,114 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         )?;
         self.resources.ict = ict;
         Ok(state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+    use core::cell::Cell;
+
+    use super::*;
+    use crate::{DmaRegion, IoBarrier};
+
+    struct Region {
+        address: u64,
+        bytes: Vec<u8>,
+    }
+    impl DmaRegion for Region {
+        fn device_address(&self) -> u64 {
+            self.address
+        }
+        fn capacity(&self) -> usize {
+            self.bytes.len()
+        }
+        fn write(&mut self, bytes: &[u8]) -> Result<(), DmaError> {
+            self.write_at(0, bytes)
+        }
+        fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), DmaError> {
+            self.bytes
+                .get_mut(offset..offset + bytes.len())
+                .ok_or(DmaError::RegionTooSmall)?
+                .copy_from_slice(bytes);
+            Ok(())
+        }
+        fn read_at(&self, offset: usize, bytes: &mut [u8]) -> Result<(), DmaError> {
+            bytes.copy_from_slice(
+                self.bytes
+                    .get(offset..offset + bytes.len())
+                    .ok_or(DmaError::RegionTooSmall)?,
+            );
+            Ok(())
+        }
+    }
+
+    struct Allocator(Cell<u64>);
+    impl DmaAllocator for Allocator {
+        type Region = Region;
+        fn allocate(&mut self, size: usize) -> Result<Region, DmaError> {
+            let address = self.0.get();
+            self.0
+                .set(address + size.max(1).div_ceil(4096) as u64 * 4096);
+            Ok(Region {
+                address,
+                bytes: alloc::vec![0; size],
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct Bus {
+        writes: Vec<(u32, u32)>,
+    }
+    impl CsrAccess for Bus {
+        fn read32(&mut self, _: u32) -> u32 {
+            0
+        }
+        fn write32(&mut self, offset: u32, value: u32) {
+            self.writes.push((offset, value));
+        }
+        fn write8(&mut self, offset: u32, value: u8) {
+            self.writes.push((offset, u32::from(value)));
+        }
+        fn barrier(&mut self, _: IoBarrier) {}
+        fn delay_us(&mut self, _: u32) {}
+    }
+
+    #[test]
+    fn controller_drains_completed_buffer_and_dispatches_notification() {
+        let allocator = Allocator(Cell::new(0x100000));
+        let mut controller =
+            IwxController::attach(Bus::default(), allocator, DeviceFamily::Ax210, 0x300000, 7)
+                .unwrap();
+        controller
+            .resources
+            .rx_queue
+            .status
+            .write_at(0, &[1, 0])
+            .unwrap();
+        controller
+            .resources
+            .rx_queue
+            .used_descriptors
+            .write_at(4, &[0, 0])
+            .unwrap();
+        let packet = [6, 0, 0, 0, 0x99, 0, 0, 0x80, 0xaa, 0xbb];
+        controller.resources.rx_queue.buffers[0]
+            .write_at(0, &packet)
+            .unwrap();
+
+        let mut seen = 0;
+        let completed = controller
+            .process_rx_notifications(|packet, _| {
+                assert_eq!(packet.command_id(), 0x99);
+                assert_eq!(packet.payload, [0xaa, 0xbb]);
+                seen += 1;
+                Ok::<_, ()>(true)
+            })
+            .unwrap();
+        assert_eq!(completed, 1);
+        assert_eq!(seen, 1);
+        assert!(!controller.registers.into_inner().writes.is_empty());
     }
 }
