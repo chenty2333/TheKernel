@@ -35,6 +35,7 @@ pub mod intel_display_modeset_full;
 pub mod intel_ddi_full;
 pub mod intel_dp_link_training_full;
 pub mod intel_dp_mst_full;
+pub mod intel_psr_full;
 pub mod intel_dp_full;
 pub mod intel_gmbus_full;
 pub mod intel_hdmi_full;
