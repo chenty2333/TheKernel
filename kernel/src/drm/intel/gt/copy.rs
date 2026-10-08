@@ -932,6 +932,7 @@ pub(super) fn upload_uc_firmware(
         false,
     )
     .map_err(|_| Error::Quarantined)?;
+    intel_gt::reset::reset_guc(&owner.bus, (12, 0)).map_err(|_| Error::Quarantined)?;
     let (huc_memory, rsa_offset) = upload_huc_for_auth(owner, huc)?;
     if let Err(error) = upload_uc_one(owner, guc) {
         let _ = huc.change_status(intel_gt::uc::FirmwareStatus::LoadFail);

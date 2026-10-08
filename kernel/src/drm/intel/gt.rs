@@ -197,13 +197,14 @@ impl GtIo for Bus {
         if !self.allowed(r, true)
             || (r == 0x941c
                 && value != 1 << 2
+                && value != intel_gt::reset::GUC_RESET_DOMAIN
                 && !(value == 1 << 1 && self.rcs_owned.load(Ordering::Acquire)))
         {
             return Err(Error::Refused);
         }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same bounded owned GT allowlist. No display/global reset is
-        // allowed; GDRST is restricted to BCS (bit2) or owned RCS (bit1).
+        // allowed; GDRST is restricted to the GuC domain, BCS or owned RCS.
         unsafe { ((self.window.base() + r as usize) as *mut u32).write_volatile(value) };
         compiler_fence(Ordering::SeqCst);
         Ok(())
@@ -736,6 +737,8 @@ mod tests {
         bus.write(0xc340, 0x10002).unwrap();
         assert_eq!(bus.read(0xc050), Ok(0x200000));
         assert_eq!(bus.read(0xc340), Ok(0x10002));
+        bus.write(0x941c, intel_gt::reset::GUC_RESET_DOMAIN).unwrap();
+        assert_eq!(words[0x941c / 4], intel_gt::reset::GUC_RESET_DOMAIN);
     }
     #[test]
     fn native_gt_window_requires_owned_wake_and_rejects_display_or_global_reset() {

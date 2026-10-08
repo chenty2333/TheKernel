@@ -29,7 +29,7 @@ Rust 侧复用 `kernel/src/drm/intel/{gt.rs,gt_probe.rs,gem_exec.rs,gem_context.
 
 `guc_log.rs` 已有 log sizing、overflow/read-pointer/relay snapshot 之外，补齐 control-log、force-flush 与 flush-complete 的 GuC action payload；log DMA/relay 工作线程以及 CT action callers 仍未接入。
 
-uC firmware upload 现在在 HuC/GuC DMA 前根据 CSS+uKernel upload size 计算 2 MiB Gen12 WOPCM partition，验证 locked/valid state 与 firmware/reserved bounds，再按上游顺序写入并回读验证 `GUC_WOPCM_SIZE` 和 `DMA_GUC_WOPCM_OFFSET`。此调用仅适用于当前集成 GT 目标；media-GT 的 BIOS/deprivileged pre-lock layout 未接入。
+uC firmware upload 现在在 HuC/GuC DMA 前根据 CSS+uKernel upload size 计算 2 MiB Gen12 WOPCM partition，验证 locked/valid state 与 firmware/reserved bounds，再按上游顺序写入并回读验证 `GUC_WOPCM_SIZE` 和 `DMA_GUC_WOPCM_OFFSET`；接着执行仅 GuC 域的 GDRST（Gen12.0 双复位 + 50us settle）。此调用仅适用于当前集成 GT 目标；media-GT 的 BIOS/deprivileged pre-lock layout 未接入。
 
 ## 移植边界
 
