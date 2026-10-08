@@ -1,21 +1,91 @@
 //! Linux-shaped registered block topology. Geometry is retained from GPT,
 //! never inferred from a partition-looking name. No device configuration writes.
-use alloc::{format, string::String, sync::Arc};
+use alloc::{borrow::Cow, format, string::String, sync::Arc, vec::Vec};
 use core::fmt::Write;
 
-use axfs_ng_vfs::{DeviceId, NodeType};
+use axfs_ng_vfs::{DeviceId, FsName, FsNameBuf, NodeType, VfsError, VfsResult};
 
-use super::{DirMapping, SimpleDir, SimpleFile, SimpleFs};
+use super::{
+    ChildNames, DirMapping, NodeOpsMux, SimpleDir, SimpleDirOps, SimpleFile, SimpleFs,
+    try_boxed_names,
+};
 use crate::mounts;
 
 pub(super) fn device_id(name: &str) -> Option<DeviceId> {
     if name == axfs::ROOT_BLOCK_DEVICE_NAME {
         return Some(mounts::ROOT_BLOCK_DEVICE_ID);
     }
+    if let Some(minor) = sd_device_minor(name) {
+        return Some(DeviceId::new(8, minor));
+    }
+    if let Some(minor) = mmc_device_minor(name) {
+        return Some(DeviceId::new(179, minor));
+    }
+    if let Some(minor) = nvme_device_minor(name) {
+        return Some(DeviceId::new(259, minor));
+    }
     axfs::block_device_names()
         .iter()
         .position(|n| n == name)
         .and_then(mounts::extra_block_device_id)
+}
+
+fn disk_letters_index(letters: &str) -> Option<u32> {
+    if letters.is_empty() || !letters.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        return None;
+    }
+    letters
+        .bytes()
+        .try_fold(0u32, |value, byte| {
+            value
+                .checked_mul(26)?
+                .checked_add(u32::from(byte - b'a' + 1))
+        })
+        .and_then(|value| value.checked_sub(1))
+}
+
+fn sd_device_minor(name: &str) -> Option<u32> {
+    let tail = name.strip_prefix("sd")?;
+    let digit = tail
+        .find(|ch: char| ch.is_ascii_digit())
+        .unwrap_or(tail.len());
+    let disk = disk_letters_index(&tail[..digit])?;
+    let partition = if digit == tail.len() {
+        0
+    } else {
+        tail[digit..].parse::<u32>().ok()?
+    };
+    disk.checked_add(1)?.checked_mul(16)?.checked_add(partition)
+}
+
+fn mmc_device_minor(name: &str) -> Option<u32> {
+    let tail = name.strip_prefix("mmcblk")?;
+    let p = tail.find('p').unwrap_or(tail.len());
+    let disk = tail[..p].parse::<u32>().ok()?;
+    let partition = if p == tail.len() {
+        0
+    } else {
+        tail[p + 1..].parse::<u32>().ok()?
+    };
+    disk.checked_mul(8)?.checked_add(partition)
+}
+
+fn nvme_device_minor(name: &str) -> Option<u32> {
+    let tail = name.strip_prefix("nvme")?;
+    let n = tail.find('n')?;
+    let controller = tail[..n].parse::<u32>().ok()?;
+    let rest = &tail[n + 1..];
+    let p = rest.find('p').unwrap_or(rest.len());
+    let namespace = rest[..p].parse::<u32>().ok()?.checked_sub(1)?;
+    let partition = if p == rest.len() {
+        0
+    } else {
+        rest[p + 1..].parse::<u32>().ok()?
+    };
+    controller
+        .checked_mul(1 << 20)?
+        .checked_add(namespace.checked_mul(16)?)?
+        .checked_add(partition)
 }
 
 fn relative_path(entry: &axfs::BlockInventoryEntry) -> String {
@@ -148,24 +218,179 @@ pub(super) fn augment_loop(dir: &mut DirMapping, fs: &Arc<SimpleFs>, id: DeviceI
 
 pub(super) fn class_root(fs: Arc<SimpleFs>) -> DirMapping {
     let mut root = DirMapping::new();
-    let mut block = DirMapping::new();
-    for number in 0..16 {
-        block.add(
-            format!("loop{number}"),
-            SimpleFile::new(fs.clone(), NodeType::Symlink, move || {
-                Ok(format!("../../block/loop{number}"))
-            }),
-        );
-    }
-    for entry in axfs::block_inventory() {
-        let target = format!("../../block/{}", relative_path(&entry));
-        block.add(
-            &entry.name,
-            SimpleFile::new(fs.clone(), NodeType::Symlink, move || Ok(target.clone())),
-        );
-    }
-    root.add("block", SimpleDir::new_maker(fs, Arc::new(block)));
+    root.add("block", block_class_root(fs));
     root
+}
+
+pub(super) fn block_class_root(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
+    SimpleDir::new_maker(fs.clone(), Arc::new(BlockClassOps { fs }))
+}
+
+pub(super) fn block_root(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
+    SimpleDir::new_maker(fs.clone(), Arc::new(BlockRootOps { fs }))
+}
+
+pub(super) fn dev_block_root(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
+    SimpleDir::new_maker(fs.clone(), Arc::new(DevBlockRootOps { fs }))
+}
+
+fn owned_names<'a>(names: impl IntoIterator<Item = String>) -> VfsResult<ChildNames<'a>> {
+    let mut owned = Vec::new();
+    for name in names {
+        owned.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+        owned.push(FsNameBuf::from_vec(name.into_bytes()).map_err(|_| VfsError::InvalidInput)?);
+    }
+    try_boxed_names(owned.into_iter().map(Cow::Owned))
+}
+
+struct BlockClassOps {
+    fs: Arc<SimpleFs>,
+}
+
+impl SimpleDirOps for BlockClassOps {
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
+        let mut names = Vec::new();
+        for number in 0..16 {
+            names.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+            names.push(format!("loop{number}"));
+        }
+        for entry in axfs::block_inventory() {
+            names.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+            names.push(entry.name);
+        }
+        owned_names(names)
+    }
+
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
+        let name = core::str::from_utf8(name.as_bytes()).map_err(|_| VfsError::NotFound)?;
+        let target = if let Some(number) = name
+            .strip_prefix("loop")
+            .and_then(|n| n.parse::<u32>().ok())
+        {
+            if number >= 16 {
+                return Err(VfsError::NotFound);
+            }
+            format!("../../block/loop{number}")
+        } else {
+            let entry = axfs::block_inventory()
+                .into_iter()
+                .find(|entry| entry.name == name)
+                .ok_or(VfsError::NotFound)?;
+            format!("../../block/{}", relative_path(&entry))
+        };
+        Ok(
+            SimpleFile::new(self.fs.clone(), NodeType::Symlink, move || {
+                Ok(target.clone())
+            })
+            .into(),
+        )
+    }
+
+    fn is_cacheable(&self) -> bool {
+        false
+    }
+}
+
+struct BlockRootOps {
+    fs: Arc<SimpleFs>,
+}
+
+impl SimpleDirOps for BlockRootOps {
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
+        let mut names = Vec::new();
+        for number in 0..16 {
+            names.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+            names.push(format!("loop{number}"));
+        }
+        for entry in axfs::block_inventory()
+            .into_iter()
+            .filter(|entry| entry.partition.is_none())
+        {
+            names.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+            names.push(entry.name);
+        }
+        owned_names(names)
+    }
+
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
+        let name = core::str::from_utf8(name.as_bytes()).map_err(|_| VfsError::NotFound)?;
+        if let Some(number) = name
+            .strip_prefix("loop")
+            .and_then(|n| n.parse::<u32>().ok())
+        {
+            if number >= 16 {
+                return Err(VfsError::NotFound);
+            }
+            return Ok(NodeOpsMux::Dir(super::sys::loop_block_device_dir(
+                self.fs.clone(),
+                number,
+                String::from(name),
+                DeviceId::new(7, number),
+            )));
+        }
+        let entry = axfs::block_inventory()
+            .into_iter()
+            .find(|entry| entry.name == name && entry.partition.is_none())
+            .ok_or(VfsError::NotFound)?;
+        let id = device_id(name).ok_or(VfsError::NotFound)?;
+        Ok(NodeOpsMux::Dir(super::sys::block_device_dir(
+            self.fs.clone(),
+            String::from(name),
+            id,
+            entry.info,
+        )))
+    }
+
+    fn is_cacheable(&self) -> bool {
+        false
+    }
+}
+
+struct DevBlockRootOps {
+    fs: Arc<SimpleFs>,
+}
+
+impl SimpleDirOps for DevBlockRootOps {
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
+        let mut names = Vec::new();
+        for number in 0..16 {
+            names.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+            names.push(format!("7:{number}"));
+        }
+        for entry in axfs::block_inventory() {
+            if let Some(id) = device_id(&entry.name) {
+                names.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+                names.push(format!("{}:{}", id.major(), id.minor()));
+            }
+        }
+        owned_names(names)
+    }
+
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
+        let name = core::str::from_utf8(name.as_bytes()).map_err(|_| VfsError::NotFound)?;
+        let (major, minor) = name.split_once(':').ok_or(VfsError::NotFound)?;
+        let major = major.parse::<u32>().map_err(|_| VfsError::NotFound)?;
+        let minor = minor.parse::<u32>().map_err(|_| VfsError::NotFound)?;
+        let target = if major == 7 && minor < 16 {
+            format!("../../block/loop{minor}")
+        } else {
+            let entry = axfs::block_inventory()
+                .into_iter()
+                .find(|entry| device_id(&entry.name) == Some(DeviceId::new(major, minor)))
+                .ok_or(VfsError::NotFound)?;
+            format!("../../block/{}", relative_path(&entry))
+        };
+        Ok(
+            SimpleFile::new(self.fs.clone(), NodeType::Symlink, move || {
+                Ok(target.clone())
+            })
+            .into(),
+        )
+    }
+
+    fn is_cacheable(&self) -> bool {
+        false
+    }
 }
 
 fn partition_row(out: &mut String, id: DeviceId, sectors: u64, name: &str) {
@@ -247,5 +472,17 @@ mod tests {
             "MAJOR=259\nMINOR=7\nDEVNAME=nvme0n1p7\nDEVTYPE=partition\nPARTN=7\n"
         );
         assert_eq!(dev_text(DeviceId::new(259, 7)), "259:7\n");
+    }
+
+    #[test]
+    fn pci_storage_device_ids_are_stable_across_registry_changes() {
+        assert_eq!(sd_device_minor("sda"), Some(16));
+        assert_eq!(sd_device_minor("sda1"), Some(17));
+        assert_eq!(sd_device_minor("sdaa"), Some(16 * 27));
+        assert_eq!(mmc_device_minor("mmcblk2"), Some(16));
+        assert_eq!(mmc_device_minor("mmcblk2p3"), Some(19));
+        assert_eq!(nvme_device_minor("nvme0n1"), Some(0));
+        assert_eq!(nvme_device_minor("nvme0n1p2"), Some(2));
+        assert_eq!(nvme_device_minor("nvme1n1"), Some(1 << 20));
     }
 }

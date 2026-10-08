@@ -64,7 +64,10 @@ pub(crate) fn account_backing_read(_bytes: usize) {}
 pub(crate) fn account_backing_write(_bytes: usize) {}
 
 mod block_inventory;
-pub use block_inventory::{block_inventory, BlockInventoryEntry};
+pub use block_inventory::{
+    add_block_device, block_inventory, remove_block_device, rescan_gpt_partitions,
+    BlockInventoryEntry, PartitionRescanError,
+};
 
 mod fs;
 #[cfg(feature = "btrfs")]
@@ -662,6 +665,23 @@ pub fn block_device_statistics(name: &str) -> Option<axdriver::block_statistics:
         EXTRA_BLOCK_DEVICES.get()?.lock().iter().find(|entry| entry.name == name)?.device.clone()
     };
     device.statistics()
+}
+
+/// Stable shared-queue identity for validating already-open block nodes after
+/// registry removal or same-name replacement.
+pub fn block_device_identity_token(name: &str) -> Option<usize> {
+    let device = if name == ROOT_BLOCK_DEVICE_NAME {
+        ROOT_BLOCK_DEVICE.get()?.device.clone()
+    } else {
+        EXTRA_BLOCK_DEVICES
+            .get()?
+            .lock()
+            .iter()
+            .find(|entry| entry.name == name)?
+            .device
+            .clone()
+    };
+    Some(device.identity_token())
 }
 
 pub fn root_block_device_info() -> Option<BlockDeviceInfo> {
