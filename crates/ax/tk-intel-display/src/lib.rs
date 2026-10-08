@@ -22,6 +22,7 @@ pub mod intel_bios;
 pub mod opregion;
 pub mod pipe_config;
 pub mod power_map;
+pub mod power_well;
 pub mod scaler;
 pub mod tc;
 pub mod universal_plane;

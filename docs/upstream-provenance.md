@@ -1000,3 +1000,9 @@ power-well domain lists and descriptor groups from Linux v7.2.3
 `drivers/gpu/drm/i915/display/intel_display_power_map.c` (`tgl_power_wells`,
 `rkl_power_wells`, `adls_power_wells`, and `xelpd_power_wells`; MIT, Copyright
 © 2022 Intel). The kernel sequence still needs to consume these descriptors.
+
+`crates/ax/tk-intel-display/src/power_well.rs` translates the HSW-style
+requester, fuse, enable/disable, and state-query helpers from Linux v7.2.3
+`intel_display_power_well.c` (MIT, Copyright © 2022 Intel). The typed kernel
+register adapter consumes the translated handshake for the current PW_1 and
+DDI-IO paths; IRQ-coupled wells and full refcount lifecycle remain.

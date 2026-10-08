@@ -549,3 +549,8 @@ statement above: package parsing is now implemented; the MMIO loader is not.
 power-domain and power-well tables from Linux v7.2.3
 `intel_display_power_map.c` (Copyright © 2022 Intel). The tables add no firmware
 or binary inputs; register/refcount use remains a separate kernel task.
+
+The MIT `intel_display_power_well.c` request/fuse helpers are translated in
+`tk-intel-display/src/power_well.rs` (Copyright © 2022 Intel), with the current
+kernel adapter invoking them using typed register access. No firmware or binary
+payload is imported by this code.

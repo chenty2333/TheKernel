@@ -44,24 +44,17 @@
 //!
 //! ## Which poll failures are fatal, and why not all of them
 //!
-//! Every poll here is bounded and every failure is reported; they differ in
-//! whether the sequence can continue.
+//! The HSW well handshake is delegated to the source-shaped
+//! `tk-intel-display::power_well` translation. Its `STATE` and fuse timeouts
+//! are reported and continue, matching i915's warning behavior; transport
+//! errors remain errors. The DBUF and later PHY observations still belong to
+//! this boot-sequence adapter.
 //!
-//! * **`PW_1`'s `STATE` bit is fatal.**  It is the hardware's own statement
-//!   that the well is up.  Continuing past it would read zeros for the rest of
-//!   the bring-up and produce exactly the "dead device" confusion §4.2 warns
-//!   about.
-//! * **The `PG0` fuse is fatal.**  It is the root of the tree: nothing under it
-//!   is powered if it is not distributed, and §11 phase 1.3 lists it as a
-//!   precondition of the request.
-//! * **A well's own `PG` fuse is recorded, not fatal.**  `[I915]`
-//!   `gen9_wait_for_power_well_fuses` warns and continues, and for the wells
-//!   above `PW_1` the fuse bit position is an `[INF]`: §4.4 derives `PG6`..`PG9`
-//!   for indices 5..8 from `SKL_FUSE_PG_DIST_STATUS(pg) = 1 << (27 - pg)`, and
-//!   §13.1 item 1 says the whole ADL-N power-well map has to be verified on
-//!   hardware rather than inferred.  Refusing to continue on an inferred bit
-//!   position would turn a documented unknown into a boot failure, while the
-//!   `STATE` bit already answers the question that matters.
+//! * **Power-well state and fuse timeouts are recorded, not fatal.** `[I915]`
+//!   `hsw_wait_for_power_well_enable` and `gen9_wait_for_power_well_fuses`
+//!   warn and continue. The PG6..PG9 positions for the ADL-N wells remain
+//!   explicitly marked as an inference in the map; a timeout is observable
+//!   without substituting a new driver policy for i915's behavior.
 //! * **A DBUF slice's `POWER_STATE` is recorded**; the step is fatal only if
 //!   *no* slice comes up.  Which slices a given SKU has is `[GAP]` (§4.7,
 //!   §13.1 item 3) and i915's own position is "just power up at least 1 slice,
@@ -427,25 +420,23 @@ impl FuseState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FusePoll {
     /// The distribution bit set within the budget.
-    Distributed { readback: u32 },
+    Distributed,
     /// It did not.  `pg` is the power gate, so a log line can name the bit that
     /// should have been at `1 << (27 - pg)`.
-    NotDistributed { pg: u8, readback: u32 },
+    NotDistributed { pg: u8 },
 }
 
 impl FusePoll {
     pub(crate) fn distributed(self) -> bool {
-        matches!(self, Self::Distributed { .. })
+        matches!(self, Self::Distributed)
     }
 
     pub(crate) fn describe(self, what: &str) -> String {
         match self {
-            Self::Distributed { readback } => {
-                format!("{what} distributed (FUSE_STATUS {readback:#010x})")
-            }
-            Self::NotDistributed { pg, readback } => format!(
-                "{what} NOT distributed within {WELL_FUSE_TIMEOUT_US} us: SKL_FUSE_STATUS reads \
-                 {readback:#010x}, so bit {} (1 << (27 - {pg})) is clear",
+            Self::Distributed => format!("{what} distributed"),
+            Self::NotDistributed { pg } => format!(
+                "{what} NOT distributed within {WELL_FUSE_TIMEOUT_US} us: bit {} (1 << (27 - \
+                 {pg})) is clear",
                 27 - pg as u32,
             ),
         }
@@ -787,21 +778,6 @@ pub(crate) enum PowerError {
         writes: u32,
     },
     Phy(phy::PhyError),
-    /// `PW_1`'s precondition: `PG0` never reported its fuse as distributed.
-    Pg0NeverDistributed {
-        fuse_status: u32,
-    },
-    /// The well's `STATE` bit never set.  §11 phase 1.3 lists what this means.
-    WellStateNeverSet {
-        well: &'static str,
-        index: u32,
-        control: u32,
-        requesters: Requesters,
-        /// Whether the request bit this call added has been withdrawn.  It is
-        /// false when the bit was already set before the call, because then it
-        /// is not this call's to withdraw.
-        rolled_back: bool,
-    },
     /// A phase after `PW_1` came up failed.
     ///
     /// The well request this call added is withdrawn before returning, so a
@@ -868,34 +844,6 @@ impl PowerError {
                  hardware may power-gate what the driver is programming, intermittently"
             ),
             Self::Phy(error) => error.describe(),
-            Self::Pg0NeverDistributed { fuse_status } => format!(
-                "PG0's fuse distribution bit never set within {WELL_FUSE_TIMEOUT_US} us: \
-                 SKL_FUSE_STATUS reads {fuse_status:#010x}, so bit 27 is clear.  PG0 is the root \
-                 of the XE_LPD well tree (reference section 4.1), so nothing below it is powered \
-                 and the PW_1 request would be dropped"
-            ),
-            Self::WellStateNeverSet {
-                well,
-                index,
-                control,
-                requesters,
-                rolled_back,
-            } => format!(
-                "power well {well} never reported its state bit: {control:#010x} after requesting \
-                 bit {request:#x} (well index {index}, state bit {state:#x}).  Reference section \
-                 11 phase 1.3 lists the causes in order of likelihood: the well index is wrong; \
-                 the fuse bit is wrong; or another requester is holding the well with a different \
-                 bit pattern -- {}.  The BIOS, KVMR and debug request registers are in the log \
-                 for exactly that comparison.  The request bit this call added was {}",
-                requesters.describe(),
-                if *rolled_back {
-                    "withdrawn, so the well is left as it was found"
-                } else {
-                    "already set before this call, so it was left alone"
-                },
-                request = well_request(*index),
-                state = well_state(*index),
-            ),
             Self::AfterPowerUp {
                 step,
                 cause,
@@ -962,27 +910,6 @@ pub(crate) fn read_fuses(regs: &impl Registers) -> Result<FuseState, PowerError>
     })
 }
 
-/// Poll a power gate's distribution bit.
-fn poll_fuse(regs: &impl Registers, pg: u8) -> Result<FusePoll, PowerError> {
-    let mask = fuse_pg_dist_status(pg);
-    let distributed = regs::poll(
-        regs,
-        regs::SKL_FUSE_STATUS,
-        mask,
-        mask,
-        WELL_FUSE_TIMEOUT_US,
-    )
-    .ok_or(PowerError::Unreadable {
-        register: regs::SKL_FUSE_STATUS.name(),
-    })?;
-    let readback = read(regs, regs::SKL_FUSE_STATUS)?;
-    Ok(if distributed {
-        FusePoll::Distributed { readback }
-    } else {
-        FusePoll::NotDistributed { pg, readback }
-    })
-}
-
 /// Which requesters hold a well's request bit.
 fn requesters(regs: &impl Registers, well: Well) -> Result<Requesters, PowerError> {
     let mask = well.request_mask();
@@ -992,6 +919,85 @@ fn requesters(regs: &impl Registers, well: Well) -> Result<Requesters, PowerErro
         kvmr: read(regs, REQUEST_REGISTERS[2])? & mask != 0,
         debug: read(regs, REQUEST_REGISTERS[3])? & mask != 0,
     })
+}
+
+struct HswPowerWellAdapter<'a, R: Registers> {
+    regs: &'a R,
+}
+
+impl<R: Registers> HswPowerWellAdapter<'_, R> {
+    fn register(offset: u32) -> Option<Register> {
+        [
+            regs::HSW_PWR_WELL_CTL1,
+            regs::HSW_PWR_WELL_CTL2,
+            regs::HSW_PWR_WELL_CTL3,
+            regs::HSW_PWR_WELL_CTL4,
+            regs::ICL_PWR_WELL_CTL_DDI2,
+            regs::ICL_PWR_WELL_CTL_AUX2,
+            regs::SKL_FUSE_STATUS,
+            regs::GEN8_CHICKEN_DCPR_1,
+        ]
+        .into_iter()
+        .find(|register| register.offset() == offset)
+    }
+}
+
+impl<R: Registers> intel_display::RegisterIo for HswPowerWellAdapter<'_, R> {
+    fn read32(&self, offset: u32) -> Result<u32, intel_display::Error> {
+        let register = Self::register(offset).ok_or(intel_display::Error::Unavailable(offset))?;
+        self.regs
+            .read(register)
+            .ok_or(intel_display::Error::Unavailable(offset))
+    }
+
+    fn write32(&self, offset: u32, value: u32) -> Result<(), intel_display::Error> {
+        let register = Self::register(offset).ok_or(intel_display::Error::Unavailable(offset))?;
+        if self.regs.write(register, value) {
+            Ok(())
+        } else {
+            Err(intel_display::Error::Refused)
+        }
+    }
+}
+
+impl<R: Registers> intel_display::power_well::HswPowerWellIo for HswPowerWellAdapter<'_, R> {
+    fn wait_set(
+        &self,
+        register: u32,
+        mask: u32,
+        timeout_ms: u16,
+    ) -> Result<bool, intel_display::Error> {
+        let typed = Self::register(register).ok_or(intel_display::Error::Unavailable(register))?;
+        super::regs::poll(self.regs, typed, mask, mask, u32::from(timeout_ms) * 1_000)
+            .ok_or(intel_display::Error::Unavailable(register))
+    }
+
+    fn wait_clear(
+        &self,
+        register: u32,
+        mask: u32,
+        timeout_ms: u16,
+    ) -> Result<bool, intel_display::Error> {
+        let typed = Self::register(register).ok_or(intel_display::Error::Unavailable(register))?;
+        super::regs::poll(self.regs, typed, mask, 0, u32::from(timeout_ms) * 1_000)
+            .ok_or(intel_display::Error::Unavailable(register))
+    }
+
+    fn post_enable(&self, irq_pipe_mask: u8) -> Result<(), intel_display::Error> {
+        if irq_pipe_mask == 0 {
+            Ok(())
+        } else {
+            Err(intel_display::Error::Refused)
+        }
+    }
+
+    fn pre_disable(&self, irq_pipe_mask: u8) -> Result<(), intel_display::Error> {
+        if irq_pipe_mask == 0 {
+            Ok(())
+        } else {
+            Err(intel_display::Error::Refused)
+        }
+    }
 }
 
 /// Turn off the DC states.
@@ -1036,95 +1042,63 @@ pub(crate) fn disable_dc_states(regs: &impl Registers) -> Result<DcStateObservat
     })
 }
 
-/// Enable one power well.
-///
-/// §4.4's handshake, with §4.5's ADL workaround in front of it:
-///
-/// ```text
-/// if this well's power gate is PG1: GEN8_CHICKEN_DCPR_1 |= DISABLE_FLR_SRC
-/// if this well's power gate is PG1: poll PG0's fuse distribution bit
-/// HSW_PWR_WELL_CTL2 |= REQ(index)
-/// poll HSW_PWR_WELL_CTL2.STATE(index)
-/// poll this well's PG fuse distribution bit
-/// ```
-///
-/// `Wa_16013190616` is `IS_ALDERLAKE_P` in i915, and ADL-N is a subplatform of
-/// ADL-P, so it applies here.  `[I915]`
-/// `display/intel_display_power_well.c:342-384`.
-///
-/// Only the `STATE` poll is fatal; see the module header for why the fuse polls
-/// are recorded instead.
-pub(crate) fn enable_well(
-    regs: &impl Registers,
+/// Enable one HSW-style power well using i915's request/fuse sequence.
+// upstream: intel_display_power_well.c hsw_power_well_enable()
+pub(crate) fn enable_well<R: Registers>(
+    regs: &R,
     well: Well,
 ) -> Result<WellObservation, PowerError> {
-    // The workaround goes first, before the request write, which is the whole
-    // point of it.  `PG0` is polled next, and only for a PG1 well, because
-    // `[I915]` waits for PG0 only when the gate it is enabling is PG1.
-    let mut pg0 = None;
-    if well.pg == Some(SKL_PG1) {
-        rmw(regs, regs::GEN8_CHICKEN_DCPR_1, 0, DISABLE_FLR_SRC)?;
-        let polled = poll_fuse(regs, SKL_PG0)?;
-        if let FusePoll::NotDistributed { readback, .. } = polled {
-            return Err(PowerError::Pg0NeverDistributed {
-                fuse_status: readback,
-            });
-        }
-        pg0 = Some(polled);
-    }
-
+    // This observation belongs to the surrounding transaction, not the
+    // translated HSW helper: it records who owned the request before handoff.
     let control_before = read(regs, well.register)?;
     let already_on = control_before & well.state_mask() != 0;
-    // Whether *this call* is the one adding the request bit.  It is the
-    // difference between a bit this call may withdraw and one that belongs to
-    // whoever set it earlier.
-    let we_request = control_before & well.request_mask() == 0;
-
-    rmw(regs, well.register, 0, well.request_mask())?;
-
-    // The write is posted.  The poll below is what establishes that the device
-    // saw it, so no separate posting read is needed here; the state bit is the
-    // acknowledgement.
-    let state_set = regs::poll(
-        regs,
-        well.register,
-        well.state_mask(),
-        well.state_mask(),
-        well.timeout_us,
-    )
-    .ok_or(PowerError::Unreadable {
-        register: well.register.name(),
-    })?;
-    if !state_set {
-        // The diagnostic describes the state at the moment of failure, so it is
-        // read before the rollback: a report that said "nobody requested this
-        // well" because the rollback had already run would be actively
-        // misleading about the one thing section 11 phase 1.3 asks a reader to
-        // compare.
-        let control = read(regs, well.register)?;
-        let requesters = requesters(regs, well)?;
-        // Then withdraw the request this call added.  Leaving it set would make
-        // the next attempt -- and anyone reading the register afterwards --
-        // unable to tell whether the bit was there before, which is the
-        // difference between a retry and a diagnosis.
-        let rolled_back = we_request && rmw(regs, well.register, well.request_mask(), 0).is_ok();
-        return Err(PowerError::WellStateNeverSet {
-            well: well.name,
-            index: well.index,
-            control,
-            requesters,
-            rolled_back,
-        });
-    }
-
-    // The well's own gate is polled after the state bit, for every well that
-    // has fuses -- including PW_1, whose gate is PG1.  i915 polls *both* PG0
-    // (before the request) and the well's own gate (after the state bit) for a
-    // PG1 well, and only its own gate for the others.
-    let pg = match well.pg {
-        Some(pg) => Some(poll_fuse(regs, pg)?),
-        None => None,
+    let adapter = HswPowerWellAdapter { regs };
+    let spec = intel_display::power_well::HswWellSpec {
+        name: well.name,
+        registers: intel_display::power_well::HswWellRegisters {
+            bios: REQUEST_REGISTERS[0].offset(),
+            driver: well.register.offset(),
+            kvmr: Some(REQUEST_REGISTERS[2].offset()),
+            debug: REQUEST_REGISTERS[3].offset(),
+            fuse_status: regs::SKL_FUSE_STATUS.offset(),
+            gen8_chicken_dcpr1: regs::GEN8_CHICKEN_DCPR_1.offset(),
+        },
+        index: well.index as u8,
+        pg: well.pg,
+        timeout_ms: well.timeout_us.div_ceil(1_000) as u16,
+        has_fuses: well.pg.is_some(),
+        alderlake_pw1_wa: well.pg == Some(SKL_PG1),
+        irq_pipe_mask: 0,
     };
+    let enable =
+        intel_display::power_well::hsw_power_well_enable(&adapter, spec).map_err(|error| {
+            match error {
+                intel_display::Error::Unavailable(offset) => PowerError::Unreadable {
+                    register: HswPowerWellAdapter::<R>::register(offset)
+                        .map(Register::name)
+                        .unwrap_or(well.register.name()),
+                },
+                _ => PowerError::WriteRefused {
+                    register: well.register.name(),
+                },
+            }
+        })?;
+    let pg0 = enable.pg0_distributed.map(|distributed| {
+        if distributed {
+            FusePoll::Distributed
+        } else {
+            FusePoll::NotDistributed { pg: SKL_PG0 }
+        }
+    });
+    let pg = enable.pg_distributed.map(|distributed| {
+        if distributed {
+            FusePoll::Distributed
+        } else {
+            FusePoll::NotDistributed {
+                pg: well.pg.unwrap_or(SKL_PG0),
+            }
+        }
+    });
 
     Ok(WellObservation {
         name: well.name,
@@ -1132,7 +1106,7 @@ pub(crate) fn enable_well(
         control_before,
         control_after: read(regs, well.register)?,
         already_on,
-        state_set: true,
+        state_set: enable.state_set,
         pg0,
         pg,
         requesters: requesters(regs, well)?,
@@ -1650,56 +1624,48 @@ mod tests {
     }
 
     #[test]
-    fn a_well_whose_state_never_sets_names_every_cause_it_can() {
-        // §11 phase 1.3's documented failure, with the requester comparison the
-        // reference tells a reader to make.
+    fn hsw_state_timeout_is_recorded_and_requester_owners_remain_visible() {
         let regs = powered_machine();
-        // The mock's PNV request bit never produces a state bit for PW_1: set
-        // the derive hook to drop it.
+        // The mock request lands but the power well never acknowledges it.
         regs.derive(regs::HSW_PWR_WELL_CTL2, |written| {
             written & !PW_1.state_mask()
         });
-        // The BIOS request register is read, not written, so the mock has to
-        // answer with the bit rather than remember a write.
         regs.on_read(regs::HSW_PWR_WELL_CTL1, |stored| {
             stored | PW_1.request_mask()
         });
 
-        let error = bring_up(&regs).unwrap_err();
-        match error {
-            PowerError::WellStateNeverSet {
-                well,
-                index,
-                requesters,
-                ..
-            } => {
-                assert_eq!(well, "PW_1");
-                assert_eq!(index, 0);
-                assert!(requesters.bios, "the BIOS request must be reported");
-                assert!(requesters.driver);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-        let text = error.describe();
+        let observation = enable_well(&regs, PW_1).unwrap();
+        assert!(!observation.state_set);
+        assert!(
+            observation.requesters.bios,
+            "the BIOS request must be reported"
+        );
+        assert!(observation.requesters.driver);
+        assert_eq!(
+            observation.control_after & PW_1.request_mask(),
+            PW_1.request_mask()
+        );
+        let text = observation.describe();
         assert!(text.contains("well index 0"), "{text}");
-        assert!(text.contains("requesting bit 0x2"), "{text}");
+        assert!(text.contains("NEVER CAME UP"), "{text}");
         assert!(text.contains("requesters: bios 1 driver 1"), "{text}");
     }
 
     #[test]
-    fn a_pg0_that_is_not_distributed_stops_the_well_before_the_request() {
-        // PG0 is the root of the tree, so a well requested under an
-        // undistributed root would be dropped.  Reference §4.4 and §11 1.3.
+    fn fuse_timeouts_are_reported_but_do_not_short_circuit_hsw_well_enable() {
         let regs = powered_machine();
         regs.set(regs::SKL_FUSE_STATUS, 0);
-        let error = bring_up(&regs).unwrap_err();
-        assert!(matches!(error, PowerError::Pg0NeverDistributed { .. }));
-        assert!(error.describe().contains("bit 27"));
-        // The request was never written, so the log cannot be misread as "the
-        // well was asked for and did not come up".
+        let observation = enable_well(&regs, PW_1).unwrap();
+        assert_eq!(
+            observation.pg0,
+            Some(FusePoll::NotDistributed { pg: SKL_PG0 })
+        );
+        assert_eq!(
+            observation.pg,
+            Some(FusePoll::NotDistributed { pg: SKL_PG1 })
+        );
         assert!(
-            !regs
-                .writes()
+            regs.writes()
                 .iter()
                 .any(|(name, _)| *name == regs::HSW_PWR_WELL_CTL2.name())
         );
@@ -1856,28 +1822,17 @@ mod tests {
     }
 
     #[test]
-    fn a_well_whose_state_never_sets_withdraws_the_request_it_added() {
-        // Rollback, at the handshake: the request bit this call added must not
-        // be left behind, or the next attempt cannot tell whether it was there
-        // before.
+    fn a_well_state_timeout_leaves_hsw_request_bit_for_domain_owner_cleanup() {
         let regs = powered_machine();
         regs.derive(regs::HSW_PWR_WELL_CTL2, |written| {
             written & !PW_1.state_mask()
         });
-        let error = enable_well(&regs, PW_1).unwrap_err();
-        match error {
-            PowerError::WellStateNeverSet { rolled_back, .. } => assert!(rolled_back),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let observation = enable_well(&regs, PW_1).unwrap();
+        assert!(!observation.state_set);
         assert_eq!(
             regs.read(regs::HSW_PWR_WELL_CTL2).unwrap() & PW_1.request_mask(),
-            0,
-            "the request bit must be gone"
-        );
-        assert!(
-            error.describe().contains("withdrawn"),
-            "{}",
-            error.describe()
+            PW_1.request_mask(),
+            "i915 leaves the request to the power-domain refcount owner"
         );
 
         // A request bit that was already set is not this call's to withdraw.
@@ -1886,11 +1841,8 @@ mod tests {
         regs.derive(regs::HSW_PWR_WELL_CTL2, |written| {
             written & !PW_1.state_mask()
         });
-        let error = enable_well(&regs, PW_1).unwrap_err();
-        match error {
-            PowerError::WellStateNeverSet { rolled_back, .. } => assert!(!rolled_back),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let observation = enable_well(&regs, PW_1).unwrap();
+        assert!(!observation.state_set);
         assert_eq!(
             regs.read(regs::HSW_PWR_WELL_CTL2).unwrap() & PW_1.request_mask(),
             PW_1.request_mask(),

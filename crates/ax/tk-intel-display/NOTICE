@@ -256,3 +256,10 @@ ADL-S and display-13 XELPD domain lists, well groups, platform order, and
 instance metadata from intel_display_power_map.c. Copyright ©2022 Intel
 Corporation; full grant in LICENSE-MIT. Kernel MMIO/refcount integration is
 separate and remains in progress.
+
+Haswell power-well handshake: src/power_well.rs translates
+intel_display_power_well.c::pw_idx_to_pg(), hsw_power_well_requesters(),
+gen9_wait_for_power_well_fuses(), hsw_wait_for_power_well_enable/disable(),
+hsw_power_well_enable/disable(), and hsw_power_well_enabled() (MIT, Copyright
+©2022 Intel). The kernel's typed register adapter uses this path for PW_1 and
+the current DDI-IO power requests; interrupt-dependent well variants remain.

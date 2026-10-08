@@ -297,7 +297,6 @@ impl ConnectReport {
 /// The order is the reference's and it is load-bearing: the wells are requested
 /// before the first GMBUS transaction, because a channel behind a shut gate
 /// NAKs every address and looks exactly like a port with nothing on it.
-//
 // `clippy::result_large_err` fires here and on the closure in
 // `resolve_device` that produces this value.  What it measures is real:
 // clippy sizes the largest variant, `ConnectError::WellDown`, at 128 bytes,
@@ -344,7 +343,6 @@ pub(crate) struct Resolved {
 /// closure so that every early return below still reaches it: a device that
 /// produced no connector has still answered the hotplug read, and that answer
 /// is the baseline the after-boot watch needs.
-//
 // The closure returns the same `Result<Connector, ConnectError>` as `resolve`,
 // and the note above that function is where the reason this lint is allowed
 // rather than answered with a `Box` is written out.
@@ -472,54 +470,25 @@ fn enable_wells<R: Registers>(regs: &R) -> Wells {
     Wells { records, down }
 }
 
-/// The record a failed well enable leaves behind.
-///
-/// `power::enable_well` reports a failure as a [`PowerError`], because its
-/// caller is expected to stop; this step does not stop, so the failure is
-/// turned back into the shape a successful enable produces and recorded beside
-/// it.  A `STATE` bit that never set is reported with the words the error kept
-/// -- the register as it read at the moment of failure, and the requesters that
-/// were holding it then -- which are the numbers §11 phase 1.3 asks a reader to
-/// compare; both control words hold that one snapshot, because the value from
-/// before the request was consumed by the handshake and the register has since
-/// been rolled back, so the snapshot is the only honest number left.
-///
-/// The other two ways to fail -- a window that does not reach
-/// `ICL_PWR_WELL_CTL_AUX2`, a write the register table refuses -- are bugs in
-/// this kernel rather than states of the machine: there are no register words
-/// to report, and the [`PowerError`] beside this record is their whole account.
+/// The observation shape for a power-well request that failed at the MMIO
+/// adapter boundary. i915's HSW helper reports state/fuse timeouts in a normal
+/// observation and does not turn them into this transport-error fallback.
 fn observation_of(well: AuxWell, cause: &PowerError) -> WellObservation {
-    match cause {
-        PowerError::WellStateNeverSet {
-            control,
-            requesters,
-            ..
-        } => WellObservation {
-            name: well.name(),
-            index: well.index(),
-            control_before: *control,
-            control_after: *control,
-            already_on: false,
-            state_set: false,
-            pg0: None,
-            pg: None,
-            requesters: *requesters,
-        },
-        _ => WellObservation {
-            name: well.name(),
-            index: well.index(),
-            control_before: 0,
-            control_after: 0,
-            already_on: false,
-            state_set: false,
-            pg0: None,
-            pg: None,
-            requesters: Requesters {
-                bios: false,
-                driver: false,
-                kvmr: false,
-                debug: false,
-            },
+    let _ = cause;
+    WellObservation {
+        name: well.name(),
+        index: well.index(),
+        control_before: 0,
+        control_after: 0,
+        already_on: false,
+        state_set: false,
+        pg0: None,
+        pg: None,
+        requesters: Requesters {
+            bios: false,
+            driver: false,
+            kvmr: false,
+            debug: false,
         },
     }
 }

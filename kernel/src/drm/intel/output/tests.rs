@@ -1428,30 +1428,23 @@ fn the_platform_reference_comes_from_skl_dssm_and_an_undefined_field_is_an_error
     assert_eq!(read_platform_reference_khz(&regs).unwrap(), 24_000);
 }
 
-/// A DBUF state of "no well" style failure: the DDI-IO well that never comes
-/// up leaves the request bit withdrawn, which is `power.rs`'s rollback
-/// observed through this sequence.
+/// i915 warns and continues if the DDI-IO state bit never acknowledges the
+/// request; the domain refcount owner keeps the request until its later put.
 #[test]
-fn a_ddi_io_well_that_never_comes_up_leaves_no_request_bit_set() {
+fn a_ddi_io_well_timeout_is_reported_and_keeps_the_request() {
     let regs = MockRegisters::new();
     // Make the PLL behave so the failure is the well's and nothing earlier.
     regs.derive(dpll::DPLL0_ENABLE, |value| {
         value | PLL_POWER_STATE | if value & PLL_ENABLE != 0 { PLL_LOCK } else { 0 }
     });
-    let error = program(&regs, &target_plan()).expect_err("the well never reports state");
-    match &error {
-        OutputError::Well(PowerError::WellStateNeverSet {
-            well, rolled_back, ..
-        }) => {
-            assert_eq!(*well, "DDI_IO_A");
-            assert!(*rolled_back, "the request this call added was withdrawn");
-        }
-        other => panic!("wrong error: {other:?}"),
-    }
+    let state =
+        program(&regs, &target_plan()).expect("i915 continues after the timed-out handshake");
+    assert_eq!(state.ddi_io_well.name, "DDI_IO_A");
+    assert!(!state.ddi_io_well.state_set);
     assert_eq!(
         regs.read(regs::ICL_PWR_WELL_CTL_DDI2),
-        Some(0),
-        "the request bit must not be left set"
+        Some(power::well_request(0)),
+        "the request remains owned by the domain refcount until put"
     );
 }
 
