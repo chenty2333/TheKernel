@@ -90,3 +90,4 @@
 - Wireless payload builder was made repeatable by replacing only its private bootstrap/stage workspace on each run; the full build-guest-tools wireless dispatch was rerun successfully with cached signed APK inputs.
 - `ieee80211_input.c` U-APSD setup now matches OpenBSD's peer/local/QoS gating and stores access-category/service-period state for beacon and association nodes; `tk-net80211` input.c marker coverage is 35/48, with remaining upstream framework/notyet/hostap/hardware-reorder functions explained in wifi-net80211.md.
 - Fuchsia WLAN Rust reuse was checked: ieee80211/RSN GN crates depend on FIDL, std and Fuchsia/Zircon/BoringSSL targets, so they are not drop-in no_std crates; wpa_supplicant remains the standard userspace PAE owner.
+- Corrected NL80211_ATTR_IFTYPE to its UAPI u32 payload width (the supported-iftypes nested attribute remains an enum-valued nested key); `tk-kernel --tests` host check and x86_64-unknown-none product check passed.

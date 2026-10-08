@@ -28,7 +28,8 @@ const ATTR_IFTYPE: u16 = 5;
 const ATTR_MAC: u16 = 6;
 const ATTR_SUPPORTED_IFTYPES: u16 = 32;
 const ATTR_SPLIT_WIPHY_DUMP: u16 = 174;
-const IFTYPE_STATION: u16 = 2;
+const IFTYPE_STATION: u32 = 2;
+const IFTYPE_STATION_ATTR: u16 = 2;
 const NLM_F_DUMP: u16 = 0x0300;
 
 const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
@@ -220,7 +221,7 @@ fn wiphy_message(
         &format!("phy{}", interface.phy_index),
     );
     let mut interface_types = Vec::new();
-    push_attr(&mut interface_types, IFTYPE_STATION, &[]);
+    push_attr(&mut interface_types, IFTYPE_STATION_ATTR, &[]);
     push_attr(
         &mut payload,
         ATTR_SUPPORTED_IFTYPES | NLA_F_NESTED,
@@ -378,7 +379,7 @@ mod tests {
                 Ok(())
             }
             ATTR_IFTYPE => {
-                iftype = Some(u16::from_ne_bytes(value.try_into().unwrap()));
+                iftype = Some(u32::from_ne_bytes(value.try_into().unwrap()));
                 Ok(())
             }
             _ => Ok(()),
