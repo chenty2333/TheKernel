@@ -8,6 +8,9 @@
 
 pub const E1000_CTRL: u32 = 0x00000;
 pub const E1000_CTRL_DUP: u32 = 0x00004;
+/// ICH/PCH-specific strap and host-to-management-engine registers.
+pub const E1000_STRAP: u32 = 0x0000C;
+pub const E1000_H2ME: u32 = 0x05B50;
 pub const E1000_STATUS: u32 = 0x00008;
 pub const E1000_EECD: u32 = 0x00010;
 pub const E1000_EERD: u32 = 0x00014;

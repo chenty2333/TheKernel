@@ -5,7 +5,7 @@
 //! Copyright (c) 2001-2020, Intel Corporation.
 
 /// MAC generation chosen by `e1000_set_mac_type()` from the PCI device ID.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum E1000MacType {
     I82542,
     I82543,

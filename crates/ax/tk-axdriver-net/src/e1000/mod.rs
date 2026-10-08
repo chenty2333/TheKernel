@@ -17,3 +17,5 @@ pub mod phy;
 pub mod registers;
 
 pub use nic::{E1000Hal, E1000Nic, MAX_FRAME_BYTES, RX_BUFFER_BYTES};
+
+pub mod chipich8;
