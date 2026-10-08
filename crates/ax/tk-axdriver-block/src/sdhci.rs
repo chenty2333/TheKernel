@@ -1107,15 +1107,20 @@ impl<I: SdhciIo> SdhciDisk<I> {
                 SD_R1 | SD_DATA,
                 Some(&mut switch_status),
                 64,
-            )?;
-            if switch_status[13] & 0x02 != 0 && host.capabilities & SDHCI_CAN_DO_HISPD != 0 {
-                host.command(
-                    SD_CMD_SWITCH_FUNC,
-                    0x80ff_fff1,
-                    SD_R1 | SD_DATA,
-                    Some(&mut switch_status),
-                    64,
-                )?;
+            )
+            .ok();
+            if switch_status[13] & 0x02 != 0
+                && host.capabilities & SDHCI_CAN_DO_HISPD != 0
+                && host
+                    .command(
+                        SD_CMD_SWITCH_FUNC,
+                        0x80ff_fff1,
+                        SD_R1 | SD_DATA,
+                        Some(&mut switch_status),
+                        64,
+                    )
+                    .is_ok()
+            {
                 if switch_status[16] & 0x0f == 1 {
                     host.set_high_speed(host.base_clock_hz.min(50_000_000))?;
                 }
