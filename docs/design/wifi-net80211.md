@@ -66,3 +66,6 @@ Candidate selection matches the scan table traversal, skips/ages prior
 association failures, tracks the current BSS, and uses the source all-band
 policy that prefers 5 GHz above its roaming threshold before strongest-RSSI
 fallback.
+Scan primitives begin active scans outside hostap mode and select channels in
+source array order with wraparound, leaving passive-only channels pending until
+passive scan and clearing only the channel actually submitted to scan.

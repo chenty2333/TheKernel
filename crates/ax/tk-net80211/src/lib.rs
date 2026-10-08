@@ -16,6 +16,7 @@ mod rates;
 mod regdomain;
 mod rsn;
 mod rssadapt;
+mod scan;
 
 pub use channel::{
     CHAN_2GHZ, CHAN_5GHZ, ChannelRef, ModeSelection, NET_CAP_QOS, NET_CAP_TX_AMPDU, NET_CHAN_2GHZ,
@@ -79,3 +80,4 @@ pub use rssadapt::{
     RSSADAPT_BUCKETS, RssAdapt, RssDescriptor, choose_rate, input_rssi, lower_rate, raise_rate,
     update_stats,
 };
+pub use scan::{ScanError, ScanProgress, ScanStep, begin_scan, next_scan_channel};
