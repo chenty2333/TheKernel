@@ -32,4 +32,5 @@
 - `iwx_phy_ctxt_cmd()` now serializes standard and UHB v3/v4 channel-info layouts, LMAC selection, width/control position, and RX-chain masks (`6bc73147`).
 - `iwx_send_cmd()` now has a one-second waiter adapter with generation checks and timeout cleanup that retains external DMA ownership until ACK (`04dd05c6`).
 - Station drain and TXPATH_FLUSH command/response parsing, queue cursor extraction, and guarded drain-flush-undrain order are translated (`a379eae2`).
+- U-APSD trigger-TID priority, firmware AC masks, EDCA AC flags, and service-period decode are translated (pending commit).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.

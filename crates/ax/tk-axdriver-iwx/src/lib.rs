@@ -26,6 +26,7 @@ mod nic;
 mod notif;
 mod nvm;
 mod phy;
+mod power;
 mod queue;
 mod rate;
 mod registers;
@@ -128,6 +129,10 @@ pub use phy::{
     PHY_BAND_5GHZ, PHY_BAND_24GHZ, PHY_CONTEXT_COMMAND, PHY_RX_CHAIN_COUNT_SHIFT,
     PHY_RX_CHAIN_MIMO_COUNT_SHIFT, PHY_RX_CHAIN_VALID_SHIFT, PHY_WIDTH_20, PHY_WIDTH_40,
     PHY_WIDTH_80, PHY_WIDTH_160, PhyContextConfig, PhyContextError, phy_context_command,
+};
+pub use power::{
+    WMM_AC_BE, WMM_AC_BK, WMM_AC_MASK, WMM_AC_VI, WMM_AC_VO, WMM_SP_2, WMM_SP_4, WMM_SP_6,
+    WMM_SP_ALL, WMM_SP_MASK, uapsd_ac_flags, uapsd_ac_mask, uapsd_qndp_tid, uapsd_service_period,
 };
 pub use queue::{
     DATA_PATH_GROUP as TX_DATA_PATH_GROUP, DEFAULT_QUEUE_SIZE, DQA_QUEUE_ADD, DQA_QUEUE_REMOVE,
