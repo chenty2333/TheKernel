@@ -767,6 +767,34 @@ pub fn format_card_id(cid: MmcCid, mmc: bool, high_capacity: bool) -> (String, S
     (id, format!("{:08X}", cid.serial_number))
 }
 
+// upstream: mmcsd.c mmcsd_pretty_size()
+pub fn pretty_size(size_bytes: u64) -> (u64, Option<char>) {
+    let mut value = size_bytes;
+    let mut unit = None;
+    for next_unit in ['k', 'M', 'G'] {
+        if value < 1000 {
+            break;
+        }
+        value = value.saturating_add(499) / 1000;
+        unit = Some(next_unit);
+    }
+    (value, unit)
+}
+
+// upstream: mmcsd.c mmcsd_errmsg()
+pub const fn mmcsd_error_message(error: i32) -> &'static str {
+    match error {
+        0 => "None",
+        1 => "Timeout",
+        2 => "Bad CRC",
+        3 => "Fifo",
+        4 => "Failed",
+        5 => "Invalid",
+        6 => "NO MEMORY",
+        _ => "Bad error code",
+    }
+}
+
 // upstream: mmc.c mmc_read_ext_csd() decoding
 pub fn parse_ext_csd(bytes: &[u8; 512]) -> MmcExtCsd {
     MmcExtCsd {
@@ -3138,6 +3166,17 @@ mod tests {
         let (id, serial) = format_card_id(cid, false, false);
         assert_eq!(id, "SD SD01G 8.0 SN 0028F959 MFG 08/2008 by 3 TN");
         assert_eq!(serial, "0028F959");
+    }
+
+    #[test]
+    fn mmcsd_size_and_error_formatters_match_source_tables() {
+        assert_eq!(pretty_size(999), (999, None));
+        assert_eq!(pretty_size(1_000_000), (1, Some('M')));
+        assert_eq!(pretty_size(1_499_999), (1, Some('M')));
+        assert_eq!(mmcsd_error_message(0), "None");
+        assert_eq!(mmcsd_error_message(6), "NO MEMORY");
+        assert_eq!(mmcsd_error_message(-1), "Bad error code");
+        assert_eq!(mmcsd_error_message(7), "Bad error code");
     }
 
     #[test]
