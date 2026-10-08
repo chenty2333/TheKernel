@@ -54,9 +54,10 @@ the global world alpha2 value; regulatory rule tables and per-phy domains are
 not yet emitted. CONNECT currently admits only an explicitly open, unprotected
 Open-System BSS already present in the scan cache; WPA/RSN and caller-provided
 security IEs fail closed because key installation/data protection are not
-implemented. Successful open CONNECT queues a CONNECT event on the `mlme`
-group, and GET_STATION encodes the associated BSSID and signed signal value
-from the live driver record. DISCONNECT, NEW_KEY/SET_KEY/GET_KEY/DEL_KEY,
-other station/authentication events, and regulatory rule operations remain incomplete.
+implemented. Successful open CONNECT and DISCONNECT queue their standard
+command events on the `mlme` group. GET_STATION encodes the associated BSSID
+and signed signal value from the live driver record. NEW_KEY/SET_KEY/GET_KEY/
+DEL_KEY, other station/authentication events, and regulatory rule operations
+remain incomplete.
 The required no-radio QEMU acceptance is
 deferred until the task-5 command surface is complete; no fake radio is used.

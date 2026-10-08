@@ -241,8 +241,10 @@ is connected. Open-System joins use the cached scan BSS and source net80211
 authentication/association frames, then activate a station queue. Ethernet
 data TX is encapsulated on that queue; RX notifications pass through iwx
 descriptor/duplicate handling and the net80211 station receive path before
-being queued to axnet. WPA/RSN joins, hardware/software key setup, protected
-data, disconnect teardown and asynchronous MLME events are still incomplete.
+being queued to axnet. Open stations can send deauthentication and remove their
+firmware station/binding/MAC/PHY contexts on disconnect. WPA/RSN joins,
+hardware/software key setup, protected data, and unsolicited/asynchronous MLME
+events remain incomplete.
 
 
 ## Guest user-space payload

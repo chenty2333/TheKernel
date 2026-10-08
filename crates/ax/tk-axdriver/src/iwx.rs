@@ -210,8 +210,8 @@ struct AttachedDevice {
     soft_blocked: bool,
 }
 
+#[derive(Clone)]
 struct StationConnection {
-    ssid: Vec<u8>,
     bss: axdriver_net::WirelessBssInfo,
     bssid: [u8; 6],
     frequency_mhz: u32,
@@ -422,6 +422,14 @@ impl NetDriverOps for IwxNetDevice {
                 signal_mbm: station.signal_mbm,
                 association_id: station.association_id,
             })
+    }
+
+    fn disconnect_wireless(&mut self, reason: u16) -> DevResult {
+        disconnect_station(self.bdf, reason).map_err(|error| match error {
+            RuntimeStartError::FirmwareNotReady => DevError::BadState,
+            RuntimeStartError::Transmission | RuntimeStartError::Firmware => DevError::Io,
+            _ => DevError::Unsupported,
+        })
     }
 
     fn wireless_scan_results(&self) -> Vec<axdriver_net::WirelessBssInfo> {
@@ -1101,10 +1109,7 @@ fn connect_station(
     if device.station.is_some() {
         return Err(RuntimeStartError::AlreadyStarted);
     }
-    if request.ssid.is_empty()
-        || request.ssid.len() > 32
-        || request.authentication_type != 0
-    {
+    if request.ssid.is_empty() || request.ssid.len() > 32 || request.authentication_type != 0 {
         return Err(RuntimeStartError::InvalidRequest);
     }
     if !is_open_station_request(request) {
@@ -1291,7 +1296,6 @@ fn connect_station(
         )
         .map_err(|_| RuntimeStartError::Transmission)?;
     device.station = Some(StationConnection {
-        ssid: request.ssid.clone(),
         bss: bss.clone(),
         bssid: bss.bssid,
         frequency_mhz: bss.frequency_mhz,
@@ -1302,6 +1306,177 @@ fn connect_station(
         rx_ethernet: VecDeque::new(),
         nodes,
     });
+    Ok(())
+}
+
+fn disconnect_station(bdf: Bdf, reason: u16) -> Result<(), RuntimeStartError> {
+    let mut devices = ATTACHED_DMA.lock();
+    let device = devices
+        .iter_mut()
+        .find(|device| device.bdf == bdf)
+        .ok_or(RuntimeStartError::DeviceNotFound)?;
+    let Some(station) = device.station.clone() else {
+        return Ok(());
+    };
+    if !device.runtime_started || device.soft_blocked {
+        device.station = None;
+        return Ok(());
+    }
+
+    let local_address = device
+        .nvm
+        .as_ref()
+        .ok_or(RuntimeStartError::FirmwareNotReady)?
+        .hardware_address;
+    let mut tx_sequence = station.tx_sequence;
+    let body = tk_net80211::build_deauth_body(reason);
+    let frame = tx_sequence
+        .frame(
+            tk_net80211::MGMT_SUBTYPE_DEAUTH,
+            station.bssid,
+            local_address,
+            station.bssid,
+            &body,
+            false,
+            false,
+        )
+        .map_err(|_| RuntimeStartError::Transmission)?;
+    send_station_management_frame_locked(device, &frame, |_| {})?;
+
+    let bundle = match device.firmware.as_ref() {
+        Some(Ok(bundle)) => bundle,
+        _ => return Err(RuntimeStartError::FirmwareNotReady),
+    };
+    let queue_version = bundle.image.lookup_command_version(
+        axdriver_iwx::DATA_PATH_GROUP,
+        axdriver_iwx::SCD_QUEUE_CONFIG_CMD,
+    );
+    let queue_ring = device
+        .controller
+        .resources
+        .tx_queues
+        .get(usize::from(IWX_STATION_DATA_QUEUE))
+        .ok_or(RuntimeStartError::Transmission)?;
+    let queue = axdriver_iwx::QueueConfig {
+        station_id: axdriver_iwx::STA_ID_LINK,
+        queue_id: IWX_STATION_DATA_QUEUE,
+        tid: 0,
+        ring_size: axdriver_iwx::DEFAULT_QUEUE_SIZE,
+        byte_count_address: queue_ring.byte_counts.device_address(),
+        tfd_address: queue_ring.descriptors.device_address(),
+    };
+    device
+        .controller
+        .disable_tx_queue(queue, queue_version)
+        .map_err(|_| RuntimeStartError::Transmission)?;
+
+    let nvm = device
+        .nvm
+        .as_ref()
+        .ok_or(RuntimeStartError::FirmwareNotReady)?;
+    let channel = axdriver_iwx::init_channel_map(nvm, device.profile.uhb_supported)
+        .into_iter()
+        .find(|channel| u32::from(channel.frequency_mhz) == station.frequency_mhz)
+        .ok_or(RuntimeStartError::Firmware)?;
+    let antenna_chains = nvm.valid_rx_antennas.count_ones().clamp(1, 2) as u8;
+    let phy = axdriver_iwx::PhyContextConfig {
+        id_and_color: 0,
+        action: axdriver_iwx::PHY_CONTEXT_ACTION_REMOVE,
+        channel: channel.channel,
+        is_24ghz: station.frequency_mhz < 3000,
+        cdb_supported: device.runtime.cdb != 0,
+        ultra_high_band_channels: false,
+        channel_40mhz: false,
+        sco: 0,
+        vht_width: 0,
+        primary_channel_index: i16::from(channel.channel),
+        center_channel_index: i16::from(channel.channel),
+        static_chains: antenna_chains,
+        dynamic_chains: antenna_chains,
+        valid_rx_antennas: nvm.valid_rx_antennas,
+        rlc_command_version: bundle.image.lookup_command_version(
+            axdriver_iwx::DATA_PATH_GROUP,
+            axdriver_iwx::RLC_CONFIG_COMMAND,
+        ),
+        command_version: bundle
+            .image
+            .lookup_command_version(0, axdriver_iwx::PHY_CONTEXT_COMMAND as u8),
+    };
+    let rates = if station.frequency_mhz < 3000 {
+        tk_net80211::STANDARD_RATES_11G
+    } else {
+        tk_net80211::STANDARD_RATES_11A
+    };
+    let mut mac = station_mac_context(
+        device.profile,
+        local_address,
+        &station.bss,
+        &rates.rates[..rates.count],
+        false,
+        0,
+    );
+    mac.action = axdriver_iwx::MAC_ACTION_REMOVE;
+    let mac_version = bundle
+        .image
+        .lookup_command_version(0, axdriver_iwx::MAC_CONTEXT_COMMAND as u8);
+    let binding_version = bundle.image.lookup_command_version(
+        axdriver_iwx::DATA_PATH_GROUP,
+        axdriver_iwx::BINDING_CONTEXT_COMMAND as u8,
+    );
+    axdriver_iwx::deauthenticate(&mut device.association, |step| match step {
+        axdriver_iwx::AssociationStep::UnprotectSession => Ok(()),
+        axdriver_iwx::AssociationStep::RemoveStation => {
+            let command = axdriver_iwx::remove_station_command(false, 0, 0)
+                .map_err(|_| RuntimeStartError::Firmware)?;
+            send_context_command(&mut device.controller, &command)?;
+            Ok(())
+        }
+        axdriver_iwx::AssociationStep::RemoveBinding => {
+            if let Some(command) = axdriver_iwx::binding_command(
+                false,
+                axdriver_iwx::CONTEXT_ACTION_REMOVE,
+                0,
+                0,
+                station.frequency_mhz < 3000,
+                device.runtime.cdb != 0,
+                binding_version,
+                0,
+            )
+            .map_err(|_| RuntimeStartError::Firmware)?
+            {
+                let response = send_context_command(&mut device.controller, &command)?
+                    .ok_or(RuntimeStartError::Firmware)?;
+                if axdriver_iwx::command_response_status(&response, false)
+                    .map_err(|_| RuntimeStartError::Firmware)?
+                    != 0
+                {
+                    return Err(RuntimeStartError::Firmware);
+                }
+            }
+            Ok(())
+        }
+        axdriver_iwx::AssociationStep::RemoveMac => {
+            let command = axdriver_iwx::mac_context_command(&mac, true, mac_version, 0)
+                .map_err(|_| RuntimeStartError::Firmware)?;
+            send_context_command(&mut device.controller, &command)?;
+            Ok(())
+        }
+        axdriver_iwx::AssociationStep::RemovePhy => {
+            let command = axdriver_iwx::phy_context_command(phy, 0, 0)
+                .map_err(|_| RuntimeStartError::Firmware)?;
+            send_context_command(&mut device.controller, &command)?;
+            Ok(())
+        }
+        _ => Err(RuntimeStartError::Firmware),
+    })
+    .map_err(|_| RuntimeStartError::Firmware)?;
+    device
+        .controller
+        .disable_management_queue(queue_version)
+        .map_err(|_| RuntimeStartError::ManagementQueue)?;
+    device.station = None;
+    device.association = axdriver_iwx::AssociationState::default();
+    device.session_protection = axdriver_iwx::SessionProtectionState::default();
     Ok(())
 }
 
@@ -2040,6 +2215,9 @@ pub fn stop_runtime(bdf: DeviceFunction) -> Result<(), RuntimeStartError> {
         .stop_device()
         .map_err(|_| RuntimeStartError::Hardware)?;
     device.runtime_started = false;
+    device.station = None;
+    device.association = axdriver_iwx::AssociationState::default();
+    device.session_protection = axdriver_iwx::SessionProtectionState::default();
     Ok(())
 }
 

@@ -165,6 +165,32 @@ fn publish_connect_event(ifindex: u32, station: &axnet::WirelessStationInfo) {
     );
 }
 
+fn publish_disconnect_event(ifindex: u32, bssid: [u8; 6], reason: u16) {
+    super::queue_nl80211_multicast(
+        disconnect_event_message(ifindex, bssid, reason),
+        NL80211_MLME_GROUP_MASK,
+    );
+}
+
+fn disconnect_event_message(ifindex: u32, bssid: [u8; 6], reason: u16) -> Vec<u8> {
+    let mut payload = payload_with(&GenlMsgHdr {
+        cmd: CMD_DISCONNECT,
+        version: FAMILY_VERSION,
+        reserved: 0,
+    });
+    push_attr(&mut payload, ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    push_attr(&mut payload, ATTR_MAC, &bssid);
+    push_attr(&mut payload, ATTR_REASON_CODE, &reason.to_ne_bytes());
+    let request = NlMsgHdr {
+        nlmsg_len: (size_of::<NlMsgHdr>() + payload.len()) as u32,
+        nlmsg_type: FAMILY_ID,
+        nlmsg_flags: 0,
+        nlmsg_seq: 0,
+        nlmsg_pid: 0,
+    };
+    nl80211_message(&request, 0, FAMILY_ID, payload, false)
+}
+
 fn connect_event_message(ifindex: u32, station: &axnet::WirelessStationInfo) -> Vec<u8> {
     let mut payload = payload_with(&GenlMsgHdr {
         cmd: CMD_CONNECT,
@@ -279,7 +305,13 @@ pub(super) fn handle(
         {
             return Err(AxError::NotFound);
         }
+        let bssid = axnet::wireless_station_info(ifindex)
+            .ok()
+            .map(|station| station.bssid);
         axnet::disconnect_wireless(ifindex, reason)?;
+        if let Some(bssid) = bssid {
+            publish_disconnect_event(ifindex, bssid, reason);
+        }
         return Ok(());
     }
     if request.cmd == CMD_GET_STATION {
@@ -725,6 +757,7 @@ fn wiphy_message(
         CMD_GET_SCAN,
         CMD_GET_REG,
         CMD_CONNECT,
+        CMD_DISCONNECT,
         CMD_GET_STATION,
     ]
     .into_iter()
@@ -1349,6 +1382,34 @@ mod tests {
         .unwrap();
         assert_eq!(status, Some(0));
         assert_eq!(frequency, Some(5180));
+    }
+
+    #[test]
+    fn disconnect_event_has_interface_peer_and_reason() {
+        let message = disconnect_event_message(12, [2, 3, 4, 5, 6, 7], 3);
+        let generic = size_of::<NlMsgHdr>();
+        assert_eq!(message[generic], CMD_DISCONNECT);
+        let mut ifindex = None;
+        let mut address = None;
+        let mut reason = None;
+        for_each_rtattr(
+            &message[generic + size_of::<GenlMsgHdr>()..],
+            |kind, value| {
+                match kind {
+                    ATTR_IFINDEX => ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap())),
+                    ATTR_MAC => address = Some(value.try_into().unwrap()),
+                    ATTR_REASON_CODE => {
+                        reason = Some(u16::from_ne_bytes(value.try_into().unwrap()))
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(ifindex, Some(12));
+        assert_eq!(address, Some([2, 3, 4, 5, 6, 7]));
+        assert_eq!(reason, Some(3));
     }
 
     #[test]
