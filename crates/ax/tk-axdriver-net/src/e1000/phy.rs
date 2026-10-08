@@ -59,6 +59,15 @@ const PHY_AUTO_NEG_LIMIT: usize = 45;
 const MII_SR_LINK_STATUS: u16 = 0x0004;
 const MII_SR_AUTONEG_COMPLETE: u16 = 0x0020;
 const M88E1000_PHY_SPEC_STATUS: u8 = 0x11;
+const M88E1000_PSSR_MDIX: u16 = 0x0040;
+const M88E1000_PSSR_SPEED: u16 = 0xc000;
+const M88E1000_PSSR_1000MBS: u16 = 0x8000;
+const IGP01E1000_PSSR_MDIX: u16 = 0x0800;
+const PHY_1000T_STATUS: u32 = 0x0a;
+const SR_1000T_REMOTE_RX_STATUS: u16 = 0x1000;
+const SR_1000T_LOCAL_RX_STATUS: u16 = 0x2000;
+const IFE_PSC_AUTO_POLARITY_DISABLE: u16 = 0x0010;
+const IFE_PMC_MDIX_STATUS: u16 = 0x0020;
 const M88E1000_PSSR_REV_POLARITY: u16 = 0x0002;
 const M88E1000_PSSR_DOWNSHIFT: u16 = 0x0020;
 const M88E1000_PSSR_CABLE_LENGTH: u16 = 0x0380;
@@ -839,6 +848,18 @@ pub struct PhyDiagnostics {
     pub min_cable_length: u16,
     pub max_cable_length: u16,
     pub cable_length: u16,
+    pub polarity_correction: bool,
+    pub is_mdix: bool,
+    pub local_rx: ReceiverStatus,
+    pub remote_rx: ReceiverStatus,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReceiverStatus {
+    #[default]
+    Undefined,
+    Ok,
+    NotOk,
 }
 
 /// upstream: e1000_phy.c e1000_check_downshift_generic()
@@ -1094,6 +1115,120 @@ where
         }
         _ => return Err(DevError::Unsupported),
     }
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_get_phy_info_m88()
+pub fn get_phy_info_m88<I, C>(
+    io: &mut I,
+    link_up: bool,
+    mut get_cable_length: C,
+    diagnostics: &mut PhyDiagnostics,
+) -> DevResult
+where
+    I: E1000PhyRegisterIo,
+    C: FnMut() -> DevResult,
+{
+    if !link_up {
+        return Err(DevError::InvalidParam);
+    }
+    let control = io.read_phy_register(M88E1000_PHY_SPEC_CTRL)?;
+    diagnostics.polarity_correction = control & M88E1000_PSCR_POLARITY_REVERSAL != 0;
+    check_polarity_m88(io, diagnostics)?;
+    let status = io.read_phy_register(M88E1000_PHY_SPEC_STATUS)?;
+    diagnostics.is_mdix = status & M88E1000_PSSR_MDIX != 0;
+    if status & M88E1000_PSSR_SPEED == M88E1000_PSSR_1000MBS {
+        get_cable_length()?;
+        let receiver = io.read_phy_register(PHY_1000T_STATUS as u8)?;
+        diagnostics.local_rx = if receiver & SR_1000T_LOCAL_RX_STATUS != 0 {
+            ReceiverStatus::Ok
+        } else {
+            ReceiverStatus::NotOk
+        };
+        diagnostics.remote_rx = if receiver & SR_1000T_REMOTE_RX_STATUS != 0 {
+            ReceiverStatus::Ok
+        } else {
+            ReceiverStatus::NotOk
+        };
+    } else {
+        diagnostics.cable_length = CABLE_LENGTH_UNDEFINED;
+        diagnostics.local_rx = ReceiverStatus::Undefined;
+        diagnostics.remote_rx = ReceiverStatus::Undefined;
+    }
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_get_phy_info_igp()
+pub fn get_phy_info_igp<F, C>(
+    mut read_phy: F,
+    link_up: bool,
+    mut get_cable_length: C,
+    diagnostics: &mut PhyDiagnostics,
+) -> DevResult
+where
+    F: FnMut(u32) -> DevResult<u16>,
+    C: FnMut() -> DevResult,
+{
+    if !link_up {
+        return Err(DevError::InvalidParam);
+    }
+    diagnostics.polarity_correction = true;
+    check_polarity_igp(&mut read_phy, diagnostics)?;
+    let status = read_phy(u32::from(IGP01E1000_PHY_PORT_STATUS))?;
+    diagnostics.is_mdix = status & IGP01E1000_PSSR_MDIX != 0;
+    if status & IGP01E1000_PSSR_SPEED_MASK == IGP01E1000_PSSR_SPEED_1000MBPS {
+        get_cable_length()?;
+        let receiver = read_phy(PHY_1000T_STATUS)?;
+        diagnostics.local_rx = if receiver & SR_1000T_LOCAL_RX_STATUS != 0 {
+            ReceiverStatus::Ok
+        } else {
+            ReceiverStatus::NotOk
+        };
+        diagnostics.remote_rx = if receiver & SR_1000T_REMOTE_RX_STATUS != 0 {
+            ReceiverStatus::Ok
+        } else {
+            ReceiverStatus::NotOk
+        };
+    } else {
+        diagnostics.cable_length = CABLE_LENGTH_UNDEFINED;
+        diagnostics.local_rx = ReceiverStatus::Undefined;
+        diagnostics.remote_rx = ReceiverStatus::Undefined;
+    }
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_get_phy_info_ife()
+pub fn get_phy_info_ife<F>(
+    mut read_phy: F,
+    link_up: bool,
+    diagnostics: &mut PhyDiagnostics,
+) -> DevResult
+where
+    F: FnMut(u32) -> DevResult<u16>,
+{
+    if !link_up {
+        return Err(DevError::InvalidParam);
+    }
+    let control = read_phy(u32::from(IFE_PHY_SPECIAL_CONTROL))?;
+    diagnostics.polarity_correction = control & IFE_PSC_AUTO_POLARITY_DISABLE == 0;
+    if diagnostics.polarity_correction {
+        let data = read_phy(u32::from(IFE_PHY_EXTENDED_STATUS_CONTROL))?;
+        diagnostics.cable_polarity = Some(if data & IFE_PESC_POLARITY_REVERSED != 0 {
+            CablePolarity::Reversed
+        } else {
+            CablePolarity::Normal
+        });
+    } else {
+        diagnostics.cable_polarity = Some(if control & IFE_PSC_FORCE_POLARITY != 0 {
+            CablePolarity::Reversed
+        } else {
+            CablePolarity::Normal
+        });
+    }
+    diagnostics.is_mdix = read_phy(u32::from(IFE_PHY_MDIX_CONTROL))? & IFE_PMC_MDIX_STATUS != 0;
+    diagnostics.cable_length = CABLE_LENGTH_UNDEFINED;
+    diagnostics.local_rx = ReceiverStatus::Undefined;
+    diagnostics.remote_rx = ReceiverStatus::Undefined;
     Ok(())
 }
 
@@ -2229,6 +2364,68 @@ mod tests {
             &(M88E1000_EXT_PHY_SPEC_CTRL, M88E1000_EPSCR_TX_CLK_25)
         );
         assert_eq!(flow, FlowControlMode::None);
+    }
+
+    #[test]
+    fn generic_phy_info_m88_igp_and_ife_follow_link_speed_branches() {
+        let mut m88 = Io::default();
+        m88.phy[M88E1000_PHY_SPEC_CTRL as usize] = M88E1000_PSCR_POLARITY_REVERSAL;
+        m88.phy[M88E1000_PHY_SPEC_STATUS as usize] = M88E1000_PSSR_MDIX | M88E1000_PSSR_1000MBS;
+        m88.phy[PHY_1000T_STATUS as usize] = SR_1000T_LOCAL_RX_STATUS;
+        let mut diagnostics = PhyDiagnostics::default();
+        let mut cable = false;
+        get_phy_info_m88(
+            &mut m88,
+            true,
+            || {
+                cable = true;
+                Ok(())
+            },
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(cable);
+        assert!(diagnostics.polarity_correction);
+        assert!(diagnostics.is_mdix);
+        assert_eq!(diagnostics.local_rx, ReceiverStatus::Ok);
+        assert_eq!(diagnostics.remote_rx, ReceiverStatus::NotOk);
+
+        let mut regs = [0u16; 0x200];
+        regs[IGP01E1000_PHY_PORT_STATUS as usize] =
+            IGP01E1000_PSSR_SPEED_1000MBPS | IGP01E1000_PSSR_MDIX;
+        regs[IGP01E1000_PHY_PCS_INIT_REG as usize] = IGP01E1000_PHY_POLARITY_MASK;
+        regs[PHY_1000T_STATUS as usize] = SR_1000T_REMOTE_RX_STATUS;
+        let mut diagnostics = PhyDiagnostics::default();
+        get_phy_info_igp(
+            |register| Ok(regs[register as usize]),
+            true,
+            || Ok(()),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(diagnostics.is_mdix);
+        assert_eq!(diagnostics.local_rx, ReceiverStatus::NotOk);
+        assert_eq!(diagnostics.remote_rx, ReceiverStatus::Ok);
+
+        let mut diagnostics = PhyDiagnostics::default();
+        get_phy_info_ife(
+            |register| {
+                Ok(match register {
+                    value if value == u32::from(IFE_PHY_SPECIAL_CONTROL) => {
+                        IFE_PSC_FORCE_POLARITY | IFE_PSC_AUTO_POLARITY_DISABLE
+                    }
+                    value if value == u32::from(IFE_PHY_MDIX_CONTROL) => IFE_PMC_MDIX_STATUS,
+                    _ => 0,
+                })
+            },
+            true,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(!diagnostics.polarity_correction);
+        assert_eq!(diagnostics.cable_polarity, Some(CablePolarity::Reversed));
+        assert!(diagnostics.is_mdix);
+        assert_eq!(diagnostics.cable_length, CABLE_LENGTH_UNDEFINED);
     }
 
     #[test]

@@ -1043,3 +1043,5 @@ retain the latest Intel inventory, with no scanner exemptions.
 - Intel/FreeBSD `e1000_phy.c` coverage update: 67 of 98 functions are now translated, including IFE forced speed/duplex and MDI crossover disable. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
 
 - Intel/FreeBSD `e1000_phy.c` exact marker audit correction: the prior 67 count was over by four; `ctags` name intersection currently finds 65 of 98 unique definitions after D3 LPLU translation. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
+
+- Intel/FreeBSD `e1000_phy.c` coverage update: 68 of 98 functions are now translated, including M88/IGP/IFE PHY-info extraction with link-speed and receiver state. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
