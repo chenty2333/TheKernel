@@ -6,6 +6,7 @@
 //! 2017, 2019, 2020 Stefan Sperling <stsp@openbsd.org>.
 
 pub const PROBE_REQUEST_BYTES: usize = 512;
+pub const PROBE_REQUEST_WIRE_BYTES: usize = 20 + PROBE_REQUEST_BYTES;
 pub const SUPPORTED_RATES_IE: u8 = 1;
 pub const DS_PARAMETER_IE: u8 = 3;
 pub const EXTENDED_RATES_IE: u8 = 50;
@@ -99,6 +100,25 @@ pub fn build_scan_probe_request(
     request.common_data = segment(common_start, cursor)?;
     request.frame_length = u16::try_from(cursor).map_err(|_| ProbeRequestError::BufferTooSmall)?;
     Ok(request)
+}
+
+/// Serialize the packed scan-probe descriptor followed by its fixed data block.
+pub fn encode_scan_probe_request(request: &ScanProbeRequest) -> [u8; PROBE_REQUEST_WIRE_BYTES] {
+    let mut bytes = [0; PROBE_REQUEST_WIRE_BYTES];
+    let mut cursor = 0;
+    for segment in [
+        request.mac_header,
+        request.band_data[0],
+        request.band_data[1],
+        request.band_data[2],
+        request.common_data,
+    ] {
+        bytes[cursor..cursor + 2].copy_from_slice(&segment.offset.to_le_bytes());
+        bytes[cursor + 2..cursor + 4].copy_from_slice(&segment.length.to_le_bytes());
+        cursor += 4;
+    }
+    bytes[cursor..].copy_from_slice(&request.bytes);
+    bytes
 }
 
 fn append_rates(
@@ -218,6 +238,10 @@ mod tests {
             usize::from(request.frame_length),
             usize::from(request.common_data.offset + request.common_data.length)
         );
+        let wire = encode_scan_probe_request(&request);
+        assert_eq!(wire.len(), PROBE_REQUEST_WIRE_BYTES);
+        assert_eq!(&wire[..4], &[0, 0, 26, 0]);
+        assert_eq!(&wire[20..22], &[0x40, 0]);
     }
 
     #[test]
