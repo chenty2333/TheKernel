@@ -64,6 +64,7 @@ pub enum IeError {
     NoExtendedRates,
     InvalidGroupCipher,
     InvalidGroupManagementCipher,
+    MissingCapabilityData,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -88,6 +89,33 @@ pub struct RsnIePolicy {
     pub pbac: bool,
     pub pmkid: Option<[u8; 16]>,
     pub group_management_cipher: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AssocRequestConfig<'a> {
+    pub ssid: &'a [u8],
+    pub rates: &'a RateSet,
+    pub listen_interval: u16,
+    pub reassociation_bssid: Option<[u8; 6]>,
+    pub channel_is_2ghz: bool,
+    pub channel_is_5ghz: bool,
+    pub channel_is_ac: bool,
+    pub channel_is_he: bool,
+    pub ht_enabled: bool,
+    pub vht_enabled: bool,
+    pub he_enabled: bool,
+    pub he_mode_supported: bool,
+    pub privacy_wep: bool,
+    pub rsn_enabled: bool,
+    pub peer_rsn_protocols: u32,
+    pub short_preamble: bool,
+    pub short_slot: bool,
+    pub peer_qos: bool,
+    pub qos_info: u8,
+    pub rsn: Option<RsnIePolicy>,
+    pub ht_caps: Option<&'a HtCapabilities>,
+    pub vht_caps: Option<&'a VhtCapabilities>,
+    pub he_caps: Option<&'a HeCapabilities>,
 }
 
 fn append_ie(output: &mut Vec<u8>, id: u8, payload: &[u8]) -> Result<(), IeError> {
@@ -152,6 +180,69 @@ pub fn append_erp_ie(
         erp |= ERP_BARKER_MODE;
     }
     append_ie(output, ELEMID_ERP, &[erp])
+}
+
+/// Build the (Re)Association Request fixed fields and ordered information elements.
+// upstream: ieee80211_output.c ieee80211_get_assoc_req()
+pub fn build_assoc_request_body(config: &AssocRequestConfig<'_>) -> Result<Vec<u8>, IeError> {
+    let mut output = Vec::new();
+    let mut capinfo = CAPINFO_ESS;
+    if config.privacy_wep {
+        capinfo |= CAPINFO_PRIVACY;
+    }
+    if config.short_preamble && config.channel_is_2ghz {
+        capinfo |= CAPINFO_SHORT_PREAMBLE;
+    }
+    if config.short_slot {
+        capinfo |= CAPINFO_SHORT_SLOTTIME;
+    }
+    output.extend_from_slice(&capinfo.to_le_bytes());
+    output.extend_from_slice(&config.listen_interval.to_le_bytes());
+    if let Some(bssid) = config.reassociation_bssid {
+        output.extend_from_slice(&bssid);
+    }
+    append_ssid_ie(&mut output, config.ssid)?;
+    append_supported_rates_ie(&mut output, config.rates)?;
+    if config.rates.count > RATE_SIZE {
+        append_extended_rates_ie(&mut output, config.rates)?;
+    }
+    if config.rsn_enabled && config.peer_rsn_protocols & crate::PROTO_RSN != 0 {
+        let rsn = config.rsn.ok_or(IeError::MissingCapabilityData)?;
+        append_rsn_ie(&mut output, &rsn)?;
+    }
+    let add_wme = config.peer_qos && config.ht_enabled;
+    if add_wme {
+        append_qos_capability_ie(&mut output, config.qos_info)?;
+    }
+    if config.rsn_enabled && config.peer_rsn_protocols & crate::PROTO_WPA != 0 {
+        let mut wpa = config.rsn.ok_or(IeError::MissingCapabilityData)?;
+        wpa.wpa = true;
+        append_wpa_ie(&mut output, &wpa)?;
+    }
+    if config.ht_enabled {
+        append_ht_caps_ie(
+            &mut output,
+            config.ht_caps.ok_or(IeError::MissingCapabilityData)?,
+        )?;
+    }
+    if add_wme {
+        append_wme_info_ie(&mut output, config.qos_info)?;
+    }
+    if config.vht_enabled && config.channel_is_5ghz && config.channel_is_ac {
+        append_vht_caps_ie(
+            &mut output,
+            config.vht_caps.ok_or(IeError::MissingCapabilityData)?,
+        )?;
+    }
+    let add_he =
+        config.ht_enabled && config.he_enabled && config.he_mode_supported && config.channel_is_he;
+    if add_he {
+        append_he_caps_ie(
+            &mut output,
+            config.he_caps.ok_or(IeError::MissingCapabilityData)?,
+        )?;
+    }
+    Ok(output)
 }
 
 /// Append an SSID information element, including the zero-length hidden SSID form.
@@ -508,6 +599,76 @@ mod tests {
             append_supported_rates_ie(&mut ies, &invalid),
             Err(IeError::InvalidRateSet)
         );
+    }
+
+    #[test]
+    fn assoc_request_orders_fixed_fields_security_qos_and_phy_ies() {
+        let rates = RateSet::new(&[2, 4, 11, 22, 12, 18, 24, 36, 48, 72]);
+        let ht = HtCapabilities::default();
+        let vht = VhtCapabilities::default();
+        let he = HeCapabilities::default();
+        let rsn = RsnIePolicy {
+            group_cipher: CIPHER_CCMP,
+            pairwise_ciphers: CIPHER_CCMP,
+            akms: AKM_PSK,
+            ..Default::default()
+        };
+        let request = build_assoc_request_body(&AssocRequestConfig {
+            ssid: b"home",
+            rates: &rates,
+            listen_interval: 0x1234,
+            reassociation_bssid: Some([7; 6]),
+            channel_is_2ghz: false,
+            channel_is_5ghz: true,
+            channel_is_ac: true,
+            channel_is_he: true,
+            ht_enabled: true,
+            vht_enabled: true,
+            he_enabled: true,
+            he_mode_supported: true,
+            privacy_wep: true,
+            rsn_enabled: true,
+            peer_rsn_protocols: crate::PROTO_RSN,
+            short_preamble: true,
+            short_slot: true,
+            peer_qos: true,
+            qos_info: 0x6b,
+            rsn: Some(rsn),
+            ht_caps: Some(&ht),
+            vht_caps: Some(&vht),
+            he_caps: Some(&he),
+        })
+        .unwrap();
+        assert_eq!(
+            &request[..4],
+            &(CAPINFO_ESS | CAPINFO_PRIVACY | CAPINFO_SHORT_SLOTTIME)
+                .to_le_bytes()
+                .into_iter()
+                .chain(0x1234u16.to_le_bytes())
+                .collect::<Vec<_>>()[..]
+        );
+        let mut ids = Vec::new();
+        let mut offset = 4 + 6;
+        while offset < request.len() {
+            let len = usize::from(request[offset + 1]);
+            ids.push(request[offset]);
+            offset += len + 2;
+        }
+        assert_eq!(
+            ids,
+            [
+                ELEMID_SSID,
+                ELEMID_RATES,
+                ELEMID_XRATES,
+                ELEMID_RSN,
+                ELEMID_QOS_CAPABILITY,
+                ELEMID_HT_CAPS,
+                ELEMID_VENDOR,
+                ELEMID_VHT_CAPS,
+                ELEMID_EXTENSION
+            ]
+        );
+        assert_eq!(request[4..10], [7; 6]);
     }
 
     #[test]

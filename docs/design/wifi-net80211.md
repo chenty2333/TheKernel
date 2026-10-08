@@ -97,3 +97,7 @@ U-APSD AC/service-period bits.
 Management frame helpers also encode Capability Information, DS channel and
 ERP NonERP/protection/Barker fields from station/AP mode, channel and local
 preamble state.
+The station association-request body builder now applies source channel/mode
+predicates, fixed reassociation BSSID and listen interval, then emits the
+ordered SSID/rates/security/QoS/HT/VHT/HE elements. It is ready for the later
+nl80211 connect adapter; four-way key exchange remains userspace-owned.

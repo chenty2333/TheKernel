@@ -81,7 +81,7 @@ pub use output::{
     append_erp_ie, append_extended_rates_ie, append_he_caps_ie, append_ht_caps_ie,
     append_ht_operation_ie, append_qos_capability_ie, append_rsn_ie, append_ssid_ie,
     append_supported_rates_ie, append_vht_caps_ie, append_wme_info_ie, append_wme_parameter_ie,
-    append_wpa_ie, build_rsn_body, uapsd_qos_info,
+    append_wpa_ie, build_assoc_request_body, build_rsn_body, uapsd_qos_info,
 };
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,
