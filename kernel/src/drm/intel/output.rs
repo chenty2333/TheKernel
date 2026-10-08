@@ -435,11 +435,7 @@ impl PortWidth {
     /// §8.6 step 7: four lanes power all four (`0x0`), two lanes power down
     /// lanes 3 and 2 (`0xC`), one lane powers down 3, 2 and 1 (`0xE`).
     const fn power_down_lanes_field(self) -> u32 {
-        match self {
-            Self::Four => 0x0,
-            Self::Two => 0xC,
-            Self::One => 0xE,
-        }
+        super::phy::combo_phy_power_up_lane_mask(self.lanes() as u8, false, false) as u32
     }
 
     /// The `A_4_LANES` bit for `DDI_BUF_CTL`, set only for four lanes.  §8.6

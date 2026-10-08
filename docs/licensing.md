@@ -627,3 +627,7 @@ pre-GMD_ID stepping maps, DMC platform, version and default port tables
 `tk-intel-display/src/ddi_buf_trans.rs` translates display 12/13 DDI buffer-translation
 entry data and platform table selection from `intel_ddi_buf_trans.c` (MIT,
 Copyright © 2020 Intel). `LICENSE-MIT` is included in the crate.
+
+`kernel/src/drm/intel/phy.rs::combo_phy_power_up_lane_mask` translates the
+`intel_combo_phy_power_up_lanes()` lane-mask cases (MIT, Copyright © 2018 Intel).
+The matching `LICENSE-MIT` is included in the display crate.

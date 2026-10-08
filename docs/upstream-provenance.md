@@ -1186,3 +1186,5 @@ N305 A/B output path; the sequence follows `_icl_ddi_enable_clock()` and
 `_icl_ddi_disable_clock()` from the same MIT `intel_ddi.c` source.
 
 `crates/ax/tk-intel-display/src/ddi_buf_trans.rs` translates display-12/13 DDI buffer-translation table data and platform selection from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_ddi_buf_trans.c` (MIT, Copyright © 2020 Intel Corporation); `LICENSE-MIT`.
+
+`kernel/src/drm/intel/phy.rs::combo_phy_power_up_lane_mask` follows the DSI, lane-count and lane-reversal cases of Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_combo_phy.c::intel_combo_phy_power_up_lanes()` (MIT, Copyright © 2018 Intel); `LICENSE-MIT`.
