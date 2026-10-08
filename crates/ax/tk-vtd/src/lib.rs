@@ -12,6 +12,7 @@ extern crate std;
 
 use alloc::vec::Vec;
 
+pub mod reg;
 pub mod iova;
 pub mod pgtbl;
 

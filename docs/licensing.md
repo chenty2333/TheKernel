@@ -533,3 +533,9 @@ Intel CNVi Bluetooth SFI/DDC blobs are optional rootfs inputs selected with
 selected `ibt-*` files and carries Intel's `LICENSE.intel` alongside them.
 Redistributors must satisfy that binary-only license; no firmware blobs are
 checked into this source tree.
+
+The VT-d Intel register definitions translated from FreeBSD
+`sys/x86/iommu/intel_reg.h` retain The FreeBSD Foundation's 2013-2015
+BSD-2-Clause grant and Konstantin Belousov's sponsorship attribution in the
+Rust module header. The full grant is retained in
+`crates/ax/tk-vtd/LICENSES/BSD-2-Clause.txt`.
