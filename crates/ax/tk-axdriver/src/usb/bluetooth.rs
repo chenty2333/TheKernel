@@ -99,6 +99,12 @@ impl UsbBluetoothHci {
     pub fn read_event(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         self.adapter.read_event(out)
     }
+    pub fn intel_get_version(&mut self) -> Result<tk_bt_hci::Version, Error> {
+        self.adapter.intel_get_version()
+    }
+    pub fn intel_get_version_tlv(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        self.adapter.intel_get_version_tlv(out)
+    }
 }
 
 impl UsbTransport for Transport {

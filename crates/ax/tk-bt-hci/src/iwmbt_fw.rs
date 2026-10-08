@@ -56,6 +56,35 @@ pub enum FirmwareError {
     TruncatedTlv,
     InvalidTlvLength { kind: u8, length: u8 },
     InvalidPatch,
+    InvalidVersionEvent,
+}
+
+/// Decode the fixed-size Command Complete response copied by
+/// `iwmbt_get_version()` from the event's return-parameter area.
+pub fn parse_version_event(event: &[u8]) -> Result<Version, FirmwareError> {
+    if event.len() != 15
+        || event[0] != 0x0e
+        || event[1] != 13
+        || event[3] != 0x05
+        || event[4] != 0xfc
+    {
+        return Err(FirmwareError::InvalidVersionEvent);
+    }
+    if event[5] != 0 {
+        return Err(FirmwareError::InvalidStatus);
+    }
+    Ok(Version {
+        status: event[5],
+        hw_platform: event[6],
+        hw_variant: event[7],
+        hw_revision: event[8],
+        fw_variant: event[9],
+        fw_revision: event[10],
+        fw_build_num: event[11],
+        fw_build_week: event[12],
+        fw_build_year: event[13],
+        fw_patch_num: event[14],
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

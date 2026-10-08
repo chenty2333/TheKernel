@@ -14,7 +14,7 @@ use alloc::collections::VecDeque;
 
 pub use iwmbt_fw::{
     BootParams, DeviceFamily, FirmwareError, PatchCommand, Version, VersionTlv, get_fwname,
-    get_fwname_tlv, parse_patch, parse_tlv, supported_device,
+    get_fwname_tlv, parse_patch, parse_tlv, parse_version_event, supported_device,
 };
 
 pub const AF_BLUETOOTH: i32 = 31;
@@ -244,6 +244,29 @@ impl<T: UsbTransport> Adapter<T> {
         }
         Ok(length)
     }
+    /// Query the Intel firmware version using vendor command 0xfc05.
+    // upstream: iwmbt_hw.c iwmbt_get_version()
+    pub fn intel_get_version(&mut self) -> Result<Version, Error> {
+        let mut event = [0u8; 32];
+        let length = self.command_complete(&[0x05, 0xfc, 0], &mut event)?;
+        iwmbt_fw::parse_version_event(&event[..length]).map_err(|_| Error::InvalidLength)
+    }
+    /// Query the extended Intel TLV firmware-version record (vendor command
+    /// 0xfc05 with the 0xff selector).
+    // upstream: iwmbt_hw.c iwmbt_read_version_tlv()
+    pub fn intel_get_version_tlv(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        let mut event = [0u8; 260];
+        let length = self.command_complete(&[0x05, 0xfc, 1, 0xff], &mut event)?;
+        if length < 6 || event[5] != 0 {
+            return Err(Error::InvalidLength);
+        }
+        let payload = &event[5..length];
+        if payload.len() > out.len() {
+            return Err(Error::InvalidLength);
+        }
+        out[..payload.len()].copy_from_slice(payload);
+        Ok(payload.len())
+    }
     pub fn into_transport(self) -> T {
         self.transport
     }
@@ -446,5 +469,18 @@ mod tests {
         let mut event = [0; 16];
         assert_eq!(adapter.command_complete(&[1, 0x10, 0], &mut event), Ok(6));
         assert_eq!(&event[..6], &[0x0e, 4, 1, 1, 0x10, 0]);
+    }
+
+    #[test]
+    fn intel_version_event_is_decoded_from_command_complete_parameters() {
+        let event = [0x0e, 13, 1, 0x05, 0xfc, 0, 1, 0x12, 3, 0x23, 4, 5, 6, 7, 8];
+        let version = parse_version_event(&event).unwrap();
+        assert_eq!(version.hw_variant, 0x12);
+        assert_eq!(version.fw_variant, 0x23);
+        assert_eq!(version.fw_patch_num, 8);
+        assert_eq!(
+            parse_version_event(&[0; 15]),
+            Err(FirmwareError::InvalidVersionEvent)
+        );
     }
 }
