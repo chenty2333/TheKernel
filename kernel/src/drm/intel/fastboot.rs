@@ -2745,6 +2745,17 @@ mod tests {
         );
     }
     #[test]
+    fn translated_tc_dpll_readout_rejects_enable_bit_drift() {
+        let (adapter, registers, ..) = native();
+        let firmware_enabled = adapter.state.lock().firmware.pll.enable;
+        assert_ne!(firmware_enabled & (1 << 31), 0);
+        let mut model = registers.inner.lock();
+        let enable = model.words.get(&0x46038).copied().unwrap();
+        model.words.insert(0x46038, enable & !(1 << 31));
+        drop(model);
+        assert!(!translated_tc_dpll_enabled(&adapter).unwrap());
+    }
+    #[test]
     fn already_on_power_pin_refuses_dark_and_recovers_landed_failure() {
         for n in 1..=3 {
             let r = Model::new();
