@@ -37,6 +37,7 @@ mod rx_event;
 mod rx_packet;
 mod scan;
 mod scan_probe;
+mod state;
 mod station;
 mod statistics;
 mod tx;
@@ -199,6 +200,10 @@ pub use scan_probe::{
     PROBE_REQUEST_WIRE_BYTES, ProbeRequestConfig, ProbeRequestError, ProbeSegment,
     SUPPORTED_RATES_IE, ScanProbeRequest, VHT_CAPABILITIES_IE, build_scan_probe_request,
     encode_scan_probe_request,
+};
+pub use state::{
+    AssociationState, AssociationStep, AuthError, AuthRequest, RunRequest, authenticate,
+    deauthenticate, run_association, stop_association,
 };
 pub use station::{
     ADD_STA_COMMAND, FlushedQueue, REMOVE_STA_COMMAND, STA_FLAG_AGG_DENSITY_MASK,

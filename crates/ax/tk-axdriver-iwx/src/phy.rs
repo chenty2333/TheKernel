@@ -71,8 +71,8 @@ pub fn phy_context_command(
         ));
     }
     let width = match config.vht_width {
-        3 => PHY_WIDTH_160,
-        2 => PHY_WIDTH_80,
+        2 => PHY_WIDTH_160,
+        1 => PHY_WIDTH_80,
         _ if config.channel_40mhz && config.sco != 0 => PHY_WIDTH_40,
         _ => PHY_WIDTH_20,
     };
@@ -251,7 +251,7 @@ mod tests {
             ultra_high_band_channels: false,
             channel_40mhz: true,
             sco: 1,
-            vht_width: 2,
+            vht_width: 1,
             primary_channel_index: 40,
             center_channel_index: 50,
             static_chains: 1,
@@ -318,7 +318,7 @@ mod tests {
         next.channel = 1;
         next.is_24ghz = true;
         next.sco = 3;
-        next.vht_width = PHY_WIDTH_40;
+        next.vht_width = 0;
         next.rlc_command_version = RLC_CONFIG_VERSION;
         let mut actions = Vec::new();
         assert_eq!(
@@ -340,6 +340,6 @@ mod tests {
         assert_eq!(current.channel, 1);
         assert!(current.is_24ghz);
         assert_eq!(current.sco, 3);
-        assert_eq!(current.vht_width, PHY_WIDTH_40);
+        assert_eq!(current.vht_width, 0);
     }
 }

@@ -56,3 +56,10 @@ rate index only for the driver's station ID and rate-update event.
 
 PHY updates now preserve the cross-band CDB remove/add ordering, update-only
 path, metadata transition timing, and optional RLC API-v2 receive-chain update.
+VHT width inputs use the OpenBSD values (`80 MHz = 1`, `160 MHz = 2`) and are
+translated separately to firmware PHY-width values.
+
+The iwx association layer models source-order AUTH context creation with
+generation-guarded reverse cleanup, DEAUTH removal order, RUN station/MAC/power/
+rate setup, and RUN_STOP flush/BA/filter teardown. Platform command adapters
+must supply those ordered actions to the builders above.
