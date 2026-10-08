@@ -12,3 +12,9 @@ The shared parser's per-report size helper follows `hid_report_size()` and the
 maximum-size helper follows `hid_report_size_max()`: it selects the largest
 report size while retaining the first nonzero Report ID as FreeBSD does. A
 multi-ID regression covers the distinction.
+
+The report-size helper mapping now covers the FreeBSD `hid_report_size()` and
+`hid_report_size_max()` semantics, while report descriptor retrieval maps both
+`hidbus_get_rdesc()` and its `hid_get_report_descr()` implementation. Other HID
+parser code remains a bounded TheKernel-owned grammar/decoder rather than a
+source-copy of FreeBSD's parser state machine.

@@ -75,7 +75,7 @@ impl DeviceInfo {
         }
     }
 
-    // upstream: hidbus.c hidbus_get_rdesc()
+    // upstream: hidbus.c hidbus_get_rdesc() / hid.c hid_get_report_descr()
     pub(super) fn report_descriptor(&self, out: &mut [u8]) -> DevResult<usize> {
         if out.len() < self.report_descriptor.len() {
             return Err(DevError::InvalidParam);
