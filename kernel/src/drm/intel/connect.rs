@@ -95,6 +95,40 @@ fn dpcd_link_ceiling(caps: &[u8; 16]) -> Option<(u32, u8)> {
     }
 }
 
+const DPCD_EXTENDED_CAPABILITY_PRESENT: u8 = 1 << 7;
+const DPCD_TRAINING_AUX_RD_INTERVAL: usize = 0x0e;
+const DPCD_EXTENDED_CAPS_ADDRESS: u32 = 0x2200;
+
+fn select_extended_dpcd_capabilities(base: [u8; 16], extended: [u8; 16]) -> [u8; 16] {
+    if base[0] > extended[0] || base == extended {
+        base
+    } else {
+        extended
+    }
+}
+
+/// Read the receiver capability block and apply the public DRM helper's
+/// extended-capability selection rule (DP 1.3+). A base revision of zero is
+/// not a valid receiver; failed extended reads remain visible to the caller.
+// Upstream behavior: Linux 7.2.3 drm_dp_helper.c drm_dp_read_dpcd_caps() and
+// drm_dp_read_extended_dpcd_caps() (MIT; Copyright © 2009 Keith Packard).
+fn read_dpcd_capabilities<R: Registers>(
+    regs: &R,
+    channel: AuxChannel,
+) -> Result<[u8; 16], AuxError> {
+    let base = super::dp_aux::read_dpcd(regs, channel, true, 0, 16)?;
+    let base = <[u8; 16]>::try_from(base).map_err(|_| AuxError::Invalid)?;
+    if base[0] == 0 {
+        return Err(AuxError::Invalid);
+    }
+    if base[DPCD_TRAINING_AUX_RD_INTERVAL] & DPCD_EXTENDED_CAPABILITY_PRESENT == 0 {
+        return Ok(base);
+    }
+    let extended = super::dp_aux::read_dpcd(regs, channel, true, DPCD_EXTENDED_CAPS_ADDRESS, 16)?;
+    let extended = <[u8; 16]>::try_from(extended).map_err(|_| AuxError::Invalid)?;
+    Ok(select_extended_dpcd_capabilities(base, extended))
+}
+
 /// The one value the modeset takes: a pin a monitor answered on, and everything
 /// the bring-up learned about it.
 ///
@@ -455,11 +489,8 @@ pub(crate) fn resolve_device<R: Registers, T: PollTimer>(
                 _ => None,
             };
             match channel {
-                Some(channel) => match super::dp_aux::read_dpcd(regs, channel, true, 0, 16) {
-                    Ok(bytes) => match <[u8; 16]>::try_from(bytes) {
-                        Ok(caps) => (Some(caps), None),
-                        Err(_) => (None, Some(AuxError::Invalid)),
-                    },
+                Some(channel) => match read_dpcd_capabilities(regs, channel) {
+                    Ok(caps) => (Some(caps), None),
                     Err(error) => (None, Some(error)),
                 },
                 None => (None, None),

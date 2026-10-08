@@ -1276,3 +1276,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `crates/ax/tk-intel-display/src/intel_cdclk_full.rs` translates 152/152 ctags functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_cdclk.c` (MIT; Copyright © 2006-2017 Intel Corporation); the full grant is retained in source and `LICENSES/Intel-i915-CDCLK-MIT.txt`.
 
 `crates/ax/tk-intel-display/src/intel_dpll_mgr_full.rs` translates 83/175 ctags functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT; Copyright © 2006-2016 Intel Corporation); 92 functions for Gen7/8/9, BXT, IBX, display-14+ and Xe3 are outside the display-12/13 target and are listed in `docs/design/intel-dpll-manager-full.md`.
+
+`kernel/src/drm/intel/connect.rs` applies the extended DPCD receiver-capability selection behavior of Linux 7.2.3 `drivers/gpu/drm/display/drm_dp_helper.c` (`drm_dp_read_dpcd_caps()` / `drm_dp_read_extended_dpcd_caps()`, MIT; Copyright © 2009 Keith Packard); the grant is retained in `kernel/LICENSES/LicenseRef-DRM-DPCD-MIT`.

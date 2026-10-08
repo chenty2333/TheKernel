@@ -43,6 +43,19 @@ fn dpcd_base_capability_report_decodes_receiver_link_ceiling() {
     assert_eq!(dpcd_link_ceiling(&caps), None);
 }
 
+#[test]
+fn extended_dpcd_caps_replace_only_an_equal_or_newer_base_block() {
+    let mut base = [0u8; 16];
+    base[0] = 0x12;
+    let mut extended = [0u8; 16];
+    extended[0] = 0x14;
+    extended[1] = 0x1e;
+
+    assert_eq!(select_extended_dpcd_capabilities(base, extended), extended);
+    assert_eq!(select_extended_dpcd_capabilities(extended, base), extended);
+    assert_eq!(select_extended_dpcd_capabilities(base, base), base);
+}
+
 /// A `Bdf` for a display function, for the report lines.
 fn bdf() -> Bdf {
     Bdf::new(0, 2, 0)
