@@ -95,6 +95,10 @@ impl Default for IgcPhyInfo {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IgcApiCallback {
     MacInitParamsGeneric,
+    MacNullOpsGeneric,
+    MacNullRar,
+    MacCollisionDistGeneric,
+    MacRarSetGeneric,
     MacInitParamsI225,
     NvmInitParamsGeneric,
     NvmInitParamsI225,

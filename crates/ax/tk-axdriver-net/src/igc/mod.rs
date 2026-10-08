@@ -58,6 +58,7 @@
 pub mod api;
 pub mod base;
 pub mod nvm;
+pub mod mac;
 pub mod bringup;
 pub mod desc;
 pub mod i225;
