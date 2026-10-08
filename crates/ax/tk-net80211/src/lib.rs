@@ -156,7 +156,11 @@ pub use output::{
     build_action_body, build_addba_request_body, build_addba_response_body, build_compressed_bar,
     build_assoc_request_body, build_auth_body, build_deauth_body, build_delba_body,
     build_disassoc_body, build_probe_request_ies, build_rsn_body, build_sa_query_body,
-    can_use_ampdu, classify_ethernet_frame, move_tx_ba_window, uapsd_qos_info,
+    can_use_ampdu, classify_ethernet_frame, move_tx_ba_window, plan_station_mgmt_send,
+    uapsd_qos_info, MGMT_SUBTYPE_ACTION, MGMT_SUBTYPE_ASSOC_REQ, MGMT_SUBTYPE_AUTH,
+    MGMT_SUBTYPE_DEAUTH, MGMT_SUBTYPE_DISASSOC, MGMT_SUBTYPE_PROBE_REQ,
+    MGMT_SUBTYPE_REASSOC_REQ, MGMT_TRANSITION_WAIT_TICKS, StationMgmtBody,
+    StationMgmtSendError, StationMgmtSendPlan,
     user_priority_to_access_category,
 };
 pub use proto::{

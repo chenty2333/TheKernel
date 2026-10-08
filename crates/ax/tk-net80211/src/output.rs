@@ -1003,6 +1003,109 @@ pub enum ManagementFrameError {
     AllocationFailed,
 }
 
+pub const MGMT_SUBTYPE_ASSOC_REQ: u8 = 0x00;
+pub const MGMT_SUBTYPE_REASSOC_REQ: u8 = 0x20;
+pub const MGMT_SUBTYPE_PROBE_REQ: u8 = 0x40;
+pub const MGMT_SUBTYPE_DISASSOC: u8 = 0xa0;
+pub const MGMT_SUBTYPE_AUTH: u8 = 0xb0;
+pub const MGMT_SUBTYPE_DEAUTH: u8 = 0xc0;
+pub const MGMT_SUBTYPE_ACTION: u8 = 0xd0;
+pub const MGMT_TRANSITION_WAIT_TICKS: u8 = 5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StationMgmtBody {
+    ProbeRequest,
+    Authentication {
+        status: u16,
+        sequence: u16,
+    },
+    Deauthentication {
+        reason: u16,
+    },
+    AssociationRequest,
+    ReassociationRequest,
+    Disassociation {
+        reason: u16,
+    },
+    Action {
+        category: u8,
+        action: u8,
+        argument: i32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StationMgmtSendPlan {
+    pub body: StationMgmtBody,
+    /// The node reference transfers to the driver only after queue success.
+    pub retain_node_on_success: bool,
+    /// Apply the transition timer only after management-queue admission.
+    pub timer_on_success: Option<u8>,
+    pub release_node_on_queue_error: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StationMgmtSendError {
+    UnknownSubtype(u8),
+}
+
+/// Select station management-body construction, node-reference transfer, and timer policy.
+// upstream: ieee80211_output.c ieee80211_send_mgmt()
+pub fn plan_station_mgmt_send(
+    subtype: u8,
+    argument1: u32,
+    argument2: i32,
+) -> Result<StationMgmtSendPlan, StationMgmtSendError> {
+    let (body, timer_on_success) = match subtype {
+        MGMT_SUBTYPE_PROBE_REQ => (
+            StationMgmtBody::ProbeRequest,
+            Some(MGMT_TRANSITION_WAIT_TICKS),
+        ),
+        MGMT_SUBTYPE_AUTH => (
+            StationMgmtBody::Authentication {
+                status: (argument1 >> 16) as u16,
+                sequence: argument1 as u16,
+            },
+            Some(MGMT_TRANSITION_WAIT_TICKS),
+        ),
+        MGMT_SUBTYPE_DEAUTH => (
+            StationMgmtBody::Deauthentication {
+                reason: argument1 as u16,
+            },
+            None,
+        ),
+        MGMT_SUBTYPE_ASSOC_REQ => (
+            StationMgmtBody::AssociationRequest,
+            Some(MGMT_TRANSITION_WAIT_TICKS),
+        ),
+        MGMT_SUBTYPE_REASSOC_REQ => (
+            StationMgmtBody::ReassociationRequest,
+            Some(MGMT_TRANSITION_WAIT_TICKS),
+        ),
+        MGMT_SUBTYPE_DISASSOC => (
+            StationMgmtBody::Disassociation {
+                reason: argument1 as u16,
+            },
+            None,
+        ),
+        MGMT_SUBTYPE_ACTION => (
+            StationMgmtBody::Action {
+                category: (argument1 >> 16) as u8,
+                action: argument1 as u8,
+                argument: argument2,
+            },
+            None,
+        ),
+        other => return Err(StationMgmtSendError::UnknownSubtype(other)),
+    };
+    Ok(StationMgmtSendPlan {
+        body,
+        retain_node_on_success: true,
+        timer_on_success,
+        release_node_on_queue_error: true,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1510,5 +1613,39 @@ mod tests {
             .unwrap();
         assert_eq!(probe[1] & 0x40, 0);
         assert_eq!(ManagementTxSequence::new(0).next(), 0);
+    }
+
+    #[test]
+    fn station_management_dispatch_retains_node_and_sets_only_transition_timers() {
+        let auth = plan_station_mgmt_send(MGMT_SUBTYPE_AUTH, (17 << 16) | 2, 0).unwrap();
+        assert_eq!(
+            auth.body,
+            StationMgmtBody::Authentication {
+                status: 17,
+                sequence: 2,
+            }
+        );
+        assert_eq!(auth.timer_on_success, Some(5));
+        assert!(auth.retain_node_on_success && auth.release_node_on_queue_error);
+        assert_eq!(
+            plan_station_mgmt_send(MGMT_SUBTYPE_DEAUTH, 3, 0)
+                .unwrap()
+                .timer_on_success,
+            None
+        );
+        assert_eq!(
+            plan_station_mgmt_send(MGMT_SUBTYPE_ACTION, (3 << 16) | 8, 0x1234)
+                .unwrap()
+                .body,
+            StationMgmtBody::Action {
+                category: 3,
+                action: 8,
+                argument: 0x1234,
+            }
+        );
+        assert_eq!(
+            plan_station_mgmt_send(0x10, 0, 0),
+            Err(StationMgmtSendError::UnknownSubtype(0x10))
+        );
     }
 }

@@ -350,6 +350,10 @@ The station `mgmt_output` header builder now emits receiver/transmitter/BSSID,
 deauth and disassoc frames. The caller still owns node reference transfer and
 the actual iwx management queue submission.
 
+The station subset of `ieee80211_send_mgmt()` selects probe/auth/deauth/assoc/
+disassoc/action body requests and preserves the five-tick transition timer
+only for probe/auth/association; the caller builds the body and queues it.
+
 Duplicate station RX nodes now inherit only the source BSS BSSID and channel
 after bounded cache allocation; the kernel owns their lifetimes instead of
 OpenBSD node reference callbacks.

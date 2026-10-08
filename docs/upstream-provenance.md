@@ -1150,3 +1150,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/net80211/ieee80211_node.c` rev 1.217 (BSD-3-Clause): transmit BA-state reset and retry-timer cancellation effects translated in `tk-net80211/src/ba_tx.rs`.
 - OpenBSD `sys/net80211/ieee80211_node.c` rev 1.217 (BSD-3-Clause): station background-roam TX-drain and BSS-switch callbacks translated to explicit caller effects in `tk-net80211/src/node.rs`.
 - OpenBSD `sys/net80211/ieee80211_node.c` rev 1.217 (BSD-3-Clause): saved security-IE cleanup, BA teardown, reorder-buffer release and HostAP-only queue purge effects translated in `tk-net80211/src/node_table.rs`.
+- OpenBSD `sys/net80211/ieee80211_output.c` rev 1.148 (BSD-3-Clause): station management subtype/body selection, node-ref transfer policy and transition-timer effects translated in `tk-net80211/src/output.rs`.
