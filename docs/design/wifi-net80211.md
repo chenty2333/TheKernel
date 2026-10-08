@@ -32,3 +32,6 @@ Channel state also exposes the OpenBSD mode-capability scan, current-mode
 fallback, active-channel selection, first-usable IBSS channel choice and the
 AMPDU/QoS capability gate. The adapter receives an active mask and chosen
 channel so the later wireless interface layer can issue scan-reset/ERP updates.
+The layer also translates rate lookup and the background-scan mode cycle (AUTO
+when a fixed media mode or all-band scanning applies; otherwise skip HT/VHT/HE
+superset channel sets).

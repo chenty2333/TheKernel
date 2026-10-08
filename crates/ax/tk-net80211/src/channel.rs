@@ -152,6 +152,63 @@ pub fn configure_ampdu_tx(capabilities: u32, enable: bool, flags: &mut u32) {
     }
 }
 
+/// Find a rate by its value, ignoring the IEEE basic-rate bit.
+// upstream: ieee80211.c ieee80211_findrate()
+pub fn find_rate(rates: &crate::RateSet, rate: u8) -> Option<usize> {
+    rates.rates[..rates.count.min(crate::RATE_MAX_SIZE)]
+        .iter()
+        .position(|candidate| candidate & crate::LEGACY_RATE_VALUE == rate)
+}
+
+/// Choose the next PHY mode for a background scan, skipping superset modes.
+// upstream: ieee80211.c ieee80211_next_mode()
+pub fn next_scan_mode(
+    current: PhyMode,
+    modecaps: u32,
+    fixed_media_mode: bool,
+    scan_all_bands: bool,
+) -> PhyMode {
+    if fixed_media_mode {
+        return PhyMode::Auto;
+    }
+    if scan_all_bands {
+        return PhyMode::Auto;
+    }
+    let mut next = current as u8 + 1;
+    while next <= 7 {
+        // 11n, 11ac and 11ax channels are supersets of the legacy mode sets.
+        if matches!(next, 4 | 5 | 6) {
+            next += 1;
+            continue;
+        }
+        if next == 7 {
+            next = PhyMode::Auto as u8;
+            break;
+        }
+        if modecaps & (1 << next) != 0 {
+            break;
+        }
+        next += 1;
+    }
+    PhyMode::try_from(next).unwrap_or(PhyMode::Auto)
+}
+
+impl TryFrom<u8> for PhyMode {
+    type Error = ();
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Auto),
+            1 => Ok(Self::A),
+            2 => Ok(Self::B),
+            3 => Ok(Self::G),
+            4 => Ok(Self::N),
+            5 => Ok(Self::Ac),
+            6 => Ok(Self::Ax),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Convert an MHz frequency to the IEEE channel number.
 // upstream: ieee80211.c ieee80211_mhz2ieee()
 pub const fn mhz_to_ieee(freq: u32, flags: u32) -> u32 {
@@ -269,6 +326,31 @@ mod tests {
         assert_eq!(selected.ibss_channel, 2);
         assert!(select_mode(&channels, modecaps, PhyMode::B, Some(2)).is_ok());
         assert!(select_mode(&channels, 0, PhyMode::A, None).is_err());
+    }
+
+    #[test]
+    fn scan_mode_selection_cycles_only_distinct_channel_sets() {
+        assert_eq!(
+            next_scan_mode(PhyMode::Auto, 1 << 1, false, false),
+            PhyMode::A
+        );
+        assert_eq!(
+            next_scan_mode(PhyMode::A, (1 << 1) | (1 << 3), false, false),
+            PhyMode::G
+        );
+        assert_eq!(
+            next_scan_mode(PhyMode::G, 0x7f, false, false),
+            PhyMode::Auto
+        );
+        assert_eq!(next_scan_mode(PhyMode::A, 0x7f, true, false), PhyMode::Auto);
+        assert_eq!(next_scan_mode(PhyMode::A, 0x7f, false, true), PhyMode::Auto);
+    }
+
+    #[test]
+    fn rate_lookup_masks_basic_marker() {
+        let rates = crate::RateSet::new(&[2, 0x84, 11]);
+        assert_eq!(find_rate(&rates, 4), Some(1));
+        assert_eq!(find_rate(&rates, 22), None);
     }
 
     #[test]
