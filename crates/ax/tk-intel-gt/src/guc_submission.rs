@@ -409,6 +409,53 @@ pub struct SchedPlan {
     pub count: u8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeregisterCompletion {
+    ReRegister,
+    Destroy,
+    Noop,
+}
+
+/// upstream: intel_guc_submission.c intel_guc_sched_done_process_msg().
+pub fn sched_mode_done_message(
+    state: &mut ContextSchedState,
+    message: &[u32],
+) -> Result<bool, Error> {
+    if message.len() < 2 || message[0] == GUC_INVALID_CONTEXT_ID {
+        return Err(Error::Refused);
+    }
+    if state.destroyed() || (!state.pending_enable() && !state.pending_disable()) {
+        return Err(Error::Refused);
+    }
+    if state.pending_enable() {
+        state.clear_pending_enable();
+        Ok(true)
+    } else {
+        state.clear_banned();
+        state.clear_pending_disable();
+        state.clear_enabled();
+        Ok(false)
+    }
+}
+
+/// upstream: intel_guc_submission.c intel_guc_deregister_done_process_msg().
+pub fn deregister_done_message(
+    state: &mut ContextSchedState,
+    message: &[u32],
+) -> Result<DeregisterCompletion, Error> {
+    if message.is_empty() || message[0] == GUC_INVALID_CONTEXT_ID {
+        return Err(Error::Refused);
+    }
+    if state.wait_for_deregister_to_register() {
+        state.clear_wait_for_deregister_to_register();
+        Ok(DeregisterCompletion::ReRegister)
+    } else if state.destroyed() {
+        Ok(DeregisterCompletion::Destroy)
+    } else {
+        Ok(DeregisterCompletion::Noop)
+    }
+}
+
 impl SchedPlan {
     fn push(&mut self, action: SchedAction) -> Result<(), Error> {
         let slot = self
@@ -942,6 +989,42 @@ mod tests {
             ACTION_SCHED_CONTEXT_MODE_SET
         );
         assert_eq!(new_parent.actions[1].words, [ACTION_SCHED_CONTEXT, 10, 0]);
+    }
+
+    #[test]
+    fn g2h_schedule_and_deregister_events_validate_pending_context_state() {
+        let mut state = ContextSchedState::default();
+        state.prepare_request(9, false).unwrap();
+        state.request_send_result(
+            SchedPlan {
+                actions: [
+                    SchedAction::new(
+                        [ACTION_SCHED_CONTEXT_MODE_SET, 9, CONTEXT_ENABLE],
+                        3,
+                        G2H_LEN_DW_SCHED_CONTEXT_MODE_SET,
+                    ),
+                    SchedAction::default(),
+                ],
+                count: 1,
+            },
+            true,
+        );
+        assert_eq!(sched_mode_done_message(&mut state, &[9, 0]), Ok(true));
+        assert_eq!(
+            sched_mode_done_message(&mut state, &[9, 0]),
+            Err(Error::Refused)
+        );
+
+        state.set_wait_for_deregister_to_register();
+        assert_eq!(
+            deregister_done_message(&mut state, &[9]),
+            Ok(DeregisterCompletion::ReRegister)
+        );
+        state.set_destroyed();
+        assert_eq!(
+            deregister_done_message(&mut state, &[9]),
+            Ok(DeregisterCompletion::Destroy)
+        );
     }
 
     #[test]
