@@ -80,6 +80,16 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         Ok(self.hardware_rfkill)
     }
 
+    /// Apply firmware/stepping NIC setup before firmware DMA publication.
+    // upstream: if_iwx.c iwx_nic_init()
+    pub fn initialize_nic(
+        &mut self,
+        firmware_phy_config: u32,
+        hardware_revision: u32,
+    ) -> Result<(), ApmError> {
+        crate::initialize_nic(&mut self.registers, firmware_phy_config, hardware_revision)
+    }
+
     /// Submit host commands through the attached command ring and HBUS doorbell.
     // upstream: if_iwx.c iwx_send_cmd()
     pub fn send_command(
@@ -187,6 +197,7 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         imr_enabled: bool,
         mut wait_for_alive: impl FnMut(u64) -> Result<bool, E>,
     ) -> Result<(), ControllerError<E>> {
+        crate::enable_firmware_load_interrupts(&mut self.registers, &mut self.interrupt_masks);
         let mut images = if init_ucode {
             initialize_init_firmware_sections(&mut self.allocator, firmware)
         } else {
