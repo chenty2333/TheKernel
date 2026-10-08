@@ -132,3 +132,10 @@ Hardware-decrypted CCMP/TKIP frames now update per-TID receive sequence counters
 after firmware/driver reorder, allow equal PN only for the explicit same-PN
 reorder case, clear Protected and remove the retained IV before Ethernet
 conversion. Frames whose IV was already stripped trust hardware replay status.
+
+Station beacon and probe-response receive processing follows OpenBSD's fixed
+field and information-element walk, active-channel/mismatch filters, hidden
+SSID recovery, peer PHY/QoS/RSN state updates, 5-GHz probe RSSI preference,
+and RUN-state current-BSS timer/protection/slot/DTIM effects. Interface-specific
+callbacks and counters are represented as explicit `BeaconUpdate` effects for
+the caller; peer records retain the associated node and beacon state.

@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+mod beacon;
 mod channel;
 mod decrypt;
 mod frame;
@@ -23,6 +24,7 @@ mod rsn;
 mod rssadapt;
 mod scan;
 
+pub use beacon::{BeaconError, BeaconPolicy, BeaconRxInfo, BeaconUpdate, receive_beacon};
 pub use channel::{
     CHAN_2GHZ, CHAN_5GHZ, ChannelRef, ModeSelection, NET_CAP_QOS, NET_CAP_TX_AMPDU, NET_CHAN_2GHZ,
     NET_CHAN_5GHZ, NET_CHAN_40MHZ, NET_CHAN_A, NET_CHAN_B, NET_CHAN_CCK, NET_CHAN_DYN, NET_CHAN_HT,
@@ -71,7 +73,8 @@ pub use node_rates::{
 };
 pub use node_table::{
     INVALID_SEQUENCE, NODE_CACHE_SIZE, NodeAllocError, NodeLifecycle, NodeRecord, NodeTable,
-    alloc_node, allocation_available, find_node, free_all_nodes, free_node, setup_node,
+    alloc_node, allocation_available, find_node, find_node_mut, free_all_nodes, free_node,
+    setup_node,
 };
 pub use output::{
     AKM_8021X as IE_AKM_8021X, AKM_PSK as IE_AKM_PSK, AKM_SHA256_8021X as IE_AKM_SHA256_8021X,

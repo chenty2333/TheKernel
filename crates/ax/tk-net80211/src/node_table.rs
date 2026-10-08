@@ -24,6 +24,22 @@ pub enum NodeLifecycle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeRecord {
     pub access_point: AccessPoint,
+    pub ht_caps: crate::HtCapabilities,
+    pub ht_operation: crate::HtOperation,
+    pub vht_caps: crate::VhtCapabilities,
+    pub vht_operation: crate::VhtOperation,
+    pub he_caps: crate::HeCapabilities,
+    pub supported_rsn_protocols: u32,
+    pub supported_rsn_akms: u32,
+    pub beacon_timestamp: [u8; 8],
+    pub receive_timestamp: u64,
+    pub beacon_interval: u16,
+    pub dtim_count: u8,
+    pub dtim_period: u8,
+    pub erp: u8,
+    pub qos: bool,
+    pub uapsd: bool,
+    pub edca: crate::EdcaState,
     pub rx_sequence: u16,
     pub qos_rx_sequences: [u16; TID_COUNT],
     pub lifecycle: NodeLifecycle,
@@ -48,6 +64,22 @@ impl Default for NodeTable {
             nodes: BTreeMap::new(),
             bss_node: NodeRecord {
                 access_point: AccessPoint::default(),
+                ht_caps: crate::HtCapabilities::default(),
+                ht_operation: crate::HtOperation::default(),
+                vht_caps: crate::VhtCapabilities::default(),
+                vht_operation: crate::VhtOperation::default(),
+                he_caps: crate::HeCapabilities::default(),
+                supported_rsn_protocols: 0,
+                supported_rsn_akms: 0,
+                beacon_timestamp: [0; 8],
+                receive_timestamp: 0,
+                beacon_interval: 0,
+                dtim_count: 0,
+                dtim_period: 0,
+                erp: 0,
+                qos: false,
+                uapsd: false,
+                edca: crate::EdcaState::default(),
                 rx_sequence: INVALID_SEQUENCE,
                 qos_rx_sequences: [INVALID_SEQUENCE; TID_COUNT],
                 lifecycle: NodeLifecycle::Bss,
@@ -81,6 +113,22 @@ pub fn setup_node(node: &mut NodeRecord, mac_address: [u8; 6]) {
 fn setup_empty_node() -> NodeRecord {
     NodeRecord {
         access_point: AccessPoint::default(),
+        ht_caps: crate::HtCapabilities::default(),
+        ht_operation: crate::HtOperation::default(),
+        vht_caps: crate::VhtCapabilities::default(),
+        vht_operation: crate::VhtOperation::default(),
+        he_caps: crate::HeCapabilities::default(),
+        supported_rsn_protocols: 0,
+        supported_rsn_akms: 0,
+        beacon_timestamp: [0; 8],
+        receive_timestamp: 0,
+        beacon_interval: 0,
+        dtim_count: 0,
+        dtim_period: 0,
+        erp: 0,
+        qos: false,
+        uapsd: false,
+        edca: crate::EdcaState::default(),
         rx_sequence: INVALID_SEQUENCE,
         qos_rx_sequences: [INVALID_SEQUENCE; TID_COUNT],
         lifecycle: NodeLifecycle::Cache,
@@ -107,6 +155,13 @@ pub fn alloc_node(
 // upstream: ieee80211_node.c ieee80211_find_node()
 pub fn find_node<'a>(table: &'a NodeTable, mac_address: &[u8; 6]) -> Option<&'a NodeRecord> {
     table.nodes.get(mac_address)
+}
+
+pub fn find_node_mut<'a>(
+    table: &'a mut NodeTable,
+    mac_address: &[u8; 6],
+) -> Option<&'a mut NodeRecord> {
+    table.nodes.get_mut(mac_address)
 }
 
 // upstream: ieee80211_node.c ieee80211_free_node()
