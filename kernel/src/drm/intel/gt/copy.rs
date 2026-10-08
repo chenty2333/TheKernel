@@ -1187,8 +1187,11 @@ impl CtDmaMemory {
             {
                 self.submission.handle_event(&mut self.pair, event)
             }
-            Some(event) => Err(intel_gt::guc_ct::CtError::InvalidMessage),
-            None => Err(intel_gt::guc_ct::CtError::InvalidMessage),
+            // A non-event G2H message is a CT response. `handle_incoming_message`
+            // has already recorded it against its fence; publish the advanced
+            // receive head here so the waiter can consume it via finish_request.
+            Some(_) => Err(intel_gt::guc_ct::CtError::InvalidMessage),
+            None => Ok(()),
         };
         self.pair
             .sync_to_blob(&mut self.blob)
