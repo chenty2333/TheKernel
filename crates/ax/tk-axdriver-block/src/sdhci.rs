@@ -479,21 +479,29 @@ impl<I: SdhciIo> SdhciHost<I> {
     // upstream: sdhci.c sdhci_generic_reset()
     pub fn initialize(&mut self) -> Result<(), SdhciError> {
         if self.quirks & SDHCI_QUIRK_CLOCK_BEFORE_RESET != 0 {
-            self.set_clock(400_000)?;
+            self.set_clock(400_000).inspect_err(|error| {
+                log::warn!("sdhci: initial clock-before-reset failed: {error:?}");
+            })?;
         }
         if self.quirks & SDHCI_QUIRK_NO_CARD_NO_RESET == 0
             || self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_CARD_PRESENT != 0
         {
-            self.reset(SDHCI_RESET_ALL as u8)?;
+            self.reset(SDHCI_RESET_ALL as u8).inspect_err(|error| {
+                log::warn!("sdhci: host reset failed: {error:?}");
+            })?;
         }
         if self.quirks & SDHCI_QUIRK_INTEL_POWER_UP_RESET != 0 {
-            self.reset(SDHCI_RESET_ALL as u8)?;
+            self.reset(SDHCI_RESET_ALL as u8).inspect_err(|error| {
+                log::warn!("sdhci: Intel power-up reset failed: {error:?}");
+            })?;
         }
         self.io.write8(
             SDHCI_POWER_CONTROL as usize,
             (SDHCI_POWER_330 | SDHCI_POWER_ON) as u8,
         );
-        self.set_clock(400_000)?;
+        self.set_clock(400_000).inspect_err(|error| {
+            log::warn!("sdhci: initial 400kHz clock failed: {error:?}");
+        })?;
         // Use the largest host timeout exponent unless a future platform
         // integration provides the per-card timeout derived from CSD/EXT_CSD.
         let timeout = if self.quirks
@@ -608,6 +616,10 @@ impl<I: SdhciIo> SdhciHost<I> {
             }
             self.io.delay_us(10);
         }
+        log::warn!(
+            "sdhci: busy wait timed out, PRESENT_STATE={:#010x}",
+            self.io.read32(SDHCI_PRESENT_STATE as usize)
+        );
         Err(SdhciError::Timeout)
     }
 
@@ -679,7 +691,9 @@ impl<I: SdhciIo> SdhciHost<I> {
                     if command_flags & SDHCI_CMD_RESP_MASK as u16
                         == SDHCI_CMD_RESP_SHORT_BUSY as u16
                     {
-                        self.wait_busy()?;
+                        self.wait_busy().inspect_err(|error| {
+                            log::warn!("sdhci: CMD{index} busy response failed: {error:?}");
+                        })?;
                     }
                     return Ok(response);
                 }
@@ -700,6 +714,10 @@ impl<I: SdhciIo> SdhciHost<I> {
                     }
                     if attempt + 1 < retries {
                         self.io.delay_us(1_000);
+                    } else {
+                        log::warn!(
+                            "sdhci: CMD{index} failed after {retries} attempt(s): {error:?}"
+                        );
                     }
                 }
             }

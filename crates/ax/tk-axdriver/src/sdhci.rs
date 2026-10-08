@@ -165,6 +165,11 @@ fn quirks_for_device(vendor_id: u16, device_id: u16) -> u32 {
 
 // upstream: sdhci_pci.c PCI_SLOT_INFO_SLOTS()/PCI_SLOT_INFO_FIRST_BAR()
 fn decode_slot_info(slot_info: u8) -> (usize, u8) {
+    if slot_info == u8::MAX || slot_info & 0x07 > 5 {
+        // Some SDHCI PCI functions omit the legacy slot-info register and
+        // return all ones; their architected single slot is BAR0.
+        return (1, 0);
+    }
     (
         usize::from(((slot_info >> 4) & 0x07) + 1).min(6),
         slot_info & 0x07,
@@ -390,7 +395,7 @@ pub(crate) fn probe(
     }
     let slot_info = root
         .read_config_dword(bdf, PCI_SLOT_INFO)
-        .map_or(0, |value| value as u8);
+        .map_or(u8::MAX, |value| value as u8);
     let (slots, first_bar) = decode_slot_info(slot_info);
     let quirks = quirks_for_device(info.vendor_id, info.device_id);
     let read_only = info.vendor_id == INTEL_EMMC_VID
@@ -430,5 +435,7 @@ mod tests {
         assert_eq!(quirks_for_device(0x1234, 0x5678), 0);
         assert_eq!(decode_slot_info(0), (1, 0));
         assert_eq!(decode_slot_info(0x25), (3, 5));
+        assert_eq!(decode_slot_info(u8::MAX), (1, 0));
+        assert_eq!(decode_slot_info(0x0f), (1, 0));
     }
 }
