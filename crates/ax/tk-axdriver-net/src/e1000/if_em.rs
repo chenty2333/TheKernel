@@ -18,7 +18,6 @@ const INTS_4K: u32 = 4_000;
 const INTS_20K: u32 = 20_000;
 const INTS_70K: u32 = 70_000;
 const INTS_DEFAULT: u32 = 8_000;
-const MAX_SCATTER: u32 = 64;
 const MAX_FRAME_NORMAL: u32 = 1518;
 const IGB_MAX_FRAME: u32 = 9234;
 const MAX_JUMBO_FRAME: u32 = 0x3f00;
@@ -394,6 +393,262 @@ pub fn em_update_82576_ecc_counter(
 pub fn em_update_pch_ecc_stats(stats: &mut EmErrorStats, status: u32) {
     stats.corrected_packet_buffer += u64::from(status & 0xff);
     stats.uncorrected_packet_buffer += u64::from((status >> 8) & 0xff);
+}
+
+/// upstream: if_em.c em_configure_82575_memory_errors()
+pub fn em_configure_82575_memory_errors<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+) -> DevResult {
+    if !em_has_82575_memory_errors(mac) {
+        return Ok(());
+    }
+    let _ = io.read_register(E1000_PBECCSTS_82575)?;
+    let _ = io.read_register(E1000_RDHESTS_82575)?;
+    let _ = io.read_register(E1000_TDHESTS_82575)?;
+    for reg in [
+        E1000_PBECCSTS_82575,
+        E1000_RDHESTS_82575,
+        E1000_TDHESTS_82575,
+    ] {
+        io.write_register(reg, E1000_ECC_82575_ENABLE)?;
+    }
+    let ctrl = io.read_register(E1000_CTRL_EXT)?;
+    io.write_register(E1000_CTRL_EXT, ctrl | E1000_CTRL_EXT_MEHE)?;
+    let _ = io.read_register(E1000_STATUS)?;
+    Ok(())
+}
+
+/// upstream: if_em.c em_configure_82576_memory_errors()
+pub fn em_configure_82576_memory_errors<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    device_id: u16,
+) -> DevResult {
+    if !em_has_82576_memory_errors(mac) {
+        return Ok(());
+    }
+    let mut reactions = E1000_PEIND_82576_NONFATAL_MASK
+        | E1000_PEIND_82576_FATAL_MASK
+        | E1000_PEINDM_82576_PARITY_ENABLE;
+    if !em_82576_has_ipsec(device_id) {
+        reactions &= !E1000_PEIND_82576_IPSEC_MASK;
+    }
+    let _ = io.read_register(E1000_PEIND)?;
+    let status = io.read_register(E1000_PEINDM)?;
+    io.write_register(E1000_PEINDM, status | reactions)?;
+    let _ = io.read_register(E1000_STATUS)?;
+    Ok(())
+}
+
+/// upstream: if_em.c em_clear_82580_memory_error_status()
+pub fn em_clear_82580_memory_error_status<I: E1000RegisterIo>(
+    io: &mut I,
+    register: u32,
+) -> DevResult {
+    let status = io.read_register(register)?;
+    if status != 0 {
+        io.write_register(register, status)?;
+    }
+    Ok(())
+}
+
+/// upstream: if_em.c em_configure_82580_memory_errors()
+pub fn em_configure_82580_memory_errors<I: E1000RegisterIo>(
+    io: &mut I,
+    stats: &mut EmErrorStats,
+    mac: E1000MacType,
+    rx_queues: u16,
+) -> DevResult {
+    if !em_has_82580_memory_errors(mac) {
+        return Ok(());
+    }
+    let _ = io.read_register(E1000_PEIND)?;
+    for reg in [
+        E1000_DTPARS_82580,
+        E1000_DRPARS_82580,
+        E1000_DDPARS_82580,
+        0x05b00,
+    ] {
+        em_clear_82580_memory_error_status(io, reg)?;
+    }
+    let _ = io.read_register(E1000_LANPERRSTS)?;
+    let _ = em_update_82580_ecc_stats(
+        stats,
+        io.read_register(E1000_RPBECCSTS)?,
+        io.read_register(E1000_TPBECCSTS)?,
+        io.read_register(E1000_PCIEECCSTS)?,
+    );
+    io.write_register(E1000_RPBECCSTS, E1000_PBECCSTS_82580_ECC_ENABLE)?;
+    io.write_register(E1000_TPBECCSTS, E1000_PBECCSTS_82580_ECC_ENABLE)?;
+    for (reg, mask) in [
+        (E1000_DTPARC_82580, E1000_DTPARC_82580_ENABLE_MASK),
+        (E1000_DRPARC_82580, E1000_DRPARC_82580_ENABLE_MASK),
+        (E1000_DDPARC_82580, E1000_DDPARC_82580_ENABLE_MASK),
+        (E1000_PCIEERRCTL_82580, E1000_PCIEERRCTL_82580_ENABLE_MASK),
+        (E1000_PCIEECCCTL_82580, E1000_PCIEECCCTL_82580_ENABLE_MASK),
+    ] {
+        let value = io.read_register(reg)?;
+        io.write_register(reg, value | mask)?;
+    }
+    let mut lane = io.read_register(E1000_LANPERRCTL_82580)? | E1000_LANPERRCTL_82580_HOST_MASK;
+    if rx_queues <= 1 {
+        lane &= !E1000_LANPERRCTL_82580_RSS_ENABLE;
+    }
+    io.write_register(E1000_LANPERRCTL_82580, lane)?;
+    let peindm = io.read_register(E1000_PEINDM)?;
+    io.write_register(E1000_PEINDM, peindm | E1000_PEIND_FATAL_MASK)?;
+    let _ = io.read_register(E1000_STATUS)?;
+    Ok(())
+}
+
+/// upstream: if_em.c em_configure_peind_memory_errors()
+pub fn em_configure_peind_memory_errors<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+) -> DevResult {
+    if !em_has_i350_i354_memory_errors(mac) && !em_has_i210_memory_errors(mac) {
+        return Ok(());
+    }
+    let _ = io.read_register(E1000_PEIND)?;
+    let value = io.read_register(E1000_PEINDM)?;
+    io.write_register(E1000_PEINDM, value | E1000_PEIND_FATAL_MASK)?;
+    let _ = io.read_register(E1000_STATUS)?;
+    Ok(())
+}
+
+/// upstream: if_em.c em_update_82576_ecc_stats()
+pub fn em_update_82576_ecc_stats<I: E1000RegisterIo>(
+    io: &mut I,
+    stats: &mut EmErrorStats,
+    has_ipsec: bool,
+) -> DevResult {
+    for reg in [E1000_RPBECCSTS, E1000_TPBECCSTS, E1000_SWPBECCSTS_82576] {
+        let status = io.read_register(reg)?;
+        em_update_82576_ecc_counter(
+            status,
+            &mut stats.corrected_packet_buffer,
+            Some(&mut stats.uncorrected_packet_buffer),
+        );
+    }
+    if has_ipsec {
+        let status = io.read_register(E1000_IPPBECCSTS_82576)?;
+        em_update_82576_ecc_counter(
+            status,
+            &mut stats.corrected_packet_buffer,
+            Some(&mut stats.uncorrected_packet_buffer),
+        );
+    }
+    for reg in [E1000_RDHESTS_82576, E1000_TDHESTS_82576] {
+        let status = io.read_register(reg)?;
+        em_update_82576_ecc_counter(
+            status,
+            &mut stats.corrected_dma,
+            Some(&mut stats.uncorrected_dma),
+        );
+    }
+    for (reg, target) in [
+        (E1000_PRBESTS_82576, &mut stats.corrected_pcie_retry),
+        (E1000_PWBESTS_82576, &mut stats.corrected_pcie_tx_data),
+        (E1000_PMSIXESTS_82576, &mut stats.corrected_pcie_other),
+    ] {
+        let status = io.read_register(reg)?;
+        em_update_82576_ecc_counter(status, target, None);
+    }
+    Ok(())
+}
+
+/// upstream: if_em.c em_update_82571_ecc_stats()
+pub fn em_update_82571_ecc_stats<I: E1000RegisterIo>(
+    io: &mut I,
+    stats: &mut EmErrorStats,
+) -> DevResult {
+    let value = io.read_register(E1000_PBA_ECC)?;
+    let count = (value & E1000_PBA_ECC_COUNTER_MASK) >> E1000_PBA_ECC_COUNTER_SHIFT;
+    if count != 0 {
+        stats.corrected_packet_buffer += u64::from(count);
+        io.write_register(E1000_PBA_ECC, value | E1000_PBA_ECC_STAT_CLR)?;
+    }
+    Ok(())
+}
+
+/// upstream: if_em.c em_update_i210_ecc_stats()
+pub fn em_update_i210_ecc_stats<I: E1000RegisterIo>(
+    io: &mut I,
+    stats: &mut EmErrorStats,
+) -> DevResult {
+    let pbeccsts = io.read_register(E1000_PBECCSTS_I210)?;
+    if pbeccsts & E1000_PBECCSTS_I210_CORR_ERR != 0 {
+        stats.corrected_dma += 1;
+        io.write_register(
+            E1000_PBECCSTS_I210,
+            pbeccsts & (E1000_PBECCSTS_I210_ECC_ENABLE | E1000_PBECCSTS_I210_CORR_ERR),
+        )?;
+    }
+    let status = io.read_register(E1000_PCIEECCSTS)? & E1000_PCIEECCSTS_I210_CORR_MASK;
+    if status & E1000_PCIEECCSTS_TX_WR_DATA != 0 {
+        stats.corrected_pcie_tx_data += 1;
+    }
+    if status & E1000_PCIEECCSTS_RETRY_BUF != 0 {
+        stats.corrected_pcie_retry += 1;
+    }
+    if status != 0 {
+        io.write_register(E1000_PCIEECCSTS, status)?;
+    }
+    Ok(())
+}
+
+/// upstream: if_em.c em_update_i350_i354_ecc_stats()
+pub fn em_update_i350_i354_ecc_stats<I: E1000RegisterIo>(
+    io: &mut I,
+    stats: &mut EmErrorStats,
+    mac: E1000MacType,
+) -> DevResult {
+    for (reg, mask) in [
+        (E1000_DTPARS, E1000_DTPARS_CORR_MASK),
+        (E1000_DRPARS, E1000_DRPARS_CORR_MASK),
+        (E1000_DDECCS, E1000_DDECCS_CORR_MASK),
+    ] {
+        let status = io.read_register(reg)? & mask;
+        if status != 0 {
+            stats.corrected_dma += u64::from(status.count_ones());
+            io.write_register(reg, status)?;
+        }
+    }
+    let lane = io.read_register(E1000_LANPERRSTS)? & E1000_LANPERRSTS_MNG_FIFO_CORR;
+    if lane != 0 {
+        stats.corrected_lan_mng_fifo += 1;
+        io.write_register(E1000_LANPERRSTS, lane)?;
+    }
+    for reg in [E1000_RPBECCSTS, E1000_TPBECCSTS] {
+        let value = io.read_register(reg)?;
+        let status = value & E1000_PBECCSTS_I350_I354_CORR_MASK;
+        if status != 0 {
+            stats.corrected_packet_buffer += u64::from(status.count_ones());
+            io.write_register(
+                reg,
+                value & (E1000_PBECCSTS_I350_I354_ENABLE_MASK | E1000_PBECCSTS_I350_I354_CORR_MASK),
+            )?;
+        }
+    }
+    let mask = if mac == E1000MacType::I354 {
+        E1000_PCIEECCSTS_I354_CORR_MASK
+    } else {
+        E1000_PCIEECCSTS_I350_CORR_MASK
+    };
+    let status = io.read_register(E1000_PCIEECCSTS)? & mask;
+    if status & E1000_PCIEECCSTS_TX_WR_DATA != 0 {
+        stats.corrected_pcie_tx_data += 1;
+    }
+    if status & E1000_PCIEECCSTS_RETRY_BUF != 0 {
+        stats.corrected_pcie_retry += 1;
+    }
+    stats.corrected_pcie_other +=
+        u64::from((status & E1000_PCIEECCSTS_I350_I354_OTHER_MASK).count_ones());
+    if status != 0 {
+        io.write_register(E1000_PCIEECCSTS, status)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
