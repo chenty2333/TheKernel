@@ -2729,6 +2729,15 @@ mod tests {
         assert_eq!(modes, vec![current], "inadmissible target stays hidden");
     }
     #[test]
+    fn translated_tc_dpll_readout_matches_firmware_capture() {
+        let (adapter, ..) = native();
+        let firmware_enabled = adapter.state.lock().firmware.pll.enable != 0;
+        assert_eq!(
+            translated_tc_dpll_enabled(&adapter).unwrap(),
+            firmware_enabled
+        );
+    }
+    #[test]
     fn already_on_power_pin_refuses_dark_and_recovers_landed_failure() {
         for n in 1..=3 {
             let r = Model::new();
