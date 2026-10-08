@@ -1105,3 +1105,11 @@ and crawl/squash midpoint calculation from Linux 7.2.3
 `drivers/gpu/drm/i915/display/intel_cdclk.c` (MIT, Copyright © 2006-2017
 Intel); see `docs/design/intel-cdclk.md` for the translated functions and
 remaining runtime adapter work.
+
+`tk-intel-display/src/dpll_mgr.rs` adds ICL/TGL combo PLL parameter search,
+fixed DP/TBT tables, CFGCR state encode/decode, and the 38.4-MHz fraction
+workaround from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_dpll_mgr.c`
+(MIT, Copyright © 2006-2016 Intel); register-field definitions follow
+`display/intel_display_regs.h` (MIT, Copyright © 2006-2018 Intel). See
+`docs/design/intel-pll.md` §7. PLL resource allocation and MMIO manager
+lifecycle remain separate gaps.

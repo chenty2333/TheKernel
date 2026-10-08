@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Linux 7.2.3 drivers/gpu/drm/i915/display/intel_dpll_mgr.c:
 // icl_mg_pll_find_divisors, icl_calc_mg_pll_state, icl_ddi_mg_pll_get_freq,
-// dkl_pll_write (ADL-P/N legacy HDMI no-SSC branch).
+// icl_wrpll_get_multipliers, icl_wrpll_params_populate, icl_calc_wrpll,
+// icl_calc_dp_combo_pll, icl_calc_tbt_pll, icl_calc_dpll_state,
+// icl_ddi_combo_pll_get_freq, dkl_pll_write (ADL-P/N HDMI no-SSC branch).
 // Copyright © 2006-2016 Intel Corporation.
 // intel_{mg,dkl}_phy_regs.h: selected DKL/clock register fields.
 // Copyright © 2022 Intel Corporation. MIT permission text: ../LICENSE-MIT.
-// ADL-P/N display-13 DKL readout/programming fields only. MG PHY, DP/TBT,
-// combo PLL and hardware enable/disable/WA sequencing remain outside this file.
-// Readout restores the shared selector; programming preserves i915 RMW order.
+// ADL-P/N display-13 DKL and ICL/TGL combo PLL arithmetic/CFGCR fields.
+// MG PHY hardware sequencing, PLL allocation/refcounts, and full DPLL manager
+// init/readout/enable/disable integration remain outside this file. DKL readout
+// restores the shared selector; programming preserves i915 RMW order.
 use crate::{
     Error,
     dkl_phy::{DklIo, DklRegister, TcPort, intel_dkl_phy_posting_read, intel_dkl_phy_rmw},
@@ -399,4 +402,346 @@ pub fn dkl_pll_get_hw_state(
         })
     })
     .map(Option::flatten)
+}
+
+/// The subset of `skl_wrpll_params` used by display-12/13 combo PHY PLLs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IclWrpllParams {
+    pub dco_integer: u32,
+    pub dco_fraction: u32,
+    /// Hardware code: P={2,3,5,7} maps to {1,2,4,8}.
+    pub pdiv: u32,
+    /// Hardware code: K={1,2,3} maps to {1,2,4}.
+    pub kdiv: u32,
+    pub qdiv_mode: u32,
+    pub qdiv_ratio: u32,
+}
+
+/// The ICL/TGL DPLL CFGCR image produced by `icl_calc_dpll_state()`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IclComboPllState {
+    pub cfgcr0: u32,
+    pub cfgcr1: u32,
+    /// AFC startup override lives in DPLL0_DIV0, not in CFGCR0/1.
+    pub div0: u32,
+}
+
+const DCO_MIN_KHZ: u32 = 7_998_000;
+const DCO_MAX_KHZ: u32 = 10_000_000;
+const DCO_MID_KHZ: u32 = (DCO_MIN_KHZ + DCO_MAX_KHZ) / 2;
+const ICL_WRPLL_DIVIDERS: [u32; 46] = [
+    2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 28, 30, 32, 36, 40, 42, 44, 48, 50, 52, 54, 56, 60, 64,
+    66, 68, 70, 72, 76, 78, 80, 84, 88, 90, 92, 96, 98, 100, 102, 3, 5, 7, 9, 15, 21,
+];
+
+/// Select the integer `(P, Q, K)` factors for one source-listed total divider.
+// upstream: intel_dpll_mgr.c icl_wrpll_get_multipliers()
+pub fn icl_wrpll_get_multipliers(best_div: u32) -> Result<(u32, u32, u32), Error> {
+    if best_div == 2 {
+        return Ok((2, 1, 1));
+    }
+    if best_div % 2 == 0 {
+        if best_div % 4 == 0 {
+            return Ok((2, best_div / 4, 2));
+        }
+        if best_div % 6 == 0 {
+            return Ok((3, best_div / 6, 2));
+        }
+        if best_div % 5 == 0 {
+            return Ok((5, best_div / 10, 2));
+        }
+        if best_div % 14 == 0 {
+            return Ok((7, best_div / 14, 2));
+        }
+        return Err(Error::Refused);
+    }
+    if [3, 5, 7].contains(&best_div) {
+        Ok((best_div, 1, 1))
+    } else if [9, 15, 21].contains(&best_div) {
+        Ok((best_div / 3, 1, 3))
+    } else {
+        Err(Error::Refused)
+    }
+}
+
+/// Encode the logical ICL WRPLL divisors and fixed-point DCO into hardware fields.
+// upstream: intel_dpll_mgr.c icl_wrpll_params_populate()
+pub fn icl_wrpll_params_populate(
+    dco_freq_khz: u32,
+    ref_freq_khz: u32,
+    pdiv: u32,
+    qdiv: u32,
+    kdiv: u32,
+) -> Result<IclWrpllParams, Error> {
+    if ref_freq_khz == 0 || (kdiv != 2 && qdiv != 1) {
+        return Err(Error::Refused);
+    }
+    let pdiv_code = match pdiv {
+        2 => 1,
+        3 => 2,
+        5 => 4,
+        7 => 8,
+        _ => return Err(Error::Refused),
+    };
+    let kdiv_code = match kdiv {
+        1 => 1,
+        2 => 2,
+        3 => 4,
+        _ => return Err(Error::Refused),
+    };
+    if qdiv == 0 || qdiv > 0xff {
+        return Err(Error::Refused);
+    }
+    let dco = (u64::from(dco_freq_khz) << 15) / u64::from(ref_freq_khz);
+    Ok(IclWrpllParams {
+        dco_integer: (dco >> 15) as u32,
+        dco_fraction: (dco & 0x7fff) as u32,
+        pdiv: pdiv_code,
+        kdiv: kdiv_code,
+        qdiv_mode: u32::from(qdiv != 1),
+        qdiv_ratio: qdiv,
+    })
+}
+
+/// Use half of the 38.4-MHz reference on ICL+; hardware divides it by two.
+// upstream: intel_dpll_mgr.c icl_wrpll_ref_clock()
+pub const fn icl_wrpll_ref_clock(ref_clock_khz: u32) -> Result<u32, Error> {
+    match ref_clock_khz {
+        19_200 | 24_000 => Ok(ref_clock_khz),
+        38_400 => Ok(19_200),
+        _ => Err(Error::Refused),
+    }
+}
+
+/// Search the source's flat candidate list for the DCO closest to 8999 MHz.
+// upstream: intel_dpll_mgr.c icl_calc_wrpll()
+pub fn icl_calc_wrpll(port_clock_khz: u32, ref_clock_khz: u32) -> Result<IclWrpllParams, Error> {
+    if port_clock_khz == 0 || port_clock_khz > 1_000_000 {
+        return Err(Error::Refused);
+    }
+    let ref_clock_khz = icl_wrpll_ref_clock(ref_clock_khz)?;
+    let afe_clock_khz = port_clock_khz.checked_mul(5).ok_or(Error::Refused)?;
+    let mut best: Option<(u32, u32)> = None;
+    for divider in ICL_WRPLL_DIVIDERS {
+        let dco = afe_clock_khz.checked_mul(divider).ok_or(Error::Refused)?;
+        if (DCO_MIN_KHZ..=DCO_MAX_KHZ).contains(&dco) {
+            let centrality = dco.abs_diff(DCO_MID_KHZ);
+            if best.is_none_or(|(_, current)| centrality < current) {
+                best = Some((divider, centrality));
+            }
+        }
+    }
+    let (best_div, _) = best.ok_or(Error::Refused)?;
+    let (pdiv, qdiv, kdiv) = icl_wrpll_get_multipliers(best_div)?;
+    icl_wrpll_params_populate(afe_clock_khz * best_div, ref_clock_khz, pdiv, qdiv, kdiv)
+}
+
+const DP_COMBO_24: [(u32, u32, u32, u32, u32, u32); 8] = [
+    (540000, 0x151, 0x4000, 2, 1, 0),
+    (270000, 0x151, 0x4000, 2, 2, 0),
+    (162000, 0x151, 0x4000, 4, 2, 0),
+    (324000, 0x151, 0x4000, 4, 1, 0),
+    (216000, 0x168, 0, 1, 2, 2),
+    (432000, 0x168, 0, 1, 2, 0),
+    (648000, 0x195, 0, 2, 1, 0),
+    (810000, 0x151, 0x4000, 1, 1, 0),
+];
+const DP_COMBO_19_2: [(u32, u32, u32, u32, u32, u32); 8] = [
+    (540000, 0x1a5, 0x7000, 2, 1, 0),
+    (270000, 0x1a5, 0x7000, 2, 2, 0),
+    (162000, 0x1a5, 0x7000, 4, 2, 0),
+    (324000, 0x1a5, 0x7000, 4, 1, 0),
+    (216000, 0x1c2, 0, 1, 2, 2),
+    (432000, 0x1c2, 0, 1, 2, 0),
+    (648000, 0x1fa, 0x2000, 2, 1, 0),
+    (810000, 0x1a5, 0x7000, 1, 1, 0),
+];
+
+fn table_wrpll(row: (u32, u32, u32, u32, u32, u32)) -> IclWrpllParams {
+    IclWrpllParams {
+        dco_integer: row.1,
+        dco_fraction: row.2,
+        pdiv: row.3,
+        kdiv: row.4,
+        qdiv_mode: u32::from(row.5 != 0),
+        qdiv_ratio: row.5,
+    }
+}
+
+/// Fixed DisplayPort combo-PLL table for 24 MHz and 19.2/38.4 MHz references.
+// upstream: intel_dpll_mgr.c icl_calc_dp_combo_pll()
+pub fn icl_calc_dp_combo_pll(
+    port_clock_khz: u32,
+    ref_clock_khz: u32,
+) -> Result<IclWrpllParams, Error> {
+    let table = match ref_clock_khz {
+        24_000 => &DP_COMBO_24,
+        19_200 | 38_400 => &DP_COMBO_19_2,
+        _ => return Err(Error::Refused),
+    };
+    table
+        .iter()
+        .find(|row| row.0 == port_clock_khz)
+        .copied()
+        .map(table_wrpll)
+        .ok_or(Error::Refused)
+}
+
+/// Fixed TBT PLL parameters. Display 12 uses the TGL table; earlier ICL used
+/// the ICL table. At the 38.4-MHz reference, source selects the 19.2-MHz row.
+// upstream: intel_dpll_mgr.c icl_calc_tbt_pll()
+pub fn icl_calc_tbt_pll(display_version: u8, ref_clock_khz: u32) -> Result<IclWrpllParams, Error> {
+    let ref_clock_khz = match ref_clock_khz {
+        19_200 | 38_400 => 19_200,
+        24_000 => 24_000,
+        _ => return Err(Error::Refused),
+    };
+    let (dco_integer, dco_fraction, pdiv, kdiv) = if display_version >= 12 {
+        if ref_clock_khz == 19_200 {
+            (0x54, 0x3000, 0, 0)
+        } else {
+            (0x43, 0x4000, 0, 0)
+        }
+    } else if ref_clock_khz == 19_200 {
+        (0x1a5, 0x7000, 4, 1)
+    } else {
+        (0x151, 0x4000, 4, 1)
+    };
+    Ok(IclWrpllParams {
+        dco_integer,
+        dco_fraction,
+        pdiv,
+        kdiv,
+        qdiv_mode: 0,
+        qdiv_ratio: 0,
+    })
+}
+
+/// Encode WRPLL state into CFGCR0/1, including the source's 38.4-MHz fraction
+/// workaround and optional TGL AFC startup override.
+// upstream: intel_dpll_mgr.c icl_calc_dpll_state()
+pub fn icl_calc_dpll_state(
+    params: IclWrpllParams,
+    display_version: u8,
+    reference_khz: u32,
+    override_afc_startup: Option<u8>,
+) -> Result<IclComboPllState, Error> {
+    if override_afc_startup.is_some_and(|v| v > 7) || params.dco_fraction > 0x7fff {
+        return Err(Error::Refused);
+    }
+    let dco_fraction = if display_version >= 12 && reference_khz == 38_400 {
+        (params.dco_fraction + 1) / 2
+    } else {
+        params.dco_fraction
+    };
+    let cfgcr0 = (dco_fraction << 10) | (params.dco_integer & 0x3ff);
+    let cfgcr1 = (params.qdiv_ratio << 10)
+        | (params.qdiv_mode << 9)
+        | (params.kdiv << 6)
+        | (params.pdiv << 2)
+        | if display_version >= 12 { 0 } else { 3 };
+    Ok(IclComboPllState {
+        cfgcr0,
+        cfgcr1,
+        div0: override_afc_startup.map_or(0, |value| u32::from(value) << 25),
+    })
+}
+
+/// Decode combo-PLL CFGCR0/1 back to the source's TMDS/symbol frequency.
+// upstream: intel_dpll_mgr.c icl_ddi_combo_pll_get_freq()
+pub fn icl_ddi_combo_pll_get_freq(
+    state: IclComboPllState,
+    ref_clock_khz: u32,
+    display_version: u8,
+    frac_div_wa: bool,
+) -> Result<u32, Error> {
+    let raw_ref_clock_khz = ref_clock_khz;
+    let ref_clock_khz = icl_wrpll_ref_clock(raw_ref_clock_khz)?;
+    let pdiv = match (state.cfgcr1 >> 2) & 0xf {
+        1 => 2,
+        2 => 3,
+        4 => 5,
+        8 => 7,
+        _ => return Err(Error::Refused),
+    };
+    let kdiv = match (state.cfgcr1 >> 6) & 7 {
+        1 => 1,
+        2 => 2,
+        4 => 3,
+        _ => return Err(Error::Refused),
+    };
+    let qdiv = if state.cfgcr1 & (1 << 9) != 0 {
+        (state.cfgcr1 >> 10) & 0xff
+    } else {
+        1
+    };
+    let mut fraction = (state.cfgcr0 >> 10) & 0x7fff;
+    if frac_div_wa && display_version >= 12 && raw_ref_clock_khz == 38_400 {
+        fraction *= 2;
+    }
+    let dco = (state.cfgcr0 & 0x3ff) * ref_clock_khz + (fraction * ref_clock_khz) / 0x8000;
+    let divider = pdiv * qdiv * kdiv * 5;
+    (divider != 0)
+        .then_some(dco / divider)
+        .ok_or(Error::Refused)
+}
+
+#[cfg(test)]
+mod combo_tests {
+    use super::*;
+
+    #[test]
+    fn wrpll_search_matches_source_divider_order_and_dco_window() {
+        let cases = [
+            (148_500, 19_200, 0x1d0, 0x0800, 1, 2, 3),
+            (148_500, 24_000, 0x173, 0x2000, 1, 2, 3),
+            (148_500, 38_400, 0x1d0, 0x0800, 1, 2, 3),
+        ];
+        for (clock, reference, integer, fraction, pdiv, kdiv, qdiv) in cases {
+            let params = icl_calc_wrpll(clock, reference).unwrap();
+            assert_eq!(
+                (
+                    params.dco_integer,
+                    params.dco_fraction,
+                    params.pdiv,
+                    params.kdiv,
+                    params.qdiv_ratio,
+                ),
+                (integer, fraction, pdiv, kdiv, qdiv)
+            );
+        }
+        assert_eq!(icl_wrpll_get_multipliers(35), Err(Error::Refused));
+        assert_eq!(icl_wrpll_ref_clock(38_400), Ok(19_200));
+    }
+
+    #[test]
+    fn dp_and_tbt_fixed_tables_preserve_gen12_values() {
+        for clock in [
+            162_000, 216_000, 270_000, 324_000, 432_000, 540_000, 648_000, 810_000,
+        ] {
+            assert!(icl_calc_dp_combo_pll(clock, 24_000).is_ok());
+            assert!(icl_calc_dp_combo_pll(clock, 38_400).is_ok());
+        }
+        let tbt = icl_calc_tbt_pll(12, 38_400).unwrap();
+        assert_eq!(
+            (tbt.dco_integer, tbt.dco_fraction, tbt.pdiv, tbt.kdiv),
+            (0x54, 0x3000, 0, 0)
+        );
+        assert_eq!(icl_calc_tbt_pll(12, 24_000).unwrap().dco_integer, 0x43);
+    }
+
+    #[test]
+    fn combo_cfgcr_encoding_readback_and_fraction_wa_round_trip() {
+        let params = icl_calc_wrpll(148_500, 38_400).unwrap();
+        let state = icl_calc_dpll_state(params, 12, 38_400, Some(5)).unwrap();
+        assert_eq!(state.div0, 5 << 25);
+        assert_eq!(state.cfgcr1 & 3, 0, "Gen12 normal-xtal override");
+        assert_eq!(
+            icl_ddi_combo_pll_get_freq(state, 38_400, 12, true),
+            Ok(148_500)
+        );
+        let state = icl_calc_dpll_state(params, 11, 38_400, None).unwrap();
+        assert_eq!(state.cfgcr1 & 3, 3, "Gen11 central-frequency selector");
+        assert!(icl_calc_dpll_state(params, 12, 24_000, Some(8)).is_err());
+    }
 }

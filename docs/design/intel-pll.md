@@ -521,3 +521,23 @@ references.
    can be made to program one. That is what §2.5 needs and nothing else will supply it.
 
 None of these has been done.
+
+## 7. ICL/TGL PLL-manager arithmetic port (2026-10-08)
+
+`tk-intel-display/src/dpll_mgr.rs` now includes the source table/search paths
+`icl_wrpll_get_multipliers()`, `icl_wrpll_params_populate()`,
+`icl_wrpll_ref_clock()`, `icl_calc_wrpll()`, `icl_calc_dp_combo_pll()`,
+`icl_calc_tbt_pll()`, `icl_calc_dpll_state()` and
+`icl_ddi_combo_pll_get_freq()` from Linux 7.2.3
+`drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT, Copyright © 2006-2016
+Intel). The register encodings follow `intel_display_regs.h` (MIT, Copyright
+© 2006-2018 Intel), and the full license is already in the crate's
+`LICENSE-MIT`.
+
+The fixed DP/TBT tables, source candidate ordering, DCO window and midpoint,
+38.4→19.2 reference division, Gen11/12 CFGCR selector, and display-12
+38.4-MHz fraction workaround have host tests. This is not yet the full manager:
+atomic PLL allocation, active-port mux updates, MG PHY DP/TBT register writes,
+PLL enable/disable/lock sequencing, clock routing, reference-clock updates,
+readout/sanitization, and display-12/13 `intel_dpll.c` state ownership are
+still not translated or wired.
