@@ -10,7 +10,10 @@ mod config;
 mod firmware;
 mod firmware_bundle;
 
-pub use config::{DeviceConfig, FirmwareConfig, RuntimeConfig, lookup_config};
+pub use config::{
+    AX211_DEVICE_ID, DeviceConfig, FirmwareConfig, INTEL_VENDOR_ID, RuntimeConfig, lookup_config,
+    matches_pci_device,
+};
 pub use firmware::{
     FirmwareError, FirmwareImage, FirmwareSection, PnvmImage, SectionType, select_pnvm,
 };

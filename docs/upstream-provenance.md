@@ -981,3 +981,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): TLV firmware-header, section and supported-capability parsing adapted in `tk-axdriver-iwx/src/firmware.rs`; ISC text in that crate's `LICENSES/ISC.txt`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): PNVM SKU, hardware-type and runtime-section selection from `iwx_pnvm_parse()` / `iwx_pnvm_handle_section()` adapted in `tk-axdriver-iwx/src/firmware.rs`; ISC text in that crate's `LICENSES/ISC.txt`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): firmware command-version TLVs and UMAC/LMAC debug event-table metadata adapted in `tk-axdriver-iwx/src/firmware.rs`; ISC text in that crate's `LICENSES/ISC.txt`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `sys/dev/pci/pcidevs` (ISC): Intel AX211 PCI vendor/product match translated from `iwx_match()` into `tk-axdriver-iwx/src/config.rs`; ISC text in that crate's `LICENSES/ISC.txt`.

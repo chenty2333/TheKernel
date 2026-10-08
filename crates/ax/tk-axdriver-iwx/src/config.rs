@@ -4,6 +4,17 @@
 //! `iwx_find_device_cfg()` and the So-F/So GF table rows; `if_iwxvar.h`,
 //! `iwx_2ax_cfg_so_gf_a0` and firmware name constants. ISC.
 
+/// Intel PCI vendor ID used by the OpenBSD `iwx_devices` table.
+pub const INTEL_VENDOR_ID: u16 = 0x8086;
+/// AX211 PCI product ID `PCI_PRODUCT_INTEL_WL_22500_16`.
+pub const AX211_DEVICE_ID: u16 = 0x54f0;
+
+/// Whether a PCI function belongs to the AX211 iwx attach table.
+// upstream: if_iwx.c iwx_match()
+pub const fn matches_pci_device(vendor_id: u16, device_id: u16) -> bool {
+    vendor_id == INTEL_VENDOR_ID && device_id == AX211_DEVICE_ID
+}
+
 /// Firmware and PNVM names selected from an iwx device configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FirmwareConfig {
@@ -90,6 +101,13 @@ mod tests {
         no_160: false,
         cdb: false,
     };
+
+    #[test]
+    fn matches_only_intel_ax211_pci_identity() {
+        assert!(matches_pci_device(INTEL_VENDOR_ID, AX211_DEVICE_ID));
+        assert!(!matches_pci_device(0xffff, AX211_DEVICE_ID));
+        assert!(!matches_pci_device(INTEL_VENDOR_ID, 0xffff));
+    }
 
     #[test]
     fn ax211_uses_so_gf_firmware_and_pnvm() {
