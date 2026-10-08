@@ -8,9 +8,76 @@ use axdriver::prelude::firmware;
 use intel_display::dmc::{self as dmc_map, DmcPlatform};
 use spin::Mutex;
 
+use super::regs::{Meaning, Register, RegisterWindow, Registers};
+
 static PLATFORM: Mutex<Option<DmcPlatform>> = Mutex::new(None);
 static STEPPING: Mutex<Option<(u8, u8)>> = Mutex::new(None);
 static PROGRAM: Mutex<Option<intel_display::dmc::DmcFirmware>> = Mutex::new(None);
+static POWER_READY: Mutex<Option<(RegisterWindow, DmcPlatform)>> = Mutex::new(None);
+static LOAD_LOCK: Mutex<()> = Mutex::new(());
+static LOAD_RESULT: Mutex<
+    Option<Result<intel_display::dmc::DmcLoadReport, intel_display::dmc::DmcLoadError>>,
+> = Mutex::new(None);
+
+struct DmcMmio<'a>(&'a RegisterWindow);
+
+impl intel_display::RegisterIo for DmcMmio<'_> {
+    fn read32(&self, offset: u32) -> Result<u32, intel_display::Error> {
+        if !dmc_map::dmc_mmio_offset_valid(offset) {
+            return Err(intel_display::Error::Unavailable(offset));
+        }
+        self.0
+            .read(Register::read_only(
+                "INTEL_DMC",
+                offset,
+                Meaning::BringUp,
+                None,
+            ))
+            .ok_or(intel_display::Error::Unavailable(offset))
+    }
+
+    fn write32(&self, offset: u32, value: u32) -> Result<(), intel_display::Error> {
+        if !dmc_map::dmc_mmio_offset_valid(offset)
+            || !self.0.write(
+                Register::read_write("INTEL_DMC", offset, Meaning::BringUp, None),
+                value,
+            )
+        {
+            return Err(intel_display::Error::Unavailable(offset));
+        }
+        Ok(())
+    }
+}
+
+fn try_load_program()
+-> Option<Result<intel_display::dmc::DmcLoadReport, intel_display::dmc::DmcLoadError>> {
+    let _guard = LOAD_LOCK.lock();
+    if let Some(result) = *LOAD_RESULT.lock() {
+        return Some(result);
+    }
+    let (window, platform) = (*POWER_READY.lock())?;
+    let firmware = PROGRAM.lock().clone()?;
+    let result = dmc_map::load_program(&firmware, platform, &DmcMmio(&window));
+    *LOAD_RESULT.lock() = Some(result);
+    Some(result)
+}
+
+/// Record the display-power-ready boundary. Firmware upload is only allowed
+/// after the opt-in hardware path has enabled the parent display power well.
+pub(super) fn display_power_ready(window: RegisterWindow, platform: DmcPlatform) {
+    *POWER_READY.lock() = Some((window, platform));
+    if let Some(result) = try_load_program() {
+        match result {
+            Ok(report) => axlog::info!(
+                "intel-dmc: uploaded {} programs, {} payload dwords, {} init MMIO writes",
+                report.programs,
+                report.payload_dwords,
+                report.mmio_writes,
+            ),
+            Err(error) => axlog::warn!("intel-dmc: firmware upload/readback failed: {error:?}"),
+        }
+    }
+}
 
 /// Register the display-13 DMC request for the identified ADL-P/N device.
 /// The source driver defers firmware access until it can use the rootfs.
@@ -73,9 +140,7 @@ fn load_after_rootfs() {
         program.version,
     );
     *PROGRAM.lock() = Some(program);
-}
-
-/// Take the validated main program for the DMC MMIO loader.
-pub(super) fn take_program() -> Option<intel_display::dmc::DmcFirmware> {
-    PROGRAM.lock().take()
+    if let Some(Err(error)) = try_load_program() {
+        axlog::warn!("intel-dmc: firmware upload/readback failed: {error:?}");
+    }
 }

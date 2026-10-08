@@ -1669,6 +1669,7 @@ pub(super) fn init(
             .map(|&(base, size)| (base as u64, size as u64))
             .collect();
         let pin = PowerPin::acquire(&window, port)?;
+        super::dmc::display_power_ready(window, intel_display::dmc::DmcPlatform::AlderLakeN);
         let admitted = (|| {
             let first = capture(&window, &pin, port, afc_startup)?;
             if first.plane.pitch != (first.plane.width * 4).div_ceil(64) * 64 {

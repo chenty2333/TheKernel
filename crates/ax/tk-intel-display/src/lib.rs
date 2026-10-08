@@ -22,6 +22,7 @@ pub mod hdmi_packet;
 pub mod intel_bios;
 pub mod opregion;
 pub mod pipe_config;
+pub mod power_domains;
 pub mod power_map;
 pub mod power_well;
 pub mod scaler;

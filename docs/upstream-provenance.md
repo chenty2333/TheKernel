@@ -985,27 +985,31 @@ retain the latest Intel inventory, with no scanner exemptions.
 
 `crates/ax/tk-intel-display/src/dmc.rs` translates the display-12/13 path and
 size selection from Linux v7.2.3 `drivers/gpu/drm/i915/display/intel_dmc.c`
-`dmc_firmware_default()` (MIT, Copyright © 2014 Intel). No DMC firmware bytes,
-firmware parser, loader, or rootfs payload were added.
+`dmc_firmware_default()` (MIT, Copyright © 2014 Intel). Firmware blobs are
+external Buildroot inputs; the package carries their separate license notice
+and does not commit binary firmware to this worktree.
 
 The same file now also translates the display-12/13 main/pipe package parser
 from `intel_dmc.c` `parse_dmc_fw()`, `parse_dmc_fw_header()`, and
 `fw_info_matches_stepping()` (MIT, Copyright © 2014 Intel). The kernel adapter
 selects by PCI revision after the rootfs-ready callback and retains the parsed
-program records; event-handler fixups and DMC MMIO programming remain pending.
-This supersedes the earlier statement above that no firmware parser was added.
+program records. It also translates the event-handler fixups, disabled-event
+policy, payload/MMIO upload and readback verification; the kernel performs the
+upload only after the opt-in power-ready boundary. This supersedes the earlier
+statement above that no firmware parser or loader was added.
 
 `crates/ax/tk-intel-display/src/power_map.rs` translates the display-12/13
 power-well domain lists and descriptor groups from Linux v7.2.3
 `drivers/gpu/drm/i915/display/intel_display_power_map.c` (`tgl_power_wells`,
 `rkl_power_wells`, `adls_power_wells`, and `xelpd_power_wells`; MIT, Copyright
-© 2022 Intel). The kernel sequence still needs to consume these descriptors.
+© 2022 Intel). `power_domains.rs` consumes these descriptors for synchronous
+domain accounting, and `kernel/src/drm/intel/power.rs` requests Pipe-A/PW_A.
 
 `crates/ax/tk-intel-display/src/power_well.rs` translates the HSW-style
 requester, fuse, enable/disable, and state-query helpers from Linux v7.2.3
 `intel_display_power_well.c` (MIT, Copyright © 2022 Intel). The typed kernel
-register adapter consumes the translated handshake for the current PW_1 and
-DDI-IO paths; IRQ-coupled wells and full refcount lifecycle remain.
+register adapter consumes the translated handshake for PW_1/PW_A; IRQ-coupled
+wells and DDI/AUX operation groups remain.
 
 `crates/ax/tk-intel-display/src/dc_state.rs` translates the display-12/13
 `gen9_dc_mask()` and `gen9_write_dc_state()` logic plus the field read-modify-

@@ -86,6 +86,12 @@ everywhere, and have nothing in the log to say why.  The table in `power.rs` is
 `display/intel_display_power_map.c:1325-1410`), and a test pins it against
 Tiger Lake's shape.
 
+`tk-intel-display::power_domains` mirrors i915's synchronous per-domain and
+per-well reference edges (`get`, `put`, `get_if_enabled`, and hardware state
+query). The opt-in ADL-N core bring-up consumes its Pipe-A/PW_A path after
+PW_1, DBUF and clock initialization; all DDI/AUX operation groups, async puts,
+and the full modeset-driven domain-set lifecycle remain to be connected.
+
 ## 3. Decisions a reviewer should check
 
 ### 3.1 A poll budget is a count of reads, not a clock reading

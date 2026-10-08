@@ -534,26 +534,32 @@ The rootfs builder accepts pre-decompressed firmware only through
 `THEKERNEL_I915_DMC_FIRMWARE_DIR`, requires the Intel `LICENSE.i915` notice,
 and stages that notice beside the five TGL/RKL/ADL-S/ADL-P DMC images. The
 binary blobs are external build inputs, never repository files. A deferred
-rootfs request retains the bytes for later parser/load work; no parser/MMIO
-loader is wired yet. The Intel binary grant permits
+rootfs request retains the bytes until the opt-in power-ready path uploads
+validated programs and firmware MMIO values with readback. The Intel binary grant permits
 unmodified binary redistribution with its conditions/disclaimer and forbids
 reverse engineering/decompilation/disassembly; input preparation must respect
 that restriction. The display DMC parser translates the published Linux
 v7.2.3 `intel_dmc.c` parser (MIT, Copyright © 2014 Intel), not a reverse
 engineering of the firmware binary. It parses CSS/package metadata and v1/v3
 DMC headers without altering, decompiling, or disassembling the image. Event
-fixups and MMIO programming remain incomplete. This updates the earlier
-statement above: package parsing is now implemented; the MMIO loader is not.
+workarounds and the register adapter implement the display-12/13 upload path;
+only the opt-in N305 bring-up currently consumes it.
 
 `tk-intel-display/src/power_map.rs` also translates the MIT TGL/RKL/ADLS/XELPD
 power-domain and power-well tables from Linux v7.2.3
 `intel_display_power_map.c` (Copyright © 2022 Intel). The tables add no firmware
-or binary inputs; register/refcount use remains a separate kernel task.
+or binary inputs; synchronous refcounts are in `power_domains.rs` and the
+opt-in core sequence currently requests the Pipe-A/PW_A domain.
 
 The MIT `intel_display_power_well.c` request/fuse helpers are translated in
 `tk-intel-display/src/power_well.rs` (Copyright © 2022 Intel), with the current
 kernel adapter invoking them using typed register access. No firmware or binary
 payload is imported by this code.
+
+The synchronous display power-domain accounting in
+`tk-intel-display/src/power_domains.rs` translates MIT `intel_display_power.c`
+reference edges (Copyright © 2022 Intel). It operates on the previously listed
+power-well map and carries no firmware or binary inputs.
 
 The MIT `intel_display_power_well.c` DC mask and write-retry functions are
 translated in `tk-intel-display/src/dc_state.rs` (Copyright © 2022 Intel).

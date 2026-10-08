@@ -6,7 +6,7 @@ Source baseline: Linux `v7.2.3`, `drivers/gpu/drm/i915/display/`. Scope is displ
 
 | Work item | Linux source files | Existing Rust destination / integration |
 |---|---|---|
-| VBT and display power | `intel_bios.c`, `intel_display_power.c`, `intel_display_power_map.c`, `intel_display_power_well.c`, `intel_dmc.c` | `tk-intel-display::{intel_bios,opregion,device,dmc,power_map,power_well,dc_state}`; `kernel/src/drm/intel/{power,dmc,regs}`; DMC package parsing, TGL/RKL/ADLS/XELPD tables, HSW PW/fuse handshake and DC-state write retry are present; DMC event/MMIO load, interrupt-coupled well callbacks, map-driven full refcount/DC-state lifecycle remain |
+| VBT and display power | `intel_bios.c`, `intel_display_power.c`, `intel_display_power_map.c`, `intel_display_power_well.c`, `intel_dmc.c` | `tk-intel-display::{intel_bios,opregion,device,dmc,power_map,power_domains,power_well,dc_state}`; `kernel/src/drm/intel/{power,dmc,regs}`; DMC package/event fixups and validated main/pipe MMIO upload, TGL/RKL/ADLS/XELPD tables, HSW PW/fuse handshake and Pipe-A domain refcounts are present; IRQ-coupled well callbacks, full map-driven domain lifecycle, and DC5/6/9 transitions remain |
 
 `intel_bios.rs` now ports the review corrections for VBT defaults/field widths,
 MIPI-v3 block sizing, LFP pointer fixup, panel-type/PnP selection, eDP/PSR

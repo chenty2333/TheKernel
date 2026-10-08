@@ -428,6 +428,7 @@ fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, Str
         tx.quiesce(&gmbus::MonotonicTimer)?;
         let state = power::bring_up_preserving_phys(&tx, reusable).map_err(|e| e.describe())?;
         *POWER.lock() = Some(state);
+        dmc::display_power_ready(*window, intel_display::dmc::DmcPlatform::AlderLakeN);
         let resolved = connect::resolve_device(bdf, &tx, &gmbus::MonotonicTimer);
         let mut report = connect::ConnectReport::default();
         report.hotplug.push((bdf, resolved.hotplug));

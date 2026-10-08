@@ -75,6 +75,13 @@
 
 use alloc::{format, string::String, vec::Vec};
 
+use intel_display::{
+    power_domains::{PowerDomainIo, PowerDomainState},
+    power_map::{
+        PowerDomain, PowerWellGroup, PowerWellInstance, WellControl, WellOps, power_wells,
+    },
+};
+
 use super::{
     clk,
     phy::{self, PhyState},
@@ -645,6 +652,8 @@ pub(crate) struct PowerState {
     /// not stick means the PHY is not powered.
     pub(crate) phy_comp_init_after_pw1: Vec<(&'static str, bool)>,
     pub(crate) pw1: WellObservation,
+    /// Refcounted pipe-A domain and its map-backed wells.
+    pub(crate) power_domains: PowerDomainState,
     pub(crate) cdclk: clk::CdclkState,
     pub(crate) raw_clock: clk::RawClockState,
     pub(crate) dbuf: DbufState,
@@ -706,6 +715,10 @@ impl PowerState {
             self.fuses.sfuse_strap & 0xF,
         ));
         line(self.dc_state.describe());
+        line(format!(
+            "power-domain PIPE_A refcount {}",
+            self.power_domains.domain_use_count(PowerDomain::PipeA)
+        ));
         for phy in &self.phys {
             line(phy.describe());
         }
@@ -783,6 +796,7 @@ pub(crate) enum PowerError {
         unwound: bool,
     },
     Clock(clk::ClockError),
+    PowerDomain(String),
     /// No DBUF slice came up at all.
     DbufNeverPowered {
         readback: [u32; 4],
@@ -843,6 +857,7 @@ impl PowerError {
                 },
             ),
             Self::Clock(error) => error.describe(),
+            Self::PowerDomain(error) => format!("i915 power-domain reference failed: {error}"),
             Self::DbufNeverPowered { readback } => format!(
                 "no DBUF slice came up: the four slice registers read {readback:#010x?} after \
                  their request bits were set.  Reference section 11 phase 1.5: the failure this \
@@ -1099,6 +1114,104 @@ pub(crate) fn enable_well<R: Registers>(
     })
 }
 
+/// Drop one HSW-style request after its final mapped domain reference.
+// upstream: intel_display_power_well.c hsw_power_well_disable()
+pub(crate) fn disable_well<R: Registers>(regs: &R, well: Well) -> Result<(), PowerError> {
+    let adapter = HswPowerWellAdapter { regs };
+    let spec = intel_display::power_well::HswWellSpec {
+        name: well.name,
+        registers: intel_display::power_well::HswWellRegisters {
+            bios: REQUEST_REGISTERS[0].offset(),
+            driver: well.register.offset(),
+            kvmr: Some(REQUEST_REGISTERS[2].offset()),
+            debug: REQUEST_REGISTERS[3].offset(),
+            fuse_status: regs::SKL_FUSE_STATUS.offset(),
+            gen8_chicken_dcpr1: regs::GEN8_CHICKEN_DCPR_1.offset(),
+        },
+        index: well.index as u8,
+        pg: well.pg,
+        timeout_ms: well.timeout_us.div_ceil(1_000) as u16,
+        has_fuses: well.pg.is_some(),
+        alderlake_pw1_wa: well.pg == Some(SKL_PG1),
+        irq_pipe_mask: 0,
+    };
+    intel_display::power_well::hsw_power_well_disable(&adapter, spec)
+        .map(|_| ())
+        .map_err(|error| match error {
+            intel_display::Error::Unavailable(offset) => PowerError::Unreadable {
+                register: HswPowerWellAdapter::<R>::register(offset)
+                    .map(Register::name)
+                    .unwrap_or(well.register.name()),
+            },
+            _ => PowerError::WriteRefused {
+                register: well.register.name(),
+            },
+        })
+}
+
+fn mapped_hsw_well(instance: PowerWellInstance) -> Option<Well> {
+    match instance.control? {
+        WellControl::IclPw1 => Some(PW_1),
+        WellControl::IclPw2 => Some(PW_2),
+        WellControl::XelpdPwA => Some(PW_A),
+        WellControl::XelpdPwB => Some(PW_B),
+        WellControl::XelpdPwC => Some(PW_C),
+        WellControl::XelpdPwD => Some(PW_D),
+        _ => None,
+    }
+}
+
+struct MappedPowerWellIo<'a, R>(&'a R);
+
+impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
+    fn enable_well(
+        &mut self,
+        group: PowerWellGroup,
+        instance: PowerWellInstance,
+    ) -> Result<(), intel_display::Error> {
+        if instance.always_on || group.ops == WellOps::AlwaysOn {
+            return Ok(());
+        }
+        if group.ops != WellOps::Hsw {
+            return Err(intel_display::Error::Refused);
+        }
+        let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
+        enable_well(self.0, well)
+            .map(|_| ())
+            .map_err(|_| intel_display::Error::Unavailable(well.register.offset()))
+    }
+
+    fn disable_well(
+        &mut self,
+        group: PowerWellGroup,
+        instance: PowerWellInstance,
+    ) -> Result<(), intel_display::Error> {
+        if instance.always_on || group.ops == WellOps::AlwaysOn {
+            return Ok(());
+        }
+        if group.ops != WellOps::Hsw {
+            return Err(intel_display::Error::Refused);
+        }
+        let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
+        disable_well(self.0, well)
+            .map_err(|_| intel_display::Error::Unavailable(well.register.offset()))
+    }
+
+    fn well_is_enabled(
+        &self,
+        group: PowerWellGroup,
+        instance: PowerWellInstance,
+    ) -> Result<bool, intel_display::Error> {
+        if instance.always_on || group.ops == WellOps::AlwaysOn {
+            return Ok(true);
+        }
+        let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
+        read(self.0, well.register)
+            .map(|value| value & well.state_mask() != 0)
+            .map_err(|_| intel_display::Error::Unavailable(well.register.offset()))
+    }
+}
+
 /// Bring the display buffer's slices up.
 ///
 /// §11 phase 1.5 and §4.7: read each slice's state, request only the ones that
@@ -1329,12 +1442,29 @@ fn bring_up_inner(
     let workarounds = apply_workarounds(regs)
         .map_err(|error| unwind(regs, we_requested, "the workaround step", error))?;
 
+    // The opt-in pipe-A modeset needs PW_A after the display core and clocks
+    // are live. Keep the reference in the returned state so the map count
+    // remains paired with the hardware request for the lifetime of scanout.
+    let power_map = power_wells(intel_display::dmc::DmcPlatform::AlderLakeN);
+    let mut power_domains = PowerDomainState::new(power_map);
+    power_domains
+        .get(power_map, PowerDomain::PipeA, &mut MappedPowerWellIo(regs))
+        .map_err(|error| {
+            unwind(
+                regs,
+                we_requested,
+                "PIPE_A power-domain request",
+                PowerError::PowerDomain(format!("{error:?}")),
+            )
+        })?;
+
     Ok(PowerState {
         fuses,
         dc_state,
         phys,
         phy_comp_init_after_pw1,
         pw1,
+        power_domains,
         cdclk,
         raw_clock,
         dbuf,
