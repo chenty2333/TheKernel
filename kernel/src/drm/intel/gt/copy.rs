@@ -547,6 +547,21 @@ impl CtDmaMemory {
         intel_gt::guc_fw::notify(bus)?;
         Ok(fence)
     }
+
+    /// Map one GuC scheduling H2G action to CTB. `expected_response_dwords`
+    /// reserves the matching G2H credit before notifying GuC.
+    pub(super) fn send_scheduling_action(
+        &mut self,
+        bus: &impl GtIo,
+        action: &intel_gt::guc_submission::SchedAction,
+    ) -> Result<u16, Error> {
+        let len = usize::from(action.len);
+        if len == 0 || len > action.words.len() {
+            return Err(Error::Refused);
+        }
+        let flags = intel_gt::guc_ct::CT_SEND_NB | u32::from(action.expected_response_dwords);
+        self.send_nonblocking(bus, &action.words[..len], flags)
+    }
 }
 
 #[cfg(target_os = "none")]
