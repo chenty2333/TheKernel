@@ -18,3 +18,10 @@ status waits and global register invalidation separately from QI; unit tests
 exercise register ordering using fake MMIO. These helpers are not yet substituted
 into `kernel/src/acpi/vtd.rs`, and no claim is made that the DMA hang is fixed.
 Translation remains opt-in pending end-to-end translated QEMU acceptance.
+
+FreeBSD `intel_qi.c` is now represented in `tk-vtd/src/qi.rs` at 19/19
+function entry points, including queue capacity/refill and tail ordering,
+wait-descriptor generation wrap, global/page/IEC invalidations, completion
+sequence waits, interrupt/task drain hooks, and queue lifecycle. `QiIo` is the
+platform seam for coherent DMA queue memory, taskqueues and lock/wakeup rules.
+The kernel's current ad-hoc queue code has not yet been replaced by this port.

@@ -15,8 +15,9 @@ use alloc::vec::Vec;
 pub mod dmar;
 pub mod iova;
 pub mod pgtbl;
-pub mod utils;
+pub mod qi;
 pub mod reg;
+pub mod utils;
 
 const DMAR_HEADER_SIZE: usize = 48;
 const DRHD: u16 = 0;
