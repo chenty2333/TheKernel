@@ -46,3 +46,4 @@
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.
 - `IwxController` now owns CSR, attach DMA/rings, command slots, and firmware bootstrap/context start; Init and regular TLVs allocate separate section layouts (`controller.rs`, `dma.rs`; 162 crate tests pass, global and n305 lint pass).
 - The owned controller now drains completion descriptors, copies/recycles RX buffers, routes direct command responses into command-slot wait state, and dispatches firmware/data packets (`process_rx_notifications`; 163 crate tests pass, lint pair run).
+- PCI probe now creates and retains the core IwxController over a bounds-checked volatile BAR0 `CsrAccess` adapter; rootfs callback still stages firmware, but does not yet execute it or publish wlan0 (`tk-axdriver/src/iwx.rs`).

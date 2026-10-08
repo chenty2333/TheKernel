@@ -11,9 +11,9 @@ use core::{
 
 use axalloc::{UsageKind, global_allocator};
 use axdriver_iwx::{
-    AX211_DEVICE_ID, AttachAllocationError, AttachProfile, DmaAllocator, DmaError, DmaRegion,
-    FirmwareBundle, FirmwareError, FirmwareImage, INTEL_VENDOR_ID, IwxAttachResources,
-    RuntimeConfig, allocate_attach_resources, attach_profile, matches_pci_device,
+    AX211_DEVICE_ID, AttachAllocationError, AttachProfile, CsrAccess, DmaAllocator, DmaError,
+    DmaRegion, FirmwareBundle, FirmwareError, FirmwareImage, INTEL_VENDOR_ID, IoBarrier,
+    IwxController, RuntimeConfig, attach_profile, matches_pci_device,
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::{phys_to_virt, virt_to_phys};
@@ -117,6 +117,59 @@ impl DmaAllocator for PlatformDmaAllocator {
     }
 }
 
+/// Bounds-checked volatile CSR access over the mapped PCI BAR.
+struct MmioCsrAccess {
+    base: usize,
+    size: usize,
+}
+
+impl MmioCsrAccess {
+    fn contains(&self, offset: u32, width: usize) -> bool {
+        let offset = offset as usize;
+        offset.is_multiple_of(width)
+            && offset
+                .checked_add(width)
+                .is_some_and(|end| end <= self.size)
+    }
+}
+
+impl CsrAccess for MmioCsrAccess {
+    fn read32(&mut self, offset: u32) -> u32 {
+        if !self.contains(offset, 4) {
+            return u32::MAX;
+        }
+        // SAFETY: PCI probe validated this register window; `contains` proves alignment/range.
+        unsafe { ((self.base + offset as usize) as *const u32).read_volatile() }
+    }
+
+    fn write32(&mut self, offset: u32, value: u32) {
+        if self.contains(offset, 4) {
+            // SAFETY: PCI probe validated this register window; `contains` proves alignment/range.
+            unsafe { ((self.base + offset as usize) as *mut u32).write_volatile(value) };
+        }
+    }
+
+    fn write8(&mut self, offset: u32, value: u8) {
+        if self.contains(offset, 1) {
+            // SAFETY: PCI probe validated this register window; `contains` proves range.
+            unsafe { ((self.base + offset as usize) as *mut u8).write_volatile(value) };
+        }
+    }
+
+    fn barrier(&mut self, direction: IoBarrier) {
+        match direction {
+            IoBarrier::ReadWrite => core::sync::atomic::fence(Ordering::SeqCst),
+            IoBarrier::Write => core::sync::atomic::fence(Ordering::Release),
+        }
+    }
+
+    fn delay_us(&mut self, micros: u32) {
+        axhal::time::busy_wait(core::time::Duration::from_micros(u64::from(micros)));
+    }
+}
+
+unsafe impl Send for MmioCsrAccess {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Bdf(u8, u8, u8);
 
@@ -125,7 +178,7 @@ struct AttachedDevice {
     profile: AttachProfile,
     bar_base: usize,
     bar_size: usize,
-    resources: IwxAttachResources<PlatformDmaRegion>,
+    controller: IwxController<MmioCsrAccess, PlatformDmaAllocator>,
     firmware: Option<Result<FirmwareBundle, FirmwareRequestError>>,
 }
 
@@ -162,7 +215,16 @@ fn allocate_resources(
     if attached.iter().any(|entry| entry.bdf == key) {
         return Ok(());
     }
-    let resources = allocate_attach_resources(&mut PlatformDmaAllocator, profile.family)?;
+    let controller = IwxController::attach(
+        MmioCsrAccess {
+            base: bar_base,
+            size: bar_size,
+        },
+        PlatformDmaAllocator,
+        profile.family,
+        profile.umac_prph_offset,
+        0,
+    )?;
     attached.try_reserve(1).map_err(|_| {
         AttachAllocationError::Allocation(
             axdriver_iwx::AttachAllocationStage::ContextInfo,
@@ -174,7 +236,7 @@ fn allocate_resources(
         profile,
         bar_base,
         bar_size,
-        resources,
+        controller,
         firmware: None,
     });
     Ok(())
@@ -240,8 +302,8 @@ fn stage_rootfs_firmware() {
                     device.profile.family,
                     device.bar_base,
                     device.bar_size,
-                    device.resources.tx_queues.len(),
-                    device.resources.rx_queue.buffers.len(),
+                    device.controller.resources.tx_queues.len(),
+                    device.controller.resources.rx_queue.buffers.len(),
                 ),
                 Err(error) => warn!("iwx: {bdf:?}: firmware staging failed: {error:?}"),
             }
