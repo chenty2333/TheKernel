@@ -24,7 +24,7 @@ Rust 侧复用 `kernel/src/drm/intel/{gt.rs,gt_probe.rs,gem_exec.rs,gem_context.
 
 `guc_ct.rs` 已提供同步 TLB 完成和 FIFO deferred-event dispatch adapter（分别对应上游 receive-context 路径与 incoming-request worker）、nonblocking send busy-loop、ring reset 和 firmware-running 时的显式 disable action；GuC 事件业务 handler、VMA fini/owner teardown 以及 kernel 侧 G2H interrupt/tasklet/workqueue 调用链仍未接入。
 
-`guc_capture.rs` 是 `intel_guc_capture.c` 的数据面切片：按上游 ring 语义解包跨环的 group/capture/register 记录，保留原始 metadata/order、跳过未知 capture type，依赖引擎 reset group 将 lists 切分为节点并克隆 shared global/class data，按 GuC ID、context ID 和页对齐 LRCA 匹配/移除节点并提取 IPEHR/INSTDONE，含 Xe_LP 静态寄存器 offset/name 表、按拓扑展开 steered registers、选择 base/ext register lists，构造 page-aligned ADS list 和 3x overbuffer size assessment。ADS owner wire-up、真正 preallocated capture-node cache、core-dump formatting 及 CT event caller 尚未实现。
+`guc_capture.rs` 是 `intel_guc_capture.c` 的数据面切片：按上游 ring 语义解包跨环的 group/capture/register 记录，保留原始 metadata/order、跳过未知 capture type，依赖引擎 reset group 将 lists 切分为节点并克隆 shared global/class data，按 GuC ID、context ID 和页对齐 LRCA 匹配/移除节点并提取 IPEHR/INSTDONE，含 Xe_LP 静态寄存器 offset/name 表、按拓扑展开 steered registers、选择 base/ext register lists，构造 page-aligned ADS list、3x overbuffer size assessment 和可独立调用的 coredump text formatter。ADS owner wire-up、真正 preallocated capture-node cache、formatter 与 coredump 的对接及 CT event caller 尚未实现。
 
 ## 移植边界
 

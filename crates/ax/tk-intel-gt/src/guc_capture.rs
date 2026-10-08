@@ -2,7 +2,8 @@
 // Linux 7.2.3 drivers/gpu/drm/i915/gt/uc/intel_guc_capture.c and
 // guc_capture_fwif.h. Copyright © 2021-2022 Intel Corporation.
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
+use core::fmt::Write as FmtWrite;
 
 pub const CAPTURE_TYPE_GLOBAL: u8 = 0;
 pub const CAPTURE_TYPE_ENGINE_CLASS: u8 = 1;
@@ -459,6 +460,152 @@ pub struct CaptureOutputNode {
 pub struct CapturedEngineState {
     pub ipehr: u32,
     pub instdone: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureEngineInfo<'a> {
+    pub name: &'a str,
+    pub class: u8,
+    pub instance: u8,
+    pub logical_mask: u32,
+}
+
+/// Format a parsed node in the same layered order used by i915 coredumps.
+/// Unknown register names fall back to the MMIO offset, and steered entries
+/// retain the slice/subslice selectors encoded in their flags.
+/// upstream: intel_guc_capture.c intel_guc_capture_print_engine_node().
+pub fn format_capture_node(
+    engine_name: &str,
+    node: Option<&CaptureOutputNode>,
+    engine: Option<CaptureEngineInfo<'_>>,
+    engine_base: u32,
+    steered_offsets: &[u32],
+) -> Result<String, CaptureError> {
+    let register_count = node
+        .map(|node| {
+            node.lists
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(|list| list.registers.len())
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    let mut output = String::new();
+    output
+        .try_reserve(register_count.saturating_mul(80).saturating_add(512))
+        .map_err(|_| CaptureError::InvalidBuffer)?;
+    writeln!(
+        output,
+        "global --- GuC Error Capture on {engine_name} command stream:"
+    )
+    .map_err(|_| CaptureError::InvalidBuffer)?;
+    let Some(node) = node else {
+        output.push_str("  No matching ee-node\n");
+        return Ok(output);
+    };
+    writeln!(
+        output,
+        "Coverage:  {}",
+        if node.is_partial {
+            "partial-capture"
+        } else {
+            "full-capture"
+        }
+    )
+    .map_err(|_| CaptureError::InvalidBuffer)?;
+    for list_type in 0..usize::from(CAPTURE_TYPE_MAX) {
+        let list = node.lists[list_type].as_ref();
+        let type_name = match list_type as u8 {
+            CAPTURE_TYPE_GLOBAL => "Global",
+            CAPTURE_TYPE_ENGINE_CLASS => "Engine-Class",
+            _ => "Engine-Instance",
+        };
+        writeln!(output, "  RegListType: {type_name}").map_err(|_| CaptureError::InvalidBuffer)?;
+        writeln!(output, "    Owner-Id: {}", list.map_or(0, |list| list.vfid))
+            .map_err(|_| CaptureError::InvalidBuffer)?;
+        match list_type as u8 {
+            CAPTURE_TYPE_ENGINE_CLASS => {
+                writeln!(output, "    GuC-Eng-Class: {}", node.engine_class)
+                    .map_err(|_| CaptureError::InvalidBuffer)?;
+                writeln!(
+                    output,
+                    "    i915-Eng-Class: {}",
+                    guc_class_to_engine_class(node.engine_class)
+                )
+                .map_err(|_| CaptureError::InvalidBuffer)?;
+            }
+            CAPTURE_TYPE_ENGINE_INSTANCE => {
+                if let Some(engine) = engine {
+                    writeln!(output, "    i915-Eng-Name: {} command stream", engine.name)
+                        .map_err(|_| CaptureError::InvalidBuffer)?;
+                    writeln!(output, "    i915-Eng-Inst-Class: 0x{:02x}", engine.class)
+                        .map_err(|_| CaptureError::InvalidBuffer)?;
+                    writeln!(output, "    i915-Eng-Inst-Id: 0x{:02x}", engine.instance)
+                        .map_err(|_| CaptureError::InvalidBuffer)?;
+                    writeln!(
+                        output,
+                        "    i915-Eng-LogicalMask: 0x{:08x}",
+                        engine.logical_mask
+                    )
+                    .map_err(|_| CaptureError::InvalidBuffer)?;
+                } else {
+                    output.push_str("    i915-Eng-Lookup Fail!\n");
+                }
+                writeln!(
+                    output,
+                    "    GuC-Engine-Inst-Id: 0x{:08x}",
+                    node.engine_instance
+                )
+                .map_err(|_| CaptureError::InvalidBuffer)?;
+                writeln!(output, "    GuC-Context-Id: 0x{:08x}", node.guc_id)
+                    .map_err(|_| CaptureError::InvalidBuffer)?;
+                writeln!(output, "    LRCA: 0x{:08x}", node.lrca)
+                    .map_err(|_| CaptureError::InvalidBuffer)?;
+            }
+            _ => {}
+        }
+        let registers = list.map_or(&[][..], |list| list.registers.as_slice());
+        writeln!(output, "    NumRegs: {}", registers.len())
+            .map_err(|_| CaptureError::InvalidBuffer)?;
+        for register in registers {
+            if let Some(name) = gen12_register_name(
+                list_type as u32,
+                u32::from(node.engine_class),
+                engine_base,
+                register.offset,
+            ) {
+                write!(output, "      {name}").map_err(|_| CaptureError::InvalidBuffer)?;
+            } else {
+                write!(output, "      REG-0x{:08x}", register.offset)
+                    .map_err(|_| CaptureError::InvalidBuffer)?;
+            }
+            let capture_steering_mask =
+                (0xf << CAPTURE_STEERING_GROUP_SHIFT) | (0xf << CAPTURE_STEERING_INSTANCE_SHIFT);
+            if register.flags & capture_steering_mask != 0
+                || steered_offsets.contains(&register.offset)
+            {
+                let group = (register.flags >> CAPTURE_STEERING_GROUP_SHIFT) & 0xf;
+                let instance = (register.flags >> CAPTURE_STEERING_INSTANCE_SHIFT) & 0xf;
+                write!(output, "[{group}][{instance}]").map_err(|_| CaptureError::InvalidBuffer)?;
+            }
+            writeln!(output, ":  0x{:08x}", register.value)
+                .map_err(|_| CaptureError::InvalidBuffer)?;
+        }
+    }
+    Ok(output)
+}
+
+/// upstream: intel_guc_fwif.h guc_class_to_engine_class().
+pub const fn guc_class_to_engine_class(guc_class: u8) -> u8 {
+    match guc_class {
+        0 => 0, // render
+        1 => 1, // video decode
+        2 => 2, // video enhancement
+        3 => 3, // blitter
+        4 => 5, // compute
+        5 => 4, // GSC/other
+        _ => u8::MAX,
+    }
 }
 
 /// Match a parsed node to a context and engine using the GuC encoded class /
@@ -1010,6 +1157,36 @@ mod tests {
         let mut nodes = vec![node];
         assert!(take_matching_node(&mut nodes, engine_id, 0x1234, 0x4567_8001).is_some());
         assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn capture_node_formatter_emits_source_headers_names_and_values() {
+        let mut node = CaptureOutputNode::empty(true);
+        node.engine_class = 0;
+        node.engine_instance = 1;
+        node.guc_id = 0x22;
+        node.lrca = 0x1234_5000;
+        node.lists[usize::from(CAPTURE_TYPE_GLOBAL)] = Some(CaptureList {
+            vfid: 0,
+            capture_type: CAPTURE_TYPE_GLOBAL,
+            engine_class: 0,
+            engine_instance: 0,
+            lrca: u32::MAX,
+            guc_id: u32::MAX,
+            registers: vec![CaptureRegister {
+                offset: 0xceb8,
+                value: 0xfeed,
+                flags: 0,
+                mask: 0,
+            }],
+        });
+        let formatted = format_capture_node("rcs0", Some(&node), None, 0x2000, &[]).unwrap();
+        assert!(formatted.contains("Coverage:  partial-capture"));
+        assert!(formatted.contains("GEN12_FAULT_TLB_DATA0:  0x0000feed"));
+        assert!(formatted.contains("i915-Eng-Lookup Fail!"));
+        assert!(formatted.contains("GuC-Context-Id: 0x00000022"));
+        let extended = format_capture_node("rcs0", Some(&node), None, 0x2000, &[0xceb8]).unwrap();
+        assert!(extended.contains("GEN12_FAULT_TLB_DATA0[0][0]"));
     }
 
     #[test]
