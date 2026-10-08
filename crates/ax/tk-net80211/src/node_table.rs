@@ -211,6 +211,41 @@ pub fn duplicate_bss_node(
     Ok(node)
 }
 
+/// Apply station-only `needs_rxnode` policy: monitor captures retain peers;
+/// ordinary STA traffic uses the active BSS node.
+// upstream: ieee80211_node.c ieee80211_needs_rxnode()
+pub fn needs_station_rx_node(frame_control: u8, monitor_mode: bool) -> bool {
+    const FC_TYPE_MASK: u8 = 0x0c;
+    const FC_TYPE_CONTROL: u8 = 0x04;
+    const FC_SUBTYPE_MASK: u8 = 0xf0;
+    const FC_SUBTYPE_RTS: u8 = 0xb0;
+    if !monitor_mode {
+        return false;
+    }
+    frame_control & FC_TYPE_MASK != FC_TYPE_CONTROL
+        || frame_control & FC_SUBTYPE_MASK == FC_SUBTYPE_RTS
+}
+
+/// Resolve or allocate the station RX peer, falling back to the BSS record.
+// upstream: ieee80211_node.c ieee80211_find_rxnode()
+pub fn find_station_rx_node<'a>(
+    table: &'a mut NodeTable,
+    frame: &[u8],
+    monitor_mode: bool,
+) -> &'a mut NodeRecord {
+    if !monitor_mode || !frame.get(..16).is_some() {
+        return &mut table.bss_node;
+    }
+    let transmitter: [u8; 6] = frame[10..16].try_into().unwrap();
+    if table.nodes.contains_key(&transmitter) {
+        return table.nodes.get_mut(&transmitter).unwrap();
+    }
+    if let Ok(node) = duplicate_bss_node(table, transmitter) {
+        return node;
+    }
+    &mut table.bss_node
+}
+
 // upstream: ieee80211_node.c ieee80211_find_node()
 pub fn find_node<'a>(table: &'a NodeTable, mac_address: &[u8; 6]) -> Option<&'a NodeRecord> {
     table.nodes.get(mac_address)
@@ -412,5 +447,29 @@ mod tests {
         let peer = duplicate_bss_node(&mut table, [2, 9, 8, 7, 6, 5]).unwrap();
         assert_eq!(peer.access_point.bssid, [2, 1, 2, 3, 4, 5]);
         assert_eq!(peer.access_point.channel, 36);
+    }
+
+    #[test]
+    fn station_rx_lookup_uses_bss_or_monitor_transmitter_node() {
+        let transmitter = [2, 9, 8, 7, 6, 5];
+        let mut frame = alloc::vec![0; 24];
+        frame[0] = 0x80;
+        frame[10..16].copy_from_slice(&transmitter);
+        let mut table = NodeTable::default();
+        table.bss_node.access_point.bssid = [2, 1, 2, 3, 4, 5];
+        table.bss_node.access_point.channel = 36;
+        let bss_bssid = table.bss_node.access_point.bssid;
+
+        assert!(!needs_station_rx_node(0x80, false));
+        assert!(needs_station_rx_node(0x80, true));
+        assert!(needs_station_rx_node(0xb4, true));
+        assert!(!needs_station_rx_node(0xd4, true));
+        let bss = find_station_rx_node(&mut table, &frame, false);
+        assert_eq!(bss.access_point.bssid, [2, 1, 2, 3, 4, 5]);
+        let monitor_peer = find_station_rx_node(&mut table, &frame, true);
+        assert_eq!(monitor_peer.access_point.bssid, [2, 1, 2, 3, 4, 5]);
+        assert_eq!(monitor_peer.access_point.channel, 36);
+        assert_eq!(monitor_peer.access_point.bssid, bss_bssid);
+        assert!(find_node(&table, &transmitter).is_some());
     }
 }

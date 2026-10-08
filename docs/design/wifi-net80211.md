@@ -348,3 +348,8 @@ effects mapped to iwx's management queue.
 Duplicate station RX nodes now inherit only the source BSS BSSID and channel
 after bounded cache allocation; the kernel owns their lifetimes instead of
 OpenBSD node reference callbacks.
+
+The station-only `needs_rxnode`/`find_rxnode` policy now routes ordinary STA
+traffic to the BSS record and monitor captures to a referenced peer record,
+allocating a duplicate-BSS peer only on cache miss. AP/IBSS address admission
+remains outside this station subset.
