@@ -358,6 +358,14 @@ impl FirmwareImage {
             .map_or(FW_CMD_VER_UNKNOWN, |entry| entry[3])
     }
 
+    /// Check an API-change bitmap bit as used by ucode-gated command layouts.
+    pub fn api_enabled(&self, api: u32) -> bool {
+        let word = (api / 32) as usize;
+        self.api
+            .get(word)
+            .is_some_and(|value| value & (1 << (api % 32)) != 0)
+    }
+
     /// Count LMAC/UMAC/paging sections using their firmware separator markers.
     // upstream: if_iwx.c iwx_get_num_sections()
     pub fn section_counts_by_layout(&self) -> (usize, usize, usize) {
@@ -914,5 +922,10 @@ mod tests {
             FirmwareImage::parse(&test_image(&[(TLV_API_CHANGES_SET, &api)])),
             Err(FirmwareError::InvalidCapabilities)
         );
+        let regulatory_nvm = [1u32.to_le_bytes(), (1u32 << 16).to_le_bytes()].concat();
+        let image =
+            FirmwareImage::parse(&test_image(&[(TLV_API_CHANGES_SET, &regulatory_nvm)])).unwrap();
+        assert!(image.api_enabled(48));
+        assert!(!image.api_enabled(47));
     }
 }

@@ -161,7 +161,10 @@ pub use lifecycle::{
     MCAST_FILTER_PAYLOAD_BYTES, StopAction, allow_multicast_command, initialize_interface,
     stop_interface,
 };
-pub use mac::{MacAddress, flip_hardware_address, is_valid_mac_address, select_csr_mac_address};
+pub use mac::{
+    MacAddress, flip_hardware_address, is_valid_mac_address, read_csr_mac_address,
+    select_csr_mac_address,
+};
 pub use mac_context::{
     ACTION_ADD as MAC_ACTION_ADD, ACTION_REMOVE as MAC_ACTION_REMOVE, EdcaParameters, HtProtection,
     MAC_CONF_GROUP, MAC_CONFIG_COMMAND, MAC_CONTEXT_COMMAND, MacContextConfig, MacContextError,
