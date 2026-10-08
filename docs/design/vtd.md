@@ -92,3 +92,12 @@ lookup, KMSAN, callback locks, and delayed taskqueue wrappers are framework
 adapters. TheKernel callers provide physical ranges to the DMA interface. The
 adapter enforces segment count/size, alignment, boundary, and low-address
 constraints, but is not yet wired as a tag layer into every kernel DMA client.
+
+`intel_intrmap.c` is represented at 10/10 function entry points by
+`tk-vtd/src/intrmap.rs`: contiguous first-fit IRTE allocation, direct DMAR MSI
+routing, requester-tagged MSI entries, IOAPIC delivery-mode/polarity/trigger
+encoding, entry update/free with IEC invalidation, and IRTA initialization/final
+sequence. VMEM, `device_t` source lookup, `intr_reprogram()` and physical IRTE
+allocation are adapters. TheKernel's current ACPI/VT-d startup does not install
+this IR table adapter into the APIC/IOAPIC vector path; therefore these routes
+are unit-tested code, not enabled interrupt remapping.

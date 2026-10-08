@@ -576,3 +576,7 @@ FreeBSD `sys/dev/iommu/busdma_iommu.c` core map/unmap behavior is represented
 in `crates/ax/tk-vtd/src/busdma.rs` under its 2013 FreeBSD Foundation
 BSD-2-Clause grant and Konstantin Belousov attribution, covered by the crate's
 retained `LICENSES/BSD-2-Clause.txt`.
+FreeBSD `sys/x86/iommu/intel_intrmap.c` interrupt-entry logic is represented in
+`crates/ax/tk-vtd/src/intrmap.rs` under its 2015 FreeBSD Foundation
+BSD-2-Clause grant and Konstantin Belousov attribution, covered by the crate's
+retained `LICENSES/BSD-2-Clause.txt`.

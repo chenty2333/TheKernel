@@ -19,6 +19,7 @@ pub mod driver;
 pub mod fault;
 pub mod gas;
 pub mod idpgtbl;
+pub mod intrmap;
 pub mod iova;
 pub mod pgtbl;
 pub mod qi;
