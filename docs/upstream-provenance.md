@@ -1017,3 +1017,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): NVM_GET_INFO request, root of its RF-kill-capable response flow, and v3/v4 NVM parsing adapter translated in `tk-axdriver-iwx/src/nvm.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): Init-MVM extended-configuration and NVM-access-complete host commands translated in `tk-axdriver-iwx/src/init_cmd.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): LTR_CONFIG payload gating and RX_PHY notification state extraction translated in `tk-axdriver-iwx/src/init_cmd.rs` and `tk-axdriver-iwx/src/rx.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): RX buffer replacement, RBD address update, and transfer descriptor repost translated in `tk-axdriver-iwx/src/rings.rs`.

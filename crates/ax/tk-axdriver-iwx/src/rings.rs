@@ -112,6 +112,27 @@ impl<R: DmaRegion> RxRing<R> {
         Ok(())
     }
 
+    /// Allocate and post a replacement RX buffer, returning the completed one
+    /// to the caller for packet processing.
+    // upstream: if_iwx.c iwx_rx_addbuf()
+    pub fn refill_buffer<A: DmaAllocator<Region = R>>(
+        &mut self,
+        allocator: &mut A,
+        buffer_id: u16,
+    ) -> Result<R, RingError> {
+        let index = usize::from(buffer_id);
+        if index >= self.buffers.len() {
+            return Err(RingError::InvalidIndex);
+        }
+        let replacement = zeroed_dma(allocator, RX_BUFFER_BYTES, 4096)?;
+        let completed = core::mem::replace(&mut self.buffers[index], replacement);
+        if let Err(error) = self.repost(buffer_id) {
+            self.buffers[index] = completed;
+            return Err(error);
+        }
+        Ok(completed)
+    }
+
     /// Reset the hardware status cursor and re-publish every free RBD descriptor.
     // upstream: if_iwx.c iwx_reset_rx_ring()
     pub fn reset(&mut self) -> Result<(), RingError> {
@@ -481,6 +502,15 @@ mod tests {
         let mut desc = [0; 16];
         ring.free_descriptors.read_at(511 * 16, &mut desc).unwrap();
         assert_eq!(u16::from_le_bytes([desc[0], desc[1]]), 511);
+        assert_eq!(
+            u64::from_le_bytes(desc[8..16].try_into().unwrap()),
+            ring.buffers[511].device_address()
+        );
+        let old_address = ring.buffers[511].device_address();
+        let completed = ring.refill_buffer(&mut alloc, 511).unwrap();
+        assert_eq!(completed.device_address(), old_address);
+        assert_ne!(ring.buffers[511].device_address(), old_address);
+        ring.free_descriptors.read_at(511 * 16, &mut desc).unwrap();
         assert_eq!(
             u64::from_le_bytes(desc[8..16].try_into().unwrap()),
             ring.buffers[511].device_address()
