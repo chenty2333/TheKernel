@@ -17,6 +17,25 @@ pub const ELEMID_HT_OPERATION: u8 = 61;
 pub const ELEMID_VHT_CAPS: u8 = 191;
 pub const ELEMID_EXTENSION: u8 = 255;
 pub const ELEMID_EXT_HE_CAPS: u8 = 35;
+pub const ELEMID_RSN: u8 = 48;
+pub const ELEMID_VENDOR: u8 = 221;
+pub const CIPHER_USE_GROUP: u32 = 0x01;
+pub const CIPHER_WEP40: u32 = 0x02;
+pub const CIPHER_TKIP: u32 = 0x04;
+pub const CIPHER_CCMP: u32 = 0x08;
+pub const CIPHER_WEP104: u32 = 0x10;
+pub const CIPHER_BIP: u32 = 0x20;
+pub const AKM_8021X: u32 = 0x01;
+pub const AKM_PSK: u32 = 0x02;
+pub const AKM_SHA256_8021X: u32 = 0x04;
+pub const AKM_SHA256_PSK: u32 = 0x08;
+pub const RSNCAP_PTKSA_RCNT_MASK: u16 = 0x000c;
+pub const RSNCAP_GTKSA_RCNT_MASK: u16 = 0x0030;
+pub const RSNCAP_MFPR: u16 = 0x0040;
+pub const RSNCAP_MFPC: u16 = 0x0080;
+pub const RSNCAP_PBAC: u16 = 0x1000;
+pub const RSN_OUI: [u8; 3] = [0x00, 0x0f, 0xac];
+pub const WPA_OUI: [u8; 3] = [0x00, 0x50, 0xf2];
 pub const RATE_SIZE: usize = 8;
 pub const SSID_MAX_LEN: usize = 32;
 
@@ -25,6 +44,23 @@ pub enum IeError {
     SsidTooLong,
     InvalidRateSet,
     NoExtendedRates,
+    InvalidGroupCipher,
+    InvalidGroupManagementCipher,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RsnIePolicy {
+    pub wpa: bool,
+    pub group_cipher: u32,
+    pub pairwise_ciphers: u32,
+    pub akms: u32,
+    pub peer_capabilities: u16,
+    pub mfp_capable: bool,
+    pub station_mode: bool,
+    pub mfp_required: bool,
+    pub pbac: bool,
+    pub pmkid: Option<[u8; 16]>,
+    pub group_management_cipher: u32,
 }
 
 fn append_ie(output: &mut Vec<u8>, id: u8, payload: &[u8]) -> Result<(), IeError> {
@@ -139,6 +175,101 @@ pub fn append_he_caps_ie(output: &mut Vec<u8>, caps: &HeCapabilities) -> Result<
     append_ie(output, ELEMID_EXTENSION, &body)
 }
 
+/// Build the RSN/WPA suite body, including PMKID and optional MFP fields.
+// upstream: ieee80211_output.c ieee80211_add_rsn_body()
+pub fn build_rsn_body(policy: &RsnIePolicy) -> Result<Vec<u8>, IeError> {
+    let oui = if policy.wpa { WPA_OUI } else { RSN_OUI };
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u16.to_le_bytes());
+    let group_suite = match policy.group_cipher {
+        CIPHER_WEP40 => 1,
+        CIPHER_TKIP => 2,
+        CIPHER_CCMP => 4,
+        CIPHER_WEP104 => 5,
+        _ => return Err(IeError::InvalidGroupCipher),
+    };
+    body.extend_from_slice(&oui);
+    body.push(group_suite);
+
+    let mut pairwise = Vec::new();
+    for (mask, suite) in [(CIPHER_USE_GROUP, 0), (CIPHER_TKIP, 2), (CIPHER_CCMP, 4)] {
+        if policy.pairwise_ciphers & mask != 0 {
+            pairwise.extend_from_slice(&oui);
+            pairwise.push(suite);
+        }
+    }
+    body.extend_from_slice(&((pairwise.len() / 4) as u16).to_le_bytes());
+    body.extend_from_slice(&pairwise);
+    let mut akms = Vec::new();
+    for (mask, suite) in [(AKM_8021X, 1), (AKM_PSK, 2)] {
+        if policy.akms & mask != 0 {
+            akms.extend_from_slice(&oui);
+            akms.push(suite);
+        }
+    }
+    if !policy.wpa {
+        for (mask, suite) in [(AKM_SHA256_8021X, 5), (AKM_SHA256_PSK, 6)] {
+            if policy.akms & mask != 0 {
+                akms.extend_from_slice(&oui);
+                akms.push(suite);
+            }
+        }
+    }
+    body.extend_from_slice(&((akms.len() / 4) as u16).to_le_bytes());
+    body.extend_from_slice(&akms);
+    if policy.wpa {
+        return Ok(body);
+    }
+
+    let pmf =
+        policy.mfp_capable && (!policy.station_mode || policy.peer_capabilities & RSNCAP_MFPC != 0);
+    let mut rsn_capabilities =
+        policy.peer_capabilities & (RSNCAP_PTKSA_RCNT_MASK | RSNCAP_GTKSA_RCNT_MASK);
+    if pmf {
+        rsn_capabilities |= RSNCAP_MFPC;
+        if policy.mfp_required {
+            rsn_capabilities |= RSNCAP_MFPR;
+        }
+    }
+    if policy.pbac {
+        rsn_capabilities |= RSNCAP_PBAC;
+    }
+    body.extend_from_slice(&rsn_capabilities.to_le_bytes());
+    if let Some(pmkid) = policy.pmkid {
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&pmkid);
+    }
+    if !pmf {
+        return Ok(body);
+    }
+    if policy.pmkid.is_none() {
+        body.extend_from_slice(&0u16.to_le_bytes());
+    }
+    if policy.group_management_cipher != CIPHER_BIP {
+        return Err(IeError::InvalidGroupManagementCipher);
+    }
+    body.extend_from_slice(&oui);
+    body.push(6);
+    Ok(body)
+}
+
+/// Append an RSN Information Element.
+// upstream: ieee80211_output.c ieee80211_add_rsn()
+pub fn append_rsn_ie(output: &mut Vec<u8>, policy: &RsnIePolicy) -> Result<(), IeError> {
+    append_ie(output, ELEMID_RSN, &build_rsn_body(policy)?)
+}
+
+/// Append the vendor-specific WPA element and WPA v1 suite body.
+// upstream: ieee80211_output.c ieee80211_add_wpa()
+pub fn append_wpa_ie(output: &mut Vec<u8>, policy: &RsnIePolicy) -> Result<(), IeError> {
+    let mut wpa = *policy;
+    wpa.wpa = true;
+    let mut body = Vec::from(WPA_OUI);
+    body.push(1);
+    body.extend_from_slice(&build_rsn_body(&wpa)?);
+    append_ie(output, ELEMID_VENDOR, &body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +309,53 @@ mod tests {
         assert_eq!(
             append_supported_rates_ie(&mut ies, &invalid),
             Err(IeError::InvalidRateSet)
+        );
+    }
+
+    #[test]
+    fn rsn_and_wpa_encoders_emit_ordered_suite_lists_and_mfp_fields() {
+        let policy = RsnIePolicy {
+            group_cipher: CIPHER_CCMP,
+            pairwise_ciphers: CIPHER_TKIP | CIPHER_CCMP,
+            akms: AKM_PSK | AKM_SHA256_PSK,
+            peer_capabilities: RSNCAP_MFPC | RSNCAP_PTKSA_RCNT_MASK,
+            mfp_capable: true,
+            station_mode: true,
+            mfp_required: true,
+            pbac: true,
+            pmkid: Some([0x5a; 16]),
+            group_management_cipher: CIPHER_BIP,
+            ..Default::default()
+        };
+        let mut ies = Vec::new();
+        append_rsn_ie(&mut ies, &policy).unwrap();
+        let parsed = crate::parse_rsn(&ies).unwrap();
+        assert_eq!(parsed.group_cipher, crate::Cipher::Ccmp);
+        assert_eq!(parsed.pairwise_ciphers, CIPHER_TKIP | CIPHER_CCMP);
+        assert_eq!(parsed.akms, AKM_PSK | AKM_SHA256_PSK);
+        assert_eq!(
+            parsed.capabilities & (RSNCAP_MFPC | RSNCAP_MFPR | RSNCAP_PBAC),
+            RSNCAP_MFPC | RSNCAP_MFPR | RSNCAP_PBAC
+        );
+        assert_eq!(parsed.pmkids, [[0x5a; 16]]);
+        assert_eq!(parsed.group_management_cipher, crate::Cipher::Bip);
+        let mut wpa_policy = RsnIePolicy {
+            wpa: true,
+            group_cipher: CIPHER_TKIP,
+            pairwise_ciphers: CIPHER_TKIP,
+            akms: AKM_PSK | AKM_SHA256_PSK,
+            ..policy
+        };
+        let mut wpa_ie = Vec::new();
+        append_wpa_ie(&mut wpa_ie, &wpa_policy).unwrap();
+        let wpa = crate::parse_wpa(&wpa_ie).unwrap();
+        assert_eq!(wpa.group_cipher, crate::Cipher::Tkip);
+        assert_eq!(wpa.akms, AKM_PSK); // WPA v1 does not carry SHA-256 AKMs.
+        wpa_policy.group_management_cipher = 0;
+        assert!(build_rsn_body(&wpa_policy).is_ok());
+        assert_eq!(
+            build_rsn_body(&RsnIePolicy::default()),
+            Err(IeError::InvalidGroupCipher)
         );
     }
 

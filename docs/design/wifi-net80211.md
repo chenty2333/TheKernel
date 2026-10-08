@@ -88,3 +88,6 @@ prior duplicate serializer for those elements.
 Output IE builders include HT/VHT/HE capability elements with the exact packed
 little-endian layouts; HT Operation uses the source reserved-zero Basic MCS
 field, while HE MCS/NSS maps follow advertised 160/80+80 width bits.
+RSN/WPA output IEs preserve source suite ordering, WPA-v1 restrictions, replay-
+counter bits, station PMF advertisement rules, optional PMKID and BIP group
+management cipher. Wire output round-trips through the crate's RSN parser.

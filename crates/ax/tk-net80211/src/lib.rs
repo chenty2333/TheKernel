@@ -67,10 +67,15 @@ pub use node_table::{
     alloc_node, allocation_available, find_node, free_all_nodes, free_node, setup_node,
 };
 pub use output::{
-    ELEMID_EXT_HE_CAPS, ELEMID_EXTENSION, ELEMID_HT_CAPS, ELEMID_HT_OPERATION, ELEMID_RATES,
-    ELEMID_SSID, ELEMID_VHT_CAPS, ELEMID_XRATES, IeError, append_extended_rates_ie,
-    append_he_caps_ie, append_ht_caps_ie, append_ht_operation_ie, append_ssid_ie,
-    append_supported_rates_ie, append_vht_caps_ie,
+    AKM_8021X as IE_AKM_8021X, AKM_PSK as IE_AKM_PSK, AKM_SHA256_8021X as IE_AKM_SHA256_8021X,
+    AKM_SHA256_PSK as IE_AKM_SHA256_PSK, CIPHER_BIP as IE_CIPHER_BIP,
+    CIPHER_CCMP as IE_CIPHER_CCMP, CIPHER_TKIP as IE_CIPHER_TKIP, CIPHER_USE_GROUP, CIPHER_WEP40,
+    CIPHER_WEP104, ELEMID_EXT_HE_CAPS, ELEMID_EXTENSION, ELEMID_HT_CAPS, ELEMID_HT_OPERATION,
+    ELEMID_RATES, ELEMID_RSN, ELEMID_SSID, ELEMID_VENDOR, ELEMID_VHT_CAPS, ELEMID_XRATES, IeError,
+    RSN_OUI, RSNCAP_GTKSA_RCNT_MASK, RSNCAP_MFPC, RSNCAP_MFPR, RSNCAP_PBAC, RSNCAP_PTKSA_RCNT_MASK,
+    RsnIePolicy, WPA_OUI, append_extended_rates_ie, append_he_caps_ie, append_ht_caps_ie,
+    append_ht_operation_ie, append_rsn_ie, append_ssid_ie, append_supported_rates_ie,
+    append_vht_caps_ie, append_wpa_ie, build_rsn_body,
 };
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,
