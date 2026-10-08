@@ -224,6 +224,21 @@ pub enum AcpiGpioPolarity {
     Both,
 }
 
+/// GPIO interrupt request routed through the ACPI-described provider.
+#[crate_interface::def_interface]
+pub trait AcpiGpioSupport {
+    fn request_interrupt(
+        controller_path: &str,
+        pin: u16,
+        edge_triggered: bool,
+        polarity: AcpiGpioPolarity,
+        level: u8,
+        pending: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+    ) -> Option<u64>;
+    fn set_interrupt_enabled(handle: u64, enabled: bool) -> bool;
+    fn release_interrupt(handle: u64);
+}
+
 #[crate_interface::def_interface]
 pub trait AcpiI2cSupport {
     fn controller_path(segment: u16, bus: u8, device: u8, function: u8) -> Option<String>;

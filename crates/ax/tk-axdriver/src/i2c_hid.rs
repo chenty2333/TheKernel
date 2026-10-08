@@ -1,6 +1,7 @@
 //! FreeBSD iichid child attachment mapped onto the existing HID decoder and
 //! evdev input-driver interface.
-use alloc::{collections::VecDeque, format, string::String, vec, vec::Vec};
+use alloc::{collections::VecDeque, format, string::String, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
 use axdriver_input::{AbsInfo, Event, EventType, InputDeviceId, InputDriverOps};
@@ -149,6 +150,8 @@ pub struct I2cInput {
     state: Mutex<InputState>,
     info: crate::hidbus::DeviceInfo,
     location: String,
+    gpio_pending: Arc<AtomicBool>,
+    gpio_interrupt: Option<u64>,
 }
 
 impl I2cInput {
@@ -156,14 +159,6 @@ impl I2cInput {
     // upstream: iichid.c iichid_attach()
     // upstream: iichid.c iichid_get_rdesc()
     fn attach(bus: usize, child: crate::i2c::AcpiI2cChild) -> DevResult<Self> {
-        if !child.gpio_interrupts.is_empty() {
-            warn!(
-                "i2c-hid: {} has {} parsed GpioInt resource(s); GPIO provider/IRQ request is \
-                 unavailable, retaining adaptive polling",
-                child.path,
-                child.gpio_interrupts.len()
-            );
-        }
         let address = if child.ten_bit {
             Address::ten_bit(child.slave_address)
         } else {
@@ -331,6 +326,25 @@ impl I2cInput {
             report_info,
             descriptor,
         );
+        let gpio_pending = Arc::new(AtomicBool::new(false));
+        let gpio_interrupt = child.gpio_interrupts.iter().find_map(|resource| {
+            let pin = *resource.pins.first()?;
+            crate_interface::call_interface!(
+                crate::i2c::AcpiGpioSupport::request_interrupt,
+                resource.controller_path.as_str(),
+                pin,
+                resource.edge_triggered,
+                resource.polarity,
+                1,
+                gpio_pending.clone()
+            )
+        });
+        if !child.gpio_interrupts.is_empty() && gpio_interrupt.is_none() {
+            warn!(
+                "i2c-hid: {} GPIO interrupt request unavailable; retaining adaptive polling",
+                child.path
+            );
+        }
         Ok(Self {
             state: Mutex::new(InputState {
                 device,
@@ -349,6 +363,8 @@ impl I2cInput {
             }),
             info,
             location: format!("i2c-{bus}/{}", child.slave_address),
+            gpio_pending,
+            gpio_interrupt,
         })
     }
 
@@ -492,6 +508,13 @@ impl InputDriverOps for I2cInput {
         if !state.opened && !state.suspended {
             state.device.set_power(Power::On).map_err(map_hid_error)?;
             state.opened = true;
+            if let Some(handle) = self.gpio_interrupt {
+                let _ = crate_interface::call_interface!(
+                    crate::i2c::AcpiGpioSupport::set_interrupt_enabled,
+                    handle,
+                    true
+                );
+            }
         }
         Ok(())
     }
@@ -502,6 +525,13 @@ impl InputDriverOps for I2cInput {
     fn close_input(&mut self) -> DevResult<()> {
         let state = self.state.get_mut();
         if state.opened && !state.suspended {
+            if let Some(handle) = self.gpio_interrupt {
+                let _ = crate_interface::call_interface!(
+                    crate::i2c::AcpiGpioSupport::set_interrupt_enabled,
+                    handle,
+                    false
+                );
+            }
             state.device.set_power(Power::Off).map_err(map_hid_error)?;
         }
         state.opened = false;
@@ -588,7 +618,8 @@ impl InputDriverOps for I2cInput {
         // upstream: iichid.c iichid_sampling_task() - adaptive 80/10 Hz sampling when
         // this platform cannot deliver a GPIO interrupt into the HID child.
         let now = axhal::time::monotonic_time_nanos();
-        if now < state.next_sample_ns {
+        let gpio_wakeup = self.gpio_pending.swap(false, Ordering::AcqRel);
+        if !gpio_wakeup && now < state.next_sample_ns {
             return Err(DevError::Again);
         }
         let length = state
@@ -636,6 +667,13 @@ impl I2cInput {
     pub fn suspend(&mut self) -> DevResult<()> {
         let state = self.state.get_mut();
         state.suspended = true;
+        if let Some(handle) = self.gpio_interrupt {
+            let _ = crate_interface::call_interface!(
+                crate::i2c::AcpiGpioSupport::set_interrupt_enabled,
+                handle,
+                false
+            );
+        }
         if state.opened {
             if let Err(error) = state.device.set_power(Power::Off) {
                 warn!("i2c-hid: suspend power transition failed: {error:?}");
@@ -649,6 +687,13 @@ impl I2cInput {
         let state = self.state.get_mut();
         state.suspended = false;
         if state.opened {
+            if let Some(handle) = self.gpio_interrupt {
+                let _ = crate_interface::call_interface!(
+                    crate::i2c::AcpiGpioSupport::set_interrupt_enabled,
+                    handle,
+                    true
+                );
+            }
             let device = &mut state.device;
             if let Err(error) = device.set_power(Power::On) {
                 warn!("i2c-hid: resume power transition failed: {error:?}");
@@ -673,6 +718,12 @@ impl Drop for I2cInput {
         let state = self.state.get_mut();
         if state.opened && !state.suspended {
             let _ = state.device.set_power(Power::Off);
+        }
+        if let Some(handle) = self.gpio_interrupt.take() {
+            crate_interface::call_interface!(
+                crate::i2c::AcpiGpioSupport::release_interrupt,
+                handle
+            );
         }
     }
 }

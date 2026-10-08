@@ -106,6 +106,55 @@ pub(crate) fn configure_sci(vector: usize, low_active: bool) -> bool {
     configure_level_line(vector, low_active)
 }
 
+/// Configure an assigned non-legacy GSI for a GPIO provider after ACPI has
+/// verified that the MADT/IOAPIC topology is directly routable.
+#[cfg(feature = "irq")]
+pub(crate) fn configure_acpi_gsi(vector: usize, level: bool, low_active: bool) -> bool {
+    let Some(pin) = io_apic_pin(vector) else {
+        return false;
+    };
+    let destination = IO_APIC_DEST.load(Ordering::Acquire);
+    if destination == IO_APIC_DEST_UNAVAILABLE {
+        return false;
+    }
+    let wanted = (if level {
+        IrqFlags::LEVEL_TRIGGERED
+    } else {
+        IrqFlags::empty()
+    }) | if low_active {
+        IrqFlags::LOW_ACTIVE
+    } else {
+        IrqFlags::empty()
+    };
+    let electrical = IrqFlags::LEVEL_TRIGGERED | IrqFlags::LOW_ACTIVE;
+    unsafe {
+        let mut io_apic = IO_APIC.lock();
+        if pin > io_apic.max_table_entry() {
+            return false;
+        }
+        let mut entry = io_apic.table_entry(pin);
+        if entry.vector() as usize != vector
+            || entry.dest() as u32 != destination
+            || entry.flags().contains(IrqFlags::LOGICAL_DEST)
+        {
+            return false;
+        }
+        if entry.flags() & electrical == wanted {
+            return true;
+        }
+        let was_masked = entry.flags().contains(IrqFlags::MASKED);
+        if !was_masked {
+            io_apic.disable_irq(pin);
+        }
+        entry.set_flags((entry.flags() & !electrical) | wanted | IrqFlags::MASKED);
+        io_apic.set_table_entry(pin, entry);
+        if !was_masked {
+            io_apic.enable_irq(pin);
+        }
+    }
+    true
+}
+
 #[cfg(feature = "irq")]
 fn configure_level_line(vector: usize, low_active: bool) -> bool {
     let electrical = IrqFlags::LEVEL_TRIGGERED | IrqFlags::LOW_ACTIVE;

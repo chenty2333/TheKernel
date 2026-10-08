@@ -15,6 +15,103 @@ pub struct Resources {
     pub io: Vec<(u16, u8)>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryRange {
+    pub base: u64,
+    pub length: u64,
+}
+
+/// Decode assigned memory windows from an ACPI resource template. Address
+/// descriptors are accepted only for memory space; ranges remain physical
+/// addresses for the platform's MMIO mapper.
+pub fn parse_memory_ranges(bytes: &[u8]) -> Result<Vec<MemoryRange>, Status> {
+    let mut ranges = Vec::new();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let tag = *bytes.get(at).ok_or(BAD_PARAMETER)?;
+        at += 1;
+        let (kind, length) = if tag & 0x80 != 0 {
+            let raw = bytes.get(at..at + 2).ok_or(BAD_PARAMETER)?;
+            at += 2;
+            (
+                tag,
+                usize::from(u16::from_le_bytes(raw.try_into().unwrap())),
+            )
+        } else {
+            (tag >> 3, usize::from(tag & 7))
+        };
+        let end = at.checked_add(length).ok_or(BAD_PARAMETER)?;
+        let item = bytes.get(at..end).ok_or(BAD_PARAMETER)?;
+        at = end;
+        if kind == 0x0f {
+            if length != 1 || at != bytes.len() {
+                return Err(BAD_PARAMETER);
+            }
+            if item[0] != 0 && bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) != 0 {
+                return Err(BAD_PARAMETER);
+            }
+            return Ok(ranges);
+        }
+        let parsed = match kind {
+            0x81 if length == 9 => Some((
+                u64::from(u16::from_le_bytes(item[1..3].try_into().unwrap())),
+                u64::from(u16::from_le_bytes(item[7..9].try_into().unwrap())),
+            )),
+            0x85 if length == 17 => {
+                let minimum = u64::from(u32::from_le_bytes(item[1..5].try_into().unwrap()));
+                let maximum = u64::from(u32::from_le_bytes(item[5..9].try_into().unwrap()));
+                if minimum == maximum {
+                    Some((
+                        minimum,
+                        u64::from(u32::from_le_bytes(item[13..17].try_into().unwrap())),
+                    ))
+                } else {
+                    None
+                }
+            }
+            0x86 if length == 9 => Some((
+                u64::from(u32::from_le_bytes(item[1..5].try_into().unwrap())),
+                u64::from(u32::from_le_bytes(item[5..9].try_into().unwrap())),
+            )),
+            0x87 if length == 23 && item[0] == 0 => {
+                let minimum = u64::from(u32::from_le_bytes(item[7..11].try_into().unwrap()));
+                let maximum = u64::from(u32::from_le_bytes(item[11..15].try_into().unwrap()));
+                let translation = u64::from(u32::from_le_bytes(item[15..19].try_into().unwrap()));
+                if minimum == maximum {
+                    Some((
+                        minimum.checked_add(translation).ok_or(BAD_PARAMETER)?,
+                        u64::from(u32::from_le_bytes(item[19..23].try_into().unwrap())),
+                    ))
+                } else {
+                    None
+                }
+            }
+            0x8a if length == 43 && item[0] == 0 => {
+                let minimum = u64::from_le_bytes(item[11..19].try_into().unwrap());
+                let maximum = u64::from_le_bytes(item[19..27].try_into().unwrap());
+                let translation = u64::from_le_bytes(item[27..35].try_into().unwrap());
+                if minimum == maximum {
+                    Some((
+                        minimum.checked_add(translation).ok_or(BAD_PARAMETER)?,
+                        u64::from_le_bytes(item[35..43].try_into().unwrap()),
+                    ))
+                } else {
+                    None
+                }
+            }
+            0x81 | 0x85 | 0x86 | 0x87 | 0x8a => return Err(BAD_PARAMETER),
+            _ => None,
+        };
+        if let Some((base, length)) = parsed {
+            if length == 0 || base.checked_add(length).is_none() {
+                return Err(BAD_PARAMETER);
+            }
+            push(&mut ranges, MemoryRange { base, length })?;
+        }
+    }
+    Err(BAD_PARAMETER)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpioTrigger {
     Level,
@@ -332,6 +429,34 @@ mod tests {
         for end in 0..descriptor.len() {
             assert!(parse_gpio_interrupts(&descriptor[..end]).is_err());
         }
+    }
+
+    #[test]
+    fn decodes_fixed_memory_and_dword_address_windows() {
+        let fixed = [0x86, 9, 0, 0, 0, 0, 0x34, 0x12, 0, 0x10, 0, 0, 0x79, 0];
+        let ranges = parse_memory_ranges(&fixed).unwrap();
+        assert_eq!(
+            ranges,
+            [MemoryRange {
+                base: 0x1234_0000,
+                length: 0x1000
+            }]
+        );
+
+        let mut dword = [0u8; 28];
+        dword[..3].copy_from_slice(&[0x87, 23, 0]);
+        dword[3] = 0; // Memory space
+        dword[10..14].copy_from_slice(&0xfedc_0000u32.to_le_bytes());
+        dword[14..18].copy_from_slice(&0xfedc_0000u32.to_le_bytes());
+        dword[22..26].copy_from_slice(&0x1000u32.to_le_bytes());
+        dword[26..].copy_from_slice(&[0x79, 0]);
+        assert_eq!(
+            parse_memory_ranges(&dword),
+            Ok(vec![MemoryRange {
+                base: 0xfedc_0000,
+                length: 0x1000
+            }])
+        );
     }
 }
 

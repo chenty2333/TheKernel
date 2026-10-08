@@ -71,3 +71,5 @@ feature locations.
 Feature-report reads for Contact Count Maximum now size the transfer from the
 selected report ID rather than the descriptor-wide maximum; this avoids mixing
 lengths when several feature Report IDs coexist.
+
+2026-10-09 follow-up: `kernel/src/acpi/pchgpio.rs` now contains the OpenBSD ISC provider tables and pad/interrupt logic, and ACPI enumerates HID-matched controllers from assigned `_CRS` memory and IRQ resources. The axhal/ x86 platform now exposes a fail-closed directly routable GSI installation path (only one IOAPIC at GSI base zero, no colliding MADT overrides, non-legacy IRQs); GPIO providers on unsupported topologies are not registered. I2C-HID requests the first pin from its `GpioInt`, sets an atomic pending bit in IRQ context, and its ordinary read path services `GET_INPUT` outside hard IRQ context. Adaptive 80/10 Hz sampling remains as fallback. IRQ request setup is currently enabled only while the input device is open. S3 lifecycle wiring, affinity/shared-GSI arbitration beyond the supported direct route, multi-pin `GpioInt` handling, and N305 physical validation remain open.

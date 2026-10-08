@@ -10,6 +10,7 @@ use tk_acpica::{Mode, Status};
 mod ec;
 #[cfg(target_os = "none")]
 mod native;
+pub mod pchgpio;
 #[cfg(target_os = "none")]
 mod pci;
 pub mod thermal;
@@ -98,6 +99,7 @@ fn initialize() -> Result<(), Status> {
     if let Err(error) = vtd::init(&engine) {
         error!("acpica: VT-d initialization failed closed: {error:?}");
     }
+    let gpio_count = pchgpio::init(&engine, &nodes);
     let osc = engine.platform_osc();
     info!("acpica: platform _OSC status={osc:?}; no native PCIe control requested");
     pci::init(&engine, &nodes)?;
@@ -110,10 +112,11 @@ fn initialize() -> Result<(), Status> {
     axhal::acpi::register_off(power_off);
     axhal::acpi::publish_button(fixed || !BUTTONS.lock().is_empty() || thermal);
     info!(
-        "acpica: ready version=20260930 nodes={} devices={} AML-errors={} fixed-button={} \
-         method-buttons={} hardware-unverified",
+        "acpica: ready version=20260930 nodes={} devices={} gpio-providers={} AML-errors={} \
+         fixed-button={} method-buttons={} hardware-unverified",
         nodes.len(),
         nodes.iter().filter(|n| n.kind == 6).count(),
+        gpio_count,
         tk_acpica::aml_error_count(),
         fixed,
         BUTTONS.lock().len()

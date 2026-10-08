@@ -182,6 +182,28 @@ pub fn unregister_msi_vector(vector: usize) -> Option<axplat::irq::IrqHandler> {
     apic::unregister_msi_vector(vector)
 }
 
+/// Configure a directly mapped ACPI GSI as edge/level and high/low active.
+#[cfg(feature = "irq")]
+pub fn configure_acpi_gsi(vector: usize, level: bool, low_active: bool) -> bool {
+    apic::configure_acpi_gsi(vector, level, low_active)
+}
+
+/// Install an ACPI-described GSI after fail-closed topology validation.
+#[cfg(feature = "irq")]
+pub fn install_acpi_gsi(
+    irq: u32,
+    level: bool,
+    low_active: bool,
+    handler: fn(),
+) -> Option<usize> {
+    power::install_acpi_gsi(irq, level, low_active, handler)
+}
+
+#[cfg(feature = "irq")]
+pub fn remove_acpi_gsi(vector: usize) {
+    power::remove_acpi_gsi(vector)
+}
+
 /// Capability-gated automatic Intel MWAIT idle state selection and counters.
 pub mod cpuidle;
 
