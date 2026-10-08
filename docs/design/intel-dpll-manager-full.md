@@ -14,10 +14,12 @@ backend dependencies.
 Both modules are exported and compiled by `cargo check -p tk-intel-display
 --lib`; the full crate suite previously passed 150 tests before the remainder
 module was added. The active N305 HDMI planner consumes the translated
-`icl_calc_wrpll()` and `icl_calc_dpll_state()` values. The separate
-kernel-side ADL-N shared-DPLL adapter is in progress; current atomic modeset
-does not yet use the translated reservation/enable/disable lifecycle. Type-C/MG
-PHY runtime paths and DP/Thunderbolt output call sites are also not connected.
+`icl_calc_wrpll()` and `icl_calc_dpll_state()` values. The kernel-side ADL-N
+shared-DPLL adapter now compiles, but current atomic modeset does not yet
+persist or call it; the fastboot TC power-state lifetime does not supply the
+required refcounted port domains. Type-C/MG PHY runtime paths and
+DP/Thunderbolt output call sites are also not connected. See
+`intel-shared-dpll-kernel.md` for the required integration order and boundary.
 
 ## Added remainder grouped by generation
 

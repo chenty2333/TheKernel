@@ -116,6 +116,7 @@ mod pll;
 mod power;
 mod probe;
 mod regs;
+mod shared_dpll;
 mod rollback;
 pub(crate) mod scanout;
 mod sink;
