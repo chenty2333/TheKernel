@@ -39,3 +39,7 @@ Node/ESS helpers now validate candidate SSID/security, preserve association
 failure reasons, apply OpenBSD's RSSI and crypto scoring, select saved-network
 scan results (including fixed BSSID/SSID versus auto-join), and filter HT/VHT
 40/80 MHz channel centers against the upstream regulatory operating-class sets.
+Bounded HT/VHT/HE capability and operation IE parsing now keeps MCS/NSS maps,
+channel-width information and peer flags in explicit node capability structs;
+clear operations reset the source fields, reserved HT MCS 77-79 are removed,
+and HT/VHT width selectors gate on both advertised and local channel support.

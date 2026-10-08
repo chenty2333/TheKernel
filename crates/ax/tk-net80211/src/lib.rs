@@ -9,6 +9,7 @@ extern crate alloc;
 mod channel;
 mod frame;
 mod node;
+mod node_caps;
 mod ra;
 mod rates;
 mod regdomain;
@@ -31,6 +32,15 @@ pub use node::{
     ess_calculate_score, ess_is_better, get_ess, match_ess, switch_ess,
     valid_40mhz_center_frequency, valid_40mhz_secondary_above, valid_40mhz_secondary_below,
     valid_80mhz_center_frequency,
+};
+pub use node_caps::{
+    HE_FIXED_CAPS_LEN, HE_MAC_CAPS_LEN, HE_MCS_NSS_80_LEN, HE_PHY_CAPS_LEN,
+    HE_PHYCAP0_CHAN_WIDTH_160_IN_5G, HE_PHYCAP0_CHAN_WIDTH_8080_IN_5G, HeCapabilities,
+    HtCapabilities, HtOperation, NODE_HE, NODE_HECAP, NODE_HT, NODE_HT_SGI20, NODE_HT_SGI40,
+    NODE_HTCAP, NODE_VHT, NODE_VHT_SGI80, NODE_VHT_SGI160, NODE_VHTCAP, VHTOP0_CHAN_WIDTH_80,
+    VHTOP0_CHAN_WIDTH_160, VHTOP0_CHAN_WIDTH_8080, VHTOP0_CHAN_WIDTH_HT, VhtCapabilities,
+    clear_he_caps, clear_ht_caps, clear_vht_caps, ht_secondary_offset, setup_he_caps,
+    setup_he_operation, setup_ht_caps, setup_ht_operation, setup_vht_caps, vht_channel_width,
 };
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,
