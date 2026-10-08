@@ -761,6 +761,31 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.wait_busy()
     }
 
+    // upstream: mmc.c mmc_sd_switch()
+    pub fn switch_sd_function(
+        &mut self,
+        mode: u8,
+        group: u8,
+        value: u8,
+        status: &mut [u8; 64],
+    ) -> Result<(), SdhciError> {
+        if mode > 1 || group > 5 || value > 0xf {
+            return Err(SdhciError::InvalidTransfer);
+        }
+        status.fill(0);
+        let shift = u32::from(group) * 4;
+        let argument =
+            (u32::from(mode) << 31) | (0x00ff_ffff & !(0xf << shift)) | (u32::from(value) << shift);
+        self.command(
+            SD_CMD_SWITCH_FUNC,
+            argument,
+            SD_R1 | SD_DATA,
+            Some(status),
+            64,
+        )?;
+        Ok(())
+    }
+
     /// Issue one command and optional PIO data transfer. Multi-block requests
     /// are bounded by the 16-bit SDHCI block-count register.
     // upstream: sdhci.c sdhci_generic_request()
@@ -1076,6 +1101,7 @@ const SD_CMD_WRITE_SINGLE: u8 = 24;
 const SD_CMD_WRITE_MULTIPLE: u8 = 25;
 const SD_CMD_APP: u8 = 55;
 const SD_ACMD_OP_COND: u8 = 41;
+const SD_ACMD_SET_BUS_WIDTH: u8 = 6;
 const RSP_NONE: u16 = SDHCI_CMD_RESP_NONE as u16;
 const SD_R1: u16 = SDHCI_CMD_RESP_SHORT as u16 | SDHCI_CMD_CRC as u16 | SDHCI_CMD_INDEX as u16;
 const SD_R1B: u16 =
@@ -1168,6 +1194,40 @@ fn mmc_select_card<I: SdhciIo>(host: &mut SdhciHost<I>, rca: u16) -> Result<(), 
         .map(|_| ())
 }
 
+// upstream: mmc.c mmc_set_card_bus_width()
+fn mmc_set_card_bus_width<I: SdhciIo>(
+    host: &mut SdhciHost<I>,
+    mmc: bool,
+    rca: u16,
+    width: u8,
+) -> Result<(), SdhciError> {
+    let configured_width = match (mmc, width) {
+        (false, 1) => {
+            host.application_command(rca, SD_ACMD_SET_BUS_WIDTH, 0, SD_R1)?;
+            1
+        }
+        (false, 4) => {
+            host.application_command(rca, SD_ACMD_SET_BUS_WIDTH, 2, SD_R1)?;
+            4
+        }
+        (true, 1) => {
+            host.mmc_switch(183, 0)?;
+            1
+        }
+        (true, 4) => {
+            host.mmc_switch(183, 1)?;
+            4
+        }
+        (true, 8) => {
+            host.mmc_switch(183, 2)?;
+            8
+        }
+        _ => return Err(SdhciError::InvalidTransfer),
+    };
+    host.set_bus_width(configured_width);
+    Ok(())
+}
+
 // upstream: mmc.c mmc_send_status()
 fn mmc_send_status<I: SdhciIo>(host: &mut SdhciHost<I>, rca: u16) -> Result<u32, SdhciError> {
     host.command(SD_CMD_SEND_STATUS, u32::from(rca) << 16, SD_R1, None, 0)
@@ -1247,8 +1307,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
             } else {
                 4
             };
-            host.mmc_switch(183, if bus_width == 8 { 2 } else { 1 })?;
-            host.set_bus_width(bus_width);
+            mmc_set_card_bus_width(&mut host, true, rca, bus_width)?;
             // EXT_CSD[185] (HS_TIMING) value 1 selects legacy MMC high speed.
             // Only use it when the card advertises a 26/52 MHz timing mode.
             let card_type = ext_csd.map_or(0, |csd| csd.card_type);
@@ -1936,15 +1995,13 @@ mod tests {
         io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
         let mut host = SdhciHost::new(io, 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
         let mut status = [0u8; 64];
-        host.command(
-            SD_CMD_SWITCH_FUNC,
-            0x00ff_fff1,
-            SD_R1 | SD_DATA,
-            Some(&mut status),
-            64,
-        )
-        .unwrap();
+        host.switch_sd_function(0, 0, 1, &mut status).unwrap();
         assert_ne!(host.io_mut().transfer_mode & SDHCI_TRNS_READ as u16, 0);
+        assert_eq!(host.io_mut().argument, 0x00ff_fff1);
+        assert!(matches!(
+            host.switch_sd_function(2, 0, 1, &mut status),
+            Err(SdhciError::InvalidTransfer)
+        ));
     }
 
     #[test]
