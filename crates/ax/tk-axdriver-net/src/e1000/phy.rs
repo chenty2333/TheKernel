@@ -112,6 +112,9 @@ const I82578_EPSCR_DOWNSHIFT_COUNTER_MASK: u16 = 0x001c;
 const BME1000_PSCR_ENABLE_DOWNSHIFT: u16 = 0x0800;
 const BME1000_E_PHY_ID_R2: u32 = 0x0141_0cb1;
 const M88E1111_I_PHY_ID: u32 = 0x0141_0cc0;
+const I347AT4_PSCR_DOWNSHIFT_ENABLE: u16 = 0x0800;
+const I347AT4_PSCR_DOWNSHIFT_MASK: u16 = 0x7000;
+const I347AT4_PSCR_DOWNSHIFT_6X: u16 = 0x5000;
 const IGP01E1000_PHY_PAGE_SELECT: u32 = 0x1f;
 const MAX_PHY_MULTI_PAGE_REG: u32 = 0x0f;
 const KMRNCTRLSTA_OFFSET: u32 = 0x001f_0000;
@@ -500,6 +503,43 @@ where
         io.write_phy_register(M88E1000_EXT_PHY_SPEC_CTRL, extended)?;
     }
     Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_copper_link_setup_m88_gen2()
+pub fn copper_link_setup_m88_gen2<I, C>(
+    io: &mut I,
+    phy_id: u32,
+    mdix: u8,
+    disable_polarity_correction: bool,
+    master_slave: MasterSlaveMode,
+    mut commit: C,
+) -> DevResult<MasterSlaveMode>
+where
+    I: E1000PhyRegisterIo,
+    C: FnMut() -> DevResult,
+{
+    let mut control = io.read_phy_register(M88E1000_PHY_SPEC_CTRL)?;
+    control &= !M88E1000_PSCR_AUTO_X_MODE;
+    match mdix {
+        1 => control |= M88E1000_PSCR_MDI_MANUAL_MODE,
+        2 => control |= M88E1000_PSCR_MDIX_MANUAL_MODE,
+        3 if phy_id != M88E1112_PHY_ID => control |= M88E1000_PSCR_AUTO_X_1000T,
+        _ => control |= M88E1000_PSCR_AUTO_X_MODE,
+    }
+    control &= !M88E1000_PSCR_POLARITY_REVERSAL;
+    if disable_polarity_correction {
+        control |= M88E1000_PSCR_POLARITY_REVERSAL;
+    }
+    if phy_id == M88E1543_PHY_ID {
+        control &= !I347AT4_PSCR_DOWNSHIFT_ENABLE;
+        io.write_phy_register(M88E1000_PHY_SPEC_CTRL, control)?;
+        commit()?;
+    }
+    control &= !I347AT4_PSCR_DOWNSHIFT_MASK;
+    control |= I347AT4_PSCR_DOWNSHIFT_6X | I347AT4_PSCR_DOWNSHIFT_ENABLE;
+    io.write_phy_register(M88E1000_PHY_SPEC_CTRL, control)?;
+    commit()?;
+    set_master_slave_mode(io, master_slave)
 }
 
 pub trait E1000PhyMdicOps: E1000RegisterIo {
@@ -1945,5 +1985,34 @@ mod tests {
             M88EC018_EPSCR_DOWNSHIFT_COUNTER_5X
         );
         assert_eq!(commits, 1);
+    }
+
+    #[test]
+    fn generic_m88_gen2_setup_commits_downshift_and_master_slave_policy() {
+        let mut io = Io::default();
+        io.phy[M88E1000_PHY_SPEC_CTRL as usize] = 0xffff;
+        let mut commits = 0;
+        copper_link_setup_m88_gen2(
+            &mut io,
+            M88E1543_PHY_ID,
+            2,
+            true,
+            MasterSlaveMode::ForceMaster,
+            || {
+                commits += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(commits, 2);
+        assert_eq!(io.phy_writes[0].1 & I347AT4_PSCR_DOWNSHIFT_ENABLE, 0);
+        assert_eq!(
+            io.phy_writes[1].1 & (I347AT4_PSCR_DOWNSHIFT_MASK | I347AT4_PSCR_DOWNSHIFT_ENABLE),
+            I347AT4_PSCR_DOWNSHIFT_6X | I347AT4_PSCR_DOWNSHIFT_ENABLE
+        );
+        assert_eq!(
+            io.phy_writes.last().unwrap(),
+            &(MII_1000T_CTRL, CR_1000T_MS_ENABLE | CR_1000T_MS_VALUE)
+        );
     }
 }
