@@ -1198,3 +1198,5 @@ The same `hdmi.rs` translation now includes the HSW deep-color GCP phase predica
 `kernel/src/drm/intel/combo_phy_full.rs` translates all 14 functions in Linux v7.2.3 `drivers/gpu/drm/i915/display/intel_combo_phy.c` (MIT, Copyright © 2018 Intel Corporation); `LICENSE-MIT`.
 
 The HSW HDMI module also translates Intel's SPD infoframe defaults and DRM metadata/version gates from `intel_hdmi.c::intel_hdmi_compute_spd_infoframe()` and `intel_hdmi_compute_drm_infoframe()` (MIT, © 2006-2009 Intel).
+
+`intel_hdmi_infoframe_enable()` in `hdmi.rs` maps all eight source packet-type values to software enable indices (MIT `intel_hdmi.c`, © 2006-2009 Intel).

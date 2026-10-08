@@ -10,7 +10,7 @@
 use crate::{
     Error,
     display::{Pipe, ReadoutIo, Timings},
-    hdmi_packet::{Drm, Infoframe, Spd, hdmi_infoframe_unpack},
+    hdmi_packet::{Avi, Drm, Infoframe, Spd, hdmi_infoframe_unpack},
 };
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameType {
@@ -100,6 +100,37 @@ pub fn hsw_read_infoframe(
     }
     Ok(RawInfoframe { raw, kind })
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HdmiOutputFormat {
+    Rgb,
+    Ycbcr422,
+    Ycbcr444,
+    Ycbcr420,
+}
+
+/// Apply the format/range portion of i915 AVI generation to the DRM-computed
+/// baseline frame. Connector colorimetry/content-type helpers remain caller
+/// inputs because they belong to the generic DRM connector layer.
+pub fn apply_avi_output_policy(
+    mut frame: Avi,
+    output_format: HdmiOutputFormat,
+    limited_color_range: bool,
+) -> Avi {
+    frame.colorspace = match output_format {
+        HdmiOutputFormat::Rgb => 0,
+        HdmiOutputFormat::Ycbcr422 => 1,
+        HdmiOutputFormat::Ycbcr444 => 2,
+        HdmiOutputFormat::Ycbcr420 => 3,
+    };
+    if output_format == HdmiOutputFormat::Rgb {
+        frame.quantization_range = if limited_color_range { 1 } else { 2 };
+    } else {
+        frame.quantization_range = 0;
+        frame.ycc_quantization_range = 1;
+    }
+    frame
+}
+
 /// Build Intel's SPD packet after the caller has admitted HDMI infoframes.
 // upstream: intel_hdmi.c intel_hdmi_compute_spd_infoframe()
 pub fn intel_hdmi_compute_spd_infoframe(
@@ -136,6 +167,18 @@ pub fn intel_hdmi_compute_drm_infoframe(
         return None;
     }
     metadata
+}
+
+const INFOFRAME_TYPE_TO_IDX: [u8; 8] = [0x03, 0x0a, 0x07, 0x22, 0x82, 0x83, 0x81, 0x87];
+
+/// Map a packet type to its `intel_crtc_state.infoframes.enable` slot.
+// upstream: intel_hdmi.c intel_hdmi_infoframe_enable()
+pub fn intel_hdmi_infoframe_enable(packet_type: u8) -> u32 {
+    INFOFRAME_TYPE_TO_IDX
+        .iter()
+        .position(|candidate| *candidate == packet_type)
+        .map(|index| 1 << index)
+        .unwrap_or(0)
 }
 
 const GCP_COLOR_INDICATION: u32 = 1 << 2;
@@ -420,6 +463,56 @@ mod write_tests {
             set_context_latency: 0,
             interlaced: false,
         }
+    }
+
+    #[test]
+    fn avi_output_policy_matches_rgb_and_ycc_source_branches() {
+        let baseline = Avi {
+            colorspace: 7,
+            scan_mode: 2,
+            colorimetry: 1,
+            picture_aspect: 2,
+            active_aspect: 8,
+            itc: false,
+            extended_colorimetry: 0,
+            quantization_range: 0,
+            nups: 0,
+            video_code: 16,
+            ycc_quantization_range: 0,
+            content_type: 0,
+            pixel_repeat: 0,
+            top_bar: 0,
+            bottom_bar: 0,
+            left_bar: 0,
+            right_bar: 0,
+        };
+        let rgb = apply_avi_output_policy(baseline, HdmiOutputFormat::Rgb, true);
+        assert_eq!(
+            (
+                rgb.colorspace,
+                rgb.quantization_range,
+                rgb.ycc_quantization_range
+            ),
+            (0, 1, 0)
+        );
+        let yuv = apply_avi_output_policy(baseline, HdmiOutputFormat::Ycbcr420, true);
+        assert_eq!(
+            (
+                yuv.colorspace,
+                yuv.quantization_range,
+                yuv.ycc_quantization_range
+            ),
+            (3, 0, 1)
+        );
+        assert_eq!(yuv.video_code, baseline.video_code);
+    }
+
+    #[test]
+    fn source_infoframe_type_index_matches_all_slots() {
+        for (index, packet) in INFOFRAME_TYPE_TO_IDX.into_iter().enumerate() {
+            assert_eq!(intel_hdmi_infoframe_enable(packet), 1 << index);
+        }
+        assert_eq!(intel_hdmi_infoframe_enable(0xff), 0);
     }
 
     #[test]

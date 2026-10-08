@@ -652,3 +652,7 @@ included `LICENSE-MIT`.
 HDMI SPD defaults and DRM metadata gates in `tk-intel-display/src/hdmi.rs` follow
 `intel_hdmi_compute_spd_infoframe()` and `intel_hdmi_compute_drm_infoframe()`
 (MIT, © 2006-2009 Intel).
+
+`tk-intel-display/src/hdmi.rs::intel_hdmi_infoframe_enable` translates the
+HDMI/DP packet-type software-slot mapping from `intel_hdmi.c` (MIT, © 2006-2009
+Intel).
