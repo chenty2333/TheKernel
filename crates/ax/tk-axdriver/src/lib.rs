@@ -109,7 +109,7 @@ mod dyn_drivers;
 pub mod prelude;
 
 #[cfg(feature = "iwx")]
-mod iwx;
+pub mod iwx;
 
 #[cfg(feature = "virtio-blk")]
 pub use axdriver_virtio::{AsyncBlockWaitPolicy, VirtioIoCounters};

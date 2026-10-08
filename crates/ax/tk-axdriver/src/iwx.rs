@@ -188,6 +188,7 @@ struct AttachedDevice {
     firmware: Option<Result<FirmwareBundle, FirmwareRequestError>>,
     nvm: Option<NvmInfo>,
     preinit: Option<PreinitPlan>,
+    runtime_started: bool,
 }
 
 #[derive(Debug)]
@@ -210,6 +211,17 @@ enum FirmwareBootstrapError {
     MissingNvmResponse,
     Nvm(axdriver_iwx::NvmError),
     Stop(axdriver_iwx::StopDeviceError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeStartError {
+    DeviceNotFound,
+    FirmwareNotReady,
+    AlreadyStarted,
+    Hardware,
+    Nic,
+    Firmware,
+    ManagementQueue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +310,7 @@ fn allocate_resources(
         firmware: None,
         nvm: None,
         preinit: None,
+        runtime_started: false,
     });
     Ok(())
 }
@@ -378,12 +391,12 @@ fn bootstrap_init_firmware(
                         })
                         .map_err(AliveWaitError::Receive)?;
                     if complete {
-                        return Ok(true);
+                        return Ok::<_, AliveWaitError>(true);
                     }
                     controller.registers.delay_us(1_000);
                     elapsed += 1_000_000;
                 }
-                Ok(false)
+                Ok::<_, AliveWaitError>(false)
             },
         )
         .map_err(FirmwareBootstrapError::FirmwareStart)?;
@@ -453,6 +466,144 @@ fn bootstrap_init_firmware(
         .stop_device()
         .map_err(FirmwareBootstrapError::Stop)?;
     Ok(nvm)
+}
+
+fn start_regular_firmware(
+    controller: &mut IwxController<MmioCsrAccess, PlatformDmaAllocator>,
+    profile: AttachProfile,
+    runtime: RuntimeConfig,
+    hardware_revision: u32,
+    bundle: &FirmwareBundle,
+) -> Result<(), RuntimeStartError> {
+    controller
+        .start_hardware(profile.integrated)
+        .map_err(|error| {
+            warn!("iwx: runtime hardware start failed: {error:?}");
+            RuntimeStartError::Hardware
+        })?;
+    controller
+        .initialize_nic(bundle.image.phy_config.unwrap_or(0), hardware_revision)
+        .map_err(|error| {
+            warn!("iwx: runtime NIC initialization failed: {error:?}");
+            RuntimeStartError::Nic
+        })?;
+    let alive_version = bundle.image.lookup_notification_version(0, 1);
+    let command_version = bundle.image.lookup_command_version(
+        axdriver_iwx::DATA_PATH_GROUP,
+        axdriver_iwx::SCD_QUEUE_CONFIG_CMD,
+    );
+    controller
+        .load_ucode_wait_alive(
+            &bundle.image,
+            false,
+            bundle.pnvm_file.as_deref(),
+            runtime.mac_type,
+            runtime.rf_type,
+            profile.imr_enabled,
+            |controller, timeout| {
+                let mut elapsed = 0;
+                let mut alive = None;
+                while elapsed < timeout {
+                    let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
+                        &mut controller.registers,
+                        &controller.interrupt_masks,
+                        None,
+                    )
+                    .map_err(AliveWaitError::Interrupt)?;
+                    controller
+                        .process_rx_notifications(|packet, _| {
+                            if packet.is_notification() && packet.command_id() == 1 {
+                                alive = Some(
+                                    axdriver_iwx::parse_alive(alive_version, packet.payload)
+                                        .map_err(AliveWaitError::Alive),
+                                );
+                            }
+                            Ok::<_, Infallible>(true)
+                        })
+                        .map_err(AliveWaitError::Receive)?;
+                    if let Some(result) = alive.take() {
+                        return result.map(Some);
+                    }
+                    controller.registers.delay_us(1_000);
+                    elapsed += 1_000_000;
+                }
+                Ok(None)
+            },
+            |controller, timeout| {
+                let mut elapsed = 0;
+                while elapsed < timeout {
+                    let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
+                        &mut controller.registers,
+                        &controller.interrupt_masks,
+                        None,
+                    )
+                    .map_err(AliveWaitError::Interrupt)?;
+                    let mut complete = false;
+                    controller
+                        .process_rx_notifications(|packet, _| {
+                            complete |= packet.is_notification()
+                                && matches!(
+                                    axdriver_iwx::decode_firmware_event(packet),
+                                    axdriver_iwx::FirmwareEvent::PnvmComplete
+                                );
+                            Ok::<_, Infallible>(true)
+                        })
+                        .map_err(AliveWaitError::Receive)?;
+                    if complete {
+                        return Ok::<_, AliveWaitError>(true);
+                    }
+                    controller.registers.delay_us(1_000);
+                    elapsed += 1_000_000;
+                }
+                Ok::<_, AliveWaitError>(false)
+            },
+        )
+        .map_err(|error| {
+            warn!("iwx: runtime ALIVE/PNVM/post-ALIVE sequence failed: {error:?}");
+            RuntimeStartError::Firmware
+        })?;
+    controller
+        .enable_management_queue(command_version)
+        .map_err(|error| {
+            warn!("iwx: runtime management queue enable failed: {error:?}");
+            RuntimeStartError::ManagementQueue
+        })?;
+    Ok(())
+}
+
+/// Start the retained PCI device's regular uCode when the wireless netdev is raised.
+pub fn start_runtime(bdf: DeviceFunction) -> Result<(), RuntimeStartError> {
+    let key = Bdf(bdf.bus, bdf.device, bdf.function);
+    let mut devices = ATTACHED_DMA.lock();
+    let device = devices
+        .iter_mut()
+        .find(|device| device.bdf == key)
+        .ok_or(RuntimeStartError::DeviceNotFound)?;
+    if device.runtime_started {
+        return Err(RuntimeStartError::AlreadyStarted);
+    }
+    let Some(Ok(bundle)) = device.firmware.as_ref() else {
+        return Err(RuntimeStartError::FirmwareNotReady);
+    };
+    if device.nvm.is_none() || device.preinit.is_none() {
+        return Err(RuntimeStartError::FirmwareNotReady);
+    }
+    match start_regular_firmware(
+        &mut device.controller,
+        device.profile,
+        device.runtime,
+        device.hardware_revision,
+        bundle,
+    ) {
+        Ok(()) => {
+            device.runtime_started = true;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = device.controller.stop_device();
+            Err(error)
+        }
+    }
 }
 
 fn log_bootstrap_error(bdf: Bdf, error: FirmwareBootstrapError) {
