@@ -2498,7 +2498,7 @@ pub const fn dvo_port_to_port(
             1 | 7 => Some(Port::B),
             2 | 8 => Some(Port::C),
             3 | 9 => Some(Port::D),
-            12 | 11 => Some(Port::E),
+            12 | 11 | 6 => Some(Port::E),
             14 | 13 => Some(Port::F),
             _ => None,
         },
@@ -3241,5 +3241,37 @@ mod tests {
         for pin in [0, 7, 8, 9, 255] {
             assert_eq!(map_ddc_pin(pin), None);
         }
+    }
+
+    #[test]
+    fn display12_dvo_port_tables_follow_platform_aliases() {
+        use DmcPlatform::{AlderLakeS, RocketLake, TigerLake};
+
+        for (dvo, platform, port) in [
+            (0, TigerLake, Port::A),
+            (10, TigerLake, Port::A),
+            (1, TigerLake, Port::B),
+            (7, TigerLake, Port::B),
+            (6, TigerLake, Port::E),
+            (11, TigerLake, Port::E),
+            (12, TigerLake, Port::E),
+            (13, TigerLake, Port::F),
+            (14, TigerLake, Port::F),
+            (2, RocketLake, Port::Tc1),
+            (8, RocketLake, Port::Tc1),
+            (3, RocketLake, Port::Tc2),
+            (9, RocketLake, Port::Tc2),
+            (1, AlderLakeS, Port::Tc1),
+            (7, AlderLakeS, Port::Tc1),
+            (2, AlderLakeS, Port::Tc2),
+            (8, AlderLakeS, Port::Tc2),
+            (3, AlderLakeS, Port::Tc3),
+            (9, AlderLakeS, Port::Tc3),
+            (12, AlderLakeS, Port::Tc4),
+            (11, AlderLakeS, Port::Tc4),
+        ] {
+            assert_eq!(dvo_port_to_port(dvo, 12, platform), Some(port));
+        }
+        assert_eq!(dvo_port_to_port(14, 12, RocketLake), None);
     }
 }
