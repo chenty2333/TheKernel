@@ -96,6 +96,11 @@ impl<B: CsrAccess> IwxRegisters<B> {
         self.bus.write32(offset, value)
     }
 
+    /// Delay through the platform-provided MMIO timing source.
+    pub fn delay_us(&mut self, micros: u32) {
+        self.bus.delay_us(micros)
+    }
+
     pub fn set_csr_bits(&mut self, offset: u32, bits: u32) {
         let value = self.bus.read32(offset);
         self.bus.write32(offset, value | bits);

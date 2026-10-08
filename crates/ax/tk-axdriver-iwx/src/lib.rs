@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+mod apm;
 mod command;
 mod config;
 mod context;
@@ -20,6 +21,10 @@ mod rings;
 mod rx;
 mod tx;
 
+pub use apm::{
+    ApmError, apm_init, apm_stop, force_power_gating, prepare_card_hw, set_hw_ready,
+    software_reset, start_hardware,
+};
 pub use command::{
     CMD_ASYNC, CMD_FAILED_MASK, CMD_SEND_DURING_RFKILL, CMD_WANT_RESPONSE, CommandError,
     CommandSlots, CompletedCommand, EncodedCommand, HostCommand, command_group_id, command_opcode,
