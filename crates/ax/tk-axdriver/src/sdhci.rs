@@ -310,6 +310,7 @@ impl SdhciIo for SdhciWindow {
 
 /// Attach one FreeBSD PCI slot and publish its user/boot areas.
 // upstream: sdhci_pci.c sdhci_pci_attach() per-slot body
+// upstream: sdhci.c sdhci_init_slot()
 fn probe_slot(
     root: &mut PciRoot,
     bdf: DeviceFunction,
