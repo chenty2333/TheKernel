@@ -306,6 +306,19 @@ Generated include copies insert the TheKernel platform configuration; vendored
 files are not edited. Neither Linux-tree ACPICA nor FreeBSD/Haiku code is copied.
 Firmware tables (including OEM AML and MSDM keys) are never repository inputs.
 
+### Optional Alpine BlueZ guest tools
+
+The optional `bluez` guest-tools payload includes unchanged Alpine v3.24.1
+x86_64 packages pinned in `config/guest-bluez-apk-pins.tsv`. This closure now
+includes `bluez-btmon` and `bluez-deprecated` (providing `btmon` and
+`hciconfig`), as well as `bluez`, `bluez-btmgmt`, D-Bus and their runtime
+libraries. Alpine's package metadata declares BlueZ tools `GPL-2.0-or-later AND
+BSD-2-Clause AND MIT`; each package's declared license expression, source
+origin, version, URL and SHA-256 are recorded in the pin file copied into the
+guest. `scripts/build-bluez-payload.sh` verifies Alpine signatures and the
+reproducibility pins before extraction. No package scripts or host installation
+run; distribution must preserve each upstream license and source obligation.
+
 ### ACPICA guest inspection payload
 
 `--toolchain acpica` stages static `acpidump` and `iasl` from the same verified

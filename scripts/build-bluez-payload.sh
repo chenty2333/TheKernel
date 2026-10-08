@@ -64,12 +64,14 @@ rm -rf -- "$STAGE" "$OUTPUT"
 mkdir -p "$STAGE"
 "${APK[@]}" extract --no-chown --destination="$STAGE" "${PACKAGES[@]}"
 LOADER="$STAGE/lib/ld-musl-x86_64.so.1"
-for binary in "$STAGE/usr/lib/bluetooth/bluetoothd" "$STAGE/usr/bin/btmgmt" "$STAGE/usr/bin/bluetoothctl"; do
+for binary in "$STAGE/usr/lib/bluetooth/bluetoothd" "$STAGE/usr/bin/btmgmt" \
+    "$STAGE/usr/bin/bluetoothctl" "$STAGE/usr/bin/btmon" "$STAGE/usr/bin/hciconfig"; do
     [ -x "$binary" ] || { echo "missing BlueZ executable: $binary" >&2; exit 1; }
 done
 "$LOADER" --library-path "$STAGE/lib:$STAGE/usr/lib" "$STAGE/usr/lib/bluetooth/bluetoothd" --version | grep -F '5.86'
 "$LOADER" --library-path "$STAGE/lib:$STAGE/usr/lib" "$STAGE/usr/bin/btmgmt" --version | grep -F '5.86'
 "$LOADER" --library-path "$STAGE/lib:$STAGE/usr/lib" "$STAGE/usr/bin/bluetoothctl" --version | grep -F '5.86'
+"$LOADER" --library-path "$STAGE/lib:$STAGE/usr/lib" "$STAGE/usr/bin/btmon" --version | grep -F '5.86'
 mkdir -p "$STAGE/opt/thekernel-tools"
 install -m 0644 "$REPO_ROOT/config/guest-bluez-apk-pins.tsv" "$STAGE/opt/thekernel-tools/BLUEZ-PACKAGES.tsv"
 printf '%s\n' 'Alpine v3.24 x86_64 signed packages; BlueZ 5.86-r2; runtime closure pinned by SHA256.' \

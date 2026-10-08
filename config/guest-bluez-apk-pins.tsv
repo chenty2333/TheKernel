@@ -2,6 +2,8 @@
 # filename	sha256	url	license	origin
 bluez-5.86-r2.apk	86234f76696b0394417ce4abb42a57528ac36874c7388d6735d47d2d98b30d80	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/bluez-5.86-r2.apk	GPL-2.0-or-later AND BSD-2-Clause AND MIT	bluez
 bluez-btmgmt-5.86-r2.apk	78db5335564fe615fe1585f21dfa18cf249ca26faf7e539c2831b413ced18699	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/bluez-btmgmt-5.86-r2.apk	GPL-2.0-or-later AND BSD-2-Clause AND MIT	bluez
+bluez-btmon-5.86-r2.apk	0457f2f25ee70c6908a8db7b6ad226f2142b3f69cbf3e45f8e595733f5c879e1	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/bluez-btmon-5.86-r2.apk	GPL-2.0-or-later AND BSD-2-Clause AND MIT	bluez
+bluez-deprecated-5.86-r2.apk	f9952fd1e8efd7109986bb2ae8c8a63f4e117c8ba7b3d640ab31ddbd78015b7b	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/bluez-deprecated-5.86-r2.apk	GPL-2.0-or-later AND BSD-2-Clause AND MIT	bluez
 dbus-1.16.2-r2.apk	37edd2a31bf599bda68cf223e8f2353b1713dbf5f770fc39399d654a69688a51	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/dbus-1.16.2-r2.apk	AFL-2.1 OR GPL-2.0-or-later	dbus
 dbus-daemon-launch-helper-1.16.2-r2.apk	d09d4f3387115420b7258dbd437ab72677a57f4eac7aa8b393a3dc7ea6001699	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/dbus-daemon-launch-helper-1.16.2-r2.apk	AFL-2.1 OR GPL-2.0-or-later	dbus
 dbus-libs-1.16.2-r2.apk	105f6ba17454c587ca9345f9deb348012d1950588a22da42120c954d396c99b6	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/dbus-libs-1.16.2-r2.apk	AFL-2.1 OR GPL-2.0-or-later	dbus

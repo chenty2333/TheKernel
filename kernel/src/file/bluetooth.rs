@@ -31,6 +31,9 @@ const HCIGETDEVINFO: u32 = 0x8004_48d3;
 const HCI_DEV_NONE: u16 = 0xffff;
 const HCI_CHANNEL_MONITOR: u16 = 2;
 const HCI_CHANNEL_CONTROL: u16 = 3;
+const HCI_OPT_DATA_DIR: u32 = 1;
+const HCI_OPT_TIME_STAMP: u32 = 3;
+const HCI_OPT_PASS_CREDENTIALS: u32 = 0x1_0000;
 const MAX_HCI_PACKET: usize = 65_536;
 const HCI_UP: u32 = 1 << 0;
 
@@ -260,6 +263,22 @@ mod tests {
     }
 
     #[test]
+    fn hci_monitor_socket_options_round_trip_and_reject_bad_values() {
+        let socket = HciSocket::new();
+        assert_eq!(socket.get_hci_option(HCI_OPT_DATA_DIR), Ok(0));
+        assert_eq!(socket.get_hci_option(HCI_OPT_TIME_STAMP), Ok(0));
+        assert_eq!(socket.get_hci_option(HCI_OPT_PASS_CREDENTIALS), Ok(0));
+        socket.set_hci_option(HCI_OPT_DATA_DIR, 1).unwrap();
+        socket.set_hci_option(HCI_OPT_TIME_STAMP, 1).unwrap();
+        socket.set_hci_option(HCI_OPT_PASS_CREDENTIALS, 1).unwrap();
+        assert_eq!(socket.get_hci_option(HCI_OPT_DATA_DIR), Ok(1));
+        assert_eq!(socket.get_hci_option(HCI_OPT_TIME_STAMP), Ok(1));
+        assert_eq!(socket.get_hci_option(HCI_OPT_PASS_CREDENTIALS), Ok(1));
+        assert!(socket.set_hci_option(HCI_OPT_TIME_STAMP, 2).is_err());
+        assert!(socket.get_hci_option(2).is_err());
+    }
+
+    #[test]
     fn inquiry_result_is_fanned_out_as_device_found() {
         let socket = HciSocket::new();
         socket
@@ -362,6 +381,14 @@ pub struct HciSocket {
     nonblocking: AtomicBool,
     binding: SpinMutex<Option<BoundChannel>>,
     control: Arc<MgmtSubscriber>,
+    socket_options: SpinMutex<HciSocketOptions>,
+}
+
+#[derive(Default)]
+struct HciSocketOptions {
+    data_direction: i32,
+    timestamps: i32,
+    pass_credentials: i32,
 }
 
 struct MgmtSubscriber {
@@ -411,6 +438,33 @@ impl HciSocket {
                 rx: SpinMutex::new(VecDeque::new()),
                 readiness: Arc::new(PollSet::new()),
             }),
+            socket_options: SpinMutex::new(HciSocketOptions::default()),
+        }
+    }
+
+    /// Retain the HCI capture and SOL_SOCKET toggles used by monitor clients.
+    /// SCM_TIMESTAMP/SCM_CREDENTIALS ancillary delivery is not implemented yet.
+    pub(crate) fn set_hci_option(&self, option: u32, value: i32) -> AxResult<()> {
+        if !matches!(value, 0 | 1) {
+            return Err(AxError::InvalidInput);
+        }
+        let mut options = self.socket_options.lock();
+        match option {
+            HCI_OPT_DATA_DIR => options.data_direction = value,
+            HCI_OPT_TIME_STAMP => options.timestamps = value,
+            HCI_OPT_PASS_CREDENTIALS => options.pass_credentials = value,
+            _ => return Err(LinuxError::ENOPROTOOPT.into()),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get_hci_option(&self, option: u32) -> AxResult<i32> {
+        let options = self.socket_options.lock();
+        match option {
+            HCI_OPT_DATA_DIR => Ok(options.data_direction),
+            HCI_OPT_TIME_STAMP => Ok(options.timestamps),
+            HCI_OPT_PASS_CREDENTIALS => Ok(options.pass_credentials),
+            _ => Err(LinuxError::ENOPROTOOPT.into()),
         }
     }
 

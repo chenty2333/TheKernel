@@ -35,3 +35,15 @@ The HCI event tap also handles LE Connection Complete and Inquiry Result with RS
 Current controller-backed mgmt status (supersedes the earlier implementation snapshot above): `SET_BREDR`, SET_IO_CAPABILITY, PIN_CODE_REPLY/NEG_REPLY, USER_CONFIRM_REPLY/NEG_REPLY and the management PIN/numeric-confirmation events are routed to HCI. Classic BR/EDR PAIR_DEVICE now starts connection/authentication and answers HCI IO Capability Request; LE PAIR_DEVICE starts a connection but still lacks SMP. Loaded link keys and LTKs answer their matching HCI key-request events from the volatile cache. The no-controller command/event table advertises 22 commands and 9 events; no-device QEMU smoke validates this table and error responses. Physical HCI behavior is unverified.
 
 `SET_PRIVACY` retains the local IRK; when privacy is enabled and the controller is up, the driver clears/repopulates the standard LE resolving list from loaded public/random IRKs and enables controller address resolution. `LOAD_IRKS` refreshes that list only while privacy is enabled. This is controller-backed HCI programming, but privacy-mode acceptance still needs a physical Intel controller.
+
+2026-10-09 no-device CLI follow-up: the optional Alpine payload also includes
+the signed `bluez-btmon` and `bluez-deprecated` packages, pinning `btmon` and
+`hciconfig` alongside the daemon and current tools. The HCI socket now retains
+the `SOL_HCI` data-direction/timestamp controls and the `SOL_SOCKET`
+timestamp/pass-credentials toggles required for `btmon` startup. Ancillary
+timestamp/credential control messages are not implemented, so this evidence is
+strictly the no-controller path: in QEMU, `hciconfig` enumerates no adapters,
+`hciconfig hci0` gets `ENODEV`, and `btmon -i 0` starts waiting until the test
+stops it. The existing BlueZ daemon, `btmgmt info`, and `bluetoothctl list`
+no-controller checks also pass. No active-controller/monitor-frame behavior is
+claimed by this smoke.
