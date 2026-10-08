@@ -51,6 +51,7 @@ pub(crate) mod ddi;
 pub(crate) mod dpll;
 pub(crate) mod interrupt;
 pub(crate) mod pipe;
+pub(crate) mod pcode;
 pub(crate) mod port;
 pub(crate) mod table;
 
