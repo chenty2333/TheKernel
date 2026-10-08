@@ -59,3 +59,5 @@
 7h. DRM mode-config UAPI source translation | 部分完成 | 0940d345 | 新增 `kernel/src/drm/mode_config_full.rs`，`drm_mode_config.c` 14/14函数、861行，含标准CTM/degamma/gamma property init、resource limits、registration unwind；源文件无EDID函数，见connector模块。worker standalone rustc及主代理 `cargo check -p tk-kernel --tests`通过；ModeConfigIo仍未接现有core初始化。
 
 8a. DP audio source translation | 部分完成 | pending | 新增 `intel_audio_dp_full.rs`，`intel_audio.c` 45 个 ctags 函数中翻译 35；省略 3 个 HDMI 路径、4 个旧 G4x 和 3 个旧 IBX 函数（display12/13 不适用）。DP audio/ELD 配置和 codec 序列通过 hooks 表达；现有 kernel 音频/ELD 路径尚未切换。`cargo test -p tk-intel-display --lib` 147/147 通过。
+
+8b. DP MST source translation | 部分完成 | pending | 新增 `intel_dp_mst_full.rs`，`intel_dp_mst.c` 68/68 ctags 函数按顺序翻译；带宽/payload/atomic policy/stream 阶段使用 Rust 算法，DRM topology、sideband/AUX、MMIO 经 `MstBackend`。`cargo test -p tk-intel-display --lib` 147/147 通过；kernel MST topology/adapter 和现行单连接器 KMS 接入未完成。
