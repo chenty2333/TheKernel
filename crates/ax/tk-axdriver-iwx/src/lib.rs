@@ -19,6 +19,7 @@ mod interrupts;
 mod intr;
 mod mac;
 mod nic;
+mod notif;
 mod nvm;
 mod queue;
 mod rate;
@@ -78,6 +79,10 @@ pub use intr::{
 };
 pub use mac::{MacAddress, flip_hardware_address, is_valid_mac_address, select_csr_mac_address};
 pub use nic::{configure_nic, initialize_nic, initialize_rx};
+pub use notif::{
+    HBUS_TARG_WRPTR, HBUS_WRPTR_RX_Q0, NotificationRingError, RFH_Q0_FRBDCB_WIDX_TRG,
+    RxNotificationBatch, drain_rx_notifications,
+};
 pub use nvm::{
     NVM_CHANNEL_40MHZ, NVM_CHANNEL_80MHZ, NVM_CHANNEL_160MHZ, NVM_CHANNEL_ACTIVE,
     NVM_CHANNEL_VALID, NVM_GET_INFO_CMD, NVM_V3_CHANNEL_COUNT, NVM_V3_RESPONSE_BYTES,

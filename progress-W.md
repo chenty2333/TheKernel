@@ -11,4 +11,5 @@
 - RX receive parsing: FH packet validation, command/group decoding, narrow-command compatibility, and 64-byte advancement implemented (`rx_packet.rs`).
 - Additional NVM setup: 802.11 rate and response parser work remains after driver completion; CSR/OTP address selection and NVM v3/v4 payload parsing are implemented in the next driver segment.
 - Interrupt core: ICT allocation/reset/drain, cause swizzle, legacy/MSI-X cause work planning, register acknowledgement and mask/vector restoration implemented.
+- RX data path: ring completion drain, producer cursor update and RFH/BZ aligned receive pointer acknowledgment implemented.
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.
