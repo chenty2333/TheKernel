@@ -6,7 +6,7 @@
 // Copyright 2006 Dave Airlie <airlied@linux.ie>
 // Copyright © 2006-2009 Intel Corporation.
 // intel_display_regs.h selected fields: Copyright © 2025 Intel Corporation.
-// MIT permission text: ../LICENSE-MIT. No packet writes or sink configuration.
+// MIT permission text: ../LICENSE-MIT. HDMI packet writes are typed and caller-owned.
 use crate::{
     Error,
     display::{Pipe, ReadoutIo},
@@ -100,6 +100,49 @@ pub fn hsw_read_infoframe(
     }
     Ok(RawInfoframe { raw, kind })
 }
+/// Pack the generic infoframe bytes into the HSW DIP buffer's ECC hole layout.
+/// `hdmi_infoframe_pack_only()` supplies the checksum/header packet; this
+/// reproduces `intel_write_infoframe()`'s memmove and zero byte at DW0 byte 3.
+// upstream: intel_hdmi.c intel_write_infoframe()
+pub fn infoframe_packet_to_dip_data(packet: &[u8]) -> Result<[u8; 32], Error> {
+    if !(3..=31).contains(&packet.len()) {
+        return Err(Error::Refused);
+    }
+    let mut raw = [0; 32];
+    raw[..3].copy_from_slice(&packet[..3]);
+    raw[4..packet.len() + 1].copy_from_slice(&packet[3..]);
+    raw[3] = 0;
+    Ok(raw)
+}
+
+/// Write one prepacked HDMI packet through the HSW transcoder DIP aperture.
+/// All 32 bytes are written so the hardware ECC state is deterministic, just
+/// as the source writes the remaining data words as zero. The caller owns the
+/// surrounding modeset/port state and decides whether this packet is enabled.
+// upstream: intel_hdmi.c hsw_write_infoframe()
+pub fn hsw_write_infoframe(
+    io: &impl ReadoutIo,
+    pipe: Pipe,
+    kind: FrameType,
+    raw_dip_data: &[u8; 32],
+) -> Result<(), Error> {
+    if !io.pipe_powered(pipe) {
+        return Err(Error::Refused);
+    }
+    let ctl = pipe.transcoder_register(0x60200);
+    let mut value = io.read32(ctl)? & !kind.enable_mask();
+    io.write32(ctl, value)?;
+    for (index, bytes) in raw_dip_data.chunks_exact(4).enumerate() {
+        let offset = kind.data_base() + index as u32 * 4;
+        let word = u32::from_le_bytes(bytes.try_into().map_err(|_| Error::Truncated)?);
+        io.write32(pipe.transcoder_register(offset), word)?;
+    }
+    value |= kind.enable_mask();
+    io.write32(ctl, value)?;
+    let _ = io.read32(ctl)?; // intel_de_posting_read()
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HdmiReadout {
     pub control: u32,
@@ -142,4 +185,81 @@ pub fn read_hdmi_state(io: &impl ReadoutIo, pipe: Pipe) -> Result<HdmiReadout, E
         gcp,
         frames,
     })
+}
+
+#[cfg(test)]
+mod write_tests {
+    extern crate std;
+    use std::{cell::RefCell, collections::BTreeMap, vec::Vec};
+
+    use super::*;
+    use crate::RegisterIo;
+
+    #[derive(Default)]
+    struct Mock {
+        registers: RefCell<BTreeMap<u32, u32>>,
+        writes: RefCell<Vec<(u32, u32)>>,
+        powered: bool,
+    }
+    impl RegisterIo for Mock {
+        fn read32(&self, offset: u32) -> Result<u32, Error> {
+            Ok(*self.registers.borrow().get(&offset).unwrap_or(&0))
+        }
+        fn write32(&self, offset: u32, value: u32) -> Result<(), Error> {
+            self.registers.borrow_mut().insert(offset, value);
+            self.writes.borrow_mut().push((offset, value));
+            Ok(())
+        }
+    }
+    impl ReadoutIo for Mock {
+        fn pipe_powered(&self, _pipe: Pipe) -> bool {
+            self.powered
+        }
+    }
+
+    #[test]
+    fn packet_hole_and_hsw_write_order_match_source() {
+        let packet = [0x82, 2, 13, 0x7a, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+        let raw = infoframe_packet_to_dip_data(&packet).unwrap();
+        assert_eq!(&raw[..4], &[0x82, 2, 13, 0]);
+        assert_eq!(&raw[4..4 + packet.len() - 3], &packet[3..]);
+        assert!(raw[4 + packet.len() - 3..].iter().all(|b| *b == 0));
+        let mock = Mock {
+            powered: true,
+            ..Mock::default()
+        };
+        let pipe = Pipe::A;
+        mock.registers
+            .borrow_mut()
+            .insert(pipe.transcoder_register(0x60200), 0xabc0_0123);
+        hsw_write_infoframe(&mock, pipe, FrameType::Avi, &raw).unwrap();
+        let writes = mock.writes.borrow();
+        assert_eq!(writes.len(), 10); // disable, eight data writes, enable
+        assert_eq!(
+            writes[0],
+            (pipe.transcoder_register(0x60200), 0xabc0_0123 & !(1 << 12))
+        );
+        assert_eq!(
+            writes[1],
+            (
+                pipe.transcoder_register(0x60220),
+                u32::from_le_bytes([0x82, 2, 13, 0])
+            )
+        );
+        assert_eq!(writes[8], (pipe.transcoder_register(0x6023c), 0));
+        assert_eq!(
+            writes[9],
+            (pipe.transcoder_register(0x60200), 0xabc0_0123 | (1 << 12))
+        );
+    }
+
+    #[test]
+    fn packet_write_refuses_when_pipe_power_is_not_owned() {
+        let mock = Mock::default();
+        assert_eq!(
+            hsw_write_infoframe(&mock, Pipe::A, FrameType::Avi, &[0; 32]),
+            Err(Error::Refused)
+        );
+        assert!(mock.writes.borrow().is_empty());
+    }
 }
