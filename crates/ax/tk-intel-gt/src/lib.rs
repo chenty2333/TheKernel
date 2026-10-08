@@ -11,6 +11,7 @@ pub mod bcs;
 pub mod cache;
 pub mod guc_config;
 pub mod guc_fw;
+pub mod guc_log;
 pub mod info;
 pub mod lrc;
 pub mod ppgtt;
