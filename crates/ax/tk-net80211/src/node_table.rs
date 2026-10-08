@@ -197,6 +197,20 @@ pub fn alloc_node(
     Ok(table.nodes.get_mut(&mac_address).expect("inserted node"))
 }
 
+/// Allocate an RX peer node and inherit the station BSS identity/channel.
+// upstream: ieee80211_node.c ieee80211_dup_bss()
+pub fn duplicate_bss_node(
+    table: &mut NodeTable,
+    mac_address: [u8; 6],
+) -> Result<&mut NodeRecord, NodeAllocError> {
+    let bssid = table.bss_node.access_point.bssid;
+    let channel = table.bss_node.access_point.channel;
+    let node = alloc_node(table, mac_address)?;
+    node.access_point.bssid = bssid;
+    node.access_point.channel = channel;
+    Ok(node)
+}
+
 // upstream: ieee80211_node.c ieee80211_find_node()
 pub fn find_node<'a>(table: &'a NodeTable, mac_address: &[u8; 6]) -> Option<&'a NodeRecord> {
     table.nodes.get(mac_address)
@@ -388,5 +402,15 @@ mod tests {
             find_station_tx_node(&table, false, [2, 0, 0, 0, 0, 4]),
             None
         );
+    }
+
+    #[test]
+    fn duplicate_rx_node_inherits_bss_address_and_channel() {
+        let mut table = NodeTable::default();
+        table.bss_node.access_point.bssid = [2, 1, 2, 3, 4, 5];
+        table.bss_node.access_point.channel = 36;
+        let peer = duplicate_bss_node(&mut table, [2, 9, 8, 7, 6, 5]).unwrap();
+        assert_eq!(peer.access_point.bssid, [2, 1, 2, 3, 4, 5]);
+        assert_eq!(peer.access_point.channel, 36);
     }
 }

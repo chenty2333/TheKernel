@@ -245,8 +245,10 @@ OpenBSD's `ieee80211_begin_bgscan()` gates background scans on RUN state,
 scan re-entry, management timer and an authorized RSN port. The ported planner
 runs the driver callback only after those guards and returns explicit cache
 clear/background-scan effects when the callback succeeds; the timeout wrapper
-uses the same planner. The controller/firmware scan callback is still a
-separate iwx runtime integration step.
+uses the same planner. The iwx callback now sends the firmware UMAC scan
+command and its RX poll feeds validated beacon/probe-response frames into the
+station scan cache; end-of-scan effects and userspace multicast notification
+remain unconnected.
 
 The generic management watchdog helper preserves the countdown and timer-rearm
 behavior, moves any expired management state to SCAN, and adds station peer
@@ -342,3 +344,7 @@ kernel's wireless netdev/ioctl surface rather than copied from OpenBSD ifnet.
 Station compressed-BAR construction is also translated as a bounded control
 frame encoder; queue admission, node retention and `if_start` are caller-side
 effects mapped to iwx's management queue.
+
+Duplicate station RX nodes now inherit only the source BSS BSSID and channel
+after bounded cache allocation; the kernel owns their lifetimes instead of
+OpenBSD node reference callbacks.

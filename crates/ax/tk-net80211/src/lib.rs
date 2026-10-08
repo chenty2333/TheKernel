@@ -129,7 +129,7 @@ pub use node_rates::{
 pub use node_table::{
     INACT_SCAN, INVALID_SEQUENCE, NODE_CACHE_SIZE, NodeAllocError, NodeCopyEffects, NodeLifecycle,
     NodeRecord, NodeTable, alloc_node, allocation_available, clean_inactive_nodes, copy_node_state,
-    find_node, find_node_mut, find_station_tx_node, free_all_nodes, free_node,
+    duplicate_bss_node, find_node, find_node_mut, find_station_tx_node, free_all_nodes, free_node,
     raise_scan_node_inactivity, setup_node,
 };
 pub use output::{
