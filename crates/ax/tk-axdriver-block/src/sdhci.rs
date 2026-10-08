@@ -424,6 +424,54 @@ pub struct MmcCsd {
     pub write_to_read_factor: u32,
 }
 
+/// FreeBSD MMC bus timing selectors used by card/host negotiation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MmcBusTiming {
+    Normal,
+    HighSpeed,
+    UhsSdr12,
+    UhsSdr25,
+    UhsDdr50,
+    UhsSdr50,
+    UhsSdr104,
+    MmcDdr52,
+    MmcHs200,
+    MmcHs400,
+    MmcHs400EnhancedStrobe,
+}
+
+// upstream: mmc.c mmc_timing_to_dtr()
+pub fn timing_to_data_rate(timing: MmcBusTiming, normal_hz: u32, high_speed_hz: u32) -> u32 {
+    match timing {
+        MmcBusTiming::Normal => normal_hz,
+        MmcBusTiming::HighSpeed => high_speed_hz,
+        MmcBusTiming::UhsSdr12 => 25_000_000,
+        MmcBusTiming::UhsSdr25 => 50_000_000,
+        MmcBusTiming::UhsDdr50 | MmcBusTiming::MmcDdr52 => 52_000_000,
+        MmcBusTiming::UhsSdr50 => 100_000_000,
+        MmcBusTiming::UhsSdr104 => 208_000_000,
+        MmcBusTiming::MmcHs200
+        | MmcBusTiming::MmcHs400
+        | MmcBusTiming::MmcHs400EnhancedStrobe => 200_000_000,
+    }
+}
+
+// upstream: mmc.c mmc_timing_to_string()
+pub const fn timing_name(timing: MmcBusTiming) -> &'static str {
+    match timing {
+        MmcBusTiming::Normal => "normal speed",
+        MmcBusTiming::HighSpeed => "high speed",
+        MmcBusTiming::UhsSdr12
+        | MmcBusTiming::UhsSdr25
+        | MmcBusTiming::UhsSdr50
+        | MmcBusTiming::UhsSdr104 => "single data rate",
+        MmcBusTiming::UhsDdr50 | MmcBusTiming::MmcDdr52 => "dual data rate",
+        MmcBusTiming::MmcHs200 => "HS200",
+        MmcBusTiming::MmcHs400 => "HS400",
+        MmcBusTiming::MmcHs400EnhancedStrobe => "HS400 with enhanced strobe",
+    }
+}
+
 /// SD Configuration Register fields supported by the current SCR structure.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MmcScr {
@@ -2603,6 +2651,14 @@ mod tests {
         assert_eq!(mmc_select_vdd(u32::MAX), SD_OCR_VOLTAGE);
         assert_eq!(mmc_highest_voltage((1 << 20) | (1 << 21)), Some(21));
         assert_eq!(mmc_highest_voltage(1 << 6), None);
+    }
+
+    #[test]
+    fn mmc_timing_rate_and_name_match_upstream_mapping() {
+        assert_eq!(timing_to_data_rate(MmcBusTiming::Normal, 25_000_000, 52_000_000), 25_000_000);
+        assert_eq!(timing_to_data_rate(MmcBusTiming::MmcHs400, 1, 2), 200_000_000);
+        assert_eq!(timing_name(MmcBusTiming::UhsDdr50), "dual data rate");
+        assert_eq!(timing_name(MmcBusTiming::MmcHs400EnhancedStrobe), "HS400 with enhanced strobe");
     }
 
     #[test]
