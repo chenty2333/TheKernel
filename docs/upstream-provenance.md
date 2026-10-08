@@ -1152,3 +1152,14 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/net80211/ieee80211_node.c` rev 1.217 (BSD-3-Clause): saved security-IE cleanup, BA teardown, reorder-buffer release and HostAP-only queue purge effects translated in `tk-net80211/src/node_table.rs`.
 - OpenBSD `sys/net80211/ieee80211_output.c` rev 1.148 (BSD-3-Clause): station management subtype/body selection, node-ref transfer policy and transition-timer effects translated in `tk-net80211/src/output.rs`.
 - OpenBSD `sys/net80211/ieee80211_ra_vht.c` rev 1.3, `ieee80211_ra_vht.h` rev 1.1 and VHT rateset table in `ieee80211.c` rev 1.92 (ISC): 20/40/80 MHz MCS/NSS tables, SGI decisions, fixed-point goodput statistics, valid-rate initialization, candidate/probe transitions and selection translated in `tk-net80211/src/ra_vht.rs`; iwx reuses the translated peer-MCS limit helper when building firmware TLC rate masks in `tk-axdriver-iwx/src/rate.rs`; grant in `tk-net80211/LICENSES/OpenBSD-ISC.txt`.
+
+The station VHT rate-adaptation translation adds two ISC license-boilerplate
+lines in `crates/ax/tk-net80211/src/ra_vht.rs` that are byte-identical to GPL
+Linux license text and therefore match the verbatim-line scanner. They are
+license statements, not Linux implementation excerpts. Re-running the pinned
+scan yields crates/ax totals at ≥40 `(0,0,0,97,88,0,0)` and ≥25
+`(18,15,4,131,118,0,0)`, exactly two more unfenced documentation/comment
+matches at both thresholds; fenced lines and Rust-code matches are unchanged.
+`tests/ci/test_linux_excerpt_baseline.py` carries the corresponding counters;
+there is no new Linux source quotation or change to the seven genuine comment
+lines and eight code matches inventoried for this subtree.
