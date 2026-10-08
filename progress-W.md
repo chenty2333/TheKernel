@@ -18,4 +18,5 @@
 - Firmware notification decoding: ALIVE v4-v7 layout/status/SKU extraction committed with the current scan/event slice.
 - Scan lifecycle: abort UMAC command and foreground/background scan flag/state ordering translated; full scan request builders remain.
 - Rate adaptation: 11g rate lookup and peer/local HT/VHT RX bitmap intersection are translated; TLC config command packing remains.
+- Post-ALIVE rate-format selection and command status-payload checks are wired into the firmware/host-command modules.
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.

@@ -5,9 +5,15 @@
 //! Fixup Software Ltd.; Copyright (c) 2017, 2019, 2020 Stefan Sperling
 //! <stsp@openbsd.org>.
 
-use crate::{DeviceFamily, DmaAllocator, DmaRegion, FirmwareDmaImages};
+use crate::{
+    CsrAccess, DeviceFamily, DmaAllocator, DmaRegion, FirmwareDmaImages, FirmwareImage, IctError,
+    InterruptCauseTable, InterruptMasks, IwxRegisters,
+};
 
 pub const FIRMWARE_ALIVE_TIMEOUT_NS: u64 = 1_000_000_000;
+pub const LONG_GROUP: u8 = 1;
+pub const TX_COMMAND_OPCODE: u8 = 0x1c;
+pub const FW_COMMAND_VERSION_UNKNOWN: u8 = 99;
 
 /// Error path for loading firmware sections and waiting for ALIVE.
 #[derive(Debug, PartialEq, Eq)]
@@ -106,6 +112,49 @@ pub fn run_init_mvm<E>(
         use_mld_api,
         init_complete: 1,
     })
+}
+
+/// Post-ALIVE ICT initialization and TX-rate-version policy from firmware tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostAliveState {
+    pub rate_n_flags_version: u8,
+    pub tx_command_version: u8,
+}
+
+/// Configure interrupt table and set the rate_n_flags layout after ALIVE.
+// upstream: if_iwx.c iwx_post_alive()
+pub fn post_alive<A, B>(
+    allocator: &mut A,
+    registers: &mut IwxRegisters<B>,
+    masks: &mut InterruptMasks,
+    firmware: &FirmwareImage,
+    ict: Option<InterruptCauseTable<A::Region>>,
+) -> Result<(InterruptCauseTable<A::Region>, PostAliveState), IctError>
+where
+    A: DmaAllocator,
+    A::Region: DmaRegion,
+    B: CsrAccess,
+{
+    let ict = crate::reset_ict(allocator, registers, masks, ict)?;
+    let notification_version = firmware.lookup_notification_version(LONG_GROUP, TX_COMMAND_OPCODE);
+    let rate_n_flags_version = rate_n_flags_version(notification_version);
+    let tx_command_version = firmware.lookup_command_version(LONG_GROUP, TX_COMMAND_OPCODE);
+    Ok((
+        ict,
+        PostAliveState {
+            rate_n_flags_version,
+            tx_command_version,
+        },
+    ))
+}
+
+/// Select the source firmware's v1/v2 legacy rate_n_flags wire format.
+pub const fn rate_n_flags_version(notification_version: u8) -> u8 {
+    if notification_version != FW_COMMAND_VERSION_UNKNOWN && notification_version > 6 {
+        2
+    } else {
+        1
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -298,5 +347,12 @@ mod tests {
             || Ok(()),
         );
         assert_eq!(error, Err(InitFirmwareError::RadioDisabled));
+    }
+
+    #[test]
+    fn tx_notification_version_selects_rate_n_flags_wire_revision() {
+        assert_eq!(rate_n_flags_version(6), 1);
+        assert_eq!(rate_n_flags_version(7), 2);
+        assert_eq!(rate_n_flags_version(FW_COMMAND_VERSION_UNKNOWN), 1);
     }
 }

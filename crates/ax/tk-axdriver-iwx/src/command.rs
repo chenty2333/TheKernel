@@ -33,6 +33,8 @@ pub enum CommandError {
     WrongQueue,
     NoResponseSlot,
     QueueIdOverflow,
+    FailedResponse,
+    InvalidStatusResponse,
     Ring(RingError),
     Dma(DmaError),
 }
@@ -409,6 +411,18 @@ where
     }
 }
 
+/// Extract the little-endian status word from a successful status response.
+// upstream: if_iwx.c iwx_send_cmd_status()
+pub fn command_response_status(response: &[u8], failed: bool) -> Result<u32, CommandError> {
+    if failed {
+        return Err(CommandError::FailedResponse);
+    }
+    if response.len() != 4 {
+        return Err(CommandError::InvalidStatusResponse);
+    }
+    Ok(u32::from_le_bytes(response.try_into().unwrap()))
+}
+
 /// Submit a prepared command on the queue and copy its wire bytes into either
 /// the inline command array or the caller-provided external DMA buffer.
 // upstream: if_iwx.c iwx_send_cmd() descriptor write, sync and queue kick preparation
@@ -585,6 +599,22 @@ mod tests {
             Some(response.to_vec())
         );
         assert_eq!(registers.into_inner().0.last(), Some(&(HBUS_TARG_WRPTR, 1)));
+    }
+
+    #[test]
+    fn status_response_checks_firmware_failure_and_exact_payload_size() {
+        assert_eq!(
+            command_response_status(&[0x78, 0x56, 0x34, 0x12], false),
+            Ok(0x12345678)
+        );
+        assert_eq!(
+            command_response_status(&[0; 4], true),
+            Err(CommandError::FailedResponse)
+        );
+        assert_eq!(
+            command_response_status(&[1, 2, 3], false),
+            Err(CommandError::InvalidStatusResponse)
+        );
     }
 
     #[test]
