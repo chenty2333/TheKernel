@@ -230,9 +230,12 @@ ordinary Ethernet devices preserve their existing UP default. The controller's
 raw-MPDU DMA submit primitive is available to the future net80211 transmitter.
 The PCI probe now returns the named `wlan0` Ethernet-compatible driver into
 init-net. Its administrative up/down callback starts/stops regular uCode and
-its firmware/NVM-derived MAC is retained. Until management/RX and association
-state are wired to `tk-net80211`, the adapter explicitly refuses TX and does
-not claim RX availability rather than fabricating packet traffic.
+its firmware/NVM-derived MAC is retained. The adapter now submits source-built
+management MPDUs on the dedicated queue and polls their TX responses before
+releasing DMA storage; protected management remains rejected until key offload
+is connected. Its RX worker is enabled for foreground scans only, where it
+drains beacon and scan-completion notifications. It still refuses ordinary
+Ethernet data TX/RX until the association/data/key state is integrated.
 
 
 ## Guest user-space payload

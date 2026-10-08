@@ -238,6 +238,7 @@ pub enum RuntimeStartError {
     Firmware,
     ManagementQueue,
     SoftBlocked,
+    Transmission,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1104,6 +1105,88 @@ pub fn start_runtime(bdf: DeviceFunction) -> Result<(), RuntimeStartError> {
             Err(error)
         }
     }
+}
+
+/// Submit one source-built station management MPDU on iwx's dedicated queue
+/// and retire its DMA storage only after the matching firmware TX response.
+pub fn send_station_management_frame(
+    bdf: DeviceFunction,
+    frame: &[u8],
+) -> Result<(), RuntimeStartError> {
+    const IEEE80211_HEADER_BYTES: usize = 24;
+    const MANAGEMENT_QUEUE: u8 = axdriver_iwx::DQA_CMD_QUEUE + 1;
+    const MANAGEMENT_TIMEOUT_US: u32 = 500_000;
+    if frame.len() < IEEE80211_HEADER_BYTES || frame[1] & 0x40 != 0 {
+        // MFP data/control key installation is still not connected; refuse a
+        // Protected management frame rather than transmit it in cleartext.
+        return Err(RuntimeStartError::Transmission);
+    }
+    let key = Bdf(bdf.bus, bdf.device, bdf.function);
+    let mut devices = ATTACHED_DMA.lock();
+    let device = devices
+        .iter_mut()
+        .find(|device| device.bdf == key)
+        .ok_or(RuntimeStartError::DeviceNotFound)?;
+    if !device.runtime_started || device.soft_blocked {
+        return Err(RuntimeStartError::FirmwareNotReady);
+    }
+    let target_slot = device
+        .controller
+        .submit_data_frame(
+            MANAGEMENT_QUEUE,
+            axdriver_iwx::STA_ID_LINK,
+            &frame[..IEEE80211_HEADER_BYTES],
+            &frame[IEEE80211_HEADER_BYTES..],
+            0,
+            0,
+            false,
+        )
+        .map_err(|_| RuntimeStartError::Transmission)?;
+    let mut elapsed = 0;
+    while elapsed < MANAGEMENT_TIMEOUT_US {
+        let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
+            &mut device.controller.registers,
+            &device.controller.interrupt_masks,
+            Some(&mut device.controller.resources.ict),
+        )
+        .map_err(|_| RuntimeStartError::Transmission)?;
+        let mut responses = Vec::new();
+        device
+            .controller
+            .process_rx_notifications(|packet, _| {
+                if matches!(
+                    axdriver_iwx::decode_firmware_event(packet),
+                    axdriver_iwx::FirmwareEvent::TxStatus(_)
+                ) && responses.try_reserve(1).is_ok()
+                {
+                    responses.push(packet.payload.to_vec());
+                }
+                Ok::<_, Infallible>(true)
+            })
+            .map_err(|_| RuntimeStartError::Transmission)?;
+        for response in responses {
+            let mut completed = false;
+            device
+                .controller
+                .process_tx_response(
+                    u16::from(MANAGEMENT_QUEUE),
+                    u16::from(axdriver_iwx::BGSCAN_FIRST_AGG_TX_QUEUE),
+                    &response,
+                    false,
+                    |_, dma| drop(dma),
+                )
+                .map(|outcome| {
+                    completed = outcome.completed_slots.contains(&target_slot);
+                })
+                .map_err(|_| RuntimeStartError::Transmission)?;
+            if completed {
+                return Ok(());
+            }
+        }
+        device.controller.registers.delay_us(1_000);
+        elapsed += 1_000;
+    }
+    Err(RuntimeStartError::Transmission)
 }
 
 /// Stop regular uCode when the wireless interface is administratively lowered.
