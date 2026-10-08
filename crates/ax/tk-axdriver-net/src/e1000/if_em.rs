@@ -2507,6 +2507,207 @@ pub fn em_if_timer<O: EmAdminOps>(ops: &mut O, state: &mut EmAdminStatus, queue:
     ops.defer_admin();
 }
 
+pub const EM_WOL_CAPABLE: u32 = (1 << 1) | (1 << 2) | (1 << 3);
+pub const EM_WOL_MAGIC_ENABLE: u32 = 1 << 1;
+pub const EM_WOL_UNICAST: u32 = 1 << 2;
+pub const EM_WOL_MULTICAST: u32 = 1 << 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmWakeupConfig {
+    pub mac: E1000MacType,
+    pub device_id: u16,
+    pub subvendor_id: u16,
+    pub subdevice_id: u16,
+    pub function: u8,
+    pub has_pme_d3_hot: bool,
+    pub has_manage: bool,
+    pub wuc: u32,
+    pub invm: bool,
+    pub quad_port_a: u8,
+}
+
+impl Default for EmWakeupConfig {
+    fn default() -> Self {
+        Self {
+            mac: E1000MacType::I82542,
+            device_id: 0,
+            subvendor_id: 0,
+            subdevice_id: 0,
+            function: 0,
+            has_pme_d3_hot: false,
+            has_manage: false,
+            wuc: 0,
+            invm: false,
+            quad_port_a: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmWakeupState {
+    pub has_manage: bool,
+    pub has_amt: bool,
+    pub wol_phy_wakeup: bool,
+    pub capabilities: u32,
+    pub enabled: u32,
+    pub quad_port_a: u8,
+}
+
+pub trait EmWakeupNvm {
+    fn read_nvm_word(&mut self, offset: u16) -> DevResult<u16>;
+}
+
+/// upstream: if_em.c em_get_wakeup()
+pub fn em_get_wakeup<N: EmWakeupNvm>(nvm: &mut N, config: EmWakeupConfig) -> EmWakeupState {
+    use E1000MacType as M;
+    let mut state = EmWakeupState {
+        has_manage: config.has_manage,
+        quad_port_a: config.quad_port_a,
+        ..EmWakeupState::default()
+    };
+    let mut apme_mask = 0x0400u16;
+    let mut nvm_offset = None;
+    let mut eeprom_data = 0u16;
+    match config.mac {
+        M::I82542 | M::I82543 => {}
+        M::I82544 => {
+            nvm_offset = Some(0x000f);
+            apme_mask = 0x0004;
+        }
+        M::I82541 | M::I82547 => {
+            nvm_offset = Some(0x0024);
+            if config.device_id != 0x1014 {
+                apme_mask = 0x0004;
+            }
+        }
+        M::I82546 | M::I82546Rev3 => {
+            nvm_offset = Some(if config.function == 1 { 0x0014 } else { 0x0024 });
+        }
+        M::I82573 | M::I82583 | M::I82571 | M::I82572 | M::I80003Es2lan => {
+            state.has_amt = true;
+            nvm_offset = Some(if config.function == 1 { 0x0014 } else { 0x0024 });
+        }
+        M::Ich8Lan
+        | M::Ich9Lan
+        | M::Ich10Lan
+        | M::PchLan
+        | M::Pch2Lan
+        | M::PchLpt
+        | M::PchSpt
+        | M::PchCnp
+        | M::PchTgp
+        | M::PchAdp
+        | M::PchMtp
+        | M::PchPtp
+        | M::PchNvp => {
+            apme_mask = E1000_WUC_APME as u16;
+            state.has_amt = true;
+            eeprom_data = config.wuc as u16;
+            state.wol_phy_wakeup = config.mac > M::Ich10Lan && config.wuc & E1000_WUC_PHY_WAKE != 0;
+        }
+        M::I82575 | M::I82576 => {
+            state.has_amt = true;
+            nvm_offset = Some(if config.function == 1 { 0x0014 } else { 0x0024 });
+        }
+        M::I82580 | M::I350 | M::I354 | M::I210 | M::I211 => {
+            state.has_amt = true;
+            nvm_offset = Some(
+                0x0024
+                    + if config.function != 0 {
+                        0x40 + 0x40 * u16::from(config.function)
+                    } else {
+                        0
+                    },
+            );
+        }
+        _ => nvm_offset = Some(0x0024),
+    }
+    let nvm_ok = if let Some(offset) = nvm_offset {
+        match nvm.read_nvm_word(offset) {
+            Ok(value) => {
+                eeprom_data = value;
+                true
+            }
+            Err(_) => false,
+        }
+    } else {
+        true
+    };
+    let mut apme = if config.invm && matches!(config.mac, M::I210 | M::I211) {
+        config.wuc & E1000_WUC_APME != 0
+    } else {
+        nvm_ok && eeprom_data & apme_mask != 0
+    };
+    let mut capabilities = if config.has_pme_d3_hot {
+        EM_WOL_CAPABLE
+    } else {
+        0
+    };
+    if matches!(config.mac, M::I82542 | M::I82543) {
+        capabilities = 0;
+    }
+    match config.device_id {
+        0x1000 | 0x1001 | 0x1004 | 0x1014 | 0x1009 | 0x100f | 0x1011 | 0x101d | 0x1099 | 0x108a => {
+            capabilities = 0
+        }
+        0x1012 | 0x107a if config.function == 1 => capabilities = 0,
+        0x10b5 => {
+            if state.quad_port_a != 0 {
+                capabilities = 0;
+            } else {
+                capabilities &= !EM_WOL_UNICAST;
+            }
+            state.quad_port_a = (state.quad_port_a + 1) % 4;
+        }
+        0x105e | 0x105f | 0x1060 if config.function == 1 => capabilities = 0,
+        0x10da => capabilities = 0,
+        0x10a4 | 0x10a5 | 0x10bc | 0x10d5 => {
+            if state.quad_port_a != 0 {
+                capabilities = 0;
+            }
+            state.quad_port_a = (state.quad_port_a + 1) % 4;
+        }
+        0x10d6 => capabilities = 0,
+        0x10a9 | 0x10e6 | 0x10e7 if config.function == 1 => capabilities = 0,
+        0x10e8 | 0x1526 => {
+            if state.quad_port_a != 0 {
+                capabilities = 0;
+            }
+            state.quad_port_a = (state.quad_port_a + 1) % 4;
+        }
+        _ => {}
+    }
+    if (config.mac < M::I82571 || config.mac >= M::I82575) && config.function != 0 && !apme {
+        capabilities = 0;
+    }
+    if (config.mac == M::I350 && config.subvendor_id == 0x103c)
+        || (matches!(config.mac, M::I350 | M::I354) && config.subvendor_id == 0x1028)
+        || (config.mac == M::I350
+            && matches!(config.subdevice_id, 0x5001 | 0x5002)
+            && config.function == 0)
+    {
+        capabilities = if config.has_pme_d3_hot {
+            EM_WOL_CAPABLE
+        } else {
+            0
+        };
+        apme = false;
+        state.enabled = 0;
+    }
+    if config.mac == M::I350 && config.subdevice_id == 0x1f52 {
+        capabilities = if config.has_pme_d3_hot {
+            EM_WOL_CAPABLE
+        } else {
+            0
+        };
+    }
+    state.capabilities = capabilities;
+    if capabilities != 0 && apme {
+        state.enabled = EM_WOL_MAGIC_ENABLE;
+    }
+    state
+}
+
 pub trait EmRxUnitOps {
     fn initialize_rss(&mut self) -> DevResult;
     fn initialize_advanced_rx_rings(&mut self, drop: bool) -> DevResult;
@@ -4010,6 +4211,14 @@ mod tests {
             Ok(())
         }
     }
+
+    #[derive(Default)]
+    struct WakeNvmMock(BTreeMap<u16, u16>);
+    impl EmWakeupNvm for WakeNvmMock {
+        fn read_nvm_word(&mut self, offset: u16) -> DevResult<u16> {
+            self.0.get(&offset).copied().ok_or(DevError::Io)
+        }
+    }
     impl EmSleepPowerOps for SleepMock {
         fn enable_ulp_lpt_lp(&mut self) -> DevResult {
             self.ulp += 1;
@@ -4316,5 +4525,62 @@ mod tests {
         em_if_timer(&mut ops, &mut state, 0);
         assert!(state.stats_pending);
         assert_eq!(ops.defers, 1);
+    }
+
+    #[test]
+    fn wakeup_policy_tracks_nvm_pme_board_port_and_pch_phy_state() {
+        let mut nvm = WakeNvmMock::default();
+        nvm.0.insert(0x24, 0x0400);
+        let legacy = em_get_wakeup(
+            &mut nvm,
+            EmWakeupConfig {
+                mac: E1000MacType::I82540,
+                device_id: 0x100e,
+                function: 1,
+                has_pme_d3_hot: true,
+                ..EmWakeupConfig::default()
+            },
+        );
+        assert_eq!(legacy.capabilities, EM_WOL_CAPABLE);
+        assert_eq!(legacy.enabled, EM_WOL_MAGIC_ENABLE);
+
+        let pch = em_get_wakeup(
+            &mut nvm,
+            EmWakeupConfig {
+                mac: E1000MacType::PchLpt,
+                device_id: 0x1559,
+                has_pme_d3_hot: true,
+                wuc: E1000_WUC_APME | E1000_WUC_PHY_WAKE,
+                ..EmWakeupConfig::default()
+            },
+        );
+        assert!(pch.has_amt && pch.wol_phy_wakeup);
+        assert_eq!(pch.enabled, EM_WOL_MAGIC_ENABLE);
+
+        let hp_i350 = em_get_wakeup(
+            &mut nvm,
+            EmWakeupConfig {
+                mac: E1000MacType::I350,
+                device_id: 0x1521,
+                subvendor_id: 0x103c,
+                function: 0,
+                has_pme_d3_hot: true,
+                ..EmWakeupConfig::default()
+            },
+        );
+        assert_eq!(hp_i350.capabilities, EM_WOL_CAPABLE);
+        assert_eq!(hp_i350.enabled, 0);
+
+        let quad = em_get_wakeup(
+            &mut nvm,
+            EmWakeupConfig {
+                mac: E1000MacType::I82546,
+                device_id: 0x10b5,
+                has_pme_d3_hot: true,
+                ..EmWakeupConfig::default()
+            },
+        );
+        assert_eq!(quad.capabilities, EM_WOL_CAPABLE & !EM_WOL_UNICAST);
+        assert_eq!(quad.quad_port_a, 1);
     }
 }
