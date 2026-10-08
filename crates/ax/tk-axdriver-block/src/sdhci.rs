@@ -265,6 +265,21 @@ pub const SDHCI_RETUNE_CNT_SHIFT: u32 = 8;
 pub const SDHCI_TUNE_SDR50: u32 = 0x00002000;
 pub const SDHCI_RETUNE_MODES_MASK: u32 = 0x0000C000;
 pub const SDHCI_RETUNE_MODES_SHIFT: u32 = 14;
+// upstream: sdhci.c sdhci_init_slot() retune count interpretation
+pub const fn retune_interval_seconds(capabilities2: u32) -> Option<u64> {
+    let mode = (capabilities2 & SDHCI_RETUNE_MODES_MASK) >> SDHCI_RETUNE_MODES_SHIFT;
+    if mode != SDHCI_RETUNE_MODE_1 {
+        return None;
+    }
+    let count = (capabilities2 & SDHCI_RETUNE_CNT_MASK) >> SDHCI_RETUNE_CNT_SHIFT;
+    if count == 0 {
+        None
+    } else if count > 0xb {
+        Some(1)
+    } else {
+        Some(1u64 << (count - 1))
+    }
+}
 pub const SDHCI_CLOCK_MULT_MASK: u32 = 0x00FF0000;
 pub const SDHCI_CLOCK_MULT_SHIFT: u32 = 16;
 pub const SDHCI_CAN_MMC_HS400: u32 = 0x80000000;
@@ -324,6 +339,10 @@ pub trait SdhciIo: Send + Sync {
     fn write16(&mut self, offset: usize, value: u16);
     fn write32(&mut self, offset: usize, value: u32);
     fn delay_us(&mut self, micros: u32);
+
+    fn monotonic_time_ns(&self) -> Option<u64> {
+        None
+    }
 
     fn has_interrupt(&self) -> bool {
         false
@@ -910,6 +929,7 @@ pub struct SdhciHost<I: SdhciIo> {
     dma: Option<SdhciDmaRegion>,
     dma_inflight: bool,
     single_block_only: bool,
+    retune_requested: bool,
     timeout_polls: usize,
 }
 
@@ -951,6 +971,7 @@ impl<I: SdhciIo> SdhciHost<I> {
             dma: None,
             dma_inflight: false,
             single_block_only: false,
+            retune_requested: false,
             timeout_polls: 100_000,
         }
     }
@@ -1172,6 +1193,10 @@ impl<I: SdhciIo> SdhciHost<I> {
     // upstream: sdhci.c sdhci_init() interrupt and status setup
     fn init_registers(&mut self) {
         self.io.write32(SDHCI_INT_STATUS as usize, u32::MAX);
+        let retune_mode =
+            (self.capabilities2 & SDHCI_RETUNE_MODES_MASK) >> SDHCI_RETUNE_MODES_SHIFT;
+        let tuning_enabled = self.version >= SDHCI_SPEC_300 as u8
+            && self.capabilities2 & (SDHCI_CAN_SDR50 | SDHCI_CAN_SDR104 | SDHCI_CAN_MMC_HS400) != 0;
         let interrupt_mask = SDHCI_INT_RESPONSE
             | SDHCI_INT_DATA_END
             | SDHCI_INT_SPACE_AVAIL
@@ -1181,7 +1206,8 @@ impl<I: SdhciIo> SdhciHost<I> {
             | SDHCI_INT_CMD_ERROR_MASK
             | SDHCI_INT_DATA_TIMEOUT
             | SDHCI_INT_DATA_CRC
-            | SDHCI_INT_DATA_END_BIT;
+            | SDHCI_INT_DATA_END_BIT
+            | tuning_interrupt_mask(tuning_enabled, retune_mode as u8);
         self.io.write32(SDHCI_INT_ENABLE as usize, interrupt_mask);
         // Keep enumeration and synchronous command completions polling by
         // default. Runtime clients opt into signaling through enable_irq().
@@ -1359,8 +1385,16 @@ impl<I: SdhciIo> SdhciHost<I> {
         if status == 0 || status == u32::MAX {
             0
         } else {
-            status
+            if status & SDHCI_INT_RETUNE != 0 {
+                self.retune_requested = true;
+                self.io.write32(SDHCI_INT_STATUS as usize, SDHCI_INT_RETUNE);
+            }
+            status & !SDHCI_INT_RETUNE
         }
+    }
+
+    fn take_retune_request(&mut self) -> bool {
+        core::mem::take(&mut self.retune_requested)
     }
 
     // upstream: sdhci.c sdhci_cmd_irq() error classification
@@ -2300,7 +2334,7 @@ fn switch_mmc_to_hs400<I: SdhciIo>(
     Ok(())
 }
 
-// upstream: mmc.c mmc_switch_to_hs200()
+// upstream: mmc.c mmc_attach() initial HS200 timing selection
 fn switch_mmc_to_hs200<I: SdhciIo>(
     host: &mut SdhciHost<I>,
     rca: u16,
@@ -2311,6 +2345,25 @@ fn switch_mmc_to_hs200<I: SdhciIo>(
     host.set_mmc_timing(MmcBusTiming::MmcHs200, clock_hz)?;
     host.execute_tuning(21, width)?;
     Ok(())
+}
+
+// upstream: mmc.c mmc_switch_to_hs200()
+fn retune_mmc_hs400_via_hs200<I: SdhciIo>(
+    host: &mut SdhciHost<I>,
+    rca: u16,
+    width: u8,
+    clock_hz: u32,
+) -> Result<(), SdhciError> {
+    if width != 8 {
+        return Err(SdhciError::InvalidTransfer);
+    }
+    let hs_clock = 52_000_000.min(host.base_clock_hz);
+    host.set_clock(hs_clock)?;
+    host.set_mmc_timing(MmcBusTiming::MmcDdr52, hs_clock)?;
+    mmc_set_card_bus_width_timing(host, rca, width, MmcBusTiming::HighSpeed)?;
+    host.set_mmc_timing(MmcBusTiming::HighSpeed, hs_clock)?;
+    host.set_mmc_timing(MmcBusTiming::MmcHs200, clock_hz)?;
+    host.execute_tuning(21, width)
 }
 
 // MMC bus-test data patterns from the upstream mmc_test_bus_width() routine.
@@ -2399,6 +2452,10 @@ pub struct SdhciDisk<I: SdhciIo> {
     read_only: bool,
     cache_enabled: bool,
     dirty: bool,
+    timing: MmcBusTiming,
+    timing_clock_hz: u32,
+    bus_width: u8,
+    last_tune_ns: Option<u64>,
 }
 
 impl<I: SdhciIo> SdhciDisk<I> {
@@ -2436,10 +2493,14 @@ impl<I: SdhciIo> SdhciDisk<I> {
             decode_sd_csd(csd)
         }
         .ok_or(SdhciError::InvalidTransfer)?;
+        let mut negotiated_timing = MmcBusTiming::Normal;
+        let mut negotiated_clock_hz = host.clock_hz;
+        let mut negotiated_bus_width = 1;
         // upstream: mmc.c mmc_set_timing() SD high-speed subset
         if !mmc {
             if scr.is_some_and(|scr| scr.bus_widths & (1 << 2) != 0) {
                 mmc_set_card_bus_width(&mut host, false, rca, 4)?;
+                negotiated_bus_width = 4;
             }
             if csd_info.command_classes & (1 << 10) != 0
                 && host.capabilities & SDHCI_CAN_DO_HISPD != 0
@@ -2455,7 +2516,9 @@ impl<I: SdhciIo> SdhciDisk<I> {
                     if !sd_switch_selected_function(&switch_status, 1) {
                         return Err(SdhciError::Controller(u32::from(switch_status[16])));
                     }
-                    host.set_high_speed(host.base_clock_hz.min(50_000_000))?;
+                    negotiated_clock_hz = host.base_clock_hz.min(50_000_000);
+                    host.set_high_speed(negotiated_clock_hz)?;
+                    negotiated_timing = MmcBusTiming::HighSpeed;
                 }
             }
         }
@@ -2495,6 +2558,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
         }
         if mmc && high_capacity {
             let bus_width = mmc_test_bus_width(&mut host, rca);
+            negotiated_bus_width = bus_width;
             let ext = ext_csd.expect("EXT_CSD was read for high-capacity MMC");
             let card_type = ext.card_type;
             let has_180 = host.capabilities & SDHCI_CAN_VDD_180 != 0;
@@ -2555,6 +2619,12 @@ impl<I: SdhciIo> SdhciDisk<I> {
                     timing.0,
                 )?;
             }
+            negotiated_timing = timing.0;
+            negotiated_clock_hz = if timing.1 == 0 {
+                host.clock_hz
+            } else {
+                timing.1
+            };
             // PARTITION_CONFIG is intentionally retained for future boot/RPMB
             // child devices; the current registry exposes only user area.
             let _partition_config = ext_csd.map_or(0, |csd| csd.partition_config);
@@ -2563,6 +2633,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
         if host.clock_hz == 0 {
             let target = host.base_clock_hz.min(25_000_000);
             host.set_clock(target)?;
+            negotiated_clock_hz = target;
         }
         if host.io.has_interrupt() && host.io.interrupt_signal_usable() {
             let _ = host.set_interrupts_enabled(true);
@@ -2573,6 +2644,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
             decode_sd_cid(raw_cid)
         };
         let write_protected = host.card_write_protected();
+        let last_tune_ns = host.io.monotonic_time_ns();
         Ok(Self {
             host,
             rca,
@@ -2588,6 +2660,10 @@ impl<I: SdhciIo> SdhciDisk<I> {
             read_only: write_protected,
             cache_enabled,
             dirty: false,
+            timing: negotiated_timing,
+            timing_clock_hz: negotiated_clock_hz,
+            bus_width: negotiated_bus_width,
+            last_tune_ns,
         })
     }
 
@@ -2721,6 +2797,51 @@ impl<I: SdhciIo> SdhciDisk<I> {
         Err(SdhciError::Timeout)
     }
 
+    // upstream: mmc.c mmc_retune()
+    fn retune_if_needed(&mut self) -> Result<(), SdhciError> {
+        if !matches!(self.timing, MmcBusTiming::MmcHs200 | MmcBusTiming::MmcHs400) {
+            return Ok(());
+        }
+        let status = self.host.io.read32(SDHCI_INT_STATUS as usize);
+        if status != u32::MAX && status & SDHCI_INT_RETUNE != 0 {
+            self.host
+                .io
+                .write32(SDHCI_INT_STATUS as usize, SDHCI_INT_RETUNE);
+            self.host.retune_requested = true;
+        }
+        let requested = self.host.take_retune_request();
+        let now = self.host.io.monotonic_time_ns();
+        let periodic = retune_interval_seconds(self.host.capabilities2())
+            .zip(self.last_tune_ns)
+            .zip(now)
+            .is_some_and(|((seconds, last), now)| {
+                now.saturating_sub(last) >= seconds.saturating_mul(1_000_000_000)
+            });
+        if !requested && !periodic {
+            return Ok(());
+        }
+        if self.timing == MmcBusTiming::MmcHs400 {
+            retune_mmc_hs400_via_hs200(
+                &mut self.host,
+                self.rca,
+                self.bus_width,
+                self.timing_clock_hz,
+            )?;
+        } else {
+            self.host.execute_tuning(21, self.bus_width)?;
+        }
+        if self.timing == MmcBusTiming::MmcHs400 {
+            switch_mmc_to_hs400(
+                &mut self.host,
+                self.rca,
+                self.bus_width,
+                self.timing_clock_hz,
+            )?;
+        }
+        self.last_tune_ns = now.or(self.last_tune_ns);
+        Ok(())
+    }
+
     // upstream: mmcsd.c mmcsd_rw() CMD17/CMD18/CMD24/CMD25 block transaction
     fn transfer(&mut self, lba: u64, data: &mut [u8], write: bool) -> Result<(), SdhciError> {
         if data.is_empty()
@@ -2731,6 +2852,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
         {
             return Err(SdhciError::InvalidTransfer);
         }
+        self.retune_if_needed()?;
         if data.len() > 512 && !self.host.allows_multi_block() {
             for (index, sector) in data.chunks_exact_mut(512).enumerate() {
                 self.transfer(lba + index as u64, sector, write)?;
@@ -3116,6 +3238,7 @@ mod tests {
         data_blocks: u16,
         command_attempts: u8,
         failed_command_attempts: u8,
+        now_ns: u64,
     }
 
     impl Default for MockIo {
@@ -3130,6 +3253,7 @@ mod tests {
                 data_blocks: 0,
                 command_attempts: 0,
                 failed_command_attempts: 0,
+                now_ns: 0,
             }
         }
     }
@@ -3185,6 +3309,15 @@ mod tests {
                 }
                 return;
             }
+            if offset == SDHCI_HOST_CONTROL2 as usize {
+                let mut control = value;
+                if control & SDHCI_CTRL2_EXEC_TUNING as u16 != 0 {
+                    control &= !(SDHCI_CTRL2_EXEC_TUNING as u16);
+                    control |= SDHCI_CTRL2_SAMPLING_CLOCK as u16;
+                }
+                self.registers[offset / 4] = u32::from(control) << ((offset % 4) * 8);
+                return;
+            }
             if offset == SDHCI_BLOCK_COUNT as usize {
                 self.block_count = value;
             }
@@ -3213,6 +3346,10 @@ mod tests {
             }
         }
         fn delay_us(&mut self, _: u32) {}
+
+        fn monotonic_time_ns(&self) -> Option<u64> {
+            Some(self.now_ns)
+        }
     }
 
     #[test]
@@ -3263,6 +3400,98 @@ mod tests {
             tuning_interrupt_mask(true, 3),
             SDHCI_INT_TUNEERR | SDHCI_INT_RETUNE
         );
+    }
+
+    #[test]
+    fn retune_interval_uses_spec_count_and_only_mode_one() {
+        let count = |n: u32| n << SDHCI_RETUNE_CNT_SHIFT;
+        assert_eq!(retune_interval_seconds(count(1)), Some(1));
+        assert_eq!(retune_interval_seconds(count(4)), Some(8));
+        assert_eq!(retune_interval_seconds(count(12)), Some(1));
+        assert_eq!(
+            retune_interval_seconds(count(3) | (SDHCI_RETUNE_MODE_2 << SDHCI_RETUNE_MODES_SHIFT)),
+            None
+        );
+    }
+
+    #[test]
+    fn retune_interrupt_is_latched_for_card_level_retuning() {
+        let mut io = MockIo::default();
+        io.registers[SDHCI_INT_STATUS as usize / 4] = SDHCI_INT_RETUNE;
+        let mut host = SdhciHost::new(io, 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+        assert_eq!(host.interrupt_status(), 0);
+        assert!(host.take_retune_request());
+        assert!(!host.take_retune_request());
+    }
+
+    #[test]
+    fn mode_one_retunes_hs200_with_cmd21_before_io() {
+        let mut io = MockIo::default();
+        io.now_ns = 2_000_000_000;
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
+        let capabilities = 50 << SDHCI_CLOCK_BASE_SHIFT;
+        let capabilities2 = SDHCI_CAN_SDR104 | (1 << SDHCI_RETUNE_CNT_SHIFT);
+        let host = SdhciHost::new(io, capabilities, capabilities2, SDHCI_SPEC_300 as u8);
+        let mut disk = SdhciDisk {
+            host,
+            rca: 1,
+            cid: MmcCid::default(),
+            csd: MmcCsd::default(),
+            scr: None,
+            sd_status: None,
+            sectors: 16,
+            high_capacity: true,
+            erase_group_sectors: 1,
+            ext_csd: None,
+            active_partition: 0,
+            read_only: false,
+            cache_enabled: false,
+            dirty: false,
+            timing: MmcBusTiming::MmcHs200,
+            timing_clock_hz: 50_000_000,
+            bus_width: 4,
+            last_tune_ns: Some(0),
+        };
+        disk.retune_if_needed().unwrap();
+        assert_eq!(disk.host.io.command >> 8, 21);
+        assert_eq!(disk.last_tune_ns, Some(2_000_000_000));
+    }
+
+    #[test]
+    fn hs400_retune_uses_hs200_tuning_then_restores_ddr8_mode() {
+        let mut io = MockIo::default();
+        io.now_ns = 2_000_000_000;
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
+        let capabilities = (50 << SDHCI_CLOCK_BASE_SHIFT) | SDHCI_CAN_DO_HISPD;
+        let capabilities2 = SDHCI_CAN_SDR104 | SDHCI_CAN_MMC_HS400 | (1 << SDHCI_RETUNE_CNT_SHIFT);
+        let host = SdhciHost::new(io, capabilities, capabilities2, SDHCI_SPEC_300 as u8);
+        let mut disk = SdhciDisk {
+            host,
+            rca: 1,
+            cid: MmcCid::default(),
+            csd: MmcCsd::default(),
+            scr: None,
+            sd_status: None,
+            sectors: 16,
+            high_capacity: true,
+            erase_group_sectors: 1,
+            ext_csd: None,
+            active_partition: 0,
+            read_only: false,
+            cache_enabled: false,
+            dirty: false,
+            timing: MmcBusTiming::MmcHs400,
+            timing_clock_hz: 50_000_000,
+            bus_width: 8,
+            last_tune_ns: Some(0),
+        };
+        disk.retune_if_needed().unwrap();
+        assert_eq!(disk.host.io.command >> 8, MMC_CMD_SWITCH as u16);
+        assert_eq!(
+            disk.host.io.read16(SDHCI_HOST_CONTROL2 as usize) as u32 & SDHCI_CTRL2_UHS_MASK,
+            SDHCI_CTRL2_MMC_HS400
+        );
+        assert_eq!(disk.last_tune_ns, Some(2_000_000_000));
     }
 
     #[test]
@@ -3943,6 +4172,10 @@ mod tests {
             read_only: true,
             cache_enabled: false,
             dirty: false,
+            timing: MmcBusTiming::Normal,
+            timing_clock_hz: 0,
+            bus_width: 1,
+            last_tune_ns: None,
         };
         assert!(crate::BlockDriverOps::is_read_only(&disk));
         assert!(matches!(
@@ -3979,6 +4212,10 @@ mod tests {
             read_only: false,
             cache_enabled: false,
             dirty: false,
+            timing: MmcBusTiming::Normal,
+            timing_clock_hz: 0,
+            bus_width: 1,
+            last_tune_ns: None,
         };
         let areas = disk.into_partition_devices(true, 0);
         assert_eq!(areas.len(), 3);
@@ -4009,6 +4246,10 @@ mod tests {
             read_only: false,
             cache_enabled: true,
             dirty: true,
+            timing: MmcBusTiming::Normal,
+            timing_clock_hz: 0,
+            bus_width: 1,
+            last_tune_ns: None,
         };
         disk.flush_cache().unwrap();
         assert!(!disk.dirty);
@@ -4040,6 +4281,10 @@ mod tests {
             read_only: false,
             cache_enabled: false,
             dirty: false,
+            timing: MmcBusTiming::Normal,
+            timing_clock_hz: 0,
+            bus_width: 1,
+            last_tune_ns: None,
         };
         assert_eq!(disk.wait_ready(), Err(SdhciError::Controller(1 << 22)));
     }

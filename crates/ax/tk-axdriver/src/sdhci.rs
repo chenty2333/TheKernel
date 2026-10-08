@@ -360,6 +360,10 @@ impl SdhciIo for SdhciWindow {
         axhal::time::busy_wait(core::time::Duration::from_micros(u64::from(micros)));
     }
 
+    fn monotonic_time_ns(&self) -> Option<u64> {
+        Some(axhal::time::monotonic_time_nanos())
+    }
+
     fn has_interrupt(&self) -> bool {
         self.irq.is_some()
     }
