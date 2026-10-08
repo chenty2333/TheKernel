@@ -123,6 +123,11 @@ pub const SDHCI_POWER_ON: u32 = 0x01;
 pub const SDHCI_POWER_180: u32 = 0x0A;
 pub const SDHCI_POWER_300: u32 = 0x0C;
 pub const SDHCI_POWER_330: u32 = 0x0E;
+const MMC_OCR_LOW_VOLTAGE: u32 = 1 << 7;
+const MMC_OCR_290_300: u32 = 1 << 17;
+const MMC_OCR_300_310: u32 = 1 << 18;
+const MMC_OCR_320_330: u32 = 1 << 20;
+const MMC_OCR_330_340: u32 = 1 << 21;
 pub const SDHCI_BLOCK_GAP_CONTROL: u32 = 0x2A;
 pub const SDHCI_WAKE_UP_CONTROL: u32 = 0x2B;
 pub const SDHCI_CLOCK_CONTROL: u32 = 0x2C;
@@ -399,6 +404,7 @@ pub struct SdhciHost<I: SdhciIo> {
     version: u8,
     base_clock_hz: u32,
     clock_hz: u32,
+    power: u32,
     quirks: u32,
     dma: Option<SdhciDmaRegion>,
     dma_inflight: bool,
@@ -426,6 +432,7 @@ impl<I: SdhciIo> SdhciHost<I> {
             version,
             base_clock_hz: base_mhz * 1_000_000,
             clock_hz: 0,
+            power: 0,
             quirks,
             dma: None,
             dma_inflight: false,
@@ -604,15 +611,7 @@ impl<I: SdhciIo> SdhciHost<I> {
                 log::warn!("sdhci: host reset failed: {error:?}");
             })?;
         }
-        if self.quirks & SDHCI_QUIRK_INTEL_POWER_UP_RESET != 0 {
-            self.reset(SDHCI_RESET_ALL as u8).inspect_err(|error| {
-                log::warn!("sdhci: Intel power-up reset failed: {error:?}");
-            })?;
-        }
-        self.io.write8(
-            SDHCI_POWER_CONTROL as usize,
-            (SDHCI_POWER_330 | SDHCI_POWER_ON) as u8,
-        );
+        self.set_power(MMC_OCR_330_340)?;
         self.set_clock(400_000).inspect_err(|error| {
             log::warn!("sdhci: initial 400kHz clock failed: {error:?}");
         })?;
@@ -696,6 +695,48 @@ impl<I: SdhciIo> SdhciHost<I> {
             self.io.delay_us(10);
         }
         Err(SdhciError::Timeout)
+    }
+
+    // upstream: sdhci.c sdhci_set_power()
+    fn set_power(&mut self, power: u32) -> Result<(), SdhciError> {
+        if self.power == power {
+            return Ok(());
+        }
+        self.io.write8(SDHCI_POWER_CONTROL as usize, 0);
+        if power == 0 {
+            self.power = 0;
+            return Ok(());
+        }
+        let voltage = match power {
+            MMC_OCR_LOW_VOLTAGE => SDHCI_POWER_180,
+            MMC_OCR_290_300 | MMC_OCR_300_310 => SDHCI_POWER_300,
+            MMC_OCR_320_330 | MMC_OCR_330_340 => SDHCI_POWER_330,
+            _ => return Err(SdhciError::UnsupportedClock),
+        } as u8;
+        self.power = power;
+        self.io.write8(SDHCI_POWER_CONTROL as usize, voltage);
+        let power_control = voltage | SDHCI_POWER_ON as u8;
+        let mut enabled = false;
+        for _ in 0..20 {
+            self.io.write8(SDHCI_POWER_CONTROL as usize, power_control);
+            if self.io.read8(SDHCI_POWER_CONTROL as usize) & SDHCI_POWER_ON as u8 != 0 {
+                enabled = true;
+                break;
+            }
+            self.io.delay_us(100);
+        }
+        if !enabled {
+            log::warn!("sdhci: bus power failed to enable");
+        }
+        if self.quirks & SDHCI_QUIRK_INTEL_POWER_UP_RESET != 0 {
+            self.io
+                .write8(SDHCI_POWER_CONTROL as usize, power_control | 0x10);
+            self.io.delay_us(10);
+            self.io
+                .write8(SDHCI_POWER_CONTROL as usize, power_control);
+            self.io.delay_us(300);
+        }
+        Ok(())
     }
 
     fn wait_status(&mut self, mask: u32) -> Result<u32, SdhciError> {
@@ -1932,6 +1973,18 @@ mod tests {
         assert_eq!(SDHCI_CAPABILITIES2, 0x44);
         assert_eq!(SDHCI_INT_CMD_MASK, 0x000f_0001);
         assert_eq!(SDHCI_SLOTTYPE_MASK, 0xc000_0000);
+    }
+
+    #[test]
+    fn set_power_uses_ocr_voltage_and_preserves_enable_handshake() {
+        let mut host = SdhciHost::new(MockIo::default(), 0, 0, SDHCI_SPEC_300 as u8);
+        host.set_power(MMC_OCR_330_340).unwrap();
+        assert_eq!(
+            host.io.read8(SDHCI_POWER_CONTROL as usize),
+            (SDHCI_POWER_330 | SDHCI_POWER_ON) as u8
+        );
+        host.set_power(0).unwrap();
+        assert_eq!(host.io.read8(SDHCI_POWER_CONTROL as usize), 0);
     }
 
     #[test]
