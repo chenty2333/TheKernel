@@ -5,7 +5,7 @@
 //! Copyright (c) 2008 Alexander Motin <mav@FreeBSD.org>.
 //! SPDX-License-Identifier: BSD-2-Clause
 
-use alloc::sync::Arc;
+use alloc::{format, string::String, sync::Arc};
 use core::{
     ptr::NonNull,
     sync::atomic::{Ordering, fence},
@@ -380,6 +380,39 @@ pub struct MmcCid {
     pub serial_number: u32,
     pub manufacturing_year: u16,
     pub manufacturing_month: u8,
+}
+
+/// Format the upstream MMC card ID and serial strings used by mmcsd.
+// upstream: mmc.c mmc_format_card_id_string()
+pub fn format_card_id(cid: MmcCid, mmc: bool, high_capacity: bool) -> (String, String) {
+    let oid = if cid.oem_id <= u16::from(u8::MAX) {
+        format!("0x{:04x}", cid.oem_id)
+    } else {
+        let high = (cid.oem_id >> 8) as u8;
+        let low = cid.oem_id as u8;
+        if (0x20..0x7f).contains(&high) && (0x20..0x7f).contains(&low) {
+            format!("{}{}", high as char, low as char)
+        } else {
+            format!("0x{:04x}", cid.oem_id)
+        }
+    };
+    let product_end = if mmc { 6 } else { 5 };
+    let product: String = cid.product_name[..product_end]
+        .iter()
+        .map(|byte| if byte.is_ascii_graphic() { *byte as char } else { '?' })
+        .collect();
+    let card_type = if mmc { "MMC" } else { "SD" };
+    let capacity = if high_capacity { "HC" } else { "" };
+    let id = format!(
+        "{card_type}{capacity} {product} {}.{} SN {:08X} MFG {:02}/{:04} by {} {oid}",
+        cid.product_revision >> 4,
+        cid.product_revision & 0x0f,
+        cid.serial_number,
+        cid.manufacturing_month,
+        cid.manufacturing_year,
+        cid.manufacturer_id,
+    );
+    (id, format!("{:08X}", cid.serial_number))
 }
 
 // upstream: mmc.c mmc_read_ext_csd() decoding
@@ -2063,6 +2096,22 @@ mod tests {
         assert_eq!(mmc.oem_id, 0x56);
         assert_eq!(&mmc.product_name, b"ABCDEF");
         assert_eq!(mmc.manufacturing_year, 2016);
+    }
+
+    #[test]
+    fn card_identity_strings_match_mmcsd_format() {
+        let cid = MmcCid {
+            manufacturer_id: 3,
+            oem_id: u16::from_be_bytes(*b"TN"),
+            product_name: *b"SD01G\0",
+            product_revision: 0x80,
+            serial_number: 0x0028_f959,
+            manufacturing_year: 2008,
+            manufacturing_month: 8,
+        };
+        let (id, serial) = format_card_id(cid, false, false);
+        assert_eq!(id, "SD SD01G 8.0 SN 0028F959 MFG 08/2008 by 3 TN");
+        assert_eq!(serial, "0028F959");
     }
 
     #[test]
