@@ -233,6 +233,8 @@ struct Owner {
     ads_memory: Option<copy::AdsDmaMemory>,
     // GuC log state/data VMA retained while GuC can write or read it.
     log_memory: Option<copy::LogDmaMemory>,
+    // Preallocated GuC error-capture output/cache nodes, reused after coredumps.
+    capture_nodes: Option<intel_gt::guc_capture::CaptureNodeCache>,
     // GuC CTB buffers/descriptor VMA retained while GuC may reference it.
     ct_memory: Option<copy::CtDmaMemory>,
 }
@@ -497,6 +499,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
             uc_memory: None,
             ads_memory: None,
             log_memory: None,
+            capture_nodes: None,
             ct_memory: None,
         });
         return Err(format!(
@@ -524,6 +527,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 uc_memory: None,
                 ads_memory: None,
                 log_memory: None,
+                capture_nodes: None,
                 ct_memory: None,
             };
             let copied = copy::run(&mut device, bdf).and_then(|()| {
@@ -575,6 +579,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 uc_memory: None,
                 ads_memory: None,
                 log_memory: None,
+                capture_nodes: None,
                 ct_memory: None,
             });
             Err(format!(

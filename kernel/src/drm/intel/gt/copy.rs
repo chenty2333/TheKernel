@@ -507,6 +507,8 @@ impl LogDmaMemory {
         let mut zeroes = Vec::new();
         zeroes.try_reserve_exact(size).map_err(|_| Error::Refused)?;
         zeroes.resize(size, 0);
+        let capture_nodes =
+            intel_gt::guc_capture::CaptureNodeCache::new_upstream().map_err(|_| Error::Refused)?;
         let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
         let ram = Ram::allocate(pages)?;
         let binding = gtt
@@ -555,6 +557,7 @@ impl LogDmaMemory {
             config,
             registered: false,
         });
+        owner.capture_nodes = Some(capture_nodes);
         Ok(())
     }
 
@@ -676,13 +679,55 @@ pub(super) fn handle_guc_capture_notification(
         .as_mut()
         .ok_or(Error::Refused)?
         .drain_capture_log(stats, reset_in_progress)?;
+    let mut cache_error = false;
+    if let Some(cache) = owner.capture_nodes.as_mut() {
+        for group in &result.groups {
+            if cache.process_group(group).is_err() {
+                cache_error = true;
+                break;
+            }
+        }
+    } else if !result.groups.is_empty() {
+        cache_error = true;
+    }
+    // As upstream, acknowledge the buffer even when a group could not be
+    // parsed/retained so GuC does not remain blocked on the flush handshake.
     owner
         .ct_memory
         .as_mut()
         .ok_or(Error::Quarantined)?
         .send_capture_flush_complete(&owner.bus)
         .map_err(|_| Error::Quarantined)?;
+    if cache_error {
+        return Err(Error::Quarantined);
+    }
+    if result.parse_error.is_some() {
+        axlog::warn!("intel-gt: GuC capture log contained a malformed record");
+    }
     Ok(result)
+}
+
+#[cfg(target_os = "none")]
+pub(super) fn take_guc_capture_node(
+    owner: &mut super::Owner,
+    engine_guc_id: u32,
+    context_guc_id: u32,
+    context_lrca: u32,
+) -> Option<intel_gt::guc_capture::PooledCaptureNode> {
+    owner
+        .capture_nodes
+        .as_mut()?
+        .take_matching_node(engine_guc_id, context_guc_id, context_lrca)
+}
+
+#[cfg(target_os = "none")]
+pub(super) fn recycle_guc_capture_node(
+    owner: &mut super::Owner,
+    node: intel_gt::guc_capture::PooledCaptureNode,
+) {
+    if let Some(cache) = owner.capture_nodes.as_mut() {
+        cache.recycle_node(node);
+    }
 }
 
 #[cfg(target_os = "none")]
