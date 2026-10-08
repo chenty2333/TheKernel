@@ -42,8 +42,10 @@ pub use apm::{
     set_hw_ready, software_reset, start_hardware,
 };
 pub use bringup::{
-    FIRMWARE_ALIVE_TIMEOUT_NS, FirmwareLoadError, InitFirmwareError, InitFirmwareState,
-    UcodeStartError, load_firmware, load_ucode_wait_alive, run_init_mvm,
+    FIRMWARE_ALIVE_TIMEOUT_NS, FW_COMMAND_VERSION_UNKNOWN, FirmwareLoadError, InitFirmwareError,
+    InitFirmwareState, LONG_GROUP as FIRMWARE_LONG_GROUP, PostAliveState, TX_COMMAND_OPCODE,
+    UcodeStartError, load_firmware, load_ucode_wait_alive, post_alive, rate_n_flags_version,
+    run_init_mvm,
 };
 pub use channel::{
     CHAN_2GHZ, CHAN_40MHZ, CHAN_A, CHAN_CCK, CHAN_DYN, CHAN_HT, CHAN_OFDM, CHAN_PASSIVE, CHAN_VHT,
@@ -108,9 +110,9 @@ pub use queue::{
     legacy_queue_command, queue_cb_size, scheduler_queue_command, validate_enable_response,
 };
 pub use rate::{
-    MCS_TO_RATE_INDEX, RATES, Rate, TX_FLAG_COMMAND_RATE, TX_FLAG_HIGH_PRIORITY, TxRateError,
-    TxRateInput, TxRateSelection, fw_rate_index_cck, fw_rate_index_ofdm, rate_value_to_index,
-    select_tx_rate,
+    HtRateSet, MCS_TO_RATE_INDEX, RATES, Rate, TX_FLAG_COMMAND_RATE, TX_FLAG_HIGH_PRIORITY,
+    TxRateError, TxRateInput, TxRateSelection, fw_rate_index_cck, fw_rate_index_ofdm,
+    rate_value_to_index, rateset_11g_index, rateset_ht_bitmap, rateset_vht_bitmap, select_tx_rate,
 };
 pub use registers::{CsrAccess, DeviceFamily, IoBarrier, IwxRegisters, RegisterError};
 pub use rings::{

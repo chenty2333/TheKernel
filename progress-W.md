@@ -17,4 +17,5 @@
 - RX event switch: core receive/ALIVE/init/scan/PNVM/TX/BA events and source-known direct command replies now route into command response storage/ACK state.
 - Firmware notification decoding: ALIVE v4-v7 layout/status/SKU extraction committed with the current scan/event slice.
 - Scan lifecycle: abort UMAC command and foreground/background scan flag/state ordering translated; full scan request builders remain.
+- Rate adaptation: 11g rate lookup and peer/local HT/VHT RX bitmap intersection are translated; TLC config command packing remains.
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.

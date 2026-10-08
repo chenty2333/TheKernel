@@ -181,6 +181,61 @@ pub enum TxRateError {
     InvalidBasicRate,
     InvalidPeerRate,
     InvalidMcs,
+    InvalidSpatialStream,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HtRateSet {
+    Siso,
+    Mimo2,
+}
+
+/// Map an advertised 11g rate value to the standard 11g rateset index.
+// upstream: if_iwx.c iwx_rs_rval2idx()
+pub fn rateset_11g_index(rate: u8) -> Option<usize> {
+    [2u8, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108]
+        .iter()
+        .position(|candidate| *candidate == rate)
+}
+
+/// Build the RX MCS bitmap supported by both peer and local 11n ratesets.
+// upstream: if_iwx.c iwx_rs_ht_rates()
+pub fn rateset_ht_bitmap(peer_rx_mcs: u16, local_supported_mcs: u16, set: HtRateSet) -> u16 {
+    let (minimum, maximum) = match set {
+        HtRateSet::Siso => (0, 7),
+        HtRateSet::Mimo2 => (8, 15),
+    };
+    let mut bitmap = 0u16;
+    for mcs in minimum..=maximum {
+        if peer_rx_mcs & (1 << mcs) == 0 || local_supported_mcs & (1 << mcs) == 0 {
+            continue;
+        }
+        bitmap |= 1 << (mcs - minimum);
+    }
+    bitmap
+}
+
+/// Build the VHT receive-MCS bitmap for one spatial stream.
+// upstream: if_iwx.c iwx_rs_vht_rates()
+pub fn rateset_vht_bitmap(
+    peer_mcs_map: u16,
+    spatial_stream: u8,
+    supports_40mhz: bool,
+) -> Result<u16, TxRateError> {
+    if !(1..=8).contains(&spatial_stream) {
+        return Err(TxRateError::InvalidSpatialStream);
+    }
+    let shift = u32::from(spatial_stream - 1) * 2;
+    let rx_mcs = (peer_mcs_map >> shift) & 0x3;
+    let max_mcs = match rx_mcs {
+        0 => 7,
+        1 => 8,
+        2 if supports_40mhz => 9,
+        2 => 8,
+        3 => return Ok(0),
+        _ => return Err(TxRateError::InvalidMcs),
+    };
+    Ok(((1u16 << (max_mcs + 1)) - 1) & 0x03ff)
 }
 
 /// Select firmware rate and flags for management, multicast, or data TX.
@@ -311,5 +366,21 @@ mod tests {
         let selected = select_tx_rate(input).unwrap();
         assert_eq!(selected.rate_index, 4);
         assert_eq!(selected.rate_n_flags, 0);
+    }
+
+    #[test]
+    fn tx_rate_adaptation_maps_11g_ht_and_vht_receive_capabilities() {
+        assert_eq!(rateset_11g_index(12), Some(4));
+        assert_eq!(rateset_11g_index(0), None);
+        assert_eq!(rateset_ht_bitmap(0xffff, 0x00f5, HtRateSet::Siso), 0xf5);
+        assert_eq!(rateset_ht_bitmap(0xffff, 0x8500, HtRateSet::Mimo2), 0x85);
+        assert_eq!(rateset_vht_bitmap(0b10, 1, true), Ok(0x03ff));
+        assert_eq!(rateset_vht_bitmap(0b10, 1, false), Ok(0x01ff));
+        assert_eq!(rateset_vht_bitmap(0b01, 1, true), Ok(0x01ff));
+        assert_eq!(rateset_vht_bitmap(0b11, 1, true), Ok(0));
+        assert_eq!(
+            rateset_vht_bitmap(0, 0, true),
+            Err(TxRateError::InvalidSpatialStream)
+        );
     }
 }
