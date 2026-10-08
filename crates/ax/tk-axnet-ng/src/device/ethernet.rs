@@ -641,6 +641,20 @@ impl Device for EthernetDevice {
         self.inner.set_link_up(up).map_err(Self::map_dev_error)
     }
 
+    fn is_wireless(&self) -> bool {
+        self.inner.is_wireless()
+    }
+
+    fn rfkill_soft_blocked(&self) -> bool {
+        self.inner.rfkill_soft_blocked()
+    }
+
+    fn set_rfkill_soft_blocked(&mut self, blocked: bool) -> AxResult {
+        self.inner
+            .set_rfkill_soft_blocked(blocked)
+            .map_err(Self::map_dev_error)
+    }
+
     fn has_rx_backlog(&self) -> bool {
         !self.quarantined && self.inner.can_receive()
     }

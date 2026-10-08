@@ -191,6 +191,8 @@ struct AttachedDevice {
     nvm: Option<NvmInfo>,
     preinit: Option<PreinitPlan>,
     runtime_started: bool,
+    interface_up: bool,
+    soft_blocked: bool,
 }
 
 #[derive(Debug)]
@@ -224,6 +226,7 @@ pub enum RuntimeStartError {
     Nic,
     Firmware,
     ManagementQueue,
+    SoftBlocked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,17 +283,41 @@ impl NetDriverOps for IwxNetDevice {
             .is_none_or(|device| device.controller.hardware_rfkill)
     }
 
+    fn rfkill_soft_blocked(&self) -> bool {
+        ATTACHED_DMA
+            .lock()
+            .iter()
+            .find(|device| device.bdf == self.bdf)
+            .is_none_or(|device| device.soft_blocked)
+    }
+
+    fn set_rfkill_soft_blocked(&mut self, blocked: bool) -> DevResult {
+        set_soft_blocked(self.bdf, blocked).map_err(|_| DevError::BadState)
+    }
+
     fn set_link_up(&mut self, up: bool) -> DevResult {
         let bdf = DeviceFunction {
             bus: self.bdf.0,
             device: self.bdf.1,
             function: self.bdf.2,
         };
-        if up {
-            start_runtime(bdf).map_err(|_| DevError::BadState)
-        } else {
-            stop_runtime(bdf).map_err(|_| DevError::Io)
+        let soft_blocked = ATTACHED_DMA
+            .lock()
+            .iter()
+            .find(|device| device.bdf == self.bdf)
+            .is_none_or(|device| device.soft_blocked);
+        if up && !soft_blocked {
+            start_runtime(bdf).map_err(|_| DevError::BadState)?;
+        } else if !up {
+            stop_runtime(bdf).map_err(|_| DevError::Io)?;
         }
+        let mut devices = ATTACHED_DMA.lock();
+        let device = devices
+            .iter_mut()
+            .find(|device| device.bdf == self.bdf)
+            .ok_or(DevError::BadState)?;
+        device.interface_up = up;
+        Ok(())
     }
 
     fn mac_address(&self) -> EthernetAddress {
@@ -436,6 +463,8 @@ fn allocate_resources(
         nvm: None,
         preinit: None,
         runtime_started: false,
+        interface_up: false,
+        soft_blocked: false,
     });
     Ok(())
 }
@@ -707,6 +736,9 @@ pub fn start_runtime(bdf: DeviceFunction) -> Result<(), RuntimeStartError> {
     if device.runtime_started {
         return Err(RuntimeStartError::AlreadyStarted);
     }
+    if device.soft_blocked {
+        return Err(RuntimeStartError::SoftBlocked);
+    }
     let Some(Ok(bundle)) = device.firmware.as_ref() else {
         return Err(RuntimeStartError::FirmwareNotReady);
     };
@@ -747,6 +779,62 @@ pub fn stop_runtime(bdf: DeviceFunction) -> Result<(), RuntimeStartError> {
         .stop_device()
         .map_err(|_| RuntimeStartError::Hardware)?;
     device.runtime_started = false;
+    Ok(())
+}
+
+fn set_soft_blocked(bdf: Bdf, blocked: bool) -> Result<(), RuntimeStartError> {
+    let (old, running, interface_up) = {
+        let devices = ATTACHED_DMA.lock();
+        let device = devices
+            .iter()
+            .find(|device| device.bdf == bdf)
+            .ok_or(RuntimeStartError::DeviceNotFound)?;
+        (
+            device.soft_blocked,
+            device.runtime_started,
+            device.interface_up,
+        )
+    };
+    if old == blocked {
+        return Ok(());
+    }
+    let address = DeviceFunction {
+        bus: bdf.0,
+        device: bdf.1,
+        function: bdf.2,
+    };
+    if blocked {
+        if running {
+            stop_runtime(address)?;
+        }
+        let mut devices = ATTACHED_DMA.lock();
+        devices
+            .iter_mut()
+            .find(|device| device.bdf == bdf)
+            .ok_or(RuntimeStartError::DeviceNotFound)?
+            .soft_blocked = true;
+        return Ok(());
+    }
+    {
+        let mut devices = ATTACHED_DMA.lock();
+        devices
+            .iter_mut()
+            .find(|device| device.bdf == bdf)
+            .ok_or(RuntimeStartError::DeviceNotFound)?
+            .soft_blocked = false;
+    }
+    if interface_up {
+        if let Err(error) = start_runtime(address) {
+            if let Some(device) = ATTACHED_DMA
+                .lock()
+                .iter_mut()
+                .find(|device| device.bdf == bdf)
+            {
+                device.soft_blocked = true;
+            }
+            return Err(error);
+        }
+    }
     Ok(())
 }
 

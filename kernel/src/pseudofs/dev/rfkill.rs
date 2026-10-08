@@ -9,6 +9,7 @@ use crate::pseudofs::DeviceOps;
 const RFKILL_EVENT_BYTES: usize = 8;
 const RFKILL_TYPE_WLAN: u8 = 1;
 const RFKILL_OP_ADD: u8 = 0;
+const RFKILL_OP_CHANGE: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RfkillEvent {
@@ -22,9 +23,26 @@ struct RfkillEvent {
 fn encode_event(event: RfkillEvent) -> [u8; RFKILL_EVENT_BYTES] {
     let index = event.index.to_ne_bytes();
     [
-        index[0], index[1], index[2], index[3], event.kind, event.operation, event.soft,
+        index[0],
+        index[1],
+        index[2],
+        index[3],
+        event.kind,
+        event.operation,
+        event.soft,
         event.hard,
     ]
+}
+
+fn decode_change_event(bytes: &[u8]) -> Result<(u32, bool), VfsError> {
+    if bytes.len() != RFKILL_EVENT_BYTES {
+        return Err(VfsError::InvalidInput);
+    }
+    let index = u32::from_ne_bytes(bytes[..4].try_into().map_err(|_| VfsError::InvalidInput)?);
+    if bytes[4] != RFKILL_TYPE_WLAN || bytes[5] != RFKILL_OP_CHANGE || bytes[6] > 1 {
+        return Err(VfsError::OperationNotSupported);
+    }
+    Ok((index, bytes[6] != 0))
 }
 
 pub(crate) struct Rfkill;
@@ -46,7 +64,7 @@ impl DeviceOps for Rfkill {
                 break;
             };
             let event = encode_event(RfkillEvent {
-                index: interface.ifindex,
+                index: interface.rfkill_index,
                 kind: RFKILL_TYPE_WLAN,
                 operation: RFKILL_OP_ADD,
                 soft: u8::from(interface.soft_blocked),
@@ -59,10 +77,14 @@ impl DeviceOps for Rfkill {
         Ok(written)
     }
 
-    fn write_at(&self, _input: &[u8], _offset: u64) -> VfsResult<usize> {
-        // State changes are not accepted until the wireless adapter can
-        // serialize an rfkill transition with its hardware bring-up path.
-        Err(VfsError::OperationNotSupported)
+    fn write_at(&self, input: &[u8], offset: u64) -> VfsResult<usize> {
+        if !offset.is_multiple_of(RFKILL_EVENT_BYTES as u64) {
+            return Err(VfsError::InvalidInput);
+        }
+        let (index, blocked) = decode_change_event(input)?;
+        axnet::set_wireless_rfkill_soft_blocked(index, blocked)
+            .map_err(|_| VfsError::OperationNotSupported)?;
+        Ok(RFKILL_EVENT_BYTES)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -89,5 +111,24 @@ mod tests {
         });
         assert_eq!(&event[..4], &0x1234_5678u32.to_ne_bytes());
         assert_eq!(&event[4..], &[RFKILL_TYPE_WLAN, RFKILL_OP_ADD, 1, 0]);
+    }
+
+    #[test]
+    fn rfkill_write_accepts_only_indexed_wlan_change_records() {
+        let mut event = [0u8; RFKILL_EVENT_BYTES];
+        event[..4].copy_from_slice(&7u32.to_ne_bytes());
+        event[4] = RFKILL_TYPE_WLAN;
+        event[5] = RFKILL_OP_CHANGE;
+        event[6] = 1;
+        assert_eq!(decode_change_event(&event), Ok((7, true)));
+        event[5] = RFKILL_OP_ADD;
+        assert_eq!(
+            decode_change_event(&event),
+            Err(VfsError::OperationNotSupported)
+        );
+        assert_eq!(
+            decode_change_event(&event[..7]),
+            Err(VfsError::InvalidInput)
+        );
     }
 }

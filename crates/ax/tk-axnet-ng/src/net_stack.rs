@@ -1396,6 +1396,18 @@ impl NetStack {
         Ok(())
     }
 
+    /// Apply a Linux rfkill software block through the owning wireless driver.
+    pub fn set_wireless_rfkill_soft_blocked(&self, ifindex: u32, blocked: bool) -> AxResult {
+        {
+            let mut service = self.service.lock();
+            service
+                .router
+                .set_wireless_rfkill_soft_blocked(ifindex, blocked)?;
+        }
+        self.poll_source.as_ref().wake();
+        Ok(())
+    }
+
     /// Subscribes a bounded link-packet endpoint to this network namespace.
     pub fn subscribe_packets(&self, selector: PacketSelector) -> PacketResult<Arc<PacketEndpoint>> {
         self.packet_broker.subscribe(selector)

@@ -211,9 +211,12 @@ must still provide the actual RX/TX and link-up implementation before a WLAN
 adapter is usable.
 The init-net wireless registry now backs `/sys/class/net/<wlan>/wireless`,
 `/sys/class/ieee80211/phyN/{index,macaddress}`, and a Linux-layout `/dev/rfkill`
-read stream that reports one WLAN ADD event per published wireless link.
-The current rfkill device is observational: writes remain unsupported until
-the adapter can atomically apply software-block transitions to hardware.
+read stream that reports one WLAN ADD record per published radio (using a
+radio index distinct from the netdev ifindex). CHANGE writes for indexed WLAN
+records now update the registry and stop/restart iwx firmware while the network-service lock serializes radio
+and netdev administrative transitions. Reads still expose the current ADD snapshot rather than a
+per-open asynchronous CHANGE event journal; this remains a minimal rfkill
+implementation, not the complete Linux event stream.
 
 The retained controller now offers a queue-validated raw-MPDU transmit entry
 that copies upper-layer payload bytes into DMA-owned storage, serializes the

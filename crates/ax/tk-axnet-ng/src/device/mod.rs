@@ -230,6 +230,18 @@ pub trait Device: Send + Sync {
         Ok(())
     }
 
+    fn is_wireless(&self) -> bool {
+        false
+    }
+
+    fn rfkill_soft_blocked(&self) -> bool {
+        false
+    }
+
+    fn set_rfkill_soft_blocked(&mut self, _blocked: bool) -> AxResult {
+        Err(AxError::OperationNotSupported)
+    }
+
     fn hardware_address(&self) -> Option<[u8; 6]> {
         None
     }

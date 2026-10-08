@@ -95,6 +95,7 @@ pub struct WirelessInterfaceInfo {
     pub name: alloc::string::String,
     pub ifindex: u32,
     pub phy_index: u32,
+    pub rfkill_index: u32,
     pub mac_address: [u8; 6],
     pub soft_blocked: bool,
     pub hard_blocked: bool,
@@ -252,10 +253,21 @@ pub fn register_wireless_device(dev: AxNetDevice) -> AxResult<u32> {
         let _ = stack.remove_device(ifindex);
         return Err(AxError::NoMemory);
     }
+    let phy_index = match interfaces.iter().map(|entry| entry.phy_index).max() {
+        Some(index) => match index.checked_add(1) {
+            Some(next) => next,
+            None => {
+                let _ = stack.remove_device(ifindex);
+                return Err(AxError::ResourceBusy);
+            }
+        },
+        None => 0,
+    };
     interfaces.push(WirelessInterfaceInfo {
         name: name.to_owned(),
         ifindex,
-        phy_index: 0,
+        phy_index,
+        rfkill_index: phy_index,
         mac_address,
         soft_blocked,
         hard_blocked,
@@ -266,6 +278,24 @@ pub fn register_wireless_device(dev: AxNetDevice) -> AxResult<u32> {
 /// Snapshot the wireless links published to init-net.
 pub fn wireless_interfaces() -> alloc::vec::Vec<WirelessInterfaceInfo> {
     WIRELESS_INTERFACES.lock().clone()
+}
+
+/// Set the software RF-kill state for one published radio index.
+pub fn set_wireless_rfkill_soft_blocked(rfkill_index: u32, blocked: bool) -> AxResult {
+    let ifindex = WIRELESS_INTERFACES
+        .lock()
+        .iter()
+        .find(|interface| interface.rfkill_index == rfkill_index)
+        .map(|interface| interface.ifindex)
+        .ok_or(AxError::NoSuchDevice)?;
+    default_stack().set_wireless_rfkill_soft_blocked(ifindex, blocked)?;
+    let mut interfaces = WIRELESS_INTERFACES.lock();
+    let interface = interfaces
+        .iter_mut()
+        .find(|interface| interface.rfkill_index == rfkill_index)
+        .ok_or(AxError::NoSuchDevice)?;
+    interface.soft_blocked = blocked;
+    Ok(())
 }
 
 /// Init vsock subsystem by vsock devices.

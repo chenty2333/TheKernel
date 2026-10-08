@@ -1016,6 +1016,18 @@ impl Router {
         Ok(())
     }
 
+    pub(crate) fn set_wireless_rfkill_soft_blocked(
+        &mut self,
+        ifindex: u32,
+        blocked: bool,
+    ) -> AxResult {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        self.devices[slot].set_rfkill_soft_blocked(blocked)
+    }
+
     pub(crate) fn routes(&self) -> Vec<RouteInfo> {
         self.table
             .rules

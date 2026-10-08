@@ -355,6 +355,7 @@ mod tests {
             name: "wlan0".into(),
             ifindex: 9,
             phy_index: 2,
+            rfkill_index: 2,
             mac_address: [2, 0, 0, 0, 0, 9],
             soft_blocked: false,
             hard_blocked: false,

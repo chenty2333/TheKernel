@@ -56,6 +56,11 @@ pub trait NetDriverOps: BaseDriverOps {
         false
     }
 
+    /// Change software rfkill state when this wireless adapter can serialize it.
+    fn set_rfkill_soft_blocked(&mut self, _blocked: bool) -> DevResult {
+        Err(DevError::Unsupported)
+    }
+
     /// Change administrative radio state before the interface state is published.
     fn set_link_up(&mut self, _up: bool) -> DevResult {
         Ok(())
