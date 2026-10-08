@@ -97,6 +97,9 @@ pub mod guc_submission;
 #[allow(unsafe_code)]
 pub mod guc_submission_upstream;
 pub mod huc;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod i915_gem_domain_upstream;
 pub mod info;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
