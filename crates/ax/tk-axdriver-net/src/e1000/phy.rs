@@ -35,6 +35,8 @@ const MII_AUTONEG_ADV: u8 = 0x04;
 const MII_1000T_CTRL: u8 = 0x09;
 const NWAY_AR_PAUSE: u16 = 0x0400;
 const NWAY_AR_ASM_DIR: u16 = 0x0800;
+const I2CCMD_TIMEOUT: u32 = E1000_I2CCMD_PHY_TIMEOUT;
+const SFP_DIAG_BASE: u16 = 0x0100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum E1000PhyCallback {
@@ -338,6 +340,80 @@ pub fn phy_setup_autoneg<I: E1000PhyRegisterIo>(
     Ok(())
 }
 
+fn i2c_wait<I: E1000RegisterIo>(io: &mut I) -> DevResult<u32> {
+    for _ in 0..I2CCMD_TIMEOUT {
+        io.delay_us(50);
+        let command = io.read_register(E1000_I2CCMD)?;
+        if command & E1000_I2CCMD_READY != 0 {
+            if command & E1000_I2CCMD_ERROR != 0 {
+                return Err(DevError::Io);
+            }
+            return Ok(command);
+        }
+    }
+    Err(DevError::Io)
+}
+
+/// upstream: e1000_phy.c e1000_read_phy_reg_i2c()
+pub fn read_phy_reg_i2c<I: E1000RegisterIo>(
+    io: &mut I,
+    phy_address: u8,
+    offset: u32,
+) -> DevResult<u16> {
+    let command = (offset << E1000_I2CCMD_REG_ADDR_SHIFT)
+        | (u32::from(phy_address) << E1000_I2CCMD_PHY_ADDR_SHIFT)
+        | E1000_I2CCMD_OPCODE_READ;
+    io.write_register(E1000_I2CCMD, command)?;
+    let response = i2c_wait(io)?;
+    Ok((((response >> 8) & 0x00ff) | ((response << 8) & 0xff00)) as u16)
+}
+
+/// upstream: e1000_phy.c e1000_write_phy_reg_i2c()
+pub fn write_phy_reg_i2c<I: E1000RegisterIo>(
+    io: &mut I,
+    phy_address: u8,
+    offset: u32,
+    data: u16,
+) -> DevResult {
+    if phy_address == 0 || phy_address > 7 {
+        return Err(DevError::InvalidParam);
+    }
+    let swapped = data.rotate_left(8);
+    let command = (offset << E1000_I2CCMD_REG_ADDR_SHIFT)
+        | (u32::from(phy_address) << E1000_I2CCMD_PHY_ADDR_SHIFT)
+        | u32::from(swapped);
+    io.write_register(E1000_I2CCMD, command)?;
+    i2c_wait(io).map(|_| ())
+}
+
+/// upstream: e1000_phy.c e1000_read_sfp_data_byte()
+pub fn read_sfp_data_byte<I: E1000RegisterIo>(io: &mut I, offset: u16) -> DevResult<u8> {
+    if offset > SFP_DIAG_BASE + 255 {
+        return Err(DevError::InvalidParam);
+    }
+    io.write_register(
+        E1000_I2CCMD,
+        (u32::from(offset) << E1000_I2CCMD_REG_ADDR_SHIFT) | E1000_I2CCMD_OPCODE_READ,
+    )?;
+    Ok((i2c_wait(io)? & 0xff) as u8)
+}
+
+/// upstream: e1000_phy.c e1000_write_sfp_data_byte()
+pub fn write_sfp_data_byte<I: E1000RegisterIo>(io: &mut I, offset: u16, data: u8) -> DevResult {
+    if offset > SFP_DIAG_BASE + 255 {
+        return Err(DevError::InvalidParam);
+    }
+    let command = (u32::from(offset) << E1000_I2CCMD_REG_ADDR_SHIFT) | E1000_I2CCMD_OPCODE_READ;
+    io.write_register(E1000_I2CCMD, command)?;
+    let old_word = i2c_wait(io)?;
+    let word = (old_word & 0xff00) | u32::from(data);
+    io.write_register(
+        E1000_I2CCMD,
+        (u32::from(offset) << E1000_I2CCMD_REG_ADDR_SHIFT) | word,
+    )?;
+    i2c_wait(io).map(|_| ())
+}
+
 /// The source represents the reset-block status as a positive driver code.
 pub const fn reset_block_error_code(blocked: bool) -> Result<(), u8> {
     if blocked {
@@ -362,6 +438,8 @@ mod tests {
         delay: usize,
         mdic_data: u16,
         mdic_error: bool,
+        i2c_data: u16,
+        i2c_error: bool,
     }
     impl E1000RegisterIo for Io {
         fn read_register(&mut self, register: u32) -> DevResult<u32> {
@@ -376,6 +454,27 @@ mod tests {
                     | E1000_MDIC_READY
                     | if self.mdic_error { E1000_MDIC_ERROR } else { 0 }
                     | u32::from(self.mdic_data));
+            }
+            if register == E1000_I2CCMD {
+                let command = self
+                    .writes
+                    .iter()
+                    .rev()
+                    .find_map(|(reg, value)| (*reg == E1000_I2CCMD).then_some(*value))
+                    .unwrap_or(0);
+                let data = if command & E1000_I2CCMD_OPCODE_READ != 0 {
+                    u32::from(self.i2c_data)
+                } else {
+                    command & 0xffff
+                };
+                return Ok((command & 0xffff_0000)
+                    | E1000_I2CCMD_READY
+                    | if self.i2c_error {
+                        E1000_I2CCMD_ERROR
+                    } else {
+                        0
+                    }
+                    | data);
             }
             Ok(self
                 .registers
@@ -486,5 +585,29 @@ mod tests {
         );
         assert_eq!(io.phy_writes[0], (MII_AUTONEG_ADV, 0xfb3f));
         assert_eq!(io.phy_writes[1], (MII_1000T_CTRL, 0xfeff));
+    }
+
+    #[test]
+    fn generic_i2c_phy_and_sfp_transfers_preserve_byte_order_and_bounds() {
+        let mut io = Io {
+            i2c_data: 0x3412,
+            ..Io::default()
+        };
+        assert_eq!(read_phy_reg_i2c(&mut io, 1, 4).unwrap(), 0x1234);
+        assert_eq!(
+            io.writes[0].1,
+            (4 << E1000_I2CCMD_REG_ADDR_SHIFT)
+                | (1 << E1000_I2CCMD_PHY_ADDR_SHIFT)
+                | E1000_I2CCMD_OPCODE_READ
+        );
+        write_phy_reg_i2c(&mut io, 1, 5, 0x1234).unwrap();
+        assert_eq!(io.writes.last().unwrap().1 & 0xffff, 0x3412);
+        assert!(write_phy_reg_i2c(&mut io, 0, 5, 0).is_err());
+        assert_eq!(read_sfp_data_byte(&mut io, 0x1ff).unwrap(), 0x12);
+        write_sfp_data_byte(&mut io, 0x10, 0xcd).unwrap();
+        assert_eq!(io.writes.last().unwrap().1 & 0xffff, 0x34cd);
+        assert!(read_sfp_data_byte(&mut io, 0x200).is_err());
+        io.i2c_error = true;
+        assert!(read_phy_reg_i2c(&mut io, 1, 1).is_err());
     }
 }
