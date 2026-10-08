@@ -140,7 +140,7 @@ impl<T> RxBaTable<T> {
     }
 
     /// Buffer, release, bypass, or drop one validated firmware RX reorder entry.
-    // upstream: if_iwx.c iwx_rx_reorder() / iwx_release_frames()
+    // upstream: if_iwx.c iwx_rx_reorder()
     pub fn reorder_mpdu(
         &mut self,
         baid: u8,
@@ -224,18 +224,7 @@ impl<T> RxBaTable<T> {
         reorder.num_stored = reorder.num_stored.saturating_add(1);
         let mut frames = Vec::new();
         if !amsdu || last_amsdu_subframe {
-            while seq_less_than(reorder.head_sn, nssn) {
-                let slot = usize::from(reorder.head_sn % reorder.buf_size);
-                let released = core::mem::take(&mut reorder.entries[slot]);
-                frames
-                    .try_reserve(released.len())
-                    .map_err(|_| BaError::InvalidWindow)?;
-                reorder.num_stored = reorder
-                    .num_stored
-                    .saturating_sub(released.len().min(usize::from(u16::MAX)) as u16);
-                frames.extend(released);
-                reorder.head_sn = reorder.head_sn.wrapping_add(1) & REORDER_SEQUENCE_MASK;
-            }
+            frames = release_frames(reorder, nssn)?;
         }
         Ok(Some(RxReorderOutcome {
             frames,
@@ -339,6 +328,25 @@ impl<T> RxBaTable<T> {
             nssn: (ba_info & 0x0fff) as u16,
         })
     }
+}
+
+/// Release all buffered sequence slots before firmware's next sequence number.
+// upstream: if_iwx.c iwx_release_frames()
+fn release_frames<T>(reorder: &mut ReorderBuffer<T>, nssn: u16) -> Result<Vec<T>, BaError> {
+    let mut frames = Vec::new();
+    while seq_less_than(reorder.head_sn, nssn) {
+        let slot = usize::from(reorder.head_sn % reorder.buf_size);
+        let released = core::mem::take(&mut reorder.entries[slot]);
+        frames
+            .try_reserve(released.len())
+            .map_err(|_| BaError::InvalidWindow)?;
+        reorder.num_stored = reorder
+            .num_stored
+            .saturating_sub(released.len().min(usize::from(u16::MAX)) as u16);
+        frames.extend(released);
+        reorder.head_sn = reorder.head_sn.wrapping_add(1) & REORDER_SEQUENCE_MASK;
+    }
+    Ok(frames)
 }
 
 fn seq_less_than(left: u16, right: u16) -> bool {
