@@ -670,3 +670,6 @@ helpers from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
 
 `tk-intel-display/src/hdmi.rs` also translates HDMI/DVI sink audio, limited-range,
 and YCbCr420 format policy helpers from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
+
+HDMI sink/cloned detection, YCbCr420 state and scrambling-support predicates in
+`hdmi.rs` follow `intel_hdmi.c` (MIT, © 2006-2009 Intel).

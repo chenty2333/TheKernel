@@ -1208,3 +1208,5 @@ The same module translates display-12/13 TMDS source limits and clock formula pl
 The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_clock_valid()`, and `intel_hdmi_compute_bpc()` display-12/13 TMDS/BPC selection branches from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
 
 `hdmi.rs` additionally translates `intel_has_hdmi_sink()`, `intel_hdmi_has_audio()`, `intel_hdmi_limited_color_range()`, and the RGB/Y420 branch of `intel_hdmi_sink_format_valid()` (MIT `intel_hdmi.c`, © 2006-2009 Intel).
+
+`hdmi.rs` also translates `intel_hdmi_is_ycbcr420()`, `intel_hdmi_is_cloned()`, `intel_hdmi_compute_has_hdmi_sink()`, and the source scrambling-cap predicate from `intel_hdmi.c` (MIT, © 2006-2009 Intel).

@@ -158,6 +158,100 @@ pub fn intel_hdmi_compute_bpc(request: HdmiBpcRequest) -> Option<u8> {
     None
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HdmiFormatRequest {
+    pub clock: HdmiBpcRequest,
+    pub has_hdmi_sink: bool,
+    pub ycbcr_420_allowed: bool,
+    pub mode_is_420: bool,
+    pub mode_is_420_only: bool,
+    pub mode_is_420_also: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HdmiFormatState {
+    pub output_format: HdmiOutputFormat,
+    pub clock: HdmiClockState,
+}
+
+/// Validate one candidate sink format and compute its BPC/TMDS state.
+// upstream: intel_hdmi.c intel_hdmi_compute_output_format()
+pub fn intel_hdmi_compute_output_format(
+    mut request: HdmiFormatRequest,
+    format: HdmiOutputFormat,
+) -> Option<HdmiFormatState> {
+    let sink_format = match format {
+        HdmiOutputFormat::Rgb => HdmiSinkFormat::Rgb,
+        HdmiOutputFormat::Ycbcr420 => HdmiSinkFormat::Ycbcr420,
+        _ => HdmiSinkFormat::Unsupported,
+    };
+    if intel_hdmi_sink_format_valid(
+        request.has_hdmi_sink,
+        request.ycbcr_420_allowed,
+        request.mode_is_420,
+        sink_format,
+    ) != HdmiFormatStatus::Ok
+    {
+        return None;
+    }
+    request.clock.format = format;
+    Some(HdmiFormatState {
+        output_format: format,
+        clock: intel_hdmi_compute_clock(request.clock.pixel_clock_khz, false, request.clock)?,
+    })
+}
+
+/// Prefer RGB, using YCbCr 4:2:0 only for a sink-advertised mode or forced
+/// fallback when downstream limits were explicitly relaxed.
+// upstream: intel_hdmi.c intel_hdmi_compute_formats()
+pub fn intel_hdmi_compute_formats(request: HdmiFormatRequest) -> Option<HdmiFormatState> {
+    if request.mode_is_420_only {
+        intel_hdmi_compute_output_format(request, HdmiOutputFormat::Ycbcr420).or_else(|| {
+            if request.clock.respect_downstream_limits {
+                None
+            } else {
+                intel_hdmi_compute_output_format(request, HdmiOutputFormat::Rgb)
+            }
+        })
+    } else {
+        intel_hdmi_compute_output_format(request, HdmiOutputFormat::Rgb).or_else(|| {
+            if request.mode_is_420_also {
+                intel_hdmi_compute_output_format(request, HdmiOutputFormat::Ycbcr420)
+            } else {
+                None
+            }
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HdmiClockState {
+    pub bpc: u8,
+    pub port_clock_khz: u32,
+    pub pipe_bpp: u8,
+}
+
+/// Calculate the HDMI pixel/TMDS clocks and retain pipe depth limits.
+// upstream: intel_hdmi.c intel_hdmi_compute_clock()
+pub fn intel_hdmi_compute_clock(
+    adjusted_clock_khz: u32,
+    double_clock: bool,
+    mut request: HdmiBpcRequest,
+) -> Option<HdmiClockState> {
+    let pixel_clock = if double_clock {
+        adjusted_clock_khz.checked_mul(2)?
+    } else {
+        adjusted_clock_khz
+    };
+    request.pixel_clock_khz = pixel_clock;
+    let bpc = intel_hdmi_compute_bpc(request)?;
+    Some(HdmiClockState {
+        bpc,
+        port_clock_khz: intel_hdmi_tmds_clock(pixel_clock, bpc, request.format),
+        pipe_bpp: request.pipe_bpp.min(bpc.saturating_mul(3)),
+    })
+}
+
 /// Source BPC ceilings selected by the display version and the ADL-S 600-MHz SKU.
 // upstream: intel_hdmi.c intel_hdmi_source_max_tmds_clock()
 pub fn intel_hdmi_source_max_tmds_clock(
@@ -199,6 +293,35 @@ pub enum BroadcastRgb {
     Full,
     Limited,
     OffDvi,
+}
+
+/// The sink format flag used by i915's 4:2:0 branches.
+// upstream: intel_hdmi.c intel_hdmi_is_ycbcr420()
+pub const fn intel_hdmi_is_ycbcr420(format: HdmiOutputFormat) -> bool {
+    matches!(format, HdmiOutputFormat::Ycbcr420)
+}
+
+/// Whether multiple encoders are attached to one CRTC state.
+// upstream: intel_hdmi.c intel_hdmi_is_cloned()
+pub const fn intel_hdmi_is_cloned(encoder_mask: u32) -> bool {
+    encoder_mask != 0 && (encoder_mask & (encoder_mask - 1)) != 0
+}
+
+/// HDMI sink state excludes forced-DVI and cloned-output cases.
+// upstream: intel_hdmi.c intel_hdmi_compute_has_hdmi_sink()
+pub const fn intel_hdmi_compute_has_hdmi_sink(
+    display_info_is_hdmi: bool,
+    force_audio_off_dvi: bool,
+    encoder_mask: u32,
+) -> bool {
+    intel_has_hdmi_sink(display_info_is_hdmi, force_audio_off_dvi)
+        && !intel_hdmi_is_cloned(encoder_mask)
+}
+
+/// HDMI 2.0 source support is decided from the VBT-capped source TMDS limit.
+// upstream: intel_hdmi.c source_supports_scrambling()
+pub const fn source_supports_scrambling(max_tmds_clock_khz: u32) -> bool {
+    max_tmds_clock_khz > 340_000
 }
 
 /// Detect whether the connector has HDMI signaling rather than forced DVI.
@@ -739,6 +862,85 @@ mod write_tests {
     }
 
     #[test]
+    fn source_hdmi_format_order_prefers_rgb_then_optional_y420() {
+        let mut request = HdmiFormatRequest {
+            clock: HdmiBpcRequest {
+                pipe_bpp: 24,
+                pixel_clock_khz: 700_000,
+                display_version: 13,
+                has_gmch: false,
+                format: HdmiOutputFormat::Rgb,
+                respect_downstream_limits: true,
+                source_limit_khz: 600_000,
+                dp_dual_mode_limit_khz: None,
+                sink_limit_khz: None,
+                has_hdmi_sink: true,
+                sink: HdmiSinkBpc {
+                    has_hdmi_sink: true,
+                    y420_dc_modes: 0,
+                    rgb444_dc_modes: 0,
+                },
+                combo_phy: true,
+                tc_phy: false,
+                y420_hblank_width: 100,
+            },
+            has_hdmi_sink: true,
+            ycbcr_420_allowed: true,
+            mode_is_420: true,
+            mode_is_420_only: false,
+            mode_is_420_also: true,
+        };
+        let selected = intel_hdmi_compute_formats(request).unwrap();
+        assert_eq!(selected.output_format, HdmiOutputFormat::Ycbcr420);
+        assert_eq!(selected.clock.port_clock_khz, 350_000);
+        request.mode_is_420_also = false;
+        assert_eq!(intel_hdmi_compute_formats(request), None);
+        request.mode_is_420_only = true;
+        request.clock.respect_downstream_limits = false;
+        request.clock.pixel_clock_khz = 500_000;
+        request.ycbcr_420_allowed = false;
+        assert_eq!(
+            intel_hdmi_compute_formats(request).unwrap().output_format,
+            HdmiOutputFormat::Rgb
+        );
+    }
+
+    #[test]
+    fn source_hdmi_compute_clock_handles_double_clock_and_pipe_bpp_ceiling() {
+        let sink = HdmiSinkBpc {
+            has_hdmi_sink: true,
+            y420_dc_modes: 0,
+            rgb444_dc_modes: (1 << 4) | (1 << 5),
+        };
+        let request = HdmiBpcRequest {
+            pipe_bpp: 30,
+            pixel_clock_khz: 0,
+            display_version: 13,
+            has_gmch: false,
+            format: HdmiOutputFormat::Rgb,
+            respect_downstream_limits: true,
+            source_limit_khz: 600_000,
+            dp_dual_mode_limit_khz: None,
+            sink_limit_khz: None,
+            has_hdmi_sink: true,
+            sink,
+            combo_phy: true,
+            tc_phy: false,
+            y420_hblank_width: 280,
+        };
+        let state = intel_hdmi_compute_clock(74_250, true, request).unwrap();
+        assert_eq!(
+            state,
+            HdmiClockState {
+                bpc: 10,
+                port_clock_khz: 185_625,
+                pipe_bpp: 30
+            }
+        );
+        assert_eq!(intel_hdmi_compute_clock(u32::MAX, true, request), None);
+    }
+
+    #[test]
     fn hdmi_bpc_fallback_and_display12_pll_holes_follow_source_order() {
         let sink = HdmiSinkBpc {
             has_hdmi_sink: true,
@@ -787,6 +989,15 @@ mod write_tests {
 
     #[test]
     fn source_hdmi_sink_audio_range_and_format_policies_match_i915() {
+        assert!(!intel_hdmi_is_ycbcr420(HdmiOutputFormat::Ycbcr444));
+        assert!(intel_hdmi_is_ycbcr420(HdmiOutputFormat::Ycbcr420));
+        assert!(!intel_hdmi_is_cloned(0));
+        assert!(!intel_hdmi_is_cloned(1 << 2));
+        assert!(intel_hdmi_is_cloned((1 << 1) | (1 << 3)));
+        assert!(intel_hdmi_compute_has_hdmi_sink(true, false, 1));
+        assert!(!intel_hdmi_compute_has_hdmi_sink(true, false, 3));
+        assert!(source_supports_scrambling(340_001));
+        assert!(!source_supports_scrambling(340_000));
         assert!(!intel_has_hdmi_sink(true, true));
         assert!(intel_has_hdmi_sink(true, false));
         assert!(!intel_hdmi_has_audio(false, true, HdmiAudioPolicy::On));
