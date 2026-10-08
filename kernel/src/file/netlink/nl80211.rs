@@ -30,6 +30,8 @@ const ATTR_IFTYPE: u16 = 5;
 const ATTR_MAC: u16 = 6;
 const ATTR_WIPHY_BANDS: u16 = 22;
 const ATTR_SUPPORTED_IFTYPES: u16 = 32;
+const ATTR_MAX_NUM_SCAN_SSIDS: u16 = 43;
+const ATTR_SUPPORTED_COMMANDS: u16 = 50;
 const ATTR_SPLIT_WIPHY_DUMP: u16 = 174;
 const ATTR_REG_ALPHA2: u16 = 33;
 const BAND_ATTR_FREQS: u16 = 1;
@@ -282,6 +284,23 @@ fn wiphy_message(
         &mut payload,
         ATTR_SUPPORTED_IFTYPES | NLA_F_NESTED,
         &interface_types,
+    );
+    push_attr(&mut payload, ATTR_MAX_NUM_SCAN_SSIDS, &[1]);
+    let mut supported_commands = Vec::new();
+    for (index, command) in [CMD_GET_WIPHY, CMD_GET_INTERFACE, CMD_GET_SCAN, CMD_GET_REG]
+        .into_iter()
+        .enumerate()
+    {
+        push_attr(
+            &mut supported_commands,
+            (index + 1) as u16,
+            &u32::from(command).to_ne_bytes(),
+        );
+    }
+    push_attr(
+        &mut payload,
+        ATTR_SUPPORTED_COMMANDS | NLA_F_NESTED,
+        &supported_commands,
     );
     let mut bands = Vec::new();
     for (band_id, is_2ghz) in [(0u16, true), (1u16, false)] {
@@ -681,6 +700,22 @@ mod tests {
             band_capabilities[1].6.as_ref().unwrap(),
             &[0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
         );
+        let mut max_ssids = None;
+        let mut commands = Vec::new();
+        for_each_rtattr(attrs, |kind, value| {
+            if kind == ATTR_MAX_NUM_SCAN_SSIDS {
+                max_ssids = value.first().copied();
+            } else if kind == ATTR_SUPPORTED_COMMANDS {
+                for_each_rtattr(value, |_, command| {
+                    commands.push(u32::from_ne_bytes(command.try_into().unwrap()));
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(max_ssids, Some(1));
+        assert_eq!(commands, [1, 5, 32, 31]);
     }
 
     #[test]

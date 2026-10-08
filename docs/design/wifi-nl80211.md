@@ -35,6 +35,8 @@ GHz NVM frequencies with NO_IR flags. Legacy 2.4/5 GHz bitrate tables and
 NVM/antenna-derived HT/VHT capability, MCS, and A-MPDU attributes are emitted;
 HE maps and supported cipher suites are not yet advertised. Rates use the
 matching 100-kbit/s UAPI units and 2.4 GHz short-preamble flags.
+The wiphy advertises a one-SSID scan limit and only the GET_WIPHY,
+GET_INTERFACE, GET_SCAN, and GET_REG commands that currently have handlers.
 GET_REG returns the global world alpha2 value;
 regulatory rule tables and per-phy domains are not yet emitted. GET_SCAN
 accepts a dump request for a registered interface and emits an empty multipart

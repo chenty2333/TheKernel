@@ -96,6 +96,7 @@
 - nl80211 GET_REG now returns the UAPI-encoded global world alpha2 attribute and validates optional wiphy selection; regulatory rule tables and per-radio regulatory state remain open.
 - Registered nl80211 WIPHY bands now include source legacy 2.4/5 GHz rate arrays in 100-kbit/s units and 2.4 GHz short-preamble support; HT/VHT/HE capability maps and cipher suites remain open.
 - The registered WIPHY path now also exports source iwx HT/VHT capability words, MCS maps, and HT A-MPDU factor/density based on NVM SKU and antenna state; HE and cipher-suite attributes remain open.
+- nl80211 GET_WIPHY now reports the one-SSID scan limit and enumerates only implemented query commands, preventing wpa_supplicant from selecting unhandled connect/key controls.
 - `ieee80211.c` background scan start/timeout helpers are now translated as a driver callback plan with source state/re-entry/timer/RSN-port gates and scan-node/cache effects; ieee80211.c marker coverage advances from 13/25 to 15/25; net80211 tests increased to 98.
 - `ieee80211.c` management watchdog countdown/rearm and station AUTH/ASSOC timeout effects now map to a typed transition plan; source-function marker coverage advances from 15/25 to 16/25.
 - `ieee80211_node.c` `ieee80211_reset_scan()` now restores the active channel mask and preserves ANY-channel wrap-to-first selection; node.c marker coverage advances from 39/110 to 40/110.
