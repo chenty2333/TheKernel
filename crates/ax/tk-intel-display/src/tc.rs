@@ -13,6 +13,7 @@
 use crate::{
     Error,
     dkl_phy::{DklIo, TcPort, with_preserved_selector},
+    power_map::PowerDomain,
 };
 
 /// i915 Type-C port state, independent of the TCSS/MG PHY transport.
@@ -194,6 +195,26 @@ pub const fn get_max_lane_count(
     } else {
         icl_get_max_lane_count(lane_mask)
     }
+}
+
+/// Derive the TC lane power domain from TC1's base domain.
+// upstream: intel_tc.c tc_port_power_domain()
+pub const fn tc_port_power_domain(port: TcPort) -> PowerDomain {
+    match port {
+        TcPort::Tc1 => PowerDomain::PortDdiLanesTc1,
+        TcPort::Tc2 => PowerDomain::PortDdiLanesTc2,
+        TcPort::Tc3 => PowerDomain::PortDdiLanesTc3,
+        TcPort::Tc4 => PowerDomain::PortDdiLanesTc4,
+    }
+}
+
+/// Whether the current TC cold-off domain is the port's legacy AUX domain.
+// upstream: intel_tc.c intel_tc_cold_requires_aux_pw()
+pub const fn intel_tc_cold_requires_aux_pw(
+    cold_off_domain: PowerDomain,
+    legacy_aux_domain: PowerDomain,
+) -> bool {
+    matches!((cold_off_domain, legacy_aux_domain), (a, b) if a as u16 == b as u16)
 }
 
 /// The public connector query returns four lanes on a non-Type-C encoder.
@@ -718,6 +739,18 @@ mod signal_level_tests {
     #[test]
     fn source_tc_mode_hpd_and_lane_count_helpers_match_i915() {
         assert_eq!(tc_port_mode_name(TcPortMode::TbtAlt), "tbt-alt");
+        assert_eq!(
+            tc_port_power_domain(TcPort::Tc4),
+            PowerDomain::PortDdiLanesTc4
+        );
+        assert!(intel_tc_cold_requires_aux_pw(
+            PowerDomain::AuxUsbc1,
+            PowerDomain::AuxUsbc1
+        ));
+        assert!(!intel_tc_cold_requires_aux_pw(
+            PowerDomain::TcColdOff,
+            PowerDomain::AuxUsbc1
+        ));
         assert_eq!(pin_assignment_name(TcPinAssignment::E), 'E');
         assert_eq!(decode_pin_assignment(4), TcPinAssignment::D);
         assert_eq!(
