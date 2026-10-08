@@ -37,6 +37,12 @@ const TLV_CSCHEME: u32 = 28;
 const TLV_NUM_OF_CPU: u32 = 27;
 const TLV_PAGING: u32 = 32;
 const TLV_CMD_VERSIONS: u32 = 48;
+const TLV_FW_DBG_DEST: u32 = 38;
+const TLV_FW_DBG_CONF: u32 = 39;
+const TLV_UMAC_DEBUG_ADDRS: u32 = 54;
+const TLV_LMAC_DEBUG_ADDRS: u32 = 55;
+const MAX_CMD_VERSIONS: usize = 704;
+const FW_ADDR_CACHE_CONTROL: u32 = 0xc000_0000;
 const TLV_IML: u32 = 52;
 const TLV_PAN_FLAG: u32 = 1;
 
@@ -70,6 +76,9 @@ pub struct FirmwareImage {
     pub enabled_capabilities: [u32; 5],
     pub pnvm: Option<Vec<u8>>,
     pub iml: Option<Vec<u8>>,
+    pub command_versions: Vec<[u8; 4]>,
+    pub umac_error_event_table: Option<u32>,
+    pub lmac_error_event_table: Option<u32>,
 }
 
 /// The selected PNVM SKU and firmware segments for a hardware RF identity.
@@ -120,6 +129,9 @@ impl FirmwareImage {
             enabled_capabilities: [0; 5],
             pnvm: None,
             iml: None,
+            command_versions: Vec::new(),
+            umac_error_event_table: None,
+            lmac_error_event_table: None,
         };
         let mut cursor = HEADER_LEN;
         while bytes.len().saturating_sub(cursor) >= 8 {
@@ -182,10 +194,38 @@ impl FirmwareImage {
                 }
                 TLV_CMD_VERSIONS => {
                     // The source rounds a trailing partial four-byte command
-                    // entry down, then bounds the stored array.
-                    if data.len() / 4 > 256 {
+                    // entry down, rejects duplicates, and bounds its array.
+                    if !image.command_versions.is_empty() {
                         return Err(FirmwareError::InvalidImage);
                     }
+                    let count = (data.len() / 4).min(MAX_CMD_VERSIONS);
+                    if data.len() / 4 > MAX_CMD_VERSIONS {
+                        return Err(FirmwareError::InvalidImage);
+                    }
+                    image.command_versions.reserve(count);
+                    for entry in data[..count * 4].as_chunks::<4>().0 {
+                        image.command_versions.push(*entry);
+                    }
+                }
+                TLV_FW_DBG_DEST => {
+                    if data.first().copied().unwrap_or(1) != 0 {
+                        return Err(FirmwareError::InvalidImage);
+                    }
+                }
+                TLV_FW_DBG_CONF => {}
+                TLV_UMAC_DEBUG_ADDRS => {
+                    if data.len() != 8 {
+                        return Err(FirmwareError::InvalidImage);
+                    }
+                    image.umac_error_event_table =
+                        Some(read_u32(data, 0)? & !FW_ADDR_CACHE_CONTROL);
+                }
+                TLV_LMAC_DEBUG_ADDRS => {
+                    if data.len() != 32 {
+                        return Err(FirmwareError::InvalidImage);
+                    }
+                    image.lmac_error_event_table =
+                        Some(read_u32(data, 0)? & !FW_ADDR_CACHE_CONTROL);
                 }
                 TLV_N_SCAN_CHANNELS => {
                     if data.len() != 4 {
@@ -531,6 +571,20 @@ mod tests {
         );
         assert_eq!(
             FirmwareImage::parse(&test_image(&[(TLV_SEC_RT, &[1, 2, 3])])),
+            Err(FirmwareError::InvalidImage)
+        );
+    }
+
+    #[test]
+    fn retains_command_version_entries_and_checks_debug_destination_version() {
+        assert_eq!(
+            FirmwareImage::parse(&test_image(&[(TLV_CMD_VERSIONS, &[1, 2, 3, 4, 5])]))
+                .unwrap()
+                .command_versions,
+            vec![[1, 2, 3, 4]]
+        );
+        assert_eq!(
+            FirmwareImage::parse(&test_image(&[(TLV_FW_DBG_DEST, &[1])])),
             Err(FirmwareError::InvalidImage)
         );
     }
