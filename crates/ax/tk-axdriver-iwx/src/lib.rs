@@ -46,8 +46,8 @@ pub use firmware_bundle::{
     FirmwareBundle, FirmwareRequestError, request_on_rootfs_ready, take_staged,
 };
 pub use interrupts::{
-    InterruptMasks, enable_firmware_load_interrupts, enable_interrupts, enable_rfkill_interrupts,
-    hardware_rfkill,
+    InterruptMasks, disable_interrupts, enable_firmware_load_interrupts, enable_interrupts,
+    enable_rfkill_interrupts, hardware_rfkill, start_firmware,
 };
 pub use rate::{
     MCS_TO_RATE_INDEX, RATES, Rate, TX_FLAG_COMMAND_RATE, TX_FLAG_HIGH_PRIORITY, TxRateError,

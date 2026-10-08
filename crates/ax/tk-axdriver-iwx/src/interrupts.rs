@@ -11,7 +11,12 @@
 use crate::{CsrAccess, IwxRegisters};
 
 const CSR_INT_MASK: u32 = 0x00c;
+const CSR_INT: u32 = 0x008;
+const CSR_FH_INT_STATUS: u32 = 0x010;
 const CSR_GP_CNTRL: u32 = 0x024;
+const CSR_UCODE_DRV_GP1_CLR: u32 = 0x05c;
+const UCODE_SW_BIT_RFKILL: u32 = 0x0000_0002;
+const UCODE_DRV_GP1_BIT_CMD_BLOCKED: u32 = 0x0000_0004;
 const CSR_GP_RF_KILL_WAKE: u32 = 0x0400_0000;
 const CSR_GP_HW_RF_KILL_SW: u32 = 0x0800_0000;
 const CSR_CSR_INT_FH_RX: u32 = 1 << 31;
@@ -47,6 +52,36 @@ pub struct InterruptMasks {
     pub fh_mask: u32,
     pub hw_init_mask: u32,
     pub hw_mask: u32,
+}
+
+/// Disable host interrupt delivery and acknowledge pending legacy causes.
+// upstream: if_iwx.c iwx_disable_interrupts()
+pub fn disable_interrupts<B: CsrAccess>(registers: &mut IwxRegisters<B>, masks: &InterruptMasks) {
+    if !masks.msix {
+        registers.write_csr(CSR_INT_MASK, 0);
+        registers.write_csr(CSR_INT, !0);
+        registers.write_csr(CSR_FH_INT_STATUS, !0);
+    } else {
+        registers.write_csr(CSR_MSIX_FH_MASK, masks.fh_init_mask);
+        registers.write_csr(CSR_MSIX_HW_MASK, masks.hw_init_mask);
+    }
+}
+
+/// Clear stale status, stop pending work, initialize the NIC, and arm ALIVE.
+// upstream: if_iwx.c iwx_start_fw()
+pub fn start_firmware<B: CsrAccess, E>(
+    registers: &mut IwxRegisters<B>,
+    masks: &mut InterruptMasks,
+    mut nic_init: impl FnMut(&mut IwxRegisters<B>) -> Result<(), E>,
+) -> Result<(), E> {
+    registers.write_csr(CSR_INT, !0);
+    disable_interrupts(registers, masks);
+    registers.write_csr(CSR_UCODE_DRV_GP1_CLR, UCODE_SW_BIT_RFKILL);
+    registers.write_csr(CSR_UCODE_DRV_GP1_CLR, UCODE_DRV_GP1_BIT_CMD_BLOCKED);
+    registers.write_csr(CSR_INT, !0);
+    nic_init(registers)?;
+    enable_firmware_load_interrupts(registers, masks);
+    Ok(())
 }
 
 /// Enable only the RF-kill wake path while the device is blocked.
@@ -191,5 +226,46 @@ mod tests {
             crate::DeviceFamily::Ax210,
             0
         )));
+    }
+
+    #[test]
+    fn firmware_start_orders_status_ack_nic_init_and_alive_enable() {
+        let mut regs = IwxRegisters::new(MockCsr::default(), crate::DeviceFamily::Ax210, 0);
+        let mut masks = InterruptMasks::default();
+        let mut initialized = false;
+        start_firmware(&mut regs, &mut masks, |_| {
+            initialized = true;
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        let mock = regs.into_inner();
+        assert!(initialized);
+        assert_eq!(
+            &mock.writes[..7],
+            &[
+                (CSR_INT, !0),
+                (CSR_INT_MASK, 0),
+                (CSR_INT, !0),
+                (CSR_FH_INT_STATUS, !0),
+                (CSR_UCODE_DRV_GP1_CLR, UCODE_SW_BIT_RFKILL),
+                (CSR_UCODE_DRV_GP1_CLR, UCODE_DRV_GP1_BIT_CMD_BLOCKED),
+                (CSR_INT, !0),
+            ]
+        );
+        assert_eq!(
+            mock.writes.last(),
+            Some(&(CSR_INT_MASK, CSR_CSR_INT_ALIVE | CSR_CSR_INT_FH_RX))
+        );
+    }
+
+    #[test]
+    fn failed_nic_init_does_not_enable_firmware_load_interrupts() {
+        let mut regs = IwxRegisters::new(MockCsr::default(), crate::DeviceFamily::Ax210, 0);
+        let mut masks = InterruptMasks::default();
+        assert_eq!(
+            start_firmware(&mut regs, &mut masks, |_| Err::<(), _>(7)),
+            Err(7)
+        );
+        assert_eq!(regs.into_inner().writes.last(), Some(&(CSR_INT, !0)));
     }
 }
