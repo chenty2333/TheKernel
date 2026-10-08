@@ -82,6 +82,81 @@ pub enum TcPinAssignment {
     Unknown(u8),
 }
 
+/// Stable single-character pin-assignment diagnostic.
+// upstream: intel_tc.c pin_assignment_name()
+pub const fn pin_assignment_name(pin: TcPinAssignment) -> char {
+    match pin {
+        TcPinAssignment::None => '-',
+        TcPinAssignment::A => 'A',
+        TcPinAssignment::B => 'B',
+        TcPinAssignment::C => 'C',
+        TcPinAssignment::D => 'D',
+        TcPinAssignment::E => 'E',
+        TcPinAssignment::F => 'F',
+        TcPinAssignment::Unknown(_) => '?',
+    }
+}
+
+/// Decode the FIA pin-assignment field used by `get_pin_assignment()`.
+pub const fn decode_pin_assignment(value: u8) -> TcPinAssignment {
+    match value {
+        0 => TcPinAssignment::None,
+        1 => TcPinAssignment::A,
+        2 => TcPinAssignment::B,
+        3 => TcPinAssignment::C,
+        4 => TcPinAssignment::D,
+        5 => TcPinAssignment::E,
+        6 => TcPinAssignment::F,
+        n => TcPinAssignment::Unknown(n),
+    }
+}
+
+/// Port configuration retained after the VBT/FIA policy read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcPortConfiguration {
+    pub pin_assignment: TcPinAssignment,
+    pub max_lane_count: u8,
+}
+
+/// The TBT mode has no DP pin assignment; otherwise decode the source field.
+// upstream: intel_tc.c get_pin_assignment()
+pub const fn get_pin_assignment(mode: TcPortMode, pin_raw: u8) -> TcPinAssignment {
+    if matches!(mode, TcPortMode::TbtAlt) {
+        TcPinAssignment::None
+    } else {
+        decode_pin_assignment(pin_raw)
+    }
+}
+
+/// Recompute pin/lane configuration after a TC mode change.
+// upstream: intel_tc.c read_pin_configuration()
+pub const fn read_pin_configuration(
+    mode: TcPortMode,
+    display_version: u8,
+    lane_mask: u8,
+    pin_raw: u8,
+) -> TcPortConfiguration {
+    let pin_assignment = get_pin_assignment(mode, pin_raw);
+    let max_lane_count = get_max_lane_count(mode, display_version, lane_mask, pin_assignment);
+    TcPortConfiguration {
+        pin_assignment,
+        max_lane_count,
+    }
+}
+
+/// Non-Type-C encoders report no TC pin-assignment value.
+// upstream: intel_tc.c intel_tc_port_get_pin_assignment()
+pub const fn intel_tc_port_get_pin_assignment(
+    is_type_c: bool,
+    pin: TcPinAssignment,
+) -> TcPinAssignment {
+    if is_type_c {
+        pin
+    } else {
+        TcPinAssignment::None
+    }
+}
+
 /// Translate the FIA DP lane mask to the maximum source lane count.
 // upstream: intel_tc.c icl_get_max_lane_count()
 pub const fn icl_get_max_lane_count(lane_mask: u8) -> u8 {
@@ -643,6 +718,24 @@ mod signal_level_tests {
     #[test]
     fn source_tc_mode_hpd_and_lane_count_helpers_match_i915() {
         assert_eq!(tc_port_mode_name(TcPortMode::TbtAlt), "tbt-alt");
+        assert_eq!(pin_assignment_name(TcPinAssignment::E), 'E');
+        assert_eq!(decode_pin_assignment(4), TcPinAssignment::D);
+        assert_eq!(
+            get_pin_assignment(TcPortMode::TbtAlt, 5),
+            TcPinAssignment::None
+        );
+        let config = read_pin_configuration(TcPortMode::DpAlt, 13, 0xc, 4);
+        assert_eq!(
+            config,
+            TcPortConfiguration {
+                pin_assignment: TcPinAssignment::D,
+                max_lane_count: 2
+            }
+        );
+        assert_eq!(
+            intel_tc_port_get_pin_assignment(false, TcPinAssignment::C),
+            TcPinAssignment::None
+        );
         assert!(intel_tc_port_in_mode(
             true,
             TcPortMode::DpAlt,
