@@ -719,3 +719,7 @@ is covered by the file SPDX identifier and crate `LICENSE-MIT`.
 universal-plane functions in Linux 7.2.3 `skl_universal_plane.c` (MIT,
 © 2020 Intel); the full grant is preserved in the file SPDX tag and crate
 `LICENSE-MIT`.
+
+`tk-intel-display/src/intel_cursor_full.rs` translates all 39 cursor functions
+from Linux 7.2.3 `intel_cursor.c` (MIT, © 2020 Intel); the file SPDX tag and
+crate `LICENSE-MIT` preserve the license.
