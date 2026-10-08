@@ -262,6 +262,13 @@ pub fn control_buffer_transport_with_regs(
     }
 }
 
+/// Disable buffer transport before releasing its pinned blob. As upstream,
+/// callers must invoke this only while GuC firmware is still running.
+/// upstream: intel_guc_ct.c intel_guc_ct_disable()/ct_control_enable().
+pub fn disable_buffer_transport(io: &impl GtIo) -> Result<(), Error> {
+    control_buffer_transport(io, false)
+}
+
 /// upstream: intel_guc_ct.c intel_guc_ct_enable(). G2H is registered first.
 pub fn enable_buffer_transport(io: &impl GtIo, addresses: CtbAddresses) -> Result<(), Error> {
     enable_buffer_transport_with_regs(io, crate::guc_fw::GT_GUC_SEND_REGS, addresses)
@@ -655,6 +662,18 @@ impl CtbPair {
             pending: Vec::new(),
             incoming: Vec::new(),
         })
+    }
+
+    /// Reset both shared rings and discard stale request/event state before
+    /// registering them again with GuC.
+    /// upstream: intel_guc_ct.c intel_guc_ct_enable() buffer reset sequence.
+    pub fn reset(&mut self) {
+        self.send.reset();
+        self.receive.reset();
+        self.unused_receive_status_seen = false;
+        self.next_fence = 0;
+        self.pending.clear();
+        self.incoming.clear();
     }
 
     /// upstream: intel_guc_ct.c ct_send_nb().
@@ -1139,8 +1158,26 @@ mod tests {
             (0x190240, ACTION_HOST2GUC_CONTROL_CTB)
         );
         assert_eq!(io.writes.borrow()[1], (0x190244, CTB_CONTROL_ENABLE));
-        assert_eq!(control_buffer_transport(&io, false), Ok(()));
+        assert_eq!(disable_buffer_transport(&io), Ok(()));
         assert_eq!(io.writes.borrow()[4], (0x190244, CTB_CONTROL_DISABLE));
+    }
+
+    #[test]
+    fn ctb_pair_reset_clears_ring_and_pending_state_before_reenable() {
+        let mut pair = CtbPair::new().unwrap();
+        let _ = pair.send_request(&[0x4000], 1).unwrap();
+        pair.send.descriptor.status = CTB_STATUS_OVERFLOW;
+        pair.incoming.push(QueuedCtbEvent {
+            action: ACTION_CONTEXT_RESET_NOTIFICATION,
+            data0: 0,
+            payload: vec![1],
+        });
+        pair.reset();
+        assert_eq!(pair.send.descriptor, CtbDescriptor::default());
+        assert!(pair.pending.is_empty());
+        assert!(pair.incoming.is_empty());
+        assert_eq!(pair.next_fence, 0);
+        assert_eq!(pair.receive.available_dwords(), 3071);
     }
 
     #[test]
