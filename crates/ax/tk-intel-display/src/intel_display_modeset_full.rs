@@ -455,7 +455,7 @@ pub struct AtomicState {
     pub wakeref: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DisplayCaps {
     pub display_version: u8,
     pub display_version_x100: u16,

@@ -79,6 +79,10 @@ use super::{
         ddi::{DDI_BUF_CTL_A, DDI_BUF_CTL_B},
     },
 };
+use intel_display::intel_display_modeset_full::{
+    self as i915_modeset, DisplayCaps as I915DisplayCaps, DisplayMode as I915DisplayMode,
+    ModeStatus as I915ModeStatus, Timing as I915Timing,
+};
 use crate::drm::modes::{
     Edid, FallbackReason, Mode, ModeFlags, ModeList, ModePlan, SelectionReason, collect_modes,
 };
@@ -1455,6 +1459,8 @@ pub(crate) enum ModesetError {
     Output(OutputError),
     /// §11 phase 4.3, after phase 5: `PLANE_CTL` and `PLANE_SURF`.
     Arm(PipeError),
+    /// The display-12/13 i915 timing admission rejected this mode.
+    IntelModeStatus(I915ModeStatus),
 }
 
 impl ModesetError {
@@ -1462,6 +1468,9 @@ impl ModesetError {
     pub(crate) fn describe(&self) -> String {
         match self {
             ModesetError::Refused(refusal) => refusal.describe(),
+            ModesetError::IntelModeStatus(status) => format!(
+                "i915 display-13 mode validation rejected the selected timing: {status:?}"
+            ),
             ModesetError::Clock(error) => {
                 format!(
                     "the CDCLK registers could not be read: {}",
@@ -1527,6 +1536,40 @@ pub(crate) fn preflight_mode<R: Registers>(
         Ok(mode) => mode,
         Err(refusal) => return Err(ModesetError::Refused(refusal)),
     };
+
+    let i915_caps = I915DisplayCaps {
+        display_version: 13,
+        cdclk_max_dotclock: cdclk.cdclk_khz,
+        ..I915DisplayCaps::default()
+    };
+    let i915_mode = I915DisplayMode {
+        timing: I915Timing {
+            hdisplay: u32::from(mode.hdisplay),
+            hsync_start: u32::from(mode.hsync_start),
+            hsync_end: u32::from(mode.hsync_end),
+            htotal: u32::from(mode.htotal),
+            hblank_start: u32::from(mode.hdisplay),
+            hblank_end: u32::from(mode.htotal),
+            vdisplay: u32::from(mode.vdisplay),
+            vblank_start: u32::from(mode.vdisplay),
+            vblank_end: u32::from(mode.vtotal),
+            vsync_start: u32::from(mode.vsync_start),
+            vsync_end: u32::from(mode.vsync_end),
+            vtotal: u32::from(mode.vtotal),
+            clock_khz: mode.clock_khz,
+        },
+        vscan: 1,
+        ..I915DisplayMode::default()
+    };
+    for status in [
+        i915_modeset::intel_mode_valid(i915_caps, &i915_mode),
+        i915_modeset::intel_cpu_transcoder_mode_valid(i915_caps, &i915_mode),
+        i915_modeset::intel_mode_valid_max_plane_size(i915_caps, &i915_mode, 1),
+    ] {
+        if status != I915ModeStatus::Ok {
+            return Err(ModesetError::IntelModeStatus(status));
+        }
+    }
 
     Ok((choice, mode))
 }
