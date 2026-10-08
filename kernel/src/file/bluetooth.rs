@@ -259,6 +259,25 @@ mod tests {
     }
 
     #[test]
+    fn inquiry_result_is_fanned_out_as_device_found() {
+        let socket = HciSocket::new();
+        socket
+            .bind(SockaddrHci {
+                family: AF_BLUETOOTH as u16,
+                device: HCI_DEV_NONE,
+                channel: HCI_CHANNEL_CONTROL,
+            })
+            .unwrap();
+        let event = [0x02, 14, 1, 1, 2, 3, 4, 5, 6, 1, 0, 0, 0, 0, 0, 0];
+        fanout_hci_management_events(3, &event);
+        let actual = socket.control.rx.lock().pop_front().unwrap();
+        assert_eq!(&actual[..6], &[0x12, 0, 3, 0, 14, 0]);
+        assert_eq!(&actual[6..13], &[1, 2, 3, 4, 5, 6, 0]);
+        assert_eq!(actual[13], 0); // RSSI unavailable in legacy Inquiry Result.
+        assert_eq!(&actual[14..], &[0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
     fn management_command_complete_encodes_status_and_settings_payload() {
         let response = management_command_complete(4, 7, 0, &0x212u32.to_le_bytes()).unwrap();
         assert_eq!(&response, &[1, 0, 4, 0, 7, 0, 7, 0, 0, 0x12, 0x02, 0, 0]);
@@ -814,6 +833,20 @@ fn fanout_hci_management_events(index: u16, event: &[u8]) {
             parameters.extend_from_slice(&0u16.to_le_bytes()); // EIR length
             publish(0x000b, &parameters);
         }
+        // LE Connection Complete -> Device Connected.
+        0x3e if event.len() >= 21 && event[2] == 0x01 && event[3] == 0 => {
+            let address_type = match event[7] {
+                0 => 1, // public LE address
+                1 => 2, // random LE address
+                _ => return,
+            };
+            let mut parameters = Vec::with_capacity(13);
+            parameters.extend_from_slice(&event[8..14]);
+            parameters.push(address_type);
+            parameters.extend_from_slice(&0u32.to_le_bytes());
+            parameters.extend_from_slice(&0u16.to_le_bytes());
+            publish(0x000b, &parameters);
+        }
         // HCI Disconnection Complete -> Device Disconnected.
         0x05 if event.len() >= 6 && event[2] == 0 => {
             let handle = u16::from_le_bytes([event[3], event[4]]) & 0x0fff;
@@ -852,6 +885,20 @@ fn fanout_hci_management_events(index: u16, event: &[u8]) {
                 publish(0x0011, &parameters);
             }
         }
+        // HCI Encryption Change can also report an LE security failure.
+        0x08 if event.len() >= 5 && event[2] != 0 => {
+            let handle = u16::from_le_bytes([event[3], event[4]]) & 0x0fff;
+            if let Some(adapter) = usb_adapter(index)
+                && let Some((address, address_type)) =
+                    adapter.lock().management_peer_for_handle(handle)
+            {
+                let mut parameters = Vec::with_capacity(8);
+                parameters.extend_from_slice(&address);
+                parameters.push(address_type);
+                parameters.push(event[2]);
+                publish(0x0011, &parameters);
+            }
+        }
         // HCI Link Key Notification contains the key bytes for classic links.
         0x18 if event.len() >= 25 => {
             let mut parameters = Vec::with_capacity(26);
@@ -870,11 +917,27 @@ fn fanout_hci_management_events(index: u16, event: &[u8]) {
                 return;
             }
             for record in event[3..].chunks_exact(13) {
-                let mut parameters = Vec::with_capacity(13);
+                let mut parameters = Vec::with_capacity(14);
                 parameters.extend_from_slice(&record[..6]);
                 parameters.extend_from_slice(&[0, 0]); // address type, RSSI unavailable
                 parameters.extend_from_slice(&0u32.to_le_bytes()); // flags
                 parameters.extend_from_slice(&0u16.to_le_bytes()); // EIR length
+                publish(0x0012, &parameters);
+            }
+        }
+        // HCI Inquiry Result with RSSI has 14-byte response records.
+        0x22 if event.len() >= 3 => {
+            let count = usize::from(event[2]);
+            if event.len() != 3 + count * 14 {
+                return;
+            }
+            for record in event[3..].chunks_exact(14) {
+                let mut parameters = Vec::with_capacity(14);
+                parameters.extend_from_slice(&record[..6]);
+                parameters.push(0); // BR/EDR address
+                parameters.push(record[13]); // RSSI
+                parameters.extend_from_slice(&0u32.to_le_bytes());
+                parameters.extend_from_slice(&0u16.to_le_bytes());
                 publish(0x0012, &parameters);
             }
         }

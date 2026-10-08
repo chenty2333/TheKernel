@@ -893,6 +893,7 @@ impl Controller {
         for (bar, address) in bars.iter().copied().enumerate() {
             if address != 0 {
                 this.padbar[bar] =
+                    // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
                     unsafe { read_volatile((address + PADBAR) as *const u32) as u16 };
             }
         }
@@ -924,6 +925,7 @@ impl Controller {
         let address = self.bars[bar]
             .checked_add(usize::from(self.padbar[bar]))?
             .checked_add(pad * usize::from(self.device.pad_size))?;
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         Some(unsafe { read_volatile(address as *const u32) } & CONF_RXSTATE != 0)
     }
     // upstream: pchgpio.c pchgpio_write_pin()
@@ -937,12 +939,14 @@ impl Controller {
         else {
             return false;
         };
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         let mut reg = unsafe { read_volatile(address as *const u32) };
         if value {
             reg |= CONF_TXSTATE
         } else {
             reg &= !CONF_TXSTATE
         };
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         unsafe { write_volatile(address as *mut u32, reg) };
         true
     }
@@ -964,6 +968,7 @@ impl Controller {
         else {
             return false;
         };
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         let mut cfg = unsafe { read_volatile(pad_addr as *const u32) };
         cfg &= !(CONF_RXEV_MASK | CONF_RXINV);
         if edge {
@@ -975,6 +980,7 @@ impl Controller {
         if both {
             cfg |= CONF_RXEV_EDGE | CONF_RXEV_ZERO;
         }
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         unsafe { write_volatile(pad_addr as *mut u32, cfg) };
         let enable_addr = self.bars[bar]
             .checked_add(usize::from(self.device.gpi_ie))
@@ -982,12 +988,14 @@ impl Controller {
         let Some(enable_addr) = enable_addr else {
             return false;
         };
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         let mut enable = unsafe { read_volatile(enable_addr as *const u32) };
         if enabled {
             enable |= 1u32 << bit
         } else {
             enable &= !(1u32 << bit)
         };
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         unsafe { write_volatile(enable_addr as *mut u32, enable) };
         true
     }
@@ -1025,8 +1033,10 @@ impl Controller {
         else {
             return false;
         };
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         let mut enable = unsafe { read_volatile(address as *const u32) };
         enable |= 1u32 << bit;
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         unsafe { write_volatile(address as *mut u32, enable) };
         true
     }
@@ -1042,8 +1052,10 @@ impl Controller {
         else {
             return false;
         };
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         let mut enable = unsafe { read_volatile(address as *const u32) };
         enable &= !(1u32 << bit);
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         unsafe { write_volatile(address as *mut u32, enable) };
         true
     }
@@ -1080,10 +1092,12 @@ impl Controller {
             else {
                 continue;
             };
+            // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
             let status = unsafe { read_volatile(status_address as *const u32) };
             if status == 0 {
                 continue;
             }
+            // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
             unsafe { write_volatile(status_address as *mut u32, status) };
             let Some(enable_address) = self.bars[bar]
                 .checked_add(usize::from(self.device.gpi_ie))
@@ -1091,6 +1105,7 @@ impl Controller {
             else {
                 continue;
             };
+            // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
             let enabled = unsafe { read_volatile(enable_address as *const u32) };
             let active = status & enabled;
             if active == 0 {
@@ -1123,8 +1138,11 @@ impl Controller {
         else {
             return false;
         };
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         saved.pad_cfg_dw0 = unsafe { read_volatile(pad_addr as *const u32) };
+        // SAFETY: PAD_CFG_DW1 is the next 32-bit word in this checked MMIO pad window.
         saved.pad_cfg_dw1 = unsafe { read_volatile((pad_addr + 4) as *const u32) };
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         saved.gpi_ie = unsafe { read_volatile(enable_addr as *const u32) } & (1u32 << bit) != 0;
         true
     }
@@ -1139,10 +1157,12 @@ impl Controller {
         else {
             return false;
         };
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         let current = unsafe { read_volatile(pad_addr as *const u32) };
         let restore = has_interrupt
             || (saved.pad_cfg_dw0 & CONF_PADRSTCFG_MASK) != (current & CONF_PADRSTCFG_MASK);
         if restore {
+            // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
             unsafe {
                 write_volatile(pad_addr as *mut u32, saved.pad_cfg_dw0);
                 write_volatile((pad_addr + 4) as *mut u32, saved.pad_cfg_dw1);
@@ -1153,12 +1173,14 @@ impl Controller {
             else {
                 return false;
             };
+            // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
             let mut enabled = unsafe { read_volatile(enable_addr as *const u32) };
             if saved.gpi_ie {
                 enabled |= 1u32 << bit
             } else {
                 enabled &= !(1u32 << bit)
             };
+            // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
             unsafe { write_volatile(enable_addr as *mut u32, enabled) };
         }
         true
@@ -1185,6 +1207,7 @@ impl Controller {
             .get(bar)?
             .checked_add(usize::from(self.device.gpi_is))?
             .checked_add(bank * 4)?;
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         Some(unsafe { read_volatile(address as *const u32) })
     }
     // upstream: pchgpio.c pchgpio_intr()
@@ -1197,6 +1220,7 @@ impl Controller {
         else {
             return false;
         };
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         unsafe { write_volatile(address as *mut u32, bits) };
         true
     }
@@ -1501,18 +1525,22 @@ mod tests {
             bars[3].as_mut_ptr() as usize,
             0,
         ];
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         let controller = unsafe { Controller::new(&ADL_N_DEVICE, addresses) }.unwrap();
         let pad0 = (addresses[0] + 0x400) as *mut u32;
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         unsafe { write_volatile(pad0, CONF_RXSTATE) };
         assert_eq!(controller.read_pin(0), Some(true));
         assert!(controller.write_pin(26, true));
         let pad26 = (addresses[0] + 0x400 + 26 * 16) as *const u32;
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         assert_ne!(unsafe { read_volatile(pad26) } & CONF_TXSTATE, 0);
 
         let pending = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
         let mut controller = controller;
         assert!(controller.establish_interrupt(0, true, true, false, 3, pending.clone()));
         assert!(controller.enable_interrupt(0));
+        // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         unsafe {
             write_volatile((addresses[0] + 0x100) as *mut u32, 1);
         }
