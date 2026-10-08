@@ -12,8 +12,10 @@ use kspin::SpinNoIrq;
 use tk_acpica::Engine;
 use tk_vtd::{
     DmarTable, Error,
+    idpgtbl::{dmar_map_buf_locked, dmar_unmap_buf_locked},
     iova::IovaAllocator,
     pgtbl::{PAGE_SIZE, PageMemory, SecondLevel},
+    reg::{DMAR_PTE_R, DMAR_PTE_W},
 };
 
 const MODE_UNKNOWN: u8 = 0;
@@ -313,7 +315,14 @@ impl Manager {
             .try_reserve(1)
             .map_err(|_| Error::OutOfMemory)?;
         let iova = self.iovas.allocate(mapped_length)?;
-        if let Err(error) = self.page_table.map(aligned_physical, iova, mapped_length) {
+        if let Err(error) = dmar_map_buf_locked(
+            &mut self.page_table,
+            aligned_physical,
+            iova,
+            mapped_length,
+            DMAR_PTE_R | DMAR_PTE_W,
+            4,
+        ) {
             let _ = self.iovas.release(iova, mapped_length);
             return Err(error);
         }
@@ -340,14 +349,19 @@ impl Manager {
             })
             .ok_or(Error::InvalidRange)?;
         let mapping = &self.mappings[index];
-        self.page_table.unmap(mapping.iova, mapping.mapped_length)?;
+        dmar_unmap_buf_locked(&mut self.page_table, mapping.iova, mapping.mapped_length)?;
         for unit in &mut self.units {
             if let Err(error) = unit.invalidate_all() {
                 // Restore the PTE before reporting failure. Callers must not
                 // release the backing page while a stale IOTLB entry may exist.
-                let _ = self
-                    .page_table
-                    .map(mapping.physical, mapping.iova, mapping.mapped_length);
+                let _ = dmar_map_buf_locked(
+                    &mut self.page_table,
+                    mapping.physical,
+                    mapping.iova,
+                    mapping.mapped_length,
+                    DMAR_PTE_R | DMAR_PTE_W,
+                    4,
+                );
                 return Err(error);
             }
         }

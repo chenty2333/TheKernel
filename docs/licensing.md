@@ -549,3 +549,7 @@ Belousov attribution in the Rust source module, covered by the crate license.
 FreeBSD `sys/x86/iommu/intel_qi.c` queued-invalidation logic is translated in
 `crates/ax/tk-vtd/src/qi.rs` with its 2013 FreeBSD Foundation BSD-2-Clause
 grant and Konstantin Belousov attribution; the crate license covers the port.
+The page-table and IOTLB translation from FreeBSD
+`sys/x86/iommu/intel_idpgtbl.c` retains the 2013 FreeBSD Foundation
+BSD-2-Clause grant and Konstantin Belousov attribution in `tk-vtd` source;
+its full grant is already present in `crates/ax/tk-vtd/LICENSES/`.

@@ -25,3 +25,12 @@ wait-descriptor generation wrap, global/page/IEC invalidations, completion
 sequence waits, interrupt/task drain hooks, and queue lifecycle. `QiIo` is the
 platform seam for coherent DMA queue memory, taskqueues and lock/wakeup rules.
 The kernel's current ad-hoc queue code has not yet been replaced by this port.
+
+FreeBSD `intel_idpgtbl.c` is now translated at 14/14 function entries in
+`tk-vtd/src/idpgtbl.rs` and `pgtbl.rs`, and the kernel Manager map/unmap seam
+calls these functions. The port covers identity-table reuse/refcounts, PTE
+permissions, map rollback, page/domain invalidation choice and the hardware
+actual-granularity fallback. The current hardware page-table adapter supports
+four-level paging and 2 MiB identity leaves; subtable pages are retained until
+quiesced domain destruction instead of being reclaimed during unmap. Unit tests
+pass, but no translated-QEMU claim follows from this source-level port.

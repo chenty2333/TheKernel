@@ -1,5 +1,6 @@
 //! Intel VT-d second-level four-level page tables (Intel VT-d Architecture
 //! Specification, §3.4). This is an original implementation of the format.
+use alloc::vec::Vec;
 use core::ptr::NonNull;
 
 use crate::Error;
@@ -30,6 +31,7 @@ pub unsafe trait PageMemory {
 pub struct SecondLevel<M: PageMemory> {
     memory: M,
     root: u64,
+    owned_pages: Vec<u64>,
 }
 
 impl<M: PageMemory> SecondLevel<M> {
@@ -47,7 +49,18 @@ impl<M: PageMemory> SecondLevel<M> {
         };
         // SAFETY: the allocator contract gives exclusive access to this new page.
         unsafe { pml4.as_mut().fill(0) };
-        Ok(Self { memory, root })
+        let mut owned_pages = Vec::new();
+        if owned_pages.try_reserve_exact(1).is_err() {
+            // SAFETY: this page is still owned by the new table.
+            unsafe { memory.free_page(root) };
+            return Err(Error::OutOfMemory);
+        }
+        owned_pages.push(root);
+        Ok(Self {
+            memory,
+            root,
+            owned_pages,
+        })
     }
 
     pub const fn root_physical(&self) -> u64 {
@@ -59,6 +72,9 @@ impl<M: PageMemory> SecondLevel<M> {
         // SAFETY: page_mut uniquely lends this table and index is in 0..512.
         let entry = unsafe { &mut parent_page.as_mut()[index] };
         if *entry & PRESENT == 0 {
+            self.owned_pages
+                .try_reserve(1)
+                .map_err(|_| Error::OutOfMemory)?;
             let child = self.memory.alloc_page()?;
             if child & (PAGE_SIZE - 1) != 0 || child & !ADDRESS_MASK != 0 {
                 // SAFETY: allocator returned child as owned memory.
@@ -73,6 +89,7 @@ impl<M: PageMemory> SecondLevel<M> {
             // SAFETY: child is freshly allocated and exclusively owned.
             unsafe { page.as_mut().fill(0) };
             *entry = child | PRESENT;
+            self.owned_pages.push(child);
             Ok(child)
         } else {
             if *entry & (1 << 7) != 0 {
@@ -84,7 +101,21 @@ impl<M: PageMemory> SecondLevel<M> {
 
     /// Install 4 KiB read/write mappings for page-aligned addresses.
     pub fn map(&mut self, physical: u64, iova: u64, length: usize) -> Result<(), Error> {
+        self.map_with_flags(physical, iova, length, PRESENT)
+    }
+
+    /// Install 4 KiB mappings with the Intel PTE access/snoop/transient bits.
+    pub fn map_with_flags(
+        &mut self,
+        physical: u64,
+        iova: u64,
+        length: usize,
+        flags: u64,
+    ) -> Result<(), Error> {
+        let permitted = PRESENT | (1 << 11) | (1 << 62);
         if length == 0
+            || flags & PRESENT == 0
+            || flags & !permitted != 0
             || !physical.is_multiple_of(PAGE_SIZE)
             || !iova.is_multiple_of(PAGE_SIZE)
             || !length.is_multiple_of(PAGE_SIZE as usize)
@@ -113,7 +144,7 @@ impl<M: PageMemory> SecondLevel<M> {
             if *entry & PRESENT != 0 {
                 return Err(Error::MapFailed);
             }
-            *entry = (pa & ADDRESS_MASK) | PRESENT;
+            *entry = (pa & ADDRESS_MASK) | flags;
         }
         Ok(())
     }
@@ -204,6 +235,16 @@ impl<M: PageMemory> SecondLevel<M> {
         // SAFETY: page_mut uniquely lends table and index is bounded.
         let entry = unsafe { page.as_mut()[i1] };
         (entry & PRESENT != 0).then_some((entry & ADDRESS_MASK) | (iova & 0xfff))
+    }
+}
+
+impl<M: PageMemory> Drop for SecondLevel<M> {
+    fn drop(&mut self) {
+        for physical in self.owned_pages.drain(..).rev() {
+            // SAFETY: these are all pages allocated and retained by this table;
+            // the owner must have quiesced hardware before dropping the domain.
+            unsafe { self.memory.free_page(physical) };
+        }
     }
 }
 
