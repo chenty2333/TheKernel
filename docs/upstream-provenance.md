@@ -566,7 +566,8 @@ the baseline rootfs tool build. Binary redistribution must also satisfy that
 C library's license (the default host glibc is LGPL-2.1-or-later); this payload
 is not claimed to be BSD-only. The archive and generated tool sources remain
 in the external state cache, not the kernel's vendored runtime tree.
-The optional payload and the merged baseline image each use 160 MiB. It contains no OEM firmware tables.
+The optional inspect payload uses 192 MiB for its signed storage/partition tools;
+the merged baseline image remains 160 MiB. It contains no OEM firmware tables.
 
 ## MIT i915 ADL-P/N display translation (Codex D, 2026-10-05)
 
