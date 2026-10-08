@@ -338,6 +338,7 @@ impl I2cInput {
         gpio_interrupts
             .try_reserve_exact(pin_count)
             .map_err(|_| DevError::NoMemory)?;
+        // upstream: iichid.c iichid_intr_setup() / iichid_setup_interrupt()
         for resource in &child.gpio_interrupts {
             for pin in &resource.pins {
                 if let Some(handle) = crate_interface::call_interface!(
@@ -516,6 +517,7 @@ impl BaseDriverOps for I2cInput {
 impl InputDriverOps for I2cInput {
     // upstream: iichid.c iichid_intr_start()
     // upstream: iichid.c iichid_set_power_state()
+    // upstream: iichid.c iichid_setup_callout() (event-pump sampling starts on open)
     // upstream: hid.c hid_intr_start()
     // upstream: hmt.c hmt_ev_open() / iichid.c iichid_set_power_state()
     fn open_input(&mut self) -> DevResult<()> {
@@ -537,6 +539,7 @@ impl InputDriverOps for I2cInput {
     // upstream: iichid.c iichid_intr_stop()
     // upstream: iichid.c iichid_set_power_state()
     // upstream: hid.c hid_intr_stop()
+    // upstream: iichid.c iichid_teardown_callout() (closed state suppresses sampling)
     // upstream: hmt.c hmt_ev_close() / iichid.c iichid_set_power_state()
     fn close_input(&mut self) -> DevResult<()> {
         let state = self.state.get_mut();
@@ -623,6 +626,7 @@ impl InputDriverOps for I2cInput {
     }
     // upstream: iichid.c iichid_intr_poll()
     // upstream: iichid.c iichid_intr() and hmt.c hmt_intr()
+    // upstream: iichid.c iichid_reset_callout() (deadline belongs to evdev pump)
     // upstream: hid.c hid_intr_poll()
     fn read_event(&mut self) -> DevResult<Event> {
         let state = self.state.get_mut();
@@ -733,6 +737,7 @@ impl I2cInput {
 
 impl Drop for I2cInput {
     // upstream: iichid.c iichid_detach()
+    // upstream: iichid.c iichid_intr_unsetup() / iichid_teardown_interrupt()
     // upstream: hmt.c hmt_detach() (evdev registration is released by owner)
     fn drop(&mut self) {
         let state = self.state.get_mut();

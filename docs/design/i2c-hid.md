@@ -90,3 +90,11 @@ not imply full source behavior: THQA handling, scan timestamps, and model
 quirks remain unsupported, and the full `hmt_intr()` geometry/options path is
 partly implemented in the generic report decoder rather than as a copied
 function body.
+
+The remaining `iichid.c` interrupt/callout entry points map to per-pin GPIO
+registration/RAII release and to evdev's scheduled polling/read lifecycle;
+`iichid.c` coverage is 38/39 entry points. Its one omitted callback is
+`iichid_sysctl_sampling_rate_handler()`: this checkout has no per-device sysctl
+control plane for input drivers, and polling currently uses the translated
+80/10 Hz adaptive behavior with fixed defaults. This does not claim the source
+sysctl behavior or caller runtime reconfiguration.
