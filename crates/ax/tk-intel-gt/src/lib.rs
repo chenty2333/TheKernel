@@ -8,21 +8,84 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 #[cfg(feature = "upstream-gt")]
+#[path = "linux/config.rs"]
 pub mod linux_config;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 #[macro_use]
+#[path = "linux/macros.rs"]
 mod linux_macros;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 #[macro_use]
+#[path = "linux/heap.rs"]
 pub(crate) mod linux_heap;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 #[macro_use]
+#[path = "linux/list.rs"]
 pub(crate) mod linux_list;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[macro_use]
+#[path = "linux/memory.rs"]
+pub(crate) mod linux_memory;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[path = "linux/locks.rs"]
+pub(crate) mod linux_locks;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[macro_use]
+#[path = "linux/xarray.rs"]
+pub(crate) mod linux_xarray;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[macro_use]
+#[path = "linux/wait.rs"]
+pub(crate) mod linux_wait;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[path = "linux/tasklet.rs"]
+pub(crate) mod linux_tasklet;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[macro_use]
+#[path = "linux/pm.rs"]
+pub(crate) mod linux_pm;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[path = "linux/i915_private.rs"]
+pub(crate) mod linux_i915_private;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[path = "linux/mutex.rs"]
+pub(crate) mod linux_mutex;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[path = "linux/sw_fence.rs"]
+pub(crate) mod linux_sw_fence;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[path = "linux/timer.rs"]
+pub(crate) mod linux_timer;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[path = "linux/workqueue.rs"]
+pub(crate) mod linux_workqueue;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[macro_use]
+#[path = "linux/assert.rs"]
+mod linux_assert;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[macro_use]
+#[path = "linux/print.rs"]
+mod linux_print;
 pub mod bcs;
 pub mod cache;
+pub mod execlists;
 pub mod guc_ads;
 pub mod guc_capture;
 pub mod guc_config;
@@ -33,6 +96,8 @@ pub mod guc_submission;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod guc_submission_upstream;
+pub mod huc;
+pub mod info;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_breadcrumbs_upstream;
@@ -44,20 +109,19 @@ pub mod intel_context_upstream;
 pub mod intel_engine_cs_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
-pub mod intel_lrc_upstream;
+pub mod intel_execlists_submission_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
-pub mod intel_execlists_submission_upstream;
+pub mod intel_lrc_upstream;
+pub mod intel_ring;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_timeline_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_workarounds_upstream;
-pub mod execlists;
-pub mod huc;
-pub mod info;
-pub mod intel_ring;
+#[cfg(feature = "upstream-gt")]
+pub(crate) mod linux;
 pub mod lrc;
 pub mod ppgtt;
 pub mod rcs;

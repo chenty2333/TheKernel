@@ -3652,6 +3652,9 @@ name = "tk-intel-gt"
 version = "0.1.0"
 dependencies = [
  "axlog",
+ "kernel_guard",
+ "tk-axhal",
+ "tk-axtask",
 ]
 
 [[package]]
