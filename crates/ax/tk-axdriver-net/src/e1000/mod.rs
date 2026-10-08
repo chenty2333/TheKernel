@@ -1,6 +1,7 @@
 //! Intel e1000 shared driver port.
 
 pub mod api;
+pub mod mac;
 pub mod nic;
 pub mod osdep;
 pub mod registers;
