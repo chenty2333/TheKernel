@@ -316,6 +316,21 @@ pub struct CtbEvent<'a> {
     pub process_immediately: bool,
 }
 
+/// Owned G2H event queued for process-context dispatch. The CT IRQ path must
+/// return reserved credits before queuing an event, and TLB invalidations are
+/// dispatched inline to avoid blocking on work queued behind an invalidation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedCtbEvent {
+    pub action: u16,
+    pub data0: u16,
+    pub payload: Vec<u32>,
+}
+
+/// Consumer for the action-specific GuC event handlers owned by GT/submission.
+pub trait CtEventHandler {
+    fn process(&mut self, action: u16, data0: u16, payload: &[u32]) -> Result<(), CtError>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CtCompletion {
     Success {
@@ -587,6 +602,7 @@ pub struct CtbPair {
     pub unused_receive_status_seen: bool,
     next_fence: u16,
     pending: Vec<PendingRequest>,
+    incoming: Vec<QueuedCtbEvent>,
 }
 
 impl CtbPair {
@@ -597,6 +613,7 @@ impl CtbPair {
             unused_receive_status_seen: false,
             next_fence: 0,
             pending: Vec::new(),
+            incoming: Vec::new(),
         })
     }
 
@@ -837,6 +854,41 @@ impl CtbPair {
         }))
     }
 
+    /// Handle an event in the receive context or queue it for the worker.
+    /// TLB invalidation completion is synchronous, matching ct_handle_event().
+    /// upstream: intel_guc_ct.c ct_handle_event()/ct_process_request().
+    pub fn dispatch_event<H: CtEventHandler>(
+        &mut self,
+        event: CtbEvent<'_>,
+        handler: &mut H,
+    ) -> Result<(), CtError> {
+        if event.process_immediately {
+            return handler.process(event.action, event.data0, event.payload);
+        }
+        self.incoming.push(QueuedCtbEvent {
+            action: event.action,
+            data0: event.data0,
+            payload: event.payload.to_vec(),
+        });
+        Ok(())
+    }
+
+    /// Drain events in arrival order. Like the upstream work item, continue
+    /// until the queue is empty so concurrent arrivals are not stranded.
+    /// upstream: intel_guc_ct.c ct_process_incoming_requests()/ct_incoming_request_worker_func().
+    pub fn process_incoming_requests<H: CtEventHandler>(
+        &mut self,
+        handler: &mut H,
+    ) -> Result<usize, CtError> {
+        let mut processed = 0;
+        while !self.incoming.is_empty() {
+            let event = self.incoming.remove(0);
+            handler.process(event.action, event.data0, &event.payload)?;
+            processed += 1;
+        }
+        Ok(processed)
+    }
+
     /// Consume a completed request and release the full maximum-size G2H
     /// reservation, matching ct_send() after its wait finishes.
     /// upstream: intel_guc_ct.c ct_send() wait completion and release credits.
@@ -908,6 +960,15 @@ mod tests {
     use core::cell::{Cell, RefCell};
 
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingEventHandler(Vec<(u16, u16, Vec<u32>)>);
+    impl CtEventHandler for RecordingEventHandler {
+        fn process(&mut self, action: u16, data0: u16, payload: &[u32]) -> Result<(), CtError> {
+            self.0.push((action, data0, payload.to_vec()));
+            Ok(())
+        }
+    }
 
     struct ClockIo(Cell<u64>);
     impl crate::GtIo for ClockIo {
@@ -1175,6 +1236,38 @@ mod tests {
             pair.receive.available_dwords(),
             CTB_G2H_BUFFER_SIZE as u32 / 4 - 1 - G2H_ROOM_BUFFER_SIZE as u32 / 4
         );
+    }
+
+    #[test]
+    fn ctb_event_worker_defers_normal_events_but_processes_tlb_inline() {
+        let mut pair = CtbPair::new().unwrap();
+        let mut handler = RecordingEventHandler::default();
+        let normal = CtbEvent {
+            action: ACTION_CONTEXT_RESET_NOTIFICATION,
+            data0: 2,
+            payload: &[0xaa],
+            released_response_credit: 0,
+            process_immediately: false,
+        };
+        pair.dispatch_event(normal, &mut handler).unwrap();
+        assert!(handler.0.is_empty());
+        assert_eq!(pair.process_incoming_requests(&mut handler), Ok(1));
+        assert_eq!(
+            handler.0,
+            [(ACTION_CONTEXT_RESET_NOTIFICATION, 2, vec![0xaa])]
+        );
+
+        let tlb = CtbEvent {
+            action: ACTION_TLB_INVALIDATION_DONE,
+            data0: 0,
+            payload: &[0xbb],
+            released_response_credit: 1,
+            process_immediately: true,
+        };
+        pair.dispatch_event(tlb, &mut handler).unwrap();
+        assert_eq!(handler.0.len(), 2);
+        assert_eq!(handler.0[1], (ACTION_TLB_INVALIDATION_DONE, 0, vec![0xbb]));
+        assert_eq!(pair.process_incoming_requests(&mut handler), Ok(0));
     }
 
     #[test]

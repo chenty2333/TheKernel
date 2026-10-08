@@ -22,6 +22,8 @@ Rust 侧复用 `kernel/src/drm/intel/{gt.rs,gt_probe.rs,gem_exec.rs,gem_context.
 
 `guc_submission.rs` 已补入上游 v69 context/process descriptors、v70 scheduling WQ descriptors、context registration/policy/action 编码、multi/single context ID partition、request scheduling state transitions、sched-state 位/blocked 引用计数，以及 multi-LRC WQ item/no-op wrap 编码。`CtDmaMemory` 保留了 GuC submission state，并有 CTB register/request/event 发布 helper，但既有 N305 RCS/BCS submitter 尚未调用它；还缺真实 engine/context/RCS backend life-cycle、tasklet/IRQ callsites、preemption/time-slice scheduler 与 reset integration。这是 ABI/queue 切片，不可据此宣称 GuC 默认提交可工作。
 
+`guc_ct.rs` 已提供同步 TLB 完成和 FIFO deferred-event dispatch adapter（分别对应上游 receive-context 路径与 incoming-request worker）；GuC 事件业务 handler 以及 kernel 侧 G2H interrupt/tasklet/workqueue 调用链仍未接入。
+
 ## 移植边界
 
 不翻译 Linux DRM 框架、debugfs/sysfs 管理面、非 Gen12 平台路径及任务未列出的显示功能。GSC、LMEM-only/独显路径以及需要尚不存在的内核内存/用户页能力部分，先核对 Gen12 ADL 集显调用路径；不能安全映射的功能记录为未移植，不以占位成功掩盖。上游代码按函数保留控制流和错误顺序，翻译文件顶部登记来源/完整版权行，每个翻译函数用 `// upstream: <文件> <函数>()` 标注；MIT 全文及来源登记遵守 `COMMON.md`。
