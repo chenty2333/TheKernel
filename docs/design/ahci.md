@@ -28,6 +28,8 @@ ID/revision/name/quirk table is translated in `tk-axdriver/src/ahci/pci_ids.rs`;
 `ahci_pci_attach` selects BAR0 for the ABAR0 quirk and BAR5 otherwise. Remaining
 porting work includes every port/device publication, MSI/MSI-X routing,
 enclosure management, Intel remapped NVMe, CAM CCB/SCSI translation, hotplug,
-publication of multiple disks per HBA, multi-slot scheduling/recovery, and
-concurrent NCQ submission. The PCI path has only been compiled so far; QEMU disk read/write
+automatic block-device publication for media inserted into an empty port,
+PCI-function removal events, multi-slot scheduling/recovery, and concurrent
+NCQ submission. An existing port returns I/O errors while absent and only
+resumes after IDENTIFY geometry and serial/model/capacity fingerprint match. The PCI path has only been compiled so far; QEMU disk read/write
 acceptance still remains.

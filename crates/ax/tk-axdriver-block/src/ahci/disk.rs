@@ -227,6 +227,7 @@ pub struct AhciDisk<I: AhciIo> {
     port: PortState,
     workspace: ManuallyDrop<PortWorkspace>,
     geometry: AtaGeometry,
+    identity_digest: u64,
     ncq: bool,
     poisoned: bool,
     workspace_live: bool,
@@ -295,6 +296,7 @@ impl<I: AhciIo> AhciDisk<I> {
                 ncq_queue_depth: 0,
                 trim: false,
             },
+            identity_digest: 0,
             ncq: false,
             poisoned: false,
             workspace_live: true,
@@ -303,22 +305,74 @@ impl<I: AhciIo> AhciDisk<I> {
         };
         let mut identify = [0u8; 512];
         if disk
-            .transfer_read(AtaRequest::Identify { pmp_port: 0 }, &mut identify)
+            .execute(AtaRequest::Identify { pmp_port: 0 }, identify.len())
             .is_err()
         {
             return Err(disk.attach_failure(AhciDiskError::IdentifyFailed));
         }
+        // SAFETY: IDENTIFY completed and the persistent bounce buffer holds
+        // the full 512-byte device response.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                disk.workspace().bounce.cpu.as_ptr(),
+                identify.as_mut_ptr(),
+                identify.len(),
+            )
+        };
         match parse_identify(&identify) {
             Some(geometry) if disk.workspace().bounce.len >= geometry.block_size => {
                 disk.ncq = geometry.ncq
                     && controller_capabilities_for_ncq(disk.controller.capabilities)
                     && disk.port.quirks & super::regs::AHCI_Q_NONCQ == 0;
                 disk.geometry = geometry;
+                disk.identity_digest = identify_digest(&identify);
             }
             Some(_) => return Err(disk.attach_failure(AhciDiskError::InvalidWorkspace)),
             None => return Err(disk.attach_failure(AhciDiskError::InvalidIdentifyData)),
         }
         Ok(disk)
+    }
+
+    /// Ensure the original ATA medium is online. A removed disk returns an
+    /// I/O error; when a medium is reinserted, IDENTIFY must match both the
+    /// saved geometry and stable serial/model/capacity fields before the old
+    /// block-device identity may resume I/O.
+    fn ensure_connected(&mut self) -> Result<(), AhciDiskError> {
+        if self.poisoned {
+            return Err(AhciDiskError::CommandTimeout);
+        }
+        let base = self.port.register_base();
+        let status = self
+            .controller
+            .io_mut()
+            .read32(base + super::regs::AHCI_P_SSTS);
+        if status & super::regs::ATA_SS_DET_MASK == super::regs::ATA_SS_DET_PHY_ONLINE
+            && status & super::regs::ATA_SS_SPD_MASK != super::regs::ATA_SS_SPD_NO_SPEED
+            && status & super::regs::ATA_SS_IPM_MASK == super::regs::ATA_SS_IPM_ACTIVE
+        {
+            return Ok(());
+        }
+        if !self.controller.ahci_sata_phy_reset(&mut self.port) {
+            return Err(AhciDiskError::NoDevice);
+        }
+        let mut identify = [0u8; 512];
+        self.execute(AtaRequest::Identify { pmp_port: 0 }, identify.len())?;
+        // SAFETY: the identify transaction finished before copying from bounce.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                self.workspace().bounce.cpu.as_ptr(),
+                identify.as_mut_ptr(),
+                identify.len(),
+            )
+        };
+        if parse_identify(&identify) != Some(self.geometry)
+            || identify_digest(&identify) != self.identity_digest
+        {
+            // Do not let a replacement disk inherit the stale device node.
+            self.poisoned = true;
+            return Err(AhciDiskError::NoDevice);
+        }
+        Ok(())
     }
 
     /// Geometry captured by ATA IDENTIFY DEVICE.
@@ -620,6 +674,7 @@ impl<I: AhciIo> AhciDisk<I> {
         if buffer.is_empty() {
             return Err(AhciDiskError::InvalidRequest);
         }
+        self.ensure_connected()?;
         self.execute(request, buffer.len())?;
         // SAFETY: copy only after the command completion proves DMA has ended.
         unsafe {
@@ -636,6 +691,7 @@ impl<I: AhciIo> AhciDisk<I> {
         if buffer.is_empty() {
             return Err(AhciDiskError::InvalidRequest);
         }
+        self.ensure_connected()?;
         // SAFETY: the bounce allocation is writable and `buffer.len()` is
         // bounded by the previously validated workspace capacity.
         unsafe {
@@ -750,6 +806,16 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
                 bytes: 0,
                 queue_full: true,
             });
+        }
+        let link_status = self
+            .controller
+            .io_mut()
+            .read32(self.port.register_base() + super::regs::AHCI_P_SSTS);
+        if link_status & super::regs::ATA_SS_DET_MASK != super::regs::ATA_SS_DET_PHY_ONLINE
+            || link_status & super::regs::ATA_SS_SPD_MASK == super::regs::ATA_SS_SPD_NO_SPEED
+            || link_status & super::regs::ATA_SS_IPM_MASK != super::regs::ATA_SS_IPM_ACTIVE
+        {
+            return Err(DevError::Again);
         }
         let request = &mut requests[0];
         if request.segments.len() > MAX_ASYNC_SEGMENTS {
@@ -896,6 +962,7 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
     }
 
     fn flush(&mut self) -> DevResult {
+        self.ensure_connected().map_err(map_error)?;
         self.execute(AtaRequest::FlushCacheExt { pmp_port: 0 }, 0)
             .map_err(map_error)
     }
@@ -909,6 +976,7 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
     }
 
     fn discard_blocks(&mut self, range: BlockRange) -> DevResult {
+        self.ensure_connected().map_err(map_error)?;
         if !self.geometry.trim {
             return Err(DevError::Unsupported);
         }
@@ -1019,6 +1087,23 @@ const fn controller_capabilities_for_ncq(capabilities: u32) -> bool {
     capabilities & AHCI_CAP_SNCQ != 0
 }
 
+fn identify_digest(bytes: &[u8; 512]) -> u64 {
+    // ATA word ranges: serial (10..20), model (27..47), capacity (100..104),
+    // and logical-sector-size fields (106..119). This is an identity guard,
+    // not a cryptographic authenticity check.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in bytes[20..40]
+        .iter()
+        .chain(bytes[54..94].iter())
+        .chain(bytes[200..208].iter())
+        .chain(bytes[212..238].iter())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// Parses ATA IDENTIFY words into LBA48 geometry and advertised features.
 pub fn parse_identify(bytes: &[u8; 512]) -> Option<AtaGeometry> {
     let word = |index: usize| u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
@@ -1100,6 +1185,20 @@ mod tests {
         assert!(geometry.trim);
         set_word(&mut bytes, 83, 0);
         assert_eq!(parse_identify(&bytes), None);
+    }
+
+    #[test]
+    fn identify_digest_changes_with_serial_model_or_capacity() {
+        let first = [0u8; 512];
+        let mut second = first;
+        second[20] = 1;
+        assert_ne!(identify_digest(&first), identify_digest(&second));
+        second = first;
+        second[54] = 1;
+        assert_ne!(identify_digest(&first), identify_digest(&second));
+        second = first;
+        second[200] = 1;
+        assert_ne!(identify_digest(&first), identify_digest(&second));
     }
 
     #[test]
@@ -1190,7 +1289,22 @@ mod tests {
         let workspace =
             PortWorkspace::new(command_list, received_fis, command_table, bounce).unwrap();
         let disk = AhciDisk {
-            controller: AhciController::new(FakeIo::default(), AHCI_CAP_64BIT, 0, 0),
+            controller: AhciController::new(
+                FakeIo {
+                    registers: {
+                        let mut regs = [0; 128];
+                        regs[(AHCI_OFFSET + super::super::regs::AHCI_P_SSTS) / 4] =
+                            super::super::regs::ATA_SS_DET_PHY_ONLINE
+                                | super::super::regs::ATA_SS_SPD_GEN1
+                                | super::super::regs::ATA_SS_IPM_ACTIVE;
+                        regs
+                    },
+                    ..FakeIo::default()
+                },
+                AHCI_CAP_64BIT,
+                0,
+                0,
+            ),
             port: PortState::new(0),
             workspace: ManuallyDrop::new(workspace),
             geometry: AtaGeometry {
@@ -1201,6 +1315,7 @@ mod tests {
                 ncq_queue_depth: 0,
                 trim: false,
             },
+            identity_digest: 0,
             ncq: false,
             poisoned: false,
             workspace_live: true,
