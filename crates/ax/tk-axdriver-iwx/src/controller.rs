@@ -240,6 +240,29 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         Err(SyncCommandError::Timeout)
     }
 
+    /// Submit a pure wire-layout command through the same ACK/response waiter.
+    pub fn send_encoded_command_wait<E>(
+        &mut self,
+        command: &crate::EncodedCommand,
+        external: Option<&mut A::Region>,
+        dispatch: impl FnMut(&crate::RxPacket<'_>, crate::RxMbufPlan) -> Result<bool, E>,
+    ) -> Result<crate::CompletedCommand, SyncCommandError<E>> {
+        let payload = command
+            .bytes
+            .get(crate::HOST_COMMAND_HEADER_BYTES..)
+            .ok_or(SyncCommandError::Command(
+                crate::CommandError::InvalidResponse,
+            ))?;
+        let parts = [payload];
+        let host = HostCommand {
+            id: command.original_id,
+            flags: command.flags,
+            response_capacity: command.response_capacity,
+            parts: &parts,
+        };
+        self.send_command_wait(&host, external, dispatch)
+    }
+
     /// Publish Init/regular firmware context and wait for the matching ALIVE event.
     // upstream: if_iwx.c iwx_load_firmware()
     pub fn boot_firmware<E>(

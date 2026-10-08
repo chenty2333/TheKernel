@@ -17,6 +17,7 @@ pub const CMD_SEND_DURING_RFKILL: u32 = 1 << 2;
 pub const CMD_FAILED_MASK: u8 = 0x40;
 pub const LONG_GROUP: u8 = 1;
 pub const FIRST_TB_BYTES: usize = 20;
+pub const HOST_COMMAND_HEADER_BYTES: usize = 8;
 pub const INLINE_COMMAND_BYTES: usize = 324;
 pub const MAX_COMMAND_PAYLOAD: usize = 4096 - 8;
 pub const MAX_RESPONSE_BYTES: usize = 4096;
