@@ -25,3 +25,8 @@ selects its Touchpad/Touchscreen TLC before resolving Contact Count Maximum,
 Button Type and Input Mode features. The Contact Count decoder is likewise
 scoped to that TLC, avoiding feature/report-ID collisions in composite HID
 interfaces.
+
+The HID bus adapter now exposes the source's generic `get_report`, `set_report`,
+`read`, `write`, `set_idle`, and `set_protocol` wrapper operations over the
+transport-independent I2C-HID client. These keep `hidbus` policy distinct from
+`iichid` wire commands while mapping the newbus dispatch to TheKernel methods.

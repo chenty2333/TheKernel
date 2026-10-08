@@ -354,55 +354,45 @@ impl I2cInput {
         report_id: u8,
         out: &mut [u8],
     ) -> DevResult<usize> {
-        self.state
-            .get_mut()
-            .device
-            .get_report(report_type, report_id, out)
-            .map_err(map_hid_error)
+        crate::hidbus::get_report(
+            &mut self.state.get_mut().device,
+            report_type,
+            report_id,
+            out,
+        )
+        .map_err(map_hid_error)
     }
 
     // upstream: iichid.c iichid_read() / iichid_intr_poll()
     pub fn read_input_report(&mut self, out: &mut [u8]) -> DevResult<usize> {
-        self.state
-            .get_mut()
-            .device
-            .read_input(out)
-            .map_err(map_hid_error)
+        crate::hidbus::read(&mut self.state.get_mut().device, out).map_err(map_hid_error)
     }
 
     // upstream: iichid.c iichid_set_report()
     pub fn set_report(&mut self, report_type: u8, report_id: u8, report: &[u8]) -> DevResult<()> {
-        self.state
-            .get_mut()
-            .device
-            .set_report(report_type, report_id, report)
-            .map_err(map_hid_error)
+        crate::hidbus::set_report(
+            &mut self.state.get_mut().device,
+            report_type,
+            report_id,
+            report,
+        )
+        .map_err(map_hid_error)
     }
 
     // upstream: iichid.c iichid_write()
     pub fn write_output(&mut self, report: &[u8]) -> DevResult<()> {
-        self.state
-            .get_mut()
-            .device
-            .write_output(report)
-            .map_err(map_hid_error)
+        crate::hidbus::write(&mut self.state.get_mut().device, report).map_err(map_hid_error)
     }
 
     // upstream: iichid.c iichid_set_idle()
     pub fn set_idle(&mut self, duration: u16, report_id: u8) -> DevResult<()> {
-        self.state
-            .get_mut()
-            .device
-            .set_idle(duration, report_id)
+        crate::hidbus::set_idle(&mut self.state.get_mut().device, duration, report_id)
             .map_err(map_hid_error)
     }
 
     // upstream: iichid.c iichid_set_protocol()
     pub fn set_protocol(&mut self, protocol: u16) -> DevResult<()> {
-        self.state
-            .get_mut()
-            .device
-            .set_protocol(protocol)
+        crate::hidbus::set_protocol(&mut self.state.get_mut().device, protocol)
             .map_err(map_hid_error)
     }
 
