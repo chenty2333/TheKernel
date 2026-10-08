@@ -7,6 +7,19 @@
 
 use crate::{RATE_MAX_SIZE, RATE_VALUE, RateSet};
 
+pub const FLAG_USE_PROTECTION: u32 = 0x0010_0000;
+pub const FLAG_SHORT_PREAMBLE: u32 = 0x0004_0000;
+pub const FLAG_SHORT_SLOT: u32 = 0x0002_0000;
+pub const CAP_SHORT_PREAMBLE: u32 = 0x0000_0100;
+pub const CAP_SHORT_SLOT: u32 = 0x0000_0080;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ErpState {
+    pub use_protection: bool,
+    pub short_preamble: bool,
+    pub short_slot: bool,
+}
+
 pub const FIX_RATE_SORT: u32 = 0x01;
 pub const FIX_RATE_FIXED: u32 = 0x02;
 pub const FIX_RATE_NEGOTIATE: u32 = 0x04;
@@ -87,12 +100,87 @@ pub fn fix_rate(peer_rates: &mut RateSet, config: FixRateConfig<'_>, mut flags: 
     }
 }
 
+/// Set the short-slot flag and return whether the state changed.
+// upstream: ieee80211_proto.c ieee80211_set_shortslottime()
+pub fn set_short_slot(flags: &mut u32, enabled: bool) -> bool {
+    let old = *flags & FLAG_SHORT_SLOT != 0;
+    if enabled {
+        *flags |= FLAG_SHORT_SLOT;
+    } else {
+        *flags &= !FLAG_SHORT_SLOT;
+    }
+    old != enabled
+}
+
+/// Reset 11g ERP state and derive short-slot/preamble behavior from mode/band.
+// upstream: ieee80211_proto.c ieee80211_reset_erp()
+pub fn reset_erp(
+    mode: crate::PhyMode,
+    channel_is_2ghz: bool,
+    channel_is_5ghz: bool,
+    hostap_mode: bool,
+    capabilities: u32,
+) -> ErpState {
+    let mode_5ghz = mode == crate::PhyMode::A || (mode == crate::PhyMode::N && channel_is_5ghz);
+    let mode_2ghz_g_or_n =
+        mode == crate::PhyMode::G || (mode == crate::PhyMode::N && channel_is_2ghz);
+    let short_slot =
+        mode_5ghz || (hostap_mode && mode_2ghz_g_or_n && capabilities & CAP_SHORT_SLOT != 0);
+    let short_preamble = mode_5ghz || capabilities & CAP_SHORT_PREAMBLE != 0;
+    ErpState {
+        use_protection: false,
+        short_preamble,
+        short_slot,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn local() -> RateSet {
         RateSet::new(&[0x82, 0x84, 11, 22, 0x8c, 18, 24, 36])
+    }
+
+    #[test]
+    fn erp_reset_and_slot_changes_follow_band_and_capability_rules() {
+        let state = reset_erp(crate::PhyMode::A, false, true, false, 0);
+        assert_eq!(
+            state,
+            ErpState {
+                use_protection: false,
+                short_preamble: true,
+                short_slot: true
+            }
+        );
+        let state = reset_erp(crate::PhyMode::G, true, false, true, CAP_SHORT_SLOT);
+        assert_eq!(
+            state,
+            ErpState {
+                use_protection: false,
+                short_preamble: false,
+                short_slot: true
+            }
+        );
+        let state = reset_erp(
+            crate::PhyMode::G,
+            true,
+            false,
+            false,
+            CAP_SHORT_SLOT | CAP_SHORT_PREAMBLE,
+        );
+        assert_eq!(
+            state,
+            ErpState {
+                use_protection: false,
+                short_preamble: true,
+                short_slot: false
+            }
+        );
+        let mut flags = FLAG_USE_PROTECTION;
+        assert!(set_short_slot(&mut flags, true));
+        assert_eq!(flags, FLAG_USE_PROTECTION | FLAG_SHORT_SLOT);
+        assert!(!set_short_slot(&mut flags, true));
     }
 
     #[test]

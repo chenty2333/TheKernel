@@ -109,3 +109,6 @@ firmware-specific probe serializer reuses its individual IE encoders.
 The rate-fix policy now matches local and peer rates, optionally sorts and
 removes unaccepted entries, restores local Basic bits, and returns the source
 failure sentinel for unsupported mandatory AP rates or mismatched fixed rates.
+The proto layer now computes 11g protection reset and short-slot/preamble
+selection from PHY mode, band, AP mode and local capability bits; a transition
+helper reports when the driver-facing short-slot state changes.
