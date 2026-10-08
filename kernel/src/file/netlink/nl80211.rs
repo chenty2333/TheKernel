@@ -27,12 +27,28 @@ const CMD_SCAN_ABORTED: u8 = 35;
 const CMD_ABORT_SCAN: u8 = 114;
 const NL80211_SCAN_GROUP_MASK: u32 = 1 << 1;
 const CMD_GET_REG: u8 = 31;
+const CMD_CONNECT: u8 = 46;
+const CMD_DISCONNECT: u8 = 48;
+const CMD_GET_STATION: u8 = 17;
+const CMD_NEW_STATION: u8 = 19;
+const NL80211_MLME_GROUP_MASK: u32 = 1 << 3;
 const ATTR_WIPHY: u16 = 1;
 const ATTR_WIPHY_NAME: u16 = 2;
 const ATTR_IFINDEX: u16 = 3;
 const ATTR_IFNAME: u16 = 4;
 const ATTR_IFTYPE: u16 = 5;
 const ATTR_MAC: u16 = 6;
+const ATTR_STA_INFO: u16 = 21;
+const ATTR_STATUS_CODE: u16 = 72;
+const ATTR_WIPHY_FREQ: u16 = 38;
+const ATTR_CONNECT_IE: u16 = 42;
+const ATTR_AUTH_TYPE: u16 = 53;
+const ATTR_REASON_CODE: u16 = 54;
+const ATTR_SSID: u16 = 52;
+const ATTR_CIPHER_SUITES_PAIRWISE: u16 = 73;
+const ATTR_CIPHER_SUITE_GROUP: u16 = 74;
+const ATTR_WPA_VERSIONS: u16 = 75;
+const ATTR_AKM_SUITES: u16 = 76;
 const ATTR_BSS: u16 = 47;
 const ATTR_SCAN_FREQUENCIES: u16 = 44;
 const ATTR_SCAN_SSIDS: u16 = 45;
@@ -60,6 +76,7 @@ const BSS_ATTR_CAPABILITY: u16 = 5;
 const BSS_ATTR_INFORMATION_ELEMENTS: u16 = 6;
 const BSS_ATTR_SIGNAL_MBM: u16 = 7;
 const BSS_ATTR_SEEN_MS_AGO: u16 = 10;
+const STA_INFO_SIGNAL: u16 = 7;
 const BITRATE_ATTR_RATE: u16 = 1;
 const BITRATE_ATTR_2GHZ_SHORTPREAMBLE: u16 = 2;
 const IFTYPE_STATION: u32 = 2;
@@ -141,6 +158,38 @@ fn scan_event_message(ifindex: u32, event: axnet::WirelessScanEvent) -> Vec<u8> 
     nl80211_message(&request, 0, FAMILY_ID, payload, false)
 }
 
+fn publish_connect_event(ifindex: u32, station: &axnet::WirelessStationInfo) {
+    super::queue_nl80211_multicast(
+        connect_event_message(ifindex, station),
+        NL80211_MLME_GROUP_MASK,
+    );
+}
+
+fn connect_event_message(ifindex: u32, station: &axnet::WirelessStationInfo) -> Vec<u8> {
+    let mut payload = payload_with(&GenlMsgHdr {
+        cmd: CMD_CONNECT,
+        version: FAMILY_VERSION,
+        reserved: 0,
+    });
+    push_attr(&mut payload, ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    push_attr(&mut payload, ATTR_MAC, &station.bssid);
+    push_attr(&mut payload, ATTR_STATUS_CODE, &0u16.to_ne_bytes());
+    push_attr(
+        &mut payload,
+        ATTR_WIPHY_FREQ,
+        &station.frequency_mhz.to_ne_bytes(),
+    );
+    let request = NlMsgHdr {
+        nlmsg_len: (size_of::<NlMsgHdr>() + payload.len()) as u32,
+        nlmsg_type: FAMILY_ID,
+        nlmsg_flags: 0,
+        nlmsg_seq: 0,
+        nlmsg_pid: 0,
+    };
+    let message = nl80211_message(&request, 0, FAMILY_ID, payload, false);
+    message
+}
+
 /// Handle the wiphy/interface dump operations used by `iw dev` and `iw phy`.
 pub(super) fn handle(
     socket: &NetlinkSocket,
@@ -163,6 +212,9 @@ pub(super) fn handle(
             | CMD_TRIGGER_SCAN
             | CMD_ABORT_SCAN
             | CMD_GET_REG
+            | CMD_CONNECT
+            | CMD_DISCONNECT
+            | CMD_GET_STATION
     ) {
         return Err(AxError::OperationNotSupported);
     }
@@ -198,6 +250,57 @@ pub(super) fn handle(
             return Err(AxError::NotFound);
         }
         axnet::abort_wireless_scan(ifindex)?;
+        return Ok(());
+    }
+    if request.cmd == CMD_CONNECT {
+        if dump {
+            return Err(AxError::InvalidInput);
+        }
+        let (ifindex, connect) = parse_connect_request(attributes)?;
+        if !interfaces
+            .iter()
+            .any(|interface| interface.ifindex == ifindex)
+        {
+            return Err(AxError::NotFound);
+        }
+        axnet::connect_wireless(ifindex, &connect)?;
+        let station = axnet::wireless_station_info(ifindex)?;
+        publish_connect_event(ifindex, &station);
+        return Ok(());
+    }
+    if request.cmd == CMD_DISCONNECT {
+        if dump {
+            return Err(AxError::InvalidInput);
+        }
+        let (ifindex, reason) = parse_disconnect_request(attributes)?;
+        if !interfaces
+            .iter()
+            .any(|interface| interface.ifindex == ifindex)
+        {
+            return Err(AxError::NotFound);
+        }
+        axnet::disconnect_wireless(ifindex, reason)?;
+        return Ok(());
+    }
+    if request.cmd == CMD_GET_STATION {
+        let (ifindex, address) = parse_station_request(attributes)?;
+        let interface = interfaces
+            .iter()
+            .find(|interface| interface.ifindex == ifindex)
+            .ok_or(AxError::NotFound)?;
+        match axnet::wireless_station_info(ifindex) {
+            Ok(station) if address.is_none_or(|address| address == station.bssid) => {
+                records.push(station_message(header, port_id, interface, &station, dump));
+            }
+            Ok(_) | Err(AxError::NotFound) if dump => {}
+            _ => return Err(AxError::NotFound),
+        }
+        for record in records {
+            socket.enqueue_kernel_permitted(permit, record);
+        }
+        if dump {
+            socket.enqueue_kernel_permitted(permit, empty_dump_response(header, port_id));
+        }
         return Ok(());
     }
     let selectors = parse_selectors(attributes)?;
@@ -323,6 +426,139 @@ fn parse_scan_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessScanRe
     ))
 }
 
+fn parse_connect_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessConnectRequest)> {
+    let mut ifindex = None;
+    let mut ssid = None;
+    let mut bssid = None;
+    let mut authentication_type = None;
+    let mut wpa_versions = None;
+    let mut pairwise_ciphers = Vec::new();
+    let mut pairwise_present = false;
+    let mut group_cipher = None;
+    let mut akm_suites = Vec::new();
+    let mut akm_present = false;
+    let mut information_elements = None;
+    for_each_rtattr(attributes, |kind, value| match kind {
+        ATTR_IFINDEX if ifindex.is_none() && value.len() == 4 => {
+            ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_SSID if ssid.is_none() && value.len() <= 32 => {
+            ssid = Some(value.to_vec());
+            Ok(())
+        }
+        ATTR_MAC if bssid.is_none() && value.len() == 6 => {
+            bssid = Some(value.try_into().unwrap());
+            Ok(())
+        }
+        ATTR_AUTH_TYPE if authentication_type.is_none() && value.len() == 4 => {
+            authentication_type = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_WPA_VERSIONS if wpa_versions.is_none() && value.len() == 4 => {
+            wpa_versions = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_CIPHER_SUITE_GROUP if group_cipher.is_none() && value.len() == 4 => {
+            group_cipher = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_CIPHER_SUITES_PAIRWISE if !pairwise_present => {
+            pairwise_present = true;
+            for_each_rtattr(value, |_, suite| {
+                if suite.len() != 4
+                    || pairwise_ciphers.contains(&u32::from_ne_bytes(suite.try_into().unwrap()))
+                {
+                    return Err(AxError::InvalidInput);
+                }
+                pairwise_ciphers.push(u32::from_ne_bytes(suite.try_into().unwrap()));
+                Ok(())
+            })
+        }
+        ATTR_AKM_SUITES if !akm_present => {
+            akm_present = true;
+            for_each_rtattr(value, |_, suite| {
+                if suite.len() != 4
+                    || akm_suites.contains(&u32::from_ne_bytes(suite.try_into().unwrap()))
+                {
+                    return Err(AxError::InvalidInput);
+                }
+                akm_suites.push(u32::from_ne_bytes(suite.try_into().unwrap()));
+                Ok(())
+            })
+        }
+        ATTR_CONNECT_IE if information_elements.is_none() && value.len() <= 4096 => {
+            information_elements = Some(value.to_vec());
+            Ok(())
+        }
+        ATTR_IFINDEX
+        | ATTR_SSID
+        | ATTR_MAC
+        | ATTR_AUTH_TYPE
+        | ATTR_WPA_VERSIONS
+        | ATTR_CIPHER_SUITE_GROUP
+        | ATTR_CIPHER_SUITES_PAIRWISE
+        | ATTR_AKM_SUITES
+        | ATTR_CONNECT_IE => Err(AxError::InvalidInput),
+        _ => Err(AxError::OperationNotSupported),
+    })?;
+    if pairwise_ciphers.len() > 8 || akm_suites.len() > 8 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok((
+        ifindex.ok_or(AxError::InvalidInput)?,
+        axnet::WirelessConnectRequest {
+            ssid: ssid.ok_or(AxError::InvalidInput)?,
+            bssid,
+            authentication_type: authentication_type.unwrap_or(0),
+            wpa_versions: wpa_versions.unwrap_or(0),
+            pairwise_ciphers,
+            group_cipher,
+            akm_suites,
+            information_elements: information_elements.unwrap_or_default(),
+        },
+    ))
+}
+
+fn parse_disconnect_request(attributes: &[u8]) -> AxResult<(u32, u16)> {
+    let mut ifindex = None;
+    let mut reason = None;
+    for_each_rtattr(attributes, |kind, value| match kind {
+        ATTR_IFINDEX if ifindex.is_none() && value.len() == 4 => {
+            ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_REASON_CODE if reason.is_none() && value.len() == 2 => {
+            reason = Some(u16::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_IFINDEX | ATTR_REASON_CODE => Err(AxError::InvalidInput),
+        _ => Err(AxError::OperationNotSupported),
+    })?;
+    Ok((
+        ifindex.ok_or(AxError::InvalidInput)?,
+        reason.unwrap_or_default(),
+    ))
+}
+
+fn parse_station_request(attributes: &[u8]) -> AxResult<(u32, Option<[u8; 6]>)> {
+    let mut ifindex = None;
+    let mut address = None;
+    for_each_rtattr(attributes, |kind, value| match kind {
+        ATTR_IFINDEX if ifindex.is_none() && value.len() == 4 => {
+            ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_MAC if address.is_none() && value.len() == 6 => {
+            address = Some(value.try_into().unwrap());
+            Ok(())
+        }
+        ATTR_IFINDEX | ATTR_MAC => Err(AxError::InvalidInput),
+        _ => Err(AxError::OperationNotSupported),
+    })?;
+    Ok((ifindex.ok_or(AxError::InvalidInput)?, address))
+}
+
 fn scan_bss_message(
     request: &NlMsgHdr,
     port_id: u32,
@@ -366,6 +602,27 @@ fn scan_bss_message(
     push_attr(&mut attributes, BSS_ATTR_SEEN_MS_AGO, &0u32.to_ne_bytes());
     push_attr(&mut payload, ATTR_BSS | NLA_F_NESTED, &attributes);
     nl80211_message(request, port_id, FAMILY_ID, payload, true)
+}
+
+fn station_message(
+    request: &NlMsgHdr,
+    port_id: u32,
+    interface: &axnet::WirelessInterfaceInfo,
+    station: &axnet::WirelessStationInfo,
+    multipart: bool,
+) -> Vec<u8> {
+    let mut payload = payload_with(&GenlMsgHdr {
+        cmd: CMD_NEW_STATION,
+        version: FAMILY_VERSION,
+        reserved: 0,
+    });
+    push_attr(&mut payload, ATTR_IFINDEX, &interface.ifindex.to_ne_bytes());
+    push_attr(&mut payload, ATTR_MAC, &station.bssid);
+    let mut statistics = Vec::new();
+    let signal_dbm = (station.signal_mbm / 100).clamp(-127, 0) as i8;
+    push_attr(&mut statistics, STA_INFO_SIGNAL, &[signal_dbm as u8]);
+    push_attr(&mut payload, ATTR_STA_INFO | NLA_F_NESTED, &statistics);
+    nl80211_message(request, port_id, FAMILY_ID, payload, multipart)
 }
 
 fn empty_dump_response(request: &NlMsgHdr, port_id: u32) -> Vec<u8> {
@@ -467,6 +724,8 @@ fn wiphy_message(
         CMD_ABORT_SCAN,
         CMD_GET_SCAN,
         CMD_GET_REG,
+        CMD_CONNECT,
+        CMD_GET_STATION,
     ]
     .into_iter()
     .enumerate()
@@ -605,9 +864,16 @@ mod tests {
         assert_eq!(CMD_SCAN_ABORTED, 35);
         assert_eq!(CMD_ABORT_SCAN, 114);
         assert_eq!(CMD_GET_REG, 31);
+        assert_eq!(CMD_CONNECT, 46);
+        assert_eq!(CMD_DISCONNECT, 48);
+        assert_eq!(CMD_GET_STATION, 17);
+        assert_eq!(CMD_NEW_STATION, 19);
+        assert_eq!(ATTR_WIPHY_FREQ, 38);
+        assert_eq!(ATTR_STATUS_CODE, 72);
         assert_eq!(ATTR_REG_ALPHA2, 33);
         assert_eq!(ATTR_IFINDEX, 3);
         assert_eq!(ATTR_IFNAME, 4);
+        assert_eq!(ATTR_STA_INFO, 21);
         assert_eq!(MULTICAST_GROUPS[1], "scan");
         assert_eq!(MULTICAST_GROUPS[3], "mlme");
     }
@@ -936,6 +1202,153 @@ mod tests {
 
         push_attr(&mut attrs, ATTR_IFINDEX, &10u32.to_ne_bytes());
         assert_eq!(parse_scan_request(&attrs), Err(AxError::InvalidInput));
+    }
+
+    #[test]
+    fn connect_and_disconnect_parse_station_uapi_attributes() {
+        let mut suites = Vec::new();
+        push_attr(&mut suites, 1, &0x000fac04u32.to_ne_bytes());
+        push_attr(&mut suites, 2, &0x000fac02u32.to_ne_bytes());
+        let mut akms = Vec::new();
+        push_attr(&mut akms, 1, &0x000fac02u32.to_ne_bytes());
+        let mut attrs = Vec::new();
+        push_attr(&mut attrs, ATTR_IFINDEX, &12u32.to_ne_bytes());
+        push_attr(&mut attrs, ATTR_SSID, b"secure");
+        push_attr(&mut attrs, ATTR_MAC, &[2, 1, 2, 3, 4, 5]);
+        push_attr(&mut attrs, ATTR_AUTH_TYPE, &0u32.to_ne_bytes());
+        push_attr(&mut attrs, ATTR_WPA_VERSIONS, &2u32.to_ne_bytes());
+        push_attr(
+            &mut attrs,
+            ATTR_CIPHER_SUITES_PAIRWISE | NLA_F_NESTED,
+            &suites,
+        );
+        push_attr(
+            &mut attrs,
+            ATTR_CIPHER_SUITE_GROUP,
+            &0x000fac04u32.to_ne_bytes(),
+        );
+        push_attr(&mut attrs, ATTR_AKM_SUITES | NLA_F_NESTED, &akms);
+        push_attr(&mut attrs, ATTR_CONNECT_IE, &[48, 2, 1, 0]);
+        let (ifindex, connect) = parse_connect_request(&attrs).unwrap();
+        assert_eq!(ifindex, 12);
+        assert_eq!(connect.ssid, b"secure");
+        assert_eq!(connect.bssid, Some([2, 1, 2, 3, 4, 5]));
+        assert_eq!(connect.authentication_type, 0);
+        assert_eq!(connect.wpa_versions, 2);
+        assert_eq!(connect.pairwise_ciphers, [0x000fac04, 0x000fac02]);
+        assert_eq!(connect.group_cipher, Some(0x000fac04));
+        assert_eq!(connect.akm_suites, [0x000fac02]);
+        assert_eq!(connect.information_elements, [48, 2, 1, 0]);
+
+        let mut disconnect = Vec::new();
+        push_attr(&mut disconnect, ATTR_IFINDEX, &12u32.to_ne_bytes());
+        push_attr(&mut disconnect, ATTR_REASON_CODE, &3u16.to_ne_bytes());
+        assert_eq!(parse_disconnect_request(&disconnect), Ok((12, 3)));
+        push_attr(&mut disconnect, ATTR_REASON_CODE, &4u16.to_ne_bytes());
+        assert_eq!(
+            parse_disconnect_request(&disconnect),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn station_request_requires_one_ifindex_and_accepts_optional_mac() {
+        let mut attrs = Vec::new();
+        push_attr(&mut attrs, ATTR_IFINDEX, &12u32.to_ne_bytes());
+        push_attr(&mut attrs, ATTR_MAC, &[2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            parse_station_request(&attrs),
+            Ok((12, Some([2, 3, 4, 5, 6, 7])))
+        );
+        push_attr(&mut attrs, ATTR_MAC, &[2, 3, 4, 5, 6, 8]);
+        assert_eq!(parse_station_request(&attrs), Err(AxError::InvalidInput));
+    }
+
+    #[test]
+    fn station_dump_encodes_bssid_and_signed_signal_as_nested_sta_info() {
+        let request = NlMsgHdr {
+            nlmsg_len: size_of::<NlMsgHdr>() as u32,
+            nlmsg_type: FAMILY_ID,
+            nlmsg_flags: NLM_F_DUMP,
+            nlmsg_seq: 3,
+            nlmsg_pid: 9,
+        };
+        let interface = axnet::WirelessInterfaceInfo {
+            name: "wlan0".into(),
+            ifindex: 12,
+            phy_index: 0,
+            rfkill_index: 0,
+            mac_address: [2, 1, 2, 3, 4, 5],
+            frequencies: Vec::new(),
+            phy_capabilities: Default::default(),
+            soft_blocked: false,
+            hard_blocked: false,
+        };
+        let station = axnet::WirelessStationInfo {
+            bssid: [2, 3, 4, 5, 6, 7],
+            frequency_mhz: 2437,
+            signal_mbm: -6123,
+            association_id: 17,
+        };
+        let message = station_message(&request, 9, &interface, &station, true);
+        let generic = size_of::<NlMsgHdr>();
+        assert_eq!(message[generic], CMD_NEW_STATION);
+        let mut attrs = Vec::new();
+        for_each_rtattr(
+            &message[generic + size_of::<GenlMsgHdr>()..],
+            |kind, value| {
+                attrs.push((kind, value.to_vec()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            attrs
+                .iter()
+                .any(|(kind, value)| *kind == ATTR_MAC && value == &station.bssid)
+        );
+        let nested = attrs
+            .iter()
+            .find(|(kind, _)| *kind == (ATTR_STA_INFO | NLA_F_NESTED))
+            .unwrap();
+        let mut signal = None;
+        for_each_rtattr(&nested.1, |kind, value| {
+            if kind == STA_INFO_SIGNAL {
+                signal = Some(value[0] as i8);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(signal, Some(-61));
+    }
+
+    #[test]
+    fn successful_connect_event_has_standard_mlme_attributes() {
+        let station = axnet::WirelessStationInfo {
+            bssid: [2, 3, 4, 5, 6, 7],
+            frequency_mhz: 5180,
+            signal_mbm: -4500,
+            association_id: 17,
+        };
+        let message = connect_event_message(12, &station);
+        let generic = size_of::<NlMsgHdr>();
+        assert_eq!(message[generic], CMD_CONNECT);
+        let mut status = None;
+        let mut frequency = None;
+        for_each_rtattr(
+            &message[generic + size_of::<GenlMsgHdr>()..],
+            |kind, value| {
+                if kind == ATTR_STATUS_CODE {
+                    status = Some(u16::from_ne_bytes(value.try_into().unwrap()));
+                } else if kind == ATTR_WIPHY_FREQ {
+                    frequency = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(status, Some(0));
+        assert_eq!(frequency, Some(5180));
     }
 
     #[test]

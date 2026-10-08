@@ -36,8 +36,8 @@ NVM/antenna-derived HT/VHT capability, MCS, and A-MPDU attributes are emitted;
 HE maps and supported cipher suites are not yet advertised. Rates use the
 matching 100-kbit/s UAPI units and 2.4 GHz short-preamble flags.
 The wiphy advertises a one-SSID scan limit and the GET_WIPHY,
-GET_INTERFACE, TRIGGER_SCAN, ABORT_SCAN, GET_SCAN, and GET_REG commands that
-currently have handlers. TRIGGER_SCAN validates the interface, the single-SSID limit and
+GET_INTERFACE, TRIGGER_SCAN, ABORT_SCAN, GET_SCAN, GET_REG, CONNECT, and
+GET_STATION commands that currently have handlers. TRIGGER_SCAN validates the interface, the single-SSID limit and
 frequency list, then asks the iwx controller to send the firmware UMAC scan
 request. GET_SCAN returns only beacon/probe-response observations parsed from
 firmware RX notifications and retained by the driver's bounded station scan
@@ -51,6 +51,12 @@ RX poll, and while a scan dump is queried. Firmware completion/abort emits
 NEW_SCAN_RESULTS/SCAN_ABORTED on the nl80211 `scan` multicast group. Events are
 deferred out of the RX service lock before listener delivery. GET_REG returns
 the global world alpha2 value; regulatory rule tables and per-phy domains are
-not yet emitted. Connection/authentication, key, station and regulatory rule
-operations remain incomplete. The required no-radio QEMU acceptance is
+not yet emitted. CONNECT currently admits only an explicitly open, unprotected
+Open-System BSS already present in the scan cache; WPA/RSN and caller-provided
+security IEs fail closed because key installation/data protection are not
+implemented. Successful open CONNECT queues a CONNECT event on the `mlme`
+group, and GET_STATION encodes the associated BSSID and signed signal value
+from the live driver record. DISCONNECT, NEW_KEY/SET_KEY/GET_KEY/DEL_KEY,
+other station/authentication events, and regulatory rule operations remain incomplete.
+The required no-radio QEMU acceptance is
 deferred until the task-5 command surface is complete; no fake radio is used.
