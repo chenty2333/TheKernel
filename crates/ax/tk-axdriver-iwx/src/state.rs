@@ -303,6 +303,153 @@ pub fn stop_association<E>(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum WifiState {
+    Init  = 0,
+    Scan  = 1,
+    Auth  = 2,
+    Assoc = 3,
+    Run   = 4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredTask {
+    Ba,
+    SetKey,
+    MacContext,
+    PhyContext,
+    BackgroundScanDone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateAction {
+    QueueStateTask,
+    CancelTask(DeferredTask),
+    ClearSetKeyQueue,
+    RunStop,
+    Deauthenticate,
+    Scan,
+    Authenticate,
+    Run,
+    ScheduleInit,
+    NotifyNet80211 { state: WifiState, arg: i32 },
+    ReleaseReference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateMachine {
+    pub current: WifiState,
+    pub pending: WifiState,
+    pub pending_arg: i32,
+    pub scanning: bool,
+    pub shutdown: bool,
+}
+
+/// Queue a newstate task, preserving repeated SCAN/AUTH transitions and RUN task cancellation.
+// upstream: if_iwx.c iwx_newstate()
+pub fn queue_state_change(state: &mut StateMachine, next: WifiState, arg: i32) -> Vec<StateAction> {
+    if state.pending == next && next != WifiState::Scan && next != WifiState::Auth {
+        return Vec::new();
+    }
+    let mut actions = Vec::new();
+    if state.current == WifiState::Run {
+        actions.extend([
+            StateAction::CancelTask(DeferredTask::Ba),
+            StateAction::CancelTask(DeferredTask::SetKey),
+            StateAction::ClearSetKeyQueue,
+            StateAction::CancelTask(DeferredTask::MacContext),
+            StateAction::CancelTask(DeferredTask::PhyContext),
+            StateAction::CancelTask(DeferredTask::BackgroundScanDone),
+        ]);
+    }
+    state.pending = next;
+    state.pending_arg = arg;
+    actions.push(StateAction::QueueStateTask);
+    actions
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionOutcome<E> {
+    Completed,
+    ScanQueued,
+    Shutdown,
+    Failed(E),
+}
+
+/// Execute deferred net80211 state work in source order and schedule recovery after errors.
+// upstream: if_iwx.c iwx_newstate_task()
+pub fn run_state_task<E>(
+    machine: &mut StateMachine,
+    mut execute: impl FnMut(StateAction) -> Result<(), E>,
+) -> TransitionOutcome<E> {
+    if machine.shutdown {
+        let _ = execute(StateAction::ReleaseReference);
+        return TransitionOutcome::Shutdown;
+    }
+    let next = machine.pending;
+    let old = machine.current;
+    let repeated_scan = old == WifiState::Scan && next == WifiState::Scan;
+    if repeated_scan && machine.scanning {
+        let _ = execute(StateAction::ReleaseReference);
+        return TransitionOutcome::Completed;
+    }
+    let mut failure = None;
+    if next <= old {
+        if old == WifiState::Run {
+            if let Err(error) = execute(StateAction::RunStop) {
+                failure = Some(error);
+            }
+        }
+        if failure.is_none()
+            && matches!(old, WifiState::Run | WifiState::Auth | WifiState::Assoc)
+            && next <= WifiState::Auth
+        {
+            if let Err(error) = execute(StateAction::Deauthenticate) {
+                failure = Some(error);
+            }
+        }
+    }
+    if machine.shutdown {
+        let _ = execute(StateAction::ReleaseReference);
+        return TransitionOutcome::Shutdown;
+    }
+    if failure.is_none() {
+        let action = match next {
+            WifiState::Init | WifiState::Assoc => None,
+            WifiState::Scan => Some(StateAction::Scan),
+            WifiState::Auth => Some(StateAction::Authenticate),
+            WifiState::Run => Some(StateAction::Run),
+        };
+        if let Some(action) = action {
+            if let Err(error) = execute(action) {
+                failure = Some(error);
+            } else if action == StateAction::Scan {
+                machine.current = WifiState::Scan;
+                let _ = execute(StateAction::ReleaseReference);
+                return TransitionOutcome::ScanQueued;
+            }
+        }
+    }
+    let outcome = if let Some(error) = failure {
+        if !machine.shutdown {
+            let _ = execute(StateAction::ScheduleInit);
+        }
+        TransitionOutcome::Failed(error)
+    } else {
+        if !machine.shutdown {
+            let _ = execute(StateAction::NotifyNet80211 {
+                state: next,
+                arg: machine.pending_arg,
+            });
+            machine.current = next;
+        }
+        TransitionOutcome::Completed
+    };
+    let _ = execute(StateAction::ReleaseReference);
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +640,82 @@ mod tests {
                 && !state.station_active
         );
         assert!(state.management_queue_active);
+    }
+
+    #[test]
+    fn state_work_cancels_run_tasks_and_preserves_scan_scan_policy() {
+        let mut machine = StateMachine {
+            current: WifiState::Run,
+            pending: WifiState::Run,
+            pending_arg: 0,
+            scanning: false,
+            shutdown: false,
+        };
+        let queued = queue_state_change(&mut machine, WifiState::Scan, 7);
+        assert_eq!(
+            queued,
+            [
+                StateAction::CancelTask(DeferredTask::Ba),
+                StateAction::CancelTask(DeferredTask::SetKey),
+                StateAction::ClearSetKeyQueue,
+                StateAction::CancelTask(DeferredTask::MacContext),
+                StateAction::CancelTask(DeferredTask::PhyContext),
+                StateAction::CancelTask(DeferredTask::BackgroundScanDone),
+                StateAction::QueueStateTask
+            ]
+        );
+        let mut executed = Vec::new();
+        assert_eq!(
+            run_state_task(&mut machine, |step| {
+                executed.push(step);
+                Ok::<_, ()>(())
+            }),
+            TransitionOutcome::ScanQueued
+        );
+        assert!(executed.contains(&StateAction::Scan));
+        assert_eq!(executed.last(), Some(&StateAction::ReleaseReference));
+        machine.scanning = true;
+        executed.clear();
+        assert_eq!(
+            run_state_task(&mut machine, |step| {
+                executed.push(step);
+                Ok::<_, ()>(())
+            }),
+            TransitionOutcome::Completed
+        );
+        assert_eq!(executed, [StateAction::ReleaseReference]);
+    }
+
+    #[test]
+    fn state_failure_restarts_init_and_shutdown_short_circuits() {
+        let mut machine = StateMachine {
+            current: WifiState::Auth,
+            pending: WifiState::Run,
+            pending_arg: 3,
+            scanning: false,
+            shutdown: false,
+        };
+        let mut steps = Vec::new();
+        let result = run_state_task(&mut machine, |step| {
+            steps.push(step);
+            if step == StateAction::Run {
+                Err("run")
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result, TransitionOutcome::Failed("run"));
+        assert!(steps.contains(&StateAction::ScheduleInit));
+        assert_eq!(steps.last(), Some(&StateAction::ReleaseReference));
+        machine.shutdown = true;
+        steps.clear();
+        assert_eq!(
+            run_state_task(&mut machine, |step| {
+                steps.push(step);
+                Ok::<_, ()>(())
+            }),
+            TransitionOutcome::Shutdown
+        );
+        assert_eq!(steps, [StateAction::ReleaseReference]);
     }
 }

@@ -38,9 +38,11 @@ mod rx_event;
 mod rx_packet;
 mod scan;
 mod scan_probe;
+mod spectrum;
 mod state;
 mod station;
 mod statistics;
+mod task;
 mod tx;
 mod tx_completion;
 
@@ -213,6 +215,12 @@ pub use scan_probe::{
     SUPPORTED_RATES_IE, ScanProbeRequest, VHT_CAPABILITIES_IE, build_scan_probe_request,
     encode_scan_probe_request,
 };
+pub use spectrum::{
+    SF_CONFIG_BYTES, SF_CONFIG_COMMAND, SF_FULL_ON, SF_INIT_OFF, SF_LONG_DELAY_AGING,
+    SF_LONG_DELAY_ON, SF_SCENARIO_COUNT, SF_TIMEOUT_TYPE_COUNT, SF_UNINIT, SF_WATERMARK_LEGACY,
+    SF_WATERMARK_MIMO2, SF_WATERMARK_SCAN, SF_WATERMARK_SISO, SpectrumError, fill_spectrum_payload,
+    spectrum_config_command,
+};
 pub use state::{
     AssociationState, AssociationStep, AuthError, AuthRequest, RunRequest, authenticate,
     deauthenticate, run_association, stop_association,
@@ -234,6 +242,7 @@ pub use statistics::{
     legacy_statistics_clear_command, statistics_clear_command, system_statistics_clear_command,
     system_statistics_end_notification, wait_system_statistics_clear,
 };
+pub use task::{TaskReferences, add_task, delete_task, release_task_reference};
 pub use tx::{EncodedTxFrame, TxError, TxFrame, encode_tx_frame, submit_tx_frame};
 pub use tx_completion::{
     COMPRESSED_BA_HEADER_BYTES, COMPRESSED_BA_RATID_BYTES, COMPRESSED_BA_TFD_BYTES,

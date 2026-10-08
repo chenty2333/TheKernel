@@ -68,3 +68,8 @@ Key setup uses `ADD_STA_KEY` for legacy firmware, v1/v2 IGTK commands where
 applicable, and `SEC_KEY_CMD` for MLD firmware; unsupported ciphers stay on
 software crypto. Deferred install bookkeeping opens the RSN port only after
 the source-required pairwise/group and (for MFP) integrity-group keys succeed.
+
+Deferred iwx state transitions now preserve RUN task cancellation, SCAN-to-SCAN
+behavior, shutdown short-circuiting, AUTH/DEAUTH/RUN/RUN_STOP action order, and
+task-reference ownership. Smart-FIFO state commands serialize the source's
+watermarks and timeout matrices and are omitted when firmware reports offload.
