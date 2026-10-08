@@ -1024,3 +1024,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): command waiter timeout/generation behavior and delayed external DMA release on ACK translated in `tk-axdriver-iwx/src/command.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): station drain ADD_STA, TXPATH_FLUSH and fixed response parsing, and ordered station-flush lifecycle translated in `tk-axdriver-iwx/src/station.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `sys/net80211/ieee80211.h` (ISC): U-APSD trigger TID selection, AC bitmap translations and maximum service period mapping translated in `tk-axdriver-iwx/src/power.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): DTIM-dependent power management command serialization, U-APSD timeout, keep-alive and beacon-abort order translated in `tk-axdriver-iwx/src/power.rs`.

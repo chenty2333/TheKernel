@@ -81,6 +81,191 @@ pub const fn uapsd_service_period(max_service_period: u8) -> u8 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PowerConfig {
+    pub monitor_mode: bool,
+    pub dtim_skip: u8,
+    pub level: u8,
+    pub mac_active: bool,
+    pub mac_id_color: u32,
+    pub dtim_period: u16,
+    pub beacon_interval_tu: u16,
+    pub uapsd_node: bool,
+    pub uapsd_supported: bool,
+    pub uapsd_access_categories: u8,
+    pub uapsd_acm: [bool; 4],
+    pub uapsd_max_service_period: u8,
+    pub asynchronous: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerError {
+    InvalidLevel,
+    Command(CommandError),
+}
+
+impl From<CommandError> for PowerError {
+    fn from(error: CommandError) -> Self {
+        Self::Command(error)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PowerCommands {
+    pub device: EncodedCommand,
+    pub mac: Option<EncodedCommand>,
+    pub beacon_abort_enabled: bool,
+    pub keep_alive_seconds: u16,
+}
+
+const POWER_TIMEOUTS_MS: [[(u16, u16, i8); 6]; 3] = [
+    [
+        (0, 0, 0),
+        (200, 500, 0),
+        (200, 300, 0),
+        (50, 100, 0),
+        (50, 25, 1),
+        (25, 25, 2),
+    ],
+    [
+        (0, 0, 0),
+        (200, 500, 0),
+        (200, 300, 0),
+        (50, 100, 0),
+        (50, 25, 1),
+        (25, 25, 2),
+    ],
+    [
+        (0, 0, 0),
+        (200, 500, 0),
+        (200, 300, 0),
+        (50, 100, 0),
+        (50, 25, 0),
+        (25, 25, 0),
+    ],
+];
+
+/// Build device and MAC power-table commands using the source DTIM/level policy.
+// upstream: if_iwx.c iwx_set_pslevel()
+pub fn build_power_commands(
+    config: PowerConfig,
+    slot: u8,
+    queue: u8,
+) -> Result<Option<PowerCommands>, PowerError> {
+    if config.monitor_mode {
+        return Ok(None);
+    }
+    if config.level >= 6 {
+        return Err(PowerError::InvalidLevel);
+    }
+    let dtim = if config.dtim_skip == 0 {
+        1
+    } else {
+        config.dtim_skip
+    };
+    let range = if dtim <= 2 {
+        0
+    } else if dtim <= 10 {
+        1
+    } else {
+        2
+    };
+    let (rx_timeout, tx_timeout, default_skip) = POWER_TIMEOUTS_MS[range][config.level as usize];
+    let skip_dtim = if config.dtim_skip == 0 {
+        0
+    } else {
+        default_skip
+    };
+    let is_async = if config.asynchronous { CMD_ASYNC } else { 0 };
+
+    let mut device_payload = [0u8; 4];
+    if config.level != 0 {
+        device_payload[..2].copy_from_slice(&POWER_SAVE_ENABLE.to_le_bytes());
+    }
+    let device_command = HostCommand {
+        id: POWER_TABLE_COMMAND,
+        flags: is_async,
+        response_capacity: 0,
+        parts: &[&device_payload],
+    };
+    let device = EncodedCommand::encode(&device_command, slot, queue)?;
+
+    if !config.mac_active {
+        return Ok(Some(PowerCommands {
+            device,
+            mac: None,
+            beacon_abort_enabled: false,
+            keep_alive_seconds: 0,
+        }));
+    }
+
+    let dtim_period = u64::from(config.dtim_period.max(1));
+    let dtim_msec = dtim_period * u64::from(config.beacon_interval_tu);
+    let keep_alive_seconds = (3 * dtim_msec)
+        .max(POWER_KEEP_ALIVE_PERIOD_SEC * 1000)
+        .div_ceil(1000)
+        .min(u64::from(u16::MAX)) as u16;
+    let mut mac_payload = [0u8; 40];
+    mac_payload[0..4].copy_from_slice(&config.mac_id_color.to_le_bytes());
+    let mut flags = 0u16;
+    if config.level != 0 {
+        flags |= POWER_SAVE_ENABLE | POWER_MANAGEMENT_ENABLE;
+        mac_payload[8..12].copy_from_slice(&(u32::from(rx_timeout) * 1024).to_le_bytes());
+        mac_payload[12..16].copy_from_slice(&(u32::from(tx_timeout) * 1024).to_le_bytes());
+        if config.uapsd_node && config.uapsd_supported {
+            flags |= POWER_ADVANCE_PM_ENABLE | POWER_UAPSD_MISBEHAVING_ENABLE;
+            mac_payload[16..20].copy_from_slice(&UAPSD_RX_DATA_TIMEOUT.to_le_bytes());
+            mac_payload[20..24].copy_from_slice(&UAPSD_TX_DATA_TIMEOUT.to_le_bytes());
+            mac_payload[31] = uapsd_qndp_tid(config.uapsd_access_categories, config.uapsd_acm);
+            mac_payload[32] = uapsd_ac_flags(config.uapsd_access_categories);
+            mac_payload[33] = config.uapsd_max_service_period & WMM_SP_MASK;
+        }
+        if skip_dtim != 0 {
+            flags |= POWER_SKIP_DTIM;
+            mac_payload[25] = (skip_dtim + 1) as u8;
+        }
+    }
+    mac_payload[4..6].copy_from_slice(&flags.to_le_bytes());
+    mac_payload[6..8].copy_from_slice(&keep_alive_seconds.to_le_bytes());
+    let mac_command = HostCommand {
+        id: MAC_PM_POWER_TABLE_COMMAND,
+        flags: is_async,
+        response_capacity: 0,
+        parts: &[&mac_payload],
+    };
+    let mac = EncodedCommand::encode(&mac_command, slot, queue)?;
+    Ok(Some(PowerCommands {
+        device,
+        mac: Some(mac),
+        beacon_abort_enabled: flags & POWER_MANAGEMENT_ENABLE != 0,
+        keep_alive_seconds,
+    }))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PowerApplyError<E> {
+    Send(E),
+    BeaconAbort(E),
+}
+
+/// Send device-wide power first, then MAC power, then beacon-abort policy.
+// upstream: if_iwx.c iwx_set_pslevel()
+pub fn apply_power_commands<E>(
+    commands: Option<&PowerCommands>,
+    mut send: impl FnMut(&EncodedCommand) -> Result<(), E>,
+    mut set_beacon_abort: impl FnMut(bool) -> Result<(), E>,
+) -> Result<(), PowerApplyError<E>> {
+    let Some(commands) = commands else {
+        return Ok(());
+    };
+    send(&commands.device).map_err(PowerApplyError::Send)?;
+    if let Some(mac) = &commands.mac {
+        send(mac).map_err(PowerApplyError::Send)?;
+        set_beacon_abort(commands.beacon_abort_enabled).map_err(PowerApplyError::BeaconAbort)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,4 +284,79 @@ mod tests {
         assert_eq!(uapsd_service_period(WMM_SP_6), 6);
         assert_eq!(uapsd_service_period(WMM_SP_ALL), 128);
     }
+
+    #[test]
+    fn power_tables_preserve_dtim_ranges_and_command_order() {
+        use alloc::vec::Vec;
+        use core::cell::RefCell;
+
+        let commands = build_power_commands(
+            PowerConfig {
+                monitor_mode: false,
+                dtim_skip: 11,
+                level: 4,
+                mac_active: true,
+                mac_id_color: 0x1234,
+                dtim_period: 2,
+                beacon_interval_tu: 100,
+                uapsd_node: true,
+                uapsd_supported: true,
+                uapsd_access_categories: WMM_AC_VO | WMM_AC_BE,
+                uapsd_acm: [false; 4],
+                uapsd_max_service_period: WMM_SP_4,
+                asynchronous: false,
+            },
+            2,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(commands.keep_alive_seconds, 25);
+        let mac = commands.mac.as_ref().unwrap();
+        assert_eq!(mac.bytes.len(), 8 + 40);
+        let payload = &mac.bytes[8..];
+        assert_eq!(
+            u16::from_le_bytes(payload[4..6].try_into().unwrap()),
+            POWER_SAVE_ENABLE
+                | POWER_MANAGEMENT_ENABLE
+                | POWER_ADVANCE_PM_ENABLE
+                | POWER_UAPSD_MISBEHAVING_ENABLE
+        );
+        assert_eq!(payload[25], 0); // DTIM>=11 level 4 disables the skip flag.
+        assert_eq!(payload[31], 6);
+        assert_eq!(payload[32], uapsd_ac_flags(WMM_AC_VO | WMM_AC_BE));
+        assert_eq!(payload[33], WMM_SP_4);
+        assert!(commands.beacon_abort_enabled);
+
+        let events = RefCell::new(Vec::new());
+        apply_power_commands(
+            Some(&commands),
+            |command| {
+                events.borrow_mut().push(command.wire_id);
+                Ok::<_, ()>(())
+            },
+            |enabled| {
+                events.borrow_mut().push(if enabled { 1 } else { 0 });
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events.borrow()[0..2],
+            [commands.device.wire_id, mac.wire_id]
+        );
+        assert_eq!(events.borrow()[2], 1);
+    }
 }
+use crate::{CMD_ASYNC, CommandError, EncodedCommand, HostCommand};
+
+pub const POWER_TABLE_COMMAND: u32 = 0x77;
+pub const MAC_PM_POWER_TABLE_COMMAND: u32 = 0xa9;
+pub const POWER_SAVE_ENABLE: u16 = 1 << 0;
+pub const POWER_MANAGEMENT_ENABLE: u16 = 1 << 1;
+pub const POWER_SKIP_DTIM: u16 = 1 << 2;
+pub const POWER_ADVANCE_PM_ENABLE: u16 = 1 << 9;
+pub const POWER_UAPSD_MISBEHAVING_ENABLE: u16 = 1 << 12;
+pub const UAPSD_RX_DATA_TIMEOUT: u32 = 50 * 1000;
+pub const UAPSD_TX_DATA_TIMEOUT: u32 = 50 * 1000;
+pub const POWER_KEEP_ALIVE_PERIOD_SEC: u64 = 25;

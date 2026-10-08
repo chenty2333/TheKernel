@@ -131,8 +131,12 @@ pub use phy::{
     PHY_WIDTH_80, PHY_WIDTH_160, PhyContextConfig, PhyContextError, phy_context_command,
 };
 pub use power::{
-    WMM_AC_BE, WMM_AC_BK, WMM_AC_MASK, WMM_AC_VI, WMM_AC_VO, WMM_SP_2, WMM_SP_4, WMM_SP_6,
-    WMM_SP_ALL, WMM_SP_MASK, uapsd_ac_flags, uapsd_ac_mask, uapsd_qndp_tid, uapsd_service_period,
+    MAC_PM_POWER_TABLE_COMMAND, POWER_ADVANCE_PM_ENABLE, POWER_KEEP_ALIVE_PERIOD_SEC,
+    POWER_MANAGEMENT_ENABLE, POWER_SAVE_ENABLE, POWER_SKIP_DTIM, POWER_TABLE_COMMAND,
+    POWER_UAPSD_MISBEHAVING_ENABLE, PowerApplyError, PowerCommands, PowerConfig, PowerError,
+    UAPSD_RX_DATA_TIMEOUT, UAPSD_TX_DATA_TIMEOUT, WMM_AC_BE, WMM_AC_BK, WMM_AC_MASK, WMM_AC_VI,
+    WMM_AC_VO, WMM_SP_2, WMM_SP_4, WMM_SP_6, WMM_SP_ALL, WMM_SP_MASK, apply_power_commands,
+    build_power_commands, uapsd_ac_flags, uapsd_ac_mask, uapsd_qndp_tid, uapsd_service_period,
 };
 pub use queue::{
     DATA_PATH_GROUP as TX_DATA_PATH_GROUP, DEFAULT_QUEUE_SIZE, DQA_QUEUE_ADD, DQA_QUEUE_REMOVE,
