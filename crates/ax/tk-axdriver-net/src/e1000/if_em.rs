@@ -4,7 +4,7 @@
 //! Copyright (c) 2001-2024, Intel Corporation; copyright (c) 2016 Nicole
 //! Graziano; copyright (c) 2024 Kevin Bowling.
 
-use alloc::collections::BTreeMap;
+use alloc::{collections::BTreeMap, vec::Vec};
 
 use axdriver_base::{DevError, DevResult};
 
@@ -2014,6 +2014,108 @@ pub struct EmMediaStatus {
     pub valid: bool,
     pub active: bool,
     pub subtype: Option<EmMediaRequest>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmMediaSpeed {
+    Auto,
+    Mbps10,
+    Mbps100,
+    Mbps1000Copper,
+    FiberSx,
+    FiberLx,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmMediaMode {
+    pub speed: EmMediaSpeed,
+    pub full_duplex: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmInterfaceSetup {
+    pub send_queue_length: Option<usize>,
+    pub send_queue_ready: bool,
+    pub media_modes: Vec<EmMediaMode>,
+    pub selected: EmMediaMode,
+}
+
+/// upstream: if_em.c em_setup_interface()
+pub fn em_setup_interface(
+    vf: bool,
+    tx_queue_count: usize,
+    tx_descriptors: usize,
+    mac: E1000MacType,
+    media: EmMediaType,
+    phy_ife: bool,
+) -> DevResult<EmInterfaceSetup> {
+    if tx_queue_count == 0 || tx_descriptors == 0 {
+        return Err(DevError::InvalidParam);
+    }
+    let mut setup = EmInterfaceSetup {
+        send_queue_length: (tx_queue_count == 1).then_some(tx_descriptors - 1),
+        send_queue_ready: tx_queue_count == 1,
+        media_modes: Vec::new(),
+        selected: EmMediaMode {
+            speed: EmMediaSpeed::Auto,
+            full_duplex: None,
+        },
+    };
+    if vf {
+        let mode = EmMediaMode {
+            speed: EmMediaSpeed::Mbps1000Copper,
+            full_duplex: Some(true),
+        };
+        setup.media_modes.push(mode);
+        setup.selected = mode;
+        return Ok(setup);
+    }
+    if matches!(media, EmMediaType::Fiber | EmMediaType::InternalSerdes) {
+        let speed = if mac == E1000MacType::I82545 {
+            EmMediaSpeed::FiberLx
+        } else {
+            EmMediaSpeed::FiberSx
+        };
+        setup.media_modes.push(EmMediaMode {
+            speed,
+            full_duplex: Some(true),
+        });
+        setup.media_modes.push(EmMediaMode {
+            speed,
+            full_duplex: None,
+        });
+    } else {
+        setup.media_modes.extend([
+            EmMediaMode {
+                speed: EmMediaSpeed::Mbps10,
+                full_duplex: Some(false),
+            },
+            EmMediaMode {
+                speed: EmMediaSpeed::Mbps10,
+                full_duplex: Some(true),
+            },
+            EmMediaMode {
+                speed: EmMediaSpeed::Mbps100,
+                full_duplex: Some(false),
+            },
+            EmMediaMode {
+                speed: EmMediaSpeed::Mbps100,
+                full_duplex: Some(true),
+            },
+        ]);
+        if !phy_ife {
+            setup.media_modes.push(EmMediaMode {
+                speed: EmMediaSpeed::Mbps1000Copper,
+                full_duplex: Some(true),
+            });
+            setup.media_modes.push(EmMediaMode {
+                speed: EmMediaSpeed::Mbps1000Copper,
+                full_duplex: None,
+            });
+        }
+    }
+    setup.media_modes.push(setup.selected);
+    Ok(setup)
 }
 
 /// upstream: if_em.c em_if_media_change()
@@ -5061,6 +5163,84 @@ mod tests {
         assert_eq!(fiber.subtype, Some(EmMediaRequest::Fiber1000 { lx: true }));
         assert_eq!(em_set_flowcntl(3).unwrap(), 3);
         assert!(em_set_flowcntl(4).is_err());
+    }
+
+    #[test]
+    fn interface_setup_exports_supported_media_and_single_queue_length() {
+        let copper = em_setup_interface(
+            false,
+            1,
+            512,
+            E1000MacType::I82540,
+            EmMediaType::Copper,
+            false,
+        )
+        .unwrap();
+        assert_eq!(copper.send_queue_length, Some(511));
+        assert!(copper.send_queue_ready);
+        assert!(
+            copper
+                .media_modes
+                .iter()
+                .any(|mode| mode.speed == EmMediaSpeed::Mbps1000Copper)
+        );
+        assert_eq!(copper.media_modes.last(), Some(&copper.selected));
+
+        let ife = em_setup_interface(
+            false,
+            2,
+            512,
+            E1000MacType::I82541,
+            EmMediaType::Copper,
+            true,
+        )
+        .unwrap();
+        assert_eq!(ife.send_queue_length, None);
+        assert!(!ife.send_queue_ready);
+        assert!(
+            !ife.media_modes
+                .iter()
+                .any(|mode| mode.speed == EmMediaSpeed::Mbps1000Copper)
+        );
+
+        let vf = em_setup_interface(
+            true,
+            1,
+            256,
+            E1000MacType::VfAdapt,
+            EmMediaType::Copper,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            vf.media_modes,
+            [EmMediaMode {
+                speed: EmMediaSpeed::Mbps1000Copper,
+                full_duplex: Some(true)
+            }]
+        );
+        assert_eq!(vf.selected, vf.media_modes[0]);
+        let fiber = em_setup_interface(
+            false,
+            1,
+            128,
+            E1000MacType::I82545,
+            EmMediaType::Fiber,
+            false,
+        )
+        .unwrap();
+        assert_eq!(fiber.media_modes[0].speed, EmMediaSpeed::FiberLx);
+        assert!(
+            em_setup_interface(
+                false,
+                1,
+                0,
+                E1000MacType::I82540,
+                EmMediaType::Copper,
+                false
+            )
+            .is_err()
+        );
     }
 
     #[test]
