@@ -29,4 +29,5 @@
 - `iwx_rx_addbuf()` buffer refill now replaces completed DMA storage and republishes the generation-specific RX descriptor (`c3e43870`).
 - TX response and compressed-BA notifications now validate bounded variable layouts and expose consumer indices/queue progress (`26b5ab14`).
 - Legacy binding context command/status state and the 20/40/80/160-MHz VHT control-position mapping are translated (`a706d77a`).
+- `iwx_phy_ctxt_cmd()` now serializes standard and UHB v3/v4 channel-info layouts, LMAC selection, width/control position, and RX-chain masks (pending commit).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.

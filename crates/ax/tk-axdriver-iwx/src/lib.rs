@@ -25,6 +25,7 @@ mod mac;
 mod nic;
 mod notif;
 mod nvm;
+mod phy;
 mod queue;
 mod rate;
 mod registers;
@@ -120,6 +121,11 @@ pub use nvm::{
     NVM_CHANNEL_VALID, NVM_GET_INFO_CMD, NVM_V3_CHANNEL_COUNT, NVM_V3_RESPONSE_BYTES,
     NVM_V4_CHANNEL_COUNT, NVM_V4_RESPONSE_BYTES, NvmError, NvmFetchError, NvmInfo,
     REGULATORY_AND_NVM_GROUP, nvm_get_command, parse_nvm_response, request_nvm_info,
+};
+pub use phy::{
+    PHY_BAND_5GHZ, PHY_BAND_24GHZ, PHY_CONTEXT_COMMAND, PHY_RX_CHAIN_COUNT_SHIFT,
+    PHY_RX_CHAIN_MIMO_COUNT_SHIFT, PHY_RX_CHAIN_VALID_SHIFT, PHY_WIDTH_20, PHY_WIDTH_40,
+    PHY_WIDTH_80, PHY_WIDTH_160, PhyContextConfig, PhyContextError, phy_context_command,
 };
 pub use queue::{
     DATA_PATH_GROUP as TX_DATA_PATH_GROUP, DEFAULT_QUEUE_SIZE, DQA_QUEUE_ADD, DQA_QUEUE_REMOVE,

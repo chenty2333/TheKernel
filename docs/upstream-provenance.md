@@ -1020,3 +1020,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): RX buffer replacement, RBD address update, and transfer descriptor repost translated in `tk-axdriver-iwx/src/rings.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): TX response sanity/status/SSN extraction and compressed-BA variable TFD queue progress parsing translated in `tk-axdriver-iwx/src/tx_completion.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): legacy binding-context command/status state and VHT control-position selection translated in `tk-axdriver-iwx/src/binding.rs` and `tk-axdriver-iwx/src/channel.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): PHY_CONTEXT_CMD v3/v4 standard and UHB serialization with bandwidth, control-channel and RX-chain fields translated in `tk-axdriver-iwx/src/phy.rs`.
