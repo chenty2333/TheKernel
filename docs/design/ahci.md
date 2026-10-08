@@ -38,10 +38,12 @@ The PCI frontend now attempts MSI-X, MSI, then firmware-routed shared INTx, and
 AHCI completions acknowledge status before waking waiters. Concurrent direct
 physical-SG NCQ submission is implemented across the advertised slot depth, but
 an error/reset completes all outstanding batch members rather than requeueing
-only the READ LOG EXT victim. PMP target FIS selection is represented per disk,
-but automatic PMP signature discovery and publication of multiple target disks
-remain unavailable because port/workspace lifetime is still owned per disk,
-not by a shared controller-port registry. Remaining work also includes
+only the READ LOG EXT victim. When CAP.SPM and the port signature identify a
+PMP, the frontend scans targets 0 through 14 with PMP-targeted IDENTIFY and
+publishes each disk as a distinct node; wrappers share one port-owned engine
+and serialize commands while selecting target-specific FIS/geometry state.
+Individual PMP-target removal detection and hot-swap behavior remain
+unimplemented. Remaining work also includes
 enclosure management, Intel remapped NVMe, CAM CCB/SCSI translation,
 PCI-function removal events, and power-management/newbus lifecycle. A controller
 worker retries ports that were empty or not ready

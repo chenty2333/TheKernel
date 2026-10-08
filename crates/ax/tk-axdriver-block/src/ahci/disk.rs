@@ -8,7 +8,7 @@
 
 extern crate alloc;
 
-use alloc::string::String;
+use alloc::{string::String, sync::Arc};
 use core::{
     mem::ManuallyDrop,
     ptr::{self, NonNull},
@@ -16,6 +16,7 @@ use core::{
 };
 
 use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
+use spin::Mutex;
 
 use super::{
     ata::{AtaRequest, setup_register_fis},
@@ -318,7 +319,7 @@ impl<I: AhciIo> AhciDisk<I> {
         port: PortState,
         workspace: PortWorkspace,
     ) -> Result<Self, AhciDiskError> {
-        Self::attach_pmp_port(controller, port, workspace, 0)
+        Self::attach_target(controller, port, workspace, 0, false, true)
     }
 
     /// Constructs one target-selected command path. This does not enumerate or
@@ -326,10 +327,30 @@ impl<I: AhciIo> AhciDisk<I> {
     /// currently publishes only target zero until that port registry exists.
     // upstream: ahci.c ahci_ch_attach() PMP target variant
     pub fn attach_pmp_port(
+        controller: AhciController<I>,
+        port: PortState,
+        workspace: PortWorkspace,
+        pmp_port: u8,
+    ) -> Result<Self, AhciDiskError> {
+        Self::attach_target(controller, port, workspace, pmp_port, true, true)
+    }
+
+    /// Initializes the shared DMA/command engine for PMP IDENTIFY discovery.
+    pub fn attach_pmp_controller(
+        controller: AhciController<I>,
+        port: PortState,
+        workspace: PortWorkspace,
+    ) -> Result<Self, AhciDiskError> {
+        Self::attach_target(controller, port, workspace, 0, true, false)
+    }
+
+    fn attach_target(
         mut controller: AhciController<I>,
         mut port: PortState,
         workspace: PortWorkspace,
         pmp_port: u8,
+        pmp_present: bool,
+        identify_target: bool,
     ) -> Result<Self, AhciDiskError> {
         if pmp_port >= 16 {
             return Err(AhciDiskError::InvalidRequest);
@@ -349,6 +370,7 @@ impl<I: AhciIo> AhciDisk<I> {
         if !controller.ahci_stop_fr(&port) || !controller.ahci_stop(&mut port) {
             return Err(AhciDiskError::PortDidNotStop);
         }
+        port.pm_present = pmp_present;
         let base = port.register_base();
         controller
             .io_mut()
@@ -364,7 +386,7 @@ impl<I: AhciIo> AhciDisk<I> {
             .io_mut()
             .write32(base + AHCI_P_FBU, (workspace.received_fis.bus >> 32) as u32);
         controller.ahci_start_fr(&port);
-        controller.ahci_start(&mut port, false);
+        controller.ahci_start(&mut port, pmp_present);
         let irq_enabled = controller.io_mut().has_interrupt();
         if irq_enabled {
             controller.io_mut().write32(
@@ -412,6 +434,9 @@ impl<I: AhciIo> AhciDisk<I> {
             next_async_handle: 1,
             irq_enabled,
         };
+        if !identify_target {
+            return Ok(disk);
+        }
         let mut identify = [0u8; 512];
         if disk
             .execute(AtaRequest::Identify { pmp_port }, identify.len())
@@ -500,9 +525,44 @@ impl<I: AhciIo> AhciDisk<I> {
         self.name = name;
     }
 
+    /// Identify one PMP device behind this shared AHCI port without changing
+    /// the currently published target's geometry or fingerprint.
+    // upstream: ahci.c ahci_ata_probe() PMP target selection
+    pub fn probe_pmp_target(&mut self, pmp_port: u8) -> Result<(AtaGeometry, u64), AhciDiskError> {
+        if !self.port.pm_present || pmp_port >= 15 || self.has_physical_work() {
+            return Err(AhciDiskError::InvalidRequest);
+        }
+        let previous = self.pmp_port;
+        self.pmp_port = pmp_port;
+        let result = (|| {
+            let mut identify = [0u8; 512];
+            self.execute(AtaRequest::Identify { pmp_port }, identify.len())?;
+            // SAFETY: IDENTIFY completed and its DMA data is quiescent.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    self.workspace().bounce.cpu.as_ptr(),
+                    identify.as_mut_ptr(),
+                    identify.len(),
+                )
+            };
+            let geometry = parse_identify(&identify).ok_or(AhciDiskError::IdentifyFailed)?;
+            Ok((geometry, identify_digest(&identify)))
+        })();
+        self.pmp_port = previous;
+        result
+    }
+
     /// Geometry captured by ATA IDENTIFY DEVICE.
     pub const fn geometry(&self) -> AtaGeometry {
         self.geometry
+    }
+
+    pub const fn identity_digest(&self) -> u64 {
+        self.identity_digest
+    }
+
+    pub const fn pmp_port(&self) -> u8 {
+        self.pmp_port
     }
 
     fn workspace(&self) -> &PortWorkspace {
@@ -1851,6 +1911,105 @@ impl<I: AhciIo> AhciDisk<I> {
     }
 }
 
+/// One synchronously serialized block view for a PMP target that shares the
+/// command/FIS engine and DMA workspace owned by a single AHCI port driver.
+pub struct AhciPmpTargetDisk<I: AhciIo> {
+    shared: Arc<Mutex<AhciDisk<I>>>,
+    pmp_port: u8,
+    geometry: AtaGeometry,
+    identity_digest: u64,
+    name: String,
+}
+
+impl<I: AhciIo> AhciPmpTargetDisk<I> {
+    /// Creates an independent device node over a target discovered by the
+    /// parent PMP port's IDENTIFY scan.
+    pub fn new(
+        shared: Arc<Mutex<AhciDisk<I>>>,
+        pmp_port: u8,
+        geometry: AtaGeometry,
+        identity_digest: u64,
+        name: String,
+    ) -> Self {
+        Self {
+            shared,
+            pmp_port,
+            geometry,
+            identity_digest,
+            name,
+        }
+    }
+
+    pub const fn pmp_port(&self) -> u8 {
+        self.pmp_port
+    }
+
+    fn with_target<R>(&self, f: impl FnOnce(&mut AhciDisk<I>) -> R) -> R {
+        let mut disk = self.shared.lock();
+        let old_port = core::mem::replace(&mut disk.pmp_port, self.pmp_port);
+        let old_geometry = core::mem::replace(&mut disk.geometry, self.geometry);
+        let old_identity = core::mem::replace(&mut disk.identity_digest, self.identity_digest);
+        let target_ncq = self.geometry.ncq
+            && controller_capabilities_for_ncq(disk.controller.capabilities)
+            && disk.port.quirks & super::regs::AHCI_Q_NONCQ == 0;
+        let old_ncq = core::mem::replace(&mut disk.ncq, target_ncq);
+        let result = f(&mut disk);
+        disk.pmp_port = old_port;
+        disk.geometry = old_geometry;
+        disk.identity_digest = old_identity;
+        disk.ncq = old_ncq;
+        result
+    }
+}
+
+impl<I: AhciIo> BaseDriverOps for AhciPmpTargetDisk<I> {
+    fn device_name(&self) -> &str {
+        &self.name
+    }
+
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Block
+    }
+}
+
+impl<I: AhciIo> BlockDriverOps for AhciPmpTargetDisk<I> {
+    fn num_blocks(&self) -> u64 {
+        self.geometry.blocks
+    }
+
+    fn block_size(&self) -> usize {
+        self.geometry.block_size
+    }
+
+    fn media_presence(&mut self) -> Option<bool> {
+        self.with_target(BlockDriverOps::media_presence)
+    }
+
+    fn read_block(&mut self, block_id: u64, output: &mut [u8]) -> DevResult {
+        self.with_target(|disk| BlockDriverOps::read_block(disk, block_id, output))
+    }
+
+    fn write_block(&mut self, block_id: u64, input: &[u8]) -> DevResult {
+        self.with_target(|disk| BlockDriverOps::write_block(disk, block_id, input))
+    }
+
+    fn flush(&mut self) -> DevResult {
+        self.with_target(BlockDriverOps::flush)
+    }
+
+    fn block_capabilities(&self) -> BlockCapabilities {
+        BlockCapabilities {
+            flush: true,
+            discard: self.geometry.trim,
+            ..BlockCapabilities::default()
+        }
+    }
+
+    fn discard_blocks(&mut self, range: BlockRange) -> DevResult {
+        self.with_target(|disk| BlockDriverOps::discard_blocks(disk, range))
+    }
+}
+
 fn map_error(error: AhciDiskError) -> DevError {
     match error {
         AhciDiskError::InvalidWorkspace | AhciDiskError::UnsupportedAddressWidth => {
@@ -2010,6 +2169,51 @@ mod tests {
     fn ncq_error_log_tag_obeys_nq_flag_and_tag_mask() {
         assert_eq!(ncq_error_log_tag(0x65), Some(5));
         assert_eq!(ncq_error_log_tag(0x85), None);
+    }
+
+    #[test]
+    fn pmp_probe_identify_targets_requested_multiplier_port() {
+        with_fake_disk(|disk, _| {
+            disk.port.pm_present = true;
+            disk.controller.io_mut().auto_complete = true;
+            assert_eq!(disk.probe_pmp_target(3), Err(AhciDiskError::IdentifyFailed));
+            assert_eq!(disk.pmp_port, 0);
+            // SAFETY: the command table is owned and the FIS was populated by
+            // the completed fake-HBA IDENTIFY transaction.
+            let target = unsafe { ptr::read(disk.workspace().command_table.cpu.as_ptr().add(1)) };
+            assert_eq!(target, 0x83);
+        });
+    }
+
+    #[test]
+    fn pmp_target_block_view_selects_its_fis_port_and_restores_shared_state() {
+        with_fake_disk(|disk, _| {
+            disk.controller.io_mut().auto_complete = true;
+            let geometry = disk.geometry;
+            // Move the disk into shared ownership for the duration of the
+            // wrapper call, then restore it before the fake backing pages go
+            // out of scope. The original local is made inert to avoid a
+            // second workspace drop.
+            let owned = unsafe { ptr::read(disk as *const AhciDisk<FakeIo>) };
+            disk.workspace_live = false;
+            let shared = Arc::new(Mutex::new(owned));
+            let mut target =
+                AhciPmpTargetDisk::new(shared.clone(), 2, geometry, 0, String::from("sdb"));
+            let mut output = [0u8; 512];
+            assert!(BlockDriverOps::read_block(&mut target, 0, &mut output).is_ok());
+            drop(target);
+            let shared = Arc::try_unwrap(shared)
+                .ok()
+                .expect("wrapper released its shared port reference")
+                .into_inner();
+            unsafe { ptr::write(disk, shared) };
+            let shared = disk;
+            assert_eq!(shared.pmp_port, 0);
+            // SAFETY: the original driver and table allocation remain alive.
+            let target_byte =
+                unsafe { ptr::read(shared.workspace().command_table.cpu.as_ptr().add(1)) };
+            assert_eq!(target_byte, 0x82);
+        });
     }
 
     #[test]

@@ -227,6 +227,7 @@ pub const AHCI_P_CMD_PARTIAL: u32 = 0x20000000;
 pub const AHCI_P_CMD_SLUMBER: u32 = 0x60000000;
 pub const AHCI_P_CMD_DEVSLEEP: u32 = 0x80000000;
 pub const AHCI_P_TFD: usize = 0x20;
+// upstream: ahci.h AHCI_P_SIG
 pub const AHCI_P_SIG: usize = 0x24;
 pub const AHCI_P_SSTS: usize = 0x28;
 pub const AHCI_P_SCTL: usize = 0x2c;

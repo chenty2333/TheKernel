@@ -11,7 +11,7 @@
 
 pub mod pci_ids;
 
-use alloc::string::String;
+use alloc::{string::String, sync::Arc};
 use core::{
     ptr,
     ptr::NonNull,
@@ -30,10 +30,11 @@ use axalloc::{UsageKind, global_allocator};
 use axdriver_block::{
     BlockDriverOps,
     ahci::{
-        AhciController, AhciDisk, AhciIo, DmaRegion, PortState, PortWorkspace,
+        AhciController, AhciDisk, AhciIo, AhciPmpTargetDisk, DmaRegion, PortState,
+        PortWorkspace,
         regs::{
-            AHCI_MAX_PORTS, AHCI_OFFSET, AHCI_P_IE, AHCI_P_SSTS, AHCI_STEP, ATA_SS_DET_MASK,
-            ATA_SS_DET_NO_DEVICE,
+            AHCI_CAP_SPM, AHCI_MAX_PORTS, AHCI_OFFSET, AHCI_P_IE, AHCI_P_SIG, AHCI_P_SSTS,
+            AHCI_STEP, ATA_SS_DET_MASK, ATA_SS_DET_NO_DEVICE,
         },
     },
 };
@@ -55,6 +56,7 @@ const ABAR_BAR: u8 = 5;
 // expose fewer than the architectural maximum of 32 ports in their MMIO size.
 const ABAR_MIN_BYTES: usize = AHCI_OFFSET + AHCI_STEP;
 const BOUNCE_PAGES: usize = 16;
+const ATA_PORT_MULTIPLIER_SIGNATURE: u32 = 0x9669_0101;
 
 /// Driver state is concrete for static builds and type-erased by the block
 /// device enum after PCI probe.
@@ -251,14 +253,29 @@ fn wrap_disk(disk: AhciDisk<Window>) -> crate::AxBlockDevice {
     raw
 }
 
+fn wrap_pmp_disk(disk: AhciPmpTargetDisk<Window>) -> crate::AxBlockDevice {
+    #[cfg(feature = "dyn")]
+    let raw: crate::AxBlockDevice = alloc::boxed::Box::new(disk);
+    #[cfg(not(feature = "dyn"))]
+    let raw: crate::AxBlockDevice = crate::StaticBlockDevice::Ahci(alloc::boxed::Box::new(disk));
+    raw
+}
+
 fn publish_disk(
     mut disk: AhciDisk<Window>,
     devices: &mut alloc::vec::Vec<crate::AxDeviceEnum>,
 ) -> String {
     let name = next_sd_name();
     disk.set_device_name(name.clone());
-    let raw = wrap_disk(disk);
+    publish_named_block(wrap_disk(disk), &name, devices);
+    name
+}
 
+fn publish_named_block(
+    raw: crate::AxBlockDevice,
+    name: &str,
+    devices: &mut alloc::vec::Vec<crate::AxDeviceEnum>,
+) {
     #[cfg(feature = "shared-block")]
     {
         let parent = crate::SharedBlockDevice::new(raw);
@@ -285,7 +302,28 @@ fn publish_disk(
         #[cfg(not(feature = "dyn"))]
         devices.push(crate::AxDeviceEnum::Block(raw));
     }
-    name
+}
+
+fn discover_pmp_targets(
+    disk: AhciDisk<Window>,
+) -> alloc::vec::Vec<(AhciPmpTargetDisk<Window>, String)> {
+    let shared = Arc::new(spin::Mutex::new(disk));
+    let mut targets = alloc::vec::Vec::new();
+    for pmp_port in 0..15u8 {
+        let identified = shared.lock().probe_pmp_target(pmp_port).ok();
+        let Some((geometry, identity)) = identified else {
+            continue;
+        };
+        if geometry.blocks == 0 {
+            continue;
+        }
+        let name = next_sd_name();
+        targets.push((
+            AhciPmpTargetDisk::new(shared.clone(), pmp_port, geometry, identity, name.clone()),
+            name,
+        ));
+    }
+    targets
 }
 
 fn start_hotplug_worker() {
@@ -342,6 +380,34 @@ fn ahci_hotplug_worker() {
                     port.capabilities2,
                     port.quirks,
                 );
+                let signature = port
+                    .window
+                    .read32(AHCI_OFFSET + usize::from(port.index) * AHCI_STEP + AHCI_P_SIG);
+                if signature == ATA_PORT_MULTIPLIER_SIGNATURE
+                    && port.capabilities & AHCI_CAP_SPM != 0
+                {
+                    let Ok(engine) = AhciDisk::attach_pmp_controller(controller, state, workspace)
+                    else {
+                        continue;
+                    };
+                    let mut first_name = None;
+                    for (target, name) in discover_pmp_targets(engine) {
+                        if crate::publish_runtime_block_device(wrap_pmp_disk(target)) {
+                            info!(
+                                "ahci: hotplug published PMP target /dev/{name} on port {}",
+                                port.index
+                            );
+                            if first_name.is_none() {
+                                first_name = Some(name);
+                            }
+                        }
+                    }
+                    if let Some(name) = first_name {
+                        port.name = Some(name);
+                        port.present = true;
+                    }
+                    continue;
+                }
                 let Ok(mut disk) = AhciDisk::attach(controller, state, workspace) else {
                     continue;
                 };
@@ -547,6 +613,46 @@ pub(crate) fn probe(
             controller.capabilities2,
             quirks,
         );
+        let signature = window.read32(port_base + AHCI_P_SIG);
+        if signature == ATA_PORT_MULTIPLIER_SIGNATURE && controller.capabilities & AHCI_CAP_SPM != 0
+        {
+            let Ok(engine) = AhciDisk::attach_pmp_controller(port_controller, port, workspace)
+            else {
+                warn!("ahci: {bdf} port {index} PMP engine initialization failed");
+                hotplug_ports.push(HotplugPort {
+                    window: window.clone(),
+                    index: index as u8,
+                    quirks,
+                    capabilities: controller.capabilities,
+                    capabilities2: controller.capabilities2,
+                    present: false,
+                    name: None,
+                });
+                continue;
+            };
+            let mut first_name = None;
+            for (target, name) in discover_pmp_targets(engine) {
+                info!(
+                    "ahci: {bdf} port {index} PMP target {} blocks={}",
+                    target.pmp_port(),
+                    target.num_blocks()
+                );
+                publish_named_block(wrap_pmp_disk(target), &name, &mut devices);
+                if first_name.is_none() {
+                    first_name = Some(name);
+                }
+            }
+            hotplug_ports.push(HotplugPort {
+                window: window.clone(),
+                index: index as u8,
+                quirks,
+                capabilities: controller.capabilities,
+                capabilities2: controller.capabilities2,
+                present: first_name.is_some(),
+                name: first_name,
+            });
+            continue;
+        }
         match AhciDisk::attach(port_controller, port, workspace) {
             Ok(disk) => {
                 info!(
