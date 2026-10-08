@@ -2345,6 +2345,29 @@ impl<I: SdhciIo> SdhciDisk<I> {
             decode_sd_csd(csd)
         }
         .ok_or(SdhciError::InvalidTransfer)?;
+        // upstream: mmc.c mmc_set_timing() SD high-speed subset
+        if !mmc {
+            if scr.is_some_and(|scr| scr.bus_widths & (1 << 2) != 0) {
+                mmc_set_card_bus_width(&mut host, false, rca, 4)?;
+            }
+            if csd_info.command_classes & (1 << 10) != 0
+                && host.capabilities & SDHCI_CAN_DO_HISPD != 0
+                && host.quirks & SDHCI_QUIRK_BROKEN_TIMINGS == 0
+            {
+                let mut switch_status = [0u8; 64];
+                if host
+                    .switch_sd_function(0, 0, 0x0f, &mut switch_status)
+                    .is_ok()
+                    && sd_switch_supports_high_speed(&switch_status)
+                {
+                    host.switch_sd_function(1, 0, 1, &mut switch_status)?;
+                    if !sd_switch_selected_function(&switch_status, 1) {
+                        return Err(SdhciError::Controller(u32::from(switch_status[16])));
+                    }
+                    host.set_high_speed(host.base_clock_hz.min(50_000_000))?;
+                }
+            }
+        }
         let mut sectors = csd_info.capacity_bytes / 512;
         let mut erase_group_sectors = csd_info.erase_block_sectors;
         if let Some(status) = sd_status {
@@ -2613,6 +2636,15 @@ impl<I: SdhciIo> SdhciDisk<I> {
         }
         Ok(())
     }
+}
+
+// mmc.c mmc_discover_cards() SD switch-status byte 13 support and byte 16 selection.
+fn sd_switch_supports_high_speed(status: &[u8; 64]) -> bool {
+    status[13] & (1 << 1) != 0
+}
+
+fn sd_switch_selected_function(status: &[u8; 64], function: u8) -> bool {
+    status[16] & 0x0f == function
 }
 
 /// Serialized user-area or eMMC boot-area view over one SDHCI/MMC controller.
@@ -3452,6 +3484,17 @@ mod tests {
         assert!(!host.media_present());
         host.io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
         assert!(host.media_present());
+    }
+
+    #[test]
+    fn sd_switch_status_selects_high_speed_only_when_reported() {
+        let mut status = [0u8; 64];
+        assert!(!sd_switch_supports_high_speed(&status));
+        status[13] = 1 << 1;
+        status[16] = 1;
+        assert!(sd_switch_supports_high_speed(&status));
+        assert!(sd_switch_selected_function(&status, 1));
+        assert!(!sd_switch_selected_function(&status, 0));
     }
 
     #[test]

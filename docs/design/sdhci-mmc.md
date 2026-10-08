@@ -82,6 +82,9 @@ clear. RPMB remains intentionally unavailable as a raw block device because its
 write protocol requires authenticated frames and key policy.
 Legacy high-speed switching is rejected before CMD6 unless the SDHCI host
 advertises `CAN_DO_HISPD`; the card and host cannot be left in mismatched modes.
+The SD path now reads CMD6 support/selection status, negotiates 4-bit mode from
+SCR, and selects SD high-speed only when the card and host both advertise it;
+the QEMU acceptance card completed guest format/RW in 4-bit mode at 26 MHz.
 
 For EXT_CSD revision 6+ devices with a nonzero cache size, attach enables the
 eMMC cache and tracks successful writes; `flush()` issues EXT_CSD FLUSH_CACHE
