@@ -1093,3 +1093,9 @@ maps TGL, RKL, ADL-S, ADL-P and ADL-N IDs to display version, DMC platform,
 default ports and the source's pre-GMD_ID stepping tables. PCI ID values follow
 `include/drm/intel/pciids.h` (MIT, Copyright © 2013 Intel). This pure classifier
 does not expand the kernel's current N305-only native PCI binding/modeset path.
+
+The kernel `PowerState` adapter exposes map-backed `get_domain()`,
+`put_domain()`, `is_domain_enabled()` and `get_domain_if_enabled()` wrappers
+around the translated power-domain manager. Pipe-A boot sync/get and an AUX-A
+reference path exercise those APIs; connector/output call sites are not yet
+fully migrated.

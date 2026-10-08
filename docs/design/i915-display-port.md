@@ -42,3 +42,8 @@ Power-well translation also includes the BIOS-to-driver request handoff and
 requester-order reads. The display-power subsystem remains partial: DDI/AUX,
 IRQ-coupled well transitions, async puts, and full KMS reference lifetimes have
 not yet been connected.
+
+`PowerState` now exposes the map-backed synchronous get/put/is-enabled/get-if-
+enabled API; the pipe-A boot path and a kernel unit path use it for AUX-A
+references. `connect.rs`/`output.rs` still own direct AUX/DDI well sequences,
+so the references are not yet unified across a complete modeset lifetime.

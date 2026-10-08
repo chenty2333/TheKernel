@@ -677,6 +677,7 @@ impl WorkaroundState {
 /// Everything [`bring_up`] observed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PowerState {
+    pub(crate) platform: DmcPlatform,
     pub(crate) fuses: FuseState,
     pub(crate) dc_state: DcStateObservation,
     pub(crate) allowed_dc_mask: u32,
@@ -696,6 +697,73 @@ pub(crate) struct PowerState {
 }
 
 impl PowerState {
+    fn power_map(&self) -> &'static [PowerWellGroup] {
+        power_wells(self.platform)
+    }
+
+    /// Acquire one source-mapped domain and its dependent power wells.
+    pub(crate) fn get_domain<R: Registers>(
+        &mut self,
+        regs: &R,
+        domain: PowerDomain,
+    ) -> Result<(), PowerError> {
+        let platform = self.platform;
+        let map = self.power_map();
+        self.power_domains
+            .get(map, domain, &mut MappedPowerWellIo { regs, platform })
+            .map_err(|error| PowerError::PowerDomain(format!("{error:?}")))
+    }
+
+    /// Release one source-mapped domain after its final client reference.
+    pub(crate) fn put_domain<R: Registers>(
+        &mut self,
+        regs: &R,
+        domain: PowerDomain,
+    ) -> Result<(), PowerError> {
+        let platform = self.platform;
+        let map = self.power_map();
+        self.power_domains
+            .put(map, domain, &mut MappedPowerWellIo { regs, platform })
+            .map_err(|error| PowerError::PowerDomain(format!("{error:?}")))
+    }
+
+    pub(crate) fn get_domain_if_enabled<R: Registers>(
+        &mut self,
+        regs: &R,
+        domain: PowerDomain,
+        runtime_active: bool,
+    ) -> Result<bool, PowerError> {
+        let platform = self.platform;
+        let map = self.power_map();
+        self.power_domains
+            .get_if_enabled(
+                map,
+                domain,
+                runtime_active,
+                &mut MappedPowerWellIo { regs, platform },
+            )
+            .map_err(|error| PowerError::PowerDomain(format!("{error:?}")))
+    }
+
+    pub(crate) fn is_domain_enabled<R: Registers>(
+        &self,
+        regs: &R,
+        domain: PowerDomain,
+        runtime_active: bool,
+    ) -> Result<bool, PowerError> {
+        self.power_domains
+            .is_enabled(
+                self.power_map(),
+                domain,
+                runtime_active,
+                &MappedPowerWellIo {
+                    regs,
+                    platform: self.platform,
+                },
+            )
+            .map_err(|error| PowerError::PowerDomain(format!("{error:?}")))
+    }
+
     /// Whether every PHY came up, which is the last thing this phase can check
     /// without a pipe.
     pub(crate) fn phys_initialised(&self) -> bool {
@@ -1626,6 +1694,7 @@ fn bring_up_inner(
     );
 
     Ok(PowerState {
+        platform,
         fuses,
         dc_state,
         allowed_dc_mask,
@@ -2157,6 +2226,44 @@ mod tests {
                 .unwrap();
             assert_eq!(mapped_hsw_well(instance), Some(expected), "{name}");
         }
+    }
+
+    #[test]
+    fn power_state_get_put_uses_map_driven_aux_domain_references() {
+        let regs = powered_machine();
+        let mut state = bring_up(&regs).unwrap();
+        assert!(
+            !state
+                .is_domain_enabled(&regs, PowerDomain::AuxIoA, true)
+                .unwrap()
+        );
+        assert!(
+            !state
+                .get_domain_if_enabled(&regs, PowerDomain::AuxIoA, true)
+                .unwrap()
+        );
+
+        state.get_domain(&regs, PowerDomain::AuxIoA).unwrap();
+        assert!(
+            state
+                .is_domain_enabled(&regs, PowerDomain::AuxIoA, true)
+                .unwrap()
+        );
+        assert!(
+            state
+                .get_domain_if_enabled(&regs, PowerDomain::AuxIoA, true)
+                .unwrap()
+        );
+        assert_eq!(state.power_domains.domain_use_count(PowerDomain::AuxIoA), 2);
+
+        state.put_domain(&regs, PowerDomain::AuxIoA).unwrap();
+        state.put_domain(&regs, PowerDomain::AuxIoA).unwrap();
+        assert_eq!(state.power_domains.domain_use_count(PowerDomain::AuxIoA), 0);
+        assert!(
+            !state
+                .is_domain_enabled(&regs, PowerDomain::AuxIoA, true)
+                .unwrap()
+        );
     }
 
     #[test]
