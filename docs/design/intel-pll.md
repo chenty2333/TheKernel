@@ -574,3 +574,9 @@ shared-resource policy from `icl_get_combo_phy_dpll()`,
 host-testable owner for the shared-state comparison and pipe references. It is
 not yet installed as the kernel's atomic-state DPLL manager; current kernel
 fastboot continues to use its pre-existing single output PLL flow.
+
+`icl_dpll_descriptors()` adds the i915 per-platform DPLL inventories in source
+order for TGL, RKL, DG1, ADL-S, ADL-P/N and EHL/JSL. The shared numeric IDs are
+platform scoped (for example ID 2 is TBT on TGL/ADL-P and DPLL4 on RKL), so the
+descriptor's kind and platform are required when resolving an ID; it is not a
+global enum.

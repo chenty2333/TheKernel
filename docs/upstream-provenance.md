@@ -1126,6 +1126,13 @@ shareable hardware-state/pipe-mask allocator corresponding to
 `icl_update_active_dpll()` and `intel_find_dpll()` plus reference edges. It is
 not yet wired into the kernel's modeset atomic-state lifecycle.
 
+`tk-intel-display/src/dpll_mgr.rs::icl_dpll_descriptors()` translates the
+per-platform DPLL ID/type/alt-port inventories and source ordering for TGL,
+RKL, DG1, ADL-S, ADL-P/N and EHL/JSL from Linux 7.2.3
+`drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT, Copyright © 2006-2016
+Intel). IDs are kept platform-scoped because numeric ID 2 aliases different
+PLL types between source profiles.
+
 `tk-intel-display/src/dpll.rs` translates generic CRTC DPLL dispatch/state
 preparation and ±1 kHz clock comparison from Linux 7.2.3
 `drivers/gpu/drm/i915/display/intel_dpll.c` (MIT, Copyright © 2020 Intel).

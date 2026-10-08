@@ -4,7 +4,8 @@
 // icl_wrpll_get_multipliers, icl_wrpll_params_populate, icl_calc_wrpll,
 // icl_calc_dp_combo_pll, icl_calc_tbt_pll, icl_calc_dpll_state,
 // icl_ddi_combo_pll_get_freq, icl_tc_port_to_pll_id, icl_update_active_dpll,
-// icl_get_combo_phy_dpll, intel_find_dpll/reference/unreference,
+// icl_get_combo_phy_dpll, icl_plls/tgl_plls/rkl_plls/adls_plls/adlp_plls,
+// intel_find_dpll/reference/unreference,
 // dkl_pll_write (ADL-P/N DKL no-SSC branch).
 // Copyright © 2006-2016 Intel Corporation.
 // intel_{mg,dkl}_phy_regs.h: selected DKL/clock register fields.
@@ -809,6 +810,114 @@ pub enum IclDpllPlatform {
     AlderLakeN,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IclDpllKind {
+    Combo,
+    Tbt,
+    Dkl,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IclDpllDescriptor {
+    pub name: &'static str,
+    pub id: u8,
+    pub kind: IclDpllKind,
+    pub is_alt_port_dpll: bool,
+}
+
+const DPLL0: IclDpllDescriptor = IclDpllDescriptor {
+    name: "DPLL 0",
+    id: 0,
+    kind: IclDpllKind::Combo,
+    is_alt_port_dpll: false,
+};
+const DPLL1: IclDpllDescriptor = IclDpllDescriptor {
+    name: "DPLL 1",
+    id: 1,
+    kind: IclDpllKind::Combo,
+    is_alt_port_dpll: false,
+};
+const TBT_PLL: IclDpllDescriptor = IclDpllDescriptor {
+    name: "TBT PLL",
+    id: 2,
+    kind: IclDpllKind::Tbt,
+    is_alt_port_dpll: true,
+};
+const DPLL2: IclDpllDescriptor = IclDpllDescriptor {
+    name: "DPLL 2",
+    id: 2,
+    kind: IclDpllKind::Combo,
+    is_alt_port_dpll: false,
+};
+const DPLL3: IclDpllDescriptor = IclDpllDescriptor {
+    name: "DPLL 3",
+    id: 3,
+    kind: IclDpllKind::Combo,
+    is_alt_port_dpll: false,
+};
+const DPLL4: IclDpllDescriptor = IclDpllDescriptor {
+    name: "DPLL 4",
+    id: 2,
+    kind: IclDpllKind::Combo,
+    is_alt_port_dpll: false,
+};
+const TC_PLL1: IclDpllDescriptor = IclDpllDescriptor {
+    name: "TC PLL 1",
+    id: 3,
+    kind: IclDpllKind::Dkl,
+    is_alt_port_dpll: false,
+};
+const TC_PLL2: IclDpllDescriptor = IclDpllDescriptor {
+    name: "TC PLL 2",
+    id: 4,
+    kind: IclDpllKind::Dkl,
+    is_alt_port_dpll: false,
+};
+const TC_PLL3: IclDpllDescriptor = IclDpllDescriptor {
+    name: "TC PLL 3",
+    id: 5,
+    kind: IclDpllKind::Dkl,
+    is_alt_port_dpll: false,
+};
+const TC_PLL4: IclDpllDescriptor = IclDpllDescriptor {
+    name: "TC PLL 4",
+    id: 6,
+    kind: IclDpllKind::Dkl,
+    is_alt_port_dpll: false,
+};
+const TC_PLL5: IclDpllDescriptor = IclDpllDescriptor {
+    name: "TC PLL 5",
+    id: 7,
+    kind: IclDpllKind::Dkl,
+    is_alt_port_dpll: false,
+};
+const TC_PLL6: IclDpllDescriptor = IclDpllDescriptor {
+    name: "TC PLL 6",
+    id: 8,
+    kind: IclDpllKind::Dkl,
+    is_alt_port_dpll: false,
+};
+const TGL_PLLS: &[IclDpllDescriptor] = &[
+    DPLL0, DPLL1, TBT_PLL, TC_PLL1, TC_PLL2, TC_PLL3, TC_PLL4, TC_PLL5, TC_PLL6,
+];
+const ICL_PLLS: &[IclDpllDescriptor] = &[DPLL0, DPLL1, TBT_PLL, TC_PLL1, TC_PLL2, TC_PLL3, TC_PLL4];
+const RKL_PLLS: &[IclDpllDescriptor] = &[DPLL0, DPLL1, DPLL4];
+const ADLS_PLLS: &[IclDpllDescriptor] = &[DPLL0, DPLL1, DPLL2, DPLL3];
+const DG1_PLLS: &[IclDpllDescriptor] = &[DPLL0, DPLL1, DPLL2, DPLL3];
+
+/// Return the platform's DPLL inventory in i915 declaration order.
+// upstream: intel_dpll_mgr.c icl_plls/ehl_plls/tgl_plls/rkl_plls/dg1_plls/adls_plls/adlp_plls
+pub const fn icl_dpll_descriptors(platform: IclDpllPlatform) -> &'static [IclDpllDescriptor] {
+    match platform {
+        IclDpllPlatform::AlderLakeS => ADLS_PLLS,
+        IclDpllPlatform::Dg1 => DG1_PLLS,
+        IclDpllPlatform::RocketLake => RKL_PLLS,
+        IclDpllPlatform::ElkhartLake | IclDpllPlatform::JasperLake => RKL_PLLS,
+        IclDpllPlatform::TigerLake => TGL_PLLS,
+        IclDpllPlatform::AlderLakeP | IclDpllPlatform::AlderLakeN => ICL_PLLS,
+    }
+}
+
 /// Candidate bitmap from `icl_get_combo_phy_dpll()` minus HTI-owned PLLs.
 // upstream: intel_dpll_mgr.c icl_get_combo_phy_dpll()
 pub const fn icl_combo_dpll_mask(platform: IclDpllPlatform, port: u8, hti_mask: u32) -> u32 {
@@ -984,6 +1093,30 @@ mod combo_tests {
         assert_eq!(icl_tc_port_to_pll_id(6), Err(Error::Refused));
         assert_eq!(icl_active_port_dpll_id(true, true), 1);
         assert_eq!(icl_active_port_dpll_id(false, true), 0);
+    }
+
+    #[test]
+    fn per_platform_dpll_inventory_matches_i915_tables() {
+        let tgl = icl_dpll_descriptors(IclDpllPlatform::TigerLake);
+        assert_eq!(tgl.len(), 9);
+        assert_eq!(tgl[2], TBT_PLL);
+        assert_eq!(tgl[8], TC_PLL6);
+
+        for platform in [IclDpllPlatform::AlderLakeP, IclDpllPlatform::AlderLakeN] {
+            let adlp = icl_dpll_descriptors(platform);
+            assert_eq!(adlp.len(), 7);
+            assert_eq!(adlp[2].kind, IclDpllKind::Tbt);
+            assert!(adlp[2].is_alt_port_dpll);
+            assert_eq!(adlp[6], TC_PLL4);
+        }
+        assert_eq!(
+            icl_dpll_descriptors(IclDpllPlatform::RocketLake),
+            &[DPLL0, DPLL1, DPLL4]
+        );
+        assert_eq!(icl_dpll_descriptors(IclDpllPlatform::AlderLakeS).len(), 4);
+        assert_eq!(icl_dpll_descriptors(IclDpllPlatform::Dg1).len(), 4);
+        assert_eq!(icl_dpll_descriptors(IclDpllPlatform::ElkhartLake).len(), 3);
+        assert_eq!(icl_dpll_descriptors(IclDpllPlatform::JasperLake).len(), 3);
     }
 
     #[test]
