@@ -16,7 +16,9 @@ mod firmware;
 mod firmware_bundle;
 mod init_cmd;
 mod interrupts;
+mod mac;
 mod nic;
+mod nvm;
 mod queue;
 mod rate;
 mod registers;
@@ -68,7 +70,14 @@ pub use interrupts::{
     enable_interrupts, enable_rfkill_interrupts, hardware_rfkill, initialize_msix_hardware,
     start_firmware,
 };
+pub use mac::{MacAddress, flip_hardware_address, is_valid_mac_address, select_csr_mac_address};
 pub use nic::{configure_nic, initialize_nic, initialize_rx};
+pub use nvm::{
+    NVM_CHANNEL_40MHZ, NVM_CHANNEL_80MHZ, NVM_CHANNEL_160MHZ, NVM_CHANNEL_ACTIVE,
+    NVM_CHANNEL_VALID, NVM_GET_INFO_CMD, NVM_V3_CHANNEL_COUNT, NVM_V3_RESPONSE_BYTES,
+    NVM_V4_CHANNEL_COUNT, NVM_V4_RESPONSE_BYTES, NvmError, NvmInfo, REGULATORY_AND_NVM_GROUP,
+    nvm_get_command, parse_nvm_response,
+};
 pub use queue::{
     DATA_PATH_GROUP as TX_DATA_PATH_GROUP, DEFAULT_QUEUE_SIZE, DQA_QUEUE_ADD, DQA_QUEUE_REMOVE,
     QueueConfig, QueueError, SCD_QUEUE_CONFIG_CMD, TX_QUEUE_CFG_ENABLE_QUEUE, dqa_queue_command,
