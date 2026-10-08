@@ -214,7 +214,7 @@ pub struct EngineRegsetInput<'a> {
     pub mocs_regs_gen12: &'a [u32],
     pub mocs_regs_gen12_55: &'a [u32],
     pub graphics_ip: (u8, u8),
-    pub eu_perf_regs: &'a [u32; 6],
+    pub eu_perf_regs: &'a [u32; 7],
 }
 
 /// Saved default LRC image used by GuC watchdog recovery.
@@ -656,7 +656,7 @@ pub fn guc_mmio_regset_init(input: EngineRegsetInput<'_>) -> Result<Vec<MmioReg>
         .and_then(|n| n.checked_add(input.workarounds.len()))
         .and_then(|n| n.checked_add(input.force_nonpriv_regs.len()))
         .and_then(|n| n.checked_add(mocs_count))
-        .and_then(|n| n.checked_add(6))
+        .and_then(|n| n.checked_add(7))
         .ok_or(Error::Refused)?;
     let mut registers = Vec::new();
     registers
@@ -1278,7 +1278,7 @@ mod tests {
         let whitelist = [0x100, 0x500];
         let mocs = [0x400];
         let mocs_1255 = [0x401];
-        let perf = [0x600, 0x604, 0x608, 0x60c, 0x610, 0x614];
+        let perf = [0x600, 0x604, 0x608, 0x60c, 0x610, 0x614, 0x618];
         let regs = guc_mmio_regset_init(EngineRegsetInput {
             ring_mode: 0x100,
             ring_hws_pga: 0x104,
@@ -1299,7 +1299,7 @@ mod tests {
             offsets,
             [
                 0x100, 0x104, 0x108, 0x10c, 0x300, 0x401, 0x500, 0x600, 0x604, 0x608, 0x60c, 0x610,
-                0x614,
+                0x614, 0x618,
             ]
         );
         let workaround = regs.iter().find(|reg| reg.offset == 0x300).unwrap();

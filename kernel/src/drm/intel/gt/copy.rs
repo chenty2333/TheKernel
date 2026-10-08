@@ -1595,7 +1595,10 @@ fn n305_guc_ads_input(
     owner: &super::Owner,
     guc: &intel_gt::uc::FirmwareImage,
 ) -> Result<intel_gt::guc_ads::AdsBuildInput, Error> {
-    use intel_gt::guc_ads::{AdsBuildInput, AdsRuntimeInfo, EngineMapEntry};
+    use intel_gt::guc_ads::{
+        AdsBuildInput, AdsRuntimeInfo, EngineMapEntry, EngineRegset, EngineRegsetInput,
+        RegsetWorkaround, guc_mmio_regset_init,
+    };
 
     if owner.platform != intel_gt::uc::Platform::AlderLakeN {
         return Err(Error::Refused);
@@ -1678,6 +1681,43 @@ fn n305_guc_ads_input(
     let golden_contexts =
         intel_gt::guc_ads::guc_init_golden_contexts(&enabled_masks, &default_states)
             .map_err(|_| Error::Refused)?;
+    // Translate Gen12.0 intel_guc_ads.c::guc_mmio_regset_init() for the
+    // supported BCS0. ADL-N is below Wa_16018031267's 12.55 IP range, so the
+    // source xcs_engine_wa_init() list is empty; engine_fake_wa_init() still
+    // contributes the uncached CMD_CCTL override (MOCS index 3).
+    let bcs_base = 0x22000;
+    let force_nonpriv_regs: Vec<u32> = (0..12).map(|slot| bcs_base + 0x4d0 + slot * 4).collect();
+    let mocs_regs_gen12: Vec<u32> = (0..32).map(|index| 0xb020 + index * 4).collect();
+    let eu_perf_regs = [0xe458, 0xe45c, 0xe558, 0xe55c, 0xe658, 0xe65c, 0xe758];
+    let bcs_regset = guc_mmio_regset_init(EngineRegsetInput {
+        ring_mode: bcs_base + 0x29c,
+        ring_hws_pga: bcs_base + 0x80,
+        ring_imr: bcs_base + 0xa8,
+        first_render_compute: false,
+        ccs_mask: 0,
+        rcu_mode: 0,
+        workarounds: &[RegsetWorkaround {
+            offset: bcs_base + 0xc4, // RING_CMD_CCTL
+            masked: true,
+            mask: 0x3fff,
+            steering_group: 0,
+            steering_instance: topology.dss.trailing_zeros() as u8,
+        }],
+        force_nonpriv_regs: &force_nonpriv_regs,
+        mocs_regs_gen12: &mocs_regs_gen12,
+        mocs_regs_gen12_55: &[],
+        graphics_ip: (12, 0),
+        eu_perf_regs: &eu_perf_regs,
+    })
+    .map_err(|_| Error::Refused)?;
+    let regsets = vec![EngineRegset {
+        engine: engines
+            .iter()
+            .find(|engine| engine.guc_class == 3 && engine.instance == 0)
+            .cloned()
+            .ok_or(Error::Refused)?,
+        registers: bcs_regset,
+    }];
     let mut generic_gt_sysinfo = [0; intel_gt::guc_ads::GUC_GENERIC_GT_SYSINFO_MAX];
     // `Topology::read()` has verified the sole Gen12.0 slice-enable register
     // value (bit 0 only), so use the actual slice count rather than DSS count.
@@ -1698,7 +1738,7 @@ fn n305_guc_ads_input(
             dgfx: false,
         },
         engines,
-        regsets: Vec::new(),
+        regsets,
         engine_context_sizes,
         golden_contexts,
         capture_lists: Vec::new(),
