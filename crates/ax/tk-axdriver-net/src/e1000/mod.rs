@@ -3,6 +3,7 @@
 pub mod api;
 pub mod mac;
 pub mod nic;
+pub mod nvm;
 pub mod osdep;
 pub mod phy;
 pub mod registers;
