@@ -153,3 +153,7 @@ RUN/protection/slot/RSN-port effects for the driver/SME to apply.
 Deauthentication and disassociation receive paths decode the fixed reason
 field and translate station background-scan/stay-authentication exceptions and
 hostap peer-removal decisions into explicit protocol effects.
+
+Block-Ack action receive helpers decode ADDBA/DELBA/BAR layouts and surface
+agreement, timeout, refusal and reorder-window effects; actual DMA reorder
+buffers and queue stop/start remain owned by the wireless device adapter.

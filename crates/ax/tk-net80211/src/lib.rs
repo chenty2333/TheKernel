@@ -8,6 +8,7 @@ extern crate alloc;
 
 mod assoc_rx;
 mod auth_rx;
+mod ba_rx;
 mod beacon;
 mod channel;
 mod decrypt;
@@ -29,6 +30,12 @@ mod scan;
 
 pub use assoc_rx::{AssocRxError, AssocRxPolicy, AssocRxResult, receive_assoc_response};
 pub use auth_rx::{AuthRxError, AuthRxResult, receive_auth_response};
+pub use ba_rx::{
+    AddbaRequestOutcome, AddbaRequestPolicy, AddbaResponseOutcome, BaAgreement, BaRxError,
+    DelbaOutcome, accept_addba_request, accept_addba_response, receive_addba_request,
+    receive_addba_response, receive_bar, receive_delba, refuse_addba_request,
+    refuse_addba_response,
+};
 pub use beacon::{BeaconError, BeaconPolicy, BeaconRxInfo, BeaconUpdate, receive_beacon};
 pub use channel::{
     CHAN_2GHZ, CHAN_5GHZ, ChannelRef, ModeSelection, NET_CAP_QOS, NET_CAP_TX_AMPDU, NET_CHAN_2GHZ,
