@@ -25,15 +25,15 @@ impl DeviceConfig {
     pub const fn firmware(self) -> FirmwareConfig {
         match self {
             Self::SoGfAx211 => FirmwareConfig {
-                firmware: "iwx-so-a0-gf-a0-77",
-                pnvm: Some("iwx-so-a0-gf-a0.pnvm"),
+                firmware: "/lib/firmware/iwlwifi-so-a0-gf-a0-89.ucode",
+                pnvm: Some("/lib/firmware/iwlwifi-so-a0-gf-a0.pnvm"),
                 uhb_supported: true,
                 xtal_latency: 0,
                 low_latency_xtal: false,
             },
             Self::SoGf4Ax411 => FirmwareConfig {
-                firmware: "iwx-so-a0-gf4-a0-77",
-                pnvm: Some("iwx-so-a0-gf4-a0.pnvm"),
+                firmware: "/lib/firmware/iwlwifi-so-a0-gf4-a0-89.ucode",
+                pnvm: Some("/lib/firmware/iwlwifi-so-a0-gf4-a0.pnvm"),
                 uhb_supported: true,
                 xtal_latency: 12_000,
                 low_latency_xtal: true,
@@ -97,8 +97,8 @@ mod tests {
         assert_eq!(
             DeviceConfig::SoGfAx211.firmware(),
             FirmwareConfig {
-                firmware: "iwx-so-a0-gf-a0-77",
-                pnvm: Some("iwx-so-a0-gf-a0.pnvm"),
+                firmware: "/lib/firmware/iwlwifi-so-a0-gf-a0-89.ucode",
+                pnvm: Some("/lib/firmware/iwlwifi-so-a0-gf-a0.pnvm"),
                 uhb_supported: true,
                 xtal_latency: 0,
                 low_latency_xtal: false,

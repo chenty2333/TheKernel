@@ -11,6 +11,7 @@
 use alloc::vec::Vec;
 
 const TLV_MAGIC: u32 = 0x0a4c_5749;
+const AX210_UCODE_API: u32 = 89;
 const HEADER_LEN: usize = 88;
 const SECTION_LIMIT: usize = 69;
 const PROBE_MAX: u32 = 512;
@@ -78,6 +79,7 @@ pub enum FirmwareError {
     InvalidCapabilities,
     InvalidScanChannels,
     UnsupportedTlv(u32),
+    UnsupportedApi(u32),
 }
 
 impl FirmwareImage {
@@ -88,15 +90,17 @@ impl FirmwareImage {
         {
             return Err(FirmwareError::InvalidImage);
         }
+        let packed_version = read_u32(bytes, 72)?;
+        let api = (packed_version >> 8) & 0xff;
+        if api != AX210_UCODE_API {
+            return Err(FirmwareError::UnsupportedApi(api));
+        }
         let mut image = Self {
-            version: {
-                let packed = read_u32(bytes, 72)?;
-                [
-                    (packed >> 24) & 0xff,
-                    (packed >> 16) & 0xff,
-                    (packed >> 8) & 0xff,
-                ]
-            },
+            version: [
+                (packed_version >> 24) & 0xff,
+                (packed_version >> 16) & 0xff,
+                api,
+            ],
             sections: Vec::new(),
             capability_flags: 0,
             probe_max_len: 0,
@@ -286,6 +290,7 @@ fn set_bitmap<const N: usize>(bitmap: &mut [u32; N], data: &[u8]) -> Result<(), 
 fn test_image(tlvs: &[(u32, &[u8])]) -> Vec<u8> {
     let mut bytes = vec![0; HEADER_LEN];
     bytes[4..8].copy_from_slice(&TLV_MAGIC.to_le_bytes());
+    bytes[72..76].copy_from_slice(&((1 << 24) | (2 << 16) | (AX210_UCODE_API << 8)).to_le_bytes());
     for (kind, data) in tlvs {
         bytes.extend_from_slice(&kind.to_le_bytes());
         bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -316,6 +321,16 @@ mod tests {
         assert_eq!(image.sections[0].bytes, [1, 2, 3]);
         assert_eq!(image.capability_flags, 0x1234);
         assert_eq!(image.pnvm.as_deref(), Some(&[9, 8, 7][..]));
+    }
+
+    #[test]
+    fn rejects_unsupported_api_version() {
+        let mut bytes = test_image(&[]);
+        bytes[72..76].copy_from_slice(&((1u32 << 24) | (2 << 16) | (77 << 8)).to_le_bytes());
+        assert_eq!(
+            FirmwareImage::parse(&bytes),
+            Err(FirmwareError::UnsupportedApi(77))
+        );
     }
 
     #[test]
