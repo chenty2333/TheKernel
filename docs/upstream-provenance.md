@@ -1029,3 +1029,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): ADD_STA station initialization/update payload fields and status validation translated in `tk-axdriver-iwx/src/station.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): REMOVE_STA command and station removal ordering across drain/flush, queue removal, BA cleanup and DELBA callbacks translated in `tk-axdriver-iwx/src/station.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): generation-specific UMAC scan channel arrays and channel/firmware count caps translated in `tk-axdriver-iwx/src/scan.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `sys/net80211/ieee80211.h` (ISC): bounded scan probe-request header, rates and capability IE segmentation translated in `tk-axdriver-iwx/src/scan_probe.rs`.

@@ -35,6 +35,7 @@ mod rx;
 mod rx_event;
 mod rx_packet;
 mod scan;
+mod scan_probe;
 mod station;
 mod tx;
 mod tx_completion;
@@ -171,6 +172,11 @@ pub use scan::{
     UMAC_SCAN_ABORT, UMAC_SCAN_COMPLETE, UMAC_SCAN_REQ, abort_scan, begin_background_scan,
     begin_foreground_scan, end_scan, fill_umac_scan_channels, fill_umac_scan_channels_v5,
     scan_abort_command,
+};
+pub use scan_probe::{
+    DS_PARAMETER_IE, EXTENDED_RATES_IE, HT_CAPABILITIES_IE, PROBE_REQUEST_BYTES,
+    ProbeRequestConfig, ProbeRequestError, ProbeSegment, SUPPORTED_RATES_IE, ScanProbeRequest,
+    VHT_CAPABILITIES_IE, build_scan_probe_request,
 };
 pub use station::{
     ADD_STA_COMMAND, FlushedQueue, REMOVE_STA_COMMAND, STA_FLAG_AGG_DENSITY_MASK,
