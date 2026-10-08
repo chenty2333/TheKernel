@@ -95,3 +95,4 @@
 - nl80211 now answers GET_SCAN dumps for a registered interface with an empty multipart response when no scan cache is connected; command ID 32 is checked against the Linux 7.2.3 UAPI. TRIGGER_SCAN and scan event handling remain unsupported.
 - nl80211 GET_REG now returns the UAPI-encoded global world alpha2 attribute and validates optional wiphy selection; regulatory rule tables and per-radio regulatory state remain open.
 - `ieee80211.c` background scan start/timeout helpers are now translated as a driver callback plan with source state/re-entry/timer/RSN-port gates and scan-node/cache effects; ieee80211.c marker coverage advances from 13/25 to 15/25; net80211 tests increased to 98.
+- `ieee80211.c` management watchdog countdown/rearm and station AUTH/ASSOC timeout effects now map to a typed transition plan; source-function marker coverage advances from 15/25 to 16/25.

@@ -118,9 +118,10 @@ pub use output::{
 pub use proto::{
     CAP_SHORT_PREAMBLE, CAP_SHORT_SLOT, ErpState, FIX_RATE_DELETE, FIX_RATE_FIXED,
     FIX_RATE_NEGOTIATE, FIX_RATE_SORT, FLAG_SHORT_PREAMBLE, FLAG_SHORT_SLOT, FLAG_USE_PROTECTION,
-    FixRateConfig, LocalPhyConfig, NegotiatedPhy, OpenAuthEffects, OpenAuthState, PeerPhyConfig,
-    ProtocolState, auth_open_station, beacon_miss_threshold, fix_rate, he_negotiate, ht_negotiate,
-    newstate, reset_erp, set_short_slot, try_another_bss, vht_negotiate,
+    FixRateConfig, LocalPhyConfig, ManagementWatchdogEffects, NegotiatedPhy, OpenAuthEffects,
+    OpenAuthState, PeerPhyConfig, ProtocolState, auth_open_station, beacon_miss_threshold,
+    fix_rate, he_negotiate, ht_negotiate, management_watchdog_tick, newstate, reset_erp,
+    set_short_slot, try_another_bss, vht_negotiate,
 };
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,

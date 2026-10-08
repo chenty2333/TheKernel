@@ -1,7 +1,8 @@
 //! Legacy rate negotiation from OpenBSD net80211.
 //!
 //! Translated from `sys/net80211/ieee80211_proto.c` rev 1.176,
-//! `ieee80211_node.h` rev 1.64 and `ieee80211.h` rev 1.137 (BSD-3-Clause).
+//! `sys/net80211/ieee80211.c` rev 1.92, `ieee80211_node.h` rev 1.64 and
+//! `ieee80211.h` rev 1.137 (BSD-3-Clause).
 //! Copyright (c) 2001 Atsushi Onoe; Copyright (c) 2002, 2003 Sam Leffler,
 //! Errno Consulting; Copyright (c) 2007-2009 Damien Bergamini.
 
@@ -20,6 +21,15 @@ pub struct ErpState {
     pub use_protection: bool,
     pub short_preamble: bool,
     pub short_slot: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ManagementWatchdogEffects {
+    pub remaining_timer: u16,
+    pub next_state: Option<ProtocolState>,
+    pub count_peer_failure: bool,
+    pub deselect_ess: bool,
+    pub rearm_interface_timer: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +52,36 @@ pub enum ProtocolState {
     Auth,
     Assoc,
     Run,
+}
+
+/// Process one management-watchdog tick and preserve station auth/assoc timeout effects.
+// upstream: ieee80211.c ieee80211_watchdog()
+pub fn management_watchdog_tick(
+    timer: u16,
+    state: ProtocolState,
+    station_mode: bool,
+    auto_join: bool,
+) -> ManagementWatchdogEffects {
+    if timer == 0 {
+        return ManagementWatchdogEffects::default();
+    }
+    let remaining_timer = timer - 1;
+    if remaining_timer != 0 {
+        return ManagementWatchdogEffects {
+            remaining_timer,
+            rearm_interface_timer: true,
+            ..ManagementWatchdogEffects::default()
+        };
+    }
+    let station_timeout =
+        station_mode && matches!(state, ProtocolState::Auth | ProtocolState::Assoc);
+    ManagementWatchdogEffects {
+        remaining_timer: 0,
+        next_state: Some(ProtocolState::Scan),
+        count_peer_failure: station_timeout,
+        deselect_ess: station_timeout && auto_join,
+        rearm_interface_timer: false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -949,5 +989,33 @@ mod tests {
             FIX_RATE_FIXED | FIX_RATE_NEGOTIATE,
         );
         assert_eq!(result, 12 | crate::LEGACY_RATE_BASIC);
+    }
+
+    #[test]
+    fn management_watchdog_rearms_counts_auth_timeout_and_deselects_auto_join() {
+        assert_eq!(
+            management_watchdog_tick(2, ProtocolState::Assoc, true, true),
+            ManagementWatchdogEffects {
+                remaining_timer: 1,
+                next_state: None,
+                count_peer_failure: false,
+                deselect_ess: false,
+                rearm_interface_timer: true,
+            }
+        );
+        assert_eq!(
+            management_watchdog_tick(1, ProtocolState::Auth, true, true),
+            ManagementWatchdogEffects {
+                remaining_timer: 0,
+                next_state: Some(ProtocolState::Scan),
+                count_peer_failure: true,
+                deselect_ess: true,
+                rearm_interface_timer: false,
+            }
+        );
+        assert_eq!(
+            management_watchdog_tick(1, ProtocolState::Run, true, true).count_peer_failure,
+            false
+        );
     }
 }

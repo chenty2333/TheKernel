@@ -218,3 +218,8 @@ runs the driver callback only after those guards and returns explicit cache
 clear/background-scan effects when the callback succeeds; the timeout wrapper
 uses the same planner. The controller/firmware scan callback is still a
 separate iwx runtime integration step.
+
+The generic management watchdog helper preserves the countdown and timer-rearm
+behavior, moves any expired management state to SCAN, and adds station peer
+failure/auto-join deselection effects only for AUTH/ASSOC timeouts. The timer
+scheduler and actual state transition remain owned by the caller.
