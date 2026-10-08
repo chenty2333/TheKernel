@@ -14,6 +14,7 @@ pub mod guc_config;
 pub mod guc_ct;
 pub mod guc_fw;
 pub mod guc_log;
+pub mod guc_submission;
 pub mod huc;
 pub mod info;
 pub mod lrc;

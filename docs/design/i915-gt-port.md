@@ -18,6 +18,10 @@ Rust 侧复用 `kernel/src/drm/intel/{gt.rs,gt_probe.rs,gem_exec.rs,gem_context.
 | Linux `drivers/gpu/drm/` 通用 DRM/GEM/VM/调度器框架 | 不移植框架层 | 映射到 `kernel/src/drm/{render,dmabuf,fence,syncobj.rs,syncobj/}` 和现有 VM、DMA、文件描述符接口；确需通用能力时新增最小接口 |
 | 用户态载荷：Mesa anv、`vulkaninfo`、intel-media-driver、libva、`vainfo` | 各仓库/文件独立核许可证；iHD 按 MIT 处理 | 在现有 N305 iris smoke payload 旁增加可复现构建/guest 加载检查；无设备时只验证预期拒绝行为 |
 
+### GuC submission 切片
+
+`guc_submission.rs` 已补入上游 v69 context/process descriptors、v70 scheduling WQ descriptors、context-registration ABI、sched-state 位/blocked 引用计数，以及 multi-LRC WQ item/no-op wrap 编码。当前既有 N305 RCS/BCS 提交器仍未改为 GuC backend；还缺 engine/context lifetime、注册策略和 CT client callsites、G2H/tasklet 工作流、抢占/时间片及 reset integration。这是 ABI/队列子集，不可据此宣称 GuC 默认提交可工作。
+
 ## 移植边界
 
 不翻译 Linux DRM 框架、debugfs/sysfs 管理面、非 Gen12 平台路径及任务未列出的显示功能。GSC、LMEM-only/独显路径以及需要尚不存在的内核内存/用户页能力部分，先核对 Gen12 ADL 集显调用路径；不能安全映射的功能记录为未移植，不以占位成功掩盖。上游代码按函数保留控制流和错误顺序，翻译文件顶部登记来源/完整版权行，每个翻译函数用 `// upstream: <文件> <函数>()` 标注；MIT 全文及来源登记遵守 `COMMON.md`。
