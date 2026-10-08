@@ -357,3 +357,5 @@ The `if_igc.c` low-level reset and hardware queue setup has advanced to 22/91 ct
 The `if_igc.c` lifecycle adapter now represents interface init/stop, suspend/shutdown/resume, MTU admission, cached link transitions, and the parity-fatal reset/drain order. Its callback boundary is still not installed in `IgcNic` or the PCI probe.
 
 The IGC interface translation now covers the interrupt mask/route and fatal-error state machine paths from `if_igc.c`: legacy and MSI-X causes, ICR fatal capture, deferred admin state, IVAR routing, queue enable and interrupt rate initialization. The PCI/iflib registration/resource allocation and the product bridge are still unfinished.
+
+The next `if_igc.c` batch adds PCI config-space identity capture, L1.2 erratum disable policy, bus-master admission, firmware `DRV_LOAD` ownership, counter exposure policy and the empty MSI-X setup routine. PCI register/interrupt allocation remains a platform boundary rather than a FreeBSD bus resource copy.

@@ -277,7 +277,12 @@ pub struct IgcPhyOps {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IgcHardware {
+    pub vendor_id: u16,
     pub device_id: u16,
+    pub revision_id: u8,
+    pub subsystem_vendor_id: u16,
+    pub subsystem_device_id: u16,
+    pub pci_command: u16,
     pub mac_type: Option<IgcMacType>,
     pub registers_mapped: bool,
     pub mac_ops: IgcMacOps,
@@ -291,7 +296,12 @@ pub struct IgcHardware {
 impl IgcHardware {
     pub fn new(device_id: u16, registers_mapped: bool) -> Self {
         Self {
+            vendor_id: ids::INTEL_VENDOR,
             device_id,
+            revision_id: 0,
+            subsystem_vendor_id: 0,
+            subsystem_device_id: 0,
+            pci_command: 0,
             mac_type: None,
             registers_mapped,
             mac_ops: IgcMacOps {

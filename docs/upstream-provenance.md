@@ -1098,3 +1098,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - FreeBSD `sys/dev/igc/if_igc.c` coverage update: `igc_reset`, RSS map programming, and TX/RX unit setup are now translated in `igc/if_igc.rs`; per-file coverage 22/91 ctags definitions.
 - FreeBSD `sys/dev/igc/if_igc.c` coverage update: translated `igc_if_init/stop/suspend/shutdown/resume`, MTU, admin link transition, and fatal parity recovery helpers; coverage is now 31/91 ctags definitions.
 - FreeBSD `sys/dev/igc/if_igc.c` coverage update: added ICR handling, MSI-X/legacy masks, fatal-error capture/admin transition, queue interrupt re-enable, IVAR routing, and initial EITR programming; coverage is now 43/91 ctags functions.
+- FreeBSD `sys/dev/igc/if_igc.c` coverage update: translated PCI identity/L1.2 and busmaster controls, shared firmware ownership, iflib counter selection, queue cap, and MSI-X setup stub; coverage is now 51/91 ctags definitions.

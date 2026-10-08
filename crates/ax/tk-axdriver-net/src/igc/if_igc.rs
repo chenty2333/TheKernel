@@ -9,7 +9,10 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use super::mac::MacState;
+use super::{
+    api::{IgcHardware, igc_set_mac_type},
+    mac::MacState,
+};
 
 const MAX_MULTICAST: usize = 128;
 const VFTA_SIZE: usize = 128;
@@ -135,6 +138,16 @@ const FATAL_RESET_REQUESTED: u32 = 3;
 const MAX_JUMBO_MTU: u32 = 9234;
 const ETHER_HDR_LEN: u32 = 14;
 const ETHER_CRC_LEN: u32 = 4;
+const PCI_COMMAND: u16 = 0x04;
+const PCI_VENDOR: u16 = 0;
+const PCI_DEVICE: u16 = 0x02;
+const PCI_REVISION: u16 = 0x08;
+const PCI_SUBVENDOR: u16 = 0x2c;
+const PCI_SUBDEVICE: u16 = 0x2e;
+const PCI_BUSMASTER_ENABLE: u32 = 0x4;
+const L1SS_CONTROL1: u16 = 0x08;
+const CTRL_EXT: u32 = 0x00018;
+const CTRL_EXT_DRV_LOAD: u32 = 0x1000_0000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MainError {
@@ -283,6 +296,38 @@ pub trait IgcFatalIo: IgcMainIo {
 }
 pub trait IgcInterruptIo: IgcMainIo {
     fn disable_interrupts(&mut self);
+}
+pub trait IgcPciIo {
+    fn read_config(&mut self, offset: u16, width: u8) -> u32;
+    fn write_config(&mut self, offset: u16, width: u8, value: u32);
+    fn enable_busmaster(&mut self) -> Result<(), MainError>;
+    fn find_l1ss_capability(&mut self) -> Option<u16>;
+    fn l1ss_aspm_l12_mask(&self) -> u32;
+    fn l1ss_pcipm_l12_mask(&self) -> u32;
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IfStats {
+    pub colc: u64,
+    pub rxerrc: u64,
+    pub crcerrs: u64,
+    pub algnerrc: u64,
+    pub ruc: u64,
+    pub rfc: u64,
+    pub roc: u64,
+    pub mpc: u64,
+    pub ecol: u64,
+    pub latecol: u64,
+    pub dropped_pkts: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IfCounter {
+    Collisions,
+    InputErrors,
+    OutputErrors,
+    Other(u8),
+}
+pub trait IfCounterIo {
+    fn default_counter(&mut self, counter: IfCounter) -> u64;
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InterruptState {
@@ -1204,6 +1249,94 @@ pub fn igc_if_update_admin_status<I: IgcAdminIo>(
     io.apply_i225_ipg_workaround();
     io.update_stats_counters();
 }
+
+// upstream: if_igc.c igc_identify_hardware()
+pub fn igc_identify_hardware<I: IgcPciIo>(
+    io: &mut I,
+    hw: &mut IgcHardware,
+) -> Result<(), MainError> {
+    hw.pci_command = io.read_config(PCI_COMMAND, 2) as u16;
+    hw.vendor_id = io.read_config(PCI_VENDOR, 2) as u16;
+    hw.device_id = io.read_config(PCI_DEVICE, 2) as u16;
+    hw.revision_id = io.read_config(PCI_REVISION, 1) as u8;
+    hw.subsystem_vendor_id = io.read_config(PCI_SUBVENDOR, 2) as u16;
+    hw.subsystem_device_id = io.read_config(PCI_SUBDEVICE, 2) as u16;
+    igc_set_mac_type(hw).map(|_| ()).map_err(|_| MainError::Io)
+}
+// upstream: if_igc.c igc_disable_broken_l1_2()
+pub fn igc_disable_broken_l1_2<I: IgcPciIo>(io: &mut I, is_i225: bool, is_i226: bool) {
+    let mask = if is_i225 {
+        io.l1ss_aspm_l12_mask() | io.l1ss_pcipm_l12_mask()
+    } else if is_i226 {
+        io.l1ss_aspm_l12_mask()
+    } else {
+        return;
+    };
+    let Some(cap) = io.find_l1ss_capability() else {
+        return;
+    };
+    let offset = cap + L1SS_CONTROL1;
+    let ctl1 = io.read_config(offset, 4) & !mask;
+    io.write_config(offset, 4, ctl1)
+}
+// upstream: if_igc.c igc_enable_pci_busmaster()
+pub fn igc_enable_pci_busmaster<I: IgcPciIo>(io: &mut I) -> Result<(), MainError> {
+    let command = io.read_config(PCI_COMMAND, 2);
+    if command == u16::MAX as u32 {
+        return Err(MainError::Io);
+    }
+    if command & PCI_BUSMASTER_ENABLE != 0 {
+        return Ok(());
+    }
+    let enabled = io.enable_busmaster();
+    let command = io.read_config(PCI_COMMAND, 2);
+    if command == u16::MAX as u32 {
+        return Err(MainError::Io);
+    }
+    if command & PCI_BUSMASTER_ENABLE == 0 {
+        return enabled.and(Err(MainError::Io));
+    }
+    Ok(())
+}
+// upstream: if_igc.c igc_get_hw_control()
+pub fn igc_get_hw_control<I: IgcMainIo>(io: &mut I, is_vf: bool) {
+    if is_vf {
+        return;
+    }
+    let ctrl = io.read(CTRL_EXT);
+    io.write(CTRL_EXT, ctrl | CTRL_EXT_DRV_LOAD)
+}
+// upstream: if_igc.c igc_release_hw_control()
+pub fn igc_release_hw_control<I: IgcMainIo>(io: &mut I) {
+    let ctrl = io.read(CTRL_EXT);
+    io.write(CTRL_EXT, ctrl & !CTRL_EXT_DRV_LOAD)
+}
+// upstream: if_igc.c igc_if_get_counter()
+pub fn igc_if_get_counter<I: IfCounterIo>(io: &mut I, stats: &IfStats, counter: IfCounter) -> u64 {
+    match counter {
+        IfCounter::Collisions => stats.colc,
+        IfCounter::InputErrors => {
+            stats.dropped_pkts
+                + stats.rxerrc
+                + stats.crcerrs
+                + stats.algnerrc
+                + stats.ruc
+                + stats.rfc
+                + stats.roc
+                + stats.mpc
+        }
+        IfCounter::OutputErrors => io.default_counter(counter) + stats.ecol + stats.latecol,
+        other => io.default_counter(other),
+    }
+}
+// upstream: if_igc.c igc_set_num_queues()
+pub const fn igc_set_num_queues() -> usize {
+    4
+}
+// upstream: if_igc.c igc_setup_msix()
+pub const fn igc_setup_msix() -> Result<(), MainError> {
+    Ok(())
+}
 // upstream: if_igc.c igc_is_valid_ether_addr()
 pub fn igc_is_valid_ether_addr(address: &[u8; 6]) -> bool {
     address[0] & 1 == 0 && address.iter().any(|b| *b != 0)
@@ -1231,6 +1364,7 @@ mod tests {
         copper: bool,
         unknown_media: bool,
         get_link_status: bool,
+        config: Vec<(u16, u8, u32)>,
     }
     impl Fake {
         fn get(&self, r: u32) -> u32 {
@@ -1406,6 +1540,41 @@ mod tests {
     impl IgcInterruptIo for Fake {
         fn disable_interrupts(&mut self) {
             self.events.push("disable-interrupts")
+        }
+    }
+    impl IgcPciIo for Fake {
+        fn read_config(&mut self, o: u16, w: u8) -> u32 {
+            self.config
+                .iter()
+                .rev()
+                .find(|v| v.0 == o && v.1 == w)
+                .map_or(0, |v| v.2)
+        }
+        fn write_config(&mut self, o: u16, w: u8, val: u32) {
+            if let Some(v) = self.config.iter_mut().find(|v| v.0 == o && v.1 == w) {
+                v.2 = val
+            } else {
+                self.config.push((o, w, val))
+            }
+        }
+        fn enable_busmaster(&mut self) -> Result<(), MainError> {
+            let cmd = self.read_config(PCI_COMMAND, 2) | PCI_BUSMASTER_ENABLE;
+            self.write_config(PCI_COMMAND, 2, cmd);
+            Ok(())
+        }
+        fn find_l1ss_capability(&mut self) -> Option<u16> {
+            Some(0x100)
+        }
+        fn l1ss_aspm_l12_mask(&self) -> u32 {
+            2
+        }
+        fn l1ss_pcipm_l12_mask(&self) -> u32 {
+            8
+        }
+    }
+    impl IfCounterIo for Fake {
+        fn default_counter(&mut self, _: IfCounter) -> u64 {
+            5
         }
     }
     #[test]
@@ -1715,5 +1884,58 @@ mod tests {
             queues[0].eitr_setting,
             (((1_000_000 / 8000) << 2) & EITR_QVECTOR_MASK) | EITR_CNT_IGNR
         );
+    }
+
+    #[test]
+    fn pci_identification_busmaster_l1ss_and_counter_callbacks_translate() {
+        let mut io = Fake::default();
+        io.config.extend([
+            (PCI_COMMAND, 2, 0),
+            (PCI_VENDOR, 2, 0x8086),
+            (PCI_DEVICE, 2, 0x15f3),
+            (PCI_REVISION, 1, 1),
+            (PCI_SUBVENDOR, 2, 0x8086),
+            (PCI_SUBDEVICE, 2, 7),
+            (0x108, 4, 0xffff),
+        ]);
+        let mut hw = IgcHardware::new(0, false);
+        igc_identify_hardware(&mut io, &mut hw).unwrap();
+        assert_eq!(hw.device_id, 0x15f3);
+        assert_eq!(hw.mac_type, Some(super::super::api::IgcMacType::I225));
+        igc_enable_pci_busmaster(&mut io).unwrap();
+        assert_eq!(
+            io.read_config(PCI_COMMAND, 2) & PCI_BUSMASTER_ENABLE,
+            PCI_BUSMASTER_ENABLE
+        );
+        igc_disable_broken_l1_2(&mut io, true, false);
+        assert_eq!(io.read_config(0x108, 4) & 0xa, 0);
+        igc_get_hw_control(&mut io, false);
+        assert_ne!(io.get(CTRL_EXT) & CTRL_EXT_DRV_LOAD, 0);
+        igc_release_hw_control(&mut io);
+        assert_eq!(io.get(CTRL_EXT) & CTRL_EXT_DRV_LOAD, 0);
+        let stats = IfStats {
+            colc: 2,
+            dropped_pkts: 1,
+            rxerrc: 2,
+            crcerrs: 3,
+            algnerrc: 4,
+            ruc: 5,
+            rfc: 6,
+            roc: 7,
+            mpc: 8,
+            ecol: 9,
+            latecol: 10,
+        };
+        assert_eq!(
+            igc_if_get_counter(&mut io, &stats, IfCounter::InputErrors),
+            36
+        );
+        assert_eq!(
+            igc_if_get_counter(&mut io, &stats, IfCounter::OutputErrors),
+            24
+        );
+        assert_eq!(igc_if_get_counter(&mut io, &stats, IfCounter::Other(0)), 5);
+        assert_eq!(igc_set_num_queues(), 4);
+        assert!(igc_setup_msix().is_ok());
     }
 }
