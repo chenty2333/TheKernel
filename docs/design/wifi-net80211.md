@@ -489,3 +489,11 @@ remain driver-owned.
 Node cleanup now clears owned security-IE storage and returns BA/reorder and
 unreference-callback retirement effects; only an explicit HostAP caller asks
 to purge the saved power-save queue.
+
+VHT goodput adaptation is now represented by the complete `ra_vht` station
+state machine and 20/40/80-MHz rateset table. iwx retains the upstream division
+of responsibility: firmware TLC performs the live rate-selection loop; the
+host's translated VHT MCS-map validation supplies per-stream admission masks to
+TLC, rather than running a competing host loop. The firmware rate notification is decoded by the existing iwx TLC update helper; the
+live firmware TLC loop remains the source of rate selection rather than a parallel
+host loop.

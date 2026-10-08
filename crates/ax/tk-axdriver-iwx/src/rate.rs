@@ -589,15 +589,9 @@ pub fn rateset_vht_bitmap(
     if !(1..=8).contains(&spatial_stream) {
         return Err(TxRateError::InvalidSpatialStream);
     }
-    let shift = u32::from(spatial_stream - 1) * 2;
-    let rx_mcs = (peer_mcs_map >> shift) & 0x3;
-    let max_mcs = match rx_mcs {
-        0 => 7,
-        1 => 8,
-        2 if supports_40mhz => 9,
-        2 => 8,
-        3 => return Ok(0),
-        _ => return Err(TxRateError::InvalidMcs),
+    let Some(max_mcs) = tk_net80211::get_vht_max_mcs(peer_mcs_map, spatial_stream, supports_40mhz)
+    else {
+        return Ok(0);
     };
     Ok(((1u16 << (max_mcs + 1)) - 1) & 0x03ff)
 }

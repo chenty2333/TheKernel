@@ -21,8 +21,8 @@ mod decrypt;
 mod disconnect_rx;
 mod frame;
 mod input;
-mod mgmt_rx;
 mod media;
+mod mgmt_rx;
 mod node;
 mod node_caps;
 mod node_rates;
@@ -30,6 +30,7 @@ mod node_table;
 mod output;
 mod proto;
 mod ra;
+mod ra_vht;
 mod rates;
 mod regdomain;
 mod rsn;
@@ -51,9 +52,9 @@ pub use ba_tx::{
     ADD_BA_RESPONSE_TIMEOUT_MICROS, ADD_BA_STATUS_UNSPECIFIED, ADD_BA_TID_SHIFT,
     ADD_BA_WINDOW_SHIFT, AddbaTxOutcome, AddbaTxPolicy, BA_TID_COUNT, DELBA_REASON_AUTH_LEAVE,
     DELBA_REASON_SETUP_REQUIRED, DELBA_REASON_TIMEOUT, DelbaRequestEffects, RxBaTimeoutEffects,
-    StopAmpduTidEffect, TX_BA_AGREED, TX_BA_INIT, TX_BA_REQUESTED, TxBaAgreement,
-    TxBaClearEffects, TxBaTimeoutEffects, clear_tx_ba, request_delba, rx_ba_timeout,
-    start_addba_request, stop_ampdu_tx, tx_ba_timeout,
+    StopAmpduTidEffect, TX_BA_AGREED, TX_BA_INIT, TX_BA_REQUESTED, TxBaAgreement, TxBaClearEffects,
+    TxBaTimeoutEffects, clear_tx_ba, request_delba, rx_ba_timeout, start_addba_request,
+    stop_ampdu_tx, tx_ba_timeout,
 };
 pub use beacon::{BeaconError, BeaconPolicy, BeaconRxInfo, BeaconUpdate, receive_beacon};
 pub use channel::{
@@ -90,11 +91,10 @@ pub use input::{
     parse_edca_body, parse_edca_ie, parse_wmm_params, parse_wmm_qos_info, qos_control,
     save_information_element, setup_uapsd,
 };
-pub use mgmt_rx::{ManagementRxError, ManagementRxKind, receive_management_kind};
 pub use media::{
-    MediaConversionError, MediaSubtype, media_to_mcs, media_to_rate, mcs_to_media,
-    rate_to_media,
+    MediaConversionError, MediaSubtype, mcs_to_media, media_to_mcs, media_to_rate, rate_to_media,
 };
+pub use mgmt_rx::{ManagementRxError, ManagementRxKind, receive_management_kind};
 pub use node::{
     AKM_8021X, AKM_PSK, AKM_SHA256_8021X, AKM_SHA256_PSK, ASSOCFAIL_BASIC_RATE, ASSOCFAIL_BSSID,
     ASSOCFAIL_CHAN, ASSOCFAIL_CSA, ASSOCFAIL_ESSID, ASSOCFAIL_IBSS, ASSOCFAIL_PRIVACY,
@@ -104,11 +104,11 @@ pub use node::{
     HTOP0_SCO_SHIFT, HtLeaveEffects, LOCAL_CAP_MFP, NetworkProfile, PRIVACY, PROTO_RSN, PROTO_WPA,
     RSN_CAP_MFPC, RsnLeaveEffects, StationBssJoinError, StationBssJoinPlan, StationBssJoinPolicy,
     SwitchBssPlan, TxStoppedPlan, check_rssi, choose_bss, choose_rsn_params, ess_adjust_rssi,
-    ess_calculate_score, ess_is_better,
-    get_ess, get_rate, get_rssi, join_station_bss, leave_11g_network, leave_he_network,
-    leave_ht_network, leave_rsn_network, leave_vht_network, match_bss, match_ess, switch_ess,
+    ess_calculate_score, ess_is_better, get_ess, get_rate, get_rssi, join_station_bss,
+    leave_11g_network, leave_he_network, leave_ht_network, leave_rsn_network, leave_vht_network,
+    match_bss, match_ess, node_switch_bss_plan, node_tx_stopped_plan, switch_ess,
     valid_40mhz_center_frequency, valid_40mhz_secondary_above, valid_40mhz_secondary_below,
-    node_switch_bss_plan, node_tx_stopped_plan, valid_80mhz_center_frequency,
+    valid_80mhz_center_frequency,
 };
 pub use node_caps::{
     HE_FIXED_CAPS_LEN, HE_MAC_CAPS_LEN, HE_MCS_NSS_80_LEN, HE_MCS_SS_NOT_SUPP, HE_PHY_CAPS_LEN,
@@ -146,22 +146,20 @@ pub use output::{
     ELEMID_ERP, ELEMID_EXT_HE_CAPS, ELEMID_EXTENSION, ELEMID_HT_CAPS, ELEMID_HT_OPERATION,
     ELEMID_QOS_CAPABILITY, ELEMID_RATES, ELEMID_RSN, ELEMID_SSID, ELEMID_VENDOR, ELEMID_VHT_CAPS,
     ELEMID_XRATES, ERP_BARKER_MODE, ERP_NON_ERP_PRESENT, ERP_USE_PROTECTION, EdcaTxopLimiter,
-    IeError, ManagementFrameError, ManagementTxSequence, OutputOpMode, ProbeRequestConfig, RSN_OUI,
-    RSNCAP_GTKSA_RCNT_MASK, RSNCAP_MFPC,
-    RSNCAP_MFPR, RSNCAP_PBAC, RSNCAP_PTKSA_RCNT_MASK, RsnIePolicy, TxBaWindow, WPA_OUI,
-    append_capability_info, append_ds_params_ie, append_edca_params_ie, append_erp_ie,
-    append_extended_rates_ie, append_he_caps_ie, append_ht_caps_ie, append_ht_operation_ie,
-    append_qos_capability_ie, append_rsn_ie, append_ssid_ie, append_supported_rates_ie,
-    append_vht_caps_ie, append_wme_info_ie, append_wme_parameter_ie, append_wpa_ie,
-    build_action_body, build_addba_request_body, build_addba_response_body, build_compressed_bar,
-    build_assoc_request_body, build_auth_body, build_deauth_body, build_delba_body,
-    build_disassoc_body, build_probe_request_ies, build_rsn_body, build_sa_query_body,
-    can_use_ampdu, classify_ethernet_frame, move_tx_ba_window, plan_station_mgmt_send,
-    uapsd_qos_info, MGMT_SUBTYPE_ACTION, MGMT_SUBTYPE_ASSOC_REQ, MGMT_SUBTYPE_AUTH,
-    MGMT_SUBTYPE_DEAUTH, MGMT_SUBTYPE_DISASSOC, MGMT_SUBTYPE_PROBE_REQ,
-    MGMT_SUBTYPE_REASSOC_REQ, MGMT_TRANSITION_WAIT_TICKS, StationMgmtBody,
-    StationMgmtSendError, StationMgmtSendPlan,
-    user_priority_to_access_category,
+    IeError, MGMT_SUBTYPE_ACTION, MGMT_SUBTYPE_ASSOC_REQ, MGMT_SUBTYPE_AUTH, MGMT_SUBTYPE_DEAUTH,
+    MGMT_SUBTYPE_DISASSOC, MGMT_SUBTYPE_PROBE_REQ, MGMT_SUBTYPE_REASSOC_REQ,
+    MGMT_TRANSITION_WAIT_TICKS, ManagementFrameError, ManagementTxSequence, OutputOpMode,
+    ProbeRequestConfig, RSN_OUI, RSNCAP_GTKSA_RCNT_MASK, RSNCAP_MFPC, RSNCAP_MFPR, RSNCAP_PBAC,
+    RSNCAP_PTKSA_RCNT_MASK, RsnIePolicy, StationMgmtBody, StationMgmtSendError,
+    StationMgmtSendPlan, TxBaWindow, WPA_OUI, append_capability_info, append_ds_params_ie,
+    append_edca_params_ie, append_erp_ie, append_extended_rates_ie, append_he_caps_ie,
+    append_ht_caps_ie, append_ht_operation_ie, append_qos_capability_ie, append_rsn_ie,
+    append_ssid_ie, append_supported_rates_ie, append_vht_caps_ie, append_wme_info_ie,
+    append_wme_parameter_ie, append_wpa_ie, build_action_body, build_addba_request_body,
+    build_addba_response_body, build_assoc_request_body, build_auth_body, build_compressed_bar,
+    build_deauth_body, build_delba_body, build_disassoc_body, build_probe_request_ies,
+    build_rsn_body, build_sa_query_body, can_use_ampdu, classify_ethernet_frame, move_tx_ba_window,
+    plan_station_mgmt_send, uapsd_qos_info, user_priority_to_access_category,
 };
 pub use proto::{
     CAP_SHORT_PREAMBLE, CAP_SHORT_SLOT, ErpState, FIX_RATE_DELETE, FIX_RATE_FIXED,
@@ -180,6 +178,23 @@ pub use ra::{
     next_lower_intra_rate, next_mcs, next_rateset, node_init, probe_clear, probe_done,
     probe_next_rate, probe_next_rateset, probe_valid, trigger_next_rateset, use_ht_sgi,
     valid_rates, valid_tx_mcs,
+};
+pub use ra_vht::{
+    GoodputStats as VhtGoodputStats, RA_FP_ONE as VHT_RA_FP_ONE, RA_FP_SHIFT as VHT_RA_FP_SHIFT,
+    RA_NOT_PROBING as VHT_RA_NOT_PROBING, RA_PROBING_DOWN as VHT_RA_PROBING_DOWN,
+    RA_PROBING_INTER as VHT_RA_PROBING_INTER, RA_PROBING_UP as VHT_RA_PROBING_UP,
+    RA_RATE_THRESHOLD as VHT_RA_RATE_THRESHOLD, VHT_MAX_MCS, VHT_NUM_RATESETS, VHT_NUM_SS,
+    VHT_RATESET_MAX_NRATES, VHT_RATESETS, VhtPeer, VhtRaNode, VhtRateSet,
+    add_stats as add_vht_stats, best_mcs_in_rateset as best_vht_mcs_in_rateset,
+    best_rate as best_vht_rate, choose as choose_vht_rate, get_max_mcs as get_vht_max_mcs,
+    get_rateset as get_vht_rateset, get_txrate as get_vht_txrate,
+    init_valid_rates as init_vht_valid_rates, inter_mode_ra_finished as vht_inter_mode_ra_finished,
+    intra_mode_ra_finished as vht_intra_mode_ra_finished, next_intra_rate as next_vht_intra_rate,
+    next_lower_intra_rate as next_vht_lower_intra_rate, next_mcs as next_vht_mcs,
+    next_rateset as next_vht_rateset, node_init as vht_node_init, probe_clear as vht_probe_clear,
+    probe_done as vht_probe_done, probe_next_rate as vht_probe_next_rate,
+    probe_next_rateset as vht_probe_next_rateset, probe_valid as vht_probe_valid,
+    trigger_next_rateset as vht_trigger_next_rateset, use_sgi as vht_use_sgi,
 };
 pub use rates::{
     PhyMode, RATE_BASIC as LEGACY_RATE_BASIC, RATE_MAX_SIZE, RATE_VALUE as LEGACY_RATE_VALUE,
