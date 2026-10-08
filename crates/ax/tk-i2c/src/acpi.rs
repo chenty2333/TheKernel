@@ -32,21 +32,22 @@ pub fn ig4iic_acpi_attach<A: AcpiResources>(
         "INT33C2" | "INT33C3" | "INT3432" | "INT3433" => Version::Haswell,
         _ => Version::Atom,
     };
-    sc.io.set_power_d0().map_err(|_| IicError::Invalid)?;
+    // upstream ignores the result of Device_SetPowerState(D0).
+    let _ = sc.io.set_power_d0();
     state.regs_allocated = sc.io.allocate_memory().is_ok();
     if !state.regs_allocated {
         let _ = ig4iic_acpi_detach(sc, state);
-        return Err(IicError::Invalid);
+        return Err(IicError::NoDevice);
     }
     state.intr_allocated = sc.io.allocate_irq().is_ok();
     if !state.intr_allocated {
         let _ = ig4iic_acpi_detach(sc, state);
-        return Err(IicError::Invalid);
+        return Err(IicError::NoDevice);
     }
     state.platform_attached = true;
     if sc.ig4iic_attach().is_err() {
         let _ = ig4iic_acpi_detach(sc, state);
-        return Err(IicError::Invalid);
+        return Err(IicError::NoDevice);
     }
     Ok(())
 }

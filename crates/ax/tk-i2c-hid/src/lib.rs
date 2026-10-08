@@ -8,10 +8,12 @@
 //! Foundation, Inc. The NetBSD-derived HID parser was contributed by Lennart
 //! Augustsson <lennart@augustsson.net>. See `LICENSES/BSD-2-Clause.txt`.
 #![no_std]
+extern crate alloc;
 
 #[cfg(test)]
 extern crate std;
 
+use alloc::vec::Vec;
 use core::fmt;
 
 use tk_i2c::{Address, Error as BusError};
@@ -31,6 +33,7 @@ pub enum Error {
     InvalidPacket,
     PacketTooLarge,
     Unsupported,
+    ResetTimeout,
     Bus(BusError),
 }
 
@@ -72,7 +75,6 @@ fn le16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
 
 impl Descriptor {
     /// Decode the fixed 30-byte little-endian `i2c_hid_desc` structure.
-    // upstream: iichid.c iichid_attach()
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() < HID_DESCRIPTOR_BYTES {
             return Err(Error::InvalidDescriptor);
@@ -92,12 +94,9 @@ impl Descriptor {
             product_id: le16(bytes, 22)?,
             version_id: le16(bytes, 24)?,
         };
-        if usize::from(d.descriptor_length) < HID_DESCRIPTOR_BYTES
-            || d.report_descriptor_length == 0
+        if d.descriptor_length != HID_DESCRIPTOR_BYTES as u16
+            || d.version != 0x0100
             || d.max_input_length < 2
-            || d.input_register == 0
-            || d.command_register == 0
-            || d.data_register == 0
         {
             return Err(Error::InvalidDescriptor);
         }
@@ -130,7 +129,7 @@ pub enum Power {
 pub struct AcpiHidDescriptorAddress(pub u16);
 
 impl AcpiHidDescriptorAddress {
-    // upstream: iichid.c iichid_probe()
+    // upstream: iichid.c iichid_get_config_reg()
     pub const fn from_dsm_integer(value: u64) -> Result<Self, Error> {
         // FreeBSD masks the ACPICA integer to the 16-bit register field.
         Ok(Self(value as u16))
@@ -149,6 +148,7 @@ pub trait Transport {
     fn read_input(&mut self, bytes: &mut [u8]) -> Result<usize, BusError>;
     fn read_report(&mut self, command: &[u8], bytes: &mut [u8]) -> Result<usize, BusError>;
     fn write_report(&mut self, command: &[u8], bytes: &[u8]) -> Result<(), BusError>;
+    fn delay_ms(&mut self, _milliseconds: u32) {}
 }
 
 /// Minimal protocol operations. Report parsing and Linux input event creation
@@ -171,15 +171,18 @@ impl<T: Transport> Device<T> {
     pub fn transport_address(&self) -> Address {
         self.transport.address()
     }
+    pub fn delay_ms(&mut self, milliseconds: u32) {
+        self.transport.delay_ms(milliseconds);
+    }
 
     /// Execute RESET using the HID-over-I2C command register, then poll the
     /// input register for the reset-complete zero-length packet.
     // upstream: iichid.c iichid_reset()
-    pub fn reset(&mut self, poll_limit: usize) -> Result<(), Error> {
+    pub fn reset(&mut self, timeout_seconds: u8) -> Result<(), Error> {
         self.transport
             .write_register(self.descriptor.command_register, &[0, Command::Reset as u8])?;
         let mut status = [0u8; 2];
-        for _ in 0..poll_limit {
+        for _ in 0..usize::from(timeout_seconds).saturating_mul(1000) {
             let n = self.transport.read_input(&mut status)?;
             if n >= 2 {
                 let length = u16::from_le_bytes(status);
@@ -187,8 +190,9 @@ impl<T: Transport> Device<T> {
                     return Ok(());
                 }
             }
+            self.transport.delay_ms(1);
         }
-        Err(Error::InvalidPacket)
+        Err(Error::ResetTimeout)
     }
 
     /// Power-on/off through SET_POWER. The HID protocol's low byte is power
@@ -203,26 +207,27 @@ impl<T: Transport> Device<T> {
 
     /// Read one input report. The two-byte length prefix is part of the I2C-HID
     /// packet; zero indicates no report, and lengths are checked before copy.
-    // upstream: iichid.c iichid_intr()
+    // upstream: iichid.c iichid_cmd_read()
     pub fn read_input(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         let max = usize::from(self.descriptor.max_input_length);
         if out.len().saturating_add(2) > max {
             return Err(Error::PacketTooLarge);
         }
-        let mut framed = [0u8; 1024];
-        if max > framed.len() {
-            return Err(Error::PacketTooLarge);
-        }
-        let n = self.transport.read_input(&mut framed[..max])?;
+        let mut framed = Vec::new();
+        framed
+            .try_reserve_exact(max)
+            .map_err(|_| Error::PacketTooLarge)?;
+        framed.resize(max, 0);
+        let n = self.transport.read_input(&mut framed)?;
         if n < 2 {
-            return Err(Error::InvalidPacket);
+            return Ok(0);
         }
         let length = usize::from(u16::from_le_bytes([framed[0], framed[1]]));
         if length == 0 {
             return Ok(0);
         }
         if length < 2 || length > n || length > max {
-            return Err(Error::InvalidPacket);
+            return Ok(0);
         }
         let payload = length - 2;
         if payload > out.len() {
@@ -236,7 +241,7 @@ impl<T: Transport> Device<T> {
     // upstream: iichid.c iichid_cmd_get_report_desc()
     pub fn report_descriptor(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         let length = usize::from(self.descriptor.report_descriptor_length);
-        if length == 0 || length > MAX_REPORT_DESCRIPTOR_BYTES || out.len() < length {
+        if length == 0 || out.len() < length {
             return Err(Error::PacketTooLarge);
         }
         let n = self.transport.read_register(
@@ -266,23 +271,19 @@ impl<T: Transport> Device<T> {
     /// Send a HID output report through the Output Register (HID-I2C §6.2.3).
     // upstream: iichid.c iichid_cmd_write()
     pub fn write_output(&mut self, report: &[u8]) -> Result<(), Error> {
-        if self.descriptor.output_register == 0
-            || self.descriptor.max_output_length == 0
-            || report.len() < 2
-            || report.len() > MAX_REPORT_BYTES
-            || report
-                .len()
-                .checked_add(2)
-                .is_none_or(|n| n > usize::from(self.descriptor.max_output_length))
-        {
-            return Err(Error::PacketTooLarge);
+        if self.descriptor.max_output_length == 0 || report.len() < 2 {
+            return Err(Error::Unsupported);
         }
         let length = u16::try_from(report.len() + 2).map_err(|_| Error::PacketTooLarge)?;
-        let mut packet = [0u8; MAX_REPORT_BYTES + 2];
+        let mut packet = Vec::new();
+        packet
+            .try_reserve_exact(report.len() + 2)
+            .map_err(|_| Error::PacketTooLarge)?;
+        packet.resize(report.len() + 2, 0);
         packet[..2].copy_from_slice(&length.to_le_bytes());
         packet[2..2 + report.len()].copy_from_slice(report);
         self.transport
-            .write_register(self.descriptor.output_register, &packet[..2 + report.len()])?;
+            .write_register(self.descriptor.output_register, &packet)?;
         Ok(())
     }
 
@@ -294,7 +295,7 @@ impl<T: Transport> Device<T> {
         report_id: u8,
         out: &mut [u8],
     ) -> Result<usize, Error> {
-        if !(1..=3).contains(&report_type) || out.is_empty() || out.len() > MAX_REPORT_BYTES {
+        if out.is_empty() {
             return Err(Error::PacketTooLarge);
         }
         let extended = report_id >= 15;
@@ -309,15 +310,19 @@ impl<T: Transport> Device<T> {
             command[4..6].copy_from_slice(&self.descriptor.data_register.to_le_bytes());
         }
         let command_len = if extended { 7 } else { 6 };
-        let mut framed = [0u8; MAX_REPORT_BYTES + 2];
-        let n = self
+        let mut framed = Vec::new();
+        framed
+            .try_reserve_exact(out.len().saturating_add(2))
+            .map_err(|_| Error::PacketTooLarge)?;
+        framed.resize(out.len().saturating_add(2), 0);
+        let actual = self
             .transport
-            .read_report(&command[..command_len], &mut framed[..out.len() + 2])?;
-        if n < 2 {
+            .read_report(&command[..command_len], &mut framed)?;
+        if actual < 2 {
             return Err(Error::InvalidPacket);
         }
         let length = usize::from(u16::from_le_bytes([framed[0], framed[1]]));
-        if length <= 2 || length > n || length > out.len() + 2 || length == usize::from(u16::MAX) {
+        if length <= 2 || length == usize::from(u16::MAX) {
             return Err(Error::InvalidPacket);
         }
         let payload_len = length - 2;
@@ -325,8 +330,9 @@ impl<T: Transport> Device<T> {
         if report_id != 0 && actual_id != report_id {
             return Err(Error::InvalidPacket);
         }
-        out[..payload_len].copy_from_slice(&framed[2..length]);
-        Ok(payload_len)
+        let copied = payload_len.min(out.len());
+        out[..copied].copy_from_slice(&framed[2..2 + copied]);
+        Ok(copied)
     }
 
     /// SET_REPORT command followed by its report payload (HID-I2C §7.2.2.3).
@@ -337,18 +343,8 @@ impl<T: Transport> Device<T> {
         report_id: u8,
         report: &[u8],
     ) -> Result<(), Error> {
-        if !(1..=3).contains(&report_type)
-            || report.len() < 2
-            || report.len() > MAX_REPORT_BYTES
-            || report
-                .len()
-                .checked_add(2)
-                .is_none_or(|n| n > usize::from(u16::MAX))
-        {
-            return Err(Error::PacketTooLarge);
-        }
         let extended = report_id >= 15;
-        let report_length = u16::try_from(report.len() + 2).map_err(|_| Error::PacketTooLarge)?;
+        let report_length = (report.len() + 2) as u16;
         let mut command = [0u8; 9];
         command[..2].copy_from_slice(&self.descriptor.command_register.to_le_bytes());
         command[2] = (if extended { 15 } else { report_id }) | (report_type << 4);
@@ -565,6 +561,44 @@ mod tests {
             set.transport.writes,
             vec![(0x23, vec![0x23, 0, 0x3f, 3, 15, 0x24, 0, 4, 0, 15, 0xaa])]
         );
+    }
+
+    #[test]
+    fn get_report_truncates_payload_to_the_callers_buffer() {
+        let mut get = Device::new(
+            Fake {
+                writes: Vec::new(),
+                read: vec![6, 0, 3, 0xaa, 0xbb, 0xcc],
+            },
+            desc(),
+        );
+        let mut report = [0; 2];
+        assert_eq!(get.get_report(1, 3, &mut report), Ok(2));
+        assert_eq!(report, [3, 0xaa]);
+    }
+
+    #[test]
+    fn output_report_uses_upstream_zero_max_and_short_report_checks_only() {
+        let mut d = desc();
+        d.max_output_length = 4;
+        let mut device = Device::new(
+            Fake {
+                writes: Vec::new(),
+                read: Vec::new(),
+            },
+            d,
+        );
+        assert_eq!(device.write_output(&[1, 2, 3, 4, 5]), Ok(()));
+        assert_eq!(device.transport.writes[0].1, vec![7, 0, 1, 2, 3, 4, 5]);
+        d.max_output_length = 0;
+        let mut device = Device::new(
+            Fake {
+                writes: Vec::new(),
+                read: Vec::new(),
+            },
+            d,
+        );
+        assert_eq!(device.write_output(&[1, 2]), Err(Error::Unsupported));
     }
 
     #[test]

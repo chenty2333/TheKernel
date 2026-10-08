@@ -747,7 +747,7 @@ pub fn ig4iic_pci_attach<P: PciResources>(
     state.regs_allocated = sc.io.allocate_bar0_memory();
     if !state.regs_allocated {
         let _ = ig4iic_pci_detach(sc, state);
-        return Err(IicError::Invalid);
+        return Err(IicError::NoDevice);
     }
     state.intr_rid = 0;
     state.msi_allocated = sc.io.allocate_msi();
@@ -757,12 +757,12 @@ pub fn ig4iic_pci_attach<P: PciResources>(
     state.irq_allocated = sc.io.allocate_irq(state.intr_rid);
     if !state.irq_allocated {
         let _ = ig4iic_pci_detach(sc, state);
-        return Err(IicError::Invalid);
+        return Err(IicError::NoDevice);
     }
     state.platform_attached = true;
     if sc.ig4iic_attach().is_err() {
         let _ = ig4iic_pci_detach(sc, state);
-        return Err(IicError::Invalid);
+        return Err(IicError::NoDevice);
     }
     Ok(())
 }

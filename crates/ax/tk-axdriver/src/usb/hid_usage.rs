@@ -147,10 +147,10 @@ pub(super) fn mapping(usage: Usage, application: Usage, relative: bool) -> Optio
         12 if usage.code == 0xe0 => Some(Mapping::Axis(3, 0x20)),
         12 => consumer(usage.code).map(Mapping::Key),
         0x0d => match usage.code {
-            0x30 => Some(Mapping::Axis(3, 0x35)), // ABS_MT_POSITION_X
-            0x31 => Some(Mapping::Axis(3, 0x36)), // ABS_MT_POSITION_Y
+            0x30 => Some(Mapping::Axis(3, 0x3a)), // ABS_MT_PRESSURE
+            0x32 => Some(Mapping::Axis(3, 0x3b)), // ABS_MT_DISTANCE / IN_RANGE
             0x42 => Some(Mapping::Key(0x14a)),    // BTN_TOUCH
-            0x32 => Some(Mapping::Key(0x145)),    // BTN_TOOL_FINGER
+            0x47 => Some(Mapping::Axis(3, 0x38)), // ABS_MT_BLOB_ID
             0x48 => Some(Mapping::Axis(3, 0x30)), // ABS_MT_TOUCH_MAJOR
             0x49 => Some(Mapping::Axis(3, 0x31)), // ABS_MT_TOUCH_MINOR
             0x51 => Some(Mapping::Axis(3, 0x39)), // ABS_MT_TRACKING_ID

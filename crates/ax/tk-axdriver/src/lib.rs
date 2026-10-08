@@ -101,6 +101,8 @@ pub(crate) mod hid_report;
 #[cfg(feature = "input")]
 #[path = "usb/hid_usage.rs"]
 mod hid_usage;
+mod hidbus;
+mod hmt;
 #[cfg(feature = "i2c")]
 pub mod i2c;
 #[cfg(feature = "i2c-hid")]

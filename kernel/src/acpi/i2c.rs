@@ -18,20 +18,26 @@ fn engine_child_devices(engine: &Engine, nodes: &[Node], controller: &str) -> Ve
             continue;
         }
         let hid = match engine.hardware_id(&node.path) {
-            Ok(hid) if matches!(hid.as_str(), "PNP0C50" | "ACPI0C50") => hid,
+            Ok(hid) if matches!(hid.as_str(), "PNP0C50" | "ACPI0C50" | "ELAN0000") => hid,
             _ => continue,
         };
-        let dsm_path = format!("{}._DSM", node.path);
-        let Some(descriptor_register) = engine
-            .evaluate_dsm_integer(&dsm_path, &I2C_HID_DSM_UUID, 1, 1)
-            .ok()
-            .map(|value| value as u16)
-        else {
-            warn!(
-                "acpica: I2C HID {} _DSM descriptor address unavailable",
-                node.path
-            );
-            continue;
+        let descriptor_register = if hid == "ELAN0000" {
+            // FreeBSD's ELAN quirk uses a fixed descriptor register and skips _DSM.
+            0x0001
+        } else {
+            let dsm_path = format!("{}._DSM", node.path);
+            let Some(register) = engine
+                .evaluate_dsm_integer(&dsm_path, &I2C_HID_DSM_UUID, 1, 1)
+                .ok()
+                .map(|value| value as u16)
+            else {
+                warn!(
+                    "acpica: I2C HID {} _DSM descriptor address unavailable",
+                    node.path
+                );
+                continue;
+            };
+            register
         };
         let resources = match engine.resources(&node.path, false) {
             Ok(resources) => resources,

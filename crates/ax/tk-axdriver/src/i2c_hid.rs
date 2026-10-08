@@ -13,8 +13,6 @@ use tk_i2c_hid::{
 };
 
 const BUS_I2C: u16 = 0x18;
-const MAX_HID_REPORT: usize = 4096;
-const MAX_INPUT_REPORT: usize = 1024;
 
 struct I2cTransport {
     bus: usize,
@@ -124,24 +122,34 @@ impl Transport for I2cTransport {
         ];
         crate::i2c::transfer(self.bus, &mut messages).map_err(bus_error)
     }
+
+    fn delay_ms(&mut self, milliseconds: u32) {
+        axhal::time::busy_wait(core::time::Duration::from_millis(u64::from(milliseconds)));
+    }
 }
 
 struct InputState {
     device: Device<I2cTransport>,
     descriptor: Descriptor,
     parser: crate::hid_report::Report,
+    hmt: Option<crate::hmt::MultiTouch>,
     events: VecDeque<Event>,
-    input: [u8; MAX_INPUT_REPORT],
+    input: Vec<u8>,
+    previous_input: Vec<u8>,
+    next_sample_ns: u64,
+    sample_rate_hz: u8,
+    missing_samples: u8,
+    duplicate_samples: u8,
 }
 
 pub struct I2cInput {
     state: Mutex<InputState>,
-    id: InputDeviceId,
+    info: crate::hidbus::DeviceInfo,
     location: String,
-    path: String,
 }
 
 impl I2cInput {
+    // upstream: iichid.c iichid_probe()
     fn attach(bus: usize, child: crate::i2c::AcpiI2cChild) -> DevResult<Self> {
         let address = if child.ten_bit {
             Address::ten_bit(child.slave_address)
@@ -160,44 +168,121 @@ impl I2cInput {
         .map_err(map_hid_error)?;
         if descriptor.version != 0x0100
             || descriptor.descriptor_length != tk_i2c_hid::HID_DESCRIPTOR_BYTES as u16
-            || usize::from(descriptor.max_input_length) > MAX_INPUT_REPORT
         {
             return Err(DevError::Unsupported);
         }
         let mut device = Device::new(transport, descriptor);
-        device.reset(256).map_err(map_hid_error)?;
         device.set_power(Power::On).map_err(map_hid_error)?;
-        let report_length = usize::from(descriptor.report_descriptor_length);
-        if report_length > MAX_HID_REPORT {
-            return Err(DevError::Unsupported);
+        device.delay_ms(1);
+        // upstream logs a warning and continues attachment on RESET timeout.
+        match device.reset(tk_i2c_hid::RESET_TIMEOUT_SECONDS) {
+            Ok(()) => {}
+            Err(HidError::ResetTimeout) => warn!(
+                "i2c-hid: device at {} did not acknowledge RESET",
+                child.slave_address
+            ),
+            Err(error) => return Err(map_hid_error(error)),
         }
-        let mut report_descriptor = vec![0; report_length];
+        let report_length = usize::from(descriptor.report_descriptor_length);
+        let mut report_descriptor = Vec::new();
+        report_descriptor
+            .try_reserve_exact(report_length)
+            .map_err(|_| DevError::NoMemory)?;
+        report_descriptor.resize(report_length, 0);
         let actual = device
             .report_descriptor(&mut report_descriptor)
             .map_err(map_hid_error)?;
-        let parser = crate::hid_report::Report::parse(&report_descriptor[..actual])?;
+        let parser = crate::hidbus::attach_report_descriptor(&report_descriptor[..actual])?;
         if parser.max_length() > usize::from(descriptor.max_input_length).saturating_sub(2) {
             return Err(DevError::Unsupported);
         }
+        let hmt = crate::hmt::MultiTouch::probe(&parser);
+        let mut input = Vec::new();
+        let input_length = usize::from(descriptor.max_input_length).saturating_sub(2);
+        input
+            .try_reserve_exact(input_length)
+            .map_err(|_| DevError::NoMemory)?;
+        input.resize(input_length, 0);
+        let mut previous_input = Vec::new();
+        previous_input
+            .try_reserve_exact(input_length)
+            .map_err(|_| DevError::NoMemory)?;
+        previous_input.resize(input_length, 0);
         let id = InputDeviceId {
             bus_type: BUS_I2C,
             vendor: descriptor.vendor_id,
             product: descriptor.product_id,
             version: descriptor.version_id,
         };
-        let path = child.path.clone();
+        let info = crate::hidbus::DeviceInfo::new(
+            id,
+            child.hid.clone(),
+            child.path.clone(),
+            report_descriptor,
+        );
         Ok(Self {
             state: Mutex::new(InputState {
                 device,
                 descriptor,
                 parser,
+                hmt,
                 events: VecDeque::new(),
-                input: [0; MAX_INPUT_REPORT],
+                input,
+                previous_input,
+                next_sample_ns: 0,
+                sample_rate_hz: tk_i2c_hid::INPUT_SAMPLING_FAST_HZ,
+                missing_samples: 0,
+                duplicate_samples: 0,
             }),
-            id,
+            info,
             location: format!("i2c-{bus}/{}", child.slave_address),
-            path,
         })
+    }
+
+    // upstream: hidbus.c hidbus_get_rdesc() / iichid.c iichid_ioctl()
+    pub fn get_report_descriptor(&self, out: &mut [u8]) -> DevResult<usize> {
+        self.info.report_descriptor(out)
+    }
+
+    // upstream: iichid.c iichid_get_report()
+    pub fn get_report(
+        &mut self,
+        report_type: u8,
+        report_id: u8,
+        out: &mut [u8],
+    ) -> DevResult<usize> {
+        self.state
+            .get_mut()
+            .device
+            .get_report(report_type, report_id, out)
+            .map_err(map_hid_error)
+    }
+
+    // upstream: iichid.c iichid_set_report()
+    pub fn set_report(&mut self, report_type: u8, report_id: u8, report: &[u8]) -> DevResult<()> {
+        self.state
+            .get_mut()
+            .device
+            .set_report(report_type, report_id, report)
+            .map_err(map_hid_error)
+    }
+
+    // upstream: iichid.c iichid_write()
+    pub fn write_output(&mut self, report: &[u8]) -> DevResult<()> {
+        self.state
+            .get_mut()
+            .device
+            .write_output(report)
+            .map_err(map_hid_error)
+    }
+
+    /// ACPI hardware ID and FreeBSD-compatible quirk bitmap from hidbus probe.
+    pub fn hardware_id(&self) -> &str {
+        &self.info.hardware_id
+    }
+
+    pub fn quirks(&self) -> u32 {
+        self.info.quirks
     }
 }
 
@@ -207,13 +292,24 @@ fn map_hid_error(error: HidError) -> DevError {
         HidError::Unsupported => DevError::Unsupported,
         HidError::Bus(BusError::Nack) => DevError::Again,
         HidError::Bus(BusError::Busy | BusError::Timeout) => DevError::Again,
-        HidError::Bus(_) | HidError::InvalidDescriptor | HidError::InvalidPacket => DevError::Io,
+        HidError::Bus(_)
+        | HidError::InvalidDescriptor
+        | HidError::InvalidPacket
+        | HidError::ResetTimeout => DevError::Io,
     }
 }
 
 impl BaseDriverOps for I2cInput {
     fn device_name(&self) -> &str {
         let state = self.state.lock();
+        if let Some(hmt) = state.hmt
+            && hmt.advertises_type()
+        {
+            match hmt.kind {
+                crate::hmt::Type::Touchpad => return "I2C HID multitouch touchpad",
+                crate::hmt::Type::Touchscreen => return "I2C HID multitouch touchscreen",
+            }
+        }
         if state.parser.is_pointer() {
             "I2C HID pointer"
         } else {
@@ -227,13 +323,13 @@ impl BaseDriverOps for I2cInput {
 
 impl InputDriverOps for I2cInput {
     fn device_id(&self) -> InputDeviceId {
-        self.id
+        self.info.id
     }
     fn physical_location(&self) -> &str {
         &self.location
     }
     fn unique_id(&self) -> &str {
-        &self.path
+        &self.info.path
     }
     fn get_event_bits(&mut self, ty: EventType, out: &mut [u8]) -> DevResult<bool> {
         Ok(self.state.get_mut().parser.event_bits(ty as u16, out))
@@ -242,6 +338,15 @@ impl InputDriverOps for I2cInput {
         out.fill(0);
         let state = self.state.get_mut();
         if state.parser.is_pointer() && state.parser.absolute_range(0).is_some() {
+            if let Some(byte) = out.first_mut() {
+                *byte = 1;
+            }
+            return Ok(true);
+        }
+        if state
+            .hmt
+            .is_some_and(|hmt| hmt.kind == crate::hmt::Type::Touchpad)
+        {
             if let Some(byte) = out.first_mut() {
                 *byte = 1;
             }
@@ -263,15 +368,46 @@ impl InputDriverOps for I2cInput {
                 res: 0,
             }))
     }
+    // upstream: iichid.c iichid_intr()
     fn read_event(&mut self) -> DevResult<Event> {
         let state = self.state.get_mut();
         if let Some(event) = state.events.pop_front() {
             return Ok(event);
         }
+        // upstream: iichid_sampling_task() - adaptive 80/10 Hz sampling when
+        // this platform cannot deliver a GPIO interrupt into the HID child.
+        let now = axhal::time::monotonic_time_nanos();
+        if now < state.next_sample_ns {
+            return Err(DevError::Again);
+        }
         let length = state
             .device
-            .read_input(&mut state.input[..usize::from(state.descriptor.max_input_length)])
+            .read_input(
+                &mut state.input
+                    [..usize::from(state.descriptor.max_input_length).saturating_sub(2)],
+            )
             .map_err(map_hid_error)?;
+        if length == 0 {
+            state.missing_samples = state.missing_samples.saturating_add(1);
+            state.duplicate_samples = 0;
+            if state.missing_samples >= tk_i2c_hid::INPUT_SAMPLING_HYSTERESIS {
+                state.sample_rate_hz = tk_i2c_hid::INPUT_SAMPLING_SLOW_HZ;
+            }
+        } else {
+            state.missing_samples = 0;
+            if state.previous_input[..length] == state.input[..length] {
+                state.duplicate_samples = state.duplicate_samples.saturating_add(1);
+                if state.duplicate_samples >= tk_i2c_hid::INPUT_SAMPLING_HYSTERESIS {
+                    state.sample_rate_hz = tk_i2c_hid::INPUT_SAMPLING_SLOW_HZ;
+                }
+            } else {
+                state.previous_input[..length].copy_from_slice(&state.input[..length]);
+                state.duplicate_samples = 0;
+                state.sample_rate_hz = tk_i2c_hid::INPUT_SAMPLING_FAST_HZ;
+            }
+        }
+        state.next_sample_ns =
+            now.saturating_add(1_000_000_000u64 / u64::from(state.sample_rate_hz.max(1)));
         if length == 0 {
             return Err(DevError::Again);
         }
@@ -279,6 +415,35 @@ impl InputDriverOps for I2cInput {
             .parser
             .decode(&state.input[..length], &mut state.events);
         state.events.pop_front().ok_or(DevError::Again)
+    }
+}
+
+impl I2cInput {
+    // upstream: iichid.c iichid_suspend()
+    pub fn suspend(&mut self) -> DevResult<()> {
+        self.state
+            .get_mut()
+            .device
+            .set_power(Power::Off)
+            .map_err(map_hid_error)
+    }
+
+    // upstream: iichid.c iichid_resume()
+    pub fn resume(&mut self) -> DevResult<()> {
+        let device = &mut self.state.get_mut().device;
+        device.set_power(Power::On).map_err(map_hid_error)?;
+        device.delay_ms(1);
+        match device.reset(tk_i2c_hid::RESET_TIMEOUT_SECONDS) {
+            Ok(()) | Err(HidError::ResetTimeout) => Ok(()),
+            Err(error) => Err(map_hid_error(error)),
+        }
+    }
+}
+
+impl Drop for I2cInput {
+    // upstream: iichid.c iichid_detach()
+    fn drop(&mut self) {
+        let _ = self.state.get_mut().device.set_power(Power::Off);
     }
 }
 

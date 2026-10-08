@@ -13,7 +13,7 @@ pub const IIC_REQUEST_BUS: i32 = 1;
 pub const IIC_RELEASE_BUS: i32 = 2;
 pub const IIC_WAIT: i32 = 1;
 pub const IIC_DONTWAIT: i32 = 0;
-pub const IIC_UNKNOWN: u8 = 0xff;
+pub const IIC_UNKNOWN: u8 = 0;
 const IG4_FIFO_LOWAT: i32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +29,7 @@ pub enum IicError {
     Overflow            = 7,
     NotSupported        = 8,
     HardwareUnavailable = 9,
+    NoDevice            = 10,
     Invalid             = 22,
 }
 
@@ -168,6 +169,7 @@ pub trait Backend {
     fn suspend_iicbus_children(&mut self) -> Result<(), IicError>;
     fn resume_iicbus_children(&mut self) -> Result<(), IicError>;
     fn debug_register(&mut self, name: &'static str, value: u32);
+    fn debug_warning(&mut self, _message: &'static str) {}
     fn init_locks(&mut self);
     fn destroy_locks(&mut self);
     fn call_lock_owned(&self) -> bool;
@@ -318,7 +320,6 @@ impl<I: Backend> Ig4<I> {
             if !self.io.do_poll() {
                 self.ig4iic_set_intr_mask(intr | IG4_INTR_ERR_MASK);
                 self.io.wait_irq(10);
-                self.ig4iic_intr();
                 self.ig4iic_set_intr_mask(0);
                 count_us = count_us.saturating_add(10_000);
             } else {
@@ -506,7 +507,7 @@ impl<I: Backend> Ig4<I> {
         while i < msgs.len() {
             if msgs[i].flags & IIC_M_NOSTART == 0 {
                 error = self.ig4iic_xfer_start(msgs[i].slave, rpstart);
-            } else if !self.slave_valid || (msgs[i].slave >> 1) as u8 != self.last_slave {
+            } else if !self.slave_valid || (msgs[i].slave >> 1) != u16::from(self.last_slave) {
                 error = IicError::Invalid;
                 break;
             } else {
@@ -775,6 +776,8 @@ impl<I: Backend> Ig4<I> {
             return Err(IicError::HardwareUnavailable);
         }
         if self.set_controller(0) != IicError::NoError {
+            self.io.debug_warning("controller core did not leave reset");
+            self.ig4iic_dump();
             return Err(IicError::HardwareUnavailable);
         }
         self.reg_read(IG4_REG_CLR_INTR);

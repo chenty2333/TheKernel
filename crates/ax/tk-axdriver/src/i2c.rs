@@ -36,6 +36,7 @@ impl IrqState {
 static IRQ_STATE: [IrqState; MAX_I2C_CONTROLLERS] =
     [const { IrqState::new() }; MAX_I2C_CONTROLLERS];
 
+// upstream: ig4_iic.c ig4iic_intr()
 fn acknowledge_irq(slot: usize) {
     let state = &IRQ_STATE[slot];
     let base = state.base.load(Ordering::Acquire);
@@ -282,9 +283,11 @@ impl Backend for Mmio {
     fn pause_ms(&mut self, _message: &'static str, millis: u32) {
         axhal::time::busy_wait(Duration::from_millis(u64::from(millis)));
     }
+    // upstream: ig4_iic.c DO_POLL, mapped to the scheduler's blocking capability.
     fn do_poll(&self) -> bool {
         !axtask::can_block_current()
     }
+    // upstream: ig4_iic.c wait_intr() waits for interrupt-driven completion.
     fn wait_irq(&mut self, milliseconds: u32) {
         let Some(msi) = self.msi.as_ref() else {
             return;
@@ -362,6 +365,9 @@ impl Backend for Mmio {
     }
     fn debug_register(&mut self, name: &'static str, value: u32) {
         log::debug!("i2c: {name}={value:#010x}");
+    }
+    fn debug_warning(&mut self, message: &'static str) {
+        log::warn!("i2c: {message}");
     }
     fn init_locks(&mut self) {
         self.call_lock = false;

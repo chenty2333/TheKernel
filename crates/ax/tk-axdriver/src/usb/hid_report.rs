@@ -250,7 +250,16 @@ impl Report {
                                     .or(usages.last())
                                     .copied()
                                     .unwrap_or_default();
-                                if let Some(mapped) = mapping(usage, app, value & 4 != 0) {
+                                let mapped = if current_slot.is_some() && usage.page == 1 {
+                                    match usage.code {
+                                        0x30 => Some(Mapping::Axis(3, 0x35)),
+                                        0x31 => Some(Mapping::Axis(3, 0x36)),
+                                        _ => mapping(usage, app, value & 4 != 0),
+                                    }
+                                } else {
+                                    mapping(usage, app, value & 4 != 0)
+                                };
+                                if let Some(mapped) = mapped {
                                     if fields.len() == MAX_FIELDS {
                                         return Err(DevError::Unsupported);
                                     }
