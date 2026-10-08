@@ -672,3 +672,5 @@ pub mod dbc;
 mod ahci;
 #[cfg(feature = "sdhci-pci")]
 mod sdhci;
+#[cfg(feature = "e1000")]
+mod e1000;

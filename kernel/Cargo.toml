@@ -17,6 +17,7 @@ workspace = true
 intel-hda = ["axfeat/driver-intel-hda"]
 nvme = ["axfeat/driver-nvme"]
 ahci = ["axfeat/driver-ahci", "axdriver/ahci-pci"]
+e1000 = ["axfeat/driver-e1000", "axdriver/e1000"]
 sdhci = ["axfeat/driver-sdhci", "axdriver/sdhci-pci"]
 usb-dbc = ["axfeat/driver-usb-dbc", "axdriver/usb-dbc"]
 watchdog-itco = ["axfeat/driver-itco", "axdriver/itco"]

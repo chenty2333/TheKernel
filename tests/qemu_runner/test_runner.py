@@ -722,6 +722,33 @@ class AhciRunnerTests(unittest.TestCase):
             self.assertEqual(disk.read_bytes(), b"AHCI payload")
 
 
+class E1000RunnerTests(unittest.TestCase):
+    def test_e1000_model_rejects_unknown_qemu_device_name(self):
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            kernel.write_bytes(b"kernel")
+            with self.assertRaisesRegex(RunnerError, "e1000 model"):
+                run(RunConfig(
+                    arch="x86_64", kernel=kernel, rootfs=None,
+                    workdir=root / "run", log_path=root / "run/console.log",
+                    direct_kernel=True, e1000_model="not-a-model",
+                ))
+
+
+    def test_e1000_tcp_forward_requires_valid_port_and_model(self):
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            kernel.write_bytes(b"kernel")
+            with self.assertRaisesRegex(RunnerError, "e1000 TCP forwarding"):
+                run(RunConfig(
+                    arch="x86_64", kernel=kernel, rootfs=None,
+                    workdir=root / "run", log_path=root / "run/console.log",
+                    direct_kernel=True, e1000_hostfwd_port=0,
+                ))
+
+
 class SdhciRunnerTests(unittest.TestCase):
     def test_sdhci_disk_fd_preserves_backing_contents(self):
         with test_tmpdir() as directory:

@@ -338,6 +338,26 @@ class SdhciTopologyTests(unittest.TestCase):
         self.assertNotIn("readonly=on", drive)
 
 
+class E1000TopologyTests(unittest.TestCase):
+    def test_qemu_e1000_family_selects_one_intel_model_on_user_net(self):
+        for model in ("e1000", "e1000e", "igb"):
+            with self.subTest(model=model):
+                command = build_qemu_command(
+                    arch="x86_64", kernel=Path("kernel"),
+                    rootfs=Drive(Path("root.img"), "snapshot"), direct_kernel=True,
+                    e1000_model=model,
+                )
+                self.assertIn(f"{model},netdev=e1000net0,mac=52:54:00:00:00:03", command)
+
+    def test_e1000_optional_tcp_forward_binds_loopback_only(self):
+        command = build_qemu_command(
+            arch="x86_64", kernel=Path("kernel"),
+            rootfs=Drive(Path("root.img"), "snapshot"), direct_kernel=True,
+            e1000_model="e1000", e1000_hostfwd_port=39011,
+        )
+        self.assertIn("user,id=e1000net0,hostfwd=tcp:127.0.0.1:39011-:8080", command)
+
+
 class HdaTopologyTests(unittest.TestCase):
     def test_hda_wav_is_distinct_from_virtio_sound(self):
         command = build_qemu_command(arch="x86_64", kernel=Path("kernel"),

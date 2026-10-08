@@ -1,6 +1,142 @@
 #[cfg(feature = "block")]
 use crate::{drivers::RegisteredStaticBlockDevice, prelude::*};
 
+#[cfg(feature = "net")]
+use crate::drivers::RegisteredStaticNetDevice;
+
+/// Static product network devices. Most platforms retain their selected
+/// primary NIC type; optional PCI families are boxed as additional devices.
+#[cfg(all(feature = "net", not(feature = "dyn")))]
+pub enum StaticNetDevice {
+    Primary(RegisteredStaticNetDevice),
+    #[cfg(feature = "e1000")]
+    E1000(alloc::boxed::Box<dyn axdriver_net::NetDriverOps>),
+}
+
+#[cfg(all(feature = "net", not(feature = "dyn")))]
+pub type AxNetDevice = StaticNetDevice;
+
+#[cfg(all(feature = "net", not(feature = "dyn")))]
+impl BaseDriverOps for StaticNetDevice {
+    fn device_name(&self) -> &str {
+        match self {
+            Self::Primary(device) => device.device_name(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.device_name(),
+        }
+    }
+    fn device_type(&self) -> DeviceType {
+        match self {
+            Self::Primary(device) => device.device_type(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.device_type(),
+        }
+    }
+}
+
+#[cfg(all(feature = "net", not(feature = "dyn")))]
+impl axdriver_net::NetDriverOps for StaticNetDevice {
+    fn mac_address(&self) -> axdriver_net::EthernetAddress {
+        match self {
+            Self::Primary(device) => device.mac_address(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.mac_address(),
+        }
+    }
+    fn can_transmit(&self) -> bool {
+        match self {
+            Self::Primary(device) => device.can_transmit(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.can_transmit(),
+        }
+    }
+    fn can_receive(&self) -> bool {
+        match self {
+            Self::Primary(device) => device.can_receive(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.can_receive(),
+        }
+    }
+    fn rx_queue_size(&self) -> usize {
+        match self {
+            Self::Primary(device) => device.rx_queue_size(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.rx_queue_size(),
+        }
+    }
+    fn tx_queue_size(&self) -> usize {
+        match self {
+            Self::Primary(device) => device.tx_queue_size(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.tx_queue_size(),
+        }
+    }
+    fn recycle_rx_buffer(&mut self, buffer: axdriver_net::NetBufPtr) -> DevResult {
+        match self {
+            Self::Primary(device) => device.recycle_rx_buffer(buffer),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.recycle_rx_buffer(buffer),
+        }
+    }
+    fn recycle_tx_buffers(&mut self) -> DevResult {
+        match self {
+            Self::Primary(device) => device.recycle_tx_buffers(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.recycle_tx_buffers(),
+        }
+    }
+    fn transmit(&mut self, buffer: axdriver_net::NetBufPtr) -> DevResult {
+        match self {
+            Self::Primary(device) => device.transmit(buffer),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.transmit(buffer),
+        }
+    }
+    fn receive(&mut self) -> DevResult<axdriver_net::NetBufPtr> {
+        match self {
+            Self::Primary(device) => device.receive(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.receive(),
+        }
+    }
+    fn alloc_tx_buffer(&mut self, size: usize) -> DevResult<axdriver_net::NetBufPtr> {
+        match self {
+            Self::Primary(device) => device.alloc_tx_buffer(size),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.alloc_tx_buffer(size),
+        }
+    }
+    fn rx_poll_interval_micros(&self) -> Option<u64> {
+        match self {
+            Self::Primary(device) => device.rx_poll_interval_micros(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.rx_poll_interval_micros(),
+        }
+    }
+    fn firmware_path(&self) -> Option<&'static str> {
+        match self {
+            Self::Primary(device) => device.firmware_path(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.firmware_path(),
+        }
+    }
+    fn load_firmware(&mut self, firmware: &[u8]) -> DevResult {
+        match self {
+            Self::Primary(device) => device.load_firmware(firmware),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.load_firmware(firmware),
+        }
+    }
+}
+
+#[cfg(all(feature = "net", not(feature = "dyn")))]
+impl StaticNetDevice {
+    #[cfg(feature = "e1000")]
+    pub fn e1000(device: impl axdriver_net::NetDriverOps + 'static) -> Self {
+        Self::E1000(alloc::boxed::Box::new(device))
+    }
+}
+
 /// The unified static block-device type.
 ///
 /// Hardware probes are wrapped as `Existing`; an immutable Multiboot rootfs
@@ -716,28 +852,31 @@ impl axdriver_input::InputDriverOps for AxInputDevice {
         }
     }
 }
-#[cfg(feature = "net")]
-pub use crate::drivers::AxNetDevice;
 #[cfg(feature = "vsock")]
 pub use crate::drivers::AxVsockDevice;
 
 impl super::AxDeviceEnum {
     /// Constructs a network device.
     #[cfg(all(feature = "net", not(net_dev = "n305-net")))]
-    pub const fn from_net(dev: AxNetDevice) -> Self {
-        Self::Net(dev)
+    pub const fn from_net(dev: RegisteredStaticNetDevice) -> Self {
+        Self::Net(StaticNetDevice::Primary(dev))
     }
 
     #[cfg(all(feature = "net", net_dev = "n305-net"))]
     pub(crate) fn try_from_net(dev: impl axdriver_net::NetDriverOps + 'static) -> DevResult<Self> {
         alloc::boxed::Box::try_new(dev)
-            .map(|device| Self::Net(device))
+            .map(|device| Self::Net(StaticNetDevice::Primary(device)))
             .map_err(|_| DevError::NoMemory)
     }
 
     #[cfg(all(feature = "net", net_dev = "n305-net"))]
     pub fn from_net(dev: impl axdriver_net::NetDriverOps + 'static) -> Self {
-        Self::Net(alloc::boxed::Box::new(dev))
+        Self::Net(StaticNetDevice::Primary(alloc::boxed::Box::new(dev)))
+    }
+
+    #[cfg(all(feature = "net", feature = "e1000"))]
+    pub fn from_e1000(dev: impl axdriver_net::NetDriverOps + 'static) -> Self {
+        Self::Net(StaticNetDevice::E1000(alloc::boxed::Box::new(dev)))
     }
 
     /// Constructs a block device.

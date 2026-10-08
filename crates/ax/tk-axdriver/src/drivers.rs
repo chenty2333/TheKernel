@@ -194,3 +194,17 @@ impl DriverProbe for SdhciDriver {
         crate::sdhci::probe(root, bdf, info)
     }
 }
+
+#[cfg(feature = "e1000")]
+pub struct E1000Driver;
+#[cfg(feature = "e1000")]
+impl DriverProbe for E1000Driver {
+    #[cfg(bus = "pci")]
+    fn probe_pci(
+        root: &mut axdriver_pci::PciRoot,
+        bdf: axdriver_pci::DeviceFunction,
+        info: &axdriver_pci::DeviceFunctionInfo,
+    ) -> BusProbeResult {
+        crate::e1000::probe(root, bdf, info)
+    }
+}

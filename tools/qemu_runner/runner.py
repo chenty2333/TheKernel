@@ -201,6 +201,8 @@ class RunConfig:
     ahci_disk_mode: DriveMode = "rw"
     sdhci_disk: Path | None = None
     sdhci_disk_mode: DriveMode = "rw"
+    e1000_model: str | None = None
+    e1000_hostfwd_port: int | None = None
     usb_disk: Path | None = None
     usb_disk_mode: DriveMode = "rw"
     usb_boot: bool = False
@@ -402,6 +404,11 @@ def run(
     extra_mode = _validate_mode("extra-block", config.extra_block_mode)
     nvme_mode = _validate_mode("NVMe disk", config.nvme_disk_mode)
     ahci_mode = _validate_mode("AHCI disk", config.ahci_disk_mode)
+    if config.e1000_model not in {None, "e1000", "e1000e", "igb"}:
+        raise RunnerError("e1000 model must be one of e1000, e1000e, or igb")
+    if config.e1000_hostfwd_port is not None:
+        if config.e1000_model is None or isinstance(config.e1000_hostfwd_port, bool) or not 1 <= config.e1000_hostfwd_port <= 65535:
+            raise RunnerError("e1000 TCP forwarding requires a valid host port and an e1000 model")
     sdhci_mode = _validate_mode("SDHCI disk", config.sdhci_disk_mode)
     usb_mode = _validate_mode("usb-disk", config.usb_disk_mode)
     initrd = _initrd_from_extra_args(config.extra_args)
@@ -654,6 +661,8 @@ def run(
             nvme_disk=qemu_nvme_disk,
             ahci_disk=qemu_ahci_disk,
             sdhci_disk=qemu_sdhci_disk,
+            e1000_model=config.e1000_model,
+            e1000_hostfwd_port=config.e1000_hostfwd_port,
             usb_boot=config.usb_boot,
             input_backend=config.input_backend,
             esp=qemu_esp,

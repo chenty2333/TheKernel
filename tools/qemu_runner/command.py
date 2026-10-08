@@ -81,6 +81,8 @@ def build_qemu_command(
     nvme_disk: Drive | None = None,
     ahci_disk: Drive | None = None,
     sdhci_disk: Drive | None = None,
+    e1000_model: str | None = None,
+    e1000_hostfwd_port: int | None = None,
     usb_disk: Drive | None = None,
     usb_boot: bool = False,
     input_backend: str = "virtio",
@@ -264,6 +266,14 @@ def build_qemu_command(
                 "-device", "sdhci-pci,id=sdhci",
                 "-drive", drive_options(sdhci_disk.path, "sd-card-drive", mode=sdhci_disk.mode),
                 "-device", "sd-card,drive=sd-card-drive",
+            ])
+        if e1000_model is not None:
+            netdev = "user,id=e1000net0"
+            if e1000_hostfwd_port is not None:
+                netdev += f",hostfwd=tcp:127.0.0.1:{e1000_hostfwd_port}-:8080"
+            command.extend([
+                "-netdev", netdev,
+                "-device", f"{e1000_model},netdev=e1000net0,mac=52:54:00:00:00:03",
             ])
         if extra_block is not None:
             _append_pci_drive(command, extra_block, "extra")
