@@ -14,6 +14,14 @@ pub const ESS_PSK: u32 = 0x0040_0000;
 pub const ASSOCFAIL_PRIVACY: u32 = 0x04;
 pub const ASSOCFAIL_ESSID: u32 = 0x10;
 pub const ASSOCFAIL_WPA_PROTO: u32 = 0x40;
+pub const ASSOCFAIL_CHAN: u32 = 0x01;
+pub const ASSOCFAIL_IBSS: u32 = 0x02;
+pub const ASSOCFAIL_BASIC_RATE: u32 = 0x08;
+pub const ASSOCFAIL_BSSID: u32 = 0x20;
+pub const ASSOCFAIL_WPA_KEY: u32 = 0x80;
+pub const ASSOCFAIL_CSA: u32 = 0x100;
+pub const CAPINFO_ESS: u16 = 0x0001;
+pub const CAPINFO_IBSS: u16 = 0x0002;
 pub const FLAG_AUTO_JOIN: u32 = 0x1000_0000;
 pub const RSN_CAP_MFPC: u16 = 0x0080;
 pub const LOCAL_CAP_MFP: u32 = 0x0000_2000;
@@ -59,6 +67,14 @@ pub struct AccessPoint {
     pub supports_vht: bool,
     pub previous_failures: u8,
     pub association_failures: u32,
+    pub channel: u8,
+    pub rates: crate::RateSet,
+    pub group_cipher: u32,
+    pub rsn_ciphers: u32,
+    pub rsn_akms: u32,
+    pub group_management_cipher: u32,
+    pub rsn_capabilities: u16,
+    pub channel_switch_announcement: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +99,25 @@ pub struct RsnChoice {
     pub cipher: u32,
     pub pmkid: Option<[u8; 16]>,
     pub mfp: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BssMatchPolicy<'a> {
+    pub active_channels: &'a [u8],
+    pub background_scan_active: bool,
+    pub background_scan: bool,
+    pub desired_channel: Option<u8>,
+    pub ibss_mode: bool,
+    pub privacy_enabled: bool,
+    pub desired_ssid: &'a [u8],
+    pub desired_bssid: Option<[u8; 6]>,
+    pub rsn_enabled: bool,
+    pub psk_configured: bool,
+    pub local_rsn_protocols: u32,
+    pub local_rsn_akms: u32,
+    pub local_rsn_ciphers: u32,
+    pub local_mfp_capable: bool,
+    pub local_mfp_required: bool,
 }
 
 impl AccessPoint {
@@ -349,6 +384,82 @@ pub fn check_rssi(ap: &AccessPoint, channel_valid: bool, max_rssi: u8) -> bool {
     }
 }
 
+/// Validate a scanned BSS against channel, mode, rates, SSID, BSSID and RSN policy.
+// upstream: ieee80211_node.c ieee80211_match_bss()
+pub fn match_bss(
+    policy: &BssMatchPolicy<'_>,
+    ap: &mut AccessPoint,
+    current_bss_failure: &mut u32,
+    mut fix_rate: impl FnMut(&mut crate::RateSet) -> u8,
+) -> u32 {
+    let mut fail = 0;
+    if !policy.background_scan_active && !policy.active_channels.contains(&ap.channel) {
+        fail |= ASSOCFAIL_CHAN;
+    }
+    if policy
+        .desired_channel
+        .is_some_and(|channel| channel != ap.channel)
+    {
+        fail |= ASSOCFAIL_CHAN;
+    }
+    if policy.ibss_mode {
+        if ap.capability_info & CAPINFO_IBSS == 0 {
+            fail |= ASSOCFAIL_IBSS;
+        }
+    } else if ap.capability_info & CAPINFO_ESS == 0 {
+        fail |= ASSOCFAIL_IBSS;
+    }
+    if policy.privacy_enabled {
+        if ap.capability_info & PRIVACY == 0 {
+            fail |= ASSOCFAIL_PRIVACY;
+        }
+    } else if ap.capability_info & PRIVACY != 0 {
+        fail |= ASSOCFAIL_PRIVACY;
+    }
+    let rate = fix_rate(&mut ap.rates);
+    if rate & crate::LEGACY_RATE_BASIC != 0 {
+        fail |= ASSOCFAIL_BASIC_RATE;
+    }
+    if policy.desired_ssid.is_empty() {
+        fail |= ASSOCFAIL_ESSID;
+    } else if policy.desired_ssid != ap.ssid() {
+        fail |= ASSOCFAIL_ESSID;
+    }
+    if policy.desired_bssid.is_some_and(|bssid| bssid != ap.bssid) {
+        fail |= ASSOCFAIL_BSSID;
+    }
+    if ap.channel_switch_announcement {
+        fail |= ASSOCFAIL_CSA;
+    }
+    if policy.rsn_enabled {
+        if ap.rsn_protocols & policy.local_rsn_protocols == 0
+            || ap.rsn_akms & policy.local_rsn_akms == 0
+            || (ap.rsn_akms & policy.local_rsn_akms & !(AKM_PSK | AKM_SHA256_PSK) == 0
+                && !policy.psk_configured)
+            || !matches!(ap.group_cipher, 2 | CIPHER_TKIP | CIPHER_CCMP | 16)
+            || ap.rsn_ciphers & policy.local_rsn_ciphers == 0
+            || (ap.rsn_capabilities & RSN_CAP_MFPC != 0 && ap.group_management_cipher != 0x20)
+            || (!policy.local_mfp_capable && ap.rsn_capabilities & 0x0040 != 0)
+            || (policy.local_mfp_capable
+                && policy.local_mfp_required
+                && ap.rsn_capabilities & RSN_CAP_MFPC == 0)
+        {
+            fail |= ASSOCFAIL_WPA_PROTO;
+        }
+    }
+    if policy.background_scan {
+        if fail & ASSOCFAIL_ESSID == 0 {
+            ap.association_failures = fail;
+        }
+    } else {
+        ap.association_failures = fail;
+    }
+    if fail & ASSOCFAIL_ESSID == 0 {
+        *current_bss_failure = ap.association_failures;
+    }
+    fail
+}
+
 // upstream: ieee80211_node.c ieee80211_40mhz_valid_secondary_above()
 pub fn valid_40mhz_secondary_above(primary_channel: u8) -> bool {
     if !((1..=9).contains(&primary_channel) || (36..=157).contains(&primary_channel)) {
@@ -430,6 +541,90 @@ mod tests {
         node.capability_info = PRIVACY;
         assert!(!match_ess(&open, &mut node));
         assert_eq!(node.association_failures, ASSOCFAIL_PRIVACY);
+    }
+
+    fn match_policy<'a>(ssid: &'a [u8]) -> BssMatchPolicy<'a> {
+        BssMatchPolicy {
+            active_channels: &[1, 6, 11],
+            background_scan_active: false,
+            background_scan: false,
+            desired_channel: None,
+            ibss_mode: false,
+            privacy_enabled: false,
+            desired_ssid: ssid,
+            desired_bssid: None,
+            rsn_enabled: false,
+            psk_configured: false,
+            local_rsn_protocols: PROTO_RSN,
+            local_rsn_akms: AKM_PSK,
+            local_rsn_ciphers: CIPHER_CCMP,
+            local_mfp_capable: false,
+            local_mfp_required: false,
+        }
+    }
+
+    #[test]
+    fn bss_match_accumulates_failure_reasons_and_preserves_background_scan_state() {
+        let mut candidate = ap(b"home", true, 80);
+        candidate.channel = 6;
+        candidate.capability_info = CAPINFO_ESS;
+        candidate.rates = crate::RateSet::new(&[12]);
+        let mut current_failure = 0;
+        assert_eq!(
+            match_bss(
+                &match_policy(b"home"),
+                &mut candidate,
+                &mut current_failure,
+                |_| 0
+            ),
+            0
+        );
+        assert_eq!(current_failure, 0);
+        let mut bad = ap(b"other", true, 70);
+        bad.channel = 36;
+        bad.capability_info = CAPINFO_ESS | PRIVACY;
+        bad.rates = crate::RateSet::new(&[12]);
+        bad.association_failures = ASSOCFAIL_BSSID;
+        let mut policy = match_policy(b"home");
+        policy.background_scan_active = false;
+        policy.background_scan = true;
+        current_failure = ASSOCFAIL_CHAN;
+        let failures = match_bss(&policy, &mut bad, &mut current_failure, |_| {
+            crate::LEGACY_RATE_BASIC
+        });
+        assert_ne!(failures & ASSOCFAIL_CHAN, 0);
+        assert_ne!(failures & ASSOCFAIL_PRIVACY, 0);
+        assert_ne!(failures & ASSOCFAIL_ESSID, 0);
+        assert_ne!(failures & ASSOCFAIL_BASIC_RATE, 0);
+        assert_eq!(bad.association_failures, ASSOCFAIL_BSSID);
+        assert_eq!(current_failure, ASSOCFAIL_CHAN);
+    }
+
+    #[test]
+    fn bss_match_checks_rsn_intersection_and_mfp_requirements() {
+        let mut candidate = ap(b"home", true, 80);
+        candidate.channel = 6;
+        candidate.capability_info = CAPINFO_ESS | PRIVACY;
+        candidate.rsn_protocols = PROTO_RSN;
+        candidate.rsn_akms = AKM_PSK;
+        candidate.rsn_ciphers = CIPHER_CCMP;
+        candidate.group_cipher = CIPHER_CCMP;
+        candidate.rsn_capabilities = RSN_CAP_MFPC;
+        candidate.group_management_cipher = 0x20;
+        let mut policy = match_policy(b"home");
+        policy.privacy_enabled = true;
+        policy.rsn_enabled = true;
+        policy.local_mfp_capable = true;
+        policy.local_mfp_required = true;
+        policy.psk_configured = true;
+        let mut current = 0;
+        assert_eq!(match_bss(&policy, &mut candidate, &mut current, |_| 0), 0);
+        policy.local_mfp_required = true;
+        candidate.rsn_capabilities = 0;
+        assert_ne!(
+            match_bss(&policy, &mut candidate, &mut current, |_| 0) & ASSOCFAIL_WPA_PROTO,
+            0
+        );
     }
 
     #[test]

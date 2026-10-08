@@ -58,3 +58,7 @@ RSN policy selection now intersects peer/local suites and applies OpenBSD's
 RSN-over-WPA, SHA-256 AKM, CCMP-over-TKIP preferences, enterprise PMKID reuse
 and MFP intersection. Link-rate/RSSI accessors preserve fixed-rate and band-
 specific roaming thresholds.
+Scanned-BSS admission now reports OpenBSD association-failure bits for channel,
+ESS/IBSS mode, privacy, mandatory rate, SSID/BSSID, CSA and RSN/MFP mismatch.
+Its background-scan path preserves the existing candidate-failure state when
+an unrelated SSID is seen.
