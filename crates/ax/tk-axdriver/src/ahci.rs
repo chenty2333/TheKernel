@@ -46,7 +46,9 @@ const PCI_COMMAND: u8 = 0x04;
 const PCI_COMMAND_MEMORY: u16 = 1 << 1;
 const PCI_COMMAND_MASTER: u16 = 1 << 2;
 const ABAR_BAR: u8 = 5;
-const ABAR_MIN_BYTES: usize = AHCI_OFFSET + AHCI_MAX_PORTS * AHCI_STEP;
+// BAR5 need only cover the HBA header and port zero. Many conforming HBAs
+// expose fewer than the architectural maximum of 32 ports in their MMIO size.
+const ABAR_MIN_BYTES: usize = AHCI_OFFSET + AHCI_STEP;
 const BOUNCE_PAGES: usize = 16;
 
 /// Driver state is concrete for static builds and type-erased by the block
@@ -253,6 +255,10 @@ pub(crate) fn probe(
             continue;
         }
         let port_base = AHCI_OFFSET + index * AHCI_STEP;
+        if port_base.checked_add(AHCI_STEP).is_none_or(|end| end > window.size) {
+            warn!("ahci: {bdf} port {index} lies outside the mapped ABAR");
+            continue;
+        }
         controller.io_mut().write32(port_base + AHCI_P_IE, 0);
         let sstatus = controller.io_mut().read32(port_base + AHCI_P_SSTS);
         if sstatus & ATA_SS_DET_MASK == ATA_SS_DET_NO_DEVICE {
