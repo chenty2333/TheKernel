@@ -9,6 +9,9 @@ pub(super) struct Usage {
 pub(super) enum Mapping {
     Key(u16),
     Axis(u16, u16),
+    MtContactId,
+    MtTipSwitch,
+    MtConfidence,
     Hat,
     Wheel(u16),
 }
@@ -118,7 +121,9 @@ pub(super) fn mapping(usage: Usage, application: Usage, relative: bool) -> Optio
         7 => keyboard(usage.code).map(Mapping::Key),
         9 if (1..=128).contains(&usage.code) => {
             let index = (usage.code - 1) as u16;
-            let base = if application.page == 1 {
+            let base = if application.page == 0x0d && application.code == 5 {
+                0x110
+            } else if application.page == 1 {
                 match application.code {
                     1 | 2 => 0x110,
                     4 => 0x120,

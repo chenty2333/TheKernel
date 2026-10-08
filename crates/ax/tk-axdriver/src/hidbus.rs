@@ -7,19 +7,46 @@ use alloc::{string::String, vec::Vec};
 use axdriver_base::{DevError, DevResult};
 use axdriver_input::InputDeviceId;
 
-use crate::hid_report::Report;
+use crate::hid_report::{Report, ReportKind};
+
+pub(super) const QUIRK_NOWRITE: u32 = 1 << 0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ReportSize {
+    pub report_id: u8,
+    pub bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ReportDescriptorInfo {
+    pub input: ReportSize,
+    pub output: ReportSize,
+    pub feature: ReportSize,
+}
 
 pub(super) struct DeviceInfo {
     pub id: InputDeviceId,
     pub hardware_id: String,
     pub path: String,
     pub report_descriptor: Vec<u8>,
+    pub report_info: ReportDescriptorInfo,
     pub quirks: u32,
 }
 
-pub(super) fn attach_report_descriptor(bytes: &[u8]) -> DevResult<Report> {
-    // upstream: hidbus.c hidbus_attach()
-    Report::parse(bytes)
+pub(super) fn attach_report_descriptor(bytes: &[u8]) -> DevResult<(Report, ReportDescriptorInfo)> {
+    // upstream: hidbus.c hidbus_fill_rdesc_info() / hidbus_attach()
+    let report = Report::parse(bytes)?;
+    let size = |kind| {
+        let (report_id, _) = report.report_size_max(kind);
+        let bytes = report.report_size(kind, report_id);
+        ReportSize { report_id, bytes }
+    };
+    let info = ReportDescriptorInfo {
+        input: size(ReportKind::Input),
+        output: size(ReportKind::Output),
+        feature: size(ReportKind::Feature),
+    };
+    Ok((report, info))
 }
 
 impl DeviceInfo {
@@ -29,14 +56,22 @@ impl DeviceInfo {
         hardware_id: String,
         path: String,
         report_descriptor: Vec<u8>,
+        report_info: ReportDescriptorInfo,
+        descriptor: tk_i2c_hid::Descriptor,
     ) -> Self {
+        let quirks = if descriptor.output_register == 0 || descriptor.max_output_length == 0 {
+            QUIRK_NOWRITE
+        } else {
+            0
+        };
         Self {
             id,
             hardware_id,
             path,
             report_descriptor,
-            // No device-specific FreeBSD HQ_* quirks are registered yet.
-            quirks: 0,
+            report_info,
+            // upstream: iichid.c iichid_fill_device_info() HQ_NOWRITE
+            quirks,
         }
     }
 

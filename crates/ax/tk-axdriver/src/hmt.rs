@@ -24,14 +24,12 @@ impl MultiTouch {
             || !report.has_code(3, 0x35) // ABS_MT_POSITION_X
             || !report.has_code(3, 0x36) // ABS_MT_POSITION_Y
             || !report.has_code(3, 0x39)
-        // ABS_MT_TRACKING_ID
+            // ABS_MT_TRACKING_ID
+            || !report.has_mt_tip_switch()
         {
             return None;
         }
-        let kind = if report.has_code(1, 0x110)
-            || report.has_code(1, 0x145)
-            || report.has_code(1, 0x14a)
-        {
+        let kind = if report.is_touchpad() {
             Type::Touchpad
         } else {
             Type::Touchscreen
@@ -47,7 +45,7 @@ impl MultiTouch {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
+    use alloc::{collections::VecDeque, vec, vec::Vec};
 
     use super::*;
 
@@ -55,6 +53,8 @@ mod tests {
     fn finger_collections_require_mt_axes_and_advertise_slots() {
         let finger = [
             0x09, 0x22, 0xa1, 2, // Finger collection
+            0x09, 0x42, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, // Tip Switch
+            0x75, 7, 0x95, 1, 0x81, 3, // alignment padding
             0x09, 0x51, 0x15, 0, 0x25, 31, 0x75, 8, 0x95, 1, 0x81, 2, // Contact ID
             0x05, 1, 0x09, 0x30, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // X
             0x09, 0x31, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // Y
@@ -64,10 +64,27 @@ mod tests {
         descriptor.extend_from_slice(&finger);
         descriptor.extend_from_slice(&finger);
         descriptor.push(0xc0);
-        let report = Report::parse(&descriptor).unwrap();
+        let mut report = Report::parse(&descriptor).unwrap();
         let hmt = MultiTouch::probe(&report).unwrap();
-        assert_eq!(hmt.kind, Type::Touchscreen);
+        assert_eq!(hmt.kind, Type::Touchpad);
         assert_eq!(hmt.slots, 32);
         assert!(report.has_code(3, 0x2f)); // ABS_MT_SLOT
+        let mut events = VecDeque::new();
+        assert!(report.decode(&[1, 7, 50, 60, 0, 8, 70, 80], &mut events));
+        let triples: Vec<_> = events
+            .iter()
+            .map(|event| (event.event_type, event.code, event.value as i32))
+            .collect();
+        assert!(triples.contains(&(3, 0x39, 7)));
+        assert!(triples.contains(&(3, 0x35, 50)));
+        assert!(triples.contains(&(3, 0x36, 60)));
+        assert!(!triples.contains(&(3, 0x35, 70)));
+        events.clear();
+        assert!(report.decode(&[0, 7, 50, 60, 0, 8, 70, 80], &mut events));
+        let triples: Vec<_> = events
+            .iter()
+            .map(|event| (event.event_type, event.code, event.value as i32))
+            .collect();
+        assert!(triples.contains(&(3, 0x39, -1)));
     }
 }

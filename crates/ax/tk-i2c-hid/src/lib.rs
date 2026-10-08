@@ -274,7 +274,7 @@ impl<T: Transport> Device<T> {
         if self.descriptor.max_output_length == 0 || report.len() < 2 {
             return Err(Error::Unsupported);
         }
-        let length = u16::try_from(report.len() + 2).map_err(|_| Error::PacketTooLarge)?;
+        let length = (report.len() + 2) as u16;
         let mut packet = Vec::new();
         packet
             .try_reserve_exact(report.len() + 2)

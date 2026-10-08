@@ -39,11 +39,19 @@ struct Field {
 pub(crate) struct Report {
     fields: Vec<Field>,
     bits: [u16; 256],
+    report_sizes: [[u16; 256]; 3],
     ids: bool,
     // Report-ID ownership prevents a Consumer release from lifting keys held
     // by a separate keyboard report. Maximum retained owners is 1024.
     keys: Vec<(u8, u16)>,
+    mt_tracking_ids: [i32; 32],
     pointer: bool,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReportKind {
+    Input   = 0,
+    Output  = 1,
+    Feature = 2,
 }
 fn reserved<T>(count: usize) -> DevResult<Vec<T>> {
     let mut v = Vec::new();
@@ -102,6 +110,7 @@ impl Report {
         let mut app = Usage::default();
         let mut pointer = false;
         let mut bits = [0u16; 256];
+        let mut report_sizes = [[0u16; 256]; 3];
         let mut ids = false;
         let mut offset = 0;
         let mut usage_budget = 0usize;
@@ -250,10 +259,13 @@ impl Report {
                                     .or(usages.last())
                                     .copied()
                                     .unwrap_or_default();
-                                let mapped = if current_slot.is_some() && usage.page == 1 {
-                                    match usage.code {
-                                        0x30 => Some(Mapping::Axis(3, 0x35)),
-                                        0x31 => Some(Mapping::Axis(3, 0x36)),
+                                let mapped = if current_slot.is_some() {
+                                    match (usage.page, usage.code) {
+                                        (1, 0x30) => Some(Mapping::Axis(3, 0x35)),
+                                        (1, 0x31) => Some(Mapping::Axis(3, 0x36)),
+                                        (0x0d, 0x51) => Some(Mapping::MtContactId),
+                                        (0x0d, 0x42) => Some(Mapping::MtTipSwitch),
+                                        (0x0d, 0x47) => Some(Mapping::MtConfidence),
                                         _ => mapping(usage, app, value & 4 != 0),
                                     }
                                 } else {
@@ -283,6 +295,29 @@ impl Report {
                         }
                     }
                     *at = end as u16;
+                    report_sizes[ReportKind::Input as usize][usize::from(g.id)] = *at;
+                }
+                (0, 9 | 11) => {
+                    if g.size == 0 || g.count == 0 || g.min > g.max {
+                        return Err(DevError::InvalidParam);
+                    }
+                    let advance = g.size.checked_mul(g.count).ok_or(DevError::Unsupported)?;
+                    let kind = if tag == 9 {
+                        ReportKind::Output
+                    } else {
+                        ReportKind::Feature
+                    };
+                    let at = &mut report_sizes[kind as usize][usize::from(g.id)];
+                    if g.id != 0 && *at == 0 {
+                        *at = 8;
+                    }
+                    let end = u32::from(*at)
+                        .checked_add(advance)
+                        .ok_or(DevError::Unsupported)?;
+                    if end > 512 {
+                        return Err(DevError::Unsupported);
+                    }
+                    *at = end as u16;
                 }
                 _ => {}
             }
@@ -303,16 +338,56 @@ impl Report {
         Ok(Self {
             fields,
             bits,
+            report_sizes,
             ids,
             keys: reserved(1024)?,
+            mt_tracking_ids: [-1; 32],
             pointer,
         })
     }
     pub(crate) fn max_length(&self) -> usize {
         usize::from(*self.bits.iter().max().unwrap_or(&0)).div_ceil(8)
     }
+    pub(crate) fn report_size(&self, kind: ReportKind, id: u8) -> usize {
+        usize::from(self.report_sizes[kind as usize][usize::from(id)]).div_ceil(8)
+    }
+    pub(crate) fn report_size_max(&self, kind: ReportKind) -> (u8, usize) {
+        self.report_sizes[kind as usize]
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, bits)| *bits)
+            .map(|(id, bits)| (id as u8, usize::from(*bits).div_ceil(8)))
+            .unwrap_or((0, 0))
+    }
+    pub(crate) fn release_all_contacts(&mut self, events: &mut VecDeque<Event>) {
+        let mut released = false;
+        for (slot, tracking_id) in self.mt_tracking_ids.iter_mut().enumerate() {
+            if *tracking_id >= 0 {
+                if events.try_reserve(3).is_err() {
+                    return;
+                }
+                emit(events, 3, 0x2f, slot as i32);
+                emit(events, 3, 0x39, -1);
+                *tracking_id = -1;
+                released = true;
+            }
+        }
+        if released {
+            emit(events, 0, 0, 0);
+        }
+    }
     pub(crate) fn is_pointer(&self) -> bool {
         self.pointer
+    }
+    pub(crate) fn is_touchpad(&self) -> bool {
+        self.fields
+            .iter()
+            .any(|field| field.app.page == 0x0d && field.app.code == 0x05)
+    }
+    pub(crate) fn has_mt_tip_switch(&self) -> bool {
+        self.fields
+            .iter()
+            .any(|field| matches!(&field.kind, Kind::Variable(Mapping::MtTipSwitch)))
     }
     fn each_code(&self, mut visit: impl FnMut(u16, u16)) {
         let mut mapped = |m| match m {
@@ -326,6 +401,9 @@ impl Report {
                 visit(3, 16);
                 visit(3, 17);
             }
+            Mapping::MtContactId => visit(3, 0x39),
+            Mapping::MtTipSwitch => {}
+            Mapping::MtConfidence => {}
         };
         for f in &self.fields {
             if f.slot.is_some() {
@@ -376,6 +454,7 @@ impl Report {
         for f in &self.fields {
             let r = match f.kind {
                 Kind::Variable(Mapping::Axis(3, c)) if c == u16::from(code) => Some((f.min, f.max)),
+                Kind::Variable(Mapping::MtContactId) if code == 0x39 => Some((f.min, f.max)),
                 Kind::Variable(Mapping::Hat) if matches!(code, 16 | 17) => Some((-1, 1)),
                 _ => None,
             };
@@ -403,6 +482,66 @@ impl Report {
         };
         if events.try_reserve(2048).is_err() {
             return false;
+        }
+        // hmt.c uses Contact ID as the Type-B tracking ID, but only while the
+        // matching Tip Switch (and Confidence, when present) says contact is
+        // active. Resolve these companion fields before emitting a slot.
+        let has_tip_switch = self
+            .fields
+            .iter()
+            .any(|f| f.id == id && matches!(&f.kind, Kind::Variable(Mapping::MtTipSwitch)));
+        let mut contact_ids = [0i32; 256];
+        let mut contact_tips = [!has_tip_switch; 256];
+        let mut contact_confidence = [true; 256];
+        for f in self.fields.iter().filter(|f| f.id == id) {
+            let Some(slot) = f.slot.map(usize::from) else {
+                continue;
+            };
+            if slot >= contact_ids.len() {
+                continue;
+            }
+            let raw = extract(report, usize::from(f.bit), f.size, f.min < 0);
+            match &f.kind {
+                Kind::Variable(Mapping::MtContactId) => contact_ids[slot] = raw,
+                Kind::Variable(Mapping::MtTipSwitch) => contact_tips[slot] = raw != 0,
+                Kind::Variable(Mapping::MtConfidence) => contact_confidence[slot] = raw != 0,
+                _ => {}
+            }
+        }
+        let mut assigned_slots = [-1i16; 256];
+        let descriptor_slots = self
+            .fields
+            .iter()
+            .filter(|field| field.id == id)
+            .filter_map(|field| field.slot)
+            .max()
+            .map_or(0, |slot| usize::from(slot) + 1)
+            .min(assigned_slots.len());
+        for descriptor_slot in 0..descriptor_slots {
+            let active = contact_tips[descriptor_slot] && contact_confidence[descriptor_slot];
+            let tracking_id = contact_ids[descriptor_slot];
+            if active {
+                let physical_slot = self
+                    .mt_tracking_ids
+                    .iter()
+                    .position(|&existing| existing == tracking_id)
+                    .or_else(|| {
+                        self.mt_tracking_ids
+                            .iter()
+                            .position(|&existing| existing < 0)
+                    });
+                if let Some(physical_slot) = physical_slot {
+                    self.mt_tracking_ids[physical_slot] = tracking_id;
+                    assigned_slots[descriptor_slot] = physical_slot as i16;
+                }
+            } else if let Some(physical_slot) = self
+                .mt_tracking_ids
+                .iter()
+                .position(|&existing| existing == tracking_id)
+            {
+                self.mt_tracking_ids[physical_slot] = -1;
+                assigned_slots[descriptor_slot] = physical_slot as i16;
+            }
         }
         for f in self.fields.iter().filter(|f| f.id == id) {
             match &f.kind {
@@ -468,7 +607,13 @@ impl Report {
             };
             let raw = extract(report, usize::from(f.bit), f.size, f.min < 0);
             if let Some(slot) = f.slot {
-                emit(events, 3, 0x2f, i32::from(slot));
+                let Some(&physical_slot) = assigned_slots.get(usize::from(slot)) else {
+                    continue;
+                };
+                if physical_slot < 0 {
+                    continue;
+                }
+                emit(events, 3, 0x2f, i32::from(physical_slot));
             }
             match mapped {
                 Mapping::Axis(ty, code) => {
@@ -515,6 +660,18 @@ impl Report {
                     }
                 }
                 Mapping::Key(_) => {}
+                Mapping::MtContactId => {
+                    let active = f.slot.map(usize::from).is_some_and(|slot| {
+                        slot < contact_tips.len() && contact_tips[slot] && contact_confidence[slot]
+                    });
+                    let value = if active { raw } else { -1 };
+                    if f.previous != Some(value) {
+                        emit(events, 3, 0x39, value);
+                    }
+                    f.previous = Some(value);
+                }
+                Mapping::MtTipSwitch => {}
+                Mapping::MtConfidence => {}
             }
         }
         if events.len() != before {
@@ -684,6 +841,11 @@ mod tests {
             0x09, 1, 0x81, 2, 0xb4, 0x09, 1, 0x91, 2, 0x09, 1, 0x81, 2,
         ];
         let mut p = Report::parse(&d).unwrap();
+        assert_eq!(p.report_size(ReportKind::Input, 0), 1);
+        assert_eq!(p.report_size(ReportKind::Output, 0), 1);
+        assert_eq!(p.report_size(ReportKind::Feature, 0), 0);
+        assert_eq!(p.report_size_max(ReportKind::Input), (0, 1));
+        assert_eq!(p.report_size_max(ReportKind::Output), (0, 1));
         let mut ev = VecDeque::new();
         assert!(p.decode(&[2], &mut ev));
         assert_eq!(triples(&ev), [(1, 0x100, 1), (0, 0, 0)]);
