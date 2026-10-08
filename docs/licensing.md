@@ -776,3 +776,8 @@ license text remains in the source and
 additional `drm_get_tv_mode_from_name()` in Linux 7.2.3 `drm_connector.c`
 (MIT-style grant, © 2016 Intel); its full license remains in the source and
 `kernel/LICENSES/LicenseRef-Intel-Drm-Connector-MIT`.
+
+`kernel/src/drm/mode_config_full.rs` translates 14 mode-config functions in
+Linux 7.2.3 `drm_mode_config.c` (MIT-style grant, © 2016 Intel); its full
+license remains in the source and the same
+`kernel/LICENSES/LicenseRef-Intel-Drm-Connector-MIT` file.
