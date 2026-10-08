@@ -771,3 +771,8 @@ copyrights); its full license text remains in the source and
 from Linux 7.2.3 `drm_plane.c` (MIT-style grant, © 2016 Intel); its full
 license text remains in the source and
 `kernel/LICENSES/LicenseRef-Intel-Drm-Plane-MIT`.
+
+`kernel/src/drm/connector_uapi_full.rs` translates 87 ctags functions and the
+additional `drm_get_tv_mode_from_name()` in Linux 7.2.3 `drm_connector.c`
+(MIT-style grant, © 2016 Intel); its full license remains in the source and
+`kernel/LICENSES/LicenseRef-Intel-Drm-Connector-MIT`.

@@ -1258,3 +1258,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `kernel/src/drm/atomic_uapi_full.rs` translates all 30 ctags definitions from Linux 7.2.3 `drivers/gpu/drm/drm_atomic_uapi.c` (MIT; Copyright (C) 2014 Red Hat, 2014/2018 Intel, and (c) 2020 The Linux Foundation); the full grant is retained in the source and `kernel/LICENSES/LicenseRef-DRM-Atomic-UAPI-MIT`.
 
 `kernel/src/drm/plane_uapi_full.rs` translates all 38 ctags definitions from Linux 7.2.3 `drivers/gpu/drm/drm_plane.c` (MIT-style grant, Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Plane-MIT`.
+
+`kernel/src/drm/connector_uapi_full.rs` translates all 87 ctags definitions plus the unrecognized `drm_get_tv_mode_from_name()` from Linux 7.2.3 `drivers/gpu/drm/drm_connector.c` (MIT-style grant, Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Connector-MIT`.
