@@ -106,3 +106,6 @@ source field order and little-endian encodings.
 A reusable Probe Request IE builder now selects WMM+HT, 5-GHz VHT and
 HE-extension elements using the same channel/PHY predicates as OpenBSD; iwx's
 firmware-specific probe serializer reuses its individual IE encoders.
+The rate-fix policy now matches local and peer rates, optionally sorts and
+removes unaccepted entries, restores local Basic bits, and returns the source
+failure sentinel for unsupported mandatory AP rates or mismatched fixed rates.

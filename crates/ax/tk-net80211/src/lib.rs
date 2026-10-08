@@ -14,6 +14,7 @@ mod node_caps;
 mod node_rates;
 mod node_table;
 mod output;
+mod proto;
 mod ra;
 mod rates;
 mod regdomain;
@@ -83,6 +84,9 @@ pub use output::{
     append_supported_rates_ie, append_vht_caps_ie, append_wme_info_ie, append_wme_parameter_ie,
     append_wpa_ie, build_assoc_request_body, build_auth_body, build_deauth_body,
     build_disassoc_body, build_probe_request_ies, build_rsn_body, uapsd_qos_info,
+};
+pub use proto::{
+    FIX_RATE_DELETE, FIX_RATE_FIXED, FIX_RATE_NEGOTIATE, FIX_RATE_SORT, FixRateConfig, fix_rate,
 };
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,
