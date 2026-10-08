@@ -93,6 +93,16 @@ int main(void) {
     if (response_len != sizeof(indices_reply) || memcmp(response, indices_reply, sizeof(indices_reply))) {
         fprintf(stderr, "mgmt READ_INDEX_LIST response length=%ld\n", (long)response_len); return 1;
     }
+    const uint8_t read_commands[] = { 2, 0, 0xff, 0xff, 0, 0 };
+    if (send(mgmt, read_commands, sizeof(read_commands), 0) != sizeof(read_commands)) return fail("mgmt READ_COMMANDS send");
+    response_len = recv(mgmt, response, sizeof(response), 0);
+    const uint8_t commands_reply[] = {
+        1, 0, 0xff, 0xff, 13, 0, 2, 0, 0, 3, 0, 0, 0,
+        3, 0, 4, 0, 5, 0,
+    };
+    if (response_len != sizeof(commands_reply) || memcmp(response, commands_reply, sizeof(commands_reply))) {
+        fprintf(stderr, "mgmt READ_COMMANDS response length=%ld\n", (long)response_len); return 1;
+    }
     close(mgmt);
     close(fd);
     puts("BLUETOOTH_NO_DEVICE_ACCEPTANCE_DONE");

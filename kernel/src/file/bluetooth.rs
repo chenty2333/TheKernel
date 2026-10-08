@@ -192,10 +192,10 @@ mod tests {
     #[test]
     fn management_commands_advertise_only_implemented_operations() {
         let commands = management_response(&[2, 0, 0xff, 0xff, 0, 0]).unwrap();
-        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 5);
-        assert_eq!(u16::from_le_bytes([commands[11], commands[12]]), 2);
-        assert_eq!(commands.len(), 9 + 4 + 2 * (5 + 2));
-        assert_eq!(&commands[13..23], &[1, 0, 2, 0, 3, 0, 4, 0, 5, 0]);
+        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 3);
+        assert_eq!(u16::from_le_bytes([commands[11], commands[12]]), 0);
+        assert_eq!(commands.len(), 9 + 4 + 2 * 3);
+        assert_eq!(&commands[13..19], &[3, 0, 4, 0, 5, 0]);
     }
 }
 
@@ -636,14 +636,11 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     match opcode {
         READ_VERSION if parameters.is_empty() => data.extend_from_slice(&[1, 0, 0]),
         READ_COMMANDS if parameters.is_empty() => {
-            let commands = [
-                READ_VERSION,
-                READ_COMMANDS,
-                READ_INDEX_LIST,
-                READ_INFO,
-                SET_POWERED,
-            ];
-            let events = [CMD_COMPLETE, 2];
+            // Linux excludes READ_VERSION/READ_COMMANDS from the advertised
+            // per-controller command table. Keep this list truthful: only
+            // operations implemented by this HCI socket are exposed.
+            let commands = [READ_INDEX_LIST, READ_INFO, SET_POWERED];
+            let events: [u16; 0] = [];
             data.extend_from_slice(&(commands.len() as u16).to_le_bytes());
             data.extend_from_slice(&(events.len() as u16).to_le_bytes());
             for item in commands.into_iter().chain(events) {
