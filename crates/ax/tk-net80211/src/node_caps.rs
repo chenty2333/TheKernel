@@ -28,6 +28,13 @@ pub const VHTOP0_CHAN_WIDTH_HT: u8 = 0;
 pub const VHTOP0_CHAN_WIDTH_80: u8 = 1;
 pub const VHTOP0_CHAN_WIDTH_160: u8 = 2;
 pub const VHTOP0_CHAN_WIDTH_8080: u8 = 3;
+pub const VHTCAP_CHAN_WIDTH_MASK: u32 = 0x0c;
+pub const VHTCAP_CHAN_WIDTH_SHIFT: u32 = 2;
+pub const VHTCAP_CHAN_WIDTH_160: u32 = 1;
+pub const VHTCAP_CHAN_WIDTH_160_8080: u32 = 2;
+pub const VHTCAP_EXT_NSS_BW_MASK: u32 = 0xc000_0000;
+pub const VHTCAP_EXT_NSS_BW_SHIFT: u32 = 30;
+pub const VHT_EXT_NSS_BW_CAPABLE: u16 = 1 << 13;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HtCapabilities {
@@ -59,6 +66,14 @@ pub struct VhtCapabilities {
     pub tx_mcs: u16,
     pub tx_max_lgi_mbps: u16,
     pub flags: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VhtOperation {
+    pub channel_width: u8,
+    pub center_frequency_index0: u8,
+    pub center_frequency_index1: u8,
+    pub basic_mcs: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -146,6 +161,92 @@ pub fn setup_vht_caps(node: &mut VhtCapabilities, data: &[u8]) -> bool {
     node.tx_mcs = le16(data, 8);
     node.tx_max_lgi_mbps = le16(data, 10);
     node.flags |= NODE_VHTCAP;
+    true
+}
+
+/// Install and normalize received VHT operation info against local 160-MHz support.
+// upstream: ieee80211_node.c ieee80211_setup_vhtop()
+pub fn setup_vht_operation(
+    operation: &mut VhtOperation,
+    ht_operation: &HtOperation,
+    peer_caps: u32,
+    primary_channel: u8,
+    local_channel_160_allowed: bool,
+    local_caps: u32,
+    local_tx_max_lgi_mbps: u16,
+    data: &[u8],
+) -> bool {
+    if data.len() != 5 || data[0] > VHTOP0_CHAN_WIDTH_8080 {
+        return false;
+    }
+    let sco = ht_operation.htop0 & HTOP0_SCO_MASK;
+    let have_40mhz = sco == 1 || sco == 3;
+    if have_40mhz && crate::valid_80mhz_center_frequency(data[1]) {
+        let mut width = data[0];
+        let center0 = data[1];
+        let center1 = if data[2] != 0 && crate::valid_80mhz_center_frequency(data[2]) {
+            data[2]
+        } else {
+            0
+        };
+        let ccfs2 = ((ht_operation.htop1 & 0x1fe0) >> 5) as u8;
+        let ccfs2 = if crate::valid_80mhz_center_frequency(ccfs2) {
+            ccfs2
+        } else {
+            0
+        };
+        let supported_width = (peer_caps & VHTCAP_CHAN_WIDTH_MASK) >> VHTCAP_CHAN_WIDTH_SHIFT;
+        let ext_nss_bw = (peer_caps & VHTCAP_EXT_NSS_BW_MASK) >> VHTCAP_EXT_NSS_BW_SHIFT;
+        let local_width = (local_caps & VHTCAP_CHAN_WIDTH_MASK) >> VHTCAP_CHAN_WIDTH_SHIFT;
+        let local_ext_nss_bw = (local_caps & VHTCAP_EXT_NSS_BW_MASK) >> VHTCAP_EXT_NSS_BW_SHIFT;
+        let local_supports_160 = local_channel_160_allowed
+            && (local_width == VHTCAP_CHAN_WIDTH_160
+                || local_width == VHTCAP_CHAN_WIDTH_160_8080
+                || (local_ext_nss_bw != 0 && local_tx_max_lgi_mbps & VHT_EXT_NSS_BW_CAPABLE != 0));
+        let ccfs1 = match (supported_width << 4) | ext_nss_bw {
+            0x01..=0x03 => ccfs2,
+            0x10 => center1,
+            0x11 | 0x12 => {
+                if center1 != 0 {
+                    center1
+                } else {
+                    ccfs2
+                }
+            }
+            0x13 | 0x20 | 0x23 => center1,
+            _ => 0,
+        };
+        let mut center0_result = center0;
+        let mut center1_result = center1;
+        if width == VHTOP0_CHAN_WIDTH_80 && ccfs1 != 0 {
+            let diff = ccfs1.abs_diff(center0);
+            if diff == 8 {
+                if local_supports_160 {
+                    center0_result = ccfs1;
+                    width = VHTOP0_CHAN_WIDTH_160;
+                }
+                center1_result = 0;
+            }
+        } else if width == VHTOP0_CHAN_WIDTH_160 {
+            if !local_supports_160 {
+                if primary_channel < center0 {
+                    center0_result = center0 - 4;
+                } else if primary_channel > center0 {
+                    center0_result = center0 + 4;
+                }
+                width = VHTOP0_CHAN_WIDTH_80;
+            }
+            center1_result = 0;
+        }
+        operation.channel_width = width;
+        operation.center_frequency_index0 = center0_result;
+        operation.center_frequency_index1 = center1_result;
+    } else {
+        operation.channel_width = VHTOP0_CHAN_WIDTH_HT;
+        operation.center_frequency_index0 = 0;
+        operation.center_frequency_index1 = 0;
+    }
+    operation.basic_mcs = le16(data, 3);
     true
 }
 
@@ -326,6 +427,56 @@ mod tests {
         assert_eq!(he.rx_mcs_80, 0);
         assert_eq!(he.flags, 0);
     }
+    #[test]
+    fn vht_operation_widens_or_clamps_from_peer_and_local_width_support() {
+        let ht = HtOperation {
+            htop0: 1,
+            ..Default::default()
+        };
+        let mut operation = VhtOperation::default();
+        let data = [VHTOP0_CHAN_WIDTH_80, 42, 50, 0x34, 0x12];
+        let local_160 = VHTCAP_CHAN_WIDTH_160 << VHTCAP_CHAN_WIDTH_SHIFT;
+        let peer_80plus80 = 1 << VHTCAP_CHAN_WIDTH_SHIFT;
+        assert!(setup_vht_operation(
+            &mut operation,
+            &ht,
+            peer_80plus80,
+            36,
+            true,
+            local_160,
+            0,
+            &data
+        ));
+        assert_eq!(operation.channel_width, VHTOP0_CHAN_WIDTH_160);
+        assert_eq!(operation.center_frequency_index0, 50);
+        assert_eq!(operation.center_frequency_index1, 0);
+        assert_eq!(operation.basic_mcs, 0x1234);
+        let data160 = [VHTOP0_CHAN_WIDTH_160, 50, 0, 1, 0];
+        assert!(setup_vht_operation(
+            &mut operation,
+            &ht,
+            0,
+            36,
+            false,
+            0,
+            0,
+            &data160
+        ));
+        assert_eq!(operation.channel_width, VHTOP0_CHAN_WIDTH_80);
+        assert_eq!(operation.center_frequency_index0, 46);
+        assert_eq!(operation.center_frequency_index1, 0);
+        assert!(!setup_vht_operation(
+            &mut operation,
+            &ht,
+            0,
+            36,
+            false,
+            0,
+            0,
+            &[0; 4]
+        ));
+    }
+
     #[test]
     fn channel_width_helpers_gate_on_both_peer_and_local_state() {
         assert_eq!(ht_secondary_offset(NODE_HT, true, true, 1), 1);

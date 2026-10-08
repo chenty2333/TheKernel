@@ -43,3 +43,7 @@ Bounded HT/VHT/HE capability and operation IE parsing now keeps MCS/NSS maps,
 channel-width information and peer flags in explicit node capability structs;
 clear operations reset the source fields, reserved HT MCS 77-79 are removed,
 and HT/VHT width selectors gate on both advertised and local channel support.
+VHT operation parsing follows the source ext-NSS bandwidth table to resolve the
+secondary 80-MHz center; it widens a 80-MHz report to 160 only when local
+channel/capability data allows, and clamps unsupported 160-MHz operation back
+to the primary-containing 80-MHz block.

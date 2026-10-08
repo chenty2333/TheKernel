@@ -40,7 +40,8 @@ pub use node_caps::{
     NODE_HTCAP, NODE_VHT, NODE_VHT_SGI80, NODE_VHT_SGI160, NODE_VHTCAP, VHTOP0_CHAN_WIDTH_80,
     VHTOP0_CHAN_WIDTH_160, VHTOP0_CHAN_WIDTH_8080, VHTOP0_CHAN_WIDTH_HT, VhtCapabilities,
     clear_he_caps, clear_ht_caps, clear_vht_caps, ht_secondary_offset, setup_he_caps,
-    setup_he_operation, setup_ht_caps, setup_ht_operation, setup_vht_caps, vht_channel_width,
+    setup_he_operation, setup_ht_caps, setup_ht_operation, setup_vht_caps, setup_vht_operation,
+    vht_channel_width,
 };
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,
