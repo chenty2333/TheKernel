@@ -6,7 +6,7 @@
 //! The userspace file-descriptor loader is intentionally replaced by the
 //! kernel rootfs firmware reader (`firmware::request`).
 
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec::Vec};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Version {
@@ -55,6 +55,70 @@ pub enum FirmwareError {
     InvalidStatus,
     TruncatedTlv,
     InvalidTlvLength { kind: u8, length: u8 },
+    InvalidPatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PatchCommand<'a> {
+    pub opcode: u16,
+    pub parameters: &'a [u8],
+    pub expected_events: Vec<(u8, &'a [u8])>,
+}
+
+/// Parse the `01 <HCI command>` / `02 <expected event>` stream consumed by
+/// `iwmbt_patch_fwfile()`. USB transfers are performed by the HCI transport.
+// upstream: iwmbt_hw.c iwmbt_patch_fwfile()
+pub fn parse_patch(image: &[u8]) -> Result<(Vec<PatchCommand<'_>>, bool), FirmwareError> {
+    let mut commands = Vec::new();
+    let mut offset = 0usize;
+    let mut activate_patch = false;
+    while offset < image.len() {
+        if image.len() - offset < 4 || image[offset] != 1 {
+            return Err(FirmwareError::InvalidPatch);
+        }
+        offset += 1;
+        let opcode = u16::from_le_bytes([image[offset], image[offset + 1]]);
+        let length = usize::from(image[offset + 2]);
+        offset += 3;
+        let end = offset
+            .checked_add(length)
+            .ok_or(FirmwareError::InvalidPatch)?;
+        if end > image.len() {
+            return Err(FirmwareError::InvalidPatch);
+        }
+        let parameters = &image[offset..end];
+        offset = end;
+        activate_patch |= opcode == 0xfc8e;
+        let mut expected_events = Vec::new();
+        while offset < image.len() && image[offset] == 2 {
+            if image.len() - offset < 3 {
+                return Err(FirmwareError::InvalidPatch);
+            }
+            let event_code = image[offset + 1];
+            let event_len = usize::from(image[offset + 2]);
+            offset += 3;
+            let end = offset
+                .checked_add(event_len)
+                .ok_or(FirmwareError::InvalidPatch)?;
+            if end > image.len() {
+                return Err(FirmwareError::InvalidPatch);
+            }
+            expected_events
+                .try_reserve(1)
+                .map_err(|_| FirmwareError::InvalidPatch)?;
+            expected_events.push((event_code, &image[offset..end]));
+            offset = end;
+        }
+        commands
+            .try_reserve(1)
+            .map_err(|_| FirmwareError::InvalidPatch)?;
+        commands.push(PatchCommand {
+            opcode,
+            parameters,
+            expected_events,
+        });
+    }
+    Ok((commands, activate_patch))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

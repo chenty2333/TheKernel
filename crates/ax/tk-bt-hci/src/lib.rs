@@ -13,8 +13,8 @@ mod iwmbt_fw;
 use alloc::collections::VecDeque;
 
 pub use iwmbt_fw::{
-    BootParams, DeviceFamily, FirmwareError, Version, VersionTlv, get_fwname, get_fwname_tlv,
-    parse_tlv, supported_device,
+    BootParams, DeviceFamily, FirmwareError, PatchCommand, Version, VersionTlv, get_fwname,
+    get_fwname_tlv, parse_patch, parse_tlv, supported_device,
 };
 
 pub const AF_BLUETOOTH: i32 = 31;
@@ -385,5 +385,20 @@ mod tests {
         assert_eq!(no_device_ioctl(HCIGETDEVINFO), Err(Error::NoDevice));
         assert_eq!(no_device_ioctl(HCIDEVUP), Err(Error::NoDevice));
         assert_eq!(no_device_ioctl(HCIDEVDOWN), Err(Error::NoDevice));
+    }
+
+    #[test]
+    fn intel_patch_stream_parses_command_event_pairs_and_activation() {
+        let (commands, activate) = parse_patch(&[1, 0x8e, 0xfc, 1, 0xaa, 2, 0x0e, 1, 0]).unwrap();
+        assert!(activate);
+        assert_eq!(
+            commands,
+            [PatchCommand {
+                opcode: 0xfc8e,
+                parameters: &[0xaa],
+                expected_events: std::vec![(0x0e, &[0][..])]
+            }]
+        );
+        assert_eq!(parse_patch(&[1, 0x01]), Err(FirmwareError::InvalidPatch));
     }
 }
