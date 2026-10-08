@@ -122,8 +122,16 @@ pub(super) fn mapping(usage: Usage, application: Usage, relative: bool) -> Optio
     match usage.page {
         7 => keyboard(usage.code).map(Mapping::Key),
         9 if (1..=128).contains(&usage.code) => {
-            let index = (usage.code - 1) as u16;
-            let base = if application.page == 0x0d && application.code == 5 {
+            let touchpad = application.page == 0x0d && application.code == 5;
+            let index = if touchpad {
+                // PTP button 1 is the integrated click switch and button 2
+                // is the external primary button; both synthesize BTN_LEFT.
+                // External button 3 begins BTN_RIGHT.
+                usage.code.saturating_sub(2) as u16
+            } else {
+                (usage.code - 1) as u16
+            };
+            let base = if touchpad {
                 0x110
             } else if application.page == 1 {
                 match application.code {
@@ -165,5 +173,38 @@ pub(super) fn mapping(usage: Usage, application: Usage, relative: bool) -> Optio
             _ => None,
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn precision_touchpad_integrated_and_primary_buttons_share_left() {
+        let touchpad = Usage {
+            page: 0x0d,
+            code: 5,
+        };
+        assert_eq!(
+            mapping(Usage { page: 9, code: 1 }, touchpad, false),
+            Some(Mapping::Key(0x110))
+        );
+        assert_eq!(
+            mapping(Usage { page: 9, code: 2 }, touchpad, false),
+            Some(Mapping::Key(0x110))
+        );
+        assert_eq!(
+            mapping(Usage { page: 9, code: 3 }, touchpad, false),
+            Some(Mapping::Key(0x111))
+        );
+        assert_eq!(
+            mapping(
+                Usage { page: 9, code: 2 },
+                Usage { page: 1, code: 2 },
+                false
+            ),
+            Some(Mapping::Key(0x111))
+        );
     }
 }

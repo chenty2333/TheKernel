@@ -209,23 +209,27 @@ impl I2cInput {
             }
             let location =
                 parser.locate_usage(crate::hid_report::ReportKind::Feature, 0x0d, 0x55, 0);
+            let mut contact_feature_id = None;
+            let mut contact_feature: Option<(Vec<u8>, usize)> = None;
             if let Some(location) = location {
                 let mut feature = Vec::new();
                 feature
                     .try_reserve_exact(report_info.feature.bytes)
                     .map_err(|_| DevError::NoMemory)?;
                 feature.resize(report_info.feature.bytes, 0);
-                if device
-                    .get_report(3, location.report_id, &mut feature)
-                    .is_ok_and(|actual| {
-                        actual.saturating_mul(8)
-                            >= usize::from(location.bit_offset) + usize::from(location.size)
-                    })
-                    && let Some(max_contacts) =
-                        crate::hid_report::get_hid_data(&feature, location, false)
+                let actual = device.get_report(3, location.report_id, &mut feature).ok();
+                if actual.is_some_and(|actual| {
+                    actual.saturating_mul(8)
+                        >= usize::from(location.bit_offset) + usize::from(location.size)
+                }) && let Some(max_contacts) =
+                    crate::hid_report::get_hid_data(&feature, location, false)
                     && max_contacts > 0
                 {
                     info.slots = u16::try_from(max_contacts).unwrap_or(32).min(32);
+                }
+                if actual.is_some() {
+                    contact_feature_id = Some(location.report_id);
+                    contact_feature = Some((feature, actual.unwrap_or(0)));
                 }
             }
             // upstream: hmt_attach() fetches HUD_BUTTON_TYPE unless it shares
@@ -233,27 +237,36 @@ impl I2cInput {
             // clickpad, and a failed/absent report falls back to ordinary pad.
             if let Some(location) =
                 parser.locate_usage(crate::hid_report::ReportKind::Feature, 0x0d, 0x59, 0)
-                && parser
-                    .locate_usage(crate::hid_report::ReportKind::Feature, 0x0d, 0x55, 0)
-                    .is_none_or(|contacts| contacts.report_id != location.report_id)
             {
-                let length =
-                    parser.report_size(crate::hid_report::ReportKind::Feature, location.report_id);
-                let mut feature = Vec::new();
-                feature
-                    .try_reserve_exact(length)
-                    .map_err(|_| DevError::NoMemory)?;
-                feature.resize(length, 0);
-                if device
-                    .get_report(3, location.report_id, &mut feature)
-                    .is_ok_and(|actual| {
-                        actual.saturating_mul(8)
+                let same_report = contact_feature_id == Some(location.report_id);
+                if same_report {
+                    if let Some((feature, actual)) = &contact_feature
+                        && actual.saturating_mul(8)
                             >= usize::from(location.bit_offset) + usize::from(location.size)
-                    })
-                {
-                    info.set_button_type(crate::hid_report::get_hid_data(
-                        &feature, location, false,
-                    ));
+                    {
+                        info.set_button_type(crate::hid_report::get_hid_data(
+                            feature, location, false,
+                        ));
+                    }
+                } else {
+                    let length = parser
+                        .report_size(crate::hid_report::ReportKind::Feature, location.report_id);
+                    let mut feature = Vec::new();
+                    feature
+                        .try_reserve_exact(length)
+                        .map_err(|_| DevError::NoMemory)?;
+                    feature.resize(length, 0);
+                    if device
+                        .get_report(3, location.report_id, &mut feature)
+                        .is_ok_and(|actual| {
+                            actual.saturating_mul(8)
+                                >= usize::from(location.bit_offset) + usize::from(location.size)
+                        })
+                    {
+                        info.set_button_type(crate::hid_report::get_hid_data(
+                            &feature, location, false,
+                        ));
+                    }
                 }
             }
             if let Err(error) = info.set_input_mode(&mut device, &parser, 3) {
