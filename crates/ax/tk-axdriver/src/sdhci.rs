@@ -187,7 +187,7 @@ fn decode_slot_info(slot_info: u8) -> (usize, u8) {
     )
 }
 
-fn allocate_sdma_buffer() -> Option<SdhciDmaRegion> {
+fn allocate_dma_buffer() -> Option<SdhciDmaRegion> {
     let virtual_address = global_allocator()
         .alloc_pages(SDMA_BUFFER_PAGES, SDMA_BUFFER_BYTES, UsageKind::Dma)
         .ok()?;
@@ -218,6 +218,13 @@ fn allocate_sdma_buffer() -> Option<SdhciDmaRegion> {
             Some(free_sdma_buffer),
         )
     })
+}
+
+fn dma_supported(capabilities: u32, quirks: u32) -> bool {
+    capabilities
+        & (axdriver_block::sdhci::SDHCI_CAN_DO_DMA | axdriver_block::sdhci::SDHCI_CAN_DO_ADMA2)
+        != 0
+        || quirks & axdriver_block::sdhci::SDHCI_QUIRK_FORCE_DMA != 0
 }
 
 unsafe fn free_sdma_buffer(cpu: NonNull<u8>, pages: usize) {
@@ -324,10 +331,9 @@ fn probe_slot(
     } else {
         host
     };
-    let dma_advertised = capabilities & axdriver_block::sdhci::SDHCI_CAN_DO_DMA != 0
-        || quirks & axdriver_block::sdhci::SDHCI_QUIRK_FORCE_DMA != 0;
+    let dma_advertised = dma_supported(capabilities, quirks);
     let host = if dma_advertised && quirks & axdriver_block::sdhci::SDHCI_QUIRK_BROKEN_DMA == 0 {
-        match allocate_sdma_buffer() {
+        match allocate_dma_buffer() {
             Some(region) => host.with_dma_region(region),
             None => host,
         }
@@ -460,5 +466,16 @@ mod tests {
         assert_eq!(decode_slot_info(0x25), (3, 5));
         assert_eq!(decode_slot_info(u8::MAX), (1, 0));
         assert_eq!(decode_slot_info(0x0f), (1, 0));
+    }
+
+    #[test]
+    fn dma_allocation_covers_sdma_adma2_and_force_dma() {
+        assert!(dma_supported(axdriver_block::sdhci::SDHCI_CAN_DO_DMA, 0));
+        assert!(dma_supported(axdriver_block::sdhci::SDHCI_CAN_DO_ADMA2, 0));
+        assert!(dma_supported(
+            0,
+            axdriver_block::sdhci::SDHCI_QUIRK_FORCE_DMA
+        ));
+        assert!(!dma_supported(0, 0));
     }
 }

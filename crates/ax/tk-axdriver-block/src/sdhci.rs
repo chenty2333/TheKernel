@@ -2644,7 +2644,7 @@ mod tests {
         let cpu = NonNull::new(bounce.as_mut_ptr()).unwrap();
         // SAFETY: the boxed test buffer remains stable while the host owns it.
         let dma = unsafe { SdhciDmaRegion::from_raw_parts(cpu, 0x1000, 8192, 0, None) };
-        let caps = (50 << SDHCI_CLOCK_BASE_SHIFT) | SDHCI_CAN_DO_DMA | SDHCI_CAN_DO_ADMA2;
+        let caps = (50 << SDHCI_CLOCK_BASE_SHIFT) | SDHCI_CAN_DO_ADMA2;
         let mut host = SdhciHost::new(io, caps, 0, 3).with_dma_region(dma);
         let mut input = [0x5a; 512];
         host.command(
