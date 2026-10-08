@@ -1210,3 +1210,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `hdmi.rs` additionally translates `intel_has_hdmi_sink()`, `intel_hdmi_has_audio()`, `intel_hdmi_limited_color_range()`, and the RGB/Y420 branch of `intel_hdmi_sink_format_valid()` (MIT `intel_hdmi.c`, © 2006-2009 Intel).
 
 `hdmi.rs` also translates `intel_hdmi_is_ycbcr420()`, `intel_hdmi_is_cloned()`, `intel_hdmi_compute_has_hdmi_sink()`, and the source scrambling-cap predicate from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
+
+`crates/ax/tk-intel-display/src/dp_aux.rs` translates all 35 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_dp_aux.c` (MIT, Copyright © 2020-2021 Intel Corporation); the kernel AUX MMIO/framework adapter remains unconnected. `LICENSE-MIT`.

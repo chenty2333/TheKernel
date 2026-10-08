@@ -17,6 +17,7 @@ pub mod device;
 pub mod display;
 pub mod dkl_phy;
 pub mod dmc;
+pub mod dp_aux;
 pub mod dpll;
 pub mod dpll_mgr;
 pub mod hdmi;
