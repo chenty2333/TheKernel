@@ -23,6 +23,7 @@ pub mod dpll_mgr;
 pub mod hdmi;
 pub mod hdmi_packet;
 pub mod intel_bios;
+pub mod intel_atomic_full;
 pub mod intel_color_full;
 pub mod intel_cursor_full;
 pub mod intel_crtc_full;
