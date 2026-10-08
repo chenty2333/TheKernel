@@ -545,3 +545,9 @@ The OpenBSD HT rate adaptation and regulatory-domain translations in
 `tk-net80211` retain their ISC-style source grants in `LICENSES/OpenBSD-ISC.txt`.
 The OpenBSD CCMP/TKIP PN/TSC extraction helpers retain their custom ISC-style
 grant and Damien Bergamini attribution in `tk-net80211/LICENSES/OpenBSD-ISC.txt`.
+
+The nl80211 public UAPI constants and family-name/multicast-group layout used
+by `kernel/src/file/netlink/nl80211.rs` derive from Linux
+`include/uapi/linux/nl80211.h` (ISC-style permission grant); copyright lines and
+the complete grant are retained in `kernel/LICENSES/ISC.txt`. GPL cfg80211,
+mac80211 and Linux generic-netlink implementation code were not copied.
