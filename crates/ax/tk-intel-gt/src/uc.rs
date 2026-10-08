@@ -64,6 +64,7 @@ pub enum FirmwareError {
 }
 
 pub struct FirmwareImage {
+    pub kind: Kind,
     pub blob: Blob,
     pub css: CssInfo,
     pub bytes: Vec<u8>,
@@ -93,6 +94,7 @@ pub fn load(
             return Err(FirmwareError::VersionRange);
         }
         return Ok(FirmwareImage {
+            kind,
             blob: *blob,
             css,
             bytes,

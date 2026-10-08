@@ -3,7 +3,7 @@
 // guc_load_done status decoding; register read is supplied by GtIo caller.
 // Copyright © 2014-2019 Intel Corporation. Full grant: LICENSE-MIT.
 
-use crate::{Error, GtIo};
+use crate::{Error, GtIo, uc::FirmwareImage};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RegisterWrite {
@@ -21,6 +21,8 @@ const START_DMA: u32 = 1;
 const UOS_MOVE: u32 = 1 << 4;
 const HUC_UKERNEL: u32 = 1 << 9;
 const DMA_ADDRESS_SPACE_WOPCM: u32 = 7 << 16;
+const UOS_RSA_SCRATCH: u32 = 0xc200;
+const UOS_RSA_SCRATCH_COUNT: usize = 64;
 
 // upstream: intel_uc_fw.c uc_fw_xfer()
 /// Caller must keep the firmware bytes and their GGTT binding alive until this
@@ -69,6 +71,76 @@ fn firmware_dma_xfer_with_timeout(
     start?;
     wait?;
     Ok(())
+}
+
+// upstream: intel_guc_fw.c guc_xfer_rsa_mmio()
+fn rsa_words(image: &FirmwareImage) -> Result<[u32; UOS_RSA_SCRATCH_COUNT], Error> {
+    const RSA_BYTES: usize = UOS_RSA_SCRATCH_COUNT * 4;
+    if image.css.rsa_bytes < RSA_BYTES {
+        return Err(Error::Refused);
+    }
+    let start = image
+        .css
+        .header_bytes
+        .checked_add(image.css.microcode_bytes)
+        .ok_or(Error::Refused)?;
+    let end = start.checked_add(RSA_BYTES).ok_or(Error::Refused)?;
+    let signature = image.bytes.get(start..end).ok_or(Error::Refused)?;
+    let mut words = [0; UOS_RSA_SCRATCH_COUNT];
+    for (word, bytes) in words.iter_mut().zip(signature.chunks_exact(4)) {
+        *word = u32::from_le_bytes(bytes.try_into().map_err(|_| Error::Refused)?);
+    }
+    Ok(words)
+}
+
+// upstream: intel_guc_fw.c intel_guc_fw_upload()
+/// Caller supplies a pinned firmware GGTT image and owns forcewake. This
+/// Gen12.0 path transfers the RSA key, copies CSS+uKernel to WOPCM, then waits
+/// for the GuC boot status; no submission queues are enabled here.
+pub fn guc_upload(
+    io: &impl GtIo,
+    source_ggtt: u64,
+    image: &FirmwareImage,
+) -> Result<u32, LoadError> {
+    if image.kind != crate::uc::Kind::GuC {
+        return Err(LoadError::Io(Error::Refused));
+    }
+    for write in gen12_prepare_xfer() {
+        io.write(write.offset, write.value).map_err(LoadError::Io)?;
+    }
+    let rsa = rsa_words(image).map_err(LoadError::Io)?;
+    for (index, word) in rsa.into_iter().enumerate() {
+        let offset = UOS_RSA_SCRATCH + (index as u32) * 4;
+        io.write(offset, word).map_err(LoadError::Io)?;
+    }
+    let code_bytes = image
+        .css
+        .header_bytes
+        .checked_add(image.css.microcode_bytes)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or(LoadError::Io(Error::Refused))?;
+    firmware_dma_xfer(io, source_ggtt, 0x2000, code_bytes, UOS_MOVE).map_err(LoadError::Io)?;
+    wait_ucode(io)
+}
+
+// upstream: intel_huc_fw.c intel_huc_fw_upload()
+/// Caller must retain the firmware GGTT mapping through DMA completion.
+pub fn huc_upload(
+    io: &impl GtIo,
+    source_ggtt: u64,
+    image: &FirmwareImage,
+    loaded_by_gsc: bool,
+) -> Result<(), Error> {
+    if loaded_by_gsc || image.kind != crate::uc::Kind::HuC {
+        return Err(Error::Refused);
+    }
+    let code_bytes = image
+        .css
+        .header_bytes
+        .checked_add(image.css.microcode_bytes)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or(Error::Refused)?;
+    firmware_dma_xfer(io, source_ggtt, 0, code_bytes, HUC_UKERNEL)
 }
 
 // upstream: intel_guc_fw.c guc_prepare_xfer()
@@ -232,10 +304,13 @@ mod tests {
     }
     impl GtIo for DmaIo {
         fn read(&self, offset: u32) -> Result<u32, Error> {
-            if offset != DMA_CTRL {
-                return Err(Error::Unavailable(offset));
+            if offset == 0xc000 {
+                return Ok(0xf0 << 8);
             }
-            Ok(u32::from(self.stuck))
+            if offset == DMA_CTRL {
+                return Ok(u32::from(self.stuck));
+            }
+            Err(Error::Unavailable(offset))
         }
         fn write(&self, offset: u32, value: u32) -> Result<(), Error> {
             self.writes.borrow_mut().push((offset, value));
@@ -302,6 +377,78 @@ mod tests {
         assert_eq!(
             firmware_dma_xfer_with_timeout(&stuck, 0x1000, 0, 0x1000, HUC_UKERNEL, 2),
             Err(Error::Quarantined)
+        );
+    }
+
+    fn huc_fixture() -> FirmwareImage {
+        let mut bytes = std::vec![0; 512];
+        for (offset, value) in [
+            (4, 160u32),
+            (24, 192),
+            (28, 64),
+            (32, 64),
+            (36, 0),
+            (64, 7 << 16 | 9 << 8 | 3),
+            (120, 0),
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let css = crate::uc::parse_css(&bytes, 2 * 1024 * 1024).unwrap();
+        FirmwareImage {
+            kind: crate::uc::Kind::HuC,
+            blob: crate::uc::candidates(crate::uc::Platform::AlderLakeN, crate::uc::Kind::HuC)[0],
+            css,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn guc_upload_orders_rsa_dma_and_waits_for_ready() {
+        let mut image = huc_fixture();
+        image.kind = crate::uc::Kind::GuC;
+        image.blob =
+            crate::uc::candidates(crate::uc::Platform::AlderLakeN, crate::uc::Kind::GuC)[0];
+        image.css.version = (70, 12, 1);
+        image.bytes[64..68].copy_from_slice(&(70u32 << 16 | 12 << 8 | 1).to_le_bytes());
+        image.css.rsa_bytes = 256;
+        for (index, word) in image.bytes[256..512].chunks_exact_mut(4).enumerate() {
+            word.copy_from_slice(&(index as u32).to_le_bytes());
+        }
+        let io = DmaIo {
+            writes: core::cell::RefCell::new(std::vec::Vec::new()),
+            time: core::cell::Cell::new(0),
+            stuck: false,
+            fail_start: false,
+        };
+        assert_eq!(guc_upload(&io, 0x10_0000, &image), Ok(0xf0 << 8));
+        let writes = io.writes.borrow();
+        assert_eq!(writes[0], (0xc064, 0x8607));
+        assert_eq!(writes[1], (0x13816c, 1));
+        assert_eq!(writes[2], (UOS_RSA_SCRATCH, 0));
+        assert_eq!(writes[65], (UOS_RSA_SCRATCH + 63 * 4, 63));
+        assert_eq!(writes[66], (DMA_ADDR_0_LOW, 0x10_0000));
+        assert_eq!(
+            writes[71],
+            (DMA_CTRL, crate::masked_enable(UOS_MOVE | START_DMA))
+        );
+    }
+
+    #[test]
+    fn huc_upload_uses_zero_destination_and_refuses_gsc_owned_firmware() {
+        let image = huc_fixture();
+        let io = DmaIo {
+            writes: core::cell::RefCell::new(std::vec::Vec::new()),
+            time: core::cell::Cell::new(0),
+            stuck: false,
+            fail_start: false,
+        };
+        assert_eq!(huc_upload(&io, 0x2000, &image, true), Err(Error::Refused));
+        assert!(io.writes.borrow().is_empty());
+        huc_upload(&io, 0x2000, &image, false).unwrap();
+        assert_eq!(io.writes.borrow()[2], (DMA_ADDR_1_LOW, 0));
+        assert_eq!(
+            io.writes.borrow()[5],
+            (DMA_CTRL, crate::masked_enable(HUC_UKERNEL | START_DMA))
         );
     }
 }

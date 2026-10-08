@@ -995,3 +995,5 @@ retain the latest Intel inventory, with no scanner exemptions.
 `crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c::intel_uc_check_file_version`, selected/wanted major validation and older-minor/patch classification for the non-overridden supported path (MIT, Copyright © 2016-2019 Intel Corporation).
 
 `crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c::uc_fw_xfer`, source/destination/size/control programming and completion poll order (MIT, Copyright © 2016-2019 Intel Corporation); ambiguous DMA retirement fails closed.
+
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `intel_guc_fw.c::intel_guc_fw_upload`/`guc_xfer_rsa_mmio` and `intel_huc_fw.c::intel_huc_fw_upload`, Gen12.0 RSA scratch, WOPCM destination and HuC ukernel DMA paths (MIT, Copyright © 2014-2019 Intel Corporation); GGTT source residency/forcewake are explicit caller inputs.
