@@ -1088,6 +1088,108 @@ const SD_OCR_CCS: u32 = 1 << 30;
 const SD_OCR_VOLTAGE: u32 = 0x00ff_8000;
 const MMC_R1_STATUS_ERRORS: u32 = 0xfff9_8000;
 
+// upstream: mmc.c mmc_send_if_cond()
+fn mmc_send_if_cond<I: SdhciIo>(host: &mut SdhciHost<I>) -> bool {
+    host.command(8, 0x1aa, SD_R1, None, 0)
+        .is_ok_and(|response| response.0[0] & 0xfff == 0x1aa)
+}
+
+// upstream: mmc.c mmc_send_app_op_cond()
+fn mmc_send_app_op_cond<I: SdhciIo>(
+    host: &mut SdhciHost<I>,
+    argument: u32,
+) -> Result<u32, SdhciError> {
+    host.application_command(0, SD_ACMD_OP_COND, argument, SD_R3)
+        .map(|response| response.0[0])
+}
+
+// upstream: mmc.c mmc_send_op_cond()
+fn mmc_send_op_cond<I: SdhciIo>(host: &mut SdhciHost<I>, argument: u32) -> Result<u32, SdhciError> {
+    host.command(MMC_CMD_SEND_OP_COND, argument, SD_R3, None, 0)
+        .map(|response| response.0[0])
+}
+
+// upstream: mmc.c mmc_idle_cards()
+fn mmc_idle_cards<I: SdhciIo>(
+    host: &mut SdhciHost<I>,
+    version2: bool,
+) -> Result<(bool, u32), SdhciError> {
+    for _ in 0..100 {
+        let argument = SD_OCR_VOLTAGE | if version2 { SD_OCR_CCS } else { 0 };
+        match mmc_send_app_op_cond(host, argument) {
+            Ok(ocr) if ocr & SD_OCR_READY != 0 => return Ok((false, ocr)),
+            Ok(_) => host.io.delay_us(10_000),
+            Err(_) => break,
+        }
+    }
+    host.command(SD_CMD_GO_IDLE, 0, RSP_NONE, None, 0)?;
+    for _ in 0..100 {
+        match mmc_send_op_cond(host, SD_OCR_VOLTAGE | SD_OCR_CCS) {
+            Ok(ocr) if ocr & SD_OCR_READY != 0 => return Ok((true, ocr)),
+            Ok(_) => host.io.delay_us(10_000),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(SdhciError::Timeout)
+}
+
+// upstream: mmc.c mmc_send_relative_addr()
+fn mmc_send_relative_addr<I: SdhciIo>(
+    host: &mut SdhciHost<I>,
+    mmc: bool,
+) -> Result<u16, SdhciError> {
+    if mmc {
+        host.command(SD_CMD_SEND_RELATIVE_ADDR, 1 << 16, SD_R1, None, 0)?;
+        Ok(1)
+    } else {
+        Ok((host
+            .command(SD_CMD_SEND_RELATIVE_ADDR, 0, SD_R1, None, 0)?
+            .0[0]
+            >> 16) as u16)
+    }
+}
+
+// upstream: mmc.c mmc_send_csd()
+fn mmc_send_csd<I: SdhciIo>(
+    host: &mut SdhciHost<I>,
+    rca: u16,
+) -> Result<SdhciResponse, SdhciError> {
+    host.command(SD_CMD_SEND_CSD, u32::from(rca) << 16, SD_R2, None, 0)
+}
+
+// upstream: mmc.c mmc_all_send_cid()
+fn mmc_all_send_cid<I: SdhciIo>(host: &mut SdhciHost<I>) -> Result<SdhciResponse, SdhciError> {
+    host.command(SD_CMD_ALL_SEND_CID, 0, SD_R2, None, 0)
+}
+
+// upstream: mmc.c mmc_select_card()
+fn mmc_select_card<I: SdhciIo>(host: &mut SdhciHost<I>, rca: u16) -> Result<(), SdhciError> {
+    host.command(SD_CMD_SELECT_CARD, u32::from(rca) << 16, SD_R1B, None, 0)
+        .map(|_| ())
+}
+
+// upstream: mmc.c mmc_send_status()
+fn mmc_send_status<I: SdhciIo>(host: &mut SdhciHost<I>, rca: u16) -> Result<u32, SdhciError> {
+    host.command(SD_CMD_SEND_STATUS, u32::from(rca) << 16, SD_R1, None, 0)
+        .map(|response| response.0[0])
+}
+
+// upstream: mmc.c mmc_decode_csd() capacity fields
+fn mmc_csd_sectors(csd: SdhciResponse, high_capacity: bool) -> Result<u64, SdhciError> {
+    if high_capacity {
+        Ok((u64::from(response_bits(csd, 48, 22)) + 1) * 1024)
+    } else {
+        let read_len = response_bits(csd, 80, 4);
+        let c_size = u64::from(response_bits(csd, 62, 12));
+        let c_mult = response_bits(csd, 47, 3);
+        ((c_size + 1)
+            .checked_shl(c_mult + 2 + read_len)
+            .ok_or(SdhciError::InvalidTransfer)?)
+        .checked_div(512)
+        .ok_or(SdhciError::InvalidTransfer)
+    }
+}
+
 /// SD card block device initialized through the generic SDHCI command path.
 pub struct SdhciDisk<I: SdhciIo> {
     host: SdhciHost<I>,
@@ -1106,68 +1208,14 @@ impl<I: SdhciIo> SdhciDisk<I> {
     pub fn attach(mut host: SdhciHost<I>) -> Result<Self, SdhciError> {
         host.initialize()?;
         host.command(SD_CMD_GO_IDLE, 0, RSP_NONE, None, 0)?;
-        let version2 = host
-            .command(8, 0x1aa, SD_R1, None, 0)
-            .is_ok_and(|response| response.0[0] & 0xfff == 0x1aa);
-        let mut sd_ocr = None;
-        for _ in 0..100 {
-            let argument = SD_OCR_VOLTAGE | if version2 { SD_OCR_CCS } else { 0 };
-            match host.application_command(0, SD_ACMD_OP_COND, argument, SD_R3) {
-                Ok(response) if response.0[0] & SD_OCR_READY != 0 => {
-                    sd_ocr = Some(response.0[0]);
-                    break;
-                }
-                Ok(_) => host.io.delay_us(10_000),
-                Err(_) => break,
-            }
-        }
-        let (mmc, ocr) = if let Some(ocr) = sd_ocr {
-            (false, ocr)
-        } else {
-            host.command(SD_CMD_GO_IDLE, 0, RSP_NONE, None, 0)?;
-            let mut mmc_ocr = None;
-            for _ in 0..100 {
-                match host.command(
-                    MMC_CMD_SEND_OP_COND,
-                    SD_OCR_VOLTAGE | SD_OCR_CCS,
-                    SD_R3,
-                    None,
-                    0,
-                ) {
-                    Ok(response) if response.0[0] & SD_OCR_READY != 0 => {
-                        mmc_ocr = Some(response.0[0]);
-                        break;
-                    }
-                    Ok(_) => host.io.delay_us(10_000),
-                    Err(error) => return Err(error),
-                }
-            }
-            (true, mmc_ocr.ok_or(SdhciError::Timeout)?)
-        };
-        host.command(SD_CMD_ALL_SEND_CID, 0, SD_R2, None, 0)?;
+        let version2 = mmc_send_if_cond(&mut host);
+        let (mmc, ocr) = mmc_idle_cards(&mut host, version2)?;
+        mmc_all_send_cid(&mut host)?;
         let high_capacity = ocr & SD_OCR_CCS != 0;
-        let rca = if mmc {
-            host.command(SD_CMD_SEND_RELATIVE_ADDR, 1 << 16, SD_R1, None, 0)?;
-            1
-        } else {
-            (host
-                .command(SD_CMD_SEND_RELATIVE_ADDR, 0, SD_R1, None, 0)?
-                .0[0]
-                >> 16) as u16
-        };
-        let csd = host.command(SD_CMD_SEND_CSD, u32::from(rca) << 16, SD_R2, None, 0)?;
-        host.command(SD_CMD_SELECT_CARD, u32::from(rca) << 16, SD_R1B, None, 0)?;
-        let mut sectors = if high_capacity {
-            (u64::from(response_bits(csd, 48, 22)) + 1) * 1024
-        } else {
-            let read_len = response_bits(csd, 80, 4);
-            let c_size = u64::from(response_bits(csd, 62, 12));
-            let c_mult = response_bits(csd, 47, 3);
-            ((c_size + 1)
-                .checked_shl(c_mult + 2 + read_len)
-                .ok_or(SdhciError::InvalidTransfer)?)
-                / 512
-        };
+        let rca = mmc_send_relative_addr(&mut host, mmc)?;
+        let csd = mmc_send_csd(&mut host, rca)?;
+        mmc_select_card(&mut host, rca)?;
+        let mut sectors = mmc_csd_sectors(csd, high_capacity)?;
         let mut erase_group_sectors = if response_bits(csd, 46, 1) != 0 {
             1
         } else {
@@ -1311,16 +1359,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
     // upstream: mmc.c mmc_wait_for_command() ready-for-data polling
     fn wait_ready(&mut self) -> Result<(), SdhciError> {
         for _ in 0..1000 {
-            let status = self
-                .host
-                .command(
-                    SD_CMD_SEND_STATUS,
-                    u32::from(self.rca) << 16,
-                    SD_R1,
-                    None,
-                    0,
-                )?
-                .0[0];
+            let status = mmc_send_status(&mut self.host, self.rca)?;
             if status & MMC_R1_STATUS_ERRORS != 0 {
                 return Err(SdhciError::Controller(status & MMC_R1_STATUS_ERRORS));
             }
