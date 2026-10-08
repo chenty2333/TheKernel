@@ -14,6 +14,8 @@ use crate::{
 
 pub const ELEMID_SSID: u8 = 0;
 pub const ELEMID_RATES: u8 = 1;
+pub const ELEMID_DS_PARAMS: u8 = 3;
+pub const ELEMID_ERP: u8 = 42;
 pub const ELEMID_XRATES: u8 = 50;
 pub const ELEMID_HT_CAPS: u8 = 45;
 pub const ELEMID_HT_OPERATION: u8 = 61;
@@ -27,6 +29,14 @@ pub const ELEMID_QOS_CAPABILITY: u8 = 46;
 pub const WMM_IE_STA_QOSINFO_AC_MASK: u8 = 0x0f;
 pub const WMM_IE_STA_QOSINFO_SP_MASK: u8 = 0x03;
 pub const WMM_IE_STA_QOSINFO_SP_SHIFT: u8 = 5;
+pub const CAPINFO_ESS: u16 = 0x0001;
+pub const CAPINFO_IBSS: u16 = 0x0002;
+pub const CAPINFO_PRIVACY: u16 = 0x0010;
+pub const CAPINFO_SHORT_PREAMBLE: u16 = 0x0020;
+pub const CAPINFO_SHORT_SLOTTIME: u16 = 0x0400;
+pub const ERP_NON_ERP_PRESENT: u8 = 0x01;
+pub const ERP_USE_PROTECTION: u8 = 0x02;
+pub const ERP_BARKER_MODE: u8 = 0x04;
 pub const CIPHER_USE_GROUP: u32 = 0x01;
 pub const CIPHER_WEP40: u32 = 0x02;
 pub const CIPHER_TKIP: u32 = 0x04;
@@ -57,6 +67,15 @@ pub enum IeError {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputOpMode {
+    Ibss,
+    HostAp,
+    #[default]
+    Station,
+    Monitor,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RsnIePolicy {
     pub wpa: bool,
     pub group_cipher: u32,
@@ -79,6 +98,60 @@ fn append_ie(output: &mut Vec<u8>, id: u8, payload: &[u8]) -> Result<(), IeError
     output.push(payload.len() as u8);
     output.extend_from_slice(payload);
     Ok(())
+}
+
+/// Compute and append the source Capability Information field.
+// upstream: ieee80211_output.c ieee80211_add_capinfo()
+pub fn append_capability_info(
+    output: &mut Vec<u8>,
+    opmode: OutputOpMode,
+    is_2ghz: bool,
+    privacy_configured: bool,
+    short_preamble: bool,
+    short_slot: bool,
+) {
+    let mut capinfo = match opmode {
+        OutputOpMode::Ibss => CAPINFO_IBSS,
+        OutputOpMode::HostAp => CAPINFO_ESS,
+        OutputOpMode::Station | OutputOpMode::Monitor => 0,
+    };
+    if opmode == OutputOpMode::HostAp && privacy_configured {
+        capinfo |= CAPINFO_PRIVACY;
+    }
+    if short_preamble && is_2ghz {
+        capinfo |= CAPINFO_SHORT_PREAMBLE;
+    }
+    if short_slot {
+        capinfo |= CAPINFO_SHORT_SLOTTIME;
+    }
+    output.extend_from_slice(&capinfo.to_le_bytes());
+}
+
+/// Append a DS Parameter Set element with the selected IEEE channel.
+// upstream: ieee80211_output.c ieee80211_add_ds_params()
+pub fn append_ds_params_ie(output: &mut Vec<u8>, channel: u8) -> Result<(), IeError> {
+    append_ie(output, ELEMID_DS_PARAMS, &[channel])
+}
+
+/// Append an ERP element from associated-peer and short-preamble state.
+// upstream: ieee80211_output.c ieee80211_add_erp()
+pub fn append_erp_ie(
+    output: &mut Vec<u8>,
+    non_erp_station_present: bool,
+    use_protection: bool,
+    short_preamble: bool,
+) -> Result<(), IeError> {
+    let mut erp = 0;
+    if non_erp_station_present {
+        erp |= ERP_NON_ERP_PRESENT;
+    }
+    if use_protection {
+        erp |= ERP_USE_PROTECTION;
+    }
+    if !short_preamble {
+        erp |= ERP_BARKER_MODE;
+    }
+    append_ie(output, ELEMID_ERP, &[erp])
 }
 
 /// Append an SSID information element, including the zero-length hidden SSID form.
@@ -434,6 +507,30 @@ mod tests {
         assert_eq!(
             append_supported_rates_ie(&mut ies, &invalid),
             Err(IeError::InvalidRateSet)
+        );
+    }
+
+    #[test]
+    fn capability_ds_and_erp_encoders_match_source_bits() {
+        let mut bytes = Vec::new();
+        append_capability_info(&mut bytes, OutputOpMode::HostAp, true, true, true, true);
+        assert_eq!(
+            bytes,
+            (CAPINFO_ESS | CAPINFO_PRIVACY | CAPINFO_SHORT_PREAMBLE | CAPINFO_SHORT_SLOTTIME)
+                .to_le_bytes()
+        );
+        append_capability_info(&mut bytes, OutputOpMode::Station, false, true, true, false);
+        assert_eq!(&bytes[2..], &[0, 0]);
+        append_ds_params_ie(&mut bytes, 36).unwrap();
+        assert_eq!(&bytes[4..], &[ELEMID_DS_PARAMS, 1, 36]);
+        append_erp_ie(&mut bytes, true, true, false).unwrap();
+        assert_eq!(
+            &bytes[7..],
+            &[
+                ELEMID_ERP,
+                1,
+                ERP_NON_ERP_PRESENT | ERP_USE_PROTECTION | ERP_BARKER_MODE
+            ]
         );
     }
 
