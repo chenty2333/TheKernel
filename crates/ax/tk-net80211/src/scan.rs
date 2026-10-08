@@ -63,6 +63,15 @@ pub struct ScanProgress {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BeginScanEffects {
+    pub clean_bss_node: bool,
+    pub raise_scan_node_inactivity: bool,
+    pub mode_to_set: crate::PhyMode,
+    pub reset_scan_count: bool,
+    pub begin_next_channel: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanError {
     EmptyChannelSet,
     PendingSetLengthMismatch,
@@ -75,14 +84,31 @@ pub enum ScanStep {
     Complete,
 }
 
-/// Begin active scan except for hostap mode, which scans passively.
+/// Begin scan and return the station-node/mode/channel effects in source order.
 // upstream: ieee80211_node.c ieee80211_begin_scan()
-pub fn begin_scan(progress: &mut ScanProgress, hostap_mode: bool) {
+pub fn begin_scan(
+    progress: &mut ScanProgress,
+    hostap_mode: bool,
+    station_mode: bool,
+    media_mode_auto: bool,
+    current_mode: crate::PhyMode,
+) -> BeginScanEffects {
     if !hostap_mode {
         progress.active_scan = true;
         progress.active_scans += 1;
     } else {
         progress.passive_scans += 1;
+    }
+    BeginScanEffects {
+        clean_bss_node: station_mode,
+        raise_scan_node_inactivity: station_mode,
+        mode_to_set: if media_mode_auto {
+            crate::PhyMode::Auto
+        } else {
+            current_mode
+        },
+        reset_scan_count: true,
+        begin_next_channel: true,
     }
 }
 
@@ -281,7 +307,7 @@ mod tests {
     #[test]
     fn begin_scan_counts_active_and_hostap_passive_runs() {
         let mut scan = ScanProgress::default();
-        begin_scan(&mut scan, false);
+        let station_effects = begin_scan(&mut scan, false, true, true, crate::PhyMode::B);
         assert_eq!(
             scan,
             ScanProgress {
@@ -290,10 +316,23 @@ mod tests {
                 passive_scans: 0
             }
         );
-        begin_scan(&mut scan, true);
+        assert_eq!(
+            station_effects,
+            BeginScanEffects {
+                clean_bss_node: true,
+                raise_scan_node_inactivity: true,
+                mode_to_set: crate::PhyMode::Auto,
+                reset_scan_count: true,
+                begin_next_channel: true,
+            }
+        );
+        let hostap_effects = begin_scan(&mut scan, true, false, false, crate::PhyMode::A);
         assert_eq!(scan.active_scans, 1);
         assert_eq!(scan.passive_scans, 1);
         assert!(scan.active_scan);
+        assert_eq!(hostap_effects.mode_to_set, crate::PhyMode::A);
+        assert!(!hostap_effects.clean_bss_node);
+        assert!(!hostap_effects.raise_scan_node_inactivity);
     }
 
     #[test]

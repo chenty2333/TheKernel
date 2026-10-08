@@ -157,7 +157,7 @@ pub use sa_query::{
     SaQueryError, SaQueryOutcome, SaQueryState, receive_sa_query_request, receive_sa_query_response,
 };
 pub use scan::{
-    BackgroundScanEffects, BackgroundScanPolicy, EndScanEffects, EndScanPolicy, ScanError,
-    ScanProgress, ScanStep, background_scan_timeout, begin_background_scan, begin_scan,
+    BackgroundScanEffects, BackgroundScanPolicy, BeginScanEffects, EndScanEffects, EndScanPolicy,
+    ScanError, ScanProgress, ScanStep, background_scan_timeout, begin_background_scan, begin_scan,
     end_station_scan, next_scan_channel, reset_scan_channels,
 };

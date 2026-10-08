@@ -287,3 +287,8 @@ reference predicate to the cache collector.
 saved RSN/WPA IE buffers), requests timeout reset, BA/reorder teardown and
 unreference-callback retirement, and leaves AP-only power-save queue
 initialization disabled for the station-only iwx use path.
+
+The `ieee80211_begin_scan()` plan now also returns the station-only BSS cleanup,
+scan-node inactivity aging, AUTO/current mode reset, scan-count reset and
+next-channel dispatch effects. The caller composes it with the node-cache age
+and channel cursor helpers; hostap still begins passively.
