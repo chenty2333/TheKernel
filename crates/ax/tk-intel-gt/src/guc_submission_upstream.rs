@@ -3481,10 +3481,10 @@ fn remove_from_context(rq: &mut i915_request) {
 }
 
 // upstream: intel_guc_submission.c submit_work_cb()
-fn submit_work_cb(wrk: &mut irq_work) {
+unsafe extern "C" fn submit_work_cb(wrk: *mut irq_work) {
     let rq = container_of!(wrk, i915_request, submit_work);
-    might_lock(&rq.engine.sched_engine.lock);
-    i915_sw_fence_complete(&mut rq.submit);
+    might_lock(&(*(*(*rq).engine).sched_engine).lock);
+    i915_sw_fence_complete(&mut (*rq).submit);
 }
 
 // upstream: intel_guc_submission.c __guc_signal_context_fence()

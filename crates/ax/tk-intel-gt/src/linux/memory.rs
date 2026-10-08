@@ -283,6 +283,55 @@ pub unsafe fn kref_init(value: *mut Kref) {
     refcount_set(reference, 1);
 }
 
+/// Increment a live `kref` (`kref_get`).
+///
+/// As in Linux, the caller must already own a live reference: this operation
+/// is not a lookup-safe way to resurrect an object whose count reached zero.
+/// A violated precondition follows `refcount_inc()`'s fail-closed invariant
+/// behavior by saturating the count and warning rather than wrapping or
+/// manufacturing a reference from zero.
+///
+/// # Safety
+/// `value` must point to a live `kref` whose storage remains valid throughout
+/// the call, and the caller must own a reference that keeps its object alive.
+#[inline]
+pub unsafe fn kref_get(value: *mut Kref) {
+    // SAFETY: required by this function's contract; the shared refcount helper
+    // performs the actual atomic transition.
+    let got_reference = unsafe { refcount_inc_not_zero(&mut (*value).refcount) };
+    if !got_reference {
+        // `refcount_inc()` warns and saturates on a zero count (a likely UAF).
+        // `inc_not_zero` intentionally leaves zero unchanged, so apply that
+        // same invariant handling here rather than allowing a later wrap.
+        let counter = unsafe { atomic(&(*value).refcount.refs) };
+        refcount_saturate(counter, "increment from zero");
+    }
+}
+
+/// Drop one `kref` reference and call `release` only for the final reference.
+///
+/// Returns `1` exactly when this call performed the 1-to-0 transition and
+/// invoked `release`; otherwise returns `0`, matching Linux's `int` result.
+/// The callback is non-null by type, matching Linux's requirement that callers
+/// provide the object's release function rather than `NULL` or a generic
+/// `kfree`.
+///
+/// # Safety
+/// `value` must point to a live `kref` with one reference owned by the caller.
+/// `release` must be the correct destructor for the containing object and may
+/// free it; it is called at most once for this decrement.
+#[inline]
+pub unsafe fn kref_put(value: *mut Kref, release: unsafe fn(*mut Kref)) -> i32 {
+    // SAFETY: required by this function's contract.  Do not touch `value`
+    // after invoking `release`, since the callback may free its container.
+    if unsafe { refcount_dec_and_test(&mut (*value).refcount) } {
+        unsafe { release(value) };
+        1
+    } else {
+        0
+    }
+}
+
 /// Read a reference count.  The generic view accepts the embedded `refcount_t`
 /// used by dma-fence as well as the enclosing `kref` used by i915 objects.
 #[inline]

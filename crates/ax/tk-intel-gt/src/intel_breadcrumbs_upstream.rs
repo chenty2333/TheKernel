@@ -178,7 +178,7 @@ unsafe fn slist_add(node: *mut LlistNode, head: *mut LlistNode) -> *mut LlistNod
 }
 
 // upstream: intel_breadcrumbs.c signal_irq_work()
-unsafe fn signal_irq_work(work: *mut IrqWork) {
+unsafe extern "C" fn signal_irq_work(work: *mut IrqWork) {
     let b = container_of!(work, IntelBreadcrumbs, irq_work);
     let timestamp = ktime_get();
     let mut signal: *mut LlistNode;
@@ -355,6 +355,17 @@ unsafe fn intel_breadcrumbs_free(kref: *mut Kref) {
     GEM_BUG_ON!((*b).irq_armed.is_some());
 
     kfree(b);
+}
+
+// upstream: intel_breadcrumbs.h intel_breadcrumbs_get()
+pub unsafe fn intel_breadcrumbs_get(b: *mut IntelBreadcrumbs) -> *mut IntelBreadcrumbs {
+    crate::linux_memory::kref_get(&mut (*b).ref_);
+    b
+}
+
+// upstream: intel_breadcrumbs.h intel_breadcrumbs_put()
+pub unsafe fn intel_breadcrumbs_put(b: *mut IntelBreadcrumbs) {
+    crate::linux_memory::kref_put(&mut (*b).ref_, intel_breadcrumbs_free);
 }
 
 // upstream: intel_breadcrumbs.c irq_signal_request()

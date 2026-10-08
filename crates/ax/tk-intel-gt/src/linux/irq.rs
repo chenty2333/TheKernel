@@ -43,6 +43,21 @@ impl IrqWorkPtr for &IrqWork {
     }
 }
 
+/// Linux 7.2.3 `init_irq_work()` / `IRQ_WORK_INIT()` initializer.
+/// The record must not be pending; the caller owns its storage.
+pub fn init_irq_work<W: IrqWorkPtr>(work: W, func: unsafe extern "C" fn(*mut IrqWork)) {
+    let work = work.irq_work_ptr();
+    assert!(!work.is_null());
+    unsafe {
+        (*work).node.next = core::ptr::null_mut();
+        (*work).node.flags.counter = 0;
+        (*work).node.src = 0;
+        (*work).node.dst = 0;
+        (*work).func = Some(func);
+        (*work).irqwait = core::ptr::null_mut();
+    }
+}
+
 #[inline]
 unsafe fn flags(work: *mut IrqWork) -> &'static AtomicU32 {
     assert!(!work.is_null());
