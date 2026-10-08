@@ -38,6 +38,7 @@ mod rx_packet;
 mod scan;
 mod scan_probe;
 mod station;
+mod statistics;
 mod tx;
 mod tx_completion;
 
@@ -200,6 +201,12 @@ pub use station::{
     TX_FLUSH_RESPONSE_BYTES, TX_PATH_FLUSH_COMMAND, TxFlushResponse, drain_station_command,
     flush_station, parse_tx_flush_response, remove_station_command, station_add_command,
     tx_path_flush_command, validate_station_add_status,
+};
+pub use statistics::{
+    SYSTEM_GROUP as STATISTICS_SYSTEM_GROUP, SYSTEM_STATISTICS_COMMAND,
+    SYSTEM_STATISTICS_END_NOTIFICATION, SystemStatisticsWait, begin_system_statistics_clear,
+    legacy_statistics_clear_command, statistics_clear_command, system_statistics_clear_command,
+    system_statistics_end_notification, wait_system_statistics_clear,
 };
 pub use tx::{EncodedTxFrame, TxError, TxFrame, encode_tx_frame, submit_tx_frame};
 pub use tx_completion::{

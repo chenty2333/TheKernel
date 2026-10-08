@@ -34,3 +34,9 @@ and MLD `MAC_CONFIG_CMD`, including station timing, EDCA FIFO placement,
 monitor filters, rates, protection flags, and add/remove active-state checks.
 The builders emit firmware payload bytes; caller-owned command transport still
 handles queue reservation, doorbell publication, and response dispatch.
+
+Statistics clearing follows the firmware command-version table: unknown
+(`99`) uses synchronous legacy `STATISTICS_CMD` with a retained response,
+version 1 sends asynchronous `SYSTEM_STATISTICS_CMD` and waits for
+`SYSTEM_STATISTICS_END_NOTIF`, and unknown newer versions follow the source's
+no-op path.
