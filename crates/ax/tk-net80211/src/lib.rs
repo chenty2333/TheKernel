@@ -7,10 +7,20 @@
 extern crate alloc;
 
 mod frame;
+mod ra;
 mod rsn;
 mod rssadapt;
 
 pub use frame::{DecapError, EthernetFrame, MacAddress, decap_data, encap_station};
+pub use ra::{
+    GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,
+    RA_NOT_PROBING, RA_PROBING_DOWN, RA_PROBING_INTER, RA_PROBING_UP, RaNode, add_stats_ht,
+    best_mcs_in_rateset, best_rate, choose, fixedp_split, fixedp_string, get_ht_rateset,
+    get_txrate, inter_mode_ra_finished, intra_mode_ra_finished, next_intra_rate,
+    next_lower_intra_rate, next_mcs, next_rateset, node_init, probe_clear, probe_done,
+    probe_next_rate, probe_next_rateset, probe_valid, trigger_next_rateset, use_ht_sgi,
+    valid_rates, valid_tx_mcs,
+};
 pub use rsn::{Akm, Cipher, RsnParams, RsnStatus, parse_akm, parse_cipher, parse_rsn, parse_wpa};
 pub use rssadapt::{
     LegacyRateSet, RATE_BASIC, RATE_SIZE, RATE_VALUE, RSSADAPT_BUCKET_POWER, RSSADAPT_BUCKET0,
