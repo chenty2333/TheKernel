@@ -40,6 +40,6 @@
 - UMAC scan channel-fill functions v1-v4 and v5 now apply valid channel caps, band layouts, PSD and iteration defaults (`27b8e9ab`).
 - `iwx_fill_probe_req()` now creates bounded 802.11 probe header, SSID placeholder, rates/extended-rates, DS, VHT and shared HT IE segments (`dce823d5`).
 - UMAC scan v14/v17 requests now assemble general/dwell policy, fixed channel arrays, probe segments, direct SSID and async/background semantics (`20c30787`).
-- Reduced SCAN_CFG v5+ setup now checks the advertised firmware API and legacy broadcast station-ID compatibility (`pending commit`).
+- Reduced SCAN_CFG v5+ setup now checks the advertised firmware API and legacy broadcast station-ID compatibility (`d8c96c37`).
 - Scan probe descriptors and raw 512-byte frame data now have an exact packed-wire serializer (`8f69492b`).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.
