@@ -1168,6 +1168,35 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.set_clock(clock_hz)
     }
 
+    // upstream: sdhci.c sdhci_generic_set_uhs_timing()
+    fn set_sd_uhs_timing(&mut self, timing: MmcBusTiming, clock_hz: u32) -> Result<(), SdhciError> {
+        if self.version < SDHCI_SPEC_300 as u8 {
+            return Err(SdhciError::UnsupportedClock);
+        }
+        let mode = match timing {
+            MmcBusTiming::UhsSdr12 => SDHCI_CTRL2_UHS_SDR12,
+            MmcBusTiming::UhsSdr25 => SDHCI_CTRL2_UHS_SDR25,
+            MmcBusTiming::UhsSdr50 => SDHCI_CTRL2_UHS_SDR50,
+            MmcBusTiming::UhsSdr104 => SDHCI_CTRL2_UHS_SDR104,
+            MmcBusTiming::UhsDdr50 => SDHCI_CTRL2_UHS_DDR50,
+            _ => return Err(SdhciError::UnsupportedClock),
+        };
+        self.set_clock(0)?;
+        let control2 = self.io.read16(SDHCI_HOST_CONTROL2 as usize);
+        self.io.write16(
+            SDHCI_HOST_CONTROL2 as usize,
+            (control2 & !(SDHCI_CTRL2_UHS_MASK as u16)) | mode as u16,
+        );
+        let mut control = self.io.read8(SDHCI_HOST_CONTROL as usize);
+        if clock_hz > 25_000_000 {
+            control |= SDHCI_CTRL_HISPD as u8;
+        } else {
+            control &= !(SDHCI_CTRL_HISPD as u8);
+        }
+        self.io.write8(SDHCI_HOST_CONTROL as usize, control);
+        self.set_clock(clock_hz)
+    }
+
     /// Reset command/data engines and establish the initial 400 kHz clock.
     // upstream: sdhci.c sdhci_generic_reset()
     pub fn initialize(&mut self) -> Result<(), SdhciError> {
@@ -2126,6 +2155,7 @@ const SD_CMD_SEND_CSD: u8 = 9;
 const SD_CMD_SELECT_CARD: u8 = 7;
 const SD_CMD_STOP_TRANSMISSION: u8 = 12;
 const SD_CMD_SEND_STATUS: u8 = 13;
+const SD_CMD_VOLTAGE_SWITCH: u8 = 11;
 const SD_CMD_SWITCH_FUNC: u8 = 6;
 const SD_CMD_SET_BLOCKLEN: u8 = 16;
 const SD_CMD_READ_SINGLE: u8 = 17;
@@ -2149,6 +2179,8 @@ const SD_R3: u16 = SDHCI_CMD_RESP_SHORT as u16;
 const SD_DATA: u16 = SDHCI_CMD_DATA as u16;
 const SD_OCR_READY: u32 = 1 << 31;
 const SD_OCR_CCS: u32 = 1 << 30;
+const SD_OCR_S18R: u32 = 1 << 24;
+const SD_OCR_S18A: u32 = 1 << 24;
 const SD_OCR_VOLTAGE: u32 = 0x00ff_8000;
 const MMC_OCR_MIN_VOLTAGE_SHIFT: u32 = 7;
 const MMC_OCR_MAX_VOLTAGE_SHIFT: u32 = 23;
@@ -2192,7 +2224,12 @@ fn mmc_idle_cards<I: SdhciIo>(
     host: &mut SdhciHost<I>,
     version2: bool,
 ) -> Result<(bool, u32), SdhciError> {
-    let host_ocr = mmc_select_vdd(SD_OCR_VOLTAGE);
+    let host_ocr = mmc_select_vdd(SD_OCR_VOLTAGE)
+        | if version2 && host.capabilities & SDHCI_CAN_VDD_180 != 0 {
+            SD_OCR_S18R
+        } else {
+            0
+        };
     for _ in 0..100 {
         let argument = host_ocr | if version2 { SD_OCR_CCS } else { 0 };
         match mmc_send_app_op_cond(host, argument) {
@@ -2203,7 +2240,7 @@ fn mmc_idle_cards<I: SdhciIo>(
     }
     host.command(SD_CMD_GO_IDLE, 0, RSP_NONE, None, 0)?;
     for _ in 0..100 {
-        match mmc_send_op_cond(host, host_ocr | SD_OCR_CCS) {
+        match mmc_send_op_cond(host, (host_ocr & !SD_OCR_S18R) | SD_OCR_CCS) {
             Ok(ocr) if ocr & SD_OCR_READY != 0 => return Ok((true, ocr)),
             Ok(_) => host.io.delay_us(10_000),
             Err(error) => return Err(error),
@@ -2456,6 +2493,7 @@ pub struct SdhciDisk<I: SdhciIo> {
     timing_clock_hz: u32,
     bus_width: u8,
     last_tune_ns: Option<u64>,
+    tuning_enabled: bool,
 }
 
 impl<I: SdhciIo> SdhciDisk<I> {
@@ -2467,6 +2505,14 @@ impl<I: SdhciIo> SdhciDisk<I> {
         host.command(SD_CMD_GO_IDLE, 0, RSP_NONE, None, 0)?;
         let version2 = mmc_send_if_cond(&mut host);
         let (mmc, ocr) = mmc_idle_cards(&mut host, version2)?;
+        let sd_uhs_voltage = !mmc
+            && ocr & SD_OCR_S18A != 0
+            && host.version >= SDHCI_SPEC_300 as u8
+            && host.capabilities & SDHCI_CAN_VDD_180 != 0;
+        if sd_uhs_voltage {
+            host.command(SD_CMD_VOLTAGE_SWITCH, 0, SD_R1, None, 0)?;
+            host.switch_signal_voltage_18v()?;
+        }
         let raw_cid = mmc_all_send_cid(&mut host)?;
         let high_capacity = ocr & SD_OCR_CCS != 0;
         let rca = mmc_send_relative_addr(&mut host, mmc)?;
@@ -2496,13 +2542,32 @@ impl<I: SdhciIo> SdhciDisk<I> {
         let mut negotiated_timing = MmcBusTiming::Normal;
         let mut negotiated_clock_hz = host.clock_hz;
         let mut negotiated_bus_width = 1;
+        let mut tuning_enabled = false;
         // upstream: mmc.c mmc_set_timing() SD high-speed subset
         if !mmc {
             if scr.is_some_and(|scr| scr.bus_widths & (1 << 2) != 0) {
                 mmc_set_card_bus_width(&mut host, false, rca, 4)?;
                 negotiated_bus_width = 4;
             }
-            if csd_info.command_classes & (1 << 10) != 0
+            if sd_uhs_voltage {
+                let mut switch_status = [0u8; 64];
+                host.switch_sd_function(0, 0, 0x0f, &mut switch_status)?;
+                let (timing, function, clock_hz, needs_tuning) =
+                    choose_sd_uhs_timing(host.capabilities2, switch_status[13], host.base_clock_hz);
+                if function != 0 {
+                    host.switch_sd_function(1, 0, function, &mut switch_status)?;
+                    if !sd_switch_selected_function(&switch_status, function) {
+                        return Err(SdhciError::Controller(u32::from(switch_status[16])));
+                    }
+                }
+                host.set_sd_uhs_timing(timing, clock_hz)?;
+                if needs_tuning {
+                    host.execute_tuning(19, negotiated_bus_width)?;
+                    tuning_enabled = true;
+                }
+                negotiated_timing = timing;
+                negotiated_clock_hz = clock_hz;
+            } else if csd_info.command_classes & (1 << 10) != 0
                 && host.capabilities & SDHCI_CAN_DO_HISPD != 0
                 && host.quirks & SDHCI_QUIRK_BROKEN_TIMINGS == 0
             {
@@ -2620,6 +2685,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
                 )?;
             }
             negotiated_timing = timing.0;
+            tuning_enabled = matches!(timing.0, MmcBusTiming::MmcHs200 | MmcBusTiming::MmcHs400);
             negotiated_clock_hz = if timing.1 == 0 {
                 host.clock_hz
             } else {
@@ -2664,6 +2730,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
             timing_clock_hz: negotiated_clock_hz,
             bus_width: negotiated_bus_width,
             last_tune_ns,
+            tuning_enabled,
         })
     }
 
@@ -2689,9 +2756,11 @@ impl<I: SdhciIo> SdhciDisk<I> {
             format_card_id(self.cid, self.ext_csd.is_some(), self.high_capacity);
         let bus_width = self.host.bus_width();
         log::info!(
-            "sdhci: card {card_id}; serial={serial}; capacity={} sectors; bus={} bit; clock={} Hz",
+            "sdhci: card {card_id}; serial={serial}; capacity={} sectors; bus={} bit; timing={}; \
+             clock={} Hz",
             self.sectors,
             bus_width,
+            timing_name(self.timing),
             self.host.clock_hz()
         );
     }
@@ -2799,7 +2868,15 @@ impl<I: SdhciIo> SdhciDisk<I> {
 
     // upstream: mmc.c mmc_retune()
     fn retune_if_needed(&mut self) -> Result<(), SdhciError> {
-        if !matches!(self.timing, MmcBusTiming::MmcHs200 | MmcBusTiming::MmcHs400) {
+        if !self.tuning_enabled
+            || !matches!(
+                self.timing,
+                MmcBusTiming::UhsSdr50
+                    | MmcBusTiming::UhsSdr104
+                    | MmcBusTiming::MmcHs200
+                    | MmcBusTiming::MmcHs400
+            )
+        {
             return Ok(());
         }
         let status = self.host.io.read32(SDHCI_INT_STATUS as usize);
@@ -2827,8 +2904,10 @@ impl<I: SdhciIo> SdhciDisk<I> {
                 self.bus_width,
                 self.timing_clock_hz,
             )?;
-        } else {
+        } else if self.timing == MmcBusTiming::MmcHs200 {
             self.host.execute_tuning(21, self.bus_width)?;
+        } else {
+            self.host.execute_tuning(19, self.bus_width)?;
         }
         if self.timing == MmcBusTiming::MmcHs400 {
             switch_mmc_to_hs400(
@@ -2898,6 +2977,52 @@ impl<I: SdhciIo> SdhciDisk<I> {
 // mmc.c mmc_discover_cards() SD switch-status byte 13 support and byte 16 selection.
 fn sd_switch_supports_high_speed(status: &[u8; 64]) -> bool {
     status[13] & (1 << 1) != 0
+}
+
+// upstream: mmc.c mmc_discover_cards() UHS timing/capability selection
+fn choose_sd_uhs_timing(
+    host_caps: u32,
+    card_group1: u8,
+    base_clock_hz: u32,
+) -> (MmcBusTiming, u8, u32, bool) {
+    if host_caps & SDHCI_CAN_SDR104 != 0 && card_group1 & (1 << 3) != 0 {
+        return (
+            MmcBusTiming::UhsSdr104,
+            3,
+            208_000_000.min(base_clock_hz),
+            true,
+        );
+    }
+    if host_caps & SDHCI_CAN_SDR50 != 0 && card_group1 & (1 << 2) != 0 {
+        return (
+            MmcBusTiming::UhsSdr50,
+            2,
+            100_000_000.min(base_clock_hz),
+            host_caps & SDHCI_TUNE_SDR50 != 0,
+        );
+    }
+    if host_caps & SDHCI_CAN_DDR50 != 0 && card_group1 & (1 << 4) != 0 {
+        return (
+            MmcBusTiming::UhsDdr50,
+            4,
+            50_000_000.min(base_clock_hz),
+            false,
+        );
+    }
+    if card_group1 & (1 << 1) != 0 {
+        return (
+            MmcBusTiming::UhsSdr25,
+            1,
+            50_000_000.min(base_clock_hz),
+            false,
+        );
+    }
+    (
+        MmcBusTiming::UhsSdr12,
+        0,
+        25_000_000.min(base_clock_hz),
+        false,
+    )
 }
 
 fn sd_switch_selected_function(status: &[u8; 64], function: u8) -> bool {
@@ -3451,6 +3576,7 @@ mod tests {
             timing_clock_hz: 50_000_000,
             bus_width: 4,
             last_tune_ns: Some(0),
+            tuning_enabled: true,
         };
         disk.retune_if_needed().unwrap();
         assert_eq!(disk.host.io.command >> 8, 21);
@@ -3484,6 +3610,7 @@ mod tests {
             timing_clock_hz: 50_000_000,
             bus_width: 8,
             last_tune_ns: Some(0),
+            tuning_enabled: true,
         };
         disk.retune_if_needed().unwrap();
         assert_eq!(disk.host.io.command >> 8, MMC_CMD_SWITCH as u16);
@@ -3879,6 +4006,21 @@ mod tests {
     }
 
     #[test]
+    fn sd_uhs_mode_selection_requires_host_and_card_support() {
+        let sdr104 = choose_sd_uhs_timing(SDHCI_CAN_SDR104, (1 << 3) | (1 << 2), 100_000_000);
+        assert_eq!(sdr104.0, MmcBusTiming::UhsSdr104);
+        assert_eq!(sdr104.1, 3);
+        assert_eq!(sdr104.2, 100_000_000);
+        assert!(sdr104.3);
+
+        let ddr50 = choose_sd_uhs_timing(SDHCI_CAN_DDR50, 1 << 4, 50_000_000);
+        assert_eq!(ddr50, (MmcBusTiming::UhsDdr50, 4, 50_000_000, false));
+
+        let safe = choose_sd_uhs_timing(SDHCI_CAN_SDR104, 0, 50_000_000);
+        assert_eq!(safe, (MmcBusTiming::UhsSdr12, 0, 25_000_000, false));
+    }
+
+    #[test]
     fn mmcsd_size_and_error_formatters_match_source_tables() {
         assert_eq!(pretty_size(999), (999, None));
         assert_eq!(pretty_size(1_000_000), (1, Some('M')));
@@ -4176,6 +4318,7 @@ mod tests {
             timing_clock_hz: 0,
             bus_width: 1,
             last_tune_ns: None,
+            tuning_enabled: false,
         };
         assert!(crate::BlockDriverOps::is_read_only(&disk));
         assert!(matches!(
@@ -4216,6 +4359,7 @@ mod tests {
             timing_clock_hz: 0,
             bus_width: 1,
             last_tune_ns: None,
+            tuning_enabled: false,
         };
         let areas = disk.into_partition_devices(true, 0);
         assert_eq!(areas.len(), 3);
@@ -4250,6 +4394,7 @@ mod tests {
             timing_clock_hz: 0,
             bus_width: 1,
             last_tune_ns: None,
+            tuning_enabled: false,
         };
         disk.flush_cache().unwrap();
         assert!(!disk.dirty);
@@ -4285,6 +4430,7 @@ mod tests {
             timing_clock_hz: 0,
             bus_width: 1,
             last_tune_ns: None,
+            tuning_enabled: false,
         };
         assert_eq!(disk.wait_ready(), Err(SdhciError::Controller(1 << 22)));
     }

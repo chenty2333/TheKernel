@@ -22,10 +22,12 @@ read-only by default; `mmc.allow_write=1` is required to permit writes, and the
 block driver itself enforces the write restriction. The PCI binding maps the
 FreeBSD `sdhci_devices[]` IDs and their quirk bits, but does not yet implement
 all behavior attached to those quirks, full card-removal lifecycle, 64-bit
-ADMA2, automatic SD UHS/1.8V negotiation, and the full upstream function set.
+ADMA2, and the full upstream function set.
 Removable SD negotiates SCR-supported four-bit mode
-and legacy CMD6 high-speed; UHS remains disabled until CMD11 signaling, voltage
-rollback, and tuning are connected to capability negotiation. The eMMC path
+and legacy CMD6 high-speed; when both ACMD41 S18A and host 1.8V capability are
+present it switches signaling voltage with CMD11 and selects SDR104/SDR50/DDR50
+only when both the card switch-status and host advertise them; SDR104 and
+required SDR50 tuning use CMD19. The eMMC path
 capability-gates 1.8V DDR52, HS200 (with CMD21 tuning), and HS400 on both
 EXT_CSD card bits and host support. Unsupported 1.2V modes are rejected because
 the generic host has no 1.2V switch operation.
@@ -91,10 +93,11 @@ and clears the dirty state only after command completion. The FreeBSD power-
 class selection fields are decoded and applied for the selected timing and bus
 width. The HS200/HS400 path uses 1.8V only and fails attach if the host/card
 transition or initial tuning fails; recovery after a failed voltage/timing
-transition is not available. MMC HS200/HS400 consumes Host Control2 retune
-interrupt requests and implements the mode-1 interval; HS400 re-enters HS200,
-runs CMD21, then restores the 52MHz DDR8-to-HS400 sequence. The SD UHS path and
-card-swap validation remain incomplete.
+transition is not available. MMC HS200/HS400 and SD SDR50/SDR104 consume Host
+Control2 retune interrupt requests and implement the mode-1 interval; HS400
+re-enters HS200, runs CMD21, then restores the 52MHz DDR8-to-HS400 sequence.
+The QEMU 1b36:0007 scenario validates SD guest formatting and I/O but is not a
+physical 1.8V signaling or removable-card swap test.
 
 On 2026-10-09, the inspect payload gained `sfdisk` and e2fsprogs; a blank 64 MiB
 QEMU SD card passed guest GPT creation, `BLKRRPART`, guest `mkfs.ext4`, mount,
