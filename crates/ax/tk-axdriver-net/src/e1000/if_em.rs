@@ -2708,6 +2708,141 @@ pub fn em_get_wakeup<N: EmWakeupNvm>(nvm: &mut N, config: EmWakeupConfig) -> EmW
     state
 }
 
+const BM_WUC_PAGE: u16 = 800;
+const BM_RCTL: u16 = 0;
+const BM_WUC: u16 = 1;
+const BM_WUFC: u16 = 2;
+const BM_WUS: u16 = 3;
+const BM_MTA_BASE: u16 = 128;
+const BM_RCTL_UPE: u16 = 0x0001;
+const BM_RCTL_MPE: u16 = 0x0002;
+const BM_RCTL_MO_MASK: u16 = 0x0018;
+const BM_RCTL_MO_SHIFT: u16 = 3;
+const BM_RCTL_BAM: u16 = 0x0020;
+const BM_RCTL_PMCF: u16 = 0x0040;
+const BM_RCTL_RFCE: u16 = 0x0080;
+const BM_WUC_ENABLE_BIT: u16 = 1 << 2;
+const BM_WUC_HOST_WU_BIT: u16 = 1 << 4;
+
+pub trait EmPhyWakeOps: super::chipich8::Ich8PhyRegOps {
+    fn copy_rx_addrs_to_phy(&mut self) -> DevResult;
+    fn enable_phy_wakeup_reg_access_bm(&mut self, saved: &mut u16) -> DevResult;
+    fn disable_phy_wakeup_reg_access_bm(&mut self, saved: &mut u16) -> DevResult;
+}
+
+/// upstream: if_em.c em_enable_phy_wakeup()
+pub fn em_enable_phy_wakeup<I: E1000RegisterIo, P: EmPhyWakeOps>(
+    io: &mut I,
+    phy: &mut P,
+    mta_reg_count: u16,
+    wake_filters: u32,
+    armed: &mut bool,
+) -> DevResult {
+    let result = (|| {
+        phy.copy_rx_addrs_to_phy()?;
+        phy.acquire()?;
+        let result = (|| {
+            let mut saved = 0;
+            phy.enable_phy_wakeup_reg_access_bm(&mut saved)?;
+            let access = (|| {
+                phy.write_reg_page(BM_WUC_PAGE, BM_WUS, u16::MAX)?;
+                for index in 0..mta_reg_count {
+                    let mta = io.read_register(E1000_MTA + u32::from(index) * 4)?;
+                    let phy_mta = BM_MTA_BASE + index * 2;
+                    phy.write_reg_page(BM_WUC_PAGE, phy_mta, mta as u16)?;
+                    phy.write_reg_page(BM_WUC_PAGE, phy_mta + 1, (mta >> 16) as u16)?;
+                }
+                let mut rctl = phy.read_reg_page(BM_WUC_PAGE, BM_RCTL)?;
+                let mac_rctl = io.read_register(E1000_RCTL)?;
+                if mac_rctl & E1000_RCTL_UPE != 0 {
+                    rctl |= BM_RCTL_UPE;
+                }
+                if mac_rctl & E1000_RCTL_MPE != 0 {
+                    rctl |= BM_RCTL_MPE;
+                }
+                rctl &= !BM_RCTL_MO_MASK;
+                if mac_rctl & E1000_RCTL_MO_3 != 0 {
+                    rctl |= (((mac_rctl & E1000_RCTL_MO_3) >> E1000_RCTL_MO_SHIFT) as u16)
+                        << BM_RCTL_MO_SHIFT;
+                }
+                if mac_rctl & E1000_RCTL_BAM != 0 {
+                    rctl |= BM_RCTL_BAM;
+                }
+                if mac_rctl & E1000_RCTL_PMCF != 0 {
+                    rctl |= BM_RCTL_PMCF;
+                }
+                if io.read_register(E1000_CTRL)? & E1000_CTRL_RFCE != 0 {
+                    rctl |= BM_RCTL_RFCE;
+                }
+                phy.write_reg_page(BM_WUC_PAGE, BM_RCTL, rctl)?;
+
+                let mut wuc = E1000_WUC_PME_EN;
+                if wake_filters & (E1000_WUFC_MAG | E1000_WUFC_LNKC) != 0 {
+                    wuc |= E1000_WUC_APME;
+                }
+                io.write_register(E1000_WUFC, wake_filters)?;
+                io.write_register(
+                    E1000_WUC,
+                    E1000_WUC_PHY_WAKE | E1000_WUC_APMPME | E1000_WUC_PME_STATUS | wuc,
+                )?;
+                phy.write_reg_page(BM_WUC_PAGE, BM_WUFC, wake_filters as u16)?;
+                phy.write_reg_page(BM_WUC_PAGE, BM_WUC, wuc as u16)?;
+                Ok(())
+            })();
+            if access.is_ok() {
+                saved |= BM_WUC_ENABLE_BIT | BM_WUC_HOST_WU_BIT;
+            } else {
+                saved &= !BM_WUC_HOST_WU_BIT;
+            }
+            let restore = phy.disable_phy_wakeup_reg_access_bm(&mut saved);
+            access.and(restore)
+        })();
+        phy.release();
+        result
+    })();
+    *armed = result.is_ok();
+    result
+}
+
+/// upstream: if_em.c em_disable_phy_wakeup()
+pub fn em_disable_phy_wakeup<P: EmPhyWakeOps>(
+    phy: &mut P,
+    armed: &mut bool,
+    wake_status: Option<&mut u16>,
+) -> DevResult {
+    phy.acquire()?;
+    let result = (|| {
+        let mut saved = 0;
+        phy.enable_phy_wakeup_reg_access_bm(&mut saved)?;
+        let mut status = 0;
+        let read_status = phy.read_reg_page(BM_WUC_PAGE, BM_WUS);
+        let mut error = match read_status {
+            Ok(value) => {
+                status = value;
+                phy.write_reg_page(BM_WUC_PAGE, BM_WUS, u16::MAX)
+            }
+            Err(error) => Err(error),
+        };
+        saved &= !BM_WUC_HOST_WU_BIT;
+        let restore = phy.disable_phy_wakeup_reg_access_bm(&mut saved);
+        if error.is_ok() {
+            error = restore;
+        }
+        error.map(|()| status)
+    })();
+    phy.release();
+    match result {
+        Ok(status) => {
+            *armed = false;
+            if let Some(wake_status) = wake_status {
+                *wake_status = status;
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub trait EmRxUnitOps {
     fn initialize_rss(&mut self) -> DevResult;
     fn initialize_advanced_rx_rings(&mut self, drop: bool) -> DevResult;
@@ -4394,6 +4529,65 @@ mod tests {
         pme_clears: usize,
         busmaster_disables: usize,
     }
+
+    #[derive(Default)]
+    struct PhyWakeMock {
+        regs: BTreeMap<(u16, u16), u16>,
+        copied_rars: usize,
+        enabled_state: u16,
+        saved_on_disable: Vec<u16>,
+        acquired: usize,
+        released: usize,
+    }
+    impl super::super::chipich8::Ich8PhyRegOps for PhyWakeMock {
+        fn read_reg(&mut self, reg: u16) -> DevResult<u16> {
+            Ok(self.regs.get(&(0, reg)).copied().unwrap_or(0))
+        }
+        fn write_reg(&mut self, reg: u16, value: u16) -> DevResult {
+            self.regs.insert((0, reg), value);
+            Ok(())
+        }
+        fn read_reg_page(&mut self, page: u16, reg: u16) -> DevResult<u16> {
+            Ok(self.regs.get(&(page, reg)).copied().unwrap_or(0))
+        }
+        fn read_reg_locked(&mut self, reg: u16) -> DevResult<u16> {
+            self.read_reg(reg)
+        }
+        fn write_reg_locked(&mut self, reg: u16, value: u16) -> DevResult {
+            self.write_reg(reg, value)
+        }
+        fn acquire(&mut self) -> DevResult {
+            self.acquired += 1;
+            Ok(())
+        }
+        fn release(&mut self) {
+            self.released += 1;
+        }
+        fn write_reg_page(&mut self, page: u16, reg: u16, value: u16) -> DevResult {
+            self.regs.insert((page, reg), value);
+            Ok(())
+        }
+        fn wakeup_reg_access(&mut self, enable: bool, saved: &mut u16) -> DevResult {
+            if enable {
+                *saved = self.enabled_state;
+            }
+            Ok(())
+        }
+    }
+    impl EmPhyWakeOps for PhyWakeMock {
+        fn copy_rx_addrs_to_phy(&mut self) -> DevResult {
+            self.copied_rars += 1;
+            Ok(())
+        }
+        fn enable_phy_wakeup_reg_access_bm(&mut self, saved: &mut u16) -> DevResult {
+            *saved = self.enabled_state;
+            Ok(())
+        }
+        fn disable_phy_wakeup_reg_access_bm(&mut self, saved: &mut u16) -> DevResult {
+            self.saved_on_disable.push(*saved);
+            Ok(())
+        }
+    }
     impl EmEnableWakeOps for EnableWakeMock {
         fn update_multicast_addresses(&mut self, _count: usize) -> DevResult {
             self.actions.push("mta");
@@ -4907,5 +5101,59 @@ mod tests {
         .unwrap();
         assert!(vf_io.0.is_empty());
         assert!(vf_ops.actions.is_empty());
+    }
+
+    #[test]
+    fn phy_wake_register_transfer_and_host_ownership_restore() {
+        let mut io = RegisterMock::default();
+        io.0.insert(E1000_MTA, 0x1122_3344);
+        io.0.insert(
+            E1000_RCTL,
+            E1000_RCTL_UPE | E1000_RCTL_MO_3 | E1000_RCTL_BAM | E1000_RCTL_PMCF,
+        );
+        io.0.insert(E1000_CTRL, E1000_CTRL_RFCE);
+        let mut phy = PhyWakeMock {
+            enabled_state: 0x20,
+            ..PhyWakeMock::default()
+        };
+        let mut armed = false;
+        em_enable_phy_wakeup(
+            &mut io,
+            &mut phy,
+            1,
+            E1000_WUFC_MAG | E1000_WUFC_EX,
+            &mut armed,
+        )
+        .unwrap();
+        assert!(armed);
+        assert_eq!(phy.regs[&(BM_WUC_PAGE, BM_WUS)], u16::MAX);
+        assert_eq!(phy.regs[&(BM_WUC_PAGE, BM_MTA_BASE)], 0x3344);
+        assert_eq!(phy.regs[&(BM_WUC_PAGE, BM_MTA_BASE + 1)], 0x1122);
+        let rctl = phy.regs[&(BM_WUC_PAGE, BM_RCTL)];
+        assert_eq!(
+            rctl & (BM_RCTL_UPE | BM_RCTL_MO_MASK | BM_RCTL_BAM | BM_RCTL_PMCF | BM_RCTL_RFCE),
+            0xf9
+        );
+        assert_eq!(
+            phy.regs[&(BM_WUC_PAGE, BM_WUFC)],
+            (E1000_WUFC_MAG | E1000_WUFC_EX) as u16
+        );
+        assert_eq!(
+            phy.saved_on_disable,
+            [0x20 | BM_WUC_ENABLE_BIT | BM_WUC_HOST_WU_BIT]
+        );
+
+        phy.regs.insert((BM_WUC_PAGE, BM_WUS), 0x0045);
+        phy.enabled_state = 0x34;
+        let mut status = 0;
+        em_disable_phy_wakeup(&mut phy, &mut armed, Some(&mut status)).unwrap();
+        assert!(!armed);
+        assert_eq!(status, 0x45);
+        assert_eq!(phy.regs[&(BM_WUC_PAGE, BM_WUS)], u16::MAX);
+        assert_eq!(
+            phy.saved_on_disable.last(),
+            Some(&(0x34 & !BM_WUC_HOST_WU_BIT))
+        );
+        assert_eq!((phy.acquired, phy.released), (2, 2));
     }
 }
