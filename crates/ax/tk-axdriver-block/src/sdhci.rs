@@ -386,6 +386,20 @@ pub struct MmcExtCsd {
     pub boot_sectors: u32,
     pub rpmb_sectors: u32,
     pub erase_group_sectors: u32,
+    pub power_classes: MmcPowerClasses,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MmcPowerClasses {
+    pub pwr_cl_26_195: u8,
+    pub pwr_cl_52_195: u8,
+    pub pwr_cl_52_195_ddr: u8,
+    pub pwr_cl_200_195: u8,
+    pub pwr_cl_26_360: u8,
+    pub pwr_cl_52_360: u8,
+    pub pwr_cl_52_360_ddr: u8,
+    pub pwr_cl_200_360: u8,
+    pub pwr_cl_200_360_ddr: u8,
 }
 
 /// Stable identity fields decoded from SD or MMC CID.
@@ -490,6 +504,61 @@ pub fn timing_to_data_rate(timing: MmcBusTiming, normal_hz: u32, high_speed_hz: 
             200_000_000
         }
     }
+}
+
+// upstream: mmc.c mmc_set_power_class()
+pub fn mmc_power_class_value(
+    csd_spec_version: u8,
+    ocr: u32,
+    clock_hz: u32,
+    bus_width: u8,
+    timing: MmcBusTiming,
+    classes: MmcPowerClasses,
+) -> Option<u8> {
+    if csd_spec_version < 4 || timing == MmcBusTiming::Normal || bus_width == 1 {
+        return Some(0);
+    }
+    let voltage = mmc_highest_voltage(ocr).and_then(|shift| 1u32.checked_shl(shift))?;
+    let value = if voltage == MMC_OCR_LOW_VOLTAGE {
+        if clock_hz <= 26_000_000 {
+            classes.pwr_cl_26_195
+        } else if clock_hz <= 52_000_000 {
+            if timing == MmcBusTiming::MmcDdr52 && bus_width >= 4 {
+                classes.pwr_cl_52_195_ddr
+            } else {
+                classes.pwr_cl_52_195
+            }
+        } else if clock_hz <= 200_000_000 {
+            classes.pwr_cl_200_195
+        } else {
+            0
+        }
+    } else if (1 << 17..=1 << 23).contains(&voltage) {
+        if clock_hz <= 26_000_000 {
+            classes.pwr_cl_26_360
+        } else if clock_hz <= 52_000_000 {
+            if timing == MmcBusTiming::MmcDdr52 && bus_width >= 4 {
+                classes.pwr_cl_52_360_ddr
+            } else {
+                classes.pwr_cl_52_360
+            }
+        } else if clock_hz <= 200_000_000 {
+            if bus_width == 8 {
+                classes.pwr_cl_200_360_ddr
+            } else {
+                classes.pwr_cl_200_360
+            }
+        } else {
+            0
+        }
+    } else {
+        return None;
+    };
+    Some(if bus_width == 8 {
+        (value & 0xf0) >> 4
+    } else {
+        value & 0x0f
+    })
 }
 
 // upstream: mmc.c mmc_timing_to_string()
@@ -706,6 +775,17 @@ pub fn parse_ext_csd(bytes: &[u8; 512]) -> MmcExtCsd {
         boot_sectors: u32::from(bytes[226]) * 256,
         rpmb_sectors: u32::from(bytes[168]) * 256,
         erase_group_sectors: u32::from(bytes[224]) * 1024,
+        power_classes: MmcPowerClasses {
+            pwr_cl_52_195: bytes[200],
+            pwr_cl_26_195: bytes[201],
+            pwr_cl_52_360: bytes[202],
+            pwr_cl_26_360: bytes[203],
+            pwr_cl_200_195: bytes[236],
+            pwr_cl_200_360: bytes[237],
+            pwr_cl_52_195_ddr: bytes[238],
+            pwr_cl_52_360_ddr: bytes[239],
+            pwr_cl_200_360_ddr: bytes[253],
+        },
     }
 }
 
@@ -1257,6 +1337,30 @@ impl<I: SdhciIo> SdhciHost<I> {
         };
         self.mmc_switch(185, hs_timing)?;
         self.set_high_speed(target_hz)
+    }
+
+    // upstream: mmc.c mmc_set_power_class() EXT_CSD switch
+    fn set_mmc_power_class(
+        &mut self,
+        csd_spec_version: u8,
+        ext_csd: MmcExtCsd,
+        clock_hz: u32,
+        bus_width: u8,
+        timing: MmcBusTiming,
+    ) -> Result<(), SdhciError> {
+        let value = mmc_power_class_value(
+            csd_spec_version,
+            self.power,
+            clock_hz,
+            bus_width,
+            timing,
+            ext_csd.power_classes,
+        )
+        .ok_or(SdhciError::UnsupportedClock)?;
+        if value != 0 {
+            self.mmc_switch(187, value)?;
+        }
+        Ok(())
     }
 
     /// Issue one command and optional PIO data transfer. Multi-block requests
@@ -2028,7 +2132,15 @@ impl<I: SdhciIo> SdhciDisk<I> {
                 } else {
                     26_000_000
                 };
-                host.set_mmc_timing(MmcBusTiming::HighSpeed, target.min(host.base_clock_hz))?;
+                let target = target.min(host.base_clock_hz);
+                host.set_mmc_timing(MmcBusTiming::HighSpeed, target)?;
+                host.set_mmc_power_class(
+                    csd_info.spec_version,
+                    ext_csd.expect("EXT_CSD was read for high-capacity MMC"),
+                    target,
+                    bus_width,
+                    MmcBusTiming::HighSpeed,
+                )?;
             }
             // PARTITION_CONFIG is intentionally retained for future boot/RPMB
             // child devices; the current registry exposes only user area.
@@ -2800,6 +2912,8 @@ mod tests {
         bytes[226] = 4;
         bytes[168] = 2;
         bytes[224] = 7;
+        bytes[202] = 0xa5;
+        bytes[239] = 0xb6;
         assert_eq!(
             parse_ext_csd(&bytes),
             MmcExtCsd {
@@ -2810,7 +2924,56 @@ mod tests {
                 boot_sectors: 1024,
                 rpmb_sectors: 512,
                 erase_group_sectors: 7168,
+                power_classes: MmcPowerClasses {
+                    pwr_cl_52_360: 0xa5,
+                    pwr_cl_52_360_ddr: 0xb6,
+                    ..MmcPowerClasses::default()
+                },
             }
+        );
+    }
+
+    #[test]
+    fn mmc_power_class_selects_voltage_rate_timing_and_width_nibble() {
+        let classes = MmcPowerClasses {
+            pwr_cl_26_360: 0x21,
+            pwr_cl_52_360: 0xa5,
+            pwr_cl_52_360_ddr: 0xb6,
+            pwr_cl_26_195: 0x43,
+            ..MmcPowerClasses::default()
+        };
+        assert_eq!(
+            mmc_power_class_value(
+                4,
+                MMC_OCR_330_340,
+                50_000_000,
+                4,
+                MmcBusTiming::HighSpeed,
+                classes,
+            ),
+            Some(5)
+        );
+        assert_eq!(
+            mmc_power_class_value(
+                4,
+                MMC_OCR_330_340,
+                50_000_000,
+                8,
+                MmcBusTiming::MmcDdr52,
+                classes,
+            ),
+            Some(11)
+        );
+        assert_eq!(
+            mmc_power_class_value(
+                3,
+                MMC_OCR_330_340,
+                26_000_000,
+                4,
+                MmcBusTiming::HighSpeed,
+                classes,
+            ),
+            Some(0)
         );
     }
 
@@ -3177,6 +3340,7 @@ mod tests {
                 boot_sectors: 4096,
                 rpmb_sectors: 2048,
                 erase_group_sectors: 1024,
+                ..MmcExtCsd::default()
             }),
             active_partition: 0,
             read_only: false,
