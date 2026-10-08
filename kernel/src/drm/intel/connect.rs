@@ -85,7 +85,9 @@ fn dpcd_link_ceiling(caps: &[u8; 16]) -> Option<(u32, u8)> {
         0x04 => 1_350_000, // UHBR13.5
         code => u32::from(code) * 27_000,
     };
-    let lanes = caps[2] & 0x1f;
+    let mut sink_caps = intel_display::intel_dp_full::DpSinkCaps::default();
+    sink_caps.dpcd.extend_from_slice(caps);
+    let lanes = intel_display::intel_dp_full::max_dprx_lane_count(&sink_caps);
     if rate == 0 || !matches!(lanes, 1 | 2 | 4) {
         None
     } else {
