@@ -352,17 +352,45 @@ impl<T: UsbTransport> Adapter<T> {
     /// Send an HCI command and read its matching Command Complete event. This
     /// is used by the Intel boot-time firmware query sequence.
     pub fn command_complete(&mut self, command: &[u8], event: &mut [u8]) -> Result<usize, Error> {
-        let parsed = Packet::parse(PacketType::Command, command)?;
+        let parsed = match Packet::parse(PacketType::Command, command) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+                return Err(error);
+            }
+        };
         if !self.up {
             return Err(Error::NotUp);
         }
         let opcode = u16::from_le_bytes([parsed.payload[0], parsed.payload[1]]);
-        self.transport.control_command(command)?;
-        let length = self.transport.read_interrupt_event(event)?;
+        if let Err(error) = self.transport.control_command(command) {
+            self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+            return Err(error);
+        }
+        self.stats.cmd_tx = self.stats.cmd_tx.saturating_add(1);
+        self.stats.byte_tx = self.stats.byte_tx.saturating_add(command.len() as u32);
+        self.queue_monitor(2, command);
+        let length = match self.transport.read_interrupt_event(event) {
+            Ok(length) => length,
+            Err(error) => {
+                self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                return Err(error);
+            }
+        };
         if length > event.len() {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
             return Err(Error::InvalidLength);
         }
-        let received = Packet::parse(PacketType::Event, &event[..length])?;
+        let received = match Packet::parse(PacketType::Event, &event[..length]) {
+            Ok(received) => received,
+            Err(error) => {
+                self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                return Err(error);
+            }
+        };
+        self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
+        self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
+        self.queue_monitor(3, &event[..length]);
         if received.payload[0] == 0xff {
             return Ok(length);
         }
@@ -455,11 +483,37 @@ impl<T: UsbTransport> Adapter<T> {
             command[0..2].copy_from_slice(&record.opcode.to_le_bytes());
             command[2] = record.parameters.len() as u8;
             command[3..3 + record.parameters.len()].copy_from_slice(record.parameters);
-            self.transport
-                .control_command(&command[..3 + record.parameters.len()])?;
-            for (_event_code, expected) in record.expected_events {
-                let length = self.transport.read_interrupt_event(&mut event)?;
-                if length != expected.len() + 2 || event[2..length] != *expected {
+            let command_length = 3 + record.parameters.len();
+            if let Err(error) = self.transport.control_command(&command[..command_length]) {
+                self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+                return Err(error);
+            }
+            self.stats.cmd_tx = self.stats.cmd_tx.saturating_add(1);
+            self.stats.byte_tx = self.stats.byte_tx.saturating_add(command_length as u32);
+            self.queue_monitor(2, &command[..command_length]);
+            for (expected_code, expected) in record.expected_events {
+                let length = match self.transport.read_interrupt_event(&mut event) {
+                    Ok(length) => length,
+                    Err(error) => {
+                        self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                        return Err(error);
+                    }
+                };
+                if length > event.len() {
+                    self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                    return Err(Error::InvalidLength);
+                }
+                let received = match Packet::parse(PacketType::Event, &event[..length]) {
+                    Ok(received) => received,
+                    Err(error) => {
+                        self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                        return Err(error);
+                    }
+                };
+                self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
+                self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
+                self.queue_monitor(3, &event[..length]);
+                if received.payload[0] != expected_code || received.payload[2..] != *expected {
                     return Err(Error::InvalidLength);
                 }
             }
@@ -895,6 +949,40 @@ mod tests {
             }]
         );
         assert_eq!(parse_patch(&[1, 0x01]), Err(FirmwareError::InvalidPatch));
+    }
+
+    #[test]
+    fn intel_patch_validates_expected_event_code_and_updates_hci_stats() {
+        let image = [1, 0x8e, 0xfc, 1, 0xaa, 2, 0x0e, 1, 0];
+        let mut adapter = Adapter::new(
+            FirmwareFake {
+                events: VecDeque::from([vec![0x0e, 1, 0]]),
+                bulk: Vec::new(),
+            },
+            0,
+        );
+        adapter.set_up(true).unwrap();
+        assert_eq!(adapter.run_intel_patch(&image), Ok(true));
+        assert_eq!(
+            adapter.statistics(),
+            Statistics {
+                cmd_tx: 1,
+                evt_rx: 1,
+                byte_tx: 4,
+                byte_rx: 3,
+                ..Statistics::default()
+            }
+        );
+
+        let mut adapter = Adapter::new(
+            FirmwareFake {
+                events: VecDeque::from([vec![0x0f, 1, 0]]),
+                bulk: Vec::new(),
+            },
+            0,
+        );
+        adapter.set_up(true).unwrap();
+        assert_eq!(adapter.run_intel_patch(&image), Err(Error::InvalidLength));
     }
 
     #[test]
