@@ -9,3 +9,6 @@ aes = { version = "0.8.4", default-features = false }
 
 [package.metadata.thekernel]
 layer = "platform"
+
+[package.metadata.thekernel.host-test]
+selected = true

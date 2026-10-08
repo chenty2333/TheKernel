@@ -12,3 +12,6 @@ tk-net80211 = { path = "../tk-net80211", version = "0.1.0" }
 
 [package.metadata.thekernel]
 layer = "platform"
+
+[package.metadata.thekernel.host-test]
+selected = true
