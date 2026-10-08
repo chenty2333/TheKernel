@@ -60,6 +60,28 @@ pub enum NodeAllocError {
     DuplicateAddress,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeCopyEffects {
+    pub reset_node_timeouts: bool,
+    pub delete_block_ack_state: bool,
+    pub release_rx_reorder_buffers: bool,
+    pub retire_unreference_callback: bool,
+    pub reinitialize_hostap_power_save_queue: bool,
+}
+
+/// Replace a node's owned station record and request source timeout reset.
+// upstream: ieee80211_node.c ieee80211_node_copy()
+pub fn copy_node_state(destination: &mut NodeRecord, source: &NodeRecord) -> NodeCopyEffects {
+    *destination = source.clone();
+    NodeCopyEffects {
+        reset_node_timeouts: true,
+        delete_block_ack_state: true,
+        release_rx_reorder_buffers: true,
+        retire_unreference_callback: true,
+        reinitialize_hostap_power_save_queue: false,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeTable {
     nodes: BTreeMap<[u8; 6], NodeRecord>,
@@ -312,5 +334,28 @@ mod tests {
         assert!(find_node(&table, &expired).is_none());
         assert!(find_node(&table, &referenced).is_some());
         assert!(find_node(&table, &young).is_some());
+    }
+
+    #[test]
+    fn node_copy_owns_saved_information_elements_and_requests_timeout_reset() {
+        let mut source = setup_empty_node();
+        source.saved_rsn_ie = alloc::vec![48, 1, 7];
+        let mut destination = setup_empty_node();
+        destination.saved_wpa_ie = alloc::vec![221, 1, 9];
+        let effects = copy_node_state(&mut destination, &source);
+        assert_eq!(destination.saved_rsn_ie, [48, 1, 7]);
+        assert!(destination.saved_wpa_ie.is_empty());
+        assert_eq!(
+            effects,
+            NodeCopyEffects {
+                reset_node_timeouts: true,
+                delete_block_ack_state: true,
+                release_rx_reorder_buffers: true,
+                retire_unreference_callback: true,
+                reinitialize_hostap_power_save_queue: false,
+            }
+        );
+        source.saved_rsn_ie[2] = 8;
+        assert_eq!(destination.saved_rsn_ie, [48, 1, 7]);
     }
 }

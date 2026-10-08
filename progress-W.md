@@ -108,3 +108,5 @@
 - `ieee80211_node.c` `ieee80211_node_leave_ht()` now clears HT capability flags and returns BA/reorder owner cleanup effects; node.c marker coverage advances from 45/110 to 46/110.
 - `ieee80211_node.c` `ieee80211_node_leave_11g()` now reports short-slot/protection/preamble changes when the final incompatible peer leaves; node.c marker coverage advances from 46/110 to 47/110.
 - `ieee80211_node.c` `ieee80211_node_raise_inact()` and `ieee80211_clean_inactive_nodes()` now age and collect unreferenced station scan nodes; node.c marker coverage advances from 47/110 to 49/110.
+- `ieee80211_node.c` `ieee80211_node_copy()` now replaces node-owned state/IE storage and emits timeout-reset effects; node.c marker coverage advances from 49/110 to 50/110, and the station BSS join consumes the copy helper.
+- Node-copy effects used by the station BSS join now also request destination BA/reorder teardown and unreference-callback retirement before replacing BSS state.

@@ -282,3 +282,8 @@ Station scan nodes now carry the OpenBSD inactivity age, increment only while
 unreferenced, cap at INACT_SCAN, and are removed at the caller's selected age
 only when no node references remain. The hardware/refcount owner supplies the
 reference predicate to the cache collector.
+
+`ieee80211_node_copy()` now performs a deep owned record replacement (including
+saved RSN/WPA IE buffers), requests timeout reset, BA/reorder teardown and
+unreference-callback retirement, and leaves AP-only power-save queue
+initialization disabled for the station-only iwx use path.
