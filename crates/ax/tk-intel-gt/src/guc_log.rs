@@ -57,6 +57,41 @@ pub fn control_log_action(level: u32) -> Result<[u32; 2], Error> {
     Ok([ACTION_UK_LOG_ENABLE_LOGGING, control])
 }
 
+/// Runtime log-level state. The caller serializes access and holds runtime PM
+/// while `send` performs the CT request.
+pub struct GucLogController {
+    level: u8,
+}
+
+impl GucLogController {
+    pub const fn new(level: u8) -> Self {
+        Self { level }
+    }
+
+    pub const fn level(&self) -> u8 {
+        self.level
+    }
+
+    /// Avoid duplicate control messages and commit the new level only after
+    /// the synchronous GuC action succeeds.
+    /// upstream: intel_guc_log.c intel_guc_log_set_level().
+    pub fn set_level(
+        &mut self,
+        level: u32,
+        mut send: impl FnMut([u32; 2]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if level > u32::from(GUC_LOG_LEVEL_MAX) {
+            return Err(Error::Refused);
+        }
+        if self.level == level as u8 {
+            return Ok(());
+        }
+        send(control_log_action(level)?)?;
+        self.level = level as u8;
+        Ok(())
+    }
+}
+
 /// CT action sent after the host has consumed a flush-to-file notification.
 /// upstream: intel_guc_log.c guc_action_flush_log_complete().
 pub const fn flush_log_complete_action() -> [u32; 2] {
@@ -465,6 +500,32 @@ mod tests {
         assert_eq!(control_log_action(6), Err(Error::Refused));
         assert_eq!(flush_log_complete_action(), [0x30, 0]);
         assert_eq!(force_log_flush_action(), [0x302, 0]);
+    }
+
+    #[test]
+    fn log_level_change_skips_duplicates_and_commits_only_after_success() {
+        let mut controller = GucLogController::new(1);
+        let mut sent = Vec::new();
+        controller
+            .set_level(1, |action| {
+                sent.push(action);
+                Ok(())
+            })
+            .unwrap();
+        assert!(sent.is_empty());
+        assert_eq!(
+            controller.set_level(3, |_action| Err(Error::Quarantined)),
+            Err(Error::Quarantined)
+        );
+        assert_eq!(controller.level(), 1);
+        controller
+            .set_level(3, |action| {
+                sent.push(action);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(controller.level(), 3);
+        assert_eq!(sent, [[ACTION_UK_LOG_ENABLE_LOGGING, 0x111]]);
     }
 
     #[test]

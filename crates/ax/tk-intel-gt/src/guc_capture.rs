@@ -339,12 +339,13 @@ pub fn capture_list_register_count(
     base: Option<&CaptureRegisterList<'_>>,
     extended: Option<&CaptureRegisterList<'_>>,
 ) -> Result<usize, CaptureError> {
-    base.map_or(Ok(0), |entry| Ok(entry.registers.len()))
-        .and_then(|count| {
-            count
-                .checked_add(extended.map_or(0, |entry| entry.registers.len()))
-                .ok_or(CaptureError::InvalidBuffer)
-        })
+    let Some(base) = base else {
+        return Ok(0);
+    };
+    base.registers
+        .len()
+        .checked_add(extended.map_or(0, |entry| entry.registers.len()))
+        .ok_or(CaptureError::InvalidBuffer)
 }
 
 /// Compute the page-aligned size returned by `intel_guc_capture_getlistsize`.
@@ -1340,6 +1341,7 @@ mod tests {
         let class = get_one_list(&lists, 0, 1, 2).unwrap();
         let extension = get_one_list(&extensions, 0, 1, 2);
         assert_eq!(capture_list_register_count(Some(class), extension), Ok(2));
+        assert_eq!(capture_list_register_count(None, extension), Ok(0));
         assert_eq!(capture_list_size(2), Ok(PAGE_SIZE));
         let bytes = build_ads_capture_list_from_groups(class, extension).unwrap();
         assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 2);

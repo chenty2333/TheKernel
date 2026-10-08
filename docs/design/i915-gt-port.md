@@ -27,7 +27,7 @@ Rust 侧复用 `kernel/src/drm/intel/{gt.rs,gt_probe.rs,gem_exec.rs,gem_context.
 
 `guc_capture.rs` 是 `intel_guc_capture.c` 的数据面切片：按上游 ring 语义解包跨环的 group/capture/register 记录，快照 log state 并按 overflow/invalid offset 选择全环重读，保留原始 metadata/order、跳过未知 capture type，依赖引擎 reset group 将 lists 切分为节点并克隆 shared global/class data，含 1536 节点/每 list 有界寄存器池并在压力下回收 outlist 节点，按 GuC ID、context ID 和页对齐 LRCA 匹配/移除节点并提取 IPEHR/INSTDONE，含 Xe_LP 静态寄存器 offset/name 表、按拓扑展开 steered registers、选择 base/ext register lists，构造 page-aligned ADS list、3x overbuffer size assessment 和可独立调用的 coredump text formatter。ADS owner wire-up、cache node 与 CT event/coredump 真实生命周期接入仍未完成。
 
-`guc_log.rs` 已有 log sizing、overflow/read-pointer/relay snapshot 之外，补齐 control-log、force-flush 与 flush-complete 的 GuC action payload；log DMA/relay 工作线程以及 CT action callers 仍未接入。
+`guc_log.rs` 已有 log sizing、overflow/read-pointer/relay snapshot 之外，补齐 control-log、force-flush、flush-complete 的 GuC action payload，并实现重复 level request elision/成功后提交状态的 controller；log DMA/relay 工作线程以及 CT action callers 仍未接入。
 
 uC firmware upload 现在在 HuC/GuC DMA 前根据 CSS+uKernel upload size 计算 2 MiB Gen12 WOPCM partition，验证 locked/valid state 与 firmware/reserved bounds，再按上游顺序写入并回读验证 `GUC_WOPCM_SIZE` 和 `DMA_GUC_WOPCM_OFFSET`；接着执行仅 GuC 域的 GDRST（Gen12.0 双复位 + 50us settle）。此调用仅适用于当前集成 GT 目标；media-GT 的 BIOS/deprivileged pre-lock layout 未接入。
 
