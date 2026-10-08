@@ -119,3 +119,8 @@ log stopped immediately after BSP CPU feature/enable messages; no VT-d-stage
 log or guest marker was observed, so the exact stall point is unknown. The
 identity-by-default fallback remains in place; translated DMA and interrupt
 remapping are not accepted and must not be enabled by default.
+
+Follow-up `busdma_iommu.c` coverage adds the page-array loader and contiguous
+physical loader seams (`iommu_bus_dmamap_load_ma` and `_load_phys`), raising
+mapped source functions to 4/34. VM page-object discovery and virtual-buffer
+`pmap_extract` stay caller-supplied framework inputs.

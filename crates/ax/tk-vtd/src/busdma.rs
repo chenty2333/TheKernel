@@ -2,8 +2,10 @@
 //!
 //! Translated from FreeBSD `sys/dev/iommu/busdma_iommu.c` (BSD-2-Clause;
 //! FreeBSD source snapshot 2026-10-08). Copyright (c) 2013 The FreeBSD
-//! Foundation. The busdma tag/callback, VM-page, taskqueue, and KMSAN framework
-//! are represented by TheKernel's DMA facade and caller-owned physical ranges.
+//! Foundation. This software was developed by Konstantin Belousov
+//! <kib@FreeBSD.org> under sponsorship from the FreeBSD Foundation. The busdma
+//! tag/callback, VM-page, taskqueue, and KMSAN framework are represented by
+//! TheKernel's DMA facade and caller-owned physical ranges.
 
 use alloc::vec::Vec;
 
@@ -111,6 +113,71 @@ impl DmaMap {
             }
         }
         Ok(output)
+    }
+
+    /// Load a scatter/gather list of physical pages with an initial page offset.
+    // upstream: busdma_iommu.c iommu_bus_dmamap_load_ma()
+    pub fn load_pages<B: Backend>(
+        &mut self,
+        dma: &mut Dma<B>,
+        requester: PciRequester,
+        pages: &[u64],
+        first_offset: usize,
+        length: usize,
+        direction: Direction,
+        limits: Constraints,
+    ) -> Result<Vec<(u64, usize)>, Error> {
+        const PAGE_SIZE: usize = 4096;
+        if first_offset >= PAGE_SIZE || (length != 0 && pages.is_empty()) {
+            return Err(Error::InvalidRange);
+        }
+        let page_count = first_offset
+            .checked_add(length)
+            .and_then(|span| span.checked_add(PAGE_SIZE - 1))
+            .ok_or(Error::InvalidRange)?
+            / PAGE_SIZE;
+        if page_count > pages.len() {
+            return Err(Error::InvalidRange);
+        }
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(page_count)
+            .map_err(|_| Error::OutOfMemory)?;
+        let mut remaining = length;
+        let mut page_offset = first_offset;
+        for &page in pages.iter().take(page_count) {
+            if page & (PAGE_SIZE as u64 - 1) != 0 {
+                return Err(Error::InvalidRange);
+            }
+            let chunk = remaining.min(PAGE_SIZE - page_offset);
+            if chunk != 0 {
+                ranges.push((
+                    page.checked_add(page_offset as u64)
+                        .ok_or(Error::InvalidRange)?,
+                    chunk,
+                ));
+                remaining -= chunk;
+            }
+            page_offset = 0;
+        }
+        if remaining != 0 {
+            return Err(Error::InvalidRange);
+        }
+        self.load(dma, requester, &ranges, direction, limits)
+    }
+
+    /// Load one contiguous physical extent through the generic segment mapper.
+    // upstream: busdma_iommu.c iommu_bus_dmamap_load_phys()
+    pub fn load_phys<B: Backend>(
+        &mut self,
+        dma: &mut Dma<B>,
+        requester: PciRequester,
+        physical: u64,
+        length: usize,
+        direction: Direction,
+        limits: Constraints,
+    ) -> Result<Vec<(u64, usize)>, Error> {
+        self.load(dma, requester, &[(physical, length)], direction, limits)
     }
 
     /// Tear down all IOMMU entries owned by this map.
@@ -232,6 +299,26 @@ mod tests {
         );
         assert_eq!(result, Err(Error::MapFailed));
         assert!(map.mappings().is_empty());
+        assert!(dma.into_backend().active.is_empty());
+    }
+
+    #[test]
+    fn load_ma_preserves_page_offset_across_scattered_physical_pages() {
+        let (mut dma, requester) = setup();
+        let mut map = DmaMap::default();
+        let segments = map
+            .load_pages(
+                &mut dma,
+                requester,
+                &[0x10_000, 0x30_000],
+                0x800,
+                0x1000,
+                Direction::FromDevice,
+                Constraints::unrestricted(),
+            )
+            .unwrap();
+        assert_eq!(segments, vec![(0x11_800, 0x800), (0x31_000, 0x800)]);
+        map.unload(&mut dma, requester).unwrap();
         assert!(dma.into_backend().active.is_empty());
     }
 }
