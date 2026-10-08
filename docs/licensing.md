@@ -689,3 +689,7 @@ functions from `intel_gmbus.c` (MIT, © 2006 Dave Airlie and © 2006-2008,
 `tk-intel-display/src/intel_hotplug_full.rs` translates 37 HPD policy and
 workqueue functions from `intel_hotplug.c` (MIT, © 2015 Intel); its module
 header preserves the complete grant.
+
+`tk-intel-display/src/intel_dp_full.rs` translates 284 DisplayPort policy and
+configuration functions from `intel_dp.c` (MIT, © 2008 Intel). Its grant is
+included in `LICENSE-MIT`.

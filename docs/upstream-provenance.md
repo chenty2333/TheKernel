@@ -1220,3 +1220,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `kernel/src/drm/intel/regs/aux.rs` declares the display-12/13 DP AUX channel A/B control and data register offsets from `intel_dp_aux_regs.h` (MIT, Copyright © 2023 Intel Corporation). No channel-specific kernel transfer backend is enabled by the declarations.
 
 `crates/ax/tk-intel-display/src/intel_hotplug_full.rs` translates 37 of 44 functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_hotplug.c` (MIT, Copyright © 2015 Intel); seven debugfs storm-control wrappers are omitted. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_dp_full.rs` translates 284 of 287 functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_dp.c` (MIT, Copyright © 2008 Intel); omissions are two generic DRM property attachment wrappers and the display-14+-only MTL source-rate helper. `LICENSE-MIT`.
