@@ -30,12 +30,29 @@ use core::{
 use axalloc::{UsageKind, global_allocator};
 use axdriver_net::igc::{
     self, DMA_PAGE_BYTES, IgcHal, IgcNic, PhysAddr, WindowBus,
+    api::{IgcApiBackend, IgcApiRequest, IgcApiValue, IgcHardware, igc_setup_init_funcs},
     ids::{self, INTEL_VENDOR},
     probe::{BarFacts, Candidate, ConfigFacts, MsixFacts},
     regs::{RegisterWindow, WINDOW_BYTES},
 };
 use axhal::mem::{phys_to_virt, virt_to_phys};
 use log::*;
+
+/// The translated operation table is installed before the current platform
+/// adapter runs the legacy reset/NVM/PHY sequence. `init_device=false` must
+/// keep this backend unreachable; it fails closed if a future caller changes
+/// that ordering without supplying a hardware implementation.
+struct ApiTableOnlyBackend;
+
+impl IgcApiBackend for ApiTableOnlyBackend {
+    fn invoke(
+        &mut self,
+        _callback: axdriver_net::igc::api::IgcApiCallback,
+        _request: IgcApiRequest,
+    ) -> axdriver_base::DevResult<IgcApiValue> {
+        Err(axdriver_base::DevError::Unsupported)
+    }
+}
 
 /// The queue size both rings are built with: the vendor driver's default of
 /// 256 descriptors (`IGC_DEFAULT_TXD`/`IGC_DEFAULT_RXD`, `igc.h:442-447`).
@@ -176,6 +193,10 @@ fn probe(
 
     let facts = config_facts(root, bdf, dev_info);
     let bdf = facts.bdf.clone();
+    let mut shared = IgcHardware::new(facts.device_id, true);
+    shared.revision_id = facts.revision;
+    shared.subsystem_vendor_id = facts.subsystem_vendor_id;
+    shared.subsystem_device_id = facts.subsystem_device_id;
     info!("igc: {}: {}", facts.bdf, facts.describe());
 
     // Phase 1: identify.  A BAR that cannot hold the registers this driver
@@ -224,6 +245,25 @@ fn probe(
             "igc: {bdf}: not brought up: the identification did not confirm the device, so \
              nothing was programmed"
         );
+        return Some(None);
+    }
+
+    // Install the FreeBSD shared-code operation tables for the identified
+    // I225 before bringing up the existing platform bus adapter. Initialization
+    // is deliberately deferred here: the callback backend is still being
+    // wired to the translated MAC/NVM/PHY modules, so claiming it is complete
+    // would be incorrect.
+    let mut api_backend = ApiTableOnlyBackend;
+    if let Err(error) = igc_setup_init_funcs(&mut shared, &mut api_backend, false) {
+        warn!("igc: {bdf}: translated shared operation setup failed: {error:?}");
+        return Some(None);
+    }
+    if shared.mac_type != Some(axdriver_net::igc::api::IgcMacType::I225)
+        || shared.mac_ops.reset_hw.is_none()
+        || shared.nvm_ops.read.is_none()
+        || shared.phy_ops.read.is_none()
+    {
+        warn!("igc: {bdf}: translated I225 operation tables are incomplete");
         return Some(None);
     }
 

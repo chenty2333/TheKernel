@@ -332,7 +332,7 @@ ends up binding a part it does not understand.
 * QEMU 10.2.2 `qemu-system-x86_64 -device help`, for the absence of an
   i225/i226 model.
 
-The IGC shared API now has the FreeBSD `igc_api.c` dispatch surface and I225 callback-table selection translated in `src/igc/api.rs` and `src/igc/i225.rs`. The backend trait is the boundary for the corresponding register/NVM/PHY implementations; this table selection is not yet connected to the legacy `IgcNic` probe/bring-up path. Subsequent IGC work will replace that handwritten path with these translated operations.
+The IGC shared API now has the FreeBSD `igc_api.c` dispatch surface and I225 callback-table selection translated in `src/igc/api.rs` and `src/igc/i225.rs`. The real PCI probe invokes `igc_setup_init_funcs` to install the source-selected I225 tables before bring-up, but passes `init_device=false`: the callback backend is not yet wired to the translated MAC/NVM/PHY modules, so hardware initialization still uses the legacy platform path.
 
 `igc_base.c` has also been translated into `src/igc/base.rs`; its host-testable base-I/O adapter preserves the function-index semaphore masks, MTA/UTA zeroing order, management-pass-through power-down gate, and receive FIFO erratum sequence. Product binding to this translated base path remains in progress.
 
@@ -377,3 +377,5 @@ The live RX ring refill now routes each DMA buffer address through the translate
 Receive now feeds the actual write-back status/error, packet-info, RSS flow id, length and VLAN words through the translated `igc_isc_rxd_pkt_get` and availability logic. RX errors are dropped and reclaimed; multi-descriptor frames are dropped as one packet because `NetDriverOps` cannot return fragment arrays or checksum/VLAN/RSS metadata. Incomplete non-EOP descriptors remain queued until a complete packet arrives.
 
 The polling readiness check uses the same translated DD/EOP budget walk over a read-only view of the live DMA ring, so completed fragmented packets reach the receive callback and are safely dropped as unsupported instead of stalling behind `can_receive == false`. Tests cover incomplete fragments, multi-descriptor drops, and the upstream RXE drop path.
+
+During each recognized PCI probe, the translated `igc_setup_init_funcs` now selects and installs the FreeBSD I225 MAC/NVM/PHY operation tables against the PCI facts before bring-up. It deliberately requests `init_device=false`; an `ApiTableOnlyBackend` refuses any callback invocation so the path cannot silently pretend that the still-missing hardware adapter is initialized. The existing reset/link sequence remains separate until the translated callback implementations are connected.
