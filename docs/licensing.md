@@ -561,7 +561,8 @@ The synchronous display power-domain accounting in
 reference edges (Copyright © 2022 Intel). It operates on the previously listed
 power-well map and carries no firmware or binary inputs.
 
-The MIT `intel_display_power_well.c` DC mask and write-retry functions are
-translated in `tk-intel-display/src/dc_state.rs` (Copyright © 2022 Intel).
-The kernel uses the source retry loop for the initial disable request; the
-larger DMC-controlled DC transition and runtime lifecycle are not included.
+The MIT `intel_display_power_well.c` DC mask/write-retry functions and
+`intel_display_power.c` allowed-mask, target-sanitize, and state query helpers
+are translated in `tk-intel-display/src/dc_state.rs` (Copyright © 2022 Intel).
+The kernel uses the source retry loop for initial disable; DMC-controlled
+DC5/6/9 transitions and runtime lifecycle are not included.

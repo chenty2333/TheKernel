@@ -646,6 +646,8 @@ impl WorkaroundState {
 pub(crate) struct PowerState {
     pub(crate) fuses: FuseState,
     pub(crate) dc_state: DcStateObservation,
+    pub(crate) allowed_dc_mask: u32,
+    pub(crate) target_dc_state: u32,
     pub(crate) phys: Vec<PhyState>,
     /// Each PHY's `COMP_INIT` after `PW_1` came up, which is the read that says
     /// whether the PHY step took: §11 phase 1.2 says a `COMP_INIT` that does
@@ -715,6 +717,10 @@ impl PowerState {
             self.fuses.sfuse_strap & 0xF,
         ));
         line(self.dc_state.describe());
+        line(format!(
+            "DC policy: allowed mask {:#04x}, target state {:#04x}",
+            self.allowed_dc_mask, self.target_dc_state
+        ));
         line(format!(
             "power-domain PIPE_A refcount {}",
             self.power_domains.domain_use_count(PowerDomain::PipeA)
@@ -1457,10 +1463,28 @@ fn bring_up_inner(
                 PowerError::PowerDomain(format!("{error:?}")),
             )
         })?;
+    let allowed_dc_mask = intel_display::dc_state::get_allowed_dc_mask(
+        intel_display::dc_state::DcStateCaps {
+            display_version: 13,
+            has_display: true,
+            dg2: false,
+            dg1: false,
+            geminilake: false,
+            broxton: false,
+            disable_power_well: true,
+        },
+        -1,
+    );
+    let target_dc_state = intel_display::dc_state::sanitize_target_dc_state(
+        intel_display::dc_state::DC_STATE_EN_UPTO_DC6,
+        allowed_dc_mask,
+    );
 
     Ok(PowerState {
         fuses,
         dc_state,
+        allowed_dc_mask,
+        target_dc_state,
         phys,
         phy_comp_init_after_pw1,
         pw1,
@@ -1569,6 +1593,14 @@ mod tests {
         // Phase 1.1: DC states off, field cleared and everything else kept.
         assert!(!state.dc_state.already_disabled);
         assert_eq!(regs.read(regs::DC_STATE_EN).unwrap() & DC_STATE_MASK, 0);
+        assert_eq!(
+            state.allowed_dc_mask,
+            intel_display::dc_state::gen9_dc_mask(13, false)
+        );
+        assert_eq!(
+            state.target_dc_state,
+            intel_display::dc_state::DC_STATE_EN_UPTO_DC6
+        );
 
         // Phase 1.2: both PHYs initialised, A first.
         assert_eq!(state.phys.len(), 2);

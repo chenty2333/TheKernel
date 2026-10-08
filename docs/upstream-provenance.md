@@ -1013,9 +1013,11 @@ wells and DDI/AUX operation groups remain.
 
 `crates/ax/tk-intel-display/src/dc_state.rs` translates the display-12/13
 `gen9_dc_mask()` and `gen9_write_dc_state()` logic plus the field read-modify-
-write part of `gen9_set_dc_state()` from the same MIT source file (Copyright
-© 2022 Intel). `kernel/src/drm/intel/power.rs` uses it for the boot-time DC
-disable sequence; asynchronous DC5/6/9 transitions are not yet wired.
+write part of `gen9_set_dc_state()` from `intel_display_power_well.c`, plus
+`get_allowed_dc_mask()`, `sanitize_target_dc_state()`, the target setter, and
+current-state readout from `intel_display_power.c` (MIT, Copyright © 2022 Intel).
+`kernel/src/drm/intel/power.rs` uses the write retry for initial DC disable;
+DMC-controlled DC5/6/9 transitions are not yet wired.
 
 The display-12/13 subset of `intel_bios.c` and its MIT-licensed
 `intel_vbt_defs.h` helpers in `crates/ax/tk-intel-display/src/intel_bios.rs`
