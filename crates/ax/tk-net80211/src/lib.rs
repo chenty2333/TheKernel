@@ -12,6 +12,7 @@ mod input;
 mod node;
 mod node_caps;
 mod node_rates;
+mod output;
 mod ra;
 mod rates;
 mod regdomain;
@@ -59,6 +60,10 @@ pub use node_caps::{
 pub use node_rates::{
     CHAN_DYN as NODE_CHAN_DYN, CHAN_OFDM as NODE_CHAN_OFDM, NODE_ERP, PeerRateState, RateIeError,
     node_abg_mode, node_is_11g, setup_rates,
+};
+pub use output::{
+    ELEMID_RATES, ELEMID_SSID, ELEMID_XRATES, IeError, append_extended_rates_ie, append_ssid_ie,
+    append_supported_rates_ie,
 };
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,

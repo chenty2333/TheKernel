@@ -75,3 +75,6 @@ extracts QoS control in little-endian order.
 EDCA/WMM parsing retains the four AC record order and low-nibble update-count
 suppression; changed parameters request a driver update only when QoS is enabled.
 Both standard EDCA and vendor WMM element offsets are checked before decoding.
+Output helpers now encode hidden/visible SSID and the first-eight/extended
+legacy rate IE split with explicit length bounds, ready for scan and association
+request frame assembly.

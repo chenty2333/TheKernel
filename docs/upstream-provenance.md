@@ -1081,3 +1081,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/net80211/ieee80211_node.c` rev 1.217 (BSD-3-Clause): active/passive scan counters and wraparound channel traversal with passive-only channel filtering translated in `tk-net80211/src/scan.rs`.
 - OpenBSD `sys/net80211/ieee80211_input.c` rev 1.263 and `ieee80211.h` rev 1.137 (BSD-3-Clause): data/control/QoS/HT-control header shape helpers, source header length and little-endian QoS control extraction translated in `tk-net80211/src/input.rs`.
 - OpenBSD `sys/net80211/ieee80211_input.c` rev 1.263 and `ieee80211.h` rev 1.137 (BSD-3-Clause): EDCA/WMM QoS update-count parsing, AC parameter field decode and QoS-info extraction translated in `tk-net80211/src/input.rs`.
+- OpenBSD `sys/net80211/ieee80211_output.c` rev 1.148 (BSD-3-Clause): SSID, Supported Rates and Extended Supported Rates IE encoders translated in `tk-net80211/src/output.rs`.
