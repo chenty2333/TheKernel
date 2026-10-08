@@ -24,6 +24,7 @@ pub mod hdmi;
 pub mod hdmi_packet;
 pub mod intel_bios;
 pub mod intel_cursor_full;
+pub mod intel_crtc_full;
 pub mod intel_ddi_full;
 pub mod intel_dp_link_training_full;
 pub mod intel_dp_full;
