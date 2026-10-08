@@ -1021,3 +1021,5 @@ retain the latest Intel inventory, with no scanner exemptions.
 - Intel/FreeBSD `e1000_phy.c` coverage correction: the 41-function report omitted already translated MAC helper callbacks from its baseline; the exact ctags marker audit now counts 49 of 98 unique PHY definitions, including M88/IGP/IFE/82577 polarity and M88 cable-length/downshift helpers. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
 
 - Intel/FreeBSD `e1000_phy.c` count audit detail: the earlier 41/98 entry was low by two existing markers; the subsequent six diagnostics translations bring the exact unique marker total to 49/98.
+
+- Intel/FreeBSD `e1000_phy.c` coverage update: 50 of 98 functions are now translated, including four-channel IGP2 AGC cable-length averaging from the upstream table. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.

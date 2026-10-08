@@ -50,6 +50,10 @@ const M88E1000_PSSR_CABLE_LENGTH_SHIFT: u32 = 7;
 const IGP01E1000_PHY_LINK_HEALTH: u8 = 0x13;
 const IGP01E1000_PLHR_SS_DOWNGRADE: u16 = 0x8000;
 const CABLE_LENGTH_UNDEFINED: u16 = 0xff;
+const IGP02E1000_AGC_LENGTH_SHIFT: u32 = 9;
+const IGP02E1000_AGC_LENGTH_MASK: u16 = 0x7f;
+const IGP02E1000_AGC_RANGE: u16 = 15;
+const IGP02E1000_PHY_AGC_REGS: [u32; 4] = [0x11b1, 0x12b1, 0x14b1, 0x18b1];
 const IGP01E1000_PHY_PORT_STATUS: u32 = 0x11;
 const IGP01E1000_PHY_PCS_INIT_REG: u32 = 0x00b4;
 const IGP01E1000_PSSR_SPEED_MASK: u16 = 0xc000;
@@ -556,6 +560,42 @@ pub fn get_cable_length_m88<I: E1000PhyRegisterIo>(
     }
     diagnostics.min_cable_length = TABLE[index];
     diagnostics.max_cable_length = TABLE[index + 1];
+    diagnostics.cable_length = (diagnostics.min_cable_length + diagnostics.max_cable_length) / 2;
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_get_cable_length_igp_2()
+pub fn get_cable_length_igp_2<F>(mut read_phy: F, diagnostics: &mut PhyDiagnostics) -> DevResult
+where
+    F: FnMut(u32) -> DevResult<u16>,
+{
+    const TABLE: [u16; 113] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 3, 5, 8, 11, 13, 16, 18, 21, 0, 0, 0, 3, 6, 10, 13, 16, 19, 23, 26,
+        29, 32, 35, 38, 41, 6, 10, 14, 18, 22, 26, 30, 33, 37, 41, 44, 48, 51, 54, 58, 61, 21, 26,
+        31, 35, 40, 44, 49, 53, 57, 61, 65, 68, 72, 75, 79, 82, 40, 45, 51, 56, 61, 66, 70, 75, 79,
+        83, 87, 91, 94, 98, 101, 104, 60, 66, 72, 77, 82, 87, 92, 96, 100, 104, 108, 111, 114, 117,
+        119, 121, 83, 89, 95, 100, 105, 109, 113, 116, 119, 122, 124, 104, 109, 114, 118, 121, 124,
+    ];
+    let mut agc_sum = 0u16;
+    let mut min_index = TABLE.len() - 1;
+    let mut max_index = 0usize;
+    for register in IGP02E1000_PHY_AGC_REGS {
+        let data = read_phy(register)?;
+        let index = usize::from((data >> IGP02E1000_AGC_LENGTH_SHIFT) & IGP02E1000_AGC_LENGTH_MASK);
+        if index >= TABLE.len() || index == 0 {
+            return Err(DevError::Io);
+        }
+        if TABLE[min_index] > TABLE[index] {
+            min_index = index;
+        }
+        if TABLE[max_index] < TABLE[index] {
+            max_index = index;
+        }
+        agc_sum = agc_sum.saturating_add(TABLE[index]);
+    }
+    agc_sum = agc_sum.saturating_sub(TABLE[min_index] + TABLE[max_index]) / 2;
+    diagnostics.min_cable_length = agc_sum.saturating_sub(IGP02E1000_AGC_RANGE);
+    diagnostics.max_cable_length = agc_sum + IGP02E1000_AGC_RANGE;
     diagnostics.cable_length = (diagnostics.min_cable_length + diagnostics.max_cable_length) / 2;
     Ok(())
 }
@@ -1399,5 +1439,35 @@ mod tests {
         io.phy[I82577_PHY_STATUS_2 as usize] = I82577_PHY_STATUS2_REV_POLARITY;
         check_polarity_82577(&mut io, &mut diagnostics).unwrap();
         assert_eq!(diagnostics.cable_polarity, Some(CablePolarity::Reversed));
+    }
+
+    #[test]
+    fn generic_igp2_cable_length_uses_trimmed_four_channel_agc_average() {
+        let mut diagnostics = PhyDiagnostics::default();
+        let mut registers = alloc::vec::Vec::new();
+        get_cable_length_igp_2(
+            |register| {
+                registers.push(register);
+                let index = match register {
+                    0x11b1 => 20,
+                    0x12b1 => 40,
+                    0x14b1 => 60,
+                    _ => 80,
+                };
+                Ok((index as u16) << IGP02E1000_AGC_LENGTH_SHIFT)
+            },
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(registers, IGP02E1000_PHY_AGC_REGS);
+        assert_eq!(
+            (
+                diagnostics.min_cable_length,
+                diagnostics.max_cable_length,
+                diagnostics.cable_length
+            ),
+            (33, 63, 48)
+        );
+        assert!(get_cable_length_igp_2(|_| Ok(0), &mut diagnostics).is_err());
     }
 }
