@@ -15,6 +15,82 @@ pub enum IgcMacType {
     I225,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IgcNvmType {
+    EepromSpi,
+    FlashHardware,
+    Invm,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IgcMediaType {
+    Copper,
+    Other,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IgcPhyType {
+    None,
+    I225,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IgcNvmInfo {
+    pub word_size: u32,
+    pub opcode_bits: u8,
+    pub delay_usec: u32,
+    pub page_size: u16,
+    pub address_bits: u8,
+    pub nvm_type: IgcNvmType,
+}
+impl Default for IgcNvmInfo {
+    fn default() -> Self {
+        Self {
+            word_size: 0,
+            opcode_bits: 0,
+            delay_usec: 0,
+            page_size: 0,
+            address_bits: 0,
+            nvm_type: IgcNvmType::EepromSpi,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IgcMacInfo {
+    pub media_type: IgcMediaType,
+    pub mta_register_count: u16,
+    pub rar_entry_count: u16,
+    pub clear_semaphore_once: bool,
+    pub asf_firmware_present: bool,
+}
+impl Default for IgcMacInfo {
+    fn default() -> Self {
+        Self {
+            media_type: IgcMediaType::Copper,
+            mta_register_count: 0,
+            rar_entry_count: 0,
+            clear_semaphore_once: false,
+            asf_firmware_present: false,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IgcPhyInfo {
+    pub media_type: IgcMediaType,
+    pub phy_type: IgcPhyType,
+    pub autoneg_mask: u32,
+    pub reset_delay_usec: u32,
+    pub phy_id: u32,
+}
+impl Default for IgcPhyInfo {
+    fn default() -> Self {
+        Self {
+            media_type: IgcMediaType::Copper,
+            phy_type: IgcPhyType::None,
+            autoneg_mask: 0,
+            reset_delay_usec: 0,
+            phy_id: 0,
+        }
+    }
+}
+
 /// Function pointer identity installed into a shared-code operation table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IgcApiCallback {
@@ -32,11 +108,13 @@ pub enum IgcApiCallback {
     ResetHwI225,
     InitHwI225,
     SetupLinkI225,
+    SetupCopperLinkI225,
     GetLinkInfoI225,
     DisablePcieMasterGeneric,
     CollisionDistI225,
     RarSetI225,
     ReadMacAddrGeneric,
+    GetPhyIdGeneric,
     ValidateMdiI225,
     PhyAcquireI225,
     PhyCheckResetBlockI225,
@@ -141,6 +219,7 @@ pub struct IgcMacOps {
     pub reset_hw: Option<IgcApiCallback>,
     pub init_hw: Option<IgcApiCallback>,
     pub setup_link: Option<IgcApiCallback>,
+    pub setup_physical_interface: Option<IgcApiCallback>,
     pub write_vfta: Option<IgcApiCallback>,
     pub config_collision_dist: Option<IgcApiCallback>,
     pub rar_set: Option<IgcApiCallback>,
@@ -190,10 +269,13 @@ pub struct IgcHardware {
     pub mac_ops: IgcMacOps,
     pub nvm_ops: IgcNvmOps,
     pub phy_ops: IgcPhyOps,
+    pub nvm_info: IgcNvmInfo,
+    pub mac_info: IgcMacInfo,
+    pub phy_info: IgcPhyInfo,
 }
 
 impl IgcHardware {
-    pub const fn new(device_id: u16, registers_mapped: bool) -> Self {
+    pub fn new(device_id: u16, registers_mapped: bool) -> Self {
         Self {
             device_id,
             mac_type: None,
@@ -208,6 +290,7 @@ impl IgcHardware {
                 reset_hw: None,
                 init_hw: None,
                 setup_link: None,
+                setup_physical_interface: None,
                 write_vfta: None,
                 config_collision_dist: None,
                 rar_set: None,
@@ -244,6 +327,9 @@ impl IgcHardware {
                 power_up: None,
                 power_down: None,
             },
+            nvm_info: IgcNvmInfo::default(),
+            mac_info: IgcMacInfo::default(),
+            phy_info: IgcPhyInfo::default(),
         }
     }
 }
@@ -257,7 +343,7 @@ pub fn igc_set_mac_type(hw: &mut IgcHardware) -> DevResult<IgcMacType> {
     Ok(IgcMacType::I225)
 }
 
-fn init_generic_ops(hw: &mut IgcHardware) {
+pub(super) fn init_generic_ops(hw: &mut IgcHardware) {
     hw.mac_ops = IgcMacOps {
         init_params: Some(IgcApiCallback::MacInitParamsGeneric),
         check_for_link: Some(IgcApiCallback::CheckLinkI225),
@@ -268,6 +354,7 @@ fn init_generic_ops(hw: &mut IgcHardware) {
         reset_hw: Some(IgcApiCallback::ResetHwI225),
         init_hw: Some(IgcApiCallback::InitHwI225),
         setup_link: Some(IgcApiCallback::SetupLinkI225),
+        setup_physical_interface: Some(IgcApiCallback::SetupCopperLinkI225),
         write_vfta: Some(IgcApiCallback::WriteVftaI225),
         config_collision_dist: Some(IgcApiCallback::CollisionDistI225),
         rar_set: Some(IgcApiCallback::RarSetI225),
