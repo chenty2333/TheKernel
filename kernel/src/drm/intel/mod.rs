@@ -86,6 +86,7 @@ mod clk;
 mod combo_phy_full;
 mod connect;
 mod ddi;
+mod dp_aux;
 pub(crate) mod debugfs;
 mod dma;
 mod dmc;
