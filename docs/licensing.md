@@ -697,3 +697,12 @@ included in `LICENSE-MIT`.
 `tk-intel-display/src/intel_hotplug_irq_full.rs` translates all 93 HPD IRQ
 functions in `intel_hotplug_irq.c` (MIT, © 2023 Intel). Its grant is included
 in `LICENSE-MIT`.
+
+`tk-intel-display/src/intel_ddi_full.rs` translates the 208-function DDI
+implementation in Linux 7.2.3 `intel_ddi.c` (MIT, © 2012 Intel); the full MIT
+grant and copyright are preserved in the source file and `LICENSE-MIT`.
+
+`tk-intel-display/src/intel_hdmi_full.rs` translates 114 of 120 functions in
+Linux 7.2.3 `intel_hdmi.c` (MIT, Dave Airlie 2006 and Intel 2006–2009). Six
+DRM connector/property/modes wrappers are framework-only and omitted; the full
+grant and copyright are preserved in the module and `LICENSE-MIT`.
