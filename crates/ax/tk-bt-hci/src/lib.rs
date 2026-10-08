@@ -13,7 +13,8 @@ mod iwmbt_fw;
 use alloc::collections::VecDeque;
 
 pub use iwmbt_fw::{
-    BootParams, FirmwareError, Version, VersionTlv, get_fwname, get_fwname_tlv, parse_tlv,
+    BootParams, DeviceFamily, FirmwareError, Version, VersionTlv, get_fwname, get_fwname_tlv,
+    parse_tlv, supported_device,
 };
 
 pub const AF_BLUETOOTH: i32 = 31;
@@ -229,6 +230,21 @@ pub fn absent_device_ioctl(_command: u32) -> Result<(), Error> {
     Err(Error::NoDevice)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IoctlOutcome {
+    EmptyDeviceList,
+}
+
+/// Linux HCI_GETDEVLIST succeeds with zero entries on a machine with no HCI
+/// controller; ioctls that name an individual device return ENODEV.
+pub fn no_device_ioctl(command: u32) -> Result<IoctlOutcome, Error> {
+    if command == HCIGETDEVLIST {
+        Ok(IoctlOutcome::EmptyDeviceList)
+    } else {
+        Err(Error::NoDevice)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +367,23 @@ mod tests {
             parse_tlv(&[0, 0x10, 4, 1], &mut VersionTlv::default()),
             Err(FirmwareError::TruncatedTlv)
         );
+    }
+
+    #[test]
+    fn intel_usb_firmware_id_table_includes_n305_cnvi() {
+        assert_eq!(supported_device(0x8087, 0x0033), DeviceFamily::I9260);
+        assert_eq!(supported_device(0x8087, 0x0029), DeviceFamily::I8260);
+        assert_eq!(supported_device(0x1234, 0x0033), DeviceFamily::Unknown);
+    }
+
+    #[test]
+    fn no_controller_ioctl_results_match_hci_device_list_semantics() {
+        assert_eq!(
+            no_device_ioctl(HCIGETDEVLIST),
+            Ok(IoctlOutcome::EmptyDeviceList)
+        );
+        assert_eq!(no_device_ioctl(HCIGETDEVINFO), Err(Error::NoDevice));
+        assert_eq!(no_device_ioctl(HCIDEVUP), Err(Error::NoDevice));
+        assert_eq!(no_device_ioctl(HCIDEVDOWN), Err(Error::NoDevice));
     }
 }

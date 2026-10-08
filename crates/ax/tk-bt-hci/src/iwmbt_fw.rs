@@ -57,6 +57,25 @@ pub enum FirmwareError {
     InvalidTlvLength { kind: u8, length: u8 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceFamily {
+    Unknown,
+    I7260,
+    I8260,
+    I9260,
+}
+
+/// Intel USB VID/PID table from the firmware utility.
+// upstream: main.c iwmbt_is_supported()
+pub fn supported_device(vendor_id: u16, product_id: u16) -> DeviceFamily {
+    match (vendor_id, product_id) {
+        (0x8087, 0x07dc | 0x0a2a | 0x0aa7) => DeviceFamily::I7260,
+        (0x8087, 0x0a2b | 0x0aaa | 0x0025 | 0x0026 | 0x0029) => DeviceFamily::I8260,
+        (0x8087, 0x0032 | 0x0033 | 0x0035 | 0x0036) => DeviceFamily::I9260,
+        _ => DeviceFamily::Unknown,
+    }
+}
+
 /// Return the same 16-bit CNVx top encoding used in FreeBSD iwmbtfw.
 fn pack_cnvx_top(value: u32) -> u16 {
     (((value & 0x0f00_0000) >> 16) | ((value & 0xf) << 12) | ((value & 0x0ff0) >> 4)) as u16
