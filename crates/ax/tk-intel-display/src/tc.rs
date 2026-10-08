@@ -259,6 +259,51 @@ pub const fn tc_port_fixup_legacy_flag(legacy_port: bool, live_status_mask: u32)
     }
 }
 
+/// Program DFLEXDPMLE1 lane selection without acquiring power or ownership.
+// upstream: intel_tc.c intel_tc_port_set_fia_lane_count()
+pub fn intel_tc_port_set_fia_lane_count(
+    io: &impl TcIo,
+    port: TcPort,
+    display_version: u8,
+    modular_fia: bool,
+    required_lanes: u8,
+    lane_reversal: bool,
+    mode: TcPortMode,
+) -> Result<(), Error> {
+    if display_version >= 14 {
+        return Ok(());
+    }
+    if !io.tc_cold_blocked(port) {
+        return Err(Error::Refused);
+    }
+    let fia = tc_phy_load_fia_params(port.index() as u8, modular_fia);
+    let base = match fia.fia_index {
+        0 => 0x163000,
+        1 => 0x16e000,
+        2 => 0x16f000,
+        _ => return Err(Error::Refused),
+    };
+    let register = base + 0x8c0;
+    let shift = 4 * u32::from(fia.port_index);
+    let mask = 0xf << shift;
+    let current = io.read32(register)?;
+    if current == u32::MAX {
+        return Err(Error::Unavailable(register));
+    }
+    let mut value = current & !mask;
+    let selection = match required_lanes {
+        1 if lane_reversal => 0x8,
+        1 => 0x1,
+        2 if lane_reversal => 0xc,
+        2 => 0x3,
+        4 => 0xf,
+        _ => 0, // MISSING_CASE in i915; the masked field is still written cleared.
+    };
+    let _legacy_reversal_diagnostic = lane_reversal && mode != TcPortMode::Legacy;
+    value |= selection << shift;
+    io.write32(register, value)
+}
+
 /// The public connector query returns four lanes on a non-Type-C encoder.
 // upstream: intel_tc.c intel_tc_port_max_lane_count()
 pub const fn intel_tc_port_max_lane_count(is_type_c: bool, lane_count: u8) -> u8 {
@@ -664,6 +709,7 @@ mod signal_level_tests {
         mmio: BTreeMap<u32, u32>,
         dkl: BTreeMap<(u32, u32), u32>,
         dkl_writes: std::vec::Vec<(u32, u32, u32)>,
+        mmio_writes: std::vec::Vec<(u32, u32)>,
         fail_write_once: Option<u32>,
     }
 
@@ -751,6 +797,7 @@ mod signal_level_tests {
                 state.dkl_writes.push((port, internal, value));
             } else {
                 state.mmio.insert(offset, value);
+                state.mmio_writes.push((offset, value));
             }
             Ok(())
         }
@@ -780,6 +827,44 @@ mod signal_level_tests {
 
     fn expected_rmw(old: u32, clear: u32, set: u32) -> u32 {
         (old & !clear) | set
+    }
+
+    #[test]
+    fn fia_lane_count_program_matches_source_masking_and_display14_noop() {
+        let model = Model::new(TcPort::Tc3, 0);
+        let address = 0x16e8c0; // modular FIA2, port index zero
+        model
+            .state
+            .lock()
+            .unwrap()
+            .mmio
+            .insert(address, 0xa5a5_5a5a);
+        intel_tc_port_set_fia_lane_count(
+            &model,
+            TcPort::Tc3,
+            13,
+            true,
+            2,
+            true,
+            TcPortMode::Legacy,
+        )
+        .unwrap();
+        assert_eq!(
+            model.state.lock().unwrap().mmio.get(&address),
+            Some(&0xa5a5_5a5c)
+        );
+        let writes = model.state.lock().unwrap().mmio_writes.len();
+        intel_tc_port_set_fia_lane_count(
+            &model,
+            TcPort::Tc3,
+            14,
+            true,
+            4,
+            false,
+            TcPortMode::DpAlt,
+        )
+        .unwrap();
+        assert_eq!(model.state.lock().unwrap().mmio_writes.len(), writes);
     }
 
     #[test]
