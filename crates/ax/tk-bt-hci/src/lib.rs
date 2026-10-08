@@ -34,6 +34,16 @@ const fn ioctl(direction: u32, number: u32, size: u32) -> u32 {
     (direction << 30) | (size << 16) | ((BT_IOC_MAGIC as u32) << 8) | number
 }
 
+fn read_le32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
+    let end = offset.checked_add(4).ok_or(Error::InvalidLength)?;
+    let raw: [u8; 4] = bytes
+        .get(offset..end)
+        .ok_or(Error::InvalidLength)?
+        .try_into()
+        .map_err(|_| Error::InvalidLength)?;
+    Ok(u32::from_le_bytes(raw))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PacketType {
     Command,
@@ -122,7 +132,7 @@ pub struct Adapter<T> {
     user_owner: bool,
     raw_users: u16,
     monitor_users: u16,
-    monitor: VecDeque<[u8; 260]>,
+    monitor: VecDeque<[u8; 272]>,
 }
 
 impl<T: UsbTransport> Adapter<T> {
@@ -190,8 +200,14 @@ impl<T: UsbTransport> Adapter<T> {
         }
         Packet::parse(kind, bytes)?;
         match kind {
-            PacketType::Command => self.transport.control_command(bytes),
-            PacketType::Acl => self.transport.bulk_acl_out(bytes),
+            PacketType::Command => {
+                self.queue_monitor(2, bytes);
+                self.transport.control_command(bytes)
+            }
+            PacketType::Acl => {
+                self.queue_monitor(4, bytes);
+                self.transport.bulk_acl_out(bytes)
+            }
             _ => Err(Error::Unsupported),
         }
     }
@@ -200,19 +216,37 @@ impl<T: UsbTransport> Adapter<T> {
     pub fn receive_event(&mut self, bytes: &[u8]) -> Result<(), Error> {
         Packet::parse(PacketType::Event, bytes)?;
         if self.monitor_users != 0 {
-            let mut frame = [0u8; 260];
-            let len = bytes.len().min(259);
-            frame[0] = 4;
-            frame[1..=len].copy_from_slice(&bytes[..len]);
-            if self.monitor.len() == 64 {
-                self.monitor.pop_front();
-            }
-            self.monitor.push_back(frame);
+            self.queue_monitor(3, bytes);
         }
         Ok(())
     }
-    pub fn pop_monitor(&mut self) -> Option<[u8; 260]> {
+    pub fn receive_acl(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        Packet::parse(PacketType::Acl, bytes)?;
+        if self.monitor_users != 0 {
+            self.queue_monitor(5, bytes);
+        }
+        Ok(())
+    }
+    fn queue_monitor(&mut self, opcode: u16, bytes: &[u8]) {
+        if self.monitor_users == 0 {
+            return;
+        }
+        let length = bytes.len().min(266);
+        let mut frame = [0u8; 272];
+        frame[..2].copy_from_slice(&opcode.to_le_bytes());
+        frame[2..4].copy_from_slice(&self.index.to_le_bytes());
+        frame[4..6].copy_from_slice(&(length as u16).to_le_bytes());
+        frame[6..6 + length].copy_from_slice(&bytes[..length]);
+        if self.monitor.len() == 64 {
+            self.monitor.pop_front();
+        }
+        self.monitor.push_back(frame);
+    }
+    pub fn pop_monitor(&mut self) -> Option<[u8; 272]> {
         self.monitor.pop_front()
+    }
+    pub fn monitor_ready(&self) -> bool {
+        !self.monitor.is_empty()
     }
     pub fn read_event(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         self.transport.read_interrupt_event(out)
@@ -235,6 +269,9 @@ impl<T: UsbTransport> Adapter<T> {
             return Err(Error::InvalidLength);
         }
         let received = Packet::parse(PacketType::Event, &event[..length])?;
+        if received.payload[0] == 0xff {
+            return Ok(length);
+        }
         if received.payload[0] != 0x0e || length < 5 {
             return Err(Error::InvalidLength);
         }
@@ -266,6 +303,257 @@ impl<T: UsbTransport> Adapter<T> {
         }
         out[..payload.len()].copy_from_slice(payload);
         Ok(payload.len())
+    }
+    /// Read Intel bootloader secure-boot parameters with opcode 0xfc0d.
+    // upstream: iwmbt_hw.c iwmbt_get_boot_params()
+    pub fn intel_get_boot_params(&mut self) -> Result<BootParams, Error> {
+        let mut event = [0u8; 32];
+        let length = self.command_complete(&[0x0d, 0xfc, 0], &mut event)?;
+        if length < 28 || event[5] != 0 {
+            return Err(Error::InvalidLength);
+        }
+        BootParams::parse(&event[5..28]).map_err(|_| Error::InvalidLength)
+    }
+    /// Determine the Intel firmware generation from its fixed or TLV version
+    /// record, retaining the USB VID/PID family as the initial device class.
+    // upstream: main.c iwmbt_identify()
+    pub fn intel_identify(&mut self, usb_family: DeviceFamily) -> Result<DeviceFamily, Error> {
+        if usb_family == DeviceFamily::Unknown {
+            return Err(Error::Unsupported);
+        }
+        if usb_family == DeviceFamily::I7260 {
+            self.intel_bt_reset()?;
+        }
+        let mut data = [0u8; 255];
+        let length = self.intel_get_version_tlv(&mut data)?;
+        if length == 10 && data[1] == 0x37 {
+            return match data[2] {
+                0x07 | 0x08 => Ok(DeviceFamily::I7260),
+                0x0b | 0x0c | 0x11..=0x14 => Ok(DeviceFamily::I8260),
+                _ => Err(Error::Unsupported),
+            };
+        }
+        let mut version = VersionTlv::default();
+        iwmbt_fw::parse_tlv(&data[..length], &mut version).map_err(|_| Error::InvalidLength)?;
+        let hw_platform = ((version.cnvi_bt >> 8) & 0xff) as u8;
+        let hw_variant = ((version.cnvi_bt >> 16) & 0x3f) as u8;
+        if hw_platform != 0x37 {
+            return Err(Error::Unsupported);
+        }
+        Ok(if hw_variant < 0x17 {
+            DeviceFamily::I8260
+        } else {
+            DeviceFamily::I9260
+        })
+    }
+    /// Execute an Intel firmware HCI command/event stream and compare each
+    /// returned event payload with the image's expected bytes.
+    // upstream: iwmbt_hw.c iwmbt_patch_fwfile()
+    pub fn run_intel_patch(&mut self, image: &[u8]) -> Result<bool, Error> {
+        if !self.up {
+            return Err(Error::NotUp);
+        }
+        let (commands, activate) =
+            iwmbt_fw::parse_patch(image).map_err(|_| Error::InvalidLength)?;
+        let mut command = [0u8; 258];
+        let mut event = [0u8; 260];
+        for record in commands {
+            command[0..2].copy_from_slice(&record.opcode.to_le_bytes());
+            command[2] = record.parameters.len() as u8;
+            command[3..3 + record.parameters.len()].copy_from_slice(record.parameters);
+            self.transport
+                .control_command(&command[..3 + record.parameters.len()])?;
+            for (_event_code, expected) in record.expected_events {
+                let length = self.transport.read_interrupt_event(&mut event)?;
+                if length != expected.len() + 2 || event[2..length] != *expected {
+                    return Err(Error::InvalidLength);
+                }
+            }
+        }
+        Ok(activate)
+    }
+    /// Send one proprietary Intel bulk firmware fragment and drain its bulk
+    /// response, preserving the upstream 0xfc09 command format.
+    // upstream: iwmbt_hw.c iwmbt_send_fragment()
+    fn send_intel_fragment(&mut self, fragment_type: u8, data: &[u8]) -> Result<(), Error> {
+        if data.len() > 0xfc {
+            return Err(Error::InvalidLength);
+        }
+        let mut command = [0u8; 256];
+        command[0..2].copy_from_slice(&0xfc09u16.to_le_bytes());
+        command[2] = (data.len() + 1) as u8;
+        command[3] = fragment_type;
+        command[4..4 + data.len()].copy_from_slice(data);
+        self.transport.bulk_acl_out(&command[..4 + data.len()])?;
+        let mut response = [0u8; 256];
+        self.transport.read_bulk_acl(&mut response)?;
+        Ok(())
+    }
+    /// Transfer the RSA secure-boot header segments.
+    // upstream: iwmbt_hw.c iwmbt_load_rsa_header()
+    pub fn intel_load_rsa_header(&mut self, firmware: &[u8]) -> Result<(), Error> {
+        if firmware.len() < 644 {
+            return Err(Error::InvalidLength);
+        }
+        self.send_intel_fragment(0x00, &firmware[0..0x80])?;
+        self.send_intel_fragment(0x03, &firmware[0x80..0x100])?;
+        self.send_intel_fragment(0x03, &firmware[0x100..0x180])?;
+        self.send_intel_fragment(0x02, &firmware[0x184..0x204])?;
+        self.send_intel_fragment(0x02, &firmware[0x204..0x284])?;
+        Ok(())
+    }
+    /// Transfer the ECDSA secure-boot header segments at the upstream RSA
+    /// header offset.
+    // upstream: iwmbt_hw.c iwmbt_load_ecdsa_header()
+    pub fn intel_load_ecdsa_header(&mut self, firmware: &[u8]) -> Result<(), Error> {
+        const OFFSET: usize = 644;
+        if firmware.len() < OFFSET + 0x140 {
+            return Err(Error::InvalidLength);
+        }
+        self.send_intel_fragment(0x00, &firmware[OFFSET..OFFSET + 0x80])?;
+        self.send_intel_fragment(0x03, &firmware[OFFSET + 0x80..OFFSET + 0xe0])?;
+        self.send_intel_fragment(0x02, &firmware[OFFSET + 0xe0..OFFSET + 0x140])?;
+        Ok(())
+    }
+    /// Transfer firmware HCI commands in 0xfc-byte/4-byte-aligned chunks and
+    /// wait for the Intel vendor download-complete event.
+    // upstream: iwmbt_hw.c iwmbt_load_fwfile()
+    pub fn intel_load_firmware(&mut self, firmware: &[u8], offset: usize) -> Result<u32, Error> {
+        if offset > firmware.len() {
+            return Err(Error::InvalidLength);
+        }
+        let mut sent = offset;
+        let mut ready = 0usize;
+        let mut boot_param = 0u32;
+        while firmware.len().saturating_sub(sent + ready) >= 3 {
+            let command = &firmware[sent + ready..];
+            let opcode = u16::from_le_bytes([command[0], command[1]]);
+            let length = usize::from(command[2]);
+            if command.len() < 3 + length {
+                return Err(Error::InvalidLength);
+            }
+            if opcode == 0xfc0e {
+                if length < 4 {
+                    return Err(Error::InvalidLength);
+                }
+                boot_param =
+                    u32::from_le_bytes(command[3..7].try_into().map_err(|_| Error::InvalidLength)?);
+            }
+            ready += 3 + length;
+            while ready >= 0xfc {
+                self.send_intel_fragment(0x01, &firmware[sent..sent + 0xfc])?;
+                sent += 0xfc;
+                ready -= 0xfc;
+            }
+            if ready > 0 && ready.is_multiple_of(4) {
+                self.send_intel_fragment(0x01, &firmware[sent..sent + ready])?;
+                sent += ready;
+                ready = 0;
+            }
+        }
+        let mut event = [0u8; 16];
+        let length = self.transport.read_interrupt_event(&mut event)?;
+        if length < 3 || event[0] != 0xff || event[2] != 0x06 {
+            return Err(Error::Unsupported);
+        }
+        Ok(boot_param)
+    }
+    /// Validate the Intel CSS headers, stream RSA/ECDSA segments, then upload
+    /// the remaining command buffer. Returns the Intel reset boot parameter.
+    // upstream: main.c iwmbt_init_firmware()
+    pub fn intel_init_firmware(
+        &mut self,
+        firmware: &[u8],
+        hw_variant: u8,
+        sbe_type: u8,
+    ) -> Result<u32, Error> {
+        let header_len = if hw_variant <= 0x14 {
+            if firmware.len() < 644 || read_le32(firmware, 8)? != 0x0001_0000 || sbe_type != 0 {
+                return Err(Error::InvalidLength);
+            }
+            644
+        } else if hw_variant >= 0x17 {
+            if firmware.len() < 964
+                || firmware[644] != 0x06
+                || read_le32(firmware, 652)? != 0x0002_0000
+            {
+                return Err(Error::InvalidLength);
+            }
+            964
+        } else {
+            return Err(Error::Unsupported);
+        };
+        match sbe_type {
+            0 => self.intel_load_rsa_header(firmware)?,
+            1 => self.intel_load_ecdsa_header(firmware)?,
+            _ => return Err(Error::Unsupported),
+        }
+        self.intel_load_firmware(firmware, header_len)
+    }
+    /// Standard HCI Reset command.
+    // upstream: iwmbt_hw.c iwmbt_bt_reset()
+    pub fn intel_bt_reset(&mut self) -> Result<(), Error> {
+        self.command_complete(&[0x03, 0x0c, 0], &mut [0u8; 16])?;
+        Ok(())
+    }
+    /// Enter Intel manufacturer mode.
+    // upstream: iwmbt_hw.c iwmbt_enter_manufacturer()
+    pub fn intel_enter_manufacturer(&mut self) -> Result<(), Error> {
+        self.command_complete(&[0x11, 0xfc, 2, 1, 0], &mut [0u8; 16])?;
+        Ok(())
+    }
+    /// Exit Intel manufacturer mode with the selected reset/patch policy.
+    // upstream: iwmbt_hw.c iwmbt_exit_manufacturer()
+    pub fn intel_exit_manufacturer(&mut self, mode: u8) -> Result<(), Error> {
+        if mode > 2 {
+            return Err(Error::InvalidLength);
+        }
+        self.command_complete(&[0x11, 0xfc, 2, 0, mode], &mut [0u8; 16])?;
+        Ok(())
+    }
+    /// Intel vendor reset followed by the vendor-specific completion event.
+    // upstream: iwmbt_hw.c iwmbt_intel_reset()
+    pub fn intel_reset(&mut self, boot_param: u32) -> Result<(), Error> {
+        let mut command = [0x01, 0xfc, 8, 0, 0, 0, 1, 0, 0, 0, 0];
+        command[7..11].copy_from_slice(&boot_param.to_le_bytes());
+        let mut event = [0u8; 16];
+        let length = self.command_complete(&command, &mut event)?;
+        if length < 3 || event[0] != 0xff || event[2] != 0x02 {
+            return Err(Error::Unsupported);
+        }
+        Ok(())
+    }
+    /// Send Intel Write DDC commands, each prefixed by its one-byte length.
+    // upstream: iwmbt_hw.c iwmbt_load_ddc()
+    pub fn intel_load_ddc(&mut self, data: &[u8]) -> Result<(), Error> {
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let chunk = usize::from(data[offset]);
+            if chunk == 0
+                || offset
+                    .checked_add(chunk + 1)
+                    .is_none_or(|end| end > data.len())
+                || chunk > 254
+            {
+                return Err(Error::InvalidLength);
+            }
+            let mut command = [0u8; 258];
+            command[0..2].copy_from_slice(&0xfc8bu16.to_le_bytes());
+            command[2] = (chunk + 1) as u8;
+            command[3..4 + chunk].copy_from_slice(&data[offset..offset + chunk + 1]);
+            self.command_complete(&command[..4 + chunk], &mut [0u8; 16])?;
+            offset += chunk + 1;
+        }
+        Ok(())
+    }
+    /// Program the Intel HCI event mask.
+    // upstream: iwmbt_hw.c iwmbt_set_event_mask()
+    pub fn intel_set_event_mask(&mut self) -> Result<(), Error> {
+        self.command_complete(
+            &[0x52, 0xfc, 8, 0x87, 0x0c, 0, 0, 0, 0, 0, 0],
+            &mut [0u8; 16],
+        )?;
+        Ok(())
     }
     pub fn into_transport(self) -> T {
         self.transport
@@ -352,7 +640,7 @@ mod tests {
         assert!(a.pop_monitor().is_none());
         a.open(Channel::Monitor).unwrap();
         a.receive_event(&[0x0e, 0]).unwrap();
-        assert_eq!(a.pop_monitor().unwrap()[0], 4);
+        assert_eq!(&a.pop_monitor().unwrap()[..2], &3u16.to_le_bytes());
         a.set_up(false).unwrap();
         assert!(a.transport.stopped);
         assert_eq!(a.transport.commands, 1);
@@ -396,7 +684,10 @@ mod tests {
                     hw_variant: 0x0c,
                     ..Version::default()
                 },
-                Some(&BootParams { dev_revid: 42 }),
+                Some(&BootParams {
+                    dev_revid: 42,
+                    ..BootParams::default()
+                }),
                 "intel",
                 "sfi"
             )

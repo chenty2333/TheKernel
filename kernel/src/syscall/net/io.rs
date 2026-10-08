@@ -38,7 +38,7 @@ use super::{
 };
 use crate::{
     file::{
-        PacketSocket, PinnedSocketDescription, PreparedSocketMessage, SocketBackendKind, WriteBuf,
+        FileLike, PacketSocket, PinnedSocketDescription, PreparedSocketMessage, SocketBackendKind, WriteBuf,
         af_alg::AfAlgSendRequest, netlink::SockaddrNl, permission::VfsSecurityContext,
     },
     mm::{
@@ -1287,7 +1287,8 @@ fn send_impl(
         return Ok(0);
     }
     if backend == SocketBackendKind::Bluetooth {
-        return Err(LinuxError::ENODEV.into());
+        if !cmsg.is_empty() { return Err(AxError::OperationNotSupported); }
+        return socket.bluetooth()?.write(&mut src).map(|sent| sent as isize);
     }
     if backend != SocketBackendKind::Network {
         return Err(AxError::NotASocket);
@@ -1873,7 +1874,14 @@ fn recv_impl(
         return Err(LinuxError::EOPNOTSUPP.into());
     }
     if socket.backend()? == SocketBackendKind::Bluetooth {
-        return Err(LinuxError::ENODEV.into());
+        let length = socket.bluetooth()?.read(&mut dst)?;
+        return Ok(ReceiveOutcome {
+            returned_len: length as isize,
+            message_truncated: false,
+            message_eor: false,
+            control_truncated: false,
+            address: want_address.then_some(ReceivedSocketAddress::Unspecified),
+        });
     }
     if socket.backend()? != SocketBackendKind::Network {
         return Err(AxError::NotASocket);

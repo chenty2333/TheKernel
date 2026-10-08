@@ -17,7 +17,7 @@ use core::{
 };
 
 use axdriver_base::{BaseDriverOps, DevError, DevResult};
-pub use bluetooth::{UsbBluetoothHci, take_devices as take_bluetooth_devices};
+pub use bluetooth::{UsbBluetoothHci, bluetooth_devices};
 use crab_usb::{
     DmaCoherency, EventHandler, USBHost,
     device::{Device, InterfaceSession},

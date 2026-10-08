@@ -305,6 +305,7 @@ def validate_artifact_config(artifacts: Artifacts, rootfs: Path | None, transpor
 # staging tree would otherwise leave a stamped image in place.
 ROOTFS_INPUT_FILES = (
     "scripts/build-rootfs.sh",
+    "scripts/stage-intel-bt-firmware.sh",
     "scripts/ci/n305-dhcp.script",
     "scripts/build-guest-tools.sh",
     "scripts/build-nested-payload.sh",

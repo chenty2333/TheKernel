@@ -95,7 +95,9 @@ mod usb;
 #[cfg(feature = "usb-xhci")]
 pub use usb::observations as usb_observations;
 #[cfg(feature = "usb-xhci")]
-pub use usb::{take_bluetooth_devices, UsbBluetoothHci};
+pub use usb::{UsbBluetoothHci, bluetooth_devices};
+#[cfg(feature = "usb-xhci")]
+pub use tk_bt_hci::{Channel as BluetoothChannel, Error as BluetoothError, PacketType as BluetoothPacketType};
 
 #[cfg(feature = "input")]
 #[path = "usb/hid_report.rs"]

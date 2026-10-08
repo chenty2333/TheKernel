@@ -527,3 +527,9 @@ libgallium from the existing same-version source/CLC/toolchain, retaining the
 Mesa/Buildroot package license obligations already registered above. No Mesa
 binary is committed. The dedicated flavor and loader check are original
 project scripts; they do not import a LinuxKPI, GPL driver body or new firmware.
+
+Intel CNVi Bluetooth SFI/DDC blobs are optional rootfs inputs selected with
+`THEKERNEL_INTEL_BT_FIRMWARE_DIR`; the offline staging helper decompresses the
+selected `ibt-*` files and carries Intel's `LICENSE.intel` alongside them.
+Redistributors must satisfy that binary-only license; no firmware blobs are
+checked into this source tree.

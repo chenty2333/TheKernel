@@ -410,6 +410,16 @@ if [ -n "${THEKERNEL_RTL8168_FIRMWARE_DIR:-}" ]; then
     install -m 0644 "$firmware_dir/rtl8168h-2.fw" "$firmware_dir/LICENSE.r8169" "$STAGE/lib/firmware/rtl_nic/"
 fi
 
+# Intel CNVi Bluetooth firmware is an explicit, redistributor-supplied rootfs
+# input. Decompress the selected linux-firmware blobs offline and retain Intel's
+# binary redistribution terms next to the staged files.
+if [ -n "${THEKERNEL_INTEL_BT_FIRMWARE_DIR:-}" ]; then
+    firmware_dir=$THEKERNEL_INTEL_BT_FIRMWARE_DIR
+    license_file=${THEKERNEL_INTEL_BT_FIRMWARE_LICENSE:-/usr/share/licenses/linux-firmware/LICENSE.intel}
+    "$SCRIPT_DIR/stage-intel-bt-firmware.sh" \
+        "$firmware_dir" "$STAGE/lib/firmware/intel" "$license_file"
+fi
+
 "$SCRIPT_DIR/create-rootfs-image.sh" \
     --arch "$ARCH" --stage "$STAGE" --output "$IMAGE" --size-mb "$SIZE_MB" \
     --owner-mode "$ROOTFS_OWNER_MODE"

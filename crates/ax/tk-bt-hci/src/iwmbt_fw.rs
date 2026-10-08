@@ -24,7 +24,50 @@ pub struct Version {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BootParams {
+    pub status: u8,
+    pub otp_format: u8,
+    pub otp_content: u8,
+    pub otp_patch: u8,
     pub dev_revid: u16,
+    pub secure_boot: u8,
+    pub key_from_hdr: u8,
+    pub key_type: u8,
+    pub otp_lock: u8,
+    pub api_lock: u8,
+    pub debug_lock: u8,
+    pub otp_bdaddr: [u8; 6],
+    pub min_fw_build_nn: u8,
+    pub min_fw_build_cw: u8,
+    pub min_fw_build_yy: u8,
+    pub limited_cce: u8,
+    pub unlocked_state: u8,
+}
+
+impl BootParams {
+    pub fn parse(bytes: &[u8]) -> Result<Self, FirmwareError> {
+        if bytes.len() != 23 {
+            return Err(FirmwareError::InvalidVersionEvent);
+        }
+        Ok(Self {
+            status: bytes[0],
+            otp_format: bytes[1],
+            otp_content: bytes[2],
+            otp_patch: bytes[3],
+            dev_revid: u16::from_le_bytes([bytes[4], bytes[5]]),
+            secure_boot: bytes[6],
+            key_from_hdr: bytes[7],
+            key_type: bytes[8],
+            otp_lock: bytes[9],
+            api_lock: bytes[10],
+            debug_lock: bytes[11],
+            otp_bdaddr: bytes[12..18].try_into().unwrap(),
+            min_fw_build_nn: bytes[18],
+            min_fw_build_cw: bytes[19],
+            min_fw_build_yy: bytes[20],
+            limited_cce: bytes[21],
+            unlocked_state: bytes[22],
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
