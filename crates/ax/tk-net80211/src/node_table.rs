@@ -202,6 +202,20 @@ pub fn find_node<'a>(table: &'a NodeTable, mac_address: &[u8; 6]) -> Option<&'a 
     table.nodes.get(mac_address)
 }
 
+/// Return the station BSS peer for every STA TX destination or multicast frame.
+// upstream: ieee80211_node.c ieee80211_find_txnode()
+pub fn find_station_tx_node<'a>(
+    table: &'a NodeTable,
+    station_mode: bool,
+    destination: [u8; 6],
+) -> Option<&'a NodeRecord> {
+    if station_mode || destination[0] & 1 != 0 {
+        Some(&table.bss_node)
+    } else {
+        None
+    }
+}
+
 pub fn find_node_mut<'a>(
     table: &'a mut NodeTable,
     mac_address: &[u8; 6],
@@ -357,5 +371,22 @@ mod tests {
         );
         source.saved_rsn_ie[2] = 8;
         assert_eq!(destination.saved_rsn_ie, [48, 1, 7]);
+    }
+
+    #[test]
+    fn station_tx_node_uses_bss_for_unicast_and_multicast_destinations() {
+        let table = NodeTable::default();
+        assert_eq!(
+            find_station_tx_node(&table, true, [2, 0, 0, 0, 0, 4]),
+            Some(&table.bss_node)
+        );
+        assert_eq!(
+            find_station_tx_node(&table, false, [1, 0, 0, 0, 0, 4]),
+            Some(&table.bss_node)
+        );
+        assert_eq!(
+            find_station_tx_node(&table, false, [2, 0, 0, 0, 0, 4]),
+            None
+        );
     }
 }
