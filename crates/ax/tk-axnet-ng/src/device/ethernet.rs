@@ -683,6 +683,16 @@ impl Device for EthernetDevice {
         self.inner.wireless_station_info()
     }
 
+    fn wireless_key_operation(
+        &mut self,
+        operation: WirelessKeyOperation,
+        key: &WirelessKeyConfig,
+    ) -> AxResult<Option<WirelessKeyInfo>> {
+        self.inner
+            .wireless_key_operation(operation, key)
+            .map_err(Self::map_dev_error)
+    }
+
     fn wireless_scan_results(&self) -> Vec<WirelessBssInfo> {
         self.inner.wireless_scan_results()
     }

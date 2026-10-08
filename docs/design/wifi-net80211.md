@@ -297,13 +297,16 @@ translated in `crypto_bip.rs`, WEP RC4/ICV in `crypto_wep.rs`, and station TKIP
 key mixing/RC4/Michael/ICV/replay in `crypto_tkip.rs`. The two TKIP functions
 remaining untranslated are HostAP-only peer-deauth and MIC timer callbacks.
 OpenBSD iwx hardware key offload covers CCMP/IGTK while upstream falls back to
-net80211 software crypto for other data ciphers; these software helpers are not
-yet wired through the Ethernet driver/key-control path. The explicit PAE files
+net80211 software crypto for other data ciphers. The Ethernet-compatible iwx
+path now installs WPA2-PSK/CCMP pairwise/group keys from nl80211 and routes
+protected station data through the translated software CCMP encrypt/decrypt
+dispatch; EAPOL remains on the unprotected userspace-supplicant port. TKIP/WEP
+are not admitted by the current key control adapter. The explicit PAE files
 remain with wpa_supplicant.
 The common net80211 cipher dispatcher and pairwise/group RX/TX key selectors
-now choose the translated cipher contexts; the iwx control path still must
-populate these keys from nl80211 and route protected Ethernet frames through
-these helpers.
+now choose the translated cipher contexts; the iwx control path populates
+CCMP keys from nl80211 and routes protected Ethernet frames through these
+helpers.
 See the function-count snapshot in progress-W.md for per-file marker totals.
 
 RSN-node leave cleanup is represented as explicit effects: initialize state,

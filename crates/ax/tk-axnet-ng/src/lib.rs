@@ -64,7 +64,8 @@ use spin::Once;
 
 pub use axdriver::prelude::{
     WirelessBssInfo, WirelessConnectRequest, WirelessHtCapabilities, WirelessPhyCapabilities,
-    WirelessScanEvent, WirelessScanRequest, WirelessStationInfo, WirelessVhtCapabilities,
+    WirelessKeyConfig, WirelessKeyInfo, WirelessKeyOperation, WirelessScanEvent,
+    WirelessScanRequest, WirelessStationInfo, WirelessVhtCapabilities,
 };
 
 static WIRELESS_SCAN_EVENT_CALLBACK: Once<fn(u32, WirelessScanEvent)> = Once::new();
@@ -361,6 +362,15 @@ pub fn disconnect_wireless(ifindex: u32, reason: u16) -> AxResult {
 /// Read the current station peer through the named wireless netdev.
 pub fn wireless_station_info(ifindex: u32) -> AxResult<WirelessStationInfo> {
     default_stack().wireless_station_info(ifindex)
+}
+
+/// Apply or query a nl80211 station/group key on one wireless interface.
+pub fn wireless_key_operation(
+    ifindex: u32,
+    operation: WirelessKeyOperation,
+    key: &WirelessKeyConfig,
+) -> AxResult<Option<WirelessKeyInfo>> {
+    default_stack().wireless_key_operation(ifindex, operation, key)
 }
 
 /// Return BSS observations collected by the wireless driver's RX path.

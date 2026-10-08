@@ -1461,6 +1461,19 @@ impl NetStack {
         self.service.lock().router.wireless_station_info(ifindex)
     }
 
+    /// Apply or query a nl80211 temporal/group key through the selected radio.
+    pub fn wireless_key_operation(
+        &self,
+        ifindex: u32,
+        operation: axdriver::prelude::WirelessKeyOperation,
+        key: &axdriver::prelude::WirelessKeyConfig,
+    ) -> AxResult<Option<axdriver::prelude::WirelessKeyInfo>> {
+        self.service
+            .lock()
+            .router
+            .wireless_key_operation(ifindex, operation, key)
+    }
+
     /// Snapshot scan records retained from firmware RX beacon/probe notifications.
     pub fn wireless_scan_results(
         &self,

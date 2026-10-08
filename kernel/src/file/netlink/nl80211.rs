@@ -31,6 +31,10 @@ const CMD_CONNECT: u8 = 46;
 const CMD_DISCONNECT: u8 = 48;
 const CMD_GET_STATION: u8 = 17;
 const CMD_NEW_STATION: u8 = 19;
+const CMD_GET_KEY: u8 = 9;
+const CMD_SET_KEY: u8 = 10;
+const CMD_NEW_KEY: u8 = 11;
+const CMD_DEL_KEY: u8 = 12;
 const NL80211_MLME_GROUP_MASK: u32 = 1 << 3;
 const ATTR_WIPHY: u16 = 1;
 const ATTR_WIPHY_NAME: u16 = 2;
@@ -38,6 +42,14 @@ const ATTR_IFINDEX: u16 = 3;
 const ATTR_IFNAME: u16 = 4;
 const ATTR_IFTYPE: u16 = 5;
 const ATTR_MAC: u16 = 6;
+const ATTR_KEY_DATA: u16 = 8;
+const ATTR_KEY_IDX: u16 = 9;
+const ATTR_KEY_CIPHER: u16 = 10;
+const ATTR_KEY_SEQ: u16 = 11;
+const ATTR_KEY_DEFAULT: u16 = 12;
+const ATTR_KEY_DEFAULT_TYPES: u16 = 110;
+const KEY_DEFAULT_TYPE_UNICAST: u16 = 1;
+const KEY_DEFAULT_TYPE_MULTICAST: u16 = 2;
 const ATTR_STA_INFO: u16 = 21;
 const ATTR_STATUS_CODE: u16 = 72;
 const ATTR_WIPHY_FREQ: u16 = 38;
@@ -56,6 +68,8 @@ const ATTR_WIPHY_BANDS: u16 = 22;
 const ATTR_SUPPORTED_IFTYPES: u16 = 32;
 const ATTR_MAX_NUM_SCAN_SSIDS: u16 = 43;
 const ATTR_SUPPORTED_COMMANDS: u16 = 50;
+const ATTR_CIPHER_SUITES: u16 = 57;
+const ATTR_MAX_NUM_PMKIDS: u16 = 86;
 const ATTR_SPLIT_WIPHY_DUMP: u16 = 174;
 const ATTR_REG_ALPHA2: u16 = 33;
 const BAND_ATTR_FREQS: u16 = 1;
@@ -241,6 +255,10 @@ pub(super) fn handle(
             | CMD_CONNECT
             | CMD_DISCONNECT
             | CMD_GET_STATION
+            | CMD_GET_KEY
+            | CMD_SET_KEY
+            | CMD_NEW_KEY
+            | CMD_DEL_KEY
     ) {
         return Err(AxError::OperationNotSupported);
     }
@@ -332,6 +350,45 @@ pub(super) fn handle(
         }
         if dump {
             socket.enqueue_kernel_permitted(permit, empty_dump_response(header, port_id));
+        }
+        return Ok(());
+    }
+    if matches!(
+        request.cmd,
+        CMD_NEW_KEY | CMD_SET_KEY | CMD_GET_KEY | CMD_DEL_KEY
+    ) {
+        if dump {
+            return Err(AxError::InvalidInput);
+        }
+        let mut operation = match request.cmd {
+            CMD_NEW_KEY => axnet::WirelessKeyOperation::Install,
+            CMD_SET_KEY => axnet::WirelessKeyOperation::SetDefault {
+                unicast: false,
+                multicast: true,
+            },
+            CMD_GET_KEY => axnet::WirelessKeyOperation::GetSequence,
+            CMD_DEL_KEY => axnet::WirelessKeyOperation::Delete,
+            _ => unreachable!(),
+        };
+        let (ifindex, key) = parse_key_request(attributes, request.cmd)?;
+        if request.cmd == CMD_SET_KEY {
+            operation = axnet::WirelessKeyOperation::SetDefault {
+                unicast: key.default_unicast || (key.peer.is_some() && !key.default_multicast),
+                multicast: key.default_multicast || (key.peer.is_none() && !key.default_unicast),
+            };
+        }
+        if !interfaces
+            .iter()
+            .any(|interface| interface.ifindex == ifindex)
+        {
+            return Err(AxError::NotFound);
+        }
+        let result = axnet::wireless_key_operation(ifindex, operation, &key)?;
+        if let Some(info) = result {
+            socket.enqueue_kernel_permitted(
+                permit,
+                key_message(header, port_id, ifindex, &key, &info),
+            );
         }
         return Ok(());
     }
@@ -591,6 +648,97 @@ fn parse_station_request(attributes: &[u8]) -> AxResult<(u32, Option<[u8; 6]>)> 
     Ok((ifindex.ok_or(AxError::InvalidInput)?, address))
 }
 
+fn parse_key_request(attributes: &[u8], command: u8) -> AxResult<(u32, axnet::WirelessKeyConfig)> {
+    let mut ifindex = None;
+    let mut index = None;
+    let mut cipher = None;
+    let mut key_data = None;
+    let mut sequence = None;
+    let mut peer = None;
+    let mut default_flag = false;
+    let mut default_types_present = false;
+    let mut default_unicast = false;
+    let mut default_multicast = false;
+    for_each_rtattr(attributes, |kind, value| match kind {
+        ATTR_IFINDEX if ifindex.is_none() && value.len() == 4 => {
+            ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_KEY_IDX if index.is_none() && value.len() == 1 => {
+            index = Some(value[0]);
+            Ok(())
+        }
+        ATTR_KEY_CIPHER if cipher.is_none() && value.len() == 4 => {
+            cipher = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_KEY_DATA if key_data.is_none() && value.len() <= 64 => {
+            key_data = Some(value.to_vec());
+            Ok(())
+        }
+        ATTR_KEY_SEQ if sequence.is_none() && !value.is_empty() && value.len() <= 8 => {
+            sequence = Some(value.to_vec());
+            Ok(())
+        }
+        ATTR_MAC if peer.is_none() && value.len() == 6 => {
+            peer = Some(value.try_into().unwrap());
+            Ok(())
+        }
+        ATTR_KEY_DEFAULT if !default_flag && value.is_empty() => {
+            default_flag = true;
+            Ok(())
+        }
+        ATTR_KEY_DEFAULT_TYPES if !default_types_present => {
+            default_types_present = true;
+            for_each_rtattr(value, |kind, flag| {
+                if !flag.is_empty() {
+                    return Err(AxError::InvalidInput);
+                }
+                match kind {
+                    KEY_DEFAULT_TYPE_UNICAST if !default_unicast => default_unicast = true,
+                    KEY_DEFAULT_TYPE_MULTICAST if !default_multicast => default_multicast = true,
+                    KEY_DEFAULT_TYPE_UNICAST | KEY_DEFAULT_TYPE_MULTICAST => {
+                        return Err(AxError::InvalidInput);
+                    }
+                    _ => return Err(AxError::OperationNotSupported),
+                }
+                Ok(())
+            })
+        }
+        ATTR_IFINDEX
+        | ATTR_KEY_IDX
+        | ATTR_KEY_CIPHER
+        | ATTR_KEY_DATA
+        | ATTR_KEY_SEQ
+        | ATTR_MAC
+        | ATTR_KEY_DEFAULT
+        | ATTR_KEY_DEFAULT_TYPES => Err(AxError::InvalidInput),
+        _ => Err(AxError::OperationNotSupported),
+    })?;
+    let index = index.ok_or(AxError::InvalidInput)?;
+    if index > 3 {
+        return Err(AxError::InvalidInput);
+    }
+    match command {
+        CMD_NEW_KEY if key_data.is_some() && cipher.is_some() && !default_flag => {}
+        CMD_SET_KEY if key_data.is_none() && cipher.is_none() && default_flag => {}
+        CMD_GET_KEY | CMD_DEL_KEY if key_data.is_none() && cipher.is_none() && !default_flag => {}
+        _ => return Err(AxError::InvalidInput),
+    }
+    Ok((
+        ifindex.ok_or(AxError::InvalidInput)?,
+        axnet::WirelessKeyConfig {
+            index,
+            cipher_suite: cipher.unwrap_or_default(),
+            peer: peer.filter(|address| *address != [0xff; 6]),
+            key_data: key_data.unwrap_or_default(),
+            sequence: sequence.unwrap_or_default(),
+            default_unicast,
+            default_multicast,
+        },
+    ))
+}
+
 fn scan_bss_message(
     request: &NlMsgHdr,
     port_id: u32,
@@ -655,6 +803,34 @@ fn station_message(
     push_attr(&mut statistics, STA_INFO_SIGNAL, &[signal_dbm as u8]);
     push_attr(&mut payload, ATTR_STA_INFO | NLA_F_NESTED, &statistics);
     nl80211_message(request, port_id, FAMILY_ID, payload, multipart)
+}
+
+fn key_message(
+    request: &NlMsgHdr,
+    port_id: u32,
+    ifindex: u32,
+    key: &axnet::WirelessKeyConfig,
+    info: &axnet::WirelessKeyInfo,
+) -> Vec<u8> {
+    let mut payload = payload_with(&GenlMsgHdr {
+        cmd: CMD_NEW_KEY,
+        version: FAMILY_VERSION,
+        reserved: 0,
+    });
+    push_attr(&mut payload, ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    push_attr(&mut payload, ATTR_KEY_IDX, &[key.index]);
+    push_attr(
+        &mut payload,
+        ATTR_KEY_CIPHER,
+        &info.cipher_suite.to_ne_bytes(),
+    );
+    if !info.sequence.is_empty() {
+        push_attr(&mut payload, ATTR_KEY_SEQ, &info.sequence);
+    }
+    if let Some(peer) = key.peer {
+        push_attr(&mut payload, ATTR_MAC, &peer);
+    }
+    nl80211_message(request, port_id, FAMILY_ID, payload, false)
 }
 
 fn empty_dump_response(request: &NlMsgHdr, port_id: u32) -> Vec<u8> {
@@ -748,6 +924,12 @@ fn wiphy_message(
         &interface_types,
     );
     push_attr(&mut payload, ATTR_MAX_NUM_SCAN_SSIDS, &[1]);
+    push_attr(
+        &mut payload,
+        ATTR_CIPHER_SUITES,
+        &0x000fac04u32.to_ne_bytes(),
+    );
+    push_attr(&mut payload, ATTR_MAX_NUM_PMKIDS, &0u32.to_ne_bytes());
     let mut supported_commands = Vec::new();
     for (index, command) in [
         CMD_GET_WIPHY,
@@ -759,6 +941,10 @@ fn wiphy_message(
         CMD_CONNECT,
         CMD_DISCONNECT,
         CMD_GET_STATION,
+        CMD_GET_KEY,
+        CMD_SET_KEY,
+        CMD_NEW_KEY,
+        CMD_DEL_KEY,
     ]
     .into_iter()
     .enumerate()
@@ -901,6 +1087,10 @@ mod tests {
         assert_eq!(CMD_DISCONNECT, 48);
         assert_eq!(CMD_GET_STATION, 17);
         assert_eq!(CMD_NEW_STATION, 19);
+        assert_eq!(CMD_GET_KEY, 9);
+        assert_eq!(CMD_SET_KEY, 10);
+        assert_eq!(CMD_NEW_KEY, 11);
+        assert_eq!(CMD_DEL_KEY, 12);
         assert_eq!(ATTR_WIPHY_FREQ, 38);
         assert_eq!(ATTR_STATUS_CODE, 72);
         assert_eq!(ATTR_REG_ALPHA2, 33);
@@ -1184,10 +1374,21 @@ mod tests {
             &[0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
         );
         let mut max_ssids = None;
+        let mut cipher_suites = Vec::new();
+        let mut max_pmkids = None;
         let mut commands = Vec::new();
         for_each_rtattr(attrs, |kind, value| {
             if kind == ATTR_MAX_NUM_SCAN_SSIDS {
                 max_ssids = value.first().copied();
+            } else if kind == ATTR_CIPHER_SUITES {
+                if !value.len().is_multiple_of(4) {
+                    return Err(AxError::InvalidInput);
+                }
+                for cipher in value.chunks_exact(4) {
+                    cipher_suites.push(u32::from_ne_bytes(cipher.try_into().unwrap()));
+                }
+            } else if kind == ATTR_MAX_NUM_PMKIDS {
+                max_pmkids = Some(u32::from_ne_bytes(value.try_into().unwrap()));
             } else if kind == ATTR_SUPPORTED_COMMANDS {
                 for_each_rtattr(value, |_, command| {
                     commands.push(u32::from_ne_bytes(command.try_into().unwrap()));
@@ -1198,7 +1399,9 @@ mod tests {
         })
         .unwrap();
         assert_eq!(max_ssids, Some(1));
-        assert_eq!(commands, [1, 5, 33, 114, 32, 31]);
+        assert_eq!(cipher_suites, [0x000fac04]);
+        assert_eq!(max_pmkids, Some(0));
+        assert_eq!(commands, [1, 5, 33, 114, 32, 31, 46, 48, 17, 9, 10, 11, 12]);
     }
 
     #[test]
@@ -1295,6 +1498,84 @@ mod tests {
         );
         push_attr(&mut attrs, ATTR_MAC, &[2, 3, 4, 5, 6, 8]);
         assert_eq!(parse_station_request(&attrs), Err(AxError::InvalidInput));
+    }
+
+    #[test]
+    fn key_requests_encode_standard_ccmp_key_fields_and_reject_duplicates() {
+        let mut attrs = Vec::new();
+        push_attr(&mut attrs, ATTR_IFINDEX, &12u32.to_ne_bytes());
+        push_attr(&mut attrs, ATTR_KEY_IDX, &[1]);
+        push_attr(&mut attrs, ATTR_KEY_CIPHER, &0x000fac04u32.to_ne_bytes());
+        push_attr(&mut attrs, ATTR_KEY_DATA, &[0x55; 16]);
+        push_attr(&mut attrs, ATTR_KEY_SEQ, &[1, 0, 0, 0, 0, 0]);
+        push_attr(&mut attrs, ATTR_MAC, &[2, 3, 4, 5, 6, 7]);
+        let (ifindex, key) = parse_key_request(&attrs, CMD_NEW_KEY).unwrap();
+        assert_eq!(ifindex, 12);
+        assert_eq!(key.index, 1);
+        assert_eq!(key.cipher_suite, 0x000fac04);
+        assert_eq!(key.key_data, [0x55; 16]);
+        assert_eq!(key.sequence, [1, 0, 0, 0, 0, 0]);
+        assert_eq!(key.peer, Some([2, 3, 4, 5, 6, 7]));
+        push_attr(&mut attrs, ATTR_KEY_IDX, &[2]);
+        assert_eq!(
+            parse_key_request(&attrs, CMD_NEW_KEY),
+            Err(AxError::InvalidInput)
+        );
+
+        let mut default = Vec::new();
+        push_attr(&mut default, ATTR_IFINDEX, &12u32.to_ne_bytes());
+        push_attr(&mut default, ATTR_KEY_IDX, &[1]);
+        push_attr(&mut default, ATTR_KEY_DEFAULT, &[]);
+        let mut default_types = Vec::new();
+        push_attr(&mut default_types, KEY_DEFAULT_TYPE_MULTICAST, &[]);
+        push_attr(
+            &mut default,
+            ATTR_KEY_DEFAULT_TYPES | NLA_F_NESTED,
+            &default_types,
+        );
+        let parsed_default = parse_key_request(&default, CMD_SET_KEY).unwrap().1;
+        assert_eq!(parsed_default.index, 1);
+        assert!(parsed_default.default_multicast);
+        assert!(!parsed_default.default_unicast);
+    }
+
+    #[test]
+    fn get_key_reply_returns_only_the_cipher_and_packet_number() {
+        let request = NlMsgHdr {
+            nlmsg_len: size_of::<NlMsgHdr>() as u32,
+            nlmsg_type: FAMILY_ID,
+            nlmsg_flags: 0,
+            nlmsg_seq: 7,
+            nlmsg_pid: 8,
+        };
+        let key = axnet::WirelessKeyConfig {
+            index: 1,
+            peer: Some([2, 3, 4, 5, 6, 7]),
+            ..Default::default()
+        };
+        let info = axnet::WirelessKeyInfo {
+            cipher_suite: 0x000fac04,
+            sequence: [1, 2, 3, 4, 5, 6].to_vec(),
+        };
+        let message = key_message(&request, 8, 12, &key, &info);
+        let generic = size_of::<NlMsgHdr>();
+        assert_eq!(message[generic], CMD_NEW_KEY);
+        let mut saw_data = false;
+        let mut sequence = None;
+        for_each_rtattr(
+            &message[generic + size_of::<GenlMsgHdr>()..],
+            |kind, value| {
+                if kind == ATTR_KEY_DATA {
+                    saw_data = true;
+                } else if kind == ATTR_KEY_SEQ {
+                    sequence = Some(value.to_vec());
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!saw_data);
+        assert_eq!(sequence, Some(info.sequence));
     }
 
     #[test]

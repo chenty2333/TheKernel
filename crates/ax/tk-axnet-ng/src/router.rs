@@ -1087,6 +1087,19 @@ impl Router {
             .ok_or(AxError::NoSuchDevice)
     }
 
+    pub(crate) fn wireless_key_operation(
+        &mut self,
+        ifindex: u32,
+        operation: axdriver::prelude::WirelessKeyOperation,
+        key: &axdriver::prelude::WirelessKeyConfig,
+    ) -> AxResult<Option<axdriver::prelude::WirelessKeyInfo>> {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        self.devices[slot].wireless_key_operation(operation, key)
+    }
+
     pub(crate) fn wireless_scan_results(
         &self,
         ifindex: u32,

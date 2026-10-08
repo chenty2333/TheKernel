@@ -20,7 +20,8 @@ use axdriver_iwx::{
 };
 use axdriver_net::{
     EthernetAddress, NetBuf, NetBufPool, NetBufPtr, NetDriverOps, WirelessFrequency,
-    WirelessHtCapabilities, WirelessPhyCapabilities, WirelessScanEvent, WirelessVhtCapabilities,
+    WirelessHtCapabilities, WirelessKeyConfig, WirelessKeyInfo, WirelessKeyOperation,
+    WirelessPhyCapabilities, WirelessScanEvent, WirelessVhtCapabilities,
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::{phys_to_virt, virt_to_phys};
@@ -204,10 +205,24 @@ struct AttachedDevice {
     scan_event: Option<WirelessScanEvent>,
     association: axdriver_iwx::AssociationState,
     session_protection: axdriver_iwx::SessionProtectionState,
+    security_keys: IwxSecurityKeys,
     station: Option<StationConnection>,
     runtime_started: bool,
     interface_up: bool,
     soft_blocked: bool,
+}
+
+#[derive(Default)]
+struct IwxSecurityKeys {
+    pairwise: Option<IwxKeySlot>,
+    groups: [Option<IwxKeySlot>; 4],
+    default_group: u8,
+}
+
+struct IwxKeySlot {
+    index: u8,
+    cipher_suite: u32,
+    software: tk_net80211::SoftwareKey,
 }
 
 #[derive(Clone)]
@@ -217,6 +232,7 @@ struct StationConnection {
     frequency_mhz: u32,
     signal_mbm: i32,
     association_id: u16,
+    security_enabled: bool,
     tx_sequence: tk_net80211::ManagementTxSequence,
     data_sequence: u16,
     rx_ethernet: VecDeque<Vec<u8>>,
@@ -424,6 +440,19 @@ impl NetDriverOps for IwxNetDevice {
             })
     }
 
+    fn wireless_key_operation(
+        &mut self,
+        operation: WirelessKeyOperation,
+        key: &WirelessKeyConfig,
+    ) -> DevResult<Option<WirelessKeyInfo>> {
+        iwx_key_operation(self.bdf, operation, key).map_err(|error| match error {
+            RuntimeStartError::InvalidRequest => DevError::InvalidParam,
+            RuntimeStartError::FirmwareNotReady => DevError::BadState,
+            RuntimeStartError::UnsupportedSecurity => DevError::Unsupported,
+            _ => DevError::Io,
+        })
+    }
+
     fn disconnect_wireless(&mut self, reason: u16) -> DevResult {
         disconnect_station(self.bdf, reason).map_err(|error| match error {
             RuntimeStartError::FirmwareNotReady => DevError::BadState,
@@ -520,10 +549,25 @@ impl NetDriverOps for IwxNetDevice {
         if device.soft_blocked || !device.interface_up || !device.runtime_started {
             return Err(DevError::BadState);
         }
-        let frame =
+        let mut frame =
             tk_net80211::encap_station(ethernet, station.bssid, station.data_sequence, false)
                 .map_err(|_| DevError::InvalidParam)?;
         station.data_sequence = station.data_sequence.wrapping_add(1) & 0x0fff;
+        let ether_type = u16::from_be_bytes([ethernet[12], ethernet[13]]);
+        if station.security_enabled && ether_type != 0x888e {
+            let key = if ethernet[0] & 1 != 0 {
+                device.security_keys.groups[usize::from(device.security_keys.default_group)]
+                    .as_mut()
+            } else {
+                device.security_keys.pairwise.as_mut()
+            }
+            .ok_or(DevError::BadState)?;
+            frame = tk_net80211::encrypt_software(&mut key.software, &frame, 24, 0)
+                .map_err(|_| DevError::Io)?;
+        } else if station.security_enabled && ether_type == 0x888e {
+            // EAPOL is the userspace supplicant's unprotected control port.
+            frame[1] &= !0x40;
+        }
         device
             .controller
             .submit_data_frame(
@@ -699,6 +743,7 @@ fn allocate_resources(
         scan_event: None,
         association: axdriver_iwx::AssociationState::default(),
         session_protection: axdriver_iwx::SessionProtectionState::default(),
+        security_keys: IwxSecurityKeys::default(),
         station: None,
         runtime_started: false,
         interface_up: false,
@@ -1042,6 +1087,174 @@ fn is_open_station_request(request: &axdriver_net::WirelessConnectRequest) -> bo
         && request.information_elements.is_empty()
 }
 
+fn find_information_element(elements: &[u8], id: u8) -> Option<&[u8]> {
+    let mut remaining = elements;
+    while remaining.len() >= 2 {
+        let end = 2usize.checked_add(usize::from(remaining[1]))?;
+        let element = remaining.get(..end)?;
+        if element[0] == id {
+            return Some(element);
+        }
+        remaining = &remaining[end..];
+    }
+    None
+}
+
+fn supplicant_rsn_policy(
+    request: &axdriver_net::WirelessConnectRequest,
+    bss: &axdriver_net::WirelessBssInfo,
+) -> Result<tk_net80211::RsnIePolicy, RuntimeStartError> {
+    const CCMP_128_SUITE: u32 = 0x000f_ac04;
+    const AKM_PSK_SUITE: u32 = 0x000f_ac02;
+    if request.wpa_versions & 2 == 0
+        || request.wpa_versions & !3 != 0
+        || !request.pairwise_ciphers.contains(&CCMP_128_SUITE)
+        || request.group_cipher != Some(CCMP_128_SUITE)
+        || !request.akm_suites.contains(&AKM_PSK_SUITE)
+    {
+        return Err(RuntimeStartError::UnsupportedSecurity);
+    }
+    let rsn_ie = find_information_element(&request.information_elements, 48)
+        .or_else(|| find_information_element(&bss.information_elements, 48))
+        .ok_or(RuntimeStartError::UnsupportedSecurity)?;
+    let parsed =
+        tk_net80211::parse_rsn(rsn_ie).map_err(|_| RuntimeStartError::UnsupportedSecurity)?;
+    if parsed.group_cipher != tk_net80211::Cipher::Ccmp
+        || parsed.pairwise_ciphers & (tk_net80211::Cipher::Ccmp as u32) == 0
+        || parsed.akms & (tk_net80211::Akm::Psk as u32) == 0
+    {
+        return Err(RuntimeStartError::UnsupportedSecurity);
+    }
+    Ok(tk_net80211::RsnIePolicy {
+        wpa: false,
+        group_cipher: tk_net80211::Cipher::Ccmp as u32,
+        pairwise_ciphers: tk_net80211::Cipher::Ccmp as u32,
+        akms: tk_net80211::Akm::Psk as u32,
+        peer_capabilities: parsed.capabilities,
+        mfp_capable: false,
+        station_mode: true,
+        mfp_required: false,
+        pbac: false,
+        // PMKSA cache management is not part of this adapter yet.
+        pmkid: None,
+        group_management_cipher: 0,
+    })
+}
+
+fn iwx_key_operation(
+    bdf: Bdf,
+    operation: WirelessKeyOperation,
+    request: &WirelessKeyConfig,
+) -> Result<Option<WirelessKeyInfo>, RuntimeStartError> {
+    const CCMP_128_SUITE: u32 = 0x000f_ac04;
+    let mut devices = ATTACHED_DMA.lock();
+    let device = devices
+        .iter_mut()
+        .find(|device| device.bdf == bdf)
+        .ok_or(RuntimeStartError::DeviceNotFound)?;
+    let station = device
+        .station
+        .as_ref()
+        .ok_or(RuntimeStartError::FirmwareNotReady)?;
+    if request.index > 3 {
+        return Err(RuntimeStartError::InvalidRequest);
+    }
+    let is_pairwise = request.peer.is_some();
+    if request.peer.is_some_and(|peer| peer != station.bssid) {
+        return Err(RuntimeStartError::InvalidRequest);
+    }
+    match operation {
+        WirelessKeyOperation::Install => {
+            if !station.security_enabled {
+                return Err(RuntimeStartError::UnsupportedSecurity);
+            }
+            if request.cipher_suite != CCMP_128_SUITE {
+                return Err(RuntimeStartError::UnsupportedSecurity);
+            }
+            let mut software = tk_net80211::set_software_key(
+                tk_net80211::Cipher::Ccmp,
+                request.index,
+                &request.key_data,
+                true,
+            )
+            .map_err(|_| RuntimeStartError::InvalidRequest)?;
+            if request.sequence.len() > 8 {
+                return Err(RuntimeStartError::InvalidRequest);
+            }
+            if let tk_net80211::SoftwareKey::Ccmp(key) = &mut software {
+                let mut packet_number = [0u8; 8];
+                packet_number[..request.sequence.len()].copy_from_slice(&request.sequence);
+                key.tx_packet_number = u64::from_le_bytes(packet_number);
+            }
+            let slot = IwxKeySlot {
+                index: request.index,
+                cipher_suite: request.cipher_suite,
+                software,
+            };
+            if is_pairwise {
+                device.security_keys.pairwise = Some(slot);
+            } else {
+                device.security_keys.groups[usize::from(request.index)] = Some(slot);
+            }
+            Ok(None)
+        }
+        WirelessKeyOperation::SetDefault { unicast, multicast } => {
+            if unicast
+                && device
+                    .security_keys
+                    .pairwise
+                    .as_ref()
+                    .is_none_or(|slot| slot.index != request.index)
+            {
+                return Err(RuntimeStartError::FirmwareNotReady);
+            }
+            if multicast {
+                if device.security_keys.groups[usize::from(request.index)].is_none() {
+                    return Err(RuntimeStartError::FirmwareNotReady);
+                }
+                device.security_keys.default_group = request.index;
+            }
+            Ok(None)
+        }
+        WirelessKeyOperation::GetSequence => {
+            let slot = if is_pairwise {
+                device.security_keys.pairwise.as_ref()
+            } else {
+                device.security_keys.groups[usize::from(request.index)].as_ref()
+            }
+            .filter(|slot| slot.index == request.index)
+            .ok_or(RuntimeStartError::FirmwareNotReady)?;
+            let mut sequence = Vec::new();
+            if let tk_net80211::SoftwareKey::Ccmp(key) = &slot.software {
+                sequence.extend_from_slice(&key.tx_packet_number.to_le_bytes()[..6]);
+            }
+            Ok(Some(WirelessKeyInfo {
+                cipher_suite: slot.cipher_suite,
+                sequence,
+            }))
+        }
+        WirelessKeyOperation::Delete => {
+            if is_pairwise {
+                if device
+                    .security_keys
+                    .pairwise
+                    .as_ref()
+                    .is_some_and(|slot| slot.index != request.index)
+                {
+                    return Err(RuntimeStartError::InvalidRequest);
+                }
+                device.security_keys.pairwise = None;
+            } else {
+                device.security_keys.groups[usize::from(request.index)] = None;
+                if device.security_keys.default_group == request.index {
+                    device.security_keys.default_group = 0;
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
 fn station_management_response(
     device: &mut AttachedDevice,
     bssid: [u8; 6],
@@ -1091,9 +1304,8 @@ fn station_management_response(
     Err(RuntimeStartError::Transmission)
 }
 
-/// Connect to a cached open BSS through Open System auth and station association.
-/// WPA/RSN requests remain rejected until key installation and the userspace EAPOL
-/// data path can both be committed transactionally.
+/// Connect to a cached open or WPA2-PSK/CCMP BSS through Open System auth and
+/// station association. The userspace supplicant performs the EAPOL handshake.
 fn connect_station(
     bdf: Bdf,
     request: &axdriver_net::WirelessConnectRequest,
@@ -1112,9 +1324,7 @@ fn connect_station(
     if request.ssid.is_empty() || request.ssid.len() > 32 || request.authentication_type != 0 {
         return Err(RuntimeStartError::InvalidRequest);
     }
-    if !is_open_station_request(request) {
-        return Err(RuntimeStartError::UnsupportedSecurity);
-    }
+    let security_enabled = !is_open_station_request(request);
     let bss = device
         .scan_cache
         .as_ref()
@@ -1122,11 +1332,20 @@ fn connect_station(
             cache.results().iter().find(|bss| {
                 request.bssid.is_none_or(|address| address == bss.bssid)
                     && bss_ssid(&bss.information_elements) == Some(request.ssid.as_slice())
-                    && bss.capability & 0x0010 == 0
+                    && if security_enabled {
+                        bss.capability & 0x0010 != 0
+                    } else {
+                        bss.capability & 0x0010 == 0
+                    }
             })
         })
         .cloned()
         .ok_or(RuntimeStartError::FirmwareNotReady)?;
+    let rsn_policy = if security_enabled {
+        Some(supplicant_rsn_policy(request, &bss)?)
+    } else {
+        None
+    };
     let rates = if bss.frequency_mhz < 3000 {
         tk_net80211::STANDARD_RATES_11G
     } else {
@@ -1156,7 +1375,7 @@ fn connect_station(
     let auth_response = station_management_response(device, bss.bssid, 0xb0)?;
     let mut auth_state = tk_net80211::OpenAuthState {
         authentication_state: true,
-        rsn_enabled: false,
+        rsn_enabled: security_enabled,
         is_bss_node: true,
         sequence: 0,
         status: 0,
@@ -1184,14 +1403,18 @@ fn connect_station(
         vht_enabled: false,
         he_enabled: false,
         he_mode_supported: false,
-        privacy_wep: false,
-        rsn_enabled: false,
-        peer_rsn_protocols: 0,
+        privacy_wep: security_enabled,
+        rsn_enabled: security_enabled,
+        peer_rsn_protocols: if security_enabled {
+            tk_net80211::PROTO_RSN
+        } else {
+            0
+        },
         short_preamble: bss.capability & 0x0020 != 0,
         short_slot: bss.capability & 0x0400 != 0,
         peer_qos: false,
         qos_info: 0,
-        rsn: None,
+        rsn: rsn_policy,
         ht_caps: None,
         vht_caps: None,
         he_caps: None,
@@ -1222,7 +1445,7 @@ fn connect_station(
         channel_supports_he: false,
         station_mode: true,
         wep_enabled: false,
-        rsn_enabled: false,
+        rsn_enabled: security_enabled,
         ht_caps: tk_net80211::HtCapabilities::default(),
         supported_ht_mcs: [0; 10],
         vht_caps: tk_net80211::VhtCapabilities::default(),
@@ -1239,8 +1462,12 @@ fn connect_station(
             fixed_rate: None,
             local_phy,
             local_channel_160_allowed: false,
-            pairwise_ciphers: 0,
-            rsn_enabled: false,
+            pairwise_ciphers: if security_enabled {
+                tk_net80211::Cipher::Ccmp as u32
+            } else {
+                0
+            },
+            rsn_enabled: security_enabled,
             wep_enabled: false,
             local_qos_enabled: false,
             local_uapsd_enabled: false,
@@ -1301,6 +1528,7 @@ fn connect_station(
         frequency_mhz: bss.frequency_mhz,
         signal_mbm: bss.signal_mbm,
         association_id: assoc.association_id & 0x3fff,
+        security_enabled,
         tx_sequence,
         data_sequence: 0,
         rx_ethernet: VecDeque::new(),
@@ -1320,6 +1548,7 @@ fn disconnect_station(bdf: Bdf, reason: u16) -> Result<(), RuntimeStartError> {
     };
     if !device.runtime_started || device.soft_blocked {
         device.station = None;
+        device.security_keys = IwxSecurityKeys::default();
         return Ok(());
     }
 
@@ -1475,6 +1704,7 @@ fn disconnect_station(bdf: Bdf, reason: u16) -> Result<(), RuntimeStartError> {
         .disable_management_queue(queue_version)
         .map_err(|_| RuntimeStartError::ManagementQueue)?;
     device.station = None;
+    device.security_keys = IwxSecurityKeys::default();
     device.association = axdriver_iwx::AssociationState::default();
     device.session_protection = axdriver_iwx::SessionProtectionState::default();
     Ok(())
@@ -1560,9 +1790,55 @@ fn pump_station_rx(device: &mut AttachedDevice) -> Result<(), RuntimeStartError>
         let Some(station) = device.station.as_mut() else {
             continue;
         };
+        let mut frame = received.frame;
+        let mut security_decrypted = false;
+        if frame.get(1).is_some_and(|control| control & 0x40 != 0) {
+            if !station.security_enabled {
+                continue;
+            }
+            let Ok(header_len) = tk_net80211::header_length(&frame) else {
+                continue;
+            };
+            let Some(selection) = tk_net80211::select_rx_key(&frame, header_len, true, false)
+            else {
+                continue;
+            };
+            let key = match selection {
+                tk_net80211::KeySelection::Pairwise => device.security_keys.pairwise.as_mut(),
+                tk_net80211::KeySelection::Group(index) => device
+                    .security_keys
+                    .groups
+                    .get_mut(usize::from(index))
+                    .and_then(Option::as_mut),
+            };
+            let Some(key) = key else { continue };
+            let Some(key_id) = frame.get(header_len + 3).map(|byte| byte >> 6) else {
+                continue;
+            };
+            if key.index != key_id {
+                continue;
+            }
+            let Ok(decrypted) =
+                tk_net80211::decrypt_software(&mut key.software, &frame, header_len)
+            else {
+                continue;
+            };
+            frame = decrypted;
+            security_decrypted = true;
+        }
+        if station.security_enabled
+            && frame.get(1).is_some_and(|control| control & 0x40 == 0)
+            && tk_net80211::header_length(&frame).is_ok_and(|header_len| {
+                frame
+                    .get(header_len..header_len + 8)
+                    .is_some_and(|snap| snap == [0xaa, 0xaa, 0x03, 0, 0, 0, 0x88, 0x8e])
+            })
+        {
+            security_decrypted = true;
+        }
         let result = tk_net80211::receive_station_data(
             &mut station.nodes,
-            &received.frame,
+            &frame,
             (i16::from(rssi) + 100).clamp(0, 100) as u8,
             u64::from(received.metadata.device_timestamp),
             0,
@@ -1576,10 +1852,10 @@ fn pump_station_rx(device: &mut AttachedDevice) -> Result<(), RuntimeStartError>
                     .map_or([0; 6], |nvm| nvm.hardware_address),
                 simplex: false,
                 wep_enabled: false,
-                rsn_rx_protected: false,
+                rsn_rx_protected: station.security_enabled,
                 peer_ht: false,
                 ampdu_done: received.metadata.reorder_data != 0,
-                hardware_decrypted: false,
+                hardware_decrypted: security_decrypted,
                 same_sequence: received.same_sequence,
                 rx_ba_states: [0; 16],
             },
@@ -2216,6 +2492,7 @@ pub fn stop_runtime(bdf: DeviceFunction) -> Result<(), RuntimeStartError> {
         .map_err(|_| RuntimeStartError::Hardware)?;
     device.runtime_started = false;
     device.station = None;
+    device.security_keys = IwxSecurityKeys::default();
     device.association = axdriver_iwx::AssociationState::default();
     device.session_protection = axdriver_iwx::SessionProtectionState::default();
     Ok(())
@@ -2582,6 +2859,8 @@ pub(crate) fn probe(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use axdriver_iwx::{INTEL_VENDOR_ID, setup_ht_rate_capabilities, setup_vht_rate_capabilities};
     use axdriver_net::NetDriverOps;
 
@@ -2643,6 +2922,51 @@ mod tests {
         );
         assert_eq!(bss_ssid(&[1, 1]), None);
         assert_eq!(bss_ssid(&[0, 3, b'o']), None);
+    }
+
+    #[test]
+    fn secure_join_admission_selects_only_wpa2_psk_ccmp() {
+        let body = tk_net80211::build_rsn_body(&tk_net80211::RsnIePolicy {
+            group_cipher: tk_net80211::CIPHER_CCMP,
+            pairwise_ciphers: tk_net80211::CIPHER_CCMP,
+            akms: tk_net80211::AKM_PSK,
+            station_mode: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut information_elements = vec![0, 4, b't', b'e', b's', b't'];
+        information_elements.push(48);
+        information_elements.push(body.len() as u8);
+        information_elements.extend_from_slice(&body);
+        let bss = axdriver_net::WirelessBssInfo {
+            bssid: [2, 3, 4, 5, 6, 7],
+            frequency_mhz: 2412,
+            signal_mbm: -6000,
+            timestamp: 1,
+            beacon_interval: 100,
+            capability: 0x0011,
+            information_elements,
+            is_probe_response: false,
+        };
+        let request = axdriver_net::WirelessConnectRequest {
+            ssid: b"test".to_vec(),
+            wpa_versions: 2,
+            pairwise_ciphers: vec![0x000fac04],
+            group_cipher: Some(0x000fac04),
+            akm_suites: vec![0x000fac02],
+            ..Default::default()
+        };
+        let policy = supplicant_rsn_policy(&request, &bss).unwrap();
+        assert_eq!(policy.group_cipher, tk_net80211::CIPHER_CCMP);
+        assert_eq!(policy.pairwise_ciphers, tk_net80211::CIPHER_CCMP);
+        assert_eq!(policy.akms, tk_net80211::AKM_PSK);
+
+        let mut unsupported = request.clone();
+        unsupported.wpa_versions = 1;
+        assert_eq!(
+            supplicant_rsn_policy(&unsupported, &bss),
+            Err(RuntimeStartError::UnsupportedSecurity)
+        );
     }
 
     #[test]

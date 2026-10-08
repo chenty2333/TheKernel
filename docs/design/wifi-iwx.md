@@ -202,11 +202,13 @@ populate the APM L0s/LTR state used by later power policy. The PCI adapter now
 exports `start_runtime(DeviceFunction)` to start regular ucode, PNVM doorbell
 completion and post-ALIVE when the WLAN netdev requests if-up. The management
 queue is deferred until station-context authentication as in `iwx_auth()`.
-The if-up caller, foreground firmware scan poll, and an Open-System station
-join path (auth, association response, firmware MAC update, data queue) are
-wired. Open, unprotected Ethernet frames are encapsulated/de-encapsulated via
-net80211 and the driver's bounded RX poll; WPA/RSN key installation and EAPOL
-data protection remain unsupported. There is no MSI-X/IRQ worker yet.
+The if-up caller, foreground firmware scan poll, and station join paths are
+wired for open networks and WPA2-PSK with CCMP (Open-System authentication,
+association response and firmware context updates). The four-way handshake
+remains in the userspace supplicant; WPA/RSN key operations install CCMP
+software keys, with Ethernet data encrypted/decrypted through net80211 while
+EAPOL remains on the unprotected control port. TKIP/WEP, MFP/IGTK hardware
+offload, and other AKMs are not admitted. There is no MSI-X/IRQ worker yet.
 
 The init-net handoff now accepts an explicitly named wireless `NetDriverOps`
 as a second Ethernet-compatible link after rootfs-ready firmware staging. It
@@ -241,10 +243,11 @@ is connected. Open-System joins use the cached scan BSS and source net80211
 authentication/association frames, then activate a station queue. Ethernet
 data TX is encapsulated on that queue; RX notifications pass through iwx
 descriptor/duplicate handling and the net80211 station receive path before
-being queued to axnet. Open stations can send deauthentication and remove their
-firmware station/binding/MAC/PHY contexts on disconnect. WPA/RSN joins,
-hardware/software key setup, protected data, and unsolicited/asynchronous MLME
-events remain incomplete.
+being queued to axnet. Open and WPA2-PSK/CCMP stations send deauthentication
+and remove their firmware station/binding/MAC/PHY contexts on disconnect.
+CCMP key material stays in the net80211 software cipher context rather than
+firmware offload. Other cipher suites, AKMs, MFP/IGTK hardware offload and
+unsolicited/asynchronous MLME events remain incomplete.
 
 
 ## Guest user-space payload

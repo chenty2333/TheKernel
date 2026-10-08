@@ -94,6 +94,34 @@ pub struct WirelessStationInfo {
     pub association_id: u16,
 }
 
+/// One nl80211-installed temporal/group key from userspace.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessKeyConfig {
+    pub index: u8,
+    pub cipher_suite: u32,
+    pub peer: Option<[u8; 6]>,
+    pub key_data: alloc::vec::Vec<u8>,
+    pub sequence: alloc::vec::Vec<u8>,
+    pub default_unicast: bool,
+    pub default_multicast: bool,
+}
+
+/// Key operations requested through nl80211.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WirelessKeyOperation {
+    Install,
+    SetDefault { unicast: bool, multicast: bool },
+    GetSequence,
+    Delete,
+}
+
+/// Key metadata returned for a GET_KEY request.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessKeyInfo {
+    pub cipher_suite: u32,
+    pub sequence: alloc::vec::Vec<u8>,
+}
+
 /// One station-mode BSS observation returned by an actual RX beacon/probe frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WirelessBssInfo {
@@ -175,6 +203,15 @@ pub trait NetDriverOps: BaseDriverOps {
     /// Return the currently associated peer for GET_STATION.
     fn wireless_station_info(&self) -> Option<WirelessStationInfo> {
         None
+    }
+
+    /// Apply a station data-key operation admitted by the adapter.
+    fn wireless_key_operation(
+        &mut self,
+        _operation: WirelessKeyOperation,
+        _key: &WirelessKeyConfig,
+    ) -> DevResult<Option<WirelessKeyInfo>> {
+        Err(DevError::Unsupported)
     }
 
     /// Snapshot BSSes parsed from received firmware RX notifications.
