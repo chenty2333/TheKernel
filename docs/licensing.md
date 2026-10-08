@@ -757,3 +757,7 @@ mode/modeset functions in Linux 7.2.3 `intel_display.c` (MIT, © 2006-2007
 Intel); the target-inapplicable generations and framework/debug boundaries
 are named in `docs/design/intel-display-modeset-full.md`. Its SPDX tag and
 crate `LICENSE-MIT` preserve the grant.
+
+`kernel/src/drm/color_mgmt_full.rs` translates 26 color-management functions
+from Linux 7.2.3 `drm_color_mgmt.c` (MIT-style grant, © 2016 Intel); its full
+license text remains in the source and `kernel/LICENSES/LicenseRef-Intel-Color-Mgmt-MIT`.
