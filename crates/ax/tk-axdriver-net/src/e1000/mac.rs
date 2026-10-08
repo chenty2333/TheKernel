@@ -120,6 +120,9 @@ pub trait E1000NvmReader {
 
 pub trait E1000PhyRegisterIo: E1000RegisterIo {
     fn read_phy_register(&mut self, register: u8) -> DevResult<u16>;
+    fn write_phy_register(&mut self, _register: u8, _value: u16) -> DevResult {
+        Err(DevError::Unsupported)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
