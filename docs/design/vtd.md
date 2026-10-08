@@ -102,9 +102,9 @@ constraints, but is not yet wired as a tag layer into every kernel DMA client.
 routing, requester-tagged MSI entries, IOAPIC delivery-mode/polarity/trigger
 encoding, entry update/free with IEC invalidation, and IRTA initialization/final
 sequence. VMEM, `device_t` source lookup, `intr_reprogram()` and physical IRTE
-allocation are adapters. TheKernel's current ACPI/VT-d startup does not install
-this IR table adapter into the APIC/IOAPIC vector path; therefore these routes
-are unit-tested code, not enabled interrupt remapping.
+allocation are adapters. `intremap=on` now installs the IR table and routes
+allocated PCI MSI vectors through IRTEs; QEMU acceptance is recorded below.
+IOAPIC vector redirection itself remains outside this MSI integration path.
 
 The generic FreeBSD `iommu_utils.c` shared routines now have an explicit
 `tk-vtd/src/iommu_utils.rs` mapping (8/44 functions): four radix page-table
@@ -115,14 +115,13 @@ IOMMU vtable dispatch, IRQ/MSI resource management, sysctl registration, and
 DDB output; page storage, DMA clients, QI, and interrupt routes map to existing
 TheKernel-owned seams instead of importing those frameworks.
 
-Final `intel_iommu=on` QEMU split-irqchip acceptance was rerun after the
-FreeBSD source adapters were added. The runner confirmed the Multiboot command
-line carried `intel_iommu=on` and attached `intel-iommu,intremap=on`, but QEMU
-timed out at 180 seconds before the guest acceptance commands ran. The serial
-log stopped immediately after BSP CPU feature/enable messages; no VT-d-stage
-log or guest marker was observed, so the exact stall point is unknown. The
-identity-by-default fallback remains in place; translated DMA and interrupt
-remapping are not accepted and must not be enabled by default.
+An early `intel_iommu=on` QEMU split-irqchip retry, before requester-aware
+domains and the final MSI routing seam were complete, timed out before guest
+acceptance commands ran. At that snapshot the serial log stopped after BSP CPU
+feature/enable messages, so the exact stall point was unknown. Later opt-in
+acceptance runs below supersede this failed attempt for their tested device
+profiles; identity/shared-DMA remains the safe default while the complete PCI
+DMA-master population and normal graphics profile are not yet accepted.
 
 Follow-up `busdma_iommu.c` coverage adds the page-array loader and contiguous
 physical loader seams (`iommu_bus_dmamap_load_ma` and `_load_phys`), raising
