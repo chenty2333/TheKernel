@@ -6,13 +6,152 @@
 
 use axdriver_base::{DevError, DevResult};
 
-use super::{osdep::E1000RegisterIo, registers::*};
+use super::{
+    osdep::{E1000PciConfig, E1000RegisterIo, read_pcie_cap_reg},
+    registers::*,
+};
 
 const ETHER_ADDR_LEN: usize = 6;
 const MTA_REG_COUNT: usize = 128;
 const VFTA_REG_COUNT: usize = 128;
 const RAL: u32 = 0x05400;
 const RAH: u32 = 0x05404;
+const PCI_HEADER_TYPE_REGISTER: u32 = 0x0e;
+const PCI_HEADER_TYPE_MULTIFUNC: u16 = 0x80;
+const PCIE_LINK_STATUS: u32 = 0x12;
+const PCIE_LINK_SPEED_MASK: u16 = 0x000f;
+const PCIE_LINK_WIDTH_MASK: u16 = 0x03f0;
+const PCIE_LINK_WIDTH_SHIFT: u32 = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum E1000BusType {
+    Pci,
+    PciX,
+    PciExpress,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum E1000BusSpeed {
+    Unknown,
+    Reserved,
+    Mhz33,
+    Mhz66,
+    Mhz100,
+    Mhz133,
+    Gt2500,
+    Gt5000,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum E1000BusWidth {
+    Unknown,
+    Bits32,
+    Bits64,
+    Pcie(u8),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct E1000BusInfo {
+    pub kind: E1000BusType,
+    pub speed: E1000BusSpeed,
+    pub width: E1000BusWidth,
+    pub function: u8,
+}
+
+/// upstream: e1000_mac.c e1000_set_lan_id_multi_port_pcie()
+pub fn set_lan_id_multi_port_pcie<I: E1000RegisterIo>(io: &mut I) -> DevResult<u8> {
+    Ok(
+        ((io.read_register(E1000_STATUS)? & E1000_STATUS_FUNC_MASK) >> E1000_STATUS_FUNC_SHIFT)
+            as u8,
+    )
+}
+
+/// upstream: e1000_mac.c e1000_set_lan_id_multi_port_pci()
+pub fn set_lan_id_multi_port_pci<I: E1000RegisterIo, P: E1000PciConfig>(
+    io: &mut I,
+    pci: &mut P,
+) -> DevResult<u8> {
+    let header = super::osdep::read_pci_cfg(pci, PCI_HEADER_TYPE_REGISTER)?;
+    if header & PCI_HEADER_TYPE_MULTIFUNC != 0 {
+        set_lan_id_multi_port_pcie(io)
+    } else {
+        Ok(0)
+    }
+}
+
+/// upstream: e1000_mac.c e1000_set_lan_id_single_port()
+pub const fn set_lan_id_single_port() -> u8 {
+    0
+}
+
+/// upstream: e1000_mac.c e1000_get_bus_info_pci_generic()
+pub fn get_bus_info_pci_generic<I: E1000RegisterIo>(io: &mut I) -> DevResult<E1000BusInfo> {
+    let status = io.read_register(E1000_STATUS)?;
+    let kind = if status & E1000_STATUS_PCIX_MODE != 0 {
+        E1000BusType::PciX
+    } else {
+        E1000BusType::Pci
+    };
+    let speed = if kind == E1000BusType::Pci {
+        if status & E1000_STATUS_PCI66 != 0 {
+            E1000BusSpeed::Mhz66
+        } else {
+            E1000BusSpeed::Mhz33
+        }
+    } else {
+        match status & E1000_STATUS_PCIX_SPEED {
+            E1000_STATUS_PCIX_SPEED_66 => E1000BusSpeed::Mhz66,
+            E1000_STATUS_PCIX_SPEED_100 => E1000BusSpeed::Mhz100,
+            E1000_STATUS_PCIX_SPEED_133 => E1000BusSpeed::Mhz133,
+            _ => E1000BusSpeed::Reserved,
+        }
+    };
+    Ok(E1000BusInfo {
+        kind,
+        speed,
+        width: if status & E1000_STATUS_BUS64 != 0 {
+            E1000BusWidth::Bits64
+        } else {
+            E1000BusWidth::Bits32
+        },
+        function: set_lan_id_multi_port_pcie(io)?,
+    })
+}
+
+/// upstream: e1000_mac.c e1000_get_bus_info_pcie_generic()
+pub fn get_bus_info_pcie_generic<I: E1000RegisterIo, P: E1000PciConfig>(
+    io: &mut I,
+    pci: &mut P,
+) -> DevResult<E1000BusInfo> {
+    let link = read_pcie_cap_reg(pci, PCIE_LINK_STATUS).ok();
+    let (speed, width) = match link {
+        Some(link) => (
+            match link & PCIE_LINK_SPEED_MASK {
+                1 => E1000BusSpeed::Gt2500,
+                2 => E1000BusSpeed::Gt5000,
+                _ => E1000BusSpeed::Unknown,
+            },
+            E1000BusWidth::Pcie(((link & PCIE_LINK_WIDTH_MASK) >> PCIE_LINK_WIDTH_SHIFT) as u8),
+        ),
+        None => (E1000BusSpeed::Unknown, E1000BusWidth::Unknown),
+    };
+    Ok(E1000BusInfo {
+        kind: E1000BusType::PciExpress,
+        speed,
+        width,
+        function: set_lan_id_multi_port_pcie(io)?,
+    })
+}
+
+/// upstream: e1000_mac.c e1000_config_collision_dist_generic()
+pub fn config_collision_dist_generic<I: E1000RegisterIo>(io: &mut I) -> DevResult {
+    let mut control = io.read_register(E1000_TCTL)?;
+    control &= !E1000_TCTL_COLD;
+    control |= E1000_COLLISION_DISTANCE << E1000_COLD_SHIFT;
+    io.write_register(E1000_TCTL, control)?;
+    let _ = io.read_register(E1000_STATUS)?;
+    Ok(())
+}
 
 /// upstream: e1000_mac.c e1000_null_ops_generic()
 pub const fn null_ops_generic() -> i32 {
@@ -170,10 +309,15 @@ mod tests {
     #[derive(Default)]
     struct Registers {
         writes: alloc::vec::Vec<(u32, u32)>,
+        status: u32,
     }
     impl E1000RegisterIo for Registers {
-        fn read_register(&mut self, _: u32) -> DevResult<u32> {
-            Ok(0)
+        fn read_register(&mut self, register: u32) -> DevResult<u32> {
+            Ok(if register == E1000_STATUS {
+                self.status
+            } else {
+                0
+            })
         }
         fn write_register(&mut self, register: u32, value: u32) -> DevResult {
             self.writes.push((register, value));
@@ -181,6 +325,34 @@ mod tests {
         }
         fn delay_us(&mut self, _: u32) {}
         fn invalid_tail_write(&mut self, _: &'static str) {}
+    }
+
+    struct Pci {
+        words: [u16; 128],
+        pcie: Option<u32>,
+    }
+    impl Default for Pci {
+        fn default() -> Self {
+            Self {
+                words: [0; 128],
+                pcie: None,
+            }
+        }
+    }
+    impl E1000PciConfig for Pci {
+        fn read_config_u16(&mut self, register: u32) -> Option<u16> {
+            self.words.get(register as usize / 2).copied()
+        }
+        fn write_config_u16(&mut self, register: u32, value: u16) -> bool {
+            let Some(word) = self.words.get_mut(register as usize / 2) else {
+                return false;
+            };
+            *word = value;
+            true
+        }
+        fn find_capability(&mut self, capability_id: u8) -> Option<u32> {
+            (capability_id == 0x10).then_some(self.pcie).flatten()
+        }
     }
 
     #[test]
@@ -203,6 +375,53 @@ mod tests {
         null_write_vfta();
         assert_eq!(null_rar_set(), 0);
         assert_eq!(null_set_obff_timer(), 0);
+    }
+
+    #[test]
+    fn generic_pci_bus_info_decodes_type_speed_width_and_function() {
+        let mut io = Registers {
+            status: E1000_STATUS_PCIX_MODE
+                | E1000_STATUS_PCIX_SPEED_100
+                | E1000_STATUS_BUS64
+                | E1000_STATUS_FUNC_1,
+            ..Registers::default()
+        };
+        let info = get_bus_info_pci_generic(&mut io).unwrap();
+        assert_eq!(info.kind, E1000BusType::PciX);
+        assert_eq!(info.speed, E1000BusSpeed::Mhz100);
+        assert_eq!(info.width, E1000BusWidth::Bits64);
+        assert_eq!(info.function, 1);
+        assert_eq!(set_lan_id_single_port(), 0);
+    }
+
+    #[test]
+    fn generic_pcie_bus_info_and_pci_function_mapping() {
+        let mut io = Registers {
+            status: E1000_STATUS_FUNC_MASK & (2 << E1000_STATUS_FUNC_SHIFT),
+            ..Registers::default()
+        };
+        let mut pci = Pci {
+            pcie: Some(0x40),
+            ..Pci::default()
+        };
+        pci.words[0x52 / 2] = 1 | (8 << PCIE_LINK_WIDTH_SHIFT);
+        pci.words[PCI_HEADER_TYPE_REGISTER as usize / 2] = PCI_HEADER_TYPE_MULTIFUNC;
+        let info = get_bus_info_pcie_generic(&mut io, &mut pci).unwrap();
+        assert_eq!(info.kind, E1000BusType::PciExpress);
+        assert_eq!(info.speed, E1000BusSpeed::Gt2500);
+        assert_eq!(info.width, E1000BusWidth::Pcie(8));
+        assert_eq!(info.function, 2);
+        assert_eq!(set_lan_id_multi_port_pci(&mut io, &mut pci).unwrap(), 2);
+    }
+
+    #[test]
+    fn generic_collision_distance_programs_tctl_field() {
+        let mut io = Registers::default();
+        config_collision_dist_generic(&mut io).unwrap();
+        assert_eq!(
+            io.writes,
+            [(E1000_TCTL, E1000_COLLISION_DISTANCE << E1000_COLD_SHIFT)]
+        );
     }
 
     #[test]
