@@ -120,6 +120,13 @@ pub struct BssMatchPolicy<'a> {
     pub local_mfp_required: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BssSelection {
+    pub selected: Option<usize>,
+    pub current: Option<usize>,
+    pub evicted: alloc::vec::Vec<usize>,
+}
+
 impl AccessPoint {
     pub fn ssid(&self) -> &[u8] {
         &self.ssid[..self.ssid_len.min(self.ssid.len())]
@@ -460,6 +467,69 @@ pub fn match_bss(
     fail
 }
 
+/// Select the strongest eligible BSS, retaining OpenBSD's all-band 5-GHz preference.
+// upstream: ieee80211_node.c ieee80211_node_choose_bss()
+pub fn choose_bss(
+    policy: &BssMatchPolicy<'_>,
+    access_points: &mut [AccessPoint],
+    current_bssid: Option<[u8; 6]>,
+    scan_all_bands: bool,
+    max_rssi: u8,
+    mut fix_rate: impl FnMut(&mut crate::RateSet) -> u8,
+) -> BssSelection {
+    let mut current = None;
+    let mut best_any: Option<(usize, u8)> = None;
+    let mut best_2ghz: Option<(usize, u8)> = None;
+    let mut best_5ghz: Option<(usize, u8)> = None;
+    let mut evicted = alloc::vec::Vec::new();
+    for (index, ap) in access_points.iter_mut().enumerate() {
+        if ap.previous_failures != 0 {
+            let failures = ap.previous_failures;
+            ap.previous_failures = failures.saturating_add(1);
+            if failures > 2 {
+                evicted.push(index);
+            }
+            continue;
+        }
+        if current_bssid == Some(ap.bssid) {
+            current = Some(index);
+        }
+        let mut ignored_current_failure = 0;
+        if match_bss(policy, ap, &mut ignored_current_failure, &mut fix_rate) != 0 {
+            continue;
+        }
+        if scan_all_bands {
+            if ap.is_2ghz && best_2ghz.is_none_or(|(_, rssi)| ap.rssi > rssi) {
+                best_2ghz = Some((index, ap.rssi));
+            } else if ap.is_5ghz && best_5ghz.is_none_or(|(_, rssi)| ap.rssi > rssi) {
+                best_5ghz = Some((index, ap.rssi));
+            }
+        } else if best_any.is_none_or(|(_, rssi)| ap.rssi > rssi) {
+            best_any = Some((index, ap.rssi));
+        }
+    }
+    let selected = if scan_all_bands {
+        if let Some((best_5, _)) =
+            best_5ghz.filter(|(index, _)| check_rssi(&access_points[*index], true, max_rssi))
+        {
+            Some(best_5)
+        } else if let (Some((best_5, rssi_5)), Some((best_2, rssi_2))) = (best_5ghz, best_2ghz) {
+            Some(if rssi_5 >= rssi_2 { best_5 } else { best_2 })
+        } else {
+            best_2ghz
+                .map(|(index, _)| index)
+                .or_else(|| best_5ghz.map(|(index, _)| index))
+        }
+    } else {
+        best_any.map(|(index, _)| index)
+    };
+    BssSelection {
+        selected,
+        current,
+        evicted,
+    }
+}
+
 // upstream: ieee80211_node.c ieee80211_40mhz_valid_secondary_above()
 pub fn valid_40mhz_secondary_above(primary_channel: u8) -> bool {
     if !((1..=9).contains(&primary_channel) || (36..=157).contains(&primary_channel)) {
@@ -598,6 +668,34 @@ mod tests {
         assert_ne!(failures & ASSOCFAIL_BASIC_RATE, 0);
         assert_eq!(bad.association_failures, ASSOCFAIL_BSSID);
         assert_eq!(current_failure, ASSOCFAIL_CHAN);
+    }
+
+    #[test]
+    fn bss_chooser_prefers_good_five_ghz_and_tracks_evictions() {
+        let mut two = ap(b"home", false, 90);
+        two.channel = 6;
+        two.capability_info = CAPINFO_ESS;
+        let mut five = ap(b"home", true, 60);
+        five.channel = 36;
+        five.capability_info = CAPINFO_ESS;
+        let mut stale = ap(b"stale", false, 80);
+        stale.channel = 1;
+        stale.capability_info = CAPINFO_ESS;
+        stale.previous_failures = 3;
+        let mut two = two;
+        two.bssid = [1; 6];
+        let mut five = five;
+        five.bssid = [2; 6];
+        let mut candidates = [two, five, stale];
+        let mut policy = match_policy(b"home");
+        policy.active_channels = &[1, 6, 11, 36];
+        let selection = choose_bss(&policy, &mut candidates, Some([1; 6]), true, 100, |_| 0);
+        assert_eq!(selection.selected, Some(1));
+        assert_eq!(selection.current, Some(0));
+        assert_eq!(selection.evicted, [2]);
+        candidates[1].rssi = 40;
+        let selection = choose_bss(&policy, &mut candidates[..2], None, true, 100, |_| 0);
+        assert_eq!(selection.selected, Some(0));
     }
 
     #[test]

@@ -62,3 +62,7 @@ Scanned-BSS admission now reports OpenBSD association-failure bits for channel,
 ESS/IBSS mode, privacy, mandatory rate, SSID/BSSID, CSA and RSN/MFP mismatch.
 Its background-scan path preserves the existing candidate-failure state when
 an unrelated SSID is seen.
+Candidate selection matches the scan table traversal, skips/ages prior
+association failures, tracks the current BSS, and uses the source all-band
+policy that prefers 5 GHz above its roaming threshold before strongest-RSSI
+fallback.
