@@ -25,6 +25,24 @@ pub const WQ_RING_TAIL_MASK: u32 = 0x1ffc_0000;
 pub const CONTEXT_REGISTRATION_FLAG_KMD: u32 = 1;
 pub const CONTEXT_POLICY_FLAG_PREEMPT_TO_IDLE_V69: u32 = 1;
 pub const GUC_INVALID_CONTEXT_ID: u32 = u32::MAX;
+pub const GUC_MAX_CONTEXT_ID: usize = 65_535;
+pub const ACTION_SCHED_CONTEXT: u32 = 0x1000;
+pub const ACTION_SCHED_CONTEXT_MODE_SET: u32 = 0x1001;
+pub const ACTION_UPDATE_CONTEXT_POLICIES: u32 = 0x100b;
+pub const ACTION_REGISTER_CONTEXT: u32 = 0x4502;
+pub const ACTION_DEREGISTER_CONTEXT: u32 = 0x4503;
+pub const CONTEXT_ENABLE: u32 = 1;
+pub const CONTEXT_DISABLE: u32 = 0;
+pub const CONTEXT_POLICY_KLV_EXECUTION_QUANTUM: u16 = 0x2001;
+pub const CONTEXT_POLICY_KLV_PREEMPTION_TIMEOUT: u16 = 0x2002;
+pub const CONTEXT_POLICY_KLV_SCHEDULING_PRIORITY: u16 = 0x2003;
+pub const CONTEXT_POLICY_KLV_PREEMPT_TO_IDLE: u16 = 0x2004;
+pub const CONTEXT_POLICY_KLV_SLPM_GT_FREQUENCY: u16 = 0x2005;
+pub const GUC_CLIENT_PRIORITY_KMD_HIGH: u8 = 0;
+pub const GUC_CLIENT_PRIORITY_HIGH: u8 = 1;
+pub const GUC_CLIENT_PRIORITY_KMD_NORMAL: u8 = 2;
+pub const GUC_CLIENT_PRIORITY_NORMAL: u8 = 3;
+const GEN12_CTX_PRIORITY_MASK: u32 = 3 << 9;
 
 const SCHED_STATE_WAIT_FOR_DEREGISTER_TO_REGISTER: u32 = 1 << 0;
 const SCHED_STATE_DESTROYED: u32 = 1 << 1;
@@ -131,6 +149,7 @@ pub struct GuCLrcDescV69 {
 }
 
 /// Linux engine-class enum order to GuC engine-class order.
+/// upstream: intel_guc_fwif.h engine_class_to_guc_class().
 pub const fn engine_class_to_guc_class(engine_class: u8) -> Result<u8, Error> {
     match engine_class {
         0 => Ok(0), // render
@@ -318,6 +337,249 @@ pub struct MultiLrcItem {
     pub child_count: u8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextIdRange {
+    pub base: u32,
+    pub count: u32,
+}
+
+/// Linux reserves a bitmap partition for contiguous multi-LRC IDs and an IDA
+/// partition for single-LRC contexts. This allocator is caller-serialized.
+pub struct ContextIdPool {
+    multi_count: usize,
+    multi_used: Vec<bool>,
+    single_used: Vec<bool>,
+}
+
+impl ContextIdPool {
+    /// upstream: intel_guc_submission.c intel_guc_submission_init() ID partitions.
+    pub fn new(total_ids: usize) -> Result<Self, Error> {
+        let multi_count = total_ids / 16;
+        if total_ids <= multi_count || total_ids > GUC_MAX_CONTEXT_ID || multi_count == 0 {
+            return Err(Error::Refused);
+        }
+        let mut multi_used = Vec::new();
+        let mut single_used = Vec::new();
+        multi_used
+            .try_reserve_exact(multi_count)
+            .map_err(|_| Error::Refused)?;
+        single_used
+            .try_reserve_exact(total_ids - multi_count)
+            .map_err(|_| Error::Refused)?;
+        multi_used.resize(multi_count, false);
+        single_used.resize(total_ids - multi_count, false);
+        Ok(Self {
+            multi_count,
+            multi_used,
+            single_used,
+        })
+    }
+
+    /// upstream: intel_guc_submission.c new_guc_id() parent bitmap branch.
+    pub fn allocate_multi(&mut self, child_count: usize) -> Result<ContextIdRange, Error> {
+        let count = child_count.checked_add(1).ok_or(Error::Refused)?;
+        if count > self.multi_count {
+            return Err(Error::Refused);
+        }
+        let block = count.checked_next_power_of_two().ok_or(Error::Refused)?;
+        let mut base = 0usize;
+        while base.checked_add(block).ok_or(Error::Refused)? <= self.multi_count {
+            if self.multi_used[base..base + block].iter().all(|used| !used) {
+                self.multi_used[base..base + block].fill(true);
+                return Ok(ContextIdRange {
+                    base: base as u32,
+                    count: count as u32,
+                });
+            }
+            base += block;
+        }
+        Err(Error::Unavailable(0))
+    }
+
+    /// upstream: intel_guc_submission.c new_guc_id() single-LRC IDA branch.
+    pub fn allocate_single(&mut self) -> Result<u32, Error> {
+        let index = self
+            .single_used
+            .iter()
+            .position(|used| !used)
+            .ok_or(Error::Unavailable(0))?;
+        self.single_used[index] = true;
+        u32::try_from(self.multi_count + index).map_err(|_| Error::Refused)
+    }
+
+    /// upstream: intel_guc_submission.c __release_guc_id().
+    pub fn release_multi(&mut self, range: ContextIdRange) -> Result<(), Error> {
+        let base = usize::try_from(range.base).map_err(|_| Error::Refused)?;
+        let block = usize::try_from(range.count)
+            .map_err(|_| Error::Refused)?
+            .checked_next_power_of_two()
+            .ok_or(Error::Refused)?;
+        if range.count == 0
+            || !base.is_multiple_of(block)
+            || base + block > self.multi_count
+            || self.multi_used[base..base + block].iter().any(|used| !used)
+        {
+            return Err(Error::Refused);
+        }
+        self.multi_used[base..base + block].fill(false);
+        Ok(())
+    }
+
+    /// upstream: intel_guc_submission.c __release_guc_id() single-context branch.
+    pub fn release_single(&mut self, id: u32) -> Result<(), Error> {
+        let index = usize::try_from(id)
+            .map_err(|_| Error::Refused)?
+            .checked_sub(self.multi_count)
+            .ok_or(Error::Refused)?;
+        let used = self.single_used.get_mut(index).ok_or(Error::Refused)?;
+        if !*used {
+            return Err(Error::Refused);
+        }
+        *used = false;
+        Ok(())
+    }
+}
+
+/// upstream: intel_guc_submission.c prepare_context_registration_info_v70().
+pub fn context_registration_info(
+    context_id: u32,
+    engine_class: u8,
+    engine_submit_mask: u32,
+    hwlrca: u64,
+    guc_priority: Option<u8>,
+    wq_descriptor: Option<u64>,
+    wq_base: Option<u64>,
+) -> Result<GuCContextRegistrationInfo, Error> {
+    let guc_class = engine_class_to_guc_class(engine_class)?;
+    if context_id == GUC_INVALID_CONTEXT_ID
+        || engine_submit_mask == 0
+        || wq_descriptor.is_some() != wq_base.is_some()
+        || hwlrca & 0xfff != 0
+    {
+        return Err(Error::Refused);
+    }
+    let mut info = GuCContextRegistrationInfo {
+        flags: CONTEXT_REGISTRATION_FLAG_KMD,
+        context_idx: context_id,
+        engine_class: u32::from(guc_class),
+        engine_submit_mask,
+        hwlrca_lo: hwlrca as u32,
+        hwlrca_hi: (hwlrca >> 32) as u32,
+        ..Default::default()
+    };
+    if let Some(priority) = guc_priority {
+        info.hwlrca_lo |= map_guc_prio_to_lrc_desc_prio(priority)?;
+    }
+    if let (Some(desc), Some(base)) = (wq_descriptor, wq_base) {
+        info.wq_desc_lo = desc as u32;
+        info.wq_desc_hi = (desc >> 32) as u32;
+        info.wq_base_lo = base as u32;
+        info.wq_base_hi = (base >> 32) as u32;
+        info.wq_size = WQ_SIZE as u32;
+    }
+    Ok(info)
+}
+
+/// upstream: intel_guc_submission.c map_guc_prio_to_lrc_desc_prio().
+pub const fn map_guc_prio_to_lrc_desc_prio(priority: u8) -> Result<u32, Error> {
+    let value = match priority {
+        GUC_CLIENT_PRIORITY_KMD_HIGH | GUC_CLIENT_PRIORITY_HIGH => 2,
+        GUC_CLIENT_PRIORITY_KMD_NORMAL => 1,
+        GUC_CLIENT_PRIORITY_NORMAL => 0,
+        _ => return Err(Error::Refused),
+    };
+    Ok((value << 9) & GEN12_CTX_PRIORITY_MASK)
+}
+
+/// upstream: intel_guc_submission.c __guc_action_register_context_v70().
+pub fn register_context_action(info: GuCContextRegistrationInfo) -> [u32; 12] {
+    [
+        ACTION_REGISTER_CONTEXT,
+        info.flags,
+        info.context_idx,
+        info.engine_class,
+        info.engine_submit_mask,
+        info.wq_desc_lo,
+        info.wq_desc_hi,
+        info.wq_base_lo,
+        info.wq_base_hi,
+        info.wq_size,
+        info.hwlrca_lo,
+        info.hwlrca_hi,
+    ]
+}
+
+/// upstream: intel_guc_submission.c __guc_action_deregister_context().
+pub const fn deregister_context_action(context_id: u32) -> Result<[u32; 2], Error> {
+    if context_id == GUC_INVALID_CONTEXT_ID {
+        Err(Error::Refused)
+    } else {
+        Ok([ACTION_DEREGISTER_CONTEXT, context_id])
+    }
+}
+
+/// upstream: intel_guc_submission.c __guc_add_request() scheduling-mode path.
+pub const fn schedule_context_action(context_id: u32, enable: bool) -> Result<[u32; 3], Error> {
+    if context_id == GUC_INVALID_CONTEXT_ID {
+        Err(Error::Refused)
+    } else {
+        Ok([
+            ACTION_SCHED_CONTEXT_MODE_SET,
+            context_id,
+            if enable {
+                CONTEXT_ENABLE
+            } else {
+                CONTEXT_DISABLE
+            },
+        ])
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextPolicy {
+    pub context_id: u32,
+    pub priority: u32,
+    pub execution_quantum_us: u32,
+    pub preemption_timeout_us: u32,
+    pub slpc_frequency_request: u32,
+    pub preempt_to_idle: bool,
+}
+
+/// upstream: intel_guc_submission.c guc_context_policy_init_v70() and
+/// __guc_context_policy_add_*(). Returns action header and key/length/value KLVs.
+pub fn context_policy_action(policy: ContextPolicy) -> Result<Vec<u32>, Error> {
+    if policy.context_id == GUC_INVALID_CONTEXT_ID || policy.priority > 3 {
+        return Err(Error::Refused);
+    }
+    let mut words = Vec::new();
+    let klv_count = if policy.preempt_to_idle { 5 } else { 4 };
+    words
+        .try_reserve_exact(2 + klv_count * 2)
+        .map_err(|_| Error::Refused)?;
+    words.extend_from_slice(&[ACTION_UPDATE_CONTEXT_POLICIES, policy.context_id]);
+    let mut add = |key: u16, value: u32| {
+        words.push((u32::from(key) << 16) | 1); // one dword value
+        words.push(value);
+    };
+    add(CONTEXT_POLICY_KLV_SCHEDULING_PRIORITY, policy.priority);
+    add(
+        CONTEXT_POLICY_KLV_EXECUTION_QUANTUM,
+        policy.execution_quantum_us,
+    );
+    add(
+        CONTEXT_POLICY_KLV_PREEMPTION_TIMEOUT,
+        policy.preemption_timeout_us,
+    );
+    add(
+        CONTEXT_POLICY_KLV_SLPM_GT_FREQUENCY,
+        policy.slpc_frequency_request,
+    );
+    if policy.preempt_to_idle {
+        add(CONTEXT_POLICY_KLV_PREEMPT_TO_IDLE, 1);
+    }
+    Ok(words)
+}
+
 /// A model of intel_guc_submission.c's v70 circular work queue. Head is
 /// supplied by GuC and tail is host-owned; the last dword remains empty.
 pub struct WorkQueue {
@@ -467,6 +729,88 @@ mod tests {
         assert_eq!(engine_class_to_guc_class(1), Ok(3));
         assert_eq!(engine_class_to_guc_class(2), Ok(1));
         assert_eq!(engine_class_to_guc_class(6), Err(Error::Refused));
+    }
+
+    #[test]
+    fn context_id_partitions_keep_multilrc_ranges_contiguous() {
+        let mut pool = ContextIdPool::new(512).unwrap();
+        let parent = pool.allocate_multi(3).unwrap();
+        let next = pool.allocate_multi(0).unwrap();
+        assert_eq!(parent, ContextIdRange { base: 0, count: 4 });
+        assert_eq!(next, ContextIdRange { base: 4, count: 1 });
+        pool.release_multi(parent).unwrap();
+        assert_eq!(
+            pool.allocate_multi(1).unwrap(),
+            ContextIdRange { base: 0, count: 2 }
+        );
+        let single = pool.allocate_single().unwrap();
+        assert_eq!(single, 32);
+        pool.release_single(single).unwrap();
+        assert_eq!(pool.allocate_single().unwrap(), 32);
+    }
+
+    #[test]
+    fn context_registration_info_splits_addresses_and_encodes_gen12_priority() {
+        let info = context_registration_info(
+            17,
+            1,
+            1,
+            0x1_2345_6000,
+            Some(2),
+            Some(0x2_0000_3000),
+            Some(0x3_0000_4000),
+        )
+        .unwrap();
+        let flags = info.flags;
+        let engine_class = info.engine_class;
+        let hwlrca_lo = info.hwlrca_lo;
+        let hwlrca_hi = info.hwlrca_hi;
+        let wq_desc_hi = info.wq_desc_hi;
+        let wq_base_hi = info.wq_base_hi;
+        let wq_size = info.wq_size;
+        assert_eq!(flags, CONTEXT_REGISTRATION_FLAG_KMD);
+        assert_eq!(engine_class, 3);
+        assert_eq!(hwlrca_lo, 0x2345_6000 | (1 << 9));
+        assert_eq!(hwlrca_hi, 1);
+        assert_eq!(wq_desc_hi, 2);
+        assert_eq!(wq_base_hi, 3);
+        assert_eq!(wq_size, WQ_SIZE as u32);
+        assert_eq!(register_context_action(info)[0], ACTION_REGISTER_CONTEXT);
+        assert_eq!(register_context_action(info).len(), 12);
+        assert_eq!(
+            deregister_context_action(17).unwrap(),
+            [ACTION_DEREGISTER_CONTEXT, 17]
+        );
+        assert_eq!(
+            schedule_context_action(17, true).unwrap(),
+            [ACTION_SCHED_CONTEXT_MODE_SET, 17, 1]
+        );
+    }
+
+    #[test]
+    fn context_policy_packet_encodes_gen12_quantum_priority_and_preemption_klvs() {
+        let words = context_policy_action(ContextPolicy {
+            context_id: 3,
+            priority: 2,
+            execution_quantum_us: 20_000,
+            preemption_timeout_us: 5_000,
+            slpc_frequency_request: 0,
+            preempt_to_idle: true,
+        })
+        .unwrap();
+        assert_eq!(words.len(), 12);
+        assert_eq!(words[0], ACTION_UPDATE_CONTEXT_POLICIES);
+        assert_eq!(words[1], 3);
+        assert_eq!(
+            words[2],
+            (u32::from(CONTEXT_POLICY_KLV_SCHEDULING_PRIORITY) << 16) | 1
+        );
+        assert_eq!(words[3], 2);
+        assert_eq!(
+            words[words.len() - 2],
+            (u32::from(CONTEXT_POLICY_KLV_PREEMPT_TO_IDLE) << 16) | 1
+        );
+        assert_eq!(words[words.len() - 1], 1);
     }
 
     #[test]
