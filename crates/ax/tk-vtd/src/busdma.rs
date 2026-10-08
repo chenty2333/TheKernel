@@ -46,8 +46,8 @@ impl DmaMap {
         &self.mappings
     }
 
-    /// Load physical ranges into device-visible segments.
-    // upstream: busdma_iommu.c iommu_bus_dmamap_load_something1()
+    /// Run the map-load operation and commit mappings only after every segment succeeds.
+    // upstream: busdma_iommu.c iommu_bus_dmamap_load_something()
     pub fn load<B: Backend>(
         &mut self,
         dma: &mut Dma<B>,
@@ -56,8 +56,27 @@ impl DmaMap {
         direction: Direction,
         limits: Constraints,
     ) -> Result<Vec<(u64, usize)>, Error> {
-        if !self.mappings.is_empty()
-            || limits.max_segment_size == 0
+        if !self.mappings.is_empty() {
+            return Err(Error::InvalidRange);
+        }
+        let mut pending = Vec::new();
+        let output =
+            Self::load_something1(dma, requester, ranges, direction, limits, &mut pending)?;
+        self.mappings = pending;
+        Ok(output)
+    }
+
+    /// Load physical ranges into device-visible segments.
+    // upstream: busdma_iommu.c iommu_bus_dmamap_load_something1()
+    fn load_something1<B: Backend>(
+        dma: &mut Dma<B>,
+        requester: PciRequester,
+        ranges: &[(u64, usize)],
+        direction: Direction,
+        limits: Constraints,
+        mappings: &mut Vec<Mapping>,
+    ) -> Result<Vec<(u64, usize)>, Error> {
+        if limits.max_segment_size == 0
             || limits.max_segments == 0
             || limits.alignment == 0
             || !limits.alignment.is_power_of_two()
@@ -79,19 +98,19 @@ impl DmaMap {
                     chunk = chunk.min(remaining as usize);
                 }
                 if chunk == 0 || address & (limits.alignment - 1) != 0 {
-                    self.rollback(dma, requester);
+                    Self::rollback_mappings(mappings, dma, requester);
                     return Err(Error::InvalidRange);
                 }
                 let mapping = match dma.map(requester, address, chunk, direction) {
                     Ok(mapping) => mapping,
                     Err(error) => {
-                        self.rollback(dma, requester);
+                        Self::rollback_mappings(mappings, dma, requester);
                         return Err(error);
                     }
                 };
                 let Some(device_end) = mapping.device_address.checked_add(chunk as u64 - 1) else {
                     let _ = dma.unmap(requester, mapping);
-                    self.rollback(dma, requester);
+                    Self::rollback_mappings(mappings, dma, requester);
                     return Err(Error::InvalidRange);
                 };
                 if device_end > limits.low_address
@@ -99,15 +118,20 @@ impl DmaMap {
                         && mapping.device_address / limits.boundary != device_end / limits.boundary)
                 {
                     let _ = dma.unmap(requester, mapping);
-                    self.rollback(dma, requester);
+                    Self::rollback_mappings(mappings, dma, requester);
                     return Err(Error::MapFailed);
                 }
-                if self.mappings.len() == limits.max_segments {
+                if mappings.len() == limits.max_segments {
                     let _ = dma.unmap(requester, mapping);
-                    self.rollback(dma, requester);
+                    Self::rollback_mappings(mappings, dma, requester);
                     return Err(Error::MapFailed);
                 }
-                self.mappings.push(mapping);
+                if mappings.try_reserve(1).is_err() || output.try_reserve(1).is_err() {
+                    let _ = dma.unmap(requester, mapping);
+                    Self::rollback_mappings(mappings, dma, requester);
+                    return Err(Error::OutOfMemory);
+                }
+                mappings.push(mapping);
                 output.push((mapping.device_address, chunk));
                 offset += chunk;
             }
@@ -180,6 +204,58 @@ impl DmaMap {
         self.load(dma, requester, &[(physical, length)], direction, limits)
     }
 
+    /// Resolve each virtual page through the platform page-table extractor,
+    /// then load the resulting physical scatter/gather list.
+    // upstream: busdma_iommu.c iommu_bus_dmamap_load_buffer()
+    pub fn load_buffer<B: Backend, F: FnMut(u64) -> Option<u64>>(
+        &mut self,
+        dma: &mut Dma<B>,
+        requester: PciRequester,
+        virtual_address: u64,
+        length: usize,
+        mut extract_physical_page: F,
+        direction: Direction,
+        limits: Constraints,
+    ) -> Result<Vec<(u64, usize)>, Error> {
+        const PAGE_SIZE: u64 = 4096;
+        if length == 0 {
+            return self.load(dma, requester, &[], direction, limits);
+        }
+        let end = virtual_address
+            .checked_add(length as u64)
+            .ok_or(Error::InvalidRange)?;
+        let first_page = virtual_address & !(PAGE_SIZE - 1);
+        let page_count = end
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(Error::InvalidRange)?
+            .checked_sub(first_page)
+            .ok_or(Error::InvalidRange)?
+            / PAGE_SIZE;
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(page_count as usize)
+            .map_err(|_| Error::OutOfMemory)?;
+        for index in 0..page_count {
+            let virtual_page = first_page
+                .checked_add(index.checked_mul(PAGE_SIZE).ok_or(Error::InvalidRange)?)
+                .ok_or(Error::InvalidRange)?;
+            let physical_page = extract_physical_page(virtual_page).ok_or(Error::MapFailed)?;
+            if physical_page & (PAGE_SIZE - 1) != 0 {
+                return Err(Error::InvalidRange);
+            }
+            pages.push(physical_page);
+        }
+        self.load_pages(
+            dma,
+            requester,
+            &pages,
+            (virtual_address & (PAGE_SIZE - 1)) as usize,
+            length,
+            direction,
+            limits,
+        )
+    }
+
     /// Tear down all IOMMU entries owned by this map.
     // upstream: busdma_iommu.c iommu_bus_dmamap_unload()
     pub fn unload<B: Backend>(
@@ -197,8 +273,12 @@ impl DmaMap {
         first_error.map_or(Ok(()), Err)
     }
 
-    fn rollback<B: Backend>(&mut self, dma: &mut Dma<B>, requester: PciRequester) {
-        for mapping in core::mem::take(&mut self.mappings).into_iter().rev() {
+    fn rollback_mappings<B: Backend>(
+        mappings: &mut Vec<Mapping>,
+        dma: &mut Dma<B>,
+        requester: PciRequester,
+    ) {
+        for mapping in core::mem::take(mappings).into_iter().rev() {
             let _ = dma.unmap(requester, mapping);
         }
     }
@@ -318,6 +398,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(segments, vec![(0x11_800, 0x800), (0x31_000, 0x800)]);
+        map.unload(&mut dma, requester).unwrap();
+        assert!(dma.into_backend().active.is_empty());
+    }
+
+    #[test]
+    fn load_buffer_resolves_virtual_pages_before_applying_the_initial_offset() {
+        let (mut dma, requester) = setup();
+        let mut map = DmaMap::default();
+        let segments = map
+            .load_buffer(
+                &mut dma,
+                requester,
+                0x7000_8ff0,
+                0x30,
+                |address| match address {
+                    0x7000_8000 => Some(0x90_0000),
+                    0x7000_9000 => Some(0x31_000),
+                    _ => None,
+                },
+                Direction::Bidirectional,
+                Constraints::unrestricted(),
+            )
+            .unwrap();
+        assert_eq!(segments, vec![(0x90_1ff0, 0x10), (0x32_000, 0x20)]);
         map.unload(&mut dma, requester).unwrap();
         assert!(dma.into_backend().active.is_empty());
     }

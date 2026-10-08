@@ -135,3 +135,10 @@ page; since this platform seam does not yet allocate/register the VT-d QI MSI
 vector, it leaves QI interrupts masked and polls the memory completion sequence.
 Global context/IOTLB invalidations now use the translated QI ring rather than the
 previous two-descriptor MMIO polling path.
+
+The busdma load sequence is now split into the upstream `load_something()`
+all-or-nothing commit wrapper and `load_something1()` segment mapper. It also
+accepts page-array, physical-extent, and virtual-buffer loads; the latter uses a
+caller-provided page-table extractor to replace FreeBSD `pmap_extract`. This
+raises direct busdma source coverage to 6/34 functions; tags, memory alloc/free,
+wait/callback and KMSAN routines remain TheKernel framework seams.
