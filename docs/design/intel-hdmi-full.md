@@ -13,7 +13,9 @@ registration wrappers. The full MIT grant is preserved in the module and
 `LICENSE-MIT`. The module is exported and compiles with the crate. The native
 ADL-N TC modeset now calls the translated `intel_hdmi_compute_clock()` before
 its first destructive write, using the implemented RGB/8-bpc/no-scrambling
-limits to reject rates outside 25–300 MHz. This is a narrow admission hook, not
-a complete HDMI backend: sink TMDS limits are not parsed, and the infoframe,
+limits to reject rates outside 25–300 MHz and the lowest nonzero HDMI VSDB
+TMDS limit from CTA EDID. Missing max-clock fields remain unknown rather than
+being inferred. This is a narrow admission hook, not a complete HDMI backend:
+the infoframe,
 SCDC, HDCP, FRL, connector, and DSC pipelines are still not live in the kernel
 path.

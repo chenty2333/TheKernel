@@ -1098,6 +1098,25 @@ impl<'a> Edid<'a> {
     pub fn first_cta_extension(&self) -> Option<Cta861<'a>> {
         self.cta_extensions().next()
     }
+
+    /// The lowest nonzero maximum TMDS rate declared by HDMI VSDBs in the
+    /// parsed CTA extensions, in kHz. A missing field is deliberately
+    /// represented as `None` rather than inferred from unrelated video modes.
+    /// The HDMI VSDB stores this value in 5 MHz units at payload byte 6.
+    pub fn max_tmds_clock_khz(&self) -> Option<u32> {
+        self.cta_extensions()
+            .flat_map(|cta| cta.data_blocks())
+            .filter(|block| block.tag == DataBlockTag::VendorSpecific)
+            .filter_map(|block| {
+                let payload = block.payload;
+                if payload.len() < 7 || payload[..3] != [0x03, 0x0c, 0x00] {
+                    return None;
+                }
+                let clock = u32::from(payload[6]) * 5_000;
+                (clock != 0).then_some(clock)
+            })
+            .min()
+    }
 }
 
 /// The 18-byte descriptor tags, for callers that want to talk about them.

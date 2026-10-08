@@ -388,7 +388,7 @@ pub(super) fn avi_words_preserve(frame: RawInfoframe) -> Result<[u32; 8], String
 /// verified; it only applies the source/mode policy for the implemented path.
 /// Returning the source-computed TMDS rate also makes the assumption explicit
 /// to the caller (for RGB 8 bpc it equals the pixel clock).
-fn source_hdmi_tmds_clock(mode: &Mode) -> Option<u32> {
+fn source_hdmi_tmds_clock(mode: &Mode, edid_bytes: &[u8]) -> Option<u32> {
     use intel_display::intel_hdmi_full::{
         ClockLimits, HdmiMode, HdmiPortClass, OutputFormat, PortPlatform, SinkCapabilities,
         intel_hdmi_compute_clock,
@@ -423,9 +423,12 @@ fn source_hdmi_tmds_clock(mode: &Mode) -> Option<u32> {
         port: HdmiPortClass::TypeC,
         source_limit_khz: 300_000,
         dp_dual_mode_limit_khz: None,
-        sink_limit_khz: None,
+        sink_limit_khz: crate::drm::modes::Edid::parse_lossy(edid_bytes)
+            .ok()
+            .and_then(|edid| edid.max_tmds_clock_khz())
+            .and_then(|clock| i32::try_from(clock).ok()),
         has_hdmi_sink: true,
-        respect_downstream_limits: false,
+        respect_downstream_limits: true,
     };
     u32::try_from(intel_hdmi_compute_clock(
         &mut pipe_bpp,
@@ -433,7 +436,7 @@ fn source_hdmi_tmds_clock(mode: &Mode) -> Option<u32> {
         OutputFormat::Rgb,
         sink,
         limits,
-        false,
+        true,
     )?)
     .ok()
 }
@@ -470,7 +473,7 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         || mode
             .flags
             .contains(crate::drm::modes::ModeFlags::DOUBLE_CLOCK)
-        || !matches!(source_hdmi_tmds_clock(mode), Some(25_000..=300_000))
+        || !matches!(source_hdmi_tmds_clock(mode, edid), Some(25_000..=300_000))
         || surface == 0
         || surface & 0xfff != 0
         || pitch < u32::from(mode.hdisplay) * 4
@@ -684,9 +687,9 @@ mod tests {
 
     #[test]
     fn active_tc_hdmi_uses_source_tmds_policy() {
-        assert_eq!(source_hdmi_tmds_clock(&mode(148_500)), Some(148_500));
-        assert_eq!(source_hdmi_tmds_clock(&mode(300_000)), Some(300_000));
-        assert_eq!(source_hdmi_tmds_clock(&mode(300_001)), None);
-        assert_eq!(source_hdmi_tmds_clock(&mode(24_999)), None);
+        assert_eq!(source_hdmi_tmds_clock(&mode(148_500), &[]), Some(148_500));
+        assert_eq!(source_hdmi_tmds_clock(&mode(300_000), &[]), Some(300_000));
+        assert_eq!(source_hdmi_tmds_clock(&mode(300_001), &[]), None);
+        assert_eq!(source_hdmi_tmds_clock(&mode(24_999), &[]), None);
     }
 }
