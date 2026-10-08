@@ -39,6 +39,8 @@ const MII_CR_RESTART_AUTO_NEG: u16 = 0x0200;
 const MII_CR_FULL_DUPLEX: u16 = 0x0100;
 const MII_CR_SPEED_1000: u16 = 0x0040;
 const MII_CR_SPEED_100: u16 = 0x2000;
+const MII_CR_RESET: u16 = 0x8000;
+const MII_CR_POWER_DOWN: u16 = 0x0800;
 const ALL_HALF_DUPLEX: u16 = ADVERTISE_10_HALF | ADVERTISE_100_HALF;
 const ALL_100_SPEED: u16 = ADVERTISE_100_HALF | ADVERTISE_100_FULL;
 const CR_1000T_MS_ENABLE: u16 = 0x1000;
@@ -710,6 +712,56 @@ pub fn phy_force_speed_duplex_setup<I: E1000RegisterIo>(
     config_collision_dist_generic(io)?;
     io.write_register(E1000_CTRL, control)?;
     Ok(phy_control)
+}
+
+/// upstream: e1000_phy.c e1000_phy_sw_reset_generic()
+pub fn phy_sw_reset_generic<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    read_callback_installed: bool,
+) -> DevResult {
+    if !read_callback_installed {
+        return Ok(());
+    }
+    let control = io.read_phy_register(PHY_CONTROL)? | MII_CR_RESET;
+    io.write_phy_register(PHY_CONTROL, control)?;
+    io.delay_us(1);
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_phy_hw_reset_generic()
+pub fn phy_hw_reset_generic<I: E1000PhyMdicOps>(
+    io: &mut I,
+    reset_blocked: bool,
+    reset_delay_us: u32,
+) -> DevResult {
+    if reset_blocked {
+        return Ok(());
+    }
+    io.acquire()?;
+    let control = io.read_register(E1000_CTRL)?;
+    io.write_register(E1000_CTRL, control | E1000_CTRL_PHY_RST)?;
+    let _ = io.read_register(E1000_STATUS)?;
+    io.delay_us(reset_delay_us);
+    io.write_register(E1000_CTRL, control)?;
+    let _ = io.read_register(E1000_STATUS)?;
+    io.delay_us(150);
+    io.release();
+    get_cfg_done_generic(io)
+}
+
+/// upstream: e1000_phy.c e1000_power_up_phy_copper()
+pub fn power_up_phy_copper<I: E1000PhyRegisterIo>(io: &mut I) {
+    if let Ok(control) = io.read_phy_register(PHY_CONTROL) {
+        let _ = io.write_phy_register(PHY_CONTROL, control & !MII_CR_POWER_DOWN);
+    }
+}
+
+/// upstream: e1000_phy.c e1000_power_down_phy_copper()
+pub fn power_down_phy_copper<I: E1000PhyRegisterIo>(io: &mut I) {
+    if let Ok(control) = io.read_phy_register(PHY_CONTROL) {
+        let _ = io.write_phy_register(PHY_CONTROL, control | MII_CR_POWER_DOWN);
+        io.delay_us(1000);
+    }
 }
 
 /// upstream: e1000_phy.c e1000_get_phy_type_from_id()
@@ -1675,5 +1727,34 @@ mod tests {
                 E1000_CTRL_FRCSPD | E1000_CTRL_FRCDPX | E1000_CTRL_FD | E1000_CTRL_SPD_100
             ))
         );
+    }
+
+    #[test]
+    fn generic_phy_reset_and_copper_power_transitions_preserve_delays() {
+        let mut io = Io::default();
+        io.phy[PHY_CONTROL as usize] = 0x1000;
+        phy_sw_reset_generic(&mut io, true).unwrap();
+        assert_eq!(
+            io.phy_writes.last(),
+            Some(&(PHY_CONTROL, 0x1000 | MII_CR_RESET))
+        );
+        assert_eq!(io.delay, 1);
+        power_down_phy_copper(&mut io);
+        assert_eq!(
+            io.phy_writes.last(),
+            Some(&(PHY_CONTROL, 0x1000 | MII_CR_POWER_DOWN))
+        );
+        assert_eq!(io.delay, 1001);
+        power_up_phy_copper(&mut io);
+        assert_eq!(io.phy_writes.last(), Some(&(PHY_CONTROL, 0x1000)));
+
+        let mut hw = Io::default();
+        phy_hw_reset_generic(&mut hw, true, 5000).unwrap();
+        assert!(hw.writes.is_empty());
+        phy_hw_reset_generic(&mut hw, false, 5000).unwrap();
+        assert_eq!(hw.writes[0], (E1000_CTRL, E1000_CTRL_PHY_RST));
+        assert_eq!(hw.writes[1], (E1000_CTRL, 0));
+        assert_eq!(hw.delay, 15_150);
+        assert_eq!((hw.locks, hw.unlocks), (1, 1));
     }
 }
