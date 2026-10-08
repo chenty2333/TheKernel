@@ -4,7 +4,6 @@
 // Copyright © 2014-2019 Intel Corporation. Full MIT grant: ../LICENSE-MIT.
 
 use alloc::vec::Vec;
-#[cfg(test)]
 use core::mem::size_of;
 
 use crate::Error;
@@ -26,6 +25,8 @@ pub const CONTEXT_REGISTRATION_FLAG_KMD: u32 = 1;
 pub const CONTEXT_POLICY_FLAG_PREEMPT_TO_IDLE_V69: u32 = 1;
 pub const GUC_INVALID_CONTEXT_ID: u32 = u32::MAX;
 pub const GUC_MAX_CONTEXT_ID: usize = 65_535;
+pub const MAX_ENGINE_INSTANCE: usize = 8;
+pub const WQ_STATUS_ACTIVE: u32 = 1;
 pub const ACTION_SCHED_CONTEXT: u32 = 0x1000;
 pub const ACTION_SCHED_CONTEXT_MODE_SET: u32 = 0x1001;
 pub const ACTION_UPDATE_CONTEXT_POLICIES: u32 = 0x100b;
@@ -1263,6 +1264,95 @@ pub fn work_queue_offset(page_index: u32) -> Result<u32, Error> {
         .ok_or(Error::Refused)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParentScratchInfo {
+    pub descriptor_ggtt: u32,
+    pub wq_ggtt: u32,
+    pub wq_size: u32,
+    pub child_count: u8,
+    pub is_v70: bool,
+}
+
+/// upstream: intel_guc_submission.c parent_scratch layout,
+/// __get_parent_scratch(), and prepare_context_registration_info_v69/v70().
+pub fn build_parent_scratch(
+    state_ggtt: u32,
+    page_index: u32,
+    stage_id: u32,
+    child_count: u8,
+    v70: bool,
+) -> Result<(ParentScratchInfo, Vec<u8>), Error> {
+    if state_ggtt == 0
+        || state_ggtt & 0xfff != 0
+        || usize::from(child_count) > MAX_ENGINE_INSTANCE
+        || stage_id == GUC_INVALID_CONTEXT_ID
+    {
+        return Err(Error::Refused);
+    }
+    let parent_offset = parent_scratch_offset(page_index)? as usize;
+    let descriptor_size = if v70 {
+        size_of::<GuCSchedWqDesc>()
+    } else {
+        size_of::<GuCProcessDescV69>()
+    };
+    let semaphore_count = usize::from(child_count) + 2; // go + one join per child + parent join
+    let semaphore_end = descriptor_size
+        .checked_add(
+            semaphore_count
+                .checked_mul(CACHELINE_BYTES)
+                .ok_or(Error::Refused)?,
+        )
+        .ok_or(Error::Refused)?;
+    if semaphore_end > WQ_OFFSET || parent_offset.checked_add(PARENT_SCRATCH_SIZE).is_none() {
+        return Err(Error::Refused);
+    }
+    let mut scratch = Vec::new();
+    scratch
+        .try_reserve_exact(PARENT_SCRATCH_SIZE)
+        .map_err(|_| Error::Refused)?;
+    scratch.resize(PARENT_SCRATCH_SIZE, 0);
+    let parent_address = state_ggtt
+        .checked_add(u32::try_from(parent_offset).map_err(|_| Error::Refused)?)
+        .ok_or(Error::Refused)?;
+    let wq_ggtt = parent_address
+        .checked_add(WQ_OFFSET as u32)
+        .ok_or(Error::Refused)?;
+    if v70 {
+        write_dword(&mut scratch, 12, WQ_STATUS_ACTIVE)?;
+    } else {
+        write_dword(&mut scratch, 0, stage_id)?;
+        write_qword(&mut scratch, 24, u64::from(wq_ggtt))?;
+        write_dword(&mut scratch, 32, WQ_SIZE as u32)?;
+        write_dword(&mut scratch, 36, WQ_STATUS_ACTIVE)?;
+    }
+    Ok((
+        ParentScratchInfo {
+            descriptor_ggtt: parent_address,
+            wq_ggtt,
+            wq_size: WQ_SIZE as u32,
+            child_count,
+            is_v70: v70,
+        },
+        scratch,
+    ))
+}
+
+fn write_dword(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), Error> {
+    let destination = bytes
+        .get_mut(offset..offset.checked_add(4).ok_or(Error::Refused)?)
+        .ok_or(Error::Refused)?;
+    destination.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn write_qword(bytes: &mut [u8], offset: usize, value: u64) -> Result<(), Error> {
+    let destination = bytes
+        .get_mut(offset..offset.checked_add(8).ok_or(Error::Refused)?)
+        .ok_or(Error::Refused)?;
+    destination.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1402,6 +1492,37 @@ mod tests {
         assert_eq!(multi[2], 7);
         assert_eq!(multi[10], 2);
         assert_eq!(&multi[13..], &[0x60_0000, 0]);
+    }
+
+    #[test]
+    fn parent_scratch_layout_and_wq_descriptors_match_v69_v70() {
+        let (v70_info, v70) = build_parent_scratch(0x10_0000, 2, 7, 2, true).unwrap();
+        assert_eq!(v70_info.descriptor_ggtt, 0x10_2000);
+        assert_eq!(v70_info.wq_ggtt, 0x10_2800);
+        assert_eq!(v70_info.wq_size, 2048);
+        assert_eq!(v70.len(), PARENT_SCRATCH_SIZE);
+        assert_eq!(
+            u32::from_le_bytes(v70[12..16].try_into().unwrap()),
+            WQ_STATUS_ACTIVE
+        );
+        assert!(v70[16..WQ_OFFSET].iter().all(|byte| *byte == 0));
+
+        let (v69_info, v69) = build_parent_scratch(0x10_0000, 2, 7, 2, false).unwrap();
+        assert!(v69_info.descriptor_ggtt == 0x10_2000);
+        assert_eq!(u32::from_le_bytes(v69[0..4].try_into().unwrap()), 7);
+        assert_eq!(
+            u64::from_le_bytes(v69[24..32].try_into().unwrap()),
+            0x10_2800
+        );
+        assert_eq!(u32::from_le_bytes(v69[32..36].try_into().unwrap()), 2048);
+        assert_eq!(
+            u32::from_le_bytes(v69[36..40].try_into().unwrap()),
+            WQ_STATUS_ACTIVE
+        );
+        assert_eq!(
+            work_queue_offset(2).unwrap(),
+            (2 * PARENT_SCRATCH_SIZE + WQ_OFFSET) as u32
+        );
     }
 
     #[test]
