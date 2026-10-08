@@ -161,3 +161,7 @@ buffers and queue stop/start remain owned by the wireless device adapter.
 Station MFP SA Query request/response handlers preserve the peer transaction
 identifier, request the matching response, and clear the active query only for
 a matching response; the management timer remains a caller-managed effect.
+
+The action dispatcher recognizes BA ADDBA/DELBA and SA Query request/response
+subtypes and returns typed dispatch tags for the translated receive handlers;
+unsupported action categories remain explicit ignored events.

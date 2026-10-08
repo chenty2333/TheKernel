@@ -14,6 +14,9 @@ const ACTION_CATEGORY_BA: u8 = 3;
 const ACTION_ADDBA_REQ: u8 = 0;
 const ACTION_ADDBA_RESP: u8 = 1;
 const ACTION_DELBA: u8 = 2;
+const CATEGORY_SA_QUERY: u8 = 8;
+const ACTION_SA_QUERY_REQ: u8 = 0;
+const ACTION_SA_QUERY_RESP: u8 = 1;
 const FC0_TYPE_MASK: u8 = 0x0c;
 const FC0_TYPE_MGT: u8 = 0x00;
 const FC0_SUBTYPE_MASK: u8 = 0xf0;
@@ -37,6 +40,16 @@ pub enum BaRxError {
     NotBlockAckAction,
     UnsupportedAction,
     InvalidTid(u8),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionDispatch {
+    AddbaRequest,
+    AddbaResponse,
+    Delba,
+    SaQueryRequest,
+    SaQueryResponse,
+    Ignore { category: u8, action: u8 },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -118,6 +131,28 @@ fn action_body(frame: &[u8]) -> Result<&[u8], BaRxError> {
         return Err(BaRxError::NotBlockAckAction);
     }
     Ok(body)
+}
+
+/// Dispatch the supported BA and SA Query management action subtypes.
+// upstream: ieee80211_input.c ieee80211_recv_action()
+pub fn dispatch_action(frame: &[u8]) -> Result<ActionDispatch, BaRxError> {
+    if frame.len() < MAC_HEADER_LEN + 2 {
+        return Err(BaRxError::ShortFrame);
+    }
+    if frame[0] & FC0_TYPE_MASK != FC0_TYPE_MGT || frame[0] & FC0_SUBTYPE_MASK != FC0_SUBTYPE_ACTION
+    {
+        return Err(BaRxError::NotBlockAckAction);
+    }
+    let category = frame[MAC_HEADER_LEN];
+    let action = frame[MAC_HEADER_LEN + 1];
+    Ok(match (category, action) {
+        (ACTION_CATEGORY_BA, ACTION_ADDBA_REQ) => ActionDispatch::AddbaRequest,
+        (ACTION_CATEGORY_BA, ACTION_ADDBA_RESP) => ActionDispatch::AddbaResponse,
+        (ACTION_CATEGORY_BA, ACTION_DELBA) => ActionDispatch::Delba,
+        (CATEGORY_SA_QUERY, ACTION_SA_QUERY_REQ) => ActionDispatch::SaQueryRequest,
+        (CATEGORY_SA_QUERY, ACTION_SA_QUERY_RESP) => ActionDispatch::SaQueryResponse,
+        _ => ActionDispatch::Ignore { category, action },
+    })
 }
 
 /// Process an incoming ADDBA Request into source accept/refuse/ignore decisions.
@@ -458,5 +493,17 @@ mod tests {
         bar[BAR_HEADER_LEN + 6..BAR_HEADER_LEN + 10]
             .copy_from_slice(&[0x2000u16.to_le_bytes(), 0x0080u16.to_le_bytes()].concat());
         assert_eq!(receive_bar(&bar, true).unwrap(), vec![(1, 4), (2, 8)]);
+    }
+
+    #[test]
+    fn action_dispatch_routes_supported_management_actions() {
+        let frame = action(ACTION_ADDBA_REQ, &[]);
+        assert_eq!(dispatch_action(&frame), Ok(ActionDispatch::AddbaRequest));
+        let mut sa_query = action(ACTION_SA_QUERY_RESP, &[0, 0]);
+        sa_query[MAC_HEADER_LEN] = CATEGORY_SA_QUERY;
+        assert_eq!(
+            dispatch_action(&sa_query),
+            Ok(ActionDispatch::SaQueryResponse)
+        );
     }
 }

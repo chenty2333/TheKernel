@@ -32,10 +32,10 @@ mod scan;
 pub use assoc_rx::{AssocRxError, AssocRxPolicy, AssocRxResult, receive_assoc_response};
 pub use auth_rx::{AuthRxError, AuthRxResult, receive_auth_response};
 pub use ba_rx::{
-    AddbaRequestOutcome, AddbaRequestPolicy, AddbaResponseOutcome, BaAgreement, BaRxError,
-    DelbaOutcome, accept_addba_request, accept_addba_response, receive_addba_request,
-    receive_addba_response, receive_bar, receive_delba, refuse_addba_request,
-    refuse_addba_response,
+    ActionDispatch, AddbaRequestOutcome, AddbaRequestPolicy, AddbaResponseOutcome, BaAgreement,
+    BaRxError, DelbaOutcome, accept_addba_request, accept_addba_response, dispatch_action,
+    receive_addba_request, receive_addba_response, receive_bar, receive_delba,
+    refuse_addba_request, refuse_addba_response,
 };
 pub use beacon::{BeaconError, BeaconPolicy, BeaconRxInfo, BeaconUpdate, receive_beacon};
 pub use channel::{
