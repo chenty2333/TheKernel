@@ -693,3 +693,7 @@ header preserves the complete grant.
 `tk-intel-display/src/intel_dp_full.rs` translates 284 DisplayPort policy and
 configuration functions from `intel_dp.c` (MIT, © 2008 Intel). Its grant is
 included in `LICENSE-MIT`.
+
+`tk-intel-display/src/intel_hotplug_irq_full.rs` translates all 93 HPD IRQ
+functions in `intel_hotplug_irq.c` (MIT, © 2023 Intel). Its grant is included
+in `LICENSE-MIT`.
