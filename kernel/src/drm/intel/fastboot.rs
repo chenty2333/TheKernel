@@ -914,6 +914,11 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
     fn supports_cursor(&self) -> bool {
         false
     }
+    fn primary_formats(&self) -> &'static [u32] {
+        // Native fastboot currently validates and programs only the exact
+        // opaque linear XR24 primary-plane path.
+        &[intel_display::universal_plane::XRGB8888]
+    }
     fn pci_identity(&self) -> Option<axdriver_display::DisplayPciIdentity> {
         Some(self.pci)
     }

@@ -164,6 +164,18 @@ pub trait DisplayAdapter: Send + Sync {
     fn supports_cursor(&self) -> bool {
         true
     }
+    /// Linear formats this adapter can actually scan out on its primary
+    /// plane. KMS must not advertise the DRM-core superset as hardware support.
+    fn primary_formats(&self) -> &'static [u32] {
+        &[
+            super::property::FORMAT_XRGB8888,
+            super::property::FORMAT_ARGB8888,
+        ]
+    }
+    /// Linear formats accepted by the native cursor plane, if present.
+    fn cursor_formats(&self) -> &'static [u32] {
+        &[super::property::FORMAT_ARGB8888]
+    }
     fn pci_identity(&self) -> Option<axdriver_display::DisplayPciIdentity> {
         None
     }
@@ -458,10 +470,7 @@ impl DrmDevice {
             super::property::IN_FORMATS_PRIMARY_BLOB_ID,
             PropertyBlob {
                 owner: None,
-                bytes: super::property::linear_in_formats_blob(&[
-                    super::property::FORMAT_XRGB8888,
-                    super::property::FORMAT_ARGB8888,
-                ]),
+                bytes: super::property::linear_in_formats_blob(adapter.primary_formats()),
                 references: 1,
                 destroyed: true,
             },
@@ -471,9 +480,7 @@ impl DrmDevice {
                 super::property::IN_FORMATS_CURSOR_BLOB_ID,
                 PropertyBlob {
                     owner: None,
-                    bytes: super::property::linear_in_formats_blob(&[
-                        super::property::FORMAT_ARGB8888,
-                    ]),
+                    bytes: super::property::linear_in_formats_blob(adapter.cursor_formats()),
                     references: 1,
                     destroyed: true,
                 },
@@ -1802,7 +1809,10 @@ fn apply_degamma_lut(state: &mut DeviceState, blob_id: u32) -> DrmResult<()> {
         }
         return Ok(());
     }
-    let blob = state.property_blobs.get(&blob_id).ok_or(DrmError::NotFound)?;
+    let blob = state
+        .property_blobs
+        .get(&blob_id)
+        .ok_or(DrmError::NotFound)?;
     if blob.bytes.len() != state.degamma_lut.len() / 3 * 8 {
         return Err(DrmError::Invalid);
     }
@@ -1823,7 +1833,10 @@ fn apply_ctm(state: &mut DeviceState, blob_id: u32) -> DrmResult<()> {
         state.ctm = [1 << 32, 0, 0, 0, 1 << 32, 0, 0, 0, 1 << 32];
         return Ok(());
     }
-    let blob = state.property_blobs.get(&blob_id).ok_or(DrmError::NotFound)?;
+    let blob = state
+        .property_blobs
+        .get(&blob_id)
+        .ok_or(DrmError::NotFound)?;
     if blob.bytes.len() != core::mem::size_of::<[u64; 9]>() {
         return Err(DrmError::Invalid);
     }
@@ -2047,11 +2060,64 @@ mod tests {
         );
         let primary = &state.property_blobs[&super::super::property::IN_FORMATS_PRIMARY_BLOB_ID];
         let cursor = &state.property_blobs[&super::super::property::IN_FORMATS_CURSOR_BLOB_ID];
-        assert_eq!(u32::from_le_bytes(primary.bytes[8..12].try_into().unwrap()), 2);
-        assert_eq!(u64::from_le_bytes(primary.bytes[32..40].try_into().unwrap()), 3);
-        assert_eq!(u32::from_le_bytes(cursor.bytes[8..12].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(cursor.bytes[24..28].try_into().unwrap()), super::super::property::FORMAT_ARGB8888);
-        assert_eq!(u64::from_le_bytes(cursor.bytes[32..40].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_le_bytes(primary.bytes[8..12].try_into().unwrap()),
+            2
+        );
+        assert_eq!(
+            u64::from_le_bytes(primary.bytes[32..40].try_into().unwrap()),
+            3
+        );
+        assert_eq!(
+            u32::from_le_bytes(cursor.bytes[8..12].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(cursor.bytes[24..28].try_into().unwrap()),
+            super::super::property::FORMAT_ARGB8888
+        );
+        assert_eq!(
+            u64::from_le_bytes(cursor.bytes[32..40].try_into().unwrap()),
+            1
+        );
+    }
+
+    struct XrgbOnlyAdapter;
+    impl DisplayAdapter for XrgbOnlyAdapter {
+        fn supports_cursor(&self) -> bool {
+            false
+        }
+        fn primary_formats(&self) -> &'static [u32] {
+            &[super::super::property::FORMAT_XRGB8888]
+        }
+        fn create_dumb(
+            &self,
+            _: DumbRequest,
+            _: u32,
+            _: u64,
+            _allocation_owner: Arc<dyn Send + Sync>,
+        ) -> DrmResult<Arc<dyn GemBacking>> {
+            Err(DrmError::Unsupported)
+        }
+        fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
+            Ok(Fence::new(true))
+        }
+    }
+
+    #[test]
+    fn adapter_primary_format_blob_uses_only_scanout_capabilities() {
+        let device = DrmDevice::new(Arc::new(XrgbOnlyAdapter), 1, 2, 3, 4);
+        let state = device.state.lock();
+        let primary = &state.property_blobs[&super::super::property::IN_FORMATS_PRIMARY_BLOB_ID];
+        assert_eq!(
+            u32::from_le_bytes(primary.bytes[8..12].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(primary.bytes[24..28].try_into().unwrap()),
+            super::super::property::FORMAT_XRGB8888
+        );
+        assert_eq!(state.resources.cursor_plane_id, 0);
     }
 
     struct Backing;
