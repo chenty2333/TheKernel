@@ -35,6 +35,9 @@ const MII_AUTONEG_ADV: u8 = 0x04;
 const MII_1000T_CTRL: u8 = 0x09;
 const IGP01E1000_PHY_PAGE_SELECT: u32 = 0x1f;
 const MAX_PHY_MULTI_PAGE_REG: u32 = 0x0f;
+const KMRNCTRLSTA_OFFSET: u32 = 0x001f_0000;
+const KMRNCTRLSTA_OFFSET_SHIFT: u32 = 16;
+const KMRNCTRLSTA_REN: u32 = 0x0020_0000;
 const NWAY_AR_PAUSE: u16 = 0x0400;
 const NWAY_AR_ASM_DIR: u16 = 0x0800;
 const I2CCMD_TIMEOUT: u32 = E1000_I2CCMD_PHY_TIMEOUT;
@@ -293,7 +296,7 @@ pub struct AutonegConfig {
     pub flow_control: FlowControlMode,
 }
 
-pub trait E1000PhyMdicOps {
+pub trait E1000PhyMdicOps: E1000RegisterIo {
     fn read_mdic(&mut self, offset: u32) -> DevResult<u16>;
     fn write_mdic(&mut self, offset: u32, data: u16) -> DevResult;
     fn acquire(&mut self) -> DevResult;
@@ -419,6 +422,88 @@ pub fn write_phy_reg_igp_locked<I: E1000PhyMdicOps>(
     data: u16,
 ) -> DevResult {
     write_phy_reg_igp_internal(io, offset, data, true, true)
+}
+
+/// upstream: e1000_phy.c __e1000_read_kmrn_reg()
+pub fn read_kmrn_reg_internal<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    locked: bool,
+    acquire_installed: bool,
+) -> DevResult<u16> {
+    if !locked {
+        if !acquire_installed {
+            return Ok(0);
+        }
+        io.acquire()?;
+    }
+    let result = (|| {
+        let command = ((offset << KMRNCTRLSTA_OFFSET_SHIFT) & KMRNCTRLSTA_OFFSET) | KMRNCTRLSTA_REN;
+        io.write_register(E1000_KMRNCTRLSTA, command)?;
+        let _ = io.read_register(E1000_STATUS)?;
+        io.delay_us(2);
+        Ok(io.read_register(E1000_KMRNCTRLSTA)? as u16)
+    })();
+    if !locked {
+        io.release();
+    }
+    result
+}
+
+/// upstream: e1000_phy.c e1000_read_kmrn_reg_generic()
+pub fn read_kmrn_reg_generic<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    acquire_installed: bool,
+) -> DevResult<u16> {
+    read_kmrn_reg_internal(io, offset, false, acquire_installed)
+}
+
+/// upstream: e1000_phy.c e1000_read_kmrn_reg_locked()
+pub fn read_kmrn_reg_locked<I: E1000PhyMdicOps>(io: &mut I, offset: u32) -> DevResult<u16> {
+    read_kmrn_reg_internal(io, offset, true, true)
+}
+
+/// upstream: e1000_phy.c __e1000_write_kmrn_reg()
+pub fn write_kmrn_reg_internal<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    data: u16,
+    locked: bool,
+    acquire_installed: bool,
+) -> DevResult {
+    if !locked {
+        if !acquire_installed {
+            return Ok(());
+        }
+        io.acquire()?;
+    }
+    let result = (|| {
+        let value = ((offset << KMRNCTRLSTA_OFFSET_SHIFT) & KMRNCTRLSTA_OFFSET) | u32::from(data);
+        io.write_register(E1000_KMRNCTRLSTA, value)?;
+        let _ = io.read_register(E1000_STATUS)?;
+        io.delay_us(2);
+        Ok(())
+    })();
+    if !locked {
+        io.release();
+    }
+    result
+}
+
+/// upstream: e1000_phy.c e1000_write_kmrn_reg_generic()
+pub fn write_kmrn_reg_generic<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    data: u16,
+    acquire_installed: bool,
+) -> DevResult {
+    write_kmrn_reg_internal(io, offset, data, false, acquire_installed)
+}
+
+/// upstream: e1000_phy.c e1000_write_kmrn_reg_locked()
+pub fn write_kmrn_reg_locked<I: E1000PhyMdicOps>(io: &mut I, offset: u32, data: u16) -> DevResult {
+    write_kmrn_reg_internal(io, offset, data, true, true)
 }
 
 /// upstream: e1000_phy.c e1000_phy_setup_autoneg()
@@ -574,9 +659,19 @@ mod tests {
         mdic_writes: alloc::vec::Vec<(u32, u16)>,
         locks: usize,
         unlocks: usize,
+        kmrn_data: u16,
     }
     impl E1000RegisterIo for Io {
         fn read_register(&mut self, register: u32) -> DevResult<u32> {
+            if register == E1000_KMRNCTRLSTA {
+                let command = self
+                    .writes
+                    .iter()
+                    .rev()
+                    .find_map(|(reg, value)| (*reg == E1000_KMRNCTRLSTA).then_some(*value))
+                    .unwrap_or(0);
+                return Ok((command & KMRNCTRLSTA_OFFSET) | u32::from(self.kmrn_data));
+            }
             if register == E1000_MDIC {
                 let command = self
                     .writes
@@ -791,5 +886,25 @@ mod tests {
             (IGP01E1000_PHY_PAGE_SELECT, 0x22)
         );
         assert_eq!(io.mdic_writes.last(), Some(&(2, 0x55aa)));
+    }
+
+    #[test]
+    fn generic_kmrn_read_write_preserve_acquire_flush_delay_order() {
+        let mut io = Io {
+            kmrn_data: 0x55aa,
+            ..Io::default()
+        };
+        assert_eq!(read_kmrn_reg_generic(&mut io, 3, true).unwrap(), 0x55aa);
+        assert_eq!((io.locks, io.unlocks), (1, 1));
+        assert_eq!(io.delay, 2);
+        assert!(io.writes[0].1 & KMRNCTRLSTA_REN != 0);
+        write_kmrn_reg_generic(&mut io, 5, 0x1234, true).unwrap();
+        assert_eq!(
+            io.writes.last().unwrap().1,
+            (5 << KMRNCTRLSTA_OFFSET_SHIFT) | 0x1234
+        );
+        let locks = io.locks;
+        write_kmrn_reg_locked(&mut io, 7, 0x4321).unwrap();
+        assert_eq!(io.locks, locks);
     }
 }
