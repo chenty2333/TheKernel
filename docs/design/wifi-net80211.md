@@ -47,3 +47,7 @@ VHT operation parsing follows the source ext-NSS bandwidth table to resolve the
 secondary 80-MHz center; it widens a 80-MHz report to 160 only when local
 channel/capability data allows, and clamps unsupported 160-MHz operation back
 to the primary-containing 80-MHz block.
+Peer rate setup bounds Supported/Extended Supported Rates to the 15-entry
+upstream set, records truncated extensions, infers ERP/11g from 2.4-GHz OFDM
+rates, and delegates mutual-rate selection to the protocol layer. Legacy ABG
+mode resolves from a fixed local choice or the peer's band/ERP state.

@@ -10,6 +10,7 @@ mod channel;
 mod frame;
 mod node;
 mod node_caps;
+mod node_rates;
 mod ra;
 mod rates;
 mod regdomain;
@@ -42,6 +43,10 @@ pub use node_caps::{
     clear_he_caps, clear_ht_caps, clear_vht_caps, ht_secondary_offset, setup_he_caps,
     setup_he_operation, setup_ht_caps, setup_ht_operation, setup_vht_caps, setup_vht_operation,
     vht_channel_width,
+};
+pub use node_rates::{
+    CHAN_DYN as NODE_CHAN_DYN, CHAN_OFDM as NODE_CHAN_OFDM, NODE_ERP, PeerRateState, RateIeError,
+    node_abg_mode, node_is_11g, setup_rates,
 };
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,
