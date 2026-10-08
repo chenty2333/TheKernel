@@ -76,6 +76,7 @@
 use alloc::{format, string::String, vec::Vec};
 
 use intel_display::{
+    dmc::DmcPlatform,
     power_domains::{PowerDomainIo, PowerDomainState},
     power_map::{
         PowerDomain, PowerWellGroup, PowerWellInstance, WellControl, WellOps, power_wells,
@@ -1065,6 +1066,7 @@ pub(crate) fn disable_dc_states<R: Registers>(regs: &R) -> Result<DcStateObserva
 pub(crate) fn enable_well<R: Registers>(
     regs: &R,
     well: Well,
+    platform: DmcPlatform,
 ) -> Result<WellObservation, PowerError> {
     // This observation belongs to the surrounding transaction, not the
     // translated HSW helper: it records who owned the request before handoff.
@@ -1085,7 +1087,8 @@ pub(crate) fn enable_well<R: Registers>(
         pg: well.pg,
         timeout_ms: well.timeout_us.div_ceil(1_000) as u16,
         has_fuses: well.pg.is_some(),
-        alderlake_pw1_wa: well.pg == Some(SKL_PG1),
+        alderlake_pw1_wa: matches!(platform, DmcPlatform::AlderLakeP | DmcPlatform::AlderLakeN)
+            && well.pg == Some(SKL_PG1),
         irq_pipe_mask: 0,
     };
     let enable =
@@ -1133,7 +1136,11 @@ pub(crate) fn enable_well<R: Registers>(
 
 /// Drop one HSW-style request after its final mapped domain reference.
 // upstream: intel_display_power_well.c hsw_power_well_disable()
-pub(crate) fn disable_well<R: Registers>(regs: &R, well: Well) -> Result<(), PowerError> {
+pub(crate) fn disable_well<R: Registers>(
+    regs: &R,
+    well: Well,
+    platform: DmcPlatform,
+) -> Result<(), PowerError> {
     let adapter = HswPowerWellAdapter { regs };
     let spec = intel_display::power_well::HswWellSpec {
         name: well.name,
@@ -1149,7 +1156,8 @@ pub(crate) fn disable_well<R: Registers>(regs: &R, well: Well) -> Result<(), Pow
         pg: well.pg,
         timeout_ms: well.timeout_us.div_ceil(1_000) as u16,
         has_fuses: well.pg.is_some(),
-        alderlake_pw1_wa: well.pg == Some(SKL_PG1),
+        alderlake_pw1_wa: matches!(platform, DmcPlatform::AlderLakeP | DmcPlatform::AlderLakeN)
+            && well.pg == Some(SKL_PG1),
         irq_pipe_mask: 0,
     };
     intel_display::power_well::hsw_power_well_disable(&adapter, spec)
@@ -1178,7 +1186,10 @@ fn mapped_hsw_well(instance: PowerWellInstance) -> Option<Well> {
     }
 }
 
-struct MappedPowerWellIo<'a, R>(&'a R);
+struct MappedPowerWellIo<'a, R> {
+    regs: &'a R,
+    platform: DmcPlatform,
+}
 
 impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
     fn enable_well(
@@ -1193,7 +1204,7 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
             return Err(intel_display::Error::Refused);
         }
         let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
-        enable_well(self.0, well)
+        enable_well(self.regs, well, self.platform)
             .map(|_| ())
             .map_err(|_| intel_display::Error::Unavailable(well.register.offset()))
     }
@@ -1210,7 +1221,7 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
             return Err(intel_display::Error::Refused);
         }
         let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
-        disable_well(self.0, well)
+        disable_well(self.regs, well, self.platform)
             .map_err(|_| intel_display::Error::Unavailable(well.register.offset()))
     }
 
@@ -1223,7 +1234,7 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
             return Ok(true);
         }
         let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
-        read(self.0, well.register)
+        read(self.regs, well.register)
             .map(|value| value & well.state_mask() != 0)
             .map_err(|_| intel_display::Error::Unavailable(well.register.offset()))
     }
@@ -1419,7 +1430,7 @@ fn bring_up_inner(
     };
 
     // Phase 1.3.
-    let pw1 = enable_well(regs, PW_1)?;
+    let pw1 = enable_well(regs, PW_1, DmcPlatform::AlderLakeN)?;
     // Every step below runs with the well up, so every failure below has to
     // put the well back.  `we_requested` is what makes that safe: a request bit
     // that was already set is not this call's to withdraw.
@@ -1462,10 +1473,15 @@ fn bring_up_inner(
     // The opt-in pipe-A modeset needs PW_A after the display core and clocks
     // are live. Keep the reference in the returned state so the map count
     // remains paired with the hardware request for the lifetime of scanout.
-    let power_map = power_wells(intel_display::dmc::DmcPlatform::AlderLakeN);
+    let platform = DmcPlatform::AlderLakeN;
+    let power_map = power_wells(platform);
     let mut power_domains = PowerDomainState::new(power_map);
     power_domains
-        .get(power_map, PowerDomain::PipeA, &mut MappedPowerWellIo(regs))
+        .get(
+            power_map,
+            PowerDomain::PipeA,
+            &mut MappedPowerWellIo { regs, platform },
+        )
         .map_err(|error| {
             unwind(
                 regs,
@@ -1788,7 +1804,7 @@ mod tests {
             stored | PW_1.request_mask()
         });
 
-        let observation = enable_well(&regs, PW_1).unwrap();
+        let observation = enable_well(&regs, PW_1, DmcPlatform::AlderLakeN).unwrap();
         assert!(!observation.state_set);
         assert!(
             observation.requesters.bios,
@@ -1809,7 +1825,7 @@ mod tests {
     fn fuse_timeouts_are_reported_but_do_not_short_circuit_hsw_well_enable() {
         let regs = powered_machine();
         regs.set(regs::SKL_FUSE_STATUS, 0);
-        let observation = enable_well(&regs, PW_1).unwrap();
+        let observation = enable_well(&regs, PW_1, DmcPlatform::AlderLakeN).unwrap();
         assert_eq!(
             observation.pg0,
             Some(FusePoll::NotDistributed { pg: SKL_PG0 })
@@ -1833,6 +1849,18 @@ mod tests {
         );
         let state = bring_up(&regs).unwrap();
         assert!(state.pw1.pg.unwrap().distributed());
+    }
+
+    #[test]
+    fn alder_lake_pw1_workaround_is_not_applied_to_other_platforms() {
+        let regs = powered_machine();
+        enable_well(&regs, PW_1, DmcPlatform::TigerLake).unwrap();
+        assert!(
+            !regs
+                .writes()
+                .iter()
+                .any(|(name, _)| *name == regs::GEN8_CHICKEN_DCPR_1.name())
+        );
     }
 
     #[test]
@@ -1905,7 +1933,7 @@ mod tests {
     fn enabling_a_well_that_is_already_on_does_not_claim_credit() {
         let regs = powered_machine();
         regs.set(regs::HSW_PWR_WELL_CTL2, well_state(PW_1.index));
-        let observation = enable_well(&regs, PW_1).unwrap();
+        let observation = enable_well(&regs, PW_1, DmcPlatform::AlderLakeN).unwrap();
         assert!(observation.already_on);
         assert!(observation.describe().contains("was already on"));
         assert!(observation.requesters.driver);
@@ -1981,7 +2009,7 @@ mod tests {
         regs.derive(regs::HSW_PWR_WELL_CTL2, |written| {
             written & !PW_1.state_mask()
         });
-        let observation = enable_well(&regs, PW_1).unwrap();
+        let observation = enable_well(&regs, PW_1, DmcPlatform::AlderLakeN).unwrap();
         assert!(!observation.state_set);
         assert_eq!(
             regs.read(regs::HSW_PWR_WELL_CTL2).unwrap() & PW_1.request_mask(),
@@ -1995,7 +2023,7 @@ mod tests {
         regs.derive(regs::HSW_PWR_WELL_CTL2, |written| {
             written & !PW_1.state_mask()
         });
-        let observation = enable_well(&regs, PW_1).unwrap();
+        let observation = enable_well(&regs, PW_1, DmcPlatform::AlderLakeN).unwrap();
         assert!(!observation.state_set);
         assert_eq!(
             regs.read(regs::HSW_PWR_WELL_CTL2).unwrap() & PW_1.request_mask(),

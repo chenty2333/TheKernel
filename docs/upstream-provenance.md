@@ -1047,3 +1047,6 @@ helper during initialization with those side effects intentionally suppressed.
 `intel_display_power_well.c` (MIT, Copyright © 2022 Intel), transferring a BIOS
 request to the driver before clearing BIOS ownership; requester reads follow
 BIOS, driver, KVMR, then debug order.
+
+The kernel HSW power-well adapter gates Wa_16013190616 on Alder Lake-P/N and
+PG1, rather than PG1 alone, matching `intel_display_power_well.c`.

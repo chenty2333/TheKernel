@@ -448,7 +448,7 @@ fn enable_wells<R: Registers>(regs: &R) -> Wells {
         // the value its own error names when a pin NAKs: the log line from this
         // step and the log line from the bus have to be about the same object.
         let reported = pin.aux_well();
-        match power::enable_well(regs, well) {
+        match power::enable_well(regs, well, intel_display::dmc::DmcPlatform::AlderLakeN) {
             Ok(observation) => {
                 info!("intel-connect: {}", observation.describe());
                 records.push((reported, observation));

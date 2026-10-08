@@ -1335,7 +1335,11 @@ pub(crate) fn program(
     // §8.6 step 5 -- the port's DDI-IO power, before anything drives a lane.
     // This is `power.rs`'s handshake, with its own rollback: a well that never
     // reports its state leaves the request bit withdrawn.
-    let ddi_io_well = power::enable_well(regs, ddi_io_well(phy))?;
+    let ddi_io_well = power::enable_well(
+        regs,
+        ddi_io_well(phy),
+        intel_display::dmc::DmcPlatform::AlderLakeN,
+    )?;
 
     // 5.3 -- §8.5's voltage-swing sequence: step 3's SUS clock config, steps 4
     // to 6's register batch.  `PORT_TX_DW2`, `PORT_TX_DW4` and `PORT_TX_DW7` are

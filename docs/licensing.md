@@ -581,3 +581,7 @@ its no-op observer is only for initialization, before PSR/DMC policy exists.
 `tk-intel-display/src/power_well.rs` also translates the BIOS-to-driver request
 handoff in `hsw_power_well_sync_hw()` (MIT, Copyright © 2022 Intel). The
 requester observations preserve the upstream BIOS, driver, KVMR, debug order.
+
+The HSW PW_1 workaround gate in `kernel/src/drm/intel/power.rs` is platform-
+qualified to Alder Lake-P/N and PG1, matching `intel_display_power_well.c`
+(Copyright © 2022 Intel).
