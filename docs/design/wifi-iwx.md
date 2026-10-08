@@ -63,3 +63,8 @@ The iwx association layer models source-order AUTH context creation with
 generation-guarded reverse cleanup, DEAUTH removal order, RUN station/MAC/power/
 rate setup, and RUN_STOP flush/BA/filter teardown. Platform command adapters
 must supply those ordered actions to the builders above.
+
+Key setup uses `ADD_STA_KEY` for legacy firmware, v1/v2 IGTK commands where
+applicable, and `SEC_KEY_CMD` for MLD firmware; unsupported ciphers stay on
+software crypto. Deferred install bookkeeping opens the RSN port only after
+the source-required pairwise/group and (for MFP) integrity-group keys succeed.

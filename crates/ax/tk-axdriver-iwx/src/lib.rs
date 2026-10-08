@@ -21,6 +21,7 @@ mod firmware_bundle;
 mod init_cmd;
 mod interrupts;
 mod intr;
+mod keys;
 mod mac;
 mod mac_context;
 mod nic;
@@ -116,6 +117,17 @@ pub use intr::{
     ICT_ADDRESS_SHIFT, ICT_ENTRY_COUNT, ICT_SIZE_BYTES, IctError, InterruptCauseTable,
     LegacyInterruptWork, MsixInterruptWork, plan_legacy_interrupt, plan_msix_interrupt, reset_ict,
     service_legacy_interrupt, service_msix_interrupt,
+};
+pub use keys::{
+    ADD_STA_KEY_COMMAND, ADD_STA_STATUS_MASK, ADD_STA_SUCCESS,
+    DATA_PATH_GROUP as KEY_DATA_PATH_GROUP, KeyCipher, KeyConfig, KeyError, KeyTracking,
+    NODE_HAVE_GROUP_KEY, NODE_HAVE_INTEGRITY_GROUP_KEY, NODE_HAVE_PAIRWISE_KEY,
+    SEC_KEY_CIPHER_CCMP, SEC_KEY_COMMAND, SEC_KEY_FLAG_MCAST, SEC_KEY_FLAG_MFP,
+    SETKEY_QUEUE_CAPACITY, STA_KEY_FLAG_CCM, STA_KEY_FLAG_KEY_ID_MASK, STA_KEY_FLAG_KEY_ID_SHIFT,
+    STA_KEY_FLAG_MFP, STA_KEY_FLAG_MULTICAST, STA_KEY_FLAG_WEP_KEY_MAP, STA_KEY_NOT_VALID,
+    SetKeyDecision, SetKeyQueue, delete_key_command, drain_key_install_queue, igtk_command,
+    key_install_succeeded, legacy_delete_key_command, legacy_station_key_command,
+    mld_station_key_command, set_key, station_key_command, validate_legacy_key_response,
 };
 pub use mac::{MacAddress, flip_hardware_address, is_valid_mac_address, select_csr_mac_address};
 pub use mac_context::{
