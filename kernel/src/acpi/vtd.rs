@@ -1206,10 +1206,15 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
         device_domains: Vec::new(),
     };
     *MANAGER.lock() = Some(manager);
-    REQUESTER_DOMAINS.store(
-        axhal::boot::command_line_value("iommu_domains") != Some("off"),
-        Ordering::Release,
-    );
+    let requester_domains = match axhal::boot::command_line_value("iommu_domains") {
+        None | Some("on") => true,
+        Some("off") => false,
+        Some(value) => {
+            warn!("vtd: ignoring invalid iommu_domains={value:?}; using shared DMA context");
+            false
+        }
+    };
+    REQUESTER_DOMAINS.store(requester_domains, Ordering::Release);
     MODE.store(MODE_ENABLED, Ordering::Release);
     info!(
         "vtd: DMAR units={} identity_end={maximum:#x} QI enabled; PCI DMA mapping active",
