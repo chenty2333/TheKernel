@@ -4,15 +4,37 @@
 //! `c2b7fe4a9e94a0edba9dd2772874928b565c4f9e` (BSD-3-Clause).
 //! Copyright (c) 2001-2020, Intel Corporation.
 
-use axdriver_base::DevResult;
+use axdriver_base::{DevError, DevResult};
 
-use super::{mac::E1000PhyRegisterIo, osdep::E1000RegisterIo, registers::*};
+use super::{
+    mac::{E1000PhyRegisterIo, FlowControlMode},
+    osdep::E1000RegisterIo,
+    registers::*,
+};
 
 const PHY_ID1: u8 = 0x02;
 const PHY_ID2: u8 = 0x03;
 const PHY_REVISION_MASK: u16 = 0x000f;
 const M88E1000_PHY_GEN_CONTROL: u8 = 0x1b;
 const E1000_BLK_PHY_RESET: u8 = 12;
+const MAX_PHY_REG_ADDRESS: u32 = 0x1f;
+const MDIC_DATA_MASK: u32 = 0xffff;
+const NWAY_AR_10T_HD_CAPS: u16 = 0x0020;
+const NWAY_AR_10T_FD_CAPS: u16 = 0x0040;
+const NWAY_AR_100TX_HD_CAPS: u16 = 0x0080;
+const NWAY_AR_100TX_FD_CAPS: u16 = 0x0100;
+const CR_1000T_HD_CAPS: u16 = 0x0100;
+const CR_1000T_FD_CAPS: u16 = 0x0200;
+const ADVERTISE_10_HALF: u16 = 0x0001;
+const ADVERTISE_10_FULL: u16 = 0x0002;
+const ADVERTISE_100_HALF: u16 = 0x0004;
+const ADVERTISE_100_FULL: u16 = 0x0008;
+const ADVERTISE_1000_HALF: u16 = 0x0010;
+const ADVERTISE_1000_FULL: u16 = 0x0020;
+const MII_AUTONEG_ADV: u8 = 0x04;
+const MII_1000T_CTRL: u8 = 0x09;
+const NWAY_AR_PAUSE: u16 = 0x0400;
+const NWAY_AR_ASM_DIR: u16 = 0x0800;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum E1000PhyCallback {
@@ -178,6 +200,144 @@ pub fn enable_phy_retry_mechanism(current: &mut u32, original: u32) {
     *current = original;
 }
 
+/// upstream: e1000_phy.c e1000_read_phy_reg_mdic()
+pub fn read_phy_reg_mdic<I: E1000RegisterIo>(
+    io: &mut I,
+    phy_address: u8,
+    retry_count: u32,
+    pch2lan: bool,
+    offset: u32,
+) -> DevResult<u16> {
+    if offset > MAX_PHY_REG_ADDRESS {
+        return Err(DevError::InvalidParam);
+    }
+    for retry in 0..=retry_count {
+        let command = (offset << E1000_MDIC_REG_SHIFT)
+            | (u32::from(phy_address) << E1000_MDIC_PHY_SHIFT)
+            | E1000_MDIC_OP_READ;
+        io.write_register(E1000_MDIC, command)?;
+        let mut mdic = 0;
+        for _ in 0..(E1000_GEN_POLL_TIMEOUT * 3) {
+            io.delay_us(50);
+            mdic = io.read_register(E1000_MDIC)?;
+            if mdic & E1000_MDIC_READY != 0 {
+                break;
+            }
+        }
+        let success = mdic & E1000_MDIC_READY != 0
+            && mdic & E1000_MDIC_ERROR == 0
+            && ((mdic & E1000_MDIC_REG_MASK) >> E1000_MDIC_REG_SHIFT) == offset;
+        if pch2lan {
+            io.delay_us(100);
+        }
+        if success {
+            return Ok((mdic & MDIC_DATA_MASK) as u16);
+        }
+        if retry != retry_count {
+            io.delay_us(10_000);
+        }
+    }
+    Err(DevError::Io)
+}
+
+/// upstream: e1000_phy.c e1000_write_phy_reg_mdic()
+pub fn write_phy_reg_mdic<I: E1000RegisterIo>(
+    io: &mut I,
+    phy_address: u8,
+    retry_count: u32,
+    pch2lan: bool,
+    offset: u32,
+    data: u16,
+) -> DevResult {
+    if offset > MAX_PHY_REG_ADDRESS {
+        return Err(DevError::InvalidParam);
+    }
+    for retry in 0..=retry_count {
+        let command = u32::from(data)
+            | (offset << E1000_MDIC_REG_SHIFT)
+            | (u32::from(phy_address) << E1000_MDIC_PHY_SHIFT)
+            | E1000_MDIC_OP_WRITE;
+        io.write_register(E1000_MDIC, command)?;
+        let mut mdic = 0;
+        for _ in 0..(E1000_GEN_POLL_TIMEOUT * 3) {
+            io.delay_us(50);
+            mdic = io.read_register(E1000_MDIC)?;
+            if mdic & E1000_MDIC_READY != 0 {
+                break;
+            }
+        }
+        let success = mdic & E1000_MDIC_READY != 0
+            && mdic & E1000_MDIC_ERROR == 0
+            && ((mdic & E1000_MDIC_REG_MASK) >> E1000_MDIC_REG_SHIFT) == offset;
+        if pch2lan {
+            io.delay_us(100);
+        }
+        if success {
+            return Ok(());
+        }
+        if retry != retry_count {
+            io.delay_us(10_000);
+        }
+    }
+    Err(DevError::Io)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutonegConfig {
+    pub advertised: u16,
+    pub mask: u16,
+    pub flow_control: FlowControlMode,
+}
+
+/// upstream: e1000_phy.c e1000_phy_setup_autoneg()
+pub fn phy_setup_autoneg<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    config: &mut AutonegConfig,
+) -> DevResult {
+    config.advertised &= config.mask;
+    let mut advertisement = io.read_phy_register(MII_AUTONEG_ADV)?;
+    let mut gigabit_control = 0;
+    if config.mask & ADVERTISE_1000_FULL != 0 {
+        gigabit_control = io.read_phy_register(MII_1000T_CTRL)?;
+    }
+    advertisement &= !(NWAY_AR_100TX_FD_CAPS
+        | NWAY_AR_100TX_HD_CAPS
+        | NWAY_AR_10T_FD_CAPS
+        | NWAY_AR_10T_HD_CAPS);
+    gigabit_control &= !(CR_1000T_HD_CAPS | CR_1000T_FD_CAPS);
+    if config.advertised & ADVERTISE_10_HALF != 0 {
+        advertisement |= NWAY_AR_10T_HD_CAPS;
+    }
+    if config.advertised & ADVERTISE_10_FULL != 0 {
+        advertisement |= NWAY_AR_10T_FD_CAPS;
+    }
+    if config.advertised & ADVERTISE_100_HALF != 0 {
+        advertisement |= NWAY_AR_100TX_HD_CAPS;
+    }
+    if config.advertised & ADVERTISE_100_FULL != 0 {
+        advertisement |= NWAY_AR_100TX_FD_CAPS;
+    }
+    // The upstream source deliberately never advertises 1000BASE-T half duplex.
+    let _denied_gigabit_half = config.advertised & ADVERTISE_1000_HALF;
+    if config.advertised & ADVERTISE_1000_FULL != 0 {
+        gigabit_control |= CR_1000T_FD_CAPS;
+    }
+    match config.flow_control {
+        FlowControlMode::None => advertisement &= !(NWAY_AR_ASM_DIR | NWAY_AR_PAUSE),
+        FlowControlMode::RxPause => advertisement |= NWAY_AR_ASM_DIR | NWAY_AR_PAUSE,
+        FlowControlMode::TxPause => {
+            advertisement |= NWAY_AR_ASM_DIR;
+            advertisement &= !NWAY_AR_PAUSE;
+        }
+        FlowControlMode::Full => advertisement |= NWAY_AR_ASM_DIR | NWAY_AR_PAUSE,
+    }
+    io.write_phy_register(MII_AUTONEG_ADV, advertisement)?;
+    if config.mask & ADVERTISE_1000_FULL != 0 {
+        io.write_phy_register(MII_1000T_CTRL, gigabit_control)?;
+    }
+    Ok(())
+}
+
 /// The source represents the reset-block status as a positive driver code.
 pub const fn reset_block_error_code(blocked: bool) -> Result<(), u8> {
     if blocked {
@@ -197,12 +357,26 @@ mod tests {
     struct Io {
         registers: [(u32, u32); 2],
         writes: alloc::vec::Vec<(u32, u32)>,
-        phy: [u16; 4],
+        phy: [u16; 16],
         phy_writes: alloc::vec::Vec<(u8, u16)>,
         delay: usize,
+        mdic_data: u16,
+        mdic_error: bool,
     }
     impl E1000RegisterIo for Io {
         fn read_register(&mut self, register: u32) -> DevResult<u32> {
+            if register == E1000_MDIC {
+                let command = self
+                    .writes
+                    .iter()
+                    .rev()
+                    .find_map(|(reg, value)| (*reg == E1000_MDIC).then_some(*value))
+                    .unwrap_or(0);
+                return Ok((command & E1000_MDIC_REG_MASK)
+                    | E1000_MDIC_READY
+                    | if self.mdic_error { E1000_MDIC_ERROR } else { 0 }
+                    | u32::from(self.mdic_data));
+            }
             Ok(self
                 .registers
                 .iter()
@@ -273,5 +447,44 @@ mod tests {
         enable_phy_retry_mechanism(&mut retries, saved);
         assert_eq!(retries, 4);
         assert_eq!(reset_block_error_code(true), Err(E1000_BLK_PHY_RESET));
+    }
+
+    #[test]
+    fn generic_mdic_transactions_validate_echo_error_retry_and_pch_delay() {
+        let mut io = Io {
+            mdic_data: 0x1234,
+            ..Io::default()
+        };
+        assert_eq!(read_phy_reg_mdic(&mut io, 1, 0, true, 2).unwrap(), 0x1234);
+        assert_eq!(io.writes[0].0, E1000_MDIC);
+        assert!(io.writes[0].1 & E1000_MDIC_OP_READ != 0);
+        assert_eq!(io.delay, 150);
+        write_phy_reg_mdic(&mut io, 1, 0, false, 3, 0xabcd).unwrap();
+        assert!(io.writes.last().unwrap().1 & E1000_MDIC_OP_WRITE != 0);
+        assert!(write_phy_reg_mdic(&mut io, 1, 0, false, 0x20, 0).is_err());
+        io.mdic_error = true;
+        assert!(read_phy_reg_mdic(&mut io, 1, 1, false, 2).is_err());
+    }
+
+    #[test]
+    fn generic_phy_autoneg_programs_speed_pause_and_gigabit_words() {
+        let mut io = Io::default();
+        io.phy[MII_AUTONEG_ADV as usize] = 0xffff;
+        io.phy[MII_1000T_CTRL as usize] = 0xffff;
+        let mut config = AutonegConfig {
+            advertised: ADVERTISE_10_HALF
+                | ADVERTISE_100_FULL
+                | ADVERTISE_1000_HALF
+                | ADVERTISE_1000_FULL,
+            mask: u16::MAX,
+            flow_control: FlowControlMode::TxPause,
+        };
+        phy_setup_autoneg(&mut io, &mut config).unwrap();
+        assert_eq!(
+            config.advertised,
+            ADVERTISE_10_HALF | ADVERTISE_100_FULL | ADVERTISE_1000_HALF | ADVERTISE_1000_FULL
+        );
+        assert_eq!(io.phy_writes[0], (MII_AUTONEG_ADV, 0xfb3f));
+        assert_eq!(io.phy_writes[1], (MII_1000T_CTRL, 0xfeff));
     }
 }
