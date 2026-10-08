@@ -194,6 +194,95 @@ pub fn intel_hdmi_tmds_clock(pixel_clock_khz: u32, bpc: u8, format: HdmiOutputFo
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastRgb {
+    Auto,
+    Full,
+    Limited,
+    OffDvi,
+}
+
+/// Detect whether the connector has HDMI signaling rather than forced DVI.
+// upstream: intel_hdmi.c intel_has_hdmi_sink()
+pub const fn intel_has_hdmi_sink(display_info_is_hdmi: bool, force_audio_off_dvi: bool) -> bool {
+    display_info_is_hdmi && !force_audio_off_dvi
+}
+
+/// Source audio-policy request values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HdmiAudioPolicy {
+    Auto,
+    On,
+    Off,
+    OffDvi,
+}
+
+/// Select HDMI audio from sink capability and connector force-audio policy.
+// upstream: intel_hdmi.c intel_hdmi_has_audio()
+pub const fn intel_hdmi_has_audio(
+    has_hdmi_sink: bool,
+    sink_has_audio: bool,
+    force_audio: HdmiAudioPolicy,
+) -> bool {
+    if !has_hdmi_sink {
+        return false;
+    }
+    match force_audio {
+        HdmiAudioPolicy::Auto => sink_has_audio,
+        HdmiAudioPolicy::On => true,
+        HdmiAudioPolicy::Off | HdmiAudioPolicy::OffDvi => false,
+    }
+}
+
+/// Derive the RGB limited-range pipe state; YCbCr always uses limited range.
+// upstream: intel_hdmi.c intel_hdmi_limited_color_range()
+pub const fn intel_hdmi_limited_color_range(
+    output_format: HdmiOutputFormat,
+    broadcast_rgb: BroadcastRgb,
+    has_hdmi_sink: bool,
+    default_rgb_limited: bool,
+) -> bool {
+    if !matches!(output_format, HdmiOutputFormat::Rgb) {
+        return false;
+    }
+    match broadcast_rgb {
+        BroadcastRgb::Auto => has_hdmi_sink && default_rgb_limited,
+        BroadcastRgb::Limited => true,
+        BroadcastRgb::Full | BroadcastRgb::OffDvi => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HdmiSinkFormat {
+    Rgb,
+    Ycbcr420,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HdmiFormatStatus {
+    Ok,
+    No420,
+    Bad,
+}
+
+/// Validate the source's RGB/Y420-only HDMI format admission branch.
+// upstream: intel_hdmi.c intel_hdmi_sink_format_valid()
+pub const fn intel_hdmi_sink_format_valid(
+    has_hdmi_sink: bool,
+    ycbcr_420_allowed: bool,
+    mode_is_420: bool,
+    format: HdmiSinkFormat,
+) -> HdmiFormatStatus {
+    match format {
+        HdmiSinkFormat::Ycbcr420 if !has_hdmi_sink || !ycbcr_420_allowed || !mode_is_420 => {
+            HdmiFormatStatus::No420
+        }
+        HdmiSinkFormat::Ycbcr420 | HdmiSinkFormat::Rgb => HdmiFormatStatus::Ok,
+        HdmiSinkFormat::Unsupported => HdmiFormatStatus::Bad,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HdmiModeStatus {
     Ok,
     ClockLow,
@@ -693,6 +782,48 @@ mod write_tests {
         assert_eq!(
             hdmi_port_clock_limit(600_000, true, None, None, false),
             165_000
+        );
+    }
+
+    #[test]
+    fn source_hdmi_sink_audio_range_and_format_policies_match_i915() {
+        assert!(!intel_has_hdmi_sink(true, true));
+        assert!(intel_has_hdmi_sink(true, false));
+        assert!(!intel_hdmi_has_audio(false, true, HdmiAudioPolicy::On));
+        assert!(intel_hdmi_has_audio(true, true, HdmiAudioPolicy::Auto));
+        assert!(!intel_hdmi_has_audio(true, false, HdmiAudioPolicy::Auto));
+        assert!(intel_hdmi_has_audio(true, false, HdmiAudioPolicy::On));
+        assert!(!intel_hdmi_limited_color_range(
+            HdmiOutputFormat::Ycbcr444,
+            BroadcastRgb::Limited,
+            true,
+            true
+        ));
+        assert!(intel_hdmi_limited_color_range(
+            HdmiOutputFormat::Rgb,
+            BroadcastRgb::Auto,
+            true,
+            true
+        ));
+        assert_eq!(
+            intel_hdmi_sink_format_valid(false, true, true, HdmiSinkFormat::Ycbcr420),
+            HdmiFormatStatus::No420
+        );
+        assert_eq!(
+            intel_hdmi_sink_format_valid(true, true, false, HdmiSinkFormat::Ycbcr420),
+            HdmiFormatStatus::No420
+        );
+        assert_eq!(
+            intel_hdmi_sink_format_valid(true, false, true, HdmiSinkFormat::Ycbcr420),
+            HdmiFormatStatus::No420
+        );
+        assert_eq!(
+            intel_hdmi_sink_format_valid(false, false, false, HdmiSinkFormat::Rgb),
+            HdmiFormatStatus::Ok
+        );
+        assert_eq!(
+            intel_hdmi_sink_format_valid(true, true, true, HdmiSinkFormat::Unsupported),
+            HdmiFormatStatus::Bad
         );
     }
 

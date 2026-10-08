@@ -667,3 +667,6 @@ source/sink BPC gating from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
 
 `hdmi.rs` also contains source/sink/downstream TMDS clock and BPC selection
 helpers from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
+
+`tk-intel-display/src/hdmi.rs` also translates HDMI/DVI sink audio, limited-range,
+and YCbCr420 format policy helpers from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
