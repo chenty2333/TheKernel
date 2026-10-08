@@ -1022,3 +1022,6 @@ and `intel_bios_fini_panel`) is represented by the owned `PanelVbtData` result
 and Rust drop rather than importing DRM panel lifecycle APIs.
 The VBT byte getter is exposed for an adapter; DRM debugfs registration and
 log-only DDI port printing remain framework diagnostics and are not copied.
+`kernel/src/drm/intel/fastboot.rs` consumes `intel_bios_init()` for the N305
+route and AFC override; general DDI cold-start admission still needs broader
+platform integration.

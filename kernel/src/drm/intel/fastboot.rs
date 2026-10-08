@@ -1592,16 +1592,39 @@ pub(super) fn init(
         if !vbt.checksum_valid() {
             return Err(Error::InvalidHeader);
         }
-        let afc_startup = vbt.afc_startup_override()?;
-        let definitions = vbt.parse_general_definitions(
+        let bios = intel_display::intel_bios::intel_bios_init(
+            Some(vbt.data()),
             13,
             intel_display::dmc::DmcPlatform::AlderLakeN,
-        )?;
-        let route = definitions
-            .encoder(if port == TcPort::Tc1 {
-                Port::Tc1
-            } else {
-                Port::Tc2
+            false,
+            true,
+            false,
+            &[
+                Port::A,
+                Port::B,
+                Port::C,
+                Port::D,
+                Port::E,
+                Port::F,
+                Port::Tc1,
+                Port::Tc2,
+            ],
+        );
+        let afc_startup = bios
+            .vbt
+            .as_ref()
+            .map(|vbt| vbt.afc_startup_override())
+            .transpose()?
+            .flatten();
+        let route = bios
+            .definitions
+            .as_ref()
+            .and_then(|definitions| {
+                definitions.encoder(if port == TcPort::Tc1 {
+                    Port::Tc1
+                } else {
+                    Port::Tc2
+                })
             })
             .ok_or(Error::Refused)?;
         if !route.supports_hdmi()

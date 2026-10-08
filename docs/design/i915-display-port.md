@@ -17,7 +17,9 @@ The TheKernel result owns panel data, so i915's DRM-panel early/late/fini
 allocation hooks map to one Rust init operation and ordinary ownership/drop.
 The VBT export getter is present; debugfs file registration and log-only DDI
 port printing are intentionally left to framework diagnostics, not copied into
-the hardware-independent parser.
+the hardware-independent parser. `kernel/src/drm/intel/fastboot.rs` now obtains
+the TC route and AFC override from `intel_bios_init()` rather than parsing those
+fields through a separate partial path.
 | Clock / PLL | `intel_cdclk.c`, `intel_dpll_mgr.c`, `intel_dpll.c` | `tk-intel-display::{cdclk,dpll_mgr,dkl_phy}`; `kernel/src/drm/intel/{clk,pll,phy,regs}` |
 | DDI / PHY / TC / HDMI | `intel_ddi.c`, `intel_ddi_buf_trans.c`, `intel_combo_phy.c`, `intel_tc.c`, `intel_hdmi.c` | `tk-intel-display::{ddi,tc,hdmi,device}`; `kernel/src/drm/intel/{output,tc_modeset,swing,phy,regs}` |
 | DP / AUX / DDC / HPD | `intel_dp.c`, `intel_dp_link_training.c`, `intel_dp_aux.c`, `intel_gmbus.c`, `intel_hotplug.c`, `intel_hotplug_irq.c` | `tk-intel-display::{ddi,tc}` and new focused modules as needed; `kernel/src/drm/intel::{connect,gmbus,hpd,irq,sink,output}`; common I2C/DRM interfaces |
