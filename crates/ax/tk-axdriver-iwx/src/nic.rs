@@ -26,6 +26,11 @@ const HW_CONFIG_PHY_STEP_POS: u32 = 14;
 const HW_CONFIG_FIELD_RADIO_TYPE: u32 = 0x3;
 const HW_CONFIG_FIELD_RADIO_STEP: u32 = 0x3 << 2;
 const HW_CONFIG_FIELD_RADIO_DASH: u32 = 0x3 << 4;
+const RFH_RXF_DMA_CFG: u32 = 0x00a0_9820;
+const RFH_RXF_DMA_CFG_GEN3: u32 = 0x00a0_7880;
+const RFH_GEN_STATUS: u32 = 0x00a0_9808;
+const RFH_GEN_STATUS_GEN3: u32 = 0x00a0_7824;
+const RXF_DMA_IDLE: u32 = 1 << 31;
 
 /// Configure MAC stepping/dash and firmware-derived radio type/step/dash.
 // upstream: if_iwx.c iwx_nic_config()
@@ -76,6 +81,40 @@ pub fn initialize_nic<B: CsrAccess>(
     initialize_rx(registers);
     registers.set_csr_bits(CSR_MAC_SHADOW_REG_CTRL, 0x800f_ffff);
     Ok(())
+}
+
+/// Disable receive DMA and poll for the generation-specific idle indication.
+// upstream: if_iwx.c iwx_disable_rx_dma()
+pub fn disable_rx_dma<B: CsrAccess>(
+    registers: &mut IwxRegisters<B>,
+) -> Result<bool, crate::RegisterError> {
+    let gen3 = registers.family() >= DeviceFamily::Ax210;
+    let (config, status) = if gen3 {
+        (RFH_RXF_DMA_CFG_GEN3, RFH_GEN_STATUS_GEN3)
+    } else {
+        (RFH_RXF_DMA_CFG, RFH_GEN_STATUS)
+    };
+    registers.nic_lock()?;
+    if gen3 {
+        registers.write_umac_prph(config, 0)?;
+    } else {
+        registers.write_prph(config, 0)?;
+    }
+    let mut idle = false;
+    for _ in 0..1000 {
+        let value = if gen3 {
+            registers.read_umac_prph(status)?
+        } else {
+            registers.read_prph(status)?
+        };
+        if value & RXF_DMA_IDLE != 0 {
+            idle = true;
+            break;
+        }
+        registers.delay_us(10);
+    }
+    registers.nic_unlock();
+    Ok(idle)
 }
 
 #[cfg(test)]
@@ -150,5 +189,19 @@ mod tests {
             | HW_CONFIG_RADIO_SI
             | HW_CONFIG_MAC_SI;
         assert_eq!(bus.regs[&CSR_HW_IF_CONFIG] & config_mask, 0);
+    }
+
+    #[test]
+    fn receive_dma_shutdown_selects_generation_and_waits_for_idle() {
+        let mut bus = Bus::default();
+        bus.regs.insert(0x024, 1);
+        let mut registers = IwxRegisters::new(bus, DeviceFamily::Ax210, 0);
+        assert_eq!(disable_rx_dma(&mut registers), Ok(false));
+        let bus = registers.into_inner();
+        assert!(
+            bus.writes
+                .contains(&(0x444, (3 << 24) | RFH_RXF_DMA_CFG_GEN3))
+        );
+        assert!(bus.writes.contains(&(0x44c, 0)));
     }
 }

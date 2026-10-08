@@ -93,7 +93,7 @@ pub use intr::{
     service_legacy_interrupt, service_msix_interrupt,
 };
 pub use mac::{MacAddress, flip_hardware_address, is_valid_mac_address, select_csr_mac_address};
-pub use nic::{configure_nic, initialize_nic, initialize_rx};
+pub use nic::{configure_nic, disable_rx_dma, initialize_nic, initialize_rx};
 pub use notif::{
     HBUS_TARG_WRPTR, HBUS_WRPTR_RX_Q0, NotificationRingError, RFH_Q0_FRBDCB_WIDX_TRG,
     RxNotificationBatch, drain_rx_notifications,

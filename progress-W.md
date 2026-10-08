@@ -20,4 +20,5 @@
 - Rate adaptation: 11g rate lookup and peer/local HT/VHT RX bitmap intersection are translated; TLC config command packing remains.
 - Post-ALIVE rate-format selection and command status-payload checks are wired into the firmware/host-command modules.
 - Review W-20..W-36 fixes: Gen3 queue modulus and doorbell kick, RX reset/command ACK/layout/context boot corrections, bounds, and normalized upstream markers (9db7b34c).
+- `iwx_disable_rx_dma()` now performs the family-specific RFH disable and bounded idle poll (pending commit).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.
