@@ -131,6 +131,7 @@
 
 - `iwx` foreground scan requests now build the firmware UMAC request from NVM-enabled/requested channels, stage reduced-scan config when firmware API 56 is present, and cache only validated RX beacons/probe responses; nl80211 TRIGGER_SCAN and GET_SCAN carry nested BSS UAPI records. `tk-axdriver-iwx` 212 tests and `tk-axdriver` 15 tests pass; kernel nl80211 test code compiles. Scan completion multicast is still open, so this is not yet a wpa_supplicant-complete scan contract.
 - nl80211 ABORT_SCAN (UAPI command 114) now validates the wireless ifindex and forwards the source UMAC scan-abort command; the wiphy's supported-command list includes it.
+- During a foreground scan the wireless driver's bounded RX poll now drains RX_PHY/RX_MPDU/scan-complete notifications into the scan cache; normal unassociated RX remains fail-closed because the station data/key path is not connected.
 - `ieee80211_proto.c` `ieee80211_addba_request()` now plans per-TID Tx BA state/token/window and request/offload outcome; proto coverage advances to 11/30 functions.
 - `ieee80211_proto.c` `ieee80211_delba_request()` now clears the source Tx/Rx agreement and returns stop/timer/reorder/send effects; proto coverage advances to 12/30 functions.
 - `ieee80211_proto.c` Tx/Rx BA timeout callbacks now update retry/stat state and route setup-required or timeout DELBA effects; proto coverage advances to 14/30 functions.

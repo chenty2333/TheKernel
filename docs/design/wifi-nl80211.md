@@ -41,8 +41,10 @@ currently have handlers. TRIGGER_SCAN validates the interface, the single-SSID l
 frequency list, then asks the iwx controller to send the firmware UMAC scan
 request. GET_SCAN returns only beacon/probe-response observations parsed from
 firmware RX notifications and retained by the driver's bounded station scan
-cache; it never synthesizes a BSS. The result records carry nested BSSID,
-frequency, TSF, capability, IEs, signal, and age attributes.
+cache; it never synthesizes a BSS. During an active scan, the axnet bounded
+polling worker drains firmware notifications and feeds that cache. The result
+records carry nested BSSID, frequency, TSF, capability, IEs, signal, and age
+attributes.
 ABORT_SCAN sends the source UMAC abort command when a foreground scan is active.
 The cache pump currently runs while waiting for the command ACK and while a
 scan dump is queried. A multicast NEW_SCAN_RESULTS/SCAN_ABORTED producer and

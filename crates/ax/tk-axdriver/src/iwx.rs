@@ -408,10 +408,13 @@ impl NetDriverOps for IwxNetDevice {
     }
 
     fn can_receive(&self) -> bool {
-        // Until the RX notification and net80211 conversion worker is
-        // attached, polling must not claim pending packets that cannot be
-        // retired into the Ethernet receive queue.
-        false
+        ATTACHED_DMA
+            .lock()
+            .iter()
+            .find(|device| device.bdf == self.bdf)
+            .is_some_and(|device| {
+                device.runtime_started && device.scan_cache.is_some() && !device.scan_complete
+            })
     }
 
     fn rx_queue_size(&self) -> usize {
@@ -440,6 +443,14 @@ impl NetDriverOps for IwxNetDevice {
     }
 
     fn receive(&mut self) -> DevResult<NetBufPtr> {
+        let mut devices = ATTACHED_DMA.lock();
+        if let Some(device) = devices.iter_mut().find(|device| device.bdf == self.bdf)
+            && device.runtime_started
+            && device.scan_cache.is_some()
+            && !device.scan_complete
+        {
+            let _ = pump_scan_events(device);
+        }
         Err(DevError::Again)
     }
 
