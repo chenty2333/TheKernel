@@ -190,6 +190,20 @@ pub const SDHCI_INT_DATA_MASK: u32 = SDHCI_INT_DATA_END
     | SDHCI_INT_DATA_TIMEOUT
     | SDHCI_INT_DATA_CRC
     | SDHCI_INT_DATA_END_BIT;
+
+// upstream: sdhci.c sdhci_tuning_intmask()
+pub const fn tuning_interrupt_mask(tuning_enabled: bool, retune_mode: u8) -> u32 {
+    if !tuning_enabled {
+        0
+    } else {
+        SDHCI_INT_TUNEERR
+            | if retune_mode == 2 || retune_mode == 3 {
+                SDHCI_INT_RETUNE
+            } else {
+                0
+            }
+    }
+}
 pub const SDHCI_DIVIDERS_MASK: u32 =
     (SDHCI_DIVIDER_MASK << SDHCI_DIVIDER_SHIFT) | (SDHCI_DIVIDER_HI_MASK << SDHCI_DIVIDER_HI_SHIFT);
 pub const SDHCI_ACMD12_ERR: u32 = 0x3C;
@@ -2965,6 +2979,20 @@ mod tests {
             SDHCI_TRNS_BLK_CNT_EN as u16
         );
         assert_eq!(transfer_mode_flags(0, SD_DATA, 0, false), 0);
+    }
+
+    #[test]
+    fn tuning_interrupt_mask_matches_retune_modes() {
+        assert_eq!(tuning_interrupt_mask(false, 3), 0);
+        assert_eq!(tuning_interrupt_mask(true, 1), SDHCI_INT_TUNEERR);
+        assert_eq!(
+            tuning_interrupt_mask(true, 2),
+            SDHCI_INT_TUNEERR | SDHCI_INT_RETUNE
+        );
+        assert_eq!(
+            tuning_interrupt_mask(true, 3),
+            SDHCI_INT_TUNEERR | SDHCI_INT_RETUNE
+        );
     }
 
     #[test]
