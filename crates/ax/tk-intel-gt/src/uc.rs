@@ -26,6 +26,9 @@ pub enum Kind {
     HuC,
 }
 
+pub const ENABLE_GUC_SUBMISSION: u32 = 1 << 0;
+pub const ENABLE_GUC_LOAD_HUC: u32 = 1 << 1;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Blob {
     pub path: &'static str,
@@ -252,6 +255,15 @@ pub fn candidates(platform: Platform, kind: Kind) -> &'static [Blob] {
     }
 }
 
+// upstream: intel_uc.c uc_expand_default_options()
+pub fn default_enable_mask(platform: Platform) -> u32 {
+    match platform {
+        Platform::TigerLake | Platform::RocketLake => 0,
+        Platform::AlderLakeS | Platform::AlderLakeN => ENABLE_GUC_LOAD_HUC,
+        Platform::AlderLakeP => ENABLE_GUC_LOAD_HUC | ENABLE_GUC_SUBMISSION,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +286,24 @@ mod tests {
         assert_eq!(candidates(Platform::AlderLakeP, Kind::HuC), ADL_HUC);
         assert_eq!(ADL_HUC[0].path, "i915/tgl_huc.bin");
         assert_eq!(ADL_HUC[1].path, "i915/tgl_huc_7.9.3.bin");
+    }
+
+    #[test]
+    fn u_c_defaults_follow_gen12_platform_policy() {
+        assert_eq!(default_enable_mask(Platform::TigerLake), 0);
+        assert_eq!(default_enable_mask(Platform::RocketLake), 0);
+        assert_eq!(
+            default_enable_mask(Platform::AlderLakeS),
+            ENABLE_GUC_LOAD_HUC
+        );
+        assert_eq!(
+            default_enable_mask(Platform::AlderLakeN),
+            ENABLE_GUC_LOAD_HUC
+        );
+        assert_eq!(
+            default_enable_mask(Platform::AlderLakeP),
+            ENABLE_GUC_LOAD_HUC | ENABLE_GUC_SUBMISSION
+        );
     }
 
     fn css_image(header_dwords: u32, image_dwords: u32) -> std::vec::Vec<u8> {

@@ -228,6 +228,8 @@ static UC_FIRMWARE: Mutex<UcFirmware> = Mutex::new(UcFirmware {
 fn load_uc_firmware() {
     const MAX_UC_BYTES: usize = 2 * 1024 * 1024;
     const WOPCM_BYTES: usize = 2 * 1024 * 1024;
+    let enable_guc = uc::default_enable_mask(Platform::AlderLakeN);
+    axlog::info!("intel-gt: upstream ADL-S/N uC default enable_guc={enable_guc:#x}");
     let mut request = |path: &str, max_len: usize| {
         axdriver::prelude::firmware::request(&alloc::format!("/lib/firmware/{path}"), max_len)
     };
