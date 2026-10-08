@@ -33,6 +33,10 @@ const ADVERTISE_1000_HALF: u16 = 0x0010;
 const ADVERTISE_1000_FULL: u16 = 0x0020;
 const MII_AUTONEG_ADV: u8 = 0x04;
 const MII_1000T_CTRL: u8 = 0x09;
+const PHY_STATUS: u8 = 0x01;
+const PHY_AUTO_NEG_LIMIT: usize = 45;
+const MII_SR_LINK_STATUS: u16 = 0x0004;
+const MII_SR_AUTONEG_COMPLETE: u16 = 0x0020;
 const IGP01E1000_PHY_PAGE_SELECT: u32 = 0x1f;
 const MAX_PHY_MULTI_PAGE_REG: u32 = 0x0f;
 const KMRNCTRLSTA_OFFSET: u32 = 0x001f_0000;
@@ -555,6 +559,45 @@ pub fn phy_setup_autoneg<I: E1000PhyRegisterIo>(
     Ok(())
 }
 
+/// upstream: e1000_phy.c e1000_wait_autoneg()
+pub fn wait_autoneg<I: E1000PhyRegisterIo>(io: &mut I, read_callback_installed: bool) -> DevResult {
+    if !read_callback_installed {
+        return Ok(());
+    }
+    for _ in (0..PHY_AUTO_NEG_LIMIT).rev() {
+        let _ = io.read_phy_register(PHY_STATUS)?;
+        let status = io.read_phy_register(PHY_STATUS)?;
+        if status & MII_SR_AUTONEG_COMPLETE != 0 {
+            break;
+        }
+        io.delay_us(100_000);
+    }
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_phy_has_link_generic()
+pub fn phy_has_link_generic<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    iterations: u32,
+    interval_us: u32,
+    read_callback_installed: bool,
+) -> DevResult<bool> {
+    if !read_callback_installed {
+        return Ok(false);
+    }
+    for _ in 0..iterations {
+        if io.read_phy_register(PHY_STATUS).is_err() {
+            io.delay_us(interval_us);
+        }
+        let status = io.read_phy_register(PHY_STATUS)?;
+        if status & MII_SR_LINK_STATUS != 0 {
+            return Ok(true);
+        }
+        io.delay_us(interval_us);
+    }
+    Ok(false)
+}
+
 fn i2c_wait<I: E1000RegisterIo>(io: &mut I) -> DevResult<u32> {
     for _ in 0..I2CCMD_TIMEOUT {
         io.delay_us(50);
@@ -906,5 +949,20 @@ mod tests {
         let locks = io.locks;
         write_kmrn_reg_locked(&mut io, 7, 0x4321).unwrap();
         assert_eq!(io.locks, locks);
+    }
+
+    #[test]
+    fn generic_phy_polling_reads_sticky_status_twice_and_bounds_wait() {
+        let mut linked = Io::default();
+        linked.phy[PHY_STATUS as usize] = MII_SR_LINK_STATUS | MII_SR_AUTONEG_COMPLETE;
+        assert!(phy_has_link_generic(&mut linked, 10, 25, true).unwrap());
+        assert!(wait_autoneg(&mut linked, true).is_ok());
+        assert_eq!(linked.delay, 0);
+
+        let mut down = Io::default();
+        assert!(!phy_has_link_generic(&mut down, 2, 10, true).unwrap());
+        assert_eq!(down.delay, 20);
+        wait_autoneg(&mut down, true).unwrap();
+        assert_eq!(down.delay, 4_500_020);
     }
 }

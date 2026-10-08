@@ -1011,3 +1011,5 @@ retain the latest Intel inventory, with no scanner exemptions.
 - Intel/FreeBSD `sys/dev/e1000/e1000_phy.c` at `c2b7fe4a9e94a0edba9dd2772874928b565c4f9e` (BSD-3-Clause): PHY callback defaults, PHY ID/revision, reset-block, DSP reset, and retry-state helpers are translated in `crates/ax/tk-axdriver-net/src/e1000/phy.rs`; remaining per-generation MDIO and PHY operations are being ported. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
 
 - Intel/FreeBSD `e1000_phy.c` coverage update: 20 of 98 source functions now have direct Rust counterparts, including bounded MDIC and I2C/SFP register operations plus PHY autoneg advertisement; per-generation PHY access paths remain in progress. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
+
+- Intel/FreeBSD `e1000_phy.c` coverage update: 35 of 98 source functions now have direct Rust counterparts, including locked/paged IGP/M88, Kumeran access, sticky-status polling, and bounded autoneg wait. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
