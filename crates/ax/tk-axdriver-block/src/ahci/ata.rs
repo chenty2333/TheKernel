@@ -4,6 +4,8 @@
 //! `ahci_setup_fis()` and ATA command definitions; CAM CCB translation is
 //! replaced by a typed block request.
 
+use super::regs::ATA_A_4BIT;
+
 /// Host-to-device Register FIS type.
 pub const FIS_TYPE_REG_H2D: u8 = 0x27;
 /// Register FIS command bit.
@@ -26,23 +28,37 @@ pub const ATA_DATA_SET_MANAGEMENT: u8 = 0x06;
 pub const ATA_DSM_TRIM: u8 = 0x01;
 
 /// A block-level ATA request that can be represented by a Register FIS.
+///
+/// Unlike FreeBSD CAM's generic ATA CCB, this request type intentionally
+/// excludes ICC, AUX, and arbitrary control/reset commands: the block
+/// interface does not issue those operations. Device-to-host reads and
+/// host-to-device writes use the command-header direction bit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtaRequest {
     /// Identify the attached ATA device into a 512-byte data buffer.
-    Identify,
+    Identify { pmp_port: u8 },
     /// LBA48 READ/WRITE DMA EXT request.
-    DmaExt { lba: u64, sectors: u16, write: bool },
+    DmaExt {
+        lba: u64,
+        sectors: u16,
+        write: bool,
+        pmp_port: u8,
+    },
     /// LBA48 NCQ read/write. `tag` occupies sector-count bits 7:3.
     Fpdma {
         lba: u64,
         sectors: u16,
         write: bool,
         tag: u8,
+        pmp_port: u8,
     },
     /// Persist the device write cache.
-    FlushCacheExt,
+    FlushCacheExt { pmp_port: u8 },
     /// Submit a DSM/TRIM parameter block of whole 512-byte sectors.
-    DsmTrim { parameter_sectors: u16 },
+    DsmTrim {
+        parameter_sectors: u16,
+        pmp_port: u8,
+    },
 }
 
 /// ATA command-transfer attributes needed to build the AHCI command header.
@@ -69,6 +85,8 @@ pub enum AtaRequestError {
     EmptyTransfer,
     /// NCQ tags are five-bit values.
     InvalidTag,
+    /// Port multiplier target is a four-bit ATA field.
+    InvalidPmpPort,
 }
 
 /// Build the 20-byte host-to-device Register FIS used by the AHCI command
@@ -81,7 +99,9 @@ pub fn setup_register_fis(
     fis[0] = FIS_TYPE_REG_H2D;
     fis[1] = FIS_FLAG_COMMAND;
     let attributes = match request {
-        AtaRequest::Identify => {
+        AtaRequest::Identify { pmp_port } => {
+            set_target(&mut fis, pmp_port)?;
+            fis[15] = ATA_A_4BIT as u8;
             fis[2] = ATA_IDENTIFY_DEVICE;
             CommandAttributes {
                 command: ATA_IDENTIFY_DEVICE,
@@ -95,7 +115,10 @@ pub fn setup_register_fis(
             lba,
             sectors,
             write,
+            pmp_port,
         } => {
+            set_target(&mut fis, pmp_port)?;
+            fis[15] = ATA_A_4BIT as u8;
             validate_lba_transfer(lba, sectors)?;
             let command = if write {
                 ATA_WRITE_DMA_EXT
@@ -120,7 +143,10 @@ pub fn setup_register_fis(
             sectors,
             write,
             tag,
+            pmp_port,
         } => {
+            set_target(&mut fis, pmp_port)?;
+            fis[15] = ATA_A_4BIT as u8;
             validate_lba_transfer(lba, sectors)?;
             if tag >= 32 {
                 return Err(AtaRequestError::InvalidTag);
@@ -137,7 +163,7 @@ pub fn setup_register_fis(
             // tag in SECTOR_COUNT, unlike DMA EXT's count fields.
             fis[3] = sectors as u8;
             fis[11] = (sectors >> 8) as u8;
-            fis[12] = tag << 3;
+            fis[12] = (sectors as u8 & 0x07) | (tag << 3);
             CommandAttributes {
                 command,
                 device_reads_buffer: write,
@@ -146,7 +172,9 @@ pub fn setup_register_fis(
                 tag: Some(tag),
             }
         }
-        AtaRequest::FlushCacheExt => {
+        AtaRequest::FlushCacheExt { pmp_port } => {
+            set_target(&mut fis, pmp_port)?;
+            fis[15] = ATA_A_4BIT as u8;
             fis[2] = ATA_FLUSH_CACHE_EXT;
             CommandAttributes {
                 command: ATA_FLUSH_CACHE_EXT,
@@ -156,7 +184,12 @@ pub fn setup_register_fis(
                 tag: None,
             }
         }
-        AtaRequest::DsmTrim { parameter_sectors } => {
+        AtaRequest::DsmTrim {
+            parameter_sectors,
+            pmp_port,
+        } => {
+            set_target(&mut fis, pmp_port)?;
+            fis[15] = ATA_A_4BIT as u8;
             if parameter_sectors == 0 {
                 return Err(AtaRequestError::EmptyTransfer);
             }
@@ -176,6 +209,15 @@ pub fn setup_register_fis(
     Ok((fis, attributes))
 }
 
+fn set_target(fis: &mut [u8; 20], pmp_port: u8) -> Result<(), AtaRequestError> {
+    if pmp_port >= 16 {
+        return Err(AtaRequestError::InvalidPmpPort);
+    }
+    // Upstream places the PMP port in bits 3:0 while retaining the command bit.
+    fis[1] = FIS_FLAG_COMMAND | pmp_port;
+    Ok(())
+}
+
 fn validate_lba_transfer(lba: u64, sectors: u16) -> Result<(), AtaRequestError> {
     if sectors == 0 {
         return Err(AtaRequestError::EmptyTransfer);
@@ -190,6 +232,7 @@ fn validate_lba_transfer(lba: u64, sectors: u16) -> Result<(), AtaRequestError> 
     Ok(())
 }
 
+// upstream: ahci.c ahci_setup_fis() LBA48 field encoding
 fn encode_lba48(fis: &mut [u8; 20], lba: u64) {
     fis[4] = lba as u8;
     fis[5] = (lba >> 8) as u8;
@@ -209,12 +252,13 @@ mod tests {
             lba: 0x12_3456_789abc,
             sectors: 0x1234,
             write: false,
+            pmp_port: 2,
         })
         .unwrap();
         assert_eq!(
             &fis[..14],
             &[
-                0x27, 0x80, 0x25, 0, 0xbc, 0x9a, 0x78, 0x40, 0x56, 0x34, 0x12, 0, 0x34, 0x12
+                0x27, 0x82, 0x25, 0, 0xbc, 0x9a, 0x78, 0x40, 0x56, 0x34, 0x12, 0, 0x34, 0x12
             ]
         );
         assert_eq!(attrs.command, ATA_READ_DMA_EXT);
@@ -229,28 +273,36 @@ mod tests {
             sectors: 0x0234,
             write: true,
             tag: 7,
+            pmp_port: 0,
         })
         .unwrap();
         assert_eq!(fis[2], ATA_WRITE_FPDMA_QUEUED);
         assert_eq!(fis[3], 0x34);
         assert_eq!(fis[11], 0x02);
-        assert_eq!(fis[12], 7 << 3);
+        assert_eq!(fis[12], (7 << 3) | 4);
+        assert_eq!(fis[15], ATA_A_4BIT as u8);
         assert!(attrs.device_reads_buffer);
         assert_eq!(attrs.tag, Some(7));
+        assert_eq!(fis[15], ATA_A_4BIT as u8);
     }
 
     #[test]
     fn flush_identify_and_trim_use_the_upstream_opcodes() {
         assert_eq!(
-            setup_register_fis(AtaRequest::Identify).unwrap().0[2],
+            setup_register_fis(AtaRequest::Identify { pmp_port: 0 })
+                .unwrap()
+                .0[2],
             ATA_IDENTIFY_DEVICE
         );
         assert_eq!(
-            setup_register_fis(AtaRequest::FlushCacheExt).unwrap().0[2],
+            setup_register_fis(AtaRequest::FlushCacheExt { pmp_port: 0 })
+                .unwrap()
+                .0[2],
             ATA_FLUSH_CACHE_EXT
         );
         let (fis, attrs) = setup_register_fis(AtaRequest::DsmTrim {
             parameter_sectors: 1,
+            pmp_port: 0,
         })
         .unwrap();
         assert_eq!(&fis[2..4], &[ATA_DATA_SET_MANAGEMENT, ATA_DSM_TRIM]);
@@ -263,7 +315,8 @@ mod tests {
             setup_register_fis(AtaRequest::DmaExt {
                 lba: 0,
                 sectors: 0,
-                write: false
+                write: false,
+                pmp_port: 0,
             }),
             Err(AtaRequestError::EmptyTransfer)
         );
@@ -271,7 +324,8 @@ mod tests {
             setup_register_fis(AtaRequest::DmaExt {
                 lba: (1 << 48) - 1,
                 sectors: 2,
-                write: false
+                write: false,
+                pmp_port: 0,
             }),
             Err(AtaRequestError::LbaOutOfRange)
         );
@@ -280,7 +334,8 @@ mod tests {
                 lba: 0,
                 sectors: 1,
                 write: false,
-                tag: 32
+                tag: 32,
+                pmp_port: 0,
             }),
             Err(AtaRequestError::InvalidTag)
         );

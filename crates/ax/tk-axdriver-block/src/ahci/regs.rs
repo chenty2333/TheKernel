@@ -320,6 +320,7 @@ pub const AHCI_CT_OFFSET: usize =
 /// Number of PRD entries chosen for a buffer length and page granularity.
 /// The FreeBSD macro pessimistically rounds `btoc(maxphys) + 1` up to a
 /// multiple of eight, capped by the 16-bit PRD count.
+// upstream: ahci.h AHCI_SG_ENTRIES
 pub const fn ahci_sg_entries(maxphys: usize, page_size: usize) -> usize {
     let pages = maxphys.saturating_add(page_size - 1) / page_size;
     let rounded = (pages.saturating_add(1).saturating_add(7)) & !7;
@@ -327,11 +328,13 @@ pub const fn ahci_sg_entries(maxphys: usize, page_size: usize) -> usize {
 }
 
 /// Per-command-table allocation size for the supplied PRD bound.
+// upstream: ahci.h AHCI_CT_SIZE
 pub const fn command_table_bytes(sg_entries: usize) -> usize {
     128 + sg_entries * core::mem::size_of::<DmaPrd>()
 }
 
 /// Aggregate work-area bytes for the given number of command slots.
+// upstream: ahci.h AHCI_WORK_SIZE
 pub const fn work_area_bytes(num_slots: usize, sg_entries: usize) -> usize {
     AHCI_CT_OFFSET + command_table_bytes(sg_entries) * num_slots
 }
@@ -535,6 +538,7 @@ pub enum ErrorType {
 
 /// AHCI port register offset for port `index` and register `offset`.
 #[inline]
+// upstream: ahci.c ahci_alloc_resource() (AHCI_OFFSET + unit * AHCI_STEP)
 pub const fn port_register(index: usize, offset: usize) -> usize {
     AHCI_OFFSET + index * AHCI_STEP + offset
 }

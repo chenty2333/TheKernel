@@ -133,12 +133,18 @@ impl<I: AhciIo> AhciController<I> {
             self.ccc = 0;
         }
         self.enclosure_location = self.io.read32(AHCI_EM_LOC);
+        // FreeBSD creates the DMA tag immediately before this point. DMA
+        // ownership is supplied by the TheKernel binding, then the same
+        // interrupt/status/CCC setup is applied here.
+        self.ahci_ctlr_setup();
     }
 
     /// FreeBSD `ahci_start`: prepare error/interrupt state, optional FBS, and
     /// start command processing on one port.
     // upstream: ahci.c ahci_start()
     pub fn ahci_start(&mut self, port: &mut PortState, fbs: bool) {
+        // The upstream optional `ch->start` hook has no registered callback
+        // in this port yet; this snapshot has no caller that installs one.
         let base = port.register_base();
         self.io.write32(base + AHCI_P_SERR, u32::MAX);
         self.io.write32(base + AHCI_P_IS, u32::MAX);
@@ -360,7 +366,12 @@ impl<I: AhciIo> AhciController<I> {
     // upstream: ahci.c ahci_ctlr_reset()
     pub fn ahci_ctlr_reset(&mut self) -> Result<(), ControllerError> {
         let version = self.io.read32(AHCI_VS);
-        if version >= 0x0001_0200 && self.capabilities2 & AHCI_CAP2_BOH != 0 {
+        let capabilities2 = if version >= 0x0001_0200 {
+            self.io.read32(AHCI_CAP2)
+        } else {
+            0
+        };
+        if version >= 0x0001_0200 && capabilities2 & AHCI_CAP2_BOH != 0 {
             let mut handoff = self.io.read32(AHCI_BOHC);
             if handoff & AHCI_BOHC_OOS == 0 {
                 handoff |= AHCI_BOHC_OOS;
@@ -638,5 +649,20 @@ mod tests {
                 | ATA_SC_IPM_DIS_SLUMBER
         )));
         assert!(io.writes[..io.write_count].contains(&(AHCI_OFFSET + AHCI_P_SERR, u32::MAX)));
+    }
+    #[test]
+    fn reset_reads_boh_capability_instead_of_relying_on_cached_attach_state() {
+        let mut io = FakeAhciIo::default();
+        io.regs[AHCI_VS / 4] = 0x0001_0200;
+        io.regs[AHCI_CAP2 / 4] = AHCI_CAP2_BOH;
+        io.regs[AHCI_BOHC / 4] = AHCI_BOHC_BOS | AHCI_BOHC_BB;
+        io.regs[AHCI_GHC / 4] = AHCI_GHC_AE;
+        let mut ctlr = AhciController::new(io, 0, 0, 0);
+        assert_eq!(ctlr.ahci_ctlr_reset(), Ok(()));
+        let io = ctlr.into_io();
+        assert!(
+            io.writes[..io.write_count]
+                .contains(&(AHCI_BOHC, AHCI_BOHC_BOS | AHCI_BOHC_BB | AHCI_BOHC_OOS,))
+        );
     }
 }

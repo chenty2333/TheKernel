@@ -249,7 +249,7 @@ impl<I: AhciIo> AhciDisk<I> {
         };
         let mut identify = [0u8; 512];
         if disk
-            .transfer_read(AtaRequest::Identify, &mut identify)
+            .transfer_read(AtaRequest::Identify { pmp_port: 0 }, &mut identify)
             .is_err()
         {
             return Err(disk.attach_failure(AhciDiskError::IdentifyFailed));
@@ -478,6 +478,7 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
                 lba,
                 sectors,
                 write: true,
+                pmp_port: 0,
             };
             self.transfer_write(request, &buf[offset..offset + count])
                 .map_err(map_error)?;
@@ -490,7 +491,7 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
     }
 
     fn flush(&mut self) -> DevResult {
-        self.execute(AtaRequest::FlushCacheExt, 0)
+        self.execute(AtaRequest::FlushCacheExt { pmp_port: 0 }, 0)
             .map_err(map_error)
     }
 
@@ -529,6 +530,7 @@ impl<I: AhciIo> AhciDisk<I> {
                 lba,
                 sectors,
                 write,
+                pmp_port: 0,
             };
             if write {
                 self.transfer_write(request, &buf[offset..offset + count])
