@@ -1171,3 +1171,10 @@ selection, preserving `icl_mg_pll_find_divisors()` search priority and
 `icl_calc_mg_pll_state()` fixed-point state generation. Source is Linux 7.2.3
 `drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT, Copyright © 2006-2016
 Intel); targeted tests cover 162/540-MHz DP and 1080p60 HDMI.
+
+`tk-intel-display/src/ddi.rs` adds TGL/ADL DDI helpers for clock-select,
+buffer PHY link-rate/stagger fields, idle/active wait policy, and transcoder
+function-control generation from Linux 7.2.3
+`drivers/gpu/drm/i915/display/intel_ddi.c` (MIT, Copyright © 2012 Intel).
+See `docs/design/intel-ddi.md` for the implemented subset and the ports still
+refused.
