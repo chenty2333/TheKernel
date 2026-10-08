@@ -5,6 +5,7 @@
 
 use alloc::vec::Vec;
 use core::{
+    convert::Infallible,
     ptr::NonNull,
     sync::atomic::{AtomicBool, Ordering, fence},
 };
@@ -13,7 +14,7 @@ use axalloc::{UsageKind, global_allocator};
 use axdriver_iwx::{
     AX211_DEVICE_ID, AttachAllocationError, AttachProfile, CsrAccess, DmaAllocator, DmaError,
     DmaRegion, FirmwareBundle, FirmwareError, FirmwareImage, INTEL_VENDOR_ID, IoBarrier,
-    IwxController, RuntimeConfig, attach_profile, matches_pci_device,
+    IwxController, NvmInfo, RuntimeConfig, attach_profile, matches_pci_device,
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::{phys_to_virt, virt_to_phys};
@@ -178,8 +179,33 @@ struct AttachedDevice {
     profile: AttachProfile,
     bar_base: usize,
     bar_size: usize,
+    hardware_revision: u32,
     controller: IwxController<MmioCsrAccess, PlatformDmaAllocator>,
     firmware: Option<Result<FirmwareBundle, FirmwareRequestError>>,
+    nvm: Option<NvmInfo>,
+}
+
+#[derive(Debug)]
+enum AliveWaitError {
+    Interrupt(axdriver_iwx::IctError),
+    Receive(axdriver_iwx::RxServiceError<Infallible>),
+    Alive(axdriver_iwx::AliveError),
+}
+
+#[derive(Debug)]
+enum FirmwareBootstrapError {
+    Hardware(axdriver_iwx::ApmError),
+    Nic(axdriver_iwx::ApmError),
+    Firmware(axdriver_iwx::ControllerError<AliveWaitError>),
+    PostAlive(axdriver_iwx::IctError),
+    Interrupt(axdriver_iwx::IctError),
+    CommandEncoding(axdriver_iwx::CommandError),
+    Command(axdriver_iwx::SyncCommandError<Infallible>),
+    InitCompleteTimeout,
+    MacAddressUnavailable,
+    MissingNvmResponse,
+    Nvm(axdriver_iwx::NvmError),
+    HardwareStopFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +235,7 @@ fn allocate_resources(
     profile: AttachProfile,
     bar_base: usize,
     bar_size: usize,
+    hardware_revision: u32,
 ) -> Result<(), AttachAllocationError> {
     let key = Bdf(bdf.bus, bdf.device, bdf.function);
     let mut attached = ATTACHED_DMA.lock();
@@ -236,10 +263,199 @@ fn allocate_resources(
         profile,
         bar_base,
         bar_size,
+        hardware_revision,
         controller,
         firmware: None,
+        nvm: None,
     });
     Ok(())
+}
+
+fn bootstrap_init_firmware(
+    controller: &mut IwxController<MmioCsrAccess, PlatformDmaAllocator>,
+    profile: AttachProfile,
+    hardware_revision: u32,
+    bundle: &FirmwareBundle,
+) -> Result<NvmInfo, FirmwareBootstrapError> {
+    controller
+        .start_hardware(profile.integrated)
+        .map_err(FirmwareBootstrapError::Hardware)?;
+    controller
+        .initialize_nic(bundle.image.phy_config.unwrap_or(0), hardware_revision)
+        .map_err(FirmwareBootstrapError::Nic)?;
+
+    let alive_version = bundle.image.lookup_notification_version(0, 1);
+    controller
+        .boot_firmware(
+            &bundle.image,
+            true,
+            profile.imr_enabled,
+            |controller, timeout| {
+                let mut elapsed = 0;
+                let mut alive = None;
+                while elapsed < timeout {
+                    let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
+                        &mut controller.registers,
+                        &controller.interrupt_masks,
+                        None,
+                    )
+                    .map_err(AliveWaitError::Interrupt)?;
+                    controller
+                        .process_rx_notifications(|packet, _| {
+                            if packet.is_notification() && packet.command_id() == 1 {
+                                alive = Some(
+                                    axdriver_iwx::parse_alive(alive_version, packet.payload)
+                                        .map_err(AliveWaitError::Alive),
+                                );
+                            }
+                            Ok::<_, Infallible>(true)
+                        })
+                        .map_err(AliveWaitError::Receive)?;
+                    if let Some(result) = alive.take() {
+                        return result.map(|info| info.alive_ok);
+                    }
+                    controller.registers.delay_us(1_000);
+                    elapsed += 1_000_000;
+                }
+                Ok(false)
+            },
+        )
+        .map_err(FirmwareBootstrapError::Firmware)?;
+    controller
+        .post_alive(&bundle.image)
+        .map_err(FirmwareBootstrapError::PostAlive)?;
+
+    let init_config = axdriver_iwx::init_extended_config_command(0, 0)
+        .map_err(FirmwareBootstrapError::CommandEncoding)?;
+    controller
+        .send_encoded_command_wait(&init_config, None, |_, _| Ok::<_, Infallible>(true))
+        .map_err(FirmwareBootstrapError::Command)?;
+    let nvm_complete = axdriver_iwx::nvm_access_complete_command(0, 0)
+        .map_err(FirmwareBootstrapError::CommandEncoding)?;
+    controller
+        .send_encoded_command_wait(&nvm_complete, None, |_, _| Ok::<_, Infallible>(true))
+        .map_err(FirmwareBootstrapError::Command)?;
+
+    let mut init_complete = false;
+    for _ in 0..2_000 {
+        let _ = axdriver_iwx::service_legacy_interrupt(
+            &mut controller.registers,
+            &controller.interrupt_masks,
+            Some(&mut controller.resources.ict),
+        )
+        .map_err(FirmwareBootstrapError::Interrupt)?;
+        controller
+            .process_rx_notifications(|packet, _| {
+                if packet.is_notification()
+                    && matches!(
+                        axdriver_iwx::decode_firmware_event(packet),
+                        axdriver_iwx::FirmwareEvent::InitComplete
+                    )
+                {
+                    init_complete = true;
+                }
+                Ok::<_, Infallible>(true)
+            })
+            .map_err(|error| {
+                FirmwareBootstrapError::Command(axdriver_iwx::SyncCommandError::Receive(error))
+            })?;
+        if init_complete {
+            break;
+        }
+        controller.registers.delay_us(1_000);
+    }
+    if !init_complete {
+        return Err(FirmwareBootstrapError::InitCompleteTimeout);
+    }
+
+    let address =
+        axdriver_iwx::read_csr_mac_address(&mut controller.registers, profile.mac_addr_from_csr)
+            .ok_or(FirmwareBootstrapError::MacAddressUnavailable)?;
+    let regulatory_v4 = bundle.image.api_enabled(48);
+    let nvm_command = axdriver_iwx::nvm_get_command(regulatory_v4, 0, 0)
+        .map_err(FirmwareBootstrapError::CommandEncoding)?;
+    let response = controller
+        .send_encoded_command_wait(&nvm_command, None, |_, _| Ok::<_, Infallible>(true))
+        .map_err(FirmwareBootstrapError::Command)?
+        .response
+        .ok_or(FirmwareBootstrapError::MissingNvmResponse)?;
+    let nvm = axdriver_iwx::parse_nvm_response(
+        &response,
+        regulatory_v4,
+        Some(address),
+        &bundle.image.enabled_capabilities,
+    )
+    .map_err(FirmwareBootstrapError::Nvm)?;
+    axdriver_iwx::disable_interrupts(&mut controller.registers, &controller.interrupt_masks);
+    if !axdriver_iwx::apm_stop(&mut controller.registers) {
+        return Err(FirmwareBootstrapError::HardwareStopFailed);
+    }
+    Ok(nvm)
+}
+
+fn log_bootstrap_error(bdf: Bdf, error: FirmwareBootstrapError) {
+    use axdriver_iwx::ControllerError;
+
+    match error {
+        FirmwareBootstrapError::Hardware(error) => {
+            warn!("iwx: {bdf:?}: hardware/APM startup failed: {error:?}")
+        }
+        FirmwareBootstrapError::Nic(error) => {
+            warn!("iwx: {bdf:?}: NIC initialization failed: {error:?}")
+        }
+        FirmwareBootstrapError::Firmware(error) => match error {
+            ControllerError::Attach(error) => warn!("iwx: {bdf:?}: attach failed: {error:?}"),
+            ControllerError::Hardware(error) => warn!("iwx: {bdf:?}: APM failed: {error:?}"),
+            ControllerError::Dma(error) => warn!("iwx: {bdf:?}: firmware DMA failed: {error:?}"),
+            ControllerError::Context(error) => {
+                warn!("iwx: {bdf:?}: firmware context failed: {error:?}")
+            }
+            ControllerError::Register(error) => {
+                warn!("iwx: {bdf:?}: firmware register write failed: {error:?}")
+            }
+            ControllerError::Wait(error) => match error {
+                AliveWaitError::Interrupt(error) => {
+                    warn!("iwx: {bdf:?}: ALIVE interrupt service failed: {error:?}")
+                }
+                AliveWaitError::Receive(error) => {
+                    warn!("iwx: {bdf:?}: ALIVE RX processing failed: {error:?}")
+                }
+                AliveWaitError::Alive(error) => {
+                    warn!("iwx: {bdf:?}: ALIVE notification malformed: {error:?}")
+                }
+            },
+            ControllerError::FirmwareNotAlive => {
+                warn!("iwx: {bdf:?}: firmware did not report ALIVE")
+            }
+        },
+        FirmwareBootstrapError::PostAlive(error) => {
+            warn!("iwx: {bdf:?}: post-ALIVE ICT setup failed: {error:?}")
+        }
+        FirmwareBootstrapError::Interrupt(error) => {
+            warn!("iwx: {bdf:?}: init interrupt service failed: {error:?}")
+        }
+        FirmwareBootstrapError::CommandEncoding(error) => {
+            warn!("iwx: {bdf:?}: command encoding failed: {error:?}")
+        }
+        FirmwareBootstrapError::Command(error) => {
+            warn!("iwx: {bdf:?}: command wait failed: {error:?}")
+        }
+        FirmwareBootstrapError::InitCompleteTimeout => {
+            warn!("iwx: {bdf:?}: init ucode did not report INIT_COMPLETE")
+        }
+        FirmwareBootstrapError::MacAddressUnavailable => {
+            warn!("iwx: {bdf:?}: no valid strap/OTP MAC address")
+        }
+        FirmwareBootstrapError::MissingNvmResponse => {
+            warn!("iwx: {bdf:?}: NVM_GET_INFO completed without a response")
+        }
+        FirmwareBootstrapError::Nvm(error) => {
+            warn!("iwx: {bdf:?}: NVM response invalid: {error:?}")
+        }
+        FirmwareBootstrapError::HardwareStopFailed => {
+            warn!("iwx: {bdf:?}: stop after init/NVM bootstrap failed")
+        }
+    }
 }
 
 fn register_rootfs_firmware_callback() {
@@ -295,16 +511,40 @@ fn stage_rootfs_firmware() {
         let mut devices = ATTACHED_DMA.lock();
         if let Some(device) = devices.iter_mut().find(|device| device.bdf == bdf) {
             match &result {
-                Ok(bundle) => info!(
-                    "iwx: {bdf:?}: staged firmware version {:?} ({:?}); BAR0 {:#x}+{:#x}, {} TX \
-                     queues and {} RX buffers retained",
-                    bundle.image.api,
-                    device.profile.family,
-                    device.bar_base,
-                    device.bar_size,
-                    device.controller.resources.tx_queues.len(),
-                    device.controller.resources.rx_queue.buffers.len(),
-                ),
+                Ok(bundle) => {
+                    info!(
+                        "iwx: {bdf:?}: staged firmware version {:?} ({:?}); BAR0 {:#x}+{:#x}, {} \
+                         TX queues and {} RX buffers retained",
+                        bundle.image.api,
+                        device.profile.family,
+                        device.bar_base,
+                        device.bar_size,
+                        device.controller.resources.tx_queues.len(),
+                        device.controller.resources.rx_queue.buffers.len(),
+                    );
+                    match bootstrap_init_firmware(
+                        &mut device.controller,
+                        device.profile,
+                        device.hardware_revision,
+                        bundle,
+                    ) {
+                        Ok(nvm) => {
+                            info!(
+                                "iwx: {bdf:?}: init ucode and NVM ready; address \
+                                 {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, {} channels",
+                                nvm.hardware_address[0],
+                                nvm.hardware_address[1],
+                                nvm.hardware_address[2],
+                                nvm.hardware_address[3],
+                                nvm.hardware_address[4],
+                                nvm.hardware_address[5],
+                                nvm.channel_profiles.len(),
+                            );
+                            device.nvm = Some(nvm);
+                        }
+                        Err(error) => log_bootstrap_error(bdf, error),
+                    }
+                }
                 Err(error) => warn!("iwx: {bdf:?}: firmware staging failed: {error:?}"),
             }
             device.firmware = Some(result);
@@ -395,7 +635,21 @@ pub(crate) fn probe(
                 root.endpoint_subsystem_ids(bdf).0,
                 subsystem,
             );
-            if let Err(error) = allocate_resources(bdf, profile, base, bar.1 as usize) {
+            // Use MMIO and bus mastering for controller DMA, but keep legacy
+            // INTx disabled: initialization pumps the source interrupt/RX path
+            // synchronously until the later network IRQ worker is installed.
+            let Some(command_status) = root.read_config_dword(bdf, 4) else {
+                warn!("iwx: {bdf}: could not read PCI command register");
+                return BusProbeResult::Claimed;
+            };
+            let command = command_status as u16 | 0x0006 | 0x0400;
+            if !root.write_config_u16(bdf, 4, command) {
+                warn!("iwx: {bdf}: could not enable PCI memory/bus-master command bits");
+                return BusProbeResult::Claimed;
+            }
+            if let Err(error) =
+                allocate_resources(bdf, profile, base, bar.1 as usize, hardware_revision)
+            {
                 warn!("iwx: {bdf}: attach DMA allocation failed: {error:?}");
                 return BusProbeResult::Claimed;
             }

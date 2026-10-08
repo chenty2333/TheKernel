@@ -119,6 +119,10 @@ runtime device-table overrides.
 The core attach allocator now creates Gen2/Gen3 context info, Gen3 peripheral
 scratch/info, the 4 KiB-aligned ICT, ten TX queues, and the 512-buffer RX ring
 in the upstream allocation order with automatic rollback on failure.
-The PCI platform currently retains these allocations after a recognized match;
-firmware execution, interrupt installation, and interface publication remain
-to be wired into the controller lifecycle.
+The PCI platform retains an `IwxController` with bounded volatile BAR0 access.
+When rootfs firmware becomes available, it runs the Init ucode ALIVE/INIT
+sequence by polling and servicing the source interrupt/RX rings, reads the
+strap/OTP MAC and NVM_GET_INFO response, then masks device interrupts and stops
+the NIC as OpenBSD's preinit path does. PCI INTx is disabled while this
+synchronous polling adapter is used. The normal runtime ucode/PNVM sequence,
+installed interrupt worker, and wlan0 publication remain incomplete.
