@@ -197,6 +197,8 @@ class RunConfig:
     extra_block_mode: DriveMode = "rw"
     nvme_disk: Path | None = None
     nvme_disk_mode: DriveMode = "rw"
+    ahci_disk: Path | None = None
+    ahci_disk_mode: DriveMode = "rw"
     usb_disk: Path | None = None
     usb_disk_mode: DriveMode = "rw"
     usb_boot: bool = False
@@ -397,6 +399,7 @@ def run(
     rootfs_mode = _validate_mode("rootfs", config.rootfs_mode)
     extra_mode = _validate_mode("extra-block", config.extra_block_mode)
     nvme_mode = _validate_mode("NVMe disk", config.nvme_disk_mode)
+    ahci_mode = _validate_mode("AHCI disk", config.ahci_disk_mode)
     usb_mode = _validate_mode("usb-disk", config.usb_disk_mode)
     initrd = _initrd_from_extra_args(config.extra_args)
     input_path = None
@@ -462,6 +465,8 @@ def run(
 
     nvme_disk = (_plan_drive(config.nvme_disk, mode=nvme_mode, label="NVMe disk")
                  if config.nvme_disk is not None else None)
+    ahci_disk = (_plan_drive(config.ahci_disk, mode=ahci_mode, label="AHCI disk")
+                 if config.ahci_disk is not None else None)
     usb_disk = (
         _plan_drive(config.usb_disk, mode=usb_mode, label="USB disk")
         if config.usb_disk is not None else None
@@ -516,6 +521,8 @@ def run(
         run_input_paths.append(extra_block.path)
     if nvme_disk is not None:
         run_input_paths.append(nvme_disk.path)
+    if ahci_disk is not None:
+        run_input_paths.append(ahci_disk.path)
     if usb_disk is not None:
         run_input_paths.append(usb_disk.path)
     if qemu_executable is not None:
@@ -590,6 +597,11 @@ def run(
             nvme_fd, nvme_path = _open_qemu_input(nvme_disk.path, label="NVMe disk", writable=nvme_disk.mode == "rw")
             opened_fds.append(nvme_fd)
             qemu_nvme_disk = Drive(path=nvme_path, mode=nvme_disk.mode)
+        qemu_ahci_disk = None
+        if ahci_disk is not None:
+            ahci_fd, ahci_path = _open_qemu_input(ahci_disk.path, label="AHCI disk", writable=ahci_disk.mode == "rw")
+            opened_fds.append(ahci_fd)
+            qemu_ahci_disk = Drive(path=ahci_path, mode=ahci_disk.mode)
         qemu_usb_disk = None
         if usb_disk is not None:
             usb_fd, qemu_usb_path = _open_qemu_input(
@@ -628,6 +640,7 @@ def run(
             extra_block=qemu_extra_block,
             usb_disk=qemu_usb_disk,
             nvme_disk=qemu_nvme_disk,
+            ahci_disk=qemu_ahci_disk,
             usb_boot=config.usb_boot,
             input_backend=config.input_backend,
             esp=qemu_esp,

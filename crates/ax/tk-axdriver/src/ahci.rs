@@ -11,9 +11,17 @@
 
 pub mod pci_ids;
 
-use core::{ptr, ptr::NonNull};
+use alloc::string::String;
+use core::{
+    ptr,
+    ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+static NEXT_DISK_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 use axalloc::{UsageKind, global_allocator};
+use axdriver_base::BaseDriverOps;
 use axdriver_block::{
     BlockDriverOps,
     ahci::{
@@ -104,6 +112,61 @@ fn allocate_workspace() -> Option<PortWorkspace> {
     let command_table = alloc_dma(1)?;
     let bounce = alloc_dma(BOUNCE_PAGES)?;
     PortWorkspace::new(command_list, received_fis, command_table, bounce).ok()
+}
+
+fn next_sd_name() -> String {
+    let mut index = NEXT_DISK_INDEX.fetch_add(1, Ordering::Relaxed);
+    let mut letters = [0u8; 8];
+    let mut len = 0;
+    loop {
+        letters[len] = b'a' + (index % 26) as u8;
+        len += 1;
+        if index < 26 {
+            break;
+        }
+        index = index / 26 - 1;
+    }
+    let mut name = String::from("sd");
+    for letter in letters[..len].iter().rev() {
+        name.push(*letter as char);
+    }
+    name
+}
+
+fn publish_disk(mut disk: AhciDisk<Window>, devices: &mut alloc::vec::Vec<crate::AxDeviceEnum>) {
+    let name = next_sd_name();
+    disk.set_device_name(name.clone());
+    #[cfg(feature = "dyn")]
+    let raw: crate::AxBlockDevice = alloc::boxed::Box::new(disk);
+    #[cfg(not(feature = "dyn"))]
+    let raw: crate::AxBlockDevice = crate::StaticBlockDevice::Ahci(alloc::boxed::Box::new(disk));
+
+    #[cfg(feature = "shared-block")]
+    {
+        let parent = crate::SharedBlockDevice::new(raw);
+        #[cfg(feature = "dyn")]
+        devices.push(crate::AxDeviceEnum::from_block(parent.clone()));
+        #[cfg(not(feature = "dyn"))]
+        devices.push(crate::AxDeviceEnum::Block(crate::StaticBlockDevice::Ahci(
+            alloc::boxed::Box::new(parent.clone()),
+        )));
+        match crate::discover_gpt_partitions(&parent, &name, false) {
+            Ok(partitions) => {
+                for partition in partitions {
+                    info!("ahci: published GPT partition {}", partition.device_name());
+                    devices.push(crate::AxDeviceEnum::Block(partition));
+                }
+            }
+            Err(error) => log::debug!("ahci: no accepted GPT on {name}: {error:?}"),
+        }
+    }
+    #[cfg(not(feature = "shared-block"))]
+    {
+        #[cfg(feature = "dyn")]
+        devices.push(crate::AxDeviceEnum::Block(raw));
+        #[cfg(not(feature = "dyn"))]
+        devices.push(crate::AxDeviceEnum::Block(raw));
+    }
 }
 
 /// FreeBSD `ahci_probe`/`ahci_pci_attach` adaptation: match an AHCI class
@@ -220,12 +283,7 @@ pub(crate) fn probe(
                     disk.block_size(),
                     disk.num_blocks()
                 );
-                #[cfg(feature = "dyn")]
-                devices.push(crate::AxDeviceEnum::from_block(disk));
-                #[cfg(not(feature = "dyn"))]
-                devices.push(crate::AxDeviceEnum::Block(crate::StaticBlockDevice::Ahci(
-                    alloc::boxed::Box::new(disk),
-                )));
+                publish_disk(disk, &mut devices);
             }
             Err(error) => {
                 warn!("ahci: {bdf} port {index} disk initialization failed: {error:?}");

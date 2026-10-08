@@ -6,6 +6,9 @@
 //! and serializes one request through slot zero. NCQ FIS encoding is provided
 //! by `ata`, but NCQ queue admission/recovery is a later stage.
 
+extern crate alloc;
+
+use alloc::string::String;
 use core::{
     mem::ManuallyDrop,
     ptr::{self, NonNull},
@@ -228,6 +231,7 @@ pub struct AhciDisk<I: AhciIo> {
     workspace: ManuallyDrop<PortWorkspace>,
     geometry: AtaGeometry,
     identity_digest: u64,
+    name: String,
     ncq: bool,
     poisoned: bool,
     workspace_live: bool,
@@ -297,6 +301,7 @@ impl<I: AhciIo> AhciDisk<I> {
                 trim: false,
             },
             identity_digest: 0,
+            name: String::from("ahci"),
             ncq: false,
             poisoned: false,
             workspace_live: true,
@@ -373,6 +378,11 @@ impl<I: AhciIo> AhciDisk<I> {
             return Err(AhciDiskError::NoDevice);
         }
         Ok(())
+    }
+
+    /// Override the registry name assigned by the PCI controller enumerator.
+    pub fn set_device_name(&mut self, name: String) {
+        self.name = name;
     }
 
     /// Geometry captured by ATA IDENTIFY DEVICE.
@@ -727,7 +737,7 @@ impl<I: AhciIo> Drop for AhciDisk<I> {
 
 impl<I: AhciIo> BaseDriverOps for AhciDisk<I> {
     fn device_name(&self) -> &str {
-        "ahci"
+        &self.name
     }
     fn device_type(&self) -> DeviceType {
         DeviceType::Block
@@ -1316,6 +1326,7 @@ mod tests {
                 trim: false,
             },
             identity_digest: 0,
+            name: String::from("sda"),
             ncq: false,
             poisoned: false,
             workspace_live: true,

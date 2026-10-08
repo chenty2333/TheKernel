@@ -698,6 +698,30 @@ class RunnerTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+class AhciRunnerTests(unittest.TestCase):
+    def test_ahci_disk_fd_preserves_backing_contents(self):
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            kernel, disk = root / "kernel", root / "ahci.img"
+            kernel.write_bytes(b"kernel")
+            disk.write_bytes(b"AHCI payload")
+
+            def capture(**kwargs):
+                option = next(value for value in kwargs["command"] if "id=ahci-disk," in value)
+                fd = int(option.split(",", 1)[0].rsplit("/", 1)[1])
+                self.assertEqual(os.pread(fd, 12, 0), b"AHCI payload")
+                return RunResult(0, kwargs["log_path"])
+
+            with patch("tools.qemu_runner.runner.run_process", side_effect=capture):
+                result = run(RunConfig(
+                    arch="x86_64", kernel=kernel, rootfs=None,
+                    workdir=root / "run", log_path=root / "run/console.log",
+                    direct_kernel=True, ahci_disk=disk,
+                ))
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(disk.read_bytes(), b"AHCI payload")
+
+
 class NvmeRunnerTests(unittest.TestCase):
     def test_nvme_output_alias_is_rejected(self):
         with test_tmpdir() as directory:

@@ -308,6 +308,22 @@ class NvmeTopologyTests(unittest.TestCase):
         self.assertTrue(any("virtio-blk-pci" in value for value in command))
         self.assertTrue(any("usb-storage" in value for value in command))
 
+class AhciTopologyTests(unittest.TestCase):
+    def test_ahci_drive_uses_ich9_controller_and_sata_ide_disk(self):
+        command = build_qemu_command(
+            arch="x86_64",
+            kernel=Path("kernel"),
+            rootfs=Drive(Path("root.img"), "snapshot"),
+            direct_kernel=True,
+            ahci_disk=Drive(Path("ahci,disk.img"), "rw"),
+        )
+        self.assertIn("ich9-ahci,id=ahci", command)
+        self.assertIn("ide-hd,drive=ahci-disk,bus=ahci.0", command)
+        drive = next(value for value in command if value.startswith("file=") and "id=ahci-disk" in value)
+        self.assertIn("ahci,,disk.img", drive)
+        self.assertNotIn("readonly=on", drive)
+
+
 class HdaTopologyTests(unittest.TestCase):
     def test_hda_wav_is_distinct_from_virtio_sound(self):
         command = build_qemu_command(arch="x86_64", kernel=Path("kernel"),
