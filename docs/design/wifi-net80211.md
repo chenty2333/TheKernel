@@ -169,3 +169,7 @@ unsupported action categories remain explicit ignored events.
 Management subtype dispatch now selects typed beacon/probe, authentication,
 association, disconnect, action and hostap-request receive paths from frame
 control; unsupported subtype values remain visible to the caller.
+
+Per-TID BAR handling checks active agreements, preserves PBAC's no-window-move
+rule and reports required DELBA, inactivity timeout refresh and forward window
+movement for the owning RX reorder engine.

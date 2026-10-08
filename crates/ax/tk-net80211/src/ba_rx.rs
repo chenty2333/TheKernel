@@ -57,6 +57,7 @@ pub struct BaAgreement {
     pub state: u8,
     pub token: u8,
     pub window_start: u16,
+    pub window_end: u16,
     pub window_size: u16,
     pub timeout_micros: u64,
     pub request_interval: u8,
@@ -116,6 +117,19 @@ pub struct DelbaOutcome {
     pub reason: u16,
     pub stops_rx: bool,
     pub stops_tx: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarTidOutcome {
+    NoAgreement {
+        delba_reason: u16,
+    },
+    PbacViolation,
+    PbacNoMove,
+    Refresh {
+        timeout_micros: u64,
+        move_window_to: Option<u16>,
+    },
 }
 
 fn action_body(frame: &[u8]) -> Result<&[u8], BaRxError> {
@@ -228,6 +242,7 @@ pub fn receive_addba_request(
     agreement.token = token;
     agreement.window_size = window_size;
     agreement.window_start = ssn;
+    agreement.window_end = ssn.wrapping_add(window_size - 1) & 0x0fff;
     agreement.request_interval = 0;
     let params =
         (params & BA_POLICY) | ((window_size & 0x03ff) << 6) | (u16::from(tid) << 2) | BA_AMSDU;
@@ -387,6 +402,31 @@ pub fn receive_bar(frame: &[u8], peer_ht: bool) -> Result<Vec<(u8, u16)>, BaRxEr
     }
 }
 
+/// Apply a BlockAckReq sequence number to its per-TID receive window.
+// upstream: ieee80211_input.c ieee80211_bar_tid()
+pub fn apply_bar_tid(
+    agreement: &BaAgreement,
+    ssn: u16,
+    peer_mfp: bool,
+    peer_pbac: bool,
+) -> BarTidOutcome {
+    if agreement.state != BA_STATE_AGREED {
+        return BarTidOutcome::NoAgreement {
+            delba_reason: REASON_SETUP_REQUIRED,
+        };
+    }
+    if peer_mfp && peer_pbac {
+        if seq_lt(ssn, agreement.window_start) || seq_lt(agreement.window_end, ssn) {
+            return BarTidOutcome::PbacViolation;
+        }
+        return BarTidOutcome::PbacNoMove;
+    }
+    BarTidOutcome::Refresh {
+        timeout_micros: agreement.timeout_micros,
+        move_window_to: seq_lt(agreement.window_start, ssn).then_some(ssn),
+    }
+}
+
 fn seq_lt(a: u16, b: u16) -> bool {
     ((a.wrapping_sub(b)) & 0x0fff) > 0x0800
 }
@@ -409,6 +449,7 @@ mod tests {
             state,
             token,
             window_start: 100,
+            window_end: 163,
             window_size: 64,
             timeout_micros: 10_000,
             request_interval: 1,
@@ -504,6 +545,32 @@ mod tests {
         assert_eq!(
             dispatch_action(&sa_query),
             Ok(ActionDispatch::SaQueryResponse)
+        );
+    }
+
+    #[test]
+    fn bar_tid_checks_agreement_pbac_window_and_inactivity_refresh() {
+        let agreed = agreement(BA_STATE_AGREED, 1);
+        assert_eq!(
+            apply_bar_tid(&agreement(BA_STATE_INIT, 1), 101, false, false),
+            BarTidOutcome::NoAgreement {
+                delba_reason: REASON_SETUP_REQUIRED
+            }
+        );
+        assert_eq!(
+            apply_bar_tid(&agreed, 101, true, true),
+            BarTidOutcome::PbacNoMove
+        );
+        assert_eq!(
+            apply_bar_tid(&agreed, 99, true, true),
+            BarTidOutcome::PbacViolation
+        );
+        assert_eq!(
+            apply_bar_tid(&agreed, 120, false, false),
+            BarTidOutcome::Refresh {
+                timeout_micros: 10_000,
+                move_window_to: Some(120)
+            }
         );
     }
 }
