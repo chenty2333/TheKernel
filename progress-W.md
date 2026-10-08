@@ -21,4 +21,5 @@
 - Post-ALIVE rate-format selection and command status-payload checks are wired into the firmware/host-command modules.
 - Review W-20..W-36 fixes: Gen3 queue modulus and doorbell kick, RX reset/command ACK/layout/context boot corrections, bounds, and normalized upstream markers (9db7b34c).
 - `iwx_disable_rx_dma()` now performs the family-specific RFH disable and bounded idle poll (`c47be738`).
+- `iwx_enable_txq()`/`iwx_disable_txq()` now include response-requesting commands, response validation, and queue-mask/TID lifecycle adapters (pending commit).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.

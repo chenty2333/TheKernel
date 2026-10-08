@@ -106,8 +106,9 @@ pub use nvm::{
 };
 pub use queue::{
     DATA_PATH_GROUP as TX_DATA_PATH_GROUP, DEFAULT_QUEUE_SIZE, DQA_QUEUE_ADD, DQA_QUEUE_REMOVE,
-    QueueConfig, QueueError, SCD_QUEUE_CONFIG_CMD, TX_QUEUE_CFG_ENABLE_QUEUE, dqa_queue_command,
-    legacy_queue_command, queue_cb_size, scheduler_queue_command, validate_enable_response,
+    QueueConfig, QueueError, SCD_QUEUE_CONFIG_CMD, TX_QUEUE_CFG_ENABLE_QUEUE, TxQueueError,
+    TxQueueState, disable_tx_queue, dqa_queue_command, enable_tx_queue, legacy_queue_command,
+    queue_cb_size, scheduler_queue_command, validate_enable_response,
 };
 pub use rate::{
     HtRateSet, MCS_TO_RATE_INDEX, RATES, Rate, TX_FLAG_COMMAND_RATE, TX_FLAG_HIGH_PRIORITY,

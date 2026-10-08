@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-use crate::{CommandError, EncodedCommand, HostCommand};
+use crate::{CMD_WANT_RESPONSE, CommandError, EncodedCommand, HostCommand, RingError, TxRing};
 
 pub const SCD_QUEUE_CONFIG_CMD: u8 = 0x17;
 pub const DATA_PATH_GROUP: u8 = 0x05;
@@ -32,14 +32,21 @@ pub struct QueueConfig {
 pub enum QueueError {
     UnsupportedCommandVersion(u8),
     InvalidQueueSize,
+    InvalidQueueId,
     InvalidStation,
     InvalidResponse,
     Command(CommandError),
+    Ring(RingError),
 }
 
 impl From<CommandError> for QueueError {
     fn from(error: CommandError) -> Self {
         Self::Command(error)
+    }
+}
+impl From<RingError> for QueueError {
+    fn from(error: RingError) -> Self {
+        Self::Ring(error)
     }
 }
 
@@ -52,7 +59,7 @@ pub fn queue_cb_size(ring_size: usize) -> Result<u32, QueueError> {
 }
 
 /// Serialize a legacy TX_QUEUE_CFG v0 enable/disable command.
-// upstream: if_iwx.c iwx_enable_txq() / iwx_disable_txq() legacy command body
+// upstream: if_iwx.c iwx_enable_txq()
 pub fn legacy_queue_command(
     config: QueueConfig,
     enabled: bool,
@@ -77,8 +84,8 @@ pub fn legacy_queue_command(
     payload[16..24].copy_from_slice(&tfd_address.to_le_bytes());
     let command = HostCommand {
         id: u32::from(SCD_QUEUE_CONFIG_CMD),
-        flags: 0,
-        response_capacity: 0,
+        flags: CMD_WANT_RESPONSE,
+        response_capacity: 8,
         parts: &[&payload],
     };
     Ok(EncodedCommand::encode(&command, slot, COMMAND_QUEUE_ID)?)
@@ -99,7 +106,7 @@ pub fn scheduler_queue_command(
 }
 
 /// Serialize an API v3 DQA queue add/remove command.
-// upstream: if_iwx.c iwx_enable_txq() / iwx_disable_txq() command v3 body
+// upstream: if_iwx.c iwx_enable_txq()
 pub fn dqa_queue_command(
     version: u8,
     config: QueueConfig,
@@ -139,11 +146,82 @@ pub fn dqa_queue_command(
     };
     let command = HostCommand {
         id: (u32::from(DATA_PATH_GROUP) << 8) | u32::from(SCD_QUEUE_CONFIG_CMD),
-        flags: 0,
-        response_capacity: 0,
+        flags: CMD_WANT_RESPONSE,
+        response_capacity: 8,
         parts: &[&bytes],
     };
     Ok(EncodedCommand::encode(&command, slot, COMMAND_QUEUE_ID)?)
+}
+
+/// Queue enable/aggregation bookkeeping retained beside the TX rings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TxQueueState {
+    pub enabled_mask: u32,
+    pub full_mask: u32,
+    pub tid: [u8; 32],
+}
+
+/// Reset a queue, send the generation-selected configuration, and validate
+/// the assigned queue and write pointer before exposing it as enabled.
+// upstream: if_iwx.c iwx_enable_txq()
+pub fn enable_tx_queue<E, R: crate::DmaRegion>(
+    state: &mut TxQueueState,
+    ring: &mut TxRing<R>,
+    config: QueueConfig,
+    command_version: u8,
+    mut send: impl FnMut(&EncodedCommand) -> Result<Vec<u8>, E>,
+) -> Result<(), TxQueueError<E>> {
+    let qid = usize::from(config.queue_id);
+    if qid >= 32 {
+        return Err(TxQueueError::Queue(QueueError::InvalidQueueId));
+    }
+    if ring.queue_id != u16::from(config.queue_id) {
+        return Err(TxQueueError::Queue(QueueError::InvalidQueueId));
+    }
+    ring.reset()
+        .map_err(|e| TxQueueError::Queue(QueueError::Ring(e)))?;
+    let command = scheduler_queue_command(command_version, config, true, ring.current as u8)
+        .map_err(TxQueueError::Queue)?;
+    let response = send(&command).map_err(TxQueueError::Send)?;
+    validate_enable_response(&response, config.queue_id, ring.current_hardware as u16)
+        .map_err(TxQueueError::Queue)?;
+    state.enabled_mask |= 1 << qid;
+    state.tid[qid] = config.tid;
+    Ok(())
+}
+
+/// Remove a queue and reset its descriptor state only after command success.
+// upstream: if_iwx.c iwx_disable_txq()
+pub fn disable_tx_queue<E, R: crate::DmaRegion>(
+    state: &mut TxQueueState,
+    ring: &mut TxRing<R>,
+    config: QueueConfig,
+    command_version: u8,
+    mut send: impl FnMut(&EncodedCommand) -> Result<Vec<u8>, E>,
+) -> Result<(), TxQueueError<E>> {
+    let qid = usize::from(config.queue_id);
+    if qid >= 32 {
+        return Err(TxQueueError::Queue(QueueError::InvalidQueueId));
+    }
+    if ring.queue_id != u16::from(config.queue_id) {
+        return Err(TxQueueError::Queue(QueueError::InvalidQueueId));
+    }
+    let command = scheduler_queue_command(command_version, config, false, ring.current as u8)
+        .map_err(TxQueueError::Queue)?;
+    let response = send(&command).map_err(TxQueueError::Send)?;
+    if response.len() < 8 {
+        return Err(TxQueueError::Queue(QueueError::InvalidResponse));
+    }
+    state.enabled_mask &= !(1 << qid);
+    ring.reset()
+        .map_err(|e| TxQueueError::Queue(QueueError::Ring(e)))?;
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TxQueueError<E> {
+    Queue(QueueError),
+    Send(E),
 }
 
 /// Check the firmware's response queue and initial hardware write pointer.
@@ -184,6 +262,8 @@ mod tests {
         assert_eq!(queue_cb_size(256), Ok(5));
         assert_eq!(queue_cb_size(7), Err(QueueError::InvalidQueueSize));
         let enabled = legacy_queue_command(queue(), true, 3).unwrap();
+        assert_eq!(enabled.flags, CMD_WANT_RESPONSE);
+        assert_eq!(enabled.response_capacity, 8);
         assert_eq!(enabled.bytes.len(), 32);
         assert_eq!(enabled.bytes[3], COMMAND_QUEUE_ID);
         assert_eq!(
@@ -206,6 +286,8 @@ mod tests {
     #[test]
     fn dqa_queue_add_remove_and_response_checks_match_source_layout() {
         let add = dqa_queue_command(3, queue(), true, 4).unwrap();
+        assert_eq!(add.flags, CMD_WANT_RESPONSE);
+        assert_eq!(add.response_capacity, 8);
         assert_eq!(&add.bytes[8..12], &DQA_QUEUE_ADD.to_le_bytes());
         assert_eq!(&add.bytes[12..16], &(1u32 << 7).to_le_bytes());
         assert_eq!(add.bytes.len(), 44);
