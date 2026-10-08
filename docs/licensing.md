@@ -731,3 +731,11 @@ SPDX identifier and crate `LICENSE-MIT` preserve the grant.
 `tk-intel-display/src/intel_crtc_full.rs` translates all 39 CRTC functions in
 Linux 7.2.3 `intel_crtc.c` (MIT, © 2020 Intel); its SPDX tag and crate
 `LICENSE-MIT` preserve the grant.
+
+`tk-intel-display/src/intel_color_full.rs` translates all 223 color functions
+in Linux 7.2.3 `intel_color.c` (MIT, © 2016 Intel); its SPDX tag and crate
+`LICENSE-MIT` preserve the grant.
+
+`tk-intel-display/src/intel_fb_full.rs` translates all 89 framebuffer functions
+in Linux 7.2.3 `intel_fb.c` (MIT, © 2021 Intel); its SPDX tag and crate
+`LICENSE-MIT` preserve the grant.
