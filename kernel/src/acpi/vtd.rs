@@ -1,9 +1,9 @@
-//! Opt-in VT-d setup and a shared DMA domain. Legacy PCI drivers see explicit
-//! identity entries; virtio/NVMe use disjoint translated IOVAs when TE is enabled.
+//! VT-d setup with a conservative shared-DMA default and experimental
+//! requester-specific domains behind `iommu_domains=on`.
 use alloc::vec::Vec;
 use core::{
     ptr::NonNull,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 use axalloc::{UsageKind, global_allocator};
@@ -14,6 +14,7 @@ use tk_vtd::{
     DmarTable, Error,
     context::{ctx_id_entry_init, dmar_ensure_ctx_page},
     idpgtbl::{dmar_map_buf_locked, dmar_unmap_buf_locked},
+    intrmap::{InterruptRemapIo, InterruptRemapper, InterruptSource},
     iova::IovaAllocator,
     pgtbl::{PAGE_SIZE, PageMemory, SecondLevel},
     qi::{self, QiIo, QiQueue},
@@ -47,6 +48,7 @@ const IDENTITY_PAGE_SIZE: u64 = 1 << 21;
 const IOVA_END: u64 = 1 << 36;
 
 static MODE: AtomicU8 = AtomicU8::new(MODE_UNKNOWN);
+static REQUESTER_DOMAINS: AtomicBool = AtomicBool::new(false);
 static MANAGER: SpinNoIrq<Option<Manager>> = SpinNoIrq::new(None);
 
 struct DmaBlock {
@@ -114,6 +116,8 @@ struct Unit {
     queue: QiQueue,
     gcmd: u32,
     root_physical: u64,
+    ir_table: Option<DmaBlock>,
+    ir: Option<InterruptRemapper>,
 }
 // SAFETY: MMIO mappings are stable for boot and mutable queue state is accessed
 // only under MANAGER's lock.
@@ -164,11 +168,18 @@ impl Unit {
     }
 
     fn invalidate_all(&mut self) -> Result<(), Error> {
+        let ir_table_physical = self.ir_table.as_ref().map_or(0, |table| table.physical);
+        let irte_count = self
+            .ir
+            .as_ref()
+            .map_or(0, |table| table.entry_count() as u32);
         let mut io = UnitQiIo {
             mmio: self.mmio,
             qi_physical: self.qi.physical,
             qi_virtual: self.qi.virtual_address,
             gcmd: &mut self.gcmd,
+            ir_table_physical,
+            irte_count,
         };
         qi::dmar_qi_invalidate_ctx_glob_locked(&mut io, &mut self.queue)?;
         qi::dmar_qi_invalidate_iotlb_glob_locked(&mut io, &mut self.queue)?;
@@ -196,6 +207,11 @@ impl Unit {
                 qi_physical: self.qi.physical,
                 qi_virtual: self.qi.virtual_address,
                 gcmd: &mut self.gcmd,
+                ir_table_physical: self.ir_table.as_ref().map_or(0, |table| table.physical),
+                irte_count: self
+                    .ir
+                    .as_ref()
+                    .map_or(0, |table| table.entry_count() as u32),
             };
             qi::dmar_disable_qi(&mut io)?;
         }
@@ -216,10 +232,34 @@ impl Unit {
                 qi_physical: self.qi.physical,
                 qi_virtual: self.qi.virtual_address,
                 gcmd: &mut self.gcmd,
+                ir_table_physical: self.ir_table.as_ref().map_or(0, |table| table.physical),
+                irte_count: self
+                    .ir
+                    .as_ref()
+                    .map_or(0, |table| table.entry_count() as u32),
             };
             qi::dmar_init_qi(&mut io, QI_ORDER, QI_ORDER)?.ok_or(Error::Unsupported)?
         };
         self.invalidate_all()?;
+        if axhal::boot::command_line_value("intremap") == Some("on") {
+            if extended & tk_vtd::reg::DMAR_ECAP_IR == 0 {
+                return Err(Error::Unsupported);
+            }
+            let table = allocate_dma(1)?;
+            let mut remapper =
+                InterruptRemapper::new(256, extended & tk_vtd::reg::DMAR_ECAP_EIM != 0)?;
+            let physical = table.physical;
+            self.ir_table = Some(table);
+            let qi_enabled = self.queue.enabled;
+            {
+                let mut io = UnitInterruptIo::from_unit(self)?;
+                if !remapper.initialize(&mut io, true, qi_enabled, physical)? {
+                    return Err(Error::Unsupported);
+                }
+            }
+            self.ir = Some(remapper);
+            info!("vtd: interrupt remapping enabled for DRHD {:#x}", self.mmio);
+        }
         utils::dmar_enable_translation(self)?;
         self.check_faults()
     }
@@ -265,10 +305,12 @@ impl RegisterIo for Unit {
         self.root_physical
     }
     fn interrupt_table_physical(&self) -> u64 {
-        0
+        self.ir_table.as_ref().map_or(0, |table| table.physical)
     }
     fn interrupt_entry_count(&self) -> u32 {
-        0
+        self.ir
+            .as_ref()
+            .map_or(0, |table| table.entry_count() as u32)
     }
     fn x2apic_mode(&self) -> bool {
         true
@@ -283,6 +325,8 @@ struct UnitQiIo<'a> {
     qi_physical: u64,
     qi_virtual: NonNull<u8>,
     gcmd: &'a mut u32,
+    ir_table_physical: u64,
+    irte_count: u32,
 }
 
 impl RegisterIo for UnitQiIo<'_> {
@@ -329,10 +373,10 @@ impl RegisterIo for UnitQiIo<'_> {
         0
     }
     fn interrupt_table_physical(&self) -> u64 {
-        0
+        self.ir_table_physical
     }
     fn interrupt_entry_count(&self) -> u32 {
-        0
+        self.irte_count
     }
     fn x2apic_mode(&self) -> bool {
         true
@@ -423,7 +467,7 @@ impl QiIo for UnitQiIo<'_> {
     fn qi_set_queue_bytes(&mut self, _bytes: u32) {}
     fn qi_release_queue(&mut self) {}
     fn qi_referenced_irte_count(&self) -> u32 {
-        0
+        self.irte_count
     }
     fn qi_clear_wait_completion(&mut self) {
         // SAFETY: the final page is reserved for the writeback sequence word.
@@ -437,6 +481,158 @@ impl QiIo for UnitQiIo<'_> {
     }
 }
 
+struct UnitInterruptIo<'a> {
+    mmio: usize,
+    qi_physical: u64,
+    qi_virtual: NonNull<u8>,
+    queue: &'a mut QiQueue,
+    gcmd: &'a mut u32,
+    ir_table_physical: u64,
+    ir_table_virtual: NonNull<u8>,
+    irte_count: u32,
+}
+
+impl UnitInterruptIo<'_> {
+    fn from_unit(unit: &mut Unit) -> Result<UnitInterruptIo<'_>, Error> {
+        let table = unit.ir_table.as_ref().ok_or(Error::NoDomain)?;
+        Ok(UnitInterruptIo {
+            mmio: unit.mmio,
+            qi_physical: unit.qi.physical,
+            qi_virtual: unit.qi.virtual_address,
+            queue: &mut unit.queue,
+            gcmd: &mut unit.gcmd,
+            ir_table_physical: table.physical,
+            ir_table_virtual: table.virtual_address,
+            irte_count: (PAGE_SIZE as usize / core::mem::size_of::<tk_vtd::reg::Irte>()) as u32,
+        })
+    }
+}
+
+impl InterruptRemapIo for UnitInterruptIo<'_> {
+    fn store_irte(&mut self, index: u16, entry: tk_vtd::reg::Irte) -> Result<(), Error> {
+        if index as u32 >= self.irte_count {
+            return Err(Error::InvalidRange);
+        }
+        // SAFETY: IRTA owns a page-aligned table with 256 16-byte entries.
+        unsafe {
+            let slot = self
+                .ir_table_virtual
+                .as_ptr()
+                .add(index as usize * 16)
+                .cast::<u64>();
+            slot.write_volatile(entry.irte1);
+            slot.add(1).write_volatile(entry.irte2);
+        }
+        core::sync::atomic::fence(Ordering::Release);
+        Ok(())
+    }
+    fn invalidate_iec(&mut self, index: u16, count: u16) -> Result<(), Error> {
+        let Self {
+            mmio,
+            qi_physical,
+            qi_virtual,
+            queue,
+            gcmd,
+            ir_table_physical,
+            irte_count,
+            ..
+        } = self;
+        let mut io = UnitQiIo {
+            mmio: *mmio,
+            qi_physical: *qi_physical,
+            qi_virtual: *qi_virtual,
+            gcmd,
+            ir_table_physical: *ir_table_physical,
+            irte_count: *irte_count,
+        };
+        qi::dmar_qi_invalidate_iec(&mut io, queue, index as u32, count as u32)
+    }
+    fn invalidate_iec_global(&mut self) -> Result<(), Error> {
+        let Self {
+            mmio,
+            qi_physical,
+            qi_virtual,
+            queue,
+            gcmd,
+            ir_table_physical,
+            irte_count,
+            ..
+        } = self;
+        let mut io = UnitQiIo {
+            mmio: *mmio,
+            qi_physical: *qi_physical,
+            qi_virtual: *qi_virtual,
+            gcmd,
+            ir_table_physical: *ir_table_physical,
+            irte_count: *irte_count,
+        };
+        qi::dmar_qi_invalidate_iec_glob(&mut io, queue)
+    }
+    fn load_table_pointer(&mut self, physical: u64, _size_order: u8) -> Result<(), Error> {
+        if physical != self.ir_table_physical {
+            return Err(Error::InvalidRange);
+        }
+        let Self {
+            mmio,
+            qi_physical,
+            qi_virtual,
+            gcmd,
+            ir_table_physical,
+            irte_count,
+            ..
+        } = self;
+        let mut io = UnitQiIo {
+            mmio: *mmio,
+            qi_physical: *qi_physical,
+            qi_virtual: *qi_virtual,
+            gcmd,
+            ir_table_physical: *ir_table_physical,
+            irte_count: *irte_count,
+        };
+        utils::dmar_load_irt_ptr(&mut io)
+    }
+    fn enable_interrupt_remapping(&mut self) -> Result<(), Error> {
+        let Self {
+            mmio,
+            qi_physical,
+            qi_virtual,
+            gcmd,
+            ir_table_physical,
+            irte_count,
+            ..
+        } = self;
+        let mut io = UnitQiIo {
+            mmio: *mmio,
+            qi_physical: *qi_physical,
+            qi_virtual: *qi_virtual,
+            gcmd,
+            ir_table_physical: *ir_table_physical,
+            irte_count: *irte_count,
+        };
+        utils::dmar_enable_ir(&mut io)
+    }
+    fn disable_interrupt_remapping(&mut self) -> Result<(), Error> {
+        let Self {
+            mmio,
+            qi_physical,
+            qi_virtual,
+            gcmd,
+            ir_table_physical,
+            irte_count,
+            ..
+        } = self;
+        let mut io = UnitQiIo {
+            mmio: *mmio,
+            qi_physical: *qi_physical,
+            qi_virtual: *qi_virtual,
+            gcmd,
+            ir_table_physical: *ir_table_physical,
+            irte_count: *irte_count,
+        };
+        utils::dmar_disable_ir(&mut io)
+    }
+}
+
 struct Mapping {
     device_address: u64,
     length: usize,
@@ -445,19 +641,349 @@ struct Mapping {
     mapped_length: usize,
 }
 
+struct DeviceDomain {
+    requester: tk_vtd::PciRequester,
+    id: u16,
+    page_table: SecondLevel<KernelPageMemory>,
+    iovas: IovaAllocator,
+    mappings: Vec<Mapping>,
+}
+
+/// Build the ACPI DMAR PCI path for a requester by walking the configured
+/// ECAM bridge topology.  DMAR scopes identify bridge prefixes, not merely
+/// the endpoint's downstream bus number.
+fn dmar_path(requester: tk_vtd::PciRequester) -> Vec<(u8, u8, u8)> {
+    axdriver::requester_path(requester.bus, requester.device, requester.function).unwrap_or_default()
+}
+
+fn dmar_scope_matches(
+    scope: &tk_vtd::OwnedScope,
+    requester: tk_vtd::PciRequester,
+    path: &[(u8, u8, u8)],
+) -> bool {
+    if scope.scope_type != 1 && scope.scope_type != 2 {
+        return false;
+    }
+    let Some(start) = path.iter().position(|entry| entry.0 == scope.start_bus) else {
+        return false;
+    };
+    let path = &path[start..];
+    if scope.path.is_empty() || scope.path.len() % 2 != 0 {
+        return false;
+    }
+    let hops = scope.path.len() / 2;
+    if scope.scope_type == 1 && hops != path.len() {
+        return false;
+    }
+    if scope.scope_type == 2 && hops > path.len() {
+        return false;
+    }
+    scope
+        .path
+        .chunks_exact(2)
+        .zip(path.iter())
+        .all(|(pair, (_, device, function))| {
+            pair[0] == *device && pair[1] & 7 == *function
+        })
+        && (path.last().is_some_and(|(_, device, function)| {
+            *device == requester.device && *function == requester.function
+        }) || scope.scope_type == 2)
+}
+
+fn dmar_unit_for_requester<'a>(
+    table: &'a DmarTable,
+    requester: tk_vtd::PciRequester,
+    path: &[(u8, u8, u8)],
+) -> Option<&'a tk_vtd::Unit> {
+    table
+        .units
+        .iter()
+        .find(|unit| {
+            unit.segment == requester.segment
+                && unit.scopes.iter().any(|scope| dmar_scope_matches(scope, requester, path))
+        })
+        .or_else(|| {
+            table
+                .units
+                .iter()
+                .find(|unit| unit.segment == requester.segment && unit.include_all)
+        })
+}
+
 struct Manager {
+    dmar: DmarTable,
     units: Vec<Unit>,
     root_table: DmaBlock,
     context_tables: Vec<DmaBlock>,
     page_table: SecondLevel<KernelPageMemory>,
     iovas: IovaAllocator,
     mappings: Vec<Mapping>,
+    ir_routes: Vec<(u8, usize, u16)>,
+    identity_end: u64,
+    iova_start: u64,
+    next_domain_id: u16,
+    device_domains: Vec<DeviceDomain>,
 }
 // SAFETY: table pages, IOVA state, and MMIO queues are mutated only while the
 // global manager lock is held.
 unsafe impl Send for Manager {}
 
 impl Manager {
+    fn ensure_device_domain(&mut self, requester: tk_vtd::PciRequester) -> Result<usize, Error> {
+        if let Some(index) = self
+            .device_domains
+            .iter()
+            .position(|domain| domain.requester == requester)
+        {
+            return Ok(index);
+        }
+        let requester_path = dmar_path(requester);
+        if dmar_unit_for_requester(&self.dmar, requester, &requester_path).is_none() {
+            return Err(Error::NoDevice);
+        }
+        let id = self.next_domain_id;
+        self.next_domain_id = id.checked_add(1).ok_or(Error::OutOfMemory)?;
+        let page_table = SecondLevel::new(KernelPageMemory { pages: Vec::new() })?;
+        let root = page_table.root_physical();
+        let domain = DeviceDomain {
+            requester,
+            id,
+            page_table,
+            iovas: IovaAllocator::new(self.iova_start, IOVA_END)?,
+            mappings: Vec::new(),
+        };
+        self.device_domains
+            .try_reserve(1)
+            .map_err(|_| Error::OutOfMemory)?;
+        self.device_domains.push(domain);
+        let domain_index = self.device_domains.len() - 1;
+
+        let context_page = self
+            .context_tables
+            .get(requester.bus as usize)
+            .ok_or(Error::InvalidRange)?;
+        // SAFETY: each retained page contains 256 zeroed/initialized hardware
+        // context entries and is exclusively mutated under MANAGER's lock.
+        let entries = unsafe {
+            core::slice::from_raw_parts_mut(
+                context_page.virtual_address.as_ptr().cast::<ContextEntry>(),
+                256,
+            )
+        };
+        let rid = (u16::from(requester.device) << 3) | u16::from(requester.function);
+        ctx_id_entry_init(
+            entries,
+            rid,
+            id,
+            DMAR_CTX2_AW_4LVL as u8,
+            Some(root),
+            false,
+            true,
+            false,
+        )?;
+        core::sync::atomic::fence(Ordering::Release);
+        for unit in &mut self.units {
+            unit.invalidate_all()?;
+        }
+        info!(
+            "vtd: installed requester domain id={} for {:04x}:{:02x}:{:02x}.{}",
+            id, requester.segment, requester.bus, requester.device, requester.function
+        );
+        Ok(domain_index)
+    }
+
+    fn map_for(
+        &mut self,
+        requester: tk_vtd::PciRequester,
+        physical: u64,
+        length: usize,
+    ) -> Result<u64, Error> {
+        if length == 0 || physical.checked_add(length as u64).is_none() {
+            return Err(Error::InvalidRange);
+        }
+        let domain_index = self.ensure_device_domain(requester)?;
+        let offset = (physical & (PAGE_SIZE - 1)) as usize;
+        let aligned_physical = physical & !(PAGE_SIZE - 1);
+        let mapped_length = offset
+            .checked_add(length)
+            .and_then(|value| value.checked_add(PAGE_SIZE as usize - 1))
+            .ok_or(Error::InvalidRange)?
+            & !(PAGE_SIZE as usize - 1);
+        let domain = self
+            .device_domains
+            .get_mut(domain_index)
+            .ok_or(Error::NoDomain)?;
+        domain
+            .mappings
+            .try_reserve(1)
+            .map_err(|_| Error::OutOfMemory)?;
+        let iova = domain.iovas.allocate(mapped_length)?;
+        if let Err(error) = dmar_map_buf_locked(
+            &mut domain.page_table,
+            aligned_physical,
+            iova,
+            mapped_length,
+            DMAR_PTE_R | DMAR_PTE_W,
+            4,
+        ) {
+            let _ = domain.iovas.release(iova, mapped_length);
+            return Err(error);
+        }
+        for unit in &mut self.units {
+            unit.invalidate_all()?;
+        }
+        let device_address = iova + offset as u64;
+        domain.mappings.push(Mapping {
+            device_address,
+            length,
+            physical: aligned_physical,
+            iova,
+            mapped_length,
+        });
+        Ok(device_address)
+    }
+
+    fn unmap_for(
+        &mut self,
+        requester: tk_vtd::PciRequester,
+        device_address: u64,
+        length: usize,
+    ) -> Result<(), Error> {
+        let domain_index = self.ensure_device_domain(requester)?;
+        let domain = self
+            .device_domains
+            .get_mut(domain_index)
+            .ok_or(Error::NoDomain)?;
+        let index = domain
+            .mappings
+            .iter()
+            .position(|mapping| {
+                mapping.device_address == device_address && mapping.length == length
+            })
+            .ok_or(Error::InvalidRange)?;
+        let mapping = &domain.mappings[index];
+        dmar_unmap_buf_locked(&mut domain.page_table, mapping.iova, mapping.mapped_length)?;
+        for unit in &mut self.units {
+            if let Err(error) = unit.invalidate_all() {
+                let _ = dmar_map_buf_locked(
+                    &mut domain.page_table,
+                    mapping.physical,
+                    mapping.iova,
+                    mapping.mapped_length,
+                    DMAR_PTE_R | DMAR_PTE_W,
+                    4,
+                );
+                return Err(error);
+            }
+        }
+        let mapping = domain.mappings.swap_remove(index);
+        domain.iovas.release(mapping.iova, mapping.mapped_length)
+    }
+
+    fn map_msi(
+        &mut self,
+        requester: tk_vtd::PciRequester,
+        vector: u8,
+        destination: u32,
+    ) -> Result<Option<(u64, u32)>, Error> {
+        let Some(selected) = tk_vtd::select_unit(&self.dmar, requester) else {
+            return Err(Error::NoDevice);
+        };
+        let unit_index = self
+            .dmar
+            .units
+            .iter()
+            .position(|unit| unit.register_base == selected.register_base)
+            .ok_or(Error::NoDevice)?;
+        let Manager {
+            units, ir_routes, ..
+        } = self;
+        let unit = units.get_mut(unit_index).ok_or(Error::NoDevice)?;
+        let Unit {
+            mmio,
+            qi,
+            queue,
+            gcmd,
+            ir_table,
+            ir,
+            ..
+        } = unit;
+        let (Some(table), Some(remapper)) = (ir_table.as_ref(), ir.as_mut()) else {
+            return Ok(None);
+        };
+        if ir_routes
+            .iter()
+            .any(|(owned_vector, ..)| *owned_vector == vector)
+        {
+            return Err(Error::InvalidStructure);
+        }
+        let mut io = UnitInterruptIo {
+            mmio: *mmio,
+            qi_physical: qi.physical,
+            qi_virtual: qi.virtual_address,
+            queue,
+            gcmd,
+            ir_table_physical: table.physical,
+            ir_table_virtual: table.virtual_address,
+            irte_count: remapper.entry_count() as u32,
+        };
+        let cookie = remapper.allocate_msi(&mut io, 1)?[0];
+        match remapper.map_msi(
+            &mut io,
+            InterruptSource::Pci {
+                unit: Some(unit_index),
+                requester_id: ((u16::from(requester.bus) << 8)
+                    | (u16::from(requester.device) << 3)
+                    | u16::from(requester.function)),
+            },
+            destination,
+            vector,
+            cookie,
+        ) {
+            Ok(route) => {
+                ir_routes.push((vector, unit_index, cookie));
+                info!(
+                    "vtd: MSI vector={vector:#x} requester={:04x}:{:02x}:{:02x}.{} IRTE={cookie}",
+                    requester.segment,
+                    requester.bus,
+                    requester.device,
+                    requester.function
+                );
+                Ok(Some(route))
+            }
+            Err(error) => {
+                let _ = remapper.unmap_msi(&mut io, Some(cookie));
+                Err(error)
+            }
+        }
+    }
+
+    fn unmap_msi(&mut self, vector: u8) -> Result<(), Error> {
+        let Some(index) = self
+            .ir_routes
+            .iter()
+            .position(|(owned_vector, ..)| *owned_vector == vector)
+        else {
+            return Ok(());
+        };
+        let (_, unit_index, cookie) = self.ir_routes.swap_remove(index);
+        let unit = self.units.get_mut(unit_index).ok_or(Error::NoDevice)?;
+        let (Some(table), Some(remapper)) = (unit.ir_table.as_ref(), unit.ir.as_mut()) else {
+            return Err(Error::NoDomain);
+        };
+        let mut io = UnitInterruptIo {
+            mmio: unit.mmio,
+            qi_physical: unit.qi.physical,
+            qi_virtual: unit.qi.virtual_address,
+            queue: &mut unit.queue,
+            gcmd: &mut unit.gcmd,
+            ir_table_physical: table.physical,
+            ir_table_virtual: table.virtual_address,
+            irte_count: remapper.entry_count() as u32,
+        };
+        remapper.unmap_msi(&mut io, Some(cookie))
+    }
+
     fn map(&mut self, physical: u64, length: usize) -> Result<u64, Error> {
         if length == 0 || physical.checked_add(length as u64).is_none() {
             return Err(Error::InvalidRange);
@@ -572,6 +1098,10 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
         dmar.units.len(),
         dmar.reserved_regions.len()
     );
+    let intremap = axhal::boot::command_line_value("intremap") == Some("on");
+    if intremap && !dmar.interrupt_remapping {
+        return Err(Error::Unsupported);
+    }
     let mut page_table = SecondLevel::new(KernelPageMemory { pages: Vec::new() })?;
     let mut maximum = 0u64;
     for &(base, size) in phys_ram_ranges() {
@@ -650,26 +1180,36 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
             queue: QiQueue::new(QI_BYTES as u32)?,
             gcmd: 0,
             root_physical: 0,
+            ir_table: None,
+            ir: None,
         };
         unit.enable(root.physical)?;
         units.push(unit);
     }
+    let iova_start = maximum
+        .max(1 << 30)
+        .checked_add((1 << 30) - 1)
+        .ok_or(Error::InvalidRange)?
+        & !((1 << 30) - 1);
     let manager = Manager {
+        dmar: dmar.clone(),
         units,
         root_table: root,
         context_tables,
         page_table,
-        iovas: IovaAllocator::new(
-            maximum
-                .max(1 << 30)
-                .checked_add((1 << 30) - 1)
-                .ok_or(Error::InvalidRange)?
-                & !((1 << 30) - 1),
-            IOVA_END,
-        )?,
+        iovas: IovaAllocator::new(iova_start, IOVA_END)?,
         mappings: Vec::new(),
+        ir_routes: Vec::new(),
+        identity_end: maximum,
+        iova_start,
+        next_domain_id: 2,
+        device_domains: Vec::new(),
     };
     *MANAGER.lock() = Some(manager);
+    REQUESTER_DOMAINS.store(
+        axhal::boot::command_line_value("iommu_domains") == Some("on"),
+        Ordering::Release,
+    );
     MODE.store(MODE_ENABLED, Ordering::Release);
     info!(
         "vtd: DMAR units={} identity_end={maximum:#x} QI enabled; PCI DMA mapping active",
@@ -711,5 +1251,98 @@ impl tk_vtd::PlatformDma for PlatformDma {
                 .unmap(device_address, length),
             _ => Err(Error::NoDomain),
         }
+    }
+
+    fn map_for(
+        requester: tk_vtd::PciRequester,
+        physical: u64,
+        length: usize,
+    ) -> Result<u64, Error> {
+        let result = match MODE.load(Ordering::Acquire) {
+            MODE_IDENTITY => {
+                if length != 0 && physical.checked_add(length as u64).is_some() {
+                    Ok(physical)
+                } else {
+                    Err(Error::InvalidRange)
+                }
+            }
+            MODE_ENABLED => {
+                let mut manager = MANAGER.lock();
+                let manager = manager.as_mut().ok_or(Error::NoDomain)?;
+                if REQUESTER_DOMAINS.load(Ordering::Acquire) {
+                    manager.map_for(requester, physical, length)
+                } else {
+                    manager.map(physical, length)
+                }
+            }
+            _ => Err(Error::NoDomain),
+        };
+        if let Err(error) = result {
+            let message = alloc::format!(
+                "THEKERNEL_VTD_REQUESTER_MAP_FAILED requester={:04x}:{:02x}:{:02x}.{} physical={:#x} len={:#x} error={:?}\n",
+                requester.segment,
+                requester.bus,
+                requester.device,
+                requester.function,
+                physical,
+                length,
+                error,
+            );
+            let _ = axhal::console::try_write_diagnostic_bytes(message.as_bytes());
+        }
+        result
+    }
+
+    fn unmap_for(
+        requester: tk_vtd::PciRequester,
+        device_address: u64,
+        length: usize,
+    ) -> Result<(), Error> {
+        match MODE.load(Ordering::Acquire) {
+            MODE_IDENTITY => Ok(()),
+            MODE_ENABLED => {
+                let mut manager = MANAGER.lock();
+                let manager = manager.as_mut().ok_or(Error::NoDomain)?;
+                if REQUESTER_DOMAINS.load(Ordering::Acquire) {
+                    manager.unmap_for(requester, device_address, length)
+                } else {
+                    manager.unmap(device_address, length)
+                }
+            }
+            _ => Err(Error::NoDomain),
+        }
+    }
+}
+
+struct PlatformInterruptRemap;
+#[crate_interface::impl_interface]
+impl tk_vtd::PlatformInterruptRemap for PlatformInterruptRemap {
+    fn map_msi(
+        requester: tk_vtd::PciRequester,
+        vector: u8,
+        destination: u32,
+    ) -> Result<Option<(u64, u32)>, Error> {
+        if axhal::boot::command_line_value("intremap") != Some("on") {
+            return Ok(None);
+        }
+        if MODE.load(Ordering::Acquire) != MODE_ENABLED {
+            return Err(Error::NoDomain);
+        }
+        MANAGER
+            .lock()
+            .as_mut()
+            .ok_or(Error::NoDomain)?
+            .map_msi(requester, vector, destination)
+    }
+
+    fn unmap_msi(vector: u8) -> Result<(), Error> {
+        if MODE.load(Ordering::Acquire) != MODE_ENABLED {
+            return Ok(());
+        }
+        MANAGER
+            .lock()
+            .as_mut()
+            .ok_or(Error::NoDomain)?
+            .unmap_msi(vector)
     }
 }

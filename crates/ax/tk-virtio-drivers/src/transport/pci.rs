@@ -16,7 +16,7 @@ use self::bus::{Command, DeviceFunction, DeviceFunctionInfo, PCI_CAP_ID_VNDR, Pc
 use super::{DeviceStatus, DeviceType, SharedMemoryRegion, Transport};
 use crate::{
     Error,
-    hal::{Hal, PhysAddr},
+    hal::{DmaRequester, Hal, PhysAddr},
     nonnull_slice_from_raw_parts,
     volatile::{
         ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly, volread, volwrite,
@@ -391,6 +391,15 @@ fn get_bar_physical_range(
 }
 
 impl Transport for PciTransport {
+    fn dma_requester(&self) -> Option<DmaRequester> {
+        Some(DmaRequester {
+            segment: 0,
+            bus: self.device_function.bus,
+            device: self.device_function.device,
+            function: self.device_function.function,
+        })
+    }
+
     fn shared_memory_region(&self, id: u8) -> Option<SharedMemoryRegion> {
         self.shared_memory[id as usize]
     }

@@ -5,7 +5,7 @@ use axdriver_base::{BaseDriverOps, DevResult, DeviceType};
 #[cfg(feature = "display")]
 use axdriver_display::DisplayDriverOps;
 use axdriver_virtio::{
-    BufferDirection, DmaMapping, PhysAddr, VirtIoError, VirtIoHal, VirtIoResult,
+    BufferDirection, DmaMapping, DmaRequester, PhysAddr, VirtIoError, VirtIoHal, VirtIoResult,
 };
 use axhal::mem::{phys_to_virt, virt_to_phys};
 use cfg_if::cfg_if;
@@ -265,8 +265,38 @@ impl<D: VirtIoDevMeta> DriverProbe for VirtIoDriver<D> {
 
 pub struct VirtIoHalImpl;
 
+fn requester_id(requester: Option<DmaRequester>) -> Option<tk_vtd::PciRequester> {
+    requester.map(|requester| tk_vtd::PciRequester {
+        segment: requester.segment,
+        bus: requester.bus,
+        device: requester.device,
+        function: requester.function,
+    })
+}
+
+fn platform_map_for(requester: Option<DmaRequester>, physical: u64, length: usize) -> Result<u64, tk_vtd::Error> {
+    let result = match requester_id(requester) {
+        Some(requester) => tk_vtd::platform_map_for(requester, physical, length),
+        None => tk_vtd::platform_map(physical, length),
+    };
+    if let Err(error) = result {
+        log::error!("virtio: DMA map failed requester={requester:?} physical={physical:#x} length={length:#x}: {error:?}");
+    }
+    result
+}
+
+fn platform_unmap_for(requester: Option<DmaRequester>, address: u64, length: usize) -> Result<(), tk_vtd::Error> {
+    match requester_id(requester) {
+        Some(requester) => tk_vtd::platform_unmap_for(requester, address, length),
+        None => tk_vtd::platform_unmap(address, length),
+    }
+}
+
 unsafe impl VirtIoHal for VirtIoHalImpl {
     fn dma_alloc(pages: usize, direction: BufferDirection) -> (PhysAddr, NonNull<u8>) {
+        Self::dma_alloc_for(None, pages, direction)
+    }
+    fn dma_alloc_for(requester: Option<DmaRequester>, pages: usize, direction: BufferDirection) -> (PhysAddr, NonNull<u8>) {
         let _ = direction;
         let (paddr, vaddr) = {
             let vaddr =
@@ -277,7 +307,7 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
                 };
             let paddr = virt_to_phys(vaddr.into()).as_usize();
             let length = pages.saturating_mul(0x1000);
-            let Ok(device_address) = tk_vtd::platform_map(paddr as u64, length) else {
+            let Ok(device_address) = platform_map_for(requester, paddr as u64, length) else {
                 global_allocator().dealloc_pages(vaddr, pages, UsageKind::Dma);
                 return (0, NonNull::dangling());
             };
@@ -292,7 +322,11 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
     }
 
     unsafe fn dma_dealloc(paddr: PhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32 {
-        if tk_vtd::platform_unmap(paddr as u64, pages.saturating_mul(0x1000)).is_err() {
+        unsafe { Self::dma_dealloc_for(None, paddr, vaddr, pages) }
+    }
+
+    unsafe fn dma_dealloc_for(requester: Option<DmaRequester>, paddr: PhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32 {
+        if platform_unmap_for(requester, paddr as u64, pages.saturating_mul(0x1000)).is_err() {
             return -1;
         }
         global_allocator().dealloc_pages(vaddr.as_ptr() as usize, pages, UsageKind::Dma);
@@ -304,11 +338,20 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
         len: usize,
         _direction: BufferDirection,
     ) -> VirtIoResult<DmaMapping> {
+        unsafe { Self::map_physical_for(None, paddr, len, _direction) }
+    }
+
+    unsafe fn map_physical_for(
+        requester: Option<DmaRequester>,
+        paddr: PhysAddr,
+        len: usize,
+        _direction: BufferDirection,
+    ) -> VirtIoResult<DmaMapping> {
         if paddr == 0 || len == 0 || paddr.checked_add(len).is_none() {
             return Err(VirtIoError::DmaError);
         }
         let device =
-            tk_vtd::platform_map(paddr as u64, len).map_err(|_| VirtIoError::DmaError)? as usize;
+            platform_map_for(requester, paddr as u64, len).map_err(|_| VirtIoError::DmaError)? as usize;
         Ok(DmaMapping {
             source: paddr,
             device,
@@ -317,7 +360,11 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
     }
 
     unsafe fn unmap_physical(mapping: DmaMapping, _direction: BufferDirection) {
-        if tk_vtd::platform_unmap(mapping.device as u64, mapping.len).is_err() {
+        unsafe { Self::unmap_physical_for(None, mapping, _direction) }
+    }
+
+    unsafe fn unmap_physical_for(requester: Option<DmaRequester>, mapping: DmaMapping, _direction: BufferDirection) {
+        if platform_unmap_for(requester, mapping.device as u64, mapping.len).is_err() {
             panic!(
                 "virtio: failed to invalidate DMA mapping {:#x}+{:#x}; backing memory remains \
                  owned",
@@ -333,19 +380,27 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
 
     #[inline]
     unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> PhysAddr {
+        unsafe { Self::share_for(None, buffer, direction) }
+    }
+
+    unsafe fn share_for(requester: Option<DmaRequester>, buffer: NonNull<[u8]>, direction: BufferDirection) -> PhysAddr {
         let _ = direction;
         let vaddr = buffer.as_ptr() as *mut u8 as usize;
         let physical = virt_to_phys(vaddr.into()).as_usize();
         let length = unsafe { buffer.as_ref().len() };
-        tk_vtd::platform_map(physical as u64, length).map_or(0, |address| address as usize)
+        platform_map_for(requester, physical as u64, length).map_or(0, |address| address as usize)
     }
 
     #[inline]
     unsafe fn unshare(paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) {
+        unsafe { Self::unshare_for(None, paddr, buffer, direction) }
+    }
+
+    unsafe fn unshare_for(requester: Option<DmaRequester>, paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) {
         let _ = direction;
         let length = unsafe { buffer.as_ref().len() };
-        if tk_vtd::platform_unmap(paddr as u64, length).is_err() {
-            panic!("virtio: failed to retire shared DMA mapping {paddr:#x}+{length:#x}");
+        if let Err(error) = platform_unmap_for(requester, paddr as u64, length) {
+            panic!("virtio: failed to retire shared DMA mapping requester={requester:?} {paddr:#x}+{length:#x}: {error:?}");
         }
     }
 }

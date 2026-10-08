@@ -9,7 +9,7 @@ use log::info;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use crate::{
-    hal::{BufferDirection, DmaMapping, Hal},
+    hal::{BufferDirection, DmaMapping, DmaRequester, Hal},
     queue::{PhysicalBuffer, VirtQueue},
     stats::{
         record_blk_async_adaptive_completion, record_blk_async_admission_stall,
@@ -124,6 +124,7 @@ pub struct VirtIOBlk<H: Hal, T: Transport> {
     // complete DMA owner without relying on panic/unwind behavior. The
     // quarantine branch of Drop intentionally leaves these values in place.
     transport: ManuallyDrop<T>,
+    requester: Option<DmaRequester>,
     queue: ManuallyDrop<VirtQueue<H, { QUEUE_SIZE as usize }>>,
     #[cfg(feature = "alloc")]
     pending: ManuallyDrop<Box<[Option<PendingBlkRequest>]>>,
@@ -205,6 +206,7 @@ struct PendingWriteSegment {
 }
 
 struct PendingBlkRequest {
+    requester: Option<DmaRequester>,
     req: BlkReq,
     resp: BlkResp,
     buffer: PendingBlkBuffer,
@@ -454,6 +456,7 @@ unsafe impl Sync for PendingBlkRequest {}
 impl PendingBlkRequest {
     fn read(block_id: usize, buf: &mut [u8]) -> Self {
         Self {
+            requester: None,
             req: BlkReq {
                 type_: ReqType::In,
                 reserved: 0,
@@ -479,6 +482,7 @@ impl PendingBlkRequest {
 
     fn write(block_id: usize, buf: &[u8]) -> Self {
         Self {
+            requester: None,
             req: BlkReq {
                 type_: ReqType::Out,
                 reserved: 0,
@@ -504,6 +508,7 @@ impl PendingBlkRequest {
 
     fn flush() -> Self {
         Self {
+            requester: None,
             req: BlkReq {
                 type_: ReqType::Flush,
                 reserved: 0,
@@ -525,6 +530,7 @@ impl PendingBlkRequest {
     }
 
     fn physical_read(
+        requester: Option<DmaRequester>,
         block_id: u64,
         mappings: [Option<DmaMapping>; MAX_PHYSICAL_SG],
         buffers: [PhysicalBuffer; MAX_PHYSICAL_SG],
@@ -532,6 +538,7 @@ impl PendingBlkRequest {
         bytes: usize,
     ) -> Self {
         Self {
+            requester,
             req: BlkReq {
                 type_: ReqType::In,
                 reserved: 0,
@@ -557,6 +564,7 @@ impl PendingBlkRequest {
     }
 
     fn physical_write(
+        requester: Option<DmaRequester>,
         block_id: u64,
         mappings: [Option<DmaMapping>; MAX_PHYSICAL_SG],
         buffers: [PhysicalBuffer; MAX_PHYSICAL_SG],
@@ -564,6 +572,7 @@ impl PendingBlkRequest {
         bytes: usize,
     ) -> Self {
         Self {
+            requester,
             req: BlkReq {
                 type_: ReqType::Out,
                 reserved: 0,
@@ -592,6 +601,7 @@ impl PendingBlkRequest {
     fn read_vectored(block_id: usize, bufs: &mut [&mut [u8]]) -> Self {
         let bytes = bufs.iter().map(|buf| buf.len()).sum();
         Self {
+            requester: None,
             req: BlkReq {
                 type_: ReqType::In,
                 reserved: 0,
@@ -624,6 +634,7 @@ impl PendingBlkRequest {
     fn write_vectored(block_id: usize, bufs: &[&[u8]]) -> Self {
         let bytes = bufs.iter().map(|buf| buf.len()).sum();
         Self {
+            requester: None,
             req: BlkReq {
                 type_: ReqType::Out,
                 reserved: 0,
@@ -812,7 +823,7 @@ impl PendingBlkRequest {
         };
         for mapping in mappings[..count].iter().rev().flatten().copied() {
             // SAFETY: This method is called only before publication.
-            unsafe { H::unmap_physical(mapping, direction) };
+            unsafe { H::unmap_physical_for(self.requester, mapping, direction) };
         }
     }
 
@@ -838,7 +849,7 @@ impl PendingBlkRequest {
             };
             // SAFETY: the caller invokes this only after a valid used entry or
             // a reset proof has stopped device access to the mapping.
-            unsafe { H::unmap_physical(mapping_value, direction) };
+            unsafe { H::unmap_physical_for(self.requester, mapping_value, direction) };
         }
     }
 
@@ -1179,6 +1190,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// Create a new VirtIO-Blk driver.
     pub fn new(mut transport: T) -> Result<Self> {
         let negotiated_features = transport.begin_init(SUPPORTED_FEATURES);
+        let requester = transport.dma_requester();
 
         // Read configuration space.
         let config = transport.config_space::<BlkConfig>()?;
@@ -1212,6 +1224,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
 
         Ok(VirtIOBlk {
             transport: ManuallyDrop::new(transport),
+            requester,
             queue: ManuallyDrop::new(queue),
             pending: ManuallyDrop::new(pending),
             notified_slots: [false; QUEUE_SIZE as usize],
@@ -1937,17 +1950,19 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         let mut mappings = [None; MAX_PHYSICAL_SG];
         let mut buffers = [PhysicalBuffer { addr: 0, len: 0 }; MAX_PHYSICAL_SG];
         for (index, segment) in segments.iter().enumerate() {
-            let mapping = match unsafe { H::map_physical(segment.paddr, segment.len, direction) } {
+            let mapping = match unsafe {
+                H::map_physical_for(self.requester, segment.paddr, segment.len, direction)
+            } {
                 Ok(mapping) => mapping,
                 Err(error) => {
-                    Self::unmap_physical_mappings(&mappings, index, direction);
+                    Self::unmap_physical_mappings(self.requester, &mappings, index, direction);
                     return Err(error);
                 }
             };
             if mapping.source != segment.paddr || mapping.len != segment.len || mapping.device == 0
             {
-                unsafe { H::unmap_physical(mapping, direction) };
-                Self::unmap_physical_mappings(&mappings, index, direction);
+                unsafe { H::unmap_physical_for(self.requester, mapping, direction) };
+                Self::unmap_physical_mappings(self.requester, &mappings, index, direction);
                 return Err(Error::DmaError);
             }
             buffers[index] = PhysicalBuffer {
@@ -1960,12 +1975,13 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     }
 
     fn unmap_physical_mappings(
+        requester: Option<DmaRequester>,
         mappings: &[Option<DmaMapping>; MAX_PHYSICAL_SG],
         count: usize,
         direction: BufferDirection,
     ) {
         for mapping in mappings[..count].iter().rev().flatten().copied() {
-            unsafe { H::unmap_physical(mapping, direction) };
+            unsafe { H::unmap_physical_for(requester, mapping, direction) };
         }
     }
 
@@ -1980,6 +1996,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     ) -> Result<u16> {
         let pending = match request.buffer {
             PendingBlkPhysicalBatchBuffer::Read(_) => PendingBlkRequest::physical_read(
+                self.requester,
                 request.block_id,
                 mappings,
                 buffers,
@@ -1987,6 +2004,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
                 bytes,
             ),
             PendingBlkPhysicalBatchBuffer::Write(_) => PendingBlkRequest::physical_write(
+                self.requester,
                 request.block_id,
                 mappings,
                 buffers,
@@ -2126,6 +2144,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             return Err(Error::QueueFull);
         }
 
+        let requester = self.requester;
         let mut prepared = PreparedBlockBatch {
             device: self,
             requests: requests.as_mut_ptr(),
@@ -2155,7 +2174,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             let slot = match prepared.device.alloc_pending_slot() {
                 Ok(slot) => slot,
                 Err(error) => {
-                    Self::unmap_physical_mappings(&mappings, counts[index], direction);
+                    Self::unmap_physical_mappings(requester, &mappings, counts[index], direction);
                     return Err(error);
                 }
             };
@@ -2347,6 +2366,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             Ok(slot) => slot,
             Err(error) => {
                 Self::unmap_physical_mappings(
+                    self.requester,
                     &mappings,
                     coalesced_count,
                     BufferDirection::DeviceToDriver,
@@ -2355,6 +2375,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             }
         };
         self.pending[slot] = Some(PendingBlkRequest::physical_read(
+            self.requester,
             block_id,
             mappings,
             buffers,
@@ -2446,6 +2467,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             Ok(slot) => slot,
             Err(error) => {
                 Self::unmap_physical_mappings(
+                    self.requester,
                     &mappings,
                     coalesced_count,
                     BufferDirection::DriverToDevice,
@@ -2454,6 +2476,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             }
         };
         self.pending[slot] = Some(PendingBlkRequest::physical_write(
+            self.requester,
             block_id,
             mappings,
             buffers,
@@ -2937,6 +2960,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             let bytes = request.buffer.len();
             let pending = match &mut request.buffer {
                 PendingBlkBatchBuffer::Read(buf) => PendingBlkRequest {
+                    requester: self.requester,
                     req: BlkReq {
                         type_: ReqType::In,
                         reserved: 0,
@@ -2959,6 +2983,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
                     completion_claimed: false,
                 },
                 PendingBlkBatchBuffer::Write(buf) => PendingBlkRequest {
+                    requester: self.requester,
                     req: BlkReq {
                         type_: ReqType::Out,
                         reserved: 0,

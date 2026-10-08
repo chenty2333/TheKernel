@@ -11,10 +11,14 @@ use core::{fmt::Debug, ptr::NonNull};
 use bitflags::{Flags, bitflags};
 use log::debug;
 
-use crate::{PAGE_SIZE, PhysAddr, Result};
+use crate::{PAGE_SIZE, PhysAddr, Result, hal::DmaRequester};
 
 /// A VirtIO transport layer.
 pub trait Transport {
+    /// DMA requester identity for PCI transports. Non-PCI transports return `None`.
+    fn dma_requester(&self) -> Option<DmaRequester> {
+        None
+    }
     /// A validated VirtIO PCI shared-memory capability.  The byte range is
     /// transport-owned and remains valid until device reset/transport drop.
     /// It is deliberately not a guest mapping permission by itself.

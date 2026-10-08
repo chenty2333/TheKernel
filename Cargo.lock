@@ -3319,6 +3319,7 @@ name = "tk-axdriver-nvme"
 version = "0.1.0"
 dependencies = [
  "tk-axdriver-block",
+ "tk-vtd",
 ]
 
 [[package]]
@@ -3455,6 +3456,7 @@ dependencies = [
  "tk-axgpu",
  "tk-axplat-x86-pc",
  "tk-page-table-multiarch",
+ "tk-vtd",
 ]
 
 [[package]]

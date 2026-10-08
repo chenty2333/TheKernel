@@ -12,8 +12,8 @@ extern crate std;
 
 use alloc::vec::Vec;
 
-pub mod context;
 pub mod busdma;
+pub mod context;
 pub mod dmar;
 pub mod driver;
 pub mod fault;
@@ -50,6 +50,35 @@ pub trait PlatformDma {
     fn pci_dma_allowed() -> bool;
     fn map(physical: u64, length: usize) -> Result<u64, Error>;
     fn unmap(device_address: u64, length: usize) -> Result<(), Error>;
+    fn map_for(requester: PciRequester, physical: u64, length: usize) -> Result<u64, Error>;
+    fn unmap_for(requester: PciRequester, device_address: u64, length: usize) -> Result<(), Error>;
+}
+
+#[crate_interface::def_interface]
+pub trait PlatformInterruptRemap {
+    fn map_msi(
+        requester: PciRequester,
+        vector: u8,
+        destination: u32,
+    ) -> Result<Option<(u64, u32)>, Error>;
+    fn unmap_msi(vector: u8) -> Result<(), Error>;
+}
+
+pub fn platform_map_msi(
+    requester: PciRequester,
+    vector: u8,
+    destination: u32,
+) -> Result<Option<(u64, u32)>, Error> {
+    crate_interface::call_interface!(
+        PlatformInterruptRemap::map_msi,
+        requester,
+        vector,
+        destination
+    )
+}
+
+pub fn platform_unmap_msi(vector: u8) -> Result<(), Error> {
+    crate_interface::call_interface!(PlatformInterruptRemap::unmap_msi, vector)
 }
 
 pub fn platform_pci_dma_allowed() -> bool {
@@ -64,6 +93,14 @@ pub fn platform_map(physical: u64, length: usize) -> Result<u64, Error> {
 /// Retire a platform DMA mapping after the device has stopped accessing it.
 pub fn platform_unmap(device_address: u64, length: usize) -> Result<(), Error> {
     crate_interface::call_interface!(PlatformDma::unmap, device_address, length)
+}
+
+pub fn platform_map_for(requester: PciRequester, physical: u64, length: usize) -> Result<u64, Error> {
+    crate_interface::call_interface!(PlatformDma::map_for, requester, physical, length)
+}
+
+pub fn platform_unmap_for(requester: PciRequester, device_address: u64, length: usize) -> Result<(), Error> {
+    crate_interface::call_interface!(PlatformDma::unmap_for, requester, device_address, length)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

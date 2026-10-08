@@ -19,6 +19,7 @@ struct Dma<H: Hal> {
     pointer: NonNull<u8>,
     pages: usize,
     safe: bool,
+    requester: Option<tk_vtd::PciRequester>,
     hal: PhantomData<H>,
 }
 // SAFETY: allocation is uniquely owned, coherent and accessed only under &mut Controller.
@@ -26,12 +27,12 @@ unsafe impl<H: Hal> Send for Dma<H> {}
 // SAFETY: shared access never changes DMA memory; hardware owns it while published.
 unsafe impl<H: Hal> Sync for Dma<H> {}
 impl<H: Hal> Dma<H> {
-    fn new(pages: usize) -> DevResult<Self> {
-        let (address, pointer) = H::allocate(pages).ok_or(DevError::NoMemory)?;
+    fn new(pages: usize, requester: Option<tk_vtd::PciRequester>) -> DevResult<Self> {
+        let (address, pointer) = H::allocate_for(requester, pages).ok_or(DevError::NoMemory)?;
         if address == 0 || address & 4095 != 0 || pointer.as_ptr() as usize & 4095 != 0 {
             // SAFETY: unpublished allocation has no DMA owner.
             unsafe {
-                H::release(address, pointer, pages);
+                H::release_for(requester, address, pointer, pages);
             }
             return Err(DevError::InvalidParam);
         }
@@ -44,6 +45,7 @@ impl<H: Hal> Dma<H> {
             pointer,
             pages,
             safe: true,
+            requester,
             hal: PhantomData,
         })
     }
@@ -53,7 +55,7 @@ impl<H: Hal> Drop for Dma<H> {
         if self.safe {
             // SAFETY: controller reset proved RDY=0, or allocation was never published.
             unsafe {
-                H::release(self.address, self.pointer, self.pages);
+                H::release_for(self.requester, self.address, self.pointer, self.pages);
             }
         }
         // If reset cannot prove DMA retirement, deliberately quarantine, never reuse.
@@ -69,10 +71,10 @@ struct Queue<H: Hal> {
     cid: u16,
 }
 impl<H: Hal> Queue<H> {
-    fn new(id: u16) -> DevResult<Self> {
+    fn new(id: u16, requester: Option<tk_vtd::PciRequester>) -> DevResult<Self> {
         Ok(Self {
-            sq: Dma::new(1)?,
-            cq: Dma::new(1)?,
+            sq: Dma::new(1, requester)?,
+            cq: Dma::new(1, requester)?,
             id,
             tail: 0,
             head: 0,
@@ -166,6 +168,7 @@ pub struct Controller<H: Hal, B: Bus> {
 }
 impl<H: Hal, B: Bus> Controller<H, B> {
     pub fn new(mut bus: B, allow_write: bool, window_size: usize) -> DevResult<Self> {
+        let requester = bus.dma_requester();
         let cap = bus.read64(regs::CAP);
         if cap == u64::MAX
             || (cap & 65535) + 1 < u64::from(DEPTH)
@@ -184,10 +187,10 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         wait_ready(&mut bus, false, timeout)?;
         let mut this = Self {
             bus,
-            admin: Queue::new(0)?,
+            admin: Queue::new(0, requester)?,
             queues: Vec::new(),
-            data: Dma::new(TRANSFER / PAGE)?,
-            list: Dma::new(1)?,
+            data: Dma::new(TRANSFER / PAGE, requester)?,
+            list: Dma::new(1, requester)?,
             stride,
             timeout,
             blocks: 0,
@@ -231,7 +234,7 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         let result = this.admin_cmd(request)?;
         let count = ((result & 65535).min(result >> 16) + 1).min(2);
         for id in 1..=count as u16 {
-            let mut queue = Queue::new(id)?;
+            let mut queue = Queue::new(id, requester)?;
             queue.sq.safe = false;
             queue.cq.safe = false;
             this.queues.push(queue);

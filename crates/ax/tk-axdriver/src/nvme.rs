@@ -19,12 +19,22 @@ pub struct PlatformHal;
 // SAFETY: x86 product uses coherent identity DMA, with page-owned contiguous allocations.
 unsafe impl Hal for PlatformHal {
     fn allocate(pages: usize) -> Option<(u64, NonNull<u8>)> {
+        Self::allocate_for(None, pages)
+    }
+    fn allocate_for(
+        requester: Option<tk_vtd::PciRequester>,
+        pages: usize,
+    ) -> Option<(u64, NonNull<u8>)> {
         let virtual_address = global_allocator()
             .alloc_pages(pages, 4096, UsageKind::Dma)
             .ok()?;
         let physical = axhal::mem::virt_to_phys(virtual_address.into()).as_usize() as u64;
         let length = pages.checked_mul(4096)?;
-        let device_address = match tk_vtd::platform_map(physical, length) {
+        let mapping = match requester {
+            Some(requester) => tk_vtd::platform_map_for(requester, physical, length),
+            None => tk_vtd::platform_map(physical, length),
+        };
+        let device_address = match mapping {
             Ok(address) => address,
             Err(_) => {
                 global_allocator().dealloc_pages(virtual_address, pages, UsageKind::Dma);
@@ -34,7 +44,19 @@ unsafe impl Hal for PlatformHal {
         Some((device_address, NonNull::new(virtual_address as *mut u8)?))
     }
     unsafe fn release(address: u64, pointer: NonNull<u8>, pages: usize) {
-        if tk_vtd::platform_unmap(address, pages.saturating_mul(4096)).is_err() {
+        unsafe { Self::release_for(None, address, pointer, pages) }
+    }
+    unsafe fn release_for(
+        requester: Option<tk_vtd::PciRequester>,
+        address: u64,
+        pointer: NonNull<u8>,
+        pages: usize,
+    ) {
+        let unmap = match requester {
+            Some(requester) => tk_vtd::platform_unmap_for(requester, address, pages.saturating_mul(4096)),
+            None => tk_vtd::platform_unmap(address, pages.saturating_mul(4096)),
+        };
+        if unmap.is_err() {
             log::error!(
                 "nvme: failed to retire DMA mapping {address:#x}+{:#x}",
                 pages.saturating_mul(4096)
@@ -48,8 +70,12 @@ pub struct Window {
     base: usize,
     size: usize,
     irq: Option<usize>,
+    requester: tk_vtd::PciRequester,
 }
 impl Bus for Window {
+    fn dma_requester(&self) -> Option<tk_vtd::PciRequester> {
+        Some(self.requester)
+    }
     fn read32(&mut self, offset: usize) -> u32 {
         if offset & 3 != 0 || offset.checked_add(4).is_none_or(|end| end > self.size) {
             return u32::MAX;
@@ -161,7 +187,15 @@ impl Msix {
             .ok()?
             .as_usize();
         let table = base.checked_add(layout.offset)?;
-        let (message, data, vector) = axhal::irq::allocate_msi(irq_handler)?;
+        let (message, data, vector) = axhal::irq::allocate_msi(
+            tk_vtd::PciRequester {
+                segment: axhal::pci::ecam_segment(),
+                bus: bdf.bus,
+                device: bdf.device,
+                function: bdf.function,
+            },
+            irq_handler,
+        )?;
         let control = capability.private_header | 0xc000;
         if !root.write_config_u16(bdf, capability.offset + 2, control) {
             return None;
@@ -240,6 +274,12 @@ impl DriverProbe for NvmeDriver {
                 base: base.as_usize(),
                 size: size as usize,
                 irq: msix.as_ref().map(|route| route.vector),
+                requester: tk_vtd::PciRequester {
+                    segment: axhal::pci::ecam_segment(),
+                    bus: bdf.bus,
+                    device: bdf.device,
+                    function: bdf.function,
+                },
             },
             allow_write,
             size as usize,

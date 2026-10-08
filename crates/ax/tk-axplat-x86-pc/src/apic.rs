@@ -71,8 +71,8 @@ pub fn set_enable(vector: usize, enabled: bool) {
             core::sync::atomic::AtomicBool::new(false);
         if !IO_APIC_UNMASK_REPORTED.swap(true, Ordering::AcqRel) {
             warn!(
-                "IOAPIC delivery is unavailable; refusing to unmask IRQ {vector}. Later \
-                 refusals are not reported."
+                "IOAPIC delivery is unavailable; refusing to unmask IRQ {vector}. Later refusals \
+                 are not reported."
             );
         }
         return;
@@ -96,7 +96,9 @@ pub fn set_enable(vector: usize, enabled: bool) {
 
 /// Configure only an admitted PCI INTx line as level-triggered, active-low.
 #[cfg(feature = "irq")]
-pub fn configure_pci_intx(vector: usize) -> bool { configure_level_line(vector, true) }
+pub fn configure_pci_intx(vector: usize) -> bool {
+    configure_level_line(vector, true)
+}
 
 /// SCI is always level-triggered; MADT can override its default low polarity.
 #[cfg(feature = "irq")]
@@ -107,7 +109,12 @@ pub(crate) fn configure_sci(vector: usize, low_active: bool) -> bool {
 #[cfg(feature = "irq")]
 fn configure_level_line(vector: usize, low_active: bool) -> bool {
     let electrical = IrqFlags::LEVEL_TRIGGERED | IrqFlags::LOW_ACTIVE;
-    let wanted = IrqFlags::LEVEL_TRIGGERED | if low_active { IrqFlags::LOW_ACTIVE } else { IrqFlags::empty() };
+    let wanted = IrqFlags::LEVEL_TRIGGERED
+        | if low_active {
+            IrqFlags::LOW_ACTIVE
+        } else {
+            IrqFlags::empty()
+        };
     let Some(pin) = io_apic_pin(vector) else {
         return false;
     };
@@ -149,7 +156,12 @@ fn configure_level_line(vector: usize, low_active: bool) -> bool {
 #[cfg(any(feature = "irq", test))]
 fn set_level_flags(entry: &mut RedirectionTableEntry, low_active: bool) {
     let mask = IrqFlags::LEVEL_TRIGGERED | IrqFlags::LOW_ACTIVE;
-    let flags = IrqFlags::LEVEL_TRIGGERED | if low_active { IrqFlags::LOW_ACTIVE } else { IrqFlags::empty() };
+    let flags = IrqFlags::LEVEL_TRIGGERED
+        | if low_active {
+            IrqFlags::LOW_ACTIVE
+        } else {
+            IrqFlags::empty()
+        };
     entry.set_flags((entry.flags() & !mask) | flags);
 }
 
@@ -639,17 +651,29 @@ mod irq_impl {
     /// outside the LAPIC/IPI range. Ownership is permanent for this boot.
     pub fn allocate_msi(handler: IrqHandler) -> Option<(u64, u32, usize)> {
         let destination = super::IO_APIC_DEST.load(core::sync::atomic::Ordering::Acquire);
-        if destination == super::IO_APIC_DEST_UNAVAILABLE { return None; }
+        if destination == super::IO_APIC_DEST_UNAVAILABLE {
+            return None;
+        }
         let max_pin = {
             // SAFETY: a published destination proves init_primary installed IO_APIC.
             unsafe { super::IO_APIC.lock().max_table_entry() }
         };
         for vector in super::msi_vectors(max_pin).rev() {
             if IRQ_HANDLER_TABLE.register_handler(vector, handler) {
-                return Some((0xfee0_0000 | (u64::from(destination) << 12), vector as u32, vector));
+                return Some((
+                    0xfee0_0000 | (u64::from(destination) << 12),
+                    vector as u32,
+                    vector,
+                ));
             }
         }
         None
+    }
+
+    /// Undo a reserved MSI vector when a platform-level remapping route fails
+    /// before the device is programmed.
+    pub fn unregister_msi_vector(vector: usize) -> Option<IrqHandler> {
+        IRQ_HANDLER_TABLE.unregister_handler(vector)
     }
 
     struct IrqIfImpl;
@@ -757,9 +781,12 @@ fn msi_vectors(max_pin: u8) -> core::ops::Range<usize> {
 }
 #[cfg(feature = "irq")]
 pub use irq_impl::allocate_msi;
+#[cfg(feature = "irq")]
+pub use irq_impl::unregister_msi_vector;
 #[cfg(test)]
 mod msi_tests {
-    #[test] fn vectors_never_alias_ioapic_or_lapic() {
+    #[test]
+    fn vectors_never_alias_ioapic_or_lapic() {
         let vectors: std::vec::Vec<_> = super::msi_vectors(23).collect();
         assert_eq!(vectors.first(), Some(&0x38));
         assert_eq!(vectors.last(), Some(&0xee));
@@ -773,17 +800,27 @@ mod sci_tests {
     #[test]
     fn firmware_active_high_sci_clears_pci_polarity_preserving_mask_and_destination() {
         let mut entry = RedirectionTableEntry::default();
-        entry.set_vector(0x29); entry.set_mode(IrqMode::Fixed); entry.set_dest(2);
+        entry.set_vector(0x29);
+        entry.set_mode(IrqMode::Fixed);
+        entry.set_dest(2);
         entry.set_flags(IrqFlags::MASKED | IrqFlags::LOW_ACTIVE);
         set_level_flags(&mut entry, false);
         assert!(!entry.flags().contains(IrqFlags::LOW_ACTIVE));
-        assert!(entry.flags().contains(IrqFlags::MASKED | IrqFlags::LEVEL_TRIGGERED));
-        assert_eq!(entry.vector(), 0x29); assert_eq!(entry.dest(), 2);
+        assert!(
+            entry
+                .flags()
+                .contains(IrqFlags::MASKED | IrqFlags::LEVEL_TRIGGERED)
+        );
+        assert_eq!(entry.vector(), 0x29);
+        assert_eq!(entry.dest(), 2);
         set_level_flags(&mut entry, true);
-        assert!(entry.flags().contains(IrqFlags::LOW_ACTIVE | IrqFlags::LEVEL_TRIGGERED));
+        assert!(
+            entry
+                .flags()
+                .contains(IrqFlags::LOW_ACTIVE | IrqFlags::LEVEL_TRIGGERED)
+        );
     }
 }
-
 
 /// Admitted firmware PCI link polarity, still level-triggered.
 #[cfg(feature = "irq")]

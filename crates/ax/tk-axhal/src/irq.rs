@@ -307,6 +307,9 @@ pub fn unregister(irq: usize) -> Option<axplat::irq::IrqHandler> {
     if irq < IRQ_CONTEXT.len() && IRQ_CONTEXT[irq].load(Ordering::Acquire) != 0 {
         None
     } else {
+        if let Ok(vector) = u8::try_from(irq) {
+            let _ = tk_vtd::platform_unmap_msi(vector);
+        }
         axplat::irq::unregister(irq)
     }
 }
@@ -831,7 +834,10 @@ mod tests {
         // thing.  Pick the lowest genuinely unassigned bit instead, and when
         // the mask is saturated assert that saturation explicitly so this
         // test resumes probing the moment a lane is retired.
-        match (0..u8::BITS).map(|bit| 1u8 << bit).find(|bit| all & bit == 0) {
+        match (0..u8::BITS)
+            .map(|bit| 1u8 << bit)
+            .find(|bit| all & bit == 0)
+        {
             Some(unknown) => {
                 assert_eq!(super::visit_pending_reasons(unknown, |_| {}), Err(unknown));
             }
@@ -917,9 +923,26 @@ mod tests {
 /// Reserve an MSI vector independently of IOAPIC routing. A driver must mask
 /// its device before configuring the returned message and retain ownership
 /// until reboot so delayed messages cannot target a different device.
-pub fn allocate_msi(handler: axplat::irq::IrqHandler) -> Option<(u64, u32, usize)> {
+pub fn allocate_msi(
+    requester: tk_vtd::PciRequester,
+    handler: axplat::irq::IrqHandler,
+) -> Option<(u64, u32, usize)> {
     #[cfg(all(target_os = "none", feature = "defplat", not(feature = "myplat")))]
-    { axplat_x86_pc::allocate_msi(handler) }
+    {
+        let (address, data, vector) = axplat_x86_pc::allocate_msi(handler)?;
+        let destination = (((address >> 12) & 0xff) | ((address >> 32) & 0xffff_ff00)) as u32;
+        match tk_vtd::platform_map_msi(requester, vector as u8, destination) {
+            Ok(Some((mapped_address, mapped_data))) => Some((mapped_address, mapped_data, vector)),
+            Ok(None) => Some((address, data, vector)),
+            Err(_) => {
+                let _ = axplat_x86_pc::unregister_msi_vector(vector);
+                None
+            }
+        }
+    }
     #[cfg(not(all(target_os = "none", feature = "defplat", not(feature = "myplat"))))]
-    { let _ = handler; None }
+    {
+        let _ = (requester, handler);
+        None
+    }
 }

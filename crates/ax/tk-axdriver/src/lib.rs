@@ -69,6 +69,8 @@ extern crate alloc;
 mod macros;
 
 mod bus;
+#[cfg(bus = "pci")]
+pub use bus::pci::requester_path;
 mod drivers;
 mod dummy;
 #[cfg(not(feature = "dyn"))]

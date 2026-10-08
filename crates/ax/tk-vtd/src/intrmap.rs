@@ -53,6 +53,7 @@ impl InterruptSource {
 
 /// Native hardware hooks for the IEC invalidation and IRTA/IRE programming.
 pub trait InterruptRemapIo {
+    fn store_irte(&mut self, index: u16, entry: Irte) -> Result<(), Error>;
     fn invalidate_iec(&mut self, index: u16, count: u16) -> Result<(), Error>;
     fn invalidate_iec_global(&mut self) -> Result<(), Error>;
     fn load_table_pointer(&mut self, physical: u64, size_order: u8) -> Result<(), Error>;
@@ -94,6 +95,10 @@ impl InterruptRemapper {
             enabled: false,
             x2apic,
         })
+    }
+
+    pub const fn entry_count(&self) -> usize {
+        self.entries.len()
     }
 
     /// Allocate a contiguous first-fit range of IRTE cookies.
@@ -274,6 +279,7 @@ impl InterruptRemapper {
             entry.irte2 = high;
             entry.irte1 = low;
         }
+        io.store_irte(index, *entry)?;
         io.invalidate_iec(index, 1)
     }
 
@@ -286,6 +292,7 @@ impl InterruptRemapper {
             .ok_or(Error::InvalidRange)?;
         entry.irte1 = 0;
         entry.irte2 = 0;
+        io.store_irte(index, *entry)?;
         io.invalidate_iec(index, 1)?;
         self.allocated[index as usize] = false;
         Ok(())
@@ -351,6 +358,9 @@ mod tests {
         enabled: bool,
     }
     impl InterruptRemapIo for Fake {
+        fn store_irte(&mut self, _: u16, _: Irte) -> Result<(), Error> {
+            Ok(())
+        }
         fn invalidate_iec(&mut self, index: u16, count: u16) -> Result<(), Error> {
             self.invalidated.push((index, count));
             Ok(())

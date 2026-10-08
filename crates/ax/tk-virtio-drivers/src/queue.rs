@@ -22,7 +22,7 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use crate::{
     Error, PAGE_SIZE, Result, align_up,
-    hal::{BufferDirection, Dma, Hal, PhysAddr},
+    hal::{BufferDirection, Dma, DmaRequester, Hal, PhysAddr},
     nonnull_slice_from_raw_parts, pages,
     stats::{io_counters_enabled, record_queue_sync_wait},
     transport::Transport,
@@ -41,6 +41,7 @@ fn dma_sync_barrier() {}
 pub struct VirtQueue<H: Hal, const SIZE: usize> {
     /// DMA guard
     layout: VirtQueueLayout<H>,
+    requester: Option<DmaRequester>,
     /// Descriptor table
     ///
     /// The device may be able to modify this, even though it's not supposed to, so we shouldn't
@@ -119,11 +120,12 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             return Err(Error::InvalidParam);
         }
         let size = SIZE as u16;
+        let requester = transport.dma_requester();
 
         let layout = if transport.requires_legacy_layout() {
-            VirtQueueLayout::allocate_legacy(size)?
+            VirtQueueLayout::allocate_legacy(size, requester)?
         } else {
-            VirtQueueLayout::allocate_flexible(size)?
+            VirtQueueLayout::allocate_flexible(size, requester)?
         };
 
         transport.queue_set(
@@ -154,6 +156,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         const NONE: Option<NonNull<[Descriptor]>> = None;
         Ok(VirtQueue {
             layout,
+            requester,
             desc,
             avail,
             used,
@@ -171,6 +174,10 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             #[cfg(feature = "alloc")]
             indirect_lists: [NONE; SIZE],
         })
+    }
+
+    pub(crate) const fn dma_requester(&self) -> Option<DmaRequester> {
+        self.requester
     }
 
     /// Add buffers to the virtqueue, return a token.
@@ -313,6 +320,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             // until the matching physical pop.
             unsafe {
                 self.desc_shadow[usize::from(current)].set_buf::<H>(
+                    self.requester,
                     (*input).into(),
                     BufferDirection::DriverToDevice,
                     DescFlags::NEXT,
@@ -340,6 +348,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             // until the matching physical pop.
             unsafe {
                 self.desc_shadow[usize::from(current)].set_buf::<H>(
+                    self.requester,
                     (*output).into(),
                     BufferDirection::DeviceToDriver,
                     DescFlags::NEXT,
@@ -380,6 +389,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             // entry is popped.
             unsafe {
                 indirect_list[index].set_buf::<H>(
+                    self.requester,
                     (*input).into(),
                     BufferDirection::DriverToDevice,
                     DescFlags::NEXT,
@@ -400,6 +410,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             // entry is popped.
             unsafe {
                 indirect_list[index].set_buf::<H>(
+                    self.requester,
                     (*output).into(),
                     BufferDirection::DeviceToDriver,
                     DescFlags::NEXT,
@@ -429,6 +440,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         // matching pop/discard path recycles it.
         unsafe {
             direct_desc.set_buf::<H>(
+                self.requester,
                 Box::leak(indirect_list).as_bytes().into(),
                 BufferDirection::DriverToDevice,
                 DescFlags::INDIRECT,
@@ -533,7 +545,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             // Safe because our caller promises that the buffers live at least until `pop_used`
             // returns them.
             unsafe {
-                desc.set_buf::<H>(buffer, direction, DescFlags::NEXT);
+                desc.set_buf::<H>(self.requester, buffer, direction, DescFlags::NEXT);
             }
             last = self.free_head;
             self.free_head = desc.next;
@@ -570,7 +582,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             // Safe because our caller promises that the buffers live at least until `pop_used`
             // returns them.
             unsafe {
-                desc.set_buf::<H>(buffer, direction, DescFlags::NEXT);
+                desc.set_buf::<H>(self.requester, buffer, direction, DescFlags::NEXT);
             }
             desc.next = (i + 1) as u16;
         }
@@ -592,6 +604,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         self.free_head = direct_desc.next;
         unsafe {
             direct_desc.set_buf::<H>(
+                self.requester,
                 Box::leak(indirect_list).as_bytes().into(),
                 BufferDirection::DriverToDevice,
                 DescFlags::INDIRECT,
@@ -870,7 +883,8 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                 head_desc.next = original_free_head;
 
                 unsafe {
-                    H::unshare(
+                    H::unshare_for(
+                        self.requester,
                         paddr as usize,
                         indirect_list.as_bytes_mut().into(),
                         BufferDirection::DriverToDevice,
@@ -887,7 +901,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                     unsafe {
                         // Unshare the buffer (and perhaps copy its contents back to the original
                         // buffer).
-                        H::unshare(indirect_list[i].addr as usize, buffer, direction);
+                        H::unshare_for(self.requester, indirect_list[i].addr as usize, buffer, direction);
                     }
                 }
                 drop(indirect_list);
@@ -915,7 +929,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                 // from which we got `paddr`.
                 unsafe {
                     // Unshare the buffer (and perhaps copy its contents back to the original buffer).
-                    H::unshare(paddr as usize, buffer, direction);
+                    H::unshare_for(self.requester, paddr as usize, buffer, direction);
                 }
             }
 
@@ -958,7 +972,8 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             self.num_used -= 1;
             head_desc.next = original_free_head;
             unsafe {
-                H::unshare(
+                H::unshare_for(
+                    self.requester,
                     paddr as usize,
                     indirect_list.as_bytes_mut().into(),
                     BufferDirection::DriverToDevice,
@@ -971,7 +986,8 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             let mut index = 0usize;
             for input in inputs {
                 unsafe {
-                    H::unshare(
+                    H::unshare_for(
+                        self.requester,
                         indirect_list[index].addr as usize,
                         (*input).into(),
                         BufferDirection::DriverToDevice,
@@ -982,7 +998,8 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             index += physical_inputs.len() + physical_outputs.len();
             for output in outputs {
                 unsafe {
-                    H::unshare(
+                    H::unshare_for(
+                        self.requester,
                         indirect_list[index].addr as usize,
                         (*output).into(),
                         BufferDirection::DeviceToDriver,
@@ -1110,7 +1127,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         if let Some((buffer, direction)) = virtual_buffer {
             // SAFETY: The caller supplied the exact virtual buffer used when
             // the descriptor was installed, and the device is quiescent.
-            unsafe { H::unshare(paddr, buffer, direction) };
+            unsafe { H::unshare_for(self.requester, paddr, buffer, direction) };
         }
     }
 
@@ -1274,11 +1291,11 @@ impl<H: Hal> VirtQueueLayout<H> {
     /// required by legacy interfaces.
     ///
     /// Ref: 2.6.2 Legacy Interfaces: A Note on Virtqueue Layout
-    fn allocate_legacy(queue_size: u16) -> Result<Self> {
+    fn allocate_legacy(queue_size: u16, requester: Option<DmaRequester>) -> Result<Self> {
         let (desc, avail, used) = queue_part_sizes(queue_size);
         let size = align_up(desc + avail) + align_up(used);
         // Allocate contiguous pages.
-        let dma = Dma::new(size / PAGE_SIZE, BufferDirection::Both)?;
+        let dma = Dma::new(size / PAGE_SIZE, BufferDirection::Both, requester)?;
         Ok(Self::Legacy {
             dma,
             avail_offset: desc,
@@ -1291,10 +1308,10 @@ impl<H: Hal> VirtQueueLayout<H> {
     ///
     /// This is preferred over `allocate_legacy` where possible as it reduces memory fragmentation
     /// and allows the HAL to know which DMA regions are used in which direction.
-    fn allocate_flexible(queue_size: u16) -> Result<Self> {
+    fn allocate_flexible(queue_size: u16, requester: Option<DmaRequester>) -> Result<Self> {
         let (desc, avail, used) = queue_part_sizes(queue_size);
-        let driver_to_device_dma = Dma::new(pages(desc + avail), BufferDirection::DriverToDevice)?;
-        let device_to_driver_dma = Dma::new(pages(used), BufferDirection::DeviceToDriver)?;
+        let driver_to_device_dma = Dma::new(pages(desc + avail), BufferDirection::DriverToDevice, requester)?;
+        let device_to_driver_dma = Dma::new(pages(used), BufferDirection::DeviceToDriver, requester)?;
         Ok(Self::Modern {
             driver_to_device_dma,
             device_to_driver_dma,
@@ -1412,13 +1429,14 @@ impl Descriptor {
     /// The caller must ensure that the buffer lives at least as long as the descriptor is active.
     unsafe fn set_buf<H: Hal>(
         &mut self,
+        requester: Option<DmaRequester>,
         buf: NonNull<[u8]>,
         direction: BufferDirection,
         extra_flags: DescFlags,
     ) {
         // Safe because our caller promises that the buffer is valid.
         unsafe {
-            self.addr = H::share(buf, direction) as u64;
+            self.addr = H::share_for(requester, buf, direction) as u64;
         }
         self.len = buf.len().try_into().unwrap();
         self.flags = extra_flags

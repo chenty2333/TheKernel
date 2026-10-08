@@ -32,7 +32,7 @@ repository.workspace = true
 
 [features]
 intel-hda = ["bus-pci", "dep:axdriver_hda", "dep:axalloc", "dep:axhal", "dep:spin"]
-nvme = ["block", "bus-pci", "dep:axdriver_nvme", "dep:axalloc", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq"]
+nvme = ["block", "bus-pci", "dep:axdriver_nvme", "dep:axalloc", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq", "dep:tk-vtd"]
 usb-dbc = ["usb-xhci", "dep:axdriver_dbc"]
 itco = ["dep:axdriver_watchdog", "dep:kspin", "dep:axhal", "dep:axklib"]
 ahci = [
@@ -52,7 +52,7 @@ bus-pci = [
     "dep:lazyinit",
 ]
 default = ["bus-pci", "i2c", "vtd"]
-i2c = ["bus-pci", "dep:tk-i2c", "dep:spin", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq"]
+i2c = ["bus-pci", "dep:tk-i2c", "dep:spin", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq", "dep:tk-vtd"]
 i2c-hid = ["i2c", "input", "dep:tk-i2c-hid"]
 vtd = ["dep:tk-vtd"]
 display = ["dep:axdriver_display"]

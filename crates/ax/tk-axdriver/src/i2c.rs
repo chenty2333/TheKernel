@@ -119,7 +119,15 @@ fn install_msi(
         .checked_add(usize::from(bdf.function) << 12)?;
     let config = axhal::mem::phys_to_virt(ecam.into()).as_mut_ptr() as usize;
     let handler = handler_for(slot)?;
-    let (message, data, vector) = axhal::irq::allocate_msi(handler)?;
+    let (message, data, vector) = axhal::irq::allocate_msi(
+        tk_vtd::PciRequester {
+            segment: axhal::pci::ecam_segment(),
+            bus: bdf.bus,
+            device: bdf.device,
+            function: bdf.function,
+        },
+        handler,
+    )?;
     // SAFETY: this capability and configuration page were validated above.
     let old_control = unsafe { ((config + offset + 2) as *const u16).read_volatile() };
     let is_64bit = old_control & 0x80 != 0;

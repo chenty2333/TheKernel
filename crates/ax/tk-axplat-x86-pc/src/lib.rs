@@ -32,7 +32,7 @@ pub mod kexec;
 mod mem;
 pub mod pci;
 mod power;
-pub use power::{system_reset, power_button_available, take_power_button_event};
+pub use power::{power_button_available, system_reset, take_power_button_event};
 mod time;
 
 pub use boot_info::{ColorField, FramebufferInfo, FramebufferRejection, ModuleInfo};
@@ -176,6 +176,12 @@ pub fn allocate_msi(handler: axplat::irq::IrqHandler) -> Option<(u64, u32, usize
     apic::allocate_msi(handler)
 }
 
+/// Release a reserved MSI vector when route programming fails before device activation.
+#[cfg(feature = "irq")]
+pub fn unregister_msi_vector(vector: usize) -> Option<axplat::irq::IrqHandler> {
+    apic::unregister_msi_vector(vector)
+}
+
 /// Capability-gated automatic Intel MWAIT idle state selection and counters.
 pub mod cpuidle;
 
@@ -186,17 +192,27 @@ pub mod cpufreq;
 pub mod thermal;
 
 /// Stable owned boot RSDP pointer for ACPICA native-RSDP mode.
-pub fn acpi_rsdp_pointer()->usize { boot_info::get().rsdp().map_or(0,|r|r.bytes().as_ptr() as usize) }
-pub use power::{register_acpica_off,record_acpica_button,publish_acpica_button,restore_static_acpi};
-#[cfg(feature="irq")]
-pub use power::{install_acpica_sci,remove_acpica_sci};
+pub fn acpi_rsdp_pointer() -> usize {
+    boot_info::get()
+        .rsdp()
+        .map_or(0, |r| r.bytes().as_ptr() as usize)
+}
+#[cfg(feature = "irq")]
+pub use power::{install_acpica_sci, remove_acpica_sci};
+pub use power::{
+    publish_acpica_button, record_acpica_button, register_acpica_off, restore_static_acpi,
+};
 
 /// Finish diagnostic serial transmission before power removal.
-pub fn acpi_flush_diagnostics(){console::flush_diagnostic();}
+pub fn acpi_flush_diagnostics() {
+    console::flush_diagnostic();
+}
 
 #[cfg(feature = "irq")]
 pub use apic::configure_pci_intx_polarity;
 
 mod intel_cpu_cache;
 /// All startup CPUs confirmed the opted-in native Intel WC mapping palette.
-pub fn intel_cpu_mmap_ready() -> bool { intel_cpu_cache::ready() }
+pub fn intel_cpu_mmap_ready() -> bool {
+    intel_cpu_cache::ready()
+}
