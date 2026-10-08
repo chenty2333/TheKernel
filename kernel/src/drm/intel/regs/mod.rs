@@ -46,9 +46,9 @@ use super::id::Quirk;
 // declared once, in [`pipe`], under the name its own chapter's table uses;
 // [`ddi`]'s timing registers live beside it at the same stride.
 
+pub(crate) mod aux;
 pub(crate) mod ddi;
 pub(crate) mod dpll;
-pub(crate) mod aux;
 pub(crate) mod interrupt;
 pub(crate) mod pipe;
 pub(crate) mod port;
@@ -949,11 +949,9 @@ pub(crate) const POWER_AND_CLOCK_REGISTERS: &[Register] = &[
 ///
 /// Access is stated per register rather than inherited from the block:
 ///
-/// * `GMBUS2` (status) and `GMBUS3` (data) are read-only *here* because this
-///   driver never writes them -- the index cycle this driver uses carries the
-///   index byte in `GMBUS1`, so `GMBUS3` is only ever read.  A later driver
-///   that speaks DPCD over I2C needs `GMBUS3` writable, and that is an
-///   addition to this table rather than a relaxation of it.
+/// * `GMBUS2` (status) remains read-only. `GMBUS3` is transmit/receive data and
+///   is writable for the translated indexed write / bit-bang-capable GMBUS
+///   engine.
 /// * `GMBUS4` (interrupt mask) is written only with zero: this kernel takes no
 ///   GMBUS interrupt, so the mask is cleared and completion is polled.
 /// * `GMBUS5` (two-byte index) is cleared before a transaction.  See
@@ -981,6 +979,9 @@ pub(crate) const BUS: &[Register] = &[
     GMBUS3,
     GMBUS4,
     GMBUS5,
+    GPIO_B,
+    GPIO_C,
+    GPIO_D,
     SHOTPLUG_CTL_DDI,
     SDEISR,
     SOUTH_CHICKEN1,
@@ -999,9 +1000,9 @@ pub(crate) const GMBUS1: Register =
 pub(crate) const GMBUS2: Register =
     Register::read_only("GMBUS2", 0xc5108, Meaning::BusController, None);
 
-/// The four-byte data buffer.
+/// The four-byte transmit/receive data buffer.
 pub(crate) const GMBUS3: Register =
-    Register::read_only("GMBUS3", 0xc510c, Meaning::BusController, None);
+    Register::read_write("GMBUS3", 0xc510c, Meaning::BusController, None);
 
 /// The interrupt mask.  Written with zero: completion is polled, not taken.
 pub(crate) const GMBUS4: Register =
@@ -1010,6 +1011,16 @@ pub(crate) const GMBUS4: Register =
 /// The two-byte index enable and value.
 pub(crate) const GMBUS5: Register =
     Register::read_write("GMBUS5", 0xc5120, Meaning::BusController, None);
+
+/// GMBUS GPIO block B, the I2C-over-GPIO fallback for DDI A (`GPIOB`).
+pub(crate) const GPIO_B: Register =
+    Register::read_write("GPIOB", 0xc5014, Meaning::BusController, None);
+/// GMBUS GPIO block C, the I2C-over-GPIO fallback for DDI B (`GPIOC`).
+pub(crate) const GPIO_C: Register =
+    Register::read_write("GPIOC", 0xc5018, Meaning::BusController, None);
+/// GMBUS GPIO block D, the I2C-over-GPIO fallback for DDI C (`GPIOD`).
+pub(crate) const GPIO_D: Register =
+    Register::read_write("GPIOD", 0xc501c, Meaning::BusController, None);
 
 /// DDI hotplug control, one four-bit field per DDI (`[I915]`
 /// `i915_reg.h:3078-3085`; reference §9.5).
@@ -1667,16 +1678,19 @@ mod tests {
                 "DP_AUX_CH_DATA(B,4)",
                 "GMBUS0",           // pin select and rate
                 "GMBUS1",           // the transaction itself
+                "GMBUS3",           // transmit/receive bytes
                 "GMBUS4",           // interrupt mask, cleared to zero
                 "GMBUS5",           // two-byte index, cleared to zero
+                "GPIOB",            // bit-banged DDC for DDI A
+                "GPIOC",            // bit-banged DDC for DDI B
+                "GPIOD",            // bit-banged DDC for DDI C
                 "SHOTPLUG_CTL_DDI", // hotplug enable
                 "SOUTH_CHICKEN1",   // board HPD inversion, when a caller asks
             ]
         );
-        // Status, data and the write-one-to-clear interrupt status stay
-        // read-only: a write to SDEISR would clear the very state a caller
-        // reads it for.
-        for name in ["GMBUS2", "GMBUS3", "SDEISR", "SHPD_FILTER_CNT"] {
+        // Status and the write-one-to-clear interrupt status stay read-only:
+        // a write to SDEISR would clear the very state a caller reads it for.
+        for name in ["GMBUS2", "SDEISR", "SHPD_FILTER_CNT"] {
             let register = BUS
                 .iter()
                 .find(|register| register.name() == name)

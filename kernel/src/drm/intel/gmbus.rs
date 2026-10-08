@@ -3,17 +3,16 @@
 //! This is the first code in this kernel that produces a fact the firmware did
 //! not give it.  Everything before it read registers the firmware had already
 //! programmed, or configuration space, which is a standard; here the kernel
-//! drives a bus of its own and a monitor on the other end answers.  That is why
-//! the failure paths in this module are as long as the happy one.
+//! drives a bus of its own and a monitor on the other end answers. The
+//! source-translated hardware transfer is `intel_gmbus_full` through
+//! `super::gmbus_full`; this module handles EDID validation and retry policy.
 //!
 //! # What the hardware is
 //!
-//! GMBUS is Intel's I2C controller for the display's DDC channels.  It lives in
-//! the south display window, six registers at `0xC5100`-`0xC5120` (reference
-//! §9.1; `[I915]` `display/intel_gmbus_regs.h:29-79`).  A transaction is a
-//! state machine over those registers: program the pin and the rate, program
-//! one command word, then take four bytes at a time out of a data register
-//! while the controller raises a ready bit.
+//! GMBUS is Intel's I2C controller for display DDC. It lives in the south
+//! display window at `0xC5100`-`0xC5120`; the active transaction state machine
+//! is the source translation in `intel_gmbus_full`, mapped to typed MMIO by
+//! `super::gmbus_full`.
 //!
 //! **Provenance is weaker here than anywhere else in this driver.**  Only
 //! `GMBUS0` appears in any public Gen12 register volume; the reference says so
@@ -25,33 +24,23 @@
 //! its §14.2).  Where the reference's prose and that source disagree, the
 //! source wins and the disagreement is recorded here.
 //!
-//! # The protocol, and the one place the reference is out of date
+//! # The protocol
 //!
-//! Reading an EDID block is one index cycle followed by one read: the
-//! controller sends the EEPROM's register address to slave `0x50`, then a
-//! repeated start and a read of the block.  i915 v6.12 programs both phases in
-//! a *single* `GMBUS1` write -- `CYCLE_INDEX | CYCLE_WAIT`, with the index byte
-//! in `SLAVE_INDEX[15:8]` (`[I915]` `display/intel_gmbus.c:596-611` and
-//! `:451-452`, unchanged since at least v5.15).  Reference §9.3 describes the
-//! older two-write form instead ("*sets* `gmbus1_index = GMBUS_CYCLE_INDEX |
-//! (msgs[0].len << 16) | (addr << 1) | SW_RDY` *for the first message*").
-//! This driver implements the single-write form, because that is the code path
-//! a Gen12 part actually runs, and a test pins the exact command word.
+//! Reading one EDID block creates an EEPROM index-write message followed by a
+//! repeated-start read from slave `0x50`. The translated source state machine
+//! owns command construction, FIFO transfers, bounded status waits, cleanup,
+//! reset, and GPIO fallback. This wrapper validates the returned EDID bytes
+//! and applies the N305 probe's retry policy.
 //!
 //! # Failure is the interesting part
 //!
 //! Reference §11.1 is a table of what goes wrong, and the two failure modes
 //! worth naming are:
 //!
-//! * **NAK on every address.**  The reference's explanation, from §11 phase
-//!   2.1, is that the AUX/DDC power well for that pin pair is not enabled --
-//!   and when a power well is down, writes to its registers are dropped and
-//!   reads return zero (§4.2).  A NAK is not a timeout, and this module does
-//!   not report it as one: on `GMBUS2.SATOER` it reads the well's state bit
-//!   back and returns [`GmbusError::AuxWellDown`], which names the well, or
-//!   [`GmbusError::NoAck`], which says the well is up and the sink itself
-//!   declined.  Nothing here enables a power well: that is the power
-//!   workstream's register to write, and this module only reads it.
+//! * **NAK on every address.** The translated engine returns a NAK status;
+//!   the wrapper reads the AUX/DDC well state and distinguishes
+//!   [`GmbusError::AuxWellDown`] from [`GmbusError::NoAck`]. The source engine
+//!   acquires/releases the GMBUS reference around each transfer.
 //! * **A bus left in a bad state.**  The recovery is the reference's (and
 //!   i915's `intel_gmbus_reset`): clear `GMBUS0` and `GMBUS4`, wait for the bus
 //!   to go idle, then toggle `GMBUS1.SW_CLR_INT` to reset the controller and
@@ -59,16 +48,15 @@
 //!
 //! # What this module does not do
 //!
-//! * It does not enable the AUX/DDC power well, and it does not enable hotplug;
-//!   [`super::hpd`] owns the latter.
+//! * It does not enable hotplug; [`super::hpd`] owns that path.
 //! * It does not take the GMBUS interrupt.  `SDE_GMBUS_ICP` (`SDEISR` bit 23,
 //!   reference §10.5) reports a completed transaction, but taking an interrupt
 //!   means wiring the display interrupt path, which this workstream is
 //!   deliberately not doing; completion is polled, bounded and read back, and
 //!   `GMBUS4` is left cleared so no interrupt is asked for.
-//! * It does not bit-bang.  Reference §11.1 gives the GPIO procedure as the
-//!   last resort when a reset does not clear a stuck bus; that needs the GPIO
-//!   pair registers and is a separate piece of work.
+//! * The translated `intel_gmbus_full` engine provides the GPIO bit-bang
+//!   fallback after a hardware GMBUS timeout, using the typed GPIO B/C/D
+//!   instances for the DDI A/B/C fallback pins.
 //! * It does not parse EDID.  [`read_edid`] returns the bytes of one validated
 //!   128-byte block; the parse belongs to `drm::modes`, which is not in this
 //!   branch yet, so this module stops at bytes and says so rather than growing
@@ -85,6 +73,8 @@
 
 use alloc::{format, string::String, vec::Vec};
 use core::fmt;
+
+use intel_display::intel_gmbus_full as source;
 
 use super::{
     hpd::Ddi,
@@ -939,12 +929,14 @@ pub(crate) struct BusNotes {
     /// How many transactions were attempted on this pin.  One when the first
     /// attempt answered and validated.
     pub(crate) attempts: u8,
+    /// The upstream GMBUS timeout selected bit-banging for the next attempt.
+    pub(crate) force_bitbang: bool,
 }
 
 impl BusNotes {
     /// Whether anything here is worth a log line.
     pub(crate) const fn is_quiet(&self) -> bool {
-        !self.stale_two_byte_index && !self.was_in_use && self.attempts <= 1
+        !self.stale_two_byte_index && !self.was_in_use && !self.force_bitbang && self.attempts <= 1
     }
 
     /// The notes as a log line, or `None` when there is nothing to say.
@@ -960,6 +952,11 @@ impl BusNotes {
         }
         if self.was_in_use {
             parts.push(String::from("GMBUS2.INUSE was set before the transaction"));
+        }
+        if self.force_bitbang {
+            parts.push(String::from(
+                "hardware GMBUS timed out; retry used GPIO bit-banging",
+            ));
         }
         if self.attempts > 1 {
             parts.push(format!(
@@ -1341,14 +1338,80 @@ fn read_block_once<R: Registers, T: PollTimer>(
 ) -> Result<EdidBytes, GmbusError> {
     notes.last_rate = rate;
     let mut bytes = [0u8; EDID_BLOCK_LEN];
-    let mut bus = Bus {
+    let transfer = super::gmbus_full::read_edid_block(
         registers,
         timer,
         pin,
         rate,
-        notes,
-    };
-    bus.transfer(address, offset, &mut bytes)?;
+        address,
+        offset,
+        &mut bytes,
+        if notes.force_bitbang { 1 << 31 } else { 0 },
+    );
+    notes.was_in_use |= transfer.was_in_use;
+    notes.stale_two_byte_index |= transfer.stale_two_byte_index;
+    notes.force_bitbang = transfer.force_bit & (1 << 31) != 0;
+    match transfer.result {
+        Ok(2) => {}
+        Ok(_) => {
+            return Err(GmbusError::ReadyTimeout {
+                pin,
+                rate,
+                status: transfer.last_status,
+                waited_micros: 0,
+            });
+        }
+        Err(source::GmbusError::NoDevice | source::GmbusError::Power) => {
+            let mut probe = Bus {
+                registers,
+                timer,
+                pin,
+                rate,
+                notes,
+            };
+            let well = probe.aux_well_state();
+            return Err(if well == AuxWellReading::Off {
+                GmbusError::AuxWellDown {
+                    pin,
+                    rate,
+                    address,
+                    well: pin.aux_well(),
+                }
+            } else {
+                GmbusError::NoAck {
+                    pin,
+                    rate,
+                    address,
+                    well,
+                }
+            });
+        }
+        Err(source::GmbusError::Timeout | source::GmbusError::Again) => {
+            return Err(
+                if terminal_outcome(transfer.last_status) == WaitOutcome::Stalled
+                    || transfer.last_status & GMBUS2_ACTIVE != 0
+                {
+                    GmbusError::BusStuck {
+                        pin,
+                        status: transfer.last_status,
+                        waited_micros: 0,
+                    }
+                } else {
+                    GmbusError::ReadyTimeout {
+                        pin,
+                        rate,
+                        status: transfer.last_status,
+                        waited_micros: 0,
+                    }
+                },
+            );
+        }
+        Err(_) => {
+            return Err(GmbusError::RegisterRefused {
+                register: "GMBUS source adapter",
+            });
+        }
+    }
     if all_ones(&bytes) {
         return Err(GmbusError::BusFloating { pin });
     }
