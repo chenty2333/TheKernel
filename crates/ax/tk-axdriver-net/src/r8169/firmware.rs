@@ -136,19 +136,17 @@ fn access(
     reg: usize,
     value: Option<u16>,
 ) -> DevResult<u16> {
-    if reg == 31 {
+    // Only PHY register 31 is the page selector. In MAC-MCU mode Linux sends
+    // the firmware operand directly to MAC OCP, including odd register 0x1f.
+    if reg == 31 && !mac {
         if let Some(data) = value {
-            *base = if !mac && data == 0 {
+            *base = if data == 0 {
                 0xa400
             } else {
                 data.checked_mul(16).ok_or(DevError::InvalidParam)?
             };
         }
-        return Ok(if !mac && *base == 0xa400 {
-            0
-        } else {
-            *base >> 4
-        });
+        return Ok(if *base == 0xa400 { 0 } else { *base >> 4 });
     }
     let offset = if mac {
         reg
@@ -160,14 +158,18 @@ fn access(
         };
         index.checked_mul(2).ok_or(DevError::InvalidParam)?
     };
-    let address = usize::from(*base)
-        .checked_add(offset)
-        .and_then(|v| u16::try_from(v).ok())
-        .ok_or(DevError::InvalidParam)?;
+    let address = if mac {
+        u16::try_from(reg).map_err(|_| DevError::InvalidParam)?
+    } else {
+        usize::from(*base)
+            .checked_add(offset)
+            .and_then(|v| u16::try_from(v).ok())
+            .ok_or(DevError::InvalidParam)?
+    };
     match (mac, value) {
-        (true, Some(data)) => i::mac_write(bus, address, data)?,
+        (true, Some(data)) => i::mac_mcu_write(bus, address, data)?,
         (false, Some(data)) => i::phy_write(bus, address, data)?,
-        (true, None) => return i::mac_read(bus, address),
+        (true, None) => return i::mac_mcu_read(bus, address),
         (false, None) => return i::phy_read(bus, address),
     }
     Ok(0)
@@ -209,8 +211,37 @@ mod tests {
             let data = std::fs::read(path).unwrap();
             let mut bus = super::super::fake::FakeBus::h8168();
             Firmware::parse(&data).unwrap().execute(&mut bus).unwrap();
+            assert!(bus.writes.contains(&(
+                0xb0,
+                super::super::regs::Width::Dword,
+                (1 << 31) | (0x1f << 15) | 0x0fc2,
+            )));
+            assert!(bus.writes.contains(&(
+                0xb0,
+                super::super::regs::Width::Dword,
+                (1 << 31) | (0x1f << 15) | 0x0f80,
+            )));
             super::super::h8168::configure_phy(&mut bus).unwrap();
         }
+    }
+
+    #[test]
+    fn mac_register_31_is_written_as_mac_ocp_not_phy_page_select() {
+        let code = bytes(&[0x40000001, 0x801f0fc2, 0x40000000, 0x80080055]);
+        let mut bus = super::super::fake::FakeBus::h8168();
+
+        Firmware::parse(&code).unwrap().execute(&mut bus).unwrap();
+
+        assert!(bus.writes.contains(&(
+            0xb0,
+            super::super::regs::Width::Dword,
+            (1 << 31) | (0x1f << 15) | 0x0fc2,
+        )));
+        assert!(bus.writes.contains(&(
+            0xb8,
+            super::super::regs::Width::Dword,
+            (1 << 31) | (0xa410 << 15) | 0x55,
+        )));
     }
     #[test]
     fn interpreter_handles_phy_mac_pages_and_previous_data() {
@@ -221,7 +252,7 @@ mod tests {
         let mut bus = super::super::fake::FakeBus::h8168();
         Firmware::parse(&code).unwrap().execute(&mut bus).unwrap();
         assert_eq!(i::phy_read(&mut bus, 0xa430).unwrap(), 0xd5);
-        assert_eq!(i::mac_read(&mut bus, 0xfc20).unwrap(), 0x33);
+        assert_eq!(i::mac_read(&mut bus, 0).unwrap(), 0x33);
     }
     #[test]
     fn backward_loops_delays_and_bad_page_arithmetic_are_bounded() {
