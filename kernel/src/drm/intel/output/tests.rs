@@ -1152,12 +1152,13 @@ fn is_idle_never_clearing_is_a_named_error_naming_the_ddi() {
             register,
             readback,
             wrote,
-            ..
+            timeout_us,
         } => {
             assert_eq!(*ddi, Ddi::A);
             assert_eq!(*register, "DDI_BUF_CTL(A)");
             assert_ne!(*readback & DDI_BUF_CTL_IS_IDLE, 0);
             assert_eq!(*wrote, 0x8200_0016);
+            assert_eq!(*timeout_us, 10_000, "display-13 source wait is 10 ms");
         }
         other => panic!("wrong error: {other:?}"),
     }

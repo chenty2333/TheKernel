@@ -300,11 +300,11 @@ const DDI_BUF_CTL_OWNED: u32 = DDI_BUF_CTL_ENABLE
 
 /// How long to wait for `IS_IDLE` to clear, in microseconds.
 ///
-/// §8.6 step 14: "[PRM] timeout 500us for HDMI".  §11 phase 5.7 calls this poll
-/// the single best "is my DDI alive" bit on the chip and records a real `46d0`
-/// field report of it timing out under coreboot + EDK2; see
-/// [`OutputError::DdiNeverIdle`].
-const DDI_IDLE_TIMEOUT_US: u32 = 500;
+/// i915's `intel_wait_ddi_buf_active()` polls for 10 ms on display version 10+
+/// (as used by ADL-N); preserve that source budget rather than the separate
+/// PRM's 500-us HDMI note. §11 phase 5.7 calls this the single best "is my DDI
+/// alive" bit and records a real `46d0` timeout under coreboot + EDK2.
+const DDI_IDLE_TIMEOUT_US: u32 = 10_000;
 
 /// `PORT_CL_DW5`'s `SUS_CLOCK_CONFIG[1:0]`, written `0b11` by §8.5 step 3.
 ///
@@ -983,6 +983,80 @@ fn source_trans_ddi_func_ctl(request: &OutputRequest) -> u32 {
     i915::intel_ddi_transcoder_func_reg_val_get(&mut DdiPolicyIo, &encoder, &state)
 }
 
+/// Kernel adapter for the translated source DDI-buffer enable handshake. It
+/// admits exactly the selected combo-PHY buffer register and implements the
+/// source's bounded `IS_IDLE` poll without exposing any other MMIO address.
+struct DdiBufferEnableIo<'a, R> {
+    registers: &'a R,
+    ddi_buf_ctl: Register,
+    read_failed: bool,
+    write_failed: bool,
+    timed_out: bool,
+}
+
+impl<'a, R: Registers> DdiBufferEnableIo<'a, R> {
+    fn new(registers: &'a R, ddi_buf_ctl: Register) -> Self {
+        Self { registers, ddi_buf_ctl, read_failed: false, write_failed: false, timed_out: false }
+    }
+}
+
+impl<R: Registers> intel_display::intel_ddi_full::DdiIo for DdiBufferEnableIo<'_, R>
+{
+    fn read(&mut self, reg: u32) -> u32 {
+        if reg != self.ddi_buf_ctl.offset() {
+            self.read_failed = true;
+            return u32::MAX;
+        }
+        match self.registers.read(self.ddi_buf_ctl) {
+            Some(value) => value,
+            None => {
+                self.read_failed = true;
+                u32::MAX
+            }
+        }
+    }
+
+    fn write(&mut self, reg: u32, value: u32) {
+        if reg != self.ddi_buf_ctl.offset() || !self.registers.write(self.ddi_buf_ctl, value) {
+            self.write_failed = true;
+        }
+    }
+
+    fn combo_phy_read(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister) -> u32 { 0 }
+    fn combo_phy_write(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister, _value: u32) {}
+    fn combo_phy_rmw(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister, _clear: u32, _set: u32) {}
+    fn mg_phy_rmw(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::MgPhyRegister, _clear: u32, _set: u32) {}
+    fn dkl_phy_read(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister) -> u32 { 0 }
+    fn dkl_phy_write(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister, _value: u32) {}
+    fn dkl_phy_rmw(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister, _clear: u32, _set: u32) {}
+    fn mg_dp_mode_read(&mut self, _port: intel_display::intel_ddi_full::Port, _lane: u8) -> u32 { 0 }
+    fn mg_dp_mode_write(&mut self, _port: intel_display::intel_ddi_full::Port, _lane: u8, _value: u32) {}
+
+    fn wait_clear(&mut self, reg: u32, mask: u32, timeout_ms: u32) -> bool {
+        if reg != self.ddi_buf_ctl.offset() {
+            self.read_failed = true;
+            return true;
+        }
+        match super::regs::poll(
+            self.registers,
+            self.ddi_buf_ctl,
+            mask,
+            0,
+            timeout_ms.saturating_mul(1000),
+        ) {
+            Some(true) => false,
+            Some(false) => {
+                self.timed_out = true;
+                true
+            }
+            None => {
+                self.read_failed = true;
+                true
+            }
+        }
+    }
+}
+
 impl OutputProgram {
     /// Compute every register value phase 5 writes, without touching hardware.
     ///
@@ -1507,41 +1581,56 @@ pub(crate) fn program(
     // `TRANSCONF` and that they are one register, not two.
     // The pipe enable follows the HDMI encoder enable below.
 
-    // 5.7 -- the DDI buffer, then idle poll, then transcoder enable.  The write is a
-    // read-modify-write over the fields the plan composes
-    // ([`DDI_BUF_CTL_OWNED`]): the register also carries the board's
-    // `PORT_REVERSAL` and i915 keeps it for this exact mode, so a whole-value
-    // write would clear a lane order the firmware declared.  Reading the
-    // register that was just written is §2.2's read-back discipline, and the
-    // poll is what establishes the device saw the enable.
-    rmw(
-        regs,
-        registers.ddi_buf_ctl,
-        DDI_BUF_CTL_OWNED,
-        plan.ddi_buf_ctl,
-    )?;
-    match poll(
-        regs,
-        registers.ddi_buf_ctl,
-        DDI_BUF_CTL_IS_IDLE,
-        0,
-        DDI_IDLE_TIMEOUT_US,
-    ) {
-        Some(true) => {}
-        Some(false) => {
-            return Err(OutputError::DdiNeverIdle {
-                ddi: plan.ddi,
-                register: registers.ddi_buf_ctl.name(),
-                readback: read(regs, registers.ddi_buf_ctl)?,
-                wrote: plan.ddi_buf_ctl,
-                timeout_us: DDI_IDLE_TIMEOUT_US,
-            });
-        }
-        None => {
-            return Err(OutputError::Unreadable {
-                register: registers.ddi_buf_ctl.name(),
-            });
-        }
+    // 5.7 -- preserve unowned board bits, then hand the DDI_BUF_CTL write,
+    // posting read and bounded IS_IDLE poll to the source helper. Its backend
+    // is restricted to this one typed buffer register.
+    let before_buffer = read(regs, registers.ddi_buf_ctl)?;
+    let buffer_value = (before_buffer & !DDI_BUF_CTL_OWNED) | plan.ddi_buf_ctl;
+    let source_port = match plan.ddi {
+        Ddi::A => intel_display::intel_ddi_full::Port::A,
+        Ddi::B => intel_display::intel_ddi_full::Port::B,
+        Ddi::C => intel_display::intel_ddi_full::Port::C,
+        Ddi::D => intel_display::intel_ddi_full::Port::D,
+    };
+    let source_output = match plan.port_type {
+        PortType::Hdmi => intel_display::intel_ddi_full::OutputType::Hdmi,
+        PortType::Dvi => intel_display::intel_ddi_full::OutputType::Dvi,
+    };
+    let source_encoder = intel_display::intel_ddi_full::DdiEncoder {
+        port: source_port,
+        output: source_output,
+        display: intel_display::intel_ddi_full::Platform {
+            display_ver: 13,
+            alderlake_p: true,
+            ..intel_display::intel_ddi_full::Platform::default()
+        },
+        ..intel_display::intel_ddi_full::DdiEncoder::default()
+    };
+    let mut source_io = DdiBufferEnableIo::new(regs, registers.ddi_buf_ctl);
+    intel_display::intel_ddi_full::intel_ddi_buf_enable(
+        &mut source_io,
+        &source_encoder,
+        buffer_value,
+    );
+    if source_io.read_failed {
+        return Err(OutputError::Unreadable {
+            register: registers.ddi_buf_ctl.name(),
+        });
+    }
+    if source_io.write_failed {
+        return Err(OutputError::WriteRefused {
+            register: registers.ddi_buf_ctl.name(),
+        });
+    }
+    let ddi_buf_ctl_readback = read(regs, registers.ddi_buf_ctl)?;
+    if source_io.timed_out || ddi_buf_ctl_readback & DDI_BUF_CTL_IS_IDLE != 0 {
+        return Err(OutputError::DdiNeverIdle {
+            ddi: plan.ddi,
+            register: registers.ddi_buf_ctl.name(),
+            readback: ddi_buf_ctl_readback,
+            wrote: buffer_value,
+            timeout_us: DDI_IDLE_TIMEOUT_US,
+        });
     }
     // ADL-P/N i915 enables the HDMI encoder before the CPU transcoder;
     // plane arm follows both. A stopped firmware pipe is mandatory at boot.
