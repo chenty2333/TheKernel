@@ -7,14 +7,13 @@
 //! call sites have no runtime side effects; these typed functions represent
 //! that configuration-selected header interface only.
 
-use crate::{
-    i915_gem_object_types_upstream::DrmI915GemObject,
-    intel_context_types_upstream::IntelContext,
-    linux_i915_private::DrmI915Private,
-    linux_config::CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS,
-};
 use core::ffi::c_ulong;
-use crate::intel_context_upstream::DmaFence;
+
+use crate::{
+    i915_gem_object_types_upstream::DrmI915GemObject, intel_context_types_upstream::IntelContext,
+    intel_context_upstream::DmaFence, intel_gtt_api_upstream::I915AddressSpace,
+    linux_config::CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS, linux_i915_private::DrmI915Private,
+};
 
 const _: () = assert!(!CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS);
 
@@ -53,6 +52,18 @@ pub fn trace_i915_gem_shrink(_i915: *mut DrmI915Private, _target: c_ulong, _shri
 
 /// Trace delivery is not enabled in this LinuxKPI configuration.
 #[inline]
-pub fn trace_i915_gem_object_fault(_obj: *mut DrmI915GemObject, _page: c_ulong, _gtt: bool, _write: bool) {}
+pub fn trace_i915_gem_object_fault(
+    _obj: *mut DrmI915GemObject,
+    _page: c_ulong,
+    _gtt: bool,
+    _write: bool,
+) {
+}
 #[inline]
 pub fn trace_i915_gem_object_clflush(_obj: *mut DrmI915GemObject) {}
+
+/// `i915_ppgtt_create` is a trace event from `i915_trace.h`; the configured
+/// TheKernel target has no i915 tracepoint sink, so this event compiles away.
+#[cfg(feature = "upstream-gt")]
+#[inline]
+pub fn trace_i915_ppgtt_create(_vm: *mut I915AddressSpace) {}

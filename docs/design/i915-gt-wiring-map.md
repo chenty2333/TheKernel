@@ -34,7 +34,7 @@
 | `gen11_irq_handler()` / display IRQ 分发 | `i915_irq.c` 本轮仅计划翻译 Gen11+ top-level 和 GT 分发；Rust callback 接口尚缺。当前 `kernel/src/drm/intel/irq.rs:526` `display_irq_handler()`、`:665` `dispatch()` 是**默认 display-only** 分发，不处理 GT/GuC CT。 | PCI INTx/MSI 和 display IRQ handler 是 kernel 实际 IRQ 路径；GT vector/共享 master enable 尚未交给 upstream-gt。display 分发必须由 callback 保留，不能在 GT 翻译里重复 ACK display 状态。 |
 | `gen11_gt_irq_handler()` / GT identity 分发 | **feature**：`intel_gt_irq_upstream.rs:399`（`intel_gt_irq.c`，21/21，已注册/编译/测试）；`:250` 的 `guc_irq_handler()`。当前 kernel 入口 `irq.rs` 未调用它。 | `linux/irq.rs:85` 的 `irq_work_queue()` 使用 axtask 延迟执行（产品实现、非 Linux softirq）；`linux/tasklet.rs:570` `tasklet_schedule()` 用持久 axtask worker（产品 task-context 近似，不是 host-only fake）；尚未接 GT 硬件 IRQ。 |
 | GT PM IRQ mask/reset | **feature**：`intel_gt_pm_irq_upstream.rs:24-116`（8/8）。没有 kernel 中断安装/dispatch caller。 | spinlock/IRQ-save 是 `kernel_guard` 产品实现，host 下 guard 为 NoOp；硬件 mask/ACK 仍需 kernel 提供唯一 owner。 |
-| GuC CT receive / `ct_receive()` / `ct_handle_msg()` | **缺少 `intel_guc_ct.c` source-order 模块**；当前 default `guc_ct.rs:353` `send_busy_loop()` 与 `gt/copy.rs` 的 CTB/G2H polling 仅支持受限同步消息。`intel_guc_ct_types_upstream.rs` 仅有布局/API owner，不是接收实现。 | `wait.rs` 基于 axtask sleep/wakeup（产品路径）；tasklet/workqueue 采用 task-context worker 适配；CTB IRQ handler/异步 G2H event caller 尚未接。 |
+| GuC CT receive / `ct_receive()` / `ct_handle_msg()` | **feature**：`intel_guc_ct_upstream.rs` (`intel_guc_ct.c`, 44/44)，source-order translation；default `guc_ct.rs:353` 仍是受限同步 `send_busy_loop()` owner，未切换调用者。 | `wait.rs` 基于 axtask sleep/wakeup（产品路径）；tasklet/workqueue 采用 task-context worker 适配；CTB IRQ handler/异步 G2H event caller 尚未接。 |
 | `intel_breadcrumbs` / fence completion | **无 upstream IRQ completion caller**。默认 N305 `gt/copy.rs:2443-2532` 消费 Gen12 CSB 与 HWS scratch，作为受限同步作业完成路径；不提升 Linux `i915_request`/timeline fences。 | atomic、wait queue 和 task wakeup 为产品代码；不构成 Linux RCU/softirq/fence scheduler 的等价证明。 |
 
 ## 3. 一次 execbuffer 提交
@@ -43,6 +43,7 @@
 |---|---|---|
 | `i915_gem_do_execbuffer()` | **feature 文件存在但未接入默认路径**：`i915_gem_execbuffer_upstream.rs:2696`（当前 86/90 标记；模块尚未注册）。默认入口为 `kernel/src/drm/intel/gem_exec.rs:422` `exec_with()` / `:442` `exec_request()`。 | user copy、GEM reservations、DMA pages、sync objects 当前由 kernel 产品对象路径实现；LinuxKPI dma-fence/GEM 完整 runtime 还未接到这些对象。 |
 | engine/context 选择与 pin | upstream 依赖 `intel_context_*`、`i915_vma_*`、`intel_engine_*` owner 模块；不代表已由 kernel exec ioctl 调用。默认实现由 `gem_context.rs:38-96` `engine_target()/image_engine()/vm()` 与 `gem_exec.rs:390-470` 选择。 | 内存、锁、wait queues 是 kernel 实现；feature 的 VMA/GEM owner 还没有连接到 `DrmFile` 和 kernel `GemObject`。 |
+| PPGTT page-table map/unmap | **feature**：`intel_ppgtt_upstream.rs` (`intel_ppgtt.c`, 18/18) 保留上游 PPGTT 操作；尚无默认 `GemVm`/kernel VM caller。 | 依赖 LinuxKPI page-table/DMA/GGTT owners；真实 GT VM allocation/binding 与 display aperture reservation 必须由 kernel owner 提供。 |
 | request 创建与 GuC 提交 | upstream `guc_submission_upstream.rs` 含 `intel_guc_submission_enable()`（`:4570`）及 submit helpers；默认软件契约是 `guc_submission.rs:542`，kernel N305 真正调用 `gt/copy.rs:1225` `submit_guc_context_request()`。 | CTB/MMIO、DMA、GT reset containment 为 N305 产品路径；功能限单个已支持 engine/context，不是 Linux 通用 request queue。 |
 | 完成与同步 | **upstream request/timeline fence 执行路径未与 kernel 接通**。默认 `gem_exec.rs:442` `exec_request()` 将 kernel fence/reservation/syncobj 生命周期接到 `gt.rs:672` `submit_user()`；GuC BCS 子路径轮询 HWS scratch + G2H event，见 `gt/copy.rs:2370-2532`。 | fence/reservation/syncobj 是 kernel 产品服务；workqueue/IRQ/tasklet 异步完成路径当前不参与 N305 exec ioctl。 |
 
@@ -90,10 +91,10 @@
 6. `intel_execlists_submission.c`：默认 `execlists.rs` 两端口/CSB polling 子集 ↔ feature `intel_execlists_submission_upstream.rs`。未切换完整 request queue/CSB IRQ state machine。
 7. `intel_wopcm.c`：默认 `wopcm.rs` Gen12 partition helper ↔ feature `intel_wopcm_upstream.rs`（10/10）。前者被当前 N305固件上传路径调用。
 8. `intel_huc.c`（pending）：默认 `huc.rs` Gen11+/GuC auth slice；完整 source-order 模块待补齐后须选择唯一运行 owner。
-9. `intel_guc_ct.c`（pending）：默认 `guc_ct.rs` 手写同步 CTB/HXG slice；当前 feature 只有 `intel_guc_ct_types_upstream.rs` ABI layout。完成翻译后必须二选一，或由一个 owner显式委托另一个。
+9. `intel_guc_ct.c`：默认 `guc_ct.rs` 手写同步 CTB/HXG slice ↔ feature `intel_guc_ct_upstream.rs` (44/44)；两个实现都不是对方的 runtime delegation，接线时必须二选一。
 10. `intel_guc_ads.c`（pending）：默认 `guc_ads.rs` 运行期 ABI builder；完整 source-order function module待补。未来 translation仅应作为验证/参考，不能成为第二个 ADS backing owner。
 
-**当前重复所有者条目：10 条**（7 条已有两个源代码 owner；3 条是待补模块后的 owner gate）。
+**当前重复所有者条目：10 条**（8 条已有两个源代码 owner；2 条是待补模块后的 owner gate）。
 
 ## 接线时 kernel 侧必须提供的接口点
 
