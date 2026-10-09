@@ -128,11 +128,12 @@
 //!   this module obtains neither.  It checks what section 11 phase 3.2
 //!   requires of them (4 KiB alignment for the address, a multiple of 64 for
 //!   the stride) and refuses the rest.
-//! * **Multi-pipe DBUF allocation and atomic watermark transitions.**  This
-//!   first-light-up path gives pipe A the whole DBUF and computes the active
-//!   primary-plane's levels, transition and SAGV values from the source PCode
-//!   latency tables. It does not yet partition DBUF or recompute a multi-pipe,
-//!   cursor, scaler, or async-flip atomic state.
+//! * **Hardware integration and atomic watermark transitions.**  The pure
+//!   [`plan_multi_plane_dbuf`] seam validates and partitions a simple
+//!   non-overlapping set of packed-RGB planes using the translated i915
+//!   watermark calculation. It is not connected to Native register writers,
+//!   does not model cursor/scaler/async-flip planes or multiple pipes, and is
+//!   not a claim of hardware support.
 //! * **`PLANE_KEYVAL`, `PLANE_KEYMSK`, `PLANE_KEYMAX`, `PLANE_AUX_DIST` and
 //!   `PLANE_AUX_OFFSET`.**  Section 5.6 names all five and gives none of them
 //!   an offset, so none is in the register table and none is invented here.
@@ -771,8 +772,9 @@ pub(crate) struct PlaneSurface {
 /// the full 12 bits of both fields, so block index 4095 fits and block 4096 is
 /// the first address past the buffer.
 ///
-/// The fields are private and [`Self::WHOLE_BUFFER`] is the only constructor,
-/// because that is the only allocation this bring-up makes: section 7.2's
+/// The fields are private; [`Self::WHOLE_BUFFER`] is used by first-light-up,
+/// while the checked range constructor is reserved for the pure DBUF planner:
+/// section 7.2's
 /// "[INF] This is the *safe maximum*: the one plane owns the entire DBUF.  It
 /// is not what a production driver does (it wastes power), but it cannot
 /// under-allocate.  For a first light-up, take it."
@@ -789,6 +791,14 @@ impl DdbAllocation {
         start: 0,
         end: DDB_BLOCKS,
     };
+
+    /// Make a half-open allocation after checking it fits the display buffer.
+    fn checked(start: u32, end: u32) -> Result<Self, PipeError> {
+        if start >= end || end > DDB_BLOCKS {
+            return Err(PipeError::DdbAllocationOutOfBounds { start, end });
+        }
+        Ok(Self { start, end })
+    }
 
     /// The first block the plane owns, inclusive.
     pub(crate) const fn start(self) -> u32 {
@@ -924,9 +934,35 @@ impl WatermarkProgram {
         config: WatermarkConfig,
         pixel_format: u32,
     ) -> Result<Self, PipeError> {
+        Self::from_i915_plane(
+            ddb,
+            mode,
+            config,
+            pixel_format,
+            0,
+            u32::from(mode.hdisplay),
+            mode.clock_khz,
+        )
+        .map(|(program, _)| program)
+    }
+
+    /// Build one packed-RGB plane's source watermark state. The caller owns
+    /// plane-index validation and any DDB partitioning across planes.
+    fn from_i915_plane(
+        ddb: DdbAllocation,
+        mode: &Mode,
+        config: WatermarkConfig,
+        pixel_format: u32,
+        plane_index: usize,
+        width: u32,
+        pixel_rate: u32,
+    ) -> Result<(Self, u32), PipeError> {
         use intel_display::skl_watermark_full as wm;
 
         let cpp = pixel_format_cpp(pixel_format)?;
+        if plane_index >= wm::PLANES || width == 0 || pixel_rate == 0 {
+            return Err(PipeError::Watermark(-22));
+        }
 
         let display = wm::DisplayCaps {
             display_ver: config.display_ver,
@@ -938,9 +974,9 @@ impl WatermarkProgram {
             ..wm::DisplayCaps::default()
         };
         let input = wm::PlaneWmInput {
-            width: u32::from(mode.hdisplay),
+            width,
             cpp: cpp as u8,
-            pixel_rate: mode.clock_khz,
+            pixel_rate,
             pipe_htotal: u32::from(mode.htotal),
             num_format_planes: 1,
             visible: true,
@@ -950,7 +986,7 @@ impl WatermarkProgram {
         wm::skl_build_plane_wm_single(
             &display,
             &input,
-            0,
+            plane_index,
             0,
             config.num_levels.min(wm::WM_LEVELS),
             &config.latencies,
@@ -960,6 +996,24 @@ impl WatermarkProgram {
             &mut source,
         )
         .map_err(PipeError::Watermark)?;
+
+        // Retain every configured level plus transition/SAGV minimum. This
+        // conservative minimum-only policy intentionally does not reproduce
+        // i915's data-rate-weighted spare-block distribution or level fallback.
+        let mut minimum = 0u32;
+        for level in source
+            .levels
+            .iter()
+            .take(config.num_levels.min(wm::WM_LEVELS))
+        {
+            minimum = minimum.max(u32::from(level.min_ddb_alloc));
+        }
+        for level in [source.trans_wm, source.sagv_wm0, source.sagv_trans_wm] {
+            minimum = minimum.max(u32::from(level.min_ddb_alloc));
+        }
+        if minimum == u32::from(u16::MAX) {
+            return Err(PipeError::Watermark(-22));
+        }
 
         let source_ddb = wm::DdbEntry {
             start: u16::try_from(ddb.start).map_err(|_| PipeError::Watermark(-22))?,
@@ -987,12 +1041,15 @@ impl WatermarkProgram {
         for (target, source) in levels.iter_mut().zip(source.levels) {
             *target = convert(source)?;
         }
-        Ok(Self {
-            levels,
-            transition: convert(source.trans_wm)?,
-            sagv: convert(source.sagv_wm0)?,
-            sagv_transition: convert(source.sagv_trans_wm)?,
-        })
+        Ok((
+            Self {
+                levels,
+                transition: convert(source.trans_wm)?,
+                sagv: convert(source.sagv_wm0)?,
+                sagv_transition: convert(source.sagv_trans_wm)?,
+            },
+            minimum,
+        ))
     }
 }
 
@@ -1097,6 +1154,213 @@ impl PlaneProgram {
         }
         Ok(units)
     }
+}
+
+/// A visible, unscaled packed-RGB plane candidate for pure DBUF planning.
+///
+/// `source_width/height` describe the complete linear framebuffer image;
+/// `dst_*` describe its unscaled destination rectangle on the mode.
+/// `allocation_bytes` is the backing framebuffer size, so the seam can reject
+/// a stride/extent that scans beyond it. `plane_index` is the translated i915
+/// watermark model's plane index (0..`skl_watermark_full::PLANES`), not a
+/// Native register address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlaneScanout {
+    pub(crate) plane_index: usize,
+    pub(crate) surface: PlaneSurface,
+    pub(crate) allocation_bytes: u64,
+    pub(crate) pixel_format: u32,
+    pub(crate) source_width: u32,
+    pub(crate) source_height: u32,
+    pub(crate) dst_x: u32,
+    pub(crate) dst_y: u32,
+    pub(crate) dst_width: u32,
+    pub(crate) dst_height: u32,
+}
+
+/// One validated plane's allocated DBUF range and translated watermark values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlannedPlaneDdb {
+    pub(crate) plane_index: usize,
+    pub(crate) ddb: DdbAllocation,
+    pub(crate) watermark: WatermarkProgram,
+}
+
+/// A pure, conservative minimum-allocation DBUF plan.
+///
+/// This is only an input to future atomic-state integration. It contains no
+/// MMIO operations, does not program plane registers, and is not proof that
+/// the selected topology is supported by the Native KMS writer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MultiPlaneDdbPlan {
+    pub(crate) planes: Vec<PlannedPlaneDdb>,
+    pub(crate) unused_blocks: u32,
+}
+
+/// Validate and size non-overlapping, unscaled packed-RGB surfaces using the
+/// translated i915 single-plane watermark helper and its DDB minimums.
+///
+/// Only the existing XRGB8888/RGB565 linear encodings are accepted;
+/// cursor/planar formats, scaling, clipping, overlap, and rectangles outside
+/// the active mode are rejected. Plane pixel-rate inputs conservatively use
+/// the full mode clock for each visible plane. The planner allocates each
+/// plane its maximum source watermark minimum, leaving any spare DBUF unused
+/// instead of guessing an optimization. It performs no register access.
+pub(crate) fn plan_multi_plane_dbuf(
+    mode: &Mode,
+    scanouts: &[PlaneScanout],
+    config: WatermarkConfig,
+) -> Result<MultiPlaneDdbPlan, PipeError> {
+    use intel_display::skl_watermark_full as wm;
+
+    if scanouts.is_empty() {
+        return Err(PipeError::NoVisiblePlanes);
+    }
+    let _ = timing::timing_registers(mode)?;
+
+    let mut seen = [false; wm::PLANES];
+    let mut requirements = Vec::with_capacity(scanouts.len());
+    for (index, scanout) in scanouts.iter().enumerate() {
+        if scanout.plane_index >= wm::PLANES {
+            return Err(PipeError::PlaneIndexOutOfRange {
+                plane_index: scanout.plane_index,
+            });
+        }
+        if core::mem::replace(&mut seen[scanout.plane_index], true) {
+            return Err(PipeError::DuplicatePlaneIndex {
+                plane_index: scanout.plane_index,
+            });
+        }
+        if scanout.dst_width == 0
+            || scanout.dst_height == 0
+            || scanout.source_width == 0
+            || scanout.source_height == 0
+        {
+            return Err(PipeError::EmptyPlaneRect {
+                plane_index: scanout.plane_index,
+            });
+        }
+        let right = scanout.dst_x.checked_add(scanout.dst_width).ok_or(
+            PipeError::PlaneRectOutOfBounds {
+                plane_index: scanout.plane_index,
+            },
+        )?;
+        let bottom = scanout.dst_y.checked_add(scanout.dst_height).ok_or(
+            PipeError::PlaneRectOutOfBounds {
+                plane_index: scanout.plane_index,
+            },
+        )?;
+        if right > u32::from(mode.hdisplay) || bottom > u32::from(mode.vdisplay) {
+            return Err(PipeError::PlaneRectOutOfBounds {
+                plane_index: scanout.plane_index,
+            });
+        }
+        if scanout.source_width != scanout.dst_width || scanout.source_height != scanout.dst_height
+        {
+            return Err(PipeError::PlaneScalingUnsupported {
+                plane_index: scanout.plane_index,
+            });
+        }
+        let cpp = pixel_format_cpp(scanout.pixel_format)?;
+        let row_bytes = u64::from(scanout.source_width)
+            .checked_mul(u64::from(cpp))
+            .ok_or(PipeError::FramebufferExtentInvalid {
+                plane_index: scanout.plane_index,
+            })?;
+        if u64::from(scanout.surface.stride_bytes) < row_bytes {
+            return Err(PipeError::FramebufferStrideTooShort {
+                plane_index: scanout.plane_index,
+            });
+        }
+        let required_bytes = u64::from(scanout.source_height - 1)
+            .checked_mul(u64::from(scanout.surface.stride_bytes))
+            .and_then(|bytes| bytes.checked_add(row_bytes))
+            .ok_or(PipeError::FramebufferExtentInvalid {
+                plane_index: scanout.plane_index,
+            })?;
+        if required_bytes > scanout.allocation_bytes {
+            return Err(PipeError::FramebufferAllocationTooSmall {
+                plane_index: scanout.plane_index,
+                required_bytes,
+                allocation_bytes: scanout.allocation_bytes,
+            });
+        }
+        // Reuse the established Native surface checks; this is validation only
+        // and performs no hardware access.
+        let _ = PlaneProgram::stride_field(scanout.surface.stride_bytes)?;
+        let _ = PlaneProgram::surface_field(scanout.surface.ggtt_address)?;
+
+        for previous in &scanouts[..index] {
+            let previous_right = previous.dst_x + previous.dst_width;
+            let previous_bottom = previous.dst_y + previous.dst_height;
+            if scanout.dst_x < previous_right
+                && previous.dst_x < right
+                && scanout.dst_y < previous_bottom
+                && previous.dst_y < bottom
+            {
+                return Err(PipeError::PlaneRectOverlap {
+                    first: previous.plane_index,
+                    second: scanout.plane_index,
+                });
+            }
+        }
+
+        let (_, minimum) = WatermarkProgram::from_i915_plane(
+            DdbAllocation::WHOLE_BUFFER,
+            mode,
+            config,
+            scanout.pixel_format,
+            scanout.plane_index,
+            scanout.source_width,
+            mode.clock_khz,
+        )?;
+        if minimum == 0 {
+            return Err(PipeError::PlaneDdbMinimumZero {
+                plane_index: scanout.plane_index,
+            });
+        }
+        requirements.push((minimum, scanout.plane_index));
+    }
+
+    let required_blocks = requirements
+        .iter()
+        .try_fold(0u32, |sum, (blocks, _)| sum.checked_add(*blocks))
+        .ok_or(PipeError::DdbRequirementsOverflow)?;
+    if required_blocks > DDB_BLOCKS {
+        return Err(PipeError::DdbInsufficient {
+            required_blocks,
+            available_blocks: DDB_BLOCKS,
+        });
+    }
+
+    let mut plans = Vec::with_capacity(scanouts.len());
+    let mut start = 0u32;
+    for (scanout, (blocks, plane_index)) in scanouts.iter().zip(requirements) {
+        debug_assert_eq!(scanout.plane_index, plane_index);
+        let end = start
+            .checked_add(blocks)
+            .ok_or(PipeError::DdbRequirementsOverflow)?;
+        let ddb = DdbAllocation::checked(start, end)?;
+        let (watermark, _) = WatermarkProgram::from_i915_plane(
+            ddb,
+            mode,
+            config,
+            scanout.pixel_format,
+            scanout.plane_index,
+            scanout.source_width,
+            mode.clock_khz,
+        )?;
+        plans.push(PlannedPlaneDdb {
+            plane_index: scanout.plane_index,
+            ddb,
+            watermark,
+        });
+        start = end;
+    }
+    Ok(MultiPlaneDdbPlan {
+        planes: plans,
+        unused_blocks: DDB_BLOCKS - start,
+    })
 }
 
 /// Everything phase 3.4 and phase 4 write, computed before anything is written.
@@ -1569,6 +1833,41 @@ pub(crate) enum PipeError {
     Timing(timing::TimingError),
     /// Source-derived latency watermarks could not be calculated for this DDB.
     Watermark(i32),
+    /// There is no visible plane to plan.
+    NoVisiblePlanes,
+    /// The plane index does not exist in the translated watermark model.
+    PlaneIndexOutOfRange { plane_index: usize },
+    /// Two candidates claim one hardware-plane slot.
+    DuplicatePlaneIndex { plane_index: usize },
+    /// A visible source or destination rectangle has zero extent.
+    EmptyPlaneRect { plane_index: usize },
+    /// The destination rectangle overflows or extends past the active mode.
+    PlaneRectOutOfBounds { plane_index: usize },
+    /// Two destination rectangles overlap; this seam does not model z-order.
+    PlaneRectOverlap { first: usize, second: usize },
+    /// The planner admits no scaling or implicit source crop.
+    PlaneScalingUnsupported { plane_index: usize },
+    /// The source surface's stride cannot hold one packed-RGB row.
+    FramebufferStrideTooShort { plane_index: usize },
+    /// Calculating the last visible byte overflowed.
+    FramebufferExtentInvalid { plane_index: usize },
+    /// The declared framebuffer allocation ends before the scanout extent.
+    FramebufferAllocationTooSmall {
+        plane_index: usize,
+        required_bytes: u64,
+        allocation_bytes: u64,
+    },
+    /// Source policy returned no minimum allocation for a visible plane.
+    PlaneDdbMinimumZero { plane_index: usize },
+    /// The summed per-plane minimum allocations overflowed their counter.
+    DdbRequirementsOverflow,
+    /// The planes' minimum watermarks do not fit the display buffer.
+    DdbInsufficient {
+        required_blocks: u32,
+        available_blocks: u32,
+    },
+    /// A planner-generated DDB range is empty or outside the display buffer.
+    DdbAllocationOutOfBounds { start: u32, end: u32 },
     /// The surface stride was zero.
     StrideZero,
     /// The stride is not a multiple of [`PLANE_STRIDE_UNIT_BYTES`], which
@@ -1615,6 +1914,65 @@ impl PipeError {
                 "i915 primary-plane watermark calculation failed with errno {errno}; the plane is \
                  not armed"
             ),
+            Self::NoVisiblePlanes => String::from(
+                "the DBUF planner needs at least one visible plane; no empty atomic state is \
+                 inferred",
+            ),
+            Self::PlaneIndexOutOfRange { plane_index } => format!(
+                "plane index {plane_index} is outside the translated i915 watermark model; no \
+                 allocation is produced"
+            ),
+            Self::DuplicatePlaneIndex { plane_index } => format!(
+                "plane index {plane_index} appears more than once; one DDB range cannot describe \
+                 two plane states"
+            ),
+            Self::EmptyPlaneRect { plane_index } => {
+                format!("plane {plane_index} has an empty source or destination rectangle")
+            }
+            Self::PlaneRectOutOfBounds { plane_index } => format!(
+                "plane {plane_index}'s destination rectangle overflows or extends beyond the \
+                 active mode"
+            ),
+            Self::PlaneRectOverlap { first, second } => format!(
+                "planes {first} and {second} have overlapping destination rectangles; this \
+                 planner does not guess z-order or blend semantics"
+            ),
+            Self::PlaneScalingUnsupported { plane_index } => format!(
+                "plane {plane_index} requests scaling or source crop, neither of which this \
+                 linear packed-RGB planner models"
+            ),
+            Self::FramebufferStrideTooShort { plane_index } => format!(
+                "plane {plane_index}'s framebuffer stride is shorter than its packed-RGB row"
+            ),
+            Self::FramebufferExtentInvalid { plane_index } => format!(
+                "plane {plane_index}'s framebuffer scanout extent overflowed; no allocation is \
+                 produced"
+            ),
+            Self::FramebufferAllocationTooSmall {
+                plane_index,
+                required_bytes,
+                allocation_bytes,
+            } => format!(
+                "plane {plane_index} needs {required_bytes} bytes for its declared scanout \
+                 extent, but the framebuffer allocation is {allocation_bytes} bytes"
+            ),
+            Self::PlaneDdbMinimumZero { plane_index } => format!(
+                "plane {plane_index}'s translated watermark state has no nonzero minimum DBUF \
+                 allocation; planner refuses an empty range"
+            ),
+            Self::DdbRequirementsOverflow => String::from(
+                "the summed per-plane DBUF minimums overflowed; no wrapped allocation is used",
+            ),
+            Self::DdbInsufficient {
+                required_blocks,
+                available_blocks,
+            } => format!(
+                "visible planes require {required_blocks} DBUF blocks for all calculated \
+                 watermarks, but only {available_blocks} blocks exist"
+            ),
+            Self::DdbAllocationOutOfBounds { start, end } => {
+                format!("planner DBUF range [{start}, {end}) is empty or outside [0, {DDB_BLOCKS})")
+            }
             Self::StrideZero => String::from(
                 "the surface stride is zero, which describes no scanline at all.  Reference \
                  section 11 phase 3.2: the stride is the framebuffer's pitch in bytes and must be \
@@ -1848,6 +2206,137 @@ pub(crate) fn arm(regs: &impl Registers, plan: &PipeProgram) -> Result<ArmState,
         pipe: plan.pipe,
         writes,
     })
+}
+
+#[cfg(test)]
+mod multi_plane_plan_tests {
+    use super::*;
+    use crate::drm::modes::CTA_VIC_TIMINGS;
+
+    fn mode_1080p() -> Mode {
+        CTA_VIC_TIMINGS
+            .iter()
+            .find(|entry| entry.vic == 16)
+            .expect("VIC 16 exists in the CTA timing table")
+            .mode
+    }
+
+    fn config() -> WatermarkConfig {
+        WatermarkConfig {
+            display_ver: 13,
+            latencies: [2, 4, 6, 8, 14, 16, 0, 0],
+            num_levels: 6,
+            sagv_block_time_us: 0,
+        }
+    }
+
+    fn half_screen(plane_index: usize, dst_x: u32, ggtt_address: u64) -> PlaneScanout {
+        PlaneScanout {
+            plane_index,
+            surface: PlaneSurface {
+                ggtt_address,
+                stride_bytes: 1920,
+            },
+            allocation_bytes: 1920 * 1080,
+            pixel_format: intel_display::universal_plane::RGB565,
+            source_width: 960,
+            source_height: 1080,
+            dst_x,
+            dst_y: 0,
+            dst_width: 960,
+            dst_height: 1080,
+        }
+    }
+
+    #[test]
+    fn plans_two_disjoint_rgb565_planes_with_nonoverlapping_ddb_ranges() {
+        let mode = mode_1080p();
+        let plan = plan_multi_plane_dbuf(
+            &mode,
+            &[
+                half_screen(0, 0, 0x0100_0000),
+                half_screen(1, 960, 0x0200_0000),
+            ],
+            config(),
+        )
+        .expect("simple disjoint packed RGB plane set should be plannable");
+
+        assert_eq!(plan.planes.len(), 2);
+        assert_eq!(plan.planes[0].ddb.start(), 0);
+        assert_eq!(plan.planes[0].ddb.end(), plan.planes[1].ddb.start());
+        assert_eq!(plan.planes[1].ddb.end() + plan.unused_blocks, DDB_BLOCKS);
+        assert!(
+            plan.planes
+                .iter()
+                .all(|plane| plane.watermark.levels()[0].is_enabled())
+        );
+    }
+
+    #[test]
+    fn refuses_overlapping_or_out_of_bounds_plane_rectangles() {
+        let mode = mode_1080p();
+        let overlap = [
+            half_screen(0, 0, 0x0100_0000),
+            half_screen(1, 900, 0x0200_0000),
+        ];
+        assert_eq!(
+            plan_multi_plane_dbuf(&mode, &overlap, config()),
+            Err(PipeError::PlaneRectOverlap {
+                first: 0,
+                second: 1
+            })
+        );
+
+        let mut out_of_bounds = half_screen(0, 960, 0x0100_0000);
+        out_of_bounds.dst_width = 961;
+        assert_eq!(
+            plan_multi_plane_dbuf(&mode, &[out_of_bounds], config()),
+            Err(PipeError::PlaneRectOutOfBounds { plane_index: 0 })
+        );
+    }
+
+    #[test]
+    fn refuses_duplicate_plane_indices_and_unsupported_formats() {
+        let mode = mode_1080p();
+        assert_eq!(
+            plan_multi_plane_dbuf(
+                &mode,
+                &[
+                    half_screen(0, 0, 0x0100_0000),
+                    half_screen(0, 960, 0x0200_0000),
+                ],
+                config(),
+            ),
+            Err(PipeError::DuplicatePlaneIndex { plane_index: 0 })
+        );
+
+        let mut unsupported = half_screen(0, 0, 0x0100_0000);
+        unsupported.pixel_format = 0x3231564e; // NV12 is not admitted.
+        assert_eq!(
+            plan_multi_plane_dbuf(&mode, &[unsupported], config()),
+            Err(PipeError::UnsupportedFormat {
+                pixel_format: unsupported.pixel_format
+            })
+        );
+    }
+
+    #[test]
+    fn refuses_short_backing_allocation_and_scaling() {
+        let mode = mode_1080p();
+        let mut undersized = half_screen(0, 0, 0x0100_0000);
+        undersized.allocation_bytes -= 1;
+        assert!(matches!(
+            plan_multi_plane_dbuf(&mode, &[undersized], config()),
+            Err(PipeError::FramebufferAllocationTooSmall { .. })
+        ));
+
+        let mut scaled = half_screen(0, 0, 0x0100_0000);
+        scaled.dst_width = 959;
+        assert_eq!(
+            plan_multi_plane_dbuf(&mode, &[scaled], config()),
+            Err(PipeError::PlaneScalingUnsupported { plane_index: 0 })
+        );
+    }
 }
 
 mod checks;
