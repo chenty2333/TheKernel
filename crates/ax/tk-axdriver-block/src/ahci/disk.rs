@@ -927,7 +927,7 @@ impl<I: AhciIo> AhciDisk<I> {
                 let log = self.workspace().bounce.cpu.as_ptr();
                 // SAFETY: READ LOG EXT completed and DMA is quiescent.
                 let status = unsafe { ptr::read_volatile(log) };
-                return ncq_error_log_tag(status);
+                return ahci_process_read_log(status);
             }
             self.wait_for_progress(observed);
         }
@@ -2021,8 +2021,8 @@ fn map_error(error: AhciDiskError) -> DevError {
     }
 }
 
-// upstream: ahci.c ahci_process_read_log() NQ bit and failing NCQ tag
-const fn ncq_error_log_tag(status: u8) -> Option<u8> {
+// upstream: ahci.c ahci_process_read_log()
+const fn ahci_process_read_log(status: u8) -> Option<u8> {
     if status & 0x80 == 0 {
         Some(status & 0x1f)
     } else {
@@ -2163,9 +2163,9 @@ mod tests {
     }
 
     #[test]
-    fn ncq_error_log_tag_obeys_nq_flag_and_tag_mask() {
-        assert_eq!(ncq_error_log_tag(0x65), Some(5));
-        assert_eq!(ncq_error_log_tag(0x85), None);
+    fn ahci_process_read_log_obeys_nq_flag_and_tag_mask() {
+        assert_eq!(ahci_process_read_log(0x65), Some(5));
+        assert_eq!(ahci_process_read_log(0x85), None);
     }
 
     #[test]

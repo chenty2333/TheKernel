@@ -85,3 +85,8 @@ The controller-error path is named `ahci_issue_recovery()`: NCQ failures attempt
 READ LOG EXT and capture the failing tag before reset. The current block layer
 reports typed errors for the affected submitted batch; it does not reproduce
 CAM's held CCB sense/retry queue.
+
+`ahci_process_read_log()` now names the NQ/tag decode of READ LOG EXT status;
+NCQ recovery consumes the failing tag before port reset, but all pending block
+members in the errored hardware batch are failed together rather than CAM's
+single-victim requeue protocol.
