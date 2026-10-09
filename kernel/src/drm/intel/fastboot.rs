@@ -788,6 +788,174 @@ fn translated_tc_dpll_target<R: Registers, T: PollTimer>(
     }
 }
 
+/// Supply the captured N305 Pipe-A/HDMI image to the translated display-12/13
+/// modeset verifier. Source warnings become a transaction failure here because
+/// a post-program mismatch must trigger the existing verified rollback path.
+struct NativeModesetVerify<'a> {
+    firmware: &'a Firmware,
+    port: TcPort,
+    connected: bool,
+    failure: Option<String>,
+}
+
+impl NativeModesetVerify<'_> {
+    fn warn(&mut self, condition: bool, format: &'static str, values: &[i64]) {
+        if condition && self.failure.is_none() {
+            self.failure = Some(alloc::format!("{format} {values:?}"));
+        }
+    }
+}
+
+impl intel_display::intel_modeset_verify_full::ModesetVerifyIo for NativeModesetVerify<'_> {
+    fn display_state_warn(
+        &mut self,
+        _display: &intel_display::intel_modeset_verify_full::Display,
+        condition: bool,
+        format: &'static str,
+        values: &[i64],
+    ) {
+        self.warn(condition, format, values);
+    }
+
+    fn drm_warn(&mut self, _drm: u32, condition: bool, format: &'static str, values: &[i64]) {
+        self.warn(condition, format, values);
+    }
+
+    fn connector_get_hw_state(
+        &mut self,
+        _connector: &intel_display::intel_modeset_verify_full::Connector,
+    ) -> bool {
+        self.connected && self.firmware.ddi.enabled
+    }
+
+    fn attached_encoder(
+        &mut self,
+        _connector: &intel_display::intel_modeset_verify_full::Connector,
+    ) -> Option<u32> {
+        (self.firmware.ddi.enabled
+            && self.firmware.ddi.port
+                == Some(match self.port {
+                    TcPort::Tc1 => Port::Tc1,
+                    TcPort::Tc2 => Port::Tc2,
+                    TcPort::Tc3 => Port::Tc3,
+                    TcPort::Tc4 => Port::Tc4,
+                })
+            && self.firmware.ddi.mode == intel_display::ddi::DdiMode::Hdmi)
+            .then_some(1)
+    }
+
+    fn encoder_get_hw_state(
+        &mut self,
+        _encoder: &intel_display::intel_modeset_verify_full::Encoder,
+    ) -> (bool, intel_display::intel_modeset_verify_full::Pipe) {
+        (
+            self.connected && self.firmware.ddi.enabled,
+            intel_display::intel_modeset_verify_full::Pipe::A,
+        )
+    }
+
+    fn alloc_crtc_state(
+        &mut self,
+        _crtc: &intel_display::intel_modeset_verify_full::Crtc,
+    ) -> Option<intel_display::intel_modeset_verify_full::CrtcState> {
+        Some(intel_display::intel_modeset_verify_full::CrtcState::default())
+    }
+
+    fn get_pipe_config(&mut self, state: &mut intel_display::intel_modeset_verify_full::CrtcState) {
+        state.hw.active = self.firmware.pipe.transconf & (1 << 31) != 0;
+        state.hw.adjusted_mode_crtc_clock = self.firmware.pixel_clock as i32;
+    }
+
+    fn encoder_get_config(
+        &mut self,
+        _encoder: &intel_display::intel_modeset_verify_full::Encoder,
+        state: &mut intel_display::intel_modeset_verify_full::CrtcState,
+    ) {
+        state.hw.adjusted_mode_crtc_clock = self.firmware.pixel_clock as i32;
+    }
+
+    fn pipe_config_compare(
+        &mut self,
+        software: &intel_display::intel_modeset_verify_full::CrtcState,
+        hardware: &intel_display::intel_modeset_verify_full::CrtcState,
+        _fastset: bool,
+    ) -> bool {
+        software.hw.active == hardware.hw.active
+            && software.hw.adjusted_mode_crtc_clock == hardware.hw.adjusted_mode_crtc_clock
+    }
+}
+
+fn verify_translated_crtc_state(
+    firmware: &Firmware,
+    port: TcPort,
+    connected: bool,
+    target_clock_khz: u32,
+) -> Result<(), String> {
+    use intel_display::intel_modeset_verify_full as verify;
+
+    if !connected || !firmware.ddi.enabled || target_clock_khz > i32::MAX as u32 {
+        return Err(String::from(
+            "source modeset verifier received inactive or invalid Pipe-A state",
+        ));
+    }
+    let connector = verify::Connector {
+        id: 1,
+        name: "HDMI-A",
+        encoder: Some(1),
+    };
+    let encoder = verify::Encoder {
+        id: 1,
+        name: "TC HDMI",
+        crtc: Some(1),
+        encoder_type: verify::EncoderType::Other,
+    };
+    let crtc = verify::Crtc {
+        id: 1,
+        name: "Pipe A",
+        pipe: verify::Pipe::A,
+        active: true,
+    };
+    let state = verify::IntelAtomicState {
+        display: verify::Display {
+            drm_id: 1,
+            i830: false,
+        },
+        connectors: alloc::vec![verify::ConnectorChange {
+            connector,
+            old_state: verify::ConnectorState {
+                crtc: Some(1),
+                best_encoder: Some(1)
+            },
+            new_state: verify::ConnectorState {
+                crtc: Some(1),
+                best_encoder: Some(1)
+            },
+        }],
+        encoders: alloc::vec![encoder],
+        crtcs: alloc::vec![verify::CrtcChange {
+            crtc: crtc.clone(),
+            new_state: verify::CrtcState {
+                hw: verify::CrtcHwState {
+                    active: true,
+                    enable: true,
+                    adjusted_mode_crtc_clock: target_clock_khz as i32,
+                },
+                needs_modeset: true,
+                primary_crtc_id: 1,
+                ..verify::CrtcState::default()
+            },
+        }],
+    };
+    let mut io = NativeModesetVerify {
+        firmware,
+        port,
+        connected,
+        failure: None,
+    };
+    verify::intel_modeset_verify_crtc(&mut io, &state, &crtc);
+    io.failure.map_or(Ok(()), Err)
+}
+
 /// Debounce task-context DDC samples and report the physical connector state
 /// independently of whether the audio owner could retire or publish its HDA
 /// route. Audio errors are retained for diagnostics, not used to hide a
@@ -1657,6 +1825,12 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                     let next_state =
                         capture(&self.registers, &self.power, self.port, self.afc_startup)
                             .map_err(|e| format!("TC modeset readback failed: {e:?}"))?;
+                    verify_translated_crtc_state(
+                        &next_state,
+                        self.port,
+                        state.connected,
+                        target.timing.clock_khz,
+                    )?;
                     let (manager_pll_on, manager_state) = translated_tc_dpll_readout(self)?;
                     if manager_pll_on != (next_state.pll.enable != 0)
                         || !super::shared_dpll::dkl_state_matches_source_readout(
@@ -2269,6 +2443,40 @@ mod tests {
         assert_eq!(
             adapter.primary_formats(),
             &[intel_display::universal_plane::XRGB8888]
+        );
+    }
+
+    #[test]
+    fn translated_modeset_verifier_checks_pipe_and_connector_image() {
+        let (adapter, ..) = native();
+        verify_translated_crtc_state(
+            &adapter.baseline,
+            TcPort::Tc1,
+            true,
+            adapter.baseline.pixel_clock,
+        )
+        .unwrap();
+
+        let mut wrong_port = adapter.baseline.clone();
+        wrong_port.ddi.port = Some(Port::Tc2);
+        assert!(
+            verify_translated_crtc_state(
+                &wrong_port,
+                TcPort::Tc1,
+                true,
+                adapter.baseline.pixel_clock,
+            )
+            .is_err()
+        );
+
+        assert!(
+            verify_translated_crtc_state(
+                &adapter.baseline,
+                TcPort::Tc1,
+                true,
+                adapter.baseline.pixel_clock + 1,
+            )
+            .is_err()
         );
     }
 
