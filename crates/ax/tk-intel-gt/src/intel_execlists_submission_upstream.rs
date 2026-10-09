@@ -3722,7 +3722,7 @@ unsafe fn rcs_submission_override(engine: *mut IntelEngineCs) {
 }
 
 // upstream: intel_execlists_submission.c intel_execlists_submission_setup()
-pub(crate) unsafe fn intel_execlists_submission_setup(engine: *mut IntelEngineCs) -> i32 {
+pub(crate) unsafe extern "C" fn intel_execlists_submission_setup(engine: *mut IntelEngineCs) -> i32 {
     let execlists = &mut (*engine).execlists;
     let i915 = (*engine).i915;
     let uncore = (*engine).uncore;
