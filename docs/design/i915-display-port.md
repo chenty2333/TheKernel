@@ -61,3 +61,23 @@ Replacement will proceed behind this queue boundary, maintaining one serialized 
 5. Acquire/release map-backed power domains around those phases, then enable DC transitions only with their observers and delayed puts. Run the translated commit tail only when every action emitted for this supported state has a real adapter; remove the matching legacy phase in the same change.
 
 Each phase is a separate commit with focused host/kernel compile checks. The old TC transaction remains the rollback owner until an equivalent translated sequence passes full register-image and failure-injection tests; no preflight or no-op callback counts as activation. Current phase status is tracked in `progress-G1.md`.
+
+### Legacy selection and fallback gate
+
+The planned `intel.legacy_tc_modeset=1` switch selects the existing TC transaction;
+absence of the parameter selects the generic path only after that path has a
+real adapter for every emitted operation. The legacy transaction remains built
+as an explicit fallback. A failed generic transaction may retry through legacy
+only after generic rollback has verified the complete old register/resource
+image (including DPLL, CDCLK, power-domain references, pipe/plane and WM state)
+and has retired any candidate scanout binding. A pre-write failure may fall
+back because hardware is unchanged. If rollback is incomplete or uncertain,
+quarantine/lost-device handling takes precedence: do not run another modeset
+against unknown hardware or DMA ownership. This gate prevents fallback from
+turning a partially applied generic commit into a second uncoordinated writer.
+
+As of this plan update, `ModesetOps` remains hook-driven and has no complete
+Native hardware adapter; the current TC transaction cannot be substituted by
+mapping already-owned actions to no-ops. Therefore the selection parameter and
+default-path switch are deliberately not activated until the generic callbacks
+and their common rollback journal exist.
