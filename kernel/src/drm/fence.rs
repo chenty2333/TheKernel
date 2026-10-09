@@ -68,6 +68,16 @@ impl Reservation {
         self.exclusive.lock().replace(fence)
     }
 
+    /// Add an external synchronization dependency without discarding a
+    /// dependency already owned by this reservation. Unlike `replace`, this
+    /// does not wait: future implicit consumers wait for both fence leaves.
+    pub fn append(&self, fence: Arc<Fence>) -> AxResult<()> {
+        let mut reservations = [(self, true)];
+        let predecessors = Self::replace_many_with_async(&mut reservations, fence)?;
+        debug_assert!(predecessors.is_empty());
+        Ok(())
+    }
+
     /// Install the initial resource-ready dependency. Resource construction
     /// has no predecessor; later GPU/KMS submissions use `replace_many`.
     pub fn publish(&self, fence: Arc<Fence>) {
