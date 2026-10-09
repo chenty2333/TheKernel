@@ -2005,6 +2005,16 @@ Intel Corporation), preserving page-allocation fallback and SG/object cleanup.
 `drivers/gpu/drm/i915/gem/i915_gem_wait.c` (MIT, Copyright © 2016 Intel
 Corporation), including request prioritization and reservation wait order.
 
+`i915_gem_create_upstream.rs` translates all 13 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gem/i915_gem_create.c` (MIT, Copyright © 2020 Intel
+Corporation), preserving placement selection, user-extension validation, and
+GEM handle publication/error order.
+
+`i915_gem_throttle_upstream.rs` translates the sole definition in Linux 7.2.3
+`drivers/gpu/drm/i915/gem/i915_gem_throttle.c` (MIT, Copyright © 2014-2016
+Intel Corporation); context/engine/timeline locks and wait ordering follow the
+source path.
+
 `intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
 `drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
 Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.
