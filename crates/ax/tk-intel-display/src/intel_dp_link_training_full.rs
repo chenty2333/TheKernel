@@ -1174,9 +1174,15 @@ pub fn intel_dp_stop_link_train<I: LinkTrainingIo>(
     dp: &mut IntelDpLinkTraining,
     io: &mut I,
     state: &LinkTrainingCrtcState,
-) {
+) -> Result<(), LinkTrainingError> {
     dp.link_active = true;
-    intel_dp_program_link_training_pattern(dp, io, state, DpPhy::Dprx, DP_TRAINING_PATTERN_DISABLE);
+    let pattern_disabled = intel_dp_program_link_training_pattern(
+        dp,
+        io,
+        state,
+        DpPhy::Dprx,
+        DP_TRAINING_PATTERN_DISABLE,
+    );
     if state.uhbr {
         let deadline = io.now_ms().wrapping_add(500);
         loop {
@@ -1194,6 +1200,10 @@ pub fn intel_dp_stop_link_train<I: LinkTrainingIo>(
         let delay_ms = if dp.seq_train_failures != 0 { 0 } else { 2_000 };
         io.queue_link_check(delay_ms);
     }
+    if !pattern_disabled {
+        return Err(LinkTrainingError::Refused);
+    }
+    Ok(())
 }
 
 // upstream: intel_dp_link_training.c intel_dp_link_train_phy()
@@ -1939,5 +1949,16 @@ mod tests {
         );
         assert_eq!(io.hpd_unblocks, 1);
         assert_eq!(io.hpd_blocks, 1);
+    }
+
+    #[test]
+    fn stop_link_train_reports_source_disable_failure_after_unblocking_hpd() {
+        let mut io = SourcePhyFailureIo::default();
+        let mut dp = IntelDpLinkTraining::default();
+        assert_eq!(
+            intel_dp_stop_link_train(&mut dp, &mut io, &LinkTrainingCrtcState::default(),),
+            Err(LinkTrainingError::Refused)
+        );
+        assert_eq!(io.hpd_unblocks, 1);
     }
 }
