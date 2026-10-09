@@ -118,71 +118,71 @@ MIT 下层依赖、完整 command parser 与 engine_pm 已补齐；其他文件�
 
 ## GP 上游翻译覆盖率（2026-10-10）
 
-下表记录 PROMPT-GT-PREP 所列 MIT 文件的 source-order 覆盖；commit 是文件主体译文提交，intel_gt.c 另有 provenance-only 修正。upstream-gt 始终默认关闭。i915_irq.c 按任务范围只翻译 Gen11+/DG1 GT/顶层部分。
+下表记录 PROMPT-GT-PREP 所列 MIT 文件的 source-order 覆盖与每个文件的函数数。upstream-gt 始终默认关闭。i915_irq.c 按任务范围只翻译 Gen11+/DG1 GT/顶层部分。
 
 ### A. GT 初始化、中断与 uC
 
-| 上游文件 | 覆盖 | 提交 |
+| 上游文件 | 覆盖 |
 |---|---:|---|
-| gt/intel_gt.c | 42/42 | 02c3a1d8；provenance 修正 fac54d53 |
-| gt/intel_gt_pm.c | 20/20 | bb6fdd99 |
-| gt/intel_gt_irq.c | 21/21 | bf4b58dc |
-| gt/intel_gt_pm_irq.c | 8/8 | 56ff5ffa |
-| gt/intel_gt_mcr.c | 21/21 | f35b3962 |
-| gt/intel_gt_clock_utils.c | 16/16 | 6e73ffe7 |
-| gt/intel_gt_buffer_pool.c | 11/11 | 121bc6c8 |
-| gt/intel_ggtt.c | 74/74 | 68092daa |
-| gt/intel_gtt.c | 33/33 | 3a13b21c |
-| gt/gen8_ppgtt.c | 30/30 | 89f4825b |
-| gt/intel_ppgtt.c | 18/18 | 58cd3326 |
-| gt/intel_mocs.c | 15/15 | 2d4dcbd3 |
-| gt/intel_sseu.c | 26/26 | 90066c92（shared getter 在 intel_sseu_types_upstream.rs） |
-| gt/intel_context_sseu.c | 3/3 | 683e0b49 |
-| gt/intel_tlb.c | 6/6 | 76ac6c8b |
-| gt/intel_renderstate.c | 5/5 | 7038999d |
-| gt/shmem_utils.c | 8/8 | c479373e |
-| gt/uc/intel_guc_hwconfig.c | 7/7 | d369450f |
-| gt/uc/intel_uc.c | 36/36 | e00f6a83 |
-| gt/uc/intel_uc_fw.c | 38/38 | 8fe3d727 |
-| gt/uc/intel_guc.c | 38/38 | 6e6360bb |
-| gt/uc/intel_guc_ct.c | 44/44 | 7edbf023 |
-| gt/uc/intel_guc_ads.c | 40/40 | f2010b68 |
-| gt/uc/intel_huc.c | 29/29 | af4a6902 |
-| gt/uc/intel_huc_fw.c | 6/6 | 1c91a7f4 |
-| gt/uc/intel_guc_capture.c | 49/49 | 2365695b |
-| gt/intel_wopcm.c | 10/10 | f18884ed |
-| gt/intel_gt_requests.c | 15/15 | 34556899 |
-| i915_irq.c | 13/55 selected | b7d4c6d6 |
+| gt/intel_gt.c | 42/42 |
+| gt/intel_gt_pm.c | 20/20 |
+| gt/intel_gt_irq.c | 21/21 |
+| gt/intel_gt_pm_irq.c | 8/8 |
+| gt/intel_gt_mcr.c | 21/21 |
+| gt/intel_gt_clock_utils.c | 16/16 |
+| gt/intel_gt_buffer_pool.c | 11/11 |
+| gt/intel_ggtt.c | 74/74 |
+| gt/intel_gtt.c | 33/33 |
+| gt/gen8_ppgtt.c | 30/30 |
+| gt/intel_ppgtt.c | 18/18 |
+| gt/intel_mocs.c | 15/15 |
+| gt/intel_sseu.c | 26/26 |
+| gt/intel_context_sseu.c | 3/3 |
+| gt/intel_tlb.c | 6/6 |
+| gt/intel_renderstate.c | 5/5 |
+| gt/shmem_utils.c | 8/8 |
+| gt/uc/intel_guc_hwconfig.c | 7/7 |
+| gt/uc/intel_uc.c | 36/36 |
+| gt/uc/intel_uc_fw.c | 38/38 |
+| gt/uc/intel_guc.c | 38/38 |
+| gt/uc/intel_guc_ct.c | 44/44 |
+| gt/uc/intel_guc_ads.c | 40/40 |
+| gt/uc/intel_huc.c | 29/29 |
+| gt/uc/intel_huc_fw.c | 6/6 |
+| gt/uc/intel_guc_capture.c | 49/49 |
+| gt/intel_wopcm.c | 10/10 |
+| gt/intel_gt_requests.c | 15/15 |
+| i915_irq.c | 13/55 selected |
 
 ### B. GEM
 
-| 上游文件 | 覆盖 | 提交 |
+| 上游文件 | 覆盖 |
 |---|---:|---|
-| gem/i915_gem_create.c | 13/13 | 3fc804f4 |
-| gem/i915_gem_wait.c | 12/12 | d32d8699 |
-| gem/i915_gem_busy.c | 6/6 | 5395c91c |
-| gem/i915_gem_internal.c | 5/5 | a621adb8 |
-| gem/i915_gem_stolen.c | 44/44 | 392425f0 |
-| gem/i915_gem_dmabuf.c | 12/12 actual C functions | ba7691a8; ctags pseudo-tag fix 3f1682fa |
-| gem/i915_gem_pm.c | 9/9 | 901fffa4 |
-| gem/i915_gem_throttle.c | 1/1 | 498b0349 |
-| gem/i915_gem_object_frontbuffer.c | 12/12 | ed3382c9 |
-| i915_gem_evict.c | 9/9 actual C functions | f22e0663; includes ctags-missed dying_vma, excludes selftest pseudo-tag |
-| i915_vma.c | 74/74 definitions | dc345205; 73 unique names because both conditional vma_print_allocator branches remain |
-| i915_query.c | 16/16 | 88aeffd0 |
-| i915_getparam.c | 1/1 | 627a7887 |
-| gem/i915_gem_execbuffer.c | 90/90 | 5531461e |
-| i915_active.c | 67/67 | 9e24afb2; lower-GEM integration 4c667b67 and 78006c83 |
+| gem/i915_gem_create.c | 13/13 |
+| gem/i915_gem_wait.c | 12/12 |
+| gem/i915_gem_busy.c | 6/6 |
+| gem/i915_gem_internal.c | 5/5 |
+| gem/i915_gem_stolen.c | 44/44 |
+| gem/i915_gem_dmabuf.c | 12/12 actual C functions |
+| gem/i915_gem_pm.c | 9/9 |
+| gem/i915_gem_throttle.c | 1/1 |
+| gem/i915_gem_object_frontbuffer.c | 12/12 |
+| i915_gem_evict.c | 9/9 actual C functions |
+| i915_vma.c | 74/74 definitions |
+| i915_query.c | 16/16 |
+| i915_getparam.c | 1/1 |
+| gem/i915_gem_execbuffer.c | 90/90 |
+| i915_active.c | 67/67 |
 
 ### C. 电源
 
-| 上游文件 | 覆盖 | 提交 |
+| 上游文件 | 覆盖 |
 |---|---:|---|
-| gt/intel_rc6.c | 30/30 | 05bfc6ae |
-| gt/uc/intel_guc_rc.c | 7/7 | 6806899a |
-| gt/intel_rps.c | 134/134 | 6051fa89 |
-| gt/uc/intel_guc_slpc.c | 46/46 | afd16a01 |
-| gt/intel_reset.c | 67/67 | 07338d43 |
+| gt/intel_rc6.c | 30/30 |
+| gt/uc/intel_guc_rc.c | 7/7 |
+| gt/intel_rps.c | 134/134 |
+| gt/uc/intel_guc_slpc.c | 46/46 |
+| gt/intel_reset.c | 67/67 |
 
 ### 未翻译或受限范围
 

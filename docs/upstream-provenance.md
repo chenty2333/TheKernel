@@ -2100,5 +2100,12 @@ complete Tungsten Graphics permission and warranty text.
 | drivers/gpu/drm/i915/gt/intel_reset.c | intel_reset_upstream.rs | 67/67 functions; MIT, Copyright © 2008-2018 Intel Corporation |
 | drivers/gpu/drm/i915/i915_irq.c | i915_irq_upstream.rs | 13/55 selected Gen11+/DG1 GT/top-level functions per task scope; MIT permission text retained; Copyright © 2003 Tungsten Graphics, Inc. |
 
-The intel_gt.c body was translated in 02c3a1d8; fac54d53 adds the missing
-source-location markers required by the translation review convention.
+The intel_gt.c body and source-location markers are present in the feature owner.
+
+### Whole-crates/ax Linux excerpt re-scan (2026-10-10)
+
+After registering the GT/GEM/power source-order translations, the scanner's
+whole-scope crates/ax totals are threshold >=40 `(0,0,0,763,589,0,0)` and
+threshold >=25 `(18,15,4,1988,1808,0,0)` in the test's seven-column order.
+The corresponding tk-intel-gt NOTICE and CI scan baseline were reconciled in
+the same change; MIT i915 text remains counted rather than exempted.
