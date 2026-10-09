@@ -34,8 +34,9 @@ This MMIO mapping is separate from the DKL PHY lane signal-level registers.
 Adding AUX D/E transport and power-well support does not itself enable a
 TC1/TC2 DP-alt link: connector/VBT route selection, DPCD negotiation,
 link-training state, full mode rollback, and DKL PHY lane programming are
-still not connected. The HSW well adapter also does not yet reproduce i915's
-post-request DKL uC-health warning poll.
+still not connected. After each Type-C AUX well request, the adapter performs
+i915's bounded DKL `CMN_UC_DW_27.UC_HEALTH` poll and logs the source-equivalent
+warning on timeout.
 The upstream debugfs-independent AUX helpers are translated; framework calls
 are represented by the adapter rather than importing DRM AUX infrastructure.
 
