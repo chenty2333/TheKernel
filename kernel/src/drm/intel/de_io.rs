@@ -254,11 +254,11 @@ mod tests {
     fn bounded_wait_returns_matching_value_and_reports_the_last_value_on_timeout() {
         let registers = MockRegisters::new();
         let status = test_rw("STATUS", 0x1000);
-        let reads = Cell::new(0);
+        let reads = Cell::new(0_u32);
         registers.on_read(status, move |value| {
-            let reads = reads.get() + 1;
-            reads.set(reads);
-            if reads == 3 { value | 0x8 } else { value }
+            let count = reads.get() + 1;
+            reads.set(count);
+            if count == 3 { value | 0x8 } else { value }
         });
         let io = DeIo::new(&registers);
 
