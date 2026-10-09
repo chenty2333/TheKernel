@@ -225,6 +225,14 @@ pub struct TtmBufferObjectLayout {
 const _: [(); 480] = [(); size_of::<TtmBufferObjectLayout>()];
 const _: [(); 8] = [(); align_of::<TtmBufferObjectLayout>()];
 
+/// `i915_gem_to_ttm()` from `gem/i915_gem_ttm.h`: the TTM BO is the
+/// alternate arm of the GEM object's base union, at the same address.
+#[cfg(feature = "upstream-gt")]
+#[inline]
+pub unsafe fn i915_gem_to_ttm(obj: *mut crate::i915_gem_object_types_upstream::DrmI915GemObject) -> *mut TtmBufferObjectLayout {
+    unsafe { core::ptr::addr_of_mut!((*obj).base.__do_not_access).cast() }
+}
+
 /// Source-layout prefix through `drm_file::driver_priv`, the member used by
 /// GEM handle close paths. Later DRM file fields are not accessed here.
 #[repr(C)]
