@@ -423,6 +423,9 @@ pub mod intel_migrate_upstream;
 pub mod intel_rc6_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_rc6_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_renderstate_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
