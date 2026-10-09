@@ -1516,9 +1516,12 @@ pub fn intel_dp_start_link_train<I: LinkTrainingIo>(
     dp: &mut IntelDpLinkTraining,
     io: &mut I,
     state: &LinkTrainingCrtcState,
-) -> LinkTrainingOutcome {
+) -> Result<LinkTrainingOutcome, LinkTrainingError> {
     io.hpd_block();
-    let mut lttpr_count = intel_dp_init_lttpr_and_dprx_caps(dp, io).unwrap_or(0);
+    // A capability/AUX error is not equivalent to a sink with no repeaters.
+    // Keep it visible to the caller instead of attempting training with an
+    // invented zero-LTTPR topology.
+    let mut lttpr_count = intel_dp_init_lttpr_and_dprx_caps(dp, io)?;
     if lttpr_count < 0 {
         lttpr_count = 0;
     }
@@ -1532,22 +1535,22 @@ pub fn intel_dp_start_link_train<I: LinkTrainingIo>(
         dp.force_train_failure -= 1;
     } else if passed {
         dp.seq_train_failures = 0;
-        return LinkTrainingOutcome::Trained;
+        return Ok(LinkTrainingOutcome::Trained);
     }
     dp.seq_train_failures = dp.seq_train_failures.saturating_add(1);
     if io.ignore_long_hpd() {
-        return LinkTrainingOutcome::RetryDeferred;
+        return Ok(LinkTrainingOutcome::RetryDeferred);
     }
     if dp.seq_train_failures < MAX_SEQ_TRAIN_FAILURES {
-        return LinkTrainingOutcome::RetryDeferred;
+        return Ok(LinkTrainingOutcome::RetryDeferred);
     }
     match intel_dp_schedule_fallback_link_training(dp, io, state) {
-        LinkTrainingRetry::Disconnected => return LinkTrainingOutcome::Disconnected,
-        LinkTrainingRetry::Scheduled => return LinkTrainingOutcome::RetryScheduled,
+        LinkTrainingRetry::Disconnected => return Ok(LinkTrainingOutcome::Disconnected),
+        LinkTrainingRetry::Scheduled => return Ok(LinkTrainingOutcome::RetryScheduled),
         LinkTrainingRetry::Unavailable => {}
     }
     dp.retrain_disabled = true;
-    LinkTrainingOutcome::RetryDisabled
+    Ok(LinkTrainingOutcome::RetryDisabled)
 }
 
 // upstream: intel_dp_link_training.c intel_dp_128b132b_sdp_crc16()
