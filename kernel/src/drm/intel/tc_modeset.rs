@@ -107,10 +107,10 @@ fn ddi_buf_ctl(port: TcPort) -> Result<u32, String> {
     // ADL-P maps PORT_D/PORT_E to TC1/TC2, at the DDI_CTL register stride.
     Ok(0x64000 + (3 + port.index()) * 0x100)
 }
-fn dkl_io<R: Registers>(registers: &R) -> DklRegisterIo<'_, R> {
+pub(super) fn dkl_io<R: Registers>(registers: &R) -> DklRegisterIo<'_, R> {
     DklRegisterIo { registers }
 }
-struct DklRegisterIo<'a, R> {
+pub(super) struct DklRegisterIo<'a, R> {
     registers: &'a R,
 }
 impl<R: Registers> RegisterIo for DklRegisterIo<'_, R> {

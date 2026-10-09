@@ -1465,6 +1465,34 @@ fn mapped_hsw_well(instance: PowerWellInstance) -> Option<Well> {
     Some(well)
 }
 
+/// `icl_tc_phy_aux_power_well_enable()` warns if the Type-C PHY uC health
+/// bit does not become ready within one millisecond. The source warning does
+/// not fail AUX power acquisition, so this bounded check is diagnostic only.
+fn warn_if_tc_aux_uc_unhealthy<R: Registers>(regs: &R, port: intel_display::dkl_phy::TcPort) {
+    let register = match intel_display::dkl_phy::DklRegister::new(port, 0x236c) {
+        Ok(register) => register,
+        Err(_) => {
+            axlog::warn!("intel power: unsupported TC AUX DKL uC-health register");
+            return;
+        }
+    };
+    let io = super::tc_modeset::dkl_io(regs);
+    let timer = super::gmbus::MonotonicTimer;
+    let start = super::gmbus::PollTimer::now_micros(&timer);
+    for _ in 0..1_000 {
+        if intel_display::dkl_phy::intel_dkl_phy_read(&io, register)
+            .is_ok_and(|value| value & (1 << 15) != 0)
+        {
+            return;
+        }
+        if super::gmbus::PollTimer::now_micros(&timer).saturating_sub(start) >= 1_000 {
+            break;
+        }
+        super::gmbus::PollTimer::pause(&timer);
+    }
+    axlog::warn!("intel power: TC AUX DKL uC health did not set within 1 ms");
+}
+
 struct MappedPowerWellIo<'a, R> {
     regs: &'a R,
     platform: DmcPlatform,
@@ -1533,8 +1561,17 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
             well.timeout_us = u32::from(timeout_ms).saturating_mul(1_000);
         }
         enable_well(self.regs, well, self.platform)
-            .map(|_| ())
-            .map_err(|_| intel_display::Error::Unavailable(well.register.offset()))
+            .map_err(|_| intel_display::Error::Unavailable(well.register.offset()))?;
+        match instance.control {
+            Some(WellControl::TglAuxTc1) => {
+                warn_if_tc_aux_uc_unhealthy(self.regs, intel_display::dkl_phy::TcPort::Tc1)
+            }
+            Some(WellControl::TglAuxTc2) => {
+                warn_if_tc_aux_uc_unhealthy(self.regs, intel_display::dkl_phy::TcPort::Tc2)
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn disable_well(
