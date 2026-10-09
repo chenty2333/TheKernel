@@ -6,7 +6,14 @@ Linux 7.2.3 `intel_cdclk.c`: 152/152 ctags functions in source order. Its
 explicit. It is exported and compiles as part of `tk-intel-display`.
 
 `crates/ax/tk-intel-display/src/cdclk.rs` owns the table-driven ADLP CDCLK
-selection and the platform-independent transition predicates. This change adds
+selection and the platform-independent transition predicates. The active
+N305 boot-mode selector now calls translated `intel_cdclk_full::bxt_calc_cdclk`
+against the ADLP table to choose the minimum source clock, then resolves that
+frequency through the existing reference/ratio table before allowing any
+programming. Its tiny `IntelCdclkIo` policy backend has no register access and
+fails closed if the source table cannot satisfy the request. This does not
+wire runtime atomic CDCLK transitions. The module also adds
+the source conditions for `intel_cdclk_can_crawl()`,
 the source conditions for `intel_cdclk_can_crawl()`,
 `intel_cdclk_can_squash()`, `intel_cdclk_can_cd2x_update()`,
 `intel_cdclk_clock_changed()`, and `cdclk_compute_crawl_and_squash_midpoint()`
