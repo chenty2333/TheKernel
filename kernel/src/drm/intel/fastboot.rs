@@ -565,22 +565,22 @@ fn require_only_primary_display_fetch(r: &impl Registers) -> Result<(), Error> {
     }
 
     // ADL-N uses the new-style cursor mode field; CURSOR_ENABLE bit 31 is an
-    // old desktop-8xx flag and is not a Gen12 enable test. Cursor FBC has its
-    // own buffer/fetcher control.
+    // old desktop-8xx flag and is not a Gen12 enable test. Upstream's cursor
+    // get_hw_state uses MCURSOR_MODE_MASK as the enable predicate. CUR_FBC_CTL
+    // is only programmed (cleared before CURCNTR on disable), not used as an
+    // independent active-fetch state; don't reject stale config with mode 0.
     let cursor = read(r, 0x70080)?;
-    if cursor & intel_display::intel_cursor_full::MCURSOR_MODE_MASK != 0
-        || read(r, 0x700a0)? & intel_display::intel_cursor_full::CUR_FBC_EN != 0
-    {
+    if cursor & intel_display::intel_cursor_full::MCURSOR_MODE_MASK != 0 {
         return Err(Error::Refused);
     }
 
     // Linux 7.2.3 selects ivb_fbc_funcs for display version >= 7, including
-    // ADL-N. Its FBC instance A is at ILK_DPFC_CONTROL(A)=0x43208 and
-    // ILK_DPFC_STATUS2(A)=0x43214; reject enabled FBC or any live compressed
-    // segments because their stolen CFB/LL buffers are outside the plane PTEs.
-    if read(r, 0x43208)? & intel_display::intel_fbc_full::DPFC_CTL_EN != 0
-        || read(r, 0x43214)? & intel_display::intel_fbc_full::DPFC_COMP_SEG_MASK_IVB != 0
-    {
+    // ADL-N. Its FBC instance A is at ILK_DPFC_CONTROL(A)=0x43208. The
+    // upstream active predicate reads DPFC_CTL_EN; STATUS2 is only an
+    // advisory compressed-segment readout and is not cleared or awaited by
+    // the upstream deactivate/sanitize path, so nonzero STATUS2 alone is not
+    // evidence of an active fetcher.
+    if read(r, 0x43208)? & intel_display::intel_fbc_full::DPFC_CTL_EN != 0 {
         return Err(Error::Refused);
     }
     Ok(())
@@ -4278,7 +4278,7 @@ mod tests {
     }
 
     #[test]
-    fn active_cursor_or_compression_buffer_refuses_dma_handoff() {
+    fn active_cursor_or_enabled_fbc_refuses_dma_handoff() {
         let r = Model::new();
         let pin = PowerPin::acquire(&r, TcPort::Tc1).unwrap();
         let baseline_capture_log_start = r.inner.lock().log.len();
@@ -4295,12 +4295,7 @@ mod tests {
                 0x70080,
                 intel_display::intel_cursor_full::MCURSOR_MODE_64_2B,
             ),
-            (0x700a0, intel_display::intel_cursor_full::CUR_FBC_EN),
             (0x43208, intel_display::intel_fbc_full::DPFC_CTL_EN),
-            (
-                0x43214,
-                intel_display::intel_fbc_full::DPFC_COMP_SEG_MASK_IVB,
-            ), // FBC segments remain live stolen-memory fetches.
         ] {
             r.set(register, value);
             let scanout_read_writes = r.inner.lock().writes;
@@ -4316,6 +4311,22 @@ mod tests {
             );
             r.set(register, 0);
         }
+    }
+
+    #[test]
+    fn stale_fbc_or_cursor_config_without_enable_does_not_block_scanout_admission() {
+        let r = Model::new();
+        let pin = PowerPin::acquire(&r, TcPort::Tc1).unwrap();
+        r.set(0x700a0, intel_display::intel_cursor_full::CUR_FBC_EN);
+        r.set(
+            0x43214,
+            intel_display::intel_fbc_full::DPFC_COMP_SEG_MASK_IVB,
+        );
+
+        let writes = r.inner.lock().writes;
+        assert!(read_only_live_scanout(&r, &pin, TcPort::Tc1).is_ok());
+        assert_eq!(r.inner.lock().writes, writes);
+        assert!(capture(&r, &pin, TcPort::Tc1, None).is_ok());
     }
 
     #[test]
