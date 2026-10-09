@@ -254,6 +254,9 @@ impl PciBlockInterrupt {
             ((table + 12) as *mut u32).write_volatile(0);
         }
         if !root.write_config_u16(bdf, capability.offset + 2, (control | 0x8000) & !0x4000) {
+            // SAFETY: the same bounded MSI-X entry written above. Setting vector
+            // control bit 0 re-masks entry zero before the capability is disabled,
+            // so no interrupt can be delivered through the abandoned route.
             unsafe { ((table + 12) as *mut u32).write_volatile(1) };
             Self::disable_capability(root, bdf, PCI_CAP_MSIX);
             return None;

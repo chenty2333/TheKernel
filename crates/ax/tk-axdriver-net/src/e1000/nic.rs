@@ -315,6 +315,9 @@ impl<H: E1000Hal, const QS: usize> E1000Nic<H, QS> {
         if self.advanced_queues {
             // Advanced writeback stores status/error in the upper dword and
             // packet length in its low word.
+            // SAFETY: `index < QS` was checked above, and `rx_desc` is a live
+            // allocation of QS advanced descriptors, so the volatile read is in
+            // bounds and observes the writeback the device completed.
             let descriptor = unsafe {
                 ptr::read_volatile(
                     self.rx_desc

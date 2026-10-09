@@ -517,8 +517,14 @@ pub(crate) fn probe(
     };
     let base = mapped.as_usize();
     // Clear firmware-left interrupt masks before admitting a PCI IRQ route.
+    // SAFETY: `base` is the ABAR mapping from `iomap` for `bar.1` bytes. GHC is
+    // a fixed 32-bit register at offset 0x04 of the generic host region, so this
+    // volatile read stays inside the mapping.
     let ghc =
         unsafe { ((base + axdriver_block::ahci::regs::AHCI_GHC) as *const u32).read_volatile() };
+    // SAFETY: the GHC write targets the same mapped register. Each port IE write
+    // is guarded by `offset + 4 <= bar.1`, so every access stays inside the ABAR
+    // mapping, and clearing interrupt-enable masks is safe before IRQ routing.
     unsafe {
         ((base + axdriver_block::ahci::regs::AHCI_GHC) as *mut u32)
             .write_volatile(ghc & !axdriver_block::ahci::regs::AHCI_GHC_IE);

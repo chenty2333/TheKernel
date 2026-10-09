@@ -395,6 +395,9 @@ impl BlockDriverOps for StaticBlockDevice {
         block_id: u64,
         segments: &[BlockPhysicalSegment],
     ) -> DevResult<BlockPhysicalSgOutcome> {
+        // SAFETY: each arm forwards the caller's contract unchanged: `segments` and
+        // the DMA memory they describe must satisfy the `BlockDriverOps` safety
+        // requirements, which every variant of this enum shares.
         match self {
             Self::Existing(device) => unsafe { device.read_block_physical_sg(block_id, segments) },
             #[cfg(feature = "shared-block")]
@@ -417,6 +420,9 @@ impl BlockDriverOps for StaticBlockDevice {
         block_id: u64,
         segments: &[BlockPhysicalSegment],
     ) -> DevResult<BlockPhysicalSgOutcome> {
+        // SAFETY: each arm forwards the caller's contract unchanged: `segments` and
+        // the DMA memory they describe must satisfy the `BlockDriverOps` safety
+        // requirements, which every variant of this enum shares.
         match self {
             Self::Existing(device) => unsafe { device.write_block_physical_sg(block_id, segments) },
             #[cfg(feature = "shared-block")]
@@ -574,6 +580,9 @@ impl BlockDriverOps for StaticBlockDevice {
         &mut self,
         requests: &mut [BlockPhysicalRequest<'_>],
     ) -> DevResult<BlockSubmitReport> {
+        // SAFETY: each arm forwards the caller's contract unchanged: `segments` and
+        // the DMA memory they describe must satisfy the `BlockDriverOps` safety
+        // requirements, which every variant of this enum shares.
         match self {
             Self::Existing(device) => unsafe { device.submit_physical_batch(requests) },
             #[cfg(feature = "shared-block")]

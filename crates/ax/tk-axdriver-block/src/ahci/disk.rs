@@ -582,6 +582,9 @@ impl<I: AhciIo> AhciDisk<I> {
             self.controller.ahci_stop_fr(&self.port) && self.controller.ahci_stop(&mut self.port);
         if stopped {
             // The workspace will be dropped as `self` returns from attach.
+            // SAFETY: `stopped` means the command engine and FIS receive are stopped, so the
+            // HBA can no longer DMA into the workspace. The field is dropped exactly once
+            // here, and `workspace_live` is cleared so no later path drops it again.
             // Transfer ownership out and drop it now, after DMA quiescence.
             unsafe { ManuallyDrop::drop(&mut self.workspace) };
             self.workspace_live = false;
@@ -1743,6 +1746,9 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
             }
             // The device reads the DSM parameter list from the persistent DMA
             // bounce buffer; its ownership outlives this synchronous command.
+            // SAFETY: `payload` is a 512-byte local array. The disk-owned bounce buffer is at
+            // least 512 bytes (`PortWorkspace::new` rejects smaller) and cannot alias a
+            // stack array, so the non-overlapping copy stays in bounds.
             unsafe {
                 ptr::copy_nonoverlapping(
                     payload.as_ptr(),
@@ -2211,6 +2217,9 @@ mod tests {
             // wrapper call, then restore it before the fake backing pages go
             // out of scope. The original local is made inert to avoid a
             // second workspace drop.
+            // SAFETY: `disk` is a valid exclusive reference. The bitwise copy moves the value
+            // out, and `workspace_live = false` makes the moved-from original inert. The slot
+            // is rewritten by `ptr::write` below before any use or drop.
             let owned = unsafe { ptr::read(disk as *const AhciDisk<FakeIo>) };
             disk.workspace_live = false;
             let shared = Arc::new(Mutex::new(owned));
@@ -2223,6 +2232,9 @@ mod tests {
                 .ok()
                 .expect("wrapper released its shared port reference")
                 .into_inner();
+            // SAFETY: the slot was moved out by `ptr::read` above and is logically
+            // uninitialized. Writing the value back restores it without dropping the old
+            // contents.
             unsafe { ptr::write(disk, shared) };
             let shared = disk;
             assert_eq!(shared.pmp_port, 0);
@@ -2325,6 +2337,9 @@ mod tests {
         let received_fis = Page([0; 4096]);
         let command_table = Page([0; 4096]);
         let bounce = Page([0; 4096]);
+        // SAFETY: every region points into a local `Page` that outlives the regions. The
+        // regions use `release: None`, so dropping them frees nothing, and they are used
+        // only to validate workspace construction, never for device DMA.
         let regions = unsafe {
             (
                 DmaRegion::borrowed(NonNull::from(&command_list.0[0]), 0x1000, 4096),
@@ -2334,7 +2349,11 @@ mod tests {
             )
         };
         assert!(PortWorkspace::new(regions.0, regions.1, regions.2, regions.3).is_ok());
+        // SAFETY: same contract as `regions` above. This 64-byte region is only used to
+        // check that a short bounce buffer is rejected.
         let short = unsafe { DmaRegion::borrowed(NonNull::from(&bounce.0[0]), 0x4000, 64) };
+        // SAFETY: the three regions below borrow the local `Page`s that remain live for
+        // the whole test, with the same non-owning, validation-only use as above.
         let command_list =
             unsafe { DmaRegion::borrowed(NonNull::from(&command_list.0[0]), 0x1000, 4096) };
         let received_fis =
@@ -2407,6 +2426,8 @@ mod tests {
             )
         };
         let bounce_ptr = pages[2].0.as_mut_ptr();
+        // SAFETY: `bounce_ptr` is `pages[2]`, a 4096-byte allocation kept alive by
+        // `with_fake_disk` and distinct from the ring pages `pages[0]` and `pages[1]`.
         let bounce =
             unsafe { DmaRegion::borrowed(NonNull::new(bounce_ptr).unwrap(), 0x4000, 4096) };
         let workspace =
@@ -2486,6 +2507,9 @@ mod tests {
             assert_eq!(output, [0; 512]);
             // Simulate device DMA into the persistent bounce region and then
             // the HBA clearing CI before task-context completion drain.
+            // SAFETY: `bounce` is the 4096-byte `pages[2]` owned by `with_fake_disk` for this
+            // closure. The 512-byte write stays in bounds, and no Rust reference to it is
+            // live while the simulated device writes.
             unsafe { ptr::write_bytes(bounce, 0x5a, 512) };
             disk.controller.io_mut().registers[(AHCI_OFFSET + AHCI_P_CI) / 4] = 0;
             let mut completions = [BlockCompletion {
@@ -2520,6 +2544,8 @@ mod tests {
                 disk.controller.io_mut().registers[(AHCI_OFFSET + AHCI_P_CI) / 4],
                 1
             );
+            // SAFETY: `bounce` is valid for 512 bytes for the whole closure. The HBA has
+            // cleared CI, so the simulated DMA write has completed before this read.
             assert_eq!(unsafe { core::slice::from_raw_parts(bounce, 512) }, &source);
             let handle = requests[0].handle.unwrap();
             disk.controller.io_mut().registers[(AHCI_OFFSET + AHCI_P_CI) / 4] = 0;
