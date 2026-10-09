@@ -1633,6 +1633,95 @@ pub fn parse_lane_count(input: &[u8]) -> Result<u8, LinkTrainingError> {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct SourcePhyFailureIo {
+        aux_writes: usize,
+    }
+
+    impl LinkTrainingIo for SourcePhyFailureIo {
+        fn dpcd_probe(&mut self, _: u32) -> Result<(), LinkTrainingError> {
+            Ok(())
+        }
+        fn read_dpcd_caps(&mut self) -> Result<[u8; DP_RECEIVER_CAP_SIZE], LinkTrainingError> {
+            Ok([0; DP_RECEIVER_CAP_SIZE])
+        }
+        fn read_lttpr_common_caps(
+            &mut self,
+        ) -> Result<[u8; DP_LTTPR_COMMON_CAP_SIZE], LinkTrainingError> {
+            Ok([0; DP_LTTPR_COMMON_CAP_SIZE])
+        }
+        fn init_lttpr_non_transparent(&mut self, _: i32) -> Result<(), LinkTrainingError> {
+            Ok(())
+        }
+        fn read_lttpr_phy_caps(
+            &mut self,
+            _: &[u8; DP_RECEIVER_CAP_SIZE],
+            _: DpPhy,
+        ) -> Result<[u8; DP_LTTPR_PHY_CAP_SIZE], LinkTrainingError> {
+            Ok([0; DP_LTTPR_PHY_CAP_SIZE])
+        }
+        fn dump_lttpr_desc(&mut self, _: DpPhy) {}
+        fn aux_read(&mut self, _: u32, _: &mut [u8]) -> Result<usize, LinkTrainingError> {
+            Ok(0)
+        }
+        fn aux_write(&mut self, _: u32, data: &[u8]) -> Result<usize, LinkTrainingError> {
+            self.aux_writes += 1;
+            Ok(data.len())
+        }
+        fn read_phy_link_status(
+            &mut self,
+            _: DpPhy,
+        ) -> Result<[u8; DP_LINK_STATUS_SIZE], LinkTrainingError> {
+            Ok([0; DP_LINK_STATUS_SIZE])
+        }
+        fn read_link_status(&mut self) -> Result<[u8; DP_LINK_STATUS_SIZE], LinkTrainingError> {
+            Ok([0; DP_LINK_STATUS_SIZE])
+        }
+        fn read_sink_status(&mut self) -> Result<u8, LinkTrainingError> {
+            Ok(0)
+        }
+        fn clock_recovery_delay(&mut self, _: DpPhy, _: bool) -> u32 {
+            0
+        }
+        fn channel_eq_delay(&mut self, _: DpPhy, _: bool) -> u32 {
+            0
+        }
+        fn uhbr_aux_rd_interval(&mut self) -> u32 {
+            0
+        }
+        fn edp_link_required(&mut self, _: i32, _: u8, _: u32, _: u32, _: u32, _: u32) -> u64 {
+            0
+        }
+        fn max_link_data_rate(&mut self, _: i32, _: u8) -> u64 {
+            0
+        }
+        fn source_pattern(
+            &mut self,
+            _: &LinkTrainingCrtcState,
+            _: u8,
+        ) -> Result<(), LinkTrainingError> {
+            Err(LinkTrainingError::Refused)
+        }
+        fn source_signal_levels(
+            &mut self,
+            _: &LinkTrainingCrtcState,
+            _: &[u8; 4],
+        ) -> Result<(), LinkTrainingError> {
+            Ok(())
+        }
+        fn compute_rate(&mut self, _: i32) -> (u8, u8) {
+            (0, 0)
+        }
+        fn wait_us(&mut self, _: u32) {}
+        fn wait_range_us(&mut self, _: u32, _: u32) {}
+        fn now_ms(&mut self) -> u64 {
+            0
+        }
+        fn connected(&mut self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn parses_auto_and_only_advertised_source_rates() {
         let mut dp = IntelDpLinkTraining::default();
@@ -1672,5 +1761,24 @@ mod tests {
             0,
             0
         ]));
+    }
+
+    #[test]
+    fn source_pattern_refusal_prevents_sink_aux_training_write() {
+        let mut dp = IntelDpLinkTraining::default();
+        let state = LinkTrainingCrtcState {
+            lane_count: 4,
+            ..Default::default()
+        };
+        let mut io = SourcePhyFailureIo::default();
+
+        assert!(!intel_dp_set_link_train(
+            &mut dp,
+            &mut io,
+            &state,
+            DpPhy::Dprx,
+            DP_TRAINING_PATTERN_1,
+        ));
+        assert_eq!(io.aux_writes, 0);
     }
 }
