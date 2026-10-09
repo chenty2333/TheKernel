@@ -579,7 +579,7 @@ unsafe extern "C" fn i915_gem_userptr_pread(
 unsafe fn probe_range(mm: *mut MmStruct, mut addr: c_ulong, len: c_ulong) -> i32 {
     let end = addr.wrapping_add(len);
     let mut vmi = crate::linux::mmu_notifier::VmaIterator::new(mm, addr);
-    let mut vma = core::ptr::null_mut::<crate::linux::mmu_notifier::VmAreaStruct>();
+    let mut vma = core::ptr::null_mut::<crate::linux::mm::VmAreaStruct>();
 
     unsafe { crate::linux::mmu_notifier::mmap_read_lock(mm) };
     loop {
@@ -592,7 +592,7 @@ unsafe fn probe_range(mm: *mut MmStruct, mut addr: c_ulong, len: c_ulong) -> i32
         }
         if unsafe {
             (*vma).vm_flags
-                & (crate::linux::mmu_notifier::VM_PFNMAP | crate::linux::mmu_notifier::VM_MIXEDMAP)
+                & (crate::linux::mm::VM_PFNMAP | crate::linux::mm::VM_MIXEDMAP)
                 != 0
         } {
             break;
@@ -643,7 +643,7 @@ pub unsafe fn i915_gem_userptr_ioctl(
     if (user_ptr | user_size) & (crate::linux_config::PAGE_SIZE as u64 - 1) != 0 {
         return -crate::linux_config::EINVAL;
     }
-    if !crate::linux::mmu_notifier::access_ok(user_ptr as *const c_void, user_size as usize) {
+    if !unsafe { crate::i915_gem_core_upstream::access_ok(user_ptr as *const c_void, user_size) } {
         return -crate::linux_config::EFAULT;
     }
     if flags & I915_USERPTR_UNSYNCHRONIZED != 0 {
