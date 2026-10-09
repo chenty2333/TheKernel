@@ -323,7 +323,7 @@ pub unsafe fn i915_gem_object_set_to_gtt_domain(obj: *mut DrmI915GemObject, writ
 
         spin_lock(&mut (*obj).vma.lock);
         crate::for_each_ggtt_vma!(vma, obj, {
-            if i915_vma_is_bound(vma, I915_VMA_GLOBAL_BIND) {
+            if i915_vma_is_bound(vma, I915_VMA_GLOBAL_BIND as u32) {
                 i915_vma_set_ggtt_write(vma);
             }
         });
@@ -363,7 +363,7 @@ pub unsafe fn i915_gem_object_set_cache_level(
     let ret = i915_gem_object_wait(
         obj,
         I915_WAIT_INTERRUPTIBLE | I915_WAIT_ALL,
-        MAX_SCHEDULE_TIMEOUT,
+        MAX_SCHEDULE_TIMEOUT as i64,
     );
     if ret != 0 {
         return ret;
@@ -386,7 +386,7 @@ pub unsafe fn i915_gem_get_caching_ioctl(
     data: *mut c_void,
     file: *mut DrmFile,
 ) -> i32 {
-    let i915 = to_i915(dev);
+    let i915 = to_i915(dev.cast());
     let args = data.cast::<DrmI915GemCaching>();
     let mut obj: *mut DrmI915GemObject;
     let mut err = 0;
@@ -396,7 +396,7 @@ pub unsafe fn i915_gem_get_caching_ioctl(
     }
 
     rcu_read_lock();
-    obj = i915_gem_object_lookup_rcu(file, (*args).handle);
+    obj = i915_gem_object_lookup_rcu(file.cast(), (*args).handle);
     if obj.is_null() {
         err = -ENOENT;
         rcu_read_unlock();
@@ -431,7 +431,7 @@ pub unsafe fn i915_gem_set_caching_ioctl(
     data: *mut c_void,
     file: *mut DrmFile,
 ) -> i32 {
-    let i915 = to_i915(dev);
+    let i915 = to_i915(dev.cast());
     let args = data.cast::<DrmI915GemCaching>();
     let mut obj: *mut DrmI915GemObject;
     let level: I915CacheLevel;
@@ -468,7 +468,7 @@ pub unsafe fn i915_gem_set_caching_ioctl(
         _ => return -EINVAL,
     };
 
-    obj = i915_gem_object_lookup(file, (*args).handle);
+    obj = i915_gem_object_lookup(file.cast(), (*args).handle);
     if obj.is_null() {
         return -ENOENT;
     }
@@ -551,18 +551,20 @@ pub unsafe fn i915_gem_object_pin_to_display_plane(
     // put it anyway and hope that userspace can cope (but always first
     // try to preserve the existing ABI).
     vma = ERR_PTR(-ENOSPC);
-    if flags & PIN_MAPPABLE == 0 && (view.is_null() || (*view).r#type == I915_GTT_VIEW_NORMAL) {
+    if flags & PIN_MAPPABLE as u32 == 0
+        && (view.is_null() || (*view).r#type == I915_GTT_VIEW_NORMAL as u32)
+    {
         vma = i915_gem_object_ggtt_pin_ww(
             obj,
             ww,
             view,
             0,
-            alignment,
-            flags | PIN_MAPPABLE | PIN_NONBLOCK,
+            alignment as u32,
+            flags | PIN_MAPPABLE as u32 | PIN_NONBLOCK as u32,
         );
     }
     if IS_ERR(vma) && vma != ERR_PTR(-EDEADLK) {
-        vma = i915_gem_object_ggtt_pin_ww(obj, ww, view, 0, alignment, flags);
+        vma = i915_gem_object_ggtt_pin_ww(obj, ww, view, 0, alignment as u32, flags);
     }
     if IS_ERR(vma) {
         return vma;
@@ -590,7 +592,7 @@ pub unsafe fn i915_gem_object_set_to_cpu_domain(obj: *mut DrmI915GemObject, writ
     let ret = i915_gem_object_wait(
         obj,
         I915_WAIT_INTERRUPTIBLE | if write { I915_WAIT_ALL } else { 0 },
-        MAX_SCHEDULE_TIMEOUT,
+        MAX_SCHEDULE_TIMEOUT as i64,
     );
     if ret != 0 {
         return ret;
@@ -635,7 +637,7 @@ pub unsafe fn i915_gem_set_domain_ioctl(
     let write_domain = (*args).write_domain;
     let mut err: i32;
 
-    if IS_DGFX(to_i915(dev)) {
+    if IS_DGFX(to_i915(dev.cast())) {
         return -ENODEV;
     }
 
@@ -654,7 +656,7 @@ pub unsafe fn i915_gem_set_domain_ioctl(
         return 0;
     }
 
-    obj = i915_gem_object_lookup(file, (*args).handle);
+    obj = i915_gem_object_lookup(file.cast(), (*args).handle);
     if obj.is_null() {
         return -ENOENT;
     }
@@ -667,7 +669,7 @@ pub unsafe fn i915_gem_set_domain_ioctl(
         I915_WAIT_INTERRUPTIBLE
             | I915_WAIT_PRIORITY
             | if write_domain != 0 { I915_WAIT_ALL } else { 0 },
-        MAX_SCHEDULE_TIMEOUT,
+        MAX_SCHEDULE_TIMEOUT as i64,
     );
     if err != 0 {
         i915_gem_object_put(obj);
@@ -684,7 +686,7 @@ pub unsafe fn i915_gem_set_domain_ioctl(
                 I915_WAIT_INTERRUPTIBLE
                     | I915_WAIT_PRIORITY
                     | if write_domain != 0 { I915_WAIT_ALL } else { 0 },
-                MAX_SCHEDULE_TIMEOUT,
+                MAX_SCHEDULE_TIMEOUT as i64,
             );
         }
         i915_gem_object_put(obj);
@@ -760,7 +762,7 @@ pub unsafe fn i915_gem_object_prepare_read(
 
     assert_object_held(obj);
 
-    let mut ret = i915_gem_object_wait(obj, I915_WAIT_INTERRUPTIBLE, MAX_SCHEDULE_TIMEOUT);
+    let mut ret = i915_gem_object_wait(obj, I915_WAIT_INTERRUPTIBLE, MAX_SCHEDULE_TIMEOUT as i64);
     if ret != 0 {
         return ret;
     }
@@ -812,7 +814,7 @@ pub unsafe fn i915_gem_object_prepare_write(
     let mut ret = i915_gem_object_wait(
         obj,
         I915_WAIT_INTERRUPTIBLE | I915_WAIT_ALL,
-        MAX_SCHEDULE_TIMEOUT,
+        MAX_SCHEDULE_TIMEOUT as i64,
     );
     if ret != 0 {
         return ret;
