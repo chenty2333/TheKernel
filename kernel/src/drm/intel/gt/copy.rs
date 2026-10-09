@@ -283,15 +283,12 @@ impl UserJob {
         {
             return Err(Error::Refused);
         }
+        let batch = sparse::normalize(self.batch)?;
+        let mut batch_owned = false;
         for (i, object) in self.objects.iter().enumerate() {
             let ram = Ram::from_pages(object.pages.clone())?;
             let (start, end) = sparse::checked_range(object.address, ram.physical.len())?;
-            if i == 0 {
-                let batch = sparse::normalize(self.batch)?;
-                if batch < start || batch >= end {
-                    return Err(Error::Refused);
-                }
-            }
+            batch_owned |= batch >= start && batch < end;
             for previous in &self.objects[..i] {
                 let pin = previous.pages.fixed_view().map_err(|_| Error::Refused)?;
                 let (a, b) = sparse::checked_range(previous.address, pin.len() / PAGE)?;
@@ -300,7 +297,11 @@ impl UserJob {
                 }
             }
         }
-        Ok(())
+        if batch_owned {
+            Ok(())
+        } else {
+            Err(Error::Refused)
+        }
     }
 }
 /// An opaque image is valid only after a confirmed hardware context switch

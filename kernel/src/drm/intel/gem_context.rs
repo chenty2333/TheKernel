@@ -715,11 +715,8 @@ mod tests {
         let mut request: Exec = read_pod(&copy, 0).unwrap();
         request.context = u64::from(fresh);
         write_pod(&copy, 0, &request).unwrap();
-        exec_with(&file, &copy, 0, |s, d, plan| {
-            let Plan::Copy(operation) = plan else {
-                panic!("copy")
-            };
-            super::super::gt::copy::tests::objects(s, d, operation).map_err(|_| AxError::Io)
+        exec_with(&file, &copy, 0, |_, _, plan| {
+            super::super::gem_exec::tests::run_copy_objects(plan)
         })
         .unwrap();
         for h in [src, dst] {
@@ -888,6 +885,22 @@ mod tests {
         let vm = file.intel_contexts.vm(id).unwrap();
         let root = vm.root();
         assert!(root != 0 && root.is_multiple_of(4096));
+        let mut forged = JobContext::new();
+        assert_eq!(
+            proto_param(
+                &file,
+                &copy,
+                &mut forged,
+                &ContextParam {
+                    param: 9,
+                    value: root,
+                    ..Default::default()
+                },
+                true,
+            ),
+            Err(AxError::NotFound),
+            "VM parameter accepts a file-local VM handle, not a user PML4 address"
+        );
         let a = file.intel_contexts.create().unwrap();
         let b = file.intel_contexts.create().unwrap();
         file.intel_contexts.set_vm(a, id).unwrap();
@@ -905,14 +918,21 @@ mod tests {
                 request,
                 crate::drm::fence::Fence::new(false),
                 None,
-                |src, dst, plan, active, _image| {
+                |_src, _dst, plan, active, _image| {
                     assert!(Arc::ptr_eq(&active, &vm));
                     assert_eq!(active.root(), root);
-                    let Plan::Copy(operation) = plan else {
-                        panic!("copy")
+                    let Plan::User(job) = plan else {
+                        panic!("shared VM job must use standard user batch")
                     };
-                    super::super::gt::copy::tests::objects_vm(src, dst, operation, active)
-                        .map_err(|_| AxError::Io)
+                    assert_eq!(job.engine_class, 1);
+                    let (src, dst) = super::super::gem_exec::tests::copy_pages(&job);
+                    super::super::gt::copy::tests::objects_vm(
+                        src,
+                        dst,
+                        super::super::gem_exec::tests::copy_operation(),
+                        active,
+                    )
+                    .map_err(|_| AxError::Io)
                 },
             )
             .unwrap();
@@ -947,6 +967,23 @@ mod tests {
             .intel_contexts
             .publish_vm(super::super::gt::copy::Vm::new().unwrap())
             .unwrap();
+        for invalid in [
+            VmControl {
+                flags: 1,
+                ..Default::default()
+            },
+            VmControl {
+                extensions: 1,
+                ..Default::default()
+            },
+        ] {
+            write_pod(&copy, 0, &invalid).unwrap();
+            assert_eq!(
+                dispatch(&file, &copy, VM_CREATE, 0),
+                Err(AxError::InvalidInput)
+            );
+            assert_eq!(file.intel_contexts.state.lock().vms.len(), 1);
+        }
         write_pod(
             &copy,
             256,
@@ -1117,11 +1154,18 @@ mod tests {
         exec.context = u64::from(context);
         exec.flags = (exec.flags & !0x3f) | 2;
         write_pod(&copy, 0, &exec).unwrap();
-        exec_with(&file, &copy, 0, |src, dst, plan| {
-            let Plan::Copy(operation) = plan else {
-                panic!("engine slot interpreted as legacy render")
+        exec_with(&file, &copy, 0, |_src, _dst, plan| {
+            let Plan::User(job) = plan else {
+                panic!("engine slot must be carried by the user batch context")
             };
-            super::super::gt::copy::tests::objects(src, dst, operation).map_err(|_| AxError::Io)
+            assert_eq!(job.engine_class, 1);
+            let (src, dst) = super::super::gem_exec::tests::copy_pages(&job);
+            super::super::gt::copy::tests::objects(
+                src,
+                dst,
+                super::super::gem_exec::tests::copy_operation(),
+            )
+            .map_err(|_| AxError::Io)
         })
         .unwrap();
         let mut bytes = [0; 16384];

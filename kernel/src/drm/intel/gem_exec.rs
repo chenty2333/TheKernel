@@ -389,42 +389,10 @@ fn wait(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
 }
 #[derive(Clone)]
 pub(super) enum Plan {
-    Copy(intel_gt::bcs::Copy),
-    Render,
     User(Arc<super::gt::copy::UserJob>),
 }
-fn decode(
-    file: &[Arc<GemObject>],
-    pages: &[Arc<SharedPages>],
-    start: usize,
-    render: bool,
-) -> AxResult<Plan> {
-    if render {
-        if start != 0 || file[0].size < 24576 || file[1].size < 24576 || file[2].size < 4096 {
-            return Err(AxError::InvalidInput);
-        }
-        let mut bytes = [0u8; 4096];
-        pages[2].read_bytes(0, &mut bytes)?;
-        for (i, expected) in intel_gt::rcs_page::PAGE.iter().enumerate() {
-            if u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) != *expected {
-                return Err(AxError::InvalidInput);
-            }
-        }
-        Ok(Plan::Render)
-    } else {
-        let mut bytes = [0u8; 44];
-        pages[2].read_bytes(start, &mut bytes)?;
-        let words: [u32; 11] = core::array::from_fn(|i| {
-            u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
-        });
-        intel_gt::bcs::decode_copy(&words, file[0].size, file[1].size)
-            .map(Plan::Copy)
-            .map_err(|_| AxError::InvalidInput)
-    }
-}
 /// Snapshot and validate first, publish shared completion edges atomically,
-/// then execute over pinned views. Native implementations never execute the
-/// user's memory as commands, including a concurrent writable batch mapping.
+/// then execute a soft-pinned, non-secure batch in its file-local VM.
 pub(super) fn exec_with(
     file: &DrmFile,
     copy: &impl UserCopy,
@@ -466,18 +434,17 @@ pub(super) fn exec_request(
     let mut context_job = context.lock();
     let (engine_class, engine_instance) = context_job.engine_target((r.flags & 0x3f) as u16)?;
     let render = engine_class == 0;
-    let user = r.flags & BATCH_FIRST != 0;
-    if (if user {
-        r.count == 0 || r.count > 1024 || r.length == 0 || !r.length.is_multiple_of(8)
-    } else {
-        r.count != 3
-            || r.length
-                != if render {
-                    intel_gt::rcs_page::COMMAND_BYTES
-                } else {
-                    44
-                }
-    }) || (!user && engine_class >= 2)
+    let batch_first = r.flags & BATCH_FIRST != 0;
+    // A reloc-free submission with a handle LUT uses the standard
+    // soft-pinned user-object path. BATCH_FIRST selects object 0; otherwise
+    // i915's standard batch-last rule selects the final object. Mesa ANV uses
+    // batch-last and batch_len=0; i915 treats zero length as the remaining
+    // bytes in that object for both layouts.
+    let user = batch_first || r.flags & HANDLE_LUT != 0;
+    if !user
+        || r.count == 0
+        || r.count > 1024
+        || (r.length != 0 && !r.length.is_multiple_of(8))
         || !r.start.is_multiple_of(8)
         || r.dr1 != 0
         || r.dr4 != 0
@@ -485,12 +452,7 @@ pub(super) fn exec_request(
         || (r.flags & (FENCE_IN | FENCE_OUT) == 0 && r.reserved != 0)
         || (r.flags & FENCE_IN != 0) != input.is_some()
         || r.flags
-            & !(FENCE_ARRAY
-                | EXTENSIONS
-                | FENCE_IN
-                | FENCE_OUT
-                | 0x3f
-                | if user { BATCH_FIRST | HANDLE_LUT } else { 0 })
+            & !(FENCE_ARRAY | EXTENSIONS | FENCE_IN | FENCE_OUT | 0x3f | BATCH_FIRST | HANDLE_LUT)
             != NO_RELOC
         || r.fence_count > 64
         || r.flags & (FENCE_ARRAY | EXTENSIONS) == (FENCE_ARRAY | EXTENSIONS)
@@ -511,26 +473,20 @@ pub(super) fn exec_request(
         .try_reserve_exact(records.len())
         .map_err(|_| AxError::NoMemory)?;
     for (i, o) in records.iter().enumerate() {
-        let permitted =
-            PINNED | ADDRESS48 | ASYNC | CAPTURE | if user || i == 1 { WRITE } else { 0 };
+        let permitted = PINNED | ADDRESS48 | ASYNC | CAPTURE | WRITE;
         if o.relocations != 0
             || o.relocation_pointer != 0
             || !matches!(o.alignment, 0 | 4096)
-            || (!user && o.offset != 0x10000 * (i as u64 + 1))
             || o.flags & !(ADDRESS48 | WRITE | ASYNC | CAPTURE) != PINNED
             || o.flags & !permitted != 0
-            || (!user && i == 1 && o.flags & WRITE == 0)
-            || (user && i == 0 && o.flags & WRITE != 0)
+            || (i == if batch_first { 0 } else { r.count as usize - 1 } && o.flags & WRITE != 0)
             || o.reserved1 != 0
             || o.reserved2 != 0
         {
             return Err(AxError::InvalidInput);
         }
         let object = object(file, o.handle)?;
-        if object.size == 0
-            || object.size > if user { MAX_SIZE } else { 65536 }
-            || object.backing.host_resource().is_some()
-        {
+        if object.size == 0 || object.size > MAX_SIZE || object.backing.host_resource().is_some() {
             return Err(AxError::InvalidInput);
         }
         if objects
@@ -613,56 +569,49 @@ pub(super) fn exec_request(
     for prior in &inputs {
         prior.wait(Some(Duration::from_millis(500)))?;
     }
-    let batch_index = if user { 0 } else { 2 };
-    let (start, _) = range(
-        &objects[batch_index],
-        u64::from(r.start),
-        if user {
-            u64::from(r.length)
-        } else if render {
-            4096
-        } else {
-            44
-        },
-    )?;
+    let batch_index = if batch_first { 0 } else { records.len() - 1 };
+    let batch_length = if r.length == 0 {
+        objects[batch_index]
+            .size
+            .checked_sub(u64::from(r.start))
+            .ok_or(AxError::InvalidInput)?
+    } else {
+        u64::from(r.length)
+    };
+    let _ = range(&objects[batch_index], u64::from(r.start), batch_length)?;
     // EXEC_OBJECT_ASYNC opts this batch object out of implicit reservation
     // waiting just like any other object. Explicit syncobj/FENCE_IN waits were
     // collected and completed above and are never skipped by this flag.
     if records[batch_index].flags & ASYNC == 0 {
         previous(&objects[batch_index], Some(Duration::from_millis(500)))?;
     }
-    let user_job = if user {
-        let mut resident = Vec::new();
-        resident
-            .try_reserve_exact(records.len())
-            .map_err(|_| AxError::NoMemory)?;
-        for (index, (record, pages)) in records.iter().zip(&pages).enumerate() {
-            resident.push(super::gt::copy::UserObject {
-                address: record.offset,
-                pages: pages.clone(),
-                // EXEC_OBJECT_WRITE is a reservation hint, not PTE protection.
-                // Linux system GEM is writable unless the object is read-only;
-                // this adapter admits only its writable system backings.
-                writable: true,
-                cache: objects[index].backing.intel_cache_policy(),
-            });
-        }
-        let job = super::gt::copy::UserJob {
-            objects: resident,
-            batch: records[0]
-                .offset
-                .checked_add(u64::from(r.start))
-                .ok_or(AxError::InvalidInput)?,
-            render,
-            engine_class,
-            engine_instance,
-        };
-        job.validate().map_err(|_| AxError::InvalidInput)?;
-        Some(Arc::try_new(job).map_err(|_| AxError::NoMemory)?)
-    } else {
-        decode(&objects, &pages, start, render)?;
-        None
+    let mut resident = Vec::new();
+    resident
+        .try_reserve_exact(records.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for (index, (record, pages)) in records.iter().zip(&pages).enumerate() {
+        resident.push(super::gt::copy::UserObject {
+            address: record.offset,
+            pages: pages.clone(),
+            // EXEC_OBJECT_WRITE is a reservation hint, not PTE protection.
+            // Linux system GEM is writable unless the object is read-only;
+            // this adapter admits only its writable system backings.
+            writable: true,
+            cache: objects[index].backing.intel_cache_policy(),
+        });
+    }
+    let job = super::gt::copy::UserJob {
+        objects: resident,
+        batch: records[batch_index]
+            .offset
+            .checked_add(u64::from(r.start))
+            .ok_or(AxError::InvalidInput)?,
+        render,
+        engine_class,
+        engine_instance,
     };
+    job.validate().map_err(|_| AxError::InvalidInput)?;
+    let user_job = Arc::try_new(job).map_err(|_| AxError::NoMemory)?;
     let vm = context_job.begin(file)?;
     let image =
         context_job.image_engine(file, (r.flags & 0x3f) as u16, engine_class, engine_instance)?;
@@ -693,20 +642,9 @@ pub(super) fn exec_request(
         }
         // A CPU pwrite could have been admitted between the first snapshot
         // and atomic reservation publication. Observe its final contents now;
-        // later pwrite is behind our completion. Mmap races cannot inject GPU
-        // commands: the native adapter rebuilds this bounded decoded plan.
-        let plan = if let Some(job) = user_job {
-            Plan::User(job)
-        } else {
-            decode(&objects, &pages, start, render)?
-        };
-        execute(
-            pages[0].clone(),
-            pages[if user { 0 } else { 1 }].clone(),
-            plan,
-            vm.clone(),
-            image,
-        )
+        // later writes using synchronized CPU access are behind our completion.
+        let plan = Plan::User(user_job);
+        execute(pages[0].clone(), pages[0].clone(), plan, vm.clone(), image)
     })();
     if result.is_ok() {
         completion.signal();
@@ -783,13 +721,9 @@ pub(crate) fn dispatch_native(
         request,
         completion,
         input,
-        |s, d, p, vm, image| {
-            match p {
-                Plan::Copy(copy) => super::gt::submit_copy(s, d, copy, vm.clone(), image),
-                Plan::Render => super::gt::submit_render(s, d, vm, image),
-                Plan::User(job) => super::gt::submit_user(job, vm, image),
-            }
-            .map_err(|_| AxError::Io)
+        |_s, _d, p, vm, image| {
+            let Plan::User(job) = p;
+            super::gt::submit_user(job, vm, image).map_err(|_| AxError::Io)
         },
     )?;
     finish_output(context, arg, request, output)?;
@@ -922,6 +856,46 @@ pub(super) mod tests {
         create(file, copy, 0).unwrap();
         read_pod::<Create>(copy, 0).unwrap().handle
     }
+    pub(in crate::drm::intel) fn copy_operation() -> intel_gt::bcs::Copy {
+        intel_gt::bcs::Copy {
+            source: 0x10000,
+            destination: 0x20000,
+            source_bytes: 16384,
+            destination_bytes: 16384,
+            width: 64,
+            height: 64,
+            pitch: 256,
+        }
+    }
+    pub(in crate::drm::intel) fn copy_pages(
+        job: &super::super::gt::copy::UserJob,
+    ) -> (Arc<SharedPages>, Arc<SharedPages>) {
+        let source = job
+            .objects
+            .iter()
+            .find(|object| object.address == 0x10000)
+            .expect("source softpin")
+            .pages
+            .clone();
+        let destination = job
+            .objects
+            .iter()
+            .find(|object| object.address == 0x20000)
+            .expect("destination softpin")
+            .pages
+            .clone();
+        (source, destination)
+    }
+    pub(in crate::drm::intel) fn run_copy_objects(plan: Plan) -> AxResult<()> {
+        let Plan::User(job) = plan else {
+            panic!("standard i915 exec path must create a user job")
+        };
+        assert!(!job.render);
+        assert_eq!(job.engine_class, 1);
+        let (source, destination) = copy_pages(&job);
+        super::super::gt::copy::tests::objects(source, destination, copy_operation())
+            .map_err(|_| AxError::Io)
+    }
     pub(in crate::drm::intel) fn prepare(file: &DrmFile, copy: &Image) -> (u32, u32, u32, u32) {
         let handles = [new(file, copy), new(file, copy), new(file, copy)];
         let src = object(file, handles[0])
@@ -930,16 +904,7 @@ pub(super) mod tests {
             .shared_pages()
             .unwrap();
         src.write_bytes(0, &vec![0x73; 16384]).unwrap();
-        let batch = intel_gt::bcs::batch(intel_gt::bcs::Copy {
-            source: 0x10000,
-            destination: 0x20000,
-            source_bytes: 16384,
-            destination_bytes: 16384,
-            width: 64,
-            height: 64,
-            pitch: 256,
-        })
-        .unwrap();
+        let batch = intel_gt::bcs::batch(intel_gt::bcs::Copy { ..copy_operation() }).unwrap();
         let mut data = Vec::new();
         for word in &batch[3..] {
             data.extend_from_slice(&word.to_le_bytes());
@@ -980,8 +945,8 @@ pub(super) mod tests {
             &Exec {
                 buffers: 256,
                 count: 3,
-                length: 44,
-                flags: 3 | NO_RELOC | FENCE_ARRAY,
+                length: 0,
+                flags: 3 | NO_RELOC | HANDLE_LUT | FENCE_ARRAY,
                 fence_count: 1,
                 fences: 512,
                 ..Default::default()
@@ -1221,6 +1186,51 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn standard_i915_batch_first_and_last_zero_length_resolve_object_extent() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        for batch_first in [false, true] {
+            let file = file();
+            let copy = Image(RefCell::new(vec![0; 65536]));
+            let (_, _, batch, _) = prepare(&file, &copy);
+
+            // ANV uses HANDLE_LUT, leaves BATCH_FIRST clear, and sends
+            // batch_len=0. i915 resolves that to the remaining bytes in the
+            // last soft-pinned object. BATCH_FIRST uses the same zero-length
+            // rule, selecting object zero instead.
+            let mut request: Exec = read_pod(&copy, 0).unwrap();
+            request.flags =
+                (request.flags & !BATCH_FIRST) | if batch_first { BATCH_FIRST } else { 0 };
+            request.start = 8;
+            assert_eq!(request.length, 0);
+            assert_eq!(request.flags & BATCH_FIRST != 0, batch_first);
+            assert_ne!(request.flags & HANDLE_LUT, 0);
+            write_pod(&copy, 0, &request).unwrap();
+            exec_with(&file, &copy, 0, |_, _, plan| {
+                let Plan::User(job) = plan else {
+                    panic!("batch-first/last must use the general user-job path")
+                };
+                assert_eq!(job.batch, if batch_first { 0x10008 } else { 0x30008 });
+                assert_eq!(job.objects.len(), 3);
+                assert_eq!(
+                    job.objects[if batch_first { 0 } else { 2 }].address,
+                    if batch_first { 0x10000 } else { 0x30000 }
+                );
+                assert!(!job.render);
+                Ok(())
+            })
+            .unwrap();
+            assert!(
+                object(&file, batch)
+                    .unwrap()
+                    .reservation
+                    .predecessor()
+                    .unwrap()
+                    .is_signaled()
+            );
+        }
+    }
+
+    #[test]
     fn exec_object_async_skips_only_implicit_edges_and_keeps_them_for_later_waits() {
         let _scheduler = crate::test_support::scheduler_test_context();
         for (batch_first, async_index) in [(false, 0), (false, 2), (true, 0), (true, 1)] {
@@ -1308,6 +1318,28 @@ pub(super) mod tests {
         let mut request: Exec = read_pod(&copy, 0).unwrap();
         request.flags |= BATCH_FIRST | HANDLE_LUT;
         request.length = 8;
+        let mut secure = request;
+        secure.flags |= 1 << 9; // I915_EXEC_SECURE is never user-selectable.
+        write_pod(&copy, 0, &secure).unwrap();
+        assert_eq!(
+            exec_with(&file, &copy, 0, |_, _, _| panic!("secure BBS admitted")),
+            Err(AxError::InvalidInput)
+        );
+        for handle in [
+            read_pod::<Object>(&copy, 256).unwrap().handle,
+            read_pod::<Object>(&copy, 256 + size_of::<Object>())
+                .unwrap()
+                .handle,
+        ] {
+            assert!(
+                object(&file, handle)
+                    .unwrap()
+                    .reservation
+                    .predecessor()
+                    .is_none()
+            );
+        }
+        write_pod(&copy, 0, &request).unwrap();
         for start in [16384, u32::MAX & !7] {
             request.start = start;
             write_pod(&copy, 0, &request).unwrap();
@@ -1356,15 +1388,7 @@ pub(super) mod tests {
         let file = file();
         let copy = Image(RefCell::new(vec![0; 65536]));
         let (src, dst, batch, sync) = prepare(&file, &copy);
-        exec_with(&file, &copy, 0, |s, d, p| {
-            match p {
-                Plan::Copy(copy) => super::super::gt::copy::tests::objects(s, d, copy),
-                Plan::Render => super::super::gt::copy::tests::render_objects(s, d),
-                Plan::User(_) => unreachable!(),
-            }
-            .map_err(|_| AxError::Io)
-        })
-        .unwrap();
+        exec_with(&file, &copy, 0, |_, _, plan| run_copy_objects(plan)).unwrap();
         let output = file.syncobj(sync).unwrap().fence().unwrap();
         assert!(output.is_signaled());
         assert!(!output.is_failed());
@@ -1420,7 +1444,7 @@ pub(super) mod tests {
         assert_eq!(first, [0x73]);
     }
     #[test]
-    fn fixed_rcs_user_page_reaches_same_gem_sync_and_private_vm_renderer_model() {
+    fn user_softpin_rcs_submit_uses_owned_vm_and_gem_pages_model() {
         let _context = crate::test_support::scheduler_test_context();
         let file = file();
         let copy = Image(RefCell::new(vec![0; 65536]));
@@ -1480,17 +1504,20 @@ pub(super) mod tests {
             &Exec {
                 buffers: 256,
                 count: 3,
-                length: intel_gt::rcs_page::COMMAND_BYTES,
-                flags: 1 | NO_RELOC,
+                length: 0,
+                flags: 1 | NO_RELOC | HANDLE_LUT,
                 ..Default::default()
             },
         )
         .unwrap();
-        exec_with(&file, &copy, 0, |s, d, p| match p {
-            Plan::Render => {
-                super::super::gt::copy::tests::render_objects(s, d).map_err(|_| AxError::Io)
-            }
-            _ => panic!("not BCS"),
+        exec_with(&file, &copy, 0, |_s, _d, p| {
+            let Plan::User(job) = p else {
+                panic!("standard render submit must create a user job")
+            };
+            assert!(job.render);
+            let (source, destination) = copy_pages(&job);
+            super::super::gt::copy::tests::render_objects(source, destination)
+                .map_err(|_| AxError::Io)
         })
         .unwrap();
         let destination = object(&file, handles[1]).unwrap();
@@ -1503,12 +1530,17 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(result, &bytes[4096..4096 + 16384]);
         assert!(destination.reservation.predecessor().unwrap().is_signaled());
-        // Arbitrary shader edits must never be submitted privileged.
+        // A structurally valid user batch is admitted only through the
+        // soft-pinned user-job path, never the removed private command plan.
         batch.write_bytes(0, &0u32.to_le_bytes()).unwrap();
-        assert_eq!(
-            exec_with(&file, &copy, 0, |_, _, _| panic!("must not submit")),
-            Err(AxError::InvalidInput)
-        );
+        exec_with(&file, &copy, 0, |_, _, plan| {
+            let Plan::User(job) = plan else {
+                panic!("user memory must use non-secure user-job path")
+            };
+            assert_eq!(job.batch, 0x30000);
+            Ok(())
+        })
+        .unwrap();
     }
     #[test]
     fn user_signal_during_exec_does_not_complete_gem_reservations_or_captured_output_fence() {
@@ -1517,7 +1549,7 @@ pub(super) mod tests {
         let copy = Image(RefCell::new(vec![0; 65536]));
         let (source, destination, _, out) = prepare(&file, &copy);
         let output = file.syncobj(out).unwrap();
-        exec_with(&file, &copy, 0, |src, dst, plan| {
+        exec_with(&file, &copy, 0, |_, _, plan| {
             let producer = output.fence().unwrap();
             assert!(!producer.is_signaled());
             output.signal();
@@ -1533,10 +1565,7 @@ pub(super) mod tests {
                         .is_signaled()
                 );
             }
-            let Plan::Copy(operation) = plan else {
-                panic!("copy")
-            };
-            super::super::gt::copy::tests::objects(src, dst, operation).map_err(|_| AxError::Io)
+            run_copy_objects(plan)
         })
         .unwrap();
         assert!(
@@ -1581,17 +1610,13 @@ pub(super) mod tests {
         .unwrap();
         write_pod(&copy, 1024, &1u64).unwrap();
         let object = file.syncobj(out).unwrap();
-        exec_with(&file, &copy, 0, |source, destination, plan| {
+        exec_with(&file, &copy, 0, |_, _, plan| {
             let producer = object.fence_at(1).unwrap();
             assert!(!producer.is_signaled());
             object.signal_point(2).unwrap();
             assert!(!producer.is_signaled());
             assert!(!object.fence_at(2).unwrap().is_signaled());
-            let Plan::Copy(operation) = plan else {
-                panic!("copy")
-            };
-            super::super::gt::copy::tests::objects(source, destination, operation)
-                .map_err(|_| AxError::Io)
+            run_copy_objects(plan)
         })
         .unwrap();
         assert!(object.fence_at(2).unwrap().is_signaled());
@@ -1711,39 +1736,6 @@ pub(super) mod tests {
             exec_with(&file, &copy, 0, |_, _, _| panic!(
                 "same nonzero WAIT/SIGNAL"
             )),
-            Err(AxError::InvalidInput)
-        );
-    }
-    #[test]
-    fn invalid_batch_or_alias_is_refused_before_any_completion_publication() {
-        let _context = crate::test_support::scheduler_test_context();
-        let file = file();
-        let copy = Image(RefCell::new(vec![0; 65536]));
-        let (src, _dst, batch, sync) = prepare(&file, &copy);
-        let pages = object(&file, batch)
-            .unwrap()
-            .backing
-            .shared_pages()
-            .unwrap();
-        pages.write_bytes(0, &0x11000001u32.to_le_bytes()).unwrap(); // arbitrary LRI
-        assert_eq!(
-            exec_with(&file, &copy, 0, |_, _, _| panic!("must not execute")),
-            Err(AxError::InvalidInput)
-        );
-        assert!(file.syncobj(sync).unwrap().fence().is_err());
-        assert!(
-            object(&file, src)
-                .unwrap()
-                .reservation
-                .predecessor()
-                .is_none()
-        );
-        let (_src, _dst, _batch, _sync) = prepare(&file, &copy);
-        let mut dst: Object = read_pod(&copy, 256 + size_of::<Object>()).unwrap();
-        dst.handle = read_pod::<Object>(&copy, 256).unwrap().handle;
-        write_pod(&copy, 256 + size_of::<Object>(), &dst).unwrap();
-        assert_eq!(
-            exec_with(&file, &copy, 0, |_, _, _| panic!("must not execute")),
             Err(AxError::InvalidInput)
         );
     }
