@@ -2044,6 +2044,12 @@ the configured x86 WC mapping with PAT1 readiness, reserved-range admission,
 and acknowledged TLB retirement; it fails closed until the kernel owner installs
 the shared-map shootdown callback.
 
+`i915_query_upstream.rs` translates all 16 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/i915_query.c` (MIT, Copyright © 2018 Intel Corporation),
+including topology, engine, memory-region, HWConfig, GuC submission-version,
+and PERF query paths. PERF ownership calls remain real service dependencies;
+the separate `i915_perf.c` translation is deferred to the end of the task.
+
 `intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
 `drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
 Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.
