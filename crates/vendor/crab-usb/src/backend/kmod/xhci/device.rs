@@ -40,6 +40,23 @@ fn endpoint_address_dci(address: u8) -> u8 {
     endpoint_number * 2 + u8::from(address & 0x80 != 0)
 }
 
+fn control_ep_max_packet_size(speed: Speed, descriptor_value: u8) -> Result<u16> {
+    if matches!(speed, Speed::SuperSpeed | Speed::SuperSpeedPlus) {
+        // USB 3.x encodes 512 bytes as exponent 9 in bMaxPacketSize0;
+        // xHCI Endpoint Contexts take the actual byte count.
+        return if descriptor_value == 9 {
+            Ok(512)
+        } else {
+            Err(USBError::InvalidParameter)
+        };
+    }
+    Ok(u16::from(if descriptor_value == 0 {
+        8
+    } else {
+        descriptor_value
+    }))
+}
+
 pub struct Device {
     id: SlotId,
     ctx: ContextData,
@@ -176,13 +193,9 @@ impl Device {
 
     async fn setup_max_packet(&mut self, desc: DeviceDescriptorBase) -> Result {
         self.ctx.perper_change();
-        // USB 设备描述符的 bMaxPacketSize0 字段（偏移 7）
-        // 对于控制端点，这是直接的字节数值，不需要解码
-        let packet_size = if desc.max_packet_size_0 == 0 {
-            8u8
-        } else {
-            desc.max_packet_size_0
-        } as u16;
+        // The descriptor stores USB 3.x bMaxPacketSize0 as exponent 9,
+        // while the xHCI Endpoint Context expects the decoded byte count.
+        let packet_size = control_ep_max_packet_size(self.port_speed, desc.max_packet_size_0)?;
 
         let dci = Dci::CTRL;
         self.ctx.with_input(|input| {
@@ -1099,5 +1112,29 @@ impl DeviceOp for Device {
 
     fn update_hub(&mut self, params: HubParams) -> BoxFuture<'_, Result<()>> {
         self.update_hub_inner(params).boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_endpoint_packet_size_decodes_usb3_descriptor_exponent() {
+        assert_eq!(
+            control_ep_max_packet_size(Speed::SuperSpeed, 9).unwrap(),
+            512
+        );
+        assert_eq!(
+            control_ep_max_packet_size(Speed::SuperSpeedPlus, 9).unwrap(),
+            512
+        );
+        assert_eq!(control_ep_max_packet_size(Speed::High, 64).unwrap(), 64);
+        assert_eq!(control_ep_max_packet_size(Speed::Low, 8).unwrap(), 8);
+        assert_eq!(control_ep_max_packet_size(Speed::Full, 0).unwrap(), 8);
+        assert!(matches!(
+            control_ep_max_packet_size(Speed::SuperSpeed, 64),
+            Err(USBError::InvalidParameter)
+        ));
     }
 }
