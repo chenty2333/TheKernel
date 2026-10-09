@@ -23,7 +23,9 @@ use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::current;
 use linux_raw_sys::{
     general::{CAP_AUDIT_READ, CAP_NET_ADMIN, CAP_SYS_ADMIN},
-    net::{AF_INET, AF_INET6, AF_NETLINK, AF_UNSPEC, SOCK_DGRAM, SOCK_RAW, sockaddr, socklen_t},
+    net::{
+        AF_INET, AF_INET6, AF_NETLINK, AF_UNSPEC, SOCK_DGRAM, SOCK_RAW, sockaddr, socklen_t,
+    },
 };
 use spin::{Lazy, Mutex, MutexGuard};
 #[cfg(test)]
@@ -122,6 +124,26 @@ const CTRL_ATTR_HDRSIZE: u16 = 4;
 const CTRL_ATTR_MAXATTR: u16 = 5;
 const THEKERNEL_GENL_FAMILY_ID: u16 = 0x11;
 const THEKERNEL_GENL_FAMILY_NAME: &str = "thekernel";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenericFamilySelection {
+    TheKernel,
+    Nl80211,
+}
+
+fn select_generic_family(
+    requested_id: Option<u16>,
+    requested_name: Option<&str>,
+) -> AxResult<GenericFamilySelection> {
+    match (requested_id, requested_name) {
+        (None, None)
+        | (Some(THEKERNEL_GENL_FAMILY_ID), None | Some(THEKERNEL_GENL_FAMILY_NAME))
+        | (None, Some(THEKERNEL_GENL_FAMILY_NAME)) => Ok(GenericFamilySelection::TheKernel),
+        (Some(nl80211::FAMILY_ID), None | Some(nl80211::FAMILY_NAME))
+        | (None, Some(nl80211::FAMILY_NAME)) => Ok(GenericFamilySelection::Nl80211),
+        _ => Err(AxError::NotFound),
+    }
+}
 const NFNL_SUBSYS_NFTABLES: u16 = 10;
 const NFNL_MSG_BATCH_BEGIN: u16 = 16;
 const NFNL_MSG_BATCH_END: u16 = 17;
@@ -194,10 +216,7 @@ fn validate_netlink_frames(data: &[u8]) -> AxResult {
 /// Ordinary receiver framing differs from the exact-envelope uevent path
 /// and this implementation's transactional nfnetlink preflight.
 fn validate_protocol_frames(protocol: u32, data: &[u8]) -> AxResult<&[u8]> {
-    if matches!(
-        protocol,
-        NETLINK_ROUTE | NETLINK_SOCK_DIAG | NETLINK_GENERIC
-    ) {
+    if matches!(protocol, NETLINK_ROUTE | NETLINK_SOCK_DIAG | NETLINK_GENERIC) {
         Ok(&data[..framing::ordinary_prefix_len(data)])
     } else {
         validate_netlink_frames(data)?;
@@ -830,18 +849,18 @@ static KOBJECT_UEVENT_SEND_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 static NETLINK_NEXT_PORT_ID: AtomicU32 = AtomicU32::new(1);
 mod audit;
 mod diag;
-mod framing;
 mod link_stats;
+mod framing;
 mod nft;
 mod nl80211;
-mod unix_observations;
 mod wiremsg;
+mod unix_observations;
 
 pub(crate) use audit::*;
 pub(crate) use diag::*;
 pub(crate) use nft::*;
-pub(crate) use unix_observations::*;
 pub(crate) use wiremsg::*;
+pub(crate) use unix_observations::*;
 
 struct NetlinkPortBinding {
     net_ns: Weak<NetworkNamespace>,
@@ -1834,15 +1853,9 @@ impl NetlinkSocket {
 
         let data = validate_protocol_frames(self.protocol, data)?;
 
-        if let NetlinkWritePermit::SockDiag {
-            records, nowait, ..
-        } = permit
-        {
+        if let NetlinkWritePermit::SockDiag { records, nowait, .. } = permit {
             *records = diagnostic_records(
-                &self.net_ns,
-                *nowait,
-                actor,
-                requested_diagnostic_protocols(data),
+                &self.net_ns, *nowait, actor, requested_diagnostic_protocols(data),
             )?;
         }
 
@@ -2475,13 +2488,11 @@ impl NetlinkSocket {
                     listeners,
                 })
             }
-            NETLINK_SOCK_DIAG => Ok(NetlinkWritePermit::SockDiag {
-                gate,
-                state,
-                queue,
-                records: Vec::new(),
-                nowait,
-            }),
+            NETLINK_SOCK_DIAG => {
+                Ok(NetlinkWritePermit::SockDiag {
+                    gate, state, queue, records: Vec::new(), nowait,
+                })
+            }
             _ => Err(AxError::OperationNotSupported),
         }
     }
@@ -2548,12 +2559,9 @@ impl NetlinkSocket {
             },
         )?;
         let port_id = permit.port_id();
-        let selected = match (requested_id, requested_name.as_deref()) {
-            (Some(THEKERNEL_GENL_FAMILY_ID), None | Some(THEKERNEL_GENL_FAMILY_NAME))
-            | (None, Some(THEKERNEL_GENL_FAMILY_NAME)) => generic_family_message(hdr, port_id),
-            (Some(nl80211::FAMILY_ID), None | Some(nl80211::FAMILY_NAME))
-            | (None, Some(nl80211::FAMILY_NAME)) => nl80211::family_message(hdr, port_id),
-            _ => return Err(AxError::NotFound),
+        let selected = match select_generic_family(requested_id, requested_name.as_deref())? {
+            GenericFamilySelection::TheKernel => generic_family_message(hdr, port_id),
+            GenericFamilySelection::Nl80211 => nl80211::family_message(hdr, port_id),
         };
         self.enqueue_kernel_permitted(permit, selected);
         Ok(())
@@ -2578,10 +2586,7 @@ impl NetlinkSocket {
         }
         // Linux selects dump when either NLM_F_ROOT or NLM_F_MATCH is set.
         // Exact lookup/bytecode providers have not been implemented here.
-        if !matches!(payload[1], 6 | 17)
-            || hdr.nlmsg_flags & 0x300 == 0
-            || payload.len() != INET_DIAG_REQ_V2_LEN
-        {
+        if !matches!(payload[1], 6 | 17) || hdr.nlmsg_flags & 0x300 == 0 || payload.len() != INET_DIAG_REQ_V2_LEN {
             return Err(AxError::OperationNotSupported);
         }
         let request = InetDiagRequest::parse(&payload[..INET_DIAG_REQ_V2_LEN])?;
@@ -3513,11 +3518,8 @@ impl NetlinkSocket {
             .ok_or(AxError::BadState)?
             .interfaces()?;
         for interface in interfaces {
-            let stats = permit
-                .route_service()
-                .ok_or(AxError::BadState)?
-                .interface_statistics(interface.index)
-                .ok_or(AxError::NotFound)?;
+            let stats = permit.route_service().ok_or(AxError::BadState)?
+                .interface_statistics(interface.index).ok_or(AxError::NotFound)?;
             let link = link_entry(interface, stats);
             if let Some(filter) = filter
                 && filter.ifi_index > 0
@@ -3761,6 +3763,26 @@ mod tests {
         task::{Cred, Kgid, Kuid, NetworkNamespace, UserNamespace},
     };
 
+    #[test]
+    fn generic_family_get_without_selector_keeps_the_kernel_default() {
+        assert_eq!(
+            select_generic_family(None, None),
+            Ok(GenericFamilySelection::TheKernel)
+        );
+        assert_eq!(
+            select_generic_family(Some(THEKERNEL_GENL_FAMILY_ID), None),
+            Ok(GenericFamilySelection::TheKernel)
+        );
+        assert_eq!(
+            select_generic_family(None, Some(nl80211::FAMILY_NAME)),
+            Ok(GenericFamilySelection::Nl80211)
+        );
+        assert_eq!(
+            select_generic_family(Some(0xffff), None),
+            Err(AxError::NotFound)
+        );
+    }
+
     struct UnreadableLengthSource {
         remaining: usize,
     }
@@ -3986,26 +4008,11 @@ mod tests {
     #[test]
     fn ordinary_netlink_padding_does_not_weaken_transactional_or_uevent_framing() {
         let bytes = [0u8; 16];
-        assert_eq!(
-            validate_protocol_frames(NETLINK_ROUTE, &bytes).unwrap(),
-            &[]
-        );
-        assert_eq!(
-            validate_protocol_frames(NETLINK_SOCK_DIAG, &bytes).unwrap(),
-            &[]
-        );
-        assert_eq!(
-            validate_protocol_frames(NETLINK_GENERIC, &bytes).unwrap(),
-            &[]
-        );
-        assert_eq!(
-            validate_protocol_frames(NETLINK_NETFILTER, &bytes),
-            Err(AxError::InvalidInput)
-        );
-        assert_eq!(
-            validate_protocol_frames(NETLINK_KOBJECT_UEVENT, &bytes),
-            Err(AxError::InvalidInput)
-        );
+        assert_eq!(validate_protocol_frames(NETLINK_ROUTE, &bytes).unwrap(), &[]);
+        assert_eq!(validate_protocol_frames(NETLINK_SOCK_DIAG, &bytes).unwrap(), &[]);
+        assert_eq!(validate_protocol_frames(NETLINK_GENERIC, &bytes).unwrap(), &[]);
+        assert_eq!(validate_protocol_frames(NETLINK_NETFILTER, &bytes), Err(AxError::InvalidInput));
+        assert_eq!(validate_protocol_frames(NETLINK_KOBJECT_UEVENT, &bytes), Err(AxError::InvalidInput));
     }
 
     #[test]
@@ -4048,10 +4055,7 @@ mod tests {
 
         // Length admission still imports exactly once. Linux's ordinary
         // receiver then ignores a zero-length first header without dispatch.
-        assert_eq!(
-            socket.write_with_actor(&mut source, &actor, 1).unwrap(),
-            NETLINK_MAX_MESSAGE_BYTES
-        );
+        assert_eq!(socket.write_with_actor(&mut source, &actor, 1).unwrap(), NETLINK_MAX_MESSAGE_BYTES);
         assert_eq!(source.remaining, 0);
         assert_eq!(source.reads, 1);
     }
@@ -5221,10 +5225,7 @@ mod tests {
             remaining: 400_000,
             reads: 0,
         };
-        assert_eq!(
-            socket.write_with_actor(&mut source, &actor, 1).unwrap(),
-            400_000
-        );
+        assert_eq!(socket.write_with_actor(&mut source, &actor, 1).unwrap(), 400_000);
         assert_eq!(source.remaining, 0);
     }
 
