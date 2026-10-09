@@ -406,3 +406,6 @@ pub(crate) fn wait(
     }
     Err(Error::Timeout(reg))
 }
+pub mod intel_engine_user_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]

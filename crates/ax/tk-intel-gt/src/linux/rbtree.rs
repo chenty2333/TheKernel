@@ -128,6 +128,98 @@ unsafe fn rotate_right(root: *mut *mut RbNode, node: *mut RbNode) {
     set_parent(node, left);
 }
 
+/// Link a node into an ordinary Linux rb-tree at a caller-selected slot.
+///
+/// This is the `rb_link_node()` header operation; the node is inserted red and
+/// must be followed by `rb_insert_color()` before it is observed by readers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_link_node(
+    node: *mut RbNode,
+    parent: *mut RbNode,
+    link: *mut *mut RbNode,
+) {
+    unsafe {
+        (*node).parent_color = parent as usize;
+        (*node).left = core::ptr::null_mut();
+        (*node).right = core::ptr::null_mut();
+        *link = node;
+    }
+}
+
+/// Rebalance an ordinary rb-tree after `rb_link_node()`.
+///
+/// This is an independently implemented LinuxKPI primitive. The caller owns
+/// ordering and node lifetime; this function only restores red-black
+/// invariants using the crate's intrusive-node representation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_insert_color(node: *mut RbNode, root: *mut RbRoot) {
+    let mut node = node;
+    let root = unsafe { core::ptr::addr_of_mut!((*root).node) };
+
+    loop {
+        let p = unsafe { parent(node) };
+        if p.is_null() || unsafe { color(p) == RB_BLACK } {
+            break;
+        }
+
+        let g = unsafe { parent(p) };
+        if g.is_null() {
+            break;
+        }
+
+        if core::ptr::eq(p, unsafe { (*g).left }) {
+            let u = unsafe { (*g).right };
+            if unsafe { color(u) == RB_RED } {
+                unsafe {
+                    set_color(p, RB_BLACK);
+                    set_color(u, RB_BLACK);
+                    set_color(g, RB_RED);
+                }
+                node = g;
+                continue;
+            }
+
+            if core::ptr::eq(node, unsafe { (*p).right }) {
+                node = p;
+                unsafe { rotate_left(root, node) };
+            }
+            let p = unsafe { parent(node) };
+            let g = unsafe { parent(p) };
+            unsafe {
+                set_color(p, RB_BLACK);
+                set_color(g, RB_RED);
+                rotate_right(root, g);
+            }
+        } else {
+            let u = unsafe { (*g).left };
+            if unsafe { color(u) == RB_RED } {
+                unsafe {
+                    set_color(p, RB_BLACK);
+                    set_color(u, RB_BLACK);
+                    set_color(g, RB_RED);
+                }
+                node = g;
+                continue;
+            }
+
+            if core::ptr::eq(node, unsafe { (*p).left }) {
+                node = p;
+                unsafe { rotate_right(root, node) };
+            }
+            let p = unsafe { parent(node) };
+            let g = unsafe { parent(p) };
+            unsafe {
+                set_color(p, RB_BLACK);
+                set_color(g, RB_RED);
+                rotate_left(root, g);
+            }
+        }
+        break;
+    }
+
+    unsafe { set_color(*root, RB_BLACK) };
+}
+
 pub unsafe fn rb_next(node: *mut RbNode) -> *mut RbNode {
     if node.is_null() {
         return core::ptr::null_mut();
@@ -146,6 +238,24 @@ pub unsafe fn rb_next(node: *mut RbNode) -> *mut RbNode {
         p = parent(p);
     }
     p
+}
+
+/// Return the first node in in-order traversal of a Linux rb-tree.
+/// This is the `rb_first()` inline from `include/linux/rbtree.h`.
+#[inline]
+pub unsafe fn rb_first(root: *const RbRoot) -> *mut RbNode {
+    if root.is_null() {
+        return core::ptr::null_mut();
+    }
+    let mut node = unsafe { (*root).node };
+    while !node.is_null() {
+        let left = unsafe { (*node).left };
+        if left.is_null() {
+            break;
+        }
+        node = left;
+    }
+    node
 }
 
 unsafe fn erase_fixup(root: *mut *mut RbNode, mut node: *mut RbNode, mut p: *mut RbNode) {
@@ -303,6 +413,54 @@ pub fn rb_erase_cached<N: RbNodePtr>(node: N, root: &mut RbRootCached) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[repr(C)]
+    struct Entry {
+        node: RbNode,
+        key: u32,
+    }
+
+    #[test]
+    fn c_abi_insert_balances_and_preserves_inorder_sequence() {
+        let mut entries = [
+            Entry { node: RbNode { parent_color: 0, left: core::ptr::null_mut(), right: core::ptr::null_mut() }, key: 3 },
+            Entry { node: RbNode { parent_color: 0, left: core::ptr::null_mut(), right: core::ptr::null_mut() }, key: 1 },
+            Entry { node: RbNode { parent_color: 0, left: core::ptr::null_mut(), right: core::ptr::null_mut() }, key: 4 },
+            Entry { node: RbNode { parent_color: 0, left: core::ptr::null_mut(), right: core::ptr::null_mut() }, key: 0 },
+            Entry { node: RbNode { parent_color: 0, left: core::ptr::null_mut(), right: core::ptr::null_mut() }, key: 2 },
+        ];
+        let mut root = RbRoot { node: core::ptr::null_mut() };
+
+        for entry in &mut entries {
+            let node = core::ptr::addr_of_mut!(entry.node);
+            let mut parent = core::ptr::null_mut();
+            let mut link = core::ptr::addr_of_mut!(root.node);
+            unsafe {
+                while !(*link).is_null() {
+                    parent = *link;
+                    let existing = parent.cast::<Entry>();
+                    link = if entry.key < (*existing).key {
+                        core::ptr::addr_of_mut!((*parent).left)
+                    } else {
+                        core::ptr::addr_of_mut!((*parent).right)
+                    };
+                }
+                rb_link_node(node, parent, link);
+                rb_insert_color(node, &mut root);
+            }
+        }
+
+        assert_eq!(unsafe { color(root.node) }, RB_BLACK);
+        let mut node = unsafe { rb_first(&root) };
+        let mut observed = [u32::MAX; 5];
+        for key in &mut observed {
+            assert!(!node.is_null());
+            *key = unsafe { (*node.cast::<Entry>()).key };
+            node = unsafe { rb_next(node) };
+        }
+        assert_eq!(observed, [0, 1, 2, 3, 4]);
+        assert!(node.is_null());
+    }
 
     #[test]
     fn cached_first_tracks_erase_of_leftmost_node() {

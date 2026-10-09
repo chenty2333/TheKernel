@@ -87,6 +87,45 @@ pub unsafe fn list_add(new: *mut ListHead, head: *mut ListHead) {
     __list_add(new, head, (*head).next);
 }
 
+/// C ABI provider for the LinuxKPI `list_sort()` contract.
+///
+/// The generic Linux implementation is GPL-only and is not copied here. This
+/// independent, allocation-free stable insertion sort has the same ordering
+/// contract; the i915 engine-registration list is small and sorted once during
+/// device setup.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn list_sort(
+    priv_: *mut core::ffi::c_void,
+    head: *mut ListHead,
+    cmp: unsafe extern "C" fn(
+        *mut core::ffi::c_void,
+        *const ListHead,
+        *const ListHead,
+    ) -> i32,
+) {
+    let mut node = unsafe { (*head).next };
+    unsafe {
+        (*head).next = head;
+        (*head).prev = head;
+    }
+
+    while !core::ptr::eq(node, head) {
+        let next = unsafe { (*node).next };
+        let mut cursor = unsafe { (*head).next };
+        while !core::ptr::eq(cursor, head) && unsafe { cmp(priv_, cursor, node) <= 0 } {
+            cursor = unsafe { (*cursor).next };
+        }
+
+        unsafe {
+            (*node).prev = (*cursor).prev;
+            (*node).next = cursor;
+            (*(*cursor).prev).next = node;
+            (*cursor).prev = node;
+        }
+        node = next;
+    }
+}
+
 pub unsafe fn list_add_tail(new: *mut ListHead, head: *mut ListHead) {
     __list_add(new, (*head).prev, head);
 }
@@ -510,4 +549,57 @@ macro_rules! for_each_child {
         };
         list_for_each_entry!($child, head, parallel.children.child_link, { $($body)+ });
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(C)]
+    struct Entry {
+        link: ListHead,
+        key: u32,
+        serial: u32,
+    }
+
+    unsafe extern "C" fn by_key(
+        _priv: *mut core::ffi::c_void,
+        a: *const ListHead,
+        b: *const ListHead,
+    ) -> i32 {
+        let a = a.cast::<Entry>();
+        let b = b.cast::<Entry>();
+        unsafe { (*a).key.cmp(&(*b).key) as i32 }
+    }
+
+    #[test]
+    fn list_sort_is_stable_and_restores_both_links() {
+        let mut head = ListHead {
+            next: core::ptr::null_mut(),
+            prev: core::ptr::null_mut(),
+        };
+        unsafe { INIT_LIST_HEAD(&mut head) };
+        let mut entries = [
+            Entry { link: ListHead { next: core::ptr::null_mut(), prev: core::ptr::null_mut() }, key: 2, serial: 0 },
+            Entry { link: ListHead { next: core::ptr::null_mut(), prev: core::ptr::null_mut() }, key: 1, serial: 1 },
+            Entry { link: ListHead { next: core::ptr::null_mut(), prev: core::ptr::null_mut() }, key: 2, serial: 2 },
+        ];
+        for entry in &mut entries {
+            unsafe { list_add_tail(core::ptr::addr_of_mut!(entry.link), &mut head) };
+        }
+
+        unsafe { list_sort(core::ptr::null_mut(), &mut head, by_key) };
+
+        let mut got = [(0u32, 0u32); 3];
+        let mut link = head.next;
+        for item in &mut got {
+            assert!(!core::ptr::eq(link, &mut head));
+            let entry = link.cast::<Entry>();
+            *item = unsafe { ((*entry).key, (*entry).serial) };
+            assert!(core::ptr::eq(unsafe { (*link).next }.as_ref().unwrap().prev, link));
+            link = unsafe { (*link).next };
+        }
+        assert!(core::ptr::eq(link, &mut head));
+        assert_eq!(got, [(1, 1), (2, 0), (2, 2)]);
+    }
 }
