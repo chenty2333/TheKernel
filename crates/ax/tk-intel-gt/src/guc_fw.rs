@@ -908,6 +908,7 @@ mod tests {
             stuck: false,
             fail_start: false,
         };
+        assert_eq!(image.status(), crate::uc::FirmwareStatus::Available);
         assert_eq!(guc_upload(&io, 0x10_0000, &image), Ok(0xf0 << 8));
         assert_eq!(image.status(), crate::uc::FirmwareStatus::Running);
         let writes = io.writes.borrow();

@@ -482,6 +482,9 @@ mod tests {
     #[test]
     fn firmware_status_follows_fetch_init_upload_and_reset_phases() {
         assert!(FirmwareStatus::Available.permits(FirmwareStatus::Loadable));
+        // The upload helper owns this transition; a caller-side pre-transition
+        // would make the helper's own Available -> Loadable fail.
+        assert!(!FirmwareStatus::Loadable.permits(FirmwareStatus::Loadable));
         assert!(FirmwareStatus::Loadable.permits(FirmwareStatus::Transferred));
         assert!(FirmwareStatus::Transferred.permits(FirmwareStatus::Running));
         assert!(FirmwareStatus::Running.permits(FirmwareStatus::Loadable));
@@ -588,5 +591,55 @@ mod tests {
         assert_eq!(check_file_version((70, 12, 1), (70, 1, 1), false), Ok(true));
         assert_eq!(check_file_version((70, 12, 1), (69, 0, 3), false), Err(()));
         assert_eq!(check_file_version((0, 0, 0), (7, 9, 3), false), Ok(false));
+    }
+
+    #[test]
+    #[ignore = "requires the staged official i915 firmware blobs"]
+    fn staged_adl_firmware_parses_through_the_product_loader() {
+        const MAX_UC_BYTES: usize = 2 * 1024 * 1024;
+        const WOPCM_BYTES: usize = 2 * 1024 * 1024;
+        let root = std::path::PathBuf::from(
+            std::env::var_os("THEKERNEL_TEST_FIRMWARE_ROOT")
+                .expect("set THEKERNEL_TEST_FIRMWARE_ROOT to a staged firmware directory"),
+        );
+        let guc_bytes = std::fs::read(root.join("i915/tgl_guc_70.bin")).unwrap();
+        let huc_bytes = std::fs::read(root.join("i915/tgl_huc.bin")).unwrap();
+
+        let guc = load(
+            Platform::AlderLakeN,
+            Kind::GuC,
+            MAX_UC_BYTES,
+            WOPCM_BYTES,
+            |path, max| {
+                assert_eq!(max, MAX_UC_BYTES);
+                (path == "i915/tgl_guc_70.bin").then(|| guc_bytes.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(guc.css.version, (70, 49, 4));
+        assert_eq!(guc.css.vf_version, 0x0001_1804);
+        assert_eq!(
+            guc_css_info(guc.css.version, guc.css).submission_version,
+            (1, 24, 4)
+        );
+        assert_eq!(guc.css.private_data_bytes, 8_392_704);
+        assert_eq!(guc.css.header_bytes + guc.css.microcode_bytes, 335_104);
+        assert_eq!(guc.css.rsa_bytes, 256);
+
+        let huc = load(
+            Platform::AlderLakeN,
+            Kind::HuC,
+            MAX_UC_BYTES,
+            WOPCM_BYTES,
+            |path, max| {
+                assert_eq!(max, MAX_UC_BYTES);
+                (path == "i915/tgl_huc.bin").then(|| huc_bytes.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(huc.css.version, (7, 9, 3));
+        assert_eq!(huc.css.header_bytes + huc.css.microcode_bytes, 589_632);
+        assert_eq!(huc.css.rsa_bytes, 256);
+        assert_eq!(huc.css.private_data_bytes, 0);
     }
 }
