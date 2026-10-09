@@ -1982,6 +1982,15 @@ mod tests {
             intel_dp_training_pattern(&dp, &io, &state, DpPhy::Dprx),
             DP_TRAINING_PATTERN_3 as u32
         );
+
+        // LTTPR capability was read separately; DPRX DPCD pattern bits do not
+        // gate the repeater's pattern selection.
+        dp.dpcd[2] = 0;
+        io.source_tps4 = true;
+        assert_eq!(
+            intel_dp_training_pattern(&dp, &io, &state, DpPhy::Lttpr(0)),
+            DP_TRAINING_PATTERN_4 as u32
+        );
     }
 
     #[test]
