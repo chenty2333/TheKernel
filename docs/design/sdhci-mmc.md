@@ -119,3 +119,8 @@ this block-driver model.
 Card hotplug now follows the upstream task/poll/present split by source function
 name. The slot table lock is acquired for one slot at a time; long card command
 polls no longer hold the lock while unrelated slots are inspected.
+
+The upstream `sdhci_retune()` state transition is represented by a small pending
+bit latch; CMD19/CMD21 retuning executes from the next request path, never in
+the interrupt top half. Periodic interval checks are likewise request-driven,
+not a dedicated callout worker.

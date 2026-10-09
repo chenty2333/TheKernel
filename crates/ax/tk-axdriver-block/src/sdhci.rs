@@ -1490,7 +1490,7 @@ impl<I: SdhciIo> SdhciHost<I> {
             0
         } else {
             if status & SDHCI_INT_RETUNE != 0 {
-                self.retune_requested = true;
+                self.sdhci_retune();
                 self.io.write32(SDHCI_INT_STATUS as usize, SDHCI_INT_RETUNE);
             }
             status & !SDHCI_INT_RETUNE
@@ -1499,6 +1499,13 @@ impl<I: SdhciIo> SdhciHost<I> {
 
     fn take_retune_request(&mut self) -> bool {
         core::mem::take(&mut self.retune_requested)
+    }
+
+    // The controller's retune timer only sets a pending bit; actual CMD19/
+    // CMD21 work runs in request context through `mmc_retune()`.
+    // upstream: sdhci.c sdhci_retune()
+    fn sdhci_retune(&mut self) {
+        self.retune_requested = true;
     }
 
     // upstream: sdhci.c sdhci_cmd_irq() error classification
@@ -2964,7 +2971,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
             self.host
                 .io
                 .write32(SDHCI_INT_STATUS as usize, SDHCI_INT_RETUNE);
-            self.host.retune_requested = true;
+            self.host.sdhci_retune();
         }
         let requested = self.host.take_retune_request();
         let now = self.host.io.monotonic_time_ns();
