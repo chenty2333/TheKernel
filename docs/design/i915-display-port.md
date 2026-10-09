@@ -62,22 +62,28 @@ Replacement will proceed behind this queue boundary, maintaining one serialized 
 
 Each phase is a separate commit with focused host/kernel compile checks. The old TC transaction remains the rollback owner until an equivalent translated sequence passes full register-image and failure-injection tests; no preflight or no-op callback counts as activation. Current phase status is tracked in `progress-G1.md`.
 
-### Legacy selection and fallback gate
+### Opt-in selection, error handling, and N305 validation
 
-The planned `intel.legacy_tc_modeset=1` switch selects the existing TC transaction;
-absence of the parameter selects the generic path only after that path has a
-real adapter for every emitted operation. The legacy transaction remains built
-as an explicit fallback. A failed generic transaction may retry through legacy
-only after generic rollback has verified the complete old register/resource
-image (including DPLL, CDCLK, power-domain references, pipe/plane and WM state)
-and has retired any candidate scanout binding. A pre-write failure may fall
-back because hardware is unchanged. If rollback is incomplete or uncertain,
-quarantine/lost-device handling takes precedence: do not run another modeset
-against unknown hardware or DMA ownership. This gate prevents fallback from
-turning a partially applied generic commit into a second uncoordinated writer.
+The new path is selected only by `intel.native_modeset=1`; with the parameter
+absent, Native continues to use the current TC transaction and its rollback.
+The existing top-level `intel.modeset=1` write opt-in remains required. There is
+no automatic retry through the old transaction: an error follows the translated
+commit's cleanup/unwind path and then fails the commit. If cleanup cannot prove
+that pipe, plane, PLL, CDCLK, DDI/TC and power-domain state are restored, the
+adapter must mark the device lost and retain/quarantine every possibly scanned
+out DMA binding. It must not start a second writer against uncertain hardware.
+The new path stays opt-in until physical N305 validation is complete.
 
-As of this plan update, `ModesetOps` remains hook-driven and has no complete
-Native hardware adapter; the current TC transaction cannot be substituted by
-mapping already-owned actions to no-ops. Therefore the selection parameter and
-default-path switch are deliberately not activated until the generic callbacks
-and their common rollback journal exist.
+Before changing the eventual default, test on the actual N305 with the Fedora
+fallback kernel and remote/serial recovery available. Keep Secure Boot and the
+known-good boot entry intact. First boot with `intel.modeset=1 intel.native_modeset=1`
+on the verified TC1/TC2 HDMI topology; retain the full early-kernel log and
+confirm the selected path explicitly reported itself. Verify firmware scanout
+readout before any atomic commit, then exercise one initial modeset, framebuffer
+flip, disable/re-enable, and a supported mode change. For every operation,
+verify KMS completion, DDI/transcoder/PLL/CDCLK/WM readbacks, vblank progression,
+no underrun, and correct pixels; inject failures at each phase and verify
+rollback or device-loss quarantine. Also exercise the old path without
+`intel.native_modeset=1`, then reboot the fallback kernel and confirm the
+firmware console remains recoverable. Do not make the new path default on QEMU,
+compile-only or model evidence.
