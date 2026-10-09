@@ -2031,6 +2031,11 @@ Linux 7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_object_frontbuffer.c` (MIT,
 Copyright © 2025 Intel Corporation). The frontbuffer interface preserves the
 display-owned init/fini/flush/invalidate calls as external owner boundaries.
 
+`i915_getparam_upstream.rs` translates the sole definition in Linux 7.2.3
+`drivers/gpu/drm/i915/i915_getparam.c` (MIT; its source header has no
+copyright line), preserving the complete 59-parameter switch and checked
+userspace result write.
+
 `intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
 `drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
 Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.
