@@ -665,7 +665,8 @@ impl HciSocket {
         }
         let mut current = self.binding.lock();
         if current.is_some() {
-            return Err(LinuxError::EINVAL.into());
+            // Linux hci_sock_bind(): a socket that is already bound fails with EALREADY.
+            return Err(LinuxError::EALREADY.into());
         }
         let adapter = if address.channel == HCI_CHANNEL_CONTROL {
             if address.device != HCI_DEV_NONE {
