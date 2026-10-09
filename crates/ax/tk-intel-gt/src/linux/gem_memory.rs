@@ -96,6 +96,20 @@ pub fn pgprot_decrypted(prot: PgProt) -> PgProt {
     prot
 }
 
+// `cachemode2protval()` is an exported x86 helper. `pgprot_noncached()` is
+// the x86 header macro selecting UC-minus (cache mode 2) on supported CPUs.
+unsafe extern "C" {
+    fn cachemode2protval(cache_mode: i32) -> c_ulong;
+}
+
+#[inline]
+pub fn pgprot_noncached(prot: PgProt) -> PgProt {
+    let uc_minus = unsafe { cachemode2protval(2) };
+    PgProt {
+        pgprot: prot.pgprot | uc_minus,
+    }
+}
+
 /// Linux `struct io_mapping` from `include/linux/io-mapping.h`.
 #[repr(C)]
 pub struct IoMapping {
