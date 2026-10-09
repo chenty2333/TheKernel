@@ -1810,6 +1810,25 @@ mod tests {
     }
 
     #[test]
+    fn short_downspread_write_stops_before_bandwidth_programming() {
+        let mut io = SourcePhyFailureIo {
+            short_aux_write: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            intel_dp_prepare_link_train(
+                &IntelDpLinkTraining::default(),
+                &mut io,
+                &LinkTrainingCrtcState::default(),
+            ),
+            Err(LinkTrainingError::Aux)
+        );
+        // The initial downspread write is short; link bandwidth/lane count
+        // programming must not proceed after that failed prerequisite.
+        assert_eq!(io.aux_writes, 1);
+    }
+
+    #[test]
     fn capability_read_error_stops_before_training_writes() {
         let mut io = SourcePhyFailureIo {
             fail_caps_read: true,
