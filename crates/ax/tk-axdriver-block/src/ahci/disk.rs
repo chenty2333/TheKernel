@@ -980,7 +980,7 @@ impl<I: AhciIo> AhciDisk<I> {
         debug_assert_eq!(offset, pending.bytes);
     }
 
-    // upstream: ahci.c ahci_timeout() + ahci_end_transaction()
+    // upstream: ahci.c ahci_ch_intr_main() completion sampling
     fn reap_async(&mut self) -> bool {
         let mut any_physical_completion = false;
         let mut physical_error = None;
@@ -1035,16 +1035,7 @@ impl<I: AhciIo> AhciDisk<I> {
             return true;
         }
         if physical_timeout {
-            let stopped = self.ahci_timeout();
-            self.finish_physical_after_port_reset(
-                if stopped {
-                    BlockCompletionStatus::DeviceError(0xff)
-                } else {
-                    BlockCompletionStatus::Quarantined
-                },
-                None,
-            );
-            return true;
+            return self.ahci_process_timeout();
         }
 
         let AsyncState::InFlight(mut pending) = self.async_state else {
@@ -1120,6 +1111,22 @@ impl<I: AhciIo> AhciDisk<I> {
                 Self::ahci_done(slot, pending, completion_status);
             }
         }
+    }
+
+    /// Retire the active physical-SG batch after bounded request polling
+    /// expires. All outstanding DMA is quarantined unless stop is proven.
+    // upstream: ahci.c ahci_process_timeout()
+    fn ahci_process_timeout(&mut self) -> bool {
+        let stopped = self.ahci_timeout();
+        self.finish_physical_after_port_reset(
+            if stopped {
+                BlockCompletionStatus::DeviceError(0xff)
+            } else {
+                BlockCompletionStatus::Quarantined
+            },
+            None,
+        );
+        true
     }
 
     // Publish the typed completion after the slot's DMA result is known.

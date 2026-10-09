@@ -99,3 +99,8 @@ Physical requests now share source-named `ahci_done()` typed completion
 publication, and reset retirement maps to `ahci_end_transaction()`. These
 adapters preserve request handle/cookie and report zero completed bytes on an
 error; they do not provide CAM sense or request-requeue policy.
+
+`ahci_process_timeout()` drains the active physical batch after a request reaches
+the bounded wait deadline; it performs one shared reset and reports device
+error only if DMA stop is proven, otherwise keeping each caller's physical
+buffer quarantined.
