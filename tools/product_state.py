@@ -320,6 +320,7 @@ ROOTFS_INPUT_FILES = (
     "tests/guest/container-podman.sh",
     "tests/guest/inspect-tools.sh",
     "tests/guest/block-gpt-tools.sh",
+    "tests/guest/block-partition-mkfs-smoke.sh",
     "tests/guest/container-namespace.sh",
     "scripts/lib/musl-host-compiler.sh",
     "scripts/create-rootfs-image.sh",
@@ -400,7 +401,7 @@ def rootfs_image_bytes(payload: str) -> int:
     # class; 160 MiB would leave under 30 MiB free, which is not enough room for
     # a compile's intermediate files.
     return {"none": 160, "tcc": 160, "nested": 224, "glibc": 160,
-            "gcc": 224, "inspect": 160, "containers": 384, "debug": 224,
+            "gcc": 224, "inspect": 192, "containers": 384, "debug": 224,
             "acpica": 160, "wireless": 160}[payload] * 1024 * 1024
 
 

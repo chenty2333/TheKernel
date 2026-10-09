@@ -2204,10 +2204,7 @@ fn block_device_name_for_rdev(rdev: DeviceId) -> AxResult<Option<String>> {
 
     Ok(block_device_names()
         .into_iter()
-        .enumerate()
-        .find_map(|(index, name)| {
-            (mounts::extra_block_device_id(index) == Some(rdev)).then_some(name)
-        }))
+        .find_map(|name| (crate::pseudofs::block_inventory::device_id(&name) == Some(rdev)).then_some(name)))
 }
 
 /// Btrfs has one ordered member set rather than XFS's named device roles.

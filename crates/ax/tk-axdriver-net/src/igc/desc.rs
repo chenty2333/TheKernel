@@ -330,6 +330,19 @@ impl DescriptorMemory {
         Some(value as u16)
     }
 
+    /// A dword from the hardware write-back descriptor, or `None` when the
+    /// descriptor/word is outside the ring. The IGC packet callback reads
+    /// `pkt_info` and the RSS flow id from dwords zero and one.
+    pub fn rx_writeback_word(&self, index: usize, word: usize) -> Option<u32> {
+        let address = self.word(index, word)?;
+        // SAFETY: `word` checked that the dword lies inside the descriptor
+        // allocation. The acquire fence orders the device's writeback before
+        // packet metadata is consumed.
+        let value = unsafe { core::ptr::read_volatile(address.as_ptr()) };
+        compiler_fence(Ordering::Acquire);
+        Some(value)
+    }
+
     /// The receive descriptor's write-back status and error word, or `None`.
     ///
     /// `IGC_RXD_STAT_EOP` and `IGC_RXD_STAT_DD` live in its low byte
@@ -888,8 +901,12 @@ mod tests {
         memory.write_rx_buffer(1, 0x1000);
         // The hardware writes: status_error at word 2, length and VLAN in
         // word 3.
+        scratch.words[1 * 4] = 0x1234_5678;
+        scratch.words[1 * 4 + 1] = 0x9abc_def0;
         scratch.words[1 * 4 + 2] = bits::RXD_STAT_DD | bits::RXD_STAT_EOP;
         scratch.words[1 * 4 + 3] = 1514 | (0x0064 << 16);
+        assert_eq!(memory.rx_writeback_word(1, 0), Some(0x1234_5678));
+        assert_eq!(memory.rx_writeback_word(1, 1), Some(0x9abc_def0));
         let frame = decode_received(&memory, 1).expect("a written-back descriptor");
         assert_eq!(frame.length, 1514);
         assert!(frame.end_of_packet);

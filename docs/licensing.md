@@ -316,7 +316,8 @@ the baseline rootfs tool build. Binary redistribution must also satisfy that
 C library's license (the default host glibc is LGPL-2.1-or-later); this payload
 is not claimed to be BSD-only. The archive and generated tool sources remain
 in the external state cache, not the kernel's vendored runtime tree.
-The optional payload and the merged baseline image each use 160 MiB. It contains no OEM firmware tables.
+The optional inspect payload uses 192 MiB for its signed storage/partition tools;
+the merged baseline image remains 160 MiB. It contains no OEM firmware tables.
 
 ## MIT i915 display translation (Codex D, 2026-10-05)
 
@@ -562,3 +563,26 @@ because this driver port is station-only.
 The shared key dispatch from OpenBSD `ieee80211_crypto.c` also carries its ISC
 grant in that same package license file; its source revision and translated
 function boundary are listed in `docs/upstream-provenance.md`.
+
+The AHCI register/header translation retains the FreeBSD BSD-2-Clause grant and
+attribution; see `crates/ax/tk-axdriver-block/LICENSES/BSD-2-Clause-FreeBSD-AHCI.txt`.
+
+
+The SDHCI hardware register and quirk constants are translated from FreeBSD
+`sys/dev/sdhci/sdhci.h` and retain its BSD-2-Clause attribution in
+`crates/ax/tk-axdriver-block/LICENSES/BSD-2-Clause-FreeBSD-SDHCI.txt`.
+
+The FreeBSD SD/MMC protocol and block path retain BSD-2-Clause attribution;
+see `crates/ax/tk-axdriver-block/LICENSES/BSD-2-Clause-FreeBSD-MMC.txt`.
+
+The SDHCI PCI binding retains FreeBSD BSD-2-Clause attribution in
+`crates/ax/tk-axdriver/LICENSES/BSD-2-Clause-FreeBSD-SDHCI-PCI.txt`.
+
+The Intel e1000 shared register definitions retain the BSD-3-Clause grant at
+`crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
+
+The optional inspect guest payload stages signed Alpine `e2fsprogs` 1.47.4-r0
+(`mkfs.ext4`, `mke2fs`, and `e2fsck`) and its runtime libraries. Its package
+metadata reports GPL-2.0-or-later, LGPL-2.0-or-later, BSD-3-Clause, and MIT
+components; these are unmodified distribution binaries, not translated kernel
+code.

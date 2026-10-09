@@ -20,6 +20,9 @@ pub mod rtl8125;
 #[cfg(feature = "igc")]
 /// Intel i225/i226 (2.5 GbE) NIC device driver.
 pub mod igc;
+#[cfg(feature = "e1000")]
+/// Intel 8254x/e1000e/igb driver family.
+pub mod e1000;
 #[cfg(feature = "ixgbe")]
 /// ixgbe NIC device driver.
 pub mod ixgbe;

@@ -1209,6 +1209,11 @@ impl SharedBlockDevice {
         self.inner.device.lock()
     }
 
+    /// Returns the lower device's hotplug/media-presence snapshot, when known.
+    pub fn media_presence(&self) -> Option<bool> {
+        self.lock_raw().media_presence()
+    }
+
     /// Runs one ordinary synchronous operation through the lower driver's
     /// legacy owner while the device has no published completion custody.
     /// Filesystem setup can run with task blocking disabled; publishing an
@@ -3441,6 +3446,10 @@ impl BlockDriverOps for SharedBlockDevice {
 
     fn block_capabilities(&self) -> BlockCapabilities {
         self.lock_raw().block_capabilities()
+    }
+
+    fn media_presence(&mut self) -> Option<bool> {
+        self.lock_raw().media_presence()
     }
 
     fn read_block(&mut self, block_id: u64, buf: &mut [u8]) -> DevResult {

@@ -4,9 +4,9 @@
 
 macro_rules! register_net_driver {
     ($driver_type:ty, $device_type:ty) => {
-        /// The unified type of the NIC devices.
+        /// The concrete primary network driver selected by the platform.
         #[cfg(not(feature = "dyn"))]
-        pub type AxNetDevice = $device_type;
+        pub type RegisteredStaticNetDevice = $device_type;
     };
 }
 
@@ -53,6 +53,21 @@ macro_rules! for_each_drivers {
         #[cfg(feature = "nvme")]
         {
             type $drv_type = crate::nvme::NvmeDriver;
+            $code
+        }
+        #[cfg(feature = "ahci-pci")]
+        {
+            type $drv_type = crate::drivers::AhciDriver;
+            $code
+        }
+        #[cfg(feature = "sdhci-pci")]
+        {
+            type $drv_type = crate::drivers::SdhciDriver;
+            $code
+        }
+        #[cfg(feature = "e1000")]
+        {
+            type $drv_type = crate::drivers::E1000Driver;
             $code
         }
         #[cfg(feature = "virtio-rng")]

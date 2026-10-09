@@ -410,7 +410,7 @@ fn probe_virtio_input(
 
     match <VirtIoInput as VirtIoDevMeta>::Driver::probe_pci(root, bdf, dev_info) {
         BusProbeResult::Device(crate::AxDeviceEnum::Input(device)) => Some(device),
-        BusProbeResult::NotMatched | BusProbeResult::Claimed => None,
+        BusProbeResult::NotMatched | BusProbeResult::Claimed | BusProbeResult::Devices(_) => None,
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -419,7 +419,10 @@ fn probe_virtio_input(
 #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
 fn quiesce_pci_function(root: &mut PciRoot, bdf: DeviceFunction) {
     crate::pci_resources::invalidate(crate::pci::Address {
-        segment: axhal::pci::ecam_segment(), bus: bdf.bus, device: bdf.device, function: bdf.function,
+        segment: axhal::pci::ecam_segment(),
+        bus: bdf.bus,
+        device: bdf.device,
+        function: bdf.function,
     });
     // Stop DMA and mask INTx before transferring the removal to axinput.  The
     // VirtIO input owner then drops its queues and resets the transport while
@@ -503,14 +506,22 @@ fn config_pci_device(
         let info = root
             .bar_info(bdf, bar)
             .map_err(|_| DevError::InvalidParam)?;
-        let raw = observe_config_word(crate::pci::Address {
-            segment: axhal::pci::ecam_segment(), bus: bdf.bus, device: bdf.device, function: bdf.function,
-        }, 0x10 + usize::from(bar) * 4);
+        let raw = observe_config_word(
+            crate::pci::Address {
+                segment: axhal::pci::ecam_segment(),
+                bus: bdf.bus,
+                device: bdf.device,
+                function: bdf.function,
+            },
+            0x10 + usize::from(bar) * 4,
+        );
         let (start, size) = match info {
             BarInfo::IO { address, size } => (u64::from(address), u64::from(size)),
             BarInfo::Memory { address, size, .. } => (address, u64::from(size)),
         };
-        if let Some(observed) = raw.and_then(|raw| crate::pci_resources::Resource::observed(start, size, raw)) {
+        if let Some(observed) =
+            raw.and_then(|raw| crate::pci_resources::Resource::observed(start, size, raw))
+        {
             resources[usize::from(bar)] = observed;
         } else {
             observed_all = false;
@@ -566,7 +577,10 @@ fn config_pci_device(
             | Command::INTERRUPT_DISABLE,
     );
     let address = crate::pci::Address {
-        segment: axhal::pci::ecam_segment(), bus: bdf.bus, device: bdf.device, function: bdf.function,
+        segment: axhal::pci::ecam_segment(),
+        bus: bdf.bus,
+        device: bdf.device,
+        function: bdf.function,
     };
     if observed_all {
         crate::pci_resources::record(address, resources);
@@ -690,6 +704,16 @@ impl AllDevices {
                                 self.add_device(dev);
                                 return;
                             }
+                        }
+                        BusProbeResult::Devices(devices) => {
+                            for dev in devices {
+                                info!(
+                                    "registered a new {:?} device at {}: {:?}",
+                                    dev.device_type(), bdf, dev.device_name(),
+                                );
+                                self.add_device(dev);
+                            }
+                            return;
                         }
                     }
                     });

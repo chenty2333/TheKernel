@@ -3,6 +3,8 @@
 #![no_std]
 #![cfg_attr(doc, feature(doc_cfg))]
 
+extern crate alloc;
+
 #[cfg(feature = "ramdisk")]
 pub mod ramdisk;
 
@@ -11,6 +13,9 @@ pub mod ramdisk_static;
 
 /// Read-only storage backed by an immutable bootloader module.
 pub mod boot_module;
+
+/// SDHCI/MMC host-controller register definitions and protocol helpers.
+pub mod sdhci;
 
 #[cfg(feature = "ahci")]
 pub mod ahci;
@@ -388,6 +393,17 @@ pub trait BlockDriverOps: BaseDriverOps {
             flush: true,
             ..BlockCapabilities::default()
         }
+    }
+
+    /// True when device policy forbids writes regardless of userspace BLKROSET.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    /// Snapshot of physical media presence for removable/hotpluggable devices.
+    /// `None` means the driver cannot provide an authoritative presence fact.
+    fn media_presence(&mut self) -> Option<bool> {
+        None
     }
 
     /// Reads blocked data from the given block.

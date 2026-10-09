@@ -76,6 +76,14 @@ pub mod pci_resources;
 mod bus;
 mod drivers;
 mod dummy;
+#[cfg(feature = "block-irq")]
+pub mod block_irq;
+#[cfg(feature = "block")]
+mod block_hotplug;
+#[cfg(feature = "block")]
+pub use block_hotplug::{
+    install_runtime_block_add_hook, publish_runtime_block_device, RuntimeBlockAddHook,
+};
 #[cfg(feature = "virtio-sound")]
 pub mod sound;
 mod structs;
@@ -204,6 +212,7 @@ pub fn activate_boot_pci_input_devices<Register, Unregister>(
 /// Returns whether a block device is immutable boot media.
 #[cfg(all(feature = "block", not(feature = "dyn")))]
 pub fn block_device_is_read_only(device: &AxBlockDevice) -> bool {
+    if device.is_read_only() { return true; }
     #[cfg(feature = "nvme")]
     if let StaticBlockDevice::Nvme(nvme) = device { return nvme.read_only(); }
     #[cfg(feature = "shared-block")]
@@ -669,3 +678,10 @@ pub mod itco;
 
 #[cfg(feature = "usb-dbc")]
 pub mod dbc;
+
+#[cfg(feature = "ahci-pci")]
+mod ahci;
+#[cfg(feature = "sdhci-pci")]
+mod sdhci;
+#[cfg(feature = "e1000")]
+mod e1000;

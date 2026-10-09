@@ -37,10 +37,12 @@ dma = [
     "paging",
 ]
 driver-ahci = ["axdriver?/ahci"]
+driver-sdhci = ["axdriver?/sdhci-pci"]
 driver-n305-net = ["axdriver?/n305-net"]
 driver-rtl8125 = ["axdriver?/rtl8125"]
 driver-rtl8168 = ["axdriver?/n305-net", "axdriver?/rtl8168"]
 driver-igc = ["axdriver?/igc"]
+driver-e1000 = ["axdriver?/e1000"]
 driver-ixgbe = ["axdriver?/ixgbe"]
 driver-ramdisk = ["axdriver?/ramdisk"]
 dwarf = [

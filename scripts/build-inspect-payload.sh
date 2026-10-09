@@ -97,7 +97,8 @@ bin_dir.mkdir(parents=True)
 shutil.copy2(root/'bin/busybox', bin_dir/'busybox')
 programs = ['ps', 'top', 'free', 'vmstat', 'uptime', 'pmap', 'pidstat', 'htop',
             'lsblk', 'findmnt', 'mount', 'df', 'lscpu', 'lsns', 'lspci', 'lsusb',
-            'iostat', 'mpstat', 'ip', 'ss', 'netstat', 'unshare', 'nsenter']
+            'iostat', 'mpstat', 'ip', 'ss', 'netstat', 'unshare', 'nsenter',
+            'sfdisk', 'mke2fs', 'mkfs.ext4', 'e2fsck']
 for program in programs:
     source = next((root/part/program for part in ['bin', 'sbin', 'usr/bin', 'usr/sbin']
                    if (root/part/program).exists() or (root/part/program).is_symlink()), None)
@@ -121,6 +122,7 @@ for program in programs:
 shutil.copy2(lock, out/'opt/thekernel-tools/MANIFEST')
 shutil.copy2(Path(os.environ["REPO_ROOT"])/'tests/guest/inspect-tools.sh', out/'opt/thekernel-tools/inspect-tools.sh')
 shutil.copy2(Path(os.environ["REPO_ROOT"])/'tests/guest/block-gpt-tools.sh', out/'opt/thekernel-tools/block-gpt-tools.sh')
+shutil.copy2(Path(os.environ["REPO_ROOT"])/'tests/guest/block-partition-mkfs-smoke.sh', out/'opt/thekernel-tools/partition-mkfs-smoke.sh')
 shutil.copy2(Path(os.environ["REPO_ROOT"])/'tests/guest/container-namespace.sh', out/'opt/thekernel-tools/container-namespace.sh')
 PY
 # OUTPUT is a dedicated regenerable tool staging tree, not a source directory.

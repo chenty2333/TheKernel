@@ -1,6 +1,6 @@
 //! Basic virtual filesystem support
 
-mod block_inventory;
+pub(crate) mod block_inventory;
 mod block_statistics;
 pub mod cgroup;
 #[cfg(any(feature="pmu",feature="hwp-uclamp"))]

@@ -1,8 +1,28 @@
 # Intel i225/i226 (`igc`) Ethernet driver
 
-Status: implemented on `feat/nic-igc`.  **It has never run on the machine it
-was written for.**  This document says what is known, what is assumed, what is
-measured, and what is unverified — and the last list is the long one.
+> **Status update (2026-10-09):** The sections below are a historical account
+> of the initial hand-written probe/ring implementation and are not a current
+> inventory. The driver now includes BSD-licensed FreeBSD translations for
+> `igc_api.c`, `igc_base.c`, `igc_i225.c`, `igc_mac.c`, `igc_nvm.c`,
+> `igc_phy.c`, `igc_txrx.c`, and the implemented `if_igc.c` helpers. The live
+> PCI path installs the I225 operation tables and runs translated NVM/PHY
+> parameter setup, MAC reset/address/RAR initialization, copper autonegotiation,
+> link polling, queue setup, and TX/RX descriptor handling through `IgcNic`.
+> The source-marker audit currently records 74/91 `if_igc.c` ctags functions;
+> the remaining functions are FreeBSD iflib/newbus/sysctl registration or
+> debug-only hooks, with each omission reason in the task progress log. The
+> generic APIs do not expose iflib MSI-X queue allocation, sysctl nodes, dynamic
+> PCI detach, or RX metadata/fragment delivery, so those are not claimed as
+> translated behavior. N305 `net-n305` builds IGC by default. The N305 product
+> build and IGC host tests pass; QEMU has no IGC model.
+
+The original text below predates that translation and uses “this driver” to
+refer to the previous implementation. Where it conflicts with the status
+update, the update is authoritative.
+
+Historical status: implemented on `feat/nic-igc`.  **It has never run on the
+machine it was written for.**  The original report below records what was
+known, assumed, measured, and unverified at that point.
 
 The target is the Acer mini-PC described in [`n305-bringup.md`](n305-bringup.md):
 an Intel i3-N305 (Alder Lake-N) with no operating system installed and no serial
@@ -331,3 +351,55 @@ ends up binding a part it does not understand.
   `125c`, `125d`, `15f2`, `15f3`, `3101`, `3102`, `5502`, `5503`.
 * QEMU 10.2.2 `qemu-system-x86_64 -device help`, for the absence of an
   i225/i226 model.
+
+The IGC shared API now has the FreeBSD `igc_api.c` dispatch surface and I225 callback-table selection translated in `src/igc/api.rs` and `src/igc/i225.rs`. The real PCI probe invokes `igc_setup_init_funcs` to install the source-selected I225 tables before bring-up, but passes `init_device=false`: the callback backend is not yet wired to the translated MAC/NVM/PHY modules, so hardware initialization still uses the legacy platform path.
+
+`igc_base.c` has also been translated into `src/igc/base.rs`; its host-testable base-I/O adapter preserves the function-index semaphore masks, MTA/UTA zeroing order, management-pass-through power-down gate, and receive FIFO erratum sequence. Product binding to this translated base path remains in progress.
+
+The I225 NVM path now translates shadow-RAM reads/writes, semaphore-scoped bursts, `SRWR` completion polling, EEPROM checksum validation/update and flash commit callbacks. NVM access remains behind `IgcI225NvmIo`, which is the platform-facing adapter for the same I225 register/NVM algorithm.
+
+The I225 flash/NVM helper set now includes flash presence, burst bounds, command completion polling, flash-update completion and the source's firmware-vs-software flash-update branches, plus D0/D3 LPLU register masks. The source's unusual erase-result branch is retained and documented in code rather than normalized.
+
+The remaining `igc_i225.c` entrypoints are translated as well: reset preserves the nonfatal PCI-master/auto-read behavior; link checking keeps the duplicated PHY probe and link-up callback order; LTR retains source scaling and register write conditions; EEE and I225 `init_hw` route are represented. The 27 ctags function definitions now each have a source marker. These hardware operations still require the eventual product I/O adapter.
+
+`igc_nvm.c` has all 22 ctags functions represented in `src/igc/nvm.rs`. Register/NVM transactions are expressed through `IgcNvmIo`, preserving the EEPROM bit-banging, grant loops, EERD polling, page-write boundaries, checksum arithmetic, PBA formats and firmware-version decoding. The I225 product adapter is not yet wired to this shared module.
+
+`igc_mac.c` now has 29/29 source functions in `src/igc/mac.rs`. `IgcMacIo` carries the register, NVM, PHY and timing calls; translated logic retains the source's RAR write flushes, reversed MTA writes, flow-control resolution table, I225 2.5G decoding, semaphore retries, auto-read and PCI-master bounds. This adapter is not yet the old `IgcNic` probe path.
+
+`igc_phy.c` now has 26/26 source functions in `src/igc/phy.rs`, covering generic operation table defaults, MDIC transactions, 10/100/1G/2.5G advertisements and pause resolution, PHY reset/link polling, LPLU, GPY MMD and XMDIO access. They remain adapter-backed and are not yet the live probe/packet path.
+
+`igc_txrx.c` has its 11 operational ctags callbacks translated in `src/igc/txrx.rs`; each source callback has a marker. `igc_dump_rs` is the only omitted definition and only prints descriptor/RS state for debugging, so its one-line omission rationale is recorded in `progress-S.md`.
+
+`if_igc.c` translation has started in `src/igc/if_igc.rs` with 18/91 ctags definitions: adaptive interrupt-rate arithmetic, VLAN/promiscuous-multicast policy, I225 IPG workaround and helper boundaries. This is not yet the live `IgcNic` lifecycle or queue path.
+
+The `if_igc.c` low-level reset and hardware queue setup has advanced to 22/91 ctags functions: the PBA/flow-control reset sequence, RSS RETA/key/hash programming, and exact TX/RX ring register initialization are now adapter-backed. iflib allocation and probe/lifecycle binding remain unfinished.
+
+The `if_igc.c` lifecycle adapter now represents interface init/stop, suspend/shutdown/resume, MTU admission, cached link transitions, and the parity-fatal reset/drain order. Its callback boundary is still not installed in `IgcNic` or the PCI probe.
+
+The IGC interface translation now covers the interrupt mask/route and fatal-error state machine paths from `if_igc.c`: legacy and MSI-X causes, ICR fatal capture, deferred admin state, IVAR routing, queue enable and interrupt rate initialization. The PCI/iflib registration/resource allocation and the product bridge are still unfinished.
+
+The next `if_igc.c` batch adds PCI config-space identity capture, L1.2 erratum disable policy, bus-master admission, firmware `DRV_LOAD` ownership, counter exposure policy and the empty MSI-X setup routine. PCI register/interrupt allocation remains a platform boundary rather than a FreeBSD bus resource copy.
+
+The statistics path now mirrors the source counter-read order, including low-dword then high-dword for read-clear 64-bit octet counters, xoff pause observation, and ECC W1C masks. Statistics values are still surfaced through the TheKernel adapter rather than FreeBSD sysctl registration.
+
+The IGC attach adapter now sequences PCI/resource setup, shared-code initialization, reset, NVM checksum retry, address validation, firmware/wakeup setup, post-attach reset/stat/link setup, and detach cleanup. The concrete adapter and live probe/NetDriver registration still need to replace the older hand-authored `IgcNic` path.
+
+The current upstream-helper layer also translates flow-control mode validation, DMAC/EEE reinitialization policy, TSO TCP flag-mask RMW, EITR interrupt-rate conversion and read-only register access from `if_igc.c`. It is not yet wired to the live `IgcNic` probe/NetDriverOps path; that replacement and product-default binding remain incomplete. The remaining omitted `if_igc.c` definitions are framework-only: PCI resource lifetime, iflib MSI-X/queue allocation, media-list registration, FreeBSD sysctl tree/callback registration and debug/descriptor/NVM dump formatters. Per-function reasons are recorded in `progress-S.md`.
+
+The live `IgcNic::transmit` path now invokes the translated `igc_isc_txd_encap` from `igc_txrx.c` for the raw single-segment frames admitted by `NetDriverOps`, then copies its advanced descriptor words into the coherent ring before the tail update. The backend remains single-queue/polling and does not yet route all reset, PHY/NVM and RX operations through the translated callback tables.
+
+The live `IgcNic::init` ring setup now invokes translated `igc_initialize_transmit_unit` and `igc_initialize_receive_unit` from FreeBSD `if_igc.c`. The queue-0 register table was corrected from the Linux IGC offsets to FreeBSD `igc_regs.h` (`RDBAL` 0x2800, `TDBAL` 0x3800); ordinary MTU setup now follows the source by clearing LPE, not writing jumbo RLPML, using one-buffer SRRCTL without a header split, and setting the source's TXDCTL thresholds. The old handwritten queue programming helpers were removed. The reset/PHY/NVM bring-up and product IGC probe are still not fully routed through the source operation tables.
+
+The live transmit reclaim callback now imports the device's write-back status into the translated report-status shadow ring and calls `igc_isc_txd_credits_update` before releasing buffers. The translated ring starts `tx_cidx_processed` at `ntxd - 1`, matching FreeBSD's queue initialization and correctly reclaiming the first packet at descriptor zero. The driver rejects non-power-of-two queue counts because the upstream RS producer/consumer indexes use a ring mask.
+
+The live RX ring refill now routes each DMA buffer address through the translated `igc_isc_rxd_refill` callback before publishing it to the coherent descriptor ring. Existing queue ownership, single-buffer policy, packet return and tail ordering remain in `IgcNic`; the upstream packet metadata callback still is not wired because `NetDriverOps` has no metadata return channel.
+
+Receive now feeds the actual write-back status/error, packet-info, RSS flow id, length and VLAN words through the translated `igc_isc_rxd_pkt_get` and availability logic. RX errors are dropped and reclaimed; multi-descriptor frames are dropped as one packet because `NetDriverOps` cannot return fragment arrays or checksum/VLAN/RSS metadata. Incomplete non-EOP descriptors remain queued until a complete packet arrives.
+
+The polling readiness check uses the same translated DD/EOP budget walk over a read-only view of the live DMA ring, so completed fragmented packets reach the receive callback and are safely dropped as unsupported instead of stalling behind `can_receive == false`. Tests cover incomplete fragments, multi-descriptor drops, and the upstream RXE drop path.
+
+During each recognized PCI probe, translated `igc_setup_init_funcs` selects and installs the FreeBSD I225 MAC/NVM/PHY operation tables. The translated I225 MAC and NVM parameter initializers run against PCI/MMIO facts and retain EEPROM-vs-iNVM geometry in the live NIC's `IgcHardware`. `init_phy_params_i225` now executes the translated generic PHY reset and MDIC PHY-ID helpers through the bounded register adapter, then records the ID/type/reset-delay in `IgcHardware`. The rest of the reset/link sequence and later MAC/NVM/PHY callbacks remain unconnected; the old `bringup::bring_up` still owns MAC reset and autonegotiation.
+
+After the existing reset/link step, the probe also invokes the translated `igc_api::igc_read_mac_addr` / `igc_nvm::igc_read_mac_addr_generic` against the live RAL/RAH registers and refuses the interface if that shared-code MAC differs from the bring-up address. This is an explicit parity check while the old reset path remains; the NVM adapter intentionally rejects EEPROM transactions that are not yet routed through I225 SRRD/EERD.
+
+Before those MMIO/DMA operations, the live probe calls the translated `igc_enable_pci_busmaster` helper through a narrow `PciRoot` config-space adapter. It reads the PCI command word, sets only `BUSMASTEREN` when needed, then rereads and verifies the bit as FreeBSD does. MSI-X/L1SS adapter methods intentionally remain unavailable; this backend polls and does not allocate vectors.

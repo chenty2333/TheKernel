@@ -66,6 +66,17 @@ impl BlockDriverOps for PartitionBlock {
         self.parent.lock().flush()
     }
 }
+
+/// Linux adds `p` only when a disk name already ends in a digit (NVMe,
+/// MMC, loop devices); SATA names such as `sda` concatenate the partition index.
+fn partition_device_name(parent: &str, number: usize) -> String {
+    if parent.as_bytes().last().is_some_and(u8::is_ascii_digit) {
+        format!("{parent}p{number}")
+    } else {
+        format!("{parent}{number}")
+    }
+}
+
 /// Scan once while the discovered parent is idle. Keep the parent queue alive
 /// in each view, enforce relative bounds and inherit immutable hardware RO.
 pub fn discover_gpt_partitions(
@@ -82,6 +93,7 @@ pub fn discover_gpt_partitions(
     Ok(partitions
         .into_iter()
         .map(|part| {
+            let partition_name = partition_device_name(name, part.number);
             StaticBlockDevice::Partition(Box::new(PartitionBlock {
                 metadata: PartitionMetadata {
                     parent: name.into(),
@@ -92,11 +104,23 @@ pub fn discover_gpt_partitions(
                 start: part.start,
                 blocks: part.blocks,
                 sector: geometry.block_size,
-                name: format!("{name}p{}", part.number),
+                name: partition_name,
                 read_only,
             }))
         })
         .collect())
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::*;
+
+    #[test]
+    fn partition_names_follow_linux_disk_naming() {
+        assert_eq!(partition_device_name("sda", 1), "sda1");
+        assert_eq!(partition_device_name("nvme0n1", 2), "nvme0n1p2");
+        assert_eq!(partition_device_name("mmcblk0", 1), "mmcblk0p1");
+    }
 }
 
 #[cfg(all(test, block_dev = "ramdisk"))]
