@@ -221,6 +221,8 @@ pub(crate) fn preflight_native_mode_change(
     old_mode: Mode,
     new_mode: Mode,
     port: TcPort,
+    old_format: u32,
+    new_format: u32,
 ) -> Result<N305PipeAProjection, ModesetError> {
     let source_port = match port {
         TcPort::Tc1 => PORT_TC1,
@@ -282,11 +284,11 @@ pub(crate) fn preflight_native_mode_change(
             id: 0,
             old_visible: true,
             old_fb_exists: true,
-            old_format: DRM_FORMAT_XRGB8888,
+            old_format,
             old_modifier: 0,
             new_visible: true,
             new_fb_exists: true,
-            new_format: DRM_FORMAT_XRGB8888,
+            new_format,
             new_modifier: 0,
             ..PlaneTransition::default()
         }],
@@ -443,7 +445,14 @@ mod tests {
     #[test]
     fn native_preflight_preserves_the_admitted_vic_16_95_pair_on_tc1_tc2() {
         for (port, index) in [(TcPort::Tc1, 0), (TcPort::Tc2, 1)] {
-            let projected = preflight_native_mode_change(vic(95), vic(16), port).unwrap();
+            let projected = preflight_native_mode_change(
+                vic(95),
+                vic(16),
+                port,
+                DRM_FORMAT_XRGB8888,
+                DRM_FORMAT_XRGB8888,
+            )
+            .unwrap();
             assert_eq!(projected.port, port);
             assert!(projected.old_mode.unwrap().same_timing(&vic(95)));
             assert!(projected.new_mode.unwrap().same_timing(&vic(16)));
@@ -455,13 +464,48 @@ mod tests {
     #[test]
     fn native_preflight_refuses_unrepresented_mode_or_tc_port() {
         assert_eq!(
-            preflight_native_mode_change(vic(95), vic(4), TcPort::Tc1),
+            preflight_native_mode_change(
+                vic(95),
+                vic(4),
+                TcPort::Tc1,
+                DRM_FORMAT_XRGB8888,
+                DRM_FORMAT_XRGB8888,
+            ),
             Err(ModesetError::Backend(EOPNOTSUPP))
         );
         assert_eq!(
-            preflight_native_mode_change(vic(95), vic(16), TcPort::Tc3),
+            preflight_native_mode_change(
+                vic(95),
+                vic(16),
+                TcPort::Tc3,
+                DRM_FORMAT_XRGB8888,
+                DRM_FORMAT_XRGB8888,
+            ),
             Err(ModesetError::Backend(EOPNOTSUPP))
         );
+        assert_eq!(
+            preflight_native_mode_change(
+                vic(95),
+                vic(16),
+                TcPort::Tc1,
+                0x3432_5241,
+                DRM_FORMAT_XRGB8888
+            ),
+            Err(ModesetError::Backend(EOPNOTSUPP))
+        );
+    }
+
+    #[test]
+    fn native_preflight_carries_the_real_old_and_new_plane_formats() {
+        let projection = preflight_native_mode_change(
+            vic(95),
+            vic(16),
+            TcPort::Tc1,
+            DRM_FORMAT_RGB565,
+            DRM_FORMAT_XRGB8888,
+        )
+        .unwrap();
+        assert!(projection.old_enabled && projection.new_enabled);
     }
 
     #[test]

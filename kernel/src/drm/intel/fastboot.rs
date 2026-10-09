@@ -1806,6 +1806,8 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                 state.current_mode.timing,
                 target.timing,
                 self.port,
+                state.current_format,
+                s.format,
             )
             .is_err()
         {
