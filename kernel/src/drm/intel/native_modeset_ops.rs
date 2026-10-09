@@ -13,9 +13,18 @@ use intel_display::intel_display_modeset_full::{
 /// Native hardware operations required by the display-12/13 atomic commit
 /// sequence. Implementations must return an error on unsupported state and
 /// must not use a successful no-op as a placeholder.
-pub(super) trait NativeModesetOps {
+pub(super) trait NativeCdclkOps {
     type Error;
 
+    /// Pre-plane CDCLK transition (`intel_cdclk_set_cdclk()`), including the
+    /// required PCode and peripheral-ordering hooks.
+    fn set_cdclk_pre_plane(&mut self, target_khz: u32) -> Result<(), Self::Error>;
+
+    /// Post-plane CDCLK transition/readback (`intel_cdclk_set_cdclk()`).
+    fn set_cdclk_post_plane(&mut self, target_khz: u32) -> Result<(), Self::Error>;
+}
+
+pub(super) trait NativeModesetOps: NativeCdclkOps {
     /// CRTC enable phase (`hsw_crtc_enable()` / `skl_commit_modeset_enables()`).
     fn crtc_enable(&mut self, state: &PipeState) -> Result<(), Self::Error>;
 
@@ -43,13 +52,6 @@ pub(super) trait NativeModesetOps {
 
     /// Universal-plane disable (`skl_universal_plane_disable_arm()` path).
     fn disable_plane(&mut self, plane: &PlaneTransition) -> Result<(), Self::Error>;
-
-    /// Pre-plane CDCLK transition (`intel_cdclk_set_cdclk()`), including the
-    /// required PCode and peripheral-ordering hooks.
-    fn set_cdclk_pre_plane(&mut self, target_khz: u32) -> Result<(), Self::Error>;
-
-    /// Post-plane CDCLK transition/readback (`intel_cdclk_set_cdclk()`).
-    fn set_cdclk_post_plane(&mut self, target_khz: u32) -> Result<(), Self::Error>;
 
     /// Reserve the shared PLL for a checked CRTC state (`intel_find_dpll()` /
     /// `intel_atomic_get_dpll_state()`).

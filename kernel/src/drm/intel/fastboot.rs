@@ -1212,6 +1212,28 @@ impl<R: Registers, T: PollTimer> super::tc_modeset::ClockLifecycle
     }
 }
 
+impl<R: Registers, T: PollTimer> super::native_modeset_ops::NativeCdclkOps
+    for NativeClockLifecycle<'_, R, T>
+{
+    type Error = String;
+
+    fn set_cdclk_pre_plane(&mut self, target_khz: u32) -> Result<(), Self::Error> {
+        set_cdclk_through_source(self, target_khz, false)
+    }
+
+    fn set_cdclk_post_plane(&mut self, target_khz: u32) -> Result<(), Self::Error> {
+        let current = super::clk::observe(self.registers)
+            .map_err(|error| format!("CDCLK post-plane readout failed: {}", error.describe()))?;
+        if current.cdclk_khz > target_khz {
+            return Err(String::from(
+                "post-plane CDCLK decrease remains unsupported until active-consumer ordering is \
+                 wired",
+            ));
+        }
+        set_cdclk_through_source(self, target_khz, false)
+    }
+}
+
 fn verify_translated_crtc_state(
     firmware: &Firmware,
     port: TcPort,
@@ -2995,7 +3017,16 @@ mod tests {
 
         // Requesting the already-active clock still exercises the translated
         // intel_cdclk_set_cdclk() dispatch but must not touch CDCLK hardware.
-        set_cdclk_through_source(&mut lifecycle, before.cdclk_khz, false).unwrap();
+        super::super::native_modeset_ops::NativeCdclkOps::set_cdclk_pre_plane(
+            &mut lifecycle,
+            before.cdclk_khz,
+        )
+        .unwrap();
+        super::super::native_modeset_ops::NativeCdclkOps::set_cdclk_post_plane(
+            &mut lifecycle,
+            before.cdclk_khz,
+        )
+        .unwrap();
     }
 
     #[derive(Clone)]
