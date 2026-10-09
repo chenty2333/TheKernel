@@ -67,6 +67,12 @@ pub const VM_DONTDUMP: c_ulong = 1 << 26;
 pub const VM_MIXEDMAP: c_ulong = 1 << 28;
 pub const VM_MAYWRITE: c_ulong = 1 << 5;
 
+/// Linux `vma_pages()`: the page-count of the page-aligned VMA interval.
+#[inline]
+pub unsafe fn vma_pages(vma: *const VmAreaStruct) -> c_ulong {
+    unsafe { ((*vma).vm_end - (*vma).vm_start) >> crate::linux_config::PAGE_SHIFT }
+}
+
 // Linux 7.2.3 include/linux/mmap_lock.h uses this helper when
 // CONFIG_PER_VMA_LOCK=y (the configured wt-dev target).
 unsafe extern "C" {
