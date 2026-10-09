@@ -264,6 +264,7 @@ fn signal_pending_current() -> bool {
 
 /// `intel_gt_common_init_early()` — initialize the shared per-GT software state.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_common_init_early()
 pub unsafe extern "C" fn intel_gt_common_init_early(gt: *mut IntelGt) {
     assert!(!gt.is_null());
     unsafe {
@@ -289,6 +290,7 @@ pub unsafe extern "C" fn intel_gt_common_init_early(gt: *mut IntelGt) {
 
 /// `intel_root_gt_init_early()` — allocate and attach the primary GT.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_root_gt_init_early()
 pub unsafe extern "C" fn intel_root_gt_init_early(i915: *mut DrmI915Private) -> i32 {
     assert!(!i915.is_null());
     let drm = unsafe { core::ptr::addr_of_mut!((*i915).drm).cast::<c_void>() };
@@ -315,6 +317,7 @@ pub unsafe extern "C" fn intel_root_gt_init_early(i915: *mut DrmI915Private) -> 
 }
 
 /// `intel_gt_probe_lmem()` — install an available GT-local-memory region.
+// upstream: intel_gt.c intel_gt_probe_lmem()
 unsafe fn intel_gt_probe_lmem(gt: *mut IntelGt) -> i32 {
     let i915 = unsafe { (*gt).i915 };
     let instance = unsafe { (*gt).info.id };
@@ -354,6 +357,7 @@ unsafe fn intel_gt_probe_lmem(gt: *mut IntelGt) -> i32 {
 
 /// `intel_gt_assign_ggtt()` — share the root GGTT for a media GT or create a tile GGTT.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_assign_ggtt()
 pub unsafe extern "C" fn intel_gt_assign_ggtt(gt: *mut IntelGt) -> i32 {
     assert!(!gt.is_null());
     unsafe {
@@ -384,6 +388,7 @@ pub unsafe extern "C" fn intel_gt_assign_ggtt(gt: *mut IntelGt) -> i32 {
 
 /// `intel_gt_init_mmio()` — initialize clocks, firmware MMIO, SSEU and MCR state.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_init_mmio()
 pub unsafe extern "C" fn intel_gt_init_mmio(gt: *mut IntelGt) -> i32 {
     unsafe {
         intel_gt_init_clock_frequency(gt);
@@ -399,6 +404,7 @@ unsafe extern "C" {
 }
 
 /// `init_unused_ring()` — clear ring state for an unused legacy ring.
+// upstream: intel_gt.c init_unused_ring()
 unsafe fn init_unused_ring(gt: *mut IntelGt, base: u32) {
     let uncore = unsafe { (*gt).uncore };
     unsafe {
@@ -410,6 +416,7 @@ unsafe fn init_unused_ring(gt: *mut IntelGt, base: u32) {
 }
 
 /// `init_unused_rings()` — idle legacy rings that are not represented by an engine.
+// upstream: intel_gt.c init_unused_rings()
 unsafe fn init_unused_rings(gt: *mut IntelGt) {
     let i915 = unsafe { (*gt).i915 };
     if unsafe { crate::linux::i915::IS_PLATFORM(i915, 1) } {
@@ -435,6 +442,7 @@ unsafe fn init_unused_rings(gt: *mut IntelGt) {
 
 /// `intel_gt_init_hw()` — initialize hardware state under forcewake.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_init_hw()
 pub unsafe extern "C" fn intel_gt_init_hw(gt: *mut IntelGt) -> i32 {
     let i915 = unsafe { (*gt).i915 };
     let uncore = unsafe { (*gt).uncore };
@@ -483,6 +491,7 @@ pub unsafe extern "C" fn intel_gt_init_hw(gt: *mut IntelGt) -> i32 {
     ret
 }
 
+// upstream: intel_gt.c gen6_clear_engine_error_register()
 unsafe fn gen6_clear_engine_error_register(engine: *mut IntelEngineCs) {
     let uncore = unsafe { (*engine).uncore };
     let reg = unsafe { ring_fault_reg(engine) };
@@ -495,6 +504,7 @@ unsafe fn gen6_clear_engine_error_register(engine: *mut IntelEngineCs) {
 
 /// `intel_gt_perf_limit_reasons_reg()` — select a GT/media perf-limit MMIO register.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_perf_limit_reasons_reg()
 pub unsafe extern "C" fn intel_gt_perf_limit_reasons_reg(gt: *mut IntelGt) -> I915RegT {
     if unsafe { GRAPHICS_VER((*gt).i915) } < 11 {
         return crate::linux::registers::INVALID_MMIO_REG;
@@ -508,6 +518,7 @@ pub unsafe extern "C" fn intel_gt_perf_limit_reasons_reg(gt: *mut IntelGt) -> I9
 
 /// `intel_gt_clear_error_registers()` — clear sticky global and engine faults.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_clear_error_registers()
 pub unsafe extern "C" fn intel_gt_clear_error_registers(
     gt: *mut IntelGt,
     engine_mask: IntelEngineMask,
@@ -574,6 +585,7 @@ pub unsafe extern "C" fn intel_gt_clear_error_registers(
     }
 }
 
+// upstream: intel_gt.c gen6_check_faults()
 unsafe fn gen6_check_faults(gt: *mut IntelGt) {
     for id in 0..I915_NUM_ENGINES as usize {
         let engine = unsafe { (*gt).engine[id] };
@@ -599,6 +611,7 @@ unsafe fn gen6_check_faults(gt: *mut IntelGt) {
     }
 }
 
+// upstream: intel_gt.c gen8_report_fault()
 unsafe fn gen8_report_fault(gt: *mut IntelGt, fault: u32, data0: u32, data1: u32) {
     let address = (((data1 & FAULT_VA_HIGH_BITS) as u64) << 44) | ((data0 as u64) << 12);
     gt_dbg!(
@@ -618,6 +631,7 @@ unsafe fn gen8_report_fault(gt: *mut IntelGt, fault: u32, data0: u32, data1: u32
     );
 }
 
+// upstream: intel_gt.c xehp_check_faults()
 unsafe fn xehp_check_faults(gt: *mut IntelGt) {
     let fault = unsafe { crate::intel_gt_mcr_upstream::intel_gt_mcr_read_any(gt, mcr_reg(0xcec4)) };
     if fault & RING_FAULT_VALID != 0 {
@@ -631,6 +645,7 @@ unsafe fn xehp_check_faults(gt: *mut IntelGt) {
     }
 }
 
+// upstream: intel_gt.c gen8_check_faults()
 unsafe fn gen8_check_faults(gt: *mut IntelGt) {
     let (fault_reg, data0_reg, data1_reg) = if unsafe { GRAPHICS_VER((*gt).i915) } >= 12 {
         (
@@ -661,6 +676,7 @@ unsafe fn gen8_check_faults(gt: *mut IntelGt) {
 
 /// `intel_gt_check_and_clear_faults()` — report and acknowledge faults for the active generation.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_check_and_clear_faults()
 pub unsafe extern "C" fn intel_gt_check_and_clear_faults(gt: *mut IntelGt) {
     let i915 = unsafe { (*gt).i915 };
     if unsafe { GRAPHICS_VER_FULL(i915) >= crate::linux::i915::IP_VER(12, 55) } {
@@ -685,6 +701,7 @@ pub unsafe extern "C" fn intel_gt_check_and_clear_faults(gt: *mut IntelGt) {
 
 /// `intel_gt_flush_ggtt_writes()` — enforce ordering between GGTT and MMIO writes.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_flush_ggtt_writes()
 pub unsafe extern "C" fn intel_gt_flush_ggtt_writes(gt: *mut IntelGt) {
     let uncore = unsafe { (*gt).uncore };
     unsafe {
@@ -722,6 +739,7 @@ pub unsafe extern "C" fn intel_gt_flush_ggtt_writes(gt: *mut IntelGt) {
 
 /// `intel_gt_chipset_flush()` — flush CPU ordering and pre-gen6 GMCH writes.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_chipset_flush()
 pub unsafe extern "C" fn intel_gt_chipset_flush(gt: *mut IntelGt) {
     unsafe {
         crate::linux::primitives::wmb();
@@ -735,6 +753,7 @@ pub unsafe extern "C" fn intel_gt_chipset_flush(gt: *mut IntelGt) {
 
 /// `intel_gt_driver_register()` — register debugfs/sysfs/GSC/RPS for this GT.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_driver_register()
 pub unsafe extern "C" fn intel_gt_driver_register(gt: *mut IntelGt) {
     unsafe {
         intel_gsc_init(core::ptr::addr_of_mut!((*gt).gsc).cast(), (*gt).i915);
@@ -745,6 +764,7 @@ pub unsafe extern "C" fn intel_gt_driver_register(gt: *mut IntelGt) {
 }
 
 /// `intel_gt_init_scratch()` — allocate and pin the GT's zeroed scratch page.
+// upstream: intel_gt.c intel_gt_init_scratch()
 unsafe fn intel_gt_init_scratch(gt: *mut IntelGt, size: u64) -> i32 {
     let i915 = unsafe { (*gt).i915 };
     let mut obj = unsafe {
@@ -800,6 +820,7 @@ unsafe fn intel_gt_init_scratch(gt: *mut IntelGt, size: u64) -> i32 {
 }
 
 /// `intel_gt_fini_scratch()` — unpin and release the scratch mapping.
+// upstream: intel_gt.c intel_gt_fini_scratch()
 unsafe fn intel_gt_fini_scratch(gt: *mut IntelGt) {
     unsafe {
         i915_vma_unpin_and_release(core::ptr::addr_of_mut!((*gt).scratch), 0);
@@ -807,6 +828,7 @@ unsafe fn intel_gt_fini_scratch(gt: *mut IntelGt) {
 }
 
 /// `kernel_vm()` — choose full PPGTT or retain the GGTT for aliasing mode.
+// upstream: intel_gt.c kernel_vm()
 unsafe fn kernel_vm(gt: *mut IntelGt) -> *mut I915AddressSpace {
     let info = unsafe {
         (*(*gt).i915)
@@ -824,6 +846,7 @@ unsafe fn kernel_vm(gt: *mut IntelGt) -> *mut I915AddressSpace {
 }
 
 /// `__engines_record_defaults()` — save the sanitized initial register state per engine.
+// upstream: intel_gt.c __engines_record_defaults()
 unsafe fn __engines_record_defaults(gt: *mut IntelGt) -> i32 {
     let mut requests: [*mut I915Request; I915_NUM_ENGINES as usize] =
         [ptr::null_mut(); I915_NUM_ENGINES as usize];
@@ -923,6 +946,7 @@ unsafe fn __engines_record_defaults(gt: *mut IntelGt) -> i32 {
 }
 
 /// `__engines_verify_workarounds()` — check that context workarounds remain installed.
+// upstream: intel_gt.c __engines_verify_workarounds()
 unsafe fn __engines_verify_workarounds(gt: *mut IntelGt) -> i32 {
     if !crate::linux_config::CONFIG_DRM_I915_DEBUG_GEM {
         return 0;
@@ -943,6 +967,7 @@ unsafe fn __engines_verify_workarounds(gt: *mut IntelGt) -> i32 {
 }
 
 /// `__intel_gt_disable()` — stop submissions and suspend the GT before teardown.
+// upstream: intel_gt.c __intel_gt_disable()
 unsafe fn __intel_gt_disable(gt: *mut IntelGt) {
     unsafe {
         intel_gt_set_wedged_on_fini(gt);
@@ -957,6 +982,7 @@ unsafe fn __intel_gt_disable(gt: *mut IntelGt) {
 
 /// `intel_gt_wait_for_idle()` — wait for request retirement and uC quiescence.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_wait_for_idle()
 pub unsafe extern "C" fn intel_gt_wait_for_idle(gt: *mut IntelGt, mut timeout: c_long) -> i32 {
     if !unsafe { crate::linux_pm::intel_gt_pm_is_awake(gt) } {
         return 0;
@@ -983,6 +1009,7 @@ pub unsafe extern "C" fn intel_gt_wait_for_idle(gt: *mut IntelGt, mut timeout: c
 
 /// `intel_gt_init()` — allocate GT scratch/kernel VM, initialize engines and firmware.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_init()
 pub unsafe extern "C" fn intel_gt_init(gt: *mut IntelGt) -> i32 {
     unsafe {
         intel_gt_init_workarounds(gt);
@@ -1069,6 +1096,7 @@ unsafe extern "C" {
 
 /// `intel_gt_driver_remove()` — stop GT runtime services and release engine resources.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_driver_remove()
 pub unsafe extern "C" fn intel_gt_driver_remove(gt: *mut IntelGt) {
     unsafe {
         __intel_gt_disable(gt);
@@ -1081,6 +1109,7 @@ pub unsafe extern "C" fn intel_gt_driver_remove(gt: *mut IntelGt) {
 
 /// `intel_gt_driver_unregister()` — unregister user-visible hooks and scrub hardware.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_driver_unregister()
 pub unsafe extern "C" fn intel_gt_driver_unregister(gt: *mut IntelGt) {
     unsafe {
         let rpm = (*(*gt).uncore).rpm;
@@ -1099,6 +1128,7 @@ pub unsafe extern "C" fn intel_gt_driver_unregister(gt: *mut IntelGt) {
 
 /// `intel_gt_driver_release()` — release VM, workaround, PM and scratch resources.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_driver_release()
 pub unsafe extern "C" fn intel_gt_driver_release(gt: *mut IntelGt) {
     let vm = unsafe { core::mem::replace(&mut (*gt).vm, ptr::null_mut()) };
     if !vm.is_null() {
@@ -1117,6 +1147,7 @@ pub unsafe extern "C" fn intel_gt_driver_release(gt: *mut IntelGt) {
 
 /// `intel_gt_driver_late_release_all()` — drain RCU and finalize all initialized tiles.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_driver_late_release_all()
 pub unsafe extern "C" fn intel_gt_driver_late_release_all(i915: *mut DrmI915Private) {
     crate::linux::rcu::rcu_barrier();
     for id in 0..crate::intel_gt_types_upstream::I915_MAX_GT {
@@ -1136,6 +1167,7 @@ pub unsafe extern "C" fn intel_gt_driver_late_release_all(i915: *mut DrmI915Priv
 }
 
 /// `intel_gt_tile_setup()` — allocate subordinate tile state and map its MMIO aperture.
+// upstream: intel_gt.c intel_gt_tile_setup()
 unsafe fn intel_gt_tile_setup(gt: *mut IntelGt, phys_addr: PhysAddrT) -> i32 {
     if !unsafe { gt_is_root(gt) } {
         let drm = unsafe { core::ptr::addr_of_mut!((*(*gt).i915).drm).cast::<c_void>() };
@@ -1177,6 +1209,7 @@ unsafe fn intel_gt_tile_setup(gt: *mut IntelGt, phys_addr: PhysAddrT) -> i32 {
 
 /// `intel_gt_probe_all()` — initialize the root GT then any additional GT tiles.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_probe_all()
 pub unsafe extern "C" fn intel_gt_probe_all(i915: *mut DrmI915Private) -> i32 {
     let pdev = unsafe { to_pci_dev((*i915).drm.dev) };
     let mut gt = unsafe { (*i915).gt[0] };
@@ -1269,6 +1302,7 @@ pub unsafe extern "C" fn intel_gt_probe_all(i915: *mut DrmI915Private) -> i32 {
 
 /// `intel_gt_tiles_init()` — discover and register local-memory regions for each GT.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_tiles_init()
 pub unsafe extern "C" fn intel_gt_tiles_init(i915: *mut DrmI915Private) -> i32 {
     for gt in unsafe { (*i915).gt }.iter().copied() {
         if !gt.is_null() {
@@ -1283,6 +1317,7 @@ pub unsafe extern "C" fn intel_gt_tiles_init(i915: *mut DrmI915Private) -> i32 {
 
 /// `intel_gt_info_print()` — print engine availability and topology information.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_info_print()
 pub unsafe extern "C" fn intel_gt_info_print(info: *const IntelGtInfo, p: *mut DrmPrinter) {
     assert!(!info.is_null());
     drm_printf!(p, "available engines: %x\n", unsafe { (*info).engine_mask });
@@ -1293,6 +1328,7 @@ pub unsafe extern "C" fn intel_gt_info_print(info: *const IntelGtInfo, p: *mut D
 
 /// `intel_gt_coherent_map_type()` — choose WB only when LLC/coherency allows it.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_coherent_map_type()
 pub unsafe extern "C" fn intel_gt_coherent_map_type(
     gt: *mut IntelGt,
     obj: *mut DrmI915GemObject,
@@ -1310,6 +1346,7 @@ pub unsafe extern "C" fn intel_gt_coherent_map_type(
 
 /// `intel_gt_needs_wa_16018031267()` — Wa_16018031267 / Wa_16018063123 predicate.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_needs_wa_16018031267()
 pub unsafe extern "C" fn intel_gt_needs_wa_16018031267(gt: *mut IntelGt) -> bool {
     unsafe {
         crate::linux::i915::IS_GFX_GT_IP_RANGE(
@@ -1322,6 +1359,7 @@ pub unsafe extern "C" fn intel_gt_needs_wa_16018031267(gt: *mut IntelGt) -> bool
 
 /// `intel_gt_needs_wa_22016122933()` — Media 13.0 mapping workaround predicate.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_needs_wa_22016122933()
 pub unsafe extern "C" fn intel_gt_needs_wa_22016122933(gt: *mut IntelGt) -> bool {
     unsafe {
         crate::linux::i915::MEDIA_VER_FULL((*gt).i915) == crate::linux::i915::IP_VER(13, 0)
@@ -1329,6 +1367,7 @@ pub unsafe extern "C" fn intel_gt_needs_wa_22016122933(gt: *mut IntelGt) -> bool
     }
 }
 
+// upstream: intel_gt.c __intel_gt_bind_context_set_ready()
 unsafe fn __intel_gt_bind_context_set_ready(gt: *mut IntelGt, ready: bool) {
     let engine = unsafe { (*gt).engine[BCS0 as usize] };
     if !engine.is_null() && !unsafe { (*engine).bind_context.is_null() } {
@@ -1340,6 +1379,7 @@ unsafe fn __intel_gt_bind_context_set_ready(gt: *mut IntelGt, ready: bool) {
 
 /// `intel_gt_bind_context_set_ready()` — publish the bind-context readiness state.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_bind_context_set_ready()
 pub unsafe extern "C" fn intel_gt_bind_context_set_ready(gt: *mut IntelGt) {
     unsafe {
         __intel_gt_bind_context_set_ready(gt, true);
@@ -1348,6 +1388,7 @@ pub unsafe extern "C" fn intel_gt_bind_context_set_ready(gt: *mut IntelGt) {
 
 /// `intel_gt_bind_context_set_unready()` — clear bind-context readiness before teardown.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_bind_context_set_unready()
 pub unsafe extern "C" fn intel_gt_bind_context_set_unready(gt: *mut IntelGt) {
     unsafe {
         __intel_gt_bind_context_set_ready(gt, false);
@@ -1356,6 +1397,7 @@ pub unsafe extern "C" fn intel_gt_bind_context_set_unready(gt: *mut IntelGt) {
 
 /// `intel_gt_is_bind_context_ready()` — query readiness of the BCS0 bind context.
 #[unsafe(no_mangle)]
+// upstream: intel_gt.c intel_gt_is_bind_context_ready()
 pub unsafe extern "C" fn intel_gt_is_bind_context_ready(gt: *mut IntelGt) -> bool {
     let engine = unsafe { (*gt).engine[BCS0 as usize] };
     !engine.is_null() && unsafe { (*engine).bind_context_ready }
