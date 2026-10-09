@@ -113,8 +113,9 @@ fn parse_hub_descriptor(data: &[u8], superspeed: bool) -> Result<HubDescriptor, 
 
 #[cfg(test)]
 mod tests {
-    use super::parse_hub_descriptor;
     use usb_if::err::USBError;
+
+    use super::parse_hub_descriptor;
 
     #[test]
     fn hub_descriptor_parser_checks_lengths_and_usb2_port_bitmaps() {
@@ -894,6 +895,8 @@ impl Port {
 pub enum PortState {
     #[default]
     Uninit,
+    /// A bounded connection reset failed. Do not spin/retry until unplug.
+    ResetFailed,
     Reseted,
     Probed,
 }

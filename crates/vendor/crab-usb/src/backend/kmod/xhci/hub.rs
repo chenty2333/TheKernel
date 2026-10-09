@@ -121,19 +121,44 @@ mod tests {
     const PORT_CONNECT: u32 = 1 << 0;
     const PORT_ENABLED: u32 = 1 << 1;
     const PORT_RESET: u32 = 1 << 4;
+    const PORT_SPEED_FULL: u32 = 1 << 10;
     const PORT_POWER: u32 = 1 << 9;
+    const PORT_WARM_RESET: u32 = 1 << 31;
 
     struct ResetCompletingKernel {
         portsc: AtomicUsize,
         reset_waits: AtomicUsize,
         reset_remaining: AtomicUsize,
+        connect_after_power_settle: AtomicBool,
     }
 
     static TEST_KERNEL: ResetCompletingKernel = ResetCompletingKernel {
         portsc: AtomicUsize::new(0),
         reset_waits: AtomicUsize::new(0),
         reset_remaining: AtomicUsize::new(0),
+        connect_after_power_settle: AtomicBool::new(true),
     };
+    static TEST_LOCKED: AtomicBool = AtomicBool::new(false);
+
+    struct TestLock;
+
+    impl TestLock {
+        fn lock() -> Self {
+            while TEST_LOCKED
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+            Self
+        }
+    }
+
+    impl Drop for TestLock {
+        fn drop(&mut self) {
+            TEST_LOCKED.store(false, Ordering::Release);
+        }
+    }
 
     impl KernelOp for ResetCompletingKernel {
         fn delay(&self, duration: Duration) {
@@ -142,6 +167,9 @@ mod tests {
                 return;
             }
             if duration == PORT_POWER_SETTLE {
+                if !self.connect_after_power_settle.load(Ordering::Acquire) {
+                    return;
+                }
                 // The device's connect status arrives after xHCI has restored
                 // port power, rather than being visible at the first read.
                 // SAFETY: the test installs a live aligned u32 in its fake
@@ -165,10 +193,11 @@ mod tests {
             unsafe {
                 let portsc = address as *mut u32;
                 let status = portsc.read_volatile();
-                if status & PORT_RESET != 0
+                if status & (PORT_RESET | PORT_WARM_RESET) != 0
                     && self.reset_remaining.fetch_sub(1, Ordering::AcqRel) <= 1
                 {
-                    portsc.write_volatile((status & !PORT_RESET) | PORT_ENABLED);
+                    portsc
+                        .write_volatile((status & !(PORT_RESET | PORT_WARM_RESET)) | PORT_ENABLED);
                 }
             }
         }
@@ -217,6 +246,7 @@ mod tests {
 
     #[test]
     fn boot_probe_observes_a_device_after_the_async_port_reset_completes() {
+        let _test_lock = TestLock::lock();
         #[repr(align(64))]
         struct FakeXhci([u32; 320]);
 
@@ -230,6 +260,9 @@ mod tests {
         );
         TEST_KERNEL.reset_waits.store(0, Ordering::Relaxed);
         TEST_KERNEL.reset_remaining.store(50, Ordering::Relaxed);
+        TEST_KERNEL
+            .connect_after_power_settle
+            .store(true, Ordering::Release);
 
         let mmio = NonNull::new(regs.0.as_mut_ptr().cast::<u8>()).unwrap();
         let kernel = Kernel::new(
@@ -274,6 +307,86 @@ mod tests {
         );
 
         TEST_KERNEL.portsc.store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn root_port_absent_at_boot_is_reset_before_a_later_hotplug_is_enumerated() {
+        let _test_lock = TestLock::lock();
+        #[repr(align(64))]
+        struct FakeXhci([u32; 320]);
+
+        let mut regs = Box::new(FakeXhci([0; 320]));
+        regs.0[0] = 0x40;
+        regs.0[1] = (1 << 24) | 1;
+        regs.0[TEST_PORTSC_OFFSET / 4] = PORT_SPEED_FULL;
+        TEST_KERNEL.portsc.store(
+            (&mut regs.0[TEST_PORTSC_OFFSET / 4] as *mut u32) as usize,
+            Ordering::Release,
+        );
+        TEST_KERNEL.reset_waits.store(0, Ordering::Relaxed);
+        TEST_KERNEL.reset_remaining.store(3, Ordering::Relaxed);
+        TEST_KERNEL
+            .connect_after_power_settle
+            .store(false, Ordering::Release);
+
+        let mmio = NonNull::new(regs.0.as_mut_ptr().cast::<u8>()).unwrap();
+        let kernel = Kernel::new(
+            DmaDeviceInfo::new(
+                DmaDomainId::Direct,
+                DmaCoherency::Coherent,
+                DmaConstraints::new(u64::MAX),
+            ),
+            &TEST_KERNEL,
+        );
+        let mut hub = XhciRootHub::new(XhciRegisters::new(mmio), kernel).unwrap();
+        let info = HubInfo {
+            parent: None,
+            slot_id: 0,
+            hub_depth: -1,
+            speed: Speed::Full,
+            port_id: 0,
+            tt: UsbTt {
+                multi: false,
+                think_time_ns: 0,
+            },
+        };
+
+        block_on_ready(hub.init(info)).unwrap();
+        assert!(block_on_ready(hub.changed_ports()).unwrap().is_empty());
+        assert_eq!(hub.ports()[0].state, PortState::Uninit);
+
+        // The cable arrives after the boot scan. The hotplug scan must issue
+        // PR and wait for its hardware completion before publishing Connected.
+        regs.0[TEST_PORTSC_OFFSET / 4] = PORT_POWER | PORT_CONNECT | PORT_SPEED_FULL;
+        let connected = block_on_ready(hub.changed_ports()).unwrap();
+        assert_eq!(TEST_KERNEL.reset_waits.load(Ordering::Relaxed), 3);
+        assert_ne!(regs.0[TEST_PORTSC_OFFSET / 4] & PORT_ENABLED, 0);
+        assert!(matches!(
+            connected.as_slice(),
+            [PortEvent::Connected(change)] if change.root_port_id == 1
+        ));
+
+        // A disconnect returns the port to Uninit, so a later device receives
+        // a new reset rather than reusing stale Reseted state.
+        regs.0[TEST_PORTSC_OFFSET / 4] = PORT_POWER | PORT_SPEED_FULL;
+        let disconnected = block_on_ready(hub.changed_ports()).unwrap();
+        assert!(matches!(
+            disconnected.as_slice(),
+            [PortEvent::Disconnected { port_id: 1 }]
+        ));
+        regs.0[TEST_PORTSC_OFFSET / 4] = PORT_POWER | PORT_CONNECT | PORT_SPEED_FULL;
+        TEST_KERNEL.reset_remaining.store(1, Ordering::Relaxed);
+        let reconnected = block_on_ready(hub.changed_ports()).unwrap();
+        assert_eq!(TEST_KERNEL.reset_waits.load(Ordering::Relaxed), 4);
+        assert!(matches!(
+            reconnected.as_slice(),
+            [PortEvent::Connected(change)] if change.root_port_id == 1
+        ));
+
+        TEST_KERNEL.portsc.store(0, Ordering::Release);
+        TEST_KERNEL
+            .connect_after_power_settle
+            .store(true, Ordering::Release);
     }
 }
 
@@ -370,6 +483,7 @@ impl HubOp for XhciRootHub {
                         idx + 1,
                         status
                     );
+                    self.ports_mut()[idx].state = PortState::ResetFailed;
                 }
             }
 
@@ -481,7 +595,7 @@ impl XhciRootHub {
         let disconnected = self
             .ports()
             .iter()
-            .filter(|port| matches!(port.state, PortState::Probed))
+            .filter(|port| matches!(port.state, PortState::Probed | PortState::ResetFailed))
             .filter_map(|port| {
                 let index = usize::from(port.port_id - 1);
                 (!self.portsc.read_volatile_at(index).current_connect_status())
@@ -508,23 +622,68 @@ impl XhciRootHub {
             .collect::<Vec<_>>();
 
         for &id in &uninited {
-            debug!("Waiting for port {id} reset ...");
             let i = (id - 1) as usize;
-
-            let port = self.portsc.read_volatile_at(i);
-
-            if port.port_reset() {
+            let before = self.portsc.read_volatile_at(i);
+            if !before.current_connect_status() {
+                // An absent port is still eligible for a future connection.
+                // Leave it Uninit so the first later attachment gets a reset.
                 continue;
             }
 
-            debug!(
-                "Port {} reset complete, enable={}, connect={}",
-                id,
-                port.port_enabled_disabled(),
-                port.current_connect_status()
-            );
+            // USB 2.x attachment uses PR; a connected USB 3.x link uses WPR.
+            // Both are hardware-completed asynchronously and must be observed
+            // before the Core attempts Address Device at address zero.
+            let warm_reset = matches!(before.port_speed(), 4 | 5);
+            let reset_active = if warm_reset {
+                before.warm_port_reset()
+            } else {
+                before.port_reset()
+            };
+            if !reset_active {
+                info!("xhci: port {id} hotplug connected; starting bounded reset");
+                self.portsc.update_volatile_at(i, |portsc| {
+                    portsc.set_0_port_enabled_disabled();
+                    if warm_reset {
+                        portsc.set_warm_port_reset();
+                    } else {
+                        portsc.set_port_reset();
+                    }
+                });
+            }
 
-            self.ports_mut()[i].state = PortState::Reseted;
+            let mut completed = false;
+            for _ in 0..PORT_RESET_POLLS {
+                let status = self.portsc.read_volatile_at(i);
+                let reset_active = if warm_reset {
+                    status.warm_port_reset()
+                } else {
+                    status.port_reset()
+                };
+                if reset_active {
+                    self.kernel.delay(PORT_RESET_POLL);
+                    continue;
+                }
+                if status.current_connect_status() && status.port_enabled_disabled() {
+                    self.ports_mut()[i].state = PortState::Reseted;
+                    info!("xhci: port {id} hotplug reset complete; device enabled");
+                } else {
+                    self.ports_mut()[i].state = PortState::ResetFailed;
+                    warn!(
+                        "xhci: port {id} hotplug reset completed without an enabled device \
+                         PORTSC={status:?}"
+                    );
+                }
+                completed = true;
+                break;
+            }
+            if !completed {
+                let status = self.portsc.read_volatile_at(i);
+                self.ports_mut()[i].state = PortState::ResetFailed;
+                warn!(
+                    "xhci: port {id} hotplug reset timed out; waiting for unplug before retry \
+                     PORTSC={status:?}"
+                );
+            }
         }
 
         Ok(())
@@ -543,7 +702,13 @@ impl XhciRootHub {
         for &id in &reseted {
             let i = (id - 1) as usize;
             let portsc = self.portsc.read_volatile_at(i);
-            if !portsc.current_connect_status() || !portsc.port_enabled_disabled() {
+            if !portsc.current_connect_status() {
+                self.ports_mut()[i].state = PortState::Uninit;
+                self.ports_mut()[i].retry_attempts = 0;
+                continue;
+            }
+            if !portsc.port_enabled_disabled() {
+                self.ports_mut()[i].state = PortState::Uninit;
                 continue;
             }
             let speed_raw = portsc.port_speed();
