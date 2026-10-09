@@ -14,6 +14,7 @@ use crate::{
     i915_gem_ww_upstream::WwAcquireCtx,
     intel_context_upstream::{DrmGemObjectBaseLayout, DrmVmaOffsetNode},
     intel_engine_cs_upstream::ListHead,
+    linux_i915_private::DrmVmaOffsetManager,
     linux::ww_mutex::{
         WwMutex, ww_mutex_lock, ww_mutex_lock_slow, ww_mutex_trylock, ww_mutex_unlock,
     },
@@ -91,6 +92,22 @@ unsafe extern "C" {
     ) -> *mut File;
     pub fn drm_dev_get(dev: *mut c_void) -> *mut c_void;
     pub fn drm_dev_put(dev: *mut c_void);
+    // Exported DRM VMA-offset manager APIs from drm_vma_manager.c. The node
+    // and manager records are the kernel's native C objects; these declarations
+    // bind the existing DRM implementation rather than reimplementing it.
+    pub fn drm_vma_offset_add(
+        manager: *mut DrmVmaOffsetManager,
+        node: *mut DrmVmaOffsetNode,
+        pages: c_ulong,
+    ) -> c_int;
+    pub fn drm_vma_offset_remove(manager: *mut DrmVmaOffsetManager, node: *mut DrmVmaOffsetNode);
+    pub fn drm_vma_node_allow_once(node: *mut DrmVmaOffsetNode, file: *mut DrmFile) -> c_int;
+    pub fn drm_vma_offset_lookup_locked(
+        manager: *mut DrmVmaOffsetManager,
+        start: c_ulong,
+        pages: c_ulong,
+    ) -> *mut DrmVmaOffsetNode;
+    pub fn drm_vma_node_is_allowed(node: *mut DrmVmaOffsetNode, file: *mut DrmFile) -> bool;
     fn unmap_mapping_range(
         mapping: *mut c_void,
         holebegin: c_long,
