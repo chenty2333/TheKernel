@@ -11,6 +11,10 @@ use alloc::{
     collections::{BTreeMap, VecDeque},
     vec::Vec,
 };
+use core::{
+    mem::ManuallyDrop,
+    ops::{Deref, DerefMut},
+};
 
 use bitflags::bitflags;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
@@ -340,18 +344,46 @@ struct Context {
     rings: u32,
 }
 
+/// Owns DMA-visible state but deliberately leaks it unless reset proves the
+/// device quiescent. This keeps the normal driver field access ergonomic while
+/// making the failure path fail-closed.
+struct ResetOwned<T>(ManuallyDrop<T>);
+
+impl<T> ResetOwned<T> {
+    fn new(value: T) -> Self {
+        Self(ManuallyDrop::new(value))
+    }
+
+    unsafe fn drop_value(&mut self) {
+        unsafe { ManuallyDrop::drop(&mut self.0) };
+    }
+}
+
+impl<T> Deref for ResetOwned<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for ResetOwned<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 /// VirtIO GPU device with a bounded asynchronous control submission path.
 /// Synchronous protocol helpers are serialized with that path; callers must
 /// reap submitted work before issuing a command that changes shared state.
 pub struct VirtIOGpu<H: Hal, T: Transport> {
-    transport: T,
-    control_queue: VirtQueue<H, { QUEUE_SIZE as usize }>,
-    cursor_queue: VirtQueue<H, { QUEUE_SIZE as usize }>,
+    transport: ResetOwned<T>,
+    control_queue: ResetOwned<VirtQueue<H, { QUEUE_SIZE as usize }>>,
+    cursor_queue: ResetOwned<VirtQueue<H, { QUEUE_SIZE as usize }>>,
     // Synchronous config probes use these fixed buffers before normal DRM
     // control traffic begins; mutable GPU operations use owned batches below.
     queue_buf_send: Box<[u8]>,
     queue_buf_recv: Box<[u8]>,
-    resources: Vec<Resource>,
+    resources: ResetOwned<Vec<Resource>>,
     next_resource_id: u32,
     virgl: bool,
     resource_uuid: bool,
@@ -363,18 +395,36 @@ pub struct VirtIOGpu<H: Hal, T: Transport> {
     failed_contexts: Vec<ContextId>,
     next_context_id: u32,
     next_fence_id: u64,
-    pending_control: Vec<PendingControl>,
+    pending_control: ResetOwned<Vec<PendingControl>>,
     pending_presents: Vec<PresentBatch>,
     terminal_control: Vec<GpuCompletion>,
     control_faulted: bool,
     /// token -> retained cursor DMA owner.  Queue tokens are unique while a
     /// descriptor is outstanding, so lookup/removal never scans the queue.
-    pending_cursor: BTreeMap<u16, PendingCursor>,
+    pending_cursor: ResetOwned<BTreeMap<u16, PendingCursor>>,
+    reset_failed: bool,
     terminal_cursor: VecDeque<GpuCompletion>,
     cursor_faulted: bool,
 }
 
 impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
+    fn reset_transport(&mut self) -> bool {
+        if self.reset_failed {
+            return false;
+        }
+        self.transport
+            .set_status(crate::transport::DeviceStatus::empty());
+        for _ in 0..4096 {
+            if self.transport.get_status().is_empty() {
+                self.transport.mark_reset_complete();
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        self.reset_failed = true;
+        false
+    }
+
     pub fn new(mut transport: T) -> Result<Self> {
         let features = transport.begin_init(SUPPORTED_FEATURES);
         let control_queue = VirtQueue::new(
@@ -392,12 +442,12 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         let hostmem = transport.shared_memory_region(1);
         transport.finish_init();
         Ok(Self {
-            transport,
-            control_queue,
-            cursor_queue,
+            transport: ResetOwned::new(transport),
+            control_queue: ResetOwned::new(control_queue),
+            cursor_queue: ResetOwned::new(cursor_queue),
             queue_buf_send: FromZeroes::new_box_slice_zeroed(PAGE_SIZE),
             queue_buf_recv: FromZeroes::new_box_slice_zeroed(PAGE_SIZE),
-            resources: Vec::new(),
+            resources: ResetOwned::new(Vec::new()),
             next_resource_id: 1,
             virgl: features.contains(Features::VIRGL),
             resource_uuid: features.contains(Features::RESOURCE_UUID),
@@ -409,13 +459,14 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             failed_contexts: Vec::new(),
             next_context_id: 1,
             next_fence_id: 1,
-            pending_control: Vec::new(),
+            pending_control: ResetOwned::new(Vec::new()),
             pending_presents: Vec::new(),
             terminal_control: Vec::new(),
             control_faulted: false,
-            pending_cursor: BTreeMap::new(),
+            pending_cursor: ResetOwned::new(BTreeMap::new()),
             terminal_cursor: VecDeque::new(),
             cursor_faulted: false,
+            reset_failed: false,
         })
     }
     pub const fn virgl_supported(&self) -> bool {
@@ -2122,10 +2173,10 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
     /// impossible; this method intentionally marks the instance unusable
     /// rather than pretending it can resume with stale resource state.
     pub fn reset_control(&mut self, out: &mut [GpuCompletion]) -> usize {
-        self.transport
-            .set_status(crate::transport::DeviceStatus::empty());
-        self.transport.mark_reset_complete();
         self.control_faulted = true;
+        if !self.reset_transport() {
+            return 0;
+        }
         while !self.pending_control.is_empty() {
             let mut pending = self.pending_control.swap_remove(0);
             let inputs = [pending.request.as_ref()];
@@ -2157,7 +2208,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         // Reset completion is the only proof available that the device has
         // stopped using resource backing addresses after an uncertain command.
         let requester = self.control_queue.dma_requester();
-        for resource in &mut self.resources {
+        for resource in self.resources.iter_mut() {
             while let Some(mapping) = resource.backing_mappings.last().copied() {
                 // SAFETY: transport reset above quiesced all device DMA.
                 if unsafe {
@@ -2165,6 +2216,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                 }
                 .is_err()
                 {
+                    self.reset_failed = true;
                     return 0;
                 }
                 resource.backing_mappings.pop();
@@ -2305,13 +2357,13 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             self.control_queue.add_notify_wait_pop(
                 &[&self.queue_buf_send[..request.len()]],
                 &mut [&mut self.queue_buf_recv],
-                &mut self.transport,
+                &mut *self.transport,
             )?
         } else {
             self.control_queue.add_notify_wait_pop(
                 &[request],
                 &mut [&mut self.queue_buf_recv],
-                &mut self.transport,
+                &mut *self.transport,
             )?
         } as usize;
         if written < core::mem::size_of::<Rsp>() {
@@ -2391,14 +2443,14 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         Ok(completed)
     }
 
-    fn fault_cursor_queue(&mut self) {
+    fn fault_cursor_queue(&mut self) -> bool {
         if self.cursor_faulted {
-            return;
+            return !self.reset_failed;
         }
         self.cursor_faulted = true;
-        self.transport
-            .set_status(crate::transport::DeviceStatus::empty());
-        self.transport.mark_reset_complete();
+        if !self.reset_transport() {
+            return false;
+        }
         while let Some((_, pending)) = self.pending_cursor.pop_first() {
             let inputs = [pending.request.as_ref()];
             let mut outputs: [&mut [u8]; 0] = [];
@@ -2412,9 +2464,12 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                 data: GpuCompletionData::None,
             });
         }
+        true
     }
     pub fn reset_cursor(&mut self, out: &mut [GpuCompletion]) -> usize {
-        self.fault_cursor_queue();
+        if !self.fault_cursor_queue() {
+            return 0;
+        }
         let count = core::cmp::min(out.len(), self.terminal_cursor.len());
         for slot in out.iter_mut().take(count) {
             *slot = self
@@ -2427,27 +2482,45 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
 }
 impl<H: Hal, T: Transport> Drop for VirtIOGpu<H, T> {
     fn drop(&mut self) {
-        if !self.pending_control.is_empty()
+        // Always fence the device before releasing queue, transport or DMA
+        // memory: even with no tracked outstanding work, the device may have
+        // been running. Reset completion is the only quiescence proof.
+        let mut completions: [GpuCompletion; MAX_PENDING_CONTROL] =
+            core::array::from_fn(|_| GpuCompletion {
+                fence_id: 0,
+                result: Ok(()),
+                data: GpuCompletionData::None,
+            });
+        let _ = self.reset_control(&mut completions);
+        let _ = self.reset_cursor(&mut completions);
+        if self.reset_failed
+            || !self.pending_control.is_empty()
             || !self.pending_cursor.is_empty()
             || self
                 .resources
                 .iter()
                 .any(|resource| !resource.backing_mappings.is_empty())
         {
-            // Published descriptors may still be DMA-visible. Reset before
-            // queue teardown; asynchronous resource cleanup is owned by the
-            // caller before dropping the driver.
-            let mut completions: [GpuCompletion; MAX_PENDING_CONTROL] =
-                core::array::from_fn(|_| GpuCompletion {
-                    fence_id: 0,
-                    result: Ok(()),
-                    data: GpuCompletionData::None,
-                });
-            let _ = self.reset_control(&mut completions);
-            let _ = self.reset_cursor(&mut completions);
+            // The reset did not confirm that the device stopped, or some DMA
+            // owner remains. ResetOwned suppresses drop glue for the queues,
+            // transport, backing records and pending owners, so the whole DMA
+            // ownership graph is deliberately leaked.
+            log::warn!("virtio-gpu: device reset not confirmed; leaking queues and DMA buffers");
+            return;
         }
         self.transport.queue_unset(QUEUE_TRANSMIT);
         self.transport.queue_unset(QUEUE_CURSOR);
+        // SAFETY: reset completed and every DMA owner was released above, so
+        // the device cannot access these buffers. Each field is dropped exactly
+        // once here; ResetOwned never drops its contents on its own.
+        unsafe {
+            self.pending_cursor.drop_value();
+            self.pending_control.drop_value();
+            self.resources.drop_value();
+            self.cursor_queue.drop_value();
+            self.control_queue.drop_value();
+            self.transport.drop_value();
+        }
     }
 }
 #[repr(C)]
