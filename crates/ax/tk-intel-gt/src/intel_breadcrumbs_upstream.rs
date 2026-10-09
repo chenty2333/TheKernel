@@ -33,12 +33,12 @@ unsafe extern "C" {
 // trace hooks and BUG helpers are explicit integration boundaries.
 
 // upstream: intel_breadcrumbs.c irq_enable()
-unsafe fn irq_enable(b: *mut IntelBreadcrumbs) -> bool {
+unsafe extern "C" fn irq_enable(b: *mut IntelBreadcrumbs) -> bool {
     crate::intel_engine_cs_upstream::intel_engine_irq_enable((*b).irq_engine)
 }
 
 // upstream: intel_breadcrumbs.c irq_disable()
-unsafe fn irq_disable(b: *mut IntelBreadcrumbs) {
+unsafe extern "C" fn irq_disable(b: *mut IntelBreadcrumbs) {
     crate::intel_engine_cs_upstream::intel_engine_irq_disable((*b).irq_engine);
 }
 
@@ -88,7 +88,7 @@ unsafe fn __intel_breadcrumbs_disarm_irq(b: *mut IntelBreadcrumbs) {
         ((*b).irq_disable.unwrap())(b);
     }
 
-    WRITE_ONCE!((*b).irq_armed, None);
+    WRITE_ONCE!((*b).irq_armed, core::ptr::null_mut());
     intel_gt_pm_put_async((*(*b).irq_engine).gt, wakeref);
 }
 
@@ -134,8 +134,8 @@ unsafe fn check_signal_order(ce: *mut IntelContext, rq: *mut I915Request) -> boo
 
     if !list_is_last(&(*rq).signal_link, &(*ce).signals)
         && i915_seqno_passed(
-            (*rq).fence.seqno,
-            (*list_next_entry!(rq, signal_link)).fence.seqno,
+            (*rq).fence.seqno as u32,
+            (*list_next_entry!(rq, signal_link)).fence.seqno as u32,
         )
     {
         return false;
@@ -143,8 +143,8 @@ unsafe fn check_signal_order(ce: *mut IntelContext, rq: *mut I915Request) -> boo
 
     if !list_is_first(&(*rq).signal_link, &(*ce).signals)
         && i915_seqno_passed(
-            (*list_prev_entry!(rq, signal_link)).fence.seqno,
-            (*rq).fence.seqno,
+            (*list_prev_entry!(rq, signal_link)).fence.seqno as u32,
+            (*rq).fence.seqno as u32,
         )
     {
         return false;
@@ -160,7 +160,7 @@ unsafe fn __dma_fence_signal(fence: *mut DmaFence) -> bool {
 
 // upstream: intel_breadcrumbs.c __dma_fence_signal__timestamp()
 unsafe fn __dma_fence_signal__timestamp(fence: *mut DmaFence, timestamp: KtimeT) {
-    (*fence).timestamp = timestamp;
+    unsafe { (*fence).timestamp_union.timestamp = timestamp };
     set_bit(DMA_FENCE_FLAG_TIMESTAMP_BIT, &mut (*fence).flags);
     trace_dma_fence_signaled(fence);
 }
@@ -174,7 +174,7 @@ unsafe fn __dma_fence_signal__notify(fence: *mut DmaFence, list: *mut ListHead) 
 
     list_for_each_entry_safe!(cur, tmp, list, node, {
         INIT_LIST_HEAD(&mut (*cur).node);
-        ((*cur).func)(fence, cur);
+        ((*cur).func.unwrap())(fence, cur);
     });
 }
 
@@ -287,7 +287,10 @@ unsafe extern "C" fn signal_irq_work(work: *mut IrqWork) {
         }
 
         spin_lock(&mut (*rq).lock);
-        list_replace(&mut (*rq).fence.cb_list, &mut cb_list);
+        list_replace(
+            core::ptr::addr_of_mut!((*rq).fence.timestamp_union.cb_list).cast::<ListHead>(),
+            &mut cb_list,
+        );
         __dma_fence_signal__timestamp(&mut (*rq).fence, timestamp);
         __dma_fence_signal__notify(&mut (*rq).fence, &mut cb_list);
         spin_unlock(&mut (*rq).lock);
@@ -396,7 +399,7 @@ unsafe fn irq_signal_request(rq: *mut I915Request, b: *mut IntelBreadcrumbs) {
 
 // upstream: intel_breadcrumbs.c insert_breadcrumb()
 unsafe fn insert_breadcrumb(rq: *mut I915Request) {
-    let b = READ_ONCE!((*rq).engine).breadcrumbs;
+    let b = READ_ONCE!((*(*rq).engine).breadcrumbs);
     let ce = (*rq).context;
     let mut pos: *mut ListHead;
 
@@ -433,7 +436,7 @@ unsafe fn insert_breadcrumb(rq: *mut I915Request) {
         list_for_each_prev!(pos, &(*ce).signals, {
             let it = list_entry!(pos, I915Request, signal_link);
 
-            if i915_seqno_passed((*rq).fence.seqno, (*it).fence.seqno) {
+            if i915_seqno_passed((*rq).fence.seqno as u32, (*it).fence.seqno as u32) {
                 break;
             }
         });
@@ -481,7 +484,7 @@ unsafe fn i915_request_enable_breadcrumb(rq: *mut I915Request) -> bool {
 
 // upstream: intel_breadcrumbs.c i915_request_cancel_breadcrumb()
 unsafe fn i915_request_cancel_breadcrumb(rq: *mut I915Request) {
-    let b = READ_ONCE!((*rq).engine).breadcrumbs;
+    let b = READ_ONCE!((*(*rq).engine).breadcrumbs);
     let ce = (*rq).context;
     let release: bool;
 
