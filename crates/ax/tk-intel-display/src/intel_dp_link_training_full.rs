@@ -88,6 +88,24 @@ pub enum LinkTrainingError {
     Refused,
 }
 
+/// Terminal disposition from one invocation of the upstream link-training
+/// state machine. In particular, a queued modeset retry is not a trained link.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkTrainingOutcome {
+    Trained,
+    RetryDeferred,
+    RetryScheduled,
+    Disconnected,
+    RetryDisabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkTrainingRetry {
+    Disconnected,
+    Scheduled,
+    Unavailable,
+}
+
 /// Minimal CRTC/encoder state read by the upstream training code.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LinkTrainingCrtcState {
@@ -1299,17 +1317,17 @@ pub fn intel_dp_schedule_fallback_link_training<I: LinkTrainingIo>(
     dp: &mut IntelDpLinkTraining,
     io: &mut I,
     state: &LinkTrainingCrtcState,
-) -> bool {
+) -> LinkTrainingRetry {
     if !io.connected() {
-        return true;
+        return LinkTrainingRetry::Disconnected;
     }
     if dp.hobl_active {
         dp.hobl_failed = true;
     } else if !intel_dp_get_link_train_fallback_values(dp, io, state) {
-        return false;
+        return LinkTrainingRetry::Unavailable;
     }
     io.queue_modeset_retry(state);
-    true
+    LinkTrainingRetry::Scheduled
 }
 
 // upstream: intel_dp_link_training.c intel_dp_link_train_all_phys()
@@ -1498,7 +1516,7 @@ pub fn intel_dp_start_link_train<I: LinkTrainingIo>(
     dp: &mut IntelDpLinkTraining,
     io: &mut I,
     state: &LinkTrainingCrtcState,
-) {
+) -> LinkTrainingOutcome {
     io.hpd_block();
     let mut lttpr_count = intel_dp_init_lttpr_and_dprx_caps(dp, io).unwrap_or(0);
     if lttpr_count < 0 {
@@ -1514,19 +1532,22 @@ pub fn intel_dp_start_link_train<I: LinkTrainingIo>(
         dp.force_train_failure -= 1;
     } else if passed {
         dp.seq_train_failures = 0;
-        return;
+        return LinkTrainingOutcome::Trained;
     }
     dp.seq_train_failures = dp.seq_train_failures.saturating_add(1);
     if io.ignore_long_hpd() {
-        return;
+        return LinkTrainingOutcome::RetryDeferred;
     }
     if dp.seq_train_failures < MAX_SEQ_TRAIN_FAILURES {
-        return;
+        return LinkTrainingOutcome::RetryDeferred;
     }
-    if intel_dp_schedule_fallback_link_training(dp, io, state) {
-        return;
+    match intel_dp_schedule_fallback_link_training(dp, io, state) {
+        LinkTrainingRetry::Disconnected => return LinkTrainingOutcome::Disconnected,
+        LinkTrainingRetry::Scheduled => return LinkTrainingOutcome::RetryScheduled,
+        LinkTrainingRetry::Unavailable => {}
     }
     dp.retrain_disabled = true;
+    LinkTrainingOutcome::RetryDisabled
 }
 
 // upstream: intel_dp_link_training.c intel_dp_128b132b_sdp_crc16()
