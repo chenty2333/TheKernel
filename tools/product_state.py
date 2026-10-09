@@ -306,6 +306,7 @@ def validate_artifact_config(artifacts: Artifacts, rootfs: Path | None, transpor
 ROOTFS_INPUT_FILES = (
     "scripts/build-rootfs.sh",
     "scripts/stage-intel-bt-firmware.sh",
+    "scripts/build-iwx-firmware-payload.sh",
     "scripts/ci/n305-dhcp.script",
     "scripts/build-guest-tools.sh",
     "scripts/build-nested-payload.sh",
@@ -505,14 +506,26 @@ def rootfs_fingerprint() -> str:
         digest.update(content)
     for name in ROOTFS_INPUT_ENV:
         digest.update(f"{name}={os.environ.get(name, '')}".encode())
-    firmware_dir = os.environ.get("THEKERNEL_RTL8168_FIRMWARE_DIR", "")
-    digest.update(f"rtl8168-firmware={firmware_dir}".encode())
-    if firmware_dir:
-        for name in ("rtl8168h-2.fw", "LICENSE.r8169"):
-            path = Path(firmware_dir) / name
-            if not path.is_file():
-                raise ProductError(f"missing firmware input: {path}")
-            digest.update(path.read_bytes())
+    for variable, names in (
+        ("THEKERNEL_RTL8168_FIRMWARE_DIR", ("rtl8168h-2.fw", "LICENSE.r8169")),
+        ("THEKERNEL_IWX_FIRMWARE_DIR", (
+            "iwlwifi-so-a0-gf-a0-89.ucode", "iwlwifi-so-a0-gf-a0.pnvm",
+            "LICENCE.iwlwifi_firmware",
+        )),
+        ("THEKERNEL_I915_UC_FIRMWARE_DIR", ("tgl_guc_70.bin", "tgl_huc.bin", "LICENSE.i915")),
+        ("THEKERNEL_I915_DMC_FIRMWARE_DIR", (
+            "adlp_dmc.bin", "adlp_dmc_ver2_16.bin", "adls_dmc_ver2_01.bin",
+            "rkl_dmc_ver2_03.bin", "tgl_dmc_ver2_12.bin", "LICENSE.i915",
+        )),
+    ):
+        firmware_dir = os.environ.get(variable, "")
+        digest.update(f"{variable}={firmware_dir}".encode())
+        if firmware_dir:
+            for name in names:
+                path = Path(firmware_dir) / name
+                if not path.is_file():
+                    raise ProductError(f"missing firmware input: {path}")
+                digest.update(path.read_bytes())
     intel_dir = os.environ.get("THEKERNEL_INTEL_BT_FIRMWARE_DIR", "")
     intel_license = os.environ.get(
         "THEKERNEL_INTEL_BT_FIRMWARE_LICENSE", "/usr/share/licenses/linux-firmware/LICENSE.intel"

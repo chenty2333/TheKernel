@@ -48,6 +48,7 @@ Environment overrides:
                               PNVM and LICENCE.iwlwifi_firmware
   THEKERNEL_SOURCE_CACHE      Download cache
   THEKERNEL_I915_DMC_FIRMWARE_DIR pre-decompressed display-12/13 DMC files
+  THEKERNEL_I915_UC_FIRMWARE_DIR  pre-decompressed N305 GuC/HuC plus LICENSE.i915
 EOF
 }
 
@@ -422,6 +423,20 @@ if [ -n "${THEKERNEL_RTL8168_FIRMWARE_DIR:-}" ]; then
     done
     install -d "$STAGE/lib/firmware/rtl_nic"
     install -m 0644 "$firmware_dir/rtl8168h-2.fw" "$firmware_dir/LICENSE.r8169" "$STAGE/lib/firmware/rtl_nic/"
+fi
+
+# ADL-N uses the TGL GuC/HuC images selected by intel_uc_fw.c. Keep
+# them explicit rootfs inputs rather than assuming DMC also supplies GT code.
+if [ -n "${THEKERNEL_I915_UC_FIRMWARE_DIR:-}" ]; then
+    uc_dir=$THEKERNEL_I915_UC_FIRMWARE_DIR
+    for name in tgl_guc_70.bin tgl_huc.bin; do
+        [ -s "$uc_dir/$name" ] || { printf 'missing uC firmware input: %s/%s\n' "$uc_dir" "$name" >&2; exit 1; }
+        [ "$(wc -c < "$uc_dir/$name")" -le 2097152 ] || { printf 'uC firmware exceeds driver size cap: %s\n' "$name" >&2; exit 1; }
+    done
+    [ -s "$uc_dir/LICENSE.i915" ] || { printf 'missing uC firmware notice: %s/LICENSE.i915\n' "$uc_dir" >&2; exit 1; }
+    install -d "$STAGE/lib/firmware/i915"
+    install -m 0644 "$uc_dir/tgl_guc_70.bin" "$uc_dir/tgl_huc.bin" \
+        "$uc_dir/LICENSE.i915" "$STAGE/lib/firmware/i915/"
 fi
 
 # DMC files are licensed binary firmware, not source inputs. The caller must

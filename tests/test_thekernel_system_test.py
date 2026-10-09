@@ -124,6 +124,43 @@ class SystemTestGateTests(unittest.TestCase):
                 source.rename(root / "second" / "probe.c")
                 self.assertNotEqual(before, product_state.rootfs_fingerprint())
 
+    def test_rootfs_cache_tracks_explicit_firmware_bytes_and_notices(self) -> None:
+        from tools import product_state
+
+        families = {
+            "THEKERNEL_IWX_FIRMWARE_DIR": (
+                "iwlwifi-so-a0-gf-a0-89.ucode", "iwlwifi-so-a0-gf-a0.pnvm",
+                "LICENCE.iwlwifi_firmware"),
+            "THEKERNEL_I915_UC_FIRMWARE_DIR": (
+                "tgl_guc_70.bin", "tgl_huc.bin", "LICENSE.i915"),
+            "THEKERNEL_I915_DMC_FIRMWARE_DIR": (
+                "adlp_dmc.bin", "adlp_dmc_ver2_16.bin", "adls_dmc_ver2_01.bin",
+                "rkl_dmc_ver2_03.bin", "tgl_dmc_ver2_12.bin", "LICENSE.i915"),
+        }
+        with test_tmpdir() as directory, patch.dict(os.environ, {
+                name: "" for name in (*families, "THEKERNEL_RTL8168_FIRMWARE_DIR",
+                                     "THEKERNEL_INTEL_BT_FIRMWARE_DIR")}):
+            source = Path(directory)
+            baseline = product_state.rootfs_fingerprint()
+            for variable, names in families.items():
+                with self.subTest(variable=variable):
+                    for name in names:
+                        (source / name).write_bytes(b"firmware or redistribution notice")
+                    os.environ[variable] = str(source)
+                    before = product_state.rootfs_fingerprint()
+                    self.assertNotEqual(baseline, before)
+                    for name in names:
+                        path = source / name
+                        path.write_bytes(path.read_bytes() + b" changed")
+                        after = product_state.rootfs_fingerprint()
+                        self.assertNotEqual(before, after, name)
+                        before = after
+                    notice = names[-1]
+                    (source / notice).unlink()
+                    with self.assertRaisesRegex(product_state.ProductError, notice):
+                        product_state.rootfs_fingerprint()
+                    os.environ[variable] = ""
+
     def test_toolchain_flag_selects_the_payload_over_the_environment(self) -> None:
         """`--toolchain` must reach the artifact layout, not be echoed away.
 
