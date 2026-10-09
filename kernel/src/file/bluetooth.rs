@@ -400,6 +400,9 @@ mod tests {
         assert_eq!(&actual[14..], &[0, 0, 0, 0, 0, 0]);
     }
 
+    // Pairing prompts are translated by fanout_hci_management_events(), which is
+    // only compiled with `feature = "input"`; see the inquiry test above.
+    #[cfg(feature = "input")]
     #[test]
     fn pairing_prompts_are_translated_to_mgmt_events() {
         let socket = HciSocket::new();
