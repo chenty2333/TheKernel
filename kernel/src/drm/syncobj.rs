@@ -7,7 +7,50 @@ use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 
 use super::fence::Fence;
-use crate::file::{FileLike, Kstat};
+use crate::file::{FileLike, IoctlContext, Kstat};
+
+const SYNC_IOC_MAGIC: u32 = b'>' as u32;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct SyncMergeData {
+    name: [u8; 32],
+    fd2: i32,
+    fence: i32,
+    flags: u32,
+    pad: u32,
+}
+
+const SYNC_IOC_MERGE: u32 =
+    (3 << 30) | ((core::mem::size_of::<SyncMergeData>() as u32) << 16) | (SYNC_IOC_MAGIC << 8) | 3;
+const _: () = {
+    assert!(core::mem::size_of::<SyncMergeData>() == 48);
+    assert!(SYNC_IOC_MERGE == 0xc030_3e03);
+};
+
+fn validate_merge_data(request: &SyncMergeData) -> AxResult<()> {
+    if request.flags != 0 || request.pad != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn finish_merge_ioctl(
+    memory: &crate::mm::UserMemoryCapability,
+    arg: usize,
+    mut request: SyncMergeData,
+    output: crate::file::PreparedFdPublication,
+) -> AxResult<usize> {
+    request.fence = output.fd();
+    memory
+        .write_value(arg as *mut SyncMergeData, request)
+        .map_err(crate::mm::map_usercopy_error)?;
+    // Linux keeps the fd reserved until after copy_to_user, so a failed
+    // result copy neither leaks a visible descriptor nor exposes a partial
+    // sync_file. Dropping `output` rolls the exact reservation back.
+    output.commit();
+    Ok(0)
+}
 
 pub type SyncobjHandle = u32;
 pub struct Syncobj {
@@ -349,6 +392,29 @@ impl FileLike for SyncFile {
     fn set_nonblocking(&self, _: bool) -> AxResult<()> {
         Ok(())
     }
+    fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
+        if cmd != SYNC_IOC_MERGE {
+            return Err(AxError::NotATty);
+        }
+
+        // `sync_file_ioctl_merge()` reserves a CLOEXEC fd before importing
+        // its userspace request. Keep the slot invisible until after the
+        // merged-fd number has been copied back successfully.
+        let slot = reserve_sync_file_fd(context, true)?;
+        let request = context
+            .user_memory()
+            .read_value::<SyncMergeData>(arg as *const SyncMergeData)
+            .map_err(crate::mm::map_usercopy_error)?;
+        validate_merge_data(&request)?;
+
+        // Linux sync_file_fdget() returns NULL for both an invalid descriptor
+        // and a descriptor of another file type; the merge ioctl reports
+        // -ENOENT in either case.
+        let other = super::syncobj::import(context, request.fd2).map_err(|_| AxError::NotFound)?;
+        let merged = Fence::join(&[self.fence.clone(), other])?;
+        let output = prepare_sync_file_publication(merged, slot)?;
+        finish_merge_ioctl(context.user_memory(), arg, request, output)
+    }
 }
 impl Pollable for SyncFile {
     fn poll(&self) -> IoEvents {
@@ -367,7 +433,26 @@ pub(crate) fn export(
     context: &crate::file::IoctlContext,
     cloexec: bool,
 ) -> AxResult<i32> {
-    context.add_file_like(SyncFile::new(fence), cloexec)
+    let slot = reserve_sync_file_fd(context, cloexec)?;
+    Ok(prepare_sync_file_publication(fence, slot)?.commit())
+}
+
+fn reserve_sync_file_fd(
+    context: &IoctlContext,
+    cloexec: bool,
+) -> AxResult<crate::file::ReservedFd> {
+    let limit = context.caller_process().rlim.read()[linux_raw_sys::general::RLIMIT_NOFILE]
+        .current
+        .min(crate::task::AX_FILE_LIMIT as u64) as usize;
+    crate::file::reserve_fd_in(context.files().clone(), limit, cloexec)
+}
+
+fn prepare_sync_file_publication(
+    fence: Arc<Fence>,
+    slot: crate::file::ReservedFd,
+) -> AxResult<crate::file::PreparedFdPublication> {
+    let description = crate::file::FileDescription::new(SyncFile::new(fence))?;
+    slot.prepare_publication(description)
 }
 pub(crate) fn import(context: &crate::file::IoctlContext, fd: i32) -> AxResult<Arc<Fence>> {
     context
@@ -538,7 +623,114 @@ mod tests {
         task::{Context, Waker},
     };
 
+    use axhal::paging::{MappingFlags, PageSize};
+    use axsync::Mutex;
+    use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+
     use super::*;
+
+    fn sync_file_test_memory() -> crate::mm::UserMemoryCapability {
+        let mut address_space =
+            crate::mm::AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K * 2).unwrap();
+        address_space
+            .map(
+                VirtAddr::from(0x1000),
+                PAGE_SIZE_4K,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                false,
+                crate::mm::Backend::new_alloc(VirtAddr::from(0x1000), PageSize::Size4K),
+            )
+            .unwrap();
+        crate::mm::UserMemoryCapability::new(Arc::new(Mutex::new(address_space)))
+    }
+
+    fn prepared_test_sync_file(
+        table: Arc<crate::file::FdTable>,
+    ) -> crate::file::PreparedFdPublication {
+        let slot = crate::file::reserve_fd_in(table, 32, true).unwrap();
+        let description =
+            crate::file::FileDescription::new(SyncFile::new(Fence::new(false))).unwrap();
+        slot.prepare_publication(description).unwrap()
+    }
+
+    #[test]
+    fn sync_file_merge_ioctl_matches_linux_abi_and_validates_reserved_fields() {
+        assert_eq!(SYNC_IOC_MERGE, 0xc030_3e03);
+        assert_eq!(core::mem::size_of::<SyncMergeData>(), 48);
+        assert_eq!(validate_merge_data(&SyncMergeData::default()), Ok(()));
+        assert_eq!(
+            validate_merge_data(&SyncMergeData {
+                flags: 1,
+                ..SyncMergeData::default()
+            }),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            validate_merge_data(&SyncMergeData {
+                pad: 1,
+                ..SyncMergeData::default()
+            }),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn sync_file_merge_copyout_fault_cancels_unpublished_cloexec_fd() {
+        let table = Arc::new(crate::file::FdTable::new().unwrap());
+        let output = prepared_test_sync_file(table.clone());
+        let fd = output.fd();
+        assert!(table.get_description(fd).is_err());
+
+        // 0x2000 lies in the address-space range but has no mapped page.
+        let error = finish_merge_ioctl(
+            &sync_file_test_memory(),
+            0x2000,
+            SyncMergeData::default(),
+            output,
+        )
+        .unwrap_err();
+        assert_eq!(error, AxError::BadAddress);
+        assert!(table.get_description(fd).is_err());
+        let replacement = crate::file::reserve_fd_in(table.clone(), 32, true).unwrap();
+        assert_eq!(replacement.fd(), fd);
+    }
+
+    #[test]
+    fn sync_file_merge_copyout_publishes_cloexec_result_only_after_success() {
+        let table = Arc::new(crate::file::FdTable::new().unwrap());
+        let memory = sync_file_test_memory();
+        let output = prepared_test_sync_file(table.clone());
+        let fd = output.fd();
+        assert_eq!(
+            finish_merge_ioctl(&memory, 0x1000, SyncMergeData::default(), output),
+            Ok(0)
+        );
+        let result = memory
+            .read_value::<SyncMergeData>(0x1000 as *const SyncMergeData)
+            .unwrap();
+        assert_eq!(result.fence, fd);
+        assert!(table.get_cloexec(fd).unwrap());
+        assert!(
+            table
+                .get_description(fd)
+                .unwrap()
+                .inner
+                .downcast_ref::<SyncFile>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn sync_file_merge_fence_waits_for_every_source_and_propagates_failure() {
+        let first = Fence::new(false);
+        let second = Fence::new(false);
+        let merged = Fence::join(&[first.clone(), second.clone()]).unwrap();
+        first.signal();
+        assert!(!merged.is_signaled());
+        second.signal_error();
+        assert!(merged.is_signaled());
+        assert!(merged.is_failed());
+    }
 
     #[test]
     fn binary_wait_any_reports_the_signaled_member() {
