@@ -19,9 +19,9 @@ use crate::{
         GuCSchedWqDesc as guc_sched_wq_desc, GuCWorkQueueItem as guc_wq_item, MAX_ENGINE_INSTANCE,
         PARENT_SCRATCH_SIZE,
     },
+    i915_gem_object_types_upstream::DrmI915GemObject as drm_i915_gem_object,
     i915_request_types_upstream::{
-        DrmI915GemObject as drm_i915_gem_object, I915Request as i915_request,
-        i915_request_notify_execute_cb_imm, i915_test_request_state,
+        I915Request as i915_request, i915_request_notify_execute_cb_imm, i915_test_request_state,
     },
     i915_scheduler_types_upstream::{I915SchedEngine as i915_sched_engine, i915_priolist},
     i915_scheduler_upstream::i915_schedule,

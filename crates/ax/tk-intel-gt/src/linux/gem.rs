@@ -14,6 +14,15 @@ use crate::{
 /// opaque storage preserves the larger `ttm_buffer_object` union size.
 pub type DrmGemObject = DrmGemObjectBaseLayout;
 
+/// Opaque TTM arm of `drm_i915_gem_object.base`; target-configured x86_64
+/// storage is 480 bytes and the i915 owner does not access TTM-private fields.
+#[repr(C, align(8))]
+pub struct TtmBufferObjectLayout {
+    _opaque: [u8; 480],
+}
+const _: [(); 480] = [(); size_of::<TtmBufferObjectLayout>()];
+const _: [(); 8] = [(); align_of::<TtmBufferObjectLayout>()];
+
 /// Source-layout prefix through `drm_file::driver_priv`, the member used by
 /// GEM handle close paths. Later DRM file fields are not accessed here.
 #[repr(C)]

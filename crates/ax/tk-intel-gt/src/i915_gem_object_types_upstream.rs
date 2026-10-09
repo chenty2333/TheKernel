@@ -24,11 +24,14 @@ use crate::{
     intel_context_types_upstream::I915Active,
     intel_context_upstream::{
         DrmMmNode, DrmVmaOffsetNode, I915AddressSpace, RadixTreeRoot, RcuHead, SgTable,
-        TtmBufferObjectLayout,
     },
     intel_engine_cs_upstream::{AtomicT, ListHead, LlistNode, Mutex, RbNode, RbRoot, Spinlock},
     intel_gt_defines_types_upstream::I915_MAX_GT,
-    linux::{gem::DrmGemObject, gem_memory::IntelMemoryRegion, mmu_notifier::MmuIntervalNotifier},
+    linux::{
+        gem::{DrmGemObject, TtmBufferObjectLayout},
+        gem_memory::IntelMemoryRegion,
+        mmu_notifier::MmuIntervalNotifier,
+    },
     linux_i915_private::DrmI915Private,
 };
 

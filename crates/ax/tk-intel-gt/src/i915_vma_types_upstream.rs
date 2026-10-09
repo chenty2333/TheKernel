@@ -18,11 +18,11 @@
 use core::ffi::{c_ulong, c_void};
 
 use crate::{
+    i915_gem_object_types_upstream::DrmI915GemObject,
     i915_vma_resource_types_upstream::{I915PageSizes, I915VmaResource},
     intel_context_types_upstream::I915Active,
     intel_context_upstream::{
-        DrmI915GemObject, DrmMmNode, I915AddressSpace, I915FenceReg, I915GttView, I915MmapOffset,
-        I915VmaOps, SgTable,
+        DrmMmNode, I915AddressSpace, I915FenceReg, I915GttView, I915MmapOffset, I915VmaOps, SgTable,
     },
     intel_engine_cs_upstream::{AtomicT, ListHead, RbNode},
 };

@@ -16,11 +16,15 @@ use core::{
 };
 
 use crate::{
-    i915_gem_object_types_upstream::DrmI915GemObject,
-    i915_gem_tiling_upstream::{
-        i915_gem_object_do_bit_17_swizzle, i915_gem_object_needs_bit17_swizzle,
-        i915_gem_object_save_bit_17_swizzle,
+    i915_gem_object_types_upstream::{
+        DrmI915GemObject, DrmI915GemObjectOps, I915_GEM_OBJECT_IS_SHRINKABLE,
+        I915_GEM_OBJECT_SHRINK_WRITEBACK, VmOperationsStruct,
     },
+    i915_gem_object_upstream::{
+        i915_gem_object_can_bypass_llc, i915_gem_object_has_struct_page, i915_gem_object_init,
+        i915_gem_object_set_cache_coherency,
+    },
+    i915_gem_tiling_upstream::i915_gem_object_needs_bit17_swizzle,
     intel_context_upstream::SgTable,
     linux::i915::{GRAPHICS_VER, GRAPHICS_VER_FULL, IP_VER, IS_DGFX, IS_I965G, IS_I965GM},
     linux_config::*,
@@ -31,8 +35,6 @@ use crate::{
 // i915_gem.h, i915_drm.h, gfp_types.h, swap.h and fs.h.
 const I915_SHRINK_UNBOUND: u32 = 1 << 0;
 const I915_SHRINK_BOUND: u32 = 1 << 1;
-const I915_GEM_OBJECT_IS_SHRINKABLE: u32 = 1 << 1;
-const I915_GEM_OBJECT_SHRINK_WRITEBACK: u32 = 1 << 0;
 const I915_BO_ALLOC_NOTHP: u32 = 1 << 8;
 const I915_BO_FLAG_STRUCT_PAGE: u32 = 1 << 0;
 const I915_MADV_WILLNEED: u32 = 0;
@@ -295,12 +297,7 @@ unsafe fn object_dirty(obj: *const DrmI915GemObject) -> bool {
 
 #[inline]
 unsafe fn set_object_dirty(obj: *mut DrmI915GemObject, dirty: bool) {
-    let madv_dirty = &mut (*obj).mm.madv_dirty;
-    if dirty {
-        *madv_dirty |= 1 << 2;
-    } else {
-        *madv_dirty &= !(1 << 2);
-    }
+    (*obj).mm.set_dirty(dirty);
 }
 
 #[inline]
@@ -548,7 +545,7 @@ pub unsafe fn shmem_sg_alloc_table(
 }
 
 // upstream: i915_gem_shmem.c shmem_get_pages()
-unsafe fn shmem_get_pages(obj: *mut DrmI915GemObject) -> c_int {
+unsafe extern "C" fn shmem_get_pages(obj: *mut DrmI915GemObject) -> c_int {
     let i915 = to_i915((*obj).base.dev);
     let mem = (*obj).mm.region as *mut IntelMemoryRegion;
     let mapping = (*object_file(obj)).f_mapping;
@@ -619,7 +616,7 @@ unsafe fn shmem_get_pages(obj: *mut DrmI915GemObject) -> c_int {
 }
 
 // upstream: i915_gem_shmem.c shmem_truncate()
-unsafe fn shmem_truncate(obj: *mut DrmI915GemObject) -> c_int {
+unsafe extern "C" fn shmem_truncate(obj: *mut DrmI915GemObject) -> c_int {
     // Our goal here is to return as much of the memory as is possible back
     // to the system as we are called from OOM. To do this we must instruct
     // the shmfs to drop all of its backing pages, *now*.
@@ -677,7 +674,7 @@ unsafe fn shmem_writeback(obj: *mut DrmI915GemObject) {
 }
 
 // upstream: i915_gem_shmem.c shmem_shrink()
-unsafe fn shmem_shrink(obj: *mut DrmI915GemObject, flags: u32) -> c_int {
+unsafe extern "C" fn shmem_shrink(obj: *mut DrmI915GemObject, flags: u32) -> c_int {
     match object_madv(obj) {
         I915_MADV_DONTNEED => return i915_gem_object_truncate(obj),
         __I915_MADV_PURGED => return 0,
@@ -744,7 +741,7 @@ pub unsafe fn i915_gem_object_put_pages_shmem(obj: *mut DrmI915GemObject, pages:
 }
 
 // upstream: i915_gem_shmem.c shmem_put_pages()
-unsafe fn shmem_put_pages(obj: *mut DrmI915GemObject, pages: *mut SgTable) {
+unsafe extern "C" fn shmem_put_pages(obj: *mut DrmI915GemObject, pages: *mut SgTable) {
     if likely(i915_gem_object_has_struct_page(obj)) {
         i915_gem_object_put_pages_shmem(obj, pages);
     } else {
@@ -753,7 +750,10 @@ unsafe fn shmem_put_pages(obj: *mut DrmI915GemObject, pages: *mut SgTable) {
 }
 
 // upstream: i915_gem_shmem.c shmem_pwrite()
-unsafe fn shmem_pwrite(obj: *mut DrmI915GemObject, arg: *const DrmI915GemPwrite) -> c_int {
+unsafe extern "C" fn shmem_pwrite(
+    obj: *mut DrmI915GemObject,
+    arg: *const DrmI915GemPwrite,
+) -> c_int {
     let user_data = u64_to_user_ptr((*arg).data_ptr).cast::<c_char>();
     let file = object_file(obj);
     let mut kiocb = Kiocb {
@@ -822,7 +822,7 @@ unsafe fn shmem_pwrite(obj: *mut DrmI915GemObject, arg: *const DrmI915GemPwrite)
 }
 
 // upstream: i915_gem_shmem.c shmem_pread()
-unsafe fn shmem_pread(obj: *mut DrmI915GemObject, arg: *const DrmI915GemPread) -> c_int {
+unsafe extern "C" fn shmem_pread(obj: *mut DrmI915GemObject, arg: *const DrmI915GemPread) -> c_int {
     if !i915_gem_object_has_struct_page(obj) {
         return i915_gem_object_pread_phys(obj, arg);
     }
@@ -831,7 +831,7 @@ unsafe fn shmem_pread(obj: *mut DrmI915GemObject, arg: *const DrmI915GemPread) -
 }
 
 // upstream: i915_gem_shmem.c shmem_release()
-unsafe fn shmem_release(obj: *mut DrmI915GemObject) {
+unsafe extern "C" fn shmem_release(obj: *mut DrmI915GemObject) {
     if i915_gem_object_has_struct_page(obj) {
         i915_gem_object_release_memory_region(obj);
     }
@@ -839,33 +839,8 @@ unsafe fn shmem_release(obj: *mut DrmI915GemObject) {
     fput(object_file(obj));
 }
 
-// Source order follows struct drm_i915_gem_object_ops in
-// gem/i915_gem_object_types.h, including null slots between these callbacks.
-#[repr(C)]
-pub struct DrmI915GemObjectOps {
-    pub flags: u32,
-    pub get_pages: Option<unsafe fn(*mut DrmI915GemObject) -> c_int>,
-    pub put_pages: Option<unsafe fn(*mut DrmI915GemObject, *mut SgTable)>,
-    pub truncate: Option<unsafe fn(*mut DrmI915GemObject) -> c_int>,
-    pub shrink: Option<unsafe fn(*mut DrmI915GemObject, u32) -> c_int>,
-    pub pread: Option<unsafe fn(*mut DrmI915GemObject, *const DrmI915GemPread) -> c_int>,
-    pub pwrite: Option<unsafe fn(*mut DrmI915GemObject, *const DrmI915GemPwrite) -> c_int>,
-    pub mmap_offset: Option<unsafe fn(*mut DrmI915GemObject) -> u64>,
-    pub unmap_virtual: Option<unsafe fn(*mut DrmI915GemObject)>,
-    pub dmabuf_export: Option<unsafe fn(*mut DrmI915GemObject) -> c_int>,
-    pub adjust_lru: Option<unsafe fn(*mut DrmI915GemObject)>,
-    pub delayed_free: Option<unsafe fn(*mut DrmI915GemObject)>,
-    pub migrate: Option<unsafe fn(*mut DrmI915GemObject, *mut IntelMemoryRegion, u32) -> c_int>,
-    pub release: Option<unsafe fn(*mut DrmI915GemObject)>,
-    pub mmap_ops: *const VmOperationsStruct,
-    pub name: *const c_char,
-}
-
-#[repr(C)]
-pub struct VmOperationsStruct {
-    _opaque: [u8; 0],
-}
-
+// The operation-table record and callback ABI come from the canonical
+// i915_gem_object_types.h owner.
 // SAFETY: the ops table is immutable after initialization and contains only
 // immutable function pointers and a static string pointer.
 unsafe impl Sync for DrmI915GemObjectOps {}

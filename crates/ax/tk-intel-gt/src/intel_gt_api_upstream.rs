@@ -13,9 +13,10 @@
 use core::ffi::{c_long, c_void};
 
 use crate::{
+    i915_gem_object_types_upstream::DrmI915GemObject,
     i915_request_types_upstream::DrmPrinter,
     intel_context_types_upstream::IntelContext,
-    intel_context_upstream::{DrmI915GemObject, I915Vma},
+    intel_context_upstream::I915Vma,
     intel_engine_cs_upstream::WorkStruct,
     intel_engine_types_upstream::{COPY_ENGINE_CLASS, IntelEngineCs, IntelEngineMask},
     intel_gsc_types_upstream::IntelGsc,

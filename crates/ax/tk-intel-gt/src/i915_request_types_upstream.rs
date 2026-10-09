@@ -14,6 +14,7 @@ use core::{
 };
 
 use crate::{
+    i915_gem_object_types_upstream::DrmI915GemObject,
     i915_scheduler_types_upstream::{I915Dependency, I915SchedNode},
     intel_context_types_upstream::{I915SwFence, IntelContext},
     intel_context_upstream::{
@@ -31,11 +32,6 @@ use crate::{
 // the request record and do not pretend to define their external layouts.
 #[repr(C)]
 pub struct DrmFile {
-    _opaque: [u8; 0],
-}
-
-#[repr(C)]
-pub struct DrmI915GemObject {
     _opaque: [u8; 0],
 }
 
