@@ -1683,6 +1683,8 @@ mod tests {
         fail_caps_read: bool,
         source_tps3: bool,
         source_tps4: bool,
+        ignore_long_hpd: bool,
+        link_checks: usize,
         hpd_blocks: usize,
         hpd_unblocks: usize,
     }
@@ -1781,11 +1783,13 @@ mod tests {
         fn hpd_unblock(&mut self) {
             self.hpd_unblocks += 1;
         }
-        fn queue_link_check(&mut self, _: u32) {}
+        fn queue_link_check(&mut self, _: u32) {
+            self.link_checks += 1;
+        }
         fn set_idle_link_train(&mut self, _: &LinkTrainingCrtcState) {}
         fn queue_modeset_retry(&mut self, _: &LinkTrainingCrtcState) {}
         fn ignore_long_hpd(&mut self) -> bool {
-            false
+            self.ignore_long_hpd
         }
         fn source_supports_tps3(&self) -> bool {
             self.source_tps3
@@ -2023,6 +2027,21 @@ mod tests {
         );
         assert_eq!(io.hpd_unblocks, 1);
         assert_eq!(io.hpd_blocks, 1);
+    }
+
+    #[test]
+    fn stop_link_train_unblocks_hpd_without_queueing_for_long_hpd_policy() {
+        let mut io = SourcePhyFailureIo {
+            ignore_long_hpd: true,
+            ..Default::default()
+        };
+        let mut dp = IntelDpLinkTraining::default();
+        assert_eq!(
+            intel_dp_stop_link_train(&mut dp, &mut io, &LinkTrainingCrtcState::default()),
+            Err(LinkTrainingError::Refused)
+        );
+        assert_eq!(io.hpd_unblocks, 1);
+        assert_eq!(io.link_checks, 0);
     }
 
     #[test]
