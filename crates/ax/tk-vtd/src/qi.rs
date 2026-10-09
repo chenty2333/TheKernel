@@ -111,6 +111,10 @@ pub fn dmar_disable_qi<I: QiIo>(io: &mut I) -> Result<(), Error> {
 
 /// upstream: intel_qi.c dmar_qi_advance_tail()
 pub fn dmar_qi_advance_tail<I: QiIo>(io: &mut I, queue: &QiQueue) {
+    // QI ring/status memory is architecturally coherent independently of
+    // ECAP.C, but descriptor stores must become visible before the MMIO tail
+    // publishes them to the remapping hardware.
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
     io.write32(IQT, queue.tail_bytes);
 }
 

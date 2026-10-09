@@ -180,7 +180,9 @@ pub trait RegisterIo {
     fn spin_wait(&mut self) {
         core::hint::spin_loop();
     }
-    fn flush_translation(&mut self, _address: usize, _length: usize) {}
+    fn flush_translation(&mut self, _address: usize, _length: usize) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 fn wait_until<I: RegisterIo>(
@@ -201,26 +203,32 @@ fn wait_until<I: RegisterIo>(
 }
 
 // upstream: intel_utils.c dmar_flush_transl_to_ram()
-pub fn dmar_flush_transl_to_ram<I: RegisterIo>(io: &mut I, destination: usize, size: usize) {
+pub fn dmar_flush_transl_to_ram<I: RegisterIo>(
+    io: &mut I,
+    destination: usize,
+    size: usize,
+) -> Result<(), Error> {
     if io.hw_ecap() & DMAR_ECAP_C == 0 {
-        io.flush_translation(destination, size);
+        io.flush_translation(destination, size)
+    } else {
+        Ok(())
     }
 }
 // upstream: intel_utils.c dmar_flush_pte_to_ram()
-pub fn dmar_flush_pte_to_ram<I: RegisterIo>(io: &mut I, destination: usize) {
-    dmar_flush_transl_to_ram(io, destination, core::mem::size_of::<u64>());
+pub fn dmar_flush_pte_to_ram<I: RegisterIo>(io: &mut I, destination: usize) -> Result<(), Error> {
+    dmar_flush_transl_to_ram(io, destination, core::mem::size_of::<u64>())
 }
 // upstream: intel_utils.c dmar_flush_ctx_to_ram()
-pub fn dmar_flush_ctx_to_ram<I: RegisterIo>(io: &mut I, destination: usize) {
+pub fn dmar_flush_ctx_to_ram<I: RegisterIo>(io: &mut I, destination: usize) -> Result<(), Error> {
     dmar_flush_transl_to_ram(
         io,
         destination,
         core::mem::size_of::<crate::reg::ContextEntry>(),
-    );
+    )
 }
 // upstream: intel_utils.c dmar_flush_root_to_ram()
-pub fn dmar_flush_root_to_ram<I: RegisterIo>(io: &mut I, destination: usize) {
-    dmar_flush_transl_to_ram(io, destination, core::mem::size_of::<RootEntry>());
+pub fn dmar_flush_root_to_ram<I: RegisterIo>(io: &mut I, destination: usize) -> Result<(), Error> {
+    dmar_flush_transl_to_ram(io, destination, core::mem::size_of::<RootEntry>())
 }
 
 /// FreeBSD dmar_load_root_entry_ptr(), including RTADDR write, SRTP command,
@@ -533,8 +541,9 @@ mod tests {
         fn spin_wait(&mut self) {
             self.now += 1;
         }
-        fn flush_translation(&mut self, address: usize, length: usize) {
+        fn flush_translation(&mut self, address: usize, length: usize) -> Result<(), Error> {
             self.flushes.push((address, length));
+            Ok(())
         }
     }
 
@@ -596,10 +605,10 @@ mod tests {
     #[test]
     fn translation_flush_obeys_noncoherent_capability() {
         let mut io = FakeIo::default();
-        dmar_flush_pte_to_ram(&mut io, 0x1000);
+        dmar_flush_pte_to_ram(&mut io, 0x1000).unwrap();
         assert_eq!(io.flushes, [(0x1000, 8)]);
         io.ecap = DMAR_ECAP_C;
-        dmar_flush_root_to_ram(&mut io, 0x2000);
+        dmar_flush_root_to_ram(&mut io, 0x2000).unwrap();
         assert_eq!(io.flushes.len(), 1);
     }
 

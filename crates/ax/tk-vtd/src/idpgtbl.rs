@@ -387,6 +387,21 @@ mod tests {
                 .get_mut(&physical)
                 .map(|page| NonNull::from(page.as_mut()))
         }
+        fn flush_range(
+            &mut self,
+            physical: u64,
+            offset: usize,
+            length: usize,
+        ) -> Result<(), Error> {
+            if !self.pages.contains_key(&physical)
+                || offset
+                    .checked_add(length)
+                    .is_none_or(|end| end > PAGE_SIZE as usize)
+            {
+                return Err(Error::InvalidRange);
+            }
+            Ok(())
+        }
         unsafe fn free_page(&mut self, physical: u64) {
             self.pages.remove(&physical);
         }

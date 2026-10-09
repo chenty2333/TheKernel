@@ -69,80 +69,6 @@ const EINVAL: c_int = 22;
 const ENOENT: c_int = 2;
 const ERESTARTSYS: c_int = 512;
 const I915_FENCE_GFP: u32 = GFP_KERNEL | __GFP_RETRY_MAYFAIL | __GFP_NOWARN;
-const CLFLUSHOPT_BIT: u32 = 1 << 23;
-const CLFLUSH_BIT: u32 = 1 << 19;
-
-#[derive(Clone, Copy)]
-struct CacheFlushCaps {
-    line_size: usize,
-    clflush: bool,
-    clflushopt: bool,
-}
-
-fn cache_flush_caps() -> CacheFlushCaps {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Intel SDM CPUID.01H:EDX.CLFSH and CPUID.07H:EBX.CLFLUSHOPT.
-        let max_leaf = unsafe { core::arch::x86_64::__cpuid(0) }.eax;
-        let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
-        let leaf7 = if max_leaf >= 7 {
-            unsafe { core::arch::x86_64::__cpuid_count(7, 0) }
-        } else {
-            core::arch::x86_64::CpuidResult {
-                eax: 0,
-                ebx: 0,
-                ecx: 0,
-                edx: 0,
-            }
-        };
-        let line_size = (((leaf1.ebx >> 8) & 0xff) as usize) * 8;
-        CacheFlushCaps {
-            line_size: if line_size == 0 { 64 } else { line_size },
-            clflush: leaf1.edx & CLFLUSH_BIT != 0,
-            clflushopt: leaf7.ebx & CLFLUSHOPT_BIT != 0,
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        panic!("i915 clflush is available only on x86_64")
-    }
-}
-
-#[inline]
-unsafe fn flush_cache_line(address: usize, caps: CacheFlushCaps) {
-    assert!(caps.clflush, "x86 CPU does not advertise CLFLUSH");
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if caps.clflushopt {
-            core::arch::asm!("clflushopt [{address}]", address = in(reg) address, options(nostack));
-        } else {
-            core::arch::asm!("clflush [{address}]", address = in(reg) address, options(nostack));
-        }
-    }
-}
-
-#[inline]
-fn cache_barrier() {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::asm!("mfence", options(nostack, preserves_flags));
-    }
-}
-
-unsafe fn flush_virtual_range_unfenced(address: usize, length: usize, caps: CacheFlushCaps) {
-    if length == 0 {
-        return;
-    }
-    let end = address
-        .checked_add(length)
-        .expect("cache flush range overflow");
-    let mut line = address & !(caps.line_size - 1);
-    while line < end {
-        unsafe { flush_cache_line(line, caps) };
-        line = line.saturating_add(caps.line_size);
-    }
-}
-
 /// Linux DRM cache API used by imported GEM code.  On x86 this selects the
 /// optional unordered CLFLUSHOPT instruction only when CPUID advertises it;
 /// otherwise it uses CLFLUSH, with full fences bracketing the range.
@@ -151,10 +77,11 @@ pub unsafe extern "C" fn drm_clflush_virt_range(address: *mut c_void, length: c_
     if length == 0 {
         return;
     }
-    let caps = cache_flush_caps();
-    cache_barrier();
-    unsafe { flush_virtual_range_unfenced(address as usize, length as usize, caps) };
-    cache_barrier();
+    let Some(caps) = axhal::cache::CacheFlushCaps::discover() else {
+        axlog::error!("i915 GEM cache flush refused: CPU has no usable CLFLUSH instruction");
+        return;
+    };
+    let _ = unsafe { caps.flush_range(address as usize, length as usize) };
 }
 
 /// Linux DRM scatter-gather cache flush. Each SG segment is physically
@@ -164,8 +91,11 @@ pub unsafe extern "C" fn drm_clflush_sg(table: *mut crate::intel_context_upstrea
     if table.is_null() {
         return;
     }
-    let caps = cache_flush_caps();
-    cache_barrier();
+    let Some(caps) = axhal::cache::CacheFlushCaps::discover() else {
+        axlog::error!("i915 GEM cache flush refused: CPU has no usable CLFLUSH instruction");
+        return;
+    };
+    caps.barrier();
     let mut sg = unsafe { (*table).sgl };
     let entries = unsafe { (*table).orig_nents };
     for _ in 0..entries {
@@ -177,11 +107,11 @@ pub unsafe extern "C" fn drm_clflush_sg(table: *mut crate::intel_context_upstrea
         let offset = unsafe { (*sg).offset as usize };
         if !page.is_null() && length != 0 {
             let address = unsafe { page_address(page) }.cast::<u8>();
-            unsafe { flush_virtual_range_unfenced(address as usize + offset, length, caps) };
+            let _ = unsafe { caps.flush_range_unfenced(address as usize + offset, length) };
         }
         sg = unsafe { crate::i915_gem_pages_upstream::sg_next(sg) };
     }
-    cache_barrier();
+    caps.barrier();
 }
 
 /// Linux `struct dma_fence_work_ops` from i915_sw_fence_work.h.

@@ -55,6 +55,8 @@ cfg_if::cfg_if! {
 }
 
 pub mod dtb;
+/// CPU cache maintenance primitives used by DMA-facing subsystems.
+pub mod cache;
 /// Immutable boot-module metadata supplied by the selected platform.
 pub mod boot {
     /// Bit position and width of one colour channel inside a pixel.

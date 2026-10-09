@@ -21,10 +21,12 @@ const PAGE_SIZE_2M: u64 = 1 << 21;
 /// `page_mut` must return the unique CPU mapping for an owned 4 KiB physical
 /// page; `alloc_page` must return a zeroed page aligned to 4 KiB.
 /// `free_page` may only receive an owned page after hardware references are
-/// invalidated.
+/// invalidated. `flush_range` must publish every modified byte in the owned
+/// page to the IOMMU before the caller issues a translation invalidation.
 pub unsafe trait PageMemory {
     fn alloc_page(&mut self) -> Result<u64, Error>;
     fn page_mut(&mut self, physical: u64) -> Option<NonNull<[u64; ENTRIES]>>;
+    fn flush_range(&mut self, physical: u64, offset: usize, length: usize) -> Result<(), Error>;
     unsafe fn free_page(&mut self, physical: u64);
 }
 
@@ -49,6 +51,12 @@ impl<M: PageMemory> SecondLevel<M> {
         };
         // SAFETY: the allocator contract gives exclusive access to this new page.
         unsafe { pml4.as_mut().fill(0) };
+        if let Err(error) = memory.flush_range(root, 0, PAGE_SIZE as usize) {
+            // No hardware can reference a second-level root before it is
+            // installed in a context entry.
+            unsafe { memory.free_page(root) };
+            return Err(error);
+        }
         let mut owned_pages = Vec::new();
         if owned_pages.try_reserve_exact(1).is_err() {
             // SAFETY: this page is still owned by the new table.
@@ -88,8 +96,20 @@ impl<M: PageMemory> SecondLevel<M> {
             };
             // SAFETY: child is freshly allocated and exclusively owned.
             unsafe { page.as_mut().fill(0) };
+            if let Err(error) = self.memory.flush_range(child, 0, PAGE_SIZE as usize) {
+                // The child is not yet reachable from its parent.
+                unsafe { self.memory.free_page(child) };
+                return Err(error);
+            }
             *entry = child | PRESENT;
             self.owned_pages.push(child);
+            self.memory
+                .flush_range(
+                    parent,
+                    index * core::mem::size_of::<u64>(),
+                    core::mem::size_of::<u64>(),
+                )
+                .map_err(|_| Error::Quarantined)?;
             Ok(child)
         } else {
             if *entry & (1 << 7) != 0 {
@@ -145,6 +165,13 @@ impl<M: PageMemory> SecondLevel<M> {
                 return Err(Error::MapFailed);
             }
             *entry = (pa & ADDRESS_MASK) | flags;
+            self.memory
+                .flush_range(
+                    l1,
+                    i1 * core::mem::size_of::<u64>(),
+                    core::mem::size_of::<u64>(),
+                )
+                .map_err(|_| Error::Quarantined)?;
         }
         Ok(())
     }
@@ -171,6 +198,13 @@ impl<M: PageMemory> SecondLevel<M> {
                 return Err(Error::MapFailed);
             }
             *entry = physical | PRESENT | LARGE_PAGE;
+            self.memory
+                .flush_range(
+                    l2,
+                    i2 * core::mem::size_of::<u64>(),
+                    core::mem::size_of::<u64>(),
+                )
+                .map_err(|_| Error::Quarantined)?;
         }
         Ok(())
     }
@@ -203,6 +237,13 @@ impl<M: PageMemory> SecondLevel<M> {
                 return Err(Error::MapFailed);
             }
             *entry = 0;
+            self.memory
+                .flush_range(
+                    l1,
+                    i1 * core::mem::size_of::<u64>(),
+                    core::mem::size_of::<u64>(),
+                )
+                .map_err(|_| Error::Quarantined)?;
         }
         Ok(())
     }
@@ -250,7 +291,7 @@ impl<M: PageMemory> Drop for SecondLevel<M> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{boxed::Box, collections::BTreeMap};
+    use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
     use core::ptr::NonNull;
 
     use super::*;
@@ -258,6 +299,7 @@ mod tests {
     struct FakeMemory {
         next: u64,
         pages: BTreeMap<u64, Box<[u64; ENTRIES]>>,
+        flushes: Vec<(u64, usize, usize, u64)>,
     }
     unsafe impl PageMemory for FakeMemory {
         fn alloc_page(&mut self) -> Result<u64, Error> {
@@ -271,6 +313,29 @@ mod tests {
                 .get_mut(&physical)
                 .map(|page| NonNull::from(page.as_mut()))
         }
+        fn flush_range(
+            &mut self,
+            physical: u64,
+            offset: usize,
+            length: usize,
+        ) -> Result<(), Error> {
+            if !self.pages.contains_key(&physical)
+                || offset
+                    .checked_add(length)
+                    .is_none_or(|end| end > PAGE_SIZE as usize)
+            {
+                return Err(Error::InvalidRange);
+            }
+            let value = if length == core::mem::size_of::<u64>()
+                && offset.is_multiple_of(core::mem::size_of::<u64>())
+            {
+                self.pages[&physical][offset / core::mem::size_of::<u64>()]
+            } else {
+                0
+            };
+            self.flushes.push((physical, offset, length, value));
+            Ok(())
+        }
         unsafe fn free_page(&mut self, physical: u64) {
             self.pages.remove(&physical);
         }
@@ -279,16 +344,37 @@ mod tests {
         FakeMemory {
             next: 0x1000,
             pages: BTreeMap::new(),
+            flushes: Vec::new(),
         }
     }
 
     #[test]
     fn maps_and_unmaps_four_level_second_level_pages() {
         let mut page_table = SecondLevel::new(fake()).unwrap();
+        let initial_flushes = page_table.memory.flushes.len();
         page_table.map(0x8000, 0x4000_0000, 0x3000).unwrap();
+        assert!(page_table.memory.flushes.len() > initial_flushes);
+        assert!(
+            page_table
+                .memory
+                .flushes
+                .iter()
+                .all(|(physical, offset, length, _)| {
+                    page_table.memory.pages.contains_key(physical)
+                        && offset
+                            .checked_add(*length)
+                            .is_some_and(|end| end <= PAGE_SIZE as usize)
+                })
+        );
+        assert_ne!(
+            page_table.memory.flushes.last().unwrap().3 & PRESENT,
+            0,
+            "the mapped leaf value is written before its flush hook"
+        );
         assert_eq!(page_table.translate(0x4000_0000), Some(0x8000));
         assert_eq!(page_table.translate(0x4000_2abc), Some(0xaabc));
         page_table.unmap(0x4000_0000, 0x3000).unwrap();
+        assert_eq!(page_table.memory.flushes.last().unwrap().3, 0);
         assert_eq!(page_table.translate(0x4000_0000), None);
     }
 

@@ -56,7 +56,9 @@ pub trait PlatformDma {
     fn unmap_for(requester: PciRequester, device_address: u64, length: usize) -> Result<(), Error>;
 }
 
-/// A narrowly scoped, explicit identity-mapping owner for one PCI requester.
+/// A pinned-page ownership lease for one PCI requester using the platform's
+/// existing shared identity aperture. This records backing lifetime; it does
+/// not install a requester-specific context or provide requester isolation.
 /// Construction is available only through the platform lease service; fields
 /// remain private so drivers cannot fabricate a lease identifier.
 #[derive(Debug, Eq, PartialEq)]
@@ -65,8 +67,9 @@ pub struct IdentityDmaLease {
     id: u64,
 }
 
-/// Ownership token for a batch of identity-mapped pages. Keep this token and
-/// the backing pages until `IdentityDmaLease::unmap_pages` succeeds.
+/// Ownership token for a batch of pinned pages within the shared identity
+/// aperture. Keep this token and the backing pages until
+/// `IdentityDmaLease::unmap_pages` succeeds.
 #[derive(Debug, Eq, PartialEq)]
 pub struct IdentityDmaMapping {
     requester: PciRequester,
@@ -95,7 +98,8 @@ impl IdentityDmaLease {
         self.requester
     }
 
-    /// Add a batch of pinned physical pages to this requester's identity map.
+    /// Record a batch of pinned pages already reachable through the shared
+    /// identity aperture. This does not modify VT-d PTEs or context entries.
     pub fn map_pages(&self, pages: &[u64]) -> Result<IdentityDmaMapping, Error> {
         let id = crate_interface::call_interface!(
             PlatformIdentityDma::map_identity_pages,
@@ -110,9 +114,9 @@ impl IdentityDmaLease {
         })
     }
 
-    /// Remove a previous batch only after hardware invalidation completes.
-    /// On error the mapping token remains valid and must not be dropped with
-    /// its backing owner.
+    /// Retire a previous ownership batch only after its device work is
+    /// quiesced. The underlying identity mapping remains installed. On error
+    /// the token remains valid and must not be dropped with its backing owner.
     pub fn unmap_pages(&self, mapping: &IdentityDmaMapping) -> Result<(), Error> {
         if mapping.requester != self.requester || mapping.lease_id != self.id {
             return Err(Error::InvalidStructure);
@@ -125,9 +129,9 @@ impl IdentityDmaLease {
         )
     }
 
-    /// Retire the persistent initial mapping (including matching scoped
-    /// RMRRs). Call only after the requester is quiesced; any failure retains
-    /// this lease and prevents reuse.
+    /// Retire the persistent initial-page/RMRR ownership record. Call only
+    /// after the requester is quiesced; this does not change the shared root
+    /// or remove its identity mappings.
     pub fn release(&self) -> Result<(), Error> {
         crate_interface::call_interface!(
             PlatformIdentityDma::release_identity_dma,
@@ -137,10 +141,12 @@ impl IdentityDmaLease {
     }
 }
 
-/// Acquire a GPU-style, requester-specific identity lease. `initial_pages`
-/// must be exact measured/pinned physical pages, not a RAM range; matching
-/// scoped RMRRs are added by the platform service before publishing the
-/// requester context.
+/// Acquire a GPU-style ownership lease on the existing shared identity
+/// aperture. `initial_pages` must be exact measured/pinned physical pages,
+/// not a RAM range. With translation enabled, the service verifies requester
+/// scopes and records matching RMRRs too. The requester remains on the shared
+/// boot context: this lease is not an isolation boundary and does not publish
+/// or replace a requester context.
 pub fn platform_acquire_identity_dma(
     requester: PciRequester,
     initial_pages: &[u64],
