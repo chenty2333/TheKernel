@@ -2870,6 +2870,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
         Err(SdhciError::Timeout)
     }
 
+    // upstream: sdhci.c sdhci_generic_retune()
     // upstream: mmc.c mmc_retune()
     fn retune_if_needed(&mut self) -> Result<(), SdhciError> {
         if !self.tuning_enabled

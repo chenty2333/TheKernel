@@ -66,6 +66,7 @@ struct AhciIrqContext {
     port_status: [AtomicU32; AHCI_MAX_PORTS],
 }
 
+// upstream: ahci.c ahci_intr() AHCI_IRQ_MODE_ALL controller status routing
 fn ack_ahci_interrupt(context: usize) -> bool {
     // SAFETY: the frontend leaks the immutable BAR context for the endpoint's
     // boot lifetime and stores only this pointer in its static IRQ slot.
