@@ -37,6 +37,12 @@ use crate::{
 
 fn endpoint_address_dci(address: u8) -> u8 {
     let endpoint_number = address & 0x0f;
+    if endpoint_number == 0 {
+        // xHCI assigns both directions of USB control endpoint 0 to DCI 1;
+        // the generic bulk/interrupt formula below would incorrectly yield
+        // DCI 0 for endpoint address 0x00.
+        return Dci::CTRL.as_u8();
+    }
     endpoint_number * 2 + u8::from(address & 0x80 != 0)
 }
 
@@ -1141,6 +1147,15 @@ impl DeviceOp for Device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_zero_maps_both_directions_to_control_dci() {
+        assert_eq!(endpoint_address_dci(0x00), Dci::CTRL.as_u8());
+        assert_eq!(endpoint_address_dci(0x80), Dci::CTRL.as_u8());
+        assert_eq!(endpoint_address_dci(0x01), 2);
+        assert_eq!(endpoint_address_dci(0x81), 3);
+        assert_eq!(endpoint_address_dci(0x02), 4);
+    }
 
     #[test]
     fn control_endpoint_packet_size_decodes_usb3_descriptor_exponent() {
