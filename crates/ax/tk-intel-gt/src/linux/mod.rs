@@ -13,6 +13,7 @@ pub(crate) use crate::{
     linux_workqueue as workqueue, linux_xarray as xarray,
 };
 pub(crate) mod average;
+pub(crate) mod bitmap;
 pub(crate) mod bits;
 pub(crate) mod contexts;
 pub(crate) mod fields;

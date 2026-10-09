@@ -23,7 +23,7 @@ use crate::{
     i915_vma_api_upstream::*,
     intel_context_upstream::I915Vma,
     intel_engine_cs_upstream::ListHead,
-    linux::{bits::IS_ALIGNED, i915::GRAPHICS_VER},
+    linux::{bitmap::{bitmap_free, bitmap_zalloc}, bits::IS_ALIGNED, i915::GRAPHICS_VER},
     linux_config::*,
     linux_i915_private::DrmI915Private,
     linux_macros::*,
@@ -408,10 +408,10 @@ pub unsafe fn i915_gem_object_set_tiling(
     // Try to preallocate memory required to save swizzling on put-pages.
     if i915_gem_object_needs_bit17_swizzle(obj) {
         if (*obj).bit_17.is_null() {
-            (*obj).bit_17 = bitmap_zalloc(((*obj).base.base.size >> PAGE_SHIFT) as usize, GFP_KERNEL);
+            (*obj).bit_17 = unsafe { bitmap_zalloc(((*obj).base.base.size >> PAGE_SHIFT) as u32, GFP_KERNEL) };
         }
     } else {
-        bitmap_free((*obj).bit_17);
+        unsafe { bitmap_free((*obj).bit_17) };
         (*obj).bit_17 = core::ptr::null_mut();
     }
 

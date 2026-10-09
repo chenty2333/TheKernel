@@ -101,9 +101,10 @@ use crate::{
     },
     intel_workarounds_types_upstream::I915RegT as i915_reg_t,
     linux::{
+        bitmap::{bitmap_find_free_region, bitmap_free, bitmap_release_region, bitmap_zalloc},
         idr::{Ida, ida_alloc_range, ida_free, ida_init},
         iosys_map::IosysMap,
-        primitives::{max_t, min_t},
+        primitives::{max_t, min_t, time_after},
         xarray::{XArray, xa_init_flags},
     },
     linux_config::*,
@@ -1209,9 +1210,11 @@ fn guc_dequeue_one_context(guc: &mut intel_guc) -> bool {
                             stage = Stage::RegisterContext;
                             break;
                         }
-                        list_del_init(&mut (*rq).sched.link);
-                        __i915_request_submit(rq);
-                        trace_i915_request_in(rq, 0);
+                        unsafe {
+                            list_del_init(&mut (*rq).sched.link);
+                            __i915_request_submit(rq);
+                            trace_i915_request_in(rq, 0);
+                        }
                         last = rq;
 
                         if is_multi_lrc_rq(unsafe { &*rq }) {
@@ -1230,7 +1233,7 @@ fn guc_dequeue_one_context(guc: &mut intel_guc) -> bool {
                         break;
                     }
                     rb_erase_cached(&p.node, unsafe { &mut (*sched_engine).queue });
-                    i915_priolist_free(p as *const _ as *mut _);
+                    unsafe { i915_priolist_free(p as *const _ as *mut _) };
                 }
                 if matches!(stage, Stage::Scan) {
                     stage = Stage::RegisterContext;
@@ -1241,7 +1244,7 @@ fn guc_dequeue_one_context(guc: &mut intel_guc) -> bool {
                     let ce = unsafe { request_to_scheduling_context_mut(&mut *last) };
                     if unlikely(
                         !ctx_id_mapped(guc, ce.guc_id.id as u32)
-                            && intel_context_is_schedulable(ce),
+                            && intel_context_is_schedulable(&*ce),
                     ) {
                         ret = try_context_registration(ce, false);
                         if unlikely(ret == -EPIPE) {
@@ -1301,11 +1304,11 @@ fn guc_dequeue_one_context(guc: &mut intel_guc) -> bool {
             }
             Stage::Deadlock => {
                 unsafe { (*sched_engine).tasklet.callbacks.callback = None };
-                tasklet_disable_nosync(core::ptr::addr_of_mut!((*sched_engine).tasklet));
+                unsafe { tasklet_disable_nosync(core::ptr::addr_of_mut!((*sched_engine).tasklet)) };
                 return false;
             }
             Stage::Schedule => {
-                tasklet_schedule(core::ptr::addr_of_mut!((*sched_engine).tasklet));
+                unsafe { tasklet_schedule(core::ptr::addr_of_mut!((*sched_engine).tasklet)) };
                 return false;
             }
         }
@@ -1698,27 +1701,28 @@ fn guc_timestamp_ping(wrk: &mut work_struct) {
     // runtime-PM reference only if runtime PM is already active. If it is not,
     // parking has already made busyness stats current. Do not requeue on this
     // path; unpark requeues it. Any timestamp wrap while parked is immaterial.
-    wakeref = intel_runtime_pm_get_if_active(
+    wakeref = unsafe { intel_runtime_pm_get_if_active(
         core::ptr::addr_of_mut!((*(*gt).i915).runtime_pm).cast::<IntelRuntimePm>(),
-    );
+    ) };
     if wakeref.is_null() {
         return;
     }
 
     // Reset cannot be waited out here because reset flushes this worker.
-    ret = intel_gt_reset_trylock(gt, &mut srcu);
+    ret = unsafe { intel_gt_reset_trylock(gt, &mut srcu) };
     if ret != 0 {
-        intel_runtime_pm_put(&(*(*gt).i915).runtime_pm, wakeref);
+        unsafe { intel_runtime_pm_put(&(*(*gt).i915).runtime_pm, wakeref) };
         return;
     }
     __update_guc_busyness_stats(guc);
     // Update context counters too, so their 32-bit runtime values are extended.
     xa_for_each!(&mut guc.context_lookup, index, ce, {
-        guc_context_update_stats(unsafe { &mut *ce.cast::<intel_context>() });
+        let ce: *mut intel_context = ce;
+        guc_context_update_stats(unsafe { &mut *ce });
     });
-    intel_gt_reset_unlock(gt, srcu);
+    unsafe { intel_gt_reset_unlock(gt, srcu) };
     guc_enable_busyness_worker(guc);
-    intel_runtime_pm_put(&(*(*gt).i915).runtime_pm, wakeref);
+    unsafe { intel_runtime_pm_put(&(*(*gt).i915).runtime_pm, wakeref) };
 }
 
 // upstream: intel_guc_submission.c guc_action_enable_usage_stats()
@@ -1806,7 +1810,7 @@ fn submission_disabled(guc: &intel_guc) -> bool {
 // upstream: intel_guc_submission.c disable_submission()
 fn disable_submission(guc: &mut intel_guc) {
     let sched_engine = guc.sched_engine;
-    let tasklet = core::ptr::addr_of_mut!((*sched_engine).tasklet);
+    let tasklet = unsafe { core::ptr::addr_of_mut!((*sched_engine).tasklet) };
     if unsafe { __tasklet_is_enabled(tasklet) } {
         gem_bug_on!(!guc.ct.enabled);
         unsafe { __tasklet_disable_sync_once(tasklet) };
@@ -1826,7 +1830,7 @@ fn enable_submission(guc: &mut intel_guc) {
     spin_lock_irqsave(unsafe { &mut (*sched_engine).lock }, &mut flags);
     unsafe { (*sched_engine).tasklet.callbacks.callback = Some(guc_submission_tasklet_callback) };
     wmb(); // Make sure the callback is visible.
-    let tasklet = core::ptr::addr_of_mut!((*sched_engine).tasklet);
+    let tasklet = unsafe { core::ptr::addr_of_mut!((*sched_engine).tasklet) };
     if !unsafe { __tasklet_is_enabled(tasklet) } && unsafe { __tasklet_enable(tasklet) } {
         gem_bug_on!(!guc.ct.enabled);
         // Kick in case a new request submission was missed.
@@ -2217,7 +2221,7 @@ fn intel_guc_submission_init(guc: &mut intel_guc) -> i32 {
         guc_lrc_desc_pool_destroy_v69(guc);
         return ret;
     }
-    guc.submission_state.guc_ids_bitmap = bitmap_zalloc(NUMBER_MULTI_LRC_GUC_ID(guc), GFP_KERNEL);
+    guc.submission_state.guc_ids_bitmap = unsafe { bitmap_zalloc(NUMBER_MULTI_LRC_GUC_ID(guc) as u32, GFP_KERNEL) };
     if guc.submission_state.guc_ids_bitmap.is_null() {
         fini_tlb_lookup(guc);
         guc_lrc_desc_pool_destroy_v69(guc);
@@ -2239,7 +2243,7 @@ fn intel_guc_submission_fini(guc: &mut intel_guc) {
     guc_flush_destroyed_contexts(guc);
     guc_lrc_desc_pool_destroy_v69(guc);
     i915_sched_engine_put(guc.sched_engine);
-    bitmap_free(guc.submission_state.guc_ids_bitmap);
+    unsafe { bitmap_free(guc.submission_state.guc_ids_bitmap) };
     fini_tlb_lookup(guc);
     guc.submission_initialized = false;
 }
@@ -2248,12 +2252,14 @@ fn intel_guc_submission_fini(guc: &mut intel_guc) {
 #[inline]
 fn queue_request(sched_engine: &mut i915_sched_engine, rq: &mut i915_request, prio: i32) {
     gem_bug_on!(!list_empty(&rq.sched.link));
-    list_add_tail(
-        &mut rq.sched.link,
-        i915_sched_lookup_priolist(sched_engine, prio),
-    );
+    unsafe {
+        list_add_tail(
+            &mut rq.sched.link,
+            i915_sched_lookup_priolist(sched_engine, prio),
+        );
+    }
     set_bit(I915_FENCE_FLAG_PQUEUE, &mut rq.fence.flags);
-    tasklet_hi_schedule(&mut sched_engine.tasklet);
+    unsafe { tasklet_hi_schedule(&mut sched_engine.tasklet) };
 }
 
 // upstream: intel_guc_submission.c guc_bypass_tasklet_submit()
@@ -2315,11 +2321,11 @@ unsafe extern "C" fn guc_submit_request_callback(rq: *mut i915_request) {
 fn new_guc_id(guc: &mut intel_guc, ce: &mut intel_context) -> i32 {
     gem_bug_on!(intel_context_is_child(ce));
     let ret = if intel_context_is_parent(&mut *ce) {
-        bitmap_find_free_region(
+        unsafe { bitmap_find_free_region(
             guc.submission_state.guc_ids_bitmap,
-            NUMBER_MULTI_LRC_GUC_ID(guc),
-            order_base_2(ce.parallel.number_children as u32 + 1),
-        )
+            NUMBER_MULTI_LRC_GUC_ID(guc) as u32,
+            order_base_2(ce.parallel.number_children as u32 + 1) as core::ffi::c_long,
+        ) }
     } else {
         ida_alloc_range(
             &mut guc.submission_state.guc_ids,
@@ -2334,7 +2340,7 @@ fn new_guc_id(guc: &mut intel_guc, ce: &mut intel_context) -> i32 {
     if !intel_context_is_parent(ce) {
         guc.submission_state.guc_ids_in_use += 1;
     }
-    ce.guc_id.id = ret as u32;
+    ce.guc_id.id = ret as u16;
     0
 }
 
@@ -2343,11 +2349,11 @@ fn __release_guc_id(guc: &mut intel_guc, ce: &mut intel_context) {
     gem_bug_on!(intel_context_is_child(ce));
     if !context_guc_id_invalid(ce) {
         if intel_context_is_parent(&mut *ce) {
-            bitmap_release_region(
+            unsafe { bitmap_release_region(
                 guc.submission_state.guc_ids_bitmap,
-                ce.guc_id.id,
-                order_base_2(ce.parallel.number_children as u32 + 1),
-            );
+                ce.guc_id.id as c_ulong,
+                order_base_2(ce.parallel.number_children as u32 + 1) as core::ffi::c_long,
+            ) };
         } else {
             guc.submission_state.guc_ids_in_use -= 1;
             ida_free(&mut guc.submission_state.guc_ids, ce.guc_id.id as u32);
@@ -4251,7 +4257,7 @@ fn guc_default_vfuncs(engine: &mut intel_engine_cs) {
     engine.emit_flush = Some(gen8_emit_flush_xcs);
     engine.emit_init_breadcrumb = Some(gen8_emit_init_breadcrumb);
     engine.emit_fini_breadcrumb = Some(gen8_emit_fini_breadcrumb_xcs);
-    if GRAPHICS_VER(engine.i915) >= 12 {
+    if unsafe { GRAPHICS_VER(engine.i915) } >= 12 {
         engine.emit_fini_breadcrumb = Some(gen12_emit_fini_breadcrumb_xcs);
         engine.emit_flush = Some(gen12_emit_flush_xcs);
     }
@@ -4262,20 +4268,21 @@ fn guc_default_vfuncs(engine: &mut intel_engine_cs) {
     engine.flags |= I915_ENGINE_HAS_TIMESLICES;
     // Wa_14014475959:dg2
     if engine.class as i32 == COMPUTE_CLASS
-        && (IS_GFX_GT_IP_STEP(engine.gt, IP_VER(12, 70), STEP_A0, STEP_B0) || IS_DG2(engine.i915))
+        && (unsafe { IS_GFX_GT_IP_STEP(engine.gt, IP_VER(12, 70), STEP_A0, STEP_B0) }
+            || unsafe { IS_DG2(engine.i915) })
     {
         engine.flags |= I915_ENGINE_USES_WA_HOLD_SWITCHOUT;
     }
     // Wa_16019325821 and Wa_14019159160.
     if (engine.class as i32 == COMPUTE_CLASS || engine.class as i32 == RENDER_CLASS)
-        && IS_GFX_GT_IP_RANGE(engine.gt, IP_VER(12, 70), IP_VER(12, 74))
+        && unsafe { IS_GFX_GT_IP_RANGE(engine.gt, IP_VER(12, 70), IP_VER(12, 74)) }
     {
         engine.flags |= I915_ENGINE_USES_WA_HOLD_SWITCHOUT;
     }
     // GuC supports timeslicing and semaphores too, but firmware handles them;
     // enabling semaphores needs minor changes and remains disabled upstream.
     engine.emit_bb_start = Some(gen8_emit_bb_start);
-    if GRAPHICS_VER_FULL(engine.i915) >= IP_VER(12, 55) {
+    if unsafe { GRAPHICS_VER_FULL(engine.i915) } >= IP_VER(12, 55) {
         engine.emit_bb_start = Some(xehp_emit_bb_start);
     }
 }
@@ -4311,8 +4318,10 @@ fn guc_sched_engine_destroy(kref: &mut kref) {
     let sched_engine = unsafe { &mut *sched_engine };
     let guc = unsafe { &mut *sched_engine.private_data.cast::<IntelGuc>() };
     guc.sched_engine = core::ptr::null_mut();
-    tasklet_kill(core::ptr::addr_of_mut!(sched_engine.tasklet)); // Flush the callback.
-    kfree(sched_engine);
+    unsafe {
+        tasklet_kill(core::ptr::addr_of_mut!(sched_engine.tasklet)); // Flush the callback.
+        kfree(sched_engine);
+    }
 }
 
 unsafe extern "C" fn guc_sched_engine_destroy_callback(kref: *mut kref) {
@@ -4350,7 +4359,7 @@ fn intel_guc_submission_setup(engine: &mut intel_engine_cs) -> i32 {
     let i915 = engine.i915;
     let guc = unsafe { gt_to_guc(engine.gt) };
     // These setup assumptions (including always-enabled IRQs) hold only gen11+.
-    gem_bug_on!(GRAPHICS_VER(i915) < 11);
+    gem_bug_on!(unsafe { GRAPHICS_VER(i915) } < 11);
     if unsafe { (*guc).sched_engine }.is_null() {
         unsafe { (*guc).sched_engine = i915_sched_engine_create(ENGINE_VIRTUAL) };
         if unsafe { (*guc).sched_engine }.is_null() {
@@ -4372,11 +4381,11 @@ fn intel_guc_submission_setup(engine: &mut intel_engine_cs) -> i32 {
         unsafe {
             tasklet_setup(
                 core::ptr::addr_of_mut!((*(*guc).sched_engine).tasklet),
-                guc_submission_tasklet_rust,
+                guc_submission_tasklet_callback,
             )
         };
     }
-    i915_sched_engine_put(engine.sched_engine);
+    unsafe { i915_sched_engine_put(engine.sched_engine) };
     engine.sched_engine = unsafe { i915_sched_engine_get((*guc).sched_engine) };
     guc_default_vfuncs(engine);
     guc_default_irqs(engine);
@@ -4384,7 +4393,7 @@ fn intel_guc_submission_setup(engine: &mut intel_engine_cs) -> i32 {
     if engine.flags & I915_ENGINE_HAS_RCS_REG_STATE != 0 {
         rcs_submission_override(engine);
     }
-    lrc_init_wa_ctx(engine);
+    unsafe { lrc_init_wa_ctx(engine) };
     // Take ownership and responsibility for cleanup last.
     engine.sanitize = Some(guc_sanitize_callback);
     engine.release = Some(guc_release_callback);
@@ -4559,9 +4568,9 @@ const SCHED_DISABLE_DELAY_MS: u64 = 34;
 fn intel_guc_submission_init_early(guc: &mut intel_guc) {
     xa_init_flags(&mut guc.context_lookup, XA_FLAGS_LOCK_IRQ);
     spin_lock_init(&mut guc.submission_state.lock);
-    INIT_LIST_HEAD(&mut guc.submission_state.guc_id_list);
+    unsafe { INIT_LIST_HEAD(&mut guc.submission_state.guc_id_list) };
     ida_init(&mut guc.submission_state.guc_ids);
-    INIT_LIST_HEAD(&mut guc.submission_state.destroyed_contexts);
+    unsafe { INIT_LIST_HEAD(&mut guc.submission_state.destroyed_contexts) };
     INIT_WORK(
         &mut guc.submission_state.destroyed_worker,
         destroyed_worker_func,
@@ -4575,7 +4584,7 @@ fn intel_guc_submission_init_early(guc: &mut intel_guc) {
     guc.submission_state.sched_disable_delay_ms = SCHED_DISABLE_DELAY_MS as u32;
     guc.submission_state.num_guc_ids = GUC_MAX_CONTEXT_ID as i32;
     guc.submission_state.sched_disable_gucid_threshold =
-        NUM_SCHED_DISABLE_GUCIDS_DEFAULT_THRESHOLD(guc);
+        NUM_SCHED_DISABLE_GUCIDS_DEFAULT_THRESHOLD(guc) as u32;
     guc.submission_supported = __guc_submission_supported(guc);
     guc.submission_selected = __guc_submission_selected(guc);
 }
@@ -4773,7 +4782,7 @@ fn intel_guc_deregister_done_process_msg(guc: &mut intel_guc, msg: &[u32], len: 
             register_context(ce, true);
         });
         guc_signal_context_fence(ce);
-        intel_context_put(&mut *ce);
+        unsafe { intel_context_put(&mut *ce) };
     } else if context_destroyed(ce) {
         // The context has already been destroyed.
         unsafe { intel_gt_pm_put_async_untracked(guc_to_gt(guc)) };
@@ -4866,7 +4875,7 @@ fn capture_error_state(guc: &mut intel_guc, ce: &mut intel_context) {
             guc_warn!(
                 guc,
                 "No matching physical engine capture for virtual engine context 0x%04X / %s",
-                ce.guc_id.id,
+                ce.guc_id.id as c_ulong,
                 unsafe { (*ce.engine).name }
             );
             engine_mask = !0;
@@ -5100,7 +5109,7 @@ fn intel_guc_dump_active_requests(
             };
             spin_unlock(&mut ce_ref.guc_state.lock);
         }
-        intel_context_put(&mut *ce);
+        unsafe { intel_context_put(&mut *ce) };
         xa_lock(&mut guc.context_lookup);
     }
     xa_unlock_irqrestore(&mut guc.context_lookup, flags);
@@ -5380,7 +5389,7 @@ fn emit_bb_start_child_no_preempt_mid_batch(
         *cs = upper_32_bits(offset);
         cs = cs.add(1);
     }
-    intel_ring_advance(rq, cs);
+    unsafe { intel_ring_advance(rq, cs) };
     0
 }
 

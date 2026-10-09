@@ -7,7 +7,7 @@
 #![allow(unsafe_code)]
 
 use core::{
-    ffi::{c_char, c_void},
+    ffi::{c_char, c_long, c_ulong, c_void},
     sync::atomic::{Ordering, fence},
 };
 
@@ -419,4 +419,10 @@ mod tests {
         assert!(!is_power_of_2(3u64));
         assert_eq!(offset_in_page(0x1234usize), 0x234);
     }
+}
+
+/// Linux jiffies `time_after(a, b)` wrap-safe comparison.
+#[inline]
+pub const fn time_after(a: c_ulong, b: c_ulong) -> bool {
+    (b.wrapping_sub(a) as c_long) < 0
 }

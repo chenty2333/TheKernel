@@ -13,6 +13,7 @@ use core::ffi::{c_int, c_ulong, c_void};
 use crate::{
     linux::gem_memory::{INTEL_MEMORY_LOCAL, INTEL_MEMORY_SYSTEM},
     i915_gem_context_upstream::{i915_gem_context_get, i915_gem_context_put},
+    i915_gem_context_types_upstream::DrmI915FilePrivate,
     i915_gem_object_api_upstream::{
         i915_gem_object_has_pages, i915_gem_object_has_pinned_pages, i915_gem_object_lock,
         i915_gem_object_put, i915_gem_object_unlock, i915_gem_object_unpin_map,
@@ -20,12 +21,14 @@ use crate::{
     i915_gem_object_header_upstream::{
         assert_object_held, assert_object_held_shared, i915_gem_object_flush_map,
     },
-    i915_gem_pages_upstream::{i915_gem_object_pin_map, __i915_gem_object_put_pages},
+    i915_gem_pages_upstream::{i915_gem_object_pin_map, __i915_gem_object_put_pages, __i915_gem_object_get_page as i915_gem_object_get_page, __i915_gem_object_get_dma_address as i915_gem_object_get_dma_address},
     i915_gem_object_types_upstream::{DrmI915GemObject, DrmI915GemObjectOps},
     i915_vma_api_upstream::*,
     intel_context_upstream::*,
     intel_engine_cs_upstream::*,
     linux::{
+        bitmap::bitmap_free,
+        highmem::{kmap_local_page, kunmap_local},
         config::*,
         fields::{i915_gem_object_is_framebuffer, i915_gem_object_pat_set_by_user},
         gem::{DrmFile, DrmGemObject, I915LutHandle, TtmBufferObjectLayout},
@@ -34,7 +37,7 @@ use crate::{
         i915::{
             HAS_FLAT_CCS, HAS_LLC, INTEL_INFO, IS_DGFX, IS_ELKHARTLAKE, IS_JASPERLAKE, to_i915,
         },
-        iosys_map::IosysMap,
+        iosys_map::{iosys_map_set_vaddr, IosysMap},
         list::*,
         locks::*,
         memory::*,
@@ -187,7 +190,7 @@ pub unsafe fn i915_gem_object_has_cache_level(obj: *const DrmI915GemObject, lvl:
 
 // upstream: i915_gem_object.c i915_gem_object_alloc()
 pub unsafe fn i915_gem_object_alloc() -> *mut DrmI915GemObject {
-    let obj = kmem_cache_zalloc(slab_objects, GFP_KERNEL) as *mut DrmI915GemObject;
+    let obj = kmem_cache_zalloc(slab_objects.cast::<KmCache>(), GFP_KERNEL) as *mut DrmI915GemObject;
     if obj.is_null() {
         return core::ptr::null_mut();
     }
@@ -198,7 +201,7 @@ pub unsafe fn i915_gem_object_alloc() -> *mut DrmI915GemObject {
 
 // upstream: i915_gem_object.c i915_gem_object_free()
 pub unsafe fn i915_gem_object_free(obj: *mut DrmI915GemObject) {
-    kmem_cache_free(slab_objects, obj.cast());
+    kmem_cache_free(slab_objects.cast::<KmCache>(), obj.cast());
 }
 
 // upstream: i915_gem_object.c i915_gem_object_init()
@@ -336,7 +339,7 @@ unsafe extern "C" fn i915_gem_close_object(gem: *mut DrmGemObject, file: *mut Dr
         let lut = cursor.wrapping_sub(member_offset) as *mut I915LutHandle;
         let ctx = (*lut).ctx;
 
-        if !ctx.is_null() && (*ctx).file_priv == fpriv {
+        if !ctx.is_null() && (*ctx).file_priv == fpriv.cast::<DrmI915FilePrivate>() {
             i915_gem_context_get(ctx);
             list_move(&mut (*lut).obj_link, &mut close);
         }
@@ -346,7 +349,7 @@ unsafe extern "C" fn i915_gem_close_object(gem: *mut DrmGemObject, file: *mut Dr
             list_add_tail(&mut bookmark.obj_link, next_link);
             let mut resume = next_link;
             if cond_resched_lock(&mut (*obj).lut_lock) {
-                resume = (*bookmark.obj_link).next;
+                resume = bookmark.obj_link.next;
             }
             __list_del_entry(&mut bookmark.obj_link);
             cursor = resume;
@@ -396,7 +399,7 @@ pub unsafe extern "C" fn __i915_gem_free_object_rcu(head: *mut RcuHead) {
 
     // Keep placement storage alive for RCU reads from fdinfo.
     if (*obj).mm.n_placements > 1 {
-        kfree((*obj).mm.placements.cast());
+        kfree((*obj).mm.placements.cast::<c_void>());
     }
 
     i915_gem_object_free(obj);
@@ -478,7 +481,7 @@ pub unsafe fn __i915_gem_free_object(obj: *mut DrmI915GemObject) {
 
     GEM_BUG_ON!(!list_empty(&(*obj).lut_list));
 
-    bitmap_free((*obj).bit_17);
+    unsafe { bitmap_free((*obj).bit_17.cast()) };
 
     if drm_gem_is_imported(&mut (*obj).base) {
         drm_prime_gem_destroy(&mut (*obj).base, core::ptr::null_mut());
@@ -537,7 +540,7 @@ pub unsafe fn i915_gem_flush_free_objects(i915: *mut DrmI915Private) {
 }
 
 // upstream: i915_gem_object.c __i915_gem_free_work()
-unsafe fn __i915_gem_free_work(work: *mut WorkStruct) {
+unsafe extern "C" fn __i915_gem_free_work(work: *mut WorkStruct) {
     let i915 = container_of!(work, DrmI915Private, mm.free_work);
 
     i915_gem_flush_free_objects(i915);
@@ -578,7 +581,7 @@ unsafe fn i915_gem_object_read_from_page_kmap(
         .add(offset_in_page(offset) as usize)
         .cast();
     if object_cache_coherent(obj) & I915_BO_CACHE_COHERENT_FOR_READ == 0 {
-        drm_clflush_virt_range(src_ptr, size as usize);
+        drm_clflush_virt_range(src_ptr, size as u64);
     }
     memcpy(dst, src_ptr, size as usize);
 
@@ -628,7 +631,7 @@ pub unsafe fn i915_gem_object_read_from_page(
 ) -> c_int {
     GEM_BUG_ON!(overflows_type!(offset >> PAGE_SHIFT, PgoffT));
     GEM_BUG_ON!(offset >= (*obj).base.base.size);
-    GEM_BUG_ON!(offset_in_page(offset) > PAGE_SIZE - size as u64);
+    GEM_BUG_ON!(offset_in_page(offset) > PAGE_SIZE as u64 - size as u64);
     GEM_BUG_ON!(!i915_gem_object_has_pinned_pages(obj));
 
     if i915_gem_object_has_struct_page(obj) {
@@ -793,7 +796,7 @@ pub unsafe fn i915_gem_object_placement_possible(
     memory_type: IntelMemoryType,
 ) -> bool {
     if (*obj).mm.n_placements == 0 {
-        match memory_type {
+        match memory_type as u16 {
             INTEL_MEMORY_LOCAL => return i915_gem_object_has_iomem(obj),
             INTEL_MEMORY_SYSTEM => return i915_gem_object_has_pages(obj),
             _ => {
@@ -805,7 +808,7 @@ pub unsafe fn i915_gem_object_placement_possible(
     }
 
     for i in 0..(*obj).mm.n_placements as usize {
-        if (**(*obj).mm.placements.add(i)).r#type == memory_type {
+        if (**(*obj).mm.placements.add(i)).r#type == memory_type as u16 {
             return true;
         }
     }
@@ -865,12 +868,12 @@ unsafe extern "C" fn i915_gem_vunmap_object(gem_obj: *mut DrmGemObject, map: *mu
 
 // upstream: i915_gem_object.c i915_gem_init__objects()
 pub unsafe fn i915_gem_init__objects(i915: *mut DrmI915Private) {
-    INIT_WORK(&mut (*i915).mm.free_work, __i915_gem_free_work);
+    INIT_WORK_C(&mut (*i915).mm.free_work, __i915_gem_free_work);
 }
 
 // upstream: i915_gem_object.c i915_objects_module_exit()
 pub unsafe fn i915_objects_module_exit() {
-    kmem_cache_destroy(slab_objects);
+    kmem_cache_destroy(slab_objects.cast::<KmCache>());
 }
 
 // upstream: i915_gem_object.c i915_objects_module_init()
