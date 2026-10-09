@@ -698,6 +698,36 @@ fn enable_pipe_a_transcoder_clock<R: Registers>(registers: &R, port: TcPort) -> 
     Ok(())
 }
 
+fn disable_pipe_a_transcoder_clock<R: Registers>(
+    registers: &R,
+    port: TcPort,
+) -> Result<(), String> {
+    use intel_display::intel_ddi_full as i915;
+
+    let encoder = source_tc_encoder(port)?;
+    let state = i915::CrtcState {
+        cpu_transcoder: i915::Transcoder::A,
+        output: i915::OutputType::Hdmi,
+        ..i915::CrtcState::default()
+    };
+    let mut io = TcTranscoderFuncIo::clock(registers, ddi::TRANS_CLK_SEL_A);
+    i915::intel_ddi_disable_transcoder_clock(&mut io, &encoder, &state);
+    if io.write_failed {
+        return Err(String::from(
+            "translated Pipe-A transcoder clock disable failed",
+        ));
+    }
+    let readback = registers
+        .read(ddi::TRANS_CLK_SEL_A)
+        .ok_or_else(|| String::from("Pipe-A transcoder clock readback unavailable"))?;
+    if readback != 0 {
+        return Err(format!(
+            "translated transcoder clock disable readback mismatch {readback:#x}"
+        ));
+    }
+    Ok(())
+}
+
 fn disable_pipe_a_transcoder<R: Registers>(registers: &R) -> Result<(), String> {
     use intel_display::intel_ddi_full as i915;
 
@@ -937,7 +967,7 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
             "translated DDI buffer disable readback mismatch {idle_buffer:#x}"
         ));
     }
-    write(r, 0x46140, 0)?;
+    disable_pipe_a_transcoder_clock(r, port)?;
     dkl_pll_off(r, timer, port)?;
 
     for planned in shadow {
@@ -1136,6 +1166,19 @@ mod tests {
         assert_eq!(
             *registers.writes.borrow(),
             [(super::ddi::TRANS_CLK_SEL_A.offset(), 6 << 28)]
+        );
+        registers.writes.borrow_mut().clear();
+        super::disable_pipe_a_transcoder_clock(&registers, super::TcPort::Tc1).unwrap();
+        assert_eq!(
+            registers
+                .values
+                .borrow()
+                .get(&super::ddi::TRANS_CLK_SEL_A.offset()),
+            Some(&0)
+        );
+        assert_eq!(
+            *registers.writes.borrow(),
+            [(super::ddi::TRANS_CLK_SEL_A.offset(), 0)]
         );
     }
 

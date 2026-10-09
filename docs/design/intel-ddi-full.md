@@ -34,6 +34,7 @@ and `intel_ddi_buf_enable()` for the source D/E selectors, preserving the
 source posting-read and 10-ms idle/active handshakes. Their adapter is bounded
 to the one selected DDI_BUF_CTL and does not expose DP FEC or PHY registers;
 the model test covers the source wait paths and writes.
-It also calls `intel_ddi_enable_transcoder_clock()` for transcoder A using the
-display-13 TC1/TC2 PHY_F/PHY_G mapping; the checked clock-select readback
-replaces a local register-value formula.
+It also calls the translated `intel_ddi_enable_transcoder_clock()` and
+`intel_ddi_disable_transcoder_clock()` for transcoder A using the display-13
+TC1/TC2 PHY_F/PHY_G mapping; checked clock-select readbacks replace local
+register-value formulas on both transitions.
