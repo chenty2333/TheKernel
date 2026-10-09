@@ -215,6 +215,43 @@ fn write(r: &impl Registers, offset: u32, value: u32) -> Result<(), Error> {
 fn message(e: Error) -> String {
     format!("N305 fastboot refused/recovered: {e:?}")
 }
+
+/// The OpRegion RVDA VBT is an optional source: i915 falls back to mailbox #4
+/// when its physical mapping or VBT validation fails. Keep that recovery
+/// boundary here, where the kernel maps physical memory, rather than making a
+/// bad optional pointer abort otherwise usable firmware modesetting.
+fn map_external_vbt(
+    op: &intel_display::opregion::OpRegion<'_>,
+    map: impl FnOnce(intel_display::opregion::ExternalVbt) -> Result<Vec<u8>, Error>,
+) -> Result<Option<Vec<u8>>, Error> {
+    op.external_vbt()?.map(map).transpose()
+}
+
+/// Prefer a structurally valid, checksummed RVDA VBT; otherwise use the
+/// mandatory OpRegion mailbox candidate. The mailbox remains subject to the
+/// same checksum validation before any board routing facts are trusted.
+fn opregion_vbt<'a>(
+    op: &intel_display::opregion::OpRegion<'a>,
+    external: Option<&'a [u8]>,
+) -> Result<intel_display::intel_bios::Vbt<'a>, Error> {
+    if let Some(external) = external {
+        match intel_display::intel_bios::Vbt::parse(external) {
+            Ok(vbt) if vbt.checksum_valid() => return Ok(vbt),
+            Ok(_) => axlog::warn!(
+                "intel-fastboot: OpRegion RVDA VBT checksum invalid; trying mailbox #4"
+            ),
+            Err(error) => axlog::warn!(
+                "intel-fastboot: OpRegion RVDA VBT invalid ({error:?}); trying mailbox #4"
+            ),
+        }
+    }
+    let mailbox = op.mailbox_vbt()?;
+    if !mailbox.checksum_valid() {
+        return Err(Error::InvalidHeader);
+    }
+    Ok(mailbox)
+}
+
 /// A reference here means driver requests are actually held, not sampled-on bits.
 struct PinnedIo<'a, R> {
     registers: &'a R,
@@ -2694,14 +2731,16 @@ pub(super) fn init(
             .ok_or(Error::Refused)?;
         let data = firmware_bytes(u64::from(asls), intel_display::opregion::SIZE)?;
         let op = intel_display::opregion::OpRegion::parse(&data, u64::from(asls))?;
-        let external = op
-            .external_vbt()?
-            .map(|v| firmware_bytes(v.physical, v.size))
-            .transpose()?;
-        let vbt = op.vbt(external.as_deref())?;
-        if !vbt.checksum_valid() {
-            return Err(Error::InvalidHeader);
-        }
+        let external = match map_external_vbt(&op, |v| firmware_bytes(v.physical, v.size)) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                axlog::warn!(
+                    "intel-fastboot: OpRegion RVDA VBT unavailable ({error:?}); trying mailbox #4"
+                );
+                None
+            }
+        };
+        let vbt = opregion_vbt(&op, external.as_deref())?;
         let bios = intel_display::intel_bios::intel_bios_init(
             Some(vbt.data()),
             13,
@@ -3097,6 +3136,53 @@ mod tests {
             num_levels: 6,
             sagv_block_time_us: 0,
         }
+    }
+
+    fn opregion_with_mailbox_vbt() -> Vec<u8> {
+        let mut opregion = vec![0; intel_display::opregion::SIZE];
+        opregion[..16].copy_from_slice(b"IntelGraphicsMem");
+        opregion[16..20].copy_from_slice(&8u32.to_le_bytes());
+        opregion[22] = 1;
+        opregion[23] = 2;
+        opregion[88] = 1 << 2; // ASLE mailbox contains RVDA metadata.
+        opregion[0x3ba..0x3c2].copy_from_slice(&8192u64.to_le_bytes());
+        opregion[0x3c2..0x3c6].copy_from_slice(&48u32.to_le_bytes());
+
+        // Minimal structurally valid VBT/BDB. The kernel retains its stricter
+        // checksum admission even though i915's structural parser does not
+        // require the checksum.
+        let len = 48 + 22 + 3 + 5;
+        let vbt = &mut opregion[0x400..0x400 + len];
+        vbt[..4].copy_from_slice(b"$VBT");
+        vbt[22..24].copy_from_slice(&48u16.to_le_bytes());
+        vbt[24..26].copy_from_slice(&(len as u16).to_le_bytes());
+        vbt[28..32].copy_from_slice(&48u32.to_le_bytes());
+        vbt[48..64].copy_from_slice(b"BIOS_DATA_BLOCK ");
+        vbt[64..66].copy_from_slice(&249u16.to_le_bytes());
+        vbt[66..68].copy_from_slice(&22u16.to_le_bytes());
+        vbt[68..70].copy_from_slice(&((len - 48) as u16).to_le_bytes());
+        vbt[70] = 2;
+        vbt[71..73].copy_from_slice(&5u16.to_le_bytes());
+        vbt[26] = 0u8.wrapping_sub(vbt.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)));
+        opregion
+    }
+
+    #[test]
+    fn unavailable_or_invalid_optional_rvda_vbt_falls_back_to_checked_mailbox() {
+        let data = opregion_with_mailbox_vbt();
+        let op = intel_display::opregion::OpRegion::parse(&data, 0x100000).unwrap();
+
+        let external =
+            map_external_vbt(&op, |_| Err(Error::Unavailable(0x102000))).unwrap_or_else(|_| None);
+        assert!(external.is_none());
+        let mailbox = opregion_vbt(&op, external.as_deref()).unwrap();
+        assert!(mailbox.checksum_valid());
+        assert_eq!(mailbox.data(), &data[0x400..0x400 + mailbox.data().len()]);
+
+        let mut corrupt_external = mailbox.data().to_vec();
+        corrupt_external[26] ^= 1;
+        let fallback = opregion_vbt(&op, Some(&corrupt_external)).unwrap();
+        assert_eq!(fallback.data(), mailbox.data());
     }
 
     #[test]
