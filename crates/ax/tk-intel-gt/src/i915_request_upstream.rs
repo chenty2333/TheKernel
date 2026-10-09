@@ -16,28 +16,48 @@ use core::{
 use crate::{
     i915_gem_context_types_upstream::I915GemContext,
     i915_request_types_upstream::{
-        DrmI915GemObject, DrmPrinter, I915CaptureList, I915Deps, I915Request, I915RequestState,
-        I915RequestWatchdog,
+        i915_request_timeline, DrmPrinter, I915CaptureList, I915Deps, I915Request,
+        I915RequestState, I915RequestWatchdog,
     },
-    i915_scheduler_types_upstream::{I915Dependency, I915SchedNode},
-    intel_context_types_upstream::{I915SwFence, IntelContext},
+    i915_scheduler_types_upstream::{
+        I915Dependency, I915SchedAttr, I915SchedNode, I915_SCHED_HAS_EXTERNAL_CHAIN,
+    },
+    i915_scheduler_upstream::*,
+    i915_sw_fence_upstream::*,
+    i915_gem_object_types_upstream::DrmI915GemObject,
+    intel_context_types_upstream::{I915SwFence, I915SwFenceNotify, IntelContext},
     intel_context_upstream::{
         DmaFence, DmaFenceCb, DrmGemObjectBaseLayout, I915Vma, I915VmaResource, IntelRing,
-        IntelTimeline, IrqWork, WaitQueueEntry,
+        IrqWork, WaitQueueEntry,
     },
+    intel_context_upstream::*,
+    intel_context_api_upstream::{
+        intel_context_cancel_request, intel_context_enter, intel_context_exit,
+        intel_context_is_barrier, intel_context_is_parallel, intel_context_is_schedulable,
+        intel_context_mark_active, intel_context_pin, intel_context_timeline_lock,
+        intel_context_timeline_unlock, intel_context_to_parent, intel_context_unpin,
+        intel_context_use_semaphores,
+    },
+    i915_active_upstream::*,
+    intel_ring_upstream::*,
+    intel_timeline_upstream::*,
+    intel_timeline_types_upstream::IntelTimeline,
     intel_engine_api_upstream::{__intel_engine_flush_submission, intel_engine_get_sibling},
-    intel_engine_cs_upstream::{IntelEngineCs, Spinlock},
-    intel_engine_types_upstream::{IntelEngineMask, VIDEO_DECODE_CLASS, intel_engine_is_virtual},
+    intel_engine_cs_upstream::{AtomicT, IntelEngineCs, LlistNode, Spinlock},
+    intel_engine_types_upstream::{
+        IntelEngineMask, VIDEO_DECODE_CLASS, intel_engine_has_semaphores, intel_engine_is_virtual,
+    },
     intel_gt_types_upstream::IntelGt,
     intel_timeline_types_upstream::I915Syncmap,
     intel_timeline_upstream::intel_timeline_get_seqno,
+    intel_huc_types_upstream::intel_huc_wait_required,
     linux::{
         bits::*, contexts::*, fields::*, irq::*, list::*, locks::*, memory::*, mutex::*, pm::*,
-        rbtree::*, rcu::*, registers::*, requests::*, sw_fence::*, tasklet::*, timer::*, wait::*,
+        rbtree::*, rcu::*, registers::*, requests::*, tasklet::*, timer::*, wait::*,
         workqueue::*,
     },
     linux_config::*,
-    linux_heap::{KmCache, kmem_cache_free},
+    linux_heap::*,
     linux_i915_private::DrmI915Private,
 };
 
@@ -70,6 +90,8 @@ const NOTIFY_DONE: i32 = 0;
 const ERESTARTSYS: i32 = 512;
 const MAX_ERRNO: i32 = 4095;
 const POISON_FREE: u8 = 0x6b;
+// Linux 7.2.3 include/linux/dma-fence.h enum dma_fence_flag_bits.
+const DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT: usize = 5;
 
 #[inline]
 unsafe fn to_request(fence: *mut DmaFence) -> *mut I915Request {
@@ -290,7 +312,7 @@ unsafe fn __notify_execute_cb_irq(rq: *mut I915Request) {
 
 // upstream i915_request.c:211
 // upstream: i915_request.c irq_work_imm()
-unsafe fn irq_work_imm(wrk: *mut IrqWork) -> bool {
+fn irq_work_imm(wrk: *mut IrqWork) -> bool {
     if let Some(func) = unsafe { (*wrk).func } {
         unsafe { func(wrk) };
     }
@@ -361,7 +383,7 @@ unsafe extern "C" fn __rq_watchdog_expired(
     let gt = unsafe { (*(*rq).engine).gt };
     if !i915_request_completed(unsafe { &*rq }) {
         if unsafe { llist_add(&mut (*rq).watchdog.link, &mut (*gt).watchdog.list) } {
-            unsafe { queue_work((*(*gt).i915).unordered_wq.cast(), &mut (*gt).watchdog.work) };
+            unsafe { queue_work((*(*gt).i915).unordered_wq, &mut (*gt).watchdog.work) };
         }
     } else {
         unsafe { i915_request_put(rq) };
@@ -442,7 +464,7 @@ pub unsafe fn i915_request_retire(rq: *mut I915Request) -> bool {
         unsafe { __i915_request_fill(rq, POISON_FREE as u8) };
     }
     unsafe { (*(*rq).ring).head = (*rq).postfix };
-    if !i915_request_signaled(unsafe { &(*rq).fence }) {
+    if !i915_request_signaled(rq) {
         unsafe { spin_lock_irq(&mut (*rq).lock) };
         unsafe { dma_fence_signal_locked(&mut (*rq).fence) };
         unsafe { spin_unlock_irq(&mut (*rq).lock) };
@@ -469,7 +491,7 @@ pub unsafe fn i915_request_retire_upto(rq: *mut I915Request) {
     gem_bug_on!(!unsafe { __i915_request_is_complete(rq) });
     loop {
         let tmp = unsafe {
-            list_first_entry::<I915Request>(&(*tl).requests, offset_of!(I915Request, link))
+            list_first_entry!(&(*tl).requests, I915Request, link)
         };
         gem_bug_on!(!i915_request_completed(unsafe { &*tmp }));
         let done = unsafe { i915_request_retire(tmp) };
@@ -481,8 +503,8 @@ pub unsafe fn i915_request_retire_upto(rq: *mut I915Request) {
 
 // upstream i915_request.c:434
 // upstream: i915_request.c __engine_active()
-unsafe fn __engine_active(engine: *mut IntelEngineCs) -> *mut *mut I915Request {
-    unsafe { ptr::read_volatile(ptr::addr_of_mut!((*engine).execlists.active)) }
+unsafe fn __engine_active(engine: *mut IntelEngineCs) -> *const *mut I915Request {
+    unsafe { ptr::read_volatile(ptr::addr_of!((*engine).execlists.active)) }
 }
 
 // upstream i915_request.c:440
@@ -491,7 +513,7 @@ unsafe fn __request_in_flight(signal: *mut I915Request) -> bool {
     if !i915_request_is_ready(unsafe { &*signal }) {
         return false;
     }
-    if !intel_context_inflight(unsafe { (*signal).context }) {
+    if intel_context_inflight(unsafe { (*signal).context }).is_null() {
         return false;
     }
     let mut inflight = false;
@@ -503,8 +525,8 @@ unsafe fn __request_in_flight(signal: *mut I915Request) -> bool {
             break;
         }
         if unsafe { (*rq).context == (*signal).context } {
-            inflight = i915_seqno_passed(unsafe { (*rq).fence.seqno }, unsafe {
-                (*signal).fence.seqno
+            inflight = i915_seqno_passed(unsafe { (*rq).fence.seqno as u32 }, unsafe {
+                (*signal).fence.seqno as u32
             });
             break;
         }
@@ -525,9 +547,9 @@ unsafe fn __await_execution(rq: *mut I915Request, signal: *mut I915Request, gfp:
         return -ENOMEM;
     }
     unsafe { (*cb).fence = ptr::addr_of_mut!((*rq).submit) };
-    unsafe { i915_sw_fence_await(&mut (*rq).submit) };
-    unsafe { init_irq_work(&mut (*cb).work, Some(irq_execute_cb)) };
-    if unsafe { llist_add(&mut (*cb).work.node.llist, &mut (*signal).execute_cb) } {
+    unsafe { crate::i915_sw_fence_upstream::i915_sw_fence_await(&mut (*rq).submit) };
+    unsafe { init_irq_work(&mut (*cb).work, irq_execute_cb) };
+    if unsafe { llist_add(core::ptr::addr_of_mut!((*cb).work.node).cast::<LlistNode>(), &mut (*signal).execute_cb) } {
         if i915_request_is_active(unsafe { &*signal }) || unsafe { __request_in_flight(signal) } {
             unsafe { i915_request_notify_execute_cb_imm(signal) };
         }
@@ -556,10 +578,10 @@ pub unsafe fn __i915_request_skip(rq: *mut I915Request) {
 // upstream: i915_request.c i915_request_set_error_once()
 pub unsafe fn i915_request_set_error_once(rq: *mut I915Request, error: i32) -> bool {
     gem_bug_on!((error as isize) >= 0 || (error as isize) < -(MAX_ERRNO as isize));
-    if i915_request_signaled(unsafe { &(*rq).fence }) {
+    if i915_request_signaled(rq) {
         return false;
     }
-    let mut old = unsafe { atomic_read(&(*rq).fence.error) };
+    let mut old = unsafe { atomic_read(&*ptr::addr_of!((*rq).fence.error).cast::<AtomicT>()) };
     loop {
         if fatal_error(old) {
             return false;
@@ -577,7 +599,7 @@ pub unsafe fn i915_request_mark_eio(rq: *mut I915Request) -> *mut I915Request {
     if unsafe { __i915_request_is_complete(rq) } {
         return ptr::null_mut();
     }
-    gem_bug_on!(i915_request_signaled(unsafe { &(*rq).fence }));
+    gem_bug_on!(i915_request_signaled(rq));
     let rq = unsafe { i915_request_get(rq) };
     unsafe { i915_request_set_error_once(rq, -EIO) };
     i915_request_mark_complete(unsafe { &*rq });
@@ -609,7 +631,7 @@ pub unsafe fn __i915_request_submit(request: *mut I915Request) -> bool {
         unsafe {
             emit(
                 request,
-                (*(*request).ring).vaddr.add((*request).postfix as usize),
+                (*(*request).ring).vaddr.cast::<u32>().add((*request).postfix as usize),
             )
         };
     }
@@ -703,7 +725,7 @@ pub unsafe fn i915_request_cancel(rq: *mut I915Request, error: i32) {
 
 // upstream i915_request.c:773
 // upstream: i915_request.c submit_notify()
-unsafe fn submit_notify(fence: *mut I915SwFence, state: I915SwFenceNotify) -> i32 {
+unsafe extern "C" fn submit_notify(fence: *mut I915SwFence, state: I915SwFenceNotify) -> i32 {
     let request = unsafe {
         fence
             .cast::<u8>()
@@ -731,7 +753,7 @@ unsafe fn submit_notify(fence: *mut I915SwFence, state: I915SwFenceNotify) -> i3
 
 // upstream i915_request.c:809
 // upstream: i915_request.c semaphore_notify()
-unsafe fn semaphore_notify(fence: *mut I915SwFence, state: I915SwFenceNotify) -> i32 {
+unsafe extern "C" fn semaphore_notify(fence: *mut I915SwFence, state: I915SwFenceNotify) -> i32 {
     let rq = unsafe {
         fence
             .cast::<u8>()
@@ -748,7 +770,7 @@ unsafe fn semaphore_notify(fence: *mut I915SwFence, state: I915SwFenceNotify) ->
 // upstream: i915_request.c retire_requests()
 unsafe fn retire_requests(tl: *mut IntelTimeline) {
     let mut rq = unsafe {
-        list_first_entry_or_null::<I915Request>(&(*tl).requests, offset_of!(I915Request, link))
+        list_first_entry_or_null!(&(*tl).requests, I915Request, link)
     };
     while !rq.is_null() {
         let next =
@@ -760,6 +782,20 @@ unsafe fn retire_requests(tl: *mut IntelTimeline) {
     }
 }
 
+// Upstream i915 list helper: return the entry after `rq`, or NULL at the head.
+unsafe fn list_next_entry_or_null(
+    rq: *mut I915Request,
+    offset: usize,
+    head: *const crate::intel_engine_cs_upstream::ListHead,
+) -> *mut I915Request {
+    let next = unsafe { ptr::read_volatile(ptr::addr_of!((*rq).link.next)) };
+    if core::ptr::eq(next, head as *mut _) {
+        ptr::null_mut()
+    } else {
+        (next as usize).wrapping_sub(offset) as *mut I915Request
+    }
+}
+
 // upstream i915_request.c:835
 // upstream: i915_request.c request_alloc_slow()
 unsafe fn request_alloc_slow(
@@ -767,7 +803,7 @@ unsafe fn request_alloc_slow(
     reserved: *mut *mut I915Request,
     gfp: u32,
 ) -> *mut I915Request {
-    if !gfpflags_allow_blocking(gfp) {
+    if !gfpflags_allow_blocking(gfp as c_ulong) {
         let rq = unsafe { ptr::replace(reserved, ptr::null_mut()) };
         if !rq.is_null() {
             return rq;
@@ -776,7 +812,7 @@ unsafe fn request_alloc_slow(
     }
     if !unsafe { list_empty(&(*tl).requests) } {
         let oldest = unsafe {
-            list_first_entry::<I915Request>(&(*tl).requests, offset_of!(I915Request, link))
+            list_first_entry!(&(*tl).requests, I915Request, link)
         };
         unsafe { i915_request_retire(oldest) };
         let rq = unsafe {
@@ -789,7 +825,7 @@ unsafe fn request_alloc_slow(
             return rq;
         }
         let last = unsafe {
-            list_last_entry::<I915Request>(&(*tl).requests, offset_of!(I915Request, link))
+            list_last_entry!(&(*tl).requests, I915Request, link)
         };
         unsafe { cond_synchronize_rcu((*last).rcustate) };
         unsafe { retire_requests(tl) };
@@ -815,7 +851,7 @@ unsafe fn __i915_request_ctor(arg: *mut c_void) {
 // CONFIG_DRM_I915_SELFTEST=n for the recorded target configuration.
 unsafe fn clear_batch_ptr(rq: *mut I915Request) {
     if CONFIG_DRM_I915_SELFTEST {
-        unsafe { (*rq).batch = ptr::null_mut() };
+        unsafe { (*rq).batch_res = ptr::null_mut() };
     }
 }
 
@@ -830,7 +866,7 @@ pub unsafe fn __i915_request_create(ce: *mut IntelContext, gfp: u32) -> *mut I91
     let mut ret = 0;
     unsafe { intel_context_pin(ce) };
     if rq.is_null() {
-        rq = unsafe { request_alloc_slow(tl, &mut (*(*(*ce).engine).request_pool), gfp) };
+        rq = unsafe { request_alloc_slow(tl, &mut (*(*ce).engine).request_pool, gfp) };
         if rq.is_null() {
             ret = -ENOMEM;
             unsafe { intel_context_unpin(ce) };
@@ -908,7 +944,7 @@ pub unsafe fn i915_request_create(ce: *mut IntelContext) -> *mut I915Request {
         return tl.cast();
     }
     let first =
-        unsafe { list_first_entry::<I915Request>(&(*tl).requests, offset_of!(I915Request, link)) };
+        unsafe { list_first_entry!(&(*tl).requests, I915Request, link) };
     if !unsafe { list_is_last(&(*first).link, &(*tl).requests) } {
         unsafe { i915_request_retire(first) };
     }
@@ -935,12 +971,12 @@ unsafe fn i915_request_await_start(rq: *mut I915Request, signal: *mut I915Reques
     rcu_read_lock();
     let pos = unsafe { ptr::read_volatile((*signal).link.prev) };
     if !unsafe { __i915_request_has_started(signal) } {
-        let timeline = unsafe { rcu_dereference((*signal).timeline) };
+        let timeline = unsafe { rcu_dereference!((*signal).timeline) };
         if pos != unsafe { ptr::addr_of_mut!((*timeline).requests) } {
-            let prev = unsafe { list_entry::<I915Request>(pos, offset_of!(I915Request, link)) };
-            if unsafe { i915_request_get_rcu(prev) } {
+            let prev = unsafe { list_entry!(pos, I915Request, link) };
+            if !unsafe { i915_request_get_rcu(prev) }.is_null() {
                 if unsafe {
-                    ptr::read_volatile((*prev).link.next) == ptr::addr_of_mut!((*signal).link)
+                    ptr::eq(ptr::read_volatile(ptr::addr_of!((*prev).link.next)) as *const _, ptr::addr_of!((*signal).link))
                 } {
                     fence = unsafe { ptr::addr_of_mut!((*prev).fence) };
                 } else {
@@ -954,7 +990,7 @@ unsafe fn i915_request_await_start(rq: *mut I915Request, signal: *mut I915Reques
         return 0;
     }
     let err = if !unsafe { intel_timeline_sync_is_later(i915_request_timeline(rq), &*fence) } {
-        unsafe { i915_sw_fence_await_dma_fence(&mut (*rq).submit, fence, 0, I915_FENCE_GFP) }
+        unsafe { i915_sw_fence_await_dma_fence(&mut (*rq).submit, fence, 0 as c_ulong, I915_FENCE_GFP as c_ulong) }
     } else {
         0
     };
@@ -1043,12 +1079,12 @@ unsafe fn emit_semaphore_wait(to: *mut I915Request, from: *mut I915Request, gfp:
         && unsafe { already_busywaiting(to) & mask == 0 }
         && unsafe { i915_request_await_start(to, from) >= 0 }
         && unsafe { __await_execution(to, from, gfp) == 0 }
-        && unsafe { __emit_semaphore_wait(to, from, (*from).fence.seqno) == 0 }
+        && unsafe { __emit_semaphore_wait(to, from, (*from).fence.seqno as u32) == 0 }
     {
         unsafe { (*to).sched.semaphores |= mask };
         wait = ptr::addr_of_mut!((*to).semaphore);
     }
-    unsafe { i915_sw_fence_await_dma_fence(wait, &mut (*from).fence, 0, I915_FENCE_GFP) }
+    unsafe { i915_sw_fence_await_dma_fence(wait, &mut (*from).fence, 0, I915_FENCE_GFP as c_ulong) }
 }
 
 // upstream i915_request.c:1264
@@ -1069,7 +1105,7 @@ unsafe fn __i915_request_await_execution(to: *mut I915Request, from: *mut I915Re
     if unsafe { can_use_semaphore_wait(to, from) && intel_engine_has_semaphores((*to).engine) }
         && !i915_request_has_initial_breadcrumb(unsafe { &*to })
     {
-        let err = unsafe { __emit_semaphore_wait(to, from, (*from).fence.seqno - 1) };
+        let err = unsafe { __emit_semaphore_wait(to, from, (*from).fence.seqno as u32 - 1) };
         if err < 0 {
             return err;
         }
@@ -1178,7 +1214,7 @@ unsafe fn __i915_request_await_external(rq: *mut I915Request, fence: *mut DmaFen
             &mut (*rq).submit,
             fence,
             i915_fence_context_timeout((*fence).context),
-            I915_FENCE_GFP,
+            I915_FENCE_GFP as c_ulong,
         )
     }
 }
@@ -1228,7 +1264,7 @@ unsafe fn is_same_parallel_context(to: *mut I915Request, from: *mut I915Request)
 
 // upstream i915_request.c:1403
 // upstream: i915_request.c i915_request_await_execution()
-pub unsafe fn i915_request_await_execution(rq: *mut I915Request, fence: *mut DmaFence) -> i32 {
+pub unsafe fn i915_request_await_execution(rq: *mut I915Request, mut fence: *mut DmaFence) -> i32 {
     let mut child = ptr::addr_of_mut!(fence);
     let mut nchild = 1u32;
     if unsafe { dma_fence_is_array(fence) } {
@@ -1266,7 +1302,7 @@ pub unsafe fn i915_request_await_execution(rq: *mut I915Request, fence: *mut Dma
 unsafe fn await_request_submit(to: *mut I915Request, from: *mut I915Request) -> i32 {
     if unsafe { (*to).engine == ptr::read_volatile(ptr::addr_of!((*from).engine)) } {
         unsafe {
-            i915_sw_fence_await_sw_fence_gfp(&mut (*to).submit, &mut (*from).submit, I915_FENCE_GFP)
+            i915_sw_fence_await_sw_fence_gfp(&mut (*to).submit, &mut (*from).submit, I915_FENCE_GFP as c_ulong)
         }
     } else {
         unsafe { __i915_request_await_execution(to, from) }
@@ -1428,7 +1464,7 @@ unsafe fn __i915_request_ensure_parallel_ordering(
                 i915_sw_fence_await_sw_fence(
                     &mut (*rq).submit,
                     &mut (*prev).submit,
-                    &mut (*rq).submitq,
+                    core::ptr::addr_of_mut!((*rq).submit_union.submitq).cast::<WaitQueueEntry>(),
                 )
             };
             if unsafe { (*(*(*rq).engine).sched_engine).schedule.is_some() } {
@@ -1474,14 +1510,14 @@ unsafe fn __i915_request_ensure_ordering(
         let same_context = unsafe { (*prev).context == (*rq).context };
         gem_bug_on!(
             same_context
-                && i915_seqno_passed(unsafe { (*prev).fence.seqno }, unsafe { (*rq).fence.seqno })
+                && i915_seqno_passed(unsafe { (*prev).fence.seqno as u32 }, unsafe { (*rq).fence.seqno as u32 })
         );
         if (same_context && uses_guc) || (!uses_guc && pow2) {
             unsafe {
                 i915_sw_fence_await_sw_fence(
                     &mut (*rq).submit,
                     &mut (*prev).submit,
-                    &mut (*rq).submitq,
+                    core::ptr::addr_of_mut!((*rq).submit_union.submitq).cast::<WaitQueueEntry>(),
                 )
             };
         } else {
@@ -1489,7 +1525,7 @@ unsafe fn __i915_request_ensure_ordering(
                 __i915_sw_fence_await_dma_fence(
                     &mut (*rq).submit,
                     &mut (*prev).fence,
-                    &mut (*rq).dmaq,
+                    core::ptr::addr_of_mut!((*rq).submit_union.dmaq).cast::<I915SwDmaFenceCb>(),
                 )
             };
         }
@@ -1511,7 +1547,7 @@ unsafe fn __i915_request_ensure_ordering(
 // upstream: i915_request.c __i915_request_add_to_timeline()
 unsafe fn __i915_request_add_to_timeline(rq: *mut I915Request) -> *mut I915Request {
     let timeline = unsafe { i915_request_timeline(rq) };
-    if unsafe { (*(*rq).engine).class == VIDEO_DECODE_CLASS } {
+    if unsafe { (*(*rq).engine).class as i32 == VIDEO_DECODE_CLASS } {
         unsafe { i915_request_await_huc(rq) };
     }
     let prev = if unsafe { is_parallel_rq(rq) } {
@@ -1522,7 +1558,7 @@ unsafe fn __i915_request_add_to_timeline(rq: *mut I915Request) -> *mut I915Reque
     if !prev.is_null() {
         unsafe { i915_request_put(prev) };
     }
-    gem_bug_on!(unsafe { (*timeline).seqno != (*rq).fence.seqno as u32 });
+    gem_bug_on!(unsafe { (*timeline).seqno != (*rq).fence.seqno });
     prev
 }
 
@@ -1533,11 +1569,11 @@ pub unsafe fn __i915_request_commit(rq: *mut I915Request) -> *mut I915Request {
     let ring = unsafe { (*rq).ring };
     gem_bug_on!(unsafe { (*rq).reserved_space > (*ring).space });
     unsafe { (*rq).reserved_space = 0 };
-    unsafe { (*rq).emitted_jiffies = jiffies };
+    unsafe { (*rq).emitted_jiffies = jiffies() };
     let dw = unsafe { (*engine).emit_fini_breadcrumb_dw };
     let cs = unsafe { intel_ring_begin(rq, dw) };
     gem_bug_on!(IS_ERR(cs));
-    unsafe { (*rq).postfix = intel_ring_offset(rq, cs) };
+    unsafe { (*rq).postfix = intel_ring_offset(rq, cs.cast::<c_void>()) };
     unsafe { __i915_request_add_to_timeline(rq) }
 }
 
@@ -1569,9 +1605,9 @@ pub unsafe fn i915_request_add(rq: *mut I915Request) {
     lockdep_assert_held(unsafe { &(*tl).mutex });
     unsafe { lockdep_unpin_lock(&mut (*tl).mutex, (*rq).cookie) };
     unsafe { __i915_request_commit(rq) };
-    let mut attr = I915SchedAttr::default();
+    let mut attr: I915SchedAttr = unsafe { core::mem::zeroed() };
     rcu_read_lock();
-    let ctx = unsafe { rcu_dereference((*(*rq).context).gem_context) };
+    let ctx = unsafe { rcu_dereference!((*(*rq).context).gem_context) };
     if !ctx.is_null() {
         attr = unsafe { (*ctx).sched };
     }
@@ -1621,10 +1657,10 @@ unsafe fn __i915_spin_request(rq: *const I915Request, state: i32) -> bool {
     let timeout = local_clock_ns(&mut cpu)
         .wrapping_add(unsafe { (*(*rq).engine).props.max_busywait_duration_ns });
     loop {
-        if unsafe { dma_fence_is_signaled(ptr::addr_of_mut!((*rq).fence)) } {
+        if unsafe { dma_fence_is_signaled(ptr::addr_of!((*rq).fence) as *mut DmaFence) } {
             return true;
         }
-        if unsafe { signal_pending_state(state, current_task_ptr()) } || busywait_stop(timeout, cpu)
+        if unsafe { signal_pending_state(state as i32, current_task_ptr()) } || busywait_stop(timeout, cpu)
         {
             break;
         }
@@ -1654,7 +1690,7 @@ struct RequestWait {
 }
 
 fn current_task_ptr() -> *mut c_void {
-    axhal::percpu::current_task_ptr::<()>().cast()
+    axhal::percpu::current_task_ptr::<()>().cast_mut().cast::<c_void>()
 }
 
 // upstream i915_request.c:1958
@@ -1693,12 +1729,12 @@ pub unsafe fn i915_request_wait_timeout(
         return if timeout == 0 { 1 } else { timeout };
     }
     if timeout == 0 {
-        return -ETIME;
+        return -(ETIME as c_long);
     }
     unsafe { trace_i915_request_wait_begin(rq, flags) };
     // The source lockdep acquire/release annotations are compiled out when
     // CONFIG_LOCKDEP=n in this target configuration.
-    if CONFIG_DRM_I915_MAX_REQUEST_BUSYWAIT != 0 && unsafe { __i915_spin_request(rq, state) } {
+    if CONFIG_DRM_I915_MAX_REQUEST_BUSYWAIT != 0 && unsafe { __i915_spin_request(rq, state as i32) } {
         unsafe { trace_i915_request_wait_end(rq) };
         return timeout;
     }
@@ -1714,11 +1750,11 @@ pub unsafe fn i915_request_wait_timeout(
         unsafe { __intel_engine_flush_submission((*rq).engine, false) };
     }
     loop {
-        unsafe { set_current_state(state) };
+        unsafe { set_current_state(state as i32) };
         if unsafe { dma_fence_is_signaled(&mut (*rq).fence) } {
             break;
         }
-        if unsafe { signal_pending_state(state, current_task_ptr()) } {
+        if unsafe { signal_pending_state(state as i32, current_task_ptr()) } {
             timeout = -(ERESTARTSYS as c_long);
             break;
         }
@@ -1728,7 +1764,7 @@ pub unsafe fn i915_request_wait_timeout(
         }
         timeout = unsafe { io_schedule_timeout(timeout) };
     }
-    unsafe { __set_current_state(TASK_RUNNING) };
+    unsafe { __set_current_state(TASK_RUNNING as i32) };
     if !wait.tsk.is_null() {
         unsafe { dma_fence_remove_callback(&mut (*rq).fence, &mut wait.cb) };
     }
@@ -1820,7 +1856,7 @@ pub unsafe fn i915_request_show(
 ) {
     let mut buf = [0i8; 80];
     let x = unsafe { print_sched_attr(&(*rq).sched.attr, buf.as_mut_ptr(), 0, buf.len() as i32) };
-    let timeline_name = unsafe { dma_fence_timeline_name(ptr::addr_of_mut!((*rq).fence)) };
+    let timeline_name = unsafe { dma_fence_timeline_name(ptr::addr_of!((*rq).fence) as *mut DmaFence) };
     rcu_read_lock();
     drm_printf!(
         printer,
@@ -1834,8 +1870,8 @@ pub unsafe fn i915_request_show(
         unsafe { run_status(rq) },
         unsafe { fence_status(rq) },
         buf.as_ptr(),
-        jiffies_to_msecs(jiffies.wrapping_sub(unsafe { (*rq).emitted_jiffies })),
-        unsafe { rcu_dereference(timeline_name) },
+        jiffies_to_msecs(jiffies().wrapping_sub(unsafe { (*rq).emitted_jiffies })),
+        unsafe { rcu_dereference!(timeline_name) },
     );
     rcu_read_unlock();
     let _ = x;
