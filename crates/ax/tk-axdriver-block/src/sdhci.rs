@@ -521,6 +521,81 @@ pub enum MmcBusTiming {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MmcClockPlan {
+    timing: MmcBusTiming,
+    clock_hz: u32,
+    needs_v180: bool,
+}
+
+/// Choose the highest card timing supported by both the selected eMMC and the
+/// host. FreeBSD intersects this choice across every child card on the bus;
+/// this block frontend has one selected card per slot.
+// upstream: mmc.c mmc_calculate_clock()
+fn mmc_calculate_clock(
+    host_version: u8,
+    host_capabilities: u32,
+    host_capabilities2: u32,
+    host_quirks: u32,
+    host_clock_hz: u32,
+    bus_width: u8,
+    card_type: u8,
+) -> MmcClockPlan {
+    let version_3 = host_version >= SDHCI_SPEC_300 as u8;
+    let v180 = host_capabilities & SDHCI_CAN_VDD_180 != 0 && version_3;
+    let hs200 = v180
+        && host_capabilities2 & SDHCI_CAN_SDR104 != 0
+        && bus_width >= 4
+        && card_type & MMC_CARD_TYPE_HS200_180 != 0;
+    let hs400 = v180
+        && (host_capabilities2 & SDHCI_CAN_MMC_HS400 != 0
+            || (host_quirks & SDHCI_QUIRK_MMC_HS400_IF_CAN_SDR104 != 0
+                && host_capabilities2 & SDHCI_CAN_SDR104 != 0))
+        && bus_width == 8
+        && card_type & (MMC_CARD_TYPE_HS400_180 | MMC_CARD_TYPE_HS200_180)
+            == (MMC_CARD_TYPE_HS400_180 | MMC_CARD_TYPE_HS200_180);
+    let ddr52 = v180
+        && host_capabilities2 & SDHCI_CAN_DDR50 != 0
+        && bus_width >= 4
+        && card_type & MMC_CARD_TYPE_DDR52_180 != 0;
+
+    if hs400 {
+        MmcClockPlan {
+            timing: MmcBusTiming::MmcHs400,
+            clock_hz: host_clock_hz.min(200_000_000),
+            needs_v180: true,
+        }
+    } else if hs200 {
+        MmcClockPlan {
+            timing: MmcBusTiming::MmcHs200,
+            clock_hz: host_clock_hz.min(200_000_000),
+            needs_v180: true,
+        }
+    } else if ddr52 {
+        MmcClockPlan {
+            timing: MmcBusTiming::MmcDdr52,
+            clock_hz: host_clock_hz.min(52_000_000),
+            needs_v180: true,
+        }
+    } else if card_type & (MMC_CARD_TYPE_HS26 | MMC_CARD_TYPE_HS52) != 0 {
+        MmcClockPlan {
+            timing: MmcBusTiming::HighSpeed,
+            clock_hz: host_clock_hz.min(if card_type & MMC_CARD_TYPE_HS52 != 0 {
+                52_000_000
+            } else {
+                26_000_000
+            }),
+            needs_v180: false,
+        }
+    } else {
+        MmcClockPlan {
+            timing: MmcBusTiming::Normal,
+            clock_hz: 0,
+            needs_v180: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MmcVccq {
     V120,
     V180,
@@ -2355,7 +2430,7 @@ fn mmc_bus_width_ext_csd_value(width: u8, timing: MmcBusTiming) -> Option<u8> {
 }
 
 // upstream: mmc.c mmc_switch_to_hs400()
-fn switch_mmc_to_hs400<I: SdhciIo>(
+fn mmc_switch_to_hs400<I: SdhciIo>(
     host: &mut SdhciHost<I>,
     rca: u16,
     width: u8,
@@ -2371,8 +2446,8 @@ fn switch_mmc_to_hs400<I: SdhciIo>(
     Ok(())
 }
 
-// upstream: mmc.c mmc_attach() initial HS200 timing selection
-fn switch_mmc_to_hs200<I: SdhciIo>(
+// upstream: mmc.c mmc_switch_to_hs200()
+fn mmc_switch_to_hs200<I: SdhciIo>(
     host: &mut SdhciHost<I>,
     rca: u16,
     width: u8,
@@ -2384,7 +2459,6 @@ fn switch_mmc_to_hs200<I: SdhciIo>(
     Ok(())
 }
 
-// upstream: mmc.c mmc_switch_to_hs200()
 fn retune_mmc_hs400_via_hs200<I: SdhciIo>(
     host: &mut SdhciHost<I>,
     rca: u16,
@@ -2500,7 +2574,15 @@ impl<I: SdhciIo> SdhciDisk<I> {
     /// Initializes an SD memory card and reads its CSD capacity.
     // upstream: mmc.c mmc_attach()
     // upstream: mmc.c mmc_idle_cards(), mmc_send_if_cond(), mmc_send_app_op_cond(), mmc_send_op_cond(), mmc_all_send_cid(), mmc_send_relative_addr(), mmc_send_csd(), mmc_select_card()
-    pub fn attach(mut host: SdhciHost<I>) -> Result<Self, SdhciError> {
+    pub fn attach(host: SdhciHost<I>) -> Result<Self, SdhciError> {
+        Self::mmc_discover_cards(host)
+    }
+
+    /// Discover and initialize the selected card on this host. The block
+    /// frontend currently models one card per host instead of FreeBSD's child
+    /// bus enumeration loop.
+    // upstream: mmc.c mmc_discover_cards()
+    pub fn mmc_discover_cards(mut host: SdhciHost<I>) -> Result<Self, SdhciError> {
         host.initialize()?;
         host.command(SD_CMD_GO_IDLE, 0, RSP_NONE, None, 0)?;
         let version2 = mmc_send_if_cond(&mut host);
@@ -2629,55 +2711,48 @@ impl<I: SdhciIo> SdhciDisk<I> {
             let bus_width = mmc_test_bus_width(&mut host, rca);
             negotiated_bus_width = bus_width;
             let ext = ext_csd.expect("EXT_CSD was read for high-capacity MMC");
-            let card_type = ext.card_type;
-            let has_180 = host.capabilities & SDHCI_CAN_VDD_180 != 0;
-            let hs200 = has_180
-                && host.version >= SDHCI_SPEC_300 as u8
-                && host.capabilities2 & SDHCI_CAN_SDR104 != 0
-                && bus_width >= 4
-                && card_type & MMC_CARD_TYPE_HS200_180 != 0;
-            let hs400 = has_180
-                && host.version >= SDHCI_SPEC_300 as u8
-                && (host.capabilities2 & SDHCI_CAN_MMC_HS400 != 0
-                    || (host.quirks & SDHCI_QUIRK_MMC_HS400_IF_CAN_SDR104 != 0
-                        && host.capabilities2 & SDHCI_CAN_SDR104 != 0))
-                && bus_width == 8
-                && card_type & (MMC_CARD_TYPE_HS400_180 | MMC_CARD_TYPE_HS200_180)
-                    == (MMC_CARD_TYPE_HS400_180 | MMC_CARD_TYPE_HS200_180);
-            let ddr52 = has_180
-                && host.version >= SDHCI_SPEC_300 as u8
-                && host.capabilities2 & SDHCI_CAN_DDR50 != 0
-                && bus_width >= 4
-                && card_type & MMC_CARD_TYPE_DDR52_180 != 0;
-            let timing = if hs400 {
-                host.switch_vccq(MmcVccq::V180)?;
-                let hs200_clock = 200_000_000.min(host.base_clock_hz);
-                switch_mmc_to_hs200(&mut host, rca, bus_width, hs200_clock)?;
-                let target = hs200_clock.min(200_000_000);
-                switch_mmc_to_hs400(&mut host, rca, bus_width, target)?;
-                (MmcBusTiming::MmcHs400, target)
-            } else if hs200 {
-                host.switch_vccq(MmcVccq::V180)?;
-                let target = 200_000_000.min(host.base_clock_hz);
-                switch_mmc_to_hs200(&mut host, rca, bus_width, target)?;
-                (MmcBusTiming::MmcHs200, target)
-            } else if ddr52 {
-                host.switch_vccq(MmcVccq::V180)?;
-                mmc_set_card_bus_width_timing(&mut host, rca, bus_width, MmcBusTiming::MmcDdr52)?;
-                let target = 52_000_000.min(host.base_clock_hz);
-                host.set_mmc_timing(MmcBusTiming::MmcDdr52, target)?;
-                (MmcBusTiming::MmcDdr52, target)
-            } else if card_type & (MMC_CARD_TYPE_HS26 | MMC_CARD_TYPE_HS52) != 0 {
-                let target = if card_type & MMC_CARD_TYPE_HS52 != 0 {
-                    52_000_000
-                } else {
-                    26_000_000
+            let plan = mmc_calculate_clock(
+                host.version,
+                host.capabilities,
+                host.capabilities2,
+                host.quirks,
+                host.base_clock_hz,
+                bus_width,
+                ext.card_type,
+            );
+            let timing = match plan.timing {
+                MmcBusTiming::MmcHs400 => {
+                    debug_assert!(plan.needs_v180);
+                    host.switch_vccq(MmcVccq::V180)?;
+                    let hs200_clock = plan.clock_hz.min(200_000_000);
+                    mmc_switch_to_hs200(&mut host, rca, bus_width, hs200_clock)?;
+                    mmc_switch_to_hs400(&mut host, rca, bus_width, plan.clock_hz)?;
+                    (plan.timing, plan.clock_hz)
                 }
-                .min(host.base_clock_hz);
-                host.set_mmc_timing(MmcBusTiming::HighSpeed, target)?;
-                (MmcBusTiming::HighSpeed, target)
-            } else {
-                (MmcBusTiming::Normal, 0)
+                MmcBusTiming::MmcHs200 => {
+                    debug_assert!(plan.needs_v180);
+                    host.switch_vccq(MmcVccq::V180)?;
+                    mmc_switch_to_hs200(&mut host, rca, bus_width, plan.clock_hz)?;
+                    (plan.timing, plan.clock_hz)
+                }
+                MmcBusTiming::MmcDdr52 => {
+                    debug_assert!(plan.needs_v180);
+                    host.switch_vccq(MmcVccq::V180)?;
+                    mmc_set_card_bus_width_timing(
+                        &mut host,
+                        rca,
+                        bus_width,
+                        MmcBusTiming::MmcDdr52,
+                    )?;
+                    host.set_mmc_timing(plan.timing, plan.clock_hz)?;
+                    (plan.timing, plan.clock_hz)
+                }
+                MmcBusTiming::HighSpeed => {
+                    debug_assert!(!plan.needs_v180);
+                    host.set_mmc_timing(plan.timing, plan.clock_hz)?;
+                    (plan.timing, plan.clock_hz)
+                }
+                _ => (MmcBusTiming::Normal, 0),
             };
             if timing.0 != MmcBusTiming::Normal {
                 host.set_mmc_power_class(
@@ -2872,7 +2947,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
 
     // upstream: sdhci.c sdhci_generic_retune()
     // upstream: mmc.c mmc_retune()
-    fn retune_if_needed(&mut self) -> Result<(), SdhciError> {
+    fn mmc_retune(&mut self) -> Result<(), SdhciError> {
         if !self.tuning_enabled
             || !matches!(
                 self.timing,
@@ -2915,7 +2990,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
             self.host.execute_tuning(19, self.bus_width)?;
         }
         if self.timing == MmcBusTiming::MmcHs400 {
-            switch_mmc_to_hs400(
+            mmc_switch_to_hs400(
                 &mut self.host,
                 self.rca,
                 self.bus_width,
@@ -2936,7 +3011,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
         {
             return Err(SdhciError::InvalidTransfer);
         }
-        self.retune_if_needed()?;
+        self.mmc_retune()?;
         if data.len() > 512 && !self.host.allows_multi_block() {
             for (index, sector) in data.chunks_exact_mut(512).enumerate() {
                 self.transfer(lba + index as u64, sector, write)?;
@@ -3584,7 +3659,7 @@ mod tests {
             last_tune_ns: Some(0),
             tuning_enabled: true,
         };
-        disk.retune_if_needed().unwrap();
+        disk.mmc_retune().unwrap();
         assert_eq!(disk.host.io.command >> 8, 21);
         assert_eq!(disk.last_tune_ns, Some(2_000_000_000));
     }
@@ -3618,7 +3693,7 @@ mod tests {
             last_tune_ns: Some(0),
             tuning_enabled: true,
         };
-        disk.retune_if_needed().unwrap();
+        disk.mmc_retune().unwrap();
         assert_eq!(disk.host.io.command >> 8, MMC_CMD_SWITCH as u16);
         assert_eq!(
             disk.host.io.read16(SDHCI_HOST_CONTROL2 as usize) as u32 & SDHCI_CTRL2_UHS_MASK,
@@ -3884,6 +3959,51 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn mmc_calculate_clock_intersects_host_card_and_width_capabilities() {
+        let hs400 = mmc_calculate_clock(
+            SDHCI_SPEC_300 as u8,
+            SDHCI_CAN_VDD_180,
+            SDHCI_CAN_SDR104 | SDHCI_CAN_MMC_HS400,
+            0,
+            208_000_000,
+            8,
+            MMC_CARD_TYPE_HS200_180 | MMC_CARD_TYPE_HS400_180,
+        );
+        assert_eq!(hs400.timing, MmcBusTiming::MmcHs400);
+        assert_eq!(hs400.clock_hz, 200_000_000);
+        assert!(hs400.needs_v180);
+
+        let ddr52 = mmc_calculate_clock(
+            SDHCI_SPEC_300 as u8,
+            SDHCI_CAN_VDD_180,
+            SDHCI_CAN_DDR50,
+            0,
+            100_000_000,
+            4,
+            MMC_CARD_TYPE_DDR52_180,
+        );
+        assert_eq!(
+            ddr52,
+            MmcClockPlan {
+                timing: MmcBusTiming::MmcDdr52,
+                clock_hz: 52_000_000,
+                needs_v180: true,
+            }
+        );
+
+        let narrow = mmc_calculate_clock(
+            SDHCI_SPEC_300 as u8,
+            SDHCI_CAN_VDD_180,
+            SDHCI_CAN_SDR104 | SDHCI_CAN_MMC_HS400,
+            0,
+            100_000_000,
+            4,
+            MMC_CARD_TYPE_HS200_180 | MMC_CARD_TYPE_HS400_180,
+        );
+        assert_eq!(narrow.timing, MmcBusTiming::MmcHs200);
     }
 
     #[test]

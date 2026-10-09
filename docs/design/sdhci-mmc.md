@@ -108,3 +108,10 @@ acceptance remains unverified. SDHCI enables routed signaling after card
 enumeration when the PCI adapter considers the route usable. The QEMU 1b36:0007
 model is marked signal-broken because enabling INTx loses CMD17 completions;
 that device retains bounded status polling as fallback.
+
+The eMMC timing selector is factored as `mmc_calculate_clock()` and consumes
+only host/card-advertised modes and the bus width actually verified by CMD19/14;
+HS200/HS400 transitions are named and sequenced by the corresponding upstream
+functions. `mmc_discover_cards()` is the one-selected-card form of FreeBSD's
+multi-child discovery loop. The bus-wide scan/child lifecycle remains outside
+this block-driver model.
