@@ -135,6 +135,9 @@ pub mod i915_gem_object_types_upstream;
 pub mod i915_gem_object_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod i915_gem_region_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod i915_gem_pages_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]

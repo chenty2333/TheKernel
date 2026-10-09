@@ -7,7 +7,7 @@
 #![allow(unsafe_code)]
 
 use core::{
-    ffi::c_void,
+    ffi::{c_char, c_void},
     sync::atomic::{Ordering, fence},
 };
 
@@ -91,6 +91,18 @@ pub fn offset_in_page<T: LinuxUnsigned + PageMask>(value: T) -> T {
     value.bit_and(T::from_page_mask())
 }
 
+/// `memchr_inv()` from lib/string.c: return the first byte not equal to `c`.
+#[inline]
+pub unsafe fn memchr_inv(start: *const c_void, c: i32, bytes: usize) -> *mut c_void {
+    let start = start.cast::<u8>();
+    for i in 0..bytes {
+        if unsafe { *start.add(i) } != c as u8 {
+            return unsafe { start.add(i).cast_mut().cast() };
+        }
+    }
+    core::ptr::null_mut()
+}
+
 pub trait PageMask: LinuxUnsigned {
     fn from_page_mask() -> Self;
 }
@@ -166,6 +178,87 @@ pub fn jiffies() -> u64 {
 #[inline]
 pub fn jiffies_to_msecs<T: LinuxUnsigned>(ticks: T) -> u64 {
     ticks.to_u64().saturating_mul(1000) / crate::linux_config::CONFIG_HZ as u64
+}
+
+/// Linux `udelay()` through the kernel HAL's calibrated busy-wait primitive.
+#[inline]
+pub fn udelay(micros: u32) {
+    axhal::time::busy_wait(core::time::Duration::from_micros(micros as u64));
+}
+
+/// Linux `ktime_to_ms()` for the i915 nanosecond `ktime_t` representation.
+#[inline]
+pub const fn ktime_to_ms(nanoseconds: i64) -> i64 {
+    nanoseconds / 1_000_000
+}
+
+/// Linux `DIV_ROUND_CLOSEST_ULL(n, d)` for unsigned 64-bit quantities.
+#[inline]
+pub const fn div_round_closest_ull(numerator: u64, denominator: u64) -> u64 {
+    numerator.wrapping_add(denominator / 2) / denominator
+}
+
+/// Linux `hex_dump_to_buffer()` for the native-endian grouped words used by
+/// i915's error-state hexdump. The caller supplies a sufficiently large line
+/// buffer, as the upstream call does (128 bytes for at most 32 input bytes).
+pub unsafe fn hex_dump_to_buffer(
+    buf: *const c_void,
+    len: usize,
+    rowsize: usize,
+    groupsize: usize,
+    linebuf: *mut c_char,
+    linebuflen: usize,
+    ascii: bool,
+) -> usize {
+    if buf.is_null() || linebuf.is_null() || linebuflen == 0 {
+        return 0;
+    }
+    let rowsize = if rowsize == 16 || rowsize == 32 { rowsize } else { 16 };
+    let len = core::cmp::min(len, rowsize);
+    let mut groupsize = groupsize;
+    if !groupsize.is_power_of_two() || groupsize > 8 || len % groupsize != 0 {
+        groupsize = 1;
+    }
+
+    let mut written = 0usize;
+    macro_rules! put {
+        ($byte:expr) => {{
+            if written + 1 < linebuflen {
+                unsafe { *linebuf.add(written) = $byte as c_char };
+            }
+            written += 1;
+        }};
+    }
+
+    let bytes = buf.cast::<u8>();
+    let digits = groupsize * 2;
+    let mut pos = 0;
+    while pos < len {
+        let count = core::cmp::min(groupsize, len - pos);
+        let mut word = 0u64;
+        for i in 0..count {
+            word |= (unsafe { *bytes.add(pos + i) } as u64) << (8 * i);
+        }
+        for shift in (0..digits).rev() {
+            let nibble = ((word >> (shift * 4)) & 0xf) as u8;
+            put!(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+        }
+        put!(b' ');
+        pos += count;
+    }
+
+    if ascii {
+        let ascii_column = rowsize * 2 + rowsize / groupsize + 1;
+        while written < ascii_column {
+            put!(b' ');
+        }
+        for i in 0..len {
+            let byte = unsafe { *bytes.add(i) };
+            put!(if byte.is_ascii_graphic() || byte == b' ' { byte } else { b'.' });
+        }
+    }
+    unsafe { *linebuf.add(core::cmp::min(written, linebuflen - 1)) = 0 };
+    written
 }
 
 #[inline]

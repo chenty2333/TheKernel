@@ -187,6 +187,12 @@ pub fn PTR_ERR<T>(pointer: *const T) -> i32 {
     pointer as isize as i32
 }
 
+/// `PTR_ERR_OR_ZERO()` from include/linux/err.h.
+#[inline]
+pub fn PTR_ERR_OR_ZERO<T>(pointer: *const T) -> i32 {
+    if IS_ERR(pointer) { PTR_ERR(pointer) } else { 0 }
+}
+
 #[allow(non_snake_case)]
 pub fn ERR_PTR<T>(error: i32) -> *mut T {
     error as isize as usize as *mut T

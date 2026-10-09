@@ -8,6 +8,11 @@
 
 use core::{ffi::c_void, mem::size_of};
 
+// Implemented by the i915_perf.c source owner; keep the cross-subsystem C ABI.
+unsafe extern "C" {
+    fn i915_oa_init_reg_state(ce: *const IntelContext, engine: *const IntelEngineCs);
+}
+
 use crate::{
     NEEDS_FASTCOLOR_BLT_WABB,
     i915_gem_object_api_upstream::{i915_gem_object_lock, i915_gem_object_unpin_map},
@@ -17,7 +22,8 @@ use crate::{
         __i915_gem_object_flush_map, __i915_gem_object_release_map, i915_gem_object_pin_map,
         page_mask_bits, page_unmask_bits,
     },
-    i915_gem_shmem_upstream::i915_gem_object_create_shmem,
+    i915_gem_lmem_upstream::i915_gem_object_create_lmem,
+    i915_gem_shmem_upstream::{i915_gem_object_create_shmem, shmem_read},
     i915_gem_ww_upstream::{
         I915GemWwCtx, i915_gem_ww_ctx_backoff, i915_gem_ww_ctx_fini, i915_gem_ww_ctx_init,
     },
@@ -47,6 +53,8 @@ use crate::{
     intel_timeline_types_upstream::IntelTimeline,
     intel_timeline_upstream::{intel_timeline_create, intel_timeline_create_from_engine},
     linux::average::ewma_runtime_add,
+    linux::i915::HAS_POOLED_EU,
+    linux::primitives::memchr_inv,
     linux::registers::{MI_LOAD_REGISTER_IMM, REG_FIELD_PREP},
     linux_config::*,
     linux_list::*,
@@ -1213,7 +1221,7 @@ pub(crate) unsafe fn lrc_init_state(
     set_redzone(state, engine);
 
     if !(*ce).default_state.is_null() {
-        shmem_read((*ce).default_state, 0, state, (*engine).context_size);
+        shmem_read((*ce).default_state.cast(), 0, state, (*engine).context_size as usize);
         __set_bit(CONTEXT_VALID_BIT, &mut (*ce).flags);
         inhibit = false;
     }
@@ -1582,7 +1590,7 @@ unsafe fn xehp_emit_fastcolor_blt_wabb(ce: *const IntelContext, mut cs: *mut u32
     // Wa_16018031267 / Wa_16018063123: emit four zero-byte-write fast-color subblits.
     *cs = XY_FAST_COLOR_BLT_CMD | (16 - 2);
     cs = cs.add(1);
-    *cs = REG_FIELD_PREP(XY_FAST_COLOR_BLT_MOCS_MASK, mocs) | 0x3f;
+    *cs = REG_FIELD_PREP(XY_FAST_COLOR_BLT_MOCS_MASK, mocs as u32) | 0x3f;
     cs = cs.add(1);
     *cs = 0;
     cs = cs.add(1);
@@ -1616,7 +1624,7 @@ unsafe fn xehp_emit_fastcolor_blt_wabb(ce: *const IntelContext, mut cs: *mut u32
 // upstream: intel_lrc.c xehp_emit_per_ctx_bb()
 unsafe fn xehp_emit_per_ctx_bb(ce: *const IntelContext, mut cs: *mut u32) -> *mut u32 {
     // Wa_16018031267, Wa_16018063123.
-    if NEEDS_FASTCOLOR_BLT_WABB!((*(*ce).engine)) {
+    if NEEDS_FASTCOLOR_BLT_WABB!((*ce).engine) {
         cs = xehp_emit_fastcolor_blt_wabb(ce, cs);
     }
     cs
@@ -1780,7 +1788,7 @@ unsafe fn gen8_emit_flush_coherentl3_wa(
     batch = batch.add(1);
     *batch = i915_mmio_reg_offset(GEN8_L3SQCREG4);
     batch = batch.add(1);
-    *batch = intel_gt_scratch_offset((*engine).gt, INTEL_GT_SCRATCH_FIELD_COHERENTL3_WA);
+    *batch = intel_gt_scratch_offset((*engine).gt, INTEL_GT_SCRATCH_FIELD_COHERENTL3_WA as i32);
     batch = batch.add(1);
     *batch = 0;
     batch = batch.add(1);
@@ -1801,7 +1809,7 @@ unsafe fn gen8_emit_flush_coherentl3_wa(
     batch = batch.add(1);
     *batch = i915_mmio_reg_offset(GEN8_L3SQCREG4);
     batch = batch.add(1);
-    *batch = intel_gt_scratch_offset((*engine).gt, INTEL_GT_SCRATCH_FIELD_COHERENTL3_WA);
+    *batch = intel_gt_scratch_offset((*engine).gt, INTEL_GT_SCRATCH_FIELD_COHERENTL3_WA as i32);
     batch = batch.add(1);
     *batch = 0;
     batch = batch.add(1);

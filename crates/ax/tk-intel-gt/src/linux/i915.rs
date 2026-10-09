@@ -317,7 +317,7 @@ impl<'a> Iterator for IntelEngineIterator<'a> {
     type Item = &'a IntelEngineCs;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.index < I915_NUM_ENGINES {
+        while self.index < I915_NUM_ENGINES as usize {
             let index = self.index;
             self.index += 1;
             // SAFETY: the iterator's lifetime is bounded by the caller's GT
@@ -373,9 +373,18 @@ pub struct IntelRuntimeInfo {
     _tail: [u8; 3],
 }
 
+/// `HAS_POOLED_EU(i915)` from intel_device_info.h.
+#[inline]
+pub unsafe fn HAS_POOLED_EU(i915: *const DrmI915Private) -> bool {
+    assert!(!i915.is_null());
+    let info = unsafe { (*i915).info.cast::<IntelDeviceInfoOverlay>() };
+    assert!(!info.is_null());
+    unsafe { (*info).runtime.has_pooled_eu }
+}
+
 /// `intel_device_info` layout from the wt-dev Linux 7.2.3 compile oracle.
 /// `is_dgfx` is bit 2 in the first byte of `DEV_INFO_FOR_EACH_FLAG`.
-#[repr(C)]
+#[repr(C, align(8))]
 pub struct IntelDeviceInfoOverlay {
     _prefix: [u8; 16],
     pub gt: u8,
@@ -414,6 +423,13 @@ pub unsafe fn HAS_L3_CCS_READ<P: I915PrivatePtr>(i915: P) -> bool {
 pub unsafe fn tuning_thread_rr_after_dep<P: I915PrivatePtr>(i915: P) -> bool {
     let info = unsafe { INTEL_INFO(i915) };
     !info.is_null() && (unsafe { (*info).flags[4] } & (1 << 2)) != 0
+}
+
+/// Source `HWS_NEEDS_PHYSICAL(i915)` bit from `DEV_INFO_FOR_EACH_FLAG`.
+#[allow(non_snake_case)]
+pub unsafe fn HWS_NEEDS_PHYSICAL<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = unsafe { INTEL_INFO(i915) };
+    !info.is_null() && (unsafe { (*info).flags[4] } & (1 << 4)) != 0
 }
 
 /// `HAS_FLAT_CCS(i915)` from i915_drv.h; source flag bit 9.

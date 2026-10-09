@@ -57,6 +57,10 @@ pub fn lockdep_pin_lock<T>(_lock: &mut T) -> PinCookie {
 #[inline]
 pub fn lockdep_unpin_lock<T>(_lock: &mut T, _cookie: PinCookie) {}
 
+/// `lockdep_set_class_and_name()` compiles away with the source CONFIG_LOCKDEP=n.
+#[inline]
+pub fn lockdep_set_class_and_name<L, K, N>(_lock: *mut L, _key: *const K, _name: *const N) {}
+
 #[cfg(all(target_os = "none", not(target_arch = "x86_64")))]
 compile_error!("the translated i915 GT spinlock layout is the wt-dev x86_64 layout");
 

@@ -17,6 +17,7 @@ use crate::{
     i915_gem_object_types_upstream::{
         DrmI915GemObject, I915_BO_ALLOC_PM_VOLATILE, I915_BO_ALLOC_VOLATILE, I915_BO_READONLY,
     },
+    i915_gem_lmem_upstream::i915_gem_object_create_lmem,
     i915_request_types_upstream::I915Request,
     i915_vma_types_upstream::{I915_VMA_CAN_FENCE_BIT, I915_VMA_GGTT_WRITE_BIT, I915Vma},
     intel_context_upstream::{I915AddressSpace, I915GemWwCtx, I915GttView, Kref},
@@ -37,11 +38,6 @@ const INTEL_I830: u32 = 1;
 const INTEL_I845G: u32 = 2;
 
 unsafe extern "C" {
-    fn i915_gem_object_create_lmem(
-        i915: *mut DrmI915Private,
-        size: u64,
-        flags: u32,
-    ) -> *mut DrmI915GemObject;
     fn i915_gem_object_create_stolen(i915: *mut DrmI915Private, size: u64)
     -> *mut DrmI915GemObject;
     pub fn i915_gem_object_create_internal(
