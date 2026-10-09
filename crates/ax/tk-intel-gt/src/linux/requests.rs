@@ -22,6 +22,12 @@ use crate::{
     },
 };
 
+// Linux v7.2.3 include/linux/dma-fence.h: generic per-driver fence-context
+// allocator. This is a real kernel C ABI binding, not an i915 substitute.
+unsafe extern "C" {
+    pub fn dma_fence_context_alloc(num: u32) -> u64;
+}
+
 /// `dma_fence_put()` is the header-inline `kref_put(..., dma_fence_release)`
 /// operation. It dispatches the optional source ops release callback or
 /// reclaims through the `dma_fence_free()` RCU path when none is supplied.
