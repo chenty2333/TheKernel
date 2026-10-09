@@ -124,3 +124,7 @@ The upstream `sdhci_retune()` state transition is represented by a small pending
 bit latch; CMD19/CMD21 retuning executes from the next request path, never in
 the interrupt top half. Periodic interval checks are likewise request-driven,
 not a dedicated callout worker.
+
+The N305 eMMC `mmc.allow_write` policy is captured in each hotplug slot before
+first attach, survives failed enumeration, and is ORed with card write-protect
+on each retry; ordinary AHCI disks remain writable by default.

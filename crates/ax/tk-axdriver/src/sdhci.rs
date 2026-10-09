@@ -287,6 +287,9 @@ struct SdhciHotplugSlot {
     vendor_id: u16,
     device_id: u16,
     disk_index: usize,
+    /// Slot-level write policy retained even when initial card enumeration
+    /// fails and a later insertion causes a fresh `SdhciDisk::attach`.
+    read_only: bool,
     present: bool,
 }
 
@@ -510,6 +513,7 @@ fn probe_slot(
                     vendor_id: info.vendor_id,
                     device_id: info.device_id,
                     disk_index,
+                    read_only,
                     present: false,
                 }),
             );
@@ -572,6 +576,7 @@ fn probe_slot(
             vendor_id: info.vendor_id,
             device_id: info.device_id,
             disk_index,
+            read_only,
             present: true,
         }),
     )
@@ -644,7 +649,8 @@ fn sdhci_handle_card_present_locked(slot: &mut SdhciHotplugSlot) {
         return;
     };
     disk.log_card();
-    let read_only = disk.is_read_only();
+    let read_only =
+        axdriver_block::sdhci::sdhci_effective_read_only(slot.read_only, disk.is_read_only());
     let areas = disk.into_partition_devices(read_only, slot.disk_index);
     let user_name = alloc::format!("mmcblk{}", slot.disk_index);
     let mut published_user = false;
@@ -732,6 +738,45 @@ pub(crate) fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_initial_attach_keeps_emmc_write_policy_for_hotplug_retry() {
+        let slot = SdhciHotplugSlot {
+            io: SdhciWindow {
+                base: NonNull::dangling(),
+                size: 0,
+                irq: None,
+                irq_context: None,
+                irq_signal_usable: false,
+            },
+            capabilities: 0,
+            capabilities2: 0,
+            version: 0,
+            quirks: 0,
+            vendor_id: INTEL_EMMC_VID,
+            device_id: INTEL_EMMC_DID,
+            disk_index: 0,
+            read_only: true,
+            present: false,
+        };
+
+        // The first card initialization failed, so the worker retains this
+        // slot and retries attach after card-detect rises.
+        assert!(!slot.present);
+        // Re-attach sees a card whose write-protect switch is off; the
+        // retained slot policy must still force a read-only publication.
+        let retry_disk_write_protected = false;
+        assert!(axdriver_block::sdhci::sdhci_effective_read_only(
+            slot.read_only,
+            retry_disk_write_protected
+        ));
+        // With mmc.allow_write=1 the slot policy is writable and the card
+        // switch decides.
+        assert!(!axdriver_block::sdhci::sdhci_effective_read_only(
+            false,
+            retry_disk_write_protected
+        ));
+    }
 
     #[test]
     fn freebsd_pci_quirks_are_selected_for_exact_controller_ids() {

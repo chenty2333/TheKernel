@@ -602,6 +602,13 @@ pub enum MmcVccq {
     V330,
 }
 
+/// Combine the persistent slot policy with the card's physical write-protect
+/// indication. A card that appears after a failed first attach must inherit
+/// the policy even when its own write-protect pin is deasserted.
+pub const fn sdhci_effective_read_only(slot_policy: bool, card_write_protected: bool) -> bool {
+    slot_policy || card_write_protected
+}
+
 // upstream: mmc.c mmc_set_vccq() voltage preference for one card timing
 pub const fn select_mmc_vccq(supports_120: bool, supports_180: bool) -> MmcVccq {
     if supports_120 {
@@ -3436,6 +3443,17 @@ mod tests {
     use crate::{BaseDriverOps, BlockDriverOps};
 
     static DMA_RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn hotplug_reattach_inherits_slot_write_policy() {
+        // Slot policy (mmc.allow_write not set) must dominate a writable card.
+        assert!(sdhci_effective_read_only(true, false));
+        assert!(sdhci_effective_read_only(true, true));
+        // A card's own write-protect switch applies even when policy allows writes.
+        assert!(sdhci_effective_read_only(false, true));
+        // Writable slot and writable card publish writable areas.
+        assert!(!sdhci_effective_read_only(false, false));
+    }
 
     unsafe fn record_dma_release(_: NonNull<u8>, _: usize) {
         DMA_RELEASES.fetch_add(1, Ordering::Relaxed);
