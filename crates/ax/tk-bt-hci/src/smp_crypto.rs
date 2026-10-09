@@ -205,6 +205,24 @@ mod tests {
     fn cmac_rfc4493_and_core_f4_f5_f6_g2_ah_vectors() {
         let key = hex("2b7e151628aed2a6abf7158809cf4f3c");
         assert_eq!(aes_cmac(&key, &[]), hex("bb1d6929e95937287fa37d129b756746"));
+        let message = hex::<64>(concat!(
+            "6bc1bee22e409f96e93d7e117393172a",
+            "ae2d8a571e03ac9c9eb76fac45af8e51",
+            "30c81c46a35ce411e5fbc1191a0a52ef",
+            "f69f2445df4f9b17ad2b417be66c3710"
+        ));
+        assert_eq!(
+            aes_cmac(&key, &message[..16]),
+            hex("070a16b46b4d4144f79bdd9dd04a287c")
+        );
+        assert_eq!(
+            aes_cmac(&key, &message[..40]),
+            hex("dfa66747de9ae63030ca32611497c827")
+        );
+        assert_eq!(
+            aes_cmac(&key, &message),
+            hex("51f0bebf7e3b9d92fc49741779363cfe")
+        );
         let u = hex("20b003d2f297be2c5e2c83a7e9f9a5b9eff49111acf4fddbcc0301480e359de6");
         let v = hex("55188b3d32f6bb9a900afcfbeed4e72a59cb9ac2f19d7cfb6b4fdd49f47fc5fd");
         let x = hex("d5cb8454d177733effffb2ec712baeab");
