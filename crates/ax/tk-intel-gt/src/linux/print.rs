@@ -975,6 +975,20 @@ macro_rules! gt_notice {
     }};
 }
 
+/// `guc_notice()` from `intel_guc_print.h`: retain the GuC tag/prefix while
+/// logging through the owning GT at Linux's notice level.
+macro_rules! guc_notice {
+    ($guc:expr, $format:literal $(, $argument:expr)* $(,)?) => {{
+        let __guc = $guc;
+        let __gt = unsafe {
+            $crate::intel_gt_api_upstream::guc_to_gt(
+                __guc as *mut $crate::intel_guc_types_upstream::IntelGuc,
+            )
+        };
+        gt_notice!(__gt, concat!("GUC: ", $format) $(, $argument)*);
+    }};
+}
+
 macro_rules! gt_dbg {
     ($gt:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
         let __gt = $gt;
