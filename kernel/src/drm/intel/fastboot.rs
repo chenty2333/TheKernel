@@ -3,10 +3,13 @@
 //! admitted modes may change the DKL PLL, transcoder timing, and plane while
 //! retaining the captured WM/DDB policy. Uses MIT i915 readouts/programming in
 //! `tk-intel-display`; adapter/ownership policy is original TheKernel code.
-//! Only pipe-A, opaque linear XR24, no scaling/color/DSC/VRR is admitted.
+//! Only pipe-A, opaque linear XR24/RG16, no scaling/color/DSC/VRR is admitted.
 //! Hardware writes remain opt-in.
 use alloc::{format, string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU32, Ordering, fence};
+use core::{
+    cell::Cell,
+    sync::atomic::{AtomicU32, Ordering, fence},
+};
 
 use intel_display::{
     Error, RegisterIo,
@@ -23,7 +26,7 @@ use spin::Mutex;
 use super::{
     gmbus::PollTimer,
     gtt::{Binding, Gtt},
-    regs::{Meaning, Register, Registers, pipe as p},
+    regs::{self, Meaning, Register, Registers, pipe as p},
 };
 use crate::{
     drm::{
@@ -136,11 +139,12 @@ fn firmware_4k30() -> crate::drm::modes::Mode {
 }
 
 fn native_modes(
-    edid: &[u8],
+    edid_bytes: &[u8],
     f: &Firmware,
 ) -> Result<(Vec<NativeMode>, NativeMode, NativeMode), Error> {
     use crate::drm::modes::{Edid, ModeList, collect_modes};
-    let edid = Edid::parse_lossy(edid).map_err(|_| Error::Refused)?;
+    let edid = Edid::parse_lossy(edid_bytes).map_err(|_| Error::Refused)?;
+    let sink_tmds_limit = edid.max_tmds_clock_khz();
     let mut candidates = ModeList::new();
     collect_modes(&edid, &mut candidates);
     let current_timing = firmware_timing(f)?;
@@ -161,6 +165,12 @@ fn native_modes(
         crate::drm::intel::modeset::is_reference_timing(mode)
             && mode.clock_khz == 148_500
             && cta_vic(mode) == Some(16)
+            && super::tc_modeset::source_hdmi_tmds_clock_with_limit(
+                mode,
+                sink_tmds_limit,
+                intel_display::intel_hdmi_full::HdmiPortClass::TypeC,
+            )
+            .is_some()
     }) {
         let target = NativeMode {
             timing: target,
@@ -168,7 +178,7 @@ fn native_modes(
             vic: 16,
         };
         if !target.timing.same_timing(&current.timing)
-            && pitch_for(target.kms.width)
+            && pitch_for(target.kms.width, 4)
                 .is_some_and(|pitch| retained_watermark_budget(f, target, pitch))
             && intel_display::dpll_mgr::icl_calc_mg_pll_state(
                 target.timing.clock_khz,
@@ -263,13 +273,15 @@ impl<R: Registers> TcIo for PinnedIo<'_, R> {
     }
 }
 #[derive(Clone, Copy)]
-struct PowerPin {
+pub(super) struct PowerPin {
+    port: TcPort,
     offsets: [u32; 3],
     before: [u32; 3],
     masks: [u32; 3],
 }
+
 impl PowerPin {
-    fn acquire(r: &impl Registers, port: TcPort) -> Result<Self, Error> {
+    pub(super) fn acquire(r: &impl Registers, port: TcPort) -> Result<Self, Error> {
         // i915 XELPD power map: PW1, PW2 and PWA; DDI_IO and legacy AUX.
         // AUX is the ADL-P legacy TC-cold blocker. No cold-exit/enable sequence
         // is attempted: every required well must already be live before writes.
@@ -290,6 +302,7 @@ impl PowerPin {
             }
         }
         let pin = Self {
+            port,
             offsets,
             before,
             masks,
@@ -325,6 +338,44 @@ impl PowerPin {
         }
         Ok(())
     }
+
+    /// Revalidate the long-lived fastboot lease before a shared-DPLL adapter
+    /// uses its read-only logical power references. This never requests or
+    /// releases a well: it proves the source-map-backed pin is still held,
+    /// DC states remain disabled, and the oscillator still matches the
+    /// firmware-captured DPLL reference clock.
+    pub(super) fn verify_dpll_context(
+        &self,
+        r: &impl Registers,
+        port: TcPort,
+        reference_khz: u32,
+    ) -> Result<(), Error> {
+        if self.port != port || port.index() > 1 {
+            return Err(Error::Refused);
+        }
+        self.held(r)?;
+        if read(r, 0x45504)? & super::power::DC_STATE_MASK != 0 {
+            return Err(Error::Refused);
+        }
+        let reference = match r
+            .read(regs::SKL_DSSM)
+            .ok_or(Error::Unavailable(regs::SKL_DSSM.offset()))?
+            >> 29
+        {
+            0 => 24_000,
+            1 => 19_200,
+            2 => 38_400,
+            _ => return Err(Error::Refused),
+        };
+        if reference != reference_khz {
+            return Err(Error::Refused);
+        }
+        Ok(())
+    }
+
+    pub(super) const fn port(&self) -> TcPort {
+        self.port
+    }
     fn restore(&self, r: &impl Registers) -> Result<(), Error> {
         for i in (0..3).rev() {
             let current =
@@ -344,6 +395,71 @@ impl PowerPin {
         Ok(())
     }
 }
+/// Nested lease of the already-live TC route; never powers a cold well or
+/// drops the firmware-preserving parent's driver requests.
+struct NativeTcPower<'a, R> {
+    registers: &'a R,
+    parent: &'a PowerPin,
+    lease: Option<PowerPin>,
+}
+impl<R: Registers> super::power::NativePowerOps for NativeTcPower<'_, R> {
+    fn power_domain_get(
+        &mut self,
+        domain: intel_display::power_map::PowerDomain,
+    ) -> Result<(), super::power::PowerError> {
+        if domain != intel_display::power_map::PowerDomain::PipeA || self.lease.is_some() {
+            return Err(super::power::PowerError::PowerDomain(String::from(
+                "unsupported TC lease",
+            )));
+        }
+        self.lease = Some(
+            PowerPin::acquire(self.registers, self.parent.port).map_err(|e| {
+                super::power::PowerError::PowerDomain(format!("TC lease get: {e:?}"))
+            })?,
+        );
+        Ok(())
+    }
+    fn power_domain_put(
+        &mut self,
+        domain: intel_display::power_map::PowerDomain,
+    ) -> Result<(), super::power::PowerError> {
+        if domain != intel_display::power_map::PowerDomain::PipeA {
+            return Err(super::power::PowerError::PowerDomain(String::from(
+                "wrong TC lease",
+            )));
+        }
+        let lease = self.lease.as_ref().ok_or_else(|| {
+            super::power::PowerError::PowerDomain(String::from("unpaired TC put"))
+        })?;
+        lease
+            .restore(self.registers)
+            .map_err(|e| super::power::PowerError::PowerDomain(format!("TC lease put: {e:?}")))?;
+        self.lease = None;
+        Ok(())
+    }
+    fn dc_state_exit(&mut self) -> Result<(), super::power::PowerError> {
+        self.parent
+            .held(self.registers)
+            .and_then(|()| {
+                if read(self.registers, 0x45504)? & super::power::DC_STATE_MASK == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::Refused)
+                }
+            })
+            .map_err(|e| super::power::PowerError::PowerDomain(format!("TC DC-off lease: {e:?}")))
+    }
+    fn dc_state_enter(&mut self) -> Result<bool, super::power::PowerError> {
+        self.dc_state_exit()?;
+        Ok(false)
+    }
+    fn set_dc_state_target(&mut self, _: u32) -> Result<bool, super::power::PowerError> {
+        Err(super::power::PowerError::PowerDomain(String::from(
+            "persistent TC lease forbids DC entry",
+        )))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Firmware {
     pipe: intel_display::pipe_config::PipeConfig,
@@ -411,7 +527,7 @@ fn capture(
         universal_plane::Plane::PRIMARY,
     )?
     .ok_or(Error::Refused)?;
-    if !plane.native_linear_xrgb()
+    if !plane.native_linear_rgb()
         || plane.offset != 0
         || (plane.width, plane.height) != pipe.source
         || read(r, 0x7018c)? != 0
@@ -630,6 +746,7 @@ struct Bound {
 struct State {
     firmware: Firmware,
     current_mode: NativeMode,
+    current_format: u32,
     connected: bool,
     last_hpd_poll: u64,
     last_hpd_irq: Option<u64>,
@@ -649,15 +766,632 @@ struct Native<R, T> {
     timer: T,
     gtt: Arc<Gtt>,
     power: PowerPin,
+    shared_dpll: Mutex<super::shared_dpll::SharedDpllState>,
     baseline: Firmware,
     modes: Vec<NativeMode>,
     preferred: DrmMode,
     sink_edid: Vec<u8>,
     afc_startup: Option<u8>,
+    watermark: super::pipe::WatermarkConfig,
     port: TcPort,
     pci: axdriver_display::DisplayPciIdentity,
     irq_event_sequence: AtomicU32,
     state: Mutex<State>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeModesetPath {
+    /// Preserve the established transactional TC modeset and rollback.
+    LegacyTc,
+    /// Source-ordered single-pipe TC atomic commit tail (explicit opt-in).
+    NativeAtomic,
+}
+
+fn select_native_modeset_path(value: Option<&str>) -> NativeModesetPath {
+    if value == Some("1") {
+        NativeModesetPath::NativeAtomic
+    } else {
+        NativeModesetPath::LegacyTc
+    }
+}
+
+/// Re-read the selected TC PLL through the translated generic manager while
+/// the Native-owned pin keeps the source-mapped display/PHY domains alive.
+fn translated_tc_dpll_readout<R: Registers, T: PollTimer>(
+    native: &Native<R, T>,
+) -> Result<(bool, intel_display::intel_dpll_mgr_full::IntelDpllHwState), String> {
+    let identity = super::shared_dpll::AdlNIdentity::verify(
+        native.pci.vendor_id,
+        native.pci.device_id,
+        native.pci.revision,
+    )
+    .map_err(|error| format!("shared DPLL identity changed: {error:?}"))?;
+    let mut power =
+        super::shared_dpll::PinnedDpllPower::new(&native.power, identity, native.baseline.refclk)
+            .map_err(|error| format!("shared DPLL power context unavailable: {error:?}"))?;
+    native
+        .shared_dpll
+        .lock()
+        .get_hw_state(
+            &native.registers,
+            &native.timer,
+            &mut power,
+            (3 + native.port.index()) as usize,
+        )
+        .map_err(|error| format!("translated shared DPLL readout refused: {error:?}"))
+}
+
+struct NativeDpllTransition {
+    undo: super::shared_dpll::SharedDpllUndo,
+    old: intel_display::intel_dpll_mgr_full::CrtcState,
+    new: intel_display::intel_dpll_mgr_full::CrtcState,
+}
+
+/// Reserve the target through the persistent translated DPLL manager, require
+/// it to match the DKL state consumed by the bounded TC transaction, and swap
+/// its software state before programming. The DKL hardware callbacks run from
+/// `tc_modeset`; the outer transaction retains the independently verified
+/// hardware before-image and software undo token.
+fn translated_tc_dpll_target<R: Registers, T: PollTimer>(
+    native: &Native<R, T>,
+    target_port_clock_khz: u32,
+    expected: &intel_display::dpll_mgr::DklPllState,
+) -> Result<NativeDpllTransition, String> {
+    let identity = super::shared_dpll::AdlNIdentity::verify(
+        native.pci.vendor_id,
+        native.pci.device_id,
+        native.pci.revision,
+    )
+    .map_err(|error| format!("shared DPLL identity changed: {error:?}"))?;
+    let mut power =
+        super::shared_dpll::PinnedDpllPower::new(&native.power, identity, native.baseline.refclk)
+            .map_err(|error| format!("shared DPLL power context unavailable: {error:?}"))?;
+    let mut manager = native.shared_dpll.lock();
+    let mut atomic = manager
+        .plan_tc_atomic_transition(
+            &native.registers,
+            &native.timer,
+            &mut power,
+            target_port_clock_khz,
+        )
+        .map_err(|error| format!("translated DPLL target compute failed: {error:?}"))?;
+    let old = atomic.old_crtcs[0];
+    let new = atomic.new_crtcs[0];
+    let source_state = atomic.new_crtcs[0].dpll_hw_state;
+    if super::shared_dpll::dkl_state_matches_source_readout(
+        expected,
+        &source_state,
+        native.afc_startup.is_some(),
+    ) {
+        let undo = manager
+            .swap_atomic(&mut atomic)
+            .map_err(|error| format!("translated DPLL atomic-state swap failed: {error:?}"))?;
+        Ok(NativeDpllTransition { undo, old, new })
+    } else {
+        Err(String::from(
+            "translated shared-DPLL calculation disagrees with the TC DKL target image",
+        ))
+    }
+}
+
+/// Supply the captured N305 Pipe-A/HDMI image to the translated display-12/13
+/// modeset verifier. Source warnings become a transaction failure here because
+/// a post-program mismatch must trigger the existing verified rollback path.
+struct NativeModesetVerify<'a> {
+    firmware: &'a Firmware,
+    port: TcPort,
+    connected: bool,
+    failure: Option<String>,
+}
+
+impl NativeModesetVerify<'_> {
+    fn warn(&mut self, condition: bool, format: &'static str, values: &[i64]) {
+        if condition && self.failure.is_none() {
+            self.failure = Some(alloc::format!("{format} {values:?}"));
+        }
+    }
+}
+
+impl intel_display::intel_modeset_verify_full::ModesetVerifyIo for NativeModesetVerify<'_> {
+    fn display_state_warn(
+        &mut self,
+        _display: &intel_display::intel_modeset_verify_full::Display,
+        condition: bool,
+        format: &'static str,
+        values: &[i64],
+    ) {
+        self.warn(condition, format, values);
+    }
+
+    fn drm_warn(&mut self, _drm: u32, condition: bool, format: &'static str, values: &[i64]) {
+        self.warn(condition, format, values);
+    }
+
+    fn connector_get_hw_state(
+        &mut self,
+        _connector: &intel_display::intel_modeset_verify_full::Connector,
+    ) -> bool {
+        self.connected
+            && self.firmware.ddi.enabled
+            && self.firmware.ddi.mode == intel_display::ddi::DdiMode::Hdmi
+            && self.firmware.ddi.port
+                == Some(match self.port {
+                    TcPort::Tc1 => Port::Tc1,
+                    TcPort::Tc2 => Port::Tc2,
+                    TcPort::Tc3 => Port::Tc3,
+                    TcPort::Tc4 => Port::Tc4,
+                })
+    }
+
+    fn attached_encoder(
+        &mut self,
+        _connector: &intel_display::intel_modeset_verify_full::Connector,
+    ) -> Option<u32> {
+        (self.firmware.ddi.enabled
+            && self.firmware.ddi.port
+                == Some(match self.port {
+                    TcPort::Tc1 => Port::Tc1,
+                    TcPort::Tc2 => Port::Tc2,
+                    TcPort::Tc3 => Port::Tc3,
+                    TcPort::Tc4 => Port::Tc4,
+                })
+            && self.firmware.ddi.mode == intel_display::ddi::DdiMode::Hdmi)
+            .then_some(1)
+    }
+
+    fn encoder_get_hw_state(
+        &mut self,
+        _encoder: &intel_display::intel_modeset_verify_full::Encoder,
+    ) -> (bool, intel_display::intel_modeset_verify_full::Pipe) {
+        (
+            self.connected && self.firmware.ddi.enabled,
+            intel_display::intel_modeset_verify_full::Pipe::A,
+        )
+    }
+
+    fn alloc_crtc_state(
+        &mut self,
+        _crtc: &intel_display::intel_modeset_verify_full::Crtc,
+    ) -> Option<intel_display::intel_modeset_verify_full::CrtcState> {
+        Some(intel_display::intel_modeset_verify_full::CrtcState::default())
+    }
+
+    fn get_pipe_config(&mut self, state: &mut intel_display::intel_modeset_verify_full::CrtcState) {
+        state.hw.active = self.firmware.pipe.transconf & (1 << 31) != 0;
+        state.hw.adjusted_mode_crtc_clock = self.firmware.pixel_clock as i32;
+    }
+
+    fn encoder_get_config(
+        &mut self,
+        _encoder: &intel_display::intel_modeset_verify_full::Encoder,
+        state: &mut intel_display::intel_modeset_verify_full::CrtcState,
+    ) {
+        state.hw.adjusted_mode_crtc_clock = self.firmware.pixel_clock as i32;
+    }
+
+    fn pipe_config_compare(
+        &mut self,
+        software: &intel_display::intel_modeset_verify_full::CrtcState,
+        hardware: &intel_display::intel_modeset_verify_full::CrtcState,
+        _fastset: bool,
+    ) -> bool {
+        software.hw.active == hardware.hw.active
+            && software.hw.adjusted_mode_crtc_clock == hardware.hw.adjusted_mode_crtc_clock
+    }
+}
+
+struct NativeDpllLifecycle<'a, R, T> {
+    manager: &'a mut super::shared_dpll::SharedDpllState,
+    registers: &'a R,
+    timer: &'a T,
+    power_pin: &'a PowerPin,
+    identity: super::shared_dpll::AdlNIdentity,
+    refclk_khz: u32,
+    old: intel_display::intel_dpll_mgr_full::CrtcState,
+    new: intel_display::intel_dpll_mgr_full::CrtcState,
+}
+
+impl<R: Registers, T: PollTimer> super::tc_modeset::DpllLifecycle
+    for NativeDpllLifecycle<'_, R, T>
+{
+    fn disable(&mut self) -> Result<(), String> {
+        let mut power = super::shared_dpll::PinnedDpllPower::new(
+            self.power_pin,
+            self.identity,
+            self.refclk_khz,
+        )
+        .map_err(|error| format!("shared DPLL power context unavailable: {error:?}"))?;
+        self.manager
+            .disable(self.registers, self.timer, &mut power, &self.old)
+            .map_err(|error| format!("translated shared DPLL disable failed: {error:?}"))
+    }
+
+    fn enable(&mut self) -> Result<(), String> {
+        let mut power = super::shared_dpll::PinnedDpllPower::new(
+            self.power_pin,
+            self.identity,
+            self.refclk_khz,
+        )
+        .map_err(|error| format!("shared DPLL power context unavailable: {error:?}"))?;
+        self.manager
+            .enable(self.registers, self.timer, &mut power, &self.new)
+            .map_err(|error| format!("translated shared DPLL enable failed: {error:?}"))
+    }
+    fn rollback_new(&mut self) -> Result<(), String> {
+        let mut power = super::shared_dpll::PinnedDpllPower::new(
+            self.power_pin,
+            self.identity,
+            self.refclk_khz,
+        )
+        .map_err(|e| format!("native PLL rollback power: {e:?}"))?;
+        self.manager
+            .disable(self.registers, self.timer, &mut power, &self.new)
+            .map_err(|e| format!("native PLL rollback disable: {e:?}"))
+    }
+    fn release_new(&mut self) -> Result<(), String> {
+        let mut power = super::shared_dpll::PinnedDpllPower::new(
+            self.power_pin,
+            self.identity,
+            self.refclk_khz,
+        )
+        .map_err(|e| format!("native PLL release power: {e:?}"))?;
+        self.manager
+            .release_stopped_tc(self.registers, self.timer, &mut power)
+            .map_err(|e| format!("native PLL rollback release: {e:?}"))
+    }
+}
+
+struct NativeClockLifecycle<'a, R, T> {
+    registers: &'a R,
+    timer: &'a T,
+    before: super::clk::CdclkObservation,
+}
+
+impl<R: Registers, T: PollTimer> NativeClockLifecycle<'_, R, T> {
+    fn read_register(&self, offset: u32) -> Result<u32, String> {
+        read(self.registers, offset)
+            .map_err(|error| format!("CDCLK safety read {offset:#x} failed: {error:?}"))
+    }
+
+    fn require_all_consumers_disabled(&self) -> Result<(), String> {
+        for register in [p::PIPECONF_A, p::PIPECONF_B, p::PIPECONF_C, p::PIPECONF_D] {
+            if self.read_register(register.offset())? & (1 << 31) != 0 {
+                return Err(format!(
+                    "CDCLK transition refused while {} is enabled",
+                    register.name()
+                ));
+            }
+        }
+        for register in [
+            regs::ddi::TRANS_DDI_FUNC_CTL_A,
+            regs::ddi::TRANS_DDI_FUNC_CTL_B,
+            regs::ddi::TRANS_DDI_FUNC_CTL_C,
+            regs::ddi::TRANS_DDI_FUNC_CTL_D,
+        ] {
+            if self.read_register(register.offset())? & (1 << 31) != 0 {
+                return Err(format!(
+                    "CDCLK transition refused while {} is enabled",
+                    register.name()
+                ));
+            }
+        }
+        // DDI_BUF_CTL belongs to the port, not the transcoder. Verify every
+        // source port window rather than inferring inactivity from Pipe-A's
+        // current route. An inaccessible peer port is not proof that its
+        // buffer is off.
+        for port in 0..6u32 {
+            let offset = 0x64000 + port * 0x100;
+            if self.read_register(offset)? & (1 << 31) != 0 {
+                return Err(format!(
+                    "CDCLK transition refused while DDI_BUF_CTL({port}) is enabled"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn transition(
+        &self,
+        current: super::clk::CdclkObservation,
+        target: super::clk::CdclkEntry,
+        pipe: Option<u8>,
+    ) -> Result<(), String> {
+        if !current.usable() {
+            return Err(String::from(
+                "CDCLK transition requires a usable current state",
+            ));
+        }
+        self.require_all_consumers_disabled()?;
+        super::pcode::prepare_cdclk_change(self.registers, self.timer)
+            .map_err(|error| format!("CDCLK PCode PREPARE failed: {error:?}"))?;
+        let transition = super::clk::transition(self.registers, current, target, pipe, true)
+            .map_err(|error| format!("CDCLK source transition failed: {}", error.describe()))?;
+        if !transition.after.usable()
+            || transition.after.entry != Some(target)
+            || transition.after.cdclk_khz != target.cdclk_khz
+        {
+            return Err(String::from("CDCLK transition target did not read back"));
+        }
+        super::pcode::commit_cdclk_voltage(self.registers, self.timer, transition.after.cdclk_khz)
+            .map_err(|error| format!("CDCLK PCode voltage update failed: {error:?}"))
+    }
+
+    fn adjust_native(
+        &mut self,
+        target_clock_khz: u32,
+        restore_before_image: bool,
+    ) -> Result<(), String> {
+        let current = super::clk::observe(self.registers)
+            .map_err(|error| format!("CDCLK readout failed: {}", error.describe()))?;
+        if restore_before_image {
+            if current.entry == self.before.entry
+                && current.cdclk_khz == self.before.cdclk_khz
+                && current.pipe_field == self.before.pipe_field
+            {
+                return Ok(());
+            }
+            let target = self
+                .before
+                .entry
+                .ok_or_else(|| String::from("saved CDCLK has no restorable source table row"))?;
+            let pipe = match self.before.pipe_field {
+                0..=3 => Some(self.before.pipe_field as u8),
+                7 => None,
+                field => {
+                    return Err(format!(
+                        "saved CDCLK pipe selector {field} cannot be restored"
+                    ));
+                }
+            };
+            return self.transition(current, target, pipe);
+        }
+
+        if !current.usable() {
+            return Err(String::from(
+                "CDCLK mode change requires a usable current state",
+            ));
+        }
+        if target_clock_khz <= current.cdclk_khz {
+            return Ok(());
+        }
+        if self.before.entry.is_none() {
+            return Err(String::from(
+                "CDCLK raise refused because the firmware before-image has no source table row",
+            ));
+        }
+        let target = super::clk::entry_at_least(current.reference, target_clock_khz)
+            .ok_or_else(|| format!("no CDCLK table row can carry {target_clock_khz} kHz"))?;
+        self.transition(current, target, None)
+    }
+}
+
+/// Narrow adapter for the translated `intel_cdclk_set_cdclk()` dispatcher.
+/// That source entry point delegates to `platform_set_cdclk`; all register,
+/// PCode, consumer-quiesce and readback work remains in the checked native
+/// lifecycle. Any unexpected source hook is latched and makes the call fail.
+struct NativeCdclkSetDispatch<'b, 'r, R, T> {
+    lifecycle: &'b mut NativeClockLifecycle<'r, R, T>,
+    restore_before_image: bool,
+    transition_error: Option<String>,
+    unexpected_hook: Cell<bool>,
+}
+
+impl<R: Registers, T: PollTimer> intel_display::intel_cdclk_full::IntelCdclkIo
+    for NativeCdclkSetDispatch<'_, '_, R, T>
+{
+    fn platform_get_cdclk(
+        &mut self,
+        _: u32,
+        _: &mut intel_display::intel_cdclk_full::IntelDisplay,
+        _: &mut intel_display::intel_cdclk_full::IntelCdclkConfig,
+    ) {
+        self.unexpected_hook.set(true);
+    }
+    fn platform_set_cdclk(
+        &mut self,
+        _: u32,
+        _: &mut intel_display::intel_cdclk_full::IntelDisplay,
+        config: &intel_display::intel_cdclk_full::IntelCdclkConfig,
+        _: i32,
+    ) {
+        let result = u32::try_from(config.cdclk)
+            .map_err(|_| String::from("translated CDCLK target is negative"))
+            .and_then(|target| {
+                self.lifecycle
+                    .adjust_native(target, self.restore_before_image)
+            });
+        if let Err(error) = result {
+            self.transition_error = Some(error);
+        }
+    }
+    fn platform_modeset_calc_cdclk(
+        &mut self,
+        _: u32,
+        _: &mut intel_display::intel_cdclk_full::IntelAtomicState,
+    ) -> i32 {
+        self.unexpected_hook.set(true);
+        -1
+    }
+    fn platform_calc_voltage_level(
+        &mut self,
+        _: u32,
+        _: &intel_display::intel_cdclk_full::IntelDisplay,
+        _: i32,
+    ) -> u8 {
+        self.unexpected_hook.set(true);
+        0
+    }
+    fn constant(&self, _: &'static str) -> u32 {
+        self.unexpected_hook.set(true);
+        0
+    }
+    fn read_mmio(&mut self, _: &'static str) -> u32 {
+        self.unexpected_hook.set(true);
+        0
+    }
+    fn write_mmio(&mut self, _: &'static str, _: u32) {
+        self.unexpected_hook.set(true);
+    }
+    fn pci_read16(&mut self, _: &'static str) -> u16 {
+        self.unexpected_hook.set(true);
+        0
+    }
+    fn pci_bus_read16(&mut self, _: u16, _: &'static str) -> u16 {
+        self.unexpected_hook.set(true);
+        0
+    }
+    fn mchbar_read8(&mut self, _: &'static str) -> u8 {
+        self.unexpected_hook.set(true);
+        0
+    }
+    fn call(&mut self, _: &'static str, _: &[i64]) -> i64 {
+        self.unexpected_hook.set(true);
+        -1
+    }
+    fn wait(&mut self, _: &'static str, _: u32, _: u32, _: i32) -> i32 {
+        self.unexpected_hook.set(true);
+        -1
+    }
+    fn log(&mut self, _: &'static str, _: &'static str, _: &[i64]) {}
+    fn log_cdclk_config(
+        &mut self,
+        _: &'static str,
+        _: &intel_display::intel_cdclk_full::IntelCdclkConfig,
+    ) {
+    }
+}
+
+fn set_cdclk_through_source<'b, 'r, R: Registers, T: PollTimer>(
+    lifecycle: &'b mut NativeClockLifecycle<'r, R, T>,
+    target_clock_khz: u32,
+    restore_before_image: bool,
+) -> Result<(), String> {
+    let target = i32::try_from(target_clock_khz)
+        .map_err(|_| String::from("CDCLK target exceeds the translated integer range"))?;
+    let mut display = intel_display::intel_cdclk_full::IntelDisplay::default();
+    display.display_ver = 13;
+    display.platform.alderlake_p = true;
+    let config = intel_display::intel_cdclk_full::IntelCdclkConfig {
+        cdclk: target,
+        ..Default::default()
+    };
+    let mut io = NativeCdclkSetDispatch {
+        lifecycle,
+        restore_before_image,
+        transition_error: None,
+        unexpected_hook: Cell::new(false),
+    };
+    intel_display::intel_cdclk_full::intel_cdclk_set_cdclk(&mut io, &mut display, &config, -1);
+    if let Some(error) = io.transition_error {
+        return Err(error);
+    }
+    if io.unexpected_hook.get() {
+        return Err(String::from(
+            "translated CDCLK setter emitted an unmapped backend hook",
+        ));
+    }
+    Ok(())
+}
+
+impl<R: Registers, T: PollTimer> super::tc_modeset::ClockLifecycle
+    for NativeClockLifecycle<'_, R, T>
+{
+    fn adjust(&mut self, target_clock_khz: u32, restore_before_image: bool) -> Result<(), String> {
+        set_cdclk_through_source(self, target_clock_khz, restore_before_image)
+    }
+}
+
+impl<R: Registers, T: PollTimer> super::native_modeset_ops::NativeCdclkOps
+    for NativeClockLifecycle<'_, R, T>
+{
+    type Error = String;
+
+    fn set_cdclk_pre_plane(&mut self, target_khz: u32) -> Result<(), Self::Error> {
+        set_cdclk_through_source(self, target_khz, false)
+    }
+
+    fn set_cdclk_post_plane(&mut self, target_khz: u32) -> Result<(), Self::Error> {
+        let current = super::clk::observe(self.registers)
+            .map_err(|error| format!("CDCLK post-plane readout failed: {}", error.describe()))?;
+        if current.cdclk_khz > target_khz {
+            return Err(String::from(
+                "post-plane CDCLK decrease remains unsupported until active-consumer ordering is \
+                 wired",
+            ));
+        }
+        set_cdclk_through_source(self, target_khz, false)
+    }
+}
+
+fn verify_translated_crtc_state(
+    firmware: &Firmware,
+    port: TcPort,
+    connected: bool,
+    target_clock_khz: u32,
+) -> Result<(), String> {
+    use intel_display::intel_modeset_verify_full as verify;
+
+    if !connected || !firmware.ddi.enabled || target_clock_khz > i32::MAX as u32 {
+        return Err(String::from(
+            "source modeset verifier received inactive or invalid Pipe-A state",
+        ));
+    }
+    let connector = verify::Connector {
+        id: 1,
+        name: "HDMI-A",
+        encoder: Some(1),
+    };
+    let encoder = verify::Encoder {
+        id: 1,
+        name: "TC HDMI",
+        crtc: Some(1),
+        encoder_type: verify::EncoderType::Other,
+    };
+    let crtc = verify::Crtc {
+        id: 1,
+        name: "Pipe A",
+        pipe: verify::Pipe::A,
+        active: true,
+    };
+    let state = verify::IntelAtomicState {
+        display: verify::Display {
+            drm_id: 1,
+            i830: false,
+        },
+        connectors: alloc::vec![verify::ConnectorChange {
+            connector,
+            old_state: verify::ConnectorState {
+                crtc: Some(1),
+                best_encoder: Some(1)
+            },
+            new_state: verify::ConnectorState {
+                crtc: Some(1),
+                best_encoder: Some(1)
+            },
+        }],
+        encoders: alloc::vec![encoder],
+        crtcs: alloc::vec![verify::CrtcChange {
+            crtc: crtc.clone(),
+            new_state: verify::CrtcState {
+                hw: verify::CrtcHwState {
+                    active: true,
+                    enable: true,
+                    adjusted_mode_crtc_clock: target_clock_khz as i32,
+                },
+                needs_modeset: true,
+                primary_crtc_id: 1,
+                ..verify::CrtcState::default()
+            },
+        }],
+    };
+    let mut io = NativeModesetVerify {
+        firmware,
+        port,
+        connected,
+        failure: None,
+    };
+    verify::intel_modeset_verify_crtc(&mut io, &state, &crtc);
+    io.failure.map_or(Ok(()), Err)
 }
 
 /// Debounce task-context DDC samples and report the physical connector state
@@ -708,6 +1442,39 @@ fn frame_count(r: &impl Registers) -> Result<u32, Error> {
     r.read(reg(0x70040, false))
         .ok_or(Error::Unavailable(0x70040))
 }
+
+/// The display-12/13 PIPEFRAME and PIPEFRAMEPIXEL pair is not synchronized.
+/// This adapter samples the high counter on both sides of the pixel register,
+/// matching intel_vblank.c's stable 64-bit read before its vblank-boundary
+/// adjustment.  A failed MMIO read is reported to the caller rather than
+/// becoming a fabricated zero counter.
+struct VblankCounterIo<'a, R> {
+    registers: &'a R,
+    valid: bool,
+}
+
+impl<R: Registers> intel_display::intel_vblank_full::VblankIo for VblankCounterIo<'_, R> {
+    fn read64_frame_pixel(&mut self, _pipe: u8) -> u64 {
+        for _ in 0..4 {
+            let high_before = self.registers.read(reg(0x70040, false));
+            let pixel = self.registers.read(reg(0x70044, false));
+            let high_after = self.registers.read(reg(0x70040, false));
+            match (high_before, pixel, high_after) {
+                (Some(before), Some(pixel), Some(after)) if before == after => {
+                    return (u64::from(before & 0xffff) << 32) | u64::from(pixel);
+                }
+                (Some(_), Some(_), Some(_)) => {}
+                _ => {
+                    self.valid = false;
+                    return 0;
+                }
+            }
+        }
+        self.valid = false;
+        0
+    }
+}
+
 fn latch(r: &impl Registers, timer: &impl PollTimer, address: u32) -> Result<(), Error> {
     let initial = frame_count(r)?;
     let start = timer.now_micros();
@@ -738,18 +1505,27 @@ fn latch(r: &impl Registers, timer: &impl PollTimer, address: u32) -> Result<(),
     Err(Error::Refused)
 }
 
-fn pitch_for(width: u32) -> Option<u32> {
+fn cpp_for_format(format: u32) -> Option<u32> {
+    match format {
+        intel_display::universal_plane::XRGB8888 => Some(4),
+        intel_display::universal_plane::RGB565 => Some(2),
+        _ => None,
+    }
+}
+
+fn pitch_for(width: u32, cpp: u32) -> Option<u32> {
     width
-        .checked_mul(4)?
+        .checked_mul(cpp)?
         .checked_add(63)
         .map(|pitch| pitch & !63)
 }
 
-/// Preserve firmware WM/DDB only for the source-checked linear-XRGB profile.
+/// Preserve firmware WM/DDB only for the source-checked linear RGB profile.
 /// Clock and pitch alone are not a watermark proof: method selection, line
 /// demand and DDB minima also depend on htotal/width. The exact 4K30->1080p60
 /// reduction has a matching source line time and no worse demand at every
-/// source-valid latency; unknown profiles refuse before display writes.
+/// source-valid latency; RGB565 uses at most half the line bytes. Unknown
+/// profiles refuse before display writes.
 fn retained_watermark_budget(baseline: &Firmware, target: NativeMode, pitch: u32) -> bool {
     intel_display::watermark::adlp_linear_xrgb_4k30_watermark_profile_no_worse(
         baseline.pixel_clock,
@@ -779,6 +1555,7 @@ fn same_mode_state(
     observed: &Firmware,
     baseline: &Firmware,
     mode: NativeMode,
+    pixel_format: u32,
     surface: u32,
     pitch: u32,
     pll: &intel_display::dpll_mgr::DklPllState,
@@ -814,7 +1591,8 @@ fn same_mode_state(
         && observed.ddi.port == Some(route)
         && observed.ddi.mode == intel_display::ddi::DdiMode::Hdmi
         && observed.ddi.bpp == Some(24)
-        && observed.plane.native_linear_xrgb()
+        && observed.plane.fourcc == pixel_format
+        && observed.plane.native_linear_rgb()
         && observed.plane.pitch == pitch
         && observed.plane.width == u32::from(t.hdisplay)
         && observed.plane.height == u32::from(t.vdisplay)
@@ -873,6 +1651,20 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
     }
     fn supports_cursor(&self) -> bool {
         false
+    }
+    fn primary_formats(&self) -> &'static [u32] {
+        // The native primary plane and reachable CREATE_DUMB/ADDFB UAPI
+        // support linear XRGB8888 and RGB565 surfaces.
+        &[
+            intel_display::universal_plane::XRGB8888,
+            intel_display::universal_plane::RGB565,
+        ]
+    }
+    fn gamma_lut_size(&self) -> u32 {
+        256
+    }
+    fn degamma_lut_size(&self) -> u32 {
+        intel_display::intel_color_full::glk_degamma_lut_size(13) as u32
     }
     fn pci_identity(&self) -> Option<axdriver_display::DisplayPciIdentity> {
         Some(self.pci)
@@ -987,13 +1779,38 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             state.lost = true;
             return Err(DrmError::DeviceLost);
         }
-        let counter = match frame_count(&self.registers) {
-            Ok(v) => v,
-            Err(_) => {
-                state.lost = true;
-                return Err(DrmError::DeviceLost);
-            }
+        let timing = state.current_mode.timing;
+        let mut vblank_io = VblankCounterIo {
+            registers: &self.registers,
+            valid: true,
         };
+        let counter = intel_display::intel_vblank_full::i915_get_vblank_counter(
+            &mut vblank_io,
+            intel_display::intel_vblank_full::Display {
+                display_ver: 13,
+                ddi: true,
+                ..Default::default()
+            },
+            0,
+            intel_display::intel_vblank_full::VblankCrtc {
+                hwmode: intel_display::intel_vblank_full::Mode {
+                    clock: timing.clock_khz,
+                    crtc_clock: timing.clock_khz,
+                    htotal: i32::from(timing.htotal),
+                    hsync_start: i32::from(timing.hsync_start),
+                    vdisplay: i32::from(timing.vdisplay),
+                    vblank_start: i32::from(timing.vdisplay),
+                    vblank_end: i32::from(timing.vtotal),
+                    vtotal: i32::from(timing.vtotal),
+                    ..Default::default()
+                },
+                max_vblank_count: 0x00ff_ffff,
+            },
+        );
+        if !vblank_io.valid {
+            state.lost = true;
+            return Err(DrmError::DeviceLost);
+        }
         let now = self.timer.now_micros();
         match state.frame_progress {
             Some((previous, since)) if previous == counter => {
@@ -1037,8 +1854,14 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             Err(_) => crate::drm::device::wait_vblank_timer(delay),
         }
     }
-    fn validate_atomic_state(&self, active: bool, dpms_on: bool, gamma_lut: bool) -> DrmResult<()> {
-        if active && dpms_on && !gamma_lut {
+    fn validate_atomic_state(
+        &self,
+        active: bool,
+        dpms_on: bool,
+        gamma_lut: bool,
+        color_pipeline_changed: bool,
+    ) -> DrmResult<()> {
+        if active && dpms_on && !gamma_lut && !color_pipeline_changed {
             Ok(())
         } else {
             Err(DrmError::Unsupported)
@@ -1059,16 +1882,13 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
         if mode.is_none() {
             return Err(DrmError::Unsupported);
         }
-        let expected_pitch = request
-            .width
-            .checked_mul(4)
-            .and_then(|width| width.checked_add(63))
-            .map(|width| width & !63)
-            .ok_or(DrmError::Overflow)?;
-        if request.bpp != 32
-            || pitch != expected_pitch
-            || size != u64::from(pitch) * u64::from(request.height)
-        {
+        let cpp = match request.bpp {
+            16 => 2,
+            32 => 4,
+            _ => return Err(DrmError::Unsupported),
+        };
+        let expected_pitch = pitch_for(request.width, cpp).ok_or(DrmError::Overflow)?;
+        if pitch != expected_pitch || size != u64::from(pitch) * u64::from(request.height) {
             return Err(DrmError::Unsupported);
         }
         let aligned = usize::try_from(size)
@@ -1087,18 +1907,23 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             .map_err(|_| DrmError::NoMemory)
     }
     fn present(&self, s: Scanout) -> DrmResult<Arc<Fence>> {
+        let native_atomic =
+            select_native_modeset_path(axhal::boot::command_line_value("intel.native_modeset"))
+                == NativeModesetPath::NativeAtomic;
         let Some(target) = self.modes.iter().find(|mode| mode.kms == s.mode).copied() else {
             return Err(DrmError::Unsupported);
         };
-        let Some(expected_pitch) = pitch_for(target.kms.width) else {
+        let Some(cpp) = cpp_for_format(s.format) else {
+            return Err(DrmError::Unsupported);
+        };
+        let Some(expected_pitch) = pitch_for(target.kms.width, cpp) else {
             return Err(DrmError::Overflow);
         };
         if s.width != target.kms.width
             || s.height != target.kms.height
             || s.framebuffer_width != s.width
             || s.pitch != expected_pitch
-            || s.bpp != 32
-            || s.format != intel_display::universal_plane::XRGB8888
+            || s.bpp != cpp * 8
             || s.framebuffer_offset != 0
             || !s.offset.is_multiple_of(4096)
             || s.offset != u64::from(s.source_y) * u64::from(s.pitch)
@@ -1246,7 +2071,38 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             });
         };
         let changing_mode = target.timing != state.current_mode.timing;
-        if !changing_mode {
+        let changing_scanout = native_atomic || changing_mode || s.format != state.current_format;
+        if changing_scanout
+            && super::atomic_modeset_wiring::preflight_native_mode_change(
+                state.current_mode.timing,
+                target.timing,
+                self.port,
+                state.current_format,
+                s.format,
+            )
+            .is_err()
+        {
+            // The translated-state projection is pure and runs before the
+            // existing TC transaction. It only admits the same Pipe-A, TC1/2,
+            // linear XRGB8888/RGB565, RGB 8-bpc, VIC 16/95 subset; it does not execute
+            // any atomic hook or replace `tc_modeset::program`.
+            if let Some(new) = next {
+                // SAFETY: the preflight only inspects CPU-side state, before
+                // any plane or link write; the verified old scanout remains
+                // the sole DMA owner of a display surface.
+                if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                    state.quarantine.push(new);
+                    state.lost = true;
+                }
+            }
+            complete.signal_error();
+            return Err(if state.lost {
+                DrmError::DeviceLost
+            } else {
+                DrmError::Unsupported
+            });
+        }
+        if !changing_scanout {
             if latch(&self.registers, &self.timer, surface).is_err() {
                 let recovered = latch(&self.registers, &self.timer, before).is_ok();
                 if let Some(new) = next {
@@ -1369,48 +2225,231 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                         });
                     }
                 };
+            let cdclk_before = match super::clk::observe(&self.registers) {
+                Ok(observation) if observation.usable() => observation,
+                result => {
+                    if let Some(new) = next {
+                        // CDCLK admission is a read-only preflight before any
+                        // pipe, link, PLL, or plane write.
+                        // SAFETY: the displayed before-image is still active;
+                        // no scanout register references this candidate binding.
+                        if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                            state.quarantine.push(new);
+                            state.lost = true;
+                        }
+                    }
+                    complete.signal_error();
+                    axlog::warn!("intel-tc-modeset: CDCLK readout refused: {result:?}");
+                    return Err(if state.lost {
+                        DrmError::DeviceLost
+                    } else {
+                        DrmError::Busy
+                    });
+                }
+            };
+            if target.timing.clock_khz > cdclk_before.cdclk_khz
+                && (cdclk_before.entry.is_none()
+                    || super::clk::entry_at_least(cdclk_before.reference, target.timing.clock_khz)
+                        .is_none())
+            {
+                if let Some(new) = next {
+                    // SAFETY: no display register has been written; the old
+                    // scanout remains the only DMA consumer of its binding.
+                    if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                        state.quarantine.push(new);
+                        state.lost = true;
+                    }
+                }
+                complete.signal_error();
+                return Err(if state.lost {
+                    DrmError::DeviceLost
+                } else {
+                    DrmError::Unsupported
+                });
+            }
             let old_firmware = state.firmware.clone();
             let old_mode = state.current_mode;
             let old_surface = before;
             let old_pitch = old_firmware.plane.pitch;
+            let watermark = self.watermark;
             let mut display_writes_started = false;
-            let transition = super::tc_modeset::program(
-                &self.registers,
-                &self.timer,
-                self.port,
-                &target.timing,
-                s.pitch,
-                surface,
-                &target_pll,
-                self.afc_startup,
-                &avi_words,
-                &self.sink_edid,
-                None,
-                None,
-                true,
-                None,
-                &mut display_writes_started,
-            )
-            .and_then(|()| {
-                let next_state = capture(&self.registers, &self.power, self.port, self.afc_startup)
-                    .map_err(|e| format!("TC modeset readback failed: {e:?}"))?;
-                if !same_mode_state(
-                    &next_state,
-                    &self.baseline,
-                    target,
-                    surface,
-                    s.pitch,
-                    &target_pll,
-                    self.port,
-                    expected_target_avi,
-                    &expected_target_phy,
-                ) {
-                    return Err(String::from(
-                        "TC modeset state did not match the full target image",
-                    ));
-                }
-                Ok(next_state)
-            });
+            let mut dpll_undo = None;
+            let mut dpll_states = None;
+            let transition = translated_tc_dpll_target(self, target.timing.clock_khz, &target_pll)
+                .and_then(|dpll| {
+                    dpll_undo = Some(dpll.undo);
+                    dpll_states = Some((dpll.old, dpll.new));
+                    translated_tc_dpll_readout(self)
+                })
+                .and_then(|(enabled, manager_state)| {
+                    if enabled != (old_firmware.pll.enable != 0)
+                        || !super::shared_dpll::dkl_state_matches_source_readout(
+                            &old_firmware.pll.state,
+                            &manager_state,
+                            self.afc_startup.is_some(),
+                        )
+                    {
+                        return Err(String::from(
+                            "translated shared DPLL no longer matches the active before-image",
+                        ));
+                    }
+                    let identity = super::shared_dpll::AdlNIdentity::verify(
+                        self.pci.vendor_id,
+                        self.pci.device_id,
+                        self.pci.revision,
+                    )
+                    .map_err(|error| format!("shared DPLL identity changed: {error:?}"))?;
+                    let (old, new) = dpll_states
+                        .ok_or_else(|| String::from("source DPLL transaction state is absent"))?;
+                    let mut manager = self.shared_dpll.lock();
+                    let mut lifecycle = NativeDpllLifecycle {
+                        manager: &mut manager,
+                        registers: &self.registers,
+                        timer: &self.timer,
+                        power_pin: &self.power,
+                        identity,
+                        refclk_khz: self.baseline.refclk,
+                        old,
+                        new,
+                    };
+                    let mut clock_lifecycle = NativeClockLifecycle {
+                        registers: &self.registers,
+                        timer: &self.timer,
+                        before: cdclk_before,
+                    };
+                    if native_atomic {
+                        let mut power = NativeTcPower {
+                            registers: &self.registers,
+                            parent: &self.power,
+                            lease: None,
+                        };
+                        let connected = state.connected;
+                        let mut verify = || {
+                            let image =
+                                capture(&self.registers, &self.power, self.port, self.afc_startup)
+                                    .map_err(|e| format!("native readback: {e:?}"))?;
+                            verify_translated_crtc_state(
+                                &image,
+                                self.port,
+                                connected,
+                                target.timing.clock_khz,
+                            )?;
+                            if !same_mode_state(
+                                &image,
+                                &self.baseline,
+                                target,
+                                s.format,
+                                surface,
+                                s.pitch,
+                                &target_pll,
+                                self.port,
+                                expected_target_avi,
+                                &expected_target_phy,
+                            ) {
+                                return Err(String::from("native target image mismatch"));
+                            }
+                            Ok(())
+                        };
+                        let mut cleanup = |stopped: bool| {
+                            if !stopped {
+                                return Err(String::from(
+                                    "native DMA stop unverified; retaining framebuffer",
+                                ));
+                            }
+                            if let Some(new) = next.take() {
+                                // SAFETY: native rollback proved the pipe stopped (or never wrote it).
+                                if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                                    state.quarantine.push(new);
+                                    state.lost = true;
+                                    return Err(String::from("native framebuffer unpin failed"));
+                                }
+                            }
+                            Ok(())
+                        };
+                        super::tc_modeset::program_native(
+                            &self.registers,
+                            &self.timer,
+                            self.port,
+                            &target.timing,
+                            s.pitch,
+                            s.format,
+                            surface,
+                            Some(watermark),
+                            &avi_words,
+                            &self.sink_edid,
+                            Some(&mut lifecycle),
+                            Some(&mut clock_lifecycle),
+                            &mut display_writes_started,
+                            &mut power,
+                            &mut cleanup,
+                            &mut verify,
+                        )
+                    } else {
+                        super::tc_modeset::program(
+                            &self.registers,
+                            &self.timer,
+                            self.port,
+                            &target.timing,
+                            s.pitch,
+                            s.format,
+                            surface,
+                            Some(watermark),
+                            &target_pll,
+                            self.afc_startup,
+                            &avi_words,
+                            &self.sink_edid,
+                            None,
+                            None,
+                            true,
+                            None,
+                            Some(&mut lifecycle),
+                            Some(&mut clock_lifecycle),
+                            false,
+                            &mut display_writes_started,
+                        )
+                    }
+                })
+                .and_then(|()| {
+                    let next_state =
+                        capture(&self.registers, &self.power, self.port, self.afc_startup)
+                            .map_err(|e| format!("TC modeset readback failed: {e:?}"))?;
+                    verify_translated_crtc_state(
+                        &next_state,
+                        self.port,
+                        state.connected,
+                        target.timing.clock_khz,
+                    )?;
+                    let (manager_pll_on, manager_state) = translated_tc_dpll_readout(self)?;
+                    if manager_pll_on != (next_state.pll.enable != 0)
+                        || !super::shared_dpll::dkl_state_matches_source_readout(
+                            &next_state.pll.state,
+                            &manager_state,
+                            self.afc_startup.is_some(),
+                        )
+                    {
+                        return Err(String::from(
+                            "firmware and translated TC DPLL enable readouts disagree after \
+                             modeset",
+                        ));
+                    }
+                    if !same_mode_state(
+                        &next_state,
+                        &self.baseline,
+                        target,
+                        s.format,
+                        surface,
+                        s.pitch,
+                        &target_pll,
+                        self.port,
+                        expected_target_avi,
+                        &expected_target_phy,
+                    ) {
+                        return Err(String::from(
+                            "TC modeset state did not match the full target image",
+                        ));
+                    }
+                    Ok(next_state)
+                });
             if display_writes_started {
                 // Equivalent to source vblank off/on around this serialized
                 // transaction. Hardware counter resets in forward OR rollback
@@ -1420,8 +2459,13 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             }
             match transition {
                 Ok(next_state) => {
+                    // The manager's new CRTC/reference image was atomically
+                    // swapped before hardware programming and stays live only
+                    // because the complete target image just verified.
+                    dpll_undo.take();
                     state.firmware = next_state;
                     state.current_mode = target;
+                    state.current_format = s.format;
                 }
                 Err(original) if !display_writes_started => {
                     // Preflight and the HDA retirement gate precede every
@@ -1429,6 +2473,18 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                     // so an audio-only refusal must not make the display
                     // worker lost or run a destructive rollback against a
                     // still-active link.
+                    if let Some(undo) = dpll_undo.take()
+                        && self
+                            .shared_dpll
+                            .lock()
+                            .restore_after_verified_hardware_rollback(undo)
+                            .is_err()
+                    {
+                        self.shared_dpll
+                            .lock()
+                            .quarantine_after_unverified_rollback();
+                        state.lost = true;
+                    }
                     if let Some(new) = next {
                         // SAFETY: `tc_modeset::program` reports this stage
                         // only before its first PLANE_CTL/SURF or link write;
@@ -1446,19 +2502,41 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                         DrmError::Busy
                     });
                 }
+                Err(original) if native_atomic => {
+                    // Never retry the legacy writer after an explicit native commit.
+                    // A failed native transaction leaves the display quiesced; the
+                    // runner already unwound hardware and its candidate mapping.
+                    self.shared_dpll
+                        .lock()
+                        .quarantine_after_unverified_rollback();
+                    if let Some(new) = next {
+                        state.quarantine.push(new);
+                    }
+                    state.lost = true;
+                    complete.signal_error();
+                    axlog::warn!("intel-native-modeset: {original}");
+                    return Err(DrmError::DeviceLost);
+                }
                 Err(original) => {
                     let old_avi_frame = old_firmware.hdmi.frames[0];
                     let old_avi = old_avi_frame
                         .and_then(|raw| super::tc_modeset::avi_words_preserve(raw).ok());
                     let mut rollback_display_writes_started = false;
-                    let recovered = old_avi.is_some_and(|old_avi| {
+                    let mut rollback_clock_lifecycle = NativeClockLifecycle {
+                        registers: &self.registers,
+                        timer: &self.timer,
+                        before: cdclk_before,
+                    };
+                    let mut recovered = old_avi.is_some_and(|old_avi| {
                         super::tc_modeset::program(
                             &self.registers,
                             &self.timer,
                             self.port,
                             &old_mode.timing,
                             old_pitch,
+                            old_firmware.plane.fourcc,
                             old_surface,
+                            Some(watermark),
                             &old_firmware.pll.state,
                             self.afc_startup,
                             &old_avi,
@@ -1467,16 +2545,33 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                             Some(old_firmware.plane.ctl),
                             false,
                             Some(&old_firmware.phy),
+                            None,
+                            Some(&mut rollback_clock_lifecycle),
+                            true,
                             &mut rollback_display_writes_started,
                         )
                         .and_then(|()| {
                             let restored =
                                 capture(&self.registers, &self.power, self.port, self.afc_startup)
                                     .map_err(|e| format!("TC rollback readback failed: {e:?}"))?;
+                            let (manager_pll_on, manager_state) = translated_tc_dpll_readout(self)?;
+                            if manager_pll_on != (restored.pll.enable != 0)
+                                || !super::shared_dpll::dkl_state_matches_source_readout(
+                                    &restored.pll.state,
+                                    &manager_state,
+                                    self.afc_startup.is_some(),
+                                )
+                            {
+                                return Err(String::from(
+                                    "firmware and translated TC DPLL enable readouts disagree \
+                                     after rollback",
+                                ));
+                            }
                             if !same_mode_state(
                                 &restored,
                                 &self.baseline,
                                 old_mode,
+                                old_firmware.plane.fourcc,
                                 old_surface,
                                 old_pitch,
                                 &old_firmware.pll.state,
@@ -1492,6 +2587,21 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                         })
                         .is_ok()
                     });
+                    if recovered
+                        && let Some(undo) = dpll_undo.take()
+                        && self
+                            .shared_dpll
+                            .lock()
+                            .restore_after_verified_hardware_rollback(undo)
+                            .is_err()
+                    {
+                        recovered = false;
+                    }
+                    if !recovered {
+                        self.shared_dpll
+                            .lock()
+                            .quarantine_after_unverified_rollback();
+                    }
                     if let Some(new) = next {
                         if recovered {
                             // SAFETY: rollback readback matched the old full
@@ -1592,14 +2702,40 @@ pub(super) fn init(
         if !vbt.checksum_valid() {
             return Err(Error::InvalidHeader);
         }
-        let afc_startup = vbt.afc_startup_override()?;
-        let definitions = vbt.parse_general_definitions()?;
-        let route = definitions
-            .encoder(if port == TcPort::Tc1 {
-                Port::Tc1
-            } else {
-                Port::Tc2
-            })?
+        let bios = intel_display::intel_bios::intel_bios_init(
+            Some(vbt.data()),
+            13,
+            intel_display::dmc::DmcPlatform::AlderLakeN,
+            false,
+            true,
+            false,
+            &[
+                Port::A,
+                Port::B,
+                Port::C,
+                Port::D,
+                Port::E,
+                Port::F,
+                Port::Tc1,
+                Port::Tc2,
+            ],
+        );
+        let afc_startup = bios
+            .vbt
+            .as_ref()
+            .map(|vbt| vbt.afc_startup_override())
+            .transpose()?
+            .flatten();
+        let route = bios
+            .definitions
+            .as_ref()
+            .and_then(|definitions| {
+                definitions.encoder(if port == TcPort::Tc1 {
+                    Port::Tc1
+                } else {
+                    Port::Tc2
+                })
+            })
             .ok_or(Error::Refused)?;
         if !route.supports_hdmi()
             || route.usb_type_c
@@ -1643,8 +2779,117 @@ pub(super) fn init(
             .map(|&(base, size)| (base as u64, size as u64))
             .collect();
         let pin = PowerPin::acquire(&window, port)?;
+        super::dmc::display_power_ready(window, intel_display::dmc::DmcPlatform::AlderLakeN);
         let admitted = (|| {
+            let watermark =
+                super::power::read_source_watermark_config(&window, &super::gmbus::MonotonicTimer)
+                    .map_err(|error| {
+                        axlog::warn!(
+                            "intel-fastboot: source watermark profile unavailable: {error}"
+                        );
+                        Error::Refused
+                    })?;
             let first = capture(&window, &pin, port, afc_startup)?;
+            // Scope the translated shared-DPLL manager to the power-proven
+            // TC route, then run its source-shaped hardware readout with the
+            // captured Pipe-A owner. This keeps unpowered sibling TC PLLs out
+            // of the manager's readout/allocator view.
+            let dpll_identity = super::shared_dpll::AdlNIdentity::verify(
+                info.vendor_id,
+                info.device_id,
+                info.revision,
+            )
+            .map_err(|error| {
+                axlog::warn!("intel-fastboot: shared DPLL identity refused: {error:?}");
+                Error::Refused
+            })?;
+            let mut shared_dpll = super::shared_dpll::SharedDpllState::new(dpll_identity, 0);
+            shared_dpll
+                .set_afc_startup_override(afc_startup)
+                .map_err(|error| {
+                    axlog::warn!("intel-fastboot: VBT DKL AFC override refused: {error:?}");
+                    Error::Refused
+                })?;
+            let mut dpll_power =
+                super::shared_dpll::PinnedDpllPower::new(&pin, dpll_identity, first.refclk)
+                    .map_err(|error| {
+                        axlog::warn!(
+                            "intel-fastboot: shared DPLL power context refused: {error:?}"
+                        );
+                        Error::Refused
+                    })?;
+            shared_dpll
+                .init(&window, &super::gmbus::MonotonicTimer, &mut dpll_power)
+                .map_err(|error| {
+                    axlog::warn!("intel-fastboot: shared DPLL manager init refused: {error:?}");
+                    Error::Refused
+                })?;
+            let source_tc_port = match port {
+                TcPort::Tc1 => intel_display::intel_dpll_mgr_full::TcPort::Tc1,
+                TcPort::Tc2 => intel_display::intel_dpll_mgr_full::TcPort::Tc2,
+                _ => return Err(Error::Refused),
+            };
+            let dpll_index = shared_dpll
+                .limit_to_tc_port(source_tc_port)
+                .map_err(|error| {
+                    axlog::warn!("intel-fastboot: shared DPLL port scope refused: {error:?}");
+                    Error::Refused
+                })?;
+            let mut crtc_states = [intel_display::intel_dpll_mgr_full::CrtcState::default();
+                intel_display::intel_dpll_mgr_full::MAX_PIPES];
+            crtc_states[0] = intel_display::intel_dpll_mgr_full::CrtcState {
+                id: 0,
+                name: "pipe A",
+                pipe: 0,
+                joined_pipe_mask: 1,
+                hw_active: true,
+                intel_dpll: Some(dpll_index),
+                port_clock: first.pixel_clock,
+                output: intel_display::intel_dpll_mgr_full::OutputType::Hdmi,
+                port: intel_display::intel_dpll_mgr_full::Port::Tc(source_tc_port),
+                ..intel_display::intel_dpll_mgr_full::CrtcState::default()
+            };
+            shared_dpll
+                .readout(
+                    &window,
+                    &super::gmbus::MonotonicTimer,
+                    &mut dpll_power,
+                    crtc_states,
+                )
+                .map_err(|error| {
+                    axlog::warn!(
+                        "intel-fastboot: translated DPLL manager readout refused: {error:?}"
+                    );
+                    Error::Refused
+                })?;
+            let (manager_pll_on, manager_state) = shared_dpll
+                .get_hw_state(
+                    &window,
+                    &super::gmbus::MonotonicTimer,
+                    &mut dpll_power,
+                    dpll_index,
+                )
+                .map_err(|error| {
+                    axlog::warn!(
+                        "intel-fastboot: translated shared DPLL readout refused: {error:?}"
+                    );
+                    Error::Refused
+                })?;
+            if manager_pll_on != (first.pll.enable != 0)
+                || !super::shared_dpll::dkl_state_matches_source_readout(
+                    &first.pll.state,
+                    &manager_state,
+                    afc_startup.is_some(),
+                )
+            {
+                axlog::warn!(
+                    "intel-fastboot: firmware and translated TC DPLL enable readouts disagree: \
+                     firmware={} manager={}",
+                    first.pll.enable,
+                    manager_pll_on
+                );
+                return Err(Error::Refused);
+            }
             if first.plane.pitch != (first.plane.width * 4).div_ceil(64) * 64 {
                 return Err(Error::Refused);
             }
@@ -1660,10 +2905,18 @@ pub(super) fn init(
                 return Err(Error::Refused);
             }
             let (modes, preferred, current) = native_modes(&sink_edid, &first)?;
-            Ok((first, modes, preferred, current, sink_edid))
+            Ok((
+                first,
+                modes,
+                preferred,
+                current,
+                sink_edid,
+                watermark,
+                shared_dpll,
+            ))
         })();
         match admitted {
-            Ok((f, modes, preferred, current, edid)) => Ok((
+            Ok((f, modes, preferred, current, edid, watermark, shared_dpll)) => Ok((
                 pin,
                 port,
                 f,
@@ -1672,6 +2925,8 @@ pub(super) fn init(
                 current,
                 edid,
                 afc_startup,
+                watermark,
+                shared_dpll,
                 info,
             )),
             Err(e) => {
@@ -1680,8 +2935,19 @@ pub(super) fn init(
             }
         }
     };
-    let (power, port, firmware, modes, preferred, current_mode, sink_edid, afc_startup, info) =
-        setup().map_err(message)?;
+    let (
+        power,
+        port,
+        firmware,
+        modes,
+        preferred,
+        current_mode,
+        sink_edid,
+        afc_startup,
+        watermark,
+        shared_dpll,
+        info,
+    ) = setup().map_err(message)?;
     let pci = axdriver_display::DisplayPciIdentity {
         bus: bdf.bus,
         device: bdf.device,
@@ -1697,15 +2963,18 @@ pub(super) fn init(
         timer: super::gmbus::MonotonicTimer,
         gtt,
         power,
+        shared_dpll: Mutex::new(shared_dpll),
         baseline: firmware.clone(),
         modes,
         preferred: preferred.kms,
         sink_edid,
         afc_startup,
+        watermark,
         port,
         pci,
         irq_event_sequence: AtomicU32::new(0),
         state: Mutex::new(State {
+            current_format: firmware.plane.fourcc,
             firmware,
             current_mode,
             connected: true,
@@ -1800,6 +3069,132 @@ mod tests {
     use core::sync::atomic::AtomicU64;
 
     use super::{super::gtt::PageTable, *};
+
+    #[test]
+    fn native_modeset_parameter_is_opt_in_and_never_silently_falls_back() {
+        assert_eq!(
+            select_native_modeset_path(None),
+            NativeModesetPath::LegacyTc
+        );
+        assert_eq!(
+            select_native_modeset_path(Some("0")),
+            NativeModesetPath::LegacyTc
+        );
+        assert_eq!(
+            select_native_modeset_path(Some("1")),
+            NativeModesetPath::NativeAtomic
+        );
+        assert_eq!(
+            select_native_modeset_path(Some("true")),
+            NativeModesetPath::LegacyTc
+        );
+    }
+
+    fn source_watermark_fixture() -> super::super::pipe::WatermarkConfig {
+        super::super::pipe::WatermarkConfig {
+            display_ver: 13,
+            latencies: [2, 4, 6, 8, 14, 16, 0, 0],
+            num_levels: 6,
+            sagv_block_time_us: 0,
+        }
+    }
+
+    #[test]
+    fn native_primary_formats_match_reachable_ioctl_formats() {
+        let (adapter, ..) = native();
+        assert_eq!(
+            adapter.primary_formats(),
+            &[
+                intel_display::universal_plane::XRGB8888,
+                intel_display::universal_plane::RGB565,
+            ]
+        );
+    }
+
+    #[test]
+    fn translated_modeset_verifier_checks_pipe_and_connector_image() {
+        let (adapter, ..) = native();
+        verify_translated_crtc_state(
+            &adapter.baseline,
+            TcPort::Tc1,
+            true,
+            adapter.baseline.pixel_clock,
+        )
+        .unwrap();
+
+        let mut wrong_port = adapter.baseline.clone();
+        wrong_port.ddi.port = Some(Port::Tc2);
+        assert!(
+            verify_translated_crtc_state(
+                &wrong_port,
+                TcPort::Tc1,
+                true,
+                adapter.baseline.pixel_clock,
+            )
+            .is_err()
+        );
+
+        assert!(
+            verify_translated_crtc_state(
+                &adapter.baseline,
+                TcPort::Tc1,
+                true,
+                adapter.baseline.pixel_clock + 1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_cdclk_lifecycle_refuses_active_pipe_consumers() {
+        let (_, registers, _) = native();
+        let timer = Timer(Arc::new(AtomicU64::new(0)));
+        let lifecycle = NativeClockLifecycle {
+            registers: &registers,
+            timer: &timer,
+            before: super::super::clk::CdclkObservation {
+                reference: super::super::clk::ReferenceClock::Mhz24,
+                reference_recognised: false,
+                pll_register: 0,
+                pll_enabled: false,
+                pll_locked: false,
+                ratio: 0,
+                vco_khz: 0,
+                divider: super::super::clk::Cd2xDivider::Div1,
+                cdclk_khz: 0,
+                ctl: 0,
+                decimal_field: 0,
+                pipe_field: 0,
+                entry: None,
+            },
+        };
+        assert!(lifecycle.require_all_consumers_disabled().is_err());
+    }
+
+    #[test]
+    fn translated_cdclk_set_dispatch_reaches_only_the_native_platform_callback() {
+        let (adapter, registers, _) = native();
+        let before = super::super::clk::observe(&registers).unwrap();
+        let mut lifecycle = NativeClockLifecycle {
+            registers: &registers,
+            timer: &adapter.timer,
+            before,
+        };
+
+        // Requesting the already-active clock still exercises the translated
+        // intel_cdclk_set_cdclk() dispatch but must not touch CDCLK hardware.
+        super::super::native_modeset_ops::NativeCdclkOps::set_cdclk_pre_plane(
+            &mut lifecycle,
+            before.cdclk_khz,
+        )
+        .unwrap();
+        super::super::native_modeset_ops::NativeCdclkOps::set_cdclk_post_plane(
+            &mut lifecycle,
+            before.cdclk_khz,
+        )
+        .unwrap();
+    }
+
     #[derive(Clone)]
     struct Model {
         inner: Arc<Mutex<ModelState>>,
@@ -1814,6 +3209,7 @@ mod tests {
         fail_offset: Option<u32>,
         stall: bool,
         fail_surface: bool,
+        frame_pixel_pending: bool,
     }
     impl Model {
         fn new() -> Self {
@@ -1854,7 +3250,12 @@ mod tests {
                 (0x46140, 6 << 28),
                 (0x164280, 0),
                 (0x51004, 0),
+                (0x46010, 0),
+                (0x46014, 0),
+                (0x46020, 0),
                 (0x46038, 0xcc000000),
+                (0x46070, (1 << 31) | (1 << 30) | 22),
+                (0x46000, (1 << 22) | (7 << 19) | 350),
                 (0x1010a0, 0x44332211),
                 (0x60200, 1 << 12),
                 (0x650c0, 0),
@@ -1869,6 +3270,7 @@ mod tests {
                 (0x44304, 0),
                 (0x4438c, 0),
                 (0x70040, 0),
+                (0x70044, 0),
             ] {
                 words.insert(r, v);
             }
@@ -1957,6 +3359,7 @@ mod tests {
                     fail_offset: None,
                     stall: false,
                     fail_surface: false,
+                    frame_pixel_pending: false,
                 })),
             }
         }
@@ -1977,9 +3380,16 @@ mod tests {
                 return Some(*line);
             }
             if r == 0x70040 && s.frames {
+                let pending = core::mem::replace(&mut s.frame_pixel_pending, false);
                 let v = s.words.get_mut(&r)?;
-                *v = v.wrapping_add(1);
+                if !pending {
+                    *v = v.wrapping_add(1);
+                }
                 return Some(*v);
+            }
+            if r == 0x70044 && s.frames {
+                s.frame_pixel_pending = true;
+                return s.words.get(&r).copied();
             }
             if (0x168000..0x169000).contains(&r) {
                 let bank = s.words.get(&0x1010a0)? & 15;
@@ -2051,6 +3461,44 @@ mod tests {
             self.0.fetch_add(1000, Ordering::Relaxed)
         }
     }
+    fn test_shared_dpll(
+        r: &Model,
+        pin: &PowerPin,
+        refclk: u32,
+    ) -> super::super::shared_dpll::SharedDpllState {
+        let identity = super::super::shared_dpll::AdlNIdentity::verify(0x8086, 0x46d0, 0).unwrap();
+        let mut manager = super::super::shared_dpll::SharedDpllState::new(identity, 0);
+        let mut power =
+            super::super::shared_dpll::PinnedDpllPower::new(pin, identity, refclk).unwrap();
+        manager
+            .init(r, &Timer(Arc::new(AtomicU64::new(0))), &mut power)
+            .unwrap();
+        use intel_display::intel_dpll_mgr_full as source;
+        let port = match pin.port() {
+            TcPort::Tc1 => source::TcPort::Tc1,
+            TcPort::Tc2 => source::TcPort::Tc2,
+            _ => unreachable!(),
+        };
+        let index = manager.limit_to_tc_port(port).unwrap();
+        let firmware = capture(r, pin, pin.port(), None).unwrap();
+        let mut crtcs = [source::CrtcState::default(); source::MAX_PIPES];
+        crtcs[0] = source::CrtcState {
+            id: 0,
+            name: "pipe A",
+            pipe: 0,
+            joined_pipe_mask: 1,
+            hw_active: true,
+            intel_dpll: Some(index),
+            port_clock: firmware.pixel_clock,
+            output: source::OutputType::Hdmi,
+            port: source::Port::Tc(port),
+            ..source::CrtcState::default()
+        };
+        manager
+            .readout(r, &Timer(Arc::new(AtomicU64::new(0))), &mut power, crtcs)
+            .unwrap();
+        manager
+    }
     fn native() -> (
         Arc<Native<Model, Timer>>,
         Model,
@@ -2090,16 +3538,19 @@ mod tests {
             array.write(0x200000 / 4096 + i, 0x80000001 + (i as u64) * 4096);
         }
         let gtt = Arc::new(Gtt::over(Box::new(array.clone())).unwrap());
+        let shared_dpll = test_shared_dpll(&r, &power, firmware.refclk);
         let adapter = Arc::new(Native {
             registers: r.clone(),
             timer: Timer(Arc::new(AtomicU64::new(0))),
             gtt,
             power,
+            shared_dpll: Mutex::new(shared_dpll),
             baseline: firmware.clone(),
             modes: vec![current_mode, target_mode],
             preferred: current_mode.kms,
             sink_edid: Vec::new(),
             afc_startup: None,
+            watermark: source_watermark_fixture(),
             port: TcPort::Tc1,
             pci: axdriver_display::DisplayPciIdentity {
                 bus: 0,
@@ -2113,6 +3564,7 @@ mod tests {
             },
             irq_event_sequence: AtomicU32::new(0),
             state: Mutex::new(State {
+                current_format: firmware.plane.fourcc,
                 firmware,
                 current_mode,
                 connected: true,
@@ -2236,16 +3688,19 @@ mod tests {
             array.write(0x200000 / 4096 + i, 0x80000001 + (i as u64) * 4096);
         }
         let gtt = Arc::new(Gtt::over(Box::new(array.clone())).unwrap());
+        let shared_dpll = test_shared_dpll(&r, &power, firmware.refclk);
         let adapter = Arc::new(Native {
             registers: r.clone(),
             timer: Timer(Arc::new(AtomicU64::new(0))),
             gtt,
             power,
+            shared_dpll: Mutex::new(shared_dpll),
             baseline: firmware.clone(),
             modes: vec![current_mode, target_mode],
             preferred: current_mode.kms,
             sink_edid: Vec::new(),
             afc_startup: None,
+            watermark: source_watermark_fixture(),
             port: TcPort::Tc1,
             pci: axdriver_display::DisplayPciIdentity {
                 bus: 0,
@@ -2259,6 +3714,7 @@ mod tests {
             },
             irq_event_sequence: AtomicU32::new(0),
             state: Mutex::new(State {
+                current_format: firmware.plane.fourcc,
                 firmware,
                 current_mode,
                 connected: true,
@@ -2279,6 +3735,9 @@ mod tests {
         (adapter, r, array)
     }
     fn edid_with_1080p60_vic16() -> Vec<u8> {
+        edid_with_1080p60_vic16_and_max_tmds(None)
+    }
+    fn edid_with_1080p60_vic16_and_max_tmds(max_tmds_5mhz: Option<u8>) -> Vec<u8> {
         let mut edid = crate::drm::intel::gmbus::tests::valid_edid(1).to_vec();
         let base = edid.get_mut(..128).unwrap();
         let checksum = base[..127]
@@ -2289,9 +3748,17 @@ mod tests {
         let mut cta = [0u8; 128];
         cta[0] = 0x02;
         cta[1] = 0x03;
-        cta[2] = 6; // data block collection ends before the checksum
-        cta[4] = 0x41; // one-entry video data block
-        cta[5] = 16; // 1080p60 VIC 16
+        if let Some(max_tmds_5mhz) = max_tmds_5mhz {
+            cta[2] = 14; // HDMI VSDB and one-entry video block
+            cta[4] = 0x67; // 7-byte vendor-specific payload
+            cta[5..12].copy_from_slice(&[0x03, 0x0c, 0x00, 0x00, 0x00, 0x00, max_tmds_5mhz]);
+            cta[12] = 0x41; // one-entry video data block
+            cta[13] = 16; // 1080p60 VIC 16
+        } else {
+            cta[2] = 6; // data block collection ends before the checksum
+            cta[4] = 0x41; // one-entry video data block
+            cta[5] = 16; // 1080p60 VIC 16
+        }
         let checksum = cta[..127]
             .iter()
             .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
@@ -2333,7 +3800,7 @@ mod tests {
     fn scanout_for_full_mode(a: &Native<Model, Timer>, mode: NativeMode) -> Scanout {
         let width = mode.kms.width;
         let height = mode.kms.height;
-        let pitch = pitch_for(width).unwrap();
+        let pitch = pitch_for(width, 4).unwrap();
         let backing_size = u64::from(pitch) * u64::from(height);
         let backing = a
             .create_dumb(
@@ -2385,6 +3852,43 @@ mod tests {
         let (modes, preferred, current) = native_modes(&edid, &unproven_baseline).unwrap();
         assert_eq!(preferred, current);
         assert_eq!(modes, vec![current], "inadmissible target stays hidden");
+
+        let capped_edid = edid_with_1080p60_vic16_and_max_tmds(Some(20)); // 100 MHz
+        let (modes, preferred, current) = native_modes(&capped_edid, &a.baseline).unwrap();
+        assert_eq!(preferred, current);
+        assert_eq!(modes, vec![current], "sink-limited target stays hidden");
+    }
+    #[test]
+    fn translated_tc_dpll_readout_matches_firmware_capture() {
+        let (adapter, ..) = native();
+        let firmware_enabled = adapter.state.lock().firmware.pll.enable != 0;
+        let (enabled, manager_state) = translated_tc_dpll_readout(&adapter).unwrap();
+        assert_eq!(enabled, firmware_enabled);
+        assert!(super::super::shared_dpll::dkl_state_matches_source_readout(
+            &adapter.baseline.pll.state,
+            &manager_state,
+            adapter.afc_startup.is_some(),
+        ));
+    }
+    #[test]
+    fn translated_tc_dpll_readout_rejects_enable_bit_drift() {
+        let (adapter, registers, ..) = native();
+        let firmware_enabled = adapter.state.lock().firmware.pll.enable;
+        assert_ne!(firmware_enabled & (1 << 31), 0);
+        let mut model = registers.inner.lock();
+        let enable = model.words.get(&0x46038).copied().unwrap();
+        model.words.insert(0x46038, enable & !(1 << 31));
+        drop(model);
+        assert!(!translated_tc_dpll_readout(&adapter).unwrap().0);
+    }
+    #[test]
+    fn translated_tc_dpll_readout_refuses_lost_phy_power_pin() {
+        let (adapter, registers, ..) = native();
+        let mut model = registers.inner.lock();
+        let request = model.words.get(&0x45444).copied().unwrap();
+        model.words.insert(0x45444, request & !(1 << 7));
+        drop(model);
+        assert!(translated_tc_dpll_readout(&adapter).is_err());
     }
     #[test]
     fn already_on_power_pin_refuses_dark_and_recovers_landed_failure() {
@@ -2405,6 +3909,26 @@ mod tests {
         r.set(0x45444, 0);
         assert!(PowerPin::acquire(&r, TcPort::Tc1).is_err());
         assert!(r.inner.lock().log.is_empty());
+    }
+
+    #[test]
+    fn dpll_pin_context_is_read_only_and_rechecks_clock_dc_state_and_route() {
+        let r = Model::new();
+        let pin = PowerPin::acquire(&r, TcPort::Tc1).unwrap();
+        let writes = r.inner.lock().writes;
+        assert!(pin.verify_dpll_context(&r, TcPort::Tc1, 24_000).is_ok());
+        assert_eq!(r.inner.lock().writes, writes, "verification is read-only");
+        assert!(pin.verify_dpll_context(&r, TcPort::Tc2, 24_000).is_err());
+        assert!(pin.verify_dpll_context(&r, TcPort::Tc1, 19_200).is_err());
+
+        r.set(0x45504, 1 << 30);
+        assert!(pin.verify_dpll_context(&r, TcPort::Tc1, 24_000).is_err());
+        r.set(0x45504, 0);
+
+        let pin_req = 2 << 2;
+        let current = read(&r, 0x45404).unwrap();
+        r.set(0x45404, current & !pin_req);
+        assert!(pin.verify_dpll_context(&r, TcPort::Tc1, 24_000).is_err());
     }
     #[test]
     fn ownership_checks_exact_boot_aperture_stolen_pte_and_allocator_exclusion() {
@@ -2523,7 +4047,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let probe_pitch = pitch_for(probe_target.kms.width).unwrap();
+        let probe_pitch = pitch_for(probe_target.kms.width, 4).unwrap();
         let probe_surface = probe_baseline.plane.surface();
         let mut probe_display_writes_started = false;
         let probe_result = super::super::tc_modeset::program(
@@ -2532,7 +4056,9 @@ mod tests {
             probe.port,
             &probe_target.timing,
             probe_pitch,
+            probe_baseline.plane.fourcc,
             probe_surface,
+            None,
             &probe_pll,
             None,
             &probe_avi,
@@ -2541,6 +4067,9 @@ mod tests {
             None,
             true,
             None,
+            None,
+            None,
+            false,
             &mut probe_display_writes_started,
         );
         assert!(probe_result.is_ok(), "direct TC program: {probe_result:?}");
@@ -2556,6 +4085,7 @@ mod tests {
                 &probe_observed,
                 &probe.baseline,
                 probe_target,
+                probe_baseline.plane.fourcc,
                 probe_surface,
                 probe_pitch,
                 &probe_pll,
@@ -2602,6 +4132,7 @@ mod tests {
                 &observed,
                 &a.baseline,
                 target,
+                intel_display::universal_plane::XRGB8888,
                 surface,
                 pitch,
                 &observed.pll.state,
@@ -2679,6 +4210,7 @@ mod tests {
                 &observed,
                 &a.baseline,
                 a.modes[0],
+                original.plane.fourcc,
                 old_surface,
                 original.plane.pitch,
                 &original.pll.state,
@@ -2770,7 +4302,7 @@ mod tests {
         dev.advance_vblank().unwrap();
         dev.advance_vblank().unwrap();
         let sequence = dev.vblank_sequence();
-        assert_eq!(sequence, 1);
+        assert_eq!(sequence, 256); // One step in PIPEFRAME high bits is 256 frames.
         a.present(target_scanout).unwrap();
         assert_eq!(a.state.lock().counter_epoch, 1);
         // Model the pipe's reset counter, not an IRQ-count substitution.
@@ -2784,8 +4316,8 @@ mod tests {
         dev.advance_vblank().unwrap();
         assert_eq!(
             dev.vblank_sequence(),
-            sequence + 1,
-            "one fresh hardware frame"
+            sequence + 256,
+            "one fresh PIPEFRAME high-field step"
         );
     }
 
@@ -2937,26 +4469,35 @@ mod tests {
         assert_eq!(dev.metrics().pending_vblank_events, 0);
         assert!(file.dequeue_event().is_none());
         assert_eq!(
-            a.validate_atomic_state(false, true, false),
+            a.validate_atomic_state(false, true, false, false),
             Err(DrmError::Unsupported)
         );
         assert_eq!(
-            a.validate_atomic_state(true, false, false),
+            a.validate_atomic_state(true, false, false, false),
             Err(DrmError::Unsupported)
         );
         assert_eq!(
-            a.validate_atomic_state(true, true, true),
+            a.validate_atomic_state(true, true, true, false),
             Err(DrmError::Unsupported)
+        );
+        assert_eq!(
+            a.validate_atomic_state(true, true, false, true),
+            Err(DrmError::Unsupported),
+            "degamma/CTM changes are not programmed by the native backend"
         );
     }
     #[test]
-    fn failed_pll_readout_restores_hip_and_terminally_closes_native_submission() {
+    fn failed_pll_readout_terminally_closes_native_submission() {
         let _context = crate::test_support::scheduler_test_context();
         let (a, r, _) = native();
         r.inner.lock().dkl.remove(&0x2214);
         assert_eq!(a.present(scanout(&a)).err(), Some(DrmError::DeviceLost));
         assert!(a.state.lock().lost);
-        assert_eq!(read(&r, 0x1010a0), Ok(0x44332211));
+        // The readout now runs through the translated shared-DPLL manager.
+        // Like i915's `intel_dkl_phy_read()`, it writes
+        // `HIP_INDEX_VAL(TC1, bank 2)` before the indexed access and does not
+        // restore the firmware selector afterwards.
+        assert_eq!(read(&r, 0x1010a0), Ok(0x2));
         let writes = r.inner.lock().log.len();
         assert_eq!(a.present(scanout(&a)).err(), Some(DrmError::DeviceLost));
         assert_eq!(r.inner.lock().log.len(), writes);

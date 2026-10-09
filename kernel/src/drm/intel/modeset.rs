@@ -62,6 +62,11 @@
 use alloc::{format, string::String, vec, vec::Vec};
 use core::cmp::Ordering;
 
+use intel_display::intel_display_modeset_full::{
+    self as i915_modeset, DisplayCaps as I915DisplayCaps, DisplayMode as I915DisplayMode,
+    ModeStatus as I915ModeStatus, Timing as I915Timing,
+};
+
 use super::{
     clk::{self, ClockError},
     fb::{self, FbError},
@@ -1294,13 +1299,15 @@ pub(crate) struct ModeRequest<'a> {
     /// guess between the two conventions the sources disagree about.
     pub(crate) encoding: PllFieldEncoding,
     /// §8.5's voltage-swing values, or `None` when nobody has them, which
-    /// makes the sequence refuse with `output`'s `MissingBufferTranslation`
+    /// uses the platform table when `None`
     /// naming the table and §13.1 item 12.
     pub(crate) swing: Option<SwingProgram>,
     /// `DDI_BUF_CTL.PHY_LINK_RATE`.  §8.6 gives no sourced HDMI encoding for
     /// it, so the honest value is [`LinkRate::NoSourcedEncoding`] until a
     /// working dump settles it (§13.4).
     pub(crate) link_rate: LinkRate,
+    /// i915 WM latency state captured from PCode before modesetting.
+    pub(crate) watermark: Option<pipe::WatermarkConfig>,
 }
 
 impl<'a> ModeRequest<'a> {
@@ -1325,6 +1332,7 @@ impl<'a> ModeRequest<'a> {
             encoding,
             swing: None,
             link_rate: LinkRate::NoSourcedEncoding,
+            watermark: None,
         }
     }
 
@@ -1343,6 +1351,11 @@ impl<'a> ModeRequest<'a> {
     /// `DDI_BUF_CTL.PHY_LINK_RATE`.
     pub(crate) const fn with_link_rate(mut self, link_rate: LinkRate) -> Self {
         self.link_rate = link_rate;
+        self
+    }
+
+    pub(crate) const fn with_watermark(mut self, watermark: pipe::WatermarkConfig) -> Self {
+        self.watermark = Some(watermark);
         self
     }
 }
@@ -1440,6 +1453,8 @@ pub(crate) enum ModesetError {
     NoCdclk { cdclk_khz: u32, detail: String },
     /// The DDI has no `DDI_BUF_CTL` in the register table.
     UnsupportedPort { ddi: Ddi },
+    /// The active kernel path has no PCode-derived watermark profile.
+    WatermarkUnavailable,
     /// The visible console dimensions must equal the programmed mode.
     SurfaceGeometry {
         surface: (u32, u32),
@@ -1455,6 +1470,13 @@ pub(crate) enum ModesetError {
     Output(OutputError),
     /// §11 phase 4.3, after phase 5: `PLANE_CTL` and `PLANE_SURF`.
     Arm(PipeError),
+    /// The display-12/13 i915 timing admission rejected this mode.
+    IntelModeStatus(I915ModeStatus),
+    /// The source HDMI RGB/8-bpc/no-scrambling clock policy rejected it.
+    HdmiClockPolicy {
+        clock_khz: u32,
+        sink_limit_khz: Option<u32>,
+    },
 }
 
 impl ModesetError {
@@ -1462,6 +1484,16 @@ impl ModesetError {
     pub(crate) fn describe(&self) -> String {
         match self {
             ModesetError::Refused(refusal) => refusal.describe(),
+            ModesetError::IntelModeStatus(status) => {
+                format!("i915 display-13 mode validation rejected the selected timing: {status:?}")
+            }
+            ModesetError::HdmiClockPolicy {
+                clock_khz,
+                sink_limit_khz,
+            } => format!(
+                "the translated HDMI RGB/8-bpc/no-scrambling policy rejected {clock_khz} kHz \
+                 (sink TMDS limit {sink_limit_khz:?}, source limit 300000 kHz)"
+            ),
             ModesetError::Clock(error) => {
                 format!(
                     "the CDCLK registers could not be read: {}",
@@ -1479,6 +1511,9 @@ impl ModesetError {
                  DDI_BUF_CTL for A and B, and reference section 8.8 defers the Type-C/DKL path \
                  entirely",
                 ddi.name()
+            ),
+            ModesetError::WatermarkUnavailable => String::from(
+                "source-derived watermark latency state is missing; the display plane is not armed",
             ),
             ModesetError::SurfaceGeometry { surface, mode } => format!(
                 "framebuffer {}x{} does not match scanout {}x{}",
@@ -1521,12 +1556,81 @@ pub(crate) fn preflight_mode<R: Registers>(
             detail: cdclk.describe(),
         });
     }
+    preflight_mode_at_cdclk(plan, edid, cdclk.cdclk_khz)
+}
 
-    let choice = choose_mode(plan, edid, EngineLimits::at_cdclk(cdclk.cdclk_khz));
+/// Preflight against a clock ceiling already admitted by the caller. The boot
+/// rollback transaction uses this before a CDCLK increase, but only after its
+/// own all-pipes-disabled check.
+pub(crate) fn preflight_mode_at_cdclk(
+    plan: &ModePlan,
+    edid: &[u8],
+    cdclk_khz: u32,
+) -> Result<(ModeChoice, Mode), ModesetError> {
+    if cdclk_khz == 0 {
+        return Err(ModesetError::NoCdclk {
+            cdclk_khz,
+            detail: String::from("CDCLK ceiling must be non-zero"),
+        });
+    }
+    let choice = choose_mode(plan, edid, EngineLimits::at_cdclk(cdclk_khz));
     let mode = match choice.into_mode() {
         Ok(mode) => mode,
         Err(refusal) => return Err(ModesetError::Refused(refusal)),
     };
+
+    // Apply the source's RGB/8-bpc HDMI TMDS policy during mode admission, not
+    // only as a last-moment output-program check. This path drives a combo PHY;
+    // use a parsed CTA VSDB limit when present, leaving absent fields unknown.
+    let sink_tmds_limit = Edid::parse_lossy(edid)
+        .ok()
+        .and_then(|sink| sink.max_tmds_clock_khz());
+    if super::tc_modeset::source_hdmi_tmds_clock_with_limit(
+        &mode,
+        sink_tmds_limit,
+        intel_display::intel_hdmi_full::HdmiPortClass::Combo,
+    )
+    .is_none()
+    {
+        return Err(ModesetError::HdmiClockPolicy {
+            clock_khz: mode.clock_khz,
+            sink_limit_khz: sink_tmds_limit,
+        });
+    }
+
+    let i915_caps = I915DisplayCaps {
+        display_version: 13,
+        cdclk_max_dotclock: cdclk_khz,
+        ..I915DisplayCaps::default()
+    };
+    let i915_mode = I915DisplayMode {
+        timing: I915Timing {
+            hdisplay: u32::from(mode.hdisplay),
+            hsync_start: u32::from(mode.hsync_start),
+            hsync_end: u32::from(mode.hsync_end),
+            htotal: u32::from(mode.htotal),
+            hblank_start: u32::from(mode.hdisplay),
+            hblank_end: u32::from(mode.htotal),
+            vdisplay: u32::from(mode.vdisplay),
+            vblank_start: u32::from(mode.vdisplay),
+            vblank_end: u32::from(mode.vtotal),
+            vsync_start: u32::from(mode.vsync_start),
+            vsync_end: u32::from(mode.vsync_end),
+            vtotal: u32::from(mode.vtotal),
+            clock_khz: mode.clock_khz,
+        },
+        vscan: 1,
+        ..I915DisplayMode::default()
+    };
+    for status in [
+        i915_modeset::intel_mode_valid(i915_caps, &i915_mode),
+        i915_modeset::intel_cpu_transcoder_mode_valid(i915_caps, &i915_mode),
+        i915_modeset::intel_mode_valid_max_plane_size(i915_caps, &i915_mode, 1),
+    ] {
+        if status != I915ModeStatus::Ok {
+            return Err(ModesetError::IntelModeStatus(status));
+        }
+    }
 
     Ok((choice, mode))
 }
@@ -1607,14 +1711,34 @@ pub(crate) fn set_mode<R: Registers, T: PollTimer>(
 
     // Compute the whole program before the first write, so that a computation
     // that cannot succeed costs no register writes at all.
-    let pipe_program = pipe::compute(
-        request.pipe,
-        &mode,
-        pipe::PlaneSurface {
-            ggtt_address: request.surface.ggtt_address(),
-            stride_bytes: request.surface.stride(),
-        },
-    )
+    let pipe_program = match request.watermark {
+        Some(watermark) => pipe::compute_with_watermarks(
+            request.pipe,
+            &mode,
+            pipe::PlaneSurface {
+                ggtt_address: request.surface.ggtt_address(),
+                stride_bytes: request.surface.stride(),
+            },
+            watermark,
+        ),
+        None => {
+            #[cfg(test)]
+            {
+                pipe::compute(
+                    request.pipe,
+                    &mode,
+                    pipe::PlaneSurface {
+                        ggtt_address: request.surface.ggtt_address(),
+                        stride_bytes: request.surface.stride(),
+                    },
+                )
+            }
+            #[cfg(not(test))]
+            {
+                return Err(ModesetError::WatermarkUnavailable);
+            }
+        }
+    }
     .map_err(ModesetError::Pipe)?;
 
     let platform_ref_khz =

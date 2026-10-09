@@ -217,13 +217,18 @@ pub(crate) const TRANS_CLK_SEL_D: Register =
 ///
 /// It picks the DDI (`TGL_TRANS_DDI_SELECT_PORT(p) = (p + 1) << 27`), the
 /// output mode (`[26:24]`: HDMI = 0, DVI = 1, DP SST = 2, DP MST = 3), the bits
-/// per colour (`[22:20]`), the sync polarities (bits 17 and 16) and the port
-/// width (`(lanes - 1) << 1` in `[3:1]`).  Section 11 step 5.5 writes the HDMI
+/// per colour (`[22:20]`), the sync polarities (bits 17 and 16) and, on
+/// display version 14+, the port width (`(lanes - 1) << 1` in `[3:1]`). Section 11 step 5.5 writes the HDMI
 /// value for the first bring-up; the old values for the mode-select, polarity
 /// and high-TMDS fields in an earlier draft of section 8.4 were wrong, and the
 /// corrected table is the one used here.
 pub(crate) const TRANS_DDI_FUNC_CTL_A: Register =
     Register::read_write("TRANS_DDI_FUNC_CTL(A)", 0x6_0400, Meaning::BringUp, None);
+
+/// `TRANS_DDI_FUNC_CTL2(A)`, the port-sync companion written before FUNC_CTL
+/// by i915's `intel_ddi_enable_transcoder_func()` on display version 11+.
+pub(crate) const TRANS_DDI_FUNC_CTL2_A: Register =
+    Register::read_write("TRANS_DDI_FUNC_CTL2(A)", 0x6_0404, Meaning::BringUp, None);
 
 /// `TRANS_DDI_FUNC_CTL(B)`, the mode select for transcoder B; reference section 8.4.
 ///
@@ -481,10 +486,9 @@ pub(crate) const DDI_BUF_TRANS_HI_B9: Register =
  *   instances of each and says which one the sequence uses.
  *
  * Registers deliberately left out
- * - `DP_AUX_CH_CTL` (`0x64010`/`0x64110`) and `DP_AUX_CH_DATA(i)` (`0x64014 +
- *   i*4`, five registers): section 8.4 documents them, but section 11's bring-up
- *   reads EDID over GMBUS and the section 8.6 sequence never touches AUX.  They
- *   belong to the DP path (sections 8.7 and 9.6).
+ * - `DP_AUX_CH_CTL` and `DP_AUX_CH_DATA(i)` are declared in `regs/aux.rs` for
+ *   the A/B channels currently used by the translated DP AUX transport;
+ *   additional channels require their platform-specific power/register map.
  * - `ICL_DPCLKA_CFGCR0` (`0x164280`) and the per-PHY `DDI_CLK_OFF` bits: written
  *   by section 8.6 step 4 and section 11 step 5.2, but the document gives them
  *   as PLL routing (section 6.3) and the clock workstream owns them.
@@ -531,7 +535,8 @@ pub(crate) const DDI_BUF_TRANS_HI_B9: Register =
  *   `base + 0x880 + ln*0x100`, with PHY A at `0x162000` and PHY B at `0x06C000`.
  *
  * Overlap with the sibling register-group files (resolve when they are merged)
- * - `DDI_BUF_CTL_A`, `DDI_BUF_CTL_B` and `TRANS_DDI_FUNC_CTL_A` are declared
+ * - `DDI_BUF_CTL_A`, `DDI_BUF_CTL_B`, `TRANS_DDI_FUNC_CTL_A` and
+ *   `TRANS_DDI_FUNC_CTL2_A` are declared
  *   both here and in `regs-phy.rs`, at the same offsets (`0x6_4000`, `0x6_4100`,
  *   `0x6_0400`): one of the two declarations has to go, and section 8.4's DDI
  *   table is this group's.

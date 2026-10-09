@@ -5,18 +5,26 @@
 //! and translates UAPI requests into these typed operations.
 
 mod atomic;
+mod atomic_uapi_full;
+mod color_mgmt_full;
+mod connector_uapi_full;
+mod crtc_uapi_full;
 mod device;
 mod dmabuf;
 mod fbdev;
 pub(crate) mod fence;
+mod framebuffer_uapi_full;
 mod file;
 mod gem;
 pub(crate) mod intel;
 mod ioctl;
 mod kms;
+mod mode_config_full;
 pub(crate) mod linear;
 pub mod modes;
 mod property;
+mod plane_uapi_full;
+mod property_uapi_full;
 mod render;
 mod syncobj;
 pub(crate) mod uapi;

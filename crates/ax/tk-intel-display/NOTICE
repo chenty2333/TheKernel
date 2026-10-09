@@ -5,15 +5,40 @@ is bundled; external capture tests read user-supplied files without modifying th
 
 src/device.rs:
   drivers/gpu/drm/i915/display/intel_display_device.c:
-  adl_p_steppings, adl_p_adl_n_steppings, get_pre_gmdid_step, xe_lpd_display
+  find_platform_desc/get_pre_gmdid_step display-12/13 TGL/RKL/ADL-S/ADL-P/ADL-N
+  PCI identities, stepping maps, port masks and DMC platform selection
   Copyright © 2023 Intel Corporation.
   include/drm/intel/pciids.h (PCI identity facts): Copyright 2013 Intel Corporation.
-src/bios.rs:
+src/intel_bios.rs:
   drivers/gpu/drm/i915/display/intel_bios.c:
-  intel_bios_is_valid_vbt, _get_blocksize, find_raw_section,
-  child_device_expected_size, parse_general_definitions, dvo_port_to_port,
-  map_ddc_pin, intel_bios_encoder_supports_{dvi,hdmi,dp,edp,typec_usb,tbt},
-  intel_bios_hdmi_max_tmds_clock, sanitize_dedicated_external
+  _get_blocksize, find_raw_section, raw_block_offset, intel_bios_is_valid_vbt,
+  parse_general_features, parse_general_definitions, child_device_expected_size,
+  child_device_size_valid, parse_driver_features, parse_panel_driver_features,
+  parse_power_conservation_features, intel_bios_ssc_frequency,
+  intel_bios_encoder_supports_*, intel_bios_encoder_data_lookup,
+  intel_bios_hdmi_max_tmds_clock, sanitize_dedicated_external, dvo_port_to_port,
+  dvo_port_type, intel_bios_encoder_port, intel_bios_is_tv_present,
+  intel_bios_is_lvds_present, intel_bios_is_port_present,
+  intel_bios_encoder_supports_dp_dual_mode,
+  parse_bdb_216_dp_max_link_rate, parse_bdb_230_dp_max_link_rate,
+  edp_rate_override_mask, intel_bios_dp_max_link_rate,
+  intel_bios_dp_max_lane_count, intel_bios_encoder_reject_edp_rate,
+  intel_bios_dp_boost_level, intel_bios_hdmi_boost_level,
+  intel_bios_hdmi_ddc_pin, translate_iboost, map_aux_ch,
+  intel_bios_dp_aux_ch, intel_bios_dp_has_shared_aux_ch,
+  parse_compression_parameters, fill_dsc, init_bdb_block, init_bdb_blocks,
+  bdb_find_section, init_vbt_defaults, init_vbt_panel_defaults,
+  init_vbt_missing_defaults, intel_bios_init_panel, parse_panel_options,
+  parse_generic_dtd, parse_lfp_backlight, parse_lfp_data,
+  parse_edp, parse_psr, lfp_data_min_size, validate_lfp_data_ptrs,
+  fixup_lfp_data_ptrs, make_lfp_data_ptr, next_lfp_data_ptr,
+  generate_lfp_data_ptrs, get_lfp_dvo_timing, get_lfp_fp_timing,
+  get_lfp_pnp_id, get_lfp_data_tail, fill_detail_timing_data,
+  dsi_dvo_port_to_port, intel_bios_encoder_port, intel_bios_is_dsi_present,
+  parse_dsi_backlight_ports, parse_mipi_config, find_panel_sequence_block,
+  parse_mipi_sequence, goto_next_sequence, goto_next_sequence_v3.
+  drivers/gpu/drm/i915/display/intel_dsi_vbt_defs.h:
+  MIPI configuration, PPS and sequence layouts. Copyright © 2025 Intel Corporation.
   Copyright © 2006 Intel Corporation.
   drivers/gpu/drm/i915/display/intel_vbt_defs.h: selected byte-layout fields
   Copyright © 2006-2016 Intel Corporation.
@@ -23,9 +48,11 @@ src/opregion.rs:
   Copyright 2008 Intel Corporation <hong.liu@intel.com>
   Copyright 2008 Red Hat <mjg@redhat.com>
 
-Only display 13 ADL-P/N semantic paths are included. Safety divergences are
-explicitly documented in each file and README.md. Original TheKernel adapter
-and tests are MIT (Copyright 2026 TheKernel contributors).
+This crate includes display-12/13 source data and selected hardware paths;
+each module entry below bounds what is translated. The kernel's native PCI
+binding and modeset orchestration remain N305-specific. Safety divergences are
+documented in each file and README.md. Original TheKernel adapter and tests are
+MIT (Copyright 2026 TheKernel contributors).
 
 src/display.rs:
   drivers/gpu/drm/i915/display/intel_display.c:
@@ -219,3 +246,37 @@ intel_ddi.c::tgl_dkl_phy_set_signal_levels/intel_ddi_level, HDMI DKL table
 from intel_ddi_buf_trans.c and known Wa_16011342517 selection. Copyright
 ©2012/2020/2023 Intel, full grant in LICENSE-MIT. Runtime uses verified VBT5
 before buffer enable; complete PHY before-image remains the rollback source.
+
+DMC firmware selection and parsing: src/dmc.rs translates the display-12/13
+portion of intel_dmc.c::dmc_firmware_default(), parse_dmc_fw(),
+parse_dmc_fw_header(), and fw_info_matches_stepping(). Copyright ©2014 Intel
+Corporation; full grant in LICENSE-MIT. Rootfs binary inputs are external and
+carry Intel's separate LICENSE.i915; this crate contains no DMC image or MMIO
+programming.
+
+Display power-well data: src/power_map.rs translates the display-12 TGL/RKL/
+ADL-S and display-13 XELPD domain lists, well groups, platform order, and
+instance metadata from intel_display_power_map.c. Copyright ©2022 Intel
+Corporation; full grant in LICENSE-MIT. Kernel MMIO/refcount integration is
+separate and remains in progress.
+
+Power domains: src/power_domains.rs translates the synchronous domain get/put,
+is_enabled/get_if_enabled, domain names, per-domain map sync and two-batch async
+put queue from intel_display_power.c (MIT, Copyright ©2022 Intel). Kernel work-
+queue/runtime-PM ownership and full-platform lifecycle are not yet integrated.
+
+Haswell power-well handshake: src/power_well.rs translates
+intel_display_power_well.c::pw_idx_to_pg(), hsw_power_well_requesters(),
+gen9_wait_for_power_well_fuses(), hsw_wait_for_power_well_enable/disable(),
+hsw_power_well_enable/disable(), and hsw_power_well_enabled() (MIT, Copyright
+©2022 Intel). The kernel's typed register adapter uses this path for PW_1 and
+the current DDI-IO power requests; interrupt-dependent well variants remain.
+The same file also translates HSW BIOS-to-driver sync and TGL/ICL TC-cold PCODE
+retry primitives; TC well mapping and the parent-PCODE kernel backend remain.
+
+DC state fields: src/dc_state.rs translates intel_display_power_well.c
+gen9_dc_mask(), gen9_write_dc_state(), and the MMIO field portion of
+gen9_set_dc_state(), plus allowed/target state policy and DC6 observer edges
+from intel_display_power.c. Copyright ©2022 Intel Corporation; full grant in
+LICENSE-MIT. The kernel uses the setter for initial disable; runtime PSR/DMC
+observers and DC5/6/9 transitions remain.

@@ -82,10 +82,17 @@
 //! context after the read.
 
 mod audio;
+pub(super) mod atomic_modeset_wiring;
 mod clk;
+mod combo_phy_full;
 mod connect;
+mod cursor;
+mod ddi;
 pub(crate) mod debugfs;
 mod dma;
+mod dmc;
+mod de_io;
+mod dp_aux;
 mod fastboot;
 pub(crate) mod fb;
 mod firmware_scanout;
@@ -93,6 +100,7 @@ mod firmware_snapshot;
 pub(super) mod gem_context;
 pub(super) mod gem_exec;
 mod gmbus;
+mod gmbus_full;
 mod gt;
 mod gt_probe;
 pub(crate) mod gtt;
@@ -101,15 +109,21 @@ mod i915_port;
 mod id;
 mod irq;
 mod modeset;
+mod native_modeset_ops;
+mod native_kms_projection;
+mod native_pipe;
+mod native_scaler;
 mod output;
 mod pattern;
 mod pci;
+mod pcode;
 mod phy;
 mod pipe;
 mod pll;
 mod power;
 mod probe;
 mod regs;
+mod shared_dpll;
 mod rollback;
 pub(crate) mod scanout;
 mod sink;
@@ -310,6 +324,9 @@ pub(crate) fn bring_up_at_boot() {
         axlog::info!("intel-gpu: no mapped display; no writes");
         return;
     }
+    if let Some((device, revision)) = identified_device_and_revision() {
+        dmc::request_for_device(device, revision);
+    }
     if axhal::boot::command_line_value("intel.modeset") != Some("1") {
         axlog::warn!(
             "intel-gpu: native display writes disabled by default; firmware console unchanged"
@@ -424,6 +441,7 @@ fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, Str
         tx.quiesce(&gmbus::MonotonicTimer)?;
         let state = power::bring_up_preserving_phys(&tx, reusable).map_err(|e| e.describe())?;
         *POWER.lock() = Some(state);
+        dmc::display_power_ready(*window, intel_display::dmc::DmcPlatform::AlderLakeN);
         let resolved = connect::resolve_device(bdf, &tx, &gmbus::MonotonicTimer);
         let mut report = connect::ConnectReport::default();
         report.hotplug.push((bdf, resolved.hotplug));
@@ -468,12 +486,18 @@ fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, Str
 /// dependency-aware rollback. Both failed and successful DMA surfaces remain
 /// owned; no old-GOP-console claim is made merely from an allocation/address.
 #[cfg(target_os = "none")]
-fn modeset_at_boot(regs: &impl Registers, gtt: &gtt::Gtt, pll_id: u8) -> Result<String, String> {
+fn modeset_at_boot<R: Registers>(
+    tx: &rollback::Transaction<'_, R>,
+    gtt: &gtt::Gtt,
+    pll_id: u8,
+) -> Result<String, String> {
     use alloc::sync::Arc;
+    let regs = tx;
     let report = CONNECT
         .lock()
         .take()
         .ok_or_else(|| String::from("connector report absent"))?;
+    let mut runtime_cdclk_transition = None;
     let result = (|| {
         let connector = report
             .connectors
@@ -486,8 +510,55 @@ fn modeset_at_boot(regs: &impl Registers, gtt: &gtt::Gtt, pll_id: u8) -> Result<
         if let Some(extension) = &connector.extension {
             edid.extend_from_slice(extension.as_slice());
         }
-        let (_, mode) =
-            modeset::preflight_mode(regs, &connector.plan, &edid).map_err(|e| e.describe())?;
+        let clock_before = clk::observe(regs).map_err(|error| error.describe())?;
+        if !clock_before.usable() {
+            return Err(clock_before.describe());
+        }
+        // Pipe A was quiesced by this transaction. Raise CDCLK only if every
+        // pipe is now disabled; otherwise mode choice stays bounded by the
+        // live firmware clock and no transition is attempted.
+        let can_reclock = tx.pipes_disabled();
+        let selection_cdclk = if can_reclock {
+            clk::maximum_cdclk(clock_before.reference).unwrap_or(clock_before.cdclk_khz)
+        } else {
+            clock_before.cdclk_khz
+        };
+        let (_, mode) = modeset::preflight_mode_at_cdclk(&connector.plan, &edid, selection_cdclk)
+            .map_err(|error| error.describe())?;
+        if mode.clock_khz > clock_before.cdclk_khz {
+            if !can_reclock {
+                return Err(String::from(
+                    "CDCLK increase refused while any display pipe is active or unreadable",
+                ));
+            }
+            let target =
+                clk::entry_at_least(clock_before.reference, mode.clock_khz).ok_or_else(|| {
+                    alloc::format!(
+                        "no source CDCLK row can carry selected mode clock {} kHz",
+                        mode.clock_khz
+                    )
+                })?;
+            let timer = gmbus::MonotonicTimer;
+            let transition = tx.transition_cdclk(&timer, target)?;
+            if transition.after.cdclk_khz < mode.clock_khz {
+                return Err(alloc::format!(
+                    "CDCLK transition read back {} kHz, below selected mode {} kHz",
+                    transition.after.cdclk_khz,
+                    mode.clock_khz
+                ));
+            }
+            axlog::info!(
+                "intel-cdclk: raised CDCLK from {} to {} kHz before modeset ({:?}, unlock timeout \
+                 {}, lock timeout {}, crawl ACK timeout {})",
+                clock_before.cdclk_khz,
+                transition.after.cdclk_khz,
+                transition.method,
+                transition.unlock_timed_out,
+                transition.lock_timed_out,
+                transition.crawl_ack_timed_out,
+            );
+            runtime_cdclk_transition = Some(transition);
+        }
         axlog::info!(
             "intel-modeset: EDID selected {}x{} clock={} kHz",
             mode.hdisplay,
@@ -501,6 +572,11 @@ fn modeset_at_boot(regs: &impl Registers, gtt: &gtt::Gtt, pll_id: u8) -> Result<
             fb::Format::Xrgb8888,
         )
         .map_err(|e| e.describe())?;
+        let watermark = POWER
+            .lock()
+            .as_ref()
+            .map(power::PowerState::watermark_config)
+            .ok_or_else(|| String::from("PCode-derived watermark state absent"))?;
         let mut request = modeset::ModeRequest::new(
             connector.ddi,
             pipe::Pipe::A,
@@ -509,6 +585,7 @@ fn modeset_at_boot(regs: &impl Registers, gtt: &gtt::Gtt, pll_id: u8) -> Result<
             &surface,
             pll::PllFieldEncoding::Named,
         );
+        request = request.with_watermark(watermark);
         request.pll_id = pll_id;
         request.swing = swing::read_firmware_swing(regs, connector.ddi).ok();
         request.link_rate = output::LinkRate::NoSourcedEncoding;
@@ -534,6 +611,11 @@ fn modeset_at_boot(regs: &impl Registers, gtt: &gtt::Gtt, pll_id: u8) -> Result<
                     }),
                 );
                 if success {
+                    if let Some(transition) = runtime_cdclk_transition {
+                        if let Some(state) = POWER.lock().as_mut() {
+                            state.runtime_cdclk_transition = Some(transition);
+                        }
+                    }
                     Ok(text)
                 } else {
                     Err(alloc::format!("native scanout not proven: {text}"))
@@ -974,13 +1056,15 @@ pub(crate) fn report_text() -> String {
 }
 
 /// Whether the boot probe found a display device it could identify.
-pub(crate) fn identified_device() -> Option<&'static id::DisplayDevice> {
+pub(crate) fn identified_device_and_revision() -> Option<(&'static id::DisplayDevice, u8)> {
     let report = REPORT.lock();
     let report = report.as_ref()?;
-    report
-        .displays
-        .iter()
-        .find_map(|found| found.identity.device())
+    report.displays.iter().find_map(|found| {
+        found
+            .identity
+            .device()
+            .map(|device| (device, found.info.revision))
+    })
 }
 
 /// Run the probe against the platform's PCI bus.

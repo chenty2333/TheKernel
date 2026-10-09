@@ -99,7 +99,7 @@ mod tests {
     #[ignore = "requires THEKERNEL_N305_CAPTURE private input; run explicitly"]
     fn captured_edid_to_tc_pll_and_preserved_cdclk() {
         use intel_display::{
-            bios::Vbt,
+            intel_bios::Vbt,
             cdclk,
             device::{Port, Step},
             dpll_mgr,
@@ -151,10 +151,12 @@ mod tests {
         let bytes = std::fs::read(debug.join("i915_vbt")).unwrap();
         let vbt = Vbt::parse(&bytes).unwrap();
         let route = vbt
-            .parse_general_definitions()
+            .parse_general_definitions(
+                13,
+                intel_display::dmc::DmcPlatform::AlderLakeN,
+            )
             .unwrap()
             .encoder(Port::Tc1)
-            .unwrap()
             .unwrap();
         assert!(route.supports_hdmi() && !route.usb_type_c && !route.lspcon);
         assert_eq!(route.gmbus_pin(), Some(9));

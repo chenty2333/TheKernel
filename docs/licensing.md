@@ -542,6 +542,260 @@ Mesa/Buildroot package license obligations already registered above. No Mesa
 binary is committed. The dedicated flavor and loader check are original
 project scripts; they do not import a LinuxKPI, GPL driver body or new firmware.
 
+`src/dmc.rs` additionally translates only the display-12/13 firmware path and
+size selection from MIT `intel_dmc.c::dmc_firmware_default()` (2014 Intel).
+The rootfs builder accepts pre-decompressed firmware only through
+`THEKERNEL_I915_DMC_FIRMWARE_DIR`, requires the Intel `LICENSE.i915` notice,
+and stages that notice beside the five TGL/RKL/ADL-S/ADL-P DMC images. The
+binary blobs are external build inputs, never repository files. A deferred
+rootfs request retains the bytes until the opt-in power-ready path uploads
+validated programs and firmware MMIO values with readback. The Intel binary grant permits
+unmodified binary redistribution with its conditions/disclaimer and forbids
+reverse engineering/decompilation/disassembly; input preparation must respect
+that restriction. The display DMC parser translates the published Linux
+v7.2.3 `intel_dmc.c` parser (MIT, Copyright © 2014 Intel), not a reverse
+engineering of the firmware binary. It parses CSS/package metadata and v1/v3
+DMC headers without altering, decompiling, or disassembling the image. Event
+workarounds and the register adapter implement the display-12/13 upload path;
+only the opt-in N305 bring-up currently consumes it.
+
+`tk-intel-display/src/power_map.rs` also translates the MIT TGL/RKL/ADLS/XELPD
+power-domain and power-well tables from Linux v7.2.3
+`intel_display_power_map.c` (Copyright © 2022 Intel). The tables add no firmware
+or binary inputs; synchronous refcounts are in `power_domains.rs` and the
+opt-in core sequence currently requests the Pipe-A/PW_A domain.
+
+The MIT `intel_display_power_well.c` request/fuse helpers are translated in
+`tk-intel-display/src/power_well.rs` (Copyright © 2022 Intel), with the current
+kernel adapter invoking them using typed register access. No firmware or binary
+payload is imported by this code.
+
+The synchronous display power-domain accounting in
+`tk-intel-display/src/power_domains.rs` translates MIT `intel_display_power.c`
+reference edges (Copyright © 2022 Intel). It operates on the previously listed
+power-well map and carries no firmware or binary inputs.
+
+The MIT `intel_display_power_well.c` DC mask/write-retry functions and
+`intel_display_power.c` allowed-mask, target-sanitize, and state query helpers
+are translated in `tk-intel-display/src/dc_state.rs` (Copyright © 2022 Intel).
+The kernel uses the source retry loop for initial disable; DMC-controlled
+DC5/6/9 transitions and runtime lifecycle are not included.
+
+The MIT `intel_display_power_domain_str()` diagnostic name mapping and full
+power-domain identifier set from `intel_display_power.c` are translated in
+`tk-intel-display/src/power_domains.rs` and `power_map.rs` (Copyright © 2022
+Intel).
+
+The tracked `gen9_set_dc_state()` helper in `tk-intel-display/src/dc_state.rs`
+translates the MIT request-mask clamp, PSR/DC6 observer boundaries, owned-field
+update, retry/readback, and stored state from `intel_display_power_well.c`
+(Copyright © 2022 Intel). The kernel uses it for the boot-time disable path;
+its no-op observer is only for initialization, before PSR/DMC policy exists.
+
+`tk-intel-display/src/power_well.rs` also translates the BIOS-to-driver request
+handoff in `hsw_power_well_sync_hw()` (MIT, Copyright © 2022 Intel). The
+requester observations preserve the upstream BIOS, driver, KVMR, debug order.
+
+The HSW PW_1 workaround gate in `kernel/src/drm/intel/power.rs` is platform-
+qualified to Alder Lake-P/N and PG1, matching `intel_display_power_well.c`
+(Copyright © 2022 Intel).
+
+The Intel display adapter now uses the source-specific HSW, ICL AUX and ICL DDI
+BIOS/driver/KVMR/debug request-register groups (the ICL groups omit KVMR) for
+power-well readback and handoff (MIT, Copyright © 2022 Intel).
+
+The kernel power-well adapter carries each map descriptor's `irq_pipe_mask` to
+`HswWellSpec`; when its parent IRQ is live, untranslated per-pipe IRQ changes
+are refused rather than silently bypassed (mapping metadata from MIT
+`intel_display_power_map.c`, Copyright © 2022 Intel).
+
+`PowerDomainState::sync_domain()` and the kernel Pipe-A initialization hook
+translate the source's mapped-well hardware sync pass, including HSW BIOS
+request handoff (`intel_display_power.c`/`intel_display_power_well.c`, MIT,
+Copyright © 2022 Intel). Only the Pipe-A domain is integrated at present.
+
+The source `sanitize_disable_power_well_option()` defaulting helper is also
+translated in `tk-intel-display/src/dc_state.rs` (MIT, Copyright © 2022 Intel).
+
+`PowerDomainIo::well_is_enabled()` now delegates to the translated HSW predicate,
+which requires both the driver request and state bits on display 12/13 (MIT,
+Copyright © 2022 Intel).
+
+`PowerDomainState` also translates i915's two-batch delayed async-put domain
+queue, pending-get reference reuse, batch requeue delay, and flush operation
+from `intel_display_power.c` (MIT, Copyright © 2022 Intel). Scheduling and
+runtime-PM reference ownership remain caller responsibilities.
+
+`tk-intel-display/src/power_well.rs` translates TGL `tgl_tc_cold_request()`
+(three PCODE reads with 1 ms retry delay and block-failed handling) and ICL
+`icl_tc_cold_exit()` (three EAGAIN retries, 1 ms completion delay) from
+`intel_display_power_well.c` (MIT, Copyright © 2022 Intel). PCODE transport
+integration remains in the kernel adapter.
+
+The MIT `intel_display_device.c` translation in `tk-intel-display/src/device.rs`
+now recognizes display-12/13 TGL, RKL, ADL-S, ADL-P and ADL-N PCI IDs, their
+pre-GMD_ID stepping maps, DMC platform, version and default port tables
+(Copyright © 2023 Intel; ID values from MIT-licensed `pciids.h`, Copyright
+© 2013 Intel).
+
+`tk-intel-display/src/ddi_buf_trans.rs` translates display 12/13 DDI buffer-translation
+entry data and platform table selection from `intel_ddi_buf_trans.c` (MIT,
+Copyright © 2020 Intel). `LICENSE-MIT` is included in the crate.
+
+`kernel/src/drm/intel/phy.rs::combo_phy_power_up_lane_mask` translates the
+`intel_combo_phy_power_up_lanes()` lane-mask cases (MIT, Copyright © 2018 Intel).
+The matching `LICENSE-MIT` is included in the display crate.
+
+`tk-intel-display/src/tc.rs` contains TC mode-query/HPD-glitch helpers and ICL/MTL
+maximum-lane-count dispatch from `intel_tc.c` (MIT, Copyright © 2019 Intel);
+`LICENSE-MIT` is included in the crate.
+
+The HSW HDMI DIP write path in `tk-intel-display/src/hdmi.rs` follows
+`intel_hdmi.c::intel_write_infoframe()` and `hsw_write_infoframe()` (MIT,
+Copyright 2006 Dave Airlie and © 2006-2009 Intel); `LICENSE-MIT` is included.
+
+`tk-intel-display/src/hdmi.rs` additionally includes GCP phase selection and the
+HSW GCP/AVI/SPD/vendor/DRM set-infoframes sequence from `intel_hdmi.c` (MIT,
+Copyright 2006 Dave Airlie and © 2006-2009 Intel).
+
+`kernel/src/drm/intel/combo_phy_full.rs` contains the source-shaped display-12/13
+combo PHY init, verification, uninit and lane-power functions from
+`intel_combo_phy.c` (MIT, Copyright © 2018 Intel). The grant is covered by the
+included `LICENSE-MIT`.
+
+HDMI SPD defaults and DRM metadata gates in `tk-intel-display/src/hdmi.rs` follow
+`intel_hdmi_compute_spd_infoframe()` and `intel_hdmi_compute_drm_infoframe()`
+(MIT, © 2006-2009 Intel).
+
+`tk-intel-display/src/hdmi.rs::intel_hdmi_infoframe_enable` translates the
+HDMI/DP packet-type software-slot mapping from `intel_hdmi.c` (MIT, © 2006-2009
+Intel).
+
+`tk-intel-display/src/tc_state_machine.rs` translates the display-12/13 Type-C
+state machine from `intel_tc.c` (MIT, Copyright © 2019 Intel); the only omitted
+applicable source function is the C pointer cast `to_tc_port()`. The complete
+MIT grant is in `LICENSE-MIT`.
+
+`tk-intel-display/src/hdmi.rs` also includes HDMI TMDS rate calculation and
+source/sink BPC gating from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
+
+`hdmi.rs` also contains source/sink/downstream TMDS clock and BPC selection
+helpers from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
+
+`tk-intel-display/src/hdmi.rs` also translates HDMI/DVI sink audio, limited-range,
+and YCbCr420 format policy helpers from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
+
+HDMI sink/cloned detection, YCbCr420 state and scrambling-support predicates in
+`hdmi.rs` follow `intel_hdmi.c` (MIT, © 2006-2009 Intel).
+
+`tk-intel-display/src/dp_aux.rs` translates the 35 source functions in
+`intel_dp_aux.c` (MIT, Copyright © 2020-2021 Intel). The full grant is in the
+crate's `LICENSE-MIT` file.
+
+`tk-intel-display/src/intel_dp_link_training_full.rs` translates the applicable
+DisplayPort link-training protocol functions in `intel_dp_link_training.c` (MIT,
+Copyright © 2008-2015 Intel). Its grant is included in `LICENSE-MIT`.
+
+`tk-intel-display/src/intel_gmbus_full.rs` translates 30 protocol and GPIO
+functions from `intel_gmbus.c` (MIT, © 2006 Dave Airlie and © 2006-2008,
+2010 Intel). The full grant is preserved in the module header and `LICENSE-MIT`.
+
+`tk-intel-display/src/intel_hotplug_full.rs` translates 37 HPD policy and
+workqueue functions from `intel_hotplug.c` (MIT, © 2015 Intel); its module
+header preserves the complete grant.
+
+`tk-intel-display/src/intel_dp_full.rs` translates 284 DisplayPort policy and
+configuration functions from `intel_dp.c` (MIT, © 2008 Intel). Its grant is
+included in `LICENSE-MIT`.
+
+`tk-intel-display/src/intel_hotplug_irq_full.rs` translates all 93 HPD IRQ
+functions in `intel_hotplug_irq.c` (MIT, © 2023 Intel). Its grant is included
+in `LICENSE-MIT`.
+
+`tk-intel-display/src/intel_ddi_full.rs` translates the 208-function DDI
+implementation in Linux 7.2.3 `intel_ddi.c` (MIT, © 2012 Intel); the full MIT
+grant and copyright are preserved in the source file and `LICENSE-MIT`.
+
+`tk-intel-display/src/intel_hdmi_full.rs` translates 114 of 120 functions in
+Linux 7.2.3 `intel_hdmi.c` (MIT, Dave Airlie 2006 and Intel 2006–2009). Six
+DRM connector/property/modes wrappers are framework-only and omitted; the full
+grant and copyright are preserved in the module and `LICENSE-MIT`.
+
+`tk-intel-display/src/skl_scaler_full.rs` translates the 43 scaler functions in
+Linux 7.2.3 `skl_scaler.c` (MIT, © 2020 Intel); the full MIT grant is preserved
+in the source header and crate `LICENSE-MIT`.
+
+`tk-intel-display/src/skl_watermark_full.rs` translates all 140 watermark/DBUF
+functions in Linux 7.2.3 `skl_watermark.c` (MIT, © 2022 Intel); the MIT grant
+is covered by the file SPDX identifier and crate `LICENSE-MIT`.
+
+`tk-intel-display/src/skl_universal_plane_full.rs` translates all 112
+universal-plane functions in Linux 7.2.3 `skl_universal_plane.c` (MIT,
+© 2020 Intel); the full grant is preserved in the file SPDX tag and crate
+`LICENSE-MIT`.
+
+`tk-intel-display/src/intel_cursor_full.rs` translates all 39 cursor functions
+from Linux 7.2.3 `intel_cursor.c` (MIT, © 2020 Intel); the file SPDX tag and
+crate `LICENSE-MIT` preserve the license.
+
+`tk-intel-display/src/intel_vblank_full.rs` translates the 30 vblank/scanout
+functions in Linux 7.2.3 `intel_vblank.c` (MIT, © 2022-2023 Intel); the file
+SPDX identifier and crate `LICENSE-MIT` preserve the grant.
+
+`tk-intel-display/src/intel_crtc_full.rs` translates all 39 CRTC functions in
+Linux 7.2.3 `intel_crtc.c` (MIT, © 2020 Intel); its SPDX tag and crate
+`LICENSE-MIT` preserve the grant.
+
+`tk-intel-display/src/intel_color_full.rs` translates all 223 color functions
+in Linux 7.2.3 `intel_color.c` (MIT, © 2016 Intel); its SPDX tag and crate
+`LICENSE-MIT` preserve the grant.
+
+`tk-intel-display/src/intel_fb_full.rs` translates all 89 framebuffer functions
+in Linux 7.2.3 `intel_fb.c` (MIT, © 2021 Intel); its SPDX tag and crate
+`LICENSE-MIT` preserve the grant.
+
+`tk-intel-display/src/intel_atomic_full.rs` translates all 15 atomic helper
+functions in Linux 7.2.3 `intel_atomic.c` (MIT, © 2015 Intel); its SPDX tag
+and crate `LICENSE-MIT` preserve the grant.
+
+`tk-intel-display/src/intel_modeset_verify_full.rs` translates all 7
+modeset-verification functions in Linux 7.2.3 `intel_modeset_verify.c` (MIT,
+© 2022 Intel); its SPDX tag and crate `LICENSE-MIT` preserve the grant.
+
+`tk-intel-display/src/intel_modeset_setup_full.rs` translates all 25
+modeset-setup functions in Linux 7.2.3 `intel_modeset_setup.c` (MIT, © 2022
+Intel); its SPDX tag and crate `LICENSE-MIT` preserve the grant.
+
+`tk-intel-display/src/intel_display_modeset_full.rs` translates 223 of 273
+mode/modeset functions in Linux 7.2.3 `intel_display.c` (MIT, © 2006-2007
+Intel); the target-inapplicable generations and framework/debug boundaries
+are named in `docs/design/intel-display-modeset-full.md`. Its SPDX tag and
+crate `LICENSE-MIT` preserve the grant.
+
+`kernel/src/drm/color_mgmt_full.rs` translates 26 color-management functions
+from Linux 7.2.3 `drm_color_mgmt.c` (MIT-style grant, © 2016 Intel); its full
+license text remains in the source and `kernel/LICENSES/LicenseRef-Intel-Color-Mgmt-MIT`.
+
+`kernel/src/drm/atomic_uapi_full.rs` translates 30 atomic UAPI functions from
+Linux 7.2.3 `drm_atomic_uapi.c` (MIT; Red Hat, Intel, and Linux Foundation
+copyrights); its full license text remains in the source and
+`kernel/LICENSES/LicenseRef-DRM-Atomic-UAPI-MIT`.
+
+`kernel/src/drm/plane_uapi_full.rs` translates 38 plane helper functions
+from Linux 7.2.3 `drm_plane.c` (MIT-style grant, © 2016 Intel); its full
+license text remains in the source and
+`kernel/LICENSES/LicenseRef-Intel-Drm-Plane-MIT`.
+
+`kernel/src/drm/connector_uapi_full.rs` translates 87 ctags functions and the
+additional `drm_get_tv_mode_from_name()` in Linux 7.2.3 `drm_connector.c`
+(MIT-style grant, © 2016 Intel); its full license remains in the source and
+`kernel/LICENSES/LicenseRef-Intel-Drm-Connector-MIT`.
+
+`kernel/src/drm/mode_config_full.rs` translates 14 mode-config functions in
+Linux 7.2.3 `drm_mode_config.c` (MIT-style grant, © 2016 Intel); its full
+license remains in the source and the same
+`kernel/LICENSES/LicenseRef-Intel-Drm-Connector-MIT` file.
+
 The optional AX211 rootfs payload stages only the linux-firmware
 `iwlwifi-so-a0-gf-a0-89.ucode` API 89 image and matching
 `iwlwifi-so-a0-gf-a0.pnvm`; it copies the upstream `LICENCE.iwlwifi_firmware`

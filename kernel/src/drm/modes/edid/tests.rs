@@ -433,6 +433,27 @@ fn a_cta_extension_is_parsed_into_modes() {
 }
 
 #[test]
+fn hdmi_vsdb_tmds_limits_are_reported_without_guessing_missing_fields() {
+    let base = panel().extension_count(1).build();
+    let cta = CtaBlockBuilder::new(3)
+        .data_block(3, &[0x03, 0x0c, 0x00, 0x00, 0x00, 0x00, 60])
+        .data_block(3, &[0x03, 0x0c, 0x00, 0x00, 0x00, 0x00, 40])
+        .data_block(3, &[0xd8, 0x5d, 0xc4, 0x01, 120])
+        .vics(&[16])
+        .build();
+    let bytes = assemble(base, &[cta]);
+    let edid = parse(&bytes);
+    assert_eq!(edid.max_tmds_clock_khz(), Some(200_000));
+
+    let no_clock = CtaBlockBuilder::new(3)
+        .data_block(3, &[0x03, 0x0c, 0x00, 0x00, 0x00, 0x00, 0])
+        .vics(&[16])
+        .build();
+    let bytes = assemble(panel().extension_count(1).build(), &[no_clock]);
+    assert_eq!(parse(&bytes).max_tmds_clock_khz(), None);
+}
+
+#[test]
 fn native_short_video_descriptors_carry_their_flag() {
     let base = panel().extension_count(1).build();
     let cta = CtaBlockBuilder::new(3)

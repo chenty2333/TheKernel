@@ -170,6 +170,32 @@ pub(crate) fn procmon_row(part: ProcessVoltage) -> &'static ProcmonRow {
     }
 }
 
+/// `PWR_DOWN_LN_*` field value for `intel_combo_phy_power_up_lanes()`.
+/// The caller shifts this field into `PORT_CL_DW10[7:4]`.
+// upstream: intel_combo_phy.c intel_combo_phy_power_up_lanes()
+pub(crate) const fn combo_phy_power_up_lane_mask(
+    lane_count: u8,
+    is_dsi: bool,
+    lane_reversal: bool,
+) -> u8 {
+    if is_dsi {
+        match lane_count {
+            1 => 0xb, // PWR_DOWN_LN_3_1_0
+            2 => 0xa, // PWR_DOWN_LN_3_1
+            3 => 0x8, // PWR_DOWN_LN_3
+            _ => 0,   // four lanes; invalid counts follow source's default case
+        }
+    } else {
+        match lane_count {
+            1 if lane_reversal => 0x7, // PWR_DOWN_LN_2_1_0
+            1 => 0xe,                  // PWR_DOWN_LN_3_2_1
+            2 if lane_reversal => 0x3, // PWR_DOWN_LN_1_0
+            2 => 0xc,                  // PWR_DOWN_LN_3_2
+            _ => 0,
+        }
+    }
+}
+
 /// `PORT_COMP_DW1[7:0]` and `[23:16]`, the fields the reference values live in.
 pub(crate) const PROC_DW1_MASK: u32 = (0xFF << 16) | 0xFF;
 /// `PORT_COMP_DW0[31]`.
@@ -213,7 +239,8 @@ pub(crate) struct PhyState {
     pub(crate) procmon: &'static ProcmonRow,
     /// Whether this PHY is the compensation source for the others.
     pub(crate) comp_source: bool,
-    /// Whether the PHY was already initialised and was therefore left alone.
+    /// Whether the PHY was already initialised at the entry to this report pass
+    /// (by firmware or by the preceding translated core-init sequence).
     pub(crate) already_initialised: bool,
     /// The verification checks when the PHY claimed to be initialised, or the
     /// single `COMP_INIT` check when it did not.  Empty only if the PHY was not
@@ -253,7 +280,7 @@ impl PhyState {
             },
         );
         if self.already_initialised {
-            text.push_str("; already initialised by firmware, left alone");
+            text.push_str("; already initialised before this report pass, left alone");
         } else {
             text.push_str(&format!("; initialised ({} register writes)", self.writes));
         }
@@ -545,6 +572,18 @@ mod tests {
         let regs = MockRegisters::new();
         regs.set(phy.comp_dw3, part);
         regs
+    }
+
+    #[test]
+    fn lane_power_masks_follow_dsi_and_reversal_cases() {
+        assert_eq!(combo_phy_power_up_lane_mask(1, true, false), 0xb);
+        assert_eq!(combo_phy_power_up_lane_mask(2, true, false), 0xa);
+        assert_eq!(combo_phy_power_up_lane_mask(3, true, false), 0x8);
+        assert_eq!(combo_phy_power_up_lane_mask(1, false, false), 0xe);
+        assert_eq!(combo_phy_power_up_lane_mask(1, false, true), 0x7);
+        assert_eq!(combo_phy_power_up_lane_mask(2, false, false), 0xc);
+        assert_eq!(combo_phy_power_up_lane_mask(2, false, true), 0x3);
+        assert_eq!(combo_phy_power_up_lane_mask(4, false, false), 0);
     }
 
     #[test]

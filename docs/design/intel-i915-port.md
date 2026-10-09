@@ -250,7 +250,7 @@ The powered firmware TC1/TC2 legacy-HDMI path now connects readout/admission,
 owned GGTT/GEM, finite source-computed modes, native atomic programming and
 SURFLIVE/fresh-frame completion. The exact firmware timing stays preferred for boot console preservation.
 A second1920x1080@60 mode is advertised only for the source-checked
-4K30->1080p60 linear-XRGB profile and matching EDID/PLL admission.
+4K30->1080p60 linear-XRGB/RGB565 profile and matching EDID/PLL admission.
 Clock/pitch alone is not a WM proof: source method1/method2, line time,
 block/line and minimum-DDB demand are compared at equal latency.
 The existing active firmware WM/DDB policy stays unchanged; this does not

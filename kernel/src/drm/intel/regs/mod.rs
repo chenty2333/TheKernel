@@ -46,9 +46,11 @@ use super::id::Quirk;
 // declared once, in [`pipe`], under the name its own chapter's table uses;
 // [`ddi`]'s timing registers live beside it at the same stride.
 
+pub(crate) mod aux;
 pub(crate) mod ddi;
 pub(crate) mod dpll;
 pub(crate) mod interrupt;
+pub(crate) mod pcode;
 pub(crate) mod pipe;
 pub(crate) mod port;
 pub(crate) mod table;
@@ -130,9 +132,9 @@ pub(crate) enum Meaning {
     StolenMemoryBase,
     /// The physical base of the global page table.
     GttBase,
-    /// One register of the GMBUS controller, the I2C master that carries DDC
-    /// and therefore EDID.  The probe's report does not read these; the
-    /// protocol that gives them meaning lives in [`super::gmbus`].
+    /// One register of a display bus controller: GMBUS I2C/DDC or a DP AUX
+    /// channel. The probe does not read these; the corresponding transaction
+    /// mechanisms live in [`super::gmbus`] and the display crate's `dp_aux`.
     BusController,
     /// A register of the south display's hotplug-detect block: the per-DDI
     /// enable, the latched detect field, the live connect state and the board
@@ -643,12 +645,12 @@ pub(crate) const SKL_FUSE_STATUS: Register =
 
 /// `HSW_PWR_WELL_CTL1`, the firmware's power well request register.
 ///
-/// Read-only here, and read only to diagnose a well that will not come up: the
-/// four request registers are OR-ed by hardware, so a well that stays off while
+/// Writable for the source BIOS-to-driver handoff in hsw_power_well_sync_hw.
+/// The four request registers are OR-ed by hardware, so a well that stays off while
 /// this one has its request bit set was requested by the firmware all along.
 /// Reference §4.2; `[I915]` `i915_reg.h:3626`.
 pub(crate) const HSW_PWR_WELL_CTL1: Register =
-    Register::read_only("HSW_PWR_WELL_CTL1", 0x4_5400, Meaning::PowerWell, None);
+    Register::read_write("HSW_PWR_WELL_CTL1", 0x4_5400, Meaning::PowerWell, None);
 
 /// `HSW_PWR_WELL_CTL2`, the driver's power well request register.
 ///
@@ -677,10 +679,23 @@ pub(crate) const HSW_PWR_WELL_CTL4: Register =
 pub(crate) const ICL_PWR_WELL_CTL_AUX2: Register =
     Register::read_write("ICL_PWR_WELL_CTL_AUX2", 0x4_5444, Meaning::PowerWell, None);
 
+/// BIOS-owned AUX well request; transferred to AUX2 by the HSW sync path.
+pub(crate) const ICL_PWR_WELL_CTL_AUX1: Register =
+    Register::read_write("ICL_PWR_WELL_CTL_AUX1", 0x4_5440, Meaning::PowerWell, None);
+/// Debug-owned AUX well request, read for shutdown diagnostics.
+pub(crate) const ICL_PWR_WELL_CTL_AUX4: Register =
+    Register::read_only("ICL_PWR_WELL_CTL_AUX4", 0x4_544C, Meaning::PowerWell, None);
+
 /// `ICL_PWR_WELL_CTL_DDI2`, the driver's DDI IO power well request register.
 /// Reference §4.2 and §11 phase 5; `[I915]` `i915_reg.h:3691`.
 pub(crate) const ICL_PWR_WELL_CTL_DDI2: Register =
     Register::read_write("ICL_PWR_WELL_CTL_DDI2", 0x4_5454, Meaning::PowerWell, None);
+/// BIOS-owned DDI well request; transferred to DDI2 by the HSW sync path.
+pub(crate) const ICL_PWR_WELL_CTL_DDI1: Register =
+    Register::read_write("ICL_PWR_WELL_CTL_DDI1", 0x4_5450, Meaning::PowerWell, None);
+/// Debug-owned DDI well request, read for shutdown diagnostics.
+pub(crate) const ICL_PWR_WELL_CTL_DDI4: Register =
+    Register::read_only("ICL_PWR_WELL_CTL_DDI4", 0x4_545C, Meaning::PowerWell, None);
 
 /// `DC_STATE_EN`, the display C-state request.
 ///
@@ -881,7 +896,11 @@ pub(crate) const POWER_AND_CLOCK_REGISTERS: &[Register] = &[
     HSW_PWR_WELL_CTL3,
     HSW_PWR_WELL_CTL4,
     ICL_PWR_WELL_CTL_AUX2,
+    ICL_PWR_WELL_CTL_AUX1,
+    ICL_PWR_WELL_CTL_AUX4,
     ICL_PWR_WELL_CTL_DDI2,
+    ICL_PWR_WELL_CTL_DDI1,
+    ICL_PWR_WELL_CTL_DDI4,
     DC_STATE_EN,
     DBUF_CTL_S0,
     DBUF_CTL_S1,
@@ -931,11 +950,9 @@ pub(crate) const POWER_AND_CLOCK_REGISTERS: &[Register] = &[
 ///
 /// Access is stated per register rather than inherited from the block:
 ///
-/// * `GMBUS2` (status) and `GMBUS3` (data) are read-only *here* because this
-///   driver never writes them -- the index cycle this driver uses carries the
-///   index byte in `GMBUS1`, so `GMBUS3` is only ever read.  A later driver
-///   that speaks DPCD over I2C needs `GMBUS3` writable, and that is an
-///   addition to this table rather than a relaxation of it.
+/// * `GMBUS2` (status) remains read-only. `GMBUS3` is transmit/receive data and
+///   is writable for the translated indexed write / bit-bang-capable GMBUS
+///   engine.
 /// * `GMBUS4` (interrupt mask) is written only with zero: this kernel takes no
 ///   GMBUS interrupt, so the mask is cleared and completion is polled.
 /// * `GMBUS5` (two-byte index) is cleared before a transaction.  See
@@ -945,12 +962,43 @@ pub(crate) const POWER_AND_CLOCK_REGISTERS: &[Register] = &[
 ///   write-one-to-clear, so a stray write would discard the state a caller
 ///   came to read.
 pub(crate) const BUS: &[Register] = &[
+    aux::DP_AUX_CH_CTL_A,
+    aux::DP_AUX_CH_DATA0_A,
+    aux::DP_AUX_CH_DATA1_A,
+    aux::DP_AUX_CH_DATA2_A,
+    aux::DP_AUX_CH_DATA3_A,
+    aux::DP_AUX_CH_DATA4_A,
+    aux::DP_AUX_CH_CTL_B,
+    aux::DP_AUX_CH_DATA0_B,
+    aux::DP_AUX_CH_DATA1_B,
+    aux::DP_AUX_CH_DATA2_B,
+    aux::DP_AUX_CH_DATA3_B,
+    aux::DP_AUX_CH_DATA4_B,
+    aux::DP_AUX_CH_CTL_D,
+    aux::DP_AUX_CH_DATA0_D,
+    aux::DP_AUX_CH_DATA1_D,
+    aux::DP_AUX_CH_DATA2_D,
+    aux::DP_AUX_CH_DATA3_D,
+    aux::DP_AUX_CH_DATA4_D,
+    aux::DP_AUX_CH_CTL_E,
+    aux::DP_AUX_CH_DATA0_E,
+    aux::DP_AUX_CH_DATA1_E,
+    aux::DP_AUX_CH_DATA2_E,
+    aux::DP_AUX_CH_DATA3_E,
+    aux::DP_AUX_CH_DATA4_E,
     GMBUS0,
     GMBUS1,
     GMBUS2,
     GMBUS3,
     GMBUS4,
     GMBUS5,
+    GPIO_B,
+    GPIO_C,
+    GPIO_D,
+    GPIO_J,
+    GPIO_K,
+    GPIO_L,
+    GPIO_M,
     SHOTPLUG_CTL_DDI,
     SDEISR,
     SOUTH_CHICKEN1,
@@ -969,9 +1017,9 @@ pub(crate) const GMBUS1: Register =
 pub(crate) const GMBUS2: Register =
     Register::read_only("GMBUS2", 0xc5108, Meaning::BusController, None);
 
-/// The four-byte data buffer.
+/// The four-byte transmit/receive data buffer.
 pub(crate) const GMBUS3: Register =
-    Register::read_only("GMBUS3", 0xc510c, Meaning::BusController, None);
+    Register::read_write("GMBUS3", 0xc510c, Meaning::BusController, None);
 
 /// The interrupt mask.  Written with zero: completion is polled, not taken.
 pub(crate) const GMBUS4: Register =
@@ -980,6 +1028,28 @@ pub(crate) const GMBUS4: Register =
 /// The two-byte index enable and value.
 pub(crate) const GMBUS5: Register =
     Register::read_write("GMBUS5", 0xc5120, Meaning::BusController, None);
+
+/// GMBUS GPIO block B, the I2C-over-GPIO fallback for DDI A (`GPIOB`).
+pub(crate) const GPIO_B: Register =
+    Register::read_write("GPIOB", 0xc5014, Meaning::BusController, None);
+/// GMBUS GPIO block C, the I2C-over-GPIO fallback for DDI B (`GPIOC`).
+pub(crate) const GPIO_C: Register =
+    Register::read_write("GPIOC", 0xc5018, Meaning::BusController, None);
+/// GMBUS GPIO block D, the I2C-over-GPIO fallback for DDI C (`GPIOD`).
+pub(crate) const GPIO_D: Register =
+    Register::read_write("GPIOD", 0xc501c, Meaning::BusController, None);
+/// GMBUS GPIO block J, the Type-C 1 DDC fallback pair.
+pub(crate) const GPIO_J: Register =
+    Register::read_write("GPIOJ", 0xc5034, Meaning::BusController, None);
+/// GMBUS GPIO block K, the Type-C 2 DDC fallback pair.
+pub(crate) const GPIO_K: Register =
+    Register::read_write("GPIOK", 0xc5038, Meaning::BusController, None);
+/// GMBUS GPIO block L, the Type-C 3 DDC fallback pair.
+pub(crate) const GPIO_L: Register =
+    Register::read_write("GPIOL", 0xc503c, Meaning::BusController, None);
+/// GMBUS GPIO block M, the Type-C 4 DDC fallback pair.
+pub(crate) const GPIO_M: Register =
+    Register::read_write("GPIOM", 0xc5040, Meaning::BusController, None);
 
 /// DDI hotplug control, one four-bit field per DDI (`[I915]`
 /// `i915_reg.h:3078-3085`; reference §9.5).
@@ -1410,9 +1480,12 @@ mod tests {
         assert_eq!(
             writable,
             vec![
+                "HSW_PWR_WELL_CTL1",
                 "HSW_PWR_WELL_CTL2",
                 "ICL_PWR_WELL_CTL_AUX2",
+                "ICL_PWR_WELL_CTL_AUX1",
                 "ICL_PWR_WELL_CTL_DDI2",
+                "ICL_PWR_WELL_CTL_DDI1",
                 "DC_STATE_EN",
                 "DBUF_CTL_S0",
                 "DBUF_CTL_S1",
@@ -1473,9 +1546,10 @@ mod tests {
                 "SKL_DSSM",
                 "SFUSE_STRAP",
                 "SKL_FUSE_STATUS",
-                "HSW_PWR_WELL_CTL1",
                 "HSW_PWR_WELL_CTL3",
                 "HSW_PWR_WELL_CTL4",
+                "ICL_PWR_WELL_CTL_AUX4",
+                "ICL_PWR_WELL_CTL_DDI4",
                 "PORT_COMP_DW3(A)",
                 "PORT_TX_DW8_LN0(A)",
                 "PORT_PCS_DW1_LN0(A)",
@@ -1521,7 +1595,11 @@ mod tests {
                 "COMP_DW10({name})"
             );
             assert_eq!(phy.tx_dw8.offset(), at(base, TX_GRP, 8), "TX_DW8({name})");
-            assert_eq!(phy.pcs_dw1.offset(), at(base, PCS_GRP, 1), "PCS_DW1({name})");
+            assert_eq!(
+                phy.pcs_dw1.offset(),
+                at(base, PCS_GRP, 1),
+                "PCS_DW1({name})"
+            );
             // The lane 0 registers are read and never written: the
             // initialisation takes its starting value from lane 0 and writes
             // the result to the group register, which is what `[I915]`
@@ -1598,9 +1676,10 @@ mod tests {
                 register.name()
             );
         }
-        // The window the probe maps must cover the south display block these
-        // registers live in, or nothing here could be reached on the target.
+        // The window the probe maps must cover both the south GMBUS block and
+        // the DP AUX A/B register blocks.
         assert!(PROBE_WINDOW as u32 > 0xc5120 + 4, "the GMBUS block");
+        assert!(PROBE_WINDOW as u32 > 0x64124 + 4, "DP AUX channels A/B");
     }
 
     #[test]
@@ -1616,23 +1695,109 @@ mod tests {
         assert_eq!(
             writable,
             vec![
+                "DP_AUX_CH_CTL(A)",
+                "DP_AUX_CH_DATA(A,0)",
+                "DP_AUX_CH_DATA(A,1)",
+                "DP_AUX_CH_DATA(A,2)",
+                "DP_AUX_CH_DATA(A,3)",
+                "DP_AUX_CH_DATA(A,4)",
+                "DP_AUX_CH_CTL(B)",
+                "DP_AUX_CH_DATA(B,0)",
+                "DP_AUX_CH_DATA(B,1)",
+                "DP_AUX_CH_DATA(B,2)",
+                "DP_AUX_CH_DATA(B,3)",
+                "DP_AUX_CH_DATA(B,4)",
+                "DP_AUX_CH_CTL(D)",
+                "DP_AUX_CH_DATA(D,0)",
+                "DP_AUX_CH_DATA(D,1)",
+                "DP_AUX_CH_DATA(D,2)",
+                "DP_AUX_CH_DATA(D,3)",
+                "DP_AUX_CH_DATA(D,4)",
+                "DP_AUX_CH_CTL(E)",
+                "DP_AUX_CH_DATA(E,0)",
+                "DP_AUX_CH_DATA(E,1)",
+                "DP_AUX_CH_DATA(E,2)",
+                "DP_AUX_CH_DATA(E,3)",
+                "DP_AUX_CH_DATA(E,4)",
                 "GMBUS0",           // pin select and rate
                 "GMBUS1",           // the transaction itself
+                "GMBUS3",           // transmit/receive bytes
                 "GMBUS4",           // interrupt mask, cleared to zero
                 "GMBUS5",           // two-byte index, cleared to zero
+                "GPIOB",            // bit-banged DDC for DDI A
+                "GPIOC",            // bit-banged DDC for DDI B
+                "GPIOD",            // bit-banged DDC for DDI C
+                "GPIOJ",            // Type-C port 1 DDC fallback
+                "GPIOK",            // Type-C port 2 DDC fallback
+                "GPIOL",            // Type-C port 3 DDC fallback
+                "GPIOM",            // Type-C port 4 DDC fallback
                 "SHOTPLUG_CTL_DDI", // hotplug enable
                 "SOUTH_CHICKEN1",   // board HPD inversion, when a caller asks
             ]
         );
-        // Status, data and the write-one-to-clear interrupt status stay
-        // read-only: a write to SDEISR would clear the very state a caller
-        // reads it for.
-        for name in ["GMBUS2", "GMBUS3", "SDEISR", "SHPD_FILTER_CNT"] {
+        // Status and the write-one-to-clear interrupt status stay read-only:
+        // a write to SDEISR would clear the very state a caller reads it for.
+        for name in ["GMBUS2", "SDEISR", "SHPD_FILTER_CNT"] {
             let register = BUS
                 .iter()
                 .find(|register| register.name() == name)
                 .unwrap_or_else(|| panic!("{name} is not in the bus table"));
             assert!(!register.is_writable(), "{name} must stay read-only");
+        }
+    }
+
+    #[test]
+    fn dp_aux_a_b_tc1_tc2_registers_follow_the_i915_channel_stride() {
+        use aux::*;
+
+        let expected = [
+            (DP_AUX_CH_CTL_A, 0x64010),
+            (DP_AUX_CH_DATA0_A, 0x64014),
+            (DP_AUX_CH_DATA1_A, 0x64018),
+            (DP_AUX_CH_DATA2_A, 0x6401c),
+            (DP_AUX_CH_DATA3_A, 0x64020),
+            (DP_AUX_CH_DATA4_A, 0x64024),
+            (DP_AUX_CH_CTL_B, 0x64110),
+            (DP_AUX_CH_DATA0_B, 0x64114),
+            (DP_AUX_CH_DATA1_B, 0x64118),
+            (DP_AUX_CH_DATA2_B, 0x6411c),
+            (DP_AUX_CH_DATA3_B, 0x64120),
+            (DP_AUX_CH_DATA4_B, 0x64124),
+            (DP_AUX_CH_CTL_D, 0x64310),
+            (DP_AUX_CH_DATA0_D, 0x64314),
+            (DP_AUX_CH_DATA1_D, 0x64318),
+            (DP_AUX_CH_DATA2_D, 0x6431c),
+            (DP_AUX_CH_DATA3_D, 0x64320),
+            (DP_AUX_CH_DATA4_D, 0x64324),
+            (DP_AUX_CH_CTL_E, 0x64410),
+            (DP_AUX_CH_DATA0_E, 0x64414),
+            (DP_AUX_CH_DATA1_E, 0x64418),
+            (DP_AUX_CH_DATA2_E, 0x6441c),
+            (DP_AUX_CH_DATA3_E, 0x64420),
+            (DP_AUX_CH_DATA4_E, 0x64424),
+        ];
+        for (register, offset) in expected {
+            assert_eq!(register.offset(), offset, "{}", register.name());
+            assert!(register.is_writable(), "{}", register.name());
+            assert!(BUS.iter().any(|candidate| *candidate == register));
+        }
+    }
+
+    #[test]
+    fn gmbus_gpio_registers_cover_ddi_and_type_c_fallback_pairs() {
+        let expected = [
+            (GPIO_B, 0xc5014),
+            (GPIO_C, 0xc5018),
+            (GPIO_D, 0xc501c),
+            (GPIO_J, 0xc5034),
+            (GPIO_K, 0xc5038),
+            (GPIO_L, 0xc503c),
+            (GPIO_M, 0xc5040),
+        ];
+        for (register, offset) in expected {
+            assert_eq!(register.offset(), offset);
+            assert!(BUS.iter().any(|candidate| *candidate == register));
+            assert_eq!(register.access, Access::ReadWrite);
         }
     }
 
@@ -1685,7 +1850,10 @@ mod tests {
             .expect("the AUX power well register must be declared");
         assert_eq!(well.name(), "ICL_PWR_WELL_CTL_AUX2");
         assert_eq!(well.meaning(), Meaning::PowerWell);
-        assert!(well.is_writable(), "the power module programs this register");
+        assert!(
+            well.is_writable(),
+            "the power module programs this register"
+        );
         assert!(
             !BUS.iter().any(|register| register.offset() == 0x4_5444),
             "the bus table must not declare the power module's register"

@@ -6,7 +6,7 @@
 //! dividers right is what makes a mode appear at the right size and in the
 //! right place; getting them wrong produces a monitor that reports no signal
 //! and gives no reason.
-//!
+
 //! Everything here is integer arithmetic over the numbers in the request and
 //! the numbers in the result.  There is no MMIO, no register window and no
 //! device: a caller hands in a pixel clock, a reference frequency and which
@@ -144,6 +144,8 @@
 //! what §13.4's read-back is for.
 
 use core::fmt;
+
+use super::regs::{self, Meaning, Register, Registers};
 
 /// The PRM's DCO window, in kHz.
 ///
@@ -790,6 +792,293 @@ impl PllRegisters {
         let divisor = 5 * u64::from(p) * u64::from(q) * u64::from(k);
         Ok(dco_hz / divisor)
     }
+}
+
+/// One of the two ICL/TGL combo PHY PLLs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ComboPllId {
+    Dpll0,
+    Dpll1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PllRuntimeError {
+    Unreadable(&'static str),
+    WriteRefused(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PllRuntimeReport {
+    pub(crate) power_state_timed_out: bool,
+    pub(crate) lock_timed_out: bool,
+}
+
+const PLL_POWER_ENABLE: u32 = 1 << 27;
+const PLL_POWER_STATE: u32 = 1 << 26;
+const PLL_ENABLE: u32 = 1 << 31;
+const PLL_LOCK: u32 = 1 << 30;
+const PLL_POWER_TIMEOUT_US: u32 = 1_000;
+const PLL_LOCK_TIMEOUT_US: u32 = 1_000;
+
+fn combo_pll_registers(id: ComboPllId) -> (Register, Register, Register) {
+    match id {
+        ComboPllId::Dpll0 => (
+            regs::dpll::DPLL0_ENABLE,
+            regs::dpll::DPLL0_CFGCR0,
+            regs::dpll::DPLL0_CFGCR1,
+        ),
+        ComboPllId::Dpll1 => (
+            regs::dpll::DPLL1_ENABLE,
+            regs::dpll::DPLL1_CFGCR0,
+            regs::dpll::DPLL1_CFGCR1,
+        ),
+    }
+}
+
+fn pll_read<R: Registers>(regs: &R, register: Register) -> Result<u32, PllRuntimeError> {
+    regs.read(register)
+        .ok_or(PllRuntimeError::Unreadable(register.name()))
+}
+
+fn pll_write<R: Registers>(
+    regs: &R,
+    register: Register,
+    value: u32,
+) -> Result<(), PllRuntimeError> {
+    regs.write(register, value)
+        .then_some(())
+        .ok_or(PllRuntimeError::WriteRefused(register.name()))
+}
+
+fn pll_poll<R: Registers>(
+    regs: &R,
+    register: Register,
+    mask: u32,
+    value: u32,
+    timeout_us: u32,
+) -> Result<bool, PllRuntimeError> {
+    regs::poll(regs, register, mask, value, timeout_us)
+        .ok_or(PllRuntimeError::Unreadable(register.name()))
+}
+
+fn enable_cfg_pll<R: Registers>(
+    regs: &R,
+    enable: Register,
+    cfgcr0: Register,
+    cfgcr1: Register,
+    state: PllRegisters,
+) -> Result<PllRuntimeReport, PllRuntimeError> {
+    let mut value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value | PLL_POWER_ENABLE)?;
+    let power_state_timed_out = !pll_poll(
+        regs,
+        enable,
+        PLL_POWER_STATE,
+        PLL_POWER_STATE,
+        PLL_POWER_TIMEOUT_US,
+    )?;
+
+    // icl_dpll_write() posts CFGCR1 after the pair of full register writes.
+    pll_write(regs, cfgcr0, state.cfgcr0)?;
+    pll_write(regs, cfgcr1, state.cfgcr1)?;
+    let _ = pll_read(regs, cfgcr1)?;
+
+    value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value | PLL_ENABLE)?;
+    let lock_timed_out = !pll_poll(regs, enable, PLL_LOCK, PLL_LOCK, PLL_LOCK_TIMEOUT_US)?;
+    Ok(PllRuntimeReport {
+        power_state_timed_out,
+        lock_timed_out,
+    })
+}
+
+/// Power and enable one combo PLL, preserving the i915 CFGCR and readback order.
+// upstream: intel_dpll_mgr.c combo_pll_enable()/icl_pll_power_enable()/icl_pll_enable()
+pub(crate) fn enable_combo_pll<R: Registers>(
+    regs: &R,
+    id: ComboPllId,
+    state: PllRegisters,
+) -> Result<PllRuntimeReport, PllRuntimeError> {
+    let (enable, cfgcr0, cfgcr1) = combo_pll_registers(id);
+    enable_cfg_pll(regs, enable, cfgcr0, cfgcr1, state)
+}
+
+/// Power and enable the fixed ICL/TGL TBT PLL using its CFGCR pair.
+// upstream: intel_dpll_mgr.c icl_tbt_pll_enable()
+pub(crate) fn enable_tbt_pll<R: Registers>(
+    regs: &R,
+    state: PllRegisters,
+) -> Result<PllRuntimeReport, PllRuntimeError> {
+    enable_cfg_pll(
+        regs,
+        regs::dpll::TBT_PLL_ENABLE,
+        regs::dpll::TBT_PLL_CFGCR0,
+        regs::dpll::TBT_PLL_CFGCR1,
+        state,
+    )
+}
+
+fn disable_pll<R: Registers>(
+    regs: &R,
+    enable: Register,
+) -> Result<PllRuntimeReport, PllRuntimeError> {
+    let mut value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value & !PLL_ENABLE)?;
+    let lock_timed_out = !pll_poll(regs, enable, PLL_LOCK, 0, PLL_LOCK_TIMEOUT_US)?;
+
+    value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value & !PLL_POWER_ENABLE)?;
+    let power_state_timed_out = !pll_poll(regs, enable, PLL_POWER_STATE, 0, PLL_POWER_TIMEOUT_US)?;
+    Ok(PllRuntimeReport {
+        power_state_timed_out,
+        lock_timed_out,
+    })
+}
+
+/// Disable one combo PLL: disable/lock-clear first, then power-off/state-clear.
+// upstream: intel_dpll_mgr.c combo_pll_disable()/icl_pll_disable()
+pub(crate) fn disable_combo_pll<R: Registers>(
+    regs: &R,
+    id: ComboPllId,
+) -> Result<PllRuntimeReport, PllRuntimeError> {
+    let (enable, ..) = combo_pll_registers(id);
+    disable_pll(regs, enable)
+}
+
+/// Disable the fixed ICL/TGL TBT PLL after its transcoder route is off.
+// upstream: intel_dpll_mgr.c icl_tbt_pll_disable()
+pub(crate) fn disable_tbt_pll<R: Registers>(regs: &R) -> Result<PllRuntimeReport, PllRuntimeError> {
+    disable_pll(regs, regs::dpll::TBT_PLL_ENABLE)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TcPllPlatform {
+    TigerLake,
+    AlderLakeP,
+    AlderLakeN,
+}
+
+static DKL_PHY_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+struct DynamicDklIo<'a, R> {
+    regs: &'a R,
+}
+
+fn dkl_dynamic_register(offset: u32, writable: bool) -> Option<Register> {
+    if offset & 3 != 0 || !(offset == 0x1010a0 || (0x168000..=0x16bffc).contains(&offset)) {
+        return None;
+    }
+    Some(if writable {
+        Register::read_write("DKL_PHY_MMIO", offset, Meaning::BringUp, None)
+    } else {
+        Register::read_only("DKL_PHY_MMIO", offset, Meaning::BringUp, None)
+    })
+}
+
+impl<R: Registers> intel_display::RegisterIo for DynamicDklIo<'_, R> {
+    fn read32(&self, offset: u32) -> Result<u32, intel_display::Error> {
+        let register =
+            dkl_dynamic_register(offset, false).ok_or(intel_display::Error::Unavailable(offset))?;
+        self.regs
+            .read(register)
+            .ok_or(intel_display::Error::Unavailable(offset))
+    }
+
+    fn write32(&self, offset: u32, value: u32) -> Result<(), intel_display::Error> {
+        let register =
+            dkl_dynamic_register(offset, true).ok_or(intel_display::Error::Unavailable(offset))?;
+        self.regs
+            .write(register, value)
+            .then_some(())
+            .ok_or(intel_display::Error::Unavailable(offset))
+    }
+}
+
+impl<R: Registers> intel_display::dkl_phy::DklIo for DynamicDklIo<'_, R> {
+    fn with_dkl_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, intel_display::Error>,
+    ) -> Result<T, intel_display::Error> {
+        let _guard = DKL_PHY_LOCK.lock();
+        operation()
+    }
+}
+
+fn tc_pll_enable_register(
+    port: intel_display::dkl_phy::TcPort,
+    platform: TcPllPlatform,
+) -> Result<Register, PllRuntimeError> {
+    let offset = match (platform, port) {
+        (TcPllPlatform::TigerLake, intel_display::dkl_phy::TcPort::Tc1) => 0x4_6030,
+        (TcPllPlatform::TigerLake, intel_display::dkl_phy::TcPort::Tc2) => 0x4_6034,
+        (TcPllPlatform::AlderLakeP, intel_display::dkl_phy::TcPort::Tc1)
+        | (TcPllPlatform::AlderLakeN, intel_display::dkl_phy::TcPort::Tc1) => 0x4_6038,
+        (TcPllPlatform::AlderLakeP, intel_display::dkl_phy::TcPort::Tc2)
+        | (TcPllPlatform::AlderLakeN, intel_display::dkl_phy::TcPort::Tc2) => 0x4_6040,
+        _ => return Err(PllRuntimeError::Unreadable("unmapped TC PLL enable")),
+    };
+    Ok(Register::read_write(
+        "TC_PLL_ENABLE",
+        offset,
+        Meaning::BringUp,
+        None,
+    ))
+}
+
+fn dkl_error(_: intel_display::Error) -> PllRuntimeError {
+    PllRuntimeError::Unreadable("DKL PHY MMIO")
+}
+
+/// Enable a display-12/13 DKL/MG PLL after its port power references are held.
+// upstream: intel_dpll_mgr.c mg_pll_enable()/icl_pll_power_enable()/icl_pll_enable()
+pub(crate) fn enable_tc_dkl_pll<R: Registers>(
+    regs: &R,
+    port: intel_display::dkl_phy::TcPort,
+    platform: TcPllPlatform,
+    state: &intel_display::dpll_mgr::DklPllState,
+    afc_startup: Option<u8>,
+) -> Result<PllRuntimeReport, PllRuntimeError> {
+    let enable = tc_pll_enable_register(port, platform)?;
+    let value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value | PLL_POWER_ENABLE)?;
+    let power_state_timed_out = !pll_poll(
+        regs,
+        enable,
+        PLL_POWER_STATE,
+        PLL_POWER_STATE,
+        PLL_POWER_TIMEOUT_US,
+    )?;
+
+    let io = DynamicDklIo { regs };
+    intel_display::dpll_mgr::dkl_pll_write(&io, port, state, afc_startup).map_err(dkl_error)?;
+
+    let value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value | PLL_ENABLE)?;
+    let lock_timed_out = !pll_poll(regs, enable, PLL_LOCK, PLL_LOCK, PLL_LOCK_TIMEOUT_US)?;
+    Ok(PllRuntimeReport {
+        power_state_timed_out,
+        lock_timed_out,
+    })
+}
+
+/// Disable a DKL/MG PLL after its DDI has been disabled by the modeset caller.
+// upstream: intel_dpll_mgr.c mg_pll_disable()/icl_pll_disable()
+pub(crate) fn disable_tc_dkl_pll<R: Registers>(
+    regs: &R,
+    port: intel_display::dkl_phy::TcPort,
+    platform: TcPllPlatform,
+) -> Result<PllRuntimeReport, PllRuntimeError> {
+    let enable = tc_pll_enable_register(port, platform)?;
+    let value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value & !PLL_ENABLE)?;
+    let lock_timed_out = !pll_poll(regs, enable, PLL_LOCK, 0, PLL_LOCK_TIMEOUT_US)?;
+    let value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value & !PLL_POWER_ENABLE)?;
+    let power_state_timed_out = !pll_poll(regs, enable, PLL_POWER_STATE, 0, PLL_POWER_TIMEOUT_US)?;
+    Ok(PllRuntimeReport {
+        power_state_timed_out,
+        lock_timed_out,
+    })
 }
 
 /// Decode `SKL_DSSM`'s reference-clock field into a frequency in kHz.

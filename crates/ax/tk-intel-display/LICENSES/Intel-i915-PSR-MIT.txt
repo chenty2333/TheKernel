@@ -1,0 +1,1572 @@
+Copyright © 2014 Intel Corporation
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice (including the next
+paragraph) shall be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+! Ordered translation of Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_psr.c`.
+! DRM/atomic/property, workqueue, MMIO, AUX/DPCD, firmware and debugfs services
+! remain explicit in [`PsrIo`]; no operation here silently emulates hardware.
+#![allow(dead_code, clippy::too_many_arguments, non_snake_case)]
+
+! # Panel Self Refresh (PSR/SRD)
+!
+! Haswell's display controller introduced hardware Panel Self Refresh for
+! eDP 1.3 panels implementing a remote frame buffer (RFB).  The panel keeps
+! the last image and permits the display engine to stop continuously fetching
+! that image from memory.  Entry and exit are handled by display hardware,
+! including the required AUX messages; the software layer coordinates source
+! configuration with sink capabilities and suppresses re-entry while the
+! frontbuffer is dirty.
+!
+! PSR requires support on both the display source and sink.  Panel Replay
+! reuses the same broad RFB model for DP/eDP.  Panel Replay's selective-update
+! mode and PSR2 selective update are represented separately from PSR1 in the
+! state: `has_psr` alone means PSR1, PSR plus selective-update means PSR2,
+! PSR plus panel-replay means Panel Replay, and Panel Replay plus selective
+! update means Panel Replay Selective Update.
+!
+! Frontbuffer invalidation/flush callbacks bridge hardware tracking gaps.
+! A dirty frontbuffer makes the affected PSR pipe busy and exits PSR or forces
+! a full selective-fetch update.  The corresponding flush clears only the
+! matching pipe bits.  Re-enable is deferred to work context because the PSR
+! lock and atomic/display locks have different ordering constraints; teardown
+! synchronously cancels both immediate and delayed work.
+!
+! ## DC3CO
+!
+! Display generation 12 adds DC3 clock-off on top of PSR2.  The lower
+! DC3CO entry/exit overhead permits a clock-off interval during periodic page
+! flips which repeatedly wake PSR2 from deep sleep.  A flip enables DC3CO and
+! moves the delayed disable work out by six frame periods.  When that work
+! expires without another flip, it restores PSR2 idle-frame programming so
+! hardware can enter deep sleep.  Frontbuffer rendering does not enable DC3CO;
+! it follows the full invalidate/flush protocol instead.
+!
+! ## PSR exit masks
+!
+! On Haswell through Skylake, the EDP_PSR_DEBUG display-register-write mask
+! controls whether almost any display write (including software-firmware
+! writes) exits PSR.  Some registers have dedicated masks.  Generation 12 and
+! later effectively keep the old display-write mask set.
+!
+! On Skylake and later, PIPE_MISC's pipe-register-write mask gates pipe and
+! plane writes.  Primary-surface writes have a distinct mask on Haswell,
+! Broadwell, and Skylake+.  Sprite-enable masks exist on Haswell/Broadwell;
+! universal planes on Skylake and later do not have that mask.  Cursor
+! position is controlled by a dedicated mask on Haswell/Broadwell and is
+! included in the broader pipe-register-write mask on Skylake+.
+!
+! Vblank/vsync interrupt masks block PSR when the interrupt is both unmasked
+! in IMR and enabled in IER.  The vblank-to-pipe bit selects whether exit
+! generates an extra vblank before the first transmitted frame; polarity
+! differs on Haswell/Broadwell versus Skylake+.  With DC states, the extra
+! vblank occurs after link training, while without DC states it occurs
+! immediately after the PSR-exit trigger.  The transition register is double
+! buffered, so its value may not latch until that first vblank.  Standby mode
+! keeps the timing generator running and does not change periodic vblank
+! behavior.
+!
+! The pipe-register unmask bit has different behavior across platforms:
+! Broadwell needs it for post-exit vblank generation, while Haswell shows no
+! apparent effect.  These platform quirks remain in the source paths rather
+! than being folded into generic PSR policy.
+!
+! The remaining mask bits describe individual events (memory-up, hotplug,
+! low-power-signal entry, sprite enable, cursor movement and similar causes).
+! The implementation uses the broad masks only in the cases and generations
+! where the corresponding hardware bits exist.
+
+pub const I915_PSR_DEBUG_MODE_MASK: u32 = 0x0f;
+pub const I915_PSR_DEBUG_DEFAULT: u32 = 0;
+pub const I915_PSR_DEBUG_DISABLE: u32 = 1;
+pub const I915_PSR_DEBUG_ENABLE: u32 = 2;
+pub const I915_PSR_DEBUG_FORCE_PSR1: u32 = 3;
+pub const I915_PSR_DEBUG_ENABLE_SEL_FETCH: u32 = 4;
+pub const I915_PSR_DEBUG_IRQ: u32 = 0x10;
+pub const I915_PSR_DEBUG_SU_REGION_ET_DISABLE: u32 = 0x20;
+pub const I915_PSR_DEBUG_PANEL_REPLAY_DISABLE: u32 = 0x40;
+pub const DP_MAX_RESYNC_FRAME_COUNT_MASK: u8 = 0x0f;
+pub const PSR_EVENT_PSR2_WD_TIMER_EXPIRE: u32 = 1 << 17;
+pub const PSR_EVENT_PSR2_DISABLED: u32 = 1 << 16;
+pub const PSR_EVENT_SU_DIRTY_FIFO_UNDERRUN: u32 = 1 << 15;
+pub const PSR_EVENT_SU_CRC_FIFO_UNDERRUN: u32 = 1 << 14;
+pub const PSR_EVENT_GRAPHICS_RESET: u32 = 1 << 12;
+pub const PSR_EVENT_PCH_INTERRUPT: u32 = 1 << 11;
+pub const PSR_EVENT_MEMORY_UP: u32 = 1 << 10;
+pub const PSR_EVENT_FRONT_BUFFER_MODIFY: u32 = 1 << 9;
+pub const PSR_EVENT_WD_TIMER_EXPIRE: u32 = 1 << 8;
+pub const PSR_EVENT_PIPE_REGISTERS_UPDATE: u32 = 1 << 6;
+pub const PSR_EVENT_REGISTER_UPDATE: u32 = 1 << 5;
+pub const PSR_EVENT_HDCP_ENABLE: u32 = 1 << 4;
+pub const PSR_EVENT_KVMR_SESSION_ENABLE: u32 = 1 << 3;
+pub const PSR_EVENT_VBI_ENABLE: u32 = 1 << 2;
+pub const PSR_EVENT_LPSP_MODE_EXIT: u32 = 1 << 1;
+pub const PSR_EVENT_PSR_DISABLE: u32 = 1;
+pub const PSR_ERROR: u32 = 1 << 2;
+pub const PSR_POST_EXIT: u32 = 1 << 1;
+pub const PSR_PRE_ENTRY: u32 = 1;
+pub const EDP_PSR_ENABLE: u32 = 1 << 31;
+pub const EDP_PSR_RESTORE_PSR_ACTIVE_CTX_MASK: u32 = 1 << 29;
+pub const EDP_PSR_LINK_STANDBY: u32 = 1 << 27;
+pub const EDP_PSR_MAX_SLEEP_TIME_MASK: u32 = 0x01f0_0000;
+pub const EDP_PSR_ENTRY_SETUP_FRAMES_MASK: u32 = 0x0003_0000;
+pub const EDP_PSR_CRC_ENABLE: u32 = 1 << 10;
+pub const EDP_PSR_IDLE_FRAMES_MASK: u32 = 0x0f;
+pub const EDP_PSR_TP2_TP3_TIME_MASK: u32 = 3 << 8;
+pub const EDP_PSR_TP4_TIME_0US: u32 = 3 << 6;
+pub const EDP_PSR_TP1_TIME_MASK: u32 = 3 << 4;
+pub const EDP_PSR_TP_SELECT_MASK: u32 = 1 << 11;
+pub const DP_PSR_ENABLE: u8 = 1 << 0;
+pub const DP_PSR_MAIN_LINK_ACTIVE: u8 = 1 << 1;
+pub const DP_PSR_CRC_VERIFICATION: u8 = 1 << 2;
+pub const DP_PSR_FRAME_CAPTURE: u8 = 1 << 3;
+pub const DP_PSR_SU_REGION_SCANLINE_CAPTURE: u8 = 1 << 4;
+pub const DP_PSR_IRQ_HPD_WITH_CRC_ERRORS: u8 = 1 << 5;
+pub const DP_PSR_ENABLE_PSR2: u8 = 1 << 6;
+pub const DP_PSR_ENABLE_SU_REGION_ET: u8 = 1 << 7;
+pub const DP_PANEL_REPLAY_ENABLE: u8 = 1 << 0;
+pub const DP_PANEL_REPLAY_VSC_SDP_CRC_EN: u8 = 1 << 1;
+pub const DP_PANEL_REPLAY_UNRECOVERABLE_ERROR_EN: u8 = 1 << 3;
+pub const DP_PANEL_REPLAY_RFB_STORAGE_ERROR_EN: u8 = 1 << 4;
+pub const DP_PANEL_REPLAY_ACTIVE_FRAME_CRC_ERROR_EN: u8 = 1 << 5;
+pub const DP_PANEL_REPLAY_SU_ENABLE: u8 = 1 << 6;
+pub const DP_PANEL_REPLAY_ENABLE_SU_REGION_ET: u8 = 1 << 7;
+pub const DP_PANEL_REPLAY_CRC_VERIFICATION: u8 = 1 << 1;
+pub const DP_PANEL_REPLAY_SU_REGION_SCANLINE_CAPTURE: u8 = 1 << 7;
+pub const DP_PSR2_SU_GRANULARITY_REQUIRED: u8 = 1 << 5;
+pub const DP_PSR2_SU_Y_COORDINATE_REQUIRED: u8 = 1 << 4;
+pub const DP_PANEL_REPLAY_SU_GRANULARITY_REQUIRED: u8 = 1 << 5;
+pub const DP_PANEL_REPLAY_EARLY_TRANSPORT_SUPPORT: u8 = 1 << 2;
+pub const DP_PANEL_REPLAY_ASYNC_VIDEO_TIMING_NOT_SUPPORTED: u8 = 1 << 3;
+pub const DP_PANEL_REPLAY_LINK_OFF_SUPPORTED_AFTER_AS_SDP: u8 = 1 << 7;
+pub const INTEL_DPCD_WA_PSR2_EARLYSCANLINE_SUPPORT: u32 = 0x3f0;
+pub const EDP_PSR2_ENABLE: u32 = 1 << 31;
+pub const EDP_PSR2_SU_TRACK_ENABLE: u32 = 1 << 30;
+pub const EDP_PSR2_BLOCK_COUNT_MASK: u32 = 1 << 28;
+pub const EDP_PSR2_SU_REGION_ET_ENABLE: u32 = 1 << 27;
+pub const EDP_PSR2_Y_COORDINATE_ENABLE: u32 = 1 << 25;
+pub const EDP_PSR2_IO_BUFFER_WAKE_MASK: u32 = 7 << 13;
+pub const EDP_PSR2_IO_BUFFER_WAKE_OLD_MASK: u32 = 3 << 13;
+pub const TGL_EDP_PSR2_IO_BUFFER_WAKE_MASK: u32 = 7 << 13;
+pub const LNL_EDP_PSR2_IO_BUFFER_WAKE_MASK: u32 = 0x3f << 13;
+pub const TGL_EDP_PSR2_FAST_WAKE_MASK: u32 = 7 << 10;
+pub const EDP_PSR2_FAST_WAKE_MASK: u32 = 3 << 11;
+pub const EDP_PSR2_TP2_TIME_MASK: u32 = 3 << 8;
+pub const EDP_PSR2_FRAME_BEFORE_SU_MASK: u32 = 0xf << 4;
+pub const EDP_PSR2_IDLE_FRAMES_MASK: u32 = 0xf;
+pub const EDP_PSR2_STATUS_STATE_MASK: u32 = 0xf << 28;
+pub const EDP_PSR2_STATUS_STATE_DEEP_SLEEP: u32 = 8 << 28;
+pub const EDP_PSR_STATUS_STATE_MASK: u32 = 7 << 29;
+pub const EDP_PSR2_MAN_TRACK_ENABLE: u32 = 1 << 31;
+pub const EDP_PSR2_MAN_TRACK_START_MASK: u32 = 0x3ff << 21;
+pub const EDP_PSR2_MAN_TRACK_END_MASK: u32 = 0x3ff << 11;
+pub const ADLP_PSR2_MAN_TRACK_PARTIAL: u32 = 1 << 31;
+pub const ADLP_PSR2_MAN_TRACK_START_MASK: u32 = 0x1fff << 16;
+pub const ADLP_PSR2_MAN_TRACK_END_MASK: u32 = 0x1fff;
+pub const PSR2_MAN_TRACK_SINGLE_FULL_FRAME: u32 = 1 << 3;
+pub const PSR2_MAN_TRACK_CONTINUOUS_FULL_FRAME: u32 = 1 << 2;
+pub const PSR2_MAN_TRACK_PARTIAL_FRAME: u32 = 1 << 1;
+pub const ADLP_MAN_TRACK_SINGLE_FULL_FRAME: u32 = 1 << 14;
+pub const ADLP_MAN_TRACK_CONTINUOUS_FULL_FRAME: u32 = 1 << 13;
+pub const EDPP_PSR_DEBUG_MASK_MAX_SLEEP: u32 = 1 << 28;
+pub const EDPP_PSR_DEBUG_MASK_LPSP: u32 = 1 << 27;
+pub const EDPP_PSR_DEBUG_MASK_MEMUP: u32 = 1 << 26;
+pub const EDPP_PSR_DEBUG_MASK_HPD: u32 = 1 << 25;
+pub const EDPP_PSR_DEBUG_MASK_SPRITE_ENABLE: u32 = 1 << 21;
+pub const EDPP_PSR_DEBUG_MASK_DISP_REG_WRITE: u32 = 1 << 16;
+pub const PSR_AUX_CTL_ALLOWED_MASK: u32 = 0x0d1f_07ff;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Transcoder(pub u8);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PsrReg {
+    Control,
+    HswSrdControl,
+    Debug,
+    HswSrdDebug,
+    PerfCount,
+    HswSrdPerfCount,
+    Status,
+    HswSrdStatus,
+    Psr2Control,
+    Psr2Status,
+    TransDp2Control,
+    ExitLine,
+    ChickenDcpR1,
+    ChickenPar1_1,
+    ChickenTrans,
+    MtlClockGateTrans,
+    ClockGateMisc,
+    LnlSffControl,
+    PipeSourceSizeEarlyTpt,
+    InterruptMask,
+    TranscoderInterruptMask,
+    InterruptIdentity,
+    TranscoderInterruptIdentity,
+    SuStatus(u8),
+    AuxControl,
+    HswSrdAuxControl,
+    AuxData(u8),
+    HswSrdAuxData(u8),
+    Event,
+    SourceStatus,
+    ManualTrack,
+    PipeSourceSize,
+    PipeScanline,
+    CursorSurfaceLive,
+    Dsb,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PsrWork {
+    Psr,
+    Dc3coDisable,
+    Dc5Dc6Wa,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PsrQueue {
+    Unordered,
+    DisplayPort,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PsrDcState {
+    UptoDc6,
+    Dc3Co,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Rect {
+    pub x1: i32,
+    pub y1: i32,
+    pub x2: i32,
+    pub y2: i32,
+}
+impl Rect {
+    pub fn width(self) -> i32 {
+        self.x2 - self.x1
+    }
+    pub fn height(self) -> i32 {
+        self.y2 - self.y1
+    }
+    pub fn empty(self) -> bool {
+        self.x1 >= self.x2 || self.y1 >= self.y2
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Timing {
+    pub pixel_clock_khz: u32,
+    pub refresh_rate_hz: u32,
+    pub htotal: u32,
+    pub hdisplay: u32,
+    pub hblank_start: u32,
+    pub hblank_end: u32,
+    pub crtc_clock_khz: u32,
+    pub lane_count: u8,
+    pub port_clock_khz: u32,
+    pub vtotal: u32,
+    pub vdisplay: u32,
+    pub vblank_start: u32,
+    pub vblank_end: u32,
+    pub frame_time_us: u32,
+    pub interlaced: bool,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FirmwarePsrPolicy {
+    pub enable_psr: bool,
+    pub full_link: bool,
+    pub idle_frames: u8,
+    pub tp1_wakeup_time_us: u32,
+    pub tp23_wakeup_time_us: u32,
+    pub psr2_tp23_wakeup_time_us: i32,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PsrCaps {
+    pub sink_psr1: bool,
+    pub sink_psr2: bool,
+    pub sink_panel_replay: bool,
+    pub source_psr: bool,
+    pub source_psr2: bool,
+    pub source_panel_replay: bool,
+    pub selective_update: bool,
+    pub su_granularity: u16,
+    pub su_y_granularity: u16,
+    pub max_su_area: u32,
+    pub alpm: bool,
+    pub alpm_aux_less: bool,
+    pub dsc: bool,
+    pub pr_dsc: bool,
+    pub pr_dsc_support: u8,
+    pub psr_dpcd_version: u8,
+    pub pr_dpcd_support: u8,
+    pub pr_dpcd_capability: u8,
+    pub panel_replay_dpcd_support: u8,
+    pub panel_replay_dpcd_capability: u8,
+    pub dsc_max_bpp_x16: u16,
+    pub async_video_timing: bool,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PsrConfig {
+    pub has_psr: bool,
+    pub has_sel_update: bool,
+    pub has_panel_replay: bool,
+    pub link_off: bool,
+    pub link_off_after_as_sdp: bool,
+    pub disable_as_sdp: bool,
+    pub dc3co: bool,
+    pub transcoder: Transcoder,
+    pub pipe: u8,
+    pub pipe_src: (u16, u16),
+    pub mode_width: u16,
+    pub mode_height: u16,
+    pub pipe_src_early_tpt: u32,
+    pub manual_track_control: u32,
+    pub su_x_granularity: u16,
+    pub su_y_granularity: u16,
+    pub idle_frames: u8,
+    pub entry_setup_frames: u8,
+    pub io_wake_lines: u8,
+    pub fast_wake_lines: u8,
+    pub aux_less_wake_lines: u8,
+    pub exit_line: u16,
+    pub frame_time_us: u32,
+    pub min_guardband: u32,
+    pub su_area: Rect,
+    pub enable_psr2_sel_fetch: bool,
+    pub enable_psr2_su_region_et: bool,
+    pub req_psr2_sdp_prior_scanline: bool,
+    pub active_non_psr_pipes: u8,
+    pub pkg_c_latency_used: bool,
+    pub crc_enabled: bool,
+    pub wm_level_disabled: bool,
+    pub infoframes_vsc_enabled: bool,
+    pub active_planes: u32,
+    pub pipe_bpp: u8,
+    pub set_context_latency: i32,
+    pub source_scanline_indication: bool,
+    pub use_trans_push: bool,
+}
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PsrState {
+    pub debug: u32,
+    pub caps: PsrCaps,
+    pub config: PsrConfig,
+    pub enabled: bool,
+    pub active: bool,
+    pub panel_replay_enabled: bool,
+    pub sel_update_enabled: bool,
+    pub paused: bool,
+    pub pause_counter: u32,
+    pub sink_not_reliable: bool,
+    pub irq_aux_error: bool,
+    pub dc3co_enabled: bool,
+    pub psr2_sel_fetch_enabled: bool,
+    pub psr2_sel_fetch_cff_enabled: bool,
+    pub su_region_et_enabled: bool,
+    pub req_psr2_sdp_prior_scanline: bool,
+    pub pkg_c_latency_used: bool,
+    pub frontbuffer_bits: u32,
+    pub busy_frontbuffer_bits: u32,
+    pub transcoder: Transcoder,
+    pub last_entry_attempt_ns: u64,
+    pub last_exit_ns: u64,
+    pub irq_mask: u32,
+    pub panel_vbt_psr: bool,
+    pub enable_panel_replay: bool,
+    pub dmc_loaded: bool,
+    pub link_ok: bool,
+    pub active_non_psr_pipes: u8,
+    pub pipe_active: bool,
+    pub port: u8,
+    pub generation: u8,
+    pub lock_held: bool,
+    pub work_pending: bool,
+    pub no_psr_reason: Option<&'static str>,
+    pub dc3co_exit_delay_ms: u32,
+    pub wake_lines: u8,
+    pub fast_wake_lines: u8,
+    pub setup_frames: u8,
+    pub sink_sync_latency: u8,
+    pub status: u32,
+    pub error_status: u32,
+}
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PsrDevice {
+    pub display_ver: u8,
+    pub transcoder: Transcoder,
+    pub is_edp: bool,
+    pub is_dp: bool,
+    pub is_mst: bool,
+    pub connector_id: u32,
+    pub connector_is_edp: bool,
+    pub crtc_has_edp: bool,
+    pub panel_replay_param: bool,
+    pub psr: PsrState,
+    pub timing: Timing,
+    pub hdisplay: u32,
+    pub new_timing: Timing,
+    pub active_planes: u32,
+    pub pipe_count: u8,
+    pub update_planes: u32,
+    pub has_psr_hardware: bool,
+    pub has_dp20: bool,
+    pub port_a: bool,
+    pub vbt_full_link: bool,
+    pub enable_psr: bool,
+    pub psr_safest_params: bool,
+    pub tp1_wakeup_time_us: u32,
+    pub tp23_wakeup_time_us: u32,
+    pub psr2_tp23_wakeup_time_us: i32,
+    pub source_tps3: bool,
+    pub sink_tps3: bool,
+    pub wa_22012278275: bool,
+    pub haswell: bool,
+    pub haswell_ult: bool,
+    pub alderlake_p: bool,
+    pub alderlake_p_early_step: bool,
+    pub old_unsupported_phy: bool,
+    pub tigerlake: bool,
+    pub splitter_enabled: bool,
+    pub wa_16029024088: bool,
+    pub wa_16025596647: bool,
+    pub wa_14014971492: bool,
+    pub output_format_ycbcr420: bool,
+    pub uhbr: bool,
+    pub jasperlake: bool,
+    pub elkhartlake: bool,
+    pub disable_psr2_quirk: bool,
+    pub force_psr1: bool,
+    pub disable_psr2_wa: bool,
+    pub has_psr_hw_tracking: bool,
+    pub has_psr2_sel_fetch: bool,
+    pub supports_trans_push: bool,
+    pub stepping_3000_a0_b0: bool,
+    pub has_dc3co: bool,
+    pub allowed_dc3co: bool,
+    pub dsc_enabled: bool,
+    pub vrr_enabled: bool,
+    pub hdcp_enabled: bool,
+    pub hdcp_desired: bool,
+    pub hdcp_value_undesired: bool,
+    pub mode_changed: bool,
+    pub atomic_committed: bool,
+    pub underrun_wa: bool,
+    pub dc5_dc6_blocked: bool,
+    pub firmware_scanout: bool,
+}
+
+/ Hardware/framework boundary used by the source-order port.
+pub trait PsrIo {
+    fn mmio_read(&mut self, reg: PsrReg, transcoder: Transcoder) -> u32;
+    fn mmio_write(&mut self, reg: PsrReg, transcoder: Transcoder, value: u32);
+    fn mmio_write_fw(&mut self, reg: PsrReg, transcoder: Transcoder, value: u32);
+    fn mmio_rmw(&mut self, reg: PsrReg, transcoder: Transcoder, clear: u32, set: u32) -> u32;
+    fn aux_read(&mut self, address: u32, data: &mut [u8]) -> i32;
+    fn aux_write(&mut self, address: u32, data: &[u8]) -> i32;
+    fn wait_vblank(&mut self, pipe: u8, count: u8) -> bool;
+    fn delay_us(&mut self, min: u32, max: u32);
+    fn now_ns(&mut self) -> u64;
+    fn queue_work(&mut self, queue: PsrQueue, work: PsrWork, delay_ms: u32);
+    fn init_work(&mut self, work: PsrWork);
+    fn init_mutex(&mut self);
+    fn cancel_work_sync(&mut self, work: PsrWork);
+    fn cancel_work(&mut self, work: PsrWork);
+    fn set_target_dc_state(&mut self, state: PsrDcState);
+    fn lock_psr(&mut self);
+    fn lock_psr_interruptible(&mut self) -> Result<(), i32>;
+    fn unlock_psr(&mut self);
+    fn assert_psr_lock_held(&mut self);
+    fn drm_log(&mut self, level: u8, message: &str, value: u32);
+    fn atomic_property_changed(&mut self, connector: u32, property: u32, value: u64);
+    fn add_debugfs_file(&mut self, name: &str, connector: u32);
+    fn dmc_block(&mut self, transcoder: Transcoder, block: bool);
+    fn set_frontbuffer_bits(&mut self, bits: u32, busy: bool);
+    fn force_frame_change(&mut self, pipe: u8);
+    fn program_dsb(&mut self, reg: PsrReg, transcoder: Transcoder, value: u32);
+    fn firmware_psr_policy(&mut self, connector: u32) -> Option<FirmwarePsrPolicy>;
+    fn debug_output(&mut self, text: &str);
+    fn alpm_compute_params(&mut self, device: &mut PsrDevice) -> bool;
+    fn as_sdp_transmission_time(&mut self) -> u8;
+    fn alpm_enable_sink(&mut self, device: &PsrDevice, config: &PsrConfig);
+    fn alpm_configure_source(&mut self, device: &PsrDevice, config: &PsrConfig);
+    fn alpm_disable(&mut self, device: &PsrDevice);
+    fn alpm_has_error(&mut self, device: &PsrDevice) -> bool;
+    fn update_psr_phy_power_state(&mut self, device: &PsrDevice, enabled: bool);
+    fn dmc_block_pkgc(&mut self, pipe: u8, blocked: bool);
+    fn dmc_start_pkgc_exit_at_undelayed_vblank(&mut self, pipe: u8, enable: bool);
+    fn enable_vrr_psr_frame_change(&mut self, device: &PsrDevice);
+    fn add_affected_planes(&mut self, pipe: u8) -> i32;
+    fn update_linked_plane_sel_fetch(&mut self, plane_id: u8, area: Rect) -> i32;
+    fn dsc_su_et_parameters(&mut self, area_height: u32);
+    fn fastset_force(&mut self) -> i32;
+    fn vblank_power_reference(&mut self, enable: bool);
+    fn runtime_pm_get(&mut self) -> u64;
+    fn runtime_pm_put(&mut self, reference: u64);
+    fn psr_aux_clock_divider(&mut self, device: &PsrDevice) -> u32;
+    fn psr_aux_send_control(&mut self, device: &PsrDevice, message_size: u8, divider: u32) -> u32;
+}
+
+const fn mode_debug(debug: u32) -> u32 {
+    debug & I915_PSR_DEBUG_MODE_MASK
+}
+const fn gen12(ver: u8) -> bool {
+    ver >= 12
+}
+const fn gen8(ver: u8) -> bool {
+    ver >= 8
+}
+
+upstream: intel_psr.c intel_encoder_can_psr()
+pub fn intel_encoder_can_psr(device: &PsrDevice) -> bool {
+    (device.is_dp || device.is_mst)
+        && (device.psr.caps.sink_psr1 && device.psr.caps.source_psr
+            || device.psr.caps.sink_panel_replay && device.psr.caps.source_panel_replay)
+}
+upstream: intel_psr.c intel_psr_needs_aux_io_power()
+pub fn intel_psr_needs_aux_io_power(device: &PsrDevice, crtc_has_edp: bool) -> bool {
+    crtc_has_edp && intel_encoder_can_psr(device)
+}
+upstream: intel_psr.c psr_global_enabled()
+pub fn psr_global_enabled(device: &PsrDevice) -> bool {
+    match mode_debug(device.psr.debug) {
+        I915_PSR_DEBUG_DEFAULT => !device.is_edp || device.psr.panel_vbt_psr,
+        I915_PSR_DEBUG_DISABLE => false,
+        _ => true,
+    }
+}
+upstream: intel_psr.c sel_update_global_enabled()
+pub fn sel_update_global_enabled(device: &PsrDevice) -> bool {
+    !matches!(
+        mode_debug(device.psr.debug),
+        I915_PSR_DEBUG_DISABLE | I915_PSR_DEBUG_FORCE_PSR1
+    )
+}
+upstream: intel_psr.c panel_replay_global_enabled()
+pub fn panel_replay_global_enabled(device: &PsrDevice) -> bool {
+    device.psr.debug & I915_PSR_DEBUG_PANEL_REPLAY_DISABLE == 0 && device.panel_replay_param
+}
+upstream: intel_psr.c psr_irq_psr_error_bit_get()
+pub fn psr_irq_psr_error_bit_get(device: &PsrDevice) -> u32 {
+    if gen12(device.display_ver) {
+        PSR_ERROR
+    } else {
+        PSR_ERROR << psr_transcoder_irq_shift(device.transcoder)
+    }
+}
+upstream: intel_psr.c psr_irq_post_exit_bit_get()
+pub fn psr_irq_post_exit_bit_get(device: &PsrDevice) -> u32 {
+    if gen12(device.display_ver) {
+        PSR_POST_EXIT
+    } else {
+        PSR_POST_EXIT << psr_transcoder_irq_shift(device.transcoder)
+    }
+}
+upstream: intel_psr.c psr_irq_pre_entry_bit_get()
+pub fn psr_irq_pre_entry_bit_get(device: &PsrDevice) -> u32 {
+    if gen12(device.display_ver) {
+        PSR_PRE_ENTRY
+    } else {
+        PSR_PRE_ENTRY << psr_transcoder_irq_shift(device.transcoder)
+    }
+}
+upstream: intel_psr.c psr_irq_mask_get()
+pub fn psr_irq_mask_get(device: &PsrDevice) -> u32 {
+    if gen12(device.display_ver) {
+        0x7
+    } else {
+        0x7 << psr_transcoder_irq_shift(device.transcoder)
+    }
+}
+
+/ Old fixed IMR/IIR pack one PSR triplet per transcoder. EDP is shift zero;
+/ the other transcoder fields advance in bytes as in `_EDP_PSR_TRANS_SHIFT`.
+fn psr_transcoder_irq_shift(transcoder: Transcoder) -> u32 {
+    if transcoder.0 == 4 {
+        0
+    } else {
+        u32::from(transcoder.0.saturating_add(1)) * 8
+    }
+}
+upstream: intel_psr.c psr_ctl_reg()
+pub fn psr_ctl_reg(device: &PsrDevice) -> PsrReg {
+    if gen8(device.display_ver) {
+        PsrReg::Control
+    } else {
+        PsrReg::HswSrdControl
+    }
+}
+upstream: intel_psr.c psr_debug_reg()
+pub fn psr_debug_reg(device: &PsrDevice) -> PsrReg {
+    if gen8(device.display_ver) {
+        PsrReg::Debug
+    } else {
+        PsrReg::HswSrdDebug
+    }
+}
+upstream: intel_psr.c psr_perf_cnt_reg()
+pub fn psr_perf_cnt_reg(device: &PsrDevice) -> PsrReg {
+    if gen8(device.display_ver) {
+        PsrReg::PerfCount
+    } else {
+        PsrReg::HswSrdPerfCount
+    }
+}
+upstream: intel_psr.c psr_status_reg()
+pub fn psr_status_reg(device: &PsrDevice) -> PsrReg {
+    if gen8(device.display_ver) {
+        PsrReg::Status
+    } else {
+        PsrReg::HswSrdStatus
+    }
+}
+upstream: intel_psr.c psr_imr_reg()
+pub fn psr_imr_reg(device: &PsrDevice) -> PsrReg {
+    if gen12(device.display_ver) {
+        PsrReg::TranscoderInterruptMask
+    } else {
+        PsrReg::InterruptMask
+    }
+}
+upstream: intel_psr.c psr_iir_reg()
+pub fn psr_iir_reg(device: &PsrDevice) -> PsrReg {
+    if gen12(device.display_ver) {
+        PsrReg::TranscoderInterruptIdentity
+    } else {
+        PsrReg::InterruptIdentity
+    }
+}
+upstream: intel_psr.c psr_aux_ctl_reg()
+pub fn psr_aux_ctl_reg(device: &PsrDevice) -> PsrReg {
+    if gen8(device.display_ver) {
+        PsrReg::AuxControl
+    } else {
+        PsrReg::HswSrdAuxControl
+    }
+}
+upstream: intel_psr.c psr_aux_data_reg()
+pub fn psr_aux_data_reg(device: &PsrDevice, index: u8) -> PsrReg {
+    if gen8(device.display_ver) {
+        PsrReg::AuxData(index)
+    } else {
+        PsrReg::HswSrdAuxData(index)
+    }
+}
+upstream: intel_psr.c psr_irq_control()
+pub fn psr_irq_control<I: PsrIo>(device: &mut PsrDevice, io: &mut I) {
+    if device.psr.panel_replay_enabled {
+        return;
+    }
+    let mut mask = psr_irq_psr_error_bit_get(device);
+    if device.psr.debug & I915_PSR_DEBUG_IRQ != 0 {
+        mask |= psr_irq_post_exit_bit_get(device) | psr_irq_pre_entry_bit_get(device);
+    }
+    device.psr.irq_mask = mask;
+    io.mmio_rmw(
+        PsrReg::InterruptMask,
+        device.psr.transcoder,
+        psr_irq_mask_get(device),
+        !mask,
+    );
+}
+upstream: intel_psr.c psr_event_print()
+pub fn psr_event_print<I: PsrIo>(io: &mut I, value: u32, sel_update_enabled: bool) {
+    const EVENTS: &[(u32, &str, bool)] = &[
+        (
+            PSR_EVENT_PSR2_WD_TIMER_EXPIRE,
+            "PSR2 watchdog timer expired",
+            false,
+        ),
+        (PSR_EVENT_PSR2_DISABLED, "PSR2 disabled", true),
+        (
+            PSR_EVENT_SU_DIRTY_FIFO_UNDERRUN,
+            "SU dirty FIFO underrun",
+            false,
+        ),
+        (
+            PSR_EVENT_SU_CRC_FIFO_UNDERRUN,
+            "SU CRC FIFO underrun",
+            false,
+        ),
+        (PSR_EVENT_GRAPHICS_RESET, "Graphics reset", false),
+        (PSR_EVENT_PCH_INTERRUPT, "PCH interrupt", false),
+        (PSR_EVENT_MEMORY_UP, "Memory up", false),
+        (
+            PSR_EVENT_FRONT_BUFFER_MODIFY,
+            "Front buffer modification",
+            false,
+        ),
+        (
+            PSR_EVENT_WD_TIMER_EXPIRE,
+            "PSR watchdog timer expired",
+            false,
+        ),
+        (
+            PSR_EVENT_PIPE_REGISTERS_UPDATE,
+            "PIPE registers updated",
+            false,
+        ),
+        (PSR_EVENT_REGISTER_UPDATE, "Register updated", false),
+        (PSR_EVENT_HDCP_ENABLE, "HDCP enabled", false),
+        (PSR_EVENT_KVMR_SESSION_ENABLE, "KVMR session enabled", false),
+        (PSR_EVENT_VBI_ENABLE, "VBI enabled", false),
+        (PSR_EVENT_LPSP_MODE_EXIT, "LPSP mode exited", false),
+        (PSR_EVENT_PSR_DISABLE, "PSR disabled", true),
+    ];
+    io.drm_log(0, "PSR exit events", value);
+    for &(bit, text, conditional) in EVENTS {
+        if value & bit != 0
+            && (!conditional || (bit == PSR_EVENT_PSR2_DISABLED) == sel_update_enabled)
+        {
+            io.drm_log(0, text, 0);
+        }
+    }
+}
+upstream: intel_psr.c intel_psr_irq_handler()
+pub fn intel_psr_irq_handler<I: PsrIo>(device: &mut PsrDevice, io: &mut I, psr_iir: u32) {
+    let tr = device.psr.transcoder;
+    let now = io.now_ns();
+    if psr_iir & psr_irq_pre_entry_bit_get(device) != 0 {
+        device.psr.last_entry_attempt_ns = now;
+        io.drm_log(0, "PSR entry attempt in 2 vblanks", u32::from(tr.0));
+    }
+    if psr_iir & psr_irq_post_exit_bit_get(device) != 0 {
+        device.psr.last_exit_ns = now;
+        io.drm_log(0, "PSR exit completed", u32::from(tr.0));
+        if device.display_ver >= 9 {
+            let val = io.mmio_rmw(PsrReg::Event, tr, 0, 0);
+            psr_event_print(io, val, device.psr.sel_update_enabled);
+        }
+    }
+    if psr_iir & psr_irq_psr_error_bit_get(device) != 0 {
+        io.drm_log(2, "PSR aux error", u32::from(tr.0));
+        device.psr.irq_aux_error = true;
+        io.mmio_rmw(
+            PsrReg::InterruptMask,
+            tr,
+            0,
+            psr_irq_psr_error_bit_get(device),
+        );
+        io.queue_work(PsrQueue::Unordered, PsrWork::Psr, 0);
+    }
+}
+upstream: intel_psr.c intel_dp_get_sink_sync_latency()
+pub fn intel_dp_get_sink_sync_latency<I: PsrIo>(device: &PsrDevice, io: &mut I) -> u8 {
+    let mut val = [8u8];
+    if io.aux_read(0x2009, &mut val) == 1 {
+        val[0] &= DP_MAX_RESYNC_FRAME_COUNT_MASK;
+    } else {
+        io.drm_log(
+            0,
+            "Unable to get sink synchronization latency, assuming 8 frames",
+            0,
+        );
+    }
+    val[0]
+}
+upstream: intel_psr.c _psr_compute_su_granularity()
+pub fn _psr_compute_su_granularity<I: PsrIo>(device: &mut PsrDevice, io: &mut I, required: bool) {
+    let mut su_x_granularity = [0u8; 2];
+    let mut su_y_granularity = 4u8;
+
+    // Panels without a required granularity use the legacy SU values. The
+    // source sends full lines, so x granularity has no PSR2 effect here.
+    if !required {
+        device.psr.caps.su_granularity = 4;
+        device.psr.caps.su_y_granularity = 4;
+        return;
+    }
+
+    // Read the little-endian X value first. A failed or zero read selects the
+    // spec's default rather than retaining stale connector data.
+    let x_read = io.aux_read(0x0225, &mut su_x_granularity);
+    if x_read != su_x_granularity.len() as i32 {
+        io.drm_log(
+            0,
+            "Unable to read selective update x granularity",
+            x_read as u32,
+        );
+    }
+    let mut x = if x_read == su_x_granularity.len() as i32 {
+        u16::from_le_bytes(su_x_granularity)
+    } else {
+        0
+    };
+    if x == 0 {
+        x = 4;
+    }
+
+    let mut y = [su_y_granularity];
+    let y_read = io.aux_read(0x0227, &mut y);
+    if y_read != 1 {
+        io.drm_log(
+            0,
+            "Unable to read selective update y granularity",
+            y_read as u32,
+        );
+        y[0] = 4;
+    }
+    // Unlike X, a successful zero Y field means one line per spec.
+    if y[0] == 0 {
+        y[0] = 1;
+    }
+
+    device.psr.caps.su_granularity = x;
+    device.psr.caps.su_y_granularity = u16::from(y[0]);
+}
+
+upstream: intel_psr.c compute_pr_dsc_support()
+pub fn compute_pr_dsc_support(capability: u8) -> u8 {
+    // DP_PANEL_REPLAY_DSC_DECODE_CAPABILITY_IN_PR_MASK is bits 2:1.
+    match (capability >> 1) & 0x3 {
+        0 => 2,     // INTEL_DP_PANEL_REPLAY_DSC_SELECTIVE_UPDATE
+        1 => 1,     // INTEL_DP_PANEL_REPLAY_DSC_FULL_FRAME_ONLY
+        2 | 3 => 0, // not supported or reserved
+        _ => unreachable!(),
+    }
+}
+
+upstream: intel_psr.c panel_replay_dsc_support_str()
+pub fn panel_replay_dsc_support_str(support: u8) -> &'static str {
+    match support {
+        0 => "not supported",
+        1 => "full frame only",
+        2 => "selective update",
+        _ => "n/a",
+    }
+}
+upstream: intel_psr.c _panel_replay_compute_su_granularity()
+pub fn _panel_replay_compute_su_granularity(device: &mut PsrDevice, caps: &[u8]) {
+    let capability = caps.get(1).copied().unwrap_or(0);
+    if capability & DP_PANEL_REPLAY_SU_GRANULARITY_REQUIRED == 0 {
+        device.psr.caps.su_granularity = 4;
+        device.psr.caps.su_y_granularity = 4;
+        return;
+    }
+
+    let x_bytes = [
+        caps.get(2).copied().unwrap_or(0),
+        caps.get(3).copied().unwrap_or(0),
+    ];
+    let x = u16::from_le_bytes(x_bytes);
+    let y = caps.get(4).copied().unwrap_or(0);
+    device.psr.caps.su_granularity = if x == 0 { 4 } else { x };
+    device.psr.caps.su_y_granularity = u16::from(if y == 0 { 1 } else { y });
+}
+
+upstream: intel_psr.c _panel_replay_init_dpcd()
+pub fn _panel_replay_init_dpcd<I: PsrIo>(
+    device: &mut PsrDevice,
+    io: &mut I,
+    connector: u32,
+    mst: bool,
+    quirk_disable: bool,
+) {
+    // TODO: Enable Panel Replay on MST only after its multi-stream lifecycle is
+    // implemented; do not read or advertise sink support on this path.
+    if mst {
+        return;
+    }
+
+    if device.is_edp && quirk_disable {
+        io.drm_log(
+            0,
+            "Panel Replay support not currently available for this setup",
+            connector,
+        );
+        return;
+    }
+
+    let mut panel_replay_dpcd = [0u8; 7];
+    let read = io.aux_read(0x00b0, &mut panel_replay_dpcd);
+    if read < 0 {
+        return;
+    }
+
+    let support = panel_replay_dpcd[0];
+    if support & 1 == 0 {
+        return;
+    }
+
+    if device.is_edp && !device.psr.caps.alpm_aux_less {
+        io.drm_log(
+            0,
+            "Panel doesn't support AUX-less ALPM, eDP Panel Replay not possible",
+            0,
+        );
+        return;
+    }
+
+    if device.is_edp && support & DP_PANEL_REPLAY_EARLY_TRANSPORT_SUPPORT == 0 {
+        io.drm_log(
+            0,
+            "Panel doesn't support early transport, eDP Panel Replay not possible",
+            0,
+        );
+        return;
+    }
+
+    device.psr.caps.sink_panel_replay = true;
+    device.psr.caps.pr_dpcd_support = support;
+    device.psr.caps.pr_dpcd_capability = panel_replay_dpcd[1];
+    if support & 2 != 0 {
+        device.psr.caps.selective_update = true;
+        _panel_replay_compute_su_granularity(device, &panel_replay_dpcd);
+    }
+
+    let dsc_support = compute_pr_dsc_support(panel_replay_dpcd[1]);
+    device.psr.caps.pr_dsc_support = dsc_support;
+    device.psr.caps.pr_dsc = dsc_support != 0;
+    io.drm_log(
+        0,
+        if device.psr.caps.selective_update {
+            "Panel replay selective_update is supported by panel (in DSC mode)"
+        } else {
+            "Panel replay is supported by panel (in DSC mode)"
+        },
+        0,
+    );
+    io.drm_log(0, panel_replay_dsc_support_str(dsc_support), 0);
+}
+
+upstream: intel_psr.c _psr_init_dpcd()
+pub fn _psr_init_dpcd<I: PsrIo>(
+    device: &mut PsrDevice,
+    io: &mut I,
+    _connector: u32,
+    dpcd: &mut [u8; 8],
+    no_psr_quirk: bool,
+    set_power_cap: bool,
+    disable_psr2: bool,
+) {
+    let read = io.aux_read(0x0070, dpcd);
+    if read < 0 || dpcd[0] == 0 {
+        return;
+    }
+
+    io.drm_log(0, "eDP panel supports PSR version", u32::from(dpcd[0]));
+    if no_psr_quirk {
+        io.drm_log(0, "PSR support not currently available for this panel", 0);
+        return;
+    }
+    if !set_power_cap {
+        io.drm_log(
+            0,
+            "Panel lacks power state control, PSR cannot be enabled",
+            0,
+        );
+        return;
+    }
+
+    device.psr.caps.sink_psr1 = true;
+    device.psr.caps.psr_dpcd_version = dpcd[0];
+    device.psr.sink_sync_latency = intel_dp_get_sink_sync_latency(device, io);
+    if disable_psr2 || device.disable_psr2_quirk {
+        return;
+    }
+
+    if device.display_ver >= 9 && dpcd[0] >= 3 {
+        let y_coordinate_required = dpcd[1] & DP_PSR2_SU_Y_COORDINATE_REQUIRED != 0;
+        // PSR DPCD 03h advertises Y-coordinate VSC support. i915 only enables
+        // selective update if required by the sink and ALPM AUX wake is usable.
+        device.psr.caps.selective_update = y_coordinate_required && device.psr.caps.alpm;
+        io.drm_log(
+            0,
+            if device.psr.caps.selective_update {
+                "PSR2 supported"
+            } else {
+                "PSR2 not supported"
+            },
+            0,
+        );
+    }
+
+    if device.psr.caps.selective_update {
+        let mut intel_wa_register_caps = [0u8; 1];
+        let read = io.aux_read(
+            INTEL_DPCD_WA_PSR2_EARLYSCANLINE_SUPPORT,
+            &mut intel_wa_register_caps,
+        );
+        if read < 0 {
+            return;
+        }
+        device.psr.status = u32::from(intel_wa_register_caps[0]);
+        _psr_compute_su_granularity(device, io, dpcd[1] & DP_PSR2_SU_GRANULARITY_REQUIRED != 0);
+    }
+}
+
+upstream: intel_psr.c intel_psr_init_dpcd()
+pub fn intel_psr_init_dpcd<I: PsrIo>(
+    device: &mut PsrDevice,
+    io: &mut I,
+    connector: u32,
+    dpcd: &mut [u8; 8],
+    no_psr_quirk: bool,
+    set_power_cap: bool,
+    disable_psr2: bool,
+    mst: bool,
+    pr_quirk: bool,
+) {
+    _psr_init_dpcd(
+        device,
+        io,
+        connector,
+        dpcd,
+        no_psr_quirk,
+        set_power_cap,
+        disable_psr2,
+    );
+    _panel_replay_init_dpcd(device, io, connector, mst, pr_quirk);
+}
+upstream: intel_psr.c hsw_psr_setup_aux()
+pub fn hsw_psr_setup_aux<I: PsrIo>(device: &PsrDevice, io: &mut I) {
+    let transcoder = device.psr.transcoder;
+
+    // Native AUX write of DP_SET_POWER = D0. The message header is packed
+    // little-endian into the display PSR AUX data registers.
+    let aux_message = [
+        (0x8u8 << 4) | ((0x0600u32 >> 16) as u8 & 0x0f),
+        (0x0600u16 >> 8) as u8,
+        0x0600u8 as u8,
+        1 - 1,
+        1, // DP_SET_POWER_D0
+    ];
+    for (index, chunk) in aux_message.chunks(4).enumerate() {
+        let mut packed = 0u32;
+        for (byte_index, byte) in chunk.iter().enumerate() {
+            packed |= u32::from(*byte) << (byte_index * 8);
+        }
+        io.mmio_write(psr_aux_data_reg(device, index as u8), transcoder, packed);
+    }
+
+    let divider = io.psr_aux_clock_divider(device);
+    let mut aux_control = io.psr_aux_send_control(device, aux_message.len() as u8, divider);
+
+    // PSR AUX_CTL exposes only the timeout, message length, legacy precharge,
+    // and 2x bit-clock fields from the regular DDI AUX send control word.
+    aux_control &= PSR_AUX_CTL_ALLOWED_MASK;
+    io.mmio_write(psr_aux_ctl_reg(device), transcoder, aux_control);
+}
+
+upstream: intel_psr.c psr2_su_region_et_valid()
+pub fn psr2_su_region_et_valid(
+    device: &PsrDevice,
+    panel_replay: bool,
+    dpcd_capability: u8,
+) -> bool {
+    if device.display_ver < 20
+        || !device.is_edp
+        || device.psr.debug & I915_PSR_DEBUG_SU_REGION_ET_DISABLE != 0
+    {
+        return false;
+    }
+
+    if panel_replay {
+        dpcd_capability & DP_PANEL_REPLAY_EARLY_TRANSPORT_SUPPORT != 0
+    } else {
+        // DP_PSR2_WITH_Y_COORD_ET_SUPPORTED is DPCD revision value 04h.
+        dpcd_capability == 4
+    }
+}
+
+upstream: intel_psr.c _panel_replay_enable_sink()
+pub fn _panel_replay_enable_sink<I: PsrIo>(_device: &PsrDevice, io: &mut I, config: &PsrConfig) {
+    let mut panel_replay_config = [
+        DP_PANEL_REPLAY_ENABLE
+            | DP_PANEL_REPLAY_VSC_SDP_CRC_EN
+            | DP_PANEL_REPLAY_UNRECOVERABLE_ERROR_EN
+            | DP_PANEL_REPLAY_RFB_STORAGE_ERROR_EN
+            | DP_PANEL_REPLAY_ACTIVE_FRAME_CRC_ERROR_EN,
+        DP_PANEL_REPLAY_CRC_VERIFICATION,
+    ];
+
+    if config.has_sel_update {
+        panel_replay_config[0] |= DP_PANEL_REPLAY_SU_ENABLE;
+    }
+    if config.enable_psr2_su_region_et {
+        panel_replay_config[0] |= DP_PANEL_REPLAY_ENABLE_SU_REGION_ET;
+    }
+    if config.req_psr2_sdp_prior_scanline {
+        panel_replay_config[1] |= DP_PANEL_REPLAY_SU_REGION_SCANLINE_CAPTURE;
+    }
+
+    // The sink programming order is CONFIG(0x1b0) before CONFIG3(0x11a).
+    let _ = io.aux_write(0x01b0, &panel_replay_config);
+    let panel_replay_config3 = io.as_sdp_transmission_time();
+    let _ = io.aux_write(0x011a, &[panel_replay_config3]);
+}
+
+upstream: intel_psr.c _psr_enable_sink()
+pub fn _psr_enable_sink<I: PsrIo>(device: &PsrDevice, io: &mut I, config: &PsrConfig) {
+    let mut value = 0u8;
+    if config.has_sel_update {
+        value |= DP_PSR_ENABLE_PSR2 | DP_PSR_IRQ_HPD_WITH_CRC_ERRORS;
+    } else {
+        if config.link_off {
+            value |= DP_PSR_MAIN_LINK_ACTIVE;
+        }
+        if device.display_ver >= 8 {
+            value |= DP_PSR_CRC_VERIFICATION;
+        }
+    }
+
+    if config.req_psr2_sdp_prior_scanline {
+        value |= DP_PSR_SU_REGION_SCANLINE_CAPTURE;
+    }
+    if config.enable_psr2_su_region_et {
+        value |= DP_PSR_ENABLE_SU_REGION_ET;
+    }
+    if config.entry_setup_frames > 0 {
+        value |= DP_PSR_FRAME_CAPTURE;
+    }
+
+    // First write setup/interrupt options with ENABLE clear, then arm the sink.
+    let _ = io.aux_write(0x0170, &[value]);
+    value |= DP_PSR_ENABLE;
+    let _ = io.aux_write(0x0170, &[value]);
+}
+
+upstream: intel_psr.c intel_psr_enable_sink()
+pub fn intel_psr_enable_sink<I: PsrIo>(device: &PsrDevice, io: &mut I, config: &PsrConfig) {
+    io.alpm_enable_sink(device, config);
+
+    if config.has_panel_replay {
+        _panel_replay_enable_sink(device, io, config);
+    } else {
+        _psr_enable_sink(device, io, config);
+    }
+
+    // eDP sink D0 is written after feature programming, before source enable.
+    if device.is_edp {
+        let _ = io.aux_write(0x0600, &[1]);
+    }
+}
+
+upstream: intel_psr.c intel_psr_panel_replay_enable_sink()
+pub fn intel_psr_panel_replay_enable_sink<I: PsrIo>(device: &PsrDevice, io: &mut I) {
+    if device.psr.caps.sink_panel_replay
+        && device.psr.caps.source_panel_replay
+        && panel_replay_global_enabled(device)
+    {
+        io.aux_write(0x01b0, &[1]);
+    }
+}
+upstream: intel_psr.c intel_psr1_get_tp_time()
+pub fn intel_psr1_get_tp_time(
+    device: &PsrDevice,
+    tp1_wakeup_time_us: u32,
+    tp23_wakeup_time_us: u32,
+    safest_params: bool,
+    source_tps3: bool,
+    sink_tps3: bool,
+) -> u32 {
+    const TP4_TIME_0US: u32 = EDP_PSR_TP4_TIME_0US;
+    const TP1_500US: u32 = 0 << 4;
+    const TP1_100US: u32 = 1 << 4;
+    const TP1_2500US: u32 = 2 << 4;
+    const TP1_0US: u32 = 3 << 4;
+    const TP23_500US: u32 = 0 << 8;
+    const TP23_100US: u32 = 1 << 8;
+    const TP23_2500US: u32 = 2 << 8;
+    const TP23_0US: u32 = 3 << 8;
+
+    let mut value = 0;
+    if device.display_ver >= 11 {
+        value |= TP4_TIME_0US;
+    }
+
+    if safest_params {
+        value |= TP1_2500US | TP23_2500US;
+    } else {
+        value |= if tp1_wakeup_time_us == 0 {
+            TP1_0US
+        } else if tp1_wakeup_time_us <= 100 {
+            TP1_100US
+        } else if tp1_wakeup_time_us <= 500 {
+            TP1_500US
+        } else {
+            TP1_2500US
+        };
+
+        value |= if tp23_wakeup_time_us == 0 {
+            TP23_0US
+        } else if tp23_wakeup_time_us <= 100 {
+            TP23_100US
+        } else if tp23_wakeup_time_us <= 500 {
+            TP23_500US
+        } else {
+            TP23_2500US
+        };
+
+        // Wa 0479: HSW/BDW must not skip both TP1 and TP2/TP3.
+        if device.display_ver < 9 && tp1_wakeup_time_us == 0 && tp23_wakeup_time_us == 0 {
+            value &= !EDP_PSR_TP2_TP3_TIME_MASK;
+            value |= TP23_100US;
+        }
+    }
+
+    if source_tps3 && sink_tps3 {
+        value |= EDP_PSR_TP_SELECT_MASK;
+    } else {
+        value &= !EDP_PSR_TP_SELECT_MASK;
+    }
+    value
+}
+
+upstream: intel_psr.c psr_compute_idle_frames()
+pub fn psr_compute_idle_frames<I: PsrIo>(
+    device: &PsrDevice,
+    io: &mut I,
+    vbt_idle_frames: u8,
+) -> u8 {
+    // Keep six frames as the minimum: this covers known panels and a hardware
+    // off-by-one issue. Also allow the sink's synchronization latency plus one.
+    let mut idle_frames = 6u8.max(vbt_idle_frames);
+    idle_frames = idle_frames.max(device.psr.sink_sync_latency.saturating_add(1));
+
+    if idle_frames > 0x0f {
+        io.drm_log(
+            1,
+            "PSR idle frame count exceeds register field",
+            u32::from(idle_frames),
+        );
+        idle_frames = 0x0f;
+    }
+    idle_frames
+}
+
+upstream: intel_psr.c is_dc5_dc6_blocked()
+pub fn is_dc5_dc6_blocked(device: &PsrDevice, current_dc_state: u8, vblank_enabled: bool) -> bool {
+    (current_dc_state != 5 && current_dc_state != 6)
+        || device.psr.active_non_psr_pipes != 0
+        || vblank_enabled
+}
+
+upstream: intel_psr.c hsw_activate_psr1()
+pub fn hsw_activate_psr1<I: PsrIo>(device: &PsrDevice, io: &mut I) {
+    let mut value = EDP_PSR_ENABLE;
+    value |= u32::from(psr_compute_idle_frames(
+        device,
+        io,
+        device.psr.config.idle_frames,
+    ));
+
+    if device.display_ver < 20 {
+        value |= (0x1f << 20) & EDP_PSR_MAX_SLEEP_TIME_MASK;
+    }
+    if device.haswell {
+        // Minimum link entry time of eight lines is the zero encoding.
+        value |= 0;
+    }
+    if device.psr.config.link_off {
+        value |= EDP_PSR_LINK_STANDBY;
+    }
+    value |= intel_psr1_get_tp_time(
+        device,
+        device.tp1_wakeup_time_us,
+        device.tp23_wakeup_time_us,
+        device.psr_safest_params,
+        device.source_tps3,
+        device.sink_tps3,
+    );
+    if device.display_ver >= 8 {
+        value |= EDP_PSR_CRC_ENABLE;
+    }
+    if device.display_ver >= 20 {
+        value |= (u32::from(device.psr.config.entry_setup_frames) << 16)
+            & EDP_PSR_ENTRY_SETUP_FRAMES_MASK;
+    }
+
+    io.mmio_rmw(
+        psr_ctl_reg(device),
+        device.psr.transcoder,
+        !EDP_PSR_RESTORE_PSR_ACTIVE_CTX_MASK,
+        value,
+    );
+
+    // Wa_16025596647: DC5/DC6 blocking and package-C latency require the exit
+    // trigger to be positioned at the start of an undelayed vblank.
+    if (device.display_ver == 20 || device.stepping_3000_a0_b0)
+        && is_dc5_dc6_blocked(device, 0, false)
+        && device.psr.pkg_c_latency_used
+    {
+        io.dmc_start_pkgc_exit_at_undelayed_vblank(device.psr.config.pipe, true);
+    }
+}
+
+upstream: intel_psr.c intel_psr2_get_tp_time()
+pub fn intel_psr2_get_tp_time(safest_params: bool, tp23_wakeup_time_us: i32) -> u32 {
+    if safest_params {
+        return 2 << 8; // EDP_PSR2_TP2_TIME_2500us
+    }
+    if (0..=50).contains(&tp23_wakeup_time_us) {
+        3 << 8 // 50 us
+    } else if tp23_wakeup_time_us <= 100 {
+        1 << 8 // 100 us
+    } else if tp23_wakeup_time_us <= 500 {
+        0 << 8 // 500 us
+    } else {
+        2 << 8 // 2500 us
+    }
+}
+
+upstream: intel_psr.c psr2_block_count_lines()
+pub fn psr2_block_count_lines(io_wake_lines: u8, fast_wake_lines: u8) -> i32 {
+    if io_wake_lines < 9 && fast_wake_lines < 9 {
+        8
+    } else {
+        12
+    }
+}
+upstream: intel_psr.c psr2_block_count()
+pub fn psr2_block_count(device: &PsrDevice) -> i32 {
+    psr2_block_count_lines(
+        device.psr.config.io_wake_lines,
+        device.psr.config.fast_wake_lines,
+    ) / 4
+}
+upstream: intel_psr.c frames_before_su_entry()
+pub fn frames_before_su_entry(device: &PsrDevice) -> u8 {
+    let mut frames = device.psr.sink_sync_latency.saturating_add(1).max(2);
+    if device.psr.config.entry_setup_frames >= frames {
+        frames = device.psr.config.entry_setup_frames + 1
+    }
+    frames
+}
+upstream: intel_psr.c intel_psr_allow_pr_bw_optimization()
+pub fn intel_psr_allow_pr_bw_optimization(
+    device: &PsrDevice,
+    tunnel_bw_alloc: bool,
+    tunnel_pr_supported: bool,
+) -> bool {
+    !device.is_edp && tunnel_bw_alloc && tunnel_pr_supported
+}
+upstream: intel_psr.c dg2_activate_panel_replay()
+pub fn dg2_activate_panel_replay<I: PsrIo>(device: &PsrDevice, io: &mut I) {
+    let transcoder = device.psr.transcoder;
+    let mut dp2_ctl_set = 1 << 0; // TRANS_DP2_PANEL_REPLAY_ENABLE
+    let mut dp2_ctl_clear = 0;
+
+    if device.is_edp && device.psr.sel_update_enabled {
+        let mut psr2_control = 0;
+        if device.psr.su_region_et_enabled {
+            psr2_control |= EDP_PSR2_SU_REGION_ET_ENABLE;
+        }
+        if device.psr.req_psr2_sdp_prior_scanline {
+            psr2_control |= 1 << 25; // EDP_PSR2_SU_SDP_SCANLINE
+        }
+        io.mmio_write(PsrReg::Psr2Control, transcoder, psr2_control);
+    }
+
+    if intel_psr_allow_pr_bw_optimization(
+        device,
+        device.psr.config.link_off_after_as_sdp,
+        device.psr.caps.pr_dsc,
+    ) {
+        dp2_ctl_set |= 1 << 1; // TRANS_DP2_PR_TUNNELING_ENABLE
+    } else {
+        dp2_ctl_clear = 1 << 1;
+    }
+
+    let continuous_full_frame =
+        man_trk_ctl_continuos_full_frame(device.display_ver, device.alderlake_p);
+    io.mmio_rmw(PsrReg::ManualTrack, transcoder, 0, continuous_full_frame);
+    io.mmio_rmw(
+        PsrReg::TransDp2Control,
+        transcoder,
+        dp2_ctl_clear,
+        dp2_ctl_set,
+    );
+}
+
+upstream: intel_psr.c hsw_activate_psr2()
+pub fn hsw_activate_psr2<I: PsrIo>(device: &PsrDevice, io: &mut I) {
+    let transcoder = device.psr.transcoder;
+    let mut value = EDP_PSR2_ENABLE;
+    let mut psr_control = 0;
+
+    // Wa_16025596647: when package-C latency has been selected while DC5/DC6
+    // is blocked, PSR2 must not wait idle frames before entry.
+    let idle_frames = if (device.display_ver == 20 || device.stepping_3000_a0_b0)
+        && is_dc5_dc6_blocked(device, 0, false)
+        && device.psr.pkg_c_latency_used
+    {
+        0
+    } else {
+        psr_compute_idle_frames(device, io, device.psr.config.idle_frames)
+    };
+    value |= u32::from(idle_frames) & EDP_PSR2_IDLE_FRAMES_MASK;
+
+    if device.display_ver < 14 && !device.alderlake_p {
+        value |= EDP_PSR2_SU_TRACK_ENABLE;
+    }
+    if (10..13).contains(&device.display_ver) {
+        value |= EDP_PSR2_Y_COORDINATE_ENABLE;
+    }
+
+    value |= (u32::from(frames_before_su_entry(device)) << 4) & EDP_PSR2_FRAME_BEFORE_SU_MASK;
+    value |= intel_psr2_get_tp_time(device.psr_safest_params, device.psr2_tp23_wakeup_time_us);
+
+    if (12..20).contains(&device.display_ver) {
+        if psr2_block_count(device) > 2 {
+            value |= EDP_PSR2_BLOCK_COUNT_MASK;
+        }
+    }
+
+    // Wa_22012278275: ADL-P remaps encoded IO/FAST wake counts. The firmware
+    // defaults are retained, then translated through the documented table.
+    if device.wa_22012278275 {
+        const WAKE_REMAP: [u8; 8] = [2, 1, 0, 3, 6, 5, 4, 7];
+        let io_index = usize::from(device.psr.config.io_wake_lines.saturating_sub(5).min(7));
+        let fast_index = usize::from(device.psr.config.fast_wake_lines.saturating_sub(5).min(7));
+        let io_lines = u32::from(WAKE_REMAP[io_index] + 5);
+        let fast_lines = u32::from(WAKE_REMAP[fast_index] + 5);
+        value |= ((io_lines - 5) << 13) & TGL_EDP_PSR2_IO_BUFFER_WAKE_MASK;
+        value |= ((fast_lines - 5) << 10) & TGL_EDP_PSR2_FAST_WAKE_MASK;
+    } else if device.display_ver >= 20 {
+        value |= ((u32::from(device.psr.config.io_wake_lines.saturating_sub(5))) << 13)
+            & LNL_EDP_PSR2_IO_BUFFER_WAKE_MASK;
+    } else if device.display_ver >= 12 {
+        value |= ((u32::from(device.psr.config.io_wake_lines.saturating_sub(5))) << 13)
+            & TGL_EDP_PSR2_IO_BUFFER_WAKE_MASK;
+        value |= ((u32::from(device.psr.config.fast_wake_lines.saturating_sub(5))) << 10)
+            & TGL_EDP_PSR2_FAST_WAKE_MASK;
+    } else if device.display_ver >= 9 {
+        value |= ((8u32.saturating_sub(u32::from(device.psr.config.io_wake_lines))) << 13)
+            & EDP_PSR2_IO_BUFFER_WAKE_OLD_MASK;
+        value |= ((8u32.saturating_sub(u32::from(device.psr.config.fast_wake_lines))) << 11)
+            & EDP_PSR2_FAST_WAKE_MASK;
+    }
+
+    if device.psr.req_psr2_sdp_prior_scanline {
+        value |= EDP_PSR2_Y_COORDINATE_ENABLE;
+    }
+    if device.display_ver >= 20 {
+        psr_control |= (u32::from(device.psr.config.entry_setup_frames) << 16)
+            & EDP_PSR_ENTRY_SETUP_FRAMES_MASK;
+    }
+
+    if device.psr.psr2_sel_fetch_enabled {
+        let manual_track = io.mmio_read(PsrReg::ManualTrack, transcoder);
+        if manual_track & man_trk_ctl_enable_bit_get(device.display_ver, device.alderlake_p) == 0 {
+            io.drm_log(
+                2,
+                "PSR2 selective fetch manual tracking is not enabled",
+                manual_track,
+            );
+        }
+    } else if device.has_psr2_sel_fetch {
+        io.mmio_write(PsrReg::ManualTrack, transcoder, 0);
+    }
+
+    if device.psr.su_region_et_enabled {
+        value |= EDP_PSR2_SU_REGION_ET_ENABLE;
+    }
+
+    // Program the shared PSR control first, then the PSR2 control register.
+    io.mmio_write(psr_ctl_reg(device), transcoder, psr_control);
+    io.mmio_write(PsrReg::Psr2Control, transcoder, value);
+}
+
+upstream: intel_psr.c transcoder_has_psr2()
+pub fn transcoder_has_psr2(display_ver: u8, transcoder: Transcoder, alderlake_p: bool) -> bool {
+    if alderlake_p || display_ver >= 14 {
+        transcoder.0 <= 1
+    } else if display_ver >= 12 {
+        transcoder.0 == 0
+    } else if display_ver >= 9 {
+        transcoder.0 == 3
+    } else {
+        false
+    }
+}
+upstream: intel_psr.c intel_get_frame_time_us()
+pub fn intel_get_frame_time_us(timing: Timing, active: bool) -> u32 {
+    if !active {
+        return 0;
+    }
+    if timing.refresh_rate_hz != 0 {
+        return 1_000_000u32.div_ceil(timing.refresh_rate_hz);
+    }
+    timing.frame_time_us
+}
+upstream: intel_psr.c psr2_program_idle_frames()
+pub fn psr2_program_idle_frames<I: PsrIo>(device: &PsrDevice, io: &mut I, idle_frames: u32) {
+    io.mmio_rmw(
+        PsrReg::Status,
+        device.psr.transcoder,
+        0xf0,
+        idle_frames << 4,
+    );
+}
+upstream: intel_psr.c tgl_psr2_enable_dc3co()
+pub fn tgl_psr2_enable_dc3co<I: PsrIo>(device: &mut PsrDevice, io: &mut I) {
+    psr2_program_idle_frames(device, io, 0);
+    io.set_target_dc_state(PsrDcState::Dc3Co);
+    device.psr.dc3co_enabled = true;
+    device.psr.config.dc3co = true;
+}
+upstream: intel_psr.c tgl_psr2_disable_dc3co()
+pub fn tgl_psr2_disable_dc3co<I: PsrIo>(device: &mut PsrDevice, io: &mut I) {
+    io.set_target_dc_state(PsrDcState::UptoDc6);
+    let idle_frames = psr_compute_idle_frames(device, io, device.psr.config.idle_frames);
+    psr2_program_idle_frames(device, io, u32::from(idle_frames));
+    device.psr.dc3co_enabled = false;
+    device.psr.config.dc3co = false;
+}
+upstream: intel_psr.c tgl_dc3co_disable_work()
+pub fn tgl_dc3co_disable_work<I: PsrIo>(
+    device: &mut PsrDevice,
+    io: &mut I,
+    delayed_work_pending: bool,
+) {
+    io.lock_psr();
+    if !delayed_work_pending {
+        tgl_psr2_disable_dc3co(device, io);
+    }
+    io.unlock_psr();
+}
+upstream: intel_psr.c tgl_disallow_dc3co_on_psr2_exit()
+pub fn tgl_disallow_dc3co_on_psr2_exit<I: PsrIo>(device: &mut PsrDevice, io: &mut I) {
+    if device.psr.config.exit_line == 0 {
+        return;
+    }
+    io.cancel_work(PsrWork::Dc3coDisable);
+    tgl_psr2_disable_dc3co(device, io);
+}
+upstream: intel_psr.c dc3co_is_pipe_port_compatible()
+pub fn dc3co_is_pipe_port_compatible(
+    device: &PsrDevice,
+    pipe: u8,
+    port: u8,
+    alderlake_p: bool,
+) -> bool {
+    if alderlake_p || device.display_ver >= 14 {
+        pipe <= 1 && port <= 1
+    } else {
+        pipe == 0 && port == 0
+    }
+}
+upstream: intel_psr.c tgl_dc3co_exitline_compute_config()
+pub fn tgl_dc3co_exitline_compute_config(
+    device: &mut PsrDevice,
+    allowed: bool,
+    pipe: u8,
+    port: u8,
+    alderlake_p: bool,
+    wa: bool,
+    scanlines_200us: u32,
+) {
+    device.psr.config.exit_line = 0; /* Source currently returns unconditionally: BSpec 49196 activation order remains disabled. */

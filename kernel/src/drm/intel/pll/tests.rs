@@ -1,5 +1,134 @@
 use super::*;
 
+#[test]
+fn combo_pll_power_cfg_enable_and_disable_follow_i915_order() {
+    let regs = crate::drm::intel::regs::mock::MockRegisters::new();
+    regs.derive(regs::dpll::DPLL0_ENABLE, |written| {
+        let mut value = written;
+        if written & PLL_POWER_ENABLE != 0 {
+            value |= PLL_POWER_STATE;
+        } else {
+            value &= !PLL_POWER_STATE;
+        }
+        if written & PLL_ENABLE != 0 {
+            value |= PLL_LOCK;
+        } else {
+            value &= !PLL_LOCK;
+        }
+        value
+    });
+
+    let config = PllRegisters {
+        cfgcr0: 0x1234,
+        cfgcr1: 0x5678,
+    };
+    let enabled = enable_combo_pll(&regs, ComboPllId::Dpll0, config).unwrap();
+    assert!(!enabled.power_state_timed_out);
+    assert!(!enabled.lock_timed_out);
+    assert_eq!(
+        regs.writes(),
+        alloc::vec![
+            ("DPLL0_ENABLE", PLL_POWER_ENABLE),
+            ("DPLL0_CFGCR0", config.cfgcr0),
+            ("DPLL0_CFGCR1", config.cfgcr1),
+            (
+                "DPLL0_ENABLE",
+                PLL_POWER_ENABLE | PLL_POWER_STATE | PLL_ENABLE
+            ),
+        ]
+    );
+
+    let disabled = disable_combo_pll(&regs, ComboPllId::Dpll0).unwrap();
+    assert!(!disabled.power_state_timed_out);
+    assert!(!disabled.lock_timed_out);
+    assert_eq!(
+        &regs.writes()[4..],
+        &[
+            (
+                "DPLL0_ENABLE",
+                PLL_POWER_ENABLE | PLL_POWER_STATE | PLL_LOCK
+            ),
+            ("DPLL0_ENABLE", PLL_POWER_STATE),
+        ]
+    );
+}
+
+#[test]
+fn tc_dkl_pll_adapter_limits_enable_register_map_to_known_tc1_tc2_offsets() {
+    use intel_display::dkl_phy::TcPort;
+
+    assert_eq!(
+        tc_pll_enable_register(TcPort::Tc1, TcPllPlatform::TigerLake)
+            .unwrap()
+            .offset(),
+        0x46030
+    );
+    assert_eq!(
+        tc_pll_enable_register(TcPort::Tc2, TcPllPlatform::TigerLake)
+            .unwrap()
+            .offset(),
+        0x46034
+    );
+    assert_eq!(
+        tc_pll_enable_register(TcPort::Tc1, TcPllPlatform::AlderLakeN)
+            .unwrap()
+            .offset(),
+        0x46038
+    );
+    assert_eq!(
+        tc_pll_enable_register(TcPort::Tc2, TcPllPlatform::AlderLakeP)
+            .unwrap()
+            .offset(),
+        0x46040
+    );
+    assert!(tc_pll_enable_register(TcPort::Tc3, TcPllPlatform::AlderLakeN).is_err());
+    assert!(dkl_dynamic_register(0x16c000, true).is_none());
+    assert!(dkl_dynamic_register(0x168001, true).is_none());
+    assert!(dkl_dynamic_register(0x1010a0, true).is_some());
+}
+
+#[test]
+fn tbt_pll_uses_tbt_cfgcr_enable_and_power_registers() {
+    let regs = crate::drm::intel::regs::mock::MockRegisters::new();
+    regs.derive(regs::dpll::TBT_PLL_ENABLE, |written| {
+        let mut value = written;
+        if written & PLL_POWER_ENABLE != 0 {
+            value |= PLL_POWER_STATE;
+        } else {
+            value &= !PLL_POWER_STATE;
+        }
+        if written & PLL_ENABLE != 0 {
+            value |= PLL_LOCK;
+        } else {
+            value &= !PLL_LOCK;
+        }
+        value
+    });
+    let config = PllRegisters {
+        cfgcr0: 0x43_4000,
+        cfgcr1: 0x101,
+    };
+    assert_eq!(enable_tbt_pll(&regs, config).unwrap().lock_timed_out, false);
+    assert_eq!(disable_tbt_pll(&regs).unwrap().power_state_timed_out, false);
+    assert_eq!(
+        regs.writes(),
+        alloc::vec![
+            ("TBT_PLL_ENABLE", PLL_POWER_ENABLE),
+            ("TBT_PLL_CFGCR0", config.cfgcr0),
+            ("TBT_PLL_CFGCR1", config.cfgcr1),
+            (
+                "TBT_PLL_ENABLE",
+                PLL_POWER_ENABLE | PLL_POWER_STATE | PLL_ENABLE
+            ),
+            (
+                "TBT_PLL_ENABLE",
+                PLL_POWER_ENABLE | PLL_POWER_STATE | PLL_LOCK
+            ),
+            ("TBT_PLL_ENABLE", PLL_POWER_STATE),
+        ]
+    );
+}
+
 /// The reference frequency the ADL-N PLL strips use most often, and the one
 /// the worked example in the reference document uses.
 const REF_24: u32 = 24_000;

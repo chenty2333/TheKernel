@@ -577,9 +577,14 @@ copyright and `LICENSE-MIT`. Current source-to-Rust mapping:
 
 - `intel_display_device.c` → `src/device.rs`: ADL-P/N default display identity
   and revision/stepping lookup; PCI ID facts from `include/drm/intel/pciids.h`.
-- `intel_bios.c` / `intel_vbt_defs.h` → `src/bios.rs`: VBT/BDB extent validation,
-  section iteration (including MIPI v3 size), general-definition child parsing,
-  XELPD DVO mapping, ADL-P DDC mapping and HDMI/DP/USB-TC flags/caps.
+- `intel_bios.c` / `intel_vbt_defs.h` → `src/intel_bios.rs`: VBT/BDB extent and
+  raw-block lookup, general features/definitions, child records, XELPD DVO,
+  HDMI/DP caps, port/presence and AUX mappings, driver/power flags, DSC records,
+  eDP and PSR settings, LFP pointer validation/generation, panel timings and
+  backlight settings, BDB zero-extended block initialization, plus DSI MIPI
+  configuration and sequence validation. MIPI layouts use MIT
+  `intel_dsi_vbt_defs.h` (2025 Intel). More `intel_bios.c` functions remain to
+  translate; no GPL source was used.
 - `intel_opregion.c` → `src/opregion.rs`: header/ASLE layout facts, external
   RVDA address/size and mailbox VBT lookup only. No ASLE/ACPI/SWSCI writes.
 
@@ -978,6 +983,340 @@ shims. The scanner measures kernel/src as (86,42,20,130,8,0,0) at >=40 and
 (159,52,26,299,14,0,0) at >=25. The merged baseline uses these measured totals;
 individual-branch historical counts above are not additive. Other scopes
 retain the latest Intel inventory, with no scanner exemptions.
+
+`crates/ax/tk-intel-display/src/dmc.rs` translates the display-12/13 path and
+size selection from Linux v7.2.3 `drivers/gpu/drm/i915/display/intel_dmc.c`
+`dmc_firmware_default()` (MIT, Copyright © 2014 Intel). Firmware blobs are
+external Buildroot inputs; the package carries their separate license notice
+and does not commit binary firmware to this worktree.
+
+The same file now also translates the display-12/13 main/pipe package parser
+from `intel_dmc.c` `parse_dmc_fw()`, `parse_dmc_fw_header()`, and
+`fw_info_matches_stepping()` (MIT, Copyright © 2014 Intel). The kernel adapter
+selects by PCI revision after the rootfs-ready callback and retains the parsed
+program records. It also translates the event-handler fixups, disabled-event
+policy, payload/MMIO upload and readback verification; the kernel performs the
+upload only after the opt-in power-ready boundary. This supersedes the earlier
+statement above that no firmware parser or loader was added.
+
+`crates/ax/tk-intel-display/src/power_map.rs` translates the display-12/13
+power-well domain lists and descriptor groups from Linux v7.2.3
+`drivers/gpu/drm/i915/display/intel_display_power_map.c` (`tgl_power_wells`,
+`rkl_power_wells`, `adls_power_wells`, and `xelpd_power_wells`; MIT, Copyright
+© 2022 Intel). `power_domains.rs` consumes these descriptors for synchronous
+domain accounting, and `kernel/src/drm/intel/power.rs` requests Pipe-A/PW_A.
+
+`crates/ax/tk-intel-display/src/power_well.rs` translates the HSW-style
+requester, fuse, enable/disable, and state-query helpers from Linux v7.2.3
+`intel_display_power_well.c` (MIT, Copyright © 2022 Intel). The typed kernel
+register adapter consumes the translated handshake for PW_1/PW_A; IRQ-coupled
+wells and DDI/AUX operation groups remain.
+
+`crates/ax/tk-intel-display/src/dc_state.rs` translates the display-12/13
+`gen9_dc_mask()` and `gen9_write_dc_state()` logic plus the field read-modify-
+write part of `gen9_set_dc_state()` from `intel_display_power_well.c`, plus
+`get_allowed_dc_mask()`, `sanitize_target_dc_state()`, the target setter, and
+current-state readout from `intel_display_power.c` (MIT, Copyright © 2022 Intel).
+`kernel/src/drm/intel/power.rs` uses the write retry for initial DC disable;
+DMC-controlled DC5/6/9 transitions are not yet wired.
+
+The display-12/13 subset of `intel_bios.c` and its MIT-licensed
+`intel_vbt_defs.h` helpers in `crates/ax/tk-intel-display/src/intel_bios.rs`
+now includes BDB block initialization/fixups, panel index and PnP selection,
+SDVO/VBT helpers, platform DDC routing, MIPI sequence repair, and display-12/13
+panel parsing. Linux's panel object allocation/lifetime (`intel_bios_init_panel_early/late`
+and `intel_bios_fini_panel`) is represented by the owned `PanelVbtData` result
+and Rust drop rather than importing DRM panel lifecycle APIs.
+The VBT byte getter is exposed for an adapter; DRM debugfs registration and
+log-only DDI port printing remain framework diagnostics and are not copied.
+`kernel/src/drm/intel/fastboot.rs` consumes `intel_bios_init()` for the N305
+route and AFC override; general DDI cold-start admission still needs broader
+platform integration.
+
+`crates/ax/tk-intel-display/src/power_domains.rs` also translates
+`intel_display_power_domain_str()` from `intel_display_power.c` (MIT, Copyright
+© 2022 Intel), and `power_map.rs` now exposes the full source domain enum,
+including display-core, eDP/DSI transcoder, DDI lane A/F, port-other, GMBUS,
+and GT-IRQ identifiers.
+
+`dc_state.rs` includes a tracked `gen9_set_dc_state()` request path from
+`intel_display_power_well.c` (MIT, Copyright © 2022 Intel). Its observer maps
+the source's PSR and DMC DC6-count side effects; boot-time disable uses the
+helper during initialization with those side effects intentionally suppressed.
+
+`power_well.rs` translates `hsw_power_well_sync_hw()` from
+`intel_display_power_well.c` (MIT, Copyright © 2022 Intel), transferring a BIOS
+request to the driver before clearing BIOS ownership; requester reads follow
+BIOS, driver, KVMR, then debug order.
+
+The kernel HSW power-well adapter gates Wa_16013190616 on Alder Lake-P/N and
+PG1, rather than PG1 alone, matching `intel_display_power_well.c`.
+
+`kernel/src/drm/intel/power.rs` associates HSW, ICL AUX and ICL DDI wells with
+the source's separate BIOS/driver/debug request registers; only HSW has a KVMR
+request register (`intel_display_power_well.c`, MIT, Copyright © 2022 Intel).
+
+The HSW wait helper documents the upstream `fixed_enable_delay` branch as
+DG2-only (600–1200 us); DG2 is not in the display-12/13 platform maps, while
+its descriptor flag remains faithfully represented.
+
+The kernel maps `PowerWellInstance::irq_pipe_mask` into the HSW power-well
+sequence. While the parent IRQ is offline the upstream hooks are no-ops; while
+it is live the unsupported pipe transition fails closed instead of replacing
+the descriptor mask with zero.
+
+`power_domains.rs` adds the mapped `sync_domain()` traversal from
+`intel_display_power.c`; the kernel invokes it for Pipe-A before acquiring that
+domain, and `MappedPowerWellIo` maps the HSW group to
+`hsw_power_well_sync_hw()`. Other power domains and their well operations remain
+unintegrated.
+
+`dc_state.rs` translates `sanitize_disable_power_well_option()` from
+`intel_display_power.c` (MIT, Copyright © 2022 Intel); negative values select
+the source default of disabling power wells.
+
+The kernel mapped power-domain enabled query calls translated
+`hsw_power_well_enabled()` and therefore tests both the driver request and
+state bits, rather than state alone (`intel_display_power_well.c`).
+
+`power_domains.rs` translates the asynchronous domain put path from
+`intel_display_power.c`: current/next masks, non-final immediate puts, pending
+get reuse, max next delay, worker batch completion, and synchronous flush.
+The surrounding kernel workqueue/runtime-PM adapter is not yet connected.
+
+`power_well.rs` translates the TGL Type-C cold-block request and ICL TC cold
+exit PCODE retry/timing helpers from `intel_display_power_well.c` (MIT,
+Copyright © 2022 Intel); it returns source-shaped reports so the kernel can
+map firmware transport and diagnostics. The TGL map callback is not yet wired.
+
+The `intel_display_device.c` port in `tk-intel-display/src/device.rs` now also
+maps TGL, RKL, ADL-S, ADL-P and ADL-N IDs to display version, DMC platform,
+default ports and the source's pre-GMD_ID stepping tables. PCI ID values follow
+`include/drm/intel/pciids.h` (MIT, Copyright © 2013 Intel). This pure classifier
+does not expand the kernel's current N305-only native PCI binding/modeset path.
+
+The kernel `PowerState` adapter exposes map-backed `get_domain()`,
+`put_domain()`, `is_domain_enabled()` and `get_domain_if_enabled()` wrappers
+around the translated power-domain manager. Pipe-A boot sync/get and an AUX-A
+reference path exercise those APIs; connector/output call sites are not yet
+fully migrated.
+
+`tk-intel-display/src/cdclk.rs` adds source-shaped CDCLK transition predicates
+and crawl/squash midpoint calculation from Linux 7.2.3
+`drivers/gpu/drm/i915/display/intel_cdclk.c` (MIT, Copyright © 2006-2017
+Intel); see `docs/design/intel-cdclk.md` for the translated functions and
+remaining runtime adapter work.
+
+`kernel/src/drm/intel/clk.rs::transition()` adds the display-12/13 runtime
+CDCLK ratio/enable/lock and PLL crawl/request/ack MMIO steps from the same
+`intel_cdclk.c` source. It is not yet called by an atomic modeset path; PCode,
+audio/PSR and AUX/GMBUS lock ordering remain caller-side gaps.
+
+`tk-intel-display/src/dpll_mgr.rs` adds ICL/TGL combo PLL parameter search,
+fixed DP/TBT tables, CFGCR state encode/decode, and the 38.4-MHz fraction
+workaround from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_dpll_mgr.c`
+(MIT, Copyright © 2006-2016 Intel); register-field definitions follow
+`display/intel_display_regs.h` (MIT, Copyright © 2006-2018 Intel). See
+`docs/design/intel-pll.md` §7. PLL resource allocation and MMIO manager
+lifecycle remain separate gaps.
+
+The same DPLL-manager translation also covers ICL/TGL combo-PHY candidate
+masks, TC-port/MG-PLL identity mapping, active-port DPLL selection and a
+shareable hardware-state/pipe-mask allocator corresponding to
+`icl_get_combo_phy_dpll()`, `icl_tc_port_to_pll_id()`,
+`icl_update_active_dpll()` and `intel_find_dpll()` plus reference edges. It is
+not yet wired into the kernel's modeset atomic-state lifecycle.
+
+`tk-intel-display/src/dpll_mgr.rs::icl_dpll_descriptors()` translates the
+per-platform DPLL ID/type/alt-port inventories and source ordering for TGL,
+RKL, DG1, ADL-S, ADL-P/N and EHL/JSL from Linux 7.2.3
+`drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT, Copyright © 2006-2016
+Intel). IDs are kept platform-scoped because numeric ID 2 aliases different
+PLL types between source profiles.
+
+`tk-intel-display/src/dpll.rs` translates generic CRTC DPLL dispatch/state
+preparation and ±1 kHz clock comparison from Linux 7.2.3
+`drivers/gpu/drm/i915/display/intel_dpll.c` (MIT, Copyright © 2020 Intel).
+The dispatcher is exposed as a pure helper and not yet wired to the kernel
+atomic modeset path.
+The same file also translates `intel_dpll_init_clock_hook()` platform order and
+`hsw_crtc_compute_clock()` dispatch/dotclock update; display-12/13 profile tests
+select the HSW shared-DPLL family.
+
+`kernel/src/drm/intel/pll.rs::enable_combo_pll()` and
+`disable_combo_pll()` translate the combo DPLL0/1 power-state, CFGCR write,
+lock and power-off sequence from Linux 7.2.3
+`drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT, Copyright © 2006-2016
+Intel). The adapter retains i915's warning-only timeout outcome and is not yet
+called by atomic modeset.
+
+`kernel/src/drm/intel/pll.rs::enable_tbt_pll()` and `disable_tbt_pll()`
+translate `icl_tbt_pll_enable()`/`icl_tbt_pll_disable()` power-state, TBT
+CFGCR0/1 posting read, PLL-enable/lock and power-off flow from the same MIT
+`intel_dpll_mgr.c` source. `TBT_PLL_{ENABLE,CFGCR0,CFGCR1}` register entries
+follow `intel_display_regs.h` (MIT, Copyright © 2006-2018 Intel). The native
+modeset does not call these functions yet.
+
+`kernel/src/drm/intel/pll.rs::enable_tc_dkl_pll()` and
+`disable_tc_dkl_pll()` connect the DKL PHY writer to a checked dynamic-register
+backend and perform the TC PLL power/lock sequence. The selector is serialized
+and the adapter currently admits only known TGL/ADL-P/N TC1/TC2 enable offsets;
+the caller must hold display/PHY power references. The function order follows
+`mg_pll_enable()`/`mg_pll_disable()` and `icl_pll_power_enable()`/
+`icl_pll_disable()` in the same MIT source file; no native modeset call site is
+connected yet.
+
+`tk-intel-display/src/dpll_mgr.rs` extends the DKL MG PLL calculation to
+source-shaped DisplayPort 8.1-GHz DCO and HDMI `[7992,10000]`-MHz window
+selection, preserving `icl_mg_pll_find_divisors()` search priority and
+`icl_calc_mg_pll_state()` fixed-point state generation. Source is Linux 7.2.3
+`drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT, Copyright © 2006-2016
+Intel); targeted tests cover 162/540-MHz DP and 1080p60 HDMI.
+
+`tk-intel-display/src/ddi.rs` adds TGL/ADL DDI helpers for clock-select,
+buffer PHY link-rate/stagger fields, idle/active wait policy, and transcoder
+function-control generation from Linux 7.2.3
+`drivers/gpu/drm/i915/display/intel_ddi.c` (MIT, Copyright © 2012 Intel).
+See `docs/design/intel-ddi.md` for the implemented subset and the ports still
+refused.
+
+`kernel/src/drm/intel/ddi.rs` adapts the platform-generated combo DPCLKA RMW
+plan to typed MMIO with a serialized two-write enable and one-write disable.
+`kernel/src/drm/intel/output.rs::program()` now consumes it for the supported
+N305 A/B output path; the sequence follows `_icl_ddi_enable_clock()` and
+`_icl_ddi_disable_clock()` from the same MIT `intel_ddi.c` source.
+
+`crates/ax/tk-intel-display/src/ddi_buf_trans.rs` translates display-12/13 DDI buffer-translation table data and platform selection from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_ddi_buf_trans.c` (MIT, Copyright © 2020 Intel Corporation); `LICENSE-MIT`.
+
+`kernel/src/drm/intel/phy.rs::combo_phy_power_up_lane_mask` follows the DSI, lane-count and lane-reversal cases of Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_combo_phy.c::intel_combo_phy_power_up_lanes()` (MIT, Copyright © 2018 Intel); `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/tc.rs` additionally translates the TC mode-name/query, HPD-glitch routing, DP lane-count decoding, and mode/version dispatch helpers from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_tc.c` (MIT, Copyright © 2019 Intel); `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/hdmi.rs` now also translates `intel_write_infoframe()`'s byte-3 ECC-hole packing and `hsw_write_infoframe()`'s transcoder DIP write order from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_hdmi.c` (MIT, Copyright 2006 Dave Airlie and © 2006-2009 Intel); `LICENSE-MIT`.
+
+The same `hdmi.rs` translation now includes the HSW deep-color GCP phase predicate/state builder, GCP payload write and HSW AVI/SPD/vendor/DRM infoframe enable sequence from Linux 7.2.3 `intel_hdmi.c` (MIT, Copyright 2006 Dave Airlie and © 2006-2009 Intel); `LICENSE-MIT`.
+
+`kernel/src/drm/intel/combo_phy_full.rs` translates all 14 functions in Linux v7.2.3 `drivers/gpu/drm/i915/display/intel_combo_phy.c` (MIT, Copyright © 2018 Intel Corporation); `LICENSE-MIT`.
+
+The HSW HDMI module also translates Intel's SPD infoframe defaults and DRM metadata/version gates from `intel_hdmi.c::intel_hdmi_compute_spd_infoframe()` and `intel_hdmi_compute_drm_infoframe()` (MIT, © 2006-2009 Intel).
+
+`intel_hdmi_infoframe_enable()` in `hdmi.rs` maps all eight source packet-type values to software enable indices (MIT `intel_hdmi.c`, © 2006-2009 Intel).
+
+`crates/ax/tk-intel-display/src/tc_state_machine.rs` translates 95 of the 96 display-12/13-applicable functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_tc.c` (MIT, Copyright © 2019 Intel); `to_tc_port` is represented by the typed `TcPortState` input, and MTL/XELPDP display-14+ functions are out of scope. `LICENSE-MIT`.
+
+The same module translates display-12/13 TMDS source limits and clock formula plus source/sink BPC predicates from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
+
+The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_clock_valid()`, and `intel_hdmi_compute_bpc()` display-12/13 TMDS/BPC selection branches from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
+
+`hdmi.rs` additionally translates `intel_has_hdmi_sink()`, `intel_hdmi_has_audio()`, `intel_hdmi_limited_color_range()`, and the RGB/Y420 branch of `intel_hdmi_sink_format_valid()` (MIT `intel_hdmi.c`, © 2006-2009 Intel).
+
+`hdmi.rs` also translates `intel_hdmi_is_ycbcr420()`, `intel_hdmi_is_cloned()`, `intel_hdmi_compute_has_hdmi_sink()`, and the source scrambling-cap predicate from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
+
+`crates/ax/tk-intel-display/src/dp_aux.rs` translates all 35 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_dp_aux.c` (MIT, Copyright © 2020-2021 Intel Corporation); the kernel AUX MMIO/framework adapter remains unconnected. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_dp_link_training_full.rs` translates 66 of 78 definitions in Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_dp_link_training.c` (MIT, Copyright © 2008-2015 Intel Corporation); the twelve unported functions are DRM debugfs wrappers. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_gmbus_full.rs` translates 30 of 39 definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_gmbus.c` (MIT, Copyright © 2006 Dave Airlie and © 2006-2008, 2010 Intel); nine I2C framework wiring/registration methods are excluded. `LICENSE-MIT`.
+
+`kernel/src/drm/intel/regs/aux.rs` declares the display-12/13 DP AUX channel A/B control and data register offsets from `intel_dp_aux_regs.h` (MIT, Copyright © 2023 Intel Corporation). No channel-specific kernel transfer backend is enabled by the declarations.
+
+`crates/ax/tk-intel-display/src/intel_hotplug_full.rs` translates 37 of 44 functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_hotplug.c` (MIT, Copyright © 2015 Intel); seven debugfs storm-control wrappers are omitted. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_dp_full.rs` translates 284 of 287 functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_dp.c` (MIT, Copyright © 2008 Intel); omissions are two generic DRM property attachment wrappers and the display-14+-only MTL source-rate helper. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_hotplug_irq_full.rs` translates all 93 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_hotplug_irq.c` (MIT, Copyright © 2023 Intel Corporation). `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_ddi_full.rs` translates all 208 function definitions in Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_ddi.c` (MIT, Copyright © 2012 Intel Corporation); DRM object registration and cross-subsystem access are represented by `DdiIo` boundaries. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_hdmi_full.rs` translates 114 of 120 function definitions in Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_hdmi.c` (MIT, Copyright 2006 Dave Airlie and © 2006-2009 Intel); six generic DRM connector/property/modes wrappers are omitted. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/skl_scaler_full.rs` translates all 43 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/skl_scaler.c` (MIT, Copyright © 2020 Intel Corporation); DRM atomic state, CASF and DSB/MMIO are explicit hooks. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/skl_watermark_full.rs` translates all 140 function definitions in Linux 7.2.3 `drivers/gpu/drm/i915/display/skl_watermark.c` (MIT, Copyright © 2022 Intel Corporation); DRM atomic objects, PCODE, MMIO and debugfs are trait boundaries. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/skl_universal_plane_full.rs` translates all 112 function definitions in Linux 7.2.3 `drivers/gpu/drm/i915/display/skl_universal_plane.c` (MIT, Copyright © 2020 Intel Corporation); DRM/FB/atomic/IRQ/DSB/MMIO boundaries are traits. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_cursor_full.rs` translates all 39 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_cursor.c` (MIT, Copyright © 2020 Intel Corporation); DRM/FB/vblank/atomic/MMIO operations are trait boundaries. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_vblank_full.rs` translates all 30 ctags definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_vblank.c` (MIT, Copyright © 2022-2023 Intel Corporation); both I915/Xe vblank-section alternatives are represented. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_crtc_full.rs` translates all 39 ctags function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_crtc.c` (MIT, Copyright © 2020 Intel Corporation); DRM/atomic/vblank/QoS operations use explicit hooks. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_color_full.rs` translates all 223 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_color.c` (MIT, Copyright © 2016 Intel Corporation); DRM objects, register access and DSB execution remain explicit framework boundaries. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_fb_full.rs` translates all 89 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_fb.c` (MIT, Copyright © 2021 Intel Corporation); framebuffer/GEM allocation and lifecycle operations remain explicit hooks. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_atomic_full.rs` translates all 15 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_atomic.c` (MIT, Copyright © 2015 Intel Corporation); DRM object allocation, state ownership, HDCP and DP tunnel helpers remain explicit hooks. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_modeset_verify_full.rs` translates all 7 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_modeset_verify.c` (MIT, Copyright © 2022 Intel Corporation); DRM object traversal, state readout and diagnostics remain hooks. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_modeset_setup_full.rs` translates all 25 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_modeset_setup.c` (MIT, Copyright © 2022 Intel Corporation); DRM state/object enumeration and diagnostics remain hooks. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_display_modeset_full.rs` translates 223 of 273 ctags function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_display.c` (MIT, Copyright © 2006-2007 Intel Corporation); 50 target-generation-excluded or DRM/GEM/debug boundary functions are enumerated with reasons in `docs/design/intel-display-modeset-full.md`. `LICENSE-MIT`.
+
+`kernel/src/drm/color_mgmt_full.rs` translates all 26 ctags definitions from Linux 7.2.3 `drivers/gpu/drm/drm_color_mgmt.c` (MIT-style grant, Copyright (c) 2016 Intel Corporation); the full grant is retained in the Rust source and `kernel/LICENSES/LicenseRef-Intel-Color-Mgmt-MIT`.
+
+`kernel/src/drm/atomic_uapi_full.rs` translates all 30 ctags definitions from Linux 7.2.3 `drivers/gpu/drm/drm_atomic_uapi.c` (MIT; Copyright (C) 2014 Red Hat, 2014/2018 Intel, and (c) 2020 The Linux Foundation); the full grant is retained in the source and `kernel/LICENSES/LicenseRef-DRM-Atomic-UAPI-MIT`.
+
+`kernel/src/drm/plane_uapi_full.rs` translates all 38 ctags definitions from Linux 7.2.3 `drivers/gpu/drm/drm_plane.c` (MIT-style grant, Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Plane-MIT`.
+
+`kernel/src/drm/connector_uapi_full.rs` translates all 87 ctags definitions plus the unrecognized `drm_get_tv_mode_from_name()` from Linux 7.2.3 `drivers/gpu/drm/drm_connector.c` (MIT-style grant, Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Connector-MIT`.
+
+`kernel/src/drm/mode_config_full.rs` translates all 14 ctags function definitions from Linux 7.2.3 `drivers/gpu/drm/drm_mode_config.c` (MIT-style grant, Copyright (c) 2016 Intel Corporation); the full grant is shared with `kernel/LICENSES/LicenseRef-Intel-Drm-Connector-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_audio_dp_full.rs` translates 35/45 ctags functions from Linux 7.2.3 `intel_audio.c` (MIT, Copyright © 2014 Intel Corporation); ten HDMI-only or pre-Display-12 G4x/IBX functions are excluded. The source contains the full MIT grant and `LICENSES/Intel-i915-DP-Audio-MIT.txt` retains it.
+
+`crates/ax/tk-intel-display/src/intel_dp_mst_full.rs` translates all 68 ctags definitions from Linux 7.2.3 `intel_dp_mst.c` (MIT; Copyright © 2008 Intel and 2014 Red Hat); full grant retained in source and `LICENSES/Intel-i915-DP-MST-MIT.txt`.
+
+`crates/ax/tk-intel-display/src/intel_psr_full.rs` translates 155/155 ctags functions from Linux 7.2.3 `intel_psr.c` (MIT, Copyright © 2014 Intel Corporation); the full grant is retained in the Rust source and `LICENSES/Intel-i915-PSR-MIT.txt`.
+
+`crates/ax/tk-intel-display/src/intel_fbc_full.rs` translates 126/134 ctags functions from Linux 7.2.3 `intel_fbc.c` (MIT-style Intel grant; Copyright © 2014 Intel Corporation); eight display-35+ system-cache or DRM debugfs functions are excluded with reasons in `docs/design/intel-fbc-full.md`.
+
+`crates/ax/tk-intel-display/src/intel_pcode_full.rs` translates 14/14 ctags functions from Linux 7.2.3 `intel_pcode.c`, `intel_pcode.h`, and all 93 `intel_pcode_regs.h` definitions (MIT; Copyright © 2013-2021 Intel); the grant is retained in source and `LICENSES/Intel-i915-PCode-MIT.txt`.
+
+`crates/ax/tk-intel-display/src/intel_cdclk_full.rs` translates 152/152 ctags functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_cdclk.c` (MIT; Copyright © 2006-2017 Intel Corporation); the full grant is retained in source and `LICENSES/Intel-i915-CDCLK-MIT.txt`.
+
+`crates/ax/tk-intel-display/src/intel_dpll_mgr_full.rs` translates 83/175 ctags functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT; Copyright © 2006-2016 Intel Corporation); 92 functions for Gen7/8/9, BXT, IBX, display-14+ and Xe3 are outside the display-12/13 target and are listed in `docs/design/intel-dpll-manager-full.md`.
+
+`kernel/src/drm/intel/connect.rs` applies the extended DPCD receiver-capability selection behavior of Linux 7.2.3 `drivers/gpu/drm/display/drm_dp_helper.c` (`drm_dp_read_dpcd_caps()` / `drm_dp_read_extended_dpcd_caps()`, MIT; Copyright © 2009 Keith Packard); the grant is retained in `kernel/LICENSES/LicenseRef-DRM-DPCD-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_audio_legacy_remainder.rs` translates the remaining 10/45 ctags functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_audio.c` (MIT; Copyright © 2014 Intel Corporation), completing source coverage alongside `intel_audio_dp_full.rs`; the shared Intel grant remains in `LICENSES/Intel-i915-DP-Audio-MIT.txt`.
+
+`kernel/src/drm/crtc_uapi_full.rs` translates all 26 ctags functions from Linux 7.2.3 `drivers/gpu/drm/drm_crtc.c` (Intel permissive MIT-style grant; Copyright (c) 2006-2008 Intel Corporation, 2007 Dave Airlie, and 2008 Red Hat); the full grant is retained in the source and `kernel/LICENSES/LicenseRef-Intel-Drm-Crtc-MIT`.
+
+`kernel/src/drm/property_uapi_full.rs` translates all 26 ctags functions from Linux 7.2.3 `drivers/gpu/drm/drm_property.c` (Intel permissive MIT-style grant; Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Property-MIT`.
+
+`kernel/src/drm/framebuffer_uapi_full.rs` translates all 27 ctags functions from Linux 7.2.3 `drivers/gpu/drm/drm_framebuffer.c` (Intel permissive MIT-style grant; Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Framebuffer-MIT`.
+
+## 2026-10-09 excerpt-count reconciliation
+
+The whole-tree scanner was re-run against `/home/ava/Desktop/linux-7.2.3`
+using `scripts/ci/scan_linux_excerpts.py` semantics (whitespace-normalized
+line hashes, default ASCII-rule filter) at thresholds 40 and 25. The measured
+seven-field tuples now pinned in `tests/ci/test_linux_excerpt_baseline.py` are:
+
+| Scope | >=40 | >=25 |
+| --- | --- | --- |
+| `crates/linux` | `(110,49,20,25,0,18,21)` | `(211,59,22,41,3,20,21)` |
+| `kernel/src` | `(86,42,20,142,9,0,0)` | `(159,52,26,317,21,0,0)` |
+| `crates/ax` | `(0,0,0,279,127,0,0)` | `(18,15,4,379,223,0,0)` |
+
+The `crates/ax` increase from the prior baseline is attributable to the new
+`tk-intel-display` Linux 7.2.3 i915 translations: scanning that crate alone
+produced 184 outside-fence matches (39 code) at >=40 and 250 (105 code) at
+>=25. These exact-line matches occur in `tk-intel-display/src` translation
+files; the crate declares MIT, retains `LICENSE-MIT`, and its `NOTICE` maps
+the source modules to MIT i915 display files. This is not the earlier small
+oracle-shim delta; the prior totals in this document are historical.
+
+The `kernel/src` increase is a separate whole-scope measurement, not an i915
+attribution: current matches include DRM-core UAPI translations and Linux
+comments/code outside `drm/intel` (for example syscall, BPF and netlink
+paths). The scan establishes line identity against Linux 7.2.3, not a license
+or source-file classification. Do not describe this delta as MIT i915. The
+kernel-source provenance entries and license texts remain the authority for
+those files; this count reconciliation changes only the measured baseline.
+
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxvar.h` (ISC): AX211 So-F/So GF runtime configuration predicates and associated firmware/PNVM configuration translated in `tk-axdriver-iwx/src/config.rs`; ISC text in that crate's `LICENSES/ISC.txt`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): TLV firmware-header, section and supported-capability parsing adapted in `tk-axdriver-iwx/src/firmware.rs`; ISC text in that crate's `LICENSES/ISC.txt`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): PNVM SKU, hardware-type and runtime-section selection from `iwx_pnvm_parse()` / `iwx_pnvm_handle_section()` adapted in `tk-axdriver-iwx/src/firmware.rs`; ISC text in that crate's `LICENSES/ISC.txt`.
@@ -1366,3 +1705,12 @@ lines and eight code matches inventoried for this subtree.
 
 | Linux `drivers/i2c/busses/` DesignWare controller register/bit definitions (the original comments do not pin an exact source file or revision) | `crates/ax/tk-i2c/src/reg.rs` | The `snarfed from linux` comments identify Linux as the source for individual bit/register values; the file contains no Linux driver functions, control-flow, or copied structure layout. Constants are independently named and used by TheKernel's I2C implementation. |
 | Linux `drivers/hid/hid-input.c` (GPL-2.0-or-later) usage-to-input behavior | `crates/ax/tk-axdriver/src/usb/hid_usage.rs` | Linux is a behavior reference for selected HID usage-to-evdev mappings only. No Linux function, data structure, or table layout is copied; TheKernel's match-based mapping implementation is original and the HID usage identifiers are protocol facts. |
+
+## 2026-10-09 G1/main merged excerpt baseline
+
+Measured after merging `cb70f258` with the G1 display changes, using the same
+scanner and Linux 7.2.3 tree. `crates/linux` and `kernel/src` retain the tuples
+in the earlier reconciliation. `crates/ax` is now `(0,0,0,284,130,0,0)` at >=40
+and `(18,15,4,407,249,0,0)` at >=25. The combined inventory includes the
+BSD/ISC-source register/control matches documented by main as well as the MIT
+i915 matches; hash identity alone does not classify their license or source.

@@ -85,19 +85,12 @@
 //!
 //! # What this module cannot source, and what it does about it
 //!
-//! **The HDMI buffer-translation values are a real `[GAP]`.**  §8.5 selects
-//! `icl_combo_phy_trans_hdmi` for an HDMI port and then says in as many words:
-//! "`[GAP]` I did not extract its values"; §13.1 item 12 repeats it.  Those
-//! numbers are the voltage swing and pre-emphasis the PHY drives, and they are
-//! board-tuned -- §8.5's own note records that the DG1 PRM's table and i915's
-//! ADL-P table disagree for the same nominal levels.  There is no honest way to
-//! invent them, so [`OutputRequest::swing`] is a caller-supplied
-//! [`SwingProgram`] and a request without one fails at
-//! [`OutputProgram::plan`] with [`OutputError::MissingBufferTranslation`],
-//! naming the table and the section.  §13.4 says where the numbers come from:
-//! dump the registers of a *working* configuration and reuse them.  The
-//! `source` field of [`SwingProgram`] is there so the log says which dump they
-//! came from.
+//! The port's buffer-translation table is selected from the platform's i915
+//! table set (`intel_ddi_buf_trans_get`); an optional firmware dump can override
+//! the selected values. The ADL-N HDMI default is entry 6 of
+//! `icl_combo_phy_trans_hdmi`. This is a source-faithful platform table, not a
+//! claim that every connector's board-level signal integrity has been measured;
+//! hardware validation remains necessary.
 //!
 //! **`DDI_BUF_CTL.PHY_LINK_RATE` has no HDMI encoding in the reference.**
 //! §8.6 step 13 puts the field in the enable write and then gives a table of
@@ -201,31 +194,18 @@ const PLL_LOCK_TIMEOUT_US: u32 = 600;
 /// `display/intel_ddi.c:987-1007`, is where the distinction is.
 const TRANS_CLK_SEL_PORT_SHIFT: u32 = 28;
 
-/// `TRANS_DDI_FUNC_CTL`'s `SELECT_PORT` field shift,
-/// `TGL_TRANS_DDI_SELECT_PORT(port) = (port + 1) << 27`
-/// (`[I915]` `i915_reg.h:3757`).  Reference §8.4 and §11 phase 5.5.
-///
-/// The argument here is the **port** -- the DDI -- on this display version and
-/// on every other: i915 composes the value from `encoder->port` with no PHY
-/// conversion (`[I915]` `display/intel_ddi.c:481,488-490`).  So the same DDI
-/// number is right for this field and wrong for [`TRANS_CLK_SEL_PORT_SHIFT`]'s,
-/// and the two §11 steps print "port" as if they were one rule.
-const TRANS_DDI_PORT_SHIFT: u32 = 27;
-
-/// `TRANS_DDI_FUNC_CTL`'s `TRANS_DDI_FUNC_ENABLE` bit.  Reference §8.4.
-const TRANS_DDI_FUNC_ENABLE: u32 = 1 << 31;
-
 /// `TRANS_DDI_FUNC_CTL`'s mode-select field, `[26:24]`.  Reference §8.4.
+#[cfg(test)]
 const TRANS_DDI_MODE_SELECT_SHIFT: u32 = 24;
 
 /// `TRANS_DDI_PVSYNC`, bit 17.  Reference §8.4's corrected table.
+#[cfg(test)]
 const TRANS_DDI_PVSYNC: u32 = 1 << 17;
 
 /// `TRANS_DDI_PHSYNC`, bit 16.  Reference §8.4's corrected table.
+#[cfg(test)]
 const TRANS_DDI_PHSYNC: u32 = 1 << 16;
 
-/// `TRANS_DDI_PORT_WIDTH_MASK` starts here: `(lanes - 1) << 1`.  §8.4.
-const TRANS_DDI_PORT_WIDTH_SHIFT: u32 = 1;
 
 /// `TRANSCONF`'s `ENABLE` bit.
 ///
@@ -263,6 +243,9 @@ const TRANSCONF_ENABLE: u32 = 1 << 31;
 /// `TRANSCONF`; poll for off state") is the reading that agrees with i915, and
 /// is where the document gives the bit its status meaning.
 const TRANSCONF_STATE_ENABLE_STATUS: u32 = 1 << 30;
+
+/// Maximum wait for the transcoder state bit to clear on CRTC disable.
+const TRANSCONF_DISABLE_TIMEOUT_US: u32 = 3_000;
 
 /// `DDI_BUF_CTL`'s `ENABLE` bit.  Reference §8.4.
 const DDI_BUF_CTL_ENABLE: u32 = 1 << 31;
@@ -320,11 +303,11 @@ const DDI_BUF_CTL_OWNED: u32 = DDI_BUF_CTL_ENABLE
 
 /// How long to wait for `IS_IDLE` to clear, in microseconds.
 ///
-/// §8.6 step 14: "[PRM] timeout 500us for HDMI".  §11 phase 5.7 calls this poll
-/// the single best "is my DDI alive" bit on the chip and records a real `46d0`
-/// field report of it timing out under coreboot + EDK2; see
-/// [`OutputError::DdiNeverIdle`].
-const DDI_IDLE_TIMEOUT_US: u32 = 500;
+/// i915's `intel_wait_ddi_buf_active()` polls for 10 ms on display version 10+
+/// (as used by ADL-N); preserve that source budget rather than the separate
+/// PRM's 500-us HDMI note. §11 phase 5.7 calls this the single best "is my DDI
+/// alive" bit and records a real `46d0` timeout under coreboot + EDK2.
+const DDI_IDLE_TIMEOUT_US: u32 = 10_000;
 
 /// `PORT_CL_DW5`'s `SUS_CLOCK_CONFIG[1:0]`, written `0b11` by §8.5 step 3.
 ///
@@ -389,33 +372,20 @@ impl PortType {
         }
     }
 
-    /// The `TRANS_DDI_FUNC_CTL` mode-select value, `[26:24]`.  §8.4.
-    const fn mode_select(self) -> u32 {
-        match self {
-            Self::Hdmi => 0,
-            Self::Dvi => 1,
-        }
-    }
-
     /// The i915 buffer-translation table this port type selects, when the
     /// reference names one.
     ///
-    /// §8.5's "Which table" table: HDMI is `icl_combo_phy_trans_hdmi`.  DVI has
-    /// no row, so this returns `None` -- which is a fact about the reference,
-    /// not about the hardware, and is why the caller supplies the values.
+    /// DVI and HDMI TMDS use the same combo-PHY translation table in i915.
     const fn buffer_translation_table(self) -> Option<&'static str> {
-        match self {
-            Self::Hdmi => Some("icl_combo_phy_trans_hdmi"),
-            Self::Dvi => None,
-        }
+        Some("icl_combo_phy_trans_hdmi")
     }
 }
 
 /// How many lanes the port drives.
 ///
 /// §8.6 step 7 gives the lane power-up values for four, two and one lane, and
-/// §8.4 gives `PORT_WIDTH = (lanes - 1) << 1` in both `TRANS_DDI_FUNC_CTL` and
-/// `DDI_BUF_CTL`.  Four lanes is the HDMI case; the narrower widths exist
+/// §8.4 gives `PORT_WIDTH = (lanes - 1) << 1` in `DDI_BUF_CTL` (and in
+/// `TRANS_DDI_FUNC_CTL` only on display version 14+). Four lanes is the HDMI case; the narrower widths exist
 /// because the same sequence is what a two-lane or one-lane port would use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PortWidth {
@@ -439,7 +409,7 @@ impl PortWidth {
 
     /// The `PORT_WIDTH` field value, `(lanes - 1) << 1`.
     const fn width_field(self) -> u32 {
-        (self.lanes() - 1) << TRANS_DDI_PORT_WIDTH_SHIFT
+        (self.lanes() - 1) << 1
     }
 
     /// The `PWR_DOWN_LN_MASK` *field* value for this width.
@@ -447,11 +417,7 @@ impl PortWidth {
     /// §8.6 step 7: four lanes power all four (`0x0`), two lanes power down
     /// lanes 3 and 2 (`0xC`), one lane powers down 3, 2 and 1 (`0xE`).
     const fn power_down_lanes_field(self) -> u32 {
-        match self {
-            Self::Four => 0x0,
-            Self::Two => 0xC,
-            Self::One => 0xE,
-        }
+        super::phy::combo_phy_power_up_lane_mask(self.lanes() as u8, false, false) as u32
     }
 
     /// The `A_4_LANES` bit for `DDI_BUF_CTL`, set only for four lanes.  §8.6
@@ -542,12 +508,15 @@ pub(crate) struct SwingProgram {
     /// (`[I915]` `display/intel_ddi.c:1148-1157`); the group instance is a
     /// different address and this sequence does not write it.
     pub(crate) dw2: [u32; 4],
+    pub(crate) dw2_mask: u32,
     /// `PORT_TX_DW4`, one value per lane, written in lane order 0 to 3.  §8.5
     /// step 2: the loadgen select differs per lane, so the group register must
     /// not be used.
     pub(crate) dw4: [u32; 4],
+    pub(crate) dw4_mask: u32,
     /// `PORT_TX_DW5` with TX training disabled, which is step 4's state.
     pub(crate) dw5_training_disabled: u32,
+    pub(crate) dw5_mask: u32,
     /// `PORT_TX_DW5` with the scaling mode set and TX training enabled, which
     /// is step 6's state and the write that triggers the update.
     pub(crate) dw5_training_enabled: u32,
@@ -555,10 +524,83 @@ pub(crate) struct SwingProgram {
     /// writes the lane instances here too
     /// (`[I915]` `display/intel_ddi.c:1171-1178`).
     pub(crate) dw7: [u32; 4],
-    /// Where these numbers came from.  Free text, printed in the log; §8.5's
-    /// values are a `[GAP]`, so a reader has to be able to see what was used
-    /// instead.
+    pub(crate) dw7_mask: u32,
+    /// Where these numbers came from. Printed in the plan log.
     pub(crate) source: &'static str,
+}
+
+/// Build the ADL-N combo-PHY default from i915's platform-selected table.
+/// The values are written through masks, preserving the unrelated bits in each
+/// PHY dword exactly as the i915 RMW sequence does.
+fn combo_default_swing(
+    port_type: PortType,
+    port_clock_khz: u32,
+) -> Result<SwingProgram, OutputError> {
+    use intel_display::ddi_buf_trans::{
+        BufferOutput, BufferPhy, DdiBufferTransEntry, DdiBufferTransRequest,
+        intel_ddi_buf_trans_get,
+    };
+    let output = match port_type {
+        PortType::Hdmi => BufferOutput::Hdmi,
+        PortType::Dvi => BufferOutput::Dvi,
+    };
+    let table = intel_ddi_buf_trans_get(DdiBufferTransRequest {
+        platform: intel_display::device::Platform::AlderLakeN,
+        phy: BufferPhy::Combo,
+        output,
+        port_clock_khz,
+        use_edp_low_vswing: false,
+        use_edp_hobl: false,
+        tigerlake_uy: false,
+    })
+    .map_err(|_| OutputError::MissingBufferTranslation {
+        port_type,
+        table: port_type.buffer_translation_table(),
+    })?;
+    let level = table
+        .hdmi_default_entry
+        .ok_or(OutputError::MissingBufferTranslation {
+            port_type,
+            table: Some(table.name),
+        })?;
+    let Some(DdiBufferTransEntry::Combo {
+        dw2_swing_sel,
+        dw7_n_scalar,
+        dw4_cursor_coeff,
+        dw4_post_cursor_2,
+        dw4_post_cursor_1,
+    }) = table.entries.get(usize::from(level)).copied()
+    else {
+        return Err(OutputError::MissingBufferTranslation {
+            port_type,
+            table: Some(table.name),
+        });
+    };
+    let dw2_mask = (1 << 15) | (0b111 << 11) | 0xff;
+    let dw4_mask = (1 << 31) | (0b11_1111 << 12) | (0b11_1111 << 6) | 0b11_1111;
+    let dw5_mask =
+        (1 << 31) | (1 << 30) | (1 << 29) | (1 << 26) | (1 << 25) | (0b111 << 18) | (0b111 << 3);
+    let dw2_value =
+        (u32::from(dw2_swing_sel >> 3) << 15) | (u32::from(dw2_swing_sel & 7) << 11) | 0x98;
+    let dw4_value = (u32::from(dw4_post_cursor_1) << 12)
+        | (u32::from(dw4_post_cursor_2) << 6)
+        | u32::from(dw4_cursor_coeff);
+    let dw7_value = u32::from(dw7_n_scalar) << 24;
+    let dw7_mask = 0x7f00_0000;
+    let dw5_value = (2 << 18) | (6 << 3) | (1 << 29);
+    Ok(SwingProgram {
+        level,
+        dw2: [dw2_value; 4],
+        dw2_mask,
+        dw4: [dw4_value; 4],
+        dw4_mask,
+        dw5_training_disabled: dw5_value,
+        dw5_mask,
+        dw5_training_enabled: dw5_value | (1 << 31),
+        dw7: [dw7_value; 4],
+        dw7_mask,
+        source: table.name,
+    })
 }
 
 /// Everything phase 5 needs told.
@@ -581,20 +623,16 @@ pub(crate) struct OutputRequest {
     /// Which `CFGCR1` field encoding to write.  No default: see the module
     /// documentation.
     pub(crate) encoding: PllFieldEncoding,
-    /// The voltage-swing values, or `None` to be refused with the `[GAP]`
-    /// named.  See [`SwingProgram`].
+    /// Optional explicit voltage-swing override. When absent, the platform
+    /// DDI buffer-translation table supplies the default level.
     pub(crate) swing: Option<SwingProgram>,
     /// `DDI_BUF_CTL.PHY_LINK_RATE`.  See [`LinkRate`].
     pub(crate) link_rate: LinkRate,
 }
 
 impl OutputRequest {
-    /// The first-light-up request: HDMI, four lanes, no swing values yet.
-    ///
-    /// `swing` starts as `None`, so this request does **not** program until
-    /// [`Self::with_swing`] supplies values: that is the §8.5 `[GAP]` doing its
-    /// job rather than a missing default.  `encoding` has no default either,
-    /// and [`PllFieldEncoding::Named`] is the one §6.3's worked example uses.
+    /// The first-light-up request: HDMI, four lanes. The platform table
+    /// supplies its default buffer-translation level unless overridden.
     pub(crate) const fn hdmi(ddi: Ddi, mode: Mode, encoding: PllFieldEncoding) -> Self {
         Self {
             pll_id: ddi.index() as u8,
@@ -650,6 +688,8 @@ struct PortRegisters {
     /// must not be used for this register.  The sequence reads these through
     /// [`TxLaneRegisters`], beside the other two per-lane dwords.
     tx_dw4: [Register; 4],
+    /// `PORT_TX_DW5` lane 0, the source read for both group writes.
+    tx_dw5_lane0: Register,
     /// `PORT_TX_DW5` (group): the training-enable and scaling-mode register,
     /// and the instance both batch writes go to
     /// (`[I915]` `display/intel_ddi.c:1146`, `:1221`, `:1229`).
@@ -686,6 +726,7 @@ const fn port_registers(phy: ComboPhy) -> PortRegisters {
                 port::PORT_TX_DW4_LN2_A,
                 port::PORT_TX_DW4_LN3_A,
             ],
+            tx_dw5_lane0: port::PORT_TX_DW5_LN0_A,
             tx_dw5: port::PORT_TX_DW5_GRP_A,
             tx_dw7: port::PORT_TX_DW7_GRP_A,
             ddi_buf_ctl: ddi::DDI_BUF_CTL_A,
@@ -703,6 +744,7 @@ const fn port_registers(phy: ComboPhy) -> PortRegisters {
                 port::PORT_TX_DW4_LN2_B,
                 port::PORT_TX_DW4_LN3_B,
             ],
+            tx_dw5_lane0: port::PORT_TX_DW5_LN0_B,
             tx_dw5: port::PORT_TX_DW5_GRP_B,
             tx_dw7: port::PORT_TX_DW7_GRP_B,
             ddi_buf_ctl: ddi::DDI_BUF_CTL_B,
@@ -806,15 +848,6 @@ const fn ddi_io_well(phy: ComboPhy) -> Well {
     }
 }
 
-/// The `DDI_CLK_SEL` field mask for a PHY in `ICL_DPCLKA_CFGCR0`.
-///
-/// The field is two bits wide at `phy * 2` (§6.3 routing step 1); it is a mask
-/// rather than a value because the write is a read-modify-write and the other
-/// PHY's field is next to it.
-const fn ddi_clock_select_mask(phy: ComboPhy) -> u32 {
-    0b11 << phy.ddi_clock_select_shift()
-}
-
 /// Which combo PHY a DDI is on, or a refusal.
 ///
 /// Split out because both [`OutputProgram::plan`] and [`program`] check it: the
@@ -839,8 +872,8 @@ fn combo_phy_of(ddi: Ddi) -> Result<ComboPhy, OutputError> {
 /// platform the two happen to be equal for ports A and B -- `intel_port_to_phy`
 /// is `PHY_A + port - PORT_A` below `PORT_TC1` (`display/intel_display.c:1950-1965`)
 /// -- and a port whose PHY is not its own letter gets a different number here,
-/// not a different register.  `TRANS_DDI_FUNC_CTL`'s field is the other way
-/// round; see [`TRANS_DDI_PORT_SHIFT`].
+/// not a different register. The translated DDI helper separately builds the
+/// `TRANS_DDI_FUNC_CTL` port field from the encoder's DDI identity.
 const fn phy_index(phy: ComboPhy) -> u32 {
     match phy {
         ComboPhy::A => 0,
@@ -883,14 +916,12 @@ pub(crate) struct OutputProgram {
     pub(crate) pll_registers: PllRegisters,
     /// The DDI-IO power well §8.6 step 5 enables.
     pub(crate) ddi_io_well: Well,
-    /// The voltage-swing values (never `None`: a plan without them is refused).
+    /// The selected voltage-swing values and per-field write masks.
     pub(crate) swing: SwingProgram,
     /// The `PHY_LINK_RATE` field and its provenance.
     pub(crate) link_rate: LinkRate,
-    /// The `DDI_CLK_SEL` field value for `ICL_DPCLKA_CFGCR0`.
-    pub(crate) dpclka_select: u32,
-    /// The bit `ICL_DPCLKA_CFGCR0`'s second write clears.
-    pub(crate) dpclka_clock_off: u32,
+    /// The platform-mapped DPCLKA field and the separate clock-off write.
+    pub(crate) ddi_clock_plan: intel_display::ddi::DdiClockPlan,
     /// `TRANS_CLK_SEL(A)`.
     pub(crate) trans_clk_sel: u32,
     /// `TRANS_DDI_FUNC_CTL(A)`.
@@ -902,6 +933,203 @@ pub(crate) struct OutputProgram {
     /// name -- the board's `PORT_REVERSAL` among them; see
     /// [`DDI_BUF_CTL_OWNED`].
     pub(crate) ddi_buf_ctl: u32,
+}
+
+/// No-register backend for the translated source register-value builder. The
+/// supported HDMI/DVI path consumes only the supplied encoder/CRTC state.
+struct DdiPolicyIo;
+
+impl intel_display::intel_ddi_full::DdiIo for DdiPolicyIo {
+    fn read(&mut self, _reg: u32) -> u32 { 0 }
+    fn write(&mut self, _reg: u32, _value: u32) {}
+    fn combo_phy_read(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister) -> u32 { 0 }
+    fn combo_phy_write(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister, _value: u32) {}
+    fn combo_phy_rmw(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister, _clear: u32, _set: u32) {}
+    fn mg_phy_rmw(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::MgPhyRegister, _clear: u32, _set: u32) {}
+    fn dkl_phy_read(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister) -> u32 { 0 }
+    fn dkl_phy_write(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister, _value: u32) {}
+    fn dkl_phy_rmw(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister, _clear: u32, _set: u32) {}
+    fn mg_dp_mode_read(&mut self, _port: intel_display::intel_ddi_full::Port, _lane: u8) -> u32 { 0 }
+    fn mg_dp_mode_write(&mut self, _port: intel_display::intel_ddi_full::Port, _lane: u8, _value: u32) {}
+}
+
+fn source_ddi_encoder(
+    ddi: Ddi,
+    port_type: PortType,
+) -> intel_display::intel_ddi_full::DdiEncoder {
+    use intel_display::intel_ddi_full as i915;
+
+    let port = match ddi {
+        Ddi::A => i915::Port::A,
+        Ddi::B => i915::Port::B,
+        Ddi::C => i915::Port::C,
+        Ddi::D => i915::Port::D,
+    };
+    let output = match port_type {
+        PortType::Hdmi => i915::OutputType::Hdmi,
+        PortType::Dvi => i915::OutputType::Dvi,
+    };
+    i915::DdiEncoder {
+        port,
+        output,
+        display: i915::Platform { display_ver: 13, alderlake_p: true, ..i915::Platform::default() },
+        ..i915::DdiEncoder::default()
+    }
+}
+
+fn source_ddi_crtc_state(
+    port_type: PortType,
+    width: PortWidth,
+    clock_khz: u32,
+    mode_flags: u32,
+) -> intel_display::intel_ddi_full::CrtcState {
+    use intel_display::intel_ddi_full as i915;
+
+    let output = match port_type {
+        PortType::Hdmi => i915::OutputType::Hdmi,
+        PortType::Dvi => i915::OutputType::Dvi,
+    };
+    i915::CrtcState {
+        pipe: i915::Pipe::A,
+        cpu_transcoder: i915::Transcoder::A,
+        master_transcoder: i915::Transcoder::Invalid,
+        mst_master_transcoder: i915::Transcoder::Invalid,
+        output,
+        port_clock: clock_khz,
+        lane_count: width.lanes() as u8,
+        pipe_bpp: 24,
+        mode_flags,
+        has_hdmi_sink: port_type == PortType::Hdmi,
+        ..i915::CrtcState::default()
+    }
+}
+
+struct DdiTranscoderEnableIo<'a, R> {
+    registers: &'a R,
+    func_ctl: Register,
+    func_ctl2: Register,
+    write_failed: Option<Register>,
+}
+
+impl<'a, R: Registers> DdiTranscoderEnableIo<'a, R> {
+    fn new(registers: &'a R, func_ctl: Register, func_ctl2: Register) -> Self {
+        Self { registers, func_ctl, func_ctl2, write_failed: None }
+    }
+}
+
+impl<R: Registers> intel_display::intel_ddi_full::DdiIo for DdiTranscoderEnableIo<'_, R> {
+    fn read(&mut self, _reg: u32) -> u32 { 0 }
+    fn write(&mut self, reg: u32, value: u32) {
+        let typed = if reg == self.func_ctl.offset() {
+            self.func_ctl
+        } else if reg == self.func_ctl2.offset() {
+            self.func_ctl2
+        } else {
+            self.write_failed = Some(self.func_ctl);
+            return;
+        };
+        if !self.registers.write(typed, value) {
+            self.write_failed = Some(typed);
+        }
+    }
+    fn combo_phy_read(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister) -> u32 { 0 }
+    fn combo_phy_write(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister, _value: u32) {}
+    fn combo_phy_rmw(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister, _clear: u32, _set: u32) {}
+    fn mg_phy_rmw(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::MgPhyRegister, _clear: u32, _set: u32) {}
+    fn dkl_phy_read(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister) -> u32 { 0 }
+    fn dkl_phy_write(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister, _value: u32) {}
+    fn dkl_phy_rmw(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister, _clear: u32, _set: u32) {}
+    fn mg_dp_mode_read(&mut self, _port: intel_display::intel_ddi_full::Port, _lane: u8) -> u32 { 0 }
+    fn mg_dp_mode_write(&mut self, _port: intel_display::intel_ddi_full::Port, _lane: u8, _value: u32) {}
+}
+
+fn source_trans_ddi_func_ctl(request: &OutputRequest) -> u32 {
+    let encoder = source_ddi_encoder(request.ddi, request.port_type);
+    let state = source_ddi_crtc_state(
+        request.port_type,
+        request.width,
+        request.mode.clock_khz,
+        u32::from(request.mode.hsync_positive) | (u32::from(request.mode.vsync_positive) << 2),
+    );
+    intel_display::intel_ddi_full::intel_ddi_transcoder_func_reg_val_get(
+        &mut DdiPolicyIo,
+        &encoder,
+        &state,
+    )
+}
+
+/// Kernel adapter for the translated source DDI-buffer enable handshake. It
+/// admits exactly the selected combo-PHY buffer register and implements the
+/// source's bounded `IS_IDLE` poll without exposing any other MMIO address.
+struct DdiBufferEnableIo<'a, R> {
+    registers: &'a R,
+    ddi_buf_ctl: Register,
+    read_failed: bool,
+    write_failed: bool,
+    timed_out: bool,
+}
+
+impl<'a, R: Registers> DdiBufferEnableIo<'a, R> {
+    fn new(registers: &'a R, ddi_buf_ctl: Register) -> Self {
+        Self { registers, ddi_buf_ctl, read_failed: false, write_failed: false, timed_out: false }
+    }
+}
+
+impl<R: Registers> intel_display::intel_ddi_full::DdiIo for DdiBufferEnableIo<'_, R>
+{
+    fn read(&mut self, reg: u32) -> u32 {
+        if reg != self.ddi_buf_ctl.offset() {
+            self.read_failed = true;
+            return u32::MAX;
+        }
+        match self.registers.read(self.ddi_buf_ctl) {
+            Some(value) => value,
+            None => {
+                self.read_failed = true;
+                u32::MAX
+            }
+        }
+    }
+
+    fn write(&mut self, reg: u32, value: u32) {
+        if reg != self.ddi_buf_ctl.offset() || !self.registers.write(self.ddi_buf_ctl, value) {
+            self.write_failed = true;
+        }
+    }
+
+    fn combo_phy_read(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister) -> u32 { 0 }
+    fn combo_phy_write(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister, _value: u32) {}
+    fn combo_phy_rmw(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister, _clear: u32, _set: u32) {}
+    fn mg_phy_rmw(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::MgPhyRegister, _clear: u32, _set: u32) {}
+    fn dkl_phy_read(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister) -> u32 { 0 }
+    fn dkl_phy_write(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister, _value: u32) {}
+    fn dkl_phy_rmw(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister, _clear: u32, _set: u32) {}
+    fn mg_dp_mode_read(&mut self, _port: intel_display::intel_ddi_full::Port, _lane: u8) -> u32 { 0 }
+    fn mg_dp_mode_write(&mut self, _port: intel_display::intel_ddi_full::Port, _lane: u8, _value: u32) {}
+
+    fn wait_clear(&mut self, reg: u32, mask: u32, timeout_ms: u32) -> bool {
+        if reg != self.ddi_buf_ctl.offset() {
+            self.read_failed = true;
+            return true;
+        }
+        match super::regs::poll(
+            self.registers,
+            self.ddi_buf_ctl,
+            mask,
+            0,
+            timeout_ms.saturating_mul(1000),
+        ) {
+            Some(true) => false,
+            Some(false) => {
+                self.timed_out = true;
+                true
+            }
+            None => {
+                self.read_failed = true;
+                true
+            }
+        }
+    }
 }
 
 impl OutputProgram {
@@ -946,14 +1174,12 @@ impl OutputProgram {
             });
         }
 
-        // The one `[GAP]` this step cannot work around: §8.5's HDMI
-        // translation values were never extracted, so there is nothing to
-        // write.  A caller that has them (from a dump, §13.4) supplies them.
-        let Some(swing) = request.swing else {
-            return Err(OutputError::MissingBufferTranslation {
-                port_type: request.port_type,
-                table: request.port_type.buffer_translation_table(),
-            });
+        // The table selector follows intel_ddi_buf_trans_get() for the
+        // supported ADL-N combo-PHY HDMI/DVI route. Explicit firmware dumps
+        // remain an override for board-specific validation/replay.
+        let swing = match request.swing {
+            Some(swing) => swing,
+            None => combo_default_swing(request.port_type, request.mode.clock_khz)?,
         };
         if u32::from(swing.level) > BUF_TRANS_SELECT_MAX {
             return Err(OutputError::SwingLevelOutOfRange { level: swing.level });
@@ -970,37 +1196,51 @@ impl OutputProgram {
         // §6.3 works through; that is what `ddi_pll_dividers` is for.
         let dividers = pll::ddi_pll_dividers(request.mode.clock_khz, platform_ref_khz, phy)?;
         let fraction_workaround = DcoFractionWorkaround::for_adl_p_n(platform_ref_khz);
-        let pll_registers = dividers.registers(request.encoding, fraction_workaround)?;
+        // The active Gen12 path takes the parameters from the translated
+        // `icl_calc_wrpll()` / `icl_calc_dpll_state()` implementation rather
+        // than merely keeping a second local copy of the same search. Keep
+        // the old `PllFieldEncoding::Executed` variant available for the
+        // explicit encoding-comparison tests, but the production/default
+        // `Named` path is the i915 display-12/13 code path.
+        let pll_registers = match request.encoding {
+            PllFieldEncoding::Named => {
+                let params = intel_display::dpll_mgr::icl_calc_wrpll(
+                    request.mode.clock_khz,
+                    platform_ref_khz,
+                )
+                .map_err(|_| {
+                    OutputError::Pll(PllError::NoLegalDividerSet {
+                        symbol_rate_khz: request.mode.clock_khz,
+                        ref_khz: platform_ref_khz,
+                    })
+                })?;
+                let state = intel_display::dpll_mgr::icl_calc_dpll_state(
+                    params,
+                    13,
+                    platform_ref_khz,
+                    None,
+                )
+                .map_err(|_| {
+                    OutputError::Pll(PllError::NoLegalDividerSet {
+                        symbol_rate_khz: request.mode.clock_khz,
+                        ref_khz: platform_ref_khz,
+                    })
+                })?;
+                PllRegisters {
+                    cfgcr0: state.cfgcr0,
+                    cfgcr1: state.cfgcr1,
+                }
+            }
+            PllFieldEncoding::Executed => {
+                dividers.registers(request.encoding, fraction_workaround)?
+            }
+        };
 
-        // The two encoder-side selects are keyed by different things, which
-        // §11's phase 5 prints as if they were one rule.  `TRANS_CLK_SEL` takes
-        // the **PHY** on this display version (`[I915]`
-        // `display/intel_ddi.c:999-1000`); `TRANS_DDI_FUNC_CTL.SELECT_PORT`
-        // takes the **DDI** on every version (`[I915]`
-        // `display/intel_ddi.c:481,488-490`, and `intel_port_to_phy` at
-        // `display/intel_display.c:1950-1965` is the conversion the first one
-        // gets and the second one does not).  `Ddi::index()` is the port's
-        // numeric index (PORT_A = 0, PORT_B = 1, §8.1) and the `+ 1` in both is
-        // there because zero means "none" (§6.3).
+        // `TRANS_CLK_SEL` takes the PHY on this display version. The translated
+        // DDI helper builds the independent transcoder port/mode/polarity
+        // fields from the encoder and CRTC state.
         let trans_clk_sel = (phy_index(phy) + 1) << TRANS_CLK_SEL_PORT_SHIFT;
-        let trans_ddi_func_ctl = TRANS_DDI_FUNC_ENABLE
-            | ((request.ddi.index() + 1) << TRANS_DDI_PORT_SHIFT)
-            | (request.port_type.mode_select() << TRANS_DDI_MODE_SELECT_SHIFT)
-            // 8 bpc is 0 in `TRANS_DDI_BPC_MASK[22:20]` (§8.4), so nothing is
-            // added for it.  That field is the transcoder's; the pipe's output
-            // depth and dithering are `PIPE_MISC`'s, which is the pipe
-            // workstream's register.
-            | if request.mode.hsync_positive {
-                TRANS_DDI_PHSYNC
-            } else {
-                0
-            }
-            | if request.mode.vsync_positive {
-                TRANS_DDI_PVSYNC
-            } else {
-                0
-            }
-            | request.width.width_field();
+        let trans_ddi_func_ctl = source_trans_ddi_func_ctl(request);
 
         // §11 phase 5.6's write, restricted to what is actually a control bit.
         // No bit depth: §8.4's correction and §11 phase 5.6 both put it in
@@ -1019,6 +1259,15 @@ impl OutputProgram {
             | request.width.width_field()
             | request.width.four_lane_bit();
 
+        let ddi_clock_plan = intel_display::ddi::ddi_combo_clock_plan(
+            intel_display::ddi::DdiClockPlatform::AlderLakeN,
+            phy_index(phy) as u8,
+            request.pll_id,
+        )
+        .map_err(|_| OutputError::ComboPllIndex {
+            index: request.pll_id,
+        })?;
+
         Ok(Self {
             pll_id: request.pll_id,
             ddi: request.ddi,
@@ -1034,8 +1283,7 @@ impl OutputProgram {
             ddi_io_well: ddi_io_well(phy),
             swing,
             link_rate: request.link_rate,
-            dpclka_select: u32::from(request.pll_id) << (phy_index(phy) * 2),
-            dpclka_clock_off: phy.ddi_clock_off_bit(),
+            ddi_clock_plan,
             trans_clk_sel,
             trans_ddi_func_ctl,
             transconf,
@@ -1091,7 +1339,7 @@ impl OutputProgram {
         out.push_str(&format!(
             "intel-output: ICL_DPCLKA_CFGCR0: DDI_CLK_SEL = {:#x}, then the DDI_CLK_OFF bit {:#x} \
              cleared in a separate write\n",
-            self.dpclka_select, self.dpclka_clock_off,
+            self.ddi_clock_plan.selector_value, self.ddi_clock_plan.clock_off_mask,
         ));
         out.push_str(&format!(
             "intel-output: voltage-swing level {} from {} ({}) , DW2 per lane {:#010x?}, DW4 per \
@@ -1099,13 +1347,8 @@ impl OutputProgram {
             self.swing.level,
             self.swing.source,
             match self.port_type.buffer_translation_table() {
-                Some(table) => format!(
-                    "i915's table is `{table}`; the reference does not carry its values -- \
-                     section 8.5 [GAP]"
-                ),
-                None => String::from(
-                    "section 8.5 names no translation table for DVI and carries no values"
-                ),
+                Some(table) => format!("platform buffer-translation table `{table}`"),
+                None => String::from("unsupported output selection"),
             },
             self.swing.dw2,
             self.swing.dw4,
@@ -1259,6 +1502,7 @@ pub(crate) fn program(
     let pll_cfgcr1 = registers
         .pll_cfgcr1
         .ok_or(OutputError::PllConfigRegisterMissing { phy })?;
+    let _old_trans_ddi_func_ctl2 = read(regs, ddi::TRANS_DDI_FUNC_CTL2_A)?;
 
     // 5.1 -- the PLL.  Power the block first: §6.3's sequence sets
     // POWER_ENABLE, polls POWER_STATE, and only then loads the dividers.
@@ -1324,18 +1568,24 @@ pub(crate) fn program(
     // clear "must be done with separate register writes".  They are two `rmw`
     // calls, and a test asserts on the write count, because merging them is the
     // kind of change a later cleanup makes innocently.
-    rmw(
-        regs,
-        dpll::ICL_DPCLKA_CFGCR0,
-        ddi_clock_select_mask(phy),
-        plan.dpclka_select,
-    )?;
-    rmw(regs, dpll::ICL_DPCLKA_CFGCR0, plan.dpclka_clock_off, 0)?;
+    super::ddi::enable_combo_clock(regs, plan.ddi_clock_plan).map_err(|error| match error {
+        super::ddi::DdiClockError::Unreadable => OutputError::Unreadable {
+            register: dpll::ICL_DPCLKA_CFGCR0.name(),
+        },
+        super::ddi::DdiClockError::WriteRefused => OutputError::WriteRefused {
+            register: dpll::ICL_DPCLKA_CFGCR0.name(),
+        },
+        super::ddi::DdiClockError::Unsupported => OutputError::ComboPllIndex { index: plan.pll_id },
+    })?;
 
     // §8.6 step 5 -- the port's DDI-IO power, before anything drives a lane.
     // This is `power.rs`'s handshake, with its own rollback: a well that never
     // reports its state leaves the request bit withdrawn.
-    let ddi_io_well = power::enable_well(regs, ddi_io_well(phy))?;
+    let ddi_io_well = power::enable_well(
+        regs,
+        ddi_io_well(phy),
+        intel_display::dmc::DmcPlatform::AlderLakeN,
+    )?;
 
     // 5.3 -- §8.5's voltage-swing sequence: step 3's SUS clock config, steps 4
     // to 6's register batch.  `PORT_TX_DW2`, `PORT_TX_DW4` and `PORT_TX_DW7` are
@@ -1351,17 +1601,37 @@ pub(crate) fn program(
     // write is step 6's training-enable, which is what commits the settings.
     let lanes = tx_lane_registers(phy);
     rmw(regs, registers.cl_dw5, 0, CL_DW5_SUS_CLOCK_CONFIG_MASK)?;
-    write(regs, registers.tx_dw5, plan.swing.dw5_training_disabled)?;
+    write_group_from_lane0(
+        regs,
+        registers.tx_dw5_lane0,
+        registers.tx_dw5,
+        plan.swing.dw5_mask,
+        plan.swing.dw5_training_disabled,
+    )?;
     for (register, value) in lanes.dw2.iter().zip(plan.swing.dw2) {
-        write(regs, *register, value)?;
+        rmw(regs, *register, plan.swing.dw2_mask, value)?;
     }
-    for (register, value) in lanes.dw4.iter().zip(plan.swing.dw4) {
-        write(regs, *register, value)?;
+    for (lane, (register, value)) in lanes.dw4.iter().zip(plan.swing.dw4).enumerate() {
+        let loadgen = if plan.pixel_clock_khz <= 600_000
+            && ((plan.width == PortWidth::Four && lane >= 1)
+                || (plan.width != PortWidth::Four && (lane == 1 || lane == 2)))
+        {
+            1 << 31
+        } else {
+            0
+        };
+        rmw(regs, *register, plan.swing.dw4_mask, value | loadgen)?;
     }
     for (register, value) in lanes.dw7.iter().zip(plan.swing.dw7) {
-        write(regs, *register, value)?;
+        rmw(regs, *register, plan.swing.dw7_mask, value)?;
     }
-    write(regs, registers.tx_dw5, plan.swing.dw5_training_enabled)?;
+    write_group_from_lane0(
+        regs,
+        registers.tx_dw5_lane0,
+        registers.tx_dw5,
+        plan.swing.dw5_mask,
+        plan.swing.dw5_training_enabled,
+    )?;
 
     // §8.6 step 7 -- power the lanes.  A read-modify-write so that whatever
     // else `PORT_CL_DW10` holds survives; the field is `[7:4]` (§8.2).
@@ -1372,56 +1642,110 @@ pub(crate) fn program(
         plan.width.power_down_lanes_field() << PWR_DOWN_LN_MASK_SHIFT,
     )?;
 
-    // 5.4 and 5.5 -- connect the transcoder to the port's clock, then to the
-    // DDI.  Both are plain writes: these registers have no other field in play
-    // on this path.  The transcoder is A's whatever DDI the plan names -- §5.1
+    // 5.4 and 5.5 -- connect the transcoder to the port's clock, then enable
+    // the source DDI transcoder function. The source routine writes FUNC_CTL2
+    // before FUNC_CTL. The transcoder is A's whatever DDI the plan names -- §5.1
     // gives the PRM's "Transcoders A-D can connect to any DDI" -- and the DDI
     // is inside the value (`plan.trans_clk_sel`'s port field and
     // `plan.trans_ddi_func_ctl`'s), so a plan for DDI B writes A's transcoder
     // registers with B's port number in them.
     write(regs, ddi::TRANS_CLK_SEL_A, plan.trans_clk_sel)?;
-    write(regs, ddi::TRANS_DDI_FUNC_CTL_A, plan.trans_ddi_func_ctl)?;
+    let source_encoder = source_ddi_encoder(plan.ddi, plan.port_type);
+    let mode_flags = u32::from(plan.trans_ddi_func_ctl & (1 << 16) != 0)
+        | (u32::from(plan.trans_ddi_func_ctl & (1 << 17) != 0) << 2);
+    let source_state = source_ddi_crtc_state(
+        plan.port_type,
+        plan.width,
+        plan.pixel_clock_khz,
+        mode_flags,
+    );
+    let mut source_io = DdiTranscoderEnableIo::new(
+        regs,
+        ddi::TRANS_DDI_FUNC_CTL_A,
+        ddi::TRANS_DDI_FUNC_CTL2_A,
+    );
+    intel_display::intel_ddi_full::intel_ddi_enable_transcoder_func(
+        &mut source_io,
+        &source_encoder,
+        &source_state,
+    );
+    if let Some(register) = source_io.write_failed {
+        return Err(OutputError::WriteRefused {
+            register: register.name(),
+        });
+    }
+    let ctl2_readback = read(regs, ddi::TRANS_DDI_FUNC_CTL2_A)?;
+    if ctl2_readback != 0 {
+        return Err(OutputError::DdiControlReadbackMismatch {
+            register: ddi::TRANS_DDI_FUNC_CTL2_A.name(),
+            wrote: 0,
+            readback: ctl2_readback,
+        });
+    }
+    let func_readback = read(regs, ddi::TRANS_DDI_FUNC_CTL_A)?;
+    if func_readback != plan.trans_ddi_func_ctl {
+        return Err(OutputError::DdiControlReadbackMismatch {
+            register: ddi::TRANS_DDI_FUNC_CTL_A.name(),
+            wrote: plan.trans_ddi_func_ctl,
+            readback: func_readback,
+        });
+    }
 
     // 5.6 -- the transcoder itself.  `regs/pipe.rs` calls this register
     // `PIPECONF_A`; §5.2 records that i915 v6.12 calls the same offset
     // `TRANSCONF` and that they are one register, not two.
     // The pipe enable follows the HDMI encoder enable below.
 
-    // 5.7 -- the DDI buffer, then idle poll, then transcoder enable.  The write is a
-    // read-modify-write over the fields the plan composes
-    // ([`DDI_BUF_CTL_OWNED`]): the register also carries the board's
-    // `PORT_REVERSAL` and i915 keeps it for this exact mode, so a whole-value
-    // write would clear a lane order the firmware declared.  Reading the
-    // register that was just written is §2.2's read-back discipline, and the
-    // poll is what establishes the device saw the enable.
-    rmw(
-        regs,
-        registers.ddi_buf_ctl,
-        DDI_BUF_CTL_OWNED,
-        plan.ddi_buf_ctl,
-    )?;
-    match poll(
-        regs,
-        registers.ddi_buf_ctl,
-        DDI_BUF_CTL_IS_IDLE,
-        0,
-        DDI_IDLE_TIMEOUT_US,
-    ) {
-        Some(true) => {}
-        Some(false) => {
-            return Err(OutputError::DdiNeverIdle {
-                ddi: plan.ddi,
-                register: registers.ddi_buf_ctl.name(),
-                readback: read(regs, registers.ddi_buf_ctl)?,
-                wrote: plan.ddi_buf_ctl,
-                timeout_us: DDI_IDLE_TIMEOUT_US,
-            });
-        }
-        None => {
-            return Err(OutputError::Unreadable {
-                register: registers.ddi_buf_ctl.name(),
-            });
-        }
+    // 5.7 -- preserve unowned board bits, then hand the DDI_BUF_CTL write,
+    // posting read and bounded IS_IDLE poll to the source helper. Its backend
+    // is restricted to this one typed buffer register.
+    let before_buffer = read(regs, registers.ddi_buf_ctl)?;
+    let buffer_value = (before_buffer & !DDI_BUF_CTL_OWNED) | plan.ddi_buf_ctl;
+    let source_port = match plan.ddi {
+        Ddi::A => intel_display::intel_ddi_full::Port::A,
+        Ddi::B => intel_display::intel_ddi_full::Port::B,
+        Ddi::C => intel_display::intel_ddi_full::Port::C,
+        Ddi::D => intel_display::intel_ddi_full::Port::D,
+    };
+    let source_output = match plan.port_type {
+        PortType::Hdmi => intel_display::intel_ddi_full::OutputType::Hdmi,
+        PortType::Dvi => intel_display::intel_ddi_full::OutputType::Dvi,
+    };
+    let source_encoder = intel_display::intel_ddi_full::DdiEncoder {
+        port: source_port,
+        output: source_output,
+        display: intel_display::intel_ddi_full::Platform {
+            display_ver: 13,
+            alderlake_p: true,
+            ..intel_display::intel_ddi_full::Platform::default()
+        },
+        ..intel_display::intel_ddi_full::DdiEncoder::default()
+    };
+    let mut source_io = DdiBufferEnableIo::new(regs, registers.ddi_buf_ctl);
+    intel_display::intel_ddi_full::intel_ddi_buf_enable(
+        &mut source_io,
+        &source_encoder,
+        buffer_value,
+    );
+    if source_io.read_failed {
+        return Err(OutputError::Unreadable {
+            register: registers.ddi_buf_ctl.name(),
+        });
+    }
+    if source_io.write_failed {
+        return Err(OutputError::WriteRefused {
+            register: registers.ddi_buf_ctl.name(),
+        });
+    }
+    let ddi_buf_ctl_readback = read(regs, registers.ddi_buf_ctl)?;
+    if source_io.timed_out || ddi_buf_ctl_readback & DDI_BUF_CTL_IS_IDLE != 0 {
+        return Err(OutputError::DdiNeverIdle {
+            ddi: plan.ddi,
+            register: registers.ddi_buf_ctl.name(),
+            readback: ddi_buf_ctl_readback,
+            wrote: buffer_value,
+            timeout_us: DDI_IDLE_TIMEOUT_US,
+        });
     }
     // ADL-P/N i915 enables the HDMI encoder before the CPU transcoder;
     // plane arm follows both. A stopped firmware pipe is mandatory at boot.
@@ -1447,6 +1771,42 @@ pub(crate) fn program(
 // ---------------------------------------------------------------------------
 // Errors.
 // ---------------------------------------------------------------------------
+
+/// Disable one CPU transcoder and wait for hardware to report it inactive.
+/// Plane and scaler shutdown must precede this call; the enclosing CRTC
+/// disable callback owns that ordering.
+pub(crate) fn disable_transcoder(
+    regs: &impl Registers,
+    pipe_id: super::pipe::Pipe,
+) -> Result<(), OutputError> {
+    let transcoder = match pipe_id {
+        super::pipe::Pipe::A => pipe::PIPECONF_A,
+        super::pipe::Pipe::B => pipe::PIPECONF_B,
+        super::pipe::Pipe::C => pipe::PIPECONF_C,
+        super::pipe::Pipe::D => pipe::PIPECONF_D,
+    };
+    let current = read(regs, transcoder)?;
+    if current & TRANSCONF_ENABLE != 0 {
+        write(regs, transcoder, current & !TRANSCONF_ENABLE)?;
+    }
+    match poll(
+        regs,
+        transcoder,
+        TRANSCONF_STATE_ENABLE_STATUS,
+        0,
+        TRANSCONF_DISABLE_TIMEOUT_US,
+    ) {
+        Some(true) => Ok(()),
+        Some(false) => Err(OutputError::TranscoderDidNotDisable {
+            register: transcoder.name(),
+            readback: read(regs, transcoder)?,
+            timeout_us: TRANSCONF_DISABLE_TIMEOUT_US,
+        }),
+        None => Err(OutputError::Unreadable {
+            register: transcoder.name(),
+        }),
+    }
+}
 
 /// What can go wrong programming the output path.
 ///
@@ -1538,6 +1898,12 @@ pub(crate) enum OutputError {
         /// The poll budget in microseconds.
         timeout_us: u32,
     },
+    /// The transcoder's state bit remained set after an explicit disable.
+    TranscoderDidNotDisable {
+        register: &'static str,
+        readback: u32,
+        timeout_us: u32,
+    },
     /// The DDI-IO power well did not come up.  Carries `power.rs`'s error.
     Well(PowerError),
     /// `DDI_BUF_CTL.IS_IDLE` never cleared.
@@ -1558,6 +1924,12 @@ pub(crate) enum OutputError {
         wrote: u32,
         /// The poll budget in microseconds.
         timeout_us: u32,
+    },
+    /// A source DDI transcoder-control write did not read back as planned.
+    DdiControlReadbackMismatch {
+        register: &'static str,
+        wrote: u32,
+        readback: u32,
     },
 }
 
@@ -1609,14 +1981,8 @@ impl OutputError {
                 phy.dpll_index(),
             ),
             Self::MissingBufferTranslation { port_type, table } => format!(
-                "the {} buffer-translation values are not in the reference document, so this \
-                 sequence has nothing to write into the PHY's TX registers.  Section 8.5 selects \
-                 {} and then says \"[GAP] I did not extract its values\"; section 13.1 item 12 \
-                 repeats it.  These are the voltage-swing and pre-emphasis numbers, and they are \
-                 board-tuned -- section 8.5 records two PRMs disagreeing about them for the same \
-                 nominal level -- so they have to come from a register dump of a working \
-                 configuration (section 13.4) through OutputRequest::with_swing.  Nothing was \
-                 written",
+                "no buffer-translation table is available for {} on this platform (table {:?}); \
+                 nothing was written",
                 port_type.name(),
                 match table {
                     Some(table) => format!("`{table}`"),
@@ -1682,6 +2048,15 @@ impl OutputError {
                  workaround that was skipped -- re-read SKL_DSSM and compare the symbol rate in \
                  the plan against the mode's pixel clock before suspecting the PHY"
             ),
+            Self::TranscoderDidNotDisable {
+                register,
+                readback,
+                timeout_us,
+            } => format!(
+                "{register}'s transcoder state remained enabled for {timeout_us} us after clearing \
+                 TRANSCONF_ENABLE; it reads {readback:#010x}.  Keep dependent clock and power \
+                 domains held and inspect the active pipe before continuing CRTC disable"
+            ),
             Self::Well(error) => {
                 format!(
                     "the port's DDI-IO power well did not come up: {}",
@@ -1704,6 +2079,10 @@ impl OutputError {
                  poll timing out on an N200/46d0 machine under coreboot + EDK2, and a wrong \
                  port/aux_ch mapping is a far more common cause than a wrong divider",
                 ddi.name()
+            ),
+            Self::DdiControlReadbackMismatch { register, wrote, readback } => format!(
+                "{register} did not read back the translated i915 value {wrote:#010x} \
+                 (observed {readback:#010x})"
             ),
         }
     }
@@ -1741,6 +2120,19 @@ fn rmw(
     let current = read(regs, register)?;
     write(regs, register, (current & !clear) | set)?;
     Ok(current)
+}
+
+/// Match i915's PORT_TX_DW5 sequence: read lane 0, then write the group
+/// instance with only the named fields changed.
+fn write_group_from_lane0(
+    regs: &impl Registers,
+    source: Register,
+    group: Register,
+    clear: u32,
+    set: u32,
+) -> Result<(), OutputError> {
+    let current = read(regs, source)?;
+    write(regs, group, (current & !clear) | set)
 }
 
 /// Poll a register until `mask` reads `value`, or the budget runs out.

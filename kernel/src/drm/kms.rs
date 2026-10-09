@@ -37,6 +37,8 @@ pub struct KmsResources {
     /// atomic KMS transaction as the primary plane.
     pub cursor_plane_id: u32,
     pub preferred_mode: Mode,
+    pub gamma_lut_size: u32,
+    pub degamma_lut_size: u32,
     /// The complete advertised list for this one virtual connector.  It is
     /// never synthesized from an active CRTC state.
     pub modes: Vec<Mode>,

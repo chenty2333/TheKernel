@@ -220,7 +220,7 @@ pub(super) fn dispatch(
                 || request.offsets[1..].iter().any(|&offset| offset != 0)
                 || request.modifier[1..].iter().any(|&modifier| modifier != 0)
                 || request.modifier[0] != 0
-                || request.pixel_format != XRGB8888 && request.pixel_format != ARGB8888
+                || !matches!(request.pixel_format, XRGB8888 | ARGB8888 | 0x3631_4752)
             {
                 return Err(AxError::InvalidInput);
             }
@@ -233,7 +233,7 @@ pub(super) fn dispatch(
                     request.width,
                     request.height,
                     request.pitches[0],
-                    32,
+                    if request.pixel_format == 0x3631_4752 { 16 } else { 32 },
                     request.pixel_format,
                     u64::from(request.offsets[0]),
                 )
@@ -364,7 +364,7 @@ fn fd_flags(flags: u32) -> AxResult<bool> {
 
 fn addfb(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let mut r: uapi::DrmModeFbCmd = read_pod(copy, arg)?;
-    if r.bpp != 32 || !matches!(r.depth, 24 | 32) {
+    if !matches!((r.bpp, r.depth), (16, 16) | (32, 24 | 32)) {
         return Err(AxError::InvalidInput);
     }
     r.fb_id = file
@@ -374,7 +374,11 @@ fn addfb(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
             r.height,
             r.pitch,
             r.bpp,
-            if r.depth == 24 { XRGB8888 } else { ARGB8888 },
+            match (r.bpp, r.depth) {
+                (16, 16) => 0x3631_4752, // DRM_FORMAT_RGB565
+                (32, 24) => XRGB8888,
+                _ => ARGB8888,
+            },
             0,
         )
         .map_err(AxError::from)?;
@@ -391,7 +395,7 @@ fn getfb(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     r.height = fb.height;
     r.pitch = fb.pitch;
     r.bpp = fb.bpp;
-    r.depth = 24;
+    r.depth = if fb.bpp == 16 { 16 } else { 24 };
     r.handle = fb.handle;
     write_pod(copy, arg, &r)
 }
@@ -1925,6 +1929,29 @@ mod tests {
         assert!((reply.max_height as i32) >= 600);
         assert!(reply.min_width <= reply.max_width);
         assert!(reply.min_height <= reply.max_height);
+    }
+
+    #[test]
+    fn legacy_addfb_preserves_rgb565_fourcc() {
+        let device = crate::drm::DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
+        let file = device.open_primary();
+        let dumb = file.create_dumb(DumbRequest { width: 8, height: 8, bpp: 16 }).unwrap();
+        let request = uapi::DrmModeFbCmd {
+            width: 8, height: 8, pitch: dumb.pitch, bpp: 16, depth: 16,
+            handle: dumb.handle, ..Default::default()
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&request as *const uapi::DrmModeFbCmd).cast::<u8>(),
+                core::mem::size_of_val(&request),
+            )
+        };
+        let copy = Image(RefCell::new(bytes.to_vec()));
+        addfb(&file, &copy, 0).unwrap();
+        let result: uapi::DrmModeFbCmd = read_pod(&copy, 0).unwrap();
+        let fb = file.framebuffer(result.fb_id).unwrap();
+        assert_eq!(fb.format, 0x3631_4752);
+        assert_eq!(fb.bpp, 16);
     }
 
     #[test]

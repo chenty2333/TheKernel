@@ -54,7 +54,7 @@ produce **one honest line**, not a half-run sequence reported as a result. The e
 | No monitor answered, or its EDID was unusable | `ModePlan::used_edid()` is false | `ModeRefusal::NoAdvertisedMode`: **the firmware framebuffer is left exactly as firmware left it.** §11 phase 2.3 forbids proceeding past an invalid EDID, and a timing the kernel guessed turns a parse bug into a display bug. |
 | The display has no usable CDCLK | `clk::observe` inside `set_mode`: the PLL not enabled and locked, or a triple the platform's table does not know | `ModesetError::NoCdclk`, refused **before the mode is even chosen** and before any write. Without CDCLK no pixel clock exists, and "every mode is above the ceiling" is a true but useless way to say so. |
 | The DDI is not a combo-PHY port | `regs::ddi` has `DDI_BUF_CTL` for A and B only | `ModesetError::UnsupportedPort`, refused before any write. §8.1 makes C and D the Type-C/DKL ports and §8.8 defers them. |
-| §8.5's swing values are missing | `request.swing` is `None` | `ModesetError::Output(MissingBufferTranslation)`, refused **before the first write**, because the whole program is computed before anything is programmed. This is the state the tree is in today: a boot path with no dump has no values to pass (§13.4). |
+| no explicit firmware swing override | `request.swing` is `None` | Output selects the ADL-N platform translation table and its HDMI default; the optional override remains available for captured register replay. |
 
 Each skip is one line in the log and one line in the debug file. None of them is an error: they are
 the answers to *why is there nothing on the screen*, which on this machine is the only question
@@ -621,7 +621,7 @@ The seams, all of them the coordinator's or WS-1's to place:
 |---|---|---|
 | `set_mode`'s call site | coordinator | `bring_up_at_boot`, after power and the sink, with a surface from WS-1's `fb::Surface::allocate` and the §8.5 swing values (§13.4) |
 | `scanout::register(surface, verdict)` | WS-1 | already implemented; it re-checks `surflive` against the surface it holds and logs the refusal |
-| the swing values | coordinator | `set_mode` refuses without them (`MissingBufferTranslation`), so the boot path needs a source — a dump, per §13.4, or WS-2 reading the firmware's own `PORT_TX_DW*` values |
+| the swing values | coordinator | ADL-N uses the source-translated ICL HDMI table by default; a firmware `PORT_TX_DW*` dump can override it for validation/replay |
 
 **Is this the interface I would have designed?** Mostly, and the one thing I would change is worth
 saying rather than working around:

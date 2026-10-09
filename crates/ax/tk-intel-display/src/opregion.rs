@@ -4,7 +4,7 @@
 // Copyright 2008 Intel Corporation <hong.liu@intel.com>
 // Copyright 2008 Red Hat <mjg@redhat.com>. MIT permission text: ../LICENSE-MIT.
 // All SWSCI/ASLE/ACPI writes, DMI quirks, panel lookup and lifecycle omitted.
-use crate::{Error, bios::Vbt, bytes, le32, le64};
+use crate::{Error, intel_bios::Vbt, bytes, le32, le64};
 
 pub const ASLS: u16 = 0xfc;
 pub const SIZE: usize = 8192;

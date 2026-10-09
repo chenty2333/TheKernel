@@ -402,6 +402,7 @@ impl DrmFile {
         };
         let job = super::device::AtomicCommit {
             owner: self.id,
+            old: super::atomic::State::default(),
             next,
             fb,
             cancellation: Arc::clone(&self.events),
@@ -582,10 +583,14 @@ impl DrmFile {
         active: bool,
         dpms_on: bool,
         gamma_lut: bool,
+        color_pipeline_changed: bool,
     ) -> DrmResult<()> {
-        self.device
-            .adapter
-            .validate_atomic_state(active, dpms_on, gamma_lut)
+        self.device.adapter.validate_atomic_state(
+            active,
+            dpms_on,
+            gamma_lut,
+            color_pipeline_changed,
+        )
     }
     pub(crate) fn fixed_mode(&self) -> Option<Mode> {
         self.device.fixed_mode
@@ -942,10 +947,10 @@ impl DrmFile {
             height,
             pitch,
             bpp,
-            if bpp == 32 {
-                0x3432_5258
-            } else {
-                return Err(DrmError::Unsupported);
+            match bpp {
+                16 => 0x3631_4752, // DRM_FORMAT_RGB565
+                32 => 0x3432_5258,
+                _ => return Err(DrmError::Unsupported),
             },
             0,
         )
@@ -984,10 +989,10 @@ impl DrmFile {
             .ok_or(DrmError::NotFound)?;
         if width == 0
             || height == 0
-            || bpp != 32 || !matches!(format, 0x3432_5258 | 0x3432_5241)
+            || !matches!((bpp, format), (16, 0x3631_4752) | (32, 0x3432_5258 | 0x3432_5241))
             || !bpp.is_multiple_of(8)
             || pitch < width.checked_mul(bpp / 8).ok_or(DrmError::Overflow)?
-            // Linear four-byte pixels may start part-way through a row; the
+            // Linear pixels may start part-way through a row; the
             // adapter carries the exact plane offset and source rectangle.
             || !offset.is_multiple_of(u64::from(bpp / 8))
             || (offset % u64::from(pitch))
@@ -1587,6 +1592,18 @@ mod tests {
         assert_eq!(second.become_master(), Err(DrmError::Busy));
         drop(first);
         assert!(second.become_master().is_ok());
+    }
+    #[test]
+    fn rgb565_dumb_buffer_can_be_wrapped_as_a_linear_framebuffer() {
+        let file = device().open_primary();
+        let dumb = file
+            .create_dumb(DumbRequest { width: 8, height: 8, bpp: 16 })
+            .unwrap();
+        assert_eq!(dumb.pitch, 64);
+        let fb = file.add_framebuffer(dumb.handle, 8, 8, dumb.pitch, 16).unwrap();
+        let info = file.framebuffer(fb).unwrap();
+        assert_eq!(info.bpp, 16);
+        assert_eq!(info.format, 0x3631_4752); // DRM_FORMAT_RGB565
     }
     #[test]
     fn flip_completes_in_order_and_events_are_bounded() {

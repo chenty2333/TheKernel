@@ -43,6 +43,7 @@
 use alloc::{format, string::String, vec::Vec};
 
 use axlog::{info, warn};
+use intel_display::dp_aux::{AuxChannel, AuxError};
 
 use super::{
     gmbus::{AuxWell, EdidBytes, GmbusError, MonotonicTimer, Pin, PollTimer, SinkProbe},
@@ -73,6 +74,61 @@ use crate::drm::modes::{ModePlan, Narration};
 /// silent failure here.
 const CANDIDATES: [(Pin, Well); 2] = [(Pin::DdiA, power::AUX_A), (Pin::DdiB, power::AUX_B)];
 
+/// Link ceilings from the standard receiver-capability bytes. This is an
+/// observation only; it does not claim that this connector's source PHY or
+/// current HDMI modeset path can train DisplayPort.
+fn dpcd_link_ceiling(caps: &[u8; 16]) -> Option<(u32, u8)> {
+    let rate = match caps[1] {
+        0x00 => 0,
+        0x01 => 1_000_000, // UHBR10
+        0x02 => 2_000_000, // UHBR20
+        0x04 => 1_350_000, // UHBR13.5
+        code => u32::from(code) * 27_000,
+    };
+    let mut sink_caps = intel_display::intel_dp_full::DpSinkCaps::default();
+    sink_caps.dpcd.extend_from_slice(caps);
+    let lanes = intel_display::intel_dp_full::max_dprx_lane_count(&sink_caps);
+    if rate == 0 || !matches!(lanes, 1 | 2 | 4) {
+        None
+    } else {
+        Some((rate, lanes))
+    }
+}
+
+const DPCD_EXTENDED_CAPABILITY_PRESENT: u8 = 1 << 7;
+const DPCD_TRAINING_AUX_RD_INTERVAL: usize = 0x0e;
+const DPCD_EXTENDED_CAPS_ADDRESS: u32 = 0x2200;
+
+fn select_extended_dpcd_capabilities(base: [u8; 16], extended: [u8; 16]) -> [u8; 16] {
+    if base[0] > extended[0] || base == extended {
+        base
+    } else {
+        extended
+    }
+}
+
+/// Read the receiver capability block and apply the public DRM helper's
+/// extended-capability selection rule (DP 1.3+). A base revision of zero is
+/// not a valid receiver; failed extended reads remain visible to the caller.
+// Upstream behavior: Linux 7.2.3 drm_dp_helper.c drm_dp_read_dpcd_caps() and
+// drm_dp_read_extended_dpcd_caps() (MIT; Copyright © 2009 Keith Packard).
+fn read_dpcd_capabilities<R: Registers>(
+    regs: &R,
+    channel: AuxChannel,
+) -> Result<[u8; 16], AuxError> {
+    let base = super::dp_aux::read_dpcd(regs, channel, true, 0, 16)?;
+    let base = <[u8; 16]>::try_from(base).map_err(|_| AuxError::Invalid)?;
+    if base[0] == 0 {
+        return Err(AuxError::Invalid);
+    }
+    if base[DPCD_TRAINING_AUX_RD_INTERVAL] & DPCD_EXTENDED_CAPABILITY_PRESENT == 0 {
+        return Ok(base);
+    }
+    let extended = super::dp_aux::read_dpcd(regs, channel, true, DPCD_EXTENDED_CAPS_ADDRESS, 16)?;
+    let extended = <[u8; 16]>::try_from(extended).map_err(|_| AuxError::Invalid)?;
+    Ok(select_extended_dpcd_capabilities(base, extended))
+}
+
 /// The one value the modeset takes: a pin a monitor answered on, and everything
 /// the bring-up learned about it.
 ///
@@ -96,6 +152,12 @@ pub(crate) struct Connector {
     pub(crate) extension: Option<EdidBytes>,
     /// `drm::modes::plan_modeset`'s result over the blocks above.
     pub(crate) plan: ModePlan,
+    /// Base DPCD capabilities read over AUX on live DDI A/B, when available.
+    /// This identifies DP-capable sinks, but output link setup does not yet
+    /// consume these caps.
+    pub(crate) dpcd_caps: Option<[u8; 16]>,
+    /// Reason an optional live DPCD read did not complete.
+    pub(crate) dpcd_error: Option<AuxError>,
     /// The live hotplug state for this connector's DDI.
     pub(crate) hotplug: HpdStatus,
     /// What phase 2.1 found for each candidate well, for the log.
@@ -110,7 +172,7 @@ impl Connector {
     /// a reader comparing this line against those steps should not have to
     /// translate.
     pub(crate) fn describe(&self) -> String {
-        format!(
+        let mut text = format!(
             "display {}: {} carries DDI {}, {}; mode layer chose {} ({:?}{})",
             self.bdf,
             self.pin,
@@ -123,7 +185,18 @@ impl Connector {
             } else {
                 ", lenient parse"
             },
-        )
+        );
+        if let Some(caps) = self.dpcd_caps {
+            text.push_str(&format!("; DPCD revision {:#04x}", caps[0]));
+            if let Some((rate, lanes)) = dpcd_link_ceiling(&caps) {
+                text.push_str(&format!(" (max link {rate} kHz x {lanes} lanes)"));
+            } else {
+                text.push_str(" (invalid link ceiling)");
+            }
+        } else if let Some(error) = self.dpcd_error {
+            text.push_str(&format!("; DPCD AUX read {error:?}"));
+        }
+        text
     }
 }
 
@@ -297,7 +370,6 @@ impl ConnectReport {
 /// The order is the reference's and it is load-bearing: the wells are requested
 /// before the first GMBUS transaction, because a channel behind a shut gate
 /// NAKs every address and looks exactly like a port with nothing on it.
-//
 // `clippy::result_large_err` fires here and on the closure in
 // `resolve_device` that produces this value.  What it measures is real:
 // clippy sizes the largest variant, `ConnectError::WellDown`, at 128 bytes,
@@ -344,7 +416,6 @@ pub(crate) struct Resolved {
 /// closure so that every early return below still reaches it: a device that
 /// produced no connector has still answered the hotplug read, and that answer
 /// is the baseline the after-boot watch needs.
-//
 // The closure returns the same `Result<Connector, ConnectError>` as `resolve`,
 // and the note above that function is where the reason this lint is allowed
 // rather than answered with a `Box` is written out.
@@ -407,6 +478,27 @@ pub(crate) fn resolve_device<R: Registers, T: PollTimer>(
             }
         };
 
+        // A live GMBUS DDC result identifies a DDI A/B pair. Query the
+        // corresponding native AUX channel once for the 16-byte receiver-cap
+        // block. Host connector models stay pure and never access global power
+        // state or pretend to have an AUX receiver.
+        let (dpcd_caps, dpcd_error) = if cfg!(target_os = "none") && hotplug.connected {
+            let channel = match pin {
+                Pin::DdiA => Some(AuxChannel::A),
+                Pin::DdiB => Some(AuxChannel::B),
+                _ => None,
+            };
+            match channel {
+                Some(channel) => match read_dpcd_capabilities(regs, channel) {
+                    Ok(caps) => (Some(caps), None),
+                    Err(error) => (None, Some(error)),
+                },
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
         Ok(Connector {
             bdf,
             pin,
@@ -414,6 +506,8 @@ pub(crate) fn resolve_device<R: Registers, T: PollTimer>(
             edid,
             extension: device.extension,
             plan,
+            dpcd_caps,
+            dpcd_error,
             hotplug,
             wells: records,
         })
@@ -450,7 +544,7 @@ fn enable_wells<R: Registers>(regs: &R) -> Wells {
         // the value its own error names when a pin NAKs: the log line from this
         // step and the log line from the bus have to be about the same object.
         let reported = pin.aux_well();
-        match power::enable_well(regs, well) {
+        match power::enable_well(regs, well, intel_display::dmc::DmcPlatform::AlderLakeN) {
             Ok(observation) => {
                 info!("intel-connect: {}", observation.describe());
                 records.push((reported, observation));
@@ -472,54 +566,25 @@ fn enable_wells<R: Registers>(regs: &R) -> Wells {
     Wells { records, down }
 }
 
-/// The record a failed well enable leaves behind.
-///
-/// `power::enable_well` reports a failure as a [`PowerError`], because its
-/// caller is expected to stop; this step does not stop, so the failure is
-/// turned back into the shape a successful enable produces and recorded beside
-/// it.  A `STATE` bit that never set is reported with the words the error kept
-/// -- the register as it read at the moment of failure, and the requesters that
-/// were holding it then -- which are the numbers §11 phase 1.3 asks a reader to
-/// compare; both control words hold that one snapshot, because the value from
-/// before the request was consumed by the handshake and the register has since
-/// been rolled back, so the snapshot is the only honest number left.
-///
-/// The other two ways to fail -- a window that does not reach
-/// `ICL_PWR_WELL_CTL_AUX2`, a write the register table refuses -- are bugs in
-/// this kernel rather than states of the machine: there are no register words
-/// to report, and the [`PowerError`] beside this record is their whole account.
+/// The observation shape for a power-well request that failed at the MMIO
+/// adapter boundary. i915's HSW helper reports state/fuse timeouts in a normal
+/// observation and does not turn them into this transport-error fallback.
 fn observation_of(well: AuxWell, cause: &PowerError) -> WellObservation {
-    match cause {
-        PowerError::WellStateNeverSet {
-            control,
-            requesters,
-            ..
-        } => WellObservation {
-            name: well.name(),
-            index: well.index(),
-            control_before: *control,
-            control_after: *control,
-            already_on: false,
-            state_set: false,
-            pg0: None,
-            pg: None,
-            requesters: *requesters,
-        },
-        _ => WellObservation {
-            name: well.name(),
-            index: well.index(),
-            control_before: 0,
-            control_after: 0,
-            already_on: false,
-            state_set: false,
-            pg0: None,
-            pg: None,
-            requesters: Requesters {
-                bios: false,
-                driver: false,
-                kvmr: false,
-                debug: false,
-            },
+    let _ = cause;
+    WellObservation {
+        name: well.name(),
+        index: well.index(),
+        control_before: 0,
+        control_after: 0,
+        already_on: false,
+        state_set: false,
+        pg0: None,
+        pg: None,
+        requesters: Requesters {
+            bios: false,
+            driver: false,
+            kvmr: false,
+            debug: false,
         },
     }
 }

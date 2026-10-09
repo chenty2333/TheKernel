@@ -44,24 +44,17 @@
 //!
 //! ## Which poll failures are fatal, and why not all of them
 //!
-//! Every poll here is bounded and every failure is reported; they differ in
-//! whether the sequence can continue.
+//! The HSW well handshake is delegated to the source-shaped
+//! `tk-intel-display::power_well` translation. Its `STATE` and fuse timeouts
+//! are reported and continue, matching i915's warning behavior; transport
+//! errors remain errors. The DBUF and later PHY observations still belong to
+//! this boot-sequence adapter.
 //!
-//! * **`PW_1`'s `STATE` bit is fatal.**  It is the hardware's own statement
-//!   that the well is up.  Continuing past it would read zeros for the rest of
-//!   the bring-up and produce exactly the "dead device" confusion §4.2 warns
-//!   about.
-//! * **The `PG0` fuse is fatal.**  It is the root of the tree: nothing under it
-//!   is powered if it is not distributed, and §11 phase 1.3 lists it as a
-//!   precondition of the request.
-//! * **A well's own `PG` fuse is recorded, not fatal.**  `[I915]`
-//!   `gen9_wait_for_power_well_fuses` warns and continues, and for the wells
-//!   above `PW_1` the fuse bit position is an `[INF]`: §4.4 derives `PG6`..`PG9`
-//!   for indices 5..8 from `SKL_FUSE_PG_DIST_STATUS(pg) = 1 << (27 - pg)`, and
-//!   §13.1 item 1 says the whole ADL-N power-well map has to be verified on
-//!   hardware rather than inferred.  Refusing to continue on an inferred bit
-//!   position would turn a documented unknown into a boot failure, while the
-//!   `STATE` bit already answers the question that matters.
+//! * **Power-well state and fuse timeouts are recorded, not fatal.** `[I915]`
+//!   `hsw_wait_for_power_well_enable` and `gen9_wait_for_power_well_fuses`
+//!   warn and continue. The PG6..PG9 positions for the ADL-N wells remain
+//!   explicitly marked as an inference in the map; a timeout is observable
+//!   without substituting a new driver policy for i915's behavior.
 //! * **A DBUF slice's `POWER_STATE` is recorded**; the step is fatal only if
 //!   *no* slice comes up.  Which slices a given SKU has is `[GAP]` (§4.7,
 //!   §13.1 item 3) and i915's own position is "just power up at least 1 slice,
@@ -82,10 +75,28 @@
 
 use alloc::{format, string::String, vec::Vec};
 
+use intel_display::{
+    dmc::DmcPlatform,
+    power_domains::{PowerDomainIo, PowerDomainState},
+    power_map::{
+        PowerDomain, PowerWellGroup, PowerWellInstance, WellControl, WellOps, power_wells,
+    },
+    skl_watermark_full::{self, DisplayCaps as WatermarkDisplayCaps, WmLatencyIo},
+};
+
 use super::{
     clk,
+    combo_phy_full::{
+        self, ComboPhyDisplay, ComboPhyInstance, ComboPhyPlatform, DiagnosticLevel, VbtPortPresence,
+    },
     phy::{self, PhyState},
     regs::{self, Register, Registers},
+};
+
+#[path = "native_power.rs"]
+mod native_power;
+pub(crate) use native_power::{
+    NativePowerAdapter, NativePowerFailure, NativePowerLease, NativePowerOps,
 };
 
 // ---------------------------------------------------------------------------
@@ -204,13 +215,6 @@ pub(crate) const WELL_FUSE_TIMEOUT_US: u32 = 1_000;
 /// outcome, because it reports the value it actually saw.
 pub(crate) const DBUF_STATE_TIMEOUT_US: u32 = 10;
 
-/// How many times the `DC_STATE_EN` write may be retried.
-///
-/// `[I915]` `gen9_write_dc_state` rewrites up to 100 times, because the
-/// hardware is documented to ignore a DC state change while it is still
-/// restoring register state.  Reference §12.1.
-pub(crate) const DC_STATE_ATTEMPTS: u32 = 100;
-
 /// One power well: its name, where its request bit lives, its index, and which
 /// power gate's fuse bit announces it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -220,14 +224,39 @@ pub(crate) struct Well {
     /// OR-s them, so the driver uses `HSW_PWR_WELL_CTL2` and leaves the BIOS,
     /// KVMR and debug registers alone.  Reference §4.2.
     pub(crate) register: Register,
+    pub(crate) request_registers: WellRequestRegisters,
     /// The well index within that register.
     pub(crate) index: u32,
+    pub(crate) irq_pipe_mask: u8,
     /// The power gate whose fuse bit is polled after the state bit, or `None`
     /// for a well with no fuses.  `[I915]` computes it as
     /// `idx - ICL_PW_CTL_IDX_PW_1 + SKL_PG1`, i.e. `idx + 1` in this table.
     pub(crate) pg: Option<u8>,
     pub(crate) timeout_us: u32,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WellRequestRegisters {
+    pub(crate) bios: Register,
+    pub(crate) kvmr: Option<Register>,
+    pub(crate) debug: Register,
+}
+
+const HSW_REQUESTS: WellRequestRegisters = WellRequestRegisters {
+    bios: regs::HSW_PWR_WELL_CTL1,
+    kvmr: Some(regs::HSW_PWR_WELL_CTL3),
+    debug: regs::HSW_PWR_WELL_CTL4,
+};
+const AUX_REQUESTS: WellRequestRegisters = WellRequestRegisters {
+    bios: regs::ICL_PWR_WELL_CTL_AUX1,
+    kvmr: None,
+    debug: regs::ICL_PWR_WELL_CTL_AUX4,
+};
+const DDI_REQUESTS: WellRequestRegisters = WellRequestRegisters {
+    bios: regs::ICL_PWR_WELL_CTL_DDI1,
+    kvmr: None,
+    debug: regs::ICL_PWR_WELL_CTL_DDI4,
+};
 
 impl Well {
     pub(crate) const fn request_mask(self) -> u32 {
@@ -247,7 +276,9 @@ impl Well {
 pub(crate) const PW_1: Well = Well {
     name: "PW_1",
     register: regs::HSW_PWR_WELL_CTL2,
+    request_registers: HSW_REQUESTS,
     index: 0,
+    irq_pipe_mask: 0,
     pg: Some(SKL_PG1),
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -261,7 +292,9 @@ pub(crate) const PW_1: Well = Well {
 pub(crate) const PW_2: Well = Well {
     name: "PW_2",
     register: regs::HSW_PWR_WELL_CTL2,
+    request_registers: HSW_REQUESTS,
     index: 1,
+    irq_pipe_mask: 0,
     pg: Some(2),
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -275,7 +308,9 @@ pub(crate) const PW_2: Well = Well {
 pub(crate) const PW_A: Well = Well {
     name: "PW_A",
     register: regs::HSW_PWR_WELL_CTL2,
+    request_registers: HSW_REQUESTS,
     index: 5,
+    irq_pipe_mask: 0,
     pg: Some(6),
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -283,7 +318,9 @@ pub(crate) const PW_A: Well = Well {
 pub(crate) const PW_B: Well = Well {
     name: "PW_B",
     register: regs::HSW_PWR_WELL_CTL2,
+    request_registers: HSW_REQUESTS,
     index: 6,
+    irq_pipe_mask: 0,
     pg: Some(7),
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -291,7 +328,9 @@ pub(crate) const PW_B: Well = Well {
 pub(crate) const PW_C: Well = Well {
     name: "PW_C",
     register: regs::HSW_PWR_WELL_CTL2,
+    request_registers: HSW_REQUESTS,
     index: 7,
+    irq_pipe_mask: 0,
     pg: Some(8),
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -299,7 +338,9 @@ pub(crate) const PW_C: Well = Well {
 pub(crate) const PW_D: Well = Well {
     name: "PW_D",
     register: regs::HSW_PWR_WELL_CTL2,
+    request_registers: HSW_REQUESTS,
     index: 8,
+    irq_pipe_mask: 0,
     pg: Some(9),
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -313,7 +354,9 @@ pub(crate) const PW_D: Well = Well {
 pub(crate) const DDI_IO_A: Well = Well {
     name: "DDI_IO_A",
     register: regs::ICL_PWR_WELL_CTL_DDI2,
+    request_registers: DDI_REQUESTS,
     index: 0,
+    irq_pipe_mask: 0,
     pg: None,
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -322,7 +365,31 @@ pub(crate) const DDI_IO_A: Well = Well {
 pub(crate) const DDI_IO_B: Well = Well {
     name: "DDI_IO_B",
     register: regs::ICL_PWR_WELL_CTL_DDI2,
+    request_registers: DDI_REQUESTS,
     index: 1,
+    irq_pipe_mask: 0,
+    pg: None,
+    timeout_us: WELL_STATE_TIMEOUT_US,
+};
+
+/// TGL/ADL TC1 DDI IO well for the Type-C PHY lane-power reference.
+pub(crate) const DDI_IO_TC1: Well = Well {
+    name: "DDI_IO_TC1",
+    register: regs::ICL_PWR_WELL_CTL_DDI2,
+    request_registers: DDI_REQUESTS,
+    index: 3,
+    irq_pipe_mask: 0,
+    pg: None,
+    timeout_us: WELL_STATE_TIMEOUT_US,
+};
+
+/// TGL/ADL TC2 DDI IO well for the Type-C PHY lane-power reference.
+pub(crate) const DDI_IO_TC2: Well = Well {
+    name: "DDI_IO_TC2",
+    register: regs::ICL_PWR_WELL_CTL_DDI2,
+    request_registers: DDI_REQUESTS,
+    index: 4,
+    irq_pipe_mask: 0,
     pg: None,
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -336,7 +403,9 @@ pub(crate) const DDI_IO_B: Well = Well {
 pub(crate) const AUX_A: Well = Well {
     name: "AUX_A",
     register: regs::ICL_PWR_WELL_CTL_AUX2,
+    request_registers: AUX_REQUESTS,
     index: 0,
+    irq_pipe_mask: 0,
     pg: None,
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -345,23 +414,34 @@ pub(crate) const AUX_A: Well = Well {
 pub(crate) const AUX_B: Well = Well {
     name: "AUX_B",
     register: regs::ICL_PWR_WELL_CTL_AUX2,
+    request_registers: AUX_REQUESTS,
     index: 1,
+    irq_pipe_mask: 0,
     pg: None,
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
 
-/// The four request registers, in the order the diagnostic line prints them.
-///
-/// i915 reports which requester is holding a well on when a disable does not
-/// take, and §11 phase 1.3 tells a reader whose `STATE` never set to read all
-/// four and compare.  Doing it for every well means the number is in the log
-/// before anyone has to go looking.
-pub(crate) const REQUEST_REGISTERS: [Register; 4] = [
-    regs::HSW_PWR_WELL_CTL1,
-    regs::HSW_PWR_WELL_CTL2,
-    regs::HSW_PWR_WELL_CTL3,
-    regs::HSW_PWR_WELL_CTL4,
-];
+/// TGL/ADL Type-C AUX1 (the source `AUX_CH_USBC1` / channel D well).
+pub(crate) const AUX_TC1: Well = Well {
+    name: "AUX_TC1",
+    register: regs::ICL_PWR_WELL_CTL_AUX2,
+    request_registers: AUX_REQUESTS,
+    index: 3,
+    irq_pipe_mask: 0,
+    pg: None,
+    timeout_us: WELL_STATE_TIMEOUT_US,
+};
+
+/// TGL/ADL Type-C AUX2 (the source `AUX_CH_USBC2` / channel E well).
+pub(crate) const AUX_TC2: Well = Well {
+    name: "AUX_TC2",
+    register: regs::ICL_PWR_WELL_CTL_AUX2,
+    request_registers: AUX_REQUESTS,
+    index: 4,
+    irq_pipe_mask: 0,
+    pg: None,
+    timeout_us: WELL_STATE_TIMEOUT_US,
+};
 
 /// The DBUF slice registers, in the order this driver enables them.
 ///
@@ -427,25 +507,23 @@ impl FuseState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FusePoll {
     /// The distribution bit set within the budget.
-    Distributed { readback: u32 },
+    Distributed,
     /// It did not.  `pg` is the power gate, so a log line can name the bit that
     /// should have been at `1 << (27 - pg)`.
-    NotDistributed { pg: u8, readback: u32 },
+    NotDistributed { pg: u8 },
 }
 
 impl FusePoll {
     pub(crate) fn distributed(self) -> bool {
-        matches!(self, Self::Distributed { .. })
+        matches!(self, Self::Distributed)
     }
 
     pub(crate) fn describe(self, what: &str) -> String {
         match self {
-            Self::Distributed { readback } => {
-                format!("{what} distributed (FUSE_STATUS {readback:#010x})")
-            }
-            Self::NotDistributed { pg, readback } => format!(
-                "{what} NOT distributed within {WELL_FUSE_TIMEOUT_US} us: SKL_FUSE_STATUS reads \
-                 {readback:#010x}, so bit {} (1 << (27 - {pg})) is clear",
+            Self::Distributed => format!("{what} distributed"),
+            Self::NotDistributed { pg } => format!(
+                "{what} NOT distributed within {WELL_FUSE_TIMEOUT_US} us: bit {} (1 << (27 - \
+                 {pg})) is clear",
                 27 - pg as u32,
             ),
         }
@@ -539,12 +617,13 @@ pub(crate) struct DcStateObservation {
     pub(crate) already_disabled: bool,
     /// How many writes it took.  Zero when the field was already clear.
     pub(crate) writes: u32,
+    pub(crate) state_stuck: bool,
 }
 
 impl DcStateObservation {
     pub(crate) fn describe(&self) -> String {
         format!(
-            "DC states: {:#010x} -> {:#010x} (field {:#x} {}{})",
+            "DC states: {:#010x} -> {:#010x} (field {:#x} {}{}, {})",
             self.before,
             self.after,
             self.after & DC_STATE_MASK,
@@ -557,6 +636,11 @@ impl DcStateObservation {
                 0 => String::new(),
                 1 => String::from(", one write"),
                 n => format!(", {n} writes"),
+            },
+            if self.state_stuck {
+                "still not matched after the i915 retry loop"
+            } else {
+                "readback matched"
             },
         )
     }
@@ -647,21 +731,156 @@ impl WorkaroundState {
 /// Everything [`bring_up`] observed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PowerState {
+    pub(crate) platform: DmcPlatform,
     pub(crate) fuses: FuseState,
     pub(crate) dc_state: DcStateObservation,
+    pub(crate) dc: DcStateControl,
     pub(crate) phys: Vec<PhyState>,
     /// Each PHY's `COMP_INIT` after `PW_1` came up, which is the read that says
     /// whether the PHY step took: §11 phase 1.2 says a `COMP_INIT` that does
     /// not stick means the PHY is not powered.
     pub(crate) phy_comp_init_after_pw1: Vec<(&'static str, bool)>,
     pub(crate) pw1: WellObservation,
+    /// Refcounted pipe-A domain and its map-backed wells.
+    pub(crate) power_domains: PowerDomainState,
     pub(crate) cdclk: clk::CdclkState,
+    /// Successful opt-in modeset CDCLK transition, if one was needed after
+    /// the initial firmware/bring-up observation.
+    pub(crate) runtime_cdclk_transition: Option<clk::CdclkTransitionReport>,
+    /// PCODE acknowledged PREPARE when initial CDCLK state required a change.
+    pub(crate) pcode_cdclk_prepared: bool,
+    /// Voltage level accepted by PCODE after a newly programmed CDCLK.
+    pub(crate) pcode_voltage_level: Option<u8>,
+    pub(crate) wm_latencies: [u32; skl_watermark_full::WM_LEVELS],
+    pub(crate) wm_num_levels: usize,
+    pub(crate) sagv_block_time_us: u32,
     pub(crate) raw_clock: clk::RawClockState,
     pub(crate) dbuf: DbufState,
     pub(crate) workarounds: WorkaroundState,
 }
 
+/// Runtime ownership and source tracking for the software-controlled DC field.
+///
+/// `tracked_dc_state` mirrors i915's `power_domains.dc_state`. The target may
+/// differ from the currently requested field while the DC-off well is held;
+/// its final release applies the target only when DMC firmware is available.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DcStateControl {
+    pub(crate) allowed_dc_mask: u32,
+    pub(crate) target_dc_state: u32,
+    pub(crate) tracked_dc_state: u32,
+    pub(crate) dc6_allowed: bool,
+    pub(crate) psr_dc5_dc6_notifications: u32,
+}
+
 impl PowerState {
+    fn power_map(&self) -> &'static [PowerWellGroup] {
+        power_wells(self.platform)
+    }
+
+    pub(crate) fn watermark_config(&self) -> super::pipe::WatermarkConfig {
+        super::pipe::WatermarkConfig {
+            display_ver: 13,
+            latencies: self.wm_latencies,
+            num_levels: self.wm_num_levels,
+            sagv_block_time_us: self.sagv_block_time_us,
+        }
+    }
+
+    /// Acquire one source-mapped domain and its dependent power wells.
+    pub(crate) fn get_domain<R: Registers>(
+        &mut self,
+        regs: &R,
+        domain: PowerDomain,
+    ) -> Result<(), PowerError> {
+        let platform = self.platform;
+        let map = self.power_map();
+        let domains = &mut self.power_domains;
+        let dc = &mut self.dc;
+        domains
+            .get(
+                map,
+                domain,
+                &mut MappedPowerWellIo {
+                    regs,
+                    platform,
+                    dc: Some(dc),
+                    dmc_payload_loaded: super::dmc::has_payload(),
+                },
+            )
+            .map_err(|error| PowerError::PowerDomain(format!("{error:?}")))
+    }
+
+    /// Release one source-mapped domain after its final client reference.
+    pub(crate) fn put_domain<R: Registers>(
+        &mut self,
+        regs: &R,
+        domain: PowerDomain,
+    ) -> Result<(), PowerError> {
+        let platform = self.platform;
+        let map = self.power_map();
+        let domains = &mut self.power_domains;
+        let dc = &mut self.dc;
+        domains
+            .put(
+                map,
+                domain,
+                &mut MappedPowerWellIo {
+                    regs,
+                    platform,
+                    dc: Some(dc),
+                    dmc_payload_loaded: super::dmc::has_payload(),
+                },
+            )
+            .map_err(|error| PowerError::PowerDomain(format!("{error:?}")))
+    }
+
+    pub(crate) fn get_domain_if_enabled<R: Registers>(
+        &mut self,
+        regs: &R,
+        domain: PowerDomain,
+        runtime_active: bool,
+    ) -> Result<bool, PowerError> {
+        let platform = self.platform;
+        let map = self.power_map();
+        let domains = &mut self.power_domains;
+        let dc = &mut self.dc;
+        domains
+            .get_if_enabled(
+                map,
+                domain,
+                runtime_active,
+                &mut MappedPowerWellIo {
+                    regs,
+                    platform,
+                    dc: Some(dc),
+                    dmc_payload_loaded: super::dmc::has_payload(),
+                },
+            )
+            .map_err(|error| PowerError::PowerDomain(format!("{error:?}")))
+    }
+
+    pub(crate) fn is_domain_enabled<R: Registers>(
+        &self,
+        regs: &R,
+        domain: PowerDomain,
+        runtime_active: bool,
+    ) -> Result<bool, PowerError> {
+        self.power_domains
+            .is_enabled(
+                self.power_map(),
+                domain,
+                runtime_active,
+                &MappedPowerWellIo {
+                    regs,
+                    platform: self.platform,
+                    dc: None,
+                    dmc_payload_loaded: super::dmc::has_payload(),
+                },
+            )
+            .map_err(|error| PowerError::PowerDomain(format!("{error:?}")))
+    }
+
     /// Whether every PHY came up, which is the last thing this phase can check
     /// without a pipe.
     pub(crate) fn phys_initialised(&self) -> bool {
@@ -716,6 +935,14 @@ impl PowerState {
             self.fuses.sfuse_strap & 0xF,
         ));
         line(self.dc_state.describe());
+        line(format!(
+            "DC policy: allowed mask {:#04x}, target state {:#04x}",
+            self.dc.allowed_dc_mask, self.dc.target_dc_state
+        ));
+        line(format!(
+            "power-domain PIPE_A refcount {}",
+            self.power_domains.domain_use_count(PowerDomain::PipeA)
+        ));
         for phy in &self.phys {
             line(phy.describe());
         }
@@ -733,6 +960,29 @@ impl PowerState {
             ));
         }
         line(self.cdclk.describe());
+        if let Some(transition) = self.runtime_cdclk_transition {
+            line(format!(
+                "runtime CDCLK: {:?}, now {} kHz; PCODE PREPARE and voltage update succeeded \
+                 (unlock timeout {}, lock timeout {}, crawl ACK timeout {})",
+                transition.method,
+                transition.after.cdclk_khz,
+                transition.unlock_timed_out,
+                transition.lock_timed_out,
+                transition.crawl_ack_timed_out,
+            ));
+        }
+        line(format!(
+            "PCode CDCLK: prepare acknowledged {}, voltage level {}",
+            u8::from(self.pcode_cdclk_prepared),
+            self.pcode_voltage_level
+                .map_or_else(|| String::from("unchanged"), |level| format!("{level}")),
+        ));
+        line(format!(
+            "i915 WM latency levels ({}): {:?} us",
+            self.wm_num_levels,
+            &self.wm_latencies[..self.wm_num_levels.min(self.wm_latencies.len())],
+        ));
+        line(format!("SAGV block time: {} us", self.sagv_block_time_us));
         line(self.raw_clock.describe());
         line(self.dbuf.describe());
         line(self.workarounds.describe());
@@ -780,28 +1030,7 @@ pub(crate) enum PowerError {
     DisplayDisabledStrap {
         sfuse_strap: u32,
     },
-    /// `DC_STATE_EN` would not take the disable.
-    DcStateNotDisabled {
-        wrote: u32,
-        readback: u32,
-        writes: u32,
-    },
     Phy(phy::PhyError),
-    /// `PW_1`'s precondition: `PG0` never reported its fuse as distributed.
-    Pg0NeverDistributed {
-        fuse_status: u32,
-    },
-    /// The well's `STATE` bit never set.  §11 phase 1.3 lists what this means.
-    WellStateNeverSet {
-        well: &'static str,
-        index: u32,
-        control: u32,
-        requesters: Requesters,
-        /// Whether the request bit this call added has been withdrawn.  It is
-        /// false when the bit was already set before the call, because then it
-        /// is not this call's to withdraw.
-        rolled_back: bool,
-    },
     /// A phase after `PW_1` came up failed.
     ///
     /// The well request this call added is withdrawn before returning, so a
@@ -814,6 +1043,8 @@ pub(crate) enum PowerError {
         unwound: bool,
     },
     Clock(clk::ClockError),
+    Pcode(String),
+    PowerDomain(String),
     /// No DBUF slice came up at all.
     DbufNeverPowered {
         readback: [u32; 4],
@@ -858,44 +1089,7 @@ impl PowerError {
                  display disabled.  Reference section 3.5; section 3.6 notes the OpRegion's \
                  PCON_HEADLESS_SKU bit as the other way a machine says this"
             ),
-            Self::DcStateNotDisabled {
-                wrote,
-                readback,
-                writes,
-            } => format!(
-                "DC_STATE_EN did not take {wrote:#010x} after {writes} writes; it reads \
-                 {readback:#010x}.  Reference section 11 phase 1.1: with DC states enabled the \
-                 hardware may power-gate what the driver is programming, intermittently"
-            ),
             Self::Phy(error) => error.describe(),
-            Self::Pg0NeverDistributed { fuse_status } => format!(
-                "PG0's fuse distribution bit never set within {WELL_FUSE_TIMEOUT_US} us: \
-                 SKL_FUSE_STATUS reads {fuse_status:#010x}, so bit 27 is clear.  PG0 is the root \
-                 of the XE_LPD well tree (reference section 4.1), so nothing below it is powered \
-                 and the PW_1 request would be dropped"
-            ),
-            Self::WellStateNeverSet {
-                well,
-                index,
-                control,
-                requesters,
-                rolled_back,
-            } => format!(
-                "power well {well} never reported its state bit: {control:#010x} after requesting \
-                 bit {request:#x} (well index {index}, state bit {state:#x}).  Reference section \
-                 11 phase 1.3 lists the causes in order of likelihood: the well index is wrong; \
-                 the fuse bit is wrong; or another requester is holding the well with a different \
-                 bit pattern -- {}.  The BIOS, KVMR and debug request registers are in the log \
-                 for exactly that comparison.  The request bit this call added was {}",
-                requesters.describe(),
-                if *rolled_back {
-                    "withdrawn, so the well is left as it was found"
-                } else {
-                    "already set before this call, so it was left alone"
-                },
-                request = well_request(*index),
-                state = well_state(*index),
-            ),
             Self::AfterPowerUp {
                 step,
                 cause,
@@ -911,6 +1105,8 @@ impl PowerError {
                 },
             ),
             Self::Clock(error) => error.describe(),
+            Self::Pcode(error) => format!("PCode CDCLK handshake failed: {error}"),
+            Self::PowerDomain(error) => format!("i915 power-domain reference failed: {error}"),
             Self::DbufNeverPowered { readback } => format!(
                 "no DBUF slice came up: the four slice registers read {readback:#010x?} after \
                  their request bits were set.  Reference section 11 phase 1.5: the failure this \
@@ -962,36 +1158,172 @@ pub(crate) fn read_fuses(regs: &impl Registers) -> Result<FuseState, PowerError>
     })
 }
 
-/// Poll a power gate's distribution bit.
-fn poll_fuse(regs: &impl Registers, pg: u8) -> Result<FusePoll, PowerError> {
-    let mask = fuse_pg_dist_status(pg);
-    let distributed = regs::poll(
-        regs,
-        regs::SKL_FUSE_STATUS,
-        mask,
-        mask,
-        WELL_FUSE_TIMEOUT_US,
-    )
-    .ok_or(PowerError::Unreadable {
-        register: regs::SKL_FUSE_STATUS.name(),
-    })?;
-    let readback = read(regs, regs::SKL_FUSE_STATUS)?;
-    Ok(if distributed {
-        FusePoll::Distributed { readback }
-    } else {
-        FusePoll::NotDistributed { pg, readback }
-    })
-}
-
 /// Which requesters hold a well's request bit.
 fn requesters(regs: &impl Registers, well: Well) -> Result<Requesters, PowerError> {
     let mask = well.request_mask();
     Ok(Requesters {
-        bios: read(regs, REQUEST_REGISTERS[0])? & mask != 0,
-        driver: read(regs, REQUEST_REGISTERS[1])? & mask != 0,
-        kvmr: read(regs, REQUEST_REGISTERS[2])? & mask != 0,
-        debug: read(regs, REQUEST_REGISTERS[3])? & mask != 0,
+        bios: read(regs, well.request_registers.bios)? & mask != 0,
+        driver: read(regs, well.register)? & mask != 0,
+        kvmr: well
+            .request_registers
+            .kvmr
+            .map(|register| read(regs, register))
+            .transpose()?
+            .is_some_and(|value| value & mask != 0),
+        debug: read(regs, well.request_registers.debug)? & mask != 0,
     })
+}
+
+/// PCode-only part of translated i915 WM-latency initialization. ADL-N is
+/// display-13, so the display-14+ MTL latency register path is not admitted.
+struct PcodeWmLatency<'a, R, T> {
+    regs: &'a R,
+    timer: &'a T,
+}
+
+impl<R: Registers, T: super::gmbus::PollTimer> WmLatencyIo for PcodeWmLatency<'_, R, T> {
+    fn read_mtl_latency_reg(&self, _index: usize) -> u32 {
+        unreachable!("display-13 uses the source SKL PCode latency path")
+    }
+
+    fn read_skl_latency_pcode(&self, index: u32) -> Result<u32, i32> {
+        super::pcode::read_wm_latency(self.regs, self.timer, index).map_err(|error| match error {
+            super::pcode::PcodeError::MailboxStatus(status) => status,
+            _ => -5, // EIO: mailbox register/backend unavailable.
+        })
+    }
+}
+
+/// Read the source watermark latency profile without running the mutating
+/// display bring-up phases. The legacy TC fastboot route already owns a live
+/// firmware scanout and cannot construct a `PowerState` by quiescing it first.
+pub(crate) fn read_source_watermark_config<R: Registers, T: super::gmbus::PollTimer>(
+    regs: &R,
+    timer: &T,
+) -> Result<super::pipe::WatermarkConfig, String> {
+    let mut latencies = [0u32; skl_watermark_full::WM_LEVELS];
+    let display = WatermarkDisplayCaps {
+        display_ver: 13,
+        display_ver_fixed: 13,
+        alderlake_p: true,
+        sagv: true,
+        sagv_wm: true,
+        has_hw_sagv_wm: true,
+        ..WatermarkDisplayCaps::default()
+    };
+    let num_levels = skl_watermark_full::skl_setup_wm_latency(
+        &PcodeWmLatency { regs, timer },
+        &display,
+        &mut latencies,
+    )
+    .map_err(|error| format!("PCode watermark-latency read returned errno {error}"))?;
+    let sagv_block_time_us = match super::pcode::read_sagv_block_time_us(regs, timer) {
+        Ok(value) if value <= u16::MAX as u32 => value,
+        Ok(value) => {
+            axlog::warn!("intel-gpu: PCode SAGV block time {value}us exceeds i915's 16-bit limit");
+            0
+        }
+        Err(error) => {
+            axlog::debug!("intel-gpu: could not read PCode SAGV block time: {error:?}");
+            0
+        }
+    };
+    Ok(super::pipe::WatermarkConfig {
+        display_ver: 13,
+        latencies,
+        num_levels,
+        sagv_block_time_us,
+    })
+}
+
+struct HswPowerWellAdapter<'a, R: Registers> {
+    regs: &'a R,
+}
+
+impl<R: Registers> HswPowerWellAdapter<'_, R> {
+    fn register(offset: u32) -> Option<Register> {
+        [
+            regs::HSW_PWR_WELL_CTL1,
+            regs::HSW_PWR_WELL_CTL2,
+            regs::HSW_PWR_WELL_CTL3,
+            regs::HSW_PWR_WELL_CTL4,
+            regs::ICL_PWR_WELL_CTL_DDI2,
+            regs::ICL_PWR_WELL_CTL_DDI1,
+            regs::ICL_PWR_WELL_CTL_DDI4,
+            regs::ICL_PWR_WELL_CTL_AUX2,
+            regs::ICL_PWR_WELL_CTL_AUX1,
+            regs::ICL_PWR_WELL_CTL_AUX4,
+            regs::SKL_FUSE_STATUS,
+            regs::GEN8_CHICKEN_DCPR_1,
+            regs::DC_STATE_EN,
+        ]
+        .into_iter()
+        .find(|register| register.offset() == offset)
+    }
+}
+
+impl<R: Registers> intel_display::RegisterIo for HswPowerWellAdapter<'_, R> {
+    fn read32(&self, offset: u32) -> Result<u32, intel_display::Error> {
+        let register = Self::register(offset).ok_or(intel_display::Error::Unavailable(offset))?;
+        self.regs
+            .read(register)
+            .ok_or(intel_display::Error::Unavailable(offset))
+    }
+
+    fn write32(&self, offset: u32, value: u32) -> Result<(), intel_display::Error> {
+        let register = Self::register(offset).ok_or(intel_display::Error::Unavailable(offset))?;
+        if self.regs.write(register, value) {
+            Ok(())
+        } else {
+            Err(intel_display::Error::Refused)
+        }
+    }
+}
+
+impl<R: Registers> intel_display::power_well::HswPowerWellIo for HswPowerWellAdapter<'_, R> {
+    fn wait_set(
+        &self,
+        register: u32,
+        mask: u32,
+        timeout_ms: u16,
+    ) -> Result<bool, intel_display::Error> {
+        let typed = Self::register(register).ok_or(intel_display::Error::Unavailable(register))?;
+        super::regs::poll(self.regs, typed, mask, mask, u32::from(timeout_ms) * 1_000)
+            .ok_or(intel_display::Error::Unavailable(register))
+    }
+
+    fn wait_clear(
+        &self,
+        register: u32,
+        mask: u32,
+        timeout_ms: u16,
+    ) -> Result<bool, intel_display::Error> {
+        let typed = Self::register(register).ok_or(intel_display::Error::Unavailable(register))?;
+        super::regs::poll(self.regs, typed, mask, 0, u32::from(timeout_ms) * 1_000)
+            .ok_or(intel_display::Error::Unavailable(register))
+    }
+
+    fn post_enable(&self, irq_pipe_mask: u8) -> Result<(), intel_display::Error> {
+        if irq_pipe_mask == 0 || !super::irq::online() {
+            Ok(())
+        } else {
+            // The source resets/initializes every pipe's DE IRQ block here.
+            // This owner currently supports Pipe A only at install time; do
+            // not silently skip a live IRQ transition.
+            Err(intel_display::Error::Refused)
+        }
+    }
+
+    fn pre_disable(&self, irq_pipe_mask: u8) -> Result<(), intel_display::Error> {
+        if irq_pipe_mask == 0 || !super::irq::online() {
+            Ok(())
+        } else {
+            // The i915 path masks/acks the pipe source and synchronizes the
+            // parent IRQ before the well drops. Keep this fail-closed until
+            // the per-well IRQ teardown path is translated.
+            Err(intel_display::Error::Refused)
+        }
+    }
 }
 
 /// Turn off the DC states.
@@ -1001,130 +1333,112 @@ fn requesters(regs: &impl Registers, well: Well) -> Result<Requesters, PowerErro
 /// so a kernel with no DMC firmware is viable and the wells stay under the
 /// driver's control.
 ///
-/// The write is a read-modify-write of the field software owns, not a write of
-/// zero: `DC_STATE_EN` also carries status and hardware-communication bits,
-/// and §12.1 says software must not change bits 9, 8 and 4.  `[I915]`
-/// `gen9_write_dc_state` retries up to 100 times, because the hardware is
-/// documented to ignore a DC state change while it is restoring register state,
-/// so a single write and a read-back would be a false failure waiting to
-/// happen.
-pub(crate) fn disable_dc_states(regs: &impl Registers) -> Result<DcStateObservation, PowerError> {
-    let before = read(regs, regs::DC_STATE_EN)?;
-    let already_disabled = before & DC_STATE_MASK == DC_STATE_DISABLE;
-    let mut after = before;
-    let mut writes = 0;
-    let mut last_written = before;
-    while after & DC_STATE_MASK != DC_STATE_DISABLE && writes < DC_STATE_ATTEMPTS {
-        last_written = (after & !DC_STATE_MASK) | DC_STATE_DISABLE;
-        write(regs, regs::DC_STATE_EN, last_written)?;
-        writes += 1;
-        after = read(regs, regs::DC_STATE_EN)?;
+/// The translated `gen9_dc_mask` preserves status and hardware-communication
+/// fields; `gen9_write_dc_state` performs i915's initial write and up to 100
+/// rewrites. A persistent mismatch is recorded in `state_stuck` rather than
+/// converted into a new fatal policy.
+pub(crate) fn disable_dc_states<R: Registers>(regs: &R) -> Result<DcStateObservation, PowerError> {
+    struct BootDcStateObserver;
+    impl intel_display::dc_state::DcStateObserver for BootDcStateObserver {
+        fn notify_psr_dc5_dc6(&mut self) {}
+        fn update_dc6_allowed_count(&mut self, _: bool) {}
     }
 
-    if after & DC_STATE_MASK != DC_STATE_DISABLE {
-        return Err(PowerError::DcStateNotDisabled {
-            wrote: last_written,
-            readback: after,
-            writes,
-        });
-    }
+    let adapter = HswPowerWellAdapter { regs };
+    let mut tracked_dc_state = DC_STATE_DISABLE;
+    let state = intel_display::dc_state::gen9_set_dc_state(
+        &adapter,
+        regs::DC_STATE_EN.offset(),
+        13,
+        false,
+        DC_STATE_DISABLE,
+        true,
+        DC_STATE_DISABLE,
+        &mut tracked_dc_state,
+        &mut BootDcStateObserver,
+    )
+    .map_err(|error| match error {
+        intel_display::Error::Unavailable(offset) => PowerError::Unreadable {
+            register: HswPowerWellAdapter::<R>::register(offset)
+                .map(Register::name)
+                .unwrap_or(regs::DC_STATE_EN.name()),
+        },
+        _ => PowerError::WriteRefused {
+            register: regs::DC_STATE_EN.name(),
+        },
+    })?;
+    let mask = intel_display::dc_state::gen9_dc_mask(13, false);
+    let before = state.before.ok_or(PowerError::Unreadable {
+        register: regs::DC_STATE_EN.name(),
+    })?;
     Ok(DcStateObservation {
         before,
-        after,
-        already_disabled,
-        writes,
+        after: state.readback,
+        already_disabled: before & mask == DC_STATE_DISABLE,
+        writes: 1 + u32::from(state.rewrites),
+        state_stuck: state.readback & mask != DC_STATE_DISABLE,
     })
 }
 
-/// Enable one power well.
-///
-/// §4.4's handshake, with §4.5's ADL workaround in front of it:
-///
-/// ```text
-/// if this well's power gate is PG1: GEN8_CHICKEN_DCPR_1 |= DISABLE_FLR_SRC
-/// if this well's power gate is PG1: poll PG0's fuse distribution bit
-/// HSW_PWR_WELL_CTL2 |= REQ(index)
-/// poll HSW_PWR_WELL_CTL2.STATE(index)
-/// poll this well's PG fuse distribution bit
-/// ```
-///
-/// `Wa_16013190616` is `IS_ALDERLAKE_P` in i915, and ADL-N is a subplatform of
-/// ADL-P, so it applies here.  `[I915]`
-/// `display/intel_display_power_well.c:342-384`.
-///
-/// Only the `STATE` poll is fatal; see the module header for why the fuse polls
-/// are recorded instead.
-pub(crate) fn enable_well(
-    regs: &impl Registers,
+/// Enable one HSW-style power well using i915's request/fuse sequence.
+// upstream: intel_display_power_well.c hsw_power_well_enable()
+pub(crate) fn enable_well<R: Registers>(
+    regs: &R,
     well: Well,
+    platform: DmcPlatform,
 ) -> Result<WellObservation, PowerError> {
-    // The workaround goes first, before the request write, which is the whole
-    // point of it.  `PG0` is polled next, and only for a PG1 well, because
-    // `[I915]` waits for PG0 only when the gate it is enabling is PG1.
-    let mut pg0 = None;
-    if well.pg == Some(SKL_PG1) {
-        rmw(regs, regs::GEN8_CHICKEN_DCPR_1, 0, DISABLE_FLR_SRC)?;
-        let polled = poll_fuse(regs, SKL_PG0)?;
-        if let FusePoll::NotDistributed { readback, .. } = polled {
-            return Err(PowerError::Pg0NeverDistributed {
-                fuse_status: readback,
-            });
-        }
-        pg0 = Some(polled);
-    }
-
+    // This observation belongs to the surrounding transaction, not the
+    // translated HSW helper: it records who owned the request before handoff.
     let control_before = read(regs, well.register)?;
     let already_on = control_before & well.state_mask() != 0;
-    // Whether *this call* is the one adding the request bit.  It is the
-    // difference between a bit this call may withdraw and one that belongs to
-    // whoever set it earlier.
-    let we_request = control_before & well.request_mask() == 0;
-
-    rmw(regs, well.register, 0, well.request_mask())?;
-
-    // The write is posted.  The poll below is what establishes that the device
-    // saw it, so no separate posting read is needed here; the state bit is the
-    // acknowledgement.
-    let state_set = regs::poll(
-        regs,
-        well.register,
-        well.state_mask(),
-        well.state_mask(),
-        well.timeout_us,
-    )
-    .ok_or(PowerError::Unreadable {
-        register: well.register.name(),
-    })?;
-    if !state_set {
-        // The diagnostic describes the state at the moment of failure, so it is
-        // read before the rollback: a report that said "nobody requested this
-        // well" because the rollback had already run would be actively
-        // misleading about the one thing section 11 phase 1.3 asks a reader to
-        // compare.
-        let control = read(regs, well.register)?;
-        let requesters = requesters(regs, well)?;
-        // Then withdraw the request this call added.  Leaving it set would make
-        // the next attempt -- and anyone reading the register afterwards --
-        // unable to tell whether the bit was there before, which is the
-        // difference between a retry and a diagnosis.
-        let rolled_back = we_request && rmw(regs, well.register, well.request_mask(), 0).is_ok();
-        return Err(PowerError::WellStateNeverSet {
-            well: well.name,
-            index: well.index,
-            control,
-            requesters,
-            rolled_back,
-        });
-    }
-
-    // The well's own gate is polled after the state bit, for every well that
-    // has fuses -- including PW_1, whose gate is PG1.  i915 polls *both* PG0
-    // (before the request) and the well's own gate (after the state bit) for a
-    // PG1 well, and only its own gate for the others.
-    let pg = match well.pg {
-        Some(pg) => Some(poll_fuse(regs, pg)?),
-        None => None,
+    let adapter = HswPowerWellAdapter { regs };
+    let spec = intel_display::power_well::HswWellSpec {
+        name: well.name,
+        registers: intel_display::power_well::HswWellRegisters {
+            bios: well.request_registers.bios.offset(),
+            driver: well.register.offset(),
+            kvmr: well.request_registers.kvmr.map(Register::offset),
+            debug: well.request_registers.debug.offset(),
+            fuse_status: regs::SKL_FUSE_STATUS.offset(),
+            gen8_chicken_dcpr1: regs::GEN8_CHICKEN_DCPR_1.offset(),
+        },
+        index: well.index as u8,
+        pg: well.pg,
+        timeout_ms: well.timeout_us.div_ceil(1_000) as u16,
+        has_fuses: well.pg.is_some(),
+        alderlake_pw1_wa: matches!(platform, DmcPlatform::AlderLakeP | DmcPlatform::AlderLakeN)
+            && well.pg == Some(SKL_PG1),
+        irq_pipe_mask: well.irq_pipe_mask,
     };
+    let enable =
+        intel_display::power_well::hsw_power_well_enable(&adapter, spec).map_err(|error| {
+            match error {
+                intel_display::Error::Unavailable(offset) => PowerError::Unreadable {
+                    register: HswPowerWellAdapter::<R>::register(offset)
+                        .map(Register::name)
+                        .unwrap_or(well.register.name()),
+                },
+                _ => PowerError::WriteRefused {
+                    register: well.register.name(),
+                },
+            }
+        })?;
+    let pg0 = enable.pg0_distributed.map(|distributed| {
+        if distributed {
+            FusePoll::Distributed
+        } else {
+            FusePoll::NotDistributed { pg: SKL_PG0 }
+        }
+    });
+    let pg = enable.pg_distributed.map(|distributed| {
+        if distributed {
+            FusePoll::Distributed
+        } else {
+            FusePoll::NotDistributed {
+                pg: well.pg.unwrap_or(SKL_PG0),
+            }
+        }
+    });
 
     Ok(WellObservation {
         name: well.name,
@@ -1132,11 +1446,427 @@ pub(crate) fn enable_well(
         control_before,
         control_after: read(regs, well.register)?,
         already_on,
-        state_set: true,
+        state_set: enable.state_set,
         pg0,
         pg,
         requesters: requesters(regs, well)?,
     })
+}
+
+/// Drop one HSW-style request after its final mapped domain reference.
+// upstream: intel_display_power_well.c hsw_power_well_disable()
+pub(crate) fn disable_well<R: Registers>(
+    regs: &R,
+    well: Well,
+    platform: DmcPlatform,
+) -> Result<(), PowerError> {
+    let adapter = HswPowerWellAdapter { regs };
+    let spec = intel_display::power_well::HswWellSpec {
+        name: well.name,
+        registers: intel_display::power_well::HswWellRegisters {
+            bios: well.request_registers.bios.offset(),
+            driver: well.register.offset(),
+            kvmr: well.request_registers.kvmr.map(Register::offset),
+            debug: well.request_registers.debug.offset(),
+            fuse_status: regs::SKL_FUSE_STATUS.offset(),
+            gen8_chicken_dcpr1: regs::GEN8_CHICKEN_DCPR_1.offset(),
+        },
+        index: well.index as u8,
+        pg: well.pg,
+        timeout_ms: well.timeout_us.div_ceil(1_000) as u16,
+        has_fuses: well.pg.is_some(),
+        alderlake_pw1_wa: matches!(platform, DmcPlatform::AlderLakeP | DmcPlatform::AlderLakeN)
+            && well.pg == Some(SKL_PG1),
+        irq_pipe_mask: well.irq_pipe_mask,
+    };
+    intel_display::power_well::hsw_power_well_disable(&adapter, spec)
+        .map(|_| ())
+        .map_err(|error| match error {
+            intel_display::Error::Unavailable(offset) => PowerError::Unreadable {
+                register: HswPowerWellAdapter::<R>::register(offset)
+                    .map(Register::name)
+                    .unwrap_or(well.register.name()),
+            },
+            _ => PowerError::WriteRefused {
+                register: well.register.name(),
+            },
+        })
+}
+
+fn mapped_hsw_well(instance: PowerWellInstance) -> Option<Well> {
+    let mut well = match instance.control? {
+        WellControl::IclPw1 => Some(PW_1),
+        WellControl::IclPw2 => Some(PW_2),
+        WellControl::IclDdiA => Some(DDI_IO_A),
+        WellControl::IclDdiB => Some(DDI_IO_B),
+        WellControl::TglDdiTc1 => Some(DDI_IO_TC1),
+        WellControl::TglDdiTc2 => Some(DDI_IO_TC2),
+        WellControl::IclAuxA => Some(AUX_A),
+        WellControl::IclAuxB => Some(AUX_B),
+        WellControl::TglAuxTc1 => Some(AUX_TC1),
+        WellControl::TglAuxTc2 => Some(AUX_TC2),
+        WellControl::XelpdPwA => Some(PW_A),
+        WellControl::XelpdPwB => Some(PW_B),
+        WellControl::XelpdPwC => Some(PW_C),
+        WellControl::XelpdPwD => Some(PW_D),
+        _ => None,
+    }?;
+    well.irq_pipe_mask = instance.irq_pipe_mask;
+    Some(well)
+}
+
+/// `icl_tc_phy_aux_power_well_enable()` warns if the Type-C PHY uC health
+/// bit does not become ready within one millisecond. The source warning does
+/// not fail AUX power acquisition, so this bounded check is diagnostic only.
+fn warn_if_tc_aux_uc_unhealthy<R: Registers>(regs: &R, port: intel_display::dkl_phy::TcPort) {
+    let register = match intel_display::dkl_phy::DklRegister::new(port, 0x236c) {
+        Ok(register) => register,
+        Err(_) => {
+            axlog::warn!("intel power: unsupported TC AUX DKL uC-health register");
+            return;
+        }
+    };
+    let io = super::tc_modeset::dkl_io(regs);
+    let timer = super::gmbus::MonotonicTimer;
+    let start = super::gmbus::PollTimer::now_micros(&timer);
+    for _ in 0..1_000 {
+        if intel_display::dkl_phy::intel_dkl_phy_read(&io, register)
+            .is_ok_and(|value| value & (1 << 15) != 0)
+        {
+            return;
+        }
+        if super::gmbus::PollTimer::now_micros(&timer).saturating_sub(start) >= 1_000 {
+            break;
+        }
+        super::gmbus::PollTimer::pause(&timer);
+    }
+    axlog::warn!("intel power: TC AUX DKL uC health did not set within 1 ms");
+}
+
+/// Record the source callbacks that would normally update PSR and DMC's DC6
+/// eligibility bookkeeping. PSR is not active on this native modeset path, so
+/// notification is counted for diagnostics while the source DC6 transition
+/// policy remains authoritative.
+struct RuntimeDcObserver<'a> {
+    dc6_allowed: &'a mut bool,
+    psr_notifications: &'a mut u32,
+}
+
+impl intel_display::dc_state::DcStateObserver for RuntimeDcObserver<'_> {
+    fn notify_psr_dc5_dc6(&mut self) {
+        *self.psr_notifications = self.psr_notifications.saturating_add(1);
+    }
+
+    fn update_dc6_allowed_count(&mut self, allowed: bool) {
+        *self.dc6_allowed = allowed;
+    }
+}
+
+fn runtime_set_dc_state<R: Registers>(
+    regs: &R,
+    dc: &mut DcStateControl,
+    requested: u32,
+) -> Result<intel_display::dc_state::DcStateWrite, PowerError> {
+    let adapter = HswPowerWellAdapter { regs };
+    let mut observer = RuntimeDcObserver {
+        dc6_allowed: &mut dc.dc6_allowed,
+        psr_notifications: &mut dc.psr_dc5_dc6_notifications,
+    };
+    let report = intel_display::dc_state::gen9_set_dc_state(
+        &adapter,
+        regs::DC_STATE_EN.offset(),
+        13,
+        false,
+        dc.allowed_dc_mask,
+        false,
+        requested,
+        &mut dc.tracked_dc_state,
+        &mut observer,
+    )
+    .map_err(|error| match error {
+        intel_display::Error::Unavailable(offset) if offset == regs::DC_STATE_EN.offset() => {
+            PowerError::Unreadable {
+                register: regs::DC_STATE_EN.name(),
+            }
+        }
+        _ => PowerError::WriteRefused {
+            register: regs::DC_STATE_EN.name(),
+        },
+    })?;
+
+    // i915 records a persistent DMC mismatch and continues. This adapter is a
+    // modeset transaction boundary: do not report a DC transition as applied
+    // unless the software-owned field actually matches. Tracking follows the
+    // observed hardware value even on refusal so a later recovery starts from
+    // the state the device retained.
+    let mask = intel_display::dc_state::gen9_dc_mask(13, false);
+    let requested = requested & dc.allowed_dc_mask & mask;
+    let actual = report.readback & mask;
+    dc.tracked_dc_state = actual;
+    dc.dc6_allowed = actual & intel_display::dc_state::DC_STATE_EN_UPTO_DC6 != 0;
+    if actual != requested {
+        return Err(PowerError::ReadbackMismatch {
+            register: regs::DC_STATE_EN.name(),
+            wrote: (report.readback & !mask) | requested,
+            read: report.readback,
+        });
+    }
+    Ok(report)
+}
+
+fn dc_off_well_is_enabled<R: Registers>(regs: &R) -> Result<bool, intel_display::Error> {
+    let value = regs
+        .read(regs::DC_STATE_EN)
+        .ok_or(intel_display::Error::Unavailable(
+            regs::DC_STATE_EN.offset(),
+        ))?;
+    // Source `gen9_dc_off_power_well_enabled()`: DC-off is enabled when no
+    // DC3CO/DC5/DC6 state is currently requested. DC9 is independently owned.
+    Ok(value & (0b11 | (1 << 30)) == 0)
+}
+
+struct PowerDcTargetIo<'a, R: Registers> {
+    regs: &'a R,
+    dc: &'a mut DcStateControl,
+    requested_target: u32,
+    dmc_payload_loaded: bool,
+}
+
+impl<R: Registers> intel_display::dc_state::DcOffPowerWellIo for PowerDcTargetIo<'_, R> {
+    fn dc_off_well_is_enabled(&self) -> Result<bool, intel_display::Error> {
+        dc_off_well_is_enabled(self.regs)
+    }
+
+    fn enable_dc_off_well(&mut self) -> Result<(), intel_display::Error> {
+        runtime_set_dc_state(self.regs, self.dc, DC_STATE_DISABLE)
+            .map(|_| ())
+            .map_err(|_| intel_display::Error::Unavailable(regs::DC_STATE_EN.offset()))
+    }
+
+    fn disable_dc_off_well(&mut self) -> Result<(), intel_display::Error> {
+        // i915 does not re-enable DC states until a DMC payload is available.
+        // Retain the selected target so a future retry can apply it, but keep
+        // the engine in the known-safe disabled state for now.
+        if self.dmc_payload_loaded {
+            runtime_set_dc_state(self.regs, self.dc, self.requested_target)
+                .map(|_| ())
+                .map_err(|_| intel_display::Error::Unavailable(regs::DC_STATE_EN.offset()))?;
+        }
+        Ok(())
+    }
+}
+
+impl PowerState {
+    /// Change the desired idle DC level with the source DC-off-well cycle.
+    ///
+    /// A `false` result is not a no-op success: the target was recorded, but
+    /// DC5/DC6 remains disabled because DMC firmware is not loaded yet.
+    pub(crate) fn set_target_dc_state<R: Registers>(
+        &mut self,
+        regs: &R,
+        requested: u32,
+    ) -> Result<bool, PowerError> {
+        let target =
+            intel_display::dc_state::sanitize_target_dc_state(requested, self.dc.allowed_dc_mask);
+        let mut target_state = self.dc.target_dc_state;
+        let dmc_payload_loaded = super::dmc::has_payload();
+        let report = intel_display::dc_state::set_target_dc_state(
+            &mut target_state,
+            self.dc.allowed_dc_mask,
+            requested,
+            &mut PowerDcTargetIo {
+                regs,
+                dc: &mut self.dc,
+                requested_target: target,
+                dmc_payload_loaded,
+            },
+        )
+        .map_err(|error| PowerError::PowerDomain(format!("DC target update failed: {error:?}")))?;
+        if report != target {
+            return Err(PowerError::ReadbackMismatch {
+                register: regs::DC_STATE_EN.name(),
+                wrote: target,
+                read: report,
+            });
+        }
+        self.dc.target_dc_state = target_state;
+        Ok(dmc_payload_loaded)
+    }
+
+    /// Synchronously leave DC5/DC6 before touching pipe, plane, or link state.
+    pub(crate) fn exit_dc_states<R: Registers>(&mut self, regs: &R) -> Result<(), PowerError> {
+        runtime_set_dc_state(regs, &mut self.dc, DC_STATE_DISABLE).map(|_| ())
+    }
+
+    /// Re-allow the sanitized idle target after modeset hardware is stable.
+    pub(crate) fn enter_dc_states<R: Registers>(&mut self, regs: &R) -> Result<bool, PowerError> {
+        if !super::dmc::has_payload() {
+            return Ok(false);
+        }
+        let target = self.dc.target_dc_state;
+        runtime_set_dc_state(regs, &mut self.dc, target)?;
+        Ok(true)
+    }
+}
+
+struct MappedPowerWellIo<'a, R> {
+    regs: &'a R,
+    platform: DmcPlatform,
+    dc: Option<&'a mut DcStateControl>,
+    dmc_payload_loaded: bool,
+}
+
+impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
+    fn sync_well(
+        &mut self,
+        group: PowerWellGroup,
+        instance: PowerWellInstance,
+        _: u32,
+    ) -> Result<(), intel_display::Error> {
+        if instance.always_on || group.ops == WellOps::AlwaysOn || group.ops == WellOps::DcOff {
+            return Ok(());
+        }
+        if !matches!(group.ops, WellOps::Hsw | WellOps::Ddi | WellOps::Aux) {
+            return Err(intel_display::Error::Refused);
+        }
+        let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
+        let adapter = HswPowerWellAdapter { regs: self.regs };
+        intel_display::power_well::hsw_power_well_sync_hw(
+            &adapter,
+            intel_display::power_well::HswWellRegisters {
+                bios: well.request_registers.bios.offset(),
+                driver: well.register.offset(),
+                kvmr: well.request_registers.kvmr.map(Register::offset),
+                debug: well.request_registers.debug.offset(),
+                fuse_status: regs::SKL_FUSE_STATUS.offset(),
+                gen8_chicken_dcpr1: regs::GEN8_CHICKEN_DCPR_1.offset(),
+            },
+            well.index as u8,
+        )
+        .map(|_| ())
+    }
+
+    fn enable_well(
+        &mut self,
+        group: PowerWellGroup,
+        instance: PowerWellInstance,
+    ) -> Result<(), intel_display::Error> {
+        if instance.always_on || group.ops == WellOps::AlwaysOn {
+            return Ok(());
+        }
+        if group.ops == WellOps::DcOff {
+            let dc = self
+                .dc
+                .as_deref_mut()
+                .ok_or(intel_display::Error::Refused)?;
+            return runtime_set_dc_state(self.regs, dc, DC_STATE_DISABLE)
+                .map(|_| ())
+                .map_err(|_| intel_display::Error::Unavailable(regs::DC_STATE_EN.offset()));
+        }
+        if !matches!(group.ops, WellOps::Hsw | WellOps::Ddi | WellOps::Aux) {
+            return Err(intel_display::Error::Refused);
+        }
+        // Linux `icl_tc_phy_aux_power_well_enable()` clears TBT_IO in the
+        // source-selected AUX D/E control before requesting the Type-C AUX
+        // well. The TBT group has a separate owner and is not admitted here.
+        let aux_ctl = match instance.control {
+            Some(WellControl::TglAuxTc1) => Some(regs::aux::DP_AUX_CH_CTL_D),
+            Some(WellControl::TglAuxTc2) => Some(regs::aux::DP_AUX_CH_CTL_E),
+            _ => None,
+        };
+        if let Some(control) = aux_ctl {
+            let current = self
+                .regs
+                .read(control)
+                .ok_or(intel_display::Error::Unavailable(control.offset()))?;
+            if !self.regs.write(control, current & !(1 << 11)) {
+                return Err(intel_display::Error::Unavailable(control.offset()));
+            }
+        }
+        let mut well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
+        if let Some(timeout_ms) = group.enable_timeout_ms {
+            well.timeout_us = u32::from(timeout_ms).saturating_mul(1_000);
+        }
+        enable_well(self.regs, well, self.platform)
+            .map_err(|_| intel_display::Error::Unavailable(well.register.offset()))?;
+        match instance.control {
+            Some(WellControl::TglAuxTc1) => {
+                warn_if_tc_aux_uc_unhealthy(self.regs, intel_display::dkl_phy::TcPort::Tc1)
+            }
+            Some(WellControl::TglAuxTc2) => {
+                warn_if_tc_aux_uc_unhealthy(self.regs, intel_display::dkl_phy::TcPort::Tc2)
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn disable_well(
+        &mut self,
+        group: PowerWellGroup,
+        instance: PowerWellInstance,
+    ) -> Result<(), intel_display::Error> {
+        if instance.always_on || group.ops == WellOps::AlwaysOn {
+            return Ok(());
+        }
+        if group.ops == WellOps::DcOff {
+            if !self.dmc_payload_loaded {
+                return Ok(());
+            }
+            let dc = self
+                .dc
+                .as_deref_mut()
+                .ok_or(intel_display::Error::Refused)?;
+            return runtime_set_dc_state(self.regs, dc, dc.target_dc_state)
+                .map(|_| ())
+                .map_err(|_| intel_display::Error::Unavailable(regs::DC_STATE_EN.offset()));
+        }
+        if !matches!(group.ops, WellOps::Hsw | WellOps::Ddi | WellOps::Aux) {
+            return Err(intel_display::Error::Refused);
+        }
+        let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
+        disable_well(self.regs, well, self.platform)
+            .map_err(|_| intel_display::Error::Unavailable(well.register.offset()))
+    }
+
+    fn well_is_enabled(
+        &self,
+        group: PowerWellGroup,
+        instance: PowerWellInstance,
+    ) -> Result<bool, intel_display::Error> {
+        if instance.always_on || group.ops == WellOps::AlwaysOn {
+            return Ok(true);
+        }
+        if group.ops == WellOps::DcOff {
+            return dc_off_well_is_enabled(self.regs);
+        }
+        let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
+        let adapter = HswPowerWellAdapter { regs: self.regs };
+        intel_display::power_well::hsw_power_well_enabled(
+            &adapter,
+            intel_display::power_well::HswWellSpec {
+                name: well.name,
+                registers: intel_display::power_well::HswWellRegisters {
+                    bios: well.request_registers.bios.offset(),
+                    driver: well.register.offset(),
+                    kvmr: well.request_registers.kvmr.map(Register::offset),
+                    debug: well.request_registers.debug.offset(),
+                    fuse_status: regs::SKL_FUSE_STATUS.offset(),
+                    gen8_chicken_dcpr1: regs::GEN8_CHICKEN_DCPR_1.offset(),
+                },
+                index: well.index as u8,
+                pg: well.pg,
+                timeout_ms: well.timeout_us.div_ceil(1_000) as u16,
+                has_fuses: well.pg.is_some(),
+                alderlake_pw1_wa: matches!(
+                    self.platform,
+                    DmcPlatform::AlderLakeP | DmcPlatform::AlderLakeN
+                ) && well.pg == Some(SKL_PG1),
+                irq_pipe_mask: well.irq_pipe_mask,
+            },
+            false,
+        )
+    }
 }
 
 /// Bring the display buffer's slices up.
@@ -1325,11 +2055,56 @@ fn bring_up_inner(
     // PW_1, which is the order `icl_display_core_init` uses.
     let phys = match preserved {
         Some(phys) => phys,
-        None => phy::init_all(regs)?,
+        None => {
+            // Source-order combo PHY initialization. The `phy::init_all`
+            // verification pass below retains the existing boot report, while
+            // the source-function translation owns the init/uninit decisions.
+            let instances: Vec<_> = regs::COMBO_PHYS
+                .iter()
+                .copied()
+                .map(|registers| ComboPhyInstance {
+                    phy: registers.port.as_bytes().first().copied().unwrap_or(b'A') - b'A',
+                    registers,
+                })
+                .collect();
+            let display = ComboPhyDisplay {
+                platform: ComboPhyPlatform {
+                    display_version: 13,
+                    ..ComboPhyPlatform::default()
+                },
+                vbt_ports: VbtPortPresence::default(),
+                phys: &instances,
+            };
+            let mut diagnostics = Vec::new();
+            combo_phy_full::intel_combo_phy_init(regs, &display, &mut diagnostics).map_err(
+                |error| match error {
+                    combo_phy_full::ComboPhyIoError::Read(register) => PowerError::Unreadable {
+                        register: register.name(),
+                    },
+                    combo_phy_full::ComboPhyIoError::Write(register) => PowerError::WriteRefused {
+                        register: register.name(),
+                    },
+                },
+            )?;
+            for diagnostic in diagnostics {
+                match diagnostic.level {
+                    DiagnosticLevel::Debug => {
+                        axlog::debug!("intel-combo-phy: {}", diagnostic.message)
+                    }
+                    DiagnosticLevel::Warning | DiagnosticLevel::MissingCase => {
+                        axlog::warn!("intel-combo-phy: {}", diagnostic.message)
+                    }
+                    DiagnosticLevel::Error => {
+                        axlog::error!("intel-combo-phy: {}", diagnostic.message)
+                    }
+                }
+            }
+            phy::init_all(regs)?
+        }
     };
 
     // Phase 1.3.
-    let pw1 = enable_well(regs, PW_1)?;
+    let pw1 = enable_well(regs, PW_1, DmcPlatform::AlderLakeN)?;
     // Every step below runs with the well up, so every failure below has to
     // put the well back.  `we_requested` is what makes that safe: a request bit
     // that was already set is not this call's to withdraw.
@@ -1344,6 +2119,26 @@ fn bring_up_inner(
     // Phases 1.4 and 1.4b.  The raw clock is a clock and belongs with CDCLK;
     // it must also be right before any south display function is enabled, which
     // is not this phase, so doing it here satisfies that with margin.
+    let pcode_timer = super::gmbus::MonotonicTimer;
+    let clock_before = clk::observe(regs).map_err(|error| {
+        unwind(
+            regs,
+            we_requested,
+            "the CDCLK readout",
+            PowerError::Clock(error),
+        )
+    })?;
+    let pcode_cdclk_prepared = !clock_before.usable();
+    if pcode_cdclk_prepared {
+        super::pcode::prepare_cdclk_change(regs, &pcode_timer).map_err(|error| {
+            unwind(
+                regs,
+                we_requested,
+                "the PCode CDCLK prepare request",
+                PowerError::Pcode(format!("{error:?}")),
+            )
+        })?;
+    }
     let cdclk = clk::bring_up(regs).map_err(|error| {
         unwind(
             regs,
@@ -1352,6 +2147,30 @@ fn bring_up_inner(
             PowerError::Clock(error),
         )
     })?;
+    let pcode_voltage_level = if let Some(programmed) = cdclk.programmed {
+        let level = clk::source_voltage_level(programmed.entry.cdclk_khz).ok_or_else(|| {
+            unwind(
+                regs,
+                we_requested,
+                "the translated CDCLK voltage-level policy",
+                PowerError::Clock(clk::ClockError::UnsupportedVoltageLevel {
+                    cdclk_khz: programmed.entry.cdclk_khz,
+                }),
+            )
+        })?;
+        super::pcode::commit_cdclk_voltage(regs, &pcode_timer, programmed.entry.cdclk_khz)
+            .map_err(|error| {
+                unwind(
+                    regs,
+                    we_requested,
+                    "the PCode CDCLK voltage update",
+                    PowerError::Pcode(format!("{error:?}")),
+                )
+            })?;
+        Some(level)
+    } else {
+        None
+    };
     let raw_clock = clk::bring_up_raw_clock(regs, fuses.sfuse_strap).map_err(|error| {
         unwind(
             regs,
@@ -1365,17 +2184,108 @@ fn bring_up_inner(
     let dbuf =
         enable_dbuf(regs).map_err(|error| unwind(regs, we_requested, "the DBUF step", error))?;
 
+    // Source `skl_wm_init` obtains the display-12/13 latency table from PCode
+    // before plane watermark computation. Preserve the source's level
+    // adjustment and sanitization instead of using a made-up latency profile.
+    let wm = read_source_watermark_config(regs, &pcode_timer).map_err(|error| {
+        unwind(
+            regs,
+            we_requested,
+            "the PCode watermark-latency read",
+            PowerError::Pcode(error),
+        )
+    })?;
+    let wm_latencies = wm.latencies;
+    let wm_num_levels = wm.num_levels;
+    let sagv_block_time_us = wm.sagv_block_time_us;
+
     // Phase 1.6.
     let workarounds = apply_workarounds(regs)
         .map_err(|error| unwind(regs, we_requested, "the workaround step", error))?;
 
+    // The opt-in pipe-A modeset needs PW_A after the display core and clocks
+    // are live. Keep the reference in the returned state so the map count
+    // remains paired with the hardware request for the lifetime of scanout.
+    let platform = DmcPlatform::AlderLakeN;
+    let power_map = power_wells(platform);
+    let mut power_domains = PowerDomainState::new(power_map);
+    power_domains
+        .sync_domain(
+            power_map,
+            PowerDomain::PipeA,
+            &mut MappedPowerWellIo {
+                regs,
+                platform,
+                dc: None,
+                dmc_payload_loaded: super::dmc::has_payload(),
+            },
+        )
+        .map_err(|error| {
+            unwind(
+                regs,
+                we_requested,
+                "PIPE_A power-well BIOS handoff",
+                PowerError::PowerDomain(format!("{error:?}")),
+            )
+        })?;
+    power_domains
+        .get(
+            power_map,
+            PowerDomain::PipeA,
+            &mut MappedPowerWellIo {
+                regs,
+                platform,
+                dc: None,
+                dmc_payload_loaded: super::dmc::has_payload(),
+            },
+        )
+        .map_err(|error| {
+            unwind(
+                regs,
+                we_requested,
+                "PIPE_A power-domain request",
+                PowerError::PowerDomain(format!("{error:?}")),
+            )
+        })?;
+    let allowed_dc_mask = intel_display::dc_state::get_allowed_dc_mask(
+        intel_display::dc_state::DcStateCaps {
+            display_version: 13,
+            has_display: true,
+            dg2: false,
+            dg1: false,
+            geminilake: false,
+            broxton: false,
+            disable_power_well: intel_display::dc_state::sanitize_disable_power_well_option(-1),
+        },
+        -1,
+    );
+    let target_dc_state = intel_display::dc_state::sanitize_target_dc_state(
+        intel_display::dc_state::DC_STATE_EN_UPTO_DC6,
+        allowed_dc_mask,
+    );
+
     Ok(PowerState {
+        platform,
         fuses,
         dc_state,
+        dc: DcStateControl {
+            allowed_dc_mask,
+            target_dc_state,
+            tracked_dc_state: DC_STATE_DISABLE,
+            dc6_allowed: false,
+            psr_dc5_dc6_notifications: 0,
+        },
         phys,
         phy_comp_init_after_pw1,
         pw1,
+        power_domains,
         cdclk,
+        runtime_cdclk_transition: None,
+        pcode_cdclk_prepared,
+        pcode_voltage_level,
+        wm_latencies,
+        wm_num_levels,
+        sagv_block_time_us,
         raw_clock,
         dbuf,
         workarounds,
@@ -1393,6 +2303,10 @@ mod tests {
     /// working firmware CDCLK, and a 24 MHz raw clock strap.
     fn powered_machine() -> MockRegisters {
         let regs = MockRegisters::new();
+        // Complete the PCode mailbox and return valid latency/prepare data.
+        regs.on_read(regs::pcode::GEN6_PCODE_MAILBOX, |_| 0);
+        regs.on_read(regs::pcode::GEN6_PCODE_DATA, |_| 0x04040405);
+
         regs.set(regs::SKL_DFSM, 0);
         regs.set(regs::SKL_DSSM, 0); // 24 MHz
         regs.set(regs::SFUSE_STRAP, 1 << 8); // the 24 MHz raw clock strap
@@ -1400,6 +2314,9 @@ mod tests {
         regs.set(regs::CDCLK_PLL_ENABLE, (1 << 31) | (1 << 30) | 22);
         regs.set(regs::CDCLK_CTL, (1 << 22) | (7 << 19) | 350);
         regs.set(regs::PCH_RAWCLK_FREQ, 24 << 16);
+        regs.set(regs::ICL_PWR_WELL_CTL_DDI2, 0);
+        regs.set(regs::aux::DP_AUX_CH_CTL_D, 1 << 11);
+        regs.set(regs::aux::DP_AUX_CH_CTL_E, 1 << 11);
         // DC6 requested: a machine that needs the DC state turned off, which is
         // the case the step exists for.
         regs.set(regs::DC_STATE_EN, 0b10);
@@ -1429,7 +2346,19 @@ mod tests {
         });
         regs.derive(regs::ICL_PWR_WELL_CTL_AUX2, |written| {
             let mut value = written;
-            for well in [AUX_A, AUX_B] {
+            for well in [AUX_A, AUX_B, AUX_TC1, AUX_TC2] {
+                let (request, state) = (well.request_mask(), well.state_mask());
+                if written & request != 0 {
+                    value |= state;
+                } else {
+                    value &= !state;
+                }
+            }
+            value
+        });
+        regs.derive(regs::ICL_PWR_WELL_CTL_DDI2, |written| {
+            let mut value = written;
+            for well in [DDI_IO_A, DDI_IO_B, DDI_IO_TC1, DDI_IO_TC2] {
                 let (request, state) = (well.request_mask(), well.state_mask());
                 if written & request != 0 {
                     value |= state;
@@ -1479,6 +2408,14 @@ mod tests {
         // Phase 1.1: DC states off, field cleared and everything else kept.
         assert!(!state.dc_state.already_disabled);
         assert_eq!(regs.read(regs::DC_STATE_EN).unwrap() & DC_STATE_MASK, 0);
+        assert_eq!(
+            state.dc.allowed_dc_mask,
+            (1 << 3) | (1 << 30) | intel_display::dc_state::DC_STATE_EN_UPTO_DC6
+        );
+        assert_eq!(
+            state.dc.target_dc_state,
+            intel_display::dc_state::DC_STATE_EN_UPTO_DC6
+        );
 
         // Phase 1.2: both PHYs initialised, A first.
         assert_eq!(state.phys.len(), 2);
@@ -1624,82 +2561,69 @@ mod tests {
             "the other bits survive"
         );
 
-        // A machine that already had DC disabled is not rewritten.
+        // i915 still writes the selected field when it already reads clear.
         let regs = powered_machine();
         regs.set(regs::DC_STATE_EN, 1 << 4);
         let observation = disable_dc_states(&regs).unwrap();
         assert!(observation.already_disabled);
-        assert!(regs.writes().is_empty());
+        assert_eq!(observation.writes, 1);
+        assert_eq!(regs.writes().len(), 1);
     }
 
     #[test]
-    fn a_dc_state_that_will_not_take_the_write_is_an_error() {
-        // i915 retries up to 100 times because the hardware ignores the write
-        // while it restores state; when it never takes, that is a real failure
-        // and the count is in the message.
+    fn a_dc_state_that_ignores_the_write_records_i915_retry_exhaustion() {
         let regs = powered_machine();
         regs.set(regs::DC_STATE_EN, 1);
         regs.derive(regs::DC_STATE_EN, |_| 1); // the write never lands
-        let error = disable_dc_states(&regs).unwrap_err();
-        assert!(matches!(
-            error,
-            PowerError::DcStateNotDisabled { writes: 100, .. }
-        ));
-        let text = error.describe();
-        assert!(text.contains("intermittently"), "{text}");
+        let state = disable_dc_states(&regs).unwrap();
+        assert!(state.state_stuck);
+        assert_eq!(state.writes, 101); // initial write + 100 rewrites
+        assert_eq!(state.after, 1);
     }
 
     #[test]
-    fn a_well_whose_state_never_sets_names_every_cause_it_can() {
-        // §11 phase 1.3's documented failure, with the requester comparison the
-        // reference tells a reader to make.
+    fn hsw_state_timeout_is_recorded_and_requester_owners_remain_visible() {
         let regs = powered_machine();
-        // The mock's PNV request bit never produces a state bit for PW_1: set
-        // the derive hook to drop it.
+        // The mock request lands but the power well never acknowledges it.
         regs.derive(regs::HSW_PWR_WELL_CTL2, |written| {
             written & !PW_1.state_mask()
         });
-        // The BIOS request register is read, not written, so the mock has to
-        // answer with the bit rather than remember a write.
         regs.on_read(regs::HSW_PWR_WELL_CTL1, |stored| {
             stored | PW_1.request_mask()
         });
 
-        let error = bring_up(&regs).unwrap_err();
-        match error {
-            PowerError::WellStateNeverSet {
-                well,
-                index,
-                requesters,
-                ..
-            } => {
-                assert_eq!(well, "PW_1");
-                assert_eq!(index, 0);
-                assert!(requesters.bios, "the BIOS request must be reported");
-                assert!(requesters.driver);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-        let text = error.describe();
-        assert!(text.contains("well index 0"), "{text}");
-        assert!(text.contains("requesting bit 0x2"), "{text}");
+        let observation = enable_well(&regs, PW_1, DmcPlatform::AlderLakeN).unwrap();
+        assert!(!observation.state_set);
+        assert!(
+            observation.requesters.bios,
+            "the BIOS request must be reported"
+        );
+        assert!(observation.requesters.driver);
+        assert_eq!(
+            observation.control_after & PW_1.request_mask(),
+            PW_1.request_mask()
+        );
+        let text = observation.describe();
+        assert!(text.contains("index 0"), "{text}");
+        assert!(text.contains("NEVER CAME UP"), "{text}");
         assert!(text.contains("requesters: bios 1 driver 1"), "{text}");
     }
 
     #[test]
-    fn a_pg0_that_is_not_distributed_stops_the_well_before_the_request() {
-        // PG0 is the root of the tree, so a well requested under an
-        // undistributed root would be dropped.  Reference §4.4 and §11 1.3.
+    fn fuse_timeouts_are_reported_but_do_not_short_circuit_hsw_well_enable() {
         let regs = powered_machine();
         regs.set(regs::SKL_FUSE_STATUS, 0);
-        let error = bring_up(&regs).unwrap_err();
-        assert!(matches!(error, PowerError::Pg0NeverDistributed { .. }));
-        assert!(error.describe().contains("bit 27"));
-        // The request was never written, so the log cannot be misread as "the
-        // well was asked for and did not come up".
+        let observation = enable_well(&regs, PW_1, DmcPlatform::AlderLakeN).unwrap();
+        assert_eq!(
+            observation.pg0,
+            Some(FusePoll::NotDistributed { pg: SKL_PG0 })
+        );
+        assert_eq!(
+            observation.pg,
+            Some(FusePoll::NotDistributed { pg: SKL_PG1 })
+        );
         assert!(
-            !regs
-                .writes()
+            regs.writes()
                 .iter()
                 .any(|(name, _)| *name == regs::HSW_PWR_WELL_CTL2.name())
         );
@@ -1713,6 +2637,18 @@ mod tests {
         );
         let state = bring_up(&regs).unwrap();
         assert!(state.pw1.pg.unwrap().distributed());
+    }
+
+    #[test]
+    fn alder_lake_pw1_workaround_is_not_applied_to_other_platforms() {
+        let regs = powered_machine();
+        enable_well(&regs, PW_1, DmcPlatform::TigerLake).unwrap();
+        assert!(
+            !regs
+                .writes()
+                .iter()
+                .any(|(name, _)| *name == regs::GEN8_CHICKEN_DCPR_1.name())
+        );
     }
 
     #[test]
@@ -1785,7 +2721,7 @@ mod tests {
     fn enabling_a_well_that_is_already_on_does_not_claim_credit() {
         let regs = powered_machine();
         regs.set(regs::HSW_PWR_WELL_CTL2, well_state(PW_1.index));
-        let observation = enable_well(&regs, PW_1).unwrap();
+        let observation = enable_well(&regs, PW_1, DmcPlatform::AlderLakeN).unwrap();
         assert!(observation.already_on);
         assert!(observation.describe().contains("was already on"));
         assert!(observation.requesters.driver);
@@ -1851,33 +2787,255 @@ mod tests {
         // The DDI and AUX wells live in their own registers.
         assert_eq!(DDI_IO_A.register.name(), "ICL_PWR_WELL_CTL_DDI2");
         assert_eq!(AUX_A.register.name(), "ICL_PWR_WELL_CTL_AUX2");
+        assert_eq!(
+            DDI_IO_A.request_registers.bios.name(),
+            "ICL_PWR_WELL_CTL_DDI1"
+        );
+        assert_eq!(
+            DDI_IO_A.request_registers.debug.name(),
+            "ICL_PWR_WELL_CTL_DDI4"
+        );
+        assert_eq!(DDI_IO_A.request_registers.kvmr, None);
+        assert_eq!(AUX_A.request_registers.bios.name(), "ICL_PWR_WELL_CTL_AUX1");
+        assert_eq!(
+            AUX_A.request_registers.debug.name(),
+            "ICL_PWR_WELL_CTL_AUX4"
+        );
+        assert_eq!(AUX_A.request_registers.kvmr, None);
         assert_eq!(DDI_IO_A.request_mask(), 0x2);
         assert_eq!(AUX_B.state_mask(), 0x4);
+        let adlp = power_wells(DmcPlatform::AlderLakeN);
+        let pw_a = adlp
+            .iter()
+            .flat_map(|group| group.instances.iter())
+            .find(|instance| instance.name == "PW_A")
+            .copied()
+            .unwrap();
+        assert_eq!(pw_a.irq_pipe_mask, 1 << 0);
+        assert_eq!(mapped_hsw_well(pw_a).unwrap().irq_pipe_mask, 1 << 0);
+        for (name, expected) in [
+            ("DDI_IO_A", DDI_IO_A),
+            ("DDI_IO_B", DDI_IO_B),
+            ("DDI_IO_TC1", DDI_IO_TC1),
+            ("DDI_IO_TC2", DDI_IO_TC2),
+            ("AUX_A", AUX_A),
+            ("AUX_B", AUX_B),
+            ("AUX_USBC1", AUX_TC1),
+            ("AUX_USBC2", AUX_TC2),
+        ] {
+            let instance = adlp
+                .iter()
+                .flat_map(|group| group.instances.iter())
+                .find(|instance| instance.name == name)
+                .copied()
+                .unwrap();
+            assert_eq!(mapped_hsw_well(instance), Some(expected), "{name}");
+        }
     }
 
     #[test]
-    fn a_well_whose_state_never_sets_withdraws_the_request_it_added() {
-        // Rollback, at the handshake: the request bit this call added must not
-        // be left behind, or the next attempt cannot tell whether it was there
-        // before.
+    fn power_state_get_put_uses_map_driven_aux_domain_references() {
+        let regs = powered_machine();
+        let mut state = bring_up(&regs).unwrap();
+        assert!(
+            !state
+                .is_domain_enabled(&regs, PowerDomain::AuxIoA, true)
+                .unwrap()
+        );
+        assert!(
+            !state
+                .get_domain_if_enabled(&regs, PowerDomain::AuxIoA, true)
+                .unwrap()
+        );
+
+        state.get_domain(&regs, PowerDomain::AuxIoA).unwrap();
+        assert!(
+            state
+                .is_domain_enabled(&regs, PowerDomain::AuxIoA, true)
+                .unwrap()
+        );
+        assert!(
+            state
+                .get_domain_if_enabled(&regs, PowerDomain::AuxIoA, true)
+                .unwrap()
+        );
+        assert_eq!(state.power_domains.domain_use_count(PowerDomain::AuxIoA), 2);
+
+        state.put_domain(&regs, PowerDomain::AuxIoA).unwrap();
+        state.put_domain(&regs, PowerDomain::AuxIoA).unwrap();
+        assert_eq!(state.power_domains.domain_use_count(PowerDomain::AuxIoA), 0);
+        assert!(
+            !state
+                .is_domain_enabled(&regs, PowerDomain::AuxIoA, true)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn dc_off_domain_refs_disable_dc_and_only_restore_after_dmc_load() {
+        let regs = powered_machine();
+        let mut state = bring_up(&regs).unwrap();
+        let dc6 = intel_display::dc_state::DC_STATE_EN_UPTO_DC6;
+
+        // Model firmware having left DC6 enabled after the initial bring-up.
+        // The source DC-off well's first reference must synchronously leave
+        // DC6, while nested references must not repeat the transition.
+        runtime_set_dc_state(&regs, &mut state.dc, dc6).unwrap();
+        let before = regs.writes().len();
+        state.get_domain(&regs, PowerDomain::DcOff).unwrap();
+        assert_eq!(state.power_domains.domain_use_count(PowerDomain::DcOff), 1);
+        assert_eq!(regs.read(regs::DC_STATE_EN).unwrap() & DC_STATE_MASK, 0);
+        let first_transition_writes = regs.writes().len() - before;
+        assert_eq!(
+            first_transition_writes, 1,
+            "first reference disables DC once"
+        );
+
+        state.get_domain(&regs, PowerDomain::DcOff).unwrap();
+        assert_eq!(state.power_domains.domain_use_count(PowerDomain::DcOff), 2);
+        assert_eq!(regs.writes().len() - before, first_transition_writes);
+
+        // No successfully uploaded DMC payload exists in this host test, so
+        // the final put must release the software ref but leave DC5/DC6 off.
+        state.put_domain(&regs, PowerDomain::DcOff).unwrap();
+        assert_eq!(state.power_domains.domain_use_count(PowerDomain::DcOff), 1);
+        state.put_domain(&regs, PowerDomain::DcOff).unwrap();
+        assert_eq!(state.power_domains.domain_use_count(PowerDomain::DcOff), 0);
+        assert_eq!(regs.read(regs::DC_STATE_EN).unwrap() & DC_STATE_MASK, 0);
+        assert_eq!(state.dc.target_dc_state, dc6);
+    }
+
+    #[test]
+    fn dc_off_final_put_restores_target_only_with_loaded_dmc() {
+        let regs = powered_machine();
+        let mut state = bring_up(&regs).unwrap();
+        let dc6 = intel_display::dc_state::DC_STATE_EN_UPTO_DC6;
+        let map = power_wells(state.platform);
+
+        runtime_set_dc_state(&regs, &mut state.dc, dc6).unwrap();
+        {
+            let dc = &mut state.dc;
+            let mut io = MappedPowerWellIo {
+                regs: &regs,
+                platform: state.platform,
+                dc: Some(dc),
+                dmc_payload_loaded: true,
+            };
+            state
+                .power_domains
+                .get(map, PowerDomain::DcOff, &mut io)
+                .unwrap();
+        }
+        assert_eq!(regs.read(regs::DC_STATE_EN).unwrap() & DC_STATE_MASK, 0);
+
+        // A non-final put only decrements counts. The final release restores
+        // the selected target and preserves status / hardware-owned bits.
+        {
+            let dc = &mut state.dc;
+            let mut io = MappedPowerWellIo {
+                regs: &regs,
+                platform: state.platform,
+                dc: Some(dc),
+                dmc_payload_loaded: true,
+            };
+            state
+                .power_domains
+                .get(map, PowerDomain::DcOff, &mut io)
+                .unwrap();
+        }
+        let hardware_bits = (1 << 9) | (1 << 8) | (1 << 4) | (1 << 29);
+        regs.set(regs::DC_STATE_EN, hardware_bits);
+        {
+            let dc = &mut state.dc;
+            let mut io = MappedPowerWellIo {
+                regs: &regs,
+                platform: state.platform,
+                dc: Some(dc),
+                dmc_payload_loaded: true,
+            };
+            state
+                .power_domains
+                .put(map, PowerDomain::DcOff, &mut io)
+                .unwrap();
+            assert_eq!(state.power_domains.domain_use_count(PowerDomain::DcOff), 1);
+            state
+                .power_domains
+                .put(map, PowerDomain::DcOff, &mut io)
+                .unwrap();
+        }
+        assert_eq!(state.power_domains.domain_use_count(PowerDomain::DcOff), 0);
+        let final_value = regs.read(regs::DC_STATE_EN).unwrap();
+        assert_eq!(final_value & DC_STATE_MASK, dc6);
+        assert_eq!(final_value & hardware_bits, hardware_bits);
+    }
+
+    #[test]
+    fn native_dc_entry_requires_successful_mmio_and_dmc_is_fail_closed() {
+        let regs = powered_machine();
+        let mut state = bring_up(&regs).unwrap();
+        assert!(!state.enter_dc_states(&regs).unwrap());
+        assert_eq!(regs.read(regs::DC_STATE_EN).unwrap() & DC_STATE_MASK, 0);
+
+        // The software target is retained for later retry while firmware is
+        // absent, but must not be enabled prematurely.
+        assert!(!state.set_target_dc_state(&regs, DC_STATE_DISABLE).unwrap());
+        assert!(
+            !state
+                .set_target_dc_state(&regs, intel_display::dc_state::DC_STATE_EN_UPTO_DC6)
+                .unwrap()
+        );
+        assert_eq!(
+            state.dc.target_dc_state,
+            intel_display::dc_state::DC_STATE_EN_UPTO_DC6
+        );
+        assert_eq!(regs.read(regs::DC_STATE_EN).unwrap() & DC_STATE_MASK, 0);
+
+        regs.refuse(regs::DC_STATE_EN);
+        assert!(matches!(
+            state.exit_dc_states(&regs),
+            Err(PowerError::WriteRefused { .. })
+        ));
+    }
+
+    #[test]
+    fn type_c_aux_domains_map_source_wells_and_clear_tbt_mode_before_request() {
+        let regs = powered_machine();
+        let mut state = bring_up(&regs).unwrap();
+
+        state.get_domain(&regs, PowerDomain::AuxUsbc1).unwrap();
+        assert_eq!(
+            state.power_domains.domain_use_count(PowerDomain::AuxUsbc1),
+            1
+        );
+        assert_eq!(
+            regs.read(regs::aux::DP_AUX_CH_CTL_D).unwrap() & (1 << 11),
+            0,
+            "legacy TC AUX must clear TBT_IO before the source well request"
+        );
+        assert_ne!(
+            regs.read(regs::ICL_PWR_WELL_CTL_AUX2).unwrap() & AUX_TC1.state_mask(),
+            0
+        );
+
+        state.put_domain(&regs, PowerDomain::AuxUsbc1).unwrap();
+        assert_eq!(
+            state.power_domains.domain_use_count(PowerDomain::AuxUsbc1),
+            0
+        );
+    }
+
+    #[test]
+    fn a_well_state_timeout_leaves_hsw_request_bit_for_domain_owner_cleanup() {
         let regs = powered_machine();
         regs.derive(regs::HSW_PWR_WELL_CTL2, |written| {
             written & !PW_1.state_mask()
         });
-        let error = enable_well(&regs, PW_1).unwrap_err();
-        match error {
-            PowerError::WellStateNeverSet { rolled_back, .. } => assert!(rolled_back),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let observation = enable_well(&regs, PW_1, DmcPlatform::AlderLakeN).unwrap();
+        assert!(!observation.state_set);
         assert_eq!(
             regs.read(regs::HSW_PWR_WELL_CTL2).unwrap() & PW_1.request_mask(),
-            0,
-            "the request bit must be gone"
-        );
-        assert!(
-            error.describe().contains("withdrawn"),
-            "{}",
-            error.describe()
+            PW_1.request_mask(),
+            "i915 leaves the request to the power-domain refcount owner"
         );
 
         // A request bit that was already set is not this call's to withdraw.
@@ -1886,11 +3044,8 @@ mod tests {
         regs.derive(regs::HSW_PWR_WELL_CTL2, |written| {
             written & !PW_1.state_mask()
         });
-        let error = enable_well(&regs, PW_1).unwrap_err();
-        match error {
-            PowerError::WellStateNeverSet { rolled_back, .. } => assert!(!rolled_back),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let observation = enable_well(&regs, PW_1, DmcPlatform::AlderLakeN).unwrap();
+        assert!(!observation.state_set);
         assert_eq!(
             regs.read(regs::HSW_PWR_WELL_CTL2).unwrap() & PW_1.request_mask(),
             PW_1.request_mask(),

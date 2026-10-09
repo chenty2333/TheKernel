@@ -521,3 +521,75 @@ references.
    can be made to program one. That is what §2.5 needs and nothing else will supply it.
 
 None of these has been done.
+
+## 7. ICL/TGL PLL-manager arithmetic port (2026-10-08)
+
+`tk-intel-display/src/dpll_mgr.rs` now includes the source table/search paths
+`icl_wrpll_get_multipliers()`, `icl_wrpll_params_populate()`,
+`icl_wrpll_ref_clock()`, `icl_calc_wrpll()`, `icl_calc_dp_combo_pll()`,
+`icl_calc_tbt_pll()`, `icl_calc_dpll_state()` and
+`icl_ddi_combo_pll_get_freq()` from Linux 7.2.3
+`drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT, Copyright © 2006-2016
+Intel). The register encodings follow `intel_display_regs.h` (MIT, Copyright
+© 2006-2018 Intel), and the full license is already in the crate's
+`LICENSE-MIT`.
+
+The DKL Type-C calculation now accepts `MgPllOutput::{DisplayPort,Hdmi}` and
+translates `icl_mg_pll_find_divisors()`/`icl_calc_mg_pll_state()` for the DKL
+branch. DP forces the 8.1-GHz DCO; HDMI uses the `[7992,10000] MHz` DCO
+window. Both retain the source loop order and calculate `CORECLKCTL1`,
+`HSCLKCTL`, fractional feedback divider, IREF trim, TDC target and feed-forward
+gain. Six DKL tests pass, including 162/540-MHz DP and 1080p60 HDMI.
+
+The fixed DP/TBT tables, source candidate ordering, DCO window and midpoint,
+38.4→19.2 reference division, Gen11/12 CFGCR selector, and display-12
+38.4-MHz fraction workaround have host tests. Manager source translation is
+complete, but atomic modeset integration, active-port mux updates, MG PHY
+DP/TBT register writes, clock routing/reference-clock updates, sanitization,
+and full display-12/13 `intel_dpll.c` state ownership remain incomplete.
+`kernel/src/drm/intel/pll.rs` now adds the combo DPLL0/1 power-state, CFGCR,
+enable/lock and disable/power-off sequences from `combo_pll_enable()` and
+`combo_pll_disable()`. Their timeout outcomes match i915's warn-and-continue
+policy. It also adds the TBT PLL's CFGCR0/1 register declarations and
+power/enable/disable sequence from `icl_tbt_pll_enable()`/
+`icl_tbt_pll_disable()`. The combo/TBT enable adapters are still not called by
+modeset; the generic manager's selected TC1/TC2 read-only `get_hw_state`
+dispatcher plus source `icl_compare_hw_state` comparison are called by
+fastboot admission and around the restricted TC transaction.
+`tk-intel-display/src/dpll.rs` additionally translates the generic CRTC
+dispatch guards, stale-state clear, ±1 kHz clock-match helper, platform hook
+selection, and HSW+ DSI/PCH adjusted-dotclock path from Linux 7.2.3
+`intel_dpll.c` (MIT, Copyright © 2020 Intel). Display-12/13 are pinned to the
+HSW shared-DPLL callback family; these functions have no kernel atomic-state
+call site yet.
+
+The kernel adapter also exposes DKL/MG TC PLL enable/disable. It serializes the
+shared HIP selector, bounds raw MMIO to the fixed DKL apertures, routes only
+known TC1/TC2 enable offsets for TGL and ADL-P/N, and composes the previously
+translated `dkl_pll_write()` sequence with power/lock polling. Its API requires
+the caller to hold the corresponding display/PHY power references. The Native
+TC HDMI transaction now uses the source manager to reserve/swap the selected
+TC1/2 state and to disable/program/enable the DKL PLL inside the outer
+before-image transaction. Direct DKL writes remain only for rollback and the
+test-only probe path. Peer-port/all-PLL readout, other Type-C modes, and the
+generic HSW atomic commit sequence remain unconnected. Kernel tests compile but
+their host test binary is not linkable due the known bare-metal relocation.
+
+The same module additionally carries the display-12/13 candidate-mask and
+shared-resource policy from `icl_get_combo_phy_dpll()`,
+`icl_tc_port_to_pll_id()`, `icl_update_active_dpll()`, and the generic
+`intel_find_dpll()`/reference/unreference edge. `SharedDpllPool` is a small
+host-testable owner for the shared-state comparison and pipe references. The
+kernel `SharedDpllState` now keeps the active selected TC reservation across
+Native mode changes, but it is deliberately scoped to the current single
+Pipe-A route rather than a general multi-CRTC atomic allocator.
+
+`icl_dpll_descriptors()` adds the i915 per-platform DPLL inventories in source
+order for TGL, RKL, DG1, ADL-S, ADL-P/N and EHL/JSL. The shared numeric IDs are
+platform scoped (for example ID 2 is TBT on TGL/ADL-P and DPLL4 on RKL), so the
+descriptor's kind and platform are required when resolving an ID; it is not a
+global enum.
+The default N305 combo-PHY output plan now uses the source-translated
+`icl_calc_wrpll()` and `icl_calc_dpll_state()` values for the CFGCR writes;
+`DdiPllDividers` remains the diagnostic/readback report. The alternate
+Skylake-style encoding remains only for the explicit comparison test.

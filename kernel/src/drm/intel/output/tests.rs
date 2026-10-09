@@ -48,10 +48,9 @@ const STRAP_38_4: u32 = 38_400;
 
 /// Buffer-translation values that are *not* sourced from anything.
 ///
-/// The reference does not contain the HDMI table (§8.5 `[GAP]`, §13.1 item 12),
-/// which is why `swing` is a caller field at all.  These numbers exist to give
-/// the sequence something to write so that its order can be asserted; the
-/// `source` string says so, and the log carries it.
+/// A full-dword fixture used to test firmware-dump override/replay semantics.
+/// Distinct per-lane values let the tests distinguish lane writes from group
+/// writes; the values are not a hardware profile.
 ///
 /// `dw2` and `dw7` differ lane by lane on purpose.  The sequence writes them to
 /// four different addresses, and a test whose four values were equal could not
@@ -60,10 +59,14 @@ fn test_swing() -> SwingProgram {
     SwingProgram {
         level: 2,
         dw2: [0x0C, 0x1C, 0x2C, 0x3C],
+        dw2_mask: u32::MAX,
         dw4: [0x30, 0x31, 0x31, 0x31],
+        dw4_mask: u32::MAX,
         dw5_training_disabled: 0x0000_0000,
+        dw5_mask: u32::MAX,
         dw5_training_enabled: 0x0002_0000,
         dw7: [0x71, 0x72, 0x73, 0x74],
+        dw7_mask: u32::MAX,
         source: "test fixture, not sourced from the reference",
     }
 }
@@ -120,6 +123,38 @@ fn ready_mock_for(phy: ComboPhy) -> MockRegisters {
 /// The PHY A mock: DPLL0, `DDI_BUF_CTL(A)` and the DDI-IO A well.
 fn ready_mock() -> MockRegisters {
     ready_mock_for(ComboPhy::A)
+}
+
+#[test]
+fn transcoder_disable_clears_request_and_waits_for_status() {
+    let regs = MockRegisters::new();
+    let pipeconf = super::pipe::PIPECONF_B;
+    regs.set(pipeconf, (1 << 31) | (1 << 30) | 0x1234);
+    regs.derive(pipeconf, |value| value & !(1 << 30));
+
+    super::disable_transcoder(&regs, super::super::pipe::Pipe::B)
+        .expect("transcoder state should clear after disable request");
+
+    assert_eq!(
+        regs.writes(),
+        alloc::vec![("PIPECONF_B", (1 << 30) | 0x1234)]
+    );
+}
+
+#[test]
+fn transcoder_disable_reports_stuck_status() {
+    let regs = MockRegisters::new();
+    let pipeconf = super::pipe::PIPECONF_C;
+    regs.set(pipeconf, (1 << 31) | (1 << 30));
+
+    assert!(matches!(
+        super::disable_transcoder(&regs, super::super::pipe::Pipe::C),
+        Err(OutputError::TranscoderDidNotDisable {
+            register: "PIPECONF_C",
+            readback,
+            timeout_us: 3_000,
+        }) if readback & (1 << 30) != 0
+    ));
 }
 
 // -- the computed values ----------------------------------------------------
@@ -199,8 +234,8 @@ fn the_transcoder_and_ddi_values_are_the_reference_encodings() {
     let plan = target_plan();
     assert_eq!(plan.trans_clk_sel, 0x1000_0000, "TRANS_CLK_SEL(A)");
     assert_eq!(
-        plan.trans_ddi_func_ctl, 0x8803_0006,
-        "ENABLE | SELECT_PORT(A) | HDMI | 8bpc | both syncs | four lanes"
+        plan.trans_ddi_func_ctl, 0x8803_0000,
+        "source helper: ENABLE | SELECT_PORT(A) | HDMI | 8bpc | both syncs"
     );
     assert_eq!(
         plan.transconf, 0x8000_0000,
@@ -394,6 +429,7 @@ fn the_write_order_enables_hdmi_encoder_before_cpu_transcoder() {
             "PORT_CL_DW10(A)",
             // 5.4, 5.5, 5.6, 5.7.
             "TRANS_CLK_SEL(A)",
+            "TRANS_DDI_FUNC_CTL2(A)",
             "TRANS_DDI_FUNC_CTL(A)",
             "DDI_BUF_CTL(A)",
             "PIPECONF_A",
@@ -455,10 +491,13 @@ fn the_clock_select_and_the_clock_off_clear_are_separate_writes() {
         .collect();
     assert_eq!(
         writes[0],
-        plan.dpclka_select | (1 << 10),
+        plan.ddi_clock_plan.selector_value | (1 << 10),
         "select, gate still set"
     );
-    assert_eq!(writes[1], plan.dpclka_select, "gate cleared, select kept");
+    assert_eq!(
+        writes[1], plan.ddi_clock_plan.selector_value,
+        "gate cleared, select kept"
+    );
 }
 
 /// The DDI-IO well is enabled through `power.rs`'s handshake: the request bit
@@ -525,9 +564,9 @@ fn the_swing_writes_reach_the_per_lane_registers_in_lane_order() {
             ("PORT_TX_DW2_LN2(A)", swing.dw2[2]),
             ("PORT_TX_DW2_LN3(A)", swing.dw2[3]),
             ("PORT_TX_DW4_LN0(A)", swing.dw4[0]),
-            ("PORT_TX_DW4_LN1(A)", swing.dw4[1]),
-            ("PORT_TX_DW4_LN2(A)", swing.dw4[2]),
-            ("PORT_TX_DW4_LN3(A)", swing.dw4[3]),
+            ("PORT_TX_DW4_LN1(A)", swing.dw4[1] | (1 << 31)),
+            ("PORT_TX_DW4_LN2(A)", swing.dw4[2] | (1 << 31)),
+            ("PORT_TX_DW4_LN3(A)", swing.dw4[3] | (1 << 31)),
             ("PORT_TX_DW7_LN0(A)", swing.dw7[0]),
             ("PORT_TX_DW7_LN1(A)", swing.dw7[1]),
             ("PORT_TX_DW7_LN2(A)", swing.dw7[2]),
@@ -567,7 +606,8 @@ fn a_lane_write_is_not_visible_at_another_lanes_address() {
     for (register, value) in lanes.dw2.iter().zip(swing.dw2) {
         assert_eq!(regs.read(*register), Some(value), "{}", register.name());
     }
-    for (register, value) in lanes.dw4.iter().zip(swing.dw4) {
+    for (lane, (register, value)) in lanes.dw4.iter().zip(swing.dw4).enumerate() {
+        let value = value | if lane == 0 { 0 } else { 1 << 31 }; // LOADGEN_SELECT
         assert_eq!(regs.read(*register), Some(value), "{}", register.name());
     }
     for (register, value) in lanes.dw7.iter().zip(swing.dw7) {
@@ -940,6 +980,7 @@ fn the_phy_b_write_order_is_the_sequence_with_b_registers() {
             // 5.4, 5.5, 5.6, 5.7: the transcoder is A's, the DDI inside the
             // values is B's, and the buffer is B's.
             "TRANS_CLK_SEL(A)",
+            "TRANS_DDI_FUNC_CTL2(A)",
             "TRANS_DDI_FUNC_CTL(A)",
             "DDI_BUF_CTL(B)",
             "PIPECONF_A",
@@ -1091,14 +1132,25 @@ fn the_dpll1_lock_poll_retries() {
 fn the_clock_select_field_carries_the_pll_id_for_each_phy() {
     let a = target_plan();
     let b = OutputProgram::plan(&hdmi_request(Ddi::B), STRAP_38_4).unwrap();
-    assert_eq!(a.dpclka_select, 0, "PHY A selects DPLL0, whose id is 0");
     assert_eq!(
-        b.dpclka_select,
+        a.ddi_clock_plan.selector_value, 0,
+        "PHY A selects DPLL0, whose id is 0"
+    );
+    assert_eq!(
+        b.ddi_clock_plan.selector_value,
         1 << 2,
         "PHY B selects DPLL1, id 1, at phy*2"
     );
-    assert_eq!(a.dpclka_clock_off, 1 << 10, "DDI A's clock-off bit");
-    assert_eq!(b.dpclka_clock_off, 1 << 11, "DDI B's clock-off bit");
+    assert_eq!(
+        a.ddi_clock_plan.clock_off_mask,
+        1 << 10,
+        "DDI A's clock-off bit"
+    );
+    assert_eq!(
+        b.ddi_clock_plan.clock_off_mask,
+        1 << 11,
+        "DDI B's clock-off bit"
+    );
 
     // On the wire, with the other PHY's field and the gate bit as firmware
     // could have left them.
@@ -1135,12 +1187,13 @@ fn is_idle_never_clearing_is_a_named_error_naming_the_ddi() {
             register,
             readback,
             wrote,
-            ..
+            timeout_us,
         } => {
             assert_eq!(*ddi, Ddi::A);
             assert_eq!(*register, "DDI_BUF_CTL(A)");
             assert_ne!(*readback & DDI_BUF_CTL_IS_IDLE, 0);
             assert_eq!(*wrote, 0x8200_0016);
+            assert_eq!(*timeout_us, 10_000, "display-13 source wait is 10 ms");
         }
         other => panic!("wrong error: {other:?}"),
     }
@@ -1320,29 +1373,23 @@ fn a_phy_without_its_pll_config_offsets_would_still_be_refused_by_name() {
     }
 }
 
-/// §8.5's HDMI translation values are a `[GAP]`, and the honest implementation
-/// is the one that says so before it writes anything.
+/// The ADL-N HDMI default is selected from the platform table before writes.
 #[test]
-fn the_hdmi_translation_values_are_a_named_gap_and_nothing_is_written() {
+fn hdmi_default_uses_adln_combo_translation_entry_six() {
     let regs = ready_mock();
-    let request = OutputRequest::hdmi(Ddi::A, target_mode(), PllFieldEncoding::Named);
-    let error = OutputProgram::plan(&request, STRAP_38_4).expect_err("no values to write");
-    match error {
-        OutputError::MissingBufferTranslation { port_type, table } => {
-            assert_eq!(port_type, PortType::Hdmi);
-            assert_eq!(table, Some("icl_combo_phy_trans_hdmi"));
-        }
-        other => panic!("wrong error: {other:?}"),
-    }
-    let text = error.describe();
-    for needle in ["[GAP]", "13.1 item 12", "icl_combo_phy_trans_hdmi", "13.4"] {
-        assert!(text.contains(needle), "{needle:?} missing from: {text}");
-    }
+    let plan = OutputProgram::plan(
+        &OutputRequest::hdmi(Ddi::A, target_mode(), PllFieldEncoding::Named),
+        STRAP_38_4,
+    )
+    .expect("ADL-N has an HDMI translation table");
+    assert_eq!(plan.swing.level, 6);
+    assert_eq!(plan.swing.source, "icl_combo_phy_trans_hdmi");
+    assert_eq!(plan.swing.dw2_mask, (1 << 15) | (0b111 << 11) | 0xff);
+    assert_eq!(plan.swing.dw4_mask & (1 << 31), 1 << 31);
+    assert_eq!(plan.swing.dw7[0] >> 24, 0x7f);
     assert!(regs.writes().is_empty());
 }
 
-/// A pixel clock at or above the HDMI scrambling threshold is refused rather
-/// than programmed half-way: the sink-side SCDC enable does not exist here.
 #[test]
 fn a_mode_that_needs_hdmi_scrambling_is_refused() {
     let mut mode = target_mode();
@@ -1428,30 +1475,23 @@ fn the_platform_reference_comes_from_skl_dssm_and_an_undefined_field_is_an_error
     assert_eq!(read_platform_reference_khz(&regs).unwrap(), 24_000);
 }
 
-/// A DBUF state of "no well" style failure: the DDI-IO well that never comes
-/// up leaves the request bit withdrawn, which is `power.rs`'s rollback
-/// observed through this sequence.
+/// i915 warns and continues if the DDI-IO state bit never acknowledges the
+/// request; the domain refcount owner keeps the request until its later put.
 #[test]
-fn a_ddi_io_well_that_never_comes_up_leaves_no_request_bit_set() {
+fn a_ddi_io_well_timeout_is_reported_and_keeps_the_request() {
     let regs = MockRegisters::new();
     // Make the PLL behave so the failure is the well's and nothing earlier.
     regs.derive(dpll::DPLL0_ENABLE, |value| {
         value | PLL_POWER_STATE | if value & PLL_ENABLE != 0 { PLL_LOCK } else { 0 }
     });
-    let error = program(&regs, &target_plan()).expect_err("the well never reports state");
-    match &error {
-        OutputError::Well(PowerError::WellStateNeverSet {
-            well, rolled_back, ..
-        }) => {
-            assert_eq!(*well, "DDI_IO_A");
-            assert!(*rolled_back, "the request this call added was withdrawn");
-        }
-        other => panic!("wrong error: {other:?}"),
-    }
+    let state =
+        program(&regs, &target_plan()).expect("i915 continues after the timed-out handshake");
+    assert_eq!(state.ddi_io_well.name, "DDI_IO_A");
+    assert!(!state.ddi_io_well.state_set);
     assert_eq!(
         regs.read(regs::ICL_PWR_WELL_CTL_DDI2),
-        Some(0),
-        "the request bit must not be left set"
+        Some(power::well_request(0)),
+        "the request remains owned by the domain refcount until put"
     );
 }
 
@@ -1774,10 +1814,10 @@ fn pll_rs_search_is_measured_against_the_documented_adl_n_search() {
     ));
 }
 
-/// DVI is the same sequence with a different mode select, and the reference
-/// names no translation table for it -- which the refusal has to say.
+/// DVI is the same sequence with a different mode select, and i915 drives DVI
+/// TMDS through the same combo-PHY HDMI translation table.
 #[test]
-fn dvi_differs_from_hdmi_only_in_the_mode_select_and_has_no_named_table() {
+fn dvi_differs_from_hdmi_only_in_the_mode_select_and_shares_the_hdmi_table() {
     let mut dvi = hdmi_request(Ddi::A);
     dvi.port_type = PortType::Dvi;
     let dvi_plan = OutputProgram::plan(&dvi, STRAP_38_4).unwrap();
@@ -1799,18 +1839,9 @@ fn dvi_differs_from_hdmi_only_in_the_mode_select_and_has_no_named_table() {
     assert_eq!(dvi_plan.trans_clk_sel, hdmi_plan.trans_clk_sel);
     assert_eq!(dvi_plan.transconf, hdmi_plan.transconf);
 
-    dvi.swing = None;
-    let error = OutputProgram::plan(&dvi, STRAP_38_4).unwrap_err();
-    match error {
-        OutputError::MissingBufferTranslation { port_type, table } => {
-            assert_eq!(port_type, PortType::Dvi);
-            assert_eq!(table, None);
-        }
-        other => panic!("wrong error: {other:?}"),
-    }
-    assert!(
-        error
-            .describe()
-            .contains("names one for HDMI and none for DVI")
-    );
+    let mut table_dvi = OutputRequest::hdmi(Ddi::A, target_mode(), PllFieldEncoding::Named);
+    table_dvi.port_type = PortType::Dvi;
+    let table_plan = OutputProgram::plan(&table_dvi, STRAP_38_4).unwrap();
+    assert_eq!(table_plan.swing.source, "icl_combo_phy_trans_hdmi");
+    assert_eq!(table_plan.swing.level, 6);
 }

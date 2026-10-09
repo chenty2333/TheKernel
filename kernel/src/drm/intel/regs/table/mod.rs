@@ -47,6 +47,7 @@ pub(crate) const DDI: &[Register] = &[
     ddi::TRANS_CLK_SEL_C,
     ddi::TRANS_CLK_SEL_D,
     ddi::TRANS_DDI_FUNC_CTL_A,
+    ddi::TRANS_DDI_FUNC_CTL2_A,
     ddi::TRANS_DDI_FUNC_CTL_B,
     ddi::TRANS_DDI_FUNC_CTL_C,
     ddi::TRANS_DDI_FUNC_CTL_D,
@@ -102,6 +103,9 @@ pub(crate) const DPLL: &[Register] = &[
     dpll::DPLL1_CFGCR1,
     dpll::DPLL0_ENABLE,
     dpll::DPLL1_ENABLE,
+    dpll::TBT_PLL_ENABLE,
+    dpll::TBT_PLL_CFGCR0,
+    dpll::TBT_PLL_CFGCR1,
     dpll::ICL_DPCLKA_CFGCR0,
 ];
 
@@ -267,13 +271,7 @@ pub(crate) const PORT: &[Register] = &[
 ];
 
 /// Every table above, for a test that has to walk all of them.
-pub(crate) const ALL: &[&[Register]] = &[
-    DDI,
-    DPLL,
-    INTERRUPT,
-    PIPE,
-    PORT,
-];
+pub(crate) const ALL: &[&[Register]] = &[DDI, DPLL, INTERRUPT, PIPE, PORT];
 
 #[cfg(test)]
 mod tests;

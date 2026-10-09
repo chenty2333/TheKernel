@@ -21,7 +21,8 @@ there.
 |---|---|
 | `kernel/src/drm/intel/power.rs` | `bring_up`, the well handshake, DC states, DBUF slices, the platform workarounds, and the bring-up log |
 | `kernel/src/drm/intel/clk.rs` | `SKL_DSSM` reference decode, the ADL-N CDCLK ratio table, the CD2X divider and decimal arithmetic, the CDCLK PLL, `PCH_RAWCLK_FREQ` |
-| `kernel/src/drm/intel/phy.rs` | combo PHY initialisation, the process/voltage reference table, the verification pass |
+| `kernel/src/drm/intel/combo_phy_full.rs` | source-shaped `intel_combo_phy.c` initialization/uninitialization, VBT mux policy and lane power-up |
+| `kernel/src/drm/intel/phy.rs` | N305 process/voltage report and post-init verification readout |
 | `kernel/src/drm/intel/regs.rs` | the registers themselves, the `Registers` trait, the bounded poll, and the host mock |
 
 `power::bring_up` is the single entry point.  It is **not wired into the boot
@@ -41,7 +42,7 @@ names the function that performs it and the register it touches.
 |---|---|---|---|
 | 0.3 | fuse and strap readback | `power::read_fuses` | `SKL_DFSM` `0x51000`, `SFUSE_STRAP` `0xC2014`, `SKL_DSSM` `0x51004`, `SKL_FUSE_STATUS` `0x42000` |
 | 1.1 | DC states off | `power::disable_dc_states` | `DC_STATE_EN` `0x45504` |
-| 1.2 | combo PHY init, PHY A first | `phy::init_all` | PHY A `0x162000`, PHY B `0x06C000`, `ICL_PHY_MISC` `0x64C00`/`0x64C04` |
+| 1.2 | combo PHY init, PHY A first | `combo_phy_full::intel_combo_phy_init`, then `phy::init_all` verification/report | PHY A `0x162000`, PHY B `0x06C000`, `ICL_PHY_MISC` `0x64C00`/`0x64C04` |
 | 1.3 | `PW_1` | `power::enable_well(PW_1)` | `GEN8_CHICKEN_DCPR_1` `0x46430`, `HSW_PWR_WELL_CTL2` `0x45404`, `SKL_FUSE_STATUS` |
 | 1.2b | PHY `COMP_INIT` re-read | `power::bring_up` | `PORT_COMP_DW0(A/B)` |
 | 1.4 | CDCLK | `clk::bring_up` | `SKL_DSSM`, `CDCLK_PLL_ENABLE` `0x46070`, `CDCLK_CTL` `0x46000` |
@@ -85,6 +86,12 @@ everywhere, and have nothing in the log to say why.  The table in `power.rs` is
 `XE_LPD`'s (`[I915]` `i915_reg.h:3650-3660`,
 `display/intel_display_power_map.c:1325-1410`), and a test pins it against
 Tiger Lake's shape.
+
+`tk-intel-display::power_domains` mirrors i915's synchronous per-domain and
+per-well reference edges (`get`, `put`, `get_if_enabled`, and hardware state
+query). The opt-in ADL-N core bring-up consumes its Pipe-A/PW_A path after
+PW_1, DBUF and clock initialization; all DDI/AUX operation groups, async puts,
+and the full modeset-driven domain-set lifecycle remain to be connected.
 
 ## 3. Decisions a reviewer should check
 
@@ -197,18 +204,31 @@ that suggestion as `[INF]`.  This driver takes the `[INF]`: an error that is
 masked is an error nobody sees.  The register is *read*, so the log says what
 state it was left in rather than implying the question was never asked.
 
-### 3.8 The PCode handshake is not implemented
+### 3.8 PCode is connected for initial CDCLK setup, not runtime transitions
 
-`[I915]` `bxt_set_cdclk` opens with
-`skl_pcode_request(SKL_PCODE_CDCLK_CONTROL, SKL_CDCLK_PREPARE_FOR_CHANGE, ...)`
-and closes by writing the voltage level.  This kernel has no PCode mailbox, so
-neither happens.  The programming path used instead is the short one §11 phase
-1.4 gives for a machine with no pipe running, and it is only reached when the
-firmware left no usable CDCLK — which on a machine whose firmware drove the
-screen should not happen.  Related: CDCLK *crawl* (`has_cdclk_crawl` is set for
-`XE_LPD`) is unreachable by construction, because `bxt_de_pll_readout` reports a
-VCO of zero unless the PLL is enabled *and* locked, so every state that reaches
-the programming path is one i915 also treats as a disable/enable.
+The full MIT PCode mailbox translation is in
+`crates/ax/tk-intel-display/src/intel_pcode_full.rs`, with the N305 register,
+serialization and polling adapter in `kernel/src/drm/intel/pcode.rs`. When
+`clk::observe()` finds no usable firmware CDCLK, phase 1.4 now sends i915's
+`SKL_PCODE_CDCLK_CONTROL / SKL_CDCLK_PREPARE_FOR_CHANGE` request before writing
+the PLL and writes the voltage level only after PLL readback succeeds. Either
+mailbox failure stops bring-up and unwinds the PW_1 request owned by that call.
+The ICL voltage thresholds are 0 through 312 MHz, 1 through 556.8 MHz, and 2
+above that, as in `icl_calc_voltage_level()`; the ADL-N voltage association is
+source-derived but not confirmed by a public PRM.
+
+The same adapter also reads the two GEN9 display-memory-latency dwords used by
+the source watermark setup. The opcode is fixed; the 0/1 slot selector is sent
+in the PCode data register, matching `skl_read_wm_latency()`'s call contract.
+An adapter-model regression test records both request data values; `cargo
+check --tests` compiles it, while host execution is blocked by bare-metal
+per-CPU `R_X86_64_32S` relocations.
+
+This does not wire runtime `clk::transition()` into atomic modeset: that path
+still needs PREPARE/post-voltage calls, modeset-lock ordering, vblank/audio/PSR
+quiescing and GMBUS/AUX locking. `cdclk::transition` remains unused by a kernel
+caller. Initial firmware-CDCLK keep needs no PCode transaction. CDCLK *crawl*
+remains unconnected for the same runtime sequencing reason.
 
 ### 3.9 Two steps of `icl_display_core_init` are not ported
 
@@ -240,9 +260,9 @@ Each is marked in the code where it is used.
    and printed, and the flag is asserted in a test.
 4. **The ADL-N raw clock frequency** (§4.8, §13.1 item 5).  Bridged as §3.6
    above.
-5. **The ADL-N CDCLK voltage-level table** (§4.6, §13.1 item 6).  Bridged by
-   not computing one: no PCode write happens, so no voltage level is needed.
-   If a PCode mailbox is added, this is the missing piece.
+5. **The ADL-N CDCLK voltage-level table** (§4.6, §13.1 item 6).  Initial
+   programming uses source-derived ICL thresholds and reports the selected
+   level to PCode. The association remains unverified against a PRM.
 6. **Which DBUF slices a given SKU populates** (§4.7, §13.1 item 3).  Bridged by
    reading each slice's state before requesting it, enabling all four from
    `XE_LPD`'s slice mask, and treating a partial result as a report rather than
@@ -414,3 +434,43 @@ device the target has.
 | `regs::a_combo_phys_registers_are_at_the_documented_sub_block_offsets` | §5.1's correction, recomputed from the rule |
 | `regs::the_writable_registers_are_exactly_the_ones_the_bring_up_programs` | a frozen write set |
 | `regs::every_bring_up_register_is_inside_a_window_that_needs_no_forcewake` | the band and window invariants |
+
+## 8. Remaining task-2 power gaps (2026-10-08)
+
+The following i915 paths are still not translated or are deliberately rejected;
+the earlier description of power-domain helpers does not imply these are
+complete:
+
+* **Power-well lifecycle:** the generic domain/well reference counters, the
+  synchronous get/put path and the ADL-N Pipe-A/PW_A core path exist. The full
+  platform power-map consumer is not wired into all connector, AUX, pipe, PLL,
+  and TC state transitions. The source TGL Type-C AUX1/AUX2 and DDI_IO TC1/2
+  wells are mapped; AUX D/E control power bits are cleared before AUX requests.
+  `DpAuxKernel` acquires the matching DDI lane reference before the AUX well,
+  but the native TC DPCD/link path does not call it yet. Async puts are only modeled in the reusable
+  domain core; the kernel workqueue/runtime-PM cancellation and flush lifecycle
+  is not connected. Thus no claim is made that disabling a modeset returns all
+  wells or reproduces every i915 delayed-put edge.
+* **IRQ-coupled wells:** descriptors carry `irq_pipe_mask`, and the translated
+  HSW well helper calls `post_enable`/`pre_disable`. The N305 MSI owner only
+  provisions Pipe-A vblank at installation; its well callbacks still refuse a
+  live IRQ-coupled power transition rather than silently leaving a pipe IRQ
+  source enabled across a well edge. Per-pipe IRQ block reset/mask/ack and
+  parent-MSI synchronization for every mapped well remain unported.
+* **DC-state runtime:** the DC field mask/write retry and allowed/target
+  sanitizers are translated. Boot initialization writes DC-off. `gen9_set_dc_state`
+  exposes the PSR notification and DC6 allowed-count hooks; the boot observer
+  intentionally does nothing because i915's DC6 count update is a no-op before
+  display version 14, and PSR work is not ported. No runtime DC5/DC6/DC9
+  target transition or DMC handshake is wired. A DC-off-well transition helper
+  exists in the display crate, but the kernel has not provided the DMC-backed
+  DC-off well implementation needed to use it.
+* **DMC:** platform selection, parsing, fixups, rootfs-ready request and the
+  guarded MMIO upload path exist in the opt-in N305 boot path. The source's
+  complete platform enable/disable lifecycle, event policy and coordination
+  with active DC states/PSR are not fully connected; unsupported transitions
+  remain refused.
+
+These are implementation gaps, not hardware-validation claims. The next
+workstream may use the translated boot sequence, but must not infer full
+modeset power lifecycle from its Pipe-A bring-up success.

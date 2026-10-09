@@ -164,6 +164,27 @@ pub trait DisplayAdapter: Send + Sync {
     fn supports_cursor(&self) -> bool {
         true
     }
+    /// Linear formats this adapter can actually scan out on its primary
+    /// plane. KMS must not advertise the DRM-core superset as hardware support.
+    fn primary_formats(&self) -> &'static [u32] {
+        &[
+            super::property::FORMAT_XRGB8888,
+            super::property::FORMAT_ARGB8888,
+        ]
+    }
+    /// Linear formats accepted by the native cursor plane, if present.
+    fn cursor_formats(&self) -> &'static [u32] {
+        &[super::property::FORMAT_ARGB8888]
+    }
+    /// CRTC LUT property sizes exposed to userspace. Display adapters with a
+    /// generation-specific degamma table must override the generic 256-entry
+    /// default instead of advertising a size their hardware cannot consume.
+    fn gamma_lut_size(&self) -> u32 {
+        256
+    }
+    fn degamma_lut_size(&self) -> u32 {
+        256
+    }
     fn pci_identity(&self) -> Option<axdriver_display::DisplayPciIdentity> {
         None
     }
@@ -178,10 +199,29 @@ pub trait DisplayAdapter: Send + Sync {
         allocation_owner: Arc<dyn Send + Sync>,
     ) -> DrmResult<Arc<dyn GemBacking>>;
     fn present(&self, scanout: Scanout) -> DrmResult<Arc<Fence>>;
+    /// Submit one committed primary-plane state transition. Native adapters
+    /// that need old/new CRTC or plane state can override this instead of
+    /// trying to reconstruct an atomic transition from the new scanout alone.
+    /// The default preserves the existing adapter contract: a visible target
+    /// is presented, while a no-scanout transition has no transport work.
+    fn commit_atomic_state(
+        &self,
+        _old: super::atomic::State,
+        _new: super::atomic::State,
+        scanout: Option<Scanout>,
+    ) -> DrmResult<Option<Arc<Fence>>> {
+        scanout.map(|scanout| self.present(scanout)).transpose()
+    }
     /// Hardware adapters reject unsupported state before the core admits a
     /// commit. A fixed firmware link cannot silently claim DPMS/color changes.
-    fn validate_atomic_state(&self, active: bool, dpms_on: bool, gamma_lut: bool) -> DrmResult<()> {
-        let _ = (active, dpms_on, gamma_lut);
+    fn validate_atomic_state(
+        &self,
+        active: bool,
+        dpms_on: bool,
+        gamma_lut: bool,
+        color_pipeline_changed: bool,
+    ) -> DrmResult<()> {
+        let _ = (active, dpms_on, gamma_lut, color_pipeline_changed);
         Ok(())
     }
     /// Native adapters report a hardware frame counter. `None` retains the
@@ -322,6 +362,9 @@ pub(crate) struct DeviceState {
     /// One software gamma LUT for the sole virtual CRTC, stored as RGB
     /// triplets in the legacy DRM 16-bit component representation.
     pub(crate) gamma_lut: Vec<u16>,
+    /// Atomic degamma LUT and S31.32 CTM retained with the CRTC properties.
+    pub(crate) degamma_lut: Vec<u16>,
+    pub(crate) ctm: [u64; 9],
     /// DRM property blobs are device objects, not per-file scratch records.
     /// `destroyed` only drops the creator's reference; queued and installed
     /// atomic state keeps the payload alive until it is no longer referenced.
@@ -427,6 +470,8 @@ impl DrmDevice {
             modes.push(fixed);
         }
         let connected = adapter.connector_connected();
+        let gamma_lut_size = adapter.gamma_lut_size();
+        let degamma_lut_size = adapter.degamma_lut_size();
         let edid = adapter
             .connector_edid()
             .unwrap_or_else(|| default_edid(preferred_mode));
@@ -440,6 +485,37 @@ impl DrmDevice {
         } else {
             0
         };
+        let mut property_blobs = BTreeMap::from([(
+            1,
+            PropertyBlob {
+                owner: None,
+                bytes: edid,
+                // The connector owns its immutable EDID for the lifetime of
+                // the device.
+                references: 1,
+                destroyed: true,
+            },
+        )]);
+        property_blobs.insert(
+            super::property::IN_FORMATS_PRIMARY_BLOB_ID,
+            PropertyBlob {
+                owner: None,
+                bytes: super::property::linear_in_formats_blob(adapter.primary_formats()),
+                references: 1,
+                destroyed: true,
+            },
+        );
+        if cursor_plane_id != 0 {
+            property_blobs.insert(
+                super::property::IN_FORMATS_CURSOR_BLOB_ID,
+                PropertyBlob {
+                    owner: None,
+                    bytes: super::property::linear_in_formats_blob(adapter.cursor_formats()),
+                    references: 1,
+                    destroyed: true,
+                },
+            );
+        }
         Arc::new(Self {
             adapter,
             fixed_mode,
@@ -465,30 +541,19 @@ impl DrmDevice {
                     primary_plane_id,
                     cursor_plane_id,
                     preferred_mode,
+                    gamma_lut_size,
+                    degamma_lut_size,
                     modes: if connected { modes.clone() } else { Vec::new() },
                 },
                 framebuffers: BTreeMap::new(),
                 next_framebuffer: 1,
                 vblank: 0,
                 hardware_vblank: None,
-                gamma_lut: (0..256)
-                    .flat_map(|index| {
-                        let value = (index * 257) as u16;
-                        [value, value, value]
-                    })
-                    .collect(),
-                next_property_blob: 2,
-                property_blobs: BTreeMap::from([(
-                    1,
-                    PropertyBlob {
-                        owner: None,
-                        bytes: edid,
-                        // The connector owns its immutable EDID for the
-                        // lifetime of the device.
-                        references: 1,
-                        destroyed: true,
-                    },
-                )]),
+                gamma_lut: identity_color_lut(gamma_lut_size),
+                degamma_lut: identity_color_lut(degamma_lut_size),
+                ctm: [1 << 32, 0, 0, 0, 1 << 32, 0, 0, 0, 1 << 32],
+                next_property_blob: if cursor_plane_id == 0 { 3 } else { 4 },
+                property_blobs,
                 atomic: super::atomic::initial(&KmsResources {
                     connector: super::kms::ConnectorInfo {
                         id: connector_id,
@@ -504,6 +569,8 @@ impl DrmDevice {
                     primary_plane_id,
                     cursor_plane_id,
                     preferred_mode,
+                    gamma_lut_size,
+                    degamma_lut_size,
                     modes: if connected { modes.clone() } else { Vec::new() },
                 }),
                 atomic_owner: None,
@@ -522,6 +589,8 @@ impl DrmDevice {
                     primary_plane_id,
                     cursor_plane_id,
                     preferred_mode,
+                    gamma_lut_size,
+                    degamma_lut_size,
                     modes: if connected { modes } else { Vec::new() },
                 }),
                 atomic_generation: 0,
@@ -911,7 +980,7 @@ impl DrmDevice {
         self.enqueue_atomic(job, generation)
     }
 
-    fn enqueue_atomic(self: &Arc<Self>, job: AtomicCommit, generation: u64) -> DrmResult<()> {
+    fn enqueue_atomic(self: &Arc<Self>, mut job: AtomicCommit, generation: u64) -> DrmResult<()> {
         self.ensure_vblank_worker()?;
         let mut state = self.state.lock();
         if state.kms_suspended {
@@ -938,6 +1007,10 @@ impl DrmDevice {
             job.discard_event();
             return Err(DrmError::QueueFull);
         }
+        // Bind the before-image to the same generation check as publication.
+        // Deriving it later from a newer atomic tail would describe a
+        // different transition than the queued target state.
+        job.old = state.atomic_tail;
         hold_state_blobs(&mut state, job.next)?;
         state.advance_atomic_generation()?;
         state.atomic_tail = job.next;
@@ -1098,10 +1171,8 @@ impl DrmDevice {
                 return Ok(false);
             }
         }
-        if let Some(scanout) = scanout
-            && job.present.is_none()
-        {
-            let present = match self.adapter.present(scanout) {
+        if job.present.is_none() {
+            let present = match self.adapter.commit_atomic_state(job.old, job.next, scanout) {
                 Ok(present) => present,
                 Err(error) => {
                     job.discard_event();
@@ -1109,18 +1180,20 @@ impl DrmDevice {
                     return Err(error);
                 }
             };
-            let target = match sequence.checked_add(1) {
-                Some(target) => target,
-                None => {
-                    job.discard_event();
-                    job.cancellation.end_delivery();
-                    return Err(DrmError::Overflow);
-                }
-            };
-            job.present = Some(present);
-            job.present_target = target;
-            job.cancellation.end_delivery();
-            return Ok(false);
+            if let Some(present) = present {
+                let target = match sequence.checked_add(1) {
+                    Some(target) => target,
+                    None => {
+                        job.discard_event();
+                        job.cancellation.end_delivery();
+                        return Err(DrmError::Overflow);
+                    }
+                };
+                job.present = Some(present);
+                job.present_target = target;
+                job.cancellation.end_delivery();
+                return Ok(false);
+            }
         }
         if let Some(present) = &job.present {
             if !present.is_signaled() {
@@ -1179,6 +1252,14 @@ impl DrmDevice {
         if previous.gamma_lut_blob != job.next.gamma_lut_blob {
             apply_gamma_lut(&mut state, job.next.gamma_lut_blob)
                 .expect("validated gamma LUT blob changed before publish");
+        }
+        if previous.degamma_lut_blob != job.next.degamma_lut_blob {
+            apply_degamma_lut(&mut state, job.next.degamma_lut_blob)
+                .expect("validated degamma LUT blob changed before publish");
+        }
+        if previous.ctm_blob != job.next.ctm_blob {
+            apply_ctm(&mut state, job.next.ctm_blob)
+                .expect("validated CTM blob changed before publish");
         }
         state.rebuild_atomic_tail();
         state.resources.crtc.mode = job.next.mode;
@@ -1700,6 +1781,20 @@ fn default_edid(mode: Mode) -> Vec<u8> {
     edid
 }
 
+fn identity_color_lut(size: u32) -> Vec<u16> {
+    let denominator = u64::from(size.saturating_sub(1)).max(1);
+    (0..size)
+        .flat_map(|index| {
+            let value = if size <= 1 {
+                0
+            } else {
+                (u64::from(index) * u64::from(u16::MAX) / denominator) as u16
+            };
+            [value, value, value]
+        })
+        .collect()
+}
+
 fn replace_connector_edid(state: &mut DeviceState) -> DrmResult<()> {
     let edid = default_edid(state.resources.preferred_mode);
     replace_connector_edid_bytes(state, edid)
@@ -1750,6 +1845,51 @@ fn apply_gamma_lut(state: &mut DeviceState, blob_id: u32) -> DrmResult<()> {
     Ok(())
 }
 
+fn apply_degamma_lut(state: &mut DeviceState, blob_id: u32) -> DrmResult<()> {
+    if blob_id == 0 {
+        for (index, triplet) in state.degamma_lut.chunks_exact_mut(3).enumerate() {
+            let value = (index * 257) as u16;
+            triplet.copy_from_slice(&[value, value, value]);
+        }
+        return Ok(());
+    }
+    let blob = state
+        .property_blobs
+        .get(&blob_id)
+        .ok_or(DrmError::NotFound)?;
+    if blob.bytes.len() != state.degamma_lut.len() / 3 * 8 {
+        return Err(DrmError::Invalid);
+    }
+    for (destination, source) in state
+        .degamma_lut
+        .chunks_exact_mut(3)
+        .zip(blob.bytes.chunks_exact(8))
+    {
+        destination[0] = u16::from_ne_bytes([source[0], source[1]]);
+        destination[1] = u16::from_ne_bytes([source[2], source[3]]);
+        destination[2] = u16::from_ne_bytes([source[4], source[5]]);
+    }
+    Ok(())
+}
+
+fn apply_ctm(state: &mut DeviceState, blob_id: u32) -> DrmResult<()> {
+    if blob_id == 0 {
+        state.ctm = [1 << 32, 0, 0, 0, 1 << 32, 0, 0, 0, 1 << 32];
+        return Ok(());
+    }
+    let blob = state
+        .property_blobs
+        .get(&blob_id)
+        .ok_or(DrmError::NotFound)?;
+    if blob.bytes.len() != core::mem::size_of::<[u64; 9]>() {
+        return Err(DrmError::Invalid);
+    }
+    for (value, bytes) in state.ctm.iter_mut().zip(blob.bytes.chunks_exact(8)) {
+        *value = u64::from_ne_bytes(bytes.try_into().map_err(|_| DrmError::Invalid)?);
+    }
+    Ok(())
+}
+
 pub(crate) struct CommitCompletion {
     result: Mutex<Option<DrmResult<()>>>,
     waiters: WaitQueue,
@@ -1782,6 +1922,7 @@ impl CommitCompletion {
 #[derive(Clone)]
 pub(crate) struct AtomicCommit {
     pub(crate) owner: u64,
+    pub(crate) old: super::atomic::State,
     pub(crate) next: super::atomic::State,
     pub(crate) fb: Option<Framebuffer>,
     pub(crate) cancellation: Arc<super::file::EventQueue>,
@@ -1937,6 +2078,188 @@ mod tests {
         fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
             Ok(Fence::new(true))
         }
+    }
+
+    struct AtomicTransitionAdapter {
+        observed: spin::Mutex<Option<(u32, u32, bool)>>,
+    }
+    impl DisplayAdapter for AtomicTransitionAdapter {
+        fn create_dumb(
+            &self,
+            _: DumbRequest,
+            _: u32,
+            _: u64,
+            _allocation_owner: Arc<dyn Send + Sync>,
+        ) -> DrmResult<Arc<dyn GemBacking>> {
+            Err(DrmError::Unsupported)
+        }
+        fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
+            Ok(Fence::new(true))
+        }
+        fn commit_atomic_state(
+            &self,
+            old: super::super::atomic::State,
+            new: super::super::atomic::State,
+            scanout: Option<Scanout>,
+        ) -> DrmResult<Option<Arc<Fence>>> {
+            *self.observed.lock() = Some((old.fb, new.fb, scanout.is_some()));
+            Ok(scanout.map(|_| Fence::new(true)))
+        }
+    }
+
+    #[test]
+    fn adapter_atomic_boundary_receives_old_and_new_kms_state_even_without_scanout() {
+        let adapter = AtomicTransitionAdapter {
+            observed: spin::Mutex::new(None),
+        };
+        let old = super::super::atomic::State {
+            active: true,
+            fb: 17,
+            ..super::super::atomic::State::default()
+        };
+        let new = super::super::atomic::State {
+            active: false,
+            fb: 23,
+            ..super::super::atomic::State::default()
+        };
+        assert!(
+            adapter
+                .commit_atomic_state(old, new, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(*adapter.observed.lock(), Some((17, 23, false)));
+    }
+
+    struct Display13ColorAdapter;
+    impl DisplayAdapter for Display13ColorAdapter {
+        fn create_dumb(
+            &self,
+            _: DumbRequest,
+            _: u32,
+            _: u64,
+            _allocation_owner: Arc<dyn Send + Sync>,
+        ) -> DrmResult<Arc<dyn GemBacking>> {
+            Err(DrmError::Unsupported)
+        }
+        fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
+            Ok(Fence::new(true))
+        }
+        fn degamma_lut_size(&self) -> u32 {
+            131
+        }
+    }
+
+    #[test]
+    fn color_lut_property_sizes_follow_adapter_generation() {
+        let device = DrmDevice::new(Arc::new(Display13ColorAdapter), 11, 12, 13, 14);
+        let state = device.state.lock();
+        assert_eq!(state.resources.gamma_lut_size, 256);
+        assert_eq!(state.resources.degamma_lut_size, 131);
+        assert_eq!(state.gamma_lut.len(), 256 * 3);
+        assert_eq!(state.degamma_lut.len(), 131 * 3);
+        assert_eq!(state.degamma_lut.last(), Some(&u16::MAX));
+        assert_eq!(
+            super::super::atomic::value_with_resources(
+                &state.resources,
+                &state.atomic,
+                super::super::property::CRTC_GAMMA_LUT_SIZE,
+            ),
+            Some(256)
+        );
+        assert_eq!(
+            super::super::atomic::value_with_resources(
+                &state.resources,
+                &state.atomic,
+                super::super::property::CRTC_DEGAMMA_LUT_SIZE,
+            ),
+            Some(131)
+        );
+    }
+
+    #[test]
+    fn primary_and_cursor_planes_publish_exact_linear_in_formats_blobs() {
+        let device = DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
+        let state = device.state.lock();
+        let resources = &state.resources;
+        assert_eq!(
+            super::super::atomic::value_for_object(
+                resources,
+                &state.atomic,
+                resources.primary_plane_id,
+                super::super::property::PLANE_IN_FORMATS,
+            ),
+            Some(super::super::property::IN_FORMATS_PRIMARY_BLOB_ID as u64),
+        );
+        assert_eq!(
+            super::super::atomic::value_for_object(
+                resources,
+                &state.atomic,
+                resources.cursor_plane_id,
+                super::super::property::PLANE_IN_FORMATS,
+            ),
+            Some(super::super::property::IN_FORMATS_CURSOR_BLOB_ID as u64),
+        );
+        let primary = &state.property_blobs[&super::super::property::IN_FORMATS_PRIMARY_BLOB_ID];
+        let cursor = &state.property_blobs[&super::super::property::IN_FORMATS_CURSOR_BLOB_ID];
+        assert_eq!(
+            u32::from_le_bytes(primary.bytes[8..12].try_into().unwrap()),
+            2
+        );
+        assert_eq!(
+            u64::from_le_bytes(primary.bytes[32..40].try_into().unwrap()),
+            3
+        );
+        assert_eq!(
+            u32::from_le_bytes(cursor.bytes[8..12].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(cursor.bytes[24..28].try_into().unwrap()),
+            super::super::property::FORMAT_ARGB8888
+        );
+        assert_eq!(
+            u64::from_le_bytes(cursor.bytes[32..40].try_into().unwrap()),
+            1
+        );
+    }
+
+    struct XrgbOnlyAdapter;
+    impl DisplayAdapter for XrgbOnlyAdapter {
+        fn supports_cursor(&self) -> bool {
+            false
+        }
+        fn primary_formats(&self) -> &'static [u32] {
+            &[super::super::property::FORMAT_XRGB8888]
+        }
+        fn create_dumb(
+            &self,
+            _: DumbRequest,
+            _: u32,
+            _: u64,
+            _allocation_owner: Arc<dyn Send + Sync>,
+        ) -> DrmResult<Arc<dyn GemBacking>> {
+            Err(DrmError::Unsupported)
+        }
+        fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
+            Ok(Fence::new(true))
+        }
+    }
+
+    #[test]
+    fn adapter_primary_format_blob_uses_only_scanout_capabilities() {
+        let device = DrmDevice::new(Arc::new(XrgbOnlyAdapter), 1, 2, 3, 4);
+        let state = device.state.lock();
+        let primary = &state.property_blobs[&super::super::property::IN_FORMATS_PRIMARY_BLOB_ID];
+        assert_eq!(
+            u32::from_le_bytes(primary.bytes[8..12].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(primary.bytes[24..28].try_into().unwrap()),
+            super::super::property::FORMAT_XRGB8888
+        );
+        assert_eq!(state.resources.cursor_plane_id, 0);
     }
 
     struct Backing;
@@ -2338,6 +2661,7 @@ mod tests {
         let completion = Fence::new(false);
         let mut job = AtomicCommit {
             owner: file.id(),
+            old: super::super::atomic::State::default(),
             next: super::super::atomic::initial(&device.state.lock().resources),
             fb: None,
             cancellation: super::super::file::EventQueue::new(),
@@ -2395,6 +2719,7 @@ mod tests {
             state.pending_fb_pins.insert(7, 1);
             state.pending_commits.push_back(AtomicCommit {
                 owner: 1,
+                old: super::super::atomic::State::default(),
                 next,
                 fb: None,
                 cancellation: Arc::clone(&first),
@@ -2415,6 +2740,7 @@ mod tests {
             let atomic = state.atomic;
             state.pending_commits.push_back(AtomicCommit {
                 owner: 2,
+                old: super::super::atomic::State::default(),
                 next: atomic,
                 fb: None,
                 cancellation: Arc::clone(&second),
@@ -2466,6 +2792,7 @@ mod tests {
         }
         let job = AtomicCommit {
             owner: 1,
+            old: super::super::atomic::State::default(),
             next,
             fb: None,
             cancellation: Arc::clone(&queue),

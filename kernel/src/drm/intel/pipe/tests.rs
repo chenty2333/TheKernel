@@ -46,6 +46,32 @@ fn dmt_0x04() -> Mode {
         .mode
 }
 
+#[test]
+fn source_watermark_and_plane_registers_admit_linear_rgb565() {
+    let mode = vic16();
+    let config = WatermarkConfig {
+        display_ver: 13,
+        latencies: [2, 4, 6, 8, 14, 16, 0, 0],
+        num_levels: 6,
+        sagv_block_time_us: 0,
+    };
+    let program = compute_with_watermarks_format(
+        Pipe::A,
+        &mode,
+        PlaneSurface {
+            ggtt_address: 0x0100_0000,
+            stride_bytes: 3840,
+        },
+        config,
+        intel_display::universal_plane::RGB565,
+    )
+    .unwrap();
+    assert_eq!(program.plane.stride_bytes, 3840);
+    assert_eq!(program.plane.ctl & (0x1f << 23), 14 << 24);
+    assert_eq!(program.plane.ctl & (7 << 28), 0);
+    assert!(program.watermark.levels[0].enabled);
+}
+
 /// The surface these tests scan out: 16 MiB into the graphics address space,
 /// which is 4 KiB-aligned, and a 7680-byte stride, which is what a 1920-wide
 /// XRGB8888 surface needs and is a multiple of 64.
@@ -1623,8 +1649,8 @@ fn the_whole_program_can_be_logged_before_the_first_write() {
         "pipe A",
         "reference section 11 phases 3.4 and 4",
         "PLANE_BUF_CFG = 0x0fff0000",
-        "watermark level 0: 0x8007cfff",
-        "levels 1..5 disabled",
+        "WM0: 0x8007cfff",
+        "WM5: 0x00000000 (enable 0",
         "SAGV 0x8007cfff",
         "TRANS 0x00000000",
         "PIPE_ARB_CTL 0x00000000 -> 0x00002000",

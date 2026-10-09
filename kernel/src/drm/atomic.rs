@@ -35,6 +35,8 @@ pub struct State {
     pub crtc_h: u32,
     pub dpms: u32,
     pub gamma_lut_blob: u32,
+    pub degamma_lut_blob: u32,
+    pub ctm_blob: u32,
     pub damage_clips_blob: u32,
     pub cursor_fb: u32,
     pub cursor_crtc: u32,
@@ -72,6 +74,8 @@ pub fn value(state: &State, property: u32) -> Option<u64> {
         property::CRTC_ACTIVE => state.active as u64,
         property::CRTC_MODE_ID => state.mode_blob as u64,
         property::CRTC_GAMMA_LUT => state.gamma_lut_blob as u64,
+        property::CRTC_DEGAMMA_LUT => state.degamma_lut_blob as u64,
+        property::CRTC_CTM => state.ctm_blob as u64,
         property::CRTC_OUT_FENCE_PTR => 0,
         property::PLANE_FB_ID => state.fb as u64,
         property::PLANE_CRTC_ID => state.plane_crtc as u64,
@@ -114,6 +118,8 @@ pub fn value_with_resources(
 ) -> Option<u64> {
     match property {
         property::CONNECTOR_EDID => Some(resources.connector.edid_blob as u64),
+        property::CRTC_GAMMA_LUT_SIZE => Some(u64::from(resources.gamma_lut_size)),
+        property::CRTC_DEGAMMA_LUT_SIZE => Some(u64::from(resources.degamma_lut_size)),
         _ => value(state, property),
     }
 }
@@ -123,6 +129,13 @@ pub fn value_for_object(
     object: u32,
     property: u32,
 ) -> Option<u64> {
+    if property == property::PLANE_IN_FORMATS {
+        return Some(if object == resources.cursor_plane_id {
+            property::IN_FORMATS_CURSOR_BLOB_ID as u64
+        } else {
+            property::IN_FORMATS_PRIMARY_BLOB_ID as u64
+        });
+    }
     if object == resources.cursor_plane_id {
         cursor_value(state, property)
     } else {
@@ -130,12 +143,20 @@ pub fn value_for_object(
     }
 }
 
-pub(crate) fn referenced_blobs(state: &State) -> [u32; 3] {
+pub(crate) fn referenced_blobs(state: &State) -> [u32; 5] {
     [
         state.mode_blob,
         state.gamma_lut_blob,
+        state.degamma_lut_blob,
+        state.ctm_blob,
         state.damage_clips_blob,
     ]
+}
+
+fn color_pipeline_changed(previous: State, next: State) -> bool {
+    previous.gamma_lut_blob != next.gamma_lut_blob
+        || previous.degamma_lut_blob != next.degamma_lut_blob
+        || previous.ctm_blob != next.ctm_blob
 }
 
 pub fn propose(
@@ -210,7 +231,23 @@ fn propose_with_mode(
             }
             property::CRTC_GAMMA_LUT => {
                 next.gamma_lut_blob = c.value as u32;
-                validate_gamma_lut_blob(&device, next.gamma_lut_blob)?;
+                validate_gamma_lut_blob(
+                    &device,
+                    next.gamma_lut_blob,
+                    device.resources.gamma_lut_size,
+                )?;
+            }
+            property::CRTC_DEGAMMA_LUT => {
+                next.degamma_lut_blob = c.value as u32;
+                validate_gamma_lut_blob(
+                    &device,
+                    next.degamma_lut_blob,
+                    device.resources.degamma_lut_size,
+                )?;
+            }
+            property::CRTC_CTM => {
+                next.ctm_blob = c.value as u32;
+                validate_ctm_blob(&device, next.ctm_blob)?;
             }
             // Explicit fences are request-local.  Their fds/pointers must
             // never leak into a later atomic state, including TEST_ONLY.
@@ -306,7 +343,13 @@ fn propose_with_mode(
     {
         return Err(DrmError::Invalid);
     }
-    file.validate_adapter_state(next.active, next.dpms == DPMS_ON, next.gamma_lut_blob != 0)?;
+    let color_changed = color_pipeline_changed(base, next);
+    file.validate_adapter_state(
+        next.active,
+        next.dpms == DPMS_ON,
+        next.gamma_lut_blob != 0,
+        color_changed,
+    )?;
     let fb = if next.active {
         if !r.connector.connected {
             return Err(DrmError::NotFound);
@@ -452,6 +495,8 @@ fn matches_object(r: &super::kms::KmsResources, object: u32, prop: u32) -> bool 
         property::CRTC_ACTIVE
         | property::CRTC_MODE_ID
         | property::CRTC_GAMMA_LUT
+        | property::CRTC_DEGAMMA_LUT
+        | property::CRTC_CTM
         | property::CRTC_OUT_FENCE_PTR => object == r.crtc.id,
         _ => {
             object == r.primary_plane_id || (r.cursor_plane_id != 0 && object == r.cursor_plane_id)
@@ -459,13 +504,16 @@ fn matches_object(r: &super::kms::KmsResources, object: u32, prop: u32) -> bool 
     }
 }
 
-fn validate_gamma_lut_blob(device: &super::device::DeviceState, blob: u32) -> DrmResult<()> {
+fn validate_gamma_lut_blob(
+    device: &super::device::DeviceState,
+    blob: u32,
+    entries: u32,
+) -> DrmResult<()> {
     if blob == 0 {
         return Ok(());
     }
     let blob = device.property_blobs.get(&blob).ok_or(DrmError::NotFound)?;
-    let entries = device.gamma_lut.len() / 3;
-    if blob.destroyed || blob.bytes.len() != entries * 8 {
+    if blob.destroyed || blob.bytes.len() != entries as usize * 8 {
         return Err(DrmError::Invalid);
     }
     if blob
@@ -504,4 +552,84 @@ fn validate_damage_blob(
         }
     }
     Ok(())
+}
+
+fn validate_ctm_blob(device: &super::device::DeviceState, blob: u32) -> DrmResult<()> {
+    if blob == 0 {
+        return Ok(());
+    }
+    let blob = device.property_blobs.get(&blob).ok_or(DrmError::NotFound)?;
+    if blob.destroyed || blob.bytes.len() != 9 * core::mem::size_of::<u64>() {
+        return Err(DrmError::Invalid);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Display13ColorAdapter;
+    impl super::super::device::DisplayAdapter for Display13ColorAdapter {
+        fn create_dumb(
+            &self,
+            _: super::super::gem::DumbRequest,
+            _: u32,
+            _: u64,
+            _allocation_owner: alloc::sync::Arc<dyn Send + Sync>,
+        ) -> DrmResult<alloc::sync::Arc<dyn super::super::gem::GemBacking>> {
+            Err(DrmError::Unsupported)
+        }
+
+        fn present(
+            &self,
+            _: super::super::device::Scanout,
+        ) -> DrmResult<alloc::sync::Arc<super::super::fence::Fence>> {
+            Ok(super::super::fence::Fence::new(true))
+        }
+
+        fn degamma_lut_size(&self) -> u32 {
+            131
+        }
+    }
+
+    #[test]
+    fn every_color_blob_change_is_reported_to_the_adapter() {
+        let old = State::default();
+        assert!(!color_pipeline_changed(old, old));
+        for changed in [
+            State {
+                gamma_lut_blob: 1,
+                ..old
+            },
+            State {
+                degamma_lut_blob: 1,
+                ..old
+            },
+            State { ctm_blob: 1, ..old },
+        ] {
+            assert!(color_pipeline_changed(old, changed));
+        }
+        // Resetting a previously configured property is also a hardware change.
+        assert!(color_pipeline_changed(State { ctm_blob: 9, ..old }, old));
+    }
+
+    #[test]
+    fn color_blob_validation_uses_generation_specific_lut_count() {
+        let device = super::super::device::DrmDevice::new(
+            alloc::sync::Arc::new(Display13ColorAdapter),
+            11,
+            12,
+            13,
+            14,
+        );
+        let file = device.open_primary();
+        let blob = file.create_blob(alloc::vec![0; 131 * 8]).unwrap();
+        let state = device.state.lock();
+        assert!(validate_gamma_lut_blob(&state, blob, state.resources.degamma_lut_size,).is_ok());
+        assert_eq!(
+            validate_gamma_lut_blob(&state, blob, state.resources.gamma_lut_size),
+            Err(DrmError::Invalid),
+        );
+    }
 }
