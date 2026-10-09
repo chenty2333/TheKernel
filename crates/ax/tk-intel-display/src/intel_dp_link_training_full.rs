@@ -1150,6 +1150,13 @@ pub fn intel_dp_disable_dpcd_training_pattern<I: LinkTrainingIo>(io: &mut I, phy
         == Some(1)
 }
 
+fn finish_link_training<I: LinkTrainingIo>(io: &mut I, phy: DpPhy, passed: bool) -> bool {
+    // Cleanup is mandatory even when training failed; avoid `passed && write()`
+    // because short-circuit evaluation would leave the sink in training mode.
+    let pattern_disabled = intel_dp_disable_dpcd_training_pattern(io, phy);
+    passed && pattern_disabled
+}
+
 // upstream: intel_dp_link_training.c intel_dp_128b132b_intra_hop()
 pub fn intel_dp_128b132b_intra_hop<I: LinkTrainingIo>(
     io: &mut I,
@@ -1529,7 +1536,7 @@ pub fn intel_dp_128b132b_link_train<I: LinkTrainingIo>(
             DP_TRAINING_PATTERN_2,
         );
     }
-    passed && intel_dp_disable_dpcd_training_pattern(io, DpPhy::Dprx)
+    finish_link_training(io, DpPhy::Dprx, passed)
 }
 
 // upstream: intel_dp_link_training.c intel_dp_start_link_train()
@@ -1871,6 +1878,13 @@ mod tests {
             &mut io,
             DpPhy::Dprx
         ));
+        assert_eq!(io.aux_writes, 1);
+    }
+
+    #[test]
+    fn failed_training_still_attempts_pattern_disable() {
+        let mut io = SourcePhyFailureIo::default();
+        assert!(!finish_link_training(&mut io, DpPhy::Dprx, false));
         assert_eq!(io.aux_writes, 1);
     }
 
