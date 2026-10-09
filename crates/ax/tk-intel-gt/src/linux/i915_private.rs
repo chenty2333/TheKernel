@@ -10,6 +10,7 @@ use core::{
 };
 
 use crate::{
+    intel_context_types_upstream::File,
     intel_engine_cs_upstream::{AtomicT, IntelEngineCs, IntelGt, Spinlock},
     intel_context_upstream::Kref,
     linux::{gem_memory::I915GemMm, i915::IntelRuntimeInfo},
@@ -80,7 +81,10 @@ pub struct DrmI915Private {
     pub params: I915Params,
     pub info: *const c_void,
     pub runtime: IntelRuntimeInfo,
-    _before_wq: [u8; 844],
+    _before_wq: [u8; 840],
+    /// Source `preserve_bios_swizzle` field (verified at offset 2532 against
+    /// the configured Linux 7.2.3 x86_64 C layout).
+    pub preserve_bios_swizzle: bool,
     pub wq: *mut c_void,
     pub unordered_wq: *mut c_void,
     _before_gem_quirks: [u8; 8],
@@ -97,7 +101,21 @@ pub struct DrmI915Private {
     pub gt: [*mut IntelGt; I915_MAX_GT],
     pub sysfs_gt: *mut c_void,
     pub media_gt: *mut IntelGt,
-    _configuration_sensitive_tail: [u8; 2368],
+    /// `gem` subobject from the source i915 private record. Its contexts
+    /// lock/list prefix is opaque here; only the singleton file pointer is
+    /// consumed by the mmap translation.
+    pub gem: I915GemPrivate,
+    _frontbuffer_lock: [u8; 8],
+    /// Source `struct intel_pxp *pxp` (opaque lower owner).
+    pub pxp: *mut c_void,
+    _overlay: *mut c_void,
+    _configuration_sensitive_tail: [u8; 2312],
+}
+
+#[repr(C)]
+pub struct I915GemPrivate {
+    _contexts_lock_and_list: [u8; 24],
+    pub mmap_singleton: *mut File,
 }
 
 pub const I915_MAX_GT: usize = 2;
@@ -139,6 +157,7 @@ const _: [(); 80] = [(); size_of::<I915Params>()];
 const _: [(); 8] = [(); align_of::<I915Params>()];
 const _: [(); 2536] = [(); offset_of!(DrmI915Private, wq)];
 const _: [(); 2544] = [(); offset_of!(DrmI915Private, unordered_wq)];
+const _: [(); 2532] = [(); offset_of!(DrmI915Private, preserve_bios_swizzle)];
 const _: [(); 2560] = [(); offset_of!(DrmI915Private, gem_quirks)];
 const _: [(); 2568] = [(); offset_of!(DrmI915Private, mm)];
 const _: [(); 3112] = [(); offset_of!(DrmI915Private, edram_size_mb)];
@@ -164,6 +183,14 @@ const _: [(); 2544] = [(); offset_of!(DrmI915Private, unordered_wq)];
 const _: [(); 3120] = [(); offset_of!(DrmI915Private, gpu_error)];
 const _: [(); 3176] = [(); offset_of!(DrmI915Private, runtime_pm)];
 const _: [(); 3528] = [(); offset_of!(DrmI915Private, gt)];
+// These target x86_64 Linux 7.2.3 offsets were measured from the configured
+// wt-dev oracle's i915_driver.o compile command and offsetof() C probe.
+const _: [(); 32] = [(); size_of::<I915GemPrivate>()];
+const _: [(); 3560] = [(); offset_of!(DrmI915Private, gem)];
+const _: [(); 3584] = [(); offset_of!(DrmI915Private, gem) + offset_of!(I915GemPrivate, mmap_singleton)];
+const _: [(); 3600] = [(); offset_of!(DrmI915Private, pxp)];
+const _: [(); 3608] = [(); offset_of!(DrmI915Private, _overlay)];
+const _: [(); 5928] = [(); size_of::<DrmI915Private>()];
 const _: [(); 5928] = [(); size_of::<DrmI915Private>()];
 const _: [(); 40] = [(); size_of::<I915GpuError>()];
 const _: [(); 8] = [(); size_of::<IntelRuntimePmPrefix>()];
