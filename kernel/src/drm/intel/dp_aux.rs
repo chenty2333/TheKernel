@@ -169,7 +169,11 @@ impl<'a, R: Registers> DpAuxKernel<'a, R> {
         }
         if state.get_domain(self.registers, domain).is_err() {
             if let Some(parent) = self.parent_power_domain {
-                let _ = state.put_domain(self.registers, parent);
+                if state.put_domain(self.registers, parent).is_err() {
+                    self.diagnostics.push(String::from(
+                        "AUX lane-domain rollback after AUX get failure failed",
+                    ));
+                }
             }
             return Err(AuxError::Power);
         }
