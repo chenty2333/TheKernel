@@ -1510,12 +1510,7 @@ pub(super) fn program_native<R: Registers + Send + Sync, T: PollTimer>(
         .into_iter()
         .filter(|planned| MODE_SHADOW.contains(&planned.register.offset()))
     {
-        let value = if planned.register.offset() == p::PIPE_MISC_A.offset() {
-            planned.value
-        } else {
-            planned.value
-        };
-        shadow.push(super::pipe::PlannedWrite { value, ..planned });
+        shadow.push(planned);
     }
     if shadow.len() != MODE_SHADOW.len() {
         let present = shadow
@@ -1731,7 +1726,7 @@ impl<R: Registers + Send + Sync, T: PollTimer> super::native_modeset_ops::Native
                 // Prove DMA quiescence even when the initial disable failed.
                 if !*self.writes {
                     self.stopped = true;
-                    return self.dpll.release_new();
+                    return Ok(());
                 }
                 write(
                     self.r,

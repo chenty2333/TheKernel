@@ -1814,10 +1814,10 @@ fn pll_rs_search_is_measured_against_the_documented_adl_n_search() {
     ));
 }
 
-/// DVI is the same sequence with a different mode select, and the reference
-/// names no translation table for it -- which the refusal has to say.
+/// DVI is the same sequence with a different mode select, and i915 drives DVI
+/// TMDS through the same combo-PHY HDMI translation table.
 #[test]
-fn dvi_differs_from_hdmi_only_in_the_mode_select_and_has_no_named_table() {
+fn dvi_differs_from_hdmi_only_in_the_mode_select_and_shares_the_hdmi_table() {
     let mut dvi = hdmi_request(Ddi::A);
     dvi.port_type = PortType::Dvi;
     let dvi_plan = OutputProgram::plan(&dvi, STRAP_38_4).unwrap();
@@ -1839,6 +1839,9 @@ fn dvi_differs_from_hdmi_only_in_the_mode_select_and_has_no_named_table() {
     assert_eq!(dvi_plan.trans_clk_sel, hdmi_plan.trans_clk_sel);
     assert_eq!(dvi_plan.transconf, hdmi_plan.transconf);
 
-    assert_eq!(dvi_plan.swing.source, test_swing().source);
-    assert_eq!(dvi_plan.swing.level, test_swing().level);
+    let mut table_dvi = OutputRequest::hdmi(Ddi::A, target_mode(), PllFieldEncoding::Named);
+    table_dvi.port_type = PortType::Dvi;
+    let table_plan = OutputProgram::plan(&table_dvi, STRAP_38_4).unwrap();
+    assert_eq!(table_plan.swing.source, "icl_combo_phy_trans_hdmi");
+    assert_eq!(table_plan.swing.level, 6);
 }
