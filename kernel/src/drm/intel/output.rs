@@ -195,12 +195,15 @@ const PLL_LOCK_TIMEOUT_US: u32 = 600;
 const TRANS_CLK_SEL_PORT_SHIFT: u32 = 28;
 
 /// `TRANS_DDI_FUNC_CTL`'s mode-select field, `[26:24]`.  Reference §8.4.
+#[cfg(test)]
 const TRANS_DDI_MODE_SELECT_SHIFT: u32 = 24;
 
 /// `TRANS_DDI_PVSYNC`, bit 17.  Reference §8.4's corrected table.
+#[cfg(test)]
 const TRANS_DDI_PVSYNC: u32 = 1 << 17;
 
 /// `TRANS_DDI_PHSYNC`, bit 16.  Reference §8.4's corrected table.
+#[cfg(test)]
 const TRANS_DDI_PHSYNC: u32 = 1 << 16;
 
 

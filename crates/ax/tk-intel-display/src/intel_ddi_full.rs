@@ -140,6 +140,7 @@ pub struct CrtcState {
     pub lane_count: u8,
     pub fdi_lanes: u8,
     pub pipe_bpp: u8,
+    /// Raw DRM mode flags from `adjusted_mode.flags` (PHSYNC bit 0, PVSYNC bit 2).
     pub mode_flags: u32,
     pub limited_color_range: bool,
     pub has_pch_encoder: bool,
