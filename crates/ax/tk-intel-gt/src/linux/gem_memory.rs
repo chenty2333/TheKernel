@@ -89,6 +89,13 @@ pub struct PgProt {
     pub pgprot: c_ulong,
 }
 
+/// x86 `pgprot_decrypted()` is an identity for this configured target:
+/// `CONFIG_AMD_MEM_ENCRYPT` is disabled in the wt-dev kernel configuration.
+#[inline]
+pub fn pgprot_decrypted(prot: PgProt) -> PgProt {
+    prot
+}
+
 /// Linux `struct io_mapping` from `include/linux/io-mapping.h`.
 #[repr(C)]
 pub struct IoMapping {
