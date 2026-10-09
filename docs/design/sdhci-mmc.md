@@ -127,4 +127,6 @@ not a dedicated callout worker.
 
 The N305 eMMC `mmc.allow_write` policy is captured in each hotplug slot before
 first attach, survives failed enumeration, and is ORed with card write-protect
-on each retry; ordinary AHCI disks remain writable by default.
+on each retry. Across block drivers, AHCI disks are writable by default
+(Linux-compatible), while N305 NVMe (`nvme.allow_write=1` enables writes) and
+eMMC (`mmc.allow_write=1` enables writes) are read-only by default.
