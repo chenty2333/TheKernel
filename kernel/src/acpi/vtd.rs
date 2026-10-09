@@ -115,6 +115,10 @@ const fn identity_dma_in_mode(mode: u8) -> bool {
     matches!(mode, MODE_UNKNOWN | MODE_IDENTITY)
 }
 
+const fn direct_identity_lease_allowed(mode: u8) -> bool {
+    mode == MODE_IDENTITY
+}
+
 fn poison_dma_state() -> Error {
     DMA_POISONED.store(true, Ordering::Release);
     MODE.store(MODE_FAILED, Ordering::Release);
@@ -2352,12 +2356,54 @@ fn init_translation(
     hardware_touched: &mut bool,
     identity_fallback_safe: &mut bool,
 ) -> Result<(), Error> {
-    // Preserve an explicit escape hatch for platforms that need firmware-style
-    // identity DMA. Supported DMAR units otherwise enable translation.
+    // Explicitly disabled translation is only safe if every described unit
+    // is confirmed inactive. Unknown firmware state must not authorize a GPU
+    // identity-DMA lease.
     if axhal::boot::command_line_value("intel_iommu") == Some("off") {
+        MODE.store(MODE_FAILED, Ordering::Release);
+        let Some(dmar) = table(engine)? else {
+            MODE.store(MODE_IDENTITY, Ordering::Release);
+            *identity_fallback_safe = true;
+            info!("vtd: intel_iommu=off with no DMAR table; using direct DMA");
+            return Ok(());
+        };
+        if dmar.units.is_empty() {
+            return Err(Error::InvalidStructure);
+        }
+        let mut probes = Vec::new();
+        probes
+            .try_reserve_exact(dmar.units.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for record in &dmar.units {
+            probes.push(probe_unit(record.register_base)?);
+        }
+        *identity_fallback_safe =
+            identity_fallback_safe_before_enable(probes.iter().map(|probe| probe.gsts));
+        if !*identity_fallback_safe {
+            let (index, probe) = probes
+                .iter()
+                .enumerate()
+                .find(|(_, probe)| probe.gsts & GSTS_ACTIVE_MASK != 0)
+                .ok_or(Error::InvalidStructure)?;
+            *FAILURE.lock() = Some(InitFailure {
+                error: Error::Unsupported,
+                stage: "intel_iommu=off but firmware left DRHD active",
+                unit_index: Some(index),
+                register_base: Some(probe.register_base),
+                cap: Some(probe.cap),
+                ecap: Some(probe.ecap),
+                gsts: Some(probe.gsts),
+                fsts: Some(probe.fsts),
+            });
+            error!(
+                "vtd: intel_iommu=off refused; DRHD {index} at {:#x} already active, GSTS={:#x} \
+                 FSTS={:#x}",
+                probe.register_base, probe.gsts, probe.fsts
+            );
+            return Err(Error::Unsupported);
+        }
         MODE.store(MODE_IDENTITY, Ordering::Release);
-        *identity_fallback_safe = true;
-        info!("vtd: translation disabled by intel_iommu=off");
+        info!("vtd: intel_iommu=off after read-only inactive-unit preflight");
         return Ok(());
     }
     MODE.store(MODE_FAILED, Ordering::Release);
@@ -2754,8 +2800,12 @@ impl tk_vtd::PlatformIdentityDma for PlatformIdentityDma {
         requester: tk_vtd::PciRequester,
         initial_pages: &[u64],
     ) -> Result<u64, Error> {
-        match MODE.load(Ordering::Acquire) {
-            MODE_UNKNOWN | MODE_IDENTITY => direct_identity_acquire(requester, initial_pages),
+        let mode = MODE.load(Ordering::Acquire);
+        if direct_identity_lease_allowed(mode) {
+            return direct_identity_acquire(requester, initial_pages);
+        }
+        match mode {
+            MODE_UNKNOWN => Err(Error::NoDomain),
             MODE_FAILED => Err(failed_dma_error()),
             MODE_ENABLED => MANAGER
                 .lock()
@@ -2772,7 +2822,8 @@ impl tk_vtd::PlatformIdentityDma for PlatformIdentityDma {
         pages: &[u64],
     ) -> Result<u64, Error> {
         match MODE.load(Ordering::Acquire) {
-            MODE_UNKNOWN | MODE_IDENTITY => direct_identity_map(requester, lease_id, pages),
+            MODE_UNKNOWN => Err(Error::NoDomain),
+            MODE_IDENTITY => direct_identity_map(requester, lease_id, pages),
             MODE_FAILED => Err(failed_dma_error()),
             MODE_ENABLED => MANAGER
                 .lock()
@@ -2789,7 +2840,8 @@ impl tk_vtd::PlatformIdentityDma for PlatformIdentityDma {
         mapping_id: u64,
     ) -> Result<(), Error> {
         match MODE.load(Ordering::Acquire) {
-            MODE_UNKNOWN | MODE_IDENTITY => direct_identity_unmap(requester, lease_id, mapping_id),
+            MODE_UNKNOWN => Err(Error::NoDomain),
+            MODE_IDENTITY => direct_identity_unmap(requester, lease_id, mapping_id),
             MODE_FAILED => Err(failed_dma_error()),
             MODE_ENABLED => MANAGER
                 .lock()
@@ -2802,7 +2854,8 @@ impl tk_vtd::PlatformIdentityDma for PlatformIdentityDma {
 
     fn release_identity_dma(requester: tk_vtd::PciRequester, lease_id: u64) -> Result<(), Error> {
         match MODE.load(Ordering::Acquire) {
-            MODE_UNKNOWN | MODE_IDENTITY => direct_identity_release(requester, lease_id),
+            MODE_UNKNOWN => Err(Error::NoDomain),
+            MODE_IDENTITY => direct_identity_release(requester, lease_id),
             MODE_FAILED => Err(failed_dma_error()),
             MODE_ENABLED => MANAGER
                 .lock()
@@ -2825,16 +2878,16 @@ mod tests {
         DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS_2M, DMAR_ECAP_EIM, DMAR_ECAP_IR, DMAR_ECAP_QI,
         DomainState, Error, IdentityDmaOwner, IdentityPage, IrRoute, IrRouteState, MODE_ENABLED,
         MODE_FAILED, MODE_IDENTITY, MODE_UNKNOWN, Mapping, MappingState, UnitProbe,
-        cap_domain_count, complete_domain_install, direct_identity_acquire, direct_identity_map,
-        direct_identity_release, direct_identity_unmap, find_owned_msi_vector,
-        identity_batch_removal_pages, identity_dma_in_mode, identity_fallback_safe_before_enable,
-        identity_pages_for_path, pci_dma_allowed_in_mode, prepare_identity_batch_record,
-        publish_identity_batch, publish_identity_batch_after_invalidation,
-        publish_mapping_after_invalidation, quarantine_boot_resources, require_ready_domain,
-        retire_identity_batch_after_invalidation, retire_identity_batch_record,
-        retire_identity_lease_after_invalidation, retire_ir_route_after_invalidation,
-        retire_mapping_after_invalidation, take_domain_id, validate_all_unit_capabilities,
-        validate_unit_capabilities,
+        cap_domain_count, complete_domain_install, direct_identity_acquire,
+        direct_identity_lease_allowed, direct_identity_map, direct_identity_release,
+        direct_identity_unmap, find_owned_msi_vector, identity_batch_removal_pages,
+        identity_dma_in_mode, identity_fallback_safe_before_enable, identity_pages_for_path,
+        pci_dma_allowed_in_mode, prepare_identity_batch_record, publish_identity_batch,
+        publish_identity_batch_after_invalidation, publish_mapping_after_invalidation,
+        quarantine_boot_resources, require_ready_domain, retire_identity_batch_after_invalidation,
+        retire_identity_batch_record, retire_identity_lease_after_invalidation,
+        retire_ir_route_after_invalidation, retire_mapping_after_invalidation, take_domain_id,
+        validate_all_unit_capabilities, validate_unit_capabilities,
     };
 
     struct DropProbe(Arc<AtomicUsize>);
@@ -2866,6 +2919,10 @@ mod tests {
         assert!(identity_dma_in_mode(MODE_IDENTITY));
         assert!(!identity_dma_in_mode(MODE_ENABLED));
         assert!(!identity_dma_in_mode(MODE_FAILED));
+        assert!(!direct_identity_lease_allowed(MODE_UNKNOWN));
+        assert!(direct_identity_lease_allowed(MODE_IDENTITY));
+        assert!(!direct_identity_lease_allowed(MODE_ENABLED));
+        assert!(!direct_identity_lease_allowed(MODE_FAILED));
     }
 
     #[test]
