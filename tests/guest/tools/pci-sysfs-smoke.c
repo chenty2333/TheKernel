@@ -9,6 +9,19 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* MSI (cap 0x05, control bit 0) or MSI-X (cap 0x11, control bit 15) enabled. */
+static int msi_enabled(const unsigned char *config) {
+    if (!(config[6] & 0x10)) return 0;
+    unsigned pos=config[0x34]&0xfc, guard=0;
+    while (pos>=0x40 && pos<0xff && guard++<48) {
+        unsigned id=config[pos], control=config[pos+2]|config[pos+3]<<8;
+        if (id==0x05 && (control&1)) return 1;
+        if (id==0x11 && (control&0x8000)) return 1;
+        pos=config[pos+1]&0xfc;
+    }
+    return 0;
+}
+
 static int fail(const char *label) { fprintf(stderr, "PCI sysfs: %s (errno=%d)\n", label, errno); return 1; }
 static int resources(const char *path, const unsigned char *config) {
     FILE *file=fopen(path,"r"); if (!file) return fail("resource-open");
@@ -62,10 +75,15 @@ int main(void) {
         FILE *irq_file=fopen(path,"r"); unsigned irq;
         if (!irq_file || fscanf(irq_file,"%u",&irq)!=1 || irq>=0xf0) return fail("irq-vector");
         fclose(irq_file);
-        // All default Q35 PCI functions use disabled MSI or legacy INTx;
-        // primary MSI message selection is independently covered on the host.
-        unsigned expected_irq=config[0x3d] && config[0x3c]<0xd0 ? 0x20+config[0x3c] : 0;
-        if (irq!=expected_irq) return fail("irq-firmware-route");
+        // Like Linux, a function whose driver enabled MSI/MSI-X reports that
+        // vector in `irq`; only INTx/no-interrupt functions keep the firmware
+        // route. Primary MSI message selection is covered on the host.
+        if (msi_enabled(config)) {
+            if (irq==0) return fail("irq-msi-vector");
+        } else {
+            unsigned expected_irq=config[0x3d] && config[0x3c]<0xd0 ? 0x20+config[0x3c] : 0;
+            if (irq!=expected_irq) return fail("irq-firmware-route");
+        }
         snprintf(path,sizeof(path),"/sys/bus/pci/devices/%s/config",entry->d_name);
         if ((class_id >> 8)==0x0604) bridges++;
         if (retained_fd<0 && (config[14]&0x7f)==0) {
