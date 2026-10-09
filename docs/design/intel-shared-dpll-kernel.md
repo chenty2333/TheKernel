@@ -33,6 +33,12 @@ backend revalidates held source-mapped power requests, D0,
 DC-state, and refclk on every hook/access; logical DPLL power cookies never
 manufacture `PowerState` reference counts or change wells.
 
+The scoped manager now remembers which TC port was selected and checks
+allocator/CRTC arguments against it before entering source compute/reserve/
+release or DKL enable/disable hooks. It rejects sibling TC selection, legacy
+C/D aliases that do not match the selected DKL PLL, and invalid CRTC indices.
+This closes an unsafe adapter API gap but is not an active modeset callsite.
+
 The source manager's unrestricted all-PLL readout is not called with this
 single-port pin: its TC1/TC2 DKL enumeration would touch the unpowered sibling.
 The source manager is instead scoped to the one power-proven DKL PLL plus

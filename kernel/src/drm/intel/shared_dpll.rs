@@ -61,6 +61,7 @@ pub(crate) enum DpllFailure {
     UnexpectedState,
     ManagerRejected(i32),
     InvalidCrtc,
+    DklPortNotSelected,
     RollbackNotProven,
 }
 
@@ -440,6 +441,10 @@ pub(crate) struct SharedDpllState {
     next_cookie: u64,
     initialized: bool,
     readout_done: bool,
+    /// TC PLL exposed by `limit_to_tc_port()`. The adapter may hold power for
+    /// this one PHY only; remember the choice so later source-shaped allocator
+    /// and CRTC callbacks cannot accidentally target the hidden sibling.
+    selected_tc_port: Option<dpll::TcPort>,
     quarantined: bool,
     last_debug_count: u32,
     last_warning_count: u32,
@@ -485,6 +490,7 @@ impl SharedDpllState {
             next_cookie: 1,
             initialized: false,
             readout_done: false,
+            selected_tc_port: None,
             quarantined: false,
             last_debug_count: 0,
             last_warning_count: 0,
@@ -585,20 +591,20 @@ impl SharedDpllState {
     /// access can be proven by this single-port N305 lease. DPLL0/1 and TBT
     /// stay in source order; TC2 is moved into the final active slot so the
     /// unpowered sibling TC PLL is not read or considered by allocator scans.
-    pub(crate) fn limit_to_tc_port(
-        &mut self,
-        port: intel_display::dkl_phy::TcPort,
-    ) -> Result<usize, DpllFailure> {
+    pub(crate) fn limit_to_tc_port(&mut self, port: dpll::TcPort) -> Result<usize, DpllFailure> {
         self.ensure_usable()?;
         if self.readout_done || self.display.num_dpll != 5 {
             return Err(DpllFailure::AlreadyInitialized);
         }
         match port {
-            intel_display::dkl_phy::TcPort::Tc1 => {}
-            intel_display::dkl_phy::TcPort::Tc2 => {
+            dpll::TcPort::Tc1 => {
+                self.selected_tc_port = Some(dpll::TcPort::Tc1);
+            }
+            dpll::TcPort::Tc2 => {
                 self.display.dplls.swap(3, 4);
                 self.display.dplls[3].index = 3;
                 self.display.dplls[4].index = 4;
+                self.selected_tc_port = Some(dpll::TcPort::Tc2);
             }
             _ => return Err(DpllFailure::UnsupportedIdentity),
         }
@@ -686,6 +692,8 @@ impl SharedDpllState {
     ) -> Result<(), DpllFailure> {
         self.ensure_usable()?;
         self.ensure_readout()?;
+        self.check_encoder_tc_selection(encoder)?;
+        self.check_atomic_old_crtc(registers, power, atomic, crtc)?;
         self.refresh_reference_clock(registers, power)?;
         self.with_hooks(registers, timer, power, false, false, |hooks, display| {
             let error = dpll::intel_dpll_compute(hooks, display, atomic, crtc, encoder);
@@ -706,6 +714,8 @@ impl SharedDpllState {
     ) -> Result<(), DpllFailure> {
         self.ensure_usable()?;
         self.ensure_readout()?;
+        self.check_encoder_tc_selection(encoder)?;
+        self.check_atomic_old_crtc(registers, power, atomic, crtc)?;
         self.refresh_reference_clock(registers, power)?;
         self.with_hooks(registers, timer, power, false, false, |hooks, display| {
             let error = dpll::intel_dpll_reserve(hooks, display, atomic, crtc, encoder);
@@ -725,6 +735,7 @@ impl SharedDpllState {
     ) -> Result<(), DpllFailure> {
         self.ensure_usable()?;
         self.ensure_readout()?;
+        self.check_atomic_old_crtc(registers, power, atomic, crtc)?;
         self.with_hooks(registers, timer, power, false, false, |hooks, display| {
             dpll::intel_dpll_release(hooks, display, atomic, crtc);
         })
@@ -848,15 +859,23 @@ impl SharedDpllState {
             (dpll::Port::A, dpll::DpllFunction::Combo, 0)
             | (dpll::Port::B, dpll::DpllFunction::Combo, 1) => Ok(()),
             (dpll::Port::C | dpll::Port::Tc(dpll::TcPort::Tc1), dpll::DpllFunction::Dkl, 3) => {
-                if power.tc_port_held(registers, dpll::TcPort::Tc1) {
+                if self.selected_tc_port == Some(dpll::TcPort::Tc1)
+                    && power.tc_port_held(registers, dpll::TcPort::Tc1)
+                {
                     Ok(())
+                } else if self.selected_tc_port != Some(dpll::TcPort::Tc1) {
+                    Err(DpllFailure::DklPortNotSelected)
                 } else {
                     Err(DpllFailure::DklPortNotPowered)
                 }
             }
             (dpll::Port::D | dpll::Port::Tc(dpll::TcPort::Tc2), dpll::DpllFunction::Dkl, 4) => {
-                if power.tc_port_held(registers, dpll::TcPort::Tc2) {
+                if self.selected_tc_port == Some(dpll::TcPort::Tc2)
+                    && power.tc_port_held(registers, dpll::TcPort::Tc2)
+                {
                     Ok(())
+                } else if self.selected_tc_port != Some(dpll::TcPort::Tc2) {
+                    Err(DpllFailure::DklPortNotSelected)
                 } else {
                     Err(DpllFailure::DklPortNotPowered)
                 }
@@ -865,6 +884,50 @@ impl SharedDpllState {
             // alternate PLL; the generic CRTC lifecycle owns the active DPLL.
             _ => Err(DpllFailure::InvalidCrtc),
         }
+    }
+
+    /// Bind source allocator calls to the single TC PHY made visible by the
+    /// readout setup. Combo-PHY allocators remain usable for non-TC encoders;
+    /// unsupported and sibling TC encoders fail before manager state changes.
+    fn check_encoder_tc_selection(&self, encoder: &dpll::IntelEncoder) -> Result<(), DpllFailure> {
+        if encoder.is_tc_phy {
+            if encoder.is_combo_phy {
+                return Err(DpllFailure::InvalidCrtc);
+            }
+            let port = tc_port_from_crtc(encoder.port)?;
+            if self.selected_tc_port == Some(port) {
+                Ok(())
+            } else {
+                Err(DpllFailure::DklPortNotSelected)
+            }
+        } else if encoder.is_combo_phy && matches!(encoder.port, dpll::Port::A | dpll::Port::B) {
+            // This manager instance still exposes its source combo PLL0/1
+            // slots; all other PHY families are outside the pinned context.
+            Ok(())
+        } else {
+            Err(DpllFailure::InvalidCrtc)
+        }
+    }
+
+    /// Source allocator callbacks index CRTC arrays before returning an error.
+    /// Validate the index and any existing DKL owner before passing through to
+    /// that source logic, including during a release-only path.
+    fn check_atomic_old_crtc<R: Registers, P: DpllPowerAccess<R>>(
+        &self,
+        registers: &R,
+        power: &P,
+        atomic: &dpll::IntelAtomicState,
+        crtc: &dpll::IntelCrtc,
+    ) -> Result<(), DpllFailure> {
+        let index = usize::from(crtc.pipe);
+        if index >= dpll::MAX_PIPES {
+            return Err(DpllFailure::InvalidCrtc);
+        }
+        let old = &atomic.old_crtcs[index];
+        if old.intel_dpll.is_some() {
+            self.check_crtc_pll_power_domains(registers, power, old)?;
+        }
+        Ok(())
     }
 
     fn ensure_readout(&self) -> Result<(), DpllFailure> {
@@ -1561,10 +1624,7 @@ mod tests {
         let mut tc1 = SharedDpllState::new(identity, 0);
         tc1.initialized = true;
         tc1.display.num_dpll = 5;
-        assert_eq!(
-            tc1.limit_to_tc_port(intel_display::dkl_phy::TcPort::Tc1),
-            Ok(3)
-        );
+        assert_eq!(tc1.limit_to_tc_port(dpll::TcPort::Tc1), Ok(3));
         assert_eq!(tc1.display.num_dpll, 4);
 
         let mut tc2 = SharedDpllState::new(identity, 0);
@@ -1586,10 +1646,7 @@ mod tests {
             always_on: false,
             is_alt_port_dpll: false,
         });
-        assert_eq!(
-            tc2.limit_to_tc_port(intel_display::dkl_phy::TcPort::Tc2),
-            Ok(3)
-        );
+        assert_eq!(tc2.limit_to_tc_port(dpll::TcPort::Tc2), Ok(3));
         assert_eq!(tc2.display.num_dpll, 4);
         assert_eq!(
             tc2.display.dplls[3].info.map(|info| info.id),
@@ -1597,6 +1654,111 @@ mod tests {
         );
         assert_eq!(tc2.display.dplls[3].index, 3);
         assert!(tc2.display.dplls[4].info.is_some());
+    }
+
+    #[test]
+    fn selected_tc_binding_rejects_sibling_allocator_and_crtc_routes() {
+        let identity = AdlNIdentity::verify(0x8086, 0x46d0, 0).unwrap();
+        let mut manager = SharedDpllState::new(identity, 0);
+        manager.initialized = true;
+        manager.display.num_dpll = 5;
+        assert_eq!(manager.limit_to_tc_port(dpll::TcPort::Tc1), Ok(3));
+
+        let encoder = |port| dpll::IntelEncoder {
+            output: dpll::OutputType::DisplayPort,
+            port,
+            is_combo_phy: false,
+            is_tc_phy: true,
+            primary_port: None,
+            tc_dp_alt_mode: false,
+            tc_legacy_mode: false,
+        };
+        assert_eq!(
+            manager.check_encoder_tc_selection(&encoder(dpll::Port::Tc(dpll::TcPort::Tc1))),
+            Ok(())
+        );
+        assert_eq!(
+            manager.check_encoder_tc_selection(&encoder(dpll::Port::Tc(dpll::TcPort::Tc2))),
+            Err(DpllFailure::DklPortNotSelected)
+        );
+        assert_eq!(
+            manager.check_encoder_tc_selection(&encoder(dpll::Port::D)),
+            Err(DpllFailure::DklPortNotSelected)
+        );
+        // Preserve the generic manager's unrelated combo-PHY path.
+        assert_eq!(
+            manager.check_encoder_tc_selection(&dpll::IntelEncoder {
+                is_tc_phy: false,
+                is_combo_phy: true,
+                ..encoder(dpll::Port::B)
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            manager.check_encoder_tc_selection(&dpll::IntelEncoder {
+                is_tc_phy: false,
+                is_combo_phy: false,
+                ..encoder(dpll::Port::D)
+            }),
+            Err(DpllFailure::InvalidCrtc)
+        );
+
+        manager.display.dplls[3].info = Some(dpll::DpllInfo {
+            name: "TC PLL 2",
+            funcs: dpll::DpllFunction::Dkl,
+            id: dpll::DPLL_ID_ICL_MGPLL2,
+            power_domain: None,
+            always_on: false,
+            is_alt_port_dpll: false,
+        });
+        let sibling_crtc = dpll::CrtcState {
+            pipe: 0,
+            joined_pipe_mask: 1,
+            port: dpll::Port::D,
+            intel_dpll: Some(3),
+            ..dpll::CrtcState::default()
+        };
+        assert_eq!(
+            manager.check_crtc_pll_power_domains(&NoRegisters, &FakePower, &sibling_crtc),
+            Err(DpllFailure::DklPortNotSelected)
+        );
+        let mut atomic = dpll::IntelAtomicState::default();
+        atomic.old_crtcs[0] = sibling_crtc;
+        assert_eq!(
+            manager.check_atomic_old_crtc(
+                &NoRegisters,
+                &FakePower,
+                &atomic,
+                &dpll::IntelCrtc {
+                    pipe: 0,
+                    ..dpll::IntelCrtc::default()
+                },
+            ),
+            Err(DpllFailure::DklPortNotSelected)
+        );
+        assert_eq!(
+            manager.check_atomic_old_crtc(
+                &NoRegisters,
+                &FakePower,
+                &atomic,
+                &dpll::IntelCrtc {
+                    pipe: dpll::MAX_PIPES as u8,
+                    ..dpll::IntelCrtc::default()
+                },
+            ),
+            Err(DpllFailure::InvalidCrtc)
+        );
+
+        // The source's legacy C/D spellings must agree with both the DKL PLL
+        // identity and the selected PHY; mismatched spellings fail closed.
+        let mismatched_legacy = dpll::CrtcState {
+            port: dpll::Port::C,
+            ..sibling_crtc
+        };
+        assert_eq!(
+            manager.check_crtc_pll_power_domains(&NoRegisters, &FakePower, &mismatched_legacy),
+            Err(DpllFailure::InvalidCrtc)
+        );
     }
 
     #[test]
