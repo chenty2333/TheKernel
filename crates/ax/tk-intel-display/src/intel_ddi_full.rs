@@ -2329,3 +2329,45 @@ pub fn intel_ddi_init(io: &mut impl DdiIo, display: Platform, request: DdiInitRe
     encoder.hpd_pin = hpd_pin;
     Some(DdiInitPlan { encoder, name: intel_ddi_encoder_name(io, display, port, phy), init_dp, init_hdmi, aux_channel, clock_kind, signal_kind, connected_kind })
 }
+
+#[cfg(test)]
+mod focused_tests {
+    use super::*;
+
+    struct NoIo;
+    impl DdiIo for NoIo {
+        fn read(&mut self, _reg: u32) -> u32 { 0 }
+        fn write(&mut self, _reg: u32, _value: u32) {}
+        fn combo_phy_read(&mut self, _phy: u8, _reg: ComboPhyRegister) -> u32 { 0 }
+        fn combo_phy_write(&mut self, _phy: u8, _reg: ComboPhyRegister, _value: u32) {}
+        fn combo_phy_rmw(&mut self, _phy: u8, _reg: ComboPhyRegister, _clear: u32, _set: u32) {}
+        fn mg_phy_rmw(&mut self, _port: Port, _reg: MgPhyRegister, _clear: u32, _set: u32) {}
+        fn dkl_phy_read(&mut self, _port: Port, _reg: DklPhyRegister) -> u32 { 0 }
+        fn dkl_phy_write(&mut self, _port: Port, _reg: DklPhyRegister, _value: u32) {}
+        fn dkl_phy_rmw(&mut self, _port: Port, _reg: DklPhyRegister, _clear: u32, _set: u32) {}
+        fn mg_dp_mode_read(&mut self, _port: Port, _lane: u8) -> u32 { 0 }
+        fn mg_dp_mode_write(&mut self, _port: Port, _lane: u8, _value: u32) {}
+    }
+
+    #[test]
+    fn transcoder_func_ctl_uses_drm_sync_flag_bits_and_gen13_width_rules() {
+        const DRM_MODE_FLAG_PHSYNC: u32 = 1 << 0;
+        const DRM_MODE_FLAG_PVSYNC: u32 = 1 << 2;
+        let encoder = DdiEncoder {
+            port: Port::A,
+            output: OutputType::Hdmi,
+            display: Platform { display_ver: 13, alderlake_p: true, ..Platform::default() },
+            ..DdiEncoder::default()
+        };
+        let state = CrtcState {
+            output: OutputType::Hdmi,
+            has_hdmi_sink: true,
+            pipe_bpp: 24,
+            mode_flags: DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC,
+            ..CrtcState::default()
+        };
+        assert_eq!(intel_ddi_transcoder_func_reg_val_get(&mut NoIo, &encoder, &state), 0x8803_0000);
+        let negative_sync = CrtcState { mode_flags: 0, ..state };
+        assert_eq!(intel_ddi_transcoder_func_reg_val_get(&mut NoIo, &encoder, &negative_sync), 0x8800_0000);
+    }
+}
