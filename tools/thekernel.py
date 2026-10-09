@@ -790,9 +790,9 @@ def lint_cmd(args: argparse.Namespace) -> int:
     # Link the product kernel with the opt-in translation feature. Keep the
     # normal profile untouched: this is an additional, non-default gate.
     generate_config(artifacts)
-    run_checked(["cargo", "build", "--locked", "-p", "tk-kernel",
-                 "--target", TARGET, "--release", "--features",
-                 f"{kernel_features(artifacts)},intel-upstream-gt"],
+    run_checked(["cargo", "build", "--locked", "-p", "thekernel",
+                 "--bin", "thekernel", "--target", TARGET, "--release", "--features",
+                 f"{kernel_features(artifacts)},tk-kernel/intel-upstream-gt"],
                 env=command_env(artifacts))
     return 0
 

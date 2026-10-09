@@ -8,7 +8,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use kernel_guard::NoPreempt;
+use kernel_guard::{BaseGuard, NoPreempt};
 
 use crate::{
     intel_breadcrumbs_types_upstream::IntelBreadcrumbs, intel_context_upstream::IrqWork,
