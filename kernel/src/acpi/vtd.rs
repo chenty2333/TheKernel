@@ -1,10 +1,10 @@
 //! VT-d setup with translation enabled when a supported DMAR is present.
 //! Requester-specific DMA domains are enabled by default; `iommu_domains=off`
 //! selects the shared DMA context, and `intel_iommu=off` selects identity DMA.
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use core::{
     ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
 
 use axalloc::{UsageKind, global_allocator};
@@ -25,9 +25,9 @@ use tk_vtd::{
     reg::{
         ContextEntry, DMAR_CAP_FRO, DMAR_CAP_MGAW, DMAR_CAP_ND, DMAR_CAP_NFR, DMAR_CAP_RWBF,
         DMAR_CAP_SAGAW, DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS, DMAR_CAP_SPS_2M, DMAR_CTX2_AW_4LVL,
-        DMAR_ECAP_C, DMAR_ECAP_EIM, DMAR_ECAP_IR, DMAR_ECAP_QI, DMAR_FECTL_IM, DMAR_FECTL_REG,
-        DMAR_FRCD2_F, DMAR_FRCD2_F32, DMAR_FSTS_FRI, DMAR_IECTL_IM, DMAR_IECTL_REG, DMAR_PTE_R,
-        DMAR_PTE_W, RootEntry,
+        DMAR_ECAP_C, DMAR_ECAP_EIM, DMAR_ECAP_IR, DMAR_ECAP_QI, DMAR_FEADDR_REG, DMAR_FECTL_IM,
+        DMAR_FECTL_REG, DMAR_FEDATA_REG, DMAR_FEUADDR_REG, DMAR_FRCD2_F, DMAR_FRCD2_F32,
+        DMAR_FSTS_FRI, DMAR_IECTL_IM, DMAR_IECTL_REG, DMAR_PTE_R, DMAR_PTE_W, RootEntry,
     },
     utils::{self, RegisterIo},
 };
@@ -42,12 +42,25 @@ const ECAP: usize = 0x10;
 const GCMD: usize = 0x18;
 const GSTS: usize = 0x1c;
 const FSTS: usize = 0x34;
+const FECTL: usize = DMAR_FECTL_REG as usize;
+const FEDATA: usize = DMAR_FEDATA_REG as usize;
+const FEADDR: usize = DMAR_FEADDR_REG as usize;
+const FEUADDR: usize = DMAR_FEUADDR_REG as usize;
 const GSTS_TES: u32 = 1 << 31;
 const GSTS_QIES: u32 = 1 << 26;
 const GSTS_IRES: u32 = 1 << 25;
 const FSTS_PPF: u32 = 1 << 1;
 const FSTS_PFO: u32 = 1;
 const FSTS_PRO: u32 = 1 << 7;
+const FSTS_AFO: u32 = 1 << 2;
+const FSTS_APF: u32 = 1 << 3;
+const FSTS_IQE: u32 = 1 << 4;
+const FSTS_ICE: u32 = 1 << 5;
+const FSTS_ITE: u32 = 1 << 6;
+const FSTS_FAULT_STATUS_MASK: u32 =
+    FSTS_PPF | FSTS_PFO | FSTS_PRO | FSTS_AFO | FSTS_APF | FSTS_IQE | FSTS_ICE | FSTS_ITE;
+const MAX_FAULT_DRAIN_RETRIES: usize = 8;
+const FAULT_IRQ_VECTOR_COUNT: usize = 256;
 const QI_ORDER: u32 = 2;
 const QI_BYTES: usize = (1 << QI_ORDER) * PAGE_SIZE as usize;
 const QI_PAGES: usize = (1 << QI_ORDER) + 1;
@@ -65,6 +78,17 @@ static DIRECT_IDENTITY_LEASES: SpinNoIrq<Vec<DirectIdentityLease>> = SpinNoIrq::
 /// Why initialization failed closed, repeated when PCI admission is refused so
 /// the reason sits next to the refusal on a screen-only machine.
 static FAILURE: SpinNoIrq<Option<InitFailure>> = SpinNoIrq::new(None);
+static FAULT_IRQ_MMIO: [AtomicUsize; FAULT_IRQ_VECTOR_COUNT] =
+    [const { AtomicUsize::new(0) }; FAULT_IRQ_VECTOR_COUNT];
+static FAULT_IRQ_PENDING: [AtomicBool; FAULT_IRQ_VECTOR_COUNT] =
+    [const { AtomicBool::new(false) }; FAULT_IRQ_VECTOR_COUNT];
+static FAULT_IRQ_MASK_FAILED: [AtomicBool; FAULT_IRQ_VECTOR_COUNT] =
+    [const { AtomicBool::new(false) }; FAULT_IRQ_VECTOR_COUNT];
+static FAULT_IRQ_UNMASKED_ONCE: [AtomicBool; FAULT_IRQ_VECTOR_COUNT] =
+    [const { AtomicBool::new(false) }; FAULT_IRQ_VECTOR_COUNT];
+static FAULT_DRAINER_READY: AtomicBool = AtomicBool::new(false);
+static FAULT_DRAINER_STARTED: AtomicBool = AtomicBool::new(false);
+static FAULT_DRAIN_WAIT_QUEUE: axtask::WaitQueue = axtask::WaitQueue::new();
 
 #[derive(Clone, Copy, Debug)]
 struct InitFailure {
@@ -359,6 +383,188 @@ struct Unit {
     root_physical: u64,
     ir_table: Option<DmaBlock>,
     ir: Option<InterruptRemapper>,
+    fault_irq: Option<FaultIrq>,
+}
+
+#[derive(Clone, Copy)]
+struct FaultIrq {
+    vector: usize,
+    programmed: bool,
+}
+
+fn fault_msi_register_writes(address: u64, data: u32) -> [(usize, u32); 3] {
+    [
+        (FEDATA, data),
+        (FEADDR, address as u32),
+        (FEUADDR, (address >> 32) as u32),
+    ]
+}
+
+fn program_fault_msi(
+    address: u64,
+    data: u32,
+    mut write32: impl FnMut(usize, u32),
+    mut read32: impl FnMut(usize) -> u32,
+) -> Result<(), Error> {
+    for (offset, value) in fault_msi_register_writes(address, data) {
+        write32(offset, value);
+    }
+    if fault_msi_register_writes(address, data)
+        .into_iter()
+        .any(|(offset, expected)| read32(offset) != expected)
+    {
+        return Err(Error::MapFailed);
+    }
+    Ok(())
+}
+
+fn rearm_fault_event(
+    mut read_status: impl FnMut() -> u32,
+    mut drain: impl FnMut(u32) -> Result<(), Error>,
+    mut read_control: impl FnMut() -> u32,
+    mut write_control: impl FnMut(u32),
+) -> Result<(), Error> {
+    for _ in 0..MAX_FAULT_DRAIN_RETRIES {
+        let status = read_status();
+        if status & FSTS_FAULT_STATUS_MASK != 0 {
+            drain(status)?;
+            continue;
+        }
+
+        // Linux's DMAR MSI unmask path writes zero to FECTL; do not echo IP,
+        // which is write-one-to-clear. A fault racing the following status
+        // observation is either drained below or retriggers on FECTL.IP.
+        write_control(0);
+        if read_control() & DMAR_FECTL_IM as u32 != 0 {
+            return Err(Error::MapFailed);
+        }
+        let raced_status = read_status();
+        if raced_status & FSTS_FAULT_STATUS_MASK == 0 {
+            return Ok(());
+        }
+        write_control(DMAR_FECTL_IM as u32);
+        if read_control() & DMAR_FECTL_IM as u32 == 0 {
+            return Err(Error::MapFailed);
+        }
+    }
+    Err(Error::Timeout)
+}
+
+/// Trap-entry observer for the DMAR's direct, non-PCI fault-event MSI.
+/// Keep this bounded: no locks, logging, allocation, or register scanning.
+fn vtd_fault_irq_observer(vector: usize, _frame: &axcpu::TrapFrame) {
+    let Some(mmio_slot) = FAULT_IRQ_MMIO.get(vector) else {
+        return;
+    };
+    let mmio = mmio_slot.load(Ordering::Acquire);
+    if mmio == 0 {
+        return;
+    }
+
+    // SAFETY: setup published the stable mapped DRHD register base for this
+    // reserved vector before programming FEADDR/FEDATA or unmasking FECTL.
+    let control = unsafe {
+        ((mmio + FECTL) as *mut u32).write_volatile(DMAR_FECTL_IM as u32);
+        ((mmio + FECTL) as *const u32).read_volatile()
+    };
+    FAULT_IRQ_MASK_FAILED[vector].store(control & DMAR_FECTL_IM as u32 == 0, Ordering::Release);
+    FAULT_IRQ_PENDING[vector].store(true, Ordering::Release);
+}
+
+/// Normal IRQ callback runs after the trap observer; wake the task-context
+/// drain without yielding or touching the Manager lock.
+fn vtd_fault_irq_handler() {
+    FAULT_DRAIN_WAIT_QUEUE.notify_all(false);
+}
+
+fn fault_irq_pending() -> bool {
+    FAULT_IRQ_PENDING
+        .iter()
+        .any(|pending| pending.load(Ordering::Acquire))
+}
+
+fn start_fault_drain_worker() -> bool {
+    if FAULT_DRAINER_STARTED.load(Ordering::Acquire) {
+        return true;
+    }
+    if FAULT_DRAINER_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return FAULT_DRAINER_STARTED.load(Ordering::Acquire);
+    }
+    let mut name = String::new();
+    if name.try_reserve_exact("vtd-fault-drain".len()).is_err() {
+        FAULT_DRAINER_STARTED.store(false, Ordering::Release);
+        return false;
+    }
+    name.push_str("vtd-fault-drain");
+    if axtask::try_spawn_with_name(vtd_fault_drain_worker, name).is_err() {
+        FAULT_DRAINER_STARTED.store(false, Ordering::Release);
+        return false;
+    }
+    true
+}
+
+fn vtd_fault_drain_worker() {
+    loop {
+        if FAULT_DRAIN_WAIT_QUEUE
+            .wait_until(|| FAULT_DRAINER_READY.load(Ordering::Acquire) && fault_irq_pending())
+            .is_err()
+        {
+            // Without a functioning wait path, keep every source masked rather
+            // than spinning or doing the drain in hard-IRQ context.
+            FAULT_DRAINER_READY.store(false, Ordering::Release);
+            error!("vtd: fault drain worker lost its wait path; fault MSI sources remain masked");
+            return;
+        }
+
+        let manager_guard = MANAGER.lock();
+        let Some(manager) = manager_guard.as_ref() else {
+            FAULT_DRAINER_READY.store(false, Ordering::Release);
+            error!("vtd: fault drain worker has no published Manager; fault sources remain masked");
+            return;
+        };
+        for vector in 0..FAULT_IRQ_VECTOR_COUNT {
+            if !FAULT_IRQ_PENDING[vector].swap(false, Ordering::AcqRel) {
+                continue;
+            }
+            if FAULT_IRQ_MASK_FAILED[vector].load(Ordering::Acquire) {
+                error!(
+                    "vtd: fault vector {vector:#x} failed FECTL mask readback; keeping it \
+                     quarantined"
+                );
+                continue;
+            }
+            let mmio = FAULT_IRQ_MMIO[vector].load(Ordering::Acquire);
+            let Some(unit) = manager.units.iter().find(|unit| {
+                unit.mmio == mmio
+                    && unit
+                        .fault_irq
+                        .is_some_and(|irq| irq.vector == vector && irq.programmed)
+            }) else {
+                error!(
+                    "vtd: fault vector {vector:#x} has no matching unit owner; keeping it masked"
+                );
+                continue;
+            };
+            match unit.rearm_fault_interrupt() {
+                Ok(()) => {
+                    if !FAULT_IRQ_UNMASKED_ONCE[vector].swap(true, Ordering::AcqRel) {
+                        info!(
+                            "vtd: DRHD {:#x} fault MSI vector={vector:#x} unmasked",
+                            unit.register_base
+                        );
+                    }
+                }
+                Err(error) => error!(
+                    "vtd: fault drain/rearm failed DRHD {:#x} vector={vector:#x}: {error:?}; \
+                     keeping it masked",
+                    unit.register_base
+                ),
+            }
+        }
+    }
 }
 
 fn cap_domain_count(cap: u64) -> u32 {
@@ -420,11 +626,7 @@ fn probe_unit(register_base: u64) -> Result<UnitProbe, Error> {
 }
 
 impl Unit {
-    fn check_faults(&self) -> Result<(), Error> {
-        let status = read32(self, FSTS);
-        if status & (FSTS_PPF | FSTS_PFO | FSTS_PRO) == 0 {
-            return Ok(());
-        }
+    fn drain_fault_status(&self, status: u32) -> Result<(), Error> {
         if status & FSTS_PPF != 0 {
             let cap = read64(self, CAP);
             drain_primary_fault_records(
@@ -440,11 +642,142 @@ impl Unit {
                 },
             )?;
         }
+        if status & (FSTS_PFO | FSTS_PRO | FSTS_AFO | FSTS_APF | FSTS_IQE | FSTS_ICE | FSTS_ITE)
+            != 0
+        {
+            error!("vtd: fault/status overflow or invalidation error FSTS={status:#x}");
+        }
         // Return primary fault records to hardware before acknowledging their
         // FSTS summary bits. Linux's dmar_fault() also clears FRCD.F for each
         // record and acknowledges PPF/PFO/PRO afterward.
-        write32(self, FSTS, status & (FSTS_PPF | FSTS_PFO | FSTS_PRO));
+        write32(self, FSTS, status & FSTS_FAULT_STATUS_MASK);
+        Ok(())
+    }
+
+    fn check_faults(&self) -> Result<(), Error> {
+        let status = read32(self, FSTS);
+        if status & FSTS_FAULT_STATUS_MASK == 0 {
+            return Ok(());
+        }
+        self.drain_fault_status(status)?;
         Err(Error::MapFailed)
+    }
+
+    fn mask_fault_event(&self) -> Result<(), Error> {
+        if let Some(mask) = fault_event_mask_write(read32(self, FECTL)) {
+            write32(self, FECTL, mask);
+        }
+        if read32(self, FECTL) & DMAR_FECTL_IM as u32 == 0 {
+            return Err(Error::MapFailed);
+        }
+        Ok(())
+    }
+
+    fn configure_fault_interrupt(
+        &mut self,
+        hardware_touched: &mut bool,
+    ) -> Result<(), (&'static str, Error)> {
+        // Never let a firmware-owned FEADDR/FEDATA receive a fault before
+        // this DRHD has an explicitly registered owner.
+        if let Some(mask) = fault_event_mask_write(read32(self, FECTL)) {
+            *hardware_touched = true;
+            write32(self, FECTL, mask);
+        }
+        if read32(self, FECTL) & DMAR_FECTL_IM as u32 == 0 {
+            return Err(("fault-event interrupt mask", Error::MapFailed));
+        }
+
+        if let Some((address, data, vector)) =
+            axhal::irq::allocate_dmar_fault_msi(vtd_fault_irq_observer, vtd_fault_irq_handler)
+        {
+            let Some(pending) = FAULT_IRQ_PENDING.get(vector) else {
+                // The platform allocator should only return 8-bit vectors.
+                // Keep the vector permanently owned rather than risk reuse if
+                // that contract is ever violated.
+                return Err(("fault-event vector range", Error::InvalidRange));
+            };
+            if FAULT_IRQ_MMIO[vector]
+                .compare_exchange(0, self.mmio, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err((
+                    "fault-event vector owner collision",
+                    Error::InvalidStructure,
+                ));
+            }
+            pending.store(false, Ordering::Release);
+            FAULT_IRQ_MASK_FAILED[vector].store(false, Ordering::Release);
+            self.fault_irq = Some(FaultIrq {
+                vector,
+                programmed: false,
+            });
+            *hardware_touched = true;
+            let programming = program_fault_msi(
+                address,
+                data,
+                |offset, value| write32(self, offset, value),
+                |offset| read32(self, offset),
+            );
+            // A partial/misrouted FE write must never become active. The
+            // vector stays owned, but this unit remains on polled faults.
+            if self.mask_fault_event().is_err() {
+                return Err(("fault-event mask after FE programming", Error::MapFailed));
+            }
+            if let Err(error) = programming {
+                warn!(
+                    "vtd: DRHD {:#x} fault MSI register readback failed ({error:?}); retaining \
+                     its vector masked",
+                    self.register_base
+                );
+            } else {
+                self.fault_irq
+                    .as_mut()
+                    .expect("fault vector just installed")
+                    .programmed = true;
+                info!(
+                    "vtd: DRHD {:#x} owns direct fault MSI vector={vector:#x}",
+                    self.register_base
+                );
+            }
+        } else {
+            warn!(
+                "vtd: no owned fault MSI vector for DRHD {:#x}; keeping FECTL masked and \
+                 retaining synchronous FSTS polling",
+                self.register_base
+            );
+        }
+
+        // Match Linux's dmar_fault() startup pass: discard and return any
+        // firmware-era records while the source remains masked.
+        let status = read32(self, FSTS);
+        if status & FSTS_FAULT_STATUS_MASK != 0 {
+            *hardware_touched = true;
+            self.drain_fault_status(status)
+                .map_err(|error| ("startup fault record drain", error))?;
+            if read32(self, FSTS) & FSTS_FAULT_STATUS_MASK != 0 {
+                return Err(("startup fault status did not clear", Error::Timeout));
+            }
+        }
+        Ok(())
+    }
+
+    fn rearm_fault_interrupt(&self) -> Result<(), Error> {
+        let Some(irq) = self.fault_irq else {
+            return Ok(());
+        };
+        if !irq.programmed {
+            return Err(Error::Unsupported);
+        }
+        let result = rearm_fault_event(
+            || read32(self, FSTS),
+            |status| self.drain_fault_status(status),
+            || read32(self, FECTL),
+            |value| write32(self, FECTL, value),
+        );
+        if result.is_err() && self.mask_fault_event().is_err() {
+            FAULT_IRQ_MASK_FAILED[irq.vector].store(true, Ordering::Release);
+        }
+        result
     }
 
     fn invalidate_all(&mut self) -> Result<(), Error> {
@@ -2504,6 +2837,7 @@ fn init_translation(
             root_physical: 0,
             ir_table: None,
             ir: None,
+            fault_irq: None,
         };
         units.push(unit);
     }
@@ -2527,7 +2861,8 @@ fn init_translation(
     // later unit fails after an earlier unit enabled TE, quarantine all of the
     // pages/queues rather than dropping backing memory still visible to DMA.
     let enable_error = units.iter_mut().enumerate().find_map(|(index, unit)| {
-        unit.enable(root.physical, hardware_touched)
+        unit.configure_fault_interrupt(hardware_touched)
+            .and_then(|()| unit.enable(root.physical, hardware_touched))
             .err()
             .map(|failure| (index, failure))
     });
@@ -2589,6 +2924,23 @@ fn init_translation(
     };
     REQUESTER_DOMAINS.store(requester_domains, Ordering::Release);
     MODE.store(MODE_ENABLED, Ordering::Release);
+    if start_fault_drain_worker() {
+        let manager_guard = MANAGER.lock();
+        if let Some(manager) = manager_guard.as_ref() {
+            for unit in &manager.units {
+                if let Some(irq) = unit.fault_irq.filter(|irq| irq.programmed) {
+                    FAULT_IRQ_PENDING[irq.vector].store(true, Ordering::Release);
+                }
+            }
+            FAULT_DRAINER_READY.store(true, Ordering::Release);
+            FAULT_DRAIN_WAIT_QUEUE.notify_all(false);
+            info!("vtd: owned per-DRHD fault MSI drain worker ready");
+        } else {
+            warn!("vtd: no published Manager for fault MSI worker; all fault events remain masked");
+        }
+    } else {
+        warn!("vtd: fault drain worker unavailable; all fault-event MSIs remain masked");
+    }
     info!(
         "vtd: DMAR units={} identity_end={maximum:#x} QI enabled; PCI DMA mapping active",
         dmar.units.len()
@@ -2841,7 +3193,7 @@ impl tk_vtd::PlatformIdentityDma for PlatformIdentityDma {
 mod tests {
     use alloc::{sync::Arc, vec, vec::Vec};
     use core::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         sync::atomic::{AtomicUsize, Ordering},
     };
 
@@ -2852,15 +3204,16 @@ mod tests {
 
     use super::{
         DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS_2M, DMAR_ECAP_C, DMAR_ECAP_EIM, DMAR_ECAP_IR,
-        DMAR_ECAP_QI, DMAR_FECTL_IM, DomainState, Error, IdentityDmaOwner, IdentityPage, IrRoute,
-        IrRouteState, KernelPageMemory, MODE_ENABLED, MODE_FAILED, MODE_IDENTITY, MODE_UNKNOWN,
-        Mapping, MappingState, PageMemory, RequesterIdentityLease, UnitProbe, cap_domain_count,
-        complete_domain_install, direct_identity_acquire, direct_identity_lease_allowed,
-        direct_identity_map, direct_identity_release, direct_identity_unmap,
-        drain_primary_fault_records, fault_event_mask_write, find_owned_msi_vector,
-        identity_dma_in_mode, identity_fallback_safe_before_enable, identity_pages_for_path,
-        pci_dma_allowed_in_mode, prepare_identity_batch_record, publish_identity_batch,
-        publish_mapping_after_invalidation, quarantine_boot_resources, register_identity_lease,
+        DMAR_ECAP_QI, DMAR_FECTL_IM, DomainState, Error, FEADDR, FEDATA, FEUADDR, IdentityDmaOwner,
+        IdentityPage, IrRoute, IrRouteState, KernelPageMemory, MODE_ENABLED, MODE_FAILED,
+        MODE_IDENTITY, MODE_UNKNOWN, Mapping, MappingState, PageMemory, RequesterIdentityLease,
+        UnitProbe, cap_domain_count, complete_domain_install, direct_identity_acquire,
+        direct_identity_lease_allowed, direct_identity_map, direct_identity_release,
+        direct_identity_unmap, drain_primary_fault_records, fault_event_mask_write,
+        find_owned_msi_vector, identity_dma_in_mode, identity_fallback_safe_before_enable,
+        identity_pages_for_path, pci_dma_allowed_in_mode, prepare_identity_batch_record,
+        program_fault_msi, publish_identity_batch, publish_mapping_after_invalidation,
+        quarantine_boot_resources, rearm_fault_event, register_identity_lease,
         release_identity_lease, require_no_identity_lease, require_ready_domain,
         retire_identity_batch_record, retire_ir_route_after_invalidation,
         retire_mapping_after_invalidation, store_irte_words, take_domain_id, take_nonreusing_id,
@@ -2977,6 +3330,95 @@ mod tests {
             Err(Error::InvalidStructure)
         );
         assert!(!cleared);
+    }
+
+    #[test]
+    fn fault_msi_registers_are_published_data_low_address_then_upper_address() {
+        let registers = RefCell::new(vec![(FEDATA, 0), (FEADDR, 0), (FEUADDR, 0)]);
+        let writes = RefCell::new(Vec::new());
+        let address = 0x1234_5678_9abc_def0;
+        let data = 0xbeef;
+        program_fault_msi(
+            address,
+            data,
+            |offset, value| {
+                writes.borrow_mut().push((offset, value));
+                registers
+                    .borrow_mut()
+                    .iter_mut()
+                    .find(|(reg, _)| *reg == offset)
+                    .unwrap()
+                    .1 = value;
+            },
+            |offset| {
+                registers
+                    .borrow()
+                    .iter()
+                    .find(|(reg, _)| *reg == offset)
+                    .unwrap()
+                    .1
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *writes.borrow(),
+            [
+                (FEDATA, data),
+                (FEADDR, address as u32),
+                (FEUADDR, (address >> 32) as u32),
+            ]
+        );
+    }
+
+    #[test]
+    fn fault_msi_register_readback_failure_does_not_report_configuration_ready() {
+        let mut writes = 0;
+        assert_eq!(
+            program_fault_msi(0xfee0_0000, 0x41, |_, _| writes += 1, |_| 0),
+            Err(Error::MapFailed)
+        );
+        assert_eq!(writes, 3);
+    }
+
+    #[test]
+    fn fault_rearm_drains_races_before_unmask_and_preserves_mask_on_scan_error() {
+        let mut statuses = [0, super::FSTS_PPF, super::FSTS_PPF, 0, 0].into_iter();
+        let control = Cell::new(DMAR_FECTL_IM as u32);
+        let writes = RefCell::new(Vec::new());
+        let drained = RefCell::new(Vec::new());
+        rearm_fault_event(
+            || statuses.next().unwrap_or(0),
+            |status| {
+                drained.borrow_mut().push(status);
+                Ok(())
+            },
+            || control.get(),
+            |value| {
+                writes.borrow_mut().push(value);
+                control.set(value);
+            },
+        )
+        .unwrap();
+        assert_eq!(*drained.borrow(), [super::FSTS_PPF]);
+        assert_eq!(*writes.borrow(), [0, DMAR_FECTL_IM as u32, 0]);
+        assert_eq!(control.get() & DMAR_FECTL_IM as u32, 0);
+
+        let remained_masked = Cell::new(DMAR_FECTL_IM as u32);
+        let mut attempted_unmask = false;
+        assert_eq!(
+            rearm_fault_event(
+                || super::FSTS_PPF,
+                |_| Err(Error::InvalidStructure),
+                || remained_masked.get(),
+                |value| {
+                    attempted_unmask |= value == 0;
+                    remained_masked.set(value);
+                },
+            ),
+            Err(Error::InvalidStructure)
+        );
+        assert!(!attempted_unmask);
+        assert_ne!(remained_masked.get() & DMAR_FECTL_IM as u32, 0);
     }
 
     #[test]
