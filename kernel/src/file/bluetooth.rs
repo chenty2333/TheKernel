@@ -378,6 +378,9 @@ mod tests {
         assert!(socket.get_hci_option(2).is_err());
     }
 
+    // fanout_hci_management_events() is only compiled with the `input` feature;
+    // without it the function is a no-op, so this test is gated the same way.
+    #[cfg(feature = "input")]
     #[test]
     fn inquiry_result_is_fanned_out_as_device_found() {
         let socket = HciSocket::new();
