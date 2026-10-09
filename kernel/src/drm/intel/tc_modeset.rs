@@ -47,7 +47,6 @@ const DDI_ENABLE: u32 = 1 << 31;
 const DDI_IDLE: u32 = 1 << 7;
 const DDI_TC_PHY_OWNERSHIP: u32 = 1 << 6;
 const DDI_LANE_REVERSAL: u32 = 1 << 16;
-const AVI_ENABLE: u32 = 1 << 12;
 const UNDERRUN: u32 = 1 << 31;
 const MODE_SHADOW: [u32; 14] = [
     0x70030, 0x70028, 0x6007c, 0x60000, 0x60004, 0x60008, 0x6000c, 0x60010, 0x60014, 0x6001c,
@@ -670,6 +669,137 @@ fn source_tc_encoder(port: TcPort) -> Result<intel_display::intel_ddi_full::DdiE
     })
 }
 
+/// Kernel adapter for the source Haswell/Gen12+ AVI-DIP writer. Only the
+/// transcoder-A AVI control and its eight data dwords are addressable here.
+struct TcAviIo<'a, R> {
+    registers: &'a R,
+    read_failed: bool,
+    write_failed: bool,
+}
+
+impl<'a, R: Registers> TcAviIo<'a, R> {
+    fn new(registers: &'a R) -> Self {
+        Self {
+            registers,
+            read_failed: false,
+            write_failed: false,
+        }
+    }
+
+    fn allowed_register(register: u32) -> bool {
+        register == 0x60200
+            || ((0x60220..=0x6023c).contains(&register) && (register - 0x60220) % 4 == 0)
+    }
+}
+
+impl<R: Registers> intel_display::intel_hdmi_full::HdmiIo for TcAviIo<'_, R> {
+    fn register(&self, register: intel_display::intel_hdmi_full::InfoframeRegister) -> u32 {
+        use intel_display::intel_hdmi_full::{InfoframeFamily, InfoframeRegister};
+
+        match register {
+            InfoframeRegister::Control {
+                family: InfoframeFamily::Haswell,
+                pipe: 0,
+                transcoder: 0,
+            } => 0x60200,
+            InfoframeRegister::Data {
+                family: InfoframeFamily::Haswell,
+                pipe: 0,
+                transcoder: 0,
+                packet_type: intel_display::intel_hdmi_full::HDMI_INFOFRAME_TYPE_AVI,
+                dword,
+            } if dword < 8 => 0x60220 + u32::from(dword) * 4,
+            _ => u32::MAX,
+        }
+    }
+
+    fn read32(&mut self, register: u32) -> u32 {
+        if !Self::allowed_register(register) {
+            self.read_failed = true;
+            return u32::MAX;
+        }
+        self.registers
+            .read(mmio_register(register, false))
+            .unwrap_or_else(|| {
+                self.read_failed = true;
+                u32::MAX
+            })
+    }
+
+    fn write32(&mut self, register: u32, value: u32) {
+        if !Self::allowed_register(register) {
+            self.write_failed = true;
+            return;
+        }
+        if !self.registers.write(mmio_register(register, true), value) {
+            self.write_failed = true;
+        }
+    }
+
+    fn hdmi_port_enabled(&mut self) -> bool {
+        false
+    }
+    fn transcoder_function_enabled(&mut self, _transcoder: u8) -> bool {
+        false
+    }
+    fn pack_infoframe(
+        &mut self,
+        _packet_type: u8,
+        _frame: &[u8],
+        _out: &mut [u8],
+    ) -> Result<usize, ()> {
+        Err(())
+    }
+    fn write_infoframe(&mut self, _packet_type: u8, _bytes: &[u8], _len: usize) {}
+    fn read_infoframe(&mut self, _packet_type: u8, _bytes: &mut [u8]) {}
+    fn unpack_infoframe(&mut self, _packet_type: u8, _packed: &[u8], _out: &mut [u8]) -> bool {
+        false
+    }
+}
+
+fn write_pipe_a_avi<R: Registers>(registers: &R, avi_words: &[u32; 8]) -> Result<(), String> {
+    let mut packet = [0u8; 32];
+    for (word, bytes) in avi_words.iter().zip(packet.chunks_exact_mut(4)) {
+        bytes.copy_from_slice(&word.to_le_bytes());
+    }
+    let mut io = TcAviIo::new(registers);
+    intel_display::intel_hdmi_full::hsw_write_infoframe(
+        &mut io,
+        0,
+        13,
+        false,
+        false,
+        intel_display::intel_hdmi_full::HDMI_INFOFRAME_TYPE_AVI,
+        &packet,
+        packet.len(),
+    );
+    if io.read_failed || io.write_failed {
+        return Err(String::from("translated Pipe-A AVI infoframe write failed"));
+    }
+    let control = registers
+        .read(mmio_register(0x60200, false))
+        .ok_or_else(|| String::from("Pipe-A AVI control readback unavailable"))?;
+    if control
+        & intel_display::intel_hdmi_full::hsw_infoframe_enable(
+            intel_display::intel_hdmi_full::HDMI_INFOFRAME_TYPE_AVI,
+        )
+        == 0
+    {
+        return Err(String::from(
+            "Pipe-A AVI enable bit missing after source write",
+        ));
+    }
+    for (index, word) in avi_words.iter().copied().enumerate() {
+        let register = mmio_register(0x60220 + index as u32 * 4, false);
+        if registers.read(register) != Some(word) {
+            return Err(format!(
+                "Pipe-A AVI data readback mismatch at dword {index}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn enable_pipe_a_transcoder_clock<R: Registers>(registers: &R, port: TcPort) -> Result<(), String> {
     use intel_display::intel_ddi_full as i915;
 
@@ -976,12 +1106,7 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
 
     dkl_pll_on(r, timer, port, pll, afc_startup)?;
     enable_pipe_a_transcoder_clock(r, port)?;
-    let avi_control = read(r, 0x60200)?;
-    write(r, 0x60200, avi_control & !AVI_ENABLE)?;
-    for (word, value) in avi.iter().copied().enumerate() {
-        write(r, 0x60220 + word as u32 * 4, value)?;
-    }
-    write(r, 0x60200, avi_control | AVI_ENABLE)?;
+    write_pipe_a_avi(r, avi)?;
     let mode_flags =
         u32::from(function & (1 << 16) != 0) | (u32::from(function & (1 << 17) != 0) << 2);
     enable_pipe_a_transcoder(r, port, mode_flags)?;
@@ -1217,6 +1342,47 @@ mod tests {
         assert_eq!(
             *registers.writes.borrow(),
             [(buffer.offset(), (1 << 16) | (1 << 6) | super::DDI_ENABLE)]
+        );
+    }
+
+    #[test]
+    fn active_tc_path_uses_source_hsw_avi_writer() {
+        let registers = TranscoderModel::default();
+        let control = super::mmio_register(0x60200, true);
+        registers
+            .values
+            .borrow_mut()
+            .insert(control.offset(), (1 << 31) | (1 << 12) | 3);
+        let avi = [
+            0x0403_0201,
+            0x0807_0605,
+            0x0c0b_0a09,
+            0x100f_0e0d,
+            0x1413_1211,
+            0x1817_1615,
+            0x1c1b_1a19,
+            0x201f_1e1d,
+        ];
+
+        super::write_pipe_a_avi(&registers, &avi).unwrap();
+
+        assert_eq!(
+            registers.values.borrow().get(&control.offset()),
+            Some(&((1 << 31) | (1 << 12) | 3))
+        );
+        for (index, word) in avi.iter().copied().enumerate() {
+            assert_eq!(
+                registers.values.borrow().get(&(0x60220 + index as u32 * 4)),
+                Some(&word)
+            );
+        }
+        assert_eq!(
+            registers.writes.borrow().first(),
+            Some(&(0x60200, (1 << 31) | 3))
+        );
+        assert_eq!(
+            registers.writes.borrow().last(),
+            Some(&(0x60200, (1 << 31) | (1 << 12) | 3))
         );
     }
 

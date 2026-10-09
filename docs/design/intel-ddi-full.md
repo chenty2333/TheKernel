@@ -37,4 +37,6 @@ the model test covers the source wait paths and writes.
 It also calls the translated `intel_ddi_enable_transcoder_clock()` and
 `intel_ddi_disable_transcoder_clock()` for transcoder A using the display-13
 TC1/TC2 PHY_F/PHY_G mapping; checked clock-select readbacks replace local
-register-value formulas on both transitions.
+register-value formulas on both transitions. The current TC AVI update also
+uses the translated `hsw_write_infoframe()` through a control-plus-eight-DIP-
+dword adapter, preserving the source disable/data/enable/posting-read order.
