@@ -53,6 +53,10 @@ impl InterruptSource {
 
 /// Native hardware hooks for the IEC invalidation and IRTA/IRE programming.
 pub trait InterruptRemapIo {
+    /// Store the entry and make it visible to the remapper. Return
+    /// [`Error::Quarantined`] if the store may have reached hardware but its
+    /// visibility cannot be confirmed; other errors must mean no publication
+    /// occurred.
     fn store_irte(&mut self, index: u16, entry: Irte) -> Result<(), Error>;
     fn invalidate_iec(&mut self, index: u16, count: u16) -> Result<(), Error>;
     fn invalidate_iec_global(&mut self) -> Result<(), Error>;
@@ -221,7 +225,12 @@ impl InterruptRemapper {
             | DMAR_IRTE1_DM_PHYSICAL
             | DMAR_IRTE1_P;
         if let Err(error) = self.program(io, index as u16, low, requester_id) {
-            self.allocated[index] = false;
+            // A store/invalidation failure after publication leaves the slot
+            // potentially visible to hardware. Only return a slot to the
+            // allocator when the adapter proves that nothing was published.
+            if error != Error::Quarantined {
+                self.allocated[index] = false;
+            }
             return Err(error);
         }
         let cookie = index as u16;
@@ -250,8 +259,9 @@ impl InterruptRemapper {
         io: &mut I,
         cookie: &mut Option<u16>,
     ) -> Result<(), Error> {
-        if let Some(index) = cookie.take() {
+        if let Some(index) = *cookie {
             self.free_entry(io, index)?;
+            *cookie = None;
         }
         Ok(())
     }
@@ -269,6 +279,7 @@ impl InterruptRemapper {
             .entries
             .get_mut(index as usize)
             .ok_or(Error::InvalidRange)?;
+        let old_entry = *entry;
         let high = DMAR_IRTE2_SVT_RID | DMAR_IRTE2_SQ_RID | DMAR_IRTE2_SID_RID(u64::from(rid));
         if entry.irte1 & DMAR_IRTE1_P != 0 {
             if entry.irte2 != high {
@@ -279,8 +290,15 @@ impl InterruptRemapper {
             entry.irte2 = high;
             entry.irte1 = low;
         }
-        io.store_irte(index, *entry)?;
-        io.invalidate_iec(index, 1)
+        if let Err(error) = io.store_irte(index, *entry) {
+            if error != Error::Quarantined {
+                *entry = old_entry;
+            }
+            return Err(error);
+        }
+        // The IRTE has been published. Any IEC failure makes its cache state
+        // ambiguous, regardless of the lower-level timeout/error code.
+        io.invalidate_iec(index, 1).map_err(|_| Error::Quarantined)
     }
 
     /// Clear both IRTE words, invalidate, and release the allocated cookie.
@@ -290,10 +308,18 @@ impl InterruptRemapper {
             .entries
             .get_mut(index as usize)
             .ok_or(Error::InvalidRange)?;
+        let old_entry = *entry;
         entry.irte1 = 0;
         entry.irte2 = 0;
-        io.store_irte(index, *entry)?;
-        io.invalidate_iec(index, 1)?;
+        if let Err(error) = io.store_irte(index, *entry) {
+            if error != Error::Quarantined {
+                *entry = old_entry;
+            }
+            return Err(error);
+        }
+        // Do not free the slot until the clear is globally visible to lookup.
+        io.invalidate_iec(index, 1)
+            .map_err(|_| Error::Quarantined)?;
         self.allocated[index as usize] = false;
         Ok(())
     }
@@ -356,14 +382,25 @@ mod tests {
         invalidated: Vec<(u16, u16)>,
         global: usize,
         enabled: bool,
+        stored: Vec<(u16, Irte)>,
+        store_error: Option<Error>,
+        store_error_after_publish: bool,
+        invalidate_error: Option<Error>,
     }
     impl InterruptRemapIo for Fake {
-        fn store_irte(&mut self, _: u16, _: Irte) -> Result<(), Error> {
+        fn store_irte(&mut self, index: u16, entry: Irte) -> Result<(), Error> {
+            if let Some(error) = self.store_error.take() {
+                if self.store_error_after_publish {
+                    self.stored.push((index, entry));
+                }
+                return Err(error);
+            }
+            self.stored.push((index, entry));
             Ok(())
         }
         fn invalidate_iec(&mut self, index: u16, count: u16) -> Result<(), Error> {
             self.invalidated.push((index, count));
-            Ok(())
+            self.invalidate_error.take().map_or(Ok(()), Err)
         }
         fn invalidate_iec_global(&mut self) -> Result<(), Error> {
             self.global += 1;
@@ -418,6 +455,79 @@ mod tests {
         let mut cookie = Some(route.cookie);
         ir.unmap_ioapic(&mut io, &mut cookie).unwrap();
         assert_eq!(cookie, None);
+    }
+
+    #[test]
+    fn ioapic_map_quarantines_slot_after_ambiguous_store_or_iec_failure() {
+        for fail_store_after_publish in [true, false] {
+            let mut ir = InterruptRemapper::new(2, true).unwrap();
+            let mut io = Fake::default();
+            ir.initialize(&mut io, true, true, 0x2000).unwrap();
+            if fail_store_after_publish {
+                io.store_error = Some(Error::Quarantined);
+                io.store_error_after_publish = true;
+            } else {
+                io.invalidate_error = Some(Error::Timeout);
+            }
+
+            assert_eq!(
+                ir.map_ioapic(&mut io, 0x4321, 3, 0x41, false, true, DeliveryMode::Fixed),
+                Err(Error::Quarantined)
+            );
+            assert!(ir.allocated[0], "ambiguous slot must remain reserved");
+            assert_ne!(ir.entries[0].irte1 & DMAR_IRTE1_P, 0);
+
+            io.store_error = None;
+            io.invalidate_error = None;
+            let next = ir
+                .map_ioapic(&mut io, 0x4321, 3, 0x42, false, true, DeliveryMode::Fixed)
+                .unwrap();
+            assert_eq!(next.cookie, 1, "the possibly published slot is not reused");
+        }
+    }
+
+    #[test]
+    fn ioapic_unmap_retains_cookie_and_slot_until_iec_succeeds() {
+        let mut ir = InterruptRemapper::new(2, true).unwrap();
+        let mut io = Fake::default();
+        ir.initialize(&mut io, true, true, 0x2000).unwrap();
+        let route = ir
+            .map_ioapic(&mut io, 0x4321, 3, 0x41, false, true, DeliveryMode::Fixed)
+            .unwrap();
+        let mut cookie = Some(route.cookie);
+
+        io.invalidate_error = Some(Error::Timeout);
+        assert_eq!(
+            ir.unmap_ioapic(&mut io, &mut cookie),
+            Err(Error::Quarantined)
+        );
+        assert_eq!(cookie, Some(route.cookie));
+        assert!(ir.allocated[route.cookie as usize]);
+
+        assert_eq!(ir.unmap_ioapic(&mut io, &mut cookie), Ok(()));
+        assert_eq!(cookie, None);
+        assert!(!ir.allocated[route.cookie as usize]);
+    }
+
+    #[test]
+    fn ioapic_map_releases_slot_when_store_proves_no_publication() {
+        let mut ir = InterruptRemapper::new(1, true).unwrap();
+        let mut io = Fake::default();
+        ir.initialize(&mut io, true, true, 0x2000).unwrap();
+        io.store_error = Some(Error::InvalidRange);
+
+        assert_eq!(
+            ir.map_ioapic(&mut io, 0x4321, 3, 0x41, false, true, DeliveryMode::Fixed),
+            Err(Error::InvalidRange)
+        );
+        assert!(!ir.allocated[0]);
+        assert_eq!(ir.entries[0], Irte::default());
+
+        io.store_error = None;
+        let route = ir
+            .map_ioapic(&mut io, 0x4321, 3, 0x42, false, true, DeliveryMode::Fixed)
+            .unwrap();
+        assert_eq!(route.cookie, 0);
     }
 
     #[test]
