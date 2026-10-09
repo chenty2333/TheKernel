@@ -119,7 +119,9 @@ fn validate_unit_capabilities(
     host_address_width: u8,
     intremap: bool,
 ) -> Result<(), Error> {
-    let mgaw = DMAR_CAP_MGAW(cap) as u8;
+    // CAP.MGAW encodes the supported physical width minus one. The BSD
+    // register extractor is raw; convert it before comparing to bit widths.
+    let mgaw = (DMAR_CAP_MGAW(cap) + 1) as u8;
     if DMAR_CAP_SAGAW(cap) & DMAR_CAP_SAGAW_4LVL == 0
         || DMAR_CAP_SPS(cap) & DMAR_CAP_SPS_2M == 0
         || mgaw < 39
@@ -352,7 +354,7 @@ impl Unit {
         let extended = read64(self, ECAP);
         if DMAR_CAP_SAGAW(capability) & DMAR_CAP_SAGAW_4LVL == 0
             || DMAR_CAP_SPS(capability) & DMAR_CAP_SPS_2M == 0
-            || DMAR_CAP_MGAW(capability) < 39
+            || DMAR_CAP_MGAW(capability) + 1 < 39
         {
             return Err(("capability recheck", Error::Unsupported));
         }
@@ -1746,7 +1748,7 @@ mod tests {
 
     #[test]
     fn all_drdhs_are_checked_for_host_and_unit_address_widths() {
-        let cap = (39 << 16) | (DMAR_CAP_SAGAW_4LVL << 8) | (DMAR_CAP_SPS_2M << 34);
+        let cap = (38 << 16) | (DMAR_CAP_SAGAW_4LVL << 8) | (DMAR_CAP_SPS_2M << 34);
         let ecap = DMAR_ECAP_QI | DMAR_ECAP_IR | DMAR_ECAP_EIM;
         assert_eq!(
             validate_unit_capabilities(cap, ecap, 1 << 38, 39, false),
@@ -1754,17 +1756,25 @@ mod tests {
         );
         assert_eq!(
             validate_unit_capabilities(cap, ecap, 1 << 39, 39, false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_unit_capabilities(cap, ecap, (1 << 39) + 4096, 39, false),
             Err(Error::InvalidRange)
         );
         assert_eq!(
             validate_unit_capabilities(cap, ecap, 1 << 38, 38, false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_unit_capabilities(cap, ecap, (1 << 38) + 4096, 38, false),
             Err(Error::InvalidRange)
         );
     }
 
     #[test]
     fn register_invalidation_supports_dma_without_qi_but_not_interrupt_remapping() {
-        let cap = (39 << 16) | (DMAR_CAP_SAGAW_4LVL << 8) | (DMAR_CAP_SPS_2M << 34);
+        let cap = (38 << 16) | (DMAR_CAP_SAGAW_4LVL << 8) | (DMAR_CAP_SPS_2M << 34);
         assert_eq!(
             validate_unit_capabilities(cap, 0, 1 << 38, 39, false),
             Ok(())
@@ -1777,7 +1787,7 @@ mod tests {
 
     #[test]
     fn all_drhd_capabilities_are_validated_before_any_unit_is_enabled() {
-        let cap = (39 << 16) | (DMAR_CAP_SAGAW_4LVL << 8) | (DMAR_CAP_SPS_2M << 34);
+        let cap = (38 << 16) | (DMAR_CAP_SAGAW_4LVL << 8) | (DMAR_CAP_SPS_2M << 34);
         let ecap = DMAR_ECAP_QI | DMAR_ECAP_IR | DMAR_ECAP_EIM;
         let probes = [
             UnitProbe {
