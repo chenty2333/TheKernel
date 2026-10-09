@@ -26,25 +26,32 @@ slot and the unpowered sibling is excluded), then calls source
 generic DKL `get_hw_state` dispatcher still independently checks the selected
 PLL before/after each restricted modeset, comparing its enable bit and
 source-comparable masked DKL register fields with the firmware capture via
-translated `icl_compare_hw_state`. This remains readout-only live-path
-integration: atomic reservation/commit still does not use the manager, and
-`tc_modeset` owns the direct DKL enable/disable sequence. The pin
-backend revalidates held source-mapped power requests, D0,
-DC-state, and refclk on every hook/access; logical DPLL power cookies never
-manufacture `PowerState` reference counts or change wells.
+translated `icl_compare_hw_state`. The adapter reconstructs Pipe-A's MG port
+reservation from that readout and uses translated source compute/release/
+reserve at initial readout. On later admitted TC mode changes, the manager
+plans and swaps the selected port's default-TBT and MG-DKL reservations. Its
+source DKL disable/enable callbacks now own the active PLL off/program/lock
+sequence inside the existing transaction, with a software undo token restored
+only after the outer rollback independently verifies the old hardware image.
+The rest of `tc_modeset` remains the bounded TC HDMI transaction; this does not
+wire the generic HSW CRTC/atomic commit-tail lifecycle. The pin backend
+revalidates held source-mapped power requests, D0, DC-state, and refclk on every
+hook/access; logical DPLL power cookies never manufacture `PowerState`
+reference counts or change wells.
 
 Before manager initialization, fastboot now carries the parsed VBT AFC-startup
 override (including the distinction between no override and an explicit zero)
-into `IntelDpllDisplay::vbt`. The source DKL writer therefore uses the same
-override policy as the existing standalone DKL planner if/when manager enable
-is called; this does not yet route active hardware writes through that manager.
+into `IntelDpllDisplay::vbt`; the source DKL writer uses the same override on
+the active TC transaction.
 
-For each admitted TC HDMI mode transition, fastboot also calls the translated
-`intel_dpll_compute()` for the selected Pipe-A/TC encoder and compares the
-source-computed DKL fields with the transaction's planned DKL image before any
-display write. A mismatch refuses the transition. This is a source-backed
-clock-plan cross-check, not `reserve`/`swap`/`enable`/`disable`; the existing
-outer transaction still owns hardware before-images and direct DKL sequencing.
+For each admitted TC HDMI mode transition, fastboot calls translated
+`intel_dpll_compute()` and `intel_dpll_reserve()` for the selected Pipe-A/TC
+encoder and compares the source-computed DKL fields with the transaction's
+planned DKL image before any display write. A mismatch refuses the transition.
+The host source test compares manager calculations against the standalone DKL
+planner at 148.5 and 297 MHz, including an explicit AFC startup override; it
+passes. Kernel test code is compile-checked but the bare-metal host linker
+cannot execute its per-CPU test image.
 The source crate has a model test that compares the manager computation to the
 standalone DKL planner at 148.5 and 297 MHz, including an explicit AFC startup
 override; it passes on the host test target.
@@ -53,7 +60,8 @@ The scoped manager now remembers which TC port was selected and checks
 allocator/CRTC arguments against it before entering source compute/reserve/
 release or DKL enable/disable hooks. It rejects sibling TC selection, legacy
 C/D aliases that do not match the selected DKL PLL, and invalid CRTC indices.
-This closes an unsafe adapter API gap but is not an active modeset callsite.
+This guard is used by the active selected-port modeset path and prevents the
+single-port `PowerPin` from being reinterpreted as power for its hidden sibling.
 
 The source manager's unrestricted all-PLL readout is not called with this
 single-port pin: its TC1/TC2 DKL enumeration would touch the unpowered sibling.
@@ -68,4 +76,4 @@ tests but does not execute them. The focused test binary compiles but is not
 currently linkable in the host test configuration because of existing
 per-CPU `R_X86_64_32S` relocation errors. No native hardware operation has
 been verified. The module still does not replace the restricted TC transaction
-with the generic atomic manager lifecycle.
+with the generic HSW/atomic commit-tail lifecycle.

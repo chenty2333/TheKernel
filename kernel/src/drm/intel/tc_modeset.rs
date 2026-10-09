@@ -17,7 +17,9 @@
 //! Restricted live TC HDMI modeset sequence. Admission and complete before-
 //! image recovery are owned by `fastboot`; this file only performs a forward
 //! programming pass after the active TC link, required power wells, firmware
-//! framebuffer ownership, target timing, PLL and watermark policy were proved.
+//! framebuffer ownership, target timing, PLL reservation and watermark policy
+//! were proved. The forward pass uses translated shared-DPLL callbacks for
+//! DKL disable/enable; its direct DKL writes remain only for rollback/tests.
 
 use alloc::{format, string::String, vec::Vec};
 
@@ -241,6 +243,14 @@ fn dkl_pll_on<R: Registers, T: PollTimer>(
     let powered = read(r, offset)?;
     write(r, offset, powered | PLL_ENABLE)?;
     poll(r, timer, offset, PLL_LOCK, PLL_LOCK, 600)
+}
+
+/// Optional source shared-DPLL lifecycle operations owned by the enclosing
+/// Native transaction. Rollback uses direct before-image restoration because
+/// source callbacks are void and cannot serve as their own inverse.
+pub(super) trait DpllLifecycle {
+    fn disable(&mut self) -> Result<(), String>;
+    fn enable(&mut self) -> Result<(), String>;
 }
 
 fn wait_two_frames<R: Registers, T: PollTimer>(r: &R, timer: &T) -> Result<(), String> {
@@ -965,6 +975,7 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     restore_plane_ctl: Option<u32>,
     retire_audio_before_link: bool,
     restore_phy: Option<&intel_display::tc::DklPhyState>,
+    mut dpll_lifecycle: Option<&mut dyn DpllLifecycle>,
     display_writes_started: &mut bool,
 ) -> Result<(), String> {
     *display_writes_started = false;
@@ -1112,13 +1123,21 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         ));
     }
     disable_pipe_a_transcoder_clock(r, port)?;
-    dkl_pll_off(r, timer, port)?;
+    if let Some(lifecycle) = dpll_lifecycle.as_deref_mut() {
+        lifecycle.disable()?;
+    } else {
+        dkl_pll_off(r, timer, port)?;
+    }
 
     for planned in shadow {
         write(r, planned.register.offset(), planned.value)?;
     }
 
-    dkl_pll_on(r, timer, port, pll, afc_startup)?;
+    if let Some(lifecycle) = dpll_lifecycle.as_deref_mut() {
+        lifecycle.enable()?;
+    } else {
+        dkl_pll_on(r, timer, port, pll, afc_startup)?;
+    }
     enable_pipe_a_transcoder_clock(r, port)?;
     write_pipe_a_avi(r, avi)?;
     let mode_flags =

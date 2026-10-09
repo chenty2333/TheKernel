@@ -15,17 +15,20 @@ Both modules are exported and compiled by `cargo check -p tk-intel-display
 --lib`; the full crate suite previously passed 150 tests before the remainder
 module was added. The active N305 HDMI planner consumes the translated
 `icl_calc_wrpll()` and `icl_calc_dpll_state()` values. The kernel-side ADL-N
-shared-DPLL adapter now has both the original `PowerState` backend and a
-read-only fastboot-pin backend. Native fastboot persists one manager for the
-KMS lifetime and calls its generic DKL `get_hw_state` for the selected
-TC1/TC2 PLL at admission and on both sides of each restricted modeset,
-refusing if the enable bit or source-comparable masked DKL register fields
-disagree with the firmware capture (`icl_compare_hw_state`). This wires source
-readout onto active paths but is not yet an atomic-state allocator:
-TC modesets still use the restricted transaction and direct DKL
-enable/disable sequence. Type-C/MG PHY runtime
-paths and DP/Thunderbolt output call sites are also not connected. See
-`intel-shared-dpll-kernel.md` for the required integration order and boundary.
+shared-DPLL adapter has both the original `PowerState` backend and a
+pinned-fastboot backend. Native fastboot persists one manager for the KMS
+lifetime, seeds Pipe-A's selected TC MG-port ownership from readout, and uses
+translated source `compute`/`release`/`reserve`/`swap` plus `enable`/`disable`
+for that DKL PLL around the bounded TC HDMI mode transition. The DKL target is
+checked against the source manager calculation before writes; the transaction
+retains a software undo token and restores it only after hardware rollback is
+verified. Separate generic `get_hw_state` dispatch still compares the selected
+PLL's enable bit and source-comparable masked fields to the independent
+firmware capture via `icl_compare_hw_state`. This is a selected-port N305
+integration, not the general HSW/atomic commit path: no second TC port or peer
+DKL can be touched with the single-port pin; Type-C cold start, DP/TBT outputs,
+active-pipe CDCLK integration, and generic HSW enable/disable/commit-tail remain
+unconnected. See `intel-shared-dpll-kernel.md` for detailed rollback and scope.
 
 ## Added remainder grouped by generation
 

@@ -653,6 +653,74 @@ impl SharedDpllState {
         });
         result?;
         self.readout_done = true;
+
+        // The generic DPLL readout establishes the active DKL PLL ownership,
+        // while this bounded caller supplies only its current DPLL index.
+        // Rebuild the MG-port slot so source `intel_dpll_release()` can balance
+        // the active reference before source reservation of future modes.
+        let mut initial_crtcs = crtcs;
+        for old in crtcs.iter().copied().filter(|crtc| crtc.hw_active) {
+            let index = old.intel_dpll.ok_or(DpllFailure::InvalidCrtc)?;
+            let hw_state = self
+                .display
+                .dplls
+                .get(index)
+                .ok_or(DpllFailure::InvalidCrtc)?
+                .state
+                .hw_state;
+            let current = &mut initial_crtcs[usize::from(old.pipe)];
+            current.dpll_hw_state = hw_state;
+            current.icl_port_dplls[dpll::PortDpllId::MgPhy as usize] = dpll::IclPortDpll {
+                pll: Some(index),
+                hw_state,
+            };
+        }
+        self.display.crtc_states = initial_crtcs;
+
+        // Linux's display-layer readout also carries the per-port default/MG
+        // DPLL reservations into each CRTC state. The narrow Native caller
+        // supplies only the observed active shared DPLL, so reconstruct those
+        // source port-DPLL slots via the same translated compute/reserve path
+        // before the manager is used by later mode transitions.
+        for old in crtcs.iter().copied().filter(|crtc| crtc.hw_active) {
+            if old.pipe != 0 || old.output != dpll::OutputType::Hdmi || old.port_clock == 0 {
+                return Err(DpllFailure::InvalidCrtc);
+            }
+            self.check_crtc_pll_power_domains(registers, power, &old)?;
+            let encoder = dpll::IntelEncoder {
+                output: old.output,
+                port: old.port,
+                is_combo_phy: false,
+                is_tc_phy: true,
+                primary_port: None,
+                tc_dp_alt_mode: false,
+                tc_legacy_mode: true,
+            };
+            let crtc = dpll::IntelCrtc {
+                id: old.id,
+                name: old.name,
+                pipe: old.pipe,
+            };
+            let mut atomic = dpll::IntelAtomicState::default();
+            atomic.old_crtcs = initial_crtcs;
+            atomic.new_crtcs = initial_crtcs;
+            self.compute(registers, timer, power, &mut atomic, &crtc, &encoder)?;
+            self.release(registers, timer, power, &mut atomic, &crtc)?;
+            self.reserve(registers, timer, power, &mut atomic, &crtc, &encoder)?;
+            let new = atomic.new_crtcs[usize::from(old.pipe)];
+            let index = new.intel_dpll.ok_or(DpllFailure::InvalidCrtc)?;
+            let observed = self
+                .display
+                .dplls
+                .get(index)
+                .ok_or(DpllFailure::InvalidCrtc)?
+                .state
+                .hw_state;
+            if !dpll::icl_compare_hw_state(&new.dpll_hw_state, &observed) {
+                return Err(DpllFailure::UnexpectedState);
+            }
+            self.swap_atomic(&mut atomic)?;
+        }
         Ok(())
     }
 
@@ -720,17 +788,16 @@ impl SharedDpllState {
         })
     }
 
-    /// Run the translated ADL-N TC PLL calculator against the read-out Pipe-A
-    /// owner. This is a read-only preflight used to check the existing bounded
-    /// DKL transaction's target fields; it does not reserve, swap, or program
-    /// the source manager's atomic state.
-    pub(crate) fn compute_tc_pll_state<R: Registers, T: PollTimer, P: DpllPowerAccess<R>>(
+    /// Run the translated ADL-N TC compute/release/reserve path against the
+    /// read-out Pipe-A owner. The returned atomic state is only a plan until
+    /// the enclosing modeset swaps it; this method does not program hardware.
+    pub(crate) fn plan_tc_atomic_transition<R: Registers, T: PollTimer, P: DpllPowerAccess<R>>(
         &mut self,
         registers: &R,
         timer: &T,
         power: &mut P,
         target_port_clock_khz: u32,
-    ) -> Result<dpll::IclDpllHwState, DpllFailure> {
+    ) -> Result<dpll::IntelAtomicState, DpllFailure> {
         self.ensure_usable()?;
         self.ensure_readout()?;
         let selected = self
@@ -772,15 +839,9 @@ impl SharedDpllState {
             tc_legacy_mode: true,
         };
         self.compute(registers, timer, power, &mut atomic, &crtc, &encoder)?;
-        atomic
-            .new_crtcs
-            .first()
-            .map(|state| {
-                state.icl_port_dplls[dpll::PortDpllId::MgPhy as usize]
-                    .hw_state
-                    .icl
-            })
-            .ok_or(DpllFailure::InvalidCrtc)
+        self.release(registers, timer, power, &mut atomic, &crtc)?;
+        self.reserve(registers, timer, power, &mut atomic, &crtc, &encoder)?;
+        Ok(atomic)
     }
 
     pub(crate) fn reserve<R: Registers, T: PollTimer, P: DpllPowerAccess<R>>(
@@ -840,6 +901,7 @@ impl SharedDpllState {
             display: self.display.clone(),
         };
         dpll::intel_dpll_swap_state(&mut self.display, atomic);
+        self.display.crtc_states = atomic.new_crtcs;
         Ok(undo)
     }
 
@@ -860,6 +922,13 @@ impl SharedDpllState {
         self.quarantined = false;
         self.last_failure = None;
         Ok(())
+    }
+
+    /// Stop all future manager operations when the enclosing display rollback
+    /// could not establish which DKL register image is active.
+    pub(crate) fn quarantine_after_unverified_rollback(&mut self) {
+        self.last_failure = Some(DpllFailure::RollbackNotProven);
+        self.quarantined = true;
     }
 
     /// Enable the reserved PLL selected by `intel_dpll_reserve()`.  This is

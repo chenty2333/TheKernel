@@ -567,21 +567,22 @@ The kernel adapter also exposes DKL/MG TC PLL enable/disable. It serializes the
 shared HIP selector, bounds raw MMIO to the fixed DKL apertures, routes only
 known TC1/TC2 enable offsets for TGL and ADL-P/N, and composes the previously
 translated `dkl_pll_write()` sequence with power/lock polling. Its API requires
-the caller to hold the corresponding display/PHY power references; the current
-modeset still uses the restricted direct DKL transaction for writes. Selected-
-port generic readout has a pin-backed backend; peer-port/all-PLL readout and
-manager enable/disable remain unconnected. The adapter has compile-checked map
-tests but its kernel-host unit binary is not run due the known bare-metal
-relocation linker failure.
+the caller to hold the corresponding display/PHY power references. The Native
+TC HDMI transaction now uses the source manager to reserve/swap the selected
+TC1/2 state and to disable/program/enable the DKL PLL inside the outer
+before-image transaction. Direct DKL writes remain only for rollback and the
+test-only probe path. Peer-port/all-PLL readout, other Type-C modes, and the
+generic HSW atomic commit sequence remain unconnected. Kernel tests compile but
+their host test binary is not linkable due the known bare-metal relocation.
 
 The same module additionally carries the display-12/13 candidate-mask and
 shared-resource policy from `icl_get_combo_phy_dpll()`,
 `icl_tc_port_to_pll_id()`, `icl_update_active_dpll()`, and the generic
 `intel_find_dpll()`/reference/unreference edge. `SharedDpllPool` is a small
-host-testable owner for the shared-state comparison and pipe references. It is
-not yet installed as the kernel's atomic-state DPLL manager; current kernel
-fastboot still uses its pre-existing single output PLL flow for modeset writes,
-with selected TC DKL readout routed through the translated manager.
+host-testable owner for the shared-state comparison and pipe references. The
+kernel `SharedDpllState` now keeps the active selected TC reservation across
+Native mode changes, but it is deliberately scoped to the current single
+Pipe-A route rather than a general multi-CRTC atomic allocator.
 
 `icl_dpll_descriptors()` adds the i915 per-platform DPLL inventories in source
 order for TGL, RKL, DG1, ADL-S, ADL-P/N and EHL/JSL. The shared numeric IDs are

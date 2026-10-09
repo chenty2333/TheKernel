@@ -2858,4 +2858,96 @@ mod readout_tests {
             assert_eq!(computed.mg_pll_tdc_coldst_bias, dkl.tdc_coldst_bias);
         }
     }
+
+    #[test]
+    fn tc_manager_readout_can_reserve_the_active_tbt_and_dkl_port_slots() {
+        let dkl = crate::dpll_mgr::icl_calc_mg_pll_state_for_output(
+            148_500,
+            24_000,
+            crate::dpll_mgr::MgPllOutput::Hdmi,
+            None,
+        )
+        .unwrap();
+        let mut display = IntelDpllDisplay::default();
+        display.display_ver = 13;
+        display.platform.alderlake_p = true;
+        display.ref_clks.nssc = 24_000;
+        let mut hooks = ReadoutHooks { dkl };
+        intel_dpll_init(&mut hooks, &mut display);
+        // The selected-port adapter exposes combo DPLL0/1, TBT, and TC1 DKL.
+        display.num_dpll = 4;
+        display.crtc_states[0] = CrtcState {
+            id: 0,
+            name: "Pipe A",
+            pipe: 0,
+            joined_pipe_mask: 1,
+            hw_active: true,
+            intel_dpll: Some(3),
+            port_clock: 148_500,
+            output: OutputType::Hdmi,
+            port: Port::Tc(TcPort::Tc1),
+            ..CrtcState::default()
+        };
+        intel_dpll_readout_hw_state(&mut hooks, &mut display);
+        let readout = display.dplls[3].state.hw_state;
+        display.crtc_states[0].dpll_hw_state = readout;
+        display.crtc_states[0].icl_port_dplls[PortDpllId::MgPhy as usize] = IclPortDpll {
+            pll: Some(3),
+            hw_state: readout,
+        };
+
+        let mut state = IntelAtomicState::default();
+        state.old_crtcs = display.crtc_states;
+        state.new_crtcs = display.crtc_states;
+        let crtc = IntelCrtc { id: 0, name: "Pipe A", pipe: 0 };
+        let encoder = IntelEncoder {
+            output: OutputType::Hdmi,
+            port: Port::Tc(TcPort::Tc1),
+            is_combo_phy: false,
+            is_tc_phy: true,
+            primary_port: None,
+            tc_dp_alt_mode: false,
+            tc_legacy_mode: true,
+        };
+        assert_eq!(intel_dpll_compute(&mut hooks, &display, &mut state, &crtc, &encoder), 0);
+        intel_dpll_release(&mut hooks, &display, &mut state, &crtc);
+        assert_eq!(intel_dpll_reserve(&mut hooks, &display, &mut state, &crtc, &encoder), 0);
+        let new_crtc = state.new_crtcs[0];
+        assert_eq!(new_crtc.icl_port_dplls[PortDpllId::Default as usize].pll, Some(2));
+        assert_eq!(new_crtc.icl_port_dplls[PortDpllId::MgPhy as usize].pll, Some(3));
+        assert_eq!(new_crtc.intel_dpll, Some(3));
+        assert_eq!(state.dpll_state[2].pipe_mask, 1);
+        assert_eq!(state.dpll_state[3].pipe_mask, 1);
+
+        intel_dpll_swap_state(&mut display, &mut state);
+        display.crtc_states = state.new_crtcs;
+        let active = display.crtc_states[0];
+        intel_dpll_disable(&mut hooks, &mut display, &active);
+        assert_eq!(display.dplls[3].active_mask, 0);
+        assert!(!display.dplls[3].on);
+        intel_dpll_enable(&mut hooks, &mut display, &active);
+        assert_eq!(display.dplls[3].active_mask, 1);
+        assert!(display.dplls[3].on);
+
+        let mut switched = IntelAtomicState::default();
+        switched.old_crtcs = display.crtc_states;
+        switched.new_crtcs = display.crtc_states;
+        switched.new_crtcs[0].port_clock = 297_000;
+        assert_eq!(intel_dpll_compute(&mut hooks, &display, &mut switched, &crtc, &encoder), 0);
+        intel_dpll_release(&mut hooks, &display, &mut switched, &crtc);
+        assert_eq!(intel_dpll_reserve(&mut hooks, &display, &mut switched, &crtc, &encoder), 0);
+        let target = switched.new_crtcs[0];
+        let expected = crate::dpll_mgr::icl_calc_mg_pll_state(
+            297_000,
+            24_000,
+            None,
+        )
+        .unwrap();
+        assert_eq!(target.intel_dpll, Some(3));
+        assert_eq!(target.icl_port_dplls[PortDpllId::Default as usize].pll, Some(2));
+        assert_eq!(target.icl_port_dplls[PortDpllId::MgPhy as usize].pll, Some(3));
+        assert_eq!(target.dpll_hw_state.icl.mg_pll_div0, expected.div0);
+        assert_eq!(switched.dpll_state[2].pipe_mask, 1);
+        assert_eq!(switched.dpll_state[3].pipe_mask, 1);
+    }
 }

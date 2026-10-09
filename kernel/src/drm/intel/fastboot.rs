@@ -743,15 +743,22 @@ fn translated_tc_dpll_readout<R: Registers, T: PollTimer>(
         .map_err(|error| format!("translated shared DPLL readout refused: {error:?}"))
 }
 
-/// Compute a target through the persistent translated DPLL manager and
-/// require it to match the DKL state consumed by the bounded TC transaction.
-/// This is source-manager planning only; reservation and writes remain owned
-/// by the outer before-image transaction until its full lifecycle is wired.
+struct NativeDpllTransition {
+    undo: super::shared_dpll::SharedDpllUndo,
+    old: intel_display::intel_dpll_mgr_full::CrtcState,
+    new: intel_display::intel_dpll_mgr_full::CrtcState,
+}
+
+/// Reserve the target through the persistent translated DPLL manager, require
+/// it to match the DKL state consumed by the bounded TC transaction, and swap
+/// its software state before programming. The DKL hardware callbacks run from
+/// `tc_modeset`; the outer transaction retains the independently verified
+/// hardware before-image and software undo token.
 fn translated_tc_dpll_target<R: Registers, T: PollTimer>(
     native: &Native<R, T>,
     target_port_clock_khz: u32,
     expected: &intel_display::dpll_mgr::DklPllState,
-) -> Result<(), String> {
+) -> Result<NativeDpllTransition, String> {
     let identity = super::shared_dpll::AdlNIdentity::verify(
         native.pci.vendor_id,
         native.pci.device_id,
@@ -761,26 +768,27 @@ fn translated_tc_dpll_target<R: Registers, T: PollTimer>(
     let mut power =
         super::shared_dpll::PinnedDpllPower::new(&native.power, identity, native.baseline.refclk)
             .map_err(|error| format!("shared DPLL power context unavailable: {error:?}"))?;
-    let source_state = native
-        .shared_dpll
-        .lock()
-        .compute_tc_pll_state(
+    let mut manager = native.shared_dpll.lock();
+    let mut atomic = manager
+        .plan_tc_atomic_transition(
             &native.registers,
             &native.timer,
             &mut power,
             target_port_clock_khz,
         )
         .map_err(|error| format!("translated DPLL target compute failed: {error:?}"))?;
-    let source_state = intel_display::intel_dpll_mgr_full::IntelDpllHwState {
-        icl: source_state,
-        ..intel_display::intel_dpll_mgr_full::IntelDpllHwState::default()
-    };
+    let old = atomic.old_crtcs[0];
+    let new = atomic.new_crtcs[0];
+    let source_state = atomic.new_crtcs[0].dpll_hw_state;
     if super::shared_dpll::dkl_state_matches_source_readout(
         expected,
         &source_state,
         native.afc_startup.is_some(),
     ) {
-        Ok(())
+        let undo = manager
+            .swap_atomic(&mut atomic)
+            .map_err(|error| format!("translated DPLL atomic-state swap failed: {error:?}"))?;
+        Ok(NativeDpllTransition { undo, old, new })
     } else {
         Err(String::from(
             "translated shared-DPLL calculation disagrees with the TC DKL target image",
@@ -882,6 +890,45 @@ impl intel_display::intel_modeset_verify_full::ModesetVerifyIo for NativeModeset
     ) -> bool {
         software.hw.active == hardware.hw.active
             && software.hw.adjusted_mode_crtc_clock == hardware.hw.adjusted_mode_crtc_clock
+    }
+}
+
+struct NativeDpllLifecycle<'a, R, T> {
+    manager: &'a mut super::shared_dpll::SharedDpllState,
+    registers: &'a R,
+    timer: &'a T,
+    power_pin: &'a PowerPin,
+    identity: super::shared_dpll::AdlNIdentity,
+    refclk_khz: u32,
+    old: intel_display::intel_dpll_mgr_full::CrtcState,
+    new: intel_display::intel_dpll_mgr_full::CrtcState,
+}
+
+impl<R: Registers, T: PollTimer> super::tc_modeset::DpllLifecycle
+    for NativeDpllLifecycle<'_, R, T>
+{
+    fn disable(&mut self) -> Result<(), String> {
+        let mut power = super::shared_dpll::PinnedDpllPower::new(
+            self.power_pin,
+            self.identity,
+            self.refclk_khz,
+        )
+        .map_err(|error| format!("shared DPLL power context unavailable: {error:?}"))?;
+        self.manager
+            .disable(self.registers, self.timer, &mut power, &self.old)
+            .map_err(|error| format!("translated shared DPLL disable failed: {error:?}"))
+    }
+
+    fn enable(&mut self) -> Result<(), String> {
+        let mut power = super::shared_dpll::PinnedDpllPower::new(
+            self.power_pin,
+            self.identity,
+            self.refclk_khz,
+        )
+        .map_err(|error| format!("shared DPLL power context unavailable: {error:?}"))?;
+        self.manager
+            .enable(self.registers, self.timer, &mut power, &self.new)
+            .map_err(|error| format!("translated shared DPLL enable failed: {error:?}"))
     }
 }
 
@@ -1787,8 +1834,14 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             let old_pitch = old_firmware.plane.pitch;
             let watermark = self.watermark;
             let mut display_writes_started = false;
+            let mut dpll_undo = None;
+            let mut dpll_states = None;
             let transition = translated_tc_dpll_target(self, target.timing.clock_khz, &target_pll)
-                .and_then(|()| translated_tc_dpll_readout(self))
+                .and_then(|dpll| {
+                    dpll_undo = Some(dpll.undo);
+                    dpll_states = Some((dpll.old, dpll.new));
+                    translated_tc_dpll_readout(self)
+                })
                 .and_then(|(enabled, manager_state)| {
                     if enabled != (old_firmware.pll.enable != 0)
                         || !super::shared_dpll::dkl_state_matches_source_readout(
@@ -1801,6 +1854,25 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                             "translated shared DPLL no longer matches the active before-image",
                         ));
                     }
+                    let identity = super::shared_dpll::AdlNIdentity::verify(
+                        self.pci.vendor_id,
+                        self.pci.device_id,
+                        self.pci.revision,
+                    )
+                    .map_err(|error| format!("shared DPLL identity changed: {error:?}"))?;
+                    let (old, new) = dpll_states
+                        .ok_or_else(|| String::from("source DPLL transaction state is absent"))?;
+                    let mut manager = self.shared_dpll.lock();
+                    let mut lifecycle = NativeDpllLifecycle {
+                        manager: &mut manager,
+                        registers: &self.registers,
+                        timer: &self.timer,
+                        power_pin: &self.power,
+                        identity,
+                        refclk_khz: self.baseline.refclk,
+                        old,
+                        new,
+                    };
                     super::tc_modeset::program(
                         &self.registers,
                         &self.timer,
@@ -1818,6 +1890,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                         None,
                         true,
                         None,
+                        Some(&mut lifecycle),
                         &mut display_writes_started,
                     )
                 })
@@ -1871,6 +1944,10 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             }
             match transition {
                 Ok(next_state) => {
+                    // The manager's new CRTC/reference image was atomically
+                    // swapped before hardware programming and stays live only
+                    // because the complete target image just verified.
+                    dpll_undo.take();
                     state.firmware = next_state;
                     state.current_mode = target;
                     state.current_format = s.format;
@@ -1881,6 +1958,18 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                     // so an audio-only refusal must not make the display
                     // worker lost or run a destructive rollback against a
                     // still-active link.
+                    if let Some(undo) = dpll_undo.take()
+                        && self
+                            .shared_dpll
+                            .lock()
+                            .restore_after_verified_hardware_rollback(undo)
+                            .is_err()
+                    {
+                        self.shared_dpll
+                            .lock()
+                            .quarantine_after_unverified_rollback();
+                        state.lost = true;
+                    }
                     if let Some(new) = next {
                         // SAFETY: `tc_modeset::program` reports this stage
                         // only before its first PLANE_CTL/SURF or link write;
@@ -1903,7 +1992,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                     let old_avi = old_avi_frame
                         .and_then(|raw| super::tc_modeset::avi_words_preserve(raw).ok());
                     let mut rollback_display_writes_started = false;
-                    let recovered = old_avi.is_some_and(|old_avi| {
+                    let mut recovered = old_avi.is_some_and(|old_avi| {
                         super::tc_modeset::program(
                             &self.registers,
                             &self.timer,
@@ -1921,6 +2010,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                             Some(old_firmware.plane.ctl),
                             false,
                             Some(&old_firmware.phy),
+                            None,
                             &mut rollback_display_writes_started,
                         )
                         .and_then(|()| {
@@ -1960,6 +2050,21 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                         })
                         .is_ok()
                     });
+                    if recovered
+                        && let Some(undo) = dpll_undo.take()
+                        && self
+                            .shared_dpll
+                            .lock()
+                            .restore_after_verified_hardware_rollback(undo)
+                            .is_err()
+                    {
+                        recovered = false;
+                    }
+                    if !recovered {
+                        self.shared_dpll
+                            .lock()
+                            .quarantine_after_unverified_rollback();
+                    }
                     if let Some(new) = next {
                         if recovered {
                             // SAFETY: rollback readback matched the old full
@@ -3322,6 +3427,7 @@ mod tests {
             None,
             None,
             true,
+            None,
             None,
             &mut probe_display_writes_started,
         );
