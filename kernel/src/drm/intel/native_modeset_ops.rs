@@ -674,3 +674,231 @@ pub(super) trait NativeModesetOps:
     /// in-place update that does not disable its CRTC.
     fn disable_plane(&mut self, plane: &NativePlaneState) -> Result<(), Self::Error>;
 }
+
+/// Observable commit-tail boundaries for the source-ordered hardware phases.
+///
+/// Individual implementations must dispatch the exact checked callback set
+/// for that phase; a successful no-op is not a valid implementation. Keeping
+/// these boundaries separate makes the required ordering executable and
+/// testable, while power-domain ownership is acquired before the first phase
+/// and released only after post-plane CDCLK work.
+pub(super) trait NativeCommitTailOps: super::power::NativePowerOps {
+    type Error;
+
+    fn disable_phase(&mut self) -> Result<(), Self::Error>;
+    fn cdclk_pre_plane(&mut self) -> Result<(), Self::Error>;
+    fn dpll_phase(&mut self) -> Result<(), Self::Error>;
+    fn encoder_pre_enable_phase(&mut self) -> Result<(), Self::Error>;
+    fn crtc_enable_phase(&mut self) -> Result<(), Self::Error>;
+    fn plane_update_phase(&mut self) -> Result<(), Self::Error>;
+    fn cdclk_post_plane(&mut self) -> Result<(), Self::Error>;
+}
+
+#[derive(Debug)]
+pub(super) enum NativeCommitTailError<E> {
+    PowerAcquire(super::power::NativePowerFailure),
+    Phase {
+        phase: NativeCommitPhase,
+        cause: E,
+        power_release: Option<super::power::NativePowerFailure>,
+    },
+    PowerRelease(super::power::NativePowerFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NativeCommitPhase {
+    Disable,
+    CdclkPrePlane,
+    Dpll,
+    EncoderPreEnable,
+    CrtcEnable,
+    PlaneUpdate,
+    CdclkPostPlane,
+}
+
+/// Run the source `intel_atomic_commit_tail()` hardware portion. This is a
+/// single-CRTC-compatible sequencing primitive; state projection and actual
+/// callback implementations remain the caller's responsibility. The phase
+/// order is fixed here so a future adapter cannot accidentally arm a plane
+/// before CRTC enable or release its domain references before CDCLK settles.
+pub(super) fn run_native_commit_tail<O: NativeCommitTailOps>(
+    ops: &mut O,
+    domains: &[intel_display::power_map::PowerDomain],
+) -> Result<bool, NativeCommitTailError<O::Error>> {
+    use super::power::NativePowerLease;
+
+    let lease =
+        NativePowerLease::acquire(ops, domains).map_err(NativeCommitTailError::PowerAcquire)?;
+    let phases: [(NativeCommitPhase, fn(&mut O) -> Result<(), O::Error>); 7] = [
+        (NativeCommitPhase::Disable, O::disable_phase),
+        (NativeCommitPhase::CdclkPrePlane, O::cdclk_pre_plane),
+        (NativeCommitPhase::Dpll, O::dpll_phase),
+        (
+            NativeCommitPhase::EncoderPreEnable,
+            O::encoder_pre_enable_phase,
+        ),
+        (NativeCommitPhase::CrtcEnable, O::crtc_enable_phase),
+        (NativeCommitPhase::PlaneUpdate, O::plane_update_phase),
+        (NativeCommitPhase::CdclkPostPlane, O::cdclk_post_plane),
+    ];
+    for (phase, dispatch) in phases {
+        if let Err(cause) = dispatch(ops) {
+            let power_release = lease.release(ops).err();
+            return Err(NativeCommitTailError::Phase {
+                phase,
+                cause,
+                power_release,
+            });
+        }
+    }
+    lease
+        .release(ops)
+        .map_err(NativeCommitTailError::PowerRelease)
+}
+
+#[cfg(test)]
+mod commit_tail_tests {
+    use alloc::vec::Vec;
+
+    use intel_display::power_map::PowerDomain;
+
+    use super::*;
+    use crate::drm::intel::power::PowerError;
+
+    #[derive(Default)]
+    struct Recorder {
+        events: Vec<&'static str>,
+        fail: Option<NativeCommitPhase>,
+    }
+
+    impl super::super::power::NativePowerOps for Recorder {
+        fn power_domain_get(&mut self, domain: PowerDomain) -> Result<(), PowerError> {
+            self.events.push(match domain {
+                PowerDomain::PipeA => "get-pipe",
+                _ => "get-other",
+            });
+            Ok(())
+        }
+
+        fn power_domain_put(&mut self, domain: PowerDomain) -> Result<(), PowerError> {
+            self.events.push(match domain {
+                PowerDomain::PipeA => "put-pipe",
+                _ => "put-other",
+            });
+            Ok(())
+        }
+
+        fn dc_state_exit(&mut self) -> Result<(), PowerError> {
+            self.events.push("dc-exit");
+            Ok(())
+        }
+
+        fn dc_state_enter(&mut self) -> Result<bool, PowerError> {
+            self.events.push("dc-enter");
+            Ok(true)
+        }
+
+        fn set_dc_state_target(&mut self, _: u32) -> Result<bool, PowerError> {
+            Ok(true)
+        }
+    }
+
+    impl NativeCommitTailOps for Recorder {
+        type Error = NativeCommitPhase;
+
+        fn disable_phase(&mut self) -> Result<(), Self::Error> {
+            self.run(NativeCommitPhase::Disable, "disable")
+        }
+
+        fn cdclk_pre_plane(&mut self) -> Result<(), Self::Error> {
+            self.run(NativeCommitPhase::CdclkPrePlane, "cdclk-pre")
+        }
+
+        fn dpll_phase(&mut self) -> Result<(), Self::Error> {
+            self.run(NativeCommitPhase::Dpll, "dpll")
+        }
+
+        fn encoder_pre_enable_phase(&mut self) -> Result<(), Self::Error> {
+            self.run(NativeCommitPhase::EncoderPreEnable, "encoder-pre")
+        }
+
+        fn crtc_enable_phase(&mut self) -> Result<(), Self::Error> {
+            self.run(NativeCommitPhase::CrtcEnable, "crtc-enable")
+        }
+
+        fn plane_update_phase(&mut self) -> Result<(), Self::Error> {
+            self.run(NativeCommitPhase::PlaneUpdate, "plane-update")
+        }
+
+        fn cdclk_post_plane(&mut self) -> Result<(), Self::Error> {
+            self.run(NativeCommitPhase::CdclkPostPlane, "cdclk-post")
+        }
+    }
+
+    impl Recorder {
+        fn run(
+            &mut self,
+            phase: NativeCommitPhase,
+            event: &'static str,
+        ) -> Result<(), NativeCommitPhase> {
+            self.events.push(event);
+            if self.fail == Some(phase) {
+                Err(phase)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn tail_runs_phases_in_source_order_and_releases_power_last() {
+        let mut ops = Recorder::default();
+        assert!(run_native_commit_tail(&mut ops, &[PowerDomain::PipeA]).unwrap());
+        assert_eq!(
+            ops.events,
+            [
+                "dc-exit",
+                "get-pipe",
+                "disable",
+                "cdclk-pre",
+                "dpll",
+                "encoder-pre",
+                "crtc-enable",
+                "plane-update",
+                "cdclk-post",
+                "put-pipe",
+                "dc-enter",
+            ]
+        );
+    }
+
+    #[test]
+    fn phase_error_stops_later_hardware_work_but_releases_power() {
+        let mut ops = Recorder {
+            fail: Some(NativeCommitPhase::CrtcEnable),
+            ..Recorder::default()
+        };
+        assert!(matches!(
+            run_native_commit_tail(&mut ops, &[PowerDomain::PipeA]),
+            Err(NativeCommitTailError::Phase {
+                phase: NativeCommitPhase::CrtcEnable,
+                power_release: None,
+                ..
+            })
+        ));
+        assert_eq!(
+            ops.events,
+            [
+                "dc-exit",
+                "get-pipe",
+                "disable",
+                "cdclk-pre",
+                "dpll",
+                "encoder-pre",
+                "crtc-enable",
+                "put-pipe",
+                "dc-enter",
+            ]
+        );
+    }
+}

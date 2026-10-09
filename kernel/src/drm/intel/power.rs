@@ -95,7 +95,9 @@ use super::{
 
 #[path = "native_power.rs"]
 mod native_power;
-pub(crate) use native_power::{NativePowerAdapter, NativePowerOps};
+pub(crate) use native_power::{
+    NativePowerAdapter, NativePowerFailure, NativePowerLease, NativePowerOps,
+};
 
 // ---------------------------------------------------------------------------
 // Bit positions, each cited to the reference section and the i915 line it was
