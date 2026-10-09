@@ -62,6 +62,7 @@ pub(crate) enum DpllFailure {
     ManagerRejected(i32),
     InvalidCrtc,
     DklPortNotSelected,
+    InvalidAfcStartup,
     RollbackNotProven,
 }
 
@@ -496,6 +497,22 @@ impl SharedDpllState {
             last_warning_count: 0,
             last_failure: None,
         }
+    }
+
+    /// Carry the VBT DKL AFC-startup override into the translated source
+    /// manager before it computes or writes a PLL state. `None` preserves the
+    /// source default; `Some(0)` is a real explicit override.
+    pub(crate) fn set_afc_startup_override(
+        &mut self,
+        value: Option<u8>,
+    ) -> Result<(), DpllFailure> {
+        self.ensure_usable()?;
+        if self.initialized || value.is_some_and(|value| value > 7) {
+            return Err(DpllFailure::InvalidAfcStartup);
+        }
+        self.display.vbt.override_afc_startup = value.is_some();
+        self.display.vbt.override_afc_startup_val = value.unwrap_or_default();
+        Ok(())
     }
 
     pub(crate) fn report(&self) -> SharedDpllReport {
@@ -1758,6 +1775,26 @@ mod tests {
         assert_eq!(
             manager.check_crtc_pll_power_domains(&NoRegisters, &FakePower, &mismatched_legacy),
             Err(DpllFailure::InvalidCrtc)
+        );
+    }
+
+    #[test]
+    fn afc_startup_override_preserves_vbt_presence_and_range() {
+        let identity = AdlNIdentity::verify(0x8086, 0x46d0, 0).unwrap();
+        let mut manager = SharedDpllState::new(identity, 0);
+        assert_eq!(manager.set_afc_startup_override(Some(0)), Ok(()));
+        assert!(manager.display.vbt.override_afc_startup);
+        assert_eq!(manager.display.vbt.override_afc_startup_val, 0);
+        assert_eq!(manager.set_afc_startup_override(None), Ok(()));
+        assert!(!manager.display.vbt.override_afc_startup);
+        assert_eq!(
+            manager.set_afc_startup_override(Some(8)),
+            Err(DpllFailure::InvalidAfcStartup)
+        );
+        manager.initialized = true;
+        assert_eq!(
+            manager.set_afc_startup_override(Some(1)),
+            Err(DpllFailure::InvalidAfcStartup)
         );
     }
 

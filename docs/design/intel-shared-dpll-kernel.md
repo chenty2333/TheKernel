@@ -33,6 +33,12 @@ backend revalidates held source-mapped power requests, D0,
 DC-state, and refclk on every hook/access; logical DPLL power cookies never
 manufacture `PowerState` reference counts or change wells.
 
+Before manager initialization, fastboot now carries the parsed VBT AFC-startup
+override (including the distinction between no override and an explicit zero)
+into `IntelDpllDisplay::vbt`. The source DKL writer therefore uses the same
+override policy as the existing standalone DKL planner if/when manager enable
+is called; this does not yet route active hardware writes through that manager.
+
 The scoped manager now remembers which TC port was selected and checks
 allocator/CRTC arguments against it before entering source compute/reserve/
 release or DKL enable/disable hooks. It rejects sibling TC selection, legacy

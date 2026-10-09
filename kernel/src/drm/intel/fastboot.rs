@@ -1942,6 +1942,12 @@ pub(super) fn init(
                 Error::Refused
             })?;
             let mut shared_dpll = super::shared_dpll::SharedDpllState::new(dpll_identity, 0);
+            shared_dpll
+                .set_afc_startup_override(afc_startup)
+                .map_err(|error| {
+                    axlog::warn!("intel-fastboot: VBT DKL AFC override refused: {error:?}");
+                    Error::Refused
+                })?;
             let mut dpll_power =
                 super::shared_dpll::PinnedDpllPower::new(&pin, dpll_identity, first.refclk)
                     .map_err(|error| {
