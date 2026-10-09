@@ -287,6 +287,14 @@ pub mod intel_gtt_api_upstream;
 pub mod intel_gt_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub(crate) mod gen8_ppgtt_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod shmem_utils_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_ppgtt_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]

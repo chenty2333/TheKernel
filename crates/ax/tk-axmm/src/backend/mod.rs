@@ -9,12 +9,15 @@ mod linear;
 
 /// A unified enum type for different memory mapping backends.
 ///
-/// Currently, two backends are implemented:
+/// The supported backends are:
 ///
 /// - **Linear**: used for linear mappings. The target physical frames are
 ///   contiguous and their addresses should be known when creating the mapping.
 /// - **Allocation**: used in general, or for lazy mappings. The target physical
 ///   frames are obtained from the global allocator.
+/// - **Reservation**: owns a virtual range without installing any PTEs. Kernel
+///   vmalloc-style adapters use it while a retired mapping waits for a global
+///   TLB grace period, preventing the VA from being reused too early.
 #[derive(Clone)]
 pub enum Backend {
     /// Linear mapping backend.
@@ -36,6 +39,8 @@ pub enum Backend {
         /// Whether to populate the physical frames when creating the mapping.
         populate: bool,
     },
+    /// Virtual-address reservation with no page-table mappings.
+    Reserved,
 }
 
 impl MappingBackend for Backend {
@@ -46,6 +51,7 @@ impl MappingBackend for Backend {
         match *self {
             Self::Linear { pa_va_offset } => self.map_linear(start, size, flags, pt, pa_va_offset),
             Self::Alloc { populate } => self.map_alloc(start, size, flags, pt, populate),
+            Self::Reserved => true,
         }
     }
 
@@ -53,6 +59,7 @@ impl MappingBackend for Backend {
         match *self {
             Self::Linear { pa_va_offset } => self.unmap_linear(start, size, pt, pa_va_offset),
             Self::Alloc { populate } => self.unmap_alloc(start, size, pt, populate),
+            Self::Reserved => true,
         }
     }
 
@@ -63,14 +70,22 @@ impl MappingBackend for Backend {
         new_flags: Self::Flags,
         page_table: &mut Self::PageTable,
     ) -> bool {
-        page_table
-            .cursor()
-            .protect_region(start, size, new_flags)
-            .is_ok()
+        match self {
+            Self::Reserved => false,
+            _ => page_table
+                .cursor()
+                .protect_region(start, size, new_flags)
+                .is_ok(),
+        }
     }
 }
 
 impl Backend {
+    /// Creates an address-only reservation that neither maps nor allocates PTEs.
+    pub const fn new_reserved() -> Self {
+        Self::Reserved
+    }
+
     pub(crate) fn handle_page_fault(
         &self,
         vaddr: VirtAddr,
@@ -82,6 +97,7 @@ impl Backend {
             Self::Alloc { populate } => {
                 self.handle_page_fault_alloc(vaddr, orig_flags, page_table, populate)
             }
+            Self::Reserved => false,
         }
     }
 }

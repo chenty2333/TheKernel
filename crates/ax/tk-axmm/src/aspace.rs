@@ -127,6 +127,22 @@ impl AddrSpace {
         Ok(())
     }
 
+    /// Reserve a virtual range without installing PTEs. Kernel mapping owners
+    /// use this to keep an unmapped VA unavailable until remote CPUs have
+    /// acknowledged a TLB shootdown for the retired mapping.
+    pub fn reserve(&mut self, start: VirtAddr, size: usize) -> AxResult {
+        if !self.contains_range(start, size) {
+            return ax_err!(InvalidInput, "address out of range");
+        }
+        if !start.is_aligned_4k() || !is_aligned_4k(size) {
+            return ax_err!(InvalidInput, "address not aligned");
+        }
+
+        let area = MemoryArea::new(start, size, MappingFlags::empty(), Backend::new_reserved());
+        self.areas.map(area, &mut self.pt, false)?;
+        Ok(())
+    }
+
     /// Add a new allocation mapping.
     ///
     /// See [`Backend`] for more details about the mapping backends.

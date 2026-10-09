@@ -299,6 +299,12 @@ pub fn atomic_add(addend: i32, value: &mut AtomicT) {
     atomic(value).fetch_add(addend, Ordering::Relaxed);
 }
 
+/// Atomic subtraction (`atomic_sub`, relaxed ordering).
+#[inline]
+pub fn atomic_sub(subtrahend: i32, value: &mut AtomicT) {
+    atomic(value).fetch_sub(subtrahend, Ordering::Relaxed);
+}
+
 /// Atomic add-unless (`atomic_add_unless`, full ordering).
 #[inline]
 pub fn atomic_add_unless(value: &mut AtomicT, addend: i32, unless: i32) -> bool {

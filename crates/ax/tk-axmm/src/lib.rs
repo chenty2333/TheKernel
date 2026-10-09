@@ -9,7 +9,9 @@ extern crate alloc;
 mod aspace;
 mod backend;
 
-use axerrno::{AxError, AxResult};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use axerrno::{AxError, AxResult, ax_err};
 use axhal::{
     mem::{MemRegionFlags, phys_to_virt},
     paging::MappingFlags,
@@ -21,6 +23,51 @@ use memory_addr::{MemoryAddr, PhysAddr, VirtAddr};
 pub use self::{aspace::AddrSpace, backend::Backend};
 
 static KERNEL_ASPACE: LazyInit<SpinNoIrq<AddrSpace>> = LazyInit::new();
+
+/// Installed owner callback for a synchronous all-CPU invalidation of shared
+/// kernel mappings. Until the kernel's TLB subsystem installs its callback,
+/// clients that need to reclaim or expose shared mappings must fail closed.
+pub type KernelMapTlbSync = unsafe extern "C" fn();
+
+static KERNEL_MAP_TLB_SYNC: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the single kernel owner for synchronous shared-map TLB invalidation.
+/// Re-installing the same callback is idempotent; replacing the owner is refused.
+pub fn install_kernel_map_tlb_sync(sync: KernelMapTlbSync) -> AxResult {
+    let address = sync as *const () as usize;
+    if address == 0 {
+        return ax_err!(InvalidInput, "null kernel-map TLB synchronizer");
+    }
+    match KERNEL_MAP_TLB_SYNC.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Ok(()),
+        Err(existing) if existing == address => Ok(()),
+        Err(_) => ax_err!(
+            AlreadyExists,
+            "kernel-map TLB synchronizer already installed"
+        ),
+    }
+}
+
+/// Whether the kernel owner has installed the shared-map invalidation service.
+#[inline]
+pub fn kernel_map_tlb_sync_installed() -> bool {
+    KERNEL_MAP_TLB_SYNC.load(Ordering::Acquire) != 0
+}
+
+/// Synchronously invalidate shared kernel mappings on every active CPU.
+///
+/// Returns an error rather than performing a local-only flush if the kernel
+/// TLB owner has not yet installed its acknowledged shootdown callback.
+pub fn synchronize_kernel_map_tlb() -> AxResult {
+    let address = KERNEL_MAP_TLB_SYNC.load(Ordering::Acquire);
+    if address == 0 {
+        return ax_err!(BadState, "kernel-map TLB synchronizer is not installed");
+    }
+    // Function pointers are code addresses on the supported x86_64 target.
+    let sync: KernelMapTlbSync = unsafe { core::mem::transmute(address) };
+    unsafe { sync() };
+    Ok(())
+}
 
 fn reg_flag_to_map_flag(f: MemRegionFlags) -> MappingFlags {
     let mut ret = MappingFlags::empty();
