@@ -507,3 +507,42 @@ mod tests {
         );
     }
 }
+
+/// Hosted builds (unit tests on Linux) link without the kernel, which provides
+/// these services only on the bare-metal target. Identity DMA and no interrupt
+/// remapping match the kernel's behaviour when VT-d is absent or disabled.
+#[cfg(not(target_os = "none"))]
+mod hosted_identity {
+    use super::{Error, PciRequester, PlatformDma, PlatformInterruptRemap};
+
+    struct HostedIdentity;
+
+    #[crate_interface::impl_interface]
+    impl PlatformDma for HostedIdentity {
+        fn pci_dma_allowed() -> bool {
+            true
+        }
+        fn map(physical: u64, _length: usize) -> Result<u64, Error> {
+            Ok(physical)
+        }
+        fn unmap(_device_address: u64, _length: usize) -> Result<(), Error> {
+            Ok(())
+        }
+        fn map_for(_requester: PciRequester, physical: u64, _length: usize) -> Result<u64, Error> {
+            Ok(physical)
+        }
+        fn unmap_for(_requester: PciRequester, _device_address: u64, _length: usize) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[crate_interface::impl_interface]
+    impl PlatformInterruptRemap for HostedIdentity {
+        fn map_msi(_requester: PciRequester, _vector: u8, _destination: u32) -> Result<Option<(u64, u32)>, Error> {
+            Ok(None)
+        }
+        fn unmap_msi(_vector: u8) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+}

@@ -51,7 +51,7 @@ bus-pci = [
     "dep:axsync",
     "dep:lazyinit",
 ]
-default = ["bus-pci", "i2c", "vtd"]
+default = ["bus-pci", "vtd"]
 i2c = ["bus-pci", "dep:tk-i2c", "dep:spin", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq", "dep:tk-vtd"]
 i2c-hid = ["i2c", "input", "dep:tk-i2c-hid"]
 vtd = ["dep:tk-vtd"]
