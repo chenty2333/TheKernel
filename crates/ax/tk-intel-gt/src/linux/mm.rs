@@ -67,6 +67,12 @@ pub const VM_DONTDUMP: c_ulong = 1 << 26;
 pub const VM_MIXEDMAP: c_ulong = 1 << 28;
 pub const VM_MAYWRITE: c_ulong = 1 << 5;
 
+// Linux `mm.h` declares this architecture-owned helper when CONFIG_MMU=y;
+// the configured x86 kernel exports the implementation from pgprot.c.
+unsafe extern "C" {
+    pub fn vm_get_page_prot(vm_flags: c_ulong) -> PgProt;
+}
+
 /// Linux `vma_pages()`: the page-count of the page-aligned VMA interval.
 #[inline]
 pub unsafe fn vma_pages(vma: *const VmAreaStruct) -> c_ulong {
