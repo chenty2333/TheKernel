@@ -1295,7 +1295,7 @@ impl<I: SdhciIo> SdhciHost<I> {
             })?;
         }
         self.power_up().inspect_err(|error| {
-            log::warn!("sdhci: initial 400kHz clock failed: {error:?}");
+            log::warn!("sdhci: initial host power-up failed: {error:?}");
         })?;
         self.init_registers();
         Ok(())
@@ -1418,21 +1418,31 @@ impl<I: SdhciIo> SdhciHost<I> {
             Some(MMC_OCR_320_330 | MMC_OCR_330_340) => SDHCI_POWER_330,
             _ => return Err(SdhciError::UnsupportedClock),
         } as u8;
-        self.power = power;
         self.io.write8(SDHCI_POWER_CONTROL as usize, voltage);
         let power_control = voltage | SDHCI_POWER_ON as u8;
         let mut enabled = false;
+        let mut observed = 0;
         for _ in 0..20 {
             self.io.write8(SDHCI_POWER_CONTROL as usize, power_control);
-            if self.io.read8(SDHCI_POWER_CONTROL as usize) & SDHCI_POWER_ON as u8 != 0 {
+            observed = self.io.read8(SDHCI_POWER_CONTROL as usize);
+            if observed & SDHCI_POWER_ON as u8 != 0 {
                 enabled = true;
                 break;
             }
             self.io.delay_us(100);
         }
         if !enabled {
-            log::warn!("sdhci: bus power failed to enable");
+            log::warn!(
+                "sdhci: bus power failed to enable requested={power_control:#04x} \
+                 readback={observed:#04x}"
+            );
+            // Do not proceed to clock/card commands after the controller has
+            // rejected the power-on bit.  Treating this as success let card
+            // initialization fail later and caused the hotplug worker to
+            // repeat the same full probe forever.
+            return Err(SdhciError::Controller(u32::from(observed)));
         }
+        self.power = power;
         if self.quirks & SDHCI_QUIRK_INTEL_POWER_UP_RESET != 0 {
             self.io
                 .write8(SDHCI_POWER_CONTROL as usize, power_control | 0x10);
@@ -3469,6 +3479,7 @@ mod tests {
         data_blocks: u16,
         command_attempts: u8,
         failed_command_attempts: u8,
+        power_on_sticks: bool,
         now_ns: u64,
     }
 
@@ -3484,6 +3495,7 @@ mod tests {
                 data_blocks: 0,
                 command_attempts: 0,
                 failed_command_attempts: 0,
+                power_on_sticks: true,
                 now_ns: 0,
             }
         }
@@ -3491,7 +3503,12 @@ mod tests {
 
     impl SdhciIo for MockIo {
         fn read8(&mut self, offset: usize) -> u8 {
-            (self.registers[offset / 4] >> ((offset % 4) * 8)) as u8
+            let value = (self.registers[offset / 4] >> ((offset % 4) * 8)) as u8;
+            if offset == SDHCI_POWER_CONTROL as usize && !self.power_on_sticks {
+                value & !(SDHCI_POWER_ON as u8)
+            } else {
+                value
+            }
         }
         fn read16(&mut self, offset: usize) -> u16 {
             if offset == SDHCI_CLOCK_CONTROL as usize {
@@ -3870,6 +3887,18 @@ mod tests {
         );
         host.set_power(0).unwrap();
         assert_eq!(host.io.read8(SDHCI_POWER_CONTROL as usize), 0);
+    }
+
+    #[test]
+    fn failed_bus_power_handshake_aborts_before_mmc_commands() {
+        let io = MockIo {
+            power_on_sticks: false,
+            ..MockIo::default()
+        };
+        let mut host = SdhciHost::new(io, 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+
+        assert!(matches!(host.initialize(), Err(SdhciError::Controller(_))));
+        assert_eq!(host.io_mut().command_attempts, 0);
     }
 
     #[test]

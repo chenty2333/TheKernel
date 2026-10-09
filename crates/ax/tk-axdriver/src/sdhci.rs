@@ -36,6 +36,7 @@ const QEMU_SDHCI_VID: u16 = 0x1b36;
 const QEMU_SDHCI_DID: u16 = 0x0007;
 const SDMA_BUFFER_BYTES: usize = 512 * 1024;
 const SDMA_BUFFER_PAGES: usize = SDMA_BUFFER_BYTES / 4096;
+const SDHCI_CARD_ATTACH_MAX_ATTEMPTS: u8 = 3;
 static SDHCI_HOTPLUG_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 static SDHCI_HOTPLUG_SLOTS: spin::Mutex<alloc::vec::Vec<SdhciHotplugSlot>> =
     spin::Mutex::new(alloc::vec::Vec::new());
@@ -290,7 +291,28 @@ struct SdhciHotplugSlot {
     /// Slot-level write policy retained even when initial card enumeration
     /// fails and a later insertion causes a fresh `SdhciDisk::attach`.
     read_only: bool,
+    /// Bounded attach retries for a continuously-present card. Once the
+    /// budget is exhausted, wait for card removal/reinsertion instead of
+    /// repeatedly reinitializing a failed controller forever.
+    attach_attempts: u8,
+    retry_abandoned: bool,
     present: bool,
+}
+
+impl SdhciHotplugSlot {
+    fn note_attach_failure(&mut self) -> bool {
+        self.attach_attempts = self.attach_attempts.saturating_add(1);
+        if self.attach_attempts >= SDHCI_CARD_ATTACH_MAX_ATTEMPTS {
+            self.retry_abandoned = true;
+        }
+        self.retry_abandoned
+    }
+
+    fn observe_absent(&mut self) {
+        self.present = false;
+        self.attach_attempts = 0;
+        self.retry_abandoned = false;
+    }
 }
 
 unsafe impl Send for SdhciWindow {}
@@ -481,7 +503,8 @@ fn probe_slot(
     let capabilities = io.read32(SDHCI_CAPABILITIES as usize);
     let capabilities2 = io.read32(SDHCI_CAPABILITIES2 as usize);
     let version = (io.read16(SDHCI_HOST_VERSION as usize) & SDHCI_SPEC_VER_MASK as u16) as u8;
-    let host = SdhciHost::new_with_quirks(io, capabilities, capabilities2, version, quirks);
+    let mut host = SdhciHost::new_with_quirks(io, capabilities, capabilities2, version, quirks);
+    let card_present = host.media_present();
     let host = if info.vendor_id == QEMU_SDHCI_VID && info.device_id == QEMU_SDHCI_DID {
         // QEMU's PCI SDHCI/card pairing times out on CMD18; use CMD17 reads
         // and CMD24 writes so the integration fixture covers generic PIO.
@@ -514,6 +537,8 @@ fn probe_slot(
                     device_id: info.device_id,
                     disk_index,
                     read_only,
+                    attach_attempts: u8::from(card_present),
+                    retry_abandoned: false,
                     present: false,
                 }),
             );
@@ -577,6 +602,8 @@ fn probe_slot(
             device_id: info.device_id,
             disk_index,
             read_only,
+            attach_attempts: 0,
+            retry_abandoned: false,
             present: true,
         }),
     )
@@ -630,10 +657,10 @@ fn sdhci_handle_card_present_locked(slot: &mut SdhciHotplugSlot) {
         slot.quirks,
     );
     if !host.media_present() {
-        slot.present = false;
+        slot.observe_absent();
         return;
     }
-    if slot.present {
+    if slot.present || slot.retry_abandoned {
         return;
     }
     if slot.vendor_id == QEMU_SDHCI_VID && slot.device_id == QEMU_SDHCI_DID {
@@ -645,8 +672,23 @@ fn sdhci_handle_card_present_locked(slot: &mut SdhciHotplugSlot) {
     {
         host = host.with_dma_region(region);
     }
-    let Ok(mut disk) = SdhciDisk::attach(host) else {
-        return;
+    let mut disk = match SdhciDisk::attach(host) {
+        Ok(disk) => disk,
+        Err(error) => {
+            if slot.note_attach_failure() {
+                warn!(
+                    "sdhci: card initialization failed after {} attempts ({error:?}); retry \
+                     disabled until media removal or reboot",
+                    slot.attach_attempts
+                );
+            } else {
+                warn!(
+                    "sdhci: card initialization failed attempt {}/{} ({error:?}); will retry",
+                    slot.attach_attempts, SDHCI_CARD_ATTACH_MAX_ATTEMPTS
+                );
+            }
+            return;
+        }
     };
     disk.log_card();
     let read_only =
@@ -665,7 +707,15 @@ fn sdhci_handle_card_present_locked(slot: &mut SdhciHotplugSlot) {
     }
     if published_user {
         slot.present = true;
+        slot.attach_attempts = 0;
+        slot.retry_abandoned = false;
         info!("sdhci: card inserted, published /dev/{user_name}");
+    } else {
+        slot.retry_abandoned = true;
+        warn!(
+            "sdhci: card attached but /dev/{user_name} could not be published; retry disabled \
+             until media removal or reboot"
+        );
     }
 }
 
@@ -757,6 +807,8 @@ mod tests {
             device_id: INTEL_EMMC_DID,
             disk_index: 0,
             read_only: true,
+            attach_attempts: 0,
+            retry_abandoned: false,
             present: false,
         };
 
@@ -776,6 +828,40 @@ mod tests {
             false,
             retry_disk_write_protected
         ));
+    }
+
+    #[test]
+    fn failed_card_attach_retries_are_bounded_until_removal() {
+        let mut slot = SdhciHotplugSlot {
+            io: SdhciWindow {
+                base: NonNull::dangling(),
+                size: 0,
+                irq: None,
+                irq_context: None,
+                irq_signal_usable: false,
+            },
+            capabilities: 0,
+            capabilities2: 0,
+            version: 0,
+            quirks: 0,
+            vendor_id: INTEL_EMMC_VID,
+            device_id: INTEL_EMMC_DID,
+            disk_index: 0,
+            read_only: true,
+            attach_attempts: 1,
+            retry_abandoned: false,
+            present: false,
+        };
+
+        assert!(!slot.note_attach_failure());
+        assert!(slot.note_attach_failure());
+        assert_eq!(slot.attach_attempts, SDHCI_CARD_ATTACH_MAX_ATTEMPTS);
+        assert!(slot.retry_abandoned);
+        assert!(slot.retry_abandoned);
+
+        slot.observe_absent();
+        assert_eq!(slot.attach_attempts, 0);
+        assert!(!slot.retry_abandoned);
     }
 
     #[test]
