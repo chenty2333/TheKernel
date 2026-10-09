@@ -94,3 +94,8 @@ single-victim requeue protocol.
 `ahci_timeout()` is the bounded-wait expiry adapter and delegates to the shared
 reset/quiescence path; no FreeBSD callout is armed, so timeout detection occurs
 while a block request is waiting or reaped.
+
+Physical requests now share source-named `ahci_done()` typed completion
+publication, and reset retirement maps to `ahci_end_transaction()`. These
+adapters preserve request handle/cookie and report zero completed bytes on an
+error; they do not provide CAM sense or request-requeue policy.

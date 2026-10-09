@@ -993,13 +993,11 @@ impl<I: AhciIo> AhciDisk<I> {
                 match result {
                     Ok(()) => {
                         self.physical_slots[slot].pending = None;
-                        self.physical_slots[slot].completion = Some(BlockCompletion {
-                            handle: pending.handle,
-                            owner: BlockCompletionOwner::Physical,
-                            cookie: pending.cookie,
-                            status: BlockCompletionStatus::Success,
-                            bytes: pending.bytes as u32,
-                        });
+                        Self::ahci_done(
+                            &mut self.physical_slots[slot],
+                            pending,
+                            BlockCompletionStatus::Success,
+                        );
                         any_physical_completion = true;
                     }
                     Err(AhciDiskError::DeviceError(status)) => {
@@ -1104,6 +1102,7 @@ impl<I: AhciIo> AhciDisk<I> {
         true
     }
 
+    // upstream: ahci.c ahci_end_transaction()
     fn finish_physical_after_port_reset(
         &mut self,
         status: BlockCompletionStatus,
@@ -1111,21 +1110,32 @@ impl<I: AhciIo> AhciDisk<I> {
     ) {
         for (slot_index, slot) in self.physical_slots.iter_mut().enumerate() {
             if let Some(pending) = slot.pending.take() {
-                slot.completion = Some(BlockCompletion {
-                    handle: pending.handle,
-                    owner: BlockCompletionOwner::Physical,
-                    cookie: pending.cookie,
-                    status: if failed_tag.is_some_and(|tag| tag != slot_index as u8)
-                        && matches!(status, BlockCompletionStatus::DeviceError(_))
-                    {
-                        BlockCompletionStatus::DeviceError(0xff)
-                    } else {
-                        status
-                    },
-                    bytes: 0,
-                });
+                let completion_status = if failed_tag.is_some_and(|tag| tag != slot_index as u8)
+                    && matches!(status, BlockCompletionStatus::DeviceError(_))
+                {
+                    BlockCompletionStatus::DeviceError(0xff)
+                } else {
+                    status
+                };
+                Self::ahci_done(slot, pending, completion_status);
             }
         }
+    }
+
+    // Publish the typed completion after the slot's DMA result is known.
+    // upstream: ahci.c ahci_done()
+    fn ahci_done(slot: &mut PhysicalSlot, pending: PendingPhysical, status: BlockCompletionStatus) {
+        slot.completion = Some(BlockCompletion {
+            handle: pending.handle,
+            owner: BlockCompletionOwner::Physical,
+            cookie: pending.cookie,
+            status,
+            bytes: if matches!(status, BlockCompletionStatus::Success) {
+                pending.bytes as u32
+            } else {
+                0
+            },
+        });
     }
 
     fn transfer_read(
