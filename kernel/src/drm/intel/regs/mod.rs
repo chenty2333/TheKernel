@@ -974,6 +974,18 @@ pub(crate) const BUS: &[Register] = &[
     aux::DP_AUX_CH_DATA2_B,
     aux::DP_AUX_CH_DATA3_B,
     aux::DP_AUX_CH_DATA4_B,
+    aux::DP_AUX_CH_CTL_D,
+    aux::DP_AUX_CH_DATA0_D,
+    aux::DP_AUX_CH_DATA1_D,
+    aux::DP_AUX_CH_DATA2_D,
+    aux::DP_AUX_CH_DATA3_D,
+    aux::DP_AUX_CH_DATA4_D,
+    aux::DP_AUX_CH_CTL_E,
+    aux::DP_AUX_CH_DATA0_E,
+    aux::DP_AUX_CH_DATA1_E,
+    aux::DP_AUX_CH_DATA2_E,
+    aux::DP_AUX_CH_DATA3_E,
+    aux::DP_AUX_CH_DATA4_E,
     GMBUS0,
     GMBUS1,
     GMBUS2,
@@ -1721,7 +1733,7 @@ mod tests {
     }
 
     #[test]
-    fn dp_aux_a_b_registers_follow_the_i915_channel_stride() {
+    fn dp_aux_a_b_tc1_tc2_registers_follow_the_i915_channel_stride() {
         use aux::*;
 
         let expected = [
@@ -1737,6 +1749,18 @@ mod tests {
             (DP_AUX_CH_DATA2_B, 0x6411c),
             (DP_AUX_CH_DATA3_B, 0x64120),
             (DP_AUX_CH_DATA4_B, 0x64124),
+            (DP_AUX_CH_CTL_D, 0x64310),
+            (DP_AUX_CH_DATA0_D, 0x64314),
+            (DP_AUX_CH_DATA1_D, 0x64318),
+            (DP_AUX_CH_DATA2_D, 0x6431c),
+            (DP_AUX_CH_DATA3_D, 0x64320),
+            (DP_AUX_CH_DATA4_D, 0x64324),
+            (DP_AUX_CH_CTL_E, 0x64410),
+            (DP_AUX_CH_DATA0_E, 0x64414),
+            (DP_AUX_CH_DATA1_E, 0x64418),
+            (DP_AUX_CH_DATA2_E, 0x6441c),
+            (DP_AUX_CH_DATA3_E, 0x64420),
+            (DP_AUX_CH_DATA4_E, 0x64424),
         ];
         for (register, offset) in expected {
             assert_eq!(register.offset(), offset, "{}", register.name());

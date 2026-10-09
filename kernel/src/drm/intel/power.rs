@@ -393,6 +393,28 @@ pub(crate) const AUX_B: Well = Well {
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
 
+/// TGL/ADL Type-C AUX1 (the source `AUX_CH_USBC1` / channel D well).
+pub(crate) const AUX_TC1: Well = Well {
+    name: "AUX_TC1",
+    register: regs::ICL_PWR_WELL_CTL_AUX2,
+    request_registers: AUX_REQUESTS,
+    index: 3,
+    irq_pipe_mask: 0,
+    pg: None,
+    timeout_us: WELL_STATE_TIMEOUT_US,
+};
+
+/// TGL/ADL Type-C AUX2 (the source `AUX_CH_USBC2` / channel E well).
+pub(crate) const AUX_TC2: Well = Well {
+    name: "AUX_TC2",
+    register: regs::ICL_PWR_WELL_CTL_AUX2,
+    request_registers: AUX_REQUESTS,
+    index: 4,
+    irq_pipe_mask: 0,
+    pg: None,
+    timeout_us: WELL_STATE_TIMEOUT_US,
+};
+
 /// The DBUF slice registers, in the order this driver enables them.
 ///
 /// All four, because `XE_LPD`'s slice mask is `S1|S2|S3|S4` (`[I915]`
@@ -1407,6 +1429,8 @@ fn mapped_hsw_well(instance: PowerWellInstance) -> Option<Well> {
         WellControl::IclDdiB => Some(DDI_IO_B),
         WellControl::IclAuxA => Some(AUX_A),
         WellControl::IclAuxB => Some(AUX_B),
+        WellControl::TglAuxTc1 => Some(AUX_TC1),
+        WellControl::TglAuxTc2 => Some(AUX_TC2),
         WellControl::XelpdPwA => Some(PW_A),
         WellControl::XelpdPwB => Some(PW_B),
         WellControl::XelpdPwC => Some(PW_C),
@@ -1463,7 +1487,27 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
         if !matches!(group.ops, WellOps::Hsw | WellOps::Ddi | WellOps::Aux) {
             return Err(intel_display::Error::Refused);
         }
-        let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
+        // Linux `icl_tc_phy_aux_power_well_enable()` clears TBT_IO in the
+        // source-selected AUX D/E control before requesting the Type-C AUX
+        // well. The TBT group has a separate owner and is not admitted here.
+        let aux_ctl = match instance.control {
+            Some(WellControl::TglAuxTc1) => Some(regs::aux::DP_AUX_CH_CTL_D),
+            Some(WellControl::TglAuxTc2) => Some(regs::aux::DP_AUX_CH_CTL_E),
+            _ => None,
+        };
+        if let Some(control) = aux_ctl {
+            let current = self
+                .regs
+                .read(control)
+                .ok_or(intel_display::Error::Unavailable(control.offset()))?;
+            if !self.regs.write(control, current & !(1 << 11)) {
+                return Err(intel_display::Error::Unavailable(control.offset()));
+            }
+        }
+        let mut well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
+        if let Some(timeout_ms) = group.enable_timeout_ms {
+            well.timeout_us = u32::from(timeout_ms).saturating_mul(1_000);
+        }
         enable_well(self.regs, well, self.platform)
             .map(|_| ())
             .map_err(|_| intel_display::Error::Unavailable(well.register.offset()))
@@ -1948,6 +1992,8 @@ mod tests {
         regs.set(regs::CDCLK_PLL_ENABLE, (1 << 31) | (1 << 30) | 22);
         regs.set(regs::CDCLK_CTL, (1 << 22) | (7 << 19) | 350);
         regs.set(regs::PCH_RAWCLK_FREQ, 24 << 16);
+        regs.set(regs::aux::DP_AUX_CH_CTL_D, 1 << 11);
+        regs.set(regs::aux::DP_AUX_CH_CTL_E, 1 << 11);
         // DC6 requested: a machine that needs the DC state turned off, which is
         // the case the step exists for.
         regs.set(regs::DC_STATE_EN, 0b10);
@@ -1977,7 +2023,7 @@ mod tests {
         });
         regs.derive(regs::ICL_PWR_WELL_CTL_AUX2, |written| {
             let mut value = written;
-            for well in [AUX_A, AUX_B] {
+            for well in [AUX_A, AUX_B, AUX_TC1, AUX_TC2] {
                 let (request, state) = (well.request_mask(), well.state_mask());
                 if written & request != 0 {
                     value |= state;
@@ -2437,6 +2483,8 @@ mod tests {
             ("DDI_IO_B", DDI_IO_B),
             ("AUX_A", AUX_A),
             ("AUX_B", AUX_B),
+            ("AUX_USBC1", AUX_TC1),
+            ("AUX_USBC2", AUX_TC2),
         ] {
             let instance = adlp
                 .iter()
@@ -2483,6 +2531,33 @@ mod tests {
             !state
                 .is_domain_enabled(&regs, PowerDomain::AuxIoA, true)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn type_c_aux_domains_map_source_wells_and_clear_tbt_mode_before_request() {
+        let regs = powered_machine();
+        let mut state = bring_up(&regs).unwrap();
+
+        state.get_domain(&regs, PowerDomain::AuxUsbc1).unwrap();
+        assert_eq!(
+            state.power_domains.domain_use_count(PowerDomain::AuxUsbc1),
+            1
+        );
+        assert_eq!(
+            regs.read(regs::aux::DP_AUX_CH_CTL_D).unwrap() & (1 << 11),
+            0,
+            "legacy TC AUX must clear TBT_IO before the source well request"
+        );
+        assert_ne!(
+            regs.read(regs::ICL_PWR_WELL_CTL_AUX2).unwrap() & AUX_TC1.state_mask(),
+            0
+        );
+
+        state.put_domain(&regs, PowerDomain::AuxUsbc1).unwrap();
+        assert_eq!(
+            state.power_domains.domain_use_count(PowerDomain::AuxUsbc1),
+            0
         );
     }
 

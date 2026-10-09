@@ -1,9 +1,10 @@
 //! MMIO adapter for the translated display-12/13 DP AUX transaction engine.
 //!
-//! This initial kernel binding admits only AUX A/B and an already-connected
-//! external DP port. It polls because the current HPD IRQ path does not yet
-//! dispatch AUX completion interrupts. PPS/eDP and DPCD reads are deliberately
-//! separate call-site decisions; construction does not start a transaction.
+//! This kernel binding admits AUX A/B plus the source-mapped TC1/TC2 Type-C AUX
+//! channels (MMIO channels D/E) and an already-connected DP port. It polls
+//! because the current HPD IRQ path does not yet dispatch AUX completion
+//! interrupts. PPS/eDP and DPCD reads are deliberately separate call-site
+//! decisions; construction does not start a transaction.
 
 use alloc::{string::String, vec::Vec};
 
@@ -19,18 +20,27 @@ use super::{
     regs::{
         Register, Registers,
         aux::{
-            DP_AUX_CH_CTL_A, DP_AUX_CH_CTL_B, DP_AUX_CH_DATA0_A, DP_AUX_CH_DATA0_B,
-            DP_AUX_CH_DATA1_A, DP_AUX_CH_DATA1_B, DP_AUX_CH_DATA2_A, DP_AUX_CH_DATA2_B,
-            DP_AUX_CH_DATA3_A, DP_AUX_CH_DATA3_B, DP_AUX_CH_DATA4_A, DP_AUX_CH_DATA4_B,
+            DP_AUX_CH_CTL_A, DP_AUX_CH_CTL_B, DP_AUX_CH_CTL_D, DP_AUX_CH_CTL_E, DP_AUX_CH_DATA0_A,
+            DP_AUX_CH_DATA0_B, DP_AUX_CH_DATA0_D, DP_AUX_CH_DATA0_E, DP_AUX_CH_DATA1_A,
+            DP_AUX_CH_DATA1_B, DP_AUX_CH_DATA1_D, DP_AUX_CH_DATA1_E, DP_AUX_CH_DATA2_A,
+            DP_AUX_CH_DATA2_B, DP_AUX_CH_DATA2_D, DP_AUX_CH_DATA2_E, DP_AUX_CH_DATA3_A,
+            DP_AUX_CH_DATA3_B, DP_AUX_CH_DATA3_D, DP_AUX_CH_DATA3_E, DP_AUX_CH_DATA4_A,
+            DP_AUX_CH_DATA4_B, DP_AUX_CH_DATA4_D, DP_AUX_CH_DATA4_E,
         },
     },
 };
 
 static AUX_A_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 static AUX_B_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static AUX_USBC1_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static AUX_USBC2_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 const POWER_DOMAIN_A: u16 = 0;
 const POWER_DOMAIN_B: u16 = 1;
+// Private transport IDs passed through translated `AuxState`; these are not
+// AUX-channel ordinals. Keep each AUX well independently reference-counted.
+const POWER_DOMAIN_USBC1: u16 = 2;
+const POWER_DOMAIN_USBC2: u16 = 3;
 
 pub(crate) struct DpAuxKernel<'a, R: Registers> {
     registers: &'a R,
@@ -51,6 +61,8 @@ impl<'a, R: Registers> DpAuxKernel<'a, R> {
         let power_domain = match channel {
             AuxChannel::A => PowerDomain::AuxA,
             AuxChannel::B => PowerDomain::AuxB,
+            AuxChannel::UsbC1 => PowerDomain::AuxUsbc1,
+            AuxChannel::UsbC2 => PowerDomain::AuxUsbc2,
             _ => return Err(AuxError::Invalid),
         };
         Ok(Self {
@@ -74,10 +86,14 @@ impl<'a, R: Registers> DpAuxKernel<'a, R> {
             edp: false,
             tbt_alt_mode: false,
             firmware_sync_length_quirk: false,
-            aux_domain: if self.channel == AuxChannel::A {
-                POWER_DOMAIN_A
-            } else {
-                POWER_DOMAIN_B
+            aux_domain: match self.channel {
+                AuxChannel::A => POWER_DOMAIN_A,
+                AuxChannel::B => POWER_DOMAIN_B,
+                AuxChannel::UsbC1 => POWER_DOMAIN_USBC1,
+                AuxChannel::UsbC2 => POWER_DOMAIN_USBC2,
+                // `new()` is the only constructor and rejects every other
+                // channel before a DpAuxKernel can be created.
+                _ => unreachable!("DpAuxKernel only admits typed AUX channels"),
             },
             encoder_name: String::from(encoder_name),
         }
@@ -104,6 +120,21 @@ impl<'a, R: Registers> DpAuxKernel<'a, R> {
             (AuxChannel::B, Some(2)) => Ok(DP_AUX_CH_DATA2_B),
             (AuxChannel::B, Some(3)) => Ok(DP_AUX_CH_DATA3_B),
             (AuxChannel::B, Some(4)) => Ok(DP_AUX_CH_DATA4_B),
+            // On TGL/ADL the Rust UsbC1/UsbC2 enum values are distinct from
+            // AUX_CH_D/AUX_CH_E. Source `_PICK_EVEN` maps these aliases to
+            // the existing MMIO D/E register windows; do not use ordinals.
+            (AuxChannel::UsbC1, None) => Ok(DP_AUX_CH_CTL_D),
+            (AuxChannel::UsbC1, Some(0)) => Ok(DP_AUX_CH_DATA0_D),
+            (AuxChannel::UsbC1, Some(1)) => Ok(DP_AUX_CH_DATA1_D),
+            (AuxChannel::UsbC1, Some(2)) => Ok(DP_AUX_CH_DATA2_D),
+            (AuxChannel::UsbC1, Some(3)) => Ok(DP_AUX_CH_DATA3_D),
+            (AuxChannel::UsbC1, Some(4)) => Ok(DP_AUX_CH_DATA4_D),
+            (AuxChannel::UsbC2, None) => Ok(DP_AUX_CH_CTL_E),
+            (AuxChannel::UsbC2, Some(0)) => Ok(DP_AUX_CH_DATA0_E),
+            (AuxChannel::UsbC2, Some(1)) => Ok(DP_AUX_CH_DATA1_E),
+            (AuxChannel::UsbC2, Some(2)) => Ok(DP_AUX_CH_DATA2_E),
+            (AuxChannel::UsbC2, Some(3)) => Ok(DP_AUX_CH_DATA3_E),
+            (AuxChannel::UsbC2, Some(4)) => Ok(DP_AUX_CH_DATA4_E),
             _ => Err(AuxError::Invalid),
         }
     }
@@ -112,6 +143,8 @@ impl<'a, R: Registers> DpAuxKernel<'a, R> {
         match id {
             POWER_DOMAIN_A => Ok(PowerDomain::AuxA),
             POWER_DOMAIN_B => Ok(PowerDomain::AuxB),
+            POWER_DOMAIN_USBC1 => Ok(PowerDomain::AuxUsbc1),
+            POWER_DOMAIN_USBC2 => Ok(PowerDomain::AuxUsbc2),
             _ => Err(AuxError::Invalid),
         }
     }
@@ -144,11 +177,14 @@ impl<'a, R: Registers> DpAuxKernel<'a, R> {
         payload: Option<&[u8]>,
         receive: &mut [u8],
     ) -> intel_display::dp_aux::AuxReply {
-        let mut state = self.state(if self.channel == AuxChannel::A {
-            "DDI A"
-        } else {
-            "DDI B"
-        });
+        let encoder_name = match self.channel {
+            AuxChannel::A => "DDI A",
+            AuxChannel::B => "DDI B",
+            AuxChannel::UsbC1 => "DDI TC1",
+            AuxChannel::UsbC2 => "DDI TC2",
+            _ => unreachable!("DpAuxKernel only admits typed AUX channels"),
+        };
+        let mut state = self.state(encoder_name);
         intel_display::dp_aux::intel_dp_aux_transfer(
             self, &mut state, request, address, payload, receive,
         )
@@ -163,6 +199,8 @@ impl<R: Registers> DpAuxIo for DpAuxKernel<'_, R> {
         self.port_lock = Some(match self.channel {
             AuxChannel::A => AUX_A_LOCK.lock(),
             AuxChannel::B => AUX_B_LOCK.lock(),
+            AuxChannel::UsbC1 => AUX_USBC1_LOCK.lock(),
+            AuxChannel::UsbC2 => AUX_USBC2_LOCK.lock(),
             _ => return Err(AuxError::Invalid),
         });
         Ok(())
@@ -408,7 +446,7 @@ pub(crate) fn read_dpcd(
 
 #[cfg(test)]
 mod tests {
-    use intel_display::dp_aux::intel_dp_aux_register;
+    use intel_display::dp_aux::{AuxRegister, intel_dp_aux_register};
 
     use super::{super::regs::RegisterWindow, *};
 
@@ -432,6 +470,71 @@ mod tests {
         let unsupported = intel_dp_aux_register(platform, AuxChannel::C, None);
         assert_eq!(
             DpAuxKernel::<RegisterWindow>::register(unsupported),
+            Err(AuxError::Invalid)
+        );
+    }
+
+    #[test]
+    fn maps_source_usbc1_usbc2_to_typed_aux_d_e_windows() {
+        let platform = aux_platform();
+        for (channel, base) in [(AuxChannel::UsbC1, 0x64310), (AuxChannel::UsbC2, 0x64410)] {
+            assert_eq!(
+                DpAuxKernel::<RegisterWindow>::register(intel_dp_aux_register(
+                    platform, channel, None,
+                ))
+                .unwrap()
+                .offset(),
+                base
+            );
+            for index in 0..5u8 {
+                assert_eq!(
+                    DpAuxKernel::<RegisterWindow>::register(intel_dp_aux_register(
+                        platform,
+                        channel,
+                        Some(index),
+                    ))
+                    .unwrap()
+                    .offset(),
+                    base + 4 + u32::from(index) * 4
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn type_c_aux_domain_ids_are_distinct_and_other_channels_stay_refused() {
+        assert_eq!(
+            DpAuxKernel::<RegisterWindow>::domain(POWER_DOMAIN_USBC1),
+            Ok(PowerDomain::AuxUsbc1)
+        );
+        assert_eq!(
+            DpAuxKernel::<RegisterWindow>::domain(POWER_DOMAIN_USBC2),
+            Ok(PowerDomain::AuxUsbc2)
+        );
+        for channel in [
+            AuxChannel::C,
+            AuxChannel::D,
+            AuxChannel::E,
+            AuxChannel::F,
+            AuxChannel::UsbC3,
+            AuxChannel::UsbC4,
+            AuxChannel::UsbC5,
+            AuxChannel::UsbC6,
+        ] {
+            let register = AuxRegister {
+                generation: intel_display::dp_aux::AuxGeneration::Tigerlake,
+                channel,
+                data_index: None,
+                pch: false,
+            };
+            assert_eq!(
+                DpAuxKernel::<RegisterWindow>::register(register),
+                Err(AuxError::Invalid),
+                "unexpectedly mapped {channel:?}"
+            );
+        }
+        assert_eq!(
+            DpAuxKernel::<RegisterWindow>::domain(4),
             Err(AuxError::Invalid)
         );
     }

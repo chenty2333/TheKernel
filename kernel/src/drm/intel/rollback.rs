@@ -115,6 +115,18 @@ fn policy(register: Register) -> (Class, u32) {
         regs::aux::DP_AUX_CH_DATA2_B,
         regs::aux::DP_AUX_CH_DATA3_B,
         regs::aux::DP_AUX_CH_DATA4_B,
+        regs::aux::DP_AUX_CH_CTL_D,
+        regs::aux::DP_AUX_CH_DATA0_D,
+        regs::aux::DP_AUX_CH_DATA1_D,
+        regs::aux::DP_AUX_CH_DATA2_D,
+        regs::aux::DP_AUX_CH_DATA3_D,
+        regs::aux::DP_AUX_CH_DATA4_D,
+        regs::aux::DP_AUX_CH_CTL_E,
+        regs::aux::DP_AUX_CH_DATA0_E,
+        regs::aux::DP_AUX_CH_DATA1_E,
+        regs::aux::DP_AUX_CH_DATA2_E,
+        regs::aux::DP_AUX_CH_DATA3_E,
+        regs::aux::DP_AUX_CH_DATA4_E,
     ]
     .contains(&register)
     {
