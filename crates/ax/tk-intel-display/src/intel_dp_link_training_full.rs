@@ -251,18 +251,18 @@ pub trait LinkTrainingIo {
         state: &LinkTrainingCrtcState,
         train_set: &[u8; 4],
     ) -> Result<(), LinkTrainingError>;
-    fn prepare_link_retrain(&mut self, _state: &LinkTrainingCrtcState) {}
+    fn prepare_link_retrain(&mut self, state: &LinkTrainingCrtcState);
     fn compute_rate(&mut self, port_clock: i32) -> (u8, u8);
-    fn reload_supported_link_rates(&mut self) {}
+    fn reload_supported_link_rates(&mut self);
     fn wait_us(&mut self, usec: u32);
     fn wait_range_us(&mut self, min_usec: u32, max_usec: u32);
     fn now_ms(&mut self) -> u64;
     fn connected(&mut self) -> bool;
-    fn hpd_block(&mut self) {}
-    fn hpd_unblock(&mut self) {}
-    fn queue_link_check(&mut self, _delay_ms: u32) {}
-    fn set_idle_link_train(&mut self, _state: &LinkTrainingCrtcState) {}
-    fn queue_modeset_retry(&mut self, _state: &LinkTrainingCrtcState) {}
+    fn hpd_block(&mut self);
+    fn hpd_unblock(&mut self);
+    fn queue_link_check(&mut self, delay_ms: u32);
+    fn set_idle_link_train(&mut self, state: &LinkTrainingCrtcState);
+    fn queue_modeset_retry(&mut self, state: &LinkTrainingCrtcState);
     fn ignore_long_hpd(&mut self) -> bool {
         false
     }
@@ -1753,9 +1753,11 @@ mod tests {
         ) -> Result<(), LinkTrainingError> {
             Ok(())
         }
+        fn prepare_link_retrain(&mut self, _: &LinkTrainingCrtcState) {}
         fn compute_rate(&mut self, _: i32) -> (u8, u8) {
             (0, 0)
         }
+        fn reload_supported_link_rates(&mut self) {}
         fn wait_us(&mut self, _: u32) {}
         fn wait_range_us(&mut self, _: u32, _: u32) {}
         fn now_ms(&mut self) -> u64 {
@@ -1764,9 +1766,13 @@ mod tests {
         fn connected(&mut self) -> bool {
             true
         }
+        fn hpd_block(&mut self) {}
         fn hpd_unblock(&mut self) {
             self.hpd_unblocks += 1;
         }
+        fn queue_link_check(&mut self, _: u32) {}
+        fn set_idle_link_train(&mut self, _: &LinkTrainingCrtcState) {}
+        fn queue_modeset_retry(&mut self, _: &LinkTrainingCrtcState) {}
     }
 
     #[test]
