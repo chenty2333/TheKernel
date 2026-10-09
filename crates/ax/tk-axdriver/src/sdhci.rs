@@ -249,6 +249,7 @@ struct SdhciIrqContext {
     pending: AtomicU32,
 }
 
+// upstream: sdhci_pci.c sdhci_pci_intr() multi-slot generic interrupt dispatch
 fn ack_sdhci_interrupt(context: usize) -> bool {
     // SAFETY: the PCI frontend leaks this immutable BAR/status context for the
     // lifetime of the fixed PCI interrupt endpoint.
