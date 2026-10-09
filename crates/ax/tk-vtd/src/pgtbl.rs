@@ -54,6 +54,7 @@ impl<M: PageMemory> SecondLevel<M> {
         if let Err(error) = memory.flush_range(root, 0, PAGE_SIZE as usize) {
             // No hardware can reference a second-level root before it is
             // installed in a context entry.
+            // SAFETY: the page is still owned by this not-yet-constructed table.
             unsafe { memory.free_page(root) };
             return Err(error);
         }
@@ -98,6 +99,7 @@ impl<M: PageMemory> SecondLevel<M> {
             unsafe { page.as_mut().fill(0) };
             if let Err(error) = self.memory.flush_range(child, 0, PAGE_SIZE as usize) {
                 // The child is not yet reachable from its parent.
+                // SAFETY: the page is still owned and no hardware pointer names it.
                 unsafe { self.memory.free_page(child) };
                 return Err(error);
             }
