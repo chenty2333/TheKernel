@@ -210,9 +210,8 @@ unsafe fn intel_uc_fw_sanitize(fw: *mut crate::intel_uc_fw_types_upstream::Intel
     }
 }
 
-// upstream: intel_guc.c intel_guc_notify(). The source function is also
-// represented by the standalone GtIo helper in guc_fw.rs; this is its device
-// ABI implementation for the upstream GT owner.
+// upstream: intel_guc.c intel_guc_notify()
+/// Device ABI implementation; the default `guc_fw.rs` helper owns a separate interface.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_guc_notify(guc: *mut IntelGuc) {
     let gt = unsafe { guc_to_gt(guc) };
@@ -547,8 +546,8 @@ pub unsafe extern "C" fn intel_guc_write_params(guc: *mut IntelGuc) {
     unsafe { intel_uncore_forcewake_put(uncore, FORCEWAKE_GT) };
 }
 
-// upstream: intel_guc.c intel_guc_dump_time_info(). LinuxKPI currently exposes
-// monotonic ktime rather than a distinct suspend-inclusive boottime clock.
+// upstream: intel_guc.c intel_guc_dump_time_info()
+/// Uses the configured LinuxKPI monotonic clock for the timestamp display.
 pub unsafe extern "C" fn intel_guc_dump_time_info(guc: *mut IntelGuc, printer: *mut DrmPrinter) {
     let gt = unsafe { guc_to_gt(guc) };
     let mut stamp = 0;
@@ -575,9 +574,8 @@ pub unsafe extern "C" fn intel_guc_dump_time_info(guc: *mut IntelGuc, printer: *
     );
 }
 
-// upstream: intel_guc.c intel_guc_init(). The PCI config revision is needed
-// by GuC firmware control word 5. Fail before allocating state when the kernel
-// has not installed its PCI owner callback; never send a guessed revision.
+// upstream: intel_guc.c intel_guc_init()
+/// Fails before allocation if the PCI revision service has no provider.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_guc_init(guc: *mut IntelGuc) -> i32 {
     let gt = unsafe { guc_to_gt(guc) };

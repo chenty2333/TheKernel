@@ -236,8 +236,8 @@ pub unsafe extern "C" fn shmem_read_to_iosys_map(
     0
 }
 
-// upstream: gt/shmem_utils.c shmem_read() — explicit forwarding to the
-// existing LinuxKPI shmem-read implementation in i915_gem_shmem_upstream.rs.
+// upstream: gt/shmem_utils.c shmem_read()
+/// Adapter to the shared native shmem page reader.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn shmem_read(
     file: *mut File,

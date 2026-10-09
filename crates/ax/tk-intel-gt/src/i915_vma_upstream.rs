@@ -671,7 +671,8 @@ unsafe fn i915_vma_free(vma: *mut I915Vma) {
     unsafe { crate::linux_heap::kmem_cache_free(cache, vma.cast()) };
 }
 
-// upstream: i915_vma.c vma_print_allocator() [CONFIG_DRM_I915_ERRLOG_GEM && CONFIG_DRM_DEBUG_MM]
+// upstream: i915_vma.c vma_print_allocator()
+/// Debug allocator-print implementation for the selected CONFIG combination.
 unsafe fn vma_print_allocator_debug(vma: *mut I915Vma, reason: *const c_char) {
     if !DEBUG_VMA_ALLOCATOR {
         return;
@@ -706,7 +707,8 @@ unsafe fn vma_print_allocator_debug(vma: *mut I915Vma, reason: *const c_char) {
     );
 }
 
-// upstream: i915_vma.c vma_print_allocator() [other configurations]
+// upstream: i915_vma.c vma_print_allocator()
+/// Disabled-debug configuration forwards to the source-compatible stub.
 unsafe fn vma_print_allocator(vma: *mut I915Vma, reason: *const c_char) {
     unsafe { vma_print_allocator_debug(vma, reason) }
 }
