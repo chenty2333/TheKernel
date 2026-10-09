@@ -25,3 +25,7 @@ construct and write FUNC_CTL2/FUNC_CTL for TC1/TC2 selectors, with source
 readback verification. Its surrounding PLL, PHY and TC ownership stages remain
 the existing bounded legacy path. A complete kernel `DdiIo` binding and source
 DDI pre-enable/enable/disable call sequence are not yet connected.
+The kernel register-model test covers TC1 FUNC_CTL2-before-FUNC_CTL ordering,
+polarity/port encoding and the matching disable masks; it type-checks with the
+kernel test target, while execution is blocked by the current host linker’s
+bare-metal per-CPU `R_X86_64_32S` relocations.

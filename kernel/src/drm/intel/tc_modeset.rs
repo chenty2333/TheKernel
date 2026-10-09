@@ -886,8 +886,85 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
 
 #[cfg(test)]
 mod tests {
+    use alloc::{collections::BTreeMap, vec::Vec};
+    use core::cell::RefCell;
+
     use super::source_hdmi_tmds_clock_with_limit;
     use crate::drm::modes::{Mode, ModeFlags, TimingSource};
+
+    #[derive(Default)]
+    struct TranscoderModel {
+        values: RefCell<BTreeMap<u32, u32>>,
+        writes: RefCell<Vec<(u32, u32)>>,
+    }
+
+    impl super::Registers for TranscoderModel {
+        fn read(&self, register: super::Register) -> Option<u32> {
+            self.values.borrow().get(&register.offset()).copied()
+        }
+
+        fn read64(&self, _register: super::Register) -> Option<u64> {
+            None
+        }
+
+        fn write(&self, register: super::Register, value: u32) -> bool {
+            self.values.borrow_mut().insert(register.offset(), value);
+            self.writes.borrow_mut().push((register.offset(), value));
+            true
+        }
+    }
+
+    #[test]
+    fn active_tc_path_uses_source_transcoder_control_order() {
+        let registers = TranscoderModel::default();
+        let tc1_select = 4 << 27;
+        registers.values.borrow_mut().insert(
+            super::ddi::TRANS_DDI_FUNC_CTL_A.offset(),
+            (1 << 31) | tc1_select,
+        );
+        registers
+            .values
+            .borrow_mut()
+            .insert(super::ddi::TRANS_DDI_FUNC_CTL2_A.offset(), u32::MAX);
+
+        super::enable_pipe_a_transcoder(&registers, super::TcPort::Tc1, (1 << 0) | (1 << 2))
+            .unwrap();
+        let expected_enabled = (1 << 31) | tc1_select | (1 << 16) | (1 << 17);
+        assert_eq!(
+            registers
+                .values
+                .borrow()
+                .get(&super::ddi::TRANS_DDI_FUNC_CTL_A.offset()),
+            Some(&expected_enabled)
+        );
+        assert_eq!(
+            *registers.writes.borrow(),
+            [
+                (super::ddi::TRANS_DDI_FUNC_CTL2_A.offset(), 0),
+                (super::ddi::TRANS_DDI_FUNC_CTL_A.offset(), expected_enabled),
+            ]
+        );
+
+        registers.writes.borrow_mut().clear();
+        super::disable_pipe_a_transcoder(&registers).unwrap();
+        assert_eq!(
+            registers
+                .values
+                .borrow()
+                .get(&super::ddi::TRANS_DDI_FUNC_CTL_A.offset()),
+            Some(&((1 << 16) | (1 << 17)))
+        );
+        assert_eq!(
+            *registers.writes.borrow(),
+            [
+                (super::ddi::TRANS_DDI_FUNC_CTL2_A.offset(), 0),
+                (
+                    super::ddi::TRANS_DDI_FUNC_CTL_A.offset(),
+                    (1 << 16) | (1 << 17)
+                ),
+            ]
+        );
+    }
 
     fn mode(clock_khz: u32) -> Mode {
         Mode::from_blanking(
