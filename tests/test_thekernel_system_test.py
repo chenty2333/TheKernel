@@ -902,6 +902,19 @@ class SystemTestGateTests(unittest.TestCase):
         self.assertEqual(spec.rootfs_transport, "module")
         self.assertIsNone(spec.stop_after_marker)
 
+    def test_vtd_guest_build_and_boot_use_the_same_drive_transport(self) -> None:
+        product = load_product()
+        args = product.build_parser().parse_args(["test", "--suite", "guest", "--vtd-q35"])
+        with patch.object(product, "build_rootfs"), \
+                patch.object(product, "build_kernel") as build, \
+                patch.object(product, "run_product", return_value=0) as run:
+            self.assertEqual(product.system_test_cmd(args), 0)
+        spec = run.call_args.args[1]
+        self.assertEqual(build.call_args.kwargs["rootfs_transport"], "drive")
+        self.assertEqual(spec.rootfs_transport, "drive")
+        self.assertTrue(spec.kernel_irqchip_split)
+        self.assertIn("intel-iommu,intremap=on", spec.qemu_extra_args)
+
     def test_guest_cmdline_cli_overrides_acpi_test_environment(self) -> None:
         product = load_product()
         for flags, expected in (([], "acpi=static"),

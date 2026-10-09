@@ -981,7 +981,7 @@ def system_test_cmd(args: argparse.Namespace) -> int:
             # hunting a slow test instead of a dead kernel.
             detect_kernel_crash=True,
             reject_ktap_skips=not args.allow_skip,
-            rootfs_transport="module",
+            rootfs_transport=rootfs_transport,
             run_cpus=run_cpus,
             qemu_extra_args=(("-device", "intel-iommu,intremap=on")
                              if vtd_q35 else ()),
