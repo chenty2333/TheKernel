@@ -21,9 +21,9 @@ use tk_vtd::{
     qi::{self, QiIo, QiQueue},
     reg::{
         ContextEntry, DMAR_CAP_MGAW, DMAR_CAP_ND, DMAR_CAP_RWBF, DMAR_CAP_SAGAW,
-        DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS, DMAR_CAP_SPS_2M, DMAR_CTX2_AW_4LVL, DMAR_ECAP_EIM,
-        DMAR_ECAP_IR, DMAR_ECAP_QI, DMAR_IECTL_IM, DMAR_IECTL_REG, DMAR_PTE_R, DMAR_PTE_W,
-        RootEntry,
+        DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS, DMAR_CAP_SPS_2M, DMAR_CTX2_AW_4LVL, DMAR_ECAP_C,
+        DMAR_ECAP_EIM, DMAR_ECAP_IR, DMAR_ECAP_QI, DMAR_IECTL_IM, DMAR_IECTL_REG, DMAR_PTE_R,
+        DMAR_PTE_W, RootEntry,
     },
     utils::{self, RegisterIo},
 };
@@ -158,6 +158,12 @@ fn validate_unit_capabilities(
     if DMAR_CAP_SAGAW(cap) & DMAR_CAP_SAGAW_4LVL == 0
         || DMAR_CAP_SPS(cap) & DMAR_CAP_SPS_2M == 0
         || mgaw < 39
+        // Root/context/second-level tables and QI descriptors are populated
+        // in ordinary cached RAM. The current DMA table writers rely on VT-d
+        // cache coherence rather than flushing each modified cache line.
+        // Reject non-coherent units during all-unit preflight instead of
+        // enabling translation with table contents the IOMMU may not observe.
+        || ecap & DMAR_ECAP_C == 0
     {
         return Err(Error::Unsupported);
     }
@@ -260,7 +266,9 @@ unsafe impl PageMemory for KernelPageMemory {
         Ok(physical)
     }
     fn page_mut(&mut self, physical: u64) -> Option<NonNull<[u64; 512]>> {
-        if !physical.is_multiple_of(PAGE_SIZE) {
+        if !physical.is_multiple_of(PAGE_SIZE)
+            || !self.pages.iter().any(|page| page.physical == physical)
+        {
             return None;
         }
         let address = phys_to_virt(PhysAddr::from_usize(usize::try_from(physical).ok()?));
@@ -2877,19 +2885,20 @@ mod tests {
     use tk_vtd::iova::IovaAllocator;
 
     use super::{
-        DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS_2M, DMAR_ECAP_EIM, DMAR_ECAP_IR, DMAR_ECAP_QI,
-        DomainState, Error, IdentityDmaOwner, IdentityPage, IrRoute, IrRouteState, MODE_ENABLED,
-        MODE_FAILED, MODE_IDENTITY, MODE_UNKNOWN, Mapping, MappingState, UnitProbe,
-        cap_domain_count, complete_domain_install, direct_identity_acquire,
-        direct_identity_lease_allowed, direct_identity_map, direct_identity_release,
-        direct_identity_unmap, find_owned_msi_vector, identity_batch_removal_pages,
-        identity_dma_in_mode, identity_fallback_safe_before_enable, identity_pages_for_path,
-        pci_dma_allowed_in_mode, prepare_identity_batch_record, publish_identity_batch,
-        publish_identity_batch_after_invalidation, publish_mapping_after_invalidation,
-        quarantine_boot_resources, require_ready_domain, retire_identity_batch_after_invalidation,
-        retire_identity_batch_record, retire_identity_lease_after_invalidation,
-        retire_ir_route_after_invalidation, retire_mapping_after_invalidation, take_domain_id,
-        validate_all_unit_capabilities, validate_unit_capabilities,
+        DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS_2M, DMAR_ECAP_C, DMAR_ECAP_EIM, DMAR_ECAP_IR,
+        DMAR_ECAP_QI, DomainState, Error, IdentityDmaOwner, IdentityPage, IrRoute, IrRouteState,
+        KernelPageMemory, MODE_ENABLED, MODE_FAILED, MODE_IDENTITY, MODE_UNKNOWN, Mapping,
+        MappingState, PageMemory, UnitProbe, cap_domain_count, complete_domain_install,
+        direct_identity_acquire, direct_identity_lease_allowed, direct_identity_map,
+        direct_identity_release, direct_identity_unmap, find_owned_msi_vector,
+        identity_batch_removal_pages, identity_dma_in_mode, identity_fallback_safe_before_enable,
+        identity_pages_for_path, pci_dma_allowed_in_mode, prepare_identity_batch_record,
+        publish_identity_batch, publish_identity_batch_after_invalidation,
+        publish_mapping_after_invalidation, quarantine_boot_resources, require_ready_domain,
+        retire_identity_batch_after_invalidation, retire_identity_batch_record,
+        retire_identity_lease_after_invalidation, retire_ir_route_after_invalidation,
+        retire_mapping_after_invalidation, take_domain_id, validate_all_unit_capabilities,
+        validate_unit_capabilities,
     };
 
     struct DropProbe(Arc<AtomicUsize>);
@@ -2930,7 +2939,7 @@ mod tests {
     #[test]
     fn all_drdhs_are_checked_for_host_and_unit_address_widths() {
         let cap = (38 << 16) | (DMAR_CAP_SAGAW_4LVL << 8) | (DMAR_CAP_SPS_2M << 34);
-        let ecap = DMAR_ECAP_QI | DMAR_ECAP_IR | DMAR_ECAP_EIM;
+        let ecap = DMAR_ECAP_C | DMAR_ECAP_QI | DMAR_ECAP_IR | DMAR_ECAP_EIM;
         assert_eq!(
             validate_unit_capabilities(cap, ecap, 1 << 38, 39, false),
             Ok(())
@@ -2951,6 +2960,13 @@ mod tests {
             validate_unit_capabilities(cap, ecap, (1 << 38) + 4096, 38, false),
             Err(Error::InvalidRange)
         );
+    }
+
+    #[test]
+    fn kernel_page_memory_refuses_unowned_table_pages() {
+        let mut memory = KernelPageMemory { pages: Vec::new() };
+        assert!(memory.page_mut(0x1000).is_none());
+        assert!(memory.page_mut(0x1001).is_none());
     }
 
     #[test]
@@ -2988,10 +3004,15 @@ mod tests {
         let cap = (38 << 16) | (DMAR_CAP_SAGAW_4LVL << 8) | (DMAR_CAP_SPS_2M << 34);
         assert_eq!(
             validate_unit_capabilities(cap, 0, 1 << 38, 39, false),
+            Err(Error::Unsupported),
+            "non-coherent table memory must be refused during preflight"
+        );
+        assert_eq!(
+            validate_unit_capabilities(cap, DMAR_ECAP_C, 1 << 38, 39, false),
             Ok(())
         );
         assert_eq!(
-            validate_unit_capabilities(cap, 0, 1 << 38, 39, true),
+            validate_unit_capabilities(cap, DMAR_ECAP_C, 1 << 38, 39, true),
             Err(Error::Unsupported)
         );
     }
@@ -2999,7 +3020,7 @@ mod tests {
     #[test]
     fn all_drhd_capabilities_are_validated_before_any_unit_is_enabled() {
         let cap = (38 << 16) | (DMAR_CAP_SAGAW_4LVL << 8) | (DMAR_CAP_SPS_2M << 34);
-        let ecap = DMAR_ECAP_QI | DMAR_ECAP_IR | DMAR_ECAP_EIM;
+        let ecap = DMAR_ECAP_C | DMAR_ECAP_QI | DMAR_ECAP_IR | DMAR_ECAP_EIM;
         let probes = [
             UnitProbe {
                 mmio: 0,

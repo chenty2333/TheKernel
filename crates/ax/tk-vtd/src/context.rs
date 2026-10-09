@@ -4,6 +4,7 @@
 //! Foundation sponsorship. PCI, RMRR/GAS, delayed-task and page-object handles
 //! are mapped through bounded caller-owned adapters. See LICENSES/BSD-2-Clause.txt.
 use alloc::vec::Vec;
+use core::ptr;
 
 use crate::{
     Error,
@@ -163,9 +164,22 @@ pub fn ctx_id_entry_init(
         if !move_context && (old.ctx1 != 0 || old.ctx2 != 0) {
             return Err(Error::InvalidStructure);
         }
-        // Preserve source update order: context high word first, then low word.
-        page[slot].ctx2 = entry.ctx2;
-        page[slot].ctx1 = entry.ctx1;
+        // A live 128-bit context move is not atomic. Preserve the upstream
+        // publication protocol exactly: update the upper DID/AW word first,
+        // then publish the lower root/translation/P word. In particular, do
+        // not clear P between the stores; FreeBSD's intel_ctx.c documents that
+        // clearing P during a move can make an active requester fault.
+        // Volatile writes make this ordering observable to the IOMMU rather
+        // than relying on compiler ordering of ordinary Rust field stores.
+        // SAFETY: `page` has exactly DEVFN_COUNT entries and `slot` is in its
+        // selected range; the mutable slice owns the hardware table page.
+        let entry_ptr = unsafe { page.as_mut_ptr().add(slot) };
+        // SAFETY: `entry_ptr` points to a valid, aligned ContextEntry in the
+        // uniquely borrowed context page; each volatile store targets a u64.
+        unsafe {
+            ptr::write_volatile(ptr::addr_of_mut!((*entry_ptr).ctx2), entry.ctx2);
+            ptr::write_volatile(ptr::addr_of_mut!((*entry_ptr).ctx1), entry.ctx1);
+        }
     }
     Ok(())
 }
