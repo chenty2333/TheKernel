@@ -1075,10 +1075,14 @@ fn init_filesystems_with_root_mode(
         index += 1;
     }
     EXTRA_BLOCK_DEVICES.call_once(|| Mutex::new(extras));
-    assert!(
-        axdriver::install_runtime_block_add_hook(publish_runtime_block_add),
-        "runtime block add hook already owned by a different registry"
-    );
+    // A conflicting owner only loses runtime hotplug publication; the boot
+    // root must still mount, so this warns rather than aborting.
+    if !axdriver::install_runtime_block_add_hook(publish_runtime_block_add) {
+        warn!(
+            "runtime block add hook already owned by a different registry; \
+             hotplugged block devices will not be published"
+        );
+    }
 
     let root_device = open_block_device(ROOT_BLOCK_DEVICE_NAME)
         .expect("failed to claim root block device for filesystem mount");
