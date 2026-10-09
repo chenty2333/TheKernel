@@ -15,6 +15,9 @@ use crate::{
     intel_engine_types_upstream::{
         COMPUTE_CLASS, COPY_ENGINE_CLASS, IntelEngineCs, RENDER_CLASS, VIDEO_DECODE_CLASS,
     },
+    intel_gt_mcr_upstream::{
+        intel_gt_mcr_multicast_write_fw, intel_gt_mcr_read_any_fw, intel_gt_mcr_report_steering,
+    },
     intel_gt_types_upstream::{IntelGt, IntelMmioRange as I915MmioRange},
     intel_uncore_types_upstream::*,
     linux_config::*,

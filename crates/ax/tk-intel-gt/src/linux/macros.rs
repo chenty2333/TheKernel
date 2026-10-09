@@ -384,3 +384,34 @@ macro_rules! mutex_acquire {
         }
     }};
 }
+
+/// `dma_fence_assert_held()` compiles away for this configured Linux build
+/// (`CONFIG_LOCKDEP=n`); preserve the expression's evaluation side effects.
+#[macro_export]
+macro_rules! dma_fence_assert_held {
+    ($fence:expr) => {{
+        let _ = $fence;
+    }};
+}
+
+/// Initialize an atomic notifier head in the CONFIG_LOCKDEP=n target layout.
+#[macro_export]
+macro_rules! ATOMIC_INIT_NOTIFIER_HEAD {
+    ($head:expr) => {{
+        let __head = $head;
+        unsafe { core::ptr::write_bytes(__head, 0, 1) }
+    }};
+}
+
+/// Release-publish an RCU pointer slot, matching `rcu_assign_pointer()`.
+#[macro_export]
+macro_rules! rcu_assign_pointer {
+    ($slot:expr, $value:expr) => {{
+        let __slot = $slot;
+        let __value = $value;
+        let __atomic = unsafe {
+            &*core::ptr::addr_of_mut!(*__slot).cast::<core::sync::atomic::AtomicPtr<_>>()
+        };
+        __atomic.store(__value, core::sync::atomic::Ordering::Release);
+    }};
+}

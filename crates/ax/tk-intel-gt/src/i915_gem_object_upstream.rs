@@ -75,12 +75,12 @@ unsafe fn object_set_cache_dirty(obj: *mut DrmI915GemObject, dirty: bool) {
 
 #[inline]
 unsafe fn object_madv(obj: *const DrmI915GemObject) -> u32 {
-    (*obj).mm.madv_dirty & 0x3
+    (*obj).mm.madv()
 }
 
 #[inline]
 unsafe fn object_set_madv(obj: *mut DrmI915GemObject, madv: u32) {
-    (*obj).mm.madv_dirty = ((*obj).mm.madv_dirty & !0x3) | (madv & 0x3);
+    (*obj).mm.set_madv(madv);
 }
 
 #[inline]

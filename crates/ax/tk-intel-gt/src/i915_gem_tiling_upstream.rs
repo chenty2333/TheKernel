@@ -11,6 +11,7 @@
 use core::ffi::c_void;
 
 use crate::{
+    for_each_ggtt_vma,
     i915_vma_api_upstream::*,
     intel_context_upstream::{DrmI915GemObject, I915Vma},
     intel_engine_cs_upstream::ListHead,

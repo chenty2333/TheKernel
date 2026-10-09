@@ -105,7 +105,13 @@ pub mod i915_gem_context_types_upstream;
 pub mod i915_gem_domain_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod i915_gem_object_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod i915_gem_object_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod i915_gem_shmem_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod i915_gem_tiling_upstream;
@@ -114,7 +120,13 @@ pub mod i915_gem_tiling_upstream;
 pub mod i915_request_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod i915_request_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod i915_scheduler_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod i915_scheduler_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod i915_vma_api_upstream;
@@ -169,10 +181,19 @@ pub mod intel_gt_buffer_pool_types_upstream;
 pub mod intel_gt_defines_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_gt_mcr_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_gt_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_guc_actions_abi_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_guc_ct_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_guc_fwif_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_guc_log_types_upstream;

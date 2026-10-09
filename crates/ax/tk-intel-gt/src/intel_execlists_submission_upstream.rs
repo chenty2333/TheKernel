@@ -116,6 +116,7 @@ use crate::{
     for_each_signaler, for_each_waiter,
     i915_request_types_upstream::*,
     i915_scheduler_types_upstream::*,
+    i915_scheduler_upstream::i915_schedule,
     i915_vma_api_upstream::i915_vma_is_pinned,
     intel_breadcrumbs_upstream::intel_context_remove_breadcrumbs,
     intel_context_types_upstream::*,

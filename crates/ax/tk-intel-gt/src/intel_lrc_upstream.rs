@@ -1056,12 +1056,12 @@ unsafe fn init_wa_bb_regs(regs: *mut u32, engine: *const IntelEngineCs) {
 unsafe fn init_ppgtt_regs(regs: *mut u32, ppgtt: *const I915Ppgtt) {
     if i915_vm_is_4lvl(&(*ppgtt).vm) {
         // 64-bit PPGTT (48-bit canonical): PDP0_DESCRIPTOR holds PML4 base.
-        ASSIGN_CTX_PML4!(ppgtt, regs);
+        crate::ASSIGN_CTX_PML4!(ppgtt, regs);
     } else {
-        ASSIGN_CTX_PDP!(ppgtt, regs, 3);
-        ASSIGN_CTX_PDP!(ppgtt, regs, 2);
-        ASSIGN_CTX_PDP!(ppgtt, regs, 1);
-        ASSIGN_CTX_PDP!(ppgtt, regs, 0);
+        crate::ASSIGN_CTX_PDP!(ppgtt, regs, 3);
+        crate::ASSIGN_CTX_PDP!(ppgtt, regs, 2);
+        crate::ASSIGN_CTX_PDP!(ppgtt, regs, 1);
+        crate::ASSIGN_CTX_PDP!(ppgtt, regs, 0);
     }
 }
 

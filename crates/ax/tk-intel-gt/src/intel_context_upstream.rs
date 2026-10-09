@@ -25,6 +25,10 @@ use crate::{
     intel_timeline_types_upstream::{I915Syncmap, IntelTimeline},
 };
 pub use crate::{
+    i915_gem_object_types_upstream::{
+        DrmI915GemObject, I915GemObjectMm, I915GemObjectMmo, I915GemObjectPageIter,
+        I915GemObjectVma,
+    },
     i915_vma_resource_types_upstream::{I915PageSizes, I915VmaResource},
     i915_vma_types_upstream::I915Vma,
     intel_ring_types_upstream::IntelRing,
@@ -275,38 +279,6 @@ pub struct RadixTreeRoot {
 }
 const _: [(); 16] = [(); core::mem::size_of::<RadixTreeRoot>()];
 
-#[repr(C)]
-pub struct I915GemObjectMm {
-    pub pages_pin_count: AtomicT,
-    pub shrink_pin: AtomicT,
-    pub ttm_shrinkable: bool,
-    pub unknown_state: bool,
-    pub _pad0: [u8; 6],
-    pub placements: *mut *mut c_void,
-    pub n_placements: i32,
-    pub _pad1: [u8; 4],
-    pub region: *mut IntelMemoryRegion,
-    pub res: *mut c_void,
-    pub region_link: ListHead,
-    pub rsgt: *mut c_void,
-    pub pages: *mut SgTable,
-    pub mapping: *mut c_void,
-    pub page_sizes: I915PageSizes,
-    pub get_page: I915GemObjectPageIter,
-    pub get_dma_page: I915GemObjectPageIter,
-    pub link: ListHead,
-    /// C bitfield storage: madv occupies bits 0..1; dirty is bit 2.
-    pub madv_dirty: u32,
-    pub tlb: [u32; 2],
-}
-
-impl I915GemObjectMm {
-    /// Set only upstream's `dirty:1` bit, retaining the `madv:2` bits.
-    pub fn set_dirty(&mut self) {
-        self.madv_dirty |= 1 << 2;
-    }
-}
-
 /// Exact Linux v7.2.3 x86_64 `drm_gem_object` fields accessed by the i915 GEM
 /// paths. Its 480-byte storage reflects the C union with `ttm_buffer_object`;
 /// only the DRM-object member fields used here are named.
@@ -329,120 +301,13 @@ pub struct DrmGemObjectBaseLayout {
     _union_tail: [u8; 112],
 }
 
-#[repr(C)]
-pub struct I915GemObjectVmaLayout {
-    pub lock: Spinlock,
-    _pad: [u8; 4],
-    pub list: ListHead,
-    pub tree: RbRoot,
-}
-
-#[repr(C)]
-pub struct I915GemObjectMmoLayout {
-    pub lock: Spinlock,
-    _pad: [u8; 4],
-    pub offsets: RbRoot,
-}
-
 const _: [(); 480] = [(); core::mem::size_of::<DrmGemObjectBaseLayout>()];
 const _: [(); 8] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, dev)];
 const _: [(); 16] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, filp)];
 const _: [(); 216] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, size)];
 const _: [(); 248] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, resv)];
 const _: [(); 336] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, funcs)];
-const _: [(); 32] = [(); core::mem::size_of::<I915GemObjectVmaLayout>()];
-const _: [(); 16] = [(); core::mem::size_of::<I915GemObjectMmoLayout>()];
-const _: [(); 480] = [(); core::mem::offset_of!(DrmI915GemObject, ops)];
-const _: [(); 488] = [(); core::mem::offset_of!(DrmI915GemObject, vma)];
-const _: [(); 520] = [(); core::mem::offset_of!(DrmI915GemObject, lut_list)];
-const _: [(); 608] = [(); core::mem::offset_of!(DrmI915GemObject, userfault_count)];
-const _: [(); 632] = [(); core::mem::offset_of!(DrmI915GemObject, mmo)];
-const _: [(); 648] = [(); core::mem::offset_of!(DrmI915GemObject, flags)];
-const _: [(); 660] = [(); core::mem::offset_of!(DrmI915GemObject, cache_bits)];
-const _: [(); 662] = [(); core::mem::offset_of!(DrmI915GemObject, read_domains)];
-const _: [(); 664] = [(); core::mem::offset_of!(DrmI915GemObject, write_domain)];
-const _: [(); 672] = [(); core::mem::offset_of!(DrmI915GemObject, frontbuffer)];
-const _: [(); 680] = [(); core::mem::offset_of!(DrmI915GemObject, tiling_and_stride)];
 
-#[repr(C, align(8))]
-pub struct DrmI915GemObject {
-    pub base: DrmGemObjectBaseLayout,
-    pub ops: *const c_void,
-    pub vma: I915GemObjectVmaLayout,
-    pub lut_list: ListHead,
-    pub lut_lock: Spinlock,
-    _pad_lut_lock: [u8; 4],
-    pub obj_link: ListHead,
-    pub shares_resv_from: *mut I915AddressSpace,
-    pub client: *mut c_void,
-    pub client_link: ListHead,
-    pub rcu: RcuHead,
-    pub userfault_count: u32,
-    _pad_userfault: [u8; 4],
-    pub userfault_link: ListHead,
-    pub mmo: I915GemObjectMmoLayout,
-    pub flags: c_ulong,
-    pub mem_flags: u32,
-    /// Source bitfields pat_index/pat_set_by_user/cache_coherent/cache_dirty/
-    /// is_dpt occupy the low 11 bits of this little-endian u16.
-    pub cache_bits: u16,
-    pub read_domains: u16,
-    pub write_domain: u16,
-    _pad_frontbuffer: [u8; 6],
-    pub frontbuffer: *mut c_void,
-    pub tiling_and_stride: u32,
-    _pad_to_mm: [u8; 4],
-    pub mm: I915GemObjectMm,
-    _ttm: [u8; 80],
-    pub pxp_key_instance: u32,
-    _pad_pxp: [u8; 4],
-    pub bit_17: *mut c_ulong,
-    _suffix: [u8; 120],
-}
-const _: [(); 1144] = [(); core::mem::size_of::<DrmI915GemObject>()];
-const _: [(); 480] = [(); core::mem::offset_of!(DrmI915GemObject, ops)];
-const _: [(); 488] = [(); core::mem::offset_of!(DrmI915GemObject, vma)];
-const _: [(); 520] = [(); core::mem::offset_of!(DrmI915GemObject, lut_list)];
-const _: [(); 608] = [(); core::mem::offset_of!(DrmI915GemObject, userfault_count)];
-const _: [(); 632] = [(); core::mem::offset_of!(DrmI915GemObject, mmo)];
-const _: [(); 648] = [(); core::mem::offset_of!(DrmI915GemObject, flags)];
-const _: [(); 660] = [(); core::mem::offset_of!(DrmI915GemObject, cache_bits)];
-const _: [(); 662] = [(); core::mem::offset_of!(DrmI915GemObject, read_domains)];
-const _: [(); 664] = [(); core::mem::offset_of!(DrmI915GemObject, write_domain)];
-const _: [(); 672] = [(); core::mem::offset_of!(DrmI915GemObject, frontbuffer)];
-const _: [(); 680] = [(); core::mem::offset_of!(DrmI915GemObject, tiling_and_stride)];
-const _: [(); 1008] = [(); core::mem::offset_of!(DrmI915GemObject, pxp_key_instance)];
-const _: [(); 1016] = [(); core::mem::offset_of!(DrmI915GemObject, bit_17)];
-
-#[repr(C)]
-pub struct TtmBufferObjectLayout {
-    pub base: DrmGemObjectBaseLayout,
-}
-
-const _: [(); 480] = [(); core::mem::size_of::<TtmBufferObjectLayout>()];
-const _: [(); 0] = [(); core::mem::offset_of!(TtmBufferObjectLayout, base)];
-const _: [(); 8] = [(); core::mem::align_of::<DrmI915GemObject>()];
-const _: [(); 0] = [(); core::mem::offset_of!(DrmI915GemObject, base)];
-
-const _: [(); 64] = [(); core::mem::size_of::<DmaFence>()];
-const _: [(); 168] = [(); core::mem::size_of::<DrmMmNode>()];
-const _: [(); 8] = [(); core::mem::align_of::<DrmMmNode>()];
-const _: [(); 56] = [(); core::mem::size_of::<I915GttView>()];
-const _: [(); 8] = [(); core::mem::align_of::<I915GttView>()];
-const _: [(); 56] = [(); core::mem::size_of::<IntelRing>()];
-const _: [(); 8] = [(); core::mem::align_of::<IntelRing>()];
-const _: [(); 8] = [(); core::mem::offset_of!(IntelRing, vma)];
-const _: [(); 24] = [(); core::mem::offset_of!(IntelRing, pin_count)];
-const _: [(); 28] = [(); core::mem::offset_of!(IntelRing, head)];
-const _: [(); 52] = [(); core::mem::offset_of!(IntelRing, effective_size)];
-const _: [(); 240] = [(); core::mem::size_of::<I915GemObjectMm>()];
-const _: [(); 8] = [(); core::mem::align_of::<I915GemObjectMm>()];
-const _: [(); 224] = [(); core::mem::offset_of!(I915GemObjectMm, madv_dirty)];
-const _: [(); 1144] = [(); core::mem::size_of::<DrmI915GemObject>()];
-const _: [(); 688] = [(); core::mem::offset_of!(DrmI915GemObject, mm)];
-const _: [(); 912] = [(); core::mem::offset_of!(DrmI915GemObject, mm)
-    + core::mem::offset_of!(I915GemObjectMm, madv_dirty)];
-const _: [(); 32] = [(); core::mem::size_of::<I915ActiveFence>()];
 static mut SLAB_CE: *mut KmCache = core::ptr::null_mut();
 
 // upstream: intel_context.c intel_context_alloc()

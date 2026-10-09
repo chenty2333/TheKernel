@@ -33,3 +33,7 @@ pub(crate) mod srcu;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod rcu_work;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod mmu_notifier;

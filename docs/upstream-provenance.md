@@ -1078,3 +1078,10 @@ retain the latest Intel inventory, with no scanner exemptions.
 `crates/ax/tk-intel-gt/src/i915_vma_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/i915_vma_types.h` MIT VMA flag constants and complete source-order `I915Vma` record with target size/offset assertions. The adjacent GTT-view BUILD_BUG_ON helper remains omitted until its owning type header is translated.
 `crates/ax/tk-intel-gt/src/i915_vma_api_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/i915_vma.h` MIT declarations, inline state/flag helpers, active/pin/list/sync APIs, and GGTT list iteration; explicit remaining boundaries are documented in the file.
 `crates/ax/tk-intel-gt/src/intel_ring_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/intel_ring_types.h` MIT ring ABI/constants; the canonical 56-byte `IntelRing` replaces the former context-source duplicate.
+`crates/ax/tk-intel-gt/src/i915_request_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/i915_request.c` MIT request/fence source translation; ctags coverage 84/84 function markers.
+`crates/ax/tk-intel-gt/src/i915_scheduler_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/i915_scheduler.c` MIT scheduler source translation; ctags coverage 23/23 function markers.
+`crates/ax/tk-intel-gt/src/intel_guc_fwif_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc_fwif.h` MIT ABI constants, structures, enums and inline helpers.
+`crates/ax/tk-intel-gt/src/intel_guc_actions_abi_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/abi/guc_actions_abi.h` MIT action constants/enums, including TLB invalidation ABI.
+`crates/ax/tk-intel-gt/src/intel_gt_mcr_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/intel_gt_mcr.h` MIT MCR declarations and subslice steering iteration semantics.
+`crates/ax/tk-intel-gt/src/i915_gem_object_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_object_types.h` MIT GEM object/MM/VMA/MMO records, owner operations and target-config layout assertions.
+`crates/ax/tk-intel-gt/src/i915_gem_shmem_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_shmem.c` MIT source translation; ctags coverage 21/21 function markers.

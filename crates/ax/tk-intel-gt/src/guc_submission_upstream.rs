@@ -24,6 +24,7 @@ use crate::{
         i915_request_notify_execute_cb_imm, i915_test_request_state,
     },
     i915_scheduler_types_upstream::{I915SchedEngine as i915_sched_engine, i915_priolist},
+    i915_scheduler_upstream::i915_schedule,
     i915_vma_api_upstream::*,
     intel_breadcrumbs_types_upstream::intel_breadcrumbs,
     intel_context_types_upstream::{
@@ -47,9 +48,11 @@ use crate::{
     },
     intel_gt_api_upstream::guc_to_i915,
     intel_gt_types_upstream::IntelGt as intel_gt,
+    intel_guc_actions_abi_types_upstream::*,
     intel_guc_ct_types_upstream::{
         IntelGucCt, IntelGucCtBuffer, IntelGucCtBuffers, IntelGucCtRequests,
     },
+    intel_guc_fwif_types_upstream::*,
     intel_guc_log_types_upstream::IntelGucLog as IntelGucLogLayout,
     intel_guc_slpc_types_upstream::IntelGucSlpc as IntelGucSlpcLayout,
     intel_guc_submission_types_upstream::intel_guc_submission_is_supported,

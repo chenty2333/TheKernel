@@ -40,6 +40,8 @@ use crate::{
         intel_execlists_dump_active_requests, intel_execlists_show_requests,
         intel_execlists_submission_setup,
     },
+    intel_gt_api_upstream::intel_gt_check_and_clear_faults,
+    intel_gt_mcr_upstream::*,
     intel_guc_submission_types_upstream::{
         intel_guc_dump_active_requests, intel_guc_submission_is_wanted, intel_guc_submission_setup,
     },
@@ -2024,17 +2026,29 @@ pub unsafe fn intel_engine_get_instdone(
             (*instdone).slice_common_extra[1] = intel_uncore_read(uncore, GEN12_SC_INSTDONE_EXTRA2);
         }
 
-        for_each_ss_steering!(iter, (*engine).gt, slice, subslice, {
-            (*instdone).sampler[slice][subslice] =
-                intel_gt_mcr_read((*engine).gt, GEN8_SAMPLER_INSTDONE, slice, subslice);
-            (*instdone).row[slice][subslice] =
-                intel_gt_mcr_read((*engine).gt, GEN8_ROW_INSTDONE, slice, subslice);
+        crate::for_each_ss_steering!(iter, (*engine).gt, slice, subslice, {
+            (*instdone).sampler[slice as usize][subslice as usize] = intel_gt_mcr_read(
+                (*engine).gt,
+                GEN8_SAMPLER_INSTDONE,
+                slice as i32,
+                subslice as i32,
+            );
+            (*instdone).row[slice as usize][subslice as usize] = intel_gt_mcr_read(
+                (*engine).gt,
+                GEN8_ROW_INSTDONE,
+                slice as i32,
+                subslice as i32,
+            );
         });
 
         if GRAPHICS_VER_FULL(i915) >= IP_VER(12, 55) {
-            for_each_ss_steering!(iter, (*engine).gt, slice, subslice, {
-                (*instdone).geom_svg[slice][subslice] =
-                    intel_gt_mcr_read((*engine).gt, XEHPG_INSTDONE_GEOM_SVG, slice, subslice);
+            crate::for_each_ss_steering!(iter, (*engine).gt, slice, subslice, {
+                (*instdone).geom_svg[slice as usize][subslice as usize] = intel_gt_mcr_read(
+                    (*engine).gt,
+                    XEHPG_INSTDONE_GEOM_SVG,
+                    slice as i32,
+                    subslice as i32,
+                );
             });
         }
     } else if GRAPHICS_VER(i915) >= 7 {
