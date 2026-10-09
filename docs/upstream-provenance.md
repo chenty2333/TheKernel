@@ -2063,6 +2063,11 @@ There are 73 unique function names because the mutually exclusive
 `vma_print_allocator()` preprocessor variants are both retained and marked in
 their original source order.
 
+`intel_guc_rc_upstream.rs` translates all 7 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/uc/intel_guc_rc.c` (MIT, Copyright © 2021 Intel
+Corporation), using the existing GuC CT action transport and preserving RC
+support/selection checks.
+
 `intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
 `drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
 Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.

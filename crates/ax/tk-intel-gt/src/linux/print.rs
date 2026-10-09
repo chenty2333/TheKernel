@@ -854,6 +854,25 @@ macro_rules! guc_err {
     }};
 }
 
+/// Linux `guc_info()` / `guc_printk(..., info, ...)` logging path.
+macro_rules! guc_info {
+    ($guc:expr, $format:literal $(, $argument:expr)* $(,)?) => {{
+        let __guc = $guc;
+        let _ = __guc;
+        let __args: &[&dyn $crate::linux_print::CFormatArg] = &[
+            $(&($argument) as &dyn $crate::linux_print::CFormatArg),*
+        ];
+        let __message = $crate::linux_print::format_message(concat!("GUC: ", $format), __args);
+        $crate::linux_print::drm_log_at(
+            $crate::linux_print::DrmLogLevel::Info,
+            "i915 GuC info",
+            file!(),
+            line!(),
+            &__message,
+        );
+    }};
+}
+
 macro_rules! pr_err {
     ($format:expr $(, $argument:expr)* $(,)?) => {{
         let __args: &[&dyn $crate::linux_print::CFormatArg] = &[
