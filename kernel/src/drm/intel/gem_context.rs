@@ -462,7 +462,11 @@ fn getparam_value(
         // Exact device/revision are already established by GT boot admission.
         4 => 0x46d0,
         32 => 0,
-        5 | 9 | 11 | 19 | 24 | 25 | 26 | 37 | 44 | 48 | 49 | 55 => 1,
+        5 | 9 | 11 | 19 | 24 | 25 | 26 | 37 | 43 | 44 | 48 | 49 | 55 => 1,
+        // Linux reports this UAPI bit even when CONFIG_DRM_I915_CAPTURE_ERROR
+        // compiles its capture hook as a no-op; EXEC_OBJECT_CAPTURE is likewise
+        // accepted and benign on this capture-disabled build.
+        45 => 1,
         40 => 4, // WC/WB/UC offsets; WC/UC require confirmed CPU palette, no legacy GTT mmap.
         33 => topology()?.dss.count_ones() as i32,
         34 => topology()?.eu_total() as i32,
@@ -473,6 +477,8 @@ fn getparam_value(
         47 => i32::from(topology()?.dss),
         50 => super::gt::context_isolation_classes() as i32, /* only completed native default-state captures. */
         51 => i32::try_from(clock()?).map_err(|_| AxError::InvalidInput)?,
+        // Scheduler/HuC status and adjacent unsupported capabilities remain
+        // false rather than being inferred from a neighboring UAPI feature.
         6..=8
         | 10
         | 12..=18
@@ -482,7 +488,8 @@ fn getparam_value(
         | 36
         | 38
         | 39
-        | 41..=45
+        | 41
+        | 42
         | 52..=54
         | 56..=59 => 0,
         1..=3 => return Err(AxError::NoSuchDevice),
@@ -859,9 +866,11 @@ mod tests {
         .unwrap();
         assert_eq!(query_with(&copy, 0, true, topo), Err(AxError::BadAddress));
         assert_eq!(read_pod::<QueryItem>(&copy, 2024).unwrap().length, 30);
-        for param in [20, 23, 35, 41, 43, 58] {
+        for param in [20, 23, 35, 41, 42, 58] {
             assert_eq!(getparam_value(param, topo, || Ok(19_200_000)), Ok(0));
         }
+        assert_eq!(getparam_value(43, topo, || Ok(19_200_000)), Ok(1));
+        assert_eq!(getparam_value(45, topo, || Ok(19_200_000)), Ok(1));
         assert_eq!(getparam_value(50, topo, || Ok(0)), Ok(0));
         assert_eq!(
             getparam_value(51, topo, || Err(AxError::NoSuchDevice)),

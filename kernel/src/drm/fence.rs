@@ -125,6 +125,101 @@ impl Reservation {
         drop(guards);
         Ok(predecessors)
     }
+
+    /// Replace a set of GEM reservations while honoring per-object opt-outs
+    /// from implicit synchronization. For opted-out objects the previous
+    /// fence is chained with the new completion fence in the reservation, so
+    /// a later non-async operation still observes both; only non-async
+    /// predecessors are returned for the caller to wait.
+    ///
+    /// Build replacement chains outside the reservation locks, then validate
+    /// that their predecessor snapshot is still current before publishing the
+    /// complete set. Under contention this retries a bounded number of times
+    /// and fails without publishing any completion fence.
+    pub fn replace_many_with_async(
+        reservations: &mut [(&Reservation, bool)],
+        fence: Arc<Fence>,
+    ) -> AxResult<Vec<Arc<Fence>>> {
+        reservations
+            .sort_unstable_by_key(|(reservation, _)| (*reservation as *const Reservation).addr());
+
+        if reservations
+            .iter()
+            .all(|(_, skip_implicit)| !*skip_implicit)
+        {
+            let mut ordinary = Vec::new();
+            ordinary
+                .try_reserve_exact(reservations.len())
+                .map_err(|_| AxError::NoMemory)?;
+            ordinary.extend(reservations.iter().map(|(reservation, _)| *reservation));
+            return Self::replace_many(&mut ordinary, fence);
+        }
+
+        let mut snapshots = Vec::new();
+        snapshots
+            .try_reserve_exact(reservations.len())
+            .map_err(|_| AxError::NoMemory)?;
+        let mut replacements = Vec::new();
+        replacements
+            .try_reserve_exact(reservations.len())
+            .map_err(|_| AxError::NoMemory)?;
+        let mut guards = Vec::new();
+        guards
+            .try_reserve_exact(reservations.len())
+            .map_err(|_| AxError::NoMemory)?;
+        let mut predecessors = Vec::new();
+        predecessors
+            .try_reserve_exact(reservations.len())
+            .map_err(|_| AxError::NoMemory)?;
+
+        for _ in 0..8 {
+            snapshots.clear();
+            for (reservation, _) in reservations.iter() {
+                snapshots.push(reservation.exclusive.lock().clone());
+            }
+
+            replacements.clear();
+            for ((_, skip_implicit), previous) in reservations.iter().zip(&snapshots) {
+                let replacement = if *skip_implicit {
+                    if let Some(previous) = previous {
+                        Fence::join(&[previous.clone(), fence.clone()])?
+                    } else {
+                        fence.clone()
+                    }
+                } else {
+                    fence.clone()
+                };
+                replacements.push(replacement);
+            }
+
+            guards.clear();
+            for (reservation, _) in reservations.iter() {
+                guards.push(reservation.exclusive.lock());
+            }
+            let unchanged = guards.iter().zip(&snapshots).all(|(current, expected)| {
+                match (current.as_ref(), expected.as_ref()) {
+                    (None, None) => true,
+                    (Some(current), Some(expected)) => Arc::ptr_eq(current, expected),
+                    _ => false,
+                }
+            });
+            if !unchanged {
+                guards.clear();
+                continue;
+            }
+
+            predecessors.clear();
+            for (index, (_, skip_implicit)) in reservations.iter().enumerate() {
+                if !skip_implicit && let Some(previous) = &snapshots[index] {
+                    predecessors.push(previous.clone());
+                }
+                *guards[index] = Some(replacements[index].clone());
+            }
+            return Ok(core::mem::take(&mut predecessors));
+        }
+
+        Err(AxError::WouldBlock)
+    }
 }
 
 impl Fence {
@@ -439,6 +534,38 @@ mod tests {
         assert!(prior.iter().all(|fence| Arc::ptr_eq(fence, &predecessor)));
         assert!(Arc::ptr_eq(&first.predecessor().unwrap(), &completion));
         assert!(Arc::ptr_eq(&second.predecessor().unwrap(), &completion));
+    }
+
+    #[test]
+    fn async_reservation_skips_wait_but_preserves_prior_and_current_edges() {
+        let asynchronous = Reservation::new();
+        let synchronous = Reservation::new();
+        let async_prior = Fence::new(false);
+        let sync_prior = Fence::new(false);
+        asynchronous.replace(async_prior.clone());
+        synchronous.replace(sync_prior.clone());
+        let completion = Fence::new(false);
+        let mut reservations = [(&synchronous, false), (&asynchronous, true)];
+
+        let waits =
+            Reservation::replace_many_with_async(&mut reservations, completion.clone()).unwrap();
+        assert_eq!(waits.len(), 1);
+        assert!(Arc::ptr_eq(&waits[0], &sync_prior));
+        assert_eq!(
+            sync_prior.wait(Some(Duration::ZERO)),
+            Err(AxError::WouldBlock)
+        );
+        assert_eq!(
+            async_prior.wait(Some(Duration::ZERO)),
+            Err(AxError::WouldBlock)
+        );
+
+        completion.signal();
+        assert!(synchronous.predecessor().unwrap().is_signaled());
+        let joined = asynchronous.predecessor().unwrap();
+        assert!(!joined.is_signaled(), "the async predecessor remains live");
+        async_prior.signal();
+        assert!(joined.is_signaled());
     }
 
     #[test]

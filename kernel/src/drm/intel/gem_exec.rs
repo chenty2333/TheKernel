@@ -149,7 +149,13 @@ const WRITE: u64 = 1 << 2;
 const MAX_SIZE: u64 = 16 * 1024 * 1024;
 const BATCH_FIRST: u64 = 1 << 18;
 const HANDLE_LUT: u64 = 1 << 12;
+// EXEC_OBJECT_ASYNC skips implicit reservation waits only. Explicit input
+// fences/syncobjs are still waited and all predecessor edges remain chained
+// for later non-async consumers.
 const ASYNC: u64 = 1 << 6;
+// Matches Linux's CONFIG_DRM_I915_CAPTURE_ERROR-disabled execbuffer hooks:
+// accept the optional flag as a no-op; no post-mortem capture is advertised
+// as an error-state facility in this kernel.
 const CAPTURE: u64 = 1 << 7;
 struct Backing {
     cache: Arc<AtomicU8>,
@@ -505,20 +511,13 @@ pub(super) fn exec_request(
         .try_reserve_exact(records.len())
         .map_err(|_| AxError::NoMemory)?;
     for (i, o) in records.iter().enumerate() {
-        let permitted = PINNED
-            | ADDRESS48
-            | if user {
-                WRITE | ASYNC | CAPTURE
-            } else if i == 1 {
-                WRITE
-            } else {
-                0
-            };
+        let permitted =
+            PINNED | ADDRESS48 | ASYNC | CAPTURE | if user || i == 1 { WRITE } else { 0 };
         if o.relocations != 0
             || o.relocation_pointer != 0
             || !matches!(o.alignment, 0 | 4096)
             || (!user && o.offset != 0x10000 * (i as u64 + 1))
-            || o.flags & !(ADDRESS48 | WRITE | if user { ASYNC | CAPTURE } else { 0 }) != PINNED
+            || o.flags & !(ADDRESS48 | WRITE | ASYNC | CAPTURE) != PINNED
             || o.flags & !permitted != 0
             || (!user && i == 1 && o.flags & WRITE == 0)
             || (user && i == 0 && o.flags & WRITE != 0)
@@ -626,7 +625,12 @@ pub(super) fn exec_request(
             44
         },
     )?;
-    previous(&objects[batch_index], Some(Duration::from_millis(500)))?;
+    // EXEC_OBJECT_ASYNC opts this batch object out of implicit reservation
+    // waiting just like any other object. Explicit syncobj/FENCE_IN waits were
+    // collected and completed above and are never skipped by this flag.
+    if records[batch_index].flags & ASYNC == 0 {
+        previous(&objects[batch_index], Some(Duration::from_millis(500)))?;
+    }
     let user_job = if user {
         let mut resident = Vec::new();
         resident
@@ -668,10 +672,10 @@ pub(super) fn exec_request(
     let mut refs = Vec::new();
     refs.try_reserve_exact(objects.len())
         .map_err(|_| AxError::NoMemory)?;
-    for object in &objects {
-        refs.push(&object.reservation);
+    for (index, object) in objects.iter().enumerate() {
+        refs.push((&object.reservation, records[index].flags & ASYNC != 0));
     }
-    let predecessors = match Reservation::replace_many(&mut refs, completion.clone()) {
+    let predecessors = match Reservation::replace_many_with_async(&mut refs, completion.clone()) {
         Ok(p) => p,
         Err(e) => {
             completion.signal_error();
@@ -1215,6 +1219,86 @@ pub(super) mod tests {
             );
         }
     }
+
+    #[test]
+    fn exec_object_async_skips_only_implicit_edges_and_keeps_them_for_later_waits() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        for (batch_first, async_index) in [(false, 0), (false, 2), (true, 0), (true, 1)] {
+            let file = file();
+            let copy = Image(RefCell::new(vec![0; 65536]));
+            let (source, destination, batch, ..) = prepare(&file, &copy);
+            let async_handle = [source, destination, batch][async_index];
+            let async_object = object(&file, async_handle).unwrap();
+            let async_prior = Fence::new(false);
+            async_object.reservation.publish(async_prior.clone());
+            let record_offset = 256 + async_index * size_of::<Object>();
+            let mut async_record: Object = read_pod(&copy, record_offset).unwrap();
+            async_record.flags |= ASYNC;
+            write_pod(&copy, record_offset, &async_record).unwrap();
+            if batch_first {
+                let mut request: Exec = read_pod(&copy, 0).unwrap();
+                request.start = 8;
+                request.length = 8;
+                request.flags |= BATCH_FIRST | HANDLE_LUT;
+                write_pod(&copy, 0, &request).unwrap();
+            }
+
+            exec_with(&file, &copy, 0, |_, _, _| {
+                assert!(!async_prior.is_signaled(), "ASYNC skipped implicit wait");
+                Ok(())
+            })
+            .unwrap();
+
+            let chained = async_object.reservation.predecessor().unwrap();
+            assert_eq!(chained.wait(Some(Duration::ZERO)), Err(AxError::WouldBlock));
+            async_prior.signal();
+            assert_eq!(chained.wait(Some(Duration::ZERO)), Ok(()));
+        }
+    }
+
+    #[test]
+    fn exec_object_async_does_not_skip_explicit_input_fence_errors() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        let (source, ..) = prepare(&file, &copy);
+        let mut source_record: Object = read_pod(&copy, 256).unwrap();
+        source_record.flags |= ASYNC;
+        write_pod(&copy, 256, &source_record).unwrap();
+        let mut request: Exec = read_pod(&copy, 0).unwrap();
+        request.start = 8;
+        request.length = 8;
+        request.flags |= FENCE_IN | BATCH_FIRST | HANDLE_LUT;
+        let explicit = Fence::new(false);
+        explicit.signal_error();
+        let completion = Fence::new(false);
+        let executed = core::cell::Cell::new(false);
+
+        let result = exec_request(
+            &file,
+            &copy,
+            request,
+            completion,
+            Some(explicit),
+            |_, _, _, _, _| {
+                executed.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(AxError::Io));
+        assert!(
+            !executed.get(),
+            "ASYNC must not bypass explicit sync inputs"
+        );
+        assert!(
+            object(&file, source)
+                .unwrap()
+                .reservation
+                .predecessor()
+                .is_none()
+        );
+    }
+
     #[test]
     fn user_softpin_overlaps_and_out_of_batch_bounds_refuse_without_fence_publication() {
         let _scheduler = crate::test_support::scheduler_test_context();
