@@ -123,7 +123,6 @@ unsafe extern "C" {
     // the C owner is not part of this SLPC source file.
     fn gen6_rps_get_freq_caps(rps: *mut IntelRps, caps: *mut IntelRpsFreqCaps);
     fn intel_gpu_freq(rps: *mut IntelRps, raw_freq: c_int) -> c_int;
-    pub fn intel_guc_slpc_boost(slpc: *mut IntelGucSlpc);
 }
 
 #[inline]
