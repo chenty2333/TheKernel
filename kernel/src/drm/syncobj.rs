@@ -42,6 +42,8 @@ fn finish_merge_ioctl(
     output: crate::file::PreparedFdPublication,
 ) -> AxResult<usize> {
     request.fence = output.fd();
+    // Linux bounds the user-visible name before returning sync_merge_data.
+    request.name[request.name.len() - 1] = 0;
     memory
         .write_value(arg as *mut SyncMergeData, request)
         .map_err(crate::mm::map_usercopy_error)?;
@@ -702,13 +704,22 @@ mod tests {
         let output = prepared_test_sync_file(table.clone());
         let fd = output.fd();
         assert_eq!(
-            finish_merge_ioctl(&memory, 0x1000, SyncMergeData::default(), output),
+            finish_merge_ioctl(
+                &memory,
+                0x1000,
+                SyncMergeData {
+                    name: [b'X'; 32],
+                    ..SyncMergeData::default()
+                },
+                output,
+            ),
             Ok(0)
         );
         let result = memory
             .read_value::<SyncMergeData>(0x1000 as *const SyncMergeData)
             .unwrap();
         assert_eq!(result.fence, fd);
+        assert_eq!(result.name[31], 0);
         assert!(table.get_cloexec(fd).unwrap());
         assert!(
             table

@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/dma-buf.h>
+#include <linux/sync_file.h>
 #include <poll.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -180,7 +181,9 @@ static void dumb_lifetime(int fd) {
 static int dma_buf_sync(void) {
     char path[64];
     int card = open_drm("card", 0, 15, path, sizeof(path));
-    int dmabuf = -1, syncfd = -1, other = -1, failed = 1;
+    int dmabuf = -1, syncfd = -1, syncfd2 = -1, mergedfd = -1;
+    int other = -1, failed = 1, probe_fd = -1, after_fd = -1;
+    void *readonly_merge_page = MAP_FAILED;
     struct drm_mode_create_dumb dumb = { .width = 64, .height = 64, .bpp = 32 };
     if (card < 0) { result("drm.dmabuf_sync.card", "FAIL", errno); return 1; }
     if (ioctl(card, DRM_IOCTL_MODE_CREATE_DUMB, &dumb) != 0) {
@@ -204,6 +207,80 @@ static int dma_buf_sync(void) {
     if (poll(&pollfd, 1, 0) != 1 || !(pollfd.revents & POLLIN)) {
         result("drm.dmabuf_sync.poll", "FAIL", errno); goto out;
     }
+    struct dma_buf_export_sync_file export2 = { .flags = DMA_BUF_SYNC_RW, .fd = -1 };
+    if (ioctl(dmabuf, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export2) != 0 || export2.fd < 0) {
+        result("drm.dmabuf_sync.export2", "FAIL", errno); goto out;
+    }
+    syncfd2 = export2.fd;
+    struct sync_merge_data merge = { .fd2 = syncfd2, .fence = -1 };
+    memset(merge.name, 'X', sizeof(merge.name));
+    if (ioctl(syncfd, SYNC_IOC_MERGE, &merge) != 0 || merge.fence < 0) {
+        result("drm.dmabuf_sync.merge", "FAIL", errno); goto out;
+    }
+    mergedfd = merge.fence;
+    if (merge.name[sizeof(merge.name) - 1] != '\0') {
+        result("drm.dmabuf_sync.merge_name_termination", "FAIL", 0); goto out;
+    }
+    fdflags = fcntl(mergedfd, F_GETFD);
+    if (fdflags < 0 || !(fdflags & FD_CLOEXEC)) {
+        result("drm.dmabuf_sync.merge_cloexec", "FAIL", errno); goto out;
+    }
+    pollfd.fd = mergedfd;
+    pollfd.revents = 0;
+    if (poll(&pollfd, 1, 0) != 1 || !(pollfd.revents & POLLIN)) {
+        result("drm.dmabuf_sync.merge_signaled", "FAIL", errno); goto out;
+    }
+    printf("TK_GRAPHICS kind=drm.dmabuf_sync.merge state=OK sources=2 cloexec=1 signaled=1 name_terminated=1\n");
+
+    struct sync_merge_data bad_merge = { .fd2 = -1, .fence = -1 };
+    errno = 0;
+    if (ioctl(syncfd, SYNC_IOC_MERGE, &bad_merge) != -1 || errno != ENOENT) {
+        result("drm.dmabuf_sync.merge_badfd", "FAIL", errno); goto out;
+    }
+    bad_merge.fd2 = syncfd2;
+    bad_merge.flags = 1;
+    errno = 0;
+    if (ioctl(syncfd, SYNC_IOC_MERGE, &bad_merge) != -1 || errno != EINVAL) {
+        result("drm.dmabuf_sync.merge_flags", "FAIL", errno); goto out;
+    }
+    bad_merge.flags = 0;
+    bad_merge.pad = 1;
+    errno = 0;
+    if (ioctl(syncfd, SYNC_IOC_MERGE, &bad_merge) != -1 || errno != EINVAL) {
+        result("drm.dmabuf_sync.merge_pad", "FAIL", errno); goto out;
+    }
+
+    /* copy_from_user must succeed while copy_to_user faults. A reserved
+     * output fd is rolled back, so the next open must reuse its number. */
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) { result("drm.dmabuf_sync.merge_fault_pagesize", "FAIL", errno); goto out; }
+    readonly_merge_page = mmap(NULL, (size_t)page_size, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (readonly_merge_page == MAP_FAILED) {
+        result("drm.dmabuf_sync.merge_fault_map", "FAIL", errno); goto out;
+    }
+    struct sync_merge_data *faulting_merge = readonly_merge_page;
+    *faulting_merge = (struct sync_merge_data) { .fd2 = syncfd2, .fence = -1 };
+    if (mprotect(readonly_merge_page, (size_t)page_size, PROT_READ) != 0) {
+        result("drm.dmabuf_sync.merge_fault_protect", "FAIL", errno); goto out;
+    }
+    probe_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (probe_fd < 0) { result("drm.dmabuf_sync.merge_fault_probe", "FAIL", errno); goto out; }
+    if (close(probe_fd) != 0) { probe_fd = -1; result("drm.dmabuf_sync.merge_fault_probe_close", "FAIL", errno); goto out; }
+    errno = 0;
+    if (ioctl(syncfd, SYNC_IOC_MERGE, faulting_merge) != -1 || errno != EFAULT) {
+        result("drm.dmabuf_sync.merge_copyout_fault", "FAIL", errno); goto out;
+    }
+    after_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (after_fd != probe_fd) {
+        result("drm.dmabuf_sync.merge_fault_fd_rollback", "FAIL", errno); goto out;
+    }
+    close(after_fd);
+    after_fd = -1;
+    probe_fd = -1;
+    munmap(readonly_merge_page, (size_t)page_size);
+    readonly_merge_page = MAP_FAILED;
+
     struct dma_buf_import_sync_file import = { .flags = DMA_BUF_SYNC_RW, .fd = syncfd };
     if (ioctl(dmabuf, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import) != 0) {
         result("drm.dmabuf_sync.import", "FAIL", errno); goto out;
@@ -233,9 +310,20 @@ static int dma_buf_sync(void) {
     if (ioctl(dmabuf, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import) != -1 || errno != EINVAL) {
         result("drm.dmabuf_sync.wrong_fd_type", "FAIL", errno); goto out;
     }
+    bad_merge.fd2 = other;
+    bad_merge.pad = 0;
+    errno = 0;
+    if (ioctl(syncfd, SYNC_IOC_MERGE, &bad_merge) != -1 || errno != ENOENT) {
+        result("drm.dmabuf_sync.merge_wrong_fd_type", "FAIL", errno); goto out;
+    }
     failed = 0;
 out:
+    if (after_fd >= 0) close(after_fd);
+    if (probe_fd >= 0) close(probe_fd);
+    if (readonly_merge_page != MAP_FAILED) munmap(readonly_merge_page, (size_t)sysconf(_SC_PAGESIZE));
     if (other >= 0) close(other);
+    if (mergedfd >= 0) close(mergedfd);
+    if (syncfd2 >= 0) close(syncfd2);
     if (syncfd >= 0) close(syncfd);
     if (dmabuf >= 0) close(dmabuf);
     if (dumb.handle) {
@@ -243,7 +331,7 @@ out:
         if (ioctl(card, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy) != 0) failed = 1;
     }
     close(card);
-    if (!failed) puts("TK_GRAPHICS kind=drm.dmabuf_sync state=OK export=cloexec_signaled import=checked negatives=checked gpu_submission=none");
+    if (!failed) puts("TK_GRAPHICS kind=drm.dmabuf_sync state=OK export=cloexec_signaled merge=two_sync_files_cloexec_signaled_name_terminated import=checked negatives=checked copyout_rollback=checked gpu_submission=none");
     return failed;
 }
 
