@@ -543,7 +543,12 @@ pub(super) trait NativeDpllOps {
     ) -> Result<(), super::shared_dpll::DpllFailure>;
 }
 
-pub(super) trait NativeModesetOps: NativeCdclkOps + NativeDpllOps {
+/// Full commit-tail adapters must share the kernel's typed, map-backed power
+/// callback contract. This keeps power-domain identities and DC5/DC6 state
+/// transitions out of untyped register-action dispatch.
+pub(super) trait NativeModesetOps:
+    NativeCdclkOps + NativeDpllOps + super::power::NativePowerOps
+{
     /// CRTC enable phase (`hsw_crtc_enable()` / `skl_commit_modeset_enables()`).
     /// This gets the same checked program later consumed by plane updates, so
     /// pipe identity/mode cannot be independently re-derived at enable time.
@@ -578,11 +583,4 @@ pub(super) trait NativeModesetOps: NativeCdclkOps + NativeDpllOps {
     /// Universal-plane disable (`skl_universal_plane_disable_arm()`) for an
     /// in-place update that does not disable its CRTC.
     fn disable_plane(&mut self, plane: &NativePlaneState) -> Result<(), Self::Error>;
-
-    /// Acquire a map-backed display power-domain reference (`intel_display_power_get()`).
-    fn power_domain_get(&mut self, domain: u8) -> Result<(), Self::Error>;
-
-    /// Release a previously acquired display power-domain reference
-    /// (`intel_display_power_put()`).
-    fn power_domain_put(&mut self, domain: u8) -> Result<(), Self::Error>;
 }
