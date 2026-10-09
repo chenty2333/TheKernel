@@ -412,7 +412,7 @@ pub unsafe fn intel_timeline_read_hwsp(
     to: *mut I915Request,
     hwsp: *mut u32,
 ) -> i32 {
-    let mut tl: *mut IntelTimeline;
+    let mut tl: *mut IntelTimeline = core::ptr::null_mut();
     let err: i32;
 
     rcu_read_lock();
@@ -487,7 +487,7 @@ pub unsafe fn intel_gt_show_timelines(
     >,
 ) {
     let timelines = &mut (*gt).timelines;
-    let mut tl: *mut IntelTimeline;
+    let mut tl: *mut IntelTimeline = core::ptr::null_mut();
     let mut free = ListHead {
         next: core::ptr::null_mut(),
         prev: core::ptr::null_mut(),
@@ -508,8 +508,8 @@ pub unsafe fn intel_gt_show_timelines(
         let mut count: c_ulong;
         let mut ready: c_ulong;
         let mut inflight: c_ulong;
-        let mut rq: *mut I915Request;
-        let mut rn: *mut I915Request;
+        let mut rq: *mut I915Request = core::ptr::null_mut();
+        let mut rn: *mut I915Request = core::ptr::null_mut();
         let mut fence: *mut DmaFence;
 
         if !mutex_trylock(&mut (*tl).mutex) {

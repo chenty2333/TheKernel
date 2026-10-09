@@ -167,8 +167,8 @@ unsafe fn __dma_fence_signal__timestamp(fence: *mut DmaFence, timestamp: KtimeT)
 
 // upstream: intel_breadcrumbs.c __dma_fence_signal__notify()
 unsafe fn __dma_fence_signal__notify(fence: *mut DmaFence, list: *mut ListHead) {
-    let mut cur: *mut DmaFenceCb;
-    let mut tmp: *mut DmaFenceCb;
+    let mut cur: *mut DmaFenceCb = core::ptr::null_mut();
+    let mut tmp: *mut DmaFenceCb = core::ptr::null_mut();
 
     dma_fence_assert_held!(fence);
 
@@ -197,7 +197,7 @@ unsafe extern "C" fn signal_irq_work(work: *mut IrqWork) {
     let timestamp = ktime_get();
     let mut signal: *mut LlistNode;
     let mut sn: *mut LlistNode;
-    let mut ce: *mut IntelContext;
+    let mut ce: *mut IntelContext = core::ptr::null_mut();
 
     signal = core::ptr::null_mut();
     if unlikely!(!llist_empty(&(*b).signaled_requests)) {
@@ -234,7 +234,7 @@ unsafe extern "C" fn signal_irq_work(work: *mut IrqWork) {
     rcu_read_lock();
     atomic_inc(&mut (*b).signaler_active);
     list_for_each_entry_rcu!(ce, &(*b).signalers, signal_link, {
-        let mut rq: *mut I915Request;
+        let mut rq: *mut I915Request = core::ptr::null_mut();
 
         list_for_each_entry_rcu!(rq, &(*ce).signals, signal_link, {
             let release: bool;
@@ -513,8 +513,8 @@ pub(crate) unsafe fn intel_context_remove_breadcrumbs(
     ce: *mut IntelContext,
     b: *mut IntelBreadcrumbs,
 ) {
-    let mut rq: *mut I915Request;
-    let mut rn: *mut I915Request;
+    let mut rq: *mut I915Request = core::ptr::null_mut();
+    let mut rn: *mut I915Request = core::ptr::null_mut();
     let mut release = false;
     let mut flags: c_ulong = 0;
 

@@ -1204,7 +1204,7 @@ unsafe fn reset_in_progress(engine: *const IntelEngineCs) -> bool {
 unsafe fn assert_pending_valid(execlists: *const IntelEngineExeclists, msg: *const c_char) -> bool {
     let engine = container_of!(execlists, IntelEngineCs, execlists);
     let mut port: *const *mut I915Request;
-    let mut rq: *mut I915Request;
+    let mut rq: *mut I915Request = core::ptr::null_mut();
     let mut prev: *mut I915Request = core::ptr::null_mut();
     let mut ce: *mut IntelContext = core::ptr::null_mut();
     let mut ccid: u32 = !0;
@@ -3341,8 +3341,8 @@ unsafe extern "C" fn nop_submission_tasklet(t: *mut TaskletStruct) {
 unsafe extern "C" fn execlists_reset_cancel(engine: *mut IntelEngineCs) {
     let execlists = &mut (*engine).execlists;
     let sched_engine = (*engine).sched_engine.cast::<I915SchedEngine>();
-    let mut rq: *mut I915Request;
-    let mut rn: *mut I915Request;
+    let mut rq: *mut I915Request = core::ptr::null_mut();
+    let mut rn: *mut I915Request = core::ptr::null_mut();
     let mut rb: *mut RbNode;
     let mut flags: c_ulong = 0;
 

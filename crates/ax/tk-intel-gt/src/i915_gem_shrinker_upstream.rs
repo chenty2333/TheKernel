@@ -507,12 +507,12 @@ unsafe extern "C" fn i915_gem_shrinker_oom(
     ptr: *mut c_void,
 ) -> c_int {
     let i915 = container_of!(nb, DrmI915Private, mm.oom_notifier);
-    let mut obj: *mut DrmI915GemObject;
+    let mut obj: *mut DrmI915GemObject = core::ptr::null_mut();
     let mut unevictable: c_ulong;
     let mut available: c_ulong;
     let mut freed_pages: c_ulong;
     let mut wakeref: IntelWakerefHandle;
-    let mut flags: c_ulong;
+    let mut flags: c_ulong = 0;
     let _ = event;
 
     freed_pages = 0;
@@ -562,7 +562,7 @@ unsafe extern "C" fn i915_gem_shrinker_vmap(
     ptr: *mut c_void,
 ) -> c_int {
     let i915 = container_of!(nb, DrmI915Private, mm.vmap_notifier);
-    let mut vma: *mut I915Vma;
+    let mut vma: *mut I915Vma = core::ptr::null_mut();
     let mut next: *mut I915Vma;
     let mut freed_pages: c_ulong = 0;
     let mut wakeref: IntelWakerefHandle;

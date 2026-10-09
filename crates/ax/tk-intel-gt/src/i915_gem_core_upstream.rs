@@ -344,7 +344,7 @@ pub unsafe fn i915_gem_get_aperture_ioctl(
         return -EINTR;
     }
     let mut pinned = (*ggtt).vm.reserved;
-    let mut vma: *mut I915Vma;
+    let mut vma: *mut I915Vma = core::ptr::null_mut();
     list_for_each_entry!(vma, &(*ggtt).vm.bound_list, vm_link, {
         if i915_vma_is_pinned(vma) {
             pinned = pinned.wrapping_add((*vma).node.size);
@@ -958,7 +958,7 @@ pub unsafe fn i915_gem_sw_finish_ioctl(
 
 // upstream: i915_gem.c i915_gem_runtime_suspend()
 pub unsafe fn i915_gem_runtime_suspend(i915: *mut DrmI915Private) {
-    let mut obj: *mut DrmI915GemObject;
+    let mut obj: *mut DrmI915GemObject = core::ptr::null_mut();
     let mut on: *mut DrmI915GemObject;
     let gt = to_gt(i915);
     let ggtt = (*gt).ggtt.cast::<I915Ggtt>();
