@@ -345,6 +345,7 @@ mod tests {
         assert!(!valid_load_irks(&irks));
     }
 
+    #[cfg(feature = "input")]
     #[test]
     fn management_event_header_uses_little_endian_lengths() {
         assert_eq!(
