@@ -5,6 +5,8 @@
 // helper bindings are integration points; do not replace them with no-op
 // compatibility shims. Keep source order and cache-domain/locking edges.
 
+use crate::i915_gem_clflush_upstream::i915_gem_clflush_object;
+
 use core::ffi::c_void;
 
 use crate::{
@@ -109,7 +111,7 @@ struct DrmFile {
 
 // upstream: i915_gem_domain.c gpu_write_needs_clflush()
 unsafe fn gpu_write_needs_clflush(obj: *mut DrmI915GemObject) -> bool {
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
 
     if IS_DGFX(i915) {
         return false;
@@ -126,7 +128,7 @@ unsafe fn gpu_write_needs_clflush(obj: *mut DrmI915GemObject) -> bool {
 
 // upstream: i915_gem_domain.c i915_gem_cpu_write_needs_clflush()
 pub unsafe fn i915_gem_cpu_write_needs_clflush(obj: *mut DrmI915GemObject) -> bool {
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
 
     if unsafe { i915_gem_object_cache_dirty(obj) } {
         return false;
@@ -514,7 +516,7 @@ pub unsafe fn i915_gem_object_pin_to_display_plane(
     view: *const I915GttView,
     mut flags: u32,
 ) -> *mut I915Vma {
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
     let mut vma: *mut I915Vma;
     let ret: i32;
 

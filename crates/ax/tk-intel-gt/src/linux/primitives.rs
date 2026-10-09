@@ -117,7 +117,7 @@ pub trait PageMask: LinuxUnsigned {
 macro_rules! impl_page_mask {
     ($($t:ty),+ $(,)?) => {$ (
         impl PageMask for $t {
-            fn from_page_mask() -> Self { !((4096 as $t) - 1) }
+            fn from_page_mask() -> Self { !((4096usize - 1) as $t) }
         }
     )+};
 }

@@ -440,3 +440,26 @@ pub(crate) mod intel_memory_region_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod i915_gem_phys_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_engine_pm_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_gem_clflush_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_reset_hw_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_guc_capture_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_gpu_error_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_cmd_parser_upstream;

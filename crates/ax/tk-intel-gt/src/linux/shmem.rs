@@ -1187,8 +1187,8 @@ pub unsafe fn writeback_iter(
         }
         let folio = page.cast::<Folio>();
         folio_batch_add(unsafe { &mut (*wbc).fbatch }, folio);
-    return folio;
-}
+        return folio;
+    }
 }
 
 /// Number of available RAM pages on the target, or modeled live pages on a

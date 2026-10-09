@@ -509,7 +509,7 @@ pub unsafe fn shmem_sg_alloc_table(
 
 // upstream: i915_gem_shmem.c shmem_get_pages()
 unsafe extern "C" fn shmem_get_pages(obj: *mut DrmI915GemObject) -> c_int {
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
     let mem = (*obj).mm.region as *mut IntelMemoryRegion;
     let mapping = (*object_file(obj)).f_mapping;
     let mut max_segment = i915_sg_segment_size((*i915).drm.dev);
@@ -657,7 +657,7 @@ pub unsafe fn __i915_gem_object_release_shmem(
     pages: *mut SgTable,
     needs_clflush: bool,
 ) {
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
 
     GEM_BUG_ON!(object_madv(obj) == __I915_MADV_PURGED);
 

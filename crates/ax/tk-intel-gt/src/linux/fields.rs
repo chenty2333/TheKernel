@@ -91,7 +91,7 @@ pub unsafe fn i915_gem_object_has_cache_level(obj: *const DrmI915GemObject, leve
     if unsafe { i915_gem_object_pat_set_by_user(obj) } {
         return true;
     }
-    let i915 = unsafe { crate::linux::i915::to_i915((*obj).base.base.dev) };
+    let i915 = unsafe { crate::linux::i915::to_i915((&(*obj).base.base).dev) };
     let pat_index = unsafe { (*obj).cache_state_bits & 0x3f };
     pat_index == unsafe { crate::linux::i915::i915_gem_get_pat_index(i915, level) }
 }

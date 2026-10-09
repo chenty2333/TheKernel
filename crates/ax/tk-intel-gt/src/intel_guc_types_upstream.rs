@@ -35,10 +35,7 @@ pub struct GucAdsBlob {
     _opaque: [u8; 0],
 }
 
-#[repr(C)]
-pub struct IntelGucStateCapture {
-    _opaque: [u8; 0],
-}
+pub use crate::intel_guc_capture_upstream::IntelGucStateCapture;
 
 #[repr(C)]
 pub struct Dentry {

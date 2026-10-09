@@ -214,7 +214,7 @@ pub unsafe fn i915_gem_object_has_cache_level(obj: *const DrmI915GemObject, lvl:
     }
 
     // Otherwise compare the PAT index converted from cache_level.
-    object_pat_index(obj) == i915_gem_get_pat_index(to_i915((*obj).base.base.dev), lvl)
+    object_pat_index(obj) == i915_gem_get_pat_index(to_i915((&(*obj).base.base).dev), lvl)
 }
 
 // upstream: i915_gem_object.c i915_gem_object_alloc()
@@ -288,7 +288,7 @@ pub unsafe fn __i915_gem_object_fini(obj: *mut DrmI915GemObject) {
 
 // upstream: i915_gem_object.c i915_gem_object_set_cache_coherency()
 pub unsafe fn i915_gem_object_set_cache_coherency(obj: *mut DrmI915GemObject, cache_level: u32) {
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
 
     object_set_pat_index(obj, i915_gem_get_pat_index(i915, cache_level));
 
@@ -311,7 +311,7 @@ pub unsafe fn i915_gem_object_set_cache_coherency(obj: *mut DrmI915GemObject, ca
 
 // upstream: i915_gem_object.c i915_gem_object_set_pat_index()
 pub unsafe fn i915_gem_object_set_pat_index(obj: *mut DrmI915GemObject, pat_index: u32) {
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
 
     if object_pat_index(obj) == pat_index {
         return;
@@ -338,7 +338,7 @@ pub unsafe fn i915_gem_object_set_pat_index(obj: *mut DrmI915GemObject, pat_inde
 
 // upstream: i915_gem_object.c i915_gem_object_can_bypass_llc()
 pub unsafe fn i915_gem_object_can_bypass_llc(obj: *mut DrmI915GemObject) -> bool {
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
 
     // This is purely from a security perspective, so ignore non-user objects.
     if (*obj).flags & I915_BO_ALLOC_USER as c_ulong == 0 {
@@ -427,7 +427,7 @@ unsafe extern "C" fn i915_gem_close_object(gem: *mut DrmGemObject, file: *mut Dr
 // upstream: i915_gem_object.c __i915_gem_free_object_rcu()
 pub unsafe extern "C" fn __i915_gem_free_object_rcu(head: *mut RcuHead) {
     let obj = container_of!(head, DrmI915GemObject, rcu_or_freed.rcu);
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
 
     // Keep placement storage alive for RCU reads from fdinfo.
     if (*obj).mm.n_placements > 1 {
@@ -443,7 +443,7 @@ pub unsafe extern "C" fn __i915_gem_free_object_rcu(head: *mut RcuHead) {
 // upstream: i915_gem_object.c __i915_gem_object_free_mmaps()
 unsafe fn __i915_gem_object_free_mmaps(obj: *mut DrmI915GemObject) {
     // Skip serialisation and waking the device if known not to be used.
-    if (*obj).userfault_count != 0 && !IS_DGFX(to_i915((*obj).base.base.dev)) {
+    if (*obj).userfault_count != 0 && !IS_DGFX(to_i915((&(*obj).base.base).dev)) {
         i915_gem_object_release_mmap_gtt(obj);
     }
 
@@ -456,7 +456,7 @@ unsafe fn __i915_gem_object_free_mmaps(obj: *mut DrmI915GemObject) {
             mmo_offset,
             |mmo: *mut I915MmapOffset, _mn| {
                 drm_vma_offset_remove(
-                    (*(*obj).base.base.dev.cast::<DrmDevicePrefix>()).vma_offset_manager,
+                    (*(&(*obj).base.base).dev.cast::<DrmDevicePrefix>()).vma_offset_manager,
                     &mut (*mmo).vma_node,
                 );
                 kfree(mmo.cast::<c_void>());
@@ -581,7 +581,7 @@ unsafe extern "C" fn __i915_gem_free_work(work: *mut WorkStruct) {
 // upstream: i915_gem_object.c i915_gem_free_object()
 unsafe extern "C" fn i915_gem_free_object(gem_obj: *mut DrmGemObject) {
     let obj = to_intel_bo(gem_obj);
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
 
     GEM_BUG_ON!(i915_gem_object_is_framebuffer(obj));
 
@@ -648,7 +648,7 @@ unsafe fn i915_gem_object_read_from_page_iomap(
 unsafe fn object_has_mappable_iomem(obj: *mut DrmI915GemObject) -> bool {
     GEM_BUG_ON!(!i915_gem_object_has_iomem(obj));
 
-    if IS_DGFX(to_i915((*obj).base.base.dev)) {
+    if IS_DGFX(to_i915((&(*obj).base.base).dev)) {
         return i915_ttm_resource_mappable((*i915_gem_to_ttm(obj)).resource);
     }
 
@@ -675,7 +675,7 @@ pub unsafe fn i915_gem_object_read_from_page(
     size: c_int,
 ) -> c_int {
     GEM_BUG_ON!(overflows_type!(offset >> PAGE_SHIFT, PgoffT));
-    GEM_BUG_ON!(offset >= (*obj).base.base.size);
+    GEM_BUG_ON!(offset >= (&(*obj).base.base).size);
     GEM_BUG_ON!(offset_in_page(offset) > PAGE_SIZE as u64 - size as u64);
     GEM_BUG_ON!(!i915_gem_object_has_pinned_pages(obj));
 
@@ -750,7 +750,7 @@ pub unsafe fn i915_gem_object_has_iomem(obj: *const DrmI915GemObject) -> bool {
 
 // upstream: i915_gem_object.c i915_gem_object_can_migrate()
 pub unsafe fn i915_gem_object_can_migrate(obj: *mut DrmI915GemObject, id: IntelRegionId) -> bool {
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
     let num_allowed = (*obj).mm.n_placements;
     let mut mr: *mut IntelMemoryRegion;
 
@@ -762,7 +762,7 @@ pub unsafe fn i915_gem_object_can_migrate(obj: *mut DrmI915GemObject, id: IntelR
         return false;
     }
 
-    if !IS_ALIGNED!((*obj).base.base.size, (*mr).min_page_size) {
+    if !IS_ALIGNED!((&(*obj).base.base).size, (*mr).min_page_size) {
         return false;
     }
 
@@ -811,7 +811,7 @@ pub unsafe fn __i915_gem_object_migrate(
     id: IntelRegionId,
     flags: u32,
 ) -> c_int {
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
     let mut mr: *mut IntelMemoryRegion;
 
     GEM_BUG_ON!(id >= INTEL_REGION_UNKNOWN);
@@ -866,7 +866,7 @@ pub unsafe fn i915_gem_object_needs_ccs_pages(obj: *mut DrmI915GemObject) -> boo
     let mut lmem_placement = false;
     let mut i = 0;
 
-    if !HAS_FLAT_CCS(to_i915((*obj).base.base.dev)) {
+    if !HAS_FLAT_CCS(to_i915((&(*obj).base.base).dev)) {
         return false;
     }
 
@@ -981,7 +981,7 @@ pub unsafe fn i915_gem_object_get_moving_fence(
     obj: *mut DrmI915GemObject,
     fence: *mut *mut DmaFence,
 ) -> c_int {
-    dma_resv_get_singleton((*obj).base.base.resv.cast::<DmaResv>(), DMA_RESV_USAGE_KERNEL, fence)
+    dma_resv_get_singleton((&(*obj).base.base).resv.cast::<DmaResv>(), DMA_RESV_USAGE_KERNEL, fence)
 }
 
 // upstream: i915_gem_object.c i915_gem_object_wait_moving_fence()
@@ -991,7 +991,7 @@ pub unsafe fn i915_gem_object_wait_moving_fence(obj: *mut DrmI915GemObject, intr
     assert_object_held(obj);
 
     ret = dma_resv_wait_timeout(
-        (*obj).base.base.resv.cast::<DmaResv>(),
+        (&(*obj).base.base).resv.cast::<DmaResv>(),
         DMA_RESV_USAGE_KERNEL,
         intr,
         MAX_SCHEDULE_TIMEOUT as core::ffi::c_long,

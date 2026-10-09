@@ -14,6 +14,14 @@
 
 use crate::linux::irq::in_atomic;
 
+use crate::linux::irq::intel_synchronize_hardirq;
+
+use crate::intel_engine_pm_upstream::intel_engine_init__pm;
+
+use crate::intel_reset_hw_upstream::intel_gt_reset_all_engines;
+
+use crate::i915_cmd_parser_upstream::{intel_engine_init_cmd_parser,intel_engine_cleanup_cmd_parser};
+
 use core::{
     ffi::{c_char, c_ulong, c_void},
     mem::{offset_of, size_of},
@@ -1758,7 +1766,7 @@ unsafe fn create_ggtt_bind_context(engine: *mut IntelEngineCs) -> *mut IntelCont
         (*(*engine).gt).vm,
         SZ_512K as u32,
         crate::intel_engine_api_upstream::I915_GEM_HWS_GGTT_BIND_ADDR as u32,
-        &mut KERNEL,
+        &raw mut KERNEL,
         c"ggtt_bind_context".as_ptr(),
     )
 }
@@ -1773,7 +1781,7 @@ unsafe fn create_kernel_context(engine: *mut IntelEngineCs) -> *mut IntelContext
         (*(*engine).gt).vm,
         SZ_4K as u32,
         crate::intel_engine_api_upstream::I915_GEM_HWS_SEQNO_ADDR as u32,
-        &mut KERNEL,
+        &raw mut KERNEL,
         c"kernel_context".as_ptr(),
     )
 }
@@ -2615,7 +2623,7 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
                 size_of_val(&hdr),
                 "\t\tActive[%d]:  ccid:%08x%s%s, ",
                 port.offset_from(execlists.active) as i32,
-                (*(*rq).context).lrc.ccid,
+                (&(*(*rq).context).lrc).ccid,
                 if intel_context_is_closed((*rq).context) {
                     "!"
                 } else {
@@ -2654,7 +2662,7 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
                 size_of_val(&hdr),
                 "\t\tPending[%d]: ccid:%08x%s%s, ",
                 port.offset_from(execlists.pending.as_ptr()) as i32,
-                (*(*rq).context).lrc.ccid,
+                (&(*(*rq).context).lrc).ccid,
                 if intel_context_is_closed((*rq).context) {
                     "!"
                 } else {

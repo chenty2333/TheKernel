@@ -143,3 +143,9 @@ pub fn irq_work_sync<W: IrqWorkPtr>(work: W) {
 pub fn in_atomic() -> bool {
     axtask::current_may_uninit().is_some_and(|task| task.preempt_disable_count() != 0)
 }
+
+// upstream: i915_irq.c intel_synchronize_hardirq()
+pub unsafe fn intel_synchronize_hardirq(i915:*mut crate::linux_i915_private::DrmI915Private) {
+    let vector=crate::linux::dma::device_irq(unsafe {(*i915).drm.dev});
+    axhal::irq::synchronize_hardirq(vector);
+}

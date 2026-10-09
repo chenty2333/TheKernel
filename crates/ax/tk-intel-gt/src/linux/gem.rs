@@ -322,11 +322,11 @@ const _: [(); 16] = [(); offset_of!(DrmMinor, dev)];
 #[repr(C)]
 pub struct FileOperations {
     pub owner: *mut core::ffi::c_void,
-    fop_flags: u32,
-    _flags_pad: u32,
-    _before_release: [*const core::ffi::c_void; 13],
+    pub(crate) fop_flags: u32,
+    pub(crate) _flags_pad: u32,
+    pub(crate) _before_release: [*const core::ffi::c_void; 13],
     pub release: Option<unsafe extern "C" fn(*mut Inode, *mut File) -> i32>,
-    _after_release: [*const core::ffi::c_void; 18],
+    pub(crate) _after_release: [*const core::ffi::c_void; 18],
 }
 
 unsafe impl Sync for FileOperations {}

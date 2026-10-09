@@ -48,10 +48,7 @@ pub const I915_MAX_SUBSLICES: usize = 8;
 pub const I915_CMD_HASH_ORDER: u32 = 9;
 
 // Pointer-only C forward declarations used by this header.
-#[repr(C)]
-pub struct DrmI915RegTable {
-    _opaque: [u8; 0],
-}
+pub use crate::i915_cmd_parser_upstream::{DrmI915RegDescriptor,DrmI915RegTable};
 
 #[repr(C)]
 pub struct I915PerfGroup {

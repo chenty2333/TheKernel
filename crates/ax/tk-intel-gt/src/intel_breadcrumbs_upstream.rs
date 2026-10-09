@@ -594,3 +594,8 @@ pub(crate) unsafe fn intel_engine_print_breadcrumbs(
         print_signals(b, p);
     }
 }
+
+// upstream: intel_breadcrumbs.h intel_breadcrumbs_unpark()
+pub unsafe fn intel_breadcrumbs_unpark(b:*mut IntelBreadcrumbs){unsafe {crate::linux::memory::atomic_inc(&mut (*b).active)};}
+// upstream: intel_breadcrumbs.h intel_breadcrumbs_park()
+pub unsafe fn intel_breadcrumbs_park(b:*mut IntelBreadcrumbs){if unsafe {crate::linux::memory::atomic_dec_and_test(&mut (*b).active)} {unsafe {__intel_breadcrumbs_park(b)};}}

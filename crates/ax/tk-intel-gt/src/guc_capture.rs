@@ -98,7 +98,7 @@ impl<'a> CaptureBuffer<'a> {
         Err(CaptureError::Truncated)
     }
 
-    fn read_words<const N: usize>(&mut self) -> Result<[u32; N], CaptureError> {
+    pub(crate) fn read_words<const N: usize>(&mut self) -> Result<[u32; N], CaptureError> {
         if self.count() < N * 4 {
             return Err(CaptureError::Truncated);
         }
@@ -123,6 +123,7 @@ impl<'a> CaptureBuffer<'a> {
     }
 }
 
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureRegister {
     pub offset: u32,

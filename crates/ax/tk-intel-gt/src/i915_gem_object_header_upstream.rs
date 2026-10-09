@@ -396,5 +396,5 @@ pub unsafe fn __start_cpu_write(obj: *mut DrmI915GemObject) {
 }
 // upstream: i915_gem_object.h i915_gem_object_is_userptr()
 pub unsafe fn i915_gem_object_is_userptr(obj: *mut DrmI915GemObject) -> bool {
-    unsafe { !(*obj).backing.userptr.notifier.mm.is_null() }
+    unsafe { !(&(*obj).backing.userptr).notifier.mm.is_null() }
 }

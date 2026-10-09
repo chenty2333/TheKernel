@@ -1387,7 +1387,7 @@ pub(crate) unsafe fn lrc_reset(ce: *mut IntelContext) {
     intel_ring_reset((*ce).ring, (*(*ce).ring).emit);
     // Scrub away the garbage.
     lrc_init_regs(ce, (*ce).engine, true);
-    (*ce).lrc.lrca = lrc_update_regs(ce, (*ce).engine, (*(*ce).ring).tail);
+    (&mut (*ce).lrc).lrca = lrc_update_regs(ce, (*ce).engine, (*(*ce).ring).tail);
 }
 
 // upstream: intel_lrc.c lrc_pre_pin()
@@ -1417,7 +1417,7 @@ pub(crate) unsafe fn lrc_pin(
     if !__test_and_set_bit(CONTEXT_INIT_BIT, &mut (*ce).flags) {
         lrc_init_state(ce, engine, vaddr);
     }
-    (*ce).lrc.lrca = lrc_update_regs(ce, engine, (*(*ce).ring).tail);
+    (&mut (*ce).lrc).lrca = lrc_update_regs(ce, engine, (*(*ce).ring).tail);
     0
 }
 

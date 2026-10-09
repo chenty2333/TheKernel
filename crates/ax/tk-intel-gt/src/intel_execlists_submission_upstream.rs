@@ -891,7 +891,7 @@ unsafe fn reset_active(rq: *mut I915Request, engine: *mut IntelEngineCs) {
     lrc_init_regs(ce, engine, true);
 
     // We have switched away; this is a no-op, but the intent matters.
-    (*ce).lrc.lrca = lrc_update_regs(ce, engine, head);
+    (&mut (*ce).lrc).lrca = lrc_update_regs(ce, engine, head);
 }
 
 // upstream: intel_execlists_submission.c bad_request()
@@ -921,24 +921,24 @@ unsafe fn __execlists_schedule_in(rq: *mut I915Request) -> *mut IntelEngineCs {
     if (*ce).tag != 0 {
         // Use a fixed tag for OA and friends.
         GEM_BUG_ON!((*ce).tag <= BITS_PER_LONG);
-        (*ce).lrc.ccid = (*ce).tag;
+        (&mut (*ce).lrc).ccid = (*ce).tag;
     } else if GRAPHICS_VER_FULL((*engine).i915) >= IP_VER(12, 55) {
         // We need distinct values, not strict matching.
         let tag = ffs(READ_ONCE!((*engine).context_tag));
         GEM_BUG_ON!(tag == 0 || tag >= BITS_PER_LONG as i32);
         clear_bit(tag - 1, &mut (*engine).context_tag);
-        (*ce).lrc.ccid = (tag as u32) << (XEHP_SW_CTX_ID_SHIFT - 32);
+        (&mut (*ce).lrc).ccid = (tag as u32) << (XEHP_SW_CTX_ID_SHIFT - 32);
         BUILD_BUG_ON!(BITS_PER_LONG > GEN12_MAX_CONTEXT_HW_ID);
     } else {
         // We need distinct values, not strict matching.
         let tag = __ffs((*engine).context_tag);
         GEM_BUG_ON!(tag >= BITS_PER_LONG as u32);
         __clear_bit(tag, &mut (*engine).context_tag);
-        (*ce).lrc.ccid = (1 + tag) << (GEN11_SW_CTX_ID_SHIFT - 32);
+        (&mut (*ce).lrc).ccid = (1 + tag) << (GEN11_SW_CTX_ID_SHIFT - 32);
         BUILD_BUG_ON!(BITS_PER_LONG > GEN12_MAX_CONTEXT_HW_ID);
     }
 
-    (*ce).lrc.ccid |= (*engine).execlists.ccid;
+    (&mut (*ce).lrc).ccid |= (*engine).execlists.ccid;
 
     __intel_gt_pm_get((*engine).gt);
     if (*engine).fw_domain != 0 && (*engine).fw_active == 0 {
@@ -1025,7 +1025,7 @@ unsafe fn __execlists_schedule_out(rq: *mut I915Request, ce: *mut IntelContext) 
         intel_engine_add_retire(engine, (*ce).timeline);
     }
 
-    ccid = (*ce).lrc.ccid;
+    ccid = (&(*ce).lrc).ccid;
     if GRAPHICS_VER_FULL((*engine).i915) >= IP_VER(12, 55) {
         ccid >>= XEHP_SW_CTX_ID_SHIFT - 32;
         ccid &= XEHP_MAX_CONTEXT_HW_ID;
@@ -1150,7 +1150,7 @@ unsafe fn dump_port(
         buflen,
         "%sccid:%x %llx:%lld%s prio %d",
         prefix,
-        (*(*rq).context).lrc.ccid,
+        (&(*(*rq).context).lrc).ccid,
         (*rq).fence.context,
         (*rq).fence.seqno,
         if __i915_request_is_complete(rq) {
@@ -1250,7 +1250,7 @@ unsafe fn assert_pending_valid(execlists: *const IntelEngineExeclists, msg: *con
         }
         ce = (*rq).context;
 
-        if ccid == (*ce).lrc.ccid {
+        if ccid == (&(*ce).lrc).ccid {
             GEM_TRACE_ERR!(
                 "%s: Dup ccid:%x context:%llx in pending[%zd]\n",
                 (*engine).name,
@@ -1260,7 +1260,7 @@ unsafe fn assert_pending_valid(execlists: *const IntelEngineExeclists, msg: *con
             );
             return false;
         }
-        ccid = (*ce).lrc.ccid;
+        ccid = (&(*ce).lrc).ccid;
 
         // Sentinels flush current execution and must be the final request.
         if !prev.is_null()
@@ -1562,7 +1562,7 @@ unsafe fn timeslice_yield(el: *const IntelEngineExeclists, rq: *const I915Reques
     // Once a semaphore miss occurs, treat this context as a hog for the rest
     // of its timeslice: CSB reports only the first miss and cannot tell us if
     // the semaphore later signaled or became blocked on another semaphore.
-    (*(*rq).context).lrc.ccid == READ_ONCE!((*el).yield_)
+    (&(*(*rq).context).lrc).ccid == READ_ONCE!((*el).yield_)
 }
 
 // upstream: intel_execlists_submission.c needs_timeslice()
@@ -2556,7 +2556,7 @@ unsafe fn active_context(engine: *mut IntelEngineCs, ccid: u32) -> *mut I915Requ
     port = el.active.cast_mut();
     while !(*port).is_null() {
         rq = *port;
-        if (*(*rq).context).lrc.ccid == ccid {
+        if (&(*(*rq).context).lrc).ccid == ccid {
             ENGINE_TRACE!(
                 engine,
                 "ccid:%x found at active:%zd\n",
@@ -2571,7 +2571,7 @@ unsafe fn active_context(engine: *mut IntelEngineCs, ccid: u32) -> *mut I915Requ
     port = el.pending.as_ptr() as *mut *mut I915Request;
     while !(*port).is_null() {
         rq = *port;
-        if (*(*rq).context).lrc.ccid == ccid {
+        if (&(*(*rq).context).lrc).ccid == ccid {
             ENGINE_TRACE!(
                 engine,
                 "ccid:%x found at pending:%zd\n",
@@ -3288,7 +3288,7 @@ unsafe fn execlists_reset_active(engine: *mut IntelEngineCs, stalled: bool) {
         (*(*ce).ring).tail
     );
     lrc_reset_regs(ce, engine);
-    (*ce).lrc.lrca = lrc_update_regs(ce, engine, head);
+    (&mut (*ce).lrc).lrca = lrc_update_regs(ce, engine, head);
 }
 
 // upstream: intel_execlists_submission.c execlists_reset_csb()

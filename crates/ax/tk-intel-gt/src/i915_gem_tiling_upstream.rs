@@ -197,7 +197,7 @@ pub unsafe fn i915_gem_fence_alignment(
 // Check pitch constraints for all chips & tiling formats.
 // upstream: i915_gem_tiling.c i915_tiling_ok()
 unsafe fn i915_tiling_ok(obj: *mut DrmI915GemObject, tiling: u32, stride: u32) -> bool {
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
     let tile_width: u32;
 
     // Linear is always fine.
@@ -274,7 +274,7 @@ unsafe fn i915_gem_object_fence_prepare(
     tiling_mode: i32,
     stride: u32,
 ) -> i32 {
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
     let ggtt = (*to_gt(i915)).ggtt;
     let mut vma: *mut I915Vma = core::ptr::null_mut();
     let mut vn: *mut I915Vma = core::ptr::null_mut();
@@ -320,7 +320,7 @@ unsafe fn i915_gem_object_fence_prepare(
 
 // upstream: i915_gem_tiling.c i915_gem_object_needs_bit17_swizzle()
 pub unsafe fn i915_gem_object_needs_bit17_swizzle(obj: *mut DrmI915GemObject) -> bool {
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
 
     (*(*to_gt(i915)).ggtt).bit_6_swizzle_x == I915_BIT_6_SWIZZLE_9_10_17
         && i915_gem_object_is_tiled(obj)
@@ -332,7 +332,7 @@ pub unsafe fn i915_gem_object_set_tiling(
     tiling: u32,
     stride: u32,
 ) -> i32 {
-    let i915 = to_i915((*obj).base.base.dev);
+    let i915 = to_i915((&(*obj).base.base).dev);
     let mut vma: *mut I915Vma = core::ptr::null_mut();
     let mut err: i32;
 
@@ -400,7 +400,7 @@ pub unsafe fn i915_gem_object_set_tiling(
     // Try to preallocate memory required to save swizzling on put-pages.
     if i915_gem_object_needs_bit17_swizzle(obj) {
         if (*obj).bit_17.is_null() {
-            (*obj).bit_17 = unsafe { bitmap_zalloc(((*obj).base.base.size >> PAGE_SHIFT) as u32, GFP_KERNEL) };
+            (*obj).bit_17 = unsafe { bitmap_zalloc(((&(*obj).base.base).size >> PAGE_SHIFT) as u32, GFP_KERNEL) };
         }
     } else {
         unsafe { bitmap_free((*obj).bit_17) };
