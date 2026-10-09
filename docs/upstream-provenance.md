@@ -1284,3 +1284,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `kernel/src/drm/crtc_uapi_full.rs` translates all 26 ctags functions from Linux 7.2.3 `drivers/gpu/drm/drm_crtc.c` (Intel permissive MIT-style grant; Copyright (c) 2006-2008 Intel Corporation, 2007 Dave Airlie, and 2008 Red Hat); the full grant is retained in the source and `kernel/LICENSES/LicenseRef-Intel-Drm-Crtc-MIT`.
 
 `kernel/src/drm/property_uapi_full.rs` translates all 26 ctags functions from Linux 7.2.3 `drivers/gpu/drm/drm_property.c` (Intel permissive MIT-style grant; Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Property-MIT`.
+
+`kernel/src/drm/framebuffer_uapi_full.rs` translates all 27 ctags functions from Linux 7.2.3 `drivers/gpu/drm/drm_framebuffer.c` (Intel permissive MIT-style grant; Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Framebuffer-MIT`.

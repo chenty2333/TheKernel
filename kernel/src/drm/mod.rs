@@ -13,6 +13,7 @@ mod device;
 mod dmabuf;
 mod fbdev;
 pub(crate) mod fence;
+mod framebuffer_uapi_full;
 mod file;
 mod gem;
 pub(crate) mod intel;
