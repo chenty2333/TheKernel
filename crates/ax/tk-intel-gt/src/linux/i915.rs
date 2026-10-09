@@ -722,6 +722,20 @@ pub unsafe fn IS_PINEVIEW<P: I915PrivatePtr>(i915: P) -> bool {
     unsafe { IS_PLATFORM(i915, INTEL_PINEVIEW) }
 }
 
+/// `HAS_GT_UC(i915)` from i915_drv.h (DEV_INFO_FOR_EACH_FLAG bit 11).
+#[allow(non_snake_case)]
+pub unsafe fn HAS_GT_UC<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = unsafe { INTEL_INFO(i915) };
+    !info.is_null() && unsafe { (*info).flags[1] & (1 << 3) != 0 }
+}
+
+/// `HAS_GUC_DEPRIVILEGE(i915)` from i915_drv.h (flag bit 14).
+#[allow(non_snake_case)]
+pub unsafe fn HAS_GUC_DEPRIVILEGE<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = unsafe { INTEL_INFO(i915) };
+    !info.is_null() && unsafe { (*info).flags[1] & (1 << 6) != 0 }
+}
+
 /// `HAS_128_BYTE_Y_TILING()` from i915_drv.h.
 #[allow(non_snake_case)]
 pub unsafe fn HAS_128_BYTE_Y_TILING<P: I915PrivatePtr>(i915: P) -> bool {

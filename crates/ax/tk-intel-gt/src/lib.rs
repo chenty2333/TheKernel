@@ -377,6 +377,9 @@ pub mod intel_wakeref_types_upstream;
 pub mod intel_wopcm_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_wopcm_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_workarounds_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]

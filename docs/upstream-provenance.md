@@ -1924,3 +1924,8 @@ are required by the Gen4 clock-frequency branch in `intel_gt_clock_utils.c`.
 `linux/firmware.rs` supplies a fail-closed `request_firmware_nowarn` adapter
 backed by `tk-axdriver-base` rootfs firmware reads; request size is capped at
 8 MiB, and ownership is released through the matching adapter.
+
+`intel_wopcm_upstream.rs` translates all 10 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_wopcm.c` (MIT, Copyright © 2017-2019 Intel
+Corporation), including Gen9 layout restrictions, locked-register verification,
+and GuC/HuC capacity checks.
