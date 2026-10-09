@@ -226,6 +226,9 @@ static PCI_DEVICE_REGISTRY: LazyInit<Mutex<BusDeviceRegistry>> = LazyInit::new()
 
 #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
 fn input_registry() -> &'static Mutex<BusDeviceRegistry> {
+    // PCI probing can be refused as a whole (VT-d failed closed); input
+    // reconciliation then sees an empty registry instead of panicking.
+    PCI_DEVICE_REGISTRY.call_once(|| Mutex::new(BusDeviceRegistry::new()));
     PCI_DEVICE_REGISTRY
         .get()
         .expect("PCI device registry not initialized")
@@ -634,7 +637,7 @@ fn config_pci_device(
 impl AllDevices {
     pub(crate) fn probe_bus_devices(&mut self) {
         #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
-        PCI_DEVICE_REGISTRY.init_once(Mutex::new(BusDeviceRegistry::new()));
+        PCI_DEVICE_REGISTRY.call_once(|| Mutex::new(BusDeviceRegistry::new()));
 
         let Some(mut root) = pci_root() else {
             // `ecam_window` has said why configuration space is unreachable.

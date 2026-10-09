@@ -97,7 +97,7 @@ fn initialize() -> Result<(), Status> {
     info!("acpica: registered wake GPE sources={wake_sources}; sleep wake masks remain disabled");
     engine.initialize_objects()?;
     if let Err(error) = vtd::init(&engine) {
-        error!("acpica: VT-d initialization failed closed: {error:?}");
+        error!("acpica: VT-d initialization failed: {error:?}");
     }
     let gpio_count = pchgpio::init(&engine, &nodes);
     let osc = engine.platform_osc();

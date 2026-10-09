@@ -393,7 +393,7 @@ pub fn dmar_init_qi<I: QiIo>(
     queue_max_order: u32,
     requested_order: u32,
 ) -> Result<Option<QiQueue>, Error> {
-    if io.hw_ecap() & DMAR_ECAP_QI == 0 || io.hw_cap() & DMAR_CAP_CM != 0 {
+    if io.hw_ecap() & DMAR_ECAP_QI == 0 {
         return Ok(None);
     }
     if !io.qi_queue_supported_by_tunable() {
@@ -695,5 +695,29 @@ mod tests {
         dmar_fini_qi(&mut io, &mut initialized).unwrap();
         assert!(io.release);
         assert!(!io.irq_enabled && !io.enabled);
+    }
+
+    #[test]
+    fn caching_mode_does_not_disable_queued_invalidation() {
+        let mut io = FakeQi::default();
+        io.cap = DMAR_CAP_CM;
+        io.ecap = DMAR_ECAP_QI;
+
+        let queue = dmar_init_qi(&mut io, 7, 3).unwrap().unwrap();
+
+        assert!(queue.enabled);
+        assert!(io.enabled);
+        assert_eq!(io.read64(IQA), 0x8003);
+    }
+
+    #[test]
+    fn absent_qi_capability_keeps_register_invalidation_fallback_available() {
+        let mut io = FakeQi::default();
+        io.cap = DMAR_CAP_CM;
+        io.ecap = 0;
+
+        assert!(dmar_init_qi(&mut io, 7, 3).unwrap().is_none());
+        assert!(!io.enabled);
+        assert!(!io.common);
     }
 }

@@ -21,8 +21,8 @@ use tk_vtd::{
     qi::{self, QiIo, QiQueue},
     reg::{
         ContextEntry, DMAR_CAP_MGAW, DMAR_CAP_RWBF, DMAR_CAP_SAGAW, DMAR_CAP_SAGAW_4LVL,
-        DMAR_CAP_SPS, DMAR_CAP_SPS_2M, DMAR_CTX2_AW_4LVL, DMAR_ECAP_QI, DMAR_IECTL_IM,
-        DMAR_IECTL_REG, DMAR_PTE_R, DMAR_PTE_W, RootEntry,
+        DMAR_CAP_SPS, DMAR_CAP_SPS_2M, DMAR_CTX2_AW_4LVL, DMAR_ECAP_EIM, DMAR_ECAP_IR,
+        DMAR_ECAP_QI, DMAR_IECTL_IM, DMAR_IECTL_REG, DMAR_PTE_R, DMAR_PTE_W, RootEntry,
     },
     utils::{self, RegisterIo},
 };
@@ -49,6 +49,48 @@ const IDENTITY_PAGE_SIZE: u64 = 1 << 21;
 const IOVA_END: u64 = 1 << 36;
 
 static MODE: AtomicU8 = AtomicU8::new(MODE_UNKNOWN);
+/// Why initialization failed closed, repeated when PCI admission is refused so
+/// the reason sits next to the refusal on a screen-only machine.
+static FAILURE: SpinNoIrq<Option<InitFailure>> = SpinNoIrq::new(None);
+
+#[derive(Clone, Copy, Debug)]
+struct InitFailure {
+    error: Error,
+    stage: &'static str,
+    unit_index: Option<usize>,
+    register_base: Option<u64>,
+    cap: Option<u64>,
+    ecap: Option<u64>,
+    gsts: Option<u32>,
+    fsts: Option<u32>,
+}
+
+impl InitFailure {
+    const fn global(error: Error, stage: &'static str) -> Self {
+        Self {
+            error,
+            stage,
+            unit_index: None,
+            register_base: None,
+            cap: None,
+            ecap: None,
+            gsts: None,
+            fsts: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UnitProbe {
+    mmio: usize,
+    register_base: u64,
+    cap: u64,
+    ecap: u64,
+    gsts: u32,
+    fsts: u32,
+}
+
+const GSTS_ACTIVE_MASK: u32 = GSTS_TES | GSTS_QIES | GSTS_IRES;
 
 const fn pci_dma_allowed_in_mode(mode: u8) -> bool {
     mode != MODE_FAILED
@@ -57,6 +99,67 @@ const fn pci_dma_allowed_in_mode(mode: u8) -> bool {
 const fn identity_dma_in_mode(mode: u8) -> bool {
     matches!(mode, MODE_UNKNOWN | MODE_IDENTITY)
 }
+
+fn address_limit(width: u8) -> Option<u64> {
+    match width {
+        1..=63 => Some(1u64 << width),
+        64 => None,
+        _ => Some(0),
+    }
+}
+
+/// Validate every remapping unit before writing its first register. QI is an
+/// optimization for DMA translation; without it, the architectural register
+/// invalidation path remains available. Interrupt remapping, however, needs QI
+/// and EIM on the x2APIC platform this kernel runs.
+fn validate_unit_capabilities(
+    cap: u64,
+    ecap: u64,
+    maximum: u64,
+    host_address_width: u8,
+    intremap: bool,
+) -> Result<(), Error> {
+    let mgaw = DMAR_CAP_MGAW(cap) as u8;
+    if DMAR_CAP_SAGAW(cap) & DMAR_CAP_SAGAW_4LVL == 0
+        || DMAR_CAP_SPS(cap) & DMAR_CAP_SPS_2M == 0
+        || mgaw < 39
+    {
+        return Err(Error::Unsupported);
+    }
+    let supported_width = mgaw.min(48);
+    if address_limit(supported_width).is_some_and(|limit| maximum > limit)
+        || address_limit(host_address_width).is_some_and(|limit| maximum > limit)
+    {
+        return Err(Error::InvalidRange);
+    }
+    if intremap
+        && ecap & (DMAR_ECAP_QI | DMAR_ECAP_IR | DMAR_ECAP_EIM)
+            != (DMAR_ECAP_QI | DMAR_ECAP_IR | DMAR_ECAP_EIM)
+    {
+        return Err(Error::Unsupported);
+    }
+    Ok(())
+}
+
+fn validate_all_unit_capabilities(
+    probes: &[UnitProbe],
+    maximum: u64,
+    host_address_width: u8,
+    intremap: bool,
+) -> Result<(), (usize, Error)> {
+    for (index, probe) in probes.iter().enumerate() {
+        validate_unit_capabilities(probe.cap, probe.ecap, maximum, host_address_width, intremap)
+            .map_err(|error| (index, error))?;
+    }
+    Ok(())
+}
+
+fn identity_fallback_safe_before_enable(statuses: impl IntoIterator<Item = u32>) -> bool {
+    statuses
+        .into_iter()
+        .all(|status| status & GSTS_ACTIVE_MASK == 0)
+}
+
 static REQUESTER_DOMAINS: AtomicBool = AtomicBool::new(false);
 static MANAGER: SpinNoIrq<Option<Manager>> = SpinNoIrq::new(None);
 
@@ -67,6 +170,16 @@ struct DmaBlock {
 }
 // SAFETY: ownership is unique and page memory is accessed through the manager lock.
 unsafe impl Send for DmaBlock {}
+
+impl Drop for DmaBlock {
+    fn drop(&mut self) {
+        global_allocator().dealloc_pages(
+            self.virtual_address.as_ptr() as usize,
+            self.pages,
+            UsageKind::Dma,
+        );
+    }
+}
 
 fn allocate_dma(pages: usize) -> Result<DmaBlock, Error> {
     let virtual_address = global_allocator()
@@ -109,18 +222,14 @@ unsafe impl PageMemory for KernelPageMemory {
     }
     unsafe fn free_page(&mut self, physical: u64) {
         if let Some(index) = self.pages.iter().position(|page| page.physical == physical) {
-            let page = self.pages.swap_remove(index);
-            global_allocator().dealloc_pages(
-                page.virtual_address.as_ptr() as usize,
-                page.pages,
-                UsageKind::Dma,
-            );
+            drop(self.pages.swap_remove(index));
         }
     }
 }
 
 struct Unit {
     mmio: usize,
+    register_base: u64,
     qi: DmaBlock,
     queue: QiQueue,
     gcmd: u32,
@@ -147,6 +256,31 @@ fn read64(unit: &Unit, offset: usize) -> u64 {
 fn write64(unit: &Unit, offset: usize, value: u64) {
     // SAFETY: the 64-bit capability/register is naturally aligned and page bounded.
     unsafe { ((unit.mmio + offset) as *mut u64).write_volatile(value) }
+}
+
+fn probe_unit(register_base: u64) -> Result<UnitProbe, Error> {
+    let physical = usize::try_from(register_base).map_err(|_| Error::InvalidRange)?;
+    let mmio = axmm::iomap(PhysAddr::from_usize(physical), MMIO_BYTES)
+        .map_err(|_| Error::MapFailed)?
+        .as_usize();
+    // SAFETY: `iomap` exposes the full 4 KiB VT-d register page and all offsets
+    // are naturally aligned, architecturally defined capability/status regs.
+    let (cap, ecap, gsts, fsts) = unsafe {
+        (
+            ((mmio + CAP) as *const u64).read_volatile(),
+            ((mmio + ECAP) as *const u64).read_volatile(),
+            ((mmio + GSTS) as *const u32).read_volatile(),
+            ((mmio + FSTS) as *const u32).read_volatile(),
+        )
+    };
+    Ok(UnitProbe {
+        mmio,
+        register_base,
+        cap,
+        ecap,
+        gsts,
+        fsts,
+    })
 }
 
 impl Unit {
@@ -177,6 +311,15 @@ impl Unit {
     }
 
     fn invalidate_all(&mut self) -> Result<(), Error> {
+        if !self.queue.enabled {
+            // Linux's Intel IOMMU driver also falls back to register-based
+            // invalidations when queued invalidation is unavailable. This is
+            // required on units where QI is absent; CAP.CM alone does not
+            // disable QI (ECAP.QI controls that capability).
+            utils::dmar_inv_ctx_glob(self)?;
+            utils::dmar_inv_iotlb_glob(self)?;
+            return self.check_faults();
+        }
         let ir_table_physical = self.ir_table.as_ref().map_or(0, |table| table.physical);
         let irte_count = self
             .ir
@@ -195,22 +338,35 @@ impl Unit {
         self.check_faults()
     }
 
-    fn enable(&mut self, root_physical: u64) -> Result<(), Error> {
+    fn enable(
+        &mut self,
+        root_physical: u64,
+        hardware_touched: &mut bool,
+    ) -> Result<(), (&'static str, Error)> {
+        macro_rules! step {
+            ($stage:literal, $result:expr) => {
+                $result.map_err(|error| ($stage, error))?
+            };
+        }
         let capability = read64(self, CAP);
         let extended = read64(self, ECAP);
-        if extended & DMAR_ECAP_QI == 0
-            || DMAR_CAP_SAGAW(capability) & DMAR_CAP_SAGAW_4LVL == 0
+        if DMAR_CAP_SAGAW(capability) & DMAR_CAP_SAGAW_4LVL == 0
             || DMAR_CAP_SPS(capability) & DMAR_CAP_SPS_2M == 0
             || DMAR_CAP_MGAW(capability) < 39
         {
-            return Err(Error::MapFailed);
+            return Err(("capability recheck", Error::Unsupported));
         }
         self.gcmd = read32(self, GCMD);
         let status = read32(self, GSTS);
         if status & GSTS_IRES != 0 {
-            utils::dmar_disable_ir(self)?;
+            *hardware_touched = true;
+            step!(
+                "disable existing interrupt remapping",
+                utils::dmar_disable_ir(self)
+            );
         }
         if status & GSTS_QIES != 0 {
+            *hardware_touched = true;
             let mut io = UnitQiIo {
                 mmio: self.mmio,
                 qi_physical: self.qi.physical,
@@ -222,20 +378,37 @@ impl Unit {
                     .as_ref()
                     .map_or(0, |table| table.entry_count() as u32),
             };
-            qi::dmar_disable_qi(&mut io)?;
+            step!(
+                "disable existing queued invalidation",
+                qi::dmar_disable_qi(&mut io)
+            );
         }
         if status & GSTS_TES != 0 {
-            utils::dmar_disable_translation(self)?;
+            *hardware_touched = true;
+            step!(
+                "disable existing translation",
+                utils::dmar_disable_translation(self)
+            );
         }
         self.root_physical = root_physical;
-        utils::dmar_load_root_entry_ptr(self)?;
+        *hardware_touched = true;
+        step!("load root table", utils::dmar_load_root_entry_ptr(self));
         // Clear state retained by firmware while queued invalidation is off.
-        utils::dmar_inv_ctx_glob(self)?;
-        utils::dmar_inv_iotlb_glob(self)?;
+        step!(
+            "initial context invalidation",
+            utils::dmar_inv_ctx_glob(self)
+        );
+        step!(
+            "initial IOTLB invalidation",
+            utils::dmar_inv_iotlb_glob(self)
+        );
         if capability & DMAR_CAP_RWBF != 0 {
-            let _ = utils::dmar_flush_write_bufs(self);
+            step!(
+                "initial write-buffer flush",
+                utils::dmar_flush_write_bufs(self)
+            );
         }
-        self.queue = {
+        if extended & DMAR_ECAP_QI != 0 {
             let mut io = UnitQiIo {
                 mmio: self.mmio,
                 qi_physical: self.qi.physical,
@@ -247,30 +420,51 @@ impl Unit {
                     .as_ref()
                     .map_or(0, |table| table.entry_count() as u32),
             };
-            qi::dmar_init_qi(&mut io, QI_ORDER, QI_ORDER)?.ok_or(Error::Unsupported)?
-        };
-        self.invalidate_all()?;
-        if axhal::boot::command_line_value("intremap") == Some("on") {
-            if extended & tk_vtd::reg::DMAR_ECAP_IR == 0 {
-                return Err(Error::Unsupported);
+            if let Some(queue) = step!(
+                "queued-invalidation initialization",
+                qi::dmar_init_qi(&mut io, QI_ORDER, QI_ORDER)
+            ) {
+                self.queue = queue;
             }
-            let table = allocate_dma(1)?;
-            let mut remapper =
-                InterruptRemapper::new(256, extended & tk_vtd::reg::DMAR_ECAP_EIM != 0)?;
+        } else {
+            warn!(
+                "vtd: DRHD {:#x} has no queued invalidation; using register invalidation",
+                self.register_base
+            );
+        }
+        step!("post-QI global invalidation", self.invalidate_all());
+        if axhal::boot::command_line_value("intremap") == Some("on") {
+            if extended & (DMAR_ECAP_IR | DMAR_ECAP_EIM | DMAR_ECAP_QI)
+                != (DMAR_ECAP_IR | DMAR_ECAP_EIM | DMAR_ECAP_QI)
+                || !self.queue.enabled
+            {
+                return Err(("interrupt-remapping capabilities", Error::Unsupported));
+            }
+            let table = allocate_dma(1).map_err(|error| ("interrupt-table allocation", error))?;
+            let mut remapper = InterruptRemapper::new(256, extended & DMAR_ECAP_EIM != 0)
+                .map_err(|error| ("interrupt-remapper allocation", error))?;
             let physical = table.physical;
             self.ir_table = Some(table);
             let qi_enabled = self.queue.enabled;
             {
-                let mut io = UnitInterruptIo::from_unit(self)?;
-                if !remapper.initialize(&mut io, true, qi_enabled, physical)? {
-                    return Err(Error::Unsupported);
+                let mut io = UnitInterruptIo::from_unit(self)
+                    .map_err(|error| ("interrupt-remapper register adapter", error))?;
+                if !step!(
+                    "interrupt-remapper initialization",
+                    remapper.initialize(&mut io, true, qi_enabled, physical)
+                ) {
+                    return Err(("interrupt-remapper unsupported", Error::Unsupported));
                 }
             }
             self.ir = Some(remapper);
-            info!("vtd: interrupt remapping enabled for DRHD {:#x}", self.mmio);
+            info!(
+                "vtd: interrupt remapping enabled for DRHD {:#x}",
+                self.register_base
+            );
         }
-        utils::dmar_enable_translation(self)?;
-        self.check_faults()
+        step!("enable translation", utils::dmar_enable_translation(self));
+        step!("post-enable fault check", self.check_faults());
+        Ok(())
     }
 }
 
@@ -1089,12 +1283,59 @@ fn quarantine_boot_resources<P, R, C, U>(page_table: P, root: R, contexts: C, un
     core::mem::forget((page_table, root, contexts, units));
 }
 
+fn release_boot_resources(
+    page_table: SecondLevel<KernelPageMemory>,
+    root: DmaBlock,
+    contexts: Vec<DmaBlock>,
+    units: Vec<Unit>,
+) {
+    // Dropping the page-table owner frees its page-table pages; DmaBlock owns
+    // allocator release for root, context, and per-unit queue pages.
+    drop(page_table);
+    drop(root);
+    drop(contexts);
+    drop(units);
+}
+
 /// Discover DMAR before PCI probing; translate by default when a supported DMAR exists.
+///
+/// A failure before the first unit is enabled has changed no hardware state,
+/// so it falls back to identity DMA, as `intel_iommu=off` would, instead of
+/// refusing every PCI device. A failure after a unit may have been enabled
+/// still fails closed.
 pub(super) fn init(engine: &Engine) -> Result<(), Error> {
+    let mut hardware_touched = false;
+    let mut identity_fallback_safe = false;
+    *FAILURE.lock() = None;
+    let result = init_translation(engine, &mut hardware_touched, &mut identity_fallback_safe);
+    if let Err(error) = result
+        && FAILURE.lock().is_none()
+    {
+        *FAILURE.lock() = Some(InitFailure::global(error, "DMAR discovery/setup"));
+    }
+    if let Err(error) = result
+        && identity_fallback_safe
+        && !hardware_touched
+    {
+        MODE.store(MODE_IDENTITY, Ordering::Release);
+        warn!(
+            "vtd: initialization failed before any unit was enabled ({error:?}); admitting \
+             identity DMA"
+        );
+    }
+    result
+}
+
+fn init_translation(
+    engine: &Engine,
+    hardware_touched: &mut bool,
+    identity_fallback_safe: &mut bool,
+) -> Result<(), Error> {
     // Preserve an explicit escape hatch for platforms that need firmware-style
     // identity DMA. Supported DMAR units otherwise enable translation.
     if axhal::boot::command_line_value("intel_iommu") == Some("off") {
         MODE.store(MODE_IDENTITY, Ordering::Release);
+        *identity_fallback_safe = true;
         info!("vtd: translation disabled by intel_iommu=off");
         return Ok(());
     }
@@ -1102,6 +1343,7 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
     info!("vtd: parsing ACPI DMAR for default translation");
     let Some(dmar) = table(engine)? else {
         MODE.store(MODE_IDENTITY, Ordering::Release);
+        *identity_fallback_safe = true;
         info!("vtd: no DMAR table; admitting identity DMA");
         return Ok(());
     };
@@ -1114,10 +1356,6 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
         dmar.reserved_regions.len()
     );
     let intremap = axhal::boot::command_line_value("intremap") == Some("on");
-    if intremap && !dmar.interrupt_remapping {
-        return Err(Error::Unsupported);
-    }
-    let mut page_table = SecondLevel::new(KernelPageMemory { pages: Vec::new() })?;
     let mut maximum = 0u64;
     for &(base, size) in phys_ram_ranges() {
         maximum = maximum.max(
@@ -1138,9 +1376,54 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
         .checked_add(IDENTITY_PAGE_SIZE - 1)
         .ok_or(Error::InvalidRange)?
         & !(IDENTITY_PAGE_SIZE - 1);
+
+    // Read every unit's capabilities and handoff state before allocating
+    // translation structures or issuing any command. A capability mismatch
+    // on a later DRHD must not be discovered only after an earlier unit has
+    // already been switched to our root table.
+    let mut probes = Vec::new();
+    probes
+        .try_reserve_exact(dmar.units.len())
+        .map_err(|_| Error::OutOfMemory)?;
+    for record in &dmar.units {
+        probes.push(probe_unit(record.register_base)?);
+    }
+    *identity_fallback_safe =
+        identity_fallback_safe_before_enable(probes.iter().map(|probe| probe.gsts));
+
     if maximum == 0 || maximum > (1 << 48) {
         return Err(Error::InvalidRange);
     }
+    if intremap && !dmar.interrupt_remapping {
+        *FAILURE.lock() = Some(InitFailure::global(
+            Error::Unsupported,
+            "DMAR interrupt-remapping flag",
+        ));
+        return Err(Error::Unsupported);
+    }
+    if let Err((index, error)) =
+        validate_all_unit_capabilities(&probes, maximum, dmar.host_address_width, intremap)
+    {
+        let probe = &probes[index];
+        *FAILURE.lock() = Some(InitFailure {
+            error,
+            stage: "DRHD capability/address-width preflight",
+            unit_index: Some(index),
+            register_base: Some(probe.register_base),
+            cap: Some(probe.cap),
+            ecap: Some(probe.ecap),
+            gsts: Some(probe.gsts),
+            fsts: Some(probe.fsts),
+        });
+        error!(
+            "vtd: preflight rejected DRHD {index} at {:#x}: {error:?} CAP={:#x} ECAP={:#x} \
+             GSTS={:#x} FSTS={:#x}",
+            probe.register_base, probe.cap, probe.ecap, probe.gsts, probe.fsts
+        );
+        return Err(error);
+    }
+
+    let mut page_table = SecondLevel::new(KernelPageMemory { pages: Vec::new() })?;
     page_table.map_identity_2m(maximum)?;
 
     let root = allocate_table_page()?;
@@ -1190,14 +1473,11 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
     units
         .try_reserve_exact(dmar.units.len())
         .map_err(|_| Error::OutOfMemory)?;
-    for record in &dmar.units {
-        let physical = usize::try_from(record.register_base).map_err(|_| Error::InvalidRange)?;
-        let base = axmm::iomap(PhysAddr::from_usize(physical), MMIO_BYTES)
-            .map_err(|_| Error::MapFailed)?
-            .as_usize();
+    for probe in &probes {
         let qi = allocate_dma(QI_PAGES)?;
         let unit = Unit {
-            mmio: base,
+            mmio: probe.mmio,
+            register_base: probe.register_base,
             qi,
             queue: QiQueue::new(QI_BYTES as u32)?,
             gcmd: 0,
@@ -1210,12 +1490,39 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
     // Complete every fallible allocation before enabling the first unit. If a
     // later unit fails after an earlier unit enabled TE, quarantine all of the
     // pages/queues rather than dropping backing memory still visible to DMA.
-    let enable_error = units
-        .iter_mut()
-        .find_map(|unit| unit.enable(root.physical).err());
-    if let Some(error) = enable_error {
-        error!("vtd: unit enable failed after partial initialization; quarantining DMA tables");
-        quarantine_boot_resources(page_table, root, context_tables, units);
+    let enable_error = units.iter_mut().enumerate().find_map(|(index, unit)| {
+        unit.enable(root.physical, hardware_touched)
+            .err()
+            .map(|failure| (index, failure))
+    });
+    if let Some((index, (stage, error))) = enable_error {
+        let register_base = dmar.units[index].register_base;
+        let unit = &units[index];
+        let (cap, ecap, gsts, fsts) = (
+            read64(unit, CAP),
+            read64(unit, ECAP),
+            read32(unit, GSTS),
+            read32(unit, FSTS),
+        );
+        *FAILURE.lock() = Some(InitFailure {
+            error,
+            stage,
+            unit_index: Some(index),
+            register_base: Some(register_base),
+            cap: Some(cap),
+            ecap: Some(ecap),
+            gsts: Some(gsts),
+            fsts: Some(fsts),
+        });
+        error!(
+            "vtd: DRHD {index} at {register_base:#x} failed during {stage}: {error:?} \
+             CAP={cap:#x} ECAP={ecap:#x} GSTS={gsts:#x} FSTS={fsts:#x}; quarantining DMA tables"
+        );
+        if *hardware_touched {
+            quarantine_boot_resources(page_table, root, context_tables, units);
+        } else {
+            release_boot_resources(page_table, root, context_tables, units);
+        }
         return Err(error);
     }
     let manager = Manager {
@@ -1257,7 +1564,11 @@ impl tk_vtd::PlatformDma for PlatformDma {
         // UNKNOWN means VT-d initialization was never reached (static ACPI,
         // missing RSDP, or ACPICA rescue). That path is firmware-style direct
         // DMA; only a VT-d initialization that explicitly failed may block PCI.
-        pci_dma_allowed_in_mode(MODE.load(Ordering::Acquire))
+        let allowed = pci_dma_allowed_in_mode(MODE.load(Ordering::Acquire));
+        if !allowed {
+            error!("vtd: PCI DMA refused; VT-d failure: {:?}", *FAILURE.lock());
+        }
+        allowed
     }
     fn map(physical: u64, length: usize) -> Result<u64, Error> {
         let mode = MODE.load(Ordering::Acquire);
@@ -1396,8 +1707,10 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        MODE_ENABLED, MODE_FAILED, MODE_IDENTITY, MODE_UNKNOWN, identity_dma_in_mode,
-        pci_dma_allowed_in_mode, quarantine_boot_resources,
+        DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS_2M, DMAR_ECAP_EIM, DMAR_ECAP_IR, DMAR_ECAP_QI, Error,
+        MODE_ENABLED, MODE_FAILED, MODE_IDENTITY, MODE_UNKNOWN, UnitProbe, identity_dma_in_mode,
+        identity_fallback_safe_before_enable, pci_dma_allowed_in_mode, quarantine_boot_resources,
+        validate_all_unit_capabilities, validate_unit_capabilities,
     };
 
     struct DropProbe(Arc<AtomicUsize>);
@@ -1429,5 +1742,73 @@ mod tests {
         assert!(identity_dma_in_mode(MODE_IDENTITY));
         assert!(!identity_dma_in_mode(MODE_ENABLED));
         assert!(!identity_dma_in_mode(MODE_FAILED));
+    }
+
+    #[test]
+    fn all_drdhs_are_checked_for_host_and_unit_address_widths() {
+        let cap = (39 << 16) | (DMAR_CAP_SAGAW_4LVL << 8) | (DMAR_CAP_SPS_2M << 34);
+        let ecap = DMAR_ECAP_QI | DMAR_ECAP_IR | DMAR_ECAP_EIM;
+        assert_eq!(
+            validate_unit_capabilities(cap, ecap, 1 << 38, 39, false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_unit_capabilities(cap, ecap, 1 << 39, 39, false),
+            Err(Error::InvalidRange)
+        );
+        assert_eq!(
+            validate_unit_capabilities(cap, ecap, 1 << 38, 38, false),
+            Err(Error::InvalidRange)
+        );
+    }
+
+    #[test]
+    fn register_invalidation_supports_dma_without_qi_but_not_interrupt_remapping() {
+        let cap = (39 << 16) | (DMAR_CAP_SAGAW_4LVL << 8) | (DMAR_CAP_SPS_2M << 34);
+        assert_eq!(
+            validate_unit_capabilities(cap, 0, 1 << 38, 39, false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_unit_capabilities(cap, 0, 1 << 38, 39, true),
+            Err(Error::Unsupported)
+        );
+    }
+
+    #[test]
+    fn all_drhd_capabilities_are_validated_before_any_unit_is_enabled() {
+        let cap = (39 << 16) | (DMAR_CAP_SAGAW_4LVL << 8) | (DMAR_CAP_SPS_2M << 34);
+        let ecap = DMAR_ECAP_QI | DMAR_ECAP_IR | DMAR_ECAP_EIM;
+        let probes = [
+            UnitProbe {
+                mmio: 0,
+                register_base: 0x1000,
+                cap,
+                ecap,
+                gsts: 0,
+                fsts: 0,
+            },
+            UnitProbe {
+                mmio: 0,
+                register_base: 0x2000,
+                cap,
+                ecap: 0,
+                gsts: 0,
+                fsts: 0,
+            },
+        ];
+
+        assert_eq!(
+            validate_all_unit_capabilities(&probes, 1 << 38, 39, true),
+            Err((1, Error::Unsupported))
+        );
+    }
+
+    #[test]
+    fn firmware_enabled_units_are_never_classified_as_identity_safe() {
+        assert!(identity_fallback_safe_before_enable([0, 0]));
+        assert!(!identity_fallback_safe_before_enable([0, super::GSTS_TES]));
+        assert!(!identity_fallback_safe_before_enable([0, super::GSTS_QIES]));
+        assert!(!identity_fallback_safe_before_enable([0, super::GSTS_IRES]));
     }
 }
