@@ -63,16 +63,19 @@ fn mmio_register(offset: u32, write: bool) -> Register {
     }
 }
 fn read(r: &impl Registers, offset: u32) -> Result<u32, String> {
-    r.read(mmio_register(offset, false))
-        .filter(|value| *value != u32::MAX)
-        .ok_or_else(|| format!("TC modeset register {offset:#x} unavailable"))
+    let value = super::de_io::DeIo::new(r)
+        .read(mmio_register(offset, false))
+        .map_err(|error| format!("TC modeset register {offset:#x} unavailable: {error:?}"))?;
+    if value == u32::MAX {
+        Err(format!("TC modeset register {offset:#x} unavailable"))
+    } else {
+        Ok(value)
+    }
 }
 fn write(r: &impl Registers, offset: u32, value: u32) -> Result<(), String> {
-    if r.write(mmio_register(offset, true), value) {
-        Ok(())
-    } else {
-        Err(format!("TC modeset write {offset:#x} refused"))
-    }
+    super::de_io::DeIo::new(r)
+        .write(mmio_register(offset, true), value)
+        .map_err(|error| format!("TC modeset write {offset:#x} refused: {error:?}"))
 }
 fn poll<T: PollTimer + ?Sized>(
     r: &impl Registers,
@@ -117,17 +120,19 @@ pub(super) struct DklRegisterIo<'a, R> {
 }
 impl<R: Registers> RegisterIo for DklRegisterIo<'_, R> {
     fn read32(&self, offset: u32) -> Result<u32, intel_display::Error> {
-        self.registers
+        let value = super::de_io::DeIo::new(self.registers)
             .read(mmio_register(offset, false))
-            .filter(|value| *value != u32::MAX)
-            .ok_or(intel_display::Error::Unavailable(offset))
+            .map_err(|_| intel_display::Error::Unavailable(offset))?;
+        if value == u32::MAX {
+            Err(intel_display::Error::Unavailable(offset))
+        } else {
+            Ok(value)
+        }
     }
     fn write32(&self, offset: u32, value: u32) -> Result<(), intel_display::Error> {
-        if self.registers.write(mmio_register(offset, true), value) {
-            Ok(())
-        } else {
-            Err(intel_display::Error::Unavailable(offset))
-        }
+        super::de_io::DeIo::new(self.registers)
+            .write(mmio_register(offset, true), value)
+            .map_err(|_| intel_display::Error::Unavailable(offset))
     }
 }
 impl<R: Registers> DklIo for DklRegisterIo<'_, R> {

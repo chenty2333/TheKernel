@@ -91,6 +91,7 @@ mod ddi;
 pub(crate) mod debugfs;
 mod dma;
 mod dmc;
+mod de_io;
 mod dp_aux;
 mod fastboot;
 pub(crate) mod fb;
