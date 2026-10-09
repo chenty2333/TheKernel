@@ -1675,6 +1675,7 @@ mod tests {
         aux_writes: usize,
         short_aux_write: bool,
         fail_caps_read: bool,
+        hpd_blocks: usize,
         hpd_unblocks: usize,
     }
 
@@ -1766,7 +1767,9 @@ mod tests {
         fn connected(&mut self) -> bool {
             true
         }
-        fn hpd_block(&mut self) {}
+        fn hpd_block(&mut self) {
+            self.hpd_blocks += 1;
+        }
         fn hpd_unblock(&mut self) {
             self.hpd_unblocks += 1;
         }
@@ -1919,6 +1922,7 @@ mod tests {
             Err(LinkTrainingError::Aux)
         );
         assert_eq!(io.aux_writes, 0);
+        assert_eq!(io.hpd_blocks, 1);
         assert_eq!(io.hpd_unblocks, 1);
     }
 
@@ -1934,5 +1938,6 @@ mod tests {
             Err(LinkTrainingError::Aux)
         );
         assert_eq!(io.hpd_unblocks, 1);
+        assert_eq!(io.hpd_blocks, 1);
     }
 }
