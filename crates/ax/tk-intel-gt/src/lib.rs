@@ -516,6 +516,10 @@ pub(crate) mod intel_guc_ads_upstream;
 
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub(crate) mod intel_ggtt_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub(crate) mod intel_guc_capture_upstream;
 
 #[cfg(feature = "upstream-gt")]
