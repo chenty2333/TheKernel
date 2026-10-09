@@ -872,6 +872,20 @@ impl<R: Registers, T: PollTimer> TcHdmiEncoderOps<'_, R, T> {
             TcHdmiEncoderPhase::Enabled,
         )
     }
+
+    /// Enable the HDMI AVI infoframe through the source HSW writer. Keep this
+    /// inside the route-bound encoder adapter so an HDMI packet cannot be
+    /// dispatched for a DP or unselected TC port by a future caller.
+    fn enable_avi_infoframe(&self, words: &[u32; 8]) -> Result<(), String> {
+        if self.phase != TcHdmiEncoderPhase::PostDisabled
+            && self.phase != TcHdmiEncoderPhase::Prepared
+        {
+            return Err(String::from(
+                "TC HDMI AVI programming is out of encoder phase",
+            ));
+        }
+        write_pipe_a_avi(self.registers, words)
+    }
 }
 
 /// Kernel adapter for the source Haswell/Gen12+ AVI-DIP writer. Only the
@@ -1331,7 +1345,7 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         dkl_pll_on(r, timer, port, pll, afc_startup)?;
     }
     enable_pipe_a_transcoder_clock(r, port)?;
-    write_pipe_a_avi(r, avi)?;
+    encoder_ops.enable_avi_infoframe(avi)?;
     let mode_flags =
         u32::from(function & (1 << 16) != 0) | (u32::from(function & (1 << 17) != 0) << 2);
     enable_pipe_a_transcoder(r, port, mode_flags)?;
