@@ -1645,6 +1645,7 @@ mod tests {
     struct SourcePhyFailureIo {
         aux_writes: usize,
         short_aux_write: bool,
+        fail_caps_read: bool,
     }
 
     impl LinkTrainingIo for SourcePhyFailureIo {
@@ -1652,7 +1653,11 @@ mod tests {
             Ok(())
         }
         fn read_dpcd_caps(&mut self) -> Result<[u8; DP_RECEIVER_CAP_SIZE], LinkTrainingError> {
-            Ok([0; DP_RECEIVER_CAP_SIZE])
+            if self.fail_caps_read {
+                Err(LinkTrainingError::Aux)
+            } else {
+                Ok([0; DP_RECEIVER_CAP_SIZE])
+            }
         }
         fn read_lttpr_common_caps(
             &mut self,
@@ -1802,5 +1807,19 @@ mod tests {
             Err(LinkTrainingError::Aux)
         );
         assert_eq!(io.aux_writes, 1);
+    }
+
+    #[test]
+    fn capability_read_error_stops_before_training_writes() {
+        let mut io = SourcePhyFailureIo {
+            fail_caps_read: true,
+            ..Default::default()
+        };
+        let mut dp = IntelDpLinkTraining::default();
+        assert_eq!(
+            intel_dp_start_link_train(&mut dp, &mut io, &LinkTrainingCrtcState::default()),
+            Err(LinkTrainingError::Aux)
+        );
+        assert_eq!(io.aux_writes, 0);
     }
 }
