@@ -581,6 +581,31 @@ impl SharedDpllState {
         Ok(())
     }
 
+    /// Restrict the translated ADLP manager to the Type-C PLLs whose AUX/PHY
+    /// access can be proven by this single-port N305 lease. DPLL0/1 and TBT
+    /// stay in source order; TC2 is moved into the final active slot so the
+    /// unpowered sibling TC PLL is not read or considered by allocator scans.
+    pub(crate) fn limit_to_tc_port(
+        &mut self,
+        port: intel_display::dkl_phy::TcPort,
+    ) -> Result<usize, DpllFailure> {
+        self.ensure_usable()?;
+        if self.readout_done || self.display.num_dpll != 5 {
+            return Err(DpllFailure::AlreadyInitialized);
+        }
+        match port {
+            intel_display::dkl_phy::TcPort::Tc1 => {}
+            intel_display::dkl_phy::TcPort::Tc2 => {
+                self.display.dplls.swap(3, 4);
+                self.display.dplls[3].index = 3;
+                self.display.dplls[4].index = 4;
+            }
+            _ => return Err(DpllFailure::UnsupportedIdentity),
+        }
+        self.display.num_dpll = 4;
+        Ok(3)
+    }
+
     /// Read hardware state once from caller-proved CRTC readouts.  The source
     /// manager dispatches DKL TC1/TC2 through `intel_dpll_get_hw_state()` to
     /// its internal `dkl_pll_get_hw_state()` implementation.
@@ -1528,6 +1553,50 @@ mod tests {
             AdlNIdentity::verify(0x1234, 0x46d0, 0),
             Err(DpllFailure::UnsupportedIdentity)
         );
+    }
+
+    #[test]
+    fn tc_dpll_scope_hides_the_unpowered_sibling_phy() {
+        let identity = AdlNIdentity::verify(0x8086, 0x46d0, 0).unwrap();
+        let mut tc1 = SharedDpllState::new(identity, 0);
+        tc1.initialized = true;
+        tc1.display.num_dpll = 5;
+        assert_eq!(
+            tc1.limit_to_tc_port(intel_display::dkl_phy::TcPort::Tc1),
+            Ok(3)
+        );
+        assert_eq!(tc1.display.num_dpll, 4);
+
+        let mut tc2 = SharedDpllState::new(identity, 0);
+        tc2.initialized = true;
+        tc2.display.num_dpll = 5;
+        tc2.display.dplls[3].info = Some(dpll::DpllInfo {
+            name: "TC PLL 1",
+            funcs: dpll::DpllFunction::Dkl,
+            id: dpll::DPLL_ID_ICL_MGPLL1,
+            power_domain: None,
+            always_on: false,
+            is_alt_port_dpll: false,
+        });
+        tc2.display.dplls[4].info = Some(dpll::DpllInfo {
+            name: "TC PLL 2",
+            funcs: dpll::DpllFunction::Dkl,
+            id: dpll::DPLL_ID_ICL_MGPLL2,
+            power_domain: None,
+            always_on: false,
+            is_alt_port_dpll: false,
+        });
+        assert_eq!(
+            tc2.limit_to_tc_port(intel_display::dkl_phy::TcPort::Tc2),
+            Ok(3)
+        );
+        assert_eq!(tc2.display.num_dpll, 4);
+        assert_eq!(
+            tc2.display.dplls[3].info.map(|info| info.id),
+            Some(dpll::DPLL_ID_ICL_MGPLL2)
+        );
+        assert_eq!(tc2.display.dplls[3].index, 3);
+        assert!(tc2.display.dplls[4].info.is_some());
     }
 
     #[test]

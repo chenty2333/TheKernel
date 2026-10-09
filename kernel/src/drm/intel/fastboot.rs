@@ -1929,11 +1929,10 @@ pub(super) fn init(
                         Error::Refused
                     })?;
             let first = capture(&window, &pin, port, afc_startup)?;
-            // Reuse the translated shared-DPLL manager's generic TC1/TC2
-            // hardware-state dispatcher as an independent read-only check of
-            // the firmware DKL PLL readout.  This is not yet the allocator or
-            // enable/disable owner: the existing TC transaction still owns
-            // its indivisible modeset/rollback sequence below.
+            // Scope the translated shared-DPLL manager to the power-proven
+            // TC route, then run its source-shaped hardware readout with the
+            // captured Pipe-A owner. This keeps unpowered sibling TC PLLs out
+            // of the manager's readout/allocator view.
             let dpll_identity = super::shared_dpll::AdlNIdentity::verify(
                 info.vendor_id,
                 info.device_id,
@@ -1958,7 +1957,44 @@ pub(super) fn init(
                     axlog::warn!("intel-fastboot: shared DPLL manager init refused: {error:?}");
                     Error::Refused
                 })?;
-            let dpll_index = (3 + port.index()) as usize;
+            let source_tc_port = match port {
+                TcPort::Tc1 => intel_display::intel_dpll_mgr_full::TcPort::Tc1,
+                TcPort::Tc2 => intel_display::intel_dpll_mgr_full::TcPort::Tc2,
+                _ => return Err(Error::Refused),
+            };
+            let dpll_index = shared_dpll
+                .limit_to_tc_port(source_tc_port)
+                .map_err(|error| {
+                    axlog::warn!("intel-fastboot: shared DPLL port scope refused: {error:?}");
+                    Error::Refused
+                })?;
+            let mut crtc_states = [intel_display::intel_dpll_mgr_full::CrtcState::default();
+                intel_display::intel_dpll_mgr_full::MAX_PIPES];
+            crtc_states[0] = intel_display::intel_dpll_mgr_full::CrtcState {
+                id: 0,
+                name: "pipe A",
+                pipe: 0,
+                joined_pipe_mask: 1,
+                hw_active: true,
+                intel_dpll: Some(dpll_index),
+                port_clock: first.pixel_clock,
+                output: intel_display::intel_dpll_mgr_full::OutputType::Hdmi,
+                port: intel_display::intel_dpll_mgr_full::Port::Tc(source_tc_port),
+                ..intel_display::intel_dpll_mgr_full::CrtcState::default()
+            };
+            shared_dpll
+                .readout(
+                    &window,
+                    &super::gmbus::MonotonicTimer,
+                    &mut dpll_power,
+                    crtc_states,
+                )
+                .map_err(|error| {
+                    axlog::warn!(
+                        "intel-fastboot: translated DPLL manager readout refused: {error:?}"
+                    );
+                    Error::Refused
+                })?;
             let (manager_pll_on, manager_state) = shared_dpll
                 .get_hw_state(
                     &window,
