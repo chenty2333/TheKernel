@@ -45,6 +45,7 @@ pub(crate) use crate::{
         CONTEXT_REGISTRATION_FLAG_KMD, PARENT_SCRATCH_SIZE, WQ_GUC_ID_MASK, WQ_RING_TAIL_MASK,
         WQ_STATUS_ACTIVE, WQ_TYPE_MULTI_LRC,
     },
+    i915_request_types_upstream::I915Request,
     intel_breadcrumbs_upstream::{
         intel_breadcrumbs_create, intel_breadcrumbs_get, intel_breadcrumbs_put,
         intel_breadcrumbs_reset,
@@ -53,7 +54,6 @@ pub(crate) use crate::{
         intel_context_enter_engine, intel_context_exit_engine, intel_context_fini,
         intel_context_free, intel_context_get_active_request,
     },
-    i915_request_types_upstream::I915Request,
     intel_engine_cs_upstream::{
         intel_engine_cleanup_common, intel_engine_create_virtual, intel_engine_irq_disable,
         intel_engine_irq_enable, intel_engine_set_hwsp_writemask, intel_engine_stop_cs,
@@ -75,7 +75,8 @@ pub(crate) use crate::{
     },
     linux_assert::*,
     linux_i915_private::{
-        DrmI915Private, intel_irqs_enabled, i915_increase_reset_engine_count, i915_reset_count, i915_reset_engine_count,
+        DrmI915Private, i915_increase_reset_engine_count, i915_reset_count,
+        i915_reset_engine_count, intel_irqs_enabled,
     },
     linux_list::*,
     linux_locks::*,
@@ -101,6 +102,7 @@ pub const MAX_SCHEDULE_TIMEOUT: u64 = i64::MAX as u64 >> 1;
 pub const EAGAIN: i32 = 11;
 pub const EINTR: i32 = 4;
 pub const ENOMEM: i32 = 12;
+pub const ENOEXEC: i32 = 8;
 pub const EFAULT: i32 = 14;
 pub const EBUSY: i32 = 16;
 pub const ENODEV: i32 = 19;
@@ -154,7 +156,10 @@ pub const X86_FEATURE_CLFLUSH: u32 = 19;
 #[cfg(feature = "upstream-gt")]
 #[inline]
 pub fn static_cpu_has(feature: u32) -> bool {
-    assert_eq!(feature, X86_FEATURE_CLFLUSH, "unbound x86 CPU feature index");
+    assert_eq!(
+        feature, X86_FEATURE_CLFLUSH,
+        "unbound x86 CPU feature index"
+    );
     core::arch::x86_64::__cpuid(1).edx & (1 << 19) != 0
 }
 

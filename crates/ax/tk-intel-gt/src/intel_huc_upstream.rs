@@ -10,7 +10,6 @@ use core::{
 };
 
 use crate::{
-    i915_vma_types_upstream::I915Vma,
     intel_context_types_upstream::{I915SwFence, I915SwFenceNotify},
     intel_context_upstream::Hrtimer,
     intel_engine_types_upstream::{GSC0, I915_MAX_VCS, VCS0},
@@ -28,11 +27,11 @@ use crate::{
         __intel_uc_fw_status, INTEL_UC_FIRMWARE_DISABLED, INTEL_UC_FIRMWARE_ERROR,
         INTEL_UC_FIRMWARE_INIT_FAIL, INTEL_UC_FIRMWARE_LOAD_FAIL, INTEL_UC_FIRMWARE_LOADABLE,
         INTEL_UC_FIRMWARE_MISSING, INTEL_UC_FIRMWARE_NOT_SUPPORTED, INTEL_UC_FIRMWARE_RUNNING,
-        INTEL_UC_FW_TYPE_HUC, IntelUcFw, intel_uc_fw_is_loadable, intel_uc_fw_is_loaded,
+        INTEL_UC_FW_TYPE_HUC, IntelUcFw,
     },
     intel_uc_fw_upstream::{
         intel_uc_fw_change_status, intel_uc_fw_dump, intel_uc_fw_fini, intel_uc_fw_init,
-        intel_uc_fw_init_early,
+        intel_uc_fw_init_early, intel_uc_fw_is_loadable, intel_uc_fw_is_loaded,
     },
     intel_uncore_types_upstream::{__intel_wait_for_register, intel_uncore_read},
     intel_workarounds_types_upstream::I915RegT,
@@ -94,11 +93,25 @@ macro_rules! huc_gt_log {
         $macro!(__gt, $fmt $(, $arg)*);
     }};
 }
-macro_rules! huc_err { ($huc:expr, $fmt:expr $(, $arg:expr)* $(,)?) => { huc_gt_log!(gt_err, $huc, $fmt $(, $arg)*); }; }
-macro_rules! huc_warn { ($huc:expr, $fmt:expr $(, $arg:expr)* $(,)?) => { huc_gt_log!(gt_warn, $huc, $fmt $(, $arg)*); }; }
-macro_rules! huc_info { ($huc:expr, $fmt:expr $(, $arg:expr)* $(,)?) => { huc_gt_log!(gt_info, $huc, $fmt $(, $arg)*); }; }
-macro_rules! huc_notice { ($huc:expr, $fmt:expr $(, $arg:expr)* $(,)?) => { huc_gt_log!(gt_notice, $huc, $fmt $(, $arg)*); }; }
-macro_rules! huc_dbg { ($huc:expr, $fmt:expr $(, $arg:expr)* $(,)?) => { huc_gt_log!(gt_dbg, $huc, $fmt $(, $arg)*); }; }
+macro_rules! huc_err { ($huc:expr, $fmt:expr $(, $arg:expr)* $(,)?) => { huc_gt_log!(gt_err, $huc, $fmt $(, $arg)*) }; }
+macro_rules! huc_info { ($huc:expr, $fmt:expr $(, $arg:expr)* $(,)?) => { huc_gt_log!(gt_notice, $huc, $fmt $(, $arg)*) }; }
+macro_rules! huc_notice { ($huc:expr, $fmt:expr $(, $arg:expr)* $(,)?) => { huc_gt_log!(gt_notice, $huc, $fmt $(, $arg)*) }; }
+macro_rules! huc_dbg { ($huc:expr, $fmt:expr $(, $arg:expr)* $(,)?) => { huc_gt_log!(gt_dbg, $huc, $fmt $(, $arg)*) }; }
+macro_rules! huc_warn { ($huc:expr, $fmt:expr $(, $arg:expr)* $(,)?) => {{
+    let __gt = unsafe { huc_to_gt($huc) };
+    let __id = unsafe { (*__gt).info.id };
+    let __args: &[&dyn crate::linux_print::CFormatArg] = &[
+        $(&($arg) as &dyn crate::linux_print::CFormatArg),*
+    ];
+    let __message = crate::linux_print::format_message($fmt, __args);
+    crate::linux_print::drm_log_at(
+        crate::linux_print::DrmLogLevel::Warn,
+        &alloc::format!("GT{__id}"),
+        file!(),
+        line!(),
+        &__message,
+    );
+}}; }
 macro_rules! huc_probe_error { ($huc:expr, $fmt:expr $(, $arg:expr)* $(,)?) => {{
     let __gt = unsafe { huc_to_gt($huc) };
     gt_err!(__gt, concat!("HuC probe: ", $fmt) $(, $arg)*);
@@ -277,7 +290,7 @@ const BUS_NOTIFY_DRIVER_NOT_BOUND: i32 = 2;
 const BUS_NOTIFY_UNBIND_DRIVER: i32 = 5;
 
 // upstream: intel_huc.c intel_huc_register_gsc_notifier()
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_huc_register_gsc_notifier(
     huc: *mut IntelHuc,
     bus: *const crate::intel_huc_types_upstream::BusType,
@@ -299,7 +312,7 @@ pub unsafe extern "C" fn intel_huc_register_gsc_notifier(
 }
 
 // upstream: intel_huc.c intel_huc_unregister_gsc_notifier()
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_huc_unregister_gsc_notifier(
     huc: *mut IntelHuc,
     bus: *const crate::intel_huc_types_upstream::BusType,
@@ -336,7 +349,7 @@ unsafe fn delayed_huc_load_fini(huc: *mut IntelHuc) {
 }
 
 // upstream: intel_huc.c intel_huc_sanitize()
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_huc_sanitize(huc: *mut IntelHuc) -> i32 {
     unsafe { delayed_huc_load_complete(huc) };
     unsafe { fw_sanitize(ptr::addr_of_mut!((*huc).fw)) };
@@ -356,7 +369,7 @@ unsafe fn vcs_supported(gt: *mut IntelGt) -> bool {
 }
 
 // upstream: intel_huc.c intel_huc_init_early()
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_huc_init_early(huc: *mut IntelHuc) {
     let gt = unsafe { huc_to_gt(huc) };
     let i915 = unsafe { (*gt).i915 };
@@ -404,7 +417,7 @@ pub unsafe extern "C" fn intel_huc_init_early(huc: *mut IntelHuc) {
 }
 
 // upstream: intel_huc.c intel_huc_fini_late()
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_huc_fini_late(huc: *mut IntelHuc) {
     unsafe { delayed_huc_load_fini(huc) };
 }
@@ -457,7 +470,7 @@ unsafe fn check_huc_loading_mode(huc: *mut IntelHuc) -> i32 {
 }
 
 // upstream: intel_huc.c intel_huc_init()
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_huc_init(huc: *mut IntelHuc) -> i32 {
     let gt = unsafe { huc_to_gt(huc) };
     let mut err = unsafe { check_huc_loading_mode(huc) };
@@ -501,7 +514,7 @@ unsafe fn huc_init_fail(huc: *mut IntelHuc, err: i32) -> i32 {
 }
 
 // upstream: intel_huc.c intel_huc_fini()
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_huc_fini(huc: *mut IntelHuc) {
     if !unsafe { (*huc).heci_pkt.is_null() } {
         unsafe {
@@ -529,7 +542,7 @@ unsafe fn auth_mode_string(
 }
 
 // upstream: intel_huc.c intel_huc_wait_for_auth_complete()
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_huc_wait_for_auth_complete(
     huc: *mut IntelHuc,
     auth_type: IntelHucAuthenticationType,
@@ -620,7 +633,7 @@ pub unsafe extern "C" fn intel_huc_wait_for_auth_complete(
 }
 
 // upstream: intel_huc.c intel_huc_auth()
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_huc_auth(
     huc: *mut IntelHuc,
     auth_type: IntelHucAuthenticationType,
@@ -669,7 +682,7 @@ pub unsafe extern "C" fn intel_huc_auth(
 }
 
 // upstream: intel_huc.c intel_huc_is_authenticated()
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_huc_is_authenticated(
     huc: *mut IntelHuc,
     auth_type: IntelHucAuthenticationType,
@@ -697,7 +710,7 @@ unsafe fn huc_is_fully_authenticated(huc: *mut IntelHuc) -> bool {
 }
 
 // upstream: intel_huc.c intel_huc_check_status()
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_huc_check_status(huc: *mut IntelHuc) -> i32 {
     let fw = unsafe { ptr::addr_of!((*huc).fw) };
     match unsafe { __intel_uc_fw_status(fw) } {
@@ -731,7 +744,7 @@ unsafe fn huc_has_delayed_load(huc: *mut IntelHuc) -> bool {
 }
 
 // upstream: intel_huc.c intel_huc_update_auth_status()
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_huc_update_auth_status(huc: *mut IntelHuc) {
     let fw = unsafe { ptr::addr_of_mut!((*huc).fw) };
     if !unsafe { intel_uc_fw_is_loadable(fw) } || !unsafe { (*fw).has_gsc_headers } {
@@ -745,7 +758,7 @@ pub unsafe extern "C" fn intel_huc_update_auth_status(huc: *mut IntelHuc) {
 }
 
 // upstream: intel_huc.c intel_huc_load_status()
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_huc_load_status(huc: *mut IntelHuc, printer: *mut DrmPrinter) {
     let gt = unsafe { huc_to_gt(huc) };
     if !unsafe { intel_huc_is_supported(huc) } {
