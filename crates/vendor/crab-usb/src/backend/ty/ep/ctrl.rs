@@ -71,14 +71,10 @@ impl EndpointHandle {
             .get_descriptor(DescriptorType::DEVICE, 0, 0, &mut buff)
             .await?;
         if actual != buff.len() {
-            return Err(anyhow!(
-                "short device descriptor: expected {} bytes, got {actual}",
-                buff.len()
-            )
-            .into());
+            return Err(USBError::InvalidParameter);
         }
         trace!("data: {buff:?}");
-        let desc = DeviceDescriptor::parse(&buff).ok_or(anyhow!("device descriptor parse err"))?;
+        let desc = DeviceDescriptor::parse(&buff).ok_or(USBError::InvalidParameter)?;
 
         Ok(desc)
     }
@@ -104,16 +100,26 @@ impl EndpointHandle {
         index: u8,
     ) -> Result<ConfigurationDescriptor, USBError> {
         let mut header = alloc::vec![0u8; ConfigurationDescriptor::LEN];
-        self.get_descriptor(DescriptorType::CONFIGURATION, index, 0, &mut header)
+        let actual = self
+            .get_descriptor(DescriptorType::CONFIGURATION, index, 0, &mut header)
             .await?;
+        if actual != header.len() {
+            return Err(USBError::InvalidParameter);
+        }
 
         let total_length = u16::from_le_bytes(header[2..4].try_into().unwrap()) as usize;
+        if total_length < ConfigurationDescriptor::LEN {
+            return Err(USBError::InvalidParameter);
+        }
         let mut full_data = alloc::vec![0u8; total_length];
         debug!("Reading configuration descriptor for index {index}, total length: {total_length}");
-        self.get_descriptor(DescriptorType::CONFIGURATION, index, 0, &mut full_data)
+        let actual = self
+            .get_descriptor(DescriptorType::CONFIGURATION, index, 0, &mut full_data)
             .await?;
+        if actual != total_length {
+            return Err(USBError::InvalidParameter);
+        }
 
-        ConfigurationDescriptor::parse(&full_data)
-            .ok_or_else(|| anyhow!("config descriptor parse err").into())
+        ConfigurationDescriptor::parse(&full_data).ok_or(USBError::InvalidParameter)
     }
 }

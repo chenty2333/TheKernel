@@ -85,7 +85,29 @@ impl Device {
             if is_64 { "64-bit" } else { "32-bit" }
         );
         let dma = host.kernel.clone();
-        let ctx = host.dev_mut()?.new_ctx(slot_id, is_64, &dma)?;
+        let context = match host
+            .dev_mut()
+            .and_then(|contexts| contexts.new_ctx(slot_id, is_64, &dma))
+        {
+            Ok(context) => context,
+            Err(error) => {
+                // Enable Slot has already reserved this hardware slot. If
+                // context allocation failed before Address Device, release it
+                // so one bad USB port cannot consume every remaining slot.
+                if host
+                    .cmd_request(command::Allowed::DisableSlot(
+                        *command::DisableSlot::default().set_slot_id(slot_id.into()),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    warn!("xhci: failed to release uninitialized slot {slot_id}");
+                    return Err(USBError::InterfaceBroken);
+                }
+                return Err(error);
+            }
+        };
+        let ctx = context;
         let bell = host.new_slot_bell(slot_id);
         let bell = Arc::new(Mutex::new(bell));
         // let port_speed = host.port_speed(port);
@@ -382,14 +404,15 @@ impl Device {
             .get_descriptor(DescriptorType::DEVICE, 0, 0, data.as_mut_slice())
             .await?;
         if actual != data.len() {
-            return Err(anyhow!(
-                "short device descriptor header: expected {} bytes, got {actual}",
-                data.len()
-            )
-            .into());
+            return Err(USBError::InvalidParameter);
         }
 
         let desc = unsafe { (data.as_ptr() as *const DeviceDescriptorBase).read_unaligned() };
+        if desc.length != DeviceDescriptor::LEN as u8
+            || desc.descriptor_type != DescriptorType::DEVICE.0
+        {
+            return Err(USBError::InvalidParameter);
+        }
 
         Ok(desc)
     }
@@ -637,7 +660,7 @@ impl Device {
         Ok(())
     }
 
-    async fn _disconnect(&mut self) -> Result {
+    pub(super) async fn _disconnect(&mut self) -> Result {
         let mut old_endpoints = self.eps.clone();
         if let Some(control) = &self.ctrl_ep {
             old_endpoints.insert(0, control.clone());

@@ -38,6 +38,7 @@ impl PortChangeWaker {
                 change_waker: AtomicWaker::new(),
                 changed: AtomicBool::new(false),
                 state: PortState::Uninit,
+                retry_attempts: 0,
             });
         }
         Self {
@@ -66,6 +67,7 @@ pub struct Port {
     change_waker: AtomicWaker,
     changed: AtomicBool,
     state: PortState,
+    retry_attempts: u8,
 }
 
 /// xHCI Root Hub
@@ -261,6 +263,16 @@ mod tests {
             [PortEvent::Connected(change)] if change.root_port_id == 1
         ));
 
+        TEST_KERNEL.reset_remaining.store(50, Ordering::Relaxed);
+        let retry = block_on_ready(hub.retry_connected_port(1)).unwrap();
+        assert!(matches!(retry, Some(change) if change.root_port_id == 1));
+        assert_eq!(TEST_KERNEL.reset_waits.load(Ordering::Relaxed), 100);
+        assert!(
+            block_on_ready(hub.retry_connected_port(1))
+                .unwrap()
+                .is_none()
+        );
+
         TEST_KERNEL.portsc.store(0, Ordering::Release);
     }
 }
@@ -268,6 +280,13 @@ mod tests {
 impl HubOp for XhciRootHub {
     fn changed_ports(&mut self) -> BoxFuture<'_, Result<Vec<PortEvent>, USBError>> {
         self._changed_ports().boxed()
+    }
+
+    fn retry_connected_port(
+        &mut self,
+        port_id: u8,
+    ) -> BoxFuture<'_, Result<Option<PortChangeInfo>, USBError>> {
+        self._retry_connected_port(port_id).boxed()
     }
 
     fn init(&mut self, info: HubInfo) -> BoxFuture<'_, Result<HubInfo, USBError>> {
@@ -396,6 +415,68 @@ impl XhciRootHub {
         Ok(events)
     }
 
+    async fn _retry_connected_port(
+        &mut self,
+        port_id: u8,
+    ) -> Result<Option<PortChangeInfo>, USBError> {
+        let Some(index) = port_id.checked_sub(1).map(usize::from) else {
+            return Err(USBError::InvalidParameter);
+        };
+        if index >= self.portsc.len() {
+            return Err(USBError::InvalidParameter);
+        }
+        if self.ports()[index].state != PortState::Probed || self.ports()[index].retry_attempts != 0
+        {
+            return Ok(None);
+        }
+
+        let before = self.portsc.read_volatile_at(index);
+        if !before.current_connect_status() {
+            return Ok(None);
+        }
+        self.ports_mut()[index].retry_attempts = 1;
+        let warm_reset = matches!(before.port_speed(), 4 | 5);
+        self.portsc.update_volatile_at(index, |portsc| {
+            portsc.set_0_port_enabled_disabled();
+            if warm_reset {
+                // USB 3.x recovery uses WPR; initial enumeration above uses
+                // the normal PR signal. Do not conflate the two controls.
+                portsc.set_warm_port_reset();
+            } else {
+                portsc.set_port_reset();
+            }
+        });
+
+        for _ in 0..PORT_RESET_POLLS {
+            let status = self.portsc.read_volatile_at(index);
+            let reset_active = if warm_reset {
+                status.warm_port_reset()
+            } else {
+                status.port_reset()
+            };
+            if !reset_active {
+                if status.current_connect_status() && status.port_enabled_disabled() {
+                    info!("xhci: port {port_id} recovered after one bounded reset retry");
+                    return Ok(Some(PortChangeInfo {
+                        root_port_id: port_id,
+                        port_id,
+                        port_speed: Speed::from_xhci_portsc(status.port_speed()),
+                    }));
+                }
+                warn!(
+                    "xhci: port {port_id} retry reset completed without an enabled device \
+                     PORTSC={status:?}"
+                );
+                return Ok(None);
+            }
+            self.kernel.delay(PORT_RESET_POLL);
+        }
+
+        let status = self.portsc.read_volatile_at(index);
+        warn!("xhci: port {port_id} bounded retry reset timed out PORTSC={status:?}");
+        Ok(None)
+    }
+
     fn handle_disconnected(&mut self) -> Vec<PortEvent> {
         let disconnected = self
             .ports()
@@ -408,7 +489,9 @@ impl XhciRootHub {
             })
             .collect::<Vec<_>>();
         for port_id in &disconnected {
-            self.ports_mut()[usize::from(*port_id - 1)].state = PortState::Uninit;
+            let port = &mut self.ports_mut()[usize::from(*port_id - 1)];
+            port.state = PortState::Uninit;
+            port.retry_attempts = 0;
         }
         disconnected
             .into_iter()

@@ -199,7 +199,20 @@ impl Xhci {
 
     async fn new_device(&mut self, info: DeviceAddressInfo) -> Result<Box<dyn DeviceOp>> {
         let mut device = Device::new(self).await?;
-        device.init(self, &info).await?;
+        if let Err(error) = device.init(self, &info).await {
+            // Device initialization may fail after Address Device has made
+            // its contexts visible to the controller. Quiesce and disable
+            // the slot before Core attempts the one allowed port retry.
+            if let Err(cleanup_error) = device._disconnect().await {
+                warn!(
+                    "xhci: failed to clean up slot {} after enumeration error ({error:?}): {cleanup_error:?}; retaining DMA-owned state",
+                    device.id()
+                );
+                core::mem::forget(device);
+                return Err(USBError::InterfaceBroken);
+            }
+            return Err(error);
+        }
 
         Ok(Box::new(device))
     }

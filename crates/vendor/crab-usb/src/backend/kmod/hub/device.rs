@@ -8,7 +8,7 @@ use core::time::Duration;
 use futures::{FutureExt, future::BoxFuture};
 use usb_if::{
     descriptor::{Class, ConfigurationDescriptor, DeviceDescriptor, EndpointType},
-    err::USBError,
+    err::{TransferError, USBError},
     host::{
         ControlSetup,
         hub::{HubDescriptor, PortFeature, PortStatus, PortStatusChange, Speed},
@@ -76,6 +76,80 @@ pub struct HubSettings {
     pub config_value: u8,
     pub interface_number: u8,
     pub alt_setting: u8,
+}
+
+fn parse_hub_descriptor(data: &[u8], superspeed: bool) -> Result<HubDescriptor, USBError> {
+    let descriptor_type = if superspeed { 0x2a } else { 0x29 };
+    if data.len() < 7 || data[0] as usize != data.len() || data[1] != descriptor_type {
+        return Err(USBError::InvalidParameter);
+    }
+    let length = data[0] as usize;
+    let ports = data[2] as usize;
+    if ports == 0 {
+        return Err(USBError::InvalidParameter);
+    }
+    let min_length = if superspeed {
+        12
+    } else {
+        // USB 2 hub descriptors carry two bitmaps with one bit per port plus
+        // the hub bit. Round the bitmap length up before multiplying by two.
+        7 + 2 * ((ports + 8) / 8)
+    };
+    if length < min_length {
+        return Err(USBError::InvalidParameter);
+    }
+
+    // HubDescriptor contains the largest (SuperSpeed) union tail. USB 2 hub
+    // descriptors can be shorter; pad the owned bytes before reading the
+    // packed value so malformed device lengths never create an out-of-bounds
+    // reference into the descriptor buffer.
+    let mut storage = [0; core::mem::size_of::<HubDescriptor>()];
+    let copy_len = length.min(storage.len());
+    storage[..copy_len].copy_from_slice(&data[..copy_len]);
+    // SAFETY: the fixed-size, zero-padded storage covers the complete packed
+    // HubDescriptor and the descriptor header/length were validated above.
+    Ok(unsafe { core::ptr::read_unaligned(storage.as_ptr().cast::<HubDescriptor>()) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_hub_descriptor;
+    use usb_if::err::USBError;
+
+    #[test]
+    fn hub_descriptor_parser_checks_lengths_and_usb2_port_bitmaps() {
+        // Eight ports require two bitmap bytes each (ports plus hub bit).
+        let valid_usb2 = [11, 0x29, 8, 0, 0, 1, 0, 0, 0, 0, 0];
+        let descriptor = parse_hub_descriptor(&valid_usb2, false).unwrap();
+        assert_eq!(descriptor.bNbrPorts, 8);
+
+        // Sixteen ports cross the bitmap byte boundary and require 13 bytes.
+        let truncated_bitmap = [11, 0x29, 16, 0, 0, 1, 0, 0, 0, 0, 0];
+        assert!(matches!(
+            parse_hub_descriptor(&truncated_bitmap, false),
+            Err(USBError::InvalidParameter)
+        ));
+        let valid_sixteen_port = [13, 0x29, 16, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+        assert!(parse_hub_descriptor(&valid_sixteen_port, false).is_ok());
+    }
+
+    #[test]
+    fn hub_descriptor_parser_rejects_wrong_type_zero_ports_and_truncation() {
+        for malformed in [
+            &[7, 0x2a, 1, 0, 0, 1, 0][..],
+            &[7, 0x29, 0, 0, 0, 1, 0][..],
+            &[8, 0x29, 1, 0, 0, 1, 0][..],
+            &[12, 0x2a, 1, 0, 0, 1, 0, 0, 0, 0, 0][..],
+        ] {
+            assert!(matches!(
+                parse_hub_descriptor(malformed, malformed[1] == 0x2a),
+                Err(USBError::InvalidParameter)
+            ));
+        }
+
+        let valid_usb3 = [12, 0x2a, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(parse_hub_descriptor(&valid_usb3, true).is_ok());
+    }
 }
 
 impl HubOp for HubDevice {
@@ -376,19 +450,25 @@ impl HubDevice {
     /// 获取 Hub 描述符（参考 Linux 内核实现）
     async fn get_hub_descriptor(&mut self) -> Result<HubDescriptor, USBError> {
         let mut buff = vec![0u8; 4]; // Hub 描述符最小长度
-        self.read_hub_descriptor_raw(&mut buff).await?;
+        if self.read_hub_descriptor_raw(&mut buff).await? != buff.len() {
+            return Err(USBError::InvalidParameter);
+        }
         let desc_len = buff[0] as usize;
         trace!("Hub descriptor length from initial read: {}", desc_len);
+        if desc_len < 7 {
+            return Err(USBError::InvalidParameter);
+        }
 
         let mut full_buff = vec![0u8; desc_len];
 
-        self.read_hub_descriptor_raw(&mut full_buff).await?;
+        if self.read_hub_descriptor_raw(&mut full_buff).await? != full_buff.len() {
+            return Err(USBError::InvalidParameter);
+        }
 
-        let desc = unsafe { (full_buff.as_ptr() as *const HubDescriptor).read_unaligned() };
-        Ok(desc)
+        parse_hub_descriptor(&full_buff, self.is_superspeed())
     }
 
-    async fn read_hub_descriptor_raw(&mut self, buff: &mut [u8]) -> Result<(), USBError> {
+    async fn read_hub_descriptor_raw(&mut self, buff: &mut [u8]) -> Result<usize, USBError> {
         const DT_SS_HUB: u16 = 0x0a;
         const DT_HUB: u16 = 0x9;
         const TYPE_CLASS: u16 = 1 << 5;
@@ -416,7 +496,7 @@ impl HubDevice {
             .await?;
         trace!("Hub raw descriptor read {n} bytes");
 
-        Ok(())
+        Ok(n)
     }
 
     async fn hub_power_on(&mut self) -> Result<(), USBError> {
@@ -705,7 +785,7 @@ impl HubDevice {
         // 阶段 1: 防抖动检测（确保连接稳定）
         let stable_status = self.debounce_port(port_id, true).await?;
         if !stable_status.connected {
-            return Err(USBError::from("Connection unstable"));
+            return Err(USBError::TransferError(TransferError::Disconnected));
         }
 
         // 阶段 2: 端口复位
@@ -744,7 +824,7 @@ impl HubDevice {
             }
 
             if !status.connected {
-                return Err(USBError::from("Device disconnected during enable wait"));
+                return Err(USBError::TransferError(TransferError::Disconnected));
             }
 
             self.kernel.delay(Duration::from_millis(CHECK_INTERVAL_MS));

@@ -20,6 +20,14 @@ impl HubId {
 pub trait HubOp: Send + 'static + Any {
     fn init<'a>(&'a mut self, info: HubInfo) -> BoxFuture<'a, Result<HubInfo, USBError>>;
     fn changed_ports<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<PortEvent>, USBError>>;
+    /// Reset one still-connected port once after a recoverable enumeration
+    /// failure. Backends without a safe per-port reset leave it unsupported.
+    fn retry_connected_port<'a>(
+        &'a mut self,
+        _port_id: u8,
+    ) -> BoxFuture<'a, Result<Option<PortChangeInfo>, USBError>> {
+        Box::pin(async { Ok(None) })
+    }
     fn disconnect(&mut self) -> BoxFuture<'_, Result<(), USBError>> {
         Box::pin(async { Ok(()) })
     }

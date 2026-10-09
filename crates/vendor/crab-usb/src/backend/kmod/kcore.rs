@@ -7,7 +7,7 @@ use futures::{
 };
 use usb_if::{
     descriptor::{ConfigurationDescriptor, DeviceDescriptor},
-    err::USBError,
+    err::{TransferError, USBError},
 };
 
 use super::osal::Kernel;
@@ -66,6 +66,44 @@ struct TopologyDevice {
     child_hub: Option<HubId>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PortProbeFailure {
+    RetryOnce,
+    Isolate,
+    Fatal,
+}
+
+fn classify_port_probe_failure(error: &USBError) -> PortProbeFailure {
+    match error {
+        USBError::Timeout
+        | USBError::TransferError(
+            TransferError::Stall
+            | TransferError::Timeout
+            | TransferError::NoDevice
+            | TransferError::Disconnected
+            | TransferError::Cancelled,
+        ) => PortProbeFailure::RetryOnce,
+        USBError::InvalidParameter
+        | USBError::NotSupported
+        | USBError::TransferError(
+            TransferError::NotSupported
+            | TransferError::InvalidEndpoint
+            | TransferError::QueueFull
+            | TransferError::EndpointRevoked,
+        ) => PortProbeFailure::Isolate,
+        // These signal lost controller/topology state, resource exhaustion,
+        // or an opaque command failure. Do not hide them as bad peripherals.
+        USBError::NoMemory
+        | USBError::NotInitialized
+        | USBError::NotFound
+        | USBError::SlotLimitReached
+        | USBError::ConfigurationNotSet
+        | USBError::InterfaceBroken
+        | USBError::Other(_)
+        | USBError::TransferError(TransferError::Other(_)) => PortProbeFailure::Fatal,
+    }
+}
+
 impl Core {
     pub(crate) fn new(backend: impl CoreOp) -> Self {
         Self {
@@ -110,9 +148,12 @@ impl Core {
             for event in events {
                 match event {
                     PortEvent::Connected(info) => {
-                        let (device, added_hub) = self.connect_port(id, info).await?;
-                        connected.push(device);
-                        is_have_new_hub |= added_hub;
+                        if let Some((device, added_hub)) =
+                            self.connect_port_with_retry(id, info).await?
+                        {
+                            connected.push(device);
+                            is_have_new_hub |= added_hub;
+                        }
                     }
                     PortEvent::Disconnected { port_id } => {
                         disconnected.extend(self.disconnect_port(id, port_id).await?);
@@ -128,6 +169,69 @@ impl Core {
                 disconnected,
             },
         ))
+    }
+
+    async fn connect_port_with_retry(
+        &mut self,
+        parent_hub: HubId,
+        address: PortChangeInfo,
+    ) -> Result<Option<(ProbedDeviceInfoOp, bool)>, USBError> {
+        match self.connect_port(parent_hub, address.clone()).await {
+            Ok(result) => return Ok(Some(result)),
+            Err(error) => match classify_port_probe_failure(&error) {
+                PortProbeFailure::Fatal => return Err(error),
+                PortProbeFailure::Isolate => {
+                    warn!(
+                        "usb: ignoring unsupported/invalid device on hub {parent_hub:?} port {}: \
+                         {error:?}",
+                        address.port_id
+                    );
+                    return Ok(None);
+                }
+                PortProbeFailure::RetryOnce => {
+                    warn!(
+                        "usb: hub {parent_hub:?} port {} enumeration failed ({error:?}); \
+                         requesting one bounded port reset retry",
+                        address.port_id
+                    );
+                }
+            },
+        }
+
+        let Some(retry_address) = self
+            .retry_connected_port(parent_hub, address.port_id)
+            .await?
+        else {
+            warn!(
+                "usb: hub {parent_hub:?} port {} has no safe reset retry; continuing with other \
+                 ports",
+                address.port_id
+            );
+            return Ok(None);
+        };
+        match self.connect_port(parent_hub, retry_address).await {
+            Ok(result) => Ok(Some(result)),
+            Err(error) => match classify_port_probe_failure(&error) {
+                PortProbeFailure::Fatal => Err(error),
+                PortProbeFailure::RetryOnce | PortProbeFailure::Isolate => {
+                    warn!(
+                        "usb: hub {parent_hub:?} port {} still failed after its single reset \
+                         retry ({error:?}); continuing with other ports",
+                        address.port_id
+                    );
+                    Ok(None)
+                }
+            },
+        }
+    }
+
+    async fn retry_connected_port(
+        &mut self,
+        parent_hub: HubId,
+        port_id: u8,
+    ) -> Result<Option<PortChangeInfo>, USBError> {
+        let hub = self.hubs.get_mut(&parent_hub).ok_or(USBError::NotFound)?;
+        hub.backend.retry_connected_port(port_id).await
     }
 
     async fn connect_port(
@@ -159,15 +263,24 @@ impl Core {
         let mut depth = 1usize;
         let mut parent = parent_hub;
         let location = loop {
-            let Some(hub) = self.hubs.get(&parent) else { break None; };
+            let Some(hub) = self.hubs.get(&parent) else {
+                break None;
+            };
             let Some(next) = hub.info.parent else {
                 ports[..depth].reverse();
-                break device.usb_address().map(|usb_address| crate::device::ObservedLocation {
-                    address: usb_address, ports, depth: depth as u8,
-                    speed: address.port_speed, configuration: device.selected_configuration(),
-                });
+                break device
+                    .usb_address()
+                    .map(|usb_address| crate::device::ObservedLocation {
+                        address: usb_address,
+                        ports,
+                        depth: depth as u8,
+                        speed: address.port_speed,
+                        configuration: device.selected_configuration(),
+                    });
             };
-            if depth == ports.len() { break None; }
+            if depth == ports.len() {
+                break None;
+            }
             ports[depth] = hub.info.port_id;
             depth += 1;
             parent = next;
@@ -193,7 +306,20 @@ impl Core {
                 address.port_id,
                 Some(parent_hub),
             );
-            hub.info = hub.backend.init(hub.info.clone()).await?;
+            hub.info = match hub.backend.init(hub.info.clone()).await {
+                Ok(info) => info,
+                Err(error) => {
+                    if let Err(cleanup_error) = hub.backend.disconnect().await {
+                        warn!(
+                            "usb: failed to quiesce hub on {parent_hub:?}:{} after init error ({error:?}): {cleanup_error:?}; retaining DMA-owned state",
+                            address.port_id
+                        );
+                        core::mem::forget(hub);
+                        return Err(USBError::InterfaceBroken);
+                    }
+                    return Err(error);
+                }
+            };
             let hub_id = self.allocate_hub_id();
             self.hubs.insert(hub_id, hub);
             self.topology.insert(
@@ -208,7 +334,9 @@ impl Core {
                 address.port_id
             );
             Ok((
-                ProbedDeviceInfoOp::Hub(Box::new(DeviceInfo::new(device_id, desc, &configs, location))),
+                ProbedDeviceInfoOp::Hub(Box::new(DeviceInfo::new(
+                    device_id, desc, &configs, location,
+                ))),
                 true,
             ))
         } else {
@@ -221,7 +349,9 @@ impl Core {
                 },
             );
             Ok((
-                ProbedDeviceInfoOp::Device(Box::new(DeviceInfo::new(device_id, desc, &configs, location))),
+                ProbedDeviceInfoOp::Device(Box::new(DeviceInfo::new(
+                    device_id, desc, &configs, location,
+                ))),
                 false,
             ))
         }
@@ -351,7 +481,12 @@ pub struct DeviceInfo {
 }
 
 impl DeviceInfo {
-    pub fn new(id: usize, desc: DeviceDescriptor, config_desc: &[ConfigurationDescriptor], location: Option<crate::device::ObservedLocation>) -> Self {
+    pub fn new(
+        id: usize,
+        desc: DeviceDescriptor,
+        config_desc: &[ConfigurationDescriptor],
+        location: Option<crate::device::ObservedLocation>,
+    ) -> Self {
         Self {
             location,
             id,
@@ -380,5 +515,322 @@ impl DeviceInfoOp for DeviceInfo {
 
     fn configuration_descriptors(&self) -> &[ConfigurationDescriptor] {
         &self.config_desc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec, vec::Vec};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::FutureExt;
+    use usb_if::{
+        descriptor::{
+            ConfigurationDescriptor, DeviceDescriptor, EndpointDescriptor, EndpointType,
+            InterfaceDescriptor, InterfaceDescriptors,
+        },
+        err::TransferError,
+        host::hub::Speed,
+        transfer::Direction,
+    };
+
+    use super::*;
+    use crate::{
+        backend::{
+            kmod::CoreOp,
+            ty::{
+                DeviceOp, Event, EventHandlerOp, HubParams, ProbeChangesOp, ProbedDeviceInfoOp,
+                ep::EndpointHandle,
+            },
+        },
+        osal::Kernel,
+    };
+
+    #[derive(Clone, Copy)]
+    enum BadPortResult {
+        Stall,
+        NoMemory,
+        InterfaceBroken,
+    }
+
+    #[derive(Default)]
+    struct ProbeCounts {
+        bad_port: AtomicUsize,
+        keyboard_port: AtomicUsize,
+        retries: AtomicUsize,
+    }
+
+    struct FakeHub {
+        events: Vec<PortEvent>,
+        retries: Arc<ProbeCounts>,
+    }
+
+    impl HubOp for FakeHub {
+        fn init<'a>(&'a mut self, info: HubInfo) -> BoxFuture<'a, Result<HubInfo, USBError>> {
+            async move { Ok(info) }.boxed()
+        }
+
+        fn changed_ports<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<PortEvent>, USBError>> {
+            async move { Ok(core::mem::take(&mut self.events)) }.boxed()
+        }
+
+        fn retry_connected_port<'a>(
+            &'a mut self,
+            port_id: u8,
+        ) -> BoxFuture<'a, Result<Option<PortChangeInfo>, USBError>> {
+            async move {
+                if port_id == 1 && self.retries.retries.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Ok(Some(port(1)))
+                } else {
+                    Ok(None)
+                }
+            }
+            .boxed()
+        }
+
+        fn slot_id(&self) -> u8 {
+            0
+        }
+    }
+
+    struct FakeCoreBackend {
+        events: Vec<PortEvent>,
+        counts: Arc<ProbeCounts>,
+        bad_result: BadPortResult,
+    }
+
+    impl CoreOp for FakeCoreBackend {
+        fn init<'a>(&'a mut self) -> BoxFuture<'a, Result<(), USBError>> {
+            async { Ok(()) }.boxed()
+        }
+
+        fn root_hub(&mut self) -> Box<dyn HubOp> {
+            Box::new(FakeHub {
+                events: core::mem::take(&mut self.events),
+                retries: self.counts.clone(),
+            })
+        }
+
+        fn new_addressed_device<'a>(
+            &'a mut self,
+            address: DeviceAddressInfo,
+        ) -> BoxFuture<'a, Result<Box<dyn DeviceOp>, USBError>> {
+            let counts = self.counts.clone();
+            let bad_result = self.bad_result;
+            async move {
+                if address.port_id == 1 {
+                    counts.bad_port.fetch_add(1, Ordering::Relaxed);
+                    return Err(match bad_result {
+                        BadPortResult::Stall => USBError::TransferError(TransferError::Stall),
+                        BadPortResult::NoMemory => USBError::NoMemory,
+                        BadPortResult::InterfaceBroken => USBError::InterfaceBroken,
+                    });
+                }
+                counts.keyboard_port.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(FakeDevice::new()) as Box<dyn DeviceOp>)
+            }
+            .boxed()
+        }
+
+        fn create_event_handler(&mut self) -> Box<dyn EventHandlerOp> {
+            Box::new(FakeEventHandler)
+        }
+
+        fn kernel(&self) -> &Kernel {
+            panic!("the non-hub enumeration test must not request a DMA kernel")
+        }
+    }
+
+    struct FakeEventHandler;
+
+    impl EventHandlerOp for FakeEventHandler {
+        fn handle_event(&self) -> Event {
+            Event::Nothing
+        }
+    }
+
+    struct FakeDevice {
+        descriptor: DeviceDescriptor,
+        configurations: Vec<ConfigurationDescriptor>,
+    }
+
+    impl FakeDevice {
+        fn new() -> Self {
+            let descriptor = DeviceDescriptor::parse(&[
+                18, 1, 0x00, 0x02, 0, 0, 0, 8, 0x34, 0x12, 0x78, 0x56, 0x00, 0x01, 0, 0, 0, 1,
+            ])
+            .unwrap();
+            let keyboard = InterfaceDescriptor {
+                interface_number: 0,
+                alternate_setting: 0,
+                class: 3,
+                subclass: 1,
+                protocol: 1,
+                string_index: None,
+                string: None,
+                num_endpoints: 1,
+                endpoints: vec![EndpointDescriptor {
+                    address: 0x81,
+                    max_packet_size: 8,
+                    transfer_type: EndpointType::Interrupt,
+                    direction: Direction::In,
+                    packets_per_microframe: 1,
+                    interval: 10,
+                }],
+            };
+            let configuration = ConfigurationDescriptor {
+                num_interfaces: 1,
+                configuration_value: 1,
+                attributes: 0x80,
+                max_power: 50,
+                string_index: None,
+                string: None,
+                interfaces: vec![InterfaceDescriptors {
+                    interface_number: 0,
+                    alt_settings: vec![keyboard],
+                }],
+                raw: Vec::new(),
+            };
+            Self {
+                descriptor,
+                configurations: vec![configuration],
+            }
+        }
+    }
+
+    impl DeviceOp for FakeDevice {
+        fn id(&self) -> usize {
+            1
+        }
+
+        fn backend_name(&self) -> &str {
+            "test"
+        }
+
+        fn descriptor(&self) -> &DeviceDescriptor {
+            &self.descriptor
+        }
+
+        fn configuration_descriptors(&self) -> &[ConfigurationDescriptor] {
+            &self.configurations
+        }
+
+        fn ctrl_ep_ref(&self) -> &EndpointHandle {
+            panic!("no control endpoint is used after fake device initialization")
+        }
+
+        fn ctrl_ep_mut(&mut self) -> &mut EndpointHandle {
+            panic!("no control endpoint is used after fake device initialization")
+        }
+
+        fn claim_interface<'a>(
+            &'a mut self,
+            _: u8,
+            _: u8,
+        ) -> BoxFuture<'a, Result<BTreeMap<u8, EndpointHandle>, USBError>> {
+            async { Err(USBError::NotSupported) }.boxed()
+        }
+
+        fn release_interface<'a>(&'a mut self, _: u8) -> BoxFuture<'a, Result<(), USBError>> {
+            async { Ok(()) }.boxed()
+        }
+
+        fn set_configuration<'a>(&'a mut self, _: u8) -> BoxFuture<'a, Result<(), USBError>> {
+            async { Ok(()) }.boxed()
+        }
+
+        fn disconnect(&mut self) -> BoxFuture<'_, Result<(), USBError>> {
+            async { Ok(()) }.boxed()
+        }
+
+        fn update_hub(&mut self, _: HubParams) -> BoxFuture<'_, Result<(), USBError>> {
+            async { Err(USBError::NotSupported) }.boxed()
+        }
+    }
+
+    fn port(port_id: u8) -> PortChangeInfo {
+        PortChangeInfo {
+            root_port_id: port_id,
+            port_id,
+            port_speed: Speed::High,
+        }
+    }
+
+    fn probe(
+        events: Vec<PortEvent>,
+        bad_result: BadPortResult,
+    ) -> (Result<ProbeChangesOp, USBError>, Arc<ProbeCounts>) {
+        let counts = Arc::new(ProbeCounts::default());
+        let backend = FakeCoreBackend {
+            events,
+            counts: counts.clone(),
+            bad_result,
+        };
+        let mut core = Core::new(backend);
+        block_on_ready(BackendOp::init(&mut core)).unwrap();
+        (block_on_ready(BackendOp::device_list(&mut core)), counts)
+    }
+
+    fn block_on_ready<F: core::future::Future>(future: F) -> F::Output {
+        use core::{
+            pin::pin,
+            task::{Context, Poll, Waker},
+        };
+        let mut future = pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("USB core test future unexpectedly pending"),
+        }
+    }
+
+    #[test]
+    fn bad_usb_port_gets_one_reset_retry_without_suppressing_keyboard_ports() {
+        for events in [
+            vec![PortEvent::Connected(port(1)), PortEvent::Connected(port(2))],
+            vec![PortEvent::Connected(port(2)), PortEvent::Connected(port(1))],
+        ] {
+            let (changes, counts) = probe(events, BadPortResult::Stall);
+            let changes = changes.unwrap();
+            assert_eq!(changes.connected.len(), 1);
+            let ProbedDeviceInfoOp::Device(keyboard) = &changes.connected[0] else {
+                panic!("expected the healthy keyboard port to be reported as a device");
+            };
+            assert!(
+                keyboard
+                    .configuration_descriptors()
+                    .iter()
+                    .flat_map(|configuration| &configuration.interfaces)
+                    .flat_map(|interface| &interface.alt_settings)
+                    .any(|interface| interface.class == 3
+                        && interface.subclass == 1
+                        && interface.protocol == 1)
+            );
+            assert_eq!(counts.bad_port.load(Ordering::Relaxed), 2);
+            assert_eq!(counts.keyboard_port.load(Ordering::Relaxed), 1);
+            assert_eq!(counts.retries.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn global_resource_or_controller_failures_are_not_hidden_as_bad_ports() {
+        for (bad_result, expected) in [
+            (BadPortResult::NoMemory, USBError::NoMemory),
+            (BadPortResult::InterfaceBroken, USBError::InterfaceBroken),
+        ] {
+            let (changes, counts) = probe(
+                vec![PortEvent::Connected(port(1)), PortEvent::Connected(port(2))],
+                bad_result,
+            );
+
+            assert!(matches!(
+                (changes, expected),
+                (Err(USBError::NoMemory), USBError::NoMemory)
+                    | (Err(USBError::InterfaceBroken), USBError::InterfaceBroken)
+            ));
+            assert_eq!(counts.bad_port.load(Ordering::Relaxed), 1);
+            assert_eq!(counts.keyboard_port.load(Ordering::Relaxed), 0);
+            assert_eq!(counts.retries.load(Ordering::Relaxed), 0);
+        }
     }
 }
