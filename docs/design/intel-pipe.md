@@ -169,13 +169,15 @@ Four ordering details worth stating:
 | `PLANE_SURF(A,1)` | the GGTT address, `[31:12]` | §5.4; the parameter of `compute` |
 | `PIPE_MISC(A)` | `[7:5] = 0` (8 bpc), `[4:2] = 0` (dithering off), `[8] = 1` (pixel rounding truncated) | §8.4, §11 step 5.6, §4.7 |
 
-The concrete control/stride row above is the XRGB8888 worked example. The active
-Native primary path also supports linear RGB565 (`cpp=2`): the translated plane
-format field is `14 << 24`, source `adlp_plane_ctl_arb_slots()` returns zero
-for its two-byte pixel format, and the source watermark input uses `cpp=2`.
-At 1920 pixels the corresponding 64-byte-unit stride is 60 (3840 bytes).
-Both formats are surfaced through the Native `IN_FORMATS` blob with only the
-linear modifier; other pixel layouts remain refused.
+The concrete control/stride row above is the XRGB8888 worked example. The
+translated pipe planner and firmware readout can represent linear RGB565
+(`cpp=2`): its plane-format field is `14 << 24`, source
+`adlp_plane_ctl_arb_slots()` returns zero for the two-byte pixel format, and
+the source watermark input uses `cpp=2`. At 1920 pixels the corresponding
+64-byte-unit stride is 60 (3840 bytes). Native does not currently advertise
+RGB565: the shared ADDFB2/dumb-buffer path rejects 16-bpp surfaces, so userspace
+cannot create a framebuffer to exercise this lower-level programming path.
+Other pixel layouts remain refused as well.
 
 Three of these need more than a citation.
 
