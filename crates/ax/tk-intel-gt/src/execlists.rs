@@ -94,7 +94,9 @@ pub fn write_desc(
     port: u32,
 ) -> Result<(), Error> {
     if _ctrl_reg.is_some() {
-        let offset = port.checked_mul(2).ok_or(Error::Refused)?;
+        // Upstream submit_reg is u32 __iomem*: pointer steps are dwords,
+        // while GtIo takes byte offsets. Preserve the C port * 2 stride.
+        let offset = port.checked_mul(2 * 4).ok_or(Error::Refused)?;
         io.write(
             submit_reg.checked_add(offset).ok_or(Error::Refused)?,
             descriptor as u32,
@@ -102,7 +104,7 @@ pub fn write_desc(
         io.write(
             submit_reg
                 .checked_add(offset)
-                .and_then(|value| value.checked_add(1))
+                .and_then(|value| value.checked_add(4))
                 .ok_or(Error::Refused)?,
             (descriptor >> 32) as u32,
         )?;
@@ -171,10 +173,10 @@ mod tests {
         assert_eq!(
             *io.0.borrow(),
             [
-                (0x2512, 0),
-                (0x2513, 0),
+                (0x2518, 0),
+                (0x251c, 0),
                 (0x2510, 0x5566_7788),
-                (0x2511, 0x1122_3344),
+                (0x2514, 0x1122_3344),
                 (0x2550, EL_CTRL_LOAD),
             ]
         );

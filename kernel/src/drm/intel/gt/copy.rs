@@ -3138,6 +3138,34 @@ pub(in crate::drm::intel) mod tests {
             }
             Ok(page + (virtual_address & 4095))
         }
+        // HOST MODEL ONLY: encode the Gen12 CSB records that real hardware
+        // writes after ELSQ promotion/context completion (intel_engine.h HWS
+        // offsets and intel_execlists_submission.c gen12_csb_parse format).
+        // Keep the production CSB validator active: a scratch breadcrumb alone
+        // is not enough to retire a submitted context.
+        fn record_csb(&self) -> Result<(), Error> {
+            let idle = 0x7ffu64 << 15;
+            let context = ((self.memory.descriptor >> 37) & 0x7ff) << 15;
+            let mut entries = [0u64; 3];
+            entries[0] = context | 1 | (idle << 32); // new queue promotion
+            let count = if let Some(switch) = &self.memory.switch {
+                let next = ((switch.descriptor >> 37) & 0x7ff) << 15;
+                entries[1] = next | (context << 32);
+                entries[2] = idle | (next << 32);
+                3
+            } else {
+                entries[1] = idle | (context << 32);
+                2
+            };
+            for (index, entry) in entries[..count].iter().enumerate() {
+                self.memory
+                    .status
+                    .write(0x10 * 4 + index * 8, &entry.to_le_bytes())?;
+            }
+            self.memory
+                .status
+                .write(0x2f * 4, &((count - 1) as u32).to_le_bytes())
+        }
         fn switch_away(&self) -> Result<(), Error> {
             let Some(switch) = &self.memory.switch else {
                 return Ok(());
@@ -3299,6 +3327,7 @@ pub(in crate::drm::intel) mod tests {
             if [0x22550, 0x2550].contains(&r) && self.execute {
                 self.gpu()?;
                 self.switch_away()?;
+                self.record_csb()?;
             }
             if self.fail_write.get() == Some(self.log.borrow().len()) {
                 self.fail_write.set(None);

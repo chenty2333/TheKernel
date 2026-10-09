@@ -49,6 +49,11 @@ impl JobContext {
                 _ => return Err(AxError::InvalidInput),
             }
         };
+        // i915_gem_context_get_engine(): an explicit INVALID_NONE map slot
+        // is a null engine, so selecting it returns EINVAL (not ENOENT).
+        if packed == u16::MAX {
+            return Err(AxError::InvalidInput);
+        }
         let class = (packed & 0xff) as u8;
         let instance = (packed >> 8) as u8;
         if matches!(
@@ -673,7 +678,7 @@ mod tests {
         assert!(job.render_engine(0).unwrap());
         assert!(job.render_engine(1).unwrap());
         assert!(!job.render_engine(2).unwrap());
-        job.engines = Some(alloc::vec![0, (2 << 8) | 2, 3 << 8]);
+        job.engines = Some(alloc::vec![0, (2 << 8) | 2, 3]);
         assert_eq!(job.engine_target(0), Ok((0, 0)));
         assert_eq!(job.engine_target(1), Ok((2, 2)));
         assert_eq!(job.engine_target(2), Ok((3, 0)));

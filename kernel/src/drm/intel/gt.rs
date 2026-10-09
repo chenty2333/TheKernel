@@ -799,7 +799,12 @@ mod tests {
         assert_eq!(bus.read(intel_gt::uncore::GT_ACK), Ok(0));
         bus.awake.store(true, Ordering::Release);
         assert_eq!(bus.write(0x941c, 1), Err(Error::Refused));
-        assert_eq!(bus.write(0x941c, 8), Err(Error::Refused));
+        // GDRST GuC-domain reset is now owned by the firmware upload path.
+        bus.write(0x941c, intel_gt::reset::GUC_RESET_DOMAIN).unwrap();
+        assert_eq!(
+            bus.write(0x941c, intel_gt::reset::GUC_RESET_DOMAIN | 4),
+            Err(Error::Refused)
+        );
         assert_eq!(bus.write(0x46038, u32::MAX), Err(Error::Refused));
         assert_eq!(bus.write(0x941c, 2), Err(Error::Refused));
         assert_eq!(bus.write(0x2550, 1), Err(Error::Refused));
