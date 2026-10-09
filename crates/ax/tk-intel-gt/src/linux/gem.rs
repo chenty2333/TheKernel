@@ -57,6 +57,23 @@ pub unsafe fn drm_vma_node_reset(node: *mut DrmVmaOffsetNode) {
     unsafe { core::ptr::write_bytes(node, 0, 1) };
 }
 
+/// Linux `drm_vma_node_unmap()` header helper. Preserve private COW mappings
+/// when invalidating the DRM object's shared mapping (`even_cows = 1`).
+#[cfg(feature = "upstream-gt")]
+pub unsafe fn drm_vma_node_unmap(node: *mut DrmVmaOffsetNode, mapping: *mut c_void) {
+    let mm_node = unsafe { &(*node).vm_node };
+    if !mm_node.mm.is_null() {
+        unsafe {
+            unmap_mapping_range(
+                mapping,
+                drm_vma_node_offset_addr(node) as c_long,
+                (mm_node.size << crate::linux_config::PAGE_SHIFT) as c_long,
+                1,
+            );
+        }
+    }
+}
+
 /// Linux v7.2.3 `struct dma_resv` for CONFIG_PREEMPT_RT=n and LOCKDEP=n.
 #[repr(C)]
 pub struct DmaResv {
@@ -65,6 +82,12 @@ pub struct DmaResv {
 }
 
 unsafe extern "C" {
+    fn unmap_mapping_range(
+        mapping: *mut c_void,
+        holebegin: c_long,
+        holelen: c_long,
+        even_cows: i32,
+    );
     #[link_name = "dma_resv_fini"]
     fn __dma_resv_fini(resv: *mut DmaResv);
     #[link_name = "dma_resv_get_singleton"]
