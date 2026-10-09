@@ -467,6 +467,8 @@ pub fn intel_ddi_config_transcoder_dp2(io: &mut impl DdiIo, display: Platform, s
 // upstream: intel_ddi.c intel_ddi_transcoder_func_reg_val_get()
 pub fn intel_ddi_transcoder_func_reg_val_get(io: &mut impl DdiIo, encoder: &DdiEncoder, state: &CrtcState) -> u32 {
     const FUNC_ENABLE: u32 = 1 << 31;
+    const DRM_MODE_FLAG_PHSYNC: u32 = 1 << 0;
+    const DRM_MODE_FLAG_PVSYNC: u32 = 1 << 2;
     const BPC_6: u32 = 2 << 20; const BPC_8: u32 = 0 << 20; const BPC_10: u32 = 1 << 20; const BPC_12: u32 = 3 << 20;
     const MODE_HDMI: u32 = 0 << 24; const MODE_DVI: u32 = 1 << 24; const MODE_DP_SST: u32 = 2 << 24;
     const MODE_DP_MST: u32 = 3 << 24; const MODE_FDI_DP2: u32 = 4 << 24;
@@ -474,8 +476,8 @@ pub fn intel_ddi_transcoder_func_reg_val_get(io: &mut impl DdiIo, encoder: &DdiE
     if encoder.display.display_ver >= 12 { value |= ((encoder.port.index() as u32 + 1) & 0xf) << 27; }
     else { value |= ((encoder.port.index() as u32) & 0x7) << 28; }
     value |= match state.pipe_bpp { 18 => BPC_6, 24 => BPC_8, 30 => BPC_10, 36 => BPC_12, other => { io.warning(other as u32); BPC_6 } };
-    if state.mode_flags & (1 << 4) != 0 { value |= 1 << 17; }
-    if state.mode_flags & (1 << 2) != 0 { value |= 1 << 16; }
+    if state.mode_flags & DRM_MODE_FLAG_PVSYNC != 0 { value |= 1 << 17; }
+    if state.mode_flags & DRM_MODE_FLAG_PHSYNC != 0 { value |= 1 << 16; }
     if state.cpu_transcoder == Transcoder::Edp {
         value |= match state.pipe { Pipe::A => if state.pfit_force_thru { 4 << 12 } else { 0 },
             Pipe::B => 5 << 12, Pipe::C => 6 << 12, Pipe::D => 7 << 12, Pipe::E | Pipe::F => 0 };

@@ -202,8 +202,8 @@ fn the_transcoder_and_ddi_values_are_the_reference_encodings() {
     let plan = target_plan();
     assert_eq!(plan.trans_clk_sel, 0x1000_0000, "TRANS_CLK_SEL(A)");
     assert_eq!(
-        plan.trans_ddi_func_ctl, 0x8803_0006,
-        "ENABLE | SELECT_PORT(A) | HDMI | 8bpc | both syncs | four lanes"
+        plan.trans_ddi_func_ctl, 0x8803_0000,
+        "source helper: ENABLE | SELECT_PORT(A) | HDMI | 8bpc | both syncs"
     );
     assert_eq!(
         plan.transconf, 0x8000_0000,

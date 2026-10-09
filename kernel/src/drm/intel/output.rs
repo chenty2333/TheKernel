@@ -194,20 +194,6 @@ const PLL_LOCK_TIMEOUT_US: u32 = 600;
 /// `display/intel_ddi.c:987-1007`, is where the distinction is.
 const TRANS_CLK_SEL_PORT_SHIFT: u32 = 28;
 
-/// `TRANS_DDI_FUNC_CTL`'s `SELECT_PORT` field shift,
-/// `TGL_TRANS_DDI_SELECT_PORT(port) = (port + 1) << 27`
-/// (`[I915]` `i915_reg.h:3757`).  Reference §8.4 and §11 phase 5.5.
-///
-/// The argument here is the **port** -- the DDI -- on this display version and
-/// on every other: i915 composes the value from `encoder->port` with no PHY
-/// conversion (`[I915]` `display/intel_ddi.c:481,488-490`).  So the same DDI
-/// number is right for this field and wrong for [`TRANS_CLK_SEL_PORT_SHIFT`]'s,
-/// and the two §11 steps print "port" as if they were one rule.
-const TRANS_DDI_PORT_SHIFT: u32 = 27;
-
-/// `TRANS_DDI_FUNC_CTL`'s `TRANS_DDI_FUNC_ENABLE` bit.  Reference §8.4.
-const TRANS_DDI_FUNC_ENABLE: u32 = 1 << 31;
-
 /// `TRANS_DDI_FUNC_CTL`'s mode-select field, `[26:24]`.  Reference §8.4.
 const TRANS_DDI_MODE_SELECT_SHIFT: u32 = 24;
 
@@ -217,8 +203,6 @@ const TRANS_DDI_PVSYNC: u32 = 1 << 17;
 /// `TRANS_DDI_PHSYNC`, bit 16.  Reference §8.4's corrected table.
 const TRANS_DDI_PHSYNC: u32 = 1 << 16;
 
-/// `TRANS_DDI_PORT_WIDTH_MASK` starts here: `(lanes - 1) << 1`.  §8.4.
-const TRANS_DDI_PORT_WIDTH_SHIFT: u32 = 1;
 
 /// `TRANSCONF`'s `ENABLE` bit.
 ///
@@ -382,14 +366,6 @@ impl PortType {
         }
     }
 
-    /// The `TRANS_DDI_FUNC_CTL` mode-select value, `[26:24]`.  §8.4.
-    const fn mode_select(self) -> u32 {
-        match self {
-            Self::Hdmi => 0,
-            Self::Dvi => 1,
-        }
-    }
-
     /// The i915 buffer-translation table this port type selects, when the
     /// reference names one.
     ///
@@ -402,8 +378,8 @@ impl PortType {
 /// How many lanes the port drives.
 ///
 /// §8.6 step 7 gives the lane power-up values for four, two and one lane, and
-/// §8.4 gives `PORT_WIDTH = (lanes - 1) << 1` in both `TRANS_DDI_FUNC_CTL` and
-/// `DDI_BUF_CTL`.  Four lanes is the HDMI case; the narrower widths exist
+/// §8.4 gives `PORT_WIDTH = (lanes - 1) << 1` in `DDI_BUF_CTL` (and in
+/// `TRANS_DDI_FUNC_CTL` only on display version 14+). Four lanes is the HDMI case; the narrower widths exist
 /// because the same sequence is what a two-lane or one-lane port would use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PortWidth {
@@ -427,7 +403,7 @@ impl PortWidth {
 
     /// The `PORT_WIDTH` field value, `(lanes - 1) << 1`.
     const fn width_field(self) -> u32 {
-        (self.lanes() - 1) << TRANS_DDI_PORT_WIDTH_SHIFT
+        (self.lanes() - 1) << 1
     }
 
     /// The `PWR_DOWN_LN_MASK` *field* value for this width.
@@ -890,8 +866,8 @@ fn combo_phy_of(ddi: Ddi) -> Result<ComboPhy, OutputError> {
 /// platform the two happen to be equal for ports A and B -- `intel_port_to_phy`
 /// is `PHY_A + port - PORT_A` below `PORT_TC1` (`display/intel_display.c:1950-1965`)
 /// -- and a port whose PHY is not its own letter gets a different number here,
-/// not a different register.  `TRANS_DDI_FUNC_CTL`'s field is the other way
-/// round; see [`TRANS_DDI_PORT_SHIFT`].
+/// not a different register. The translated DDI helper separately builds the
+/// `TRANS_DDI_FUNC_CTL` port field from the encoder's DDI identity.
 const fn phy_index(phy: ComboPhy) -> u32 {
     match phy {
         ComboPhy::A => 0,
@@ -951,6 +927,57 @@ pub(crate) struct OutputProgram {
     /// name -- the board's `PORT_REVERSAL` among them; see
     /// [`DDI_BUF_CTL_OWNED`].
     pub(crate) ddi_buf_ctl: u32,
+}
+
+/// No-register backend for the translated source register-value builder. The
+/// supported HDMI/DVI path consumes only the supplied encoder/CRTC state.
+struct DdiPolicyIo;
+
+impl intel_display::intel_ddi_full::DdiIo for DdiPolicyIo {
+    fn read(&mut self, _reg: u32) -> u32 { 0 }
+    fn write(&mut self, _reg: u32, _value: u32) {}
+    fn combo_phy_read(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister) -> u32 { 0 }
+    fn combo_phy_write(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister, _value: u32) {}
+    fn combo_phy_rmw(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister, _clear: u32, _set: u32) {}
+    fn mg_phy_rmw(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::MgPhyRegister, _clear: u32, _set: u32) {}
+    fn dkl_phy_read(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister) -> u32 { 0 }
+    fn dkl_phy_write(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister, _value: u32) {}
+    fn dkl_phy_rmw(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister, _clear: u32, _set: u32) {}
+    fn mg_dp_mode_read(&mut self, _port: intel_display::intel_ddi_full::Port, _lane: u8) -> u32 { 0 }
+    fn mg_dp_mode_write(&mut self, _port: intel_display::intel_ddi_full::Port, _lane: u8, _value: u32) {}
+}
+
+fn source_trans_ddi_func_ctl(request: &OutputRequest) -> u32 {
+    use intel_display::intel_ddi_full as i915;
+
+    let port = match request.ddi {
+        Ddi::A => i915::Port::A,
+        Ddi::B => i915::Port::B,
+        Ddi::C => i915::Port::C,
+        Ddi::D => i915::Port::D,
+    };
+    let output = match request.port_type {
+        PortType::Hdmi => i915::OutputType::Hdmi,
+        PortType::Dvi => i915::OutputType::Dvi,
+    };
+    let encoder = i915::DdiEncoder {
+        port,
+        output,
+        display: i915::Platform { display_ver: 13, alderlake_p: true, ..i915::Platform::default() },
+        ..i915::DdiEncoder::default()
+    };
+    let state = i915::CrtcState {
+        pipe: i915::Pipe::A,
+        cpu_transcoder: i915::Transcoder::A,
+        output,
+        port_clock: request.mode.clock_khz,
+        lane_count: request.width.lanes() as u8,
+        pipe_bpp: 24,
+        mode_flags: u32::from(request.mode.hsync_positive) | (u32::from(request.mode.vsync_positive) << 2),
+        has_hdmi_sink: request.port_type == PortType::Hdmi,
+        ..i915::CrtcState::default()
+    };
+    i915::intel_ddi_transcoder_func_reg_val_get(&mut DdiPolicyIo, &encoder, &state)
 }
 
 impl OutputProgram {
@@ -1057,35 +1084,11 @@ impl OutputProgram {
             }
         };
 
-        // The two encoder-side selects are keyed by different things, which
-        // §11's phase 5 prints as if they were one rule.  `TRANS_CLK_SEL` takes
-        // the **PHY** on this display version (`[I915]`
-        // `display/intel_ddi.c:999-1000`); `TRANS_DDI_FUNC_CTL.SELECT_PORT`
-        // takes the **DDI** on every version (`[I915]`
-        // `display/intel_ddi.c:481,488-490`, and `intel_port_to_phy` at
-        // `display/intel_display.c:1950-1965` is the conversion the first one
-        // gets and the second one does not).  `Ddi::index()` is the port's
-        // numeric index (PORT_A = 0, PORT_B = 1, §8.1) and the `+ 1` in both is
-        // there because zero means "none" (§6.3).
+        // `TRANS_CLK_SEL` takes the PHY on this display version. The translated
+        // DDI helper builds the independent transcoder port/mode/polarity
+        // fields from the encoder and CRTC state.
         let trans_clk_sel = (phy_index(phy) + 1) << TRANS_CLK_SEL_PORT_SHIFT;
-        let trans_ddi_func_ctl = TRANS_DDI_FUNC_ENABLE
-            | ((request.ddi.index() + 1) << TRANS_DDI_PORT_SHIFT)
-            | (request.port_type.mode_select() << TRANS_DDI_MODE_SELECT_SHIFT)
-            // 8 bpc is 0 in `TRANS_DDI_BPC_MASK[22:20]` (§8.4), so nothing is
-            // added for it.  That field is the transcoder's; the pipe's output
-            // depth and dithering are `PIPE_MISC`'s, which is the pipe
-            // workstream's register.
-            | if request.mode.hsync_positive {
-                TRANS_DDI_PHSYNC
-            } else {
-                0
-            }
-            | if request.mode.vsync_positive {
-                TRANS_DDI_PVSYNC
-            } else {
-                0
-            }
-            | request.width.width_field();
+        let trans_ddi_func_ctl = source_trans_ddi_func_ctl(request);
 
         // §11 phase 5.6's write, restricted to what is actually a control bit.
         // No bit depth: §8.4's correction and §11 phase 5.6 both put it in
