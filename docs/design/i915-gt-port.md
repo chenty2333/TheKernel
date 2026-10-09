@@ -108,3 +108,22 @@ The active `gt/intel_context.h` owner now supplies 41/41 configured helper defin
 ### Lower API integration snapshot (2026-10-09)
 
 The current opt-in check is 2,118 errors. Complete registered source translations now include `i915_active.c` (67), `i915_sw_fence.c` (42), `i915_gem_ww.c` (5), `i915_gem_object.h` active inline helpers (46), `i915_gem_pages.c` (28), `i915_gem_shrinker.c` (19), `intel_context.h` helpers (41), `i915_drm_client.c` (10 plus two header ref helpers), `intel_ring.c` (10), and `i915_gem_context.c`. The active/sw-fence/WW/object API/context API/object-header/page/context/DRM-client modules have no module-local diagnostics in the latest feature check; the remaining shrinker errors identify missing Linux reclaim/swap/notifier/runtime-PM and trace facilities. This is not a successful full feature build or runtime evidence.
+
+## 剩余工作
+
+本收尾阶段保留 `upstream-gt` 默认关闭，不推进以下运行时接线或功能；上游路径均相对于 Linux 7.2.3 `drivers/gpu/drm/i915/`。
+
+- 去掉 `upstream-gt` feature gate：待全部下层接口具备；涉及本 crate 模块注册及下列上游实现。
+- 切换 GuC 提交路径：`gt/uc/intel_uc.c`、`gt/uc/intel_guc_submission.c`。
+- GEM execbuffer 完整接线：`gem/i915_gem_execbuffer.c`。
+- GEM mman / mmap offset / GTT 缺页接线：`gem/i915_gem_mman.c`、`i915_mm.c`。
+- GEM tiling 与 fence 接线：`gem/i915_gem_tiling.c`、`gt/intel_ggtt_fencing.c`。
+- GEM evict 接线：`gem/i915_gem_evict.c`。
+- GEM shrinker 接线：`gem/i915_gem_shrinker.c`。
+- GEM context 参数接线：`gem/i915_gem_context.c`。
+- RPS 接线：`gt/intel_rps.c`。
+- RC6 接线：`gt/intel_rc6.c`。
+- reset 接线：`gt/intel_reset.c`。
+- heartbeat 接线：`gt/intel_engine_heartbeat.c`。
+- query 用户态接口：`i915_query.c`。
+- getparam 用户态接口：`i915_getparam.c`。

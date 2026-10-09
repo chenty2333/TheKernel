@@ -193,7 +193,7 @@ pub fn load(
     Err(FirmwareError::Missing)
 }
 
-/// upstream: intel_uc_fw.c intel_uc_check_file_version()
+// upstream: intel_uc_fw.c intel_uc_check_file_version()
 /// Return whether an accepted file is older than the version table entry.
 pub fn check_file_version(
     wanted: (u8, u8, u8),
@@ -209,7 +209,8 @@ pub fn check_file_version(
     Ok((selected.1, selected.2) < (wanted.1, wanted.2))
 }
 
-// upstream: intel_uc_fw.c __check_ccs_header()
+// Source: intel_uc_fw.c __check_ccs_header(); checked Rust parser adaptation,
+// not a line-by-line translation (checked arithmetic and typed errors).
 /// Validate the CSS sizes before a caller allocates DMA memory or writes MMIO.
 pub fn parse_css(data: &[u8], wopcm_bytes: usize) -> Result<CssInfo, CssError> {
     const HEADER_BYTES: usize = 128;
