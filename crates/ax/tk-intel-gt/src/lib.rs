@@ -138,6 +138,9 @@ pub(crate) mod i915_gem_pm_upstream;
 pub(crate) mod i915_gem_dmabuf_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub(crate) mod i915_gem_object_frontbuffer_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod i915_gem_mman_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]

@@ -2026,6 +2026,11 @@ Hat Inc). The `dma_buf` ABI views and Linux PRIME/DMA mappings keep
 their source layout; generic DMA-BUF, DMA map, and VMA services remain external
 LinuxKPI/kernel ownership boundaries.
 
+`i915_gem_object_frontbuffer_upstream.rs` translates all 12 functions from
+Linux 7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_object_frontbuffer.c` (MIT,
+Copyright © 2025 Intel Corporation). The frontbuffer interface preserves the
+display-owned init/fini/flush/invalidate calls as external owner boundaries.
+
 `intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
 `drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
 Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.
