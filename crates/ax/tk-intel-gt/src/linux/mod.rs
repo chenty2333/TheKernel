@@ -21,6 +21,9 @@ pub(crate) mod cpufreq;
 pub(crate) mod fields;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub(crate) mod forcewake;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub(crate) mod firmware;
 pub(crate) mod gem;
 pub(crate) mod gem_memory;

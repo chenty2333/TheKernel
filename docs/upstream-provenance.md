@@ -1934,10 +1934,6 @@ and GuC/HuC capacity checks.
 `drivers/gpu/drm/i915/gt/intel_context_sseu.c` (MIT, Copyright © 2019 Intel
 Corporation); it uses the source header's kernel-context request helper.
 
-`intel_tlb_upstream.rs` translates the 6 definitions in Linux 7.2.3
-`drivers/gpu/drm/i915/gt/intel_tlb.c` (MIT, Copyright © 2023 Intel Corporation);
-its rate-limited diagnostic path uses a Linux-style five-second interval.
-
 `intel_tlb_upstream.rs` translates all 6 definitions in Linux 7.2.3
 `drivers/gpu/drm/i915/gt/intel_tlb.c` (MIT, Copyright © 2023 Intel Corporation);
 its diagnostic path applies a monotonic five-second error rate limit.
@@ -1945,3 +1941,20 @@ its diagnostic path applies a monotonic five-second error rate limit.
 `intel_gt_pm_irq_upstream.rs` translates all 8 functions in Linux 7.2.3
 `drivers/gpu/drm/i915/gt/intel_gt_pm_irq.c` (MIT, Copyright © 2019 Intel
 Corporation), retaining mask/update, repeated reset writes, and posting-read order.
+
+`intel_gt_mcr_impl_upstream.rs` translates all 21 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_gt_mcr.c` (MIT, Copyright © 2022 Intel
+Corporation); common steering and multicast behavior follows the source.
+
+`linux/forcewake.rs` implements the Linux 7.2.3 i915 forcewake reference-count,
+domain-selection, callback, and release-register behavior based on the MIT
+`drivers/gpu/drm/i915/intel_uncore.c` implementation (Copyright © 2013 Intel
+Corporation).
+
+`intel_huc_fw_upstream.rs` translates all 6 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c` (MIT, Copyright © 2014-2019 Intel
+Corporation), preserving firmware state transitions and HECI/PXP message layout.
+
+`intel_guc_hwconfig_upstream.rs` translates all 7 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/uc/intel_guc_hwconfig.c` (MIT, Copyright © 2022 Intel
+Corporation), retaining KLV parsing, temporary VMA lifecycle, and failure order.
