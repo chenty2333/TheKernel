@@ -163,7 +163,7 @@ fn is_err_or_null(ptr: *const c_void) -> bool {
 // bindings rather than success-returning stand-ins. The final section reports
 // the precise lower-layer symbols still required by this translation.
 unsafe extern "C" {
-    fn i915_gem_object_release_mmap_offset(obj: *mut DrmI915GemObject);
+    pub(crate) fn i915_gem_object_release_mmap_offset(obj: *mut DrmI915GemObject);
     fn intel_gt_invalidate_tlb_full(gt: *mut IntelGt, seqno: u32);
     pub(crate) fn drm_clflush_sg(pages: *mut SgTable);
     fn radix_tree_next_chunk(
@@ -171,7 +171,7 @@ unsafe extern "C" {
         iter: *mut RadixTreeIter,
         flags: u32,
     ) -> *mut *mut c_void;
-    fn radix_tree_delete(
+    pub(crate) fn radix_tree_delete(
         root: *mut crate::intel_context_upstream::RadixTreeRoot,
         index: u64,
     ) -> *mut c_void;

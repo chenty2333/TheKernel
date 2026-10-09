@@ -11,6 +11,8 @@
 use core::ffi::{c_int, c_ulong, c_void};
 
 use crate::{
+    i915_drm_client_upstream::i915_drm_client_remove_object,
+    i915_gem_core_upstream::{io_mapping_map_wc, io_mapping_unmap},
     linux::gem_memory::{INTEL_MEMORY_LOCAL, INTEL_MEMORY_SYSTEM},
     i915_gem_context_upstream::{i915_gem_context_get, i915_gem_context_put},
     i915_gem_context_types_upstream::DrmI915FilePrivate,
@@ -21,9 +23,14 @@ use crate::{
     i915_gem_object_header_upstream::{
         assert_object_held, assert_object_held_shared, i915_gem_object_flush_map,
     },
-    i915_gem_pages_upstream::{i915_gem_object_pin_map, __i915_gem_object_put_pages, __i915_gem_object_get_page as i915_gem_object_get_page, __i915_gem_object_get_dma_address as i915_gem_object_get_dma_address},
+    i915_gem_pages_upstream::{
+        i915_gem_object_pin_map, i915_gem_object_release_mmap_offset, radix_tree_delete,
+        __i915_gem_object_put_pages, __i915_gem_object_get_page as i915_gem_object_get_page,
+        __i915_gem_object_get_dma_address as i915_gem_object_get_dma_address,
+    },
     i915_gem_object_types_upstream::{DrmI915GemObject, DrmI915GemObjectOps},
     i915_vma_api_upstream::*,
+    intel_gtt_api_upstream::i915_vm_resv_put,
     intel_context_upstream::*,
     intel_engine_cs_upstream::*,
     linux::{
