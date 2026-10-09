@@ -1681,6 +1681,8 @@ mod tests {
         aux_writes: usize,
         short_aux_write: bool,
         fail_caps_read: bool,
+        source_tps3: bool,
+        source_tps4: bool,
         hpd_blocks: usize,
         hpd_unblocks: usize,
     }
@@ -1786,10 +1788,10 @@ mod tests {
             false
         }
         fn source_supports_tps3(&self) -> bool {
-            false
+            self.source_tps3
         }
         fn source_supports_tps4(&self) -> bool {
-            false
+            self.source_tps4
         }
     }
 
@@ -1916,6 +1918,34 @@ mod tests {
             DpPhy::Dprx
         ));
         assert_eq!(io.aux_writes, 1);
+    }
+
+    #[test]
+    fn training_pattern_requires_both_source_and_sink_capability() {
+        let state = LinkTrainingCrtcState::default();
+        let mut dp = IntelDpLinkTraining::default();
+        let mut io = SourcePhyFailureIo::default();
+
+        dp.dpcd[3] = DP_TPS4_SUPPORTED;
+        io.source_tps4 = true;
+        assert_eq!(
+            intel_dp_training_pattern(&dp, &io, &state, DpPhy::Dprx),
+            DP_TRAINING_PATTERN_4 as u32
+        );
+
+        io.source_tps4 = false;
+        assert_eq!(
+            intel_dp_training_pattern(&dp, &io, &state, DpPhy::Dprx),
+            DP_TRAINING_PATTERN_2 as u32
+        );
+
+        dp.dpcd[3] = 0;
+        dp.dpcd[2] = DP_TPS3_SUPPORTED;
+        io.source_tps3 = true;
+        assert_eq!(
+            intel_dp_training_pattern(&dp, &io, &state, DpPhy::Dprx),
+            DP_TRAINING_PATTERN_3 as u32
+        );
     }
 
     #[test]
