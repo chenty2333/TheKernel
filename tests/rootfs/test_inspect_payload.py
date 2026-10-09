@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import unittest
 
-from tools.product_state import ROOTFS_INPUT_FILES, rootfs_image_bytes, selected_tool_payload
+from tools.product_state import ROOTFS_INPUT_FILES, rootfs_image_bytes, selected_tool_payload, state_root
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -63,7 +63,7 @@ class InspectPayloadTests(unittest.TestCase):
     def test_builder_refuses_to_remove_unrelated_files_before_network(self):
         # Product outputs deliberately reject tmpfs paths.  Use disk-backed
         # scratch so this test exercises the unrelated-tree guard itself.
-        test_tmp = Path.home()/'.cache'/'thekernel-test-tmp'
+        test_tmp = state_root()/'test-tmp'
         test_tmp.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=test_tmp) as directory:
             out = Path(directory)/'precious'

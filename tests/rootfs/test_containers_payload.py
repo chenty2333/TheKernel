@@ -6,7 +6,7 @@ import unittest
 import importlib.util
 import struct
 
-from tools.product_state import ROOTFS_INPUT_FILES, rootfs_image_bytes, selected_tool_payload
+from tools.product_state import ROOTFS_INPUT_FILES, rootfs_image_bytes, selected_tool_payload, state_root
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -116,7 +116,7 @@ class ContainersPayloadTests(unittest.TestCase):
         # Product outputs deliberately reject tmpfs paths.  Put this test's
         # disposable tree on the same disk-backed storage policy so it reaches
         # the unrelated-tree guard instead of failing the earlier storage gate.
-        test_tmp = Path.home()/'.cache'/'thekernel-test-tmp'
+        test_tmp = state_root()/'test-tmp'
         test_tmp.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=test_tmp) as directory:
             out = Path(directory)/'unrelated'
