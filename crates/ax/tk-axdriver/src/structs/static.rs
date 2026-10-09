@@ -1,10 +1,9 @@
-#[cfg(feature = "block")]
-use crate::{drivers::RegisteredStaticBlockDevice, prelude::*};
-#[cfg(feature = "net")]
-use crate::prelude::*;
-
 #[cfg(feature = "net")]
 use crate::drivers::RegisteredStaticNetDevice;
+#[cfg(feature = "net")]
+use crate::prelude::*;
+#[cfg(feature = "block")]
+use crate::{drivers::RegisteredStaticBlockDevice, prelude::*};
 
 /// Static product network devices. Most platforms retain their selected
 /// primary NIC type; optional PCI families are boxed as additional devices.
@@ -20,6 +19,13 @@ pub type AxNetDevice = StaticNetDevice;
 
 #[cfg(all(feature = "net", not(feature = "dyn")))]
 impl BaseDriverOps for StaticNetDevice {
+    fn irq_num(&self) -> Option<usize> {
+        match self {
+            Self::Primary(device) => device.irq_num(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.irq_num(),
+        }
+    }
     fn device_name(&self) -> &str {
         match self {
             Self::Primary(device) => device.device_name(),
@@ -38,6 +44,159 @@ impl BaseDriverOps for StaticNetDevice {
 
 #[cfg(all(feature = "net", not(feature = "dyn")))]
 impl axdriver_net::NetDriverOps for StaticNetDevice {
+    // This wrapper must preserve the optional operations too: inheriting
+    // the trait defaults disguises an unready WLAN device as a wired NIC,
+    // drops its IRQ capability and makes runtime publish it as eth0.
+    fn interface_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Primary(device) => device.interface_name(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.interface_name(),
+        }
+    }
+    fn is_wireless(&self) -> bool {
+        match self {
+            Self::Primary(device) => device.is_wireless(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.is_wireless(),
+        }
+    }
+    fn rfkill_hard_blocked(&self) -> bool {
+        match self {
+            Self::Primary(device) => device.rfkill_hard_blocked(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.rfkill_hard_blocked(),
+        }
+    }
+    fn rfkill_soft_blocked(&self) -> bool {
+        match self {
+            Self::Primary(device) => device.rfkill_soft_blocked(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.rfkill_soft_blocked(),
+        }
+    }
+    fn set_rfkill_soft_blocked(&mut self, blocked: bool) -> DevResult {
+        match self {
+            Self::Primary(device) => device.set_rfkill_soft_blocked(blocked),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.set_rfkill_soft_blocked(blocked),
+        }
+    }
+    fn wireless_frequencies(&self) -> alloc::vec::Vec<axdriver_net::WirelessFrequency> {
+        match self {
+            Self::Primary(device) => device.wireless_frequencies(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.wireless_frequencies(),
+        }
+    }
+    fn wireless_phy_capabilities(&self) -> axdriver_net::WirelessPhyCapabilities {
+        match self {
+            Self::Primary(device) => device.wireless_phy_capabilities(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.wireless_phy_capabilities(),
+        }
+    }
+    fn trigger_wireless_scan(&mut self, request: &axdriver_net::WirelessScanRequest) -> DevResult {
+        match self {
+            Self::Primary(device) => device.trigger_wireless_scan(request),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.trigger_wireless_scan(request),
+        }
+    }
+    fn abort_wireless_scan(&mut self) -> DevResult {
+        match self {
+            Self::Primary(device) => device.abort_wireless_scan(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.abort_wireless_scan(),
+        }
+    }
+    fn connect_wireless(&mut self, request: &axdriver_net::WirelessConnectRequest) -> DevResult {
+        match self {
+            Self::Primary(device) => device.connect_wireless(request),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.connect_wireless(request),
+        }
+    }
+    fn authenticate_wireless(
+        &mut self,
+        request: &axdriver_net::WirelessAuthenticateRequest,
+    ) -> DevResult<axdriver_net::WirelessSmeFrame> {
+        match self {
+            Self::Primary(device) => device.authenticate_wireless(request),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.authenticate_wireless(request),
+        }
+    }
+    fn associate_wireless(
+        &mut self,
+        request: &axdriver_net::WirelessAssociateRequest,
+    ) -> DevResult<axdriver_net::WirelessSmeFrame> {
+        match self {
+            Self::Primary(device) => device.associate_wireless(request),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.associate_wireless(request),
+        }
+    }
+    fn disconnect_wireless_sme(&mut self, reason: u16, disassociate: bool) -> DevResult {
+        match self {
+            Self::Primary(device) => device.disconnect_wireless_sme(reason, disassociate),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.disconnect_wireless_sme(reason, disassociate),
+        }
+    }
+    fn disconnect_wireless(&mut self, reason: u16) -> DevResult {
+        match self {
+            Self::Primary(device) => device.disconnect_wireless(reason),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.disconnect_wireless(reason),
+        }
+    }
+    fn wireless_station_info(&self) -> Option<axdriver_net::WirelessStationInfo> {
+        match self {
+            Self::Primary(device) => device.wireless_station_info(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.wireless_station_info(),
+        }
+    }
+    fn take_wireless_disconnect_event(&mut self) -> Option<axdriver_net::WirelessDisconnectEvent> {
+        match self {
+            Self::Primary(device) => device.take_wireless_disconnect_event(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.take_wireless_disconnect_event(),
+        }
+    }
+    fn wireless_key_operation(
+        &mut self,
+        operation: axdriver_net::WirelessKeyOperation,
+        key: &axdriver_net::WirelessKeyConfig,
+    ) -> DevResult<Option<axdriver_net::WirelessKeyInfo>> {
+        match self {
+            Self::Primary(device) => device.wireless_key_operation(operation, key),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.wireless_key_operation(operation, key),
+        }
+    }
+    fn wireless_scan_results(&self) -> alloc::vec::Vec<axdriver_net::WirelessBssInfo> {
+        match self {
+            Self::Primary(device) => device.wireless_scan_results(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.wireless_scan_results(),
+        }
+    }
+    fn take_wireless_scan_event(&mut self) -> Option<axdriver_net::WirelessScanEvent> {
+        match self {
+            Self::Primary(device) => device.take_wireless_scan_event(),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.take_wireless_scan_event(),
+        }
+    }
+    fn set_link_up(&mut self, up: bool) -> DevResult {
+        match self {
+            Self::Primary(device) => device.set_link_up(up),
+            #[cfg(feature = "e1000")]
+            Self::E1000(device) => device.set_link_up(up),
+        }
+    }
     fn mac_address(&self) -> axdriver_net::EthernetAddress {
         match self {
             Self::Primary(device) => device.mac_address(),
@@ -966,5 +1125,151 @@ impl super::AxDeviceEnum {
     #[cfg(feature = "vsock")]
     pub const fn from_vsock(dev: AxVsockDevice) -> Self {
         Self::Vsock(dev)
+    }
+}
+
+#[cfg(all(test, feature = "net", net_dev = "n305-net"))]
+mod net_tests {
+    use alloc::{boxed::Box, vec, vec::Vec};
+
+    use axdriver_net::{
+        EthernetAddress, NetBufPtr, NetDriverOps, WirelessFrequency, WirelessScanEvent,
+        WirelessScanRequest,
+    };
+
+    use super::*;
+
+    struct WirelessNic {
+        blocked: bool,
+        up: bool,
+        scan: bool,
+    }
+    impl BaseDriverOps for WirelessNic {
+        fn device_name(&self) -> &str {
+            "test-radio"
+        }
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Net
+        }
+        fn irq_num(&self) -> Option<usize> {
+            Some(73)
+        }
+    }
+    impl NetDriverOps for WirelessNic {
+        fn interface_name(&self) -> Option<&'static str> {
+            Some("wlan0")
+        }
+        fn is_wireless(&self) -> bool {
+            true
+        }
+        fn mac_address(&self) -> EthernetAddress {
+            EthernetAddress([0; 6])
+        }
+        fn rfkill_hard_blocked(&self) -> bool {
+            true
+        }
+        fn rfkill_soft_blocked(&self) -> bool {
+            self.blocked
+        }
+        fn set_rfkill_soft_blocked(&mut self, blocked: bool) -> DevResult {
+            self.blocked = blocked;
+            Ok(())
+        }
+        fn wireless_frequencies(&self) -> Vec<WirelessFrequency> {
+            vec![WirelessFrequency {
+                frequency_mhz: 2412,
+                no_ir: true,
+            }]
+        }
+        fn set_link_up(&mut self, up: bool) -> DevResult {
+            self.up = up;
+            Ok(())
+        }
+        fn can_transmit(&self) -> bool {
+            self.up && !self.blocked
+        }
+        fn can_receive(&self) -> bool {
+            false
+        }
+        fn rx_queue_size(&self) -> usize {
+            1
+        }
+        fn tx_queue_size(&self) -> usize {
+            1
+        }
+        fn recycle_rx_buffer(&mut self, _: NetBufPtr) -> DevResult {
+            Err(DevError::Unsupported)
+        }
+        fn recycle_tx_buffers(&mut self) -> DevResult {
+            Ok(())
+        }
+        fn transmit(&mut self, _: NetBufPtr) -> DevResult {
+            Err(DevError::Again)
+        }
+        fn receive(&mut self) -> DevResult<NetBufPtr> {
+            Err(DevError::Again)
+        }
+        fn alloc_tx_buffer(&mut self, _: usize) -> DevResult<NetBufPtr> {
+            Err(DevError::Again)
+        }
+        fn trigger_wireless_scan(&mut self, request: &WirelessScanRequest) -> DevResult {
+            self.scan = request.frequencies_mhz == [2412];
+            Ok(())
+        }
+        fn take_wireless_scan_event(&mut self) -> Option<WirelessScanEvent> {
+            core::mem::take(&mut self.scan).then_some(WirelessScanEvent::Results)
+        }
+    }
+
+    fn check_wireless_forwarding(mut device: StaticNetDevice) {
+        // Runtime uses these two operations before choosing the boot NIC.
+        assert!(device.is_wireless());
+        assert_eq!(device.interface_name(), Some("wlan0"));
+        assert_eq!(device.irq_num(), Some(73));
+        assert_eq!(device.mac_address().0, [0; 6]);
+        assert!(device.rfkill_hard_blocked());
+        assert!(!device.rfkill_soft_blocked());
+        device.set_link_up(true).unwrap();
+        assert!(device.can_transmit());
+        device.set_rfkill_soft_blocked(true).unwrap();
+        assert!(device.rfkill_soft_blocked());
+        assert!(!device.can_transmit());
+        assert_eq!(
+            device.wireless_frequencies(),
+            vec![WirelessFrequency {
+                frequency_mhz: 2412,
+                no_ir: true
+            }]
+        );
+        device
+            .trigger_wireless_scan(&WirelessScanRequest {
+                ssid: vec![],
+                frequencies_mhz: vec![2412],
+            })
+            .unwrap();
+        assert_eq!(
+            device.take_wireless_scan_event(),
+            Some(WirelessScanEvent::Results)
+        );
+        assert_eq!(device.take_wireless_scan_event(), None);
+    }
+
+    #[test]
+    fn static_primary_preserves_wireless_identity_irq_and_control() {
+        check_wireless_forwarding(StaticNetDevice::Primary(Box::new(WirelessNic {
+            blocked: false,
+            up: false,
+            scan: false,
+        })));
+    }
+
+    #[cfg(feature = "e1000")]
+    #[test]
+    fn boxed_secondary_preserves_optional_net_operations() {
+        check_wireless_forwarding(StaticNetDevice::e1000(WirelessNic {
+            blocked: false,
+            up: false,
+            scan: false,
+        }));
     }
 }

@@ -185,12 +185,20 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> AxResult<Ar
         lo_ip6.address().into(),
     ));
 
-    let eth0_ip = if let Some(dev) = net_devs.take_one() {
+    // Wireless links are published separately after their firmware callback.
+    // A stopped or invalid station address must not shadow a usable wired NIC.
+    let boot_nic = net_devs
+        .iter()
+        .rposition(|dev| !dev.is_wireless() && valid_station_address(dev.mac_address().0))
+        .map(|index| net_devs.swap_remove(index));
+    let eth0_ip = if let Some(dev) = boot_nic {
         info!("  use NIC 0: {:?}", dev.device_name());
 
         let eth0_address = EthernetAddress(dev.mac_address().0);
         let config = boot_ipv4::parse(IP, GATEWAY, IP_PREFIX)?;
-        let eth0_ip = config.address.unwrap_or_else(|| Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0));
+        let eth0_ip = config
+            .address
+            .unwrap_or_else(|| Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0));
 
         let eth0_dev = router.try_add_device(Box::new(EthernetDevice::new(
             "eth0".to_owned(),
@@ -217,7 +225,7 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> AxResult<Ar
 
         config.address
     } else {
-        warn!("  No network device found!");
+        warn!("  No wired network device with a valid station address found!");
         None
     };
 
@@ -433,4 +441,24 @@ pub fn init_vsock(mut vsock_devs: AxDeviceContainer<AxVsockDevice>) {
 /// Poll all network interfaces on the default stack.
 pub fn poll_interfaces() {
     default_stack().poll_interfaces();
+}
+
+// Like Linux is_valid_ether_addr(): neither zero nor a group address is a
+// usable station address. Locally administered unicast addresses are valid.
+fn valid_station_address(address: [u8; 6]) -> bool {
+    address != [0; 6] && address[0] & 1 == 0
+}
+
+#[cfg(test)]
+mod boot_nic_tests {
+    use super::valid_station_address;
+
+    #[test]
+    fn station_address_admission_rejects_unready_and_group_addresses() {
+        assert!(!valid_station_address([0; 6]));
+        assert!(!valid_station_address([0xff; 6]));
+        assert!(!valid_station_address([1, 0, 0x5e, 0, 0, 1]));
+        assert!(valid_station_address([2, 0, 0, 0, 0, 1]));
+        assert!(valid_station_address([0xec, 0xd6, 0x8a, 0xea, 0x63, 0xdb]));
+    }
 }
