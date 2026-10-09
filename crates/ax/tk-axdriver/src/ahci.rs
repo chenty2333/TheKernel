@@ -443,7 +443,8 @@ fn ahci_hotplug_worker() {
 /// FreeBSD `ahci_probe`/`ahci_pci_attach` adaptation: match an AHCI class
 /// function, enable memory and bus mastering, reset the HBA, and publish the
 /// first attached ATA disk as a TheKernel block device.
-// upstream: ahci_pci.c ahci_probe() + ahci_pci_attach()
+// upstream: ahci_pci.c ahci_probe()
+// upstream: ahci_pci.c ahci_pci_attach()
 pub(crate) fn probe(
     root: &mut PciRoot,
     bdf: DeviceFunction,
@@ -452,7 +453,7 @@ pub(crate) fn probe(
     if info.class != PCI_CLASS_STORAGE {
         return BusProbeResult::NotMatched;
     }
-    let id_quirk = pci_ids::identify(info.vendor_id, info.device_id, info.revision);
+    let id_quirk = ahci_ata_probe(info);
     let ahci_class = info.subclass == PCI_SUBCLASS_SATA && info.prog_if == PCI_PROGIF_AHCI;
     // FreeBSD also admits known AHCI controllers that advertise RAID class.
     let force_ahci = axhal::boot::command_line_value("ahci.force_ahci") == Some("1");
@@ -709,4 +710,10 @@ pub(crate) fn probe(
     } else {
         BusProbeResult::Devices(devices)
     }
+}
+
+/// Apply the revision-qualified upstream AHCI ID match before resource setup.
+// upstream: ahci_pci.c ahci_ata_probe()
+fn ahci_ata_probe(info: &DeviceFunctionInfo) -> Option<pci_ids::PciIdQuirk> {
+    pci_ids::identify(info.vendor_id, info.device_id, info.revision)
 }

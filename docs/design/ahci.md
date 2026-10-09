@@ -104,3 +104,8 @@ error; they do not provide CAM sense or request-requeue policy.
 the bounded wait deadline; it performs one shared reset and reports device
 error only if DMA stop is proven, otherwise keeping each caller's physical
 buffer quarantined.
+
+The PCI frontend identifies its upstream probe, attach, ID-match, and controller
+reset steps (`ahci_probe`, `ahci_pci_attach`, `ahci_ata_probe`,
+`ahci_pci_ctlr_reset`). These are adapters over TheKernel's one-shot PCI probe;
+detach and suspend/resume are not implemented.

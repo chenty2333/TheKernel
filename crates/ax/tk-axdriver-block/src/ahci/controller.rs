@@ -390,6 +390,7 @@ impl<I: AhciIo> AhciController<I> {
     /// FreeBSD `ahci_ctlr_reset`: request BIOS/OS handoff, enter AHCI mode,
     /// reset the HBA, and restore capability bits on quirked controllers.
     // upstream: ahci.c ahci_ctlr_reset()
+    // upstream: ahci_pci.c ahci_pci_ctlr_reset()
     pub fn ahci_ctlr_reset(&mut self) -> Result<(), ControllerError> {
         let version = self.io.read32(AHCI_VS);
         let capabilities2 = if version >= 0x0001_0200 {
