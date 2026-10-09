@@ -166,7 +166,7 @@ unsafe extern "C" {
     fn intel_guc_ct_enable(ct: *mut IntelGucCt) -> i32;
     fn intel_guc_ct_disable(ct: *mut IntelGucCt);
     fn intel_guc_ct_event_handler(ct: *mut IntelGucCt);
-    fn intel_guc_to_host_process_recv_msg(guc: *mut IntelGuc, payload: *const u32, len: u32);
+    fn intel_guc_to_host_process_recv_msg(guc: *mut IntelGuc, payload: *const u32, len: u32) -> i32;
     fn intel_guc_submission_reset_prepare(guc: *mut IntelGuc);
     fn intel_guc_submission_reset(guc: *mut IntelGuc, stalled: IntelEngineMask);
     fn intel_guc_submission_reset_finish(guc: *mut IntelGuc);

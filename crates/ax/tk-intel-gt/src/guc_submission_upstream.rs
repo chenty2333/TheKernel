@@ -148,7 +148,7 @@ unsafe extern "C" {
         g2h_len_dw: u32,
         loop_on_busy: bool,
     ) -> i32;
-    fn dma_fence_context_alloc(num: usize) -> u64;
+    fn dma_fence_context_alloc(num: u32) -> u64;
     fn intel_engine_reset_pinned_contexts(engine: *mut intel_engine_cs);
     fn intel_mocs_init_engine(engine: *mut intel_engine_cs);
     fn gen8_emit_flush_xcs(rq: *mut i915_request, mode: u32) -> i32;
