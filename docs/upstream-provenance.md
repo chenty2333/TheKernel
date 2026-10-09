@@ -1280,3 +1280,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `kernel/src/drm/intel/connect.rs` applies the extended DPCD receiver-capability selection behavior of Linux 7.2.3 `drivers/gpu/drm/display/drm_dp_helper.c` (`drm_dp_read_dpcd_caps()` / `drm_dp_read_extended_dpcd_caps()`, MIT; Copyright © 2009 Keith Packard); the grant is retained in `kernel/LICENSES/LicenseRef-DRM-DPCD-MIT`.
 
 `crates/ax/tk-intel-display/src/intel_audio_legacy_remainder.rs` translates the remaining 10/45 ctags functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_audio.c` (MIT; Copyright © 2014 Intel Corporation), completing source coverage alongside `intel_audio_dp_full.rs`; the shared Intel grant remains in `LICENSES/Intel-i915-DP-Audio-MIT.txt`.
+
+`kernel/src/drm/crtc_uapi_full.rs` translates all 26 ctags functions from Linux 7.2.3 `drivers/gpu/drm/drm_crtc.c` (Intel permissive MIT-style grant; Copyright (c) 2006-2008 Intel Corporation, 2007 Dave Airlie, and 2008 Red Hat); the full grant is retained in the source and `kernel/LICENSES/LicenseRef-Intel-Drm-Crtc-MIT`.

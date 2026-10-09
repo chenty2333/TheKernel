@@ -8,6 +8,7 @@ mod atomic;
 mod atomic_uapi_full;
 mod color_mgmt_full;
 mod connector_uapi_full;
+mod crtc_uapi_full;
 mod device;
 mod dmabuf;
 mod fbdev;
