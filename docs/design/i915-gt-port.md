@@ -94,3 +94,7 @@ Registered the complete request (`i915_request.c`, 84/84 functions) and schedule
 ### Canonical GEM record cutover (2026-10-09)
 
 GEM, shmem, tiling, domain, VMA, request, GuC, and GT callers now import the MIT `i915_gem_object_types.h` `DrmI915GemObject` owner instead of the old context-source object overlay. Removed the duplicate overlay/MM subrecord and switched the shmem callback table to the header-owned `DrmI915GemObjectOps` ABI; packed `madv`/`dirty` fields use source-bitfield owner accessors. Added only an opaque target-size LinuxKPI TTM union arm, not TTM behavior. The latest `upstream-gt` check still fails at 2,207 errors, mostly real DRM/MM/GEM/MMIO API dependencies and translated caller field paths; default tests and package formatting pass.
+
+### GEM owner callsite field mapping (2026-10-09)
+
+The `i915_gem_object.c` and `i915_gem_shmem.c` translations now consume the canonical object's cache bitfield, nested DRM-base union, RCU/free union, and source-owned GEM ops table rather than the removed overlay fields. The LinuxKPI TTM union arm exposes only its shared DRM base member and verified target size. This cutover remains partial: the feature check reports 2,206 errors, including missing DRM VMA manager/MM/GEM lifetime services; the default crate suite and package format check pass.

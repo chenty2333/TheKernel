@@ -18,7 +18,9 @@ pub type DrmGemObject = DrmGemObjectBaseLayout;
 /// storage is 480 bytes and the i915 owner does not access TTM-private fields.
 #[repr(C, align(8))]
 pub struct TtmBufferObjectLayout {
-    _opaque: [u8; 480],
+    /// The DRM GEM base is the leading TTM member; the remaining TTM-private
+    /// payload is not accessed by this GT/GEM translation.
+    pub base: DrmGemObjectBaseLayout,
 }
 const _: [(); 480] = [(); size_of::<TtmBufferObjectLayout>()];
 const _: [(); 8] = [(); align_of::<TtmBufferObjectLayout>()];
