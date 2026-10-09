@@ -75,7 +75,7 @@ pub(crate) use crate::{
     },
     linux_assert::*,
     linux_i915_private::{
-        DrmI915Private, i915_increase_reset_engine_count, i915_reset_count, i915_reset_engine_count,
+        DrmI915Private, intel_irqs_enabled, i915_increase_reset_engine_count, i915_reset_count, i915_reset_engine_count,
     },
     linux_list::*,
     linux_locks::*,

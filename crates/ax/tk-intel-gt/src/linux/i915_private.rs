@@ -102,7 +102,9 @@ pub struct DrmI915Private {
     pub params: I915Params,
     pub info: *const c_void,
     pub runtime: IntelRuntimeInfo,
-    _before_wq: [u8; 840],
+    _before_irqs_enabled: [u8; 704],
+    pub irqs_enabled: bool,
+    _after_irqs_enabled: [u8; 135],
     /// Source `preserve_bios_swizzle` field (verified at offset 2532 against
     /// the configured Linux 7.2.3 x86_64 C layout).
     pub preserve_bios_swizzle: bool,
@@ -140,6 +142,12 @@ pub struct I915GemPrivate {
 }
 
 pub const I915_MAX_GT: usize = 2;
+
+/// `intel_irqs_enabled()` from `i915_irq.c`.
+#[inline]
+pub unsafe fn intel_irqs_enabled(i915: *const DrmI915Private) -> bool {
+    unsafe { (*i915).irqs_enabled }
+}
 
 /// Source inline helper from i915_gpu_error.h.
 #[inline]
@@ -184,6 +192,7 @@ const _: [(); 1488] = [(); offset_of!(DrmDevicePrefix, vma_offset_manager)];
 const _: [(); 80] = [(); size_of::<I915Params>()];
 const _: [(); 8] = [(); align_of::<I915Params>()];
 const _: [(); 2536] = [(); offset_of!(DrmI915Private, wq)];
+const _: [(); 2396] = [(); offset_of!(DrmI915Private, irqs_enabled)];
 const _: [(); 2544] = [(); offset_of!(DrmI915Private, unordered_wq)];
 const _: [(); 2532] = [(); offset_of!(DrmI915Private, preserve_bios_swizzle)];
 const _: [(); 2560] = [(); offset_of!(DrmI915Private, gem_quirks)];
@@ -207,6 +216,7 @@ const _: [(); 1568] = [(); offset_of!(DrmI915Private, params)];
 const _: [(); 1572] = [(); offset_of!(DrmI915Private, params.enable_guc)];
 const _: [(); 1648] = [(); offset_of!(DrmI915Private, info)];
 const _: [(); 1656] = [(); offset_of!(DrmI915Private, runtime)];
+const _: [(); 2396] = [(); offset_of!(DrmI915Private, irqs_enabled)];
 const _: [(); 2544] = [(); offset_of!(DrmI915Private, unordered_wq)];
 const _: [(); 3120] = [(); offset_of!(DrmI915Private, gpu_error)];
 const _: [(); 3176] = [(); offset_of!(DrmI915Private, runtime_pm)];
