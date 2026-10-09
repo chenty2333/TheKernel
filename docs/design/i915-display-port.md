@@ -47,3 +47,17 @@ not yet been connected.
 enabled API; the pipe-A boot path and a kernel unit path use it for AUX-A
 references. `connect.rs`/`output.rs` still own direct AUX/DDI well sequences,
 so the references are not yet unified across a complete modeset lifetime.
+
+## Native atomic activation replacement plan (2026-10-09)
+
+The active userspace path is `DRM_IOCTL_MODE_ATOMIC` in `kernel/src/drm/atomic.rs` → `DrmDevice` job queue / `advance_atomic_commit()` → `complete_atomic()` in `kernel/src/drm/device.rs` → `DisplayAdapter::present()` → `Native::present()` in `kernel/src/drm/intel/fastboot.rs`. Today the Native adapter validates and prepares the framebuffer, then `tc_modeset::program()` owns one monolithic TC1/2 HDMI transaction; the translated atomic-state code is a pure preflight, not the hardware path.
+
+Replacement will proceed behind this queue boundary, maintaining one serialized transaction and the existing before-image/readback/rollback/quarantine guarantees:
+
+1. Move the existing quiesced CDCLK raise/restore callback behind the translated `SetCdclkPrePlaneUpdate`/`SetCdclkPostPlaneUpdate` operations; keep refusing a transition until all consumers are proven disabled.
+2. Feed the translated DPLL atomic state the validated target clock/route, perform source-shaped get/reserve/swap and source enable/disable callbacks, and include allocator state in rollback.
+3. Replace TC's direct phase ownership incrementally with translated DDI/TC output hooks. Keep cold-exit, ownership, AUX/DP training and failures fail-closed until each has checked power references, bounded waits, readback and rollback.
+4. Move pipe/plane programming to translated CRTC and universal-plane steps; derive and verify WM/DDB before any arm, with vblank/DMA-retirement ownership retained.
+5. Acquire/release map-backed power domains around those phases, then enable DC transitions only with their observers and delayed puts. Run the translated commit tail only when every action emitted for this supported state has a real adapter; remove the matching legacy phase in the same change.
+
+Each phase is a separate commit with focused host/kernel compile checks. The old TC transaction remains the rollback owner until an equivalent translated sequence passes full register-image and failure-injection tests; no preflight or no-op callback counts as activation. Current phase status is tracked in `progress-G1.md`.
