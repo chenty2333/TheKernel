@@ -297,18 +297,13 @@ pub(crate) fn commit_cdclk_voltage<R: Registers, T: PollTimer>(
     timer: &T,
     cdclk_khz: u32,
 ) -> Result<(), PcodeError> {
-    let voltage_level = if cdclk_khz <= 312_000 {
-        0
-    } else if cdclk_khz <= 556_800 {
-        1
-    } else {
-        2
-    };
+    let voltage_level = super::clk::source_voltage_level(cdclk_khz)
+        .ok_or(PcodeError::MailboxStatus(-intel_pcode_full::EINVAL))?;
     let mut io = RegisterPcode::new(regs, timer, 12, false);
     let status = intel_pcode_full::snb_pcode_write_timeout(
         &mut io,
         intel_pcode_full::SKL_PCODE_CDCLK_CONTROL,
-        voltage_level,
+        u32::from(voltage_level),
         1,
     );
     io.result(status)

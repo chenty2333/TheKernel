@@ -932,6 +932,130 @@ impl<R: Registers, T: PollTimer> super::tc_modeset::DpllLifecycle
     }
 }
 
+struct NativeClockLifecycle<'a, R, T> {
+    registers: &'a R,
+    timer: &'a T,
+    before: super::clk::CdclkObservation,
+}
+
+impl<R: Registers, T: PollTimer> NativeClockLifecycle<'_, R, T> {
+    fn read_register(&self, offset: u32) -> Result<u32, String> {
+        read(self.registers, offset)
+            .map_err(|error| format!("CDCLK safety read {offset:#x} failed: {error:?}"))
+    }
+
+    fn require_all_consumers_disabled(&self) -> Result<(), String> {
+        for register in [p::PIPECONF_A, p::PIPECONF_B, p::PIPECONF_C, p::PIPECONF_D] {
+            if self.read_register(register.offset())? & (1 << 31) != 0 {
+                return Err(format!(
+                    "CDCLK transition refused while {} is enabled",
+                    register.name()
+                ));
+            }
+        }
+        for register in [
+            regs::ddi::TRANS_DDI_FUNC_CTL_A,
+            regs::ddi::TRANS_DDI_FUNC_CTL_B,
+            regs::ddi::TRANS_DDI_FUNC_CTL_C,
+            regs::ddi::TRANS_DDI_FUNC_CTL_D,
+        ] {
+            if self.read_register(register.offset())? & (1 << 31) != 0 {
+                return Err(format!(
+                    "CDCLK transition refused while {} is enabled",
+                    register.name()
+                ));
+            }
+        }
+        // DDI_BUF_CTL belongs to the port, not the transcoder. Verify every
+        // source port window rather than inferring inactivity from Pipe-A's
+        // current route. An inaccessible peer port is not proof that its
+        // buffer is off.
+        for port in 0..6u32 {
+            let offset = 0x64000 + port * 0x100;
+            if self.read_register(offset)? & (1 << 31) != 0 {
+                return Err(format!(
+                    "CDCLK transition refused while DDI_BUF_CTL({port}) is enabled"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn transition(
+        &self,
+        current: super::clk::CdclkObservation,
+        target: super::clk::CdclkEntry,
+        pipe: Option<u8>,
+    ) -> Result<(), String> {
+        if !current.usable() {
+            return Err(String::from(
+                "CDCLK transition requires a usable current state",
+            ));
+        }
+        self.require_all_consumers_disabled()?;
+        super::pcode::prepare_cdclk_change(self.registers, self.timer)
+            .map_err(|error| format!("CDCLK PCode PREPARE failed: {error:?}"))?;
+        let transition = super::clk::transition(self.registers, current, target, pipe, true)
+            .map_err(|error| format!("CDCLK source transition failed: {}", error.describe()))?;
+        if !transition.after.usable()
+            || transition.after.entry != Some(target)
+            || transition.after.cdclk_khz != target.cdclk_khz
+        {
+            return Err(String::from("CDCLK transition target did not read back"));
+        }
+        super::pcode::commit_cdclk_voltage(self.registers, self.timer, transition.after.cdclk_khz)
+            .map_err(|error| format!("CDCLK PCode voltage update failed: {error:?}"))
+    }
+}
+
+impl<R: Registers, T: PollTimer> super::tc_modeset::ClockLifecycle
+    for NativeClockLifecycle<'_, R, T>
+{
+    fn adjust(&mut self, target_clock_khz: u32, restore_before_image: bool) -> Result<(), String> {
+        let current = super::clk::observe(self.registers)
+            .map_err(|error| format!("CDCLK readout failed: {}", error.describe()))?;
+        if restore_before_image {
+            if current.entry == self.before.entry
+                && current.cdclk_khz == self.before.cdclk_khz
+                && current.pipe_field == self.before.pipe_field
+            {
+                return Ok(());
+            }
+            let target = self
+                .before
+                .entry
+                .ok_or_else(|| String::from("saved CDCLK has no restorable source table row"))?;
+            let pipe = match self.before.pipe_field {
+                0..=3 => Some(self.before.pipe_field as u8),
+                7 => None,
+                field => {
+                    return Err(format!(
+                        "saved CDCLK pipe selector {field} cannot be restored"
+                    ));
+                }
+            };
+            return self.transition(current, target, pipe);
+        }
+
+        if !current.usable() {
+            return Err(String::from(
+                "CDCLK mode change requires a usable current state",
+            ));
+        }
+        if target_clock_khz <= current.cdclk_khz {
+            return Ok(());
+        }
+        if self.before.entry.is_none() {
+            return Err(String::from(
+                "CDCLK raise refused because the firmware before-image has no source table row",
+            ));
+        }
+        let target = super::clk::entry_at_least(current.reference, target_clock_khz)
+            .ok_or_else(|| format!("no CDCLK table row can carry {target_clock_khz} kHz"))?;
+        self.transition(current, target, None)
+    }
+}
+
 fn verify_translated_crtc_state(
     firmware: &Firmware,
     port: TcPort,
@@ -1828,6 +1952,48 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                         });
                     }
                 };
+            let cdclk_before = match super::clk::observe(&self.registers) {
+                Ok(observation) if observation.usable() => observation,
+                result => {
+                    if let Some(new) = next {
+                        // CDCLK admission is a read-only preflight before any
+                        // pipe, link, PLL, or plane write.
+                        // SAFETY: the displayed before-image is still active;
+                        // no scanout register references this candidate binding.
+                        if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                            state.quarantine.push(new);
+                            state.lost = true;
+                        }
+                    }
+                    complete.signal_error();
+                    axlog::warn!("intel-tc-modeset: CDCLK readout refused: {result:?}");
+                    return Err(if state.lost {
+                        DrmError::DeviceLost
+                    } else {
+                        DrmError::Busy
+                    });
+                }
+            };
+            if target.timing.clock_khz > cdclk_before.cdclk_khz
+                && (cdclk_before.entry.is_none()
+                    || super::clk::entry_at_least(cdclk_before.reference, target.timing.clock_khz)
+                        .is_none())
+            {
+                if let Some(new) = next {
+                    // SAFETY: no display register has been written; the old
+                    // scanout remains the only DMA consumer of its binding.
+                    if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                        state.quarantine.push(new);
+                        state.lost = true;
+                    }
+                }
+                complete.signal_error();
+                return Err(if state.lost {
+                    DrmError::DeviceLost
+                } else {
+                    DrmError::Unsupported
+                });
+            }
             let old_firmware = state.firmware.clone();
             let old_mode = state.current_mode;
             let old_surface = before;
@@ -1873,6 +2039,11 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                         old,
                         new,
                     };
+                    let mut clock_lifecycle = NativeClockLifecycle {
+                        registers: &self.registers,
+                        timer: &self.timer,
+                        before: cdclk_before,
+                    };
                     super::tc_modeset::program(
                         &self.registers,
                         &self.timer,
@@ -1891,6 +2062,8 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                         true,
                         None,
                         Some(&mut lifecycle),
+                        Some(&mut clock_lifecycle),
+                        false,
                         &mut display_writes_started,
                     )
                 })
@@ -1992,6 +2165,11 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                     let old_avi = old_avi_frame
                         .and_then(|raw| super::tc_modeset::avi_words_preserve(raw).ok());
                     let mut rollback_display_writes_started = false;
+                    let mut rollback_clock_lifecycle = NativeClockLifecycle {
+                        registers: &self.registers,
+                        timer: &self.timer,
+                        before: cdclk_before,
+                    };
                     let mut recovered = old_avi.is_some_and(|old_avi| {
                         super::tc_modeset::program(
                             &self.registers,
@@ -2011,6 +2189,8 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                             false,
                             Some(&old_firmware.phy),
                             None,
+                            Some(&mut rollback_clock_lifecycle),
+                            true,
                             &mut rollback_display_writes_started,
                         )
                         .and_then(|()| {
@@ -2583,6 +2763,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn native_cdclk_lifecycle_refuses_active_pipe_consumers() {
+        let (_, registers, _) = native();
+        let timer = Timer(Arc::new(AtomicU64::new(0)));
+        let lifecycle = NativeClockLifecycle {
+            registers: &registers,
+            timer: &timer,
+            before: super::super::clk::CdclkObservation {
+                reference: super::super::clk::ReferenceClock::Mhz24,
+                reference_recognised: false,
+                pll_register: 0,
+                pll_enabled: false,
+                pll_locked: false,
+                ratio: 0,
+                vco_khz: 0,
+                divider: super::super::clk::Cd2xDivider::Div1,
+                cdclk_khz: 0,
+                ctl: 0,
+                decimal_field: 0,
+                pipe_field: 0,
+                entry: None,
+            },
+        };
+        assert!(lifecycle.require_all_consumers_disabled().is_err());
     }
 
     #[derive(Clone)]
@@ -3429,6 +3635,8 @@ mod tests {
             true,
             None,
             None,
+            None,
+            false,
             &mut probe_display_writes_started,
         );
         assert!(probe_result.is_ok(), "direct TC program: {probe_result:?}");

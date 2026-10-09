@@ -35,7 +35,17 @@ boot modeset now invokes the adapter only after all four pipes and the combo
 DDI link are proven off,
 with PCode PREPARE / voltage update around the change and a reverse transaction
 path restoring both clock registers and the old PCODE voltage on later
-modeset failure. Active-pipe atomic CDCLK transitions remain unconnected.
+modeset failure. Native TC HDMI now also carries a restricted runtime callback
+in its Pipe-A transaction: when a requested pixel clock exceeds the current
+CDCLK, it requires every PIPECONF, transcoder FUNC_CTL and DDI buffer window to
+read disabled while the transaction has quiesced the link, then raises to the
+minimum source table row with PCode prepare/voltage and restores the captured
+clock during verified rollback. An inaccessible peer DDI buffer fails closed.
+This is raise-only for the single selected TC path; general active-pipe atomic
+CDCLK changes, lowering/power optimization, and generic modeset orchestration
+remain unconnected. The current Native mode set (firmware 4K30 and 1080p60)
+is not expected to cross its boot CDCLK ceiling, so this callback is integrated
+but not exercised by those presently advertised timings.
 
 Still unported from the upstream file are caller-side PCode pre/post
 notifications, audio/PSR/GMBUS/AUX locking and coordination, atomic CDCLK

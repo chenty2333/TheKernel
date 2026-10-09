@@ -253,6 +253,13 @@ pub(super) trait DpllLifecycle {
     fn enable(&mut self) -> Result<(), String>;
 }
 
+/// CDCLK is shared by every display pipe. The Native caller may change it
+/// only while a complete all-pipes/link-disabled predicate holds, and must
+/// pair any forward transition with the captured CDCLK before-image.
+pub(super) trait ClockLifecycle {
+    fn adjust(&mut self, target_clock_khz: u32, restore_before_image: bool) -> Result<(), String>;
+}
+
 fn wait_two_frames<R: Registers, T: PollTimer>(r: &R, timer: &T) -> Result<(), String> {
     if read(r, p::PIPECONF_A.offset())? & PIPE_RUNNING == 0 {
         return Ok(());
@@ -976,6 +983,8 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     retire_audio_before_link: bool,
     restore_phy: Option<&intel_display::tc::DklPhyState>,
     mut dpll_lifecycle: Option<&mut dyn DpllLifecycle>,
+    mut clock_lifecycle: Option<&mut dyn ClockLifecycle>,
+    restore_clock: bool,
     display_writes_started: &mut bool,
 ) -> Result<(), String> {
     *display_writes_started = false;
@@ -1123,6 +1132,9 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         ));
     }
     disable_pipe_a_transcoder_clock(r, port)?;
+    if let Some(lifecycle) = clock_lifecycle.as_deref_mut() {
+        lifecycle.adjust(mode.clock_khz, restore_clock)?;
+    }
     if let Some(lifecycle) = dpll_lifecycle.as_deref_mut() {
         lifecycle.disable()?;
     } else {
