@@ -1611,13 +1611,18 @@ impl InputManager {
         let dev_id = key.device_id;
         let bus_identity = registered.identity;
         let transport_path = input_transport_path(bus_identity);
+        let transport_bus = match bus_identity {
+            axdriver::InputBusIdentity::Pci(_) => "pci",
+            axdriver::InputBusIdentity::Usb(_) => "usb",
+            axdriver::InputBusIdentity::Bootstrap => "virtual",
+        };
         let sysfs = input_sysfs_description(&mut registered.device, bus_identity);
         let parent_identity =
-            DeviceIdentity::without_dev("pci".into(), "input".into(), input_name.clone()).and_then(
+            DeviceIdentity::without_dev(transport_bus.into(), "input".into(), input_name.clone()).and_then(
                 |identity| identity.child_of_path(transport_path.clone(), "input".into()),
             );
         let event_identity =
-            DeviceIdentity::new("pci".into(), "input".into(), event_name.clone(), dev_id)
+            DeviceIdentity::new(transport_bus.into(), "input".into(), event_name.clone(), dev_id)
                 .and_then(|identity| identity.with_devname(format!("input/{event_name}")))
                 .and_then(|identity| {
                     identity.child_of_path(format!("{transport_path}/input"), input_name.clone())
@@ -1644,8 +1649,11 @@ impl InputManager {
                 )?;
                 return Ok((None, parent_handle, event_handle));
             }
-            let pci = pci_sysfs_registration(bus_identity)?;
-            let virtio = virtio_sysfs_registration(bus_identity)?;
+            let axdriver::InputBusIdentity::Pci(pci_identity) = bus_identity else {
+                unreachable!("PCI transport publication requires a PCI input identity")
+            };
+            let pci = pci_sysfs_registration(pci_identity)?;
+            let virtio = virtio_sysfs_registration(pci_identity)?;
             let pci_reservation = global_device_registry().reserve(pci.identity().clone())?;
             let virtio_reservation = global_device_registry().reserve(virtio.identity().clone())?;
             let parent_reservation = global_device_registry().reserve(parent.identity().clone())?;
@@ -1906,23 +1914,32 @@ struct InputSysfsDescription {
     modalias: String,
     capabilities: Vec<(&'static str, String)>,
     properties: String,
-    pci_vendor: u16,
-    pci_device: u16,
-    pci_modalias: String,
-    virtio_index: u32,
+    pci: Option<axdriver::PciInputIdentity>,
 }
 
 impl InputSysfsDescription {
     fn attributes(&self) -> Vec<DeviceAttribute> {
-        vec![
+        let mut attributes = vec![
             attribute("name", self.name.clone()),
             attribute("phys", self.phys.clone()),
             attribute("uniq", self.uniq.clone()),
             attribute("modalias", self.modalias.clone()),
-            attribute("pci_vendor", format!("{:04x}\n", self.pci_vendor)),
-            attribute("pci_device", format!("{:04x}\n", self.pci_device)),
-            attribute("pci_modalias", self.pci_modalias.clone()),
-            attribute("virtio_index", format!("{}\n", self.virtio_index)),
+        ];
+        if let Some(pci) = self.pci {
+            attributes.extend([
+                attribute("pci_vendor", format!("{:04x}\n", pci.vendor_id)),
+                attribute("pci_device", format!("{:04x}\n", pci.device_id)),
+                attribute(
+                    "pci_modalias",
+                    format!(
+                        "pci:v{:08X}d{:08X}sv*sd*bc*sc*i*\n",
+                        pci.vendor_id, pci.device_id
+                    ),
+                ),
+                attribute("virtio_index", format!("{}\n", pci.virtio_index)),
+            ]);
+        }
+        attributes.extend([
             attribute("properties", self.properties.clone()),
             attribute_dir(
                 "id",
@@ -1940,7 +1957,8 @@ impl InputSysfsDescription {
                     .map(|(name, value)| attribute(name, value.clone()))
                     .collect(),
             ),
-        ]
+        ]);
+        attributes
     }
 }
 
@@ -1948,38 +1966,55 @@ impl InputSysfsDescription {
 /// The input kobject is represented separately by `child_of_path` so the
 /// event child can name that same parent without duplicating either name.
 fn input_transport_path(identity: axdriver::InputBusIdentity) -> String {
-    if identity.vendor_id == 0 && identity.device_id == 0 {
-        return format!("virtual/virtio{}", identity.virtio_index);
+    match identity {
+        axdriver::InputBusIdentity::Bootstrap => "virtual/input".into(),
+        axdriver::InputBusIdentity::Pci(identity) => format!(
+            "{}/{}/{}",
+            pci_root_name(identity),
+            pci_bdf_name(identity),
+            virtio_name(identity),
+        ),
+        axdriver::InputBusIdentity::Usb(identity) => format!(
+            "usb{}/{}",
+            identity.bus,
+            axdriver::InputBusIdentity::usb_device_name(identity),
+        ),
     }
-    format!(
-        "{}/{}/{}",
-        pci_root_name(identity),
-        pci_bdf_name(identity),
-        virtio_name(identity),
-    )
+}
+
+fn input_physical_path(identity: axdriver::InputBusIdentity) -> String {
+    match identity {
+        axdriver::InputBusIdentity::Usb(identity) => format!(
+            "{}:{}.{:x}/input",
+            input_transport_path(axdriver::InputBusIdentity::Usb(identity)),
+            identity.configuration,
+            identity.interface,
+        ),
+        _ => format!("{}/input", input_transport_path(identity)),
+    }
 }
 
 fn has_pci_transport(identity: axdriver::InputBusIdentity) -> bool {
-    identity.vendor_id != 0 || identity.device_id != 0
+    matches!(identity, axdriver::InputBusIdentity::Pci(_))
 }
 
-fn pci_root_name(identity: axdriver::InputBusIdentity) -> String {
+fn pci_root_name(identity: axdriver::PciInputIdentity) -> String {
     format!("pci{:04x}:{:02x}", identity.domain, identity.bus)
 }
 
-fn pci_bdf_name(identity: axdriver::InputBusIdentity) -> String {
+fn pci_bdf_name(identity: axdriver::PciInputIdentity) -> String {
     format!(
         "{:04x}:{:02x}:{:02x}.{:x}",
         identity.domain, identity.bus, identity.device, identity.function
     )
 }
 
-fn virtio_name(identity: axdriver::InputBusIdentity) -> String {
+fn virtio_name(identity: axdriver::PciInputIdentity) -> String {
     format!("virtio{}", identity.virtio_index)
 }
 
 fn pci_sysfs_registration(
-    identity: axdriver::InputBusIdentity,
+    identity: axdriver::PciInputIdentity,
 ) -> VfsResult<alloc::sync::Arc<DeviceRegistration>> {
     let root = pci_root_name(identity);
     let bdf = pci_bdf_name(identity);
@@ -2003,7 +2038,7 @@ fn pci_sysfs_registration(
 }
 
 fn virtio_sysfs_registration(
-    identity: axdriver::InputBusIdentity,
+    identity: axdriver::PciInputIdentity,
 ) -> VfsResult<alloc::sync::Arc<DeviceRegistration>> {
     let root = pci_root_name(identity);
     let bdf = pci_bdf_name(identity);
@@ -2060,7 +2095,7 @@ fn input_sysfs_description(
         phys: {
             let physical = device.physical_location();
             if physical.is_empty() {
-                format!("{}/input", input_transport_path(identity))
+                input_physical_path(identity)
             } else {
                 physical.into()
             }
@@ -2073,13 +2108,10 @@ fn input_sysfs_description(
         ),
         capabilities,
         properties: bitmap_hex(&properties),
-        pci_vendor: identity.vendor_id,
-        pci_device: identity.device_id,
-        pci_modalias: format!(
-            "pci:v{:08X}d{:08X}sv*sd*bc*sc*i*\n",
-            identity.vendor_id, identity.device_id
-        ),
-        virtio_index: identity.virtio_index,
+        pci: match identity {
+            axdriver::InputBusIdentity::Pci(identity) => Some(identity),
+            _ => None,
+        },
     }
 }
 
@@ -2252,6 +2284,28 @@ mod tests {
     }
 
     #[test]
+    fn usb_input_identity_uses_observed_port_chain_without_pci_aliases() {
+        let identity = axdriver::UsbInputIdentity {
+            bus: 2,
+            ports: [4, 3, 0, 0, 0, 0],
+            depth: 2,
+            configuration: 1,
+            interface: 7,
+        };
+        let bus_identity = axdriver::InputBusIdentity::Usb(identity);
+        assert_eq!(
+            input_transport_path(bus_identity),
+            "usb2/2-4.3"
+        );
+        assert_eq!(input_physical_path(bus_identity), "usb2/2-4.3:1.7/input");
+        assert!(!has_pci_transport(bus_identity));
+        assert_eq!(
+            input_transport_path(axdriver::InputBusIdentity::Bootstrap),
+            "virtual/input"
+        );
+    }
+
+    #[test]
     fn input_parent_sysfs_has_linux_id_and_capability_paths() {
         let description = InputSysfsDescription {
             name: "virtio keyboard".into(),
@@ -2276,10 +2330,15 @@ mod tests {
                 ("sw", "0\n".into()),
             ],
             properties: "0\n".into(),
-            pci_vendor: 0x1af4,
-            pci_device: 0x1052,
-            pci_modalias: "pci:v00001AF4d00001052sv*sd*bc*sc*i*\n".into(),
-            virtio_index: 16,
+            pci: Some(axdriver::PciInputIdentity {
+                domain: 0,
+                bus: 0,
+                device: 3,
+                function: 0,
+                vendor_id: 0x1af4,
+                device_id: 0x1052,
+                virtio_index: 16,
+            }),
         };
         let attributes = description.attributes();
         let names = attributes
@@ -2319,6 +2378,19 @@ mod tests {
                 .directory_child_names()
                 .unwrap(),
             vec!["ev", "key", "rel", "abs", "msc", "led", "snd", "ff", "sw"]
+        );
+        let usb_names = InputSysfsDescription {
+            pci: None,
+            ..description
+        }
+        .attributes()
+        .into_iter()
+        .map(|attribute| alloc::string::String::from(attribute.name()))
+        .collect::<Vec<_>>();
+        assert!(
+            ["pci_vendor", "pci_device", "pci_modalias", "virtio_index"]
+                .iter()
+                .all(|name| !usb_names.iter().any(|present| present.as_str() == *name))
         );
     }
 

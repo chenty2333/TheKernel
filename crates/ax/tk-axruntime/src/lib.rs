@@ -254,10 +254,10 @@ static INITED_CPUS: AtomicUsize = AtomicUsize::new(0);
 /// PCI config-space scans and input removal callbacks may sleep, so neither
 /// belongs in a PCI/interrupt notification handler.
 #[cfg(all(feature = "input", feature = "multitask", feature = "irq"))]
-static PCI_INPUT_RECONCILE_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+static INPUT_RECONCILE_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(all(feature = "input", feature = "multitask", feature = "irq"))]
-const PCI_INPUT_RECONCILE_INTERVAL: core::time::Duration = core::time::Duration::from_secs(1);
+const INPUT_RECONCILE_INTERVAL: core::time::Duration = core::time::Duration::from_secs(1);
 
 #[cfg(all(feature = "irq", feature = "multitask", feature = "ipi"))]
 const CALL_FUNCTION_TIMER_EVENT_RETRIGGER: usize = 1 << 0;
@@ -632,7 +632,7 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     // secondary CPUs must pass their initialization barrier before the input
     // reconciliation worker can submit that work.
     #[cfg(all(feature = "input", feature = "multitask", feature = "irq"))]
-    start_pci_input_reconcile_worker();
+    start_input_reconcile_worker();
 
     // Everything before `main` is now done, including every step which could
     // have stopped the machine without a console to say so.  From here the
@@ -651,24 +651,18 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     }
 }
 
-/// Reconcile the explicitly supported PCI VirtIO-input hotplug domain.
-///
-/// Platform PCI/ACPI notification code calls this after a topology change;
-/// MMIO and non-input PCI devices remain outside this lifecycle until they
-/// have their own teardown ownership.
+/// Reconcile input transports that have an explicit safe hotplug lifecycle.
 #[cfg(feature = "input")]
-pub fn reconcile_pci_input_hotplug() {
-    axinput::reconcile_pci_devices();
+pub fn reconcile_input_hotplug() {
+    axinput::reconcile_devices();
 }
 
-/// Starts the fallback service used on Q35 while no ACPI PCI hotplug event
-/// source is exposed by the platform.  A future ACPI notifier may call
-/// [`reconcile_pci_input_hotplug`] immediately; this worker remains the
-/// bounded loss-recovery path for missed notifications and QMP `device_add` /
-/// `device_del` transitions.
+/// Starts the existing bounded input hotplug fallback service. A future bus
+/// notifier may call [`reconcile_input_hotplug`] immediately; this worker
+/// remains the loss-recovery path for missed notifications.
 #[cfg(all(feature = "input", feature = "multitask", feature = "irq"))]
-fn start_pci_input_reconcile_worker() {
-    if PCI_INPUT_RECONCILE_WORKER_STARTED
+fn start_input_reconcile_worker() {
+    if INPUT_RECONCILE_WORKER_STARTED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
@@ -676,8 +670,8 @@ fn start_pci_input_reconcile_worker() {
     }
     if let Err(error) = axtask::spawn(|| {
         loop {
-            reconcile_pci_input_hotplug();
-            if axtask::sleep(PCI_INPUT_RECONCILE_INTERVAL).is_err() {
+            reconcile_input_hotplug();
+            if axtask::sleep(INPUT_RECONCILE_INTERVAL).is_err() {
                 // The worker must remain live if a timer admission is temporarily
                 // exhausted. Yielding avoids a tight scan loop and lets the
                 // scheduler/timer owners make progress before retrying.
@@ -685,7 +679,7 @@ fn start_pci_input_reconcile_worker() {
             }
         }
     }) {
-        PCI_INPUT_RECONCILE_WORKER_STARTED.store(false, Ordering::Release);
+        INPUT_RECONCILE_WORKER_STARTED.store(false, Ordering::Release);
         warn!("failed to start PCI input reconcile worker: {error:?}");
     }
 }

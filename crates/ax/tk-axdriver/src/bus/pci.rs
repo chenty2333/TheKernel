@@ -189,7 +189,7 @@ fn input_identity(
     bdf: DeviceFunction,
     info: &axdriver_pci::DeviceFunctionInfo,
 ) -> crate::InputBusIdentity {
-    crate::InputBusIdentity {
+    crate::InputBusIdentity::Pci(crate::PciInputIdentity {
         domain: 0,
         bus: bdf.bus,
         device: bdf.device,
@@ -197,7 +197,7 @@ fn input_identity(
         vendor_id: info.vendor_id,
         device_id: info.device_id,
         virtio_index: ((bdf.bus as u32) << 8) | ((bdf.device as u32) << 3) | bdf.function as u32,
-    }
+    })
 }
 
 /// PCI discovery state retained after boot.  `PciRoot` is cheaply rebuilt for

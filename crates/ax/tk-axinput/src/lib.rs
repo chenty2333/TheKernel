@@ -27,11 +27,11 @@ impl InputDeviceToken {
     }
 }
 
-/// Reconciles the PCI input topology. It is intentionally explicit: callers
-/// invoke it from their PCI hotplug notification/poll point, while this module
-/// remains the sole owner of event-node lifetime and removal revocation.
-pub fn reconcile_pci_devices() {
-    axdriver::reconcile_pci_input_devices(
+/// Reconciles input devices on transports with a safe removal lifecycle.
+/// The input subsystem remains the sole owner of event-node lifetime and
+/// removal revocation.
+pub fn reconcile_devices() {
+    axdriver::reconcile_input_devices(
         |device, identity| register_input_with_identity(device, identity).get(),
         |token| unregister_input(InputDeviceToken(token)),
     );
@@ -213,7 +213,7 @@ pub fn init_input(mut input_devs: AxDeviceContainer<AxInputDevice>) {
         );
         register_input(dev);
     }
-    axdriver::activate_boot_pci_input_devices(
+    axdriver::activate_boot_input_devices(
         |device, identity| register_input_with_identity(device, identity).get(),
         |token| unregister_input(InputDeviceToken(token)),
     );

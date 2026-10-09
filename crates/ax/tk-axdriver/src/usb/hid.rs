@@ -1,5 +1,6 @@
 //! USB HID report protocol using the bounded shared descriptor decoder.
 use alloc::collections::VecDeque;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use axdriver_base::{BaseDriverOps, DeviceType};
 use axdriver_input::{Event, EventType, InputDeviceId, InputDriverOps};
@@ -28,6 +29,7 @@ impl UsbInput {
         device: Arc<Mutex<Device>>,
         session: InterfaceSession,
         interface: &InterfaceDescriptor,
+        dma_quiesced: Arc<AtomicBool>,
     ) -> DevResult<Self> {
         let descriptor = interface
             .endpoints
@@ -80,6 +82,7 @@ impl UsbInput {
                 _owner: DeviceOwner {
                     _device: device,
                     _session: session,
+                    dma_quiesced,
                 },
                 endpoint,
                 report,
@@ -95,7 +98,7 @@ impl Drop for InputState {
     fn drop(&mut self) {
         // Boot devices normally live forever. If ownership is dropped, halt
         // the controller before freeing the report buffer still owned by DMA.
-        if self.pending.is_some() {
+        if self.pending.is_some() && !self._owner.dma_quiesced.load(Ordering::Acquire) {
             self.host.halt();
         }
     }
@@ -120,7 +123,9 @@ impl InputDriverOps for UsbInput {
         self.id
     }
     fn physical_location(&self) -> &str {
-        "usb/xhci"
+        // The input subsystem derives the stable physical path from the
+        // retained USB bus/port/interface identity rather than a generic tag.
+        ""
     }
     fn unique_id(&self) -> &str {
         ""

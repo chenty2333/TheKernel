@@ -118,6 +118,7 @@ impl UsbBlock {
             _owner: DeviceOwner {
                 _device: device,
                 _session: session,
+                dma_quiesced: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             },
             input,
             output,

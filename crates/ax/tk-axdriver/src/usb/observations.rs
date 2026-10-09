@@ -8,7 +8,10 @@ use crab_usb::{
 };
 use spin::Mutex;
 
-use crate::prelude::{DevError, DevResult};
+use crate::{
+    UsbInputIdentity,
+    prelude::{DevError, DevResult},
+};
 
 static NEXT_BUS: AtomicU16 = AtomicU16::new(1);
 static OBSERVATIONS: Mutex<Vec<Observation>> = Mutex::new(Vec::new());
@@ -120,6 +123,29 @@ pub fn speed(observation: &Observation) -> Option<&'static str> {
     }
 }
 
+pub(super) fn input_identity(
+    bus: u8,
+    location: ObservedLocation,
+    configuration: u8,
+    interface: u8,
+) -> Option<UsbInputIdentity> {
+    let depth = usize::from(location.depth);
+    if depth == 0
+        || depth > location.ports.len()
+        || location.ports[..depth].contains(&0)
+        || configuration == 0
+    {
+        return None;
+    }
+    Some(UsbInputIdentity {
+        bus,
+        ports: location.ports,
+        depth: location.depth,
+        configuration,
+        interface,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +171,38 @@ mod tests {
         assert_eq!(name(&observation), "3-4.2");
         assert_eq!(speed(&observation), Some("480\n"));
         assert_eq!(observation.location.address, 7);
+    }
+
+    #[test]
+    fn input_identity_retains_bus_port_chain_configuration_and_interface() {
+        let location = ObservedLocation {
+            address: 7,
+            ports: [4, 2, 0, 0, 0, 0],
+            depth: 2,
+            speed: Speed::High,
+            configuration: Some(1),
+        };
+        assert_eq!(
+            input_identity(3, location, 1, 2),
+            Some(UsbInputIdentity {
+                bus: 3,
+                ports: [4, 2, 0, 0, 0, 0],
+                depth: 2,
+                configuration: 1,
+                interface: 2,
+            })
+        );
+        assert_eq!(
+            input_identity(
+                3,
+                ObservedLocation {
+                    depth: 7,
+                    ..location
+                },
+                1,
+                2,
+            ),
+            None
+        );
     }
 }

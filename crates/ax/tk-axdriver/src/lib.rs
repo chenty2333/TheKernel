@@ -168,12 +168,20 @@ pub use self::structs::AxNetDevice;
 use self::structs::StaticBlockDevice;
 pub use self::structs::{AxDeviceContainer, AxDeviceEnum};
 
-/// Stable physical location supplied with a VirtIO-input registration.  The
-/// BDF-derived virtio index is deterministic across remove/re-add; it is not
-/// the transient `/dev/input/eventN` minor.
+/// Stable physical location supplied with an input registration.  PCI and
+/// USB identities retain their real bus topology; bootstrap devices remain
+/// explicitly unbound instead of being assigned a fabricated transport.
 #[cfg(feature = "input")]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct InputBusIdentity {
+pub enum InputBusIdentity {
+    Bootstrap,
+    Pci(PciInputIdentity),
+    Usb(UsbInputIdentity),
+}
+
+#[cfg(feature = "input")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PciInputIdentity {
     pub domain: u16,
     pub bus: u8,
     pub device: u8,
@@ -184,55 +192,90 @@ pub struct InputBusIdentity {
 }
 
 #[cfg(feature = "input")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct UsbInputIdentity {
+    /// USB bus number allocated to the xHCI controller for this boot.
+    pub bus: u8,
+    /// Root-to-leaf USB port chain, as reported by the probed topology.
+    pub ports: [u8; 6],
+    pub depth: u8,
+    pub configuration: u8,
+    pub interface: u8,
+}
+
+#[cfg(feature = "input")]
 impl InputBusIdentity {
     pub const fn bootstrap() -> Self {
-        Self {
-            domain: 0,
-            bus: 0,
-            device: 0,
-            function: 0,
-            vendor_id: 0,
-            device_id: 0,
-            virtio_index: 0,
+        Self::Bootstrap
+    }
+
+    pub fn usb_device_name(identity: UsbInputIdentity) -> alloc::string::String {
+        use alloc::string::ToString;
+
+        let mut name = alloc::format!("{}-", identity.bus);
+        for (index, port) in identity.ports[..usize::from(identity.depth.min(6))]
+            .iter()
+            .enumerate()
+        {
+            if index != 0 {
+                name.push('.');
+            }
+            name.push_str(&port.to_string());
         }
+        name
     }
 }
 
-/// Reconciles PCI VirtIO-input devices and delivers additions/removals to the
-/// input subsystem.  PCI is the only hotplug bus implemented today; MMIO
-/// discovery remains boot-only.
+/// Reconciles supported PCI/USB input transports and delivers additions and
+/// removals to the input subsystem. Other transport classes remain boot-only.
 ///
 /// The callbacks intentionally live above `axdriver`: input owns event-node
 /// lifetime, while this layer owns stable BDF identity and PCI transport
 /// discovery.  `register` returns the stable input token as a raw `u64`; the
 /// matching value is supplied to `unregister` exactly once on removal.
 #[cfg(feature = "input")]
-pub fn reconcile_pci_input_devices<Register, Unregister>(register: Register, unregister: Unregister)
+pub fn reconcile_input_devices<Register, Unregister>(
+    mut register: Register,
+    mut unregister: Unregister,
+)
 where
     Register: FnMut(AxInputDevice, InputBusIdentity) -> u64,
     Unregister: FnMut(u64),
 {
     #[cfg(all(not(feature = "dyn"), bus = "pci", input_dev = "virtio-input"))]
-    bus::pci::reconcile_input_devices(register, unregister);
+    bus::pci::reconcile_input_devices(&mut register, &mut unregister);
 
-    #[cfg(not(all(not(feature = "dyn"), bus = "pci", input_dev = "virtio-input")))]
+    #[cfg(feature = "usb-xhci")]
+    usb::reconcile_input_devices(register, unregister);
+
+    #[cfg(not(any(
+        all(not(feature = "dyn"), bus = "pci", input_dev = "virtio-input"),
+        feature = "usb-xhci"
+    )))]
     let _ = (register, unregister);
 }
 
-/// Publishes PCI input devices found during boot after the input subsystem has
-/// installed its listener. This shares BDF ownership with runtime reconcile.
+/// Publishes input devices found during boot after the input subsystem has
+/// installed its listener. Bus discovery retains the same ownership for later
+/// runtime removal.
 #[cfg(feature = "input")]
-pub fn activate_boot_pci_input_devices<Register, Unregister>(
-    register: Register,
-    unregister: Unregister,
+pub fn activate_boot_input_devices<Register, Unregister>(
+    mut register: Register,
+    mut unregister: Unregister,
 ) where
     Register: FnMut(AxInputDevice, InputBusIdentity) -> u64,
     Unregister: FnMut(u64),
 {
     #[cfg(all(not(feature = "dyn"), bus = "pci", input_dev = "virtio-input"))]
-    bus::pci::activate_boot_input_devices(register, unregister);
+    bus::pci::activate_boot_input_devices(&mut register, &mut unregister);
 
-    #[cfg(not(all(not(feature = "dyn"), bus = "pci", input_dev = "virtio-input")))]
+    #[cfg(feature = "usb-xhci")]
+    usb::activate_boot_input_devices(register, unregister);
+
+    #[cfg(not(any(
+        all(not(feature = "dyn"), bus = "pci", input_dev = "virtio-input"),
+        feature = "usb-xhci"
+    )))]
     let _ = (register, unregister);
 }
 
