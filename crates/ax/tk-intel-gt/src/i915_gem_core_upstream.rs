@@ -147,8 +147,8 @@ unsafe extern "C" {
     ) -> c_int;
     fn drm_mm_remove_node(node: *mut DrmMmNode);
     fn boot_cpu_data_clflush_size() -> usize;
-    fn __i915_gem_object_frontbuffer_flush(obj: *mut DrmI915GemObject, origin: u32);
-    fn __i915_gem_object_frontbuffer_invalidate(obj: *mut DrmI915GemObject, origin: u32);
+    pub(crate) fn __i915_gem_object_frontbuffer_flush(obj: *mut DrmI915GemObject, origin: u32);
+    pub(crate) fn __i915_gem_object_frontbuffer_invalidate(obj: *mut DrmI915GemObject, origin: u32);
     pub(crate) fn i915_gem_object_wait(obj: *mut DrmI915GemObject, flags: u32, timeout: c_long) -> c_int;
     fn __i915_gem_object_release_mmap_gtt(obj: *mut DrmI915GemObject);
     fn i915_gem_object_runtime_pm_release_mmap_offset(obj: *mut DrmI915GemObject);
@@ -178,6 +178,24 @@ unsafe extern "C" {
     fn flush_workqueue(wq: *mut c_void);
     fn drain_workqueue(wq: *mut c_void);
     static jiffies: c_ulong;
+}
+
+// Inline helpers from i915_gem_object_frontbuffer.h. rcu_access_pointer()
+// intentionally performs a READ_ONCE access without dereferencing the RCU
+// pointer; the out-of-line operation remains owned by i915_frontbuffer.c.
+pub(crate) unsafe fn i915_gem_object_frontbuffer_flush(obj: *mut DrmI915GemObject, origin: u32) {
+    if !unsafe { READ_ONCE!((*obj).frontbuffer) }.is_null() {
+        unsafe { __i915_gem_object_frontbuffer_flush(obj, origin) };
+    }
+}
+
+pub(crate) unsafe fn i915_gem_object_frontbuffer_invalidate(
+    obj: *mut DrmI915GemObject,
+    origin: u32,
+) {
+    if !unsafe { READ_ONCE!((*obj).frontbuffer) }.is_null() {
+        unsafe { __i915_gem_object_frontbuffer_invalidate(obj, origin) };
+    }
 }
 
 // Kernel constants/macros whose selected values are fixed by Linux 7.2.3.

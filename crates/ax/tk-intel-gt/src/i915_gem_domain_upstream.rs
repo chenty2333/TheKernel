@@ -13,7 +13,10 @@ use crate::{
         i915_gem_object_pin_pages, i915_gem_object_put, i915_gem_object_unlock,
         i915_gem_object_unpin_pages,
     },
-    i915_gem_core_upstream::i915_gem_object_wait,
+    i915_gem_core_upstream::{
+        i915_gem_object_frontbuffer_flush, i915_gem_object_frontbuffer_invalidate,
+        i915_gem_object_ggtt_pin_ww, i915_gem_object_unbind, i915_gem_object_wait,
+    },
     i915_gem_object_header_upstream::{
         __start_cpu_write, assert_object_held, i915_gem_object_is_proxy,
         i915_gem_object_is_userptr, i915_gem_object_lookup, i915_gem_object_lookup_rcu,
@@ -23,6 +26,7 @@ use crate::{
     i915_gem_object_upstream::{
         i915_gem_object_has_struct_page, i915_gem_object_set_cache_coherency,
     },
+    i915_gem_userptr_upstream::i915_gem_object_userptr_validate,
     i915_vma_api_upstream::*,
     intel_context_upstream::{I915GemWwCtx, I915GttView, I915Vma},
     linux_config::*,
@@ -376,7 +380,7 @@ pub unsafe fn i915_gem_object_set_cache_level(
     // The cache-level will be applied when each vma is rebound.
     i915_gem_object_unbind(
         obj,
-        I915_GEM_OBJECT_UNBIND_ACTIVE | I915_GEM_OBJECT_UNBIND_BARRIER,
+        (I915_GEM_OBJECT_UNBIND_ACTIVE | I915_GEM_OBJECT_UNBIND_BARRIER) as u64,
     )
 }
 
@@ -559,12 +563,12 @@ pub unsafe fn i915_gem_object_pin_to_display_plane(
             ww,
             view,
             0,
-            alignment as u32,
-            flags | PIN_MAPPABLE as u32 | PIN_NONBLOCK as u32,
+            alignment as u64,
+            (flags | PIN_MAPPABLE as u32 | PIN_NONBLOCK as u32) as u64,
         );
     }
     if IS_ERR(vma) && vma != ERR_PTR(-EDEADLK) {
-        vma = i915_gem_object_ggtt_pin_ww(obj, ww, view, 0, alignment as u32, flags);
+        vma = i915_gem_object_ggtt_pin_ww(obj, ww, view, 0, alignment as u64, flags as u64);
     }
     if IS_ERR(vma) {
         return vma;
