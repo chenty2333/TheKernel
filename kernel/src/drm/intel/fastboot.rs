@@ -1386,11 +1386,12 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
         false
     }
     fn primary_formats(&self) -> &'static [u32] {
-        // The shared ADDFB2 ioctl path still admits only four-byte XRGB/ARGB
-        // surfaces, so it cannot create the RGB565 framebuffers this plane
-        // transaction understands. Keep the advertised Native set aligned
-        // with the reachable UAPI instead of exposing an unusable format.
-        &[intel_display::universal_plane::XRGB8888]
+        // The native primary plane and reachable CREATE_DUMB/ADDFB UAPI
+        // support linear XRGB8888 and RGB565 surfaces.
+        &[
+            intel_display::universal_plane::XRGB8888,
+            intel_display::universal_plane::RGB565,
+        ]
     }
     fn gamma_lut_size(&self) -> u32 {
         256
@@ -2729,7 +2730,10 @@ mod tests {
         let (adapter, ..) = native();
         assert_eq!(
             adapter.primary_formats(),
-            &[intel_display::universal_plane::XRGB8888]
+            &[
+                intel_display::universal_plane::XRGB8888,
+                intel_display::universal_plane::RGB565,
+            ]
         );
     }
 

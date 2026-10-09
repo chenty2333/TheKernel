@@ -220,7 +220,7 @@ pub(super) fn dispatch(
                 || request.offsets[1..].iter().any(|&offset| offset != 0)
                 || request.modifier[1..].iter().any(|&modifier| modifier != 0)
                 || request.modifier[0] != 0
-                || request.pixel_format != XRGB8888 && request.pixel_format != ARGB8888
+                || !matches!(request.pixel_format, XRGB8888 | ARGB8888 | 0x3631_4752)
             {
                 return Err(AxError::InvalidInput);
             }
@@ -233,7 +233,7 @@ pub(super) fn dispatch(
                     request.width,
                     request.height,
                     request.pitches[0],
-                    32,
+                    if request.pixel_format == 0x3631_4752 { 16 } else { 32 },
                     request.pixel_format,
                     u64::from(request.offsets[0]),
                 )
@@ -364,7 +364,7 @@ fn fd_flags(flags: u32) -> AxResult<bool> {
 
 fn addfb(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let mut r: uapi::DrmModeFbCmd = read_pod(copy, arg)?;
-    if r.bpp != 32 || !matches!(r.depth, 24 | 32) {
+    if !matches!((r.bpp, r.depth), (16, 16) | (32, 24 | 32)) {
         return Err(AxError::InvalidInput);
     }
     r.fb_id = file
@@ -374,7 +374,11 @@ fn addfb(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
             r.height,
             r.pitch,
             r.bpp,
-            if r.depth == 24 { XRGB8888 } else { ARGB8888 },
+            match (r.bpp, r.depth) {
+                (16, 16) => 0x3631_4752, // DRM_FORMAT_RGB565
+                (32, 24) => XRGB8888,
+                _ => ARGB8888,
+            },
             0,
         )
         .map_err(AxError::from)?;
@@ -391,7 +395,7 @@ fn getfb(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     r.height = fb.height;
     r.pitch = fb.pitch;
     r.bpp = fb.bpp;
-    r.depth = 24;
+    r.depth = if fb.bpp == 16 { 16 } else { 24 };
     r.handle = fb.handle;
     write_pod(copy, arg, &r)
 }
