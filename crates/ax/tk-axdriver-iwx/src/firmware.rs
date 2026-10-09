@@ -25,6 +25,7 @@ const TLV_SEC_INIT: u32 = 20;
 const TLV_SEC_WOWLAN: u32 = 21;
 const TLV_PHY_SKU: u32 = 23;
 const TLV_API_CHANGES_SET: u32 = 29;
+const API_NEW_VERSION: u32 = 20;
 const TLV_ENABLED_CAPABILITIES: u32 = 30;
 const TLV_N_SCAN_CHANNELS: u32 = 31;
 const TLV_SEC_RT_USNIFFER: u32 = 34;
@@ -92,6 +93,8 @@ pub struct DefaultCalibration {
 /// Parsed firmware facts used to configure and stage the device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirmwareImage {
+    /// API version selected from the header using the API_NEW_VERSION flag.
+    pub firmware_api: u32,
     pub version: [u32; 3],
     pub sections: Vec<FirmwareSection>,
     pub section_counts: [usize; UCODE_TYPE_MAX],
@@ -142,18 +145,13 @@ impl FirmwareImage {
         {
             return Err(FirmwareError::InvalidImage);
         }
-        let packed_version = read_u32(bytes, 72)?;
-        let api = (packed_version >> 8) & 0xff;
-        // Intentional scope restriction: this product enables the Linux 7.2.3
-        // AX210 firmware API 89 only (that source sets min=max=89).
-        if api != AX210_UCODE_API {
-            return Err(FirmwareError::UnsupportedApi(api));
-        }
+        let header_version = read_u32(bytes, 72)?;
         let mut image = Self {
+            firmware_api: 0,
             version: [
-                (packed_version >> 24) & 0xff,
-                (packed_version >> 16) & 0xff,
-                api,
+                (header_version >> 24) & 0xff,
+                (header_version >> 16) & 0xff,
+                (header_version >> 8) & 0xff,
             ],
             sections: Vec::new(),
             section_counts: [0; UCODE_TYPE_MAX],
@@ -173,6 +171,7 @@ impl FirmwareImage {
             debug_configs: core::array::from_fn(|_| None),
         };
         let mut cursor = HEADER_LEN;
+        let mut version_tlv_seen = false;
         while bytes.len().saturating_sub(cursor) >= 8 {
             let kind = read_u32(bytes, cursor)?;
             let len = read_u32(bytes, cursor + 4)? as usize;
@@ -288,6 +287,7 @@ impl FirmwareImage {
                         return Err(FirmwareError::InvalidVersion);
                     }
                     image.version = [read_u32(data, 0)?, read_u32(data, 4)?, read_u32(data, 8)?];
+                    version_tlv_seen = true;
                 }
                 TLV_PNVM_DATA => {
                     if image.pnvm.is_none() {
@@ -326,6 +326,22 @@ impl FirmwareImage {
                 break;
             }
             cursor = data_end + padding;
+        }
+        // Linux iwl-drv.c tests IWL_UCODE_TLV_API_NEW_VERSION before
+        // interpreting ucode_ver: with it the complete header word is the
+        // API, otherwise the legacy packed API occupies bits 8..15. Do not
+        // guess the format from whether the packed field happens to be zero.
+        let api = if image.api_enabled(API_NEW_VERSION) {
+            header_version
+        } else {
+            (header_version >> 8) & 0xff
+        };
+        if api != AX210_UCODE_API {
+            return Err(FirmwareError::UnsupportedApi(api));
+        }
+        image.firmware_api = api;
+        if !version_tlv_seen {
+            image.version[2] = api;
         }
         Ok(image)
     }
@@ -811,6 +827,74 @@ mod tests {
             FirmwareImage::parse(&bytes),
             Err(FirmwareError::UnsupportedApi(77))
         );
+    }
+
+    #[test]
+    fn selects_new_version_api_from_api_change_bitmap() {
+        let api_flags = [0u32.to_le_bytes(), (1u32 << API_NEW_VERSION).to_le_bytes()].concat();
+        let fw_version = [
+            89u32.to_le_bytes(),
+            0xd257_9d43u32.to_le_bytes(),
+            0u32.to_le_bytes(),
+        ]
+        .concat();
+        let mut bytes = test_image(&[
+            (TLV_API_CHANGES_SET, &api_flags),
+            (TLV_FW_VERSION, &fw_version),
+        ]);
+        bytes[72..76].copy_from_slice(&89u32.to_le_bytes());
+
+        let image = FirmwareImage::parse(&bytes).unwrap();
+
+        assert!(image.api_enabled(API_NEW_VERSION));
+        assert_eq!(image.firmware_api, 89);
+        assert_eq!(image.version, [89, 0xd257_9d43, 0]);
+    }
+
+    #[test]
+    fn raw_header_value_without_new_version_flag_uses_legacy_packed_api() {
+        let mut bytes = test_image(&[]);
+        bytes[72..76].copy_from_slice(&89u32.to_le_bytes());
+        assert_eq!(
+            FirmwareImage::parse(&bytes),
+            Err(FirmwareError::UnsupportedApi(0))
+        );
+    }
+
+    #[test]
+    fn new_version_flag_does_not_fall_back_to_a_packed_api_on_mismatch() {
+        let api_flags = [0u32.to_le_bytes(), (1u32 << API_NEW_VERSION).to_le_bytes()].concat();
+        let mut bytes = test_image(&[(TLV_API_CHANGES_SET, &api_flags)]);
+        bytes[72..76].copy_from_slice(&90u32.to_le_bytes());
+        assert_eq!(
+            FirmwareImage::parse(&bytes),
+            Err(FirmwareError::UnsupportedApi(90))
+        );
+    }
+
+    #[test]
+    fn malformed_api_change_bitmap_is_rejected_before_version_admission() {
+        assert_eq!(
+            FirmwareImage::parse(&test_image(&[(TLV_API_CHANGES_SET, &[0; 4])])),
+            Err(FirmwareError::InvalidCapabilities)
+        );
+        let bad_index = [4u32.to_le_bytes(), 1u32.to_le_bytes()].concat();
+        assert_eq!(
+            FirmwareImage::parse(&test_image(&[(TLV_API_CHANGES_SET, &bad_index)])),
+            Err(FirmwareError::InvalidCapabilities)
+        );
+    }
+
+    #[test]
+    fn parses_external_api89_firmware_when_configured() {
+        let Some(path) = std::env::var_os("THEKERNEL_IWX_API89_FIRMWARE") else {
+            return;
+        };
+        let bytes = std::fs::read(path).expect("read configured API 89 firmware input");
+        let image = FirmwareImage::parse(&bytes).expect("parse configured API 89 firmware input");
+        assert_eq!(image.firmware_api, AX210_UCODE_API);
+        assert!(!image.sections.is_empty());
+        assert!(image.api_enabled(API_NEW_VERSION));
     }
 
     #[test]

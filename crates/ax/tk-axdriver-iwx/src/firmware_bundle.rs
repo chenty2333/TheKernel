@@ -85,6 +85,16 @@ mod tests {
         bytes
     }
 
+    fn new_version_api89_image() -> Vec<u8> {
+        let mut bytes = minimal_api89_image();
+        bytes[72..76].copy_from_slice(&89u32.to_le_bytes());
+        let flags = [0u32.to_le_bytes(), (1u32 << 20).to_le_bytes()].concat();
+        bytes.extend_from_slice(&29u32.to_le_bytes());
+        bytes.extend_from_slice(&(flags.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&flags);
+        bytes
+    }
+
     #[test]
     fn requests_linux_firmware_paths_with_size_caps() {
         let mut requests = Vec::new();
@@ -130,6 +140,18 @@ mod tests {
         .unwrap();
         assert!(bundle.pnvm_file.is_none());
         assert_eq!(requested, ["/lib/firmware/iwlwifi-so-a0-gf-a0-89.ucode"]);
+    }
+
+    #[test]
+    fn new_version_api89_is_admitted_by_rootfs_stager() {
+        let bundle = load_bundle(
+            |path, _| {
+                (path == "/lib/firmware/iwlwifi-so-a0-gf-a0-89.ucode").then(new_version_api89_image)
+            },
+            Some([0; 3]),
+        )
+        .unwrap();
+        assert_eq!(bundle.image.firmware_api, 89);
     }
 
     #[test]

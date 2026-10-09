@@ -40,13 +40,40 @@ done
 
 python3 - "$SOURCE_DIR/$UCODE" "$SOURCE_DIR/$PNVM" <<'PY'
 import pathlib
+import struct
 import sys
 
 ucode = pathlib.Path(sys.argv[1]).read_bytes()
 pnvm = pathlib.Path(sys.argv[2]).stat().st_size
 if len(ucode) < 88 or int.from_bytes(ucode[4:8], "little") != 0x0A4C5749:
     raise SystemExit("iwlwifi API 89 ucode has an invalid TLV header")
-api = (int.from_bytes(ucode[72:76], "little") >> 8) & 0xFF
+
+# IWL_UCODE_TLV_API_CHANGES_SET (29) carries indexed bitmaps. API 20 is
+# IWL_UCODE_TLV_API_NEW_VERSION: when set, header.ver is the API itself;
+# otherwise the legacy API occupies bits 8..15. Match the driver's exact
+# bitmap bounds and do not infer a version format from a zero packed field.
+api_flags = [0] * 4
+cursor = 88
+while len(ucode) - cursor >= 8:
+    kind, tlv_len = struct.unpack_from("<II", ucode, cursor)
+    data = cursor + 8
+    end = data + tlv_len
+    if end > len(ucode):
+        raise SystemExit("iwlwifi API 89 ucode has a truncated TLV")
+    if kind == 29:
+        if tlv_len != 8:
+            raise SystemExit("iwlwifi API 89 ucode has an invalid API-change TLV")
+        index, flags = struct.unpack_from("<II", ucode, data)
+        if index >= len(api_flags):
+            raise SystemExit(f"iwlwifi API-change bitmap index {index} is unsupported")
+        api_flags[index] |= flags
+    padded_len = (tlv_len + 3) & ~3
+    if padded_len > len(ucode) - data:
+        break
+    cursor = data + padded_len
+
+header_version = struct.unpack_from("<I", ucode, 72)[0]
+api = header_version if api_flags[0] & (1 << 20) else (header_version >> 8) & 0xFF
 if api != 89:
     raise SystemExit(f"expected iwlwifi firmware API 89, found API {api}")
 if len(ucode) > 4 * 1024 * 1024 or pnvm > 2 * 1024 * 1024:
