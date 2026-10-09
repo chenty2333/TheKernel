@@ -1520,10 +1520,20 @@ mod tests {
         assert_eq!(device.npins, 384);
         assert_eq!(device.pad_size, 16);
         assert_eq!((device.gpi_is, device.gpi_ie), (0x100, 0x120));
+        // Pin numbers are the upstream `gpiobase` space (pchgpio_find_group),
+        // not the per-community pad index `base`.
         assert_eq!(find_group(device, 0).unwrap().1.bar, 0);
-        assert_eq!(find_group(device, 67).unwrap().1.bank, 0);
-        assert_eq!(find_group(device, 169).unwrap().1.bar, 2);
-        assert_eq!(find_group(device, 224).unwrap().1.bank, 3);
+        assert_eq!(find_group(device, 25).unwrap().1.base, 0);
+        assert!(find_group(device, 26).is_none());
+        // GPP_S: bar 1, bank 0, gpiobase 96.
+        assert_eq!(find_group(device, 96).unwrap().1.bank, 0);
+        assert_eq!(find_group(device, 96).unwrap().1.bar, 1);
+        // GPP_C: bar 2, bank 0, gpiobase 256.
+        assert_eq!(find_group(device, 256).unwrap().1.bar, 2);
+        // GPP_E: bar 2, bank 3, gpiobase 320.
+        assert_eq!(find_group(device, 320).unwrap().1.bank, 3);
+        // GPP_R: bar 3, bank 0, gpiobase 352.
+        assert_eq!(find_group(device, 352).unwrap().1.bar, 3);
         assert!(find_group(device, 148).is_none());
         assert!(find_group(device, 383).is_none());
     }
