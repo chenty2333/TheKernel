@@ -1929,3 +1929,7 @@ backed by `tk-axdriver-base` rootfs firmware reads; request size is capped at
 `drivers/gpu/drm/i915/gt/intel_wopcm.c` (MIT, Copyright © 2017-2019 Intel
 Corporation), including Gen9 layout restrictions, locked-register verification,
 and GuC/HuC capacity checks.
+
+`intel_context_sseu_upstream.rs` translates all 3 definitions in Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_context_sseu.c` (MIT, Copyright © 2019 Intel
+Corporation); it uses the source header's kernel-context request helper.

@@ -199,6 +199,9 @@ pub mod intel_context_api_upstream;
 pub mod intel_context_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_context_sseu_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_context_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
