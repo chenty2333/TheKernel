@@ -81,17 +81,17 @@
 //! register reads that write nothing, and every expensive step happens in task
 //! context after the read.
 
-mod audio;
 pub(super) mod atomic_modeset_wiring;
+mod audio;
 mod clk;
 mod combo_phy_full;
 mod connect;
 mod cursor;
 mod ddi;
+mod de_io;
 pub(crate) mod debugfs;
 mod dma;
 mod dmc;
-mod de_io;
 mod dp_aux;
 mod fastboot;
 pub(crate) mod fb;
@@ -109,8 +109,8 @@ mod i915_port;
 mod id;
 mod irq;
 mod modeset;
-mod native_modeset_ops;
 mod native_kms_projection;
+mod native_modeset_ops;
 mod native_pipe;
 mod native_scaler;
 mod output;
@@ -123,9 +123,9 @@ mod pll;
 mod power;
 mod probe;
 mod regs;
-mod shared_dpll;
 mod rollback;
 pub(crate) mod scanout;
+mod shared_dpll;
 mod sink;
 mod swing;
 mod tc_modeset;
@@ -419,6 +419,15 @@ fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, Str
         Some(intel_display::device::Port::Tc1 | intel_display::device::Port::Tc2)
     ) {
         return fastboot::init(bdf, *window, gtt);
+    }
+    // The non-TC path still needs an initial live-plane/stolen-memory DMA
+    // ownership proof before changing the GPU requester context. It has no
+    // such proof yet, so do not quiesce or program a physical GGTT surface.
+    if !gtt.has_identity_lease(bdf) {
+        return Err(String::from(
+            "intel.modeset=1 REFUSED before writes: non-TC scanout has no verified GPU \
+             identity-DMA lease",
+        ));
     }
     let image = gtt.checkpoint().map_err(|e| e.describe())?;
     *FIRMWARE_STATE.lock() = alloc::vec![(bdf, firmware_snapshot::Snapshot::capture(window))];

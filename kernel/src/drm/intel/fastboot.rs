@@ -689,7 +689,7 @@ fn ownership(
     aperture: u64,
     stolen: core::ops::Range<u64>,
     allocatable: &[(u64, u64)],
-) -> Result<(), Error> {
+) -> Result<Vec<u64>, Error> {
     let address = u64::from(f.plane.surface_raw & 0xffff_f000);
     let boot_matches = boot.is_some_and(|boot| {
         Some(boot.address) == aperture.checked_add(address)
@@ -736,6 +736,12 @@ fn ownership(
     {
         return Err(Error::Refused);
     }
+    let page_count =
+        usize::try_from(f.plane.main_size.div_ceil(4096)).map_err(|_| Error::Refused)?;
+    let mut live_pages = Vec::new();
+    live_pages
+        .try_reserve_exact(page_count)
+        .map_err(|_| Error::Refused)?;
     for i in 0..f.plane.main_size.div_ceil(4096) {
         let pte = gtt.entry(address + i * 4096).map_err(|_| Error::Refused)?;
         let p = pte.address();
@@ -751,8 +757,9 @@ fn ownership(
         {
             return Err(Error::Refused);
         }
+        live_pages.push(p);
     }
-    Ok(())
+    Ok(live_pages)
 }
 fn mode(f: &Firmware) -> Result<DrmMode, Error> {
     let t = f.pipe.timings;
@@ -2091,7 +2098,10 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                 }
                 physical.push(p);
             }
-            let binding = match self.gtt.bind_pages(&physical) {
+            let binding = match self
+                .gtt
+                .bind_pages(&physical, Some((pages.clone(), pin.clone())))
+            {
                 Ok(b) => b,
                 Err(
                     super::gtt::GttError::CheckpointUnavailable
@@ -2729,7 +2739,6 @@ pub(super) fn init(
     gtt: Arc<Gtt>,
 ) -> Result<String, String> {
     use super::{dma::firmware_bytes, pci::ConfigSpace};
-    super::dma::require_direct(bdf).map_err(message)?;
     if axhal::boot::command_line_value("intel.modeset.fail_write").is_some() {
         return Err(String::from(
             "combo-only fail_write injection is not a TC fastboot command; refused before writes",
@@ -2847,7 +2856,6 @@ pub(super) fn init(
             .map(|&(base, size)| (base as u64, size as u64))
             .collect();
         let pin = PowerPin::acquire(&window, port)?;
-        super::dmc::display_power_ready(window, intel_display::dmc::DmcPlatform::AlderLakeN);
         let admitted = (|| {
             let watermark =
                 super::power::read_source_watermark_config(&window, &super::gmbus::MonotonicTimer)
@@ -2961,7 +2969,15 @@ pub(super) fn init(
             if first.plane.pitch != (first.plane.width * 4).div_ceil(64) * 64 {
                 return Err(Error::Refused);
             }
-            ownership(&gtt, &first, boot.as_ref(), aperture, stolen, &allocatable)?;
+            let live_pages =
+                ownership(&gtt, &first, boot.as_ref(), aperture, stolen, &allocatable)?;
+            // Preserve the active firmware scanout before changing this GPU's
+            // requester context. The VT-d owner adds only matching GPU RMRRs
+            // and this separately verified set of stolen pages.
+            let identity_lease = super::dma::acquire_identity_lease(bdf, &live_pages)?;
+            gtt.install_identity_lease(identity_lease)
+                .map_err(|_| Error::Refused)?;
+            super::dmc::display_power_ready(window, intel_display::dmc::DmcPlatform::AlderLakeN);
             let ddc = if port == TcPort::Tc1 {
                 super::gmbus::Pin::Tc1
             } else {
@@ -4074,7 +4090,7 @@ mod tests {
             pitch: 3200,
             ..boot
         };
-        assert!(
+        assert_eq!(
             ownership(
                 &a.gtt,
                 &a.baseline,
@@ -4083,7 +4099,8 @@ mod tests {
                 0x80000000..0x90000000,
                 &[]
             )
-            .is_ok()
+            .unwrap(),
+            vec![0x8000_0000, 0x8000_1000, 0x8000_2000, 0x8000_3000]
         );
         assert!(
             ownership(

@@ -267,7 +267,7 @@ fn four_gib_aperture_keeps_new_allocations_below_the_guc_window() {
     assert_eq!(gtt.entry(live_gop_address).unwrap().raw(), live_gop);
     let checkpoint = gtt.checkpoint().unwrap();
 
-    let binding = gtt.bind_pages(&[0x5000]).unwrap();
+    let binding = gtt.bind_pages(&[0x5000], None).unwrap();
     assert!(binding.address + binding.before.len() as u64 * PAGE_SIZE <= allocation_end);
     assert!(binding.address < GUC_GGTT_TOP);
     assert_eq!(gtt.entry(live_gop_address).unwrap().raw(), live_gop);
@@ -278,6 +278,74 @@ fn four_gib_aperture_keeps_new_allocations_below_the_guc_window() {
     gtt.verify_checkpoint(&checkpoint).unwrap();
     assert_eq!(*gtt.next.lock(), allocation_end);
     assert!(*gtt.next.lock() < GUC_GGTT_TOP);
+}
+
+#[test]
+fn identity_mapping_failure_or_missing_page_prevents_any_ggtt_publication() {
+    let pages = [0x2000, 0x9000];
+    let events = core::cell::RefCell::new(alloc::vec::Vec::new());
+    let missing_page = map_before_publish(
+        &pages,
+        |requested| {
+            events.borrow_mut().push("map");
+            assert_eq!(requested, &[0x2000, 0x9000]);
+            // Model a lease that rejects an incomplete/unauthorized batch.
+            Err::<(), _>(GttError::IdentityMapFailed)
+        },
+        |_| {
+            events.borrow_mut().push("PTE");
+            Ok(())
+        },
+        |_| Ok(()),
+        |_| Ok(()),
+        |_| events.borrow_mut().push("quarantine"),
+    );
+    assert_eq!(missing_page, Err(GttError::IdentityMapFailed));
+    assert_eq!(
+        *events.borrow(),
+        ["map"],
+        "no physical GGTT PTE may precede DMA map"
+    );
+}
+
+#[test]
+fn ambiguous_ggtt_rollback_keeps_identity_mapping_and_backing_quarantined() {
+    let pages = [0x3000];
+    let events = core::cell::RefCell::new(alloc::vec::Vec::new());
+    let result = map_before_publish(
+        &pages,
+        |_| {
+            events.borrow_mut().push("map");
+            Ok(())
+        },
+        |_| {
+            events.borrow_mut().push("PTE");
+            Err(GttError::ReadBackMismatch {
+                index: 1,
+                wrote: 1,
+                read: 0,
+            })
+        },
+        |_| {
+            events.borrow_mut().push("rollback");
+            Err(GttError::ReadBackMismatch {
+                index: 1,
+                wrote: 0,
+                read: 1,
+            })
+        },
+        |_| {
+            events.borrow_mut().push("unmap");
+            Ok(())
+        },
+        |_| events.borrow_mut().push("quarantine"),
+    );
+    assert_eq!(result, Err(GttError::IdentityDmaQuarantined));
+    assert_eq!(*events.borrow(), ["map", "PTE", "rollback", "quarantine"]);
+    assert!(
+        !events.borrow().contains(&"unmap"),
+        "ambiguous PTEs keep the DMA map live"
+    );
 }
 
 #[test]

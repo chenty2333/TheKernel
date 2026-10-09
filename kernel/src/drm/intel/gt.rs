@@ -501,6 +501,14 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
             "N305 GT requires exact Gen12/media A0; no writes",
         ));
     }
+    let shared_gtt = super::shared_ggtt(bdf)
+        .map_err(|_| String::from("GT requires the display owner's shared GGTT; no writes"))?;
+    if !shared_gtt.has_identity_lease(bdf) {
+        return Err(String::from(
+            "GT requires a verified GPU requester identity-DMA lease preserving live firmware \
+             scanout; no writes",
+        ));
+    }
     let bus = Bus {
         window,
         awake: AtomicBool::new(false),
@@ -608,6 +616,16 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                  BCS submission"
             ))
         }
+    }
+}
+
+#[cfg(target_os = "none")]
+pub(super) fn require_identity_dma_lease(bdf: pci::Bdf) -> Result<(), Error> {
+    let gtt = super::shared_ggtt(bdf).map_err(|_| Error::Refused)?;
+    if gtt.has_identity_lease(bdf) {
+        Ok(())
+    } else {
+        Err(Error::Refused)
     }
 }
 
@@ -800,7 +818,8 @@ mod tests {
         bus.awake.store(true, Ordering::Release);
         assert_eq!(bus.write(0x941c, 1), Err(Error::Refused));
         // GDRST GuC-domain reset is now owned by the firmware upload path.
-        bus.write(0x941c, intel_gt::reset::GUC_RESET_DOMAIN).unwrap();
+        bus.write(0x941c, intel_gt::reset::GUC_RESET_DOMAIN)
+            .unwrap();
         assert_eq!(
             bus.write(0x941c, intel_gt::reset::GUC_RESET_DOMAIN | 4),
             Err(Error::Refused)

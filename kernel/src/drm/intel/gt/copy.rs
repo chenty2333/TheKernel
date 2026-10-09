@@ -19,6 +19,29 @@ use crate::mm::{SharedFixedView, SharedPages};
 mod sparse;
 const PAGE: usize = 4096;
 const PAYLOAD: usize = 64 * 64 * 4;
+
+fn append_dma_pages(output: &mut Vec<u64>, pages: &[u64]) -> Result<(), Error> {
+    output
+        .try_reserve(pages.len())
+        .map_err(|_| Error::Refused)?;
+    output.extend_from_slice(pages);
+    Ok(())
+}
+
+/// Transfer one exact page batch into the requester's identity map before a
+/// caller can publish PPGTT/GGTT addresses or submit work.
+fn map_page_batch<T>(
+    pages: &[u64],
+    map: impl FnOnce(&[u64]) -> Result<T, Error>,
+    publish: impl FnOnce(T) -> Result<(), Error>,
+) -> Result<(), Error> {
+    if pages.is_empty() || pages.iter().any(|page| !page.is_multiple_of(PAGE as u64)) {
+        return Err(Error::Refused);
+    }
+    let mapping = map(pages)?;
+    publish(mapping)
+}
+
 struct Ram {
     pages: Arc<SharedPages>,
     _pin: SharedFixedView,
@@ -71,6 +94,12 @@ impl Ram {
             _pin: pin,
             physical,
         })
+    }
+    fn bind(&self, gtt: &Gtt) -> Result<Binding, super::super::gtt::GttError> {
+        gtt.bind_pages(
+            &self.physical,
+            Some((self.pages.clone(), self._pin.clone())),
+        )
     }
     fn write(&self, offset: usize, data: &[u8]) -> Result<(), Error> {
         self.pages
@@ -420,10 +449,8 @@ impl SwitchAway {
     }
     fn build(&mut self, gtt: &Gtt, render: bool, root: u64, io: &impl GtIo) -> Result<(), Error> {
         for ram in [&self.context, &self.ring] {
-            self.bindings.push(
-                gtt.bind_pages(&ram.physical)
-                    .map_err(|_| Error::Quarantined)?,
-            );
+            self.bindings
+                .push(ram.bind(gtt).map_err(|_| Error::Quarantined)?);
         }
         let context = self.bindings[0].address as u32;
         let ring = self.bindings[1].address as u32;
@@ -515,6 +542,10 @@ pub(super) struct Memory {
     batch: Ram,
     status: Ram,
     bindings: Vec<Binding>,
+    /// Non-GGTT PPGTT leaf/page-table backing is identity-mapped as one batch
+    /// and retained through the engine's existing reset/idle proof.
+    #[cfg(target_os = "none")]
+    identity_mappings: Vec<tk_vtd::IdentityDmaMapping>,
     descriptor: u64,
     operation: bcs::Copy,
     selftest: bool,
@@ -614,9 +645,7 @@ impl LogDmaMemory {
         zeroes.resize(size, 0);
         let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
         let ram = Ram::allocate(pages)?;
-        let binding = gtt
-            .bind_pages(&ram.physical)
-            .map_err(|_| Error::Quarantined)?;
+        let binding = ram.bind(&gtt).map_err(|_| Error::Quarantined)?;
         let base = match u32::try_from(binding.address) {
             Ok(base) if base != 0 && base.is_multiple_of(PAGE as u32) => base,
             _ => {
@@ -894,9 +923,7 @@ impl AdsDmaMemory {
             / PAGE;
         let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
         let ram = Ram::allocate(pages)?;
-        let binding = gtt
-            .bind_pages(&ram.physical)
-            .map_err(|_| Error::Quarantined)?;
+        let binding = ram.bind(&gtt).map_err(|_| Error::Quarantined)?;
         let base = match u32::try_from(binding.address) {
             Ok(base) if base != 0 && base.is_multiple_of(PAGE as u32) => base,
             _ => {
@@ -1011,9 +1038,7 @@ impl CtDmaMemory {
         let blob = pair.initial_blob();
         ram.write(0, &blob)?;
         ram.flush();
-        let binding = gtt
-            .bind_pages(&ram.physical)
-            .map_err(|_| Error::Quarantined)?;
+        let binding = ram.bind(&gtt).map_err(|_| Error::Quarantined)?;
         let memory = Self {
             _gtt: gtt,
             _ram: ram,
@@ -1374,9 +1399,7 @@ fn upload_huc_for_auth(
     let ram = Ram::allocate(pages)?;
     ram.write(0, &image.bytes)?;
     ram.flush();
-    let binding = gtt
-        .bind_pages(&ram.physical)
-        .map_err(|_| Error::Quarantined)?;
+    let binding = ram.bind(&gtt).map_err(|_| Error::Quarantined)?;
     let rsa_offset = image
         .css
         .header_bytes
@@ -1442,9 +1465,7 @@ fn upload_uc_one(
     let ram = Ram::allocate(pages)?;
     ram.write(0, &image.bytes)?;
     ram.flush();
-    let binding = gtt
-        .bind_pages(&ram.physical)
-        .map_err(|_| Error::Quarantined)?;
+    let binding = ram.bind(&gtt).map_err(|_| Error::Quarantined)?;
     let transfer = match image.kind {
         intel_gt::uc::Kind::HuC => {
             intel_gt::guc_fw::huc_upload(&owner.bus, binding.address, image, false)
@@ -1506,7 +1527,7 @@ pub(super) fn upload_uc_firmware(
     {
         return Err(Error::Quarantined);
     }
-    super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
+    super::require_identity_dma_lease(owner.bdf).map_err(|_| Error::Refused)?;
     if !owner.bus.awake.load(Ordering::Acquire) {
         return Err(Error::Refused);
     }
@@ -1825,6 +1846,8 @@ impl Memory {
             batch: Ram::allocate(1)?,
             status: Ram::allocate(1)?,
             bindings,
+            #[cfg(target_os = "none")]
+            identity_mappings: Vec::new(),
             descriptor: 0,
             operation: bcs::Copy {
                 source: 0x11000,
@@ -1869,16 +1892,12 @@ impl Memory {
         Ok(memory)
     }
     fn bind_and_build(&mut self) -> Result<(), Error> {
-        for r in [&*self.context, &self.ring, &self.status] {
-            self.bindings.push(
-                self.gtt
-                    .bind_pages(&r.physical)
-                    .map_err(|_| Error::Quarantined)?,
-            );
-        }
-        let ctx = self.bindings[0].address as u32;
-        let ring = self.bindings[1].address as u32;
-        let p = &self.tables.physical;
+        let p: [u64; 8] = self
+            .tables
+            .physical
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Refused)?;
         let mut table_data = zero_words::<u64>(512)?;
         let table: &mut [u64; 512] = table_data.as_mut_slice().try_into().unwrap();
         // Main root/PDPT/PD/PT and scratch PDPT/PD/PT/data. All unused VA
@@ -1972,6 +1991,17 @@ impl Memory {
         if let Some(vm) = &self.vm {
             *vm.residency.lock() = self.retained.clone();
         }
+        // PPGTT leaf entries and root pointers name physical memory directly.
+        // Map the complete, exact set before publishing any GGTT PTE for this
+        // submission; user GEM pages, scratch tables and VM roots share the
+        // same requester-specific identity lease, never a full-RAM mapping.
+        self.map_ppgtt_backing()?;
+        for r in [&*self.context, &self.ring, &self.status] {
+            self.bindings
+                .push(r.bind(&self.gtt).map_err(|_| Error::Quarantined)?);
+        }
+        let ctx = self.bindings[0].address as u32;
+        let ring = self.bindings[1].address as u32;
         let mut regs_data = zero_words::<u32>(1024)?;
         let mut indirect_data = zero_words::<u32>(1024)?;
         let mut per_data = zero_words::<u32>(1024)?;
@@ -2081,6 +2111,44 @@ impl Memory {
         }
         Ok(())
     }
+
+    fn map_ppgtt_backing(&mut self) -> Result<(), Error> {
+        #[cfg(target_os = "none")]
+        {
+            let lease = self.gtt.identity_lease().ok_or(Error::Quarantined)?;
+            let mut pages = Vec::new();
+            append_dma_pages(&mut pages, &self.tables.physical)?;
+            append_dma_pages(&mut pages, &self.source.physical)?;
+            append_dma_pages(&mut pages, &self.destination.physical)?;
+            append_dma_pages(&mut pages, &self.batch.physical)?;
+            for ram in self.resident.iter().chain(self.extra_tables.iter()) {
+                append_dma_pages(&mut pages, &ram.physical)?;
+            }
+            if let Some(vm) = &self.vm {
+                append_dma_pages(&mut pages, &vm.tables.physical)?;
+            }
+            self.identity_mappings
+                .try_reserve(1)
+                .map_err(|_| Error::Refused)?;
+            map_page_batch(
+                &pages,
+                |pages| {
+                    lease.map_pages(pages).map_err(|error| {
+                        if error == tk_vtd::Error::Quarantined {
+                            Error::Quarantined
+                        } else {
+                            Error::Refused
+                        }
+                    })
+                },
+                |mapping| {
+                    self.identity_mappings.push(mapping);
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    }
     fn pattern(&self, i: usize) -> u8 {
         if self.render && i % 4 == 3 {
             255
@@ -2144,6 +2212,12 @@ impl Memory {
             unsafe { self.gtt.release_binding(binding) }.map_err(|_| Error::Quarantined)?;
         }
         self.bindings.clear();
+        #[cfg(target_os = "none")]
+        while let Some(mapping) = self.identity_mappings.last() {
+            let lease = self.gtt.identity_lease().ok_or(Error::Quarantined)?;
+            lease.unmap_pages(mapping).map_err(|_| Error::Quarantined)?;
+            self.identity_mappings.pop();
+        }
         Ok(())
     }
 }
@@ -2695,7 +2769,7 @@ fn prepare_user_engine(
 
 #[cfg(target_os = "none")]
 pub(super) fn run(owner: &mut super::Owner, bdf: pci::Bdf) -> Result<(), Error> {
-    super::super::dma::require_direct(bdf).map_err(|_| Error::Refused)?;
+    super::require_identity_dma_lease(bdf).map_err(|_| Error::Refused)?;
     intel_gt::uncore::acquire_render(&owner.bus)?;
     owner.bus.render_awake.store(true, Ordering::Release);
     owner.bus.acquire_idle_media()?;
@@ -2778,7 +2852,7 @@ pub(super) fn render_test(owner: &mut super::Owner) -> Result<(), Error> {
     if owner.memory.is_some() || owner.lost {
         return Err(Error::Quarantined);
     }
-    super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
+    super::require_identity_dma_lease(owner.bdf).map_err(|_| Error::Refused)?;
     if owner.bus.read(0xc000)? & 1 == 0 || !intel_gt::uncore::ring_idle(&owner.bus, 0x2000)? {
         return Err(Error::Refused);
     }
@@ -2815,7 +2889,7 @@ pub(super) fn render_objects(
     if owner.lost || owner.memory.is_some() {
         return Err(Error::Quarantined);
     }
-    super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
+    super::require_identity_dma_lease(owner.bdf).map_err(|_| Error::Refused)?;
     let guc_submission = prepare_user_engine(owner, 0, 0)?;
     if !guc_submission
         && (owner.bus.read(0x480c)? != 0
@@ -2891,7 +2965,7 @@ pub(super) fn user_objects(
         return Err(Error::Refused);
     }
     job.validate()?;
-    super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
+    super::require_identity_dma_lease(owner.bdf).map_err(|_| Error::Refused)?;
     let guc_submission = prepare_user_engine(owner, job.engine_class, job.engine_instance)?;
     if saved.render != job.render
         || saved.engine_class != job.engine_class
@@ -2961,7 +3035,7 @@ pub(super) fn objects(
     if owner.lost || owner.memory.is_some() {
         return Err(Error::Quarantined);
     }
-    super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
+    super::require_identity_dma_lease(owner.bdf).map_err(|_| Error::Refused)?;
     operation.validate()?;
     if Arc::ptr_eq(&source, &destination) {
         return Err(Error::Refused);
@@ -3016,6 +3090,68 @@ pub(in crate::drm::intel) mod tests {
     use core::cell::{Cell, RefCell};
 
     use super::*;
+
+    #[test]
+    fn ppgtt_identity_batch_covers_each_backing_and_map_failure_stops_publication() {
+        let mut pages = Vec::new();
+        let groups: [&[u64]; 7] = [
+            &[0x1000, 0x2000], // PPGTT root and intermediate tables.
+            &[0x3000],         // extra sparse PT page.
+            &[0x4000],         // source.
+            &[0x5000],         // destination.
+            &[0x6000],         // batch.
+            &[0x7000],         // resident user GEM page.
+            &[0x8000],         // retained VM table page.
+        ];
+        for group in groups {
+            append_dma_pages(&mut pages, group).unwrap();
+        }
+        let expected = [
+            0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000, 0x8000,
+        ];
+        assert_eq!(pages, expected);
+
+        let submitted = Cell::new(false);
+        let error = map_page_batch(
+            &pages,
+            |requested| {
+                assert_eq!(requested, expected);
+                Err::<(), _>(Error::Quarantined)
+            },
+            |_| {
+                submitted.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(error, Err(Error::Quarantined));
+        assert!(
+            !submitted.get(),
+            "no PTE or submit follows an ambiguous map"
+        );
+
+        // An accidentally omitted resident page is not silently replaced by
+        // identity-all-RAM; the domain mapper rejects the incomplete set and
+        // the publication callback is still never entered.
+        let incomplete = &pages[..pages.len() - 1];
+        let published = Cell::new(false);
+        let error = map_page_batch(
+            incomplete,
+            |requested| {
+                if requested == expected {
+                    Ok(())
+                } else {
+                    Err(Error::Refused)
+                }
+            },
+            |_| {
+                published.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(error, Err(Error::Refused));
+        assert!(!published.get());
+    }
+
     struct Model<'a> {
         memory: &'a Memory,
         words: RefCell<BTreeMap<u32, u32>>,

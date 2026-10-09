@@ -345,28 +345,40 @@ impl FbError {
 
 /// A surface of memory the display engine can read.
 ///
-/// The value owns its memory: dropping it returns the pages to the allocator.
-/// **Nothing in this kernel drops a surface once its page table entries exist**,
-/// and that is deliberate rather than incidental.  Two things forbid freeing
-/// one: the GGTT entries naming its pages stay present for the rest of the
-/// boot, because [`Gtt`] has no unmap path (see its module comment), and the
-/// display engine may still be reading the address those entries name.  Pages
-/// handed back to the allocator under a present entry would be scanned out as
-/// whatever the next owner puts there, and pages handed back under a live
-/// *mapping* would be worse still -- see [`Surface::allocate`]'s failure path.
-/// [`super::scanout`] keeps every surface it has offered, including the ones a
-/// later offer replaced.
+/// The value owns its memory: dropping a retired surface returns the pages to
+/// the allocator. The live console keeps every offered surface through the
+/// boot, including replacements. If a caller drops one before its GGTT token
+/// has been safely retired, the product `Drop` path intentionally leaks the
+/// backing rather than returning pages still reachable by the display engine
+/// or its requester identity map.
 pub(crate) struct Surface {
     /// The allocation that owns the memory.  Held whether or not anything
     /// reads it, because dropping it is what returns the pages.
-    memory: GlobalPage,
+    memory: Option<GlobalPage>,
     /// The kernel's writable view of the first byte, device-uncached.
     cpu: usize,
     /// The physical base the page table entries name.
     physical: u64,
     /// The graphics address a plane's surface register is given.
     ggtt: u64,
+    /// Holds the requester identity map until the surface is retired.
+    #[cfg(target_os = "none")]
+    binding: super::gtt::Binding,
     plan: Plan,
+}
+
+#[cfg(target_os = "none")]
+impl Drop for Surface {
+    fn drop(&mut self) {
+        if self.binding.dma_active()
+            && let Some(memory) = self.memory.take()
+        {
+            // The GGTT binding remains present for this boot and may still be
+            // the console owner. Do not return its identity-mapped backing to
+            // the global allocator if a caller drops the surface early.
+            core::mem::forget(memory);
+        }
+    }
 }
 
 /// The kernel's view of `size` bytes of physical memory, mapped so that a write
@@ -427,26 +439,31 @@ impl Surface {
         // yet.  The write goes through the device-uncached mapping, which is
         // the only mapping of these pages the kernel uses.
         unsafe { core::ptr::write_bytes(cpu as *mut u8, 0, plan.size()) };
+        #[cfg(target_os = "none")]
+        let (ggtt, binding) = match gtt.bind_linear(physical, plan.size()) {
+            Ok(binding) => (binding.address, binding),
+            Err(error) => {
+                if error == super::gtt::GttError::IdentityDmaQuarantined {
+                    core::mem::forget(memory);
+                }
+                return Err(FbError::Gtt(error));
+            }
+        };
+        #[cfg(not(target_os = "none"))]
         let ggtt = match gtt.map_linear(physical, plan.size()) {
             Ok(ggtt) => ggtt,
             Err(error) => {
-                // The device-uncached mapping of these pages belongs to the
-                // kernel address space and outlives the allocation, so the
-                // pages are deliberately not returned to the allocator here: a
-                // live mapping of memory that has been handed to someone else
-                // is worse than a few leaked pages on a path that runs at most
-                // once per boot.  The leak is the reason and not a side effect
-                // -- the pages cannot be freed while that mapping names them,
-                // and it cannot be unmapped from here.
                 core::mem::forget(memory);
                 return Err(FbError::Gtt(error));
             }
         };
         Ok(Self {
-            memory,
+            memory: Some(memory),
             cpu,
             physical,
             ggtt,
+            #[cfg(target_os = "none")]
+            binding,
             plan,
         })
     }

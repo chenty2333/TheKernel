@@ -154,26 +154,28 @@
 //!
 //! ## What this module deliberately does not do
 //!
-//! * **Display-only bindings use uncached GGTT stores.** Local Linux 7.2.3
-//!   `gen8_ggtt_invalidate()` emits a GFX flush only for WC mappings; ADL-N
-//!   uses UC. The GuC invalidate route is selected only for GuC submission.
-//!   No GuC/GT register is written by display-only binding. Runtime GT/GuC
-//!   ownership must coordinate its own invalidation before sharing this table.
-//! * **It does not unmap.**  An aperture range that is released must first be
-//!   cleared out of the display engine's plane register, which belongs to the
-//!   module that programs the plane, and the pages behind it must not go back
-//!   to the allocator while entries naming them are present.  A partial
-//!   teardown would be worse than none, so [`super::scanout`] keeps every
-//!   surface it has offered alive instead -- including the ones a later offer
-//!   replaced -- and nothing calls for an unmap.
+//! * **Display-only bindings use uncached GGTT stores and requester identity
+//!   maps.** Local Linux 7.2.3 `gen8_ggtt_invalidate()` emits a GFX flush only
+//!   for WC mappings; ADL-N uses UC. No GuC/GT register is written by
+//!   display-only binding. The VT-d identity-map token is published before a
+//!   physical GGTT PTE and retired only after the display owner proves the
+//!   binding inactive and the exact PTE before-image is restored.
+//! * **It does not decide when hardware is quiesced.** The owner that programs
+//!   the plane or GT must prove fresh-frame/idle/reset retirement before calling
+//!   [`Gtt::release_binding`]. Uncertain owners retain the binding and backing;
+//!   the table never guesses based on a dropped Rust value.
 //! * **It does not choose the physical memory.**  [`super::fb`] does that, and
 //!   says why.
 
+use alloc::sync::Arc;
+#[cfg(target_os = "none")]
+use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use spin::Mutex;
 
 use super::{pci, regs};
+use crate::mm::{SharedFixedView, SharedPages};
 
 /// Where the GGTT page table array starts inside BAR 0.
 ///
@@ -705,6 +707,12 @@ impl ApertureSize {
 pub(crate) enum GttError {
     CheckpointUnavailable,
     CheckpointMismatch,
+    /// The shared GPU owner has not installed a requester-scoped VT-d lease.
+    IdentityLeaseUnavailable,
+    /// VT-d rejected a new identity page mapping before publishing it.
+    IdentityMapFailed,
+    /// A mapping or its retirement became ambiguous; backing must be retained.
+    IdentityDmaQuarantined,
     /// BAR 0 is shorter than the register window plus the page table array.
     BarTooSmall {
         observed: u64,
@@ -776,6 +784,16 @@ impl GttError {
             Self::CheckpointMismatch => {
                 String::from("GGTT checkpoint belongs to a different aperture")
             }
+            Self::IdentityLeaseUnavailable => String::from(
+                "no verified requester-scoped Intel GPU identity-DMA lease owns this GGTT",
+            ),
+            Self::IdentityMapFailed => String::from(
+                "VT-d refused the pinned GPU backing pages before a GGTT PTE was published",
+            ),
+            Self::IdentityDmaQuarantined => String::from(
+                "VT-d identity-map state is ambiguous; backing pages and GGTT owner are \
+                 quarantined",
+            ),
             Self::BarTooSmall { observed, needed } => format!(
                 "BAR 0 is {observed:#x} bytes, but the page table array is at \
                  {GGTT_ARRAY_OFFSET:#x} and is {GGTT_ARRAY_BYTES:#x} bytes, so {needed:#x} are \
@@ -854,12 +872,104 @@ pub(crate) struct Gtt {
     /// The next address to hand out, counted downwards from below the GuC
     /// limit and the prefetch guard.
     next: Mutex<u64>,
+    /// The single requester-scoped DMA owner shared by display and GT.
+    #[cfg(target_os = "none")]
+    identity_lease: Mutex<Option<Arc<tk_vtd::IdentityDmaLease>>>,
+    /// The shared scratch page is referenced by every GGTT padding run and
+    /// remains identity-mapped for the lifetime of this single-owner table.
+    #[cfg(target_os = "none")]
+    scratch_dma_mapping: Mutex<Option<tk_vtd::IdentityDmaMapping>>,
+    /// Ambiguous pre-publication failures retain page ownership here until
+    /// boot ends; no recovery path may silently free their DMA backing.
+    #[cfg(target_os = "none")]
+    dma_quarantine: Mutex<alloc::vec::Vec<DmaBinding>>,
 }
 
 /// A bounded reservation's exact absent PTE before-image, including padding.
 pub(crate) struct Binding {
     pub(crate) address: u64,
     before: alloc::vec::Vec<u64>,
+    #[cfg(target_os = "none")]
+    dma: Option<DmaBinding>,
+}
+
+#[cfg(target_os = "none")]
+impl Binding {
+    pub(crate) fn dma_active(&self) -> bool {
+        self.dma
+            .as_ref()
+            .is_some_and(|dma| dma.active.load(Ordering::Acquire))
+    }
+}
+
+#[cfg(target_os = "none")]
+struct DmaBinding {
+    lease: Arc<tk_vtd::IdentityDmaLease>,
+    mapping: Option<tk_vtd::IdentityDmaMapping>,
+    active: AtomicBool,
+    backing: Option<(alloc::sync::Arc<SharedPages>, SharedFixedView)>,
+}
+
+#[cfg(target_os = "none")]
+impl DmaBinding {
+    fn retire(&self) -> Result<(), GttError> {
+        if !self.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mapping = self
+            .mapping
+            .as_ref()
+            .ok_or(GttError::IdentityDmaQuarantined)?;
+        self.lease
+            .unmap_pages(mapping)
+            .map_err(|_| GttError::IdentityDmaQuarantined)?;
+        self.active.store(false, Ordering::Release);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "none")]
+impl Drop for DmaBinding {
+    fn drop(&mut self) {
+        if self.active.load(Ordering::Acquire)
+            && let Some((pages, pin)) = &self.backing
+        {
+            // SAFETY: this is an intentional safety leak. If a caller drops an
+            // ambiguously live binding, keep both physical frame ownership and
+            // the fixed-view pin rather than returning pages still reachable
+            // through the requester's possibly cached translation.
+            core::mem::forget(pages.clone());
+            core::mem::forget(pin.clone());
+        }
+    }
+}
+
+/// The exact ordering boundary for a device binding: acquire the complete
+/// identity-map token, only then publish physical addresses; on a failed
+/// publication, restore the full preimage before retiring the DMA map.
+fn map_before_publish<T>(
+    physical: &[u64],
+    map: impl FnOnce(&[u64]) -> Result<T, GttError>,
+    publish: impl FnOnce(&T) -> Result<(), GttError>,
+    rollback: impl FnOnce(&T) -> Result<(), GttError>,
+    retire: impl FnOnce(&T) -> Result<(), GttError>,
+    quarantine: impl FnOnce(T),
+) -> Result<T, GttError> {
+    if physical.is_empty() {
+        return Err(GttError::EmptyRun);
+    }
+    if let Some(&address) = physical.iter().find(|page| !page.is_multiple_of(PAGE_SIZE)) {
+        return Err(GttError::AddressNotAligned { address });
+    }
+    let mapping = map(physical)?;
+    if let Err(error) = publish(&mapping) {
+        if rollback(&mapping).is_err() || retire(&mapping).is_err() {
+            quarantine(mapping);
+            return Err(GttError::IdentityDmaQuarantined);
+        }
+        return Err(error);
+    }
+    Ok(mapping)
 }
 
 /// Exact before-image, including absent PTE bits, not a reconstructed mapping.
@@ -960,7 +1070,75 @@ impl Gtt {
             size,
             scratch: Pte::encode(zero_page_physical())?,
             next: Mutex::new(allocatable_end(aperture)),
+            #[cfg(target_os = "none")]
+            identity_lease: Mutex::new(None),
+            #[cfg(target_os = "none")]
+            scratch_dma_mapping: Mutex::new(None),
+            #[cfg(target_os = "none")]
+            dma_quarantine: Mutex::new(alloc::vec::Vec::new()),
         })
+    }
+
+    /// Install the single requester-scoped VT-d owner after live firmware
+    /// scanout ownership has been proved. Display and GT then share this exact
+    /// lease through the same GGTT instance.
+    #[cfg(target_os = "none")]
+    pub(crate) fn install_identity_lease(
+        &self,
+        lease: tk_vtd::IdentityDmaLease,
+    ) -> Result<(), GttError> {
+        let mut current = self.identity_lease.lock();
+        let lease = if let Some(existing) = current.as_ref() {
+            if existing.as_ref() != &lease {
+                return Err(GttError::IdentityLeaseUnavailable);
+            }
+            existing.clone()
+        } else {
+            let lease = Arc::try_new(lease).map_err(|_| GttError::CheckpointUnavailable)?;
+            *current = Some(lease.clone());
+            lease
+        };
+        if self.scratch_dma_mapping.lock().is_some() {
+            return Ok(());
+        }
+        let scratch = [zero_page_physical()];
+        let mapping = lease.map_pages(&scratch).map_err(|error| {
+            if error == tk_vtd::Error::Quarantined {
+                GttError::IdentityDmaQuarantined
+            } else {
+                GttError::IdentityMapFailed
+            }
+        })?;
+        *self.scratch_dma_mapping.lock() = Some(mapping);
+        Ok(())
+    }
+
+    #[cfg(target_os = "none")]
+    pub(crate) fn has_identity_lease(&self, bdf: pci::Bdf) -> bool {
+        let scratch_ready = self.scratch_dma_mapping.lock().is_some();
+        let lease_matches = self
+            .identity_lease
+            .lock()
+            .as_ref()
+            .is_some_and(|lease| super::dma::lease_matches(lease, bdf));
+        scratch_ready && lease_matches
+    }
+
+    #[cfg(target_os = "none")]
+    pub(crate) fn identity_lease(&self) -> Option<Arc<tk_vtd::IdentityDmaLease>> {
+        self.identity_lease.lock().as_ref().cloned()
+    }
+
+    #[cfg(target_os = "none")]
+    fn quarantine_dma(&self, binding: DmaBinding) {
+        let mut quarantine = self.dma_quarantine.lock();
+        if quarantine.try_reserve(1).is_ok() {
+            quarantine.push(binding);
+        } else {
+            // SAFETY: this intentional leak keeps the VT-d mapping token and
+            // backing alive when even the quarantine record cannot be grown.
+            core::mem::forget(binding);
+        }
     }
 
     /// Exclusive upper bound for new display and GT bindings.
@@ -1158,6 +1336,7 @@ impl Gtt {
     /// caller must not use the surface (it has no address), and clearing the
     /// entries would be a write to the page table for a caller that is already
     /// being told the page table did not answer.
+    #[cfg(not(target_os = "none"))]
     pub(crate) fn map_linear(&self, physical: u64, len: usize) -> Result<u64, GttError> {
         if len == 0 {
             return Err(GttError::EmptyRun);
@@ -1212,10 +1391,41 @@ impl Gtt {
         Ok(start)
     }
 
+    /// Product-kernel contiguous scanout allocation. Unlike the host model,
+    /// this always publishes an identity-mapped binding under the installed
+    /// GPU requester lease and returns its retirement owner.
+    #[cfg(target_os = "none")]
+    pub(crate) fn bind_linear(&self, physical: u64, len: usize) -> Result<Binding, GttError> {
+        if len == 0 || !physical.is_multiple_of(PAGE_SIZE) {
+            return Err(if len == 0 {
+                GttError::EmptyRun
+            } else {
+                GttError::AddressNotAligned { address: physical }
+            });
+        }
+        let pages = (len as u64).div_ceil(PAGE_SIZE);
+        let mut physical_pages = alloc::vec::Vec::new();
+        physical_pages
+            .try_reserve_exact(usize::try_from(pages).map_err(|_| GttError::CheckpointUnavailable)?)
+            .map_err(|_| GttError::CheckpointUnavailable)?;
+        for page in 0..pages {
+            physical_pages.push(
+                physical
+                    .checked_add(page * PAGE_SIZE)
+                    .ok_or(GttError::AddressTooWide { address: physical })?,
+            );
+        }
+        self.bind_pages(&physical_pages, None)
+    }
+
     /// Bind fixed, pinned scattered system pages for the native KMS adapter.
     /// The caller keeps the backing pinned even on an ambiguous PTE failure.
     /// UC stores and full readback implement ADL-N's non-GuC GGTT route.
-    pub(crate) fn bind_pages(&self, physical: &[u64]) -> Result<Binding, GttError> {
+    pub(crate) fn bind_pages(
+        &self,
+        physical: &[u64],
+        backing: Option<(Arc<SharedPages>, SharedFixedView)>,
+    ) -> Result<Binding, GttError> {
         if physical.is_empty() {
             return Err(GttError::EmptyRun);
         }
@@ -1239,45 +1449,129 @@ impl Gtt {
         for i in first..first + count {
             before.push(self.array.read(i));
         }
-        // Complete before-image exists before the first write. If a readback
-        // fails, this run has never been exposed to a consumer; restore it now.
-        for i in 0..count {
-            let value = if i < physical.len() {
-                Pte::encode(physical[i])?.raw()
-            } else {
-                self.scratch.raw()
-            };
-            self.array.write(first + i, value);
-        }
-        for i in 0..count {
-            let wrote = if i < physical.len() {
-                Pte::encode(physical[i])?.raw()
-            } else {
-                self.scratch.raw()
-            };
-            let read = self.array.read(first + i);
-            if read != wrote {
-                for (j, &value) in before.iter().enumerate().rev() {
-                    self.array.write(first + j, value);
-                }
-                for (j, &wrote) in before.iter().enumerate() {
-                    let read = self.array.read(first + j);
-                    if read != wrote {
-                        return Err(GttError::ReadBackMismatch {
-                            index: first + j,
-                            wrote,
-                            read,
+        #[cfg(target_os = "none")]
+        let dma = {
+            let lease = self
+                .identity_lease
+                .lock()
+                .as_ref()
+                .cloned()
+                .ok_or(GttError::IdentityLeaseUnavailable)?;
+            let mut backing = backing;
+            map_before_publish(
+                physical,
+                |pages| match lease.map_pages(pages) {
+                    Ok(mapping) => Ok(DmaBinding {
+                        lease,
+                        mapping: Some(mapping),
+                        active: AtomicBool::new(true),
+                        backing: backing.take(),
+                    }),
+                    Err(error) if error == tk_vtd::Error::Quarantined => {
+                        self.quarantine_dma(DmaBinding {
+                            lease,
+                            mapping: None,
+                            active: AtomicBool::new(true),
+                            backing: backing.take(),
                         });
+                        Err(GttError::IdentityDmaQuarantined)
                     }
+                    Err(_) => Err(GttError::IdentityMapFailed),
+                },
+                |_| {
+                    for i in 0..count {
+                        let value = if i < physical.len() {
+                            Pte::encode(physical[i])?.raw()
+                        } else {
+                            self.scratch.raw()
+                        };
+                        self.array.write(first + i, value);
+                    }
+                    for i in 0..count {
+                        let wrote = if i < physical.len() {
+                            Pte::encode(physical[i])?.raw()
+                        } else {
+                            self.scratch.raw()
+                        };
+                        let read = self.array.read(first + i);
+                        if read != wrote {
+                            return Err(GttError::ReadBackMismatch {
+                                index: first + i,
+                                wrote,
+                                read,
+                            });
+                        }
+                    }
+                    Ok(())
+                },
+                |_| {
+                    for (j, &value) in before.iter().enumerate().rev() {
+                        self.array.write(first + j, value);
+                    }
+                    for (j, &wrote) in before.iter().enumerate() {
+                        let read = self.array.read(first + j);
+                        if read != wrote {
+                            return Err(GttError::ReadBackMismatch {
+                                index: first + j,
+                                wrote,
+                                read,
+                            });
+                        }
+                    }
+                    Ok(())
+                },
+                DmaBinding::retire,
+                |mapping| self.quarantine_dma(mapping),
+            )?
+        };
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = backing;
+            // Host-only page-table model: product kernels use the mapping-first
+            // path above and never publish physical addresses without a lease.
+            for i in 0..count {
+                let value = if i < physical.len() {
+                    Pte::encode(physical[i])?.raw()
+                } else {
+                    self.scratch.raw()
+                };
+                self.array.write(first + i, value);
+            }
+            for i in 0..count {
+                let wrote = if i < physical.len() {
+                    Pte::encode(physical[i])?.raw()
+                } else {
+                    self.scratch.raw()
+                };
+                let read = self.array.read(first + i);
+                if read != wrote {
+                    for (j, &value) in before.iter().enumerate().rev() {
+                        self.array.write(first + j, value);
+                    }
+                    for (j, &wrote) in before.iter().enumerate() {
+                        let read = self.array.read(first + j);
+                        if read != wrote {
+                            return Err(GttError::ReadBackMismatch {
+                                index: first + j,
+                                wrote,
+                                read,
+                            });
+                        }
+                    }
+                    return Err(GttError::ReadBackMismatch {
+                        index: first + i,
+                        wrote,
+                        read,
+                    });
                 }
-                return Err(GttError::ReadBackMismatch {
-                    index: first + i,
-                    wrote,
-                    read,
-                });
             }
         }
-        Ok(Binding { address, before })
+        Ok(Binding {
+            address,
+            before,
+            #[cfg(target_os = "none")]
+            dma: Some(dma),
+        })
     }
 
     /// # Safety
@@ -1299,6 +1593,10 @@ impl Gtt {
                     read,
                 });
             }
+        }
+        #[cfg(target_os = "none")]
+        if let Some(dma) = &binding.dma {
+            dma.retire()?;
         }
         // Search still checks every present entry, including live bindings.
         *next = self.allocation_end();
