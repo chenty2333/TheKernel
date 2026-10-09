@@ -14,12 +14,16 @@ programming. Its tiny `IntelCdclkIo` policy backend has no register access and
 fails closed if the source table cannot satisfy the request. This does not
 wire runtime atomic CDCLK transitions. The module also adds
 the source conditions for `intel_cdclk_can_crawl()`,
-the source conditions for `intel_cdclk_can_crawl()`,
 `intel_cdclk_can_squash()`, `intel_cdclk_can_cd2x_update()`,
 `intel_cdclk_clock_changed()`, and `cdclk_compute_crawl_and_squash_midpoint()`
 from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_cdclk.c` (MIT,
 Copyright © 2006-2017 Intel). The full MIT text is in
 `crates/ax/tk-intel-display/LICENSE-MIT`.
+
+Initial power-up also calls translated `icl_calc_voltage_level()` for the
+PCODE level instead of keeping a second local threshold chain. The policy-only
+backend performs no MMIO and reports an unsupported out-of-range clock before
+committing the mailbox update.
 
 `CdclkConfig` carries the actual frequency, PLL VCO/reference and squash
 waveform. `transition()` follows `_bxt_set_cdclk()`'s selection order: use a
