@@ -13,6 +13,7 @@ use crate::{
 };
 
 pub const XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
+pub const RGB565: u32 = u32::from_le_bytes(*b"RG16");
 
 /// ADL-P exposes five universal planes per pipe. Numbering is zero-based internally
 /// like i915 PLANE_1; never confuse it with KMS object IDs or CURSOR.
@@ -164,6 +165,31 @@ impl InitialPlaneConfig {
             && self.color_ctl & (1 << 13) != 0
             && self.pitch >= self.width.saturating_mul(4)
     }
+
+    /// A narrow plane-local proof for the supported linear RGB565 primary
+    /// surface. All outer GGTT, link, vblank, watermark and DDB conditions are
+    /// still checked by the Native transaction.
+    pub fn native_linear_rgb565(self) -> bool {
+        self.ctl & (0x1f << 23) == 14 << 24
+            && self.fourcc == RGB565
+            && self.modifier == Modifier::Linear
+            && self.rotation_degrees_ccw == 0
+            && !self.reflect_x
+            && self.offset == 0
+            && self.surface_raw & 0xfff == 0
+            && self.ctl & ((3 << 21) | (1 << 19) | (1 << 15) | (1 << 9) | (1 << 4)) == 0
+            && self.color_ctl
+                & ((1 << 21) | (1 << 20) | (7 << 17) | (1 << 15) | (1 << 14) | (3 << 4))
+                == 0
+            && self.color_ctl & (1 << 13) != 0
+            && self.cpp == 2
+            && self.format_planes == 1
+            && self.pitch >= self.width.saturating_mul(2)
+    }
+
+    pub fn native_linear_rgb(self) -> bool {
+        self.native_linear_xrgb() || self.native_linear_rgb565()
+    }
 }
 
 pub fn skl_get_initial_plane_config(
@@ -250,4 +276,34 @@ pub fn skl_get_initial_plane_config(
         rotation_degrees_ccw,
         reflect_x,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InitialPlaneConfig, Modifier, RGB565};
+
+    #[test]
+    fn native_linear_rgb565_readout_matches_source_plane_format() {
+        let plane = InitialPlaneConfig {
+            ctl: (1 << 31) | (14 << 24),
+            color_ctl: 1 << 13,
+            surface_raw: 0x1000,
+            offset: 0,
+            size_raw: 0,
+            stride_raw: 60,
+            fourcc: RGB565,
+            modifier: Modifier::Linear,
+            cpp: 2,
+            format_planes: 1,
+            width: 1920,
+            height: 1080,
+            pitch: 3840,
+            main_size: 3840 * 1080,
+            rotation_degrees_ccw: 0,
+            reflect_x: false,
+        };
+        assert!(plane.native_linear_rgb565());
+        assert!(plane.native_linear_rgb());
+        assert!(!plane.native_linear_xrgb());
+    }
 }
