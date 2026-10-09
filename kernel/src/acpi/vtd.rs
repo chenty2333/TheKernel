@@ -1,5 +1,6 @@
-//! VT-d setup with a conservative shared-DMA default and experimental
-//! requester-specific domains by default (`iommu_domains=off` opts out).
+//! VT-d setup with translation enabled when a supported DMAR is present.
+//! Requester-specific DMA domains are enabled by default; `iommu_domains=off`
+//! selects the shared DMA context, and `intel_iommu=off` selects identity DMA.
 use alloc::vec::Vec;
 use core::{
     ptr::NonNull,
