@@ -13,8 +13,9 @@ use core::ffi::{c_int, c_ulong, c_void};
 use crate::{
     i915_drm_client_upstream::i915_drm_client_remove_object,
     i915_gem_core_upstream::{io_mapping_map_wc, io_mapping_unmap},
+    i915_gem_mman_upstream::i915_gem_object_release_mmap_gtt,
     linux::gem_memory::{INTEL_MEMORY_LOCAL, INTEL_MEMORY_SYSTEM},
-    i915_gem_context_upstream::{i915_gem_context_get, i915_gem_context_put},
+    i915_gem_context_upstream::{i915_gem_context_get, i915_gem_context_put, i915_lut_handle_free},
     i915_gem_context_types_upstream::DrmI915FilePrivate,
     i915_gem_object_api_upstream::{
         i915_gem_object_has_pages, i915_gem_object_has_pinned_pages, i915_gem_object_lock,
@@ -28,17 +29,22 @@ use crate::{
         __i915_gem_object_put_pages, __i915_gem_object_get_page as i915_gem_object_get_page,
         __i915_gem_object_get_dma_address as i915_gem_object_get_dma_address,
     },
-    i915_gem_object_types_upstream::{DrmI915GemObject, DrmI915GemObjectOps},
+    i915_gem_object_types_upstream::{DrmI915GemObject, DrmI915GemObjectOps, I915LutHandle},
     i915_vma_api_upstream::*,
     intel_gtt_api_upstream::i915_vm_resv_put,
     intel_context_upstream::*,
     intel_engine_cs_upstream::*,
     linux::{
+        i915_trace::trace_i915_gem_object_destroy,
         bitmap::bitmap_free,
         highmem::{kmap_local_page, kunmap_local},
         config::*,
         fields::{i915_gem_object_is_framebuffer, i915_gem_object_pat_set_by_user},
-        gem::{DrmFile, DrmGemObject, I915LutHandle, TtmBufferObjectLayout},
+        gem::{
+            dma_resv_fini, dma_resv_get_singleton, dma_resv_wait_timeout, drm_gem_is_imported,
+            DrmFile, DrmGemObject, DmaResv, TtmBufferObjectLayout, TtmResource,
+            drm_vma_offset_remove, i915_gem_to_ttm, i915_ttm_resource_visible_size,
+        },
         gem_memory::*,
         heap::*,
         i915::{
@@ -53,8 +59,24 @@ use crate::{
         rcu::*,
         workqueue::*,
     },
-    linux_i915_private::DrmI915Private,
+    linux_i915_private::{DrmDevicePrefix, DrmI915Private},
 };
+
+// Linux DRM API entry points whose C implementations live below this GEM
+// translation; keep their source signatures at this integration boundary.
+unsafe extern "C" {
+    fn drm_vma_node_revoke(node: *mut DrmVmaOffsetNode, file: *mut DrmFile);
+    fn drm_prime_gem_destroy(obj: *mut DrmGemObject, sg: *mut SgTable);
+    fn drm_gem_free_mmap_offset(obj: *mut DrmGemObject);
+    fn __cond_resched_lock(lock: *mut Spinlock) -> c_int;
+    fn i915_memcpy_from_wc(dst: *mut c_void, src: *const c_void, len: c_ulong) -> bool;
+    fn memcpy_fromio(dst: *mut c_void, src: *const c_void, len: usize);
+}
+
+#[inline]
+fn cond_resched_lock(lock: &mut Spinlock) -> bool {
+    unsafe { __cond_resched_lock(lock) != 0 }
+}
 
 // Linux i915 GEM allocation cache and the private GEM object callback table.
 // The table layout is supplied by the surrounding DRM integration binding.
@@ -201,7 +223,8 @@ pub unsafe fn i915_gem_object_alloc() -> *mut DrmI915GemObject {
     if obj.is_null() {
         return core::ptr::null_mut();
     }
-    (*obj).base.base.funcs = core::ptr::addr_of!(i915_gem_object_funcs).cast();
+    core::ops::DerefMut::deref_mut(&mut (*obj).base.base).funcs =
+        core::ptr::addr_of!(i915_gem_object_funcs).cast();
 
     obj
 }
@@ -258,7 +281,9 @@ pub unsafe fn i915_gem_object_init(
 pub unsafe fn __i915_gem_object_fini(obj: *mut DrmI915GemObject) {
     mutex_destroy(&mut (*obj).mm.get_page.lock);
     mutex_destroy(&mut (*obj).mm.get_dma_page.lock);
-    dma_resv_fini(&mut (*obj).base.base.resv);
+    dma_resv_fini(core::ptr::addr_of_mut!(
+        core::ops::DerefMut::deref_mut(&mut (*obj).base.base)._resv
+    ).cast());
 }
 
 // upstream: i915_gem_object.c i915_gem_object_set_cache_coherency()
@@ -385,7 +410,7 @@ unsafe extern "C" fn i915_gem_close_object(gem: *mut DrmGemObject, file: *mut Dr
 
         // flink/open may give one process multiple handles to the same VMA.
         mutex_lock(&mut (*ctx).lut_mutex);
-        vma = radix_tree_delete(&mut (*ctx).handles_vma, (*lut).handle) as *mut I915Vma;
+        vma = radix_tree_delete(&mut (*ctx).handles_vma, u64::from((*lut).handle)) as *mut I915Vma;
         if !vma.is_null() {
             GEM_BUG_ON!((*vma).obj != obj);
             GEM_BUG_ON!(atomic_read(&(*vma).open_count) == 0);
@@ -431,10 +456,10 @@ unsafe fn __i915_gem_object_free_mmaps(obj: *mut DrmI915GemObject) {
             mmo_offset,
             |mmo: *mut I915MmapOffset, _mn| {
                 drm_vma_offset_remove(
-                    (*obj).base.base.dev.vma_offset_manager,
+                    (*(*obj).base.base.dev.cast::<DrmDevicePrefix>()).vma_offset_manager,
                     &mut (*mmo).vma_node,
                 );
-                kfree(mmo.cast());
+                kfree(mmo.cast::<c_void>());
             },
         );
         (*obj).mmo.offsets = RB_ROOT;
@@ -469,13 +494,13 @@ pub unsafe fn __i915_gem_object_pages_fini(obj: *mut DrmI915GemObject) {
     atomic_set(&mut (*obj).mm.pages_pin_count, 0);
 
     // Imported dma-buf unmap requires the reservation to be locked.
-    if drm_gem_is_imported(&mut (*obj).base) {
+    if drm_gem_is_imported(core::ptr::addr_of!((*obj).base).cast::<DrmGemObject>()) {
         i915_gem_object_lock(obj, core::ptr::null_mut());
     }
 
     __i915_gem_object_put_pages(obj);
 
-    if drm_gem_is_imported(&mut (*obj).base) {
+    if drm_gem_is_imported(core::ptr::addr_of!((*obj).base).cast::<DrmGemObject>()) {
         i915_gem_object_unlock(obj);
     }
 
@@ -490,11 +515,11 @@ pub unsafe fn __i915_gem_free_object(obj: *mut DrmI915GemObject) {
 
     unsafe { bitmap_free((*obj).bit_17.cast()) };
 
-    if drm_gem_is_imported(&mut (*obj).base) {
-        drm_prime_gem_destroy(&mut (*obj).base, core::ptr::null_mut());
+    if drm_gem_is_imported(core::ptr::addr_of!((*obj).base).cast::<DrmGemObject>()) {
+        drm_prime_gem_destroy(core::ptr::addr_of_mut!((*obj).base).cast::<DrmGemObject>(), core::ptr::null_mut());
     }
 
-    drm_gem_free_mmap_offset(&mut (*obj).base);
+    drm_gem_free_mmap_offset(core::ptr::addr_of_mut!((*obj).base).cast::<DrmGemObject>());
 
     if let Some(release) = (*(*obj).ops).release {
         release(obj);
@@ -605,13 +630,14 @@ unsafe fn i915_gem_object_read_from_page_iomap(
     let idx = (offset >> PAGE_SHIFT) as PgoffT;
     let dma = i915_gem_object_get_dma_address(obj, idx);
     let src_map = io_mapping_map_wc(
-        &mut (*(*obj).mm.region).iomap,
-        dma - (*(*obj).mm.region).region.start,
-        PAGE_SIZE,
+        (&mut (*(*obj).mm.region).iomap as *mut crate::linux::gem_memory::IoMapping)
+            .cast::<c_void>(),
+        (dma - (*(*obj).mm.region).region.start) as i64,
+        PAGE_SIZE as usize,
     );
-    let src_ptr = src_map.cast::<u8>().add(offset_in_page(offset) as usize);
+    let src_ptr: *mut u8 = src_map.cast::<u8>().add(offset_in_page(offset) as usize);
 
-    if !i915_memcpy_from_wc(dst, src_ptr.cast(), size as usize) {
+    if !i915_memcpy_from_wc(dst, src_ptr.cast(), size as c_ulong) {
         memcpy_fromio(dst, src_ptr.cast(), size as usize);
     }
 
@@ -623,10 +649,22 @@ unsafe fn object_has_mappable_iomem(obj: *mut DrmI915GemObject) -> bool {
     GEM_BUG_ON!(!i915_gem_object_has_iomem(obj));
 
     if IS_DGFX(to_i915((*obj).base.base.dev)) {
-        return i915_ttm_resource_mappable(i915_gem_to_ttm(obj).resource);
+        return i915_ttm_resource_mappable((*i915_gem_to_ttm(obj)).resource);
     }
 
     true
+}
+
+/// The source owner is `i915_gem_ttm.c`; this is its target-layout-equivalent
+/// predicate over `ttm_resource` and `i915_ttm_buddy_resource`.
+unsafe fn i915_ttm_resource_mappable(res: *mut TtmResource) -> bool {
+    if (*res).mem_type == 0 /* TTM_PL_SYSTEM */ {
+        return true;
+    }
+
+    let pfn_up = ((*res).size + crate::linux_config::PAGE_SIZE - 1)
+        >> crate::linux_config::PAGE_SHIFT;
+    i915_ttm_resource_visible_size(res) == pfn_up
 }
 
 // upstream: i915_gem_object.c i915_gem_object_read_from_page()
@@ -943,7 +981,7 @@ pub unsafe fn i915_gem_object_get_moving_fence(
     obj: *mut DrmI915GemObject,
     fence: *mut *mut DmaFence,
 ) -> c_int {
-    dma_resv_get_singleton((*obj).base.base.resv, DMA_RESV_USAGE_KERNEL, fence)
+    dma_resv_get_singleton((*obj).base.base.resv.cast::<DmaResv>(), DMA_RESV_USAGE_KERNEL, fence)
 }
 
 // upstream: i915_gem_object.c i915_gem_object_wait_moving_fence()
@@ -953,11 +991,11 @@ pub unsafe fn i915_gem_object_wait_moving_fence(obj: *mut DrmI915GemObject, intr
     assert_object_held(obj);
 
     ret = dma_resv_wait_timeout(
-        (*obj).base.base.resv,
+        (*obj).base.base.resv.cast::<DmaResv>(),
         DMA_RESV_USAGE_KERNEL,
         intr,
-        MAX_SCHEDULE_TIMEOUT,
-    );
+        MAX_SCHEDULE_TIMEOUT as core::ffi::c_long,
+    ) as isize;
     if ret == 0 {
         ret = -ETIME as isize;
     } else if ret > 0 && i915_gem_object_has_unknown_state(obj) {
