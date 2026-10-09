@@ -14,7 +14,7 @@ pub mod pchgpio;
 #[cfg(target_os = "none")]
 mod pci;
 pub mod thermal;
-#[cfg(target_os = "none")]
+#[cfg(any(target_os = "none", test))]
 mod vtd;
 #[cfg(target_os = "none")]
 mod wake;
