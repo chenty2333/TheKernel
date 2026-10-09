@@ -418,6 +418,7 @@ sleep() { echo wait; }
         header = ROOT / "tests/guest/tools/intel-rcs-page.h"
         client = source.read_text()
         builder = (GRAPHICS / "build-guest-tools.sh").read_text()
+        rootfs_wrapper = (ROOT / "scripts/build-graphics-rootfs.sh").read_text()
 
         self.assertTrue(header.is_file())
         self.assertIn("#include <drm/drm.h>", client)
@@ -425,6 +426,10 @@ sleep() { echo wait; }
         self.assertIn('#include "intel-rcs-page.h"', client)
         self.assertIn('"$source_dir/tests/guest/tools/intel-bcs-smoke.c"', builder)
         self.assertIn('"$target/usr/local/bin/intel-bcs-smoke"', builder)
+        self.assertIn('printf \'%s\\n\' intel-bcs-smoke', rootfs_wrapper)
+        self.assertIn('"$REPO_ROOT/tests/guest/tools/intel-bcs-smoke.c"', rootfs_wrapper)
+        self.assertIn('"$REPO_ROOT/tests/guest/tools/intel-rcs-page.h"', rootfs_wrapper)
+        self.assertIn('[ -x "$target/usr/local/bin/intel-bcs-smoke" ]', rootfs_wrapper)
         self.assertFalse((ROOT / "tests/guest/graphics/intel-bcs-smoke.c").exists())
 
     def test_graphics_smoke_hands_an_existing_rootfs_to_the_drive_transport_without_building(self) -> None:

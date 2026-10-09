@@ -124,7 +124,8 @@ case "$flavor" in
         ;;
 esac
 
-# build-guest-tools.sh glob-discovers its probe sources; the wrapper derives
+# build-guest-tools.sh glob-discovers graphics probes and explicitly builds
+# the shared BCS acceptance client from tests/guest/tools. The wrapper derives
 # the installed guest names with the same device-lease-probe rename rule.
 graphics_probe_names() {
     local probe_source probe_name
@@ -134,6 +135,7 @@ graphics_probe_names() {
         [ "$probe_name" = device-lease-probe ] && probe_name=thekernel-device-lease-probe
         printf '%s\n' "$probe_name"
     done
+    printf '%s\n' intel-bcs-smoke
 }
 
 if [ -n "$fault" ]; then
@@ -339,6 +341,7 @@ validate_n305_iris_build_output() {
     grep -qx 'BR2_PACKAGE_LINUX_FIRMWARE_I915=y' "$resolved"
     grep -qx 'BR2_PACKAGE_MESA3D_OPENGL_EGL=y' "$resolved"
     grep -qx 'BR2_PACKAGE_MESA3D_OPENGL_ES=y' "$resolved"
+    [ -x "$target/usr/local/bin/intel-bcs-smoke" ]
     [ -x "$target/usr/local/bin/intel-mesa-smoke" ]
     [ -x "$target/usr/local/bin/intel-vulkan-smoke" ]
     [ -x "$target/usr/local/bin/intel-va-driver-load" ]
@@ -391,6 +394,11 @@ validate_checked_in() {
     grep -qx 'CONFIG_STAT=y' "$BUSYBOX_FRAGMENT"
     grep -qx 'CONFIG_FEATURE_STAT_FORMAT=y' "$BUSYBOX_FRAGMENT"
     grep -qx 'BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="@REPO_ROOT@/config/graphics/busybox.fragment"' "$COMMON"
+    for path in \
+        "$REPO_ROOT/tests/guest/tools/intel-bcs-smoke.c" \
+        "$REPO_ROOT/tests/guest/tools/intel-rcs-page.h"; do
+        [ -r "$path" ] || { printf 'missing shared Intel graphics client input: %s\n' "$path" >&2; return 1; }
+    done
     if [ "$flavor" = n305-iris-smoke ]; then
         validate_n305_iris_checked_in
         return
@@ -759,6 +767,7 @@ validate_logind_build_output() {
     [ -x "$target/usr/bin/sway" ]
     [ -x "$target/usr/bin/getfacl" ]
     [ -r "$target/etc/pam.d/login" ]
+    [ -x "$target/usr/local/bin/intel-bcs-smoke" ]
     [ -r "$target/usr/local/bin/thekernel-sway-session" ]
     [ -x "$target/usr/local/bin/thekernel-logind-cycle" ]
     [ -x "$target/usr/local/bin/thekernel-device-lease-probe" ]
