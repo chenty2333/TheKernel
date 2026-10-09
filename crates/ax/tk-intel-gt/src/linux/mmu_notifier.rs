@@ -3,6 +3,8 @@
 //! LinuxKPI storage layout for an interval MMU-notifier embedded by the i915
 //! userptr object. This provides no notifier registration or invalidation work.
 
+use core::ffi::c_ulong;
+
 use crate::intel_engine_cs_upstream::{HlistNode, RbNode};
 
 #[repr(C)]
@@ -11,7 +13,7 @@ pub struct MmuIntervalNotifier {
     pub ops: *const MmuIntervalNotifierOps,
     pub mm: *mut MmStruct,
     pub deferred_item: HlistNode,
-    pub invalidate_seq: usize,
+    pub invalidate_seq: c_ulong,
 }
 
 #[repr(C)]
@@ -24,12 +26,35 @@ pub struct IntervalTreeNode {
 
 #[repr(C)]
 pub struct MmuIntervalNotifierOps {
+    pub invalidate: Option<
+        unsafe extern "C" fn(*mut MmuIntervalNotifier, *const MmuNotifierRange, c_ulong) -> bool,
+    >,
+    pub invalidate_start: Option<
+        unsafe extern "C" fn(
+            *mut MmuIntervalNotifier,
+            *const MmuNotifierRange,
+            c_ulong,
+            *mut *mut MmuIntervalNotifierFinish,
+        ) -> bool,
+    >,
+    pub invalidate_finish: Option<unsafe extern "C" fn(*mut MmuIntervalNotifierFinish)>,
+}
+#[repr(C)]
+pub struct MmuNotifierRange {
+    _opaque: [u8; 0],
+}
+#[repr(C)]
+pub struct MmuIntervalNotifierFinish {
     _opaque: [u8; 0],
 }
 #[repr(C)]
 pub struct MmStruct {
     _opaque: [u8; 0],
 }
+
+const _: [(); 24] = [(); core::mem::size_of::<MmuIntervalNotifierOps>()];
+const _: [(); 88] = [(); core::mem::size_of::<MmuIntervalNotifier>()];
+const _: [(); 80] = [(); core::mem::offset_of!(MmuIntervalNotifier, invalidate_seq)];
 
 const _: [(); 48] = [(); core::mem::size_of::<IntervalTreeNode>()];
 const _: [(); 88] = [(); core::mem::size_of::<MmuIntervalNotifier>()];

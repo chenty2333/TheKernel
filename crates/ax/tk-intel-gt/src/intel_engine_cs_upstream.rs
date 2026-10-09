@@ -27,6 +27,7 @@ pub use crate::intel_engine_types_upstream::{
     VECS2, VECS3, VIDEO_DECODE_CLASS, VIDEO_ENHANCEMENT_CLASS, VIRTUAL_ENGINES,
 };
 use crate::{
+    i915_gem_object_types_upstream::DrmI915GemObject,
     i915_gem_object_upstream::i915_gem_object_set_cache_coherency,
     i915_request_types_upstream::*,
     i915_scheduler_types_upstream::*,
@@ -61,7 +62,10 @@ use crate::{
         intel_engine_apply_whitelist, intel_engine_apply_workarounds, intel_engine_init_ctx_wa,
         intel_engine_init_whitelist, intel_engine_init_workarounds,
     },
-    linux::i915::{CCS_MASK, HAS_ENGINE, HAS_EXECLISTS, RCS_MASK, VDBOX_MASK, VEBOX_MASK},
+    linux::{
+        average::{ewma__engine_latency_init, ewma__engine_latency_read},
+        i915::{CCS_MASK, HAS_ENGINE, HAS_EXECLISTS, RCS_MASK, VDBOX_MASK, VEBOX_MASK},
+    },
     linux_config::*,
     linux_heap::kmem_cache_free,
     linux_list::*,

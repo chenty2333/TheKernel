@@ -23,6 +23,12 @@ pub const WQ_FLAG_CUSTOM: u32 = 4;
 pub const WQ_FLAG_DONE: u32 = 8;
 pub const WQ_FLAG_PRIORITY: u32 = 16;
 
+/// Linux `cond_resched()` voluntary scheduling point.
+#[inline]
+pub fn cond_resched() {
+    axtask::resched_if_needed();
+}
+
 pub type WaitQueueFunc = unsafe extern "C" fn(*mut WaitQueueEntry, u32, i32, *mut c_void) -> i32;
 
 pub fn init_waitqueue_head(head: &mut WaitQueueHead) {

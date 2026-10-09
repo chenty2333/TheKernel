@@ -99,10 +99,25 @@ pub mod guc_submission_upstream;
 pub mod huc;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod i915_active_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod i915_drm_client_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod i915_gem_context_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod i915_gem_context_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod i915_gem_domain_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod i915_gem_object_api_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod i915_gem_object_header_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod i915_gem_object_types_upstream;
@@ -111,10 +126,22 @@ pub mod i915_gem_object_types_upstream;
 pub mod i915_gem_object_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod i915_gem_pages_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod i915_gem_shmem_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod i915_gem_shrinker_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod i915_gem_tiling_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod i915_gem_userptr_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod i915_gem_ww_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod i915_request_types_upstream;
@@ -127,6 +154,9 @@ pub mod i915_scheduler_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod i915_scheduler_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod i915_sw_fence_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod i915_vma_api_upstream;
@@ -143,6 +173,9 @@ pub mod intel_breadcrumbs_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_breadcrumbs_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_context_api_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_context_types_upstream;
@@ -166,6 +199,12 @@ pub mod intel_engine_types_upstream;
 pub mod intel_execlists_submission_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_ggtt_fencing_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_ggtt_fencing_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_gsc_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
@@ -185,6 +224,9 @@ pub mod intel_gt_mcr_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_gt_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_gtt_api_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_guc_actions_abi_types_upstream;
@@ -246,6 +288,9 @@ pub mod intel_ring;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_ring_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_ring_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_rps_types_upstream;

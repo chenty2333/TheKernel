@@ -11,8 +11,8 @@
 use core::ffi::{c_char, c_ulong};
 
 use crate::{
+    i915_vma_types_upstream::I915Vma,
     intel_context_types_upstream::IntelWakerefT,
-    intel_context_upstream::{I915AddressSpace, I915Vma},
     intel_engine_cs_upstream::{
         AtomicT, DelayedWork, I915PerfGt, Kobject, ListHead, LlistHead, Mutex, SeqcountMutex,
         Spinlock, WorkStruct,
@@ -22,6 +22,7 @@ use crate::{
     },
     intel_gsc_types_upstream::IntelGsc,
     intel_gt_buffer_pool_types_upstream::IntelGtBufferPool,
+    intel_gtt_api_upstream::{I915AddressSpace, I915Ggtt},
     intel_hwconfig_types_upstream::IntelHwconfig,
     intel_llc_types_upstream::IntelLlc,
     intel_migrate_types_upstream::IntelMigrate,
@@ -36,12 +37,6 @@ use crate::{
     intel_workarounds_types_upstream::I915WaList,
     linux_i915_private::DrmI915Private,
 };
-
-// Forward declaration `struct i915_ggtt` is pointer-only in this header.
-#[repr(C)]
-pub struct I915Ggtt {
-    _opaque: [u8; 0],
-}
 
 // Linux x86_64 phys_addr_t representation used by this target.
 pub type PhysAddrT = u64;

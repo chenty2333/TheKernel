@@ -12,12 +12,14 @@ pub(crate) use crate::{
     linux_sw_fence as sw_fence, linux_tasklet as tasklet, linux_timer as timer, linux_wait as wait,
     linux_workqueue as workqueue, linux_xarray as xarray,
 };
+pub(crate) mod average;
 pub(crate) mod bits;
 pub(crate) mod contexts;
 pub(crate) mod fields;
 pub(crate) mod gem;
 pub(crate) mod gem_memory;
 pub(crate) mod i915;
+pub(crate) mod i915_trace;
 pub(crate) mod idr;
 pub(crate) mod iosys_map;
 pub(crate) use idr::Ida;
@@ -29,6 +31,7 @@ pub(crate) mod rcu;
 pub(crate) mod registers;
 pub(crate) mod requests;
 pub(crate) mod srcu;
+pub(crate) mod ww_mutex;
 
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]

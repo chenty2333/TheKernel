@@ -18,6 +18,7 @@ use crate::{
     intel_gt_types_upstream::IntelGt,
     intel_ring::{CACHELINE_BYTES, PAGE_SIZE},
     intel_timeline_types_upstream::IntelTimeline,
+    linux::average::ewma_runtime_add,
     linux_config::*,
     linux_list::*,
 };
@@ -1365,7 +1366,7 @@ pub(crate) unsafe fn lrc_pin(
 }
 
 // upstream: intel_lrc.c lrc_unpin()
-pub(crate) unsafe fn lrc_unpin(ce: *mut IntelContext) {
+pub(crate) unsafe extern "C" fn lrc_unpin(ce: *mut IntelContext) {
     if unlikely(!(*ce).parallel.last_rq.is_null()) {
         i915_request_put((*ce).parallel.last_rq);
         (*ce).parallel.last_rq = core::ptr::null_mut();
@@ -1381,7 +1382,7 @@ pub(crate) unsafe fn lrc_unpin(ce: *mut IntelContext) {
 }
 
 // upstream: intel_lrc.c lrc_post_unpin()
-pub(crate) unsafe fn lrc_post_unpin(ce: *mut IntelContext) {
+pub(crate) unsafe extern "C" fn lrc_post_unpin(ce: *mut IntelContext) {
     i915_gem_object_unpin_map((*(*ce).state).obj);
 }
 
@@ -2031,6 +2032,6 @@ pub(crate) unsafe fn lrc_update_runtime(ce: *mut IntelContext) {
         st_runtime_underflow(stats, dt);
         return;
     }
-    ewma_runtime_add(&mut stats.runtime.avg, dt as u32);
+    ewma_runtime_add(&mut stats.runtime.avg, dt as u64);
     stats.runtime.total += dt as u64;
 }

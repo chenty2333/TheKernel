@@ -16,7 +16,8 @@ use core::{
 };
 
 use crate::{
-    intel_context_upstream::{I915Request, I915SchedNode, I915SwFence, WaitQueueHead},
+    i915_request_types_upstream::I915Request, i915_scheduler_types_upstream::I915SchedNode,
+    intel_context_types_upstream::I915SwFence, intel_context_upstream::WaitQueueHead,
     intel_engine_cs_upstream::ListHead,
 };
 
@@ -163,7 +164,7 @@ impl Drop for AdvanceCursor<'_> {
 #[macro_export]
 macro_rules! for_each_waiter {
     ($pos:ident, $request:expr, $body:block) => {{
-        let __request = ($request) as *const $crate::intel_context_upstream::I915Request;
+        let __request = ($request) as *const $crate::i915_request_types_upstream::I915Request;
         let __head = unsafe {
             core::ptr::addr_of!((*__request).sched.waiters_list)
                 as *const $crate::intel_engine_cs_upstream::ListHead
@@ -199,7 +200,7 @@ macro_rules! for_each_waiter {
 #[macro_export]
 macro_rules! for_each_signaler {
     ($pos:ident, $request:expr, $body:block) => {{
-        let __request = ($request) as *const $crate::intel_context_upstream::I915Request;
+        let __request = ($request) as *const $crate::i915_request_types_upstream::I915Request;
         let __head = unsafe {
             core::ptr::addr_of!((*__request).sched.signalers_list)
                 as *const $crate::intel_engine_cs_upstream::ListHead

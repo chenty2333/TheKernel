@@ -45,6 +45,14 @@ pub struct DrmMm {
     pub scan_active: c_ulong,
 }
 
+const DRM_MM_NODE_ALLOCATED_BIT: u32 = 0;
+
+/// Source `drm_mm_node_allocated()` from include/drm/drm_mm.h.
+#[inline]
+pub unsafe fn drm_mm_node_allocated(node: *const DrmMmNode) -> bool {
+    unsafe { (*node).flags & (1 << DRM_MM_NODE_ALLOCATED_BIT) != 0 }
+}
+
 /// `struct notifier_block` from `include/linux/notifier.h`.
 #[repr(C)]
 pub struct NotifierBlock {

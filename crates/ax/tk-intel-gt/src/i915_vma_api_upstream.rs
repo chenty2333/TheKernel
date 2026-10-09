@@ -26,6 +26,7 @@ use crate::{
     },
     intel_engine_cs_upstream::AtomicT,
     intel_gt_types_upstream::IntelGt,
+    intel_gtt_api_upstream::i915_vm_to_ggtt,
 };
 
 /// `I915_VMA_RELEASE_MAP` from `i915_vma.h:48-49`.
@@ -179,13 +180,24 @@ pub unsafe fn i915_vma_is_closed(vma: *const I915Vma) -> bool {
     unsafe { !crate::linux::list::list_empty(&*core::ptr::addr_of!((*vma).closed_link)) }
 }
 
+/// `i915_ggtt_pin_bias()` (`i915_vma.h:183-186`).
+///
+/// # Safety
+/// `vma` must be a live VMA attached to the GGTT.
+pub unsafe fn i915_ggtt_pin_bias(vma: *const I915Vma) -> u32 {
+    GEM_BUG_ON!(!unsafe { i915_vma_is_ggtt(vma) });
+    let ggtt = unsafe { i915_vm_to_ggtt((*vma).vm) };
+    unsafe { (*ggtt).pin_bias }
+}
+
 // `__i915_vma_size`, `i915_vma_size`, `__i915_vma_offset`,
 // `i915_vma_offset`, `i915_ggtt_offset`, and `i915_node_color_differs`
 // (i915_vma.h:128-181, 332-336) need `drm_mm_node.start/size/color` and the
 // node-allocation bit. The current DRM MM binding deliberately keeps
 // `DrmMmNode` opaque, so these inline accessors cannot be represented here
 // faithfully until the drm_mm.h owner binding exposes those members/helpers.
-// `i915_ggtt_pin_bias` (183-186) likewise needs the owning `i915_ggtt` layout.
+// `i915_ggtt_pin_bias` (183-186) is implemented below from the owning GGTT
+// header's `pin_bias` member and `i915_vm_to_ggtt()` helper.
 //
 // `i915_vma_compare` (207-249) requires the full `i915_gtt_view` union payload
 // and DRM `memcmp` semantics; the current I915GttView binding exposes only its
@@ -197,7 +209,7 @@ unsafe extern "C" {
     fn drm_gem_object_free(refcount: *mut Kref);
 }
 
-unsafe fn release_gem_object(refcount: *mut Kref) {
+unsafe extern "C" fn release_gem_object(refcount: *mut Kref) {
     // SAFETY: invoked only as the final-reference callback for a GEM object.
     unsafe { drm_gem_object_free(refcount) }
 }
@@ -329,10 +341,14 @@ pub unsafe fn __i915_vma_unpin(vma: *mut I915Vma) {
     unsafe { crate::linux::memory::atomic_dec(&mut (*vma).flags) };
 }
 
-// `i915_vma_unpin()` (`i915_vma.h:320-324`) is not emitted: its required
-// `drm_mm_node_allocated()` precondition cannot be faithfully implemented while
-// the DRM MM node owner remains opaque. The exact private counter operation
-// `__i915_vma_unpin()` above remains available.
+/// `i915_vma_unpin()` (`i915_vma.h:320-324`).
+///
+/// # Safety
+/// `vma` must point to a live VMA whose DRM-MM node is allocated and pinned.
+pub unsafe fn i915_vma_unpin(vma: *mut I915Vma) {
+    GEM_BUG_ON!(!unsafe { crate::linux::gem_memory::drm_mm_node_allocated(&(*vma).node) });
+    unsafe { __i915_vma_unpin(vma) };
+}
 
 /// `i915_vma_is_bound()` (`i915_vma.h:326-330`).
 ///

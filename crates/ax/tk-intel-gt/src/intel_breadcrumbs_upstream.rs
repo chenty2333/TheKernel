@@ -349,7 +349,7 @@ unsafe fn __intel_breadcrumbs_park(b: *mut IntelBreadcrumbs) {
 }
 
 // upstream: intel_breadcrumbs.c intel_breadcrumbs_free()
-unsafe fn intel_breadcrumbs_free(kref: *mut Kref) {
+unsafe extern "C" fn intel_breadcrumbs_free(kref: *mut Kref) {
     let b = container_of!(kref, IntelBreadcrumbs, r#ref);
 
     irq_work_sync(&mut (*b).irq_work);

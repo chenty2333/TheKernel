@@ -34,6 +34,15 @@ use crate::{
     linux_timer::{del_timer, del_timer_sync, mod_timer, timer_setup},
 };
 
+const WORK_STRUCT_PENDING_BIT: u32 = 0;
+
+/// Linux `work_pending()` tests WORK_STRUCT_PENDING_BIT with READ_ONCE.
+#[inline]
+pub unsafe fn work_pending(work: *const WorkStruct) -> bool {
+    let data = unsafe { ptr::read_volatile(ptr::addr_of!((*work).data)) };
+    data & (1u64 << WORK_STRUCT_PENDING_BIT) != 0
+}
+
 const WORKER_UNINITIALIZED: u8 = 0;
 const WORKER_STARTING: u8 = 1;
 const WORKER_READY: u8 = 2;

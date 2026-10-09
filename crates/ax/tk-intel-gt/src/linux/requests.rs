@@ -12,13 +12,67 @@ use core::{
 
 use crate::{
     i915_request_types_upstream::I915Request,
-    intel_context_upstream::{DmaFence, I915Active, I915GemWwCtx},
+    i915_request_upstream::DmaFenceOps,
+    intel_context_types_upstream::I915Active,
+    intel_context_upstream::{DmaFence, I915GemWwCtx, Kref, RcuHead},
     intel_ring_types_upstream::IntelRing,
     linux::{
         contexts::IntelContextPtr,
-        memory::{atomic_add_unless, atomic_inc, atomic_read, kref_get_unless_zero},
+        memory::{atomic_add_unless, atomic_inc, atomic_read, kref_get_unless_zero, kref_put},
     },
 };
+
+/// `dma_fence_put()` is the header-inline `kref_put(..., dma_fence_release)`
+/// operation. It dispatches the optional source ops release callback or
+/// reclaims through the `dma_fence_free()` RCU path when none is supplied.
+pub unsafe fn dma_fence_put(fence: *mut DmaFence) {
+    if fence.is_null() {
+        return;
+    }
+    unsafe {
+        kref_put(&mut (*fence).refcount, dma_fence_release_i915);
+    }
+}
+
+unsafe extern "C" fn dma_fence_release_i915(refcount: *mut Kref) {
+    if refcount.is_null() {
+        return;
+    }
+    let fence = unsafe {
+        refcount
+            .cast::<u8>()
+            .sub(core::mem::offset_of!(DmaFence, refcount))
+            .cast::<DmaFence>()
+    };
+    crate::linux::rcu::rcu_read_lock();
+    let ops = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*fence).ops)) }
+        .cast::<DmaFenceOps>();
+    match if ops.is_null() {
+        None
+    } else {
+        unsafe { (*ops).release }
+    } {
+        Some(release) => unsafe { release(fence) },
+        None => {
+            let head =
+                unsafe { core::ptr::addr_of_mut!((*fence).timestamp_union.rcu).cast::<RcuHead>() };
+            crate::linux::rcu::call_rcu(head, dma_fence_free_rcu);
+        }
+    }
+    crate::linux::rcu::rcu_read_unlock();
+}
+
+unsafe extern "C" fn dma_fence_free_rcu(head: *mut RcuHead) {
+    if head.is_null() {
+        return;
+    }
+    let fence = unsafe {
+        head.cast::<u8>()
+            .sub(core::mem::offset_of!(DmaFence, timestamp_union))
+            .cast::<DmaFence>()
+    };
+    unsafe { crate::linux::memory::kfree(fence) };
+}
 
 pub const DMA_FENCE_FLAG_SIGNALED_BIT: u32 = 3;
 pub const DMA_FENCE_FLAG_TIMESTAMP_BIT: u32 = 4;

@@ -1368,6 +1368,16 @@ fn guc_engine_busyness(engine: &mut intel_engine_cs, now: &mut ktime_t) -> ktime
     ns_to_ktime(stats.total)
 }
 
+// Match intel_engine_cs.busyness's C callback ABI while keeping the translated
+// implementation's safe borrowed form above.
+unsafe extern "C" fn guc_engine_busyness_callback(
+    engine: *mut intel_engine_cs,
+    now: *mut ktime_t,
+) -> ktime_t {
+    // SAFETY: the engine callback contract supplies live, writable arguments.
+    guc_engine_busyness(unsafe { &mut *engine }, unsafe { &mut *now })
+}
+
 // upstream: intel_guc_submission.c guc_enable_busyness_worker()
 fn guc_enable_busyness_worker(guc: &mut intel_guc) {
     mod_delayed_work(
@@ -1684,11 +1694,27 @@ fn guc_engine_reset_prepare(engine: &mut intel_engine_cs) {
     }
 }
 
+unsafe extern "C" fn guc_engine_reset_prepare_callback(engine: *mut intel_engine_cs) {
+    // SAFETY: reset callbacks receive a live engine pointer.
+    guc_engine_reset_prepare(unsafe { &mut *engine });
+}
+
 // upstream: intel_guc_submission.c guc_reset_nop()
 fn guc_reset_nop(_engine: &mut intel_engine_cs) {}
 
+unsafe extern "C" fn guc_reset_nop_callback(engine: *mut intel_engine_cs) {
+    // SAFETY: the callback receives a live engine pointer; the helper does not
+    // access it, but retaining the ABI argument matches the C callback.
+    guc_reset_nop(unsafe { &mut *engine });
+}
+
 // upstream: intel_guc_submission.c guc_rewind_nop()
 fn guc_rewind_nop(_engine: &mut intel_engine_cs, _stalled: bool) {}
+
+unsafe extern "C" fn guc_rewind_nop_callback(engine: *mut intel_engine_cs, stalled: bool) {
+    // SAFETY: reset callbacks receive a live engine pointer.
+    guc_rewind_nop(unsafe { &mut *engine }, stalled);
+}
 
 // upstream: intel_guc_submission.c __unwind_incomplete_requests()
 fn __unwind_incomplete_requests(ce: &mut intel_context) {
@@ -2038,6 +2064,11 @@ fn guc_submit_request(rq: &mut i915_request) {
         tasklet_hi_schedule(&mut sched_engine.tasklet);
     }
     spin_unlock_irqrestore(&mut sched_engine.lock, flags);
+}
+
+unsafe extern "C" fn guc_submit_request_callback(rq: *mut i915_request) {
+    // SAFETY: IntelEngineCs.submit_request is invoked with a live request.
+    guc_submit_request(unsafe { &mut *rq });
 }
 
 // upstream: intel_guc_submission.c new_guc_id()
@@ -3319,6 +3350,11 @@ fn add_to_context(rq: &mut i915_request) {
     spin_unlock(&mut ce.guc_state.lock);
 }
 
+unsafe extern "C" fn add_to_context_callback(rq: *mut i915_request) {
+    // SAFETY: IntelEngineCs.add_active_request supplies a live request.
+    add_to_context(unsafe { &mut *rq });
+}
+
 // upstream: intel_guc_submission.c guc_prio_fini()
 fn guc_prio_fini(rq: &mut i915_request, ce: &mut intel_context) {
     lockdep_assert_held(&ce.guc_state.lock);
@@ -3342,6 +3378,11 @@ fn remove_from_context(rq: &mut i915_request) {
     spin_unlock_irq(&mut ce.guc_state.lock);
     atomic_dec(&mut ce.guc_id.r#ref);
     i915_request_notify_execute_cb_imm(rq);
+}
+
+unsafe extern "C" fn remove_from_context_callback(rq: *mut i915_request) {
+    // SAFETY: IntelEngineCs.remove_active_request supplies a live request.
+    remove_from_context(unsafe { &mut *rq });
 }
 
 // upstream: intel_guc_submission.c submit_work_cb()
@@ -3473,6 +3514,11 @@ fn guc_request_alloc(rq: &mut i915_request) -> i32 {
     }
     spin_unlock_irqrestore(&mut ce.guc_state.lock, flags);
     0
+}
+
+unsafe extern "C" fn guc_request_alloc_callback(rq: *mut i915_request) -> i32 {
+    // SAFETY: IntelEngineCs.request_alloc supplies a live request.
+    guc_request_alloc(unsafe { &mut *rq })
 }
 
 // upstream: intel_guc_submission.c guc_virtual_context_pre_pin()
@@ -3738,6 +3784,11 @@ fn guc_sanitize(engine: &mut intel_engine_cs) {
     intel_engine_reset_pinned_contexts(engine);
 }
 
+unsafe extern "C" fn guc_sanitize_callback(engine: *mut intel_engine_cs) {
+    // SAFETY: IntelEngineCs.sanitize supplies a live engine.
+    guc_sanitize(unsafe { &mut *engine });
+}
+
 // upstream: intel_guc_submission.c setup_hwsp()
 fn setup_hwsp(engine: &mut intel_engine_cs) {
     intel_engine_set_hwsp_writemask(engine, !0u32); // HWSTAM
@@ -3772,6 +3823,11 @@ fn guc_resume(engine: &mut intel_engine_cs) -> i32 {
     0
 }
 
+unsafe extern "C" fn guc_resume_callback(engine: *mut intel_engine_cs) -> i32 {
+    // SAFETY: IntelEngineCs.resume supplies a live engine.
+    guc_resume(unsafe { &mut *engine })
+}
+
 // upstream: intel_guc_submission.c guc_sched_engine_disabled()
 fn guc_sched_engine_disabled(sched_engine: &i915_sched_engine) -> bool {
     sched_engine.tasklet.callback.is_none()
@@ -3779,7 +3835,12 @@ fn guc_sched_engine_disabled(sched_engine: &i915_sched_engine) -> bool {
 
 // upstream: intel_guc_submission.c guc_set_default_submission()
 fn guc_set_default_submission(engine: &mut intel_engine_cs) {
-    engine.submit_request = guc_submit_request;
+    engine.submit_request = guc_submit_request_callback;
+}
+
+unsafe extern "C" fn guc_set_default_submission_callback(engine: *mut intel_engine_cs) {
+    // SAFETY: IntelEngineCs.set_default_submission supplies a live engine.
+    guc_set_default_submission(unsafe { &mut *engine });
 }
 
 // upstream: intel_guc_submission.c guc_kernel_context_pin()
@@ -3833,6 +3894,11 @@ fn guc_release(engine: &mut intel_engine_cs) {
     lrc_fini_wa_ctx(engine);
 }
 
+unsafe extern "C" fn guc_release_callback(engine: *mut intel_engine_cs) {
+    // SAFETY: IntelEngineCs.release supplies a live engine.
+    guc_release(unsafe { &mut *engine });
+}
+
 // upstream: intel_guc_submission.c virtual_guc_bump_serial()
 fn virtual_guc_bump_serial(engine: &mut intel_engine_cs) {
     for_each_engine_masked!(sibling, tmp, engine.gt, engine.mask, {
@@ -3840,19 +3906,24 @@ fn virtual_guc_bump_serial(engine: &mut intel_engine_cs) {
     });
 }
 
+unsafe extern "C" fn virtual_guc_bump_serial_callback(engine: *mut intel_engine_cs) {
+    // SAFETY: IntelEngineCs.bump_serial supplies a live virtual engine.
+    virtual_guc_bump_serial(unsafe { &mut *engine });
+}
+
 // upstream: intel_guc_submission.c guc_default_vfuncs()
 fn guc_default_vfuncs(engine: &mut intel_engine_cs) {
     // Default virtual functions, overridable by individual engines.
-    engine.resume = guc_resume;
+    engine.resume = guc_resume_callback;
     engine.cops = &guc_context_ops;
-    engine.request_alloc = guc_request_alloc;
-    engine.add_active_request = add_to_context;
-    engine.remove_active_request = remove_from_context;
+    engine.request_alloc = guc_request_alloc_callback;
+    engine.add_active_request = add_to_context_callback;
+    engine.remove_active_request = remove_from_context_callback;
     engine.sched_engine.schedule = i915_schedule;
-    engine.reset.prepare = guc_engine_reset_prepare;
-    engine.reset.rewind = guc_rewind_nop;
-    engine.reset.cancel = guc_reset_nop;
-    engine.reset.finish = guc_reset_nop;
+    engine.reset.prepare = guc_engine_reset_prepare_callback;
+    engine.reset.rewind = guc_rewind_nop_callback;
+    engine.reset.cancel = guc_reset_nop_callback;
+    engine.reset.finish = guc_reset_nop_callback;
     engine.emit_flush = gen8_emit_flush_xcs;
     engine.emit_init_breadcrumb = gen8_emit_init_breadcrumb;
     engine.emit_fini_breadcrumb = gen8_emit_fini_breadcrumb_xcs;
@@ -3860,8 +3931,8 @@ fn guc_default_vfuncs(engine: &mut intel_engine_cs) {
         engine.emit_fini_breadcrumb = gen12_emit_fini_breadcrumb_xcs;
         engine.emit_flush = gen12_emit_flush_xcs;
     }
-    engine.set_default_submission = guc_set_default_submission;
-    engine.busyness = guc_engine_busyness;
+    engine.set_default_submission = guc_set_default_submission_callback;
+    engine.busyness = guc_engine_busyness_callback;
     engine.flags |= I915_ENGINE_SUPPORTS_STATS;
     engine.flags |= I915_ENGINE_HAS_PREEMPTION;
     engine.flags |= I915_ENGINE_HAS_TIMESLICES;
@@ -3948,8 +4019,8 @@ fn intel_guc_submission_setup(engine: &mut intel_engine_cs) -> i32 {
     }
     lrc_init_wa_ctx(engine);
     // Take ownership and responsibility for cleanup last.
-    engine.sanitize = guc_sanitize;
-    engine.release = guc_release;
+    engine.sanitize = guc_sanitize_callback;
+    engine.release = guc_release_callback;
     0
 }
 
@@ -5097,9 +5168,9 @@ fn guc_create_virtual(
         );
         (*ve).base.sched_engine = i915_sched_engine_get(guc.sched_engine);
         (*ve).base.cops = &virtual_guc_context_ops;
-        (*ve).base.request_alloc = guc_request_alloc;
-        (*ve).base.bump_serial = virtual_guc_bump_serial;
-        (*ve).base.submit_request = guc_submit_request;
+        (*ve).base.request_alloc = guc_request_alloc_callback;
+        (*ve).base.bump_serial = virtual_guc_bump_serial_callback;
+        (*ve).base.submit_request = guc_submit_request_callback;
         (*ve).base.flags = I915_ENGINE_IS_VIRTUAL;
         build_bug_on!(ilog2(VIRTUAL_ENGINES) < I915_NUM_ENGINES);
         (*ve).base.mask = VIRTUAL_ENGINES;
@@ -5233,12 +5304,16 @@ unsafe fn guc_virtual_context_pre_pin_op(
     })
 }
 
-unsafe fn guc_context_revoke_op(ce: *mut intel_context, rq: *mut i915_request, timeout: u32) {
+unsafe extern "C" fn guc_context_revoke_op(
+    ce: *mut intel_context,
+    rq: *mut i915_request,
+    timeout: u32,
+) {
     assert!(!ce.is_null() && !rq.is_null());
     guc_context_revoke(unsafe { &mut *ce }, unsafe { &mut *rq }, timeout);
 }
 
-unsafe fn guc_context_cancel_request_op(ce: *mut intel_context, rq: *mut i915_request) {
+unsafe extern "C" fn guc_context_cancel_request_op(ce: *mut intel_context, rq: *mut i915_request) {
     assert!(!ce.is_null() && !rq.is_null());
     guc_context_cancel_request(unsafe { &mut *ce }, unsafe { &mut *rq });
 }

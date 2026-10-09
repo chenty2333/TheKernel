@@ -2,7 +2,9 @@
 // Copyright © 2026 Intel Corporation and TheKernel contributors.
 // Linux bitops/bitfield operations used by the v7.2.3 i915 headers.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{
+    AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 pub trait BitWord: Copy {
     fn to_u64(self) -> u64;
@@ -167,6 +169,79 @@ pub fn for_each_set_bit(word: u64, limit: u32) -> impl Iterator<Item = u32> {
 pub fn IS_ALIGNED<V: BitWord, A: BitWord>(value: V, alignment: A) -> bool {
     let alignment = alignment.to_u64();
     alignment != 0 && value.to_u64() & (alignment - 1) == 0
+}
+
+/// Exact-value Linux `cmpxchg()` operation. x86 LOCK CMPXCHG provides full ordering.
+pub unsafe trait CmpxchgValue: Copy {
+    unsafe fn cmpxchg(pointer: *mut Self, old: Self, new: Self) -> Self;
+}
+
+unsafe impl<T> CmpxchgValue for *mut T {
+    unsafe fn cmpxchg(pointer: *mut Self, old: Self, new: Self) -> Self {
+        unsafe { AtomicPtr::from_ptr(pointer) }
+            .compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst)
+            .unwrap_or_else(|actual| actual)
+    }
+}
+
+unsafe impl<T> CmpxchgValue for *const T {
+    unsafe fn cmpxchg(pointer: *mut Self, old: Self, new: Self) -> Self {
+        unsafe { AtomicPtr::from_ptr(pointer.cast::<*mut T>()) }
+            .compare_exchange(
+                old.cast_mut(),
+                new.cast_mut(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .unwrap_or_else(|actual| actual)
+            .cast_const()
+    }
+}
+
+unsafe impl CmpxchgValue for u32 {
+    unsafe fn cmpxchg(pointer: *mut Self, old: Self, new: Self) -> Self {
+        unsafe { AtomicU32::from_ptr(pointer) }
+            .compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst)
+            .unwrap_or_else(|actual| actual)
+    }
+}
+unsafe impl CmpxchgValue for u64 {
+    unsafe fn cmpxchg(pointer: *mut Self, old: Self, new: Self) -> Self {
+        unsafe { AtomicU64::from_ptr(pointer) }
+            .compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst)
+            .unwrap_or_else(|actual| actual)
+    }
+}
+unsafe impl CmpxchgValue for i32 {
+    unsafe fn cmpxchg(pointer: *mut Self, old: Self, new: Self) -> Self {
+        unsafe { AtomicI32::from_ptr(pointer) }
+            .compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst)
+            .unwrap_or_else(|actual| actual)
+    }
+}
+unsafe impl CmpxchgValue for i64 {
+    unsafe fn cmpxchg(pointer: *mut Self, old: Self, new: Self) -> Self {
+        unsafe { AtomicI64::from_ptr(pointer) }
+            .compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst)
+            .unwrap_or_else(|actual| actual)
+    }
+}
+unsafe impl CmpxchgValue for usize {
+    unsafe fn cmpxchg(pointer: *mut Self, old: Self, new: Self) -> Self {
+        unsafe { AtomicUsize::from_ptr(pointer) }
+            .compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst)
+            .unwrap_or_else(|actual| actual)
+    }
+}
+
+#[inline]
+pub unsafe fn cmpxchg<T: CmpxchgValue>(pointer: *mut T, old: T, new: T) -> T {
+    unsafe { T::cmpxchg(pointer, old, new) }
+}
+
+#[inline]
+pub unsafe fn cmpxchg64(pointer: *mut u64, old: u64, new: u64) -> u64 {
+    unsafe { <u64 as CmpxchgValue>::cmpxchg(pointer, old, new) }
 }
 
 #[cfg(test)]

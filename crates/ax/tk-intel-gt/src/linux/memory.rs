@@ -23,7 +23,7 @@ use core::{
 
 use crate::{
     intel_context_upstream::{Kref, RefcountT},
-    intel_engine_cs_upstream::AtomicT,
+    intel_engine_cs_upstream::{AtomicT, Spinlock},
     linux_config::{GFP_ATOMIC, GFP_KERNEL},
 };
 
@@ -130,6 +130,17 @@ where
     kmalloc_objs_flags::<T, N>(count, GFP_KERNEL)
 }
 
+/// Allocate a variable-sized array with Linux `kvmalloc_array()` semantics
+/// for CPU-only backing storage. This allocator provides virtual addressability
+/// but does not promise physical contiguity, so it must not be used for
+/// DMA-visible arrays.
+pub fn kvmalloc_objs<T, N>(count: N) -> *mut T
+where
+    N: TryInto<usize>,
+{
+    kmalloc_objs_flags::<T, N>(count, GFP_KERNEL)
+}
+
 /// Allocate a zero-initialized array with `GFP_KERNEL`.
 pub fn kzalloc_objs<T, N>(count: N) -> *mut T
 where
@@ -220,10 +231,48 @@ pub fn atomic_inc(value: &mut AtomicT) {
     atomic(value).fetch_add(1, Ordering::Relaxed);
 }
 
+/// `atomic_inc_not_zero()` with Linux's full ordering on successful RMW.
+#[inline]
+pub fn atomic_inc_not_zero(value: &mut AtomicT) -> bool {
+    let counter = atomic(value);
+    let mut old = counter.load(Ordering::Relaxed);
+    while old != 0 {
+        match counter.compare_exchange_weak(old, old + 1, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => old = actual,
+        }
+    }
+    false
+}
+
+/// Linux `atomic_dec_and_lock_irqsave()`: decrement with full atomic
+/// ordering; when this observes the last reference, acquire the supplied raw
+/// spinlock with local IRQ state saved before returning true.
+pub unsafe fn atomic_dec_and_lock_irqsave(
+    value: *mut AtomicT,
+    lock: *mut Spinlock,
+    flags: *mut core::ffi::c_ulong,
+) -> bool {
+    let old = atomic(unsafe { &mut *value }).fetch_sub(1, Ordering::AcqRel);
+    if old != 1 {
+        return false;
+    }
+    let mut saved = 0;
+    unsafe { crate::linux_locks::spin_lock_irqsave_raw(lock, &mut saved) };
+    unsafe { *flags = saved };
+    true
+}
+
 /// Atomic decrement (`atomic_dec`, relaxed ordering).
 #[inline]
 pub fn atomic_dec(value: &mut AtomicT) {
     atomic(value).fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Linux SMP read barrier (`smp_rmb`).
+#[inline]
+pub fn smp_rmb() {
+    fence(Ordering::Acquire);
 }
 
 /// Atomic addition (`atomic_add`, relaxed ordering).
@@ -321,7 +370,7 @@ pub unsafe fn kref_get(value: *mut Kref) {
 /// `release` must be the correct destructor for the containing object and may
 /// free it; it is called at most once for this decrement.
 #[inline]
-pub unsafe fn kref_put(value: *mut Kref, release: unsafe fn(*mut Kref)) -> i32 {
+pub unsafe fn kref_put(value: *mut Kref, release: unsafe extern "C" fn(*mut Kref)) -> i32 {
     // SAFETY: required by this function's contract.  Do not touch `value`
     // after invoking `release`, since the callback may free its container.
     if unsafe { refcount_dec_and_test(&mut (*value).refcount) } {

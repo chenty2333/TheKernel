@@ -4,9 +4,63 @@
 // Linux 7.2.3 list primitives used by the upstream i915 translations. The
 // node layout is supplied by intel_engine_types.h; links remain intrusive.
 
-use core::mem::MaybeUninit;
+use core::{
+    mem::MaybeUninit,
+    sync::atomic::{AtomicPtr, Ordering},
+};
 
 use crate::intel_engine_cs_upstream::{ListHead, LlistHead};
+
+/// Initialize Linux's lock-free list head.
+#[inline]
+pub unsafe fn init_llist_head(head: *mut LlistHead) {
+    unsafe { AtomicPtr::from_ptr(core::ptr::addr_of_mut!((*head).first)) }
+        .store(core::ptr::null_mut(), Ordering::Relaxed);
+}
+
+/// Push one node onto a Linux llist. Returns true when the list was empty.
+#[inline]
+pub unsafe fn llist_add(
+    node: *mut crate::intel_engine_cs_upstream::LlistNode,
+    head: *mut LlistHead,
+) -> bool {
+    let first = unsafe { AtomicPtr::from_ptr(core::ptr::addr_of_mut!((*head).first)) };
+    let mut old = first.load(Ordering::Relaxed);
+    loop {
+        unsafe { (*node).next = old };
+        match first.compare_exchange_weak(old, node, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => return old.is_null(),
+            Err(actual) => old = actual,
+        }
+    }
+}
+
+/// Push a linked batch onto a Linux llist. Returns true when the list was empty.
+#[inline]
+pub unsafe fn llist_add_batch(
+    first_node: *mut crate::intel_engine_cs_upstream::LlistNode,
+    last_node: *mut crate::intel_engine_cs_upstream::LlistNode,
+    head: *mut LlistHead,
+) -> bool {
+    let first = unsafe { AtomicPtr::from_ptr(core::ptr::addr_of_mut!((*head).first)) };
+    let mut old = first.load(Ordering::Relaxed);
+    loop {
+        unsafe { (*last_node).next = old };
+        match first.compare_exchange_weak(old, first_node, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => return old.is_null(),
+            Err(actual) => old = actual,
+        }
+    }
+}
+
+/// Atomically detach every node from an llist.
+#[inline]
+pub unsafe fn llist_del_all(
+    head: *mut LlistHead,
+) -> *mut crate::intel_engine_cs_upstream::LlistNode {
+    unsafe { AtomicPtr::from_ptr(core::ptr::addr_of_mut!((*head).first)) }
+        .swap(core::ptr::null_mut(), Ordering::Acquire)
+}
 
 #[allow(non_snake_case)]
 pub unsafe fn INIT_LIST_HEAD(head: *mut ListHead) {
@@ -40,6 +94,11 @@ pub unsafe fn list_add_tail(new: *mut ListHead, head: *mut ListHead) {
 unsafe fn __list_del(prev: *mut ListHead, next: *mut ListHead) {
     (*next).prev = prev;
     (*prev).next = next;
+}
+
+#[inline]
+pub unsafe fn __list_del_entry(entry: *mut ListHead) {
+    unsafe { __list_del((*entry).prev, (*entry).next) };
 }
 
 pub unsafe fn list_del(entry: *mut ListHead) {

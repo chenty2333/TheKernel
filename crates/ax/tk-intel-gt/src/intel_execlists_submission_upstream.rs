@@ -2342,7 +2342,7 @@ unsafe fn __execlists_context_pre_pin(
 }
 
 // upstream: intel_execlists_submission.c execlists_context_pre_pin()
-unsafe fn execlists_context_pre_pin(
+unsafe extern "C" fn execlists_context_pre_pin(
     ce: *mut IntelContext,
     ww: *mut I915GemWwCtx,
     vaddr: *mut *mut c_void,
@@ -2351,7 +2351,7 @@ unsafe fn execlists_context_pre_pin(
 }
 
 // upstream: intel_execlists_submission.c execlists_context_pin()
-unsafe fn execlists_context_pin(ce: *mut IntelContext, vaddr: *mut c_void) -> i32 {
+unsafe extern "C" fn execlists_context_pin(ce: *mut IntelContext, vaddr: *mut c_void) -> i32 {
     lrc_pin(ce, (*ce).engine, vaddr)
 }
 
@@ -2361,7 +2361,7 @@ unsafe fn execlists_context_alloc(ce: *mut IntelContext) -> i32 {
 }
 
 // upstream: intel_execlists_submission.c execlists_context_cancel_request()
-unsafe fn execlists_context_cancel_request(ce: *mut IntelContext, rq: *mut I915Request) {
+unsafe extern "C" fn execlists_context_cancel_request(ce: *mut IntelContext, rq: *mut I915Request) {
     let mut engine: *mut IntelEngineCs = core::ptr::null_mut();
 
     i915_request_active_engine(rq, &mut engine);
@@ -2420,18 +2420,23 @@ unsafe fn execlists_create_parallel(
 #[allow(non_upper_case_globals)]
 static execlists_context_ops: IntelContextOps = IntelContextOps {
     flags: COPS_HAS_INFLIGHT | COPS_RUNTIME_CYCLES,
-    alloc: execlists_context_alloc,
-    cancel_request: execlists_context_cancel_request,
-    pre_pin: execlists_context_pre_pin,
-    pin: execlists_context_pin,
-    unpin: lrc_unpin,
-    post_unpin: lrc_post_unpin,
-    enter: intel_context_enter_engine,
-    exit: intel_context_exit_engine,
-    reset: lrc_reset,
-    destroy: lrc_destroy,
-    create_parallel: execlists_create_parallel,
+    alloc: Some(execlists_context_alloc),
+    revoke: None,
+    close: None,
+    pre_pin: Some(execlists_context_pre_pin),
+    pin: Some(execlists_context_pin),
+    unpin: Some(lrc_unpin),
+    post_unpin: Some(lrc_post_unpin),
+    cancel_request: Some(execlists_context_cancel_request),
+    enter: Some(intel_context_enter_engine),
+    exit: Some(intel_context_exit_engine),
+    sched_disable: None,
+    update_stats: None,
+    reset: Some(lrc_reset),
+    destroy: Some(lrc_destroy),
     create_virtual: Some(execlists_create_virtual),
+    create_parallel: Some(execlists_create_parallel),
+    get_sibling: None,
 };
 
 // upstream: intel_execlists_submission.c emit_pdps()
@@ -3309,13 +3314,13 @@ unsafe fn virtual_engine_initial_hint(ve: *mut VirtualEngine) {
 }
 
 // upstream: intel_execlists_submission.c virtual_context_alloc()
-unsafe fn virtual_context_alloc(ce: *mut IntelContext) -> i32 {
+unsafe extern "C" fn virtual_context_alloc(ce: *mut IntelContext) -> i32 {
     let ve = container_of!(ce, VirtualEngine, context);
     lrc_alloc(ce, *(*ve).siblings)
 }
 
 // upstream: intel_execlists_submission.c virtual_context_pre_pin()
-unsafe fn virtual_context_pre_pin(
+unsafe extern "C" fn virtual_context_pre_pin(
     ce: *mut IntelContext,
     ww: *mut I915GemWwCtx,
     vaddr: *mut *mut c_void,
@@ -3326,7 +3331,7 @@ unsafe fn virtual_context_pre_pin(
 }
 
 // upstream: intel_execlists_submission.c virtual_context_pin()
-unsafe fn virtual_context_pin(ce: *mut IntelContext, vaddr: *mut c_void) -> i32 {
+unsafe extern "C" fn virtual_context_pin(ce: *mut IntelContext, vaddr: *mut c_void) -> i32 {
     let ve = container_of!(ce, VirtualEngine, context);
     lrc_pin(ce, *(*ve).siblings, vaddr)
 }
@@ -3367,15 +3372,22 @@ unsafe fn virtual_get_sibling(engine: *mut IntelEngineCs, sibling: u32) -> *mut 
 #[allow(non_upper_case_globals)]
 static virtual_context_ops: IntelContextOps = IntelContextOps {
     flags: COPS_HAS_INFLIGHT | COPS_RUNTIME_CYCLES,
-    alloc: virtual_context_alloc,
-    cancel_request: execlists_context_cancel_request,
-    pre_pin: virtual_context_pre_pin,
-    pin: virtual_context_pin,
-    unpin: lrc_unpin,
-    post_unpin: lrc_post_unpin,
-    enter: virtual_context_enter,
-    exit: virtual_context_exit,
-    destroy: virtual_context_destroy,
+    alloc: Some(virtual_context_alloc),
+    revoke: None,
+    close: None,
+    pre_pin: Some(virtual_context_pre_pin),
+    pin: Some(virtual_context_pin),
+    unpin: Some(lrc_unpin),
+    post_unpin: Some(lrc_post_unpin),
+    cancel_request: Some(execlists_context_cancel_request),
+    enter: Some(virtual_context_enter),
+    exit: Some(virtual_context_exit),
+    sched_disable: None,
+    update_stats: None,
+    reset: None,
+    destroy: Some(virtual_context_destroy),
+    create_virtual: None,
+    create_parallel: None,
     get_sibling: Some(virtual_get_sibling),
 };
 

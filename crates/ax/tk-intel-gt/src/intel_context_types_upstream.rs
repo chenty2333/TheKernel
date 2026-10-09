@@ -20,15 +20,15 @@ use core::{
 };
 
 use crate::{
+    i915_gem_context_types_upstream::I915GemContext,
+    i915_request_types_upstream::I915Request,
     i915_vma_types_upstream::I915Vma,
-    intel_context_upstream::{
-        I915ActiveFence, I915AddressSpace, I915GemContext, I915GemWwCtx, I915Request, Kref,
-        RcuHead, WaitQueueHead,
-    },
+    intel_context_upstream::{I915ActiveFence, I915GemWwCtx, Kref, RcuHead, WaitQueueHead},
     intel_engine_cs_upstream::{
         AtomicT, DelayedWork, IntelEngineCs, ListHead, LlistHead, Mutex, RbRoot, Spinlock,
         WorkStruct,
     },
+    intel_gtt_api_upstream::I915AddressSpace,
     intel_ring_types_upstream::IntelRing,
     intel_sseu_types_upstream::IntelSseu,
     intel_timeline_types_upstream::IntelTimeline,
@@ -61,7 +61,10 @@ pub type IntelWakerefT = intel_wakeref_t;
 // than relying on the earlier Rust-callable mirrors.
 #[repr(C)]
 pub struct ActiveNode {
-    _opaque: [u8; 0],
+    pub node: crate::intel_engine_cs_upstream::RbNode,
+    pub base: I915ActiveFence,
+    pub ref_: *mut I915Active,
+    pub timeline: u64,
 }
 
 #[repr(C)]
@@ -78,6 +81,12 @@ pub struct I915Active {
     pub work: WorkStruct,
     pub preallocated_barriers: LlistHead,
 }
+
+const _: [(); 72] = [(); core::mem::size_of::<ActiveNode>()];
+const _: [(); 0] = [(); core::mem::offset_of!(ActiveNode, node)];
+const _: [(); 24] = [(); core::mem::offset_of!(ActiveNode, base)];
+const _: [(); 56] = [(); core::mem::offset_of!(ActiveNode, ref_)];
+const _: [(); 64] = [(); core::mem::offset_of!(ActiveNode, timeline)];
 
 #[repr(C)]
 #[derive(Clone, Copy)]

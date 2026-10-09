@@ -14,23 +14,55 @@ use core::{
 };
 
 use crate::{
+    i915_active_upstream::{
+        __i915_active_acquire, __i915_active_init, i915_active_acquire,
+        i915_active_acquire_barrier, i915_active_acquire_preallocate_barrier,
+        i915_active_add_request, i915_active_fence_set, i915_active_fini, i915_active_release,
+    },
+    i915_drm_client_upstream::i915_drm_client_add_context_objects,
     i915_gem_context_types_upstream::I915GemContext,
+    i915_gem_context_upstream::{fput, i915_gem_context_put},
+    i915_gem_object_api_upstream::i915_gem_object_lock,
+    i915_gem_ww_upstream::{
+        i915_gem_ww_ctx_backoff, i915_gem_ww_ctx_fini, i915_gem_ww_ctx_init,
+        i915_gem_ww_unlock_single,
+    },
     i915_request_types_upstream::*,
+    i915_request_upstream::i915_request_create,
     i915_scheduler_types_upstream::{
         I915Dependency, I915Priolist, I915SchedAttr, I915SchedEngine, I915SchedNode, TaskletStruct,
     },
+    i915_sw_fence_upstream::{__i915_sw_fence_init, i915_sw_fence_commit, i915_sw_fence_fini},
     i915_vma_api_upstream::*,
+    intel_context_api_upstream as ctx_api,
+    intel_context_api_upstream::{
+        intel_context_clock, intel_context_has_own_state, intel_context_set_banned,
+        intel_context_set_exiting, mutex_lock_interruptible,
+    },
     intel_context_types_upstream::*,
+    intel_gtt_api_upstream::{i915_vm_get, i915_vm_put},
+    intel_ring_upstream::{__intel_ring_pin, intel_ring_pin, intel_ring_unpin},
     intel_sseu_types_upstream::IntelSseu,
     intel_timeline_types_upstream::{I915Syncmap, IntelTimeline},
+    intel_timeline_upstream::{__intel_timeline_pin, intel_timeline_pin, intel_timeline_unpin},
+    linux::{
+        average::{ewma_runtime_init, ewma_runtime_read},
+        i915_trace::{
+            trace_intel_context_ban, trace_intel_context_create, trace_intel_context_do_pin,
+            trace_intel_context_do_unpin, trace_intel_context_free,
+        },
+    },
 };
 pub use crate::{
     i915_gem_object_types_upstream::{
         DrmI915GemObject, I915GemObjectMm, I915GemObjectMmo, I915GemObjectPageIter,
         I915GemObjectVma,
     },
+    i915_gem_ww_upstream::I915GemWwCtx,
     i915_vma_resource_types_upstream::{I915PageSizes, I915VmaResource},
     i915_vma_types_upstream::I915Vma,
+    intel_ggtt_fencing_types_upstream::I915FenceReg,
+    intel_gtt_api_upstream::I915AddressSpace,
     intel_ring_types_upstream::IntelRing,
 };
 pub type IntelWakerefHandle = crate::intel_context_types_upstream::IntelWakerefT;
@@ -131,50 +163,6 @@ pub struct I915ActiveFence {
 }
 
 #[repr(C)]
-pub struct I915AddressSpaceReserved {
-    pub obj: *mut DrmI915GemObject,
-    pub vma: *mut I915Vma,
-}
-
-#[repr(C)]
-pub struct I915AddressSpace {
-    _prefix: [u8; 280],
-    pub rsvd: I915AddressSpaceReserved,
-    pub gt: *mut c_void,
-    pub i915: *mut c_void,
-    _fpriv_dma: [u8; 16],
-    pub total: u64,
-    pub reserved: u64,
-    pub min_alignment: [u64; 4],
-    pub bind_async_flags: u32,
-    _pad_bind: [u8; 4],
-    pub mutex: Mutex,
-    _resv_ref: Kref,
-    pub _resv: [u8; 40],
-    _scratch: [*mut c_void; 4],
-    pub bound_list: ListHead,
-    pub unbound_list: ListHead,
-    pub vm_flags: u8,
-    pub top: u8,
-    pub pd_shift: u8,
-    pub scratch_order: u8,
-    _pad_lmem_flags: [u8; 4],
-    pub lmem_pt_obj_flags: c_ulong,
-    pub pending_unbind: RbRootCached,
-    _ops_tail: [u8; 128],
-}
-const _: [(); 680] = [(); core::mem::size_of::<I915AddressSpace>()];
-const _: [(); 8] = [(); core::mem::align_of::<I915AddressSpace>()];
-const _: [(); 16] = [(); core::mem::size_of::<I915AddressSpaceReserved>()];
-const _: [(); 280] = [(); core::mem::offset_of!(I915AddressSpace, rsvd)];
-const _: [(); 296] = [(); core::mem::offset_of!(I915AddressSpace, gt)];
-const _: [(); 304] = [(); core::mem::offset_of!(I915AddressSpace, i915)];
-const _: [(); 328] = [(); core::mem::offset_of!(I915AddressSpace, total)];
-const _: [(); 384] = [(); core::mem::offset_of!(I915AddressSpace, mutex)];
-const _: [(); 488] = [(); core::mem::offset_of!(I915AddressSpace, bound_list)];
-const _: [(); 520] = [(); core::mem::offset_of!(I915AddressSpace, vm_flags)];
-
-#[repr(C)]
 pub struct XArray {
     pub xa_lock: Spinlock,
     pub xa_flags: u32,
@@ -182,18 +170,27 @@ pub struct XArray {
 }
 const _: [(); 16] = [(); core::mem::size_of::<XArray>()];
 
-#[repr(C)]
-pub struct I915GemWwCtx {
-    _opaque: [u8; 0],
-}
-
 // Linux v7.2.3 framework records embedded by value in i915_vma and
 // i915_request. Their storage is kernel-owned; only their ABI size/alignment
 // is needed by this source file.
 #[repr(C, align(8))]
 pub struct DrmMmNode {
-    _opaque: [u8; 168],
+    pub color: c_ulong,
+    pub start: u64,
+    pub size: u64,
+    pub mm: *mut crate::linux::gem_memory::DrmMm,
+    pub node_list: ListHead,
+    pub hole_stack: ListHead,
+    pub rb: RbNode,
+    pub rb_hole_size: RbNode,
+    pub rb_hole_addr: RbNode,
+    pub subtree_last: u64,
+    pub hole_size: u64,
+    pub subtree_max_hole: u64,
+    pub flags: c_ulong,
 }
+const _: [(); 168] = [(); core::mem::size_of::<DrmMmNode>()];
+const _: [(); 160] = [(); core::mem::offset_of!(DrmMmNode, flags)];
 
 #[repr(C, align(8))]
 pub struct I915GttView {
@@ -250,10 +247,6 @@ pub struct SgEntry {
     _opaque: [u8; 0],
 }
 #[repr(C)]
-pub struct I915FenceReg {
-    _opaque: [u8; 0],
-}
-#[repr(C)]
 pub struct I915MmapOffset {
     pub vma_node: DrmVmaOffsetNode,
     pub obj: *mut DrmI915GemObject,
@@ -284,7 +277,8 @@ const _: [(); 16] = [(); core::mem::size_of::<RadixTreeRoot>()];
 /// only the DRM-object member fields used here are named.
 #[repr(C, align(8))]
 pub struct DrmGemObjectBaseLayout {
-    _refcount: [u8; 8],
+    pub refcount: Kref,
+    _refcount_padding: [u8; 4],
     pub dev: *mut c_void,
     pub filp: *mut c_void,
     _vma_node: [u8; 192],
@@ -293,7 +287,7 @@ pub struct DrmGemObjectBaseLayout {
     pub dma_buf: *mut c_void,
     pub import_attach: *mut c_void,
     pub resv: *mut c_void,
-    _resv: [u8; 40],
+    pub _resv: crate::linux::gem::DmaResv,
     _gpuva: [u8; 40],
     pub funcs: *const c_void,
     _lru_node: [u8; 16],
@@ -321,7 +315,7 @@ unsafe extern "C" fn rcu_context_free(rcu: *mut RcuHead) {
 
     trace_intel_context_free(ce);
     if intel_context_has_own_state(ce) {
-        fput((*ce).default_state);
+        fput((*ce).default_state.cast());
     }
     kmem_cache_free(SLAB_CE, ce.cast::<c_void>());
 }
@@ -356,7 +350,7 @@ pub unsafe fn intel_context_alloc_state(ce: *mut IntelContext) -> i32 {
         let mut ctx: *mut I915GemContext;
 
         if !test_bit(CONTEXT_ALLOC_BIT, &(*ce).flags) {
-            if intel_context_is_banned(ce) {
+            if ctx_api::intel_context_is_banned(ce) {
                 return -EIO;
             }
 
@@ -393,9 +387,9 @@ pub unsafe fn intel_context_alloc_state(ce: *mut IntelContext) -> i32 {
 unsafe fn intel_context_active_acquire(ce: *mut IntelContext) -> i32 {
     __i915_active_acquire(&mut (*ce).active);
 
-    if intel_context_is_barrier(ce)
+    if ctx_api::intel_context_is_barrier(ce)
         || intel_engine_uses_guc((*ce).engine)
-        || intel_context_is_parallel(ce)
+        || ctx_api::intel_context_is_parallel(ce)
     {
         return 0;
     }
@@ -417,8 +411,8 @@ unsafe fn intel_context_active_release(ce: *mut IntelContext) {
 
 // upstream: intel_context.c __context_pin_state()
 unsafe fn __context_pin_state(vma: *mut I915Vma, ww: *mut I915GemWwCtx) -> i32 {
-    let bias = i915_ggtt_pin_bias(vma) | PIN_OFFSET_BIAS;
-    let err = i915_ggtt_pin(vma, ww, 0, bias | PIN_HIGH);
+    let bias = i915_ggtt_pin_bias(vma) | PIN_OFFSET_BIAS as u32;
+    let err = i915_ggtt_pin(vma, ww, 0, bias | PIN_HIGH as u32);
     if err != 0 {
         return err;
     }
@@ -431,7 +425,7 @@ unsafe fn __context_pin_state(vma: *mut I915Vma, ww: *mut I915GemWwCtx) -> i32 {
 
     // Mark it globally pinned so the shrinker cannot reclaim it before release.
     i915_vma_make_unshrinkable(vma);
-    (*(*vma).obj).mm.set_dirty();
+    (*(*vma).obj).mm.set_dirty(true);
     0
 }
 
@@ -531,7 +525,9 @@ pub unsafe fn __intel_context_do_pin_ww(ce: *mut IntelContext, ww: *mut I915GemW
         return err;
     }
 
-    err = ((*(*ce).ops).pre_pin)(ce, ww, &mut vaddr);
+    err = ((*(*ce).ops)
+        .pre_pin
+        .expect("IntelContextOps.pre_pin is required"))(ce, ww, &mut vaddr);
     if err != 0 {
         intel_context_post_unpin(ce);
         i915_gem_ww_unlock_single((*(*(*ce).timeline).hwsp_ggtt).obj);
@@ -540,7 +536,9 @@ pub unsafe fn __intel_context_do_pin_ww(ce: *mut IntelContext, ww: *mut I915GemW
 
     err = i915_active_acquire(&mut (*ce).active);
     if err != 0 {
-        ((*(*ce).ops).post_unpin)(ce);
+        ((*(*ce).ops)
+            .post_unpin
+            .expect("IntelContextOps.post_unpin is required"))(ce);
         intel_context_post_unpin(ce);
         i915_gem_ww_unlock_single((*(*(*ce).timeline).hwsp_ggtt).obj);
         return err;
@@ -549,7 +547,9 @@ pub unsafe fn __intel_context_do_pin_ww(ce: *mut IntelContext, ww: *mut I915GemW
     err = mutex_lock_interruptible(&mut (*ce).pin_mutex);
     if err != 0 {
         i915_active_release(&mut (*ce).active);
-        ((*(*ce).ops).post_unpin)(ce);
+        ((*(*ce).ops)
+            .post_unpin
+            .expect("IntelContextOps.post_unpin is required"))(ce);
         intel_context_post_unpin(ce);
         i915_gem_ww_unlock_single((*(*(*ce).timeline).hwsp_ggtt).obj);
         return err;
@@ -557,12 +557,12 @@ pub unsafe fn __intel_context_do_pin_ww(ce: *mut IntelContext, ww: *mut I915GemW
 
     intel_engine_pm_might_get((*ce).engine);
 
-    if unlikely(intel_context_is_closed(ce)) {
+    if unlikely(ctx_api::intel_context_is_closed(ce)) {
         err = -ENOENT;
     } else if likely(!atomic_add_unless(&mut (*ce).pin_count, 1, 0)) {
         err = intel_context_active_acquire(ce);
         if err == 0 {
-            err = ((*(*ce).ops).pin)(ce, vaddr);
+            err = ((*(*ce).ops).pin.expect("IntelContextOps.pin is required"))(ce, vaddr);
             if err != 0 {
                 intel_context_active_release(ce);
             } else {
@@ -575,21 +575,23 @@ pub unsafe fn __intel_context_do_pin_ww(ce: *mut IntelContext, ww: *mut I915GemW
                 );
 
                 handoff = true;
-                smp_mb__before_atomic(); // Flush pin before it is visible.
+                crate::linux::primitives::mb(); // smp_mb__before_atomic(): publish pin before visibility.
                 atomic_inc(&mut (*ce).pin_count);
             }
         }
     }
 
     if err == 0 {
-        GEM_BUG_ON!(!intel_context_is_pinned(ce)); // No overflow.
+        GEM_BUG_ON!(!ctx_api::intel_context_is_pinned(ce)); // No overflow.
         trace_intel_context_do_pin(ce);
     }
 
     mutex_unlock(&mut (*ce).pin_mutex);
     i915_active_release(&mut (*ce).active);
     if !handoff {
-        ((*(*ce).ops).post_unpin)(ce);
+        ((*(*ce).ops)
+            .post_unpin
+            .expect("IntelContextOps.post_unpin is required"))(ce);
     }
     intel_context_post_unpin(ce);
 
@@ -625,19 +627,23 @@ pub unsafe fn __intel_context_do_unpin(ce: *mut IntelContext, sub: i32) {
     }
 
     CE_TRACE!(ce, "unpin\n");
-    ((*(*ce).ops).unpin)(ce);
-    ((*(*ce).ops).post_unpin)(ce);
+    ((*(*ce).ops)
+        .unpin
+        .expect("IntelContextOps.unpin is required"))(ce);
+    ((*(*ce).ops)
+        .post_unpin
+        .expect("IntelContextOps.post_unpin is required"))(ce);
 
     // Keep an extra reference: active_release() may asynchronously drop the
     // only reference keeping this context alive.
-    intel_context_get(ce);
+    ctx_api::intel_context_get(ce);
     intel_context_active_release(ce);
     trace_intel_context_do_unpin(ce);
-    intel_context_put(ce);
+    ctx_api::intel_context_put(ce);
 }
 
 // upstream: intel_context.c __intel_context_retire()
-unsafe fn __intel_context_retire(active: *mut I915Active) {
+unsafe extern "C" fn __intel_context_retire(active: *mut I915Active) {
     let ce = container_of!(active, IntelContext, active);
 
     CE_TRACE!(
@@ -649,14 +655,14 @@ unsafe fn __intel_context_retire(active: *mut I915Active) {
 
     set_bit(CONTEXT_VALID_BIT, &mut (*ce).flags);
     intel_context_post_unpin(ce);
-    intel_context_put(ce);
+    ctx_api::intel_context_put(ce);
 }
 
 // upstream: intel_context.c __intel_context_active()
-unsafe fn __intel_context_active(active: *mut I915Active) -> i32 {
+unsafe extern "C" fn __intel_context_active(active: *mut I915Active) -> i32 {
     let ce = container_of!(active, IntelContext, active);
 
-    intel_context_get(ce);
+    ctx_api::intel_context_get(ce);
 
     // Everything should already be activated by intel_context_pre_pin().
     GEM_WARN_ON!(!i915_active_acquire_if_busy(
@@ -676,7 +682,10 @@ unsafe fn __intel_context_active(active: *mut I915Active) -> i32 {
 }
 
 // upstream: intel_context.c sw_fence_dummy_notify()
-unsafe fn sw_fence_dummy_notify(_sf: *mut I915SwFence, _state: I915SwFenceNotify) -> i32 {
+unsafe extern "C" fn sw_fence_dummy_notify(
+    _sf: *mut I915SwFence,
+    _state: I915SwFenceNotify,
+) -> i32 {
     NOTIFY_DONE
 }
 
@@ -707,7 +716,7 @@ pub unsafe fn intel_context_init(ce: *mut IntelContext, engine: *mut IntelEngine
     INIT_LIST_HEAD(&mut (*ce).guc_state.fences);
     INIT_LIST_HEAD(&mut (*ce).guc_state.requests);
 
-    (*ce).guc_id.id = GUC_INVALID_CONTEXT_ID;
+    (*ce).guc_id.id = GUC_INVALID_CONTEXT_ID as u16;
     INIT_LIST_HEAD(&mut (*ce).guc_id.link);
 
     INIT_LIST_HEAD(&mut (*ce).destroyed_link);
@@ -717,14 +726,21 @@ pub unsafe fn intel_context_init(ce: *mut IntelContext, engine: *mut IntelEngine
     );
 
     // Initialize fence as complete unless schedule-disable is pending.
-    i915_sw_fence_init(&mut (*ce).guc_state.blocked, sw_fence_dummy_notify);
+    __i915_sw_fence_init(
+        &mut (*ce).guc_state.blocked,
+        Some(sw_fence_dummy_notify),
+        core::ptr::null(),
+        core::ptr::null_mut(),
+    );
     i915_sw_fence_commit(&mut (*ce).guc_state.blocked);
 
-    i915_active_init(
+    __i915_active_init(
         &mut (*ce).active,
-        __intel_context_active,
-        __intel_context_retire,
+        Some(__intel_context_active),
+        Some(__intel_context_retire),
         0,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
     );
 }
 
@@ -739,9 +755,9 @@ pub unsafe fn intel_context_fini(ce: *mut IntelContext) {
     i915_vm_put((*ce).vm);
 
     // Drop the creation reference held for each child.
-    if intel_context_is_parent(ce) {
+    if ctx_api::intel_context_is_parent(ce) {
         for_each_child_safe!(ce, child, next, {
-            intel_context_put(child);
+            ctx_api::intel_context_put(child);
         });
     }
 
@@ -766,13 +782,13 @@ pub unsafe fn i915_context_module_init() -> i32 {
 }
 
 // upstream: intel_context.c intel_context_enter_engine()
-pub unsafe fn intel_context_enter_engine(ce: *mut IntelContext) {
+pub unsafe extern "C" fn intel_context_enter_engine(ce: *mut IntelContext) {
     intel_engine_pm_get((*ce).engine);
     intel_timeline_enter((*ce).timeline);
 }
 
 // upstream: intel_context.c intel_context_exit_engine()
-pub unsafe fn intel_context_exit_engine(ce: *mut IntelContext) {
+pub unsafe extern "C" fn intel_context_exit_engine(ce: *mut IntelContext) {
     intel_timeline_exit((*ce).timeline);
     intel_engine_pm_put((*ce).engine);
 }
@@ -787,7 +803,7 @@ pub unsafe fn intel_context_prepare_remote_request(
     // This function is only suitable for remotely modifying this context.
     GEM_BUG_ON!((*rq).context == ce);
 
-    if rcu_access_pointer((*rq).timeline) != tl {
+    if unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*rq).timeline)) } != tl {
         // Timeline sharing: queue this switch after current activity.
         let err = i915_active_fence_set(&mut (*tl).last_request, rq);
         if err != 0 {
@@ -809,10 +825,10 @@ pub unsafe fn intel_context_create_request(ce: *mut IntelContext) -> *mut I915Re
 
     i915_gem_ww_ctx_init(&mut ww, true);
     loop {
-        err = intel_context_pin_ww(ce, &mut ww);
+        err = ctx_api::intel_context_pin_ww(ce, &mut ww);
         if err == 0 {
             rq = i915_request_create(ce);
-            intel_context_unpin(ce);
+            ctx_api::intel_context_unpin(ce);
             break;
         } else if err == -EDEADLK {
             err = i915_gem_ww_ctx_backoff(&mut ww);
@@ -835,7 +851,7 @@ pub unsafe fn intel_context_create_request(ce: *mut IntelContext) -> *mut I915Re
 
     // timeline->mutex is logically inner but used as outer; retain the
     // selftest lockdep workaround and its exact order.
-    lockdep_unpin_lock(&mut (*(*ce).timeline).mutex, (*rq).cookie);
+    // CONFIG_LOCKDEP=n: Linux expands lockdep_unpin_lock() to no code.
     mutex_release!(&mut (*(*ce).timeline).mutex.dep_map, _RET_IP_);
     mutex_acquire!(
         &mut (*(*ce).timeline).mutex.dep_map,
@@ -843,14 +859,15 @@ pub unsafe fn intel_context_create_request(ce: *mut IntelContext) -> *mut I915Re
         0,
         _RET_IP_,
     );
-    (*rq).cookie = lockdep_pin_lock(&mut (*(*ce).timeline).mutex);
+    // CONFIG_LOCKDEP=n: Linux lockdep_pin_lock() yields NIL_COOKIE.
+    (*rq).cookie = PinCookie;
 
     rq
 }
 
 // upstream: intel_context.c intel_context_get_active_request()
 pub unsafe fn intel_context_get_active_request(ce: *mut IntelContext) -> *mut I915Request {
-    let parent = intel_context_to_parent(ce);
+    let parent = ctx_api::intel_context_to_parent(ce);
     let mut rq: *mut I915Request = core::ptr::null_mut();
     let mut active: *mut I915Request = core::ptr::null_mut();
     let mut flags = 0;
@@ -881,11 +898,11 @@ pub unsafe fn intel_context_get_active_request(ce: *mut IntelContext) -> *mut I9
 // upstream: intel_context.c intel_context_bind_parent_child()
 pub unsafe fn intel_context_bind_parent_child(parent: *mut IntelContext, child: *mut IntelContext) {
     // Caller validates usage; keep the upstream assertions as the contract.
-    GEM_BUG_ON!(intel_context_is_pinned(parent));
-    GEM_BUG_ON!(intel_context_is_child(parent));
-    GEM_BUG_ON!(intel_context_is_pinned(child));
-    GEM_BUG_ON!(intel_context_is_child(child));
-    GEM_BUG_ON!(intel_context_is_parent(child));
+    GEM_BUG_ON!(ctx_api::intel_context_is_pinned(parent));
+    GEM_BUG_ON!(ctx_api::intel_context_is_child(parent));
+    GEM_BUG_ON!(ctx_api::intel_context_is_pinned(child));
+    GEM_BUG_ON!(ctx_api::intel_context_is_child(child));
+    GEM_BUG_ON!(ctx_api::intel_context_is_parent(child));
 
     (*parent).parallel.child_index = (*parent).parallel.number_children;
     (*parent).parallel.number_children += 1;

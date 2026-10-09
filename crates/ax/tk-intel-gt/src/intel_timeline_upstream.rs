@@ -12,10 +12,10 @@ use core::{
 };
 
 use crate::{
-    intel_context_upstream::*, intel_engine_cs_upstream::*,
-    intel_engine_types_upstream::IntelEngineCs, intel_gt_types_upstream::IntelGt,
-    intel_ring::PAGE_SIZE, intel_timeline_types_upstream::IntelTimeline, linux_config::*,
-    linux_list::*,
+    i915_gem_object_types_upstream::DrmI915GemObject, intel_context_upstream::*,
+    intel_engine_cs_upstream::*, intel_engine_types_upstream::IntelEngineCs,
+    intel_gt_types_upstream::IntelGt, intel_ring::PAGE_SIZE,
+    intel_timeline_types_upstream::IntelTimeline, linux_config::*, linux_list::*,
 };
 
 // The `intel_timeline_types_upstream`/`intel_gt_types_upstream` bindings own

@@ -176,6 +176,14 @@ const _: [(); 520] = [(); core::mem::offset_of!(I915Request, watchdog)];
 const _: [(); 608] = [(); core::mem::offset_of!(I915Request, guc_fence_link)];
 const _: [(); 632] = [(); core::mem::offset_of!(I915Request, hucq)];
 
+// upstream: i915_request.h i915_request_timeline()
+#[inline]
+pub unsafe fn i915_request_timeline(request: *const I915Request) -> *mut IntelTimeline {
+    // With CONFIG_LOCKDEP=n, rcu_dereference_protected() retains only the
+    // source's dependency-ordered single-copy pointer load.
+    unsafe { rcu_dereference!((*request).timeline) }
+}
+
 // Out-of-line declarations from i915_request.h. Implementations are owned by
 // the separately translated i915_request.c module.
 unsafe extern "C" {
