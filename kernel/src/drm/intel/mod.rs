@@ -110,6 +110,7 @@ mod id;
 mod irq;
 mod modeset;
 mod native_modeset_ops;
+mod native_kms_projection;
 mod native_pipe;
 mod native_scaler;
 mod output;

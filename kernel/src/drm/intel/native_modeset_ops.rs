@@ -104,6 +104,23 @@ impl NativePipeProgram {
         planes: &[NativePlaneState],
         watermarks: WatermarkConfig,
     ) -> Result<Self, NativePipeProjectionError> {
+        let mode = mode_from_source(transition.new.pipe_mode)
+            .ok_or(NativePipeProjectionError::InvalidTiming)?;
+        Self::from_source_with_mode(transition, planes, watermarks, mode)
+    }
+
+    /// Project a complete source transition while retaining the exact crate
+    /// mode resolved from the DRM framebuffer/CRTC state. Source `Timing`
+    /// omits polarity and provenance, so production KMS callers must use this
+    /// entry point rather than reconstructing those fields from timing totals.
+    /// Interlace and double-clock are deliberately unsupported by this
+    /// single-scanout writer and fail before any register access.
+    pub(super) fn from_source_with_mode(
+        transition: &PipeTransition,
+        planes: &[NativePlaneState],
+        watermarks: WatermarkConfig,
+        mode: Mode,
+    ) -> Result<Self, NativePipeProjectionError> {
         let old = transition.old.pipe;
         let new = transition.new.pipe;
         if old != new {
@@ -148,8 +165,9 @@ impl NativePipeProgram {
         {
             return Err(NativePipeProjectionError::UnsupportedPipeState);
         }
-        let mode =
-            mode_from_source(state.pipe_mode).ok_or(NativePipeProjectionError::InvalidTiming)?;
+        if !mode.flags.is_empty() || !mode_matches_source_timing(mode, state.pipe_mode) {
+            return Err(NativePipeProjectionError::InvalidTiming);
+        }
 
         if planes.len() > 4 {
             return Err(NativePipeProjectionError::TooManyPlanes);
@@ -304,6 +322,11 @@ impl NativePipeProgram {
     pub(super) const fn source_state(&self) -> &PipeState {
         &self.source
     }
+
+    /// Exact resolved crate mode retained by `from_source_with_mode`.
+    pub(super) const fn mode(&self) -> &Mode {
+        &self.mode
+    }
 }
 
 impl NativePipeDisableProgram {
@@ -426,6 +449,34 @@ fn mode_from_source(timing: intel_display::intel_display_modeset_full::Timing) -
         && timing.vblank_start == timing.vdisplay
         && timing.vblank_end == timing.vtotal)
         .then_some(mode)
+}
+
+fn mode_matches_source_timing(
+    mode: Mode,
+    timing: intel_display::intel_display_modeset_full::Timing,
+) -> bool {
+    u32::from(mode.hdisplay) == timing.hdisplay
+        && u32::from(mode.hsync_start) == timing.hsync_start
+        && u32::from(mode.hsync_end) == timing.hsync_end
+        && u32::from(mode.htotal) == timing.htotal
+        && timing.hblank_start == timing.hdisplay
+        && timing.hblank_end == timing.htotal
+        && u32::from(mode.vdisplay) == timing.vdisplay
+        && u32::from(mode.vsync_start) == timing.vsync_start
+        && u32::from(mode.vsync_end) == timing.vsync_end
+        && u32::from(mode.vtotal) == timing.vtotal
+        && timing.vblank_start == timing.vdisplay
+        && timing.vblank_end == timing.vtotal
+        && mode.clock_khz == timing.clock_khz
+        && mode.hdisplay != 0
+        && mode.vdisplay != 0
+        && mode.clock_khz != 0
+        && mode.hdisplay < mode.hsync_start
+        && mode.hsync_start < mode.hsync_end
+        && mode.hsync_end <= mode.htotal
+        && mode.vdisplay < mode.vsync_start
+        && mode.vsync_start < mode.vsync_end
+        && mode.vsync_end <= mode.vtotal
 }
 
 fn scanout_matches_transition(scanout: PlaneScanout, state: &PlaneTransition) -> bool {
