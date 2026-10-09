@@ -41,10 +41,16 @@ pub struct EwmaRuntime {
 }
 
 // Linux forward declarations used only behind pointers in this header.
-#[repr(C)]
+#[repr(C, align(8))]
 pub struct File {
-    _opaque: [u8; 0],
+    _before_f_mapping: [u8; 16],
+    pub f_mapping: *mut c_void,
+    pub private_data: *mut c_void,
+    _tail: [u8; 144],
 }
+const _: [(); 176] = [(); core::mem::size_of::<File>()];
+const _: [(); 16] = [(); core::mem::offset_of!(File, f_mapping)];
+const _: [(); 24] = [(); core::mem::offset_of!(File, private_data)];
 
 #[repr(C)]
 pub struct IntelRefTracker {
