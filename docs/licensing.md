@@ -306,6 +306,19 @@ Generated include copies insert the TheKernel platform configuration; vendored
 files are not edited. Neither Linux-tree ACPICA nor FreeBSD/Haiku code is copied.
 Firmware tables (including OEM AML and MSDM keys) are never repository inputs.
 
+### Optional Alpine BlueZ guest tools
+
+The optional `bluez` guest-tools payload includes unchanged Alpine v3.24.1
+x86_64 packages pinned in `config/guest-bluez-apk-pins.tsv`. This closure now
+includes `bluez-btmon` and `bluez-deprecated` (providing `btmon` and
+`hciconfig`), as well as `bluez`, `bluez-btmgmt`, D-Bus and their runtime
+libraries. Alpine's package metadata declares BlueZ tools `GPL-2.0-or-later AND
+BSD-2-Clause AND MIT`; each package's declared license expression, source
+origin, version, URL and SHA-256 are recorded in the pin file copied into the
+guest. `scripts/build-bluez-payload.sh` verifies Alpine signatures and the
+reproducibility pins before extraction. No package scripts or host installation
+run; distribution must preserve each upstream license and source obligation.
+
 ### ACPICA guest inspection payload
 
 `--toolchain acpica` stages static `acpidump` and `iasl` from the same verified
@@ -316,7 +329,8 @@ the baseline rootfs tool build. Binary redistribution must also satisfy that
 C library's license (the default host glibc is LGPL-2.1-or-later); this payload
 is not claimed to be BSD-only. The archive and generated tool sources remain
 in the external state cache, not the kernel's vendored runtime tree.
-The optional payload and the merged baseline image each use 160 MiB. It contains no OEM firmware tables.
+The optional inspect payload uses 192 MiB for its signed storage/partition tools;
+the merged baseline image remains 160 MiB. It contains no OEM firmware tables.
 
 ## MIT i915 display translation (Codex D, 2026-10-05)
 
@@ -781,3 +795,118 @@ additional `drm_get_tv_mode_from_name()` in Linux 7.2.3 `drm_connector.c`
 Linux 7.2.3 `drm_mode_config.c` (MIT-style grant, © 2016 Intel); its full
 license remains in the source and the same
 `kernel/LICENSES/LicenseRef-Intel-Drm-Connector-MIT` file.
+
+The optional AX211 rootfs payload stages only the linux-firmware
+`iwlwifi-so-a0-gf-a0-89.ucode` API 89 image and matching
+`iwlwifi-so-a0-gf-a0.pnvm`; it copies the upstream `LICENCE.iwlwifi_firmware`
+to `/usr/share/licenses/linux-firmware/` next to the payload's license record.
+These firmware binaries are supplied by the caller via
+`THEKERNEL_IWX_FIRMWARE_DIR` and are not checked into this repository.
+
+The `tk-net80211` wireless protocol crate uses OpenBSD BSD-3-Clause grants for
+frame conversion, RSN/WPA parsing and RSSI rate adaptation, and retains the
+OpenBSD custom ISC-style grant for HT rate adaptation. Their copyright lines
+and full grant texts are retained in the crate's `LICENSES/`. Fuchsia BSD-3-
+Clause WLAN libraries remain the selected source for later EAPOL/RSN/MLME
+reuse.
+The OpenBSD HT rate adaptation and regulatory-domain translations in
+`tk-net80211` retain their ISC-style source grants in `LICENSES/OpenBSD-ISC.txt`.
+The OpenBSD CCMP/TKIP PN/TSC extraction helpers retain their custom ISC-style
+grant and Damien Bergamini attribution in `tk-net80211/LICENSES/OpenBSD-ISC.txt`.
+
+The nl80211 public UAPI constants and family-name/multicast-group layout used
+by `kernel/src/file/netlink/nl80211.rs` derive from Linux
+`include/uapi/linux/nl80211.h` (ISC-style permission grant); copyright lines and
+the complete grant are retained in `kernel/LICENSES/ISC.txt`. GPL cfg80211,
+mac80211 and Linux generic-netlink implementation code were not copied.
+
+The OpenBSD software CCMP translation in `tk-net80211/src/crypto_ccmp.rs`
+retains its ISC grant in `tk-net80211/LICENSES/OpenBSD-ISC.txt`; AES-128 block
+operations use the crates.io `aes` 0.8.4 dependency (MIT OR Apache-2.0), already
+used by the kernel. No AES implementation source was copied into this crate.
+The OpenBSD BIP, WEP, and station TKIP translations in `tk-net80211` use the
+same retained `OpenBSD-ISC.txt` grant; the AP-only TKIP callbacks are omitted
+because this driver port is station-only.
+The shared key dispatch from OpenBSD `ieee80211_crypto.c` also carries its ISC
+grant in that same package license file; its source revision and translated
+function boundary are listed in `docs/upstream-provenance.md`.
+
+The AHCI register/header translation retains the FreeBSD BSD-2-Clause grant and
+attribution; see `crates/ax/tk-axdriver-block/LICENSES/BSD-2-Clause-FreeBSD-AHCI.txt`.
+
+
+The SDHCI hardware register and quirk constants are translated from FreeBSD
+`sys/dev/sdhci/sdhci.h` and retain its BSD-2-Clause attribution in
+`crates/ax/tk-axdriver-block/LICENSES/BSD-2-Clause-FreeBSD-SDHCI.txt`.
+
+The FreeBSD SD/MMC protocol and block path retain BSD-2-Clause attribution;
+see `crates/ax/tk-axdriver-block/LICENSES/BSD-2-Clause-FreeBSD-MMC.txt`.
+
+The SDHCI PCI binding retains FreeBSD BSD-2-Clause attribution in
+`crates/ax/tk-axdriver/LICENSES/BSD-2-Clause-FreeBSD-SDHCI-PCI.txt`.
+
+The Intel e1000 shared register definitions retain the BSD-3-Clause grant at
+`crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
+
+The optional inspect guest payload stages signed Alpine `e2fsprogs` 1.47.4-r0
+(`mkfs.ext4`, `mke2fs`, and `e2fsck`) and its runtime libraries. Its package
+metadata reports GPL-2.0-or-later, LGPL-2.0-or-later, BSD-3-Clause, and MIT
+components; these are unmodified distribution binaries, not translated kernel
+code.
+
+Intel CNVi Bluetooth SFI/DDC blobs are optional rootfs inputs selected with
+`THEKERNEL_INTEL_BT_FIRMWARE_DIR`; the offline staging helper decompresses the
+selected `ibt-*` files and carries Intel's `LICENSE.intel` alongside them.
+Redistributors must satisfy that binary-only license; no firmware blobs are
+checked into this source tree.
+
+The VT-d Intel register definitions translated from FreeBSD
+`sys/x86/iommu/intel_reg.h` retain The FreeBSD Foundation's 2013-2015
+BSD-2-Clause grant and Konstantin Belousov's sponsorship attribution in the
+Rust module header. The full grant is retained in
+`crates/ax/tk-vtd/LICENSES/BSD-2-Clause.txt`.
+The VT-d DMAR data-model translation from FreeBSD
+`sys/x86/iommu/intel_dmar.h` likewise retains The FreeBSD Foundation's
+2013-2015 BSD-2-Clause grant and Konstantin Belousov attribution in
+`crates/ax/tk-vtd/src/dmar.rs`, under the same retained license file.
+The VT-d utility translation from FreeBSD `sys/x86/iommu/intel_utils.c`
+retains the 2013 FreeBSD Foundation BSD-2-Clause grant and Konstantin
+Belousov attribution in the Rust source module, covered by the crate license.
+FreeBSD `sys/x86/iommu/intel_qi.c` queued-invalidation logic is translated in
+`crates/ax/tk-vtd/src/qi.rs` with its 2013 FreeBSD Foundation BSD-2-Clause
+grant and Konstantin Belousov attribution; the crate license covers the port.
+The page-table and IOTLB translation from FreeBSD
+`sys/x86/iommu/intel_idpgtbl.c` retains the 2013 FreeBSD Foundation
+BSD-2-Clause grant and Konstantin Belousov attribution in `tk-vtd` source;
+its full grant is already present in `crates/ax/tk-vtd/LICENSES/`.
+The VT-d root/context/domain translation from FreeBSD
+`sys/x86/iommu/intel_ctx.c` retains the 2013 FreeBSD Foundation BSD-2-Clause
+grant and Konstantin Belousov attribution in `tk-vtd` Rust source, covered by
+the crate's retained BSD-2-Clause license.
+The VT-d fault-ring and reporting translation from FreeBSD
+`sys/x86/iommu/intel_fault.c` retains the 2013 FreeBSD Foundation BSD-2-Clause
+grant and Konstantin Belousov attribution in `tk-vtd/src/fault.rs`.
+The Intel VT-d northbridge/CPU quirk translation from FreeBSD
+`sys/x86/iommu/intel_quirks.c` retains its 2013/2015 BSD-2-Clause grant and
+Konstantin Belousov attribution in `tk-vtd/src/quirks.rs`.
+The DMAR driver/table/scope translation from FreeBSD
+`sys/x86/iommu/intel_drv.c` retains the 2013-2015 FreeBSD Foundation
+BSD-2-Clause grant and Konstantin Belousov attribution in the `tk-vtd` source.
+The guest-address-space allocator/MSI helper translation from FreeBSD
+`sys/dev/iommu/iommu_gas.c` retains the 2013 FreeBSD Foundation BSD-2-Clause
+grant and Konstantin Belousov attribution in `crates/ax/tk-vtd/src/gas.rs`.
+The guest-address-space allocator translation from FreeBSD
+`sys/dev/iommu/iommu_gas.c` retains its 2013 BSD-2-Clause grant and Konstantin
+Belousov attribution in `tk-vtd/src/gas.rs`.
+FreeBSD `sys/dev/iommu/busdma_iommu.c` core map/unmap behavior is represented
+in `crates/ax/tk-vtd/src/busdma.rs` under its 2013 FreeBSD Foundation
+BSD-2-Clause grant and Konstantin Belousov attribution, covered by the crate's
+retained `LICENSES/BSD-2-Clause.txt`.
+FreeBSD `sys/x86/iommu/intel_intrmap.c` interrupt-entry logic is represented in
+`crates/ax/tk-vtd/src/intrmap.rs` under its 2015 FreeBSD Foundation
+BSD-2-Clause grant and Konstantin Belousov attribution, covered by the crate's
+retained `LICENSES/BSD-2-Clause.txt`.
+FreeBSD `sys/x86/iommu/iommu_utils.c` helpers are represented in
+`crates/ax/tk-vtd/src/iommu_utils.rs` and the shared QI helpers in `qi.rs`,
+retaining the 2013/2014/2024 FreeBSD Foundation BSD-2-Clause attribution under
+the crate's `LICENSES/BSD-2-Clause.txt` grant.

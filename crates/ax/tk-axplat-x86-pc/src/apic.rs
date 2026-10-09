@@ -104,6 +104,55 @@ pub(crate) fn configure_sci(vector: usize, low_active: bool) -> bool {
     configure_level_line(vector, low_active)
 }
 
+/// Configure an assigned non-legacy GSI for a GPIO provider after ACPI has
+/// verified that the MADT/IOAPIC topology is directly routable.
+#[cfg(feature = "irq")]
+pub(crate) fn configure_acpi_gsi(vector: usize, level: bool, low_active: bool) -> bool {
+    let Some(pin) = io_apic_pin(vector) else {
+        return false;
+    };
+    let destination = IO_APIC_DEST.load(Ordering::Acquire);
+    if destination == IO_APIC_DEST_UNAVAILABLE {
+        return false;
+    }
+    let wanted = (if level {
+        IrqFlags::LEVEL_TRIGGERED
+    } else {
+        IrqFlags::empty()
+    }) | if low_active {
+        IrqFlags::LOW_ACTIVE
+    } else {
+        IrqFlags::empty()
+    };
+    let electrical = IrqFlags::LEVEL_TRIGGERED | IrqFlags::LOW_ACTIVE;
+    unsafe {
+        let mut io_apic = IO_APIC.lock();
+        if pin > io_apic.max_table_entry() {
+            return false;
+        }
+        let mut entry = io_apic.table_entry(pin);
+        if entry.vector() as usize != vector
+            || entry.dest() as u32 != destination
+            || entry.flags().contains(IrqFlags::LOGICAL_DEST)
+        {
+            return false;
+        }
+        if entry.flags() & electrical == wanted {
+            return true;
+        }
+        let was_masked = entry.flags().contains(IrqFlags::MASKED);
+        if !was_masked {
+            io_apic.disable_irq(pin);
+        }
+        entry.set_flags((entry.flags() & !electrical) | wanted | IrqFlags::MASKED);
+        io_apic.set_table_entry(pin, entry);
+        if !was_masked {
+            io_apic.enable_irq(pin);
+        }
+    }
+    true
+}
+
 #[cfg(feature = "irq")]
 fn configure_level_line(vector: usize, low_active: bool) -> bool {
     let electrical = IrqFlags::LEVEL_TRIGGERED | IrqFlags::LOW_ACTIVE;
@@ -527,7 +576,7 @@ mod tests {
 
     #[cfg(feature = "irq")]
     #[test]
-    fn shared_dispatcher_registration_keeps_one_owner() {
+    fn shared_dispatcher_registration_accepts_bounded_multiple_owners() {
         fn first(_: usize) -> bool {
             true
         }
@@ -536,7 +585,8 @@ mod tests {
         }
         assert!(super::register_shared_dispatcher(first));
         assert!(super::register_shared_dispatcher(first));
-        assert!(!super::register_shared_dispatcher(second));
+        assert!(super::register_shared_dispatcher(second));
+        assert!(super::register_shared_dispatcher(second));
     }
 
     #[test]
@@ -622,17 +672,30 @@ mod irq_impl {
 
     static IRQ_HANDLER_TABLE: HandlerTable<MAX_IRQ_COUNT> = HandlerTable::new();
 
-    static SHARED_DISPATCHER: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(0);
+    /// Bounded no-allocation registry: block, virtio, and other PCI INTx
+    /// consumers each need an acknowledgment pass before direct IRQ handlers.
+    const SHARED_DISPATCHER_COUNT: usize = 16;
+    static SHARED_DISPATCHERS: [core::sync::atomic::AtomicUsize; SHARED_DISPATCHER_COUNT] =
+        [const { core::sync::atomic::AtomicUsize::new(0) }; SHARED_DISPATCHER_COUNT];
 
     /// Install the shared-source acknowledgement pass, before direct handlers.
     pub fn register_shared_dispatcher(dispatcher: fn(usize) -> bool) -> bool {
         use core::sync::atomic::Ordering;
         let address = dispatcher as usize;
-        match SHARED_DISPATCHER.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => true,
-            Err(existing) => existing == address,
+        for slot in &SHARED_DISPATCHERS {
+            let existing = slot.load(Ordering::Acquire);
+            if existing == address {
+                return true;
+            }
+            if existing == 0 {
+                match slot.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => return true,
+                    Err(actual) if actual == address => return true,
+                    Err(_) => continue,
+                }
+            }
         }
+        false
     }
 
     /// Reserve a message vector outside every implemented IOAPIC pin and
@@ -650,6 +713,12 @@ mod irq_impl {
             }
         }
         None
+    }
+
+    /// Undo a reserved MSI vector when a platform-level remapping route fails
+    /// before the device is programmed.
+    pub fn unregister_msi_vector(vector: usize) -> Option<IrqHandler> {
+        IRQ_HANDLER_TABLE.unregister_handler(vector)
     }
 
     struct IrqIfImpl;
@@ -690,15 +759,16 @@ mod irq_impl {
         /// also acknowledges the interrupt controller after handling.
         fn handle(vector: usize) -> Option<usize> {
             trace!("IRQ {}", vector);
-            let address = SHARED_DISPATCHER.load(core::sync::atomic::Ordering::Acquire);
-            let shared_handled = if address != 0 {
-                // SAFETY: registration publishes only an immutable function pointer.
-                let dispatcher =
-                    unsafe { core::mem::transmute::<usize, fn(usize) -> bool>(address) };
-                dispatcher(vector)
-            } else {
-                false
-            };
+            let mut shared_handled = false;
+            for slot in &SHARED_DISPATCHERS {
+                let address = slot.load(core::sync::atomic::Ordering::Acquire);
+                if address != 0 {
+                    // SAFETY: registration publishes only an immutable function pointer.
+                    let dispatcher =
+                        unsafe { core::mem::transmute::<usize, fn(usize) -> bool>(address) };
+                    shared_handled |= dispatcher(vector);
+                }
+            }
             // Do not short-circuit: direct handlers consume the ISR state latched
             // by the shared pass. All sources must be acknowledged before EOI.
             let direct_handled = IRQ_HANDLER_TABLE.handle(vector);
@@ -757,6 +827,8 @@ fn msi_vectors(max_pin: u8) -> core::ops::Range<usize> {
 }
 #[cfg(feature = "irq")]
 pub use irq_impl::allocate_msi;
+#[cfg(feature = "irq")]
+pub use irq_impl::unregister_msi_vector;
 #[cfg(test)]
 mod msi_tests {
     #[test] fn vectors_never_alias_ioapic_or_lapic() {

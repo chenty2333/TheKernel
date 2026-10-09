@@ -15,10 +15,11 @@ use linux_raw_sys::{
     if_packet::{PACKET_RX_RING, PACKET_TX_RING, tpacket_req, tpacket_stats},
     net::{
         AF_INET, AF_INET6, AF_PACKET, IP_HDRINCL, IPV6_ADDRFORM, SO_ATTACH_BPF, SO_ATTACH_FILTER,
-        SO_ATTACH_REUSEPORT_CBPF, SO_ATTACH_REUSEPORT_EBPF, SO_DETACH_BPF, SO_DETACH_REUSEPORT_BPF,
-        SO_BINDTODEVICE, SO_DOMAIN, SO_ERROR, SO_LINGER, SO_LOCK_FILTER, SO_PROTOCOL,
-        SO_RCVBUF, SO_RCVBUFFORCE, SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE, SOCK_DGRAM, SOCK_RAW,
-        SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_SOCKET, socklen_t,
+        SO_ATTACH_REUSEPORT_CBPF, SO_ATTACH_REUSEPORT_EBPF, SO_BINDTODEVICE, SO_DETACH_BPF,
+        SO_DETACH_REUSEPORT_BPF, SO_DOMAIN, SO_ERROR, SO_LINGER, SO_LOCK_FILTER, SO_PASSCRED,
+        SO_PROTOCOL, SO_RCVBUF, SO_RCVBUFFORCE, SO_SNDBUF, SO_SNDBUFFORCE, SO_TIMESTAMP,
+        SO_TIMESTAMP_NEW, SO_TYPE, SOCK_DGRAM, SOCK_RAW, SOL_IPV6, SOL_NETLINK, SOL_PACKET,
+        SOL_SOCKET, socklen_t,
     },
 };
 use spin::{Lazy, Mutex};
@@ -46,6 +47,7 @@ use crate::{
 };
 
 const PROTO_TCP: u32 = linux_raw_sys::net::IPPROTO_TCP as u32;
+const SOL_HCI: u32 = 0;
 const SOCK_DCCP: i32 = 6;
 const IPPROTO_DCCP: i32 = 33;
 
@@ -1346,6 +1348,25 @@ pub fn sys_getsockopt(
             .map_err(map_usercopy_error)
     };
 
+    if pinned.backend()? == SocketBackendKind::Bluetooth {
+        let option = match level {
+            SOL_HCI => optname,
+            SOL_SOCKET => match optname {
+                SO_TIMESTAMP | SO_TIMESTAMP_NEW => 3,
+                SO_PASSCRED => 0x1_0000,
+                _ => return Err(LinuxError::ENOPROTOOPT.into()),
+            },
+            _ => return Err(LinuxError::ENOPROTOOPT.into()),
+        };
+        let mut optlen = admitted_option_length(import_option_length()?)?;
+        let value = pinned.bluetooth()?.get_hci_option(option)?;
+        write_option(&capability, optval, &mut optlen, value)?;
+        capability
+            .write_value(optlen_ptr.address().as_usize() as *mut socklen_t, optlen)
+            .map_err(map_usercopy_error)?;
+        return Ok(0);
+    }
+
     if pinned.backend()? == SocketBackendKind::Xdp {
         // `xsk_getsockopt` is an `ops->getsockopt_iter`, so
         // `sockptr_to_sockopt()` (`net/socket.c:2411-2420`) copies and rejects
@@ -1795,6 +1816,24 @@ pub fn sys_setsockopt(
             .read_into(optval.address().as_usize() as *const u8, &mut key)
             .map_err(map_usercopy_error)?;
         pinned.af_alg()?.set_alg_key(&key)?;
+        return Ok(0);
+    }
+
+    if pinned.backend()? == SocketBackendKind::Bluetooth {
+        let option = match level {
+            SOL_HCI => optname,
+            SOL_SOCKET => match optname {
+                SO_TIMESTAMP | SO_TIMESTAMP_NEW => 3,
+                SO_PASSCRED => 0x1_0000,
+                _ => return Err(LinuxError::ENOPROTOOPT.into()),
+            },
+            _ => return Err(LinuxError::ENOPROTOOPT.into()),
+        };
+        if (optlen as usize) < size_of::<i32>() {
+            return Err(AxError::InvalidInput);
+        }
+        let value = read_option::<i32>(&capability, optval, optlen)?;
+        pinned.bluetooth()?.set_hci_option(option, value)?;
         return Ok(0);
     }
 

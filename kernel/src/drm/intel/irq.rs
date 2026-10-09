@@ -334,8 +334,16 @@ pub(super) fn install_n305(
     }
     let (gen11_hpd, sde_hpd, hpd_enable) = port_hpd_masks(port)?;
 
-    let (message_address, message_data, vector) = axhal::irq::allocate_msi(display_irq_handler)
-        .ok_or_else(|| String::from("display MSI vector could not be reserved"))?;
+    let (message_address, message_data, vector) = axhal::irq::allocate_msi(
+        tk_vtd::PciRequester {
+            segment: 0,
+            bus: bdf.bus,
+            device: bdf.device,
+            function: bdf.function,
+        },
+        display_irq_handler,
+    )
+    .ok_or_else(|| String::from("display MSI vector could not be reserved"))?;
     // The callback's raw base is backed by this permanent window owner; a
     // later DRM registration/worker failure cannot invalidate an installed
     // MSI callback or leave it pointing at a dropped mapping token.

@@ -21,4 +21,5 @@ class BaselineCapacityTests(unittest.TestCase):
             match = re.search(expression, source, re.MULTILINE)
             self.assertIsNotNone(match, script)
             self.assertEqual(int(match.group(1)), expected, script)
-        self.assertEqual(rootfs_image_bytes('inspect'), 160 * 1024 * 1024)
+        # The inspect payload includes additional partitioning/e2fsprogs tools.
+        self.assertEqual(rootfs_image_bytes('inspect'), 192 * 1024 * 1024)

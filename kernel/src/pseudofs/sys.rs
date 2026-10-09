@@ -7,7 +7,6 @@ use alloc::{
 use axfs_ng_vfs::{DeviceId, Filesystem, NodeType, VfsResult};
 
 use crate::{
-    mounts,
     pmu_registry::{PMU_EVENTS, PmuEvents, registered_pmus},
     pseudofs::{
         DirMapping, SimpleDir, SimpleDirOps, SimpleFile, SimpleFs, dev::r#loop as loopdev,
@@ -15,7 +14,6 @@ use crate::{
     },
 };
 
-const LOOP_MAJOR: u32 = 7;
 const BLOCK_DMA_ALIGNMENT: u32 = 0;
 const NUMA_NODE_COUNT: u32 = 1;
 
@@ -26,6 +24,7 @@ pub fn new_sysfs() -> Filesystem {
 fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     super::pci_sysfs::publish_inventory();
     super::usb_sysfs::publish_inventory();
+    super::block_inventory::install_uevent_bridge();
     let mut root = DirMapping::new();
     let mut fs_dir = DirMapping::new();
     let mut fuse_dir = DirMapping::new();
@@ -194,7 +193,8 @@ fn class_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     // Device-registry publication supplies the complete graphics class
     // object.  A static empty fb0 directory would shadow that object and
     // prevent udev from reading its dev/uevent attributes.
-    let classes = super::block_inventory::class_root(fs.clone())
+    let classes = super::bluetooth_sysfs::class_root(fs.clone())
+        .chain(super::block_inventory::class_root(fs.clone()))
         .chain(super::net_sysfs::class_root(fs.clone()))
         .chain(super::acpi_thermal::class_root(fs.clone()));
     #[cfg(any(feature = "pmu", feature = "hwp-uclamp"))]
@@ -206,75 +206,12 @@ fn class_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
 }
 
 fn block_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
-    let mut block = DirMapping::new();
-
-    for i in 0..16 {
-        let name = format!("loop{i}");
-        block.add(
-            name.clone(),
-            loop_block_device_dir(fs.clone(), i, name, DeviceId::new(LOOP_MAJOR, i)),
-        );
-    }
-
-    if let Some(info) = axfs::root_block_device_info() {
-        let name = axfs::ROOT_BLOCK_DEVICE_NAME.to_string();
-        block.add(
-            name.clone(),
-            block_device_dir(fs.clone(), name, mounts::ROOT_BLOCK_DEVICE_ID, info),
-        );
-    }
-
-    for (index, name) in axfs::block_device_names().into_iter().enumerate() {
-        if axfs::block_inventory().iter().any(|entry| entry.name == name && entry.partition.is_some()) {
-            continue;
-        }
-        let Some(info) = axfs::block_device_info(&name) else {
-            continue;
-        };
-        let Some(dev_id) = mounts::extra_block_device_id(index) else {
-            continue;
-        };
-        block.add(
-            name.clone(),
-            block_device_dir(fs.clone(), name, dev_id, info),
-        );
-    }
-
-    SimpleDir::new_maker(fs, Arc::new(block))
+    super::block_inventory::block_root(fs)
 }
 
 fn dev_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     let mut dev = DirMapping::new();
-    let mut block = DirMapping::new();
-
-    for i in 0..16 {
-        let name = format!("loop{i}");
-        let dev_id = DeviceId::new(LOOP_MAJOR, i);
-        block.add(
-            format!("{}:{}", dev_id.major(), dev_id.minor()),
-            block_device_link(fs.clone(), name),
-        );
-    }
-
-    if axfs::root_block_device_info().is_some() {
-        let dev_id = mounts::ROOT_BLOCK_DEVICE_ID;
-        block.add(
-            format!("{}:{}", dev_id.major(), dev_id.minor()),
-            block_device_link(fs.clone(), axfs::ROOT_BLOCK_DEVICE_NAME.to_string()),
-        );
-    }
-
-    for (index, name) in axfs::block_device_names().into_iter().enumerate() {
-        let Some(dev_id) = mounts::extra_block_device_id(index) else {
-            continue;
-        };
-        block.add(
-            format!("{}:{}", dev_id.major(), dev_id.minor()),
-            block_device_link(fs.clone(), name),
-        );
-    }
-
-    dev.add("block", SimpleDir::new_maker(fs.clone(), Arc::new(block)));
+    dev.add("block", super::block_inventory::dev_block_root(fs.clone()));
     dev.add(
         "char",
         SimpleDir::new_maker(
@@ -283,15 +220,6 @@ fn dev_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
         ),
     );
     SimpleDir::new_maker(fs, Arc::new(dev))
-}
-
-fn block_device_link(fs: Arc<SimpleFs>, dev_name: String) -> Arc<SimpleFile> {
-    SimpleFile::new(fs, NodeType::Symlink, move || {
-        Ok(format!(
-            "../../block/{}",
-            super::block_inventory::path(&dev_name)
-        ))
-    })
 }
 
 fn devices_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
@@ -447,7 +375,7 @@ pub(super) fn block_device_dir(
     SimpleDir::new_maker(fs, Arc::new(dir))
 }
 
-fn loop_block_device_dir(
+pub(super) fn loop_block_device_dir(
     fs: Arc<SimpleFs>,
     number: u32,
     dev_name: String,
@@ -567,7 +495,13 @@ mod tests {
         let filesystem = new_sysfs();
         let root = Mountpoint::new_root(&filesystem);
         let context = FsContext::new(root.root_location());
-        for path in [b"/class/block".as_slice(), b"/class/net", b"/class/thermal"] {
+        for path in [
+            b"/class/block".as_slice(),
+            b"/class/net",
+            b"/class/ieee80211",
+            b"/class/thermal",
+            b"/class/bluetooth",
+        ] {
             assert!(context.resolve(FsPath::new(path)).is_ok(), "{path:?}");
         }
         #[cfg(any(feature = "pmu", feature = "hwp-uclamp"))]

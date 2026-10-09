@@ -1,3 +1,10 @@
+//! Host-only regression model for the former hand-written bring-up sequence.
+//!
+//! The product's live I225 reset, NVM, PHY, MAC and link setup now runs through
+//! the translated FreeBSD modules and the platform adapter. This module is
+//! included only by unit tests as a compatibility oracle for the register
+//! facts and old failure-reporting behavior; it is not part of the product.
+//!
 //! Bringing the part up: reset it, read its station address, wait for link.
 //!
 //! This is the phase the brief calls "where the interesting hardware behaviour
@@ -72,6 +79,7 @@ use super::{
         self, DeviceControl, DeviceStatus, MdicCommand, MdicResult, NvmControl, ReceiveAddressHigh,
         Register, Speed, assemble_receive_address, bits, mii,
     },
+    station::StationAddress,
 };
 
 /// How long to wait between `STATUS.GIO_MASTER_ENABLE` polls.
@@ -167,39 +175,6 @@ impl BringUpError {
                  word was {last_phy_status:#06x}"
             ),
         }
-    }
-}
-
-/// The station address, and the evidence for it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StationAddress {
-    /// The six bytes, assembled the way `igc_read_mac_addr` assembles them.
-    pub bytes: [u8; 6],
-    /// The raw `IGC_RAL(0)` value.
-    pub low: u32,
-    /// The raw `IGC_RAH(0)` value.
-    pub high: u32,
-    /// `IGC_RAH_AV`, the bit that says the receive filter entry is armed.
-    ///
-    /// Linux does not require it (`igc_main.c:7090` only checks
-    /// `is_valid_ether_addr`), and neither does this driver, but a receive
-    /// filter entry with this bit clear will not accept the machine's own
-    /// unicast frames, so the report prints it rather than assuming.
-    pub address_valid: bool,
-}
-
-impl StationAddress {
-    /// How the report spells the address.
-    pub fn describe(&self) -> String {
-        format!(
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            self.bytes[0],
-            self.bytes[1],
-            self.bytes[2],
-            self.bytes[3],
-            self.bytes[4],
-            self.bytes[5],
-        )
     }
 }
 

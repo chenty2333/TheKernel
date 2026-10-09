@@ -4,10 +4,10 @@ use log::{debug, info};
 use zerocopy::AsBytes;
 
 use super::{
-    Config, EthernetAddress, Features, VirtioNetHdr, MIN_BUFFER_LEN, NET_HDR_SIZE, QUEUE_RECEIVE,
-    QUEUE_TRANSMIT, SUPPORTED_FEATURES,
+    Config, EthernetAddress, Features, LEGACY_NET_HDR_SIZE, MIN_BUFFER_LEN, NET_HDR_SIZE,
+    QUEUE_RECEIVE, QUEUE_TRANSMIT, SUPPORTED_FEATURES, VirtioNetHdr,
 };
-use crate::{hal::Hal, queue::VirtQueue, transport::Transport, volatile::volread, Error, Result};
+use crate::{Error, Result, hal::Hal, queue::VirtQueue, transport::Transport, volatile::volread};
 
 const RESET_POLL_BUDGET: usize = 1024;
 
@@ -36,6 +36,7 @@ pub struct VirtIONetRaw<H: Hal, T: Transport, const QUEUE_SIZE: usize> {
     // access.
     transport: ManuallyDrop<T>,
     mac: EthernetAddress,
+    net_hdr_size: usize,
     recv_queue: ManuallyDrop<VirtQueue<H, QUEUE_SIZE>>,
     send_queue: ManuallyDrop<VirtQueue<H, QUEUE_SIZE>>,
     /// Whether the transport has already been reset by the owning wrapper.
@@ -49,6 +50,10 @@ pub struct VirtIONetRaw<H: Hal, T: Transport, const QUEUE_SIZE: usize> {
 }
 
 impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZE> {
+    pub(crate) const fn net_hdr_size(&self) -> usize {
+        self.net_hdr_size
+    }
+
     #[inline]
     fn operational(&self) -> bool {
         !self.quiesced && !self.quarantined
@@ -76,6 +81,11 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
     pub fn new(mut transport: T) -> Result<Self> {
         let negotiated_features = transport.begin_init(SUPPORTED_FEATURES);
         info!("negotiated_features {:?}", negotiated_features);
+        let net_hdr_size = if negotiated_features.contains(Features::VERSION_1) {
+            NET_HDR_SIZE
+        } else {
+            LEGACY_NET_HDR_SIZE
+        };
         // read configuration space
         let config = transport.config_space::<Config>()?;
         let mac;
@@ -106,6 +116,7 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
         Ok(VirtIONetRaw {
             transport: ManuallyDrop::new(transport),
             mac,
+            net_hdr_size,
             recv_queue: ManuallyDrop::new(recv_queue),
             send_queue: ManuallyDrop::new(send_queue),
             quiesced: false,
@@ -245,8 +256,8 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
     }
 
     /// Whether the length of the transmit buffer is valid.
-    fn check_tx_buf_len(tx_buf: &[u8]) -> Result<()> {
-        if tx_buf.len() < NET_HDR_SIZE {
+    fn check_tx_buf_len(&self, tx_buf: &[u8]) -> Result<()> {
+        if tx_buf.len() < self.net_hdr_size {
             ratelimit::warn_ratelimited!("Transmit buffer len {} is too small", tx_buf.len());
             Err(Error::InvalidParam)
         } else {
@@ -258,12 +269,12 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
     ///
     /// If the `buffer` is not large enough, it returns [`Error::InvalidParam`].
     pub fn fill_buffer_header(&self, buffer: &mut [u8]) -> Result<usize> {
-        if buffer.len() < NET_HDR_SIZE {
+        if buffer.len() < self.net_hdr_size {
             return Err(Error::InvalidParam);
         }
         let header = VirtioNetHdr::default();
-        buffer[..NET_HDR_SIZE].copy_from_slice(header.as_bytes());
-        Ok(NET_HDR_SIZE)
+        buffer[..self.net_hdr_size].copy_from_slice(&header.as_bytes()[..self.net_hdr_size]);
+        Ok(self.net_hdr_size)
     }
 
     /// Submits a request to transmit a buffer immediately without waiting for
@@ -294,7 +305,7 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
         if !self.operational() {
             return Err(Error::NotReady);
         }
-        Self::check_tx_buf_len(tx_buf)?;
+        self.check_tx_buf_len(tx_buf)?;
         let token = self.send_queue.add(&[tx_buf], &mut [])?;
         if self.send_queue.should_notify() {
             self.transport.notify(QUEUE_TRANSMIT);
@@ -405,11 +416,11 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
                 return Err(Error::Quarantined);
             }
         };
-        let Some(packet_len) = len.checked_sub(NET_HDR_SIZE) else {
+        let Some(packet_len) = len.checked_sub(self.net_hdr_size) else {
             self.quarantine();
             return Err(Error::Quarantined);
         };
-        Ok((NET_HDR_SIZE, packet_len))
+        Ok((self.net_hdr_size, packet_len))
     }
 
     /// Sends a packet to the network, and blocks until the request completed.
@@ -422,13 +433,13 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
             // Special case sending an empty packet, to avoid adding an empty buffer to the
             // virtqueue.
             self.send_queue.add_notify_wait_pop(
-                &[header.as_bytes()],
+                &[&header.as_bytes()[..self.net_hdr_size]],
                 &mut [],
                 &mut *self.transport,
             )?;
         } else {
             self.send_queue.add_notify_wait_pop(
-                &[header.as_bytes(), tx_buf],
+                &[&header.as_bytes()[..self.net_hdr_size], tx_buf],
                 &mut [],
                 &mut *self.transport,
             )?;
@@ -485,8 +496,8 @@ mod tests {
         device::net::Status,
         hal::fake::FakeHal,
         transport::{
-            fake::{FakeTransport, QueueStatus, State},
             DeviceType,
+            fake::{FakeTransport, QueueStatus, State},
         },
         volatile::ReadOnly,
     };
@@ -542,6 +553,34 @@ mod tests {
         assert_eq!(unsafe { dev.transmit_begin(&tx) }, Err(Error::NotReady));
         drop(state);
         drop(buffer);
+    }
+
+    #[test]
+    fn network_header_tracks_legacy_and_version_1_wire_lengths() {
+        for (device_features, expected_len) in [(0, LEGACY_NET_HDR_SIZE), (1 << 32, NET_HDR_SIZE)] {
+            let state = Arc::new(Mutex::new(State {
+                queues: vec![QueueStatus::default(), QueueStatus::default()],
+                ..Default::default()
+            }));
+            let mut config = Config {
+                mac: ReadOnly::new([0x02, 0, 0, 0, 0, 1]),
+                status: ReadOnly::new(Status::LINK_UP),
+                max_virtqueue_pairs: ReadOnly::new(1),
+                mtu: ReadOnly::new(1500),
+            };
+            let transport = FakeTransport {
+                device_type: DeviceType::Network,
+                max_queue_size: 4,
+                device_features,
+                config_space: NonNull::from(&mut config),
+                state,
+            };
+            let dev = VirtIONetRaw::<FakeHal, _, 4>::new(transport).unwrap();
+            assert_eq!(dev.net_hdr_size(), expected_len);
+            let mut header = [0xff; NET_HDR_SIZE];
+            assert_eq!(dev.fill_buffer_header(&mut header).unwrap(), expected_len);
+            assert!(header[..expected_len].iter().all(|byte| *byte == 0));
+        }
     }
 
     #[test]

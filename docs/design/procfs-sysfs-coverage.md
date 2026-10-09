@@ -117,7 +117,7 @@ Rust 测试通过（含 kernel 2580）；q35 和 n305 product lint 通过（各 
 
 ### B1.3：独立真实工具 payload 与第一轮发现
 
-`--toolchain inspect` 独立 160 MiB 镜像；76 个精确版本签名 APK，实际工具
+`--toolchain inspect` 独立 192 MiB 镜像；76 个精确版本签名 APK，实际工具
 staging 约 17 MiB。保留默认 init、BusyBox、账户；真实程序在
 `/opt/thekernel-tools/bin`，动态库/硬件 ID 数据按发行版路径安装。
 测试脚本 `/opt/thekernel-tools/inspect-tools.sh` 逐个运行上述工具，有失败则
@@ -993,7 +993,7 @@ fragmented physical SG, fixed-buffer lifetimes and queued-close completion.
 The baseline allocation and both standalone builder defaults are therefore
 128 MiB now, with a host test keeping them in sync. This is capacity for the
 existing regression corpus, not a new payload or an alternate validation path.
-The optional inspect payload remains 160 MiB; container tools are still separate.
+The optional inspect payload is 192 MiB to carry pinned e2fsprogs/sfdisk; container tools are still separate.
 Native ext4's insufficient-space fsync errno of EINVAL was observed but is not
 claimed repaired by this capacity change. No filesystem errno was weakened to
 make the test pass. Freshly rebuilt 128 MiB baseline: complete host suite passed (657 Python cases,

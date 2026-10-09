@@ -1,6 +1,6 @@
 //! Basic virtual filesystem support
 
-mod block_inventory;
+pub(crate) mod block_inventory;
 mod block_statistics;
 pub mod cgroup;
 #[cfg(any(feature="pmu",feature="hwp-uclamp"))]
@@ -22,6 +22,7 @@ mod pci_sysfs;
 mod pci_resources;
 mod usb_sysfs;
 mod net_sysfs;
+mod bluetooth_sysfs;
 pub(crate) mod nsfs;
 pub(crate) mod proc;
 mod proc_exe;

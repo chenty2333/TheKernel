@@ -18,9 +18,25 @@ use core::ptr::NonNull;
 /// the returned memory in the device's DMA domain (not merely a CPU address).
 pub unsafe trait Hal: Send + Sync {
     fn allocate(pages: usize) -> Option<(u64, NonNull<u8>)>;
+    fn allocate_for(
+        requester: Option<tk_vtd::PciRequester>,
+        pages: usize,
+    ) -> Option<(u64, NonNull<u8>)> {
+        let _ = requester;
+        Self::allocate(pages)
+    }
     /// # Safety
     /// Device access must have retired and the allocation must still be owned.
     unsafe fn release(address: u64, pointer: NonNull<u8>, pages: usize);
+    unsafe fn release_for(
+        requester: Option<tk_vtd::PciRequester>,
+        address: u64,
+        pointer: NonNull<u8>,
+        pages: usize,
+    ) {
+        let _ = requester;
+        unsafe { Self::release(address, pointer, pages) }
+    }
 }
 pub use bringup::Controller;
 

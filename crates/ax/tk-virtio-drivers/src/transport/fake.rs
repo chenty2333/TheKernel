@@ -9,8 +9,8 @@ use std::{sync::Mutex, thread};
 
 use super::{DeviceStatus, DeviceType, Transport};
 use crate::{
-    queue::{fake_read_write_queue, Descriptor},
     PhysAddr, Result,
+    queue::{Descriptor, fake_read_write_queue},
 };
 
 /// A fake implementation of [`Transport`] for unit tests.
@@ -37,8 +37,16 @@ impl<C> Transport for FakeTransport<C> {
         self.device_features
     }
 
+    fn common_features(&self) -> u64 {
+        self.device_features & ((1 << 32) | (1 << 33))
+    }
+
     fn write_driver_features(&mut self, driver_features: u64) {
         self.state.lock().unwrap().driver_features = driver_features;
+    }
+
+    fn set_dma_access_platform(&mut self, enabled: bool) {
+        self.state.lock().unwrap().dma_access_platform = enabled;
     }
 
     fn max_queue_size(&mut self, _queue: u16) -> u32 {
@@ -119,6 +127,8 @@ pub struct State {
     pub status: DeviceStatus,
     /// Feature bits accepted by the driver.
     pub driver_features: u64,
+    /// Whether the transport observed ACCESS_PLATFORM negotiation.
+    pub dma_access_platform: bool,
     /// Legacy guest page size selected by the driver.
     pub guest_page_size: u32,
     /// Whether the fake device has a pending interrupt.

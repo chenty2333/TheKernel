@@ -481,3 +481,41 @@ mod fixed_power_tests {
         }
     }
 }
+
+unsafe extern "C" {
+    fn tk_acpi_evaluate_dsm_integer(
+        path: *const c_char,
+        uuid: *const u8,
+        revision: u64,
+        function: u64,
+        value: *mut u64,
+    ) -> Status;
+}
+
+impl Engine {
+    /// Evaluate a standard ACPI _DSM method with a 16-byte UUID and empty
+    /// argument package, requiring an integer return value.
+    pub fn evaluate_dsm_integer(
+        &self,
+        path: &str,
+        uuid: &[u8; 16],
+        revision: u64,
+        function: u64,
+    ) -> Result<u64, Status> {
+        let path = CString::new(path).map_err(|_| crate::BAD_PARAMETER)?;
+        let mut value = 0;
+        // SAFETY: path and UUID remain live for this synchronous ACPICA call;
+        // the C adapter validates the returned object type before writing value.
+        let result = unsafe {
+            tk_acpi_evaluate_dsm_integer(
+                path.as_ptr(),
+                uuid.as_ptr(),
+                revision,
+                function,
+                &mut value,
+            )
+        };
+        status(result)?;
+        Ok(value)
+    }
+}

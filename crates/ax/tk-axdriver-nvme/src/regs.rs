@@ -7,6 +7,9 @@ pub const ASQ: usize = 0x28;
 pub const ACQ: usize = 0x30;
 pub const DBS: usize = 0x1000;
 pub trait Bus: Send + Sync {
+    fn dma_requester(&self) -> Option<tk_vtd::PciRequester> {
+        None
+    }
     fn read32(&mut self, offset: usize) -> u32;
     fn write32(&mut self, offset: usize, value: u32);
     fn delay_us(&mut self, micros: u32);

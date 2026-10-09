@@ -1,17 +1,17 @@
 //! The NIC: two descriptor rings, and the `NetDriverOps` implementation.
 //!
 //! This is the phase that makes the device usable by the network stack.  It
-//! configures one transmit and one receive ring the way
-//! `igc_configure_tx_ring` / `igc_configure_rx_ring` / `igc_configure` do
-//! (`igc_main.c:625`, `:728`, `:4020`), fills the receive ring, and implements
+//! configures one transmit and one receive ring through the translated
+//! FreeBSD `igc_initialize_transmit_unit` / `igc_initialize_receive_unit`
+//! from `if_igc.c`, fills the receive ring, and implements
 //! the buffer handover the stack expects: the stack asks for a transmit buffer,
 //! writes a frame into it, hands it back, and later hands receive buffers back
 //! for the hardware to use again.
 //!
 //! # What is deliberately not here
 //!
-//! * **No interrupts.**  This driver polls.  The bring-up phase masked every
-//!   interrupt source and nothing unmasks one, so [`NetDriverOps::can_receive`]
+//! * **No interrupts.**  This driver polls.  Translated attach masks interrupt
+//!   sources and no current interface unmasks them, so [`NetDriverOps::can_receive`]
 //!   and [`NetDriverOps::receive`] mean exactly what they say: a descriptor has
 //!   been written back, or it has not yet.
 //! * **No segmentation, no checksum offload, no VLAN insertion, no
@@ -22,8 +22,9 @@
 //!   driver does not adjust it.
 //! * **One queue in each direction**, which is what `NetDriverOps` describes.
 //!   The vendor driver runs one to four.
-//! * **No flow control, no receive-filter programming, no RSS.**  The design
-//!   note lists these with their consequences.
+//! * **No RSS or multicast address hashing.**  The translated shared setup
+//!   programs flow control and the RAR filter; the single-queue stack boundary
+//!   does not expose RSS steering or multicast-list updates.
 //!
 //! # The invariant that matters
 //!
@@ -48,14 +49,22 @@ use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
 
 use super::{
     DMA_PAGE_BYTES, IgcBus, IgcHal, WindowBus,
-    bringup::StationAddress,
+    api::IgcHardware,
     desc::{
-        BufferPool, DESCRIPTOR_BYTES, DescriptorMemory, MAX_FRAME_BYTES, RX_BUFFER_BYTES,
-        RX_HEADER_BYTES, RingError, RxRing, TxRing, tx_command_length, tx_offload_status,
+        BufferPool, DESCRIPTOR_BYTES, DescriptorMemory, MAX_FRAME_BYTES, RX_BUFFER_BYTES, RxRing,
+        TxRing,
     },
-    regs::{
-        self, QueueControl, ReceiveControl, RingBase, RingLength, SplitReceiveControl,
-        TransmitControl,
+    if_igc::{
+        IgcMainIo, IgcRssIo, MainError, RingDma, UnitConfig, igc_initialize_receive_unit,
+        igc_initialize_transmit_unit,
+    },
+    mac::FlowMode,
+    regs::{self, DeviceControl, DeviceStatus, QueueControl, RingLength, bits},
+    station::StationAddress,
+    txrx::{
+        RxRingState, TxChecksum, TxIpType, TxPacketInfo, TxProtocol, TxRingState, TxRxError,
+        TxRxIo, TxSegment, igc_isc_rxd_available, igc_isc_rxd_available_from, igc_isc_rxd_pkt_get,
+        igc_isc_rxd_refill, igc_isc_txd_encap,
     },
 };
 use crate::{EthernetAddress, NetBufPtr, NetDriverOps};
@@ -63,13 +72,68 @@ use crate::{EthernetAddress, NetBufPtr, NetDriverOps};
 /// The device name the interface reports.
 pub const DEVICE_NAME: &str = "igc";
 
-/// The receive buffer size in bytes.
-///
-/// It is used in two places and in two different units, which is worth naming
-/// once: `IGC_RLPML` takes a byte count, and `SRRCTL`'s packet-size field
-/// takes kilobytes (`igc_base.h:97-99`), which
-/// `SplitReceiveControl::one_buffer` divides down to.
-const RX_PACKET_BYTES: u32 = RX_BUFFER_BYTES as u32;
+/// The register adapter used by the translated `if_igc.c` queue initializer.
+struct IgcUnitIo<'a, H: IgcHal> {
+    bus: &'a mut WindowBus<H>,
+    failed: bool,
+}
+
+impl<H: IgcHal> IgcMainIo for IgcUnitIo<'_, H> {
+    fn read(&mut self, offset: u32) -> u32 {
+        match regs::at_offset(offset).and_then(|register| self.bus.read(register)) {
+            Some(value) => value,
+            None => {
+                self.failed = true;
+                0
+            }
+        }
+    }
+
+    fn write(&mut self, offset: u32, value: u32) {
+        if !regs::at_offset(offset).is_some_and(|register| self.bus.write(register, value)) {
+            self.failed = true;
+        }
+    }
+
+    fn admin_status_deferred(&mut self) {
+        self.failed = true;
+    }
+
+    fn update_mc(&mut self, _addresses: &[u8], _count: u32) -> Result<(), MainError> {
+        Err(MainError::Io)
+    }
+
+    fn write_vfta(&mut self, _index: u32, _value: u32) {
+        self.failed = true;
+    }
+}
+
+impl<H: IgcHal> IgcRssIo for IgcUnitIo<'_, H> {
+    fn rss_bucket(&mut self, _bucket: usize, _queue_count: usize) -> usize {
+        0
+    }
+
+    fn rss_key(&mut self) -> [u32; 10] {
+        [0; 10]
+    }
+
+    fn rss_hash_config(&mut self) -> u32 {
+        0
+    }
+}
+
+/// The translated packet parser only needs notification hooks for metadata
+/// callbacks; this interface cannot export those values, and the descriptor
+/// tail is still published by `IgcNic` after it has safely re-armed buffers.
+struct RxMetadataSink;
+
+impl TxRxIo for RxMetadataSink {
+    fn write_tdt(&mut self, _queue: u16, _index: usize) {}
+    fn write_rdt(&mut self, _queue: u16, _index: usize) {}
+    fn aim_publish_tx(&mut self, _queue: u16) {}
+    fn aim_publish_rx(&mut self, _queue: u16) {}
+    fn note_drop(&mut self) {}
+}
 
 /// Counters, for the report and for the tests.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -89,8 +153,6 @@ pub struct Stats {
     /// Receive descriptors discarded because they did not describe a usable
     /// frame.
     pub rx_dropped: u64,
-    /// Receive descriptors whose length was set but whose done bit was not.
-    pub rx_without_done: u64,
     /// Calls refused because a pointer did not belong to this driver.
     pub foreign_buffers: u64,
     /// Calls refused because the transmit ring had no room.
@@ -105,8 +167,7 @@ impl Stats {
     pub fn describe(&self) -> alloc::string::String {
         alloc::format!(
             "tx {} frames/{} bytes, rx {} frames/{} bytes, recycled tx {} rx {}, dropped {} \
-             (length without done bit {}, foreign pointers {}, transmit ring full {}, register \
-             writes refused {})",
+             (foreign pointers {}, transmit ring full {}, register writes refused {})",
             self.transmitted,
             self.transmitted_bytes,
             self.received,
@@ -114,7 +175,6 @@ impl Stats {
             self.tx_recycled,
             self.rx_recycled,
             self.rx_dropped,
-            self.rx_without_done,
             self.foreign_buffers,
             self.tx_full,
             self.register_refused,
@@ -141,9 +201,14 @@ impl<H: IgcHal> Drop for Allocation<H> {
 /// The Intel i225/i226 NIC, with `QS` descriptors in each ring.
 pub struct IgcNic<H: IgcHal, const QS: usize> {
     bus: WindowBus<H>,
+    /// FreeBSD shared-code operation tables installed for this PCI device.
+    shared: IgcHardware,
     mac: [u8; 6],
     tx_memory: DescriptorMemory,
     tx_ring: TxRing,
+    /// FreeBSD `igc_isc_txd_encap` shadow state; the coherent descriptor ring
+    /// remains the device-visible copy.
+    tx_source_state: TxRingState,
     tx_pool: BufferPool,
     tx_free: Vec<usize>,
     /// Which slots are currently out with the *caller*, not with the ring.
@@ -159,6 +224,9 @@ pub struct IgcNic<H: IgcHal, const QS: usize> {
     tx_owner: Vec<usize>,
     rx_memory: DescriptorMemory,
     rx_ring: RxRing,
+    /// Shadow of the extended receive descriptors used by the translated
+    /// FreeBSD refill callback.
+    rx_source_state: RxRingState,
     rx_pool: BufferPool,
     rx_owner: Vec<usize>,
     rx_free: Vec<usize>,
@@ -184,13 +252,17 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
     /// The caller has already reset the part and read its station address; the
     /// address is passed in so that this function cannot be reached without
     /// one.
-    pub fn init(bus: WindowBus<H>, station: &StationAddress) -> DevResult<Self> {
+    pub fn init(
+        bus: WindowBus<H>,
+        station: &StationAddress,
+        shared: IgcHardware,
+    ) -> DevResult<Self> {
         // One descriptor is always left unused, so a ring of one descriptor
         // could never hand anything over.
-        if QS < 2 {
+        if QS < 2 || !QS.is_power_of_two() {
             return Err(DevError::InvalidParam);
         }
-        let Some(ring_length) = RingLength::new(QS, DESCRIPTOR_BYTES) else {
+        let Some(_ring_length) = RingLength::new(QS, DESCRIPTOR_BYTES) else {
             return Err(DevError::InvalidParam);
         };
 
@@ -224,15 +296,18 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
 
         let mut nic = Self {
             bus,
+            shared,
             mac: station.bytes,
             tx_memory,
             tx_ring: TxRing::new(QS),
+            tx_source_state: TxRingState::new(QS),
             tx_pool,
             tx_free: (0..QS).rev().collect(),
             tx_in_flight: vec![false; QS],
             tx_owner: vec![0; QS],
             rx_memory,
             rx_ring: RxRing::new(QS),
+            rx_source_state: RxRingState::new(QS),
             rx_pool,
             rx_owner: vec![0; QS],
             rx_free: (0..QS).rev().collect(),
@@ -244,12 +319,41 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
         nic.rx_memory.zero();
         // Fill the receive ring before anything can arrive, and hand it over.
         nic.fill_receive_ring();
-        // Establish the owner before any fallible register write, and prepare
-        // the descriptors before enabling the queues. Errors now use the same
-        // DMA stop discipline as ordinary teardown.
-        enable_mac(&mut nic.bus)?;
-        configure_transmit(&mut nic.bus, tx_base, ring_length)?;
-        configure_receive(&mut nic.bus, rx_base, ring_length)?;
+        // The source-derived queue initializer consumes the same ring
+        // geometry but programs the descriptor controls and checksums in the
+        // upstream order. The single-queue network API intentionally leaves
+        // RSS and checksum offload disabled.
+        let config = UnitConfig {
+            tx_rings: vec![RingDma {
+                bus_address: tx_base,
+                descriptors: QS,
+            }],
+            rx_rings: vec![RingDma {
+                bus_address: rx_base,
+                descriptors: QS,
+            }],
+            max_frame_size: 1518,
+            mtu: 1500,
+            rx_buffer_size: RX_BUFFER_BYTES as u32,
+            vlan_trunk: false,
+            disable_crc_stripping: false,
+            rx_checksum: false,
+            flow_mode: FlowMode::None,
+            multicast_filter_type: 0,
+            low_water: 0,
+            high_water: 0,
+            send_xon: true,
+        };
+        let mut io = IgcUnitIo {
+            bus: &mut nic.bus,
+            failed: false,
+        };
+        igc_initialize_transmit_unit(&mut io, &config).map_err(|_| DevError::BadState)?;
+        igc_initialize_receive_unit(&mut io, &config).map_err(|_| DevError::BadState)?;
+        if io.failed {
+            return Err(DevError::BadState);
+        }
+        drop(io);
         nic.write_receive_tail();
         Ok(nic)
     }
@@ -259,6 +363,11 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
         self.mac
     }
 
+    /// The source-selected FreeBSD MAC/NVM/PHY callbacks for this part.
+    pub const fn shared_hardware(&self) -> &IgcHardware {
+        &self.shared
+    }
+
     /// The counters since this device was taken over.
     pub const fn stats(&self) -> &Stats {
         &self.stats
@@ -266,15 +375,15 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
 
     /// Whether the receive ring has a frame waiting.
     ///
-    /// This reads one descriptor, which is the whole cost of the check, and it
-    /// is what the stack's `can_receive` becomes.
+    /// This reads one descriptor and applies the upstream done/EOP predicate;
+    /// it is what the stack's `can_receive` becomes for the single-buffer path.
     pub fn receive_pending(&self) -> bool {
         if self.rx_ring.outstanding() == 0 {
             return false;
         }
-        self.rx_memory
-            .rx_length(self.rx_ring.next_to_clean())
-            .is_some_and(|length| length != 0)
+        igc_isc_rxd_available_from(QS, self.rx_ring.next_to_clean(), 0, |index| {
+            self.rx_memory.rx_status_error(index).unwrap_or(0)
+        }) != 0
     }
 
     /// Whether a frame can be handed to the hardware right now.
@@ -299,7 +408,14 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
                 self.rx_free.push(slot);
                 break;
             };
-            match self.rx_ring.fill(&mut self.rx_memory, address) {
+            let index = self.rx_ring.tail();
+            if igc_isc_rxd_refill(&mut self.rx_source_state, index, &[address]).is_err() {
+                self.rx_free.push(slot);
+                break;
+            }
+            let descriptor = self.rx_source_state.desc[index];
+            let descriptor_address = u64::from(descriptor[0]) | (u64::from(descriptor[1]) << 32);
+            match self.rx_ring.fill(&mut self.rx_memory, descriptor_address) {
                 Ok(index) => self.rx_owner[index] = slot,
                 Err(_) => {
                     self.rx_free.push(slot);
@@ -361,20 +477,28 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
         Ok(NetBufPtr::new(pointer, pointer, length))
     }
 
-    /// Discard the descriptor at the receive ring's cursor and give its buffer
-    /// back.
-    ///
-    /// A descriptor that reports an impossible frame still has to be reclaimed:
-    /// leaving it would stall the ring, and the buffer it names is the driver's
-    /// again either way.
-    fn discard_receive_descriptor(&mut self) {
-        let index = self.rx_ring.next_to_clean();
-        let slot = self.rx_owner[index];
-        self.rx_free.push(slot);
-        let _ = self.rx_ring.discard();
+    /// Drop every descriptor through the next EOP and immediately return its
+    /// buffers to the receive ring. This is used for source-reported RX errors
+    /// and multi-fragment packets, which the current NetDriverOps buffer API
+    /// cannot hand to the stack as a single packet.
+    fn discard_receive_packet(&mut self) {
+        let mut consumed = 0;
+        while self.rx_ring.outstanding() > 0 && consumed < QS {
+            let index = self.rx_ring.next_to_clean();
+            let status = self.rx_memory.rx_status_error(index).unwrap_or(0);
+            self.rx_free.push(self.rx_owner[index]);
+            if self.rx_ring.discard().is_err() {
+                break;
+            }
+            consumed += 1;
+            if status & regs::bits::RXD_STAT_EOP != 0 {
+                break;
+            }
+        }
+        if consumed == 0 {
+            return;
+        }
         self.stats.rx_dropped += 1;
-        // The buffer is the driver's again, so it goes straight back into the
-        // ring at the tail: a dropped frame must not cost the ring a slot.
         let before = self.rx_ring.tail();
         self.fill_receive_ring();
         if self.rx_ring.tail() != before {
@@ -431,13 +555,14 @@ impl<H: IgcHal, const QS: usize> NetDriverOps for IgcNic<H, QS> {
     }
 
     fn recycle_tx_buffers(&mut self) -> DevResult {
-        // The hardware writes the done bit in ring order, so reclamation is a
-        // walk from the driver's own cursor while the bit is set.
-        while self.tx_ring.outstanding() > 0 {
-            let index = self.tx_ring.next_to_clean();
-            if !self.tx_memory.tx_done(index) {
-                break;
-            }
+        // Feed the device's write-back status into the translated report-
+        // status ring, then use FreeBSD's credit walk to decide how many
+        // descriptors are reusable.
+        for (index, descriptor) in self.tx_source_state.desc.iter_mut().enumerate() {
+            descriptor[3] = self.tx_memory.tx_status(index).unwrap_or(0);
+        }
+        let credits = super::txrx::igc_isc_txd_credits_update(&mut self.tx_source_state, true);
+        for _ in 0..credits {
             let Ok(index) = self.tx_ring.release() else {
                 break;
             };
@@ -466,12 +591,38 @@ impl<H: IgcHal, const QS: usize> NetDriverOps for IgcNic<H, QS> {
         // The descriptor's three words, then the tail.  The tail write is what
         // hands the descriptor over, so it comes after the descriptor is
         // complete and after a fence, which `write_tx` performs.
-        if !self.tx_memory.write_tx(
-            index,
-            address,
-            tx_command_length(length),
-            tx_offload_status(length),
-        ) {
+        let packet = TxPacketInfo {
+            pidx: index,
+            segments: vec![TxSegment {
+                address,
+                length: length as u32,
+            }],
+            len: length as u32,
+            ehdrlen: 14,
+            ip_hlen: 0,
+            tcp_hlen: 0,
+            tso_segsz: 0,
+            tso: false,
+            vlan_tag: None,
+            ip_type: TxIpType::Other(0),
+            protocol: TxProtocol::Other(0),
+            checksum: TxChecksum::default(),
+            tx_interrupt: true,
+        };
+        if let Err(error) = igc_isc_txd_encap(&mut self.tx_source_state, &packet, QS) {
+            log::error!("igc: translated TX encapsulation failed: {error:?}");
+            return Err(match error {
+                TxRxError::NoDescriptor => DevError::Again,
+                TxRxError::Bounds | TxRxError::Unsupported | TxRxError::BadMessage => {
+                    DevError::BadState
+                }
+            });
+        }
+        let descriptor = self.tx_source_state.desc[index];
+        if !self
+            .tx_memory
+            .write_tx(index, address, descriptor[2], descriptor[3])
+        {
             return Err(DevError::BadState);
         }
         self.tx_owner[index] = slot;
@@ -507,27 +658,53 @@ impl<H: IgcHal, const QS: usize> NetDriverOps for IgcNic<H, QS> {
 
     fn receive(&mut self) -> DevResult<NetBufPtr> {
         loop {
-            match self.rx_ring.take(&self.rx_memory) {
-                Ok((index, frame)) => {
-                    if !frame.done {
-                        self.stats.rx_without_done += 1;
-                    }
-                    let slot = self.rx_owner[index];
-                    self.rx_in_flight[slot] = true;
-                    self.stats.received += 1;
-                    self.stats.received_bytes += frame.length as u64;
-                    return self.buffer_for(&self.rx_pool, slot, frame.length);
-                }
-                Err(RingError::NotReady(_)) | Err(RingError::Empty(_)) => {
-                    return Err(DevError::Again);
-                }
-                Err(_) => {
-                    // A descriptor that cannot describe a usable frame is
-                    // dropped and the ring moves on; the interface does not
-                    // fail because one packet was malformed.
-                    self.discard_receive_descriptor();
-                }
+            let start = self.rx_ring.next_to_clean();
+            if self.rx_ring.outstanding() == 0 {
+                return Err(DevError::Again);
             }
+            for offset in 0..self.rx_ring.outstanding() {
+                let index = (start + offset) % QS;
+                let status = self.rx_memory.rx_status_error(index).unwrap_or(0);
+                let length = u32::from(self.rx_memory.rx_length(index).unwrap_or(0));
+                let vlan = u32::from(self.rx_memory.rx_vlan(index).unwrap_or(0));
+                self.rx_source_state.desc[index][0] =
+                    self.rx_memory.rx_writeback_word(index, 0).unwrap_or(0);
+                self.rx_source_state.desc[index][1] =
+                    self.rx_memory.rx_writeback_word(index, 1).unwrap_or(0);
+                self.rx_source_state.desc[index][2] = status;
+                self.rx_source_state.desc[index][3] = length | (vlan << 16);
+            }
+            if igc_isc_rxd_available(&self.rx_source_state, start, 0) == 0 {
+                return Err(DevError::Again);
+            }
+            let parsed = {
+                let mut sink = RxMetadataSink;
+                igc_isc_rxd_pkt_get(&mut sink, &mut self.rx_source_state, start, true)
+            };
+            match parsed {
+                Ok((metadata, fragments)) if fragments.len() == 1 => {
+                    match self.rx_ring.take(&self.rx_memory) {
+                        Ok((index, frame)) if index == fragments[0].index => {
+                            let slot = self.rx_owner[index];
+                            self.rx_in_flight[slot] = true;
+                            self.stats.received += 1;
+                            self.stats.received_bytes += u64::from(metadata.len);
+                            debug_assert_eq!(metadata.len as usize, frame.length);
+                            return self.buffer_for(&self.rx_pool, slot, frame.length);
+                        }
+                        _ => {
+                            self.discard_receive_packet();
+                            continue;
+                        }
+                    }
+                }
+                Ok(_) | Err(_) => self.discard_receive_packet(),
+            }
+
+            // Continue past malformed or unsupported packets. The translated
+            // parser has consumed the status in its shadow; the DMA descriptor
+            // cursor is advanced here, not by that pure parser.
+            continue;
         }
     }
 }
@@ -544,10 +721,7 @@ impl<H: IgcHal, const QS: usize> Drop for IgcNic<H, QS> {
             .write(named("IGC_TXDCTL(0)"), QueueControl::disabled().raw());
         // Posted queue-disable writes are not proof that outstanding DMA has
         // completed. Reuse the reset path's bounded PCIe-master handshake.
-        if matches!(
-            super::bringup::disable_pcie_master(&mut self.bus),
-            Ok(Some(_))
-        ) {
+        if stop_master_before_dma_free(&mut self.bus) {
             // SAFETY: the device reported that it can no longer access these
             // pages. This is the sole destruction of these four owners.
             unsafe { ManuallyDrop::drop(&mut self.allocations) };
@@ -555,6 +729,37 @@ impl<H: IgcHal, const QS: usize> Drop for IgcNic<H, QS> {
             log::warn!("igc: DMA stop was not confirmed; retaining ring and packet memory");
         }
     }
+}
+
+/// Teardown-only PCIe master handshake. The full adapter path uses the
+/// translated `igc_disable_pcie_master_generic`; this narrow bus-only form is
+/// needed because `Drop` cannot borrow the NVM/PHY side of `I225RegisterIo`.
+fn stop_master_before_dma_free<B: IgcBus>(bus: &mut B) -> bool {
+    let Some(control_register) = regs::named("IGC_CTRL") else {
+        return false;
+    };
+    let Some(status_register) = regs::named("IGC_STATUS") else {
+        return false;
+    };
+    let Some(control) = bus.read(control_register) else {
+        return false;
+    };
+    if !bus.write(
+        control_register,
+        DeviceControl::new(control).with_master_disabled().raw(),
+    ) {
+        return false;
+    }
+    for _ in 0..bits::MASTER_DISABLE_TIMEOUT {
+        let Some(status) = bus.read(status_register) else {
+            return false;
+        };
+        if !DeviceStatus::new(status).master_enabled() {
+            return true;
+        }
+        bus.delay_us(2_000);
+    }
+    false
 }
 
 #[cfg(test)]
@@ -592,21 +797,6 @@ fn named(name: &str) -> regs::Register {
     regs::named(name).unwrap_or_else(|| panic!("{name} is not in the register table"))
 }
 
-/// Write a register, or fail.
-fn write<B: IgcBus>(bus: &mut B, name: &str, value: u32) -> DevResult {
-    let register = named(name);
-    if bus.write(register, value) {
-        Ok(())
-    } else {
-        Err(DevError::BadState)
-    }
-}
-
-/// Read a register, or fail.
-fn read<B: IgcBus>(bus: &mut B, name: &str) -> DevResult<u32> {
-    bus.read(named(name)).ok_or(DevError::BadState)
-}
-
 /// Allocate one DMA region and remember it for the teardown path.
 ///
 /// The region is allocated in whole pages, because that is the primitive the
@@ -637,79 +827,19 @@ fn allocate<H: IgcHal>(size: usize, align: usize) -> DevResult<Allocation<H>> {
     })
 }
 
-/// Program the receive and transmit control registers
-/// (`igc_setup_rctl` and `igc_setup_tctl`, `igc_main.c:835`, `:882`), and the
-/// long-packet bound.
-fn enable_mac<H: IgcHal>(bus: &mut WindowBus<H>) -> DevResult {
-    write(bus, "IGC_RCTL", ReceiveControl::setup_value().raw())?;
-    // The long-packet bound is the size of the buffers this driver gives the
-    // hardware, not the vendor driver's jumbo bound
-    // (`MAX_JUMBO_FRAME_SIZE`, `igc_defines.h:147`): a receive limit larger
-    // than the buffer a frame is written into is a limit this driver cannot
-    // honour.
-    write(bus, "IGC_RLPML", RX_PACKET_BYTES)?;
-    let current = read(bus, "IGC_TCTL")?;
-    write(bus, "IGC_TCTL", TransmitControl::setup_value(current).raw())?;
-    Ok(())
-}
-
-/// Program the transmit ring, the way `igc_configure_tx_ring` does
-/// (`igc_main.c:728-758`).
-fn configure_transmit<H: IgcHal>(
-    bus: &mut WindowBus<H>,
-    descriptors: u64,
-    length: RingLength,
-) -> DevResult {
-    write(bus, "IGC_TXDCTL(0)", QueueControl::disabled().raw())?;
-    write(bus, "IGC_TDLEN(0)", length.bytes())?;
-    let base = RingBase::new(descriptors);
-    write(bus, "IGC_TDBAL(0)", base.low())?;
-    write(bus, "IGC_TDBAH(0)", base.high())?;
-    write(bus, "IGC_TDH(0)", 0)?;
-    write(bus, "IGC_TDT(0)", 0)?;
-    write(
-        bus,
-        "IGC_TXDCTL(0)",
-        QueueControl::transmit_defaults().with_queue_enable().raw(),
-    )?;
-    Ok(())
-}
-
-/// Program the receive ring, the way `igc_configure_rx_ring` does
-/// (`igc_main.c:625-702`).
-fn configure_receive<H: IgcHal>(
-    bus: &mut WindowBus<H>,
-    descriptors: u64,
-    length: RingLength,
-) -> DevResult {
-    write(bus, "IGC_RXDCTL(0)", QueueControl::disabled().raw())?;
-    let base = RingBase::new(descriptors);
-    write(bus, "IGC_RDBAL(0)", base.low())?;
-    write(bus, "IGC_RDBAH(0)", base.high())?;
-    write(bus, "IGC_RDLEN(0)", length.bytes())?;
-    write(bus, "IGC_RDH(0)", 0)?;
-    write(bus, "IGC_RDT(0)", 0)?;
-    write(
-        bus,
-        "IGC_SRRCTL(0)",
-        SplitReceiveControl::one_buffer(RX_PACKET_BYTES, RX_HEADER_BYTES as u32).raw(),
-    )?;
-    write(
-        bus,
-        "IGC_RXDCTL(0)",
-        QueueControl::receive_defaults().with_queue_enable().raw(),
-    )?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use alloc::vec;
 
     use super::*;
     use crate::igc::{
+        api::{
+            IgcApiBackend, IgcApiCallback, IgcApiRequest, IgcApiValue, IgcHardware,
+            igc_setup_init_funcs,
+        },
         desc::RX_BUFFER_BYTES,
         fake::{FakeBus, FakeHal},
+        i225::{init_mac_params_i225, init_nvm_params_i225},
         regs::{self as regs, RegisterWindow, WINDOW_BYTES, bits},
     };
 
@@ -728,6 +858,27 @@ mod tests {
             high: 0x8000_u32 | u32::from(MAC[4]) | (u32::from(MAC[5]) << 8),
             address_valid: true,
         }
+    }
+
+    struct NoInitCallbacks;
+
+    impl IgcApiBackend for NoInitCallbacks {
+        fn invoke(
+            &mut self,
+            _callback: IgcApiCallback,
+            _request: IgcApiRequest,
+        ) -> DevResult<IgcApiValue> {
+            Err(DevError::Unsupported)
+        }
+    }
+
+    fn source_hardware() -> IgcHardware {
+        let mut hw = IgcHardware::new(0x15f3, true);
+        let mut callbacks = NoInitCallbacks;
+        igc_setup_init_funcs(&mut hw, &mut callbacks, false).expect("I225 callback tables");
+        init_mac_params_i225(&mut hw);
+        init_nvm_params_i225(&mut hw, 0, false);
+        hw
     }
 
     /// The device's aperture, the driver, and the plumbing a test needs to
@@ -758,7 +909,8 @@ mod tests {
                     WINDOW_BYTES,
                 ))
             };
-            let nic = IgcNic::<FakeHal, QS>::init(bus, &station()).expect("the rings come up");
+            let nic = IgcNic::<FakeHal, QS>::init(bus, &station(), source_hardware())
+                .expect("the rings come up");
             Self { aperture, nic }
         }
 
@@ -850,21 +1002,31 @@ mod tests {
         );
         assert_eq!(
             harness.register("IGC_TXDCTL(0)"),
-            QueueControl::transmit_defaults().with_queue_enable().raw(),
+            0x0200_0108,
+            "FreeBSD igc_initialize_transmit_unit sets only PTHRESH/HTHRESH and enable",
         );
         assert_eq!(
             harness.register("IGC_RXDCTL(0)"),
             QueueControl::receive_defaults().with_queue_enable().raw(),
         );
-        // The receive control value, and the long-packet bound the driver
-        // chose: its own buffer size, not the vendor's jumbo bound.
-        assert_eq!(harness.register("IGC_RCTL"), 0x0400_8022);
-        assert_eq!(harness.register("IGC_RLPML"), RX_BUFFER_BYTES as u32);
+        // The source initializes ordinary MTU receive control and does not
+        // write RLPML until jumbo MTU is requested.
+        assert_eq!(harness.register("IGC_RCTL"), 0x0400_8002);
+        assert_eq!(
+            harness.register("IGC_RLPML"),
+            0,
+            "source writes RLPML only for jumbo MTU"
+        );
+        assert_eq!(
+            harness.register("IGC_RXCSUM"),
+            0,
+            "single queue disables checksum offload"
+        );
         assert_eq!(harness.register("IGC_TCTL"), 0x0100_00fa);
         assert_eq!(
             harness.register("IGC_SRRCTL(0)"),
-            (4 << 8) | 2 | (1 << 25),
-            "BSIZEHDR(256) | BSIZEPKT(2 KiB) | DESCTYPE_ADV_ONEBUF",
+            2 | (1 << 25),
+            "BSIZEPKT(2 KiB) | DESCTYPE_ADV_ONEBUF",
         );
         // The tail: one short of the ring, which is what hands the filled
         // descriptors to the hardware.
@@ -882,6 +1044,11 @@ mod tests {
                 harness.descriptor_address(rx_descriptors, index),
                 expected,
                 "descriptor {index}",
+            );
+            let shadow = harness.nic.rx_source_state.desc[index];
+            assert_eq!(
+                u64::from(shadow[0]) | (u64::from(shadow[1]) << 32),
+                expected
             );
             // The length field is clear, so a stale value cannot look like a
             // frame.
@@ -1062,6 +1229,28 @@ mod tests {
     }
 
     #[test]
+    fn live_transmit_uses_the_translated_freebsd_data_descriptor_builder() {
+        let mut harness = Harness::new();
+        let (tx_descriptors, ..) = harness.regions();
+        let buffer = harness.nic.alloc_tx_buffer(64).unwrap();
+        let slot = harness.nic.transmit_slot(&buffer).unwrap();
+        let expected_address = harness.nic.tx_pool.bus_address(slot).unwrap();
+        harness.nic.transmit(buffer).unwrap();
+        assert_eq!(
+            harness.descriptor_address(tx_descriptors, 0),
+            expected_address
+        );
+        let command = harness.word(tx_descriptors, 2 * 4);
+        assert_eq!(command & 0x0030_0000, 0x0030_0000); // advanced data type
+        assert_eq!(
+            command & (0x0100_0000 | 0x0200_0000 | 0x0800_0000 | 0x2000_0000),
+            0x0100_0000 | 0x0200_0000 | 0x0800_0000 | 0x2000_0000
+        );
+        assert_eq!(command & 0xffff, 64);
+        assert_eq!(harness.word(tx_descriptors, 3 * 4), 64 << 14);
+    }
+
+    #[test]
     fn allocated_transmit_buffers_reserve_descriptor_capacity() {
         let mut harness = Harness::new();
         let buffers: Vec<_> = (0..QS - 1)
@@ -1123,37 +1312,49 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_receive_descriptor_is_dropped_and_the_ring_moves_on() {
+    fn an_incomplete_receive_descriptor_waits_for_end_of_packet() {
         let mut harness = Harness::new();
         let (_, rx_descriptors, ..) = harness.regions();
-        // A length with no end-of-packet bit: this driver's single-buffer
-        // receive path cannot assemble a split packet, so the descriptor is
-        // dropped rather than handed to the stack as a fragment.
+        // A descriptor without EOP can be the first fragment of an upstream
+        // multi-descriptor packet, so wait rather than consuming it early.
         harness.receive_frame(0, 64, bits::RXD_STAT_DD);
         assert!(matches!(harness.nic.receive(), Err(DevError::Again)));
-        assert_eq!(harness.nic.stats().rx_dropped, 1);
+        assert_eq!(harness.nic.stats().rx_dropped, 0);
         assert!(!harness.nic.can_receive());
-        // The descriptor was given back to the ring: its buffer is armed in
-        // the descriptor at the tail, and the tail moved.
-        assert_eq!(harness.nic.stats().rx_recycled, 0);
-        assert_eq!(
-            harness.descriptor_address(rx_descriptors, QS - 1),
-            harness.regions().3.as_ptr() as u64,
-        );
+        assert_eq!(harness.register("IGC_RDT(0)"), (QS - 1) as u32);
+        assert_ne!(harness.descriptor_address(rx_descriptors, 0), 0);
+    }
+
+    #[test]
+    fn unsupported_multi_descriptor_packet_is_dropped_as_one_packet() {
+        let mut harness = Harness::new();
+        harness.receive_frame(0, 32, bits::RXD_STAT_DD);
+        harness.receive_frame(1, 32, bits::RXD_STAT_DD | bits::RXD_STAT_EOP);
+        assert!(harness.nic.can_receive());
+        assert!(matches!(harness.nic.receive(), Err(DevError::Again)));
+        assert_eq!(harness.nic.stats().rx_dropped, 1);
+        assert_eq!(harness.nic.stats().received, 0);
+        assert_eq!(harness.register("IGC_RDT(0)"), 1);
+    }
+
+    #[test]
+    fn source_reported_receive_error_is_reclaimed_without_delivery() {
+        let mut harness = Harness::new();
+        harness.receive_frame(0, 60, bits::RXD_STAT_DD | bits::RXD_STAT_EOP | 0x8000_0000);
+        assert!(harness.nic.can_receive());
+        assert!(matches!(harness.nic.receive(), Err(DevError::Again)));
+        assert_eq!(harness.nic.stats().rx_dropped, 1);
+        assert_eq!(harness.nic.stats().received, 0);
         assert_eq!(harness.register("IGC_RDT(0)"), 0);
     }
 
     #[test]
-    fn a_length_without_the_done_bit_is_still_received_and_counted() {
-        // The vendor driver's hot path treats a non-zero length as "written
-        // back" and never looks at the done bit; this driver does the same and
-        // reports the difference, so that a part which does not set it is
-        // visible rather than a ring that never delivers anything.
+    fn a_length_without_the_done_bit_is_not_available_to_the_source_packet_parser() {
         let mut harness = Harness::new();
         harness.receive_frame(0, 60, bits::RXD_STAT_EOP);
-        let received = harness.nic.receive().expect("a frame");
-        assert_eq!(received.packet_len(), 60);
-        assert_eq!(harness.nic.stats().rx_without_done, 1);
+        assert!(!harness.nic.can_receive());
+        assert!(matches!(harness.nic.receive(), Err(DevError::Again)));
+        assert_eq!(harness.nic.stats().received, 0);
     }
 
     #[test]
@@ -1162,6 +1363,16 @@ mod tests {
         assert_eq!(harness.nic.device_name(), DEVICE_NAME);
         assert_eq!(harness.nic.device_type(), DeviceType::Net);
         assert_eq!(harness.nic.mac_address().0, MAC);
+        assert_eq!(
+            harness.nic.shared_hardware().mac_type,
+            Some(super::super::api::IgcMacType::I225)
+        );
+        assert_eq!(harness.nic.shared_hardware().mac_info.rar_entry_count, 16);
+        assert_eq!(harness.nic.shared_hardware().nvm_info.word_size, 64);
+        assert_eq!(
+            harness.nic.shared_hardware().nvm_info.nvm_type,
+            super::super::api::IgcNvmType::Invm
+        );
         assert_eq!(harness.nic.rx_queue_size(), QS);
         assert_eq!(harness.nic.tx_queue_size(), QS);
         // The device is ready to transmit and has nothing to receive.
@@ -1185,7 +1396,8 @@ mod tests {
                     WINDOW_BYTES,
                 ))
             };
-            let nic = IgcNic::<FakeHal, QS>::init(bus, &station()).expect("the rings come up");
+            let nic = IgcNic::<FakeHal, QS>::init(bus, &station(), source_hardware())
+                .expect("the rings come up");
             assert_eq!(FakeHal::live_allocations(), 4);
             drop(nic);
         }
@@ -1213,7 +1425,7 @@ mod tests {
             ))
         };
         assert!(matches!(
-            IgcNic::<FakeHal, 1>::init(bus, &station()),
+            IgcNic::<FakeHal, 1>::init(bus, &station(), source_hardware()),
             Err(DevError::InvalidParam)
         ));
         assert_eq!(FakeHal::live_allocations(), 0, "nothing was leaked");
@@ -1248,7 +1460,7 @@ mod tests {
                 ))
             };
             assert!(matches!(
-                IgcNic::<FailAfter<N>, QS>::init(bus, &station()),
+                IgcNic::<FailAfter<N>, QS>::init(bus, &station(), source_hardware()),
                 Err(DevError::NoMemory)
             ));
             assert_eq!(

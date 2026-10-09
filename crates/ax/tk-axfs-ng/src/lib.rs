@@ -64,7 +64,26 @@ pub(crate) fn account_backing_read(_bytes: usize) {}
 pub(crate) fn account_backing_write(_bytes: usize) {}
 
 mod block_inventory;
-pub use block_inventory::{block_inventory, BlockInventoryEntry};
+pub use block_inventory::{
+    add_block_device, block_device_media_presence_capable, block_inventory,
+    install_block_device_change_hook,
+    remove_absent_media_devices, remove_block_device,
+    rescan_gpt_partitions, BlockDeviceChangeAction, BlockDeviceChangeHook, BlockInventoryEntry,
+    PartitionRescanError,
+};
+
+fn publish_runtime_block_add(device: AxBlockDevice) -> bool {
+    match add_block_device(device) {
+        Ok(name) => {
+            info!("published runtime block device /dev/{name}");
+            true
+        }
+        Err(error) => {
+            warn!("runtime block device publication deferred: {error:?}");
+            false
+        }
+    }
+}
 
 mod fs;
 #[cfg(feature = "btrfs")]
@@ -664,6 +683,23 @@ pub fn block_device_statistics(name: &str) -> Option<axdriver::block_statistics:
     device.statistics()
 }
 
+/// Stable shared-queue identity for validating already-open block nodes after
+/// registry removal or same-name replacement.
+pub fn block_device_identity_token(name: &str) -> Option<usize> {
+    let device = if name == ROOT_BLOCK_DEVICE_NAME {
+        ROOT_BLOCK_DEVICE.get()?.device.clone()
+    } else {
+        EXTRA_BLOCK_DEVICES
+            .get()?
+            .lock()
+            .iter()
+            .find(|entry| entry.name == name)?
+            .device
+            .clone()
+    };
+    Some(device.identity_token())
+}
+
 pub fn root_block_device_info() -> Option<BlockDeviceInfo> {
     ROOT_BLOCK_DEVICE.get().map(|entry| entry.info)
 }
@@ -860,16 +896,88 @@ pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
     // or else the runner's rootfs image (vda), precedes any data image (vdb).
     // Do not infer root identity from capacity; a perfectly valid data disk
     // may be larger than the rootfs image.
-    let root_index = if axhal::boot::command_line_value("root") == Some("usb") {
-        // Fail closed: never mount the first internal disk if USB-root discovery fails.
-        block_devs.iter().position(|dev| dev.device_name() == "USB rootfs")
-            .expect("root=usb requested but no validated USB GPT root partition was found")
-    } else { 0 };
+    let root_index = {
+        let names: Vec<&str> = block_devs.iter().map(|dev| dev.device_name()).collect();
+        select_root_index(&names, axhal::boot::command_line_value("root"))
+    };
     let dev = block_devs.remove(root_index);
     if axdriver::block_device_is_read_only(&dev) {
         init_filesystems_with_root_read_only(dev, block_devs);
     } else {
         init_filesystems_with_root(dev, block_devs);
+    }
+}
+
+/// Returns the position of the root block device among `names`, the discovered
+/// device names in discovery order.
+///
+/// Precedence:
+/// 1. `root=usb` fails closed on the validated USB GPT root.
+/// 2. An explicit `root=<name>` (optionally `/dev/`-prefixed) selects the device
+///    with that driver name. `vda`, the registry name the root always receives,
+///    selects the default choice below. An unmatched name logs a warning and
+///    falls through, as configurations without a matching device always did.
+/// 3. The first device that is not an AHCI (`sd*`) or SDHCI (`mmcblk*`) disk.
+///    Those controllers are default-on and can enumerate before the rootfs
+///    disk, so discovery position alone is not a root identity. When only such
+///    disks exist, position 0 is used, as before.
+fn select_root_index(names: &[&str], root_arg: Option<&str>) -> usize {
+    if root_arg == Some("usb") {
+        // Fail closed: never mount the first internal disk if USB-root discovery fails.
+        return names
+            .iter()
+            .position(|name| *name == "USB rootfs")
+            .expect("root=usb requested but no validated USB GPT root partition was found");
+    }
+    if let Some(requested) = root_arg.map(|arg| arg.strip_prefix("/dev/").unwrap_or(arg))
+        && requested != ROOT_BLOCK_DEVICE_NAME
+    {
+        if let Some(index) = names.iter().position(|name| *name == requested) {
+            return index;
+        }
+        warn!("root={requested} matches no block device; using default root selection");
+    }
+    names
+        .iter()
+        .position(|name| !(name.starts_with("sd") || name.starts_with("mmcblk")))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod root_selection_tests {
+    use super::select_root_index;
+
+    #[test]
+    fn default_root_skips_hotplug_sata_and_sdhci_disks() {
+        // AHCI enumerated before virtio: the virtio rootfs must still win.
+        assert_eq!(select_root_index(&["sda", "virtio-blk"], None), 1);
+        assert_eq!(select_root_index(&["mmcblk0", "nvme0n1"], None), 1);
+        assert_eq!(select_root_index(&["sda", "mmcblk0p1", "sdb"], None), 0);
+    }
+
+    #[test]
+    fn default_root_keeps_position_zero_when_no_legacy_device_exists() {
+        assert_eq!(select_root_index(&["virtio-blk", "sda"], None), 0);
+        assert_eq!(select_root_index(&["sda", "sdb"], None), 0);
+        assert_eq!(select_root_index(&["vda"], Some("vda")), 0);
+    }
+
+    #[test]
+    fn explicit_root_name_selects_matching_device() {
+        let names = ["virtio-blk", "sda", "mmcblk0"];
+        assert_eq!(select_root_index(&names, Some("sda")), 1);
+        assert_eq!(select_root_index(&names, Some("/dev/mmcblk0")), 2);
+        assert_eq!(select_root_index(&names, Some("vda")), 0);
+    }
+
+    #[test]
+    fn explicit_root_name_without_match_uses_default() {
+        assert_eq!(select_root_index(&["sda", "virtio-blk"], Some("/dev/sdz")), 1);
+    }
+
+    #[test]
+    fn usb_root_selects_validated_usb_partition() {
+        assert_eq!(select_root_index(&["sda", "USB rootfs"], Some("usb")), 1);
     }
 }
 
@@ -931,7 +1039,7 @@ fn init_filesystems_with_root_mode(
             extra_device_name(index)
         );
         let read_only = axdriver::block_device_is_read_only(&dev);
-        let name = if dev.device_name().starts_with("nvme") {
+        let name = if dev.device_name().starts_with("nvme") || dev.device_name().starts_with("sd") || dev.device_name().starts_with("mmcblk") {
             String::from(dev.device_name())
         } else { extra_device_name(index) };
         let removable = axdriver::block_device_removable(&dev);
@@ -968,6 +1076,14 @@ fn init_filesystems_with_root_mode(
         index += 1;
     }
     EXTRA_BLOCK_DEVICES.call_once(|| Mutex::new(extras));
+    // A conflicting owner only loses runtime hotplug publication; the boot
+    // root must still mount, so this warns rather than aborting.
+    if !axdriver::install_runtime_block_add_hook(publish_runtime_block_add) {
+        warn!(
+            "runtime block add hook already owned by a different registry; \
+             hotplugged block devices will not be published"
+        );
+    }
 
     let root_device = open_block_device(ROOT_BLOCK_DEVICE_NAME)
         .expect("failed to claim root block device for filesystem mount");

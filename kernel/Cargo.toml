@@ -16,6 +16,9 @@ workspace = true
 [features]
 intel-hda = ["axfeat/driver-intel-hda"]
 nvme = ["axfeat/driver-nvme"]
+ahci = ["axfeat/driver-ahci", "axdriver/ahci-pci"]
+e1000 = ["axfeat/driver-e1000", "axdriver/e1000"]
+sdhci = ["axfeat/driver-sdhci", "axdriver/sdhci-pci"]
 usb-dbc = ["axfeat/driver-usb-dbc", "axdriver/usb-dbc"]
 watchdog-itco = ["axfeat/driver-itco", "axdriver/itco"]
 bpf = ["dep:axbpf", "dep:tk-linux-bpf", "perf-sampling"]
@@ -71,7 +74,7 @@ axfeat = { workspace = true, features = [
 axalloc.workspace = true
 axconfig.workspace = true
 axdisplay.workspace = true
-axdriver = { workspace = true, features = ["virtio-sound"] }
+axdriver = { workspace = true, features = ["virtio-sound", "i2c"] }
 axdriver_display.workspace = true
 axfs = { workspace = true, features = ["task-io-accounting", "nfs41"] }
 axhal = { workspace = true, features = ["fp-simd", "pkeys"] }
@@ -200,3 +203,9 @@ layer = "integration"
 
 [dependencies.tk-acpica]
 path = "../crates/ax/tk-acpica"
+
+[dependencies.tk-i2c]
+path = "../crates/ax/tk-i2c"
+
+[dependencies.tk-vtd]
+path = "../crates/ax/tk-vtd"

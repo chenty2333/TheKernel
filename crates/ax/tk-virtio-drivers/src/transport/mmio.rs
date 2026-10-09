@@ -1,17 +1,17 @@
 //! MMIO transport for VirtIO.
 
-use super::{DeviceStatus, DeviceType, Transport};
-use crate::{
-    align_up,
-    queue::Descriptor,
-    volatile::{volread, volwrite, ReadOnly, Volatile, WriteOnly},
-    Error, PhysAddr, PAGE_SIZE,
-};
 use core::{
     convert::{TryFrom, TryInto},
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},
     ptr::NonNull,
+};
+
+use super::{DeviceStatus, DeviceType, Transport};
+use crate::{
+    Error, PAGE_SIZE, PhysAddr, align_up,
+    queue::Descriptor,
+    volatile::{ReadOnly, Volatile, WriteOnly, volread, volwrite},
 };
 
 const MAGIC_VALUE: u32 = 0x7472_6976;
@@ -341,6 +341,13 @@ impl Transport for MmioTransport {
         }
     }
 
+    fn common_features(&self) -> u64 {
+        match self.version {
+            MmioVersion::Legacy => 0,
+            MmioVersion::Modern => (1 << 32) | (1 << 33),
+        }
+    }
+
     fn write_driver_features(&mut self, driver_features: u64) {
         // Safe because self.header points to a valid VirtIO MMIO region.
         unsafe {
@@ -512,7 +519,8 @@ impl Transport for MmioTransport {
         if align_of::<T>() > 4 {
             // Panic as this should only happen if the driver is written incorrectly.
             panic!(
-                "Driver expected config space alignment of {} bytes, but VirtIO only guarantees 4 byte alignment.",
+                "Driver expected config space alignment of {} bytes, but VirtIO only guarantees 4 \
+                 byte alignment.",
                 align_of::<T>()
             );
         }

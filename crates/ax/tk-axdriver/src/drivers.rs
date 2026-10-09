@@ -15,6 +15,7 @@ pub(crate) enum BusProbeResult {
     NotMatched,
     Claimed,
     Device(AxDeviceEnum),
+    Devices(alloc::vec::Vec<AxDeviceEnum>),
 }
 
 pub trait DriverProbe {
@@ -163,5 +164,62 @@ cfg_if::cfg_if! {
                 None
             }
         }
+    }
+}
+
+// Appended PCI probe for Intel iwx. The full network/net80211 adapter follows.
+#[cfg(feature = "iwx")]
+pub struct IwxDriver;
+#[cfg(feature = "iwx")]
+impl DriverProbe for IwxDriver {
+    #[cfg(bus = "pci")]
+    fn probe_pci(
+        root: &mut axdriver_pci::PciRoot,
+        bdf: axdriver_pci::DeviceFunction,
+        info: &axdriver_pci::DeviceFunctionInfo,
+    ) -> BusProbeResult {
+        crate::iwx::probe(root, bdf, info)
+    }
+}
+
+#[cfg(feature = "ahci-pci")]
+pub struct AhciDriver;
+#[cfg(feature = "ahci-pci")]
+impl DriverProbe for AhciDriver {
+    #[cfg(bus = "pci")]
+    fn probe_pci(
+        root: &mut axdriver_pci::PciRoot,
+        bdf: axdriver_pci::DeviceFunction,
+        info: &axdriver_pci::DeviceFunctionInfo,
+    ) -> BusProbeResult {
+        crate::ahci::probe(root, bdf, info)
+    }
+}
+
+#[cfg(feature = "sdhci-pci")]
+pub struct SdhciDriver;
+#[cfg(feature = "sdhci-pci")]
+impl DriverProbe for SdhciDriver {
+    #[cfg(bus = "pci")]
+    fn probe_pci(
+        root: &mut axdriver_pci::PciRoot,
+        bdf: axdriver_pci::DeviceFunction,
+        info: &axdriver_pci::DeviceFunctionInfo,
+    ) -> BusProbeResult {
+        crate::sdhci::probe(root, bdf, info)
+    }
+}
+
+#[cfg(feature = "e1000")]
+pub struct E1000Driver;
+#[cfg(feature = "e1000")]
+impl DriverProbe for E1000Driver {
+    #[cfg(bus = "pci")]
+    fn probe_pci(
+        root: &mut axdriver_pci::PciRoot,
+        bdf: axdriver_pci::DeviceFunction,
+        info: &axdriver_pci::DeviceFunctionInfo,
+    ) -> BusProbeResult {
+        crate::e1000::probe(root, bdf, info)
     }
 }

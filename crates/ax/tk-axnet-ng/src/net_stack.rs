@@ -24,8 +24,8 @@ use spin::Once;
 
 use crate::{
     device::{
-        Device, DeviceStats, InterfaceInfo, InterfaceKind, LoopbackDevice, PacketSendProgress,
-        RxWakeSource, TapDevice, TapHandle, TunDevice, TunHandle, VethEnd,
+        Device, DeviceStats, InterfaceInfo, InterfaceKind, LoopbackDevice, PacketSendProgress, RxWakeSource,
+        TapDevice, TapHandle, TunDevice, TunHandle, VethEnd,
     },
     listen_table::ListenTable,
     packet::{
@@ -1394,6 +1394,129 @@ impl NetStack {
             self.poll_source.as_ref().wake();
         }
         Ok(())
+    }
+
+    /// Apply a Linux rfkill software block through the owning wireless driver.
+    pub fn set_wireless_rfkill_soft_blocked(&self, ifindex: u32, blocked: bool) -> AxResult {
+        {
+            let mut service = self.service.lock();
+            service
+                .router
+                .set_wireless_rfkill_soft_blocked(ifindex, blocked)?;
+        }
+        self.poll_source.as_ref().wake();
+        Ok(())
+    }
+
+    /// Start a station scan through the selected wireless driver.
+    pub fn trigger_wireless_scan(
+        &self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessScanRequest,
+    ) -> AxResult {
+        self.service
+            .lock()
+            .router
+            .trigger_wireless_scan(ifindex, request)?;
+        self.poll_source.as_ref().wake();
+        Ok(())
+    }
+
+    /// Abort a foreground scan through the selected wireless driver.
+    pub fn abort_wireless_scan(&self, ifindex: u32) -> AxResult {
+        self.service.lock().router.abort_wireless_scan(ifindex)?;
+        self.poll_source.as_ref().wake();
+        Ok(())
+    }
+
+    /// Start a station connection through the selected wireless driver.
+    pub fn connect_wireless(
+        &self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessConnectRequest,
+    ) -> AxResult {
+        self.service
+            .lock()
+            .router
+            .connect_wireless(ifindex, request)?;
+        self.poll_source.as_ref().wake();
+        Ok(())
+    }
+
+    /// Run one userspace-SME authentication exchange.
+    pub fn authenticate_wireless(
+        &self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessAuthenticateRequest,
+    ) -> AxResult<axdriver::prelude::WirelessSmeFrame> {
+        self.service
+            .lock()
+            .router
+            .authenticate_wireless(ifindex, request)
+    }
+
+    /// Run one userspace-SME association exchange.
+    pub fn associate_wireless(
+        &self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessAssociateRequest,
+    ) -> AxResult<axdriver::prelude::WirelessSmeFrame> {
+        self.service
+            .lock()
+            .router
+            .associate_wireless(ifindex, request)
+    }
+
+    /// Disconnect through the userspace-SME DEAUTHENTICATE/DISASSOCIATE path.
+    pub fn disconnect_wireless_sme(
+        &self,
+        ifindex: u32,
+        reason: u16,
+        disassociate: bool,
+    ) -> AxResult {
+        self.service
+            .lock()
+            .router
+            .disconnect_wireless_sme(ifindex, reason, disassociate)
+    }
+
+    /// Disconnect a station peer through the selected wireless driver.
+    pub fn disconnect_wireless(&self, ifindex: u32, reason: u16) -> AxResult {
+        self.service
+            .lock()
+            .router
+            .disconnect_wireless(ifindex, reason)?;
+        self.poll_source.as_ref().wake();
+        Ok(())
+    }
+
+    /// Return the current station peer for nl80211 GET_STATION.
+    pub fn wireless_station_info(
+        &self,
+        ifindex: u32,
+    ) -> AxResult<axdriver::prelude::WirelessStationInfo> {
+        self.service.lock().router.wireless_station_info(ifindex)
+    }
+
+    /// Apply or query a nl80211 temporal/group key through the selected radio.
+    pub fn wireless_key_operation(
+        &self,
+        ifindex: u32,
+        operation: axdriver::prelude::WirelessKeyOperation,
+        key: &axdriver::prelude::WirelessKeyConfig,
+    ) -> AxResult<Option<axdriver::prelude::WirelessKeyInfo>> {
+        self.service
+            .lock()
+            .router
+            .wireless_key_operation(ifindex, operation, key)
+    }
+
+    /// Snapshot scan records retained from firmware RX beacon/probe notifications.
+    pub fn wireless_scan_results(
+        &self,
+        ifindex: u32,
+    ) -> AxResult<Vec<axdriver::prelude::WirelessBssInfo>> {
+        self.service.lock().router.wireless_scan_results(ifindex)
     }
 
     /// Subscribes a bounded link-packet endpoint to this network namespace.

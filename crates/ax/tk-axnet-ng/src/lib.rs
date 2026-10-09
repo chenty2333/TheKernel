@@ -62,6 +62,41 @@ use smoltcp::wire::{EthernetAddress, Ipv4Cidr, Ipv6Cidr};
 pub use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 use spin::Once;
 
+pub use axdriver::prelude::{
+    WirelessAssociateRequest, WirelessAuthenticateRequest, WirelessBssInfo, WirelessConnectRequest,
+    WirelessDisconnectEvent, WirelessHtCapabilities, WirelessKeyConfig, WirelessKeyInfo,
+    WirelessKeyOperation, WirelessPhyCapabilities, WirelessScanEvent, WirelessScanRequest,
+    WirelessSmeFrame, WirelessStationInfo, WirelessVhtCapabilities,
+};
+
+static WIRELESS_SCAN_EVENT_CALLBACK: Once<fn(u32, WirelessScanEvent)> = Once::new();
+static WIRELESS_DISCONNECT_EVENT_CALLBACK: Once<fn(u32, WirelessDisconnectEvent)> = Once::new();
+
+/// Register the kernel nl80211 recipient for completed firmware scans.
+pub fn register_wireless_scan_event_callback(callback: fn(u32, WirelessScanEvent)) {
+    let _ = WIRELESS_SCAN_EVENT_CALLBACK.call_once(|| callback);
+}
+
+pub(crate) fn publish_wireless_scan_event(ifindex: u32, event: WirelessScanEvent) {
+    if let Some(callback) = WIRELESS_SCAN_EVENT_CALLBACK.get() {
+        callback(ifindex, event);
+    }
+}
+
+/// Register the kernel nl80211 recipient for unsolicited wireless disconnects.
+pub fn register_wireless_disconnect_event_callback(callback: fn(u32, WirelessDisconnectEvent)) {
+    let _ = WIRELESS_DISCONNECT_EVENT_CALLBACK.call_once(|| callback);
+}
+
+pub(crate) fn publish_wireless_disconnect_event(
+    ifindex: u32,
+    event: WirelessDisconnectEvent,
+) {
+    if let Some(callback) = WIRELESS_DISCONNECT_EVENT_CALLBACK.get() {
+        callback(ifindex, event);
+    }
+}
+
 use self::{
     consts::{GATEWAY, IP, IP_PREFIX},
     device::{EthernetDevice, LoopbackDevice},
@@ -88,6 +123,29 @@ pub use self::{
 pub const MAX_LISTEN_BACKLOG: usize = consts::LISTEN_QUEUE_SIZE;
 
 static DEFAULT_STACK: Once<Arc<NetStack>> = Once::new();
+
+/// One published 802.11 interface backed by an Ethernet-compatible netdev.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WirelessFrequencyInfo {
+    pub frequency_mhz: u32,
+    pub no_ir: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WirelessInterfaceInfo {
+    pub name: alloc::string::String,
+    pub ifindex: u32,
+    pub phy_index: u32,
+    pub rfkill_index: u32,
+    pub mac_address: [u8; 6],
+    pub frequencies: alloc::vec::Vec<WirelessFrequencyInfo>,
+    pub phy_capabilities: WirelessPhyCapabilities,
+    pub soft_blocked: bool,
+    pub hard_blocked: bool,
+}
+
+static WIRELESS_INTERFACES: spin::Mutex<alloc::vec::Vec<WirelessInterfaceInfo>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
 
 /// Returns a reference to the default (init) network stack.
 ///
@@ -205,6 +263,156 @@ pub fn init_network_loopback_only() -> AxResult<Arc<NetStack>> {
     let stack = NetStack::try_new_loopback_only()?;
     DEFAULT_STACK.call_once(|| stack.clone());
     Ok(stack)
+}
+
+/// Publish an Ethernet-compatible wireless NIC as a separately named link.
+///
+/// Runtime calls this after the ordinary network stack has started and after
+/// rootfs firmware callbacks have completed, so wireless firmware and the
+/// link's RX wake owner exist before the interface becomes visible.
+pub fn register_wireless_device(dev: AxNetDevice) -> AxResult<u32> {
+    let Some(name) = dev.interface_name() else {
+        return Err(AxError::InvalidInput);
+    };
+    if !dev.is_wireless() || name.is_empty() {
+        return Err(AxError::InvalidInput);
+    }
+    let mac_address = dev.mac_address().0;
+    let soft_blocked = dev.rfkill_soft_blocked();
+    let hard_blocked = dev.rfkill_hard_blocked();
+    let frequencies = dev
+        .wireless_frequencies()
+        .into_iter()
+        .map(|frequency| WirelessFrequencyInfo {
+            frequency_mhz: frequency.frequency_mhz,
+            no_ir: frequency.no_ir,
+        })
+        .collect();
+    let phy_capabilities = dev.wireless_phy_capabilities();
+    let stack = default_stack();
+    let interface = Box::new(EthernetDevice::new(
+        name.to_owned(),
+        dev,
+        Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0),
+    ));
+    let ifindex = stack.try_add_device(interface)?;
+    let mut interfaces = WIRELESS_INTERFACES.lock();
+    if interfaces.iter().any(|entry| entry.name == name) {
+        let _ = stack.remove_device(ifindex);
+        return Err(AxError::AlreadyExists);
+    }
+    if interfaces.try_reserve(1).is_err() {
+        let _ = stack.remove_device(ifindex);
+        return Err(AxError::NoMemory);
+    }
+    let phy_index = match interfaces.iter().map(|entry| entry.phy_index).max() {
+        Some(index) => match index.checked_add(1) {
+            Some(next) => next,
+            None => {
+                let _ = stack.remove_device(ifindex);
+                return Err(AxError::ResourceBusy);
+            }
+        },
+        None => 0,
+    };
+    interfaces.push(WirelessInterfaceInfo {
+        name: name.to_owned(),
+        ifindex,
+        phy_index,
+        rfkill_index: phy_index,
+        mac_address,
+        frequencies,
+        phy_capabilities,
+        soft_blocked,
+        hard_blocked,
+    });
+    Ok(ifindex)
+}
+
+/// Snapshot the wireless links published to init-net.
+pub fn wireless_interfaces() -> alloc::vec::Vec<WirelessInterfaceInfo> {
+    WIRELESS_INTERFACES.lock().clone()
+}
+
+/// Set the software RF-kill state for one published radio index.
+pub fn set_wireless_rfkill_soft_blocked(rfkill_index: u32, blocked: bool) -> AxResult {
+    let ifindex = WIRELESS_INTERFACES
+        .lock()
+        .iter()
+        .find(|interface| interface.rfkill_index == rfkill_index)
+        .map(|interface| interface.ifindex)
+        .ok_or(AxError::NoSuchDevice)?;
+    default_stack().set_wireless_rfkill_soft_blocked(ifindex, blocked)?;
+    let mut interfaces = WIRELESS_INTERFACES.lock();
+    let interface = interfaces
+        .iter_mut()
+        .find(|interface| interface.rfkill_index == rfkill_index)
+        .ok_or(AxError::NoSuchDevice)?;
+    interface.soft_blocked = blocked;
+    Ok(())
+}
+
+/// Trigger a scan through the named init-net wireless interface.
+pub fn trigger_wireless_scan(
+    ifindex: u32,
+    request: &WirelessScanRequest,
+) -> AxResult {
+    default_stack().trigger_wireless_scan(ifindex, request)
+}
+
+/// Abort the selected wireless interface's active foreground scan.
+pub fn abort_wireless_scan(ifindex: u32) -> AxResult {
+    default_stack().abort_wireless_scan(ifindex)
+}
+
+/// Begin a station connection through the named wireless netdev.
+pub fn connect_wireless(ifindex: u32, request: &WirelessConnectRequest) -> AxResult {
+    default_stack().connect_wireless(ifindex, request)
+}
+
+/// Run one userspace-SME authentication exchange.
+pub fn authenticate_wireless(
+    ifindex: u32,
+    request: &WirelessAuthenticateRequest,
+) -> AxResult<WirelessSmeFrame> {
+    default_stack().authenticate_wireless(ifindex, request)
+}
+
+/// Run one userspace-SME association exchange.
+pub fn associate_wireless(
+    ifindex: u32,
+    request: &WirelessAssociateRequest,
+) -> AxResult<WirelessSmeFrame> {
+    default_stack().associate_wireless(ifindex, request)
+}
+
+/// Disconnect through nl80211's userspace-SME deauth/disassoc command.
+pub fn disconnect_wireless_sme(ifindex: u32, reason: u16, disassociate: bool) -> AxResult {
+    default_stack().disconnect_wireless_sme(ifindex, reason, disassociate)
+}
+
+/// Disconnect a station peer through the named wireless netdev.
+pub fn disconnect_wireless(ifindex: u32, reason: u16) -> AxResult {
+    default_stack().disconnect_wireless(ifindex, reason)
+}
+
+/// Read the current station peer through the named wireless netdev.
+pub fn wireless_station_info(ifindex: u32) -> AxResult<WirelessStationInfo> {
+    default_stack().wireless_station_info(ifindex)
+}
+
+/// Apply or query a nl80211 station/group key on one wireless interface.
+pub fn wireless_key_operation(
+    ifindex: u32,
+    operation: WirelessKeyOperation,
+    key: &WirelessKeyConfig,
+) -> AxResult<Option<WirelessKeyInfo>> {
+    default_stack().wireless_key_operation(ifindex, operation, key)
+}
+
+/// Return BSS observations collected by the wireless driver's RX path.
+pub fn wireless_scan_results(ifindex: u32) -> AxResult<alloc::vec::Vec<WirelessBssInfo>> {
+    default_stack().wireless_scan_results(ifindex)
 }
 
 /// Init vsock subsystem by vsock devices.

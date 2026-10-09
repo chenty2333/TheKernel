@@ -730,6 +730,11 @@ workload rather than listing tools, which is what let the later `glibc` and
 `gcc` payloads — gated on the Phase 3 dynamic-glibc milestone — extend the
 enum without redesigning it.
 
+The separate `bluez` optional payload stages signed, version-pinned Alpine
+BlueZ/D-Bus runtime packages without changing the default image or the
+compiler/emulator milestones. Its acceptance case runs `bluetoothd -n`,
+`btmgmt info`, and `bluetoothctl list` in a guest with no HCI controller.
+
 | Concern | Existing mechanism | Required change |
 |---|---|---|
 | Build selection | `tools/thekernel.py::build_rootfs` calls `scripts/build-rootfs.sh` | Pass the same selection through build and test; install only that payload and choose sufficient image size |
