@@ -842,10 +842,7 @@ mod tests {
         // thing.  Pick the lowest genuinely unassigned bit instead, and when
         // the mask is saturated assert that saturation explicitly so this
         // test resumes probing the moment a lane is retired.
-        match (0..u8::BITS)
-            .map(|bit| 1u8 << bit)
-            .find(|bit| all & bit == 0)
-        {
+        match (0..u8::BITS).map(|bit| 1u8 << bit).find(|bit| all & bit == 0) {
             Some(unknown) => {
                 assert_eq!(super::visit_pending_reasons(unknown, |_| {}), Err(unknown));
             }
