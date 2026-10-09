@@ -432,6 +432,17 @@ sleep() { echo wait; }
         self.assertIn('[ -x "$target/usr/local/bin/intel-bcs-smoke" ]', rootfs_wrapper)
         self.assertFalse((ROOT / "tests/guest/graphics/intel-bcs-smoke.c").exists())
 
+    def test_n305_graphics_builder_reuses_base_and_optional_iris_guest_check(self) -> None:
+        builder = (ROOT / "scripts/build-n305-graphics-rootfs.sh").read_text()
+        self.assertIn('"$SOURCE/host/bin/x86_64-buildroot-linux-gnu-gcc"', builder)
+        self.assertIn('"$SOURCE/host/x86_64-buildroot-linux-gnu/sysroot"', builder)
+        self.assertIn('"$REPO/config/graphics/build-guest-tools.sh" "$OUT/stage"', builder)
+        self.assertIn('--mesa-iris-stage "$MESA_IRIS_STAGE"', builder)
+        self.assertIn('"$REPO/config/graphics/overlay/n305-iris-smoke/etc/init.d/S90n305-iris-smoke"', builder)
+        self.assertIn('"$OUT/stage/etc/thekernel/n305-iris-loader-smoke"', builder)
+        self.assertNotIn('"$OUT/stage/etc/init.d/n305-iris-loader-smoke"', builder)
+        self.assertIn("q35-graphics-seatd", builder)
+
     def test_graphics_smoke_hands_an_existing_rootfs_to_the_drive_transport_without_building(self) -> None:
         module = load_script_module("thekernel_product", "tools/thekernel.py")
         with test_tmpdir() as directory:

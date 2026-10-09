@@ -179,6 +179,25 @@ class SystemTestGateTests(unittest.TestCase):
                         product_state.rootfs_fingerprint()
                     os.environ[variable] = ""
 
+    def test_firmware_stager_is_shared_and_rootfs_fingerprinted(self) -> None:
+        from tools import product_state
+
+        self.assertIn("scripts/stage-rootfs-firmware.sh", product_state.ROOTFS_INPUT_FILES)
+        helper = REPO_ROOT / "scripts/stage-rootfs-firmware.sh"
+        self.assertTrue(helper.is_file())
+        self.assertTrue(os.access(helper, os.X_OK))
+        rootfs_builder = (REPO_ROOT / "scripts/build-rootfs.sh").read_text()
+        n305_builder = (REPO_ROOT / "scripts/build-n305-graphics-rootfs.sh").read_text()
+        self.assertIn('"$SCRIPT_DIR/stage-rootfs-firmware.sh" "$STAGE"', rootfs_builder)
+        self.assertIn('"$REPO/scripts/stage-rootfs-firmware.sh" "$OUT/stage"', n305_builder)
+        for variable in (
+            "THEKERNEL_RTL8168_FIRMWARE_DIR",
+            "THEKERNEL_IWX_FIRMWARE_DIR",
+            "THEKERNEL_I915_UC_FIRMWARE_DIR",
+            "THEKERNEL_I915_DMC_FIRMWARE_DIR",
+        ):
+            self.assertIn(variable, n305_builder)
+
     def test_toolchain_flag_selects_the_payload_over_the_environment(self) -> None:
         """`--toolchain` must reach the artifact layout, not be echoed away.
 

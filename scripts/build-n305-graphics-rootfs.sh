@@ -8,6 +8,20 @@ SOURCE=$(realpath "$1"); OUT=$(realpath -m "$2")
 case "$OUT" in /tmp/*|/dev/shm/*) echo "output must be under /home, not tmpfs" >&2; exit 2;; esac
 [[ "$OUT" != "$SOURCE" && "$OUT" != "$SOURCE"/* ]] || exit 2
 [[ -x "$SOURCE/host/bin/x86_64-buildroot-linux-gnu-gcc" && -f "$SOURCE/target/usr/lib/libSDL2.so" ]] || { echo "SDL2-enabled Buildroot output is required" >&2; exit 1; }
+for variable in \
+    THEKERNEL_RTL8168_FIRMWARE_DIR \
+    THEKERNEL_IWX_FIRMWARE_DIR \
+    THEKERNEL_I915_UC_FIRMWARE_DIR \
+    THEKERNEL_I915_DMC_FIRMWARE_DIR; do
+    [[ -n "${!variable:-}" ]] || { printf 'N305 graphics rootfs requires %s\n' "$variable" >&2; exit 2; }
+done
+
+MESA_IRIS_STAGE=${THEKERNEL_MESA_IRIS_STAGE:-}
+if [[ -n "$MESA_IRIS_STAGE" ]]; then
+    MESA_IRIS_STAGE=$(realpath -e "$MESA_IRIS_STAGE")
+    "$REPO/scripts/build-graphics-rootfs.sh" --flavor n305-iris-smoke --check \
+        --mesa-iris-stage "$MESA_IRIS_STAGE"
+fi
 mkdir -p "$OUT/stage"
 tar -C "$SOURCE/target" --exclude='./usr/lib/piglit' --exclude='./usr/bin/piglit' -cf - . | tar --no-same-owner -C "$OUT/stage" -xf -
 # User/group creation happens in Buildroot's fakeroot phase, after target/.
@@ -20,11 +34,22 @@ grep -q '^weston:' "$OUT/stage/etc/passwd" || { echo "completed image has no wes
 CC="$SOURCE/host/bin/x86_64-buildroot-linux-gnu-gcc"
 SYSROOT="$SOURCE/host/x86_64-buildroot-linux-gnu/sysroot"
 "$CC" -O2 -Wall -Wextra -Werror -I"$SYSROOT/usr/include/SDL2" "$REPO/config/graphics/n305-sdl-kms-smoke.c" -lSDL2 -o "$OUT/stage/usr/local/bin/n305-sdl-kms-smoke"
-install -m 0755 "$REPO/tests/guest/shell-init.sh" "$OUT/stage/etc/thekernel/shell-init.sh"
 install -m 0755 "$REPO/scripts/ci/n305-dhcp.script" "$OUT/stage/etc/thekernel/n305-dhcp.script"
 mkdir -p "$OUT/stage/opt/thekernel-tests/bin"
 "$CC" -O2 -Wall -Wextra -Werror "$REPO/tests/guest/tools/netconsole.c" -o "$OUT/stage/opt/thekernel-tests/bin/thekernel-netconsole"
 "$CC" -O2 -Wall -Wextra -Werror "$REPO/tests/guest/tools/usb-input-smoke.c" -o "$OUT/stage/opt/thekernel-tests/bin/thekernel-usb-input-smoke"
+HOST_DIR="$SOURCE/host" \
+STAGING_DIR="$SOURCE/host/x86_64-buildroot-linux-gnu/sysroot" \
+    "$REPO/config/graphics/build-guest-tools.sh" "$OUT/stage"
+"$REPO/scripts/stage-rootfs-firmware.sh" "$OUT/stage"
+if [[ -n "$MESA_IRIS_STAGE" ]]; then
+    install -m 0644 \
+        "$MESA_IRIS_STAGE/usr/lib/libgallium-26.1.2.so" \
+        "$OUT/stage/usr/lib/libgallium-26.1.2.so"
+    install -m 0755 \
+        "$REPO/config/graphics/overlay/n305-iris-smoke/etc/init.d/S90n305-iris-smoke" \
+        "$OUT/stage/etc/thekernel/n305-iris-loader-smoke"
+fi
 # No persistent home disk, audio device or Virgl dependency on the DUT.
 printf 'q35-graphics-seatd\n' > "$OUT/stage/etc/thekernel-graphics-flavor"
 : > "$OUT/stage/etc/default/weston"
