@@ -4798,7 +4798,7 @@ fn guc_send_invalidate_tlb(guc: &mut intel_guc, ty: intel_guc_tlb_invalidation_t
 }
 
 // upstream: intel_guc_submission.c intel_guc_invalidate_tlb_engines()
-fn intel_guc_invalidate_tlb_engines(guc: &mut intel_guc) -> i32 {
+pub(crate) fn intel_guc_invalidate_tlb_engines(guc: &mut intel_guc) -> i32 {
     guc_send_invalidate_tlb(
         guc,
         intel_guc_tlb_invalidation_type::INTEL_GUC_TLB_INVAL_ENGINES,

@@ -1933,3 +1933,11 @@ and GuC/HuC capacity checks.
 `intel_context_sseu_upstream.rs` translates all 3 definitions in Linux 7.2.3
 `drivers/gpu/drm/i915/gt/intel_context_sseu.c` (MIT, Copyright © 2019 Intel
 Corporation); it uses the source header's kernel-context request helper.
+
+`intel_tlb_upstream.rs` translates the 6 definitions in Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_tlb.c` (MIT, Copyright © 2023 Intel Corporation);
+its rate-limited diagnostic path uses a Linux-style five-second interval.
+
+`intel_tlb_upstream.rs` translates all 6 definitions in Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_tlb.c` (MIT, Copyright © 2023 Intel Corporation);
+its diagnostic path applies a monotonic five-second error rate limit.

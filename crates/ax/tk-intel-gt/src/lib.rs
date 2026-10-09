@@ -301,6 +301,9 @@ pub mod intel_guc_upstream;
 pub mod intel_huc_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_huc_fw_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_hwconfig_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
@@ -357,6 +360,9 @@ pub mod intel_sseu_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_timeline_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_tlb_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_timeline_upstream;
