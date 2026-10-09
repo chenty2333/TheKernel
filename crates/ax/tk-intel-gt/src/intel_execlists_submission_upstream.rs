@@ -802,7 +802,7 @@ unsafe fn __unwind_incomplete_requests(engine: *mut IntelEngineCs) -> *mut I915R
     let mut rq: *mut I915Request = core::ptr::null_mut();
     let mut rn: *mut I915Request;
     let mut active: *mut I915Request = core::ptr::null_mut();
-    let mut pl: *mut ListHead;
+    let mut pl: *mut ListHead = core::ptr::null_mut();
     let mut prio = I915_PRIORITY_INVALID;
 
     lockdep_assert_held!(&(*(*engine).sched_engine.cast::<I915SchedEngine>()).lock);
@@ -3517,7 +3517,12 @@ unsafe fn can_preempt(engine: *mut IntelEngineCs) -> bool {
 }
 
 // upstream: intel_execlists_submission.c kick_execlists()
-unsafe fn kick_execlists(rq: *const I915Request, prio: i32) {
+unsafe extern "C" fn i915_schedule_callback(rq: *mut I915Request, attr: *const I915SchedAttr) {
+    // SAFETY: the scheduler C callback supplies a live request and attribute.
+    unsafe { i915_schedule(rq, attr) };
+}
+
+unsafe extern "C" fn kick_execlists(rq: *const I915Request, prio: i32) {
     let engine = (*rq).engine;
     let sched_engine = (*engine).sched_engine.cast::<I915SchedEngine>();
     let mut inflight: *const I915Request;
@@ -3566,7 +3571,7 @@ unsafe fn kick_execlists(rq: *const I915Request, prio: i32) {
 // upstream: intel_execlists_submission.c execlists_set_default_submission()
 unsafe extern "C" fn execlists_set_default_submission(engine: *mut IntelEngineCs) {
     (*engine).submit_request = Some(execlists_submit_request);
-    (*(*engine).sched_engine.cast::<I915SchedEngine>()).schedule = Some(i915_schedule);
+    (*(*engine).sched_engine.cast::<I915SchedEngine>()).schedule = Some(i915_schedule_callback);
     (*(*engine).sched_engine.cast::<I915SchedEngine>()).kick_backend = Some(kick_execlists);
     (*(*engine).sched_engine.cast::<I915SchedEngine>())
         .tasklet
@@ -3830,7 +3835,7 @@ unsafe extern "C" fn rcu_virtual_context_destroy(wrk: *mut WorkStruct) {
     n = 0;
     while n < (*ve).num_siblings {
         let sibling = *(*ve).siblings.as_mut_ptr().add(n as usize);
-        let node = &mut (*ve).nodes[(*sibling).id as usize].rb;
+        let node = core::ptr::addr_of_mut!((*ve).nodes[(*sibling).id as usize].rb);
 
         if RB_EMPTY_NODE(node) {
             n += 1;
@@ -4189,7 +4194,7 @@ unsafe extern "C" fn execlists_create_virtual(
 
     (*ve).base.cops = &virtual_context_ops;
     (*ve).base.request_alloc = Some(execlists_request_alloc);
-    (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).schedule = Some(i915_schedule);
+    (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).schedule = Some(i915_schedule_callback);
     (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).kick_backend = Some(kick_execlists);
     (*ve).base.submit_request = Some(virtual_submit_request);
 
