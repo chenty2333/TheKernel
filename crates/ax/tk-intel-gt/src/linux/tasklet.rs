@@ -29,7 +29,7 @@ use core::{
 
 use kernel_guard::{NoPreempt, NoPreemptIrqSave};
 
-use crate::intel_context_upstream::TaskletStruct;
+use crate::i915_scheduler_types_upstream::TaskletStruct;
 
 pub(crate) const TASKLET_STATE_SCHED: u32 = 0;
 const TASKLET_STATE_RUN: u32 = 1;
@@ -42,8 +42,8 @@ const _: [(); core::mem::size_of::<usize>()] = [(); core::mem::size_of::<c_ulong
 const _: [(); core::mem::size_of::<Option<TaskletCallback>>()] =
     [(); core::mem::size_of::<Option<TaskletFunc>>()];
 
-pub type TaskletCallback = unsafe fn(*mut TaskletStruct);
-pub type TaskletFunc = unsafe fn(c_ulong);
+pub type TaskletCallback = unsafe extern "C" fn(*mut TaskletStruct);
+pub type TaskletFunc = unsafe extern "C" fn(c_ulong);
 
 /// Setup or task-context wait failed; no tasklet work is silently discarded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -349,7 +349,7 @@ pub unsafe fn try_tasklet_setup(
         (*tasklet).state = 0;
         (*tasklet).count.counter = 0;
         (*tasklet).use_callback = true;
-        (*tasklet).callback = Some(callback);
+        (*tasklet).callbacks.callback = Some(callback);
         (*tasklet).data = 0;
     }
     Ok(())
@@ -382,7 +382,7 @@ pub unsafe fn try_tasklet_init(
         (*tasklet).state = 0;
         (*tasklet).count.counter = 0;
         (*tasklet).use_callback = false;
-        (*tasklet).callback = callback_slot;
+        (*tasklet).callbacks.callback = callback_slot;
         (*tasklet).data = data;
     }
     Ok(())
@@ -688,7 +688,7 @@ fn tasklet_worker() {
             let (use_callback, callback, data) = unsafe {
                 (
                     (*tasklet).use_callback,
-                    ptr::read_volatile(ptr::addr_of!((*tasklet).callback)),
+                    ptr::read_volatile(ptr::addr_of!((*tasklet).callbacks.callback)),
                     (*tasklet).data,
                 )
             };

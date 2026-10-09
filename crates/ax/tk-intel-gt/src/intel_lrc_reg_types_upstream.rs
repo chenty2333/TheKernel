@@ -38,7 +38,7 @@ pub const GEN9_CTX_RING_MI_MODE: u32 = 0x54;
 macro_rules! ASSIGN_CTX_PDP {
     ($ppgtt:expr, $reg_state:expr,0) => {{
         let reg_state__ = $reg_state;
-        let addr__: u64 = i915_page_dir_dma_addr($ppgtt, 0);
+        let addr__: u64 = unsafe { $crate::intel_gtt_api_upstream::i915_page_dir_dma_addr($ppgtt, 0) };
         *reg_state__.add($crate::intel_lrc_reg_types_upstream::CTX_PDP0_UDW) =
             $crate::linux::bits::upper_32_bits(addr__);
         *reg_state__.add($crate::intel_lrc_reg_types_upstream::CTX_PDP0_LDW) =
@@ -46,7 +46,7 @@ macro_rules! ASSIGN_CTX_PDP {
     }};
     ($ppgtt:expr, $reg_state:expr,1) => {{
         let reg_state__ = $reg_state;
-        let addr__: u64 = i915_page_dir_dma_addr($ppgtt, 1);
+        let addr__: u64 = unsafe { $crate::intel_gtt_api_upstream::i915_page_dir_dma_addr($ppgtt, 1) };
         *reg_state__.add($crate::intel_lrc_reg_types_upstream::CTX_PDP1_UDW) =
             $crate::linux::bits::upper_32_bits(addr__);
         *reg_state__.add($crate::intel_lrc_reg_types_upstream::CTX_PDP1_LDW) =
@@ -54,7 +54,7 @@ macro_rules! ASSIGN_CTX_PDP {
     }};
     ($ppgtt:expr, $reg_state:expr,2) => {{
         let reg_state__ = $reg_state;
-        let addr__: u64 = i915_page_dir_dma_addr($ppgtt, 2);
+        let addr__: u64 = unsafe { $crate::intel_gtt_api_upstream::i915_page_dir_dma_addr($ppgtt, 2) };
         *reg_state__.add($crate::intel_lrc_reg_types_upstream::CTX_PDP2_UDW) =
             $crate::linux::bits::upper_32_bits(addr__);
         *reg_state__.add($crate::intel_lrc_reg_types_upstream::CTX_PDP2_LDW) =
@@ -62,7 +62,7 @@ macro_rules! ASSIGN_CTX_PDP {
     }};
     ($ppgtt:expr, $reg_state:expr,3) => {{
         let reg_state__ = $reg_state;
-        let addr__: u64 = i915_page_dir_dma_addr($ppgtt, 3);
+        let addr__: u64 = unsafe { $crate::intel_gtt_api_upstream::i915_page_dir_dma_addr($ppgtt, 3) };
         *reg_state__.add($crate::intel_lrc_reg_types_upstream::CTX_PDP3_UDW) =
             $crate::linux::bits::upper_32_bits(addr__);
         *reg_state__.add($crate::intel_lrc_reg_types_upstream::CTX_PDP3_LDW) =
@@ -77,7 +77,7 @@ macro_rules! ASSIGN_CTX_PML4 {
     ($ppgtt:expr, $reg_state:expr) => {{
         let reg_state__ = $reg_state;
         let ppgtt__ = $ppgtt;
-        let addr__: u64 = px_dma((*ppgtt__).pd);
+        let addr__: u64 = unsafe { $crate::intel_gtt_api_upstream::px_dma((*ppgtt__).pd) };
         *reg_state__.add($crate::intel_lrc_reg_types_upstream::CTX_PDP0_UDW) =
             $crate::linux::bits::upper_32_bits(addr__);
         *reg_state__.add($crate::intel_lrc_reg_types_upstream::CTX_PDP0_LDW) =
