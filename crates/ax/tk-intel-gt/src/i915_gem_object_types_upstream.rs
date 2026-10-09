@@ -41,10 +41,7 @@ use crate::{
 pub struct I915Frontbuffer {
     _opaque: [u8; 0],
 }
-#[repr(C)]
-pub struct VmOperationsStruct {
-    _opaque: [u8; 0],
-}
+pub use crate::linux::mm::VmOperationsStruct;
 #[repr(C)]
 pub struct TtmResource {
     _opaque: [u8; 0],

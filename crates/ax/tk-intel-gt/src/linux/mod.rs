@@ -31,6 +31,9 @@ pub(crate) use iosys_map::{IosysMap, IosysMapAddr};
 pub(crate) mod irq;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub(crate) mod mm;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub(crate) mod page;
 pub(crate) mod primitives;
 pub(crate) mod rbtree;
