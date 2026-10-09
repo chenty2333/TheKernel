@@ -25,6 +25,10 @@ evidence of AUX transport.
 data dwords from the MIT `intel_dp_aux_regs.h` table. The rollback transaction
 classifies these AUX command/data registers as transient and leaves restoration
 to the AUX state machine's status clearing.
+This A/B-only mapping must not be reused for TC1/TC2: their DKL PHY AUX path
+requires a different source-confirmed channel register and power-reference
+mapping, which is not present yet. In particular, the DKL DP PHY signal-level
+hooks alone do not make AUX transport or link training safe for DP-alt mode.
 The upstream debugfs-independent AUX helpers are translated; framework calls
 are represented by the adapter rather than importing DRM AUX infrastructure.
 
