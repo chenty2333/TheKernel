@@ -132,6 +132,7 @@ fn irq_with(
     address: Address,
     header: &[u8; 64],
     mut read: impl FnMut(Address, usize) -> Option<u32>,
+    mut resolve_remapped: impl FnMut(Address, u64, u32) -> Option<u32>,
 ) -> Option<u32> {
     // Linux pci-sysfs irq_show uses the primary MSI IRQ when MSI is enabled,
     // but retains legacy INTx for MSI-X. Read the actual message vector; do
@@ -143,7 +144,22 @@ fn irq_with(
             if data_offset > 252 {
                 return None;
             }
-            let vector = read(address, data_offset)? & 0xff;
+            let low = read(address, position + 4)?;
+            let high = if control & 0x80 != 0 {
+                read(address, position + 8)?
+            } else {
+                0
+            };
+            let data = read(address, data_offset)? & 0xffff;
+            let vector = if low & (1 << 4) != 0 {
+                // VT-d remappable MSI format: Data contains a subhandle,
+                // not an APIC vector (IRTE zero commonly means Data zero).
+                // Only the published interrupt owner can resolve it; match
+                // requester and full message, never expose the IRTE index.
+                resolve_remapped(address, u64::from(low) | (u64::from(high) << 32), data)?
+            } else {
+                data & 0xff
+            };
             return (0x20..0xf0).contains(&vector).then_some(vector);
         }
     }
@@ -158,7 +174,31 @@ fn irq_with(
 }
 
 pub fn irq(address: Address) -> Option<u32> {
-    irq_with(address, &header(address)?, word)
+    irq_with(
+        address,
+        &header(address)?,
+        word,
+        |address, message, data| {
+            #[cfg(feature = "vtd")]
+            {
+                let requester = tk_vtd::PciRequester {
+                    segment: address.segment,
+                    bus: address.bus,
+                    device: address.device,
+                    function: address.function,
+                };
+                tk_vtd::platform_msi_vector(requester, message, data)
+                    .ok()
+                    .flatten()
+                    .map(u32::from)
+            }
+            #[cfg(not(feature = "vtd"))]
+            {
+                let _ = (address, message, data);
+                None
+            }
+        },
+    )
 }
 
 fn config_size(address: Address, header: &[u8; 64]) -> usize {
@@ -237,6 +277,53 @@ pub fn read_configuration(address: Address, offset: usize, output: &mut [u8]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn legacy_irq_with(
+        address: Address,
+        header: &[u8; 64],
+        read: impl FnMut(Address, usize) -> Option<u32>,
+    ) -> Option<u32> {
+        irq_with(address, header, read, |_, _, _| None)
+    }
+
+    #[test]
+    fn remapped_msi_resolves_the_owned_vector_not_the_message_subhandle() {
+        let address = Address::parse("0000:00:1f.2").unwrap();
+        let mut header = [0; 64];
+        header[6] = 0x10;
+        header[0x34] = 0x50;
+        for wide in [false, true] {
+            let message = 0xfee0_0018u64; // remappable, SHV, IRTE 0
+            let read = |_: Address, at| {
+                Some(match at {
+                    0x50 => {
+                        if wide {
+                            0x0081_0005
+                        } else {
+                            0x0001_0005
+                        }
+                    }
+                    0x54 => message as u32,
+                    0x58 | 0x5c => 0, // high address / zero subhandle
+                    _ => panic!("unexpected MSI read"),
+                })
+            };
+            let mut resolved = false;
+            assert_eq!(
+                irq_with(address, &header, read, |requester, observed, data| {
+                    assert_eq!(requester, address);
+                    assert_eq!(observed, message);
+                    assert_eq!(data, 0);
+                    resolved = true;
+                    Some(0xee)
+                }),
+                Some(0xee)
+            );
+            assert!(resolved);
+            assert_eq!(irq_with(address, &header, read, |_, _, _| None), None);
+            assert_eq!(irq_with(address, &header, read, |_, _, _| Some(0xf0)), None);
+        }
+    }
+
     #[test]
     fn irq_selects_primary_msi_and_retains_intx_for_msix_or_disabled_msi() {
         let address = Address::parse("0000:00:01.0").unwrap();
@@ -244,44 +331,49 @@ mod tests {
         header[0x3c] = 11;
         header[0x3d] = 1;
         assert_eq!(
-            irq_with(address, &header, |_, _| panic!("no capabilities")),
+            legacy_irq_with(address, &header, |_, _| panic!("no capabilities")),
             Some(43)
         );
         header[0x3d] = 0;
-        assert_eq!(irq_with(address, &header, |_, _| None), Some(0));
+        assert_eq!(legacy_irq_with(address, &header, |_, _| None), Some(0));
         header[0x3d] = 1;
         header[0x3c] = 0xff;
-        assert_eq!(irq_with(address, &header, |_, _| None), Some(0));
+        assert_eq!(legacy_irq_with(address, &header, |_, _| None), Some(0));
         header[0x3c] = 11;
         header[6] = 0x10;
         header[0x34] = 0x50;
         assert_eq!(
-            irq_with(address, &header, |_, at| Some(match at {
+            legacy_irq_with(address, &header, |_, at| Some(match at {
                 0x50 => 0x00810005,
+                0x54 => 0xfee0_0000,
+                0x58 => 0,
                 0x5c => 100,
                 _ => panic!("unexpected read"),
             })),
             Some(100)
         );
         assert_eq!(
-            irq_with(address, &header, |_, at| Some(match at {
+            legacy_irq_with(address, &header, |_, at| Some(match at {
                 0x50 => 0x00010005,
+                0x54 => 0xfee0_0000,
                 0x58 => 101,
                 _ => panic!("unexpected read"),
             })),
             Some(101)
         );
         assert_eq!(
-            irq_with(address, &header, |_, _| Some(0x00000005)),
+            legacy_irq_with(address, &header, |_, _| Some(0x00000005)),
             Some(43)
         );
         assert_eq!(
-            irq_with(address, &header, |_, _| Some(0x80000011)),
+            legacy_irq_with(address, &header, |_, _| Some(0x80000011)),
             Some(43)
         );
         assert_eq!(
-            irq_with(address, &header, |_, at| Some(if at == 0x50 {
+            legacy_irq_with(address, &header, |_, at| Some(if at == 0x50 {
                 0x00010005
+            } else if at == 0x54 {
+                0xfee0_0000
             } else {
                 0xf0
             })),
