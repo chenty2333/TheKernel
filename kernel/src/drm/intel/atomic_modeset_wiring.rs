@@ -108,10 +108,56 @@ pub(crate) fn classify_action(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct N305PipeAProjection {
     pub(crate) port: TcPort,
+    pub(crate) old_encoder_attached: bool,
+    pub(crate) new_encoder_attached: bool,
     pub(crate) old_mode: Option<Mode>,
     pub(crate) new_mode: Option<Mode>,
     pub(crate) old_enabled: bool,
     pub(crate) new_enabled: bool,
+}
+
+/// Typed connector-side route retained for the upcoming per-encoder
+/// `ModesetOps` callbacks. The current hardware owner remains the composite
+/// TC transaction; this projection only ensures callback planning cannot
+/// confuse TC1/TC2 with combo-D interface indices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct N305EncoderRoute {
+    port: TcPort,
+    old_attached: bool,
+    new_attached: bool,
+}
+
+fn project_encoder_route(state: &AtomicState) -> Result<N305EncoderRoute, ModesetError> {
+    let mut route = None;
+    let mut count = 0usize;
+    for encoder in &state.encoders {
+        let old_attached = encoder.old_crtc == Some(PIPE_A);
+        let new_attached = encoder.new_crtc == Some(PIPE_A);
+        if !old_attached && !new_attached {
+            continue;
+        }
+        count += 1;
+        if encoder.kind != EncoderKind::Hdmi || encoder.tbt_alt_mode || encoder.dedicated_external {
+            return Err(unsupported());
+        }
+        let port = match encoder.port {
+            PORT_TC1 => TcPort::Tc1,
+            PORT_TC2 => TcPort::Tc2,
+            _ => return Err(unsupported()),
+        };
+        if route.is_some_and(|previous: N305EncoderRoute| previous.port != port) {
+            return Err(unsupported());
+        }
+        route = Some(N305EncoderRoute {
+            port,
+            old_attached,
+            new_attached,
+        });
+    }
+    if count != 1 {
+        return Err(unsupported());
+    }
+    route.ok_or_else(unsupported)
 }
 
 /// Convert the narrow Pipe-A/TC-HDMI subset that the existing transaction can
@@ -135,37 +181,11 @@ pub(crate) fn project_pipe_a(
     validate_pipe_shape(&transition.old)?;
     validate_pipe_shape(&transition.new)?;
 
-    let mut port = None;
-    let mut encoder_count = 0usize;
-    let mut has_old_encoder = false;
-    let mut has_new_encoder = false;
-    for encoder in &state.encoders {
-        let touches_a = encoder.old_crtc == Some(PIPE_A) || encoder.new_crtc == Some(PIPE_A);
-        if !touches_a {
-            continue;
-        }
-        encoder_count += 1;
-        has_old_encoder |= encoder.old_crtc == Some(PIPE_A);
-        has_new_encoder |= encoder.new_crtc == Some(PIPE_A);
-        if encoder.kind != EncoderKind::Hdmi || encoder.tbt_alt_mode || encoder.dedicated_external {
-            return Err(unsupported());
-        }
-        let encoder_port = match encoder.port {
-            PORT_TC1 => TcPort::Tc1,
-            PORT_TC2 => TcPort::Tc2,
-            _ => return Err(unsupported()),
-        };
-        if port.is_some_and(|previous| previous != encoder_port) {
-            return Err(unsupported());
-        }
-        port = Some(encoder_port);
-    }
-    let port = port.ok_or_else(unsupported)?;
-    if encoder_count != 1
-        || (transition.old.hw_enable && !has_old_encoder)
-        || (transition.old.pipe_active && !has_old_encoder)
-        || (transition.new.hw_enable && !has_new_encoder)
-        || (transition.new.pipe_active && !has_new_encoder)
+    let encoder_route = project_encoder_route(state)?;
+    if (transition.old.hw_enable && !encoder_route.old_attached)
+        || (transition.old.pipe_active && !encoder_route.old_attached)
+        || (transition.new.hw_enable && !encoder_route.new_attached)
+        || (transition.new.pipe_active && !encoder_route.new_attached)
     {
         return Err(unsupported());
     }
@@ -204,7 +224,9 @@ pub(crate) fn project_pipe_a(
     };
 
     Ok(N305PipeAProjection {
-        port,
+        port: encoder_route.port,
+        old_encoder_attached: encoder_route.old_attached,
+        new_encoder_attached: encoder_route.new_attached,
         old_mode,
         new_mode,
         old_enabled,
@@ -454,11 +476,50 @@ mod tests {
             )
             .unwrap();
             assert_eq!(projected.port, port);
+            assert!(projected.old_encoder_attached && projected.new_encoder_attached);
             assert!(projected.old_mode.unwrap().same_timing(&vic(95)));
             assert!(projected.new_mode.unwrap().same_timing(&vic(16)));
             assert!(projected.old_enabled && projected.new_enabled);
             assert_eq!(port.index(), index);
         }
+    }
+
+    #[test]
+    fn encoder_route_is_typed_and_rejects_ambiguous_or_dp_routes() {
+        let encoder = |port, kind| EncoderTransition {
+            old_crtc: Some(PIPE_A),
+            new_crtc: Some(PIPE_A),
+            kind,
+            port,
+            ..EncoderTransition::default()
+        };
+        let state = AtomicState {
+            encoders: alloc::vec![encoder(PORT_TC2, EncoderKind::Hdmi)],
+            ..AtomicState::default()
+        };
+        assert_eq!(
+            project_encoder_route(&state),
+            Ok(N305EncoderRoute {
+                port: TcPort::Tc2,
+                old_attached: true,
+                new_attached: true
+            })
+        );
+
+        let dp = AtomicState {
+            encoders: alloc::vec![encoder(PORT_TC2, EncoderKind::Dp)],
+            ..AtomicState::default()
+        };
+        assert_eq!(project_encoder_route(&dp), Err(unsupported()));
+
+        let ambiguous = AtomicState {
+            encoders: alloc::vec![
+                encoder(PORT_TC1, EncoderKind::Hdmi),
+                encoder(PORT_TC2, EncoderKind::Hdmi),
+            ],
+            ..AtomicState::default()
+        };
+        assert_eq!(project_encoder_route(&ambiguous), Err(unsupported()));
     }
 
     #[test]
