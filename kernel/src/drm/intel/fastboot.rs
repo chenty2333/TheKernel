@@ -6,7 +6,10 @@
 //! Only pipe-A, opaque linear XR24/RG16, no scaling/color/DSC/VRR is admitted.
 //! Hardware writes remain opt-in.
 use alloc::{format, string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU32, Ordering, fence};
+use core::{
+    cell::Cell,
+    sync::atomic::{AtomicU32, Ordering, fence},
+};
 
 use intel_display::{
     Error, RegisterIo,
@@ -1023,12 +1026,12 @@ impl<R: Registers, T: PollTimer> NativeClockLifecycle<'_, R, T> {
         super::pcode::commit_cdclk_voltage(self.registers, self.timer, transition.after.cdclk_khz)
             .map_err(|error| format!("CDCLK PCode voltage update failed: {error:?}"))
     }
-}
 
-impl<R: Registers, T: PollTimer> super::tc_modeset::ClockLifecycle
-    for NativeClockLifecycle<'_, R, T>
-{
-    fn adjust(&mut self, target_clock_khz: u32, restore_before_image: bool) -> Result<(), String> {
+    fn adjust_native(
+        &mut self,
+        target_clock_khz: u32,
+        restore_before_image: bool,
+    ) -> Result<(), String> {
         let current = super::clk::observe(self.registers)
             .map_err(|error| format!("CDCLK readout failed: {}", error.describe()))?;
         if restore_before_image {
@@ -1070,6 +1073,142 @@ impl<R: Registers, T: PollTimer> super::tc_modeset::ClockLifecycle
         let target = super::clk::entry_at_least(current.reference, target_clock_khz)
             .ok_or_else(|| format!("no CDCLK table row can carry {target_clock_khz} kHz"))?;
         self.transition(current, target, None)
+    }
+}
+
+/// Narrow adapter for the translated `intel_cdclk_set_cdclk()` dispatcher.
+/// That source entry point delegates to `platform_set_cdclk`; all register,
+/// PCode, consumer-quiesce and readback work remains in the checked native
+/// lifecycle. Any unexpected source hook is latched and makes the call fail.
+struct NativeCdclkSetDispatch<'b, 'r, R, T> {
+    lifecycle: &'b mut NativeClockLifecycle<'r, R, T>,
+    restore_before_image: bool,
+    transition_error: Option<String>,
+    unexpected_hook: Cell<bool>,
+}
+
+impl<R: Registers, T: PollTimer> intel_display::intel_cdclk_full::IntelCdclkIo
+    for NativeCdclkSetDispatch<'_, '_, R, T>
+{
+    fn platform_get_cdclk(
+        &mut self,
+        _: u32,
+        _: &mut intel_display::intel_cdclk_full::IntelDisplay,
+        _: &mut intel_display::intel_cdclk_full::IntelCdclkConfig,
+    ) {
+        self.unexpected_hook.set(true);
+    }
+    fn platform_set_cdclk(
+        &mut self,
+        _: u32,
+        _: &mut intel_display::intel_cdclk_full::IntelDisplay,
+        config: &intel_display::intel_cdclk_full::IntelCdclkConfig,
+        _: i32,
+    ) {
+        let result = u32::try_from(config.cdclk)
+            .map_err(|_| String::from("translated CDCLK target is negative"))
+            .and_then(|target| {
+                self.lifecycle
+                    .adjust_native(target, self.restore_before_image)
+            });
+        if let Err(error) = result {
+            self.transition_error = Some(error);
+        }
+    }
+    fn platform_modeset_calc_cdclk(
+        &mut self,
+        _: u32,
+        _: &mut intel_display::intel_cdclk_full::IntelAtomicState,
+    ) -> i32 {
+        self.unexpected_hook.set(true);
+        -1
+    }
+    fn platform_calc_voltage_level(
+        &mut self,
+        _: u32,
+        _: &intel_display::intel_cdclk_full::IntelDisplay,
+        _: i32,
+    ) -> u8 {
+        self.unexpected_hook.set(true);
+        0
+    }
+    fn constant(&self, _: &'static str) -> u32 {
+        self.unexpected_hook.set(true);
+        0
+    }
+    fn read_mmio(&mut self, _: &'static str) -> u32 {
+        self.unexpected_hook.set(true);
+        0
+    }
+    fn write_mmio(&mut self, _: &'static str, _: u32) {
+        self.unexpected_hook.set(true);
+    }
+    fn pci_read16(&mut self, _: &'static str) -> u16 {
+        self.unexpected_hook.set(true);
+        0
+    }
+    fn pci_bus_read16(&mut self, _: u16, _: &'static str) -> u16 {
+        self.unexpected_hook.set(true);
+        0
+    }
+    fn mchbar_read8(&mut self, _: &'static str) -> u8 {
+        self.unexpected_hook.set(true);
+        0
+    }
+    fn call(&mut self, _: &'static str, _: &[i64]) -> i64 {
+        self.unexpected_hook.set(true);
+        -1
+    }
+    fn wait(&mut self, _: &'static str, _: u32, _: u32, _: i32) -> i32 {
+        self.unexpected_hook.set(true);
+        -1
+    }
+    fn log(&mut self, _: &'static str, _: &'static str, _: &[i64]) {}
+    fn log_cdclk_config(
+        &mut self,
+        _: &'static str,
+        _: &intel_display::intel_cdclk_full::IntelCdclkConfig,
+    ) {
+    }
+}
+
+fn set_cdclk_through_source<'b, 'r, R: Registers, T: PollTimer>(
+    lifecycle: &'b mut NativeClockLifecycle<'r, R, T>,
+    target_clock_khz: u32,
+    restore_before_image: bool,
+) -> Result<(), String> {
+    let target = i32::try_from(target_clock_khz)
+        .map_err(|_| String::from("CDCLK target exceeds the translated integer range"))?;
+    let mut display = intel_display::intel_cdclk_full::IntelDisplay::default();
+    display.display_ver = 13;
+    display.platform.alderlake_p = true;
+    let config = intel_display::intel_cdclk_full::IntelCdclkConfig {
+        cdclk: target,
+        ..Default::default()
+    };
+    let mut io = NativeCdclkSetDispatch {
+        lifecycle,
+        restore_before_image,
+        transition_error: None,
+        unexpected_hook: Cell::new(false),
+    };
+    intel_display::intel_cdclk_full::intel_cdclk_set_cdclk(&mut io, &mut display, &config, -1);
+    if let Some(error) = io.transition_error {
+        return Err(error);
+    }
+    if io.unexpected_hook.get() {
+        return Err(String::from(
+            "translated CDCLK setter emitted an unmapped backend hook",
+        ));
+    }
+    Ok(())
+}
+
+impl<R: Registers, T: PollTimer> super::tc_modeset::ClockLifecycle
+    for NativeClockLifecycle<'_, R, T>
+{
+    fn adjust(&mut self, target_clock_khz: u32, restore_before_image: bool) -> Result<(), String> {
+        set_cdclk_through_source(self, target_clock_khz, restore_before_image)
     }
 }
 
@@ -2842,6 +2981,21 @@ mod tests {
             },
         };
         assert!(lifecycle.require_all_consumers_disabled().is_err());
+    }
+
+    #[test]
+    fn translated_cdclk_set_dispatch_reaches_only_the_native_platform_callback() {
+        let (adapter, registers, _) = native();
+        let before = super::super::clk::observe(&registers).unwrap();
+        let mut lifecycle = NativeClockLifecycle {
+            registers: &registers,
+            timer: &adapter.timer,
+            before,
+        };
+
+        // Requesting the already-active clock still exercises the translated
+        // intel_cdclk_set_cdclk() dispatch but must not touch CDCLK hardware.
+        set_cdclk_through_source(&mut lifecycle, before.cdclk_khz, false).unwrap();
     }
 
     #[derive(Clone)]

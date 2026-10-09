@@ -51,7 +51,10 @@
 
 use alloc::{format, string::String};
 
-use super::regs::{self, Registers};
+use super::{
+    de_io::{DeIo, DeIoError},
+    regs::{self, Registers},
+};
 
 /// The CDCLK PLL's reference frequency, as `SKL_DSSM[31:29]` states it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1274,9 +1277,11 @@ impl ClockError {
 
 /// Read a register the sequence cannot do without.
 pub(crate) fn read(regs: &impl Registers, register: regs::Register) -> Result<u32, ClockError> {
-    regs.read(register).ok_or(ClockError::Unreadable {
-        register: register.name(),
-    })
+    DeIo::new(regs)
+        .read(register)
+        .map_err(|_| ClockError::Unreadable {
+            register: register.name(),
+        })
 }
 
 /// Write a register, refusing to continue if the write did not happen.
@@ -1285,13 +1290,11 @@ pub(crate) fn write(
     register: regs::Register,
     value: u32,
 ) -> Result<(), ClockError> {
-    if regs.write(register, value) {
-        Ok(())
-    } else {
-        Err(ClockError::WriteRefused {
+    DeIo::new(regs)
+        .write(register, value)
+        .map_err(|_| ClockError::WriteRefused {
             register: register.name(),
         })
-    }
 }
 
 /// Poll a register until `mask` reads `value`, or the poll budget runs out.
@@ -1306,9 +1309,13 @@ pub(crate) fn poll(
     value: u32,
     timeout_us: u32,
 ) -> Result<bool, ClockError> {
-    regs::poll(regs, register, mask, value, timeout_us).ok_or(ClockError::Unreadable {
-        register: register.name(),
-    })
+    match DeIo::new(regs).wait_for_register(register, mask, value, timeout_us) {
+        Ok(_) => Ok(true),
+        Err(DeIoError::TimedOut { .. }) => Ok(false),
+        Err(_) => Err(ClockError::Unreadable {
+            register: register.name(),
+        }),
+    }
 }
 
 #[cfg(test)]
