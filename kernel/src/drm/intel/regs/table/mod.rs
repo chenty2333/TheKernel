@@ -47,6 +47,7 @@ pub(crate) const DDI: &[Register] = &[
     ddi::TRANS_CLK_SEL_C,
     ddi::TRANS_CLK_SEL_D,
     ddi::TRANS_DDI_FUNC_CTL_A,
+    ddi::TRANS_DDI_FUNC_CTL2_A,
     ddi::TRANS_DDI_FUNC_CTL_B,
     ddi::TRANS_DDI_FUNC_CTL_C,
     ddi::TRANS_DDI_FUNC_CTL_D,

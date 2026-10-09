@@ -397,6 +397,7 @@ fn the_write_order_enables_hdmi_encoder_before_cpu_transcoder() {
             "PORT_CL_DW10(A)",
             // 5.4, 5.5, 5.6, 5.7.
             "TRANS_CLK_SEL(A)",
+            "TRANS_DDI_FUNC_CTL2(A)",
             "TRANS_DDI_FUNC_CTL(A)",
             "DDI_BUF_CTL(A)",
             "PIPECONF_A",
@@ -946,6 +947,7 @@ fn the_phy_b_write_order_is_the_sequence_with_b_registers() {
             // 5.4, 5.5, 5.6, 5.7: the transcoder is A's, the DDI inside the
             // values is B's, and the buffer is B's.
             "TRANS_CLK_SEL(A)",
+            "TRANS_DDI_FUNC_CTL2(A)",
             "TRANS_DDI_FUNC_CTL(A)",
             "DDI_BUF_CTL(B)",
             "PIPECONF_A",

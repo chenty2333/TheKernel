@@ -950,37 +950,109 @@ impl intel_display::intel_ddi_full::DdiIo for DdiPolicyIo {
     fn mg_dp_mode_write(&mut self, _port: intel_display::intel_ddi_full::Port, _lane: u8, _value: u32) {}
 }
 
-fn source_trans_ddi_func_ctl(request: &OutputRequest) -> u32 {
+fn source_ddi_encoder(
+    ddi: Ddi,
+    port_type: PortType,
+) -> intel_display::intel_ddi_full::DdiEncoder {
     use intel_display::intel_ddi_full as i915;
 
-    let port = match request.ddi {
+    let port = match ddi {
         Ddi::A => i915::Port::A,
         Ddi::B => i915::Port::B,
         Ddi::C => i915::Port::C,
         Ddi::D => i915::Port::D,
     };
-    let output = match request.port_type {
+    let output = match port_type {
         PortType::Hdmi => i915::OutputType::Hdmi,
         PortType::Dvi => i915::OutputType::Dvi,
     };
-    let encoder = i915::DdiEncoder {
+    i915::DdiEncoder {
         port,
         output,
         display: i915::Platform { display_ver: 13, alderlake_p: true, ..i915::Platform::default() },
         ..i915::DdiEncoder::default()
+    }
+}
+
+fn source_ddi_crtc_state(
+    port_type: PortType,
+    width: PortWidth,
+    clock_khz: u32,
+    mode_flags: u32,
+) -> intel_display::intel_ddi_full::CrtcState {
+    use intel_display::intel_ddi_full as i915;
+
+    let output = match port_type {
+        PortType::Hdmi => i915::OutputType::Hdmi,
+        PortType::Dvi => i915::OutputType::Dvi,
     };
-    let state = i915::CrtcState {
+    i915::CrtcState {
         pipe: i915::Pipe::A,
         cpu_transcoder: i915::Transcoder::A,
+        master_transcoder: i915::Transcoder::Invalid,
+        mst_master_transcoder: i915::Transcoder::Invalid,
         output,
-        port_clock: request.mode.clock_khz,
-        lane_count: request.width.lanes() as u8,
+        port_clock: clock_khz,
+        lane_count: width.lanes() as u8,
         pipe_bpp: 24,
-        mode_flags: u32::from(request.mode.hsync_positive) | (u32::from(request.mode.vsync_positive) << 2),
-        has_hdmi_sink: request.port_type == PortType::Hdmi,
+        mode_flags,
+        has_hdmi_sink: port_type == PortType::Hdmi,
         ..i915::CrtcState::default()
-    };
-    i915::intel_ddi_transcoder_func_reg_val_get(&mut DdiPolicyIo, &encoder, &state)
+    }
+}
+
+struct DdiTranscoderEnableIo<'a, R> {
+    registers: &'a R,
+    func_ctl: Register,
+    func_ctl2: Register,
+    write_failed: Option<Register>,
+}
+
+impl<'a, R: Registers> DdiTranscoderEnableIo<'a, R> {
+    fn new(registers: &'a R, func_ctl: Register, func_ctl2: Register) -> Self {
+        Self { registers, func_ctl, func_ctl2, write_failed: None }
+    }
+}
+
+impl<R: Registers> intel_display::intel_ddi_full::DdiIo for DdiTranscoderEnableIo<'_, R> {
+    fn read(&mut self, _reg: u32) -> u32 { 0 }
+    fn write(&mut self, reg: u32, value: u32) {
+        let typed = if reg == self.func_ctl.offset() {
+            self.func_ctl
+        } else if reg == self.func_ctl2.offset() {
+            self.func_ctl2
+        } else {
+            self.write_failed = Some(self.func_ctl);
+            return;
+        };
+        if !self.registers.write(typed, value) {
+            self.write_failed = Some(typed);
+        }
+    }
+    fn combo_phy_read(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister) -> u32 { 0 }
+    fn combo_phy_write(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister, _value: u32) {}
+    fn combo_phy_rmw(&mut self, _phy: u8, _reg: intel_display::intel_ddi_full::ComboPhyRegister, _clear: u32, _set: u32) {}
+    fn mg_phy_rmw(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::MgPhyRegister, _clear: u32, _set: u32) {}
+    fn dkl_phy_read(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister) -> u32 { 0 }
+    fn dkl_phy_write(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister, _value: u32) {}
+    fn dkl_phy_rmw(&mut self, _port: intel_display::intel_ddi_full::Port, _reg: intel_display::intel_ddi_full::DklPhyRegister, _clear: u32, _set: u32) {}
+    fn mg_dp_mode_read(&mut self, _port: intel_display::intel_ddi_full::Port, _lane: u8) -> u32 { 0 }
+    fn mg_dp_mode_write(&mut self, _port: intel_display::intel_ddi_full::Port, _lane: u8, _value: u32) {}
+}
+
+fn source_trans_ddi_func_ctl(request: &OutputRequest) -> u32 {
+    let encoder = source_ddi_encoder(request.ddi, request.port_type);
+    let state = source_ddi_crtc_state(
+        request.port_type,
+        request.width,
+        request.mode.clock_khz,
+        u32::from(request.mode.hsync_positive) | (u32::from(request.mode.vsync_positive) << 2),
+    );
+    intel_display::intel_ddi_full::intel_ddi_transcoder_func_reg_val_get(
+        &mut DdiPolicyIo,
+        &encoder,
+        &state,
+    )
 }
 
 /// Kernel adapter for the translated source DDI-buffer enable handshake. It
@@ -1427,6 +1499,7 @@ pub(crate) fn program(
     let pll_cfgcr1 = registers
         .pll_cfgcr1
         .ok_or(OutputError::PllConfigRegisterMissing { phy })?;
+    let _old_trans_ddi_func_ctl2 = read(regs, ddi::TRANS_DDI_FUNC_CTL2_A)?;
 
     // 5.1 -- the PLL.  Power the block first: §6.3's sequence sets
     // POWER_ENABLE, polls POWER_STATE, and only then loads the dividers.
@@ -1566,15 +1639,54 @@ pub(crate) fn program(
         plan.width.power_down_lanes_field() << PWR_DOWN_LN_MASK_SHIFT,
     )?;
 
-    // 5.4 and 5.5 -- connect the transcoder to the port's clock, then to the
-    // DDI.  Both are plain writes: these registers have no other field in play
-    // on this path.  The transcoder is A's whatever DDI the plan names -- §5.1
+    // 5.4 and 5.5 -- connect the transcoder to the port's clock, then enable
+    // the source DDI transcoder function. The source routine writes FUNC_CTL2
+    // before FUNC_CTL. The transcoder is A's whatever DDI the plan names -- §5.1
     // gives the PRM's "Transcoders A-D can connect to any DDI" -- and the DDI
     // is inside the value (`plan.trans_clk_sel`'s port field and
     // `plan.trans_ddi_func_ctl`'s), so a plan for DDI B writes A's transcoder
     // registers with B's port number in them.
     write(regs, ddi::TRANS_CLK_SEL_A, plan.trans_clk_sel)?;
-    write(regs, ddi::TRANS_DDI_FUNC_CTL_A, plan.trans_ddi_func_ctl)?;
+    let source_encoder = source_ddi_encoder(plan.ddi, plan.port_type);
+    let mode_flags = u32::from(plan.trans_ddi_func_ctl & (1 << 16) != 0)
+        | (u32::from(plan.trans_ddi_func_ctl & (1 << 17) != 0) << 2);
+    let source_state = source_ddi_crtc_state(
+        plan.port_type,
+        plan.width,
+        plan.pixel_clock_khz,
+        mode_flags,
+    );
+    let mut source_io = DdiTranscoderEnableIo::new(
+        regs,
+        ddi::TRANS_DDI_FUNC_CTL_A,
+        ddi::TRANS_DDI_FUNC_CTL2_A,
+    );
+    intel_display::intel_ddi_full::intel_ddi_enable_transcoder_func(
+        &mut source_io,
+        &source_encoder,
+        &source_state,
+    );
+    if let Some(register) = source_io.write_failed {
+        return Err(OutputError::WriteRefused {
+            register: register.name(),
+        });
+    }
+    let ctl2_readback = read(regs, ddi::TRANS_DDI_FUNC_CTL2_A)?;
+    if ctl2_readback != 0 {
+        return Err(OutputError::DdiControlReadbackMismatch {
+            register: ddi::TRANS_DDI_FUNC_CTL2_A.name(),
+            wrote: 0,
+            readback: ctl2_readback,
+        });
+    }
+    let func_readback = read(regs, ddi::TRANS_DDI_FUNC_CTL_A)?;
+    if func_readback != plan.trans_ddi_func_ctl {
+        return Err(OutputError::DdiControlReadbackMismatch {
+            register: ddi::TRANS_DDI_FUNC_CTL_A.name(),
+            wrote: plan.trans_ddi_func_ctl,
+            readback: func_readback,
+        });
+    }
 
     // 5.6 -- the transcoder itself.  `regs/pipe.rs` calls this register
     // `PIPECONF_A`; §5.2 records that i915 v6.12 calls the same offset
@@ -1768,6 +1880,12 @@ pub(crate) enum OutputError {
         /// The poll budget in microseconds.
         timeout_us: u32,
     },
+    /// A source DDI transcoder-control write did not read back as planned.
+    DdiControlReadbackMismatch {
+        register: &'static str,
+        wrote: u32,
+        readback: u32,
+    },
 }
 
 impl From<PllError> for OutputError {
@@ -1907,6 +2025,10 @@ impl OutputError {
                  poll timing out on an N200/46d0 machine under coreboot + EDK2, and a wrong \
                  port/aux_ch mapping is a far more common cause than a wrong divider",
                 ddi.name()
+            ),
+            Self::DdiControlReadbackMismatch { register, wrote, readback } => format!(
+                "{register} did not read back the translated i915 value {wrote:#010x} \
+                 (observed {readback:#010x})"
             ),
         }
     }
