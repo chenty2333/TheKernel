@@ -36,12 +36,6 @@ use crate::{
     mm::{SharedFixedView, SharedPages},
 };
 
-// Compile the adjacent DPLL adapter in the host test build without adding a
-// production callsite or requiring the owner module to wire it yet.
-#[cfg(test)]
-#[path = "shared_dpll.rs"]
-mod shared_dpll_adapter_compile_check;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeMode {
     timing: crate::drm::modes::Mode,

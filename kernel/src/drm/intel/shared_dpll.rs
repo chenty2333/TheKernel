@@ -1621,6 +1621,96 @@ fn tc_domain_counts_held(port: dpll::TcPort, lane_refs: u32, io_refs: u32) -> bo
     matches!(port, dpll::TcPort::Tc1 | dpll::TcPort::Tc2) && lane_refs > 0 && io_refs > 0
 }
 
+/// Per-commit bridge from the generic native modeset callbacks to the
+/// translated shared-DPLL manager. The fastboot power pin is borrowed for the
+/// full callback lifetime; the atomic manager undo must be retained by the
+/// caller until its hardware rollback checkpoint is resolved.
+pub(crate) struct NativeSharedDpllAdapter<'a, R, T> {
+    manager: &'a mut SharedDpllState,
+    registers: &'a R,
+    timer: &'a T,
+    power_pin: &'a crate::drm::intel::fastboot::PowerPin,
+    identity: AdlNIdentity,
+    refclk_khz: u32,
+    undo: Option<SharedDpllUndo>,
+}
+
+impl<'a, R: Registers, T: PollTimer> NativeSharedDpllAdapter<'a, R, T> {
+    pub(crate) fn new(
+        manager: &'a mut SharedDpllState,
+        registers: &'a R,
+        timer: &'a T,
+        power_pin: &'a crate::drm::intel::fastboot::PowerPin,
+        identity: AdlNIdentity,
+        refclk_khz: u32,
+    ) -> Self {
+        Self {
+            manager,
+            registers,
+            timer,
+            power_pin,
+            identity,
+            refclk_khz,
+            undo: None,
+        }
+    }
+
+    /// Transfer the software before-image to the enclosing modeset
+    /// transaction. It must only be discarded after verified commit or
+    /// restored after verified hardware rollback.
+    pub(crate) fn take_undo(&mut self) -> Option<SharedDpllUndo> {
+        self.undo.take()
+    }
+}
+
+impl<R: Registers, T: PollTimer> crate::drm::intel::native_modeset_ops::NativeDpllOps
+    for NativeSharedDpllAdapter<'_, R, T>
+{
+    fn dpll_get(
+        &mut self,
+        atomic: &mut dpll::IntelAtomicState,
+        crtc: &dpll::IntelCrtc,
+        encoder: &dpll::IntelEncoder,
+    ) -> Result<(), DpllFailure> {
+        if self.undo.is_some() {
+            return Err(DpllFailure::UnexpectedState);
+        }
+        let mut power = PinnedDpllPower::new(self.power_pin, self.identity, self.refclk_khz)?;
+        self.manager.compute(
+            self.registers,
+            self.timer,
+            &mut power,
+            atomic,
+            crtc,
+            encoder,
+        )?;
+        self.manager
+            .release(self.registers, self.timer, &mut power, atomic, crtc)?;
+        self.manager.reserve(
+            self.registers,
+            self.timer,
+            &mut power,
+            atomic,
+            crtc,
+            encoder,
+        )?;
+        self.undo = Some(self.manager.swap_atomic(atomic)?);
+        Ok(())
+    }
+
+    fn dpll_enable(&mut self, state: &dpll::CrtcState) -> Result<(), DpllFailure> {
+        let mut power = PinnedDpllPower::new(self.power_pin, self.identity, self.refclk_khz)?;
+        self.manager
+            .enable(self.registers, self.timer, &mut power, state)
+    }
+
+    fn dpll_disable(&mut self, state: &dpll::CrtcState) -> Result<(), DpllFailure> {
+        let mut power = PinnedDpllPower::new(self.power_pin, self.identity, self.refclk_khz)?;
+        self.manager
+            .disable(self.registers, self.timer, &mut power, state)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::collections::BTreeMap;

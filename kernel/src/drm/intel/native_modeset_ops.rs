@@ -24,7 +24,32 @@ pub(super) trait NativeCdclkOps {
     fn set_cdclk_post_plane(&mut self, target_khz: u32) -> Result<(), Self::Error>;
 }
 
-pub(super) trait NativeModesetOps: NativeCdclkOps {
+/// Shared-PLL callbacks use the source manager's typed atomic/CRTC/encoder
+/// state. A DRM projection alone is not enough to synthesize this state.
+pub(super) trait NativeDpllOps {
+    /// Compute/release/reserve and swap the shared PLL state
+    /// (`intel_dpll_compute()` / `intel_dpll_reserve()` / `intel_dpll_swap_state()`).
+    fn dpll_get(
+        &mut self,
+        atomic: &mut intel_display::intel_dpll_mgr_full::IntelAtomicState,
+        crtc: &intel_display::intel_dpll_mgr_full::IntelCrtc,
+        encoder: &intel_display::intel_dpll_mgr_full::IntelEncoder,
+    ) -> Result<(), super::shared_dpll::DpllFailure>;
+
+    /// Enable the reserved PLL (`intel_enable_shared_dpll()`).
+    fn dpll_enable(
+        &mut self,
+        state: &intel_display::intel_dpll_mgr_full::CrtcState,
+    ) -> Result<(), super::shared_dpll::DpllFailure>;
+
+    /// Disable/release an old PLL (`intel_disable_shared_dpll()`).
+    fn dpll_disable(
+        &mut self,
+        state: &intel_display::intel_dpll_mgr_full::CrtcState,
+    ) -> Result<(), super::shared_dpll::DpllFailure>;
+}
+
+pub(super) trait NativeModesetOps: NativeCdclkOps + NativeDpllOps {
     /// CRTC enable phase (`hsw_crtc_enable()` / `skl_commit_modeset_enables()`).
     fn crtc_enable(&mut self, state: &PipeState) -> Result<(), Self::Error>;
 
@@ -52,16 +77,6 @@ pub(super) trait NativeModesetOps: NativeCdclkOps {
 
     /// Universal-plane disable (`skl_universal_plane_disable_arm()` path).
     fn disable_plane(&mut self, plane: &PlaneTransition) -> Result<(), Self::Error>;
-
-    /// Reserve the shared PLL for a checked CRTC state (`intel_find_dpll()` /
-    /// `intel_atomic_get_dpll_state()`).
-    fn dpll_get(&mut self, state: &PipeState) -> Result<(), Self::Error>;
-
-    /// Program the reserved shared PLL (`intel_enable_shared_dpll()`).
-    fn dpll_enable(&mut self, state: &PipeState) -> Result<(), Self::Error>;
-
-    /// Disable/release a no-longer-used shared PLL (`intel_disable_shared_dpll()`).
-    fn dpll_disable(&mut self, state: &PipeState) -> Result<(), Self::Error>;
 
     /// Acquire a map-backed display power-domain reference (`intel_display_power_get()`).
     fn power_domain_get(&mut self, domain: u8) -> Result<(), Self::Error>;
