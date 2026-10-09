@@ -430,14 +430,22 @@ pub unsafe extern "C" fn dma_fence_set_error(fence: *mut DmaFence, error: c_int)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dma_fence_is_signaled(fence: *mut DmaFence) -> bool {
     !fence.is_null()
-        && unsafe { AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).load(Ordering::Acquire) & (1usize << DMA_FENCE_FLAG_SIGNALED_BIT) != 0 }
+        && unsafe {
+            AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).load(Ordering::Acquire)
+                & (1usize << DMA_FENCE_FLAG_SIGNALED_BIT)
+                != 0
+        }
 }
 
 unsafe fn dma_fence_signal_locked_inner(fence: *mut DmaFence) {
     if fence.is_null() {
         return;
     }
-    if unsafe { AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).load(Ordering::Acquire) & (1usize << DMA_FENCE_FLAG_SIGNALED_BIT) != 0 } {
+    if unsafe {
+        AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).load(Ordering::Acquire)
+            & (1usize << DMA_FENCE_FLAG_SIGNALED_BIT)
+            != 0
+    } {
         return;
     }
     let mut callback_list = ListHead {
@@ -450,7 +458,9 @@ unsafe fn dma_fence_signal_locked_inner(fence: *mut DmaFence) {
         list_splice_init(callbacks, &mut callback_list);
         (*fence).timestamp_union.timestamp = ktime_get();
         AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).fetch_or(
-            (1usize << DMA_FENCE_FLAG_SIGNALED_BIT) | (1usize << DMA_FENCE_FLAG_TIMESTAMP_BIT), Ordering::Release);
+            (1usize << DMA_FENCE_FLAG_SIGNALED_BIT) | (1usize << DMA_FENCE_FLAG_TIMESTAMP_BIT),
+            Ordering::Release,
+        );
     }
     while !list_empty(&callback_list) {
         let node = callback_list.next;
@@ -492,7 +502,11 @@ pub unsafe extern "C" fn dma_fence_add_callback(
     }
     let mut flags = 0;
     unsafe { fence_lock(fence, &mut flags) };
-    if unsafe { AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).load(Ordering::Acquire) & (1usize << DMA_FENCE_FLAG_SIGNALED_BIT) != 0 } {
+    if unsafe {
+        AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).load(Ordering::Acquire)
+            & (1usize << DMA_FENCE_FLAG_SIGNALED_BIT)
+            != 0
+    } {
         unsafe { fence_unlock(fence, flags) };
         return -ENOENT;
     }
@@ -864,4 +878,55 @@ pub unsafe fn i915_gem_clflush_object(obj: *mut DrmI915GemObject, flags: u32) ->
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    static CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn completed(_: *mut DmaFence, _: *mut DmaFenceCb) {
+        CALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn fence_callbacks_and_reservation_references_have_real_lifetimes() {
+        unsafe {
+            let mut fence: DmaFence = core::mem::zeroed();
+            let mut lock: Spinlock = core::mem::zeroed();
+            let ops: DmaFenceOps = core::mem::zeroed();
+            spin_lock_init(&mut lock);
+            dma_fence_init(&mut fence, &ops, &mut lock, 1, 2);
+            let mut callback: DmaFenceCb = core::mem::zeroed();
+            assert_eq!(
+                dma_fence_add_callback(&mut fence, &mut callback, completed),
+                0
+            );
+            assert!(!dma_fence_is_signaled(&mut fence));
+            dma_fence_signal(&mut fence);
+            dma_fence_signal(&mut fence);
+            assert!(dma_fence_is_signaled(&mut fence));
+            assert_eq!(CALLBACKS.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                dma_fence_add_callback(&mut fence, &mut callback, completed),
+                -ENOENT
+            );
+            // Also exercises the empty callback list and timestamp union switch.
+            let mut empty: DmaFence = core::mem::zeroed();
+            dma_fence_init(&mut empty, &ops, &mut lock, 1, 3);
+            dma_fence_signal(&mut empty);
+            let mut resv: DmaResv = core::mem::zeroed();
+            dma_resv_init(&mut resv);
+            assert_eq!(dma_resv_reserve_fences(&mut resv, 1), 0);
+            dma_resv_add_fence(&mut resv, &mut fence, DMA_RESV_USAGE_KERNEL);
+            let mut cursor: DmaResvIter = core::mem::zeroed();
+            cursor.obj = &mut resv;
+            cursor.usage = DMA_RESV_USAGE_KERNEL;
+            assert_eq!(dma_resv_iter_next(&mut cursor), &mut fence as *mut _);
+            assert!(dma_resv_iter_next(&mut cursor).is_null());
+            requests_dma_fence_put(cursor.fence);
+            dma_resv_fini(&mut resv);
+            assert_eq!(fence.refcount.refcount.refs.counter, 1);
+        }
+    }
 }

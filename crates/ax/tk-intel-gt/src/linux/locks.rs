@@ -396,6 +396,7 @@ pub unsafe fn spin_trylock_irqsave_raw(lock: *mut Spinlock, flags: &mut c_ulong)
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
     use core::{
         cell::UnsafeCell,
         mem::MaybeUninit,

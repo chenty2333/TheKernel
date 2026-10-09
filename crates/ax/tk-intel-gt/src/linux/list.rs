@@ -596,7 +596,7 @@ mod tests {
             assert!(!core::ptr::eq(link, &mut head));
             let entry = link.cast::<Entry>();
             *item = unsafe { ((*entry).key, (*entry).serial) };
-            assert!(core::ptr::eq(unsafe { (*link).next }.as_ref().unwrap().prev, link));
+            assert!(core::ptr::eq(unsafe { (*(*link).next).prev }, link));
             link = unsafe { (*link).next };
         }
         assert!(core::ptr::eq(link, &mut head));

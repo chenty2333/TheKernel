@@ -157,7 +157,7 @@ pub fn xa_alloc_cyclic_irq<T, V>(
     next: &mut u32,
     gfp: u32,
 ) -> i32 {
-    if gfp & GFP_ATOMIC != 0 && gfp & GFP_KERNEL == 0 {
+    if gfp & (1 << 10) == 0 {
         // The Rust heap has no nonblocking allocator API, so preserve Linux's
         // failure contract rather than allocating while IRQs may be disabled.
         return -12;
@@ -169,7 +169,7 @@ pub fn xa_alloc_cyclic_irq<T, V>(
     xa_lock_irqsave(array, &mut flags);
     unsafe {
         let head = entries(array, true);
-        let span = limit.max.wrapping_sub(limit.min).wrapping_add(1);
+        let span = u64::from(limit.max) - u64::from(limit.min) + 1;
         let start = (*next).clamp(limit.min, limit.max);
         let mut candidate = start;
         let mut found = false;

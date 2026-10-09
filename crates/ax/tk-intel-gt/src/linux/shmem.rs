@@ -1226,3 +1226,46 @@ pub fn dev_warn<T, A: CFormatArg>(device: *mut T, format: &str, argument: A) {
         &message,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_pages_survive_no_swap_writeback_and_truncate() {
+        unsafe {
+            let file = shmem_file_setup(c"native-test".as_ptr(), (2 * PAGE_SIZE) as u64, 0);
+            assert!(!file.is_null() && (file as isize) > 0);
+            let payload = [0xa5u8; 32];
+            let mut pos = (PAGE_SIZE - 16) as i64;
+            assert_eq!(
+                kernel_write(file, payload.as_ptr().cast(), payload.len(), &mut pos),
+                32
+            );
+            assert_eq!(pos, (PAGE_SIZE + 16) as i64);
+            let mapping = (*file).f_mapping;
+            let folio = shmem_read_folio_gfp(mapping, 0, GFP_KERNEL);
+            assert!(!folio.is_null() && (folio as isize) > 0);
+            let page = folio.cast::<Page>();
+            let addr = page_address(page).cast::<u8>();
+            assert_eq!(*addr, 0);
+            assert_eq!(*addr.add(PAGE_SIZE - 1), 0xa5);
+            assert_eq!(
+                shmem_writeout(folio, ptr::null_mut(), ptr::null_mut()),
+                AOP_WRITEPAGE_ACTIVATE
+            );
+            assert_eq!(*addr.add(PAGE_SIZE - 1), 0xa5);
+            shmem_truncate_range((*file).f_inode, 0, -1);
+            // A caller reference survives removal of the mapping reference.
+            assert_eq!(*addr.add(PAGE_SIZE - 1), 0xa5);
+            folio_put(folio);
+            let fresh = shmem_read_folio_gfp(mapping, 0, GFP_KERNEL);
+            assert_eq!(
+                *page_address(fresh.cast()).cast::<u8>().add(PAGE_SIZE - 1),
+                0
+            );
+            folio_put(fresh);
+            fput_file(file);
+        }
+    }
+}

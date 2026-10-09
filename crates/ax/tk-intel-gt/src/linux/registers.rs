@@ -1143,7 +1143,7 @@ mod tests {
     #[test]
     fn gen12_lrc_slots_and_register_types_match_linux_headers() {
         assert_eq!(I915_GTT_PAGE_SIZE, 4096);
-        assert_eq!(LRC_STATE_OFFSET, 8192);
+        assert_eq!(LRC_STATE_OFFSET, 4096);
         assert_eq!(LRC_PPHWSP_SCRATCH_ADDR, 0xd0);
         assert_eq!(CTX_RING_HEAD, 5);
         assert_eq!(CTX_RING_TAIL, 7);

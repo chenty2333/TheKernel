@@ -96,7 +96,7 @@ pub fn is_power_of_2<T: LinuxUnsigned>(value: T) -> bool {
 
 #[inline]
 pub fn offset_in_page<T: LinuxUnsigned + PageMask>(value: T) -> T {
-    value.bit_and(T::from_page_mask())
+    value.bit_and(T::from_page_mask().bit_not())
 }
 
 /// `memchr_inv()` from lib/string.c: return the first byte not equal to `c`.

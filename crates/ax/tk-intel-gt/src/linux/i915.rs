@@ -633,7 +633,7 @@ pub unsafe fn IS_SUBPLATFORM<P: I915PrivatePtr>(i915: P, platform: u32, subplatf
     }
     let runtime = &*runtime_info(i915);
     let mask_index = platform / PLATFORM_MASK_BITS;
-    runtime.platform_mask[mask_index as usize] & SUBPLATFORM_MASK == subplatform
+    runtime.platform_mask[mask_index as usize] & (1 << subplatform) != 0
 }
 
 macro_rules! platform_predicates {
