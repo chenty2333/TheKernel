@@ -769,6 +769,34 @@ fn pre_enable_tc_hdmi_encoder<I: DklIo + intel_display::tc::TcIo>(
     .map_err(|error| format!("TC HDMI signal-level programming failed: {error:?}"))
 }
 
+/// Concrete encoder callback adapter for the currently admitted HDMI route.
+/// These methods are transaction-bound: callers must retain the firmware
+/// before-image and not expose their partial success as a completed atomic
+/// commit. DP and cold Type-C are intentionally not represented by this type.
+struct TcHdmiEncoderOps<'a, R, T> {
+    registers: &'a R,
+    timer: &'a T,
+    port: TcPort,
+}
+
+impl<R: Registers, T: PollTimer> TcHdmiEncoderOps<'_, R, T> {
+    fn disable(&self) -> Result<(), String> {
+        disable_tc_hdmi_encoder(self.registers, self.timer, self.port)
+    }
+
+    fn post_disable(&self) -> Result<(), String> {
+        post_disable_tc_hdmi_encoder(self.registers, self.port)
+    }
+
+    fn pre_enable(&self, port_clock_khz: u32) -> Result<(), String> {
+        pre_enable_tc_hdmi_encoder(&dkl_io(self.registers), self.port, port_clock_khz)
+    }
+
+    fn enable(&self, output: u32) -> Result<(), String> {
+        enable_tc_hdmi_encoder(self.registers, self.timer, self.port, output)
+    }
+}
+
 /// Kernel adapter for the source Haswell/Gen12+ AVI-DIP writer. Only the
 /// transcoder-A AVI control and its eight data dwords are addressable here.
 struct TcAviIo<'a, R> {
@@ -1111,6 +1139,11 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         ));
     }
     let control_offset = ddi_buf_ctl(port)?;
+    let encoder_ops = TcHdmiEncoderOps {
+        registers: r,
+        timer,
+        port,
+    };
     let buffer = read(r, control_offset)?;
     let plane_surface = pipe::PlaneSurface {
         ggtt_address: u64::from(surface),
@@ -1199,8 +1232,8 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     )?;
     poll(r, timer, p::PIPECONF_A.offset(), PIPE_RUNNING, 0, 100_000)?;
     disable_pipe_a_transcoder(r)?;
-    disable_tc_hdmi_encoder(r, timer, port)?;
-    post_disable_tc_hdmi_encoder(r, port)?;
+    encoder_ops.disable()?;
+    encoder_ops.post_disable()?;
     if let Some(lifecycle) = clock_lifecycle.as_deref_mut() {
         lifecycle.adjust(mode.clock_khz, restore_clock)?;
     }
@@ -1232,12 +1265,12 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     if let Some(before) = restore_phy {
         restore_signal_levels(&phy_io, port, before)?;
     } else {
-        pre_enable_tc_hdmi_encoder(&phy_io, port, mode.clock_khz)?;
+        encoder_ops.pre_enable(mode.clock_khz)?;
     }
     // HDMI on ADL-P/DKL has zero DP lanes and retains board lane reversal. TC
     // PHY ownership remains asserted; no inferred swing or USB-C mux is set.
     let output = (buffer & DDI_LANE_REVERSAL) | DDI_TC_PHY_OWNERSHIP;
-    enable_tc_hdmi_encoder(r, timer, port, output)?;
+    encoder_ops.enable(output)?;
     write(
         r,
         p::PIPECONF_A.offset(),
