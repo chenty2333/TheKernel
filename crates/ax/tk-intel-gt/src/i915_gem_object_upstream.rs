@@ -489,7 +489,7 @@ pub unsafe fn __i915_gem_free_object(obj: *mut DrmI915GemObject) {
 
 // upstream: i915_gem_object.c __i915_gem_free_objects()
 unsafe fn __i915_gem_free_objects(i915: *mut DrmI915Private, freed: *mut LlistNode) {
-    let member_offset = core::mem::offset_of!(DrmI915GemObject, freed);
+    let member_offset = core::mem::offset_of!(DrmI915GemObject, rcu_or_freed.freed);
     let mut node = freed;
 
     while !node.is_null() {
@@ -795,7 +795,7 @@ pub unsafe fn i915_gem_object_placement_possible(
     }
 
     for i in 0..(*obj).mm.n_placements as usize {
-        if (*(*obj).mm.placements.add(i)).r#type == memory_type {
+        if (**(*obj).mm.placements.add(i)).r#type == memory_type {
             return true;
         }
     }
@@ -818,7 +818,7 @@ pub unsafe fn i915_gem_object_needs_ccs_pages(obj: *mut DrmI915GemObject) -> boo
 
     while i < (*obj).mm.n_placements as c_int {
         // Compression is not allowed with a system-memory placement.
-        let memory_type = (*(*obj).mm.placements.add(i as usize)).r#type;
+        let memory_type = (**(*obj).mm.placements.add(i as usize)).r#type;
         if memory_type == INTEL_MEMORY_SYSTEM {
             return false;
         }
