@@ -12,7 +12,7 @@ use crate::{
     intel_context_types_upstream::File,
     linux_i915_private::Inode,
     i915_gem_ww_upstream::WwAcquireCtx,
-    intel_context_upstream::{DrmGemObjectBaseLayout, DrmVmaOffsetNode},
+    intel_context_upstream::{DrmGemObjectBaseLayout, DrmVmaOffsetNode, Kref},
     intel_engine_cs_upstream::ListHead,
     linux_i915_private::DrmVmaOffsetManager,
     linux::ww_mutex::{
@@ -214,16 +214,75 @@ pub unsafe fn drm_device_device(drm: *mut core::ffi::c_void) -> *mut core::ffi::
     unsafe { (*drm.cast::<DrmDevice>()).dev }
 }
 
-/// Opaque TTM arm of `drm_i915_gem_object.base`; target-configured x86_64
-/// storage is 480 bytes and the i915 owner does not access TTM-private fields.
+/// Target x86_64 prefix of `drm_gem_object`, embedded at offset zero in TTM.
+#[repr(C, align(8))]
+pub struct TtmGemObjectPrefix {
+    pub refcount: Kref,
+    _refcount_padding: [u8; 4],
+    pub dev: *mut core::ffi::c_void,
+    pub filp: *mut core::ffi::c_void,
+    pub vma_node: DrmVmaOffsetNode,
+    pub size: u64,
+    _name_and_padding: [u8; 8],
+    pub dma_buf: *mut core::ffi::c_void,
+    pub import_attach: *mut core::ffi::c_void,
+    pub resv: *mut core::ffi::c_void,
+    pub _resv: DmaResv,
+    _gpuva: [u8; 40],
+    pub funcs: *const core::ffi::c_void,
+    _lru_node: [u8; 16],
+    _lru: *mut core::ffi::c_void,
+}
+const _: [(); 368] = [(); size_of::<TtmGemObjectPrefix>()];
+
+/// Linux v7.2.3 TTM buffer-object layout, with the unused tail opaque.
 #[repr(C, align(8))]
 pub struct TtmBufferObjectLayout {
-    /// The DRM GEM base is the leading TTM member; the remaining TTM-private
-    /// payload is not accessed by this GT/GEM translation.
-    pub base: DrmGemObjectBaseLayout,
+    pub base: TtmGemObjectPrefix,
+    pub bdev: *mut core::ffi::c_void,
+    _type: u32,
+    _page_alignment: u32,
+    _destroy: *const core::ffi::c_void,
+    _kref: Kref,
+    _kref_padding: u32,
+    pub resource: *mut TtmResource,
+    _tail: [u8; 72],
 }
 const _: [(); 480] = [(); size_of::<TtmBufferObjectLayout>()];
 const _: [(); 8] = [(); align_of::<TtmBufferObjectLayout>()];
+const _: [(); 368] = [(); offset_of!(TtmBufferObjectLayout, bdev)];
+const _: [(); 400] = [(); offset_of!(TtmBufferObjectLayout, resource)];
+
+/// TTM resource prefix used by the i915 mappable-memory predicate.
+#[repr(C, align(8))]
+pub struct TtmResource {
+    _start: usize,
+    pub size: usize,
+    pub mem_type: u32,
+    _tail: [u8; 68],
+}
+const _: [(); 88] = [(); size_of::<TtmResource>()];
+
+#[inline]
+pub unsafe fn i915_ttm_resource_visible_size(res: *mut TtmResource) -> usize {
+    // i915_ttm_buddy_resource::used_visible_size follows the 88-byte base,
+    // list_head, and flags. Its offset is bound from Linux's target layout.
+    unsafe { res.cast::<u8>().add(112).cast::<usize>().read() }
+}
+
+/// `ttm_device::dev_mapping` from the configured Linux 7.2.3 x86_64 layout.
+/// The enclosing TTM device has many opaque subrecords; this is the only
+/// member used by i915's mmap-offset invalidation path.
+#[inline]
+pub unsafe fn ttm_device_dev_mapping(bdev: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    const DEV_MAPPING_OFFSET: usize = 1656;
+    unsafe {
+        bdev.cast::<u8>()
+            .add(DEV_MAPPING_OFFSET)
+            .cast::<*mut core::ffi::c_void>()
+            .read()
+    }
+}
 
 /// `i915_gem_to_ttm()` from `gem/i915_gem_ttm.h`: the TTM BO is the
 /// alternate arm of the GEM object's base union, at the same address.

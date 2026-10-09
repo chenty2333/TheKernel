@@ -28,7 +28,7 @@ use crate::{
     intel_engine_cs_upstream::{AtomicT, ListHead, LlistNode, Mutex, RbNode, RbRoot, Spinlock},
     intel_gt_defines_types_upstream::I915_MAX_GT,
     linux::{
-        gem::{DrmGemObject, TtmBufferObjectLayout},
+        gem::{DrmGemObject, TtmBufferObjectLayout, TtmResource},
         gem_memory::IntelMemoryRegion,
         mmu_notifier::MmuIntervalNotifier,
     },
@@ -42,10 +42,6 @@ pub struct I915Frontbuffer {
     _opaque: [u8; 0],
 }
 pub use crate::linux::mm::VmOperationsStruct;
-#[repr(C)]
-pub struct TtmResource {
-    _opaque: [u8; 0],
-}
 #[repr(C)]
 pub struct Page {
     _opaque: [u8; 0],
