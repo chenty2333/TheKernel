@@ -3,7 +3,7 @@
 //! admitted modes may change the DKL PLL, transcoder timing, and plane while
 //! retaining the captured WM/DDB policy. Uses MIT i915 readouts/programming in
 //! `tk-intel-display`; adapter/ownership policy is original TheKernel code.
-//! Only pipe-A, opaque linear XR24, no scaling/color/DSC/VRR is admitted.
+//! Only pipe-A, opaque linear XR24/RG16, no scaling/color/DSC/VRR is admitted.
 //! Hardware writes remain opt-in.
 use alloc::{format, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, Ordering, fence};
@@ -181,7 +181,7 @@ fn native_modes(
             vic: 16,
         };
         if !target.timing.same_timing(&current.timing)
-            && pitch_for(target.kms.width)
+            && pitch_for(target.kms.width, 4)
                 .is_some_and(|pitch| retained_watermark_budget(f, target, pitch))
             && intel_display::dpll_mgr::icl_calc_mg_pll_state(
                 target.timing.clock_khz,
@@ -465,7 +465,7 @@ fn capture(
         universal_plane::Plane::PRIMARY,
     )?
     .ok_or(Error::Refused)?;
-    if !plane.native_linear_xrgb()
+    if !plane.native_linear_rgb()
         || plane.offset != 0
         || (plane.width, plane.height) != pipe.source
         || read(r, 0x7018c)? != 0
@@ -684,6 +684,7 @@ struct Bound {
 struct State {
     firmware: Firmware,
     current_mode: NativeMode,
+    current_format: u32,
     connected: bool,
     last_hpd_poll: u64,
     last_hpd_irq: Option<u64>,
@@ -853,18 +854,27 @@ fn latch(r: &impl Registers, timer: &impl PollTimer, address: u32) -> Result<(),
     Err(Error::Refused)
 }
 
-fn pitch_for(width: u32) -> Option<u32> {
+fn cpp_for_format(format: u32) -> Option<u32> {
+    match format {
+        intel_display::universal_plane::XRGB8888 => Some(4),
+        intel_display::universal_plane::RGB565 => Some(2),
+        _ => None,
+    }
+}
+
+fn pitch_for(width: u32, cpp: u32) -> Option<u32> {
     width
-        .checked_mul(4)?
+        .checked_mul(cpp)?
         .checked_add(63)
         .map(|pitch| pitch & !63)
 }
 
-/// Preserve firmware WM/DDB only for the source-checked linear-XRGB profile.
+/// Preserve firmware WM/DDB only for the source-checked linear RGB profile.
 /// Clock and pitch alone are not a watermark proof: method selection, line
 /// demand and DDB minima also depend on htotal/width. The exact 4K30->1080p60
 /// reduction has a matching source line time and no worse demand at every
-/// source-valid latency; unknown profiles refuse before display writes.
+/// source-valid latency; RGB565 uses at most half the line bytes. Unknown
+/// profiles refuse before display writes.
 fn retained_watermark_budget(baseline: &Firmware, target: NativeMode, pitch: u32) -> bool {
     intel_display::watermark::adlp_linear_xrgb_4k30_watermark_profile_no_worse(
         baseline.pixel_clock,
@@ -894,6 +904,7 @@ fn same_mode_state(
     observed: &Firmware,
     baseline: &Firmware,
     mode: NativeMode,
+    pixel_format: u32,
     surface: u32,
     pitch: u32,
     pll: &intel_display::dpll_mgr::DklPllState,
@@ -929,7 +940,8 @@ fn same_mode_state(
         && observed.ddi.port == Some(route)
         && observed.ddi.mode == intel_display::ddi::DdiMode::Hdmi
         && observed.ddi.bpp == Some(24)
-        && observed.plane.native_linear_xrgb()
+        && observed.plane.fourcc == pixel_format
+        && observed.plane.native_linear_rgb()
         && observed.plane.pitch == pitch
         && observed.plane.width == u32::from(t.hdisplay)
         && observed.plane.height == u32::from(t.vdisplay)
@@ -990,9 +1002,12 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
         false
     }
     fn primary_formats(&self) -> &'static [u32] {
-        // Native fastboot currently validates and programs only the exact
-        // opaque linear XR24 primary-plane path.
-        &[intel_display::universal_plane::XRGB8888]
+        // Only source-mapped linear XR24 and RGB565 formats are enabled by
+        // the current primary-plane transaction.
+        &[
+            intel_display::universal_plane::XRGB8888,
+            intel_display::universal_plane::RGB565,
+        ]
     }
     fn gamma_lut_size(&self) -> u32 {
         256
@@ -1216,16 +1231,13 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
         if mode.is_none() {
             return Err(DrmError::Unsupported);
         }
-        let expected_pitch = request
-            .width
-            .checked_mul(4)
-            .and_then(|width| width.checked_add(63))
-            .map(|width| width & !63)
-            .ok_or(DrmError::Overflow)?;
-        if request.bpp != 32
-            || pitch != expected_pitch
-            || size != u64::from(pitch) * u64::from(request.height)
-        {
+        let cpp = match request.bpp {
+            16 => 2,
+            32 => 4,
+            _ => return Err(DrmError::Unsupported),
+        };
+        let expected_pitch = pitch_for(request.width, cpp).ok_or(DrmError::Overflow)?;
+        if pitch != expected_pitch || size != u64::from(pitch) * u64::from(request.height) {
             return Err(DrmError::Unsupported);
         }
         let aligned = usize::try_from(size)
@@ -1247,15 +1259,17 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
         let Some(target) = self.modes.iter().find(|mode| mode.kms == s.mode).copied() else {
             return Err(DrmError::Unsupported);
         };
-        let Some(expected_pitch) = pitch_for(target.kms.width) else {
+        let Some(cpp) = cpp_for_format(s.format) else {
+            return Err(DrmError::Unsupported);
+        };
+        let Some(expected_pitch) = pitch_for(target.kms.width, cpp) else {
             return Err(DrmError::Overflow);
         };
         if s.width != target.kms.width
             || s.height != target.kms.height
             || s.framebuffer_width != s.width
             || s.pitch != expected_pitch
-            || s.bpp != 32
-            || s.format != intel_display::universal_plane::XRGB8888
+            || s.bpp != cpp * 8
             || s.framebuffer_offset != 0
             || !s.offset.is_multiple_of(4096)
             || s.offset != u64::from(s.source_y) * u64::from(s.pitch)
@@ -1403,7 +1417,8 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             });
         };
         let changing_mode = target.timing != state.current_mode.timing;
-        if changing_mode
+        let changing_scanout = changing_mode || s.format != state.current_format;
+        if changing_scanout
             && super::atomic_modeset_wiring::preflight_native_mode_change(
                 state.current_mode.timing,
                 target.timing,
@@ -1413,7 +1428,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
         {
             // The translated-state projection is pure and runs before the
             // existing TC transaction. It only admits the same Pipe-A, TC1/2,
-            // linear-XRGB8888, RGB 8-bpc, VIC 16/95 subset; it does not execute
+            // linear XRGB8888/RGB565, RGB 8-bpc, VIC 16/95 subset; it does not execute
             // any atomic hook or replace `tc_modeset::program`.
             if let Some(new) = next {
                 // SAFETY: the preflight only inspects CPU-side state, before
@@ -1431,7 +1446,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                 DrmError::Unsupported
             });
         }
-        if !changing_mode {
+        if !changing_scanout {
             if latch(&self.registers, &self.timer, surface).is_err() {
                 let recovered = latch(&self.registers, &self.timer, before).is_ok();
                 if let Some(new) = next {
@@ -1579,6 +1594,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                         self.port,
                         &target.timing,
                         s.pitch,
+                        s.format,
                         surface,
                         Some(watermark),
                         &target_pll,
@@ -1613,6 +1629,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                         &next_state,
                         &self.baseline,
                         target,
+                        s.format,
                         surface,
                         s.pitch,
                         &target_pll,
@@ -1637,6 +1654,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                 Ok(next_state) => {
                     state.firmware = next_state;
                     state.current_mode = target;
+                    state.current_format = s.format;
                 }
                 Err(original) if !display_writes_started => {
                     // Preflight and the HDA retirement gate precede every
@@ -1673,6 +1691,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                             self.port,
                             &old_mode.timing,
                             old_pitch,
+                            old_firmware.plane.fourcc,
                             old_surface,
                             Some(watermark),
                             &old_firmware.pll.state,
@@ -1706,6 +1725,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                                 &restored,
                                 &self.baseline,
                                 old_mode,
+                                old_firmware.plane.fourcc,
                                 old_surface,
                                 old_pitch,
                                 &old_firmware.pll.state,
@@ -2051,6 +2071,7 @@ pub(super) fn init(
         pci,
         irq_event_sequence: AtomicU32::new(0),
         state: Mutex::new(State {
+            current_format: firmware.plane.fourcc,
             firmware,
             current_mode,
             connected: true,
@@ -2153,6 +2174,18 @@ mod tests {
             num_levels: 6,
             sagv_block_time_us: 0,
         }
+    }
+
+    #[test]
+    fn native_primary_formats_match_source_plane_encodings() {
+        let (adapter, ..) = native();
+        assert_eq!(
+            adapter.primary_formats(),
+            &[
+                intel_display::universal_plane::XRGB8888,
+                intel_display::universal_plane::RGB565,
+            ]
+        );
     }
 
     #[derive(Clone)]
@@ -2495,6 +2528,7 @@ mod tests {
             },
             irq_event_sequence: AtomicU32::new(0),
             state: Mutex::new(State {
+                current_format: firmware.plane.fourcc,
                 firmware,
                 current_mode,
                 connected: true,
@@ -2644,6 +2678,7 @@ mod tests {
             },
             irq_event_sequence: AtomicU32::new(0),
             state: Mutex::new(State {
+                current_format: firmware.plane.fourcc,
                 firmware,
                 current_mode,
                 connected: true,
@@ -2729,7 +2764,7 @@ mod tests {
     fn scanout_for_full_mode(a: &Native<Model, Timer>, mode: NativeMode) -> Scanout {
         let width = mode.kms.width;
         let height = mode.kms.height;
-        let pitch = pitch_for(width).unwrap();
+        let pitch = pitch_for(width, 4).unwrap();
         let backing_size = u64::from(pitch) * u64::from(height);
         let backing = a
             .create_dumb(
@@ -2976,7 +3011,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let probe_pitch = pitch_for(probe_target.kms.width).unwrap();
+        let probe_pitch = pitch_for(probe_target.kms.width, 4).unwrap();
         let probe_surface = probe_baseline.plane.surface();
         let mut probe_display_writes_started = false;
         let probe_result = super::super::tc_modeset::program(
@@ -2985,6 +3020,7 @@ mod tests {
             probe.port,
             &probe_target.timing,
             probe_pitch,
+            probe_baseline.plane.fourcc,
             probe_surface,
             None,
             &probe_pll,
@@ -3010,6 +3046,7 @@ mod tests {
                 &probe_observed,
                 &probe.baseline,
                 probe_target,
+                probe_baseline.plane.fourcc,
                 probe_surface,
                 probe_pitch,
                 &probe_pll,
@@ -3056,6 +3093,7 @@ mod tests {
                 &observed,
                 &a.baseline,
                 target,
+                intel_display::universal_plane::XRGB8888,
                 surface,
                 pitch,
                 &observed.pll.state,
@@ -3133,6 +3171,7 @@ mod tests {
                 &observed,
                 &a.baseline,
                 a.modes[0],
+                original.plane.fourcc,
                 old_surface,
                 original.plane.pitch,
                 &original.pll.state,

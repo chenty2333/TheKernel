@@ -25,6 +25,7 @@ const PIPE_A: u8 = 0;
 const PORT_TC1: u8 = 3;
 const PORT_TC2: u8 = 4;
 const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+const DRM_FORMAT_RGB565: u32 = 0x3631_4752;
 const EOPNOTSUPP: i32 = -95;
 
 /// An action already performed inside the existing TC-HDMI transaction.
@@ -174,9 +175,9 @@ pub(crate) fn project_pipe_a(
         || state.planes.iter().any(|plane| {
             plane.id != 0
                 || plane.is_y_plane
-                || plane.new_format != DRM_FORMAT_XRGB8888
+                || !matches!(plane.new_format, DRM_FORMAT_XRGB8888 | DRM_FORMAT_RGB565)
                 || plane.new_modifier != 0
-                || plane.old_format != DRM_FORMAT_XRGB8888
+                || !matches!(plane.old_format, DRM_FORMAT_XRGB8888 | DRM_FORMAT_RGB565)
                 || plane.old_modifier != 0
                 || !plane.old_visible
                 || !plane.old_fb_exists

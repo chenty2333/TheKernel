@@ -169,6 +169,14 @@ Four ordering details worth stating:
 | `PLANE_SURF(A,1)` | the GGTT address, `[31:12]` | §5.4; the parameter of `compute` |
 | `PIPE_MISC(A)` | `[7:5] = 0` (8 bpc), `[4:2] = 0` (dithering off), `[8] = 1` (pixel rounding truncated) | §8.4, §11 step 5.6, §4.7 |
 
+The concrete control/stride row above is the XRGB8888 worked example. The active
+Native primary path also supports linear RGB565 (`cpp=2`): the translated plane
+format field is `14 << 24`, source `adlp_plane_ctl_arb_slots()` returns zero
+for its two-byte pixel format, and the source watermark input uses `cpp=2`.
+At 1920 pixels the corresponding 64-byte-unit stride is 60 (3840 bytes).
+Both formats are surfaced through the Native `IN_FORMATS` blob with only the
+linear modifier; other pixel layouts remain refused.
+
 Three of these need more than a citation.
 
 ### 3.1 `PLANE_SIZE` is `PIPESRC` with its halves swapped

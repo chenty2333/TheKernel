@@ -954,6 +954,7 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     port: TcPort,
     mode: &Mode,
     pitch: u32,
+    pixel_format: u32,
     surface: u32,
     watermark: Option<pipe::WatermarkConfig>,
     pll: &DklPllState,
@@ -967,6 +968,15 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     display_writes_started: &mut bool,
 ) -> Result<(), String> {
     *display_writes_started = false;
+    let cpp = match pixel_format {
+        intel_display::universal_plane::XRGB8888 => 4,
+        intel_display::universal_plane::RGB565 => 2,
+        _ => {
+            return Err(String::from(
+                "TC primary plane pixel format is not admitted",
+            ));
+        }
+    };
     let function = read(r, ddi::TRANS_DDI_FUNC_CTL_A.offset())?;
     if !matches!(
         intel_display::ddi::decode_function_control(function).port,
@@ -978,7 +988,7 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         || !matches!(source_hdmi_tmds_clock(mode, edid), Some(25_000..=300_000))
         || surface == 0
         || surface & 0xfff != 0
-        || pitch < u32::from(mode.hdisplay) * 4
+        || pitch < u32::from(mode.hdisplay) * cpp
         || !pitch.is_multiple_of(64)
     {
         return Err(String::from(
@@ -998,9 +1008,13 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         stride_bytes: pitch,
     };
     let pipe_program = match watermark {
-        Some(watermark) => {
-            pipe::compute_with_watermarks(pipe::Pipe::A, mode, plane_surface, watermark)
-        }
+        Some(watermark) => pipe::compute_with_watermarks_format(
+            pipe::Pipe::A,
+            mode,
+            plane_surface,
+            watermark,
+            pixel_format,
+        ),
         None => {
             #[cfg(test)]
             {

@@ -915,15 +915,18 @@ pub(crate) struct WatermarkConfig {
 }
 
 impl WatermarkProgram {
-    /// Build the single visible XRGB8888 primary-plane watermarks with the
-    /// translated `skl_build_plane_wm_single()` path, then apply i915's DDB
+    /// Build single-visible-plane watermarks for the selected packed RGB
+    /// format with the translated `skl_build_plane_wm_single()` path, then apply i915's DDB
     /// minimum-allocation checks before packing the register program.
     fn from_i915(
         ddb: DdbAllocation,
         mode: &Mode,
         config: WatermarkConfig,
+        pixel_format: u32,
     ) -> Result<Self, PipeError> {
         use intel_display::skl_watermark_full as wm;
+
+        let cpp = pixel_format_cpp(pixel_format)?;
 
         let display = wm::DisplayCaps {
             display_ver: config.display_ver,
@@ -936,7 +939,7 @@ impl WatermarkProgram {
         };
         let input = wm::PlaneWmInput {
             width: u32::from(mode.hdisplay),
-            cpp: 4,
+            cpp: cpp as u8,
             pixel_rate: mode.clock_khz,
             pipe_htotal: u32::from(mode.htotal),
             num_format_planes: 1,
@@ -1056,7 +1059,7 @@ pub(crate) struct PlaneProgram {
     pub(crate) offset: u32,
     /// `PLANE_COLOR_CTL`: alpha disabled, no CSC, no gamma.
     pub(crate) color_ctl: u32,
-    /// `PLANE_CTL`: enable, XRGB8888, linear.
+    /// `PLANE_CTL`: enable, the admitted packed RGB format, linear.
     pub(crate) ctl: u32,
     /// `PLANE_SURF`: the GGTT address masked to `[31:12]`.  The commit.
     pub(crate) surf: u32,
@@ -1428,7 +1431,14 @@ pub(crate) fn compute(
 ) -> Result<PipeProgram, PipeError> {
     let ddb = DdbAllocation::WHOLE_BUFFER;
     let watermark = WatermarkProgram::generous(ddb);
-    compute_with_program(pipe, mode, surface, ddb, watermark)
+    compute_with_program(
+        pipe,
+        mode,
+        surface,
+        ddb,
+        watermark,
+        intel_display::universal_plane::XRGB8888,
+    )
 }
 
 /// Compute the active pipe program using i915's latency-derived watermark
@@ -1440,8 +1450,55 @@ pub(crate) fn compute_with_watermarks(
     config: WatermarkConfig,
 ) -> Result<PipeProgram, PipeError> {
     let ddb = DdbAllocation::WHOLE_BUFFER;
-    let watermark = WatermarkProgram::from_i915(ddb, mode, config)?;
-    compute_with_program(pipe, mode, surface, ddb, watermark)
+    let format = intel_display::universal_plane::XRGB8888;
+    let watermark = WatermarkProgram::from_i915(ddb, mode, config, format)?;
+    compute_with_program(pipe, mode, surface, ddb, watermark, format)
+}
+
+/// Compute a source-watermarked primary plane for a format with a complete
+/// source-derived register encoding and bytes-per-pixel profile.
+pub(crate) fn compute_with_watermarks_format(
+    pipe: Pipe,
+    mode: &Mode,
+    surface: PlaneSurface,
+    config: WatermarkConfig,
+    pixel_format: u32,
+) -> Result<PipeProgram, PipeError> {
+    let ddb = DdbAllocation::WHOLE_BUFFER;
+    let watermark = WatermarkProgram::from_i915(ddb, mode, config, pixel_format)?;
+    compute_with_program(pipe, mode, surface, ddb, watermark, pixel_format)
+}
+
+fn plane_format_fields(pixel_format: u32) -> Result<(u32, u32, u32), PipeError> {
+    use intel_display::skl_universal_plane_full as source;
+
+    let cpp = match pixel_format {
+        intel_display::universal_plane::XRGB8888 => 4,
+        intel_display::universal_plane::RGB565 => 2,
+        _ => return Err(PipeError::UnsupportedFormat { pixel_format }),
+    };
+    let (source_format, yuv) = match pixel_format {
+        intel_display::universal_plane::XRGB8888 => (source::DRM_FORMAT_XRGB8888, false),
+        intel_display::universal_plane::RGB565 => (source::DRM_FORMAT_RGB565, false),
+        _ => return Err(PipeError::UnsupportedFormat { pixel_format }),
+    };
+    let format_info = source::FormatInfo {
+        cpp: [cpp as u8, 0, 0, 0],
+        planes: 1,
+        yuv_semiplanar: false,
+        is_yuv: yuv,
+    };
+    let ctl = match source_format {
+        source::DRM_FORMAT_XRGB8888 => source::FMT_XRGB8888,
+        source::DRM_FORMAT_RGB565 => source::FMT_RGB565,
+        _ => return Err(PipeError::UnsupportedFormat { pixel_format }),
+    };
+    let arb_slots = source::adlp_plane_ctl_arb_slots(format_info);
+    Ok((cpp, ctl, arb_slots))
+}
+
+fn pixel_format_cpp(pixel_format: u32) -> Result<u32, PipeError> {
+    plane_format_fields(pixel_format).map(|(cpp, ..)| cpp)
 }
 
 fn compute_with_program(
@@ -1450,7 +1507,9 @@ fn compute_with_program(
     surface: PlaneSurface,
     ddb: DdbAllocation,
     watermark: WatermarkProgram,
+    pixel_format: u32,
 ) -> Result<PipeProgram, PipeError> {
+    let (_cpp, format_ctl, arb_slots) = plane_format_fields(pixel_format)?;
     let timings = timing::timing_registers(mode)?;
     let plane = PlaneProgram {
         stride: PlaneProgram::stride_field(surface.stride_bytes)?,
@@ -1464,7 +1523,7 @@ fn compute_with_program(
         size: timings.pipesrc().rotate_left(16),
         offset: 0,
         color_ctl: PLANE_COLOR_CTL_LINEAR_RGB,
-        ctl: PLANE_CTL_LINEAR_XRGB8888,
+        ctl: PLANE_CTL_ENABLE | format_ctl | PLANE_CTL_TILED_LINEAR | arb_slots,
         surf: PlaneProgram::surface_field(surface.ggtt_address)?,
     };
     Ok(PipeProgram {
@@ -1497,6 +1556,9 @@ fn compute_with_program(
 /// rendered form the boot log carries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PipeError {
+    /// The active primary-plane writer has no proven register encoding for
+    /// this pixel format.
+    UnsupportedFormat { pixel_format: u32 },
     /// A register the sequence cannot do without was outside the mapped window.
     Unreadable { register: &'static str },
     /// A write did not happen: the register is not declared writable, or it is
@@ -1532,6 +1594,10 @@ impl PipeError {
     /// showing either a picture or nothing, and nothing else to go on.
     pub(crate) fn describe(&self) -> String {
         match self {
+            Self::UnsupportedFormat { pixel_format } => format!(
+                "primary-plane pixel format {pixel_format:#x} has no admitted linear source \
+                 encoding"
+            ),
             Self::Unreadable { register } => format!(
                 "{register} could not be read: it is outside the mapped register window, so the \
                  display engine's state cannot be established.  Reference section 2.2"
