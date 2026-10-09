@@ -67,6 +67,28 @@ pub const VM_DONTDUMP: c_ulong = 1 << 26;
 pub const VM_MIXEDMAP: c_ulong = 1 << 28;
 pub const VM_MAYWRITE: c_ulong = 1 << 5;
 
+// Linux 7.2.3 include/linux/mmap_lock.h uses this helper when
+// CONFIG_PER_VMA_LOCK=y (the configured wt-dev target).
+unsafe extern "C" {
+    fn __vma_start_write(vma: *mut VmAreaStruct, state: i32) -> i32;
+}
+
+#[inline]
+pub unsafe fn vm_flags_set(vma: *mut VmAreaStruct, flags: c_ulong) {
+    unsafe {
+        __vma_start_write(vma, crate::linux::wait::TASK_UNINTERRUPTIBLE as i32);
+        (*vma).vm_flags |= flags;
+    }
+}
+
+#[inline]
+pub unsafe fn vm_flags_clear(vma: *mut VmAreaStruct, flags: c_ulong) {
+    unsafe {
+        __vma_start_write(vma, crate::linux::wait::TASK_UNINTERRUPTIBLE as i32);
+        (*vma).vm_flags &= !flags;
+    }
+}
+
 const _: [(); 192] = [(); core::mem::size_of::<VmAreaStruct>()];
 const _: [(); 64] = [(); core::mem::align_of::<VmAreaStruct>()];
 const _: [(); 40] = [(); core::mem::offset_of!(VmAreaStruct, vm_lock_seq)];
