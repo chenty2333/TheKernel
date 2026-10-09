@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pathlib
 import os
+import re
 import subprocess
 import shlex
 import socket
@@ -136,8 +137,18 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         self.assertIn('echo "$marker"', smoke)
         self.assertIn("/usr/lib/gbm/dri_gbm.so", smoke)
         self.assertIn("LD_BIND_NOW=1 MESA_LOADER_DRIVER_OVERRIDE=iris", smoke)
+        self.assertIn("LD_BIND_NOW=1 \"$client\" --loader-only", smoke)
+        self.assertIn("INTEL_MESA_LOADER_ONLY dri=iris_dri\\.so extensions=", smoke)
         self.assertIn("renderer=not_tested", smoke)
         self.assertNotIn('$client --execute', smoke)
+        mesa_client = (ROOT / "tests/guest/graphics/intel-mesa-smoke.c").read_text()
+        loader_only = mesa_client.split("static int loader_only(void) {", 1)[1].split("int main(", 1)[0]
+        self.assertIn('const char *path = "/usr/lib/dri/iris_dri.so"', loader_only)
+        self.assertIn("dlopen(path, RTLD_NOW | RTLD_LOCAL)", loader_only)
+        self.assertIn('dlsym(module, "__driDriverGetExtensions_iris")', loader_only)
+        self.assertIn("get_extensions()", loader_only)
+        self.assertIn("device=not_opened renderer=not_tested", loader_only)
+        self.assertIsNone(re.search(r"\bopen\s*\(", loader_only))
         vulkan_smoke = self.read("overlay/n305-iris-smoke/etc/init.d/S91n305-vulkan-smoke")
         self.assertIn("VK_DRIVER_FILES=\"$icd\"", vulkan_smoke)
         self.assertIn("vulkaninfo --summary", vulkan_smoke)
@@ -434,13 +445,21 @@ sleep() { echo wait; }
 
     def test_n305_graphics_builder_reuses_base_and_optional_iris_guest_check(self) -> None:
         builder = (ROOT / "scripts/build-n305-graphics-rootfs.sh").read_text()
+        runtime_stager = (GRAPHICS / "stage-n305-mesa-runtime.sh").read_text()
+        guest_tools = (GRAPHICS / "build-guest-tools.sh").read_text()
         self.assertIn('"$SOURCE/host/bin/x86_64-buildroot-linux-gnu-gcc"', builder)
         self.assertIn('"$SOURCE/host/x86_64-buildroot-linux-gnu/sysroot"', builder)
         self.assertIn('"$REPO/config/graphics/build-guest-tools.sh" "$OUT/stage"', builder)
         self.assertIn('--mesa-iris-stage "$MESA_IRIS_STAGE"', builder)
-        self.assertIn('"$REPO/config/graphics/overlay/n305-iris-smoke/etc/init.d/S90n305-iris-smoke"', builder)
-        self.assertIn('"$OUT/stage/etc/thekernel/n305-iris-loader-smoke"', builder)
-        self.assertNotIn('"$OUT/stage/etc/init.d/n305-iris-loader-smoke"', builder)
+        self.assertIn('stage-n305-mesa-runtime.sh', builder)
+        self.assertIn('S90n305-iris-smoke', runtime_stager)
+        self.assertIn('n305-iris-loader-smoke', runtime_stager)
+        self.assertIn('usr/lib/dri/libdril_dri.so', runtime_stager)
+        self.assertIn('usr/lib/dri/iris_dri.so', runtime_stager)
+        self.assertIn('__driDriverGetExtensions_iris', runtime_stager)
+        self.assertIn('intel_icd.x86_64.json', runtime_stager)
+        self.assertIn('n305-anv-loader-smoke', runtime_stager)
+        self.assertIn('"-lgbm -lEGL -lGLESv2 -ldl"', guest_tools)
         self.assertIn("q35-graphics-seatd", builder)
 
     def test_graphics_smoke_hands_an_existing_rootfs_to_the_drive_transport_without_building(self) -> None:

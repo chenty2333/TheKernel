@@ -43,12 +43,8 @@ STAGING_DIR="$SOURCE/host/x86_64-buildroot-linux-gnu/sysroot" \
     "$REPO/config/graphics/build-guest-tools.sh" "$OUT/stage"
 "$REPO/scripts/stage-rootfs-firmware.sh" "$OUT/stage"
 if [[ -n "$MESA_IRIS_STAGE" ]]; then
-    install -m 0644 \
-        "$MESA_IRIS_STAGE/usr/lib/libgallium-26.1.2.so" \
-        "$OUT/stage/usr/lib/libgallium-26.1.2.so"
-    install -m 0755 \
-        "$REPO/config/graphics/overlay/n305-iris-smoke/etc/init.d/S90n305-iris-smoke" \
-        "$OUT/stage/etc/thekernel/n305-iris-loader-smoke"
+    "$REPO/config/graphics/stage-n305-mesa-runtime.sh" \
+        "$MESA_IRIS_STAGE" "$OUT/stage"
 fi
 # No persistent home disk, audio device or Virgl dependency on the DUT.
 printf 'q35-graphics-seatd\n' > "$OUT/stage/etc/thekernel-graphics-flavor"

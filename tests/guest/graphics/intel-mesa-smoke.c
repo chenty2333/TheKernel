@@ -1,15 +1,18 @@
 /* SPDX-License-Identifier: MIT
  * Copyright 2026 TheKernel contributors.
- * Explicit real Mesa/iris acceptance. Never invoked by default guest tests.
- * Initialization and shader/result markers are separate, neither is a model.
+ * Explicit Mesa/iris acceptance plus a no-render DRI metadata loader probe.
+ * Never invoked by default guest tests. Initialization and shader/result
+ * markers are separate, neither is a model.
  */
 #define _GNU_SOURCE
 #include <drm.h>
 #include <i915_drm.h>
+#include <GL/internal/dri_interface.h>
 #include <gbm.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,9 +28,59 @@ static GLuint shader(GLenum type, const char *text) {
     if(!okay){char log[2048]={0};glGetShaderInfoLog(object,sizeof(log),NULL,log);fprintf(stderr,"INTEL_MESA_FAIL shader %s\n",log);glDeleteShader(object);return 0;}
     return object;
 }
+
+static int loader_only(void) {
+    const char *path = "/usr/lib/dri/iris_dri.so";
+    void *module = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!module) {
+        fprintf(stderr, "INTEL_MESA_FAIL loader_only dlopen %s: %s\n", path, dlerror());
+        return 1;
+    }
+
+    dlerror();
+    const __DRIextension **(*get_extensions)(void) =
+        (const __DRIextension **(*)(void))dlsym(module, "__driDriverGetExtensions_iris");
+    const char *error = dlerror();
+    if (error || !get_extensions) {
+        fprintf(stderr, "INTEL_MESA_FAIL loader_only getter: %s\n",
+                error ? error : "missing symbol");
+        dlclose(module);
+        return 1;
+    }
+
+    /* This is only the DRI metadata getter; do not create a screen. */
+    const __DRIextension **extensions = get_extensions();
+    unsigned count = 0;
+    if (!extensions) {
+        fprintf(stderr, "INTEL_MESA_FAIL loader_only null extension table\n");
+        dlclose(module);
+        return 1;
+    }
+    for (; count < 64 && extensions[count]; ++count) {
+        if (!extensions[count]->name || !extensions[count]->name[0] ||
+            extensions[count]->version < 1) {
+            fprintf(stderr, "INTEL_MESA_FAIL loader_only invalid extension metadata\n");
+            dlclose(module);
+            return 1;
+        }
+    }
+    if (count == 0 || count == 64) {
+        fprintf(stderr, "INTEL_MESA_FAIL loader_only empty or unterminated extension table\n");
+        dlclose(module);
+        return 1;
+    }
+
+    printf("INTEL_MESA_LOADER_ONLY dri=iris_dri.so extensions=%u device=not_opened renderer=not_tested\n",
+           count);
+    dlclose(module);
+    return 0;
+}
+
 int main(int argc,char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--loader-only"))
+        return loader_only();
     if(argc!=3 || (strcmp(argv[1],"--initialize") && strcmp(argv[1],"--execute"))) {
-        fprintf(stderr,"usage: intel-mesa-smoke {--initialize|--execute} /dev/dri/renderD128\n");return 2;
+        fprintf(stderr,"usage: intel-mesa-smoke {--loader-only|--initialize|--execute} [/dev/dri/renderD128]\n");return 2;
     }
     int result=1,fd=-1,chipset=0;
     struct gbm_device *gbm=NULL;

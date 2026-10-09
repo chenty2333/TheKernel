@@ -98,19 +98,7 @@ case "$flavor" in
                 printf 'Mesa iris stage does not exist: %s\n' "$mesa_iris_stage_input" >&2
                 exit 1
             }
-            iris_gallium=$mesa_iris_stage/usr/lib/libgallium-26.1.2.so
-            [ -r "$iris_gallium" ] || {
-                printf 'target Mesa iris library missing from stage: %s\n' "$iris_gallium" >&2
-                exit 1
-            }
-            command -v readelf >/dev/null || { printf '%s\n' 'readelf is required to validate the Mesa iris stage' >&2; exit 1; }
-            readelf -h "$iris_gallium" | grep -q 'Class:.*ELF64'
-            readelf -h "$iris_gallium" | grep -q 'Machine:.*Advanced Micro Devices X86-64'
-            readelf -d "$iris_gallium" | grep -q 'SONAME.*libgallium-26\.1\.2\.so'
-            grep -aFq 'iris_driver_descriptor' "$iris_gallium" || {
-                printf 'staged libgallium does not contain the Mesa iris driver: %s\n' "$iris_gallium" >&2
-                exit 1
-            }
+            "$REPO_ROOT/config/graphics/stage-n305-mesa-runtime.sh" --check "$mesa_iris_stage"
         elif [ "$check_only" -ne 1 ]; then
             printf '%s\n' '--mesa-iris-stage is required for n305-iris-smoke builds' >&2
             exit 2
@@ -270,6 +258,7 @@ validate_n305_iris_checked_in() {
     for path in \
         "$fragment" \
         "$REPO_ROOT/config/graphics/build-guest-tools.sh" \
+        "$REPO_ROOT/config/graphics/stage-n305-mesa-runtime.sh" \
         "$REPO_ROOT/tests/guest/graphics/intel-mesa-smoke.c" \
         "$script" \
         "$REPO_ROOT/tests/guest/graphics/intel-vulkan-smoke.c" \
@@ -348,6 +337,9 @@ validate_n305_iris_build_output() {
     [ -x "$target/usr/bin/vulkaninfo" ]
     [ -x "$target/usr/bin/vainfo" ]
     [ -r "$target/usr/lib/dri/iHD_drv_video.so" ]
+    [ -r "$target/usr/lib/dri/libdril_dri.so" ]
+    [ -L "$target/usr/lib/dri/iris_dri.so" ]
+    [ "$(readlink "$target/usr/lib/dri/iris_dri.so")" = libdril_dri.so ]
     [ -r "$target/usr/share/vulkan/icd.d/intel_icd.x86_64.json" ]
     [ -r "$target/lib/firmware/i915/tgl_guc_70.bin" ]
     [ -r "$target/lib/firmware/i915/tgl_huc.bin" ]
@@ -855,12 +847,8 @@ for overlay_tree in "$REPO_ROOT"/config/graphics/overlay/*/; do
 done
 find "$staged_overlay" -type d -name __pycache__ -prune -exec rm -rf {} +
 if [ "$flavor" = n305-iris-smoke ]; then
-    # The staged DSO was built for this exact Buildroot 2026.05.2 target ABI.
-    # Its ELF soname is what the Buildroot EGL/GLES/GBM clients request; the
-    # /usr/lib location also matches the rootfs loader and GBM backend.
-    install -D -m 0644 \
-        "$mesa_iris_stage/usr/lib/libgallium-26.1.2.so" \
-        "$staged_overlay/$flavor_overlay/usr/lib/libgallium-26.1.2.so"
+    "$REPO_ROOT/config/graphics/stage-n305-mesa-runtime.sh" \
+        "$mesa_iris_stage" "$staged_overlay/$flavor_overlay"
 fi
 generated_config=$output/.thekernel-graphics.config
 sed -e "s|@REPO_ROOT@/config/graphics/overlay|$staged_overlay|g" -e "s|@REPO_ROOT@|$REPO_ROOT|g" "$COMMON" >"$generated_config"

@@ -8,6 +8,7 @@ marker=THEKERNEL_N305_IRIS_MESA_LOADER_READY
 loader=/lib/ld-linux-x86-64.so.2
 client=/usr/local/bin/intel-mesa-smoke
 log=/run/intel-mesa-smoke-usage.log
+loader_log=/run/intel-mesa-smoke-loader.log
 
 fail() {
     echo "$marker state=FAIL reason=$1" >&2
@@ -48,7 +49,17 @@ LD_BIND_NOW=1 MESA_LOADER_DRIVER_OVERRIDE=iris "$client" >"$log" 2>&1 || status=
     cat "$log" >&2
     fail guest_client_load
 }
-grep -Fq 'usage: intel-mesa-smoke {--initialize|--execute}' "$log" || fail expected_usage
+grep -Fq 'usage: intel-mesa-smoke {--loader-only|--initialize|--execute}' "$log" || fail expected_usage
 cat "$log"
-echo "$marker state=PASS layer=guest_dynamic_loader renderer=not_tested"
+
+status=0
+LD_BIND_NOW=1 "$client" --loader-only >"$loader_log" 2>&1 || status=$?
+[ "$status" -eq 0 ] || {
+    cat "$loader_log" >&2
+    fail iris_dri_loader
+}
+grep -Eq '^INTEL_MESA_LOADER_ONLY dri=iris_dri\.so extensions=[1-9][0-9]* device=not_opened renderer=not_tested$' \
+    "$loader_log" || fail iris_dri_extension_metadata
+cat "$loader_log"
+echo "$marker state=PASS layer=guest_dynamic_loader dri_metadata=checked renderer=not_tested"
 echo "$marker"

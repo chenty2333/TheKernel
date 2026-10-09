@@ -24,7 +24,7 @@ for source in "$source_dir/tests/guest/graphics/"*.c; do
     case "$name" in
         intel-mesa-smoke)
             cflags=-I$STAGING_DIR/usr/include/libdrm
-            libraries="-lgbm -lEGL -lGLESv2"
+            libraries="-lgbm -lEGL -lGLESv2 -ldl"
             ;;
         intel-vulkan-smoke)
             libraries="-lvulkan"
