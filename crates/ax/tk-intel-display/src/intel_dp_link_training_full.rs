@@ -263,9 +263,7 @@ pub trait LinkTrainingIo {
     fn queue_link_check(&mut self, delay_ms: u32);
     fn set_idle_link_train(&mut self, state: &LinkTrainingCrtcState);
     fn queue_modeset_retry(&mut self, state: &LinkTrainingCrtcState);
-    fn ignore_long_hpd(&mut self) -> bool {
-        false
-    }
+    fn ignore_long_hpd(&mut self) -> bool;
     fn trigger_hpd_irq(&mut self) {}
 }
 
@@ -1786,6 +1784,9 @@ mod tests {
         fn queue_link_check(&mut self, _: u32) {}
         fn set_idle_link_train(&mut self, _: &LinkTrainingCrtcState) {}
         fn queue_modeset_retry(&mut self, _: &LinkTrainingCrtcState) {}
+        fn ignore_long_hpd(&mut self) -> bool {
+            false
+        }
     }
 
     #[test]
