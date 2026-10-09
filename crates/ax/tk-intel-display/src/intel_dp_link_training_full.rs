@@ -222,12 +222,10 @@ pub trait LinkTrainingIo {
     fn channel_eq_delay(&mut self, phy: DpPhy, uhbr: bool) -> u32;
     fn uhbr_aux_rd_interval(&mut self) -> u32;
     fn dump_link_status(&mut self, _phy: DpPhy, _status: &[u8; DP_LINK_STATUS_SIZE]) {}
-    fn source_supports_tps3(&self) -> bool {
-        false
-    }
-    fn source_supports_tps4(&self) -> bool {
-        false
-    }
+    /// Report transmitter capability from the selected PHY/platform, not sink DPCD.
+    fn source_supports_tps3(&self) -> bool;
+    /// Report transmitter capability from the selected PHY/platform, not sink DPCD.
+    fn source_supports_tps4(&self) -> bool;
     fn edp_link_required(
         &mut self,
         link_rate: i32,
@@ -1785,6 +1783,12 @@ mod tests {
         fn set_idle_link_train(&mut self, _: &LinkTrainingCrtcState) {}
         fn queue_modeset_retry(&mut self, _: &LinkTrainingCrtcState) {}
         fn ignore_long_hpd(&mut self) -> bool {
+            false
+        }
+        fn source_supports_tps3(&self) -> bool {
+            false
+        }
+        fn source_supports_tps4(&self) -> bool {
             false
         }
     }
