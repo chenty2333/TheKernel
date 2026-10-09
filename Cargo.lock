@@ -3788,6 +3788,7 @@ dependencies = [
  "memory_addr",
  "spin 0.9.9",
  "tk-axalloc",
+ "tk-axdriver-base",
  "tk-axhal",
  "tk-axmm",
  "tk-axtask",

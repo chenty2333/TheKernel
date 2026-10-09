@@ -577,6 +577,7 @@ const INTEL_ALDERLAKE_S: u32 = 34;
 const INTEL_ALDERLAKE_P: u32 = 35;
 const INTEL_DG2: u32 = 36;
 const INTEL_METEORLAKE: u32 = 37;
+const INTEL_PINEVIEW: u32 = 10;
 
 /// Source semantics of `HAS_EXECLISTS(i915)`/`HAS_LOGICAL_RING_CONTEXTS`: the
 /// device-info bit is flag index 19 (byte 2, bit 3) in Linux v7.2.3.
@@ -705,6 +706,20 @@ pub unsafe fn IS_DGFX<P: I915PrivatePtr>(i915: P) -> bool {
     let info = unsafe { (*i915).info.cast::<IntelDeviceInfoOverlay>() };
     assert!(!info.is_null());
     unsafe { (*info).flags[0] & (1 << 2) != 0 }
+}
+
+/// `IS_MOBILE()` from i915_drv.h; the first `DEV_INFO_FOR_EACH_FLAG` bit is
+/// `is_mobile` in the Linux x86_64 `intel_device_info` layout.
+#[allow(non_snake_case)]
+pub unsafe fn IS_MOBILE<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = unsafe { INTEL_INFO(i915) };
+    !info.is_null() && unsafe { (*info).flags[0] & 1 != 0 }
+}
+
+/// `IS_PINEVIEW()` platform test used by the i915 FSB clock helper.
+#[allow(non_snake_case)]
+pub unsafe fn IS_PINEVIEW<P: I915PrivatePtr>(i915: P) -> bool {
+    unsafe { IS_PLATFORM(i915, INTEL_PINEVIEW) }
 }
 
 /// `HAS_128_BYTE_Y_TILING()` from i915_drv.h.

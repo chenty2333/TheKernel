@@ -1917,3 +1917,10 @@ source-semantic fence wait dispatcher and relative jiffies rounding helper.
 `seq_printf`/`seq_write` count and overflow behavior as original LinuxKPI, using
 the crate's typed C-format formatter. GPL `fs/seq_file.c` function bodies were
 not copied.
+
+`i915_freq_upstream.rs` translates the three MIT functions from Linux 7.2.3
+`drivers/gpu/drm/i915/i915_freq.c` (Copyright © 2025 Intel Corporation), which
+are required by the Gen4 clock-frequency branch in `intel_gt_clock_utils.c`.
+`linux/firmware.rs` supplies a fail-closed `request_firmware_nowarn` adapter
+backed by `tk-axdriver-base` rootfs firmware reads; request size is capped at
+8 MiB, and ownership is released through the matching adapter.

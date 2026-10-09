@@ -19,6 +19,9 @@ pub(crate) mod contexts;
 #[cfg(feature = "upstream-gt")]
 pub(crate) mod cpufreq;
 pub(crate) mod fields;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod firmware;
 pub(crate) mod gem;
 pub(crate) mod gem_memory;
 #[cfg(feature = "upstream-gt")]
@@ -43,6 +46,9 @@ pub(crate) mod rcu;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod scatterlist;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod seq_file;
 pub(crate) mod registers;
 pub(crate) mod requests;
 pub(crate) mod srcu;

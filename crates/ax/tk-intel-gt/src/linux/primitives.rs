@@ -33,6 +33,12 @@ pub const fn hweight8(value: u8) -> u32 {
     value.count_ones()
 }
 
+/// Linux `hweight16()`: population count of the low sixteen bits.
+#[inline]
+pub const fn hweight16(value: u16) -> u32 {
+    value.count_ones()
+}
+
 pub trait LinuxUnsigned: Copy + Ord {
     const ZERO: Self;
     const ONE: Self;
