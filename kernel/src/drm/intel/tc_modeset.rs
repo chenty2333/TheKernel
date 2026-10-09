@@ -777,23 +777,100 @@ struct TcHdmiEncoderOps<'a, R, T> {
     registers: &'a R,
     timer: &'a T,
     port: TcPort,
+    phase: TcHdmiEncoderPhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TcHdmiEncoderPhase {
+    Active,
+    Disabled,
+    PostDisabled,
+    Prepared,
+    Enabled,
+}
+
+fn advance_hdmi_encoder_phase(
+    phase: &mut TcHdmiEncoderPhase,
+    expected: TcHdmiEncoderPhase,
+    next: TcHdmiEncoderPhase,
+) -> Result<(), String> {
+    if *phase != expected {
+        return Err(format!(
+            "TC HDMI callback out of order: phase={phase:?}, expected={expected:?}"
+        ));
+    }
+    *phase = next;
+    Ok(())
 }
 
 impl<R: Registers, T: PollTimer> TcHdmiEncoderOps<'_, R, T> {
-    fn disable(&self) -> Result<(), String> {
-        disable_tc_hdmi_encoder(self.registers, self.timer, self.port)
+    fn disable(&mut self) -> Result<(), String> {
+        if self.phase != TcHdmiEncoderPhase::Active {
+            return Err(String::from("TC HDMI disable requires active encoder"));
+        }
+        disable_tc_hdmi_encoder(self.registers, self.timer, self.port)?;
+        advance_hdmi_encoder_phase(
+            &mut self.phase,
+            TcHdmiEncoderPhase::Active,
+            TcHdmiEncoderPhase::Disabled,
+        )
     }
 
-    fn post_disable(&self) -> Result<(), String> {
-        post_disable_tc_hdmi_encoder(self.registers, self.port)
+    fn post_disable(&mut self) -> Result<(), String> {
+        if self.phase != TcHdmiEncoderPhase::Disabled {
+            return Err(String::from(
+                "TC HDMI post-disable requires disabled encoder",
+            ));
+        }
+        post_disable_tc_hdmi_encoder(self.registers, self.port)?;
+        advance_hdmi_encoder_phase(
+            &mut self.phase,
+            TcHdmiEncoderPhase::Disabled,
+            TcHdmiEncoderPhase::PostDisabled,
+        )
     }
 
-    fn pre_enable(&self, port_clock_khz: u32) -> Result<(), String> {
-        pre_enable_tc_hdmi_encoder(&dkl_io(self.registers), self.port, port_clock_khz)
+    fn pre_enable(&mut self, port_clock_khz: u32) -> Result<(), String> {
+        if self.phase != TcHdmiEncoderPhase::PostDisabled {
+            return Err(String::from(
+                "TC HDMI pre-enable requires post-disabled encoder",
+            ));
+        }
+        pre_enable_tc_hdmi_encoder(&dkl_io(self.registers), self.port, port_clock_khz)?;
+        advance_hdmi_encoder_phase(
+            &mut self.phase,
+            TcHdmiEncoderPhase::PostDisabled,
+            TcHdmiEncoderPhase::Prepared,
+        )
     }
 
-    fn enable(&self, output: u32) -> Result<(), String> {
-        enable_tc_hdmi_encoder(self.registers, self.timer, self.port, output)
+    fn restore_pre_enable(
+        &mut self,
+        before: &intel_display::tc::DklPhyState,
+    ) -> Result<(), String> {
+        if self.phase != TcHdmiEncoderPhase::PostDisabled {
+            return Err(String::from(
+                "TC HDMI restore requires post-disabled encoder",
+            ));
+        }
+        restore_signal_levels(&dkl_io(self.registers), self.port, before)?;
+        advance_hdmi_encoder_phase(
+            &mut self.phase,
+            TcHdmiEncoderPhase::PostDisabled,
+            TcHdmiEncoderPhase::Prepared,
+        )
+    }
+
+    fn enable(&mut self, output: u32) -> Result<(), String> {
+        if self.phase != TcHdmiEncoderPhase::Prepared {
+            return Err(String::from("TC HDMI enable requires prepared encoder"));
+        }
+        enable_tc_hdmi_encoder(self.registers, self.timer, self.port, output)?;
+        advance_hdmi_encoder_phase(
+            &mut self.phase,
+            TcHdmiEncoderPhase::Prepared,
+            TcHdmiEncoderPhase::Enabled,
+        )
     }
 }
 
@@ -1139,10 +1216,11 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         ));
     }
     let control_offset = ddi_buf_ctl(port)?;
-    let encoder_ops = TcHdmiEncoderOps {
+    let mut encoder_ops = TcHdmiEncoderOps {
         registers: r,
         timer,
         port,
+        phase: TcHdmiEncoderPhase::Active,
     };
     let buffer = read(r, control_offset)?;
     let plane_surface = pipe::PlaneSurface {
@@ -1261,9 +1339,8 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     // Exact N305 D0 admission is the source Wa_16011342517 applicability proof;
     // VBT level5 was checked at the outer native handoff. Unknown revisions
     // cannot reach this restricted path.
-    let phy_io = dkl_io(r);
     if let Some(before) = restore_phy {
-        restore_signal_levels(&phy_io, port, before)?;
+        encoder_ops.restore_pre_enable(before)?;
     } else {
         encoder_ops.pre_enable(mode.clock_khz)?;
     }
@@ -1318,6 +1395,41 @@ mod tests {
 
     use super::source_hdmi_tmds_clock_with_limit;
     use crate::drm::modes::{Mode, ModeFlags, TimingSource};
+
+    #[test]
+    fn hdmi_encoder_callbacks_enforce_source_phase_order() {
+        let mut phase = super::TcHdmiEncoderPhase::Active;
+        assert!(
+            super::advance_hdmi_encoder_phase(
+                &mut phase,
+                super::TcHdmiEncoderPhase::Disabled,
+                super::TcHdmiEncoderPhase::PostDisabled,
+            )
+            .is_err()
+        );
+        assert_eq!(phase, super::TcHdmiEncoderPhase::Active);
+        for (expected, next) in [
+            (
+                super::TcHdmiEncoderPhase::Active,
+                super::TcHdmiEncoderPhase::Disabled,
+            ),
+            (
+                super::TcHdmiEncoderPhase::Disabled,
+                super::TcHdmiEncoderPhase::PostDisabled,
+            ),
+            (
+                super::TcHdmiEncoderPhase::PostDisabled,
+                super::TcHdmiEncoderPhase::Prepared,
+            ),
+            (
+                super::TcHdmiEncoderPhase::Prepared,
+                super::TcHdmiEncoderPhase::Enabled,
+            ),
+        ] {
+            super::advance_hdmi_encoder_phase(&mut phase, expected, next).unwrap();
+        }
+        assert_eq!(phase, super::TcHdmiEncoderPhase::Enabled);
+    }
 
     #[derive(Default)]
     struct TranscoderModel {
