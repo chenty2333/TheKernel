@@ -10,6 +10,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <linux/dma-buf.h>
+#include <poll.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -173,7 +175,82 @@ static void dumb_lifetime(int fd) {
     printf("TK_GRAPHICS kind=drm.gem_close_lifetime state=OK\n");
 }
 
-int main(void) {
+/* Strict opt-in exercise of the dma-buf synchronization path ANV requires.
+ * No GPU batch, display commit, or native hardware access is submitted. */
+static int dma_buf_sync(void) {
+    char path[64];
+    int card = open_drm("card", 0, 15, path, sizeof(path));
+    int dmabuf = -1, syncfd = -1, other = -1, failed = 1;
+    struct drm_mode_create_dumb dumb = { .width = 64, .height = 64, .bpp = 32 };
+    if (card < 0) { result("drm.dmabuf_sync.card", "FAIL", errno); return 1; }
+    if (ioctl(card, DRM_IOCTL_MODE_CREATE_DUMB, &dumb) != 0) {
+        result("drm.dmabuf_sync.create", "FAIL", errno); goto out;
+    }
+    struct drm_prime_handle prime = { .handle = dumb.handle, .flags = DRM_CLOEXEC | DRM_RDWR, .fd = -1 };
+    if (ioctl(card, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) != 0 || prime.fd < 0) {
+        result("drm.dmabuf_sync.prime", "FAIL", errno); goto out;
+    }
+    dmabuf = prime.fd;
+    struct dma_buf_export_sync_file export = { .flags = DMA_BUF_SYNC_RW, .fd = -1 };
+    if (ioctl(dmabuf, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export) != 0 || export.fd < 0) {
+        result("drm.dmabuf_sync.export", "FAIL", errno); goto out;
+    }
+    syncfd = export.fd;
+    int fdflags = fcntl(syncfd, F_GETFD);
+    if (fdflags < 0 || !(fdflags & FD_CLOEXEC)) {
+        result("drm.dmabuf_sync.cloexec", "FAIL", errno); goto out;
+    }
+    struct pollfd pollfd = { .fd = syncfd, .events = POLLIN };
+    if (poll(&pollfd, 1, 0) != 1 || !(pollfd.revents & POLLIN)) {
+        result("drm.dmabuf_sync.poll", "FAIL", errno); goto out;
+    }
+    struct dma_buf_import_sync_file import = { .flags = DMA_BUF_SYNC_RW, .fd = syncfd };
+    if (ioctl(dmabuf, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import) != 0) {
+        result("drm.dmabuf_sync.import", "FAIL", errno); goto out;
+    }
+    const unsigned invalid_flags[] = { 0, 4, DMA_BUF_SYNC_RW | 4 };
+    for (size_t i = 0; i < sizeof(invalid_flags) / sizeof(invalid_flags[0]); ++i) {
+        struct dma_buf_export_sync_file bad_export = { .flags = invalid_flags[i], .fd = -1 };
+        struct dma_buf_import_sync_file bad_import = { .flags = invalid_flags[i], .fd = syncfd };
+        errno = 0;
+        if (ioctl(dmabuf, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &bad_export) != -1 || errno != EINVAL) {
+            result("drm.dmabuf_sync.export_flags", "FAIL", errno); goto out;
+        }
+        errno = 0;
+        if (ioctl(dmabuf, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &bad_import) != -1 || errno != EINVAL) {
+            result("drm.dmabuf_sync.import_flags", "FAIL", errno); goto out;
+        }
+    }
+    import.fd = -1;
+    errno = 0;
+    if (ioctl(dmabuf, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import) != -1 || errno != EINVAL) {
+        result("drm.dmabuf_sync.badfd", "FAIL", errno); goto out;
+    }
+    other = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (other < 0) { result("drm.dmabuf_sync.other_fd", "FAIL", errno); goto out; }
+    import.fd = other;
+    errno = 0;
+    if (ioctl(dmabuf, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import) != -1 || errno != EINVAL) {
+        result("drm.dmabuf_sync.wrong_fd_type", "FAIL", errno); goto out;
+    }
+    failed = 0;
+out:
+    if (other >= 0) close(other);
+    if (syncfd >= 0) close(syncfd);
+    if (dmabuf >= 0) close(dmabuf);
+    if (dumb.handle) {
+        struct drm_mode_destroy_dumb destroy = { .handle = dumb.handle };
+        if (ioctl(card, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy) != 0) failed = 1;
+    }
+    close(card);
+    if (!failed) puts("TK_GRAPHICS kind=drm.dmabuf_sync state=OK export=cloexec_signaled import=checked negatives=checked gpu_submission=none");
+    return failed;
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--dma-buf-sync") == 0) return dma_buf_sync();
+    if (argc != 1) { fputs("usage: drm-uapi-oracle [--dma-buf-sync]\n", stderr); return 2; }
+
     char path[64];
     abi_oracle();
     printf("TK_GRAPHICS kind=drm.uapi state=OK card_res=%zu create_dumb=%zu map_dumb=%zu gem_close=%zu page_flip=%zu event=%zu flip_event=%zu getresources=0x%lx create=0x%lx map=0x%lx destroy=0x%lx gem_close_ioctl=0x%lx page_flip_ioctl=0x%lx\n",
