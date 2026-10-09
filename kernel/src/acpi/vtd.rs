@@ -23,10 +23,11 @@ use tk_vtd::{
     pgtbl::{PAGE_SIZE, PageMemory, SecondLevel},
     qi::{self, QiIo, QiQueue},
     reg::{
-        ContextEntry, DMAR_CAP_MGAW, DMAR_CAP_ND, DMAR_CAP_RWBF, DMAR_CAP_SAGAW,
-        DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS, DMAR_CAP_SPS_2M, DMAR_CTX2_AW_4LVL, DMAR_ECAP_C,
-        DMAR_ECAP_EIM, DMAR_ECAP_IR, DMAR_ECAP_QI, DMAR_FECTL_IM, DMAR_FECTL_REG, DMAR_IECTL_IM,
-        DMAR_IECTL_REG, DMAR_PTE_R, DMAR_PTE_W, RootEntry,
+        ContextEntry, DMAR_CAP_FRO, DMAR_CAP_MGAW, DMAR_CAP_ND, DMAR_CAP_NFR, DMAR_CAP_RWBF,
+        DMAR_CAP_SAGAW, DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS, DMAR_CAP_SPS_2M, DMAR_CTX2_AW_4LVL,
+        DMAR_ECAP_C, DMAR_ECAP_EIM, DMAR_ECAP_IR, DMAR_ECAP_QI, DMAR_FECTL_IM, DMAR_FECTL_REG,
+        DMAR_FRCD2_F, DMAR_FRCD2_F32, DMAR_FSTS_FRI, DMAR_IECTL_IM, DMAR_IECTL_REG, DMAR_PTE_R,
+        DMAR_PTE_W, RootEntry,
     },
     utils::{self, RegisterIo},
 };
@@ -46,6 +47,7 @@ const GSTS_QIES: u32 = 1 << 26;
 const GSTS_IRES: u32 = 1 << 25;
 const FSTS_PPF: u32 = 1 << 1;
 const FSTS_PFO: u32 = 1;
+const FSTS_PRO: u32 = 1 << 7;
 const QI_ORDER: u32 = 2;
 const QI_BYTES: usize = (1 << QI_ORDER) * PAGE_SIZE as usize;
 const QI_PAGES: usize = (1 << QI_ORDER) + 1;
@@ -420,27 +422,28 @@ fn probe_unit(register_base: u64) -> Result<UnitProbe, Error> {
 impl Unit {
     fn check_faults(&self) -> Result<(), Error> {
         let status = read32(self, FSTS);
-        if status & (FSTS_PPF | FSTS_PFO) == 0 {
+        if status & (FSTS_PPF | FSTS_PFO | FSTS_PRO) == 0 {
             return Ok(());
         }
         if status & FSTS_PPF != 0 {
-            let index = ((status >> 8) & 0xff) as usize;
-            let record_offset = (((read64(self, CAP) >> 24) & 0x1ff) as usize)
-                .checked_mul(16)
-                .and_then(|offset| offset.checked_add(index * 16));
-            if let Some(offset) = record_offset.filter(|offset| offset + 16 <= MMIO_BYTES) {
-                let info = read64(self, offset);
-                let address = read64(self, offset + 8);
-                error!(
-                    "vtd: DMA fault sid={:#06x} reason={:#x} address={address:#x} record={index}",
-                    info as u16,
-                    (info >> 32) & 0xff
-                );
-            }
+            let cap = read64(self, CAP);
+            drain_primary_fault_records(
+                cap,
+                status,
+                |offset| read64(self, offset),
+                |offset, value| write32(self, offset, value),
+                |sid, reason, address, index| {
+                    error!(
+                        "vtd: DMA fault sid={sid:#06x} reason={reason:#x} address={address:#x} \
+                         record={index}"
+                    );
+                },
+            )?;
         }
-        // W1C only the pending/overflow bits we observed. The fault record is
-        // left to firmware diagnostics; the DMA service fails closed.
-        write32(self, FSTS, status & (FSTS_PPF | FSTS_PFO));
+        // Return primary fault records to hardware before acknowledging their
+        // FSTS summary bits. Linux's dmar_fault() also clears FRCD.F for each
+        // record and acknowledges PPF/PFO/PRO afterward.
+        write32(self, FSTS, status & (FSTS_PPF | FSTS_PFO | FSTS_PRO));
         Err(Error::MapFailed)
     }
 
@@ -619,6 +622,56 @@ impl Unit {
         step!("post-enable fault check", self.check_faults());
         Ok(())
     }
+}
+
+/// Drain the bounded primary-fault ring, reading each FRCD2 before FRCD1 and
+/// returning every consumed slot to hardware by W1C-clearing FRCD2.F.
+fn drain_primary_fault_records(
+    cap: u64,
+    status: u32,
+    mut read64: impl FnMut(usize) -> u64,
+    mut clear32: impl FnMut(usize, u32),
+    mut report: impl FnMut(u16, u8, u64, usize),
+) -> Result<usize, Error> {
+    if status & FSTS_PPF == 0 {
+        return Ok(0);
+    }
+    let record_count = usize::try_from(DMAR_CAP_NFR(cap)).map_err(|_| Error::InvalidStructure)?;
+    let mut index =
+        usize::try_from(DMAR_FSTS_FRI(status as u64)).map_err(|_| Error::InvalidStructure)?;
+    let records_start = usize::try_from(DMAR_CAP_FRO(cap))
+        .ok()
+        .and_then(|offset| offset.checked_mul(16))
+        .ok_or(Error::InvalidStructure)?;
+    if record_count == 0 || index >= record_count || records_start >= MMIO_BYTES {
+        return Err(Error::InvalidStructure);
+    }
+
+    let mut drained = 0;
+    for _ in 0..record_count {
+        let offset = records_start
+            .checked_add(index.checked_mul(16).ok_or(Error::InvalidStructure)?)
+            .ok_or(Error::InvalidStructure)?;
+        if offset.checked_add(16).map_or(true, |end| end > MMIO_BYTES) {
+            return Err(Error::InvalidStructure);
+        }
+        let frcd2 = read64(offset + 8);
+        if frcd2 & DMAR_FRCD2_F == 0 {
+            break;
+        }
+        let frcd1 = read64(offset);
+        let sid = frcd2 as u16;
+        let reason = ((frcd2 >> 32) & 0xff) as u8;
+        let address = frcd1 & !0xfff;
+        clear32(offset + 12, DMAR_FRCD2_F32 as u32);
+        report(sid, reason, address, index);
+        drained += 1;
+        index += 1;
+        if index == record_count {
+            index = 0;
+        }
+    }
+    Ok(drained)
 }
 
 impl RegisterIo for Unit {
@@ -2787,9 +2840,15 @@ impl tk_vtd::PlatformIdentityDma for PlatformIdentityDma {
 #[cfg(test)]
 mod tests {
     use alloc::{sync::Arc, vec, vec::Vec};
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::{
+        cell::RefCell,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
-    use tk_vtd::{iova::IovaAllocator, reg::DMAR_FECTL_IP};
+    use tk_vtd::{
+        iova::IovaAllocator,
+        reg::{DMAR_FECTL_IP, DMAR_FRCD2_F},
+    };
 
     use super::{
         DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS_2M, DMAR_ECAP_C, DMAR_ECAP_EIM, DMAR_ECAP_IR,
@@ -2798,14 +2857,15 @@ mod tests {
         Mapping, MappingState, PageMemory, RequesterIdentityLease, UnitProbe, cap_domain_count,
         complete_domain_install, direct_identity_acquire, direct_identity_lease_allowed,
         direct_identity_map, direct_identity_release, direct_identity_unmap,
-        fault_event_mask_write, find_owned_msi_vector, identity_dma_in_mode,
-        identity_fallback_safe_before_enable, identity_pages_for_path, pci_dma_allowed_in_mode,
-        prepare_identity_batch_record, publish_identity_batch, publish_mapping_after_invalidation,
-        quarantine_boot_resources, register_identity_lease, release_identity_lease,
-        require_no_identity_lease, require_ready_domain, retire_identity_batch_record,
-        retire_ir_route_after_invalidation, retire_mapping_after_invalidation, store_irte_words,
-        take_domain_id, take_nonreusing_id, validate_all_unit_capabilities,
-        validate_identity_pages_in_aperture, validate_unit_capabilities,
+        drain_primary_fault_records, fault_event_mask_write, find_owned_msi_vector,
+        identity_dma_in_mode, identity_fallback_safe_before_enable, identity_pages_for_path,
+        pci_dma_allowed_in_mode, prepare_identity_batch_record, publish_identity_batch,
+        publish_mapping_after_invalidation, quarantine_boot_resources, register_identity_lease,
+        release_identity_lease, require_no_identity_lease, require_ready_domain,
+        retire_identity_batch_record, retire_ir_route_after_invalidation,
+        retire_mapping_after_invalidation, store_irte_words, take_domain_id, take_nonreusing_id,
+        validate_all_unit_capabilities, validate_identity_pages_in_aperture,
+        validate_unit_capabilities,
     };
 
     struct DropProbe(Arc<AtomicUsize>);
@@ -2853,6 +2913,70 @@ mod tests {
         assert_eq!(fault_event_mask_write(mask), None);
         assert_eq!(fault_event_mask_write(mask | pending), None);
         assert_eq!(fault_event_mask_write(pending).unwrap() & pending, 0);
+    }
+
+    #[test]
+    fn primary_fault_drain_decodes_frcd_words_and_releases_wrapped_slots() {
+        const FRO: usize = 0x80;
+        let records = RefCell::new(vec![0u64; super::MMIO_BYTES / 8]);
+        let cap = ((3u64) << 40) | ((FRO as u64) << 24); // four records
+        let start = FRO * 16;
+        let record = |index: usize, address: u64, sid: u16, reason: u8| {
+            let mut words = records.borrow_mut();
+            words[(start + index * 16) / 8] = address;
+            words[(start + index * 16 + 8) / 8] =
+                DMAR_FRCD2_F | (u64::from(reason) << 32) | u64::from(sid);
+        };
+        record(3, 0x1234_5678_9abc_deff, 0x4321, 0x2a);
+        record(0, 0x0fed_cba9_8765_4321, 0x1234, 0x17);
+        let status = super::FSTS_PPF | (3 << 8);
+        let mut cleared = Vec::new();
+        let mut reported = Vec::new();
+
+        let drained = drain_primary_fault_records(
+            cap,
+            status,
+            |offset| records.borrow()[offset / 8],
+            |offset, value| {
+                cleared.push(offset);
+                let mut words = records.borrow_mut();
+                words[offset / 8] &= !(u64::from(value) << 32);
+            },
+            |sid, reason, address, index| reported.push((sid, reason, address, index)),
+        )
+        .unwrap();
+
+        assert_eq!(drained, 2);
+        assert_eq!(cleared, [start + 3 * 16 + 12, start + 12]);
+        assert_eq!(
+            reported,
+            [
+                (0x4321, 0x2a, 0x1234_5678_9abc_d000, 3),
+                (0x1234, 0x17, 0x0fed_cba9_8765_4000, 0),
+            ]
+        );
+        let words = records.borrow();
+        assert_eq!(words[(start + 3 * 16 + 8) / 8] & DMAR_FRCD2_F, 0);
+        assert_eq!(words[(start + 8) / 8] & DMAR_FRCD2_F, 0);
+    }
+
+    #[test]
+    fn primary_fault_drain_rejects_out_of_range_fri_without_clearing_records() {
+        let records = vec![0u64; super::MMIO_BYTES / 8];
+        let cap = (3u64 << 40) | (0x80u64 << 24); // four records
+        let status = super::FSTS_PPF | (4 << 8);
+        let mut cleared = false;
+        assert_eq!(
+            drain_primary_fault_records(
+                cap,
+                status,
+                |offset| records[offset / 8],
+                |_, _| cleared = true,
+                |_, _, _, _| {},
+            ),
+            Err(Error::InvalidStructure)
+        );
+        assert!(!cleared);
     }
 
     #[test]
