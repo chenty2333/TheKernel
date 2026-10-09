@@ -1904,3 +1904,16 @@ host tests do not constitute native hardware or runtime integration acceptance.
 function definitions in Linux 7.2.3 `drivers/gpu/drm/i915/gt/intel_gt_requests.c`
 (MIT, Copyright © 2019 Intel Corporation). Its LinuxKPI additions are the
 source-semantic fence wait dispatcher and relative jiffies rounding helper.
+
+### GT preparation source-order translations
+
+| Source | Rust owner / translated scope |
+|---|---|
+| `gt/intel_gt_buffer_pool.c` | `intel_gt_buffer_pool_upstream.rs`: all 11 functions; RCU reclamation, delayed work, intrusive-list and GEM object behavior retain source ordering. Its `__list_del_many()` helper follows `i915_list_util.h` (MIT, Copyright © 2025 Intel Corporation). |
+| `gt/intel_gt_clock_utils.c` | `intel_gt_clock_utils_upstream.rs`: all 16 functions including Gen4–Gen11 frequency selection and interval conversions; `i9xx_fsb_freq()` is the companion `i915_freq.c` dependency. |
+| `gt/intel_sseu.c` | `intel_sseu_upstream.rs`: all 26 C functions; the existing `intel_sseu_get_hsw_subslices()` definition remains in `intel_sseu_types_upstream.rs` to avoid duplicate ownership. |
+
+`linux/seq_file.rs` implements the Linux 7.2.3 `seq_file` buffer-prefix,
+`seq_printf`/`seq_write` count and overflow behavior as original LinuxKPI, using
+the crate's typed C-format formatter. GPL `fs/seq_file.c` function bodies were
+not copied.
