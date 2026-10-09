@@ -256,6 +256,7 @@ fn dkl_pll_on<R: Registers, T: PollTimer>(
 pub(super) trait DpllLifecycle {
     fn disable(&mut self) -> Result<(), String>;
     fn enable(&mut self) -> Result<(), String>;
+    fn rollback_new(&mut self) -> Result<(), String>;
 }
 
 /// CDCLK is shared by every display pipe. The Native caller may change it
@@ -1400,6 +1401,367 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         }
     }
     Ok(())
+}
+
+pub(super) fn program_native<R: Registers + Send + Sync, T: PollTimer>(
+    r: &R,
+    timer: &T,
+    port: TcPort,
+    mode: &Mode,
+    pitch: u32,
+    pixel_format: u32,
+    surface: u32,
+    watermark: Option<pipe::WatermarkConfig>,
+    avi: &[u32; 8],
+    edid: &[u8],
+    mut dpll_lifecycle: Option<&mut dyn DpllLifecycle>,
+    mut clock_lifecycle: Option<&mut dyn ClockLifecycle>,
+    display_writes_started: &mut bool,
+    power: &mut dyn super::power::NativePowerOps,
+    cleanup: &mut dyn FnMut(bool) -> Result<(), String>,
+    verify: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    *display_writes_started = false;
+    let cpp = match pixel_format {
+        intel_display::universal_plane::XRGB8888 => 4,
+        intel_display::universal_plane::RGB565 => 2,
+        _ => {
+            return Err(String::from(
+                "TC primary plane pixel format is not admitted",
+            ));
+        }
+    };
+    let function = read(r, ddi::TRANS_DDI_FUNC_CTL_A.offset())?;
+    if !matches!(
+        intel_display::ddi::decode_function_control(function).port,
+        Some(Port::Tc1 | Port::Tc2)
+    ) || mode.flags.contains(crate::drm::modes::ModeFlags::INTERLACE)
+        || mode
+            .flags
+            .contains(crate::drm::modes::ModeFlags::DOUBLE_CLOCK)
+        || !matches!(source_hdmi_tmds_clock(mode, edid), Some(25_000..=300_000))
+        || surface == 0
+        || surface & 0xfff != 0
+        || pitch < u32::from(mode.hdisplay) * cpp
+        || !pitch.is_multiple_of(64)
+    {
+        return Err(String::from(
+            "TC target mode or current legacy link not admitted",
+        ));
+    }
+    let selected = tc_phy(port)?;
+    if intel_display::ddi::decode_function_control(function).port != Some(selected) {
+        return Err(String::from(
+            "TC request does not match active firmware route",
+        ));
+    }
+    let control_offset = ddi_buf_ctl(port)?;
+    let encoder_ops = TcHdmiEncoderOps {
+        registers: r,
+        timer,
+        port,
+        phase: TcHdmiEncoderPhase::Active,
+    };
+    let buffer = read(r, control_offset)?;
+    let plane_surface = pipe::PlaneSurface {
+        ggtt_address: u64::from(surface),
+        stride_bytes: pitch,
+    };
+    let pipe_program = match watermark {
+        Some(watermark) => pipe::compute_with_watermarks_format(
+            pipe::Pipe::A,
+            mode,
+            plane_surface,
+            watermark,
+            pixel_format,
+        ),
+        None => {
+            #[cfg(test)]
+            {
+                pipe::compute(pipe::Pipe::A, mode, plane_surface)
+            }
+            #[cfg(not(test))]
+            {
+                return Err(String::from("PCode-derived watermark state absent"));
+            }
+        }
+    }
+    .map_err(|e| format!("TC pipe plan refused: {}", e.describe()))?;
+    // Preflight every direct RW input needed by this pass before the first
+    // destructive write. Power, link, WM/DDB and ownership proof are performed
+    // by the admission transaction that invokes this function.
+    let pipe_misc = read(r, p::PIPE_MISC_A.offset())?;
+    let arb = read(r, p::PIPE_ARB_CTL_A.offset())?;
+    let old_plane = read(r, p::PLANE_CTL_A.offset())?;
+    let old_surface = read(r, p::PLANE_SURF_A.offset())?;
+    let _old_clock = read(r, 0x46140)?;
+    let _old_pipeconf = read(r, p::PIPECONF_A.offset())?;
+    // Pipe shadow values are all calculated and all heap space is reserved
+    // before the first MMIO write. The DDB allocation remains the one-pipe
+    // whole-buffer first-light-up policy; its source-derived WM values above
+    // were calculated for this exact target before entering this function.
+    let all_shadow = pipe_program.writes(pipe_misc, arb);
+    let mut shadow = Vec::new();
+    shadow
+        .try_reserve_exact(MODE_SHADOW.len())
+        .map_err(|_| String::from("TC shadow-write journal allocation failed"))?;
+    for planned in all_shadow
+        .into_iter()
+        .filter(|planned| MODE_SHADOW.contains(&planned.register.offset()))
+    {
+        let value = if planned.register.offset() == p::PIPE_MISC_A.offset() {
+            planned.value
+        } else {
+            planned.value
+        };
+        shadow.push(super::pipe::PlannedWrite { value, ..planned });
+    }
+    if shadow.len() != MODE_SHADOW.len() {
+        let present = shadow
+            .iter()
+            .map(|planned| planned.register.offset())
+            .collect::<Vec<_>>();
+        let missing = MODE_SHADOW
+            .iter()
+            .copied()
+            .filter(|offset| !present.contains(offset))
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "TC source pipe plan is missing shadow fields present={present:?} missing={missing:?}"
+        ));
+    }
+    let mut tail = TcNativeTail {
+        r,
+        timer,
+        port,
+        mode,
+        surface,
+        function,
+        buffer,
+        old_plane,
+        old_surface,
+        shadow,
+        pipe_program,
+        encoder: encoder_ops,
+        avi,
+        dpll: dpll_lifecycle
+            .take()
+            .ok_or_else(|| String::from("native DPLL lifecycle absent"))?,
+        clock: clock_lifecycle
+            .take()
+            .ok_or_else(|| String::from("native CDCLK lifecycle absent"))?,
+        power,
+        cleanup,
+        verify,
+        writes: display_writes_started,
+        stopped: false,
+    };
+    super::native_modeset_ops::run_native_commit_tail(
+        &mut tail,
+        &[intel_display::power_map::PowerDomain::PipeA],
+    )
+    .map_err(|e| format!("native commit-tail failed: {e:?}"))?;
+    Ok(())
+}
+
+struct TcNativeTail<'a, R, T> {
+    r: &'a R,
+    timer: &'a T,
+    port: TcPort,
+    mode: &'a Mode,
+    surface: u32,
+    function: u32,
+    buffer: u32,
+    old_plane: u32,
+    old_surface: u32,
+    shadow: Vec<pipe::PlannedWrite>,
+    pipe_program: pipe::PipeProgram,
+    encoder: TcHdmiEncoderOps<'a, R, T>,
+    avi: &'a [u32; 8],
+    dpll: &'a mut dyn DpllLifecycle,
+    clock: &'a mut dyn ClockLifecycle,
+    power: &'a mut dyn super::power::NativePowerOps,
+    cleanup: &'a mut dyn FnMut(bool) -> Result<(), String>,
+    verify: &'a mut dyn FnMut() -> Result<(), String>,
+    writes: &'a mut bool,
+    stopped: bool,
+}
+impl<R: Registers, T: PollTimer> super::power::NativePowerOps for TcNativeTail<'_, R, T> {
+    fn power_domain_get(
+        &mut self,
+        d: intel_display::power_map::PowerDomain,
+    ) -> Result<(), super::power::PowerError> {
+        self.power.power_domain_get(d)
+    }
+    fn power_domain_put(
+        &mut self,
+        d: intel_display::power_map::PowerDomain,
+    ) -> Result<(), super::power::PowerError> {
+        self.power.power_domain_put(d)
+    }
+    fn dc_state_exit(&mut self) -> Result<(), super::power::PowerError> {
+        self.power.dc_state_exit()
+    }
+    fn dc_state_enter(&mut self) -> Result<bool, super::power::PowerError> {
+        self.power.dc_state_enter()
+    }
+    fn set_dc_state_target(&mut self, d: u32) -> Result<bool, super::power::PowerError> {
+        self.power.set_dc_state_target(d)
+    }
+}
+impl<R: Registers + Send + Sync, T: PollTimer> super::native_modeset_ops::NativeCommitTailOps
+    for TcNativeTail<'_, R, T>
+{
+    type Error = String;
+    fn disable_phase(&mut self) -> Result<(), String> {
+        super::audio::before_link_disable(self.r, self.timer, self.port)?;
+        *self.writes = true;
+        write(
+            self.r,
+            p::PLANE_CTL_A.offset(),
+            self.old_plane & !PIPE_ENABLE,
+        )?;
+        write(self.r, p::PLANE_SURF_A.offset(), self.old_surface)?;
+        wait_two_frames(self.r, self.timer)?;
+        write(
+            self.r,
+            p::PIPECONF_A.offset(),
+            read(self.r, p::PIPECONF_A.offset())? & !(PIPE_ENABLE | PIPE_RUNNING),
+        )?;
+        poll(
+            self.r,
+            self.timer,
+            p::PIPECONF_A.offset(),
+            PIPE_RUNNING,
+            0,
+            100_000,
+        )?;
+        disable_pipe_a_transcoder(self.r)?;
+        self.encoder.disable()?;
+        self.encoder.post_disable()?;
+        self.dpll.disable()
+    }
+    fn cdclk_pre_plane(&mut self) -> Result<(), String> {
+        self.clock.adjust(self.mode.clock_khz, false)
+    }
+    fn dpll_phase(&mut self) -> Result<(), String> {
+        self.dpll.enable()
+    }
+    fn encoder_pre_enable_phase(&mut self) -> Result<(), String> {
+        enable_pipe_a_transcoder_clock(self.r, self.port)?;
+        self.encoder.enable_avi_infoframe(self.avi)?;
+        self.encoder.pre_enable(self.mode.clock_khz)
+    }
+    fn crtc_enable_phase(&mut self) -> Result<(), String> {
+        for w in &self.shadow {
+            write(self.r, w.register.offset(), w.value)?;
+        }
+        let flags = u32::from(self.function & (1 << 16) != 0)
+            | (u32::from(self.function & (1 << 17) != 0) << 2);
+        enable_pipe_a_transcoder(self.r, self.port, flags)?;
+        self.encoder
+            .enable((self.buffer & DDI_LANE_REVERSAL) | DDI_TC_PHY_OWNERSHIP)?;
+        write(
+            self.r,
+            p::PIPECONF_A.offset(),
+            read(self.r, p::PIPECONF_A.offset())? | PIPE_ENABLE,
+        )?;
+        poll(
+            self.r,
+            self.timer,
+            p::PIPECONF_A.offset(),
+            PIPE_RUNNING,
+            PIPE_RUNNING,
+            100_000,
+        )
+    }
+    fn plane_update_phase(&mut self) -> Result<(), String> {
+        write(self.r, p::PLANE_CTL_A.offset(), self.pipe_program.plane.ctl)?;
+        write(
+            self.r,
+            p::PLANE_SURF_A.offset(),
+            self.pipe_program.plane.surf,
+        )?;
+        prove_new_scanout(self.r, self.timer, self.surface)
+    }
+    fn cdclk_post_plane(&mut self) -> Result<(), String> {
+        let current = super::clk::observe(self.r).map_err(|e| format!("CDCLK readback: {e:?}"))?;
+        if !current.usable() || current.cdclk_khz < self.mode.clock_khz {
+            return Err(String::from("native CDCLK insufficient"));
+        }
+        (self.verify)() // No post-plane decrease was requested by this single-pipe plan.
+    }
+    fn rollback_phase(
+        &mut self,
+        phase: super::native_modeset_ops::NativeCommitPhase,
+    ) -> Result<(), String> {
+        use super::native_modeset_ops::NativeCommitPhase as P;
+        match phase {
+            P::PlaneUpdate => {
+                write(
+                    self.r,
+                    p::PLANE_CTL_A.offset(),
+                    read(self.r, p::PLANE_CTL_A.offset())? & !PIPE_ENABLE,
+                )?;
+                write(self.r, p::PLANE_SURF_A.offset(), self.old_surface)
+            }
+            P::CrtcEnable => {
+                // Enable may have failed after a write: disable unconditionally.
+                disable_tc_hdmi_encoder(self.r, self.timer, self.port)?;
+                write(
+                    self.r,
+                    p::PIPECONF_A.offset(),
+                    read(self.r, p::PIPECONF_A.offset())? & !(PIPE_ENABLE | PIPE_RUNNING),
+                )?;
+                poll(
+                    self.r,
+                    self.timer,
+                    p::PIPECONF_A.offset(),
+                    PIPE_RUNNING,
+                    0,
+                    100_000,
+                )?;
+                disable_pipe_a_transcoder(self.r)
+            }
+            P::EncoderPreEnable => post_disable_tc_hdmi_encoder(self.r, self.port),
+            P::Dpll => self.dpll.rollback_new(),
+            P::CdclkPrePlane => self.clock.adjust(self.mode.clock_khz, true),
+            P::Disable => {
+                // Prove DMA quiescence even when the initial disable failed.
+                if !*self.writes {
+                    self.stopped = true;
+                    return Ok(());
+                }
+                write(
+                    self.r,
+                    p::PLANE_CTL_A.offset(),
+                    read(self.r, p::PLANE_CTL_A.offset())? & !PIPE_ENABLE,
+                )?;
+                write(self.r, p::PLANE_SURF_A.offset(), self.old_surface)?;
+                write(
+                    self.r,
+                    p::PIPECONF_A.offset(),
+                    read(self.r, p::PIPECONF_A.offset())? & !(PIPE_ENABLE | PIPE_RUNNING),
+                )?;
+                poll(
+                    self.r,
+                    self.timer,
+                    p::PIPECONF_A.offset(),
+                    PIPE_RUNNING,
+                    0,
+                    100_000,
+                )?;
+                self.stopped = true;
+                disable_tc_hdmi_encoder(self.r, self.timer, self.port)?;
+                disable_pipe_a_transcoder(self.r)?;
+                post_disable_tc_hdmi_encoder(self.r, self.port)
+            }
+            P::CdclkPostPlane => Ok(()), // Readback only, no resource acquired.
+        }
+    }
+    fn rollback_framebuffer(&mut self) -> Result<(), String> {
+        (self.cleanup)(self.stopped)
+    }
 }
 
 #[cfg(test)]

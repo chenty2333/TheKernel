@@ -844,6 +844,34 @@ impl SharedDpllState {
         Ok(atomic)
     }
 
+    /// Release the stopped single-TC CRTC reservation after native rollback.
+    pub(crate) fn release_stopped_tc<R: Registers, T: PollTimer, P: DpllPowerAccess<R>>(
+        &mut self,
+        registers: &R,
+        timer: &T,
+        power: &mut P,
+    ) -> Result<(), DpllFailure> {
+        let old = *self
+            .display
+            .crtc_states
+            .first()
+            .ok_or(DpllFailure::InvalidCrtc)?;
+        let mut atomic = dpll::IntelAtomicState::default();
+        atomic.old_crtcs[0] = old;
+        atomic.new_crtcs[0] = dpll::CrtcState {
+            hw_active: false,
+            ..old
+        };
+        let crtc = dpll::IntelCrtc {
+            id: old.id,
+            name: old.name,
+            pipe: old.pipe,
+        };
+        self.release(registers, timer, power, &mut atomic, &crtc)?;
+        self.swap_atomic(&mut atomic)?;
+        Ok(())
+    }
+
     pub(crate) fn reserve<R: Registers, T: PollTimer, P: DpllPowerAccess<R>>(
         &mut self,
         registers: &R,

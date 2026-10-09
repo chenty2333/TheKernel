@@ -692,6 +692,10 @@ pub(super) trait NativeCommitTailOps: super::power::NativePowerOps {
     fn crtc_enable_phase(&mut self) -> Result<(), Self::Error>;
     fn plane_update_phase(&mut self) -> Result<(), Self::Error>;
     fn cdclk_post_plane(&mut self) -> Result<(), Self::Error>;
+    /// Undo even a partially executed phase; keep unwinding after errors.
+    fn rollback_phase(&mut self, phase: NativeCommitPhase) -> Result<(), Self::Error>;
+    /// Release the candidate GGTT mapping only after DMA is proved stopped.
+    fn rollback_framebuffer(&mut self) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug)]
@@ -701,6 +705,7 @@ pub(super) enum NativeCommitTailError<E> {
         phase: NativeCommitPhase,
         cause: E,
         power_release: Option<super::power::NativePowerFailure>,
+        rollback: alloc::vec::Vec<E>,
     },
     PowerRelease(super::power::NativePowerFailure),
 }
@@ -741,13 +746,23 @@ pub(super) fn run_native_commit_tail<O: NativeCommitTailOps>(
         (NativeCommitPhase::PlaneUpdate, O::plane_update_phase),
         (NativeCommitPhase::CdclkPostPlane, O::cdclk_post_plane),
     ];
-    for (phase, dispatch) in phases {
+    for (index, (phase, dispatch)) in phases.iter().copied().enumerate() {
         if let Err(cause) = dispatch(ops) {
+            let mut rollback = alloc::vec::Vec::new();
+            for (completed, _) in phases[..=index].iter().rev() {
+                if let Err(error) = ops.rollback_phase(*completed) {
+                    rollback.push(error);
+                }
+            }
+            if let Err(error) = ops.rollback_framebuffer() {
+                rollback.push(error);
+            }
             let power_release = lease.release(ops).err();
             return Err(NativeCommitTailError::Phase {
                 phase,
                 cause,
                 power_release,
+                rollback,
             });
         }
     }
@@ -833,6 +848,22 @@ mod commit_tail_tests {
         fn cdclk_post_plane(&mut self) -> Result<(), Self::Error> {
             self.run(NativeCommitPhase::CdclkPostPlane, "cdclk-post")
         }
+        fn rollback_phase(&mut self, phase: NativeCommitPhase) -> Result<(), Self::Error> {
+            self.events.push(match phase {
+                NativeCommitPhase::Disable => "undo-disable",
+                NativeCommitPhase::CdclkPrePlane => "undo-cdclk",
+                NativeCommitPhase::Dpll => "undo-dpll",
+                NativeCommitPhase::EncoderPreEnable => "undo-encoder",
+                NativeCommitPhase::CrtcEnable => "undo-crtc",
+                NativeCommitPhase::PlaneUpdate => "undo-plane",
+                NativeCommitPhase::CdclkPostPlane => "undo-post",
+            });
+            Ok(())
+        }
+        fn rollback_framebuffer(&mut self) -> Result<(), Self::Error> {
+            self.events.push("unpin");
+            Ok(())
+        }
     }
 
     impl Recorder {
@@ -896,8 +927,36 @@ mod commit_tail_tests {
                 "dpll",
                 "encoder-pre",
                 "crtc-enable",
+                "undo-crtc",
+                "undo-encoder",
+                "undo-dpll",
+                "undo-cdclk",
+                "undo-disable",
+                "unpin",
                 "put-pipe",
                 "dc-enter",
+            ]
+        );
+    }
+    #[test]
+    fn plane_failure_unwinds_plane_crtc_encoder_dpll_before_unpin_and_power() {
+        let mut ops = Recorder {
+            fail: Some(NativeCommitPhase::PlaneUpdate),
+            ..Recorder::default()
+        };
+        assert!(run_native_commit_tail(&mut ops, &[PowerDomain::PipeA]).is_err());
+        assert_eq!(
+            &ops.events[8..],
+            &[
+                "undo-plane",
+                "undo-crtc",
+                "undo-encoder",
+                "undo-dpll",
+                "undo-cdclk",
+                "undo-disable",
+                "unpin",
+                "put-pipe",
+                "dc-enter"
             ]
         );
     }

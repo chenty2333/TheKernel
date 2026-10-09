@@ -395,6 +395,71 @@ impl PowerPin {
         Ok(())
     }
 }
+/// Nested lease of the already-live TC route; never powers a cold well or
+/// drops the firmware-preserving parent's driver requests.
+struct NativeTcPower<'a, R> {
+    registers: &'a R,
+    parent: &'a PowerPin,
+    lease: Option<PowerPin>,
+}
+impl<R: Registers> super::power::NativePowerOps for NativeTcPower<'_, R> {
+    fn power_domain_get(
+        &mut self,
+        domain: intel_display::power_map::PowerDomain,
+    ) -> Result<(), super::power::PowerError> {
+        if domain != intel_display::power_map::PowerDomain::PipeA || self.lease.is_some() {
+            return Err(super::power::PowerError::PowerDomain(String::from(
+                "unsupported TC lease",
+            )));
+        }
+        self.lease = Some(
+            PowerPin::acquire(self.registers, self.parent.port).map_err(|e| {
+                super::power::PowerError::PowerDomain(format!("TC lease get: {e:?}"))
+            })?,
+        );
+        Ok(())
+    }
+    fn power_domain_put(
+        &mut self,
+        domain: intel_display::power_map::PowerDomain,
+    ) -> Result<(), super::power::PowerError> {
+        if domain != intel_display::power_map::PowerDomain::PipeA {
+            return Err(super::power::PowerError::PowerDomain(String::from(
+                "wrong TC lease",
+            )));
+        }
+        let lease = self.lease.as_ref().ok_or_else(|| {
+            super::power::PowerError::PowerDomain(String::from("unpaired TC put"))
+        })?;
+        lease
+            .restore(self.registers)
+            .map_err(|e| super::power::PowerError::PowerDomain(format!("TC lease put: {e:?}")))?;
+        self.lease = None;
+        Ok(())
+    }
+    fn dc_state_exit(&mut self) -> Result<(), super::power::PowerError> {
+        self.parent
+            .held(self.registers)
+            .and_then(|()| {
+                if read(self.registers, 0x45504)? & super::power::DC_STATE_MASK == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::Refused)
+                }
+            })
+            .map_err(|e| super::power::PowerError::PowerDomain(format!("TC DC-off lease: {e:?}")))
+    }
+    fn dc_state_enter(&mut self) -> Result<bool, super::power::PowerError> {
+        self.dc_state_exit()?;
+        Ok(false)
+    }
+    fn set_dc_state_target(&mut self, _: u32) -> Result<bool, super::power::PowerError> {
+        Err(super::power::PowerError::PowerDomain(String::from(
+            "persistent TC lease forbids DC entry",
+        )))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Firmware {
     pipe: intel_display::pipe_config::PipeConfig,
@@ -718,8 +783,7 @@ struct Native<R, T> {
 enum NativeModesetPath {
     /// Preserve the established transactional TC modeset and rollback.
     LegacyTc,
-    /// Reserved for the translated atomic commit path. Until its Native
-    /// adapter is complete, this selection fails before touching hardware.
+    /// Source-ordered single-pipe TC atomic commit tail (explicit opt-in).
     NativeAtomic,
 }
 
@@ -943,6 +1007,20 @@ impl<R: Registers, T: PollTimer> super::tc_modeset::DpllLifecycle
         self.manager
             .enable(self.registers, self.timer, &mut power, &self.new)
             .map_err(|error| format!("translated shared DPLL enable failed: {error:?}"))
+    }
+    fn rollback_new(&mut self) -> Result<(), String> {
+        let mut power = super::shared_dpll::PinnedDpllPower::new(
+            self.power_pin,
+            self.identity,
+            self.refclk_khz,
+        )
+        .map_err(|e| format!("native PLL rollback power: {e:?}"))?;
+        self.manager
+            .disable(self.registers, self.timer, &mut power, &self.new)
+            .map_err(|e| format!("native PLL rollback disable: {e:?}"))?;
+        self.manager
+            .release_stopped_tc(self.registers, self.timer, &mut power)
+            .map_err(|e| format!("native PLL rollback release: {e:?}"))
     }
 }
 
@@ -1812,16 +1890,9 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             .map_err(|_| DrmError::NoMemory)
     }
     fn present(&self, s: Scanout) -> DrmResult<Arc<Fence>> {
-        match select_native_modeset_path(axhal::boot::command_line_value("intel.native_modeset")) {
-            NativeModesetPath::LegacyTc => {}
-            NativeModesetPath::NativeAtomic => {
-                // The option is deliberately fail-closed until the complete
-                // source ModesetOps adapter and its rollback owner are wired.
-                // In particular, never fall through to the legacy transaction
-                // after an explicitly requested atomic-path commit.
-                return Err(DrmError::Unsupported);
-            }
-        }
+        let native_atomic =
+            select_native_modeset_path(axhal::boot::command_line_value("intel.native_modeset"))
+                == NativeModesetPath::NativeAtomic;
         let Some(target) = self.modes.iter().find(|mode| mode.kms == s.mode).copied() else {
             return Err(DrmError::Unsupported);
         };
@@ -1983,7 +2054,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             });
         };
         let changing_mode = target.timing != state.current_mode.timing;
-        let changing_scanout = changing_mode || s.format != state.current_format;
+        let changing_scanout = native_atomic || changing_mode || s.format != state.current_format;
         if changing_scanout
             && super::atomic_modeset_wiring::preflight_native_mode_change(
                 state.current_mode.timing,
@@ -2229,28 +2300,97 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                         timer: &self.timer,
                         before: cdclk_before,
                     };
-                    super::tc_modeset::program(
-                        &self.registers,
-                        &self.timer,
-                        self.port,
-                        &target.timing,
-                        s.pitch,
-                        s.format,
-                        surface,
-                        Some(watermark),
-                        &target_pll,
-                        self.afc_startup,
-                        &avi_words,
-                        &self.sink_edid,
-                        None,
-                        None,
-                        true,
-                        None,
-                        Some(&mut lifecycle),
-                        Some(&mut clock_lifecycle),
-                        false,
-                        &mut display_writes_started,
-                    )
+                    if native_atomic {
+                        let mut power = NativeTcPower {
+                            registers: &self.registers,
+                            parent: &self.power,
+                            lease: None,
+                        };
+                        let connected = state.connected;
+                        let mut verify = || {
+                            let image =
+                                capture(&self.registers, &self.power, self.port, self.afc_startup)
+                                    .map_err(|e| format!("native readback: {e:?}"))?;
+                            verify_translated_crtc_state(
+                                &image,
+                                self.port,
+                                connected,
+                                target.timing.clock_khz,
+                            )?;
+                            if !same_mode_state(
+                                &image,
+                                &self.baseline,
+                                target,
+                                s.format,
+                                surface,
+                                s.pitch,
+                                &target_pll,
+                                self.port,
+                                expected_target_avi,
+                                &expected_target_phy,
+                            ) {
+                                return Err(String::from("native target image mismatch"));
+                            }
+                            Ok(())
+                        };
+                        let mut cleanup = |stopped: bool| {
+                            if !stopped {
+                                return Err(String::from(
+                                    "native DMA stop unverified; retaining framebuffer",
+                                ));
+                            }
+                            if let Some(new) = next.take() {
+                                // SAFETY: native rollback proved the pipe stopped (or never wrote it).
+                                if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                                    state.quarantine.push(new);
+                                    state.lost = true;
+                                    return Err(String::from("native framebuffer unpin failed"));
+                                }
+                            }
+                            Ok(())
+                        };
+                        super::tc_modeset::program_native(
+                            &self.registers,
+                            &self.timer,
+                            self.port,
+                            &target.timing,
+                            s.pitch,
+                            s.format,
+                            surface,
+                            Some(watermark),
+                            &avi_words,
+                            &self.sink_edid,
+                            Some(&mut lifecycle),
+                            Some(&mut clock_lifecycle),
+                            &mut display_writes_started,
+                            &mut power,
+                            &mut cleanup,
+                            &mut verify,
+                        )
+                    } else {
+                        super::tc_modeset::program(
+                            &self.registers,
+                            &self.timer,
+                            self.port,
+                            &target.timing,
+                            s.pitch,
+                            s.format,
+                            surface,
+                            Some(watermark),
+                            &target_pll,
+                            self.afc_startup,
+                            &avi_words,
+                            &self.sink_edid,
+                            None,
+                            None,
+                            true,
+                            None,
+                            Some(&mut lifecycle),
+                            Some(&mut clock_lifecycle),
+                            false,
+                            &mut display_writes_started,
+                        )
+                    }
                 })
                 .and_then(|()| {
                     let next_state =
@@ -2344,6 +2484,21 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                     } else {
                         DrmError::Busy
                     });
+                }
+                Err(original) if native_atomic => {
+                    // Never retry the legacy writer after an explicit native commit.
+                    // A failed native transaction leaves the display quiesced; the
+                    // runner already unwound hardware and its candidate mapping.
+                    self.shared_dpll
+                        .lock()
+                        .quarantine_after_unverified_rollback();
+                    if let Some(new) = next {
+                        state.quarantine.push(new);
+                    }
+                    state.lost = true;
+                    complete.signal_error();
+                    axlog::warn!("intel-native-modeset: {original}");
+                    return Err(DrmError::DeviceLost);
                 }
                 Err(original) => {
                     let old_avi_frame = old_firmware.hdmi.frames[0];
