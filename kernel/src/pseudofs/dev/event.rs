@@ -344,7 +344,27 @@ impl EvdevDevice {
     }
 
     pub fn resume(&self) {
-        if self.disconnected() || !self.paused.swap(false, Ordering::AcqRel) {
+        if self.disconnected() || !self.paused.load(Ordering::Acquire) {
+            return;
+        }
+        {
+            let mut state = self.state.lock();
+            let has_clients = state
+                .clients
+                .values()
+                .any(|client| client.strong_count() != 0);
+            if has_clients {
+                if let Err(error) = state.device.open_input() {
+                    warn!("evdev: input open callback failed during resume: {error:?}");
+                    return;
+                }
+            }
+        }
+        if self
+            .paused
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
         if let Some(irq) = self.irq {
