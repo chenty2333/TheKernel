@@ -8,6 +8,10 @@ helpers, output state readback and init planning follow the source ordering.
 DRM object registration and access to clocks, power, PHY, AUX, panel, audio and
 hotplug collaborators are explicit `DdiIo` hooks rather than fabricated
 services. The file is exported by `tk-intel-display` and compiled by its crate
-tests; only the existing narrower DDI clock/buffer helpers are currently used
-by the live kernel output path. A complete kernel `DdiIo` binding and source
-DDI pre-enable/enable/disable call sequence are not yet connected.
+tests; the live combo-PHY output path now uses the source
+`intel_ddi_transcoder_func_reg_val_get()` to compose `TRANS_DDI_FUNC_CTL` from
+the admitted HDMI/DVI encoder and Pipe-A state. That integration caught and
+fixed a translated sync-flag offset error and removed a Gen13 `PORT_WIDTH` field
+that upstream only adds on display version 14+. The policy calculation's
+`DdiIo` adapter cannot access hardware. A complete kernel `DdiIo` binding and
+source DDI pre-enable/enable/disable call sequence are not yet connected.
