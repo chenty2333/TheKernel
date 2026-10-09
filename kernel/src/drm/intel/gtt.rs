@@ -154,12 +154,14 @@
 //!
 //! ## What this module deliberately does not do
 //!
-//! * **Display-only bindings use uncached GGTT stores and requester identity
-//!   maps.** Local Linux 7.2.3 `gen8_ggtt_invalidate()` emits a GFX flush only
-//!   for WC mappings; ADL-N uses UC. No GuC/GT register is written by
-//!   display-only binding. The VT-d identity-map token is published before a
-//!   physical GGTT PTE and retired only after the display owner proves the
-//!   binding inactive and the exact PTE before-image is restored.
+//! * **Display-only bindings use uncached GGTT stores and shared-identity
+//!   admission tokens.** Local Linux 7.2.3 `gen8_ggtt_invalidate()` emits a
+//!   GFX flush only for WC mappings; ADL-N uses UC. No GuC/GT register is
+//!   written by display-only binding. Before publishing a physical GGTT PTE,
+//!   the VT-d lease checks the backing pages against the retained shared boot
+//!   identity aperture and records an ownership token. This does not switch or
+//!   isolate the GPU requester context. Retire the token only after the display
+//!   owner proves the binding inactive and restores the exact PTE before-image.
 //! * **It does not decide when hardware is quiesced.** The owner that programs
 //!   the plane or GT must prove fresh-frame/idle/reset retirement before calling
 //!   [`Gtt::release_binding`]. Uncertain owners retain the binding and backing;
@@ -707,11 +709,11 @@ impl ApertureSize {
 pub(crate) enum GttError {
     CheckpointUnavailable,
     CheckpointMismatch,
-    /// The shared GPU owner has not installed a requester-scoped VT-d lease.
+    /// The shared GPU owner has not acquired a requester-scoped page-admission lease.
     IdentityLeaseUnavailable,
-    /// VT-d rejected a new identity page mapping before publishing it.
-    IdentityMapFailed,
-    /// A mapping or its retirement became ambiguous; backing must be retained.
+    /// The VT-d identity-aperture lease rejected admission before publication.
+    IdentityAdmissionFailed,
+    /// A DMA ownership token or its retirement became ambiguous; backing must be retained.
     IdentityDmaQuarantined,
     /// BAR 0 is shorter than the register window plus the page table array.
     BarTooSmall {
@@ -785,13 +787,15 @@ impl GttError {
                 String::from("GGTT checkpoint belongs to a different aperture")
             }
             Self::IdentityLeaseUnavailable => String::from(
-                "no verified requester-scoped Intel GPU identity-DMA lease owns this GGTT",
+                "no verified Intel GPU page-admission lease owns this GGTT's shared identity \
+                 aperture",
             ),
-            Self::IdentityMapFailed => String::from(
-                "VT-d refused the pinned GPU backing pages before a GGTT PTE was published",
+            Self::IdentityAdmissionFailed => String::from(
+                "VT-d identity-aperture lease refused the pinned GPU pages before a GGTT PTE was \
+                 published",
             ),
             Self::IdentityDmaQuarantined => String::from(
-                "VT-d identity-map state is ambiguous; backing pages and GGTT owner are \
+                "VT-d DMA ownership-token state is ambiguous; backing pages and GGTT owner are \
                  quarantined",
             ),
             Self::BarTooSmall { observed, needed } => format!(
@@ -876,7 +880,7 @@ pub(crate) struct Gtt {
     #[cfg(target_os = "none")]
     identity_lease: Mutex<Option<Arc<tk_vtd::IdentityDmaLease>>>,
     /// The shared scratch page is referenced by every GGTT padding run and
-    /// remains identity-mapped for the lifetime of this single-owner table.
+    /// has a live admission token for the lifetime of this single-owner table.
     #[cfg(target_os = "none")]
     scratch_dma_mapping: Mutex<Option<tk_vtd::IdentityDmaMapping>>,
     /// Ambiguous pre-publication failures retain page ownership here until
@@ -937,7 +941,7 @@ impl Drop for DmaBinding {
             // SAFETY: this is an intentional safety leak. If a caller drops an
             // ambiguously live binding, keep both physical frame ownership and
             // the fixed-view pin rather than returning pages still reachable
-            // through the requester's possibly cached translation.
+            // through the retained shared boot identity aperture.
             core::mem::forget(pages.clone());
             core::mem::forget(pin.clone());
         }
@@ -945,9 +949,9 @@ impl Drop for DmaBinding {
 }
 
 /// The exact ordering boundary for a device binding: acquire the complete
-/// identity-map token, only then publish physical addresses; on a failed
-/// publication, restore the full preimage before retiring the DMA map.
-fn map_before_publish<T>(
+/// identity-aperture admission token, only then publish physical addresses; on
+/// a failed publication, restore the full preimage before retiring the token.
+fn admit_before_publish<T>(
     physical: &[u64],
     map: impl FnOnce(&[u64]) -> Result<T, GttError>,
     publish: impl FnOnce(&T) -> Result<(), GttError>,
@@ -1079,9 +1083,11 @@ impl Gtt {
         })
     }
 
-    /// Install the single requester-scoped VT-d owner after live firmware
-    /// scanout ownership has been proved. Display and GT then share this exact
-    /// lease through the same GGTT instance.
+    /// Retain the single requester-scoped VT-d bookkeeping owner after live
+    /// firmware scanout ownership has been proved. The owner validates pages
+    /// against the existing shared boot identity aperture; it does not replace
+    /// the GPU context or provide requester isolation. Display and GT share
+    /// this exact lease through the same GGTT instance.
     #[cfg(target_os = "none")]
     pub(crate) fn install_identity_lease(
         &self,
@@ -1106,7 +1112,7 @@ impl Gtt {
             if error == tk_vtd::Error::Quarantined {
                 GttError::IdentityDmaQuarantined
             } else {
-                GttError::IdentityMapFailed
+                GttError::IdentityAdmissionFailed
             }
         })?;
         *self.scratch_dma_mapping.lock() = Some(mapping);
@@ -1392,8 +1398,10 @@ impl Gtt {
     }
 
     /// Product-kernel contiguous scanout allocation. Unlike the host model,
-    /// this always publishes an identity-mapped binding under the installed
-    /// GPU requester lease and returns its retirement owner.
+    /// this checks and retains backing-page admission under the installed GPU
+    /// lease before publishing physical GGTT addresses, then returns its
+    /// retirement owner. The physical identity aperture is the shared boot
+    /// mapping; this lease does not install a GPU-specific mapping.
     #[cfg(target_os = "none")]
     pub(crate) fn bind_linear(&self, physical: u64, len: usize) -> Result<Binding, GttError> {
         if len == 0 || !physical.is_multiple_of(PAGE_SIZE) {
@@ -1458,7 +1466,7 @@ impl Gtt {
                 .cloned()
                 .ok_or(GttError::IdentityLeaseUnavailable)?;
             let mut backing = backing;
-            map_before_publish(
+            admit_before_publish(
                 physical,
                 |pages| match lease.map_pages(pages) {
                     Ok(mapping) => Ok(DmaBinding {
@@ -1476,7 +1484,7 @@ impl Gtt {
                         });
                         Err(GttError::IdentityDmaQuarantined)
                     }
-                    Err(_) => Err(GttError::IdentityMapFailed),
+                    Err(_) => Err(GttError::IdentityAdmissionFailed),
                 },
                 |_| {
                     for i in 0..count {

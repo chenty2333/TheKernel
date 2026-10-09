@@ -2,12 +2,13 @@
 // Copyright 2026 TheKernel contributors. See the repository MIT license.
 //! Intel GPU DMA identity-lease admission and checked firmware reads.
 //!
-//! N305's native display and GT paths keep physical GGTT/PPGTT addresses, so
-//! they may run under VT-d only after an exact, requester-scoped identity map
-//! has been installed and invalidated. Firmware scanout pages are admitted by
-//! `fastboot::ownership` before this module asks the VT-d owner to switch the
-//! GPU requester context. Kernel-owned pages are added through the returned
-//! lease only while pinned and are unmapped after hardware retirement.
+//! N305's native display and GT paths keep physical GGTT/PPGTT addresses. They
+//! therefore rely on the existing shared boot DID1 identity aperture; this
+//! lease does not switch the GPU context or provide requester isolation. The
+//! exact firmware scanout and kernel-owned backing pages are checked against
+//! that aperture and held in lease tokens while pinned. Firmware scanout pages
+//! are admitted by `fastboot::ownership`; kernel-owned tokens are retired only
+//! after hardware retirement.
 #[cfg(target_os = "none")]
 use alloc::vec::Vec;
 

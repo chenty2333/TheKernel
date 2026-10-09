@@ -281,16 +281,16 @@ fn four_gib_aperture_keeps_new_allocations_below_the_guc_window() {
 }
 
 #[test]
-fn identity_mapping_failure_or_missing_page_prevents_any_ggtt_publication() {
+fn identity_aperture_admission_failure_prevents_any_ggtt_publication() {
     let pages = [0x2000, 0x9000];
     let events = core::cell::RefCell::new(alloc::vec::Vec::new());
-    let missing_page = map_before_publish(
+    let missing_page = admit_before_publish(
         &pages,
         |requested| {
-            events.borrow_mut().push("map");
+            events.borrow_mut().push("admit");
             assert_eq!(requested, &[0x2000, 0x9000]);
-            // Model a lease that rejects an incomplete/unauthorized batch.
-            Err::<(), _>(GttError::IdentityMapFailed)
+            // Model a lease that rejects an unauthorized batch.
+            Err::<(), _>(GttError::IdentityAdmissionFailed)
         },
         |_| {
             events.borrow_mut().push("PTE");
@@ -300,22 +300,22 @@ fn identity_mapping_failure_or_missing_page_prevents_any_ggtt_publication() {
         |_| Ok(()),
         |_| events.borrow_mut().push("quarantine"),
     );
-    assert_eq!(missing_page, Err(GttError::IdentityMapFailed));
+    assert_eq!(missing_page, Err(GttError::IdentityAdmissionFailed));
     assert_eq!(
         *events.borrow(),
-        ["map"],
-        "no physical GGTT PTE may precede DMA map"
+        ["admit"],
+        "no physical GGTT PTE may precede page admission"
     );
 }
 
 #[test]
-fn ambiguous_ggtt_rollback_keeps_identity_mapping_and_backing_quarantined() {
+fn ambiguous_ggtt_rollback_keeps_admission_token_and_backing_quarantined() {
     let pages = [0x3000];
     let events = core::cell::RefCell::new(alloc::vec::Vec::new());
-    let result = map_before_publish(
+    let result = admit_before_publish(
         &pages,
         |_| {
-            events.borrow_mut().push("map");
+            events.borrow_mut().push("admit");
             Ok(())
         },
         |_| {
@@ -335,16 +335,16 @@ fn ambiguous_ggtt_rollback_keeps_identity_mapping_and_backing_quarantined() {
             })
         },
         |_| {
-            events.borrow_mut().push("unmap");
+            events.borrow_mut().push("retire");
             Ok(())
         },
         |_| events.borrow_mut().push("quarantine"),
     );
     assert_eq!(result, Err(GttError::IdentityDmaQuarantined));
-    assert_eq!(*events.borrow(), ["map", "PTE", "rollback", "quarantine"]);
+    assert_eq!(*events.borrow(), ["admit", "PTE", "rollback", "quarantine"]);
     assert!(
-        !events.borrow().contains(&"unmap"),
-        "ambiguous PTEs keep the DMA map live"
+        !events.borrow().contains(&"retire"),
+        "ambiguous PTEs keep the DMA ownership token live"
     );
 }
 

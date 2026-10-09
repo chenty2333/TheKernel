@@ -28,8 +28,10 @@ fn append_dma_pages(output: &mut Vec<u64>, pages: &[u64]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Transfer one exact page batch into the requester's identity map before a
-/// caller can publish PPGTT/GGTT addresses or submit work.
+/// Admit and retain one exact page batch against the requester's existing
+/// shared boot identity aperture before a caller can publish PPGTT/GGTT
+/// addresses or submit work. This token does not install a per-requester map
+/// or provide GPU isolation.
 fn map_page_batch<T>(
     pages: &[u64],
     map: impl FnOnce(&[u64]) -> Result<T, Error>,
@@ -542,8 +544,9 @@ pub(super) struct Memory {
     batch: Ram,
     status: Ram,
     bindings: Vec<Binding>,
-    /// Non-GGTT PPGTT leaf/page-table backing is identity-mapped as one batch
-    /// and retained through the engine's existing reset/idle proof.
+    /// Non-GGTT PPGTT leaf/page-table backing is admitted as one exact batch
+    /// against the shared boot identity aperture and retained through the
+    /// engine's existing reset/idle proof.
     #[cfg(target_os = "none")]
     identity_mappings: Vec<tk_vtd::IdentityDmaMapping>,
     descriptor: u64,
@@ -1994,7 +1997,9 @@ impl Memory {
         // PPGTT leaf entries and root pointers name physical memory directly.
         // Map the complete, exact set before publishing any GGTT PTE for this
         // submission; user GEM pages, scratch tables and VM roots share the
-        // same requester-specific identity lease, never a full-RAM mapping.
+        // same requester-specific page-ownership lease. The VT-d backend keeps
+        // the existing shared boot identity context, so this is not a claim of
+        // GPU isolation or a per-GPU page-table mapping.
         self.map_ppgtt_backing()?;
         for r in [&*self.context, &self.ring, &self.status] {
             self.bindings

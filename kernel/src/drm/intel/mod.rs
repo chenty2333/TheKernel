@@ -420,13 +420,14 @@ fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, Str
     ) {
         return fastboot::init(bdf, *window, gtt);
     }
-    // The non-TC path still needs an initial live-plane/stolen-memory DMA
-    // ownership proof before changing the GPU requester context. It has no
-    // such proof yet, so do not quiesce or program a physical GGTT surface.
+    // The non-TC path still needs an initial live-plane/stolen-memory proof
+    // before admitting its pages to the retained shared boot identity
+    // aperture. It has no such proof yet, so do not quiesce or program a
+    // physical GGTT surface.
     if !gtt.has_identity_lease(bdf) {
         return Err(String::from(
-            "intel.modeset=1 REFUSED before writes: non-TC scanout has no verified GPU \
-             identity-DMA lease",
+            "intel.modeset=1 REFUSED before writes: non-TC scanout has no verified shared boot \
+             identity aperture lease",
         ));
     }
     let image = gtt.checkpoint().map_err(|e| e.describe())?;

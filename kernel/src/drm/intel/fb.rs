@@ -350,7 +350,7 @@ impl FbError {
 /// boot, including replacements. If a caller drops one before its GGTT token
 /// has been safely retired, the product `Drop` path intentionally leaks the
 /// backing rather than returning pages still reachable by the display engine
-/// or its requester identity map.
+/// or its shared-identity DMA admission token.
 pub(crate) struct Surface {
     /// The allocation that owns the memory.  Held whether or not anything
     /// reads it, because dropping it is what returns the pages.
@@ -361,7 +361,7 @@ pub(crate) struct Surface {
     physical: u64,
     /// The graphics address a plane's surface register is given.
     ggtt: u64,
-    /// Holds the requester identity map until the surface is retired.
+    /// Holds the exact backing-page admission token until the surface is retired.
     #[cfg(target_os = "none")]
     binding: super::gtt::Binding,
     plan: Plan,
@@ -374,8 +374,8 @@ impl Drop for Surface {
             && let Some(memory) = self.memory.take()
         {
             // The GGTT binding remains present for this boot and may still be
-            // the console owner. Do not return its identity-mapped backing to
-            // the global allocator if a caller drops the surface early.
+            // the console owner. Do not return its backing to the global
+            // allocator while the shared boot identity aperture can reach it.
             core::mem::forget(memory);
         }
     }

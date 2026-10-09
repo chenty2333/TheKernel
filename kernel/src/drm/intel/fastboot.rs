@@ -320,8 +320,8 @@ pub(super) struct PowerPin {
 impl PowerPin {
     /// Adopt only an already requested live TC route. Unlike `acquire`, this
     /// observation never sets a power request bit or writes any display MMIO;
-    /// GT-only startup uses it to prove the active scanout before switching
-    /// the GPU's VT-d requester context.
+    /// GT-only startup uses it to prove the active scanout before admitting
+    /// its pages to the retained shared boot identity aperture.
     fn observe(r: &impl Registers, port: TcPort) -> Result<Self, Error> {
         if port.index() > 1 || read(r, 0x45504)? & super::power::DC_STATE_MASK != 0 {
             return Err(Error::Refused);
@@ -546,6 +546,46 @@ struct Firmware {
     pixel_clock: u32,
     afc_startup: Option<u8>,
 }
+
+/// The identity lease admits only the primary plane's exact GGTT PTE pages in
+/// the retained shared boot identity aperture. Refuse any other display
+/// fetcher or compression side buffer rather than inferring its address or
+/// extent from a GOP descriptor.
+fn require_only_primary_display_fetch(r: &impl Registers) -> Result<(), Error> {
+    let power = read(r, 0x45404)?;
+    for i in 1..4 {
+        if power & (1 << ((5 + i) * 2)) != 0 && read(r, 0x70008 + i * 0x1000)? & (3 << 30) != 0 {
+            return Err(Error::Refused);
+        }
+    }
+    for i in 1..5 {
+        if read(r, 0x70180 + i * 0x100)? & (1 << 31) != 0 {
+            return Err(Error::Refused);
+        }
+    }
+
+    // ADL-N uses the new-style cursor mode field; CURSOR_ENABLE bit 31 is an
+    // old desktop-8xx flag and is not a Gen12 enable test. Cursor FBC has its
+    // own buffer/fetcher control.
+    let cursor = read(r, 0x70080)?;
+    if cursor & intel_display::intel_cursor_full::MCURSOR_MODE_MASK != 0
+        || read(r, 0x700a0)? & intel_display::intel_cursor_full::CUR_FBC_EN != 0
+    {
+        return Err(Error::Refused);
+    }
+
+    // Linux 7.2.3 selects ivb_fbc_funcs for display version >= 7, including
+    // ADL-N. Its FBC instance A is at ILK_DPFC_CONTROL(A)=0x43208 and
+    // ILK_DPFC_STATUS2(A)=0x43214; reject enabled FBC or any live compressed
+    // segments because their stolen CFB/LL buffers are outside the plane PTEs.
+    if read(r, 0x43208)? & intel_display::intel_fbc_full::DPFC_CTL_EN != 0
+        || read(r, 0x43214)? & intel_display::intel_fbc_full::DPFC_COMP_SEG_MASK_IVB != 0
+    {
+        return Err(Error::Refused);
+    }
+    Ok(())
+}
+
 fn capture(
     r: &impl Registers,
     pin: &PowerPin,
@@ -572,28 +612,20 @@ fn capture(
     {
         return Err(Error::Refused);
     }
-    // No secondary running pipe, hidden sprite/cursor or compression owner.
-    let power = read(r, 0x45404)?;
-    for i in 1..4 {
-        if power & (1 << ((5 + i) * 2)) != 0 && read(r, 0x70008 + i * 0x1000)? & (3 << 30) != 0 {
-            return Err(Error::Refused);
-        }
-    }
-    for i in 1..5 {
-        if read(r, 0x70180 + i * 0x100)? & (1 << 31) != 0 {
-            return Err(Error::Refused);
-        }
-    }
-    if read(r, 0x70080)? & 0x3f != 0 {
-        return Err(Error::Refused);
-    }
+    require_only_primary_display_fetch(r)?;
     let plane = universal_plane::skl_get_initial_plane_config(
         &io,
         Pipe::A,
         universal_plane::Plane::PRIMARY,
     )?
     .ok_or(Error::Refused)?;
-    if !plane.native_linear_rgb()
+    let xrgb_stride = plane
+        .width
+        .checked_mul(4)
+        .and_then(|minimum| minimum.div_ceil(64).checked_mul(64))
+        .ok_or(Error::Refused)?;
+    if !plane.native_linear_xrgb()
+        || plane.pitch != xrgb_stride
         || plane.offset != 0
         || (plane.width, plane.height) != pipe.source
         || read(r, 0x7018c)? != 0
@@ -790,8 +822,9 @@ fn ownership(
     Ok(live_pages)
 }
 
-/// Read only the active firmware Pipe-A scanout that the GT requester lease
-/// must preserve. This intentionally avoids DKL/PHY and DMC paths: those may
+/// Read only the active firmware Pipe-A scanout whose exact backing pages the
+/// shared boot identity lease must admit. This intentionally avoids DKL/PHY
+/// and DMC paths: those may
 /// perform selector or power-request writes even when called for readout.
 fn read_only_live_scanout<R: Registers>(
     r: &R,
@@ -824,22 +857,7 @@ fn read_only_live_scanout<R: Registers>(
         return Err(Error::Refused);
     }
 
-    // Do not switch the requester while another pipe, sprite or cursor can
-    // still fetch an unenumerated surface from the same GPU.
-    let power = read(r, 0x45404)?;
-    for i in 1..4 {
-        if power & (1 << ((5 + i) * 2)) != 0 && read(r, 0x70008 + i * 0x1000)? & (3 << 30) != 0 {
-            return Err(Error::Refused);
-        }
-    }
-    for i in 1..5 {
-        if read(r, 0x70180 + i * 0x100)? & (1 << 31) != 0 {
-            return Err(Error::Refused);
-        }
-    }
-    if read(r, 0x70080)? & 0x3f != 0 {
-        return Err(Error::Refused);
-    }
+    require_only_primary_display_fetch(r)?;
 
     let plane = universal_plane::skl_get_initial_plane_config(
         &io,
@@ -847,7 +865,13 @@ fn read_only_live_scanout<R: Registers>(
         universal_plane::Plane::PRIMARY,
     )?
     .ok_or(Error::Refused)?;
-    if !plane.native_linear_rgb()
+    let xrgb_stride = plane
+        .width
+        .checked_mul(4)
+        .and_then(|minimum| minimum.div_ceil(64).checked_mul(64))
+        .ok_or(Error::Refused)?;
+    if !plane.native_linear_xrgb()
+        || plane.pitch != xrgb_stride
         || plane.offset != 0
         || (plane.width, plane.height) != pipe.source
         || read(r, 0x7018c)? != 0
@@ -955,8 +979,10 @@ pub(super) fn admit_read_only_identity_lease(
     let lease = dma::acquire_identity_lease(bdf, &live_pages)?;
     gtt.install_identity_lease(lease)
         .map_err(|_| Error::Refused)?;
-    // Recheck after the VT-d context transition. If firmware changed scanout
-    // concurrently, the new lease remains owned but no GT MMIO is attempted.
+    // Recheck after bookkeeping admission into the retained shared boot
+    // identity aperture. No requester context transition or GPU isolation is
+    // performed. If firmware changed scanout concurrently, keep the lease
+    // owned but do not attempt GT MMIO.
     if read_only_live_scanout(window, &pin, port)? != (pipe, plane) {
         return Err(Error::Refused);
     }
@@ -3151,9 +3177,6 @@ pub(super) fn init(
                 );
                 return Err(Error::Refused);
             }
-            if first.plane.pitch != (first.plane.width * 4).div_ceil(64) * 64 {
-                return Err(Error::Refused);
-            }
             let live_pages = ownership(
                 &gtt,
                 &first.plane,
@@ -3162,9 +3185,10 @@ pub(super) fn init(
                 stolen,
                 &allocatable,
             )?;
-            // Preserve the active firmware scanout before changing this GPU's
-            // requester context. The VT-d owner adds only matching GPU RMRRs
-            // and this separately verified set of stolen pages.
+            // Preserve the active firmware scanout within the existing shared
+            // boot identity aperture. The VT-d owner admits only matching GPU
+            // RMRRs and this separately verified set of stolen pages; it does
+            // not replace the context or isolate this requester.
             let identity_lease = super::dma::acquire_identity_lease(bdf, &live_pages)?;
             gtt.install_identity_lease(identity_lease)
                 .map_err(|_| Error::Refused)?;
@@ -3559,10 +3583,13 @@ mod tests {
                 (0x7019c, 0x200000),
                 (0x701ac, 0x200000),
                 (0x701a4, 0),
+                (0x700a0, 0),
                 (0x70190, (63 << 16) | 63),
                 (0x70188, 4),
                 (0x7018c, 0),
                 (0x70080, 0),
+                (0x43208, 0),
+                (0x43214, 0),
                 (0x60400, (1 << 31) | (4 << 27) | (3 << 16)),
                 (0x161500, 4),
                 (0x64300, (1 << 31) | (1 << 6)),
@@ -4248,6 +4275,47 @@ mod tests {
         r.set(0x45404, current & !(2 << 2));
         assert!(PowerPin::observe(&r, TcPort::Tc1).is_err());
         assert_eq!(r.inner.lock().writes, writes);
+    }
+
+    #[test]
+    fn active_cursor_or_compression_buffer_refuses_dma_handoff() {
+        let r = Model::new();
+        let pin = PowerPin::acquire(&r, TcPort::Tc1).unwrap();
+        let baseline_capture_log_start = r.inner.lock().log.len();
+        assert!(capture(&r, &pin, TcPort::Tc1, None).is_ok());
+        assert!(
+            !r.inner.lock().log[baseline_capture_log_start..]
+                .iter()
+                .any(|(offset, _)| *offset == 0x7019c),
+            "baseline capture must not write the live plane surface"
+        );
+
+        for (register, value) in [
+            (
+                0x70080,
+                intel_display::intel_cursor_full::MCURSOR_MODE_64_2B,
+            ),
+            (0x700a0, intel_display::intel_cursor_full::CUR_FBC_EN),
+            (0x43208, intel_display::intel_fbc_full::DPFC_CTL_EN),
+            (
+                0x43214,
+                intel_display::intel_fbc_full::DPFC_COMP_SEG_MASK_IVB,
+            ), // FBC segments remain live stolen-memory fetches.
+        ] {
+            r.set(register, value);
+            let scanout_read_writes = r.inner.lock().writes;
+            assert!(read_only_live_scanout(&r, &pin, TcPort::Tc1).is_err());
+            assert_eq!(r.inner.lock().writes, scanout_read_writes);
+            let capture_log_start = r.inner.lock().log.len();
+            assert!(capture(&r, &pin, TcPort::Tc1, None).is_err());
+            assert!(
+                !r.inner.lock().log[capture_log_start..]
+                    .iter()
+                    .any(|(offset, _)| *offset == 0x7019c),
+                "refused FBC/cursor capture must not write the live plane surface"
+            );
+            r.set(register, 0);
+        }
     }
 
     #[test]
