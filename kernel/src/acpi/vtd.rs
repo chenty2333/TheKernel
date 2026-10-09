@@ -548,6 +548,10 @@ fn vtd_fault_drain_worker() {
                 );
                 continue;
             };
+            info!(
+                "vtd: fault-event MSI vector={vector:#x} deferred drain for DRHD {:#x}",
+                unit.register_base
+            );
             match unit.rearm_fault_interrupt() {
                 Ok(()) => {
                     if !FAULT_IRQ_UNMASKED_ONCE[vector].swap(true, Ordering::AcqRel) {
