@@ -118,3 +118,10 @@ ArceOS, StarryOS, smoltcp, rust-fatfs, virtio-drivers, kernel-elf-parser
   declaration, and the sync status; where this repository records no upstream
   revision it says "unknown" and names the evidence that would pin it rather
   than inventing a hash.
+
+  Scan-only note for `crates/ax`: the VHT RA translation's ISC license
+  boilerplate contributes two extra >=40/25 comment-line hash matches in
+  `tk-net80211/src/ra_vht.rs`. These are license text collisions, not Linux
+  implementation excerpts; the seven genuine Linux comment lines and eight
+  code matches above are unchanged. The pinned counter baseline and detailed
+  provenance ledger record the 97/131 total scan counts.

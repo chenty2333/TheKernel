@@ -1,0 +1,1932 @@
+//! Bluetooth HCI packet formats, USB endpoint contract and channel model.
+//!
+//! The endpoint routing follows FreeBSD `sys/netgraph/bluetooth/drivers/ubt/
+//! ng_ubt.c` (BSD-2-Clause, Copyright (c) 2001-2009 Maksim Yevmenkin), with
+//! no netgraph code carried over. HCI packet layouts and Linux socket channel
+//! values follow the Bluetooth Core specification and UAPI semantics.
+#![no_std]
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
+
+mod iwmbt_fw;
+pub mod smp;
+pub mod smp_crypto;
+use alloc::{collections::VecDeque, vec::Vec};
+
+pub use iwmbt_fw::{
+    BootParams, DeviceFamily, FirmwareError, PatchCommand, Version, VersionTlv, get_fwname,
+    get_fwname_fallback, get_fwname_tlv, parse_patch, parse_tlv, parse_version_event,
+    supported_device,
+};
+
+pub const AF_BLUETOOTH: i32 = 31;
+pub const BTPROTO_HCI: i32 = 1;
+pub const HCI_CHANNEL_RAW: u32 = 0;
+pub const HCI_CHANNEL_USER: u32 = 1;
+pub const HCI_CHANNEL_MONITOR: u32 = 2;
+pub const HCI_CHANNEL_CONTROL: u32 = 3;
+pub const BT_IOC_MAGIC: u8 = b'H';
+pub const HCIDEVUP: u32 = ioctl(1, 201, 4);
+pub const HCIDEVDOWN: u32 = ioctl(1, 202, 4);
+pub const HCIGETDEVLIST: u32 = ioctl(2, 210, 4);
+pub const HCIGETDEVINFO: u32 = ioctl(2, 211, 4);
+
+/// Linux _IOC encoding for the fixed integer hci_dev ioctl arguments.
+const fn ioctl(direction: u32, number: u32, size: u32) -> u32 {
+    (direction << 30) | (size << 16) | ((BT_IOC_MAGIC as u32) << 8) | number
+}
+
+fn read_le32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
+    let end = offset.checked_add(4).ok_or(Error::InvalidLength)?;
+    let raw: [u8; 4] = bytes
+        .get(offset..end)
+        .ok_or(Error::InvalidLength)?
+        .try_into()
+        .map_err(|_| Error::InvalidLength)?;
+    Ok(u32::from_le_bytes(raw))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacketType {
+    Command,
+    Acl,
+    Sco,
+    Event,
+    Iso,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    Truncated,
+    InvalidLength,
+    Unsupported,
+    NoDevice,
+    NoMemory,
+    Busy,
+    NotUp,
+    Again,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Packet<'a> {
+    pub kind: PacketType,
+    pub payload: &'a [u8],
+}
+
+impl<'a> Packet<'a> {
+    /// Validate the HCI header and exact packet payload length before queueing.
+    pub fn parse(kind: PacketType, bytes: &'a [u8]) -> Result<Self, Error> {
+        let (header, length_offset, length_width) = match kind {
+            PacketType::Command => (3, 2, 1),
+            PacketType::Acl => (4, 2, 2),
+            PacketType::Sco => (3, 2, 1),
+            PacketType::Event => (2, 1, 1),
+            PacketType::Iso => (4, 2, 2),
+        };
+        if bytes.len() < header {
+            return Err(Error::Truncated);
+        }
+        let payload_len = if length_width == 1 {
+            usize::from(bytes[length_offset])
+        } else {
+            usize::from(
+                u16::from_le_bytes([bytes[length_offset], bytes[length_offset + 1]]) & 0x3fff,
+            )
+        };
+        if bytes.len() != header + payload_len {
+            return Err(Error::InvalidLength);
+        }
+        Ok(Self {
+            kind,
+            payload: bytes,
+        })
+    }
+}
+
+/// Split an outbound HCI ACL packet whose payload contains one complete
+/// L2CAP PDU into controller-MTU-sized HCI packets. The first fragment uses
+/// PB=2; continuations use PB=1, as required by the HCI ACL packet format.
+pub fn fragment_acl_packet(packet: &[u8], mtu: usize) -> Result<Vec<Vec<u8>>, Error> {
+    Packet::parse(PacketType::Acl, packet)?;
+    let payload = &packet[4..];
+    if mtu == 0 || payload.len() <= mtu {
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(packet.len())
+            .map_err(|_| Error::NoMemory)?;
+        copy.extend_from_slice(packet);
+        return Ok(alloc::vec![copy]);
+    }
+    let raw_flags = u16::from_le_bytes([packet[0], packet[1]]);
+    let handle_bc = (raw_flags & 0x0fff) | (raw_flags & 0xc000);
+    let original_pb = (raw_flags >> 12) & 3;
+    if original_pb != 1 {
+        if !matches!(original_pb, 0 | 2) || payload.len() < 4 {
+            return Err(Error::InvalidLength);
+        }
+        let l2cap_payload = usize::from(u16::from_le_bytes([payload[0], payload[1]]));
+        if l2cap_payload.checked_add(4) != Some(payload.len()) {
+            return Err(Error::InvalidLength);
+        }
+    }
+    let count = payload.len().div_ceil(mtu);
+    let mut fragments = Vec::new();
+    fragments
+        .try_reserve_exact(count)
+        .map_err(|_| Error::NoMemory)?;
+    for (index, chunk) in payload.chunks(mtu).enumerate() {
+        let pb = if original_pb == 1 || index != 0 {
+            0x1000
+        } else {
+            0x2000
+        };
+        let mut fragment = Vec::new();
+        fragment
+            .try_reserve_exact(4 + chunk.len())
+            .map_err(|_| Error::NoMemory)?;
+        fragment.extend_from_slice(&(handle_bc | pb).to_le_bytes());
+        fragment.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+        fragment.extend_from_slice(chunk);
+        fragments.push(fragment);
+    }
+    Ok(fragments)
+}
+
+/// Construct LE Start Encryption (0x2019) using a bluetoothd-loaded LTK
+/// material tuple. LE HCI uses little-endian handle/Rand/EDIV/key bytes.
+pub fn le_start_encryption_command(
+    handle: u16,
+    random: &[u8; 8],
+    ediv: u16,
+    key: &[u8; 16],
+) -> Result<[u8; 31], Error> {
+    if handle > 0x0fff {
+        return Err(Error::InvalidLength);
+    }
+    let mut command = [0u8; 31];
+    command[..2].copy_from_slice(&0x2019u16.to_le_bytes());
+    command[2] = 28;
+    command[3..5].copy_from_slice(&handle.to_le_bytes());
+    command[5..13].copy_from_slice(random);
+    command[13..15].copy_from_slice(&ediv.to_le_bytes());
+    command[15..31].copy_from_slice(key);
+    Ok(command)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagementLtk {
+    pub random: [u8; 8],
+    pub ediv: u16,
+    pub key: [u8; 16],
+}
+
+/// Select the LE master key for an identity loaded by MGMT_LOAD_LONG_TERM_KEYS
+/// (`mgmt_ltk_info`: address/type/authenticated/master/size/EDIV/Rand/value).
+pub fn find_management_ltk(
+    records: &[[u8; 36]],
+    address: [u8; 6],
+    address_type: u8,
+) -> Option<ManagementLtk> {
+    records
+        .iter()
+        .find(|record| {
+            record[..6] == address
+                && record[6] == address_type
+                && record[8] != 0
+                && (7..=16).contains(&record[9])
+        })
+        .map(|record| ManagementLtk {
+            random: record[12..20].try_into().unwrap_or([0; 8]),
+            ediv: u16::from_le_bytes([record[10], record[11]]),
+            key: record[20..36].try_into().unwrap_or([0; 16]),
+        })
+}
+
+/// Bounded per-handle reassembly for incoming ACL packets. A completed value
+/// is a normalized HCI ACL packet containing one complete L2CAP frame.
+#[derive(Default)]
+pub struct AclReassembler {
+    partial: Vec<(u16, usize, Vec<u8>)>,
+}
+
+impl AclReassembler {
+    pub const fn new() -> Self {
+        Self {
+            partial: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
+        if Packet::parse(PacketType::Acl, packet).is_err() {
+            return None;
+        }
+        let raw_flags = u16::from_le_bytes([packet[0], packet[1]]);
+        let handle = raw_flags & 0x0fff;
+        let pb = (raw_flags >> 12) & 3;
+        let payload = &packet[4..];
+        match pb {
+            0 | 2 | 3 => {
+                self.partial.retain(|(old, ..)| *old != handle);
+                if payload.len() < 4 {
+                    return None;
+                }
+                let expected = usize::from(u16::from_le_bytes([payload[0], payload[1]])) + 4;
+                if payload.len() > expected {
+                    return None;
+                }
+                if payload.len() == expected {
+                    return normalize_acl(handle, payload);
+                }
+                if pb == 3 {
+                    return None;
+                }
+                if self.partial.len() >= 16 {
+                    self.partial.remove(0);
+                }
+                self.partial.try_reserve(1).ok()?;
+                let mut bytes = Vec::new();
+                bytes.try_reserve_exact(payload.len()).ok()?;
+                bytes.extend_from_slice(payload);
+                self.partial.push((handle, expected, bytes));
+                None
+            }
+            1 => {
+                let position = self.partial.iter().position(|(old, ..)| *old == handle)?;
+                let (_, expected, bytes) = &mut self.partial[position];
+                if bytes.len().saturating_add(payload.len()) > *expected {
+                    self.partial.remove(position);
+                    return None;
+                }
+                bytes.try_reserve(payload.len()).ok()?;
+                bytes.extend_from_slice(payload);
+                if bytes.len() == *expected {
+                    let (_, _, bytes) = self.partial.remove(position);
+                    normalize_acl(handle, &bytes)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                self.partial.retain(|(old, ..)| *old != handle);
+                None
+            }
+        }
+    }
+
+    pub fn clear_handle(&mut self, handle: u16) {
+        self.partial.retain(|(old, ..)| *old != handle);
+    }
+}
+
+fn normalize_acl(handle: u16, payload: &[u8]) -> Option<Vec<u8>> {
+    let mut packet = Vec::new();
+    packet.try_reserve_exact(4 + payload.len()).ok()?;
+    packet.extend_from_slice(&(handle | 0x2000).to_le_bytes());
+    packet.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    packet.extend_from_slice(payload);
+    Some(packet)
+}
+
+/// USB Bluetooth transport uses control endpoint for HCI commands, interrupt
+/// IN for events, bulk IN/OUT for ACL, and optional isochronous for SCO/ISO.
+pub trait UsbTransport {
+    fn control_command(&mut self, command: &[u8]) -> Result<(), Error>;
+    fn bulk_acl_out(&mut self, packet: &[u8]) -> Result<(), Error>;
+    fn read_interrupt_event(&mut self, out: &mut [u8]) -> Result<usize, Error>;
+    fn read_bulk_acl(&mut self, out: &mut [u8]) -> Result<usize, Error>;
+    /// Temporarily claim the HCI event endpoint for a synchronous command
+    /// transaction. Drivers with a persistent asynchronous event read must
+    /// quiesce that request here and restore it in `end_command_transaction`.
+    fn begin_command_transaction(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn end_command_transaction(&mut self) {}
+    /// Nonblocking, multiplexed receive of HCI events and ACL packets. The
+    /// transport may retain endpoint requests between calls.
+    fn read_packet(
+        &mut self,
+        _out: &mut [u8],
+        _nonblocking: bool,
+    ) -> Result<Option<(PacketType, usize)>, Error> {
+        Ok(None)
+    }
+    fn stop(&mut self);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Channel {
+    Raw,
+    User,
+    Monitor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceInfo {
+    pub id: u16,
+    pub address: [u8; 6],
+    pub flags: u32,
+    pub name: [u8; 8],
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Statistics {
+    pub err_rx: u32,
+    pub err_tx: u32,
+    pub cmd_tx: u32,
+    pub evt_rx: u32,
+    pub acl_tx: u32,
+    pub acl_rx: u32,
+    pub sco_tx: u32,
+    pub sco_rx: u32,
+    pub byte_rx: u32,
+    pub byte_tx: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HciCapabilities {
+    pub address: [u8; 6],
+    pub features: [u8; 8],
+    pub hci_version: u8,
+    pub hci_revision: u16,
+    pub manufacturer: u16,
+    pub acl_mtu: u16,
+    pub acl_packets: u16,
+    pub le_acl_mtu: u16,
+    pub le_acl_packets: u16,
+    pub sco_mtu: u16,
+    pub sco_packets: u16,
+}
+
+/// Small HCI device/channel owner independent of AF_BLUETOOTH socket plumbing.
+pub struct Adapter<T> {
+    transport: T,
+    index: u16,
+    up: bool,
+    user_owner: bool,
+    raw_users: u16,
+    monitor_users: u16,
+    monitor: VecDeque<Vec<u8>>,
+    incoming: VecDeque<IncomingPacket>,
+    observed_events: VecDeque<Vec<u8>>,
+    observed_acls: VecDeque<Vec<u8>>,
+    stats: Statistics,
+    acl_mtu: usize,
+    acl_packet_limit: usize,
+    acl_in_flight: usize,
+    pending_acl_out: VecDeque<Vec<u8>>,
+}
+
+struct IncomingPacket {
+    kind: PacketType,
+    bytes: Vec<u8>,
+    timestamp_nanos: u64,
+}
+
+impl<T: UsbTransport> Adapter<T> {
+    pub fn new(transport: T, index: u16) -> Self {
+        Self {
+            transport,
+            index,
+            up: false,
+            user_owner: false,
+            raw_users: 0,
+            monitor_users: 0,
+            monitor: VecDeque::new(),
+            incoming: VecDeque::new(),
+            observed_events: VecDeque::new(),
+            observed_acls: VecDeque::new(),
+            stats: Statistics::default(),
+            acl_mtu: 1024,
+            acl_packet_limit: 4,
+            acl_in_flight: 0,
+            pending_acl_out: VecDeque::new(),
+        }
+    }
+    pub fn index(&self) -> u16 {
+        self.index
+    }
+    pub fn is_up(&self) -> bool {
+        self.up
+    }
+    pub fn statistics(&self) -> Statistics {
+        self.stats
+    }
+    /// Configure packet size/credit limits from Read Buffer Size and
+    /// LE_Read_Buffer_Size. Credits are replenished by Number Of Completed
+    /// Packets; only the controller-facing writer consumes them.
+    pub fn configure_acl_flow_control(&mut self, mtu: u16, packets: u16) {
+        self.acl_mtu = usize::from(mtu.max(1));
+        self.acl_packet_limit = usize::from(packets.max(1));
+        self.acl_in_flight = self.acl_in_flight.min(self.acl_packet_limit);
+    }
+    pub fn pending_acl_packets(&self) -> usize {
+        self.pending_acl_out.len()
+    }
+    /// Query the standard controller address, feature bitmap and ACL/SCO
+    /// buffer limits for HCIGETDEVINFO. Values are device replies, not guesses.
+    pub fn read_capabilities(&mut self) -> Result<HciCapabilities, Error> {
+        let mut capabilities = HciCapabilities::default();
+        let mut event = [0u8; 32];
+        let length = self.command_complete(&[0x09, 0x10, 0], &mut event)?;
+        if length < 12 || event[0] != 0x0e || event[5] != 0 {
+            return Err(Error::InvalidLength);
+        }
+        capabilities.address.copy_from_slice(&event[6..12]);
+
+        let length = self.command_complete(&[0x03, 0x10, 0], &mut event)?;
+        if length < 14 || event[0] != 0x0e || event[5] != 0 {
+            return Err(Error::InvalidLength);
+        }
+        capabilities.features.copy_from_slice(&event[6..14]);
+
+        let length = self.command_complete(&[0x01, 0x10, 0], &mut event)?;
+        if length < 14 || event[0] != 0x0e || event[5] != 0 {
+            return Err(Error::InvalidLength);
+        }
+        capabilities.hci_version = event[6];
+        capabilities.hci_revision = u16::from_le_bytes([event[7], event[8]]);
+        capabilities.manufacturer = u16::from_le_bytes([event[10], event[11]]);
+
+        let length = self.command_complete(&[0x05, 0x10, 0], &mut event)?;
+        if length < 13 || event[0] != 0x0e || event[5] != 0 {
+            return Err(Error::InvalidLength);
+        }
+        capabilities.acl_mtu = u16::from_le_bytes([event[6], event[7]]);
+        capabilities.sco_mtu = u16::from(event[8]);
+        capabilities.acl_packets = u16::from_le_bytes([event[9], event[10]]);
+        capabilities.sco_packets = u16::from_le_bytes([event[11], event[12]]);
+        if let Ok(length) = self.command_complete(&[0x02, 0x20, 0], &mut event)
+            && length >= 10
+            && event[0] == 0x0e
+            && event[5] == 0
+        {
+            capabilities.le_acl_mtu = u16::from_le_bytes([event[6], event[7]]);
+            capabilities.le_acl_packets = u16::from_le_bytes([event[8], event[9]]);
+        }
+        Ok(capabilities)
+    }
+    pub fn open(&mut self, channel: Channel) -> Result<(), Error> {
+        match channel {
+            Channel::Raw => {
+                if self.user_owner {
+                    return Err(Error::Busy);
+                }
+                self.raw_users = self.raw_users.saturating_add(1);
+            }
+            Channel::Monitor => self.monitor_users = self.monitor_users.saturating_add(1),
+            Channel::User => {
+                if self.user_owner || self.raw_users != 0 {
+                    return Err(Error::Busy);
+                }
+                self.user_owner = true;
+            }
+        }
+        Ok(())
+    }
+    pub fn close(&mut self, channel: Channel) {
+        match channel {
+            Channel::Raw => self.raw_users = self.raw_users.saturating_sub(1),
+            Channel::Monitor => self.monitor_users = self.monitor_users.saturating_sub(1),
+            Channel::User => self.user_owner = false,
+        }
+    }
+    pub fn set_up(&mut self, up: bool) -> Result<(), Error> {
+        if up == self.up {
+            return Ok(());
+        }
+        if !up {
+            self.transport.stop();
+        }
+        self.up = up;
+        Ok(())
+    }
+    pub fn submit(
+        &mut self,
+        channel: Channel,
+        kind: PacketType,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        if channel == Channel::Monitor {
+            return Err(Error::Unsupported);
+        }
+        if channel == Channel::User && !self.user_owner {
+            return Err(Error::Busy);
+        }
+        if !self.up {
+            return Err(Error::NotUp);
+        }
+        if let Err(error) = Packet::parse(kind, bytes) {
+            self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+            return Err(error);
+        }
+        match kind {
+            PacketType::Command => {
+                if let Err(error) = self.transport.control_command(bytes) {
+                    self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+                    return Err(error);
+                }
+                self.queue_monitor(5, bytes);
+                self.stats.cmd_tx = self.stats.cmd_tx.saturating_add(1);
+                self.stats.byte_tx = self.stats.byte_tx.saturating_add(bytes.len() as u32);
+                Ok(())
+            }
+            PacketType::Acl => {
+                let fragments = fragment_acl_packet(bytes, self.acl_mtu)?;
+                if self.pending_acl_out.len().saturating_add(fragments.len()) > 256 {
+                    return Err(Error::Busy);
+                }
+                self.pending_acl_out.extend(fragments);
+                self.flush_acl_out()
+            }
+            _ => Err(Error::Unsupported),
+        }
+    }
+    /// HCI event capture is copied to monitor observers with a leading packet
+    /// type byte. This bounded queue drops the oldest packet on overflow.
+    pub fn receive_event(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if let Err(error) = Packet::parse(PacketType::Event, bytes) {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+            return Err(error);
+        }
+        self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
+        self.stats.byte_rx = self.stats.byte_rx.saturating_add(bytes.len() as u32);
+        if self.monitor_users != 0 {
+            self.queue_monitor(3, bytes);
+        }
+        Ok(())
+    }
+    pub fn receive_acl(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if let Err(error) = Packet::parse(PacketType::Acl, bytes) {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+            return Err(error);
+        }
+        self.stats.acl_rx = self.stats.acl_rx.saturating_add(1);
+        self.stats.byte_rx = self.stats.byte_rx.saturating_add(bytes.len() as u32);
+        if self.monitor_users != 0 {
+            self.queue_monitor(5, bytes);
+        }
+        Ok(())
+    }
+    fn queue_monitor(&mut self, opcode: u16, bytes: &[u8]) {
+        if self.monitor_users == 0 {
+            return;
+        }
+        let length = bytes.len().min(1028);
+        let mut frame = Vec::new();
+        if frame.try_reserve_exact(6 + length).is_err() {
+            return;
+        }
+        frame.resize(6 + length, 0);
+        frame[..2].copy_from_slice(&opcode.to_le_bytes());
+        frame[2..4].copy_from_slice(&self.index.to_le_bytes());
+        frame[4..6].copy_from_slice(&(length as u16).to_le_bytes());
+        frame[6..6 + length].copy_from_slice(&bytes[..length]);
+        if self.monitor.len() == 64 {
+            self.monitor.pop_front();
+        }
+        self.monitor.push_back(frame);
+    }
+    pub fn pop_monitor(&mut self) -> Option<Vec<u8>> {
+        self.monitor.pop_front()
+    }
+    pub fn monitor_ready(&self) -> bool {
+        !self.monitor.is_empty()
+    }
+    pub fn receive_ready(&self) -> bool {
+        !self.incoming.is_empty()
+    }
+    pub fn read_event(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        match self.transport.read_interrupt_event(out) {
+            Ok(length) => Ok(length),
+            Err(error) => {
+                self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                Err(error)
+            }
+        }
+    }
+    pub fn read_acl(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        match self.transport.read_bulk_acl(out) {
+            Ok(length) => Ok(length),
+            Err(error) => {
+                self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                Err(error)
+            }
+        }
+    }
+    /// Receive a single event or ACL packet with Linux HCI packet type
+    /// framing left to the socket adapter. Monitor capture is updated here.
+    pub fn receive_packet(
+        &mut self,
+        out: &mut [u8],
+        nonblocking: bool,
+    ) -> Result<(PacketType, usize), Error> {
+        self.receive_packet_at(out, nonblocking, 0)
+            .map(|(kind, length, _)| (kind, length))
+    }
+    pub fn receive_packet_at(
+        &mut self,
+        out: &mut [u8],
+        nonblocking: bool,
+        timestamp_nanos: u64,
+    ) -> Result<(PacketType, usize, u64), Error> {
+        if let Some(packet) = self.incoming.pop_front() {
+            if packet.bytes.len() > out.len() {
+                self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                return Err(Error::InvalidLength);
+            }
+            out[..packet.bytes.len()].copy_from_slice(&packet.bytes);
+            return Ok((packet.kind, packet.bytes.len(), packet.timestamp_nanos));
+        }
+        let Some((kind, length)) = self.transport.read_packet(out, nonblocking)? else {
+            return Err(Error::Again);
+        };
+        if length > out.len() {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+            return Err(Error::InvalidLength);
+        }
+        let bytes = &out[..length];
+        let parsed = Packet::parse(kind, bytes);
+        if let Err(error) = parsed {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+            return Err(error);
+        }
+        match kind {
+            PacketType::Event => {
+                self.observe_acl_completions(&bytes[..length]);
+                self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
+                self.queue_monitor(3, bytes);
+            }
+            PacketType::Acl => {
+                self.stats.acl_rx = self.stats.acl_rx.saturating_add(1);
+                self.queue_monitor(5, bytes);
+            }
+            _ => return Err(Error::Unsupported),
+        }
+        self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
+        Ok((kind, length, timestamp_nanos))
+    }
+
+    /// Pump one already-submitted USB receive completion into the shared
+    /// adapter queue. The host task may call this independently of socket
+    /// reads, making event/ACL readiness observable to poll and epoll.
+    pub fn pump_receive(&mut self) -> Result<bool, Error> {
+        self.pump_receive_at(0)
+    }
+    pub fn pump_receive_at(&mut self, timestamp_nanos: u64) -> Result<bool, Error> {
+        if !self.up {
+            return Ok(false);
+        }
+        let mut bytes = [0u8; 1028];
+        let Some((kind, length)) = self.transport.read_packet(&mut bytes, true)? else {
+            return Ok(false);
+        };
+        if length > bytes.len() || Packet::parse(kind, &bytes[..length]).is_err() {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+            return Err(Error::InvalidLength);
+        }
+        match kind {
+            PacketType::Event => {
+                self.observe_acl_completions(&bytes[..length]);
+                self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
+                self.queue_monitor(3, &bytes[..length]);
+                if self.observed_events.len() == 64 {
+                    self.observed_events.pop_front();
+                }
+                self.observed_events.push_back(Vec::from(&bytes[..length]));
+            }
+            PacketType::Acl => {
+                self.stats.acl_rx = self.stats.acl_rx.saturating_add(1);
+                self.queue_monitor(5, &bytes[..length]);
+                if self.observed_acls.len() == 64 {
+                    self.observed_acls.pop_front();
+                }
+                self.observed_acls.push_back(Vec::from(&bytes[..length]));
+            }
+            _ => return Err(Error::Unsupported),
+        }
+        self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
+        if self.incoming.len() >= 64 {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+            return Ok(false);
+        }
+        self.incoming.push_back(IncomingPacket {
+            kind,
+            bytes: Vec::from(&bytes[..length]),
+            timestamp_nanos,
+        });
+        Ok(true)
+    }
+    /// Pop a raw HCI event observed by the asynchronous receiver. Upper
+    /// protocols use this tap for management notifications without consuming
+    /// the event from raw/user HCI sockets.
+    pub fn pop_observed_event(&mut self) -> Option<Vec<u8>> {
+        self.observed_events.pop_front()
+    }
+    /// Pop an ACL packet observed by the asynchronous receive pump. The packet
+    /// remains queued independently for the bound raw/user socket consumer.
+    pub fn pop_observed_acl(&mut self) -> Option<Vec<u8>> {
+        self.observed_acls.pop_front()
+    }
+    // upstream: iwmbt_hw.c iwmbt_hci_command()
+    /// Send an HCI command and read its matching Command Complete event. This
+    /// is used by the Intel boot-time firmware query sequence.
+    pub fn command_complete(&mut self, command: &[u8], event: &mut [u8]) -> Result<usize, Error> {
+        let parsed = match Packet::parse(PacketType::Command, command) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+                return Err(error);
+            }
+        };
+        if !self.up {
+            return Err(Error::NotUp);
+        }
+        let opcode = u16::from_le_bytes([parsed.payload[0], parsed.payload[1]]);
+        self.transport.begin_command_transaction()?;
+        let result = self.command_complete_transaction(command, opcode, event);
+        self.transport.end_command_transaction();
+        result
+    }
+    /// Send an HCI command that completes asynchronously with Command Status
+    /// (for example Inquiry) and preserve all unrelated events for sockets.
+    pub fn command_status(&mut self, command: &[u8], event: &mut [u8]) -> Result<usize, Error> {
+        let parsed = Packet::parse(PacketType::Command, command)?;
+        if !self.up {
+            return Err(Error::NotUp);
+        }
+        let opcode = u16::from_le_bytes([parsed.payload[0], parsed.payload[1]]);
+        self.transport.begin_command_transaction()?;
+        let result = self.command_status_transaction(command, opcode, event);
+        self.transport.end_command_transaction();
+        result
+    }
+    fn command_status_transaction(
+        &mut self,
+        command: &[u8],
+        opcode: u16,
+        event: &mut [u8],
+    ) -> Result<usize, Error> {
+        if let Err(error) = self.transport.control_command(command) {
+            self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+            return Err(error);
+        }
+        self.stats.cmd_tx = self.stats.cmd_tx.saturating_add(1);
+        self.stats.byte_tx = self.stats.byte_tx.saturating_add(command.len() as u32);
+        self.queue_monitor(2, command);
+        for _ in 0..64 {
+            let length = match self.transport.read_interrupt_event(event) {
+                Ok(length) => length,
+                Err(error) => {
+                    self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                    return Err(error);
+                }
+            };
+            if length > event.len() {
+                return Err(Error::InvalidLength);
+            }
+            let parsed = Packet::parse(PacketType::Event, &event[..length])?;
+            self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
+            self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
+            self.queue_monitor(3, &event[..length]);
+            if parsed.payload[0] == 0x0f && length >= 6 {
+                let completed = u16::from_le_bytes([event[4], event[5]]);
+                if completed == opcode {
+                    return if event[2] == 0 {
+                        Ok(length)
+                    } else {
+                        Err(Error::Unsupported)
+                    };
+                }
+            }
+            self.queue_incoming_event(&event[..length])?;
+        }
+        Err(Error::Again)
+    }
+    fn command_complete_transaction(
+        &mut self,
+        command: &[u8],
+        opcode: u16,
+        event: &mut [u8],
+    ) -> Result<usize, Error> {
+        if let Err(error) = self.transport.control_command(command) {
+            self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+            return Err(error);
+        }
+        self.stats.cmd_tx = self.stats.cmd_tx.saturating_add(1);
+        self.stats.byte_tx = self.stats.byte_tx.saturating_add(command.len() as u32);
+        self.queue_monitor(2, command);
+        for _ in 0..64 {
+            let length = match self.transport.read_interrupt_event(event) {
+                Ok(length) => length,
+                Err(error) => {
+                    self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                    return Err(error);
+                }
+            };
+            if length > event.len() {
+                self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                return Err(Error::InvalidLength);
+            }
+            let received = match Packet::parse(PacketType::Event, &event[..length]) {
+                Ok(received) => received,
+                Err(error) => {
+                    self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                    return Err(error);
+                }
+            };
+            self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
+            self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
+            self.queue_monitor(3, &event[..length]);
+            if received.payload[0] == 0xff {
+                if opcode >= 0xfc00 {
+                    return Ok(length);
+                }
+                self.queue_incoming_event(&event[..length])?;
+                continue;
+            }
+            if received.payload[0] != 0x0e || length < 5 {
+                self.queue_incoming_event(&event[..length])?;
+                continue;
+            }
+            let completed = u16::from_le_bytes([received.payload[3], received.payload[4]]);
+            if completed != opcode {
+                self.queue_incoming_event(&event[..length])?;
+                continue;
+            }
+            return Ok(length);
+        }
+        Err(Error::Again)
+    }
+    fn queue_incoming_event(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.observe_acl_completions(bytes);
+        if self.incoming.len() >= 64 {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+            return Err(Error::Busy);
+        }
+        self.incoming.push_back(IncomingPacket {
+            kind: PacketType::Event,
+            bytes: Vec::from(bytes),
+            timestamp_nanos: 0,
+        });
+        if self.observed_events.len() == 64 {
+            self.observed_events.pop_front();
+        }
+        self.observed_events.push_back(Vec::from(bytes));
+        Ok(())
+    }
+    fn observe_acl_completions(&mut self, event: &[u8]) {
+        if event.len() < 3 || event[0] != 0x13 || event.len() != usize::from(event[1]) + 2 {
+            return;
+        }
+        let handles = usize::from(event[2]);
+        if event.len() != 3 + handles * 4 {
+            return;
+        }
+        let completed: usize = event[3..]
+            .chunks_exact(4)
+            .map(|record| usize::from(u16::from_le_bytes([record[2], record[3]])))
+            .sum();
+        self.acl_in_flight = self.acl_in_flight.saturating_sub(completed);
+        let _ = self.flush_acl_out();
+    }
+    fn flush_acl_out(&mut self) -> Result<(), Error> {
+        while self.acl_in_flight < self.acl_packet_limit {
+            let Some(packet) = self.pending_acl_out.pop_front() else {
+                break;
+            };
+            if let Err(error) = self.transport.bulk_acl_out(&packet) {
+                self.pending_acl_out.push_front(packet);
+                self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+                return Err(error);
+            }
+            self.queue_monitor(4, &packet);
+            self.stats.acl_tx = self.stats.acl_tx.saturating_add(1);
+            self.stats.byte_tx = self.stats.byte_tx.saturating_add(packet.len() as u32);
+            self.acl_in_flight += 1;
+        }
+        Ok(())
+    }
+    /// Query the Intel firmware version using vendor command 0xfc05.
+    // upstream: iwmbt_hw.c iwmbt_get_version()
+    pub fn intel_get_version(&mut self) -> Result<Version, Error> {
+        let mut event = [0u8; 32];
+        let length = self.command_complete(&[0x05, 0xfc, 0], &mut event)?;
+        iwmbt_fw::parse_version_event(&event[..length]).map_err(|_| Error::InvalidLength)
+    }
+    /// Query the extended Intel TLV firmware-version record (vendor command
+    /// 0xfc05 with the 0xff selector).
+    // upstream: iwmbt_hw.c iwmbt_read_version_tlv()
+    pub fn intel_get_version_tlv(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        let mut event = [0u8; 260];
+        let length = self.command_complete(&[0x05, 0xfc, 1, 0xff], &mut event)?;
+        if length < 6 || event[5] != 0 {
+            return Err(Error::InvalidLength);
+        }
+        let payload = &event[5..length];
+        if payload.len() > out.len() {
+            return Err(Error::InvalidLength);
+        }
+        out[..payload.len()].copy_from_slice(payload);
+        Ok(payload.len())
+    }
+    /// Read Intel bootloader secure-boot parameters with opcode 0xfc0d.
+    // upstream: iwmbt_hw.c iwmbt_get_boot_params()
+    pub fn intel_get_boot_params(&mut self) -> Result<BootParams, Error> {
+        let mut event = [0u8; 32];
+        let length = self.command_complete(&[0x0d, 0xfc, 0], &mut event)?;
+        if length < 28 || event[5] != 0 {
+            return Err(Error::InvalidLength);
+        }
+        BootParams::parse(&event[5..28]).map_err(|_| Error::InvalidLength)
+    }
+    /// Determine the Intel firmware generation from its fixed or TLV version
+    /// record, retaining the USB VID/PID family as the initial device class.
+    // upstream: main.c iwmbt_identify()
+    pub fn intel_identify(&mut self, usb_family: DeviceFamily) -> Result<DeviceFamily, Error> {
+        if usb_family == DeviceFamily::Unknown {
+            return Err(Error::Unsupported);
+        }
+        if usb_family == DeviceFamily::I7260 {
+            self.intel_bt_reset()?;
+        }
+        let mut data = [0u8; 255];
+        let length = self.intel_get_version_tlv(&mut data)?;
+        if length == 10 && data[1] == 0x37 {
+            return match data[2] {
+                0x07 | 0x08 => Ok(DeviceFamily::I7260),
+                0x0b | 0x0c | 0x11..=0x14 => Ok(DeviceFamily::I8260),
+                _ => Err(Error::Unsupported),
+            };
+        }
+        let mut version = VersionTlv::default();
+        iwmbt_fw::parse_tlv(&data[..length], &mut version).map_err(|_| Error::InvalidLength)?;
+        let hw_platform = ((version.cnvi_bt >> 8) & 0xff) as u8;
+        let hw_variant = ((version.cnvi_bt >> 16) & 0x3f) as u8;
+        if hw_platform != 0x37 {
+            return Err(Error::Unsupported);
+        }
+        Ok(if hw_variant < 0x17 {
+            DeviceFamily::I8260
+        } else {
+            DeviceFamily::I9260
+        })
+    }
+    /// Execute an Intel firmware HCI command/event stream and compare each
+    /// returned event payload with the image's expected bytes.
+    // upstream: iwmbt_hw.c iwmbt_patch_fwfile()
+    pub fn run_intel_patch(&mut self, image: &[u8]) -> Result<bool, Error> {
+        if !self.up {
+            return Err(Error::NotUp);
+        }
+        let (commands, activate) =
+            iwmbt_fw::parse_patch(image).map_err(|_| Error::InvalidLength)?;
+        let mut command = [0u8; 258];
+        let mut event = [0u8; 260];
+        for record in commands {
+            command[0..2].copy_from_slice(&record.opcode.to_le_bytes());
+            command[2] = record.parameters.len() as u8;
+            command[3..3 + record.parameters.len()].copy_from_slice(record.parameters);
+            let command_length = 3 + record.parameters.len();
+            if let Err(error) = self.transport.control_command(&command[..command_length]) {
+                self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+                return Err(error);
+            }
+            self.stats.cmd_tx = self.stats.cmd_tx.saturating_add(1);
+            self.stats.byte_tx = self.stats.byte_tx.saturating_add(command_length as u32);
+            self.queue_monitor(2, &command[..command_length]);
+            for (expected_code, expected) in record.expected_events {
+                let length = match self.transport.read_interrupt_event(&mut event) {
+                    Ok(length) => length,
+                    Err(error) => {
+                        self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                        return Err(error);
+                    }
+                };
+                if length > event.len() {
+                    self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                    return Err(Error::InvalidLength);
+                }
+                let received = match Packet::parse(PacketType::Event, &event[..length]) {
+                    Ok(received) => received,
+                    Err(error) => {
+                        self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                        return Err(error);
+                    }
+                };
+                self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
+                self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
+                self.queue_monitor(3, &event[..length]);
+                self.observe_acl_completions(&event[..length]);
+                if received.payload[0] != expected_code || received.payload[2..] != *expected {
+                    return Err(Error::InvalidLength);
+                }
+            }
+        }
+        Ok(activate)
+    }
+    /// Send one proprietary Intel bulk firmware fragment and drain its bulk
+    /// response, preserving the upstream 0xfc09 command format.
+    // upstream: iwmbt_hw.c iwmbt_send_fragment()
+    fn send_intel_fragment(&mut self, fragment_type: u8, data: &[u8]) -> Result<(), Error> {
+        if data.len() > 0xfc {
+            return Err(Error::InvalidLength);
+        }
+        let mut command = [0u8; 256];
+        command[0..2].copy_from_slice(&0xfc09u16.to_le_bytes());
+        command[2] = (data.len() + 1) as u8;
+        command[3] = fragment_type;
+        command[4..4 + data.len()].copy_from_slice(data);
+        self.transport.bulk_acl_out(&command[..4 + data.len()])?;
+        let mut response = [0u8; 256];
+        self.transport.read_bulk_acl(&mut response)?;
+        Ok(())
+    }
+    /// Transfer the RSA secure-boot header segments.
+    // upstream: iwmbt_hw.c iwmbt_load_rsa_header()
+    pub fn intel_load_rsa_header(&mut self, firmware: &[u8]) -> Result<(), Error> {
+        if firmware.len() < 644 {
+            return Err(Error::InvalidLength);
+        }
+        self.send_intel_fragment(0x00, &firmware[0..0x80])?;
+        self.send_intel_fragment(0x03, &firmware[0x80..0x100])?;
+        self.send_intel_fragment(0x03, &firmware[0x100..0x180])?;
+        self.send_intel_fragment(0x02, &firmware[0x184..0x204])?;
+        self.send_intel_fragment(0x02, &firmware[0x204..0x284])?;
+        Ok(())
+    }
+    /// Transfer the ECDSA secure-boot header segments at the upstream RSA
+    /// header offset.
+    // upstream: iwmbt_hw.c iwmbt_load_ecdsa_header()
+    pub fn intel_load_ecdsa_header(&mut self, firmware: &[u8]) -> Result<(), Error> {
+        const OFFSET: usize = 644;
+        if firmware.len() < OFFSET + 0x140 {
+            return Err(Error::InvalidLength);
+        }
+        self.send_intel_fragment(0x00, &firmware[OFFSET..OFFSET + 0x80])?;
+        self.send_intel_fragment(0x03, &firmware[OFFSET + 0x80..OFFSET + 0xe0])?;
+        self.send_intel_fragment(0x02, &firmware[OFFSET + 0xe0..OFFSET + 0x140])?;
+        Ok(())
+    }
+    /// Transfer firmware HCI commands in 0xfc-byte/4-byte-aligned chunks and
+    /// wait for the Intel vendor download-complete event.
+    // upstream: iwmbt_hw.c iwmbt_load_fwfile()
+    pub fn intel_load_firmware(&mut self, firmware: &[u8], offset: usize) -> Result<u32, Error> {
+        if offset > firmware.len() {
+            return Err(Error::InvalidLength);
+        }
+        let mut sent = offset;
+        let mut ready = 0usize;
+        let mut boot_param = 0u32;
+        while firmware.len().saturating_sub(sent + ready) >= 3 {
+            let command = &firmware[sent + ready..];
+            let opcode = u16::from_le_bytes([command[0], command[1]]);
+            let length = usize::from(command[2]);
+            if command.len() < 3 + length {
+                return Err(Error::InvalidLength);
+            }
+            if opcode == 0xfc0e {
+                if length < 4 {
+                    return Err(Error::InvalidLength);
+                }
+                boot_param =
+                    u32::from_le_bytes(command[3..7].try_into().map_err(|_| Error::InvalidLength)?);
+            }
+            ready += 3 + length;
+            while ready >= 0xfc {
+                self.send_intel_fragment(0x01, &firmware[sent..sent + 0xfc])?;
+                sent += 0xfc;
+                ready -= 0xfc;
+            }
+            if ready > 0 && ready.is_multiple_of(4) {
+                self.send_intel_fragment(0x01, &firmware[sent..sent + ready])?;
+                sent += ready;
+                ready = 0;
+            }
+        }
+        let mut event = [0u8; 16];
+        let length = self.transport.read_interrupt_event(&mut event)?;
+        if length < 3 || event[0] != 0xff || event[2] != 0x06 {
+            return Err(Error::Unsupported);
+        }
+        Ok(boot_param)
+    }
+    /// Validate the Intel CSS headers, stream RSA/ECDSA segments, then upload
+    /// the remaining command buffer. Returns the Intel reset boot parameter.
+    // upstream: main.c iwmbt_init_firmware()
+    pub fn intel_init_firmware(
+        &mut self,
+        firmware: &[u8],
+        hw_variant: u8,
+        sbe_type: u8,
+    ) -> Result<u32, Error> {
+        let header_len = if hw_variant <= 0x14 {
+            if firmware.len() < 644 || read_le32(firmware, 8)? != 0x0001_0000 || sbe_type != 0 {
+                return Err(Error::InvalidLength);
+            }
+            644
+        } else if hw_variant >= 0x17 {
+            if firmware.len() < 964
+                || firmware[644] != 0x06
+                || read_le32(firmware, 652)? != 0x0002_0000
+            {
+                return Err(Error::InvalidLength);
+            }
+            964
+        } else {
+            return Err(Error::Unsupported);
+        };
+        match sbe_type {
+            0 => self.intel_load_rsa_header(firmware)?,
+            1 => self.intel_load_ecdsa_header(firmware)?,
+            _ => return Err(Error::Unsupported),
+        }
+        self.intel_load_firmware(firmware, header_len)
+    }
+    /// Standard HCI Reset command.
+    // upstream: iwmbt_hw.c iwmbt_bt_reset()
+    pub fn intel_bt_reset(&mut self) -> Result<(), Error> {
+        self.command_complete(&[0x03, 0x0c, 0], &mut [0u8; 16])?;
+        Ok(())
+    }
+    /// Enter Intel manufacturer mode.
+    // upstream: iwmbt_hw.c iwmbt_enter_manufacturer()
+    pub fn intel_enter_manufacturer(&mut self) -> Result<(), Error> {
+        self.command_complete(&[0x11, 0xfc, 2, 1, 0], &mut [0u8; 16])?;
+        Ok(())
+    }
+    /// Exit Intel manufacturer mode with the selected reset/patch policy.
+    // upstream: iwmbt_hw.c iwmbt_exit_manufacturer()
+    pub fn intel_exit_manufacturer(&mut self, mode: u8) -> Result<(), Error> {
+        if mode > 2 {
+            return Err(Error::InvalidLength);
+        }
+        self.command_complete(&[0x11, 0xfc, 2, 0, mode], &mut [0u8; 16])?;
+        Ok(())
+    }
+    /// Intel vendor reset followed by the vendor-specific completion event.
+    // upstream: iwmbt_hw.c iwmbt_intel_reset()
+    pub fn intel_reset(&mut self, boot_param: u32) -> Result<(), Error> {
+        let mut command = [0x01, 0xfc, 8, 0, 0, 0, 1, 0, 0, 0, 0];
+        command[7..11].copy_from_slice(&boot_param.to_le_bytes());
+        let mut event = [0u8; 16];
+        let length = self.command_complete(&command, &mut event)?;
+        if length < 3 || event[0] != 0xff || event[2] != 0x02 {
+            return Err(Error::Unsupported);
+        }
+        Ok(())
+    }
+    /// Send Intel Write DDC commands, each prefixed by its one-byte length.
+    // upstream: iwmbt_hw.c iwmbt_load_ddc()
+    pub fn intel_load_ddc(&mut self, data: &[u8]) -> Result<(), Error> {
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let chunk = usize::from(data[offset]);
+            if chunk == 0
+                || offset
+                    .checked_add(chunk + 1)
+                    .is_none_or(|end| end > data.len())
+                || chunk > 254
+            {
+                return Err(Error::InvalidLength);
+            }
+            let mut command = [0u8; 258];
+            command[0..2].copy_from_slice(&0xfc8bu16.to_le_bytes());
+            command[2] = (chunk + 1) as u8;
+            command[3..4 + chunk].copy_from_slice(&data[offset..offset + chunk + 1]);
+            self.command_complete(&command[..4 + chunk], &mut [0u8; 16])?;
+            offset += chunk + 1;
+        }
+        Ok(())
+    }
+    /// Program the Intel HCI event mask.
+    // upstream: iwmbt_hw.c iwmbt_set_event_mask()
+    pub fn intel_set_event_mask(&mut self) -> Result<(), Error> {
+        self.command_complete(
+            &[0x52, 0xfc, 8, 0x87, 0x0c, 0, 0, 0, 0, 0, 0],
+            &mut [0u8; 16],
+        )?;
+        Ok(())
+    }
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+}
+
+/// Device operations against an absent controller use ENODEV semantics.
+pub fn absent_device_ioctl(_command: u32) -> Result<(), Error> {
+    Err(Error::NoDevice)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IoctlOutcome {
+    EmptyDeviceList,
+}
+
+/// Linux HCI_GETDEVLIST succeeds with zero entries on a machine with no HCI
+/// controller; ioctls that name an individual device return ENODEV.
+pub fn no_device_ioctl(command: u32) -> Result<IoctlOutcome, Error> {
+    if command == HCIGETDEVLIST {
+        Ok(IoctlOutcome::EmptyDeviceList)
+    } else {
+        Err(Error::NoDevice)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, vec, vec::Vec};
+
+    use super::*;
+    struct Fake {
+        stopped: bool,
+        commands: usize,
+        acl: usize,
+    }
+
+    struct FirmwareFake {
+        events: VecDeque<Vec<u8>>,
+        bulk: Vec<Vec<u8>>,
+    }
+    struct RxFake {
+        packet: Option<(PacketType, Vec<u8>)>,
+    }
+    struct CommandFake {
+        events: VecDeque<Vec<u8>>,
+        begun: usize,
+        ended: usize,
+    }
+    impl UsbTransport for RxFake {
+        fn control_command(&mut self, _: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+        fn bulk_acl_out(&mut self, _: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+        fn read_interrupt_event(&mut self, _: &mut [u8]) -> Result<usize, Error> {
+            Err(Error::Unsupported)
+        }
+        fn read_bulk_acl(&mut self, _: &mut [u8]) -> Result<usize, Error> {
+            Err(Error::Unsupported)
+        }
+        fn read_packet(
+            &mut self,
+            out: &mut [u8],
+            _: bool,
+        ) -> Result<Option<(PacketType, usize)>, Error> {
+            let Some((kind, packet)) = self.packet.take() else {
+                return Ok(None);
+            };
+            if packet.len() > out.len() {
+                return Err(Error::InvalidLength);
+            }
+            out[..packet.len()].copy_from_slice(&packet);
+            Ok(Some((kind, packet.len())))
+        }
+        fn stop(&mut self) {}
+    }
+    impl UsbTransport for CommandFake {
+        fn control_command(&mut self, _: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+        fn bulk_acl_out(&mut self, _: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+        fn read_interrupt_event(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+            let event = self.events.pop_front().ok_or(Error::NoDevice)?;
+            if event.len() > out.len() {
+                return Err(Error::InvalidLength);
+            }
+            out[..event.len()].copy_from_slice(&event);
+            Ok(event.len())
+        }
+        fn read_bulk_acl(&mut self, _: &mut [u8]) -> Result<usize, Error> {
+            Err(Error::Unsupported)
+        }
+        fn begin_command_transaction(&mut self) -> Result<(), Error> {
+            self.begun += 1;
+            Ok(())
+        }
+        fn end_command_transaction(&mut self) {
+            self.ended += 1;
+        }
+        fn stop(&mut self) {}
+    }
+    impl UsbTransport for FirmwareFake {
+        fn control_command(&mut self, _: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+        fn bulk_acl_out(&mut self, packet: &[u8]) -> Result<(), Error> {
+            self.bulk.push(packet.to_vec());
+            Ok(())
+        }
+        fn read_interrupt_event(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+            let event = self.events.pop_front().ok_or(Error::NoDevice)?;
+            if event.len() > out.len() {
+                return Err(Error::InvalidLength);
+            }
+            out[..event.len()].copy_from_slice(&event);
+            Ok(event.len())
+        }
+        fn read_bulk_acl(&mut self, _: &mut [u8]) -> Result<usize, Error> {
+            Ok(0)
+        }
+        fn stop(&mut self) {}
+    }
+    impl UsbTransport for Fake {
+        fn control_command(&mut self, _: &[u8]) -> Result<(), Error> {
+            self.commands += 1;
+            Ok(())
+        }
+        fn bulk_acl_out(&mut self, _: &[u8]) -> Result<(), Error> {
+            self.acl += 1;
+            Ok(())
+        }
+        fn read_interrupt_event(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+            let event = [0x0e, 4, 1, 1, 0x10, 0];
+            if out.len() < event.len() {
+                return Err(Error::InvalidLength);
+            }
+            out[..event.len()].copy_from_slice(&event);
+            Ok(event.len())
+        }
+        fn read_bulk_acl(&mut self, _: &mut [u8]) -> Result<usize, Error> {
+            Ok(0)
+        }
+        fn stop(&mut self) {
+            self.stopped = true
+        }
+    }
+    #[test]
+    fn validates_command_and_event_lengths() {
+        assert!(Packet::parse(PacketType::Command, &[1, 0, 1, 0xaa]).is_ok());
+        assert_eq!(
+            Packet::parse(PacketType::Command, &[1, 0, 2, 0xaa]),
+            Err(Error::InvalidLength)
+        );
+        assert!(Packet::parse(PacketType::Event, &[0x0e, 0]).is_ok());
+    }
+    #[test]
+    fn channels_and_usb_paths_are_owned() {
+        let mut a = Adapter::new(
+            Fake {
+                stopped: false,
+                commands: 0,
+                acl: 0,
+            },
+            0,
+        );
+        assert_eq!(a.open(Channel::User), Ok(()));
+        assert_eq!(a.open(Channel::User), Err(Error::Busy));
+        a.set_up(true).unwrap();
+        assert_eq!(
+            a.submit(Channel::User, PacketType::Command, &[1, 0, 2, 0xaa]),
+            Err(Error::InvalidLength)
+        );
+        assert_eq!(a.receive_event(&[0x0e, 1]), Err(Error::InvalidLength));
+        a.submit(Channel::User, PacketType::Command, &[1, 0, 1, 0xaa])
+            .unwrap();
+        a.receive_event(&[0x0e, 0]).unwrap();
+        assert!(a.pop_monitor().is_none());
+        a.open(Channel::Monitor).unwrap();
+        a.receive_event(&[0x0e, 0]).unwrap();
+        assert_eq!(&a.pop_monitor().unwrap()[..2], &3u16.to_le_bytes());
+        assert_eq!(
+            a.statistics(),
+            Statistics {
+                err_rx: 1,
+                err_tx: 1,
+                cmd_tx: 1,
+                evt_rx: 2,
+                byte_rx: 4,
+                byte_tx: 4,
+                ..Statistics::default()
+            }
+        );
+        a.set_up(false).unwrap();
+        assert!(a.transport.stopped);
+        assert_eq!(a.transport.commands, 1);
+    }
+    #[test]
+    fn user_channel_excludes_raw_sockets_but_allows_monitoring() {
+        let mut adapter = Adapter::new(
+            Fake {
+                stopped: false,
+                commands: 0,
+                acl: 0,
+            },
+            0,
+        );
+        adapter.open(Channel::Raw).unwrap();
+        assert_eq!(adapter.open(Channel::User), Err(Error::Busy));
+        adapter.close(Channel::Raw);
+        adapter.open(Channel::User).unwrap();
+        assert_eq!(adapter.open(Channel::Raw), Err(Error::Busy));
+        assert_eq!(adapter.open(Channel::Monitor), Ok(()));
+    }
+    #[test]
+    fn monitor_preserves_maximum_sized_acl_frames() {
+        let mut adapter = Adapter::new(
+            Fake {
+                stopped: false,
+                commands: 0,
+                acl: 0,
+            },
+            7,
+        );
+        adapter.open(Channel::User).unwrap();
+        adapter.open(Channel::Monitor).unwrap();
+        adapter.set_up(true).unwrap();
+        let mut acl = vec![0u8; 1028];
+        acl[0] = 1;
+        acl[2] = 0;
+        acl[3] = 4;
+        acl[1027] = 0xaa;
+        adapter
+            .submit(Channel::User, PacketType::Acl, &acl)
+            .unwrap();
+        let frame = adapter.pop_monitor().unwrap();
+        assert_eq!(u16::from_le_bytes([frame[0], frame[1]]), 4);
+        assert_eq!(u16::from_le_bytes([frame[2], frame[3]]), 7);
+        assert_eq!(u16::from_le_bytes([frame[4], frame[5]]), 1028);
+        assert_eq!(frame.len(), 1034);
+        assert_eq!(frame[1033], 0xaa);
+    }
+    #[test]
+    fn received_acl_is_counted_and_captured_for_monitors() {
+        let mut adapter = Adapter::new(
+            RxFake {
+                packet: Some((PacketType::Acl, vec![1, 0, 2, 0, 0xaa, 0xbb])),
+            },
+            3,
+        );
+        adapter.open(Channel::Monitor).unwrap();
+        adapter.set_up(true).unwrap();
+        let mut packet = [0u8; 16];
+        assert_eq!(
+            adapter.receive_packet(&mut packet, true),
+            Ok((PacketType::Acl, 6))
+        );
+        let monitor = adapter.pop_monitor().unwrap();
+        assert_eq!(u16::from_le_bytes([monitor[0], monitor[1]]), 5);
+        assert_eq!(u16::from_le_bytes([monitor[2], monitor[3]]), 3);
+        assert_eq!(&monitor[6..], &[1, 0, 2, 0, 0xaa, 0xbb]);
+        assert_eq!(adapter.statistics().acl_rx, 1);
+    }
+
+    #[test]
+    fn acl_packet_is_fragmented_at_mtu_and_reassembled_by_pb() {
+        let mut l2cap = vec![0u8; 30];
+        l2cap[..2].copy_from_slice(&26u16.to_le_bytes());
+        l2cap[2..4].copy_from_slice(&4u16.to_le_bytes());
+        for (i, byte) in l2cap[4..].iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        let mut packet = vec![0x01, 0x20];
+        packet.extend_from_slice(&(l2cap.len() as u16).to_le_bytes());
+        packet.extend_from_slice(&l2cap);
+        let fragments = fragment_acl_packet(&packet, 12).unwrap();
+        assert_eq!(fragments.len(), 3);
+        assert_eq!(
+            (u16::from_le_bytes([fragments[0][0], fragments[0][1]]) >> 12) & 3,
+            2
+        );
+        assert_eq!(
+            (u16::from_le_bytes([fragments[1][0], fragments[1][1]]) >> 12) & 3,
+            1
+        );
+        let mut reassembler = AclReassembler::default();
+        assert_eq!(reassembler.push(&fragments[0]), None);
+        assert_eq!(reassembler.push(&fragments[1]), None);
+        let rebuilt = reassembler.push(&fragments[2]).unwrap();
+        assert_eq!(
+            Packet::parse(PacketType::Acl, &rebuilt)
+                .unwrap()
+                .payload
+                .len(),
+            34
+        );
+        assert_eq!(&rebuilt[4..], &l2cap);
+    }
+
+    #[test]
+    fn acl_transmit_waits_for_controller_completed_packet_credits() {
+        let mut adapter = Adapter::new(
+            Fake {
+                stopped: false,
+                commands: 0,
+                acl: 0,
+            },
+            0,
+        );
+        adapter.set_up(true).unwrap();
+        adapter.configure_acl_flow_control(8, 1);
+        let mut l2cap = vec![0u8; 20];
+        l2cap[..2].copy_from_slice(&16u16.to_le_bytes());
+        l2cap[2..4].copy_from_slice(&4u16.to_le_bytes());
+        let mut packet = vec![0x01, 0x20];
+        packet.extend_from_slice(&(l2cap.len() as u16).to_le_bytes());
+        packet.extend_from_slice(&l2cap);
+        adapter
+            .submit(Channel::Raw, PacketType::Acl, &packet)
+            .unwrap();
+        assert_eq!(adapter.pending_acl_packets(), 2);
+        let completed = [0x13, 5, 1, 1, 0, 1, 0];
+        adapter.observe_acl_completions(&completed);
+        assert_eq!(adapter.pending_acl_packets(), 1);
+        let fake = adapter.into_transport();
+        assert_eq!(fake.acl, 2);
+    }
+
+    #[test]
+    fn loaded_ltk_is_framed_as_hci_le_start_encryption() {
+        let command =
+            le_start_encryption_command(0x0123, &[1, 2, 3, 4, 5, 6, 7, 8], 0x4567, &[9; 16])
+                .unwrap();
+        assert_eq!(&command[..5], &[0x19, 0x20, 28, 0x23, 0x01]);
+        assert_eq!(&command[5..13], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&command[13..15], &[0x67, 0x45]);
+        assert_eq!(&command[15..], &[9; 16]);
+        assert_eq!(
+            le_start_encryption_command(0x1000, &[0; 8], 0, &[0; 16]),
+            Err(Error::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn management_loaded_ltk_record_selects_and_starts_the_matching_link() {
+        let mut record = [0u8; 36];
+        record[..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        record[6] = 2;
+        record[7] = 1; // authenticated
+        record[8] = 1; // local device is master/central
+        record[9] = 16;
+        record[10..12].copy_from_slice(&0x1234u16.to_le_bytes());
+        record[12..20].copy_from_slice(&[8, 7, 6, 5, 4, 3, 2, 1]);
+        record[20..36].copy_from_slice(&[0xa5; 16]);
+        let ltk = find_management_ltk(&[record], [1, 2, 3, 4, 5, 6], 2).unwrap();
+        assert_eq!(ltk.ediv, 0x1234);
+        assert_eq!(ltk.random, [8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(ltk.key, [0xa5; 16]);
+        assert_eq!(
+            &le_start_encryption_command(0x0123, &ltk.random, ltk.ediv, &ltk.key).unwrap()[..15],
+            &[
+                0x19, 0x20, 28, 0x23, 0x01, 8, 7, 6, 5, 4, 3, 2, 1, 0x34, 0x12
+            ]
+        );
+        assert_eq!(find_management_ltk(&[record], [0; 6], 2), None);
+        record[8] = 0;
+        assert_eq!(find_management_ltk(&[record], [1, 2, 3, 4, 5, 6], 2), None);
+    }
+
+    #[test]
+    fn background_acl_observer_tap_preserves_packet_for_socket_reader() {
+        let packet = vec![1, 0, 2, 0, 0xaa, 0xbb];
+        let mut adapter = Adapter::new(
+            RxFake {
+                packet: Some((PacketType::Acl, packet.clone())),
+            },
+            3,
+        );
+        adapter.open(Channel::Raw).unwrap();
+        adapter.set_up(true).unwrap();
+        assert_eq!(adapter.pump_receive(), Ok(true));
+        assert_eq!(adapter.pop_observed_acl(), Some(packet.clone()));
+        let mut output = [0u8; 8];
+        assert_eq!(
+            adapter.receive_packet(&mut output, true),
+            Ok((PacketType::Acl, 6))
+        );
+        assert_eq!(&output[..6], &packet);
+    }
+
+    #[test]
+    fn background_receive_pump_publishes_packet_readiness() {
+        let mut adapter = Adapter::new(
+            RxFake {
+                packet: Some((PacketType::Event, vec![0x0e, 0])),
+            },
+            4,
+        );
+        adapter.open(Channel::Raw).unwrap();
+        adapter.set_up(true).unwrap();
+        assert!(!adapter.receive_ready());
+        assert_eq!(adapter.pump_receive_at(1_234_567_890), Ok(true));
+        assert!(adapter.receive_ready());
+        let mut bytes = [0u8; 8];
+        assert_eq!(
+            adapter.receive_packet_at(&mut bytes, true, 0),
+            Ok((PacketType::Event, 2, 1_234_567_890))
+        );
+        assert_eq!(&bytes[..2], &[0x0e, 0]);
+        assert!(!adapter.receive_ready());
+    }
+    #[test]
+    fn empty_controller_reports_no_device() {
+        assert_eq!(absent_device_ioctl(HCIDEVUP), Err(Error::NoDevice));
+        assert_eq!(AF_BLUETOOTH, 31);
+        assert_eq!(BTPROTO_HCI, 1);
+    }
+
+    #[test]
+    fn intel_firmware_tlv_and_name_selection() {
+        let mut v = VersionTlv::default();
+        parse_tlv(
+            &[
+                0, 0x10, 4, 0x12, 0x34, 0x56, 0x78, 0x11, 4, 0xef, 0xcd, 0xab, 0x90,
+            ],
+            &mut v,
+        )
+        .unwrap();
+        assert_eq!(
+            get_fwname_tlv(&v, "/lib/firmware/intel", "sfi"),
+            "/lib/firmware/intel/ibt-2841-f0de.sfi"
+        );
+        assert_eq!(
+            get_fwname(
+                &Version {
+                    hw_variant: 0x0c,
+                    ..Version::default()
+                },
+                None,
+                "intel",
+                "sfi"
+            ),
+            None
+        );
+        assert_eq!(
+            get_fwname(
+                &Version {
+                    hw_variant: 0x0c,
+                    ..Version::default()
+                },
+                Some(&BootParams {
+                    dev_revid: 42,
+                    ..BootParams::default()
+                }),
+                "intel",
+                "sfi"
+            )
+            .unwrap(),
+            "intel/ibt-12-42.sfi"
+        );
+        assert_eq!(
+            get_fwname_fallback(
+                &Version {
+                    hw_platform: 0x37,
+                    hw_variant: 7,
+                    ..Version::default()
+                },
+                "intel",
+                "bseq"
+            )
+            .as_deref(),
+            Some("intel/ibt-hw-37.7.bseq")
+        );
+    }
+
+    #[test]
+    fn intel_firmware_tlv_rejects_short_and_bad_status() {
+        assert_eq!(
+            parse_tlv(&[], &mut VersionTlv::default()),
+            Err(FirmwareError::TruncatedTlv)
+        );
+        assert_eq!(
+            parse_tlv(&[1], &mut VersionTlv::default()),
+            Err(FirmwareError::InvalidStatus)
+        );
+        assert_eq!(
+            parse_tlv(&[0, 0x10, 4, 1], &mut VersionTlv::default()),
+            Err(FirmwareError::TruncatedTlv)
+        );
+    }
+
+    #[test]
+    fn intel_usb_firmware_id_table_includes_n305_cnvi() {
+        assert_eq!(supported_device(0x8087, 0x0033), DeviceFamily::I9260);
+        assert_eq!(supported_device(0x8087, 0x0029), DeviceFamily::I8260);
+        assert_eq!(supported_device(0x1234, 0x0033), DeviceFamily::Unknown);
+    }
+
+    #[test]
+    fn no_controller_ioctl_results_match_hci_device_list_semantics() {
+        assert_eq!(
+            no_device_ioctl(HCIGETDEVLIST),
+            Ok(IoctlOutcome::EmptyDeviceList)
+        );
+        assert_eq!(no_device_ioctl(HCIGETDEVINFO), Err(Error::NoDevice));
+        assert_eq!(no_device_ioctl(HCIDEVUP), Err(Error::NoDevice));
+        assert_eq!(no_device_ioctl(HCIDEVDOWN), Err(Error::NoDevice));
+    }
+
+    #[test]
+    fn intel_patch_stream_parses_command_event_pairs_and_activation() {
+        let (commands, activate) = parse_patch(&[1, 0x8e, 0xfc, 1, 0xaa, 2, 0x0e, 1, 0]).unwrap();
+        assert!(activate);
+        assert_eq!(
+            commands,
+            [PatchCommand {
+                opcode: 0xfc8e,
+                parameters: &[0xaa],
+                expected_events: std::vec![(0x0e, &[0][..])]
+            }]
+        );
+        assert_eq!(parse_patch(&[1, 0x01]), Err(FirmwareError::InvalidPatch));
+    }
+
+    #[test]
+    fn intel_patch_validates_expected_event_code_and_updates_hci_stats() {
+        let image = [1, 0x8e, 0xfc, 1, 0xaa, 2, 0x0e, 1, 0];
+        let mut adapter = Adapter::new(
+            FirmwareFake {
+                events: VecDeque::from([vec![0x0e, 1, 0]]),
+                bulk: Vec::new(),
+            },
+            0,
+        );
+        adapter.set_up(true).unwrap();
+        assert_eq!(adapter.run_intel_patch(&image), Ok(true));
+        assert_eq!(
+            adapter.statistics(),
+            Statistics {
+                cmd_tx: 1,
+                evt_rx: 1,
+                byte_tx: 4,
+                byte_rx: 3,
+                ..Statistics::default()
+            }
+        );
+
+        let mut adapter = Adapter::new(
+            FirmwareFake {
+                events: VecDeque::from([vec![0x0f, 1, 0]]),
+                bulk: Vec::new(),
+            },
+            0,
+        );
+        adapter.set_up(true).unwrap();
+        assert_eq!(adapter.run_intel_patch(&image), Err(Error::InvalidLength));
+    }
+
+    #[test]
+    fn intel_hci_command_waits_for_matching_command_complete() {
+        let mut adapter = Adapter::new(
+            Fake {
+                stopped: false,
+                commands: 0,
+                acl: 0,
+            },
+            0,
+        );
+        adapter.open(Channel::User).unwrap();
+        adapter.set_up(true).unwrap();
+        let mut event = [0; 16];
+        assert_eq!(adapter.command_complete(&[1, 0x10, 0], &mut event), Ok(6));
+        assert_eq!(&event[..6], &[0x0e, 4, 1, 1, 0x10, 0]);
+    }
+
+    #[test]
+    fn hci_command_transaction_preserves_unrelated_events_and_rearms() {
+        let fake = CommandFake {
+            events: VecDeque::from([
+                vec![0x0e, 4, 1, 0x02, 0x10, 0],
+                vec![0x0e, 4, 1, 0x01, 0x10, 0],
+            ]),
+            begun: 0,
+            ended: 0,
+        };
+        let mut adapter = Adapter::new(fake, 0);
+        adapter.set_up(true).unwrap();
+        let mut event = [0; 16];
+        assert_eq!(
+            adapter.command_complete(&[0x01, 0x10, 0], &mut event),
+            Ok(6)
+        );
+        assert_eq!(
+            adapter.pop_observed_event(),
+            Some(vec![0x0e, 4, 1, 0x02, 0x10, 0])
+        );
+        assert_eq!(
+            adapter.receive_packet(&mut event, true),
+            Ok((PacketType::Event, 6))
+        );
+        let fake = adapter.into_transport();
+        assert_eq!((fake.begun, fake.ended), (1, 1));
+    }
+
+    #[test]
+    fn inquiry_command_status_matches_opcode() {
+        let fake = CommandFake {
+            events: VecDeque::from([vec![0x0f, 4, 0, 1, 0x01, 0x04]]),
+            begun: 0,
+            ended: 0,
+        };
+        let mut adapter = Adapter::new(fake, 0);
+        adapter.set_up(true).unwrap();
+        let mut event = [0; 16];
+        assert_eq!(
+            adapter.command_status(&[0x01, 0x04, 5, 0x33, 0x8b, 0x9e, 8, 0], &mut event),
+            Ok(6)
+        );
+    }
+    #[test]
+    fn hci_capabilities_are_decoded_from_standard_command_replies() {
+        let mut adapter = Adapter::new(
+            FirmwareFake {
+                events: VecDeque::from([
+                    vec![0x0e, 10, 1, 0x09, 0x10, 0, 1, 2, 3, 4, 5, 6],
+                    vec![0x0e, 12, 1, 0x03, 0x10, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+                    vec![
+                        0x0e, 12, 1, 0x01, 0x10, 0, 0x0c, 0x34, 0x12, 0x0c, 2, 0, 0, 0,
+                    ],
+                    vec![0x0e, 11, 1, 0x05, 0x10, 0, 0x40, 0, 0x20, 2, 0, 1, 0],
+                    vec![0x0e, 8, 1, 0x02, 0x20, 0, 0x40, 0, 2, 0],
+                ]),
+                bulk: Vec::new(),
+            },
+            0,
+        );
+        adapter.set_up(true).unwrap();
+        assert_eq!(
+            adapter.read_capabilities(),
+            Ok(HciCapabilities {
+                address: [1, 2, 3, 4, 5, 6],
+                features: [1, 2, 3, 4, 5, 6, 7, 8],
+                hci_version: 0x0c,
+                hci_revision: 0x1234,
+                manufacturer: 2,
+                acl_mtu: 64,
+                acl_packets: 2,
+                le_acl_mtu: 64,
+                le_acl_packets: 2,
+                sco_mtu: 32,
+                sco_packets: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn intel_version_event_is_decoded_from_command_complete_parameters() {
+        let event = [0x0e, 13, 1, 0x05, 0xfc, 0, 1, 0x12, 3, 0x23, 4, 5, 6, 7, 8];
+        let version = parse_version_event(&event).unwrap();
+        assert_eq!(version.hw_variant, 0x12);
+        assert_eq!(version.fw_variant, 0x23);
+        assert_eq!(version.fw_patch_num, 8);
+        assert_eq!(
+            parse_version_event(&[0; 15]),
+            Err(FirmwareError::InvalidVersionEvent)
+        );
+    }
+
+    #[test]
+    fn intel_rsa_firmware_header_and_aligned_command_chunks_are_transferred() {
+        let mut firmware = std::vec![0u8; 644];
+        firmware[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        firmware.extend_from_slice(&[0x0e, 0xfc, 5, 1, 2, 3, 4, 0x55]);
+        let transport = FirmwareFake {
+            events: VecDeque::from([std::vec![0xff, 1, 6]]),
+            bulk: Vec::new(),
+        };
+        let mut adapter = Adapter::new(transport, 0);
+        adapter.set_up(true).unwrap();
+        assert_eq!(
+            adapter.intel_init_firmware(&firmware, 0x12, 0),
+            Ok(0x0403_0201)
+        );
+        assert_eq!(adapter.transport.bulk.len(), 6);
+        assert_eq!(&adapter.transport.bulk[5][..4], &[0x09, 0xfc, 9, 1]);
+        assert_eq!(
+            &adapter.transport.bulk[5][4..],
+            &[0x0e, 0xfc, 5, 1, 2, 3, 4, 0x55]
+        );
+    }
+
+    #[test]
+    fn intel_ecdsa_css_header_is_transferred_at_rsa_offset() {
+        let mut firmware = std::vec![0u8; 964];
+        firmware[644] = 0x06;
+        firmware[652..656].copy_from_slice(&0x0002_0000u32.to_le_bytes());
+        let transport = FirmwareFake {
+            events: VecDeque::from([std::vec![0xff, 1, 6]]),
+            bulk: Vec::new(),
+        };
+        let mut adapter = Adapter::new(transport, 0);
+        adapter.set_up(true).unwrap();
+        assert_eq!(adapter.intel_init_firmware(&firmware, 0x17, 1), Ok(0));
+        assert_eq!(adapter.transport.bulk.len(), 3);
+        assert_eq!(&adapter.transport.bulk[0][..4], &[0x09, 0xfc, 129, 0]);
+    }
+
+    #[test]
+    fn intel_boot_params_decode_packed_revision_and_limits() {
+        let mut bytes = [0u8; 23];
+        bytes[4..6].copy_from_slice(&0x1234u16.to_le_bytes());
+        bytes[21] = 7;
+        let params = BootParams::parse(&bytes).unwrap();
+        assert_eq!(params.dev_revid, 0x1234);
+        assert_eq!(params.limited_cce, 7);
+        assert_eq!(
+            BootParams::parse(&bytes[..22]),
+            Err(FirmwareError::InvalidVersionEvent)
+        );
+    }
+}

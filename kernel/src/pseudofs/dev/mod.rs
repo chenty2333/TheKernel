@@ -12,6 +12,7 @@ mod fb;
 pub(crate) use fb::restore_console_after_master_close;
 pub(crate) mod fuse;
 pub(crate) mod r#loop;
+pub(crate) mod rfkill;
 pub(crate) mod rtc;
 pub(crate) mod scanout;
 mod sound;
@@ -38,7 +39,8 @@ use hashbrown::HashMap;
 use linux_raw_sys::{
     general::CAP_SYS_ADMIN,
     ioctl::{
-        BLKGETSIZE, BLKGETSIZE64, BLKRAGET, BLKRASET, BLKROGET, BLKROSET, BLKSSZGET, RNDGETENTCNT,
+        BLKGETSIZE, BLKGETSIZE64, BLKRAGET, BLKRASET, BLKRRPART, BLKROGET, BLKROSET, BLKSSZGET,
+        RNDGETENTCNT,
     },
 };
 
@@ -104,6 +106,25 @@ impl DevRoot {
             }
         }
     }
+
+    fn block_device(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        if name != axfs::ROOT_BLOCK_DEVICE_NAME
+            && !axfs::block_device_names().iter().any(|candidate| candidate == name)
+        {
+            return Err(VfsError::NotFound);
+        }
+        let info = axfs::block_device_info(name).ok_or(VfsError::NotFound)?;
+        let device = axfs::raw_block_device(name).map_err(|_| VfsError::NotFound)?;
+        let device_id = super::block_inventory::device_id(name).ok_or(VfsError::NotFound)?;
+        Ok(Device::new_with_permissions(
+            self.fs.clone(),
+            NodeType::BlockDevice,
+            device_id,
+            NodePermission::from_bits_truncate(0o600),
+            Arc::new(BlockDevice::new(String::from(name), info, device)),
+        )
+        .into())
+    }
 }
 
 impl SimpleDirOps for DevRoot {
@@ -117,25 +138,36 @@ impl SimpleDirOps for DevRoot {
             names.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
             names.push(Self::try_owned_name(name.as_ref())?);
         }
+        for name in axfs::block_device_names()
+            .into_iter()
+            .chain(core::iter::once(String::from(axfs::ROOT_BLOCK_DEVICE_NAME)))
+        {
+            let name = FsName::new(name.as_bytes());
+            if self.static_entries.lookup_child(name).is_ok() {
+                continue;
+            }
+            names.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+            names.push(Self::try_owned_name(name.as_ref())?);
+        }
         try_boxed_names(names.into_iter().map(Cow::Owned))
     }
 
     fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
         match self.static_entries.lookup_child(name) {
             Ok(ops) => Ok(ops),
-            Err(VfsError::NotFound) => self
-                .sockets
-                .lock()
-                .get(name)
-                .cloned()
-                .map(|socket| NodeOpsMux::File(socket))
-                .ok_or(VfsError::NotFound),
+            Err(VfsError::NotFound) => {
+                if let Some(socket) = self.sockets.lock().get(name).cloned() {
+                    return Ok(NodeOpsMux::File(socket));
+                }
+                let name = core::str::from_utf8(name.as_bytes()).map_err(|_| VfsError::NotFound)?;
+                self.block_device(name)
+            }
             Err(error) => Err(error),
         }
     }
 
     fn is_cacheable(&self) -> bool {
-        true
+        false
     }
 
     fn namespace_epoch(&self) -> u64 {
@@ -435,11 +467,21 @@ struct BlockDevice {
     name: String,
     info: BlockDeviceInfo,
     device: SharedBlockDevice,
+    identity: usize,
 }
 
 impl BlockDevice {
     fn new(name: String, info: BlockDeviceInfo, device: SharedBlockDevice) -> Self {
-        Self { name, info, device }
+        let identity = device.identity_token();
+        Self { name, info, device, identity }
+    }
+
+    fn ensure_live(&self) -> VfsResult<()> {
+        if axfs::block_device_identity_token(&self.name) == Some(self.identity) {
+            Ok(())
+        } else {
+            Err(AxError::NoSuchDevice)
+        }
     }
 
     fn read_only(&self) -> bool {
@@ -462,6 +504,7 @@ impl BlockDevice {
 
 impl DeviceOps for BlockDevice {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        self.ensure_live()?;
         if buf.is_empty() || offset >= self.info.byte_len() {
             return Ok(0);
         }
@@ -469,6 +512,7 @@ impl DeviceOps for BlockDevice {
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+        self.ensure_live()?;
         if buf.is_empty() {
             return Ok(0);
         }
@@ -482,6 +526,7 @@ impl DeviceOps for BlockDevice {
     }
 
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> VfsResult<usize> {
+        self.ensure_live()?;
         match cmd {
             BLKGETSIZE => {
                 let sectors = self.info.byte_len() / 512;
@@ -522,6 +567,16 @@ impl DeviceOps for BlockDevice {
                     axfs::OpenBlockDeviceError::Busy => AxError::ResourceBusy,
                 })?;
             }
+            BLKRRPART => {
+                require_blkroset_admin(context.caller_cred())?;
+                axfs::rescan_gpt_partitions(&self.name).map_err(|err| match err {
+                    axfs::PartitionRescanError::NotFound => AxError::NoSuchDevice,
+                    axfs::PartitionRescanError::Busy => AxError::ResourceBusy,
+                    axfs::PartitionRescanError::Invalid => AxError::InvalidInput,
+                    axfs::PartitionRescanError::Io => AxError::Io,
+                    axfs::PartitionRescanError::NoMemory => AxError::NoMemory,
+                })?;
+            }
             BLKRAGET | BLKRASET => return Err(AxError::OperationNotSupported),
             _ => return Err(AxError::NotATty),
         }
@@ -529,6 +584,7 @@ impl DeviceOps for BlockDevice {
     }
 
     fn sync(&self, _data_only: bool) -> VfsResult<()> {
+        self.ensure_live()?;
         self.device.lock().flush().map_err(Self::map_error)
     }
 
@@ -537,6 +593,7 @@ impl DeviceOps for BlockDevice {
     }
 
     fn len(&self) -> VfsResult<u64> {
+        self.ensure_live()?;
         Ok(self.info.byte_len())
     }
 
@@ -621,6 +678,16 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
             NodeType::CharacterDevice,
             DeviceId::new(1, 9),
             Arc::new(Random { insecure: true }),
+        ),
+    );
+    root.add(
+        "rfkill",
+        Device::new_with_permissions(
+            fs.clone(),
+            NodeType::CharacterDevice,
+            DeviceId::new(10, 242),
+            NodePermission::from_bits_truncate(0o664),
+            Arc::new(rfkill::Rfkill),
         ),
     );
     // The FUSE transport is an OFD-owned character device: each daemon open
@@ -791,50 +858,27 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
         );
     }
 
-    if let (Some(info), Ok(device)) = (
-        axfs::root_block_device_info(),
-        axfs::raw_block_device(axfs::ROOT_BLOCK_DEVICE_NAME),
-    ) {
-        root.add(
-            axfs::ROOT_BLOCK_DEVICE_NAME,
-            Device::new_with_permissions(
-                fs.clone(),
-                NodeType::BlockDevice,
-                mounts::ROOT_BLOCK_DEVICE_ID,
-                NodePermission::from_bits_truncate(0o600),
-                Arc::new(BlockDevice::new(
-                    axfs::ROOT_BLOCK_DEVICE_NAME.into(),
-                    info,
-                    device,
-                )),
-            ),
-        );
-    }
-
-    for (index, name) in axfs::block_device_names().into_iter().enumerate() {
-        let Some(info) = axfs::block_device_info(&name) else {
-            continue;
-        };
-        let Ok(device) = axfs::raw_block_device(&name) else {
-            continue;
-        };
-        let Some(dev_id) = mounts::extra_block_device_id(index) else {
-            continue;
-        };
-        root.add(
-            name.clone(),
-            Device::new_with_permissions(
-                fs.clone(),
-                NodeType::BlockDevice,
-                dev_id,
-                NodePermission::from_bits_truncate(0o600),
-                Arc::new(BlockDevice::new(name, info, device)),
-            ),
-        );
+    // I2C-dev minors are published after the platform PCI walker has attached
+    // all default-enabled Intel LPSS controllers.
+    for bus in 0..axdriver::i2c::bus_count() {
+        if let Ok(minor) = u32::try_from(bus) {
+            root.add(
+                format!("i2c-{bus}"),
+                Device::new_with_permissions(
+                    fs.clone(),
+                    NodeType::CharacterDevice,
+                    DeviceId::new(i2c::DEVICE_MAJOR, minor),
+                    NodePermission::from_bits_truncate(0o660),
+                    Arc::new(i2c::I2cDevice { bus }),
+                ),
+            );
+        }
     }
 
     root
 }
+
+pub(crate) mod i2c;
 
 #[cfg(test)]
 mod tests {
@@ -920,6 +964,18 @@ mod tests {
         let console = console.downcast::<Device>().unwrap();
         let console = console.inner().as_any().downcast_ref::<VtNode>().unwrap();
         assert!(console.0.is_active_alias());
+    }
+
+    #[test]
+    fn devfs_publishes_linux_rfkill_character_device() {
+        let devfs = new_test_devfs();
+        let root = devfs.root_dir();
+        let root = root.as_dir().unwrap();
+        let rfkill = root.lookup(FsName::new(b"rfkill")).unwrap();
+        let metadata = rfkill.metadata().unwrap();
+        assert_eq!(metadata.node_type, NodeType::CharacterDevice);
+        assert_eq!(metadata.rdev, DeviceId::new(10, 242));
+        assert_eq!(metadata.mode.bits(), 0o664);
     }
 
     #[test]

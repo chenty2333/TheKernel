@@ -35,6 +35,7 @@
 
 #[macro_use]
 extern crate axlog;
+extern crate alloc;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -869,10 +870,6 @@ fn read_rootfs_firmware(path: &str, max_len: usize) -> Option<alloc::vec::Vec<u8
     }
 }
 
-#[cfg(all(feature = "fs-ng", feature = "axdriver"))]
-extern crate alloc;
-
-
 /// Firmware/IRQ routing services which must precede the initial PCI probe.
 /// Called once after heap, mappings, BSP scheduler and IRQ services; before AP startup.
 #[cfg(feature = "platform-services")]
@@ -919,10 +916,26 @@ fn init_device_subsystems() {
 
         #[cfg(feature = "net-ng")]
         {
-            if let Err(error) = axnet_ng::init_network(all_devices.net) {
+            use axdriver::prelude::NetDriverOps;
+
+            let mut network_devices = axdriver::AxDeviceContainer::default();
+            let mut wireless_devices = alloc::vec::Vec::new();
+            while let Some(device) = all_devices.net.take_one() {
+                if device.is_wireless() {
+                    wireless_devices.push(device);
+                } else {
+                    network_devices.push(device);
+                }
+            }
+            if let Err(error) = axnet_ng::init_network(network_devices) {
                 klog::fatal(format_args!(
                     "Network subsystem initialization failed: {error:?}"
                 ));
+            }
+            for device in wireless_devices {
+                if let Err(error) = axnet_ng::register_wireless_device(device) {
+                    warn!("wireless interface publication failed: {error:?}");
+                }
             }
 
             #[cfg(feature = "vsock")]

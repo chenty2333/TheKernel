@@ -384,6 +384,47 @@ fn pci_root() -> Option<PciRoot> {
     Some(unsafe { PciRoot::new(base.as_mut_ptr(), Cam::Ecam) })
 }
 
+/// Resolve a PCI function to the ACPI DMAR device-scope path that reaches it.
+/// The returned entries are `(bus, device, function)` from the root bridge to
+/// the endpoint; this keeps requester-to-IOMMU selection correct behind PCIe
+/// bridges instead of assuming the endpoint bus is the DMAR scope start bus.
+pub fn requester_path(bus: u8, device: u8, function: u8) -> Option<alloc::vec::Vec<(u8, u8, u8)>> {
+    let mut root = pci_root()?;
+    let bus_end = pci_scan_bus_end();
+    let mut pending = alloc::vec::Vec::new();
+    pending.push((0u8, alloc::vec::Vec::<(u8, u8, u8)>::new()));
+    let mut visited = [false; u8::MAX as usize + 1];
+    visited[0] = true;
+    while let Some((current_bus, parent_path)) = pending.pop() {
+        for (bdf, info) in root.enumerate_bus(current_bus) {
+            let mut path = parent_path.clone();
+            path.push((current_bus, bdf.device, bdf.function));
+            if current_bus == bus && bdf.device == device && bdf.function == function {
+                return Some(path);
+            }
+            if info.header_type != HeaderType::PciPciBridge {
+                continue;
+            }
+            let numbers = root.bridge_bus_numbers(bdf);
+            let Some(secondary) = valid_bridge_secondary_bus(
+                current_bus,
+                numbers.primary,
+                numbers.secondary,
+                numbers.subordinate,
+                bus_end,
+            ) else {
+                continue;
+            };
+            if visited[secondary as usize] || pending.len() >= MAX_REACHABLE_PCI_BUSES {
+                continue;
+            }
+            visited[secondary as usize] = true;
+            pending.push((secondary, path));
+        }
+    }
+    None
+}
+
 #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
 fn pci_snapshot(
     root: &mut PciRoot,
@@ -410,7 +451,7 @@ fn probe_virtio_input(
 
     match <VirtIoInput as VirtIoDevMeta>::Driver::probe_pci(root, bdf, dev_info) {
         BusProbeResult::Device(crate::AxDeviceEnum::Input(device)) => Some(device),
-        BusProbeResult::NotMatched | BusProbeResult::Claimed => None,
+        BusProbeResult::NotMatched | BusProbeResult::Claimed | BusProbeResult::Devices(_) => None,
         #[allow(unreachable_patterns)]
         _ => None,
     }
@@ -419,7 +460,10 @@ fn probe_virtio_input(
 #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
 fn quiesce_pci_function(root: &mut PciRoot, bdf: DeviceFunction) {
     crate::pci_resources::invalidate(crate::pci::Address {
-        segment: axhal::pci::ecam_segment(), bus: bdf.bus, device: bdf.device, function: bdf.function,
+        segment: axhal::pci::ecam_segment(),
+        bus: bdf.bus,
+        device: bdf.device,
+        function: bdf.function,
     });
     // Stop DMA and mask INTx before transferring the removal to axinput.  The
     // VirtIO input owner then drops its queues and resets the transport while
@@ -503,14 +547,22 @@ fn config_pci_device(
         let info = root
             .bar_info(bdf, bar)
             .map_err(|_| DevError::InvalidParam)?;
-        let raw = observe_config_word(crate::pci::Address {
-            segment: axhal::pci::ecam_segment(), bus: bdf.bus, device: bdf.device, function: bdf.function,
-        }, 0x10 + usize::from(bar) * 4);
+        let raw = observe_config_word(
+            crate::pci::Address {
+                segment: axhal::pci::ecam_segment(),
+                bus: bdf.bus,
+                device: bdf.device,
+                function: bdf.function,
+            },
+            0x10 + usize::from(bar) * 4,
+        );
         let (start, size) = match info {
             BarInfo::IO { address, size } => (u64::from(address), u64::from(size)),
             BarInfo::Memory { address, size, .. } => (address, u64::from(size)),
         };
-        if let Some(observed) = raw.and_then(|raw| crate::pci_resources::Resource::observed(start, size, raw)) {
+        if let Some(observed) =
+            raw.and_then(|raw| crate::pci_resources::Resource::observed(start, size, raw))
+        {
             resources[usize::from(bar)] = observed;
         } else {
             observed_all = false;
@@ -566,7 +618,10 @@ fn config_pci_device(
             | Command::INTERRUPT_DISABLE,
     );
     let address = crate::pci::Address {
-        segment: axhal::pci::ecam_segment(), bus: bdf.bus, device: bdf.device, function: bdf.function,
+        segment: axhal::pci::ecam_segment(),
+        bus: bdf.bus,
+        device: bdf.device,
+        function: bdf.function,
     };
     if observed_all {
         crate::pci_resources::record(address, resources);
@@ -621,6 +676,10 @@ impl AllDevices {
             }
             match config_pci_device(root, bdf, &mut allocator) {
                 Ok(_) => {
+                    #[cfg(feature = "i2c")]
+                    if crate::i2c::probe(root, bdf, dev_info) {
+                        return;
+                    }
                     #[cfg(feature = "usb-xhci")]
                     if dev_info.class == 0x0c
                         && dev_info.subclass == 0x03
@@ -690,6 +749,16 @@ impl AllDevices {
                                 self.add_device(dev);
                                 return;
                             }
+                        }
+                        BusProbeResult::Devices(devices) => {
+                            for dev in devices {
+                                info!(
+                                    "registered a new {:?} device at {}: {:?}",
+                                    dev.device_type(), bdf, dev.device_name(),
+                                );
+                                self.add_device(dev);
+                            }
+                            return;
                         }
                     }
                     });

@@ -14,6 +14,7 @@ repository.workspace = true
 default = []
 fxmac = ["dep:fxmac_rs"]
 igc = []
+e1000 = []
 rtl8125 = []
 ixgbe = ["dep:ixgbe-driver"]
 

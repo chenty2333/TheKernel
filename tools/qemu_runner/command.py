@@ -79,6 +79,10 @@ def build_qemu_command(
     rootfs: Drive | None,
     extra_block: Drive | None = None,
     nvme_disk: Drive | None = None,
+    ahci_disk: Drive | None = None,
+    sdhci_disk: Drive | None = None,
+    e1000_model: str | None = None,
+    e1000_hostfwd_port: int | None = None,
     usb_disk: Drive | None = None,
     usb_boot: bool = False,
     input_backend: str = "virtio",
@@ -100,6 +104,8 @@ def build_qemu_command(
     diagnostic_log_path: Path | None = None,
     extra_args: tuple[str, ...] = (),
     cpu_pm: bool = False,
+    kernel_irqchip_split: bool = False,
+    virtio_modern_only: bool = False,
 ) -> tuple[str, ...]:
     """Build the deterministic architecture-specific QEMU topology."""
 
@@ -125,16 +131,19 @@ def build_qemu_command(
         raise CommandError(f"unsupported input backend: {input_backend}")
     if cpu_pm and accel != "kvm":
         raise CommandError("cpu-pm passthrough requires --accel kvm")
+    if kernel_irqchip_split and arch != "x86_64":
+        raise CommandError("split kernel irqchip is supported only on x86_64")
     _validate_extra_args(extra_args)
     if usb_boot and (arch != "x86_64" or usb_disk is None or rootfs is not None or direct_kernel):
         raise CommandError("USB boot requires x86 UEFI, USB disk, and no other root drive")
     qemu_argv = [qemu_binary or "qemu-system-x86_64"]
     if arch == "x86_64":
+        machine = Q35_MACHINE + (",kernel-irqchip=split" if kernel_irqchip_split else "")
         if direct_kernel:
             command = [
                 *qemu_argv,
                 "-machine",
-                Q35_MACHINE,
+                machine,
                 "-kernel",
                 str(kernel),
                 "-m",
@@ -156,7 +165,7 @@ def build_qemu_command(
             command = [
                 *qemu_argv,
                 "-machine",
-                Q35_MACHINE,
+                machine,
                 "-drive",
                 f"if=pflash,format=raw,readonly=on,aio=threads,file={_escaped_path(ovmf_code)}",
                 "-drive",
@@ -251,12 +260,46 @@ def build_qemu_command(
         if nvme_disk is not None:
             command.extend(["-drive", drive_options(nvme_disk.path, "nvme-disk", mode=nvme_disk.mode),
                             "-device", "nvme,drive=nvme-disk,serial=TK-NVME-TEST,max_ioqpairs=4"])
+        if ahci_disk is not None:
+            command.extend([
+                "-device", "ich9-ahci,id=ahci",
+                "-drive", drive_options(ahci_disk.path, "ahci-disk", mode=ahci_disk.mode),
+                "-device", "ide-hd,drive=ahci-disk,bus=ahci.0",
+            ])
+        if sdhci_disk is not None:
+            command.extend([
+                "-device", "sdhci-pci,id=sdhci",
+                "-drive", drive_options(sdhci_disk.path, "sd-card-drive", mode=sdhci_disk.mode),
+                "-device", "sd-card,drive=sd-card-drive",
+            ])
+        if e1000_model is not None:
+            netdev = "user,id=e1000net0"
+            if e1000_hostfwd_port is not None:
+                netdev += f",hostfwd=tcp:127.0.0.1:{e1000_hostfwd_port}-:8080"
+            command.extend([
+                "-netdev", netdev,
+                "-device", f"{e1000_model},netdev=e1000net0,mac=52:54:00:00:00:03",
+            ])
         if extra_block is not None:
             _append_pci_drive(command, extra_block, "extra")
         if cpu_pm:
             command.extend(("-overcommit", "cpu-pm=on"))
         if extra_args:
             command.extend(extra_args)
+        if kernel_irqchip_split:
+            # The VT-d topology passes IOVAs through the DMA HAL. Transitional
+            # VirtIO PCI devices neither advertise ACCESS_PLATFORM nor support
+            # it; use modern-only devices and let them advertise the feature so
+            # the guest can negotiate platform DMA addresses.
+            for index, option in enumerate(command[:-1]):
+                if option == "-device" and command[index + 1].startswith("virtio-"):
+                    command[index + 1] += ",disable-legacy=on,iommu_platform=on"
+        elif virtio_modern_only:
+            # Isolate the modern VirtIO path without adding an IOMMU device or
+            # changing the platform DMA addresses returned by an identity HAL.
+            for index, option in enumerate(command[:-1]):
+                if option == "-device" and command[index + 1].startswith("virtio-"):
+                    command[index + 1] += ",disable-legacy=on"
         return tuple(command)
 
     raise CommandError(f"unsupported architecture: {arch}")

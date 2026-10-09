@@ -12,9 +12,9 @@
 //!
 //! 1. **Identify.**  Read configuration space, map BAR0, read the registers
 //!    that identify the part, and print one verdict.  Writes nothing.
-//! 2. **Bring up.**  Reset the MAC, wait for the NVM auto-read, read the
-//!    station address, ask the PHY to autonegotiate and wait for link.  Sets up
-//!    no ring, so nothing can be sent or received yet.
+//! 2. **Bring up.**  Install FreeBSD's shared I225 operation tables, translate
+//!    its MAC/NVM/PHY parameter, reset, RAR, link-setup and link-check helpers
+//!    onto the bounded MMIO/NVM/MDIC adapters.  Sets up no ring yet.
 //! 3. **Take over.**  Build the descriptor rings and hand the NIC to the bus.
 //!
 //! Each phase logs its own outcome before the next begins, so a machine that
@@ -29,13 +29,677 @@ use core::{
 
 use axalloc::{UsageKind, global_allocator};
 use axdriver_net::igc::{
-    self, DMA_PAGE_BYTES, IgcHal, IgcNic, PhysAddr, WindowBus,
+    self, DMA_PAGE_BYTES, IgcBus, IgcHal, IgcNic, PhysAddr, WindowBus,
+    api::{
+        IgcApiBackend, IgcApiCallback, IgcApiRequest, IgcApiValue, IgcHardware, igc_read_mac_addr,
+        igc_setup_init_funcs,
+    },
+    base::SWFW_PHY0_SM,
+    i225::{
+        IgcI225Io, IgcI225LinkIo, igc_acquire_swfw_sync_i225, igc_get_flash_presence_i225,
+        igc_release_swfw_sync_i225, init_mac_params_i225, init_nvm_params_i225,
+        init_phy_params_i225,
+    },
     ids::{self, INTEL_VENDOR},
+    if_igc::{IgcPciIo, igc_enable_pci_busmaster},
+    mac::{FlowMode, IgcMacIo, MacError, MacState},
+    phy::{self, IgcPhyIo, PhyError, PhyState},
     probe::{BarFacts, Candidate, ConfigFacts, MsixFacts},
-    regs::{RegisterWindow, WINDOW_BYTES},
+    regs::{self, RegisterWindow, WINDOW_BYTES},
 };
 use axhal::mem::{phys_to_virt, virt_to_phys};
 use log::*;
+
+/// Installs shared-code operation tables only; live callbacks run later
+/// through `I225RegisterIo`, after PCI and MMIO admission.
+struct ApiTableOnlyBackend;
+
+impl IgcApiBackend for ApiTableOnlyBackend {
+    fn invoke(
+        &mut self,
+        _callback: axdriver_net::igc::api::IgcApiCallback,
+        _request: IgcApiRequest,
+    ) -> axdriver_base::DevResult<IgcApiValue> {
+        Err(axdriver_base::DevError::Unsupported)
+    }
+}
+
+/// PCI config-space adapter for the translated FreeBSD bus-master admission
+/// helper. This is deliberately narrow: the current port polls and does not
+/// allocate MSI-X or L1SS state through this adapter.
+struct I225PciIo<'a> {
+    root: &'a mut axdriver_pci::PciRoot,
+    bdf: axdriver_pci::DeviceFunction,
+}
+
+impl IgcPciIo for I225PciIo<'_> {
+    fn read_config(&mut self, offset: u16, width: u8) -> u32 {
+        let Ok(offset) = u8::try_from(offset) else {
+            return u32::MAX;
+        };
+        let Some(value) = self.root.read_config_dword(self.bdf, offset & !3) else {
+            return u32::MAX;
+        };
+        let shift = u32::from(offset & 3) * 8;
+        match width {
+            1 => (value >> shift) & 0xff,
+            2 => (value >> shift) & 0xffff,
+            4 if offset & 3 == 0 => value,
+            _ => u32::MAX,
+        }
+    }
+
+    fn write_config(&mut self, offset: u16, width: u8, value: u32) {
+        if width == 2 {
+            if let Ok(offset) = u8::try_from(offset) {
+                let _ = self.root.write_config_u16(self.bdf, offset, value as u16);
+            }
+        }
+    }
+
+    fn enable_busmaster(&mut self) -> Result<(), axdriver_net::igc::if_igc::MainError> {
+        const PCI_COMMAND: u8 = 0x04;
+        const PCI_BUSMASTER_ENABLE: u16 = 0x0004;
+        let Some(config) = self.root.read_config_dword(self.bdf, PCI_COMMAND) else {
+            return Err(axdriver_net::igc::if_igc::MainError::Io);
+        };
+        let command = config as u16 | PCI_BUSMASTER_ENABLE;
+        if self.root.write_config_u16(self.bdf, PCI_COMMAND, command) {
+            Ok(())
+        } else {
+            Err(axdriver_net::igc::if_igc::MainError::Io)
+        }
+    }
+
+    fn find_l1ss_capability(&mut self) -> Option<u16> {
+        None
+    }
+
+    fn l1ss_aspm_l12_mask(&self) -> u32 {
+        0
+    }
+
+    fn l1ss_pcipm_l12_mask(&self) -> u32 {
+        0
+    }
+}
+
+const STATUS: u32 = 0x00008;
+
+/// Register/timing boundary for translated I225 NVM, MAC, PHY and reset/link
+/// callbacks. Access still goes through the bounded register map.
+struct I225RegisterIo<'a, H: IgcHal> {
+    bus: &'a mut WindowBus<H>,
+    clear_semaphore_once: bool,
+    nvm_word_size: u32,
+    nvm_kind: axdriver_net::igc::nvm::NvmKind,
+    phy: PhyState,
+    mac: MacState,
+}
+
+impl<H: IgcHal> IgcI225Io for I225RegisterIo<'_, H> {
+    fn read(&mut self, offset: u32) -> u32 {
+        regs::at_offset(offset)
+            .and_then(|register| self.bus.read(register))
+            .unwrap_or(0)
+    }
+
+    fn write(&mut self, offset: u32, value: u32) {
+        if let Some(register) = regs::at_offset(offset) {
+            let _ = self.bus.write(register, value);
+        }
+    }
+
+    fn write_flush(&mut self) {
+        let _ = <Self as IgcI225Io>::read(self, STATUS);
+    }
+
+    fn delay_us(&mut self, us: u32) {
+        axhal::time::busy_wait(core::time::Duration::from_micros(u64::from(us)));
+    }
+
+    fn delay_ms(&mut self, ms: u32) {
+        axhal::time::busy_wait(core::time::Duration::from_millis(u64::from(ms)));
+    }
+
+    fn delay_ms_irq(&mut self, ms: u32) {
+        <Self as IgcI225Io>::delay_ms(self, ms);
+    }
+
+    fn nvm_word_size(&self) -> u32 {
+        self.nvm_word_size
+    }
+
+    fn clear_semaphore_once(&mut self) -> bool {
+        self.clear_semaphore_once
+    }
+
+    fn set_clear_semaphore_once(&mut self, value: bool) {
+        self.clear_semaphore_once = value;
+    }
+
+    fn put_hw_semaphore_generic(&mut self) {
+        const SWSM: u32 = 0x05b50;
+        const SWSM_SWESMBI: u32 = 0x2;
+        let swsm = <Self as IgcI225Io>::read(self, SWSM);
+        <Self as IgcI225Io>::write(self, SWSM, swsm & !SWSM_SWESMBI);
+    }
+}
+
+impl<H: IgcHal> IgcPhyIo for I225RegisterIo<'_, H> {
+    fn read(&mut self, offset: u32) -> u32 {
+        <Self as IgcI225Io>::read(self, offset)
+    }
+
+    fn write(&mut self, offset: u32, value: u32) {
+        <Self as IgcI225Io>::write(self, offset, value)
+    }
+
+    fn flush(&mut self) {
+        <Self as IgcI225Io>::write_flush(self)
+    }
+
+    fn read_phy(&mut self, offset: u32) -> Result<u16, PhyError> {
+        let phy = self.phy.clone();
+        phy::igc_read_phy_reg_mdic(self, &phy, offset)
+    }
+
+    fn write_phy(&mut self, offset: u32, value: u16) -> Result<(), PhyError> {
+        let phy = self.phy.clone();
+        phy::igc_write_phy_reg_mdic(self, &phy, offset, value)
+    }
+
+    fn has_read_phy_callback(&self) -> bool {
+        true
+    }
+
+    fn acquire_phy(&mut self) -> Result<(), PhyError> {
+        igc_acquire_swfw_sync_i225(self, SWFW_PHY0_SM).map_err(|_| PhyError::Sync)
+    }
+
+    fn release_phy(&mut self) {
+        igc_release_swfw_sync_i225(self, SWFW_PHY0_SM);
+    }
+
+    fn delay_us(&mut self, us: u32) {
+        <Self as IgcI225Io>::delay_us(self, us)
+    }
+
+    fn delay_us_irq(&mut self, us: u32) {
+        <Self as IgcI225Io>::delay_us(self, us)
+    }
+
+    fn delay_ms(&mut self, ms: u32) {
+        <Self as IgcI225Io>::delay_ms(self, ms)
+    }
+
+    fn mac_autoneg(&self) -> bool {
+        self.mac.autoneg
+    }
+
+    fn flow_mode(&self) -> FlowMode {
+        self.mac.flow.current
+    }
+
+    fn set_flow_mode(&mut self, mode: FlowMode) {
+        self.mac.flow.current = mode;
+    }
+
+    fn check_phy_reset_block(&mut self) -> Result<(), PhyError> {
+        phy::igc_check_reset_block_generic(self)
+    }
+
+    fn configure_collision_distance(&mut self) {
+        axdriver_net::igc::mac::igc_config_collision_dist_generic(self);
+    }
+
+    fn configure_flow_control(&mut self) -> Result<(), PhyError> {
+        let mut mac = self.mac.clone();
+        let result = axdriver_net::igc::mac::igc_config_fc_after_link_up_generic(self, &mut mac);
+        self.mac = mac;
+        result.map_err(|_| PhyError::Io)
+    }
+
+    fn link_status(&mut self) -> Result<bool, PhyError> {
+        let link = phy::igc_phy_has_link_generic(self, 10, 10)?;
+        self.mac.get_link_status = !link;
+        Ok(link)
+    }
+
+    fn force_speed_duplex(&mut self) -> Result<(), PhyError> {
+        Ok(())
+    }
+}
+
+impl<H: IgcHal> axdriver_net::igc::nvm::IgcNvmIo for I225RegisterIo<'_, H> {
+    fn read_reg(&mut self, offset: u32) -> u32 {
+        <Self as IgcI225Io>::read(self, offset)
+    }
+
+    fn write_reg(&mut self, offset: u32, value: u32) {
+        <Self as IgcI225Io>::write(self, offset, value)
+    }
+
+    fn write_flush(&mut self) {
+        <Self as IgcI225Io>::write_flush(self)
+    }
+
+    fn delay_us(&mut self, us: u32) {
+        <Self as IgcI225Io>::delay_us(self, us)
+    }
+
+    fn delay_ms(&mut self, ms: u32) {
+        <Self as IgcI225Io>::delay_ms(self, ms)
+    }
+
+    fn nvm_info(&self) -> axdriver_net::igc::nvm::NvmInfo {
+        axdriver_net::igc::nvm::NvmInfo {
+            kind: self.nvm_kind,
+            word_size: self.nvm_word_size,
+            opcode_bits: 8,
+            delay_usec: 1,
+            page_size: 8,
+            address_bits: 8,
+        }
+    }
+
+    fn acquire_nvm(&mut self) -> Result<(), axdriver_net::igc::nvm::NvmError> {
+        axdriver_net::igc::i225::igc_acquire_nvm_i225(self)
+            .map_err(|_| axdriver_net::igc::nvm::NvmError::Sync)
+    }
+
+    fn release_nvm(&mut self) {
+        axdriver_net::igc::i225::igc_release_nvm_i225(self);
+    }
+
+    fn read_nvm(
+        &mut self,
+        offset: u16,
+        words: u16,
+        data: &mut [u16],
+    ) -> Result<(), axdriver_net::igc::nvm::NvmError> {
+        axdriver_net::igc::i225::igc_read_nvm_srrd_i225(self, offset, data, words)
+            .map_err(map_i225_nvm_error)
+    }
+
+    fn write_nvm(
+        &mut self,
+        offset: u16,
+        words: u16,
+        data: &[u16],
+    ) -> Result<(), axdriver_net::igc::nvm::NvmError> {
+        let words = usize::from(words);
+        if words > data.len() {
+            return Err(axdriver_net::igc::nvm::NvmError::Bounds);
+        }
+        axdriver_net::igc::i225::igc_write_nvm_srwr_i225(self, offset, &data[..words])
+            .map_err(map_i225_nvm_error)
+    }
+
+    fn mac_type_i225(&self) -> bool {
+        true
+    }
+}
+
+impl<H: IgcHal> IgcMacIo for I225RegisterIo<'_, H> {
+    fn read(&mut self, offset: u32) -> u32 {
+        <Self as IgcI225Io>::read(self, offset)
+    }
+
+    fn write(&mut self, offset: u32, value: u32) {
+        <Self as IgcI225Io>::write(self, offset, value)
+    }
+
+    fn write_flush(&mut self) {
+        <Self as IgcI225Io>::write_flush(self)
+    }
+
+    fn read_nvm_word(&mut self, offset: u16) -> Result<u16, MacError> {
+        let mut word = [0u16; 1];
+        axdriver_net::igc::i225::igc_read_nvm_srrd_i225(self, offset, &mut word, 1)
+            .map_err(|_| MacError::Io)?;
+        Ok(word[0])
+    }
+
+    fn nvm_word_size(&self) -> u32 {
+        self.nvm_word_size
+    }
+
+    fn mac_type_i225(&self) -> bool {
+        true
+    }
+
+    fn check_reset_block(&mut self) -> Result<bool, MacError> {
+        match phy::igc_check_reset_block_generic(self) {
+            Ok(()) => Ok(false),
+            Err(PhyError::ResetBlocked) => Ok(true),
+            Err(_) => Err(MacError::Io),
+        }
+    }
+
+    fn rar_set(&mut self, address: [u8; 6], index: u32) -> Result<(), MacError> {
+        axdriver_net::igc::mac::igc_rar_set_generic(self, address, index)
+    }
+
+    fn check_link(&mut self) -> Result<bool, MacError> {
+        let result = axdriver_net::igc::i225::igc_check_for_link_i225(self);
+        if result != 0 {
+            return Err(MacError::Io);
+        }
+        Ok(!self.mac.get_link_status)
+    }
+
+    fn check_downshift(&mut self) {
+        phy::igc_check_downshift_generic(&mut self.phy);
+    }
+
+    fn setup_physical_interface(&mut self) -> Result<(), MacError> {
+        let result = axdriver_net::igc::i225::igc_setup_copper_link_i225(self, |io| {
+            let mut phy = io.phy.clone();
+            let mut link = io.mac.get_link_status;
+            match phy::igc_setup_copper_link_generic(io, &mut phy, &mut link) {
+                Ok(()) => {
+                    io.phy = phy;
+                    io.mac.get_link_status = link;
+                    0
+                }
+                Err(_) => -1,
+            }
+        });
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(MacError::Io)
+        }
+    }
+
+    fn phy_read(&mut self, reg: u16) -> Result<u16, MacError> {
+        <Self as IgcPhyIo>::read_phy(self, u32::from(reg)).map_err(|_| MacError::Io)
+    }
+
+    fn get_speed_duplex(&mut self) -> Result<(u16, u16), MacError> {
+        Ok(axdriver_net::igc::mac::igc_get_speed_and_duplex_copper_generic(self))
+    }
+
+    fn acquire_hw_semaphore(&mut self) -> Result<(), MacError> {
+        axdriver_net::igc::mac::igc_get_hw_semaphore_generic(self)
+    }
+
+    fn put_hw_semaphore(&mut self) {
+        axdriver_net::igc::mac::igc_put_hw_semaphore_generic(self);
+    }
+
+    fn auto_read_done(&mut self) -> Result<(), MacError> {
+        axdriver_net::igc::mac::igc_get_auto_rd_done_generic(self)
+    }
+
+    fn disable_pcie_master(&mut self) -> Result<(), MacError> {
+        axdriver_net::igc::mac::igc_disable_pcie_master_generic(self)
+    }
+
+    fn delay_us(&mut self, us: u32) {
+        <Self as IgcI225Io>::delay_us(self, us);
+    }
+
+    fn delay_ms(&mut self, ms: u32) {
+        <Self as IgcI225Io>::delay_ms(self, ms);
+    }
+}
+
+impl<H: IgcHal> IgcI225LinkIo for I225RegisterIo<'_, H> {
+    fn get_link_status(&self) -> bool {
+        self.mac.get_link_status
+    }
+
+    fn set_get_link_status(&mut self, value: bool) {
+        self.mac.get_link_status = value;
+    }
+
+    fn phy_has_link(&mut self, iterations: u32, interval_ms: u32) -> Result<bool, i32> {
+        phy::igc_phy_has_link_generic(self, iterations, interval_ms.saturating_mul(1000))
+            .map_err(|_| -1)
+    }
+
+    fn check_downshift(&mut self) {
+        phy::igc_check_downshift_generic(&mut self.phy);
+    }
+
+    fn autoneg(&self) -> bool {
+        self.mac.autoneg
+    }
+
+    fn config_collision_dist(&mut self) {
+        axdriver_net::igc::mac::igc_config_collision_dist_generic(self);
+    }
+
+    fn config_fc_after_link_up(&mut self) -> Result<(), i32> {
+        let mut mac = self.mac.clone();
+        let result = axdriver_net::igc::mac::igc_config_fc_after_link_up_generic(self, &mut mac);
+        self.mac = mac;
+        result.map_err(|_| -1)
+    }
+
+    fn get_speed_duplex(&mut self) -> (u16, u16) {
+        axdriver_net::igc::mac::igc_get_speed_and_duplex_copper_generic(self)
+    }
+
+    fn eee_disabled(&self) -> bool {
+        false
+    }
+
+    fn mtu(&self) -> u32 {
+        1500
+    }
+}
+
+impl<H: IgcHal> axdriver_net::igc::base::IgcBaseIo for I225RegisterIo<'_, H> {
+    fn read(&mut self, reg: u32) -> u32 {
+        <Self as IgcI225Io>::read(self, reg)
+    }
+
+    fn write(&mut self, reg: u32, value: u32) {
+        <Self as IgcI225Io>::write(self, reg, value)
+    }
+
+    fn delay_ms(&mut self, ms: u32) {
+        <Self as IgcI225Io>::delay_ms(self, ms)
+    }
+
+    fn write_flush(&mut self) {
+        <Self as IgcI225Io>::write_flush(self)
+    }
+
+    fn bus_function(&self) -> u8 {
+        0
+    }
+
+    fn acquire_swfw_sync(&mut self, mask: u16) -> i32 {
+        igc_acquire_swfw_sync_i225(self, mask).map_or(-1, |_| 0)
+    }
+
+    fn release_swfw_sync(&mut self, mask: u16) {
+        igc_release_swfw_sync_i225(self, mask);
+    }
+
+    fn init_rx_addrs_generic(&mut self, rar_count: u16) {
+        if axdriver_net::igc::mac::igc_init_rx_addrs_generic(self, self.mac.address, rar_count)
+            .is_err()
+        {
+            self.mac.get_link_status = true;
+        }
+    }
+
+    fn setup_link(&mut self) -> i32 {
+        let mut mac = self.mac.clone();
+        let result = axdriver_net::igc::mac::igc_setup_link_generic(self, &mut mac);
+        self.mac = mac;
+        result.map_or(-1, |_| 0)
+    }
+
+    fn clear_hw_counters(&mut self) {
+        axdriver_net::igc::mac::igc_clear_hw_cntrs_base_generic(self);
+    }
+
+    fn check_reset_block_installed(&self) -> bool {
+        true
+    }
+
+    fn enable_mng_pass_thru(&mut self) -> bool {
+        false
+    }
+
+    fn check_reset_block(&mut self) -> bool {
+        phy::igc_check_reset_block_generic(self).is_err()
+    }
+
+    fn power_down_phy_copper(&mut self) {
+        let _ = phy::igc_power_down_phy_copper(self);
+    }
+}
+
+impl<H: IgcHal> axdriver_net::igc::i225::IgcI225ResetIo for I225RegisterIo<'_, H> {
+    fn disable_pcie_master_generic(&mut self) -> i32 {
+        axdriver_net::igc::mac::igc_disable_pcie_master_generic(self)
+            .map(|_| 0)
+            .unwrap_or(-1)
+    }
+
+    fn get_auto_rd_done_generic(&mut self) -> i32 {
+        axdriver_net::igc::mac::igc_get_auto_rd_done_generic(self)
+            .map(|_| 0)
+            .unwrap_or(-1)
+    }
+
+    fn check_alt_mac_addr_generic(&mut self) -> i32 {
+        match axdriver_net::igc::mac::igc_check_alt_mac_addr_generic(self, 0) {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
+    }
+}
+
+fn map_i225_nvm_error(
+    error: axdriver_net::igc::i225::I225NvmError,
+) -> axdriver_net::igc::nvm::NvmError {
+    use axdriver_net::igc::{i225::I225NvmError, nvm::NvmError};
+    match error {
+        I225NvmError::Bounds => NvmError::Bounds,
+        I225NvmError::Sync => NvmError::Sync,
+        I225NvmError::Timeout => NvmError::Timeout,
+        I225NvmError::Hardware => NvmError::Io,
+    }
+}
+
+impl<H: IgcHal> axdriver_net::igc::i225::IgcI225NvmIo for I225RegisterIo<'_, H> {
+    fn read_nvm_eerd(
+        &mut self,
+        offset: u16,
+        data: &mut [u16],
+    ) -> Result<(), axdriver_net::igc::i225::I225NvmError> {
+        const EERD: u32 = 0x12014;
+        const ADDR_SHIFT: u32 = 2;
+        const START: u32 = 1;
+        const DONE: u32 = 2;
+        const DATA_SHIFT: u32 = 16;
+        for (index, word) in data.iter_mut().enumerate() {
+            <Self as IgcI225Io>::write(
+                self,
+                EERD,
+                ((u32::from(offset) + index as u32) << ADDR_SHIFT) | START,
+            );
+            axdriver_net::igc::nvm::igc_poll_eerd_eewr_done(self, false)
+                .map_err(|_| axdriver_net::igc::i225::I225NvmError::Timeout)?;
+            let value = <Self as IgcI225Io>::read(self, EERD);
+            if value & DONE == 0 {
+                return Err(axdriver_net::igc::i225::I225NvmError::Hardware);
+            }
+            *word = (value >> DATA_SHIFT) as u16;
+        }
+        Ok(())
+    }
+
+    fn validate_nvm_checksum_generic(
+        &mut self,
+    ) -> Result<(), axdriver_net::igc::i225::I225NvmError> {
+        axdriver_net::igc::nvm::igc_validate_nvm_checksum_generic(self)
+            .map(|_| ())
+            .map_err(|_| axdriver_net::igc::i225::I225NvmError::Hardware)
+    }
+
+    fn update_flash_i225(&mut self) -> Result<(), axdriver_net::igc::i225::I225NvmError> {
+        axdriver_net::igc::i225::igc_update_flash_i225(self)
+            .map_err(|_| axdriver_net::igc::i225::I225NvmError::Hardware)
+    }
+
+    fn poll_eerd_read_done(&mut self) -> Result<(), axdriver_net::igc::i225::I225NvmError> {
+        axdriver_net::igc::nvm::igc_poll_eerd_eewr_done(self, false)
+            .map_err(|_| axdriver_net::igc::i225::I225NvmError::Timeout)
+    }
+}
+
+impl<H: IgcHal> IgcApiBackend for I225RegisterIo<'_, H> {
+    fn invoke(
+        &mut self,
+        callback: IgcApiCallback,
+        request: IgcApiRequest,
+    ) -> axdriver_base::DevResult<IgcApiValue> {
+        match (callback, request) {
+            (IgcApiCallback::ReadMacAddrGeneric, IgcApiRequest::None) => Ok(IgcApiValue::Bytes(
+                axdriver_net::igc::nvm::igc_read_mac_addr_generic(self).to_vec(),
+            )),
+            (IgcApiCallback::PhyResetI225, IgcApiRequest::None) => {
+                let phy = self.phy.clone();
+                phy::igc_phy_hw_reset_generic(self, &phy)
+                    .map_err(|_| axdriver_base::DevError::Io)?;
+                Ok(IgcApiValue::Unit)
+            }
+            (IgcApiCallback::GetPhyIdGeneric, IgcApiRequest::None) => {
+                let mut phy = self.phy.clone();
+                phy::igc_get_phy_id(self, &mut phy, true)
+                    .map_err(|_| axdriver_base::DevError::Io)?;
+                self.phy = phy.clone();
+                Ok(IgcApiValue::U32(phy.id))
+            }
+            (IgcApiCallback::ResetHwI225, IgcApiRequest::None) => {
+                if axdriver_net::igc::i225::igc_reset_hw_i225(self) != 0 {
+                    return Err(axdriver_base::DevError::Io);
+                }
+                Ok(IgcApiValue::Unit)
+            }
+            (IgcApiCallback::SetupLinkI225, IgcApiRequest::None) => {
+                let mut mac = self.mac.clone();
+                axdriver_net::igc::mac::igc_setup_link_generic(self, &mut mac)
+                    .map_err(|_| axdriver_base::DevError::Io)?;
+                self.mac = mac;
+                Ok(IgcApiValue::Unit)
+            }
+            (IgcApiCallback::CheckLinkI225, IgcApiRequest::None) => {
+                let result = axdriver_net::igc::i225::igc_check_for_link_i225(self);
+                if result == 0 {
+                    Ok(IgcApiValue::Unit)
+                } else {
+                    Err(axdriver_base::DevError::Io)
+                }
+            }
+            (IgcApiCallback::InitHwI225, IgcApiRequest::None) => {
+                let result = axdriver_net::igc::i225::igc_init_hw_i225(|| {
+                    axdriver_net::igc::base::igc_init_hw_base(
+                        self,
+                        self.mac.rar_entry_count,
+                        self.mac.mta_register_count,
+                        0,
+                    )
+                });
+                if result == 0 {
+                    Ok(IgcApiValue::Unit)
+                } else {
+                    Err(axdriver_base::DevError::Io)
+                }
+            }
+            _ => Err(axdriver_base::DevError::Unsupported),
+        }
+    }
+}
 
 /// The queue size both rings are built with: the vendor driver's default of
 /// 256 descriptors (`IGC_DEFAULT_TXD`/`IGC_DEFAULT_RXD`, `igc.h:442-447`).
@@ -174,8 +838,13 @@ fn probe(
         return None;
     };
 
-    let facts = config_facts(root, bdf, dev_info);
+    let pci_bdf = bdf;
+    let facts = config_facts(root, pci_bdf, dev_info);
     let bdf = facts.bdf.clone();
+    let mut shared = IgcHardware::new(facts.device_id, true);
+    shared.revision_id = facts.revision;
+    shared.subsystem_vendor_id = facts.subsystem_vendor_id;
+    shared.subsystem_device_id = facts.subsystem_device_id;
     info!("igc: {}: {}", facts.bdf, facts.describe());
 
     // Phase 1: identify.  A BAR that cannot hold the registers this driver
@@ -227,18 +896,151 @@ fn probe(
         return Some(None);
     }
 
-    // Phase 2: bring the link up.  No packets yet, and the report says so.
-    let up = match igc::bringup::bring_up(&mut bus) {
-        Ok(up) => up,
+    // Match FreeBSD's bus-master gate before the translated PHY helper and
+    // later DMA-ring setup can let the device access memory.
+    let mut pci_io = I225PciIo { root, bdf: pci_bdf };
+    if let Err(error) = igc_enable_pci_busmaster(&mut pci_io) {
+        warn!("igc: {bdf}: PCI bus-master enable failed: {error:?}");
+        return Some(None);
+    }
+    drop(pci_io);
+
+    // Install the FreeBSD shared-code operation tables for the identified
+    // I225, then run translated MAC and NVM parameter initialization against
+    // live PCI/MMIO facts. PHY reset/ID callback execution remains deferred
+    // until the full callback backend is connected.
+    let mut api_backend = ApiTableOnlyBackend;
+    if let Err(error) = igc_setup_init_funcs(&mut shared, &mut api_backend, false) {
+        warn!("igc: {bdf}: translated shared operation setup failed: {error:?}");
+        return Some(None);
+    }
+    if shared.mac_type != Some(axdriver_net::igc::api::IgcMacType::I225)
+        || shared.mac_ops.reset_hw.is_none()
+        || shared.nvm_ops.read.is_none()
+        || shared.phy_ops.read.is_none()
+    {
+        warn!("igc: {bdf}: translated I225 operation tables are incomplete");
+        return Some(None);
+    }
+    init_mac_params_i225(&mut shared);
+    let eecd = bus
+        .read(regs::named("IGC_EECD").expect("EECD is in the named register map"))
+        .unwrap_or(0);
+    let flash_present = {
+        let mut io = I225RegisterIo {
+            bus: &mut bus,
+            clear_semaphore_once: false,
+            nvm_word_size: 0,
+            nvm_kind: axdriver_net::igc::nvm::NvmKind::Other,
+            phy: PhyState::default(),
+            mac: MacState::default(),
+        };
+        igc_get_flash_presence_i225(&mut io)
+    };
+    init_nvm_params_i225(&mut shared, eecd, flash_present);
+    let mut phy_io = I225RegisterIo {
+        bus: &mut bus,
+        clear_semaphore_once: shared.mac_info.clear_semaphore_once,
+        nvm_word_size: shared.nvm_info.word_size,
+        nvm_kind: match shared.nvm_info.nvm_type {
+            axdriver_net::igc::api::IgcNvmType::EepromSpi => axdriver_net::igc::nvm::NvmKind::Spi,
+            axdriver_net::igc::api::IgcNvmType::FlashHardware
+            | axdriver_net::igc::api::IgcNvmType::Invm => axdriver_net::igc::nvm::NvmKind::Other,
+        },
+        phy: PhyState::default(),
+        mac: MacState::default(),
+    };
+    if let Err(error) = init_phy_params_i225(&mut shared, &mut phy_io) {
+        warn!("igc: {bdf}: translated I225 PHY reset/identity failed: {error:?}");
+        return Some(None);
+    }
+    let mut phy_state = phy_io.phy.clone();
+    phy_state.id = shared.phy_info.phy_id;
+    phy_state.revision = shared.phy_info.phy_id & 0xf;
+    phy_state.autoneg_mask = shared.phy_info.autoneg_mask as u16;
+    phy_state.autoneg_advertised = phy_state.autoneg_mask;
+    phy_state.reset_delay_usec = shared.phy_info.reset_delay_usec;
+    drop(phy_io);
+
+    // Run the translated I225 reset, NVM address, RAR, and link setup paths
+    // through the installed shared operation tables. The former local
+    // bring-up sequence is no longer the live device path.
+    let mac_state = MacState {
+        address: [0; 6],
+        permanent_address: [0; 6],
+        asf_firmware_present: shared.mac_info.asf_firmware_present,
+        rar_entry_count: shared.mac_info.rar_entry_count,
+        mta_register_count: shared.mac_info.mta_register_count,
+        get_link_status: true,
+        ..MacState::default()
+    };
+    let mut mac_io = I225RegisterIo {
+        bus: &mut bus,
+        clear_semaphore_once: shared.mac_info.clear_semaphore_once,
+        nvm_word_size: shared.nvm_info.word_size,
+        nvm_kind: match shared.nvm_info.nvm_type {
+            axdriver_net::igc::api::IgcNvmType::EepromSpi => axdriver_net::igc::nvm::NvmKind::Spi,
+            axdriver_net::igc::api::IgcNvmType::FlashHardware
+            | axdriver_net::igc::api::IgcNvmType::Invm => axdriver_net::igc::nvm::NvmKind::Other,
+        },
+        phy: phy_state,
+        mac: mac_state.clone(),
+    };
+    if let Err(error) = axdriver_net::igc::api::igc_reset_hw(&shared, &mut mac_io) {
+        warn!("igc: {bdf}: translated I225 reset failed: {error:?}");
+        return Some(None);
+    }
+    let source_mac = match igc_read_mac_addr(&mut mac_io) {
+        Ok(address) => address,
         Err(error) => {
-            warn!("igc: bring-up {bdf} failed: {}", error.describe());
+            warn!("igc: {bdf}: translated shared MAC read failed: {error:?}");
             return Some(None);
         }
     };
-    info!("{}", up.render(&bdf));
+    if source_mac == [0; 6] || source_mac == [0xff; 6] || source_mac[0] & 1 != 0 {
+        warn!("igc: {bdf}: translated shared MAC read returned an invalid station address");
+        return Some(None);
+    }
+    mac_io.mac.address = source_mac;
+    mac_io.mac.permanent_address = source_mac;
+    if let Err(error) = axdriver_net::igc::api::igc_init_hw(&shared, &mut mac_io) {
+        warn!("igc: {bdf}: translated I225 MAC initialization failed: {error:?}");
+        return Some(None);
+    }
+    mac_io.mac.get_link_status = true;
+    let mut link_up = false;
+    for _ in 0..500 {
+        if let Err(error) = axdriver_net::igc::api::igc_check_for_link(&shared, &mut mac_io) {
+            warn!("igc: {bdf}: translated link check failed: {error:?}");
+            return Some(None);
+        }
+        if !mac_io.mac.get_link_status {
+            link_up = true;
+            break;
+        }
+        axhal::time::busy_wait(core::time::Duration::from_millis(10));
+    }
+    if !link_up {
+        warn!("igc: {bdf}: translated I225 link setup timed out");
+        return Some(None);
+    }
+    let status = <I225RegisterIo<'_, IgcHalImpl> as IgcI225Io>::read(&mut mac_io, STATUS);
+    let station = axdriver_net::igc::StationAddress {
+        bytes: source_mac,
+        low: <I225RegisterIo<'_, IgcHalImpl> as IgcI225Io>::read(&mut mac_io, 0x05400),
+        high: <I225RegisterIo<'_, IgcHalImpl> as IgcI225Io>::read(&mut mac_io, 0x05404),
+        address_valid: <I225RegisterIo<'_, IgcHalImpl> as IgcI225Io>::read(&mut mac_io, 0x05404)
+            & (1 << 31)
+            != 0,
+    };
+    info!(
+        "igc: {bdf}: translated shared setup link-up status={status:#010x} MAC={}",
+        station.describe()
+    );
+    drop(mac_io);
 
     // Phase 3: take the device over.
-    let nic = match IgcNic::<IgcHalImpl, QUEUE_SIZE>::init(bus, &up.station) {
+    let nic = match IgcNic::<IgcHalImpl, QUEUE_SIZE>::init(bus, &station, shared) {
         Ok(nic) => nic,
         Err(error) => {
             warn!(
@@ -250,7 +1052,7 @@ fn probe(
     info!(
         "igc: {bdf}: {QUEUE_SIZE} descriptors in each ring, station address {}; the interface is \
          ready, it polls, and it takes no interrupts",
-        up.station.describe(),
+        station.describe(),
     );
     Some(Some(nic))
 }

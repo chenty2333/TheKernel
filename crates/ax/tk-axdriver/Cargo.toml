@@ -32,7 +32,7 @@ repository.workspace = true
 
 [features]
 intel-hda = ["bus-pci", "dep:axdriver_hda", "dep:axalloc", "dep:axhal", "dep:spin"]
-nvme = ["block", "bus-pci", "dep:axdriver_nvme", "dep:axalloc", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq"]
+nvme = ["block", "bus-pci", "dep:axdriver_nvme", "dep:axalloc", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq", "dep:tk-vtd"]
 usb-dbc = ["usb-xhci", "dep:axdriver_dbc"]
 itco = ["dep:axdriver_watchdog", "dep:kspin", "dep:axhal", "dep:axklib"]
 ahci = [
@@ -41,6 +41,10 @@ ahci = [
     "dep:axhal",
     "dep:axconfig",
 ]
+# Native FreeBSD AHCI translation plus the PCI frontend.
+ahci-pci = ["ahci", "bus-pci", "dep:axalloc", "dep:axklib", "block-irq"]
+sdhci-pci = ["block", "bus-pci", "dep:axklib", "dep:axalloc", "block-irq"]
+block-irq = ["block", "bus-pci", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq", "dep:spin", "dep:tk-vtd"]
 block = ["dep:axdriver_block"]
 bus-mmio = []
 bus-pci = [
@@ -51,7 +55,10 @@ bus-pci = [
     "dep:axsync",
     "dep:lazyinit",
 ]
-default = ["bus-pci"]
+default = ["bus-pci", "ahci-pci", "vtd"]
+i2c = ["bus-pci", "dep:tk-i2c", "dep:spin", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq", "dep:tk-vtd"]
+i2c-hid = ["i2c", "input", "dep:tk-i2c-hid"]
+vtd = ["dep:tk-vtd"]
 display = ["dep:axdriver_display"]
 dyn = [
     "dep:axerrno",
@@ -65,7 +72,7 @@ dyn = [
 ]
 input = ["dep:axdriver_input"]
 irq = ["axdriver_virtio?/irq"]
-n305-net = ["igc", "rtl8125", "virtio-net"]
+n305-net = ["igc", "rtl8125", "virtio-net", "iwx"]
 rtl8125 = ["net", "axdriver_net/rtl8125", "dep:axalloc", "dep:axhal"]
 rtl8168 = ["rtl8125", "axhal/irq"]
 igc = [
@@ -74,6 +81,8 @@ igc = [
     "dep:axalloc",
     "dep:axhal",
 ]
+iwx = ["net", "bus-pci", "dep:axdriver_iwx", "dep:axalloc", "dep:axhal", "dep:spin", "dep:tk_net80211", "dep:tk-vtd"]
+e1000 = ["net", "bus-pci", "axdriver_net/e1000", "dep:axalloc", "dep:axhal"]
 ixgbe = [
     "net",
     "axdriver_net/ixgbe",
@@ -107,6 +116,9 @@ usb-xhci = [
     "dep:ax-sync",
     "dep:ax-crate-interface",
     "dep:kernel_guard",
+    "dep:axtask",
+    "axtask/multitask",
+    "dep:axpoll",
 ]
 virtio = [
     "dep:axdriver_virtio",
@@ -151,6 +163,12 @@ path = "src/lib.rs"
 [dependencies.axalloc]
 package = "tk-axalloc"
 path = "../tk-axalloc"
+version = "0.1.0"
+optional = true
+
+[dependencies.axpoll]
+package = "tk-axpoll"
+path = "../tk-axpoll"
 version = "0.1.0"
 optional = true
 
@@ -339,3 +357,28 @@ optional = true
 package = "tk-axdriver-dbc"
 path = "../tk-axdriver-dbc"
 optional = true
+
+[dependencies.axdriver_iwx]
+package = "tk-axdriver-iwx"
+path = "../tk-axdriver-iwx"
+optional = true
+
+[dependencies.tk_net80211]
+package = "tk-net80211"
+path = "../tk-net80211"
+optional = true
+
+[dependencies.tk-i2c]
+path = "../tk-i2c"
+optional = true
+
+[dependencies.tk-i2c-hid]
+path = "../tk-i2c-hid"
+optional = true
+
+[dependencies.tk-vtd]
+path = "../tk-vtd"
+optional = true
+
+[dependencies.tk-bt-hci]
+path = "../tk-bt-hci"

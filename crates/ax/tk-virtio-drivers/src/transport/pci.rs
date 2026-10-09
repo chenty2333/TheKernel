@@ -16,7 +16,7 @@ use self::bus::{Command, DeviceFunction, DeviceFunctionInfo, PCI_CAP_ID_VNDR, Pc
 use super::{DeviceStatus, DeviceType, SharedMemoryRegion, Transport};
 use crate::{
     Error,
-    hal::{Hal, PhysAddr},
+    hal::{DmaRequester, Hal, PhysAddr},
     nonnull_slice_from_raw_parts,
     volatile::{
         ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly, volread, volwrite,
@@ -104,6 +104,7 @@ pub fn virtio_device_type(device_function_info: &DeviceFunctionInfo) -> Option<D
 #[derive(Debug)]
 pub struct PciTransport {
     device_type: DeviceType,
+    device_id: u16,
     /// The bus, device and function identifier for the VirtIO device.
     device_function: DeviceFunction,
     /// The common configuration structure within some BAR.
@@ -120,6 +121,8 @@ pub struct PciTransport {
     shared_memory: [Option<SharedMemoryRegion>; 256],
     /// Set after a device wrapper observed status zero and completed reset.
     reset_complete: bool,
+    /// True only after ACCESS_PLATFORM was negotiated.
+    dma_access_platform: bool,
     /// A malformed notify offset was observed and the device was failed.
     notify_faulted: bool,
 }
@@ -298,6 +301,7 @@ impl PciTransport {
 
         Ok(Self {
             device_type,
+            device_id,
             device_function,
             common_cfg,
             notify_region,
@@ -308,6 +312,7 @@ impl PciTransport {
             config_space,
             shared_memory,
             reset_complete: false,
+            dma_access_platform: false,
             notify_faulted: false,
         })
     }
@@ -389,6 +394,20 @@ fn get_bar_physical_range(
 }
 
 impl Transport for PciTransport {
+    fn dma_requester(&self) -> Option<DmaRequester> {
+        Some(DmaRequester {
+            segment: 0,
+            bus: self.device_function.bus,
+            device: self.device_function.device,
+            function: self.device_function.function,
+            access_platform: self.dma_access_platform,
+        })
+    }
+
+    fn set_dma_access_platform(&mut self, enabled: bool) {
+        self.dma_access_platform = enabled;
+    }
+
     fn shared_memory_region(&self, id: u8) -> Option<SharedMemoryRegion> {
         self.shared_memory[id as usize]
     }
@@ -405,6 +424,14 @@ impl Transport for PciTransport {
             volwrite!(self.common_cfg, device_feature_select, 1);
             device_features_bits |= (volread!(self.common_cfg, device_feature) as u64) << 32;
             device_features_bits
+        }
+    }
+
+    fn common_features(&self) -> u64 {
+        if self.device_id >= PCI_DEVICE_ID_OFFSET {
+            (1 << 32) | (1 << 33)
+        } else {
+            0
         }
     }
 
@@ -847,6 +874,7 @@ mod tests {
         let mut isr = Volatile::new(3u8);
         let mut transport = PciTransport {
             device_type: DeviceType::Block,
+            device_id: TRANSITIONAL_BLOCK,
             device_function: DeviceFunction {
                 bus: 0,
                 device: 6,
@@ -863,6 +891,7 @@ mod tests {
             config_space: None,
             shared_memory: [None; 256],
             reset_complete: true,
+            dma_access_platform: false,
             notify_faulted: false,
         };
         assert!(!transport.enable_interrupts());

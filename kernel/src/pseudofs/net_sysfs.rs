@@ -85,6 +85,15 @@ impl SimpleDirOps for NetClass {
             "ifindex",
             SimpleFile::new_regular(self.fs.clone(), move || Ok(format!("{index}\n"))),
         );
+        if axnet::wireless_interfaces()
+            .iter()
+            .any(|wireless| wireless.ifindex == index)
+        {
+            device.add(
+                "wireless",
+                SimpleDir::new_maker(self.fs.clone(), Arc::new(DirMapping::new())),
+            );
+        }
         Ok(SimpleDir::new_maker(self.fs.clone(), Arc::new(device)).into())
     }
     fn is_cacheable(&self) -> bool {
@@ -98,11 +107,69 @@ pub(super) fn class_root(fs: Arc<SimpleFs>) -> DirMapping {
         .or_else(crate::file::netlink::initial_network_namespace);
     let mut root = DirMapping::new();
     if let Some(namespace) = namespace {
-        let maker: DirMaker =
-            SimpleDir::new_maker(fs.clone(), Arc::new(NetClass { fs, namespace }));
+        let maker: DirMaker = SimpleDir::new_maker(
+            fs.clone(),
+            Arc::new(NetClass {
+                fs: fs.clone(),
+                namespace,
+            }),
+        );
         root.add("net", maker);
+        root.add(
+            "ieee80211",
+            SimpleDir::new_maker(fs.clone(), Arc::new(WirelessPhyClass { fs })),
+        );
     }
     root
+}
+
+struct WirelessPhyClass {
+    fs: Arc<SimpleFs>,
+}
+impl SimpleDirOps for WirelessPhyClass {
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
+        let phys = axnet::wireless_interfaces();
+        let mut names = Vec::new();
+        names
+            .try_reserve(phys.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        let mut seen = alloc::collections::BTreeSet::new();
+        for phy in phys {
+            let name = format!("phy{}", phy.phy_index);
+            if seen.insert(phy.phy_index) {
+                names.push(Cow::Owned(FsNameBuf::from_vec(name.into_bytes())?));
+            }
+        }
+        try_boxed_names(names.into_iter())
+    }
+
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
+        let phy = axnet::wireless_interfaces()
+            .into_iter()
+            .find(|phy| format!("phy{}", phy.phy_index).as_bytes() == name.as_bytes())
+            .ok_or(VfsError::NotFound)?;
+        let mut entries = DirMapping::new();
+        let index = phy.phy_index;
+        entries.add(
+            "index",
+            SimpleFile::new_regular(self.fs.clone(), move || Ok(format!("{index}\n"))),
+        );
+        let mac = phy.mac_address;
+        entries.add(
+            "macaddress",
+            SimpleFile::new_regular(self.fs.clone(), move || {
+                Ok(format!(
+                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                ))
+            }),
+        );
+        Ok(SimpleDir::new_maker(self.fs.clone(), Arc::new(entries)).into())
+    }
+
+    fn is_cacheable(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

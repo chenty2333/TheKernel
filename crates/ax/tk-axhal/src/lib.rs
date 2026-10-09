@@ -974,6 +974,16 @@ pub mod acpi {
         #[cfg(all(target_os="none",feature="defplat",feature="irq"))] { axplat_x86_pc::remove_acpica_sci(vector); }
         #[cfg(not(all(target_os="none",feature="defplat",feature="irq")))] { let _=vector; }
     }
+    /// Install a directly routable ACPI-described GSI. Unsupported IOAPIC
+    /// topologies and MADT overrides fail closed.
+    pub fn install_gsi(irq:u32, level:bool, low_active:bool, handler:fn())->Option<usize> {
+        #[cfg(all(target_os="none",feature="defplat",feature="irq"))] { axplat_x86_pc::install_acpi_gsi(irq,level,low_active,handler) }
+        #[cfg(not(all(target_os="none",feature="defplat",feature="irq")))] { let _=(irq,level,low_active,handler);None }
+    }
+    pub fn remove_gsi(vector:usize) {
+        #[cfg(all(target_os="none",feature="defplat",feature="irq"))] { axplat_x86_pc::remove_acpi_gsi(vector); }
+        #[cfg(not(all(target_os="none",feature="defplat",feature="irq")))] { let _=vector; }
+    }
     pub fn register_off(callback:fn()->bool) {
         #[cfg(all(target_os="none",feature="defplat"))] { axplat_x86_pc::register_acpica_off(callback); }
         #[cfg(not(all(target_os="none",feature="defplat")))] { let _=callback; }

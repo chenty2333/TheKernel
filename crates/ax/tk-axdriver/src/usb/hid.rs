@@ -16,7 +16,7 @@ struct InputState {
     _owner: DeviceOwner,
     endpoint: crab_usb::EndpointHandle,
     report: Box<[u8; 64]>,
-    parser: super::hid_report::Report,
+    parser: crate::hid_report::Report,
     report_len: usize,
     pending: Option<RequestId>,
     events: VecDeque<Event>,
@@ -54,7 +54,7 @@ impl UsbInput {
                 &mut descriptor_bytes,
             ))?
             .map_err(|_| DevError::Io)?;
-        let parser = super::hid_report::Report::parse(
+        let parser = crate::hid_report::Report::parse(
             &descriptor_bytes[..length.min(descriptor_bytes.len())],
         )?;
         let id = InputDeviceId {

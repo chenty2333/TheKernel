@@ -1,11 +1,10 @@
 //! PCI xHCI host integration. Class drivers use the existing block/evdev APIs.
+mod bluetooth;
 mod dma;
 mod hid;
-mod hid_report;
-mod hid_usage;
-mod storage;
-mod root_partition;
 pub mod observations;
+mod root_partition;
+mod storage;
 mod sync;
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -18,6 +17,7 @@ use core::{
 };
 
 use axdriver_base::{BaseDriverOps, DevError, DevResult};
+pub use bluetooth::{UsbBluetoothHci, bluetooth_devices};
 use crab_usb::{
     DmaCoherency, EventHandler, USBHost,
     device::{Device, InterfaceSession},
@@ -171,8 +171,13 @@ fn class_control(
 /// Called only after the existing PCI enumerator has mapped/enabled BAR0.
 fn supported_interface(interface: &InterfaceDescriptor) -> bool {
     interface.alternate_setting == 0
-        && (interface.class == 3
+        && (is_bluetooth_hci(interface.class, interface.subclass, interface.protocol)
+            || interface.class == 3
             || (interface.class == 8 && interface.subclass == 6 && interface.protocol == 0x50))
+}
+
+fn is_bluetooth_hci(class: u8, subclass: u8, protocol: u8) -> bool {
+    class == 0xe0 && subclass == 1 && protocol == 1
 }
 
 pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
@@ -198,11 +203,16 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
     for probed in changes.connected {
         let mut observation = bus.and_then(|bus| match observations::observe(bus, &probed) {
             Ok(observation) => observation,
-            Err(error) => { warn!("USB observation unavailable: {error:?}"); None }
+            Err(error) => {
+                warn!("USB observation unavailable: {error:?}");
+                None
+            }
         });
 
         let Some(info) = probed.into_device_info() else {
-            if let Some(observation) = observation.take() { observations::publish(observation); }
+            if let Some(observation) = observation.take() {
+                observations::publish(observation);
+            }
             continue;
         };
         let selected = info.configurations().iter().find(|config| {
@@ -213,7 +223,9 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
                 .any(supported_interface)
         });
         let Some(config) = selected else {
-            if let Some(observation) = observation.take() { observations::publish(observation); }
+            if let Some(observation) = observation.take() {
+                observations::publish(observation);
+            }
             continue;
         };
         let opened: DevResult<Arc<Mutex<Device>>> = (|| {
@@ -225,9 +237,13 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
             Arc::try_new(Mutex::new(device)).map_err(|_| DevError::NoMemory)
         })();
         if opened.is_ok() {
-            if let Some(observation) = &mut observation { observation.location.configuration = Some(config.configuration_value); }
+            if let Some(observation) = &mut observation {
+                observation.location.configuration = Some(config.configuration_value);
+            }
         }
-        if let Some(observation) = observation.take() { observations::publish(observation); }
+        if let Some(observation) = observation.take() {
+            observations::publish(observation);
+        }
         let device = match opened {
             Ok(device) => device,
             Err(error) => {
@@ -245,7 +261,7 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
             .flat_map(|group| &group.alt_settings)
             .filter(|i| supported_interface(i))
         {
-            let result: DevResult<crate::AxDeviceEnum> = (|| {
+            let result: DevResult<Option<crate::AxDeviceEnum>> = (|| {
                 let mut guard = device.lock();
                 let session = host
                     .wait(guard.claim_interface(interface.interface_number, 0))?
@@ -260,21 +276,42 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
                     )?;
                 }
                 drop(guard);
+                if is_bluetooth_hci(interface.class, interface.subclass, interface.protocol) {
+                    static NEXT_BT_INDEX: core::sync::atomic::AtomicU16 =
+                        core::sync::atomic::AtomicU16::new(0);
+                    let bluetooth = bluetooth::UsbBluetoothHci::new(
+                        host.clone(),
+                        device.clone(),
+                        session,
+                        interface,
+                        NEXT_BT_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                    )?;
+                    bluetooth::register(bluetooth);
+                    info!(
+                        "USB Bluetooth HCI interface {} registered",
+                        interface.interface_number
+                    );
+                    return Ok(None);
+                }
                 if interface.class == 3 {
                     let input = UsbInput::new(host.clone(), device.clone(), session, interface)?;
                     #[cfg(not(feature = "dyn"))]
-                    return Ok(crate::AxDeviceEnum::Input(crate::AxInputDevice::Usb(input)));
+                    return Ok(Some(crate::AxDeviceEnum::Input(crate::AxInputDevice::Usb(
+                        input,
+                    ))));
                     #[cfg(feature = "dyn")]
-                    return Ok(crate::AxDeviceEnum::Input(Box::new(input)));
+                    return Ok(Some(crate::AxDeviceEnum::Input(Box::new(input))));
                 }
                 let block = UsbBlock::new(host.clone(), device.clone(), session, interface)?;
                 #[cfg(not(feature = "dyn"))]
-                return Ok(crate::AxDeviceEnum::Block(crate::AxBlockDevice::Usb(block)));
+                return Ok(Some(crate::AxDeviceEnum::Block(crate::AxBlockDevice::Usb(
+                    block,
+                ))));
                 #[cfg(feature = "dyn")]
-                return Ok(crate::AxDeviceEnum::Block(Box::new(block)));
+                return Ok(Some(crate::AxDeviceEnum::Block(Box::new(block))));
             })();
             match result {
-                Ok(device) => {
+                Ok(Some(device)) => {
                     info!(
                         "USB registered {} interface {}",
                         device.device_name(),
@@ -282,6 +319,7 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
                     );
                     devices.push(device);
                 }
+                Ok(None) => {}
                 Err(error) => warn!(
                     "USB {:04x}:{:04x} interface {} failed: {error:?}",
                     info.vendor_id(),
@@ -294,4 +332,17 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
     guard.armed = false;
     Box::leak(controller);
     Ok(devices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_bluetooth_hci;
+
+    #[test]
+    fn bluetooth_requires_hci_interface_subclass_and_protocol() {
+        assert!(is_bluetooth_hci(0xe0, 1, 1));
+        assert!(!is_bluetooth_hci(0xe0, 0, 0));
+        assert!(!is_bluetooth_hci(0xe0, 1, 2));
+        assert!(!is_bluetooth_hci(3, 1, 1));
+    }
 }

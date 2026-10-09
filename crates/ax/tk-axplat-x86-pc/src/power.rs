@@ -301,6 +301,29 @@ pub fn install_acpica_sci(irq:u32,handler:fn())->Option<usize> {
     if !axplat::irq::register(vector,handler){return None;}
     ACPICA_SCI.store(true,Ordering::Release);Some(vector)
 }
+#[cfg(feature = "irq")]
+pub fn install_acpi_gsi(irq: u32, level: bool, low_active: bool, handler: fn()) -> Option<usize> {
+    if irq < 16 { return None; }
+    let facts = crate::cpu::apic_facts()?;
+    if facts.io_apic_count != 1
+        || facts.io_apic_gsi_base != 0
+        || facts.override_total != facts.overrides().len()
+        || facts.overrides().iter().any(|entry| entry.gsi == irq || entry.source as u32 == irq)
+    {
+        return None;
+    }
+    let vector = usize::try_from(irq).ok()?.checked_add(0x20)?;
+    if vector >= 0xef || !crate::apic::configure_acpi_gsi(vector, level, low_active) {
+        return None;
+    }
+    if !axplat::irq::register(vector, handler) { return None; }
+    Some(vector)
+}
+#[cfg(feature = "irq")]
+pub fn remove_acpi_gsi(vector: usize) {
+    crate::apic::set_enable(vector, false);
+    let _ = axplat::irq::unregister(vector);
+}
 #[cfg(feature="irq")]
 pub fn remove_acpica_sci(vector:usize){if ACPICA_SCI.swap(false,Ordering::AcqRel){let _=axplat::irq::unregister(vector);}}
 pub fn restore_static_acpi() {

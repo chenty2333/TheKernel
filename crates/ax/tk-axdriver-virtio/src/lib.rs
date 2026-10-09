@@ -44,7 +44,7 @@ mod socket;
 use axdriver_base::{DevError, DeviceType};
 use virtio_drivers::transport::DeviceType as VirtIoDevType;
 pub use virtio_drivers::{
-    BufferDirection, DmaMapping, Error as VirtIoError, Hal as VirtIoHal, PhysAddr,
+    BufferDirection, DmaMapping, DmaRequester, Error as VirtIoError, Hal as VirtIoHal, PhysAddr,
     Result as VirtIoResult,
     device::entropy::VirtIOEntropy,
     stats::{

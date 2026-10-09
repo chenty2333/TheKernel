@@ -39,11 +39,13 @@ Environment overrides:
   THEKERNEL_ROOTFS_OWNER_MODE image ownership (default: root; use preserve
                                 when fakeroot is intentionally unavailable)
   THEKERNEL_TOOLCHAIN         guest tool payload name (default: none); it
-                                selects which cases the suite contains, so it
-                                is compiled into the image, not just recorded;
-                                the payload itself is staged separately
+                                selects image-specific tests where applicable;
+                                wireless tools are copied via
+                                THEKERNEL_ROOTFS_TOOLS_DIR
   THEKERNEL_ROOTFS_TOOLS_DIR  tree of guest tools to copy into the image
   THEKERNEL_ROOTFS_SIZE_MB    image size (default: 160)
+  THEKERNEL_IWX_FIRMWARE_DIR  linux-firmware tree with AX211 API 89 ucode,
+                              PNVM and LICENCE.iwlwifi_firmware
   THEKERNEL_SOURCE_CACHE      Download cache
 EOF
 }
@@ -287,6 +289,14 @@ EOF
 cat > "$STAGE/etc/group" <<'EOF'
 root:!:0:
 EOF
+if [ "$TOOLCHAIN" = bluez ]; then
+    # Alpine's system D-Bus policy expects the unprivileged messagebus account;
+    # without it dbus-daemon exits before bluetoothd can start or wait for HCI.
+    printf '%s\n' 'messagebus:!:81:81:D-Bus system message bus:/nonexistent:/sbin/nologin' \
+        >> "$STAGE/etc/passwd"
+    printf '%s\n' 'messagebus:!:81:' >> "$STAGE/etc/group"
+    mkdir -p "$STAGE/run/dbus" "$STAGE/var/lib/dbus"
+fi
 chmod 0644 "$STAGE/etc/passwd" "$STAGE/etc/group"
 install -m 0644 "$SOURCE_DIR/LICENSE" \
     "$STAGE/usr/share/licenses/busybox/LICENSE"
@@ -299,6 +309,8 @@ install -m 0644 "$REPO_ROOT/NOTICE" \
 install -m 0755 "$REPO_ROOT/tests/guest/shell-init.sh" \
     "$STAGE/etc/thekernel/shell-init.sh"
 install -m 0755 "$REPO_ROOT/scripts/ci/n305-dhcp.script" "$STAGE/etc/thekernel/n305-dhcp.script"
+install -m 0755 "$REPO_ROOT/tests/guest/bluetooth-bluez-smoke.sh" \
+    "$STAGE/etc/thekernel/bluetooth-bluez-smoke.sh"
 rm -f "$STAGE/sbin/init"
 # The payload selection also selects which cases the suite contains: the
 # native-compilation case is only meaningful when the compiler is installed,
@@ -311,7 +323,8 @@ rm -f "$STAGE/sbin/init"
 # line in the transcript always says which image was booted.
 INIT_DEFINES=""
 case "$TOOLCHAIN" in
-    none|inspect|containers|acpica) ;;
+    none|inspect|containers|acpica|wireless) ;;
+    bluez) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_BLUEZ=1" ;;
     tcc) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1" ;;
     nested) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1 -DTHEKERNEL_TOOL_PAYLOAD_NESTED=1" ;;
     # `glibc` deliberately does not include the tcc case: it is a staging
@@ -408,6 +421,24 @@ if [ -n "${THEKERNEL_RTL8168_FIRMWARE_DIR:-}" ]; then
     done
     install -d "$STAGE/lib/firmware/rtl_nic"
     install -m 0644 "$firmware_dir/rtl8168h-2.fw" "$firmware_dir/LICENSE.r8169" "$STAGE/lib/firmware/rtl_nic/"
+fi
+
+# The AX211 payload is opt-in and sourced from a caller-supplied linux-firmware
+# tree. Validate its API, stage only the matching So/GF files, and carry Intel's
+# firmware grant alongside them.
+if [ -n "${THEKERNEL_IWX_FIRMWARE_DIR:-}" ]; then
+    "$SCRIPT_DIR/build-iwx-firmware-payload.sh" \
+        --source-dir "$THEKERNEL_IWX_FIRMWARE_DIR" --output "$STAGE"
+fi
+
+# Intel CNVi Bluetooth firmware is an explicit, redistributor-supplied rootfs
+# input. Decompress the selected linux-firmware blobs offline and retain Intel's
+# binary redistribution terms next to the staged files.
+if [ -n "${THEKERNEL_INTEL_BT_FIRMWARE_DIR:-}" ]; then
+    firmware_dir=$THEKERNEL_INTEL_BT_FIRMWARE_DIR
+    license_file=${THEKERNEL_INTEL_BT_FIRMWARE_LICENSE:-/usr/share/licenses/linux-firmware/LICENSE.intel}
+    "$SCRIPT_DIR/stage-intel-bt-firmware.sh" \
+        "$firmware_dir" "$STAGE/lib/firmware/intel" "$license_file"
 fi
 
 "$SCRIPT_DIR/create-rootfs-image.sh" \

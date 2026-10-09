@@ -160,6 +160,9 @@ workspace = true
 [features]
 intel-hda = ["tk-kernel/intel-hda"]
 nvme = ["tk-kernel/nvme"]
+ahci = ["tk-kernel/ahci"]
+sdhci = ["tk-kernel/sdhci"]
+e1000 = ["tk-kernel/e1000"]
 usb-dbc = ["tk-kernel/usb-dbc"]
 watchdog-itco = ["tk-kernel/watchdog-itco"]
 # `cargo build` is the shipped x86_64 product, not an accidental reduced

@@ -284,6 +284,48 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn("-bios", command)
         self.assertNotIn("-net none", text)
 
+    def test_vtd_split_topology_uses_modern_virtio_platform_dma(self) -> None:
+        command = build_qemu_command(
+            arch="x86_64",
+            kernel=Path("kernel-x86_64.elf"),
+            rootfs=Drive(Path("root.img"), "snapshot"),
+            direct_kernel=True,
+            kernel_irqchip_split=True,
+            extra_args=("-device", "intel-iommu,intremap=on"),
+        )
+        virtio_devices = [
+            command[index + 1]
+            for index, option in enumerate(command[:-1])
+            if option == "-device" and command[index + 1].startswith("virtio-")
+        ]
+        self.assertGreaterEqual(len(virtio_devices), 3)
+        self.assertTrue(
+            all(
+                "disable-legacy=on" in device and "iommu_platform=on" in device
+                for device in virtio_devices
+            )
+        )
+        self.assertIn("intel-iommu,intremap=on", command)
+
+    def test_modern_virtio_topology_does_not_add_iommu(self) -> None:
+        command = build_qemu_command(
+            arch="x86_64",
+            kernel=Path("kernel-x86_64.elf"),
+            rootfs=Drive(Path("root.img"), "snapshot"),
+            direct_kernel=True,
+            virtio_modern_only=True,
+        )
+        devices = [
+            command[index + 1]
+            for index, option in enumerate(command[:-1])
+            if option == "-device"
+        ]
+        virtio_devices = [device for device in devices if device.startswith("virtio-")]
+        self.assertGreaterEqual(len(virtio_devices), 3)
+        self.assertTrue(all("disable-legacy=on" in device for device in virtio_devices))
+        self.assertTrue(all("iommu_platform=" not in device for device in virtio_devices))
+        self.assertFalse(any("intel-iommu" in device for device in devices))
+
     def test_x86_64_direct_kernel_mode_is_explicit_debug_path(self) -> None:
         command = build_qemu_command(
             arch="x86_64",
@@ -307,6 +349,56 @@ class NvmeTopologyTests(unittest.TestCase):
         self.assertTrue(any("nvme,,a.img" in value and "readonly=on" in value for value in command))
         self.assertTrue(any("virtio-blk-pci" in value for value in command))
         self.assertTrue(any("usb-storage" in value for value in command))
+
+class AhciTopologyTests(unittest.TestCase):
+    def test_ahci_drive_uses_ich9_controller_and_sata_ide_disk(self):
+        command = build_qemu_command(
+            arch="x86_64",
+            kernel=Path("kernel"),
+            rootfs=Drive(Path("root.img"), "snapshot"),
+            direct_kernel=True,
+            ahci_disk=Drive(Path("ahci,disk.img"), "rw"),
+        )
+        self.assertIn("ich9-ahci,id=ahci", command)
+        self.assertIn("ide-hd,drive=ahci-disk,bus=ahci.0", command)
+        drive = next(value for value in command if value.startswith("file=") and "id=ahci-disk" in value)
+        self.assertIn("ahci,,disk.img", drive)
+        self.assertNotIn("readonly=on", drive)
+
+
+class SdhciTopologyTests(unittest.TestCase):
+    def test_sdhci_drive_uses_pci_host_and_sd_card(self):
+        command = build_qemu_command(
+            arch="x86_64", kernel=Path("kernel"),
+            rootfs=Drive(Path("root.img"), "snapshot"), direct_kernel=True,
+            sdhci_disk=Drive(Path("sd-card.img"), "rw"),
+        )
+        self.assertIn("sdhci-pci,id=sdhci", command)
+        self.assertIn("sd-card,drive=sd-card-drive", command)
+        drive = next(value for value in command if value.startswith("file=") and "id=sd-card-drive" in value)
+        self.assertIn("sd-card.img", drive)
+        self.assertNotIn("readonly=on", drive)
+
+
+class E1000TopologyTests(unittest.TestCase):
+    def test_qemu_e1000_family_selects_one_intel_model_on_user_net(self):
+        for model in ("e1000", "e1000e", "igb"):
+            with self.subTest(model=model):
+                command = build_qemu_command(
+                    arch="x86_64", kernel=Path("kernel"),
+                    rootfs=Drive(Path("root.img"), "snapshot"), direct_kernel=True,
+                    e1000_model=model,
+                )
+                self.assertIn(f"{model},netdev=e1000net0,mac=52:54:00:00:00:03", command)
+
+    def test_e1000_optional_tcp_forward_binds_loopback_only(self):
+        command = build_qemu_command(
+            arch="x86_64", kernel=Path("kernel"),
+            rootfs=Drive(Path("root.img"), "snapshot"), direct_kernel=True,
+            e1000_model="e1000", e1000_hostfwd_port=39011,
+        )
+        self.assertIn("user,id=e1000net0,hostfwd=tcp:127.0.0.1:39011-:8080", command)
+
 
 class HdaTopologyTests(unittest.TestCase):
     def test_hda_wav_is_distinct_from_virtio_sound(self):

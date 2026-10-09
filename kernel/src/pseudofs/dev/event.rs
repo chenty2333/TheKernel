@@ -253,7 +253,7 @@ impl EvdevDevice {
 
     /// Open-factory integration hook.  The VFS/OFD layer owns when this is
     /// called; this module deliberately has no global FD-table dependency.
-    pub fn open_client(self: &Arc<Self>) -> Arc<EvdevClient> {
+    pub fn open_client(self: &Arc<Self>) -> AxResult<Arc<EvdevClient>> {
         let id = self.next_client.fetch_add(1, Ordering::Relaxed);
         let lease = self.session_lease.load(Ordering::Acquire);
         let client = Arc::new(EvdevClient {
@@ -270,11 +270,12 @@ impl EvdevDevice {
                 overflowed: false,
             }),
         });
-        self.state
-            .lock()
-            .clients
-            .insert(id, Arc::downgrade(&client));
-        client
+        let mut state = self.state.lock();
+        if state.clients.is_empty() && !self.paused() {
+            state.device.open_input().map_err(map_dev_error)?;
+        }
+        state.clients.insert(id, Arc::downgrade(&client));
+        Ok(client)
     }
 
     fn live_client_count(&self) -> u64 {
@@ -343,7 +344,27 @@ impl EvdevDevice {
     }
 
     pub fn resume(&self) {
-        if self.disconnected() || !self.paused.swap(false, Ordering::AcqRel) {
+        if self.disconnected() || !self.paused.load(Ordering::Acquire) {
+            return;
+        }
+        {
+            let mut state = self.state.lock();
+            let has_clients = state
+                .clients
+                .values()
+                .any(|client| client.strong_count() != 0);
+            if has_clients {
+                if let Err(error) = state.device.open_input() {
+                    warn!("evdev: input open callback failed during resume: {error:?}");
+                    return;
+                }
+            }
+        }
+        if self
+            .paused
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
         if let Some(irq) = self.irq {
@@ -478,7 +499,8 @@ impl EvdevDevice {
                 });
             }
         }
-        let input_source = super::tty::input_trace::InputSource::from_bus(state.device.device_id().bus_type);
+        let input_source =
+            super::tty::input_trace::InputSource::from_bus(state.device.device_id().bus_type);
         let grabbed = state.grab_owner.is_some();
         drop(state);
         // Key handling may switch seats (and pause this very device); never
@@ -595,6 +617,11 @@ impl EvdevDevice {
 
     fn close_client(&self, client: u64) {
         let mut state = self.state.lock();
+        if state.clients.len() == 1 && state.clients.contains_key(&client) {
+            if let Err(error) = state.device.close_input() {
+                warn!("evdev: input close callback failed: {error:?}");
+            }
+        }
         state.clients.remove(&client);
         if state.grab_owner == Some(client) {
             state.grab_owner = None;
@@ -1359,7 +1386,7 @@ impl EvdevFile {
 impl DeviceOps for EvdevNode {
     fn open_description(&self, location: &Location, _flags: u32) -> VfsResult<Option<DeviceOpen>> {
         crate::pseudofs::dev::tty::remember_input_node(location)?;
-        let client = self.device.open_client();
+        let client = self.device.open_client()?;
         let file: Arc<dyn FileLike> = Arc::try_new(EvdevFile {
             client,
             device: self.device.clone(),

@@ -1,0 +1,11 @@
+# Signed Alpine v3.24 x86_64 wireless tools closure; versions/hashes captured from repository APKs.
+# filename	sha256	url	license	origin
+dbus-libs-1.16.2-r2.apk	105f6ba17454c587ca9345f9deb348012d1950588a22da42120c954d396c99b6	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/dbus-libs-1.16.2-r2.apk	AFL-2.1 OR GPL-2.0-or-later	dbus
+iw-6.17-r0.apk	fa011d7ca3e49b6262a4fda3790cb5fa0c9ff6e3078e7c592798fb049f2c8769	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/iw-6.17-r0.apk	ISC	iw
+libcrypto3-3.5.9-r0.apk	6632d758d8f5e9ea3b650fe966f23bbf9a202f8b8dceecac93da135dec5e3689	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libcrypto3-3.5.9-r0.apk	Apache-2.0	openssl
+libnl3-3.11.0-r0.apk	b8c9b0a045b1615027b58618103f3dabeca69aacb80b527ac7b96ba354aba4a4	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libnl3-3.11.0-r0.apk	LGPL-2.1-or-later	libnl3
+libssl3-3.5.9-r0.apk	05e3393fb95aa5751ca2f9d242f659f6cff82c1cc7767cc2df4a086f7ad01877	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libssl3-3.5.9-r0.apk	Apache-2.0	openssl
+musl-1.2.6-r2.apk	573712e2f49c15bfc20a2699f204acdfc74c772722b15e7353d768057fae0e71	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/musl-1.2.6-r2.apk	MIT	musl
+pcsc-lite-libs-2.4.0-r4.apk	f01c9af6f32a01dc385e7959dd2215711ab1037afe45f0cbf34efb19c7cb39ac	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/pcsc-lite-libs-2.4.0-r4.apk	BSD-3-Clause AND BSD-2-Clause AND ISC	pcsc-lite
+wireless-regdb-2025.10.07-r0.apk	1c0ea2a3f34fdb7b3466fbb273e0a89c693c98f3524db87d2a10d5023a5f3cee	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/wireless-regdb-2025.10.07-r0.apk	ISC	wireless-regdb
+wpa_supplicant-2.11-r4.apk	6b3dc3546634cebd64570162b6b399582a83d6d00635d7436804e39a7850a0ef	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/wpa_supplicant-2.11-r4.apk	BSD-3-Clause	wpa_supplicant

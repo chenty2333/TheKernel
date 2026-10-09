@@ -175,3 +175,10 @@ Copyright © 2014-2019 Intel Corporation; MIT grant retained.
 src/guc_fw.rs also translates the GEN11 HuC-authenticated status bit and
 intel_huc_wait_for_auth_complete() polling boundary (MIT, © 2014-2019 Intel).
 GuC CT authentication dispatch is not wired yet.
+
+G2 closeout merge measurement (2026-10-09): current whole crates/ax totals
+against Linux 7.2.3 are 0 fenced and 408 outside-fence matches (399 code) at
+threshold 40; at threshold 25, 18 fenced lines / 15 blocks / 4 files and
+1283 outside-fence matches (1268 code). These supersede historical whole-scope
+counts in this NOTICE. MIT i915 Rust translations are counted, not exempted;
+see docs/upstream-provenance.md for the merged-scope measurement.

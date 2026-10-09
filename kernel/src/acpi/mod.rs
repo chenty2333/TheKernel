@@ -10,16 +10,23 @@ use tk_acpica::{Mode, Status};
 mod ec;
 #[cfg(target_os = "none")]
 mod native;
+pub mod pchgpio;
 #[cfg(target_os = "none")]
 mod pci;
 pub mod thermal;
+#[cfg(target_os = "none")]
+mod vtd;
 #[cfg(target_os = "none")]
 mod wake;
 static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 static BUTTONS: SpinNoIrq<Vec<String>> = SpinNoIrq::new(Vec::new());
 
 fn select_native(option: Option<&str>) -> Result<bool, ()> {
-    match option { None | Some("acpica") => Ok(true), Some("static") => Ok(false), Some(_) => Err(()) }
+    match option {
+        None | Some("acpica") => Ok(true),
+        Some("static") => Ok(false),
+        Some(_) => Err(()),
+    }
 }
 pub fn enabled() -> bool {
     select_native(axhal::boot::command_line_value("acpi")) == Ok(true)
@@ -33,18 +40,30 @@ pub fn namespace() -> Vec<Node> {
 }
 static INIT_TRIED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 pub fn init() {
-    if INIT_TRIED.swap(true, core::sync::atomic::Ordering::AcqRel) { return; }
+    if INIT_TRIED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
     match select_native(axhal::boot::command_line_value("acpi")) {
         Ok(true) => {}
-        Ok(false) => { info!("acpica: explicit static rescue requested; AML disabled"); return; }
-        Err(()) => { warn!("acpica: unknown acpi option; using static rescue, AML disabled"); return; }
+        Ok(false) => {
+            info!("acpica: explicit static rescue requested; AML disabled");
+            return;
+        }
+        Err(()) => {
+            warn!("acpica: unknown acpi option; using static rescue, AML disabled");
+            return;
+        }
     }
     #[cfg(target_os = "none")]
     if let Err(status) = initialize() {
         ec::stop();
         native::stop_worker();
         axhal::acpi::restore_static();
-        warn!("acpica: initialization failed status={status:#x}; static fallback restored; fixed-button={}", axhal::power::power_button_available());
+        warn!(
+            "acpica: initialization failed status={status:#x}; static fallback restored; \
+             fixed-button={}",
+            axhal::power::power_button_available()
+        );
         axhal::console::write_tty_bytes(b"THEKERNEL_ACPICA_INIT_FAILED_STATIC_RESCUE\n");
     }
 }
@@ -70,11 +89,17 @@ fn initialize() -> Result<(), Status> {
     }
     *BUTTONS.lock() = buttons;
     let fixed = engine.fixed_power_supported();
-    if fixed { engine.install_fixed_power(axhal::acpi::button_event)?; }
+    if fixed {
+        engine.install_fixed_power(axhal::acpi::button_event)?;
+    }
     let ec_count = ec::install(&engine, &nodes)?;
     let wake_sources = wake::configure(&engine, &nodes)?;
     info!("acpica: registered wake GPE sources={wake_sources}; sleep wake masks remain disabled");
     engine.initialize_objects()?;
+    if let Err(error) = vtd::init(&engine) {
+        error!("acpica: VT-d initialization failed closed: {error:?}");
+    }
+    let gpio_count = pchgpio::init(&engine, &nodes);
     let osc = engine.platform_osc();
     info!("acpica: platform _OSC status={osc:?}; no native PCIe control requested");
     pci::init(&engine, &nodes)?;
@@ -87,10 +112,11 @@ fn initialize() -> Result<(), Status> {
     axhal::acpi::register_off(power_off);
     axhal::acpi::publish_button(fixed || !BUTTONS.lock().is_empty() || thermal);
     info!(
-        "acpica: ready version=20260930 nodes={} devices={} AML-errors={} fixed-button={} \
-         method-buttons={} hardware-unverified",
+        "acpica: ready version=20260930 nodes={} devices={} gpio-providers={} AML-errors={} \
+         fixed-button={} method-buttons={} hardware-unverified",
         nodes.len(),
         nodes.iter().filter(|n| n.kind == 6).count(),
+        gpio_count,
         tk_acpica::aml_error_count(),
         fixed,
         BUTTONS.lock().len()
@@ -102,6 +128,19 @@ fn notify(path: &str, value: u32) {
         axhal::acpi::button_event();
     }
 }
+
+/// Preserve GPIO pad state at the entry boundary of a future ACPI S3 path.
+/// S3 entry itself is not yet enabled by this kernel, so this hook is not
+/// presently called by a system suspend operation.
+pub fn prepare_s3_gpio() {
+    pchgpio::save_all();
+}
+
+/// Restore GPIO pads before devices resume after ACPI S3.
+pub fn resume_s3_gpio() {
+    pchgpio::restore_all();
+}
+
 #[cfg(target_os = "none")]
 fn power_off() -> bool {
     // Panic/IRQ paths must not execute AML or wait on an interpreter mutex.
@@ -143,7 +182,6 @@ fn disable_storming_gpes() {
     }
 }
 
-
 struct FirmwareServices;
 #[crate_interface::impl_interface]
 impl axruntime::PlatformServices for FirmwareServices {
@@ -165,3 +203,6 @@ mod tests {
         assert_eq!(super::select_native(Some("")), Err(()));
     }
 }
+
+// I2C PCI companions and I2cSerialBusV2 child enumeration for tk-axdriver.
+pub(crate) mod i2c;

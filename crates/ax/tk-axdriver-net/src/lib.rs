@@ -20,6 +20,9 @@ pub mod rtl8125;
 #[cfg(feature = "igc")]
 /// Intel i225/i226 (2.5 GbE) NIC device driver.
 pub mod igc;
+#[cfg(feature = "e1000")]
+/// Intel 8254x/e1000e/igb driver family.
+pub mod e1000;
 #[cfg(feature = "ixgbe")]
 /// ixgbe NIC device driver.
 pub mod ixgbe;
@@ -33,8 +36,278 @@ pub use self::net_buf::{NetBuf, NetBufBox, NetBufPool, NetBufPtr};
 /// The ethernet address of the NIC (MAC address).
 pub struct EthernetAddress(pub [u8; 6]);
 
+/// One validated frequency made available by a wireless hardware radio.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WirelessFrequency {
+    pub frequency_mhz: u32,
+    pub no_ir: bool,
+}
+
+/// IEEE 802.11 HT capability bytes advertised by an 802.11 radio.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WirelessHtCapabilities {
+    pub capability: u16,
+    pub ampdu_parameters: u8,
+    /// The UAPI 16-byte HT MCS information block.
+    pub mcs_set: [u8; 16],
+}
+
+/// IEEE 802.11 VHT capability and MCS-map bytes for a radio.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WirelessVhtCapabilities {
+    pub capability: u32,
+    /// RX map/highest rate followed by TX map/highest rate (8 bytes).
+    pub mcs_set: [u8; 8],
+}
+
+/// Negotiated local PHY capabilities exported to generic wireless users.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WirelessPhyCapabilities {
+    pub ht: Option<WirelessHtCapabilities>,
+    pub vht: Option<WirelessVhtCapabilities>,
+}
+
+/// One foreground nl80211 scan request; an empty SSID means passive scan.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessScanRequest {
+    pub ssid: alloc::vec::Vec<u8>,
+    pub frequencies_mhz: alloc::vec::Vec<u32>,
+}
+
+/// One userspace-requested station connection (the 4-way handshake remains in
+/// the userspace supplicant).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessConnectRequest {
+    pub ssid: alloc::vec::Vec<u8>,
+    pub bssid: Option<[u8; 6]>,
+    pub frequency_mhz: Option<u32>,
+    pub authentication_type: u32,
+    /// nl80211 MFP mode: 0 disabled, 1 required, 2 optional.
+    pub use_mfp: u32,
+    pub wpa_versions: u32,
+    pub pairwise_ciphers: alloc::vec::Vec<u32>,
+    pub group_cipher: Option<u32>,
+    pub akm_suites: alloc::vec::Vec<u32>,
+    pub information_elements: alloc::vec::Vec<u8>,
+}
+
+/// A userspace-SME Authentication command, including the UAPI body tail.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessAuthenticateRequest {
+    pub bssid: Option<[u8; 6]>,
+    pub frequency_mhz: Option<u32>,
+    pub ssid: alloc::vec::Vec<u8>,
+    pub authentication_type: u32,
+    /// Starts at the Authentication transaction sequence number (UAPI AUTH_DATA).
+    pub authentication_data: alloc::vec::Vec<u8>,
+    pub information_elements: alloc::vec::Vec<u8>,
+}
+
+/// A userspace-SME Association command; `information_elements` are transmitted verbatim.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessAssociateRequest {
+    pub bssid: Option<[u8; 6]>,
+    pub frequency_mhz: Option<u32>,
+    pub ssid: alloc::vec::Vec<u8>,
+    pub information_elements: alloc::vec::Vec<u8>,
+    pub pairwise_ciphers: alloc::vec::Vec<u32>,
+    pub group_cipher: Option<u32>,
+    pub akm_suites: alloc::vec::Vec<u32>,
+    pub use_mfp: u32,
+    pub control_port: bool,
+}
+
+/// An 802.11 management response returned by a synchronous SME command.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessSmeFrame {
+    pub bssid: [u8; 6],
+    pub frame: alloc::vec::Vec<u8>,
+}
+
+/// The peer status fields consumed by nl80211 GET_STATION.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessStationInfo {
+    pub bssid: [u8; 6],
+    pub frequency_mhz: u32,
+    pub signal_mbm: i32,
+    pub association_id: u16,
+    pub request_ies: alloc::vec::Vec<u8>,
+    pub response_ies: alloc::vec::Vec<u8>,
+}
+
+/// A firmware-authenticated station disconnection to publish on nl80211 mlme.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WirelessDisconnectEvent {
+    pub bssid: [u8; 6],
+    pub reason: u16,
+}
+
+/// One nl80211-installed temporal/group key from userspace.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessKeyConfig {
+    pub index: u8,
+    pub cipher_suite: u32,
+    pub peer: Option<[u8; 6]>,
+    pub key_data: alloc::vec::Vec<u8>,
+    pub sequence: alloc::vec::Vec<u8>,
+    pub default_unicast: bool,
+    pub default_multicast: bool,
+    pub default_management: bool,
+}
+
+/// Key operations requested through nl80211.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WirelessKeyOperation {
+    Install,
+    SetDefault {
+        unicast: bool,
+        multicast: bool,
+        management: bool,
+    },
+    GetSequence,
+    Delete,
+}
+
+/// Key metadata returned for a GET_KEY request.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessKeyInfo {
+    pub cipher_suite: u32,
+    pub sequence: alloc::vec::Vec<u8>,
+}
+
+/// One station-mode BSS observation returned by an actual RX beacon/probe frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WirelessBssInfo {
+    pub bssid: [u8; 6],
+    pub frequency_mhz: u32,
+    pub signal_mbm: i32,
+    pub timestamp: u64,
+    pub beacon_interval: u16,
+    pub capability: u16,
+    pub information_elements: alloc::vec::Vec<u8>,
+    pub is_probe_response: bool,
+}
+
+/// A completed station scan notification for the nl80211 scan multicast group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WirelessScanEvent {
+    Results,
+    Aborted,
+}
+
 /// Operations that require a network device (NIC) driver to implement.
 pub trait NetDriverOps: BaseDriverOps {
+    /// Preferred init-net interface name, when the driver owns a named link.
+    /// `None` keeps the platform's existing primary-Ethernet naming policy.
+    fn interface_name(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Whether this Ethernet-compatible link exposes 802.11 control state.
+    fn is_wireless(&self) -> bool {
+        false
+    }
+
+    /// Current hardware RF-kill state, when this is a wireless interface.
+    fn rfkill_hard_blocked(&self) -> bool {
+        false
+    }
+
+    /// Current software RF-kill state, when this is a wireless interface.
+    fn rfkill_soft_blocked(&self) -> bool {
+        false
+    }
+
+    /// Change software rfkill state when this wireless adapter can serialize it.
+    fn set_rfkill_soft_blocked(&mut self, _blocked: bool) -> DevResult {
+        Err(DevError::Unsupported)
+    }
+
+    /// Frequencies validated by the device NVM/regulatory admission path.
+    fn wireless_frequencies(&self) -> alloc::vec::Vec<WirelessFrequency> {
+        alloc::vec::Vec::new()
+    }
+
+    /// HT/VHT capabilities admitted by the radio's NVM and local antenna policy.
+    fn wireless_phy_capabilities(&self) -> WirelessPhyCapabilities {
+        WirelessPhyCapabilities::default()
+    }
+
+    /// Start a real hardware scan; adapters without scan control fail closed.
+    fn trigger_wireless_scan(&mut self, _request: &WirelessScanRequest) -> DevResult {
+        Err(DevError::Unsupported)
+    }
+
+    /// Abort a currently active foreground scan if the driver supports it.
+    fn abort_wireless_scan(&mut self) -> DevResult {
+        Err(DevError::Unsupported)
+    }
+
+    /// Begin or replace a station connection from an nl80211 request.
+    fn connect_wireless(&mut self, _request: &WirelessConnectRequest) -> DevResult {
+        Err(DevError::Unsupported)
+    }
+
+    /// Run one userspace-SME authentication exchange and return the received frame.
+    fn authenticate_wireless(
+        &mut self,
+        _request: &WirelessAuthenticateRequest,
+    ) -> DevResult<WirelessSmeFrame> {
+        Err(DevError::Unsupported)
+    }
+
+    /// Run one userspace-SME association exchange and return the received frame.
+    fn associate_wireless(
+        &mut self,
+        _request: &WirelessAssociateRequest,
+    ) -> DevResult<WirelessSmeFrame> {
+        Err(DevError::Unsupported)
+    }
+
+    /// Disconnect through the userspace-SME DEAUTHENTICATE/DISASSOCIATE path.
+    fn disconnect_wireless_sme(&mut self, _reason: u16, _disassociate: bool) -> DevResult {
+        Err(DevError::Unsupported)
+    }
+
+    /// Disconnect the current station peer using the requested reason.
+    fn disconnect_wireless(&mut self, _reason: u16) -> DevResult {
+        Err(DevError::Unsupported)
+    }
+
+    /// Return the currently associated peer for GET_STATION.
+    fn wireless_station_info(&self) -> Option<WirelessStationInfo> {
+        None
+    }
+
+    /// Take one unsolicited, authenticated station disconnect indication.
+    fn take_wireless_disconnect_event(&mut self) -> Option<WirelessDisconnectEvent> {
+        None
+    }
+
+    /// Apply a station data-key operation admitted by the adapter.
+    fn wireless_key_operation(
+        &mut self,
+        _operation: WirelessKeyOperation,
+        _key: &WirelessKeyConfig,
+    ) -> DevResult<Option<WirelessKeyInfo>> {
+        Err(DevError::Unsupported)
+    }
+
+    /// Snapshot BSSes parsed from received firmware RX notifications.
+    fn wireless_scan_results(&self) -> alloc::vec::Vec<WirelessBssInfo> {
+        alloc::vec::Vec::new()
+    }
+
+    /// Take one completion event after firmware scan notification processing.
+    fn take_wireless_scan_event(&mut self) -> Option<WirelessScanEvent> {
+        None
+    }
+
+    /// Change administrative radio state before the interface state is published.
+    fn set_link_up(&mut self, _up: bool) -> DevResult {
+        Ok(())
+    }
+
     /// The ethernet address of the NIC.
     fn mac_address(&self) -> EthernetAddress;
 
@@ -85,7 +358,6 @@ pub trait NetDriverOps: BaseDriverOps {
     fn firmware_path(&self) -> Option<&'static str> { None }
     /// Apply validated runtime firmware while there are no packet borrowers.
     fn load_firmware(&mut self, _bytes: &[u8]) -> DevResult { Err(DevError::Unsupported) }
-
 }
 
 #[cfg(feature = "rtl8125")]

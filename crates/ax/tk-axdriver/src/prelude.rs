@@ -1,6 +1,6 @@
 //! Device driver prelude that includes some traits and types.
 
-pub use axdriver_base::{firmware, BaseDriverOps, DevError, DevResult, DeviceType};
+pub use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType, firmware};
 #[cfg(feature = "block")]
 pub use {
     crate::structs::AxBlockDevice,
@@ -26,7 +26,13 @@ pub use {
 #[cfg(feature = "net")]
 pub use {
     crate::structs::AxNetDevice,
-    axdriver_net::{NetBufPtr, NetDriverOps},
+    axdriver_net::{
+        NetBufPtr, NetDriverOps, WirelessAssociateRequest, WirelessAuthenticateRequest,
+        WirelessBssInfo, WirelessConnectRequest, WirelessDisconnectEvent, WirelessFrequency,
+        WirelessHtCapabilities, WirelessKeyConfig, WirelessKeyInfo, WirelessKeyOperation,
+        WirelessPhyCapabilities, WirelessScanEvent, WirelessScanRequest, WirelessSmeFrame,
+        WirelessStationInfo, WirelessVhtCapabilities,
+    },
 };
 #[cfg(feature = "vsock")]
 pub use {

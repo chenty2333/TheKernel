@@ -23,6 +23,7 @@ impl axfs::TaskIoAccounting for TaskIoAccountingIf {
 
 pub(crate) mod af_alg;
 pub(crate) mod af_xdp;
+pub(crate) mod bluetooth;
 #[cfg(feature = "bpf")]
 pub mod bpf;
 pub(crate) mod dnotify;
@@ -88,6 +89,7 @@ pub use self::{
 };
 pub(crate) use self::{
     af_xdp::XdpSocket,
+    bluetooth::HciSocket,
     fs::{
         allowed_write_len, check_resize_limit, resolve_at_with_security,
         resolve_at_with_synthetic_credentials, validate_pathname, validate_symlink_target,

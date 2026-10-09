@@ -3,7 +3,7 @@ use core::{convert::TryInto, mem::size_of};
 
 use zerocopy::AsBytes;
 
-use super::{VirtioNetHdr, NET_HDR_SIZE};
+use super::VirtioNetHdr;
 
 /// A buffer used for transmitting.
 pub struct TxBuffer(pub(crate) Vec<u8>);
@@ -13,6 +13,7 @@ pub struct RxBuffer {
     pub(crate) buf: Vec<usize>, // for alignment
     pub(crate) packet_len: usize,
     pub(crate) idx: u16,
+    pub(crate) header_len: usize,
 }
 
 impl TxBuffer {
@@ -39,11 +40,12 @@ impl TxBuffer {
 
 impl RxBuffer {
     /// Allocates a new buffer with length `buf_len`.
-    pub(crate) fn new(idx: usize, buf_len: usize) -> Self {
+    pub(crate) fn new(idx: usize, buf_len: usize, header_len: usize) -> Self {
         Self {
             buf: vec![0; buf_len / size_of::<usize>()],
             packet_len: 0,
             idx: idx.try_into().unwrap(),
+            header_len,
         }
     }
 
@@ -75,11 +77,11 @@ impl RxBuffer {
 
     /// Returns the network packet as a slice.
     pub fn packet(&self) -> &[u8] {
-        &self.buf.as_bytes()[NET_HDR_SIZE..NET_HDR_SIZE + self.packet_len]
+        &self.buf.as_bytes()[self.header_len..self.header_len + self.packet_len]
     }
 
     /// Returns the network packet as a mutable slice.
     pub fn packet_mut(&mut self) -> &mut [u8] {
-        &mut self.buf.as_bytes_mut()[NET_HDR_SIZE..NET_HDR_SIZE + self.packet_len]
+        &mut self.buf.as_bytes_mut()[self.header_len..self.header_len + self.packet_len]
     }
 }
