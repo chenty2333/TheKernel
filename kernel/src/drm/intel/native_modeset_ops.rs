@@ -69,18 +69,31 @@ pub(super) struct NativePlaneUpdatePlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum NativePipeProjectionError {
     InvalidPipe(u8),
-    PipeMismatch { old: u8, new: u8 },
+    PipeMismatch {
+        old: u8,
+        new: u8,
+    },
     InactivePipe,
     UnsupportedPipeState,
     InvalidTiming,
-    PlanePipeMismatch { plane: u8, pipe: u8 },
+    PlanePipeMismatch {
+        plane: u8,
+        pipe: u8,
+    },
     InvalidPlaneIndex(usize),
     DuplicatePlaneIndex(usize),
     MissingScanout(usize),
     UnexpectedScanout(usize),
-    PlaneMaskMismatch { expected: u32, projected: u32 },
+    PlaneMaskMismatch {
+        expected: u32,
+        projected: u32,
+    },
     PlaneStateMismatch(usize),
     UnsupportedOldPipeState,
+    /// The full source-derived watermark/DBUF plan did not fit the supplied
+    /// framebuffer set and platform latency data. This is checked while the
+    /// program is still value-only, before pipe timing or any other MMIO.
+    DdbPlanning(pipe::PipeError),
     TooManyPlanes,
 }
 
@@ -175,6 +188,9 @@ impl NativePipeProgram {
         let mut seen = [false; 4];
         let mut old_mask = 0u32;
         let mut projected_mask = 0u32;
+        let mut seen_uapi_mask = 0u32;
+        let mut old_uapi_mask = 0u32;
+        let mut projected_uapi_mask = 0u32;
         let mut scanouts = alloc::vec::Vec::with_capacity(planes.len());
         let mut disabled_planes = alloc::vec::Vec::with_capacity(planes.len());
         for plane in planes {
@@ -192,41 +208,89 @@ impl NativePipeProgram {
             if core::mem::replace(&mut seen[index], true) {
                 return Err(NativePipeProjectionError::DuplicatePlaneIndex(index));
             }
+            let uapi_bit = update.uapi_plane_mask_bit;
+            if uapi_bit.count_ones() != 1 || seen_uapi_mask & uapi_bit != 0 {
+                return Err(NativePipeProjectionError::PlaneMaskMismatch {
+                    expected: seen_uapi_mask | uapi_bit,
+                    projected: seen_uapi_mask,
+                });
+            }
+            seen_uapi_mask |= uapi_bit;
+            if update.old_visible && !update.old_fb_exists {
+                return Err(NativePipeProjectionError::PlaneStateMismatch(index));
+            }
             if update.old_visible {
                 old_mask |= 1u32 << index;
+                old_uapi_mask |= uapi_bit;
             }
             match (update.new_visible, plane.scanout) {
                 (true, Some(scanout)) => {
-                    if scanout.plane_index != index
+                    if !update.new_fb_exists
+                        || update.new_async_flip
+                        || update.async_flip_capable
+                        || update.need_async_flip_toggle_wa
+                        || update.is_y_plane
+                        || update.new_alpha != u16::MAX
+                        || update.new_pixel_blend_mode != 0
+                        || update.new_color_encoding != 0
+                        || update.new_color_range != 0
+                        || update.new_decrypt
+                        || update.new_aux_dist != 0
+                        || update.fence_pending
+                        || update.clear_color_plane
+                        || update.clear_color_value != 0
+                        || scanout.plane_index != index
                         || scanout.pixel_format != update.new_format
                         || !scanout_matches_transition(scanout, update)
                     {
                         return Err(NativePipeProjectionError::PlaneStateMismatch(index));
                     }
                     projected_mask |= 1u32 << index;
+                    projected_uapi_mask |= uapi_bit;
                     scanouts.push(scanout);
                 }
                 (true, None) => return Err(NativePipeProjectionError::MissingScanout(index)),
                 (false, Some(_)) => {
                     return Err(NativePipeProjectionError::UnexpectedScanout(index));
                 }
-                (false, None) if update.old_visible => disabled_planes.push(index),
+                (false, None) if update.old_visible => {
+                    if !update.old_fb_exists || update.new_fb_exists {
+                        return Err(NativePipeProjectionError::PlaneStateMismatch(index));
+                    }
+                    disabled_planes.push(index);
+                }
+                (false, None) if update.new_fb_exists => {
+                    return Err(NativePipeProjectionError::PlaneStateMismatch(index));
+                }
                 (false, None) => {}
             }
         }
         if transition.old.enabled_planes != old_mask
             || transition.old.active_planes != old_mask
+            || transition.old.uapi_plane_mask != old_uapi_mask
             || state.enabled_planes != projected_mask
             || state.active_planes != projected_mask
+            || state.uapi_plane_mask != projected_uapi_mask
         {
             return Err(NativePipeProjectionError::PlaneMaskMismatch {
                 expected: transition.old.enabled_planes
                     | transition.old.active_planes
+                    | transition.old.uapi_plane_mask
                     | state.enabled_planes
-                    | state.active_planes,
-                projected: old_mask | projected_mask,
+                    | state.active_planes
+                    | state.uapi_plane_mask,
+                projected: old_mask | old_uapi_mask | projected_mask | projected_uapi_mask,
             });
         }
+
+        // The DDB and watermark planner is pure, but prepare_plane_update()
+        // must eventually run after pipe configuration and CRTC enable. Run
+        // the exact planner here so an impossible allocation, unsupported WM
+        // latency or unencodable timing can never be discovered only after
+        // those earlier register writes have happened.
+        pipe::plan_multi_plane_dbuf(&mode, &scanouts, watermarks)
+            .map_err(NativePipeProjectionError::DdbPlanning)?;
+
         Ok(Self {
             source: *state,
             source_pipe: new,
@@ -345,6 +409,8 @@ impl NativePipeDisableProgram {
         let pipe = pipe_for_source(old)?;
         if !transition.old.hw_active
             || !transition.old.hw_enable
+            || !transition.old.uapi_active
+            || !transition.old.uapi_enable
             || transition.old.cpu_transcoder != old
             || transition.old.is_joiner_secondary
             || transition.old.joiner_pipes != 0
@@ -358,6 +424,9 @@ impl NativePipeDisableProgram {
             || transition.new.hw_active
             || transition.new.uapi_enable
             || transition.new.uapi_active
+            || transition.new.uapi_plane_mask != 0
+            || transition.new.enabled_planes != 0
+            || transition.new.active_planes != 0
         {
             return Err(NativePipeProjectionError::UnsupportedPipeState);
         }
@@ -366,6 +435,8 @@ impl NativePipeDisableProgram {
         }
         let mut seen = [false; 4];
         let mut old_mask = 0u32;
+        let mut seen_uapi_mask = 0u32;
+        let mut old_uapi_mask = 0u32;
         let mut plane_indices = alloc::vec::Vec::with_capacity(planes.len());
         for plane in planes {
             let state = &plane.transition;
@@ -382,18 +453,37 @@ impl NativePipeDisableProgram {
             if core::mem::replace(&mut seen[index], true) {
                 return Err(NativePipeProjectionError::DuplicatePlaneIndex(index));
             }
+            let uapi_bit = state.uapi_plane_mask_bit;
+            if uapi_bit.count_ones() != 1 || seen_uapi_mask & uapi_bit != 0 {
+                return Err(NativePipeProjectionError::PlaneMaskMismatch {
+                    expected: seen_uapi_mask | uapi_bit,
+                    projected: seen_uapi_mask,
+                });
+            }
+            seen_uapi_mask |= uapi_bit;
             if state.old_visible {
+                if !state.old_fb_exists || state.new_visible || state.new_fb_exists {
+                    return Err(NativePipeProjectionError::PlaneStateMismatch(index));
+                }
                 old_mask |= 1u32 << index;
+                old_uapi_mask |= uapi_bit;
                 plane_indices.push(index);
+            } else if state.new_visible || state.new_fb_exists {
+                return Err(NativePipeProjectionError::PlaneStateMismatch(index));
             }
             if plane.scanout.is_some() {
                 return Err(NativePipeProjectionError::UnexpectedScanout(index));
             }
         }
-        if transition.old.enabled_planes != old_mask || transition.old.active_planes != old_mask {
+        if transition.old.enabled_planes != old_mask
+            || transition.old.active_planes != old_mask
+            || transition.old.uapi_plane_mask != old_uapi_mask
+        {
             return Err(NativePipeProjectionError::PlaneMaskMismatch {
-                expected: transition.old.enabled_planes | transition.old.active_planes,
-                projected: old_mask,
+                expected: transition.old.enabled_planes
+                    | transition.old.active_planes
+                    | transition.old.uapi_plane_mask,
+                projected: old_mask | old_uapi_mask,
             });
         }
         Ok(Self {

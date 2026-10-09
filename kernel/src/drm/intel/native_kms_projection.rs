@@ -625,6 +625,41 @@ mod tests {
     }
 
     #[test]
+    fn source_program_requires_exact_uapi_and_hardware_plane_masks() {
+        let mode = mode();
+        let projected = project_atomic_kms(
+            41,
+            State::default(),
+            visible_state(41, 7, mode),
+            None,
+            Some(descriptor(mode, 7, Some(0x0100_0000))),
+        )
+        .expect("atomic state projects");
+        let mut bad_pipe_mask = projected.transition;
+        bad_pipe_mask.new.uapi_plane_mask = 3;
+        assert!(matches!(
+            NativePipeProgram::from_source_with_mode(&bad_pipe_mask, &projected.planes, wm(), mode,),
+            Err(
+                super::super::native_modeset_ops::NativePipeProjectionError::PlaneMaskMismatch { .. }
+            )
+        ));
+
+        let mut bad_plane_mask = projected.planes;
+        bad_plane_mask[0].transition.uapi_plane_mask_bit = 2;
+        assert!(matches!(
+            NativePipeProgram::from_source_with_mode(
+                &projected.transition,
+                &bad_plane_mask,
+                wm(),
+                mode,
+            ),
+            Err(
+                super::super::native_modeset_ops::NativePipeProjectionError::PlaneMaskMismatch { .. }
+            )
+        ));
+    }
+
+    #[test]
     fn incomplete_or_mismatched_framebuffer_resolution_fails_closed() {
         let mode = mode();
         let old = State::default();
@@ -809,6 +844,35 @@ mod tests {
             .unwrap_err(),
             super::super::native_modeset_ops::NativePipeProjectionError::InvalidTiming
         );
+    }
+
+    #[test]
+    fn source_builder_preflights_watermarks_and_ddb_before_pipe_callbacks() {
+        let mode = mode();
+        let projected = project_atomic_kms(
+            41,
+            State::default(),
+            visible_state(41, 7, mode),
+            None,
+            Some(descriptor(mode, 7, Some(0x0100_0000))),
+        )
+        .expect("atomic state projects");
+        let impossible_latency = WatermarkConfig {
+            // A zero latency is invalid for every watermark level in the
+            // source builder; its sentinel minimum must be rejected.
+            latencies: [0; intel_display::skl_watermark_full::WM_LEVELS],
+            ..wm()
+        };
+
+        assert!(matches!(
+            NativePipeProgram::from_source_with_mode(
+                &projected.transition,
+                &projected.planes,
+                impossible_latency,
+                mode,
+            ),
+            Err(super::super::native_modeset_ops::NativePipeProjectionError::DdbPlanning(_))
+        ));
     }
 
     #[test]
