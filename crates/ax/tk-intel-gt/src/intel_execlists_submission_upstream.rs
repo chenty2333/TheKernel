@@ -1,9 +1,473 @@
 // SPDX-License-Identifier: MIT
 // Copyright © 2014 Intel Corporation.
 use core::{
-    ffi::{c_char, c_ulong, c_void},
-    mem::{size_of, size_of_val},
+    ffi::{c_char, c_int, c_ulong, c_void},
+    mem::{size_of, size_of_val, swap},
+    sync::atomic::{AtomicPtr, AtomicU32, Ordering, fence},
 };
+
+use kernel_guard::{BaseGuard, IrqSave};
+
+// Resolve duplicated Linux/i915 declarations to their canonical owner modules.
+use crate::{
+    i915_gem_pages_upstream::__i915_gem_object_flush_map,
+    i915_request_types_upstream::{
+        I915_FENCE_FLAG_ACTIVE, I915_FENCE_FLAG_HOLD, I915_FENCE_FLAG_NOPREEMPT,
+        I915_FENCE_FLAG_PQUEUE, I915_FENCE_FLAG_SENTINEL,
+    },
+    i915_request_upstream::{__i915_request_skip, __i915_request_submit, __i915_request_unsubmit},
+    i915_scheduler_types_upstream::{I915_DEPENDENCY_WEAK, I915SchedEngine},
+    i915_scheduler_upstream::{i915_sched_engine_create, i915_sched_lookup_priolist},
+    intel_context_api_upstream::{
+        intel_context_force_single_submission, intel_context_set_exiting,
+        intel_context_set_nopreempt,
+    },
+    intel_engine_api_upstream::{
+        drm_clflush_virt_range, intel_engine_has_heartbeat, intel_engine_has_preempt_reset,
+    },
+    intel_engine_types_upstream::{
+        I915_MAX_SFC, IntelEngineExeclists, IntelEngineExeclistsStats, IntelEngineMask,
+    },
+    intel_gt_types_upstream::IntelGtInfo,
+    intel_gtt_api_upstream::I915_MAX_NUM_FENCES,
+    intel_gtt_api_upstream::{i915_page_dir_dma_addr, i915_vm_is_4lvl, i915_vm_to_ppgtt},
+    intel_ring_upstream::intel_ring_begin,
+    linux::fields::{I915GpuCoredump, IntelEngineCaptureVma},
+    linux::i915::IntelDeviceInfoOverlay,
+    linux::registers::_MMIO as MMIO,
+    linux_i915_private::DrmI915Private,
+};
+
+const __GFP_KSWAPD_RECLAIM: u32 = 1 << 11;
+
+// Direct declarations for real Linux/i915 C entry points referenced by this
+// source unit but owned by other C files/headers.
+unsafe extern "C" {
+    fn intel_vgpu_active(i915: *mut DrmI915Private) -> bool;
+    fn intel_gt_handle_error(
+        gt: *mut IntelGt,
+        mask: IntelEngineMask,
+        flags: c_ulong,
+        fmt: *const c_char,
+        ...
+    );
+    fn intel_has_reset_engine(gt: *const IntelGt) -> bool;
+    fn intel_engine_pulse(engine: *mut IntelEngineCs) -> c_int;
+    fn __i915_request_reset(rq: *mut I915Request, guilty: bool);
+    fn intel_engine_reset(engine: *mut IntelEngineCs, message: *const c_char) -> c_int;
+    fn intel_gt_reset_engine(engine: *mut IntelEngineCs) -> c_int;
+    fn intel_engine_reset_pinned_contexts(engine: *mut IntelEngineCs);
+    fn intel_mocs_init_engine(engine: *mut IntelEngineCs);
+    fn __i915_priolist_free(pl: *mut I915Priolist);
+    fn atomic_notifier_call_chain(head: *mut c_void, value: c_ulong, data: *mut c_void) -> c_int;
+    fn trace_i915_request_in(rq: *mut I915Request, port: u32);
+    fn trace_i915_request_out(rq: *mut I915Request);
+    fn intel_engine_add_retire(engine: *mut IntelEngineCs, timeline: *mut IntelTimeline);
+    fn i915_gpu_coredump_alloc(i915: *mut DrmI915Private, gfp: u32) -> *mut I915GpuCoredump;
+    fn intel_gt_coredump_alloc(gt: *mut IntelGt, gfp: u32, flags: u32) -> *mut c_void;
+    fn intel_engine_coredump_alloc(engine: *mut IntelEngineCs, gfp: u32, flags: u32)
+    -> *mut c_void;
+    fn intel_engine_coredump_add_request(
+        engine: *mut c_void,
+        request: *mut I915Request,
+        gfp: u32,
+    ) -> *mut IntelEngineCaptureVma;
+    fn intel_engine_coredump_add_vma(
+        engine: *mut c_void,
+        capture: *mut IntelEngineCaptureVma,
+        compress: *mut c_void,
+    );
+    fn i915_vma_capture_prepare(gt: *mut c_void) -> *mut c_void;
+    fn i915_vma_capture_finish(gt: *mut c_void, compress: *mut c_void);
+    fn i915_error_state_store(error: *mut I915GpuCoredump);
+    fn __i915_gpu_coredump_free(kref: *mut crate::intel_context_upstream::Kref);
+    fn current_comm() -> *const c_char;
+    fn dma_fence_context_alloc(num: usize) -> u64;
+    fn clear_and_wake_up_bit(bit: i32, word: *mut c_ulong);
+    fn queue_rcu_work(wq: *mut c_void, rcu: *mut RcuWork) -> bool;
+    fn get_random_u32_below(range: u32) -> u32;
+    fn rb_insert_color(node: *mut RbNode, root: *mut RbRoot);
+    fn gen8_emit_flush_rcs(rq: *mut I915Request, mode: u32) -> c_int;
+    fn gen11_emit_flush_rcs(rq: *mut I915Request, mode: u32) -> c_int;
+    fn gen12_emit_flush_rcs(rq: *mut I915Request, mode: u32) -> c_int;
+    fn gen8_emit_flush_xcs(rq: *mut I915Request, mode: u32) -> c_int;
+    fn gen12_emit_flush_xcs(rq: *mut I915Request, mode: u32) -> c_int;
+    fn gen8_emit_init_breadcrumb(rq: *mut I915Request) -> c_int;
+    fn gen8_emit_bb_start_noarb(rq: *mut I915Request, offset: u64, len: u32, flags: u32) -> c_int;
+    fn gen8_emit_bb_start(rq: *mut I915Request, offset: u64, len: u32, flags: u32) -> c_int;
+    fn xehp_emit_bb_start_noarb(rq: *mut I915Request, offset: u64, len: u32, flags: u32) -> c_int;
+    fn xehp_emit_bb_start(rq: *mut I915Request, offset: u64, len: u32, flags: u32) -> c_int;
+    fn gen8_emit_fini_breadcrumb_xcs(rq: *mut I915Request, cs: *mut u32) -> *mut u32;
+    fn gen12_emit_fini_breadcrumb_xcs(rq: *mut I915Request, cs: *mut u32) -> *mut u32;
+    fn gen8_emit_fini_breadcrumb_rcs(rq: *mut I915Request, cs: *mut u32) -> *mut u32;
+    fn gen11_emit_fini_breadcrumb_rcs(rq: *mut I915Request, cs: *mut u32) -> *mut u32;
+    fn gen12_emit_fini_breadcrumb_rcs(rq: *mut I915Request, cs: *mut u32) -> *mut u32;
+}
+
+#[repr(C)]
+struct IntelEngineCoredumpLayout {
+    engine: *const IntelEngineCs,
+    hung: bool,
+    simulated: bool,
+    _pad: [u8; 2],
+    _reset_count: u32,
+}
+
+#[repr(C)]
+struct IntelGtCoredumpLayout {
+    gt: *const IntelGt,
+    awake: bool,
+    simulated: bool,
+    _pad: [u8; 2],
+    info: IntelGtInfo,
+    eir: u32,
+    pgtbl_er: u32,
+    gtier: [u32; 6],
+    ngtier: u32,
+    forcewake: u32,
+    error: u32,
+    fault_data0: u32,
+    fault_data1: u32,
+    done_reg: u32,
+    gac_eco: u32,
+    gam_ecochk: u32,
+    gab_ctl: u32,
+    gfx_mode: u32,
+    gtt_cache: u32,
+    aux_err: u32,
+    gam_done: u32,
+    clock_frequency: u32,
+    clock_period_ns: u32,
+    sfc_done: [u32; I915_MAX_SFC],
+    nfence: u32,
+    fence: [u64; I915_MAX_NUM_FENCES as usize],
+    engine: *mut IntelEngineCoredumpLayout,
+}
+
+#[repr(C)]
+struct I915GpuCoredumpLayout {
+    ref_: crate::intel_context_upstream::Kref,
+    time: i64,
+    boottime: i64,
+    uptime: i64,
+    capture: c_ulong,
+    i915: *mut DrmI915Private,
+    gt: *mut IntelGtCoredumpLayout,
+    error_msg: [c_char; 128],
+    simulated: bool,
+    _wakelock: bool,
+    _suspended: bool,
+}
+
+#[inline]
+unsafe fn gpu_coredump(error: *mut I915GpuCoredump) -> *mut I915GpuCoredumpLayout {
+    error.cast()
+}
+
+#[inline]
+unsafe fn i915_gpu_coredump_put(error: *mut I915GpuCoredump) {
+    if !error.is_null() {
+        let view = unsafe { gpu_coredump(error) };
+        unsafe {
+            crate::linux::memory::kref_put(
+                core::ptr::addr_of_mut!((*view).ref_),
+                __i915_gpu_coredump_free,
+            )
+        };
+    }
+}
+
+#[inline]
+unsafe extern "C" fn lrc_reset_callback(ce: *mut IntelContext) {
+    unsafe { crate::intel_lrc_upstream::lrc_reset(ce) };
+}
+
+#[inline]
+unsafe extern "C" fn lrc_destroy_callback(kref: *mut crate::intel_context_upstream::Kref) {
+    unsafe { crate::intel_lrc_upstream::lrc_destroy(kref) };
+}
+
+#[inline]
+fn ktime_add(a: i64, b: i64) -> i64 {
+    a.wrapping_add(b)
+}
+
+#[inline]
+fn ktime_sub(a: i64, b: i64) -> i64 {
+    a.wrapping_sub(b)
+}
+
+#[inline]
+fn seqcount_init(seq: &mut crate::intel_engine_cs_upstream::Seqcount) {
+    unsafe {
+        AtomicU32::from_ptr(core::ptr::addr_of_mut!(seq.sequence)).store(0, Ordering::Relaxed)
+    };
+}
+
+#[inline]
+fn write_seqcount_begin(seq: &mut crate::intel_engine_cs_upstream::Seqcount) {
+    unsafe {
+        AtomicU32::from_ptr(core::ptr::addr_of_mut!(seq.sequence)).fetch_add(1, Ordering::Relaxed)
+    };
+    fence(Ordering::Release);
+}
+
+#[inline]
+fn write_seqcount_end(seq: &mut crate::intel_engine_cs_upstream::Seqcount) {
+    fence(Ordering::Release);
+    unsafe {
+        AtomicU32::from_ptr(core::ptr::addr_of_mut!(seq.sequence)).fetch_add(1, Ordering::Release)
+    };
+}
+
+#[inline]
+fn read_seqcount_begin(seq: &mut crate::intel_engine_cs_upstream::Seqcount) -> u32 {
+    loop {
+        let value = unsafe {
+            AtomicU32::from_ptr(core::ptr::addr_of_mut!(seq.sequence)).load(Ordering::Acquire)
+        };
+        if value & 1 == 0 {
+            return value;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+fn read_seqcount_retry(seq: &mut crate::intel_engine_cs_upstream::Seqcount, start: u32) -> bool {
+    fence(Ordering::Acquire);
+    unsafe {
+        AtomicU32::from_ptr(core::ptr::addr_of_mut!(seq.sequence)).load(Ordering::Acquire) != start
+    }
+}
+
+#[inline]
+unsafe fn intel_engine_context_in(engine: *mut IntelEngineCs) {
+    let stats = unsafe { core::ptr::addr_of_mut!((*engine).stats.data.execlists) };
+    if unsafe { (*stats).active != 0 } {
+        unsafe {
+            (*stats).active += 1;
+        }
+        return;
+    }
+    let flags = IrqSave::acquire();
+    unsafe { write_seqcount_begin(&mut (*stats).lock) };
+    unsafe {
+        (*stats).start = crate::linux::primitives::ktime_get();
+    }
+    unsafe {
+        (*stats).active += 1;
+    }
+    unsafe { write_seqcount_end(&mut (*stats).lock) };
+    IrqSave::release(flags);
+    GEM_BUG_ON!(unsafe { (*stats).active == 0 });
+}
+
+#[inline]
+unsafe fn intel_engine_context_out(engine: *mut IntelEngineCs) {
+    let stats = unsafe { core::ptr::addr_of_mut!((*engine).stats.data.execlists) };
+    GEM_BUG_ON!(unsafe { (*stats).active == 0 });
+    if unsafe { (*stats).active > 1 } {
+        unsafe {
+            (*stats).active -= 1;
+        }
+        return;
+    }
+    let flags = IrqSave::acquire();
+    unsafe { write_seqcount_begin(&mut (*stats).lock) };
+    unsafe {
+        (*stats).active -= 1;
+    }
+    unsafe {
+        (*stats).total = ktime_add(
+            (*stats).total,
+            ktime_sub(crate::linux::primitives::ktime_get(), (*stats).start),
+        );
+    }
+    unsafe { write_seqcount_end(&mut (*stats).lock) };
+    IrqSave::release(flags);
+}
+
+#[inline]
+unsafe fn execlists_active(execlists: *const IntelEngineExeclists) -> *mut I915Request {
+    let mut current = unsafe { READ_ONCE!((*execlists).active) };
+    loop {
+        let old = current;
+        crate::linux_memory::smp_rmb();
+        let active = unsafe { READ_ONCE!(*current) };
+        current = unsafe { READ_ONCE!((*execlists).active) };
+        crate::linux_memory::smp_rmb();
+        if current == old {
+            return active;
+        }
+    }
+}
+
+#[inline]
+unsafe fn writel(value: u32, address: *mut u32) {
+    fence(Ordering::SeqCst);
+    unsafe { core::ptr::write_volatile(address, value) };
+    fence(Ordering::SeqCst);
+}
+
+#[inline]
+unsafe fn memset_p<T>(destination: *mut *mut T, value: *mut T, count: usize) {
+    let _ = value; // source always supplies NULL, whose representation is all zero.
+    unsafe { core::ptr::write_bytes(destination, 0, count) };
+}
+
+#[inline]
+unsafe fn memcmp<T>(a: *const T, b: *const T, bytes: usize) -> i32 {
+    let a = a.cast::<u8>();
+    let b = b.cast::<u8>();
+    for i in 0..bytes {
+        let av = unsafe { *a.add(i) };
+        let bv = unsafe { *b.add(i) };
+        if av != bv {
+            return av as i32 - bv as i32;
+        }
+    }
+    0
+}
+
+#[inline]
+unsafe fn xchg<T>(destination: *mut *const T, value: *mut T) -> *const T {
+    unsafe { AtomicPtr::from_ptr(destination.cast::<*mut T>()).swap(value, Ordering::AcqRel) }
+}
+
+#[inline]
+unsafe fn i915_request_has_nopreempt(rq: *const I915Request) -> bool {
+    unsafe { crate::linux::bits::test_bit(I915_FENCE_FLAG_NOPREEMPT, &(*rq).fence.flags) }
+}
+
+#[inline]
+unsafe fn i915_request_set_hold(rq: *mut I915Request) {
+    unsafe { crate::linux::bits::set_bit(I915_FENCE_FLAG_HOLD, &mut (*rq).fence.flags) };
+}
+
+#[inline]
+unsafe fn i915_request_clear_hold(rq: *mut I915Request) {
+    unsafe { crate::linux::bits::clear_bit(I915_FENCE_FLAG_HOLD, &mut (*rq).fence.flags) };
+}
+
+#[inline]
+fn __intel_context_inflight_count(engine: *mut IntelEngineCs) -> usize {
+    engine as usize & 7
+}
+
+#[inline]
+fn ptr_inc<T>(ptr: *mut T) -> *mut T {
+    (ptr as usize).wrapping_add(1) as *mut T
+}
+
+#[inline]
+fn ptr_dec<T>(ptr: *mut T) -> *mut T {
+    (ptr as usize).wrapping_sub(1) as *mut T
+}
+
+#[inline]
+unsafe fn intel_timeline_is_last(tl: *const IntelTimeline, rq: *const I915Request) -> bool {
+    unsafe {
+        crate::linux::list::list_is_last_rcu(
+            core::ptr::addr_of!((*rq).link),
+            core::ptr::addr_of!((*tl).requests),
+        )
+    }
+}
+
+#[inline]
+unsafe fn i915_priolist_free(pl: *mut I915Priolist) {
+    if !pl.is_null() {
+        unsafe { __i915_priolist_free(pl) };
+    }
+}
+
+#[inline]
+unsafe fn rb_link_node(node: *mut RbNode, parent: *mut RbNode, link: *mut *mut RbNode) {
+    unsafe {
+        (*node).parent_color = parent as usize;
+        (*node).left = core::ptr::null_mut();
+        (*node).right = core::ptr::null_mut();
+        *link = node;
+    }
+}
+
+#[inline]
+unsafe fn rb_insert_color_cached(node: *mut RbNode, root: *mut RbRootCached, leftmost: bool) {
+    if leftmost {
+        unsafe { (*root).leftmost = node };
+    }
+    unsafe { rb_insert_color(node, core::ptr::addr_of_mut!((*root).root)) };
+}
+
+#[inline]
+unsafe fn HAS_LOGICAL_RING_ELSQ(i915: *mut DrmI915Private) -> bool {
+    let info = unsafe { (*i915).info.cast::<IntelDeviceInfoOverlay>() };
+    assert!(!info.is_null());
+    // `has_logical_ring_elsq` is bit 20 in DEV_INFO_FOR_EACH_FLAG.
+    unsafe { (*info).flags[2] & (1 << 4) != 0 }
+}
+
+#[allow(non_snake_case)]
+unsafe fn INIT_RCU_WORK(rcu: *mut RcuWork, callback: unsafe extern "C" fn(*mut WorkStruct)) {
+    unsafe { crate::linux::workqueue::INIT_WORK_C(&mut (*rcu).work, callback) };
+}
+
+#[inline]
+unsafe fn intel_engine_set_irq_handler(
+    engine: *mut IntelEngineCs,
+    handler: unsafe extern "C" fn(*mut IntelEngineCs, u16),
+) {
+    // Equivalent to the source header's smp_store_mb() of the IRQ callback.
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    unsafe { (*engine).irq_handler = Some(handler) };
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+// The generic list adapters live in linux_list, but their older helper macros
+// referred through a private re-export. Keep the same traversal/consumption
+// behavior while naming the owning public type directly in this module.
+macro_rules! priolist_for_each_request_consume {
+    ($request:ident, $next:ident, $plist:expr, $body:block) => {{
+        let mut $request: *mut crate::i915_request_types_upstream::I915Request =
+            core::ptr::null_mut();
+        let mut $next: *mut crate::i915_request_types_upstream::I915Request = core::ptr::null_mut();
+        let __priolist = $plist;
+        list_for_each_entry_safe!(
+            $request,
+            $next,
+            unsafe { core::ptr::addr_of_mut!((*__priolist).requests) },
+            sched.link,
+            $body
+        );
+    }};
+}
+
+macro_rules! priolist_for_each_request {
+    ($request:ident, $plist:expr, $body:block) => {{
+        let mut $request: *mut crate::i915_request_types_upstream::I915Request =
+            core::ptr::null_mut();
+        let __priolist = $plist;
+        list_for_each_entry!(
+            $request,
+            unsafe { core::ptr::addr_of_mut!((*__priolist).requests) },
+            sched.link,
+            $body
+        );
+    }};
+}
+
+macro_rules! for_each_child {
+    ($parent:ident, $child:ident, $($body:tt)+) => {{
+        let mut $child: *mut crate::intel_context_types_upstream::IntelContext =
+            core::ptr::null_mut();
+        let head = unsafe {
+            core::ptr::addr_of_mut!((*$parent).parallel.children.child_list)
+                as *mut crate::intel_engine_cs_upstream::ListHead
+        };
+        list_for_each_entry!($child, head, parallel.children.child_link, { $($body)+ });
+    }};
+}
 
 /// DOC: Logical Rings, Logical Ring Contexts and Execlists
 ///
@@ -185,7 +649,7 @@ struct VirtualEngine {
     context: IntelContext,
     rcu: RcuWork,
     request: *mut I915Request,
-    nodes: [VeNode; I915_NUM_ENGINES],
+    nodes: [VeNode; I915_NUM_ENGINES as usize],
     num_siblings: u32,
     siblings: [*mut IntelEngineCs; 0],
 }
@@ -235,7 +699,10 @@ unsafe fn ring_set_paused(engine: *const IntelEngineCs, state: i32) {
     // We inspect HWS_PREEMPT with a semaphore inside
     // engine->emit_fini_breadcrumb. If the dword is true, the ring is paused
     // as the semaphore will busywait until the dword is false.
-    *(*engine).status_page.addr.add(I915_GEM_HWS_PREEMPT) = state as u32;
+    *(*engine)
+        .status_page
+        .addr
+        .add(I915_GEM_HWS_PREEMPT as usize) = state as u32;
     if state != 0 {
         wmb();
     }
@@ -278,7 +745,7 @@ unsafe fn queue_prio(sched_engine: *const I915SchedEngine) -> i32 {
 
 // upstream: intel_execlists_submission.c virtual_prio()
 unsafe fn virtual_prio(el: *const IntelEngineExeclists) -> i32 {
-    let rb = rb_first_cached(&(*el).r#virtual);
+    let rb = rb_first_cached(&(*el).virtual_);
     if rb.is_null() {
         INT_MIN
     } else {
@@ -300,13 +767,15 @@ unsafe fn need_preempt(engine: *const IntelEngineCs, rq: *const I915Request) -> 
     // to preempt ourselves. Do not trigger at equal priority: preserve FIFO
     // ordering of dependencies for the running task.
     last_prio = max(effective_prio(rq), I915_PRIORITY_NORMAL - 1);
-    if (*(*engine).sched_engine).queue_priority_hint <= last_prio {
+    if (*(*engine).sched_engine.cast::<I915SchedEngine>()).queue_priority_hint <= last_prio {
         return false;
     }
 
     // Check ELSP[1], whose priority is the highest for that context via PI.
-    if !list_is_last(&(*rq).sched.link, &(*(*engine).sched_engine).requests)
-        && rq_prio(list_next_entry!(rq, sched.link)) > last_prio
+    if !list_is_last(
+        &(*rq).sched.link,
+        &(*(*engine).sched_engine.cast::<I915SchedEngine>()).requests,
+    ) && rq_prio(list_next_entry!(rq as *mut I915Request, sched.link)) > last_prio
     {
         return true;
     }
@@ -314,7 +783,7 @@ unsafe fn need_preempt(engine: *const IntelEngineCs, rq: *const I915Request) -> 
     // Otherwise compare the first active queued priolist and virtual queue.
     max(
         virtual_prio(&(*engine).execlists),
-        queue_prio((*engine).sched_engine),
+        queue_prio((*engine).sched_engine.cast::<I915SchedEngine>()),
     ) > last_prio
 }
 
@@ -336,13 +805,13 @@ unsafe fn __unwind_incomplete_requests(engine: *mut IntelEngineCs) -> *mut I915R
     let mut pl: *mut ListHead;
     let mut prio = I915_PRIORITY_INVALID;
 
-    lockdep_assert_held!(&(*(*engine).sched_engine).lock);
+    lockdep_assert_held!(&(*(*engine).sched_engine.cast::<I915SchedEngine>()).lock);
 
     list_for_each_entry_safe_reverse!(
         rq,
         rn,
         I915Request,
-        &(*(*engine).sched_engine).requests,
+        &(*(*engine).sched_engine.cast::<I915SchedEngine>()).requests,
         sched.link,
         {
             if __i915_request_is_complete(rq) {
@@ -355,9 +824,14 @@ unsafe fn __unwind_incomplete_requests(engine: *mut IntelEngineCs) -> *mut I915R
             GEM_BUG_ON!(rq_prio(rq) == I915_PRIORITY_INVALID);
             if rq_prio(rq) != prio {
                 prio = rq_prio(rq);
-                pl = i915_sched_lookup_priolist((*engine).sched_engine, prio);
+                pl = i915_sched_lookup_priolist(
+                    (*engine).sched_engine.cast::<I915SchedEngine>(),
+                    prio,
+                );
             }
-            GEM_BUG_ON!(i915_sched_engine_is_empty((*engine).sched_engine));
+            GEM_BUG_ON!(i915_sched_engine_is_empty(
+                (*engine).sched_engine.cast::<I915SchedEngine>()
+            ));
 
             list_move(&mut (*rq).sched.link, pl);
             set_bit(I915_FENCE_FLAG_PQUEUE, &mut (*rq).fence.flags);
@@ -381,7 +855,11 @@ unsafe fn execlists_context_status_change(rq: *mut I915Request, status: c_ulong)
         return;
     }
 
-    atomic_notifier_call_chain(&mut (*(*rq).engine).context_status_notifier, status, rq);
+    atomic_notifier_call_chain(
+        core::ptr::addr_of_mut!((*(*rq).engine).context_status_notifier).cast(),
+        status,
+        rq.cast(),
+    );
 }
 
 // upstream: intel_execlists_submission.c reset_active()
@@ -437,7 +915,7 @@ unsafe fn __execlists_schedule_in(rq: *mut I915Request) -> *mut IntelEngineCs {
     }
 
     if IS_ENABLED!(CONFIG_DRM_I915_DEBUG_GEM) {
-        lrc_check_regs(ce, engine, "before");
+        lrc_check_regs(ce, engine, c"before".as_ptr());
     }
 
     if (*ce).tag != 0 {
@@ -447,14 +925,14 @@ unsafe fn __execlists_schedule_in(rq: *mut I915Request) -> *mut IntelEngineCs {
     } else if GRAPHICS_VER_FULL((*engine).i915) >= IP_VER(12, 55) {
         // We need distinct values, not strict matching.
         let tag = ffs(READ_ONCE!((*engine).context_tag));
-        GEM_BUG_ON!(tag == 0 || tag >= BITS_PER_LONG);
+        GEM_BUG_ON!(tag == 0 || tag >= BITS_PER_LONG as i32);
         clear_bit(tag - 1, &mut (*engine).context_tag);
-        (*ce).lrc.ccid = tag << (XEHP_SW_CTX_ID_SHIFT - 32);
+        (*ce).lrc.ccid = (tag as u32) << (XEHP_SW_CTX_ID_SHIFT - 32);
         BUILD_BUG_ON!(BITS_PER_LONG > GEN12_MAX_CONTEXT_HW_ID);
     } else {
         // We need distinct values, not strict matching.
         let tag = __ffs((*engine).context_tag);
-        GEM_BUG_ON!(tag >= BITS_PER_LONG);
+        GEM_BUG_ON!(tag >= BITS_PER_LONG as u32);
         __clear_bit(tag, &mut (*engine).context_tag);
         (*ce).lrc.ccid = (1 + tag) << (GEN11_SW_CTX_ID_SHIFT - 32);
         BUILD_BUG_ON!(BITS_PER_LONG > GEN12_MAX_CONTEXT_HW_ID);
@@ -469,7 +947,7 @@ unsafe fn __execlists_schedule_in(rq: *mut I915Request) -> *mut IntelEngineCs {
     if (*engine).fw_domain != 0 {
         (*engine).fw_active += 1;
     }
-    execlists_context_status_change(rq, INTEL_CONTEXT_SCHEDULE_IN);
+    execlists_context_status_change(rq, INTEL_CONTEXT_SCHEDULE_IN as c_ulong);
     intel_engine_context_in(engine);
 
     CE_TRACE!(ce, "schedule-in, ccid:%x\n", (*ce).lrc.ccid);
@@ -482,7 +960,7 @@ unsafe fn execlists_schedule_in(rq: *mut I915Request, idx: i32) {
     let mut old: *mut IntelEngineCs;
 
     GEM_BUG_ON!(!intel_engine_pm_is_awake((*rq).engine));
-    trace_i915_request_in(rq, idx);
+    trace_i915_request_in(rq, idx as u32);
 
     old = (*ce).inflight;
     if old.is_null() {
@@ -497,13 +975,13 @@ unsafe fn execlists_schedule_in(rq: *mut I915Request, idx: i32) {
 unsafe fn resubmit_virtual_request(rq: *mut I915Request, ve: *mut VirtualEngine) {
     let engine = (*rq).engine;
 
-    spin_lock_irq(&mut (*(*engine).sched_engine).lock);
+    spin_lock_irq(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock);
 
     clear_bit(I915_FENCE_FLAG_PQUEUE, &mut (*rq).fence.flags);
     WRITE_ONCE!((*rq).engine, &mut (*ve).base);
-    ((*ve).base.submit_request)(rq);
+    ((*ve).base.submit_request.unwrap_unchecked())(rq);
 
-    spin_unlock_irq(&mut (*(*engine).sched_engine).lock);
+    spin_unlock_irq(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock);
 }
 
 // upstream: intel_execlists_submission.c kick_siblings()
@@ -524,7 +1002,7 @@ unsafe fn kick_siblings(rq: *mut I915Request, ce: *mut IntelContext) {
     }
 
     if READ_ONCE!((*ve).request) != core::ptr::null_mut() {
-        tasklet_hi_schedule(&mut (*(*ve).base.sched_engine).tasklet);
+        tasklet_hi_schedule(&mut (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).tasklet);
     }
 }
 
@@ -539,7 +1017,7 @@ unsafe fn __execlists_schedule_out(rq: *mut I915Request, ce: *mut IntelContext) 
     GEM_BUG_ON!((*ce).inflight != engine);
 
     if IS_ENABLED!(CONFIG_DRM_I915_DEBUG_GEM) {
-        lrc_check_regs(ce, engine, "after");
+        lrc_check_regs(ce, engine, c"after".as_ptr());
     }
 
     // Re-enter power saving after the last request on this context completes.
@@ -562,7 +1040,7 @@ unsafe fn __execlists_schedule_out(rq: *mut I915Request, ce: *mut IntelContext) 
         __set_bit(ccid - 1, &mut (*engine).context_tag);
     }
     intel_engine_context_out(engine);
-    execlists_context_status_change(rq, INTEL_CONTEXT_SCHEDULE_OUT);
+    execlists_context_status_change(rq, INTEL_CONTEXT_SCHEDULE_OUT as c_ulong);
     if (*engine).fw_domain != 0 {
         (*engine).fw_active -= 1;
         if (*engine).fw_active == 0 {
@@ -588,7 +1066,7 @@ unsafe fn execlists_schedule_out(rq: *mut I915Request) {
 
     GEM_BUG_ON!((*ce).inflight.is_null());
     (*ce).inflight = ptr_dec((*ce).inflight);
-    if !__intel_context_inflight_count((*ce).inflight) {
+    if __intel_context_inflight_count((*ce).inflight) == 0 {
         __execlists_schedule_out(rq, ce);
     }
 
@@ -614,7 +1092,7 @@ unsafe fn execlists_update_context(rq: *mut I915Request) -> u64 {
     let prev: u32;
 
     if (*(*rq).engine).flags & I915_ENGINE_HAS_EU_PRIORITY != 0 {
-        desc |= map_i915_prio_to_lrc_desc_prio(rq_prio(rq));
+        desc |= map_i915_prio_to_lrc_desc_prio(rq_prio(rq)) as u64;
     }
 
     // WaIdleLiteRestore:bdw,skl
@@ -623,13 +1101,13 @@ unsafe fn execlists_update_context(rq: *mut I915Request) -> u64 {
     // the tail. If not, force context reload. Returning to a preempted context
     // must also force reload, as HW may ignore rewinding TAIL to an earlier
     // request's end.
-    GEM_BUG_ON!((*ce).lrc_reg_state[CTX_RING_TAIL] != (*(*rq).ring).tail);
+    GEM_BUG_ON!(*(*ce).lrc_reg_state.add(CTX_RING_TAIL as usize) != (*(*rq).ring).tail);
     prev = (*(*rq).ring).tail;
     tail = intel_ring_set_tail((*rq).ring, (*rq).tail);
     if unlikely!(intel_ring_direction((*rq).ring, tail, prev) <= 0) {
         desc |= CTX_DESC_FORCE_RESTORE;
     }
-    (*ce).lrc_reg_state[CTX_RING_TAIL] = tail;
+    *(*ce).lrc_reg_state.add(CTX_RING_TAIL as usize) = tail;
     (*rq).tail = (*rq).wa_tail;
 
     // Ensure the context image is complete before submitting it to HW.
@@ -717,7 +1195,9 @@ unsafe fn trace_ports(
 
 // upstream: intel_execlists_submission.c reset_in_progress()
 unsafe fn reset_in_progress(engine: *const IntelEngineCs) -> bool {
-    unlikely!(!__tasklet_is_enabled(&(*(*engine).sched_engine).tasklet))
+    unlikely!(!__tasklet_is_enabled(
+        &(*(*engine).sched_engine.cast::<I915SchedEngine>()).tasklet
+    ))
 }
 
 // upstream: intel_execlists_submission.c assert_pending_valid()
@@ -931,7 +1411,10 @@ unsafe fn can_merge_rq(prev: *const I915Request, next: *const I915Request) -> bo
         return false;
     }
 
-    GEM_BUG_ON!(i915_seqno_passed((*prev).fence.seqno, (*next).fence.seqno));
+    GEM_BUG_ON!(i915_seqno_passed(
+        (*prev).fence.seqno as u32,
+        (*next).fence.seqno as u32
+    ));
     true
 }
 
@@ -953,7 +1436,7 @@ unsafe fn virtual_matches(
 
     // Do not overwrite the context image until HW completed saving it.
     inflight = intel_context_inflight(&(*ve).context);
-    if !inflight.is_null() && inflight != engine {
+    if !inflight.is_null() && inflight != engine.cast_mut() {
         return false;
     }
     true
@@ -962,7 +1445,7 @@ unsafe fn virtual_matches(
 // upstream: intel_execlists_submission.c first_virtual_engine()
 unsafe fn first_virtual_engine(engine: *mut IntelEngineCs) -> *mut VirtualEngine {
     let el = &mut (*engine).execlists;
-    let mut rb = rb_first_cached(&(*el).r#virtual);
+    let mut rb = rb_first_cached(&(*el).virtual_);
 
     while !rb.is_null() {
         let ve = rb_entry!(rb, VirtualEngine, nodes[(*engine).id].rb);
@@ -970,9 +1453,9 @@ unsafe fn first_virtual_engine(engine: *mut IntelEngineCs) -> *mut VirtualEngine
 
         // Lazily clean up after another engine handled the request.
         if rq.is_null() || !virtual_matches(ve, rq, engine) {
-            rb_erase_cached(rb, &mut (*el).r#virtual);
+            rb_erase_cached(rb, &mut (*el).virtual_);
             RB_CLEAR_NODE(rb);
-            rb = rb_first_cached(&(*el).r#virtual);
+            rb = rb_first_cached(&(*el).virtual_);
             continue;
         }
 
@@ -985,7 +1468,7 @@ unsafe fn first_virtual_engine(engine: *mut IntelEngineCs) -> *mut VirtualEngine
 unsafe fn virtual_xfer_context(ve: *mut VirtualEngine, engine: *mut IntelEngineCs) {
     let mut n: u32;
 
-    if likely!(engine == *(*ve).siblings) {
+    if likely!(engine == *(*ve).siblings.as_mut_ptr()) {
         return;
     }
 
@@ -998,8 +1481,11 @@ unsafe fn virtual_xfer_context(ve: *mut VirtualEngine, engine: *mut IntelEngineC
     // is kicked first so the chosen register bindings are preferentially reused.
     n = 1;
     while n < (*ve).num_siblings {
-        if *(*ve).siblings.add(n as usize) == engine {
-            swap(&mut *(*ve).siblings.add(n as usize), &mut *(*ve).siblings);
+        if *(*ve).siblings.as_mut_ptr().add(n as usize) == engine {
+            swap(
+                &mut *(*ve).siblings.as_mut_ptr().add(n as usize),
+                &mut *(*ve).siblings.as_mut_ptr(),
+            );
             break;
         }
         n += 1;
@@ -1064,7 +1550,10 @@ unsafe fn defer_active(engine: *mut IntelEngineCs) {
     }
     defer_request(
         rq,
-        i915_sched_lookup_priolist((*engine).sched_engine, rq_prio(rq)),
+        i915_sched_lookup_priolist(
+            (*engine).sched_engine.cast::<I915SchedEngine>(),
+            rq_prio(rq),
+        ),
     );
 }
 
@@ -1073,7 +1562,7 @@ unsafe fn timeslice_yield(el: *const IntelEngineExeclists, rq: *const I915Reques
     // Once a semaphore miss occurs, treat this context as a hog for the rest
     // of its timeslice: CSB reports only the first miss and cannot tell us if
     // the semaphore later signaled or became blocked on another semaphore.
-    (*(*rq).context).lrc.ccid == READ_ONCE!((*el).yield)
+    (*(*rq).context).lrc.ccid == READ_ONCE!((*el).yield_)
 }
 
 // upstream: intel_execlists_submission.c needs_timeslice()
@@ -1091,15 +1580,18 @@ unsafe fn needs_timeslice(engine: *const IntelEngineCs, rq: *const I915Request) 
         return false;
     }
     // ELSP[1] occupied: check whether slicing is worthwhile.
-    if !list_is_last_rcu(&(*rq).sched.link, &(*(*engine).sched_engine).requests) {
+    if !list_is_last_rcu(
+        &(*rq).sched.link,
+        &(*(*engine).sched_engine.cast::<I915SchedEngine>()).requests,
+    ) {
         ENGINE_TRACE!(engine, "timeslice required for second inflight context\n");
         return true;
     }
-    if !i915_sched_engine_is_empty((*engine).sched_engine) {
+    if !i915_sched_engine_is_empty((*engine).sched_engine.cast::<I915SchedEngine>()) {
         ENGINE_TRACE!(engine, "timeslice required for queue\n");
         return true;
     }
-    if !RB_EMPTY_ROOT(&(*engine).execlists.r#virtual.rb_root) {
+    if !RB_EMPTY_ROOT(&(*engine).execlists.virtual_.root) {
         ENGINE_TRACE!(engine, "timeslice required for virtual\n");
         return true;
     }
@@ -1135,7 +1627,9 @@ unsafe fn start_timeslice(engine: *mut IntelEngineCs) {
         if timer_active(&el.timer) {
             // A newly submitted ELSP may inherit an already-consumed slice.
             if !timer_pending(&el.timer) {
-                tasklet_hi_schedule(&mut (*(*engine).sched_engine).tasklet);
+                tasklet_hi_schedule(
+                    &mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).tasklet,
+                );
             }
             return;
         }
@@ -1160,7 +1654,7 @@ unsafe fn active_preempt_timeout(engine: *mut IntelEngineCs, rq: *const I915Requ
 
     // Force fast reset for terminated contexts (ignore sysfs).
     if unlikely!(intel_context_is_banned((*rq).context) || bad_request(rq)) {
-        return INTEL_CONTEXT_BANNED_PREEMPT_TIMEOUT_MS;
+        return INTEL_CONTEXT_BANNED_PREEMPT_TIMEOUT_MS as c_ulong;
     }
     READ_ONCE!((*engine).props.preempt_timeout_ms)
 }
@@ -1187,7 +1681,7 @@ unsafe fn completed(rq: *const I915Request) -> bool {
 // upstream: intel_execlists_submission.c execlists_dequeue()
 unsafe fn execlists_dequeue(engine: *mut IntelEngineCs) {
     let execlists = &mut (*engine).execlists;
-    let sched_engine = (*engine).sched_engine;
+    let sched_engine = (*engine).sched_engine.cast::<I915SchedEngine>();
     let mut port = execlists.pending.as_mut_ptr();
     let last_port = port.add(execlists.port_mask as usize);
     let mut last: *mut I915Request;
@@ -1257,7 +1751,7 @@ unsafe fn execlists_dequeue(engine: *mut IntelEngineCs) {
             last = core::ptr::null_mut();
         } else {
             // An already-pending second request can wait for the next CS event.
-            if !*active.add(1).is_null() {
+            if !(*active.add(1)).is_null() {
                 spin_unlock(&mut (*sched_engine).lock);
                 return;
             }
@@ -1271,7 +1765,7 @@ unsafe fn execlists_dequeue(engine: *mut IntelEngineCs) {
             break;
         }
 
-        let virtual_sched = (*ve).base.sched_engine;
+        let virtual_sched = (*ve).base.sched_engine.cast::<I915SchedEngine>();
         spin_lock(&mut (*virtual_sched).lock);
 
         let rq = (*ve).request;
@@ -1307,14 +1801,14 @@ unsafe fn execlists_dequeue(engine: *mut IntelEngineCs) {
             } else {
                 ""
             },
-            str_yes_no(engine != *(*ve).siblings)
+            str_yes_no(engine != *(*ve).siblings.as_mut_ptr())
         );
 
         WRITE_ONCE!((*ve).request, core::ptr::null_mut());
         WRITE_ONCE!((*virtual_sched).queue_priority_hint, INT_MIN);
 
         rb = &mut (*ve).nodes[(*engine).id as usize].rb;
-        rb_erase_cached(rb, &mut execlists.r#virtual);
+        rb_erase_cached(rb, &mut execlists.virtual_);
         RB_CLEAR_NODE(rb);
 
         GEM_BUG_ON!((*rq).execution_mask & (*engine).mask == 0);
@@ -1324,7 +1818,7 @@ unsafe fn execlists_dequeue(engine: *mut IntelEngineCs) {
             // Only a real submission may change sibling bindings: this avoids
             // touching an idle context used by virtual_context_enter/exit.
             virtual_xfer_context(ve, engine);
-            GEM_BUG_ON!(*(*ve).siblings != engine);
+            GEM_BUG_ON!(*(*ve).siblings.as_mut_ptr() != engine);
             submit = true;
             last = rq;
         }
@@ -1384,7 +1878,8 @@ unsafe fn execlists_dequeue(engine: *mut IntelEngineCs) {
 
                 GEM_BUG_ON!(!last.is_null() && !can_merge_ctx((*last).context, (*rq).context));
                 GEM_BUG_ON!(
-                    !last.is_null() && i915_seqno_passed((*last).fence.seqno, (*rq).fence.seqno)
+                    !last.is_null()
+                        && i915_seqno_passed((*last).fence.seqno as u32, (*rq).fence.seqno as u32)
                 );
 
                 submit = true;
@@ -1423,7 +1918,7 @@ unsafe fn execlists_dequeue(engine: *mut IntelEngineCs) {
             );
         }
 
-        WRITE_ONCE!(execlists.yield, -1);
+        WRITE_ONCE!(execlists.yield_, u32::MAX);
         set_preempt_timeout(engine, *active);
         execlists_submit_ports(engine);
     } else {
@@ -1453,7 +1948,11 @@ unsafe fn clear_ports(ports: *mut *mut I915Request, count: i32) {
 }
 
 // upstream: intel_execlists_submission.c copy_ports()
-unsafe fn copy_ports(dst: *mut *mut I915Request, src: *mut *mut I915Request, mut count: i32) {
+unsafe fn copy_ports(
+    mut dst: *mut *mut I915Request,
+    mut src: *mut *mut I915Request,
+    mut count: i32,
+) {
     // A memcpy_p() would be very useful here!
     while count != 0 {
         WRITE_ONCE!(*dst, *src); /* Avoid write tearing. */
@@ -1482,7 +1981,7 @@ unsafe fn cancel_port_requests(
     );
 
     // Mark the end of active before overwriting *active.
-    port = xchg(&mut (*execlists).active, (*execlists).pending.as_mut_ptr());
+    port = xchg(&mut (*execlists).active, (*execlists).pending.as_mut_ptr()).cast_mut();
     while !(*port).is_null() {
         *inactive = *port;
         inactive = inactive.add(1);
@@ -1547,7 +2046,7 @@ unsafe fn gen12_csb_parse(csb: u64) -> bool {
 
 // upstream: intel_execlists_submission.c gen8_csb_parse()
 unsafe fn gen8_csb_parse(csb: u64) -> bool {
-    csb & (GEN8_CTX_STATUS_IDLE_ACTIVE | GEN8_CTX_STATUS_PREEMPTED) != 0
+    csb & (GEN8_CTX_STATUS_IDLE_ACTIVE | GEN8_CTX_STATUS_PREEMPTED) as u64 != 0
 }
 
 // upstream: intel_execlists_submission.c wa_csb_read()
@@ -1558,18 +2057,24 @@ unsafe fn wa_csb_read(engine: *const IntelEngineCs, csb: *const u64) -> u64 {
     // do not trust the HW at all: the MMIO entry can also be unordered, so
     // prefer this self-checking path and return MMIO as a final fallback.
     // tgl,dg1:HSDES#22011327657.
-    preempt_disable();
-    if wait_for_atomic_us!((entry = READ_ONCE!(*csb)) != !0u64, 10) {
+    kernel_guard::NoPreempt::acquire();
+    if wait_for_atomic_us!(
+        {
+            entry = READ_ONCE!(*csb);
+            entry != !0u64
+        },
+        10
+    ) {
         let mut idx = csb.offset_from((*engine).execlists.csb_status) as i32;
         let mut status = GEN8_EXECLISTS_STATUS_BUF;
         if idx >= 6 {
             status = GEN11_EXECLISTS_STATUS_BUF2;
             idx -= 6;
         }
-        status += size_of::<u64>() as i32 * idx;
+        status += size_of::<u64>() as u32 * idx as u32;
         entry = intel_uncore_read64((*engine).uncore, MMIO((*engine).mmio_base + status as u32));
     }
-    preempt_enable();
+    kernel_guard::NoPreempt::release(());
     entry
 }
 
@@ -1610,7 +2115,8 @@ unsafe fn process_csb(
 
     // CSB tracking is exclusive in the tasklet, or during serialized reset.
     GEM_BUG_ON!(
-        !tasklet_is_locked(&mut (*(*engine).sched_engine).tasklet) && !reset_in_progress(engine)
+        !tasklet_is_locked(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).tasklet)
+            && !reset_in_progress(engine)
     );
 
     // Read only the low byte of the MMIO write pointer: the following bits
@@ -1713,7 +2219,7 @@ unsafe fn process_csb(
             // impossible case where the context completes first.
             if GEM_SHOW_DEBUG!() && !__i915_request_is_complete(*execlists.active) {
                 let rq = *execlists.active;
-                let regs = (*(*rq).context).lrc_reg_state.as_ptr();
+                let regs = (*(*rq).context).lrc_reg_state;
 
                 ENGINE_TRACE!(engine, "context completed before request!\n");
                 ENGINE_TRACE!(
@@ -1761,7 +2267,10 @@ unsafe fn process_csb(
 
     // Gen11 can violate global observation ordering between CSB entries and
     // tail updates. Flush entries for the next update even on working HW.
-    drm_clflush_virt_range(buf, num_entries as usize * size_of::<u64>());
+    drm_clflush_virt_range(
+        buf.cast(),
+        num_entries as c_ulong * size_of::<u64>() as c_ulong,
+    );
 
     // Any event changes context flow and merits a fresh slice; reinstall only
     // after examining whether a new submission is needed.
@@ -1818,7 +2327,7 @@ unsafe fn __execlists_hold(mut rq: *mut I915Request) {
         clear_bit(I915_FENCE_FLAG_PQUEUE, &mut (*rq).fence.flags);
         list_move_tail(
             &mut (*rq).sched.link,
-            &mut (*(*(*rq).engine).sched_engine).hold,
+            &mut (*(*(*rq).engine).sched_engine.cast::<I915SchedEngine>()).hold,
         );
         i915_request_set_hold(rq);
         RQ_TRACE!(rq, "on hold\n");
@@ -1855,12 +2364,12 @@ unsafe fn execlists_hold(engine: *mut IntelEngineCs, mut rq: *mut I915Request) -
         return false;
     }
 
-    spin_lock_irq(&mut (*(*engine).sched_engine).lock);
+    spin_lock_irq(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock);
 
     if __i915_request_is_complete(rq) {
         // Too late!
         rq = core::ptr::null_mut();
-        spin_unlock_irq(&mut (*(*engine).sched_engine).lock);
+        spin_unlock_irq(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock);
         return false;
     }
 
@@ -1869,9 +2378,11 @@ unsafe fn execlists_hold(engine: *mut IntelEngineCs, mut rq: *mut I915Request) -
     GEM_BUG_ON!(i915_request_on_hold(rq));
     GEM_BUG_ON!((*rq).engine != engine);
     __execlists_hold(rq);
-    GEM_BUG_ON!(list_empty(&(*(*engine).sched_engine).hold));
+    GEM_BUG_ON!(list_empty(
+        &(*(*engine).sched_engine.cast::<I915SchedEngine>()).hold
+    ));
 
-    spin_unlock_irq(&mut (*(*engine).sched_engine).lock);
+    spin_unlock_irq(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock);
     !rq.is_null()
 }
 
@@ -1916,7 +2427,10 @@ unsafe fn __execlists_unhold(mut rq: *mut I915Request) {
         i915_request_clear_hold(rq);
         list_move_tail(
             &mut (*rq).sched.link,
-            i915_sched_lookup_priolist((*(*rq).engine).sched_engine, rq_prio(rq)),
+            i915_sched_lookup_priolist(
+                (*(*rq).engine).sched_engine.cast::<I915SchedEngine>(),
+                rq_prio(rq),
+            ),
         );
         set_bit(I915_FENCE_FLAG_PQUEUE, &mut (*rq).fence.flags);
 
@@ -1945,17 +2459,17 @@ unsafe fn __execlists_unhold(mut rq: *mut I915Request) {
 
 // upstream: intel_execlists_submission.c execlists_unhold()
 unsafe fn execlists_unhold(engine: *mut IntelEngineCs, rq: *mut I915Request) {
-    spin_lock_irq(&mut (*(*engine).sched_engine).lock);
+    spin_lock_irq(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock);
 
     // Return this request and its suspended children/grandchildren to queues.
     __execlists_unhold(rq);
 
-    if rq_prio(rq) > (*(*engine).sched_engine).queue_priority_hint {
-        (*(*engine).sched_engine).queue_priority_hint = rq_prio(rq);
-        tasklet_hi_schedule(&mut (*(*engine).sched_engine).tasklet);
+    if rq_prio(rq) > (*(*engine).sched_engine.cast::<I915SchedEngine>()).queue_priority_hint {
+        (*(*engine).sched_engine.cast::<I915SchedEngine>()).queue_priority_hint = rq_prio(rq);
+        tasklet_hi_schedule(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).tasklet);
     }
 
-    spin_unlock_irq(&mut (*(*engine).sched_engine).lock);
+    spin_unlock_irq(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock);
 }
 
 #[repr(C)]
@@ -1970,19 +2484,20 @@ unsafe extern "C" fn execlists_capture_work(work: *mut WorkStruct) {
     let cap = container_of!(work, ExeclistsCapture, work);
     let gfp = __GFP_KSWAPD_RECLAIM | __GFP_RETRY_MAYFAIL | __GFP_NOWARN;
     let engine = (*cap).rq.as_ref().unwrap_unchecked().engine;
-    let gt = (*(*cap).error).gt;
+    let error = gpu_coredump((*cap).error);
+    let gt = (*error).gt;
     let mut vma: *mut IntelEngineCaptureVma;
 
     // Compress all objects attached to the request (slow).
-    vma = intel_engine_coredump_add_request((*gt).engine, (*cap).rq, gfp);
+    vma = intel_engine_coredump_add_request((*gt).engine.cast(), (*cap).rq, gfp);
     if !vma.is_null() {
-        let compress = i915_vma_capture_prepare(gt);
-        intel_engine_coredump_add_vma((*gt).engine, vma, compress);
-        i915_vma_capture_finish(gt, compress);
+        let compress = i915_vma_capture_prepare(gt.cast());
+        intel_engine_coredump_add_vma((*gt).engine.cast(), vma, compress);
+        i915_vma_capture_finish(gt.cast(), compress);
     }
 
     (*gt).simulated = (*(*gt).engine).simulated;
-    (*(*cap).error).simulated = (*gt).simulated;
+    (*error).simulated = (*gt).simulated;
 
     // Publish the error state and notify the system.
     i915_error_state_store((*cap).error);
@@ -2010,22 +2525,23 @@ unsafe fn capture_regs(engine: *mut IntelEngineCs) -> *mut ExeclistsCapture {
         return core::ptr::null_mut();
     }
 
-    (*(*cap).error).gt = intel_gt_coredump_alloc((*engine).gt, gfp, CORE_DUMP_FLAG_NONE);
-    if (*(*cap).error).gt.is_null() {
+    let error = gpu_coredump((*cap).error);
+    (*error).gt = intel_gt_coredump_alloc((*engine).gt, gfp, CORE_DUMP_FLAG_NONE).cast();
+    if (*error).gt.is_null() {
         kfree((*cap).error as *mut c_void);
         kfree(cap as *mut c_void);
         return core::ptr::null_mut();
     }
 
-    (*(*(*cap).error).gt).engine = intel_engine_coredump_alloc(engine, gfp, CORE_DUMP_FLAG_NONE);
-    if (*(*(*cap).error).gt).engine.is_null() {
-        kfree((*(*cap).error).gt as *mut c_void);
+    (*(*error).gt).engine = intel_engine_coredump_alloc(engine, gfp, CORE_DUMP_FLAG_NONE).cast();
+    if (*(*error).gt).engine.is_null() {
+        kfree((*error).gt as *mut c_void);
         kfree((*cap).error as *mut c_void);
         kfree(cap as *mut c_void);
         return core::ptr::null_mut();
     }
 
-    (*(*(*(*cap).error).gt).engine).hung = true;
+    (*(*(*error).gt).engine).hung = true;
     cap
 }
 
@@ -2037,7 +2553,7 @@ unsafe fn active_context(engine: *mut IntelEngineCs, ccid: u32) -> *mut I915Requ
 
     // Prefer process_csb() state; check pending in case an error interrupt
     // arrives before the first CS event is written.
-    port = el.active;
+    port = el.active.cast_mut();
     while !(*port).is_null() {
         rq = *port;
         if (*(*rq).context).lrc.ccid == ccid {
@@ -2091,13 +2607,13 @@ unsafe fn execlists_capture(engine: *mut IntelEngineCs) {
         return;
     }
 
-    spin_lock_irq(&mut (*(*engine).sched_engine).lock);
+    spin_lock_irq(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock);
     (*cap).rq = active_context(engine, active_ccid(engine));
     if !(*cap).rq.is_null() {
         (*cap).rq = active_request((*(*(*cap).rq).context).timeline, (*cap).rq);
         (*cap).rq = i915_request_get_rcu((*cap).rq);
     }
-    spin_unlock_irq(&mut (*(*engine).sched_engine).lock);
+    spin_unlock_irq(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock);
     if (*cap).rq.is_null() {
         i915_gpu_coredump_put((*cap).error);
         kfree(cap as *mut c_void);
@@ -2122,7 +2638,7 @@ unsafe fn execlists_capture(engine: *mut IntelEngineCs) {
 
 // upstream: intel_execlists_submission.c execlists_reset()
 unsafe fn execlists_reset(engine: *mut IntelEngineCs, msg: *const c_char) {
-    let bit = I915_RESET_ENGINE + (*engine).id;
+    let bit = I915_RESET_ENGINE + (*engine).id as u32;
     let lock = &mut (*(*engine).gt).reset.flags;
 
     if !intel_has_reset_engine((*engine).gt) {
@@ -2134,14 +2650,14 @@ unsafe fn execlists_reset(engine: *mut IntelEngineCs, msg: *const c_char) {
 
     ENGINE_TRACE!(engine, "reset for %s\n", msg);
     // Disable without waiting for the current tasklet to complete.
-    tasklet_disable_nosync(&mut (*(*engine).sched_engine).tasklet);
+    tasklet_disable_nosync(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).tasklet);
 
     ring_set_paused(engine, 1); /* Freeze the current request in place. */
     execlists_capture(engine);
     intel_engine_reset(engine, msg);
 
-    tasklet_enable(&mut (*(*engine).sched_engine).tasklet);
-    clear_and_wake_up_bit(bit, lock);
+    tasklet_enable(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).tasklet);
+    clear_and_wake_up_bit(bit as i32, lock);
 }
 
 // upstream: intel_execlists_submission.c preempt_timeout()
@@ -2158,9 +2674,9 @@ unsafe fn preempt_timeout(engine: *const IntelEngineCs) -> bool {
 }
 
 // upstream: intel_execlists_submission.c execlists_submission_tasklet()
-unsafe fn execlists_submission_tasklet(t: *mut TaskletStruct) {
+unsafe extern "C" fn execlists_submission_tasklet(t: *mut TaskletStruct) {
     let sched_engine = from_tasklet!(t, I915SchedEngine, tasklet);
-    let engine = (*sched_engine).private_data;
+    let engine = (*sched_engine).private_data.cast::<IntelEngineCs>();
     let mut post = [core::ptr::null_mut::<I915Request>(); 2 * EXECLIST_MAX_PORTS];
     let mut inactive: *mut *mut I915Request;
 
@@ -2175,7 +2691,7 @@ unsafe fn execlists_submission_tasklet(t: *mut TaskletStruct) {
         // switched contexts but the pending preemption event has not arrived,
         // restart the timeout for the new context to exit gracefully.
         cancel_timer(&mut (*engine).execlists.preempt);
-        if rq == (*engine).execlists.preempt_target {
+        if rq == (*engine).execlists.preempt_target.cast_mut() {
             (*engine).execlists.error_interrupt |= ERROR_PREEMPT;
         } else {
             set_timer_ms(
@@ -2212,10 +2728,10 @@ unsafe fn execlists_submission_tasklet(t: *mut TaskletStruct) {
 }
 
 // upstream: intel_execlists_submission.c execlists_irq_handler()
-unsafe fn execlists_irq_handler(engine: *mut IntelEngineCs, iir: u16) {
+unsafe extern "C" fn execlists_irq_handler(engine: *mut IntelEngineCs, iir: u16) {
     let mut tasklet = false;
 
-    if unlikely!(iir & GT_CS_MASTER_ERROR_INTERRUPT != 0) {
+    if unlikely!((iir as u32) & GT_CS_MASTER_ERROR_INTERRUPT != 0) {
         let eir = ENGINE_READ!(engine, RING_EIR) & GENMASK!(15, 0);
         ENGINE_TRACE!(engine, "CS error: %x\n", eir);
 
@@ -2228,25 +2744,29 @@ unsafe fn execlists_irq_handler(engine: *mut IntelEngineCs, iir: u16) {
         }
     }
 
-    if iir & GT_WAIT_SEMAPHORE_INTERRUPT != 0 {
+    if (iir as u32) & GT_WAIT_SEMAPHORE_INTERRUPT != 0 {
         WRITE_ONCE!(
-            (*engine).execlists.yield,
+            (*engine).execlists.yield_,
             ENGINE_READ_FW!(engine, RING_EXECLIST_STATUS_HI)
         );
-        ENGINE_TRACE!(engine, "semaphore yield: %08x\n", (*engine).execlists.yield);
+        ENGINE_TRACE!(
+            engine,
+            "semaphore yield: %08x\n",
+            (*engine).execlists.yield_
+        );
         if timer_delete(&mut (*engine).execlists.timer) {
             tasklet = true;
         }
     }
 
-    if iir & GT_CONTEXT_SWITCH_INTERRUPT != 0 {
+    if (iir as u32) & GT_CONTEXT_SWITCH_INTERRUPT != 0 {
         tasklet = true;
     }
-    if iir & GT_RENDER_USER_INTERRUPT != 0 {
+    if (iir as u32) & GT_RENDER_USER_INTERRUPT != 0 {
         intel_engine_signal_breadcrumbs(engine);
     }
     if tasklet {
-        tasklet_hi_schedule(&mut (*(*engine).sched_engine).tasklet);
+        tasklet_hi_schedule(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).tasklet);
     }
 }
 
@@ -2254,7 +2774,7 @@ unsafe fn execlists_irq_handler(engine: *mut IntelEngineCs, iir: u16) {
 unsafe fn __execlists_kick(execlists: *mut IntelEngineExeclists) {
     let engine = container_of!(execlists, IntelEngineCs, execlists);
     // Interrupt coalescing and reset handling are delegated to the tasklet.
-    tasklet_hi_schedule(&mut (*(*engine).sched_engine).tasklet);
+    tasklet_hi_schedule(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).tasklet);
 }
 
 // upstream: intel_execlists_submission.c execlists_timeslice()
@@ -2274,14 +2794,17 @@ unsafe fn queue_request(engine: *mut IntelEngineCs, rq: *mut I915Request) {
     GEM_BUG_ON!(!list_empty(&(*rq).sched.link));
     list_add_tail(
         &mut (*rq).sched.link,
-        i915_sched_lookup_priolist((*engine).sched_engine, rq_prio(rq)),
+        i915_sched_lookup_priolist(
+            (*engine).sched_engine.cast::<I915SchedEngine>(),
+            rq_prio(rq),
+        ),
     );
     set_bit(I915_FENCE_FLAG_PQUEUE, &mut (*rq).fence.flags);
 }
 
 // upstream: intel_execlists_submission.c submit_queue()
 unsafe fn submit_queue(engine: *mut IntelEngineCs, rq: *const I915Request) -> bool {
-    let sched_engine = (*engine).sched_engine;
+    let sched_engine = (*engine).sched_engine.cast::<I915SchedEngine>();
     if rq_prio(rq) <= (*sched_engine).queue_priority_hint {
         return false;
     }
@@ -2292,34 +2815,42 @@ unsafe fn submit_queue(engine: *mut IntelEngineCs, rq: *const I915Request) -> bo
 // upstream: intel_execlists_submission.c ancestor_on_hold()
 unsafe fn ancestor_on_hold(engine: *const IntelEngineCs, rq: *const I915Request) -> bool {
     GEM_BUG_ON!(i915_request_on_hold(rq));
-    !list_empty(&(*(*engine).sched_engine).hold) && hold_request(rq)
+    !list_empty(&(*(*engine).sched_engine.cast::<I915SchedEngine>()).hold) && hold_request(rq)
 }
 
 // upstream: intel_execlists_submission.c execlists_submit_request()
-unsafe fn execlists_submit_request(request: *mut I915Request) {
+unsafe extern "C" fn execlists_submit_request(request: *mut I915Request) {
     let engine = (*request).engine;
     let mut flags: c_ulong = 0;
 
     // Foreign fences may call this in IRQ context.
-    spin_lock_irqsave(&mut (*(*engine).sched_engine).lock, &mut flags);
+    spin_lock_irqsave(
+        &mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock,
+        &mut flags,
+    );
 
     if unlikely!(ancestor_on_hold(engine, request)) {
         RQ_TRACE!(request, "ancestor on hold\n");
         list_add_tail(
             &mut (*request).sched.link,
-            &mut (*(*engine).sched_engine).hold,
+            &mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).hold,
         );
         i915_request_set_hold(request);
     } else {
         queue_request(engine, request);
-        GEM_BUG_ON!(i915_sched_engine_is_empty((*engine).sched_engine));
+        GEM_BUG_ON!(i915_sched_engine_is_empty(
+            (*engine).sched_engine.cast::<I915SchedEngine>()
+        ));
         GEM_BUG_ON!(list_empty(&(*request).sched.link));
         if submit_queue(engine, request) {
             __execlists_kick(&mut (*engine).execlists);
         }
     }
 
-    spin_unlock_irqrestore(&mut (*(*engine).sched_engine).lock, flags);
+    spin_unlock_irqrestore(
+        &mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock,
+        flags,
+    );
 }
 
 // upstream: intel_execlists_submission.c __execlists_context_pre_pin()
@@ -2336,7 +2867,7 @@ unsafe fn __execlists_context_pre_pin(
 
     if !__test_and_set_bit(CONTEXT_INIT_BIT, &mut (*ce).flags) {
         lrc_init_state(ce, engine, *vaddr);
-        __i915_gem_object_flush_map((*(*ce).state).obj, 0, (*engine).context_size);
+        __i915_gem_object_flush_map((*(*ce).state).obj, 0, (*engine).context_size as u64);
     }
     0
 }
@@ -2356,7 +2887,7 @@ unsafe extern "C" fn execlists_context_pin(ce: *mut IntelContext, vaddr: *mut c_
 }
 
 // upstream: intel_execlists_submission.c execlists_context_alloc()
-unsafe fn execlists_context_alloc(ce: *mut IntelContext) -> i32 {
+unsafe extern "C" fn execlists_context_alloc(ce: *mut IntelContext) -> i32 {
     lrc_alloc(ce, (*ce).engine)
 }
 
@@ -2365,7 +2896,7 @@ unsafe extern "C" fn execlists_context_cancel_request(ce: *mut IntelContext, rq:
     let mut engine: *mut IntelEngineCs = core::ptr::null_mut();
 
     i915_request_active_engine(rq, &mut engine);
-    if !engine.is_null() && intel_engine_pulse(engine) {
+    if !engine.is_null() && intel_engine_pulse(engine) != 0 {
         intel_gt_handle_error(
             (*engine).gt,
             (*engine).mask,
@@ -2377,7 +2908,7 @@ unsafe extern "C" fn execlists_context_cancel_request(ce: *mut IntelContext, rq:
 }
 
 // upstream: intel_execlists_submission.c execlists_create_parallel()
-unsafe fn execlists_create_parallel(
+unsafe extern "C" fn execlists_create_parallel(
     engines: *mut *mut IntelEngineCs,
     num_siblings: u32,
     width: u32,
@@ -2432,8 +2963,8 @@ static execlists_context_ops: IntelContextOps = IntelContextOps {
     exit: Some(intel_context_exit_engine),
     sched_disable: None,
     update_stats: None,
-    reset: Some(lrc_reset),
-    destroy: Some(lrc_destroy),
+    reset: Some(lrc_reset_callback),
+    destroy: Some(lrc_destroy_callback),
     create_virtual: Some(execlists_create_virtual),
     create_parallel: Some(execlists_create_parallel),
     get_sibling: None,
@@ -2447,7 +2978,7 @@ unsafe fn emit_pdps(rq: *mut I915Request) -> i32 {
     let mut i: u32;
     let mut cs: *mut u32;
 
-    GEM_BUG_ON!(intel_vgpu_active(rq));
+    GEM_BUG_ON!(intel_vgpu_active((*rq).i915));
 
     // This magic sequence is fragile: small changes can cause GPU hangs,
     // forcewake failures, or machine lockups.
@@ -2462,12 +2993,12 @@ unsafe fn emit_pdps(rq: *mut I915Request) -> i32 {
     intel_ring_advance(rq, cs);
 
     // Flush residual operations from context load.
-    err = ((*engine).emit_flush)(rq, EMIT_FLUSH);
+    err = ((*engine).emit_flush.unwrap_unchecked())(rq, EMIT_FLUSH);
     if err != 0 {
         return err;
     }
     // Required magic to prevent forcewake errors.
-    err = ((*engine).emit_flush)(rq, EMIT_INVALIDATE);
+    err = ((*engine).emit_flush.unwrap_unchecked())(rq, EMIT_INVALIDATE);
     if err != 0 {
         return err;
     }
@@ -2504,7 +3035,7 @@ unsafe fn emit_pdps(rq: *mut I915Request) -> i32 {
 }
 
 // upstream: intel_execlists_submission.c execlists_request_alloc()
-unsafe fn execlists_request_alloc(request: *mut I915Request) -> i32 {
+unsafe extern "C" fn execlists_request_alloc(request: *mut I915Request) -> i32 {
     GEM_BUG_ON!(!intel_context_is_pinned((*request).context));
 
     // Reserve enough space to reduce waits after request construction starts.
@@ -2520,7 +3051,7 @@ unsafe fn execlists_request_alloc(request: *mut I915Request) -> i32 {
     }
 
     // Always invalidate GPU caches and TLBs.
-    let ret = ((*(*request).engine).emit_flush)(request, EMIT_INVALIDATE);
+    let ret = ((*(*request).engine).emit_flush.unwrap_unchecked())(request, EMIT_INVALIDATE);
     if ret != 0 {
         return ret;
     }
@@ -2553,12 +3084,12 @@ unsafe fn reset_csb_pointers(engine: *mut IntelEngineCs) {
     // Check that the GPU updates CSB entries.
     memset(
         execlists.csb_status as *mut c_void,
-        !0,
+        !0i32,
         (reset_value as usize + 1) * size_of::<u64>(),
     );
     drm_clflush_virt_range(
-        execlists.csb_status,
-        execlists.csb_size as usize * size_of_val(&execlists.csb_status),
+        execlists.csb_status.cast(),
+        execlists.csb_size as c_ulong * size_of::<u64>() as c_ulong,
     );
 
     // Once more for luck and our trusty paranoia.
@@ -2574,21 +3105,21 @@ unsafe fn reset_csb_pointers(engine: *mut IntelEngineCs) {
 
 // upstream: intel_execlists_submission.c sanitize_hwsp()
 unsafe fn sanitize_hwsp(engine: *mut IntelEngineCs) {
-    let mut tl: *mut IntelTimeline;
+    let mut tl: *mut IntelTimeline = core::ptr::null_mut();
     list_for_each_entry!(tl, &mut (*engine).status_page.timelines, engine_link, {
         intel_timeline_reset_seqno(tl);
     });
 }
 
 // upstream: intel_execlists_submission.c execlists_sanitize()
-unsafe fn execlists_sanitize(engine: *mut IntelEngineCs) {
-    GEM_BUG_ON!(execlists_active(&mut (*engine).execlists));
+unsafe extern "C" fn execlists_sanitize(engine: *mut IntelEngineCs) {
+    GEM_BUG_ON!(!execlists_active(&(*engine).execlists).is_null());
 
     // Poison possible lost/replaced pinned state after suspend/resume.
     if IS_ENABLED!(CONFIG_DRM_I915_DEBUG_GEM) {
         memset(
             (*engine).status_page.addr as *mut c_void,
-            POISON_INUSE,
+            POISON_INUSE as i32,
             PAGE_SIZE,
         );
     }
@@ -2599,7 +3130,7 @@ unsafe fn execlists_sanitize(engine: *mut IntelEngineCs) {
     sanitize_hwsp(engine);
 
     // Scrub dirty cachelines for the HWSP.
-    drm_clflush_virt_range((*engine).status_page.addr, PAGE_SIZE);
+    drm_clflush_virt_range((*engine).status_page.addr.cast(), PAGE_SIZE as c_ulong);
     intel_engine_reset_pinned_contexts(engine);
 }
 
@@ -2651,7 +3182,7 @@ unsafe fn enable_execlists(engine: *mut IntelEngineCs) {
 }
 
 // upstream: intel_execlists_submission.c execlists_resume()
-unsafe fn execlists_resume(engine: *mut IntelEngineCs) -> i32 {
+unsafe extern "C" fn execlists_resume(engine: *mut IntelEngineCs) -> i32 {
     intel_mocs_init_engine(engine);
     intel_breadcrumbs_reset((*engine).breadcrumbs);
     enable_execlists(engine);
@@ -2663,16 +3194,20 @@ unsafe fn execlists_resume(engine: *mut IntelEngineCs) -> i32 {
 }
 
 // upstream: intel_execlists_submission.c execlists_reset_prepare()
-unsafe fn execlists_reset_prepare(engine: *mut IntelEngineCs) {
+unsafe extern "C" fn execlists_reset_prepare(engine: *mut IntelEngineCs) {
     ENGINE_TRACE!(
         engine,
         "depth<-%d\n",
-        atomic_read(&(*(*engine).sched_engine).tasklet.count)
+        atomic_read(
+            &(*(*engine).sched_engine.cast::<I915SchedEngine>())
+                .tasklet
+                .count
+        )
     );
 
     // Stop submissions until reset_finish; otherwise another engine may queue
     // work into the ELSP while this engine resumes and writes its own ELSP.
-    __tasklet_disable_sync_once(&mut (*(*engine).sched_engine).tasklet);
+    __tasklet_disable_sync_once(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).tasklet);
     GEM_BUG_ON!(!reset_in_progress(engine));
 
     // Stop CS before reset: failed resets can deadlock old parts, and newer
@@ -2694,7 +3229,7 @@ unsafe fn reset_csb(
     inactive: *mut *mut I915Request,
 ) -> *mut *mut I915Request {
     let execlists = &mut (*engine).execlists;
-    drm_clflush_virt_range(execlists.csb_write, size_of::<u32>());
+    drm_clflush_virt_range(execlists.csb_write.cast(), size_of::<u32>() as c_ulong);
 
     let inactive = process_csb(engine, inactive); /* Drain preemption events. */
 
@@ -2770,7 +3305,7 @@ unsafe fn execlists_reset_csb(engine: *mut IntelEngineCs, stalled: bool) {
 }
 
 // upstream: intel_execlists_submission.c execlists_reset_rewind()
-unsafe fn execlists_reset_rewind(engine: *mut IntelEngineCs, stalled: bool) {
+unsafe extern "C" fn execlists_reset_rewind(engine: *mut IntelEngineCs, stalled: bool) {
     let mut flags: c_ulong = 0;
     ENGINE_TRACE!(engine, "\n");
 
@@ -2779,24 +3314,33 @@ unsafe fn execlists_reset_rewind(engine: *mut IntelEngineCs, stalled: bool) {
 
     // Queue incomplete requests for replay after reset.
     rcu_read_lock();
-    spin_lock_irqsave(&mut (*(*engine).sched_engine).lock, &mut flags);
+    spin_lock_irqsave(
+        &mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock,
+        &mut flags,
+    );
     __unwind_incomplete_requests(engine);
-    spin_unlock_irqrestore(&mut (*(*engine).sched_engine).lock, flags);
+    spin_unlock_irqrestore(
+        &mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock,
+        flags,
+    );
     rcu_read_unlock();
 }
 
 // upstream: intel_execlists_submission.c nop_submission_tasklet()
-unsafe fn nop_submission_tasklet(t: *mut TaskletStruct) {
+unsafe extern "C" fn nop_submission_tasklet(t: *mut TaskletStruct) {
     let sched_engine = from_tasklet!(t, I915SchedEngine, tasklet);
-    let engine = (*sched_engine).private_data;
+    let engine = (*sched_engine).private_data.cast::<IntelEngineCs>();
     // Driver is wedged; do not process further events.
-    WRITE_ONCE!((*(*engine).sched_engine).queue_priority_hint, INT_MIN);
+    WRITE_ONCE!(
+        (*(*engine).sched_engine.cast::<I915SchedEngine>()).queue_priority_hint,
+        INT_MIN
+    );
 }
 
 // upstream: intel_execlists_submission.c execlists_reset_cancel()
-unsafe fn execlists_reset_cancel(engine: *mut IntelEngineCs) {
+unsafe extern "C" fn execlists_reset_cancel(engine: *mut IntelEngineCs) {
     let execlists = &mut (*engine).execlists;
-    let sched_engine = (*engine).sched_engine;
+    let sched_engine = (*engine).sched_engine.cast::<I915SchedEngine>();
     let mut rq: *mut I915Request;
     let mut rn: *mut I915Request;
     let mut rb: *mut RbNode;
@@ -2825,7 +3369,7 @@ unsafe fn execlists_reset_cancel(engine: *mut IntelEngineCs) {
         }
         let p = to_priolist(rb);
         priolist_for_each_request_consume!(rq, rn, p, {
-            if i915_request_mark_eio(unsafe { &mut *rq }) {
+            if !i915_request_mark_eio(unsafe { &mut *rq }).is_null() {
                 __i915_request_submit(rq);
                 i915_request_put(rq);
             }
@@ -2841,41 +3385,46 @@ unsafe fn execlists_reset_cancel(engine: *mut IntelEngineCs) {
 
     // Cancel virtual engines attached to this physical engine.
     loop {
-        rb = rb_first_cached(&(*execlists).r#virtual);
+        rb = rb_first_cached(&(*execlists).virtual_);
         if rb.is_null() {
             break;
         }
         let ve = rb_entry!(rb, VirtualEngine, nodes[(*engine).id].rb);
-        rb_erase_cached(rb, &mut (*execlists).r#virtual);
+        rb_erase_cached(rb, &mut (*execlists).virtual_);
         RB_CLEAR_NODE(rb);
 
-        spin_lock(&mut (*(*ve).base.sched_engine).lock);
+        spin_lock(&mut (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).lock);
         rq = fetch_and_zero(&mut (*ve).request);
         if !rq.is_null() {
-            if i915_request_mark_eio(unsafe { &mut *rq }) {
+            if !i915_request_mark_eio(unsafe { &mut *rq }).is_null() {
                 (*rq).engine = engine;
                 __i915_request_submit(rq);
                 i915_request_put(rq);
             }
             i915_request_put(rq);
-            (*(*ve).base.sched_engine).queue_priority_hint = INT_MIN;
+            (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).queue_priority_hint = INT_MIN;
         }
-        spin_unlock(&mut (*(*ve).base.sched_engine).lock);
+        spin_unlock(&mut (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).lock);
     }
 
     // Remaining unready requests are nopped when submitted.
     (*sched_engine).queue_priority_hint = INT_MIN;
     (*sched_engine).queue = RB_ROOT_CACHED!();
 
-    GEM_BUG_ON!(__tasklet_is_enabled(&mut (*(*engine).sched_engine).tasklet));
-    (*(*engine).sched_engine).tasklet.callback = nop_submission_tasklet;
+    GEM_BUG_ON!(__tasklet_is_enabled(
+        &mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).tasklet
+    ));
+    (*(*engine).sched_engine.cast::<I915SchedEngine>())
+        .tasklet
+        .callbacks
+        .callback = Some(nop_submission_tasklet);
 
     spin_unlock_irqrestore(&mut (*sched_engine).lock, flags);
     rcu_read_unlock();
 }
 
 // upstream: intel_execlists_submission.c execlists_reset_finish()
-unsafe fn execlists_reset_finish(engine: *mut IntelEngineCs) {
+unsafe extern "C" fn execlists_reset_finish(engine: *mut IntelEngineCs) {
     let execlists = &mut (*engine).execlists;
 
     // Replay requests while forcewake is held, before the GPU can sleep. On
@@ -2883,18 +3432,22 @@ unsafe fn execlists_reset_finish(engine: *mut IntelEngineCs) {
     // higher level, with wedging the final fallback.
     GEM_BUG_ON!(!reset_in_progress(engine));
 
-    if __tasklet_enable(&mut (*(*engine).sched_engine).tasklet) {
+    if __tasklet_enable(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).tasklet) {
         __execlists_kick(execlists);
     }
     ENGINE_TRACE!(
         engine,
         "depth->%d\n",
-        atomic_read(&(*(*engine).sched_engine).tasklet.count)
+        atomic_read(
+            &(*(*engine).sched_engine.cast::<I915SchedEngine>())
+                .tasklet
+                .count
+        )
     );
 }
 
 // upstream: intel_execlists_submission.c gen8_logical_ring_enable_irq()
-unsafe fn gen8_logical_ring_enable_irq(engine: *mut IntelEngineCs) {
+unsafe extern "C" fn gen8_logical_ring_enable_irq(engine: *mut IntelEngineCs) {
     ENGINE_WRITE!(
         engine,
         RING_IMR,
@@ -2904,43 +3457,46 @@ unsafe fn gen8_logical_ring_enable_irq(engine: *mut IntelEngineCs) {
 }
 
 // upstream: intel_execlists_submission.c gen8_logical_ring_disable_irq()
-unsafe fn gen8_logical_ring_disable_irq(engine: *mut IntelEngineCs) {
+unsafe extern "C" fn gen8_logical_ring_disable_irq(engine: *mut IntelEngineCs) {
     ENGINE_WRITE!(engine, RING_IMR, !(*engine).irq_keep_mask);
 }
 
 // upstream: intel_execlists_submission.c execlists_park()
-unsafe fn execlists_park(engine: *mut IntelEngineCs) {
+unsafe extern "C" fn execlists_park(engine: *mut IntelEngineCs) {
     cancel_timer(&mut (*engine).execlists.timer);
     cancel_timer(&mut (*engine).execlists.preempt);
     // Reset on idle so we do not delay busy wakeup.
-    WRITE_ONCE!((*(*engine).sched_engine).queue_priority_hint, INT_MIN);
+    WRITE_ONCE!(
+        (*(*engine).sched_engine.cast::<I915SchedEngine>()).queue_priority_hint,
+        INT_MIN
+    );
 }
 
 // upstream: intel_execlists_submission.c add_to_engine()
-unsafe fn add_to_engine(rq: *mut I915Request) {
-    lockdep_assert_held!(&mut (*(*(*rq).engine).sched_engine).lock);
+unsafe extern "C" fn add_to_engine(rq: *mut I915Request) {
+    lockdep_assert_held!(&mut (*(*(*rq).engine).sched_engine.cast::<I915SchedEngine>()).lock);
     list_move_tail(
         &mut (*rq).sched.link,
-        &mut (*(*(*rq).engine).sched_engine).requests,
+        &mut (*(*(*rq).engine).sched_engine.cast::<I915SchedEngine>()).requests,
     );
 }
 
 // upstream: intel_execlists_submission.c remove_from_engine()
-unsafe fn remove_from_engine(rq: *mut I915Request) {
+unsafe extern "C" fn remove_from_engine(rq: *mut I915Request) {
     let mut engine: *mut IntelEngineCs;
     let mut locked: *mut IntelEngineCs;
 
     // A virtual request's rq->engine is unstable until under that engine lock.
     // Lock the observed engine and retry if ownership changed.
     locked = READ_ONCE!((*rq).engine);
-    spin_lock_irq(&mut (*(*locked).sched_engine).lock);
+    spin_lock_irq(&mut (*(*locked).sched_engine.cast::<I915SchedEngine>()).lock);
     loop {
         engine = READ_ONCE!((*rq).engine);
         if likely!(locked == engine) {
             break;
         }
-        spin_unlock(&mut (*(*locked).sched_engine).lock);
-        spin_lock(&mut (*(*engine).sched_engine).lock);
+        spin_unlock(&mut (*(*locked).sched_engine.cast::<I915SchedEngine>()).lock);
+        spin_lock(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock);
         locked = engine;
     }
 
@@ -2950,7 +3506,7 @@ unsafe fn remove_from_engine(rq: *mut I915Request) {
 
     // Block future __await_execution() callback registration, then flush.
     set_bit(I915_FENCE_FLAG_ACTIVE, &mut (*rq).fence.flags);
-    spin_unlock_irq(&mut (*(*locked).sched_engine).lock);
+    spin_unlock_irq(&mut (*(*locked).sched_engine.cast::<I915SchedEngine>()).lock);
 
     i915_request_notify_execute_cb_imm(rq);
 }
@@ -2963,7 +3519,7 @@ unsafe fn can_preempt(engine: *mut IntelEngineCs) -> bool {
 // upstream: intel_execlists_submission.c kick_execlists()
 unsafe fn kick_execlists(rq: *const I915Request, prio: i32) {
     let engine = (*rq).engine;
-    let sched_engine = (*engine).sched_engine;
+    let sched_engine = (*engine).sched_engine.cast::<I915SchedEngine>();
     let mut inflight: *const I915Request;
 
     // Only kick once for a high-priority new context.
@@ -3008,11 +3564,14 @@ unsafe fn kick_execlists(rq: *const I915Request, prio: i32) {
 }
 
 // upstream: intel_execlists_submission.c execlists_set_default_submission()
-unsafe fn execlists_set_default_submission(engine: *mut IntelEngineCs) {
-    (*engine).submit_request = execlists_submit_request;
-    (*(*engine).sched_engine).schedule = i915_schedule;
-    (*(*engine).sched_engine).kick_backend = kick_execlists;
-    (*(*engine).sched_engine).tasklet.callback = execlists_submission_tasklet;
+unsafe extern "C" fn execlists_set_default_submission(engine: *mut IntelEngineCs) {
+    (*engine).submit_request = Some(execlists_submit_request);
+    (*(*engine).sched_engine.cast::<I915SchedEngine>()).schedule = Some(i915_schedule);
+    (*(*engine).sched_engine.cast::<I915SchedEngine>()).kick_backend = Some(kick_execlists);
+    (*(*engine).sched_engine.cast::<I915SchedEngine>())
+        .tasklet
+        .callbacks
+        .callback = Some(execlists_submission_tasklet);
 }
 
 // upstream: intel_execlists_submission.c execlists_shutdown()
@@ -3020,11 +3579,11 @@ unsafe fn execlists_shutdown(engine: *mut IntelEngineCs) {
     // Synchronize residual timers and any softirqs they raise.
     timer_delete_sync(&mut (*engine).execlists.timer);
     timer_delete_sync(&mut (*engine).execlists.preempt);
-    tasklet_kill(&mut (*(*engine).sched_engine).tasklet);
+    tasklet_kill(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).tasklet);
 }
 
 // upstream: intel_execlists_submission.c execlists_release()
-unsafe fn execlists_release(engine: *mut IntelEngineCs) {
+unsafe extern "C" fn execlists_release(engine: *mut IntelEngineCs) {
     (*engine).sanitize = None; /* No longer controlled; nothing to sanitize. */
     execlists_shutdown(engine);
     intel_engine_cleanup_common(engine);
@@ -3033,7 +3592,7 @@ unsafe fn execlists_release(engine: *mut IntelEngineCs) {
 
 // upstream: intel_execlists_submission.c __execlists_engine_busyness()
 unsafe fn __execlists_engine_busyness(engine: *mut IntelEngineCs, now: *mut KtimeT) -> KtimeT {
-    let stats = &mut (*engine).stats.execlists;
+    let stats = &mut (*engine).stats.data.execlists;
     let mut total = stats.total;
 
     // Include current execution in accumulated busyness.
@@ -3045,8 +3604,11 @@ unsafe fn __execlists_engine_busyness(engine: *mut IntelEngineCs, now: *mut Ktim
 }
 
 // upstream: intel_execlists_submission.c execlists_engine_busyness()
-unsafe fn execlists_engine_busyness(engine: *mut IntelEngineCs, now: *mut KtimeT) -> KtimeT {
-    let stats = &mut (*engine).stats.execlists;
+unsafe extern "C" fn execlists_engine_busyness(
+    engine: *mut IntelEngineCs,
+    now: *mut KtimeT,
+) -> KtimeT {
+    let stats = &mut (*engine).stats.data.execlists;
     let mut seq: u32;
     let mut total: KtimeT;
 
@@ -3063,31 +3625,31 @@ unsafe fn execlists_engine_busyness(engine: *mut IntelEngineCs, now: *mut KtimeT
 // upstream: intel_execlists_submission.c logical_ring_default_vfuncs()
 unsafe fn logical_ring_default_vfuncs(engine: *mut IntelEngineCs) {
     // Default virtual functions, overridable per engine.
-    (*engine).resume = execlists_resume;
+    (*engine).resume = Some(execlists_resume);
     (*engine).cops = &execlists_context_ops;
-    (*engine).request_alloc = execlists_request_alloc;
-    (*engine).add_active_request = add_to_engine;
-    (*engine).remove_active_request = remove_from_engine;
+    (*engine).request_alloc = Some(execlists_request_alloc);
+    (*engine).add_active_request = Some(add_to_engine);
+    (*engine).remove_active_request = Some(remove_from_engine);
 
-    (*engine).reset.prepare = execlists_reset_prepare;
-    (*engine).reset.rewind = execlists_reset_rewind;
-    (*engine).reset.cancel = execlists_reset_cancel;
-    (*engine).reset.finish = execlists_reset_finish;
+    (*engine).reset.prepare = Some(execlists_reset_prepare);
+    (*engine).reset.rewind = Some(execlists_reset_rewind);
+    (*engine).reset.cancel = Some(execlists_reset_cancel);
+    (*engine).reset.finish = Some(execlists_reset_finish);
 
-    (*engine).park = execlists_park;
+    (*engine).park = Some(execlists_park);
     (*engine).unpark = None;
-    (*engine).emit_flush = gen8_emit_flush_xcs;
-    (*engine).emit_init_breadcrumb = gen8_emit_init_breadcrumb;
-    (*engine).emit_fini_breadcrumb = gen8_emit_fini_breadcrumb_xcs;
+    (*engine).emit_flush = Some(gen8_emit_flush_xcs);
+    (*engine).emit_init_breadcrumb = Some(gen8_emit_init_breadcrumb);
+    (*engine).emit_fini_breadcrumb = Some(gen8_emit_fini_breadcrumb_xcs);
     if GRAPHICS_VER((*engine).i915) >= 12 {
-        (*engine).emit_fini_breadcrumb = gen12_emit_fini_breadcrumb_xcs;
-        (*engine).emit_flush = gen12_emit_flush_xcs;
+        (*engine).emit_fini_breadcrumb = Some(gen12_emit_fini_breadcrumb_xcs);
+        (*engine).emit_flush = Some(gen12_emit_flush_xcs);
     }
-    (*engine).set_default_submission = execlists_set_default_submission;
+    (*engine).set_default_submission = Some(execlists_set_default_submission);
 
     if GRAPHICS_VER((*engine).i915) < 11 {
-        (*engine).irq_enable = gen8_logical_ring_enable_irq;
-        (*engine).irq_disable = gen8_logical_ring_disable_irq;
+        (*engine).irq_enable = Some(gen8_logical_ring_enable_irq);
+        (*engine).irq_disable = Some(gen8_logical_ring_disable_irq);
     } else {
         // TODO: Gen11 masks must be clear for C6; keep interrupts enabled and
         // accept extra interrupts until a more refined solution exists.
@@ -3107,17 +3669,17 @@ unsafe fn logical_ring_default_vfuncs(engine: *mut IntelEngineCs) {
 
     if GRAPHICS_VER_FULL((*engine).i915) >= IP_VER(12, 55) {
         if intel_engine_has_preemption(engine) {
-            (*engine).emit_bb_start = xehp_emit_bb_start;
+            (*engine).emit_bb_start = Some(xehp_emit_bb_start);
         } else {
-            (*engine).emit_bb_start = xehp_emit_bb_start_noarb;
+            (*engine).emit_bb_start = Some(xehp_emit_bb_start_noarb);
         }
     } else if intel_engine_has_preemption(engine) {
-        (*engine).emit_bb_start = gen8_emit_bb_start;
+        (*engine).emit_bb_start = Some(gen8_emit_bb_start);
     } else {
-        (*engine).emit_bb_start = gen8_emit_bb_start_noarb;
+        (*engine).emit_bb_start = Some(gen8_emit_bb_start_noarb);
     }
 
-    (*engine).busyness = execlists_engine_busyness;
+    (*engine).busyness = Some(execlists_engine_busyness);
 }
 
 // upstream: intel_execlists_submission.c logical_ring_default_irqs()
@@ -3126,13 +3688,13 @@ unsafe fn logical_ring_default_irqs(engine: *mut IntelEngineCs) {
 
     if GRAPHICS_VER((*engine).i915) < 11 {
         let irq_shifts = [
-            [RCS0, GEN8_RCS_IRQ_SHIFT],
-            [BCS0, GEN8_BCS_IRQ_SHIFT],
-            [VCS0, GEN8_VCS0_IRQ_SHIFT],
-            [VCS1, GEN8_VCS1_IRQ_SHIFT],
-            [VECS0, GEN8_VECS_IRQ_SHIFT],
+            [RCS0 as u32, GEN8_RCS_IRQ_SHIFT],
+            [BCS0 as u32, GEN8_BCS_IRQ_SHIFT],
+            [VCS0 as u32, GEN8_VCS0_IRQ_SHIFT],
+            [VCS1 as u32, GEN8_VCS1_IRQ_SHIFT],
+            [VECS0 as u32, GEN8_VECS_IRQ_SHIFT],
         ];
-        shift = irq_shifts[(*engine).id as usize].1;
+        shift = irq_shifts[(*engine).id as usize][1];
     }
 
     (*engine).irq_enable_mask = GT_RENDER_USER_INTERRUPT << shift;
@@ -3145,16 +3707,16 @@ unsafe fn logical_ring_default_irqs(engine: *mut IntelEngineCs) {
 unsafe fn rcs_submission_override(engine: *mut IntelEngineCs) {
     match GRAPHICS_VER((*engine).i915) {
         12 => {
-            (*engine).emit_flush = gen12_emit_flush_rcs;
-            (*engine).emit_fini_breadcrumb = gen12_emit_fini_breadcrumb_rcs;
+            (*engine).emit_flush = Some(gen12_emit_flush_rcs);
+            (*engine).emit_fini_breadcrumb = Some(gen12_emit_fini_breadcrumb_rcs);
         }
         11 => {
-            (*engine).emit_flush = gen11_emit_flush_rcs;
-            (*engine).emit_fini_breadcrumb = gen11_emit_fini_breadcrumb_rcs;
+            (*engine).emit_flush = Some(gen11_emit_flush_rcs);
+            (*engine).emit_fini_breadcrumb = Some(gen11_emit_fini_breadcrumb_rcs);
         }
         _ => {
-            (*engine).emit_flush = gen8_emit_flush_rcs;
-            (*engine).emit_fini_breadcrumb = gen8_emit_fini_breadcrumb_rcs;
+            (*engine).emit_flush = Some(gen8_emit_flush_rcs);
+            (*engine).emit_fini_breadcrumb = Some(gen8_emit_fini_breadcrumb_rcs);
         }
     }
 }
@@ -3167,7 +3729,7 @@ pub(crate) unsafe fn intel_execlists_submission_setup(engine: *mut IntelEngineCs
     let base = (*engine).mmio_base;
 
     tasklet_setup(
-        &mut (*(*engine).sched_engine).tasklet,
+        &mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).tasklet,
         execlists_submission_tasklet,
     );
     timer_setup(&mut execlists.timer, execlists_timeslice, 0);
@@ -3175,7 +3737,7 @@ pub(crate) unsafe fn intel_execlists_submission_setup(engine: *mut IntelEngineCs
 
     logical_ring_default_vfuncs(engine);
     logical_ring_default_irqs(engine);
-    seqcount_init(&mut (*engine).stats.execlists.lock);
+    seqcount_init(&mut (*engine).stats.data.execlists.lock);
 
     if (*engine).flags & I915_ENGINE_HAS_RCS_REG_STATE != 0 {
         rcs_submission_override(engine);
@@ -3184,50 +3746,61 @@ pub(crate) unsafe fn intel_execlists_submission_setup(engine: *mut IntelEngineCs
 
     if HAS_LOGICAL_RING_ELSQ(i915) {
         execlists.submit_reg = intel_uncore_regs(uncore)
-            .add(i915_mmio_reg_offset(RING_EXECLIST_SQ_CONTENTS(base)) as usize);
+            .cast::<u8>()
+            .add(i915_mmio_reg_offset(RING_EXECLIST_SQ_CONTENTS(base)) as usize)
+            .cast::<u32>();
         execlists.ctrl_reg = intel_uncore_regs(uncore)
-            .add(i915_mmio_reg_offset(RING_EXECLIST_CONTROL(base)) as usize);
+            .cast::<u8>()
+            .add(i915_mmio_reg_offset(RING_EXECLIST_CONTROL(base)) as usize)
+            .cast::<u32>();
         (*engine).fw_domain = intel_uncore_forcewake_for_reg(
             (*engine).uncore,
             RING_EXECLIST_CONTROL((*engine).mmio_base),
             FW_REG_WRITE,
         );
     } else {
-        execlists.submit_reg =
-            intel_uncore_regs(uncore).add(i915_mmio_reg_offset(RING_ELSP(base)) as usize);
+        execlists.submit_reg = intel_uncore_regs(uncore)
+            .cast::<u8>()
+            .add(i915_mmio_reg_offset(RING_ELSP(base)) as usize)
+            .cast::<u32>();
     }
 
-    execlists.csb_status = ((*engine).status_page.addr.add(I915_HWS_CSB_BUF0_INDEX)) as *mut u64;
+    execlists.csb_status = ((*engine)
+        .status_page
+        .addr
+        .add(I915_HWS_CSB_BUF0_INDEX as usize)) as *mut u64;
     execlists.csb_write = (*engine)
         .status_page
         .addr
-        .add(INTEL_HWS_CSB_WRITE_INDEX(i915));
+        .add(crate::INTEL_HWS_CSB_WRITE_INDEX!(i915));
 
     if GRAPHICS_VER(i915) < 11 {
-        execlists.csb_size = GEN8_CSB_ENTRIES;
+        execlists.csb_size = GEN8_CSB_ENTRIES as u8;
     } else {
-        execlists.csb_size = GEN11_CSB_ENTRIES;
+        execlists.csb_size = GEN11_CSB_ENTRIES as u8;
     }
 
     (*engine).context_tag = GENMASK!(BITS_PER_LONG - 2, 0);
     if GRAPHICS_VER(i915) >= 11 && GRAPHICS_VER_FULL(i915) < IP_VER(12, 55) {
-        execlists.ccid |= (*engine).instance << (GEN11_ENGINE_INSTANCE_SHIFT - 32);
-        execlists.ccid |= (*engine).class << (GEN11_ENGINE_CLASS_SHIFT - 32);
+        execlists.ccid |= ((*engine).instance as u32) << (GEN11_ENGINE_INSTANCE_SHIFT - 32);
+        execlists.ccid |= ((*engine).class as u32) << (GEN11_ENGINE_CLASS_SHIFT - 32);
     }
 
     // Take ownership and responsibility for cleanup.
-    (*engine).sanitize = execlists_sanitize;
-    (*engine).release = execlists_release;
+    (*engine).sanitize = Some(execlists_sanitize);
+    (*engine).release = Some(execlists_release);
     0
 }
 
 // upstream: intel_execlists_submission.c virtual_queue()
 unsafe fn virtual_queue(ve: *mut VirtualEngine) -> *mut ListHead {
-    &mut (*(*ve).base.sched_engine).default_priolist.requests
+    &mut (*(*ve).base.sched_engine.cast::<I915SchedEngine>())
+        .default_priolist
+        .requests
 }
 
 // upstream: intel_execlists_submission.c rcu_virtual_context_destroy()
-unsafe fn rcu_virtual_context_destroy(wrk: *mut WorkStruct) {
+unsafe extern "C" fn rcu_virtual_context_destroy(wrk: *mut WorkStruct) {
     let ve = container_of!(wrk, VirtualEngine, rcu.work);
     let mut n: u32;
 
@@ -3235,7 +3808,7 @@ unsafe fn rcu_virtual_context_destroy(wrk: *mut WorkStruct) {
 
     // Preempt-to-busy may leave a stale request behind.
     if unlikely!(!(*ve).request.is_null()) {
-        spin_lock_irq(&mut (*(*(*ve).base.sched_engine)).lock);
+        spin_lock_irq(&mut (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).lock);
 
         let old = fetch_and_zero(&mut (*ve).request);
         if !old.is_null() {
@@ -3244,17 +3817,17 @@ unsafe fn rcu_virtual_context_destroy(wrk: *mut WorkStruct) {
             i915_request_put(old);
         }
 
-        spin_unlock_irq(&mut (*(*(*ve).base.sched_engine)).lock);
+        spin_unlock_irq(&mut (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).lock);
     }
 
     // Flush tasklet before removing sibling rbtrees; a concurrent tasklet
     // could otherwise reinsert its rb_node into a sibling.
-    tasklet_kill(&mut (*(*ve).base.sched_engine).tasklet);
+    tasklet_kill(&mut (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).tasklet);
 
     // Detach from siblings; no access is permitted after this.
     n = 0;
     while n < (*ve).num_siblings {
-        let sibling = *(*ve).siblings.add(n as usize);
+        let sibling = *(*ve).siblings.as_mut_ptr().add(n as usize);
         let node = &mut (*ve).nodes[(*sibling).id as usize].rb;
 
         if RB_EMPTY_NODE(node) {
@@ -3262,19 +3835,19 @@ unsafe fn rcu_virtual_context_destroy(wrk: *mut WorkStruct) {
             continue;
         }
 
-        spin_lock_irq(&mut (*(*sibling).sched_engine).lock);
+        spin_lock_irq(&mut (*(*sibling).sched_engine.cast::<I915SchedEngine>()).lock);
         // Detachment is otherwise lazy in sched_engine->tasklet.
         if !RB_EMPTY_NODE(node) {
-            rb_erase_cached(node, &mut (*sibling).execlists.r#virtual);
+            rb_erase_cached(node, &mut (*sibling).execlists.virtual_);
         }
-        spin_unlock_irq(&mut (*(*sibling).sched_engine).lock);
+        spin_unlock_irq(&mut (*(*sibling).sched_engine.cast::<I915SchedEngine>()).lock);
         n += 1;
     }
 
     GEM_BUG_ON!(__tasklet_is_scheduled(
-        &mut (*(*ve).base.sched_engine).tasklet
+        &mut (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).tasklet
     ));
-    GEM_BUG_ON!(!list_empty(virtual_queue(ve)));
+    GEM_BUG_ON!(!list_empty(&*virtual_queue(ve)));
 
     lrc_fini(&mut (*ve).context);
     intel_context_fini(&mut (*ve).context);
@@ -3283,14 +3856,14 @@ unsafe fn rcu_virtual_context_destroy(wrk: *mut WorkStruct) {
         intel_breadcrumbs_put((*ve).base.breadcrumbs);
     }
     if !(*ve).base.sched_engine.is_null() {
-        i915_sched_engine_put((*ve).base.sched_engine);
+        i915_sched_engine_put((*ve).base.sched_engine.cast::<I915SchedEngine>());
     }
     intel_engine_free_request_pool(&mut (*ve).base);
     kfree(ve as *mut c_void);
 }
 
 // upstream: intel_execlists_submission.c virtual_context_destroy()
-unsafe fn virtual_context_destroy(kref: *mut Kref) {
+unsafe extern "C" fn virtual_context_destroy(kref: *mut Kref) {
     let ve = container_of!(kref, VirtualEngine, context.r#ref);
 
     GEM_BUG_ON!(!list_empty(&(*ve).context.signals));
@@ -3309,14 +3882,17 @@ unsafe fn virtual_engine_initial_hint(ve: *mut VirtualEngine) {
     // Randomize initial sibling order to spread batches of similarly created
     // contexts. sibling[0] is inspected first, but does not force execution.
     if swp != 0 {
-        swap(&mut *(*ve).siblings.add(swp as usize), &mut *(*ve).siblings);
+        swap(
+            &mut *(*ve).siblings.as_mut_ptr().add(swp as usize),
+            &mut *(*ve).siblings.as_mut_ptr(),
+        );
     }
 }
 
 // upstream: intel_execlists_submission.c virtual_context_alloc()
 unsafe extern "C" fn virtual_context_alloc(ce: *mut IntelContext) -> i32 {
     let ve = container_of!(ce, VirtualEngine, context);
-    lrc_alloc(ce, *(*ve).siblings)
+    lrc_alloc(ce, *(*ve).siblings.as_mut_ptr())
 }
 
 // upstream: intel_execlists_submission.c virtual_context_pre_pin()
@@ -3327,46 +3903,49 @@ unsafe extern "C" fn virtual_context_pre_pin(
 ) -> i32 {
     let ve = container_of!(ce, VirtualEngine, context);
     // Use a real engine class to set up register state.
-    __execlists_context_pre_pin(ce, *(*ve).siblings, ww, vaddr)
+    __execlists_context_pre_pin(ce, *(*ve).siblings.as_mut_ptr(), ww, vaddr)
 }
 
 // upstream: intel_execlists_submission.c virtual_context_pin()
 unsafe extern "C" fn virtual_context_pin(ce: *mut IntelContext, vaddr: *mut c_void) -> i32 {
     let ve = container_of!(ce, VirtualEngine, context);
-    lrc_pin(ce, *(*ve).siblings, vaddr)
+    lrc_pin(ce, *(*ve).siblings.as_mut_ptr(), vaddr)
 }
 
 // upstream: intel_execlists_submission.c virtual_context_enter()
-unsafe fn virtual_context_enter(ce: *mut IntelContext) {
+unsafe extern "C" fn virtual_context_enter(ce: *mut IntelContext) {
     let ve = container_of!(ce, VirtualEngine, context);
     let mut n = 0;
 
     while n < (*ve).num_siblings {
-        intel_engine_pm_get(*(*ve).siblings.add(n as usize));
+        intel_engine_pm_get(*(*ve).siblings.as_mut_ptr().add(n as usize));
         n += 1;
     }
     intel_timeline_enter((*ce).timeline);
 }
 
 // upstream: intel_execlists_submission.c virtual_context_exit()
-unsafe fn virtual_context_exit(ce: *mut IntelContext) {
+unsafe extern "C" fn virtual_context_exit(ce: *mut IntelContext) {
     let ve = container_of!(ce, VirtualEngine, context);
     let mut n = 0;
 
     intel_timeline_exit((*ce).timeline);
     while n < (*ve).num_siblings {
-        intel_engine_pm_put(*(*ve).siblings.add(n as usize));
+        intel_engine_pm_put(*(*ve).siblings.as_mut_ptr().add(n as usize));
         n += 1;
     }
 }
 
 // upstream: intel_execlists_submission.c virtual_get_sibling()
-unsafe fn virtual_get_sibling(engine: *mut IntelEngineCs, sibling: u32) -> *mut IntelEngineCs {
+unsafe extern "C" fn virtual_get_sibling(
+    engine: *mut IntelEngineCs,
+    sibling: u32,
+) -> *mut IntelEngineCs {
     let ve = to_virtual_engine(engine);
     if sibling >= (*ve).num_siblings {
         return core::ptr::null_mut();
     }
-    *(*ve).siblings.add(sibling as usize)
+    *(*ve).siblings.as_mut_ptr().add(sibling as usize)
 }
 
 #[allow(non_upper_case_globals)]
@@ -3405,7 +3984,7 @@ unsafe fn virtual_submission_mask(ve: *mut VirtualEngine) -> IntelEngineMaskT {
     if unlikely!(mask == 0) {
         // Invalid selection: submit to a random engine in error.
         i915_request_set_error_once(rq, -ENODEV);
-        mask = (**(*ve).siblings).mask;
+        mask = (**(*ve).siblings.as_mut_ptr()).mask;
     }
 
     ENGINE_TRACE!(
@@ -3414,13 +3993,13 @@ unsafe fn virtual_submission_mask(ve: *mut VirtualEngine) -> IntelEngineMaskT {
         (*rq).fence.context,
         (*rq).fence.seqno,
         mask,
-        (*(*ve).base.sched_engine).queue_priority_hint
+        (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).queue_priority_hint
     );
     mask
 }
 
 // upstream: intel_execlists_submission.c virtual_submission_tasklet()
-unsafe fn virtual_submission_tasklet(t: *mut TaskletStruct) {
+unsafe extern "C" fn virtual_submission_tasklet(t: *mut TaskletStruct) {
     let sched_engine = from_tasklet!(t, I915SchedEngine, tasklet);
     let ve = (*sched_engine).private_data as *mut VirtualEngine;
     let prio = READ_ONCE!((*sched_engine).queue_priority_hint);
@@ -3435,7 +4014,7 @@ unsafe fn virtual_submission_tasklet(t: *mut TaskletStruct) {
     }
 
     while n < (*ve).num_siblings {
-        let sibling = READ_ONCE!(*(*ve).siblings.add(n as usize));
+        let sibling = READ_ONCE!(*(*ve).siblings.as_mut_ptr().add(n as usize));
         let node = &mut (*ve).nodes[(*sibling).id as usize];
         let mut parent: *mut *mut RbNode;
         let mut rb: *mut RbNode;
@@ -3445,61 +4024,67 @@ unsafe fn virtual_submission_tasklet(t: *mut TaskletStruct) {
             break; /* Already handled by another sibling tasklet. */
         }
 
-        spin_lock_irq(&mut (*(*sibling).sched_engine).lock);
+        spin_lock_irq(&mut (*(*sibling).sched_engine.cast::<I915SchedEngine>()).lock);
 
         if unlikely!(mask & (*sibling).mask == 0) {
             if !RB_EMPTY_NODE(&mut node.rb) {
-                rb_erase_cached(&mut node.rb, &mut (*sibling).execlists.r#virtual);
+                rb_erase_cached(&mut node.rb, &mut (*sibling).execlists.virtual_);
                 RB_CLEAR_NODE(&mut node.rb);
             }
-            spin_unlock_irq(&mut (*(*sibling).sched_engine).lock);
+            spin_unlock_irq(&mut (*(*sibling).sched_engine.cast::<I915SchedEngine>()).lock);
             n += 1;
             continue;
         }
 
         if unlikely!(!RB_EMPTY_NODE(&mut node.rb)) {
             // Reuse in place when it avoids tree rebalancing.
-            first = rb_first_cached(&(*sibling).execlists.r#virtual) == &mut node.rb;
+            first = rb_first_cached(&(*sibling).execlists.virtual_) == &mut node.rb;
             if prio == node.prio || (prio > node.prio && first) {
                 node.prio = prio;
-                if first && prio > (*(*sibling).sched_engine).queue_priority_hint {
-                    tasklet_hi_schedule(&mut (*(*sibling).sched_engine).tasklet);
+                if first
+                    && prio
+                        > (*(*sibling).sched_engine.cast::<I915SchedEngine>()).queue_priority_hint
+                {
+                    tasklet_hi_schedule(
+                        &mut (*(*sibling).sched_engine.cast::<I915SchedEngine>()).tasklet,
+                    );
                 }
-                spin_unlock_irq(&mut (*(*sibling).sched_engine).lock);
+                spin_unlock_irq(&mut (*(*sibling).sched_engine.cast::<I915SchedEngine>()).lock);
                 if !intel_context_inflight(&(*ve).context).is_null() {
                     break;
                 }
                 n += 1;
                 continue;
             }
-            rb_erase_cached(&mut node.rb, &mut (*sibling).execlists.r#virtual);
+            rb_erase_cached(&mut node.rb, &mut (*sibling).execlists.virtual_);
         }
 
         rb = core::ptr::null_mut();
         first = true;
-        parent = &mut (*sibling).execlists.r#virtual.rb_root.rb_node;
+        parent = &mut (*sibling).execlists.virtual_.root.node;
         while !(*parent).is_null() {
             let other_node = *parent;
             let other = rb_entry!(other_node, VeNode, rb);
             rb = other_node;
             if prio > (*other).prio {
-                parent = &mut (*other).rb.rb_left;
+                parent = &mut (*other).rb.left;
             } else {
-                parent = &mut (*other).rb.rb_right;
+                parent = &mut (*other).rb.right;
                 first = false;
             }
         }
 
         rb_link_node(&mut node.rb, rb, parent);
-        rb_insert_color_cached(&mut node.rb, &mut (*sibling).execlists.r#virtual, first);
+        rb_insert_color_cached(&mut node.rb, &mut (*sibling).execlists.virtual_, first);
 
         GEM_BUG_ON!(RB_EMPTY_NODE(&mut node.rb));
         node.prio = prio;
-        if first && prio > (*(*sibling).sched_engine).queue_priority_hint {
-            tasklet_hi_schedule(&mut (*(*sibling).sched_engine).tasklet);
+        if first && prio > (*(*sibling).sched_engine.cast::<I915SchedEngine>()).queue_priority_hint
+        {
+            tasklet_hi_schedule(&mut (*(*sibling).sched_engine.cast::<I915SchedEngine>()).tasklet);
         }
 
-        spin_unlock_irq(&mut (*(*sibling).sched_engine).lock);
+        spin_unlock_irq(&mut (*(*sibling).sched_engine.cast::<I915SchedEngine>()).lock);
         if !intel_context_inflight(&(*ve).context).is_null() {
             break;
         }
@@ -3508,7 +4093,7 @@ unsafe fn virtual_submission_tasklet(t: *mut TaskletStruct) {
 }
 
 // upstream: intel_execlists_submission.c virtual_submit_request()
-unsafe fn virtual_submit_request(rq: *mut I915Request) {
+unsafe extern "C" fn virtual_submit_request(rq: *mut I915Request) {
     let ve = to_virtual_engine((*rq).engine);
     let mut flags: c_ulong = 0;
 
@@ -3518,14 +4103,20 @@ unsafe fn virtual_submit_request(rq: *mut I915Request) {
         (*rq).fence.context,
         (*rq).fence.seqno
     );
-    GEM_BUG_ON!((*ve).base.submit_request != virtual_submit_request);
+    GEM_BUG_ON!((*ve).base.submit_request != Some(virtual_submit_request));
 
-    spin_lock_irqsave(&mut (*(*ve).base.sched_engine).lock, &mut flags);
+    spin_lock_irqsave(
+        &mut (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).lock,
+        &mut flags,
+    );
 
     // A resubmitted request may already have completed.
     if __i915_request_is_complete(rq) {
         __i915_request_submit(rq);
-        spin_unlock_irqrestore(&mut (*(*ve).base.sched_engine).lock, flags);
+        spin_unlock_irqrestore(
+            &mut (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).lock,
+            flags,
+        );
         return;
     }
 
@@ -3536,18 +4127,21 @@ unsafe fn virtual_submit_request(rq: *mut I915Request) {
         i915_request_put((*ve).request);
     }
 
-    (*(*ve).base.sched_engine).queue_priority_hint = rq_prio(rq);
+    (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).queue_priority_hint = rq_prio(rq);
     (*ve).request = i915_request_get(rq);
 
-    GEM_BUG_ON!(!list_empty(virtual_queue(ve)));
+    GEM_BUG_ON!(!list_empty(&*virtual_queue(ve)));
     list_move_tail(&mut (*rq).sched.link, virtual_queue(ve));
 
-    tasklet_hi_schedule(&mut (*(*ve).base.sched_engine).tasklet);
-    spin_unlock_irqrestore(&mut (*(*ve).base.sched_engine).lock, flags);
+    tasklet_hi_schedule(&mut (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).tasklet);
+    spin_unlock_irqrestore(
+        &mut (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).lock,
+        flags,
+    );
 }
 
 // upstream: intel_execlists_submission.c execlists_create_virtual()
-unsafe fn execlists_create_virtual(
+unsafe extern "C" fn execlists_create_virtual(
     siblings: *mut *mut IntelEngineCs,
     count: u32,
     flags: c_ulong,
@@ -3567,7 +4161,7 @@ unsafe fn execlists_create_virtual(
     (*ve).base.uncore = (**siblings).uncore;
     (*ve).base.id = -1;
 
-    (*ve).base.class = OTHER_CLASS;
+    (*ve).base.class = OTHER_CLASS as u8;
     (*ve).base.uabi_class = I915_ENGINE_CLASS_INVALID as u16;
     (*ve).base.instance = I915_ENGINE_CLASS_INVALID_VIRTUAL as u8;
     (*ve).base.uabi_instance = I915_ENGINE_CLASS_INVALID_VIRTUAL as u16;
@@ -3583,22 +4177,23 @@ unsafe fn execlists_create_virtual(
     );
 
     intel_engine_init_execlists(&mut (*ve).base);
-    (*ve).base.sched_engine = i915_sched_engine_create(ENGINE_VIRTUAL);
+    (*ve).base.sched_engine = i915_sched_engine_create(ENGINE_VIRTUAL).cast();
     if (*ve).base.sched_engine.is_null() {
         kfree(ve as *mut c_void);
         return ERR_PTR!(err);
     }
-    (*(*ve).base.sched_engine).private_data = &mut (*ve).base;
+    (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).private_data =
+        core::ptr::addr_of_mut!((*ve).base).cast();
 
     (*ve).base.cops = &virtual_context_ops;
-    (*ve).base.request_alloc = execlists_request_alloc;
-    (*(*ve).base.sched_engine).schedule = i915_schedule;
-    (*(*ve).base.sched_engine).kick_backend = kick_execlists;
-    (*ve).base.submit_request = virtual_submit_request;
+    (*ve).base.request_alloc = Some(execlists_request_alloc);
+    (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).schedule = Some(i915_schedule);
+    (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).kick_backend = Some(kick_execlists);
+    (*ve).base.submit_request = Some(virtual_submit_request);
 
     INIT_LIST_HEAD(virtual_queue(ve));
     tasklet_setup(
-        &mut (*(*ve).base.sched_engine).tasklet,
+        &mut (*(*ve).base.sched_engine.cast::<I915SchedEngine>()).tasklet,
         virtual_submission_tasklet,
     );
     intel_context_init(&mut (*ve).context, &mut (*ve).base);
@@ -3627,7 +4222,12 @@ unsafe fn execlists_create_virtual(
 
         // Backend is coupled to execlists: requests are inserted directly
         // into each physical engine's tree. Layering would need cloned requests.
-        if (*(*sibling).sched_engine).tasklet.callback != execlists_submission_tasklet {
+        if (*(*sibling).sched_engine.cast::<I915SchedEngine>())
+            .tasklet
+            .callbacks
+            .callback
+            != Some(execlists_submission_tasklet)
+        {
             err = -ENODEV;
             intel_context_put(&mut (*ve).context);
             return ERR_PTR!(err);
@@ -3636,14 +4236,14 @@ unsafe fn execlists_create_virtual(
         GEM_BUG_ON!(RB_EMPTY_NODE(&mut (*ve).nodes[(*sibling).id as usize].rb));
         RB_CLEAR_NODE(&mut (*ve).nodes[(*sibling).id as usize].rb);
 
-        *(*ve).siblings.add((*ve).num_siblings as usize) = sibling;
+        *(*ve).siblings.as_mut_ptr().add((*ve).num_siblings as usize) = sibling;
         (*ve).num_siblings += 1;
         (*ve).base.mask |= (*sibling).mask;
         (*ve).base.logical_mask |= (*sibling).logical_mask;
 
         // Emission functions must be compatible because commands are built
         // before submission; engine class is the current compatibility guide.
-        if (*ve).base.class != OTHER_CLASS {
+        if (*ve).base.class as i32 != OTHER_CLASS {
             if (*ve).base.class != (*sibling).class {
                 drm_dbg!(
                     &(*i915).drm,
@@ -3694,7 +4294,7 @@ pub(crate) unsafe fn intel_execlists_show_requests(
     max: u32,
 ) {
     let execlists = &(*engine).execlists;
-    let sched_engine = (*engine).sched_engine;
+    let sched_engine = (*engine).sched_engine.cast::<I915SchedEngine>();
     let mut rq: *mut I915Request = core::ptr::null_mut();
     let mut last: *mut I915Request;
     let mut flags: c_ulong = 0;
@@ -3752,7 +4352,7 @@ pub(crate) unsafe fn intel_execlists_show_requests(
 
     last = core::ptr::null_mut();
     count = 0;
-    rb = rb_first_cached(&execlists.r#virtual);
+    rb = rb_first_cached(&execlists.virtual_);
     while !rb.is_null() {
         let ve = rb_entry!(rb, VirtualEngine, nodes[(*engine).id].rb);
         rq = READ_ONCE!((*ve).request);
@@ -3784,14 +4384,24 @@ pub(crate) unsafe fn intel_execlists_dump_active_requests(
 ) {
     let mut flags: c_ulong = 0;
 
-    spin_lock_irqsave(&mut (*(*engine).sched_engine).lock, &mut flags);
-    intel_engine_dump_active_requests(&mut (*(*engine).sched_engine).requests, hung_rq, m);
+    spin_lock_irqsave(
+        &mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock,
+        &mut flags,
+    );
+    intel_engine_dump_active_requests(
+        &mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).requests,
+        hung_rq,
+        m,
+    );
     drm_printf!(
         m,
         "\tOn hold?: %zu\n",
-        list_count_nodes(&mut (*(*engine).sched_engine).hold)
+        list_count_nodes(&mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).hold)
     );
-    spin_unlock_irqrestore(&mut (*(*engine).sched_engine).lock, flags);
+    spin_unlock_irqrestore(
+        &mut (*(*engine).sched_engine.cast::<I915SchedEngine>()).lock,
+        flags,
+    );
 }
 
 // Upstream tail, kept as an integration boundary rather than inlined here:
