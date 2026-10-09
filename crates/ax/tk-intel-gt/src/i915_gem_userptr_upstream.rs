@@ -423,7 +423,7 @@ pub unsafe fn i915_gem_object_userptr_submit_init(obj: *mut DrmI915GemObject) ->
         return ret;
     }
 
-    let mut pvec = crate::linux::memory::kvmalloc_objs::<*mut Page>(num_pages);
+    let mut pvec = crate::linux::memory::kvmalloc_objs::<*mut Page, u64>(num_pages);
     if pvec.is_null() {
         return -crate::linux_config::ENOMEM;
     }

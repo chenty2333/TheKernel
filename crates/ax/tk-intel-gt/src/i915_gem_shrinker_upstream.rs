@@ -7,7 +7,7 @@
 // GEM/MM/shrinker/notifier/runtime-PM helpers are integration bindings and must
 // resolve to the source Linux/i915 behavior; this file does not emulate them.
 
-use core::ffi::{c_int, c_long, c_ulong, c_void};
+use core::ffi::{c_char, c_int, c_long, c_ulong, c_void};
 
 use crate::{
     for_each_gt,
@@ -24,7 +24,9 @@ use crate::{
     intel_engine_cs_upstream::{ListHead, Mutex},
     intel_gt_types_upstream::IntelGt,
     intel_gtt_api_upstream::{I915Ggtt, intel_vm_no_concurrent_access_wa},
+    intel_runtime_pm_upstream::intel_runtime_pm_get_if_in_use,
     linux::{
+        i915_trace::trace_i915_gem_shrink,
         gem_memory::{NotifierBlock, Shrinker},
         i915_private::DrmI915Private,
     },
@@ -104,12 +106,20 @@ unsafe fn list_splice_tail(list: *mut ListHead, head: *mut ListHead) {
 unsafe extern "C" {
     fn i915_gem_object_unbind(obj: *mut DrmI915GemObject, flags: c_ulong) -> c_int;
     fn is_vmalloc_addr(ptr: *const c_void) -> bool;
+    // Linux MM/shrinker APIs declared by include/linux/{shrinker,oom,vmalloc}.h.
+    fn get_nr_swap_pages() -> c_long;
+    fn shrinker_alloc(flags: u32, fmt: *const c_char, ...) -> *mut Shrinker;
+    fn shrinker_register(shrinker: *mut Shrinker);
+    fn shrinker_free(shrinker: *mut Shrinker);
+    fn register_oom_notifier(nb: *mut NotifierBlock) -> c_int;
+    fn unregister_oom_notifier(nb: *mut NotifierBlock) -> c_int;
+    fn register_vmap_purge_notifier(nb: *mut NotifierBlock) -> c_int;
+    fn unregister_vmap_purge_notifier(nb: *mut NotifierBlock) -> c_int;
     fn intel_gt_retire_requests_timeout(
         gt: *mut IntelGt,
         timeout: c_long,
         remaining_timeout: *mut c_long,
     ) -> c_long;
-    fn intel_runtime_pm_get_if_in_use(rpm: *mut c_void) -> *mut c_void;
 }
 
 /// Source inline `intel_gt_retire_requests()` delegates to the exported
@@ -241,9 +251,11 @@ pub unsafe fn i915_gem_shrink(
     // device just to recover a little memory. If absolutely necessary,
     // we will force the wake during oom-notifier.
     if shrink & I915_SHRINK_BOUND != 0 {
-        wakeref = core::ptr::NonNull::new(intel_runtime_pm_get_if_in_use(
-            core::ptr::addr_of_mut!((*i915).runtime_pm).cast::<c_void>(),
-        ));
+        wakeref = unsafe {
+            intel_runtime_pm_get_if_in_use(
+                core::ptr::addr_of_mut!((*i915).runtime_pm).cast(),
+            )
+        };
         if wakeref.is_null() {
             shrink &= !I915_SHRINK_BOUND;
         }

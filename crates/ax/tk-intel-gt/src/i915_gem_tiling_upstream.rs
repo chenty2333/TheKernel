@@ -13,17 +13,19 @@ use core::ffi::c_void;
 use crate::{
     for_each_ggtt_vma,
     i915_gem_object_api_upstream::{i915_gem_object_has_pages, i915_gem_object_put},
+    i915_gem_mman_upstream::i915_gem_object_release_mmap_gtt,
     i915_gem_object_header_upstream::{
         i915_gem_object_clear_tiling_quirk, i915_gem_object_has_tiling_quirk,
         i915_gem_object_is_proxy, i915_gem_object_lookup, i915_gem_object_lookup_rcu,
         i915_gem_object_set_tiling_quirk, i915_gem_object_lock, i915_gem_object_unlock,
+        DrmFileObjectLookup,
     },
     i915_gem_shrinker_upstream::{i915_gem_object_make_shrinkable, i915_gem_object_make_unshrinkable},
     i915_gem_object_types_upstream::DrmI915GemObject,
     i915_vma_api_upstream::*,
     intel_context_upstream::I915Vma,
     intel_engine_cs_upstream::ListHead,
-    linux::{bitmap::{bitmap_free, bitmap_zalloc}, bits::IS_ALIGNED, i915::GRAPHICS_VER},
+    linux::{bitmap::{bitmap_free, bitmap_zalloc}, bits::IS_ALIGNED, gem::{DrmDevice, DrmFile}, i915::GRAPHICS_VER},
     linux_config::*,
     linux_i915_private::DrmI915Private,
     linux_macros::*,
@@ -32,16 +34,6 @@ use crate::{
 
 // UAPI and GEM records referenced by this translation. The complete records
 // are owned by the DRM/i915 integration layer.
-#[repr(C)]
-pub struct DrmDevice {
-    _opaque: [u8; 0],
-}
-
-#[repr(C)]
-pub struct DrmFile {
-    _opaque: [u8; 0],
-}
-
 #[repr(C)]
 pub struct DrmI915GemSetTiling {
     pub handle: u32,
@@ -438,7 +430,7 @@ pub unsafe fn i915_gem_set_tiling_ioctl(
     data: *mut c_void,
     file: *mut DrmFile,
 ) -> i32 {
-    let i915 = to_i915(dev);
+    let i915 = to_i915(dev.cast());
     let args = data.cast::<DrmI915GemSetTiling>();
     let obj: *mut DrmI915GemObject;
 
@@ -446,7 +438,7 @@ pub unsafe fn i915_gem_set_tiling_ioctl(
         return -EOPNOTSUPP;
     }
 
-    obj = i915_gem_object_lookup(file, (*args).handle);
+    obj = i915_gem_object_lookup((*file).driver_priv.cast::<DrmFileObjectLookup>(), (*args).handle);
     if obj.is_null() {
         return -ENOENT;
     }
@@ -518,7 +510,7 @@ pub unsafe fn i915_gem_get_tiling_ioctl(
     file: *mut DrmFile,
 ) -> i32 {
     let args = data.cast::<DrmI915GemGetTiling>();
-    let i915 = to_i915(dev);
+    let i915 = to_i915(dev.cast());
     let mut obj: *mut DrmI915GemObject;
     let mut err = -ENOENT;
 
@@ -527,7 +519,7 @@ pub unsafe fn i915_gem_get_tiling_ioctl(
     }
 
     rcu_read_lock();
-    obj = i915_gem_object_lookup_rcu(file, (*args).handle);
+    obj = i915_gem_object_lookup_rcu((*file).driver_priv.cast::<DrmFileObjectLookup>(), (*args).handle);
     if !obj.is_null() {
         (*args).tiling_mode = READ_ONCE!((*obj).tiling_and_stride) & TILING_MASK;
         err = 0;

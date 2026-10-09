@@ -55,6 +55,7 @@ use crate::{
         I915_NUM_ENGINES, ListHead as list_head, LlistHead as llist_head, LlistNode as llist_node,
         Mutex as mutex, RbNode as rb_node, Spinlock as spinlock_t, WorkStruct as work_struct,
     },
+    intel_engine_heartbeat_upstream::{intel_gt_park_heartbeats, intel_gt_unpark_heartbeats},
     intel_engine_types_upstream::{
         IntelEngineCs as intel_engine_cs, IntelEngineId as intel_engine_id_t,
         IntelEngineMask as intel_engine_mask_t, RENDER_CLASS, VIRTUAL_ENGINES,
@@ -84,7 +85,10 @@ use crate::{
     intel_guc_log_types_upstream::IntelGucLog as IntelGucLogLayout,
     intel_guc_slpc_types_upstream::IntelGucSlpc as IntelGucSlpcLayout,
     intel_guc_submission_types_upstream::intel_guc_submission_is_supported,
-    intel_guc_upstream::intel_guc_write_barrier,
+    intel_guc_upstream::{
+        intel_guc_engine_usage_offset, intel_guc_engine_usage_record_map, intel_guc_ggtt_offset,
+        intel_guc_write_barrier,
+    },
     linux::i915::HAS_GUC_TLB_INVALIDATION,
     intel_guc_types_upstream::{
         IntelGuc, IntelGucInterrupts, IntelGucSendRegs, IntelGucSubmissionState, IntelGucTimestamp,
@@ -103,10 +107,12 @@ use crate::{
     },
     intel_workarounds_types_upstream::I915RegT as i915_reg_t,
     linux::{
+        i915_trace::{trace_intel_context_deregister_done, trace_intel_context_fence_release, trace_intel_context_reset, trace_intel_context_sched_done, trace_intel_context_set_prio},
         bitmap::{bitmap_find_free_region, bitmap_free, bitmap_release_region, bitmap_zalloc},
         idr::{Ida, ida_alloc_range, ida_free, ida_init},
         iosys_map::IosysMap,
         primitives::{max_t, min_t, time_after},
+        wait::{msleep, schedule_timeout},
         xarray::{XArray, xa_init_flags},
     },
     linux_config::*,
@@ -357,6 +363,36 @@ unsafe fn intel_guc_is_ready<G: IntelGucPtr>(guc: G) -> bool {
     let guc = guc.intel_guc_ptr();
     assert!(!guc.is_null());
     unsafe { __intel_uc_fw_status(&(*guc).fw) == INTEL_UC_FIRMWARE_RUNNING && (*guc).ct.enabled }
+}
+
+// upstream: intel_guc_ads.c intel_guc_global_policies_update().
+fn intel_guc_global_policies_update(guc: &mut intel_guc) -> i32 {
+    let guc_ptr = guc as *mut intel_guc;
+    let mapped_len = unsafe {
+        GEM_BUG_ON!((*guc_ptr).ads_vma.is_null());
+        if (*guc_ptr).ads_vma.is_null() {
+            return -EOPNOTSUPP;
+        }
+        (*(*guc_ptr).ads_vma).size as usize
+    };
+    let i915 = unsafe { guc_to_i915(guc_ptr) };
+    let policy_address = unsafe {
+        crate::guc_ads::runtime_policy_init(
+            core::ptr::addr_of_mut!((*guc_ptr).ads_map),
+            mapped_len,
+            (*i915).params.reset as u8,
+        )
+    };
+    let Some(policy_address) = policy_address else {
+        return -EOPNOTSUPP;
+    };
+    GEM_BUG_ON!(policy_address == 0);
+    if !unsafe { intel_guc_is_ready(&*guc_ptr) } {
+        return 0;
+    }
+
+    let action = [crate::guc_ads::ACTION_GLOBAL_SCHED_POLICY_CHANGE, policy_address];
+    unsafe { intel_guc_send_busy_loop(guc_ptr, action.as_ptr(), action.len() as u32, 0, true) }
 }
 
 // `GUC_SUBMIT_VER(guc)` from intel_guc.h, adapted from the C macro to a typed
@@ -1441,18 +1477,16 @@ fn __get_engine_usage_record(
     id: &mut u32,
     total: &mut u32,
 ) {
-    let rec_map = intel_guc_engine_usage_record_map(engine);
+    let rec_map = unsafe { intel_guc_engine_usage_record_map(engine) };
     let mut i = 0;
     loop {
         *last_in = iosys_map_rd_field!(&rec_map, 0, guc_engine_usage_record, last_switch_in_stamp);
         *id = iosys_map_rd_field!(&rec_map, 0, guc_engine_usage_record, current_context_index);
         *total = iosys_map_rd_field!(&rec_map, 0, guc_engine_usage_record, total_runtime);
-        if iosys_map_rd_field!(&rec_map, 0, guc_engine_usage_record, last_switch_in_stamp)
-            == *last_in
-            && iosys_map_rd_field!(&rec_map, 0, guc_engine_usage_record, current_context_index)
-                == *id
-            && iosys_map_rd_field!(&rec_map, 0, guc_engine_usage_record, total_runtime) == *total
-        {
+        let check_last: u32 = iosys_map_rd_field!(&rec_map, 0, guc_engine_usage_record, last_switch_in_stamp);
+        let check_id: u32 = iosys_map_rd_field!(&rec_map, 0, guc_engine_usage_record, current_context_index);
+        let check_total: u32 = iosys_map_rd_field!(&rec_map, 0, guc_engine_usage_record, total_runtime);
+        if check_last == *last_in && check_id == *id && check_total == *total {
             break;
         }
         i += 1;
@@ -1464,7 +1498,7 @@ fn __get_engine_usage_record(
 
 // upstream: intel_guc_submission.c __set_engine_usage_record()
 fn __set_engine_usage_record(engine: &intel_engine_cs, last_in: u32, id: u32, total: u32) {
-    let rec_map = intel_guc_engine_usage_record_map(engine);
+    let rec_map = unsafe { intel_guc_engine_usage_record_map(engine) };
     iosys_map_wr_field!(
         &rec_map,
         0,
@@ -1730,7 +1764,7 @@ fn guc_timestamp_ping(wrk: &mut work_struct) {
 // upstream: intel_guc_submission.c guc_action_enable_usage_stats()
 fn guc_action_enable_usage_stats(guc: &mut intel_guc) -> i32 {
     let gt = unsafe { guc_to_gt(guc) };
-    let offset = intel_guc_engine_usage_offset(guc);
+    let offset = unsafe { intel_guc_engine_usage_offset(guc) };
     let action = [INTEL_GUC_ACTION_SET_ENG_UTIL_BUFF, offset, 0];
     for_each_engine!(engine, id, gt, {
         __set_engine_usage_record(engine, 0, 0xffff_ffff, 0);
@@ -1860,7 +1894,7 @@ fn intel_guc_submission_reset_prepare(guc: &mut intel_guc) {
         // Reset may be called during driver load, before GuC initialization.
         return;
     }
-    intel_gt_park_heartbeats(guc_to_gt(guc));
+    intel_gt_park_heartbeats(unsafe { guc_to_gt(guc) });
     disable_submission(guc);
     if let Some(disable) = guc.interrupts.disable {
         unsafe { disable(guc) };
@@ -1870,11 +1904,11 @@ fn intel_guc_submission_reset_prepare(guc: &mut intel_guc) {
     spin_lock_irq(unsafe { &mut *(*guc_to_gt(guc)).irq_lock });
     spin_unlock_irq(unsafe { &mut *(*guc_to_gt(guc)).irq_lock });
     // Flush the receive tasklet.
-    tasklet_disable(&mut guc.ct.receive_tasklet);
-    tasklet_enable(&mut guc.ct.receive_tasklet);
+    unsafe { tasklet_disable(&mut guc.ct.receive_tasklet) };
+    unsafe { tasklet_enable(&mut guc.ct.receive_tasklet) };
     guc_flush_submissions(guc);
     guc_flush_destroyed_contexts(guc);
-    flush_work(&mut guc.ct.requests.worker);
+    unsafe { flush_work(&mut guc.ct.requests.worker) };
     scrub_guc_desc_for_outstanding_g2h(guc);
 }
 
@@ -2137,8 +2171,8 @@ fn intel_guc_submission_cancel_requests(guc: &mut intel_guc) {
 fn intel_guc_submission_reset_finish(guc: &mut intel_guc) {
     if unlikely(
         !guc_submission_initialized(guc)
-            || !intel_guc_is_fw_running(guc)
-            || intel_gt_is_wedged(guc_to_gt(guc)),
+            || !unsafe { intel_guc_is_fw_running(guc) }
+            || unsafe { intel_gt_is_wedged(guc_to_gt(guc)) },
     ) {
         // Reset during driver load or a wedge.
         return;
@@ -2146,15 +2180,15 @@ fn intel_guc_submission_reset_finish(guc: &mut intel_guc) {
     let outstanding = atomic_read(&guc.outstanding_submission_g2h);
     if outstanding != 0 {
         guc_err!(
-            guc,
+            &mut *guc,
             "Unexpected outstanding GuC to Host response(s) in reset finish: %d\n",
             outstanding
         );
     }
     atomic_set(&mut guc.outstanding_submission_g2h, 0);
-    intel_guc_global_policies_update(guc);
+    intel_guc_global_policies_update(&mut *guc);
     enable_submission(guc);
-    intel_gt_unpark_heartbeats(guc_to_gt(guc));
+    intel_gt_unpark_heartbeats(unsafe { guc_to_gt(guc) });
     // Full GT reset cleared the TLB caches and G2H queue; release blocked waiters.
     wake_up_all_tlb_invalidate(guc);
 }
@@ -2443,7 +2477,7 @@ fn pin_guc_id(guc: &mut intel_guc, ce: &mut intel_context) -> i32 {
     loop {
         let mut flags: c_ulong = 0;
         spin_lock_irqsave(&mut guc.submission_state.lock, &mut flags);
-        might_lock(&ce.guc_state.lock);
+        might_lock!(&ce.guc_state.lock);
         if context_guc_id_invalid(ce) {
             ret = assign_guc_id(guc, ce);
             if ret == 0 {
@@ -2452,7 +2486,7 @@ fn pin_guc_id(guc: &mut intel_guc, ce: &mut intel_context) -> i32 {
         }
         if ret >= 0 {
             if !list_empty(&ce.guc_id.link) {
-                list_del_init(&mut ce.guc_id.link);
+                unsafe { list_del_init(&mut ce.guc_id.link) };
             }
             atomic_inc(&mut ce.guc_id.r#ref);
         }
@@ -2469,9 +2503,9 @@ fn pin_guc_id(guc: &mut intel_guc, ce: &mut intel_context) -> i32 {
                 let timeslice_shifted = unsafe { (*ce.engine).props.timeslice_duration_ms }
                     << (PIN_GUC_ID_TRIES - tries - 2);
                 let max = min_t(100, timeslice_shifted);
-                msleep(max_t(max, 1));
+                msleep(max_t(max, 1) as u32);
             }
-            intel_gt_retire_requests(guc_to_gt(guc));
+            intel_gt_retire_requests(unsafe { guc_to_gt(guc) });
             continue;
         }
         break;
@@ -2603,7 +2637,7 @@ fn __guc_action_register_context_v70(
 
 // upstream: intel_guc_submission.c register_context_v69()
 fn register_context_v69(guc: &mut intel_guc, ce: &mut intel_context, loop_on_busy: bool) -> i32 {
-    let offset = intel_guc_ggtt_offset(guc, guc.lrc_desc_pool_v69)
+    let offset = unsafe { intel_guc_ggtt_offset(guc as *mut _, guc.lrc_desc_pool_v69) }
         + ce.guc_id.id as u32 * size_of::<guc_lrc_desc_v69>() as u32;
     prepare_context_registration_info_v69(ce);
     if unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) } {
@@ -3316,7 +3350,7 @@ fn __delay_sched_disable(wrk: &mut work_struct) {
     spin_lock_irqsave(&mut ce.guc_state.lock, &mut flags);
     if bypass_sched_disable(guc, ce) {
         spin_unlock_irqrestore(&mut ce.guc_state.lock, flags);
-        intel_context_sched_disable_unpin(ce);
+        intel_context_sched_disable_unpin(ce as *mut _);
     } else {
         do_sched_disable(guc, ce, flags);
     }
@@ -3341,7 +3375,7 @@ fn guc_context_sched_disable(ce: &mut intel_context) {
     spin_lock_irqsave(&mut ce.guc_state.lock, &mut flags);
     if bypass_sched_disable(guc, &mut *ce) {
         spin_unlock_irqrestore(&mut ce.guc_state.lock, flags);
-        intel_context_sched_disable_unpin(ce);
+        intel_context_sched_disable_unpin(ce as *mut _);
     } else if !intel_context_is_closed(&mut *ce) && !guc_id_pressure(guc, ce) && delay != 0 {
         spin_unlock_irqrestore(&mut ce.guc_state.lock, flags);
         unsafe {
@@ -3690,7 +3724,7 @@ unsafe extern "C" fn remove_from_context_callback(rq: *mut i915_request) {
 // upstream: intel_guc_submission.c submit_work_cb()
 unsafe extern "C" fn submit_work_cb(wrk: *mut irq_work) {
     let rq = container_of!(wrk, i915_request, submit_work);
-    might_lock(&(*(*(*rq).engine).sched_engine).lock);
+    might_lock!(&(*(*(*rq).engine).sched_engine).lock);
     i915_sw_fence_complete(&mut (*rq).submit);
 }
 
@@ -3707,7 +3741,7 @@ fn __guc_signal_context_fence(ce: &mut intel_context) {
         unsafe { list_del(&mut (*rq).guc_fence_link) };
         unsafe { irq_work_queue(&mut (*rq).submit_work) };
     });
-    INIT_LIST_HEAD(&mut ce.guc_state.fences);
+    unsafe { INIT_LIST_HEAD(&mut ce.guc_state.fences) };
 }
 
 // upstream: intel_guc_submission.c guc_signal_context_fence()
@@ -4642,7 +4676,7 @@ fn must_wait_woken(wq_entry: &mut wait_queue_entry, mut timeout: i64) -> i64 {
     // Like wait_woken(), but do not return early when a kthread has completed:
     // page reclaim may call this from a stopped kthread and HW must finish wait.
     loop {
-        set_current_state(TASK_UNINTERRUPTIBLE as i32);
+        unsafe { set_current_state(TASK_UNINTERRUPTIBLE as i32) };
         if wq_entry.flags & WQ_FLAG_WOKEN != 0 {
             break;
         }
@@ -4652,7 +4686,7 @@ fn must_wait_woken(wq_entry: &mut wait_queue_entry, mut timeout: i64) -> i64 {
         }
     }
     // Match wait_woken()/woken_wake_function() state and wake-flag handling.
-    __set_current_state(TASK_RUNNING as i32);
+    unsafe { __set_current_state(TASK_RUNNING as i32) };
     WRITE_ONCE!(wq_entry.flags, wq_entry.flags & !WQ_FLAG_WOKEN);
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     timeout
@@ -4661,7 +4695,7 @@ fn must_wait_woken(wq_entry: &mut wait_queue_entry, mut timeout: i64) -> i64 {
 // upstream: intel_guc_submission.c intel_gt_is_enabled()
 fn intel_gt_is_enabled(gt: &intel_gt) -> bool {
     // Treat a wedged or suspended GT as disabled.
-    if intel_gt_is_wedged(gt) || !intel_irqs_enabled(gt.i915) {
+    if unsafe { intel_gt_is_wedged(gt) || !intel_irqs_enabled(gt.i915) } {
         return false;
     }
     true
@@ -4839,7 +4873,7 @@ fn intel_guc_sched_done_process_msg(guc: &mut intel_guc, msg: &[u32], len: u32) 
         // Unpin before signaling fences: requests can submit and retire before
         // the unpin finishes, which could otherwise drop pin_count to zero while
         // the context remains enabled.
-        intel_context_sched_disable_unpin(ce);
+        intel_context_sched_disable_unpin(ce as *mut _);
         let mut flags: c_ulong = 0;
         spin_lock_irqsave(&mut ce.guc_state.lock, &mut flags);
         let banned = context_banned(ce);
@@ -4849,8 +4883,8 @@ fn intel_guc_sched_done_process_msg(guc: &mut intel_guc, msg: &[u32], len: u32) 
         guc_blocked_fence_complete(ce);
         spin_unlock_irqrestore(&mut ce.guc_state.lock, flags);
         if banned {
-            guc_cancel_context_requests(ce);
-            intel_engine_signal_breadcrumbs(ce.engine);
+            guc_cancel_context_requests(&mut *ce);
+            unsafe { intel_engine_signal_breadcrumbs(ce.engine) };
         }
     }
     decr_outstanding_submission_g2h(guc);
@@ -4902,20 +4936,20 @@ fn guc_context_replay(ce: &mut intel_context) {
 
 // upstream: intel_guc_submission.c guc_handle_context_reset()
 fn guc_handle_context_reset(guc: &mut intel_guc, ce: &mut intel_context) {
-    let capture = intel_context_is_schedulable(ce);
+    let capture = intel_context_is_schedulable(ce as *const _);
     trace_intel_context_reset(ce);
     guc_dbg!(
-        guc,
+        &mut *guc,
         "%s context reset notification: 0x%04X on %s, exiting = %s, banned = %s\n",
         if capture { "Got" } else { "Ignoring" },
         ce.guc_id.id,
         unsafe { (*ce.engine).name },
-        str_yes_no(intel_context_is_exiting(ce)),
-        str_yes_no(intel_context_is_banned(ce))
+        str_yes_no(unsafe { intel_context_is_exiting(ce as *const _) }),
+        str_yes_no(unsafe { intel_context_is_banned(ce as *const _) })
     );
     if capture {
-        capture_error_state(guc, ce);
-        guc_context_replay(ce);
+        capture_error_state(&mut *guc, &mut *ce);
+        guc_context_replay(&mut *ce);
     }
 }
 

@@ -2,16 +2,24 @@
 // Copyright © 2026 TheKernel contributors.
 //
 // Linux v7.2.3 drivers/gpu/drm/i915/gt/intel_reset.c reset-backoff SRCU
-// entry points needed by GuC workers. The broader reset implementation is
-// kept in source order in this module as it is translated.
+// entry points needed by GuC workers. This is a partial source owner: the
+// reset execution paths still need a complete translation before this module
+// can replace Linux's reset implementation.
 
 use core::ffi::c_int;
 
 use crate::{
     intel_gt_types_upstream::IntelGt,
     intel_reset_types_upstream::I915_RESET_BACKOFF,
+    linux::i915::INTEL_INFO,
     linux::{bits::test_bit, rcu::{rcu_read_lock, rcu_read_unlock}, srcu::SrcuStruct},
 };
+
+/// Source `intel_gt_gpu_reset_clobbers_display()` device-info accessor.
+pub unsafe fn intel_gt_gpu_reset_clobbers_display(gt: *mut IntelGt) -> bool {
+    let info = unsafe { INTEL_INFO((*gt).i915) };
+    unsafe { (*info).flags[0] & (1 << 5) != 0 }
+}
 
 unsafe extern "C" {
     fn srcu_read_lock(srcu: *mut SrcuStruct) -> c_int;

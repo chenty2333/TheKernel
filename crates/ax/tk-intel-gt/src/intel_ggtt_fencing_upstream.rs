@@ -45,6 +45,7 @@ use crate::{
     intel_ggtt_fencing_types_upstream::I915FenceReg,
     intel_gt_types_upstream::IntelGt,
     intel_gtt_api_upstream::{I915Ggtt, i915_ggtt_has_aperture, i915_vm_to_ggtt},
+    intel_runtime_pm_upstream::assert_rpm_wakelock_held,
     intel_uncore_types_upstream::{
         IntelRuntimePm, IntelUncore, intel_uncore_posting_read_fw, intel_uncore_read,
         intel_uncore_read16, intel_uncore_rmw, intel_uncore_write, intel_uncore_write_fw,
@@ -588,7 +589,7 @@ pub unsafe fn i915_vma_pin_fence(vma: *mut I915Vma) -> i32 {
         return 0;
     }
 
-    crate::linux::pm::assert_rpm_wakelock_held(unsafe { (*(*(*(*vma).vm).gt).uncore).rpm });
+    assert_rpm_wakelock_held(unsafe { (*(*(*(*vma).vm).gt).uncore).rpm });
     GEM_BUG_ON!(!unsafe { i915_vma_is_ggtt(vma) });
 
     let ret = unsafe { mutex_lock_interruptible(&mut (*(*vma).vm).mutex) };

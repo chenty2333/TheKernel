@@ -46,15 +46,18 @@ use crate::{
     intel_context_types_upstream::{IntelWakerefT, *},
     intel_context_upstream::*,
     intel_engine_regs_upstream,
+    intel_engine_user_upstream::{
+        engine_uabi_llist, intel_engine_add_user, intel_engine_class_repr,
+    },
     intel_execlists_submission_upstream::{
         intel_execlists_dump_active_requests, intel_execlists_show_requests,
         intel_execlists_submission_setup,
     },
     intel_gt_api_upstream::intel_gt_check_and_clear_faults,
+    intel_gt_requests_upstream::{intel_engine_fini_retire, intel_engine_init_retire},
     intel_gt_mcr_upstream::*,
     intel_gtt_api_upstream::{
         i915_ggtt_has_aperture, i915_ggtt_require_binder, i915_vm_get, i915_vm_put,
-    intel_gt_requests_upstream::{intel_engine_fini_retire, intel_engine_init_retire},
     },
     intel_guc_fwif_types_upstream::{
         MAKE_GUC_ID, engine_class_to_guc_class, guc_policy_max_preempt_timeout_ms,
@@ -67,26 +70,67 @@ use crate::{
         SseuDevInfo, intel_slicemask_from_xehp_dssmask, intel_sseu_from_device_info,
     },
     intel_timeline_types_upstream::IntelTimeline,
+    intel_runtime_pm_upstream::intel_runtime_pm_get_if_in_use,
+    intel_reset_upstream::intel_gt_gpu_reset_clobbers_display,
     intel_uc_types_upstream::{intel_uc_uses_guc_submission, intel_uc_wants_gsc_uc},
     intel_uncore_types_upstream::{
         __intel_wait_for_register_fw, IntelUncore, intel_uncore_posting_read_fw,
         intel_uncore_prune_engine_fw_domains, intel_uncore_read, intel_uncore_write,
         intel_uncore_write_fw,
     },
-    intel_workarounds_types_upstream::I915WaList,
+    intel_workarounds_types_upstream::{I915McrRegT, I915RegT, I915WaList},
     intel_workarounds_upstream::{
         intel_engine_apply_whitelist, intel_engine_apply_workarounds, intel_engine_init_ctx_wa,
         intel_engine_init_whitelist, intel_engine_init_workarounds,
     },
     linux::{
         average::{ewma__engine_latency_init, ewma__engine_latency_read},
-        i915::{CCS_MASK, HAS_ENGINE, HAS_EXECLISTS, RCS_MASK, VDBOX_MASK, VEBOX_MASK},
+        i915::{
+            CCS_MASK, HAS_ENGINE, HAS_EXECLISTS, HWS_NEEDS_PHYSICAL, RCS_MASK, VDBOX_MASK,
+            VEBOX_MASK,
+        },
         primitives::hweight32,
     },
     linux_config::*,
     linux_heap::kmem_cache_free,
     linux_list::*,
 };
+
+// Header constants from Linux v7.2.3 gt/intel_gt_regs.h.
+const GEN8_SAMPLER_INSTDONE: I915McrRegT = I915McrRegT { reg: 0xe160 };
+const GEN8_ROW_INSTDONE: I915McrRegT = I915McrRegT { reg: 0xe164 };
+const XEHPG_INSTDONE_GEOM_SVG: I915McrRegT = I915McrRegT { reg: 0x666c };
+
+#[allow(non_snake_case)]
+const fn I915_REG(reg: u32) -> I915RegT {
+    I915RegT { reg }
+}
+
+/// Linux `i915_scheduler.h` inline pair: keep bottom halves disabled around
+/// the tasklet lock while walking active requests.
+unsafe fn i915_sched_engine_active_lock_bh(sched_engine: *mut I915SchedEngine) {
+    crate::linux::irq::local_bh_disable();
+    unsafe { tasklet_lock(core::ptr::addr_of_mut!((*sched_engine).tasklet)) };
+}
+
+unsafe fn i915_sched_engine_active_unlock_bh(sched_engine: *mut I915SchedEngine) {
+    unsafe { tasklet_unlock(core::ptr::addr_of_mut!((*sched_engine).tasklet)) };
+    crate::linux::irq::local_bh_enable();
+}
+
+/// C `memcmp()` ordering, used by the source hexdump's repeated-row elision.
+unsafe fn memcmp(a: *const c_void, b: *const c_void, bytes: usize) -> i32 {
+    let a = a.cast::<u8>();
+    let b = b.cast::<u8>();
+    for i in 0..bytes {
+        let left = unsafe { *a.add(i) };
+        let right = unsafe { *b.add(i) };
+        if left != right {
+            return left as i32 - right as i32;
+        }
+    }
+    0
+}
 pub use crate::{
     intel_engine_api_upstream::*,
     intel_engine_regs_upstream::*,
@@ -758,7 +802,7 @@ unsafe fn intel_engine_sanitize_mmio(engine: *mut IntelEngineCs) {
 
 // upstream: intel_engine_cs.c nop_irq_handler()
 unsafe extern "C" fn nop_irq_handler(engine: *mut IntelEngineCs, iir: u16) {
-    GEM_DEBUG_WARN_ON!(iir);
+    GEM_DEBUG_WARN_ON!(iir != 0);
 }
 
 // upstream: intel_engine_cs.c get_reset_domain()
@@ -1031,7 +1075,7 @@ pub unsafe fn intel_engines_release(gt: *mut IntelGt) {
         );
     });
 
-    llist_del_all(&mut (*(*gt).i915).uabi_engines_llist);
+    llist_del_all(engine_uabi_llist((*gt).i915));
 }
 
 // upstream: intel_engine_cs.c intel_engine_free_request_pool()
@@ -1677,7 +1721,11 @@ pub unsafe fn intel_engine_create_pinned_context(
         &mut (*ce).pinned_contexts_link,
         &mut (*engine).pinned_contexts_list,
     );
-    lockdep_set_class_and_name(&mut (*(*ce).timeline).mutex, key, name);
+    crate::linux::locks::lockdep_set_class_and_name(
+        &mut (*(*ce).timeline).mutex,
+        key,
+        name,
+    );
 
     ce
 }
@@ -1877,7 +1925,7 @@ pub unsafe fn intel_engine_get_last_batch_head(engine: *const IntelEngineCs) -> 
             intel_engine_regs_upstream::RING_BBADDR_UDW
         );
     } else {
-        bbaddr = ENGINE_READ!(engine, intel_engine_regs_upstream::RING_BBADDR);
+        bbaddr = ENGINE_READ!(engine, intel_engine_regs_upstream::RING_BBADDR) as u64;
     }
 
     bbaddr
@@ -2004,7 +2052,7 @@ unsafe fn __cs_pending_mi_force_wakes(engine: *mut IntelEngineCs) -> u32 {
 unsafe fn __gpm_wait_for_fw_complete(gt: *mut IntelGt, fw_mask: u32) {
     let mut ret: i32;
 
-    udelay(1);
+    crate::linux::primitives::udelay(1);
 
     ret = __intel_wait_for_register_fw(
         (*gt).uncore,
@@ -2016,7 +2064,7 @@ unsafe fn __gpm_wait_for_fw_complete(gt: *mut IntelGt, fw_mask: u32) {
         core::ptr::null_mut(),
     );
 
-    udelay(1);
+    crate::linux::primitives::udelay(1);
 
     if ret != 0 {
         GT_TRACE!(gt, "Failed to complete pending forcewake %d\n", ret);
@@ -2040,9 +2088,9 @@ pub unsafe fn intel_engine_get_instdone(
     let i915 = (*engine).i915;
     let uncore = (*engine).uncore;
     let mmio_base = (*engine).mmio_base;
-    let mut slice;
-    let mut subslice;
-    let mut iter;
+    let mut slice: u32;
+    let mut subslice: u32;
+    let mut iter: usize;
 
     memset(instdone as *mut c_void, 0, size_of::<IntelInstdone>());
 
@@ -2283,7 +2331,7 @@ unsafe fn print_ring(buf: *mut c_char, sz: i32, rq: *mut I915Request) -> i32 {
             i915_ggtt_offset((*(*rq).ring).vma),
             if !tl.is_null() { (*tl).hwsp_offset } else { 0 },
             hwsp_seqno(rq),
-            DIV_ROUND_CLOSEST_ULL(
+            crate::linux::primitives::div_round_closest_ull(
                 intel_context_get_total_runtime_ns((*rq).context),
                 1000 * 1000,
             ),
@@ -2319,7 +2367,7 @@ unsafe fn hexdump(m: *mut DrmPrinter, buf: *const c_void, len: usize) {
         }
 
         WARN_ON_ONCE!(
-            hex_dump_to_buffer(
+            crate::linux::primitives::hex_dump_to_buffer(
                 bytes.add(pos).cast::<c_void>(),
                 len - pos,
                 rowsize,
@@ -2466,9 +2514,9 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
             intel_engine_regs_upstream::RING_DMA_FADD_UDW
         );
     } else if GRAPHICS_VER(i915) >= 4 {
-        addr = ENGINE_READ!(engine, intel_engine_regs_upstream::RING_DMA_FADD);
+        addr = ENGINE_READ!(engine, intel_engine_regs_upstream::RING_DMA_FADD) as u64;
     } else {
-        addr = ENGINE_READ!(engine, DMA_FADD_I8XX);
+        addr = ENGINE_READ!(engine, DMA_FADD_I8XX) as u64;
     }
     drm_printf!(
         m,
@@ -2853,7 +2901,7 @@ pub unsafe fn intel_engine_dump(
     let error = &mut (*(*engine).i915).gpu_error;
     let mut rq: *mut I915Request = core::ptr::null_mut();
     let mut wakeref: IntelWakerefT;
-    let mut dummy: Ktime;
+    let mut dummy: Ktime = 0;
 
     if !header.is_null() {
         drm_vprintf(m, header, ap);
@@ -2878,7 +2926,7 @@ pub unsafe fn intel_engine_dump(
         drm_printf!(
             m,
             "\tRuntime: %llums\n",
-            ktime_to_ms(intel_engine_get_busy_time(engine, &mut dummy)),
+            crate::linux::primitives::ktime_to_ms(intel_engine_get_busy_time(engine, &mut dummy)),
         );
     }
     drm_printf!(

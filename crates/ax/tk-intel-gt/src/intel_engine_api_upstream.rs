@@ -431,7 +431,7 @@ pub unsafe fn intel_hws_csb_write_index(i915: *const DrmI915Private) -> u32 {
 }
 #[macro_export]
 macro_rules! INTEL_HWS_CSB_WRITE_INDEX {
-    ($i915:expr) => {{ unsafe { $crate::intel_engine_api_upstream::intel_hws_csb_write_index($i915) } }};
+    ($i915:expr) => {{ unsafe { $crate::intel_engine_api_upstream::intel_hws_csb_write_index($i915) as usize } }};
 }
 
 // C entry points declared by intel_engine.h.

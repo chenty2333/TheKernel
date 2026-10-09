@@ -117,6 +117,9 @@ pub mod i915_gem_context_upstream;
 pub mod i915_gem_core_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod i915_gem_mman_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod i915_gem_domain_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
@@ -208,13 +211,16 @@ pub mod intel_engine_cs_upstream;
 pub mod intel_engine_heartbeat_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_gt_requests_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_engine_regs_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_engine_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
-pub mod intel_gt_requests_upstream;
-pub mod intel_engine_types_upstream;
+pub mod intel_engine_user_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_execlists_submission_upstream;
@@ -289,6 +295,9 @@ pub mod intel_hwconfig_types_upstream;
 pub mod intel_llc_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_llc_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_lrc_reg_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
@@ -324,6 +333,9 @@ pub mod intel_ring_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_rps_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_rps_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_sseu_types_upstream;
@@ -409,6 +421,3 @@ pub(crate) fn wait(
     }
     Err(Error::Timeout(reg))
 }
-pub mod intel_engine_user_upstream;
-#[cfg(feature = "upstream-gt")]
-#[allow(unsafe_code)]

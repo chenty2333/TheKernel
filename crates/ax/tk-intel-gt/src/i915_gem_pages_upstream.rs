@@ -163,7 +163,7 @@ fn is_err_or_null(ptr: *const c_void) -> bool {
 // bindings rather than success-returning stand-ins. The final section reports
 // the precise lower-layer symbols still required by this translation.
 unsafe extern "C" {
-    fn sg_alloc_table(sgt: *mut SgTable, nents: u32, gfp_mask: u32) -> c_int;
+    pub(crate) fn sg_alloc_table(sgt: *mut SgTable, nents: u32, gfp_mask: u32) -> c_int;
     pub(crate) fn i915_gem_object_release_mmap_offset(obj: *mut DrmI915GemObject);
     fn intel_gt_invalidate_tlb_full(gt: *mut IntelGt, seqno: u32);
     pub(crate) fn drm_clflush_sg(pages: *mut SgTable);
@@ -406,9 +406,9 @@ pub(crate) unsafe fn sg_mark_end(sg: *mut Scatterlist) {
 /// embedded `struct page`; the caller supplies the source `size_t` length and
 /// offset, which Linux stores in the unsigned-int scatterlist fields.
 #[inline]
-pub(crate) unsafe fn sg_set_folio(
+pub(crate) unsafe fn sg_set_folio<T>(
     sg: *mut Scatterlist,
-    folio: *mut c_void,
+    folio: *mut T,
     len: usize,
     offset: usize,
 ) {

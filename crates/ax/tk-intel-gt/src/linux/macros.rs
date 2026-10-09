@@ -412,6 +412,13 @@ macro_rules! mutex_acquire {
     }};
 }
 
+// `might_lock()` is a lockdep annotation which compiles out when the source
+// kernel is built with CONFIG_LOCKDEP=n. Keep the argument unevaluated, as in
+// the disabled Linux macro expansion.
+macro_rules! might_lock {
+    ($($argument:tt)*) => {{}};
+}
+
 /// `dma_fence_assert_held()` compiles away for this configured Linux build
 /// (`CONFIG_LOCKDEP=n`); preserve the expression's evaluation side effects.
 #[macro_export]

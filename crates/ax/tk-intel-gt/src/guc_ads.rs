@@ -1176,6 +1176,62 @@ pub fn engine_usage_record_offset(guc_class: u8, logical_index: u8) -> Result<us
             * size_of::<EngineUsageRecord>())
 }
 
+/// Initialize the policy fields through the configured tagged ADS mapping,
+/// preserving the `IOSYS_MAP` I/O-memory arm and returning the policy GGTT
+/// address published in the fixed ADS header.
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub unsafe fn runtime_policy_init(
+    map: *mut crate::linux::iosys_map::IosysMap,
+    mapped_len: usize,
+    reset_parameter: u8,
+) -> Option<u32> {
+    if map.is_null() || mapped_len < size_of::<AdsFixed>() {
+        return None;
+    }
+    let map = unsafe { &*map };
+    let base = unsafe {
+        if map.is_iomem {
+            map.addr.vaddr_iomem.cast::<u8>()
+        } else {
+            map.addr.vaddr.cast::<u8>()
+        }
+    };
+    if base.is_null() {
+        return None;
+    }
+
+    let scheduler_offset = offset_of!(AdsFixed, ads.scheduler_policies);
+    let scheduler_policies = unsafe {
+        core::ptr::read_volatile(base.add(scheduler_offset).cast::<u32>())
+    };
+    let policies = guc_policies_init(reset_parameter);
+    let policies_offset = offset_of!(AdsFixed, policies);
+    unsafe {
+        core::ptr::write_volatile(
+            base.add(policies_offset + offset_of!(Policies, dpc_promote_time))
+                .cast::<u32>(),
+            policies.dpc_promote_time,
+        );
+        core::ptr::write_volatile(
+            base.add(policies_offset + offset_of!(Policies, max_num_work_items))
+                .cast::<u32>(),
+            policies.max_num_work_items,
+        );
+        core::ptr::write_volatile(
+            base.add(policies_offset + offset_of!(Policies, global_flags))
+                .cast::<u32>(),
+            policies.global_flags,
+        );
+        core::ptr::write_volatile(
+            base.add(policies_offset + offset_of!(Policies, is_valid))
+                .cast::<u32>(),
+            policies.is_valid,
+        );
+    }
+    Some(scheduler_policies)
+}
+
 /// upstream: intel_guc_ads.c guc_ads_private_data_reset().
 pub fn reset_private_data(bytes: &mut [u8], layout: AdsLayout) -> Result<(), Error> {
     let end = layout

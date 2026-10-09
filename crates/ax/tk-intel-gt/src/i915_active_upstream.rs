@@ -1098,7 +1098,7 @@ pub unsafe fn i915_request_add_active_barriers(rq: *mut I915Request) {
             ptr::write_volatile(ll_to_fence_slot(node), &mut (*rq).fence);
             list_add_tail(
                 node.cast(),
-                core::ptr::addr_of_mut!((*rq).fence.cb_list).cast::<ListHead>(),
+                core::ptr::addr_of_mut!((*rq).fence.timestamp_union.cb_list).cast::<ListHead>(),
             );
             node = next;
         }

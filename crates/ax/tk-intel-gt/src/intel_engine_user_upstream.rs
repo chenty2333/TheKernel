@@ -106,6 +106,13 @@ pub(crate) unsafe fn engine_uabi_tree(i915: *mut DrmI915Private) -> *mut RbRoot 
 }
 
 #[inline]
+pub(crate) unsafe fn engine_uabi_llist(
+    i915: *mut DrmI915Private,
+) -> *mut crate::intel_engine_cs_upstream::LlistHead {
+    ptr::addr_of_mut!((*engine_uabi_view(i915)).engines.llist)
+}
+
+#[inline]
 unsafe fn i915_scheduler_caps(i915: *mut DrmI915Private) -> *mut u32 {
     // `intel_driver_caps caps` immediately follows `intel_runtime_info __runtime`
     // in i915_drv.h; both its prefix and the runtime size are source-owned.

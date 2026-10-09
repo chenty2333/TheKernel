@@ -27,6 +27,7 @@ use crate::{
     i915_gem_object_types_upstream::{DrmI915GemObject, intel_bo_to_drm_bo},
     i915_gem_context_types_upstream::{DrmI915FilePrivate, I915DrmClient},
     i915_gem_shmem_upstream::{DrmI915GemPread, DrmI915GemPwrite},
+    i915_gem_mman_upstream::__i915_gem_object_release_mmap_gtt,
     i915_gem_object_upstream::{
         i915_gem_get_pat_index, i915_gem_object_has_struct_page, i915_gem_init__objects,
     },
@@ -150,7 +151,6 @@ unsafe extern "C" {
     pub(crate) fn __i915_gem_object_frontbuffer_flush(obj: *mut DrmI915GemObject, origin: u32);
     pub(crate) fn __i915_gem_object_frontbuffer_invalidate(obj: *mut DrmI915GemObject, origin: u32);
     pub(crate) fn i915_gem_object_wait(obj: *mut DrmI915GemObject, flags: u32, timeout: c_long) -> c_int;
-    fn __i915_gem_object_release_mmap_gtt(obj: *mut DrmI915GemObject);
     fn i915_gem_object_runtime_pm_release_mmap_offset(obj: *mut DrmI915GemObject);
     fn __copy_to_user(to: *mut c_void, from: *const c_void, n: usize) -> usize;
     fn __copy_from_user(to: *mut c_void, from: *const c_void, n: usize) -> usize;
@@ -1258,7 +1258,8 @@ pub unsafe fn i915_gem_driver_remove(dev_priv: *mut DrmI915Private) {
     for_each_gt!(gt, dev_priv, i, {
         intel_gt_driver_remove(gt);
     });
-    (*dev_priv).uabi_engines = RB_ROOT!();
+    (*crate::intel_engine_user_upstream::engine_uabi_tree(dev_priv)).node =
+        core::ptr::null_mut();
     i915_gem_drain_workqueue(dev_priv);
 }
 

@@ -133,7 +133,7 @@ pub unsafe fn kmem_cache_destroy(cache: *mut KmCache) {
 }
 
 macro_rules! KMEM_CACHE {
-    ($object:ty, $flags:expr) => {{ unsafe { $crate::linux_heap::kmem_cache_create::<$object>($flags) } }};
+    ($object:ty, $flags:expr) => {{ unsafe { $crate::linux_heap::kmem_cache_create::<$object>($flags).cast() } }};
 }
 
 #[cfg(test)]

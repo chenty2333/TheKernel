@@ -11,7 +11,7 @@
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
 
 use core::{
-    ffi::{c_char, c_int, c_long, c_ulong, c_void},
+    ffi::{c_char, c_int, c_long, c_ulong, c_void, CStr},
     ptr,
 };
 
@@ -19,23 +19,31 @@ use crate::{
     i915_gem_object_api_upstream::{i915_gem_object_has_pages, i915_gem_object_put},
     i915_gem_object_header_upstream::__start_cpu_write,
     i915_gem_object_types_upstream::{
-        DrmI915GemObject, DrmI915GemObjectOps, I915_GEM_OBJECT_IS_SHRINKABLE,
+        DrmI915GemObject, DrmI915GemObjectOps, Page, I915_GEM_OBJECT_IS_SHRINKABLE,
         I915_GEM_OBJECT_SHRINK_WRITEBACK, VmOperationsStruct,
     },
     i915_gem_object_upstream::{
         i915_gem_object_can_bypass_llc, i915_gem_object_has_struct_page, i915_gem_object_init,
         i915_gem_object_set_cache_coherency,
     },
-    i915_gem_pages_upstream::{__i915_gem_object_set_pages, i915_gem_object_truncate, sg_next, sg_page},
+    i915_gem_pages_upstream::{__i915_gem_object_set_pages, i915_gem_object_truncate, i915_sg_trim, sg_alloc_table, sg_mark_end, sg_next, sg_page, sg_set_folio, Scatterlist as ScatterList},
+    i915_gem_region_upstream::{i915_gem_object_create_region, i915_gem_object_init_memory_region, i915_gem_object_release_memory_region},
     i915_gem_pages_upstream::drm_clflush_sg,
     i915_gem_userptr_upstream::{drm_gem_private_object_init, i915_gem_gtt_finish_pages, sg_free_table},
     i915_gem_core_upstream::{access_ok, u64_to_user_ptr},
     i915_gem_context_upstream::fput,
+    linux::gem::DrmGemObject,
     i915_gem_shrinker_upstream::i915_gem_shrink,
     i915_gem_tiling_upstream::i915_gem_object_needs_bit17_swizzle,
     intel_ggtt_fencing_upstream::{i915_gem_object_do_bit_17_swizzle, i915_gem_object_save_bit_17_swizzle},
     intel_context_upstream::SgTable,
     linux::i915::{GRAPHICS_VER, GRAPHICS_VER_FULL, IP_VER, IS_DGFX, IS_I965G, IS_I965GM},
+    linux::gem_memory::{IntelMemoryRegion, Resource},
+    linux::fields::LockClassKey,
+    linux::highmem::{kmap_local_page, kunmap_local, mark_page_accessed, put_page},
+    linux::primitives::offset_in_page,
+    linux::scatterlist::i915_sg_segment_size,
+    linux::page::{folio_pfn, page_to_pfn},
     linux_config::*,
     linux_i915_private::DrmI915Private,
 };
@@ -93,6 +101,38 @@ const ITER_SOURCE: c_int = 1;
 const EIOCBQUEUED: c_int = 529;
 const INTEL_REGION_SMEM: usize = 0;
 
+// The two C DRM logging macros used by init_shmem() lower to these typed
+// adapters. Their format strings are static NUL-terminated strings, and the
+// notice site has exactly one `%s` argument.
+unsafe fn drm_info<T>(device: *mut T, format: *const c_char) {
+    let _ = device;
+    let message = unsafe { CStr::from_ptr(format) }.to_string_lossy();
+    crate::linux::print::drm_log_at(
+        crate::linux::print::DrmLogLevel::Info,
+        "i915 DRM info",
+        file!(),
+        line!(),
+        &message,
+    );
+}
+
+unsafe fn drm_notice<T>(device: *mut T, format: *const c_char, argument: *const c_char) {
+    let _ = device;
+    let format = unsafe { CStr::from_ptr(format) }.to_string_lossy();
+    let argument = unsafe { CStr::from_ptr(argument) }
+        .to_string_lossy()
+        .into_owned();
+    let args: [&dyn crate::linux::print::CFormatArg; 1] = [&argument];
+    let message = crate::linux::print::format_c_message(&format, &args);
+    crate::linux::print::drm_log_at(
+        crate::linux::print::DrmLogLevel::Info,
+        "i915 DRM notice",
+        file!(),
+        line!(),
+        &message,
+    );
+}
+
 // Linux records passed through pointers remain opaque here. The records whose
 // source members this file accesses are represented by source-derived prefixes.
 #[repr(C)]
@@ -100,9 +140,6 @@ struct Folio {
     _opaque: [u8; 0],
 }
 #[repr(C)]
-struct Page {
-    _opaque: [u8; 0],
-}
 #[repr(C)]
 pub struct AddressSpace {
     _opaque: [u8; 0],
@@ -123,40 +160,6 @@ struct VfsMount {
     _opaque: [u8; 0],
 }
 #[repr(C)]
-pub struct IntelMemoryRegion {
-    i915: *mut DrmI915Private,
-    ops: *const IntelMemoryRegionOps,
-    iomap: IoMapping,
-    region: Resource,
-}
-#[repr(C)]
-struct IoMapping {
-    base: u64,
-    size: c_ulong,
-    prot: c_ulong,
-    iomem: *mut c_void,
-}
-#[repr(C)]
-struct Resource {
-    start: u64,
-    end: u64,
-    name: *const c_char,
-    flags: c_ulong,
-    desc: c_ulong,
-    parent: *mut Resource,
-    sibling: *mut Resource,
-    child: *mut Resource,
-}
-#[repr(C)]
-struct DrmGemObject {
-    _refcount_and_handle_count: [u8; 8],
-    dev: *mut c_void,
-    filp: *mut File,
-    _vma_node: [u8; 192],
-    size: usize,
-}
-const _: [(); 216] = [(); core::mem::offset_of!(DrmGemObject, size)];
-#[repr(C)]
 struct FolioBatch {
     nr: u8,
     i: u8,
@@ -170,10 +173,6 @@ struct SgtIter {
     pfn: c_ulong,
     curr: u32,
     max: u32,
-}
-#[repr(C)]
-struct ScatterList {
-    _opaque: [usize; 4],
 }
 #[repr(C)]
 struct WritebackControl {
@@ -241,12 +240,6 @@ pub struct DrmI915GemPread {
 }
 
 #[repr(C)]
-struct SgTableLayout {
-    sgl: *mut ScatterList,
-    nents: u32,
-    orig_nents: u32,
-}
-#[repr(C)]
 struct ScatterListLayout {
     page_link: c_ulong,
     offset: u32,
@@ -255,18 +248,12 @@ struct ScatterListLayout {
     dma_length: u32,
     dma_flags: u32,
 }
-#[repr(C)]
-struct LockClassKey {
-    _opaque: [u8; 0],
-}
-const _: [(); 16] = [(); core::mem::size_of::<SgTableLayout>()];
 const _: [(); 24] = [(); core::mem::size_of::<SgtIter>()];
 const _: [(); 128] = [(); core::mem::size_of::<FolioBatch>()];
-const _: [(); 48] = [(); core::mem::offset_of!(IntelMemoryRegion, region)];
 
 #[inline]
-unsafe fn sgt_layout(st: *mut SgTable) -> *mut SgTableLayout {
-    st.cast()
+unsafe fn sgt_layout(st: *mut SgTable) -> *mut SgTable {
+    st
 }
 
 #[inline]
@@ -281,12 +268,12 @@ unsafe fn drm_gem_base(obj: *mut DrmI915GemObject) -> *mut DrmGemObject {
 
 #[inline]
 unsafe fn object_file(obj: *mut DrmI915GemObject) -> *mut File {
-    (*drm_gem_base(obj)).filp
+    (*drm_gem_base(obj)).filp.cast()
 }
 
 #[inline]
 unsafe fn object_size(obj: *mut DrmI915GemObject) -> usize {
-    (*drm_gem_base(obj)).size
+    (*drm_gem_base(obj)).size as usize
 }
 
 #[inline]
@@ -315,11 +302,45 @@ unsafe fn file_inode_mapping(file: *mut File) -> *mut AddressSpace {
     (*file).f_mapping
 }
 
+unsafe extern "C" {
+    fn shmem_read_mapping_page_gfp(mapping: *mut AddressSpace, index: c_ulong, gfp: u32) -> *mut Page;
+}
+
+// upstream: gt/shmem_utils.c shmem_read()
+pub unsafe fn shmem_read(file: *mut c_void, mut off: u64, mut dst: *mut c_void, mut len: usize) -> c_int {
+    let file = file.cast::<File>();
+    let mut pfn = off >> PAGE_SHIFT;
+    while len != 0 {
+        let this = core::cmp::min(PAGE_SIZE - offset_in_page(off) as usize, len);
+        let page = unsafe { shmem_read_mapping_page_gfp((*file).f_mapping, pfn as c_ulong, GFP_KERNEL) };
+        if IS_ERR(page) {
+            return PTR_ERR(page);
+        }
+        let vaddr = unsafe { kmap_local_page(page) };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                vaddr.cast::<u8>().add(offset_in_page(off) as usize),
+                dst.cast::<u8>(),
+                this,
+            );
+            mark_page_accessed(page);
+            kunmap_local(vaddr);
+            put_page(page);
+        }
+        len -= this;
+        dst = unsafe { dst.cast::<u8>().add(this).cast() };
+        off = 0;
+        pfn += 1;
+    }
+    0
+}
+
 #[inline]
 unsafe fn file_inode(file: *mut File) -> *mut Inode {
     (*file).f_inode
 }
 
+#[inline]
 #[inline]
 fn resource_size(resource: &Resource) -> u64 {
     resource.end.wrapping_sub(resource.start).wrapping_add(1)
@@ -745,7 +766,7 @@ pub unsafe fn i915_gem_object_put_pages_shmem(obj: *mut DrmI915GemObject, pages:
         object_dirty(obj),
         object_madv(obj) == I915_MADV_WILLNEED,
     );
-    kfree(pages.cast());
+    kfree(pages.cast::<c_void>());
     set_object_dirty(obj, false);
 }
 
@@ -781,7 +802,7 @@ unsafe extern "C" fn shmem_pwrite(
     let size = (*arg).size;
 
     // Caller already validated user args.
-    GEM_BUG_ON!(!access_ok(user_data, (*arg).size as usize));
+    GEM_BUG_ON!(!access_ok(user_data.cast(), (*arg).size));
 
     if !i915_gem_object_has_struct_page(obj) {
         return i915_gem_object_pwrite_phys(obj, arg);
@@ -845,7 +866,7 @@ unsafe extern "C" fn shmem_release(obj: *mut DrmI915GemObject) {
         i915_gem_object_release_memory_region(obj);
     }
 
-    fput(object_file(obj));
+    fput(object_file(obj).cast());
 }
 
 // The operation-table record and callback ABI come from the canonical
@@ -884,7 +905,7 @@ unsafe fn __create_shmem(
     let mut huge_mnt: *mut VfsMount;
     let filp: *mut File;
 
-    drm_gem_private_object_init(&mut (*i915).drm, obj, size);
+    drm_gem_private_object_init((&mut (*i915).drm as *mut crate::linux_i915_private::DrmDevicePrefix).cast::<c_void>(), obj, size as usize);
 
     // __shmem_file_setup() returns -EINVAL when size exceeds MAX_LFS_FILESIZE.
     // Match other i915 size checks by returning -E2BIG for oversized objects.
@@ -911,7 +932,7 @@ unsafe fn __create_shmem(
         (*filp).f_flags |= O_LARGEFILE as u32;
     }
 
-    (*obj).filp = filp;
+    (*obj).filp = filp.cast();
     0
 }
 
@@ -924,7 +945,7 @@ unsafe fn shmem_object_init(
     page_size: u64,
     flags: u32,
 ) -> c_int {
-    static mut LOCK_CLASS: LockClassKey = LockClassKey { _opaque: [0; 0] };
+    static mut LOCK_CLASS: LockClassKey = LockClassKey {};
     let i915 = (*mem).i915;
     let mut mapping: *mut AddressSpace;
     let mut cache_level: u32;
@@ -963,7 +984,7 @@ unsafe fn shmem_object_init(
     // MTL does not snoop the CPU cache by default for GPU access (one-way
     // coherency), but existing userspace depends on snooping. Default to
     // one-way coherent on MTL; GEM_CREATE will gain an explicit setting later.
-    if HAS_LLC(i915) || GRAPHICS_VER_FULL(i915) >= IP_VER(12, 70) as u32 {
+    if HAS_LLC(i915) || GRAPHICS_VER_FULL(i915) >= IP_VER(12, 70) as u16 {
         // LLC caching can improve performance by roughly 10% over uncached
         // access. Non-display graphics accesses are CPU coherent; display
         // planes remain UC and are rebound when first used as such.
@@ -1098,5 +1119,5 @@ pub unsafe fn i915_gem_shmem_setup(
 
 // upstream: i915_gem_shmem.c i915_gem_object_is_shmem()
 pub unsafe fn i915_gem_object_is_shmem(obj: *const DrmI915GemObject) -> bool {
-    (*obj).ops == ptr::addr_of!(i915_gem_shmem_ops).cast::<c_void>()
+    (*obj).ops == ptr::addr_of!(i915_gem_shmem_ops)
 }
