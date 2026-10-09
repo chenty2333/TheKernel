@@ -1932,6 +1932,29 @@ mod tests {
     }
 
     #[test]
+    fn legacy_addfb_preserves_rgb565_fourcc() {
+        let device = crate::drm::DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
+        let file = device.open_primary();
+        let dumb = file.create_dumb(DumbRequest { width: 8, height: 8, bpp: 16 }).unwrap();
+        let request = uapi::DrmModeFbCmd {
+            width: 8, height: 8, pitch: dumb.pitch, bpp: 16, depth: 16,
+            handle: dumb.handle, ..Default::default()
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&request as *const uapi::DrmModeFbCmd).cast::<u8>(),
+                core::mem::size_of_val(&request),
+            )
+        };
+        let copy = Image(RefCell::new(bytes.to_vec()));
+        addfb(&file, &copy, 0).unwrap();
+        let result: uapi::DrmModeFbCmd = read_pod(&copy, 0).unwrap();
+        let fb = file.framebuffer(result.fb_id).unwrap();
+        assert_eq!(fb.format, 0x3631_4752);
+        assert_eq!(fb.bpp, 16);
+    }
+
+    #[test]
     fn destroy_dumb_reads_only_its_four_byte_payload() {
         let device = crate::drm::DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
         let file = device.open_primary();
