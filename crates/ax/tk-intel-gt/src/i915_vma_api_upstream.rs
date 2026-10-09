@@ -19,6 +19,7 @@ pub use crate::i915_vma_types_upstream::{
 };
 use crate::{
     i915_request_types_upstream::I915Request,
+    intel_ggtt_fencing_types_upstream::I915FenceReg,
     i915_vma_resource_types_upstream::I915VmaResource,
     i915_vma_types_upstream::I915Vma,
     intel_context_upstream::{
@@ -27,6 +28,7 @@ use crate::{
     intel_engine_cs_upstream::AtomicT,
     intel_gt_types_upstream::IntelGt,
     intel_gtt_api_upstream::i915_vm_to_ggtt,
+    linux_memory::{atomic_dec, atomic_read},
 };
 
 /// `I915_VMA_RELEASE_MAP` from `i915_vma.h:48-49`.
@@ -390,9 +392,18 @@ unsafe extern "C" {
     pub fn i915_vma_parked(gt: *mut IntelGt);
 }
 
-// `__i915_vma_unpin_fence()` / `i915_vma_unpin_fence()` (i915_vma.h:386-405)
-// require `i915_fence_reg.pin_count`; `I915FenceReg` remains pointer-only in
-// its current owning binding. No incomplete inline fence decrement is exposed.
+/// Source-inline `i915_vma_unpin_fence()` from `i915_vma.h:393-405`.
+///
+/// # Safety
+/// `vma` must be a live i915 VMA, and its fence pointer must follow the source
+/// VMA ownership invariant.
+pub unsafe fn i915_vma_unpin_fence(vma: *mut I915Vma) {
+    let fence = unsafe { (*vma).fence };
+    if !fence.is_null() {
+        GEM_BUG_ON!(unsafe { atomic_read(&(*fence).pin_count) } <= 0);
+        unsafe { atomic_dec(&mut (*fence).pin_count) };
+    }
+}
 
 /// `i915_vma_is_scanout()` (`i915_vma.h:409-412`).
 ///
