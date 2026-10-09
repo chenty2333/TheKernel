@@ -184,13 +184,6 @@ unsafe extern "C" {
         timeout: i64,
         remaining_timeout: *mut i64,
     ) -> i64;
-    fn intel_gt_handle_error(
-        gt: *mut intel_gt,
-        engine_mask: u32,
-        flags: c_ulong,
-        fmt: *const c_char,
-        ...
-    );
 }
 
 #[allow(non_snake_case)]
@@ -5040,12 +5033,12 @@ fn reset_fail_worker_func(w: &mut work_struct) {
             intel_guc_find_hung_context(unsafe { &mut *engine });
         });
         unsafe {
-            intel_gt_handle_error(
+            crate::intel_reset_upstream::intel_gt_handle_error_format(
                 gt,
                 reset_fail_mask,
                 I915_ERROR_CAPTURE as c_ulong,
                 c"GuC failed to reset engine mask=0x%x".as_ptr(),
-                reset_fail_mask,
+                &[&reset_fail_mask as &dyn crate::linux::print::CFormatArg],
             )
         };
     }

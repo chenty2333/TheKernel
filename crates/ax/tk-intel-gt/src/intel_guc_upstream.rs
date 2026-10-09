@@ -175,13 +175,6 @@ unsafe extern "C" {
     fn intel_guc_capture_destroy(guc: *mut IntelGuc);
     fn intel_synchronize_irq(i915: *mut DrmI915Private);
     fn intel_gt_set_wedged(gt: *mut IntelGt);
-    fn intel_gt_handle_error(
-        gt: *mut IntelGt,
-        mask: IntelEngineMask,
-        flags: c_ulong,
-        fmt: *const c_char,
-        ...
-    );
 }
 
 unsafe fn intel_guc_is_ready(guc: *const IntelGuc) -> bool {
@@ -349,11 +342,12 @@ unsafe extern "C" fn guc_dead_worker_func(work: *mut WorkStruct) {
     } else {
         let reason = b"dead GuC\0";
         unsafe {
-            intel_gt_handle_error(
+            crate::intel_reset_upstream::intel_gt_handle_error_format(
                 gt,
                 ALL_ENGINES,
                 I915_ERROR_CAPTURE as c_ulong,
                 reason.as_ptr().cast(),
+                &[],
             );
             (*guc).last_dead_guc_jiffies = jiffies() as c_ulong;
         }

@@ -470,6 +470,7 @@ unsafe fn dma_fence_signal_locked_inner(fence: *mut DmaFence) {
             unsafe { function(fence, callback) };
         }
     }
+    crate::linux::requests::wake_dma_fence_waiters();
 }
 
 /// Signal a fence and run registered completion callbacks.

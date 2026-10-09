@@ -54,6 +54,9 @@ pub(crate) mod scatterlist;
 pub(crate) mod seq_file;
 pub(crate) mod registers;
 pub(crate) mod requests;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod signal;
 pub(crate) mod srcu;
 pub(crate) mod ww_mutex;
 

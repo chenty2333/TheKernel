@@ -331,13 +331,6 @@ unsafe extern "C" {
     fn intel_pxp_start(pxp: *mut c_void) -> c_int;
     fn intel_context_reconfigure_sseu(ce: *mut IntelContext, sseu: *const IntelSseu) -> c_int;
     fn intel_engine_pulse(engine: *mut IntelEngineCs) -> c_int;
-    fn intel_gt_handle_error(
-        gt: *mut IntelGt,
-        mask: IntelEngineMask,
-        flags: u32,
-        fmt: *const c_char,
-        ...
-    );
     fn i915_request_get_rcu(rq: *mut I915Request) -> bool;
     fn i915_request_put(rq: *mut I915Request);
     fn i915_request_active_engine(rq: *mut I915Request, engine: *mut *mut IntelEngineCs) -> bool;
@@ -1807,12 +1800,12 @@ unsafe fn __context_engines_static(ctx: *const I915GemContext) -> *mut I915GemEn
 unsafe fn __reset_context(ctx: *mut I915GemContext, engine: *mut IntelEngineCs) {
     let message = b"context closure in %s\0";
     unsafe {
-        intel_gt_handle_error(
+        crate::intel_reset_upstream::intel_gt_handle_error_format(
             (*engine).gt,
             (*engine).mask,
             0,
             message.as_ptr().cast(),
-            (*ctx).name.as_ptr(),
+            &[&(*ctx).name.as_ptr() as &dyn crate::linux::print::CFormatArg],
         );
     }
 }

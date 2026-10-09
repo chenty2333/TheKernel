@@ -6,7 +6,7 @@
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{
     cell::UnsafeCell,
-    ffi::{c_int, c_ulong, c_void},
+    ffi::{c_int, c_long, c_ulong, c_void},
     ptr,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -179,10 +179,85 @@ pub unsafe fn zap_range(mm: *mut MmStruct, addr: usize, size: usize) {
     assert!(!mm.is_null());
     let space = unsafe { &mut *(*mm).aspace.get() };
     if size != 0 {
-        space
-            .unmap(addr.into(), size)
-            .expect("invalid native MM unmap");
+        let page_size = crate::linux_config::PAGE_SIZE;
+        let mut offset = 0usize;
+        while offset < size {
+            let page = addr + offset;
+            if space.query_leaf(page.into()).is_ok() {
+                space
+                    .unmap(page.into(), page_size)
+                    .expect("native MM lost a mapped leaf during zap");
+            }
+            offset = offset.saturating_add(page_size);
+        }
         unsafe { axhal::asm::flush_tlb(None) };
+    }
+}
+
+/// Linux `unmap_mapping_range()` for native MM mappings created by this
+/// LinuxKPI backend. `vm_mmap()` currently admits shared file mappings only,
+/// so `even_cows` has no private-COW distinction to apply. The file/page refs
+/// remain owned by each VMA until normal VMA teardown; this operation only
+/// removes the affected PTEs, matching the source API's revocation semantics.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn unmap_mapping_range(
+    mapping: *mut c_void,
+    holebegin: c_long,
+    holelen: c_long,
+    _even_cows: i32,
+) {
+    if mapping.is_null() || holebegin < 0 || holelen < 0 {
+        return;
+    }
+    let page_size = crate::linux_config::PAGE_SIZE as u64;
+    let hole_start = holebegin as u64;
+    let hole_end = if holelen == 0 {
+        u64::MAX
+    } else {
+        hole_start.saturating_add(holelen as u64)
+    };
+
+    // Clone the process MM owners before taking their sleepable mmap locks;
+    // duplicate thread bindings are harmless because zapping is idempotent.
+    let mms = {
+        let registry = MAPPINGS.lock();
+        let mut mms = Vec::new();
+        mms.try_reserve_exact(registry.len())
+            .expect("cannot snapshot native MM owners for mapping revocation");
+        mms.extend(registry.values().cloned());
+        mms
+    };
+    for mm_owner in mms {
+        let mm = Arc::as_ptr(&mm_owner).cast_mut();
+        unsafe { mmap_read_lock(mm) };
+        let vmas = unsafe { &*(*mm).vmas.get() };
+        for vma in vmas.values() {
+            let area = &vma.area;
+            if area.vm_file.is_null() {
+                continue;
+            }
+            let file = area.vm_file.cast::<shmem::File>();
+            if unsafe { (*file).f_mapping } != mapping.cast() {
+                continue;
+            }
+
+            let file_start = (area.vm_pgoff as u64).saturating_mul(page_size);
+            let address_start = area.vm_start as u64;
+            let vma_len = area.vm_end.saturating_sub(area.vm_start) as u64;
+            let file_end = file_start.saturating_add(vma_len);
+            let first = core::cmp::max(file_start, hole_start);
+            let last = core::cmp::min(file_end, hole_end);
+            if first >= last {
+                continue;
+            }
+
+            let first_page = first / page_size * page_size;
+            let last_page = last.saturating_add(page_size - 1) / page_size * page_size;
+            let address = address_start.saturating_add(first_page.saturating_sub(file_start));
+            let length = last_page.saturating_sub(first_page) as usize;
+            unsafe { zap_range(mm, address as usize, length) };
+        }
+        unsafe { mmap_read_unlock(mm) };
     }
 }
 pub unsafe fn vm_mmap(

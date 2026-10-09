@@ -8,7 +8,7 @@
 #![allow(unsafe_code, non_snake_case, non_camel_case_types, dead_code)]
 
 use core::{
-    ffi::{c_char, c_int, c_ulong, c_void},
+    ffi::{c_char, c_int, c_long, c_ulong, c_void},
     mem::{offset_of, size_of},
     ptr,
     sync::atomic::{AtomicI32, AtomicPtr, Ordering},
@@ -349,7 +349,7 @@ unsafe extern "C" {
     fn __intel_frontbuffer_invalidate(front: *mut c_void, origin: i32, bits: u32);
     fn trace_i915_vma_unbind(vma: *mut I915Vma);
     fn stack_depot_snprint(handle: u32, buf: *mut c_char, size: usize, spaces: u32) -> usize;
-    fn unmap_mapping_range(mapping: *mut c_void, start: u64, length: u64, even_cows: i32);
+    fn unmap_mapping_range(mapping: *mut c_void, start: c_long, length: c_long, even_cows: i32);
     fn sg_alloc_table(table: *mut SgTable, nents: u32, flags: u32) -> i32;
     fn sg_free_table(table: *mut SgTable);
     static dma_fence_array_ops: u8;
@@ -2664,8 +2664,8 @@ pub unsafe extern "C" fn i915_vma_revoke_mmap(vma: *mut I915Vma) {
     unsafe {
         unmap_mapping_range(
             (*inode).i_mapping,
-            drm_vma_node_offset_addr(node) + vma_offset,
-            (*vma).size,
+            (drm_vma_node_offset_addr(node) + vma_offset) as c_long,
+            (*vma).size as c_long,
             1,
         )
     };

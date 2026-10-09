@@ -5,9 +5,10 @@
 #![allow(unsafe_code)]
 
 use core::{
-    ffi::c_void,
+    ffi::{c_long, c_void},
     ptr,
     sync::atomic::{AtomicI32, Ordering},
+    time::Duration,
 };
 
 use crate::{
@@ -113,6 +114,79 @@ pub const I915_FENCE_FLAG_NOPREEMPT: u32 = 11;
 pub const I915_FENCE_FLAG_SENTINEL: u32 = 12;
 pub const I915_FENCE_FLAG_BOOST: u32 = 13;
 pub const I915_FENCE_FLAG_SUBMIT_PARALLEL: u32 = 14;
+
+static DMA_FENCE_WAITERS: axtask::WaitQueue = axtask::WaitQueue::new();
+
+/// Wake generic dma-fence default waiters after a source fence is signaled.
+pub fn wake_dma_fence_waiters() {
+    DMA_FENCE_WAITERS.notify_all(false);
+}
+
+/// Linux `dma_fence_default_wait()`: wait on the source signaled flag, honor
+/// interruptible waits, and return remaining jiffies (or Linux's timeout /
+/// restart error value). The source callback list is woken by the shared
+/// dma-fence signal path; spurious notifications always recheck the flag.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_fence_default_wait(
+    fence: *mut DmaFence,
+    interruptible: bool,
+    timeout: c_long,
+) -> c_long {
+    if fence.is_null() {
+        return -(crate::linux_config::EINVAL as c_long);
+    }
+    let signaled =
+        || crate::linux::bits::test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, unsafe { &(*fence).flags });
+    if signaled() {
+        return timeout;
+    }
+    if interruptible && unsafe { crate::linux::signal::signal_pending_state(1, current_task_ptr()) }
+    {
+        return -512; // -ERESTARTSYS
+    }
+    if timeout == 0 {
+        return 0;
+    }
+
+    let start = axhal::time::monotonic_time_nanos();
+    let result = if timeout == crate::linux_config::MAX_SCHEDULE_TIMEOUT as c_long {
+        if interruptible {
+            DMA_FENCE_WAITERS.wait_until_interruptible(signaled)
+        } else {
+            DMA_FENCE_WAITERS.wait_until(signaled)
+        }
+        .map(|_| false)
+    } else {
+        let ticks = timeout.max(0) as u64;
+        let hz = u64::from(crate::linux_config::CONFIG_HZ);
+        let duration = Duration::from_secs(ticks / hz)
+            .saturating_add(Duration::from_nanos((ticks % hz) * 1_000_000_000 / hz));
+        if interruptible {
+            DMA_FENCE_WAITERS.wait_timeout_until_interruptible(duration, signaled)
+        } else {
+            DMA_FENCE_WAITERS.wait_timeout_until(duration, signaled)
+        }
+    };
+
+    match result {
+        // The Linux wait-queue API returns false when its condition wins and
+        // true when the deadline expires.
+        Ok(true) => 0,
+        Ok(false) if signaled() => {
+            let elapsed = axhal::time::monotonic_time_nanos().saturating_sub(start);
+            let elapsed_ticks =
+                elapsed.saturating_mul(u64::from(crate::linux_config::CONFIG_HZ)) / 1_000_000_000;
+            timeout.saturating_sub(elapsed_ticks as c_long).max(1)
+        }
+        Ok(false) => 0,
+        Err(axtask::WaitError::Interrupted) => -512, // -ERESTARTSYS
+        Err(_) => -(crate::linux_config::EIO as c_long),
+    }
+}
+
+fn current_task_ptr() -> *mut c_void {
+    axhal::percpu::current_task_ptr::<()>().cast_mut().cast()
+}
 pub const I915_FENCE_FLAG_SKIP_PARALLEL: u32 = 15;
 pub const I915_FENCE_FLAG_COMPOSITE: u32 = 16;
 

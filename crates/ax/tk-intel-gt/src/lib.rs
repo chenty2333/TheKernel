@@ -83,6 +83,10 @@ mod linux_assert;
 #[macro_use]
 #[path = "linux/print.rs"]
 mod linux_print;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[path = "linux/platform.rs"]
+pub mod linux_platform;
 pub mod bcs;
 pub mod cache;
 pub mod execlists;

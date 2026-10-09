@@ -44,13 +44,6 @@ const __GFP_KSWAPD_RECLAIM: u32 = 1 << 11;
 // source unit but owned by other C files/headers.
 unsafe extern "C" {
     fn intel_vgpu_active(i915: *mut DrmI915Private) -> bool;
-    fn intel_gt_handle_error(
-        gt: *mut IntelGt,
-        mask: IntelEngineMask,
-        flags: c_ulong,
-        fmt: *const c_char,
-        ...
-    );
     fn intel_has_reset_engine(gt: *const IntelGt) -> bool;
     fn intel_engine_pulse(engine: *mut IntelEngineCs) -> c_int;
     fn __i915_request_reset(rq: *mut I915Request, guilty: bool);
@@ -2897,12 +2890,12 @@ unsafe extern "C" fn execlists_context_cancel_request(ce: *mut IntelContext, rq:
 
     i915_request_active_engine(rq, &mut engine);
     if !engine.is_null() && intel_engine_pulse(engine) != 0 {
-        intel_gt_handle_error(
+        crate::intel_reset_upstream::intel_gt_handle_error_format(
             (*engine).gt,
             (*engine).mask,
             0,
             c"request cancellation by %s".as_ptr(),
-            current_comm(),
+            &[&current_comm() as &dyn crate::linux::print::CFormatArg],
         );
     }
 }
