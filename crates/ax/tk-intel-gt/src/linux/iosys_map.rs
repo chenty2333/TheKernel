@@ -41,3 +41,9 @@ impl IosysMap {
         self.is_iomem = true;
     }
 }
+
+/// Linux `iosys_map_set_vaddr()` inline helper.
+#[inline]
+pub unsafe fn iosys_map_set_vaddr(map: *mut IosysMap, address: *mut c_void) {
+    unsafe { (*map).set_vaddr(address) };
+}

@@ -684,6 +684,18 @@ pub unsafe fn IS_DG2_G11<P: I915PrivatePtr>(i915: P) -> bool {
     IS_SUBPLATFORM(i915, INTEL_DG2, 1)
 }
 
+/// `HAS_GUC_TLB_INVALIDATION()` from i915_drv.h.
+#[allow(non_snake_case)]
+pub unsafe fn HAS_GUC_TLB_INVALIDATION<P: I915PrivatePtr>(i915: P) -> bool {
+    let i915 = i915.as_i915_private().cast::<DrmI915Private>();
+    assert!(!i915.is_null());
+    let info = unsafe { (*i915).info.cast::<IntelDeviceInfoOverlay>() };
+    assert!(!info.is_null());
+    // DEV_INFO_FOR_EACH_FLAG places this flag at bit 15, after the three
+    // platform flags and twelve alphabetically ordered feature flags.
+    unsafe { (*info).flags[1] & (1 << 7) != 0 }
+}
+
 /// `IS_DGFX()` from i915_drv.h, reading the asserted `is_dgfx` bit from the
 /// source `intel_device_info` object.
 #[allow(non_snake_case)]

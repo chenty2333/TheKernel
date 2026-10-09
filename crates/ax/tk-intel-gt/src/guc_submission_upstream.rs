@@ -84,6 +84,8 @@ use crate::{
     intel_guc_log_types_upstream::IntelGucLog as IntelGucLogLayout,
     intel_guc_slpc_types_upstream::IntelGucSlpc as IntelGucSlpcLayout,
     intel_guc_submission_types_upstream::intel_guc_submission_is_supported,
+    intel_guc_upstream::intel_guc_write_barrier,
+    linux::i915::HAS_GUC_TLB_INVALIDATION,
     intel_guc_types_upstream::{
         IntelGuc, IntelGucInterrupts, IntelGucSendRegs, IntelGucSubmissionState, IntelGucTimestamp,
         IntelGucTlbWait as intel_guc_tlb_wait, intel_guc_is_fw_running, intel_guc_is_supported,
@@ -978,7 +980,7 @@ fn __guc_add_request(guc: &mut intel_guc, rq: &mut i915_request) -> i32 {
     spin_lock(&mut ce.guc_state.lock);
 
     // A blocked non-parent request is submitted by the unblock path instead.
-    if unlikely(context_blocked(&mut *ce) != 0 && !intel_context_is_parent(&mut *ce)) {
+    if unlikely(context_blocked(&mut *ce) != 0 && !unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) }) {
         spin_unlock(&mut ce.guc_state.lock);
         return 0;
     }
@@ -1008,7 +1010,7 @@ fn __guc_add_request(guc: &mut intel_guc, rq: &mut i915_request) -> i32 {
         set_context_enabled(ce);
 
         // Multi-LRC needs an additional H2G after enabling to move its tails.
-        if intel_context_is_parent(&mut *ce) {
+        if unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) } {
             action[0] = INTEL_GUC_ACTION_SCHED_CONTEXT;
             err = intel_guc_send_nb(guc, &action[..len - 1], 0);
         }
@@ -1068,9 +1070,9 @@ fn wq_space_until_wrap(ce: &intel_context) -> u32 {
 
 // upstream: intel_guc_submission.c write_wqi()
 fn write_wqi(ce: &mut intel_context, wqi_size: u32) {
-    build_bug_on!(!is_power_of_2(WQ_SIZE));
+    build_bug_on!(!WQ_SIZE.is_power_of_two());
     // Ensure WQIs are visible before publishing the tail.
-    intel_guc_write_barrier(ce_to_guc(ce));
+    unsafe { intel_guc_write_barrier(ce_to_guc(ce)) };
     ce.parallel.guc.wqi_tail =
         ((ce.parallel.guc.wqi_tail as u32 + wqi_size) & (WQ_SIZE as u32 - 1)) as u16;
     WRITE_ONCE!(*ce.parallel.guc.wq_tail, ce.parallel.guc.wqi_tail as u32);
@@ -1980,7 +1982,7 @@ fn __unwind_incomplete_requests(ce: &mut intel_context) {
 // upstream: intel_guc_submission.c __guc_reset_context()
 fn __guc_reset_context(mut ce: &mut intel_context, stalled: intel_engine_mask_t) {
     let number_children = ce.parallel.number_children;
-    let parent = ce as *mut intel_context;
+    let parent = ce as *const intel_context as *mut intel_context;
     gem_bug_on!(intel_context_is_child(&mut *ce));
     intel_context_get(&mut *ce);
     // GuC implicitly makes the context non-schedulable on reset notification.
@@ -2159,13 +2161,13 @@ fn intel_guc_submission_reset_finish(guc: &mut intel_guc) {
 
 // upstream: intel_guc_submission.c intel_guc_tlb_invalidation_is_available()
 fn intel_guc_tlb_invalidation_is_available(guc: &intel_guc) -> bool {
-    HAS_GUC_TLB_INVALIDATION(unsafe { (*guc_to_gt(guc as *const _ as *mut _)).i915 })
-        && unsafe { intel_guc_is_ready(guc) }
+    return (unsafe { HAS_GUC_TLB_INVALIDATION((*guc_to_gt(guc as *const _ as *mut _)).i915) })
+        && (unsafe { intel_guc_is_ready(guc) });
 }
 
 // upstream: intel_guc_submission.c init_tlb_lookup()
 fn init_tlb_lookup(guc: &mut intel_guc) -> i32 {
-    if !HAS_GUC_TLB_INVALIDATION(unsafe { (*guc_to_gt(guc as *const _ as *mut _)).i915 }) {
+    if !unsafe { HAS_GUC_TLB_INVALIDATION((*guc_to_gt(guc as *const _ as *mut _)).i915) } {
         return 0;
     }
     xa_init_flags(&mut guc.tlb_lookup, XA_FLAGS_ALLOC);
@@ -2184,7 +2186,7 @@ fn init_tlb_lookup(guc: &mut intel_guc) -> i32 {
         GFP_KERNEL,
     );
     if err < 0 {
-        kfree(wait);
+        unsafe { kfree(wait) };
         return err;
     }
     0
@@ -2192,14 +2194,14 @@ fn init_tlb_lookup(guc: &mut intel_guc) -> i32 {
 
 // upstream: intel_guc_submission.c fini_tlb_lookup()
 fn fini_tlb_lookup(guc: &mut intel_guc) {
-    if !HAS_GUC_TLB_INVALIDATION(unsafe { (*guc_to_gt(guc as *const _ as *mut _)).i915 }) {
+    if !unsafe { HAS_GUC_TLB_INVALIDATION((*guc_to_gt(guc as *const _ as *mut _)).i915) } {
         return;
     }
-    let wait = xa_load(&mut guc.tlb_lookup, guc.serial_slot);
+    let wait: *mut intel_guc_tlb_wait = xa_load(&mut guc.tlb_lookup, guc.serial_slot);
     if !wait.is_null() && unsafe { (*wait).busy } {
-        guc_err!(guc, "Unexpected busy item in tlb_lookup on fini\n");
+        guc_err!(&*guc, "Unexpected busy item in tlb_lookup on fini\n");
     }
-    kfree(wait);
+    unsafe { kfree(wait) };
     xa_destroy(&mut guc.tlb_lookup);
 }
 
@@ -2242,7 +2244,7 @@ fn intel_guc_submission_fini(guc: &mut intel_guc) {
     guc_fini_engine_stats(guc);
     guc_flush_destroyed_contexts(guc);
     guc_lrc_desc_pool_destroy_v69(guc);
-    i915_sched_engine_put(guc.sched_engine);
+    unsafe { i915_sched_engine_put(guc.sched_engine) };
     unsafe { bitmap_free(guc.submission_state.guc_ids_bitmap) };
     fini_tlb_lookup(guc);
     guc.submission_initialized = false;
@@ -2319,17 +2321,18 @@ unsafe extern "C" fn guc_submit_request_callback(rq: *mut i915_request) {
 
 // upstream: intel_guc_submission.c new_guc_id()
 fn new_guc_id(guc: &mut intel_guc, ce: &mut intel_context) -> i32 {
-    gem_bug_on!(intel_context_is_child(ce));
-    let ret = if intel_context_is_parent(&mut *ce) {
+    gem_bug_on!(unsafe { intel_context_is_child(ce as *const intel_context as *mut intel_context) });
+    let num_guc_ids = NUMBER_MULTI_LRC_GUC_ID(guc) as u32;
+    let ret = if unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) } {
         unsafe { bitmap_find_free_region(
             guc.submission_state.guc_ids_bitmap,
-            NUMBER_MULTI_LRC_GUC_ID(guc) as u32,
+            num_guc_ids,
             order_base_2(ce.parallel.number_children as u32 + 1) as core::ffi::c_long,
         ) }
     } else {
         ida_alloc_range(
             &mut guc.submission_state.guc_ids,
-            NUMBER_MULTI_LRC_GUC_ID(guc) as u32,
+            num_guc_ids,
             (guc.submission_state.num_guc_ids - 1) as u32,
             GFP_KERNEL | __GFP_RETRY_MAYFAIL | __GFP_NOWARN,
         )
@@ -2337,7 +2340,7 @@ fn new_guc_id(guc: &mut intel_guc, ce: &mut intel_context) -> i32 {
     if unlikely(ret < 0) {
         return ret;
     }
-    if !intel_context_is_parent(ce) {
+    if !unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) } {
         guc.submission_state.guc_ids_in_use += 1;
     }
     ce.guc_id.id = ret as u16;
@@ -2346,9 +2349,9 @@ fn new_guc_id(guc: &mut intel_guc, ce: &mut intel_context) -> i32 {
 
 // upstream: intel_guc_submission.c __release_guc_id()
 fn __release_guc_id(guc: &mut intel_guc, ce: &mut intel_context) {
-    gem_bug_on!(intel_context_is_child(ce));
+    gem_bug_on!(unsafe { intel_context_is_child(ce as *const intel_context as *mut intel_context) });
     if !context_guc_id_invalid(ce) {
-        if intel_context_is_parent(&mut *ce) {
+        if unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) } {
             unsafe { bitmap_release_region(
                 guc.submission_state.guc_ids_bitmap,
                 ce.guc_id.id as c_ulong,
@@ -2362,7 +2365,7 @@ fn __release_guc_id(guc: &mut intel_guc, ce: &mut intel_context) {
         set_context_guc_id_invalid(ce);
     }
     if !list_empty(&ce.guc_id.link) {
-        list_del_init(&mut ce.guc_id.link);
+        unsafe { list_del_init(&mut ce.guc_id.link) };
     }
 }
 
@@ -2378,7 +2381,7 @@ fn release_guc_id(guc: &mut intel_guc, ce: &mut intel_context) {
 fn steal_guc_id(guc: &mut intel_guc, ce: &mut intel_context) -> i32 {
     lockdep_assert_held(&guc.submission_state.lock);
     gem_bug_on!(intel_context_is_child(&mut *ce));
-    gem_bug_on!(intel_context_is_parent(&mut *ce));
+    gem_bug_on!(unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) });
     if !list_empty(&guc.submission_state.guc_id_list) {
         let cn = list_first_entry!(
             &mut guc.submission_state.guc_id_list,
@@ -2412,7 +2415,7 @@ fn assign_guc_id(guc: &mut intel_guc, ce: &mut intel_context) -> i32 {
     gem_bug_on!(intel_context_is_child(&mut *ce));
     let mut ret = new_guc_id(guc, &mut *ce);
     if unlikely(ret < 0) {
-        if intel_context_is_parent(&mut *ce) {
+        if unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) } {
             return -ENOSPC;
         }
         ret = steal_guc_id(guc, &mut *ce);
@@ -2420,7 +2423,7 @@ fn assign_guc_id(guc: &mut intel_guc, ce: &mut intel_context) -> i32 {
             return ret;
         }
     }
-    if intel_context_is_parent(&mut *ce) {
+    if unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) } {
         let mut i = 1;
         for_each_child!(ce, child, {
             unsafe { (*child).guc_id.id = (*ce).guc_id.id + i };
@@ -2480,7 +2483,7 @@ fn pin_guc_id(guc: &mut intel_guc, ce: &mut intel_context) -> i32 {
 fn unpin_guc_id(guc: &mut intel_guc, ce: &mut intel_context) {
     gem_bug_on!(atomic_read(&ce.guc_id.r#ref) < 0);
     gem_bug_on!(intel_context_is_child(&mut *ce));
-    if unlikely(context_guc_id_invalid(&mut *ce) || intel_context_is_parent(&mut *ce)) {
+    if unlikely(context_guc_id_invalid(&mut *ce) || unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) }) {
         return;
     }
     let mut flags: c_ulong = 0;
@@ -2603,7 +2606,7 @@ fn register_context_v69(guc: &mut intel_guc, ce: &mut intel_context, loop_on_bus
     let offset = intel_guc_ggtt_offset(guc, guc.lrc_desc_pool_v69)
         + ce.guc_id.id as u32 * size_of::<guc_lrc_desc_v69>() as u32;
     prepare_context_registration_info_v69(ce);
-    if intel_context_is_parent(&mut *ce) {
+    if unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) } {
         __guc_action_register_multi_lrc_v69(guc, ce, ce.guc_id.id as u32, offset, loop_on_busy)
     } else {
         __guc_action_register_context_v69(guc, ce.guc_id.id as u32, offset, loop_on_busy)
@@ -2614,7 +2617,7 @@ fn register_context_v69(guc: &mut intel_guc, ce: &mut intel_context, loop_on_bus
 fn register_context_v70(guc: &mut intel_guc, ce: &mut intel_context, loop_on_busy: bool) -> i32 {
     let mut info = guc_ctxt_registration_info::default();
     prepare_context_registration_info_v70(&mut *ce, &mut info);
-    if intel_context_is_parent(&mut *ce) {
+    if unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) } {
         __guc_action_register_multi_lrc_v70(guc, &mut *ce, &info, loop_on_busy)
     } else {
         __guc_action_register_context_v70(guc, &info, loop_on_busy)
@@ -2658,7 +2661,7 @@ fn __guc_action_deregister_context(guc: &mut intel_guc, guc_id: u32) -> i32 {
 // upstream: intel_guc_submission.c deregister_context()
 fn deregister_context(ce: &intel_context, guc_id: u32) -> i32 {
     let guc = unsafe { &mut *(ce_to_guc(ce) as *const _ as *mut _) };
-    gem_bug_on!(intel_context_is_child(ce));
+    gem_bug_on!(unsafe { intel_context_is_child(ce as *const intel_context as *mut intel_context) });
     unsafe { trace_intel_context_deregister(ce as *const _ as *mut _) };
     __guc_action_deregister_context(guc, guc_id)
 }
@@ -2867,7 +2870,7 @@ fn prepare_context_registration_info_v69(ce: &mut intel_context) {
     }
 
     // A parent registers its process descriptor/work queue and all children.
-    if intel_context_is_parent(&mut *ce) {
+    if unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) } {
         ce.parallel.guc.wqi_tail = 0;
         ce.parallel.guc.wqi_head = 0;
         unsafe {
@@ -2934,7 +2937,7 @@ fn prepare_context_registration_info_v70(
     info.flags = CONTEXT_REGISTRATION_FLAG_KMD as u32;
 
     // A parent registers a process descriptor/work queue and all children.
-    if intel_context_is_parent(&mut *ce) {
+    if unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) } {
         ce.parallel.guc.wqi_tail = 0;
         ce.parallel.guc.wqi_head = 0;
         let wq_desc_offset =
@@ -3100,7 +3103,7 @@ fn __guc_context_sched_disable(guc: &mut intel_guc, ce: &intel_context, guc_id: 
         crate::intel_guc_fwif_types_upstream::GUC_CONTEXT_DISABLE,
     ];
     gem_bug_on!(guc_id as u32 == GUC_INVALID_CONTEXT_ID);
-    gem_bug_on!(intel_context_is_child(ce));
+    gem_bug_on!(unsafe { intel_context_is_child(ce as *const intel_context as *mut intel_context) });
     unsafe { trace_intel_context_sched_disable(ce) };
     guc_submission_send_busy_loop(
         guc,
@@ -3893,7 +3896,7 @@ fn guc_virtual_context_alloc(ce: &mut intel_context) -> i32 {
 fn guc_parent_context_pin(ce: &mut intel_context, vaddr: *mut c_void) -> i32 {
     let engine = guc_virtual_get_sibling(unsafe { &*ce.engine }, 0).unwrap();
     let guc = unsafe { &mut *(ce_to_guc(ce) as *const intel_guc as *mut intel_guc) };
-    gem_bug_on!(!intel_context_is_parent(&mut *ce));
+    gem_bug_on!(!unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) });
     gem_bug_on!(!unsafe { intel_engine_is_virtual(ce.engine) });
     let ret = pin_guc_id(&mut *guc, &mut *ce);
     if unlikely(ret < 0) {
@@ -3916,7 +3919,7 @@ fn guc_parent_context_unpin(ce: &mut intel_context) {
     let guc = ce_to_guc(ce) as *const _ as *mut IntelGuc;
     gem_bug_on!(context_enabled(&mut *ce));
     gem_bug_on!(intel_context_is_barrier(&mut *ce));
-    gem_bug_on!(!intel_context_is_parent(&mut *ce));
+    gem_bug_on!(!unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) });
     gem_bug_on!(!unsafe { intel_engine_is_virtual(ce.engine) });
     unpin_guc_id(unsafe { &mut *guc }, &mut *ce);
     unsafe { lrc_unpin(&mut *ce) };
@@ -5219,7 +5222,7 @@ fn intel_guc_submission_print_context_info(guc: &mut intel_guc, p: &mut drm_prin
         gem_bug_on!(intel_context_is_child(&mut *ce));
         guc_log_context(p, &mut *ce);
         guc_log_context_priority(p, &*ce);
-        if intel_context_is_parent(&mut *ce) {
+        if unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) } {
             drm_printf!(p, "\t\tNumber children: %u\n", ce.parallel.number_children);
             if !ce.parallel.guc.wq_status.is_null() {
                 drm_printf!(p, "\t\tWQI Head: %u\n", READ_ONCE!(ce.parallel.guc.wq_head));
@@ -5252,7 +5255,7 @@ fn intel_guc_submission_print_context_info(guc: &mut intel_guc, p: &mut drm_prin
 // upstream: intel_guc_submission.c get_children_go_addr()
 #[inline]
 fn get_children_go_addr(ce: &intel_context) -> u32 {
-    gem_bug_on!(!intel_context_is_parent(ce));
+    gem_bug_on!(!unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) });
     (unsafe { i915_ggtt_offset(ce.state) })
         + __get_parent_scratch_offset(ce)
         + offset_of!(parent_scratch, go.semaphore) as u32
@@ -5261,7 +5264,7 @@ fn get_children_go_addr(ce: &intel_context) -> u32 {
 // upstream: intel_guc_submission.c get_children_join_addr()
 #[inline]
 fn get_children_join_addr(ce: &intel_context, child_index: u8) -> u32 {
-    gem_bug_on!(!intel_context_is_parent(ce));
+    gem_bug_on!(!unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) });
     (unsafe { i915_ggtt_offset(ce.state) })
         + __get_parent_scratch_offset(ce)
         + (offset_of!(parent_scratch, join)
@@ -5282,7 +5285,7 @@ fn emit_bb_start_parent_no_preempt_mid_batch(
     flags: u32,
 ) -> i32 {
     let ce = unsafe { &*rq.context };
-    gem_bug_on!(!intel_context_is_parent(ce));
+    gem_bug_on!(!unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) });
     let mut cs = unsafe { intel_ring_begin(rq, 10 + 4 * ce.parallel.number_children as u32) };
     if IS_ERR(cs) {
         return PTR_ERR(cs);
@@ -5409,7 +5412,7 @@ fn __emit_fini_breadcrumb_parent_no_preempt_mid_batch(
     mut cs: *mut u32,
 ) -> *mut u32 {
     let ce = unsafe { &*rq.context };
-    gem_bug_on!(!intel_context_is_parent(ce));
+    gem_bug_on!(!unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) });
     // Wait for children to reach the fini-breadcrumb boundary.
     for i in 0..ce.parallel.number_children {
         unsafe {
@@ -5450,7 +5453,7 @@ fn emit_fini_breadcrumb_parent_no_preempt_mid_batch(
     mut cs: *mut u32,
 ) -> *mut u32 {
     let ce = unsafe { &*rq.context };
-    gem_bug_on!(!intel_context_is_parent(ce));
+    gem_bug_on!(!unsafe { intel_context_is_parent(ce as *const intel_context as *mut intel_context) });
     let start_fini_breadcrumb_cs = cs;
     let before_fini_breadcrumb_user_interrupt_cs;
     if unlikely(skip_handshake(rq)) {

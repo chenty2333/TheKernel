@@ -271,6 +271,9 @@ pub mod intel_guc_submission_types_upstream;
 pub mod intel_guc_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_guc_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_huc_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
