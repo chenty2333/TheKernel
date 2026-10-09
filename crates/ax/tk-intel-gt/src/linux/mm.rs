@@ -4,15 +4,79 @@
 
 use core::ffi::{c_char, c_int, c_ulong, c_void};
 
-#[repr(C)]
+use crate::{
+    intel_context_types_upstream::File,
+    linux::gem_memory::PgProt,
+};
+
+/// Linux 7.2.3 `vm_area_struct` fields consumed by the i915 translations.
+/// Offsets are from the wt-dev x86_64 oracle build (including
+/// CONFIG_PER_VMA_LOCK, CONFIG_SWAP, and CONFIG_NUMA). Unused source fields
+/// remain opaque bytes; this record does not model their behavior.
+#[repr(C, align(64))]
 pub struct VmAreaStruct {
-    _opaque: [u8; 0],
+    pub vm_start: c_ulong,
+    pub vm_end: c_ulong,
+    pub vm_mm: *mut c_void,
+    pub vm_page_prot: PgProt,
+    pub vm_flags: c_ulong,
+    pub vm_lock_seq: u32,
+    _vm_lock_seq_pad: u32,
+    _anon_vma_chain: [u8; 16],
+    _anon_vma: *mut c_void,
+    pub vm_ops: *const VmOperationsStruct,
+    pub vm_pgoff: c_ulong,
+    pub vm_file: *mut File,
+    pub vm_private_data: *mut c_void,
+    _swap_readahead_info: c_ulong,
+    _vm_policy: *mut c_void,
+    _rest: [u8; 72],
 }
 
 #[repr(C)]
 pub struct VmFault {
-    _opaque: [u8; 0],
+    pub vma: *mut VmAreaStruct,
+    pub gfp_mask: u32,
+    _gfp_pad: u32,
+    pub pgoff: c_ulong,
+    pub address: c_ulong,
+    pub real_address: c_ulong,
+    pub flags: u32,
+    _flags_pad: u32,
+    _pmd: *mut c_void,
+    _pud: *mut c_void,
+    _orig_pte_or_pmd: u64,
+    _cow_page: *mut c_void,
+    _page: *mut c_void,
+    _pte: *mut c_void,
+    _ptl: *mut c_void,
+    _prealloc_pte: *mut c_void,
 }
+
+// `vm_fault_t` result bits from include/linux/mm_types.h.
+pub const VM_FAULT_OOM: u32 = 0x000001;
+pub const VM_FAULT_SIGBUS: u32 = 0x000002;
+pub const VM_FAULT_NOPAGE: u32 = 0x000100;
+
+// Linux `vm_flags` values from include/linux/mm.h for this CONFIG_MMU build.
+pub const VM_WRITE: c_ulong = 1 << 1;
+pub const VM_PFNMAP: c_ulong = 1 << 10;
+pub const VM_IO: c_ulong = 1 << 14;
+pub const VM_DONTEXPAND: c_ulong = 1 << 18;
+pub const VM_DONTDUMP: c_ulong = 1 << 26;
+pub const VM_MIXEDMAP: c_ulong = 1 << 28;
+pub const VM_MAYWRITE: c_ulong = 1 << 5;
+
+const _: [(); 192] = [(); core::mem::size_of::<VmAreaStruct>()];
+const _: [(); 64] = [(); core::mem::align_of::<VmAreaStruct>()];
+const _: [(); 40] = [(); core::mem::offset_of!(VmAreaStruct, vm_lock_seq)];
+const _: [(); 80] = [(); core::mem::offset_of!(VmAreaStruct, vm_pgoff)];
+const _: [(); 88] = [(); core::mem::offset_of!(VmAreaStruct, vm_file)];
+const _: [(); 96] = [(); core::mem::offset_of!(VmAreaStruct, vm_private_data)];
+const _: [(); 112] = [(); core::mem::offset_of!(VmAreaStruct, _vm_policy)];
+const _: [(); 112] = [(); core::mem::size_of::<VmFault>()];
+const _: [(); 0] = [(); core::mem::offset_of!(VmFault, vma)];
+const _: [(); 24] = [(); core::mem::offset_of!(VmFault, address)];
 
 /// Linux 7.2.3 `vm_operations_struct` callback table for the wt-dev target.
 /// The target's `auto.conf` has CONFIG_NUMA=y and CONFIG_USERFAULTFD=y, while

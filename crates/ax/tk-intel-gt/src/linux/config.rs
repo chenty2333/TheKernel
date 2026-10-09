@@ -7,6 +7,7 @@
 #![allow(non_snake_case, non_upper_case_globals)]
 
 pub const CONFIG_DRM_I915_CAPTURE_ERROR: bool = true;
+pub const CONFIG_DRM_I915_USERFAULT_AUTOSUSPEND: u32 = 250;
 pub const CONFIG_PM: bool = true;
 pub const CONFIG_DRM_I915_DEBUG_GEM: bool = false;
 pub const CONFIG_DRM_I915_GVT: bool = false;
