@@ -11,10 +11,12 @@ services. The file is exported by `tk-intel-display` and compiled by its crate
 tests; the live combo-PHY output path now uses the source
 `intel_ddi_transcoder_func_reg_val_get()` to compose `TRANS_DDI_FUNC_CTL` from
 the admitted HDMI/DVI encoder and Pipe-A state. The source
+`intel_ddi_enable_transcoder_func()` now writes `TRANS_DDI_FUNC_CTL2(A)` before
+`TRANS_DDI_FUNC_CTL(A)` and the kernel verifies both readbacks. The source
 `intel_ddi_buf_enable()` also owns the combo output's buffer write, posting read
-and 10-ms active poll through a single-register `DdiIo` adapter. That
-integration caught and fixed a translated sync-flag offset error and removed a
-Gen13 `PORT_WIDTH` field that upstream only adds on display version 14+. The
-policy adapter cannot access unrelated MMIO/PHY registers. A complete kernel
+and 10-ms active poll through a single-register `DdiIo` adapter. The bounded
+adapters cannot access unrelated MMIO/PHY registers. This integration caught
+and fixed a translated sync-flag offset error and removed a Gen13 `PORT_WIDTH`
+field that upstream only adds on display version 14+. A complete kernel
 `DdiIo` binding and source DDI pre-enable/enable/disable call sequence are not
 yet connected.
