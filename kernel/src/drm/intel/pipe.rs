@@ -2015,6 +2015,50 @@ pub(crate) fn compute_with_watermarks_format(
     compute_with_program(pipe, mode, surface, ddb, watermark, pixel_format)
 }
 
+/// Program only the timing and per-pipe configuration required before a
+/// multi-plane DDB/plane update.  Unlike [`program`], this deliberately does
+/// not touch the primary plane, DDB partition, or watermark registers: those
+/// are owned by [`update_multi_plane_scanout`] when a pipe has more than one
+/// visible plane.
+///
+/// This is the `hsw_crtc_enable()` pipe-configuration portion for a KMS state
+/// whose plane allocation was computed by the multi-plane planner.  The
+/// caller still owns transcoder enable and plane arming order.
+pub(crate) fn program_multi_plane_pipe_config(
+    regs: &impl Registers,
+    pipe: Pipe,
+    mode: &Mode,
+) -> Result<(), PipeError> {
+    let timings = timing::timing_registers(mode).map_err(PipeError::Timing)?;
+    let misc_before = read(regs, pipe.misc())?;
+    let arb_before = read(regs, pipe.arb_ctl())?;
+    let writes = [
+        PlannedWrite {
+            register: pipe.misc(),
+            value: (misc_before & !PIPE_MISC_OWNED_MASK)
+                | PIPE_MISC_BPC_8
+                | PIPE_MISC_PIXEL_ROUNDING_TRUNC,
+        },
+        PlannedWrite {
+            register: pipe.arb_ctl(),
+            value: arb_before | PIPE_ARB_USE_PROG_SLOTS,
+        },
+    ];
+    // Validate the complete timing sequence before the first MMIO write.
+    let timing_writes: Vec<_> = timings
+        .in_write_order()
+        .into_iter()
+        .map(|(register, value)| PlannedWrite {
+            register: pipe.timing(register),
+            value,
+        })
+        .collect();
+    for planned in writes.into_iter().chain(timing_writes) {
+        write(regs, planned)?;
+    }
+    Ok(())
+}
+
 fn plane_format_fields(pixel_format: u32) -> Result<(u32, u32, u32), PipeError> {
     use intel_display::skl_universal_plane_full as source;
 
@@ -2517,6 +2561,35 @@ mod multi_plane_plan_tests {
             num_levels: 6,
             sagv_block_time_us: 0,
         }
+    }
+
+    #[test]
+    fn multi_plane_pipe_config_programs_only_pipe_and_timing_registers() {
+        let regs = crate::drm::intel::regs::mock::MockRegisters::new();
+        program_multi_plane_pipe_config(&regs, Pipe::B, &mode_1080p())
+            .expect("pipe timing and per-pipe configuration should be writable");
+
+        let writes = regs.writes();
+        assert_eq!(writes.len(), 2 + 7);
+        assert_eq!(writes[0].0, "PIPE_MISC_B");
+        assert_eq!(writes[1].0, "PIPE_ARB_CTL_B");
+        assert_eq!(writes[2].0, "TRANS_HTOTAL_B");
+        assert_eq!(writes.last().unwrap().0, "PIPESRC_B");
+        assert!(writes.iter().all(|(name, _)| {
+            !name.contains("PLANE") && !name.contains("WM") && !name.contains("BUF_CFG")
+        }));
+    }
+
+    #[test]
+    fn multi_plane_pipe_config_rejects_invalid_timing_before_mmio() {
+        let regs = crate::drm::intel::regs::mock::MockRegisters::new();
+        let mut mode = mode_1080p();
+        mode.htotal = 0;
+        assert!(matches!(
+            program_multi_plane_pipe_config(&regs, Pipe::A, &mode),
+            Err(PipeError::Timing(_))
+        ));
+        assert!(regs.writes().is_empty());
     }
 
     fn half_screen(plane_index: usize, dst_x: u32, ggtt_address: u64) -> PlaneScanout {
