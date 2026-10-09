@@ -9,6 +9,7 @@
 use core::{ffi::c_void, mem::size_of};
 
 use crate::{
+    NEEDS_FASTCOLOR_BLT_WABB,
     i915_gem_object_api_upstream::{i915_gem_object_lock, i915_gem_object_unpin_map},
     i915_gem_object_header_upstream::i915_gem_object_put,
     i915_gem_object_upstream::i915_gem_object_set_cache_coherency,
@@ -31,6 +32,7 @@ use crate::{
     intel_context_upstream::*,
     intel_engine_cs_upstream::*,
     intel_engine_types_upstream::{I915WaCtxBb, IntelEngineCs, intel_engine_has_relative_mmio},
+    gen8_engine_cs_upstream::{gen12_emit_aux_table_inv, gen8_emit_pipe_control},
     intel_gt_api_upstream::{
         intel_gt_coherent_map_type, intel_gt_needs_wa_22016122933, intel_gt_scratch_offset,
     },
@@ -45,6 +47,7 @@ use crate::{
     intel_timeline_types_upstream::IntelTimeline,
     intel_timeline_upstream::{intel_timeline_create, intel_timeline_create_from_engine},
     linux::average::ewma_runtime_add,
+    linux::registers::{MI_LOAD_REGISTER_IMM, REG_FIELD_PREP},
     linux_config::*,
     linux_list::*,
 };
@@ -73,7 +76,7 @@ unsafe fn set_offsets(
         flags = *data >> 6;
         data = data.add(1);
 
-        *regs = mi_load_register_imm(count as u32);
+        *regs = MI_LOAD_REGISTER_IMM(count as u32);
         if flags & POSTED != 0 {
             *regs |= MI_LRI_FORCE_POSTED;
         }
@@ -1238,7 +1241,7 @@ pub(crate) unsafe fn lrc_init_state(
 }
 
 // upstream: intel_lrc.c lrc_indirect_bb()
-unsafe fn lrc_indirect_bb(ce: *const IntelContext) -> u32 {
+pub(crate) unsafe fn lrc_indirect_bb(ce: *const IntelContext) -> u32 {
     i915_ggtt_offset((*ce).state) + context_wa_bb_offset(ce)
 }
 
@@ -1566,7 +1569,7 @@ unsafe fn gen12_emit_indirect_ctx_xcs(ce: *const IntelContext, mut cs: *mut u32)
     cs = gen12_emit_timestamp_wa(ce, cs);
     cs = gen12_emit_restore_scratch(ce, cs);
     // Wa_16013000631:dg2
-    if IS_DG2_G11((*(*ce).engine).i915) && (*(*ce).engine).class == COMPUTE_CLASS {
+    if IS_DG2_G11((*(*ce).engine).i915) && (*(*ce).engine).class == COMPUTE_CLASS as u8 {
         cs = gen8_emit_pipe_control(cs, PIPE_CONTROL_INSTRUCTION_CACHE_INVALIDATE, 0);
     }
     gen12_emit_aux_table_inv((*ce).engine, cs)
@@ -1579,7 +1582,7 @@ unsafe fn xehp_emit_fastcolor_blt_wabb(ce: *const IntelContext, mut cs: *mut u32
     // Wa_16018031267 / Wa_16018063123: emit four zero-byte-write fast-color subblits.
     *cs = XY_FAST_COLOR_BLT_CMD | (16 - 2);
     cs = cs.add(1);
-    *cs = FIELD_PREP(XY_FAST_COLOR_BLT_MOCS_MASK, mocs) | 0x3f;
+    *cs = REG_FIELD_PREP(XY_FAST_COLOR_BLT_MOCS_MASK, mocs) | 0x3f;
     cs = cs.add(1);
     *cs = 0;
     cs = cs.add(1);
@@ -1613,7 +1616,7 @@ unsafe fn xehp_emit_fastcolor_blt_wabb(ce: *const IntelContext, mut cs: *mut u32
 // upstream: intel_lrc.c xehp_emit_per_ctx_bb()
 unsafe fn xehp_emit_per_ctx_bb(ce: *const IntelContext, mut cs: *mut u32) -> *mut u32 {
     // Wa_16018031267, Wa_16018063123.
-    if NEEDS_FASTCOLOR_BLT_WABB((*(*ce).engine)) {
+    if NEEDS_FASTCOLOR_BLT_WABB!((*(*ce).engine)) {
         cs = xehp_emit_fastcolor_blt_wabb(ce, cs);
     }
     cs
@@ -1693,7 +1696,7 @@ pub(crate) unsafe fn lrc_update_regs(
     *regs.add(CTX_RING_CTL) = RING_CTL_SIZE((*ring).size) | RING_VALID;
 
     // RPCS.
-    if (*engine).class == RENDER_CLASS {
+    if (*engine).class == RENDER_CLASS as u8 {
         *regs.add(CTX_R_PWR_CLK_STATE) = intel_sseu_make_rpcs((*engine).gt, &(*ce).sseu);
         i915_oa_init_reg_state(ce, engine);
     }
@@ -1701,7 +1704,7 @@ pub(crate) unsafe fn lrc_update_regs(
     if (*ce).wa_bb_page != 0 {
         let mut emit =
             gen12_emit_indirect_ctx_xcs as unsafe fn(*const IntelContext, *mut u32) -> *mut u32;
-        if (*(*ce).engine).class == RENDER_CLASS {
+        if (*(*ce).engine).class == RENDER_CLASS as u8 {
             emit = gen12_emit_indirect_ctx_rcs;
         }
         // Mutually exclusive with global indirect BB.
@@ -1709,7 +1712,7 @@ pub(crate) unsafe fn lrc_update_regs(
         setup_indirect_ctx_bb(ce, engine, emit);
         setup_per_ctx_bb(ce, engine, xehp_emit_per_ctx_bb);
     }
-    lrc_descriptor(ce) | CTX_DESC_FORCE_RESTORE
+    lrc_descriptor(ce) | CTX_DESC_FORCE_RESTORE as u32
 }
 
 // upstream: intel_lrc.c lrc_update_offsets()
@@ -1764,7 +1767,7 @@ pub(crate) unsafe fn lrc_check_regs(
         *regs.add((x + 1) as usize) |= STOP_RING << 16;
         valid = false;
     }
-    WARN_ONCE!(!valid, "Invalid lrc state found {} submission", when);
+    WARN_ONCE!(!valid, "Invalid lrc state found {:?} submission", when);
 }
 
 // upstream: intel_lrc.c gen8_emit_flush_coherentl3_wa()
@@ -1821,7 +1824,7 @@ unsafe fn gen8_init_indirectctx_bb(engine: *mut IntelEngineCs, mut batch: *mut u
             | PIPE_CONTROL_STORE_DATA_INDEX
             | PIPE_CONTROL_CS_STALL
             | PIPE_CONTROL_QW_WRITE,
-        LRC_PPHWSP_SCRATCH_ADDR,
+        LRC_PPHWSP_SCRATCH_ADDR as i32,
     );
     *batch = MI_ARB_ON_OFF | MI_ARB_ENABLE;
     batch = batch.add(1);
@@ -1891,7 +1894,7 @@ unsafe fn gen9_init_indirectctx_bb(engine: *mut IntelEngineCs, mut batch: *mut u
             | PIPE_CONTROL_STORE_DATA_INDEX
             | PIPE_CONTROL_CS_STALL
             | PIPE_CONTROL_QW_WRITE,
-        LRC_PPHWSP_SCRATCH_ADDR,
+        LRC_PPHWSP_SCRATCH_ADDR as i32,
     );
     batch = emit_lri(batch, LRI_ENTRIES.as_ptr(), LRI_ENTRIES.len() as u32);
 
@@ -1924,11 +1927,11 @@ unsafe fn gen9_init_indirectctx_bb(engine: *mut IntelEngineCs, mut batch: *mut u
 
 // upstream: intel_lrc.c lrc_create_wa_ctx()
 unsafe fn lrc_create_wa_ctx(engine: *mut IntelEngineCs) -> i32 {
-    let obj = i915_gem_object_create_shmem((*engine).i915, CTX_WA_BB_SIZE);
+    let obj = i915_gem_object_create_shmem((*engine).i915, CTX_WA_BB_SIZE as u64);
     if IS_ERR(obj) {
         return PTR_ERR(obj);
     }
-    let vma = i915_vma_instance(obj, &(*(*(*engine).gt).ggtt).vm, core::ptr::null_mut());
+    let vma = i915_vma_instance(obj, &mut (*(*(*engine).gt).ggtt).vm, core::ptr::null());
     if IS_ERR(vma) {
         let err = PTR_ERR(vma);
         i915_gem_object_put(obj);
@@ -1989,7 +1992,7 @@ pub(crate) unsafe fn lrc_init_wa_ctx(engine: *mut IntelEngineCs) {
     'retry: loop {
         err = i915_gem_object_lock((*(*wa_ctx).vma).obj, &mut ww);
         if err == 0 {
-            err = i915_ggtt_pin((*wa_ctx).vma, &mut ww, 0, PIN_HIGH);
+            err = i915_ggtt_pin((*wa_ctx).vma, &mut ww, 0, PIN_HIGH as u32);
         }
         if err == 0 {
             batch = i915_gem_object_pin_map((*(*wa_ctx).vma).obj, I915_MAP_WB);
@@ -2015,7 +2018,7 @@ pub(crate) unsafe fn lrc_init_wa_ctx(engine: *mut IntelEngineCs) {
                 __i915_gem_object_flush_map(
                     (*(*wa_ctx).vma).obj,
                     0,
-                    batch_ptr.offset_from(batch.cast::<u8>()) as usize,
+                    batch_ptr.offset_from(batch.cast::<u8>()) as u64,
                 );
                 __i915_gem_object_release_map((*(*wa_ctx).vma).obj);
             }
@@ -2044,11 +2047,9 @@ pub(crate) unsafe fn lrc_init_wa_ctx(engine: *mut IntelEngineCs) {
 
 // upstream: intel_lrc.c st_runtime_underflow()
 unsafe fn st_runtime_underflow(stats: *mut IntelContextStats, dt: i32) {
-    if IS_ENABLED!(CONFIG_DRM_I915_SELFTEST) {
-        (*stats).runtime.num_underflow += 1;
-        (*stats).runtime.max_underflow =
-            core::cmp::max((*stats).runtime.max_underflow, (-dt) as u32);
-    }
+    // CONFIG_DRM_I915_SELFTEST is disabled in the target layout, so the
+    // corresponding debug-only counters are absent from IntelContextRuntimeStats.
+    let _ = (stats, dt);
 }
 
 // upstream: intel_lrc.c lrc_get_runtime()

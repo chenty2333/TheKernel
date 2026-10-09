@@ -10,6 +10,9 @@
 
 use core::ffi::{c_char, c_ulong};
 
+/// Maximum GT count from i915_drv.h for this driver ABI.
+pub const I915_MAX_GT: usize = 2;
+
 use crate::{
     i915_vma_types_upstream::I915Vma,
     intel_context_types_upstream::IntelWakerefT,

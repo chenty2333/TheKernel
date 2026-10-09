@@ -912,7 +912,7 @@ unsafe fn intel_engine_setup(gt: *mut IntelGt, id: IntelEngineId, logical_instan
         (*engine).context_size = 0;
     }
     if (*engine).context_size != 0 {
-        DRIVER_CAPS!(i915).has_logical_contexts = true;
+        crate::i915_gem_context_upstream::set_has_logical_contexts(i915);
     }
 
     ewma__engine_latency_init(&mut (*engine).latency);
@@ -1857,9 +1857,9 @@ pub unsafe fn intel_engine_get_active_head(engine: *const IntelEngineCs) -> u64 
             intel_engine_regs_upstream::RING_ACTHD_UDW
         );
     } else if GRAPHICS_VER(i915) >= 4 {
-        acthd = ENGINE_READ!(engine, intel_engine_regs_upstream::RING_ACTHD);
+        acthd = ENGINE_READ!(engine, intel_engine_regs_upstream::RING_ACTHD) as u64;
     } else {
-        acthd = ENGINE_READ!(engine, ACTHD);
+        acthd = ENGINE_READ!(engine, ACTHD) as u64;
     }
 
     acthd
@@ -2510,7 +2510,7 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
                 TASKLET_STATE_SCHED,
                 &(*(*engine).sched_engine).tasklet.state
             )),
-            str_enabled_disabled(!atomic_read(&(*(*engine).sched_engine).tasklet.count)),
+            if atomic_read(&(*(*engine).sched_engine).tasklet.count) == 0 { "enabled" } else { "disabled" },
             repr_timer(&execlists.preempt),
             repr_timer(&execlists.timer),
         );
@@ -2792,7 +2792,7 @@ pub unsafe fn intel_engine_dump_active_requests(
     hung_rq: *mut I915Request,
     m: *mut DrmPrinter,
 ) {
-    let mut rq: *mut I915Request;
+    let mut rq: *mut I915Request = core::ptr::null_mut();
     let mut msg: *const c_char;
     let mut state: I915RequestState;
 
@@ -2850,7 +2850,7 @@ pub unsafe fn intel_engine_dump(
     ap: *mut VaList,
 ) {
     let error = &mut (*(*engine).i915).gpu_error;
-    let mut rq: *mut I915Request;
+    let mut rq: *mut I915Request = core::ptr::null_mut();
     let mut wakeref: IntelWakerefT;
     let mut dummy: Ktime;
 

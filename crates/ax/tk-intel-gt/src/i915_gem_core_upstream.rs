@@ -25,6 +25,8 @@ use crate::{
         i915_gem_object_unpin_pages, i915_gem_object_finish_access,
     },
     i915_gem_object_types_upstream::{DrmI915GemObject, intel_bo_to_drm_bo},
+    i915_gem_context_types_upstream::{DrmI915FilePrivate, I915DrmClient},
+    i915_gem_shmem_upstream::{DrmI915GemPread, DrmI915GemPwrite},
     i915_gem_object_upstream::{
         i915_gem_get_pat_index, i915_gem_object_has_struct_page, i915_gem_init__objects,
     },
@@ -44,8 +46,7 @@ use crate::{
         i915_vma_unpin, i915_vma_wait_for_bind,
     },
     i915_vma_types_upstream::I915Vma,
-    intel_context_upstream::{DrmMmNode, I915GttView, XArray},
-    intel_context_types_upstream::RcuHead,
+    intel_context_upstream::{DrmMmNode, I915GttView, RcuHead, XArray},
     intel_engine_cs_upstream::{AtomicT, ListHead, Mutex},
     intel_ggtt_fencing_types_upstream::I915FenceReg,
     intel_gt_api_upstream::{
@@ -53,7 +54,7 @@ use crate::{
     },
     intel_gt_types_upstream::IntelGt,
     intel_gtt_api_upstream::{
-        i915_ggtt_enable_hw, i915_ggtt_offset, i915_ggtt_resume, i915_init_ggtt,
+        i915_ggtt_enable_hw, i915_ggtt_resume, i915_init_ggtt,
         setup_private_pat, i915_vm_put, i915_vm_tryget, I915Ggtt,
     },
     intel_gt_api_upstream::intel_gt_flush_ggtt_writes,
@@ -72,8 +73,14 @@ use crate::{
     linux_locks::{spin_lock, spin_lock_init, spin_lock_irqsave, spin_unlock, spin_unlock_irqrestore},
     linux_memory::{atomic_dec_and_test, atomic_read as linux_atomic_read},
     linux_mutex::{mutex_lock, mutex_trylock, mutex_unlock},
-    linux_pm::{intel_runtime_pm_get, intel_runtime_pm_get_if_in_use, intel_runtime_pm_put},
+    linux_pm::{intel_runtime_pm_get, intel_runtime_pm_put},
+    intel_runtime_pm_upstream::intel_runtime_pm_get_if_in_use,
+    linux::i915::i915_ggtt_offset,
     intel_context_api_upstream::mutex_lock_interruptible,
+    intel_engine_api_upstream::drm_clflush_virt_range,
+    i915_gem_domain_upstream::i915_gem_cpu_write_needs_clflush,
+    linux::highmem::{kmap, kunmap},
+    linux::rbtree::rb_erase,
 };
 
 const I915_GEM_OBJECT_UNBIND_ASYNC: c_ulong = 1 << 4;
@@ -139,10 +146,10 @@ unsafe extern "C" {
         color: u64, start: u64, end: u64, flags: u32,
     ) -> c_int;
     fn drm_mm_remove_node(node: *mut DrmMmNode);
-    fn i915_gem_cpu_write_needs_clflush(obj: *mut DrmI915GemObject) -> bool;
+    fn boot_cpu_data_clflush_size() -> usize;
     fn __i915_gem_object_frontbuffer_flush(obj: *mut DrmI915GemObject, origin: u32);
     fn __i915_gem_object_frontbuffer_invalidate(obj: *mut DrmI915GemObject, origin: u32);
-    fn i915_gem_object_wait(obj: *mut DrmI915GemObject, flags: u32, timeout: c_long) -> c_int;
+    pub(crate) fn i915_gem_object_wait(obj: *mut DrmI915GemObject, flags: u32, timeout: c_long) -> c_int;
     fn __i915_gem_object_release_mmap_gtt(obj: *mut DrmI915GemObject);
     fn i915_gem_object_runtime_pm_release_mmap_offset(obj: *mut DrmI915GemObject);
     fn __copy_to_user(to: *mut c_void, from: *const c_void, n: usize) -> usize;
@@ -153,9 +160,9 @@ unsafe extern "C" {
     fn copy_from_user(to: *mut c_void, from: *const c_void, n: usize) -> usize;
     fn io_mapping_map_atomic_wc(mapping: *mut c_void, offset: c_long) -> *mut c_void;
     fn io_mapping_unmap_atomic(addr: *mut c_void);
-    fn io_mapping_map_wc(mapping: *mut c_void, offset: c_long, size: usize) -> *mut c_void;
-    fn io_mapping_unmap(addr: *mut c_void);
-    fn access_ok(addr: *const c_void, size: u64) -> bool;
+    pub(crate) fn io_mapping_map_wc(mapping: *mut c_void, offset: c_long, size: usize) -> *mut c_void;
+    pub(crate) fn io_mapping_unmap(addr: *mut c_void);
+    pub(crate) fn access_ok(addr: *const c_void, size: u64) -> bool;
     fn trace_i915_gem_object_pread(obj: *mut DrmI915GemObject, offset: u64, size: u64);
     fn trace_i915_gem_object_pwrite(obj: *mut DrmI915GemObject, offset: u64, size: u64);
     fn i915_gem_suspend_late(i915: *mut DrmI915Private);
@@ -209,7 +216,7 @@ struct DrmI915FilePrivateView {
 #[repr(C)]
 union I915FileOrRcuView {
     file: *mut c_void,
-    rcu: RcuHead,
+    rcu: core::mem::ManuallyDrop<RcuHead>,
 }
 const _: [(); 96] = [(); core::mem::offset_of!(DrmI915FilePrivateView, bsd_engine)];
 const _: [(); 112] = [(); core::mem::offset_of!(DrmI915FilePrivateView, client)];
@@ -244,7 +251,7 @@ unsafe fn private_tail(i915: *mut DrmI915Private) -> *mut DrmI915PrivateTailView
 }
 
 #[inline]
-fn u64_to_user_ptr(value: u64) -> *mut c_void {
+pub(crate) fn u64_to_user_ptr(value: u64) -> *mut c_void {
     value as usize as *mut c_void
 }
 
@@ -367,7 +374,7 @@ pub unsafe fn i915_gem_object_unbind(obj: *mut DrmI915GemObject, flags: c_ulong)
                     break;
                 }
                 ret = -EAGAIN;
-                if !i915_vm_tryget((*vma).vm) {
+                if i915_vm_tryget((*vma).vm).is_null() {
                     break;
                 }
                 spin_unlock(&mut (*obj).vma.lock);
@@ -406,7 +413,7 @@ pub unsafe fn i915_gem_object_unbind(obj: *mut DrmI915GemObject, flags: c_ulong)
 
 // upstream: i915_gem.c shmem_pread()
 unsafe fn shmem_pread(
-    page: *mut c_void,
+    page: *mut crate::i915_gem_object_types_upstream::Page,
     offset: c_int,
     len: c_int,
     user: *mut c_char,
@@ -414,7 +421,7 @@ unsafe fn shmem_pread(
 ) -> c_int {
     let vaddr = kmap(page);
     if needs_clflush {
-        drm_clflush_virt_range(vaddr.add(offset as usize), len as usize);
+        drm_clflush_virt_range(vaddr.add(offset as usize), len as u64);
     }
     let ret = __copy_to_user(user.cast(), vaddr.add(offset as usize), len as usize);
     kunmap(page);
@@ -507,7 +514,8 @@ unsafe fn i915_gem_gtt_prepare(
     let mut ret: c_int;
     i915_gem_ww_ctx_init(ww.as_mut_ptr(), true);
     'retry: loop {
-        vma = ERR_PTR(-ENODEV).cast();
+      loop {
+        vma = ERR_PTR::<I915Vma>(-ENODEV);
         ret = i915_gem_object_lock(obj, ww.as_mut_ptr());
         if ret == 0 {
             ret = i915_gem_object_set_to_gtt_domain(obj, write);
@@ -525,12 +533,12 @@ unsafe fn i915_gem_gtt_prepare(
                 PIN_MAPPABLE | PIN_NONBLOCK | PIN_NOEVICT,
             );
         }
-        if vma == ERR_PTR(-EDEADLK).cast() {
+    if vma == ERR_PTR::<I915Vma>(-EDEADLK) {
             ret = -EDEADLK;
             break;
         }
         if !IS_ERR(vma) {
-            (*node).start = i915_ggtt_offset(vma);
+            (*node).start = i915_ggtt_offset(vma) as u64;
             (*node).flags = 0;
         } else {
             ret = insert_mappable_node(ggtt, node, PAGE_SIZE as u32);
@@ -550,15 +558,17 @@ unsafe fn i915_gem_gtt_prepare(
             }
         }
         break;
-    }
-    if ret == -EDEADLK {
-        ret = i915_gem_ww_ctx_backoff(ww.as_mut_ptr());
-        if ret == 0 {
-            continue 'retry;
+      }
+      if ret == -EDEADLK {
+          ret = i915_gem_ww_ctx_backoff(ww.as_mut_ptr());
+          if ret == 0 {
+              continue 'retry;
+          }
         }
+      break;
     }
     i915_gem_ww_ctx_fini(ww.as_mut_ptr());
-    if ret != 0 { ERR_PTR(ret).cast() } else { vma }
+    if ret != 0 { ERR_PTR::<I915Vma>(ret) } else { vma }
 }
 
 // upstream: i915_gem.c i915_gem_gtt_cleanup()
@@ -618,7 +628,7 @@ unsafe fn i915_gem_gtt_pread(obj: *mut DrmI915GemObject, args: *const GemPreadAr
                 map_base = map_base.wrapping_add((offset & !(PAGE_SIZE as c_ulong - 1)) as u32);
             }
             if gtt_user_read(
-                (&mut (*ggtt).iomap).cast(),
+                core::ptr::addr_of_mut!((*ggtt).iomap).cast(),
                 map_base as c_long,
                 page_offset as c_int,
                 user_data,
@@ -645,7 +655,7 @@ pub unsafe fn i915_gem_pread_ioctl(
 ) -> c_int {
     let i915 = to_i915(dev);
     let args = data.cast::<GemPreadArgs>();
-    if GRAPHICS_VER(i915) >= GRAPHICS_VER_MIN_TGL && !IS_PLATFORM(i915, INTEL_TIGERLAKE) {
+    if GRAPHICS_VER(i915) >= GRAPHICS_VER_MIN_TGL as u8 && !IS_PLATFORM(i915, INTEL_TIGERLAKE) {
         return -EOPNOTSUPP;
     }
     if (*args).size == 0 {
@@ -654,7 +664,7 @@ pub unsafe fn i915_gem_pread_ioctl(
     if !access_ok(u64_to_user_ptr((*args).data_ptr), (*args).size) {
         return -EFAULT;
     }
-    let obj = i915_gem_object_lookup(file, (*args).handle);
+    let obj = i915_gem_object_lookup(file.cast(), (*args).handle);
     if obj.is_null() {
         return -ENOENT;
     }
@@ -715,7 +725,7 @@ unsafe fn i915_gem_gtt_pwrite_fast(
 ) -> c_int {
     let i915 = to_i915((*gem_base(obj)).dev);
     let ggtt = (*to_gt(i915)).ggtt.cast::<I915Ggtt>();
-    let rpm = &mut (*i915).runtime_pm as *mut _;
+    let rpm = core::ptr::addr_of_mut!((*i915).runtime_pm).cast();
     let mut remain: c_ulong = 0;
     let mut offset: c_ulong = 0;
     let wakeref;
@@ -728,7 +738,7 @@ unsafe fn i915_gem_gtt_pwrite_fast(
     }
     if i915_gem_object_has_struct_page(obj) {
         wakeref = intel_runtime_pm_get_if_in_use(rpm);
-        if wakeref.is_none() {
+        if wakeref.is_null() {
             return -EFAULT;
         }
     } else {
@@ -738,7 +748,7 @@ unsafe fn i915_gem_gtt_pwrite_fast(
     if IS_ERR(vma) {
         ret = PTR_ERR(vma);
     } else {
-        i915_gem_object_frontbuffer_invalidate(obj, ORIGIN_CPU);
+        __i915_gem_object_frontbuffer_invalidate(obj, ORIGIN_CPU);
         user_data = u64_to_user_ptr((*args).data_ptr).cast();
         offset = (*args).offset as c_ulong;
         remain = (*args).size as c_ulong;
@@ -760,7 +770,7 @@ unsafe fn i915_gem_gtt_pwrite_fast(
                 page_base = page_base.wrapping_add((offset & !(PAGE_SIZE as c_ulong - 1)) as u32);
             }
             if ggtt_write(
-                (&mut (*ggtt).iomap).cast(),
+            core::ptr::addr_of_mut!((*ggtt).iomap).cast(),
                 page_base as c_long,
                 page_offset as c_int,
                 user_data,
@@ -774,7 +784,7 @@ unsafe fn i915_gem_gtt_pwrite_fast(
             offset += page_length as c_ulong;
         }
         intel_gt_flush_ggtt_writes((*ggtt).vm.gt);
-        i915_gem_object_frontbuffer_flush(obj, ORIGIN_CPU);
+        __i915_gem_object_frontbuffer_flush(obj, ORIGIN_CPU);
         i915_gem_gtt_cleanup(obj, node.as_mut_ptr(), vma);
     }
     intel_runtime_pm_put(rpm, wakeref);
@@ -783,7 +793,7 @@ unsafe fn i915_gem_gtt_pwrite_fast(
 
 // upstream: i915_gem.c shmem_pwrite()
 unsafe fn shmem_pwrite(
-    page: *mut c_void,
+    page: *mut crate::i915_gem_object_types_upstream::Page,
     offset: c_int,
     len: c_int,
     user: *mut c_char,
@@ -792,11 +802,11 @@ unsafe fn shmem_pwrite(
 ) -> c_int {
     let vaddr = kmap(page);
     if before {
-        drm_clflush_virt_range(vaddr.add(offset as usize), len as usize);
+        drm_clflush_virt_range(vaddr.add(offset as usize), len as u64);
     }
     let ret = __copy_from_user(vaddr.add(offset as usize), user.cast(), len as usize);
     if ret == 0 && after {
-        drm_clflush_virt_range(vaddr.add(offset as usize), len as usize);
+        drm_clflush_virt_range(vaddr.add(offset as usize), len as u64);
     }
     kunmap(page);
     if ret != 0 { -EFAULT } else { 0 }
@@ -849,7 +859,7 @@ unsafe fn i915_gem_shmem_pwrite(obj: *mut DrmI915GemObject, args: *const GemPwri
         offset = 0;
         idx += 1;
     }
-    i915_gem_object_frontbuffer_flush(obj, ORIGIN_CPU);
+    __i915_gem_object_frontbuffer_flush(obj, ORIGIN_CPU);
     i915_gem_object_unpin_pages(obj);
     ret
 }
@@ -862,7 +872,7 @@ pub unsafe fn i915_gem_pwrite_ioctl(
 ) -> c_int {
     let i915 = to_i915(dev);
     let args = data.cast::<GemPwriteArgs>();
-    if GRAPHICS_VER(i915) >= GRAPHICS_VER_MIN_TGL && !IS_PLATFORM(i915, INTEL_TIGERLAKE) {
+    if GRAPHICS_VER(i915) >= GRAPHICS_VER_MIN_TGL as u8 && !IS_PLATFORM(i915, INTEL_TIGERLAKE) {
         return -EOPNOTSUPP;
     }
     if (*args).size == 0 {
@@ -871,7 +881,7 @@ pub unsafe fn i915_gem_pwrite_ioctl(
     if !access_ok(u64_to_user_ptr((*args).data_ptr), (*args).size) {
         return -EFAULT;
     }
-    let obj = i915_gem_object_lookup(file, (*args).handle);
+    let obj = i915_gem_object_lookup(file.cast(), (*args).handle);
     if obj.is_null() {
         return -ENOENT;
     }
@@ -897,7 +907,7 @@ pub unsafe fn i915_gem_pwrite_ioctl(
         );
         if ret == 0 {
             ret = -EFAULT;
-            if !i915_gem_object_has_struct_page(obj) || i915_gem_object_cpu_write_needs_clflush(obj)
+            if !i915_gem_object_has_struct_page(obj) || i915_gem_cpu_write_needs_clflush(obj)
             {
                 ret = i915_gem_gtt_pwrite_fast(obj, args);
             }
@@ -919,7 +929,7 @@ pub unsafe fn i915_gem_sw_finish_ioctl(
     file: *mut c_void,
 ) -> c_int {
     let args = data.cast::<GemSwFinishArgs>();
-    let obj = i915_gem_object_lookup(file, (*args).handle);
+    let obj = i915_gem_object_lookup(file.cast(), (*args).handle);
     if obj.is_null() {
         return -ENOENT;
     }
@@ -983,10 +993,10 @@ pub unsafe fn i915_gem_object_ggtt_pin_ww(
     GEM_WARN_ON!(ww.is_null());
     if flags & PIN_MAPPABLE != 0 && (view.is_null() || (*view).r#type == 0) {
         if (*gem_base(obj)).size > (*ggtt).mappable_end {
-            return ERR_PTR(-E2BIG).cast();
+            return ERR_PTR::<I915Vma>(-E2BIG);
         }
         if flags & PIN_NONBLOCK != 0 && (*gem_base(obj)).size > (*ggtt).mappable_end / 2 {
-            return ERR_PTR(-ENOSPC).cast();
+            return ERR_PTR::<I915Vma>(-ENOSPC);
         }
     }
     'new_vma: loop {
@@ -997,13 +1007,13 @@ pub unsafe fn i915_gem_object_ggtt_pin_ww(
         if i915_vma_misplaced(vma, size, alignment, flags) {
             if flags & PIN_NONBLOCK != 0 {
                 if i915_vma_is_pinned(vma) || i915_vma_is_active(vma) {
-                    return ERR_PTR(-ENOSPC).cast();
+                    return ERR_PTR::<I915Vma>(-ENOSPC);
                 }
                 if flags & PIN_MAPPABLE != 0
-                    && ((*vma).fence_size > (*ggtt).mappable_end / 2
+                    && (((*vma).fence_size as u64) > (*ggtt).mappable_end / 2
                         || !i915_vma_is_map_and_fenceable(vma))
                 {
-                    return ERR_PTR(-ENOSPC).cast();
+                    return ERR_PTR::<I915Vma>(-ENOSPC);
                 }
             }
             if i915_vma_is_pinned(vma) || i915_vma_is_active(vma) {
@@ -1012,12 +1022,12 @@ pub unsafe fn i915_gem_object_ggtt_pin_ww(
             }
             let ret = i915_vma_unbind(vma);
             if ret != 0 {
-                return ERR_PTR(ret).cast();
+                return ERR_PTR::<I915Vma>(ret);
             }
         }
         let ret = i915_vma_pin_ww(vma, ww, size, alignment, flags | PIN_GLOBAL);
         if ret != 0 {
-            return ERR_PTR(ret).cast();
+            return ERR_PTR::<I915Vma>(ret);
         }
         if !(*vma).fence.is_null() && !i915_gem_object_is_tiled(obj) {
             mutex_lock(&mut (*ggtt).vm.mutex);
@@ -1027,7 +1037,7 @@ pub unsafe fn i915_gem_object_ggtt_pin_ww(
         let ret = i915_vma_wait_for_bind(vma);
         if ret != 0 {
             i915_vma_unpin(vma);
-            return ERR_PTR(ret).cast();
+            return ERR_PTR::<I915Vma>(ret);
         }
         return vma;
     }
@@ -1062,7 +1072,7 @@ pub unsafe fn i915_gem_object_ggtt_pin(
         break;
     }
     i915_gem_ww_ctx_fini(ww.as_mut_ptr());
-    if ret != 0 { ERR_PTR(ret).cast() } else { vma }
+    if ret != 0 { ERR_PTR::<I915Vma>(ret) } else { vma }
 }
 
 // upstream: i915_gem.c i915_gem_madvise_ioctl()
@@ -1077,7 +1087,7 @@ pub unsafe fn i915_gem_madvise_ioctl(
         I915_MADV_DONTNEED | I915_MADV_WILLNEED => {}
         _ => return -EINVAL,
     }
-    let obj = i915_gem_object_lookup(file, (*args).handle);
+    let obj = i915_gem_object_lookup(file.cast(), (*args).handle);
     if obj.is_null() {
         return -ENOENT;
     }
@@ -1245,7 +1255,7 @@ pub unsafe fn i915_gem_driver_release(dev_priv: *mut DrmI915Private) {
     i915_gem_drain_workqueue(dev_priv);
     drm_WARN_ON!(
         core::ptr::addr_of_mut!((*dev_priv).drm),
-        !list_empty(&(*dev_priv).gem.contexts.list)
+        !list_empty(&(*private_tail(dev_priv)).contexts.list)
     );
 }
 
@@ -1284,10 +1294,10 @@ pub unsafe fn i915_gem_open(i915: *mut DrmI915Private, file: *mut c_void) -> c_i
     }
     let client = i915_drm_client_alloc();
     if client.is_null() {
-        kfree(file_priv.cast());
-        return ret;
+        kfree(file_priv.cast::<c_void>());
+        return -ENOMEM;
     }
-    (*file.cast::<DrmFile>()).driver_priv = file_priv.cast::<DrmI915FilePrivate>();
+    (*file.cast::<DrmFile>()).driver_priv = file_priv.cast::<c_void>();
     (*file_priv).i915 = i915;
     (*file_priv).file_or_rcu.file = file;
     (*file_priv).client = client;
@@ -1296,7 +1306,7 @@ pub unsafe fn i915_gem_open(i915: *mut DrmI915Private, file: *mut c_void) -> c_i
     let ret = i915_gem_context_open(i915, file);
     if ret != 0 {
         i915_drm_client_put(client);
-        kfree(file_priv.cast());
+        kfree(file_priv.cast::<c_void>());
         return ret;
     }
     0

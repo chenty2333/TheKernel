@@ -11,6 +11,16 @@ use core::{
     sync::atomic::{Ordering, fence},
 };
 
+#[inline]
+pub fn min_t<T: Ord>(a: T, b: T) -> T {
+    core::cmp::min(a, b)
+}
+
+#[inline]
+pub fn max_t<T: Ord>(a: T, b: T) -> T {
+    core::cmp::max(a, b)
+}
+
 /// Linux `hweight32()`: population count of the low 32 bits.
 #[inline]
 pub const fn hweight32(value: u32) -> u32 {

@@ -10,7 +10,7 @@ use core::{
 };
 
 use crate::{
-    i915_request_types_upstream::DrmI915GemObject,
+    i915_gem_object_types_upstream::DrmI915GemObject,
     i915_vma_resource_types_upstream::I915VmaResource, intel_context_upstream::I915Vma,
     intel_gt_types_upstream::IntelGt, linux_i915_private::DrmI915Private, linux_print::DrmPrinter,
 };

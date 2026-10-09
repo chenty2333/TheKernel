@@ -242,7 +242,7 @@ unsafe fn lock_sched_engine(
 }
 
 // upstream: i915_scheduler.c __i915_schedule()
-unsafe fn __i915_schedule(node: *mut I915SchedNode, attr: *const I915SchedAttr) {
+unsafe fn __i915_schedule(mut node: *mut I915SchedNode, attr: *const I915SchedAttr) {
     let prio = unsafe { (*attr).priority.max((*node).attr.priority) };
     let mut sched_engine: *mut I915SchedEngine;
     let mut cache = SchedCache {

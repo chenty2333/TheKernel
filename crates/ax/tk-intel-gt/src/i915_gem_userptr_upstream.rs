@@ -78,10 +78,10 @@ unsafe extern "C" {
         mark_dirty: bool,
     );
     fn i915_gem_object_gtt_prepare_pages(obj: *mut DrmI915GemObject, pages: *mut SgTable) -> i32;
-    fn i915_gem_gtt_finish_pages(obj: *mut DrmI915GemObject, pages: *mut SgTable);
+    pub(crate) fn i915_gem_gtt_finish_pages(obj: *mut DrmI915GemObject, pages: *mut SgTable);
     fn i915_gem_object_can_bypass_llc(obj: *mut DrmI915GemObject) -> bool;
     fn ____i915_gem_object_get_pages(obj: *mut DrmI915GemObject) -> i32;
-    fn drm_gem_private_object_init(dev: *mut c_void, obj: *mut DrmGemObject, size: usize);
+    pub(crate) fn drm_gem_private_object_init(dev: *mut c_void, obj: *mut DrmGemObject, size: usize);
     fn drm_gem_handle_create(file: *mut DrmFile, obj: *mut DrmGemObject, handle: *mut u32) -> i32;
     fn drm_gem_object_free(refcount: *mut Kref);
     fn sg_alloc_table_from_pages_segment(
@@ -93,7 +93,7 @@ unsafe extern "C" {
         max_segment: u32,
         gfp_mask: u32,
     ) -> i32;
-    fn sg_free_table(sgt: *mut SgTable);
+    pub(crate) fn sg_free_table(sgt: *mut SgTable);
     fn pin_user_pages_fast(
         start: c_ulong,
         nr_pages: i32,

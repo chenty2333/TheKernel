@@ -165,7 +165,7 @@ fn is_err_or_null(ptr: *const c_void) -> bool {
 unsafe extern "C" {
     fn i915_gem_object_release_mmap_offset(obj: *mut DrmI915GemObject);
     fn intel_gt_invalidate_tlb_full(gt: *mut IntelGt, seqno: u32);
-    fn drm_clflush_sg(pages: *mut SgTable);
+    pub(crate) fn drm_clflush_sg(pages: *mut SgTable);
     fn radix_tree_next_chunk(
         root: *const crate::intel_context_upstream::RadixTreeRoot,
         iter: *mut RadixTreeIter,
@@ -332,7 +332,7 @@ unsafe fn radix_tree_next_slot(
 }
 
 #[inline]
-unsafe fn sg_page(sg: *mut Scatterlist) -> *mut Page {
+pub(crate) unsafe fn sg_page(sg: *mut Scatterlist) -> *mut Page {
     unsafe { ((*sg).page_link & !SG_PAGE_LINK_MASK) as *mut Page }
 }
 #[inline]
@@ -356,7 +356,7 @@ unsafe fn sg_chain_ptr(sg: *mut Scatterlist) -> *mut Scatterlist {
     unsafe { ((*sg).page_link & !SG_PAGE_LINK_MASK) as *mut Scatterlist }
 }
 #[inline]
-unsafe fn sg_next(sg: *mut Scatterlist) -> *mut Scatterlist {
+pub(crate) unsafe fn sg_next(sg: *mut Scatterlist) -> *mut Scatterlist {
     unsafe {
         if sg.is_null() || (*sg).page_link & SG_END != 0 {
             return ptr::null_mut();

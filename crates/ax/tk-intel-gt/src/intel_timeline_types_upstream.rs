@@ -11,7 +11,8 @@ use core::{
 };
 
 use crate::{
-    intel_context_upstream::{I915Active, I915ActiveFence, I915Vma, Kref, RcuHead},
+    intel_context_types_upstream::I915Active,
+    intel_context_upstream::{I915ActiveFence, I915Vma, Kref, RcuHead},
     intel_engine_cs_upstream::{AtomicT, IntelGt, ListHead, Mutex},
 };
 

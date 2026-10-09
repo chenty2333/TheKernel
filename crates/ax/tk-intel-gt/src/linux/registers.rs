@@ -27,6 +27,56 @@ pub const MI_SEMAPHORE_WAIT: u32 = (0x1c << 23) | 2;
 pub const MI_SEMAPHORE_POLL: u32 = 1 << 15;
 pub const MI_SEMAPHORE_GLOBAL_GTT: u32 = 1 << 22;
 
+// Linux 7.2.3 gt/intel_gpu_commands.h command encodings used by the Gen8
+// emitter. Keep these in the command-register owner rather than duplicating
+// ad-hoc values in the emitter.
+const fn mi_instr(opcode: u32, length: u32) -> u32 {
+    (opcode << 23) | length
+}
+#[allow(non_snake_case)]
+pub const fn GFX_OP_PIPE_CONTROL(len: u32) -> u32 {
+    (0x3 << 29) | (0x3 << 27) | (0x2 << 24) | (len - 2)
+}
+pub const MI_ARB_CHECK: u32 = mi_instr(0x05, 0);
+pub const MI_SEMAPHORE_WAIT_TOKEN: u32 = mi_instr(0x1c, 3);
+pub const MI_SEMAPHORE_REGISTER_POLL: u32 = 1 << 16;
+pub const MI_SEMAPHORE_SAD_EQ_SDD: u32 = 4 << 12;
+pub const MI_LRI_MMIO_REMAP_EN: u32 = 1 << 17;
+pub const MI_ATOMIC_GLOBAL_GTT: u32 = 1 << 22;
+pub const MI_ATOMIC_CS_STALL: u32 = 1 << 17;
+pub const MI_ATOMIC_MOVE: u32 = 4 << 8;
+pub const MI_ATOMIC_INLINE: u32 = mi_instr(0x2f, 9) | (1 << 18);
+
+pub const PIPE_CONTROL_COMMAND_CACHE_INVALIDATE: u32 = 1 << 29;
+pub const PIPE_CONTROL_TILE_CACHE_FLUSH: u32 = 1 << 28;
+pub const PIPE_CONTROL_AMFS_FLUSH: u32 = 1 << 25;
+pub const PIPE_CONTROL_GLOBAL_GTT_IVB: u32 = 1 << 24;
+pub const PIPE_CONTROL_GLOBAL_SNAPSHOT_RESET: u32 = 1 << 19;
+pub const PIPE_CONTROL_TLB_INVALIDATE: u32 = 1 << 18;
+pub const PIPE_CONTROL_PSD_SYNC: u32 = 1 << 17;
+pub const PIPE_CONTROL_MEDIA_STATE_CLEAR: u32 = 1 << 16;
+pub const PIPE_CONTROL_DEPTH_STALL: u32 = 1 << 13;
+pub const PIPE_CONTROL_CCS_FLUSH: u32 = 1 << 13;
+pub const PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH: u32 = 1 << 12;
+pub const PIPE_CONTROL_TEXTURE_CACHE_INVALIDATE: u32 = 1 << 10;
+pub const PIPE_CONTROL_INDIRECT_STATE_DISABLE: u32 = 1 << 9;
+pub const PIPE_CONTROL0_HDC_PIPELINE_FLUSH: u32 = 1 << 9;
+pub const PIPE_CONTROL_NOTIFY: u32 = 1 << 8;
+pub const PIPE_CONTROL_FLUSH_ENABLE: u32 = 1 << 7;
+pub const PIPE_CONTROL_VF_CACHE_INVALIDATE: u32 = 1 << 4;
+pub const PIPE_CONTROL_CONST_CACHE_INVALIDATE: u32 = 1 << 3;
+pub const PIPE_CONTROL_STATE_CACHE_INVALIDATE: u32 = 1 << 2;
+pub const PIPE_CONTROL_STALL_AT_SCOREBOARD: u32 = 1 << 1;
+pub const PIPE_CONTROL_DEPTH_CACHE_FLUSH: u32 = 1;
+pub const PIPE_CONTROL_3D_ENGINE_FLAGS: u32 = PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH
+    | PIPE_CONTROL_DEPTH_CACHE_FLUSH | PIPE_CONTROL_TILE_CACHE_FLUSH
+    | PIPE_CONTROL_DEPTH_STALL | PIPE_CONTROL_STALL_AT_SCOREBOARD
+    | PIPE_CONTROL_PSD_SYNC | PIPE_CONTROL_AMFS_FLUSH
+    | PIPE_CONTROL_VF_CACHE_INVALIDATE | PIPE_CONTROL_GLOBAL_SNAPSHOT_RESET;
+pub const PIPE_CONTROL_3D_ARCH_FLAGS: u32 = PIPE_CONTROL_3D_ENGINE_FLAGS
+    | PIPE_CONTROL_INDIRECT_STATE_DISABLE | PIPE_CONTROL_FLUSH_ENABLE
+    | PIPE_CONTROL_TEXTURE_CACHE_INVALIDATE | PIPE_CONTROL_DC_FLUSH_ENABLE;
+
 pub const STOP_RING: u32 = 1 << 8;
 pub const MODE_IDLE: u32 = 1 << 9;
 pub const RING_FORCE_TO_NONPRIV_ACCESS_RD: u32 = 1 << 28;
@@ -220,6 +270,20 @@ const fn mcr(offset: u32) -> I915McrReg {
     I915McrReg { reg: offset }
 }
 
+pub const INVALID_MMIO_REG: I915Reg = mmio(0);
+pub const GEN12_CCS_AUX_INV: I915Reg = mmio(0x4208);
+pub const GEN12_VD0_AUX_INV: I915Reg = mmio(0x4218);
+pub const GEN12_VE0_AUX_INV: I915Reg = mmio(0x4238);
+pub const GEN12_BCS0_AUX_INV: I915Reg = mmio(0x4248);
+pub const GEN12_VD2_AUX_INV: I915Reg = mmio(0x4298);
+pub const GEN12_CCS0_AUX_INV: I915Reg = mmio(0x42c8);
+pub const AUX_INV: u32 = 1;
+
+#[inline]
+pub fn i915_mmio_reg_valid(reg: I915Reg) -> bool {
+    reg.reg != INVALID_MMIO_REG.reg
+}
+
 #[allow(non_snake_case)]
 pub const fn RING_TAIL(base: u32) -> I915Reg {
     mmio(base + 0x30)
@@ -410,8 +474,6 @@ pub const MI_BATCH_BUFFER_START_GEN8: u32 = (0x31 << 23) | 1;
 pub const MI_LRI_FORCE_POSTED: u32 = 1 << 12;
 pub const MI_LRR_SOURCE_CS_MMIO: u32 = 1 << 18;
 pub const MI_USE_GGTT: u32 = 1 << 22;
-pub const MI_SEMAPHORE_SAD_EQ_SDD: u32 = 4 << 12;
-pub const MI_SEMAPHORE_REGISTER_POLL: u32 = 1 << 16;
 pub const MI_SEMAPHORE_SAD_GT_SDD: u32 = 0 << 12;
 pub const MI_SEMAPHORE_SAD_GTE_SDD: u32 = 1 << 12;
 pub const MI_SEMAPHORE_SAD_LT_SDD: u32 = 2 << 12;

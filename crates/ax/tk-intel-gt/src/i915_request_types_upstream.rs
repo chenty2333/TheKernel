@@ -17,8 +17,9 @@ use crate::{
     i915_gem_object_types_upstream::DrmI915GemObject,
     i915_scheduler_types_upstream::{I915Dependency, I915SchedNode},
     intel_context_types_upstream::{I915SwFence, IntelContext},
+    intel_timeline_types_upstream::IntelTimeline,
     intel_context_upstream::{
-        DmaFence, DmaFenceCb, Hrtimer, I915Vma, I915VmaResource, IntelTimeline, IrqWork, PinCookie,
+        DmaFence, DmaFenceCb, Hrtimer, I915Vma, I915VmaResource, IrqWork, PinCookie,
         WaitQueueEntry,
     },
     intel_engine_cs_upstream::{
@@ -182,6 +183,15 @@ pub unsafe fn i915_request_timeline(request: *const I915Request) -> *mut IntelTi
     // With CONFIG_LOCKDEP=n, rcu_dereference_protected() retains only the
     // source's dependency-ordered single-copy pointer load.
     unsafe { rcu_dereference!((*request).timeline) }
+}
+
+/// Protected active-submission view used by `i915_request_active_timeline()`.
+/// The caller holds the request's scheduler-engine lock, matching the
+/// `rcu_dereference_protected()` precondition in Linux 7.2.3.
+#[inline]
+pub unsafe fn i915_request_active_timeline(request: *const I915Request) -> *mut IntelTimeline {
+    assert!(!request.is_null());
+    unsafe { (*request).timeline }
 }
 
 // Out-of-line declarations from i915_request.h. Implementations are owned by

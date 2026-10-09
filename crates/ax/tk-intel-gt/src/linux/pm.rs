@@ -149,7 +149,7 @@ pub unsafe fn intel_wakeref_get(wf: *mut IntelWakeref) -> i32 {
     }
 
     let rpm = unsafe { wakeref_runtime_pm(wf) };
-    let mut runtime_ref: *mut c_void = intel_runtime_pm_get(rpm).cast();
+    let mut runtime_ref = intel_runtime_pm_get(rpm).cast::<crate::intel_context_types_upstream::IntelRefTracker>();
     assert!(
         !runtime_ref.is_null(),
         "runtime PM backend returned no wakeref"
@@ -401,10 +401,10 @@ pub(crate) fn runtime_wakeref_is_acquired(value: IntelWakerefHandle) -> bool {
 macro_rules! with_intel_runtime_pm {
     ($rpm:expr, $wakeref:ident, $body:block) => {{
         let __rpm = $rpm;
-        let mut $wakeref = $crate::linux_pm::intel_runtime_pm_get(__rpm);
+        let mut $wakeref = $crate::linux_pm::intel_runtime_pm_get(unsafe { &*__rpm });
         if $crate::linux_pm::runtime_wakeref_is_acquired($wakeref) {
             $body
-            $crate::linux_pm::intel_runtime_pm_put(__rpm, $wakeref);
+            $crate::linux_pm::intel_runtime_pm_put(unsafe { &*__rpm }, $wakeref);
             $wakeref = core::ptr::null_mut();
         }
     }};

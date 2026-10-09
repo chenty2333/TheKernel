@@ -870,6 +870,22 @@ macro_rules! pr_err {
     }};
 }
 
+macro_rules! pr_info {
+    ($format:expr $(, $argument:expr)* $(,)?) => {{
+        let __args: &[&dyn $crate::linux_print::CFormatArg] = &[
+            $(&($argument) as &dyn $crate::linux_print::CFormatArg),*
+        ];
+        let __message = $crate::linux_print::format_message($format, __args);
+        $crate::linux_print::drm_log_at(
+            $crate::linux_print::DrmLogLevel::Info,
+            "kernel info",
+            file!(),
+            line!(),
+            &__message,
+        );
+    }};
+}
+
 macro_rules! GEM_TRACE_ERR {
     ($format:expr $(, $argument:expr)* $(,)?) => {{
         let __args: &[&dyn $crate::linux_print::CFormatArg] = &[

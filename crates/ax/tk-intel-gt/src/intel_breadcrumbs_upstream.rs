@@ -11,10 +11,22 @@ use core::ffi::c_ulong;
 
 use crate::{
     i915_request_types_upstream::*, intel_breadcrumbs_types_upstream::IntelBreadcrumbs,
+    intel_execlists_submission_upstream::intel_timeline_is_last,
     intel_context_types_upstream::*, intel_context_upstream::*, intel_engine_cs_upstream::*,
     intel_engine_types_upstream::IntelEngineCs, intel_gt_types_upstream::IntelGt,
     intel_timeline_types_upstream::IntelTimeline, linux_config::*, linux_list::*,
 };
+
+// Prefer the i915 request-private fence bits over LinuxKPI compatibility
+// aliases, which share the historical names but use the generic fence layout.
+use crate::i915_request_types_upstream::{
+    I915_FENCE_FLAG_ACTIVE, I915_FENCE_FLAG_SIGNAL,
+};
+
+unsafe extern "C" {
+    fn intel_engine_add_retire(engine: *mut IntelEngineCs, timeline: *mut IntelTimeline);
+    fn trace_dma_fence_signaled(fence: *mut DmaFence);
+}
 
 // Header-owned breadcrumb, engine, context, request and timeline records are
 // imported above. Remaining Linux GEM/RCU/locking/PM services, allocation,
@@ -35,7 +47,7 @@ unsafe fn __intel_breadcrumbs_arm_irq(b: *mut IntelBreadcrumbs) {
     // Since we are waiting on a request, the GPU should be busy
     // and should have its own rpm reference.
     let wakeref = intel_gt_pm_get_if_awake((*(*b).irq_engine).gt);
-    if GEM_WARN_ON!(wakeref.is_none()) {
+    if GEM_WARN_ON!(wakeref.is_null()) {
         return;
     }
 
@@ -60,7 +72,7 @@ unsafe fn intel_breadcrumbs_arm_irq(b: *mut IntelBreadcrumbs) {
     }
 
     spin_lock(&mut (*b).irq_lock);
-    if (*b).irq_armed.is_none() {
+    if (*b).irq_armed.is_null() {
         __intel_breadcrumbs_arm_irq(b);
     }
     spin_unlock(&mut (*b).irq_lock);
@@ -83,7 +95,7 @@ unsafe fn __intel_breadcrumbs_disarm_irq(b: *mut IntelBreadcrumbs) {
 // upstream: intel_breadcrumbs.c intel_breadcrumbs_disarm_irq()
 unsafe fn intel_breadcrumbs_disarm_irq(b: *mut IntelBreadcrumbs) {
     spin_lock(&mut (*b).irq_lock);
-    if (*b).irq_armed.is_some() {
+    if !(*b).irq_armed.is_null() {
         __intel_breadcrumbs_disarm_irq(b);
     }
     spin_unlock(&mut (*b).irq_lock);
@@ -215,7 +227,7 @@ unsafe extern "C" fn signal_irq_work(work: *mut IrqWork) {
     // Fewer interrupts should conserve power -- at the very least, fewer
     // interrupt draw less ire from other users of the system and tools
     // like powertop.
-    if signal.is_null() && READ_ONCE!((*b).irq_armed).is_some() && list_empty(&(*b).signalers) {
+    if signal.is_null() && !READ_ONCE!((*b).irq_armed).is_null() && list_empty(&(*b).signalers) {
         intel_breadcrumbs_disarm_irq(b);
     }
 
@@ -284,12 +296,12 @@ unsafe extern "C" fn signal_irq_work(work: *mut IrqWork) {
     });
 
     // Lazy irq enabling after HW submission
-    if READ_ONCE!((*b).irq_armed).is_none() && !list_empty(&(*b).signalers) {
+    if READ_ONCE!((*b).irq_armed).is_null() && !list_empty(&(*b).signalers) {
         intel_breadcrumbs_arm_irq(b);
     }
 
     // And confirm that we still want irqs enabled before we yield
-    if READ_ONCE!((*b).irq_armed).is_some() && atomic_read(&(*b).active) == 0 {
+    if !READ_ONCE!((*b).irq_armed).is_null() && atomic_read(&(*b).active) == 0 {
         intel_breadcrumbs_disarm_irq(b);
     }
 }
@@ -303,7 +315,7 @@ pub unsafe fn intel_breadcrumbs_create(irq_engine: *mut IntelEngineCs) -> *mut I
         return core::ptr::null_mut();
     }
 
-    kref_init(&mut (*b).ref_);
+    kref_init(&mut (*b).r#ref);
 
     spin_lock_init(&mut (*b).signalers_lock);
     INIT_LIST_HEAD(&mut (*b).signalers);
@@ -340,7 +352,7 @@ pub unsafe fn intel_breadcrumbs_reset(b: *mut IntelBreadcrumbs) {
 
 // upstream: intel_breadcrumbs.c __intel_breadcrumbs_park()
 unsafe fn __intel_breadcrumbs_park(b: *mut IntelBreadcrumbs) {
-    if READ_ONCE!((*b).irq_armed).is_none() {
+    if READ_ONCE!((*b).irq_armed).is_null() {
         return;
     }
 
@@ -354,20 +366,20 @@ unsafe extern "C" fn intel_breadcrumbs_free(kref: *mut Kref) {
 
     irq_work_sync(&mut (*b).irq_work);
     GEM_BUG_ON!(!list_empty(&(*b).signalers));
-    GEM_BUG_ON!((*b).irq_armed.is_some());
+    GEM_BUG_ON!(!(*b).irq_armed.is_null());
 
     kfree(b);
 }
 
 // upstream: intel_breadcrumbs.h intel_breadcrumbs_get()
 pub unsafe fn intel_breadcrumbs_get(b: *mut IntelBreadcrumbs) -> *mut IntelBreadcrumbs {
-    crate::linux_memory::kref_get(&mut (*b).ref_);
+    crate::linux_memory::kref_get(&mut (*b).r#ref);
     b
 }
 
 // upstream: intel_breadcrumbs.h intel_breadcrumbs_put()
 pub unsafe fn intel_breadcrumbs_put(b: *mut IntelBreadcrumbs) {
-    crate::linux_memory::kref_put(&mut (*b).ref_, intel_breadcrumbs_free);
+    crate::linux_memory::kref_put(&mut (*b).r#ref, intel_breadcrumbs_free);
 }
 
 // upstream: intel_breadcrumbs.c irq_signal_request()
@@ -436,7 +448,7 @@ unsafe fn insert_breadcrumb(rq: *mut I915Request) {
     // Defer enabling the interrupt to after HW submission and recheck
     // the request as it may have completed and raised the interrupt as
     // we were attaching it into the lists.
-    if READ_ONCE!((*b).irq_armed).is_none() || __i915_request_is_complete(rq) {
+    if READ_ONCE!((*b).irq_armed).is_null() || __i915_request_is_complete(rq) {
         irq_work_queue(&mut (*b).irq_work);
     }
 }
@@ -525,7 +537,7 @@ pub(crate) unsafe fn intel_context_remove_breadcrumbs(
     }
 
     while atomic_read(&(*b).signaler_active) != 0 {
-        cpu_relax();
+        core::hint::spin_loop();
     }
 }
 
@@ -573,7 +585,7 @@ pub(crate) unsafe fn intel_engine_print_breadcrumbs(
     drm_printf!(
         p,
         "IRQ: %s\n",
-        str_enabled_disabled(READ_ONCE!((*b).irq_armed).is_some()),
+        if !READ_ONCE!((*b).irq_armed).is_null() { "enabled" } else { "disabled" },
     );
     if !list_empty(&(*b).signalers) {
         print_signals(b, p);

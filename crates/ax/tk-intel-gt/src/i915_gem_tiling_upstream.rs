@@ -12,6 +12,13 @@ use core::ffi::c_void;
 
 use crate::{
     for_each_ggtt_vma,
+    i915_gem_object_api_upstream::{i915_gem_object_has_pages, i915_gem_object_put},
+    i915_gem_object_header_upstream::{
+        i915_gem_object_clear_tiling_quirk, i915_gem_object_has_tiling_quirk,
+        i915_gem_object_is_proxy, i915_gem_object_lookup, i915_gem_object_lookup_rcu,
+        i915_gem_object_set_tiling_quirk, i915_gem_object_lock, i915_gem_object_unlock,
+    },
+    i915_gem_shrinker_upstream::{i915_gem_object_make_shrinkable, i915_gem_object_make_unshrinkable},
     i915_gem_object_types_upstream::DrmI915GemObject,
     i915_vma_api_upstream::*,
     intel_context_upstream::I915Vma,
@@ -19,6 +26,7 @@ use crate::{
     linux::{bits::IS_ALIGNED, i915::GRAPHICS_VER},
     linux_config::*,
     linux_i915_private::DrmI915Private,
+    linux_macros::*,
     linux_list::*,
 };
 
@@ -197,7 +205,7 @@ pub unsafe fn i915_gem_fence_alignment(
 // Check pitch constraints for all chips & tiling formats.
 // upstream: i915_gem_tiling.c i915_tiling_ok()
 unsafe fn i915_tiling_ok(obj: *mut DrmI915GemObject, tiling: u32, stride: u32) -> bool {
-    let i915 = to_i915((*obj).base.dev);
+    let i915 = to_i915((*obj).base.base.dev);
     let tile_width: u32;
 
     // Linear is always fine.
@@ -255,7 +263,7 @@ unsafe fn i915_vma_fence_prepare(vma: *mut I915Vma, tiling_mode: i32, stride: u3
     }
 
     size = i915_gem_fence_size(i915, (*vma).size as u32, tiling_mode as u32, stride);
-    if i915_vma_size(vma) < size as u64 {
+    if (*vma).size < size as u64 {
         return false;
     }
 
@@ -274,7 +282,7 @@ unsafe fn i915_gem_object_fence_prepare(
     tiling_mode: i32,
     stride: u32,
 ) -> i32 {
-    let i915 = to_i915((*obj).base.dev);
+    let i915 = to_i915((*obj).base.base.dev);
     let ggtt = (*to_gt(i915)).ggtt;
     let mut vma: *mut I915Vma = core::ptr::null_mut();
     let mut vn: *mut I915Vma = core::ptr::null_mut();
@@ -320,7 +328,7 @@ unsafe fn i915_gem_object_fence_prepare(
 
 // upstream: i915_gem_tiling.c i915_gem_object_needs_bit17_swizzle()
 pub unsafe fn i915_gem_object_needs_bit17_swizzle(obj: *mut DrmI915GemObject) -> bool {
-    let i915 = to_i915((*obj).base.dev);
+    let i915 = to_i915((*obj).base.base.dev);
 
     (*(*to_gt(i915)).ggtt).bit_6_swizzle_x == I915_BIT_6_SWIZZLE_9_10_17
         && i915_gem_object_is_tiled(obj)
@@ -332,12 +340,12 @@ pub unsafe fn i915_gem_object_set_tiling(
     tiling: u32,
     stride: u32,
 ) -> i32 {
-    let i915 = to_i915((*obj).base.dev);
+    let i915 = to_i915((*obj).base.base.dev);
     let mut vma: *mut I915Vma = core::ptr::null_mut();
     let mut err: i32;
 
     // Make sure we do not cross-contaminate obj->tiling_and_stride.
-    BUILD_BUG_ON!(I915_TILING_LAST & STRIDE_MASK);
+    BUILD_BUG_ON!((I915_TILING_LAST & STRIDE_MASK) != 0);
 
     GEM_BUG_ON!(!i915_tiling_ok(obj, tiling, stride));
     GEM_BUG_ON!((stride == 0) ^ (tiling == I915_TILING_NONE));
@@ -369,8 +377,8 @@ pub unsafe fn i915_gem_object_set_tiling(
     // If memory has unknown (i.e. varying) swizzling, pin the pages to
     // prevent them from being swapped out and corrupting their contents.
     if i915_gem_object_has_pages(obj)
-        && (*obj).mm.madv == I915_MADV_WILLNEED
-        && (*i915).gem_quirks & GEM_QUIRK_PIN_SWIZZLED_PAGES != 0
+        && (*obj).mm.madv() == I915_MADV_WILLNEED
+        && (*i915).gem_quirks & GEM_QUIRK_PIN_SWIZZLED_PAGES as u64 != 0
     {
         if tiling == I915_TILING_NONE {
             GEM_BUG_ON!(!i915_gem_object_has_tiling_quirk(obj));
@@ -400,7 +408,7 @@ pub unsafe fn i915_gem_object_set_tiling(
     // Try to preallocate memory required to save swizzling on put-pages.
     if i915_gem_object_needs_bit17_swizzle(obj) {
         if (*obj).bit_17.is_null() {
-            (*obj).bit_17 = bitmap_zalloc(((*obj).base.size >> PAGE_SHIFT) as usize, GFP_KERNEL);
+            (*obj).bit_17 = bitmap_zalloc(((*obj).base.base.size >> PAGE_SHIFT) as usize, GFP_KERNEL);
         }
     } else {
         bitmap_free((*obj).bit_17);
@@ -521,7 +529,7 @@ pub unsafe fn i915_gem_get_tiling_ioctl(
     rcu_read_lock();
     obj = i915_gem_object_lookup_rcu(file, (*args).handle);
     if !obj.is_null() {
-        (*args).tiling_mode = READ_ONCE((*obj).tiling_and_stride) & TILING_MASK;
+        (*args).tiling_mode = READ_ONCE!((*obj).tiling_and_stride) & TILING_MASK;
         err = 0;
     }
     rcu_read_unlock();
@@ -544,7 +552,7 @@ pub unsafe fn i915_gem_get_tiling_ioctl(
     }
 
     // Hide bit 17 from userspace -- see the set-tiling comment.
-    if (*i915).gem_quirks & GEM_QUIRK_PIN_SWIZZLED_PAGES != 0 {
+    if (*i915).gem_quirks & GEM_QUIRK_PIN_SWIZZLED_PAGES as u64 != 0 {
         (*args).phys_swizzle_mode = I915_BIT_6_SWIZZLE_UNKNOWN;
     } else {
         (*args).phys_swizzle_mode = (*args).swizzle_mode;

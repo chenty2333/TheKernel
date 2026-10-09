@@ -8,7 +8,18 @@
 use core::ffi::c_void;
 
 use crate::{
+    i915_gem_object_api_upstream::{
+        i915_gem_object_has_pages, i915_gem_object_lock, i915_gem_object_lock_interruptible,
+        i915_gem_object_pin_pages, i915_gem_object_put, i915_gem_object_unlock,
+        i915_gem_object_unpin_pages,
+    },
+    i915_gem_core_upstream::i915_gem_object_wait,
+    i915_gem_object_header_upstream::{
+        __start_cpu_write, assert_object_held, i915_gem_object_is_proxy,
+        i915_gem_object_is_userptr, i915_gem_object_lookup, i915_gem_object_lookup_rcu,
+    },
     i915_gem_object_types_upstream::DrmI915GemObject,
+    i915_gem_lmem_upstream::i915_gem_object_is_lmem,
     i915_gem_object_upstream::{
         i915_gem_object_has_struct_page, i915_gem_object_set_cache_coherency,
     },
@@ -94,7 +105,7 @@ struct DrmFile {
 
 // upstream: i915_gem_domain.c gpu_write_needs_clflush()
 unsafe fn gpu_write_needs_clflush(obj: *mut DrmI915GemObject) -> bool {
-    let i915 = to_i915((*obj).base.dev);
+    let i915 = to_i915((*obj).base.base.dev);
 
     if IS_DGFX(i915) {
         return false;
@@ -111,7 +122,7 @@ unsafe fn gpu_write_needs_clflush(obj: *mut DrmI915GemObject) -> bool {
 
 // upstream: i915_gem_domain.c i915_gem_cpu_write_needs_clflush()
 pub unsafe fn i915_gem_cpu_write_needs_clflush(obj: *mut DrmI915GemObject) -> bool {
-    let i915 = to_i915((*obj).base.dev);
+    let i915 = to_i915((*obj).base.base.dev);
 
     if unsafe { i915_gem_object_cache_dirty(obj) } {
         return false;
@@ -211,7 +222,7 @@ pub unsafe fn i915_gem_object_set_to_wc_domain(obj: *mut DrmI915GemObject, write
     let mut ret = i915_gem_object_wait(
         obj,
         I915_WAIT_INTERRUPTIBLE | if write { I915_WAIT_ALL } else { 0 },
-        MAX_SCHEDULE_TIMEOUT,
+        MAX_SCHEDULE_TIMEOUT as _,
     );
     if ret != 0 {
         return ret;
@@ -249,7 +260,7 @@ pub unsafe fn i915_gem_object_set_to_wc_domain(obj: *mut DrmI915GemObject, write
     if write {
         (*obj).read_domains = I915_GEM_DOMAIN_WC as u16;
         (*obj).write_domain = I915_GEM_DOMAIN_WC as u16;
-        (*obj).mm.set_dirty();
+        (*obj).mm.set_dirty(true);
     }
 
     i915_gem_object_unpin_pages(obj);
@@ -270,7 +281,7 @@ pub unsafe fn i915_gem_object_set_to_gtt_domain(obj: *mut DrmI915GemObject, writ
     let mut ret = i915_gem_object_wait(
         obj,
         I915_WAIT_INTERRUPTIBLE | if write { I915_WAIT_ALL } else { 0 },
-        MAX_SCHEDULE_TIMEOUT,
+        MAX_SCHEDULE_TIMEOUT as _,
     );
     if ret != 0 {
         return ret;
@@ -308,7 +319,7 @@ pub unsafe fn i915_gem_object_set_to_gtt_domain(obj: *mut DrmI915GemObject, writ
     if write {
         (*obj).read_domains = I915_GEM_DOMAIN_GTT as u16;
         (*obj).write_domain = I915_GEM_DOMAIN_GTT as u16;
-        (*obj).mm.set_dirty();
+        (*obj).mm.set_dirty(true);
 
         spin_lock(&mut (*obj).vma.lock);
         crate::for_each_ggtt_vma!(vma, obj, {
@@ -499,12 +510,12 @@ pub unsafe fn i915_gem_object_pin_to_display_plane(
     view: *const I915GttView,
     mut flags: u32,
 ) -> *mut I915Vma {
-    let i915 = to_i915((*obj).base.dev);
+    let i915 = to_i915((*obj).base.base.dev);
     let mut vma: *mut I915Vma;
     let ret: i32;
 
     // Frame buffer must be in LMEM
-    if HAS_LMEM(i915) && !i915_gem_object_is_lmem(obj) {
+    if HAS_LMEM(i915) && !unsafe { i915_gem_object_is_lmem(obj) } {
         return ERR_PTR(-EINVAL);
     }
 
@@ -839,7 +850,7 @@ pub unsafe fn i915_gem_object_prepare_write(
     }
 
     i915_gem_object_frontbuffer_invalidate(obj, ORIGIN_CPU);
-    (*obj).mm.set_dirty();
+    (*obj).mm.set_dirty(true);
     // return with the pages pinned
     0
 }

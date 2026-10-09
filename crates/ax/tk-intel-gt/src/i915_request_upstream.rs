@@ -964,7 +964,7 @@ unsafe fn i915_request_await_start(rq: *mut I915Request, signal: *mut I915Reques
     }
     let mut fence: *mut DmaFence = ptr::null_mut();
     rcu_read_lock();
-    let pos = unsafe { ptr::read_volatile((*signal).link.prev) };
+    let pos = unsafe { ptr::read_volatile(ptr::addr_of!((*signal).link.prev)) };
     if !unsafe { __i915_request_has_started(signal) } {
         let timeline = unsafe { rcu_dereference!((*signal).timeline) };
         if pos != unsafe { ptr::addr_of_mut!((*timeline).requests) } {
@@ -1354,7 +1354,7 @@ unsafe fn i915_request_await_request(to: *mut I915Request, from: *mut I915Reques
 
 // upstream i915_request.c:1500
 // upstream: i915_request.c i915_request_await_dma_fence()
-pub unsafe fn i915_request_await_dma_fence(rq: *mut I915Request, fence: *mut DmaFence) -> i32 {
+pub unsafe fn i915_request_await_dma_fence(rq: *mut I915Request, mut fence: *mut DmaFence) -> i32 {
     let mut child = ptr::addr_of_mut!(fence);
     let mut nchild = 1u32;
     if unsafe { dma_fence_is_array(fence) } {
@@ -1569,7 +1569,7 @@ unsafe fn __i915_request_add_to_timeline(rq: *mut I915Request) -> *mut I915Reque
     if !prev.is_null() {
         unsafe { i915_request_put(prev) };
     }
-    gem_bug_on!(unsafe { (*timeline).seqno != (*rq).fence.seqno });
+    gem_bug_on!(unsafe { (*timeline).seqno != (*rq).fence.seqno as u32 });
     prev
 }
 

@@ -423,6 +423,13 @@ pub unsafe fn HAS_FLAT_CCS<P: I915PrivatePtr>(i915: P) -> bool {
     !info.is_null() && ((*info).flags[1] & (1 << 1)) != 0
 }
 
+/// `HAS_3D_PIPELINE(i915)` from i915_drv.h, device-info flag bit 8.
+#[allow(non_snake_case)]
+pub unsafe fn HAS_3D_PIPELINE<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = unsafe { INTEL_INFO(i915) };
+    !info.is_null() && (unsafe { (*info).flags[1] } & 1) != 0
+}
+
 /// Prefix overlay for `drm_i915_private.__runtime`. Offset and runtime size
 /// were obtained from the source kernel's x86_64 v7.2.3 compile configuration.
 #[repr(C)]
@@ -531,6 +538,7 @@ const SUBPLATFORM_MASK: u32 = 0xf;
 const INTEL_I915G: u32 = 5;
 const INTEL_I915GM: u32 = 6;
 const INTEL_I965G: u32 = 11;
+const INTEL_I965GM: u32 = 12;
 const INTEL_G45: u32 = 13;
 const INTEL_IVYBRIDGE: u32 = 17;
 const INTEL_VALLEYVIEW: u32 = 18;
@@ -546,7 +554,7 @@ const INTEL_COMETLAKE: u32 = 27;
 const INTEL_ICELAKE: u32 = 28;
 const INTEL_ELKHARTLAKE: u32 = 29;
 const INTEL_JASPERLAKE: u32 = 30;
-const INTEL_TIGERLAKE: u32 = 31;
+pub const INTEL_TIGERLAKE: u32 = 31;
 const INTEL_ROCKETLAKE: u32 = 32;
 const INTEL_DG1: u32 = 33;
 const INTEL_ALDERLAKE_S: u32 = 34;
@@ -625,6 +633,7 @@ platform_predicates! {
     IS_I915G = INTEL_I915G,
     IS_I915GM = INTEL_I915GM,
     IS_I965G = INTEL_I965G,
+    IS_I965GM = INTEL_I965GM,
     IS_G4X = INTEL_G45,
     IS_IVYBRIDGE = INTEL_IVYBRIDGE,
     IS_VALLEYVIEW = INTEL_VALLEYVIEW,
@@ -756,12 +765,12 @@ pub unsafe fn i915_ggtt_offset(vma: *const I915Vma) -> u32 {
 pub const GT_GUC_OFFSET: usize = 624;
 
 #[inline]
-pub unsafe fn gt_to_guc(gt: *mut IntelGt) -> *mut crate::guc_submission_upstream::IntelGuc {
+pub unsafe fn gt_to_guc(gt: *mut IntelGt) -> *mut crate::intel_guc_types_upstream::IntelGuc {
     gt.cast::<u8>().add(GT_GUC_OFFSET).cast()
 }
 
 #[inline]
-pub unsafe fn guc_to_gt(guc: *mut crate::guc_submission_upstream::IntelGuc) -> *mut IntelGt {
+pub unsafe fn guc_to_gt(guc: *mut crate::intel_guc_types_upstream::IntelGuc) -> *mut IntelGt {
     guc.cast::<u8>().sub(GT_GUC_OFFSET).cast()
 }
 

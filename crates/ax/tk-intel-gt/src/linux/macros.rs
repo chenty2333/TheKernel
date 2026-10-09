@@ -91,7 +91,7 @@ macro_rules! from_tasklet {
     ($pointer:expr,tasklet) => {
         container_of!(
             $pointer,
-            crate::intel_context_upstream::I915SchedEngine,
+            crate::i915_scheduler_types_upstream::I915SchedEngine,
             tasklet
         )
     };
@@ -231,6 +231,28 @@ macro_rules! RB_ROOT_CACHED {
     }};
 }
 
+macro_rules! RB_ROOT {
+    () => { $crate::linux::rbtree::RB_ROOT };
+}
+
+macro_rules! RB_EMPTY_NODE {
+    ($node:expr) => {{
+        let __node = $node;
+        unsafe { (*__node).parent_color == (__node as *const _ as usize) }
+    }};
+}
+
+macro_rules! RB_CLEAR_NODE {
+    ($node:expr) => {{
+        let __node = $node;
+        unsafe { (*__node).parent_color = __node as *const _ as usize; }
+    }};
+}
+
+macro_rules! wmb {
+    () => { $crate::linux::primitives::wmb() };
+}
+
 macro_rules! ENGINE_READ {
     ($engine:expr, $reg:expr) => {{
         $crate::intel_uncore_types_upstream::intel_uncore_read(
@@ -251,10 +273,10 @@ macro_rules! ENGINE_READ_FW {
 
 macro_rules! ENGINE_POSTING_READ {
     ($engine:expr, $reg:expr) => {{
-        $crate::intel_uncore_types_upstream::intel_uncore_posting_read_fw(
+        unsafe { $crate::intel_uncore_types_upstream::intel_uncore_posting_read_fw(
             (*$engine).uncore,
             ($reg)((*$engine).mmio_base),
-        )
+        ) }
     }};
 }
 
@@ -290,11 +312,11 @@ macro_rules! ENGINE_WRITE16 {
 
 macro_rules! ENGINE_WRITE_FW {
     ($engine:expr, $reg:expr, $value:expr) => {{
-        $crate::intel_uncore_types_upstream::intel_uncore_write_fw(
+        unsafe { $crate::intel_uncore_types_upstream::intel_uncore_write_fw(
             (*$engine).uncore,
             ($reg)((*$engine).mmio_base),
             $value,
-        )
+        ) }
     }};
 }
 
@@ -315,7 +337,7 @@ macro_rules! for_each_engine {
     ($engine:ident, $id:ident, $gt:expr, $body:block) => {{
         let __gt = $gt;
         let mut __engine_index = 0usize;
-        while __engine_index < $crate::intel_engine_cs_upstream::I915_NUM_ENGINES {
+        while __engine_index < $crate::intel_engine_cs_upstream::I915_NUM_ENGINES as usize {
             let $id: $crate::intel_engine_cs_upstream::IntelEngineId =
                 __engine_index as $crate::intel_engine_cs_upstream::IntelEngineId;
             let __engine_ptr = unsafe { (*__gt).engine[__engine_index] };

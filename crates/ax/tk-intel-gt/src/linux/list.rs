@@ -122,6 +122,24 @@ pub unsafe fn list_move_tail(entry: *mut ListHead, head: *mut ListHead) {
     list_add_tail(entry, head);
 }
 
+/// Move all entries from `list` to the beginning of `head`, then reinitialize
+/// `list`, matching Linux list_splice_init().
+pub unsafe fn list_splice_init(list: *mut ListHead, head: *mut ListHead) {
+    if unsafe { list_empty(&*list) } {
+        return;
+    }
+    let first = unsafe { (*list).next };
+    let last = unsafe { (*list).prev };
+    let at = unsafe { (*head).next };
+    unsafe {
+        (*first).prev = head;
+        (*head).next = first;
+        (*last).next = at;
+        (*at).prev = last;
+        INIT_LIST_HEAD(list);
+    }
+}
+
 pub unsafe fn list_replace(old: *mut ListHead, new: *mut ListHead) {
     (*new).next = (*old).next;
     (*(*new).next).prev = new;
@@ -232,6 +250,13 @@ macro_rules! list_first_entry {
     }};
 }
 
+macro_rules! list_last_entry {
+    ($head:expr, $container:ty, $($member:tt)+) => {{
+        let head = ($head) as *const _ as *mut $crate::intel_engine_cs_upstream::ListHead;
+        unsafe { container_of!((*head).prev, $container, $($member)+) }
+    }};
+}
+
 macro_rules! list_first_entry_or_null {
     ($head:expr, $container:ty, $($member:tt)+) => {{
         let head = ($head) as *const _ as *mut $crate::intel_engine_cs_upstream::ListHead;
@@ -241,26 +266,36 @@ macro_rules! list_first_entry_or_null {
 }
 
 macro_rules! list_next_entry {
-    ($entry:expr, $($member:tt)+) => {{
-        let entry = $entry;
-        let member = unsafe { core::ptr::addr_of_mut!((*entry).$($member)+) } as *mut $crate::intel_engine_cs_upstream::ListHead;
-        let offset = (member as usize).wrapping_sub(entry as *const _ as usize);
+    ($entry:expr, signal_link) => {{
+        let entry = ($entry) as *mut $crate::i915_request_types_upstream::I915Request;
+        let member = unsafe { core::ptr::addr_of_mut!((*entry).signal_link) } as *mut $crate::intel_engine_cs_upstream::ListHead;
+        let offset = (member as usize).wrapping_sub(entry as usize);
         let next = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*member).next)) };
-        let mut next_entry = entry;
-        next_entry = next.wrapping_sub(offset) as *mut _;
-        next_entry
+        next.wrapping_sub(offset) as *mut $crate::i915_request_types_upstream::I915Request
+    }};
+    ($entry:expr, parallel.children.child_link) => {{
+        let entry = ($entry) as *mut $crate::intel_context_types_upstream::IntelContext;
+        let member = unsafe { core::ptr::addr_of_mut!((*entry).parallel.children.child_link) } as *mut $crate::intel_engine_cs_upstream::ListHead;
+        let offset = (member as usize).wrapping_sub(entry as usize);
+        let next = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*member).next)) };
+        unsafe { &mut *(next.wrapping_sub(offset) as *mut $crate::intel_context_types_upstream::IntelContext) }
+    }};
+    ($entry:expr, sched.link) => {{
+        let entry = ($entry) as *mut $crate::i915_request_types_upstream::I915Request;
+        let member = unsafe { core::ptr::addr_of_mut!((*entry).sched.link) } as *mut $crate::intel_engine_cs_upstream::ListHead;
+        let offset = (member as usize).wrapping_sub(entry as usize);
+        let next = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*member).next)) };
+        next.wrapping_sub(offset) as *mut $crate::i915_request_types_upstream::I915Request
     }};
 }
 
 macro_rules! list_prev_entry {
-    ($entry:expr, $($member:tt)+) => {{
-        let entry = $entry;
-        let member = unsafe { core::ptr::addr_of_mut!((*entry).$($member)+) } as *mut $crate::intel_engine_cs_upstream::ListHead;
-        let offset = (member as usize).wrapping_sub(entry as *const _ as usize);
+    ($entry:expr, signal_link) => {{
+        let entry = ($entry) as *mut $crate::i915_request_types_upstream::I915Request;
+        let member = unsafe { core::ptr::addr_of_mut!((*entry).signal_link) } as *mut $crate::intel_engine_cs_upstream::ListHead;
+        let offset = (member as usize).wrapping_sub(entry as usize);
         let prev = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*member).prev)) };
-        let mut prev_entry = entry;
-        prev_entry = prev.wrapping_sub(offset) as *mut _;
-        prev_entry
+        prev.wrapping_sub(offset) as *mut $crate::i915_request_types_upstream::I915Request
     }};
 }
 
@@ -309,13 +344,13 @@ macro_rules! list_for_each_entry_safe {
 // remove the current request, matching list_for_each_entry_safe().
 macro_rules! priolist_for_each_request_consume {
     ($request:ident, $next:ident, $plist:expr, $body:block) => {{
-        let mut $request: *mut $crate::intel_context_upstream::I915Request = core::ptr::null_mut();
-        let mut $next: *mut $crate::intel_context_upstream::I915Request = core::ptr::null_mut();
-        let __priolist = $plist;
+        let mut $request: *mut $crate::i915_request_types_upstream::I915Request = core::ptr::null_mut();
+        let mut $next: *mut $crate::i915_request_types_upstream::I915Request = core::ptr::null_mut();
+        let __priolist = ($plist) as *const _ as *mut $crate::i915_scheduler_types_upstream::I915Priolist;
         list_for_each_entry_safe!(
             $request,
             $next,
-            unsafe { core::ptr::addr_of!((*__priolist).requests) as *mut _ },
+            unsafe { core::ptr::addr_of_mut!((*__priolist).requests) },
             sched.link,
             $body
         );
@@ -324,8 +359,8 @@ macro_rules! priolist_for_each_request_consume {
 
 macro_rules! priolist_for_each_request {
     ($request:ident, $plist:expr, $body:block) => {{
-        let mut $request: *mut $crate::intel_context_upstream::I915Request = core::ptr::null_mut();
-        let __priolist = $plist;
+        let mut $request: *mut $crate::i915_request_types_upstream::I915Request = core::ptr::null_mut();
+        let __priolist = ($plist) as *const _ as *mut $crate::i915_scheduler_types_upstream::I915Priolist;
         list_for_each_entry!(
             $request,
             unsafe { core::ptr::addr_of_mut!((*__priolist).requests) },
@@ -436,10 +471,11 @@ macro_rules! llist_for_each_safe {
 
 macro_rules! for_each_child_safe {
     ($parent:ident, $child:ident, $next:ident, $body:block) => {{
-        let mut $child: *mut $crate::intel_context_upstream::IntelContext = core::ptr::null_mut();
-        let mut $next: *mut $crate::intel_context_upstream::IntelContext = core::ptr::null_mut();
+        let mut $child: *mut $crate::intel_context_types_upstream::IntelContext = core::ptr::null_mut();
+        let mut $next: *mut $crate::intel_context_types_upstream::IntelContext = core::ptr::null_mut();
+        let $parent = ($parent) as *const _ as *mut $crate::intel_context_types_upstream::IntelContext;
         let head = unsafe {
-            core::ptr::addr_of!((*$parent).parallel.children.child_list) as *mut _
+            core::ptr::addr_of_mut!((*$parent).parallel.children.child_list)
                 as *mut $crate::intel_engine_cs_upstream::ListHead
         };
         list_for_each_entry_safe!($child, $next, head, parallel.children.child_link, $body);
@@ -448,9 +484,10 @@ macro_rules! for_each_child_safe {
 
 macro_rules! for_each_child {
     ($parent:ident, $child:ident, $($body:tt)+) => {{
-        let mut $child: *mut $crate::intel_context_upstream::IntelContext = core::ptr::null_mut();
+        let mut $child: *mut $crate::intel_context_types_upstream::IntelContext = core::ptr::null_mut();
+        let $parent = ($parent) as *const _ as *mut $crate::intel_context_types_upstream::IntelContext;
         let head = unsafe {
-            core::ptr::addr_of_mut!((*$parent).parallel.children.child_list)
+            core::ptr::addr_of!((*$parent).parallel.children.child_list)
                 as *mut $crate::intel_engine_cs_upstream::ListHead
         };
         list_for_each_entry!($child, head, parallel.children.child_link, { $($body)+ });

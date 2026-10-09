@@ -7,6 +7,7 @@ use core::{
     ffi::c_void,
     sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
 };
+use kernel_guard::NoPreemptIrqSave;
 
 use crate::{
     i915_gem_ww_upstream::WwAcquireCtx,

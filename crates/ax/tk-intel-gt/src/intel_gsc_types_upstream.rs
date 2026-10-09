@@ -8,7 +8,7 @@
 use core::ffi::c_ulong;
 
 use crate::{
-    i915_request_types_upstream::DrmI915GemObject, intel_gt_types_upstream::IntelGt,
+    i915_gem_object_types_upstream::DrmI915GemObject, intel_gt_types_upstream::IntelGt,
     linux_i915_private::DrmI915Private,
 };
 

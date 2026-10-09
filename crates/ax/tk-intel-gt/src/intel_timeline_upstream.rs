@@ -424,7 +424,7 @@ pub unsafe fn intel_timeline_read_hwsp(
     if !tl.is_null() {
         // hwsp_offset may wraparound, so use from->hwsp_seqno
         *hwsp = i915_ggtt_offset((*tl).hwsp_ggtt)
-            .wrapping_add(offset_in_page((*from).hwsp_seqno) as u32);
+            .wrapping_add(offset_in_page((*from).hwsp_seqno as usize) as u32);
     }
 
     // ensure we wait on the right request, if not, we completed

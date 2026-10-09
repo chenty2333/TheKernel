@@ -11,6 +11,16 @@
 use core::ffi::{c_int, c_ulong, c_void};
 
 use crate::{
+    linux::gem_memory::{INTEL_MEMORY_LOCAL, INTEL_MEMORY_SYSTEM},
+    i915_gem_context_upstream::{i915_gem_context_get, i915_gem_context_put},
+    i915_gem_object_api_upstream::{
+        i915_gem_object_has_pages, i915_gem_object_has_pinned_pages, i915_gem_object_lock,
+        i915_gem_object_put, i915_gem_object_unlock, i915_gem_object_unpin_map,
+    },
+    i915_gem_object_header_upstream::{
+        assert_object_held, assert_object_held_shared, i915_gem_object_flush_map,
+    },
+    i915_gem_pages_upstream::{i915_gem_object_pin_map, __i915_gem_object_put_pages},
     i915_gem_object_types_upstream::{DrmI915GemObject, DrmI915GemObjectOps},
     i915_vma_api_upstream::*,
     intel_context_upstream::*,
@@ -159,7 +169,7 @@ pub unsafe fn i915_gem_get_pat_index(i915: *mut DrmI915Private, level: u32) -> u
         return 0;
     }
 
-    INTEL_INFO(i915).cachelevel_to_pat[level as usize]
+    (*INTEL_INFO(i915)).cachelevel_to_pat[level as usize]
 }
 
 // upstream: i915_gem_object.c i915_gem_object_has_cache_level()

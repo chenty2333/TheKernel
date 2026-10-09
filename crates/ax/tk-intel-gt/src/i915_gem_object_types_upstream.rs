@@ -104,6 +104,7 @@ pub enum I915CacheLevel {
     I915_CACHE_WT        = 3,
     I915_MAX_CACHE_LEVEL = 4,
 }
+pub const I915_MAX_CACHE_LEVEL: u32 = 4;
 
 /// `enum i915_map_type` has an unsigned 32-bit representation on the target
 /// compiler because its force-map enumerators use bit 31.

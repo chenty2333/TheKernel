@@ -437,7 +437,7 @@ unsafe extern "C" fn i915_gem_shrinker_count(
     let _ = sc;
 
     count = READ_ONCE!((*i915).mm.shrink_memory) >> PAGE_SHIFT;
-    num_objects = READ_ONCE!((*i915).mm.shrink_count);
+    num_objects = READ_ONCE!((*i915).mm.shrink_count) as c_ulong;
 
     // Update our preferred vmscan batch size for the next pass.
     // Our rough guess for an effective batch size is roughly 2

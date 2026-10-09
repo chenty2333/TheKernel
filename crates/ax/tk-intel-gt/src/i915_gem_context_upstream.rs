@@ -18,16 +18,19 @@ use core::{
 };
 
 use crate::{
+    i915_gem_object_api_upstream::i915_gem_object_put,
     i915_gem_context_types_upstream::{
         CONTEXT_CLOSED, CONTEXT_FAST_HANG_JIFFIES, CONTEXT_USER_ENGINES, DrmI915FilePrivate,
-        I915_NUM_ENGINES, I915DrmClient, I915GemContext, I915GemEngineType, I915GemEngines,
+        I915DrmClient, I915GemContext, I915GemEngineType, I915GemEngines,
         I915GemEnginesIter, I915GemProtoContext, I915GemProtoEngine, UCONTEXT_BANNABLE,
         UCONTEXT_LOW_LATENCY, UCONTEXT_NO_ERROR_CAPTURE, UCONTEXT_PERSISTENCE,
         UCONTEXT_RECOVERABLE,
     },
-    i915_gem_object_types_upstream::I915LutHandle,
+    i915_gem_object_types_upstream::{DrmI915GemObject, I915LutHandle},
+    i915_request_types_upstream::I915Request,
     i915_vma_types_upstream::I915Vma,
-    intel_context_types_upstream::{I915SwFence, IntelContext, IntelWakerefT},
+    intel_context_types_upstream::{CONTEXT_BANNED, I915SwFence, IntelContext, IntelWakerefT},
+    intel_context_api_upstream::intel_context_get,
     intel_context_upstream::{
         DmaFence, DrmMmNode, I915ActiveFence, I915AddressSpace as OldI915AddressSpace, Kref,
         RcuHead, WaitQueueEntry,
@@ -36,7 +39,7 @@ use crate::{
         AtomicT, IntelEngineCs, ListHead, Mutex, RbRoot, Spinlock, WorkStruct,
     },
     intel_engine_types_upstream::{
-        COMPUTE_CLASS, I915_ENGINE_CLASS_INVALID, I915_NUM_ENGINES as ENGINE_COUNT, INVALID_ENGINE,
+        COMPUTE_CLASS, I915_NUM_ENGINES as ENGINE_COUNT, INVALID_ENGINE,
         IntelEngineMask, RENDER_CLASS,
     },
     intel_gt_types_upstream::{IntelGt, IntelGtType},
@@ -46,10 +49,11 @@ use crate::{
     linux::{
         bits::*, fields::*, gem::DrmFile, gem_memory::*, irq::*, locks::*, memory::*, mutex::*,
         rcu::*, registers::*, requests::*, sw_fence::*, workqueue::*, xarray::*,
+        i915::{to_gt},
     },
     linux_config::{
         EFAULT, EINVAL, EIO, ENODEV, ENOENT, ENOMEM, GFP_KERNEL, HZ, I915_CONTEXT_DEFAULT_PRIORITY,
-        I915_CONTEXT_MAX_USER_PRIORITY, I915_CONTEXT_MIN_USER_PRIORITY,
+        ERR_PTR,
     },
     linux_i915_private::DrmI915Private,
 };
@@ -58,6 +62,19 @@ const EPERM: i32 = 1;
 const EBADF: i32 = 9;
 const EEXIST: i32 = 17;
 const I915_EXEC_RING_MASK: u32 = 0x3f;
+
+/// Source `i915_gem_context_release()`: final reference schedules deferred
+/// release on the device workqueue; it must not free the context inline.
+unsafe extern "C" fn i915_gem_context_release(ref_: *mut Kref) {
+    let ctx = unsafe {
+        ref_.cast::<u8>()
+            .sub(offset_of!(I915GemContext, r#ref))
+            .cast::<I915GemContext>()
+    };
+    let i915 = unsafe { (*ctx).i915 };
+    let wq = unsafe { (*i915).wq };
+    unsafe { queue_work(wq, &mut (*ctx).release_work) };
+}
 const I915_CLIENT_SCORE_BANNED: i32 = 9;
 const CAP_SYS_NICE: u32 = 23;
 const CAP_SYS_ADMIN: u32 = 21;
@@ -286,7 +303,7 @@ const _: [(); 32] = [(); size_of::<I915UserExtension>()];
 const _: [(); 24] = [(); size_of::<DrmI915GemContextParam>()];
 const _: [(); 32] = [(); size_of::<DrmI915GemContextParamSseu>()];
 const _: [(); 24] = [(); size_of::<DrmI915GemContextCreateExt>()];
-const _: [(); 24] = [(); size_of::<DrmI915GemContextParamContextImage>()];
+const _: [(); 24] = [(); size_of::<I915GemContextParamContextImage>()];
 
 // Linux/UAPI and i915 helpers not owned by this source file. Static-inline
 // services are implemented locally below instead of being declared as symbols.
@@ -322,7 +339,6 @@ unsafe extern "C" {
     fn i915_request_put(rq: *mut I915Request);
     fn i915_request_active_engine(rq: *mut I915Request, engine: *mut *mut IntelEngineCs) -> bool;
     fn i915_gem_object_get(obj: *mut DrmI915GemObject);
-    fn i915_gem_object_put(obj: *mut DrmI915GemObject);
     fn i915_vma_close(vma: *mut I915Vma);
     fn drm_syncobj_create(syncobj: *mut *mut c_void, flags: u32, fence: *mut DmaFence) -> c_int;
     fn drm_syncobj_put(syncobj: *mut c_void);
@@ -388,6 +404,12 @@ unsafe fn scheduler_caps(i915: *mut DrmI915Private) -> u32 {
     let offset =
         offset_of!(DrmI915Private, runtime) + size_of::<crate::linux::i915::IntelRuntimeInfo>();
     unsafe { *i915.cast::<u8>().add(offset).cast::<u32>() }
+}
+
+pub(crate) unsafe fn set_has_logical_contexts(i915: *mut DrmI915Private) {
+    let offset =
+        offset_of!(DrmI915Private, runtime) + size_of::<crate::linux::i915::IntelRuntimeInfo>() + 4;
+    unsafe { *i915.cast::<u8>().add(offset) = 1 };
 }
 
 unsafe fn has_logical_contexts(i915: *mut DrmI915Private) -> bool {
@@ -502,7 +524,7 @@ unsafe fn context_engine(ctx: *const I915GemContext, index: u32) -> *mut IntelCo
     if ce.is_null() {
         ERR_PTR(-EINVAL)
     } else {
-        unsafe { crate::intel_context_upstream::intel_context_get(ce) }
+        unsafe { crate::intel_context_api_upstream::intel_context_get(ce) }
     }
 }
 
@@ -514,7 +536,7 @@ unsafe fn context_engines_unlock(ctx: *mut I915GemContext) {
     unsafe { mutex_unlock(&mut (*ctx).engines_mutex) };
 }
 
-unsafe fn i915_gem_context_get(ctx: *mut I915GemContext) -> *mut I915GemContext {
+pub(crate) unsafe fn i915_gem_context_get(ctx: *mut I915GemContext) -> *mut I915GemContext {
     unsafe { kref_get(ptr::addr_of_mut!((*ctx).r#ref)) };
     ctx
 }

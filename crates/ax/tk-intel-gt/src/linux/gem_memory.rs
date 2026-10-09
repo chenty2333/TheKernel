@@ -33,6 +33,18 @@ pub const INTEL_REGION_STOLEN_SMEM: IntelRegionId = 5;
 pub const INTEL_REGION_STOLEN_LMEM: IntelRegionId = 6;
 pub const INTEL_REGION_UNKNOWN: IntelRegionId = 7;
 
+/// `enum intel_memory_type` values from `intel_memory_region.h`.
+pub const INTEL_MEMORY_SYSTEM: u16 = 0;
+pub const INTEL_MEMORY_LOCAL: u16 = 1;
+pub const INTEL_MEMORY_STOLEN_SYSTEM: u16 = 2;
+pub const INTEL_MEMORY_STOLEN_LOCAL: u16 = 3;
+pub const INTEL_MEMORY_MOCK: u16 = 4;
+
+#[inline]
+pub const fn intel_memory_type_is_local(memory_type: u16) -> bool {
+    memory_type == INTEL_MEMORY_LOCAL || memory_type == INTEL_MEMORY_STOLEN_LOCAL
+}
+
 /// Source `struct drm_mm` from `include/drm/drm_mm.h`.
 #[repr(C)]
 pub struct DrmMm {

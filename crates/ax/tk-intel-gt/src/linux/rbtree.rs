@@ -282,6 +282,13 @@ impl RbNodePtr for &RbNode {
     }
 }
 
+/// Remove a node from an ordinary Linux rb_root.
+pub unsafe fn rb_erase<N: RbNodePtr>(node: N, root: &mut RbRoot) {
+    let node = node.rb_node_ptr();
+    assert!(!node.is_null());
+    unsafe { erase(node, core::ptr::addr_of_mut!(root.node)) };
+}
+
 pub fn rb_erase_cached<N: RbNodePtr>(node: N, root: &mut RbRootCached) {
     let node = node.rb_node_ptr();
     assert!(!node.is_null());

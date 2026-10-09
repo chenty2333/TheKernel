@@ -366,7 +366,7 @@ fn ptr_dec<T>(ptr: *mut T) -> *mut T {
 }
 
 #[inline]
-unsafe fn intel_timeline_is_last(tl: *const IntelTimeline, rq: *const I915Request) -> bool {
+pub(crate) unsafe fn intel_timeline_is_last(tl: *const IntelTimeline, rq: *const I915Request) -> bool {
     unsafe {
         crate::linux::list::list_is_last_rcu(
             core::ptr::addr_of!((*rq).link),
@@ -3597,7 +3597,7 @@ unsafe fn __execlists_engine_busyness(engine: *mut IntelEngineCs, now: *mut Ktim
 
     // Include current execution in accumulated busyness.
     *now = ktime_get();
-    if READ_ONCE!(stats.active) {
+    if READ_ONCE!(stats.active) != 0 {
         total = ktime_add(total, ktime_sub(*now, stats.start));
     }
     total

@@ -5,9 +5,9 @@
 #![allow(unsafe_code)]
 
 use crate::{
-    intel_context_upstream::{
-        DmaFence, DmaFenceCb, I915ActiveFence, I915SchedEngine, IntelContext,
-    },
+    intel_context_upstream::{DmaFence, DmaFenceCb, I915ActiveFence},
+    intel_context_types_upstream::IntelContext,
+    i915_scheduler_types_upstream::I915SchedEngine,
     intel_engine_cs_upstream::IntelEngineCs,
     linux_memory::{atomic_inc, atomic_read, refcount_dec_and_test},
 };
@@ -113,7 +113,7 @@ pub fn intel_context_sched_disable_unpin<C: IntelContextPtr>(context: C) {
 pub fn intel_context_is_banned<C: IntelContextPtr>(context: C) -> bool {
     let context = context.intel_context_ptr();
     assert!(!context.is_null());
-    crate::linux::bits::test_bit(crate::intel_context_upstream::CONTEXT_BANNED, unsafe {
+    crate::linux::bits::test_bit(crate::intel_context_types_upstream::CONTEXT_BANNED, unsafe {
         &(*context).flags
     })
 }

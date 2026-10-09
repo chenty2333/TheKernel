@@ -95,6 +95,9 @@ pub mod guc_log;
 pub mod guc_submission;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod gen8_engine_cs_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod guc_submission_upstream;
 pub mod huc;
 #[cfg(feature = "upstream-gt")]
@@ -111,7 +114,13 @@ pub mod i915_gem_context_types_upstream;
 pub mod i915_gem_context_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod i915_gem_core_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod i915_gem_domain_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod i915_gem_lmem_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod i915_gem_object_api_upstream;
@@ -275,6 +284,12 @@ pub mod intel_lrc_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_lrc_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_runtime_pm_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_reset_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_migrate_types_upstream;

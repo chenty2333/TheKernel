@@ -397,7 +397,7 @@ unsafe fn assert_rpm_raw_wakeref_held(rpm: *mut IntelRuntimePm) {
 }
 
 #[inline]
-unsafe fn assert_rpm_wakelock_held(rpm: *mut IntelRuntimePm) {
+pub(crate) unsafe fn assert_rpm_wakelock_held(rpm: *mut IntelRuntimePm) {
     unsafe { assert_rpm_raw_wakeref_held(rpm) };
     let count = unsafe { atomic_read(&(*rpm_layout(rpm)).wakeref_count) };
     crate::linux_assert::warn_on(count >> INTEL_RPM_WAKELOCK_SHIFT == 0);

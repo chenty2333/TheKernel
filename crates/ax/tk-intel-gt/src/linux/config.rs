@@ -7,6 +7,7 @@
 #![allow(non_snake_case, non_upper_case_globals)]
 
 pub const CONFIG_DRM_I915_CAPTURE_ERROR: bool = true;
+pub const CONFIG_PM: bool = true;
 pub const CONFIG_DRM_I915_DEBUG_GEM: bool = false;
 pub const CONFIG_DRM_I915_GVT: bool = false;
 pub const CONFIG_DRM_I915_SELFTEST: bool = false;
@@ -48,9 +49,10 @@ pub(crate) use crate::{
         intel_breadcrumbs_reset,
     },
     intel_context_upstream::{
-        I915Request, intel_context_enter_engine, intel_context_exit_engine, intel_context_fini,
+        intel_context_enter_engine, intel_context_exit_engine, intel_context_fini,
         intel_context_free, intel_context_get_active_request,
     },
+    i915_request_types_upstream::I915Request,
     intel_engine_cs_upstream::{
         intel_engine_cleanup_common, intel_engine_create_virtual, intel_engine_irq_disable,
         intel_engine_irq_enable, intel_engine_set_hwsp_writemask, intel_engine_stop_cs,

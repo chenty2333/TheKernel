@@ -6,7 +6,7 @@
 use core::{ffi::c_ulong, mem::ManuallyDrop};
 
 use crate::{
-    i915_request_types_upstream::DrmI915GemObject,
+    i915_gem_object_types_upstream::DrmI915GemObject,
     intel_context_types_upstream::I915Active,
     intel_context_upstream::RcuHead,
     intel_engine_cs_upstream::{DelayedWork, ListHead, Spinlock},

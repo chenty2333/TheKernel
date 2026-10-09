@@ -10,7 +10,8 @@
 use core::ffi::{c_ulong, c_void};
 
 use crate::{
-    intel_context_upstream::{I915Request, Kref},
+    intel_context_upstream::Kref,
+    i915_request_types_upstream::I915Request,
     intel_engine_cs_upstream::{
         AtomicT, IntelEngineMask, ListHead, RbNode, RbRootCached, Spinlock,
     },

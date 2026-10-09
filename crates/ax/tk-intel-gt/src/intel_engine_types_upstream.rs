@@ -17,7 +17,7 @@ use crate::{
     i915_vma_types_upstream::I915Vma,
     intel_breadcrumbs_types_upstream::IntelBreadcrumbs,
     intel_context_types_upstream::{File, IntelContext, IntelContextOps, IntelWakerefT},
-    intel_context_upstream::IntelTimeline,
+    intel_timeline_types_upstream::IntelTimeline,
     intel_engine_cs_upstream::{
         AtomicNotifierHead, AtomicT, DelayedWork, HlistHead, IntelWakeref, ListHead, LlistHead,
         LlistNode, RbNode, RbRootCached, Seqcount, TimerList, WorkStruct,

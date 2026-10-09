@@ -18,6 +18,9 @@ pub(crate) mod contexts;
 pub(crate) mod fields;
 pub(crate) mod gem;
 pub(crate) mod gem_memory;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod highmem;
 pub(crate) mod i915;
 pub(crate) mod i915_trace;
 pub(crate) mod idr;

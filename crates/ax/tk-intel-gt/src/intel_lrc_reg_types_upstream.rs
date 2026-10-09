@@ -8,6 +8,8 @@
 //! the source header owns register-state indexes, CSB fields, and the PDP
 //! assignment macros represented below.
 
+use crate::intel_gtt_api_upstream::px_dma;
+
 pub const CTX_DESC_FORCE_RESTORE: u64 = 1u64 << 2;
 
 // GEN8 to GEN12 Reg State Context dword indexes.

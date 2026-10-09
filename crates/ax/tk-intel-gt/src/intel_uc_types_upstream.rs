@@ -9,7 +9,7 @@
 use core::ffi::c_long;
 
 use crate::{
-    i915_request_types_upstream::DrmI915GemObject,
+    i915_gem_object_types_upstream::DrmI915GemObject,
     intel_gsc_uc_types_upstream::{
         IntelGscUc, intel_gsc_uc_is_supported, intel_gsc_uc_is_used, intel_gsc_uc_is_wanted,
     },

@@ -16,6 +16,8 @@ use core::{
 };
 
 use crate::{
+    i915_gem_object_api_upstream::{i915_gem_object_has_pages, i915_gem_object_put},
+    i915_gem_object_header_upstream::__start_cpu_write,
     i915_gem_object_types_upstream::{
         DrmI915GemObject, DrmI915GemObjectOps, I915_GEM_OBJECT_IS_SHRINKABLE,
         I915_GEM_OBJECT_SHRINK_WRITEBACK, VmOperationsStruct,
@@ -24,7 +26,14 @@ use crate::{
         i915_gem_object_can_bypass_llc, i915_gem_object_has_struct_page, i915_gem_object_init,
         i915_gem_object_set_cache_coherency,
     },
+    i915_gem_pages_upstream::{__i915_gem_object_set_pages, i915_gem_object_truncate, sg_next, sg_page},
+    i915_gem_pages_upstream::drm_clflush_sg,
+    i915_gem_userptr_upstream::{drm_gem_private_object_init, i915_gem_gtt_finish_pages, sg_free_table},
+    i915_gem_core_upstream::{access_ok, u64_to_user_ptr},
+    i915_gem_context_upstream::fput,
+    i915_gem_shrinker_upstream::i915_gem_shrink,
     i915_gem_tiling_upstream::i915_gem_object_needs_bit17_swizzle,
+    intel_ggtt_fencing_upstream::{i915_gem_object_do_bit_17_swizzle, i915_gem_object_save_bit_17_swizzle},
     intel_context_upstream::SgTable,
     linux::i915::{GRAPHICS_VER, GRAPHICS_VER_FULL, IP_VER, IS_DGFX, IS_I965G, IS_I965GM},
     linux_config::*,

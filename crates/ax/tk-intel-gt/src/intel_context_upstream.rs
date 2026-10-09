@@ -229,6 +229,7 @@ pub struct WaitQueueEntry {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct PinCookie;
 
 // Pointer-only Linux types. These are intentionally incomplete just like C

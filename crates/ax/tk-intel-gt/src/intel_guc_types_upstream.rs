@@ -102,7 +102,7 @@ pub struct IntelGuc {
     pub ads_vma: *mut I915Vma,
     pub ads_map: IosysMap,
     pub ads_regset_size: u32,
-    pub ads_regset_count: [u32; crate::intel_engine_cs_upstream::I915_NUM_ENGINES],
+    pub ads_regset_count: [u32; crate::intel_engine_cs_upstream::I915_NUM_ENGINES as usize],
     pub ads_regset: *mut GucMmioReg,
     pub ads_golden_ctxt_size: u32,
     pub ads_waklv_size: u32,
