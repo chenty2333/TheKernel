@@ -1713,10 +1713,12 @@ mod tests {
             0x09, 0x51, 0x15, 0, 0x25, 31, 0x75, 8, 0x95, 1, 0x81, 2, // Contact ID
             0x05, 1, 0x09, 0x30, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // X
             0x09, 0x31, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // Y
-            0x05, 0x0d, 0x09, 0x56, 0x15, 0, 0x25, 0xff, 0x75, 8, 0x95, 1, 0x81,
+            0x05, 0x0d, 0x09, 0x56, 0x15, 0, 0x26, 0xff, 0x00, 0x75, 8, 0x95, 1, 0x81,
             2, // Scan time
             0xc0, 0xc0,
         ];
+        // FreeBSD hmt.c wraps by the logical maximum (255 here, encoded as a
+        // two-byte item so it is not read as -1): 250 -> 5 is 10 ticks of 100 us.
         let mut report = Report::parse(&descriptor).unwrap();
         let mut events = VecDeque::new();
         assert!(report.decode(&[1, 1, 20, 30, 250], &mut events));
@@ -1730,14 +1732,14 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| (e.event_type, e.code, e.value) == (4, 5, 1_100))
+                .any(|e| (e.event_type, e.code, e.value) == (4, 5, 1_000))
         );
         events.clear();
         assert!(report.decode(&[0, 1, 20, 30, 10], &mut events));
         assert!(
             events
                 .iter()
-                .any(|e| (e.event_type, e.code, e.value) == (4, 5, 1_600))
+                .any(|e| (e.event_type, e.code, e.value) == (4, 5, 1_500))
         );
     }
 }
