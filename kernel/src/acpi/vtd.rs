@@ -48,6 +48,14 @@ const IDENTITY_PAGE_SIZE: u64 = 1 << 21;
 const IOVA_END: u64 = 1 << 36;
 
 static MODE: AtomicU8 = AtomicU8::new(MODE_UNKNOWN);
+
+const fn pci_dma_allowed_in_mode(mode: u8) -> bool {
+    mode != MODE_FAILED
+}
+
+const fn identity_dma_in_mode(mode: u8) -> bool {
+    matches!(mode, MODE_UNKNOWN | MODE_IDENTITY)
+}
 static REQUESTER_DOMAINS: AtomicBool = AtomicBool::new(false);
 static MANAGER: SpinNoIrq<Option<Manager>> = SpinNoIrq::new(None);
 
@@ -653,7 +661,8 @@ struct DeviceDomain {
 /// ECAM bridge topology.  DMAR scopes identify bridge prefixes, not merely
 /// the endpoint's downstream bus number.
 fn dmar_path(requester: tk_vtd::PciRequester) -> Vec<(u8, u8, u8)> {
-    axdriver::requester_path(requester.bus, requester.device, requester.function).unwrap_or_default()
+    axdriver::requester_path(requester.bus, requester.device, requester.function)
+        .unwrap_or_default()
 }
 
 fn dmar_scope_matches(
@@ -682,9 +691,7 @@ fn dmar_scope_matches(
         .path
         .chunks_exact(2)
         .zip(path.iter())
-        .all(|(pair, (_, device, function))| {
-            pair[0] == *device && pair[1] & 7 == *function
-        })
+        .all(|(pair, (_, device, function))| pair[0] == *device && pair[1] & 7 == *function)
         && (path.last().is_some_and(|(_, device, function)| {
             *device == requester.device && *function == requester.function
         }) || scope.scope_type == 2)
@@ -700,7 +707,10 @@ fn dmar_unit_for_requester<'a>(
         .iter()
         .find(|unit| {
             unit.segment == requester.segment
-                && unit.scopes.iter().any(|scope| dmar_scope_matches(scope, requester, path))
+                && unit
+                    .scopes
+                    .iter()
+                    .any(|scope| dmar_scope_matches(scope, requester, path))
         })
         .or_else(|| {
             table
@@ -944,10 +954,7 @@ impl Manager {
                 ir_routes.push((vector, unit_index, cookie));
                 info!(
                     "vtd: MSI vector={vector:#x} requester={:04x}:{:02x}:{:02x}.{} IRTE={cookie}",
-                    requester.segment,
-                    requester.bus,
-                    requester.device,
-                    requester.function
+                    requester.segment, requester.bus, requester.device, requester.function
                 );
                 Ok(Some(route))
             }
@@ -1188,7 +1195,7 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
             .map_err(|_| Error::MapFailed)?
             .as_usize();
         let qi = allocate_dma(QI_PAGES)?;
-        let mut unit = Unit {
+        let unit = Unit {
             mmio: base,
             qi,
             queue: QiQueue::new(QI_BYTES as u32)?,
@@ -1202,7 +1209,9 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
     // Complete every fallible allocation before enabling the first unit. If a
     // later unit fails after an earlier unit enabled TE, quarantine all of the
     // pages/queues rather than dropping backing memory still visible to DMA.
-    let enable_error = units.iter_mut().find_map(|unit| unit.enable(root.physical).err());
+    let enable_error = units
+        .iter_mut()
+        .find_map(|unit| unit.enable(root.physical).err());
     if let Some(error) = enable_error {
         error!("vtd: unit enable failed after partial initialization; quarantining DMA tables");
         quarantine_boot_resources(page_table, root, context_tables, units);
@@ -1244,34 +1253,41 @@ struct PlatformDma;
 #[crate_interface::impl_interface]
 impl tk_vtd::PlatformDma for PlatformDma {
     fn pci_dma_allowed() -> bool {
-        matches!(MODE.load(Ordering::Acquire), MODE_IDENTITY | MODE_ENABLED)
+        // UNKNOWN means VT-d initialization was never reached (static ACPI,
+        // missing RSDP, or ACPICA rescue). That path is firmware-style direct
+        // DMA; only a VT-d initialization that explicitly failed may block PCI.
+        pci_dma_allowed_in_mode(MODE.load(Ordering::Acquire))
     }
     fn map(physical: u64, length: usize) -> Result<u64, Error> {
-        match MODE.load(Ordering::Acquire) {
-            MODE_IDENTITY => {
-                if length != 0 && physical.checked_add(length as u64).is_some() {
-                    Ok(physical)
-                } else {
-                    Err(Error::InvalidRange)
-                }
+        let mode = MODE.load(Ordering::Acquire);
+        if identity_dma_in_mode(mode) {
+            if length != 0 && physical.checked_add(length as u64).is_some() {
+                Ok(physical)
+            } else {
+                Err(Error::InvalidRange)
             }
-            MODE_ENABLED => MANAGER
+        } else if mode == MODE_ENABLED {
+            MANAGER
                 .lock()
                 .as_mut()
                 .ok_or(Error::NoDomain)?
-                .map(physical, length),
-            _ => Err(Error::NoDomain),
+                .map(physical, length)
+        } else {
+            Err(Error::NoDomain)
         }
     }
     fn unmap(device_address: u64, length: usize) -> Result<(), Error> {
-        match MODE.load(Ordering::Acquire) {
-            MODE_IDENTITY => Ok(()),
-            MODE_ENABLED => MANAGER
+        let mode = MODE.load(Ordering::Acquire);
+        if identity_dma_in_mode(mode) {
+            Ok(())
+        } else if mode == MODE_ENABLED {
+            MANAGER
                 .lock()
                 .as_mut()
                 .ok_or(Error::NoDomain)?
-                .unmap(device_address, length),
-            _ => Err(Error::NoDomain),
+                .unmap(device_address, length)
+        } else {
+            Err(Error::NoDomain)
         }
     }
 
@@ -1280,28 +1296,28 @@ impl tk_vtd::PlatformDma for PlatformDma {
         physical: u64,
         length: usize,
     ) -> Result<u64, Error> {
-        let result = match MODE.load(Ordering::Acquire) {
-            MODE_IDENTITY => {
-                if length != 0 && physical.checked_add(length as u64).is_some() {
-                    Ok(physical)
-                } else {
-                    Err(Error::InvalidRange)
-                }
+        let mode = MODE.load(Ordering::Acquire);
+        let result = if identity_dma_in_mode(mode) {
+            if length != 0 && physical.checked_add(length as u64).is_some() {
+                Ok(physical)
+            } else {
+                Err(Error::InvalidRange)
             }
-            MODE_ENABLED => {
-                let mut manager = MANAGER.lock();
-                let manager = manager.as_mut().ok_or(Error::NoDomain)?;
-                if REQUESTER_DOMAINS.load(Ordering::Acquire) {
-                    manager.map_for(requester, physical, length)
-                } else {
-                    manager.map(physical, length)
-                }
+        } else if mode == MODE_ENABLED {
+            let mut manager = MANAGER.lock();
+            let manager = manager.as_mut().ok_or(Error::NoDomain)?;
+            if REQUESTER_DOMAINS.load(Ordering::Acquire) {
+                manager.map_for(requester, physical, length)
+            } else {
+                manager.map(physical, length)
             }
-            _ => Err(Error::NoDomain),
+        } else {
+            Err(Error::NoDomain)
         };
         if let Err(error) = result {
             let message = alloc::format!(
-                "THEKERNEL_VTD_REQUESTER_MAP_FAILED requester={:04x}:{:02x}:{:02x}.{} physical={:#x} len={:#x} error={:?}\n",
+                "THEKERNEL_VTD_REQUESTER_MAP_FAILED requester={:04x}:{:02x}:{:02x}.{} \
+                 physical={:#x} len={:#x} error={:?}\n",
                 requester.segment,
                 requester.bus,
                 requester.device,
@@ -1320,18 +1336,19 @@ impl tk_vtd::PlatformDma for PlatformDma {
         device_address: u64,
         length: usize,
     ) -> Result<(), Error> {
-        match MODE.load(Ordering::Acquire) {
-            MODE_IDENTITY => Ok(()),
-            MODE_ENABLED => {
-                let mut manager = MANAGER.lock();
-                let manager = manager.as_mut().ok_or(Error::NoDomain)?;
-                if REQUESTER_DOMAINS.load(Ordering::Acquire) {
-                    manager.unmap_for(requester, device_address, length)
-                } else {
-                    manager.unmap(device_address, length)
-                }
+        let mode = MODE.load(Ordering::Acquire);
+        if identity_dma_in_mode(mode) {
+            Ok(())
+        } else if mode == MODE_ENABLED {
+            let mut manager = MANAGER.lock();
+            let manager = manager.as_mut().ok_or(Error::NoDomain)?;
+            if REQUESTER_DOMAINS.load(Ordering::Acquire) {
+                manager.unmap_for(requester, device_address, length)
+            } else {
+                manager.unmap(device_address, length)
             }
-            _ => Err(Error::NoDomain),
+        } else {
+            Err(Error::NoDomain)
         }
     }
 }
@@ -1347,8 +1364,11 @@ impl tk_vtd::PlatformInterruptRemap for PlatformInterruptRemap {
         if axhal::boot::command_line_value("intremap") != Some("on") {
             return Ok(None);
         }
-        if MODE.load(Ordering::Acquire) != MODE_ENABLED {
-            return Err(Error::NoDomain);
+        match MODE.load(Ordering::Acquire) {
+            MODE_UNKNOWN | MODE_IDENTITY => return Ok(None),
+            MODE_FAILED => return Err(Error::NoDomain),
+            MODE_ENABLED => {}
+            _ => return Err(Error::NoDomain),
         }
         MANAGER
             .lock()
@@ -1374,7 +1394,10 @@ mod tests {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::quarantine_boot_resources;
+    use super::{
+        MODE_ENABLED, MODE_FAILED, MODE_IDENTITY, MODE_UNKNOWN, identity_dma_in_mode,
+        pci_dma_allowed_in_mode, quarantine_boot_resources,
+    };
 
     struct DropProbe(Arc<AtomicUsize>);
     impl Drop for DropProbe {
@@ -1393,5 +1416,17 @@ mod tests {
             DropProbe(drops.clone()),
         );
         assert_eq!(drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unknown_and_identity_modes_keep_pci_dma_direct_but_failure_denies_it() {
+        assert!(pci_dma_allowed_in_mode(MODE_UNKNOWN));
+        assert!(pci_dma_allowed_in_mode(MODE_IDENTITY));
+        assert!(pci_dma_allowed_in_mode(MODE_ENABLED));
+        assert!(!pci_dma_allowed_in_mode(MODE_FAILED));
+        assert!(identity_dma_in_mode(MODE_UNKNOWN));
+        assert!(identity_dma_in_mode(MODE_IDENTITY));
+        assert!(!identity_dma_in_mode(MODE_ENABLED));
+        assert!(!identity_dma_in_mode(MODE_FAILED));
     }
 }
