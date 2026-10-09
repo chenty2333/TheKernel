@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Actual USB keyboard/report arrays, mouse and tablet evdev input via QMP."""
 import argparse
+from contextlib import nullcontext
 from pathlib import Path
 import sys
 import os
@@ -15,6 +16,7 @@ from tools.product_state import state_root, selected_tool_payload
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--hotplug',action='store_true',help='also unplug/replug the keyboard and verify old-fd revocation')
+    parser.add_argument('--workdir',type=Path,help='retain this run in an explicit debugging directory')
     options=parser.parse_args()
     # Match the public CLI normalization before artifact fingerprint validation.
     os.environ["THEKERNEL_TOOLCHAIN"]=selected_tool_payload()
@@ -22,8 +24,10 @@ def main():
     artifacts=product.artifacts_for(args)
     subprocess.run([sys.executable,str(ROOT/'tools/thekernel.py'),'build','--platform','n305','--profile','shell'],cwd=ROOT,check=True)
     runs=state_root()/'runs';runs.mkdir(parents=True,exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='usb-hid-',dir=runs) as directory:
-        directory=Path(directory);commands=directory/'commands'
+    context=(nullcontext(options.workdir.expanduser().resolve()) if options.workdir else
+        tempfile.TemporaryDirectory(prefix='usb-hid-',dir=runs))
+    with context as directory:
+        directory=Path(directory);directory.mkdir(parents=True,exist_ok=True);commands=directory/'commands'
         commands.write_text(('/opt/thekernel-tests/bin/thekernel-usb-input-smoke --hotplug\n\x15' if options.hotplug else '')+
             '/opt/thekernel-tests/bin/thekernel-usb-input-smoke\n\x15poweroff -f\n')
         def key(name,down):return {'type':'key','data':{'down':down,'key':{'type':'qcode','data':name}}}
