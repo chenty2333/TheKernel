@@ -12,7 +12,13 @@ connection-modeset framework machinery.
 
 The mechanism calls `LinkTrainingIo` for DPCD/AUX traffic, source PHY and DDI
 signal-level programming, clocks, delays, HPD, and modeset retry work. The
-display crate owns protocol sequencing and retry policy. No kernel implementation
-of this adapter currently composes it with `dp_aux.rs`, a live DDI/TC PHY, or the
-connector lifecycle, so DisplayPort output is not yet activated by this module.
+display crate owns protocol sequencing and retry policy. The kernel now has
+source-mapped TC1/TC2 AUX D/E transport and power refs plus checked DKL register
+access, but no `LinkTrainingIo` adapter was added: the source's start routine
+blocks/unblocks HPD and can queue retrain/modeset work, while the kernel has no
+TC equivalents. Several source hooks return `()` or a scalar, so an adapter-side
+sticky error alone cannot prevent the translated routine from continuing and
+the caller from accepting a trained link. Keep DP output disabled until a
+checked-run wrapper must inspect a terminal status and real TC HPD/retry hooks
+exist. The MIT grant is in `crates/ax/tk-intel-display/LICENSE-MIT`.
 The MIT grant is in `crates/ax/tk-intel-display/LICENSE-MIT`.
