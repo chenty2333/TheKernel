@@ -679,31 +679,60 @@ fn capture(
     })
 }
 
-/// Firmware PTE pages must be stolen memory outside allocator RAM. The CPU
-/// boot aperture must denote this same GGTT extent, never an unrelated GOP.
+/// Firmware PTE pages must be stolen memory outside allocator RAM. The boot
+/// framebuffer descriptor is only corroboration: the live pipe/plane and its
+/// actual GGTT PTEs are the scanout authority, as in i915 initial-plane setup.
 fn ownership(
     gtt: &Gtt,
     f: &Firmware,
-    boot: &axhal::boot::BootFramebuffer,
+    boot: Option<&axhal::boot::BootFramebuffer>,
     aperture: u64,
     stolen: core::ops::Range<u64>,
     allocatable: &[(u64, u64)],
 ) -> Result<(), Error> {
     let address = u64::from(f.plane.surface_raw & 0xffff_f000);
-    if boot.address != aperture.checked_add(address).ok_or(Error::Refused)?
-        || boot.width != f.plane.width
-        || boot.height != f.plane.height
-        || boot.pitch != f.plane.pitch
-        || boot.bpp != 32
-        || boot.red.position != 16
-        || boot.red.size != 8
-        || boot.green.position != 8
-        || boot.green.size != 8
-        || boot.blue.position != 0
-        || boot.blue.size != 8
-        || address == 0
+    let boot_matches = boot.is_some_and(|boot| {
+        Some(boot.address) == aperture.checked_add(address)
+            && boot.width == f.plane.width
+            && boot.height == f.plane.height
+            && boot.pitch == f.plane.pitch
+            && boot.bpp == 32
+            && boot.red.position == 16
+            && boot.red.size == 8
+            && boot.green.position == 8
+            && boot.green.size == 8
+            && boot.blue.position == 0
+            && boot.blue.size == 8
+            && boot.byte_len().map(|len| len as u64) == Some(f.plane.main_size)
+    });
+    if !boot_matches {
+        if let Some(boot) = boot {
+            axlog::warn!(
+                "intel-fastboot: GOP handoff {}x{} pitch {} at {:#x} differs from live Pipe-A \
+                 scanout {}x{} pitch {} at GGTT {address:#x}; admission uses live plane/PTE \
+                 ownership, and will not map or write the unmatched GOP buffer",
+                boot.width,
+                boot.height,
+                boot.pitch,
+                boot.address,
+                f.plane.width,
+                f.plane.height,
+                f.plane.pitch
+            );
+        } else {
+            axlog::warn!(
+                "intel-fastboot: no GOP framebuffer metadata; admission uses live Pipe-A \
+                 plane/PTE ownership only"
+            );
+        }
+    }
+    if address == 0
         || f.plane.main_size == 0
-        || boot.byte_len().map(|n| n as u64) != Some(f.plane.main_size)
+        || f.plane.main_size
+            < u64::from(f.plane.pitch)
+                .checked_mul(u64::from(f.plane.height))
+                .ok_or(Error::Refused)?
+        || f.plane.main_size.div_ceil(4096) > stolen.end.saturating_sub(stolen.start).div_ceil(4096)
     {
         return Err(Error::Refused);
     }
@@ -2713,7 +2742,7 @@ pub(super) fn init(
         {
             return Err(Error::Refused);
         }
-        let boot = axhal::boot::framebuffer().ok_or(Error::Refused)?;
+        let boot = axhal::boot::framebuffer();
         let aperture = match info.bars[2].kind {
             super::pci::BarKind::Memory { address, .. } if address != 0 => address,
             _ => return Err(Error::Refused),
@@ -2932,7 +2961,7 @@ pub(super) fn init(
             if first.plane.pitch != (first.plane.width * 4).div_ceil(64) * 64 {
                 return Err(Error::Refused);
             }
-            ownership(&gtt, &first, &boot, aperture, stolen, &allocatable)?;
+            ownership(&gtt, &first, boot.as_ref(), aperture, stolen, &allocatable)?;
             let ddc = if port == TcPort::Tc1 {
                 super::gmbus::Pin::Tc1
             } else {
@@ -4017,7 +4046,7 @@ mod tests {
         assert!(pin.verify_dpll_context(&r, TcPort::Tc1, 24_000).is_err());
     }
     #[test]
-    fn ownership_checks_exact_boot_aperture_stolen_pte_and_allocator_exclusion() {
+    fn ownership_uses_live_plane_pte_and_stolen_ranges_not_gop_metadata() {
         let (a, _, array) = native();
         let boot = axhal::boot::BootFramebuffer {
             address: 0xc0200000,
@@ -4038,11 +4067,18 @@ mod tests {
                 size: 8,
             },
         };
+        let different_gop = axhal::boot::BootFramebuffer {
+            address: 0xd0100000,
+            width: 800,
+            height: 600,
+            pitch: 3200,
+            ..boot
+        };
         assert!(
             ownership(
                 &a.gtt,
                 &a.baseline,
-                &boot,
+                Some(&boot),
                 0xc0000000,
                 0x80000000..0x90000000,
                 &[]
@@ -4053,7 +4089,36 @@ mod tests {
             ownership(
                 &a.gtt,
                 &a.baseline,
-                &boot,
+                Some(&different_gop),
+                0xc0000000,
+                0x80000000..0x90000000,
+                &[]
+            )
+            .is_ok(),
+            "a mismatched GOP descriptor is not authoritative over the live pipe/PTE"
+        );
+        assert!(
+            ownership(
+                &a.gtt,
+                &a.baseline,
+                None,
+                0xc0000000,
+                0x80000000..0x90000000,
+                &[]
+            )
+            .is_ok(),
+            "live plane and stolen GGTT pages suffice without GOP metadata"
+        );
+        assert_eq!(
+            array.raw(512),
+            0x80000001,
+            "live scanout PTE remains untouched while ownership is admitted"
+        );
+        assert!(
+            ownership(
+                &a.gtt,
+                &a.baseline,
+                Some(&boot),
                 0xc0000000,
                 0x80000000..0x90000000,
                 &[(0x80001000, 4096)]
@@ -4064,19 +4129,20 @@ mod tests {
             ownership(
                 &a.gtt,
                 &a.baseline,
-                &boot,
-                0xd0000000,
-                0x80000000..0x90000000,
+                Some(&boot),
+                0xc0000000,
+                0x80001000..0x90000000,
                 &[]
             )
-            .is_err()
+            .is_err(),
+            "a live scanout PTE outside stolen memory is never adopted"
         );
         array.write(513, 0x80001003);
         assert!(
             ownership(
                 &a.gtt,
                 &a.baseline,
-                &boot,
+                Some(&boot),
                 0xc0000000,
                 0x80000000..0x90000000,
                 &[]
