@@ -28,7 +28,7 @@ def main():
         tempfile.TemporaryDirectory(prefix='usb-hid-',dir=runs))
     with context as directory:
         directory=Path(directory);directory.mkdir(parents=True,exist_ok=True);commands=directory/'commands'
-        commands.write_text(('/opt/thekernel-tests/bin/thekernel-usb-input-smoke --hotplug\n\x15' if options.hotplug else '')+
+        commands.write_text(('/opt/thekernel-tests/bin/thekernel-usb-input-smoke --hotplug\n\x15dmesg | tail -100\n' if options.hotplug else '')+
             '/opt/thekernel-tests/bin/thekernel-usb-input-smoke\n\x15poweroff -f\n')
         def key(name,down):return {'type':'key','data':{'down':down,'key':{'type':'qcode','data':name}}}
         batches=(
