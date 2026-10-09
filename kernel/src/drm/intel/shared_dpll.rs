@@ -381,6 +381,11 @@ fn verify_adln_pin_map(port: dpll::TcPort) -> Result<(), DpllFailure> {
     let mut pwa = 0;
     for group in map {
         for instance in group.instances.iter().copied() {
+            // PW_1 is an always-on source-map well, but the pin still proves
+            // its request/state bits; do not omit it from the topology proof.
+            if instance.control == Some(WellControl::IclPw1) {
+                pw1 += 1;
+            }
             if instance.always_on {
                 continue;
             }
@@ -405,9 +410,6 @@ fn verify_adln_pin_map(port: dpll::TcPort) -> Result<(), DpllFailure> {
                     (WellOps::Aux, Some(control)) if control == aux_control => aux_controller += 1,
                     _ => return Err(DpllFailure::UnsupportedRegister),
                 }
-            }
-            if instance.control == Some(WellControl::IclPw1) {
-                pw1 += 1;
             }
             if instance.control == Some(WellControl::XelpdPwA) {
                 pwa += 1;
@@ -506,7 +508,9 @@ impl SharedDpllState {
         &mut self,
         value: Option<u8>,
     ) -> Result<(), DpllFailure> {
-        self.ensure_usable()?;
+        if self.quarantined {
+            return Err(DpllFailure::Quarantined);
+        }
         if self.initialized || value.is_some_and(|value| value > 7) {
             return Err(DpllFailure::InvalidAfcStartup);
         }

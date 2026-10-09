@@ -182,7 +182,7 @@ mod tests {
         disable_pipe(&regs, Pipe::A, &[0]).expect("all dependent blocks should disable");
 
         let writes = regs.writes();
-        assert_eq!(writes[0].0, "PLANE_CTL_MULTI_1");
+        assert_eq!(writes[0].0, "PLANE_CTL_MULTI");
         assert_eq!(writes[1].0, "PS_CTRL");
         assert_eq!(writes[2].0, "PS_WIN_POS");
         assert_eq!(writes[3].0, "PS_WIN_SZ");

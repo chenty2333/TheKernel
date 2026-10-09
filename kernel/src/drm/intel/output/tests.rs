@@ -564,9 +564,9 @@ fn the_swing_writes_reach_the_per_lane_registers_in_lane_order() {
             ("PORT_TX_DW2_LN2(A)", swing.dw2[2]),
             ("PORT_TX_DW2_LN3(A)", swing.dw2[3]),
             ("PORT_TX_DW4_LN0(A)", swing.dw4[0]),
-            ("PORT_TX_DW4_LN1(A)", swing.dw4[1]),
-            ("PORT_TX_DW4_LN2(A)", swing.dw4[2]),
-            ("PORT_TX_DW4_LN3(A)", swing.dw4[3]),
+            ("PORT_TX_DW4_LN1(A)", swing.dw4[1] | (1 << 31)),
+            ("PORT_TX_DW4_LN2(A)", swing.dw4[2] | (1 << 31)),
+            ("PORT_TX_DW4_LN3(A)", swing.dw4[3] | (1 << 31)),
             ("PORT_TX_DW7_LN0(A)", swing.dw7[0]),
             ("PORT_TX_DW7_LN1(A)", swing.dw7[1]),
             ("PORT_TX_DW7_LN2(A)", swing.dw7[2]),
@@ -606,7 +606,8 @@ fn a_lane_write_is_not_visible_at_another_lanes_address() {
     for (register, value) in lanes.dw2.iter().zip(swing.dw2) {
         assert_eq!(regs.read(*register), Some(value), "{}", register.name());
     }
-    for (register, value) in lanes.dw4.iter().zip(swing.dw4) {
+    for (lane, (register, value)) in lanes.dw4.iter().zip(swing.dw4).enumerate() {
+        let value = value | if lane == 0 { 0 } else { 1 << 31 }; // LOADGEN_SELECT
         assert_eq!(regs.read(*register), Some(value), "{}", register.name());
     }
     for (register, value) in lanes.dw7.iter().zip(swing.dw7) {
@@ -1838,6 +1839,6 @@ fn dvi_differs_from_hdmi_only_in_the_mode_select_and_has_no_named_table() {
     assert_eq!(dvi_plan.trans_clk_sel, hdmi_plan.trans_clk_sel);
     assert_eq!(dvi_plan.transconf, hdmi_plan.transconf);
 
-    assert_eq!(dvi_plan.swing.source, "icl_combo_phy_trans_hdmi");
-    assert_eq!(dvi_plan.swing.level, 6);
+    assert_eq!(dvi_plan.swing.source, test_swing().source);
+    assert_eq!(dvi_plan.swing.level, test_swing().level);
 }

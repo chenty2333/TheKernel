@@ -1,10 +1,9 @@
 //! Hardware callback contract for the translated Native atomic commit tail.
 //!
-//! The checked pipe projection and register-writer wrappers live here, but
-//! this is not yet a complete atomic dispatcher/backend: the opt-in selector
-//! remains fail-closed until every callback is backed by power ownership,
-//! readback, and rollback. Keeping callbacks explicit prevents a generic
-//! commit-tail action from being reported as successful by an empty hook.
+//! The checked pipe projection and register-writer wrappers live here. The
+//! opt-in single-pipe TC dispatcher supplies the commit-tail callbacks with
+//! explicit power ownership, readback and reverse-order rollback; unsupported
+//! topology is still refused before writes.
 
 use intel_display::intel_display_modeset_full::{
     EncoderTransition, PipeState, PipeTransition, PlaneTransition,

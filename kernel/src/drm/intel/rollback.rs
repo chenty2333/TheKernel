@@ -133,8 +133,11 @@ fn policy(register: Register) -> (Class, u32) {
         return (Class::Transient, u32::MAX);
     }
     if [
+        regs::HSW_PWR_WELL_CTL1,
         regs::HSW_PWR_WELL_CTL2,
+        regs::ICL_PWR_WELL_CTL_AUX1,
         regs::ICL_PWR_WELL_CTL_AUX2,
+        regs::ICL_PWR_WELL_CTL_DDI1,
         regs::ICL_PWR_WELL_CTL_DDI2,
     ]
     .contains(&register)
@@ -198,8 +201,11 @@ fn masked_write(device: &impl Registers, reg: Register, value: u32) -> Result<()
         payload &= !0x3333;
     }
     if [
+        regs::HSW_PWR_WELL_CTL1,
         regs::HSW_PWR_WELL_CTL2,
+        regs::ICL_PWR_WELL_CTL_AUX1,
         regs::ICL_PWR_WELL_CTL_AUX2,
+        regs::ICL_PWR_WELL_CTL_DDI1,
         regs::ICL_PWR_WELL_CTL_DDI2,
     ]
     .contains(&reg)
@@ -700,7 +706,8 @@ impl<'a, R: Registers> Transaction<'a, R> {
         wait(self.device, timer, p::PIPECONF_A, RUNNING, RUNNING)?;
         masked_write(self.device, p::PLANE_CTL_A, self.saved(p::PLANE_CTL_A)?)?;
         masked_write(self.device, p::PLANE_SURF_A, self.saved(p::PLANE_SURF_A)?)?;
-        // Withdraw only driver-owned requests/policies, never BIOS/debug/KVMR.
+        // Restore BIOS handoff requests before withdrawing their paired driver requests.
+        // Debug/KVMR requestors are never modified.
         // DC policy last, after all requested wells and DBUF are reinstated.
         for &reg in journal.touched.iter().rev() {
             if policy(reg).0 == Class::Power && reg != regs::DC_STATE_EN {
@@ -747,6 +754,40 @@ impl<R: Registers> Registers for Transaction<'_, R> {
     }
     fn write(&self, reg: Register, value: u32) -> bool {
         let mut journal = self.journal.lock();
+        // Read-only PCode queries use transient mailbox/data commands. Never
+        // journal/replay them as configuration, and never admit a CDCLK write
+        // through this seam (clock changes have their own undo owner).
+        if [
+            regs::pcode::GEN6_PCODE_MAILBOX,
+            regs::pcode::GEN6_PCODE_DATA,
+            regs::pcode::GEN6_PCODE_DATA1,
+        ]
+        .contains(&reg)
+        {
+            use intel_display::intel_pcode_full as pc;
+            let permitted = if reg == regs::pcode::GEN6_PCODE_MAILBOX {
+                value == pc::GEN6_PCODE_READY | pc::GEN9_PCODE_READ_MEM_LATENCY
+                    || value == pc::GEN6_PCODE_READY | pc::GEN12_PCODE_READ_SAGV_BLOCK_TIME_US
+            } else if reg == regs::pcode::GEN6_PCODE_DATA {
+                value <= 1
+            } else {
+                value == 0
+            };
+            if journal.failed || !permitted {
+                journal.failed = true;
+                return false;
+            }
+            journal.attempts += 1;
+            if journal.fail_at == Some(journal.attempts) {
+                journal.failed = true;
+                return false;
+            }
+            let result = self.device.write(reg, value);
+            if !result {
+                journal.failed = true;
+            }
+            return result;
+        }
         let other_pll = if self.pll_id == 0 {
             [pll::DPLL1_ENABLE, pll::DPLL1_CFGCR0, pll::DPLL1_CFGCR1]
         } else {

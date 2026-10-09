@@ -1493,7 +1493,7 @@ fn a_mode_above_the_cdclk_ceiling_gives_way_to_the_reference_timing() {
 }
 
 #[test]
-fn without_swing_values_the_sequence_refuses_before_any_write() {
+fn without_swing_override_the_sequence_uses_the_source_table() {
     let _guard = scheduler_test_context();
     // §8.5's HDMI translation values are a `[GAP]`; `output::plan` refuses
     // rather than inventing them, and the refusal happens before the first
@@ -1509,15 +1509,10 @@ fn without_swing_values_the_sequence_refuses_before_any_write() {
         &surface,
         PllFieldEncoding::Named,
     );
-    let result = set_mode(&regs, &FakeClock::new(), &bare);
-    let Err(error) = result else {
-        panic!("without swing values the output cannot be planned")
-    };
-    assert!(matches!(error, ModesetError::Output(_)), "{error:?}");
-    assert!(regs.writes().is_empty(), "computing first means no writes");
-    // The framebuffer is already the pattern, though: the fill precedes the
-    // computation, and a caller that fixes the gap and runs again gets the
-    // same frame rather than a stale one.
+    let outcome = set_mode(&regs, &FakeClock::new(), &bare)
+        .expect("the translated platform table supplies the default swing");
+    assert_eq!(outcome.mode.clock_khz, 148_500);
+    assert!(!regs.writes().is_empty());
     assert_eq!(top_right_pixel(&surface), top_right_expected());
 }
 
@@ -1700,6 +1695,8 @@ impl Registers for FailOneWrite<'_> {
 }
 fn boot_firmware_device() -> (MockRegisters, Rc<Cell<u32>>) {
     let (r, live) = working_device(7);
+    r.on_read(regs::pcode::GEN6_PCODE_MAILBOX, |_| 0);
+    r.on_read(regs::pcode::GEN6_PCODE_DATA, |_| 0x04040405);
     let lines = Cell::new(0u32);
     r.on_read(PIPEDSL_A, move |_| {
         lines.set((lines.get() + 7) % 600);
@@ -1795,6 +1792,7 @@ fn boot_firmware_device() -> (MockRegisters, Rc<Cell<u32>>) {
     // withdrawn without faking loss of the firmware's global power references.
     let well_states = power::well_state(power::PW_1.index) | power::well_state(power::PW_A.index);
     r.set(regs::HSW_PWR_WELL_CTL1, well_states | (well_states << 1));
+    r.derive(regs::HSW_PWR_WELL_CTL1, move |v| v | well_states);
     r.set(regs::HSW_PWR_WELL_CTL2, well_states);
     r.derive(regs::HSW_PWR_WELL_CTL2, move |v| v | well_states);
     for reg in [
@@ -1985,4 +1983,19 @@ fn firmware_phy_recalibration_and_foreign_state_writes_are_not_admitted() {
     let tx = Transaction::begin(&regs, &FakeClock::new()).unwrap();
     assert!(!tx.write(regs::dpll::DPLL1_ENABLE, 0));
     assert!(regs.writes().is_empty());
+}
+
+#[test]
+fn boot_transaction_admits_only_read_only_pcode_queries() {
+    use super::super::{pcode, rollback::Transaction};
+    let (regs, _) = boot_firmware_device();
+    let timer = FakeClock::new();
+    let tx = Transaction::begin(&regs, &timer).unwrap();
+    assert_eq!(pcode::read_wm_latency(&tx, &timer, 0).unwrap(), 0x04040405);
+    assert_eq!(pcode::read_wm_latency(&tx, &timer, 1).unwrap(), 0x04040405);
+    assert_eq!(
+        pcode::read_sagv_block_time_us(&tx, &timer).unwrap(),
+        0x04040405
+    );
+    assert!(pcode::prepare_cdclk_change(&tx, &timer).is_err());
 }

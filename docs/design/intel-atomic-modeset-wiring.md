@@ -9,15 +9,20 @@ Unsupported source actions are classified as owned by the indivisible
 `tc_modeset::program` transaction or refused; the classifier never converts a
 missing callback into success.
 
-This projection is wired before the actual fastboot mode-change transaction and
-is validated by `cargo check -p tk-kernel --tests --features 'intel-hda nvme
-watchdog-itco bpf'`. It is only an admission preflight. It does not call
-`intel_crtc_atomic_check`, `intel_atomic_check`, `hsw_crtc_enable`,
-`hsw_crtc_disable`, or `intel_atomic_commit_tail`, and it does not perform
-register writes. The old transactional TC path remains the only writer. Full
-atomic orchestration still needs exact callback implementations for DMC,
-CDCLK, shared DPLL, DDI/DP training, color, WM/DBUF, DSB, and rollback before
-that path can safely be replaced.
+The projection remains a pure preflight. The default TC transaction is
+unchanged. With `intel.native_modeset=1`, `present()` reuses its GGTT preparation
+and runs `run_native_commit_tail`: disable, pre-plane CDCLK, shared DPLL,
+encoder pre-enable, CRTC/encoder enable, primary-plane update, post-plane
+CDCLK/readback, then power put. The adapter remains single Pipe-A/TC1/TC2,
+linear XRGB8888/RGB565 and canonical VIC 16/95. It does not implement the full
+upstream all-output dispatcher.
+
+Failure unwinds attempted phases in reverse order (including partially
+executed callbacks), releases the stopped CRTC's DPLL reservation, unpins the
+candidate only after DMA quiescence, then puts the nested power lease. An
+uncertain stop retains the candidate binding. No failure retries the legacy
+writer. The persistent firmware-preserving power pin remains held, so the
+nested lease cannot power down the current route or enter DC states.
 
 ## 剩余工作
 

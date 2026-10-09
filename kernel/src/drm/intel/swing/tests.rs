@@ -632,14 +632,10 @@ fn the_read_back_program_unblocks_phase_five() {
         .mode;
     let request =
         crate::drm::intel::output::OutputRequest::hdmi(Ddi::A, mode, PllFieldEncoding::Named);
-    // Without the read the plan is refused, naming the gap; that is the
-    // deliberate refusal this module exists to satisfy.
-    let refusal = crate::drm::intel::output::OutputProgram::plan(&request, 38_400)
-        .expect_err("no swing values, no plan");
-    assert!(matches!(
-        refusal,
-        crate::drm::intel::output::OutputError::MissingBufferTranslation { .. }
-    ));
+    // The source table now supplies a default; the readback is an explicit
+    // firmware swing override rather than the only way to obtain a plan.
+    crate::drm::intel::output::OutputProgram::plan(&request, 38_400)
+        .expect("translated platform default is available");
 
     let request = request.with_swing(swing);
     let plan = crate::drm::intel::output::OutputProgram::plan(&request, 38_400)

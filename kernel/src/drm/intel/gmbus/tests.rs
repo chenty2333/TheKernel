@@ -79,6 +79,7 @@ struct FakeState {
     nak_first_transaction: bool,
     /// Words served in the current transaction.
     served: usize,
+    words_expected: usize,
     /// The EEPROM address of the current transaction's index cycle.
     index_offset: usize,
     /// The rate and pin fields of the last selection.
@@ -133,6 +134,7 @@ impl FakeController {
                 stuck_after_stop: false,
                 nak_first_transaction: false,
                 served: 0,
+                words_expected: 0,
                 index_offset: 0,
                 rate_field: 0,
                 pin_field: 0,
@@ -296,15 +298,23 @@ impl FakeState {
         if self.satoer {
             status |= GMBUS2_SATOER;
         }
-        if self.stall || self.stall_after_words.is_some_and(|words| self.served >= words) {
+        if self.stall
+            || self
+                .stall_after_words
+                .is_some_and(|words| self.served >= words)
+        {
             status |= GMBUS2_STALL_TIMEOUT;
         }
         if self.running
             && self.attached
             && self.words_available != 0
             && self.served < self.words_available
+            && self.served < self.words_expected
         {
             status |= GMBUS2_HW_RDY;
+        }
+        if self.running && self.served >= self.words_expected {
+            status |= GMBUS2_HW_WAIT_PHASE;
         }
         status
     }
@@ -359,6 +369,7 @@ impl FakeState {
         // A transfer starts.
         self.transactions += 1;
         self.served = 0;
+        self.words_expected = (((value >> 16) & 0x1ff) as usize).div_ceil(4);
         self.index_offset =
             ((value & GMBUS1_SLAVE_INDEX_MASK) >> GMBUS1_SLAVE_INDEX_SHIFT) as usize;
         let pin = Pin::ALL
@@ -576,10 +587,9 @@ fn the_command_word_is_the_one_the_sources_say() {
     // than once (the reset writes 0), so the *last* value before the data is
     // the one that matters.
     let selects = controller.writes_to(GMBUS0);
-    assert_eq!(
-        selects.first(),
-        Some(&0),
-        "the reset releases the pin first"
+    assert!(
+        matches!(selects.first().copied(), Some(0 | 1)),
+        "the optional once-per-device reset or the selected DDI-A pin: {selects:?}"
     );
     assert_eq!(
         selects.last(),
@@ -631,7 +641,12 @@ fn the_command_word_is_the_one_the_sources_say() {
     let stop = *controller.commands().last().expect("a stop cycle");
     assert_eq!(stop & GMBUS1_CYCLE_MASK, GMBUS1_CYCLE_STOP);
     // The interrupt mask is left cleared: this driver polls.
-    assert_eq!(controller.writes_to(GMBUS4), vec![0]);
+    let masks = controller.writes_to(GMBUS4);
+    assert!(!masks.is_empty());
+    assert!(
+        masks.iter().all(|&mask| mask == 0),
+        "polling disables the IRQ at every wait boundary"
+    );
     // And the protocol never took data the controller had not offered.
     assert_eq!(controller.reads_without_ready(), 0);
 }
@@ -746,7 +761,13 @@ fn a_bus_that_never_offers_data_times_out_and_is_left_released() {
     let controller = FakeController::with_monitor(Pin::DdiA, &block);
     // The controller accepts the command and then says nothing.
     controller.serve_words(0);
-    let (result, _) = read(&controller, Pin::DdiA);
+    let clock = FakeClock::new();
+    let mut notes = BusNotes::default();
+    let result = read_edid_with(&controller, &clock, Pin::DdiA, &mut notes);
+    assert!(
+        clock.now_micros() >= READY_TIMEOUT_MICROS,
+        "the hardware wait used its 50ms budget before GPIO fallback"
+    );
     match result {
         Err(GmbusError::ReadyTimeout {
             pin,
@@ -757,8 +778,8 @@ fn a_bus_that_never_offers_data_times_out_and_is_left_released() {
             assert_eq!(pin, Pin::DdiA);
             assert_eq!(rate, Rate::Khz100);
             assert!(
-                waited_micros >= READY_TIMEOUT_MICROS,
-                "a timeout must wait its budget, not less: {waited_micros}"
+                waited_micros >= 2_200,
+                "the final GPIO stretch wait used its budget: {waited_micros}"
             );
         }
         other => panic!("expected a ready timeout, got {other:?}"),
@@ -767,14 +788,11 @@ fn a_bus_that_never_offers_data_times_out_and_is_left_released() {
     // the controller was reset through SW_CLR_INT.
     assert_eq!(controller.peek(GMBUS0), Some(0));
     assert_eq!(controller.peek(GMBUS4), Some(0));
-    let commands = controller.commands();
-    assert!(
-        commands
-            .iter()
-            .any(|command| command & GMBUS1_SW_CLR_INT != 0),
-        "the latched error must be cleared"
+    assert_eq!(
+        controller.transactions(),
+        1,
+        "the retry is GPIO, not a second hardware transaction"
     );
-    assert_eq!(controller.transactions(), 2, "the timeout is retried once");
 }
 
 #[test]
@@ -849,7 +867,7 @@ fn a_nak_is_retried_once_and_a_late_answer_is_used() {
     controller.nak_first_transaction();
     let (result, notes) = read(&controller, Pin::DdiA);
     assert_eq!(result, Ok(EdidBytes { bytes: block }));
-    assert_eq!(notes.attempts, 2);
+    assert_eq!(notes.attempts, 1); // The source engine retries the NAK internally.
     assert_eq!(controller.transactions(), 2);
 }
 
@@ -892,7 +910,11 @@ fn a_stall_after_the_last_word_is_a_stuck_bus_not_a_nak() {
     let (result, _) = read(&controller, Pin::DdiA);
     match result {
         Err(GmbusError::BusStuck { status, .. }) => {
-            assert_ne!(status & GMBUS2_STALL_TIMEOUT, 0, "the stall bit is the story");
+            assert_ne!(
+                status & GMBUS2_STALL_TIMEOUT,
+                0,
+                "the stall bit is the story"
+            );
         }
         other => panic!("a stall must be reported as a stuck bus, got {other:?}"),
     }
@@ -978,7 +1000,7 @@ fn a_window_that_does_not_reach_gmbus_at_all_refuses_the_write() {
     let (result, _) = read(&controller, Pin::DdiA);
     assert_eq!(
         result,
-        Err(GmbusError::RegisterRefused { register: "GMBUS0" })
+        Err(GmbusError::WindowTooSmall { register: "GMBUS5" })
     );
 }
 

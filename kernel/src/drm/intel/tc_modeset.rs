@@ -257,6 +257,7 @@ pub(super) trait DpllLifecycle {
     fn disable(&mut self) -> Result<(), String>;
     fn enable(&mut self) -> Result<(), String>;
     fn rollback_new(&mut self) -> Result<(), String>;
+    fn release_new(&mut self) -> Result<(), String>;
 }
 
 /// CDCLK is shared by every display pipe. The Native caller may change it
@@ -1730,7 +1731,7 @@ impl<R: Registers + Send + Sync, T: PollTimer> super::native_modeset_ops::Native
                 // Prove DMA quiescence even when the initial disable failed.
                 if !*self.writes {
                     self.stopped = true;
-                    return Ok(());
+                    return self.dpll.release_new();
                 }
                 write(
                     self.r,
@@ -1752,9 +1753,11 @@ impl<R: Registers + Send + Sync, T: PollTimer> super::native_modeset_ops::Native
                     100_000,
                 )?;
                 self.stopped = true;
-                disable_tc_hdmi_encoder(self.r, self.timer, self.port)?;
-                disable_pipe_a_transcoder(self.r)?;
-                post_disable_tc_hdmi_encoder(self.r, self.port)
+                let encoder = disable_tc_hdmi_encoder(self.r, self.timer, self.port)
+                    .and_then(|()| disable_pipe_a_transcoder(self.r))
+                    .and_then(|()| post_disable_tc_hdmi_encoder(self.r, self.port));
+                let reservation = self.dpll.release_new();
+                encoder.and(reservation)
             }
             P::CdclkPostPlane => Ok(()), // Readback only, no resource acquired.
         }

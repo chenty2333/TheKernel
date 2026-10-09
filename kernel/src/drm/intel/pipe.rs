@@ -1008,8 +1008,12 @@ impl WatermarkProgram {
         {
             minimum = minimum.max(u32::from(level.min_ddb_alloc));
         }
+        // Unknown SAGV block time disables the source SAGV WM with the
+        // U16_MAX sentinel; it is not a demand for 65535 DDB blocks.
         for level in [source.trans_wm, source.sagv_wm0, source.sagv_trans_wm] {
-            minimum = minimum.max(u32::from(level.min_ddb_alloc));
+            if level.enable {
+                minimum = minimum.max(u32::from(level.min_ddb_alloc));
+            }
         }
         if minimum == u32::from(u16::MAX) {
             return Err(PipeError::Watermark(-22));
@@ -2580,6 +2584,7 @@ pub(crate) fn arm(regs: &impl Registers, plan: &PipeProgram) -> Result<ArmState,
 #[cfg(test)]
 mod multi_plane_plan_tests {
     use alloc::vec;
+
     use super::*;
     use crate::drm::modes::CTA_VIC_TIMINGS;
 
@@ -2607,10 +2612,11 @@ mod multi_plane_plan_tests {
             .expect("pipe timing and per-pipe configuration should be writable");
 
         let writes = regs.writes();
-        assert_eq!(writes.len(), 2 + 7);
+        assert_eq!(writes.len(), 2 + 8);
         assert_eq!(writes[0].0, "PIPE_MISC_B");
         assert_eq!(writes[1].0, "PIPE_ARB_CTL_B");
-        assert_eq!(writes[2].0, "TRANS_HTOTAL_B");
+        assert_eq!(writes[2].0, "TRANS_SET_CONTEXT_LATENCY(B)");
+        assert_eq!(writes[3].0, "TRANS_HTOTAL(B)");
         assert_eq!(writes.last().unwrap().0, "PIPESRC_B");
         assert!(writes.iter().all(|(name, _)| {
             !name.contains("PLANE") && !name.contains("WM") && !name.contains("BUF_CFG")
@@ -2730,7 +2736,7 @@ mod multi_plane_plan_tests {
             .iter()
             .position(|(name, _)| *name == "PLANE_CTL_MULTI")
             .expect("first control arm is present");
-        assert_eq!(second_arm, 20);
+        assert_eq!(second_arm, 30); // Per-plane shadow plus six levels, transition and SAGV.
         assert!(
             writes[..second_arm]
                 .iter()
@@ -2758,10 +2764,11 @@ mod multi_plane_plan_tests {
         let (_ddb, arm) = prepare_multi_plane_scanout(&regs, Pipe::A, &mode, &scanouts, config())
             .expect("shadow state must be prepared before CRTC enable");
 
-        assert!(regs
-            .writes()
-            .iter()
-            .all(|(name, _)| *name != "PLANE_CTL_MULTI" && *name != "PLANE_SURF_MULTI"));
+        assert!(
+            regs.writes()
+                .iter()
+                .all(|(name, _)| *name != "PLANE_CTL_MULTI" && *name != "PLANE_SURF_MULTI")
+        );
         arm_multi_plane_scanout(&regs, &arm).expect("plane arms should be a distinct phase");
         let writes = regs.writes();
         let first = writes

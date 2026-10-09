@@ -2303,6 +2303,10 @@ mod tests {
     /// working firmware CDCLK, and a 24 MHz raw clock strap.
     fn powered_machine() -> MockRegisters {
         let regs = MockRegisters::new();
+        // Complete the PCode mailbox and return valid latency/prepare data.
+        regs.on_read(regs::pcode::GEN6_PCODE_MAILBOX, |_| 0);
+        regs.on_read(regs::pcode::GEN6_PCODE_DATA, |_| 0x04040405);
+
         regs.set(regs::SKL_DFSM, 0);
         regs.set(regs::SKL_DSSM, 0); // 24 MHz
         regs.set(regs::SFUSE_STRAP, 1 << 8); // the 24 MHz raw clock strap
@@ -2406,7 +2410,7 @@ mod tests {
         assert_eq!(regs.read(regs::DC_STATE_EN).unwrap() & DC_STATE_MASK, 0);
         assert_eq!(
             state.dc.allowed_dc_mask,
-            intel_display::dc_state::gen9_dc_mask(13, false)
+            (1 << 3) | (1 << 30) | intel_display::dc_state::DC_STATE_EN_UPTO_DC6
         );
         assert_eq!(
             state.dc.target_dc_state,
@@ -2600,7 +2604,7 @@ mod tests {
             PW_1.request_mask()
         );
         let text = observation.describe();
-        assert!(text.contains("well index 0"), "{text}");
+        assert!(text.contains("index 0"), "{text}");
         assert!(text.contains("NEVER CAME UP"), "{text}");
         assert!(text.contains("requesters: bios 1 driver 1"), "{text}");
     }

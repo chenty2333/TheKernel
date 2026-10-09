@@ -899,10 +899,28 @@ pub(crate) struct MonotonicTimer;
 
 impl PollTimer for MonotonicTimer {
     fn now_micros(&self) -> u64 {
-        axhal::time::monotonic_time_nanos() / 1_000
+        #[cfg(test)]
+        {
+            extern crate std;
+            static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            START
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_micros() as u64
+        }
+        #[cfg(not(test))]
+        {
+            axhal::time::monotonic_time_nanos() / 1_000
+        }
     }
 
     fn pause(&self) {
+        #[cfg(test)]
+        {
+            extern crate std;
+            std::thread::yield_now();
+        }
+        #[cfg(not(test))]
         axhal::time::busy_wait(core::time::Duration::from_micros(POLL_INTERVAL_MICROS));
     }
 }
@@ -1351,6 +1369,9 @@ fn read_block_once<R: Registers, T: PollTimer>(
     notes.was_in_use |= transfer.was_in_use;
     notes.stale_two_byte_index |= transfer.stale_two_byte_index;
     notes.force_bitbang = transfer.force_bit & (1 << 31) != 0;
+    if let Some(error) = transfer.io_failure {
+        return Err(error);
+    }
     match transfer.result {
         Ok(2) => {}
         Ok(_) => {
@@ -1358,7 +1379,7 @@ fn read_block_once<R: Registers, T: PollTimer>(
                 pin,
                 rate,
                 status: transfer.last_status,
-                waited_micros: 0,
+                waited_micros: transfer.elapsed_micros,
             });
         }
         Err(source::GmbusError::NoDevice | source::GmbusError::Power) => {
@@ -1389,19 +1410,19 @@ fn read_block_once<R: Registers, T: PollTimer>(
         Err(source::GmbusError::Timeout | source::GmbusError::Again) => {
             return Err(
                 if terminal_outcome(transfer.last_status) == WaitOutcome::Stalled
-                    || transfer.last_status & GMBUS2_ACTIVE != 0
+                    || transfer.idle_timeout
                 {
                     GmbusError::BusStuck {
                         pin,
                         status: transfer.last_status,
-                        waited_micros: 0,
+                        waited_micros: transfer.elapsed_micros,
                     }
                 } else {
                     GmbusError::ReadyTimeout {
                         pin,
                         rate,
                         status: transfer.last_status,
-                        waited_micros: 0,
+                        waited_micros: transfer.elapsed_micros,
                     }
                 },
             );

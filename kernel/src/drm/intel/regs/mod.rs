@@ -50,8 +50,8 @@ pub(crate) mod aux;
 pub(crate) mod ddi;
 pub(crate) mod dpll;
 pub(crate) mod interrupt;
-pub(crate) mod pipe;
 pub(crate) mod pcode;
+pub(crate) mod pipe;
 pub(crate) mod port;
 pub(crate) mod table;
 
@@ -645,12 +645,12 @@ pub(crate) const SKL_FUSE_STATUS: Register =
 
 /// `HSW_PWR_WELL_CTL1`, the firmware's power well request register.
 ///
-/// Read-only here, and read only to diagnose a well that will not come up: the
-/// four request registers are OR-ed by hardware, so a well that stays off while
+/// Writable for the source BIOS-to-driver handoff in hsw_power_well_sync_hw.
+/// The four request registers are OR-ed by hardware, so a well that stays off while
 /// this one has its request bit set was requested by the firmware all along.
 /// Reference §4.2; `[I915]` `i915_reg.h:3626`.
 pub(crate) const HSW_PWR_WELL_CTL1: Register =
-    Register::read_only("HSW_PWR_WELL_CTL1", 0x4_5400, Meaning::PowerWell, None);
+    Register::read_write("HSW_PWR_WELL_CTL1", 0x4_5400, Meaning::PowerWell, None);
 
 /// `HSW_PWR_WELL_CTL2`, the driver's power well request register.
 ///
@@ -1480,6 +1480,7 @@ mod tests {
         assert_eq!(
             writable,
             vec![
+                "HSW_PWR_WELL_CTL1",
                 "HSW_PWR_WELL_CTL2",
                 "ICL_PWR_WELL_CTL_AUX2",
                 "ICL_PWR_WELL_CTL_AUX1",
@@ -1545,9 +1546,10 @@ mod tests {
                 "SKL_DSSM",
                 "SFUSE_STRAP",
                 "SKL_FUSE_STATUS",
-                "HSW_PWR_WELL_CTL1",
                 "HSW_PWR_WELL_CTL3",
                 "HSW_PWR_WELL_CTL4",
+                "ICL_PWR_WELL_CTL_AUX4",
+                "ICL_PWR_WELL_CTL_DDI4",
                 "PORT_COMP_DW3(A)",
                 "PORT_TX_DW8_LN0(A)",
                 "PORT_PCS_DW1_LN0(A)",
@@ -1705,6 +1707,18 @@ mod tests {
                 "DP_AUX_CH_DATA(B,2)",
                 "DP_AUX_CH_DATA(B,3)",
                 "DP_AUX_CH_DATA(B,4)",
+                "DP_AUX_CH_CTL(D)",
+                "DP_AUX_CH_DATA(D,0)",
+                "DP_AUX_CH_DATA(D,1)",
+                "DP_AUX_CH_DATA(D,2)",
+                "DP_AUX_CH_DATA(D,3)",
+                "DP_AUX_CH_DATA(D,4)",
+                "DP_AUX_CH_CTL(E)",
+                "DP_AUX_CH_DATA(E,0)",
+                "DP_AUX_CH_DATA(E,1)",
+                "DP_AUX_CH_DATA(E,2)",
+                "DP_AUX_CH_DATA(E,3)",
+                "DP_AUX_CH_DATA(E,4)",
                 "GMBUS0",           // pin select and rate
                 "GMBUS1",           // the transaction itself
                 "GMBUS3",           // transmit/receive bytes

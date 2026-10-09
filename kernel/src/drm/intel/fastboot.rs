@@ -911,7 +911,16 @@ impl intel_display::intel_modeset_verify_full::ModesetVerifyIo for NativeModeset
         &mut self,
         _connector: &intel_display::intel_modeset_verify_full::Connector,
     ) -> bool {
-        self.connected && self.firmware.ddi.enabled
+        self.connected
+            && self.firmware.ddi.enabled
+            && self.firmware.ddi.mode == intel_display::ddi::DdiMode::Hdmi
+            && self.firmware.ddi.port
+                == Some(match self.port {
+                    TcPort::Tc1 => Port::Tc1,
+                    TcPort::Tc2 => Port::Tc2,
+                    TcPort::Tc3 => Port::Tc3,
+                    TcPort::Tc4 => Port::Tc4,
+                })
     }
 
     fn attached_encoder(
@@ -1017,7 +1026,15 @@ impl<R: Registers, T: PollTimer> super::tc_modeset::DpllLifecycle
         .map_err(|e| format!("native PLL rollback power: {e:?}"))?;
         self.manager
             .disable(self.registers, self.timer, &mut power, &self.new)
-            .map_err(|e| format!("native PLL rollback disable: {e:?}"))?;
+            .map_err(|e| format!("native PLL rollback disable: {e:?}"))
+    }
+    fn release_new(&mut self) -> Result<(), String> {
+        let mut power = super::shared_dpll::PinnedDpllPower::new(
+            self.power_pin,
+            self.identity,
+            self.refclk_khz,
+        )
+        .map_err(|e| format!("native PLL release power: {e:?}"))?;
         self.manager
             .release_stopped_tc(self.registers, self.timer, &mut power)
             .map_err(|e| format!("native PLL rollback release: {e:?}"))
@@ -3233,7 +3250,12 @@ mod tests {
                 (0x46140, 6 << 28),
                 (0x164280, 0),
                 (0x51004, 0),
+                (0x46010, 0),
+                (0x46014, 0),
+                (0x46020, 0),
                 (0x46038, 0xcc000000),
+                (0x46070, (1 << 31) | (1 << 30) | 22),
+                (0x46000, (1 << 22) | (7 << 19) | 350),
                 (0x1010a0, 0x44332211),
                 (0x60200, 1 << 12),
                 (0x650c0, 0),
@@ -3450,6 +3472,30 @@ mod tests {
             super::super::shared_dpll::PinnedDpllPower::new(pin, identity, refclk).unwrap();
         manager
             .init(r, &Timer(Arc::new(AtomicU64::new(0))), &mut power)
+            .unwrap();
+        use intel_display::intel_dpll_mgr_full as source;
+        let port = match pin.port() {
+            TcPort::Tc1 => source::TcPort::Tc1,
+            TcPort::Tc2 => source::TcPort::Tc2,
+            _ => unreachable!(),
+        };
+        let index = manager.limit_to_tc_port(port).unwrap();
+        let firmware = capture(r, pin, pin.port(), None).unwrap();
+        let mut crtcs = [source::CrtcState::default(); source::MAX_PIPES];
+        crtcs[0] = source::CrtcState {
+            id: 0,
+            name: "pipe A",
+            pipe: 0,
+            joined_pipe_mask: 1,
+            hw_active: true,
+            intel_dpll: Some(index),
+            port_clock: firmware.pixel_clock,
+            output: source::OutputType::Hdmi,
+            port: source::Port::Tc(port),
+            ..source::CrtcState::default()
+        };
+        manager
+            .readout(r, &Timer(Arc::new(AtomicU64::new(0))), &mut power, crtcs)
             .unwrap();
         manager
     }
@@ -4256,7 +4302,7 @@ mod tests {
         dev.advance_vblank().unwrap();
         dev.advance_vblank().unwrap();
         let sequence = dev.vblank_sequence();
-        assert_eq!(sequence, 1);
+        assert_eq!(sequence, 256); // One step in PIPEFRAME high bits is 256 frames.
         a.present(target_scanout).unwrap();
         assert_eq!(a.state.lock().counter_epoch, 1);
         // Model the pipe's reset counter, not an IRQ-count substitution.
@@ -4270,8 +4316,8 @@ mod tests {
         dev.advance_vblank().unwrap();
         assert_eq!(
             dev.vblank_sequence(),
-            sequence + 1,
-            "one fresh hardware frame"
+            sequence + 256,
+            "one fresh PIPEFRAME high-field step"
         );
     }
 

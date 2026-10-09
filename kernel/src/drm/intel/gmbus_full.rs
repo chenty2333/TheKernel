@@ -33,6 +33,8 @@ pub(crate) struct KernelGmbusIo<'a, R: Registers, T: PollTimer> {
     display: GmbusDisplay,
     bus: GmbusBus,
     last_status: u32,
+    io_failure: Option<super::gmbus::GmbusError>,
+    idle_timeout: bool,
     was_in_use: bool,
     stale_two_byte_index: bool,
     power_held: bool,
@@ -82,6 +84,8 @@ impl<'a, R: Registers, T: PollTimer> KernelGmbusIo<'a, R, T> {
             display,
             bus,
             last_status: 0,
+            io_failure: None,
+            idle_timeout: false,
             was_in_use: false,
             stale_two_byte_index: false,
             power_held: false,
@@ -125,7 +129,12 @@ impl<'a, R: Registers, T: PollTimer> KernelGmbusIo<'a, R, T> {
 
     fn read_register(&mut self, address: u32) -> Result<u32, SourceError> {
         let register = self.register(address)?;
-        let value = self.registers.read(register).ok_or(SourceError::Io)?;
+        let value = self.registers.read(register).ok_or_else(|| {
+            self.io_failure = Some(super::gmbus::GmbusError::WindowTooSmall {
+                register: register.name(),
+            });
+            SourceError::Io
+        })?;
         if register == GMBUS2 {
             self.last_status = value;
         }
@@ -226,6 +235,9 @@ impl<R: Registers, T: PollTimer> GmbusIo for KernelGmbusIo<'_, R, T> {
         if self.registers.write(register, value) {
             Ok(())
         } else {
+            self.io_failure = Some(super::gmbus::GmbusError::RegisterRefused {
+                register: register.name(),
+            });
             Err(SourceError::Io)
         }
     }
@@ -310,6 +322,7 @@ impl<R: Registers, T: PollTimer> GmbusIo for KernelGmbusIo<'_, R, T> {
                 return Ok(());
             }
             if self.timer.now_micros() >= deadline {
+                self.idle_timeout = true;
                 return Err(SourceError::Timeout);
             }
             self.timer.pause();
@@ -336,8 +349,17 @@ impl<R: Registers, T: PollTimer> GmbusIo for KernelGmbusIo<'_, R, T> {
         if let Ok(status) = self.read32(GMBUS_MMIO_BASE + 0x5108, Access::Firmware) {
             self.was_in_use = status & (1 << 15) != 0;
         }
-        if let Ok(index) = self.read32(GMBUS_MMIO_BASE + 0x5120, Access::Firmware) {
+        let index_state = (|| {
+            let index = self.read32(GMBUS_MMIO_BASE + 0x5120, Access::Firmware)?;
             self.stale_two_byte_index = index & (1 << 31) != 0;
+            if self.stale_two_byte_index {
+                self.write32(GMBUS_MMIO_BASE + 0x5120, 0, Access::Firmware)?;
+            }
+            Ok::<(), SourceError>(())
+        })();
+        if let Err(error) = index_state {
+            self.display_power_put();
+            return Err(error);
         }
         if !GMBUS_INITIALIZED.load(Ordering::Acquire) {
             let display = self.display;
@@ -414,6 +436,9 @@ impl<R: Registers, T: PollTimer> GmbusIo for KernelGmbusIo<'_, R, T> {
 pub(crate) struct GMBusTransfer {
     pub(crate) result: Result<usize, SourceError>,
     pub(crate) last_status: u32,
+    pub(crate) io_failure: Option<super::gmbus::GmbusError>,
+    pub(crate) idle_timeout: bool,
+    pub(crate) elapsed_micros: u64,
     pub(crate) force_bit: u32,
     pub(crate) was_in_use: bool,
     pub(crate) stale_two_byte_index: bool,
@@ -430,6 +455,7 @@ pub(crate) fn read_edid_block<R: Registers, T: PollTimer>(
     output: &mut [u8],
     force_bit: u32,
 ) -> GMBusTransfer {
+    let start = timer.now_micros();
     let mut io = KernelGmbusIo::new(registers, timer, pin, rate);
     let mut bus = io.bus();
     bus.force_bit = force_bit;
@@ -454,6 +480,9 @@ pub(crate) fn read_edid_block<R: Registers, T: PollTimer>(
     GMBusTransfer {
         result,
         last_status: io.last_status(),
+        io_failure: io.io_failure,
+        idle_timeout: io.idle_timeout,
+        elapsed_micros: timer.now_micros().saturating_sub(start),
         force_bit: bus.force_bit,
         was_in_use: io.was_in_use,
         stale_two_byte_index: io.stale_two_byte_index,

@@ -184,7 +184,7 @@ fn a_window_that_does_not_reach_the_registers_is_reported_and_not_guessed_at() {
     let text = device.render();
     assert!(text.contains("does not reach"), "{text}");
     assert!(
-        text.contains(&format!("register {}", "SHOTPLUG_CTL_DDI")) || text.contains("GMBUS0"),
+        text.contains(&format!("register {}", "SHOTPLUG_CTL_DDI")) || text.contains("GMBUS5"),
         "{text}"
     );
 }

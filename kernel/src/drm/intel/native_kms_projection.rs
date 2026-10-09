@@ -561,7 +561,7 @@ mod tests {
         assert_eq!(projected.transition.old.pipe, PIPE_A);
         assert!(!projected.transition.old.hw_active);
         assert!(projected.transition.new.hw_active);
-        assert_eq!(projected.transition.new.old_timing, mode_timing(mode));
+        assert_eq!(projected.transition.new.old_timing, Timing::default());
         assert_eq!(projected.transition.new.new_timing, mode_timing(mode));
         assert_eq!(projected.transition.old.uapi_plane_mask, 0);
         assert_eq!(projected.transition.old.enabled_planes, 0);

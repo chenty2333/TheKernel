@@ -258,7 +258,7 @@ mod tests {
         registers.on_read(status, move |value| {
             let count = reads.get() + 1;
             reads.set(count);
-            if count == 3 { value | 0x8 } else { value }
+            if count >= 3 { value | 0x8 } else { value }
         });
         let io = DeIo::new(&registers);
 
