@@ -278,9 +278,15 @@ const _: [(); 208] = [(); core::mem::offset_of!(I915MmapOffset, offset)];
 
 #[repr(C, align(8))]
 pub struct DrmVmaOffsetNode {
-    _opaque: [u8; 192],
+    _vm_lock: [u8; 8],
+    pub vm_node: DrmMmNode,
+    pub vm_files: crate::intel_engine_cs_upstream::RbRoot,
+    pub driver_private: *mut c_void,
 }
 const _: [(); 192] = [(); core::mem::size_of::<DrmVmaOffsetNode>()];
+const _: [(); 8] = [(); core::mem::offset_of!(DrmVmaOffsetNode, vm_node)];
+const _: [(); 176] = [(); core::mem::offset_of!(DrmVmaOffsetNode, vm_files)];
+const _: [(); 184] = [(); core::mem::offset_of!(DrmVmaOffsetNode, driver_private)];
 
 #[repr(C)]
 pub struct RadixTreeRoot {
@@ -299,7 +305,7 @@ pub struct DrmGemObjectBaseLayout {
     _refcount_padding: [u8; 4],
     pub dev: *mut c_void,
     pub filp: *mut c_void,
-    _vma_node: [u8; 192],
+    pub vma_node: DrmVmaOffsetNode,
     pub size: u64,
     _name_and_padding: [u8; 8],
     pub dma_buf: *mut c_void,
