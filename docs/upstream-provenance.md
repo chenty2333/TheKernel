@@ -2057,6 +2057,12 @@ Intel Corporation). Ctags reports the same number of entries but one is an
 `I915_SELFTEST_DECLARE` data pseudo-tag and it misses the actual `dying_vma()`;
 all nine function bodies are translated and only function bodies carry markers.
 
+`i915_vma_upstream.rs` translates all 74 source definitions in Linux 7.2.3
+`drivers/gpu/drm/i915/i915_vma.c` (MIT, Copyright © 2016 Intel Corporation).
+There are 73 unique function names because the mutually exclusive
+`vma_print_allocator()` preprocessor variants are both retained and marked in
+their original source order.
+
 `intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
 `drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
 Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.
