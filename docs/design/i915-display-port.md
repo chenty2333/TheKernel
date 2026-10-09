@@ -50,7 +50,7 @@ so the references are not yet unified across a complete modeset lifetime.
 
 ## Native atomic activation replacement plan (2026-10-09)
 
-The active userspace path is `DRM_IOCTL_MODE_ATOMIC` in `kernel/src/drm/atomic.rs` → `DrmDevice` job queue / `advance_atomic_commit()` → `complete_atomic()` in `kernel/src/drm/device.rs` → `DisplayAdapter::present()` → `Native::present()` in `kernel/src/drm/intel/fastboot.rs`. Today the Native adapter validates and prepares the framebuffer, then `tc_modeset::program()` owns one monolithic TC1/2 HDMI transaction; the translated atomic-state code is a pure preflight, not the hardware path.
+The active userspace path is `DRM_IOCTL_MODE_ATOMIC` in `kernel/src/drm/ioctl.rs::atomic()` → `DrmFile::submit_atomic()` → `DrmDevice` job queue / `advance_atomic_commit()` → `complete_atomic()` in `kernel/src/drm/device.rs` → `DisplayAdapter::present()` → `Native::present()` in `kernel/src/drm/intel/fastboot.rs`. Today the Native adapter validates and prepares the framebuffer, then `tc_modeset::program()` owns one monolithic TC1/2 HDMI transaction; the translated `intel_atomic_commit_tail()` is not the hardware path.
 
 Replacement will proceed behind this queue boundary, maintaining one serialized transaction and the existing before-image/readback/rollback/quarantine guarantees:
 
