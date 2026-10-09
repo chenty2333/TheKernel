@@ -1863,7 +1863,7 @@ unsafe fn fence_status(rq: *const I915Request) -> *const c_char {
 
 // upstream i915_request.c:2180
 // upstream: i915_request.c i915_request_show()
-pub unsafe fn i915_request_show(
+pub unsafe extern "C" fn i915_request_show(
     printer: *mut DrmPrinter,
     rq: *const I915Request,
     prefix: *const c_char,
