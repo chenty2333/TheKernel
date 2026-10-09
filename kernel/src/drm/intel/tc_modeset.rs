@@ -691,6 +691,84 @@ fn source_tc_encoder(port: TcPort) -> Result<intel_display::intel_ddi_full::DdiE
     })
 }
 
+/// HDMI encoder disable callback used by the TC modeset transaction. The
+/// source DDI helper owns the buffer handshake; this wrapper adds checked DE
+/// readback so timeout or a lost register cannot look like success.
+fn disable_tc_hdmi_encoder<R: Registers, T: PollTimer>(
+    registers: &R,
+    timer: &T,
+    port: TcPort,
+) -> Result<(), String> {
+    use intel_display::intel_ddi_full as i915;
+
+    let encoder = source_tc_encoder(port)?;
+    let state = i915::CrtcState {
+        output: i915::OutputType::Hdmi,
+        ..i915::CrtcState::default()
+    };
+    let control = ddi_buf_ctl(port)?;
+    let source_buffer = mmio_register(control, true);
+    let mut io = TcTranscoderFuncIo::buffer(registers, source_buffer, timer);
+    i915::intel_ddi_buf_disable(&mut io, &encoder, &state);
+    if io.read_failed || io.write_failed || io.wait_timed_out {
+        return Err(String::from("translated DDI buffer disable failed"));
+    }
+    let value = read(registers, control)?;
+    if value & DDI_ENABLE != 0 || value & DDI_IDLE == 0 {
+        return Err(format!(
+            "translated DDI buffer disable readback mismatch {value:#x}"
+        ));
+    }
+    Ok(())
+}
+
+/// HDMI encoder enable callback, paired with `disable_tc_hdmi_encoder` and
+/// called only while the enclosing transaction owns the old/new PHY image.
+fn enable_tc_hdmi_encoder<R: Registers, T: PollTimer>(
+    registers: &R,
+    timer: &T,
+    port: TcPort,
+    output: u32,
+) -> Result<(), String> {
+    use intel_display::intel_ddi_full as i915;
+
+    let encoder = source_tc_encoder(port)?;
+    let state = i915::CrtcState {
+        output: i915::OutputType::Hdmi,
+        ..i915::CrtcState::default()
+    };
+    let control = ddi_buf_ctl(port)?;
+    let mut io = TcTranscoderFuncIo::buffer(registers, mmio_register(control, true), timer);
+    i915::intel_ddi_buf_enable(&mut io, &encoder, output);
+    if io.read_failed || io.write_failed || io.wait_timed_out {
+        return Err(String::from("translated DDI buffer enable failed"));
+    }
+    let value = read(registers, control)?;
+    if value & DDI_ENABLE == 0 || value & DDI_IDLE != 0 {
+        return Err(format!(
+            "translated DDI buffer enable readback mismatch {value:#x}"
+        ));
+    }
+    Ok(())
+}
+
+/// HDMI pre-enable signal-level callback from `intel_ddi_pre_enable_hdmi()`.
+/// The caller must already have proved the exact ADL-P D0 waiver and VBT level.
+fn pre_enable_tc_hdmi_encoder<I: DklIo + intel_display::tc::TcIo>(
+    io: &I,
+    port: TcPort,
+    port_clock_khz: u32,
+) -> Result<(), String> {
+    intel_display::tc::adlp_tc_dkl_hdmi_set_signal_levels(
+        io,
+        port,
+        port_clock_khz,
+        5,
+        intel_display::tc::Wa16011342517::Active,
+    )
+    .map_err(|error| format!("TC HDMI signal-level programming failed: {error:?}"))
+}
+
 /// Kernel adapter for the source Haswell/Gen12+ AVI-DIP writer. Only the
 /// transcoder-A AVI control and its eight data dwords are addressable here.
 struct TcAviIo<'a, R> {
@@ -878,6 +956,12 @@ fn disable_pipe_a_transcoder_clock<R: Registers>(
         ));
     }
     Ok(())
+}
+
+/// Encoder post-disable callback (`intel_ddi_post_disable()`): drop the
+/// selected transcoder clock only after the source DDI disable handshake.
+fn post_disable_tc_hdmi_encoder<R: Registers>(registers: &R, port: TcPort) -> Result<(), String> {
+    disable_pipe_a_transcoder_clock(registers, port)
 }
 
 fn disable_pipe_a_transcoder<R: Registers>(registers: &R) -> Result<(), String> {
@@ -1115,28 +1199,8 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     )?;
     poll(r, timer, p::PIPECONF_A.offset(), PIPE_RUNNING, 0, 100_000)?;
     disable_pipe_a_transcoder(r)?;
-    let source_encoder = source_tc_encoder(port)?;
-    let source_state = intel_display::intel_ddi_full::CrtcState {
-        output: intel_display::intel_ddi_full::OutputType::Hdmi,
-        ..intel_display::intel_ddi_full::CrtcState::default()
-    };
-    let source_buffer = mmio_register(control_offset, true);
-    let mut source_io = TcTranscoderFuncIo::buffer(r, source_buffer, timer);
-    intel_display::intel_ddi_full::intel_ddi_buf_disable(
-        &mut source_io,
-        &source_encoder,
-        &source_state,
-    );
-    if source_io.read_failed || source_io.write_failed || source_io.wait_timed_out {
-        return Err(String::from("translated DDI buffer disable failed"));
-    }
-    let idle_buffer = read(r, control_offset)?;
-    if idle_buffer & DDI_ENABLE != 0 || idle_buffer & DDI_IDLE == 0 {
-        return Err(format!(
-            "translated DDI buffer disable readback mismatch {idle_buffer:#x}"
-        ));
-    }
-    disable_pipe_a_transcoder_clock(r, port)?;
+    disable_tc_hdmi_encoder(r, timer, port)?;
+    post_disable_tc_hdmi_encoder(r, port)?;
     if let Some(lifecycle) = clock_lifecycle.as_deref_mut() {
         lifecycle.adjust(mode.clock_khz, restore_clock)?;
     }
@@ -1168,29 +1232,12 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     if let Some(before) = restore_phy {
         restore_signal_levels(&phy_io, port, before)?;
     } else {
-        intel_display::tc::adlp_tc_dkl_hdmi_set_signal_levels(
-            &phy_io,
-            port,
-            mode.clock_khz,
-            5,
-            intel_display::tc::Wa16011342517::Active,
-        )
-        .map_err(|e| format!("TC HDMI signal-level programming failed: {e:?}"))?;
+        pre_enable_tc_hdmi_encoder(&phy_io, port, mode.clock_khz)?;
     }
     // HDMI on ADL-P/DKL has zero DP lanes and retains board lane reversal. TC
     // PHY ownership remains asserted; no inferred swing or USB-C mux is set.
     let output = (buffer & DDI_LANE_REVERSAL) | DDI_TC_PHY_OWNERSHIP;
-    let mut source_io = TcTranscoderFuncIo::buffer(r, source_buffer, timer);
-    intel_display::intel_ddi_full::intel_ddi_buf_enable(&mut source_io, &source_encoder, output);
-    if source_io.read_failed || source_io.write_failed || source_io.wait_timed_out {
-        return Err(String::from("translated DDI buffer enable failed"));
-    }
-    let active_buffer = read(r, control_offset)?;
-    if active_buffer & DDI_ENABLE == 0 || active_buffer & DDI_IDLE != 0 {
-        return Err(format!(
-            "translated DDI buffer enable readback mismatch {active_buffer:#x}"
-        ));
-    }
+    enable_tc_hdmi_encoder(r, timer, port, output)?;
     write(
         r,
         p::PIPECONF_A.offset(),
