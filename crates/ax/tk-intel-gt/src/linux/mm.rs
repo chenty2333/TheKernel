@@ -71,6 +71,7 @@ pub const VM_MAYWRITE: c_ulong = 1 << 5;
 // the configured x86 kernel exports the implementation from pgprot.c.
 unsafe extern "C" {
     pub fn vm_get_page_prot(vm_flags: c_ulong) -> PgProt;
+    pub fn vma_set_file(vma: *mut VmAreaStruct, file: *mut File);
 }
 
 /// Linux `vma_pages()`: the page-count of the page-aligned VMA interval.

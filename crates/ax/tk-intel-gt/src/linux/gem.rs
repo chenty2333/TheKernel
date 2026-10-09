@@ -3,7 +3,7 @@
 // Linux v7.2.3 DRM/i915 GEM shared layout records.
 
 use core::{
-    ffi::{c_long, c_ulong, c_void},
+    ffi::{c_char, c_int, c_long, c_ulong, c_void},
     mem::{align_of, offset_of, size_of},
 };
 
@@ -82,6 +82,15 @@ pub struct DmaResv {
 }
 
 unsafe extern "C" {
+    pub fn get_file_active(file: *mut *mut File) -> *mut File;
+    pub fn anon_inode_getfile(
+        name: *const c_char,
+        fops: *const FileOperations,
+        private_data: *mut c_void,
+        flags: c_int,
+    ) -> *mut File;
+    pub fn drm_dev_get(dev: *mut c_void) -> *mut c_void;
+    pub fn drm_dev_put(dev: *mut c_void);
     fn unmap_mapping_range(
         mapping: *mut c_void,
         holebegin: c_long,
