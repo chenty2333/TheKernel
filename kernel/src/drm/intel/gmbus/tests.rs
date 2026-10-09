@@ -894,44 +894,34 @@ fn a_stuck_bus_is_named_and_the_recovery_releases_the_pin() {
     assert_eq!(controller.peek(GMBUS0), Some(0));
 }
 
-/// A stall that latches while the stop cycle is running is a stuck bus, not a
-/// sink refusing the address.
+/// A `STALL_TIMEOUT` bit that latches after the last word does not fail the
+/// transfer.
 ///
-/// The block is already read in full at that point, so the only thing left to
-/// get wrong is what to call the failure.  A stall is not a NAK: reporting it
-/// as one sends a reader to inspect the AUX well and the monitor, and discards
-/// a block that was read successfully.
+/// i915's `gmbus_wait()` polls only for the requested ready/wait-phase bit and
+/// `GMBUS_SATOER`; `intel_gmbus.c` never reads `GMBUS_STALL_TIMEOUT`.  With the
+/// wait phase reached, the source transfer completes and the block read is
+/// kept.
 #[test]
-fn a_stall_after_the_last_word_is_a_stuck_bus_not_a_nak() {
+fn a_stall_bit_after_the_last_word_does_not_fail_the_source_transfer() {
     let _guard = scheduler_test_context();
     let block = valid_edid(0);
     let controller = FakeController::with_monitor(Pin::DdiA, &block);
     controller.stall_after_words(EDID_BLOCK_LEN / 4);
     let (result, _) = read(&controller, Pin::DdiA);
-    match result {
-        Err(GmbusError::BusStuck { status, .. }) => {
-            assert_ne!(
-                status & GMBUS2_STALL_TIMEOUT,
-                0,
-                "the stall bit is the story"
-            );
-        }
-        other => panic!("a stall must be reported as a stuck bus, got {other:?}"),
-    }
+    assert_eq!(result.map(|edid| *edid.bytes()), Ok(block));
 }
 
+/// `STALL_TIMEOUT` alone does not change the outcome: a bare bus that keeps
+/// signalling `HW_RDY` reads all-ones whether or not the bit is set, because
+/// the source wait only consults the ready bits and `GMBUS_SATOER`.  The
+/// diagnostic still names the bit when a timeout carries it.
 #[test]
-fn a_stall_is_reported_with_the_status_bit_that_says_so() {
+fn a_stall_bit_alone_is_ignored_like_the_source_wait() {
     let _guard = scheduler_test_context();
     let controller = FakeController::bare();
     controller.stall();
     let (result, _) = read(&controller, Pin::DdiA);
-    match result {
-        Err(GmbusError::BusStuck { status, .. }) => {
-            assert_ne!(status & GMBUS2_STALL_TIMEOUT, 0);
-        }
-        other => panic!("expected a stalled bus, got {other:?}"),
-    }
+    assert_eq!(result, Err(GmbusError::BusFloating { pin: Pin::DdiA }));
     assert!(
         GmbusError::BusStuck {
             pin: Pin::DdiA,

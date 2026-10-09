@@ -4487,13 +4487,17 @@ mod tests {
         );
     }
     #[test]
-    fn failed_pll_readout_restores_hip_and_terminally_closes_native_submission() {
+    fn failed_pll_readout_terminally_closes_native_submission() {
         let _context = crate::test_support::scheduler_test_context();
         let (a, r, _) = native();
         r.inner.lock().dkl.remove(&0x2214);
         assert_eq!(a.present(scanout(&a)).err(), Some(DrmError::DeviceLost));
         assert!(a.state.lock().lost);
-        assert_eq!(read(&r, 0x1010a0), Ok(0x44332211));
+        // The readout now runs through the translated shared-DPLL manager.
+        // Like i915's `intel_dkl_phy_read()`, it writes
+        // `HIP_INDEX_VAL(TC1, bank 2)` before the indexed access and does not
+        // restore the firmware selector afterwards.
+        assert_eq!(read(&r, 0x1010a0), Ok(0x2));
         let writes = r.inner.lock().log.len();
         assert_eq!(a.present(scanout(&a)).err(), Some(DrmError::DeviceLost));
         assert_eq!(r.inner.lock().log.len(), writes);

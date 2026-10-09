@@ -1208,10 +1208,17 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         }
     };
     let function = read(r, ddi::TRANS_DDI_FUNC_CTL_A.offset())?;
-    if !matches!(
-        intel_display::ddi::decode_function_control(function).port,
-        Some(Port::Tc1 | Port::Tc2)
-    ) || mode.flags.contains(crate::drm::modes::ModeFlags::INTERLACE)
+    // A rollback re-enters after the translated
+    // `intel_ddi_disable_transcoder_func()` has run; on display 12+ that
+    // clears the port select together with the enable bit, so a disabled
+    // transcoder with no port is the quiesced form of the same TC link.
+    let link_admitted = match intel_display::ddi::decode_function_control(function).port {
+        Some(Port::Tc1 | Port::Tc2) => true,
+        None => function & (1 << 31) == 0,
+        Some(_) => false,
+    };
+    if !link_admitted
+        || mode.flags.contains(crate::drm::modes::ModeFlags::INTERLACE)
         || mode
             .flags
             .contains(crate::drm::modes::ModeFlags::DOUBLE_CLOCK)
@@ -1226,7 +1233,8 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         ));
     }
     let selected = tc_phy(port)?;
-    if intel_display::ddi::decode_function_control(function).port != Some(selected) {
+    let routed = intel_display::ddi::decode_function_control(function).port;
+    if routed != Some(selected) && routed.is_some() {
         return Err(String::from(
             "TC request does not match active firmware route",
         ));
