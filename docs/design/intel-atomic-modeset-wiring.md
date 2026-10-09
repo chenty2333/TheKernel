@@ -18,3 +18,14 @@ register writes. The old transactional TC path remains the only writer. Full
 atomic orchestration still needs exact callback implementations for DMC,
 CDCLK, shared DPLL, DDI/DP training, color, WM/DBUF, DSB, and rollback before
 that path can safely be replaced.
+
+## 剩余工作
+
+- 步骤 8：多 CRTC 接线。
+- 步骤 8：cursor 接线。
+- 步骤 8：多 plane 接线。
+- 步骤 8：颜色寄存器接线。
+- G1-16：运行时 PSR 通知和 DMC DC6 计数 observer 尚未接线。
+- G1-18：电源井 IRQ init/reset/synchronize 回调尚未接线。
+- `intel.native_modeset=1` 尚未在 N305 上点亮过。
+- 默认 TC 路径已改用翻译函数，但未上真机。
