@@ -1074,6 +1074,13 @@ fn allocate_table_page() -> Result<DmaBlock, Error> {
     allocate_dma(1)
 }
 
+/// Keep every table and queue allocation alive when a partially enabled unit
+/// may still fetch them. MODE_FAILED prevents further PCI admission; leaking
+/// is safer than allowing Rust drop glue to release a hardware-visible page.
+fn quarantine_boot_resources<P, R, C, U>(page_table: P, root: R, contexts: C, units: U) {
+    core::mem::forget((page_table, root, contexts, units));
+}
+
 /// Discover DMAR before PCI probing; translate by default when a supported DMAR exists.
 pub(super) fn init(engine: &Engine) -> Result<(), Error> {
     // Preserve an explicit escape hatch for platforms that need firmware-style
@@ -1164,6 +1171,13 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
     }
     core::sync::atomic::fence(Ordering::Release);
 
+    let iova_start = maximum
+        .max(1 << 30)
+        .checked_add((1 << 30) - 1)
+        .ok_or(Error::InvalidRange)?
+        & !((1 << 30) - 1);
+    let iovas = IovaAllocator::new(iova_start, IOVA_END)?;
+
     let mut units = Vec::new();
     units
         .try_reserve_exact(dmar.units.len())
@@ -1183,21 +1197,24 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
             ir_table: None,
             ir: None,
         };
-        unit.enable(root.physical)?;
         units.push(unit);
     }
-    let iova_start = maximum
-        .max(1 << 30)
-        .checked_add((1 << 30) - 1)
-        .ok_or(Error::InvalidRange)?
-        & !((1 << 30) - 1);
+    // Complete every fallible allocation before enabling the first unit. If a
+    // later unit fails after an earlier unit enabled TE, quarantine all of the
+    // pages/queues rather than dropping backing memory still visible to DMA.
+    let enable_error = units.iter_mut().find_map(|unit| unit.enable(root.physical).err());
+    if let Some(error) = enable_error {
+        error!("vtd: unit enable failed after partial initialization; quarantining DMA tables");
+        quarantine_boot_resources(page_table, root, context_tables, units);
+        return Err(error);
+    }
     let manager = Manager {
         dmar: dmar.clone(),
         units,
         root_table: root,
         context_tables,
         page_table,
-        iovas: IovaAllocator::new(iova_start, IOVA_END)?,
+        iovas,
         mappings: Vec::new(),
         ir_routes: Vec::new(),
         identity_end: maximum,
@@ -1349,5 +1366,32 @@ impl tk_vtd::PlatformInterruptRemap for PlatformInterruptRemap {
             .as_mut()
             .ok_or(Error::NoDomain)?
             .unmap_msi(vector)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::quarantine_boot_resources;
+
+    struct DropProbe(Arc<AtomicUsize>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn failed_partial_enable_quarantines_every_dma_owner() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        quarantine_boot_resources(
+            DropProbe(drops.clone()),
+            DropProbe(drops.clone()),
+            DropProbe(drops.clone()),
+            DropProbe(drops.clone()),
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
     }
 }
