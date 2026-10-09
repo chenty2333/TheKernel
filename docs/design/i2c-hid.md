@@ -118,3 +118,27 @@ interrupt-enable bit. ACPI exports `prepare_s3_gpio()` and `resume_s3_gpio()` at
 the corresponding entry/return boundaries. The kernel still has no ACPI S3
 entry mechanism, so these lifecycle hooks are compile-checked but cannot yet be
 invoked by a real suspend/resume cycle; this does not claim S3 acceptance.
+
+Final function-coverage scope for the FreeBSD `hidbus.c` snapshot (38 entry
+points): 13 host/report operations are represented by shared parser metadata,
+collection-scoped lookup, HMT child probe/input dispatch, generic report/read/
+write/idle/protocol wrappers, and RAII teardown. The remaining methods are
+newbus registration and child enumeration/attach/detach/ivar/location/PnP-info
+callbacks (`hidbus_add_child`, `hidbus_enumerate_children`,
+`hidbus_attach_children`, `hidbus_detach_children`, device/child probe/attach/
+detach, ivar/epoch callbacks, location/pnpinfo/driver-ID lookup and method
+registration). Those have no TheKernel newbus/epoch/child-driver framework;
+ACPI firmware child parsing and the in-tree HMT probe replace the selection path.
+The actual report grammar, bit cursor, locations, report sizes, per-TLC fields,
+contact count, and report dispatch are implemented in the shared HID core, not
+skipped as framework work.
+
+`hid.c` retains 24/32 direct source markers: remaining `hid_switch_rid` behavior
+uses per-report-ID bit cursors in the parser; dynamic quirk loading/unloading
+and generic `hid_ioctl` depend on absent FreeBSD SYSCTL/module/newbus APIs. The
+upstream `HQ_MT_TIMESTAMP` knob is dynamic and has no static model entries in
+the source table, so no VID/PID timestamp quirk list is fabricated. `hmt.c`
+uses descriptor scan time and THQA Feature report handling, but hardware touch
+reports remain unverified because the standalone axdriver test executable
+cannot link on the host (`R_X86_64_32S` per-CPU relocation); its test targets
+compile successfully.

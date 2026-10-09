@@ -628,7 +628,9 @@ impl InputDriverOps for I2cInput {
     // upstream: iichid.c iichid_intr_poll()
     // upstream: iichid.c iichid_intr() and hmt.c hmt_intr()
     // upstream: iichid.c iichid_reset_callout() (deadline belongs to evdev pump)
-    // upstream: hid.c hid_intr_poll()
+    // upstream: hidbus.c hidbus_intr() / hidbus_intr_poll(),
+    // iichid.c iichid_intr_poll(), hmt.c hmt_intr(). The unified input pump
+    // invokes this in task context rather than dispatching from the GPIO IRQ.
     fn read_event(&mut self) -> DevResult<Event> {
         let state = self.state.get_mut();
         if !state.opened || state.suspended {

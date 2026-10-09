@@ -312,6 +312,8 @@ impl Report {
         let mut pointer = false;
         let mut bits = [0u16; 256];
         let mut report_sizes = [[0u16; 256]; 3];
+        // upstream: hid.c hid_switch_rid() report-ID position preservation.
+        // The owned parser keeps an independent bit cursor for each report ID.
         let mut locations = reserved(128)?;
         let mut ids = false;
         let mut offset = 0;
