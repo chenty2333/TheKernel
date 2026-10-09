@@ -210,8 +210,10 @@ mod tests {
                 })
                 .is_ok()
         );
+        // `socket` is already bound to the monitor channel above, so a device
+        // channel needs a fresh socket. RAW (0) on a missing device is ENODEV.
         assert_eq!(
-            socket.bind(SockaddrHci {
+            HciSocket::new().bind(SockaddrHci {
                 family: AF_BLUETOOTH as u16,
                 device: 0,
                 channel: 0
