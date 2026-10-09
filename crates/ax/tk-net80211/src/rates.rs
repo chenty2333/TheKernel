@@ -117,7 +117,7 @@ pub fn rate_to_plcp(rate: u8, mode: PhyMode) -> u8 {
             108 => 0x0c,
             _ => 0,
         },
-        _ => panic!("unexpected 802.11 PHY mode {mode:?}"),
+        PhyMode::Auto | PhyMode::N | PhyMode::Ac | PhyMode::Ax => 0,
     }
 }
 
@@ -144,7 +144,7 @@ pub fn plcp_to_rate(plcp: u8, mode: PhyMode) -> u8 {
             0x0c => 108,
             _ => 0,
         },
-        _ => panic!("unexpected 802.11 PHY mode {mode:?}"),
+        PhyMode::Auto | PhyMode::N | PhyMode::Ac | PhyMode::Ax => 0,
     }
 }
 
@@ -161,6 +161,14 @@ mod tests {
         set_basic_rates(&mut supported);
         assert_eq!(&supported[3].rates[..4], &[0x82, 0x84, 0x8b, 0x96]);
         assert_eq!(supported[4].rates[0], 2);
+    }
+
+    #[test]
+    fn non_legacy_phy_modes_have_no_legacy_plcp_mapping() {
+        for mode in [PhyMode::Auto, PhyMode::N, PhyMode::Ac, PhyMode::Ax] {
+            assert_eq!(rate_to_plcp(24, mode), 0);
+            assert_eq!(plcp_to_rate(0x0a, mode), 0);
+        }
     }
 
     #[test]

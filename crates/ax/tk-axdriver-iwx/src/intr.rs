@@ -55,6 +55,7 @@ const CSR_MSIX_AUTOMASK: u32 = 0x2810;
 pub enum IctError {
     Dma(DmaError),
     InvalidSize,
+    DrainLimitExceeded,
 }
 
 impl From<DmaError> for IctError {
@@ -82,10 +83,15 @@ impl<R: DmaRegion> InterruptCauseTable<R> {
         }
         let mut causes = 0u32;
         let mut current = first;
+        let mut drained = 0;
         while current != 0 {
+            if drained == ICT_ENTRY_COUNT {
+                return Err(IctError::DrainLimitExceeded);
+            }
             causes |= current;
             self.memory.write_at(self.current * 4, &[0, 0, 0, 0])?;
             self.current = (self.current + 1) % ICT_ENTRY_COUNT;
+            drained += 1;
             current = read_entry(&self.memory, self.current)?;
         }
         if causes == u32::MAX {
@@ -417,6 +423,26 @@ mod tests {
             Ok(())
         }
     }
+
+    struct RepeatingRegion;
+    impl DmaRegion for RepeatingRegion {
+        fn device_address(&self) -> u64 {
+            0x1000
+        }
+        fn capacity(&self) -> usize {
+            ICT_SIZE_BYTES
+        }
+        fn write(&mut self, _: &[u8]) -> Result<(), DmaError> {
+            Ok(())
+        }
+        fn write_at(&mut self, _: usize, _: &[u8]) -> Result<(), DmaError> {
+            Ok(())
+        }
+        fn read_at(&self, _: usize, output: &mut [u8]) -> Result<(), DmaError> {
+            output.copy_from_slice(&1u32.to_le_bytes()[..output.len()]);
+            Ok(())
+        }
+    }
     struct Allocator(Cell<u64>);
     impl DmaAllocator for Allocator {
         type Region = Region;
@@ -477,6 +503,16 @@ mod tests {
         assert_eq!(ict.drain().unwrap(), Some(0x8000_0003));
         assert_eq!(ict.current, 1);
         assert_eq!(ict.drain().unwrap(), None);
+    }
+
+    #[test]
+    fn ict_drain_bounds_a_non_quiescing_table_in_interrupt_context() {
+        let mut ict = InterruptCauseTable {
+            memory: RepeatingRegion,
+            current: 0,
+        };
+        assert_eq!(ict.drain(), Err(IctError::DrainLimitExceeded));
+        assert_eq!(ict.current, 0);
     }
 
     #[test]
