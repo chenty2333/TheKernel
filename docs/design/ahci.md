@@ -90,3 +90,7 @@ CAM's held CCB sense/retry queue.
 NCQ recovery consumes the failing tag before port reset, but all pending block
 members in the errored hardware batch are failed together rather than CAM's
 single-victim requeue protocol.
+
+`ahci_timeout()` is the bounded-wait expiry adapter and delegates to the shared
+reset/quiescence path; no FreeBSD callout is armed, so timeout detection occurs
+while a block request is waiting or reaped.

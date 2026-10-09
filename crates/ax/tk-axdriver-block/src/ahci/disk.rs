@@ -837,7 +837,10 @@ impl<I: AhciIo> AhciDisk<I> {
         true
     }
 
-    fn timeout_command(&mut self) -> bool {
+    // FreeBSD `ahci_timeout()` recovery transition; the block adapter detects
+    // expiry in its bounded wait/reap loop rather than arming a callout.
+    // upstream: ahci.c ahci_timeout()
+    fn ahci_timeout(&mut self) -> bool {
         self.ahci_reset()
     }
 
@@ -874,7 +877,7 @@ impl<I: AhciIo> AhciDisk<I> {
             }
             self.wait_for_progress(observed);
         }
-        if self.timeout_command() {
+        if self.ahci_timeout() {
             Err(AhciDiskError::CommandTimeout)
         } else {
             Err(AhciDiskError::DmaMayStillBeActive)
@@ -931,7 +934,7 @@ impl<I: AhciIo> AhciDisk<I> {
             }
             self.wait_for_progress(observed);
         }
-        self.timeout_command();
+        self.ahci_timeout();
         None
     }
 
@@ -1034,7 +1037,7 @@ impl<I: AhciIo> AhciDisk<I> {
             return true;
         }
         if physical_timeout {
-            let stopped = self.timeout_command();
+            let stopped = self.ahci_timeout();
             self.finish_physical_after_port_reset(
                 if stopped {
                     BlockCompletionStatus::DeviceError(0xff)
@@ -1086,7 +1089,7 @@ impl<I: AhciIo> AhciDisk<I> {
             self.async_state = AsyncState::InFlight(pending);
             return false;
         }
-        let quiesced = self.timeout_command();
+        let quiesced = self.ahci_timeout();
         self.async_state = AsyncState::Complete(BlockCompletion {
             handle: pending.handle,
             owner: pending.owner,
