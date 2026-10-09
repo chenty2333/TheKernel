@@ -166,7 +166,7 @@ use alloc::{format, string::String, vec::Vec};
 use super::{
     gmbus::{MonotonicTimer, PollTimer},
     hex,
-    regs::{Register, Registers, ddi, pipe as pipe_regs},
+    regs::{Meaning, Register, Registers, ddi, pipe as pipe_regs},
     timing::{self, TimingRegister, TimingRegisters},
 };
 use crate::drm::modes::Mode;
@@ -1197,6 +1197,288 @@ pub(crate) struct MultiPlaneDdbPlan {
     pub(crate) unused_blocks: u32,
 }
 
+/// Program the DBUF and all watermark levels produced by the multi-plane
+/// planner.  The source model's `plane_index` is zero-based (`PLANE_1` is 0);
+/// this writer deliberately admits only the four packed-RGB plane engines,
+/// not the cursor, whose format/WM model is different.  Register offsets are
+/// formed only after validating the bounded pipe/plane indices and are still
+/// passed through `Registers`, whose DE window rejects non-writable or
+/// unmapped MMIO.
+///
+/// This is the shadow half of `skl_allocate_pipe_ddb()` /
+/// `skl_write_plane_wm()`; callers must arm the plane only after every write
+/// succeeds.  DDB ranges are half-open internally and encoded by
+/// `DdbAllocation::register_value()` as the hardware's inclusive end.
+pub(crate) fn program_multi_plane_dbuf(
+    regs: &impl Registers,
+    pipe: Pipe,
+    plan: &MultiPlaneDdbPlan,
+) -> Result<(), PipeError> {
+    if plan.planes.is_empty() {
+        return Err(PipeError::NoVisiblePlanes);
+    }
+    let mut seen = [false; 4];
+    // Validate the entire plan before its first MMIO write.  In particular,
+    // never write a partial DDB repartition because a later plane is invalid.
+    for plane in &plan.planes {
+        if plane.plane_index >= seen.len() {
+            return Err(PipeError::PlaneIndexOutOfRange {
+                plane_index: plane.plane_index,
+            });
+        }
+        if core::mem::replace(&mut seen[plane.plane_index], true) {
+            return Err(PipeError::DuplicatePlaneIndex {
+                plane_index: plane.plane_index,
+            });
+        }
+        if plane.ddb.start() >= plane.ddb.end() || plane.ddb.end() > DDB_BLOCKS {
+            return Err(PipeError::DdbAllocationOutOfBounds {
+                start: plane.ddb.start(),
+                end: plane.ddb.end(),
+            });
+        }
+        if plan.planes.iter().any(|other| {
+            other.plane_index != plane.plane_index
+                && plane.ddb.start() < other.ddb.end()
+                && other.ddb.start() < plane.ddb.end()
+        }) {
+            return Err(PipeError::DdbAllocationOverlap {
+                first: plane.plane_index,
+                second: plan
+                    .planes
+                    .iter()
+                    .find(|other| {
+                        other.plane_index != plane.plane_index
+                            && plane.ddb.start() < other.ddb.end()
+                            && other.ddb.start() < plane.ddb.end()
+                    })
+                    .map(|other| other.plane_index)
+                    .unwrap_or(plane.plane_index),
+            });
+        }
+    }
+
+    let mut writes = Vec::with_capacity(plan.planes.len() * (1 + PLANE_WM_LEVELS + 3));
+    for plane in &plan.planes {
+        let regs_for_plane = plane_registers(pipe, plane.plane_index)?;
+        writes.push(PlannedWrite {
+            register: regs_for_plane.ddb,
+            value: plane.ddb.register_value(),
+        });
+        for (level, value) in plane.watermark.levels().iter().enumerate() {
+            writes.push(PlannedWrite {
+                register: regs_for_plane.level(level),
+                value: value.register_value(),
+            });
+        }
+        writes.push(PlannedWrite {
+            register: regs_for_plane.trans,
+            value: plane.watermark.transition_value(),
+        });
+        writes.push(PlannedWrite {
+            register: regs_for_plane.sagv,
+            value: plane.watermark.sagv_value(),
+        });
+        writes.push(PlannedWrite {
+            register: regs_for_plane.sagv_trans,
+            value: plane.watermark.sagv_transition_value(),
+        });
+    }
+    for planned in writes {
+        write(regs, planned)?;
+    }
+    Ok(())
+}
+
+/// Program an unscaled packed-RGB multi-plane update from the already checked
+/// DDB plan.  All buffer and watermark registers are written before any plane
+/// arm, then each plane writes `PLANE_CTL` immediately followed by
+/// `PLANE_SURF`, matching `skl_universal_plane`'s update ordering.  Unsupported
+/// formats, clipping, scaling and overlap are rejected by the shared planner.
+pub(crate) fn update_multi_plane_scanout(
+    regs: &impl Registers,
+    pipe: Pipe,
+    mode: &Mode,
+    scanouts: &[PlaneScanout],
+    config: WatermarkConfig,
+) -> Result<MultiPlaneDdbPlan, PipeError> {
+    let plan = plan_multi_plane_dbuf(mode, scanouts, config)?;
+    program_multi_plane_dbuf(regs, pipe, &plan)?;
+
+    // Construct every plane's shadow/arm values before writing any of them.
+    let mut plane_writes = Vec::with_capacity(scanouts.len() * 7);
+    let mut arms = Vec::with_capacity(scanouts.len() * 2);
+    for scanout in scanouts {
+        let hw = plane_scanout_registers(pipe, scanout.plane_index)?;
+        let (_, format, arb_slots) = plane_format_fields(scanout.pixel_format)?;
+        let stride = PlaneProgram::stride_field(scanout.surface.stride_bytes)?;
+        let surface = PlaneProgram::surface_field(scanout.surface.ggtt_address)?;
+        let pos = (scanout.dst_y << 16) | scanout.dst_x;
+        let size = ((scanout.dst_height - 1) << 16) | (scanout.dst_width - 1);
+        plane_writes.extend([
+            PlannedWrite {
+                register: hw.stride,
+                value: stride,
+            },
+            PlannedWrite {
+                register: hw.pos,
+                value: pos,
+            },
+            PlannedWrite {
+                register: hw.size,
+                value: size,
+            },
+            PlannedWrite {
+                register: hw.offset,
+                value: 0,
+            },
+            PlannedWrite {
+                register: hw.color_ctl,
+                value: PLANE_COLOR_CTL_LINEAR_RGB,
+            },
+        ]);
+        arms.extend([
+            PlannedWrite {
+                register: hw.ctl,
+                value: PLANE_CTL_ENABLE | format | PLANE_CTL_TILED_LINEAR | arb_slots,
+            },
+            PlannedWrite {
+                register: hw.surface,
+                value: surface,
+            },
+        ]);
+    }
+    for planned in plane_writes.into_iter().chain(arms) {
+        write(regs, planned)?;
+    }
+    Ok(plan)
+}
+
+/// Disable one supported non-cursor plane, preserving the other control bits
+/// while clearing only `PLANE_CTL_ENABLE`.  The disable control write is its
+/// arm; no surface register is changed.
+pub(crate) fn disable_multi_plane(
+    regs: &impl Registers,
+    pipe: Pipe,
+    plane_index: usize,
+) -> Result<(), PipeError> {
+    let hw = plane_scanout_registers(pipe, plane_index)?;
+    let before = read(regs, hw.ctl)?;
+    write(
+        regs,
+        PlannedWrite {
+            register: hw.ctl,
+            value: before & !PLANE_CTL_ENABLE,
+        },
+    )
+}
+
+struct PlaneScanoutRegisters {
+    stride: Register,
+    pos: Register,
+    size: Register,
+    offset: Register,
+    ctl: Register,
+    surface: Register,
+    color_ctl: Register,
+}
+
+fn plane_scanout_registers(
+    pipe: Pipe,
+    plane_index: usize,
+) -> Result<PlaneScanoutRegisters, PipeError> {
+    if plane_index >= 4 {
+        return Err(PipeError::PlaneIndexOutOfRange { plane_index });
+    }
+    let base = 0x7_0180 + pipe.index() * 0x1000 + (plane_index as u32) * 0x100;
+    Ok(PlaneScanoutRegisters {
+        ctl: Register::read_write("PLANE_CTL_MULTI", base, Meaning::BringUp, None),
+        stride: Register::read_write("PLANE_STRIDE_MULTI", base + 8, Meaning::BringUp, None),
+        pos: Register::read_write("PLANE_POS_MULTI", base + 0xc, Meaning::BringUp, None),
+        size: Register::read_write("PLANE_SIZE_MULTI", base + 0x10, Meaning::BringUp, None),
+        offset: Register::read_write("PLANE_OFFSET_MULTI", base + 0x14, Meaning::BringUp, None),
+        surface: Register::read_write("PLANE_SURF_MULTI", base + 0x1c, Meaning::BringUp, None),
+        color_ctl: Register::read_write(
+            "PLANE_COLOR_CTL_MULTI",
+            base + 0x4c,
+            Meaning::BringUp,
+            None,
+        ),
+    })
+}
+
+struct MultiPlaneRegisters {
+    ddb: Register,
+    trans: Register,
+    sagv: Register,
+    sagv_trans: Register,
+    wm_base: u32,
+}
+
+impl MultiPlaneRegisters {
+    fn level(&self, level: usize) -> Register {
+        debug_assert!(level < PLANE_WM_LEVELS);
+        Register::read_write(
+            match level {
+                0 => "PLANE_WM_MULTI_0",
+                1 => "PLANE_WM_MULTI_1",
+                2 => "PLANE_WM_MULTI_2",
+                3 => "PLANE_WM_MULTI_3",
+                4 => "PLANE_WM_MULTI_4",
+                _ => "PLANE_WM_MULTI_5",
+            },
+            self.wm_base + (level as u32) * 4,
+            Meaning::BringUp,
+            None,
+        )
+    }
+}
+
+/// Exact Gen12 plane-register mapping from `skl_universal_plane_regs.h`:
+/// pipe stride `0x1000`, plane stride `0x100`, WM block `+0x240`, DBUF `+0x27c`.
+/// Restricting the index before arithmetic prevents it becoming an arbitrary
+/// DE MMIO offset.  The same source mapping is used for pipes A-D.
+fn plane_registers(pipe: Pipe, plane_index: usize) -> Result<MultiPlaneRegisters, PipeError> {
+    if plane_index >= 4 {
+        return Err(PipeError::PlaneIndexOutOfRange { plane_index });
+    }
+    let base = 0x7_0180 + pipe.index() * 0x1000 + (plane_index as u32) * 0x100;
+    let ddb = Register::read_write(
+        match plane_index {
+            0 => "PLANE_BUF_CFG_MULTI_1",
+            1 => "PLANE_BUF_CFG_MULTI_2",
+            2 => "PLANE_BUF_CFG_MULTI_3",
+            _ => "PLANE_BUF_CFG_MULTI_4",
+        },
+        base + 0xfc,
+        Meaning::BringUp,
+        None,
+    );
+    let wm_base = base + 0xc0;
+    Ok(MultiPlaneRegisters {
+        ddb,
+        wm_base,
+        trans: Register::read_write(
+            "PLANE_WM_MULTI_TRANS",
+            wm_base + 0x28,
+            Meaning::BringUp,
+            None,
+        ),
+        sagv: Register::read_write(
+            "PLANE_WM_MULTI_SAGV",
+            wm_base + 0x20,
+            Meaning::BringUp,
+            None,
+        ),
+        sagv_trans: Register::read_write(
+            "PLANE_WM_MULTI_SAGV_TRANS",
+            wm_base + 0x24,
+            Meaning::BringUp,
+            None,
+        ),
+    })
+}
+
 /// Validate and size non-overlapping, unscaled packed-RGB surfaces using the
 /// translated i915 single-plane watermark helper and its DDB minimums.
 ///
@@ -1868,6 +2150,8 @@ pub(crate) enum PipeError {
     },
     /// A planner-generated DDB range is empty or outside the display buffer.
     DdbAllocationOutOfBounds { start: u32, end: u32 },
+    /// Two planes claim overlapping DBUF blocks.
+    DdbAllocationOverlap { first: usize, second: usize },
     /// The surface stride was zero.
     StrideZero,
     /// The stride is not a multiple of [`PLANE_STRIDE_UNIT_BYTES`], which
@@ -1973,6 +2257,10 @@ impl PipeError {
             Self::DdbAllocationOutOfBounds { start, end } => {
                 format!("planner DBUF range [{start}, {end}) is empty or outside [0, {DDB_BLOCKS})")
             }
+            Self::DdbAllocationOverlap { first, second } => format!(
+                "planes {first} and {second} claim overlapping DBUF blocks; no DDB or watermark \
+                 register was written"
+            ),
             Self::StrideZero => String::from(
                 "the surface stride is zero, which describes no scanline at all.  Reference \
                  section 11 phase 3.2: the stride is the framebuffer's pitch in bytes and must be \
@@ -2210,6 +2498,7 @@ pub(crate) fn arm(regs: &impl Registers, plan: &PipeProgram) -> Result<ArmState,
 
 #[cfg(test)]
 mod multi_plane_plan_tests {
+    use alloc::vec;
     use super::*;
     use crate::drm::modes::CTA_VIC_TIMINGS;
 
@@ -2270,6 +2559,114 @@ mod multi_plane_plan_tests {
                 .iter()
                 .all(|plane| plane.watermark.levels()[0].is_enabled())
         );
+    }
+
+    #[test]
+    fn writes_each_plane_ddb_before_its_source_watermarks() {
+        let mode = mode_1080p();
+        let plan = plan_multi_plane_dbuf(
+            &mode,
+            &[
+                half_screen(0, 0, 0x0100_0000),
+                half_screen(1, 960, 0x0200_0000),
+            ],
+            config(),
+        )
+        .expect("two packed RGB planes should have a DDB plan");
+        let regs = crate::drm::intel::regs::mock::MockRegisters::new();
+
+        program_multi_plane_dbuf(&regs, Pipe::A, &plan)
+            .expect("bounded DDB and watermark writes should be admitted");
+
+        let writes = regs.writes();
+        assert_eq!(writes.len(), 2 * (1 + PLANE_WM_LEVELS + 3));
+        assert_eq!(writes[0].0, "PLANE_BUF_CFG_MULTI_1");
+        assert_eq!(writes[1].0, "PLANE_WM_MULTI_0");
+        assert_eq!(
+            writes[1].1,
+            plan.planes[0].watermark.levels()[0].register_value()
+        );
+        assert_eq!(writes[7].0, "PLANE_WM_MULTI_TRANS");
+        assert_eq!(writes[8].0, "PLANE_WM_MULTI_SAGV");
+        assert_eq!(writes[9].0, "PLANE_WM_MULTI_SAGV_TRANS");
+        assert_eq!(writes[10].0, "PLANE_BUF_CFG_MULTI_2");
+        assert_eq!(writes[10].1, plan.planes[1].ddb.register_value());
+
+        let primary = plane_registers(Pipe::A, 0).unwrap();
+        let sprite = plane_registers(Pipe::A, 1).unwrap();
+        let pipe_b_primary = plane_registers(Pipe::B, 0).unwrap();
+        assert_eq!(primary.ddb.offset(), 0x7027c);
+        assert_eq!(primary.level(0).offset(), 0x70240);
+        assert_eq!(primary.trans.offset(), 0x70268);
+        assert_eq!(sprite.ddb.offset(), 0x7037c);
+        assert_eq!(sprite.level(0).offset(), 0x70340);
+        assert_eq!(pipe_b_primary.ddb.offset(), 0x7127c);
+    }
+
+    #[test]
+    fn multi_plane_update_arms_only_after_each_plane_shadow_and_watermarks() {
+        let mode = mode_1080p();
+        let scanouts = [
+            half_screen(0, 0, 0x0100_0000),
+            half_screen(1, 960, 0x0200_0000),
+        ];
+        let regs = crate::drm::intel::regs::mock::MockRegisters::new();
+
+        let plan = update_multi_plane_scanout(&regs, Pipe::A, &mode, &scanouts, config())
+            .expect("validated two-plane update should complete its checked register writes");
+
+        let writes = regs.writes();
+        let second_arm = writes
+            .iter()
+            .position(|(name, _)| *name == "PLANE_CTL_MULTI")
+            .expect("first control arm is present");
+        assert_eq!(second_arm, 20);
+        assert!(
+            writes[..second_arm]
+                .iter()
+                .all(|(name, _)| *name != "PLANE_SURF_MULTI" && *name != "PLANE_CTL_MULTI")
+        );
+        assert_eq!(writes[second_arm + 1].0, "PLANE_SURF_MULTI");
+        assert_eq!(writes[second_arm + 2].0, "PLANE_CTL_MULTI");
+        assert_eq!(writes[second_arm + 3].0, "PLANE_SURF_MULTI");
+        assert_eq!(plan.planes.len(), 2);
+        assert_eq!(
+            plane_scanout_registers(Pipe::B, 1).unwrap().ctl.offset(),
+            0x71280
+        );
+    }
+
+    #[test]
+    fn multi_plane_disable_clears_only_enable_after_readback() {
+        let regs = crate::drm::intel::regs::mock::MockRegisters::new();
+        let ctl = plane_scanout_registers(Pipe::A, 2).unwrap().ctl;
+        regs.set(ctl, 0x8123_4567);
+
+        disable_multi_plane(&regs, Pipe::A, 2).expect("bounded plane disable write");
+
+        assert_eq!(regs.writes(), vec![("PLANE_CTL_MULTI", 0x0123_4567)]);
+    }
+
+    #[test]
+    fn rejects_overlapping_ddb_before_any_mmio_write() {
+        let mode = mode_1080p();
+        let mut plan = plan_multi_plane_dbuf(
+            &mode,
+            &[
+                half_screen(0, 0, 0x0100_0000),
+                half_screen(1, 960, 0x0200_0000),
+            ],
+            config(),
+        )
+        .expect("two packed RGB planes should have a DDB plan");
+        plan.planes[1].ddb = plan.planes[0].ddb;
+        let regs = crate::drm::intel::regs::mock::MockRegisters::new();
+
+        assert!(matches!(
+            program_multi_plane_dbuf(&regs, Pipe::A, &plan),
+            Err(PipeError::DdbAllocationOverlap { .. })
+        ));
+        assert!(regs.writes().is_empty());
     }
 
     #[test]
