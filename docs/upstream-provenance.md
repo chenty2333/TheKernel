@@ -1522,3 +1522,33 @@ initialization/memtest/type/name dependency functions from
 are retained in the crate. The original LinuxKPI DMA adapter allocates native
 DMA pages and uses requester-scoped tk-vtd mapping/retirement; unknown device
 ownership refuses mapping, and no feature-enabled runtime path is installed.
+
+### G2 LinuxKPI follow-up (2026-10-09)
+
+The GPL Linux core implementations were not copied. Original LinuxKPI owners
+map anonymous shmem/folio/file I/O to the native allocator and page registry,
+MM/VMA/usercopy to `axmm::AddrSpace`, task context to axtask's preemption count,
+DMA to axalloc and requester-scoped tk-vtd, hard-IRQ synchronization to axhal's
+IRQ-boundary active counters, and reservation/fence completion to native locks,
+reference counts and workqueue callbacks. No-swap writeback keeps pages dirty;
+there is no kswapd and unsupported tracepoints emit no events. MM/device owner
+registration remains explicit and is not installed in the product.
+
+Additional Linux 7.2.3 MIT translations (grants retained in the crate):
+
+| Source | Rust owner / translated scope |
+|---|---|
+| `gem/i915_gem_clflush.c`, `i915_sw_fence_work.c` | `i915_gem_clflush_upstream.rs`: all five clflush and eight fence-work C functions plus two header helpers; Linux-core DMA-fence/reservation APIs are original adapters |
+| `gt/intel_engine_pm.c` | `intel_engine_pm_upstream.rs`: all ten C functions; breadcrumbs park/unpark header helpers in their existing owner |
+| `gt/intel_reset.c` | `intel_reset_hw_upstream.rs`: Gen6/Gen8+ hardware-domain reset dependencies, GuC reset and GSC workarounds; selector explicitly limited to the admitted Gen12 target, not an implementation of Gen2–5 reset |
+| `i915_cmd_parser.c` | `i915_cmd_parser_upstream.rs`: all 23 C functions and two command header helpers, including complete Gen7/Haswell/Gen9 command/register tables |
+| `gt/uc/intel_guc_capture.c` | `intel_guc_capture_upstream.rs`: linked output-node/cache lifecycle, extraction, log processing and engine matching dependencies, not the entire file or runtime hookup |
+| `i915_gpu_error.c` | `i915_gpu_error_upstream.rs`: needed capture/store/reset/disable entry points; coredump storage is a native GT-only adapter retaining real GuC nodes, not Linux's full display/VM/compression/debugfs snapshot |
+| `i915_irq.c` | `linux/irq.rs`: `intel_synchronize_hardirq` entry mapped to the registered device's native vector |
+
+The additional files retain Intel Corporation copyright notices (2008–2022 as
+applicable). The measured `crates/ax` totals now supersede the merge snapshot:
+threshold 40: `(0, 0, 0, 414, 405, 0, 0)`; threshold 25:
+`(18, 15, 4, 1318, 1303, 0, 0)`, in the CI baseline's seven-column order.
+Other scopes are unchanged. The feature remains default-off; compilation and
+host tests do not constitute native hardware or runtime integration acceptance.

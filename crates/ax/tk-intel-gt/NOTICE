@@ -182,3 +182,15 @@ threshold 40; at threshold 25, 18 fenced lines / 15 blocks / 4 files and
 1283 outside-fence matches (1268 code). These supersede historical whole-scope
 counts in this NOTICE. MIT i915 Rust translations are counted, not exempted;
 see docs/upstream-provenance.md for the merged-scope measurement.
+
+G2 LinuxKPI follow-up (2026-10-09) additionally translates MIT
+ gem/i915_gem_clflush.c, i915_sw_fence_work.c, gt/intel_engine_pm.c,
+ gt/intel_reset.c (Gen6/Gen8+ dependencies), i915_cmd_parser.c,
+ gt/uc/intel_guc_capture.c (required node/log helpers), i915_gpu_error.c
+ (required entry wrappers), and i915_irq.c intel_synchronize_hardirq.
+Intel Corporation copyrights and MIT grants are retained in source and
+LICENSE-MIT; docs/upstream-provenance.md records full versus partial scope.
+Linux-core LinuxKPI implementations are original TheKernel code, not GPL copies.
+Current whole crates/ax totals supersede the merge measurement above:
+threshold 40: 0 fenced, 414 outside-fence (405 code); threshold 25:
+18 fenced lines / 15 blocks / 4 files, 1318 outside-fence (1303 code).
