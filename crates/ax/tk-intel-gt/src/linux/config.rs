@@ -114,6 +114,8 @@ pub const EOVERFLOW: i32 = 75;
 pub const ETIME: i32 = 62;
 pub const ETIMEDOUT: i32 = 110;
 pub const EOPNOTSUPP: i32 = 95;
+pub const EBADMSG: i32 = 74;
+pub const EMSGSIZE: i32 = 90;
 
 // i915 UAPI / VMA-view values from Linux v7.2.3.
 pub const I915_MADV_WILLNEED: u32 = 0;
