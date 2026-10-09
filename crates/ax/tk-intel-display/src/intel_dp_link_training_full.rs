@@ -1351,16 +1351,19 @@ pub fn intel_dp_link_train_all_phys<I: LinkTrainingIo>(
     let mut passed = true;
     for i in (0..lttpr_count).rev() {
         let phy = DpPhy::Lttpr(i as u8);
-        passed = intel_dp_link_train_phy(dp, io, state, phy);
-        let _ = intel_dp_disable_dpcd_training_pattern(io, phy);
-        if !passed {
+        let trained = intel_dp_link_train_phy(dp, io, state, phy);
+        let pattern_disabled = intel_dp_disable_dpcd_training_pattern(io, phy);
+        if !trained || !pattern_disabled {
+            passed = false;
             break;
         }
     }
     if passed {
         passed = intel_dp_link_train_phy(dp, io, state, DpPhy::Dprx);
     }
-    let _ = intel_dp_disable_dpcd_training_pattern(io, DpPhy::Dprx);
+    if !intel_dp_disable_dpcd_training_pattern(io, DpPhy::Dprx) {
+        passed = false;
+    }
     io.set_idle_link_train(state);
     if passed {
         passed = intel_dp_post_lt_adj_req(dp, io, state);
@@ -1518,10 +1521,15 @@ pub fn intel_dp_128b132b_link_train<I: LinkTrainingIo>(
         false
     };
     if !passed {
-        intel_dp_program_link_training_pattern(dp, io, state, DpPhy::Dprx, DP_TRAINING_PATTERN_2);
+        let _ = intel_dp_program_link_training_pattern(
+            dp,
+            io,
+            state,
+            DpPhy::Dprx,
+            DP_TRAINING_PATTERN_2,
+        );
     }
-    let _ = intel_dp_disable_dpcd_training_pattern(io, DpPhy::Dprx);
-    passed
+    passed && intel_dp_disable_dpcd_training_pattern(io, DpPhy::Dprx)
 }
 
 // upstream: intel_dp_link_training.c intel_dp_start_link_train()
@@ -1851,6 +1859,19 @@ mod tests {
             intel_dp_stop_post_lt_adj_req(&dp, &mut io, &state),
             Err(LinkTrainingError::Aux)
         );
+    }
+
+    #[test]
+    fn training_pattern_disable_requires_complete_aux_write() {
+        let mut io = SourcePhyFailureIo {
+            short_aux_write: true,
+            ..Default::default()
+        };
+        assert!(!intel_dp_disable_dpcd_training_pattern(
+            &mut io,
+            DpPhy::Dprx
+        ));
+        assert_eq!(io.aux_writes, 1);
     }
 
     #[test]
