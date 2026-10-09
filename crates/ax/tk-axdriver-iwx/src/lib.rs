@@ -187,9 +187,7 @@ pub use keys::{
     mld_station_key_command, set_key, station_key_command, validate_legacy_key_response,
 };
 pub use lifecycle::{
-    InitAction, InitOutcome, InterfaceInitState, InterfaceStopState, MCAST_FILTER_COMMAND,
-    MCAST_FILTER_PAYLOAD_BYTES, StopAction, allow_multicast_command, initialize_interface,
-    stop_interface,
+    MCAST_FILTER_COMMAND, MCAST_FILTER_PAYLOAD_BYTES, allow_multicast_command,
 };
 pub use mac::{
     MacAddress, flip_hardware_address, is_valid_mac_address, read_csr_mac_address,

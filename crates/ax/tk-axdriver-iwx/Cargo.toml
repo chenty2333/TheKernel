@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "ISC"
 
+[lints]
+workspace = true
+
 [dependencies]
 axdriver_base = { package = "tk-axdriver-base", path = "../tk-axdriver-base", version = "0.1.0" }
 axdriver_net = { package = "tk-axdriver-net", path = "../tk-axdriver-net", version = "0.1.0" }

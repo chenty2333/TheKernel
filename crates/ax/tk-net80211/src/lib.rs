@@ -2,6 +2,8 @@
 //!
 //! This crate translates the station-mode Ethernet/802.11 frame conversion
 //! performed by OpenBSD net80211 and defines shared wireless frame types.
+//! Copyright (c) 2001 Atsushi Onoe; see `LICENSES/BSD-3-Clause.txt` and the
+//! per-module headers for the remaining upstream copyright notices.
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;

@@ -2,6 +2,12 @@
 //!
 //! The target hardware path is continued in `tk-axdriver-iwx`; this module
 //! wires the upstream PCI match decision into TheKernel's PCI driver walk.
+//! Translated from OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC).
+//! Copyright (c) 2014, 2016 genua gmbh <info@genua.de>
+//! Author: Stefan Sperling <stsp@openbsd.org>
+//! Copyright (c) 2014 Fixup Software Ltd.
+//! Copyright (c) 2017, 2019, 2020 Stefan Sperling <stsp@openbsd.org>
+//! See `crates/ax/tk-axdriver-iwx/LICENSES/ISC.txt`.
 
 use alloc::{collections::VecDeque, vec::Vec};
 #[cfg(feature = "irq")]
@@ -312,6 +318,10 @@ struct PlatformDmaRegion {
     pages: usize,
 }
 
+// SAFETY: this uniquely owned region keeps the allocator's backing allocation
+// and device address stable when moved. CPU access is exclusive through
+// `&mut self` and the controller lock; it is never shared as `Sync` while DMA
+// can target the region.
 unsafe impl Send for PlatformDmaRegion {}
 
 impl DmaRegion for PlatformDmaRegion {
@@ -447,6 +457,9 @@ impl CsrAccess for MmioCsrAccess {
     }
 }
 
+// SAFETY: this value carries only a stable mapped PCI BAR address and length.
+// Access is volatile and bounds-checked, and the device/controller is moved
+// under the driver registry lock; the value is not shared as `Sync`.
 unsafe impl Send for MmioCsrAccess {}
 
 fn map_wireless_sme_error(error: RuntimeStartError) -> DevError {
@@ -856,7 +869,9 @@ impl NetDriverOps for IwxNetDevice {
     }
 
     fn recycle_rx_buffer(&mut self, rx_buf: NetBufPtr) -> DevResult {
-        // SAFETY: receive() returns a pointer produced by this device's pool.
+        // SAFETY: `receive()` transfers this device's unique pooled allocation
+        // as a raw pointer; reconstructing the box consumes it once and returns
+        // it to the same pool.
         drop(unsafe { NetBuf::from_buf_ptr(rx_buf) });
         Ok(())
     }
@@ -870,6 +885,8 @@ impl NetDriverOps for IwxNetDevice {
     }
 
     fn transmit(&mut self, tx_buf: NetBufPtr) -> DevResult {
+        // SAFETY: the stack transfers the unique `NetBufPtr` allocated by this
+        // device for TX; this reconstruction consumes that raw owner once.
         let tx_buf = unsafe { NetBuf::from_buf_ptr(tx_buf) };
         let ethernet = tx_buf.packet_with_header();
         let mut devices = ATTACHED_DMA.lock();
@@ -1122,12 +1139,19 @@ fn clear_station_statistics(
         send_context_command(controller, &command)?;
         return Ok(());
     }
+    let mut wait = axdriver_iwx::SystemStatisticsWait::default();
+    axdriver_iwx::begin_system_statistics_clear(&mut wait);
     controller
         .send_encoded_command(&command, None)
         .map_err(|_| RuntimeStartError::Firmware)?;
     let notification = (u32::from(axdriver_iwx::STATISTICS_SYSTEM_GROUP) << 8)
         | u32::from(axdriver_iwx::SYSTEM_STATISTICS_END_NOTIFICATION);
-    for _ in 0..1_000 {
+    let mut remaining = 1_000;
+    axdriver_iwx::wait_system_statistics_clear(&mut wait, |wait| {
+        if remaining == 0 {
+            return Err(RuntimeStartError::Firmware);
+        }
+        remaining -= 1;
         let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
             &mut controller.registers,
             &controller.interrupt_masks,
@@ -1142,11 +1166,12 @@ fn clear_station_statistics(
             })
             .map_err(|_| RuntimeStartError::Firmware)?;
         if complete {
-            return Ok(());
+            axdriver_iwx::system_statistics_end_notification(wait);
+        } else {
+            controller.registers.delay_us(1_000);
         }
-        controller.registers.delay_us(1_000);
-    }
-    Err(RuntimeStartError::Firmware)
+        Ok(())
+    })
 }
 
 fn station_mac_context(
@@ -2510,6 +2535,12 @@ fn finish_station_association(
             queue_version,
         )
         .map_err(|_| RuntimeStartError::Transmission)?;
+    let multicast = axdriver_iwx::allow_multicast_command(bss.bssid, 0)
+        .map_err(|_| RuntimeStartError::Firmware)?;
+    device
+        .controller
+        .send_encoded_command(&multicast, None)
+        .map_err(|_| RuntimeStartError::Firmware)?;
     let power = axdriver_iwx::build_power_commands(
         axdriver_iwx::default_station_power_config(0, bss.beacon_interval),
         0,
@@ -4030,7 +4061,20 @@ fn stage_rootfs_firmware() {
     }
 }
 
+/// Decline probing when this static network type cannot publish `wlan0`.
+#[cfg(not(any(feature = "dyn", net_dev = "n305-net")))]
+pub(crate) fn probe(
+    _root: &mut PciRoot,
+    _bdf: DeviceFunction,
+    _info: &DeviceFunctionInfo,
+) -> BusProbeResult {
+    // This static device set cannot represent wlan0. Fail before reading the
+    // BAR or changing PCI/DMA state so another driver may safely probe it.
+    BusProbeResult::NotMatched
+}
+
 /// Apply `iwx_match()` to one PCI function, including the BZ/GF runtime RF check.
+#[cfg(any(feature = "dyn", net_dev = "n305-net"))]
 pub(crate) fn probe(
     root: &mut PciRoot,
     bdf: DeviceFunction,
@@ -4166,13 +4210,7 @@ pub(crate) fn probe(
     }
     if publish_device {
         return match IwxNetDevice::try_new(bdf) {
-            #[cfg(any(feature = "dyn", net_dev = "n305-net"))]
             Ok(device) => BusProbeResult::Device(crate::AxDeviceEnum::from_net(device)),
-            #[cfg(not(any(feature = "dyn", net_dev = "n305-net")))]
-            Ok(_device) => {
-                warn!("iwx: {bdf}: this static device set cannot represent the wlan0 link type");
-                BusProbeResult::Claimed
-            }
             Err(error) => {
                 warn!("iwx: {bdf}: could not allocate wlan0 buffers: {error:?}");
                 BusProbeResult::Claimed

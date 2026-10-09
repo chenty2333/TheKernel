@@ -51,7 +51,7 @@ bus-pci = [
     "dep:axsync",
     "dep:lazyinit",
 ]
-default = ["bus-pci", "iwx"]
+default = ["bus-pci"]
 display = ["dep:axdriver_display"]
 dyn = [
     "dep:axerrno",
@@ -65,7 +65,7 @@ dyn = [
 ]
 input = ["dep:axdriver_input"]
 irq = ["axdriver_virtio?/irq"]
-n305-net = ["igc", "rtl8125", "virtio-net"]
+n305-net = ["igc", "rtl8125", "virtio-net", "iwx"]
 rtl8125 = ["net", "axdriver_net/rtl8125", "dep:axalloc", "dep:axhal"]
 rtl8168 = ["rtl8125", "axhal/irq"]
 igc = [

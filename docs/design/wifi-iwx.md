@@ -238,7 +238,9 @@ radio index distinct from the netdev ifindex). CHANGE writes for indexed WLAN
 records now update the registry and stop/restart iwx firmware while the network-service lock serializes radio
 and netdev administrative transitions. Reads still expose the current ADD snapshot rather than a
 per-open asynchronous CHANGE event journal; this remains a minimal rfkill
-implementation, not the complete Linux event stream.
+implementation, not the complete Linux event stream. The device is published
+as misc major/minor 10:242 with mode 0664, matching the Linux misc rfkill
+device number and allowing non-root reads.
 
 The retained controller now offers a queue-validated raw-MPDU transmit entry
 that copies upper-layer payload bytes into DMA-owned storage, serializes the
@@ -267,6 +269,19 @@ management-key commands plus BIP-CMAC software MIC/replay checks. Group
 protected-management transmit and BIP-GMAC/256 are not implemented; other
 cipher suites/AKMs and unsolicited/asynchronous MLME event classes remain
 incomplete.
+
+The adapter's runtime start/stop path remains the authoritative interface
+lifecycle implementation; the unused synthetic `initialize_interface()` and
+`stop_interface()` action-plan helpers were removed. The multicast-filter
+command is now sent during station association, and the source statistics-clear
+wait helper is used by the firmware notification loop.
+
+The driver is opt-in in the general `tk-axdriver` feature set; a static net
+variant that cannot represent `wlan0` returns `NotMatched` before BAR, PCI
+command, MSI-X, DMA, or firmware-callback work. The N305 aggregate static
+net-device variant includes `iwx` and stores each link behind the shared
+`NetDriverOps` trait object, so the PCI registration can publish the named
+wireless interface alongside its other network links.
 
 
 ## Guest user-space payload
