@@ -32,7 +32,7 @@ for source in "$source_dir/tests/guest/graphics/"*.c; do
         intel-va-driver-load)
             libraries="-ldl"
             ;;
-        drm-uapi-oracle|intel-bcs-smoke)
+        drm-uapi-oracle)
             cflags=-I$STAGING_DIR/usr/include/libdrm
             ;;
         device-lease-probe)
@@ -46,6 +46,13 @@ for source in "$source_dir/tests/guest/graphics/"*.c; do
     installed="$installed $target/usr/local/bin/$output"
 done
 [ -n "$installed" ] || { echo "no graphics probe sources found" >&2; exit 1; }
+# The acceptance client is also part of normal shell-rootfs tool discovery.
+# Build that same canonical source into the graphics image's established path;
+# it remains inert unless the user passes an explicit execute mode and DRM node.
+"$compiler" -O2 -std=c11 -Wall -Wextra -Werror \
+    "$source_dir/tests/guest/tools/intel-bcs-smoke.c" \
+    -o "$target/usr/local/bin/intel-bcs-smoke"
+installed="$installed $target/usr/local/bin/intel-bcs-smoke"
 # Intentional word splitting: each installed path is space-joined above.
 # shellcheck disable=SC2086
 chmod 0755 $installed

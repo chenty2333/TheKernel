@@ -413,6 +413,20 @@ sleep() { echo wait; }
         self.assertIn('result("evdev.grab_unowned_release", "FAIL"', evdev_oracle)
         self.assertIn("return failures == 0 ? 0 : 1", evdev_oracle)
 
+    def test_intel_bcs_client_is_shared_by_shell_and_graphics_images(self) -> None:
+        source = ROOT / "tests/guest/tools/intel-bcs-smoke.c"
+        header = ROOT / "tests/guest/tools/intel-rcs-page.h"
+        client = source.read_text()
+        builder = (GRAPHICS / "build-guest-tools.sh").read_text()
+
+        self.assertTrue(header.is_file())
+        self.assertIn("#include <drm/drm.h>", client)
+        self.assertIn("#include <drm/i915_drm.h>", client)
+        self.assertIn('#include "intel-rcs-page.h"', client)
+        self.assertIn('"$source_dir/tests/guest/tools/intel-bcs-smoke.c"', builder)
+        self.assertIn('"$target/usr/local/bin/intel-bcs-smoke"', builder)
+        self.assertFalse((ROOT / "tests/guest/graphics/intel-bcs-smoke.c").exists())
+
     def test_graphics_smoke_hands_an_existing_rootfs_to_the_drive_transport_without_building(self) -> None:
         module = load_script_module("thekernel_product", "tools/thekernel.py")
         with test_tmpdir() as directory:

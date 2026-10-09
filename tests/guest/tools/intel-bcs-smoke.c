@@ -5,8 +5,8 @@
  * a DRM node and confirm the experimental driver with --execute or --rcs-execute.
  */
 #define _GNU_SOURCE
-#include <drm.h>
-#include <i915_drm.h>
+#include <drm/drm.h>
+#include <drm/i915_drm.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>

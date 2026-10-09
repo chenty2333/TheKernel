@@ -74,7 +74,8 @@ plane/timing/GGTT 完整恢复且 fresh frame 后才释放候选页。无法证�
   timeout/reset，无法证明退休则保留全部 DMA owners、禁止再提交；确认 console
   持续可读。当前没有开放真机故障注入，不使用旧 display fail_write 参数。
   GEM/submit/binary/timeline/sync-file、持久 VM/上下文和标准多 BO softpin 链已接通；
-  真实用户程序尚未验收。图形镜像现在包含 `intel-bcs-smoke`，未来用户显式运行
+  真实用户程序尚未验收。普通 shell 与图形镜像现在都包含
+  `intel-bcs-smoke`，未来用户显式运行
   `intel-bcs-smoke --execute /dev/dri/renderD128`，只有真实 ioctl 提交、16384 字节
   readback、binary syncobj wait 和 mmap-after-close 全通过才出现用户态成功标记。
   本轮只编译及测试无参数拒绝入口，未打开主机 DRM。之后分别测试 RCS/iris/ANV。

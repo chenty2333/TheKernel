@@ -336,6 +336,7 @@ ROOTFS_INPUT_FILES = (
 ROOTFS_INPUT_GLOBS = (
     "tests/rootfs/busybox-*.config",
     "tests/guest/tools/*.c",
+    "tests/guest/tools/*.h",
     "tests/guest/portable/*.c",
     "tools/nested/hello/*",
 )

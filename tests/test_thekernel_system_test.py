@@ -124,6 +124,24 @@ class SystemTestGateTests(unittest.TestCase):
                 source.rename(root / "second" / "probe.c")
                 self.assertNotEqual(before, product_state.rootfs_fingerprint())
 
+    def test_rootfs_cache_tracks_guest_tool_header_sources(self) -> None:
+        from tools import product_state
+
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            tools = root / "tests" / "guest" / "tools"
+            tools.mkdir(parents=True)
+            header = tools / "intel-rcs-page.h"
+            header.write_text("static const unsigned page[] = { 1 };\n")
+            with patch.object(product_state, "REPO_ROOT", root), \
+                    patch.object(product_state, "ROOTFS_INPUT_FILES", ()), \
+                    patch.object(product_state, "ROOTFS_INPUT_GLOBS",
+                                 ("tests/guest/tools/*.h",)), \
+                    patch.object(product_state, "ROOTFS_INPUT_ENV", ()):
+                before = product_state.rootfs_fingerprint()
+                header.write_text("static const unsigned page[] = { 2 };\n")
+                self.assertNotEqual(before, product_state.rootfs_fingerprint())
+
     def test_rootfs_cache_tracks_explicit_firmware_bytes_and_notices(self) -> None:
         from tools import product_state
 
