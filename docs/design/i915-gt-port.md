@@ -109,6 +109,13 @@ The active `gt/intel_context.h` owner now supplies 41/41 configured helper defin
 
 The current opt-in check is 2,118 errors. Complete registered source translations now include `i915_active.c` (67), `i915_sw_fence.c` (42), `i915_gem_ww.c` (5), `i915_gem_object.h` active inline helpers (46), `i915_gem_pages.c` (28), `i915_gem_shrinker.c` (19), `intel_context.h` helpers (41), `i915_drm_client.c` (10 plus two header ref helpers), `intel_ring.c` (10), and `i915_gem_context.c`. The active/sw-fence/WW/object API/context API/object-header/page/context/DRM-client modules have no module-local diagnostics in the latest feature check; the remaining shrinker errors identify missing Linux reclaim/swap/notifier/runtime-PM and trace facilities. This is not a successful full feature build or runtime evidence.
 
+### 收尾后的编译状态（2026-10-09）
+
+以上错误计数为历史快照。当前默认构建和 `upstream-gt` 构建均为0错误；
+LinuxKPI 的核心 MM/file/folio/DMA/IRQ API 采用原生实现，不翻译 GPL 核心代码。
+MIT 下层依赖、完整 command parser 与 engine_pm 已补齐；其他文件仅补齐本阶段
+所需函数，详见 provenance。feature 保持默认关闭，以下运行时接线仍未推进。
+
 ## 剩余工作
 
 本收尾阶段保留 `upstream-gt` 默认关闭，不推进以下运行时接线或功能；上游路径均相对于 Linux 7.2.3 `drivers/gpu/drm/i915/`。
