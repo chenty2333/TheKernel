@@ -1992,6 +1992,25 @@ mod tests {
     }
 
     #[test]
+    fn source_pattern_refusal_keeps_hpd_blocked_until_stop() {
+        let mut io = SourcePhyFailureIo::default();
+        let mut dp = IntelDpLinkTraining::default();
+        let state = LinkTrainingCrtcState::default();
+        assert_eq!(
+            intel_dp_start_link_train(&mut dp, &mut io, &state),
+            Ok(LinkTrainingOutcome::RetryDeferred)
+        );
+        assert_eq!(io.hpd_blocks, 1);
+        assert_eq!(io.hpd_unblocks, 0);
+
+        assert_eq!(
+            intel_dp_stop_link_train(&mut dp, &mut io, &state),
+            Err(LinkTrainingError::Refused)
+        );
+        assert_eq!(io.hpd_unblocks, 1);
+    }
+
+    #[test]
     fn setup_aux_error_unblocks_hpd_before_returning() {
         let mut io = SourcePhyFailureIo {
             short_aux_write: true,
