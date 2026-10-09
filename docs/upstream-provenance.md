@@ -2020,9 +2020,10 @@ source path.
 Corporation), preserving suspend/freeze/resume order and TTM calls behind the
 upstream local-memory-region type checks.
 
-`i915_gem_dmabuf_upstream.rs` translates the 13 ctags definitions in Linux
+`i915_gem_dmabuf_upstream.rs` translates all 12 actual C functions in Linux
 7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_dmabuf.c` (MIT, Copyright 2012 Red
-Hat Inc). The `dma_buf` ABI views and Linux PRIME/DMA mappings keep
+Hat Inc); ctags reports one additional `I915_SELFTEST_DECLARE` macro pseudo-tag.
+The `dma_buf` ABI views and Linux PRIME/DMA mappings keep
 their source layout; generic DMA-BUF, DMA map, and VMA services remain external
 LinuxKPI/kernel ownership boundaries.
 

@@ -206,7 +206,6 @@ unsafe extern "C" {
     fn wbinvd_on_all_cpus();
 }
 
-// upstream: i915_gem_dmabuf.c I915_SELFTEST_DECLARE()
 #[cfg(CONFIG_DRM_I915_SELFTEST)]
 static mut force_different_devices: bool = false;
 
