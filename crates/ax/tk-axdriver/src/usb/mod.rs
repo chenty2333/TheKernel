@@ -171,9 +171,13 @@ fn class_control(
 /// Called only after the existing PCI enumerator has mapped/enabled BAR0.
 fn supported_interface(interface: &InterfaceDescriptor) -> bool {
     interface.alternate_setting == 0
-        && ((interface.class == 0xe0 && interface.subclass == 1 && interface.protocol == 1)
+        && (is_bluetooth_hci(interface.class, interface.subclass, interface.protocol)
             || interface.class == 3
             || (interface.class == 8 && interface.subclass == 6 && interface.protocol == 0x50))
+}
+
+fn is_bluetooth_hci(class: u8, subclass: u8, protocol: u8) -> bool {
+    class == 0xe0 && subclass == 1 && protocol == 1
 }
 
 pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
@@ -272,7 +276,7 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
                     )?;
                 }
                 drop(guard);
-                if interface.class == 0xe0 {
+                if is_bluetooth_hci(interface.class, interface.subclass, interface.protocol) {
                     static NEXT_BT_INDEX: core::sync::atomic::AtomicU16 =
                         core::sync::atomic::AtomicU16::new(0);
                     let bluetooth = bluetooth::UsbBluetoothHci::new(
@@ -328,4 +332,17 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
     guard.armed = false;
     Box::leak(controller);
     Ok(devices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_bluetooth_hci;
+
+    #[test]
+    fn bluetooth_requires_hci_interface_subclass_and_protocol() {
+        assert!(is_bluetooth_hci(0xe0, 1, 1));
+        assert!(!is_bluetooth_hci(0xe0, 0, 0));
+        assert!(!is_bluetooth_hci(0xe0, 1, 2));
+        assert!(!is_bluetooth_hci(3, 1, 1));
+    }
 }
