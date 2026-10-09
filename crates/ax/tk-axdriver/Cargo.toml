@@ -65,7 +65,7 @@ dyn = [
 ]
 input = ["dep:axdriver_input"]
 irq = ["axdriver_virtio?/irq"]
-n305-net = ["igc", "rtl8125", "virtio-net"]
+n305-net = ["igc", "rtl8125", "virtio-net", "iwx"]
 rtl8125 = ["net", "axdriver_net/rtl8125", "dep:axalloc", "dep:axhal"]
 rtl8168 = ["rtl8125", "axhal/irq"]
 igc = [
@@ -74,6 +74,7 @@ igc = [
     "dep:axalloc",
     "dep:axhal",
 ]
+iwx = ["net", "bus-pci", "dep:axdriver_iwx", "dep:axalloc", "dep:axhal", "dep:spin", "dep:tk_net80211"]
 ixgbe = [
     "net",
     "axdriver_net/ixgbe",
@@ -338,4 +339,14 @@ optional = true
 [dependencies.axdriver_dbc]
 package = "tk-axdriver-dbc"
 path = "../tk-axdriver-dbc"
+optional = true
+
+[dependencies.axdriver_iwx]
+package = "tk-axdriver-iwx"
+path = "../tk-axdriver-iwx"
+optional = true
+
+[dependencies.tk_net80211]
+package = "tk-net80211"
+path = "../tk-net80211"
 optional = true

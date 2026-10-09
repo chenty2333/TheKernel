@@ -1,4 +1,4 @@
-use alloc::{string::String, vec};
+use alloc::{string::String, vec, vec::Vec};
 use core::task::Waker;
 
 use axdriver::prelude::*;
@@ -633,6 +633,102 @@ impl Device for EthernetDevice {
         STANDARD_MTU
     }
 
+    fn initial_link_up(&self) -> bool {
+        !self.inner.is_wireless()
+    }
+
+    fn set_link_up(&mut self, up: bool) -> AxResult {
+        self.inner.set_link_up(up).map_err(Self::map_dev_error)
+    }
+
+    fn is_wireless(&self) -> bool {
+        self.inner.is_wireless()
+    }
+
+    fn rfkill_soft_blocked(&self) -> bool {
+        self.inner.rfkill_soft_blocked()
+    }
+
+    fn set_rfkill_soft_blocked(&mut self, blocked: bool) -> AxResult {
+        self.inner
+            .set_rfkill_soft_blocked(blocked)
+            .map_err(Self::map_dev_error)
+    }
+
+    fn trigger_wireless_scan(&mut self, request: &WirelessScanRequest) -> AxResult {
+        self.inner
+            .trigger_wireless_scan(request)
+            .map_err(Self::map_dev_error)
+    }
+
+    fn abort_wireless_scan(&mut self) -> AxResult {
+        self.inner
+            .abort_wireless_scan()
+            .map_err(Self::map_dev_error)
+    }
+
+    fn connect_wireless(&mut self, request: &WirelessConnectRequest) -> AxResult {
+        self.inner
+            .connect_wireless(request)
+            .map_err(Self::map_dev_error)
+    }
+
+    fn authenticate_wireless(
+        &mut self,
+        request: &WirelessAuthenticateRequest,
+    ) -> AxResult<WirelessSmeFrame> {
+        self.inner
+            .authenticate_wireless(request)
+            .map_err(Self::map_dev_error)
+    }
+
+    fn associate_wireless(
+        &mut self,
+        request: &WirelessAssociateRequest,
+    ) -> AxResult<WirelessSmeFrame> {
+        self.inner
+            .associate_wireless(request)
+            .map_err(Self::map_dev_error)
+    }
+
+    fn disconnect_wireless_sme(&mut self, reason: u16, disassociate: bool) -> AxResult {
+        self.inner
+            .disconnect_wireless_sme(reason, disassociate)
+            .map_err(Self::map_dev_error)
+    }
+
+    fn disconnect_wireless(&mut self, reason: u16) -> AxResult {
+        self.inner
+            .disconnect_wireless(reason)
+            .map_err(Self::map_dev_error)
+    }
+
+    fn wireless_station_info(&self) -> Option<WirelessStationInfo> {
+        self.inner.wireless_station_info()
+    }
+
+    fn wireless_key_operation(
+        &mut self,
+        operation: WirelessKeyOperation,
+        key: &WirelessKeyConfig,
+    ) -> AxResult<Option<WirelessKeyInfo>> {
+        self.inner
+            .wireless_key_operation(operation, key)
+            .map_err(Self::map_dev_error)
+    }
+
+    fn wireless_scan_results(&self) -> Vec<WirelessBssInfo> {
+        self.inner.wireless_scan_results()
+    }
+
+    fn take_wireless_scan_event(&mut self) -> Option<WirelessScanEvent> {
+        self.inner.take_wireless_scan_event()
+    }
+
+    fn take_wireless_disconnect_event(&mut self) -> Option<WirelessDisconnectEvent> {
+        self.inner.take_wireless_disconnect_event()
+    }
+
     fn has_rx_backlog(&self) -> bool {
         !self.quarantined && self.inner.can_receive()
     }
@@ -687,7 +783,14 @@ impl Device for EthernetDevice {
         if self.quarantined {
             return RxStep::Idle;
         }
-        let rx_buf = match self.inner.receive() {
+        let rx = self.inner.receive();
+        if let Some(event) = self.inner.take_wireless_scan_event() {
+            crate::publish_wireless_scan_event(context.interface_index(), event);
+        }
+        if let Some(event) = self.inner.take_wireless_disconnect_event() {
+            crate::publish_wireless_disconnect_event(context.interface_index(), event);
+        }
+        let rx_buf = match rx {
             Ok(buf) => buf,
             Err(err) => {
                 if !matches!(err, DevError::Again) {

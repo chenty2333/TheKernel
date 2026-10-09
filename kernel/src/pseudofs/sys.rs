@@ -567,7 +567,12 @@ mod tests {
         let filesystem = new_sysfs();
         let root = Mountpoint::new_root(&filesystem);
         let context = FsContext::new(root.root_location());
-        for path in [b"/class/block".as_slice(), b"/class/net", b"/class/thermal"] {
+        for path in [
+            b"/class/block".as_slice(),
+            b"/class/net",
+            b"/class/ieee80211",
+            b"/class/thermal",
+        ] {
             assert!(context.resolve(FsPath::new(path)).is_ok(), "{path:?}");
         }
         #[cfg(any(feature = "pmu", feature = "hwp-uclamp"))]

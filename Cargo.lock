@@ -3246,6 +3246,7 @@ dependencies = [
  "tk-axdriver-display",
  "tk-axdriver-hda",
  "tk-axdriver-input",
+ "tk-axdriver-iwx",
  "tk-axdriver-net",
  "tk-axdriver-nvme",
  "tk-axdriver-pci",
@@ -3255,6 +3256,7 @@ dependencies = [
  "tk-axhal",
  "tk-axsync",
  "tk-axtask",
+ "tk-net80211",
  "tk-ratelimit",
 ]
 
@@ -3296,6 +3298,16 @@ version = "0.1.0"
 dependencies = [
  "strum 0.27.2",
  "tk-axdriver-base",
+]
+
+[[package]]
+name = "tk-axdriver-iwx"
+version = "0.1.0"
+dependencies = [
+ "spin 0.10.1",
+ "tk-axdriver-base",
+ "tk-axdriver-net",
+ "tk-net80211",
 ]
 
 [[package]]
@@ -3954,6 +3966,13 @@ version = "0.1.0"
 dependencies = [
  "axerrno 0.1.2",
  "memory_addr",
+]
+
+[[package]]
+name = "tk-net80211"
+version = "0.1.0"
+dependencies = [
+ "aes",
 ]
 
 [[package]]

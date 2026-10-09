@@ -37,7 +37,7 @@ pub(crate) fn done_message(request: &NlMsgHdr, port_id: u32) -> Vec<u8> {
     out
 }
 
-fn netlink_message(
+pub(crate) fn netlink_message(
     request: &NlMsgHdr,
     port_id: u32,
     msg_type: u16,
@@ -189,7 +189,7 @@ fn push_attr_u32(out: &mut Vec<u8>, attr_type: u16, value: u32) {
     push_attr(out, attr_type, &value.to_ne_bytes());
 }
 
-fn push_attr_string(out: &mut Vec<u8>, attr_type: u16, value: &str) {
+pub(crate) fn push_attr_string(out: &mut Vec<u8>, attr_type: u16, value: &str) {
     let mut bytes = value.as_bytes().to_vec();
     bytes.push(0);
     push_attr(out, attr_type, &bytes);

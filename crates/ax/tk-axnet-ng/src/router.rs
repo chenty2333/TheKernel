@@ -581,12 +581,13 @@ impl Router {
         }
         self.next_ifindex = self.next_ifindex.checked_add(1).unwrap_or(0);
         let mtu = device.mtu();
+        let up = device.initial_link_up();
         self.devices.push(device);
         self.ifindices.push(ifindex);
         self.links.push(LinkState {
             name,
             mtu,
-            up: true,
+            up,
             peer: None,
         });
         Ok(ifindex)
@@ -903,7 +904,8 @@ impl Router {
 
     pub(crate) fn device_stats(&self) -> Vec<(String, DeviceStats)> {
         self.devices
-            .iter().enumerate()
+            .iter()
+            .enumerate()
             .map(|(slot, device)| (self.links[slot].name.clone(), device.stats()))
             .collect()
     }
@@ -982,13 +984,6 @@ impl Router {
                 return Err(AxError::InvalidInput);
             }
         }
-        let link = &mut self.links[slot];
-        if let Some(name) = name {
-            link.name = name;
-        }
-        if let Some(mtu) = mtu {
-            link.mtu = mtu;
-        }
         if let Some(up) = up {
             if !up
                 && self
@@ -998,6 +993,18 @@ impl Router {
             {
                 return Err(AxError::ResourceBusy);
             }
+            if self.links[slot].up != up {
+                self.devices[slot].set_link_up(up)?;
+            }
+        }
+        let link = &mut self.links[slot];
+        if let Some(name) = name {
+            link.name = name;
+        }
+        if let Some(mtu) = mtu {
+            link.mtu = mtu;
+        }
+        if let Some(up) = up {
             if link.up && !up {
                 // The device bridge is a one-shot retained owner.  Dropping
                 // it while administratively down prevents queued ingress
@@ -1007,6 +1014,144 @@ impl Router {
             link.up = up;
         }
         Ok(())
+    }
+
+    pub(crate) fn set_wireless_rfkill_soft_blocked(
+        &mut self,
+        ifindex: u32,
+        blocked: bool,
+    ) -> AxResult {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        self.devices[slot].set_rfkill_soft_blocked(blocked)
+    }
+
+    pub(crate) fn trigger_wireless_scan(
+        &mut self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessScanRequest,
+    ) -> AxResult {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        if !self.links[slot].up {
+            return Err(AxError::BadState);
+        }
+        self.devices[slot].trigger_wireless_scan(request)
+    }
+
+    pub(crate) fn abort_wireless_scan(&mut self, ifindex: u32) -> AxResult {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        self.devices[slot].abort_wireless_scan()
+    }
+
+    pub(crate) fn connect_wireless(
+        &mut self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessConnectRequest,
+    ) -> AxResult {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        if !self.links[slot].up {
+            return Err(AxError::BadState);
+        }
+        self.devices[slot].connect_wireless(request)
+    }
+
+    pub(crate) fn authenticate_wireless(
+        &mut self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessAuthenticateRequest,
+    ) -> AxResult<axdriver::prelude::WirelessSmeFrame> {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        if !self.links[slot].up {
+            return Err(AxError::BadState);
+        }
+        self.devices[slot].authenticate_wireless(request)
+    }
+
+    pub(crate) fn associate_wireless(
+        &mut self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessAssociateRequest,
+    ) -> AxResult<axdriver::prelude::WirelessSmeFrame> {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        if !self.links[slot].up {
+            return Err(AxError::BadState);
+        }
+        self.devices[slot].associate_wireless(request)
+    }
+
+    pub(crate) fn disconnect_wireless_sme(
+        &mut self,
+        ifindex: u32,
+        reason: u16,
+        disassociate: bool,
+    ) -> AxResult {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        self.devices[slot].disconnect_wireless_sme(reason, disassociate)
+    }
+
+    pub(crate) fn disconnect_wireless(&mut self, ifindex: u32, reason: u16) -> AxResult {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        self.devices[slot].disconnect_wireless(reason)
+    }
+
+    pub(crate) fn wireless_station_info(
+        &self,
+        ifindex: u32,
+    ) -> AxResult<axdriver::prelude::WirelessStationInfo> {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        self.devices[slot]
+            .wireless_station_info()
+            .ok_or(AxError::NoSuchDevice)
+    }
+
+    pub(crate) fn wireless_key_operation(
+        &mut self,
+        ifindex: u32,
+        operation: axdriver::prelude::WirelessKeyOperation,
+        key: &axdriver::prelude::WirelessKeyConfig,
+    ) -> AxResult<Option<axdriver::prelude::WirelessKeyInfo>> {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        self.devices[slot].wireless_key_operation(operation, key)
+    }
+
+    pub(crate) fn wireless_scan_results(
+        &self,
+        ifindex: u32,
+    ) -> AxResult<Vec<axdriver::prelude::WirelessBssInfo>> {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(self.devices[slot].wireless_scan_results())
     }
 
     pub(crate) fn routes(&self) -> Vec<RouteInfo> {
@@ -2089,6 +2234,55 @@ mod tests {
         }
     }
 
+    struct WirelessLinkDevice(Arc<Mutex<Vec<bool>>>);
+    impl Device for WirelessLinkDevice {
+        fn name(&self) -> &str {
+            "wlan0"
+        }
+        fn stats(&self) -> DeviceStats {
+            DeviceStats::default()
+        }
+        fn interface_kind(&self) -> crate::device::InterfaceKind {
+            crate::device::InterfaceKind::Ethernet
+        }
+        fn mtu(&self) -> usize {
+            LOOPBACK_MTU
+        }
+        fn initial_link_up(&self) -> bool {
+            false
+        }
+        fn set_link_up(&mut self, up: bool) -> AxResult {
+            self.0.lock().unwrap().push(up);
+            Ok(())
+        }
+        fn rx_wake_required(&self) -> bool {
+            true
+        }
+        fn rx_poll_interval_micros(&self) -> Option<u64> {
+            Some(10_000)
+        }
+        fn recv(
+            &mut self,
+            _context: PacketDeviceContext<'_>,
+            _buffer: &mut IngressPacketBuffer,
+            _timestamp: Instant,
+        ) -> RxStep {
+            RxStep::Idle
+        }
+        fn send(
+            &mut self,
+            _context: PacketDeviceContext<'_>,
+            _next_hop: IpAddress,
+            _packet: &[u8],
+            _timestamp: Instant,
+        ) -> bool {
+            false
+        }
+        fn register_waker(&self, _: &Waker) -> Result<(), axpoll::PollRegistrationError> {
+            Ok(())
+        }
+    }
+
     fn router_with_devices(devices: impl IntoIterator<Item = Box<dyn Device>>) -> Router {
         let listen_table = Arc::new(ListenTable::try_new().unwrap());
         let mut router = Router::try_new_loopback_only(listen_table).unwrap();
@@ -2170,6 +2364,19 @@ mod tests {
         // Ethernet-shaped interfaces.
         let (software, _) = FakeDevice::new("software", core::iter::empty());
         assert_eq!(router.try_add_device(Box::new(software)), Ok(1));
+    }
+
+    #[test]
+    fn wireless_link_starts_down_and_applies_only_admin_transitions() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut router =
+            router_with_devices([Box::new(WirelessLinkDevice(events.clone())) as Box<dyn Device>]);
+        assert!(!router.interfaces()[0].administrative_up);
+        router.configure_link(1, None, None, Some(true)).unwrap();
+        router.configure_link(1, None, None, Some(true)).unwrap();
+        assert!(router.interfaces()[0].administrative_up);
+        router.configure_link(1, None, None, Some(false)).unwrap();
+        assert_eq!(*events.lock().unwrap(), [true, false]);
     }
 
     #[test]

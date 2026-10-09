@@ -1,6 +1,11 @@
 use alloc::{string::String, vec::Vec};
 use core::task::Waker;
 
+use axdriver::prelude::{
+    WirelessAssociateRequest, WirelessAuthenticateRequest, WirelessBssInfo, WirelessConnectRequest,
+    WirelessDisconnectEvent, WirelessKeyConfig, WirelessKeyInfo, WirelessKeyOperation,
+    WirelessScanEvent, WirelessScanRequest, WirelessSmeFrame, WirelessStationInfo,
+};
 use axerrno::{AxError, AxResult};
 use axpoll::{PollRegistrationError, PollSet, RegisterError, RegistrationToken, UpdateError};
 use axsync::spin::SpinNoIrq;
@@ -219,6 +224,87 @@ pub trait Device: Send + Sync {
     fn stats(&self) -> DeviceStats;
     fn interface_kind(&self) -> InterfaceKind;
     fn mtu(&self) -> usize;
+
+    /// Whether the interface should be administratively up at publication.
+    fn initial_link_up(&self) -> bool {
+        true
+    }
+
+    /// Apply a link's administrative up/down transition to a hardware owner.
+    fn set_link_up(&mut self, _up: bool) -> AxResult {
+        Ok(())
+    }
+
+    fn is_wireless(&self) -> bool {
+        false
+    }
+
+    fn rfkill_soft_blocked(&self) -> bool {
+        false
+    }
+
+    fn set_rfkill_soft_blocked(&mut self, _blocked: bool) -> AxResult {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn trigger_wireless_scan(&mut self, _request: &WirelessScanRequest) -> AxResult {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn abort_wireless_scan(&mut self) -> AxResult {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn connect_wireless(&mut self, _request: &WirelessConnectRequest) -> AxResult {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn authenticate_wireless(
+        &mut self,
+        _request: &WirelessAuthenticateRequest,
+    ) -> AxResult<WirelessSmeFrame> {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn associate_wireless(
+        &mut self,
+        _request: &WirelessAssociateRequest,
+    ) -> AxResult<WirelessSmeFrame> {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn disconnect_wireless_sme(&mut self, _reason: u16, _disassociate: bool) -> AxResult {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn disconnect_wireless(&mut self, _reason: u16) -> AxResult {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn wireless_station_info(&self) -> Option<WirelessStationInfo> {
+        None
+    }
+
+    fn wireless_key_operation(
+        &mut self,
+        _operation: WirelessKeyOperation,
+        _key: &WirelessKeyConfig,
+    ) -> AxResult<Option<WirelessKeyInfo>> {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn wireless_scan_results(&self) -> Vec<WirelessBssInfo> {
+        Vec::new()
+    }
+
+    fn take_wireless_scan_event(&mut self) -> Option<WirelessScanEvent> {
+        None
+    }
+
+    /// Take one authenticated spontaneous wireless disconnect indication.
+    fn take_wireless_disconnect_event(&mut self) -> Option<WirelessDisconnectEvent> {
+        None
+    }
 
     fn hardware_address(&self) -> Option<[u8; 6]> {
         None

@@ -357,6 +357,11 @@ TOOL_PAYLOADS += ("containers", "debug")
 ROOTFS_INPUT_FILES += ("scripts/build-debug-payload.sh", "config/guest-debug-apk-pins.tsv")
 ROOTFS_INPUT_GLOBS += ("tests/guest/debugger/*",)
 TOOL_PAYLOADS += ("acpica",)
+TOOL_PAYLOADS += ("wireless",)
+ROOTFS_INPUT_FILES += (
+    "scripts/build-wireless-payload.sh",
+    "config/guest-wireless-apk-pins.tsv",
+)
 
 
 def selected_tool_payload(requested: str | None = None) -> str:
@@ -395,7 +400,8 @@ def rootfs_image_bytes(payload: str) -> int:
     # class; 160 MiB would leave under 30 MiB free, which is not enough room for
     # a compile's intermediate files.
     return {"none": 160, "tcc": 160, "nested": 224, "glibc": 160,
-            "gcc": 224, "inspect": 160, "containers": 384, "debug": 224, "acpica": 160}[payload] * 1024 * 1024
+            "gcc": 224, "inspect": 160, "containers": 384, "debug": 224,
+            "acpica": 160, "wireless": 160}[payload] * 1024 * 1024
 
 
 

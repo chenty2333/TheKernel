@@ -527,3 +527,38 @@ libgallium from the existing same-version source/CLC/toolchain, retaining the
 Mesa/Buildroot package license obligations already registered above. No Mesa
 binary is committed. The dedicated flavor and loader check are original
 project scripts; they do not import a LinuxKPI, GPL driver body or new firmware.
+
+The optional AX211 rootfs payload stages only the linux-firmware
+`iwlwifi-so-a0-gf-a0-89.ucode` API 89 image and matching
+`iwlwifi-so-a0-gf-a0.pnvm`; it copies the upstream `LICENCE.iwlwifi_firmware`
+to `/usr/share/licenses/linux-firmware/` next to the payload's license record.
+These firmware binaries are supplied by the caller via
+`THEKERNEL_IWX_FIRMWARE_DIR` and are not checked into this repository.
+
+The `tk-net80211` wireless protocol crate uses OpenBSD BSD-3-Clause grants for
+frame conversion, RSN/WPA parsing and RSSI rate adaptation, and retains the
+OpenBSD custom ISC-style grant for HT rate adaptation. Their copyright lines
+and full grant texts are retained in the crate's `LICENSES/`. Fuchsia BSD-3-
+Clause WLAN libraries remain the selected source for later EAPOL/RSN/MLME
+reuse.
+The OpenBSD HT rate adaptation and regulatory-domain translations in
+`tk-net80211` retain their ISC-style source grants in `LICENSES/OpenBSD-ISC.txt`.
+The OpenBSD CCMP/TKIP PN/TSC extraction helpers retain their custom ISC-style
+grant and Damien Bergamini attribution in `tk-net80211/LICENSES/OpenBSD-ISC.txt`.
+
+The nl80211 public UAPI constants and family-name/multicast-group layout used
+by `kernel/src/file/netlink/nl80211.rs` derive from Linux
+`include/uapi/linux/nl80211.h` (ISC-style permission grant); copyright lines and
+the complete grant are retained in `kernel/LICENSES/ISC.txt`. GPL cfg80211,
+mac80211 and Linux generic-netlink implementation code were not copied.
+
+The OpenBSD software CCMP translation in `tk-net80211/src/crypto_ccmp.rs`
+retains its ISC grant in `tk-net80211/LICENSES/OpenBSD-ISC.txt`; AES-128 block
+operations use the crates.io `aes` 0.8.4 dependency (MIT OR Apache-2.0), already
+used by the kernel. No AES implementation source was copied into this crate.
+The OpenBSD BIP, WEP, and station TKIP translations in `tk-net80211` use the
+same retained `OpenBSD-ISC.txt` grant; the AP-only TKIP callbacks are omitted
+because this driver port is station-only.
+The shared key dispatch from OpenBSD `ieee80211_crypto.c` also carries its ISC
+grant in that same package license file; its source revision and translated
+function boundary are listed in `docs/upstream-provenance.md`.
