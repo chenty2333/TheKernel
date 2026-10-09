@@ -140,7 +140,9 @@ unsafe fn flush_write_domain(obj: *mut DrmI915GemObject, flush_domains: u32) {
     match (*obj).write_domain as u32 {
         I915_GEM_DOMAIN_GTT => {
             spin_lock(&mut (*obj).vma.lock);
-            for_each_ggtt_vma(obj, |vma| i915_vma_flush_writes(vma));
+            crate::for_each_ggtt_vma!(vma, obj, {
+                i915_vma_flush_writes(vma);
+            });
             spin_unlock(&mut (*obj).vma.lock);
 
             i915_gem_object_frontbuffer_flush(obj, ORIGIN_CPU);
@@ -309,7 +311,7 @@ pub unsafe fn i915_gem_object_set_to_gtt_domain(obj: *mut DrmI915GemObject, writ
         (*obj).mm.set_dirty();
 
         spin_lock(&mut (*obj).vma.lock);
-        for_each_ggtt_vma(obj, |vma| {
+        crate::for_each_ggtt_vma!(vma, obj, {
             if i915_vma_is_bound(vma, I915_VMA_GLOBAL_BIND) {
                 i915_vma_set_ggtt_write(vma);
             }
