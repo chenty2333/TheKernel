@@ -91,6 +91,10 @@ pub struct RtlNic<H: Hal, B: Bus, const N: usize> {
     counters: super::health::Counters,
     monitor: super::health::Monitor,
     firmware_stage: &'static str,
+    // A failed firmware operation after MAC reset must not leave the stack
+    // publishing fresh DMA descriptors to an uninitialized device. This is
+    // software admission, not a claim that hardware DMA has stopped.
+    data_path_ready: bool,
 }
 // DMA pointers denote exclusive allocations; &mut self serializes CPU access.
 unsafe impl<H: Hal, B: Bus, const N: usize> Send for RtlNic<H, B, N> {}
@@ -125,12 +129,14 @@ impl<H: Hal, B: Bus, const N: usize> RtlNic<H, B, N> {
             counters: super::health::Counters::default(),
             monitor: super::health::Monitor::default(),
             firmware_stage: "warm-PXE-no-firmware-attempt",
+            data_path_ready: false,
         };
         bringup::reset(&mut nic.bus, chip)?;
         for index in 0..N {
             nic.arm_rx(index);
         }
         bringup::program(&mut nic.bus, chip, nic.tx_desc.address, nic.rx_desc.address)?;
+        nic.data_path_ready = true;
         Ok(nic)
     }
     /// Read-only status snapshot; PHY OCP reads do not write PHY values and
@@ -230,9 +236,7 @@ impl<H: Hal, B: Bus, const N: usize> Drop for RtlNic<H, B, N> {
             || self.rx_loan.contains(&true)
             || self.tx_loan.contains(&CALLER)
         {
-            log::warn!(
-                "r8169: DMA stop or packet-loan release unconfirmed; retaining DMA memory"
-            );
+            log::warn!("r8169: DMA stop or packet-loan release unconfirmed; retaining DMA memory");
             return;
         }
         // SAFETY: reset completed, so no DMA can access these allocations;
@@ -276,6 +280,7 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
                 return super::health::stage(self.firmware_stage, Err(DevError::ResourceBusy));
             }
             self.firmware_stage = "firmware-MAC-reset";
+            self.data_path_ready = false;
             super::health::stage(
                 self.firmware_stage,
                 bringup::reset(&mut self.bus, self.chip),
@@ -290,7 +295,25 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
             self.firmware_stage = "firmware-ring-rearm";
             for index in 0..N {
                 self.arm_rx(index);
+                // MAC reset restarts descriptor fetch at slot zero. Every
+                // loan was checked quiescent before reset; do not retain a
+                // software TX cursor pointing past the hardware cursor.
+                // SAFETY: reset succeeded, TX borrowers are absent, and the
+                // descriptor remains CPU-owned (OWN is clear).
+                unsafe {
+                    d::publish(
+                        self.descriptor(false, index),
+                        0,
+                        if index == N - 1 { d::END } else { 0 },
+                    );
+                }
             }
+            self.tx_lengths = [0; N];
+            self.tx_loan = [FREE; N];
+            self.tx_slots = [0; N];
+            self.tx_head = 0;
+            self.tx_tail = 0;
+            self.tx_used = 0;
             self.rx_head = 0;
             self.firmware_stage = "firmware-MAC-program";
             super::health::stage(
@@ -303,14 +326,16 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
                 ),
             )?;
             self.firmware_stage = "ready-after-firmware";
+            self.data_path_ready = true;
             Ok(())
         })();
         let snapshot = self.snapshot();
         if result.is_err() {
             log::warn!(
-                "\x013RTL8168_FIRMWARE_FAILED stage={} state={snapshot:?}; MAC may be stopped; no \
+                "\x013RTL8168_FIRMWARE_FAILED stage={} data_path_ready={} state={snapshot:?}; no \
                  automatic recovery",
-                self.firmware_stage
+                self.firmware_stage,
+                self.data_path_ready
             );
         } else {
             log::info!(
@@ -324,10 +349,11 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
         EthernetAddress(self.mac)
     }
     fn can_transmit(&self) -> bool {
-        self.tx_used < N - 1 && self.tx_loan.contains(&FREE)
+        self.data_path_ready && self.tx_used < N - 1 && self.tx_loan.contains(&FREE)
     }
     fn can_receive(&self) -> bool {
-        !self.rx_loan[self.rx_head]
+        self.data_path_ready
+            && !self.rx_loan[self.rx_head]
             && unsafe { d::status(self.descriptor(true, self.rx_head)) } & d::OWN == 0
     }
     fn rx_queue_size(&self) -> usize {
@@ -337,6 +363,9 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
         N - 1
     }
     fn alloc_tx_buffer(&mut self, size: usize) -> DevResult<NetBufPtr> {
+        if !self.data_path_ready {
+            return Err(DevError::BadState);
+        }
         if size == 0 || size > d::MAX_FRAME {
             return Err(DevError::InvalidParam);
         }
@@ -357,6 +386,9 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
         Ok(NetBufPtr::new(pointer, pointer, size))
     }
     fn transmit(&mut self, buffer: NetBufPtr) -> DevResult {
+        if !self.data_path_ready {
+            return Err(DevError::BadState);
+        }
         let index = self.tx_data.index(&buffer, N).ok_or(DevError::BadState)?;
         if buffer.packet_len() != self.tx_lengths[index]
             || self.tx_loan[index] != CALLER
@@ -402,6 +434,9 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
         Ok(())
     }
     fn receive(&mut self) -> DevResult<NetBufPtr> {
+        if !self.data_path_ready {
+            return Err(DevError::BadState);
+        }
         self.diagnostic_tick();
         for _ in 0..N {
             let index = self.rx_head;
@@ -465,6 +500,79 @@ mod tests {
         assert_eq!(nic.firmware_stage, "firmware-parse");
         assert_eq!(nic.snapshot().command, r::RX_TX_ENABLE); // bad header did not pretend to reset/recover
     }
+    fn minimal_firmware() -> std::vec::Vec<u8> {
+        [0x801f_0a43u32, 0x8010_0055]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect()
+    }
+
+    #[test]
+    fn firmware_parse_and_busy_failures_preserve_the_running_warm_path() {
+        let mut nic = RtlNic::<FakeHal, _, 4>::new(FakeBus::h8168()).unwrap();
+        assert!(nic.can_transmit());
+        assert!(nic.load_firmware(&[1]).is_err());
+        assert!(nic.can_transmit());
+        let packet = nic.alloc_tx_buffer(42).unwrap();
+        assert!(matches!(
+            nic.load_firmware(&minimal_firmware()),
+            Err(DevError::ResourceBusy)
+        ));
+        assert!(nic.can_transmit());
+        nic.transmit(packet).unwrap();
+    }
+
+    #[test]
+    fn firmware_failures_after_reset_fence_new_dma_until_explicit_success() {
+        for stuck_reset in [false, true] {
+            let mut nic = RtlNic::<FakeHal, _, 4>::new(FakeBus::h8168()).unwrap();
+            nic.bus.stuck_reset = stuck_reset;
+            nic.bus.stuck_indirect = !stuck_reset;
+            assert!(nic.load_firmware(&minimal_firmware()).is_err());
+            assert!(!nic.can_transmit());
+            assert!(!nic.can_receive());
+            let writes = nic.bus.writes.len();
+            assert!(matches!(nic.alloc_tx_buffer(42), Err(DevError::BadState)));
+            assert!(matches!(nic.receive(), Err(DevError::BadState)));
+            assert_eq!(nic.bus.writes.len(), writes);
+            assert_eq!(nic.tx_used, 0);
+            nic.bus.stuck_reset = false;
+            nic.bus.stuck_indirect = false;
+            nic.load_firmware(&minimal_firmware()).unwrap();
+            assert!(nic.can_transmit());
+            assert_eq!(nic.firmware_stage, "ready-after-firmware");
+        }
+    }
+
+    #[test]
+    fn firmware_reset_restarts_both_hardware_and_software_tx_at_slot_zero() {
+        let mut nic = RtlNic::<FakeHal, _, 4>::new(FakeBus::h8168()).unwrap();
+        let packet = nic.alloc_tx_buffer(42).unwrap();
+        nic.transmit(packet).unwrap();
+        // SAFETY: fake hardware completes the sole outstanding descriptor.
+        unsafe {
+            (*nic.descriptor(false, 0)).options &= !d::OWN;
+        }
+        nic.recycle_tx_buffers().unwrap();
+        assert_eq!((nic.tx_head, nic.tx_tail, nic.tx_used), (1, 1, 0));
+        nic.load_firmware(&minimal_firmware()).unwrap();
+        assert_eq!((nic.tx_head, nic.tx_tail, nic.tx_used), (0, 0, 0));
+        // SAFETY: the fake NIC owns the live four-entry ring with no device DMA.
+        let statuses = unsafe {
+            (
+                d::status(nic.descriptor(false, 0)),
+                d::status(nic.descriptor(false, 3)),
+            )
+        };
+        assert_eq!(statuses, (0, d::END));
+        let packet = nic.alloc_tx_buffer(42).unwrap();
+        nic.transmit(packet).unwrap();
+        // SAFETY: descriptor zero is live and only this fake NIC accesses it.
+        let status = unsafe { d::status(nic.descriptor(false, 0)) };
+        assert_ne!(status & d::OWN, 0);
+        assert_eq!((nic.tx_head, nic.tx_tail, nic.tx_used), (0, 1, 1));
+    }
+
     #[test]
     fn failed_allocations_release_unpublished_prefix_but_failed_reset_retains_dma() {
         let (a, f) = FakeHal::counts();
