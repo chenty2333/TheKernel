@@ -1549,11 +1549,20 @@ pub fn intel_dp_start_link_train<I: LinkTrainingIo>(
     // A capability/AUX error is not equivalent to a sink with no repeaters.
     // Keep it visible to the caller instead of attempting training with an
     // invented zero-LTTPR topology.
-    let mut lttpr_count = intel_dp_init_lttpr_and_dprx_caps(dp, io)?;
+    let mut lttpr_count = match intel_dp_init_lttpr_and_dprx_caps(dp, io) {
+        Ok(count) => count,
+        Err(error) => {
+            io.hpd_unblock();
+            return Err(error);
+        }
+    };
     if lttpr_count < 0 {
         lttpr_count = 0;
     }
-    intel_dp_prepare_link_train(dp, io, state)?;
+    if let Err(error) = intel_dp_prepare_link_train(dp, io, state) {
+        io.hpd_unblock();
+        return Err(error);
+    }
     let passed = if state.uhbr {
         intel_dp_128b132b_link_train(dp, io, state, lttpr_count)
     } else {
@@ -1666,6 +1675,7 @@ mod tests {
         aux_writes: usize,
         short_aux_write: bool,
         fail_caps_read: bool,
+        hpd_unblocks: usize,
     }
 
     impl LinkTrainingIo for SourcePhyFailureIo {
@@ -1753,6 +1763,9 @@ mod tests {
         }
         fn connected(&mut self) -> bool {
             true
+        }
+        fn hpd_unblock(&mut self) {
+            self.hpd_unblocks += 1;
         }
     }
 
@@ -1900,5 +1913,20 @@ mod tests {
             Err(LinkTrainingError::Aux)
         );
         assert_eq!(io.aux_writes, 0);
+        assert_eq!(io.hpd_unblocks, 1);
+    }
+
+    #[test]
+    fn setup_aux_error_unblocks_hpd_before_returning() {
+        let mut io = SourcePhyFailureIo {
+            short_aux_write: true,
+            ..Default::default()
+        };
+        let mut dp = IntelDpLinkTraining::default();
+        assert_eq!(
+            intel_dp_start_link_train(&mut dp, &mut io, &LinkTrainingCrtcState::default()),
+            Err(LinkTrainingError::Aux)
+        );
+        assert_eq!(io.hpd_unblocks, 1);
     }
 }
