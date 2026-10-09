@@ -64,14 +64,15 @@ Each phase is a separate commit with focused host/kernel compile checks. The old
 
 ### Opt-in selection, error handling, and N305 validation
 
-**Implementation status: the selector and generic Native `ModesetOps` adapter
-are not implemented yet.** Thus `intel.native_modeset=1` is currently only the
-agreed future switch, not a working feature. With no selector present, Native
-continues to use the current TC transaction and its rollback, regardless of
-that parameter. The existing top-level `intel.modeset=1` write opt-in remains
-required. Once implemented, the new path must not automatically retry through
-the old transaction: an error follows the translated commit's cleanup/unwind
-path and then fails the commit. If cleanup cannot prove
+**Implementation status: the opt-in selector is implemented, but the generic
+Native `ModesetOps` adapter is not.** With `intel.native_modeset=1`, commits
+are refused before the legacy TC transaction can touch hardware; this is a
+fail-closed staging gate, not a working atomic modeset feature. With the
+parameter absent (or not exactly `1`), Native continues to use the current TC
+transaction and its rollback. The existing top-level `intel.modeset=1` write
+opt-in remains required. Once the generic path is implemented, it must not
+automatically retry through the old transaction: an error follows the
+translated commit's cleanup/unwind path and then fails the commit. If cleanup cannot prove
 that pipe, plane, PLL, CDCLK, DDI/TC and power-domain state are restored, the
 adapter must mark the device lost and retain/quarantine every possibly scanned
 out DMA binding. It must not start a second writer against uncertain hardware.

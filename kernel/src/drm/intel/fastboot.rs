@@ -717,6 +717,23 @@ struct Native<R, T> {
     state: Mutex<State>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeModesetPath {
+    /// Preserve the established transactional TC modeset and rollback.
+    LegacyTc,
+    /// Reserved for the translated atomic commit path. Until its Native
+    /// adapter is complete, this selection fails before touching hardware.
+    NativeAtomic,
+}
+
+fn select_native_modeset_path(value: Option<&str>) -> NativeModesetPath {
+    if value == Some("1") {
+        NativeModesetPath::NativeAtomic
+    } else {
+        NativeModesetPath::LegacyTc
+    }
+}
+
 /// Re-read the selected TC PLL through the translated generic manager while
 /// the Native-owned pin keeps the source-mapped display/PHY domains alive.
 fn translated_tc_dpll_readout<R: Registers, T: PollTimer>(
@@ -1640,6 +1657,16 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             .map_err(|_| DrmError::NoMemory)
     }
     fn present(&self, s: Scanout) -> DrmResult<Arc<Fence>> {
+        match select_native_modeset_path(axhal::boot::command_line_value("intel.native_modeset")) {
+            NativeModesetPath::LegacyTc => {}
+            NativeModesetPath::NativeAtomic => {
+                // The option is deliberately fail-closed until the complete
+                // source ModesetOps adapter and its rollback owner are wired.
+                // In particular, never fall through to the legacy transaction
+                // after an explicitly requested atomic-path commit.
+                return Err(DrmError::Unsupported);
+            }
+        }
         let Some(target) = self.modes.iter().find(|mode| mode.kms == s.mode).copied() else {
             return Err(DrmError::Unsupported);
         };
@@ -2715,6 +2742,26 @@ mod tests {
     use core::sync::atomic::AtomicU64;
 
     use super::{super::gtt::PageTable, *};
+
+    #[test]
+    fn native_modeset_parameter_is_opt_in_and_never_silently_falls_back() {
+        assert_eq!(
+            select_native_modeset_path(None),
+            NativeModesetPath::LegacyTc
+        );
+        assert_eq!(
+            select_native_modeset_path(Some("0")),
+            NativeModesetPath::LegacyTc
+        );
+        assert_eq!(
+            select_native_modeset_path(Some("1")),
+            NativeModesetPath::NativeAtomic
+        );
+        assert_eq!(
+            select_native_modeset_path(Some("true")),
+            NativeModesetPath::LegacyTc
+        );
+    }
 
     fn source_watermark_fixture() -> super::super::pipe::WatermarkConfig {
         super::super::pipe::WatermarkConfig {
