@@ -220,8 +220,19 @@ pub trait LinkTrainingIo {
         flags: u32,
     ) -> u64;
     fn max_link_data_rate(&mut self, link_rate: i32, lane_count: u8) -> u64;
-    fn source_pattern(&mut self, state: &LinkTrainingCrtcState, pattern: u8);
-    fn source_signal_levels(&mut self, state: &LinkTrainingCrtcState, train_set: &[u8; 4]);
+    /// Program a source-side pattern and report PHY/MMIO refusal. A successful
+    /// sink AUX write cannot make training pass if the transmitter rejected it.
+    fn source_pattern(
+        &mut self,
+        state: &LinkTrainingCrtcState,
+        pattern: u8,
+    ) -> Result<(), LinkTrainingError>;
+    /// Program source voltage/pre-emphasis and report PHY/MMIO refusal.
+    fn source_signal_levels(
+        &mut self,
+        state: &LinkTrainingCrtcState,
+        train_set: &[u8; 4],
+    ) -> Result<(), LinkTrainingError>;
     fn prepare_link_retrain(&mut self, _state: &LinkTrainingCrtcState) {}
     fn compute_rate(&mut self, port_clock: i32) -> (u8, u8);
     fn reload_supported_link_rates(&mut self) {}
@@ -597,7 +608,9 @@ pub fn intel_dp_set_link_train<I: LinkTrainingIo>(
     phy: DpPhy,
     pattern: u8,
 ) -> bool {
-    intel_dp_program_link_training_pattern(dp, io, state, phy, pattern);
+    if !intel_dp_program_link_training_pattern(dp, io, state, phy, pattern) {
+        return false;
+    }
     let mut buf = [0u8; 5];
     buf[0] = pattern;
     let lanes = (state.lane_count as usize).min(4);
@@ -625,8 +638,9 @@ pub fn intel_dp_program_link_training_pattern<I: LinkTrainingIo>(
     state: &LinkTrainingCrtcState,
     _phy: DpPhy,
     pattern: u8,
-) {
-    io.source_pattern(state, training_pattern_symbol(pattern));
+) -> bool {
+    io.source_pattern(state, training_pattern_symbol(pattern))
+        .is_ok()
 }
 
 const fn training_pattern_symbol(pattern: u8) -> u8 {
@@ -639,9 +653,11 @@ pub fn intel_dp_set_signal_levels<I: LinkTrainingIo>(
     io: &mut I,
     state: &LinkTrainingCrtcState,
     phy: DpPhy,
-) {
+) -> bool {
     if intel_dp_phy_is_downstream_of_source(dp, phy) {
-        io.source_signal_levels(state, &dp.train_set);
+        io.source_signal_levels(state, &dp.train_set).is_ok()
+    } else {
+        true
     }
 }
 
@@ -654,7 +670,9 @@ pub fn intel_dp_reset_link_train<I: LinkTrainingIo>(
     pattern: u8,
 ) -> bool {
     dp.train_set = [0; 4];
-    intel_dp_set_signal_levels(dp, io, state, phy);
+    if !intel_dp_set_signal_levels(dp, io, state, phy) {
+        return false;
+    }
     intel_dp_set_link_train(dp, io, state, phy, pattern)
 }
 
@@ -665,7 +683,9 @@ pub fn intel_dp_update_link_train<I: LinkTrainingIo>(
     state: &LinkTrainingCrtcState,
     phy: DpPhy,
 ) -> bool {
-    intel_dp_set_signal_levels(dp, io, state, phy);
+    if !intel_dp_set_signal_levels(dp, io, state, phy) {
+        return false;
+    }
     let address = match phy {
         DpPhy::Dprx => DP_TRAINING_LANE0_SET,
         DpPhy::Lttpr(i) => 0xf0011 + (i as u32) * 0x50,
