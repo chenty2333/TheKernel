@@ -275,6 +275,9 @@ fn requester_id(requester: Option<DmaRequester>) -> Option<tk_vtd::PciRequester>
 }
 
 fn platform_map_for(requester: Option<DmaRequester>, physical: u64, length: usize) -> Result<u64, tk_vtd::Error> {
+    if requester.is_some_and(|requester| !requester.access_platform) {
+        return Ok(physical);
+    }
     let result = match requester_id(requester) {
         Some(requester) => tk_vtd::platform_map_for(requester, physical, length),
         None => tk_vtd::platform_map(physical, length),
@@ -286,6 +289,9 @@ fn platform_map_for(requester: Option<DmaRequester>, physical: u64, length: usiz
 }
 
 fn platform_unmap_for(requester: Option<DmaRequester>, address: u64, length: usize) -> Result<(), tk_vtd::Error> {
+    if requester.is_some_and(|requester| !requester.access_platform) {
+        return Ok(());
+    }
     match requester_id(requester) {
         Some(requester) => tk_vtd::platform_unmap_for(requester, address, length),
         None => tk_vtd::platform_unmap(address, length),

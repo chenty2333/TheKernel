@@ -38,6 +38,10 @@ pub trait Transport {
         0
     }
 
+    /// Records whether `ACCESS_PLATFORM` was accepted for this device.
+    /// Transports use this to select the matching DMA address contract.
+    fn set_dma_access_platform(&mut self, _enabled: bool) {}
+
     /// Writes device features.
     fn write_driver_features(&mut self, driver_features: u64);
 
@@ -112,6 +116,7 @@ pub trait Transport {
         let common_features = self.common_features() & (VERSION_1 | ACCESS_PLATFORM);
         let negotiated_bits = device_feature_bits & (supported_features.bits() | common_features);
         let negotiated_features = F::from_bits_truncate(negotiated_bits);
+        self.set_dma_access_platform(negotiated_bits & ACCESS_PLATFORM != 0);
         self.write_driver_features(negotiated_bits);
 
         self.set_status(
@@ -170,6 +175,7 @@ mod tests {
             state.lock().unwrap().driver_features,
             Feature::VERSION_1.bits() | Feature::ACCESS_PLATFORM.bits()
         );
+        assert!(state.lock().unwrap().dma_access_platform);
     }
 
     #[test]
@@ -188,6 +194,7 @@ mod tests {
 
         assert!(!negotiated.contains(Feature::ACCESS_PLATFORM));
         assert_eq!(state.lock().unwrap().driver_features, 0);
+        assert!(!state.lock().unwrap().dma_access_platform);
     }
 }
 

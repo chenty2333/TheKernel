@@ -19,6 +19,8 @@ pub struct DmaRequester {
     pub device: u8,
     /// PCI function number.
     pub function: u8,
+    /// Whether this transport negotiated VirtIO `ACCESS_PLATFORM`.
+    pub access_platform: bool,
 }
 
 /// A physical range mapped for device DMA.

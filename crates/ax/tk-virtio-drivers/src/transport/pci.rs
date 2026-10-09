@@ -121,6 +121,8 @@ pub struct PciTransport {
     shared_memory: [Option<SharedMemoryRegion>; 256],
     /// Set after a device wrapper observed status zero and completed reset.
     reset_complete: bool,
+    /// True only after ACCESS_PLATFORM was negotiated.
+    dma_access_platform: bool,
     /// A malformed notify offset was observed and the device was failed.
     notify_faulted: bool,
 }
@@ -310,6 +312,7 @@ impl PciTransport {
             config_space,
             shared_memory,
             reset_complete: false,
+            dma_access_platform: false,
             notify_faulted: false,
         })
     }
@@ -397,7 +400,12 @@ impl Transport for PciTransport {
             bus: self.device_function.bus,
             device: self.device_function.device,
             function: self.device_function.function,
+            access_platform: self.dma_access_platform,
         })
+    }
+
+    fn set_dma_access_platform(&mut self, enabled: bool) {
+        self.dma_access_platform = enabled;
     }
 
     fn shared_memory_region(&self, id: u8) -> Option<SharedMemoryRegion> {
@@ -883,6 +891,7 @@ mod tests {
             config_space: None,
             shared_memory: [None; 256],
             reset_complete: true,
+            dma_access_platform: false,
             notify_faulted: false,
         };
         assert!(!transport.enable_interrupts());

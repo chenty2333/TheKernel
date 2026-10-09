@@ -45,6 +45,10 @@ impl<C> Transport for FakeTransport<C> {
         self.state.lock().unwrap().driver_features = driver_features;
     }
 
+    fn set_dma_access_platform(&mut self, enabled: bool) {
+        self.state.lock().unwrap().dma_access_platform = enabled;
+    }
+
     fn max_queue_size(&mut self, _queue: u16) -> u32 {
         self.max_queue_size
     }
@@ -123,6 +127,8 @@ pub struct State {
     pub status: DeviceStatus,
     /// Feature bits accepted by the driver.
     pub driver_features: u64,
+    /// Whether the transport observed ACCESS_PLATFORM negotiation.
+    pub dma_access_platform: bool,
     /// Legacy guest page size selected by the driver.
     pub guest_page_size: u32,
     /// Whether the fake device has a pending interrupt.
