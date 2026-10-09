@@ -29,9 +29,15 @@ pub(crate) mod iosys_map;
 pub(crate) use idr::Ida;
 pub(crate) use iosys_map::{IosysMap, IosysMapAddr};
 pub(crate) mod irq;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod page;
 pub(crate) mod primitives;
 pub(crate) mod rbtree;
 pub(crate) mod rcu;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod scatterlist;
 pub(crate) mod registers;
 pub(crate) mod requests;
 pub(crate) mod srcu;
