@@ -8,9 +8,53 @@
 use super::{
     native_scaler::{self, NativeScalerError},
     output::{self, OutputError},
-    pipe::{self, Pipe, PipeError},
+    pipe::{
+        self, MultiPlaneArmPlan, MultiPlaneDdbPlan, Pipe, PipeError, PlaneScanout, WatermarkConfig,
+    },
     regs::Registers,
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativePipeEnablePlan {
+    ddb: MultiPlaneDdbPlan,
+    arm: MultiPlaneArmPlan,
+}
+
+impl NativePipeEnablePlan {
+    pub(crate) fn ddb(&self) -> &MultiPlaneDdbPlan {
+        &self.ddb
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativePipeEnableError {
+    Pipe(PipeError),
+}
+
+/// Prepare an enable without arming a plane. The source commit-tail order is:
+/// pipe timing/misc, DBUF and plane shadow state, CRTC/transcoder enable, then
+/// [`arm_pipe_enable`] at the plane-update phase.
+pub(crate) fn prepare_pipe_enable(
+    regs: &impl Registers,
+    pipe_id: Pipe,
+    mode: &crate::drm::modes::Mode,
+    scanouts: &[PlaneScanout],
+    config: WatermarkConfig,
+) -> Result<NativePipeEnablePlan, NativePipeEnableError> {
+    pipe::program_multi_plane_pipe_config(regs, pipe_id, mode)
+        .map_err(NativePipeEnableError::Pipe)?;
+    let (ddb, arm) = pipe::prepare_multi_plane_scanout(regs, pipe_id, mode, scanouts, config)
+        .map_err(NativePipeEnableError::Pipe)?;
+    Ok(NativePipeEnablePlan { ddb, arm })
+}
+
+/// Arm planes after the caller's checked transcoder/CRTC enable has succeeded.
+pub(crate) fn arm_pipe_enable(
+    regs: &impl Registers,
+    plan: &NativePipeEnablePlan,
+) -> Result<(), NativePipeEnableError> {
+    pipe::arm_multi_plane_scanout(regs, &plan.arm).map_err(NativePipeEnableError::Pipe)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum NativePipeDisableError {
@@ -53,7 +97,76 @@ pub(crate) fn disable_pipe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drm::intel::regs::{mock::MockRegisters, pipe as pipe_regs};
+    use crate::drm::{
+        intel::regs::{mock::MockRegisters, pipe as pipe_regs},
+        modes::CTA_VIC_TIMINGS,
+    };
+
+    fn mode_1080p() -> crate::drm::modes::Mode {
+        CTA_VIC_TIMINGS
+            .iter()
+            .find(|entry| entry.vic == 16)
+            .expect("CTA 1080p60 mode")
+            .mode
+    }
+
+    fn config() -> WatermarkConfig {
+        WatermarkConfig {
+            display_ver: 13,
+            latencies: [2, 4, 6, 8, 14, 16, 0, 0],
+            num_levels: 6,
+            sagv_block_time_us: 0,
+        }
+    }
+
+    fn half_screen(plane_index: usize, dst_x: u32, address: u64) -> PlaneScanout {
+        PlaneScanout {
+            plane_index,
+            pixel_format: intel_display::universal_plane::XRGB8888,
+            surface: pipe::PlaneSurface {
+                ggtt_address: address,
+                stride_bytes: 1920 * 4,
+            },
+            allocation_bytes: 1920 * 1080 * 4,
+            source_width: 960,
+            source_height: 1080,
+            dst_x,
+            dst_y: 0,
+            dst_width: 960,
+            dst_height: 1080,
+        }
+    }
+
+    #[test]
+    fn prepare_crtc_enable_defers_plane_arm_to_post_enable_phase() {
+        let regs = MockRegisters::new();
+        let scanouts = [
+            half_screen(0, 0, 0x0100_0000),
+            half_screen(1, 960, 0x0200_0000),
+        ];
+        let plan = prepare_pipe_enable(&regs, Pipe::A, &mode_1080p(), &scanouts, config())
+            .expect("pipe and plane shadow state should prepare");
+
+        let before = regs.writes();
+        assert!(before.iter().any(|(name, _)| *name == "PIPESRC_A"));
+        assert!(
+            before
+                .iter()
+                .any(|(name, _)| *name == "PLANE_BUF_CFG_MULTI_1")
+        );
+        assert!(
+            before
+                .iter()
+                .all(|(name, _)| *name != "PLANE_CTL_MULTI" && *name != "PLANE_SURF_MULTI")
+        );
+
+        arm_pipe_enable(&regs, &plan).expect("planes arm only after CRTC enable");
+        let after = regs.writes();
+        assert_eq!(after[after.len() - 4].0, "PLANE_CTL_MULTI");
+        assert_eq!(after[after.len() - 3].0, "PLANE_SURF_MULTI");
+        assert_eq!(after[after.len() - 2].0, "PLANE_CTL_MULTI");
+        assert_eq!(after[after.len() - 1].0, "PLANE_SURF_MULTI");
+    }
 
     #[test]
     fn crtc_disable_orders_plane_scalers_then_transcoder() {

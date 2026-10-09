@@ -1197,6 +1197,14 @@ pub(crate) struct MultiPlaneDdbPlan {
     pub(crate) unused_blocks: u32,
 }
 
+/// Precomputed `PLANE_CTL`/`PLANE_SURF` arm writes, separated so an atomic
+/// modeset can enable the CRTC after shadow programming and arm at the source
+/// commit-tail point. Constructed only by [`prepare_multi_plane_scanout`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MultiPlaneArmPlan {
+    writes: Vec<PlannedWrite>,
+}
+
 /// Program the DBUF and all watermark levels produced by the multi-plane
 /// planner.  The source model's `plane_index` is zero-based (`PLANE_1` is 0);
 /// this writer deliberately admits only the four packed-RGB plane engines,
@@ -1302,10 +1310,24 @@ pub(crate) fn update_multi_plane_scanout(
     scanouts: &[PlaneScanout],
     config: WatermarkConfig,
 ) -> Result<MultiPlaneDdbPlan, PipeError> {
-    let plan = plan_multi_plane_dbuf(mode, scanouts, config)?;
-    program_multi_plane_dbuf(regs, pipe, &plan)?;
+    let (plan, arms) = prepare_multi_plane_scanout(regs, pipe, mode, scanouts, config)?;
+    arm_multi_plane_scanout(regs, &arms)?;
+    Ok(plan)
+}
 
-    // Construct every plane's shadow/arm values before writing any of them.
+/// Compute and write DBUF/watermark and plane shadow state without arming any
+/// plane. The caller can now enable the CRTC, then pass the returned token to
+/// [`arm_multi_plane_scanout`] at the commit-tail plane-update phase.
+pub(crate) fn prepare_multi_plane_scanout(
+    regs: &impl Registers,
+    pipe: Pipe,
+    mode: &Mode,
+    scanouts: &[PlaneScanout],
+    config: WatermarkConfig,
+) -> Result<(MultiPlaneDdbPlan, MultiPlaneArmPlan), PipeError> {
+    let plan = plan_multi_plane_dbuf(mode, scanouts, config)?;
+
+    // Construct every plane's shadow/arm values before the first write.
     let mut plane_writes = Vec::with_capacity(scanouts.len() * 7);
     let mut arms = Vec::with_capacity(scanouts.len() * 2);
     for scanout in scanouts {
@@ -1348,10 +1370,25 @@ pub(crate) fn update_multi_plane_scanout(
             },
         ]);
     }
-    for planned in plane_writes.into_iter().chain(arms) {
+    // The DDB planner and all plane format/stride/surface encodings have now
+    // been validated. No invalid later plane can leave an earlier DBUF write.
+    program_multi_plane_dbuf(regs, pipe, &plan)?;
+    for planned in plane_writes {
         write(regs, planned)?;
     }
-    Ok(plan)
+    Ok((plan, MultiPlaneArmPlan { writes: arms }))
+}
+
+/// Arm a previously prepared multi-plane update. Each plane's control and
+/// surface writes remain adjacent, matching `skl_universal_plane`.
+pub(crate) fn arm_multi_plane_scanout(
+    regs: &impl Registers,
+    plan: &MultiPlaneArmPlan,
+) -> Result<(), PipeError> {
+    for planned in &plan.writes {
+        write(regs, *planned)?;
+    }
+    Ok(())
 }
 
 /// Disable one supported non-cursor plane, preserving the other control bits
@@ -2707,6 +2744,33 @@ mod multi_plane_plan_tests {
             plane_scanout_registers(Pipe::B, 1).unwrap().ctl.offset(),
             0x71280
         );
+    }
+
+    #[test]
+    fn multi_plane_prepare_defers_all_arms_until_crtc_enable_phase() {
+        let mode = mode_1080p();
+        let scanouts = [
+            half_screen(0, 0, 0x0100_0000),
+            half_screen(1, 960, 0x0200_0000),
+        ];
+        let regs = crate::drm::intel::regs::mock::MockRegisters::new();
+
+        let (_ddb, arm) = prepare_multi_plane_scanout(&regs, Pipe::A, &mode, &scanouts, config())
+            .expect("shadow state must be prepared before CRTC enable");
+
+        assert!(regs
+            .writes()
+            .iter()
+            .all(|(name, _)| *name != "PLANE_CTL_MULTI" && *name != "PLANE_SURF_MULTI"));
+        arm_multi_plane_scanout(&regs, &arm).expect("plane arms should be a distinct phase");
+        let writes = regs.writes();
+        let first = writes
+            .iter()
+            .position(|(name, _)| *name == "PLANE_CTL_MULTI")
+            .expect("first plane arm follows prepared shadow state");
+        assert_eq!(writes[first + 1].0, "PLANE_SURF_MULTI");
+        assert_eq!(writes[first + 2].0, "PLANE_CTL_MULTI");
+        assert_eq!(writes[first + 3].0, "PLANE_SURF_MULTI");
     }
 
     #[test]
