@@ -267,11 +267,96 @@ pub(crate) fn entry_for(clock: ReferenceClock, cdclk_khz: u32, ratio: u32) -> Op
 /// The N305 native path uses this conservative one-pixel-per-clock bound until
 /// the complete i915 atomic bandwidth calculation is connected.
 pub(crate) fn entry_at_least(clock: ReferenceClock, min_cdclk_khz: u32) -> Option<CdclkEntry> {
+    let requested = i32::try_from(min_cdclk_khz).ok()?;
+    let maximum = i32::try_from(maximum_cdclk(clock)?).ok()?;
+    let mut io = CdclkPolicyIo::default();
+    let mut display = intel_display::intel_cdclk_full::IntelDisplay::default();
+    display.platform.alderlake_p = true;
+    display.display_ver = 13;
+    display.cdclk.table = 5; // upstream table_for(): ADLP_CDCLK_TABLE
+    display.cdclk.hw.refclk = i32::try_from(clock.khz()).ok()?;
+    display.cdclk.max_cdclk_freq = maximum;
+
+    let selected = intel_display::intel_cdclk_full::bxt_calc_cdclk(&mut io, &display, requested);
+    if io.unsupported || selected < requested {
+        return None;
+    }
     ADL_N_CDCLK_TABLE
         .iter()
         .copied()
-        .filter(|entry| entry.reference_khz == clock.khz() && entry.cdclk_khz >= min_cdclk_khz)
-        .min_by_key(|entry| entry.cdclk_khz)
+        .find(|entry| entry.reference_khz == clock.khz() && entry.cdclk_khz == selected as u32)
+}
+
+/// The translated `bxt_calc_cdclk()` uses the source table and only calls
+/// `IntelCdclkIo` to report the impossible no-entry case. This deliberately
+/// inert backend is used for that source policy calculation only; it cannot
+/// read or write registers or participate in CDCLK programming.
+#[derive(Default)]
+struct CdclkPolicyIo {
+    unsupported: bool,
+}
+
+impl intel_display::intel_cdclk_full::IntelCdclkIo for CdclkPolicyIo {
+    fn platform_get_cdclk(
+        &mut self,
+        _family: u32,
+        _display: &mut intel_display::intel_cdclk_full::IntelDisplay,
+        _config: &mut intel_display::intel_cdclk_full::IntelCdclkConfig,
+    ) {
+    }
+    fn platform_set_cdclk(
+        &mut self,
+        _family: u32,
+        _display: &mut intel_display::intel_cdclk_full::IntelDisplay,
+        _config: &intel_display::intel_cdclk_full::IntelCdclkConfig,
+        _pipe: i32,
+    ) {
+    }
+    fn platform_modeset_calc_cdclk(
+        &mut self,
+        _family: u32,
+        _state: &mut intel_display::intel_cdclk_full::IntelAtomicState,
+    ) -> i32 {
+        -1
+    }
+    fn platform_calc_voltage_level(
+        &mut self,
+        _family: u32,
+        _display: &intel_display::intel_cdclk_full::IntelDisplay,
+        _cdclk: i32,
+    ) -> u8 {
+        0
+    }
+    fn constant(&self, _name: &'static str) -> u32 {
+        0
+    }
+    fn read_mmio(&mut self, _register: &'static str) -> u32 {
+        0
+    }
+    fn write_mmio(&mut self, _register: &'static str, _value: u32) {}
+    fn pci_read16(&mut self, _register: &'static str) -> u16 {
+        0
+    }
+    fn pci_bus_read16(&mut self, _devfn: u16, _register: &'static str) -> u16 {
+        0
+    }
+    fn mchbar_read8(&mut self, _register: &'static str) -> u8 {
+        0
+    }
+    fn call(&mut self, _operation: &'static str, _args: &[i64]) -> i64 {
+        self.unsupported = true;
+        -1
+    }
+    fn wait(&mut self, _register: &'static str, _mask: u32, _value: u32, _timeout: i32) -> i32 {
+        -1
+    }
+    fn log(&mut self, _level: &'static str, _message: &'static str, _args: &[i64]) {}
+    fn log_cdclk_config(
+        &mut self,
+        _context: &'static str,
+        _config: &intel_display::intel_cdclk_full::IntelCdclkConfig,
+    ) {
+    }
 }
 
 pub(crate) fn maximum_cdclk(clock: ReferenceClock) -> Option<u32> {
