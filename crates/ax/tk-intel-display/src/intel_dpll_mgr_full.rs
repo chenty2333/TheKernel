@@ -2796,4 +2796,66 @@ mod readout_tests {
         assert_eq!(display.dplls[3].state.hw_state.icl.mg_pll_div0, dkl.div0);
         assert_eq!(display.dplls[3].state.hw_state.icl.mg_pll_div1, dkl.div1);
     }
+
+    #[test]
+    fn tc_manager_compute_matches_dkl_hdmi_planner() {
+        for (clock, afc_startup) in [(148_500, None), (297_000, Some(5))] {
+            let dkl = crate::dpll_mgr::icl_calc_mg_pll_state_for_output(
+                clock,
+                24_000,
+                crate::dpll_mgr::MgPllOutput::Hdmi,
+                afc_startup,
+            )
+            .unwrap();
+            let mut display = IntelDpllDisplay::default();
+            display.display_ver = 13;
+            display.platform.alderlake_p = true;
+            display.ref_clks.nssc = 24_000;
+            display.vbt.override_afc_startup = afc_startup.is_some();
+            display.vbt.override_afc_startup_val = afc_startup.unwrap_or_default();
+            let mut hooks = ReadoutHooks { dkl };
+            intel_dpll_init(&mut hooks, &mut display);
+            display.num_dpll = 4;
+
+            let crtc_state = CrtcState {
+                id: 0,
+                name: "Pipe A",
+                pipe: 0,
+                joined_pipe_mask: 1,
+                hw_active: true,
+                intel_dpll: Some(3),
+                port_clock: 297_000,
+                output: OutputType::Hdmi,
+                port: Port::Tc(TcPort::Tc1),
+                ..CrtcState::default()
+            };
+            let crtc = IntelCrtc { id: 0, name: "Pipe A", pipe: 0 };
+            let encoder = IntelEncoder {
+                output: OutputType::Hdmi,
+                port: Port::Tc(TcPort::Tc1),
+                is_combo_phy: false,
+                is_tc_phy: true,
+                primary_port: None,
+                tc_dp_alt_mode: false,
+                tc_legacy_mode: true,
+            };
+            let mut state = IntelAtomicState::default();
+            state.old_crtcs[0] = crtc_state;
+            state.new_crtcs[0] = CrtcState { port_clock: clock, ..crtc_state };
+
+            assert_eq!(intel_dpll_compute(&mut hooks, &display, &mut state, &crtc, &encoder), 0);
+            let computed = state.new_crtcs[0].icl_port_dplls[PortDpllId::MgPhy as usize]
+                .hw_state
+                .icl;
+            assert_eq!(state.new_crtcs[0].port_clock, clock);
+            assert_eq!(computed.mg_refclkin_ctl, dkl.refclkin_ctl);
+            assert_eq!(computed.mg_clktop2_coreclkctl1, dkl.coreclkctl1);
+            assert_eq!(computed.mg_clktop2_hsclkctl, dkl.hsclkctl);
+            assert_eq!(computed.mg_pll_div0, dkl.div0);
+            assert_eq!(computed.mg_pll_div1, dkl.div1);
+            assert_eq!(computed.mg_pll_ssc, dkl.ssc);
+            assert_eq!(computed.mg_pll_bias, dkl.bias);
+            assert_eq!(computed.mg_pll_tdc_coldst_bias, dkl.tdc_coldst_bias);
+        }
+    }
 }

@@ -45,6 +45,9 @@ source-computed DKL fields with the transaction's planned DKL image before any
 display write. A mismatch refuses the transition. This is a source-backed
 clock-plan cross-check, not `reserve`/`swap`/`enable`/`disable`; the existing
 outer transaction still owns hardware before-images and direct DKL sequencing.
+The source crate has a model test that compares the manager computation to the
+standalone DKL planner at 148.5 and 297 MHz, including an explicit AFC startup
+override; it passes on the host test target.
 
 The scoped manager now remembers which TC port was selected and checks
 allocator/CRTC arguments against it before entering source compute/reserve/
