@@ -839,7 +839,7 @@ class SystemTestGateTests(unittest.TestCase):
         args = product.build_parser().parse_args(["test", "--suite", "guest"])
         calls: dict[str, object] = {}
 
-        def fake_build(_artifacts):
+        def fake_build(_artifacts, **_kwargs):
             return None
 
         def fake_run_product(_artifacts, spec):
