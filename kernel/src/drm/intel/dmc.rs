@@ -19,6 +19,12 @@ static LOAD_RESULT: Mutex<
     Option<Result<intel_display::dmc::DmcLoadReport, intel_display::dmc::DmcLoadError>>,
 > = Mutex::new(None);
 
+/// DC5/DC6 are only re-enabled after the source DMC payload completed upload
+/// and readback. Merely finding or parsing firmware is not sufficient.
+pub(super) fn has_payload() -> bool {
+    LOAD_RESULT.lock().as_ref().is_some_and(Result::is_ok)
+}
+
 struct DmcMmio<'a>(&'a RegisterWindow);
 
 impl intel_display::RegisterIo for DmcMmio<'_> {

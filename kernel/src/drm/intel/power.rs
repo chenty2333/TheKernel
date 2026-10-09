@@ -93,6 +93,10 @@ use super::{
     regs::{self, Register, Registers},
 };
 
+#[path = "native_power.rs"]
+mod native_power;
+pub(crate) use native_power::{NativePowerAdapter, NativePowerOps};
+
 // ---------------------------------------------------------------------------
 // Bit positions, each cited to the reference section and the i915 line it was
 // read from.  They live here rather than in `regs` because they are field
@@ -728,8 +732,7 @@ pub(crate) struct PowerState {
     pub(crate) platform: DmcPlatform,
     pub(crate) fuses: FuseState,
     pub(crate) dc_state: DcStateObservation,
-    pub(crate) allowed_dc_mask: u32,
-    pub(crate) target_dc_state: u32,
+    pub(crate) dc: DcStateControl,
     pub(crate) phys: Vec<PhyState>,
     /// Each PHY's `COMP_INIT` after `PW_1` came up, which is the read that says
     /// whether the PHY step took: §11 phase 1.2 says a `COMP_INIT` that does
@@ -754,6 +757,20 @@ pub(crate) struct PowerState {
     pub(crate) workarounds: WorkaroundState,
 }
 
+/// Runtime ownership and source tracking for the software-controlled DC field.
+///
+/// `tracked_dc_state` mirrors i915's `power_domains.dc_state`. The target may
+/// differ from the currently requested field while the DC-off well is held;
+/// its final release applies the target only when DMC firmware is available.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DcStateControl {
+    pub(crate) allowed_dc_mask: u32,
+    pub(crate) target_dc_state: u32,
+    pub(crate) tracked_dc_state: u32,
+    pub(crate) dc6_allowed: bool,
+    pub(crate) psr_dc5_dc6_notifications: u32,
+}
+
 impl PowerState {
     fn power_map(&self) -> &'static [PowerWellGroup] {
         power_wells(self.platform)
@@ -776,8 +793,19 @@ impl PowerState {
     ) -> Result<(), PowerError> {
         let platform = self.platform;
         let map = self.power_map();
-        self.power_domains
-            .get(map, domain, &mut MappedPowerWellIo { regs, platform })
+        let domains = &mut self.power_domains;
+        let dc = &mut self.dc;
+        domains
+            .get(
+                map,
+                domain,
+                &mut MappedPowerWellIo {
+                    regs,
+                    platform,
+                    dc: Some(dc),
+                    dmc_payload_loaded: super::dmc::has_payload(),
+                },
+            )
             .map_err(|error| PowerError::PowerDomain(format!("{error:?}")))
     }
 
@@ -789,8 +817,19 @@ impl PowerState {
     ) -> Result<(), PowerError> {
         let platform = self.platform;
         let map = self.power_map();
-        self.power_domains
-            .put(map, domain, &mut MappedPowerWellIo { regs, platform })
+        let domains = &mut self.power_domains;
+        let dc = &mut self.dc;
+        domains
+            .put(
+                map,
+                domain,
+                &mut MappedPowerWellIo {
+                    regs,
+                    platform,
+                    dc: Some(dc),
+                    dmc_payload_loaded: super::dmc::has_payload(),
+                },
+            )
             .map_err(|error| PowerError::PowerDomain(format!("{error:?}")))
     }
 
@@ -802,12 +841,19 @@ impl PowerState {
     ) -> Result<bool, PowerError> {
         let platform = self.platform;
         let map = self.power_map();
-        self.power_domains
+        let domains = &mut self.power_domains;
+        let dc = &mut self.dc;
+        domains
             .get_if_enabled(
                 map,
                 domain,
                 runtime_active,
-                &mut MappedPowerWellIo { regs, platform },
+                &mut MappedPowerWellIo {
+                    regs,
+                    platform,
+                    dc: Some(dc),
+                    dmc_payload_loaded: super::dmc::has_payload(),
+                },
             )
             .map_err(|error| PowerError::PowerDomain(format!("{error:?}")))
     }
@@ -826,6 +872,8 @@ impl PowerState {
                 &MappedPowerWellIo {
                     regs,
                     platform: self.platform,
+                    dc: None,
+                    dmc_payload_loaded: super::dmc::has_payload(),
                 },
             )
             .map_err(|error| PowerError::PowerDomain(format!("{error:?}")))
@@ -887,7 +935,7 @@ impl PowerState {
         line(self.dc_state.describe());
         line(format!(
             "DC policy: allowed mask {:#04x}, target state {:#04x}",
-            self.allowed_dc_mask, self.target_dc_state
+            self.dc.allowed_dc_mask, self.dc.target_dc_state
         ));
         line(format!(
             "power-domain PIPE_A refcount {}",
@@ -1493,9 +1541,177 @@ fn warn_if_tc_aux_uc_unhealthy<R: Registers>(regs: &R, port: intel_display::dkl_
     axlog::warn!("intel power: TC AUX DKL uC health did not set within 1 ms");
 }
 
+/// Record the source callbacks that would normally update PSR and DMC's DC6
+/// eligibility bookkeeping. PSR is not active on this native modeset path, so
+/// notification is counted for diagnostics while the source DC6 transition
+/// policy remains authoritative.
+struct RuntimeDcObserver<'a> {
+    dc6_allowed: &'a mut bool,
+    psr_notifications: &'a mut u32,
+}
+
+impl intel_display::dc_state::DcStateObserver for RuntimeDcObserver<'_> {
+    fn notify_psr_dc5_dc6(&mut self) {
+        *self.psr_notifications = self.psr_notifications.saturating_add(1);
+    }
+
+    fn update_dc6_allowed_count(&mut self, allowed: bool) {
+        *self.dc6_allowed = allowed;
+    }
+}
+
+fn runtime_set_dc_state<R: Registers>(
+    regs: &R,
+    dc: &mut DcStateControl,
+    requested: u32,
+) -> Result<intel_display::dc_state::DcStateWrite, PowerError> {
+    let adapter = HswPowerWellAdapter { regs };
+    let mut observer = RuntimeDcObserver {
+        dc6_allowed: &mut dc.dc6_allowed,
+        psr_notifications: &mut dc.psr_dc5_dc6_notifications,
+    };
+    let report = intel_display::dc_state::gen9_set_dc_state(
+        &adapter,
+        regs::DC_STATE_EN.offset(),
+        13,
+        false,
+        dc.allowed_dc_mask,
+        false,
+        requested,
+        &mut dc.tracked_dc_state,
+        &mut observer,
+    )
+    .map_err(|error| match error {
+        intel_display::Error::Unavailable(offset) if offset == regs::DC_STATE_EN.offset() => {
+            PowerError::Unreadable {
+                register: regs::DC_STATE_EN.name(),
+            }
+        }
+        _ => PowerError::WriteRefused {
+            register: regs::DC_STATE_EN.name(),
+        },
+    })?;
+
+    // i915 records a persistent DMC mismatch and continues. This adapter is a
+    // modeset transaction boundary: do not report a DC transition as applied
+    // unless the software-owned field actually matches. Tracking follows the
+    // observed hardware value even on refusal so a later recovery starts from
+    // the state the device retained.
+    let mask = intel_display::dc_state::gen9_dc_mask(13, false);
+    let requested = requested & dc.allowed_dc_mask & mask;
+    let actual = report.readback & mask;
+    dc.tracked_dc_state = actual;
+    dc.dc6_allowed = actual & intel_display::dc_state::DC_STATE_EN_UPTO_DC6 != 0;
+    if actual != requested {
+        return Err(PowerError::ReadbackMismatch {
+            register: regs::DC_STATE_EN.name(),
+            wrote: (report.readback & !mask) | requested,
+            read: report.readback,
+        });
+    }
+    Ok(report)
+}
+
+fn dc_off_well_is_enabled<R: Registers>(regs: &R) -> Result<bool, intel_display::Error> {
+    let value = regs
+        .read(regs::DC_STATE_EN)
+        .ok_or(intel_display::Error::Unavailable(
+            regs::DC_STATE_EN.offset(),
+        ))?;
+    // Source `gen9_dc_off_power_well_enabled()`: DC-off is enabled when no
+    // DC3CO/DC5/DC6 state is currently requested. DC9 is independently owned.
+    Ok(value & (0b11 | (1 << 30)) == 0)
+}
+
+struct PowerDcTargetIo<'a, R: Registers> {
+    regs: &'a R,
+    dc: &'a mut DcStateControl,
+    requested_target: u32,
+    dmc_payload_loaded: bool,
+}
+
+impl<R: Registers> intel_display::dc_state::DcOffPowerWellIo for PowerDcTargetIo<'_, R> {
+    fn dc_off_well_is_enabled(&self) -> Result<bool, intel_display::Error> {
+        dc_off_well_is_enabled(self.regs)
+    }
+
+    fn enable_dc_off_well(&mut self) -> Result<(), intel_display::Error> {
+        runtime_set_dc_state(self.regs, self.dc, DC_STATE_DISABLE)
+            .map(|_| ())
+            .map_err(|_| intel_display::Error::Unavailable(regs::DC_STATE_EN.offset()))
+    }
+
+    fn disable_dc_off_well(&mut self) -> Result<(), intel_display::Error> {
+        // i915 does not re-enable DC states until a DMC payload is available.
+        // Retain the selected target so a future retry can apply it, but keep
+        // the engine in the known-safe disabled state for now.
+        if self.dmc_payload_loaded {
+            runtime_set_dc_state(self.regs, self.dc, self.requested_target)
+                .map(|_| ())
+                .map_err(|_| intel_display::Error::Unavailable(regs::DC_STATE_EN.offset()))?;
+        }
+        Ok(())
+    }
+}
+
+impl PowerState {
+    /// Change the desired idle DC level with the source DC-off-well cycle.
+    ///
+    /// A `false` result is not a no-op success: the target was recorded, but
+    /// DC5/DC6 remains disabled because DMC firmware is not loaded yet.
+    pub(crate) fn set_target_dc_state<R: Registers>(
+        &mut self,
+        regs: &R,
+        requested: u32,
+    ) -> Result<bool, PowerError> {
+        let target =
+            intel_display::dc_state::sanitize_target_dc_state(requested, self.dc.allowed_dc_mask);
+        let mut target_state = self.dc.target_dc_state;
+        let dmc_payload_loaded = super::dmc::has_payload();
+        let report = intel_display::dc_state::set_target_dc_state(
+            &mut target_state,
+            self.dc.allowed_dc_mask,
+            requested,
+            &mut PowerDcTargetIo {
+                regs,
+                dc: &mut self.dc,
+                requested_target: target,
+                dmc_payload_loaded,
+            },
+        )
+        .map_err(|error| PowerError::PowerDomain(format!("DC target update failed: {error:?}")))?;
+        if report != target {
+            return Err(PowerError::ReadbackMismatch {
+                register: regs::DC_STATE_EN.name(),
+                wrote: target,
+                read: report,
+            });
+        }
+        self.dc.target_dc_state = target_state;
+        Ok(dmc_payload_loaded)
+    }
+
+    /// Synchronously leave DC5/DC6 before touching pipe, plane, or link state.
+    pub(crate) fn exit_dc_states<R: Registers>(&mut self, regs: &R) -> Result<(), PowerError> {
+        runtime_set_dc_state(regs, &mut self.dc, DC_STATE_DISABLE).map(|_| ())
+    }
+
+    /// Re-allow the sanitized idle target after modeset hardware is stable.
+    pub(crate) fn enter_dc_states<R: Registers>(&mut self, regs: &R) -> Result<bool, PowerError> {
+        if !super::dmc::has_payload() {
+            return Ok(false);
+        }
+        let target = self.dc.target_dc_state;
+        runtime_set_dc_state(regs, &mut self.dc, target)?;
+        Ok(true)
+    }
+}
+
 struct MappedPowerWellIo<'a, R> {
     regs: &'a R,
     platform: DmcPlatform,
+    dc: Option<&'a mut DcStateControl>,
+    dmc_payload_loaded: bool,
 }
 
 impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
@@ -1535,6 +1751,15 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
     ) -> Result<(), intel_display::Error> {
         if instance.always_on || group.ops == WellOps::AlwaysOn {
             return Ok(());
+        }
+        if group.ops == WellOps::DcOff {
+            let dc = self
+                .dc
+                .as_deref_mut()
+                .ok_or(intel_display::Error::Refused)?;
+            return runtime_set_dc_state(self.regs, dc, DC_STATE_DISABLE)
+                .map(|_| ())
+                .map_err(|_| intel_display::Error::Unavailable(regs::DC_STATE_EN.offset()));
         }
         if !matches!(group.ops, WellOps::Hsw | WellOps::Ddi | WellOps::Aux) {
             return Err(intel_display::Error::Refused);
@@ -1582,6 +1807,18 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
         if instance.always_on || group.ops == WellOps::AlwaysOn {
             return Ok(());
         }
+        if group.ops == WellOps::DcOff {
+            if !self.dmc_payload_loaded {
+                return Ok(());
+            }
+            let dc = self
+                .dc
+                .as_deref_mut()
+                .ok_or(intel_display::Error::Refused)?;
+            return runtime_set_dc_state(self.regs, dc, dc.target_dc_state)
+                .map(|_| ())
+                .map_err(|_| intel_display::Error::Unavailable(regs::DC_STATE_EN.offset()));
+        }
         if !matches!(group.ops, WellOps::Hsw | WellOps::Ddi | WellOps::Aux) {
             return Err(intel_display::Error::Refused);
         }
@@ -1597,6 +1834,9 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
     ) -> Result<bool, intel_display::Error> {
         if instance.always_on || group.ops == WellOps::AlwaysOn {
             return Ok(true);
+        }
+        if group.ops == WellOps::DcOff {
+            return dc_off_well_is_enabled(self.regs);
         }
         let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
         let adapter = HswPowerWellAdapter { regs: self.regs };
@@ -1971,7 +2211,12 @@ fn bring_up_inner(
         .sync_domain(
             power_map,
             PowerDomain::PipeA,
-            &mut MappedPowerWellIo { regs, platform },
+            &mut MappedPowerWellIo {
+                regs,
+                platform,
+                dc: None,
+                dmc_payload_loaded: super::dmc::has_payload(),
+            },
         )
         .map_err(|error| {
             unwind(
@@ -1985,7 +2230,12 @@ fn bring_up_inner(
         .get(
             power_map,
             PowerDomain::PipeA,
-            &mut MappedPowerWellIo { regs, platform },
+            &mut MappedPowerWellIo {
+                regs,
+                platform,
+                dc: None,
+                dmc_payload_loaded: super::dmc::has_payload(),
+            },
         )
         .map_err(|error| {
             unwind(
@@ -2016,8 +2266,13 @@ fn bring_up_inner(
         platform,
         fuses,
         dc_state,
-        allowed_dc_mask,
-        target_dc_state,
+        dc: DcStateControl {
+            allowed_dc_mask,
+            target_dc_state,
+            tracked_dc_state: DC_STATE_DISABLE,
+            dc6_allowed: false,
+            psr_dc5_dc6_notifications: 0,
+        },
         phys,
         phy_comp_init_after_pw1,
         pw1,
@@ -2148,11 +2403,11 @@ mod tests {
         assert!(!state.dc_state.already_disabled);
         assert_eq!(regs.read(regs::DC_STATE_EN).unwrap() & DC_STATE_MASK, 0);
         assert_eq!(
-            state.allowed_dc_mask,
+            state.dc.allowed_dc_mask,
             intel_display::dc_state::gen9_dc_mask(13, false)
         );
         assert_eq!(
-            state.target_dc_state,
+            state.dc.target_dc_state,
             intel_display::dc_state::DC_STATE_EN_UPTO_DC6
         );
 
@@ -2608,6 +2863,132 @@ mod tests {
                 .is_domain_enabled(&regs, PowerDomain::AuxIoA, true)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn dc_off_domain_refs_disable_dc_and_only_restore_after_dmc_load() {
+        let regs = powered_machine();
+        let mut state = bring_up(&regs).unwrap();
+        let dc6 = intel_display::dc_state::DC_STATE_EN_UPTO_DC6;
+
+        // Model firmware having left DC6 enabled after the initial bring-up.
+        // The source DC-off well's first reference must synchronously leave
+        // DC6, while nested references must not repeat the transition.
+        runtime_set_dc_state(&regs, &mut state.dc, dc6).unwrap();
+        let before = regs.writes().len();
+        state.get_domain(&regs, PowerDomain::DcOff).unwrap();
+        assert_eq!(state.power_domains.domain_use_count(PowerDomain::DcOff), 1);
+        assert_eq!(regs.read(regs::DC_STATE_EN).unwrap() & DC_STATE_MASK, 0);
+        let first_transition_writes = regs.writes().len() - before;
+        assert_eq!(
+            first_transition_writes, 1,
+            "first reference disables DC once"
+        );
+
+        state.get_domain(&regs, PowerDomain::DcOff).unwrap();
+        assert_eq!(state.power_domains.domain_use_count(PowerDomain::DcOff), 2);
+        assert_eq!(regs.writes().len() - before, first_transition_writes);
+
+        // No successfully uploaded DMC payload exists in this host test, so
+        // the final put must release the software ref but leave DC5/DC6 off.
+        state.put_domain(&regs, PowerDomain::DcOff).unwrap();
+        assert_eq!(state.power_domains.domain_use_count(PowerDomain::DcOff), 1);
+        state.put_domain(&regs, PowerDomain::DcOff).unwrap();
+        assert_eq!(state.power_domains.domain_use_count(PowerDomain::DcOff), 0);
+        assert_eq!(regs.read(regs::DC_STATE_EN).unwrap() & DC_STATE_MASK, 0);
+        assert_eq!(state.dc.target_dc_state, dc6);
+    }
+
+    #[test]
+    fn dc_off_final_put_restores_target_only_with_loaded_dmc() {
+        let regs = powered_machine();
+        let mut state = bring_up(&regs).unwrap();
+        let dc6 = intel_display::dc_state::DC_STATE_EN_UPTO_DC6;
+        let map = power_wells(state.platform);
+
+        runtime_set_dc_state(&regs, &mut state.dc, dc6).unwrap();
+        {
+            let dc = &mut state.dc;
+            let mut io = MappedPowerWellIo {
+                regs: &regs,
+                platform: state.platform,
+                dc: Some(dc),
+                dmc_payload_loaded: true,
+            };
+            state
+                .power_domains
+                .get(map, PowerDomain::DcOff, &mut io)
+                .unwrap();
+        }
+        assert_eq!(regs.read(regs::DC_STATE_EN).unwrap() & DC_STATE_MASK, 0);
+
+        // A non-final put only decrements counts. The final release restores
+        // the selected target and preserves status / hardware-owned bits.
+        {
+            let dc = &mut state.dc;
+            let mut io = MappedPowerWellIo {
+                regs: &regs,
+                platform: state.platform,
+                dc: Some(dc),
+                dmc_payload_loaded: true,
+            };
+            state
+                .power_domains
+                .get(map, PowerDomain::DcOff, &mut io)
+                .unwrap();
+        }
+        let hardware_bits = (1 << 9) | (1 << 8) | (1 << 4) | (1 << 29);
+        regs.set(regs::DC_STATE_EN, hardware_bits);
+        {
+            let dc = &mut state.dc;
+            let mut io = MappedPowerWellIo {
+                regs: &regs,
+                platform: state.platform,
+                dc: Some(dc),
+                dmc_payload_loaded: true,
+            };
+            state
+                .power_domains
+                .put(map, PowerDomain::DcOff, &mut io)
+                .unwrap();
+            assert_eq!(state.power_domains.domain_use_count(PowerDomain::DcOff), 1);
+            state
+                .power_domains
+                .put(map, PowerDomain::DcOff, &mut io)
+                .unwrap();
+        }
+        assert_eq!(state.power_domains.domain_use_count(PowerDomain::DcOff), 0);
+        let final_value = regs.read(regs::DC_STATE_EN).unwrap();
+        assert_eq!(final_value & DC_STATE_MASK, dc6);
+        assert_eq!(final_value & hardware_bits, hardware_bits);
+    }
+
+    #[test]
+    fn native_dc_entry_requires_successful_mmio_and_dmc_is_fail_closed() {
+        let regs = powered_machine();
+        let mut state = bring_up(&regs).unwrap();
+        assert!(!state.enter_dc_states(&regs).unwrap());
+        assert_eq!(regs.read(regs::DC_STATE_EN).unwrap() & DC_STATE_MASK, 0);
+
+        // The software target is retained for later retry while firmware is
+        // absent, but must not be enabled prematurely.
+        assert!(!state.set_target_dc_state(&regs, DC_STATE_DISABLE).unwrap());
+        assert!(
+            !state
+                .set_target_dc_state(&regs, intel_display::dc_state::DC_STATE_EN_UPTO_DC6)
+                .unwrap()
+        );
+        assert_eq!(
+            state.dc.target_dc_state,
+            intel_display::dc_state::DC_STATE_EN_UPTO_DC6
+        );
+        assert_eq!(regs.read(regs::DC_STATE_EN).unwrap() & DC_STATE_MASK, 0);
+
+        regs.refuse(regs::DC_STATE_EN);
+        assert!(matches!(
+            state.exit_dc_states(&regs),
+            Err(PowerError::WriteRefused { .. })
+        ));
     }
 
     #[test]
