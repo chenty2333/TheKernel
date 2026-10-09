@@ -17,7 +17,7 @@ use axdriver_block::sdhci::{
     SDHCI_CAPABILITIES, SDHCI_CAPABILITIES2, SDHCI_HOST_VERSION, SDHCI_SPEC_VER_MASK, SdhciDisk,
     SdhciDmaRegion, SdhciHost, SdhciIo, SdhciPartitionDisk,
 };
-use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
+use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, HeaderType, PciRoot};
 use axhal::mem::virt_to_phys;
 use log::{info, warn};
 
@@ -26,6 +26,25 @@ use crate::block_irq::PciBlockInterrupt;
 const PCI_COMMAND: u8 = 0x04;
 const PCI_COMMAND_MEMORY: u16 = 0x0002;
 const PCI_COMMAND_MASTER: u16 = 0x0004;
+const PCI_STATUS_CAPABILITIES_LIST: u16 = 1 << 4;
+const PCI_CAPABILITIES_POINTER: u8 = 0x34;
+const PCI_CAPABILITY_MIN_OFFSET: u8 = 0x40;
+const PCI_CONFIG_LAST_DWORD: u8 = 0xfc;
+const PCI_CAP_ID_POWER_MANAGEMENT: u8 = 0x01;
+const PCI_PM_CAP_VERSION_MASK: u16 = 0x0007;
+const PCI_PM_CAP_D1: u16 = 1 << 9;
+const PCI_PM_CAP_D2: u16 = 1 << 10;
+const PCI_PM_CONTROL_OFFSET: u8 = 4;
+const PCI_PM_STATE_MASK: u16 = 0x0003;
+const PCI_PM_NO_SOFT_RESET: u16 = 1 << 3;
+const PCI_PM_D1_DELAY_US: u32 = 0;
+const PCI_PM_D2_DELAY_US: u32 = 200;
+const PCI_PM_D3HOT_DELAY_US: u32 = 10_000;
+const PCI_PM_RESET_READY_POLL_US: u32 = 1_000;
+const PCI_PM_RESET_READY_POLLS: usize = 1_000;
+const PCI_PM_READBACK_POLL_US: u32 = 100;
+const PCI_PM_READBACK_POLLS: usize = 100;
+const PCI_PM_PME_STATUS: u16 = 1 << 15;
 const PCI_CLASS_SYSTEM_PERIPHERAL: u8 = 0x08;
 const PCI_SUBCLASS_SD_HOST: u8 = 0x05;
 const PCI_SLOT_INFO: u8 = 0x40;
@@ -46,6 +65,189 @@ static NEXT_RUNTIME_MMC_INDEX: AtomicUsize = AtomicUsize::new(0);
 struct SdhciPciId {
     id: u32,
     quirks: u32,
+}
+
+trait PciPmConfig {
+    fn read_config_dword(&mut self, offset: u8) -> Option<u32>;
+    fn write_config_u16(&mut self, offset: u8, value: u16) -> bool;
+    fn delay_us(&mut self, micros: u32);
+}
+
+struct PciPmRoot<'a> {
+    root: &'a mut PciRoot,
+    bdf: DeviceFunction,
+}
+
+impl PciPmConfig for PciPmRoot<'_> {
+    fn read_config_dword(&mut self, offset: u8) -> Option<u32> {
+        self.root.read_config_dword(self.bdf, offset)
+    }
+
+    fn write_config_u16(&mut self, offset: u8, value: u16) -> bool {
+        self.root.write_config_u16(self.bdf, offset, value)
+    }
+
+    fn delay_us(&mut self, micros: u32) {
+        axhal::time::busy_wait(core::time::Duration::from_micros(u64::from(micros)));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PciPmError {
+    ConfigUnavailable,
+    InvalidCapabilityList,
+    CapabilityCycle,
+    UnsupportedPmVersion,
+    UnsupportedCurrentState,
+    PmWriteFailed,
+    TransitionTimedOut,
+}
+
+fn find_pci_pm_capability(io: &mut impl PciPmConfig) -> Result<Option<u8>, PciPmError> {
+    let status_command = io
+        .read_config_dword(PCI_COMMAND)
+        .filter(|value| *value != u32::MAX)
+        .ok_or(PciPmError::ConfigUnavailable)?;
+    if (status_command >> 16) as u16 & PCI_STATUS_CAPABILITIES_LIST == 0 {
+        return Ok(None);
+    }
+
+    let pointer_word = io
+        .read_config_dword(PCI_CAPABILITIES_POINTER & !0x3)
+        .filter(|value| *value != u32::MAX)
+        .ok_or(PciPmError::ConfigUnavailable)?;
+    let mut offset = (pointer_word & 0xff) as u8;
+    if offset == 0 || offset & 0x3 != 0 || offset < PCI_CAPABILITY_MIN_OFFSET {
+        return Err(PciPmError::InvalidCapabilityList);
+    }
+
+    // Conventional capabilities occupy aligned dwords from 0x40 through
+    // 0xfc. A fixed visited set makes malformed loops bounded and explicit.
+    let mut visited = [false; 64];
+    let mut pm_capability = None;
+    loop {
+        if offset < PCI_CAPABILITY_MIN_OFFSET || offset > PCI_CONFIG_LAST_DWORD || offset & 0x3 != 0
+        {
+            return Err(PciPmError::InvalidCapabilityList);
+        }
+        let index = usize::from(offset >> 2);
+        if visited[index] {
+            return Err(PciPmError::CapabilityCycle);
+        }
+        visited[index] = true;
+
+        let header = io
+            .read_config_dword(offset)
+            .filter(|value| *value != u32::MAX)
+            .ok_or(PciPmError::ConfigUnavailable)?;
+        let capability_id = header as u8;
+        let next = (header >> 8) as u8;
+        if capability_id == PCI_CAP_ID_POWER_MANAGEMENT {
+            if pm_capability.is_some() || offset > PCI_CONFIG_LAST_DWORD - PCI_PM_CONTROL_OFFSET {
+                return Err(PciPmError::InvalidCapabilityList);
+            }
+            let version = ((header >> 16) as u16) & PCI_PM_CAP_VERSION_MASK;
+            if version == 0 || version > 3 {
+                return Err(PciPmError::UnsupportedPmVersion);
+            }
+            pm_capability = Some(offset);
+        }
+
+        if next == 0 {
+            return Ok(pm_capability);
+        }
+        if next < PCI_CAPABILITY_MIN_OFFSET || next > PCI_CONFIG_LAST_DWORD || next & 0x3 != 0 {
+            return Err(PciPmError::InvalidCapabilityList);
+        }
+        offset = next;
+    }
+}
+
+/// Request PCI D0 before the SDHCI driver touches its BAR. Returns true when
+/// a D3hot transition may have reset the function and its saved BARs must be
+/// restored before mapping them.
+fn request_pci_d0(io: &mut impl PciPmConfig) -> Result<bool, PciPmError> {
+    // A function in D3cold is not configuration-space accessible. Do not
+    // attempt PMCSR writes or trust a BAR snapshot in that state.
+    let vendor_device = io
+        .read_config_dword(0)
+        .filter(|value| *value != u32::MAX && *value as u16 != u16::MAX)
+        .ok_or(PciPmError::ConfigUnavailable)?;
+    let Some(pm_capability) = find_pci_pm_capability(io)? else {
+        // PCI functions without a PM capability are not software-managed by
+        // PCI PM; retain the firmware's default D0 behavior.
+        return Ok(false);
+    };
+
+    let capability = io
+        .read_config_dword(pm_capability)
+        .filter(|value| *value != u32::MAX)
+        .ok_or(PciPmError::ConfigUnavailable)?;
+    let pmc = (capability >> 16) as u16;
+    let version = pmc & PCI_PM_CAP_VERSION_MASK;
+    if version == 0 || version > 3 {
+        return Err(PciPmError::UnsupportedPmVersion);
+    }
+    let pmcsr_offset = pm_capability + PCI_PM_CONTROL_OFFSET;
+    let pmcsr_word = io
+        .read_config_dword(pmcsr_offset)
+        .filter(|value| *value != u32::MAX && *value as u16 != u16::MAX)
+        .ok_or(PciPmError::ConfigUnavailable)? as u16;
+    let current_state = pmcsr_word & PCI_PM_STATE_MASK;
+    if (current_state == 1 && pmc & PCI_PM_CAP_D1 == 0)
+        || (current_state == 2 && pmc & PCI_PM_CAP_D2 == 0)
+    {
+        return Err(PciPmError::UnsupportedCurrentState);
+    }
+    if current_state == 0 {
+        return Ok(false);
+    }
+
+    // PMCSR.PME_Status is RW1C. Never echo it back as one while changing only
+    // PowerState; keep PME_Enable and every other readable control bit intact.
+    let write_value = pmcsr_word & !(PCI_PM_STATE_MASK | PCI_PM_PME_STATUS);
+    if !io.write_config_u16(pmcsr_offset, write_value) {
+        return Err(PciPmError::PmWriteFailed);
+    }
+
+    match current_state {
+        1 => io.delay_us(PCI_PM_D1_DELAY_US),
+        2 => io.delay_us(PCI_PM_D2_DELAY_US),
+        3 => io.delay_us(PCI_PM_D3HOT_DELAY_US),
+        _ => return Err(PciPmError::UnsupportedCurrentState),
+    }
+
+    let restore_bars = current_state == 3 && pmcsr_word & PCI_PM_NO_SOFT_RESET == 0;
+    if restore_bars {
+        let mut ready = false;
+        for _ in 0..PCI_PM_RESET_READY_POLLS {
+            let current = io.read_config_dword(0);
+            if current.is_some_and(|value| {
+                value != u32::MAX && value as u16 != u16::MAX && value == vendor_device
+            }) {
+                ready = true;
+                break;
+            }
+            io.delay_us(PCI_PM_RESET_READY_POLL_US);
+        }
+        if !ready {
+            return Err(PciPmError::TransitionTimedOut);
+        }
+    }
+
+    for _ in 0..PCI_PM_READBACK_POLLS {
+        let Some(pmcsr) = io
+            .read_config_dword(pmcsr_offset)
+            .filter(|value| *value != u32::MAX && *value as u16 != u16::MAX)
+        else {
+            return Err(PciPmError::ConfigUnavailable);
+        };
+        if pmcsr as u16 & PCI_PM_STATE_MASK == 0 {
+            return Ok(restore_bars);
+        }
+        io.delay_us(PCI_PM_READBACK_POLL_US);
+    }
+    Err(PciPmError::TransitionTimedOut)
 }
 
 // FreeBSD sys/dev/sdhci/sdhci_pci.c sdhci_devices[]; descriptions are omitted
@@ -741,7 +943,77 @@ pub(crate) fn probe(
     if info.class != PCI_CLASS_SYSTEM_PERIPHERAL || info.subclass != PCI_SUBCLASS_SD_HOST {
         return BusProbeResult::NotMatched;
     }
-    let Some(command) = root.read_config_dword(bdf, PCI_COMMAND) else {
+    if info.header_type != HeaderType::Standard {
+        warn!(
+            "sdhci: {bdf} has unsupported PCI header type {:?}",
+            info.header_type
+        );
+        return BusProbeResult::Claimed;
+    }
+    let Some(identity) = root
+        .read_config_dword(bdf, 0)
+        .filter(|value| *value != u32::MAX && *value as u16 != u16::MAX)
+    else {
+        warn!("sdhci: {bdf} config space is inaccessible before power-up");
+        return BusProbeResult::Claimed;
+    };
+    if identity as u16 != info.vendor_id || (identity >> 16) as u16 != info.device_id {
+        warn!("sdhci: {bdf} PCI identity changed during probe");
+        return BusProbeResult::Claimed;
+    }
+
+    // A D3hot->D0 transition may cause an internal reset when PMCSR says
+    // No_Soft_Reset is clear. Save firmware-assigned BARs before requesting
+    // D0 so that those addresses can be restored before any BAR mapping.
+    let original_bars = root.raw_bars(bdf, HeaderType::Standard);
+    if root
+        .read_config_dword(bdf, PCI_COMMAND)
+        .filter(|value| *value != u32::MAX)
+        .is_none()
+    {
+        warn!("sdhci: {bdf} command register is inaccessible");
+        return BusProbeResult::Claimed;
+    }
+
+    let restore_bars = {
+        let mut pm = PciPmRoot { root, bdf };
+        match request_pci_d0(&mut pm) {
+            Ok(restore_bars) => restore_bars,
+            Err(error) => {
+                warn!("sdhci: {bdf} refused PCI D0 transition: {error:?}");
+                return BusProbeResult::Claimed;
+            }
+        }
+    };
+    let Some(command) = root
+        .read_config_dword(bdf, PCI_COMMAND)
+        .filter(|value| *value != u32::MAX)
+    else {
+        warn!("sdhci: {bdf} command register unavailable after PCI D0 transition");
+        return BusProbeResult::Claimed;
+    };
+    if !root.write_config_u16(
+        bdf,
+        PCI_COMMAND,
+        command as u16 & !(PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER),
+    ) {
+        warn!("sdhci: {bdf} could not quiesce PCI memory/bus-master decoding");
+        return BusProbeResult::Claimed;
+    }
+    if restore_bars {
+        for (bar, value) in original_bars.iter().copied().enumerate() {
+            root.set_bar_32(bdf, bar as u8, value);
+        }
+        if root.raw_bars(bdf, HeaderType::Standard) != original_bars {
+            warn!("sdhci: {bdf} could not restore BARs after D3hot reset");
+            return BusProbeResult::Claimed;
+        }
+    }
+    let Some(command) = root
+        .read_config_dword(bdf, PCI_COMMAND)
+        .filter(|value| *value != u32::MAX)
+    else {
+        warn!("sdhci: {bdf} command register became inaccessible while restoring resources");
         return BusProbeResult::Claimed;
     };
     if !root.write_config_u16(
@@ -749,7 +1021,7 @@ pub(crate) fn probe(
         PCI_COMMAND,
         command as u16 | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER,
     ) {
-        warn!("sdhci: {bdf} could not enable memory decoding");
+        warn!("sdhci: {bdf} could not enable memory decoding after PCI D0 transition");
         return BusProbeResult::Claimed;
     }
     let slot_info = root
@@ -788,6 +1060,65 @@ pub(crate) fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakePciPm {
+        config: [u32; 64],
+        writes: alloc::vec::Vec<(u8, u16)>,
+        delays: alloc::vec::Vec<u32>,
+        accept_pm_write: bool,
+    }
+
+    impl FakePciPm {
+        fn new(pmc: u16, pmcsr: u16) -> Self {
+            let mut config = [0; 64];
+            config[0] = (u32::from(INTEL_EMMC_DID) << 16) | u32::from(INTEL_EMMC_VID);
+            config[PCI_COMMAND as usize / 4] = u32::from(PCI_STATUS_CAPABILITIES_LIST) << 16;
+            config[PCI_CAPABILITIES_POINTER as usize / 4] = 0x50;
+            config[0x50 / 4] = (u32::from(pmc) << 16) | u32::from(PCI_CAP_ID_POWER_MANAGEMENT);
+            config[(0x50 + PCI_PM_CONTROL_OFFSET) as usize / 4] = u32::from(pmcsr);
+            Self {
+                config,
+                writes: alloc::vec::Vec::new(),
+                delays: alloc::vec::Vec::new(),
+                accept_pm_write: true,
+            }
+        }
+
+        fn add_capability(&mut self, offset: u8, id: u8, next: u8) {
+            self.config[usize::from(offset / 4)] = u32::from(id) | (u32::from(next) << 8);
+        }
+    }
+
+    impl PciPmConfig for FakePciPm {
+        fn read_config_dword(&mut self, offset: u8) -> Option<u32> {
+            self.config.get(usize::from(offset / 4)).copied()
+        }
+
+        fn write_config_u16(&mut self, offset: u8, value: u16) -> bool {
+            self.writes.push((offset, value));
+            if offset == 0x50 + PCI_PM_CONTROL_OFFSET && !self.accept_pm_write {
+                return true;
+            }
+            let index = usize::from(offset / 4);
+            let shift = u32::from(offset & 2) * 8;
+            let old_dword = self.config[index];
+            let old_word = (old_dword >> shift) as u16;
+            // PME_Status is RW1C: writing zero leaves the old status set.
+            let status = if value & PCI_PM_PME_STATUS != 0 {
+                0
+            } else {
+                old_word & PCI_PM_PME_STATUS
+            };
+            let next_word = (value & !PCI_PM_PME_STATUS) | status;
+            self.config[index] =
+                (old_dword & !(u32::from(u16::MAX) << shift)) | (u32::from(next_word) << shift);
+            true
+        }
+
+        fn delay_us(&mut self, micros: u32) {
+            self.delays.push(micros);
+        }
+    }
 
     #[test]
     fn failed_initial_attach_keeps_emmc_write_policy_for_hotplug_retry() {
@@ -887,6 +1218,89 @@ mod tests {
         assert_eq!(decode_slot_info(0x0f), (1, 0));
         assert!(!irq_signal_usable(QEMU_SDHCI_VID, QEMU_SDHCI_DID));
         assert!(irq_signal_usable(0x8086, 0x54c4));
+    }
+
+    #[test]
+    fn pci_pm_moves_d3hot_to_d0_preserving_controls_without_clearing_pme_status() {
+        let mut pci = FakePciPm::new(3, 0x810b); // D3hot, No_Soft_Reset, PME_EN, PME_STATUS
+        assert!(!request_pci_d0(&mut pci).unwrap());
+        assert_eq!(pci.writes, [(0x54, 0x0108)]);
+        assert_eq!(pci.delays, [PCI_PM_D3HOT_DELAY_US]);
+        assert_eq!(pci.config[0x54 / 4] as u16, 0x8108);
+    }
+
+    #[test]
+    fn pci_pm_restores_bars_after_d3hot_that_may_reset_the_function() {
+        let mut pci = FakePciPm::new(3, 0x0003); // D3hot, No_Soft_Reset clear
+        assert!(request_pci_d0(&mut pci).unwrap());
+        assert_eq!(pci.delays, [PCI_PM_D3HOT_DELAY_US]);
+    }
+
+    #[test]
+    fn pci_pm_accepts_devices_without_a_pm_capability_as_firmware_d0() {
+        let mut pci = FakePciPm::new(3, 0);
+        pci.config[PCI_COMMAND as usize / 4] = 0;
+        assert!(!request_pci_d0(&mut pci).unwrap());
+        assert!(pci.writes.is_empty());
+        assert!(pci.delays.is_empty());
+    }
+
+    #[test]
+    fn pci_pm_rejects_malformed_or_cyclic_capability_chains() {
+        let mut invalid = FakePciPm::new(3, 3);
+        invalid.config[PCI_CAPABILITIES_POINTER as usize / 4] = 0x20;
+        assert_eq!(
+            find_pci_pm_capability(&mut invalid),
+            Err(PciPmError::InvalidCapabilityList)
+        );
+
+        let mut cyclic = FakePciPm::new(3, 3);
+        cyclic.add_capability(0x50, 2, 0x54);
+        cyclic.add_capability(0x54, 3, 0x50);
+        assert_eq!(
+            find_pci_pm_capability(&mut cyclic),
+            Err(PciPmError::CapabilityCycle)
+        );
+    }
+
+    #[test]
+    fn pci_pm_rejects_unsupported_power_states_and_inaccessible_pmcsr() {
+        let mut unsupported_d1 = FakePciPm::new(3, 1);
+        assert_eq!(
+            request_pci_d0(&mut unsupported_d1),
+            Err(PciPmError::UnsupportedCurrentState)
+        );
+        assert!(unsupported_d1.writes.is_empty());
+
+        let mut inaccessible = FakePciPm::new(3, u16::MAX);
+        assert_eq!(
+            request_pci_d0(&mut inaccessible),
+            Err(PciPmError::ConfigUnavailable)
+        );
+        assert!(inaccessible.writes.is_empty());
+    }
+
+    #[test]
+    fn pci_pm_rejects_config_space_that_is_unresponsive_in_d3cold() {
+        let mut cold = FakePciPm::new(3, 3);
+        cold.config[0] = u32::MAX;
+        assert_eq!(
+            request_pci_d0(&mut cold),
+            Err(PciPmError::ConfigUnavailable)
+        );
+        assert!(cold.writes.is_empty());
+        assert!(cold.delays.is_empty());
+    }
+
+    #[test]
+    fn pci_pm_refuses_a_power_transition_without_d0_readback() {
+        let mut pci = FakePciPm::new(3, 0x000b);
+        pci.accept_pm_write = false;
+        assert_eq!(
+            request_pci_d0(&mut pci),
+            Err(PciPmError::TransitionTimedOut)
+        );
+        assert_eq!(pci.delays.len(), PCI_PM_READBACK_POLLS + 1);
     }
 
     #[test]
