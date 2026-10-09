@@ -5,7 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class PlatformServicePhaseTests(unittest.TestCase):
     def test_bsp_runtime_precedes_firmware_and_pci_before_ap_startup(self):
         source = (ROOT / 'crates/ax/tk-axruntime/src/lib.rs').read_text()
-        body = source[source.index('pub fn rust_main('):source.index('pub fn reconcile_pci_input_hotplug(')]
+        body = source[source.index('pub fn rust_main('):source.index('pub fn reconcile_input_hotplug(')]
         markers = ['axtask::init_scheduler()', 'init_interrupt();', 'ctor_bare::call_ctors();',
                    'axhal::asm::enable_irqs();', 'PlatformServices::before_pci_probe',
                    'init_device_subsystems();', 'self::mp::start_secondary_cpus(cpu_id)', 'unsafe { main() }']
