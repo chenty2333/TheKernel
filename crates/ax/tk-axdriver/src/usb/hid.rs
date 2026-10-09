@@ -102,6 +102,10 @@ impl Drop for InputState {
         // Boot devices normally live forever. If ownership is dropped, halt
         // the controller before freeing the report buffer still owned by DMA.
         if self.pending.is_some() && !self._owner.dma_quiesced.load(Ordering::Acquire) {
+            warn!(
+                "USB HID owner dropped before endpoint retirement; halting xHCI before freeing \
+                 report DMA"
+            );
             self.host.halt();
         }
     }

@@ -37,6 +37,7 @@ use crate::{AxDeviceEnum, AxInputDevice, InputBusIdentity, UsbInputIdentity};
 
 static USB_CONTROLLERS: Mutex<Vec<Arc<UsbController>>> = Mutex::new(Vec::new());
 static USB_INPUT_READY: AtomicBool = AtomicBool::new(false);
+static USB_RECONCILE_NOT_READY_LOGGED: AtomicBool = AtomicBool::new(false);
 
 pub(super) struct Host {
     events: kspin::SpinNoIrq<EventHandler>,
@@ -166,6 +167,8 @@ struct UsbController {
     devices: Mutex<BTreeMap<usize, ManagedUsbDevice>>,
     scan_active: AtomicBool,
     poisoned: AtomicBool,
+    first_scan_logged: AtomicBool,
+    scan_busy_logged: AtomicBool,
 }
 
 struct ManagedUsbDevice {
@@ -236,6 +239,12 @@ impl UsbController {
             match state {
                 Some(state @ ManagedUsbInterface::Registering) => {
                     *state = ManagedUsbInterface::Active { token };
+                    info!(
+                        "USB xHCI bus={} port={} interface={} input registered token={token}",
+                        identity.bus,
+                        InputBusIdentity::usb_device_name(identity),
+                        identity.interface,
+                    );
                 }
                 _ => {
                     drop(devices);
@@ -273,13 +282,29 @@ impl UsbController {
         let Some(device) = self.devices.lock().remove(&device_id) else {
             return;
         };
+        let interface_count = device.interfaces.len();
+        info!(
+            "USB xHCI bus={} disconnect observed for device={device_id}; retiring endpoints",
+            self.bus
+        );
         let disconnected = {
             let mut owner = device.owner.lock();
             self.host.wait(owner.disconnect())
         };
+        if !matches!(&disconnected, Ok(Ok(()))) {
+            warn!(
+                "USB xHCI bus={} device={device_id} endpoint retirement failed: {disconnected:?}",
+                self.bus
+            );
+        }
         match disconnected {
             Ok(Ok(())) => {
                 device.dma_quiesced.store(true, Ordering::Release);
+                info!(
+                    "USB xHCI bus={} device={device_id} endpoints retired; removing \
+                     {interface_count} input interface(s)",
+                    self.bus
+                );
                 let tokens = device
                     .interfaces
                     .values()
@@ -301,6 +326,11 @@ impl UsbController {
                     // HCHalted fences every device on this controller. Keep
                     // all backing pinned until that boundary, then revoke the
                     // input registrations without freeing any active DMA.
+                    warn!(
+                        "USB xHCI bus={} device={device_id} teardown failed; controller halted \
+                         and input owners quiesced",
+                        self.bus
+                    );
                     self.unregister_all_quiesced(unregister);
                 } else {
                     warn!(
@@ -323,6 +353,12 @@ impl UsbController {
         // Own the guard for the complete scan so a second notifier cannot
         // duplicate registration or race a disconnect with a pending HID add.
         let Some(_scan) = ScanGuard::try_acquire(&self.scan_active) else {
+            if !self.scan_busy_logged.swap(true, Ordering::AcqRel) {
+                warn!(
+                    "USB xHCI bus={} input reconciliation skipped: scan already active",
+                    self.bus
+                );
+            }
             return;
         };
         let changes = match self.host.wait(self.backend.lock().probe_devices()) {
@@ -337,6 +373,15 @@ impl UsbController {
                 return;
             }
         };
+        if !self.first_scan_logged.swap(true, Ordering::AcqRel) {
+            info!(
+                "USB xHCI bus={} first input reconciliation completed: connected={} \
+                 disconnected={}",
+                self.bus,
+                changes.connected.len(),
+                changes.disconnected.len()
+            );
+        }
         for device_id in changes.disconnected {
             self.remove_device(device_id, unregister);
             if self.poisoned.load(Ordering::Acquire) {
@@ -378,9 +423,22 @@ pub(crate) fn activate_boot_input_devices<Register, Unregister>(
 {
     USB_INPUT_READY.store(true, Ordering::Release);
     let controllers = USB_CONTROLLERS.lock().clone();
+    info!(
+        "USB input listener ready; retained xHCI controller(s)={}",
+        controllers.len()
+    );
     for controller in controllers {
         if let Some(_scan) = ScanGuard::try_acquire(&controller.scan_active) {
             controller.register_pending(&mut register, &mut unregister);
+            info!(
+                "USB xHCI bus={} boot input activation complete",
+                controller.bus
+            );
+        } else if !controller.scan_busy_logged.swap(true, Ordering::AcqRel) {
+            warn!(
+                "USB xHCI bus={} boot input activation deferred: scan already active",
+                controller.bus
+            );
         }
     }
 }
@@ -393,6 +451,9 @@ pub(crate) fn reconcile_input_devices<Register, Unregister>(
     Unregister: FnMut(u64),
 {
     if !USB_INPUT_READY.load(Ordering::Acquire) {
+        if !USB_RECONCILE_NOT_READY_LOGGED.swap(true, Ordering::AcqRel) {
+            info!("USB input reconciliation deferred until the input listener is ready");
+        }
         return;
     }
     let controllers = USB_CONTROLLERS.lock().clone();
@@ -705,6 +766,8 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<AxDeviceEnum>> {
         devices: Mutex::new(BTreeMap::new()),
         scan_active: AtomicBool::new(false),
         poisoned: AtomicBool::new(false),
+        first_scan_logged: AtomicBool::new(false),
+        scan_busy_logged: AtomicBool::new(false),
     })
     .map_err(|_| DevError::NoMemory)?;
     let mut guard = ProbeGuard {
