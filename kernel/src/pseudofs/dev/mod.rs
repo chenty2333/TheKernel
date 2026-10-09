@@ -629,8 +629,8 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
         Device::new_with_permissions(
             fs.clone(),
             NodeType::CharacterDevice,
-            DeviceId::new(10, 58),
-            NodePermission::from_bits_truncate(0o600),
+            DeviceId::new(10, 242),
+            NodePermission::from_bits_truncate(0o664),
             Arc::new(rfkill::Rfkill),
         ),
     );
@@ -941,8 +941,8 @@ mod tests {
         let rfkill = root.lookup(FsName::new(b"rfkill")).unwrap();
         let metadata = rfkill.metadata().unwrap();
         assert_eq!(metadata.node_type, NodeType::CharacterDevice);
-        assert_eq!(metadata.rdev, DeviceId::new(10, 58));
-        assert_eq!(metadata.mode.bits(), 0o600);
+        assert_eq!(metadata.rdev, DeviceId::new(10, 242));
+        assert_eq!(metadata.mode.bits(), 0o664);
     }
 
     #[test]
