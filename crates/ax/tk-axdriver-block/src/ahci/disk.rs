@@ -864,7 +864,7 @@ impl<I: AhciIo> AhciDisk<I> {
             let observed = self.controller.io_mut().interrupt_generation();
             if let Some(result) = self.sample_command(ncq) {
                 if let Err(error @ AhciDiskError::DeviceError(_)) = result {
-                    if !self.recover_command_error(ncq) {
+                    if !self.ahci_issue_recovery(ncq) {
                         self.poisoned = true;
                         return Err(AhciDiskError::DmaMayStillBeActive);
                     }
@@ -891,12 +891,11 @@ impl<I: AhciIo> AhciDisk<I> {
         }
     }
 
-    /// FreeBSD keeps an NCQ error victim on hold while issuing READ LOG EXT,
-    /// then restarts the channel before releasing it. This driver has one slot,
-    /// so it reads the error log and reinitializes the engine before returning
-    /// the exact failed request; no unrelated queued victim exists.
-    // upstream: ahci.c ahci_end_transaction() + ahci_issue_recovery()
-    fn recover_command_error(&mut self, ncq: bool) -> bool {
+    /// Resolve an interface error before completing its block requests. NCQ
+    /// reads READ LOG EXT then resets the channel; CAM's held-CCB queue and
+    /// victim retry policy are replaced by typed block completions.
+    // upstream: ahci.c ahci_issue_recovery()
+    fn ahci_issue_recovery(&mut self, ncq: bool) -> bool {
         if ncq {
             self.ncq_error_tag = self.read_ncq_error_log();
         } else {
@@ -1020,7 +1019,7 @@ impl<I: AhciIo> AhciDisk<I> {
             }
         }
         if let Some(status) = physical_error {
-            let recovered = self.recover_command_error(self.ncq);
+            let recovered = self.ahci_issue_recovery(self.ncq);
             if !recovered {
                 self.poisoned = true;
             }
@@ -1062,7 +1061,7 @@ impl<I: AhciIo> AhciDisk<I> {
                 }
                 Err(AhciDiskError::DeviceError(status)) => {
                     let ncq = self.ncq && pending.op != BlockAsyncOp::Flush;
-                    if !self.recover_command_error(ncq) {
+                    if !self.ahci_issue_recovery(ncq) {
                         self.poisoned = true;
                     }
                     BlockCompletionStatus::DeviceError(status as u8)

@@ -80,3 +80,8 @@ The IRQ top half now splits controller-wide interrupt routing from the exact
 `ahci_ch_intr()` per-port latch/ack step. It does not run CAM's locked task
 queue; status is atomically retained and request-context completion checks CI/
 SACT and TFD before publishing completion.
+
+The controller-error path is named `ahci_issue_recovery()`: NCQ failures attempt
+READ LOG EXT and capture the failing tag before reset. The current block layer
+reports typed errors for the affected submitted batch; it does not reproduce
+CAM's held CCB sense/retry queue.
