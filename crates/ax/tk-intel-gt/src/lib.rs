@@ -211,6 +211,9 @@ pub mod intel_engine_heartbeat_upstream;
 pub mod intel_engine_regs_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_gt_requests_upstream;
 pub mod intel_engine_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]

@@ -54,6 +54,7 @@ use crate::{
     intel_gt_mcr_upstream::*,
     intel_gtt_api_upstream::{
         i915_ggtt_has_aperture, i915_ggtt_require_binder, i915_vm_get, i915_vm_put,
+    intel_gt_requests_upstream::{intel_engine_fini_retire, intel_engine_init_retire},
     },
     intel_guc_fwif_types_upstream::{
         MAKE_GUC_ID, engine_class_to_guc_class, guc_policy_max_preempt_timeout_ms,
