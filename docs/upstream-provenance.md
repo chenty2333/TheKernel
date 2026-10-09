@@ -2015,6 +2015,11 @@ GEM handle publication/error order.
 Intel Corporation); context/engine/timeline locks and wait ordering follow the
 source path.
 
+`i915_gem_pm_upstream.rs` translates all 9 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gem/i915_gem_pm.c` (MIT, Copyright © 2019 Intel
+Corporation), preserving suspend/freeze/resume order and TTM calls behind the
+upstream local-memory-region type checks.
+
 `intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
 `drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
 Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.
