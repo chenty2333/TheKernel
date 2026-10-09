@@ -619,13 +619,7 @@ fn capture(
         universal_plane::Plane::PRIMARY,
     )?
     .ok_or(Error::Refused)?;
-    let xrgb_stride = plane
-        .width
-        .checked_mul(4)
-        .and_then(|minimum| minimum.div_ceil(64).checked_mul(64))
-        .ok_or(Error::Refused)?;
     if !plane.native_linear_xrgb()
-        || plane.pitch != xrgb_stride
         || plane.offset != 0
         || (plane.width, plane.height) != pipe.source
         || read(r, 0x7018c)? != 0
@@ -865,13 +859,7 @@ fn read_only_live_scanout<R: Registers>(
         universal_plane::Plane::PRIMARY,
     )?
     .ok_or(Error::Refused)?;
-    let xrgb_stride = plane
-        .width
-        .checked_mul(4)
-        .and_then(|minimum| minimum.div_ceil(64).checked_mul(64))
-        .ok_or(Error::Refused)?;
     if !plane.native_linear_xrgb()
-        || plane.pitch != xrgb_stride
         || plane.offset != 0
         || (plane.width, plane.height) != pipe.source
         || read(r, 0x7018c)? != 0
@@ -4326,6 +4314,21 @@ mod tests {
         let writes = r.inner.lock().writes;
         assert!(read_only_live_scanout(&r, &pin, TcPort::Tc1).is_ok());
         assert_eq!(r.inner.lock().writes, writes);
+        assert!(capture(&r, &pin, TcPort::Tc1, None).is_ok());
+    }
+
+    #[test]
+    fn padded_linear_xrgb_firmware_pitch_is_preserved_for_both_readout_paths() {
+        let r = Model::new();
+        let pin = PowerPin::acquire(&r, TcPort::Tc1).unwrap();
+        // PLANE_STRIDE is in 64-byte units: 5 * 64 = 320, versus the
+        // 256-byte minimum for this 64-pixel XRGB test surface.
+        r.set(0x70188, 5);
+
+        let (pipe, plane) = read_only_live_scanout(&r, &pin, TcPort::Tc1).unwrap();
+        assert_eq!(plane.pitch, 320);
+        assert_eq!(plane.main_size, 320 * u64::from(plane.height));
+        assert_eq!(plane.width, pipe.source.0);
         assert!(capture(&r, &pin, TcPort::Tc1, None).is_ok());
     }
 
