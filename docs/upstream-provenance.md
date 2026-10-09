@@ -2075,3 +2075,30 @@ Corporation), including GuC parameter construction, PCI revision handling, MMIO/
 `intel_gt_pm_upstream.rs` translates all 20 functions from Linux 7.2.3
 `drivers/gpu/drm/i915/gt/intel_gt_pm.c` (MIT, Copyright © 2019 Intel
 Corporation); runtime-PM, display-power, RC6/RPS, request, and system-PM services remain explicit owner boundaries.
+
+### GP GT/GEM/power coverage provenance (Linux 7.2.3)
+
+The following MIT source files were completed for the default-off upstream-gt
+preparation. Copyright notices are retained in each Rust owner; GPL DRM/MM
+framework bodies are not copied. The i915_irq.c owner additionally retains the
+complete Tungsten Graphics permission and warranty text.
+
+| Upstream source | Rust owner | Scope / source copyright |
+|---|---|---|
+| drivers/gpu/drm/i915/gt/intel_gt.c | intel_gt_upstream.rs | 42/42 functions; MIT, Copyright © 2019 Intel Corporation |
+| drivers/gpu/drm/i915/gt/intel_ggtt.c | intel_ggtt_upstream.rs | 74/74 functions; MIT, Copyright © 2020 Intel Corporation |
+| drivers/gpu/drm/i915/gt/intel_gtt.c | intel_gtt_upstream.rs | 33/33 functions; MIT, Copyright © 2020 Intel Corporation |
+| drivers/gpu/drm/i915/gt/intel_ppgtt.c | intel_ppgtt_upstream.rs | 18/18 functions; MIT, Copyright © 2020 Intel Corporation |
+| drivers/gpu/drm/i915/gt/intel_mocs.c | intel_mocs_upstream.rs | 15/15 functions; MIT, Copyright © 2015 Intel Corporation |
+| drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c | intel_uc_fw_upstream.rs | 38/38 functions; MIT, Copyright © 2016-2019 Intel Corporation |
+| drivers/gpu/drm/i915/gt/uc/intel_guc_ct.c | intel_guc_ct_upstream.rs | 44/44 functions; MIT, Copyright © 2016-2019 Intel Corporation |
+| drivers/gpu/drm/i915/gt/uc/intel_guc_ads.c | intel_guc_ads_upstream.rs | 40/40 functions; MIT, Copyright © 2014-2019 Intel Corporation |
+| drivers/gpu/drm/i915/gt/uc/intel_huc.c | intel_huc_upstream.rs | 29/29 functions; MIT, Copyright © 2016-2019 Intel Corporation |
+| drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c | i915_gem_execbuffer_upstream.rs | 90/90 functions; MIT, Copyright © 2008, 2010 Intel Corporation |
+| drivers/gpu/drm/i915/gt/intel_rc6.c | intel_rc6_upstream.rs | 30/30 functions; MIT, Copyright © 2019 Intel Corporation |
+| drivers/gpu/drm/i915/gt/intel_rps.c | intel_rps_upstream.rs | 134/134 functions; MIT, Copyright © 2019 Intel Corporation |
+| drivers/gpu/drm/i915/gt/intel_reset.c | intel_reset_upstream.rs | 67/67 functions; MIT, Copyright © 2008-2018 Intel Corporation |
+| drivers/gpu/drm/i915/i915_irq.c | i915_irq_upstream.rs | 13/55 selected Gen11+/DG1 GT/top-level functions per task scope; MIT permission text retained; Copyright © 2003 Tungsten Graphics, Inc. |
+
+The intel_gt.c body was translated in 02c3a1d8; fac54d53 adds the missing
+source-location markers required by the translation review convention.
