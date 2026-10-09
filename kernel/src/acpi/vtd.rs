@@ -108,11 +108,11 @@ fn invalidate_all_units(units: &mut [Unit]) -> Result<(), Error> {
 const GSTS_ACTIVE_MASK: u32 = GSTS_TES | GSTS_QIES | GSTS_IRES;
 
 const fn pci_dma_allowed_in_mode(mode: u8) -> bool {
-    mode != MODE_FAILED
+    matches!(mode, MODE_IDENTITY | MODE_ENABLED)
 }
 
 const fn identity_dma_in_mode(mode: u8) -> bool {
-    matches!(mode, MODE_UNKNOWN | MODE_IDENTITY)
+    mode == MODE_IDENTITY
 }
 
 const fn direct_identity_lease_allowed(mode: u8) -> bool {
@@ -2632,12 +2632,14 @@ struct PlatformDma;
 #[crate_interface::impl_interface]
 impl tk_vtd::PlatformDma for PlatformDma {
     fn pci_dma_allowed() -> bool {
-        // UNKNOWN means VT-d initialization was never reached (static ACPI,
-        // missing RSDP, or ACPICA rescue). That path is firmware-style direct
-        // DMA; only a VT-d initialization that explicitly failed may block PCI.
-        let allowed = pci_dma_allowed_in_mode(MODE.load(Ordering::Acquire));
+        let mode = MODE.load(Ordering::Acquire);
+        let allowed = pci_dma_allowed_in_mode(mode);
         if !allowed {
-            error!("vtd: PCI DMA refused; VT-d failure: {:?}", *FAILURE.lock());
+            if mode == MODE_UNKNOWN {
+                error!("vtd: PCI DMA refused; no safe firmware/VT-d handoff state was established");
+            } else {
+                error!("vtd: PCI DMA refused; VT-d failure: {:?}", *FAILURE.lock());
+            }
         }
         allowed
     }
@@ -2910,12 +2912,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_and_identity_modes_keep_pci_dma_direct_but_failure_denies_it() {
-        assert!(pci_dma_allowed_in_mode(MODE_UNKNOWN));
+    fn unknown_firmware_state_denies_pci_dma_until_safe_mode_is_established() {
+        assert!(!pci_dma_allowed_in_mode(MODE_UNKNOWN));
         assert!(pci_dma_allowed_in_mode(MODE_IDENTITY));
         assert!(pci_dma_allowed_in_mode(MODE_ENABLED));
         assert!(!pci_dma_allowed_in_mode(MODE_FAILED));
-        assert!(identity_dma_in_mode(MODE_UNKNOWN));
+        assert!(!identity_dma_in_mode(MODE_UNKNOWN));
         assert!(identity_dma_in_mode(MODE_IDENTITY));
         assert!(!identity_dma_in_mode(MODE_ENABLED));
         assert!(!identity_dma_in_mode(MODE_FAILED));

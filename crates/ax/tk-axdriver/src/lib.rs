@@ -565,15 +565,26 @@ impl AllDevices {
 
     /// Probes all supported devices.
     fn probe(&mut self) {
+        #[cfg(all(not(feature = "dyn"), feature = "rootfs-module"))]
+        self.probe_rootfs_module();
+
+        // Do not let either a global driver probe or PCI enumeration allocate
+        // bus-master DMA while ACPI/firmware left VT-d handoff state unknown.
+        #[cfg(feature = "vtd")]
+        if !tk_vtd::platform_pci_dma_allowed() {
+            error!(
+                "pci: DMA admission unavailable after ACPI VT-d initialization; refusing device \
+                 probes"
+            );
+            return;
+        }
+
         #[cfg(feature = "dyn")]
         for dev in dyn_drivers::probe_all_devices() {
             self.add_device(dev);
         }
         #[cfg(not(feature = "dyn"))]
         {
-            #[cfg(feature = "rootfs-module")]
-            self.probe_rootfs_module();
-
             for_each_drivers!(type Driver, {
                 if let Some(dev) = Driver::probe_global() {
                     info!(
@@ -585,14 +596,6 @@ impl AllDevices {
                 }
             });
 
-            #[cfg(feature = "vtd")]
-            if !tk_vtd::platform_pci_dma_allowed() {
-                error!(
-                    "pci: DMA admission unavailable after ACPI VT-d initialization; refusing PCI \
-                     probe"
-                );
-                return;
-            }
             self.probe_bus_devices();
             #[cfg(feature = "i2c-hid")]
             for device in crate::i2c_hid::probe_devices() {
