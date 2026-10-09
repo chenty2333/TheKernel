@@ -5,7 +5,7 @@
 //! Unlike a device/UC `iomap`, i915 stolen-memory mappings require PAT WC.
 //! This owner creates a dedicated kernel VA alias with PAT1/WC leaves and
 //! keeps the VA reserved until the kernel's acknowledged global shootdown has
-//! completed. The service admits only firmware-reserved physical ranges, so
+//! completed. The service admits only reserved or device physical ranges, so
 //! it never creates a WC alias over allocator-owned normal RAM.
 
 #![allow(unsafe_code)]
@@ -60,7 +60,7 @@ fn physical_extent(base: usize, size: usize) -> Option<(usize, usize, usize)> {
 
 /// Return true only when the full byte range is firmware-reserved and not
 /// part of the page allocator's free physical ranges.
-fn reserved_physical_range(base: usize, size: usize) -> bool {
+fn wc_physical_range_allowed(base: usize, size: usize) -> bool {
     let Some(end) = base.checked_add(size) else {
         return false;
     };
@@ -77,7 +77,9 @@ fn reserved_physical_range(base: usize, size: usize) -> bool {
             continue;
         }
         if region.flags.contains(MemRegionFlags::FREE)
-            || !region.flags.contains(MemRegionFlags::RESERVED)
+            || !region
+                .flags
+                .intersects(MemRegionFlags::RESERVED | MemRegionFlags::DEVICE)
         {
             return false;
         }
@@ -148,7 +150,7 @@ pub unsafe fn io_mapping_init_wc(mapping: *mut IoMapping, base: u64, size: usize
     else {
         return false;
     };
-    if !reserved_physical_range(physical_base, mapped_size) {
+    if !wc_physical_range_allowed(physical_base, mapped_size) {
         return false;
     }
     let Some((hint, limit)) = vmap_search_window() else {
