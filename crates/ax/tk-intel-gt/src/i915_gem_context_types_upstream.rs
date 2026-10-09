@@ -148,7 +148,7 @@ pub struct I915GemContext {
     pub active_count: AtomicT,
     pub hang_timestamp: [c_ulong; 2],
     pub remap_slice: u8,
-    pub handles_vma: XArray,
+    pub handles_vma: crate::intel_context_upstream::RadixTreeRoot,
     pub lut_mutex: Mutex,
     pub name: [c_char; TASK_COMM_LEN + 8],
     pub stale: I915GemContextStale,
