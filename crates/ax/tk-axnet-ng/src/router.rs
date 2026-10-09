@@ -108,12 +108,19 @@ pub struct RouteInfo {
 
 impl Rule {
     pub fn new(filter: IpCidr, via: Option<IpAddress>, dev: u32, src: IpAddress) -> Self {
-        Self {
-            filter,
-            via,
-            dev,
-            src,
-        }
+        // Route identity is a network prefix, not an interface's host address.
+        // Rtnetlink dumps the canonical prefix; retaining host bits here makes
+        // a subsequent dump-and-delete (DHCP renew/flush) fail with ENOENT.
+        let filter = match filter {
+            IpCidr::Ipv4(cidr) => cidr.network().into(),
+            IpCidr::Ipv6(cidr) => {
+                let prefix = cidr.prefix_len();
+                let mask = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
+                let network = u128::from_be_bytes(cidr.address().octets()) & mask;
+                IpCidr::new(smoltcp::wire::Ipv6Address::from(network.to_be_bytes()).into(), prefix)
+            }
+        };
+        Self { filter, via, dev, src }
     }
 }
 
@@ -2110,6 +2117,36 @@ mod tests {
 
     use super::*;
     use crate::packet::PacketDeviceContext;
+
+    #[test]
+    fn canonical_route_dump_can_be_deleted_without_losing_another_interface() {
+        let source = smoltcp::wire::Ipv4Address::new(10, 0, 2, 15);
+        let network = smoltcp::wire::Ipv4Address::new(10, 0, 2, 0);
+        let mut table = RouteTable::new();
+        table.add_rule(Rule::new(IpCidr::new(source.into(), 24), None, 2, source.into()));
+        table.add_rule(Rule::new(IpCidr::new(source.into(), 24), None, 3, source.into()));
+        assert_eq!(table.rules[0].filter, IpCidr::new(network.into(), 24));
+        let dump_delete = Rule::new(IpCidr::new(network.into(), 24), None, 2, source.into());
+        assert!(table.remove_rule(&dump_delete));
+        assert!(!table.remove_rule(&dump_delete));
+        assert_eq!(table.rules.len(), 1);
+        assert_eq!(table.rules[0].dev, 3);
+    }
+
+    #[test]
+    fn ipv6_route_identity_masks_host_bits_for_replace_and_delete() {
+        use smoltcp::wire::Ipv6Address;
+        let source = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0xffff, 0xffff, 0xffff, 0xffff);
+        let network = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0x8000, 0, 0, 0);
+        let mut table = RouteTable::new();
+        table.add_rule(Rule::new(IpCidr::new(source.into(), 65), None, 2, source.into()));
+        let canonical = Rule::new(IpCidr::new(network.into(), 65), None, 2, source.into());
+        table.replace_rule(canonical);
+        assert_eq!(table.rules.len(), 1);
+        assert!(table.remove_rule(&Rule::new(IpCidr::new(network.into(), 65), None, 2, source.into())));
+        assert_eq!(Rule::new(IpCidr::new(source.into(), 0), None, 2, source.into()).filter.address(), Ipv6Address::UNSPECIFIED.into());
+        assert_eq!(Rule::new(IpCidr::new(source.into(), 128), None, 2, source.into()).filter.address(), source.into());
+    }
 
     struct FakeDevice {
         name: String,

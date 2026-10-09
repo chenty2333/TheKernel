@@ -3477,11 +3477,6 @@ impl NetlinkSocket {
         hdr: &NlMsgHdr,
         payload: &[u8],
     ) -> AxResult {
-        let filter = if payload.len() >= size_of::<RtMsg>() {
-            Some(read_unaligned::<RtMsg>(payload)?)
-        } else {
-            None
-        };
         let port_id = permit.port_id();
         let routes = permit
             .route_service()
@@ -3489,10 +3484,7 @@ impl NetlinkSocket {
             .route_snapshot();
         for route in routes {
             let entry = route_entry(&route);
-            if let Some(filter) = filter
-                && filter.rtm_family != AF_UNSPEC as u8
-                && filter.rtm_family != entry.family
-            {
+            if !route_dump_matches_family(payload, entry.family) {
                 continue;
             }
             self.enqueue_kernel_permitted(permit, route_message(hdr, port_id, &entry));

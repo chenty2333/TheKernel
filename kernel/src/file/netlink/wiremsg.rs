@@ -440,6 +440,13 @@ fn route_network_address(cidr: IpCidr) -> IpAddress {
     }
 }
 
+/// Legacy RTM_GETROUTE dumps may carry only `struct rtgenmsg` (one
+/// family byte), as BusyBox does. `struct rtmsg` starts with the same field.
+pub(crate) fn route_dump_matches_family(payload: &[u8], family: u8) -> bool {
+    let requested = payload.first().copied().unwrap_or(AF_UNSPEC as u8);
+    requested == AF_UNSPEC as u8 || requested == family
+}
+
 pub(crate) fn route_entry(route: &RouteInfo) -> RouteEntry {
     let destination = route_network_address(route.destination);
     let is_loopback = match destination {
@@ -490,6 +497,23 @@ pub(crate) fn align4(value: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn route_dump_honors_both_rtgenmsg_and_rtmsg_family_filters() {
+        for len in [1, size_of::<RtMsg>()] {
+            let mut payload = alloc::vec![0; len];
+            payload[0] = AF_INET as u8;
+            assert!(route_dump_matches_family(&payload, AF_INET as u8));
+            assert!(!route_dump_matches_family(&payload, AF_INET6 as u8));
+            payload[0] = AF_INET6 as u8;
+            assert!(route_dump_matches_family(&payload, AF_INET6 as u8));
+            assert!(!route_dump_matches_family(&payload, AF_INET as u8));
+            payload[0] = AF_UNSPEC as u8;
+            assert!(route_dump_matches_family(&payload, AF_INET as u8));
+            assert!(route_dump_matches_family(&payload, AF_INET6 as u8));
+        }
+        assert!(route_dump_matches_family(&[], AF_INET as u8));
+    }
+
     #[test]
     fn route_dump_publishes_network_prefix_not_configured_host_bits() {
         let route = RouteInfo {
