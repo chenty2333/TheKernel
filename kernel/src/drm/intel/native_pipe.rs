@@ -41,6 +41,10 @@ pub(crate) fn prepare_pipe_enable(
     scanouts: &[PlaneScanout],
     config: WatermarkConfig,
 ) -> Result<NativePipeEnablePlan, NativePipeEnableError> {
+    // Refuse every user-visible mode/plane/layout error before any pipe
+    // register write. The checked builder below recomputes the same plan and
+    // writes it only after this preflight has accepted the complete set.
+    pipe::plan_multi_plane_dbuf(mode, scanouts, config).map_err(NativePipeEnableError::Pipe)?;
     pipe::program_multi_plane_pipe_config(regs, pipe_id, mode)
         .map_err(NativePipeEnableError::Pipe)?;
     let (ddb, arm) = pipe::prepare_multi_plane_scanout(regs, pipe_id, mode, scanouts, config)
