@@ -16,6 +16,8 @@ pub(crate) mod average;
 pub(crate) mod bitmap;
 pub(crate) mod bits;
 pub(crate) mod contexts;
+#[cfg(feature = "upstream-gt")]
+pub(crate) mod cpufreq;
 pub(crate) mod fields;
 pub(crate) mod gem;
 pub(crate) mod gem_memory;
