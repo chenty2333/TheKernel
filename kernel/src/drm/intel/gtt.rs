@@ -117,7 +117,7 @@
 //!
 //! ## Where an allocation may go
 //!
-//! An allocation is placed **downwards from just below the reserved top page**,
+//! An allocation is placed **downwards below the GuC GGTT limit**,
 //! and every entry of a candidate block is read before any of it is written.
 //! The second half of that is the load-bearing one: the firmware programmed this
 //! machine's current scanout into the same table, and overwriting those entries
@@ -133,12 +133,16 @@
 //! (`intel_plane_initial.c:207-209`, "MTL GOP likes to place the framebuffer
 //! high up in ggtt"), so neither direction is safe on its own.
 //!
-//! Two pages are reserved by name rather than by luck.  The **first page** of
-//! the aperture is never handed out (see [`RESERVED_LOW_APERTURE`]), and neither
-//! is the **last** one (see [`RESERVED_HIGH_APERTURE`]): `[I915]` leaves the top
-//! page of the GGTT bound to its scratch page because the hardware prefetches
-//! past the end of an object, and this kernel reserves it without writing it,
-//! because the firmware's own entries may still be in that page.
+//! The **first page** of the aperture is never handed out (see
+//! [`RESERVED_LOW_APERTURE`]). The high end is capped at `GUC_GGTT_TOP` from
+//! `[I915]` `gt/uc/intel_guc.h:401` (`0xfee00000`): GuC-addressed GGTT objects
+//! must remain below that point, leaving the top 18 MiB unused on a 4 GiB
+//! aperture. One additional page below the limit is reserved as the hardware
+//! prefetch guard (see [`RESERVED_HIGH_APERTURE`]). Both reservations apply to
+//! the single shared display/GT owner, even before GuC load, so its display
+//! allocations cannot consume space later required by GuC firmware/ADS/CT.
+//! Existing present PTEs in either high region are still read/captured but
+//! never rewritten.
 //!
 //! Every run is placed on a [`SCANOUT_ALIGNMENT`] boundary with
 //! [`SCANOUT_PADDING_ENTRIES`] entries of [`zero_page_physical`] bound after it,
@@ -227,8 +231,15 @@ pub(crate) const RESERVED_LOW_APERTURE: u64 = PAGE_SIZE;
 /// §5.4), so no surface can be named above 4 GiB however large the table is.
 pub(crate) const MAX_APERTURE: u64 = 1 << 32;
 
-/// The highest aperture address this module will hand out, exclusive of one
-/// page at the top.
+/// GuC's highest addressable GGTT address, exclusive.
+///
+/// Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc.h:401` defines
+/// `GUC_GGTT_TOP` as `0xFEE00000`; the 18 MiB above this value in a 4 GiB GGTT
+/// is reserved from all new display/GT allocations. Smaller apertures are
+/// already below this limit.
+pub(crate) const GUC_GGTT_TOP: u64 = 0xFEE0_0000;
+
+/// Number of bytes at the upper edge unavailable to the allocator.
 ///
 /// `[I915]` leaves the last page of the GGTT bound to its scratch page rather
 /// than allocatable: "However, leave one page at the end still bound to the
@@ -245,17 +256,24 @@ pub(crate) const MAX_APERTURE: u64 = 1 << 32;
 /// the reserve its own, by name, rather than relying on the direction of the
 /// search.
 ///
-/// The same region is where `[I915]` puts the GuC's firmware reserve -- the top
-/// `GUC_TOP_RESERVE_SIZE` bytes, `SZ_4G - GUC_GGTT_TOP` (`:768-799`) -- and
-/// where at least one GOP puts its framebuffer
-/// (`display/intel_plane_initial.c:207-209`), which is the second reason not to
-/// write anything here: the reserve is a bound in the allocator, not an entry
-/// this module writes.  Reserving rather than clearing is the difference
-/// between this kernel and `[I915]`: the vendor driver reaches this page before
-/// it has bound anything, while this kernel runs after firmware that may have
-/// left a live entry in it, and overwriting a present entry is the one thing
-/// that costs the only console this machine has.
+/// This includes the GuC top reserve above [`GUC_GGTT_TOP`] when the measured
+/// aperture exceeds that limit, plus one page immediately below the allocation
+/// ceiling for hardware prefetch. `GUC_GGTT_TOP` is exclusive, so the upper
+/// reserve is `aperture - GUC_GGTT_TOP`; the guard is always retained. At
+/// smaller apertures, only the guard applies. At least one GOP may place its
+/// framebuffer in the high GuC region (`display/intel_plane_initial.c:207-209`),
+/// so this is only an allocator bound: existing firmware entries are never
+/// cleared or rewritten.
 pub(crate) const RESERVED_HIGH_APERTURE: u64 = PAGE_SIZE;
+
+/// Shared exclusive ceiling for display and GT allocations. Keeping it below
+/// the GuC limit unconditionally avoids changing owners or moving live PTEs
+/// when rootfs-ready later makes GuC firmware available.
+fn allocatable_end(aperture: u64) -> u64 {
+    aperture
+        .min(GUC_GGTT_TOP)
+        .saturating_sub(RESERVED_HIGH_APERTURE)
+}
 
 /// The alignment a scanout run's graphics address is placed at, in bytes.
 ///
@@ -833,8 +851,8 @@ pub(crate) struct Gtt {
     size: ApertureSize,
     /// The entry bound into the padding after a run: a page of zeros.
     scratch: Pte,
-    /// The next address to hand out, counted downwards from just below the
-    /// reserved top page.
+    /// The next address to hand out, counted downwards from below the GuC
+    /// limit and the prefetch guard.
     next: Mutex<u64>,
 }
 
@@ -941,8 +959,13 @@ impl Gtt {
             aperture,
             size,
             scratch: Pte::encode(zero_page_physical())?,
-            next: Mutex::new(aperture.saturating_sub(RESERVED_HIGH_APERTURE)),
+            next: Mutex::new(allocatable_end(aperture)),
         })
+    }
+
+    /// Exclusive upper bound for new display and GT bindings.
+    fn allocation_end(&self) -> u64 {
+        allocatable_end(self.aperture)
     }
 
     /// Map a Gen12 device's page table array out of its BAR 0.
@@ -1003,7 +1026,8 @@ impl Gtt {
     pub(crate) fn capacity(&self) -> Result<(u64, u64), GttError> {
         let _allocation = self.next.lock();
         let mut available = 0u64;
-        for index in (RESERVED_LOW_APERTURE / PAGE_SIZE) as usize..self.entries.saturating_sub(1) {
+        let end = (self.allocation_end() / PAGE_SIZE) as usize;
+        for index in (RESERVED_LOW_APERTURE / PAGE_SIZE) as usize..end {
             if !Pte::from_raw(self.array.read(index)).is_present() {
                 available += PAGE_SIZE;
             }
@@ -1053,13 +1077,17 @@ impl Gtt {
     pub(crate) fn describe(&self) -> alloc::string::String {
         use alloc::format;
 
+        let allocation_end = self.allocation_end();
+        let reserved_high = self.aperture.saturating_sub(allocation_end);
         format!(
             "GGTT: aperture {aperture:#x} ({entries} entries of {PAGE_SIZE} bytes, the page table \
              the device reports); the mapped window is {array:#x} bytes of array ({window} \
              entries, covering {space:#x} bytes of graphics address space); the first \
-             {RESERVED_LOW_APERTURE:#x} and the top {RESERVED_HIGH_APERTURE:#x} of the aperture \
-             are reserved, and a run is placed on a {SCANOUT_ALIGNMENT:#x} boundary with \
-             {SCANOUT_PADDING_ENTRIES} entries of zero page after it.  {observation}",
+             {RESERVED_LOW_APERTURE:#x} is reserved and allocations stop below \
+             {allocation_end:#x} (GuC limit {GUC_GGTT_TOP:#x}, plus a {RESERVED_HIGH_APERTURE:#x} \
+             prefetch guard; {reserved_high:#x} bytes at the upper edge remain reserved), and a \
+             run is placed on a {SCANOUT_ALIGNMENT:#x} boundary with {SCANOUT_PADDING_ENTRIES} \
+             entries of zero page after it.  {observation}",
             aperture = self.aperture,
             entries = self.entries,
             array = self.window_entries as u64 * PTE_BYTES as u64,
@@ -1273,7 +1301,7 @@ impl Gtt {
             }
         }
         // Search still checks every present entry, including live bindings.
-        *next = self.aperture.saturating_sub(RESERVED_HIGH_APERTURE);
+        *next = self.allocation_end();
         Ok(())
     }
 
@@ -1287,11 +1315,10 @@ impl Gtt {
     /// the alignment is a property of where the run starts.
     fn reserve_run(&self, next: &mut u64, pages: u64) -> Result<u64, GttError> {
         let block = (pages + SCANOUT_PADDING_ENTRIES) * PAGE_SIZE;
-        // The top page of the aperture is not allocatable: see
-        // [`RESERVED_HIGH_APERTURE`].  The cursor already starts below it, and
-        // the `min` is what keeps that true if a caller ever hands in a cursor
-        // that does not.
-        let ceiling = self.aperture.saturating_sub(RESERVED_HIGH_APERTURE);
+        // Both the GuC limit and the prefetch guard apply to all clients of
+        // this shared GGTT, including the display owner. The `min` also keeps
+        // that true if a caller ever hands in a stale or invalid cursor.
+        let ceiling = self.allocation_end();
         let mut end = (*next).min(ceiling);
         loop {
             // A block ending at `end` would start at `end - block`, rounded

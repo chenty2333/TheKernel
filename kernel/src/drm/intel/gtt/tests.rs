@@ -217,6 +217,7 @@ fn the_observed_aperture_bounds_every_entry_and_every_allocation() {
     )
     .unwrap();
     assert_eq!(gtt.aperture(), 1 << 30);
+    assert_eq!(gtt.allocation_end(), (1 << 30) - RESERVED_HIGH_APERTURE);
     assert_eq!(gtt.entries(), ((1 << 30) / PAGE_SIZE) as usize);
     assert_eq!(gtt.window_entries(), GGTT_ARRAY_BYTES / PTE_BYTES);
     // The address is inside the mapped window and outside the aperture, so
@@ -240,6 +241,43 @@ fn the_observed_aperture_bounds_every_entry_and_every_allocation() {
     assert!(address + (1 + SCANOUT_PADDING_ENTRIES) * PAGE_SIZE <= 1 << 30);
     assert_eq!(table.raw(((1 << 30) / PAGE_SIZE) as usize), 0);
     assert_eq!(table.raw(GGTT_ARRAY_BYTES / PTE_BYTES - 1), 0);
+}
+
+#[test]
+fn four_gib_aperture_keeps_new_allocations_below_the_guc_window() {
+    // GuC cannot address GGTT space at or above GUC_GGTT_TOP.  Keep the
+    // display and GT allocator below that shared ceiling, not merely below
+    // the hardware's 4 GiB aperture.  Existing firmware PTEs in the excluded
+    // region remain addressable for capture and are never overwritten.
+    let entries = (1u64 << 32) as usize / PAGE_SIZE as usize;
+    let table = MockPageTable::new(entries);
+    let aperture_size = ApertureSize::decode(3 << 6);
+    let gtt = Gtt::over_reported(alloc::boxed::Box::new(table.clone()), aperture_size).unwrap();
+    let allocation_end = GUC_GGTT_TOP - RESERVED_HIGH_APERTURE;
+    assert_eq!(gtt.aperture(), 1 << 32);
+    assert_eq!(gtt.allocation_end(), allocation_end);
+    assert_eq!(
+        gtt.capacity().unwrap(),
+        (1 << 32, allocation_end - RESERVED_LOW_APERTURE)
+    );
+
+    let live_gop_address = GUC_GGTT_TOP + PAGE_SIZE;
+    let live_gop = Pte::encode(0x3000).unwrap().raw();
+    table.write((live_gop_address / PAGE_SIZE) as usize, live_gop);
+    assert_eq!(gtt.entry(live_gop_address).unwrap().raw(), live_gop);
+    let checkpoint = gtt.checkpoint().unwrap();
+
+    let binding = gtt.bind_pages(&[0x5000]).unwrap();
+    assert!(binding.address + binding.before.len() as u64 * PAGE_SIZE <= allocation_end);
+    assert!(binding.address < GUC_GGTT_TOP);
+    assert_eq!(gtt.entry(live_gop_address).unwrap().raw(), live_gop);
+    assert!(gtt.verify_checkpoint(&checkpoint).is_err());
+
+    // SAFETY: this mock GGTT has no hardware consumers.
+    unsafe { gtt.release_binding(&binding).unwrap() };
+    gtt.verify_checkpoint(&checkpoint).unwrap();
+    assert_eq!(*gtt.next.lock(), allocation_end);
+    assert!(*gtt.next.lock() < GUC_GGTT_TOP);
 }
 
 #[test]
