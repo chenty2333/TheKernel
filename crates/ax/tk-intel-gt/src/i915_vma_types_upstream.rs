@@ -124,7 +124,7 @@ pub struct I915Vma {
 const _: [(); 168] = [(); core::mem::size_of::<DrmMmNode>()];
 const _: [(); 8] = [(); core::mem::align_of::<DrmMmNode>()];
 const _: [(); 56] = [(); core::mem::size_of::<I915GttView>()];
-const _: [(); 8] = [(); core::mem::align_of::<I915GttView>()];
+const _: [(); 4] = [(); core::mem::align_of::<I915GttView>()];
 const _: [(); 8] = [(); core::mem::size_of::<I915PageSizes>()];
 const _: [(); 152] = [(); core::mem::size_of::<I915Active>()];
 const _: [(); 584] = [(); core::mem::size_of::<I915Vma>()];

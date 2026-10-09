@@ -192,13 +192,30 @@ pub struct DrmMmNode {
 const _: [(); 168] = [(); core::mem::size_of::<DrmMmNode>()];
 const _: [(); 160] = [(); core::mem::offset_of!(DrmMmNode, flags)];
 
-#[repr(C, align(8))]
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct IntelPartialInfo {
+    pub offset: u64,
+    pub size: u32,
+}
+
+#[repr(C)]
+pub union I915GttViewInfo {
+    pub partial: IntelPartialInfo,
+    _opaque: [u8; 52],
+}
+
+#[repr(C)]
 pub struct I915GttView {
     pub r#type: u32,
-    _opaque: [u8; 52],
+    pub info: I915GttViewInfo,
 }
 const _: [(); 56] = [(); core::mem::size_of::<I915GttView>()];
 const _: [(); 0] = [(); core::mem::offset_of!(I915GttView, r#type)];
+const _: [(); 12] = [(); core::mem::size_of::<IntelPartialInfo>()];
+const _: [(); 8] = [(); core::mem::offset_of!(IntelPartialInfo, size)];
+const _: [(); 4] = [(); core::mem::align_of::<I915GttView>()];
+const _: [(); 4] = [(); core::mem::offset_of!(I915GttView, info)];
 
 #[repr(C, align(8))]
 pub struct IrqWork {
