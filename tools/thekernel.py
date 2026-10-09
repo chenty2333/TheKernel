@@ -781,6 +781,11 @@ def build_cmd(args: argparse.Namespace) -> int:
 def lint_cmd(args: argparse.Namespace) -> int:
     lint_kernel(artifacts_for(args), workspace=args.workspace,
                 deny_warnings=args.deny_warnings)
+    # Keep the opt-in source translations buildable without enabling them in
+    # the product. Use host flags/cache, not the kernel's bare-metal linker.
+    run_checked(["cargo", "check", "--locked", "-p", "tk-intel-gt",
+                 "--features", "upstream-gt"],
+                env=_lint_env(artifacts_for(args), workspace=True))
     return 0
 
 

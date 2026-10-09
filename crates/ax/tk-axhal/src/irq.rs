@@ -51,6 +51,8 @@ static MSI_OWNED: [core::sync::atomic::AtomicBool; 256] =
     [const { core::sync::atomic::AtomicBool::new(false) }; 256];
 const CONTEXT_INSTALLING: usize = 1;
 static IRQ_CONTEXT: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
+// Counts the complete native hard-IRQ boundary, including contextual handlers.
+static IRQ_ACTIVE: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
 
 const IRQ_BOUNDARY_UNINITIALIZED: u8 = 0;
 const IRQ_BOUNDARY_INSTALLED: u8 = 1;
@@ -286,6 +288,7 @@ pub fn set_enable(irq: usize, enabled: bool) {
 /// [`register_ipi_reason`].
 #[must_use]
 pub fn register(irq: usize, handler: axplat::irq::IrqHandler) -> bool {
+    if !ensure_irq_boundary_hook() { return false; }
     #[cfg(feature = "ipi")]
     if irq == IPI_IRQ {
         return false;
@@ -593,9 +596,12 @@ fn irq_boundary(boundary: IrqBoundary) {
 }
 
 fn irq_context(boundary: IrqBoundary, vector: usize, frame: &TrapFrame) {
+    let active = &IRQ_ACTIVE[vector & 0xff];
     if boundary != IrqBoundary::Enter {
+        assert!(active.fetch_sub(1, Ordering::Release) != 0);
         return;
     }
+    active.fetch_add(1, Ordering::Acquire);
     let address = IRQ_CONTEXT[vector & 0xff].load(Ordering::Acquire);
     if address != 0 && address != CONTEXT_INSTALLING {
         // SAFETY: registration publishes an immutable function pointer.
@@ -932,6 +938,7 @@ pub fn allocate_msi(
     requester: tk_vtd::PciRequester,
     handler: axplat::irq::IrqHandler,
 ) -> Option<(u64, u32, usize)> {
+    if !ensure_irq_boundary_hook() { return None; }
     #[cfg(all(target_os = "none", feature = "defplat", not(feature = "myplat")))]
     {
         let (address, data, vector) = axplat_x86_pc::allocate_msi(handler)?;
@@ -960,4 +967,17 @@ pub fn allocate_msi(
         let _ = (requester, handler);
         None
     }
+}
+
+/// Wait until all hard handlers already executing for a masked device vector
+/// have left the native IRQ boundary. Future interrupts require separate source
+/// masking by the caller; this does not disable the device or wait task work.
+pub fn synchronize_hardirq(vector: usize) {
+    assert!(vector < IRQ_ACTIVE.len());
+    assert!(!in_irq_context(), "cannot synchronize a hard IRQ from its handler");
+    assert!(ensure_irq_boundary_hook(), "IRQ boundary ownership is unavailable");
+    while IRQ_ACTIVE[vector].load(Ordering::Acquire) != 0 {
+        core::hint::spin_loop();
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
 }

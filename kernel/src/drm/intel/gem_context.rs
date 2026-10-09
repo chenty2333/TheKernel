@@ -35,39 +35,55 @@ impl JobContext {
             images: BTreeMap::new(),
         }
     }
-    pub(super) fn render_engine(&self, selector: u16) -> AxResult<bool> {
-        let class = if let Some(engines) = &self.engines {
+    pub(super) fn engine_target(&self, selector: u16) -> AxResult<(u8, u8)> {
+        let packed = if let Some(engines) = &self.engines {
             *engines
                 .get(usize::from(selector))
                 .ok_or(AxError::InvalidInput)?
         } else {
             match selector {
-                0 | 1 => 0,
-                3 => 1,
+                0 | 1 => 0, // RCS0
+                2 => 2,     // VCS0
+                3 => 1,     // BCS0
+                4 => 3,     // VECS0
                 _ => return Err(AxError::InvalidInput),
             }
         };
-        match class {
-            0 => Ok(true),
-            1 => Ok(false),
-            _ => Err(AxError::InvalidInput),
+        // i915_gem_context_get_engine(): an explicit INVALID_NONE map slot
+        // is a null engine, so selecting it returns EINVAL (not ENOENT).
+        if packed == u16::MAX {
+            return Err(AxError::InvalidInput);
+        }
+        let class = (packed & 0xff) as u8;
+        let instance = (packed >> 8) as u8;
+        if matches!(
+            (class, instance),
+            (0, 0) | (1, 0) | (2, 0) | (2, 2) | (3, 0)
+        ) {
+            Ok((class, instance))
+        } else {
+            Err(AxError::NotFound)
         }
     }
-    pub(super) fn image(
+    pub(super) fn render_engine(&self, selector: u16) -> AxResult<bool> {
+        Ok(self.engine_target(selector)?.0 == 0)
+    }
+    pub(super) fn image_engine(
         &mut self,
         file: &DrmFile,
         selector: u16,
-        render: bool,
+        class: u8,
+        instance: u8,
     ) -> AxResult<Arc<super::gt::copy::SavedContext>> {
         let slot = if self.engines.is_none() {
-            if render { 0 } else { 3 }
+            u16::from(class)
         } else {
             selector
         };
         if let Some(image) = self.images.get(&slot) {
             return Ok(image.clone());
         }
-        let image = super::gt::copy::SavedContext::new(file, render)?;
+        let image = super::gt::copy::SavedContext::new_engine(file, class, instance)?;
         self.images.insert(slot, image.clone());
         Ok(image)
     }
@@ -321,13 +337,14 @@ fn engine_map(
             engines.push(u16::MAX);
             continue;
         }
-        if record.instance != 0
-            || !matches!(record.class, 0 | 1)
-            || (record.class == 0 && !render_available)
+        if !matches!(
+            (record.class, record.instance),
+            (0, 0) | (1, 0) | (2, 0) | (2, 2) | (3, 0)
+        ) || (record.class == 0 && !render_available)
         {
             return Err(AxError::NotFound);
         }
-        engines.push(record.class);
+        engines.push((record.instance << 8) | record.class);
     }
     let extensions: u64 = read_pod(copy, address)?;
     if extensions != 0 {
@@ -661,6 +678,10 @@ mod tests {
         assert!(job.render_engine(0).unwrap());
         assert!(job.render_engine(1).unwrap());
         assert!(!job.render_engine(2).unwrap());
+        job.engines = Some(alloc::vec![0, (2 << 8) | 2, 3]);
+        assert_eq!(job.engine_target(0), Ok((0, 0)));
+        assert_eq!(job.engine_target(1), Ok((2, 2)));
+        assert_eq!(job.engine_target(2), Ok((3, 0)));
     }
     #[test]
     fn created_context_is_file_local_and_retained_across_destroy_for_admitted_jobs() {
@@ -1145,8 +1166,18 @@ mod tests {
             &copy,
             264,
             &Engine {
-                class: 0,
-                instance: 0,
+                class: 2,
+                instance: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(engine_map(&copy, &param, false).unwrap(), [0x0202]);
+        write_pod(
+            &copy,
+            264,
+            &Engine {
+                class: 2,
+                instance: 1,
             },
         )
         .unwrap();

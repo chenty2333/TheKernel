@@ -336,7 +336,7 @@ pub(super) fn install_n305(
 
     let (message_address, message_data, vector) = axhal::irq::allocate_msi(
         tk_vtd::PciRequester {
-            segment: 0,
+            segment: axhal::pci::ecam_segment(),
             bus: bdf.bus,
             device: bdf.device,
             function: bdf.function,

@@ -14,3 +14,52 @@ layer = "mechanism"
 
 [lints]
 workspace = true
+
+[features]
+default = []
+# Keep the source-order Linux 7.2.3 translations opt-in until their LinuxKPI
+# bindings are complete. This is deliberately not enabled by the product.
+upstream-gt = ["dep:axlog", "dep:kernel_guard", "dep:axhal", "dep:axtask", "dep:axmm", "dep:memory_addr", "dep:spin", "dep:axalloc", "dep:tk-vtd"]
+
+[dependencies]
+axlog = { workspace = true, optional = true }
+
+[dependencies.kernel_guard]
+version = "0.1"
+optional = true
+features = ["preempt"]
+
+[dependencies.axhal]
+package = "tk-axhal"
+path = "../tk-axhal"
+version = "0.1.0"
+optional = true
+features = ["irq"]
+
+[dependencies.axtask]
+package = "tk-axtask"
+path = "../tk-axtask"
+version = "0.1.0"
+optional = true
+features = ["multitask", "preempt"]
+
+[dependencies.axmm]
+workspace = true
+optional = true
+
+[dependencies.memory_addr]
+version = "0.4"
+optional = true
+
+[dependencies.spin]
+version = "0.9"
+optional = true
+
+[dependencies.axalloc]
+package = "tk-axalloc"
+path = "../tk-axalloc"
+optional = true
+
+[dependencies.tk-vtd]
+path = "../tk-vtd"
+optional = true

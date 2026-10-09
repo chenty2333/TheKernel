@@ -11,6 +11,22 @@ use crate::{Error, GtIo, masked_disable, masked_enable, wait};
 pub const BCS: u32 = 0x22000;
 
 const GDRST: u32 = 0x941c;
+pub const GUC_RESET_DOMAIN: u32 = 1 << 3;
+
+/// Reset only the GuC domain before a firmware upload.
+/// upstream: intel_reset.c intel_reset_guc()/__reset_guc().
+pub fn reset_guc(io: &impl GtIo, graphics_ip: (u8, u8)) -> Result<(), Error> {
+    let loops = if graphics_ip < (12, 70) { 2 } else { 1 };
+    let result = (|| {
+        for _ in 0..loops {
+            io.write(GDRST, GUC_RESET_DOMAIN)?;
+            wait(io, GDRST, GUC_RESET_DOMAIN, 0, 2000)?;
+        }
+        Ok(())
+    })();
+    io.delay_us(50);
+    result
+}
 /// Forcewake must be held by the sole owner. No further submission enters until
 /// reset finishes. No global GT/display reset or firmware-PTE mutation occurs.
 pub fn stop_and_reset_bcs(io: &impl GtIo) -> Result<(), Error> {
@@ -76,4 +92,55 @@ fn stop_and_reset(io: &impl GtIo, base: u32, domain: u32, idle: u32) -> Result<(
         return Err(Error::Quarantined);
     }
     prepared
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+    use core::cell::{Cell, RefCell};
+
+    use super::*;
+
+    struct Io {
+        writes: RefCell<Vec<(u32, u32)>>,
+        delayed: Cell<u32>,
+    }
+
+    impl GtIo for Io {
+        fn read(&self, _offset: u32) -> Result<u32, Error> {
+            Ok(0)
+        }
+        fn write(&self, offset: u32, value: u32) -> Result<(), Error> {
+            self.writes.borrow_mut().push((offset, value));
+            Ok(())
+        }
+        fn now_us(&self) -> u64 {
+            0
+        }
+        fn delay_us(&self, micros: u32) {
+            self.delayed.set(self.delayed.get() + micros);
+        }
+    }
+
+    #[test]
+    fn guc_domain_reset_uses_gen12_double_reset_and_settlement_delay() {
+        let io = Io {
+            writes: RefCell::new(Vec::new()),
+            delayed: Cell::new(0),
+        };
+        reset_guc(&io, (12, 0)).unwrap();
+        assert_eq!(
+            io.writes.borrow().as_slice(),
+            &[(GDRST, GUC_RESET_DOMAIN); 2]
+        );
+        assert_eq!(io.delayed.get(), 50);
+
+        let io = Io {
+            writes: RefCell::new(Vec::new()),
+            delayed: Cell::new(0),
+        };
+        reset_guc(&io, (12, 70)).unwrap();
+        assert_eq!(io.writes.borrow().as_slice(), &[(GDRST, GUC_RESET_DOMAIN)]);
+        assert_eq!(io.delayed.get(), 50);
+    }
 }

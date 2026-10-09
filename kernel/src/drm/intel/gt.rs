@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See the repository MIT license.
-//! Independently opted-in N305 BCS/RCS execution adapter. Never reached from the
-//! display modeset flag; display D0 is not used as the GT/media A0 stepping.
+//! Independently opted-in Gen12 BCS and N305 RCS execution adapter. Never
+//! reached from the display modeset flag; display D0 is not the GT/media step.
 #[cfg(target_os = "none")]
 use alloc::{format, string::String};
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering, compiler_fence};
 
 use axsync::Mutex;
-use intel_gt::{Error, GtIo};
+#[cfg(target_os = "none")]
+use intel_gt::uc::{self, FirmwareImage, Kind};
+use intel_gt::{Error, GtIo, uc::Platform};
 
 #[cfg(target_os = "none")]
 use super::pci;
@@ -99,9 +101,40 @@ impl Bus {
         if (0x224d0..0x22500).contains(&r) {
             return self.awake.load(Ordering::Acquire);
         }
+        if ((0x2370..0x23a0).contains(&r) || (0x23c0..0x23f0).contains(&r)) && !write {
+            return self.rcs_owned.load(Ordering::Acquire)
+                && self.render_awake.load(Ordering::Acquire);
+        }
+        if ((0x22370..0x223a0).contains(&r) || (0x223c0..0x223f0).contains(&r)) && !write {
+            return self.awake.load(Ordering::Acquire);
+        }
         if (0x24d0..0x2500).contains(&r) {
             return self.rcs_owned.load(Ordering::Acquire)
                 && self.render_awake.load(Ordering::Acquire);
+        }
+        if [0xc064, 0x13816c].contains(&r) {
+            return write && self.awake.load(Ordering::Acquire);
+        }
+        if [0xc050, 0xc340].contains(&r) {
+            return self.awake.load(Ordering::Acquire);
+        }
+        if (0x190240..=0x19024c).contains(&r) {
+            return self.awake.load(Ordering::Acquire);
+        }
+        if r == 0x1901f0 {
+            return write && self.awake.load(Ordering::Acquire);
+        }
+        if (0xc180..=0xc1b8).contains(&r) {
+            return self.awake.load(Ordering::Acquire);
+        }
+        if r == 0xd3b0 {
+            return !write && self.awake.load(Ordering::Acquire);
+        }
+        if (0xc200..=0xc2fc).contains(&r) {
+            return write && self.awake.load(Ordering::Acquire);
+        }
+        if (0xc300..=0xc314).contains(&r) {
+            return self.awake.load(Ordering::Acquire) && (write || r == 0xc314);
         }
         if self.rcs_owned.load(Ordering::Acquire) && self.render_awake.load(Ordering::Acquire) {
             if matches!(r, 0x2030 | 0x2034 | 0x8000) {
@@ -141,13 +174,15 @@ impl Bus {
         }
         self.awake.load(Ordering::Acquire)
             && match r {
-                0xc000 | 0x800c | 0xa2a0 | 0x22030 | 0x22034 => !write,
+                0xc000 | 0xc1dc | 0x800c | 0xa2a0 | 0x22030 | 0x22034 => !write,
                 0x941c | 0x2209c | 0x2229c | 0x220d0 => true,
                 0xfdc | 0x9424 | 0x480c | 0x400c | 0x22080 | 0x22098 | 0x220a8 | 0x220b0
                 | 0x220b4 | 0x220c4 | 0x223a0 | 0x22510 | 0x22514 | 0x22518 | 0x2251c | 0x22550 => {
                     true
                 }
-                0x220b8 | 0x9134 | 0x9138 | 0x913c | 0x9140 | 0xa26c | 0x44074 | 0xd00 => !write,
+                0x220b8 | 0x9134 | 0x9138 | 0x913c | 0x9140 | 0xa26c | 0x44074 | 0xd00 | 0xd08 => {
+                    !write
+                }
                 _ => false,
             }
     }
@@ -171,13 +206,14 @@ impl GtIo for Bus {
         if !self.allowed(r, true)
             || (r == 0x941c
                 && value != 1 << 2
+                && value != intel_gt::reset::GUC_RESET_DOMAIN
                 && !(value == 1 << 1 && self.rcs_owned.load(Ordering::Acquire)))
         {
             return Err(Error::Refused);
         }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same bounded owned GT allowlist. No display/global reset is
-        // allowed; GDRST is restricted to BCS (bit2) or owned RCS (bit1).
+        // allowed; GDRST is restricted to the GuC domain, BCS or owned RCS.
         unsafe { ((self.window.base() + r as usize) as *mut u32).write_volatile(value) };
         compiler_fence(Ordering::SeqCst);
         Ok(())
@@ -194,11 +230,27 @@ impl GtIo for Bus {
 }
 struct Owner {
     bdf: super::pci::Bdf,
+    platform: Platform,
     bus: Bus,
     lost: bool,
     render_ready: bool,
     // Published before an ELSQ load; retained through any ambiguous reset/DMA.
     memory: Option<copy::Memory>,
+    // Firmware source mapping retained if DMA completion cannot be proven.
+    #[cfg(target_os = "none")]
+    uc_memory: Option<copy::UcDmaMemory>,
+    // ADS GGTT VMA retained once its address has been published to GuC.
+    #[cfg(target_os = "none")]
+    ads_memory: Option<copy::AdsDmaMemory>,
+    // GuC log state/data VMA retained while GuC can write or read it.
+    #[cfg(target_os = "none")]
+    log_memory: Option<copy::LogDmaMemory>,
+    // Preallocated GuC error-capture output/cache nodes, reused after coredumps.
+    #[cfg(target_os = "none")]
+    capture_nodes: Option<intel_gt::guc_capture::CaptureNodeCache>,
+    // GuC CTB buffers/descriptor VMA retained while GuC may reference it.
+    #[cfg(target_os = "none")]
+    ct_memory: Option<copy::CtDmaMemory>,
 }
 pub(super) mod copy;
 static READY: AtomicBool = AtomicBool::new(false);
@@ -207,19 +259,152 @@ pub(super) fn registered() -> bool {
 }
 static OWNER: Mutex<Option<Owner>> = Mutex::new(None);
 
+#[cfg(target_os = "none")]
+struct UcFirmware {
+    guc: Option<FirmwareImage>,
+    huc: Option<FirmwareImage>,
+}
+
+#[cfg(target_os = "none")]
+static UC_FIRMWARE: Mutex<UcFirmware> = Mutex::new(UcFirmware {
+    guc: None,
+    huc: None,
+});
+
+/// Runs after the rootfs reader is installed; no probe-time filesystem access.
+#[cfg(target_os = "none")]
+// upstream: intel_uc.c __uc_init_hw()
+fn load_uc_firmware() {
+    const MAX_UC_BYTES: usize = 2 * 1024 * 1024;
+    const WOPCM_BYTES: usize = 2 * 1024 * 1024;
+    let platform = OWNER
+        .lock()
+        .as_ref()
+        .filter(|owner| !owner.lost)
+        .map(|owner| owner.platform);
+    let Some(platform) = platform else {
+        axlog::warn!("intel-gt: no live GT owner for firmware load");
+        return;
+    };
+    let enable_guc = uc::default_enable_mask(platform);
+    axlog::info!("intel-gt: platform {platform:?} upstream uC default enable_guc={enable_guc:#x}");
+    if enable_guc & uc::ENABLE_GUC_LOAD_HUC == 0 {
+        return;
+    }
+    let mut request = |path: &str, max_len: usize| {
+        axdriver::prelude::firmware::request(&alloc::format!("/lib/firmware/{path}"), max_len)
+    };
+    let guc = uc::load(platform, Kind::GuC, MAX_UC_BYTES, WOPCM_BYTES, &mut request);
+    let huc = uc::load(platform, Kind::HuC, MAX_UC_BYTES, WOPCM_BYTES, &mut request);
+    let mut state = UC_FIRMWARE.lock();
+    match guc {
+        Ok(image) => {
+            if image.old_version {
+                let wanted = uc::candidates(platform, Kind::GuC)[0];
+                axlog::warn!(
+                    "intel-gt: GuC {} ({:?}) recommended but only {} ({:?}) was found",
+                    wanted.path,
+                    wanted.version,
+                    image.blob.path,
+                    image.css.version
+                );
+            }
+            let css = uc::guc_css_info(image.css.version, image.css);
+            axlog::info!(
+                "intel-gt: GuC firmware {} selected, CSS {:?}, submission {:?}, private data {} \
+                 bytes, image {} bytes",
+                image.blob.path,
+                image.css.version,
+                css.submission_version,
+                css.private_data_bytes,
+                image.bytes.len()
+            );
+            state.guc = Some(image);
+        }
+        Err(error) => axlog::warn!("intel-gt: GuC firmware unavailable: {error:?}"),
+    }
+    match huc {
+        Ok(image) => {
+            if image.old_version {
+                let wanted = uc::candidates(platform, Kind::HuC)[0];
+                axlog::warn!(
+                    "intel-gt: HuC {} ({:?}) recommended but only {} ({:?}) was found",
+                    wanted.path,
+                    wanted.version,
+                    image.blob.path,
+                    image.css.version
+                );
+            }
+            axlog::info!(
+                "intel-gt: HuC firmware {} selected, {:?} CSS, {} bytes",
+                image.blob.path,
+                image.css.version,
+                image.bytes.len()
+            );
+            state.huc = Some(image);
+        }
+        Err(error) => axlog::warn!("intel-gt: HuC firmware unavailable: {error:?}"),
+    }
+    if let (Some(guc), Some(huc)) = (state.guc.as_ref(), state.huc.as_ref()) {
+        let mut owner = OWNER.lock();
+        let Some(owner) = owner.as_mut().filter(|owner| !owner.lost) else {
+            axlog::warn!("intel-gt: firmware validated but GT owner is unavailable");
+            return;
+        };
+        let guc_status = match owner.bus.read(0xc000) {
+            Ok(status) => status,
+            Err(error) => {
+                axlog::warn!("intel-gt: GuC status unavailable before upload: {error:?}");
+                return;
+            }
+        };
+        if guc_status & 1 == 0 {
+            // Upstream first calls intel_reset_guc() and then warns if MIA
+            // remains active. We deliberately keep the stricter refusal here
+            // until GT-wide reset ownership exists; proceeding could race a
+            // firmware/submission controller while DMA mutates WOPCM.
+            axlog::warn!(
+                "intel-gt: GuC is not confirmed in reset; no uC DMA without owned GuC reset"
+            );
+            return;
+        }
+        match copy::upload_uc_firmware(owner, guc, huc) {
+            Ok(()) => {
+                axlog::info!("intel-gt: HuC/GuC firmware upload and authentication completed")
+            }
+            Err(error) => {
+                if error == Error::Quarantined {
+                    owner.lost = true;
+                }
+                axlog::warn!("intel-gt: uC DMA upload failed: {error:?}");
+            }
+        }
+    }
+}
+
 /// Task-context coordination only, not proof of firmware interrupt masks.
 /// The display IRQ owner separately reads every Gen11/12 GT class ENABLE and
 /// the shared master before it changes PCI/MSI or display interrupt state.
 /// Our audited GT register allowlist never writes those class enables or the
 /// GFX master; native jobs remain completion-polled even with display MSI.
 /// Refuse concurrent preparation/submission and retained uncertain DMA owners.
+#[cfg(target_os = "none")]
 pub(super) fn display_irq_owner_idle() -> bool {
     let Some(owner) = OWNER.try_lock() else {
         return false;
     };
-    owner
-        .as_ref()
-        .is_none_or(|owner| !owner.lost && owner.memory.is_none())
+    owner.as_ref().is_none_or(|owner| {
+        !owner.lost
+            && owner.memory.is_none()
+            && owner.uc_memory.is_none()
+            && owner.ct_memory.is_none()
+    })
+}
+
+#[cfg(not(target_os = "none"))]
+pub(super) fn display_irq_owner_idle() -> bool {
+    // This hardware GT owner only exists in the freestanding product kernel.
+    true
 }
 
 /// Capability probes use only a successfully bootstrapped, still-live owner.
@@ -276,14 +461,18 @@ pub(super) fn init_at_boot() {
     let windows = super::mapped_windows();
     let result = if windows.len() != 1 {
         Err(String::from(
-            "intel.gt=1 refused: require one mapped N305 GPU",
+            "intel.gt=1 refused: require one mapped supported Gen12 GPU",
         ))
     } else {
         let (bdf, window) = windows[0];
         initialize(bdf, window)
     };
+    let initialized = result.is_ok();
     let text = result.unwrap_or_else(|s| s);
     axlog::info!("{text}");
+    if initialized && !axdriver::prelude::firmware::on_rootfs_ready(load_uc_firmware) {
+        axlog::warn!("intel-gt: rootfs firmware callback table is full; GuC/HuC left unloaded");
+    }
     if let Some((bdf, _)) = windows.first() {
         super::GT_REPORT.lock().push((*bdf, text));
     }
@@ -300,10 +489,16 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
         pci::Ecam::platform().ok_or_else(|| String::from("GT PCI facts unavailable; no writes"))?;
     let info = pci::DeviceInfo::read(&ecam, bdf)
         .ok_or_else(|| String::from("GT PCI device unavailable; no writes"))?;
-    // Local i915 intel_step.c::adlp_n_revids[0] COMMON_STEP(A0), not display D0.
-    if (info.vendor_id, info.device_id, info.revision) != (0x8086, 0x46d0, 0) {
+    let platform = uc::platform_from_device_id(info.device_id)
+        .ok_or_else(|| String::from("unsupported Gen12 GT PCI ID; no writes"))?;
+    if info.vendor_id != 0x8086 {
+        return Err(String::from("GT requires Intel vendor ID; no writes"));
+    }
+    if platform == Platform::AlderLakeN && (info.device_id != 0x46d0 || info.revision != 0) {
+        // The N305 BCS/PPGTT path is qualified against local i915
+        // intel_step.c::adlp_n_revids[0] COMMON_STEP(A0), not display D0.
         return Err(String::from(
-            "GT requires exact N305 Gen12/media A0; no writes",
+            "N305 GT requires exact Gen12/media A0; no writes",
         ));
     }
     let bus = Bus {
@@ -317,10 +512,16 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
     if let Err(error) = intel_gt::uncore::acquire_gt(&bus) {
         *owner = Some(Owner {
             bdf,
+            platform,
             bus,
             lost: true,
             render_ready: false,
             memory: None,
+            uc_memory: None,
+            ads_memory: None,
+            log_memory: None,
+            capture_nodes: None,
+            ct_memory: None,
         });
         return Err(format!(
             "GT forcewake failed: {error:?}; terminal owner, no submission"
@@ -339,13 +540,21 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
         Ok(()) => {
             let mut device = Owner {
                 bdf,
+                platform,
                 bus,
                 lost: false,
                 render_ready: false,
                 memory: None,
+                uc_memory: None,
+                ads_memory: None,
+                log_memory: None,
+                capture_nodes: None,
+                ct_memory: None,
             };
             let copied = copy::run(&mut device, bdf).and_then(|()| {
-                if axhal::boot::command_line_value("intel.rcs") == Some("1") {
+                if axhal::boot::command_line_value("intel.rcs") == Some("1")
+                    && platform == Platform::AlderLakeN
+                {
                     copy::render_test(&mut device)?;
                     device.render_ready = true;
                     axlog::info!(
@@ -364,10 +573,10 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
             *owner = Some(device);
             copied
                 .map(|_| {
-                    String::from(
+                    String::from(format!(
                         "intel-gt: BCS_COPY_BYTES_AND_GUARDS_VERIFIED after hardware breadcrumb \
-                         and reset retirement; GT/media A0; not RCS/Mesa rendering",
-                    )
+                         and reset retirement; {platform:?}; not Mesa rendering"
+                    ))
                 })
                 .map_err(|e| {
                     format!(
@@ -383,10 +592,16 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
             }
             *owner = Some(Owner {
                 bdf,
+                platform,
                 bus,
                 lost: true,
                 render_ready: false,
                 memory: None,
+                uc_memory: None,
+                ads_memory: None,
+                log_memory: None,
+                capture_nodes: None,
+                ct_memory: None,
             });
             Err(format!(
                 "intel-gt: initialization failed {error:?}; wake-release-verified={released}; no \
@@ -467,7 +682,9 @@ pub(super) fn submit_user(
         let mut state = OWNER.lock();
         let owner = state.as_mut().ok_or(Error::Refused)?;
         let result = copy::user_objects(owner, job, vm, saved);
-        if result.is_err() {
+        // A preflight refusal (for example a fuse-disabled GuC engine) has
+        // not created transient GGTT state and must not quarantine the GT.
+        if result.is_err() && (owner.memory.is_some() || result != Err(Error::Refused)) {
             owner.lost = true;
         }
         result
@@ -536,6 +753,32 @@ mod tests {
         words[0x1c0030 / 4] = 8;
         assert_eq!(bus.assert_media_idle(), Err(Error::Refused));
     }
+
+    #[test]
+    fn wopcm_registers_are_only_accessible_while_the_gt_is_awake() {
+        let mut words = vec![0u32; 0x200000 / 4];
+        // SAFETY: aligned private stable model memory, not a hardware BAR.
+        let window =
+            unsafe { RegisterWindow::from_mapped(words.as_mut_ptr() as usize, words.len() * 4) };
+        let bus = Bus {
+            window,
+            awake: AtomicBool::new(false),
+            render_awake: AtomicBool::new(false),
+            rcs_owned: AtomicBool::new(false),
+            media_present: AtomicU8::new(0),
+            media_awake: AtomicU8::new(0),
+        };
+        assert_eq!(bus.read(0xc050), Err(Error::Unavailable(0xc050)));
+        assert_eq!(bus.write(0xc340, 0), Err(Error::Refused));
+        bus.awake.store(true, Ordering::Release);
+        bus.write(0xc050, 0x200000).unwrap();
+        bus.write(0xc340, 0x10002).unwrap();
+        assert_eq!(bus.read(0xc050), Ok(0x200000));
+        assert_eq!(bus.read(0xc340), Ok(0x10002));
+        bus.write(0x941c, intel_gt::reset::GUC_RESET_DOMAIN)
+            .unwrap();
+        assert_eq!(words[0x941c / 4], intel_gt::reset::GUC_RESET_DOMAIN);
+    }
     #[test]
     fn native_gt_window_requires_owned_wake_and_rejects_display_or_global_reset() {
         let mut words = vec![0u32; 0x130048 / 4];
@@ -556,7 +799,12 @@ mod tests {
         assert_eq!(bus.read(intel_gt::uncore::GT_ACK), Ok(0));
         bus.awake.store(true, Ordering::Release);
         assert_eq!(bus.write(0x941c, 1), Err(Error::Refused));
-        assert_eq!(bus.write(0x941c, 8), Err(Error::Refused));
+        // GDRST GuC-domain reset is now owned by the firmware upload path.
+        bus.write(0x941c, intel_gt::reset::GUC_RESET_DOMAIN).unwrap();
+        assert_eq!(
+            bus.write(0x941c, intel_gt::reset::GUC_RESET_DOMAIN | 4),
+            Err(Error::Refused)
+        );
         assert_eq!(bus.write(0x46038, u32::MAX), Err(Error::Refused));
         assert_eq!(bus.write(0x941c, 2), Err(Error::Refused));
         assert_eq!(bus.write(0x2550, 1), Err(Error::Refused));

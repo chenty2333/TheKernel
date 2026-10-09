@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+marker=THEKERNEL_N305_IHD_NO_DEVICE_OK
+driver=/usr/lib/dri/iHD_drv_video.so
+loader=/usr/local/bin/intel-va-driver-load
+log=/run/vainfo-intel.log
+
+[ -x /usr/bin/vainfo ] || { echo "$marker state=FAIL reason=vainfo" >&2; exit 1; }
+[ -r "$driver" ] || { echo "$marker state=FAIL reason=ihd_driver" >&2; exit 1; }
+[ -x "$loader" ] || { echo "$marker state=FAIL reason=ihd_loader" >&2; exit 1; }
+"$loader" || { echo "$marker state=FAIL reason=ihd_dlopen" >&2; exit 1; }
+
+# The guest has no Intel GPU/DRM node. Ask libva to use iHD explicitly; the
+# expected open/initialization error is valid, but the iHD module must resolve.
+status=0
+LIBVA_DRIVER_NAME=iHD LIBVA_DRIVERS_PATH=/usr/lib/dri \
+    vainfo --display drm --device /dev/dri/renderD128 >"$log" 2>&1 || status=$?
+if [ "$status" -ne 0 ] &&
+   ! grep -Eqi 'failed to open|permission denied|no such file|vaInitialize failed|failed to get display' "$log"; then
+    cat "$log" >&2
+    echo "$marker state=FAIL reason=unexpected_vainfo_error status=$status" >&2
+    exit 1
+fi
+echo "$marker state=PASS layer=libva_iHD status=$status no_device_expected"

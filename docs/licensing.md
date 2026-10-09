@@ -796,6 +796,22 @@ Linux 7.2.3 `drm_mode_config.c` (MIT-style grant, © 2016 Intel); its full
 license remains in the source and the same
 `kernel/LICENSES/LicenseRef-Intel-Drm-Connector-MIT` file.
 
+The `n305-iris-smoke` Buildroot flavor now enables Mesa's Intel Vulkan driver
+(anv), Intel media-driver (iHD), libva-utils/vainfo and the linux-firmware i915
+selection. The firmware binaries remain externally sourced by the pinned
+Buildroot linux-firmware package; they are not committed here. Their upstream
+`LICENSE.i915` grants binary redistribution subject to retaining Intel's
+copyright/disclaimer, no endorsement, and no reverse engineering or
+
+decompilation. Intel media-driver/Mesa/libva package licenses and source notice
+files remain Buildroot-managed; the guest smoke checks only loader resolution
+and the expected no-GPU result, not hardware decode/render.
+
+The common graphics rootfs overlay carries the upstream Intel `LICENSE.i915`
+text under `/usr/share/licenses/i915/`; `scripts/build-graphics-rootfs.sh`
+checks that the ADL-P/N `adlp_guc_70.bin` candidate is present alongside the
+existing TGL GuC/HuC firmware. Firmware binaries remain Buildroot-sourced and
+are not checked into this repository.
 The optional AX211 rootfs payload stages only the linux-firmware
 `iwlwifi-so-a0-gf-a0-89.ucode` API 89 image and matching
 `iwlwifi-so-a0-gf-a0.pnvm`; it copies the upstream `LICENCE.iwlwifi_firmware`

@@ -5,8 +5,8 @@
 // Full MIT grant and inventory: crates/ax/tk-intel-gt/LICENSE-MIT and NOTICE.
 //! BCS/RCS selftests and standard nonprivileged soft-pinned jobs. Software
 //! preparation uses existing SharedPages/GGTT; DMA ownership precedes ELSQ load.
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering, fence};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 
 use intel_gt::{Error, GtIo, bcs, lrc, ppgtt};
 
@@ -90,6 +90,15 @@ impl Ram {
             data.extend_from_slice(&word.to_le_bytes());
         }
         self.write(page * PAGE, &data)
+    }
+    fn dwords_at(&self, offset: usize, words: &[u32]) -> Result<(), Error> {
+        let bytes = words.len().checked_mul(4).ok_or(Error::Refused)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(bytes).map_err(|_| Error::Refused)?;
+        for word in words {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        self.write(offset, &data)
     }
     fn table(&self, page: usize, words: &[u64; 512]) -> Result<(), Error> {
         let mut data = Vec::new();
@@ -227,10 +236,20 @@ pub(crate) struct UserJob {
     pub(crate) objects: Vec<UserObject>,
     pub(crate) batch: u64,
     pub(crate) render: bool,
+    pub(crate) engine_class: u8,
+    pub(crate) engine_instance: u8,
 }
 impl UserJob {
     pub(crate) fn validate(&self) -> Result<(), Error> {
-        if self.objects.is_empty() || self.objects.len() > 1024 || !self.batch.is_multiple_of(8) {
+        if self.objects.is_empty()
+            || self.objects.len() > 1024
+            || !self.batch.is_multiple_of(8)
+            || self.render != (self.engine_class == 0)
+            || !matches!(
+                (self.engine_class, self.engine_instance),
+                (0, 0) | (1, 0) | (2, 0) | (2, 2) | (3, 0)
+            )
+        {
             return Err(Error::Refused);
         }
         for (i, object) in self.objects.iter().enumerate() {
@@ -266,13 +285,48 @@ pub(super) fn isolation_classes() -> u32 {
 fn captured_classes(copy: bool, render: bool) -> u32 {
     (u32::from(copy) << 1) | u32::from(render)
 }
+
+#[cfg(target_os = "none")]
+fn default_lrc_image(engine_class: u8) -> Result<Option<Vec<u8>>, Error> {
+    let (slot, bytes) = match engine_class {
+        0 => (1, 14 * PAGE), // RCS engine state excludes the two WA pages.
+        3 => (0, 2 * PAGE),  // BCS engine state excludes the two WA pages.
+        _ => return Ok(None),
+    };
+    let defaults = DEFAULTS.lock();
+    let Some(default) = defaults[slot].as_ref() else {
+        return Ok(None);
+    };
+    let mut image = Vec::new();
+    image.try_reserve_exact(bytes).map_err(|_| Error::Refused)?;
+    image.resize(bytes, 0);
+    default.read(0, &mut image)?;
+    Ok(Some(image))
+}
+
 pub(crate) struct SavedContext {
     ram: Arc<Ram>,
     valid: AtomicBool,
     render: bool,
+    engine_class: u8,
+    engine_instance: u8,
 }
 impl SavedContext {
     pub(crate) fn new(file: &crate::drm::DrmFile, render: bool) -> axerrno::AxResult<Arc<Self>> {
+        Self::new_engine(file, u8::from(!render), 0)
+    }
+    pub(crate) fn new_engine(
+        file: &crate::drm::DrmFile,
+        engine_class: u8,
+        engine_instance: u8,
+    ) -> axerrno::AxResult<Arc<Self>> {
+        if !matches!(
+            (engine_class, engine_instance),
+            (0, 0) | (1, 0) | (2, 0) | (2, 2) | (3, 0)
+        ) {
+            return Err(axerrno::AxError::InvalidInput);
+        }
+        let render = engine_class == 0;
         let count = if render {
             intel_gt::rcs::CONTEXT_PAGES
         } else {
@@ -284,7 +338,12 @@ impl SavedContext {
         let ram = Arc::try_new(Ram::allocate(count).map_err(|_| axerrno::AxError::NoMemory)?)
             .map_err(|_| axerrno::AxError::NoMemory)?;
         ram.pages.retain_allocation_owner(charge)?;
-        let default = DEFAULTS.lock()[usize::from(render)].clone();
+        let default = match engine_class {
+            0 => DEFAULTS.lock()[1].clone(),
+            1 => DEFAULTS.lock()[0].clone(),
+            // These media engines do not yet have a retained boot default LRC.
+            _ => None,
+        };
         if let Some(default) = &default {
             let count = if render { 14 } else { 2 };
             let mut bytes = Vec::new();
@@ -308,8 +367,20 @@ impl SavedContext {
             ram,
             valid: AtomicBool::new(default.is_some()),
             render,
+            engine_class,
+            engine_instance,
         })
         .map_err(|_| axerrno::AxError::NoMemory)
+    }
+}
+fn engine_mmio_base(engine_class: u8, engine_instance: u8) -> Result<u32, Error> {
+    match (engine_class, engine_instance) {
+        (0, 0) => Ok(0x2000),
+        (1, 0) => Ok(0x22000),
+        (2, 0) => Ok(0x1c0000),
+        (2, 2) => Ok(0x1d0000),
+        (3, 0) => Ok(0x1c8000),
+        _ => Err(Error::Refused),
     }
 }
 struct SwitchAway {
@@ -317,9 +388,21 @@ struct SwitchAway {
     ring: Ram,
     bindings: Vec<Binding>,
     descriptor: u64,
+    engine_class: u8,
+    engine_instance: u8,
 }
 impl SwitchAway {
     fn new(render: bool) -> Result<Self, Error> {
+        Self::new_engine(u8::from(!render), 0)
+    }
+    fn new_engine(engine_class: u8, engine_instance: u8) -> Result<Self, Error> {
+        if !matches!(
+            (engine_class, engine_instance),
+            (0, 0) | (1, 0) | (2, 0) | (2, 2) | (3, 0)
+        ) {
+            return Err(Error::Refused);
+        }
+        let render = engine_class == 0;
         let mut bindings = Vec::new();
         bindings.try_reserve_exact(2).map_err(|_| Error::Refused)?;
         Ok(Self {
@@ -331,6 +414,8 @@ impl SwitchAway {
             ring: Ram::allocate(1)?,
             bindings,
             descriptor: 0,
+            engine_class,
+            engine_instance,
         })
     }
     fn build(&mut self, gtt: &Gtt, render: bool, root: u64, io: &impl GtIo) -> Result<(), Error> {
@@ -356,7 +441,18 @@ impl SwitchAway {
                 root,
             )?
         } else {
-            lrc::build(&mut regs, &mut indirect, &mut per, context, ring, 120, root)?
+            lrc::build_engine(
+                &mut regs,
+                &mut indirect,
+                &mut per,
+                context,
+                ring,
+                120,
+                root,
+                engine_mmio_base(self.engine_class, self.engine_instance)?,
+                self.engine_class,
+                self.engine_instance,
+            )?
         };
         // Source Gen11/12.0 descriptor SW context bits37..47. Port1 must be a
         // distinct context to force the port0 image save before its breadcrumb.
@@ -375,11 +471,18 @@ impl SwitchAway {
             intel_gt::rcs::context_wa(io, &mut words[22..36])?;
             words[36..].copy_from_slice(&normal);
             words[37] |= 1 << 27;
-            self.ring.dwords(0, &words)?;
+            write_ring_commands(&self.ring, &words)?;
         } else {
-            let count = bcs::ring(&mut regs, 0x30000, context, 1)?;
+            let count = bcs::ring_engine(
+                &mut regs,
+                0x30000,
+                context,
+                1,
+                self.engine_class,
+                self.engine_instance,
+            )?;
             regs[15..18].fill(0); // only MI_BATCH_BUFFER_START and its two address words.
-            self.ring.dwords(0, &regs[..count])?;
+            write_ring_commands(&self.ring, &regs[..count])?;
         }
         self.context.flush();
         self.ring.flush();
@@ -416,10 +519,1357 @@ pub(super) struct Memory {
     operation: bcs::Copy,
     selftest: bool,
     render: bool,
+    engine_class: u8,
+    engine_instance: u8,
     idle: bool,
     saved: Option<Arc<SavedContext>>,
     switch: Option<Box<SwitchAway>>,
 }
+
+/// A firmware GGTT source retained until its DMA completion has been proven.
+#[cfg(target_os = "none")]
+pub(super) struct UcDmaMemory {
+    _gtt: Arc<Gtt>,
+    _ram: Ram,
+    _binding: Binding,
+}
+
+#[cfg(target_os = "none")]
+impl UcDmaMemory {
+    fn release(self) -> Result<(), Self> {
+        // SAFETY: callers use this only after the GuC has either completed
+        // HuC authentication or explicitly rejected the action.
+        if unsafe { self._gtt.release_binding(&self._binding) }.is_err() {
+            Err(self)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
+pub(super) struct CtDmaMemory {
+    _gtt: Arc<Gtt>,
+    _ram: Ram,
+    _binding: Binding,
+    pair: intel_gt::guc_ct::CtbPair,
+    submission: intel_gt::guc_submission::GucSubmission,
+    blob: Vec<u8>,
+    enabled: bool,
+}
+
+#[cfg(target_os = "none")]
+pub(super) struct AdsDmaMemory {
+    _gtt: Arc<Gtt>,
+    _ram: Ram,
+    binding: Binding,
+    input: intel_gt::guc_ads::AdsBuildInput,
+    layout: intel_gt::guc_ads::AdsLayout,
+    blob: Vec<u8>,
+    registered: bool,
+}
+
+#[cfg(target_os = "none")]
+pub(super) struct LogDmaMemory {
+    _gtt: Arc<Gtt>,
+    _ram: Ram,
+    binding: Binding,
+    layout: intel_gt::guc_log::GucLogLayout,
+    config: intel_gt::guc_config::LogConfig,
+    registered: bool,
+}
+
+#[cfg(target_os = "none")]
+impl LogDmaMemory {
+    fn release(self) -> Result<(), Self> {
+        if self.registered {
+            return Err(self);
+        }
+        // SAFETY: GuC has not been configured with this address, or its reset
+        // completed before registration was cleared.
+        if unsafe { self._gtt.release_binding(&self.binding) }.is_err() {
+            Err(self)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Allocate a zeroed GuC logging state/data VMA and derive GUC_CTL layout
+    /// fields from upstream section sizing.
+    /// upstream: intel_guc_log.c intel_guc_log_create()/guc_log_init_sizes().
+    pub(super) fn initialize(
+        owner: &mut super::Owner,
+        debug_guc: bool,
+        debug_gem: bool,
+    ) -> Result<(), Error> {
+        if owner.lost || owner.log_memory.is_some() {
+            return Err(Error::Quarantined);
+        }
+        let layout = intel_gt::guc_log::guc_log_init_sizes(debug_guc, debug_gem)
+            .map_err(|_| Error::Refused)?;
+        let size = usize::try_from(layout.buffer_bytes).map_err(|_| Error::Refused)?;
+        let pages = size.checked_add(PAGE - 1).ok_or(Error::Refused)? / PAGE;
+        let mut zeroes = Vec::new();
+        zeroes.try_reserve_exact(size).map_err(|_| Error::Refused)?;
+        zeroes.resize(size, 0);
+        let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+        let ram = Ram::allocate(pages)?;
+        let binding = gtt
+            .bind_pages(&ram.physical)
+            .map_err(|_| Error::Quarantined)?;
+        let base = match u32::try_from(binding.address) {
+            Ok(base) if base != 0 && base.is_multiple_of(PAGE as u32) => base,
+            _ => {
+                let memory = Self {
+                    _gtt: gtt,
+                    _ram: ram,
+                    binding,
+                    layout,
+                    config: layout.control_config(0),
+                    registered: false,
+                };
+                if let Err(memory) = memory.release() {
+                    owner.log_memory = Some(memory);
+                    return Err(Error::Quarantined);
+                }
+                return Err(Error::Refused);
+            }
+        };
+        let config = layout.control_config(base);
+        if let Err(error) = ram.write(0, &zeroes) {
+            let memory = Self {
+                _gtt: gtt,
+                _ram: ram,
+                binding,
+                layout,
+                config,
+                registered: false,
+            };
+            if let Err(memory) = memory.release() {
+                owner.log_memory = Some(memory);
+                return Err(Error::Quarantined);
+            }
+            return Err(error);
+        }
+        ram.flush();
+        owner.log_memory = Some(Self {
+            _gtt: gtt,
+            _ram: ram,
+            binding,
+            layout,
+            config,
+            registered: false,
+        });
+        Ok(())
+    }
+
+    pub(super) fn config(&self) -> intel_gt::guc_config::LogConfig {
+        self.config
+    }
+
+    pub(super) fn layout(&self) -> intel_gt::guc_log::GucLogLayout {
+        self.layout
+    }
+
+    fn read_shared_log(&self) -> Result<Vec<u8>, Error> {
+        let size = usize::try_from(self.layout.buffer_bytes).map_err(|_| Error::Refused)?;
+        let mut shared = Vec::new();
+        shared.try_reserve_exact(size).map_err(|_| Error::Refused)?;
+        shared.resize(size, 0);
+        self._ram.read(0, &mut shared)?;
+        Ok(shared)
+    }
+
+    /// Copy debug/crash rings, update their read state and leave capture data
+    /// for the state-capture event path.
+    /// upstream: intel_guc_log.c _guc_log_copy_debuglogs_for_relay().
+    pub(super) fn drain_debug_logs(
+        &mut self,
+        stats: &mut [intel_gt::guc_log::LogStats; 3],
+    ) -> Result<intel_gt::guc_log::LogSnapshot, Error> {
+        let mut shared = self.read_shared_log()?;
+        let snapshot =
+            intel_gt::guc_log::copy_debug_logs_for_relay(&mut shared, self.layout, stats)?;
+        self._ram.write(0, &shared)?;
+        self._ram.flush();
+        Ok(snapshot)
+    }
+
+    /// Parse and acknowledge the capture-region state after a G2H capture
+    /// notification. The caller sends the corresponding flush-complete action.
+    pub(super) fn drain_capture_log(
+        &mut self,
+        stats: &mut intel_gt::guc_log::LogStats,
+        reset_in_progress: bool,
+    ) -> Result<intel_gt::guc_capture::CaptureLogResult, Error> {
+        let mut shared = self.read_shared_log()?;
+        let result = intel_gt::guc_log::process_capture_log(
+            &mut shared,
+            self.layout,
+            stats,
+            reset_in_progress,
+        )?;
+        self._ram.write(0, &shared)?;
+        self._ram.flush();
+        Ok(result)
+    }
+
+    pub(super) fn mark_registered(&mut self) {
+        self.registered = true;
+    }
+}
+
+/// Publish GuC scratch parameters only after matching pinned ADS/log buffers
+/// exist. The GuC must still be held in MIA reset; after any write succeeds,
+/// retain both VMA owners before firmware transfer can consume the pointers.
+/// upstream: intel_guc.c intel_guc_write_params().
+#[cfg(target_os = "none")]
+pub(super) fn write_guc_init_params(
+    owner: &mut super::Owner,
+    options: intel_gt::guc_config::GucOptions,
+) -> Result<[u32; intel_gt::guc_config::GUC_CTL_MAX_DWORDS], Error> {
+    if owner.lost || !owner.bus.awake.load(Ordering::Acquire) {
+        return Err(Error::Refused);
+    }
+    if owner.bus.read(0xc000)? & 1 == 0 {
+        return Err(Error::Refused);
+    }
+    let ads_address = owner
+        .ads_memory
+        .as_ref()
+        .ok_or(Error::Refused)?
+        .ggtt_address()?;
+    let log_config = owner.log_memory.as_ref().ok_or(Error::Refused)?.config();
+    if options.ads_ggtt_address != ads_address
+        || options.log.ggtt_address != log_config.ggtt_address
+    {
+        return Err(Error::Refused);
+    }
+    let params = intel_gt::guc_config::guc_init_params(options).map_err(|_| Error::Refused)?;
+    intel_gt::guc_config::write_params(&owner.bus, &params)?;
+    owner
+        .ads_memory
+        .as_mut()
+        .ok_or(Error::Quarantined)?
+        .mark_registered();
+    owner
+        .log_memory
+        .as_mut()
+        .ok_or(Error::Quarantined)?
+        .mark_registered();
+    Ok(params)
+}
+
+/// Handle a G2H state-capture notification: report NOSPACE, drain/ack the
+/// capture region, then send LOG_BUFFER_FILE_FLUSH_COMPLETE over CTB.
+/// upstream: intel_guc_submission.c intel_guc_error_capture_process_msg()
+/// + intel_guc_capture.c __guc_capture_process_output().
+#[cfg(target_os = "none")]
+pub(super) fn handle_guc_capture_notification(
+    owner: &mut super::Owner,
+    stats: &mut intel_gt::guc_log::LogStats,
+    reset_in_progress: bool,
+    status_word: u32,
+) -> Result<intel_gt::guc_capture::CaptureLogResult, Error> {
+    if owner.lost || !owner.bus.awake.load(Ordering::Acquire) {
+        return Err(Error::Refused);
+    }
+    let status = status_word & intel_gt::guc_capture::CAPTURE_EVENT_STATUS_MASK;
+    if status == intel_gt::guc_capture::CAPTURE_EVENT_STATUS_NOSPACE {
+        axlog::warn!("intel-gt: GuC capture buffer reported no space");
+    }
+    let result = owner
+        .log_memory
+        .as_mut()
+        .ok_or(Error::Refused)?
+        .drain_capture_log(stats, reset_in_progress)?;
+    let mut cache_error = false;
+    if let Some(cache) = owner.capture_nodes.as_mut() {
+        for group in &result.groups {
+            if cache.process_group(group).is_err() {
+                cache_error = true;
+                break;
+            }
+        }
+    } else if !result.groups.is_empty() {
+        cache_error = true;
+    }
+    // As upstream, acknowledge the buffer even when a group could not be
+    // parsed/retained so GuC does not remain blocked on the flush handshake.
+    owner
+        .ct_memory
+        .as_mut()
+        .ok_or(Error::Quarantined)?
+        .send_capture_flush_complete(&owner.bus)
+        .map_err(|_| Error::Quarantined)?;
+    if cache_error {
+        return Err(Error::Quarantined);
+    }
+    if result.parse_error.is_some() {
+        axlog::warn!("intel-gt: GuC capture log contained a malformed record");
+    }
+    Ok(result)
+}
+
+/// Workqueue-side debug-log relay snapshot and GuC flush acknowledgment.
+/// upstream: intel_guc_log.c copy_debug_logs_work()/guc_log_copy_debuglogs_for_relay().
+#[cfg(target_os = "none")]
+pub(super) fn process_guc_debug_log_flush(
+    owner: &mut super::Owner,
+    stats: &mut [intel_gt::guc_log::LogStats; 3],
+) -> Result<intel_gt::guc_log::LogSnapshot, Error> {
+    if owner.lost || !owner.bus.awake.load(Ordering::Acquire) {
+        return Err(Error::Refused);
+    }
+    let snapshot = owner
+        .log_memory
+        .as_mut()
+        .ok_or(Error::Refused)?
+        .drain_debug_logs(stats)?;
+    owner
+        .ct_memory
+        .as_mut()
+        .ok_or(Error::Quarantined)?
+        .send_debug_flush_complete(&owner.bus)
+        .map_err(|_| Error::Quarantined)?;
+    Ok(snapshot)
+}
+
+#[cfg(target_os = "none")]
+pub(super) fn take_guc_capture_node(
+    owner: &mut super::Owner,
+    engine_guc_id: u32,
+    context_guc_id: u32,
+    context_lrca: u32,
+) -> Option<intel_gt::guc_capture::PooledCaptureNode> {
+    owner
+        .capture_nodes
+        .as_mut()?
+        .take_matching_node(engine_guc_id, context_guc_id, context_lrca)
+}
+
+#[cfg(target_os = "none")]
+pub(super) fn recycle_guc_capture_node(
+    owner: &mut super::Owner,
+    node: intel_gt::guc_capture::PooledCaptureNode,
+) {
+    if let Some(cache) = owner.capture_nodes.as_mut() {
+        cache.recycle_node(node);
+    }
+}
+
+#[cfg(target_os = "none")]
+impl AdsDmaMemory {
+    fn release(self) -> Result<(), Self> {
+        if self.registered {
+            return Err(self);
+        }
+        // SAFETY: ADS has not been published to GuC, or GuC was reset before
+        // the caller cleared `registered`.
+        if unsafe { self._gtt.release_binding(&self.binding) }.is_err() {
+            Err(self)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Allocate and populate the ADS GGTT VMA. Caller-provided data must come
+    /// from probed engine/MCR/system-info/context state, not guessed defaults.
+    /// upstream: intel_guc_ads.c intel_guc_ads_create()/__guc_ads_init().
+    pub(super) fn initialize(
+        owner: &mut super::Owner,
+        mut input: intel_gt::guc_ads::AdsBuildInput,
+    ) -> Result<(), Error> {
+        if owner.lost || owner.ads_memory.is_some() {
+            return Err(Error::Quarantined);
+        }
+        // The required allocation size is independent of the eventual GGTT
+        // address; use an aligned placeholder to run the checked builder once.
+        input.base_ggtt = PAGE as u32;
+        let (layout, _) = intel_gt::guc_ads::build_ads(&input).map_err(|_| Error::Refused)?;
+        let pages = layout
+            .total_size
+            .checked_add(PAGE - 1)
+            .ok_or(Error::Refused)?
+            / PAGE;
+        let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+        let ram = Ram::allocate(pages)?;
+        let binding = gtt
+            .bind_pages(&ram.physical)
+            .map_err(|_| Error::Quarantined)?;
+        let base = match u32::try_from(binding.address) {
+            Ok(base) if base != 0 && base.is_multiple_of(PAGE as u32) => base,
+            _ => {
+                let memory = Self {
+                    _gtt: gtt,
+                    _ram: ram,
+                    binding,
+                    input,
+                    layout,
+                    blob: Vec::new(),
+                    registered: false,
+                };
+                if let Err(memory) = memory.release() {
+                    owner.ads_memory = Some(memory);
+                    return Err(Error::Quarantined);
+                }
+                return Err(Error::Refused);
+            }
+        };
+        input.base_ggtt = base;
+        let (actual_layout, blob) = match intel_gt::guc_ads::build_ads(&input) {
+            Ok(built) if built.0.total_size == layout.total_size => built,
+            _ => {
+                let memory = Self {
+                    _gtt: gtt,
+                    _ram: ram,
+                    binding,
+                    input,
+                    layout,
+                    blob: Vec::new(),
+                    registered: false,
+                };
+                if let Err(memory) = memory.release() {
+                    owner.ads_memory = Some(memory);
+                    return Err(Error::Quarantined);
+                }
+                return Err(Error::Refused);
+            }
+        };
+        let memory = Self {
+            _gtt: gtt,
+            _ram: ram,
+            binding,
+            input,
+            layout: actual_layout,
+            blob,
+            registered: false,
+        };
+        if let Err(error) = memory._ram.write(0, &memory.blob) {
+            if let Err(memory) = memory.release() {
+                owner.ads_memory = Some(memory);
+                return Err(Error::Quarantined);
+            }
+            return Err(error);
+        }
+        memory._ram.flush();
+        owner.ads_memory = Some(memory);
+        Ok(())
+    }
+
+    pub(super) fn ggtt_address(&self) -> Result<u32, Error> {
+        u32::try_from(self.binding.address).map_err(|_| Error::Refused)
+    }
+
+    /// Rebuild all ADS regions after GuC reset and publish the bytes before
+    /// re-registering the VMA.
+    /// upstream: intel_guc_ads.c intel_guc_ads_reset().
+    pub(super) fn reset_after_guc_reset(&mut self) -> Result<(), Error> {
+        let layout = intel_gt::guc_ads::intel_guc_ads_reset(&self.input, &mut self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        if layout.total_size != self.layout.total_size {
+            return Err(Error::Quarantined);
+        }
+        self._ram.write(0, &self.blob)?;
+        self._ram.flush();
+        self.registered = false;
+        Ok(())
+    }
+
+    pub(super) fn mark_registered(&mut self) {
+        self.registered = true;
+    }
+}
+
+#[cfg(target_os = "none")]
+impl CtDmaMemory {
+    fn release(self) -> Result<(), Self> {
+        // SAFETY: the CTB KLVs have not been registered with GuC yet.
+        if unsafe { self._gtt.release_binding(&self._binding) }.is_err() {
+            Err(self)
+        } else {
+            Ok(())
+        }
+    }
+
+    // upstream: intel_guc_ct.c intel_guc_ct_init()/intel_guc_ct_enable()
+    pub(super) fn initialize(owner: &mut super::Owner) -> Result<(), Error> {
+        if owner.ct_memory.is_some() {
+            return Err(Error::Quarantined);
+        }
+        let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+        let submission = intel_gt::guc_submission::GucSubmission::new(
+            intel_gt::guc_submission::GUC_MAX_CONTEXT_ID,
+        )
+        .map_err(|_| Error::Refused)?;
+        let pages = intel_gt::guc_ct::CTB_BLOB_SIZE
+            .checked_add(PAGE - 1)
+            .ok_or(Error::Refused)?
+            / PAGE;
+        let ram = Ram::allocate(pages)?;
+        let pair = intel_gt::guc_ct::CtbPair::new().map_err(|_| Error::Refused)?;
+        let blob = pair.initial_blob();
+        ram.write(0, &blob)?;
+        ram.flush();
+        let binding = gtt
+            .bind_pages(&ram.physical)
+            .map_err(|_| Error::Quarantined)?;
+        let memory = Self {
+            _gtt: gtt,
+            _ram: ram,
+            _binding: binding,
+            pair,
+            submission,
+            blob,
+            enabled: false,
+        };
+        let base = match u32::try_from(memory._binding.address) {
+            Ok(address) => address,
+            Err(_) => {
+                if let Err(memory) = memory.release() {
+                    owner.ct_memory = Some(memory);
+                    return Err(Error::Quarantined);
+                }
+                return Err(Error::Refused);
+            }
+        };
+        let addresses = match intel_gt::guc_ct::ctb_addresses(base) {
+            Ok(addresses) => addresses,
+            Err(_) => {
+                if let Err(memory) = memory.release() {
+                    owner.ct_memory = Some(memory);
+                    return Err(Error::Quarantined);
+                }
+                return Err(Error::Refused);
+            }
+        };
+        owner.ct_memory = Some(memory);
+        let result = intel_gt::guc_ct::enable_buffer_transport(&owner.bus, addresses);
+        if result.is_err() {
+            // Self-config may have landed even when MMIO response handling
+            // failed; keep the whole blob resident and quarantine the owner.
+            return Err(Error::Quarantined);
+        }
+        if let Some(memory) = owner.ct_memory.as_mut() {
+            memory.enabled = true;
+        }
+        Ok(())
+    }
+
+    pub(super) fn send_nonblocking(
+        &mut self,
+        bus: &impl GtIo,
+        action: &[u32],
+        flags: u32,
+    ) -> Result<u16, Error> {
+        if !self.enabled {
+            return Err(Error::Refused);
+        }
+        self._ram.read(0, &mut self.blob)?;
+        self.pair
+            .sync_from_blob(&self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        let fence = self
+            .pair
+            .send_nonblocking(action, flags)
+            .map_err(|_| Error::Refused)?;
+        self.pair
+            .sync_to_blob(&mut self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        self._ram.write(0, &self.blob)?;
+        self._ram.flush();
+        intel_gt::guc_fw::notify(bus)?;
+        Ok(fence)
+    }
+
+    /// Exercise enabled CTB with an H2G control action and wait for its HXG
+    /// response before reporting the startup transport ready. This does not
+    /// replace the later IRQ/tasklet/workqueue event path.
+    /// upstream: intel_guc_ct.c ct_send()/ct_handle_response().
+    pub(super) fn verify_ctb_roundtrip(&mut self, bus: &impl GtIo) -> Result<(), Error> {
+        if !self.enabled {
+            return Err(Error::Refused);
+        }
+        self._ram.read(0, &mut self.blob)?;
+        self.pair
+            .sync_from_blob(&self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        let action = [
+            intel_gt::guc_ct::ACTION_HOST2GUC_CONTROL_CTB,
+            intel_gt::guc_ct::CTB_CONTROL_ENABLE,
+        ];
+        let ram = &self._ram;
+        let blob = &mut self.blob;
+        let completion = self
+            .pair
+            .send_request_with_retry(bus, &action, 0, |pair, fence, short, long| {
+                if fence.is_some() {
+                    pair.sync_to_blob(blob)
+                        .map_err(|_| intel_gt::guc_ct::CtError::InvalidMessage)?;
+                    ram.write(0, blob)
+                        .map_err(|_| intel_gt::guc_ct::CtError::InvalidMessage)?;
+                    ram.flush();
+                    intel_gt::guc_fw::notify(bus)
+                        .map_err(|_| intel_gt::guc_ct::CtError::InvalidMessage)?;
+                }
+                let start = bus.now_us();
+                let timeout = short.saturating_add(long);
+                loop {
+                    ram.read(0, blob)
+                        .map_err(|_| intel_gt::guc_ct::CtError::InvalidMessage)?;
+                    pair.sync_from_blob(blob)?;
+                    let old_send_tail = pair.send.descriptor.tail;
+                    if let Some(words) = pair.receive.read_message()? {
+                        if pair.handle_incoming_message(&words)?.is_some() {
+                            return Err(intel_gt::guc_ct::CtError::InvalidMessage);
+                        }
+                        pair.sync_to_blob(blob)?;
+                        ram.write(0, blob)
+                            .map_err(|_| intel_gt::guc_ct::CtError::InvalidMessage)?;
+                        ram.flush();
+                        if pair.send.descriptor.tail != old_send_tail {
+                            intel_gt::guc_fw::notify(bus)
+                                .map_err(|_| intel_gt::guc_ct::CtError::InvalidMessage)?;
+                        }
+                        return Ok(());
+                    }
+                    if bus.now_us().saturating_sub(start) > timeout {
+                        return Err(intel_gt::guc_ct::CtError::Timeout);
+                    }
+                    bus.delay_us(50);
+                }
+            })
+            .map_err(|_| Error::Quarantined)?;
+        self.pair
+            .sync_to_blob(&mut self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        self._ram.write(0, &self.blob)?;
+        self._ram.flush();
+        intel_gt::guc_fw::notify(bus).map_err(|_| Error::Quarantined)?;
+        match completion {
+            intel_gt::guc_ct::CtCompletion::Success { .. } => Ok(()),
+            intel_gt::guc_ct::CtCompletion::Failure { .. }
+            | intel_gt::guc_ct::CtCompletion::Retry { .. } => Err(Error::Quarantined),
+        }
+    }
+
+    /// Map one GuC scheduling H2G action to CTB. `expected_response_dwords`
+    /// reserves the matching G2H credit before notifying GuC.
+    pub(super) fn send_scheduling_action(
+        &mut self,
+        bus: &impl GtIo,
+        action: &intel_gt::guc_submission::SchedAction,
+    ) -> Result<u16, Error> {
+        let len = usize::from(action.len);
+        if len == 0 || len > action.words.len() {
+            return Err(Error::Refused);
+        }
+        let flags = intel_gt::guc_ct::CT_SEND_NB | u32::from(action.expected_response_dwords);
+        self.send_nonblocking(bus, &action.words[..len], flags)
+    }
+
+    /// Acknowledge completed capture-buffer file flush through CTB.
+    pub(super) fn send_capture_flush_complete(&mut self, bus: &impl GtIo) -> Result<u16, Error> {
+        let action = intel_gt::guc_capture::capture_flush_complete_action();
+        self.send_nonblocking(bus, &action, intel_gt::guc_ct::CT_SEND_NB)
+    }
+
+    pub(super) fn send_debug_flush_complete(&mut self, bus: &impl GtIo) -> Result<u16, Error> {
+        let action = intel_gt::guc_log::flush_log_complete_action();
+        self.send_nonblocking(bus, &action, intel_gt::guc_ct::CT_SEND_NB)
+    }
+
+    fn publish_ctb(&mut self, bus: &impl GtIo) -> Result<(), Error> {
+        self.pair
+            .sync_to_blob(&mut self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        self._ram.write(0, &self.blob)?;
+        self._ram.flush();
+        intel_gt::guc_fw::notify(bus)
+    }
+
+    /// GuC v70 context registration bridge. The context/LRC image and GGTT
+    /// descriptor inputs remain owned by the caller; uncertain shared-memory
+    /// publication retains the CT owner and must quarantine the GT.
+    pub(super) fn register_guc_context_v70(
+        &mut self,
+        bus: &impl GtIo,
+        info: intel_gt::guc_submission::GuCContextRegistrationInfo,
+        policy: intel_gt::guc_submission::ContextPolicy,
+        lease: intel_gt::guc_submission::ContextIdLease,
+        child_lrcas: &[u64],
+        child_ids: &[u32],
+    ) -> Result<u16, Error> {
+        if !self.enabled {
+            return Err(Error::Refused);
+        }
+        self._ram.read(0, &mut self.blob)?;
+        self.pair
+            .sync_from_blob(&self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        let old_tail = self.pair.send.descriptor.tail;
+        let result = self.submission.register_v70(
+            &mut self.pair,
+            info,
+            policy,
+            lease,
+            child_lrcas,
+            child_ids,
+        );
+        if self.pair.send.descriptor.tail != old_tail {
+            self.publish_ctb(bus).map_err(|_| Error::Quarantined)?;
+        }
+        result.map_err(|_| Error::Refused)
+    }
+
+    pub(super) fn submit_guc_context_request(
+        &mut self,
+        bus: &impl GtIo,
+        context_id: u32,
+        is_parent: bool,
+    ) -> Result<([u16; 2], usize), Error> {
+        if !self.enabled {
+            return Err(Error::Refused);
+        }
+        self._ram.read(0, &mut self.blob)?;
+        self.pair
+            .sync_from_blob(&self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        let old_tail = self.pair.send.descriptor.tail;
+        let result = self
+            .submission
+            .submit_request(&mut self.pair, context_id, is_parent);
+        if self.pair.send.descriptor.tail != old_tail {
+            self.publish_ctb(bus).map_err(|_| Error::Quarantined)?;
+        }
+        result.map_err(|_| Error::Refused)
+    }
+
+    pub(super) fn deregister_guc_context(
+        &mut self,
+        bus: &impl GtIo,
+        context_id: u32,
+    ) -> Result<u16, Error> {
+        if !self.enabled {
+            return Err(Error::Refused);
+        }
+        self._ram.read(0, &mut self.blob)?;
+        self.pair
+            .sync_from_blob(&self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        let old_tail = self.pair.send.descriptor.tail;
+        let result = self
+            .submission
+            .deregister_context(&mut self.pair, context_id);
+        if self.pair.send.descriptor.tail != old_tail {
+            self.publish_ctb(bus).map_err(|_| Error::Quarantined)?;
+        }
+        result.map_err(|_| Error::Refused)
+    }
+
+    pub(super) fn guc_context_registered(&self, context_id: u32) -> bool {
+        self.submission.contains_context(context_id)
+    }
+
+    /// Receive one CTB message after a GuC G2H interrupt/poll notification and
+    /// dispatch submission completion events before publishing the new head.
+    /// IRQ/tasklet registration remains owned by the GT event integration.
+    pub(super) fn receive_guc_submission_event(&mut self, bus: &impl GtIo) -> Result<bool, Error> {
+        if !self.enabled {
+            return Err(Error::Refused);
+        }
+        self._ram.read(0, &mut self.blob)?;
+        self.pair
+            .sync_from_blob(&self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        if self.pair.take_unused_receive_status_seen() {
+            axlog::warn!("intel-gt: unexpected GuC G2H after CT shutdown (UNUSED status)");
+        }
+        let words = match self
+            .pair
+            .receive
+            .read_message()
+            .map_err(|_| Error::Quarantined)?
+        {
+            Some(words) => words,
+            None => return Ok(false),
+        };
+        let event = self
+            .pair
+            .handle_incoming_message(&words)
+            .map_err(|_| Error::Quarantined)?;
+        let old_send_tail = self.pair.send.descriptor.tail;
+        let dispatch = match event {
+            Some(event)
+                if matches!(
+                    event.action,
+                    intel_gt::guc_ct::ACTION_SCHED_CONTEXT_MODE_DONE
+                        | intel_gt::guc_ct::ACTION_DEREGISTER_CONTEXT_DONE
+                ) =>
+            {
+                self.submission.handle_event(&mut self.pair, event)
+            }
+            // A non-event G2H message is a CT response. `handle_incoming_message`
+            // has already recorded it against its fence; publish the advanced
+            // receive head here so the waiter can consume it via finish_request.
+            Some(_) => Err(intel_gt::guc_ct::CtError::InvalidMessage),
+            None => Ok(()),
+        };
+        self.pair
+            .sync_to_blob(&mut self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        self._ram.write(0, &self.blob)?;
+        self._ram.flush();
+        if self.pair.send.descriptor.tail != old_send_tail {
+            intel_gt::guc_fw::notify(bus)?;
+        }
+        dispatch.map_err(|_| Error::Quarantined)?;
+        Ok(true)
+    }
+
+    /// Consume a response previously received by the CT bridge and return its
+    /// reserved G2H credits after the caller has waited for the matching fence.
+    pub(super) fn finish_guc_submission_response(
+        &mut self,
+        fence: u16,
+    ) -> Result<intel_gt::guc_ct::CtCompletion, Error> {
+        if !self.enabled {
+            return Err(Error::Refused);
+        }
+        self._ram.read(0, &mut self.blob)?;
+        self.pair
+            .sync_from_blob(&self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        let completion = self
+            .pair
+            .finish_request(fence)
+            .map_err(|_| Error::Quarantined)?;
+        self.pair
+            .sync_to_blob(&mut self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        self._ram.write(0, &self.blob)?;
+        self._ram.flush();
+        Ok(completion)
+    }
+}
+
+#[cfg(target_os = "none")]
+fn upload_huc_for_auth(
+    owner: &mut super::Owner,
+    image: &intel_gt::uc::FirmwareImage,
+) -> Result<(UcDmaMemory, u32), Error> {
+    if image.kind != intel_gt::uc::Kind::HuC
+        || image.bytes.is_empty()
+        || image.bytes.len() > 2 * 1024 * 1024
+    {
+        return Err(Error::Refused);
+    }
+    let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+    let pages = image
+        .bytes
+        .len()
+        .checked_add(PAGE - 1)
+        .ok_or(Error::Refused)?
+        / PAGE;
+    let ram = Ram::allocate(pages)?;
+    ram.write(0, &image.bytes)?;
+    ram.flush();
+    let binding = gtt
+        .bind_pages(&ram.physical)
+        .map_err(|_| Error::Quarantined)?;
+    let rsa_offset = image
+        .css
+        .header_bytes
+        .checked_add(image.css.microcode_bytes)
+        .and_then(|offset| u32::try_from(offset).ok())
+        .and_then(|offset| u32::try_from(binding.address).ok()?.checked_add(offset));
+    let Some(rsa_offset) = rsa_offset else {
+        // SAFETY: no firmware transfer has started, so the binding is idle.
+        if unsafe { gtt.release_binding(&binding) }.is_err() {
+            owner.uc_memory = Some(UcDmaMemory {
+                _gtt: gtt,
+                _ram: ram,
+                _binding: binding,
+            });
+            return Err(Error::Quarantined);
+        }
+        return Err(Error::Refused);
+    };
+    if image
+        .change_status(intel_gt::uc::FirmwareStatus::Loadable)
+        .is_err()
+    {
+        // SAFETY: HuC DMA has not started; the binding has no device consumer.
+        if unsafe { gtt.release_binding(&binding) }.is_err() {
+            owner.uc_memory = Some(UcDmaMemory {
+                _gtt: gtt,
+                _ram: ram,
+                _binding: binding,
+            });
+            return Err(Error::Quarantined);
+        }
+        return Err(Error::Refused);
+    }
+    if let Err(error) = intel_gt::guc_fw::huc_upload(&owner.bus, binding.address, image, false) {
+        let _ = image.change_status(intel_gt::uc::FirmwareStatus::LoadFail);
+        let release_failed = if error == Error::Quarantined {
+            true
+        } else {
+            // SAFETY: non-quarantine errors mean the DMA transfer was never
+            // started or was observed complete before returning.
+            unsafe { gtt.release_binding(&binding) }.is_err()
+        };
+        if release_failed {
+            owner.uc_memory = Some(UcDmaMemory {
+                _gtt: gtt,
+                _ram: ram,
+                _binding: binding,
+            });
+            return Err(Error::Quarantined);
+        }
+        return Err(error);
+    }
+    if image
+        .change_status(intel_gt::uc::FirmwareStatus::Transferred)
+        .is_err()
+    {
+        owner.uc_memory = Some(UcDmaMemory {
+            _gtt: gtt,
+            _ram: ram,
+            _binding: binding,
+        });
+        return Err(Error::Quarantined);
+    }
+    Ok((
+        UcDmaMemory {
+            _gtt: gtt,
+            _ram: ram,
+            _binding: binding,
+        },
+        rsa_offset,
+    ))
+}
+
+#[cfg(target_os = "none")]
+// upstream: intel_uc_fw.c intel_uc_fw_upload()
+fn upload_uc_one(
+    owner: &mut super::Owner,
+    image: &intel_gt::uc::FirmwareImage,
+) -> Result<(), Error> {
+    if image.bytes.is_empty() || image.bytes.len() > 2 * 1024 * 1024 {
+        return Err(Error::Refused);
+    }
+    let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+    let pages = image
+        .bytes
+        .len()
+        .checked_add(PAGE - 1)
+        .ok_or(Error::Refused)?
+        / PAGE;
+    let ram = Ram::allocate(pages)?;
+    ram.write(0, &image.bytes)?;
+    ram.flush();
+    let binding = gtt
+        .bind_pages(&ram.physical)
+        .map_err(|_| Error::Quarantined)?;
+    if image
+        .change_status(intel_gt::uc::FirmwareStatus::Loadable)
+        .is_err()
+    {
+        // SAFETY: firmware DMA has not started; the binding has no device consumer.
+        if unsafe { gtt.release_binding(&binding) }.is_err() {
+            owner.uc_memory = Some(UcDmaMemory {
+                _gtt: gtt,
+                _ram: ram,
+                _binding: binding,
+            });
+            return Err(Error::Quarantined);
+        }
+        return Err(Error::Refused);
+    }
+    let transfer = match image.kind {
+        intel_gt::uc::Kind::HuC => {
+            intel_gt::guc_fw::huc_upload(&owner.bus, binding.address, image, false)
+        }
+        intel_gt::uc::Kind::GuC => intel_gt::guc_fw::guc_upload(&owner.bus, binding.address, image)
+            .map(|_| ())
+            .map_err(|error| match error {
+                intel_gt::guc_fw::LoadError::Io(error) => error,
+                intel_gt::guc_fw::LoadError::Firmware { status, failure } => {
+                    failure.into_error(status)
+                }
+                intel_gt::guc_fw::LoadError::Timeout { .. } => Error::Timeout(0xc000),
+            }),
+    };
+    if let Err(error) = transfer {
+        let _ = image.change_status(intel_gt::uc::FirmwareStatus::LoadFail);
+        let release_failed = if error == Error::Quarantined {
+            true
+        } else {
+            // SAFETY: non-quarantine errors are returned only after DMA is
+            // either not started or its completion was observed.
+            unsafe { gtt.release_binding(&binding) }.is_err()
+        };
+        if release_failed {
+            owner.uc_memory = Some(UcDmaMemory {
+                _gtt: gtt,
+                _ram: ram,
+                _binding: binding,
+            });
+            return Err(Error::Quarantined);
+        }
+        return Err(error);
+    }
+    if image
+        .change_status(intel_gt::uc::FirmwareStatus::Transferred)
+        .is_err()
+    {
+        owner.uc_memory = Some(UcDmaMemory {
+            _gtt: gtt,
+            _ram: ram,
+            _binding: binding,
+        });
+        return Err(Error::Quarantined);
+    }
+    if image.kind == intel_gt::uc::Kind::GuC
+        && image
+            .change_status(intel_gt::uc::FirmwareStatus::Running)
+            .is_err()
+    {
+        owner.uc_memory = Some(UcDmaMemory {
+            _gtt: gtt,
+            _ram: ram,
+            _binding: binding,
+        });
+        return Err(Error::Quarantined);
+    }
+    // SAFETY: GuC/HuC DMA completion has been observed before success returns.
+    if unsafe { gtt.release_binding(&binding) }.is_err() {
+        owner.uc_memory = Some(UcDmaMemory {
+            _gtt: gtt,
+            _ram: ram,
+            _binding: binding,
+        });
+        return Err(Error::Quarantined);
+    }
+    Ok(())
+}
+
+/// Upload HuC then GuC and authenticate it as in intel_uc_init_hw(). ADL-N
+/// defaults to HuC authentication plus GuC submission; submission setup is a
+/// separate stage and must not be treated as complete by this loader.
+#[cfg(target_os = "none")]
+// upstream: intel_uc.c __uc_init_hw()
+pub(super) fn upload_uc_firmware(
+    owner: &mut super::Owner,
+    guc: &intel_gt::uc::FirmwareImage,
+    huc: &intel_gt::uc::FirmwareImage,
+) -> Result<(), Error> {
+    if owner.lost
+        || owner.memory.is_some()
+        || owner.uc_memory.is_some()
+        || owner.ct_memory.is_some()
+    {
+        return Err(Error::Quarantined);
+    }
+    super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
+    if !owner.bus.awake.load(Ordering::Acquire) {
+        return Err(Error::Refused);
+    }
+    let guc_upload_size = guc
+        .css
+        .header_bytes
+        .checked_add(guc.css.microcode_bytes)
+        .and_then(|size| u32::try_from(size).ok())
+        .ok_or(Error::Refused)?;
+    let huc_upload_size = huc
+        .css
+        .header_bytes
+        .checked_add(huc.css.microcode_bytes)
+        .and_then(|size| u32::try_from(size).ok())
+        .ok_or(Error::Refused)?;
+    intel_gt::wopcm::initialize_gen12(&owner.bus, guc_upload_size, huc_upload_size, true, false)
+        .map_err(|_| Error::Quarantined)?;
+    intel_gt::reset::reset_guc(&owner.bus, (12, 0)).map_err(|_| Error::Quarantined)?;
+    // The loader must publish pinned ADS/log addresses before the GuC image is
+    // DMA'd, because the firmware consumes these GUC_CTL scratch values at
+    // boot. This first runtime profile is exact N305/ADL-N only; it is derived
+    // from the validated PCI identity, GT topology, media fuses and GuC CSS.
+    if owner.platform == intel_gt::uc::Platform::AlderLakeN {
+        let input = n305_guc_ads_input(owner, guc)?;
+        AdsDmaMemory::initialize(owner, input)?;
+        LogDmaMemory::initialize(owner, false, false)?;
+        let ads_address = owner
+            .ads_memory
+            .as_ref()
+            .ok_or(Error::Quarantined)?
+            .ggtt_address()?;
+        let log = owner
+            .log_memory
+            .as_ref()
+            .ok_or(Error::Quarantined)?
+            .config();
+        let options = intel_gt::guc_config::gen12_options(
+            owner.platform,
+            0x46d0,
+            0,
+            guc.css.version,
+            ads_address,
+            log,
+        );
+        write_guc_init_params(owner, options)?;
+    }
+    let (huc_memory, rsa_offset) = upload_huc_for_auth(owner, huc)?;
+    if let Err(error) = upload_uc_one(owner, guc) {
+        let _ = huc.change_status(intel_gt::uc::FirmwareStatus::LoadFail);
+        if let Err(memory) = huc_memory.release() {
+            owner.uc_memory = Some(memory);
+            return Err(Error::Quarantined);
+        }
+        return Err(error);
+    }
+    let authentication = intel_gt::huc::authenticate_by_guc(&owner.bus, rsa_offset)
+        .map(|_| ())
+        .map_err(|_| Error::Quarantined);
+    if let Err(error) = authentication {
+        let _ = huc.change_status(intel_gt::uc::FirmwareStatus::LoadFail);
+        owner.uc_memory = Some(huc_memory);
+        return Err(error);
+    }
+    if huc
+        .change_status(intel_gt::uc::FirmwareStatus::Running)
+        .is_err()
+    {
+        owner.uc_memory = Some(huc_memory);
+        return Err(Error::Quarantined);
+    }
+    if let Err(memory) = huc_memory.release() {
+        owner.uc_memory = Some(memory);
+        return Err(Error::Quarantined);
+    }
+    if intel_gt::uc::default_enable_mask(owner.platform) & intel_gt::uc::ENABLE_GUC_SUBMISSION != 0
+    {
+        CtDmaMemory::initialize(owner)?;
+        owner
+            .ct_memory
+            .as_mut()
+            .ok_or(Error::Quarantined)?
+            .verify_ctb_roundtrip(&owner.bus)
+            .map_err(|_| Error::Quarantined)?;
+    }
+    Ok(())
+}
+
+/// Construct only the GuC boot-time ADS inventory for the exact supported
+/// Alder Lake-N device.  The engine list follows `adl_p_info`'s platform mask
+/// and is pruned with the Gen11+ media-enable fuse; GT topology and doorbell
+/// count are read from hardware.  Dynamic MMIO regsets/default LRC images are
+/// intentionally left empty here; those are task-3 runtime initialization,
+/// not fabricated values for the firmware loader.
+/// upstream: intel_guc_ads.c __guc_ads_init()/fill_engine_enable_masks().
+#[cfg(target_os = "none")]
+fn n305_guc_ads_input(
+    owner: &super::Owner,
+    guc: &intel_gt::uc::FirmwareImage,
+) -> Result<intel_gt::guc_ads::AdsBuildInput, Error> {
+    use intel_gt::guc_ads::{
+        AdsBuildInput, AdsRuntimeInfo, EngineMapEntry, EngineRegset, EngineRegsetInput,
+        RegsetWorkaround, guc_mmio_regset_init,
+    };
+
+    if owner.platform != intel_gt::uc::Platform::AlderLakeN {
+        return Err(Error::Refused);
+    }
+    let topology = intel_gt::info::Topology::read(&owner.bus)?;
+    let media_fuse = !owner.bus.read(0x9140)?;
+    let vdbox_mask = media_fuse & 0xff;
+    let vebox_mask = (media_fuse >> 16) & 0xf;
+    let doorbell_count = ((owner.bus.read(0xd08)? >> 16) & 0xff) + 1;
+
+    let mut engines = vec![
+        EngineMapEntry {
+            guc_class: 0,
+            instance: 0,
+            logical_index: 0,
+        },
+        EngineMapEntry {
+            guc_class: 3,
+            instance: 0,
+            logical_index: 0,
+        },
+    ]; // RCS0 + BCS0
+    // `setup_logical_ids()` compacts enabled VDBOX instances in physical map
+    // order {0, 2, 4, 6, 1, 3, 5, 7}; ADL-N's platform mask contains VCS0 and
+    // VCS2, so VCS2's GuC logical index is 1 while its physical instance is 2.
+    let mut logical_video = 0u8;
+    let mut sfc_mask = 0u32;
+    for instance in [0u8, 2] {
+        if vdbox_mask & (1 << instance) != 0 {
+            engines.push(EngineMapEntry {
+                guc_class: 1,
+                instance,
+                logical_index: logical_video,
+            });
+            logical_video += 1;
+            // On Gen12, each enabled even physical VDBOX is attached to SFC.
+            sfc_mask |= 1 << instance;
+        }
+    }
+    if vebox_mask & 1 != 0 {
+        engines.push(EngineMapEntry {
+            guc_class: 2,
+            instance: 0,
+            logical_index: 0,
+        });
+    }
+    let enabled_masks = intel_gt::guc_ads::fill_engine_enable_masks(&engines)?;
+    let render_context = 14 * PAGE;
+    let other_context = 2 * PAGE;
+    let skip = intel_gt::guc_ads::lrc_skip_size(12, 0);
+    let mut engine_context_sizes = Vec::new();
+    for class in 0u8..=3 {
+        if enabled_masks[usize::from(class)] != 0 {
+            let total = if class == 0 {
+                render_context
+            } else {
+                other_context
+            };
+            // ADS reserves a page-aligned slot for the full default LRC
+            // image. Only its engine_state_size ABI field excludes the
+            // common execlists/HWSP prefix.
+            if total <= skip {
+                return Err(Error::Refused);
+            }
+            engine_context_sizes.push((class, total));
+        }
+    }
+    let render_default = default_lrc_image(0)?;
+    let copy_default = default_lrc_image(3)?;
+    let default_states = [
+        intel_gt::guc_ads::EngineDefaultState {
+            engine_class: 0,
+            default_state: render_default.as_deref(),
+        },
+        intel_gt::guc_ads::EngineDefaultState {
+            engine_class: 3,
+            default_state: copy_default.as_deref(),
+        },
+    ];
+    let golden_contexts =
+        intel_gt::guc_ads::guc_init_golden_contexts(&enabled_masks, &default_states)
+            .map_err(|_| Error::Refused)?;
+    // Translate Gen12.0 intel_guc_ads.c::guc_mmio_regset_init() for the
+    // BCS and enabled media engines. ADL-N is below Wa_16018031267's 12.55
+    // IP range, so xcs_engine_wa_init() adds no extra WA; engine_fake_wa_init()
+    // still contributes the uncached CMD_CCTL override (MOCS index 3).
+    let force_nonpriv_regs: Vec<u32> = (0..12).collect();
+    let mocs_regs_gen12: Vec<u32> = (0..32).map(|index| 0xb020 + index * 4).collect();
+    let eu_perf_regs = [0xe458, 0xe45c, 0xe558, 0xe55c, 0xe658, 0xe65c, 0xe758];
+    let steering_instance = topology.dss.trailing_zeros() as u8;
+    let mut regsets = Vec::new();
+    regsets
+        .try_reserve_exact(engines.len().saturating_sub(1))
+        .map_err(|_| Error::Refused)?;
+    for engine in &engines {
+        let (base, first_render_compute) = match (engine.guc_class, engine.instance) {
+            (0, 0) => (0x2000, true),    // RENDER_RING_BASE, RCS0
+            (1, 0) => (0x1c0000, false), // GEN11_BSD_RING_BASE, VCS0
+            (1, 2) => (0x1d0000, false), // GEN11_BSD3_RING_BASE, VCS2
+            (2, 0) => (0x1c8000, false), // GEN11_VEBOX_RING_BASE, VECS0
+            (3, 0) => (0x22000, false),  // BLT_RING_BASE, BCS0
+            _ => continue,
+        };
+        let mut workarounds = Vec::new();
+        workarounds
+            .try_reserve_exact(if first_render_compute { 4 } else { 1 })
+            .map_err(|_| Error::Refused)?;
+        workarounds.push(RegsetWorkaround {
+            offset: base + 0xc4, // RING_CMD_CCTL
+            masked: true,
+            mask: 0x3fff,
+            steering_group: 0,
+            steering_instance,
+        });
+        if first_render_compute {
+            // Gen12.0 RCS0 engine_wa_list in intel_workarounds.c:
+            // GEN12<12.55 bus-hash tuning, sampler-mode indirect-state
+            // override, and per-context preemption control.
+            workarounds.extend([
+                RegsetWorkaround {
+                    offset: 0xb004, // GEN8_GARBCNTL, clear bit 7
+                    masked: false,
+                    mask: 0,
+                    steering_group: 0,
+                    steering_instance,
+                },
+                RegsetWorkaround {
+                    offset: 0xe18c, // GEN10_SAMPLER_MODE
+                    masked: true,
+                    mask: 1, // GEN11_INDIRECT_STATE_BASE_ADDR_OVERRIDE
+                    steering_group: 0,
+                    steering_instance,
+                },
+                RegsetWorkaround {
+                    offset: 0x20e0, // GEN7_FF_SLICE_CS_CHICKEN1
+                    masked: true,
+                    mask: 1 << 14, // GEN9_FFSC_PERCTX_PREEMPT_CTRL
+                    steering_group: 0,
+                    steering_instance,
+                },
+            ]);
+        }
+        let force_nonpriv_offsets: Vec<u32> = force_nonpriv_regs
+            .iter()
+            .map(|slot| base + 0x4d0 + slot * 4)
+            .collect();
+        let registers = guc_mmio_regset_init(EngineRegsetInput {
+            ring_mode: base + 0x29c,
+            ring_hws_pga: base + 0x80,
+            ring_imr: base + 0xa8,
+            first_render_compute,
+            ccs_mask: 0,
+            rcu_mode: 0,
+            workarounds: &workarounds,
+            force_nonpriv_regs: &force_nonpriv_offsets,
+            mocs_regs_gen12: &mocs_regs_gen12,
+            mocs_regs_gen12_55: &[],
+            graphics_ip: (12, 0),
+            eu_perf_regs: &eu_perf_regs,
+        })
+        .map_err(|_| Error::Refused)?;
+        regsets.push(EngineRegset {
+            engine: engine.clone(),
+            registers,
+        });
+    }
+    let mut generic_gt_sysinfo = [0; intel_gt::guc_ads::GUC_GENERIC_GT_SYSINFO_MAX];
+    // `Topology::read()` has verified the sole Gen12.0 slice-enable register
+    // value (bit 0 only), so use the actual slice count rather than DSS count.
+    generic_gt_sysinfo[0] = 1;
+    generic_gt_sysinfo[1] = sfc_mask;
+    generic_gt_sysinfo[2] = doorbell_count;
+    let css = intel_gt::uc::guc_css_info(guc.css.version, guc.css);
+    Ok(AdsBuildInput {
+        base_ggtt: PAGE as u32,
+        reset_parameter: 2,
+        runtime: AdsRuntimeInfo {
+            generic_gt_sysinfo,
+            graphics_ip_major: 12,
+            graphics_ip_minor: 0,
+            media_ip_major: 12,
+            media_ip_minor: 0,
+            firmware_version: guc.css.version,
+            dgfx: false,
+        },
+        engines,
+        regsets,
+        engine_context_sizes,
+        golden_contexts,
+        capture_lists: Vec::new(),
+        private_data_size: css.private_data_bytes,
+    })
+}
+
 impl Memory {
     fn allocate(gtt: Arc<Gtt>) -> Result<Self, Error> {
         let mut bindings = Vec::new();
@@ -453,6 +1903,8 @@ impl Memory {
             },
             selftest: true,
             render: false,
+            engine_class: 1,
+            engine_instance: 0,
             idle: false,
             saved: None,
             switch: None,
@@ -611,9 +2063,31 @@ impl Memory {
             }
         } else {
             if restore {
-                lrc::restore_context(regs, indirect, per_ctx, ctx, ring, 120, p[0])?
+                lrc::restore_engine_context(
+                    regs,
+                    indirect,
+                    per_ctx,
+                    ctx,
+                    ring,
+                    120,
+                    p[0],
+                    engine_mmio_base(self.engine_class, self.engine_instance)?,
+                    self.engine_class,
+                    self.engine_instance,
+                )?
             } else {
-                lrc::build(regs, indirect, per_ctx, ctx, ring, 120, p[0])?
+                lrc::build_engine(
+                    regs,
+                    indirect,
+                    per_ctx,
+                    ctx,
+                    ring,
+                    120,
+                    p[0],
+                    engine_mmio_base(self.engine_class, self.engine_instance)?,
+                    self.engine_class,
+                    self.engine_instance,
+                )?
             }
         };
         self.context.write(0, &[0; 4096])?;
@@ -630,11 +2104,18 @@ impl Memory {
                 self.batch.dwords(0, &batch)?;
             }
         }
-        let count = bcs::ring(regs, self.batch_address, ctx, 1)?;
+        let count = bcs::ring_engine(
+            regs,
+            self.batch_address,
+            ctx,
+            1,
+            self.engine_class,
+            self.engine_instance,
+        )?;
         if self.idle {
             regs[15..18].fill(0);
         }
-        self.ring.dwords(0, &regs[..count])?;
+        write_ring_commands(&self.ring, &regs[..count])?;
         if self.selftest {
             let mut data = Vec::new();
             data.try_reserve_exact(6 * PAGE)
@@ -690,7 +2171,7 @@ impl Memory {
         if self.idle {
             words[36 + 23..36 + 26].fill(0);
         }
-        self.ring.dwords(0, &words)?;
+        write_ring_commands(&self.ring, &words)?;
         self.ring.flush();
         Ok(())
     }
@@ -722,9 +2203,10 @@ impl Memory {
             switch.release(&self.gtt)?;
         }
         for binding in self.bindings.iter().rev() {
-            // SAFETY: only reached after successful source selected-engine stop/reset,
-            // pending-MI-wake/ready/GDRST/cancel checks; no other engine sees
-            // this private context, ring, status or PPGTT. RAM stays pinned.
+            // SAFETY: only reached after either source selected-engine
+            // stop/reset (ELSQ) or GuC context-deregister completion; no engine
+            // can still fetch these per-job context/ring/status pages. RAM is
+            // retained by its owner throughout the submission proof.
             unsafe { self.gtt.release_binding(binding) }.map_err(|_| Error::Quarantined)?;
         }
         self.bindings.clear();
@@ -739,6 +2221,150 @@ fn zero_words<T: Default + Clone>(count: usize) -> Result<Vec<T>, Error> {
 }
 fn pattern(index: usize) -> u8 {
     (index as u8).wrapping_mul(29) ^ ((index >> 8) as u8) ^ 0x73
+}
+
+/// Use the source-faithful ring reservation path for the private, already
+/// GGTT-bound BCS/RCS command page. The backend writes directly to `Ram`;
+/// `RingSpan` never points at a detached CPU copy.
+fn write_ring_commands(ram: &Ram, words: &[u32]) -> Result<(), Error> {
+    if words.is_empty() || words.len() & 1 != 0 {
+        return Err(Error::Refused);
+    }
+    let id = *ram.physical.first().ok_or(Error::Refused)?;
+    let ring = &mut intel_gt::intel_ring::Ring {
+        id,
+        vma: intel_gt::intel_ring::RingVma {
+            id,
+            size: PAGE,
+            stolen: false,
+            map_and_fenceable: false,
+            has_llc: true,
+            has_aperture: false,
+            has_read_only: false,
+            i830_or_i845g: false,
+        },
+        head: 0,
+        tail: 0,
+        emit: 0,
+        size: PAGE,
+        effective_size: PAGE,
+        space: PAGE - intel_gt::intel_ring::CACHELINE_BYTES,
+        wrap: 20,
+        // The caller retains the GGTT binding through the subsequent engine
+        // execution and retirement/reset boundary.
+        pin_count: AtomicUsize::new(1),
+    };
+    let request = intel_gt::intel_ring::Request {
+        ring_id: id,
+        reserved_space: 0,
+    };
+    let span = intel_gt::intel_ring::intel_ring_begin(
+        ring,
+        &request,
+        &intel_gt::intel_ring::Timeline::default(),
+        words.len(),
+        &mut RamRingBackend { ram },
+    )
+    .map_err(|_| Error::Refused)?;
+    intel_gt::intel_ring::intel_ring_emit(ring, span, words, &mut RamRingBackend { ram })
+        .map_err(|_| Error::Refused)
+}
+
+struct RamRingBackend<'a> {
+    ram: &'a Ram,
+}
+
+impl intel_gt::intel_ring::RingBackend for RamRingBackend<'_> {
+    fn ggtt_pin_bias(&mut self, _: &intel_gt::intel_ring::RingVma) -> u32 {
+        0
+    }
+    fn ggtt_pin(
+        &mut self,
+        _: &mut intel_gt::intel_ring::RingVma,
+        _: intel_gt::intel_ring::VmaFlags,
+    ) -> Result<(), intel_gt::intel_ring::RingError> {
+        Err(intel_gt::intel_ring::RingError::Invalid)
+    }
+    fn map_iomap(
+        &mut self,
+        _: &intel_gt::intel_ring::RingVma,
+    ) -> Result<(), intel_gt::intel_ring::RingError> {
+        Err(intel_gt::intel_ring::RingError::Invalid)
+    }
+    fn coherent_map(
+        &mut self,
+        _: &intel_gt::intel_ring::RingVma,
+    ) -> Result<(), intel_gt::intel_ring::RingError> {
+        Err(intel_gt::intel_ring::RingError::Invalid)
+    }
+    fn fill_ring_words(
+        &mut self,
+        _: &intel_gt::intel_ring::RingVma,
+        byte_offset: usize,
+        dwords: usize,
+        value: u32,
+    ) -> Result<(), intel_gt::intel_ring::RingError> {
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(dwords)
+            .map_err(|_| intel_gt::intel_ring::RingError::NoMemory)?;
+        words.resize(dwords, value);
+        self.ram
+            .dwords_at(byte_offset, &words)
+            .map_err(|_| intel_gt::intel_ring::RingError::Invalid)
+    }
+    fn write_ring_words(
+        &mut self,
+        _: &intel_gt::intel_ring::RingVma,
+        byte_offset: usize,
+        words: &[u32],
+    ) -> Result<(), intel_gt::intel_ring::RingError> {
+        self.ram
+            .dwords_at(byte_offset, words)
+            .map_err(|_| intel_gt::intel_ring::RingError::Invalid)
+    }
+    fn unmap_iomap(&mut self, _: &intel_gt::intel_ring::RingVma) {}
+    fn unmap_object(&mut self, _: &intel_gt::intel_ring::RingVma) {}
+    fn make_unshrinkable(&mut self, _: &intel_gt::intel_ring::RingVma) {}
+    fn make_purgeable(&mut self, _: &intel_gt::intel_ring::RingVma) {}
+    fn unset_ggtt_write(&mut self, _: &intel_gt::intel_ring::RingVma) {}
+    fn vma_unpin(&mut self, _: &mut intel_gt::intel_ring::RingVma) {}
+    fn ggtt_has_aperture_without_llc(&self) -> bool {
+        false
+    }
+    fn create_lmem(
+        &mut self,
+        _: usize,
+    ) -> Result<intel_gt::intel_ring::RingVma, intel_gt::intel_ring::RingError> {
+        Err(intel_gt::intel_ring::RingError::NoMemory)
+    }
+    fn create_stolen(
+        &mut self,
+        _: usize,
+    ) -> Result<intel_gt::intel_ring::RingVma, intel_gt::intel_ring::RingError> {
+        Err(intel_gt::intel_ring::RingError::NoMemory)
+    }
+    fn create_internal(
+        &mut self,
+        _: usize,
+    ) -> Result<intel_gt::intel_ring::RingVma, intel_gt::intel_ring::RingError> {
+        Err(intel_gt::intel_ring::RingError::NoMemory)
+    }
+    fn set_readonly(&mut self, _: &mut intel_gt::intel_ring::RingVma) {}
+    fn vma_instance(
+        &mut self,
+        vma: intel_gt::intel_ring::RingVma,
+    ) -> Result<intel_gt::intel_ring::RingVma, intel_gt::intel_ring::RingError> {
+        Ok(vma)
+    }
+    fn vma_put(&mut self, _: intel_gt::intel_ring::RingVma) {}
+    fn request_wait_interruptible_max(
+        &mut self,
+        _: intel_gt::intel_ring::TimelineRequest,
+    ) -> Result<(), intel_gt::intel_ring::RingError> {
+        Err(intel_gt::intel_ring::RingError::NoSpace)
+    }
+    fn request_retire_upto(&mut self, _: intel_gt::intel_ring::TimelineRequest) {}
 }
 
 fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
@@ -769,13 +2395,15 @@ fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
     io.write(base + 0x3a0, 0xffff0000 | (11 << 8) | 11)?;
     io.read(base + 0x3a0)?;
     fence(Ordering::SeqCst);
-    // Gen12 ELSQ writes port1 then port0, low then high, then explicit load.
+    // Submit the complete Gen12 port vector (including a zeroed unused port)
+    // before loading the ELSQ, as `execlists_submit_ports()` requires.
     let second = memory.switch.as_ref().map_or(0, |s| s.descriptor);
-    io.write(base + 0x518, second as u32)?;
-    io.write(base + 0x51c, (second >> 32) as u32)?;
-    io.write(base + 0x510, memory.descriptor as u32)?;
-    io.write(base + 0x514, (memory.descriptor >> 32) as u32)?;
-    io.write(base + 0x550, 1)?;
+    intel_gt::execlists::execlists_submit_ports(
+        io,
+        base + 0x510,
+        base + 0x550,
+        [memory.descriptor, second],
+    )?;
     let start = io.now_us();
     let mut value = [0u8; 4];
     for _ in 0..100_000 {
@@ -795,6 +2423,7 @@ fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
                 }
             }
             fence(Ordering::SeqCst);
+            consume_gen12_csb(memory, io)?;
             return Ok(());
         }
         if io.read(base + 0x0b8)? != 0 {
@@ -806,6 +2435,96 @@ fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
         io.delay_us(10);
     }
     Err(Error::Timeout(base + 0x550))
+}
+
+/// Poll the Gen12 HWS context-status buffer after the job's scratch breadcrumb
+/// completes. Every submit resets the pointer to slot 11; process the bounded
+/// circular buffer before the subsequent engine reset retires this context.
+fn consume_gen12_csb(memory: &Memory, io: &impl GtIo) -> Result<(), Error> {
+    let mut pointer = [0; 4];
+    memory.status.flush();
+    memory.status.read(0x2f * 4, &mut pointer)?;
+    let write_pointer = u32::from_le_bytes(pointer);
+    let tail = (write_pointer & 0xf) as usize;
+    if tail >= intel_gt::execlists::GEN12_CSB_ENTRIES {
+        return Err(Error::Refused);
+    }
+    let mut entries = [0; intel_gt::execlists::GEN12_CSB_ENTRIES];
+    let mut head = intel_gt::execlists::GEN12_CSB_ENTRIES - 1;
+    let engine_base = if memory.render { 0x2000 } else { 0x22000 };
+    while head != tail {
+        head = (head + 1) % intel_gt::execlists::GEN12_CSB_ENTRIES;
+        entries[head] = csb_read(memory, io, engine_base, head)?;
+    }
+    let progress = intel_gt::execlists::process_gen12_csb(
+        (intel_gt::execlists::GEN12_CSB_ENTRIES - 1) as u8,
+        write_pointer,
+        &entries,
+    )?;
+    if progress.consumed == 0 || progress.promoted == 0 {
+        return Err(Error::Refused);
+    }
+    Ok(())
+}
+
+/// `wa_csb_read()` — on TGL the HWSP store can be stale even after the write
+/// pointer advanced. Wait for the slot to leave its sentinel, then use the
+/// source MMIO status-buffer mirror as the last-resort value.
+/// upstream: intel_execlists_submission.c wa_csb_read()
+fn wa_csb_read(
+    memory: &Memory,
+    io: &impl GtIo,
+    engine_base: u32,
+    status_index: usize,
+) -> Result<u64, Error> {
+    let offset = 0x10 * 4 + status_index * 8;
+    let start = io.now_us();
+    loop {
+        let mut bytes = [0; 8];
+        memory.status.read(offset, &mut bytes)?;
+        let entry = u64::from_le_bytes(bytes);
+        if entry != u64::MAX {
+            return Ok(entry);
+        }
+        if io.now_us().saturating_sub(start) >= 10 {
+            break;
+        }
+        io.delay_us(1);
+    }
+
+    let register = if status_index < 6 {
+        engine_base
+            .checked_add(0x370 + (status_index as u32) * 8)
+            .ok_or(Error::Refused)?
+    } else {
+        engine_base
+            .checked_add(0x3c0 + ((status_index - 6) as u32) * 8)
+            .ok_or(Error::Refused)?
+    };
+    let low = io.read(register)?;
+    let high = io.read(register.checked_add(4).ok_or(Error::Refused)?)?;
+    Ok(u64::from(low) | (u64::from(high) << 32))
+}
+
+/// Read a CSB entry, fall back through the TGL write-order workaround, and
+/// poison the consumed HWSP slot so a later wrap cannot reuse stale data.
+/// upstream: intel_execlists_submission.c csb_read()
+fn csb_read(
+    memory: &Memory,
+    io: &impl GtIo,
+    engine_base: u32,
+    status_index: usize,
+) -> Result<u64, Error> {
+    let offset = 0x10 * 4 + status_index * 8;
+    let mut bytes = [0; 8];
+    memory.status.read(offset, &mut bytes)?;
+    let mut entry = u64::from_le_bytes(bytes);
+    if entry == u64::MAX {
+        entry = wa_csb_read(memory, io, engine_base, status_index)?;
+    }
+    memory.status.write(offset, &u64::MAX.to_le_bytes())?;
+    fence(Ordering::SeqCst);
+    Ok(entry)
 }
 
 // Outer error means quiescence was not established: caller MUST retain all
@@ -838,6 +2557,206 @@ fn execute_and_quiesce(io: &impl GtIo, memory: &Memory) -> Result<Result<(), Err
             Ok(())
         }
     }))
+}
+
+/// Register one synchronous user context with the booted Gen12 GuC, submit its
+/// LRC, and wait for the matching deregistration event before releasing the
+/// per-job GGTT mappings. The persistent SavedContext owns the LRC backing;
+/// the transient Memory remains pinned until GuC confirms deregistration.
+#[cfg(target_os = "none")]
+fn execute_guc_context(
+    bus: &super::Bus,
+    ads: Option<&AdsDmaMemory>,
+    ct_memory: Option<&mut CtDmaMemory>,
+    memory: &Memory,
+) -> Result<(), Error> {
+    if let Some(saved) = &memory.saved {
+        saved.valid.store(false, Ordering::Release);
+    }
+    let class = memory.engine_class;
+    let base = engine_mmio_base(class, memory.engine_instance)?;
+    let guc_class = intel_gt::guc_submission::engine_class_to_guc_class(class)?;
+    let engine = ads
+        .ok_or(Error::Refused)?
+        .input
+        .engines
+        .iter()
+        .find(|engine| engine.guc_class == guc_class && engine.instance == memory.engine_instance)
+        .ok_or(Error::Refused)?;
+    let engine_submit_mask = 1u32
+        .checked_shl(u32::from(engine.logical_index))
+        .ok_or(Error::Refused)?;
+    let ct = ct_memory.ok_or(Error::Refused)?;
+    if !ct.enabled {
+        return Err(Error::Refused);
+    }
+    let lease = ct
+        .submission
+        .allocate_single_id()
+        .map_err(|_| Error::Refused)?;
+    let context_id = match lease {
+        intel_gt::guc_submission::ContextIdLease::Single(id) => id,
+        intel_gt::guc_submission::ContextIdLease::Multi(_) => return Err(Error::Refused),
+    };
+    let info = intel_gt::guc_submission::context_registration_info(
+        context_id,
+        class,
+        engine_submit_mask,
+        memory.descriptor,
+        Some(intel_gt::guc_submission::GUC_CLIENT_PRIORITY_NORMAL),
+        None,
+        None,
+    )
+    .map_err(|_| Error::Refused)?;
+    let policy = intel_gt::guc_submission::ContextPolicy {
+        context_id,
+        priority: u32::from(intel_gt::guc_submission::GUC_CLIENT_PRIORITY_NORMAL),
+        execution_quantum_us: 1_000,
+        preemption_timeout_us: if memory.render { 7_500_000 } else { 640_000 },
+        slpc_frequency_request: 0,
+        preempt_to_idle: false,
+    };
+    ct.register_guc_context_v70(bus, info, policy, lease, &[], &[])?;
+    ct.submit_guc_context_request(bus, context_id, false)?;
+
+    let start = bus.now_us();
+    let mut scratch = [0; 4];
+    loop {
+        ct.receive_guc_submission_event(bus)?;
+        memory.context.flush();
+        memory
+            .context
+            .read(intel_gt::lrc::SCRATCH as usize, &mut scratch)?;
+        if u32::from_le_bytes(scratch) == 1 {
+            break;
+        }
+        if bus.read(base + 0xb8)? != 0 {
+            return Err(Error::Quarantined);
+        }
+        if bus.now_us().saturating_sub(start) > 500_000 {
+            return Err(Error::Timeout(base + 0x550));
+        }
+        bus.delay_us(10);
+    }
+
+    let mode_start = bus.now_us();
+    while ct
+        .submission
+        .context_state(context_id)
+        .is_none_or(|state| state.pending_enable())
+    {
+        ct.receive_guc_submission_event(bus)?;
+        if bus.now_us().saturating_sub(mode_start) > 500_000 {
+            return Err(Error::Timeout(base + 0x550));
+        }
+        bus.delay_us(50);
+    }
+
+    // Drain mode-change completions before retiring the context. Do not let a
+    // pending G2H event or an uncertain fence release transient GGTT memory.
+    let mut drained = false;
+    for _ in 0..16 {
+        if !ct.receive_guc_submission_event(bus)? {
+            drained = true;
+            break;
+        }
+    }
+    if !drained && !ct.receive_guc_submission_event(bus)? {
+        drained = true;
+    }
+    if !drained {
+        return Err(Error::Quarantined);
+    }
+    if !ct.guc_context_registered(context_id) {
+        return Err(Error::Quarantined);
+    }
+    ct.deregister_guc_context(bus, context_id)?;
+    let deregister_start = bus.now_us();
+    while ct.guc_context_registered(context_id) {
+        ct.receive_guc_submission_event(bus)?;
+        if bus.now_us().saturating_sub(deregister_start) > intel_gt::guc_ct::CTB_DEADLOCK_TIMEOUT_US
+        {
+            return Err(Error::Timeout(base + 0x550));
+        }
+        bus.delay_us(50);
+    }
+    if let Some(saved) = &memory.saved {
+        saved.valid.store(true, Ordering::Release);
+    }
+    Ok(())
+}
+
+/// ELSQ is only the boot/selftest submission path before GuC startup. Once MIA
+/// leaves reset, require the registered GuC CT route instead of writing ELSQ
+/// behind firmware's scheduler.
+#[cfg(target_os = "none")]
+fn execute_user_context(
+    bus: &super::Bus,
+    ads: Option<&AdsDmaMemory>,
+    ct_memory: Option<&mut CtDmaMemory>,
+    memory: &Memory,
+    guc_submission: bool,
+) -> Result<Result<(), Error>, Error> {
+    if guc_submission {
+        execute_guc_context(bus, ads, ct_memory, memory).map(Ok)
+    } else {
+        execute_and_quiesce(bus, memory)
+    }
+}
+
+/// Prepare shared engine state only while GuC is still in MIA reset. Once the
+/// firmware owns submission, require the CT scheduler path and avoid direct
+/// engine resets, ELSQ-era workarounds, and MOCS programming behind the GuC.
+#[cfg(target_os = "none")]
+fn prepare_user_engine(
+    owner: &mut super::Owner,
+    engine_class: u8,
+    engine_instance: u8,
+) -> Result<bool, Error> {
+    let render = engine_class == 0;
+    let _ = engine_mmio_base(engine_class, engine_instance)?;
+    owner.bus.assert_media_idle()?;
+    if owner.bus.read(0xc000)? & 1 == 0 {
+        if owner.ct_memory.as_ref().is_none_or(|ct| !ct.enabled) || owner.ads_memory.is_none() {
+            return Err(Error::Refused);
+        }
+        let guc_class = intel_gt::guc_submission::engine_class_to_guc_class(engine_class)?;
+        if !owner
+            .ads_memory
+            .as_ref()
+            .unwrap()
+            .input
+            .engines
+            .iter()
+            .any(|engine| engine.guc_class == guc_class && engine.instance == engine_instance)
+        {
+            return Err(Error::Refused);
+        }
+        return Ok(true);
+    }
+    if owner.ct_memory.as_ref().is_some_and(|ct| ct.enabled) {
+        // Firmware reset invalidates the registered CT/ADS submission state;
+        // do not fall back to ELSQ behind stale GuC registrations.
+        return Err(Error::Quarantined);
+    }
+    if engine_class >= 2 {
+        // The media engines have no direct-ELSQ fallback in this private
+        // caller; they require a live, matching GuC ADS/CT registration.
+        return Err(Error::Refused);
+    }
+    if render {
+        intel_gt::reset::stop_and_reset_rcs(&owner.bus)?;
+    } else {
+        intel_gt::reset::stop_and_reset_bcs(&owner.bus)?;
+    }
+    owner.bus.prepare_shared()?;
+    if render {
+        intel_gt::rcs::prepare(&owner.bus)?;
+    } else {
+        bcs::apply_nonpriv(&owner.bus, false)?;
+    }
+    intel_gt::cache::prepare(&owner.bus)?;
+    Ok(false)
 }
 
 #[cfg(target_os = "none")]
@@ -963,15 +2882,14 @@ pub(super) fn render_objects(
         return Err(Error::Quarantined);
     }
     super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
-    if owner.bus.read(intel_gt::uncore::GT_ACK)? & 1 == 0
-        || owner.bus.read(intel_gt::uncore::RENDER_ACK)? & 1 == 0
-        || owner.bus.read(0xc000)? & 1 == 0
+    let guc_submission = prepare_user_engine(owner, 0, 0)?;
+    if !guc_submission
+        && (owner.bus.read(0x480c)? != 0
+            || owner.bus.read(0x400c)? != 5
+            || owner.bus.read(0xb024)? >> 16 != 0x10)
     {
         return Err(Error::Refused);
     }
-    intel_gt::reset::stop_and_reset_rcs(&owner.bus)?;
-    owner.bus.prepare_shared()?;
-    intel_gt::rcs::prepare(&owner.bus)?;
     let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
     let operation = bcs::Copy {
         source: 0x11000,
@@ -988,7 +2906,12 @@ pub(super) fn render_objects(
     memory.vm = Some(vm.clone());
     memory.context = Arc::new(Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?);
     memory.render = true;
+    memory.engine_class = 0;
+    memory.engine_instance = 0;
     if saved.render != memory.render {
+        return Err(Error::Refused);
+    }
+    if saved.engine_class != 0 || saved.engine_instance != 0 {
         return Err(Error::Refused);
     }
     memory.context = saved.ram.clone();
@@ -1005,10 +2928,18 @@ pub(super) fn render_objects(
         &owner.bus,
     )?;
     memory.render_ring(&owner.bus)?;
-    let result = execute_and_quiesce(&owner.bus, memory)?;
+    let result = execute_user_context(
+        &owner.bus,
+        owner.ads_memory.as_ref(),
+        owner.ct_memory.as_mut(),
+        memory,
+        guc_submission,
+    )?;
     memory.release()?;
     owner.memory = None;
-    owner.bus.prepare_shared()?;
+    if !guc_submission {
+        owner.bus.prepare_shared()?;
+    }
     result
 }
 
@@ -1027,20 +2958,11 @@ pub(super) fn user_objects(
     }
     job.validate()?;
     super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
-    owner.bus.assert_media_idle()?;
-    if job.render {
-        intel_gt::reset::stop_and_reset_rcs(&owner.bus)?;
-    } else {
-        intel_gt::reset::stop_and_reset_bcs(&owner.bus)?;
-    }
-    owner.bus.prepare_shared()?;
-    if job.render {
-        intel_gt::rcs::prepare(&owner.bus)?;
-    } else {
-        bcs::apply_nonpriv(&owner.bus, false)?;
-    }
-    intel_gt::cache::prepare(&owner.bus)?;
-    if saved.render != job.render {
+    let guc_submission = prepare_user_engine(owner, job.engine_class, job.engine_instance)?;
+    if saved.render != job.render
+        || saved.engine_class != job.engine_class
+        || saved.engine_instance != job.engine_instance
+    {
         return Err(Error::Refused);
     }
     let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
@@ -1051,11 +2973,18 @@ pub(super) fn user_objects(
     memory.context = saved.ram.clone();
     memory.saved = Some(saved);
     memory.render = job.render;
+    memory.engine_class = job.engine_class;
+    memory.engine_instance = job.engine_instance;
     memory.selftest = false;
     memory.batch_address = sparse::normalize(job.batch)?;
     memory.user = Some(job);
-    memory.switch =
-        Some(Box::try_new(SwitchAway::new(memory.render)?).map_err(|_| Error::Refused)?);
+    memory.switch = Some(
+        Box::try_new(SwitchAway::new_engine(
+            memory.engine_class,
+            memory.engine_instance,
+        )?)
+        .map_err(|_| Error::Refused)?,
+    );
     owner.memory = Some(memory);
     let memory = owner.memory.as_mut().unwrap();
     memory.bind_and_build()?;
@@ -1068,10 +2997,18 @@ pub(super) fn user_objects(
     if memory.render {
         memory.render_ring(&owner.bus)?;
     }
-    let result = execute_and_quiesce(&owner.bus, memory)?;
+    let result = execute_user_context(
+        &owner.bus,
+        owner.ads_memory.as_ref(),
+        owner.ct_memory.as_mut(),
+        memory,
+        guc_submission,
+    )?;
     memory.release()?;
     owner.memory = None;
-    owner.bus.prepare_shared()?;
+    if !guc_submission {
+        owner.bus.prepare_shared()?;
+    }
     result
 }
 
@@ -1095,20 +3032,14 @@ pub(super) fn objects(
     if Arc::ptr_eq(&source, &destination) {
         return Err(Error::Refused);
     }
-    if owner.bus.read(intel_gt::uncore::GT_ACK)? & 1 == 0
-        || owner.bus.read(intel_gt::uncore::RENDER_ACK)? & 1 == 0
-        || owner.bus.read(0xc000)? & 1 == 0
-        || owner.bus.read(0x480c)? != 0
-        || owner.bus.read(0x400c)? != 5
-        || owner.bus.read(0xb024)? >> 16 != 0x10
+    let guc_submission = prepare_user_engine(owner, 1, 0)?;
+    if !guc_submission
+        && (owner.bus.read(0x480c)? != 0
+            || owner.bus.read(0x400c)? != 5
+            || owner.bus.read(0xb024)? >> 16 != 0x10)
     {
         return Err(Error::Refused);
     }
-    owner.bus.assert_media_idle()?;
-    // Last job and bootstrap must already be quiescent; bounded reset also
-    // establishes a fresh engine state before loading another private context.
-    intel_gt::reset::stop_and_reset_bcs(&owner.bus)?;
-    bcs::apply_nonpriv(&owner.bus, false)?;
     let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
     let mut memory = Memory::from_objects(gtt, source, destination, operation)?;
     memory.tables = vm.tables.clone();
@@ -1130,9 +3061,18 @@ pub(super) fn objects(
         memory.tables.physical[0],
         &owner.bus,
     )?;
-    let outcome = execute_and_quiesce(&owner.bus, memory)?;
+    let outcome = execute_user_context(
+        &owner.bus,
+        owner.ads_memory.as_ref(),
+        owner.ct_memory.as_mut(),
+        memory,
+        guc_submission,
+    )?;
     memory.release()?;
     owner.memory = None;
+    if !guc_submission {
+        owner.bus.prepare_shared()?;
+    }
     outcome
 }
 
@@ -1197,6 +3137,34 @@ pub(in crate::drm::intel) mod tests {
                 page = entry & (((1u64 << 39) - 1) & !4095);
             }
             Ok(page + (virtual_address & 4095))
+        }
+        // HOST MODEL ONLY: encode the Gen12 CSB records that real hardware
+        // writes after ELSQ promotion/context completion (intel_engine.h HWS
+        // offsets and intel_execlists_submission.c gen12_csb_parse format).
+        // Keep the production CSB validator active: a scratch breadcrumb alone
+        // is not enough to retire a submitted context.
+        fn record_csb(&self) -> Result<(), Error> {
+            let idle = 0x7ffu64 << 15;
+            let context = ((self.memory.descriptor >> 37) & 0x7ff) << 15;
+            let mut entries = [0u64; 3];
+            entries[0] = context | 1 | (idle << 32); // new queue promotion
+            let count = if let Some(switch) = &self.memory.switch {
+                let next = ((switch.descriptor >> 37) & 0x7ff) << 15;
+                entries[1] = next | (context << 32);
+                entries[2] = idle | (next << 32);
+                3
+            } else {
+                entries[1] = idle | (context << 32);
+                2
+            };
+            for (index, entry) in entries[..count].iter().enumerate() {
+                self.memory
+                    .status
+                    .write(0x10 * 4 + index * 8, &entry.to_le_bytes())?;
+            }
+            self.memory
+                .status
+                .write(0x2f * 4, &((count - 1) as u32).to_le_bytes())
         }
         fn switch_away(&self) -> Result<(), Error> {
             let Some(switch) = &self.memory.switch else {
@@ -1359,6 +3327,7 @@ pub(in crate::drm::intel) mod tests {
             if [0x22550, 0x2550].contains(&r) && self.execute {
                 self.gpu()?;
                 self.switch_away()?;
+                self.record_csb()?;
             }
             if self.fail_write.get() == Some(self.log.borrow().len()) {
                 self.fail_write.set(None);

@@ -3782,6 +3782,17 @@ version = "0.1.0"
 [[package]]
 name = "tk-intel-gt"
 version = "0.1.0"
+dependencies = [
+ "axlog",
+ "kernel_guard",
+ "memory_addr",
+ "spin 0.9.9",
+ "tk-axalloc",
+ "tk-axhal",
+ "tk-axmm",
+ "tk-axtask",
+ "tk-vtd",
+]
 
 [[package]]
 name = "tk-kernel"

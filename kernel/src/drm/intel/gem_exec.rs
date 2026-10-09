@@ -458,7 +458,8 @@ pub(super) fn exec_request(
     }
     let context = file.intel_contexts.lookup(r.context as u32)?;
     let mut context_job = context.lock();
-    let render = context_job.render_engine((r.flags & 0x3f) as u16)?;
+    let (engine_class, engine_instance) = context_job.engine_target((r.flags & 0x3f) as u16)?;
+    let render = engine_class == 0;
     let user = r.flags & BATCH_FIRST != 0;
     if (if user {
         r.count == 0 || r.count > 1024 || r.length == 0 || !r.length.is_multiple_of(8)
@@ -470,7 +471,8 @@ pub(super) fn exec_request(
                 } else {
                     44
                 }
-    }) || !r.start.is_multiple_of(8)
+    }) || (!user && engine_class >= 2)
+        || !r.start.is_multiple_of(8)
         || r.dr1 != 0
         || r.dr4 != 0
         || r.context >> 32 != 0
@@ -648,6 +650,8 @@ pub(super) fn exec_request(
                 .checked_add(u64::from(r.start))
                 .ok_or(AxError::InvalidInput)?,
             render,
+            engine_class,
+            engine_instance,
         };
         job.validate().map_err(|_| AxError::InvalidInput)?;
         Some(Arc::try_new(job).map_err(|_| AxError::NoMemory)?)
@@ -656,7 +660,8 @@ pub(super) fn exec_request(
         None
     };
     let vm = context_job.begin(file)?;
-    let image = context_job.image(file, (r.flags & 0x3f) as u16, render)?;
+    let image =
+        context_job.image_engine(file, (r.flags & 0x3f) as u16, engine_class, engine_instance)?;
     // Capture/wait producers before taking a shared VM execution gate: their
     // jobs may need the same root through another context.
     let _vm_job = vm.gate.lock();

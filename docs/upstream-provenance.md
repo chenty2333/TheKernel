@@ -1317,6 +1317,126 @@ or source-file classification. Do not describe this delta as MIT i915. The
 kernel-source provenance entries and license texts remain the authority for
 those files; this count reconciliation changes only the measured baseline.
 
+`crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c`, `__uc_fw_auto_select` platform GuC/HuC filename/version table for TGL/RKL/ADL-S/ADL-P (MIT, Copyright © 2016-2019 Intel Corporation); ADL-N selects ADL-S firmware, while its runtime platform defaults remain ADL-P/N. Metadata only; no binary included.
+
+`crates/ax/tk-intel-gt/src/uc.rs::parse_css`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c::__check_ccs_header` size-field validation, translated with checked arithmetic (MIT, Copyright © 2016-2019 Intel Corporation); WOPCM and file-size checks retained.
+
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc_fw.c::guc_load_done`, terminal GuC/BootROM status decoding (MIT, Copyright © 2014-2019 Intel Corporation); register access remains through existing `GtIo`.
+
+`crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c::uc_unpack_css_version` and `guc_read_css_info`, CSS ABI version extraction and GuC 69/70 compatibility branches (MIT, Copyright © 2016-2019 Intel Corporation).
+
+`crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc.c::uc_expand_default_options`, Gen12 TGL/RKL/ADL-S/ADL-P GuC/HuC defaults (MIT, Copyright © 2016-2019 Intel Corporation); ADL-N follows the default branch and enables both HuC authentication and GuC submission.
+
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc_fw.c::guc_prepare_xfer`, Gen12.0 shim-control and doorbell-enable writes in source order (MIT, Copyright © 2014-2019 Intel Corporation).
+
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc_fw.c::guc_wait_ucode`, readiness polling with three one-second default release attempts (MIT, Copyright © 2014-2019 Intel Corporation); status reads use `GtIo`.
+
+`crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c::intel_uc_check_file_version`, selected/wanted major validation and older-minor/patch classification for the non-overridden supported path (MIT, Copyright © 2016-2019 Intel Corporation).
+
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c::uc_fw_xfer`, source/destination/size/control programming and completion poll order (MIT, Copyright © 2016-2019 Intel Corporation); ambiguous DMA retirement fails closed.
+
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `intel_guc_fw.c::intel_guc_fw_upload`/`guc_xfer_rsa_mmio` and `intel_huc_fw.c::intel_huc_fw_upload`, Gen12.0 RSA scratch, WOPCM destination and HuC ukernel DMA paths (MIT, Copyright © 2014-2019 Intel Corporation); GGTT source residency/forcewake are explicit caller inputs.
+
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_huc.c::intel_huc_is_authenticated` and `intel_huc_wait_for_auth_complete`, `GEN11_HUC_KERNEL_LOAD_INFO` / `HUC_LOAD_SUCCESSFUL` poll for Gen11+ (MIT, Copyright © 2014-2019 Intel Corporation); GuC authentication is sent through the MMIO HXG transport, while GuC CT remains unimplemented.
+
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc.c::intel_guc_send_mmio` and `intel_guc_auth_huc`, Gen11+ HXG busy/retry/failure handling and HuC-auth action transport (MIT, Copyright © 2014-2019 Intel Corporation); register ownership and forcewake remain with the caller.
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc.c::guc_send_reg` and `intel_guc_notify`, four-dword GuC send-register indexing and H2G notification write (MIT, Copyright © 2014-2019 Intel Corporation).
+
+`crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `include/drm/intel/pciids.h` TGL/RKL/ADL-S/ADL-P/ADL-N device-ID tables (MIT, Copyright 2013 Intel Corporation), translated to a runtime `Platform` selector.
+`crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.h::intel_uc_fw_status`, the uC firmware phase enum and fetch/init/upload state transitions (MIT, Copyright © 2014-2019 Intel Corporation); unavailable and invalid fetches remain typed loader errors.
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc_fw.c::guc_wait_ucode`, BootROM/GuC failure classification and source error mapping for key, signature, exception, save/restore, KLV, and HWCONFIG failures (MIT, Copyright © 2014-2019 Intel Corporation).
+`crates/ax/tk-intel-gt/src/guc_config.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc.c::{guc_ctl_debug_flags,guc_ctl_feature_flags,guc_ctl_log_params_flags,guc_ctl_ads_flags,guc_ctl_wa_flags,guc_ctl_devid,guc_init_params,intel_guc_write_params}` and `intel_guc_fwif.h`, GuC control block flags and soft-scratch serialization (MIT, Copyright © 2014-2019 Intel Corporation); parameter calculation is implemented, but GuC ADS/log allocations and runtime call-site wiring remain pending.
+`crates/ax/tk-intel-gt/src/guc_log.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc_log.c` sizing/default-level/section-offset, overflow accounting and debug/crash ring-snapshot helpers plus `intel_guc_log.h`/`intel_guc_fwif.h` state ABI (MIT, Copyright © 2014-2019 Intel Corporation); buffer GGTT allocation, interrupt/workqueue handling, and user relay endpoint are not wired.
+`crates/ax/tk-intel-gt/src/guc_ct.rs`: Linux 7.2.3 `intel_guc_ct.c` CTB ring/reset/send/response, receive credit handling, inline TLB completion, FIFO deferred-event dispatch, explicit disable and `intel_guc_send_busy_loop()` helpers plus the complete constant/layout surface of `guc_communication_ctb_abi.h`, `guc_communication_mmio_abi.h`, and `guc_messages_abi.h` (MIT, Copyright © 2014-2021 Intel Corporation; C driver Copyright © 2016-2019 Intel Corporation); CT VMA allocation and self-config/enable registration are wired for the default-submission path; VMA fini/owner teardown, IRQ/tasklet/workqueue dispatch and H2G client callsites remain pending.
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `intel_guc.c::{__guc_action_self_cfg,__guc_self_cfg,intel_guc_self_cfg32,intel_guc_self_cfg64}` and `guc_actions_abi.h`/`guc_klvs_abi.h`, MMIO self-config KLV request layout and 32/64-bit value handling (MIT, Copyright © 2014-2021 Intel Corporation).
+`crates/ax/tk-intel-gt/src/huc.rs`: Linux 7.2.3 `intel_huc.c::{intel_huc_is_authenticated,intel_huc_wait_for_auth_complete,intel_huc_auth,intel_huc_check_status}` Gen11+/Gen12 legacy GuC-auth path (MIT, Copyright © 2016-2019 Intel Corporation); GSC/MEI delayed-load modes are excluded for the TGL/RKL/ADL integrated target.
+`crates/ax/tk-intel-gt/src/guc_submission.rs`: Linux 7.2.3 `intel_guc_submission.c` scheduler state/request scheduling and G2H completion plus context-reset/engine-failure payload validation, contiguous multi-LRC/single-LRC ID partitions, v69 descriptor pool layout/reset and v69/v70 descriptor/registration/policy packets, a CTB-backed context state facade, parent-scratch v69/v70 layout, circular multi-LRC work-queue append, and `intel_guc_fwif.h` v69/v70 registration/process/WQ descriptor ABI (MIT, Copyright © 2014-2019 Intel Corporation); kernel CT owner exposes register/submit/receive adapters but no engine context lifecycle or IRQ/tasklet caller is wired; preemption/reset flow remain pending.
+`crates/ax/tk-intel-gt/src/guc_ads.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc_ads.c` and `intel_guc_fwif.h`, GuC ADS ABI/layout, policy update, source engine-class maps, first default-LRC selection, `guc_mmio_regset_init()` ring/WA/whitelist/MOCS/EU-perf entry packing and steering flags, Gen12 12.55 LRC skip-size, golden-context/capture/WAKLV/private-data sections, full blob reset, and engine-usage offsets (MIT, Copyright © 2014-2019 Intel Corporation); live GT engine/default-state/MCR collection and startup parameter wiring remain pending. `kernel/src/drm/intel/gt/copy.rs` adds an input-driven pinned ADS VMA allocator/reset owner, not yet invoked by GT startup.
+`crates/ax/tk-intel-gt/src/guc_capture.rs`: Linux 7.2.3 `intel_guc_capture.c` and `guc_capture_fwif.h` error-capture null header, output-size/3x buffer assessment, ring counters, wrap-safe dword extraction, capture-group/data/register header decoding, unknown-type skipping, dependent-engine node grouping with shared list cloning, preallocated 1536-node cache with bounded register arrays and outlist reuse, context/engine/LRCA node matching and IPEHR/INSTDONE extraction, ADS list/null-header cache, Xe_LP static register offsets/names, slice/subslice steered-register expansion and 12.55+ geometry register gate, base/ext register-list selection, page-aligned ADS capture-list serialization and coredump text formatting adapter (MIT, Copyright © 2021-2022 Intel Corporation); `guc_log::process_capture_log()` snapshots/acks shared state and `copy::handle_guc_capture_notification()` drains it into the cache and sends CT flush-complete; G2H IRQ/workqueue caller, cache destroy lifecycle, ADS registration and coredump hookup remain pending.
+`crates/ax/tk-intel-gt/src/guc_log.rs`: Linux 7.2.3 `intel_guc_log.c`/`intel_guc_log.h` log sizing, default log-level policy, overflow/ring snapshot, control/flush action ABI and state-after-success log-level controller (MIT, Copyright © 2014-2019 Intel Corporation); `kernel/src/drm/intel/gt/copy.rs` has a zeroed pinned log-VMA allocator, but GUC_CTL params, relay lifecycle, workqueue and CT action callers remain pending.
+`crates/ax/tk-intel-gt/src/wopcm.rs`: Linux 7.2.3 `gt/intel_wopcm.c`, Gen12 WOPCM partition layout, GuC/HuC firmware and reserved-region bounds, BIOS lock-state decoding, `uc_init_wopcm()` register write/readback verification (MIT, Copyright © 2017-2019 Intel Corporation); called before GT firmware DMA for the integrated GT targets; media-GT/deprivileged partition discovery remains unsupported.
+`kernel/src/drm/intel/gt/copy.rs`: ADS/log GGTT VMA owner adapters based on `intel_guc_ads.c::intel_guc_ads_create()` and `intel_guc_log.c::intel_guc_log_create()`, address-checked `intel_guc_write_params()` scratch publication, workqueue-side debug-log snapshot/ack and capture notification drain/CT flush-complete adapters (MIT); allocate, bind, initialize and retain buffers once configured. Runtime GT-derived ADS inputs/options, firmware-loader/IRQ/workqueue callers, relay output delivery and teardown remain pending.
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `intel_guc.c` `intel_guc_suspend()` / `intel_guc_resume()` CLIENT_SOFT_RESET action, ignore-on-failure behavior and GuC-domain sanitize/reset policy (MIT, Copyright © 2014-2021 Intel Corporation); PM/runtime suspend callback and retained CT/ADS/log owner teardown are not wired.
+`crates/ax/tk-intel-gt/src/reset.rs`: Linux 7.2.3 `gt/intel_reset.c` `intel_reset_guc()`/`__reset_guc()` Gen12 GuC-only GDRST domain reset, pre-12.70 double-reset policy and settling delay (MIT, Copyright © 2008-2018 Intel Corporation); wired before HuC/GuC firmware transfer; display/global reset domains remain excluded.
+`kernel/src/drm/intel/gt/copy.rs`: N305-only GuC boot sequence now sizes/pins ADS and baseline log buffers, publishes GUC_CTL scratch parameters before GuC DMA, then initializes CTB self-config and verifies a control-action HXG response over CTB, using upstream `intel_guc_ads.c`, `intel_guc_log.c`, `intel_guc.c`, and `intel_guc_ct.c` behavior (MIT); runtime ADS MMIO regsets/golden contexts/capture lists, async CT IRQ/event dispatch and non-N305 ADS callers remain pending.
+`crates/ax/tk-intel-gt/src/intel_ring.rs`: Linux 7.2.3 `gt/intel_ring.c` ring-space update, pin/unpin/map unwind, reset, GEM VMA fallback, engine ring creation/free, timeline request space wait, wrap/noop emission and begin reservation (MIT, Copyright © 2019 Intel Corporation); GPU object/GGTT/timeline calls are behind a narrow backend and the GuC/execlists call sites remain to be wired.
+`kernel/src/drm/intel/gt/copy.rs`: N305 GuC video engine inventory now preserves the physical VDBOX enable mask while compacting logical VCS IDs in upstream `intel_engine_cs.c::setup_logical_ids()` order (MIT); ADL-N VCS0/VCS2 maps to GuC table columns 0/1 -> physical instances 0/2.
+`crates/ax/tk-intel-gt/src/intel_ring.rs`: ring mappings now remain owned by the GGTT backend rather than copied into a detached `Vec`; `intel_ring_begin()` returns an offset/length `RingSpan`, with `intel_ring_emit()` writing through the backend mapping to preserve hardware-visible ring contents (Rust adapter for MIT `intel_ring.c` semantics).
+`kernel/src/drm/intel/gt/copy.rs`: private prebound BCS/RCS command-ring pages now use `tk-intel-gt::intel_ring::{intel_ring_begin,intel_ring_emit}` to reserve and write the source ring bytes directly through `Ram`/GGTT backend (MIT `intel_ring.c`); the current ELSQ submit path and GuC/execlists production caller remain unchanged.
+`crates/ax/tk-intel-gt/src/execlists.rs`: Linux 7.2.3 `gt/intel_execlists_submission.c` `write_desc()` and `execlists_submit_ports()` implement descriptor dword order, clearing every Gen12 ELSQ slot in reverse order, and explicit queue load (MIT, Copyright © 2014 Intel Corporation); wired into the existing private BCS/RCS submit path, while execlists scheduling, CSB completion, preemption, and GuC production submission remain unintegrated.
+`crates/ax/tk-intel-gt/src/execlists.rs`: `__gen12_csb_parse()` and `gen12_csb_parse()` translate Gen12 CSB completion/status decoding from `intel_execlists_submission.c`; upstream `GEM_BUG_ON` invariants return `Error::Refused` in the callable adapter. CSB interrupt/tasklet scheduler dispatch has not yet been connected.
+`crates/ax/tk-intel-gt/src/execlists.rs`: `process_gen12_csb()` drains the 12-entry Gen11/12 HWS status ring through the source decoder; `copy.rs::consume_gen12_csb()` reads HWS slots after a completed synchronous BCS/RCS job, before reset. This polling caller does not implement the upstream IRQ/tasklet state machine or scheduling actions.
+`kernel/src/drm/intel/gt/copy.rs`: `csb_read()` / `wa_csb_read()` mirror the TGL 10us stale-HWSP wait and GEN8/GEN11 MMIO fallback for each status entry, then write the consumed `U64_MAX` sentinel; `gt.rs` admits only the corresponding read-only BCS/RCS MMIO status ranges.
+`kernel/src/drm/intel/gt/copy.rs`: GuC submission G2H receive now retains valid non-event response completions for their fence waiters while publishing the updated shared receive head; event-class handling remains limited to context scheduling and deregistration until the async event workers are connected.
+`kernel/src/drm/intel/gt/copy.rs`: adds a CT adapter to finish a previously received GuC submission response by fence and return its reserved G2H credits to the shared blob; scheduling/deregister G2H events remain the only event actions currently dispatched.
+`kernel/src/drm/intel/gt/copy.rs` and `crates/ax/tk-intel-gt/src/guc_submission.rs`: N305 single-LRC BCS jobs now use Gen12 v70 context registration, normal scheduling policy, context-mode submit, HWS scratch polling, and a GuC deregistration event before transient LRC/ring GGTT bindings are retired; only while GuC remains in MIA reset do user jobs use direct ELSQ. This adapter does not implement general GuC request queues, preemption, async IRQ handling, RCS GuC WAs, or media-engine execution.
+`crates/ax/tk-intel-gt/src/guc_ads.rs` and `kernel/src/drm/intel/gt/copy.rs`: pass and reserve page-aligned full LRC image sizes in ADS, while writing `engine_state_size` as full size minus upstream `LRC_SKIP_SIZE` (MIT `intel_guc_ads.c::guc_prep_golden_context` / `guc_init_golden_context`). This keeps each golden-context slot and following ADS region at the upstream offset.
+`kernel/src/drm/intel/gt/copy.rs`: feeds retained, hardware-captured BCS and optional RCS default LRC images through `guc_ads::guc_init_golden_contexts()` into the startup ADS; absent render/media defaults remain zeroed while full slots stay reserved, matching `intel_guc_ads.c::guc_init_golden_context` (MIT).
+`kernel/src/drm/intel/gt/copy.rs` and `crates/ax/tk-intel-gt/src/guc_ads.rs`: N305 GuC ADS builds Gen12.0 save/restore MMIO regsets for RCS0, BCS0 and fuse-enabled VCS/VECS instances from discovered DSS steering and upstream register/MOCS/WA inputs; `guc_ads.rs::EngineRegsetInput` retains all seven EU performance registers required by `intel_guc_ads.c::guc_mmio_regset_init()` (MIT). Existing render objects can take the synchronous GuC context register/schedule route; media submission callers remain pending.
+`crates/ax/tk-intel-gt/src/lrc.rs` and `bcs.rs`: Gen12 XCS LRC and flush/ring generation now parameterize the upstream `gen12_xcs_offsets`, `lrc_update_regs`/`lrc_descriptor`, `gen12_get_aux_inv_reg`/`gen12_emit_aux_table_inv`, and `gen12_emit_flush_xcs` rules for BCS0/VCS0/VCS2/VECS0 (Linux 7.2.3, MIT, Intel copyright lines retained in their source modules). BCS keeps its prior API; video-class callers are not wired yet.
+`crates/ax/tk-intel-gt/src/intel_engine_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/intel_engine_types.h` MIT owner-record binding; `IntelEngineCs` now consumes this `IntelEngineCs`/execlists/props/WAs/breadcrumb/scheduler/context/timeline type graph, with x86_64 size/offset assertions. Remaining Linux GT services are compatibility-layer bindings, not duplicated records.
+`crates/ax/tk-intel-gt/src/intel_gt_types_upstream.rs`: Linux 7.2.3 `gt/intel_gt_types.h` MIT `IntelGt` record and nested engine-map/info/WAs/PM/UC state; now uses owner modules for GSC, UC, RC6, reset, RPS, SSEU, wakeref, WOPCM, LLC, HW config, migrate, and buffer pool where available; ABI assertions guard the x86_64 layout.
+`crates/ax/tk-intel-gt/src/intel_context_types_upstream.rs`: Linux 7.2.3 `gt/intel_context_types.h` MIT context, flags, ops and inline predicate records; target config and C-probed ABI offsets are asserted.
+`crates/ax/tk-intel-gt/src/i915_request_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/i915_request.h` MIT request/fence records and source-config capture-error layout.
+`crates/ax/tk-intel-gt/src/i915_scheduler_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/i915_scheduler_types.h` MIT scheduler attributes/nodes/dependencies/engine records and callback ABI.
+`crates/ax/tk-intel-gt/src/i915_gem_context_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_context_types.h` MIT by-value context records and target layout assertions.
+`crates/ax/tk-intel-gt/src/intel_breadcrumbs_types_upstream.rs`: Linux 7.2.3 `gt/intel_breadcrumbs_types.h` MIT exact breadcrumb fields and callback ABI.
+`crates/ax/tk-intel-gt/src/intel_timeline_types_upstream.rs`: Linux 7.2.3 `gt/intel_timeline_types.h` MIT field-order/layout binding; timeline C translation imports this owner type directly.
+`crates/ax/tk-intel-gt/src/intel_lrc_types_upstream.rs`: Linux 7.2.3 `gt/intel_lrc.h` MIT source constants, enum values and inline bit-field helpers.
+`crates/ax/tk-intel-gt/src/intel_lrc_reg_types_upstream.rs`: Linux 7.2.3 `gt/intel_lrc_reg.h` MIT register offsets and PDP helper macros.
+`crates/ax/tk-intel-gt/src/intel_workarounds_types_upstream.rs`: Linux 7.2.3 `gt/intel_workarounds_types.h` MIT register unions, WA record, and bitfield storage/accessors; `intel_workarounds_upstream.rs` uses these header records.
+`crates/ax/tk-intel-gt/src/intel_wakeref_types_upstream.rs`: Linux 7.2.3 `intel_wakeref.h` MIT owner records, constants, inline references and out-of-line API bindings; 144-byte config is debug-wakeref-disabled.
+`crates/ax/tk-intel-gt/src/intel_sseu_types_upstream.rs`: Linux 7.2.3 `gt/intel_sseu.h` MIT SSEU masks/device-info, source enum/bit constants and inline helper declarations; x86_64 bitfield storage and layouts are asserted.
+`crates/ax/tk-intel-gt/src/intel_uc_fw_types_upstream.rs`: Linux 7.2.3 `gt/uc/intel_uc_fw.h` MIT firmware records, status/type enums and firmware state predicates; embeds the canonical 296-byte capture-error VMA resource and asserts its 416-byte outer ABI.
+`crates/ax/tk-intel-gt/src/i915_vma_resource_types_upstream.rs`: Linux 7.2.3 `i915_vma_resource.h` MIT page-size, bindinfo and VMA-resource records with capture-error-enabled bitfield storage and fixed target offsets.
+`crates/ax/tk-intel-gt/src/intel_guc_types_upstream.rs`: Linux 7.2.3 `gt/uc/intel_guc.h` MIT GuC/state/timestamp/interrupt records, constants and inline firmware-state predicates; includes the owner CT/log/SLPC/firmware/SSEU dependencies.
+`crates/ax/tk-intel-gt/src/intel_guc_ct_types_upstream.rs`: Linux 7.2.3 `gt/uc/intel_guc_ct.h` MIT CT buffer/requests/transport records and source action constants under the configured debug-off ABI.
+`crates/ax/tk-intel-gt/src/intel_guc_submission_types_upstream.rs`: Linux 7.2.3 `gt/uc/intel_guc_submission.h` MIT submission prototypes and capability predicates with canonical GuC/engine/request owner types.
+`crates/ax/tk-intel-gt/src/intel_guc_log_types_upstream.rs`: Linux 7.2.3 `gt/uc/intel_guc_log.h` MIT log state/section records, level constants/macros, and target 224-byte ABI assertions.
+`crates/ax/tk-intel-gt/src/intel_guc_slpc_types_upstream.rs`: Linux 7.2.3 `gt/uc/intel_guc_slpc_types.h` MIT SLPC state record and reset timeout constant; target 120-byte ABI.
+`crates/ax/tk-intel-gt/src/intel_guc_slpc_upstream.rs`: Linux 7.2.3 `gt/uc/intel_guc_slpc.h` MIT SLPC inline state helpers and C API declarations.
+`crates/ax/tk-intel-gt/src/intel_huc_types_upstream.rs`: Linux 7.2.3 `gt/uc/intel_huc.h` MIT HuC records/enums/constants, inline state helpers and C declarations; target layout assertions cover the 608-byte HuC state.
+`crates/ax/tk-intel-gt/src/intel_guc_rc_types_upstream.rs`: Linux 7.2.3 `gt/uc/intel_guc_rc.h` MIT RC predicates and C API declarations, delegating submission-used policy to its owner header.
+`crates/ax/tk-intel-gt/src/intel_gsc_types_upstream.rs`: Linux 7.2.3 `gt/intel_gsc.h` MIT distinct graphics security controller/interface record and C API declarations.
+`crates/ax/tk-intel-gt/src/intel_gsc_uc_types_upstream.rs`: Linux 7.2.3 `gt/uc/intel_gsc_uc.h` MIT GSC firmware/proxy record, action bits, state helpers and API declarations; target state size576.
+`crates/ax/tk-intel-gt/src/intel_rc6_types_upstream.rs`: Linux 7.2.3 `gt/intel_rc6_types.h` MIT residency record, enum aliases and target 104-byte ABI.
+`crates/ax/tk-intel-gt/src/intel_reset_types_upstream.rs`: Linux 7.2.3 `gt/intel_reset_types.h` MIT reset state/flag masks; embeds the configured 32-byte tree-SRCU ABI.
+`crates/ax/tk-intel-gt/src/intel_rps_types_upstream.rs`: Linux 7.2.3 `gt/intel_rps_types.h` MIT RPS/IPS/EI/frequency-capability records and enum values; target 280-byte ABI.
+`crates/ax/tk-intel-gt/src/intel_wopcm_types_upstream.rs`: Linux 7.2.3 `gt/intel_wopcm.h` MIT WOPCM record, GuC subrecord, inline accessors and initialization declarations.
+`crates/ax/tk-intel-gt/src/intel_hwconfig_types_upstream.rs`: Linux 7.2.3 `gt/intel_hwconfig.h` MIT size/pointer owner record and init/fini declarations.
+`crates/ax/tk-intel-gt/src/intel_migrate_types_upstream.rs`: Linux 7.2.3 `gt/intel_migrate_types.h` MIT embedded migrate-context record.
+`crates/ax/tk-intel-gt/src/intel_llc_types_upstream.rs`: Linux 7.2.3 `gt/intel_llc_types.h` MIT target-config empty LLC record.
+`crates/ax/tk-intel-gt/src/intel_gt_buffer_pool_types_upstream.rs`: Linux 7.2.3 `gt/intel_gt_buffer_pool_types.h` MIT buffer-pool/node records and anonymous union with source-compatible field access paths.
+`crates/ax/tk-intel-gt/src/intel_migrate_upstream.rs`: Linux 7.2.3 `gt/intel_migrate.h` MIT C API declarations using the separate `intel_migrate_types.h` owner record; migration implementation and runtime callers remain pending.
+`crates/ax/tk-intel-gt/src/linux/srcu.rs`: target-bound Linux 7.2.3 `include/linux/srcutree.h` `srcu_struct` storage for CONFIG_TREE_SRCU=y/CONFIG_LOCKDEP=n; this is an embedded LinuxKPI record, not an SRCU runtime implementation.
+`crates/ax/tk-intel-gt/src/intel_uncore_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/intel_uncore.h` MIT full uncore/MMIO/forcewake owner records, function tables, raw 64-bit access order, inline flag and wait helpers, and API declarations; replaces the partial prefix in the workarounds C translation.
+`crates/ax/tk-intel-gt/src/intel_engine_regs_upstream.rs`: Linux 7.2.3 `gt/intel_engine_regs.h` MIT register-offset constructors, ring/PP/Execlist/SFC constants and parameterized register/field macros.
+`crates/ax/tk-intel-gt/src/intel_uc_types_upstream.rs`: Linux 7.2.3 `gt/uc/intel_uc.h` MIT uC ops/state record, all source state-checker wrappers, idle-wait and ops dispatch helpers, with canonical GSC/Guc/HuC/RC/SLPC owners.
+`crates/ax/tk-intel-gt/src/intel_gt_api_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/intel_gt.h` MIT declarations, inline GT helpers, source range/step checks, and GT/engine iteration macros. `GT_TRACE` is left at the unavailable `GEM_TRACE` framework boundary.
+`crates/ax/tk-intel-gt/src/intel_gt_defines_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/intel_gt_defines.h` MIT `I915_MAX_GT` source constant.
+`crates/ax/tk-intel-gt/src/i915_vma_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/i915_vma_types.h` MIT VMA flag constants and complete source-order `I915Vma` record with target size/offset assertions. The adjacent GTT-view BUILD_BUG_ON helper remains omitted until its owning type header is translated.
+`crates/ax/tk-intel-gt/src/i915_vma_api_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/i915_vma.h` MIT declarations, inline state/flag helpers, active/pin/list/sync APIs, and GGTT list iteration; explicit remaining boundaries are documented in the file.
+`crates/ax/tk-intel-gt/src/intel_ring_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/intel_ring_types.h` MIT ring ABI/constants; the canonical 56-byte `IntelRing` replaces the former context-source duplicate.
+`crates/ax/tk-intel-gt/src/i915_request_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/i915_request.c` MIT request/fence source translation; ctags coverage 84/84 function markers.
+`crates/ax/tk-intel-gt/src/i915_scheduler_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/i915_scheduler.c` MIT scheduler source translation; ctags coverage 23/23 function markers.
+`crates/ax/tk-intel-gt/src/intel_guc_fwif_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc_fwif.h` MIT ABI constants, structures, enums and inline helpers.
+`crates/ax/tk-intel-gt/src/intel_guc_actions_abi_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/abi/guc_actions_abi.h` MIT action constants/enums, including TLB invalidation ABI.
+`crates/ax/tk-intel-gt/src/intel_gt_mcr_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/intel_gt_mcr.h` MIT MCR declarations and subslice steering iteration semantics.
+`crates/ax/tk-intel-gt/src/i915_gem_object_types_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_object_types.h` MIT GEM object/MM/VMA/MMO records, owner operations and target-config layout assertions.
+`crates/ax/tk-intel-gt/src/i915_gem_shmem_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_shmem.c` MIT source translation; ctags coverage 21/21 function markers.
+`crates/ax/tk-intel-gt/src/i915_gem_object_header_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_object.h` MIT active inline functions, source order (46 configured definitions); consumes the separate page/object API owners and documents unresolved DRM `idr_find`/GEM-free service bindings.
+`crates/ax/tk-intel-gt/src/i915_gem_context_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_context.c` MIT source translation, registered for compile integration; its framework calls remain dependent on task/signal, DRM-client, tracepoint, mutex, and engine bindings.
+`crates/ax/tk-intel-gt/src/intel_ring_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/intel_ring.c` MIT source translation, registered for compile integration; ring allocation/pinning and request/active dependencies remain incomplete.
+`crates/ax/tk-intel-gt/src/intel_context_api_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/intel_context.h` MIT active inline/API helper translation for CONFIG_LOCKDEP=n and replay API disabled; 41/41 target-active functions in source order.
+`crates/ax/tk-intel-gt/src/linux/average.rs`: Independent fixed-point EWMA expansions for the source-configured `DECLARE_EWMA(runtime, 3, 8)` and `DECLARE_EWMA(_engine_latency, 6, 4)` layouts.
+`crates/ax/tk-intel-gt/src/linux/i915_trace.rs`: Typed source-config dispatch for the i915 trace-event header's disabled `CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS` branch; target config is checked at compile time.
+`crates/ax/tk-intel-gt/src/i915_drm_client_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/i915_drm_client.c` MIT source translation (10/10 C functions plus the two header get/put helpers), registered for feature-build integration.
+`crates/ax/tk-intel-gt/src/i915_gem_shrinker_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_shrinker.c` MIT translation, 19/19 source-order functions. Canonical object/VMA/GT owner imports are wired; task-specific Linux shrinker/reclaim/notifier/runtime-PM APIs remain explicit unresolved dependencies.
+`crates/ax/tk-intel-gt/src/i915_active_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/i915_active.c` MIT source translation; all 67 source functions are present in source order.
+`crates/ax/tk-intel-gt/src/i915_sw_fence_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/i915_sw_fence.c` MIT source translation; all 42 configured source functions are present in source order (LOCKDEP, debug objects and DAG checker disabled by target config).
+`crates/ax/tk-intel-gt/src/i915_gem_ww_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/i915_gem_ww.c` MIT source translation and 56-byte target `I915GemWwCtx` owner.
+`crates/ax/tk-intel-gt/src/i915_gem_object_api_upstream.rs`: MIT i915 GEM object-header API bindings using the canonical GEM object owner and LinuxKPI reference/WW-lock primitives.
+`crates/ax/tk-intel-gt/src/intel_ring_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/intel_ring.c` MIT source translation, integrated against canonical `IntelRing`/VMA/request owners; complete package feature build remains blocked by missing surrounding APIs.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxvar.h` (ISC): AX211 So-F/So GF runtime configuration predicates and associated firmware/PNVM configuration translated in `tk-axdriver-iwx/src/config.rs`; ISC text in that crate's `LICENSES/ISC.txt`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): TLV firmware-header, section and supported-capability parsing adapted in `tk-axdriver-iwx/src/firmware.rs`; ISC text in that crate's `LICENSES/ISC.txt`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): PNVM SKU, hardware-type and runtime-section selection from `iwx_pnvm_parse()` / `iwx_pnvm_handle_section()` adapted in `tk-axdriver-iwx/src/firmware.rs`; ISC text in that crate's `LICENSES/ISC.txt`.
@@ -1714,3 +1834,68 @@ in the earlier reconciliation. `crates/ax` is now `(0,0,0,284,130,0,0)` at >=40
 and `(18,15,4,407,249,0,0)` at >=25. The combined inventory includes the
 BSD/ISC-source register/control matches documented by main as well as the MIT
 i915 matches; hash identity alone does not classify their license or source.
+
+## G2 closeout / merged-main excerpt measurement (2026-10-09)
+
+After merging `origin/main` (`cb70f258`) with the opt-in GT source translations,
+`scan_linux_excerpts.py` against the local Linux 7.2.3 tree measures the following
+current whole-scope totals. These supersede earlier historical whole-scope
+counts above; both branches' provenance and license records are retained.
+
+| Scope | Threshold | Fenced lines / blocks / files | Outside fences / code | Marked blocks / markers |
+|---|---|---|---|---|
+| `crates/ax` | 40 | 0 / 0 / 0 | 408 / 399 | 0 / 0 |
+| `crates/ax` | 25 | 18 / 15 / 4 | 1283 / 1268 | 0 / 0 |
+
+The `crates/linux` and `kernel/src` scan totals are unchanged from the CI
+baseline. Matching Rust expressions in the MIT i915 translations are counted,
+not exempted; a scanner match is a measurement, not a license classification.
+The feature remains default-off; compilation is not runtime acceptance.
+
+G2 follow-up: `i915_mm_upstream.rs` translates Linux 7.2.3 MIT `i915_mm.c`
+`sgt_pfn`, `remap_sg`, `remap_pfn`, `remap_io_mapping`, `remap_io_sg`; copyright
+© 2014 Intel Corporation, full grant in `tk-intel-gt/LICENSE-MIT`. Native
+`linux/{mm_native,shmem}.rs` are original LinuxKPI implementations over axmm,
+axtask, the native allocator and axhal physical-address translation, not copied
+Linux GPL MM/fs implementations. The C layout probe confirms the VMA manager
+lock at offset 0, size 248, and CONFIG_TRANSPARENT_HUGEPAGE=n (no huge_mnt field).
+
+G2 follow-up: Linux 7.2.3 MIT `gem/i915_gem_phys.c` all nine functions are in
+`i915_gem_phys_upstream.rs` (copyright © 2014-2016 Intel Corporation);
+`i915_gem_gtt.c` page prepare/finish and `i915_utils.c` VT-d predicate have
+source-order owners. `intel_memory_region_upstream.rs` contains the MIT
+initialization/memtest/type/name dependency functions from
+`intel_memory_region.c` (copyright © 2019 Intel Corporation). Full MIT grants
+are retained in the crate. The original LinuxKPI DMA adapter allocates native
+DMA pages and uses requester-scoped tk-vtd mapping/retirement; unknown device
+ownership refuses mapping, and no feature-enabled runtime path is installed.
+
+### G2 LinuxKPI follow-up (2026-10-09)
+
+The GPL Linux core implementations were not copied. Original LinuxKPI owners
+map anonymous shmem/folio/file I/O to the native allocator and page registry,
+MM/VMA/usercopy to `axmm::AddrSpace`, task context to axtask's preemption count,
+DMA to axalloc and requester-scoped tk-vtd, hard-IRQ synchronization to axhal's
+IRQ-boundary active counters, and reservation/fence completion to native locks,
+reference counts and workqueue callbacks. No-swap writeback keeps pages dirty;
+there is no kswapd and unsupported tracepoints emit no events. MM/device owner
+registration remains explicit and is not installed in the product.
+
+Additional Linux 7.2.3 MIT translations (grants retained in the crate):
+
+| Source | Rust owner / translated scope |
+|---|---|
+| `gem/i915_gem_clflush.c`, `i915_sw_fence_work.c` | `i915_gem_clflush_upstream.rs`: all five clflush and eight fence-work C functions plus two header helpers; Linux-core DMA-fence/reservation APIs are original adapters |
+| `gt/intel_engine_pm.c` | `intel_engine_pm_upstream.rs`: all ten C functions; breadcrumbs park/unpark header helpers in their existing owner |
+| `gt/intel_reset.c` | `intel_reset_hw_upstream.rs`: Gen6/Gen8+ hardware-domain reset dependencies, GuC reset and GSC workarounds; selector explicitly limited to the admitted Gen12 target, not an implementation of Gen2–5 reset |
+| `i915_cmd_parser.c` | `i915_cmd_parser_upstream.rs`: all 23 C functions and two command header helpers, including complete Gen7/Haswell/Gen9 command/register tables |
+| `gt/uc/intel_guc_capture.c` | `intel_guc_capture_upstream.rs`: linked output-node/cache lifecycle, extraction, log processing and engine matching dependencies, not the entire file or runtime hookup |
+| `i915_gpu_error.c` | `i915_gpu_error_upstream.rs`: needed capture/store/reset/disable entry points; coredump storage is a native GT-only adapter retaining real GuC nodes, not Linux's full display/VM/compression/debugfs snapshot |
+| `i915_irq.c` | `linux/irq.rs`: `intel_synchronize_hardirq` entry mapped to the registered device's native vector |
+
+The additional files retain Intel Corporation copyright notices (2008–2022 as
+applicable). The measured `crates/ax` totals now supersede the merge snapshot:
+threshold 40: `(0, 0, 0, 414, 405, 0, 0)`; threshold 25:
+`(18, 15, 4, 1318, 1303, 0, 0)`, in the CI baseline's seven-column order.
+Other scopes are unchanged. The feature remains default-off; compilation and
+host tests do not constitute native hardware or runtime integration acceptance.
