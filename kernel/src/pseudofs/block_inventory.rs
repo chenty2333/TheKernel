@@ -51,6 +51,16 @@ pub fn start_media_poll_worker() -> axerrno::AxResult<()> {
     Ok(())
 }
 
+/// Starts the poller once a registered block device reports media presence.
+/// Boot with only fixed disks therefore spawns no polling task; the first
+/// removable registration starts it lazily.
+pub fn start_media_poll_worker_for(name: &str) -> axerrno::AxResult<()> {
+    if !axfs::block_device_media_presence_capable(name) {
+        return Ok(());
+    }
+    start_media_poll_worker()
+}
+
 fn publish_block_uevent_device(entry: &axfs::BlockInventoryEntry) -> VfsResult<()> {
     let mut handles = BLOCK_DEVICE_HANDLES.lock();
     if handles.iter().any(|(name, _)| name == &entry.name) {
@@ -97,6 +107,11 @@ fn block_device_change(action: axfs::BlockDeviceChangeAction, entry: axfs::Block
         axfs::BlockDeviceChangeAction::Added => publish_block_uevent_device(&entry),
         axfs::BlockDeviceChangeAction::Removed => remove_block_uevent_device(&entry.name),
     };
+    if action == axfs::BlockDeviceChangeAction::Added
+        && let Err(error) = start_media_poll_worker_for(&entry.name)
+    {
+        warn!("block hotplug: media poll worker unavailable: {error:?}");
+    }
     if let Err(error) = result {
         warn!(
             "block uevent registry {} {} failed: {error:?}",

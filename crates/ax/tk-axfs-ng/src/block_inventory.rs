@@ -80,6 +80,13 @@ pub fn block_inventory() -> Vec<BlockInventoryEntry> {
 /// snapshot. The device set is sampled without holding the topology lock while
 /// touching hardware; mounted queue claims make `remove_block_device` return
 /// Busy and are retried on the next poll.
+/// True when the named registered block device reports a media-presence fact,
+/// meaning its medium can vanish without an orderly removal. Only such devices
+/// need the kernel's absent-media poller.
+pub fn block_device_media_presence_capable(name: &str) -> bool {
+    crate::raw_block_device(name).is_ok_and(|device| device.media_presence().is_some())
+}
+
 pub fn remove_absent_media_devices() -> usize {
     let candidates = EXTRA_BLOCK_DEVICES
         .get()

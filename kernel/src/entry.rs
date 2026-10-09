@@ -338,8 +338,10 @@ pub fn init(args: &[String], envs: &[String]) {
     axruntime::boot_progress::mark(axruntime::boot_progress::Stage::AlarmStart);
     spawn_alarm_task().expect("Failed to start alarm workers");
     axruntime::boot_progress::mark(axruntime::boot_progress::Stage::AlarmDone);
-    if let Err(error) = crate::pseudofs::block_inventory::start_media_poll_worker() {
-        warn!("block hotplug: media poll worker unavailable: {error:?}");
+    for entry in axfs::block_inventory() {
+        if let Err(error) = crate::pseudofs::block_inventory::start_media_poll_worker_for(&entry.name) {
+            warn!("block hotplug: media poll worker unavailable: {error:?}");
+        }
     }
     if axhal::power::power_button_available()
         && let Err(error) = spawn_power_button_task()
