@@ -134,3 +134,4 @@ MIT 下层依赖、完整 command parser 与 engine_pm 已补齐；其他文件�
 - heartbeat 接线：`gt/intel_engine_heartbeat.c`。
 - query 用户态接口：`i915_query.c`。
 - getparam 用户态接口：`i915_getparam.c`。
+- 链接级缺口：`cargo check` 不检查链接，`upstream-gt` 仍有 3 个只声明未定义的外部符号：`intel_engine_add_retire`（`gt/intel_gt_requests.c`，MIT，待翻译）、`trace_dma_fence_signaled`（tracepoint，映射为空操作）、`intel_sseu_get_hsw_subslices`（`gt/intel_sseu.c`，MIT，待翻译）。去掉 feature gate 之前必须补齐。
