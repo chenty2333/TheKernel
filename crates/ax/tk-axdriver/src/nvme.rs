@@ -36,6 +36,12 @@ unsafe impl Hal for PlatformHal {
         };
         let device_address = match mapping {
             Ok(address) => address,
+            Err(tk_vtd::Error::Quarantined) => {
+                // The page-table update or invalidation may be visible to
+                // hardware. Keep these pages allocated even though no DMA
+                // address can safely be handed to NVMe.
+                return None;
+            }
             Err(_) => {
                 global_allocator().dealloc_pages(virtual_address, pages, UsageKind::Dma);
                 return None;
@@ -53,7 +59,9 @@ unsafe impl Hal for PlatformHal {
         pages: usize,
     ) {
         let unmap = match requester {
-            Some(requester) => tk_vtd::platform_unmap_for(requester, address, pages.saturating_mul(4096)),
+            Some(requester) => {
+                tk_vtd::platform_unmap_for(requester, address, pages.saturating_mul(4096))
+            }
             None => tk_vtd::platform_unmap(address, pages.saturating_mul(4096)),
         };
         if unmap.is_err() {

@@ -43,6 +43,8 @@ pub enum Error {
     Timeout,
     Unsupported,
     NoDevice,
+    /// Hardware may retain a mapping; backing storage and the domain must stay owned.
+    Quarantined,
 }
 
 #[crate_interface::def_interface]
@@ -54,6 +56,103 @@ pub trait PlatformDma {
     fn unmap_for(requester: PciRequester, device_address: u64, length: usize) -> Result<(), Error>;
 }
 
+/// A narrowly scoped, explicit identity-mapping owner for one PCI requester.
+/// Construction is available only through the platform lease service; fields
+/// remain private so drivers cannot fabricate a lease identifier.
+#[derive(Debug, Eq, PartialEq)]
+pub struct IdentityDmaLease {
+    requester: PciRequester,
+    id: u64,
+}
+
+/// Ownership token for a batch of identity-mapped pages. Keep this token and
+/// the backing pages until `IdentityDmaLease::unmap_pages` succeeds.
+#[derive(Debug, Eq, PartialEq)]
+pub struct IdentityDmaMapping {
+    requester: PciRequester,
+    lease_id: u64,
+    id: u64,
+}
+
+#[crate_interface::def_interface]
+pub trait PlatformIdentityDma {
+    fn acquire_identity_dma(requester: PciRequester, initial_pages: &[u64]) -> Result<u64, Error>;
+    fn map_identity_pages(
+        requester: PciRequester,
+        lease_id: u64,
+        pages: &[u64],
+    ) -> Result<u64, Error>;
+    fn unmap_identity_pages(
+        requester: PciRequester,
+        lease_id: u64,
+        mapping_id: u64,
+    ) -> Result<(), Error>;
+    fn release_identity_dma(requester: PciRequester, lease_id: u64) -> Result<(), Error>;
+}
+
+impl IdentityDmaLease {
+    pub const fn requester(&self) -> PciRequester {
+        self.requester
+    }
+
+    /// Add a batch of pinned physical pages to this requester's identity map.
+    pub fn map_pages(&self, pages: &[u64]) -> Result<IdentityDmaMapping, Error> {
+        let id = crate_interface::call_interface!(
+            PlatformIdentityDma::map_identity_pages,
+            self.requester,
+            self.id,
+            pages
+        )?;
+        Ok(IdentityDmaMapping {
+            requester: self.requester,
+            lease_id: self.id,
+            id,
+        })
+    }
+
+    /// Remove a previous batch only after hardware invalidation completes.
+    /// On error the mapping token remains valid and must not be dropped with
+    /// its backing owner.
+    pub fn unmap_pages(&self, mapping: &IdentityDmaMapping) -> Result<(), Error> {
+        if mapping.requester != self.requester || mapping.lease_id != self.id {
+            return Err(Error::InvalidStructure);
+        }
+        crate_interface::call_interface!(
+            PlatformIdentityDma::unmap_identity_pages,
+            self.requester,
+            self.id,
+            mapping.id
+        )
+    }
+
+    /// Retire the persistent initial mapping (including matching scoped
+    /// RMRRs). Call only after the requester is quiesced; any failure retains
+    /// this lease and prevents reuse.
+    pub fn release(&self) -> Result<(), Error> {
+        crate_interface::call_interface!(
+            PlatformIdentityDma::release_identity_dma,
+            self.requester,
+            self.id
+        )
+    }
+}
+
+/// Acquire a GPU-style, requester-specific identity lease. `initial_pages`
+/// must be exact measured/pinned physical pages, not a RAM range; matching
+/// scoped RMRRs are added by the platform service before publishing the
+/// requester context.
+pub fn platform_acquire_identity_dma(
+    requester: PciRequester,
+    initial_pages: &[u64],
+) -> Result<IdentityDmaLease, Error> {
+    let id = crate_interface::call_interface!(
+        PlatformIdentityDma::acquire_identity_dma,
+        requester,
+        initial_pages
+    )?;
+    Ok(IdentityDmaLease { requester, id })
+}
+
 #[crate_interface::def_interface]
 pub trait PlatformInterruptRemap {
     fn map_msi(
@@ -62,6 +161,12 @@ pub trait PlatformInterruptRemap {
         destination: u32,
     ) -> Result<Option<(u64, u32)>, Error>;
     fn unmap_msi(vector: u8) -> Result<(), Error>;
+    /// Resolve only an MSI message currently owned by the interrupt remapper.
+    fn msi_vector(
+        requester: PciRequester,
+        message_address: u64,
+        message_data: u32,
+    ) -> Result<Option<u8>, Error>;
 }
 
 pub fn platform_map_msi(
@@ -81,6 +186,23 @@ pub fn platform_unmap_msi(vector: u8) -> Result<(), Error> {
     crate_interface::call_interface!(PlatformInterruptRemap::unmap_msi, vector)
 }
 
+/// Resolve an interrupt-remapped MSI message to its original vector.
+///
+/// This is intentionally an exact owner lookup: callers must not infer an
+/// APIC vector from remappable MSI subhandle bits.
+pub fn platform_msi_vector(
+    requester: PciRequester,
+    message_address: u64,
+    message_data: u32,
+) -> Result<Option<u8>, Error> {
+    crate_interface::call_interface!(
+        PlatformInterruptRemap::msi_vector,
+        requester,
+        message_address,
+        message_data
+    )
+}
+
 pub fn platform_pci_dma_allowed() -> bool {
     crate_interface::call_interface!(PlatformDma::pci_dma_allowed)
 }
@@ -95,11 +217,19 @@ pub fn platform_unmap(device_address: u64, length: usize) -> Result<(), Error> {
     crate_interface::call_interface!(PlatformDma::unmap, device_address, length)
 }
 
-pub fn platform_map_for(requester: PciRequester, physical: u64, length: usize) -> Result<u64, Error> {
+pub fn platform_map_for(
+    requester: PciRequester,
+    physical: u64,
+    length: usize,
+) -> Result<u64, Error> {
     crate_interface::call_interface!(PlatformDma::map_for, requester, physical, length)
 }
 
-pub fn platform_unmap_for(requester: PciRequester, device_address: u64, length: usize) -> Result<(), Error> {
+pub fn platform_unmap_for(
+    requester: PciRequester,
+    device_address: u64,
+    length: usize,
+) -> Result<(), Error> {
     crate_interface::call_interface!(PlatformDma::unmap_for, requester, device_address, length)
 }
 
@@ -513,7 +643,7 @@ mod tests {
 /// remapping match the kernel's behaviour when VT-d is absent or disabled.
 #[cfg(not(target_os = "none"))]
 mod hosted_identity {
-    use super::{Error, PciRequester, PlatformDma, PlatformInterruptRemap};
+    use super::{Error, PciRequester, PlatformDma, PlatformIdentityDma, PlatformInterruptRemap};
 
     struct HostedIdentity;
 
@@ -531,18 +661,60 @@ mod hosted_identity {
         fn map_for(_requester: PciRequester, physical: u64, _length: usize) -> Result<u64, Error> {
             Ok(physical)
         }
-        fn unmap_for(_requester: PciRequester, _device_address: u64, _length: usize) -> Result<(), Error> {
+        fn unmap_for(
+            _requester: PciRequester,
+            _device_address: u64,
+            _length: usize,
+        ) -> Result<(), Error> {
             Ok(())
         }
     }
 
     #[crate_interface::impl_interface]
     impl PlatformInterruptRemap for HostedIdentity {
-        fn map_msi(_requester: PciRequester, _vector: u8, _destination: u32) -> Result<Option<(u64, u32)>, Error> {
+        fn map_msi(
+            _requester: PciRequester,
+            _vector: u8,
+            _destination: u32,
+        ) -> Result<Option<(u64, u32)>, Error> {
             Ok(None)
         }
         fn unmap_msi(_vector: u8) -> Result<(), Error> {
             Ok(())
+        }
+        fn msi_vector(
+            _requester: PciRequester,
+            _message_address: u64,
+            _message_data: u32,
+        ) -> Result<Option<u8>, Error> {
+            Ok(None)
+        }
+    }
+
+    #[crate_interface::impl_interface]
+    impl PlatformIdentityDma for HostedIdentity {
+        fn acquire_identity_dma(
+            _requester: PciRequester,
+            _initial_pages: &[u64],
+        ) -> Result<u64, Error> {
+            Err(Error::Unsupported)
+        }
+        fn map_identity_pages(
+            _requester: PciRequester,
+            _lease_id: u64,
+            _pages: &[u64],
+        ) -> Result<u64, Error> {
+            Err(Error::Unsupported)
+        }
+        fn unmap_identity_pages(
+            _requester: PciRequester,
+            _lease_id: u64,
+            _mapping_id: u64,
+        ) -> Result<(), Error> {
+            Err(Error::Unsupported)
+        }
+        fn release_identity_dma(_requester: PciRequester, _lease_id: u64) -> Result<(), Error> {
+            Err(Error::Unsupported)
         }
     }
 }

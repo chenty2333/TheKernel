@@ -1962,15 +1962,35 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             } {
                 Ok(mapping) => mapping,
                 Err(error) => {
-                    Self::unmap_physical_mappings(self.requester, &mappings, index, direction);
-                    return Err(error);
+                    let previous_unmapped = Self::unmap_physical_mappings(
+                        self.requester,
+                        &mappings,
+                        index,
+                        direction,
+                    );
+                    return Err(if error == Error::Quarantined || !previous_unmapped {
+                        Error::Quarantined
+                    } else {
+                        error
+                    });
                 }
             };
             if mapping.source != segment.paddr || mapping.len != segment.len || mapping.device == 0
             {
-                let _ = unsafe { H::unmap_physical_for(self.requester, mapping, direction) };
-                Self::unmap_physical_mappings(self.requester, &mappings, index, direction);
-                return Err(Error::DmaError);
+                let current_unmapped = unsafe {
+                    H::unmap_physical_for(self.requester, mapping, direction).is_ok()
+                };
+                let previous_unmapped = Self::unmap_physical_mappings(
+                    self.requester,
+                    &mappings,
+                    index,
+                    direction,
+                );
+                return Err(if current_unmapped && previous_unmapped {
+                    Error::DmaError
+                } else {
+                    Error::Quarantined
+                });
             }
             buffers[index] = PhysicalBuffer {
                 addr: mapping.device,
@@ -1986,10 +2006,14 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         mappings: &[Option<DmaMapping>; MAX_PHYSICAL_SG],
         count: usize,
         direction: BufferDirection,
-    ) {
+    ) -> bool {
+        let mut success = true;
         for mapping in mappings[..count].iter().rev().flatten().copied() {
-            let _ = unsafe { H::unmap_physical_for(requester, mapping, direction) };
+            if unsafe { H::unmap_physical_for(requester, mapping, direction) }.is_err() {
+                success = false;
+            }
         }
+        success
     }
 
     fn install_prepared_physical_request(
@@ -2061,7 +2085,9 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// Prepares an all-or-nothing physical batch.  No descriptor is published
     /// until the returned [`PreparedBlockBatch`] is consumed by `publish`.
     /// Any validation, queue, slot, or DMA mapping failure leaves the device
-    /// queue and every caller range untouched.
+    /// queue and every caller range untouched unless it returns
+    /// [`Error::Quarantined`]; on that error, keep all request ranges pinned
+    /// and do not recycle them because DMA invalidation could not be proven.
     pub unsafe fn prepare_physical_batch<'dev, 'req>(
         &'dev mut self,
         requests: &'req mut [PendingBlkPhysicalBatchRequest<'req>],
@@ -2081,6 +2107,8 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// but must not perform a hidden ordinary drain here. Admission remains
     /// all-or-nothing and no descriptor is visible until the returned batch is
     /// published.
+    /// If this returns [`Error::Quarantined`], all request ranges must remain
+    /// pinned and unreused.
     ///
     /// # Safety
     ///
@@ -2181,8 +2209,13 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             let slot = match prepared.device.alloc_pending_slot() {
                 Ok(slot) => slot,
                 Err(error) => {
-                    Self::unmap_physical_mappings(requester, &mappings, counts[index], direction);
-                    return Err(error);
+                    let unmapped = Self::unmap_physical_mappings(
+                        requester,
+                        &mappings,
+                        counts[index],
+                        direction,
+                    );
+                    return Err(if unmapped { error } else { Error::Quarantined });
                 }
             };
             let token = match prepared.device.install_prepared_physical_request(
@@ -2354,6 +2387,8 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// The caller must keep every segment pinned and valid until the returned
     /// handle is completed and must provide ranges in the device-write
     /// direction of a read. Concurrent CPU/device access races on contents.
+    /// If this returns [`Error::Quarantined`], keep every input segment pinned
+    /// and do not recycle it; DMA invalidation ownership could not be proven.
     pub unsafe fn submit_read_blocks_physical_pending(
         &mut self,
         block_id: u64,
@@ -2372,13 +2407,13 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         let slot = match self.alloc_pending_slot() {
             Ok(slot) => slot,
             Err(error) => {
-                Self::unmap_physical_mappings(
+                let unmapped = Self::unmap_physical_mappings(
                     self.requester,
                     &mappings,
                     coalesced_count,
                     BufferDirection::DeviceToDriver,
                 );
-                return Err(error);
+                return Err(if unmapped { error } else { Error::Quarantined });
             }
         };
         self.pending[slot] = Some(PendingBlkRequest::physical_read(
@@ -2455,6 +2490,8 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// The caller must keep every segment pinned and valid until the returned
     /// handle is completed and must provide ranges in the device-read direction
     /// of a write. Concurrent CPU/device access races on contents.
+    /// If this returns [`Error::Quarantined`], keep every input segment pinned
+    /// and do not recycle it; DMA invalidation ownership could not be proven.
     pub unsafe fn submit_write_blocks_physical_pending(
         &mut self,
         block_id: u64,
@@ -2473,13 +2510,13 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         let slot = match self.alloc_pending_slot() {
             Ok(slot) => slot,
             Err(error) => {
-                Self::unmap_physical_mappings(
+                let unmapped = Self::unmap_physical_mappings(
                     self.requester,
                     &mappings,
                     coalesced_count,
                     BufferDirection::DriverToDevice,
                 );
-                return Err(error);
+                return Err(if unmapped { error } else { Error::Quarantined });
             }
         };
         self.pending[slot] = Some(PendingBlkRequest::physical_write(

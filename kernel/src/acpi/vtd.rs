@@ -4,7 +4,7 @@
 use alloc::vec::Vec;
 use core::{
     ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 
 use axalloc::{UsageKind, global_allocator};
@@ -20,9 +20,10 @@ use tk_vtd::{
     pgtbl::{PAGE_SIZE, PageMemory, SecondLevel},
     qi::{self, QiIo, QiQueue},
     reg::{
-        ContextEntry, DMAR_CAP_MGAW, DMAR_CAP_RWBF, DMAR_CAP_SAGAW, DMAR_CAP_SAGAW_4LVL,
-        DMAR_CAP_SPS, DMAR_CAP_SPS_2M, DMAR_CTX2_AW_4LVL, DMAR_ECAP_EIM, DMAR_ECAP_IR,
-        DMAR_ECAP_QI, DMAR_IECTL_IM, DMAR_IECTL_REG, DMAR_PTE_R, DMAR_PTE_W, RootEntry,
+        ContextEntry, DMAR_CAP_MGAW, DMAR_CAP_ND, DMAR_CAP_RWBF, DMAR_CAP_SAGAW,
+        DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS, DMAR_CAP_SPS_2M, DMAR_CTX2_AW_4LVL, DMAR_ECAP_EIM,
+        DMAR_ECAP_IR, DMAR_ECAP_QI, DMAR_IECTL_IM, DMAR_IECTL_REG, DMAR_PTE_R, DMAR_PTE_W,
+        RootEntry,
     },
     utils::{self, RegisterIo},
 };
@@ -49,6 +50,13 @@ const IDENTITY_PAGE_SIZE: u64 = 1 << 21;
 const IOVA_END: u64 = 1 << 36;
 
 static MODE: AtomicU8 = AtomicU8::new(MODE_UNKNOWN);
+/// Once a DMA invalidation fails, callers can no longer prove whether hardware
+/// holds an old or new translation. Do not admit further devices or release
+/// mappings/backing from this boot.
+static DMA_POISONED: AtomicBool = AtomicBool::new(false);
+static NEXT_DIRECT_LEASE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_DIRECT_MAPPING_ID: AtomicU64 = AtomicU64::new(1);
+static DIRECT_IDENTITY_LEASES: SpinNoIrq<Vec<DirectIdentityLease>> = SpinNoIrq::new(Vec::new());
 /// Why initialization failed closed, repeated when PCI admission is refused so
 /// the reason sits next to the refusal on a screen-only machine.
 static FAILURE: SpinNoIrq<Option<InitFailure>> = SpinNoIrq::new(None);
@@ -90,6 +98,13 @@ struct UnitProbe {
     fsts: u32,
 }
 
+fn invalidate_all_units(units: &mut [Unit]) -> Result<(), Error> {
+    for unit in units {
+        unit.invalidate_all()?;
+    }
+    Ok(())
+}
+
 const GSTS_ACTIVE_MASK: u32 = GSTS_TES | GSTS_QIES | GSTS_IRES;
 
 const fn pci_dma_allowed_in_mode(mode: u8) -> bool {
@@ -98,6 +113,20 @@ const fn pci_dma_allowed_in_mode(mode: u8) -> bool {
 
 const fn identity_dma_in_mode(mode: u8) -> bool {
     matches!(mode, MODE_UNKNOWN | MODE_IDENTITY)
+}
+
+fn poison_dma_state() -> Error {
+    DMA_POISONED.store(true, Ordering::Release);
+    MODE.store(MODE_FAILED, Ordering::Release);
+    Error::Quarantined
+}
+
+fn failed_dma_error() -> Error {
+    if DMA_POISONED.load(Ordering::Acquire) {
+        Error::Quarantined
+    } else {
+        Error::NoDomain
+    }
 }
 
 fn address_limit(width: u8) -> Option<u64> {
@@ -164,6 +193,18 @@ fn identity_fallback_safe_before_enable(statuses: impl IntoIterator<Item = u32>)
 
 static REQUESTER_DOMAINS: AtomicBool = AtomicBool::new(false);
 static MANAGER: SpinNoIrq<Option<Manager>> = SpinNoIrq::new(None);
+
+struct DirectIdentityBatch {
+    id: u64,
+    pages: Vec<u64>,
+}
+
+struct DirectIdentityLease {
+    requester: tk_vtd::PciRequester,
+    id: u64,
+    initial_pages: Vec<u64>,
+    batches: Vec<DirectIdentityBatch>,
+}
 
 struct DmaBlock {
     physical: u64,
@@ -232,12 +273,28 @@ unsafe impl PageMemory for KernelPageMemory {
 struct Unit {
     mmio: usize,
     register_base: u64,
+    mgaw: u8,
+    domain_count: u32,
+    next_domain_id: u32,
     qi: DmaBlock,
     queue: QiQueue,
     gcmd: u32,
     root_physical: u64,
     ir_table: Option<DmaBlock>,
     ir: Option<InterruptRemapper>,
+}
+
+fn cap_domain_count(cap: u64) -> u32 {
+    1u32 << (4 + 2 * DMAR_CAP_ND(cap) as u32)
+}
+
+fn take_domain_id(next_id: &mut u32, domain_count: u32) -> Result<u16, Error> {
+    let id = *next_id;
+    if id == 0 || id > u32::from(u16::MAX) || id >= domain_count {
+        return Err(Error::OutOfMemory);
+    }
+    *next_id = id.checked_add(1).ok_or(Error::OutOfMemory)?;
+    Ok(id as u16)
 }
 // SAFETY: MMIO mappings are stable for boot and mutable queue state is accessed
 // only under MANAGER's lock.
@@ -838,20 +895,359 @@ impl InterruptRemapIo for UnitInterruptIo<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MappingState {
+    Active,
+    Quarantined,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Mapping {
     device_address: u64,
     length: usize,
     physical: u64,
     iova: u64,
     mapped_length: usize,
+    state: MappingState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DomainState {
+    Installing,
+    Ready,
+    Quarantined,
 }
 
 struct DeviceDomain {
     requester: tk_vtd::PciRequester,
+    unit_index: usize,
     id: u16,
     page_table: SecondLevel<KernelPageMemory>,
     iovas: IovaAllocator,
     mappings: Vec<Mapping>,
+    state: DomainState,
+    identity_dma: Option<IdentityDmaOwner>,
+}
+
+struct IdentityPage {
+    physical: u64,
+    references: u32,
+    permanent: bool,
+}
+
+struct IdentityBatch {
+    id: u64,
+    pages: Vec<u64>,
+    state: MappingState,
+}
+
+struct IdentityDmaOwner {
+    lease_id: u64,
+    pages: Vec<IdentityPage>,
+    batches: Vec<IdentityBatch>,
+}
+
+fn prepare_identity_batch_record(
+    owner: &mut IdentityDmaOwner,
+    pages: &[u64],
+) -> Result<Vec<u64>, Error> {
+    let mut new_pages = 0usize;
+    for &page in pages {
+        if let Some(owned) = owner.pages.iter().find(|owned| owned.physical == page) {
+            if owned.references == u32::MAX {
+                return Err(Error::OutOfMemory);
+            }
+        } else {
+            new_pages += 1;
+        }
+    }
+    owner
+        .pages
+        .try_reserve(new_pages)
+        .map_err(|_| Error::OutOfMemory)?;
+    owner
+        .batches
+        .try_reserve(1)
+        .map_err(|_| Error::OutOfMemory)?;
+    let mut recorded_pages = Vec::new();
+    recorded_pages
+        .try_reserve_exact(pages.len())
+        .map_err(|_| Error::OutOfMemory)?;
+    recorded_pages.extend_from_slice(pages);
+    Ok(recorded_pages)
+}
+
+fn publish_identity_batch(
+    owner: &mut IdentityDmaOwner,
+    id: u64,
+    pages: Vec<u64>,
+    state: MappingState,
+) {
+    for &page in &pages {
+        if let Some(owned) = owner.pages.iter_mut().find(|owned| owned.physical == page) {
+            owned.references += 1;
+        } else {
+            owner.pages.push(IdentityPage {
+                physical: page,
+                references: 1,
+                permanent: false,
+            });
+        }
+    }
+    owner.batches.push(IdentityBatch { id, pages, state });
+}
+
+fn identity_batch_removal_pages(owner: &IdentityDmaOwner, id: u64) -> Result<Vec<u64>, Error> {
+    let batch = owner
+        .batches
+        .iter()
+        .find(|batch| batch.id == id)
+        .ok_or(Error::InvalidRange)?;
+    if batch.state != MappingState::Active {
+        return Err(Error::Quarantined);
+    }
+    let mut remove = Vec::new();
+    remove
+        .try_reserve_exact(batch.pages.len())
+        .map_err(|_| Error::OutOfMemory)?;
+    for &page in &batch.pages {
+        let owned = owner
+            .pages
+            .iter()
+            .find(|owned| owned.physical == page)
+            .ok_or(Error::InvalidStructure)?;
+        if owned.references == 0 {
+            return Err(Error::InvalidStructure);
+        }
+        if owned.references == 1 && !owned.permanent {
+            remove.push(page);
+        }
+    }
+    Ok(remove)
+}
+
+fn retire_identity_batch_record(owner: &mut IdentityDmaOwner, id: u64) -> Result<(), Error> {
+    let batch_index = owner
+        .batches
+        .iter()
+        .position(|batch| batch.id == id)
+        .ok_or(Error::InvalidRange)?;
+    if owner.batches[batch_index].state != MappingState::Active {
+        return Err(Error::Quarantined);
+    }
+    for &page in &owner.batches[batch_index].pages {
+        let page_index = owner
+            .pages
+            .iter()
+            .position(|owned| owned.physical == page)
+            .ok_or(Error::InvalidStructure)?;
+        if owner.pages[page_index].references == 0 {
+            return Err(Error::InvalidStructure);
+        }
+        owner.pages[page_index].references -= 1;
+        if owner.pages[page_index].references == 0 && !owner.pages[page_index].permanent {
+            owner.pages.swap_remove(page_index);
+        }
+    }
+    owner.batches.swap_remove(batch_index);
+    Ok(())
+}
+
+fn publish_identity_batch_after_invalidation(
+    owner: &mut IdentityDmaOwner,
+    id: u64,
+    pages: Vec<u64>,
+    invalidate: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    publish_identity_batch(owner, id, pages, MappingState::Active);
+    if invalidate().is_err() {
+        let batch = owner
+            .batches
+            .iter_mut()
+            .find(|batch| batch.id == id)
+            .ok_or(Error::InvalidStructure)?;
+        batch.state = MappingState::Quarantined;
+        return Err(Error::Quarantined);
+    }
+    Ok(())
+}
+
+fn retire_identity_batch_after_invalidation(
+    owner: &mut IdentityDmaOwner,
+    id: u64,
+    mut clear_page: impl FnMut(u64) -> Result<(), Error>,
+    invalidate: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    let remove_pages = identity_batch_removal_pages(owner, id)?;
+    for &page in &remove_pages {
+        if clear_page(page).is_err() {
+            if let Some(batch) = owner.batches.iter_mut().find(|batch| batch.id == id) {
+                batch.state = MappingState::Quarantined;
+            }
+            return Err(Error::Quarantined);
+        }
+    }
+    if !remove_pages.is_empty() && invalidate().is_err() {
+        if let Some(batch) = owner.batches.iter_mut().find(|batch| batch.id == id) {
+            batch.state = MappingState::Quarantined;
+        }
+        return Err(Error::Quarantined);
+    }
+    if retire_identity_batch_record(owner, id).is_err() {
+        if let Some(batch) = owner.batches.iter_mut().find(|batch| batch.id == id) {
+            batch.state = MappingState::Quarantined;
+        }
+        return Err(Error::Quarantined);
+    }
+    Ok(())
+}
+
+fn retire_identity_lease_after_invalidation(
+    owner: &mut Option<IdentityDmaOwner>,
+    lease_id: u64,
+    mut clear_page: impl FnMut(u64) -> Result<(), Error>,
+    invalidate: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    let lease = owner.as_ref().ok_or(Error::NoDomain)?;
+    if lease.lease_id != lease_id {
+        return Err(Error::InvalidStructure);
+    }
+    if !lease.batches.is_empty() || lease.pages.iter().any(|page| page.references != 0) {
+        return Err(Error::InvalidStructure);
+    }
+    let mut pages = Vec::new();
+    pages
+        .try_reserve_exact(lease.pages.len())
+        .map_err(|_| Error::OutOfMemory)?;
+    pages.extend(lease.pages.iter().map(|page| page.physical));
+    for page in pages {
+        if clear_page(page).is_err() {
+            return Err(Error::Quarantined);
+        }
+    }
+    if !lease.pages.is_empty() && invalidate().is_err() {
+        return Err(Error::Quarantined);
+    }
+    *owner = None;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IrRouteState {
+    Active,
+    Quarantined,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IrRoute {
+    requester: tk_vtd::PciRequester,
+    vector: u8,
+    unit_index: usize,
+    cookie: u16,
+    message_address: u64,
+    message_data: u32,
+    state: IrRouteState,
+}
+
+fn find_owned_msi_vector(
+    routes: &[IrRoute],
+    requester: tk_vtd::PciRequester,
+    message_address: u64,
+    message_data: u32,
+) -> Result<Option<u8>, Error> {
+    let mut found = None;
+    for route in routes {
+        if route.requester == requester
+            && route.message_address == message_address
+            && route.message_data == message_data
+        {
+            if route.state != IrRouteState::Active {
+                return Err(Error::Quarantined);
+            }
+            if found.replace(route.vector).is_some() {
+                return Err(Error::InvalidStructure);
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn retire_ir_route_after_invalidation(
+    routes: &mut Vec<IrRoute>,
+    index: usize,
+    invalidate: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    let Some(route) = routes.get(index).copied() else {
+        return Err(Error::InvalidRange);
+    };
+    if route.state != IrRouteState::Active {
+        return Err(Error::Quarantined);
+    }
+    if invalidate().is_err() {
+        routes[index].state = IrRouteState::Quarantined;
+        return Err(Error::Quarantined);
+    }
+    routes.swap_remove(index);
+    Ok(())
+}
+
+fn require_ready_domain(state: DomainState) -> Result<(), Error> {
+    match state {
+        DomainState::Ready => Ok(()),
+        DomainState::Installing | DomainState::Quarantined => Err(Error::Quarantined),
+    }
+}
+
+fn complete_domain_install(
+    state: &mut DomainState,
+    invalidate: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    if invalidate().is_err() {
+        *state = DomainState::Quarantined;
+        return Err(Error::Quarantined);
+    }
+    *state = DomainState::Ready;
+    Ok(())
+}
+
+/// Record a PTE update before invalidating caches so ambiguous completion can
+/// never lose the software owner of the translation/backing relationship.
+fn publish_mapping_after_invalidation(
+    mappings: &mut Vec<Mapping>,
+    mapping: Mapping,
+    invalidate: impl FnOnce() -> Result<(), Error>,
+) -> Result<u64, Error> {
+    mappings.push(mapping);
+    let index = mappings.len() - 1;
+    if invalidate().is_err() {
+        mappings[index].state = MappingState::Quarantined;
+        return Err(Error::Quarantined);
+    }
+    Ok(mapping.device_address)
+}
+
+/// The caller owns the physical allocation until both the leaf removal and
+/// all-unit invalidation are confirmed. Any uncertainty keeps the record and
+/// IOVA reserved for quarantine instead of best-effort PTE restoration.
+fn retire_mapping_after_invalidation(
+    mappings: &mut Vec<Mapping>,
+    index: usize,
+    iovas: &mut IovaAllocator,
+    clear_pte: impl FnOnce() -> Result<(), Error>,
+    invalidate: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    let Some(mapping) = mappings.get(index).copied() else {
+        return Err(Error::InvalidRange);
+    };
+    if mapping.state != MappingState::Active {
+        return Err(Error::Quarantined);
+    }
+    if clear_pte().is_err() || invalidate().is_err() {
+        mappings[index].state = MappingState::Quarantined;
+        return Err(Error::Quarantined);
+    }
+    mappings.swap_remove(index);
+    iovas.release(mapping.iova, mapping.mapped_length)
 }
 
 /// Build the ACPI DMAR PCI path for a requester by walking the configured
@@ -894,27 +1290,111 @@ fn dmar_scope_matches(
         }) || scope.scope_type == 2)
 }
 
-fn dmar_unit_for_requester<'a>(
-    table: &'a DmarTable,
+fn dmar_unit_index_for_requester(
+    table: &DmarTable,
     requester: tk_vtd::PciRequester,
     path: &[(u8, u8, u8)],
-) -> Option<&'a tk_vtd::Unit> {
-    table
-        .units
-        .iter()
-        .find(|unit| {
-            unit.segment == requester.segment
-                && unit
-                    .scopes
-                    .iter()
-                    .any(|scope| dmar_scope_matches(scope, requester, path))
+) -> Result<usize, Error> {
+    if path.is_empty()
+        && table.units.iter().any(|unit| {
+            unit.segment == requester.segment && !unit.include_all && !unit.scopes.is_empty()
         })
-        .or_else(|| {
-            table
-                .units
+    {
+        return Err(Error::NoDevice);
+    }
+    let mut scoped = None;
+    for (index, unit) in table.units.iter().enumerate() {
+        if unit.segment == requester.segment
+            && unit
+                .scopes
                 .iter()
-                .find(|unit| unit.segment == requester.segment && unit.include_all)
-        })
+                .any(|scope| dmar_scope_matches(scope, requester, path))
+        {
+            if scoped.replace(index).is_some() {
+                return Err(Error::InvalidStructure);
+            }
+        }
+    }
+    if let Some(index) = scoped {
+        return Ok(index);
+    }
+    let mut include_all = None;
+    for (index, unit) in table.units.iter().enumerate() {
+        if unit.segment == requester.segment && unit.include_all {
+            if include_all.replace(index).is_some() {
+                return Err(Error::InvalidStructure);
+            }
+        }
+    }
+    include_all.ok_or(Error::NoDevice)
+}
+
+fn identity_pages_for_requester(
+    dmar: &DmarTable,
+    requester: tk_vtd::PciRequester,
+    initial_pages: &[u64],
+) -> Result<Vec<u64>, Error> {
+    let path = dmar_path(requester);
+    if path.is_empty()
+        && dmar
+            .reserved_regions
+            .iter()
+            .any(|region| region.segment == requester.segment)
+    {
+        // Without PCI bridge topology, the service cannot prove whether a
+        // scoped RMRR belongs to this requester; do not silently omit it.
+        return Err(Error::NoDevice);
+    }
+    identity_pages_for_path(dmar, requester, &path, initial_pages)
+}
+
+fn identity_pages_for_path(
+    dmar: &DmarTable,
+    requester: tk_vtd::PciRequester,
+    path: &[(u8, u8, u8)],
+    initial_pages: &[u64],
+) -> Result<Vec<u64>, Error> {
+    let mut pages = Vec::new();
+    pages
+        .try_reserve(initial_pages.len())
+        .map_err(|_| Error::OutOfMemory)?;
+    for &page in initial_pages {
+        if !page.is_multiple_of(PAGE_SIZE) || page >= 1 << 48 {
+            return Err(Error::InvalidRange);
+        }
+        pages.push(page);
+    }
+    for region in &dmar.reserved_regions {
+        if region.segment != requester.segment
+            || !region
+                .scopes
+                .iter()
+                .any(|scope| dmar_scope_matches(scope, requester, path))
+        {
+            continue;
+        }
+        let base = region.base & !(PAGE_SIZE - 1);
+        let end = region
+            .end_inclusive
+            .checked_add(1)
+            .ok_or(Error::InvalidRange)?;
+        let end = end.checked_add(PAGE_SIZE - 1).ok_or(Error::InvalidRange)? & !(PAGE_SIZE - 1);
+        if base >= end || end > 1 << 48 {
+            return Err(Error::InvalidRange);
+        }
+        let additional =
+            usize::try_from((end - base) / PAGE_SIZE).map_err(|_| Error::OutOfMemory)?;
+        pages
+            .try_reserve(additional)
+            .map_err(|_| Error::OutOfMemory)?;
+        pages.extend((base..end).step_by(PAGE_SIZE as usize));
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    if pages.is_empty() {
+        return Err(Error::InvalidRange);
+    }
+    Ok(pages)
 }
 
 struct Manager {
@@ -925,39 +1405,85 @@ struct Manager {
     page_table: SecondLevel<KernelPageMemory>,
     iovas: IovaAllocator,
     mappings: Vec<Mapping>,
-    ir_routes: Vec<(u8, usize, u16)>,
+    ir_routes: Vec<IrRoute>,
     identity_end: u64,
     iova_start: u64,
-    next_domain_id: u16,
     device_domains: Vec<DeviceDomain>,
+    next_identity_lease_id: u64,
+    next_identity_mapping_id: u64,
 }
 // SAFETY: table pages, IOVA state, and MMIO queues are mutated only while the
 // global manager lock is held.
 unsafe impl Send for Manager {}
 
 impl Manager {
-    fn ensure_device_domain(&mut self, requester: tk_vtd::PciRequester) -> Result<usize, Error> {
-        if let Some(index) = self
+    fn create_device_domain(
+        &mut self,
+        requester: tk_vtd::PciRequester,
+        identity: Option<(u64, Vec<u64>)>,
+    ) -> Result<usize, Error> {
+        let unit_index =
+            dmar_unit_index_for_requester(&self.dmar, requester, &dmar_path(requester))?;
+        let selected_unit = self.units.get(unit_index).ok_or(Error::NoDevice)?;
+        let mgaw = selected_unit.mgaw;
+        let limit = 1u64
+            .checked_shl(u32::from(mgaw))
+            .ok_or(Error::InvalidRange)?;
+        if self
             .device_domains
             .iter()
-            .position(|domain| domain.requester == requester)
+            .any(|domain| domain.requester == requester)
         {
-            return Ok(index);
+            return Err(Error::InvalidStructure);
         }
-        let requester_path = dmar_path(requester);
-        if dmar_unit_for_requester(&self.dmar, requester, &requester_path).is_none() {
-            return Err(Error::NoDevice);
-        }
-        let id = self.next_domain_id;
-        self.next_domain_id = id.checked_add(1).ok_or(Error::OutOfMemory)?;
-        let page_table = SecondLevel::new(KernelPageMemory { pages: Vec::new() })?;
+        let domain_count = self.units[unit_index].domain_count;
+        let id = take_domain_id(&mut self.units[unit_index].next_domain_id, domain_count)?;
+        let mut page_table = SecondLevel::new(KernelPageMemory { pages: Vec::new() })?;
+        let identity_dma = if let Some((lease_id, pages)) = identity {
+            let mut owned_pages = Vec::new();
+            owned_pages
+                .try_reserve_exact(pages.len())
+                .map_err(|_| Error::OutOfMemory)?;
+            for physical in pages {
+                if physical
+                    .checked_add(PAGE_SIZE)
+                    .is_none_or(|end| end > limit)
+                {
+                    return Err(Error::InvalidRange);
+                }
+                // The domain is not present in any context entry yet, so
+                // these exact identity PTEs can be prepared without exposing
+                // a partially initialized map to the requester.
+                page_table.map_with_flags(
+                    physical,
+                    physical,
+                    PAGE_SIZE as usize,
+                    DMAR_PTE_R | DMAR_PTE_W,
+                )?;
+                owned_pages.push(IdentityPage {
+                    physical,
+                    references: 0,
+                    permanent: true,
+                });
+            }
+            Some(IdentityDmaOwner {
+                lease_id,
+                pages: owned_pages,
+                batches: Vec::new(),
+            })
+        } else {
+            None
+        };
         let root = page_table.root_physical();
         let domain = DeviceDomain {
             requester,
+            unit_index,
             id,
             page_table,
             iovas: IovaAllocator::new(self.iova_start, IOVA_END)?,
             mappings: Vec::new(),
+            state: DomainState::Installing,
+            identity_dma,
         };
         self.device_domains
             .try_reserve(1)
@@ -965,10 +1491,10 @@ impl Manager {
         self.device_domains.push(domain);
         let domain_index = self.device_domains.len() - 1;
 
-        let context_page = self
-            .context_tables
-            .get(requester.bus as usize)
-            .ok_or(Error::InvalidRange)?;
+        let Some(context_page) = self.context_tables.get(requester.bus as usize) else {
+            self.device_domains.swap_remove(domain_index);
+            return Err(Error::InvalidRange);
+        };
         // SAFETY: each retained page contains 256 zeroed/initialized hardware
         // context entries and is exclusively mutated under MANAGER's lock.
         let entries = unsafe {
@@ -978,7 +1504,7 @@ impl Manager {
             )
         };
         let rid = (u16::from(requester.device) << 3) | u16::from(requester.function);
-        ctx_id_entry_init(
+        if let Err(error) = ctx_id_entry_init(
             entries,
             rid,
             id,
@@ -987,16 +1513,314 @@ impl Manager {
             false,
             true,
             false,
-        )?;
+        ) {
+            // ctx_id_entry_init validates every fallible input before writing
+            // the entry; no hardware can have observed this page table yet.
+            self.device_domains.swap_remove(domain_index);
+            return Err(error);
+        }
         core::sync::atomic::fence(Ordering::Release);
-        for unit in &mut self.units {
-            unit.invalidate_all()?;
+        let installed =
+            complete_domain_install(&mut self.device_domains[domain_index].state, || {
+                invalidate_all_units(&mut self.units)
+            });
+        if installed.is_err() {
+            return Err(poison_dma_state());
         }
         info!(
             "vtd: installed requester domain id={} for {:04x}:{:02x}:{:02x}.{}",
             id, requester.segment, requester.bus, requester.device, requester.function
         );
         Ok(domain_index)
+    }
+
+    fn ensure_device_domain(&mut self, requester: tk_vtd::PciRequester) -> Result<usize, Error> {
+        if let Some(index) = self
+            .device_domains
+            .iter()
+            .position(|domain| domain.requester == requester)
+        {
+            require_ready_domain(self.device_domains[index].state)?;
+            return Ok(index);
+        }
+        self.create_device_domain(requester, None)
+    }
+
+    fn acquire_identity_dma(
+        &mut self,
+        requester: tk_vtd::PciRequester,
+        initial_pages: &[u64],
+    ) -> Result<u64, Error> {
+        if !REQUESTER_DOMAINS.load(Ordering::Acquire) {
+            return Err(Error::Unsupported);
+        }
+        if self
+            .device_domains
+            .iter()
+            .any(|domain| domain.requester == requester)
+        {
+            // Do not turn an already-published generic DMA domain into an
+            // identity aperture after the requester context is live.
+            return Err(Error::InvalidStructure);
+        }
+        let pages = identity_pages_for_requester(&self.dmar, requester, initial_pages)?;
+        let lease_id = self.next_identity_lease_id;
+        self.next_identity_lease_id = lease_id.checked_add(1).ok_or(Error::OutOfMemory)?;
+        self.create_device_domain(requester, Some((lease_id, pages)))?;
+        Ok(lease_id)
+    }
+
+    fn map_identity_pages(
+        &mut self,
+        requester: tk_vtd::PciRequester,
+        lease_id: u64,
+        physical_pages: &[u64],
+    ) -> Result<u64, Error> {
+        if physical_pages.is_empty() {
+            return Err(Error::InvalidRange);
+        }
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(physical_pages.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for &page in physical_pages {
+            if !page.is_multiple_of(PAGE_SIZE) || page >= 1 << 48 {
+                return Err(Error::InvalidRange);
+            }
+            pages.push(page);
+        }
+        pages.sort_unstable();
+        pages.dedup();
+
+        let domain_index = self
+            .device_domains
+            .iter()
+            .position(|domain| domain.requester == requester)
+            .ok_or(Error::NoDomain)?;
+        let unit_index = self.device_domains[domain_index].unit_index;
+        let mgaw = self.units.get(unit_index).ok_or(Error::NoDevice)?.mgaw;
+        let limit = 1u64
+            .checked_shl(u32::from(mgaw))
+            .ok_or(Error::InvalidRange)?;
+        if pages
+            .iter()
+            .any(|page| page.checked_add(PAGE_SIZE).is_none_or(|end| end > limit))
+        {
+            return Err(Error::InvalidRange);
+        }
+        let domain = &self.device_domains[domain_index];
+        require_ready_domain(domain.state)?;
+        let owner = domain.identity_dma.as_ref().ok_or(Error::NoDomain)?;
+        if owner.lease_id != lease_id {
+            return Err(Error::InvalidStructure);
+        }
+        let mut new_pages = Vec::new();
+        new_pages
+            .try_reserve_exact(pages.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for &page in &pages {
+            if !owner.pages.iter().any(|owned| owned.physical == page) {
+                new_pages.push(page);
+            } else if owner
+                .pages
+                .iter()
+                .find(|owned| owned.physical == page)
+                .is_some_and(|owned| owned.references == u32::MAX)
+            {
+                return Err(Error::OutOfMemory);
+            }
+        }
+        let mapping_id = self.next_identity_mapping_id;
+        self.next_identity_mapping_id = mapping_id.checked_add(1).ok_or(Error::OutOfMemory)?;
+
+        let batch_pages = {
+            let owner = self.device_domains[domain_index]
+                .identity_dma
+                .as_mut()
+                .ok_or(Error::NoDomain)?;
+            prepare_identity_batch_record(owner, &pages)?
+        };
+
+        let map_result = {
+            let Manager {
+                units,
+                device_domains,
+                ..
+            } = self;
+            let domain = device_domains
+                .get_mut(domain_index)
+                .ok_or(Error::NoDomain)?;
+            let owner = domain.identity_dma.as_mut().ok_or(Error::NoDomain)?;
+            let mut mapped_new = Vec::new();
+            mapped_new
+                .try_reserve_exact(new_pages.len())
+                .map_err(|_| Error::OutOfMemory)?;
+            let mut failure = None;
+            for &page in &new_pages {
+                match dmar_map_buf_locked(
+                    &mut domain.page_table,
+                    page,
+                    page,
+                    PAGE_SIZE as usize,
+                    DMAR_PTE_R | DMAR_PTE_W,
+                    4,
+                ) {
+                    Ok(()) => mapped_new.push(page),
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                if error == Error::Quarantined {
+                    publish_identity_batch(
+                        owner,
+                        mapping_id,
+                        batch_pages,
+                        MappingState::Quarantined,
+                    );
+                    domain.state = DomainState::Quarantined;
+                    return Err(poison_dma_state());
+                }
+                let mut rollback_failed = false;
+                for &page in mapped_new.iter().rev() {
+                    if dmar_unmap_buf_locked(&mut domain.page_table, page, PAGE_SIZE as usize)
+                        .is_err()
+                    {
+                        rollback_failed = true;
+                    }
+                }
+                if !mapped_new.is_empty() && invalidate_all_units(units).is_err() {
+                    rollback_failed = true;
+                }
+                if rollback_failed {
+                    publish_identity_batch(
+                        owner,
+                        mapping_id,
+                        batch_pages,
+                        MappingState::Quarantined,
+                    );
+                    domain.state = DomainState::Quarantined;
+                    return Err(poison_dma_state());
+                }
+                return Err(error);
+            }
+            publish_identity_batch_after_invalidation(owner, mapping_id, batch_pages, || {
+                if mapped_new.is_empty() {
+                    Ok(())
+                } else {
+                    invalidate_all_units(units)
+                }
+            })
+        };
+        match map_result {
+            Ok(()) => Ok(mapping_id),
+            Err(Error::Quarantined) => {
+                self.device_domains[domain_index].state = DomainState::Quarantined;
+                if let Some(owner) = self.device_domains[domain_index].identity_dma.as_mut()
+                    && let Some(batch) = owner
+                        .batches
+                        .iter_mut()
+                        .find(|batch| batch.id == mapping_id)
+                {
+                    batch.state = MappingState::Quarantined;
+                }
+                Err(poison_dma_state())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn unmap_identity_pages(
+        &mut self,
+        requester: tk_vtd::PciRequester,
+        lease_id: u64,
+        mapping_id: u64,
+    ) -> Result<(), Error> {
+        let domain_index = self
+            .device_domains
+            .iter()
+            .position(|domain| domain.requester == requester)
+            .ok_or(Error::NoDomain)?;
+        let domain = &self.device_domains[domain_index];
+        require_ready_domain(domain.state)?;
+        let owner = domain.identity_dma.as_ref().ok_or(Error::NoDomain)?;
+        if owner.lease_id != lease_id {
+            return Err(Error::InvalidStructure);
+        }
+        let clear_result = {
+            let Manager {
+                units,
+                device_domains,
+                ..
+            } = self;
+            let domain = device_domains
+                .get_mut(domain_index)
+                .ok_or(Error::NoDomain)?;
+            let DeviceDomain {
+                page_table,
+                identity_dma,
+                ..
+            } = domain;
+            let owner = identity_dma.as_mut().ok_or(Error::NoDomain)?;
+            retire_identity_batch_after_invalidation(
+                owner,
+                mapping_id,
+                |page| dmar_unmap_buf_locked(page_table, page, PAGE_SIZE as usize),
+                || invalidate_all_units(units),
+            )
+        };
+        match clear_result {
+            Ok(()) => Ok(()),
+            Err(Error::Quarantined) => {
+                self.device_domains[domain_index].state = DomainState::Quarantined;
+                Err(poison_dma_state())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn release_identity_dma(
+        &mut self,
+        requester: tk_vtd::PciRequester,
+        lease_id: u64,
+    ) -> Result<(), Error> {
+        let domain_index = self
+            .device_domains
+            .iter()
+            .position(|domain| domain.requester == requester)
+            .ok_or(Error::NoDomain)?;
+        let clear_result = {
+            let Manager {
+                units,
+                device_domains,
+                ..
+            } = self;
+            let domain = device_domains
+                .get_mut(domain_index)
+                .ok_or(Error::NoDomain)?;
+            require_ready_domain(domain.state)?;
+            let DeviceDomain {
+                page_table,
+                identity_dma,
+                ..
+            } = domain;
+            retire_identity_lease_after_invalidation(
+                identity_dma,
+                lease_id,
+                |page| dmar_unmap_buf_locked(page_table, page, PAGE_SIZE as usize),
+                || invalidate_all_units(units),
+            )
+        };
+        match clear_result {
+            Ok(()) => Ok(()),
+            Err(Error::Quarantined) => {
+                self.device_domains[domain_index].state = DomainState::Quarantined;
+                Err(poison_dma_state())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn map_for(
@@ -1020,6 +1844,10 @@ impl Manager {
             .device_domains
             .get_mut(domain_index)
             .ok_or(Error::NoDomain)?;
+        require_ready_domain(domain.state)?;
+        if domain.identity_dma.is_some() {
+            return Err(Error::Unsupported);
+        }
         domain
             .mappings
             .try_reserve(1)
@@ -1033,21 +1861,49 @@ impl Manager {
             DMAR_PTE_R | DMAR_PTE_W,
             4,
         ) {
-            let _ = domain.iovas.release(iova, mapped_length);
+            if error == Error::Quarantined {
+                domain.mappings.push(Mapping {
+                    device_address: iova + offset as u64,
+                    length,
+                    physical: aligned_physical,
+                    iova,
+                    mapped_length,
+                    state: MappingState::Quarantined,
+                });
+                domain.state = DomainState::Quarantined;
+                return Err(poison_dma_state());
+            }
+            domain.iovas.release(iova, mapped_length)?;
             return Err(error);
         }
-        for unit in &mut self.units {
-            unit.invalidate_all()?;
-        }
         let device_address = iova + offset as u64;
-        domain.mappings.push(Mapping {
+        let mapping = Mapping {
             device_address,
             length,
             physical: aligned_physical,
             iova,
             mapped_length,
+            state: MappingState::Active,
+        };
+        let Manager {
+            units,
+            device_domains,
+            ..
+        } = self;
+        let domain = device_domains
+            .get_mut(domain_index)
+            .ok_or(Error::NoDomain)?;
+        let result = publish_mapping_after_invalidation(&mut domain.mappings, mapping, || {
+            invalidate_all_units(units)
         });
-        Ok(device_address)
+        match result {
+            Ok(address) => Ok(address),
+            Err(Error::Quarantined) => {
+                domain.state = DomainState::Quarantined;
+                Err(poison_dma_state())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn unmap_for(
@@ -1061,6 +1917,10 @@ impl Manager {
             .device_domains
             .get_mut(domain_index)
             .ok_or(Error::NoDomain)?;
+        require_ready_domain(domain.state)?;
+        if domain.identity_dma.is_some() {
+            return Err(Error::Unsupported);
+        }
         let index = domain
             .mappings
             .iter()
@@ -1068,23 +1928,36 @@ impl Manager {
                 mapping.device_address == device_address && mapping.length == length
             })
             .ok_or(Error::InvalidRange)?;
-        let mapping = &domain.mappings[index];
-        dmar_unmap_buf_locked(&mut domain.page_table, mapping.iova, mapping.mapped_length)?;
-        for unit in &mut self.units {
-            if let Err(error) = unit.invalidate_all() {
-                let _ = dmar_map_buf_locked(
-                    &mut domain.page_table,
-                    mapping.physical,
-                    mapping.iova,
-                    mapping.mapped_length,
-                    DMAR_PTE_R | DMAR_PTE_W,
-                    4,
-                );
-                return Err(error);
+        let Manager {
+            units,
+            device_domains,
+            ..
+        } = self;
+        let domain = device_domains
+            .get_mut(domain_index)
+            .ok_or(Error::NoDomain)?;
+        let DeviceDomain {
+            mappings,
+            page_table,
+            iovas,
+            state,
+            ..
+        } = domain;
+        let mapping = mappings.get(index).copied().ok_or(Error::InvalidRange)?;
+        match retire_mapping_after_invalidation(
+            mappings,
+            index,
+            iovas,
+            || dmar_unmap_buf_locked(page_table, mapping.iova, mapping.mapped_length),
+            || invalidate_all_units(units),
+        ) {
+            Ok(()) => Ok(()),
+            Err(Error::Quarantined) => {
+                *state = DomainState::Quarantined;
+                Err(poison_dma_state())
             }
+            Err(error) => Err(error),
         }
-        let mapping = domain.mappings.swap_remove(index);
-        domain.iovas.release(mapping.iova, mapping.mapped_length)
     }
 
     fn map_msi(
@@ -1093,15 +1966,8 @@ impl Manager {
         vector: u8,
         destination: u32,
     ) -> Result<Option<(u64, u32)>, Error> {
-        let Some(selected) = tk_vtd::select_unit(&self.dmar, requester) else {
-            return Err(Error::NoDevice);
-        };
-        let unit_index = self
-            .dmar
-            .units
-            .iter()
-            .position(|unit| unit.register_base == selected.register_base)
-            .ok_or(Error::NoDevice)?;
+        let unit_index =
+            dmar_unit_index_for_requester(&self.dmar, requester, &dmar_path(requester))?;
         let Manager {
             units, ir_routes, ..
         } = self;
@@ -1118,12 +1984,10 @@ impl Manager {
         let (Some(table), Some(remapper)) = (ir_table.as_ref(), ir.as_mut()) else {
             return Ok(None);
         };
-        if ir_routes
-            .iter()
-            .any(|(owned_vector, ..)| *owned_vector == vector)
-        {
+        if ir_routes.iter().any(|route| route.vector == vector) {
             return Err(Error::InvalidStructure);
         }
+        ir_routes.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
         let mut io = UnitInterruptIo {
             mmio: *mmio,
             qi_physical: qi.physical,
@@ -1135,6 +1999,18 @@ impl Manager {
             irte_count: remapper.entry_count() as u32,
         };
         let cookie = remapper.allocate_msi(&mut io, 1)?[0];
+        let address =
+            0xfee0_0018 | (u64::from(cookie & 0x7fff) << 5) | (u64::from(cookie & 0x8000) << 2);
+        let route_index = ir_routes.len();
+        ir_routes.push(IrRoute {
+            requester,
+            vector,
+            unit_index,
+            cookie,
+            message_address: address,
+            message_data: 0,
+            state: IrRouteState::Quarantined,
+        });
         match remapper.map_msi(
             &mut io,
             InterruptSource::Pci {
@@ -1147,31 +2023,48 @@ impl Manager {
             vector,
             cookie,
         ) {
-            Ok(route) => {
-                ir_routes.push((vector, unit_index, cookie));
+            Ok((message_address, message_data)) => {
+                let record = &mut ir_routes[route_index];
+                record.message_address = message_address;
+                record.message_data = message_data;
+                record.state = IrRouteState::Active;
                 info!(
                     "vtd: MSI vector={vector:#x} requester={:04x}:{:02x}:{:02x}.{} IRTE={cookie}",
                     requester.segment, requester.bus, requester.device, requester.function
                 );
-                Ok(Some(route))
+                Ok(Some((message_address, message_data)))
             }
-            Err(error) => {
-                let _ = remapper.unmap_msi(&mut io, Some(cookie));
-                Err(error)
+            Err(_error) => {
+                // Programming may have reached the IRTE before IEC
+                // invalidation failed. Retain the allocated cookie and route
+                // owner, then refuse further DMA/interrupt ownership.
+                Err(poison_dma_state())
             }
         }
+    }
+
+    fn msi_vector(
+        &self,
+        requester: tk_vtd::PciRequester,
+        message_address: u64,
+        message_data: u32,
+    ) -> Result<Option<u8>, Error> {
+        find_owned_msi_vector(&self.ir_routes, requester, message_address, message_data)
     }
 
     fn unmap_msi(&mut self, vector: u8) -> Result<(), Error> {
         let Some(index) = self
             .ir_routes
             .iter()
-            .position(|(owned_vector, ..)| *owned_vector == vector)
+            .position(|route| route.vector == vector)
         else {
             return Ok(());
         };
-        let (_, unit_index, cookie) = self.ir_routes.swap_remove(index);
-        let unit = self.units.get_mut(unit_index).ok_or(Error::NoDevice)?;
+        let route = self.ir_routes[index];
+        let unit = self
+            .units
+            .get_mut(route.unit_index)
+            .ok_or(Error::NoDevice)?;
         let (Some(table), Some(remapper)) = (unit.ir_table.as_ref(), unit.ir.as_mut()) else {
             return Err(Error::NoDomain);
         };
@@ -1185,7 +2078,13 @@ impl Manager {
             ir_table_virtual: table.virtual_address,
             irte_count: remapper.entry_count() as u32,
         };
-        remapper.unmap_msi(&mut io, Some(cookie))
+        match retire_ir_route_after_invalidation(&mut self.ir_routes, index, || {
+            remapper.unmap_msi(&mut io, Some(route.cookie))
+        }) {
+            Ok(()) => Ok(()),
+            Err(Error::Quarantined) => Err(poison_dma_state()),
+            Err(error) => Err(error),
+        }
     }
 
     fn map(&mut self, physical: u64, length: usize) -> Result<u64, Error> {
@@ -1199,33 +2098,52 @@ impl Manager {
             .and_then(|value| value.checked_add(PAGE_SIZE as usize - 1))
             .ok_or(Error::InvalidRange)?
             & !(PAGE_SIZE as usize - 1);
-        self.mappings
-            .try_reserve(1)
-            .map_err(|_| Error::OutOfMemory)?;
-        let iova = self.iovas.allocate(mapped_length)?;
+        let Manager {
+            page_table,
+            iovas,
+            mappings,
+            units,
+            ..
+        } = self;
+        mappings.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        let iova = iovas.allocate(mapped_length)?;
         if let Err(error) = dmar_map_buf_locked(
-            &mut self.page_table,
+            page_table,
             aligned_physical,
             iova,
             mapped_length,
             DMAR_PTE_R | DMAR_PTE_W,
             4,
         ) {
-            let _ = self.iovas.release(iova, mapped_length);
+            if error == Error::Quarantined {
+                mappings.push(Mapping {
+                    device_address: iova + offset as u64,
+                    length,
+                    physical: aligned_physical,
+                    iova,
+                    mapped_length,
+                    state: MappingState::Quarantined,
+                });
+                return Err(poison_dma_state());
+            }
+            iovas.release(iova, mapped_length)?;
             return Err(error);
         }
-        for unit in &mut self.units {
-            unit.invalidate_all()?;
-        }
         let device_address = iova + offset as u64;
-        self.mappings.push(Mapping {
+        let mapping = Mapping {
             device_address,
             length,
             physical: aligned_physical,
             iova,
             mapped_length,
-        });
-        Ok(device_address)
+            state: MappingState::Active,
+        };
+        match publish_mapping_after_invalidation(mappings, mapping, || invalidate_all_units(units))
+        {
+            Ok(address) => Ok(address),
+            Err(Error::Quarantined) => Err(poison_dma_state()),
+            Err(error) => Err(error),
+        }
     }
 
     fn unmap(&mut self, device_address: u64, length: usize) -> Result<(), Error> {
@@ -1236,26 +2154,126 @@ impl Manager {
                 mapping.device_address == device_address && mapping.length == length
             })
             .ok_or(Error::InvalidRange)?;
-        let mapping = &self.mappings[index];
-        dmar_unmap_buf_locked(&mut self.page_table, mapping.iova, mapping.mapped_length)?;
-        for unit in &mut self.units {
-            if let Err(error) = unit.invalidate_all() {
-                // Restore the PTE before reporting failure. Callers must not
-                // release the backing page while a stale IOTLB entry may exist.
-                let _ = dmar_map_buf_locked(
-                    &mut self.page_table,
-                    mapping.physical,
-                    mapping.iova,
-                    mapping.mapped_length,
-                    DMAR_PTE_R | DMAR_PTE_W,
-                    4,
-                );
-                return Err(error);
-            }
+        let Manager {
+            mappings,
+            page_table,
+            iovas,
+            units,
+            ..
+        } = self;
+        let mapping = mappings.get(index).copied().ok_or(Error::InvalidRange)?;
+        match retire_mapping_after_invalidation(
+            mappings,
+            index,
+            iovas,
+            || dmar_unmap_buf_locked(page_table, mapping.iova, mapping.mapped_length),
+            || invalidate_all_units(units),
+        ) {
+            Ok(()) => Ok(()),
+            Err(Error::Quarantined) => Err(poison_dma_state()),
+            Err(error) => Err(error),
         }
-        let mapping = self.mappings.swap_remove(index);
-        self.iovas.release(mapping.iova, mapping.mapped_length)
     }
+}
+
+fn next_monotonic_id(counter: &AtomicU64) -> Result<u64, Error> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+        .map_err(|_| Error::OutOfMemory)
+}
+
+fn normalize_lease_pages(pages: &[u64]) -> Result<Vec<u64>, Error> {
+    if pages.is_empty() {
+        return Err(Error::InvalidRange);
+    }
+    let mut normalized = Vec::new();
+    normalized
+        .try_reserve_exact(pages.len())
+        .map_err(|_| Error::OutOfMemory)?;
+    for &page in pages {
+        if !page.is_multiple_of(PAGE_SIZE) || page >= 1 << 48 {
+            return Err(Error::InvalidRange);
+        }
+        normalized.push(page);
+    }
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn direct_identity_acquire(
+    requester: tk_vtd::PciRequester,
+    initial_pages: &[u64],
+) -> Result<u64, Error> {
+    let initial_pages = normalize_lease_pages(initial_pages)?;
+    let mut leases = DIRECT_IDENTITY_LEASES.lock();
+    if leases.iter().any(|lease| lease.requester == requester) {
+        return Err(Error::InvalidStructure);
+    }
+    leases.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+    let id = next_monotonic_id(&NEXT_DIRECT_LEASE_ID)?;
+    leases.push(DirectIdentityLease {
+        requester,
+        id,
+        initial_pages,
+        batches: Vec::new(),
+    });
+    Ok(id)
+}
+
+fn direct_identity_map(
+    requester: tk_vtd::PciRequester,
+    lease_id: u64,
+    pages: &[u64],
+) -> Result<u64, Error> {
+    let pages = normalize_lease_pages(pages)?;
+    let mut leases = DIRECT_IDENTITY_LEASES.lock();
+    let lease = leases
+        .iter_mut()
+        .find(|lease| lease.requester == requester && lease.id == lease_id)
+        .ok_or(Error::NoDomain)?;
+    lease
+        .batches
+        .try_reserve(1)
+        .map_err(|_| Error::OutOfMemory)?;
+    let id = next_monotonic_id(&NEXT_DIRECT_MAPPING_ID)?;
+    lease.batches.push(DirectIdentityBatch { id, pages });
+    Ok(id)
+}
+
+fn direct_identity_unmap(
+    requester: tk_vtd::PciRequester,
+    lease_id: u64,
+    mapping_id: u64,
+) -> Result<(), Error> {
+    let mut leases = DIRECT_IDENTITY_LEASES.lock();
+    let lease = leases
+        .iter_mut()
+        .find(|lease| lease.requester == requester && lease.id == lease_id)
+        .ok_or(Error::NoDomain)?;
+    let index = lease
+        .batches
+        .iter()
+        .position(|batch| batch.id == mapping_id)
+        .ok_or(Error::InvalidRange)?;
+    if lease.batches[index].pages.is_empty() {
+        return Err(Error::InvalidStructure);
+    }
+    lease.batches.swap_remove(index);
+    Ok(())
+}
+
+fn direct_identity_release(requester: tk_vtd::PciRequester, lease_id: u64) -> Result<(), Error> {
+    let mut leases = DIRECT_IDENTITY_LEASES.lock();
+    let index = leases
+        .iter()
+        .position(|lease| lease.requester == requester && lease.id == lease_id)
+        .ok_or(Error::NoDomain)?;
+    if leases[index].initial_pages.is_empty() || !leases[index].batches.is_empty() {
+        return Err(Error::InvalidStructure);
+    }
+    leases.swap_remove(index);
+    Ok(())
 }
 
 fn table(engine: &Engine) -> Result<Option<DmarTable>, Error> {
@@ -1308,6 +2326,7 @@ fn release_boot_resources(
 pub(super) fn init(engine: &Engine) -> Result<(), Error> {
     let mut hardware_touched = false;
     let mut identity_fallback_safe = false;
+    DMA_POISONED.store(false, Ordering::Release);
     *FAILURE.lock() = None;
     let result = init_translation(engine, &mut hardware_touched, &mut identity_fallback_safe);
     if let Err(error) = result
@@ -1480,6 +2499,9 @@ fn init_translation(
         let unit = Unit {
             mmio: probe.mmio,
             register_base: probe.register_base,
+            mgaw: (DMAR_CAP_MGAW(probe.cap) + 1) as u8,
+            domain_count: cap_domain_count(probe.cap),
+            next_domain_id: 2,
             qi,
             queue: QiQueue::new(QI_BYTES as u32)?,
             gcmd: 0,
@@ -1538,8 +2560,9 @@ fn init_translation(
         ir_routes: Vec::new(),
         identity_end: maximum,
         iova_start,
-        next_domain_id: 2,
         device_domains: Vec::new(),
+        next_identity_lease_id: 1,
+        next_identity_mapping_id: 1,
     };
     *MANAGER.lock() = Some(manager);
     let requester_domains = match axhal::boot::command_line_value("iommu_domains") {
@@ -1587,7 +2610,7 @@ impl tk_vtd::PlatformDma for PlatformDma {
                 .ok_or(Error::NoDomain)?
                 .map(physical, length)
         } else {
-            Err(Error::NoDomain)
+            Err(failed_dma_error())
         }
     }
     fn unmap(device_address: u64, length: usize) -> Result<(), Error> {
@@ -1601,7 +2624,7 @@ impl tk_vtd::PlatformDma for PlatformDma {
                 .ok_or(Error::NoDomain)?
                 .unmap(device_address, length)
         } else {
-            Err(Error::NoDomain)
+            Err(failed_dma_error())
         }
     }
 
@@ -1626,7 +2649,7 @@ impl tk_vtd::PlatformDma for PlatformDma {
                 manager.map(physical, length)
             }
         } else {
-            Err(Error::NoDomain)
+            Err(failed_dma_error())
         };
         if let Err(error) = result {
             let message = alloc::format!(
@@ -1662,7 +2685,7 @@ impl tk_vtd::PlatformDma for PlatformDma {
                 manager.unmap(device_address, length)
             }
         } else {
-            Err(Error::NoDomain)
+            Err(failed_dma_error())
         }
     }
 }
@@ -1680,7 +2703,7 @@ impl tk_vtd::PlatformInterruptRemap for PlatformInterruptRemap {
         }
         match MODE.load(Ordering::Acquire) {
             MODE_UNKNOWN | MODE_IDENTITY => return Ok(None),
-            MODE_FAILED => return Err(Error::NoDomain),
+            MODE_FAILED => return Err(failed_dma_error()),
             MODE_ENABLED => {}
             _ => return Err(Error::NoDomain),
         }
@@ -1692,8 +2715,11 @@ impl tk_vtd::PlatformInterruptRemap for PlatformInterruptRemap {
     }
 
     fn unmap_msi(vector: u8) -> Result<(), Error> {
-        if MODE.load(Ordering::Acquire) != MODE_ENABLED {
-            return Ok(());
+        match MODE.load(Ordering::Acquire) {
+            MODE_UNKNOWN | MODE_IDENTITY => return Ok(()),
+            MODE_FAILED => return Err(failed_dma_error()),
+            MODE_ENABLED => {}
+            _ => return Err(Error::NoDomain),
         }
         MANAGER
             .lock()
@@ -1701,18 +2727,114 @@ impl tk_vtd::PlatformInterruptRemap for PlatformInterruptRemap {
             .ok_or(Error::NoDomain)?
             .unmap_msi(vector)
     }
+
+    fn msi_vector(
+        requester: tk_vtd::PciRequester,
+        message_address: u64,
+        message_data: u32,
+    ) -> Result<Option<u8>, Error> {
+        match MODE.load(Ordering::Acquire) {
+            MODE_UNKNOWN | MODE_IDENTITY => return Ok(None),
+            MODE_FAILED => return Err(failed_dma_error()),
+            MODE_ENABLED => {}
+            _ => return Err(Error::NoDomain),
+        }
+        MANAGER.lock().as_ref().ok_or(Error::NoDomain)?.msi_vector(
+            requester,
+            message_address,
+            message_data,
+        )
+    }
+}
+
+struct PlatformIdentityDma;
+#[crate_interface::impl_interface]
+impl tk_vtd::PlatformIdentityDma for PlatformIdentityDma {
+    fn acquire_identity_dma(
+        requester: tk_vtd::PciRequester,
+        initial_pages: &[u64],
+    ) -> Result<u64, Error> {
+        match MODE.load(Ordering::Acquire) {
+            MODE_UNKNOWN | MODE_IDENTITY => direct_identity_acquire(requester, initial_pages),
+            MODE_FAILED => Err(failed_dma_error()),
+            MODE_ENABLED => MANAGER
+                .lock()
+                .as_mut()
+                .ok_or(Error::NoDomain)?
+                .acquire_identity_dma(requester, initial_pages),
+            _ => Err(Error::NoDomain),
+        }
+    }
+
+    fn map_identity_pages(
+        requester: tk_vtd::PciRequester,
+        lease_id: u64,
+        pages: &[u64],
+    ) -> Result<u64, Error> {
+        match MODE.load(Ordering::Acquire) {
+            MODE_UNKNOWN | MODE_IDENTITY => direct_identity_map(requester, lease_id, pages),
+            MODE_FAILED => Err(failed_dma_error()),
+            MODE_ENABLED => MANAGER
+                .lock()
+                .as_mut()
+                .ok_or(Error::NoDomain)?
+                .map_identity_pages(requester, lease_id, pages),
+            _ => Err(Error::NoDomain),
+        }
+    }
+
+    fn unmap_identity_pages(
+        requester: tk_vtd::PciRequester,
+        lease_id: u64,
+        mapping_id: u64,
+    ) -> Result<(), Error> {
+        match MODE.load(Ordering::Acquire) {
+            MODE_UNKNOWN | MODE_IDENTITY => direct_identity_unmap(requester, lease_id, mapping_id),
+            MODE_FAILED => Err(failed_dma_error()),
+            MODE_ENABLED => MANAGER
+                .lock()
+                .as_mut()
+                .ok_or(Error::NoDomain)?
+                .unmap_identity_pages(requester, lease_id, mapping_id),
+            _ => Err(Error::NoDomain),
+        }
+    }
+
+    fn release_identity_dma(requester: tk_vtd::PciRequester, lease_id: u64) -> Result<(), Error> {
+        match MODE.load(Ordering::Acquire) {
+            MODE_UNKNOWN | MODE_IDENTITY => direct_identity_release(requester, lease_id),
+            MODE_FAILED => Err(failed_dma_error()),
+            MODE_ENABLED => MANAGER
+                .lock()
+                .as_mut()
+                .ok_or(Error::NoDomain)?
+                .release_identity_dma(requester, lease_id),
+            _ => Err(Error::NoDomain),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloc::sync::Arc;
+    use alloc::{sync::Arc, vec, vec::Vec};
     use core::sync::atomic::{AtomicUsize, Ordering};
 
+    use tk_vtd::iova::IovaAllocator;
+
     use super::{
-        DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS_2M, DMAR_ECAP_EIM, DMAR_ECAP_IR, DMAR_ECAP_QI, Error,
-        MODE_ENABLED, MODE_FAILED, MODE_IDENTITY, MODE_UNKNOWN, UnitProbe, identity_dma_in_mode,
-        identity_fallback_safe_before_enable, pci_dma_allowed_in_mode, quarantine_boot_resources,
-        validate_all_unit_capabilities, validate_unit_capabilities,
+        DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS_2M, DMAR_ECAP_EIM, DMAR_ECAP_IR, DMAR_ECAP_QI,
+        DomainState, Error, IdentityDmaOwner, IdentityPage, IrRoute, IrRouteState, MODE_ENABLED,
+        MODE_FAILED, MODE_IDENTITY, MODE_UNKNOWN, Mapping, MappingState, UnitProbe,
+        cap_domain_count, complete_domain_install, direct_identity_acquire, direct_identity_map,
+        direct_identity_release, direct_identity_unmap, find_owned_msi_vector,
+        identity_batch_removal_pages, identity_dma_in_mode, identity_fallback_safe_before_enable,
+        identity_pages_for_path, pci_dma_allowed_in_mode, prepare_identity_batch_record,
+        publish_identity_batch, publish_identity_batch_after_invalidation,
+        publish_mapping_after_invalidation, quarantine_boot_resources, require_ready_domain,
+        retire_identity_batch_after_invalidation, retire_identity_batch_record,
+        retire_identity_lease_after_invalidation, retire_ir_route_after_invalidation,
+        retire_mapping_after_invalidation, take_domain_id, validate_all_unit_capabilities,
+        validate_unit_capabilities,
     };
 
     struct DropProbe(Arc<AtomicUsize>);
@@ -1773,6 +2895,36 @@ mod tests {
     }
 
     #[test]
+    fn requester_domain_ids_respect_selected_drhd_cap_nd_capacity() {
+        assert_eq!(cap_domain_count(0), 16);
+        assert_eq!(cap_domain_count(1), 64);
+        assert_eq!(cap_domain_count(7), 1 << 18);
+        let mut first_unit_next_did = 2;
+        let mut second_unit_next_did = 2;
+        assert_eq!(take_domain_id(&mut first_unit_next_did, 16), Ok(2));
+        assert_eq!(take_domain_id(&mut second_unit_next_did, 16), Ok(2));
+        for expected in 3..16 {
+            assert_eq!(take_domain_id(&mut first_unit_next_did, 16), Ok(expected));
+        }
+        assert_eq!(
+            take_domain_id(&mut first_unit_next_did, 16),
+            Err(Error::OutOfMemory)
+        );
+        assert_eq!(first_unit_next_did, 16);
+        assert_eq!(second_unit_next_did, 3);
+        let mut high_capacity_next_did = u32::from(u16::MAX);
+        assert_eq!(
+            take_domain_id(&mut high_capacity_next_did, 1 << 18),
+            Ok(u16::MAX)
+        );
+        assert_eq!(high_capacity_next_did, 1 << 16);
+        assert_eq!(
+            take_domain_id(&mut high_capacity_next_did, 1 << 18),
+            Err(Error::OutOfMemory)
+        );
+    }
+
+    #[test]
     fn register_invalidation_supports_dma_without_qi_but_not_interrupt_remapping() {
         let cap = (38 << 16) | (DMAR_CAP_SAGAW_4LVL << 8) | (DMAR_CAP_SPS_2M << 34);
         assert_eq!(
@@ -1820,5 +2972,352 @@ mod tests {
         assert!(!identity_fallback_safe_before_enable([0, super::GSTS_TES]));
         assert!(!identity_fallback_safe_before_enable([0, super::GSTS_QIES]));
         assert!(!identity_fallback_safe_before_enable([0, super::GSTS_IRES]));
+    }
+
+    #[test]
+    fn failed_context_invalidation_poisons_domain_and_retry_cannot_skip_it() {
+        let mut state = DomainState::Installing;
+        assert_eq!(
+            complete_domain_install(&mut state, || Err(Error::Timeout)),
+            Err(Error::Quarantined)
+        );
+        assert_eq!(state, DomainState::Quarantined);
+        assert_eq!(require_ready_domain(state), Err(Error::Quarantined));
+        let mut ready = DomainState::Installing;
+        assert_eq!(complete_domain_install(&mut ready, || Ok(())), Ok(()));
+        assert_eq!(require_ready_domain(ready), Ok(()));
+    }
+
+    fn mapping(iova: u64) -> Mapping {
+        Mapping {
+            device_address: iova,
+            length: 4096,
+            physical: 0x8000,
+            iova,
+            mapped_length: 4096,
+            state: MappingState::Active,
+        }
+    }
+
+    #[test]
+    fn failed_map_invalidation_retains_quarantined_mapping_record() {
+        let mut mappings = Vec::new();
+        let expected = mapping(0x4000);
+        assert_eq!(
+            publish_mapping_after_invalidation(&mut mappings, expected, || Err(Error::Timeout)),
+            Err(Error::Quarantined)
+        );
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].physical, expected.physical);
+        assert_eq!(mappings[0].state, MappingState::Quarantined);
+    }
+
+    #[test]
+    fn failed_unmap_invalidation_keeps_backing_record_and_iova_reserved() {
+        let mut iovas = IovaAllocator::new(0x1000, 0x10_000).unwrap();
+        let iova = iovas.allocate(4096).unwrap();
+        let mut mappings = vec![mapping(iova)];
+        let mut pte_cleared = false;
+        assert_eq!(
+            retire_mapping_after_invalidation(
+                &mut mappings,
+                0,
+                &mut iovas,
+                || {
+                    pte_cleared = true;
+                    Ok(())
+                },
+                || Err(Error::Timeout),
+            ),
+            Err(Error::Quarantined)
+        );
+        assert!(pte_cleared);
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].physical, 0x8000);
+        assert_eq!(mappings[0].state, MappingState::Quarantined);
+        assert_ne!(iovas.allocate(4096).unwrap(), iova);
+    }
+
+    fn test_requester() -> tk_vtd::PciRequester {
+        tk_vtd::PciRequester {
+            segment: 0,
+            bus: 0,
+            device: 2,
+            function: 0,
+        }
+    }
+
+    fn test_ir_route() -> IrRoute {
+        IrRoute {
+            requester: test_requester(),
+            vector: 0xee,
+            unit_index: 0,
+            cookie: 7,
+            message_address: 0xfee0_00f8,
+            message_data: 0,
+            state: IrRouteState::Active,
+        }
+    }
+
+    #[test]
+    fn remapped_msi_query_requires_exact_requester_address_and_data() {
+        let route = test_ir_route();
+        assert_eq!(
+            find_owned_msi_vector(
+                &[route],
+                route.requester,
+                route.message_address,
+                route.message_data,
+            ),
+            Ok(Some(route.vector))
+        );
+        assert_eq!(
+            find_owned_msi_vector(&[route], route.requester, route.message_address, 0xee,),
+            Ok(None)
+        );
+        assert_eq!(
+            find_owned_msi_vector(
+                &[route],
+                tk_vtd::PciRequester {
+                    device: 3,
+                    ..route.requester
+                },
+                route.message_address,
+                route.message_data,
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            find_owned_msi_vector(
+                &[route],
+                route.requester,
+                route.message_address ^ 0x20,
+                route.message_data,
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn failed_ir_invalidation_keeps_route_quarantined_until_successful_retirement() {
+        let mut routes = alloc::vec![test_ir_route()];
+        assert_eq!(
+            retire_ir_route_after_invalidation(&mut routes, 0, || Err(Error::Timeout)),
+            Err(Error::Quarantined)
+        );
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].state, IrRouteState::Quarantined);
+        assert_eq!(
+            find_owned_msi_vector(
+                &routes,
+                routes[0].requester,
+                routes[0].message_address,
+                routes[0].message_data,
+            ),
+            Err(Error::Quarantined)
+        );
+        assert_eq!(
+            retire_ir_route_after_invalidation(&mut routes, 0, || Ok(())),
+            Err(Error::Quarantined)
+        );
+        assert_eq!(routes.len(), 1);
+    }
+
+    #[test]
+    fn successfully_retired_ir_route_is_no_longer_resolvable() {
+        let mut routes = alloc::vec![test_ir_route()];
+        let route = routes[0];
+        assert_eq!(
+            retire_ir_route_after_invalidation(&mut routes, 0, || Ok(())),
+            Ok(())
+        );
+        assert!(routes.is_empty());
+        assert_eq!(
+            find_owned_msi_vector(
+                &routes,
+                route.requester,
+                route.message_address,
+                route.message_data,
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn identity_batches_reference_count_overlaps_and_preserve_initial_pages() {
+        let mut owner = IdentityDmaOwner {
+            lease_id: 9,
+            pages: vec![IdentityPage {
+                physical: 0x1000,
+                references: 0,
+                permanent: true,
+            }],
+            batches: Vec::new(),
+        };
+        let first = prepare_identity_batch_record(&mut owner, &[0x1000, 0x2000]).unwrap();
+        publish_identity_batch(&mut owner, 1, first, MappingState::Active);
+        let second = prepare_identity_batch_record(&mut owner, &[0x2000, 0x3000]).unwrap();
+        publish_identity_batch(&mut owner, 2, second, MappingState::Active);
+
+        assert_eq!(
+            identity_batch_removal_pages(&owner, 1).unwrap(),
+            Vec::<u64>::new()
+        );
+        retire_identity_batch_record(&mut owner, 1).unwrap();
+        assert_eq!(owner.pages.len(), 3);
+        assert!(
+            owner
+                .pages
+                .iter()
+                .any(|page| page.physical == 0x1000 && page.permanent)
+        );
+        assert!(
+            owner
+                .pages
+                .iter()
+                .any(|page| page.physical == 0x2000 && page.references == 1)
+        );
+        assert_eq!(
+            identity_batch_removal_pages(&owner, 2).unwrap(),
+            [0x2000, 0x3000]
+        );
+        retire_identity_batch_record(&mut owner, 2).unwrap();
+        assert_eq!(owner.pages.len(), 1);
+        assert_eq!(owner.pages[0].physical, 0x1000);
+        assert_eq!(owner.pages[0].references, 0);
+    }
+
+    #[test]
+    fn failed_identity_map_and_unmap_invalidations_keep_all_page_owners() {
+        let mut owner = IdentityDmaOwner {
+            lease_id: 12,
+            pages: vec![IdentityPage {
+                physical: 0x1000,
+                references: 0,
+                permanent: true,
+            }],
+            batches: Vec::new(),
+        };
+        let batch = prepare_identity_batch_record(&mut owner, &[0x2000]).unwrap();
+        assert_eq!(
+            publish_identity_batch_after_invalidation(&mut owner, 1, batch, || {
+                Err(Error::Timeout)
+            }),
+            Err(Error::Quarantined)
+        );
+        assert_eq!(owner.pages.len(), 2);
+        assert_eq!(owner.pages[1].physical, 0x2000);
+        assert_eq!(owner.pages[1].references, 1);
+        assert_eq!(owner.batches[0].state, MappingState::Quarantined);
+
+        let mut lease = Some(IdentityDmaOwner {
+            lease_id: 13,
+            pages: vec![IdentityPage {
+                physical: 0x4000,
+                references: 0,
+                permanent: true,
+            }],
+            batches: Vec::new(),
+        });
+        let mut clear_attempted = false;
+        assert_eq!(
+            retire_identity_lease_after_invalidation(
+                &mut lease,
+                13,
+                |_| {
+                    clear_attempted = true;
+                    Ok(())
+                },
+                || Err(Error::Timeout),
+            ),
+            Err(Error::Quarantined)
+        );
+        assert!(clear_attempted);
+        assert_eq!(lease.as_ref().unwrap().pages[0].physical, 0x4000);
+
+        let mut active_owner = IdentityDmaOwner {
+            lease_id: 14,
+            pages: vec![IdentityPage {
+                physical: 0x6000,
+                references: 1,
+                permanent: false,
+            }],
+            batches: vec![super::IdentityBatch {
+                id: 3,
+                pages: vec![0x6000],
+                state: MappingState::Active,
+            }],
+        };
+        assert_eq!(
+            retire_identity_batch_after_invalidation(
+                &mut active_owner,
+                3,
+                |_| Ok(()),
+                || Err(Error::Timeout),
+            ),
+            Err(Error::Quarantined)
+        );
+        assert_eq!(active_owner.pages[0].references, 1);
+        assert_eq!(active_owner.batches[0].state, MappingState::Quarantined);
+    }
+
+    #[test]
+    fn direct_identity_lease_tracks_complete_no_translation_lifecycle() {
+        let requester = test_requester();
+        let lease = direct_identity_acquire(requester, &[0x1000, 0x1000]).unwrap();
+        let mapping = direct_identity_map(requester, lease, &[0x1000, 0x2000]).unwrap();
+        assert_eq!(
+            direct_identity_release(requester, lease),
+            Err(Error::InvalidStructure)
+        );
+        assert_eq!(direct_identity_unmap(requester, lease, mapping), Ok(()));
+        assert_eq!(
+            direct_identity_unmap(requester, lease, mapping),
+            Err(Error::InvalidRange)
+        );
+        assert_eq!(direct_identity_release(requester, lease), Ok(()));
+        assert_eq!(
+            direct_identity_release(requester, lease),
+            Err(Error::NoDomain)
+        );
+    }
+
+    #[test]
+    fn identity_lease_adds_only_matching_scoped_rmrr_pages() {
+        let requester = test_requester();
+        let scope = tk_vtd::OwnedScope {
+            scope_type: 1,
+            enumeration_id: 0,
+            start_bus: 0,
+            path: vec![2, 0],
+        };
+        let other_scope = tk_vtd::OwnedScope {
+            path: vec![3, 0],
+            ..scope.clone()
+        };
+        let dmar = tk_vtd::DmarTable {
+            host_address_width: 39,
+            interrupt_remapping: true,
+            units: Vec::new(),
+            reserved_regions: vec![
+                tk_vtd::ReservedRegion {
+                    segment: 0,
+                    base: 0x3001,
+                    end_inclusive: 0x4fff,
+                    scopes: vec![scope],
+                },
+                tk_vtd::ReservedRegion {
+                    segment: 0,
+                    base: 0x8000,
+                    end_inclusive: 0x8fff,
+                    scopes: vec![other_scope],
+                },
+            ],
+            hardware_affinities: Vec::new(),
+        };
+        assert_eq!(
+            identity_pages_for_path(&dmar, requester, &[(0, 2, 0)], &[0x1000, 0x3000]).unwrap(),
+            [0x1000, 0x3000, 0x4000]
+        );
     }
 }

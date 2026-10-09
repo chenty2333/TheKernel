@@ -298,6 +298,22 @@ fn platform_unmap_for(requester: Option<DmaRequester>, address: u64, length: usi
     }
 }
 
+fn dma_error(error: tk_vtd::Error) -> VirtIoError {
+    match error {
+        tk_vtd::Error::Quarantined => VirtIoError::Quarantined,
+        _ => VirtIoError::DmaError,
+    }
+}
+
+fn unmap_error(error: tk_vtd::Error) -> VirtIoError {
+    if error == tk_vtd::Error::Quarantined {
+        // The upstream virtual-buffer recycle path cannot retain the caller's
+        // borrowed buffer on this callback. Stop before it can return/reuse it.
+        panic!("virtio: VT-d unmap is quarantined; refusing to release DMA backing");
+    }
+    VirtIoError::DmaError
+}
+
 unsafe impl VirtIoHal for VirtIoHalImpl {
     fn dma_alloc(pages: usize, direction: BufferDirection) -> (PhysAddr, NonNull<u8>) {
         Self::dma_alloc_for(None, pages, direction)
@@ -313,9 +329,17 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
                 };
             let paddr = virt_to_phys(vaddr.into()).as_usize();
             let length = pages.saturating_mul(0x1000);
-            let Ok(device_address) = platform_map_for(requester, paddr as u64, length) else {
-                global_allocator().dealloc_pages(vaddr, pages, UsageKind::Dma);
-                return (0, NonNull::dangling());
+            let device_address = match platform_map_for(requester, paddr as u64, length) {
+                Ok(address) => address,
+                Err(tk_vtd::Error::Quarantined) => {
+                    // Hardware may retain this IOTLB backing; leave allocator
+                    // pages allocated even though no descriptor is returned.
+                    return (0, NonNull::dangling());
+                }
+                Err(_) => {
+                    global_allocator().dealloc_pages(vaddr, pages, UsageKind::Dma);
+                    return (0, NonNull::dangling());
+                }
             };
             (device_address as usize, vaddr)
         };
@@ -332,8 +356,12 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
     }
 
     unsafe fn dma_dealloc_for(requester: Option<DmaRequester>, paddr: PhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32 {
-        if platform_unmap_for(requester, paddr as u64, pages.saturating_mul(0x1000)).is_err() {
-            return -1;
+        match platform_unmap_for(requester, paddr as u64, pages.saturating_mul(0x1000)) {
+            Ok(()) => {}
+            Err(tk_vtd::Error::Quarantined) => {
+                panic!("virtio: VT-d unmap is quarantined; DMA allocation retained");
+            }
+            Err(_) => return -1,
         }
         global_allocator().dealloc_pages(vaddr.as_ptr() as usize, pages, UsageKind::Dma);
         0
@@ -356,8 +384,7 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
         if paddr == 0 || len == 0 || paddr.checked_add(len).is_none() {
             return Err(VirtIoError::DmaError);
         }
-        let device =
-            platform_map_for(requester, paddr as u64, len).map_err(|_| VirtIoError::DmaError)? as usize;
+        let device = platform_map_for(requester, paddr as u64, len).map_err(dma_error)? as usize;
         Ok(DmaMapping {
             source: paddr,
             device,
@@ -375,7 +402,7 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
     unsafe fn unmap_physical_for(requester: Option<DmaRequester>, mapping: DmaMapping, _direction: BufferDirection) -> VirtIoResult<()> {
         platform_unmap_for(requester, mapping.device as u64, mapping.len).map_err(|error| {
             log::error!("virtio: failed to invalidate DMA mapping {:#x}+{:#x}; backing remains quarantined: {error:?}", mapping.device, mapping.len);
-            VirtIoError::DmaError
+            unmap_error(error)
         })
     }
 
@@ -400,7 +427,7 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
             .map(|address| address as usize)
             .map_err(|error| {
                 log::error!("virtio: shared DMA map failed requester={requester:?} {physical:#x}+{length:#x}: {error:?}");
-                VirtIoError::DmaError
+                dma_error(error)
             })
     }
 
@@ -415,7 +442,7 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
         let length = unsafe { buffer.as_ref().len() };
         platform_unmap_for(requester, paddr as u64, length).map_err(|error| {
             log::error!("virtio: failed to retire shared DMA mapping requester={requester:?} {paddr:#x}+{length:#x}; buffer must remain quarantined: {error:?}");
-            VirtIoError::DmaError
+            unmap_error(error)
         })
     }
 }

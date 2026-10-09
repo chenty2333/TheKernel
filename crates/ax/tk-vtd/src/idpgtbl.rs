@@ -184,7 +184,13 @@ pub fn dmar_map_buf_locked<M: PageMemory>(
         );
         if let Err(error) = result {
             if mapped != 0 {
-                table.unmap(base, mapped)?;
+                if table.unmap(base, mapped).is_err() {
+                    // A partially installed run could not be removed from the
+                    // software page tables. Its IOVA/backing must be retained
+                    // by the platform owner rather than treated as a normal
+                    // allocation failure.
+                    return Err(Error::Quarantined);
+                }
             }
             return Err(error);
         }

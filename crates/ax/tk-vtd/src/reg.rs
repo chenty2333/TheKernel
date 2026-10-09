@@ -195,7 +195,7 @@ pub const DMAR_CAP_RWBF: u64 = (1 << 4);
 // upstream: intel_reg.h DMAR_CAP_AFL
 pub const DMAR_CAP_AFL: u64 = (1 << 3);
 // upstream: intel_reg.h DMAR_CAP_ND
-pub const fn DMAR_CAP_ND(x: u64) -> u64 { (((x) & 0x3)) }
+pub const fn DMAR_CAP_ND(x: u64) -> u64 { (((x) & 0x7)) }
 // upstream: intel_reg.h DMAR_ECAP_REG
 pub const DMAR_ECAP_REG: u64 = 0x10;
 // upstream: intel_reg.h DMAR_ECAP_PSS
@@ -530,6 +530,7 @@ mod tests {
     fn register_field_encodings_preserve_upstream_bit_positions() {
         assert_eq!(DMAR_GCMD_TE, 1 << 31);
         assert_eq!(DMAR_GSTS_QIES, 1 << 26);
+        assert_eq!(DMAR_CAP_ND(0x7), 7);
         assert_eq!(DMAR_CTX2_DID(0x1234), 0x123400);
         assert_eq!(DMAR_IQ_DESCR_IOTLB_DID(0x1234), 0x1234_0000);
         assert_eq!(DMAR_IQ_DESCR_WAIT_SD(1), 1 << 32);

@@ -54,7 +54,16 @@ fn map(dev: *mut c_void, physical: u64, size: usize) -> Result<u64, ()> {
     let device = *DEVICES.lock().get(&(dev as usize)).ok_or(())?;
     #[cfg(target_os = "none")]
     {
-        tk_vtd::platform_map_for(device.requester, physical, size).map_err(|_| ())
+        match tk_vtd::platform_map_for(device.requester, physical, size) {
+            Ok(address) => Ok(address),
+            Err(tk_vtd::Error::Quarantined) => {
+                // i915's LinuxKPI mapping ABI can only return zero on failure;
+                // that lets upstream unwind/free pages. Stop before that path
+                // can drop backing that VT-d may still reference.
+                panic!("i915: VT-d mapping quarantined; refusing to release DMA pages");
+            }
+            Err(_) => Err(()),
+        }
     }
     #[cfg(not(target_os = "none"))]
     {

@@ -1337,10 +1337,12 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         let mappings = if entries.is_empty() {
             Vec::new()
         } else {
-            match self.map_backing_entries(entries) {
+            match self.map_backing_entries(id, entries) {
                 Ok(mappings) => mappings,
                 Err(error) => {
-                    self.forget_resource(id);
+                    if error != Error::Quarantined {
+                        self.forget_resource(id);
+                    }
                     return Err(error);
                 }
             }
@@ -1491,7 +1493,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             .backing_mappings
             .try_reserve_exact(entries.len())
             .map_err(|_| Error::DmaError)?;
-        let mappings = self.map_backing_entries(entries)?;
+        let mappings = self.map_backing_entries(id, entries)?;
         for (mapping, &(_, length)) in mappings.iter().zip(entries) {
             request.extend_from_slice(
                 MemEntry {
@@ -2245,7 +2247,11 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             .ok_or(Error::InvalidParam)
     }
 
-    fn map_backing_entries(&self, entries: &[(u64, u32)]) -> Result<Vec<DmaMapping>> {
+    fn map_backing_entries(
+        &mut self,
+        id: ResourceId,
+        entries: &[(u64, u32)],
+    ) -> Result<Vec<DmaMapping>> {
         if entries.is_empty() || entries.len() > MAX_SG_ENTRIES {
             return Err(Error::InvalidParam);
         }
@@ -2261,11 +2267,14 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                 || physical % PAGE_SIZE as u64 != 0
                 || !length.is_multiple_of(PAGE_SIZE)
             {
-                return Err(if self.unmap_backing_entries(&mappings) {
-                    Error::InvalidParam
-                } else {
-                    Error::Quarantined
-                });
+                if self.unmap_backing_entries(&mappings) {
+                    return Err(Error::InvalidParam);
+                }
+                self.resource_mut(id)?
+                    .backing_mappings
+                    .extend_from_slice(&mappings);
+                self.control_faulted = true;
+                return Err(Error::Quarantined);
             }
             // SAFETY: caller keeps each physical range pinned until resource
             // detach/unref completes; the returned mapping is retained below.
@@ -2273,12 +2282,22 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                 H::map_physical_for(requester, physical as usize, length, BufferDirection::Both)
             } {
                 Ok(mapping) => mapping,
-                Err(_) => {
-                    return Err(if self.unmap_backing_entries(&mappings) {
-                        Error::DmaError
-                    } else {
-                        Error::Quarantined
-                    });
+                Err(Error::Quarantined) => {
+                    self.resource_mut(id)?
+                        .backing_mappings
+                        .extend_from_slice(&mappings);
+                    self.control_faulted = true;
+                    return Err(Error::Quarantined);
+                }
+                Err(error) => {
+                    if self.unmap_backing_entries(&mappings) {
+                        return Err(error);
+                    }
+                    self.resource_mut(id)?
+                        .backing_mappings
+                        .extend_from_slice(&mappings);
+                    self.control_faulted = true;
+                    return Err(Error::Quarantined);
                 }
             };
             if mapping.source as u64 != physical
@@ -2295,6 +2314,13 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                 return Err(if current_unmapped && previous_unmapped {
                     Error::DmaError
                 } else {
+                    self.resource_mut(id)?
+                        .backing_mappings
+                        .extend_from_slice(&mappings);
+                    if !current_unmapped {
+                        self.resource_mut(id)?.backing_mappings.push(mapping);
+                    }
+                    self.control_faulted = true;
                     Error::Quarantined
                 });
             }
