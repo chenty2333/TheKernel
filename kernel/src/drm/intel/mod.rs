@@ -86,6 +86,7 @@ pub(super) mod atomic_modeset_wiring;
 mod clk;
 mod combo_phy_full;
 mod connect;
+mod cursor;
 mod ddi;
 pub(crate) mod debugfs;
 mod dma;
