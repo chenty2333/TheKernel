@@ -1980,6 +1980,31 @@ Corporation), including GuC parameter construction, PCI revision handling, MMIO/
 `drivers/gpu/drm/i915/gt/intel_gt_pm.c` (MIT, Copyright © 2019 Intel
 Corporation); runtime-PM, display-power, RC6/RPS, request, and system-PM services remain explicit owner boundaries.
 
+`gen8_ppgtt_upstream.rs` translates all 30 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/gen8_ppgtt.c` (MIT, Copyright © 2020 Intel
+Corporation), retaining source-order page-table allocation, insertion, and
+cleanup. The target build disables GVT and the i915 PPGTT selftests; no
+GVT-specific locking behavior is claimed.
+
+`shmem_utils_upstream.rs` translates all 8 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/shmem_utils.c` (MIT, Copyright © 2020 Intel
+Corporation). `linux/vm.rs` supplies its vmap/vfree dependencies through axmm
+and fails closed until the kernel owner installs an acknowledged global TLB
+shootdown callback; it is not a runtime-ready vmap path by itself.
+
+`i915_gem_busy_upstream.rs` translates all 6 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gem/i915_gem_busy.c` (MIT, Copyright © 2014-2016 Intel
+Corporation), including reservation restart handling and the engine-class uABI
+busy-bit encoding.
+
+`i915_gem_internal_upstream.rs` translates all 5 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gem/i915_gem_internal.c` (MIT, Copyright © 2014-2016
+Intel Corporation), preserving page-allocation fallback and SG/object cleanup.
+
+`i915_gem_wait_upstream.rs` translates all 12 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gem/i915_gem_wait.c` (MIT, Copyright © 2016 Intel
+Corporation), including request prioritization and reservation wait order.
+
 `intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
 `drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
 Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.
