@@ -130,7 +130,7 @@ impl Xhci {
         let event_ring = EventRing::new(max_event_ring_segments, &kernel)?;
         let event_ring_info = event_ring.info();
 
-        let root_hub = XhciRootHub::new(reg.clone())?;
+        let root_hub = XhciRootHub::new(reg.clone(), kernel.clone())?;
 
         let transfer_result_handler = TransferResultHandler::new(reg_shared.clone());
         let ports = root_hub.waker();

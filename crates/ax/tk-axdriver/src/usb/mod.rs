@@ -198,6 +198,10 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
     let changes = host
         .wait(controller.probe_devices())?
         .map_err(|_| DevError::Io)?;
+    info!(
+        "USB xHCI boot enumeration found {} device(s)",
+        changes.connected.len()
+    );
     let bus = observations::allocate_bus();
     let mut devices = Vec::new();
     for probed in changes.connected {
