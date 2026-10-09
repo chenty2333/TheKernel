@@ -1148,8 +1148,7 @@ def _run_fbcon_boot(args: argparse.Namespace, artifacts: Artifacts, directory: P
             stop_after_marker=FBCON_MARKER,
             commands=None,
             extra_block=None,
-            rootfs=artifacts.rootfs if vtd_q35 else None,
-            rootfs_transport=rootfs_transport,
+            rootfs_transport="module",
             run_cpus=run_cpus,
             # This suite stops at the first KTAP line and then reads pixels.  A
             # kernel that died before painting would otherwise surface as a
@@ -1763,7 +1762,7 @@ def add_graphics_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def component_host_test_command(package: dict) -> list[str]:
-    settings = package.get("metadata", {}).get("thekernel", {}).get("host-test", {})
+    settings = (package.get("metadata") or {}).get("thekernel", {}).get("host-test", {})
     command = ["cargo", "test", "--locked", "-p", package["name"]]
     features = settings.get("features", [])
     if not isinstance(features, list) or any(not isinstance(feature, str) or not feature for feature in features):
@@ -1799,7 +1798,7 @@ def host_test_selection(packages: list[dict]) -> list[dict]:
     selected = []
     undeclared = []
     for package in packages:
-        settings = package.get("metadata", {}).get("thekernel", {})
+        settings = (package.get("metadata") or {}).get("thekernel", {})
         host_test = settings.get("host-test", {})
         selection = host_test.get("selected")
         if settings.get("layer") == "platform" and not isinstance(selection, bool):
@@ -1844,7 +1843,7 @@ def host_test_cmd() -> int:
     # from changing every other component's link.
     percpu_rustflags = f"-C link-arg=-T{REPO_ROOT / 'crates/ax/tk-scope-local/percpu.x'}"
     for package in sorted(selected, key=lambda item: item["name"]):
-        settings = package.get("metadata", {}).get("thekernel", {}).get("host-test", {})
+        settings = (package.get("metadata") or {}).get("thekernel", {}).get("host-test", {})
         command_env = env
         if settings.get("percpu-linker", False):
             command_env = {**env, "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": percpu_rustflags}
