@@ -12,10 +12,29 @@ use core::{
 };
 
 use crate::{
-    i915_gem_object_types_upstream::DrmI915GemObject, intel_context_upstream::*,
-    intel_engine_cs_upstream::*, intel_engine_types_upstream::IntelEngineCs,
-    intel_gt_types_upstream::IntelGt, intel_ring::PAGE_SIZE,
-    intel_timeline_types_upstream::IntelTimeline, linux_config::*, linux_list::*,
+    i915_active_upstream::{
+        i915_active_acquire, i915_active_add_request, i915_active_fence_get, i915_active_fini,
+        i915_active_init, i915_active_release,
+    },
+    i915_gem_object_api_upstream::{i915_gem_object_put, i915_gem_object_unpin_map},
+    i915_gem_object_types_upstream::DrmI915GemObject,
+    i915_gem_object_upstream::i915_gem_object_set_cache_coherency,
+    i915_gem_pages_upstream::i915_gem_object_pin_map,
+    i915_request_upstream::to_request,
+    i915_syncmap_upstream::{i915_syncmap_free, i915_syncmap_init},
+    i915_vma_api_upstream::{
+        __i915_vma_pin, __i915_vma_unpin, i915_ggtt_pin, i915_vma_get, i915_vma_instance,
+        i915_vma_put, i915_vma_unpin,
+    },
+    intel_context_types_upstream::I915Active,
+    intel_context_upstream::*,
+    intel_engine_cs_upstream::*,
+    intel_engine_types_upstream::IntelEngineCs,
+    intel_gt_types_upstream::IntelGt,
+    intel_ring::PAGE_SIZE,
+    intel_timeline_types_upstream::IntelTimeline,
+    linux_config::*,
+    linux_list::*,
 };
 
 // The `intel_timeline_types_upstream`/`intel_gt_types_upstream` bindings own
@@ -32,7 +51,7 @@ unsafe fn hwsp_alloc(gt: *mut IntelGt) -> *mut I915Vma {
 
     obj = i915_gem_object_create_internal(i915, PAGE_SIZE);
     if IS_ERR(obj) {
-        return ERR_CAST(obj);
+        return obj.cast::<I915Vma>();
     }
 
     i915_gem_object_set_cache_coherency(obj, I915_CACHE_LLC);
@@ -46,7 +65,7 @@ unsafe fn hwsp_alloc(gt: *mut IntelGt) -> *mut I915Vma {
 }
 
 // upstream: intel_timeline.c __timeline_retire()
-unsafe fn __timeline_retire(active: *mut I915Active) {
+unsafe extern "C" fn __timeline_retire(active: *mut I915Active) {
     let tl = container_of!(active, IntelTimeline, active);
 
     i915_vma_unpin((*tl).hwsp_ggtt);
@@ -54,12 +73,21 @@ unsafe fn __timeline_retire(active: *mut I915Active) {
 }
 
 // upstream: intel_timeline.c __timeline_active()
-unsafe fn __timeline_active(active: *mut I915Active) -> i32 {
+unsafe extern "C" fn __timeline_active(active: *mut I915Active) -> i32 {
     let tl = container_of!(active, IntelTimeline, active);
 
     __i915_vma_pin((*tl).hwsp_ggtt);
     intel_timeline_get(tl);
     0
+}
+
+// upstream: intel_timeline.h intel_timeline_get()
+#[inline]
+unsafe fn intel_timeline_get(timeline: *mut IntelTimeline) -> *mut IntelTimeline {
+    unsafe {
+        crate::linux::memory::kref_get(core::ptr::addr_of_mut!((*timeline).kref));
+        timeline
+    }
 }
 
 // upstream: intel_timeline.c intel_timeline_pin_map()
@@ -76,7 +104,7 @@ pub unsafe fn intel_timeline_pin_map(timeline: *mut IntelTimeline) -> i32 {
     (*timeline).hwsp_map = vaddr.cast::<c_void>();
     (*timeline).hwsp_seqno = memset(vaddr.add(ofs).cast::<c_void>(), 0, TIMELINE_SEQNO_BYTES)
         .cast::<u32>() as *const u32;
-    drm_clflush_virt_range(vaddr.add(ofs).cast::<c_void>(), TIMELINE_SEQNO_BYTES);
+    drm_clflush_virt_range(vaddr.add(ofs).cast::<c_void>(), TIMELINE_SEQNO_BYTES as u64);
 
     0
 }
@@ -220,7 +248,7 @@ pub unsafe fn intel_timeline_pin(tl: *mut IntelTimeline, ww: *mut I915GemWwCtx) 
         }
     }
 
-    err = i915_ggtt_pin((*tl).hwsp_ggtt, ww, 0, PIN_HIGH);
+    err = i915_ggtt_pin((*tl).hwsp_ggtt, ww, 0, PIN_HIGH as u32);
     if err != 0 {
         return err;
     }
@@ -255,7 +283,7 @@ pub unsafe fn intel_timeline_reset_seqno(tl: *const IntelTimeline) {
         TIMELINE_SEQNO_BYTES - size_of::<u32>(),
     );
     WRITE_ONCE!(*hwsp_seqno, (*tl).seqno);
-    drm_clflush_virt_range(hwsp_seqno.cast::<c_void>(), TIMELINE_SEQNO_BYTES);
+    drm_clflush_virt_range(hwsp_seqno.cast::<c_void>(), TIMELINE_SEQNO_BYTES as u64);
 }
 
 // upstream: intel_timeline.c intel_timeline_enter()
@@ -381,7 +409,7 @@ pub unsafe fn intel_timeline_read_hwsp(
     let err: i32;
 
     rcu_read_lock();
-    tl = rcu_dereference((*from).timeline);
+    tl = rcu_dereference!((*from).timeline);
     if i915_request_signaled(from) || !i915_active_acquire_if_busy(&mut (*tl).active) {
         tl = core::ptr::null_mut();
     }
@@ -548,6 +576,7 @@ pub unsafe fn intel_gt_show_timelines(
     }
     spin_unlock(&mut timelines.lock);
 
+    let mut tn: *mut IntelTimeline = core::ptr::null_mut();
     list_for_each_entry_safe!(tl, tn, &mut free, link, {
         __intel_timeline_free(&mut (*tl).kref);
     });

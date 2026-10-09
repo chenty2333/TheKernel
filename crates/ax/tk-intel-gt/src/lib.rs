@@ -159,6 +159,9 @@ pub mod i915_scheduler_upstream;
 pub mod i915_sw_fence_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod i915_syncmap_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod i915_vma_api_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
