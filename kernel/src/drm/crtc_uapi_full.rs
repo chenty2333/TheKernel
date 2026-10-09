@@ -873,7 +873,7 @@ pub fn drm_mode_getcrtc<I: CrtcUapiIo>(
     let _ = io.modeset_lock(primary_id, None);
     let plane = &device.planes[plane_index];
     data.returned_fb_id = if let Some(state) = plane.state.as_ref() {
-        if let Some(fb) = state.fb { fb } else { 0 }
+        state.fb.unwrap_or_default()
     } else {
         plane.fb.unwrap_or(0)
     };
