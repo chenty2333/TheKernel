@@ -2051,6 +2051,12 @@ including topology, engine, memory-region, HWConfig, GuC submission-version,
 and PERF query paths. PERF ownership calls remain real service dependencies;
 the separate `i915_perf.c` translation is deferred to the end of the task.
 
+`i915_gem_evict_upstream.rs` translates all 9 actual definitions in Linux
+7.2.3 `drivers/gpu/drm/i915/i915_gem_evict.c` (MIT, Copyright © 2008-2010
+Intel Corporation). Ctags reports the same number of entries but one is an
+`I915_SELFTEST_DECLARE` data pseudo-tag and it misses the actual `dying_vma()`;
+all nine function bodies are translated and only function bodies carry markers.
+
 `intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
 `drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
 Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.
