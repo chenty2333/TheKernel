@@ -110,6 +110,7 @@ mod id;
 mod irq;
 mod modeset;
 mod native_modeset_ops;
+mod native_scaler;
 mod output;
 mod pattern;
 mod pci;
