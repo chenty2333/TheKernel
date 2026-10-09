@@ -172,3 +172,9 @@ impl VmOperationsStruct {
 
 const _: [(); 17 * core::mem::size_of::<usize>()] =
     [(); core::mem::size_of::<VmOperationsStruct>()];
+
+/// TheKernel has no swap daemon; no native task has Linux's PF_KSWAPD role.
+#[inline]
+pub fn current_is_kswapd() -> bool {
+    false
+}

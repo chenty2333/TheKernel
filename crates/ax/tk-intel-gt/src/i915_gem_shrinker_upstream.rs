@@ -7,6 +7,8 @@
 // GEM/MM/shrinker/notifier/runtime-PM helpers are integration bindings and must
 // resolve to the source Linux/i915 behavior; this file does not emulate them.
 
+use crate::linux::mm::current_is_kswapd;
+
 use core::ffi::{c_char, c_int, c_long, c_ulong, c_void};
 
 use crate::{

@@ -40,4 +40,4 @@ package = "tk-axtask"
 path = "../tk-axtask"
 version = "0.1.0"
 optional = true
-features = ["multitask"]
+features = ["multitask", "preempt"]

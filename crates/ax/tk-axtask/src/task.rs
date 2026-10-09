@@ -1885,8 +1885,10 @@ impl TaskInner {
     }
 
     #[inline]
-    #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
-    pub(crate) fn preempt_disable_count(&self) -> usize {
+    /// Current task's nesting count, for drivers that must not block in an
+    /// atomic section. Read-only; guard acquisition/release owns mutations.
+    #[cfg(feature = "preempt")]
+    pub fn preempt_disable_count(&self) -> usize {
         self.preempt_disable_count.load(Ordering::Acquire)
     }
 

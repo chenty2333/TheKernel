@@ -137,3 +137,9 @@ pub fn irq_work_sync<W: IrqWorkPtr>(work: W) {
         axtask::yield_now();
     }
 }
+
+/// Linux atomic-context predicate mapped to the native task's guard nesting.
+#[inline]
+pub fn in_atomic() -> bool {
+    axtask::current_may_uninit().is_some_and(|task| task.preempt_disable_count() != 0)
+}

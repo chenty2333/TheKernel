@@ -12,6 +12,8 @@
 // Remaining binding boundary: the i915/GEM/GT object types, constants, helpers,
 // iterators and kernel macros not represented by the header-layout records.
 
+use crate::linux::irq::in_atomic;
+
 use core::{
     ffi::{c_char, c_ulong, c_void},
     mem::{offset_of, size_of},
