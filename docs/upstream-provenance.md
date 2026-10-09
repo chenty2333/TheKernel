@@ -2036,6 +2036,14 @@ display-owned init/fini/flush/invalidate calls as external owner boundaries.
 copyright line), preserving the complete 59-parameter switch and checked
 userspace result write.
 
+`i915_gem_stolen_upstream.rs` translates all 44 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gem/i915_gem_stolen.c` (MIT, Copyright © 2008-2012 Intel
+Corporation), preserving platform-specific stolen-memory discovery, reserved
+region handling, and GEM object lifetime branches. `linux/iomapping.rs` supplies
+the configured x86 WC mapping with PAT1 readiness, reserved-range admission,
+and acknowledged TLB retirement; it fails closed until the kernel owner installs
+the shared-map shootdown callback.
+
 `intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
 `drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
 Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.
