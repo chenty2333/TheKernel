@@ -108,11 +108,6 @@ fn ddi_buf_ctl(port: TcPort) -> Result<u32, String> {
     // ADL-P maps PORT_D/PORT_E to TC1/TC2, at the DDI_CTL register stride.
     Ok(0x64000 + (3 + port.index()) * 0x100)
 }
-fn trans_select_port(port: TcPort) -> Result<u32, String> {
-    tc_phy(port)?;
-    // `TGL_TRANS_DDI_SELECT_PORT(port) = (port + 1) << 27`, with TC1=D(3).
-    Ok((4 + port.index()) << 27)
-}
 fn trans_clock_select(port: TcPort) -> Result<u32, String> {
     tc_phy(port)?;
     // Display13 maps D/E (TC1/2) to PHY_F/PHY_G, not DDI D/E.
@@ -457,13 +452,13 @@ pub(super) fn source_hdmi_tmds_clock_with_limit(
 /// Bound the translated transcoder-disable helper to the single Pipe-A pair
 /// that the N305 TC transaction already owns. A failed read suppresses the
 /// follow-up FUNC_CTL write; the caller verifies both writes by readback.
-struct TcTranscoderDisableIo<'a, R> {
+struct TcTranscoderFuncIo<'a, R> {
     registers: &'a R,
     read_failed: bool,
     write_failed: bool,
 }
 
-impl<'a, R: Registers> TcTranscoderDisableIo<'a, R> {
+impl<'a, R: Registers> TcTranscoderFuncIo<'a, R> {
     fn new(registers: &'a R) -> Self {
         Self {
             registers,
@@ -473,7 +468,7 @@ impl<'a, R: Registers> TcTranscoderDisableIo<'a, R> {
     }
 }
 
-impl<R: Registers> intel_display::intel_ddi_full::DdiIo for TcTranscoderDisableIo<'_, R> {
+impl<R: Registers> intel_display::intel_ddi_full::DdiIo for TcTranscoderFuncIo<'_, R> {
     fn read(&mut self, reg: u32) -> u32 {
         let typed = if reg == ddi::TRANS_DDI_FUNC_CTL_A.offset() {
             ddi::TRANS_DDI_FUNC_CTL_A
@@ -590,7 +585,7 @@ fn disable_pipe_a_transcoder<R: Registers>(registers: &R) -> Result<(), String> 
         mst_master: false,
         ..i915::CrtcState::default()
     };
-    let mut io = TcTranscoderDisableIo::new(registers);
+    let mut io = TcTranscoderFuncIo::new(registers);
     i915::intel_ddi_disable_transcoder_func(&mut io, &encoder, &state);
     if io.read_failed || io.write_failed {
         return Err(String::from("translated Pipe-A transcoder disable failed"));
@@ -604,6 +599,70 @@ fn disable_pipe_a_transcoder<R: Registers>(registers: &R) -> Result<(), String> 
     if ctl2 != 0 || ctl & DDI_ENABLE != 0 {
         return Err(format!(
             "translated transcoder disable readback mismatch ctl2={ctl2:#x} ctl={ctl:#x}"
+        ));
+    }
+    Ok(())
+}
+
+fn enable_pipe_a_transcoder<R: Registers>(
+    registers: &R,
+    port: TcPort,
+    drm_mode_flags: u32,
+) -> Result<(), String> {
+    use intel_display::intel_ddi_full as i915;
+
+    // The source encoder's `port` enum encodes DDI selectors 1..N. On this
+    // display-13 DKL route, TC1/TC2 occupy selector values 4/5, corresponding
+    // to source enum entries D/E (see `tgl_transcoder_port_select`).
+    let source_port = match port {
+        TcPort::Tc1 => i915::Port::D,
+        TcPort::Tc2 => i915::Port::E,
+        TcPort::Tc3 | TcPort::Tc4 => {
+            return Err(String::from(
+                "translated Pipe-A TC transcoder only admits TC1/TC2",
+            ));
+        }
+    };
+    let encoder = i915::DdiEncoder {
+        port: source_port,
+        output: i915::OutputType::Hdmi,
+        display: i915::Platform {
+            display_ver: 13,
+            alderlake_p: true,
+            ..i915::Platform::default()
+        },
+        is_tc: true,
+        ..i915::DdiEncoder::default()
+    };
+    let state = i915::CrtcState {
+        cpu_transcoder: i915::Transcoder::A,
+        output: i915::OutputType::Hdmi,
+        pipe_bpp: 24,
+        mode_flags: drm_mode_flags,
+        has_hdmi_sink: true,
+        master_transcoder: i915::Transcoder::Invalid,
+        mst_master_transcoder: i915::Transcoder::Invalid,
+        ..i915::CrtcState::default()
+    };
+    let mut io = TcTranscoderFuncIo::new(registers);
+    i915::intel_ddi_enable_transcoder_func(&mut io, &encoder, &state);
+    if io.read_failed || io.write_failed {
+        return Err(String::from("translated Pipe-A transcoder enable failed"));
+    }
+    let ctl2 = registers
+        .read(ddi::TRANS_DDI_FUNC_CTL2_A)
+        .ok_or_else(|| String::from("Pipe-A FUNC_CTL2 readback unavailable"))?;
+    let ctl = registers
+        .read(ddi::TRANS_DDI_FUNC_CTL_A)
+        .ok_or_else(|| String::from("Pipe-A FUNC_CTL readback unavailable"))?;
+    let expected = (1 << 31)
+        | ((u32::from(source_port.index()) + 1) << 27)
+        | (drm_mode_flags & (1 << 0)) << 16
+        | (drm_mode_flags & (1 << 2)) << 15;
+    if ctl2 != 0 || ctl != expected {
+        return Err(format!(
+            "translated transcoder enable readback mismatch ctl2={ctl2:#x} ctl={ctl:#x} \
+             expected={expected:#x}"
         ));
     }
     Ok(())
@@ -760,12 +819,9 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         write(r, 0x60220 + word as u32 * 4, value)?;
     }
     write(r, 0x60200, avi_control | AVI_ENABLE)?;
-    let polarity = function & ((1 << 16) | (1 << 17));
-    write(
-        r,
-        ddi::TRANS_DDI_FUNC_CTL_A.offset(),
-        DDI_ENABLE | trans_select_port(port)? | polarity,
-    )?;
+    let mode_flags =
+        u32::from(function & (1 << 16) != 0) | (u32::from(function & (1 << 17) != 0) << 2);
+    enable_pipe_a_transcoder(r, port, mode_flags)?;
     // Linux intel_ddi_enable_hdmi sets DKL levels before enabling DDI_BUF.
     // Exact N305 D0 admission is the source Wa_16011342517 applicability proof;
     // VBT level5 was checked at the outer native handoff. Unknown revisions
