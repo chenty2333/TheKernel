@@ -791,7 +791,7 @@ pub fn intel_dp_link_training_set_mode<I: LinkTrainingIo>(
     link_rate: i32,
     is_vrr: bool,
     pr_with_as_sdp_enable: bool,
-) {
+) -> Result<(), LinkTrainingError> {
     let mut link_config = [0u8; 2];
     if is_vrr {
         link_config[0] |= DP_MSA_TIMING_PAR_IGNORE_EN;
@@ -803,7 +803,10 @@ pub fn intel_dp_link_training_set_mode<I: LinkTrainingIo>(
         link_config[1] = DP_SET_ANSI_128B132B;
     }
     let _ = dp;
-    let _ = io.aux_write(DP_DOWNSPREAD_CTRL, &link_config);
+    if io.aux_write(DP_DOWNSPREAD_CTRL, &link_config)? != link_config.len() {
+        return Err(LinkTrainingError::Aux);
+    }
+    Ok(())
 }
 
 // upstream: intel_dp_link_training.c intel_dp_pr_with_as_sdp_enabled()
@@ -816,14 +819,14 @@ pub fn intel_dp_update_downspread_ctrl<I: LinkTrainingIo>(
     dp: &IntelDpLinkTraining,
     io: &mut I,
     state: &LinkTrainingCrtcState,
-) {
+) -> Result<(), LinkTrainingError> {
     intel_dp_link_training_set_mode(
         dp,
         io,
         state.port_clock,
         state.vrr_in_range,
         intel_dp_pr_with_as_sdp_enabled(state),
-    );
+    )
 }
 
 // upstream: intel_dp_link_training.c intel_dp_link_training_set_bw()
@@ -834,7 +837,7 @@ pub fn intel_dp_link_training_set_bw<I: LinkTrainingIo>(
     lane_count: u8,
     enhanced_framing: bool,
     post_lt_adj_req: bool,
-) {
+) -> Result<(), LinkTrainingError> {
     let mut lane_count = lane_count;
     if enhanced_framing {
         lane_count |= DP_LANE_COUNT_ENHANCED_FRAME_EN;
@@ -843,11 +846,17 @@ pub fn intel_dp_link_training_set_bw<I: LinkTrainingIo>(
         lane_count |= DP_POST_LT_ADJ_REQ_GRANTED;
     }
     if link_bw != 0 {
-        let _ = io.aux_write(DP_LINK_BW_SET, &[link_bw, lane_count]);
+        if io.aux_write(DP_LINK_BW_SET, &[link_bw, lane_count])? != 2 {
+            return Err(LinkTrainingError::Aux);
+        }
     } else {
-        let _ = io.aux_write(DP_LANE_COUNT_SET, &[lane_count]);
-        let _ = io.aux_write(DP_LINK_RATE_SET, &[rate_select]);
+        if io.aux_write(DP_LANE_COUNT_SET, &[lane_count])? != 1
+            || io.aux_write(DP_LINK_RATE_SET, &[rate_select])? != 1
+        {
+            return Err(LinkTrainingError::Aux);
+        }
     }
+    Ok(())
 }
 
 // upstream: intel_dp_link_training.c intel_dp_training_pattern()
@@ -891,7 +900,7 @@ pub fn intel_dp_update_link_bw_set<I: LinkTrainingIo>(
     state: &LinkTrainingCrtcState,
     link_bw: u8,
     rate_select: u8,
-) {
+) -> Result<(), LinkTrainingError> {
     let post_lt_adj_req = intel_dp_use_post_lt_adj_req(dp, io, state);
     intel_dp_link_training_set_bw(
         io,
@@ -900,7 +909,7 @@ pub fn intel_dp_update_link_bw_set<I: LinkTrainingIo>(
         state.lane_count,
         state.enhanced_framing,
         post_lt_adj_req,
-    );
+    )
 }
 
 // upstream: intel_dp_link_training.c intel_dp_prepare_link_train()
@@ -908,15 +917,14 @@ pub fn intel_dp_prepare_link_train<I: LinkTrainingIo>(
     dp: &IntelDpLinkTraining,
     io: &mut I,
     state: &LinkTrainingCrtcState,
-) -> bool {
+) -> Result<(), LinkTrainingError> {
     io.prepare_link_retrain(state);
     let (link_bw, rate_select) = io.compute_rate(state.port_clock);
     if link_bw == 0 {
         io.reload_supported_link_rates();
     }
-    intel_dp_update_downspread_ctrl(dp, io, state);
-    intel_dp_update_link_bw_set(dp, io, state, link_bw, rate_select);
-    true
+    intel_dp_update_downspread_ctrl(dp, io, state)?;
+    intel_dp_update_link_bw_set(dp, io, state, link_bw, rate_select)
 }
 
 // upstream: intel_dp_link_training.c intel_dp_adjust_request_changed()
@@ -1525,7 +1533,7 @@ pub fn intel_dp_start_link_train<I: LinkTrainingIo>(
     if lttpr_count < 0 {
         lttpr_count = 0;
     }
-    let _ = intel_dp_prepare_link_train(dp, io, state);
+    intel_dp_prepare_link_train(dp, io, state)?;
     let passed = if state.uhbr {
         intel_dp_128b132b_link_train(dp, io, state, lttpr_count)
     } else {
@@ -1636,6 +1644,7 @@ mod tests {
     #[derive(Default)]
     struct SourcePhyFailureIo {
         aux_writes: usize,
+        short_aux_write: bool,
     }
 
     impl LinkTrainingIo for SourcePhyFailureIo {
@@ -1666,7 +1675,7 @@ mod tests {
         }
         fn aux_write(&mut self, _: u32, data: &[u8]) -> Result<usize, LinkTrainingError> {
             self.aux_writes += 1;
-            Ok(data.len())
+            Ok(data.len() - usize::from(self.short_aux_write))
         }
         fn read_phy_link_status(
             &mut self,
@@ -1780,5 +1789,18 @@ mod tests {
             DP_TRAINING_PATTERN_1,
         ));
         assert_eq!(io.aux_writes, 0);
+    }
+
+    #[test]
+    fn short_aux_bandwidth_write_refuses_link_training_prepare() {
+        let mut io = SourcePhyFailureIo {
+            short_aux_write: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            intel_dp_link_training_set_bw(&mut io, 0x14, 0, 4, false, false),
+            Err(LinkTrainingError::Aux)
+        );
+        assert_eq!(io.aux_writes, 1);
     }
 }
