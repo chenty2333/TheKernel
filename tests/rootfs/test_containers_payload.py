@@ -113,7 +113,12 @@ class ContainersPayloadTests(unittest.TestCase):
         self.assertIn('THEKERNEL_CONTAINER_BWRAP_OK', text)
 
     def test_builder_refuses_unrelated_output_before_package_install(self):
-        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as directory:
+        # Product outputs deliberately reject tmpfs paths.  Put this test's
+        # disposable tree on the same disk-backed storage policy so it reaches
+        # the unrelated-tree guard instead of failing the earlier storage gate.
+        test_tmp = Path.home()/'.cache'/'thekernel-test-tmp'
+        test_tmp.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=test_tmp) as directory:
             out = Path(directory)/'unrelated'
             out.mkdir()
             keep = out/'keep'
