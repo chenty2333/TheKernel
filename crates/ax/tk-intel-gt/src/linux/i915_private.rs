@@ -11,6 +11,7 @@ use core::{
 
 use crate::{
     intel_engine_cs_upstream::{AtomicT, IntelEngineCs, IntelGt, Spinlock},
+    intel_context_upstream::Kref,
     linux::{gem_memory::I915GemMm, i915::IntelRuntimeInfo},
     linux_memory::{atomic_inc, atomic_read},
 };
@@ -20,7 +21,10 @@ use crate::{
 /// this representation; its size/alignment preserve the following offsets.
 #[repr(C, align(8))]
 pub struct DrmDevicePrefix {
-    _bytes: [u8; DRM_DEVICE_SIZE],
+    if_version: i32,
+    refcount: Kref,
+    pub dev: *mut c_void,
+    _bytes: [u8; DRM_DEVICE_SIZE - 16],
 }
 
 pub const DRM_DEVICE_SIZE: usize = 1552;
@@ -128,6 +132,7 @@ pub unsafe fn i915_reset_engine_count(
 }
 
 const _: [(); 1552] = [(); size_of::<DrmDevicePrefix>()];
+const _: [(); 8] = [(); offset_of!(DrmDevicePrefix, dev)];
 const _: [(); 8] = [(); align_of::<DrmDevicePrefix>()];
 
 const _: [(); 80] = [(); size_of::<I915Params>()];
