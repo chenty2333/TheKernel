@@ -1967,3 +1967,7 @@ Corporation), preserving uC policy selection, lifecycle, rollback, and suspend/r
 `drivers/gpu/drm/i915/gt/intel_renderstate.c` (MIT, Copyright © 2014 Intel
 Corporation). Gen6-Gen9 immutable render-state table data is not included because
 this target is Gen12, where the upstream selector returns null.
+
+`intel_gt_irq_upstream.rs` translates all 21 definitions in Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_gt_irq.c` (MIT, Copyright © 2019 Intel
+Corporation); display interrupt dispatch remains a kernel-provided callback boundary.
