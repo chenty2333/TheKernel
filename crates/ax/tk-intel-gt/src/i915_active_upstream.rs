@@ -134,7 +134,7 @@ unsafe extern "C" {
 
 // Header inline: hold RCU while obtaining a reference to the active fence.
 #[inline]
-unsafe fn i915_active_fence_get(active: *mut I915ActiveFence) -> *mut DmaFence {
+pub unsafe fn i915_active_fence_get(active: *mut I915ActiveFence) -> *mut DmaFence {
     unsafe {
         rcu_read_lock();
         let fence = ptr::read_volatile(&(*active).fence);
@@ -145,6 +145,25 @@ unsafe fn i915_active_fence_get(active: *mut I915ActiveFence) -> *mut DmaFence {
         };
         rcu_read_unlock();
         held
+    }
+}
+
+// upstream: i915_active.h i915_active_init() (CONFIG_LOCKDEP=n expansion)
+pub unsafe fn i915_active_init(
+    active: *mut I915Active,
+    on_active: unsafe extern "C" fn(*mut I915Active) -> c_int,
+    on_retire: unsafe extern "C" fn(*mut I915Active),
+    flags: c_ulong,
+) {
+    unsafe {
+        __i915_active_init(
+            active,
+            Some(on_active),
+            Some(on_retire),
+            flags,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
     }
 }
 #[inline]
