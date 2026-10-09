@@ -1958,3 +1958,12 @@ Corporation), preserving firmware state transitions and HECI/PXP message layout.
 `intel_guc_hwconfig_upstream.rs` translates all 7 functions from Linux 7.2.3
 `drivers/gpu/drm/i915/gt/uc/intel_guc_hwconfig.c` (MIT, Copyright © 2022 Intel
 Corporation), retaining KLV parsing, temporary VMA lifecycle, and failure order.
+
+`intel_uc_upstream.rs` translates all 36 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/uc/intel_uc.c` (MIT, Copyright © 2016-2019 Intel
+Corporation), preserving uC policy selection, lifecycle, rollback, and suspend/resume ordering.
+
+`intel_renderstate_upstream.rs` translates all 5 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_renderstate.c` (MIT, Copyright © 2014 Intel
+Corporation). Gen6-Gen9 immutable render-state table data is not included because
+this target is Gen12, where the upstream selector returns null.

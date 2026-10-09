@@ -346,6 +346,9 @@ pub mod intel_migrate_upstream;
 pub mod intel_rc6_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_renderstate_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_reset_types_upstream;
 pub mod intel_ring;
 #[cfg(feature = "upstream-gt")]
@@ -384,6 +387,9 @@ pub mod intel_uc_fw_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_uc_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_uc_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_uncore_types_upstream;
