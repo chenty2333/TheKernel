@@ -75,3 +75,8 @@ The block error path now uses an explicit `ahci_reset()` adapter matching the
 upstream reset order: prove FIS/command-engine DMA stop, attempt CLO without
 making CLO timeout fatal, reset PHY, then restart FIS and command processing.
 The block caller completes its request rather than CAM-freezing/requeueing CCBs.
+
+The IRQ top half now splits controller-wide interrupt routing from the exact
+`ahci_ch_intr()` per-port latch/ack step. It does not run CAM's locked task
+queue; status is atomically retained and request-context completion checks CI/
+SACT and TFD before publishing completion.

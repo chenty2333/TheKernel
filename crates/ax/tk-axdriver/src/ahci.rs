@@ -66,26 +66,48 @@ struct AhciIrqContext {
     port_status: [AtomicU32; AHCI_MAX_PORTS],
 }
 
+fn read_ahci_irq_register(context: &AhciIrqContext, offset: usize) -> u32 {
+    if offset & 3 != 0 || offset.checked_add(4).is_none_or(|end| end > context.size) {
+        return u32::MAX;
+    }
+    // SAFETY: the mapped BAR bounds were checked and this is an aligned MMIO dword.
+    unsafe { ((context.base + offset) as *const u32).read_volatile() }
+}
+
+fn write_ahci_irq_register(context: &AhciIrqContext, offset: usize, value: u32) {
+    if offset & 3 == 0 && offset.checked_add(4).is_some_and(|end| end <= context.size) {
+        // SAFETY: same validated BAR aperture; AHCI PxIS/IS are W1C status registers.
+        unsafe { ((context.base + offset) as *mut u32).write_volatile(value) };
+    }
+}
+
+/// Latch and acknowledge one port's status before the task-context completion
+/// sampler observes the generation change.
+// upstream: ahci.c ahci_ch_intr()
+fn ahci_ch_intr(context: &AhciIrqContext, port: usize) -> bool {
+    if port >= AHCI_MAX_PORTS {
+        return false;
+    }
+    let base = AHCI_OFFSET + port * AHCI_STEP;
+    let status = read_ahci_irq_register(context, base + axdriver_block::ahci::regs::AHCI_P_IS);
+    if status == 0 || status == u32::MAX {
+        return false;
+    }
+    context.port_status[port].fetch_or(status, Ordering::AcqRel);
+    write_ahci_irq_register(
+        context,
+        base + axdriver_block::ahci::regs::AHCI_P_IS,
+        status,
+    );
+    true
+}
+
 // upstream: ahci.c ahci_intr() AHCI_IRQ_MODE_ALL controller status routing
 fn ack_ahci_interrupt(context: usize) -> bool {
     // SAFETY: the frontend leaks the immutable BAR context for the endpoint's
     // boot lifetime and stores only this pointer in its static IRQ slot.
     let context = unsafe { &*(context as *const AhciIrqContext) };
-    let read = |offset: usize| {
-        if offset & 3 != 0 || offset.checked_add(4).is_none_or(|end| end > context.size) {
-            u32::MAX
-        } else {
-            // SAFETY: the mapped BAR bounds were checked and this is an aligned MMIO dword.
-            unsafe { ((context.base + offset) as *const u32).read_volatile() }
-        }
-    };
-    let write = |offset: usize, value: u32| {
-        if offset & 3 == 0 && offset.checked_add(4).is_some_and(|end| end <= context.size) {
-            // SAFETY: same validated BAR aperture; AHCI PxIS/IS are W1C status registers.
-            unsafe { ((context.base + offset) as *mut u32).write_volatile(value) };
-        }
-    };
-    let pending = read(axdriver_block::ahci::regs::AHCI_IS);
+    let pending = read_ahci_irq_register(context, axdriver_block::ahci::regs::AHCI_IS);
     if pending == 0 || pending == u32::MAX {
         return false;
     }
@@ -93,14 +115,9 @@ fn ack_ahci_interrupt(context: usize) -> bool {
         if pending & (1 << port) == 0 {
             continue;
         }
-        let base = AHCI_OFFSET + port * AHCI_STEP;
-        let status = read(base + axdriver_block::ahci::regs::AHCI_P_IS);
-        if status != 0 && status != u32::MAX {
-            context.port_status[port].fetch_or(status, Ordering::AcqRel);
-            write(base + axdriver_block::ahci::regs::AHCI_P_IS, status);
-        }
+        ahci_ch_intr(context, port);
     }
-    write(axdriver_block::ahci::regs::AHCI_IS, pending);
+    write_ahci_irq_register(context, axdriver_block::ahci::regs::AHCI_IS, pending);
     true
 }
 
