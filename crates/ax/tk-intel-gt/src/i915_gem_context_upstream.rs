@@ -302,7 +302,7 @@ const _: [(); 4] = [(); size_of::<I915EngineClassInstance>()];
 const _: [(); 32] = [(); size_of::<I915UserExtension>()];
 const _: [(); 24] = [(); size_of::<DrmI915GemContextParam>()];
 const _: [(); 32] = [(); size_of::<DrmI915GemContextParamSseu>()];
-const _: [(); 24] = [(); size_of::<DrmI915GemContextCreateExt>()];
+const _: [(); 16] = [(); size_of::<DrmI915GemContextCreateExt>()];
 const _: [(); 24] = [(); size_of::<I915GemContextParamContextImage>()];
 
 // Linux/UAPI and i915 helpers not owned by this source file. Static-inline
@@ -496,7 +496,7 @@ unsafe fn radix_tree_for_each_slot_start(iter: *mut RadixTreeIter) {
 }
 
 unsafe fn current_task_ptr() -> *mut c_void {
-    axhal::percpu::current_task_ptr::<()>().cast()
+    axhal::percpu::current_task_ptr::<()>().cast_mut().cast()
 }
 
 unsafe fn set_context_bit(ctx: *mut I915GemContext, bit: u32, value: bool) {

@@ -140,6 +140,24 @@ pub unsafe fn list_splice_init(list: *mut ListHead, head: *mut ListHead) {
     }
 }
 
+/// Insert all entries from `list` after `head` without reinitializing `list`,
+/// matching Linux `list_splice()` (`include/linux/list.h`).
+#[inline]
+pub unsafe fn list_splice(list: *mut ListHead, head: *mut ListHead) {
+    if unsafe { list_empty(&*list) } {
+        return;
+    }
+    let first = unsafe { (*list).next };
+    let last = unsafe { (*list).prev };
+    let at = unsafe { (*head).next };
+    unsafe {
+        (*first).prev = head;
+        (*head).next = first;
+        (*last).next = at;
+        (*at).prev = last;
+    }
+}
+
 pub unsafe fn list_replace(old: *mut ListHead, new: *mut ListHead) {
     (*new).next = (*old).next;
     (*(*new).next).prev = new;
