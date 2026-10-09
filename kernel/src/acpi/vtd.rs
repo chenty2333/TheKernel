@@ -25,8 +25,8 @@ use tk_vtd::{
     reg::{
         ContextEntry, DMAR_CAP_MGAW, DMAR_CAP_ND, DMAR_CAP_RWBF, DMAR_CAP_SAGAW,
         DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS, DMAR_CAP_SPS_2M, DMAR_CTX2_AW_4LVL, DMAR_ECAP_C,
-        DMAR_ECAP_EIM, DMAR_ECAP_IR, DMAR_ECAP_QI, DMAR_IECTL_IM, DMAR_IECTL_REG, DMAR_PTE_R,
-        DMAR_PTE_W, RootEntry,
+        DMAR_ECAP_EIM, DMAR_ECAP_IR, DMAR_ECAP_QI, DMAR_FECTL_IM, DMAR_FECTL_REG, DMAR_IECTL_IM,
+        DMAR_IECTL_REG, DMAR_PTE_R, DMAR_PTE_W, RootEntry,
     },
     utils::{self, RegisterIo},
 };
@@ -212,6 +212,18 @@ fn store_irte_words(mut store: impl FnMut(usize, u64), low: u64, high: u64) {
     // does for a new entry.
     store(1, high);
     store(0, low);
+}
+
+/// Return the write needed to mask the DMAR fault-event MSI when this kernel
+/// has no registered VT-d fault handler. Write only IM: FECTL.IP is W1C, so
+/// echoing a pending bit from the readback could acknowledge firmware state.
+const fn fault_event_mask_write(control: u32) -> Option<u32> {
+    let mask = DMAR_FECTL_IM as u32;
+    if control & mask == 0 {
+        Some(mask)
+    } else {
+        None
+    }
 }
 
 fn validate_all_unit_capabilities(
@@ -480,6 +492,17 @@ impl Unit {
         }
         self.gcmd = read32(self, GCMD);
         let status = read32(self, GSTS);
+        // Linux installs dmar_fault and its MSI before enabling translation.
+        // This kernel currently polls FSTS during VT-d operations instead of
+        // owning a fault-event IRQ, so prevent a fault from being delivered to
+        // firmware's stale/unregistered FEADDR/FEDATA vector.
+        if let Some(mask) = fault_event_mask_write(read32(self, DMAR_FECTL_REG as usize)) {
+            *hardware_touched = true;
+            write32(self, DMAR_FECTL_REG as usize, mask);
+            if read32(self, DMAR_FECTL_REG as usize) & DMAR_FECTL_IM as u32 == 0 {
+                return Err(("fault-event interrupt mask readback", Error::MapFailed));
+            }
+        }
         if status & GSTS_IRES != 0 {
             *hardware_touched = true;
             step!(
@@ -2766,23 +2789,23 @@ mod tests {
     use alloc::{sync::Arc, vec, vec::Vec};
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use tk_vtd::iova::IovaAllocator;
+    use tk_vtd::{iova::IovaAllocator, reg::DMAR_FECTL_IP};
 
     use super::{
         DMAR_CAP_SAGAW_4LVL, DMAR_CAP_SPS_2M, DMAR_ECAP_C, DMAR_ECAP_EIM, DMAR_ECAP_IR,
-        DMAR_ECAP_QI, DomainState, Error, IdentityDmaOwner, IdentityPage, IrRoute, IrRouteState,
-        KernelPageMemory, MODE_ENABLED, MODE_FAILED, MODE_IDENTITY, MODE_UNKNOWN, Mapping,
-        MappingState, PageMemory, RequesterIdentityLease, UnitProbe, cap_domain_count,
+        DMAR_ECAP_QI, DMAR_FECTL_IM, DomainState, Error, IdentityDmaOwner, IdentityPage, IrRoute,
+        IrRouteState, KernelPageMemory, MODE_ENABLED, MODE_FAILED, MODE_IDENTITY, MODE_UNKNOWN,
+        Mapping, MappingState, PageMemory, RequesterIdentityLease, UnitProbe, cap_domain_count,
         complete_domain_install, direct_identity_acquire, direct_identity_lease_allowed,
-        direct_identity_map, direct_identity_release, direct_identity_unmap, find_owned_msi_vector,
-        identity_dma_in_mode, identity_fallback_safe_before_enable, identity_pages_for_path,
-        pci_dma_allowed_in_mode, prepare_identity_batch_record, publish_identity_batch,
-        publish_mapping_after_invalidation, quarantine_boot_resources, register_identity_lease,
-        release_identity_lease, require_no_identity_lease, require_ready_domain,
-        retire_identity_batch_record, retire_ir_route_after_invalidation,
-        retire_mapping_after_invalidation, store_irte_words, take_domain_id, take_nonreusing_id,
-        validate_all_unit_capabilities, validate_identity_pages_in_aperture,
-        validate_unit_capabilities,
+        direct_identity_map, direct_identity_release, direct_identity_unmap,
+        fault_event_mask_write, find_owned_msi_vector, identity_dma_in_mode,
+        identity_fallback_safe_before_enable, identity_pages_for_path, pci_dma_allowed_in_mode,
+        prepare_identity_batch_record, publish_identity_batch, publish_mapping_after_invalidation,
+        quarantine_boot_resources, register_identity_lease, release_identity_lease,
+        require_no_identity_lease, require_ready_domain, retire_identity_batch_record,
+        retire_ir_route_after_invalidation, retire_mapping_after_invalidation, store_irte_words,
+        take_domain_id, take_nonreusing_id, validate_all_unit_capabilities,
+        validate_identity_pages_in_aperture, validate_unit_capabilities,
     };
 
     struct DropProbe(Arc<AtomicUsize>);
@@ -2818,6 +2841,18 @@ mod tests {
         assert!(direct_identity_lease_allowed(MODE_IDENTITY));
         assert!(!direct_identity_lease_allowed(MODE_ENABLED));
         assert!(!direct_identity_lease_allowed(MODE_FAILED));
+    }
+
+    #[test]
+    fn unowned_fault_event_msi_is_masked_without_acknowledging_pending_state() {
+        let mask = DMAR_FECTL_IM as u32;
+        let pending = DMAR_FECTL_IP as u32;
+
+        assert_eq!(fault_event_mask_write(0), Some(mask));
+        assert_eq!(fault_event_mask_write(pending), Some(mask));
+        assert_eq!(fault_event_mask_write(mask), None);
+        assert_eq!(fault_event_mask_write(mask | pending), None);
+        assert_eq!(fault_event_mask_write(pending).unwrap() & pending, 0);
     }
 
     #[test]
