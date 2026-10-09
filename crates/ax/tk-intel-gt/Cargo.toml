@@ -19,7 +19,7 @@ workspace = true
 default = []
 # Keep the source-order Linux 7.2.3 translations opt-in until their LinuxKPI
 # bindings are complete. This is deliberately not enabled by the product.
-upstream-gt = ["dep:axlog", "dep:kernel_guard", "dep:axhal", "dep:axtask", "dep:axmm", "dep:memory_addr", "dep:spin"]
+upstream-gt = ["dep:axlog", "dep:kernel_guard", "dep:axhal", "dep:axtask", "dep:axmm", "dep:memory_addr", "dep:spin", "dep:axalloc", "dep:tk-vtd"]
 
 [dependencies]
 axlog = { workspace = true, optional = true }
@@ -52,4 +52,13 @@ optional = true
 
 [dependencies.spin]
 version = "0.9"
+optional = true
+
+[dependencies.axalloc]
+package = "tk-axalloc"
+path = "../tk-axalloc"
+optional = true
+
+[dependencies.tk-vtd]
+path = "../tk-vtd"
 optional = true

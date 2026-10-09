@@ -3787,9 +3787,11 @@ dependencies = [
  "kernel_guard",
  "memory_addr",
  "spin 0.9.9",
+ "tk-axalloc",
  "tk-axhal",
  "tk-axmm",
  "tk-axtask",
+ "tk-vtd",
 ]
 
 [[package]]

@@ -13,6 +13,12 @@
 use crate::linux::shmem::{AddressSpace, File, FileOperations, Folio, FolioBatch, Inode, IovIter, Kiocb, VfsMount, WritebackControl,
  pfn_to_page,check_move_unevictable_folios,__folio_batch_release,mapping_clear_unevictable,folio_batch_init,page_folio,folio_mark_dirty,folio_mark_accessed,folio_batch_add,mapping_set_unevictable,mapping_gfp_constraint,shmem_read_folio_gfp,mapping_gfp_mask,folio_nr_pages,shmem_truncate_range,writeback_iter,folio_mapped,folio_redirty_for_writepage,shmem_writeout,init_sync_kiocb,iov_iter_ubuf,shmem_file_setup_with_mnt,shmem_file_setup,force_o_largefile,mapping_set_gfp_mask,kernel_write,totalram_pages,dev_warn};
 
+use crate::{i915_gem_gtt_upstream::{i915_gem_gtt_prepare_pages,i915_gem_gtt_finish_pages},i915_utils_upstream::i915_vtd_active};
+
+use crate::{intel_memory_region_upstream::{intel_memory_region_create,intel_memory_region_set_name},i915_gem_region_upstream::IntelMemoryRegionOps};
+
+use crate::i915_gem_phys_upstream::{i915_gem_object_put_pages_phys,i915_gem_object_pwrite_phys,i915_gem_object_pread_phys};
+
 use core::{
     ffi::{c_char, c_int, c_long, c_ulong, c_void, CStr},
     ptr,
@@ -32,7 +38,7 @@ use crate::{
     i915_gem_pages_upstream::{__i915_gem_object_set_pages, i915_gem_object_truncate, i915_sg_trim, sg_alloc_table, sg_mark_end, sg_next, sg_page, sg_set_folio, Scatterlist as ScatterList},
     i915_gem_region_upstream::{i915_gem_object_create_region, i915_gem_object_init_memory_region, i915_gem_object_release_memory_region},
     i915_gem_pages_upstream::drm_clflush_sg,
-    i915_gem_userptr_upstream::{drm_gem_private_object_init, i915_gem_gtt_finish_pages, sg_free_table},
+    i915_gem_userptr_upstream::{drm_gem_private_object_init, sg_free_table},
     i915_gem_core_upstream::{access_ok, u64_to_user_ptr},
     linux::shmem::fput,
     linux::gem::{DrmGemObject,drm_gem_get_huge_mnt,drm_gem_huge_mnt_create},
@@ -528,7 +534,7 @@ unsafe extern "C" fn shmem_get_pages(obj: *mut DrmI915GemObject) -> c_int {
             if ret == -ENOSPC {
                 ret = -ENOMEM;
             }
-            kfree(st.cast());
+            kfree(st);
             return ret;
         }
 
@@ -539,7 +545,7 @@ unsafe extern "C" fn shmem_get_pages(obj: *mut DrmI915GemObject) -> c_int {
             // instead may help.
             if max_segment > PAGE_SIZE as u32 {
                 shmem_sg_free_table(st, mapping, false, false);
-                kfree(st.cast());
+                kfree(st);
 
                 max_segment = PAGE_SIZE as u32;
                 continue;
@@ -554,7 +560,7 @@ unsafe extern "C" fn shmem_get_pages(obj: *mut DrmI915GemObject) -> c_int {
             if ret == -ENOSPC {
                 ret = -ENOMEM;
             }
-            kfree(st.cast());
+            kfree(st);
             return ret;
         }
 
@@ -864,7 +870,7 @@ unsafe fn __create_shmem(
 }
 
 // upstream: i915_gem_shmem.c shmem_object_init()
-unsafe fn shmem_object_init(
+unsafe extern "C" fn shmem_object_init(
     mem: *mut IntelMemoryRegion,
     obj: *mut DrmI915GemObject,
     offset: u64,
@@ -972,7 +978,7 @@ pub unsafe fn i915_gem_object_create_shmem_from_data(
 }
 
 // upstream: i915_gem_shmem.c init_shmem()
-unsafe fn init_shmem(mem: *mut IntelMemoryRegion) -> c_int {
+unsafe extern "C" fn init_shmem(mem: *mut IntelMemoryRegion) -> c_int {
     let i915 = (*mem).i915;
 
     // By creating our own shmemfs mountpoint, pass mount flags that better
@@ -981,7 +987,7 @@ unsafe fn init_shmem(mem: *mut IntelMemoryRegion) -> c_int {
     // regress on slow reads.
     if GRAPHICS_VER(i915) >= 11 || i915_vtd_active(i915) {
         drm_gem_huge_mnt_create(&mut (*i915).drm, b"within_size\0".as_ptr().cast());
-        if !drm_gem_get_huge_mnt(&mut (*i915).drm).is_null() {
+        if !drm_gem_get_huge_mnt::<_, VfsMount>(&mut (*i915).drm).is_null() {
             drm_info(
                 &mut (*i915).drm,
                 b"Using Transparent Hugepages\n\0".as_ptr().cast(),
@@ -1001,23 +1007,15 @@ unsafe fn init_shmem(mem: *mut IntelMemoryRegion) -> c_int {
         }
     }
 
-    intel_memory_region_set_name(mem, b"system\0".as_ptr().cast());
+    intel_memory_region_set_name(mem, b"system\0".as_ptr().cast(), &[]);
 
     0 // Fall back to the kernel mount if huge mount creation failed.
 }
 
 // Source order follows struct intel_memory_region_ops in intel_memory_region.h.
-#[repr(C)]
-struct IntelMemoryRegionOps {
-    init: Option<unsafe fn(*mut IntelMemoryRegion) -> c_int>,
-    release: Option<unsafe fn(*mut IntelMemoryRegion) -> c_int>,
-    init_object: Option<
-        unsafe fn(*mut IntelMemoryRegion, *mut DrmI915GemObject, u64, u64, u64, u32) -> c_int,
-    >,
-}
 
 // SAFETY: this ops table is immutable and contains only function pointers.
-unsafe impl Sync for IntelMemoryRegionOps {}
+
 
 static shmem_region_ops: IntelMemoryRegionOps = IntelMemoryRegionOps {
     init: Some(init_shmem),

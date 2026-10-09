@@ -63,3 +63,7 @@ pub mod mm_native;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod shmem;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod dma;

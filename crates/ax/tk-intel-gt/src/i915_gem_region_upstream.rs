@@ -30,6 +30,8 @@ pub struct IntelMemoryRegionOps {
     pub init_object: Option<unsafe extern "C" fn(*mut IntelMemoryRegion, *mut DrmI915GemObject, u64, u64, u64, u32) -> c_int>,
 }
 
+unsafe impl Sync for IntelMemoryRegionOps {}
+
 #[repr(C)]
 pub struct I915GemApplyToRegionOps {
     pub process_obj: Option<unsafe extern "C" fn(*mut I915GemApplyToRegion, *mut DrmI915GemObject) -> c_int>,

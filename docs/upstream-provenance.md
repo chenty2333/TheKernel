@@ -1512,3 +1512,13 @@ G2 follow-up: `i915_mm_upstream.rs` translates Linux 7.2.3 MIT `i915_mm.c`
 axtask, the native allocator and axhal physical-address translation, not copied
 Linux GPL MM/fs implementations. The C layout probe confirms the VMA manager
 lock at offset 0, size 248, and CONFIG_TRANSPARENT_HUGEPAGE=n (no huge_mnt field).
+
+G2 follow-up: Linux 7.2.3 MIT `gem/i915_gem_phys.c` all nine functions are in
+`i915_gem_phys_upstream.rs` (copyright © 2014-2016 Intel Corporation);
+`i915_gem_gtt.c` page prepare/finish and `i915_utils.c` VT-d predicate have
+source-order owners. `intel_memory_region_upstream.rs` contains the MIT
+initialization/memtest/type/name dependency functions from
+`intel_memory_region.c` (copyright © 2019 Intel Corporation). Full MIT grants
+are retained in the crate. The original LinuxKPI DMA adapter allocates native
+DMA pages and uses requester-scoped tk-vtd mapping/retirement; unknown device
+ownership refuses mapping, and no feature-enabled runtime path is installed.

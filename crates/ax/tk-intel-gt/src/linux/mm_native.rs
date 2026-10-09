@@ -145,3 +145,20 @@ pub unsafe fn vm_mmap(file:*mut File,addr:c_ulong,size:c_ulong,prot:u32,flags:u3
     unsafe {mmap_read_unlock(mm)};
     result.unwrap_or_else(|err|err as isize as usize) as c_ulong
 }
+
+/// Fault-checked usercopy through the native address space, never a raw copy
+/// from an untrusted user pointer. Linux returns the number of uncopied bytes.
+pub unsafe fn copy_from_user(to:*mut c_void,from:*const c_void,size:usize)->usize {
+    if size==0{return 0;}
+    let mm=current_mm();if mm.is_null(){return size;}
+    unsafe {mmap_read_lock(mm)};
+    let result=unsafe {(&*(*mm).aspace.get()).read((from as usize).into(),core::slice::from_raw_parts_mut(to.cast(),size))};
+    unsafe {mmap_read_unlock(mm)};if result.is_ok(){0}else{size}
+}
+pub unsafe fn copy_to_user(to:*mut c_void,from:*const c_void,size:usize)->usize {
+    if size==0{return 0;}
+    let mm=current_mm();if mm.is_null(){return size;}
+    unsafe {mmap_read_lock(mm)};
+    let result=unsafe {(&*(*mm).aspace.get()).write((to as usize).into(),core::slice::from_raw_parts(from.cast(),size))};
+    unsafe {mmap_read_unlock(mm)};if result.is_ok(){0}else{size}
+}
