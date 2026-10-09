@@ -49,6 +49,7 @@ pub(crate) struct DpAuxKernel<'a, R: Registers> {
     channel: AuxChannel,
     port_lock: Option<MutexGuard<'static, ()>>,
     power_domain: PowerDomain,
+    parent_power_domain: Option<PowerDomain>,
     diagnostics: Vec<String>,
 }
 
@@ -65,6 +66,11 @@ impl<'a, R: Registers> DpAuxKernel<'a, R> {
             AuxChannel::UsbC2 => PowerDomain::AuxUsbc2,
             _ => return Err(AuxError::Invalid),
         };
+        let parent_power_domain = match channel {
+            AuxChannel::UsbC1 => Some(PowerDomain::PortDdiLanesTc1),
+            AuxChannel::UsbC2 => Some(PowerDomain::PortDdiLanesTc2),
+            _ => None,
+        };
         Ok(Self {
             registers,
             timer: MonotonicTimer,
@@ -72,6 +78,7 @@ impl<'a, R: Registers> DpAuxKernel<'a, R> {
             channel,
             port_lock: None,
             power_domain,
+            parent_power_domain,
             diagnostics: Vec::new(),
         })
     }
@@ -150,19 +157,45 @@ impl<'a, R: Registers> DpAuxKernel<'a, R> {
     }
 
     fn power_get_domain(&mut self, domain: PowerDomain) -> Result<(), AuxError> {
+        if domain != self.power_domain {
+            return Err(AuxError::Power);
+        }
         let mut power = POWER.lock();
         let state = power.as_mut().ok_or(AuxError::Power)?;
-        state
-            .get_domain(self.registers, domain)
-            .map_err(|_| AuxError::Power)
+        if let Some(parent) = self.parent_power_domain {
+            state
+                .get_domain(self.registers, parent)
+                .map_err(|_| AuxError::Power)?;
+        }
+        if state.get_domain(self.registers, domain).is_err() {
+            if let Some(parent) = self.parent_power_domain {
+                let _ = state.put_domain(self.registers, parent);
+            }
+            return Err(AuxError::Power);
+        }
+        Ok(())
     }
 
     fn power_put_domain(&mut self, domain: PowerDomain) {
+        if domain != self.power_domain {
+            self.diagnostics
+                .push(String::from("invalid AUX domain on put"));
+            return;
+        }
         let mut power = POWER.lock();
         if let Some(state) = power.as_mut() {
             if state.put_domain(self.registers, domain).is_err() {
                 self.diagnostics
                     .push(String::from("AUX power-domain put failed"));
+                // Keep the parent lane reference if the AUX reference could
+                // not be proven released.
+                return;
+            }
+            if let Some(parent) = self.parent_power_domain
+                && state.put_domain(self.registers, parent).is_err()
+            {
+                self.diagnostics
+                    .push(String::from("AUX parent lane-domain put failed"));
             }
         } else {
             self.diagnostics
@@ -450,6 +483,21 @@ mod tests {
 
     use super::{super::regs::RegisterWindow, *};
 
+    struct NoRegisters;
+    impl Registers for NoRegisters {
+        fn read(&self, _register: Register) -> Option<u32> {
+            None
+        }
+
+        fn read64(&self, _register: Register) -> Option<u64> {
+            None
+        }
+
+        fn write(&self, _register: Register, _value: u32) -> bool {
+            false
+        }
+    }
+
     #[test]
     fn maps_only_typed_adl_n_aux_a_b_registers() {
         let platform = aux_platform();
@@ -499,6 +547,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn type_c_aux_references_hold_the_matching_ddi_lane_well() {
+        let registers = NoRegisters;
+        let tc1 = DpAuxKernel::new(&registers, AuxChannel::UsbC1, true).unwrap();
+        assert_eq!(tc1.power_domain, PowerDomain::AuxUsbc1);
+        assert_eq!(tc1.parent_power_domain, Some(PowerDomain::PortDdiLanesTc1));
+        let tc2 = DpAuxKernel::new(&registers, AuxChannel::UsbC2, true).unwrap();
+        assert_eq!(tc2.power_domain, PowerDomain::AuxUsbc2);
+        assert_eq!(tc2.parent_power_domain, Some(PowerDomain::PortDdiLanesTc2));
+        assert!(DpAuxKernel::new(&registers, AuxChannel::UsbC3, true).is_err());
     }
 
     #[test]

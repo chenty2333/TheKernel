@@ -366,6 +366,28 @@ pub(crate) const DDI_IO_B: Well = Well {
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
 
+/// TGL/ADL TC1 DDI IO well for the Type-C PHY lane-power reference.
+pub(crate) const DDI_IO_TC1: Well = Well {
+    name: "DDI_IO_TC1",
+    register: regs::ICL_PWR_WELL_CTL_DDI2,
+    request_registers: DDI_REQUESTS,
+    index: 3,
+    irq_pipe_mask: 0,
+    pg: None,
+    timeout_us: WELL_STATE_TIMEOUT_US,
+};
+
+/// TGL/ADL TC2 DDI IO well for the Type-C PHY lane-power reference.
+pub(crate) const DDI_IO_TC2: Well = Well {
+    name: "DDI_IO_TC2",
+    register: regs::ICL_PWR_WELL_CTL_DDI2,
+    request_registers: DDI_REQUESTS,
+    index: 4,
+    irq_pipe_mask: 0,
+    pg: None,
+    timeout_us: WELL_STATE_TIMEOUT_US,
+};
+
 /// `AUX_A`, the AUX channel power well for port A.
 ///
 /// §11 phase 2.1: enabling this is a precondition of GMBUS or AUX working on
@@ -1427,6 +1449,8 @@ fn mapped_hsw_well(instance: PowerWellInstance) -> Option<Well> {
         WellControl::IclPw2 => Some(PW_2),
         WellControl::IclDdiA => Some(DDI_IO_A),
         WellControl::IclDdiB => Some(DDI_IO_B),
+        WellControl::TglDdiTc1 => Some(DDI_IO_TC1),
+        WellControl::TglDdiTc2 => Some(DDI_IO_TC2),
         WellControl::IclAuxA => Some(AUX_A),
         WellControl::IclAuxB => Some(AUX_B),
         WellControl::TglAuxTc1 => Some(AUX_TC1),
@@ -1992,6 +2016,7 @@ mod tests {
         regs.set(regs::CDCLK_PLL_ENABLE, (1 << 31) | (1 << 30) | 22);
         regs.set(regs::CDCLK_CTL, (1 << 22) | (7 << 19) | 350);
         regs.set(regs::PCH_RAWCLK_FREQ, 24 << 16);
+        regs.set(regs::ICL_PWR_WELL_CTL_DDI2, 0);
         regs.set(regs::aux::DP_AUX_CH_CTL_D, 1 << 11);
         regs.set(regs::aux::DP_AUX_CH_CTL_E, 1 << 11);
         // DC6 requested: a machine that needs the DC state turned off, which is
@@ -2024,6 +2049,18 @@ mod tests {
         regs.derive(regs::ICL_PWR_WELL_CTL_AUX2, |written| {
             let mut value = written;
             for well in [AUX_A, AUX_B, AUX_TC1, AUX_TC2] {
+                let (request, state) = (well.request_mask(), well.state_mask());
+                if written & request != 0 {
+                    value |= state;
+                } else {
+                    value &= !state;
+                }
+            }
+            value
+        });
+        regs.derive(regs::ICL_PWR_WELL_CTL_DDI2, |written| {
+            let mut value = written;
+            for well in [DDI_IO_A, DDI_IO_B, DDI_IO_TC1, DDI_IO_TC2] {
                 let (request, state) = (well.request_mask(), well.state_mask());
                 if written & request != 0 {
                     value |= state;
@@ -2481,6 +2518,8 @@ mod tests {
         for (name, expected) in [
             ("DDI_IO_A", DDI_IO_A),
             ("DDI_IO_B", DDI_IO_B),
+            ("DDI_IO_TC1", DDI_IO_TC1),
+            ("DDI_IO_TC2", DDI_IO_TC2),
             ("AUX_A", AUX_A),
             ("AUX_B", AUX_B),
             ("AUX_USBC1", AUX_TC1),

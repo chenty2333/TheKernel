@@ -444,9 +444,10 @@ complete:
 * **Power-well lifecycle:** the generic domain/well reference counters, the
   synchronous get/put path and the ADL-N Pipe-A/PW_A core path exist. The full
   platform power-map consumer is not wired into all connector, AUX, pipe, PLL,
-  and TC state transitions. The source TGL Type-C AUX1/AUX2 wells and D/E AUX
-  control power bits are now usable through the map-backed `AuxUsbc1/2`
-  references, but the native TC DPCD/link path does not call them yet. Async puts are only modeled in the reusable
+  and TC state transitions. The source TGL Type-C AUX1/AUX2 and DDI_IO TC1/2
+  wells are mapped; AUX D/E control power bits are cleared before AUX requests.
+  `DpAuxKernel` acquires the matching DDI lane reference before the AUX well,
+  but the native TC DPCD/link path does not call it yet. Async puts are only modeled in the reusable
   domain core; the kernel workqueue/runtime-PM cancellation and flush lifecycle
   is not connected. Thus no claim is made that disabling a modeset returns all
   wells or reproduces every i915 delayed-put edge.
