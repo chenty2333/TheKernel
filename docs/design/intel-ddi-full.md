@@ -17,6 +17,9 @@ the admitted HDMI/DVI encoder and Pipe-A state. The source
 and 10-ms active poll through a single-register `DdiIo` adapter. The bounded
 adapters cannot access unrelated MMIO/PHY registers. This integration caught
 and fixed a translated sync-flag offset error and removed a Gen13 `PORT_WIDTH`
-field that upstream only adds on display version 14+. A complete kernel
-`DdiIo` binding and source DDI pre-enable/enable/disable call sequence are not
-yet connected.
+field that upstream only adds on display version 14+. The active Pipe-A TC
+transaction now uses the translated `intel_ddi_disable_transcoder_func()` to
+clear FUNC_CTL2/FUNC_CTL, with a two-register allowlist and readback checks;
+its surrounding PLL, PHY and TC ownership stages remain the existing bounded
+legacy path. A complete kernel `DdiIo` binding and source DDI pre-enable/enable/
+disable call sequence are not yet connected.

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Linux 7.2.3 drivers/gpu/drm/i915/display/intel_ddi.c:
 // intel_ddi_enable_transcoder_clock, intel_ddi_transcoder_func_reg_val_get,
+// intel_ddi_disable_transcoder_func,
 // intel_ddi_buf_enable/disable; intel_dpll_mgr.c: dkl_pll_write, mg_pll_enable/
 // disable; intel_display.c: intel_set_transcoder_timings and pipe enable;
 // skl_universal_plane.c: primary-plane arm. Original source copyrights:
@@ -453,6 +454,161 @@ pub(super) fn source_hdmi_tmds_clock_with_limit(
     .ok()
 }
 
+/// Bound the translated transcoder-disable helper to the single Pipe-A pair
+/// that the N305 TC transaction already owns. A failed read suppresses the
+/// follow-up FUNC_CTL write; the caller verifies both writes by readback.
+struct TcTranscoderDisableIo<'a, R> {
+    registers: &'a R,
+    read_failed: bool,
+    write_failed: bool,
+}
+
+impl<'a, R: Registers> TcTranscoderDisableIo<'a, R> {
+    fn new(registers: &'a R) -> Self {
+        Self {
+            registers,
+            read_failed: false,
+            write_failed: false,
+        }
+    }
+}
+
+impl<R: Registers> intel_display::intel_ddi_full::DdiIo for TcTranscoderDisableIo<'_, R> {
+    fn read(&mut self, reg: u32) -> u32 {
+        let typed = if reg == ddi::TRANS_DDI_FUNC_CTL_A.offset() {
+            ddi::TRANS_DDI_FUNC_CTL_A
+        } else if reg == ddi::TRANS_DDI_FUNC_CTL2_A.offset() {
+            ddi::TRANS_DDI_FUNC_CTL2_A
+        } else {
+            self.read_failed = true;
+            return u32::MAX;
+        };
+        match self.registers.read(typed) {
+            Some(value) => value,
+            None => {
+                self.read_failed = true;
+                u32::MAX
+            }
+        }
+    }
+
+    fn write(&mut self, reg: u32, value: u32) {
+        let typed = if reg == ddi::TRANS_DDI_FUNC_CTL_A.offset() {
+            ddi::TRANS_DDI_FUNC_CTL_A
+        } else if reg == ddi::TRANS_DDI_FUNC_CTL2_A.offset() {
+            ddi::TRANS_DDI_FUNC_CTL2_A
+        } else {
+            self.write_failed = true;
+            return;
+        };
+        if self.read_failed || !self.registers.write(typed, value) {
+            self.write_failed = true;
+        }
+    }
+
+    fn combo_phy_read(
+        &mut self,
+        _phy: u8,
+        _reg: intel_display::intel_ddi_full::ComboPhyRegister,
+    ) -> u32 {
+        0
+    }
+    fn combo_phy_write(
+        &mut self,
+        _phy: u8,
+        _reg: intel_display::intel_ddi_full::ComboPhyRegister,
+        _value: u32,
+    ) {
+    }
+    fn combo_phy_rmw(
+        &mut self,
+        _phy: u8,
+        _reg: intel_display::intel_ddi_full::ComboPhyRegister,
+        _clear: u32,
+        _set: u32,
+    ) {
+    }
+    fn mg_phy_rmw(
+        &mut self,
+        _port: intel_display::intel_ddi_full::Port,
+        _reg: intel_display::intel_ddi_full::MgPhyRegister,
+        _clear: u32,
+        _set: u32,
+    ) {
+    }
+    fn dkl_phy_read(
+        &mut self,
+        _port: intel_display::intel_ddi_full::Port,
+        _reg: intel_display::intel_ddi_full::DklPhyRegister,
+    ) -> u32 {
+        0
+    }
+    fn dkl_phy_write(
+        &mut self,
+        _port: intel_display::intel_ddi_full::Port,
+        _reg: intel_display::intel_ddi_full::DklPhyRegister,
+        _value: u32,
+    ) {
+    }
+    fn dkl_phy_rmw(
+        &mut self,
+        _port: intel_display::intel_ddi_full::Port,
+        _reg: intel_display::intel_ddi_full::DklPhyRegister,
+        _clear: u32,
+        _set: u32,
+    ) {
+    }
+    fn mg_dp_mode_read(&mut self, _port: intel_display::intel_ddi_full::Port, _lane: u8) -> u32 {
+        0
+    }
+    fn mg_dp_mode_write(
+        &mut self,
+        _port: intel_display::intel_ddi_full::Port,
+        _lane: u8,
+        _value: u32,
+    ) {
+    }
+}
+
+fn disable_pipe_a_transcoder<R: Registers>(registers: &R) -> Result<(), String> {
+    use intel_display::intel_ddi_full as i915;
+
+    let encoder = i915::DdiEncoder {
+        output: i915::OutputType::Hdmi,
+        display: i915::Platform {
+            display_ver: 13,
+            alderlake_p: true,
+            ..i915::Platform::default()
+        },
+        ..i915::DdiEncoder::default()
+    };
+    let state = i915::CrtcState {
+        cpu_transcoder: i915::Transcoder::A,
+        output: i915::OutputType::Hdmi,
+        master_transcoder: i915::Transcoder::Invalid,
+        mst_master_transcoder: i915::Transcoder::Invalid,
+        mst_master: false,
+        ..i915::CrtcState::default()
+    };
+    let mut io = TcTranscoderDisableIo::new(registers);
+    i915::intel_ddi_disable_transcoder_func(&mut io, &encoder, &state);
+    if io.read_failed || io.write_failed {
+        return Err(String::from("translated Pipe-A transcoder disable failed"));
+    }
+    let ctl2 = registers
+        .read(ddi::TRANS_DDI_FUNC_CTL2_A)
+        .ok_or_else(|| String::from("Pipe-A FUNC_CTL2 readback unavailable"))?;
+    let ctl = registers
+        .read(ddi::TRANS_DDI_FUNC_CTL_A)
+        .ok_or_else(|| String::from("Pipe-A FUNC_CTL readback unavailable"))?;
+    if ctl2 != 0 || ctl & DDI_ENABLE != 0 {
+        return Err(format!(
+            "translated transcoder disable readback mismatch ctl2={ctl2:#x} ctl={ctl:#x}"
+        ));
+    }
+    Ok(())
+}
+
 /// Program one validated progressive RGB/XRGB timing on an already-active,
 /// already-owned legacy TC port. No cold transition or new PHY ownership is
 /// attempted. The DDB allocation and DBUF slice programming remain the
@@ -585,11 +741,7 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         read(r, p::PIPECONF_A.offset())? & !(PIPE_ENABLE | PIPE_RUNNING),
     )?;
     poll(r, timer, p::PIPECONF_A.offset(), PIPE_RUNNING, 0, 100_000)?;
-    write(
-        r,
-        ddi::TRANS_DDI_FUNC_CTL_A.offset(),
-        read(r, ddi::TRANS_DDI_FUNC_CTL_A.offset())? & !DDI_ENABLE,
-    )?;
+    disable_pipe_a_transcoder(r)?;
     let current_buf = read(r, control_offset)?;
     write(r, control_offset, current_buf & !(DDI_ENABLE | DDI_IDLE))?;
     poll(r, timer, control_offset, DDI_IDLE, DDI_IDLE, 100_000)?;
