@@ -67,3 +67,9 @@ pub fn trace_i915_gem_object_clflush(_obj: *mut DrmI915GemObject) {}
 #[cfg(feature = "upstream-gt")]
 #[inline]
 pub fn trace_i915_ppgtt_create(_vm: *mut I915AddressSpace) {}
+
+/// `i915_ppgtt_release` is an optional i915 trace event with no enabled sink in
+/// this target; release lifetime and ordering are still implemented by caller.
+#[cfg(feature = "upstream-gt")]
+#[inline]
+pub fn trace_i915_ppgtt_release(_vm: *mut I915AddressSpace) {}

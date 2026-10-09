@@ -266,6 +266,10 @@ pub mod intel_gt_pm_irq_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_gt_irq_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_irq_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_gt_pm_upstream;
@@ -317,6 +321,14 @@ pub mod intel_guc_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_guc_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_huc_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_mocs_upstream;
+
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_huc_types_upstream;
@@ -517,6 +529,10 @@ pub(crate) mod intel_guc_ads_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod intel_ggtt_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_gtt_upstream;
 
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
