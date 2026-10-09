@@ -27,7 +27,7 @@ for source in "$source_dir/tests/guest/graphics/"*.c; do
             libraries="-lgbm -lEGL -lGLESv2 -ldl"
             ;;
         intel-vulkan-smoke)
-            libraries="-lvulkan"
+            libraries="-lvulkan -ldl"
             ;;
         intel-va-driver-load)
             libraries="-ldl"

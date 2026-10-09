@@ -12,19 +12,61 @@ icd=/usr/share/vulkan/icd.d/intel_icd.x86_64.json
 grep -Fq 'libvulkan_intel.so' "$icd" || { echo "$marker state=FAIL reason=anv_icd" >&2; exit 1; }
 
 status=0
-VK_DRIVER_FILES="$icd" LD_DEBUG=libs "$client" >"$log" 2>&1 || status=$?
+VK_DRIVER_FILES="$icd" VK_LOADER_DEBUG=error LD_DEBUG=libs "$client" >"$log" 2>&1 || status=$?
 [ "$status" -eq 0 ] || { cat "$log" >&2; echo "$marker state=FAIL reason=enumeration" >&2; exit 1; }
 grep -Fq "$marker" "$log" || { cat "$log" >&2; echo "$marker state=FAIL reason=no_device_oracle" >&2; exit 1; }
 grep -Fq 'libvulkan_intel.so' "$log" || { cat "$log" >&2; echo "$marker state=FAIL reason=anv_not_loaded" >&2; exit 1; }
+grep -Fq 'Failed to detect any valid GPUs in the current config' "$log" || {
+    cat "$log" >&2
+    echo "$marker state=FAIL reason=loader_zero_device_reason" >&2
+    exit 1
+}
+if grep -Fq "vkEnumeratePhysicalDevices' in ICD " "$log"; then
+    cat "$log" >&2
+    echo "$marker state=FAIL reason=icd_enumeration_error" >&2
+    exit 1
+fi
+unexpected_loader_errors=$(grep -F '[Vulkan Loader] ERROR:' "$log" \
+    | grep -Fv 'Failed to detect any valid GPUs in the current config' || true)
+[ -z "$unexpected_loader_errors" ] || {
+    printf '%s\n' "$unexpected_loader_errors" >&2
+    echo "$marker state=FAIL reason=unexpected_loader_error" >&2
+    exit 1
+}
 
 # Include the requested diagnostic utility. The C oracle above distinguishes a
 # valid zero-device result from an unrelated loader/driver failure.
 vulkaninfo_status=0
-VK_DRIVER_FILES="$icd" vulkaninfo --summary >/run/vulkaninfo-intel.log 2>&1 || vulkaninfo_status=$?
-if [ "$vulkaninfo_status" -ne 0 ] &&
-   ! grep -Eq 'ERROR_INCOMPATIBLE_DRIVER|no physical device|No GPU|failed to find GPUs' /run/vulkaninfo-intel.log; then
+VK_DRIVER_FILES="$icd" VK_LOADER_DEBUG=error vulkaninfo --summary >/run/vulkaninfo-intel.log 2>&1 || vulkaninfo_status=$?
+if [ "$vulkaninfo_status" -eq 0 ] ||
+   ! grep -Fq 'Failed to detect any valid GPUs in the current config' /run/vulkaninfo-intel.log ||
+   ! grep -Fq 'vkEnumeratePhysicalDevices failed with ERROR_INITIALIZATION_FAILED' /run/vulkaninfo-intel.log ||
+   grep -Fq "vkEnumeratePhysicalDevices' in ICD " /run/vulkaninfo-intel.log; then
     cat /run/vulkaninfo-intel.log >&2
     echo "$marker state=FAIL reason=vulkaninfo_unexpected" >&2
     exit 1
 fi
-echo "$marker state=PASS layer=anv_loader physical_devices=0 vulkaninfo_status=$vulkaninfo_status"
+unexpected_vulkaninfo_loader_errors=$(grep -E '^ERROR: \[Loader Message\]|^\[Vulkan Loader\] ERROR:' \
+    /run/vulkaninfo-intel.log \
+    | grep -Fv 'Failed to detect any valid GPUs in the current config' || true)
+[ -z "$unexpected_vulkaninfo_loader_errors" ] || {
+    printf '%s\n' "$unexpected_vulkaninfo_loader_errors" >&2
+    echo "$marker state=FAIL reason=vulkaninfo_loader_error" >&2
+    exit 1
+}
+unexpected_vulkaninfo_errors=$(grep '^ERROR at ' /run/vulkaninfo-intel.log \
+    | grep -Fv 'vkEnumeratePhysicalDevices failed with ERROR_INITIALIZATION_FAILED' || true)
+[ -z "$unexpected_vulkaninfo_errors" ] || {
+    printf '%s\n' "$unexpected_vulkaninfo_errors" >&2
+    echo "$marker state=FAIL reason=vulkaninfo_error" >&2
+    exit 1
+}
+unexpected_vulkaninfo_error_lines=$(grep '^ERROR' /run/vulkaninfo-intel.log \
+    | grep -Fv 'Failed to detect any valid GPUs in the current config' \
+    | grep -Fv 'vkEnumeratePhysicalDevices failed with ERROR_INITIALIZATION_FAILED' || true)
+[ -z "$unexpected_vulkaninfo_error_lines" ] || {
+    printf '%s\n' "$unexpected_vulkaninfo_error_lines" >&2
+    echo "$marker state=FAIL reason=vulkaninfo_other_error" >&2
+    exit 1
+}
+echo "$marker state=PASS layer=anv_loader icd_enumeration=VK_SUCCESS physical_devices=0 renderer=not_tested vulkaninfo_status=$vulkaninfo_status"
