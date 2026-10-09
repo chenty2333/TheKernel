@@ -18,22 +18,27 @@ the outer display transaction has independently verified its hardware
 rollback. Recreating the state for each modeset or sanitizing before complete
 CRTC readout is invalid.
 
-Native fastboot now persists the manager for the KMS-device lifetime and uses
-its generic DKL `get_hw_state` dispatcher for the selected TC1/TC2 PLL during
-admission and before/after each restricted modeset, checking that its enable
-bit and source-comparable masked DKL register fields agree with the independent
-firmware capture via translated `icl_compare_hw_state`. This is a read-only
-live-path integration only: atomic reservation/commit still does not use the
-manager, and `tc_modeset` owns the direct DKL enable/disable sequence. The pin
+Native fastboot now persists the manager for the KMS-device lifetime. At
+admission it limits the manager view to DPLL0/1, TBT and the one TC DKL PLL
+whose DDI/AUX wells the `PowerPin` proves (TC2's DPLL4 is moved to the active
+slot and the unpowered sibling is excluded), then calls source
+`intel_dpll_readout_hw_state()` with the captured Pipe-A CRTC owner. The public
+generic DKL `get_hw_state` dispatcher still independently checks the selected
+PLL before/after each restricted modeset, comparing its enable bit and
+source-comparable masked DKL register fields with the firmware capture via
+translated `icl_compare_hw_state`. This remains readout-only live-path
+integration: atomic reservation/commit still does not use the manager, and
+`tc_modeset` owns the direct DKL enable/disable sequence. The pin
 backend revalidates held source-mapped power requests, D0,
 DC-state, and refclk on every hook/access; logical DPLL power cookies never
 manufacture `PowerState` reference counts or change wells.
 
-The source manager's all-PLL readout is intentionally not called with this
-single-port pin: it enumerates both DKL PLLs, while the fastboot pin proves
-only the selected port's DDI-I/O/AUX domains. Admission therefore asks for
-only the selected TC1/TC2 `get_hw_state`; enumerating another port requires a
-separately held and verified power context, not an assumed inactive route.
+The source manager's unrestricted all-PLL readout is not called with this
+single-port pin: its TC1/TC2 DKL enumeration would touch the unpowered sibling.
+The source manager is instead scoped to the one power-proven DKL PLL plus
+non-TC manager entries that use display-core MMIO. This scoping is an adapter
+policy, not a claim that the unpowered route is inactive; an allocator shared
+with a second active TC route still requires a broader verified power context.
 
 This adapter is compiled by `cargo check -p tk-kernel --tests --features
 'intel-hda nvme watchdog-itco bpf'`; that command also type-checks its unit
