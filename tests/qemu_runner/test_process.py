@@ -16,8 +16,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.qemu_runner.model import Interaction, QmpCheckpoint, QmpColorBlock, QmpPciHotplug, RunLimits
-from tools.qemu_runner.process import ProcessError, run_process, _pin_vcpu_threads, _QmpController, _ShellConsoleFilter
+from tools.qemu_runner.model import Interaction, QmpCheckpoint, QmpColorBlock, QmpPciHotplug, QmpUsbHotplug, RunLimits
+from tools.qemu_runner.process import ProcessError, run_process, _pin_vcpu_threads, _QmpController, _ShellConsoleFilter, _validate_usb_hotplug
 
 # How long the signal tests wait for two fresh Python interpreters to start and
 # then to tear themselves down.  Both bounds are hang detectors, not latency
@@ -800,6 +800,37 @@ for index in range(2):
             )
             self.assertEqual(result.returncode, 0, result.error_message)
             self.assertEqual([command["execute"] for command in commands], ["qmp_capabilities", "device_del", "device_add"])
+
+    def test_qmp_usb_hotplug_waits_for_removal_before_restoring_exact_hid_port(self) -> None:
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            qmp_socket = root / "qmp.sock"
+            commands = self.start_qmp_server(qmp_socket, device_deleted_device="input-kbd")
+            result = run_process(
+                command=(sys.executable, "-c", "import time; print('READY', flush=True); time.sleep(.3)"),
+                workdir=root, log_path=root / "console.log", limits=RunLimits(total_timeout_secs=2),
+                interaction=Interaction(), qmp_socket=qmp_socket,
+                qmp_checkpoints=(QmpCheckpoint(input_after_marker="READY", usb_hotplug=(
+                    QmpUsbHotplug("del", "input-kbd"),
+                    QmpUsbHotplug("add", "input-kbd", "usb-kbd", "xhci.0", "1"),
+                )),),
+            )
+            self.assertTrue(result.guest_clean_shutdown, result.error_message)
+            self.assertEqual([c["execute"] for c in commands], ["qmp_capabilities", "device_del", "device_add"])
+            self.assertEqual(commands[-1]["arguments"], {"driver": "usb-kbd", "id": "input-kbd", "bus": "xhci.0", "port": "1"})
+
+    def test_qmp_usb_hotplug_rejects_non_hid_topology_and_delete_payloads(self) -> None:
+        _validate_usb_hotplug(QmpUsbHotplug("del", "input-kbd"))
+        _validate_usb_hotplug(QmpUsbHotplug("add", "input-tablet", "usb-tablet", "xhci.0", "3"))
+        for action in (
+            QmpUsbHotplug("del", "usb-storage"),
+            QmpUsbHotplug("add", "input-kbd", "usb-storage", "xhci.0", "1"),
+            QmpUsbHotplug("add", "input-kbd", "usb-kbd", "xhci.0", "2"),
+            QmpUsbHotplug("add", "input-kbd", "usb-kbd", "other.0", "1"),
+            QmpUsbHotplug("del", "input-kbd", "usb-kbd"),
+        ):
+            with self.subTest(action=action), self.assertRaises(ProcessError):
+                _validate_usb_hotplug(action)
 
     def test_qmp_hotplug_protocol_waits_for_guest_remove_and_add_readiness_before_input(self) -> None:
         with test_tmpdir() as directory:

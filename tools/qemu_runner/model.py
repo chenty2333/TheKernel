@@ -194,6 +194,7 @@ class QmpCheckpoint:
     screenshot_color_blocks: tuple[QmpColorBlock, ...] = ()
     screenshot_text_cells: "QmpTextCells | None" = None
     pci_hotplug: tuple["QmpPciHotplug", ...] = ()
+    usb_hotplug: tuple["QmpUsbHotplug", ...] = ()
     # Fixed-function ACPI button injection, never a host-forced shutdown.
     powerdown: bool = False
     # When set, measure from immediately before QMP input submission until
@@ -216,6 +217,17 @@ class QmpPciHotplug:
     device_id: str
     driver: Literal["virtio-keyboard-pci", "virtio-mouse-pci", "virtio-tablet-pci"] | None = None
     bus: Literal["rp-input-kbd", "rp-input-mouse", "rp-input-tablet"] | None = None
+
+
+@dataclass(frozen=True)
+class QmpUsbHotplug:
+    """One fixed-topology xHCI HID add/delete, never USB storage removal."""
+
+    action: Literal["add", "del"]
+    device_id: Literal["input-kbd", "input-mouse", "input-tablet"]
+    driver: Literal["usb-kbd", "usb-mouse", "usb-tablet"] | None = None
+    bus: Literal["xhci.0"] | None = None
+    port: Literal["1", "2", "3"] | None = None
 
 
 @dataclass(frozen=True)

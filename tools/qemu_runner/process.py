@@ -28,6 +28,7 @@ from .model import (
     QmpCheckpoint,
     QmpConsoleLine,
     QmpPciHotplug,
+    QmpUsbHotplug,
     QmpTextCells,
     RunLimits,
     RunResult,
@@ -763,7 +764,7 @@ class _QmpController:
                 self._request(client, buffer, "cont", None, sequence, deadline, device_deleted_events)
                 sequence += 1
             for checkpoint in self.checkpoints:
-                if checkpoint.input_events or checkpoint.pci_hotplug or checkpoint.powerdown:
+                if checkpoint.input_events or checkpoint.pci_hotplug or checkpoint.usb_hotplug or checkpoint.powerdown:
                     self._wait_marker(
                         checkpoint.input_after_marker,
                         f"checkpoint marker: {checkpoint.input_after_marker}",
@@ -772,13 +773,16 @@ class _QmpController:
                 if checkpoint.powerdown:
                     self._request(client, buffer, "system_powerdown", None, sequence, deadline, device_deleted_events)
                     sequence += 1
-                for action in checkpoint.pci_hotplug:
+                for action in (*checkpoint.pci_hotplug, *checkpoint.usb_hotplug):
                     if action.action == "add":
+                        arguments = {"driver": action.driver, "id": action.device_id, "bus": action.bus}
+                        if isinstance(action, QmpUsbHotplug):
+                            arguments["port"] = action.port
                         self._request(
                             client,
                             buffer,
                             "device_add",
-                            {"driver": action.driver, "id": action.device_id, "bus": action.bus},
+                            arguments,
                             sequence,
                             deadline,
                             device_deleted_events,
@@ -955,6 +959,18 @@ def _validate_pci_hotplug(action: QmpPciHotplug) -> None:
         raise ProcessError("QMP PCI delete accepts only a device id")
 
 
+def _validate_usb_hotplug(action: QmpUsbHotplug) -> None:
+    topology = {"input-kbd": ("usb-kbd", "1"), "input-mouse": ("usb-mouse", "2"),
+                "input-tablet": ("usb-tablet", "3")}
+    if action.action not in {"add", "del"} or action.device_id not in topology:
+        raise ProcessError("QMP USB hotplug supports only the reserved xHCI HID devices")
+    if action.action == "add":
+        if (action.driver, action.port) != topology[action.device_id] or action.bus != "xhci.0":
+            raise ProcessError("QMP USB add requires the matching HID driver and original xHCI port")
+    elif action.driver is not None or action.bus is not None or action.port is not None:
+        raise ProcessError("QMP USB delete accepts only a device id")
+
+
 def validate_interaction(interaction: Interaction, limits: RunLimits) -> None:
     _validate_marker("input-after marker", interaction.input_after_marker)
     _validate_marker("stop-after marker", interaction.stop_after_marker)
@@ -1022,6 +1038,8 @@ def validate_qmp_controls(
             _validate_text_cells(checkpoint.screenshot_text_cells)
         for action in checkpoint.pci_hotplug:
             _validate_pci_hotplug(action)
+        for action in checkpoint.usb_hotplug:
+            _validate_usb_hotplug(action)
 
 
 def terminate_process_group(process: subprocess.Popen[bytes], sig: int) -> None:
