@@ -229,6 +229,7 @@ impl GtIo for Bus {
     }
 }
 struct Owner {
+    pci: axdriver_display::DisplayPciIdentity,
     bdf: super::pci::Bdf,
     platform: Platform,
     bus: Bus,
@@ -256,6 +257,16 @@ pub(super) mod copy;
 static READY: AtomicBool = AtomicBool::new(false);
 pub(super) fn registered() -> bool {
     READY.load(Ordering::Acquire)
+}
+
+/// The render node belongs to the admitted GT PCI function, even when KMS
+/// deliberately retains the firmware framebuffer's platform adapter.
+pub(super) fn pci_identity() -> Option<axdriver_display::DisplayPciIdentity> {
+    OWNER
+        .lock()
+        .as_ref()
+        .filter(|o| registered() && !o.lost)
+        .map(|o| o.pci)
 }
 static OWNER: Mutex<Option<Owner>> = Mutex::new(None);
 
@@ -501,6 +512,16 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
             "N305 GT requires exact Gen12/media A0; no writes",
         ));
     }
+    let pci = axdriver_display::DisplayPciIdentity {
+        bus: bdf.bus,
+        device: bdf.device,
+        function: bdf.function,
+        vendor_id: info.vendor_id,
+        device_id: info.device_id,
+        revision: info.revision,
+        subsystem_vendor: info.subsystem_vendor_id,
+        subsystem_device: info.subsystem_id,
+    };
     let shared_gtt = super::shared_ggtt(bdf)
         .map_err(|_| String::from("GT requires the display owner's shared GGTT; no writes"))?;
     if !shared_gtt.has_identity_lease(bdf) {
@@ -530,6 +551,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
     };
     if let Err(error) = intel_gt::uncore::acquire_gt(&bus) {
         *owner = Some(Owner {
+            pci,
             bdf,
             platform,
             bus,
@@ -558,6 +580,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
     match result {
         Ok(()) => {
             let mut device = Owner {
+                pci,
                 bdf,
                 platform,
                 bus,
@@ -610,6 +633,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 bus.awake.store(false, Ordering::Release);
             }
             *owner = Some(Owner {
+                pci,
                 bdf,
                 platform,
                 bus,

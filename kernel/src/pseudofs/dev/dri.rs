@@ -67,11 +67,11 @@ fn mode_attribute(mode: crate::drm::Mode) -> DeviceAttribute {
     .expect("static DRM sysfs mode attribute")
 }
 
-// libdrm resolves the DRM node's device link, skips a virtio parent, then
-// reads PCI_SLOT_NAME from uevent and these five separate PCI attributes.
+// libdrm resolves the DRM node's physical device (skipping a real virtio
+// transport when present), then reads PCI_SLOT_NAME and these PCI attributes.
 fn pci_registrations(
     identity: axdriver_display::DisplayPciIdentity,
-) -> VfsResult<[Arc<DeviceRegistration>; 2]> {
+) -> VfsResult<Vec<Arc<DeviceRegistration>>> {
     let root = alloc::format!("pci0000:{:02x}", identity.bus);
     let bdf = alloc::format!(
         "0000:{:02x}:{:02x}.{}",
@@ -100,6 +100,11 @@ fn pci_registrations(
         "pci".into(),
         false,
     )?;
+    // Native PCI GPUs are not VirtIO devices. In particular, an Intel render
+    // node must not publish a fabricated virtio modalias/parent to udev.
+    if identity.vendor_id != 0x1af4 {
+        return Ok(vec![pci]);
+    }
     let transport = DeviceRegistration::try_bus_device(
         DeviceIdentity::without_dev(root.clone(), "virtio".into(), virtio)?
             .child_of_path(root, bdf)?,
@@ -108,7 +113,7 @@ fn pci_registrations(
         "virtio".into(),
         true,
     )?;
-    Ok([pci, transport])
+    Ok(vec![pci, transport])
 }
 
 fn platform_registration(name: &str) -> VfsResult<Arc<DeviceRegistration>> {
@@ -121,34 +126,59 @@ fn platform_registration(name: &str) -> VfsResult<Arc<DeviceRegistration>> {
     )
 }
 
-fn publish_sysfs(device: &DrmDevice) -> VfsResult<Vec<DeviceHandle<'static, MAX_DEVICES>>> {
-    let mut parents = Vec::new();
-    let transport = if let Some(identity) = device.adapter.pci_identity() {
-        let [pci, virtio] = pci_registrations(identity)?;
-        let path = alloc::format!("{}/{}", pci.identity().bus, pci.identity().name);
+fn publish_pci_parent(
+    identity: axdriver_display::DisplayPciIdentity,
+    parents: &mut Vec<DeviceHandle<'static, MAX_DEVICES>>,
+) -> VfsResult<alloc::string::String> {
+    let mut registrations = pci_registrations(identity)?.into_iter();
+    let pci = registrations.next().expect("PCI registration");
+    let path = alloc::format!("{}/{}", pci.identity().bus, pci.identity().name);
+    let pci_reservation = global_device_registry().reserve(pci.identity().clone())?;
+    if let Some(virtio) = registrations.next() {
         let name = virtio.identity().name.clone();
-        let pci_reservation = global_device_registry().reserve(pci.identity().clone())?;
         let virtio_reservation = global_device_registry().reserve(virtio.identity().clone())?;
         let (pci, virtio) =
             DeviceReservation::publish_pair(pci_reservation, pci, virtio_reservation, virtio)?;
         parents.extend([pci, virtio]);
-        Some((path, name))
+        Ok(alloc::format!("{path}/{name}"))
+    } else {
+        parents.push(pci_reservation.publish(pci)?);
+        Ok(path)
+    }
+}
+
+fn attach_drm_minor(
+    identity: DeviceIdentity,
+    transport: &Option<alloc::string::String>,
+) -> VfsResult<DeviceIdentity> {
+    match transport {
+        Some(path) => identity.child_of_path(path.clone(), "drm".into()),
+        None => Ok(identity),
+    }
+}
+
+fn publish_sysfs(device: &DrmDevice) -> VfsResult<Vec<DeviceHandle<'static, MAX_DEVICES>>> {
+    let mut parents = Vec::new();
+    let transport = if let Some(identity) = device.adapter.pci_identity() {
+        Some(publish_pci_parent(identity, &mut parents)?)
     } else if let Some(name) = device.adapter.platform_name() {
         let platform = platform_registration(name)?;
         let reservation = global_device_registry().reserve(platform.identity().clone())?;
         parents.push(reservation.publish(platform)?);
-        Some(("platform".into(), name.into()))
+        Some(alloc::format!("platform/{name}"))
     } else {
         None
     };
-    let attach = |identity: DeviceIdentity| -> VfsResult<DeviceIdentity> {
-        match &transport {
-            Some((path, name)) => {
-                identity.child_of_path(alloc::format!("{path}/{name}"), "drm".into())
-            }
-            None => Ok(identity),
-        }
+    // GT-only operation keeps simpledrm KMS, but ANV/Iris must discover the
+    // render engine as its actual PCI function, not a platform framebuffer.
+    let render_transport = if device.has_intel_gt() && device.adapter.pci_identity().is_none() {
+        let identity =
+            crate::drm::intel::gt_pci_identity().ok_or(axfs_ng_vfs::VfsError::NotFound)?;
+        Some(publish_pci_parent(identity, &mut parents)?)
+    } else {
+        transport.clone()
     };
+    let attach = |identity| attach_drm_minor(identity, &transport);
     let card = DeviceRegistration::try_new(
         attach(
             DeviceIdentity::new(
@@ -163,10 +193,9 @@ fn publish_sysfs(device: &DrmDevice) -> VfsResult<Vec<DeviceHandle<'static, MAX_
         Vec::new(),
         None,
     )?;
-    let connector_parent = transport.as_ref().map_or_else(
-        || "virtio0".into(),
-        |(path, name)| alloc::format!("{path}/{name}/drm"),
-    );
+    let connector_parent = transport
+        .as_ref()
+        .map_or_else(|| "virtio0".into(), |path| alloc::format!("{path}/drm"));
     let connector = DeviceRegistration::try_new(
         DeviceIdentity::without_dev("virtio0".into(), "drm".into(), "card0-Virtual-1".into())?
             .child_of_path(connector_parent, "card0".into())?,
@@ -179,7 +208,7 @@ fn publish_sysfs(device: &DrmDevice) -> VfsResult<Vec<DeviceHandle<'static, MAX_
     )?;
     let render = if device.has_render() {
         Some(DeviceRegistration::try_new(
-            attach(
+            attach_drm_minor(
                 DeviceIdentity::new(
                     "virtio0".into(),
                     "drm".into(),
@@ -187,6 +216,7 @@ fn publish_sysfs(device: &DrmDevice) -> VfsResult<Vec<DeviceHandle<'static, MAX_
                     DRM_RENDER_DEVICE_ID,
                 )?
                 .with_devname("dri/renderD128".into())?,
+                &render_transport,
             )?,
             "drm_minor".into(),
             Vec::new(),
@@ -500,7 +530,11 @@ mod tests {
             subsystem_device: 0x1100,
             revision: 1,
         };
-        let [pci, virtio] = pci_registrations(identity).unwrap();
+        let [pci, virtio]: [Arc<DeviceRegistration>; 2] = pci_registrations(identity)
+            .unwrap()
+            .try_into()
+            .ok()
+            .unwrap();
         assert_eq!(pci.identity().bus, "pci0000:02");
         assert_eq!(pci.identity().name, "0000:02:07.3");
         assert!(
@@ -517,6 +551,63 @@ mod tests {
             virtio
                 .uevent_payload()
                 .contains("DEVPATH=/devices/pci0000:02/0000:02:07.3/virtio571\nSUBSYSTEM=virtio\n")
+        );
+    }
+
+    #[test]
+    fn native_gt_render_identity_is_pci_not_virtio_or_firmware_platform() {
+        let identity = axdriver_display::DisplayPciIdentity {
+            bus: 0,
+            device: 2,
+            function: 0,
+            vendor_id: 0x8086,
+            device_id: 0x46d0,
+            subsystem_vendor: 0x8086,
+            subsystem_device: 0x2212,
+            revision: 0,
+        };
+        let registrations = pci_registrations(identity).unwrap();
+        assert_eq!(registrations.len(), 1);
+        let pci = &registrations[0];
+        assert!(pci.uevent_payload().contains("SUBSYSTEM=pci\n"));
+        assert!(
+            pci.uevent_payload()
+                .contains("PCI_SLOT_NAME=0000:00:02.0\n")
+        );
+        assert!(!pci.uevent_payload().contains("virtio"));
+        let render = attach_drm_minor(
+            DeviceIdentity::new(
+                "virtio0".into(),
+                "drm".into(),
+                "renderD128".into(),
+                DRM_RENDER_DEVICE_ID,
+            )
+            .unwrap(),
+            &Some("pci0000:00/0000:00:02.0".into()),
+        )
+        .unwrap();
+        let render =
+            DeviceRegistration::try_new(render, "drm_minor".into(), Vec::new(), None).unwrap();
+        assert!(
+            render
+                .uevent_payload()
+                .contains("DEVPATH=/devices/pci0000:00/0000:00:02.0/drm/renderD128\n")
+        );
+        let card = attach_drm_minor(
+            DeviceIdentity::new(
+                "virtio0".into(),
+                "drm".into(),
+                "card0".into(),
+                DRM_PRIMARY_DEVICE_ID,
+            )
+            .unwrap(),
+            &Some("platform/simple-framebuffer.0".into()),
+        )
+        .unwrap();
+        let card = DeviceRegistration::try_new(card, "drm_minor".into(), Vec::new(), None).unwrap();
+        assert!(
+            card.uevent_payload()
+                .contains("DEVPATH=/devices/platform/simple-framebuffer.0/drm/card0\n")
         );
     }
 

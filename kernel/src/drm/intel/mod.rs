@@ -1395,3 +1395,8 @@ pub(crate) fn bring_up_gt_at_boot() {
 pub(super) fn gt_registered() -> bool {
     gt::registered()
 }
+
+/// PCI identity of the live, independently admitted render engine owner.
+pub(crate) fn gt_pci_identity() -> Option<axdriver_display::DisplayPciIdentity> {
+    gt::pci_identity()
+}
