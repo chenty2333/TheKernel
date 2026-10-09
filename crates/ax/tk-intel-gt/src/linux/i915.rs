@@ -9,6 +9,7 @@ use core::{
     ffi::{c_ulong, c_void},
     marker::PhantomData,
     mem::{offset_of, size_of},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use crate::{
@@ -21,6 +22,43 @@ use crate::{
     intel_workarounds_upstream::{I915McrReg, I915Reg, I915WaList},
     linux_i915_private::DrmI915Private,
 };
+
+/// Kernel-side PCI owner callback for Linux `INTEL_REVID(i915)`.
+///
+/// The GT crate deliberately does not mirror `struct pci_dev`; the kernel
+/// adapter reads the PCI config-space revision from the actual owning device.
+/// Return 0 and write the revision on success, or return a negative errno.
+pub type I915PciRevisionReader = unsafe extern "C" fn(*mut DrmI915Private, *mut u8) -> i32;
+
+static I915_PCI_REVISION_READER: AtomicUsize = AtomicUsize::new(0);
+
+/// Install or clear the PCI revision reader supplied by the kernel device
+/// owner. Clearing it makes future reads fail closed with `-ENODEV`.
+pub fn install_pci_revision_reader(reader: Option<I915PciRevisionReader>) {
+    let address = reader.map_or(0, |read| read as *const () as usize);
+    I915_PCI_REVISION_READER.store(address, Ordering::Release);
+}
+
+/// Read the actual PCI config-space revision corresponding to Linux
+/// `INTEL_REVID(i915)`. It never substitutes a graphics/media stepping.
+pub unsafe fn i915_pci_revision(i915: *mut DrmI915Private) -> Result<u8, i32> {
+    assert!(!i915.is_null());
+    let address = I915_PCI_REVISION_READER.load(Ordering::Acquire);
+    if address == 0 {
+        return Err(-crate::linux::config::ENODEV);
+    }
+
+    // Function pointers are pointer-width values on TheKernel's x86_64-only
+    // target. A zero address is rejected above before reconstituting one.
+    let read: I915PciRevisionReader = unsafe { core::mem::transmute(address) };
+    let mut revision = 0;
+    let result = unsafe { read(i915, &mut revision) };
+    if result == 0 {
+        Ok(revision)
+    } else {
+        Err(result)
+    }
+}
 
 /// Iterator for Linux's `for_each_engine(gt, engine)` idiom. The `gt` pointer
 /// and its engine array must remain alive and immutable for the iterator's
