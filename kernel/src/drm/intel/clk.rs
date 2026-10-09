@@ -359,6 +359,18 @@ impl intel_display::intel_cdclk_full::IntelCdclkIo for CdclkPolicyIo {
     }
 }
 
+/// Source ICL voltage-level mapping for the ADL-N PCODE mailbox. Only the
+/// pure translated thresholds are used; the backend cannot issue a mailbox or
+/// touch hardware. Values beyond the documented table fail closed.
+pub(crate) fn source_voltage_level(cdclk_khz: u32) -> Option<u8> {
+    let mut io = CdclkPolicyIo::default();
+    let level = intel_display::intel_cdclk_full::icl_calc_voltage_level(
+        &mut io,
+        i32::try_from(cdclk_khz).ok()?,
+    );
+    (!io.unsupported).then_some(level)
+}
+
 pub(crate) fn maximum_cdclk(clock: ReferenceClock) -> Option<u32> {
     ADL_N_CDCLK_TABLE
         .iter()
@@ -1195,6 +1207,9 @@ pub(crate) enum ClockError {
     /// an error rather than a panic because a driver that panics on hardware
     /// nobody has characterised is worse than one that refuses to guess.
     NoTableRow { reference_khz: u32 },
+    /// The translated ICL voltage selector reported a frequency outside its
+    /// documented ADL-N range.
+    UnsupportedVoltageLevel { cdclk_khz: u32 },
     /// The CDCLK was programmed and still does not read back as a combination
     /// the table states.  The read-back is the point: a display running at a
     /// frequency nobody chose is the failure this whole module exists to
@@ -1240,6 +1255,9 @@ impl ClockError {
             Self::NoTableRow { reference_khz } => format!(
                 "the CDCLK table has no row for a {reference_khz} kHz reference frequency, which \
                  is a bug in this driver's table"
+            ),
+            Self::UnsupportedVoltageLevel { cdclk_khz } => format!(
+                "the translated ICL voltage selector has no ADL-N level for {cdclk_khz} kHz"
             ),
             Self::StillNotUsable {
                 cdclk_khz,
@@ -1313,6 +1331,16 @@ mod tests {
         );
         assert_eq!(entry_at_least(ReferenceClock::Mhz24, 648_001), None);
         assert_eq!(maximum_cdclk(ReferenceClock::Mhz24), Some(648_000));
+    }
+
+    #[test]
+    fn translated_icl_voltage_thresholds_drive_the_source_policy() {
+        assert_eq!(source_voltage_level(312_000), Some(0));
+        assert_eq!(source_voltage_level(312_001), Some(1));
+        assert_eq!(source_voltage_level(556_800), Some(1));
+        assert_eq!(source_voltage_level(556_801), Some(2));
+        assert_eq!(source_voltage_level(652_800), Some(2));
+        assert_eq!(source_voltage_level(652_801), None);
     }
     use crate::drm::intel::regs::mock::MockRegisters;
 

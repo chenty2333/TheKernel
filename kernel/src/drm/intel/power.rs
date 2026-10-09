@@ -1801,13 +1801,16 @@ fn bring_up_inner(
         )
     })?;
     let pcode_voltage_level = if let Some(programmed) = cdclk.programmed {
-        let level = if programmed.entry.cdclk_khz <= 312_000 {
-            0
-        } else if programmed.entry.cdclk_khz <= 556_800 {
-            1
-        } else {
-            2
-        };
+        let level = clk::source_voltage_level(programmed.entry.cdclk_khz).ok_or_else(|| {
+            unwind(
+                regs,
+                we_requested,
+                "the translated CDCLK voltage-level policy",
+                PowerError::Clock(clk::ClockError::UnsupportedVoltageLevel {
+                    cdclk_khz: programmed.entry.cdclk_khz,
+                }),
+            )
+        })?;
         super::pcode::commit_cdclk_voltage(regs, &pcode_timer, programmed.entry.cdclk_khz)
             .map_err(|error| {
                 unwind(
