@@ -109,6 +109,7 @@ mod i915_port;
 mod id;
 mod irq;
 mod modeset;
+mod native_modeset_ops;
 mod output;
 mod pattern;
 mod pci;
