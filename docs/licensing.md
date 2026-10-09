@@ -306,6 +306,19 @@ Generated include copies insert the TheKernel platform configuration; vendored
 files are not edited. Neither Linux-tree ACPICA nor FreeBSD/Haiku code is copied.
 Firmware tables (including OEM AML and MSDM keys) are never repository inputs.
 
+### Optional Alpine BlueZ guest tools
+
+The optional `bluez` guest-tools payload includes unchanged Alpine v3.24.1
+x86_64 packages pinned in `config/guest-bluez-apk-pins.tsv`. This closure now
+includes `bluez-btmon` and `bluez-deprecated` (providing `btmon` and
+`hciconfig`), as well as `bluez`, `bluez-btmgmt`, D-Bus and their runtime
+libraries. Alpine's package metadata declares BlueZ tools `GPL-2.0-or-later AND
+BSD-2-Clause AND MIT`; each package's declared license expression, source
+origin, version, URL and SHA-256 are recorded in the pin file copied into the
+guest. `scripts/build-bluez-payload.sh` verifies Alpine signatures and the
+reproducibility pins before extraction. No package scripts or host installation
+run; distribution must preserve each upstream license and source obligation.
+
 ### ACPICA guest inspection payload
 
 `--toolchain acpica` stages static `acpidump` and `iasl` from the same verified
@@ -586,3 +599,60 @@ The optional inspect guest payload stages signed Alpine `e2fsprogs` 1.47.4-r0
 metadata reports GPL-2.0-or-later, LGPL-2.0-or-later, BSD-3-Clause, and MIT
 components; these are unmodified distribution binaries, not translated kernel
 code.
+
+Intel CNVi Bluetooth SFI/DDC blobs are optional rootfs inputs selected with
+`THEKERNEL_INTEL_BT_FIRMWARE_DIR`; the offline staging helper decompresses the
+selected `ibt-*` files and carries Intel's `LICENSE.intel` alongside them.
+Redistributors must satisfy that binary-only license; no firmware blobs are
+checked into this source tree.
+
+The VT-d Intel register definitions translated from FreeBSD
+`sys/x86/iommu/intel_reg.h` retain The FreeBSD Foundation's 2013-2015
+BSD-2-Clause grant and Konstantin Belousov's sponsorship attribution in the
+Rust module header. The full grant is retained in
+`crates/ax/tk-vtd/LICENSES/BSD-2-Clause.txt`.
+The VT-d DMAR data-model translation from FreeBSD
+`sys/x86/iommu/intel_dmar.h` likewise retains The FreeBSD Foundation's
+2013-2015 BSD-2-Clause grant and Konstantin Belousov attribution in
+`crates/ax/tk-vtd/src/dmar.rs`, under the same retained license file.
+The VT-d utility translation from FreeBSD `sys/x86/iommu/intel_utils.c`
+retains the 2013 FreeBSD Foundation BSD-2-Clause grant and Konstantin
+Belousov attribution in the Rust source module, covered by the crate license.
+FreeBSD `sys/x86/iommu/intel_qi.c` queued-invalidation logic is translated in
+`crates/ax/tk-vtd/src/qi.rs` with its 2013 FreeBSD Foundation BSD-2-Clause
+grant and Konstantin Belousov attribution; the crate license covers the port.
+The page-table and IOTLB translation from FreeBSD
+`sys/x86/iommu/intel_idpgtbl.c` retains the 2013 FreeBSD Foundation
+BSD-2-Clause grant and Konstantin Belousov attribution in `tk-vtd` source;
+its full grant is already present in `crates/ax/tk-vtd/LICENSES/`.
+The VT-d root/context/domain translation from FreeBSD
+`sys/x86/iommu/intel_ctx.c` retains the 2013 FreeBSD Foundation BSD-2-Clause
+grant and Konstantin Belousov attribution in `tk-vtd` Rust source, covered by
+the crate's retained BSD-2-Clause license.
+The VT-d fault-ring and reporting translation from FreeBSD
+`sys/x86/iommu/intel_fault.c` retains the 2013 FreeBSD Foundation BSD-2-Clause
+grant and Konstantin Belousov attribution in `tk-vtd/src/fault.rs`.
+The Intel VT-d northbridge/CPU quirk translation from FreeBSD
+`sys/x86/iommu/intel_quirks.c` retains its 2013/2015 BSD-2-Clause grant and
+Konstantin Belousov attribution in `tk-vtd/src/quirks.rs`.
+The DMAR driver/table/scope translation from FreeBSD
+`sys/x86/iommu/intel_drv.c` retains the 2013-2015 FreeBSD Foundation
+BSD-2-Clause grant and Konstantin Belousov attribution in the `tk-vtd` source.
+The guest-address-space allocator/MSI helper translation from FreeBSD
+`sys/dev/iommu/iommu_gas.c` retains the 2013 FreeBSD Foundation BSD-2-Clause
+grant and Konstantin Belousov attribution in `crates/ax/tk-vtd/src/gas.rs`.
+The guest-address-space allocator translation from FreeBSD
+`sys/dev/iommu/iommu_gas.c` retains its 2013 BSD-2-Clause grant and Konstantin
+Belousov attribution in `tk-vtd/src/gas.rs`.
+FreeBSD `sys/dev/iommu/busdma_iommu.c` core map/unmap behavior is represented
+in `crates/ax/tk-vtd/src/busdma.rs` under its 2013 FreeBSD Foundation
+BSD-2-Clause grant and Konstantin Belousov attribution, covered by the crate's
+retained `LICENSES/BSD-2-Clause.txt`.
+FreeBSD `sys/x86/iommu/intel_intrmap.c` interrupt-entry logic is represented in
+`crates/ax/tk-vtd/src/intrmap.rs` under its 2015 FreeBSD Foundation
+BSD-2-Clause grant and Konstantin Belousov attribution, covered by the crate's
+retained `LICENSES/BSD-2-Clause.txt`.
+FreeBSD `sys/x86/iommu/iommu_utils.c` helpers are represented in
+`crates/ax/tk-vtd/src/iommu_utils.rs` and the shared QI helpers in `qi.rs`,
+retaining the 2013/2014/2024 FreeBSD Foundation BSD-2-Clause attribution under
+the crate's `LICENSES/BSD-2-Clause.txt` grant.

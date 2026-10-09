@@ -238,7 +238,15 @@ impl PciBlockInterrupt {
         let table = base
             .checked_add(table_offset)?
             .checked_add(table_index.checked_mul(16)?)?;
-        let (message, data, vector) = axhal::irq::allocate_msi(DIRECT_HANDLERS[endpoint])?;
+        let (message, data, vector) = axhal::irq::allocate_msi(
+            tk_vtd::PciRequester {
+                segment: axhal::pci::ecam_segment(),
+                bus: bdf.bus,
+                device: bdf.device,
+                function: bdf.function,
+            },
+            DIRECT_HANDLERS[endpoint],
+        )?;
         endpoint_publish_vector(endpoint, vector);
         if !root.write_config_u16(bdf, capability.offset + 2, control | 0xc000) {
             return None;
@@ -283,7 +291,15 @@ impl PciBlockInterrupt {
         let data_offset = capability
             .offset
             .checked_add(if is_64bit { 12 } else { 8 })?;
-        let (message, data, vector) = axhal::irq::allocate_msi(DIRECT_HANDLERS[endpoint])?;
+        let (message, data, vector) = axhal::irq::allocate_msi(
+            tk_vtd::PciRequester {
+                segment: axhal::pci::ecam_segment(),
+                bus: bdf.bus,
+                device: bdf.device,
+                function: bdf.function,
+            },
+            DIRECT_HANDLERS[endpoint],
+        )?;
         endpoint_publish_vector(endpoint, vector);
         let disabled = control & !1;
         root.write_config_u16(bdf, capability.offset + 2, disabled);

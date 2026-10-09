@@ -44,9 +44,9 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # `crates/ax` at 25 also includes 4 `nullfs.rs` lines, 14 smoltcp RFC bit-ruler
 # rows reprinted by Linux headers, and 25 common Intel/SDHCI register/control
 # lines in the newly translated FreeBSD drivers and the OpenBSD iwx/net80211
-# translations. Those have BSD-source
+# translations, plus one FreeBSD ig4 register line. Those have BSD-source
 # provenance, not Linux provenance; see `docs/upstream-provenance.md`.
-    ("crates/ax", 25): (18, 15, 4, 156, 143, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 157, 144, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their

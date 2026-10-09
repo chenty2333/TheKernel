@@ -858,8 +858,27 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
         );
     }
 
+    // I2C-dev minors are published after the platform PCI walker has attached
+    // all default-enabled Intel LPSS controllers.
+    for bus in 0..axdriver::i2c::bus_count() {
+        if let Ok(minor) = u32::try_from(bus) {
+            root.add(
+                format!("i2c-{bus}"),
+                Device::new_with_permissions(
+                    fs.clone(),
+                    NodeType::CharacterDevice,
+                    DeviceId::new(i2c::DEVICE_MAJOR, minor),
+                    NodePermission::from_bits_truncate(0o660),
+                    Arc::new(i2c::I2cDevice { bus }),
+                ),
+            );
+        }
+    }
+
     root
 }
+
+pub(crate) mod i2c;
 
 #[cfg(test)]
 mod tests {

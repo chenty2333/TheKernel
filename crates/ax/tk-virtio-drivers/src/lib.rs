@@ -61,7 +61,7 @@ use core::{
     ptr::{self, NonNull},
 };
 
-pub use self::hal::{BufferDirection, DmaMapping, Hal, PhysAddr};
+pub use self::hal::{BufferDirection, DmaMapping, DmaRequester, Hal, PhysAddr};
 
 /// The page size in bytes supported by the library (4 KiB).
 pub const PAGE_SIZE: usize = 0x1000;

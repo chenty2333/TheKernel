@@ -9,17 +9,17 @@ use strum::FromRepr;
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, FromRepr)]
 pub enum EventType {
-    Synchronization = 0x00,
-    Key = 0x01,
-    Relative = 0x02,
-    Absolute = 0x03,
-    Misc = 0x04,
-    Switch = 0x05,
-    Led = 0x11,
-    Sound = 0x12,
-    Repeat = 0x14,
-    ForceFeedback = 0x15,
-    Power = 0x16,
+    Synchronization     = 0x00,
+    Key                 = 0x01,
+    Relative            = 0x02,
+    Absolute            = 0x03,
+    Misc                = 0x04,
+    Switch              = 0x05,
+    Led                 = 0x11,
+    Sound               = 0x12,
+    Repeat              = 0x14,
+    ForceFeedback       = 0x15,
+    Power               = 0x16,
     ForceFeedbackStatus = 0x17,
 }
 
@@ -79,6 +79,15 @@ pub struct AbsInfo {
 /// default to unsupported so existing non-virtio drivers remain source
 /// compatible while evdev can faithfully expose hardware that provides them.
 pub trait InputDriverOps: BaseDriverOps {
+    /// Start input delivery for the first evdev client. Drivers without
+    /// power-managed input default to a no-op.
+    fn open_input(&mut self) -> DevResult<()> {
+        Ok(())
+    }
+    /// Stop input delivery after the last evdev client closes.
+    fn close_input(&mut self) -> DevResult<()> {
+        Ok(())
+    }
     fn device_id(&self) -> InputDeviceId;
     fn physical_location(&self) -> &str;
     fn unique_id(&self) -> &str;

@@ -8,6 +8,21 @@ use crate::{Error, Result, PAGE_SIZE};
 /// A physical address as used for virtio.
 pub type PhysAddr = usize;
 
+/// PCI requester identity carried with DMA mappings when the transport is PCI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmaRequester {
+    /// PCI segment/domain number.
+    pub segment: u16,
+    /// PCI bus number.
+    pub bus: u8,
+    /// PCI device number.
+    pub device: u8,
+    /// PCI function number.
+    pub function: u8,
+    /// Whether this transport negotiated VirtIO `ACCESS_PLATFORM`.
+    pub access_platform: bool,
+}
+
 /// A physical range mapped for device DMA.
 ///
 /// `source` is the caller-owned physical range. `device` is the address that
@@ -42,6 +57,7 @@ pub struct Dma<H: Hal> {
     paddr: usize,
     vaddr: NonNull<u8>,
     pages: usize,
+    requester: Option<DmaRequester>,
     _hal: PhantomData<H>,
 }
 
@@ -57,8 +73,8 @@ impl<H: Hal> Dma<H> {
     /// the given direction.
     ///
     /// The pages will be zeroed.
-    pub fn new(pages: usize, direction: BufferDirection) -> Result<Self> {
-        let (paddr, vaddr) = H::dma_alloc(pages, direction);
+    pub fn new(pages: usize, direction: BufferDirection, requester: Option<DmaRequester>) -> Result<Self> {
+        let (paddr, vaddr) = H::dma_alloc_for(requester, pages, direction);
         if paddr == 0 {
             return Err(Error::DmaError);
         }
@@ -66,6 +82,7 @@ impl<H: Hal> Dma<H> {
             paddr,
             vaddr,
             pages,
+            requester,
             _hal: PhantomData,
         })
     }
@@ -93,8 +110,10 @@ impl<H: Hal> Drop for Dma<H> {
     fn drop(&mut self) {
         // Safe because the memory was previously allocated by `dma_alloc` in `Dma::new`, not yet
         // deallocated, and we are passing the values from then.
-        let err = unsafe { H::dma_dealloc(self.paddr, self.vaddr, self.pages) };
-        assert_eq!(err, 0, "failed to deallocate DMA");
+        let err = unsafe { H::dma_dealloc_for(self.requester, self.paddr, self.vaddr, self.pages) };
+        if err != 0 {
+            log::error!("virtio: DMA deallocation failed; retaining allocation {:#x}", self.paddr);
+        }
     }
 }
 
@@ -119,6 +138,13 @@ pub unsafe trait Hal {
     /// is deallocated by `dma_dealloc`. The pages must be zeroed.
     fn dma_alloc(pages: usize, direction: BufferDirection) -> (PhysAddr, NonNull<u8>);
 
+    /// Requester-aware allocation; legacy HAL implementations may use the
+    /// shared `dma_alloc` hook until they provide a per-device domain.
+    fn dma_alloc_for(requester: Option<DmaRequester>, pages: usize, direction: BufferDirection) -> (PhysAddr, NonNull<u8>) {
+        let _ = requester;
+        Self::dma_alloc(pages, direction)
+    }
+
     /// Deallocates the given contiguous physical DMA memory pages.
     ///
     /// # Safety
@@ -127,6 +153,12 @@ pub unsafe trait Hal {
     /// yet deallocated. `pages` must be the same number passed to `dma_alloc` originally, and both
     /// `paddr` and `vaddr` must be the values returned by `dma_alloc`.
     unsafe fn dma_dealloc(paddr: PhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32;
+
+    /// Requester-aware deallocation matching [`Self::dma_alloc_for`].
+    unsafe fn dma_dealloc_for(requester: Option<DmaRequester>, paddr: PhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32 {
+        let _ = requester;
+        unsafe { Self::dma_dealloc(paddr, vaddr, pages) }
+    }
 
     /// Maps a caller-owned physical range for direct device DMA.
     ///
@@ -147,6 +179,14 @@ pub unsafe trait Hal {
         direction: BufferDirection,
     ) -> Result<DmaMapping>;
 
+    /// Requester-aware physical mapping; defaults to the legacy HAL hook.
+    unsafe fn map_physical_for(
+        requester: Option<DmaRequester>, paddr: PhysAddr, len: usize, direction: BufferDirection,
+    ) -> Result<DmaMapping> {
+        let _ = requester;
+        unsafe { Self::map_physical(paddr, len, direction) }
+    }
+
     /// Unmaps a previously returned physical DMA mapping.
     ///
     /// # Safety
@@ -154,6 +194,13 @@ pub unsafe trait Hal {
     /// `mapping` must be returned by [`Self::map_physical`] on this HAL and
     /// the device must no longer access the corresponding descriptor.
     unsafe fn unmap_physical(mapping: DmaMapping, direction: BufferDirection);
+
+    /// Requester-aware physical unmap matching [`Self::map_physical_for`].
+    unsafe fn unmap_physical_for(requester: Option<DmaRequester>, mapping: DmaMapping, direction: BufferDirection) -> Result<()> {
+        let _ = requester;
+        unsafe { Self::unmap_physical(mapping, direction) };
+        Ok(())
+    }
 
     /// Converts a physical address used for MMIO to a virtual address which the driver can access.
     ///
@@ -185,6 +232,12 @@ pub unsafe trait Hal {
     /// any other thread for the duration of this method call.
     unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> PhysAddr;
 
+    /// Requester-aware shared-buffer map; defaults to the legacy HAL hook.
+    unsafe fn share_for(requester: Option<DmaRequester>, buffer: NonNull<[u8]>, direction: BufferDirection) -> Result<PhysAddr> {
+        let _ = requester;
+        Ok(unsafe { Self::share(buffer, direction) })
+    }
+
     /// Unshares the given memory range from the device and (if necessary) copies it back to the
     /// original buffer.
     ///
@@ -194,6 +247,13 @@ pub unsafe trait Hal {
     /// any other thread for the duration of this method call. The `paddr` must be the value
     /// previously returned by the corresponding `share` call.
     unsafe fn unshare(paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection);
+
+    /// Requester-aware shared-buffer unmap matching [`Self::share_for`].
+    unsafe fn unshare_for(requester: Option<DmaRequester>, paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) -> Result<()> {
+        let _ = requester;
+        unsafe { Self::unshare(paddr, buffer, direction) };
+        Ok(())
+    }
 }
 
 /// The direction in which a buffer is passed.

@@ -104,6 +104,10 @@ version = "0.1.0"
 [dependencies.axplat]
 version = "0.3.1-pre.6"
 
+[dependencies.tk-vtd]
+path = "../tk-vtd"
+version = "0.1.0"
+
 [dependencies.cfg-if]
 version = "1.0"
 

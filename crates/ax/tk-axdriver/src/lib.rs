@@ -68,14 +68,16 @@ extern crate alloc;
 #[macro_use]
 mod macros;
 
+mod bus;
+#[cfg(bus = "pci")]
+pub use bus::pci::requester_path;
+mod drivers;
+mod dummy;
 #[cfg(not(feature = "dyn"))]
 #[path = "pci_observation.rs"]
 pub mod pci;
 #[cfg(not(feature = "dyn"))]
 pub mod pci_resources;
-mod bus;
-mod drivers;
-mod dummy;
 #[cfg(feature = "block-irq")]
 pub mod block_irq;
 #[cfg(feature = "block")]
@@ -89,19 +91,44 @@ pub mod sound;
 mod structs;
 
 #[cfg(feature = "shared-block")]
+pub mod block_statistics;
+#[cfg(feature = "shared-block")]
 mod block_volume;
 #[cfg(feature = "shared-block")]
 mod shared_block;
-#[cfg(feature = "shared-block")]
-pub mod block_statistics;
 
 #[cfg(feature = "virtio")]
 mod virtio;
 
 #[cfg(feature = "usb-xhci")]
 mod usb;
+pub use tk_bt_hci::{
+    AclReassembler as BluetoothAclReassembler, smp as bluetooth_smp,
+    smp_crypto as bluetooth_smp_crypto,
+};
+#[cfg(feature = "usb-xhci")]
+pub use tk_bt_hci::{
+    Channel as BluetoothChannel, Error as BluetoothError, PacketType as BluetoothPacketType,
+};
 #[cfg(feature = "usb-xhci")]
 pub use usb::observations as usb_observations;
+#[cfg(feature = "usb-xhci")]
+pub use usb::{UsbBluetoothHci, bluetooth_devices};
+
+#[cfg(feature = "input")]
+#[path = "usb/hid_report.rs"]
+pub(crate) mod hid_report;
+#[cfg(feature = "input")]
+#[path = "usb/hid_usage.rs"]
+mod hid_usage;
+#[cfg(feature = "i2c-hid")]
+mod hidbus;
+#[cfg(feature = "i2c-hid")]
+mod hmt;
+#[cfg(feature = "i2c")]
+pub mod i2c;
+#[cfg(feature = "i2c-hid")]
+pub mod i2c_hid;
 
 #[cfg(any(net_dev = "igc", net_dev = "n305-net"))]
 mod igc;
@@ -214,9 +241,13 @@ pub fn activate_boot_pci_input_devices<Register, Unregister>(
 pub fn block_device_is_read_only(device: &AxBlockDevice) -> bool {
     if device.is_read_only() { return true; }
     #[cfg(feature = "nvme")]
-    if let StaticBlockDevice::Nvme(nvme) = device { return nvme.read_only(); }
+    if let StaticBlockDevice::Nvme(nvme) = device {
+        return nvme.read_only();
+    }
     #[cfg(feature = "shared-block")]
-    if let StaticBlockDevice::Partition(partition) = device { return partition.read_only(); }
+    if let StaticBlockDevice::Partition(partition) = device {
+        return partition.read_only();
+    }
     matches!(device, StaticBlockDevice::BootModule(_))
 }
 
@@ -225,13 +256,17 @@ pub fn block_device_is_read_only(device: &AxBlockDevice) -> bool {
 #[cfg(all(feature = "block", not(feature = "dyn")))]
 pub fn block_device_removable(device: &AxBlockDevice) -> Option<bool> {
     #[cfg(feature = "usb-xhci")]
-    if matches!(device, StaticBlockDevice::Usb(_)) { return None; }
+    if matches!(device, StaticBlockDevice::Usb(_)) {
+        return None;
+    }
     #[cfg(not(feature = "usb-xhci"))]
     let _ = device;
     Some(false)
 }
 #[cfg(all(feature = "block", feature = "dyn"))]
-pub fn block_device_removable(_device: &AxBlockDevice) -> Option<bool> { None }
+pub fn block_device_removable(_device: &AxBlockDevice) -> Option<bool> {
+    None
+}
 
 /// Dynamic block drivers do not currently expose immutable boot modules.
 #[cfg(all(feature = "block", feature = "dyn"))]
@@ -550,7 +585,19 @@ impl AllDevices {
                 }
             });
 
+            #[cfg(feature = "vtd")]
+            if !tk_vtd::platform_pci_dma_allowed() {
+                error!(
+                    "pci: DMA admission unavailable after ACPI VT-d initialization; refusing PCI \
+                     probe"
+                );
+                return;
+            }
             self.probe_bus_devices();
+            #[cfg(feature = "i2c-hid")]
+            for device in crate::i2c_hid::probe_devices() {
+                self.input.push(AxInputDevice::I2c(device));
+            }
         }
     }
 
@@ -662,17 +709,21 @@ mod hda;
 #[cfg(feature = "shared-block")]
 mod partition;
 #[cfg(feature = "shared-block")]
-pub use partition::{discover_gpt_partitions, PartitionMetadata};
+pub use partition::{PartitionMetadata, discover_gpt_partitions};
 
 /// Geometry retained by a validated GPT view; never inferred from its name.
 #[cfg(all(feature = "shared-block", not(feature = "dyn")))]
 pub fn block_device_partition(device: &AxBlockDevice) -> Option<PartitionMetadata> {
     if let StaticBlockDevice::Partition(partition) = device {
         Some(partition.metadata().clone())
-    } else { None }
+    } else {
+        None
+    }
 }
 #[cfg(all(feature = "shared-block", feature = "dyn"))]
-pub fn block_device_partition(_device: &AxBlockDevice) -> Option<PartitionMetadata> { None }
+pub fn block_device_partition(_device: &AxBlockDevice) -> Option<PartitionMetadata> {
+    None
+}
 #[cfg(feature = "itco")]
 pub mod itco;
 

@@ -22,6 +22,7 @@ mod pci_sysfs;
 mod pci_resources;
 mod usb_sysfs;
 mod net_sysfs;
+mod bluetooth_sysfs;
 pub(crate) mod nsfs;
 pub(crate) mod proc;
 mod proc_exe;

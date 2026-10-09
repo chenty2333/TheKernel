@@ -74,7 +74,7 @@ axfeat = { workspace = true, features = [
 axalloc.workspace = true
 axconfig.workspace = true
 axdisplay.workspace = true
-axdriver = { workspace = true, features = ["virtio-sound"] }
+axdriver = { workspace = true, features = ["virtio-sound", "i2c"] }
 axdriver_display.workspace = true
 axfs = { workspace = true, features = ["task-io-accounting", "nfs41"] }
 axhal = { workspace = true, features = ["fp-simd", "pkeys"] }
@@ -203,3 +203,9 @@ layer = "integration"
 
 [dependencies.tk-acpica]
 path = "../crates/ax/tk-acpica"
+
+[dependencies.tk-i2c]
+path = "../crates/ax/tk-i2c"
+
+[dependencies.tk-vtd]
+path = "../crates/ax/tk-vtd"

@@ -642,6 +642,18 @@ static int test_glibc_smoke(void) {
 }
 #endif
 
+#if defined(THEKERNEL_TOOL_PAYLOAD_BLUEZ)
+/* Runs Alpine's unmodified BlueZ daemon and CLI against the no-controller
+ * management socket. A valid empty controller index is the expected Linux-
+ * shaped result; the daemon must remain alive while waiting for an adapter. */
+static int test_bluez_no_controller(void) {
+    return run_guest_program(
+        "/etc/thekernel/bluetooth-bluez-smoke.sh",
+        NULL,
+        "bluez-no-controller-child");
+}
+#endif
+
 #if defined(THEKERNEL_TOOL_PAYLOAD_GCC)
 /* Phase 3, second milestone: a real distribution C compiler runs in the guest.
  *
@@ -1268,6 +1280,9 @@ static int run_init(int argc, char **argv) {
 #endif
 #if defined(THEKERNEL_TOOL_PAYLOAD_GLIBC)
         { "glibc-smoke", test_glibc_smoke, 60 },
+#endif
+#if defined(THEKERNEL_TOOL_PAYLOAD_BLUEZ)
+        { "bluez-no-controller", test_bluez_no_controller, 30 },
 #endif
 #if defined(THEKERNEL_TOOL_PAYLOAD_GCC)
         /* Above the compile deadline the helper enforces, so a compile that

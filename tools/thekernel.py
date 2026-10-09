@@ -585,6 +585,8 @@ class RunSpec:
     audio_backend: str | None = None
     kernel_cmdline: str | None = None
     qemu_extra_args: tuple[str, ...] = ()
+    kernel_irqchip_split: bool = False
+    virtio_modern_only: bool = False
     powerdown_after_marker: str | None = None
     cpu_pm: bool = False
 
@@ -719,6 +721,8 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
                 ("-gdb", f"unix:{run_dir / 'gdb.sock'},server=on,wait=off",
                  "-action", "reboot=shutdown,shutdown=pause,panic=pause") if spec.gdb else ()) + spec.qemu_extra_args,
             qmp=qmp,
+            kernel_irqchip_split=spec.kernel_irqchip_split,
+            virtio_modern_only=spec.virtio_modern_only,
         ),
     )
     print(f"qemu-runner exit={result.returncode} log={result.log_path} "
@@ -914,7 +918,14 @@ def run_cmd(args: argparse.Namespace) -> int:
             kernel_cmdline=getattr(args, "kernel_cmdline", None),
             powerdown_after_marker=getattr(args,"powerdown_after_marker",None),
             qmp_timeout_secs=args.timeout,
-            qemu_extra_args=(("-action", "reboot=reset", "-watchdog-action", "reset") if getattr(args,"allow_reboot",False) else ()),
+            qemu_extra_args=(
+                (("-action", "reboot=reset", "-watchdog-action", "reset")
+                 if getattr(args, "allow_reboot", False) else ())
+                + (("-device", "intel-iommu,intremap=on")
+                   if getattr(args, "vtd_q35", False) else ())
+            ),
+            kernel_irqchip_split=getattr(args, "vtd_q35", False),
+            virtio_modern_only=getattr(args, "virtio_modern_only", False),
             input_after_marker=input_after_marker,
             stop_after_marker=args.stop_after_marker,
             commands=Path(args.commands) if args.commands else None,
@@ -937,9 +948,11 @@ def run_cmd(args: argparse.Namespace) -> int:
 def system_test_cmd(args: argparse.Namespace) -> int:
     artifacts = artifacts_for(args, "system")
     run_cpus = resolve_run_cpus(args.smp, args.run_cpus)
+    vtd_q35 = getattr(args, "vtd_q35", False)
+    rootfs_transport = "drive" if vtd_q35 else "module"
     if not args.no_build:
         build_rootfs(artifacts)
-        build_kernel(artifacts)
+        build_kernel(artifacts, rootfs_transport=rootfs_transport)
     return run_product(
         artifacts,
         RunSpec(
@@ -965,6 +978,9 @@ def system_test_cmd(args: argparse.Namespace) -> int:
             reject_ktap_skips=not args.allow_skip,
             rootfs_transport="module",
             run_cpus=run_cpus,
+            qemu_extra_args=(("-device", "intel-iommu,intremap=on")
+                             if vtd_q35 else ()),
+            kernel_irqchip_split=vtd_q35,
         ),
     )
 
@@ -1627,6 +1643,16 @@ def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool
     parser.add_argument("--timeout", type=positive_timeout, default=300.0)
     parser.add_argument("--workdir")
     parser.add_argument("--qemu-debug", help="QEMU -d categories; write workdir/qemu-debug.log")
+    parser.add_argument(
+        "--vtd-q35",
+        action="store_true",
+        help="run the QEMU VT-d acceptance topology: q35 split irqchip and intel-iommu,intremap=on",
+    )
+    parser.add_argument(
+        "--virtio-modern-only",
+        action="store_true",
+        help="use modern-only VirtIO PCI devices without adding an IOMMU device",
+    )
     parser.add_argument("--gdb", action="store_true",
                         help="serve workdir/gdb.sock; pause on guest shutdown/reboot/panic for inspection")
     parser.add_argument("--rootfs-transport", choices=("module", "drive"), default="module")
@@ -1755,7 +1781,7 @@ def add_graphics_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def component_host_test_command(package: dict) -> list[str]:
-    settings = package.get("metadata", {}).get("thekernel", {}).get("host-test", {})
+    settings = (package.get("metadata") or {}).get("thekernel", {}).get("host-test", {})
     command = ["cargo", "test", "--locked", "-p", package["name"]]
     features = settings.get("features", [])
     if not isinstance(features, list) or any(not isinstance(feature, str) or not feature for feature in features):
@@ -1791,7 +1817,7 @@ def host_test_selection(packages: list[dict]) -> list[dict]:
     selected = []
     undeclared = []
     for package in packages:
-        settings = package.get("metadata", {}).get("thekernel", {})
+        settings = (package.get("metadata") or {}).get("thekernel", {})
         host_test = settings.get("host-test", {})
         selection = host_test.get("selected")
         if settings.get("layer") == "platform" and not isinstance(selection, bool):
@@ -1836,7 +1862,7 @@ def host_test_cmd() -> int:
     # from changing every other component's link.
     percpu_rustflags = f"-C link-arg=-T{REPO_ROOT / 'crates/ax/tk-scope-local/percpu.x'}"
     for package in sorted(selected, key=lambda item: item["name"]):
-        settings = package.get("metadata", {}).get("thekernel", {}).get("host-test", {})
+        settings = (package.get("metadata") or {}).get("thekernel", {}).get("host-test", {})
         command_env = env
         if settings.get("percpu-linker", False):
             command_env = {**env, "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": percpu_rustflags}
@@ -2265,6 +2291,11 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--cpu-pm", action="store_true", help="KVM guest: pass HLT/MWAIT power management through")
     test.add_argument("--allow-skip", action="store_true")
     test.add_argument("--qemu-debug", help="QEMU -d categories; write workdir/qemu-debug.log")
+    test.add_argument(
+        "--vtd-q35",
+        action="store_true",
+        help="run the QEMU VT-d acceptance topology: q35 split irqchip and intel-iommu,intremap=on",
+    )
     test.add_argument("--gdb", action="store_true",
                       help="graphics smoke: serve workdir/gdb.sock and pause on guest shutdown/reboot/panic")
     test.add_argument("--linux-kernel", help="already built Linux 7.2.3 oracle bzImage for ABI differential")

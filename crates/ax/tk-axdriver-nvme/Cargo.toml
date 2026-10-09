@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 axdriver_block = { package = "tk-axdriver-block", path = "../tk-axdriver-block" }
+tk-vtd = { path = "../tk-vtd" }
 
 [package.metadata.thekernel]
 layer = "platform"

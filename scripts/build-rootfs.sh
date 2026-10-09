@@ -289,6 +289,14 @@ EOF
 cat > "$STAGE/etc/group" <<'EOF'
 root:!:0:
 EOF
+if [ "$TOOLCHAIN" = bluez ]; then
+    # Alpine's system D-Bus policy expects the unprivileged messagebus account;
+    # without it dbus-daemon exits before bluetoothd can start or wait for HCI.
+    printf '%s\n' 'messagebus:!:81:81:D-Bus system message bus:/nonexistent:/sbin/nologin' \
+        >> "$STAGE/etc/passwd"
+    printf '%s\n' 'messagebus:!:81:' >> "$STAGE/etc/group"
+    mkdir -p "$STAGE/run/dbus" "$STAGE/var/lib/dbus"
+fi
 chmod 0644 "$STAGE/etc/passwd" "$STAGE/etc/group"
 install -m 0644 "$SOURCE_DIR/LICENSE" \
     "$STAGE/usr/share/licenses/busybox/LICENSE"
@@ -301,6 +309,8 @@ install -m 0644 "$REPO_ROOT/NOTICE" \
 install -m 0755 "$REPO_ROOT/tests/guest/shell-init.sh" \
     "$STAGE/etc/thekernel/shell-init.sh"
 install -m 0755 "$REPO_ROOT/scripts/ci/n305-dhcp.script" "$STAGE/etc/thekernel/n305-dhcp.script"
+install -m 0755 "$REPO_ROOT/tests/guest/bluetooth-bluez-smoke.sh" \
+    "$STAGE/etc/thekernel/bluetooth-bluez-smoke.sh"
 rm -f "$STAGE/sbin/init"
 # The payload selection also selects which cases the suite contains: the
 # native-compilation case is only meaningful when the compiler is installed,
@@ -314,6 +324,7 @@ rm -f "$STAGE/sbin/init"
 INIT_DEFINES=""
 case "$TOOLCHAIN" in
     none|inspect|containers|acpica|wireless) ;;
+    bluez) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_BLUEZ=1" ;;
     tcc) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1" ;;
     nested) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1 -DTHEKERNEL_TOOL_PAYLOAD_NESTED=1" ;;
     # `glibc` deliberately does not include the tcc case: it is a staging
@@ -418,6 +429,16 @@ fi
 if [ -n "${THEKERNEL_IWX_FIRMWARE_DIR:-}" ]; then
     "$SCRIPT_DIR/build-iwx-firmware-payload.sh" \
         --source-dir "$THEKERNEL_IWX_FIRMWARE_DIR" --output "$STAGE"
+fi
+
+# Intel CNVi Bluetooth firmware is an explicit, redistributor-supplied rootfs
+# input. Decompress the selected linux-firmware blobs offline and retain Intel's
+# binary redistribution terms next to the staged files.
+if [ -n "${THEKERNEL_INTEL_BT_FIRMWARE_DIR:-}" ]; then
+    firmware_dir=$THEKERNEL_INTEL_BT_FIRMWARE_DIR
+    license_file=${THEKERNEL_INTEL_BT_FIRMWARE_LICENSE:-/usr/share/licenses/linux-firmware/LICENSE.intel}
+    "$SCRIPT_DIR/stage-intel-bt-firmware.sh" \
+        "$firmware_dir" "$STAGE/lib/firmware/intel" "$license_file"
 fi
 
 "$SCRIPT_DIR/create-rootfs-image.sh" \

@@ -384,6 +384,47 @@ fn pci_root() -> Option<PciRoot> {
     Some(unsafe { PciRoot::new(base.as_mut_ptr(), Cam::Ecam) })
 }
 
+/// Resolve a PCI function to the ACPI DMAR device-scope path that reaches it.
+/// The returned entries are `(bus, device, function)` from the root bridge to
+/// the endpoint; this keeps requester-to-IOMMU selection correct behind PCIe
+/// bridges instead of assuming the endpoint bus is the DMAR scope start bus.
+pub fn requester_path(bus: u8, device: u8, function: u8) -> Option<alloc::vec::Vec<(u8, u8, u8)>> {
+    let mut root = pci_root()?;
+    let bus_end = pci_scan_bus_end();
+    let mut pending = alloc::vec::Vec::new();
+    pending.push((0u8, alloc::vec::Vec::<(u8, u8, u8)>::new()));
+    let mut visited = [false; u8::MAX as usize + 1];
+    visited[0] = true;
+    while let Some((current_bus, parent_path)) = pending.pop() {
+        for (bdf, info) in root.enumerate_bus(current_bus) {
+            let mut path = parent_path.clone();
+            path.push((current_bus, bdf.device, bdf.function));
+            if current_bus == bus && bdf.device == device && bdf.function == function {
+                return Some(path);
+            }
+            if info.header_type != HeaderType::PciPciBridge {
+                continue;
+            }
+            let numbers = root.bridge_bus_numbers(bdf);
+            let Some(secondary) = valid_bridge_secondary_bus(
+                current_bus,
+                numbers.primary,
+                numbers.secondary,
+                numbers.subordinate,
+                bus_end,
+            ) else {
+                continue;
+            };
+            if visited[secondary as usize] || pending.len() >= MAX_REACHABLE_PCI_BUSES {
+                continue;
+            }
+            visited[secondary as usize] = true;
+            pending.push((secondary, path));
+        }
+    }
+    None
+}
+
 #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
 fn pci_snapshot(
     root: &mut PciRoot,
@@ -635,6 +676,10 @@ impl AllDevices {
             }
             match config_pci_device(root, bdf, &mut allocator) {
                 Ok(_) => {
+                    #[cfg(feature = "i2c")]
+                    if crate::i2c::probe(root, bdf, dev_info) {
+                        return;
+                    }
                     #[cfg(feature = "usb-xhci")]
                     if dev_info.class == 0x0c
                         && dev_info.subclass == 0x03

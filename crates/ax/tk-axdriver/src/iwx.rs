@@ -248,7 +248,15 @@ impl IwxMsixRoute {
         let mapped = axklib::mem::iomap((address as usize).into(), size as usize).ok()?;
         let table = mapped.as_usize().checked_add(layout.offset)?;
         let irq_slot = reserve_iwx_irq_slot(bar0_base, bar0_size)?;
-        let Some((message, data, vector)) = axhal::irq::allocate_msi(IWX_MSIX_HANDLERS[irq_slot])
+        let Some((message, data, vector)) = axhal::irq::allocate_msi(
+            tk_vtd::PciRequester {
+                segment: axhal::pci::ecam_segment(),
+                bus: bdf.bus,
+                device: bdf.device,
+                function: bdf.function,
+            },
+            IWX_MSIX_HANDLERS[irq_slot],
+        )
         else {
             release_iwx_irq_slot(irq_slot);
             return None;

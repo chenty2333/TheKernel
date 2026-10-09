@@ -10,11 +10,16 @@ use super::hid_usage::{Mapping, Usage, mapping};
 
 const MAX_FIELDS: usize = 256;
 const MAX_USAGES: usize = 1024;
+const MAX_LOCATIONS: usize = 4096;
 #[derive(Clone, Copy, Default)]
 struct Global {
     page: u32,
     min: i32,
     max: i32,
+    physical_min: i32,
+    physical_max: i32,
+    unit: u32,
+    unit_exponent: i32,
     size: u32,
     count: u32,
     id: u8,
@@ -30,19 +35,104 @@ struct Field {
     count: u16,
     min: i32,
     max: i32,
+    physical_min: i32,
+    physical_max: i32,
+    unit: u32,
+    unit_exponent: i32,
     app: Usage,
+    tlc_index: u8,
     relative: bool,
     kind: Kind,
     previous: Option<i32>,
+    slot: Option<u8>,
 }
-pub(super) struct Report {
+pub(crate) struct Report {
     fields: Vec<Field>,
     bits: [u16; 256],
+    report_sizes: [[u16; 256]; 3],
+    locations: Vec<ReportLocation>,
+    tlc_usages: Vec<Usage>,
+    collection_usages: Vec<(u8, Usage)>,
     ids: bool,
     // Report-ID ownership prevents a Consumer release from lifting keys held
     // by a separate keyboard report. Maximum retained owners is 1024.
     keys: Vec<(u8, u16)>,
+    mt_tracking_ids: [i32; 32],
+    mt_slot_limit: usize,
+    mt_geometry: [[i32; 3]; 32],
+    mt_contact_count: Option<HidLocation>,
+    mt_contacts_per_report: usize,
+    mt_contacts_remaining: usize,
+    mt_prev_touch: bool,
+    mt_scan_time: u32,
+    mt_timestamp_us: u32,
     pointer: bool,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReportKind {
+    Input   = 0,
+    Output  = 1,
+    Feature = 2,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HidLocation {
+    pub report_id: u8,
+    pub tlc_index: u8,
+    pub bit_offset: u16,
+    pub size: u8,
+    pub flags: u8,
+    pub logical_min: i32,
+    pub logical_max: i32,
+    pub physical_min: i32,
+    pub physical_max: i32,
+    pub unit: u32,
+    pub unit_exponent: i32,
+}
+struct ReportLocation {
+    kind: ReportKind,
+    usage: Usage,
+    tlc_index: u8,
+    location: HidLocation,
+}
+fn record_location(
+    locations: &mut Vec<ReportLocation>,
+    kind: ReportKind,
+    report_id: u8,
+    tlc_index: u8,
+    usage: Usage,
+    bit_offset: u32,
+    size: u32,
+    flags: u8,
+    min: i32,
+    max: i32,
+    physical_min: i32,
+    physical_max: i32,
+    unit: u32,
+    unit_exponent: i32,
+) -> DevResult<()> {
+    if locations.len() == MAX_LOCATIONS || bit_offset > u32::from(u16::MAX) {
+        return Err(DevError::Unsupported);
+    }
+    locations.try_reserve(1).map_err(|_| DevError::NoMemory)?;
+    locations.push(ReportLocation {
+        kind,
+        usage,
+        tlc_index,
+        location: HidLocation {
+            report_id,
+            tlc_index,
+            bit_offset: bit_offset as u16,
+            size: size.min(32) as u8,
+            flags,
+            logical_min: min,
+            logical_max: max,
+            physical_min,
+            physical_max,
+            unit,
+            unit_exponent,
+        },
+    });
+    Ok(())
 }
 fn reserved<T>(count: usize) -> DevResult<Vec<T>> {
     let mut v = Vec::new();
@@ -84,8 +174,124 @@ fn emit(events: &mut VecDeque<Event>, ty: u16, code: u16, value: i32) {
         value: value as u32,
     });
 }
+
+// upstream: hid.c hid_get_data_sub(), hid_get_data(), hid_get_udata()
+pub(crate) fn get_hid_data(bytes: &[u8], location: HidLocation, signed: bool) -> Option<i32> {
+    let size = usize::from(location.size.min(32));
+    let start = usize::from(location.bit_offset);
+    let end = start.checked_add(size)?;
+    if size == 0 || end > bytes.len().checked_mul(8)? {
+        return None;
+    }
+    let mut value = 0u32;
+    for bit in 0..size {
+        value |= u32::from((bytes[(start + bit) / 8] >> ((start + bit) % 8)) & 1) << bit;
+    }
+    if signed && size < 32 && value & (1 << (size - 1)) != 0 {
+        Some((value | (!0u32 << size)) as i32)
+    } else {
+        Some(value as i32)
+    }
+}
+
+// upstream: hid.c hid_put_udata()
+pub(crate) fn put_hid_udata(bytes: &mut [u8], location: HidLocation, value: u32) -> bool {
+    let size = usize::from(location.size.min(32));
+    let start = usize::from(location.bit_offset);
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    if size == 0 || end > bytes.len().saturating_mul(8) {
+        return false;
+    }
+    for bit in 0..size {
+        let mask = 1u8 << ((start + bit) % 8);
+        let byte = &mut bytes[(start + bit) / 8];
+        if value & (1 << bit) != 0 {
+            *byte |= mask;
+        } else {
+            *byte &= !mask;
+        }
+    }
+    true
+}
+
+// upstream: hid.c hid_item_resolution()
+pub(crate) fn hid_item_resolution(location: HidLocation) -> i32 {
+    const SCALE: [(i64, i64); 16] = [
+        (1, 1),
+        (1, 10),
+        (1, 100),
+        (1, 1000),
+        (1, 10_000),
+        (1, 100_000),
+        (1, 1_000_000),
+        (1, 10_000_000),
+        (100_000_000, 1),
+        (10_000_000, 1),
+        (1_000_000, 1),
+        (100_000, 1),
+        (10_000, 1),
+        (1000, 1),
+        (100, 1),
+        (10, 1),
+    ];
+    let (multiplier, divisor) = match location.unit {
+        0x11 => (1, 10),
+        0x13 | 0x33 => (10, 254),
+        0x12 => (1, 1),
+        0x14 => (573, 10),
+        _ => return 0,
+    };
+    if location.logical_max <= location.logical_min
+        || location.physical_max <= location.physical_min
+        || !(0..16).contains(&location.unit_exponent)
+    {
+        return 0;
+    }
+    let (scale_numerator, scale_denominator) = SCALE[location.unit_exponent as usize];
+    let Some(numerator) = (i64::from(location.logical_max) - i64::from(location.logical_min))
+        .checked_mul(multiplier)
+        .and_then(|value| value.checked_mul(scale_numerator))
+    else {
+        return 0;
+    };
+    let Some(denominator) = (i64::from(location.physical_max) - i64::from(location.physical_min))
+        .checked_mul(divisor)
+        .and_then(|value| value.checked_mul(scale_denominator))
+    else {
+        return 0;
+    };
+    if denominator <= 0 {
+        return 0;
+    }
+    i32::try_from(numerator / denominator).unwrap_or(0)
+}
+
+// upstream: hid.c hid_get_byte() -- the bounded Rust parser returns an error
+// on truncation instead of silently synthesizing zero bytes at end-of-input.
+fn item_value(bytes: &[u8], offset: &mut usize, width: usize) -> DevResult<u32> {
+    let data = bytes
+        .get(*offset..offset.saturating_add(width))
+        .ok_or(DevError::InvalidParam)?;
+    *offset += width;
+    Ok(data
+        .iter()
+        .enumerate()
+        .fold(0, |value, (i, byte)| value | (u32::from(*byte) << (8 * i))))
+}
+
+// upstream: hid.c hid_clear_local().
+fn clear_local(usages: &mut Vec<Usage>, ranges: &mut Option<Usage>) {
+    usages.clear();
+    *ranges = None;
+}
+
 impl Report {
-    pub(super) fn parse(bytes: &[u8]) -> DevResult<Self> {
+    // upstream: hid.c hid_start_parse(), hid_get_item(), hid_end_parse(). The
+    // kernel stores a bounded decoded report rather than exposing a borrowed
+    // iterator, preserving the same global/local/collection state machine.
+    pub(crate) fn parse(bytes: &[u8]) -> DevResult<Self> {
         if bytes.len() > 4096 {
             return Err(DevError::Unsupported);
         }
@@ -95,9 +301,20 @@ impl Report {
         let mut ranges: Option<Usage> = None;
         let mut fields = reserved(MAX_FIELDS)?;
         let mut collections = reserved(16)?;
+        let mut collection_slots = reserved(16)?;
+        let mut top_level_index = 0usize;
+        let mut current_tlc_index = 0u8;
+        let mut tlc_usages = reserved(16)?;
+        let mut collection_usages = reserved(32)?;
+        let mut current_slot = None;
+        let mut next_slot = 0u8;
         let mut app = Usage::default();
         let mut pointer = false;
         let mut bits = [0u16; 256];
+        let mut report_sizes = [[0u16; 256]; 3];
+        // upstream: hid.c hid_switch_rid() report-ID position preservation.
+        // The owned parser keeps an independent bit cursor for each report ID.
+        let mut locations = reserved(128)?;
         let mut ids = false;
         let mut offset = 0;
         let mut usage_budget = 0usize;
@@ -117,14 +334,7 @@ impl Report {
                 3 => 4,
                 x => x as usize,
             };
-            let data = bytes
-                .get(offset..offset + width)
-                .ok_or(DevError::InvalidParam)?;
-            offset += width;
-            let value = data
-                .iter()
-                .enumerate()
-                .fold(0, |v, (i, b)| v | (u32::from(*b) << (8 * i)));
+            let value = item_value(bytes, &mut offset, width)?;
             let class = prefix >> 2 & 3;
             let tag = prefix >> 4;
             match (class, tag) {
@@ -137,6 +347,23 @@ impl Report {
                         i32::try_from(value).map_err(|_| DevError::Unsupported)?
                     }
                 }
+                (1, 3) => g.physical_min = signed(value, width),
+                (1, 4) => {
+                    g.physical_max = if g.physical_min < 0 {
+                        signed(value, width)
+                    } else {
+                        i32::try_from(value).map_err(|_| DevError::Unsupported)?
+                    }
+                }
+                (1, 5) => {
+                    let exponent = (value & 0x0f) as i8;
+                    g.unit_exponent = if exponent & 0x08 != 0 {
+                        i32::from(exponent - 16)
+                    } else {
+                        i32::from(exponent)
+                    };
+                }
+                (1, 6) => g.unit = value,
                 (1, 7) => g.size = value,
                 (1, 8) => {
                     if !(1..=255).contains(&value) {
@@ -181,12 +408,49 @@ impl Report {
                     if collections.len() == 16 {
                         return Err(DevError::Unsupported);
                     }
+                    if collections.is_empty() {
+                        current_tlc_index =
+                            u8::try_from(top_level_index).map_err(|_| DevError::Unsupported)?;
+                        tlc_usages.try_reserve(1).map_err(|_| DevError::NoMemory)?;
+                        tlc_usages.push(usages.first().copied().unwrap_or_default());
+                    }
+                    collection_usages
+                        .try_reserve(1)
+                        .map_err(|_| DevError::NoMemory)?;
+                    collection_usages.push((
+                        current_tlc_index,
+                        usages.first().copied().unwrap_or_default(),
+                    ));
                     collections.push(app);
+                    collection_slots.push(current_slot);
+                    if matches!(value, 0 | 2)
+                        && usages
+                            .first()
+                            .is_some_and(|usage| usage.page == 0x0d && usage.code == 0x22)
+                    {
+                        if next_slot >= 32 {
+                            return Err(DevError::Unsupported);
+                        }
+                        current_slot = Some(next_slot);
+                        next_slot += 1;
+                    }
                     if value == 1 {
                         app = usages.first().copied().unwrap_or_default();
+                        if collections.len() == 1 {
+                            tlc_usages[usize::from(current_tlc_index)] = app;
+                        }
+                        pointer |= app.page == 0x0d && matches!(app.code, 4 | 5);
                     }
                 }
-                (0, 12) => app = collections.pop().ok_or(DevError::InvalidParam)?,
+                (0, 12) => {
+                    app = collections.pop().ok_or(DevError::InvalidParam)?;
+                    current_slot = collection_slots.pop().ok_or(DevError::InvalidParam)?;
+                    if collections.is_empty() {
+                        top_level_index = top_level_index
+                            .checked_add(1)
+                            .ok_or(DevError::Unsupported)?;
+                    }
+                }
                 (0, 8) => {
                     if g.size == 0 || g.count == 0 || g.min > g.max {
                         return Err(DevError::InvalidParam);
@@ -207,6 +471,24 @@ impl Report {
                             if fields.len() == MAX_FIELDS || usage_budget + usages.len() > 4096 {
                                 return Err(DevError::Unsupported);
                             }
+                            for usage in &usages {
+                                record_location(
+                                    &mut locations,
+                                    ReportKind::Input,
+                                    g.id,
+                                    current_tlc_index,
+                                    *usage,
+                                    u32::from(*at),
+                                    g.size,
+                                    value as u8,
+                                    g.min,
+                                    g.max,
+                                    g.physical_min,
+                                    g.physical_max,
+                                    g.unit,
+                                    g.unit_exponent,
+                                )?;
+                            }
                             let mut choices = reserved(usages.len())?;
                             choices.extend_from_slice(&usages);
                             usage_budget += choices.len();
@@ -217,10 +499,16 @@ impl Report {
                                 count: g.count as u16,
                                 min: g.min,
                                 max: g.max,
+                                physical_min: g.physical_min,
+                                physical_max: g.physical_max,
+                                unit: g.unit,
+                                unit_exponent: g.unit_exponent,
                                 app,
+                                tlc_index: current_tlc_index,
                                 relative: value & 4 != 0,
                                 kind: Kind::Array(choices),
                                 previous: None,
+                                slot: current_slot,
                             });
                         } else {
                             for index in 0..g.count {
@@ -229,7 +517,37 @@ impl Report {
                                     .or(usages.last())
                                     .copied()
                                     .unwrap_or_default();
-                                if let Some(mapped) = mapping(usage, app, value & 4 != 0) {
+                                record_location(
+                                    &mut locations,
+                                    ReportKind::Input,
+                                    g.id,
+                                    current_tlc_index,
+                                    usage,
+                                    u32::from(*at) + index * g.size,
+                                    g.size,
+                                    value as u8,
+                                    g.min,
+                                    g.max,
+                                    g.physical_min,
+                                    g.physical_max,
+                                    g.unit,
+                                    g.unit_exponent,
+                                )?;
+                                let mapped = if current_slot.is_some() {
+                                    match (usage.page, usage.code) {
+                                        (1, 0x30) => Some(Mapping::Axis(3, 0x35)),
+                                        (1, 0x31) => Some(Mapping::Axis(3, 0x36)),
+                                        (0x0d, 0x51) => Some(Mapping::MtContactId),
+                                        (0x0d, 0x42) => Some(Mapping::MtTipSwitch),
+                                        (0x0d, 0x47) => Some(Mapping::MtConfidence),
+                                        (0x0d, 0x48) => Some(Mapping::MtWidth),
+                                        (0x0d, 0x49) => Some(Mapping::MtHeight),
+                                        _ => mapping(usage, app, value & 4 != 0),
+                                    }
+                                } else {
+                                    mapping(usage, app, value & 4 != 0)
+                                };
+                                if let Some(mapped) = mapped {
                                     if fields.len() == MAX_FIELDS {
                                         return Err(DevError::Unsupported);
                                     }
@@ -240,28 +558,83 @@ impl Report {
                                         count: 1,
                                         min: g.min,
                                         max: g.max,
+                                        physical_min: g.physical_min,
+                                        physical_max: g.physical_max,
+                                        unit: g.unit,
+                                        unit_exponent: g.unit_exponent,
                                         app,
+                                        tlc_index: current_tlc_index,
                                         relative: value & 4 != 0,
                                         kind: Kind::Variable(mapped),
                                         previous: None,
+                                        slot: current_slot,
                                     });
-                                    pointer |= app.page == 1 && matches!(app.code, 1 | 2);
+                                    pointer |= (app.page == 1 && matches!(app.code, 1 | 2))
+                                        || (app.page == 0x0d && matches!(app.code, 4 | 5));
                                 }
                             }
                         }
+                    }
+                    *at = end as u16;
+                    report_sizes[ReportKind::Input as usize][usize::from(g.id)] = *at;
+                }
+                (0, 9 | 11) => {
+                    if g.size == 0 || g.count == 0 || g.min > g.max {
+                        return Err(DevError::InvalidParam);
+                    }
+                    let advance = g.size.checked_mul(g.count).ok_or(DevError::Unsupported)?;
+                    let kind = if tag == 9 {
+                        ReportKind::Output
+                    } else {
+                        ReportKind::Feature
+                    };
+                    let at = &mut report_sizes[kind as usize][usize::from(g.id)];
+                    if g.id != 0 && *at == 0 {
+                        *at = 8;
+                    }
+                    let end = u32::from(*at)
+                        .checked_add(advance)
+                        .ok_or(DevError::Unsupported)?;
+                    if end > 512 {
+                        return Err(DevError::Unsupported);
+                    }
+                    let report_id = g.id;
+                    let bit_start = u32::from(*at);
+                    for index in 0..g.count {
+                        let usage = usages
+                            .get(index as usize)
+                            .or(usages.last())
+                            .copied()
+                            .unwrap_or_default();
+                        record_location(
+                            &mut locations,
+                            kind,
+                            report_id,
+                            current_tlc_index,
+                            usage,
+                            bit_start + index * g.size,
+                            g.size,
+                            value as u8,
+                            g.min,
+                            g.max,
+                            g.physical_min,
+                            g.physical_max,
+                            g.unit,
+                            g.unit_exponent,
+                        )?;
                     }
                     *at = end as u16;
                 }
                 _ => {}
             }
             if class == 0 {
-                usages.clear();
-                ranges = None;
+                clear_local(&mut usages, &mut ranges);
             }
         }
         if fields.is_empty()
             || !saved.is_empty()
             || !collections.is_empty()
+            || !collection_slots.is_empty()
             || ranges.is_some()
             || (ids && bits[0] != 0)
         {
@@ -270,16 +643,156 @@ impl Report {
         Ok(Self {
             fields,
             bits,
+            report_sizes,
+            locations,
+            tlc_usages,
+            collection_usages,
             ids,
             keys: reserved(1024)?,
+            mt_tracking_ids: [-1; 32],
+            mt_slot_limit: 32,
+            mt_geometry: [[i32::MIN; 3]; 32],
+            mt_contact_count: None,
+            mt_contacts_per_report: 1,
+            mt_contacts_remaining: 0,
+            mt_prev_touch: false,
+            mt_scan_time: 0,
+            mt_timestamp_us: 0,
             pointer,
         })
     }
-    pub(super) fn max_length(&self) -> usize {
+    pub(crate) fn max_length(&self) -> usize {
         usize::from(*self.bits.iter().max().unwrap_or(&0)).div_ceil(8)
     }
-    pub(super) fn is_pointer(&self) -> bool {
+    // upstream: hid.c hid_report_size()
+    pub(crate) fn report_size(&self, kind: ReportKind, id: u8) -> usize {
+        usize::from(self.report_sizes[kind as usize][usize::from(id)]).div_ceil(8)
+    }
+    // upstream: hid.c hid_report_size_max()
+    pub(crate) fn report_size_max(&self, kind: ReportKind) -> (u8, usize) {
+        let sizes = &self.report_sizes[kind as usize];
+        let report_id = sizes
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, bits)| **bits != 0)
+            .map_or(0, |(id, _)| id as u8);
+        let max_bits = sizes.iter().copied().max().unwrap_or(0);
+        (report_id, usize::from(max_bits).div_ceil(8))
+    }
+    // upstream: hid.c hid_locate() / hidbus.c hidbus_locate()
+    pub(crate) fn locate_usage(
+        &self,
+        kind: ReportKind,
+        page: u32,
+        code: u32,
+        index: usize,
+    ) -> Option<HidLocation> {
+        self.locations
+            .iter()
+            .filter(|item| item.kind == kind && item.usage.page == page && item.usage.code == code)
+            .nth(index)
+            .map(|item| item.location)
+    }
+    pub(crate) fn locate_usage_in_collection(
+        &self,
+        kind: ReportKind,
+        page: u32,
+        code: u32,
+        tlc_index: u8,
+        index: usize,
+    ) -> Option<HidLocation> {
+        self.locations
+            .iter()
+            .filter(|item| {
+                item.kind == kind
+                    && item.tlc_index == tlc_index
+                    && item.usage.page == page
+                    && item.usage.code == code
+            })
+            .nth(index)
+            .map(|item| item.location)
+    }
+    // upstream: hid.c hid_is_collection(), hid_is_mouse(), hid_is_keyboard()
+    pub(crate) fn has_collection_usage(&self, page: u32, code: u32) -> bool {
+        self.fields
+            .iter()
+            .any(|field| field.app.page == page && field.app.code == code)
+    }
+    pub(crate) fn set_mt_slot_limit(&mut self, slots: u16) {
+        self.mt_slot_limit = usize::from(slots).clamp(1, self.mt_tracking_ids.len());
+        for tracking_id in &mut self.mt_tracking_ids[self.mt_slot_limit..] {
+            *tracking_id = -1;
+        }
+    }
+    pub(crate) fn configure_mt_contact_count(&mut self, location: HidLocation) {
+        self.mt_contacts_per_report = self
+            .fields
+            .iter()
+            .filter(|field| {
+                field.tlc_index == location.tlc_index
+                    && field.id == location.report_id
+                    && matches!(field.kind, Kind::Variable(Mapping::MtContactId))
+            })
+            .filter_map(|field| field.slot)
+            .max()
+            .map_or(1, |slot| usize::from(slot) + 1)
+            .max(1);
+        self.mt_contact_count = Some(location);
+        self.mt_contacts_remaining = 0;
+    }
+    pub(crate) fn release_all_contacts(&mut self, events: &mut VecDeque<Event>) {
+        let mut released = false;
+        for (slot, tracking_id) in self
+            .mt_tracking_ids
+            .iter_mut()
+            .take(self.mt_slot_limit)
+            .enumerate()
+        {
+            if *tracking_id >= 0 {
+                if events.try_reserve(3).is_err() {
+                    return;
+                }
+                emit(events, 3, 0x2f, slot as i32);
+                emit(events, 3, 0x39, -1);
+                *tracking_id = -1;
+                self.mt_geometry[slot] = [i32::MIN; 3];
+                released = true;
+            }
+        }
+        if released {
+            emit(events, 0, 0, 0);
+        }
+    }
+    pub(crate) fn is_pointer(&self) -> bool {
         self.pointer
+    }
+    // upstream: hid.c hid_is_mouse()
+    pub(crate) fn is_mouse(&self) -> bool {
+        self.has_collection_usage(1, 2)
+    }
+    // upstream: hid.c hid_is_keyboard()
+    pub(crate) fn is_keyboard(&self) -> bool {
+        self.has_collection_usage(1, 6)
+    }
+    pub(crate) fn top_level_collection_count(&self) -> u8 {
+        self.tlc_usages.len().min(usize::from(u8::MAX)) as u8
+    }
+    pub(crate) fn has_collection_in_collection(
+        &self,
+        tlc_index: u8,
+        page: u32,
+        usage: u32,
+    ) -> bool {
+        self.collection_usages.iter().any(|(index, collection)| {
+            *index == tlc_index && collection.page == page && collection.code == usage
+        })
+    }
+    pub(crate) fn has_mt_tip_switch_in_collection(&self, tlc_index: u8) -> bool {
+        self.fields.iter().any(|field| {
+            field.tlc_index == tlc_index
+                && matches!(&field.kind, Kind::Variable(Mapping::MtTipSwitch))
+        })
     }
     fn each_code(&self, mut visit: impl FnMut(u16, u16)) {
         let mut mapped = |m| match m {
@@ -293,8 +806,23 @@ impl Report {
                 visit(3, 16);
                 visit(3, 17);
             }
+            Mapping::MtContactId => visit(3, 0x39),
+            Mapping::MtTipSwitch => {}
+            Mapping::MtConfidence => {}
+            Mapping::MtWidth => {
+                visit(3, 0x30);
+                visit(3, 0x34);
+            }
+            Mapping::MtHeight => {
+                visit(3, 0x31);
+                visit(3, 0x34);
+            }
+            Mapping::MtScanTime => visit(4, 5),
         };
         for f in &self.fields {
+            if f.slot.is_some() {
+                mapped(Mapping::Axis(3, 0x2f)); // ABS_MT_SLOT
+            }
             match &f.kind {
                 Kind::Variable(m) => mapped(*m),
                 Kind::Array(usages) => {
@@ -307,12 +835,51 @@ impl Report {
             }
         }
     }
-    pub(super) fn has_code(&self, ty: u16, code: u16) -> bool {
+    pub(crate) fn has_code(&self, ty: u16, code: u16) -> bool {
         let mut found = false;
         self.each_code(|t, c| found |= t == ty && c == code);
         found
     }
-    pub(super) fn event_bits(&self, ty: u16, out: &mut [u8]) -> bool {
+    pub(crate) fn has_code_in_collection(&self, tlc_index: u8, ty: u16, code: u16) -> bool {
+        let mut found = false;
+        let mut has_slot = false;
+        let mut mapped = |mapping| match mapping {
+            Mapping::Key(mapped_code) => found |= ty == 1 && code == mapped_code,
+            Mapping::Axis(mapped_type, mapped_code) => {
+                found |= ty == mapped_type && code == mapped_code
+            }
+            Mapping::Wheel(mapped_code) => {
+                found |= ty == 2
+                    && (code == mapped_code || code == if mapped_code == 8 { 11 } else { 12 });
+            }
+            Mapping::Hat => found |= ty == 3 && matches!(code, 16 | 17),
+            Mapping::MtContactId => found |= ty == 3 && code == 0x39,
+            Mapping::MtTipSwitch | Mapping::MtConfidence => {}
+            Mapping::MtWidth => found |= ty == 3 && matches!(code, 0x30 | 0x34),
+            Mapping::MtHeight => found |= ty == 3 && matches!(code, 0x31 | 0x34),
+            Mapping::MtScanTime => found |= ty == 4 && code == 5,
+        };
+        for field in self
+            .fields
+            .iter()
+            .filter(|field| field.tlc_index == tlc_index)
+        {
+            has_slot |= field.slot.is_some();
+            match &field.kind {
+                Kind::Variable(mapping) => mapped(*mapping),
+                Kind::Array(usages) => {
+                    for &usage in usages {
+                        if let Some(Mapping::Key(key)) = mapping(usage, field.app, field.relative) {
+                            mapped(Mapping::Key(key));
+                        }
+                    }
+                }
+            }
+        }
+        found |= has_slot && ty == 3 && code == 0x2f;
+        found
+    }
+    pub(crate) fn event_bits(&self, ty: u16, out: &mut [u8]) -> bool {
         out.fill(0);
         let mut any = false;
         let mut set = |code: u16| {
@@ -332,11 +899,20 @@ impl Report {
         }
         any
     }
-    pub(super) fn absolute_range(&self, code: u8) -> Option<(i32, i32)> {
+    pub(crate) fn absolute_range(&self, code: u8) -> Option<(i32, i32)> {
+        if code == 0x2f && self.fields.iter().any(|field| field.slot.is_some()) {
+            return Some((0, 31));
+        }
         let mut range: Option<(i32, i32)> = None;
         for f in &self.fields {
             let r = match f.kind {
                 Kind::Variable(Mapping::Axis(3, c)) if c == u16::from(code) => Some((f.min, f.max)),
+                Kind::Variable(Mapping::MtContactId) if code == 0x39 => Some((f.min, f.max)),
+                Kind::Variable(Mapping::MtWidth) if code == 0x30 => Some((f.min / 2, f.max / 2)),
+                Kind::Variable(Mapping::MtHeight) if code == 0x31 => Some((f.min / 2, f.max / 2)),
+                Kind::Variable(Mapping::MtWidth | Mapping::MtHeight) if code == 0x34 => {
+                    Some((-1, 1))
+                }
                 Kind::Variable(Mapping::Hat) if matches!(code, 16 | 17) => Some((-1, 1)),
                 _ => None,
             };
@@ -346,7 +922,34 @@ impl Report {
         }
         range
     }
-    pub(super) fn decode(&mut self, report: &[u8], events: &mut VecDeque<Event>) -> bool {
+    pub(crate) fn absolute_resolution(&self, code: u8) -> i32 {
+        self.fields
+            .iter()
+            .find(|field| {
+                matches!(
+                    field.kind,
+                    Kind::Variable(Mapping::Axis(3, mapped)) if mapped == u16::from(code)
+                ) || (code == 0x30 && matches!(field.kind, Kind::Variable(Mapping::MtWidth)))
+                    || (code == 0x31 && matches!(field.kind, Kind::Variable(Mapping::MtHeight)))
+            })
+            .map(|field| {
+                hid_item_resolution(HidLocation {
+                    report_id: field.id,
+                    tlc_index: field.tlc_index,
+                    bit_offset: field.bit,
+                    size: field.size,
+                    flags: 0,
+                    logical_min: field.min,
+                    logical_max: field.max,
+                    physical_min: field.physical_min,
+                    physical_max: field.physical_max,
+                    unit: field.unit,
+                    unit_exponent: field.unit_exponent,
+                })
+            })
+            .unwrap_or(0)
+    }
+    pub(crate) fn decode(&mut self, report: &[u8], events: &mut VecDeque<Event>) -> bool {
         let id = if self.ids {
             let Some(&id) = report.first() else {
                 return false;
@@ -359,13 +962,134 @@ impl Report {
         if bits == 0 || report.len() * 8 < usize::from(bits) {
             return false;
         }
+        // upstream: hmt_intr() serial/hybrid Contact Count batching. Only
+        // synchronize after all contacts announced by the first packet have
+        // been delivered; later packets carry a zero Contact Count.
+        let mut next_contacts_remaining = self.mt_contacts_remaining;
+        let mut contacts_to_process = usize::MAX;
+        let finish_contact_batch = if let Some(location) = self.mt_contact_count {
+            if location.report_id == id {
+                let Some(count) = get_hid_data(report, location, false) else {
+                    return false;
+                };
+                if count > 0 {
+                    next_contacts_remaining = usize::try_from(count).unwrap_or(32).min(32);
+                }
+                contacts_to_process = next_contacts_remaining.min(self.mt_contacts_per_report);
+                next_contacts_remaining -= contacts_to_process;
+                next_contacts_remaining == 0
+            } else {
+                true
+            }
+        } else {
+            true
+        };
         let Ok(mut next) = reserved::<u16>(512) else {
             return false;
         };
         if events.try_reserve(2048).is_err() {
             return false;
         }
+        self.mt_contacts_remaining = next_contacts_remaining;
+        // hmt.c uses Contact ID as the Type-B tracking ID, but only while the
+        // matching Tip Switch (and Confidence, when present) says contact is
+        // active. Resolve these companion fields before emitting a slot.
+        let has_tip_switch = self
+            .fields
+            .iter()
+            .any(|f| f.id == id && matches!(&f.kind, Kind::Variable(Mapping::MtTipSwitch)));
+        let mut contact_ids = [0i32; 256];
+        let mut contact_tips = [!has_tip_switch; 256];
+        let mut contact_confidence = [true; 256];
+        let mut contact_widths = [0i32; 256];
+        let mut contact_heights = [0i32; 256];
+        let mut assigned_slots = [-1i16; 256];
+        let mut scan_time_value = None;
+        let descriptor_slots = self
+            .fields
+            .iter()
+            .filter(|field| field.id == id)
+            .filter_map(|field| field.slot)
+            .max()
+            .map_or(0, |slot| usize::from(slot) + 1)
+            .min(assigned_slots.len());
+        let slots_to_process = contacts_to_process.min(descriptor_slots);
         for f in self.fields.iter().filter(|f| f.id == id) {
+            if matches!(f.kind, Kind::Variable(Mapping::MtScanTime)) {
+                let raw = extract(report, usize::from(f.bit), f.size, f.min < 0);
+                scan_time_value = Some((raw.max(0) as u32, f.max.max(0) as u32));
+                continue;
+            }
+            let Some(slot) = f.slot.map(usize::from) else {
+                continue;
+            };
+            if slot >= contact_ids.len() || slot >= slots_to_process {
+                continue;
+            }
+            let raw = extract(report, usize::from(f.bit), f.size, f.min < 0);
+            match &f.kind {
+                Kind::Variable(Mapping::MtContactId) => contact_ids[slot] = raw,
+                Kind::Variable(Mapping::MtTipSwitch) => contact_tips[slot] = raw != 0,
+                Kind::Variable(Mapping::MtConfidence) => contact_confidence[slot] = raw != 0,
+                Kind::Variable(Mapping::MtWidth) => contact_widths[slot] = raw,
+                Kind::Variable(Mapping::MtHeight) => contact_heights[slot] = raw,
+                _ => {}
+            }
+        }
+        for descriptor_slot in 0..slots_to_process {
+            let active = contact_tips[descriptor_slot] && contact_confidence[descriptor_slot];
+            let tracking_id = contact_ids[descriptor_slot];
+            if active {
+                let physical_slot = self
+                    .mt_tracking_ids
+                    .iter()
+                    .take(self.mt_slot_limit)
+                    .position(|&existing| existing == tracking_id)
+                    .or_else(|| {
+                        self.mt_tracking_ids
+                            .iter()
+                            .take(self.mt_slot_limit)
+                            .position(|&existing| existing < 0)
+                    });
+                if let Some(physical_slot) = physical_slot {
+                    self.mt_tracking_ids[physical_slot] = tracking_id;
+                    assigned_slots[descriptor_slot] = physical_slot as i16;
+                }
+            } else if let Some(physical_slot) = self
+                .mt_tracking_ids
+                .iter()
+                .take(self.mt_slot_limit)
+                .position(|&existing| existing == tracking_id)
+            {
+                self.mt_tracking_ids[physical_slot] = -1;
+                self.mt_geometry[physical_slot] = [i32::MIN; 3];
+                assigned_slots[descriptor_slot] = physical_slot as i16;
+            }
+        }
+        let mut contact_geometry = [[0i32; 3]; 32];
+        for descriptor_slot in 0..slots_to_process {
+            let physical_slot = assigned_slots[descriptor_slot];
+            if physical_slot < 0
+                || !contact_tips[descriptor_slot]
+                || !contact_confidence[descriptor_slot]
+            {
+                continue;
+            }
+            let width = contact_widths[descriptor_slot].max(0) / 2;
+            let height = contact_heights[descriptor_slot].max(0) / 2;
+            let geometry_slot = usize::from(physical_slot as u16);
+            contact_geometry[geometry_slot] = [
+                width.max(height),
+                width.min(height),
+                i32::from(width > height),
+            ];
+        }
+        for f in self.fields.iter().filter(|f| f.id == id) {
+            if f.slot
+                .is_some_and(|slot| usize::from(slot) >= slots_to_process)
+            {
+                continue;
+            }
             match &f.kind {
                 Kind::Variable(Mapping::Key(code)) => {
                     let value = extract(report, usize::from(f.bit), f.size, f.min < 0);
@@ -424,12 +1148,34 @@ impl Report {
             self.keys.push((id, code));
         }
         for f in self.fields.iter_mut().filter(|f| f.id == id) {
+            if f.slot
+                .is_some_and(|slot| usize::from(slot) >= slots_to_process)
+            {
+                continue;
+            }
             let Kind::Variable(mapped) = f.kind else {
                 continue;
             };
             let raw = extract(report, usize::from(f.bit), f.size, f.min < 0);
+            if let Some(slot) = f.slot {
+                let Some(&physical_slot) = assigned_slots.get(usize::from(slot)) else {
+                    continue;
+                };
+                if physical_slot < 0 {
+                    continue;
+                }
+                emit(events, 3, 0x2f, i32::from(physical_slot));
+            }
             match mapped {
                 Mapping::Axis(ty, code) => {
+                    if f.slot.is_some_and(|slot| {
+                        let slot = usize::from(slot);
+                        slot >= contact_tips.len()
+                            || !contact_tips[slot]
+                            || !contact_confidence[slot]
+                    }) {
+                        continue;
+                    }
                     let value = raw.clamp(f.min, f.max);
                     if (ty == 2 && value != 0) || (ty == 3 && f.previous != Some(value)) {
                         emit(events, ty, code, value);
@@ -473,9 +1219,66 @@ impl Report {
                     }
                 }
                 Mapping::Key(_) => {}
+                Mapping::MtContactId => {
+                    let active = f.slot.map(usize::from).is_some_and(|slot| {
+                        slot < contact_tips.len() && contact_tips[slot] && contact_confidence[slot]
+                    });
+                    let value = if active { raw } else { -1 };
+                    if f.previous != Some(value) {
+                        emit(events, 3, 0x39, value);
+                    }
+                    f.previous = Some(value);
+                }
+                Mapping::MtTipSwitch => {}
+                Mapping::MtConfidence => {}
+                Mapping::MtScanTime => {}
+                Mapping::MtWidth | Mapping::MtHeight => {
+                    let Some(slot) = f.slot.map(usize::from) else {
+                        continue;
+                    };
+                    let Some(&physical_slot) = assigned_slots.get(slot) else {
+                        continue;
+                    };
+                    if physical_slot < 0 || !contact_tips[slot] || !contact_confidence[slot] {
+                        continue;
+                    }
+                    let physical_slot = usize::from(physical_slot as u16);
+                    let geometry = contact_geometry[physical_slot];
+                    for (index, code) in [0x30u16, 0x31, 0x34].into_iter().enumerate() {
+                        if self.mt_geometry[physical_slot][index] != geometry[index] {
+                            emit(events, 3, code, geometry[index]);
+                            self.mt_geometry[physical_slot][index] = geometry[index];
+                        }
+                    }
+                }
             }
         }
-        if events.len() != before {
+        if finish_contact_batch && let Some((scan_time, scan_time_max)) = scan_time_value {
+            let touching =
+                (0..slots_to_process).any(|slot| contact_tips[slot] && contact_confidence[slot]);
+            let delta = if self.mt_prev_touch {
+                let delta = scan_time as i64 - self.mt_scan_time as i64;
+                if delta < 0 {
+                    delta + i64::from(scan_time_max)
+                } else {
+                    delta
+                }
+            } else {
+                0
+            };
+            self.mt_scan_time = scan_time;
+            self.mt_timestamp_us = self.mt_timestamp_us.saturating_add(
+                u32::try_from(delta.max(0))
+                    .unwrap_or(u32::MAX)
+                    .saturating_mul(100),
+            );
+            emit(events, 4, 5, self.mt_timestamp_us as i32);
+            self.mt_prev_touch = touching;
+            if !touching {
+                self.mt_timestamp_us = 0;
+            }
+        }
+        if events.len() != before && finish_contact_batch {
             emit(events, 0, 0, 0);
         }
         true
@@ -486,15 +1289,106 @@ impl Report {
 mod tests {
     use super::*;
     const KEYBOARD: &[u8] = &[
-        0x05, 1, 0x09, 6, 0xa1, 1, 0x05, 7, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8,
-        0x81, 2, 0x75, 8, 0x95, 1, 0x81, 1, 0x19, 0, 0x29, 0x65, 0x15, 0, 0x25, 0x65, 0x75, 8,
-        0x95, 6, 0x81, 0, 0xc0,
+        0x05, 1, 0x09, 6, 0xa1, 1, 0x05, 7, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0, 0x25, 1, 0x75, 1,
+        0x95, 8, 0x81, 2, 0x75, 8, 0x95, 1, 0x81, 1, 0x19, 0, 0x29, 0x65, 0x15, 0, 0x25, 0x65,
+        0x75, 8, 0x95, 6, 0x81, 0, 0xc0,
     ];
     fn triples(events: &VecDeque<Event>) -> Vec<(u16, u16, i32)> {
         events
             .iter()
             .map(|e| (e.event_type, e.code, e.value as i32))
             .collect()
+    }
+    #[test]
+    fn multitouch_serial_batches_sync_after_contact_count_is_delivered() {
+        let descriptor = [
+            0x05, 0x0d, 0x09, 0x05, 0xa1, 1, // Touchpad
+            0x09, 0x54, 0x15, 0, 0x25, 10, 0x75, 8, 0x95, 1, 0x81, 2, // Contact Count
+            0x09, 0x22, 0xa1, 2, // Finger
+            0x09, 0x42, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, // Tip
+            0x75, 7, 0x95, 1, 0x81, 3, // Padding
+            0x09, 0x51, 0x15, 0, 0x25, 31, 0x75, 8, 0x95, 1, 0x81, 2, // Contact ID
+            0x05, 1, 0x09, 0x30, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // X
+            0x09, 0x31, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // Y
+            0xc0, 0xc0,
+        ];
+        let mut parser = Report::parse(&descriptor).unwrap();
+        let location = parser
+            .locate_usage(ReportKind::Input, 0x0d, 0x54, 0)
+            .unwrap();
+        parser.configure_mt_contact_count(location);
+        let mut events = VecDeque::new();
+        assert!(parser.decode(&[2, 1, 7, 50, 60], &mut events));
+        assert!(!triples(&events).contains(&(0, 0, 0)));
+        events.clear();
+        assert!(parser.decode(&[0, 1, 8, 70, 80], &mut events));
+        assert!(triples(&events).contains(&(0, 0, 0)));
+    }
+    #[test]
+    fn contact_batch_does_not_block_other_report_ids() {
+        let mut descriptor = alloc::vec![
+            0x05, 0x0d, 0x09, 0x05, 0xa1, 1, 0x85, 1, // Touchpad, report 1
+            0x09, 0x54, 0x15, 0, 0x25, 10, 0x75, 8, 0x95, 1, 0x81, 2, // Contact Count
+            0x09, 0x22, 0xa1, 2, // Finger
+            0x09, 0x42, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, // Tip
+            0x75, 7, 0x95, 1, 0x81, 3, // Padding
+            0x09, 0x51, 0x15, 0, 0x25, 31, 0x75, 8, 0x95, 1, 0x81, 2, // Contact ID
+            0x05, 1, 0x09, 0x30, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // X
+            0x09, 0x31, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // Y
+            0xc0, 0xc0,
+        ];
+        descriptor.extend([
+            0x05, 1, 0x09, 6, 0xa1, 1, 0x85, 2, // Keyboard, report 2
+            0x05, 7, 0x09, 4, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, // A
+            0x75, 7, 0x95, 1, 0x81, 3, 0xc0,
+        ]);
+        let mut parser = Report::parse(&descriptor).unwrap();
+        let location = parser
+            .locate_usage(ReportKind::Input, 0x0d, 0x54, 0)
+            .unwrap();
+        parser.configure_mt_contact_count(location);
+        let mut events = VecDeque::new();
+        assert!(parser.decode(&[1, 2, 1, 7, 50, 60], &mut events));
+        assert!(!triples(&events).contains(&(0, 0, 0)));
+        events.clear();
+        assert!(parser.decode(&[2, 1], &mut events));
+        assert!(triples(&events).contains(&(1, 30, 1)));
+        assert!(triples(&events).contains(&(0, 0, 0)));
+        events.clear();
+        assert!(parser.decode(&[1, 0, 1, 8, 70, 80], &mut events));
+        assert!(triples(&events).contains(&(0, 0, 0)));
+    }
+    #[test]
+    fn hybrid_contact_batch_processes_only_the_remaining_subset() {
+        let descriptor = [
+            0x05, 0x0d, 0x09, 0x05, 0xa1, 1, // Touchpad
+            0x09, 0x54, 0x15, 0, 0x25, 10, 0x75, 8, 0x95, 1, 0x81, 2, // Contact Count
+            0x09, 0x22, 0xa1, 2, // Finger 1
+            0x09, 0x42, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, // Tip
+            0x75, 7, 0x95, 1, 0x81, 3, // Padding
+            0x09, 0x51, 0x15, 0, 0x25, 31, 0x75, 8, 0x95, 1, 0x81, 2, // Contact ID
+            0x05, 1, 0x09, 0x30, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // X
+            0x09, 0x31, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // Y
+            0xc0, 0x05, 0x0d, 0x09, 0x22, 0xa1, 2, // Finger 2
+            0x09, 0x42, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, 0x75, 7, 0x95, 1, 0x81, 3,
+            0x09, 0x51, 0x15, 0, 0x25, 31, 0x75, 8, 0x95, 1, 0x81, 2, 0x05, 1, 0x09, 0x30, 0x15, 0,
+            0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, 0x09, 0x31, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1,
+            0x81, 2, 0xc0, 0xc0,
+        ];
+        let mut parser = Report::parse(&descriptor).unwrap();
+        let location = parser
+            .locate_usage(ReportKind::Input, 0x0d, 0x54, 0)
+            .unwrap();
+        parser.configure_mt_contact_count(location);
+        let mut events = VecDeque::new();
+        assert!(parser.decode(&[3, 1, 7, 50, 60, 1, 8, 70, 80], &mut events));
+        assert!(!triples(&events).contains(&(0, 0, 0)));
+        events.clear();
+        assert!(parser.decode(&[0, 1, 9, 90, 95, 0, 8, 70, 80], &mut events));
+        let decoded = triples(&events);
+        assert!(decoded.contains(&(3, 0x35, 90)));
+        assert!(!decoded.contains(&(3, 0x35, 70)));
+        assert!(decoded.contains(&(0, 0, 0)));
     }
     fn pointer(absolute: bool, id: Option<u8>) -> Vec<u8> {
         let mut d = alloc::vec![0x05, 1, 0x09, 2, 0xa1, 1];
@@ -642,9 +1536,100 @@ mod tests {
             0x09, 1, 0x81, 2, 0xb4, 0x09, 1, 0x91, 2, 0x09, 1, 0x81, 2,
         ];
         let mut p = Report::parse(&d).unwrap();
+        assert_eq!(p.report_size(ReportKind::Input, 0), 1);
+        assert_eq!(p.report_size(ReportKind::Output, 0), 1);
+        assert_eq!(p.report_size(ReportKind::Feature, 0), 0);
+        assert_eq!(p.report_size_max(ReportKind::Input), (0, 1));
+        assert_eq!(p.report_size_max(ReportKind::Output), (0, 1));
         let mut ev = VecDeque::new();
         assert!(p.decode(&[2], &mut ev));
         assert_eq!(triples(&ev), [(1, 0x100, 1), (0, 0, 0)]);
+    }
+
+    #[test]
+    fn report_size_max_returns_first_nonzero_id_and_largest_size() {
+        let descriptor = [
+            0x85, 1, // Report ID 1
+            0x05, 1, 0x09, 0x30, 0x15, 0, 0x25, 1, 0x75, 8, 0x95, 1, 0x81, 2, 0x85,
+            2, // Report ID 2
+            0x05, 1, 0x09, 0x31, 0x15, 0, 0x25, 1, 0x75, 8, 0x95, 2, 0x81, 2,
+        ];
+        let report = Report::parse(&descriptor).unwrap();
+        assert_eq!(report.report_size(ReportKind::Input, 1), 2);
+        assert_eq!(report.report_size(ReportKind::Input, 2), 3);
+        assert_eq!(report.report_size_max(ReportKind::Input), (1, 3));
+    }
+
+    #[test]
+    fn usage_locations_are_scoped_to_their_top_level_collection() {
+        let descriptor = [
+            0x05, 1, 0x09, 2, 0xa1, 1, // TLC 0: Mouse
+            0x85, 1, 0x09, 0x30, 0x15, 0, 0x25, 127, 0x75, 8, 0x95, 1, 0x81, 2, 0xc0, 0x05, 1,
+            0x09, 5, 0xa1, 1, // TLC 1: Game Pad
+            0x85, 2, 0x09, 0x30, 0x15, 0, 0x25, 127, 0x75, 8, 0x95, 1, 0x81, 2, 0xc0,
+        ];
+        let report = Report::parse(&descriptor).unwrap();
+        assert_eq!(
+            report
+                .locate_usage_in_collection(ReportKind::Input, 1, 0x30, 0, 0)
+                .unwrap()
+                .report_id,
+            1
+        );
+        assert_eq!(
+            report
+                .locate_usage_in_collection(ReportKind::Input, 1, 0x30, 1, 0)
+                .unwrap()
+                .report_id,
+            2
+        );
+        assert!(
+            report
+                .locate_usage_in_collection(ReportKind::Input, 1, 0x30, 2, 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn locates_feature_usage_and_reads_writes_bounded_report_bits() {
+        let descriptor = [
+            0x05, 0x0d, 0x09, 0x55, 0x15, 0, 0x25, 10, 0x85, 1, 0x75, 8, 0x95, 1, 0xb1, 2, 0x05, 1,
+            0x09, 2, 0xa1, 1, 0x09, 0x30, 0x15, 0, 0x25, 10, 0x75, 8, 0x95, 1, 0x81, 2, 0xc0,
+        ];
+        let report = Report::parse(&descriptor).unwrap();
+        let location = report
+            .locate_usage(ReportKind::Feature, 0x0d, 0x55, 0)
+            .unwrap();
+        assert_eq!(
+            (location.report_id, location.bit_offset, location.size),
+            (1, 8, 8)
+        );
+        assert_eq!(get_hid_data(&[1, 7], location, false), Some(7));
+        let mut packet = [1, 0];
+        assert!(put_hid_udata(&mut packet, location, 9));
+        assert_eq!(packet, [1, 9]);
+        assert_eq!(get_hid_data(&packet, location, false), Some(9));
+        assert_eq!(get_hid_data(&[1], location, false), None);
+    }
+
+    #[test]
+    fn hid_item_resolution_matches_hid_unit_scale() {
+        let mut location = HidLocation {
+            report_id: 0,
+            tlc_index: 0,
+            bit_offset: 0,
+            size: 8,
+            flags: 0,
+            logical_min: 0,
+            logical_max: 1000,
+            physical_min: 0,
+            physical_max: 100,
+            unit: 0x11,
+            unit_exponent: 0,
+        };
+        assert_eq!(hid_item_resolution(location), 1);
+        location.unit_exponent = -1;
+        assert_eq!(hid_item_resolution(location), 0);
     }
     #[test]
     fn wheel_emits_legacy_and_high_resolution_codes() {
@@ -657,6 +1642,33 @@ mod tests {
         assert!(p.has_code(2, 11));
         assert!(p.decode(&[255], &mut ev));
         assert_eq!(triples(&ev), [(2, 8, -1), (2, 11, -120), (0, 0, 0)]);
+    }
+    #[test]
+    fn digitizer_finger_collection_emits_multitouch_slot_and_tracking_id() {
+        let finger = [
+            0x09, 0x22, 0xa1, 2, // Finger logical collection
+            0x09, 0x51, 0x15, 0, 0x25, 31, 0x75, 8, 0x95, 1, 0x81, 2, // Contact ID
+            0xc0,
+        ];
+        let mut descriptor = alloc::vec![0x05, 0x0d, 0x09, 0x05, 0xa1, 1];
+        descriptor.extend_from_slice(&finger);
+        descriptor.extend_from_slice(&finger);
+        descriptor.push(0xc0);
+        let mut report = Report::parse(&descriptor).unwrap();
+        assert!(report.is_pointer());
+        assert_eq!(report.absolute_range(0x2f), Some((0, 31)));
+        let mut events = VecDeque::new();
+        assert!(report.decode(&[7, 8], &mut events));
+        assert_eq!(
+            triples(&events),
+            [
+                (3, 0x2f, 0),
+                (3, 0x39, 7),
+                (3, 0x2f, 1),
+                (3, 0x39, 8),
+                (0, 0, 0)
+            ]
+        );
     }
     #[test]
     fn malformed_and_random_descriptors_are_bounded() {
@@ -689,5 +1701,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hmt_scan_time_wraps_and_accumulates_in_microseconds() {
+        let descriptor = [
+            0x05, 0x0d, 0x09, 0x05, 0xa1, 1, // Touchpad application
+            0x09, 0x22, 0xa1, 2, // Finger collection
+            0x09, 0x42, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, // Tip Switch
+            0x75, 7, 0x95, 1, 0x81, 3, // Padding
+            0x09, 0x51, 0x15, 0, 0x25, 31, 0x75, 8, 0x95, 1, 0x81, 2, // Contact ID
+            0x05, 1, 0x09, 0x30, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // X
+            0x09, 0x31, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // Y
+            0x05, 0x0d, 0x09, 0x56, 0x15, 0, 0x26, 0xff, 0x00, 0x75, 8, 0x95, 1, 0x81,
+            2, // Scan time
+            0xc0, 0xc0,
+        ];
+        // FreeBSD hmt.c wraps by the logical maximum (255 here, encoded as a
+        // two-byte item so it is not read as -1): 250 -> 5 is 10 ticks of 100 us.
+        let mut report = Report::parse(&descriptor).unwrap();
+        let mut events = VecDeque::new();
+        assert!(report.decode(&[1, 1, 20, 30, 250], &mut events));
+        assert!(
+            events
+                .iter()
+                .any(|e| (e.event_type, e.code, e.value) == (4, 5, 0))
+        );
+        events.clear();
+        assert!(report.decode(&[1, 1, 20, 30, 5], &mut events));
+        assert!(
+            events
+                .iter()
+                .any(|e| (e.event_type, e.code, e.value) == (4, 5, 1_000))
+        );
+        events.clear();
+        assert!(report.decode(&[0, 1, 20, 30, 10], &mut events));
+        assert!(
+            events
+                .iter()
+                .any(|e| (e.event_type, e.code, e.value) == (4, 5, 1_500))
+        );
     }
 }

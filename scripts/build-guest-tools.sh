@@ -51,7 +51,7 @@ JOBS=${CARGO_BUILD_JOBS:-$(nproc)}
 
 usage() {
     cat <<'EOF'
-Usage: scripts/build-guest-tools.sh --payload {none,tcc,nested,glibc,gcc,wireless} --output DIR
+Usage: scripts/build-guest-tools.sh --payload {none,tcc,nested,glibc,gcc,wireless,bluez} --output DIR
 
 Stage the optional guest tool payload into DIR, for build-rootfs.sh to copy
 into the image.  `nested`, `glibc` and `gcc` are delegated to their own
@@ -119,7 +119,11 @@ case "$PAYLOAD" in
         [ -n "$OUTPUT" ] || { printf '%s\n' '--output is required' >&2; exit 2; }
         exec "$SCRIPT_DIR/build-wireless-payload.sh" --output "$OUTPUT" --source-cache "$SOURCE_CACHE"
         ;;
-    *) printf '%s\n' '--payload must be none, tcc, nested, glibc, gcc, debug or wireless' >&2; exit 2 ;;
+    bluez)
+        [ -n "$OUTPUT" ] || { printf '%s\n' '--output is required' >&2; exit 2; }
+        exec "$SCRIPT_DIR/build-bluez-payload.sh" --output "$OUTPUT" --source-cache "$SOURCE_CACHE"
+        ;;
+    *) printf '%s\n' '--payload must be none, tcc, nested, glibc, gcc, debug, wireless or bluez' >&2; exit 2 ;;
 esac
 
 # `none` is a valid request that produces an empty staging tree; the caller
