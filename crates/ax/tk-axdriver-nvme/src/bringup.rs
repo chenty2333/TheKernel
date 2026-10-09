@@ -407,6 +407,9 @@ impl<H: Hal, B: Bus> BlockDriverOps for Controller<H, B> {
     fn block_size(&self) -> usize {
         self.block_size
     }
+    fn is_read_only(&self) -> bool {
+        !self.allow_write
+    }
     fn read_block(&mut self, block: u64, buf: &mut [u8]) -> DevResult {
         self.transfer(block, buf.len(), false, |pointer, offset, size| {
             // SAFETY: disjoint owned bounce and caller slices, both cover size bytes.
