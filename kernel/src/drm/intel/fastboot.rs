@@ -743,6 +743,51 @@ fn translated_tc_dpll_readout<R: Registers, T: PollTimer>(
         .map_err(|error| format!("translated shared DPLL readout refused: {error:?}"))
 }
 
+/// Compute a target through the persistent translated DPLL manager and
+/// require it to match the DKL state consumed by the bounded TC transaction.
+/// This is source-manager planning only; reservation and writes remain owned
+/// by the outer before-image transaction until its full lifecycle is wired.
+fn translated_tc_dpll_target<R: Registers, T: PollTimer>(
+    native: &Native<R, T>,
+    target_port_clock_khz: u32,
+    expected: &intel_display::dpll_mgr::DklPllState,
+) -> Result<(), String> {
+    let identity = super::shared_dpll::AdlNIdentity::verify(
+        native.pci.vendor_id,
+        native.pci.device_id,
+        native.pci.revision,
+    )
+    .map_err(|error| format!("shared DPLL identity changed: {error:?}"))?;
+    let mut power =
+        super::shared_dpll::PinnedDpllPower::new(&native.power, identity, native.baseline.refclk)
+            .map_err(|error| format!("shared DPLL power context unavailable: {error:?}"))?;
+    let source_state = native
+        .shared_dpll
+        .lock()
+        .compute_tc_pll_state(
+            &native.registers,
+            &native.timer,
+            &mut power,
+            target_port_clock_khz,
+        )
+        .map_err(|error| format!("translated DPLL target compute failed: {error:?}"))?;
+    let source_state = intel_display::intel_dpll_mgr_full::IntelDpllHwState {
+        icl: source_state,
+        ..intel_display::intel_dpll_mgr_full::IntelDpllHwState::default()
+    };
+    if super::shared_dpll::dkl_state_matches_source_readout(
+        expected,
+        &source_state,
+        native.afc_startup.is_some(),
+    ) {
+        Ok(())
+    } else {
+        Err(String::from(
+            "translated shared-DPLL calculation disagrees with the TC DKL target image",
+        ))
+    }
+}
+
 /// Debounce task-context DDC samples and report the physical connector state
 /// independently of whether the audio owner could retire or publish its HDA
 /// route. Audio errors are retained for diagnostics, not used to hide a
@@ -1574,7 +1619,8 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             let old_pitch = old_firmware.plane.pitch;
             let watermark = self.watermark;
             let mut display_writes_started = false;
-            let transition = translated_tc_dpll_readout(self)
+            let transition = translated_tc_dpll_target(self, target.timing.clock_khz, &target_pll)
+                .and_then(|()| translated_tc_dpll_readout(self))
                 .and_then(|(enabled, manager_state)| {
                     if enabled != (old_firmware.pll.enable != 0)
                         || !super::shared_dpll::dkl_state_matches_source_readout(

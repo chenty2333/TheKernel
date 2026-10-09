@@ -720,6 +720,69 @@ impl SharedDpllState {
         })
     }
 
+    /// Run the translated ADL-N TC PLL calculator against the read-out Pipe-A
+    /// owner. This is a read-only preflight used to check the existing bounded
+    /// DKL transaction's target fields; it does not reserve, swap, or program
+    /// the source manager's atomic state.
+    pub(crate) fn compute_tc_pll_state<R: Registers, T: PollTimer, P: DpllPowerAccess<R>>(
+        &mut self,
+        registers: &R,
+        timer: &T,
+        power: &mut P,
+        target_port_clock_khz: u32,
+    ) -> Result<dpll::IclDpllHwState, DpllFailure> {
+        self.ensure_usable()?;
+        self.ensure_readout()?;
+        let selected = self
+            .selected_tc_port
+            .ok_or(DpllFailure::DklPortNotSelected)?;
+        let old = *self
+            .display
+            .crtc_states
+            .first()
+            .ok_or(DpllFailure::InvalidCrtc)?;
+        if !old.hw_active || old.intel_dpll.is_none() || old.pipe != 0 || target_port_clock_khz == 0
+        {
+            return Err(DpllFailure::InvalidCrtc);
+        }
+        let port = dpll::Port::Tc(selected);
+        if tc_port_from_crtc(old.port)? != selected {
+            return Err(DpllFailure::DklPortNotSelected);
+        }
+        let mut atomic = dpll::IntelAtomicState::default();
+        atomic.old_crtcs[0] = old;
+        atomic.new_crtcs[0] = dpll::CrtcState {
+            port_clock: target_port_clock_khz,
+            output: dpll::OutputType::Hdmi,
+            port,
+            ..old
+        };
+        let crtc = dpll::IntelCrtc {
+            id: old.id,
+            name: old.name,
+            pipe: 0,
+        };
+        let encoder = dpll::IntelEncoder {
+            output: dpll::OutputType::Hdmi,
+            port,
+            is_combo_phy: false,
+            is_tc_phy: true,
+            primary_port: None,
+            tc_dp_alt_mode: false,
+            tc_legacy_mode: true,
+        };
+        self.compute(registers, timer, power, &mut atomic, &crtc, &encoder)?;
+        atomic
+            .new_crtcs
+            .first()
+            .map(|state| {
+                state.icl_port_dplls[dpll::PortDpllId::MgPhy as usize]
+                    .hw_state
+                    .icl
+            })
+            .ok_or(DpllFailure::InvalidCrtc)
+    }
+
     pub(crate) fn reserve<R: Registers, T: PollTimer, P: DpllPowerAccess<R>>(
         &mut self,
         registers: &R,
