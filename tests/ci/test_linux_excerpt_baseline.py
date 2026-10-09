@@ -32,19 +32,23 @@ WINDOW = 14
 
 # (fenced lines, fenced blocks, files holding one, lines outside fences, of those
 # `code`, marked blocks, marker lines) -- the seven a scan's header line prints,
-# for the scope and threshold named. Intel host C oracle shims add ninety-six
-# code-line matches at 25 (seventy-eight at 40): conventional macros/constants and
-# MIT state-layout declarations, documented in NOTICE and provenance.
+# for the scope and threshold named. Re-scan 2026-10-09: `tk-intel-display` adds
+# 184 / 250 outside-fence matches at >=40 / >=25 (39 / 105 code lines); these
+# hash-matched lines occur in the display crate's Linux 7.2.3 i915 translations,
+# whose MIT license, per-module source mapping, and grant are recorded in its
+# `NOTICE` and `LICENSE-MIT`. The `kernel/src` increase is separately measured;
+# it includes DRM-core and non-i915 Linux-derived matches and is not attributed
+# to i915 here. See the dated reconciliation in docs/upstream-provenance.md.
 SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     ("crates/linux", 40): (110, 49, 20, 25, 0, 18, 21),
-    ("kernel/src", 40): (86, 42, 20, 130, 8, 0, 0),
-    ("crates/ax", 40): (0, 0, 0, 95, 88, 0, 0),
+    ("kernel/src", 40): (86, 42, 20, 142, 9, 0, 0),
+    ("crates/ax", 40): (0, 0, 0, 279, 127, 0, 0),
     ("crates/linux", 25): (211, 59, 22, 41, 3, 20, 21),
-    ("kernel/src", 25): (159, 52, 26, 299, 14, 0, 0),
+    ("kernel/src", 25): (159, 52, 26, 317, 21, 0, 0),
     # `crates/ax` at 25 is 4 `nullfs.rs` lines plus 14 smoltcp RFC bit-ruler rows
     # that Linux headers reprint from the same IETF figures: read the `crates/ax`
     # section of `docs/upstream-provenance.md` before counting these as text.
-    ("crates/ax", 25): (18, 15, 4, 129, 118, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 379, 223, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their

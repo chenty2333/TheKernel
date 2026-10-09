@@ -1286,3 +1286,32 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `kernel/src/drm/property_uapi_full.rs` translates all 26 ctags functions from Linux 7.2.3 `drivers/gpu/drm/drm_property.c` (Intel permissive MIT-style grant; Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Property-MIT`.
 
 `kernel/src/drm/framebuffer_uapi_full.rs` translates all 27 ctags functions from Linux 7.2.3 `drivers/gpu/drm/drm_framebuffer.c` (Intel permissive MIT-style grant; Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Framebuffer-MIT`.
+
+## 2026-10-09 excerpt-count reconciliation
+
+The whole-tree scanner was re-run against `/home/ava/Desktop/linux-7.2.3`
+using `scripts/ci/scan_linux_excerpts.py` semantics (whitespace-normalized
+line hashes, default ASCII-rule filter) at thresholds 40 and 25. The measured
+seven-field tuples now pinned in `tests/ci/test_linux_excerpt_baseline.py` are:
+
+| Scope | >=40 | >=25 |
+| --- | --- | --- |
+| `crates/linux` | `(110,49,20,25,0,18,21)` | `(211,59,22,41,3,20,21)` |
+| `kernel/src` | `(86,42,20,142,9,0,0)` | `(159,52,26,317,21,0,0)` |
+| `crates/ax` | `(0,0,0,279,127,0,0)` | `(18,15,4,379,223,0,0)` |
+
+The `crates/ax` increase from the prior baseline is attributable to the new
+`tk-intel-display` Linux 7.2.3 i915 translations: scanning that crate alone
+produced 184 outside-fence matches (39 code) at >=40 and 250 (105 code) at
+>=25. These exact-line matches occur in `tk-intel-display/src` translation
+files; the crate declares MIT, retains `LICENSE-MIT`, and its `NOTICE` maps
+the source modules to MIT i915 display files. This is not the earlier small
+oracle-shim delta; the prior totals in this document are historical.
+
+The `kernel/src` increase is a separate whole-scope measurement, not an i915
+attribution: current matches include DRM-core UAPI translations and Linux
+comments/code outside `drm/intel` (for example syscall, BPF and netlink
+paths). The scan establishes line identity against Linux 7.2.3, not a license
+or source-file classification. Do not describe this delta as MIT i915. The
+kernel-source provenance entries and license texts remain the authority for
+those files; this count reconciliation changes only the measured baseline.
