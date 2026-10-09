@@ -402,6 +402,7 @@ impl DrmFile {
         };
         let job = super::device::AtomicCommit {
             owner: self.id,
+            old: super::atomic::State::default(),
             next,
             fb,
             cancellation: Arc::clone(&self.events),

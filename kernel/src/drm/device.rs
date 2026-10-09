@@ -199,6 +199,19 @@ pub trait DisplayAdapter: Send + Sync {
         allocation_owner: Arc<dyn Send + Sync>,
     ) -> DrmResult<Arc<dyn GemBacking>>;
     fn present(&self, scanout: Scanout) -> DrmResult<Arc<Fence>>;
+    /// Submit one committed primary-plane state transition. Native adapters
+    /// that need old/new CRTC or plane state can override this instead of
+    /// trying to reconstruct an atomic transition from the new scanout alone.
+    /// The default preserves the existing adapter contract: a visible target
+    /// is presented, while a no-scanout transition has no transport work.
+    fn commit_atomic_state(
+        &self,
+        _old: super::atomic::State,
+        _new: super::atomic::State,
+        scanout: Option<Scanout>,
+    ) -> DrmResult<Option<Arc<Fence>>> {
+        scanout.map(|scanout| self.present(scanout)).transpose()
+    }
     /// Hardware adapters reject unsupported state before the core admits a
     /// commit. A fixed firmware link cannot silently claim DPMS/color changes.
     fn validate_atomic_state(
@@ -967,7 +980,7 @@ impl DrmDevice {
         self.enqueue_atomic(job, generation)
     }
 
-    fn enqueue_atomic(self: &Arc<Self>, job: AtomicCommit, generation: u64) -> DrmResult<()> {
+    fn enqueue_atomic(self: &Arc<Self>, mut job: AtomicCommit, generation: u64) -> DrmResult<()> {
         self.ensure_vblank_worker()?;
         let mut state = self.state.lock();
         if state.kms_suspended {
@@ -994,6 +1007,10 @@ impl DrmDevice {
             job.discard_event();
             return Err(DrmError::QueueFull);
         }
+        // Bind the before-image to the same generation check as publication.
+        // Deriving it later from a newer atomic tail would describe a
+        // different transition than the queued target state.
+        job.old = state.atomic_tail;
         hold_state_blobs(&mut state, job.next)?;
         state.advance_atomic_generation()?;
         state.atomic_tail = job.next;
@@ -1154,10 +1171,8 @@ impl DrmDevice {
                 return Ok(false);
             }
         }
-        if let Some(scanout) = scanout
-            && job.present.is_none()
-        {
-            let present = match self.adapter.present(scanout) {
+        if job.present.is_none() {
+            let present = match self.adapter.commit_atomic_state(job.old, job.next, scanout) {
                 Ok(present) => present,
                 Err(error) => {
                     job.discard_event();
@@ -1165,18 +1180,20 @@ impl DrmDevice {
                     return Err(error);
                 }
             };
-            let target = match sequence.checked_add(1) {
-                Some(target) => target,
-                None => {
-                    job.discard_event();
-                    job.cancellation.end_delivery();
-                    return Err(DrmError::Overflow);
-                }
-            };
-            job.present = Some(present);
-            job.present_target = target;
-            job.cancellation.end_delivery();
-            return Ok(false);
+            if let Some(present) = present {
+                let target = match sequence.checked_add(1) {
+                    Some(target) => target,
+                    None => {
+                        job.discard_event();
+                        job.cancellation.end_delivery();
+                        return Err(DrmError::Overflow);
+                    }
+                };
+                job.present = Some(present);
+                job.present_target = target;
+                job.cancellation.end_delivery();
+                return Ok(false);
+            }
         }
         if let Some(present) = &job.present {
             if !present.is_signaled() {
@@ -1905,6 +1922,7 @@ impl CommitCompletion {
 #[derive(Clone)]
 pub(crate) struct AtomicCommit {
     pub(crate) owner: u64,
+    pub(crate) old: super::atomic::State,
     pub(crate) next: super::atomic::State,
     pub(crate) fb: Option<Framebuffer>,
     pub(crate) cancellation: Arc<super::file::EventQueue>,
@@ -2060,6 +2078,57 @@ mod tests {
         fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
             Ok(Fence::new(true))
         }
+    }
+
+    struct AtomicTransitionAdapter {
+        observed: spin::Mutex<Option<(u32, u32, bool)>>,
+    }
+    impl DisplayAdapter for AtomicTransitionAdapter {
+        fn create_dumb(
+            &self,
+            _: DumbRequest,
+            _: u32,
+            _: u64,
+            _allocation_owner: Arc<dyn Send + Sync>,
+        ) -> DrmResult<Arc<dyn GemBacking>> {
+            Err(DrmError::Unsupported)
+        }
+        fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
+            Ok(Fence::new(true))
+        }
+        fn commit_atomic_state(
+            &self,
+            old: super::super::atomic::State,
+            new: super::super::atomic::State,
+            scanout: Option<Scanout>,
+        ) -> DrmResult<Option<Arc<Fence>>> {
+            *self.observed.lock() = Some((old.fb, new.fb, scanout.is_some()));
+            Ok(scanout.map(|_| Fence::new(true)))
+        }
+    }
+
+    #[test]
+    fn adapter_atomic_boundary_receives_old_and_new_kms_state_even_without_scanout() {
+        let adapter = AtomicTransitionAdapter {
+            observed: spin::Mutex::new(None),
+        };
+        let old = super::super::atomic::State {
+            active: true,
+            fb: 17,
+            ..super::super::atomic::State::default()
+        };
+        let new = super::super::atomic::State {
+            active: false,
+            fb: 23,
+            ..super::super::atomic::State::default()
+        };
+        assert!(
+            adapter
+                .commit_atomic_state(old, new, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(*adapter.observed.lock(), Some((17, 23, false)));
     }
 
     struct Display13ColorAdapter;
@@ -2592,6 +2661,7 @@ mod tests {
         let completion = Fence::new(false);
         let mut job = AtomicCommit {
             owner: file.id(),
+            old: super::super::atomic::State::default(),
             next: super::super::atomic::initial(&device.state.lock().resources),
             fb: None,
             cancellation: super::super::file::EventQueue::new(),
@@ -2649,6 +2719,7 @@ mod tests {
             state.pending_fb_pins.insert(7, 1);
             state.pending_commits.push_back(AtomicCommit {
                 owner: 1,
+                old: super::super::atomic::State::default(),
                 next,
                 fb: None,
                 cancellation: Arc::clone(&first),
@@ -2669,6 +2740,7 @@ mod tests {
             let atomic = state.atomic;
             state.pending_commits.push_back(AtomicCommit {
                 owner: 2,
+                old: super::super::atomic::State::default(),
                 next: atomic,
                 fb: None,
                 cancellation: Arc::clone(&second),
@@ -2720,6 +2792,7 @@ mod tests {
         }
         let job = AtomicCommit {
             owner: 1,
+            old: super::super::atomic::State::default(),
             next,
             fb: None,
             cancellation: Arc::clone(&queue),
