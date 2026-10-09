@@ -143,6 +143,19 @@ pub type IntelMemoryType = i32;
 // `arch/x86/include/asm/cpufeatures.h`: CPUID feature word 0, bit 19.
 pub const X86_FEATURE_CLFLUSH: u32 = 19;
 
+/// Target's x86 `static_cpu_has(X86_FEATURE_CLFLUSH)` query.
+///
+/// The i915 source path currently uses only feature word 0, bit 19. Linux
+/// captures this boot-CPU capability in its static feature bitmap; on this
+/// x86_64 target the architectural CPUID.1 EDX bit is the corresponding
+/// immutable capability source.
+#[cfg(feature = "upstream-gt")]
+#[inline]
+pub fn static_cpu_has(feature: u32) -> bool {
+    assert_eq!(feature, X86_FEATURE_CLFLUSH, "unbound x86 CPU feature index");
+    core::arch::x86_64::__cpuid(1).edx & (1 << 19) != 0
+}
+
 /// `i915_gem_tile_height()` from gem/i915_gem_object.h.
 #[inline]
 pub fn i915_gem_tile_height(tiling: u32) -> u32 {
