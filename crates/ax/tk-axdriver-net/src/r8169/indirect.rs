@@ -29,12 +29,6 @@ pub fn mac_read(bus: &mut impl Bus, address: u16) -> DevResult<u16> {
     if address & 1 != 0 {
         return Err(DevError::InvalidParam);
     }
-    mac_mcu_read(bus, address)
-}
-/// Raw MAC-MCU OCP accessor used by r8169 firmware bytecode. Unlike the
-/// higher-level register helpers, firmware's 12-bit register operand may be
-/// odd (notably register 0x1f) and Linux forwards it unchanged.
-pub fn mac_mcu_read(bus: &mut impl Bus, address: u16) -> DevResult<u16> {
     bus.write(0xb0, Dword, u32::from(address) << 15);
     Ok(bus.read(0xb0, Dword) as u16)
 }
@@ -42,10 +36,6 @@ pub fn mac_write(bus: &mut impl Bus, address: u16, data: u16) -> DevResult {
     if address & 1 != 0 {
         return Err(DevError::InvalidParam);
     }
-    mac_mcu_write(bus, address, data)
-}
-/// Raw MAC-MCU OCP write corresponding to Linux `mac_mcu_write()`.
-pub fn mac_mcu_write(bus: &mut impl Bus, address: u16, data: u16) -> DevResult {
     bus.write(
         0xb0,
         Dword,
@@ -79,8 +69,7 @@ pub fn phy_write(bus: &mut impl Bus, address: u16, data: u16) -> DevResult {
     );
     wait(bus, 0xb8, false, 25, 10).map_err(|error| {
         log::warn!(
-            "\x013RTL8168_PHY_WRITE_FAILED address={address:#06x} value={data:#06x} \
-             error={error:?}"
+            "\x013RTL8168_PHY_WRITE_FAILED address={address:#06x} value={data:#06x} error={error:?}"
         );
         error
     })?;
