@@ -22,7 +22,34 @@ use core::{
 
 use kernel_guard::{NoPreempt, NoPreemptIrqSave};
 
-use crate::intel_engine_cs_upstream::{HlistNode, TimerList};
+use crate::{
+    intel_context_upstream::Hrtimer,
+    intel_engine_cs_upstream::{HlistNode, TimerList},
+    linux::fields::KtimeT,
+};
+
+pub const HRTIMER_NORESTART: i32 = 0;
+pub const HRTIMER_MODE_REL: i32 = 1;
+pub const CLOCK_MONOTONIC: i32 = 1;
+pub const NSEC_PER_USEC: u64 = 1_000;
+pub const NSEC_PER_MSEC: u64 = 1_000_000;
+
+unsafe extern "C" {
+    pub fn hrtimer_setup(
+        timer: *mut Hrtimer,
+        function: Option<unsafe extern "C" fn(*mut Hrtimer) -> i32>,
+        clock_id: i32,
+        mode: i32,
+    );
+    pub fn hrtimer_start_range_ns(timer: *mut Hrtimer, time: KtimeT, range_ns: u64, mode: i32);
+    pub fn hrtimer_try_to_cancel(timer: *mut Hrtimer) -> i32;
+}
+
+/// Linux `ns_to_ktime()` for the target's scalar `ktime_t` representation.
+#[inline]
+pub const fn ns_to_ktime(ns: u64) -> KtimeT {
+    ns as KtimeT
+}
 
 const TIMER_WORKER_UNINITIALIZED: u8 = 0;
 const TIMER_WORKER_STARTING: u8 = 1;

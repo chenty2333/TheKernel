@@ -13,6 +13,8 @@ use core::{
 };
 
 pub const SLAB_HWCACHE_ALIGN: u32 = 1 << 4;
+pub const SLAB_RECLAIM_ACCOUNT: u32 = 0x0002_0000;
+pub const SLAB_TYPESAFE_BY_RCU: u32 = 0x0008_0000;
 const L1_CACHE_BYTES: usize = 64;
 
 #[repr(C)]

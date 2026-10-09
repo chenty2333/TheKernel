@@ -39,6 +39,11 @@ macro_rules! REG_MASKED_FIELD_ENABLE {
     }};
 }
 
+/// Intel register mask/value encoding from include/drm/intel/reg_bits.h.
+macro_rules! REG_MASKED_FIELD {
+    ($mask:expr, $value:expr $(,)?) => {{ (($mask) << 16) | ($value) }};
+}
+
 /// Encode the Intel `REG_MASKED_FIELD_DISABLE(mask)` write value.
 #[macro_export]
 macro_rules! REG_MASKED_FIELD_DISABLE {

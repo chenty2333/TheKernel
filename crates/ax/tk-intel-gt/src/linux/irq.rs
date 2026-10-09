@@ -8,6 +8,8 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use kernel_guard::NoPreempt;
+
 use crate::{
     intel_breadcrumbs_types_upstream::IntelBreadcrumbs, intel_context_upstream::IrqWork,
     intel_engine_cs_upstream::IntelEngineCs,
@@ -18,6 +20,20 @@ pub const IRQ_WORK_BUSY: u32 = 0x02;
 pub const IRQ_WORK_LAZY: u32 = 0x04;
 pub const IRQ_WORK_HARD_IRQ: u32 = 0x08;
 pub const IRQ_WORK_CLAIMED: u32 = IRQ_WORK_PENDING | IRQ_WORK_BUSY;
+
+/// Linux bottom-half exclusion maps to non-preemptible task context here;
+/// tasklet callbacks are dispatched as axtasks rather than softirq vectors.
+#[inline]
+pub fn local_bh_disable() {
+    #[cfg(target_os = "none")]
+    NoPreempt::acquire();
+}
+
+#[inline]
+pub fn local_bh_enable() {
+    #[cfg(target_os = "none")]
+    NoPreempt::release(());
+}
 
 pub trait IrqWorkPtr {
     fn irq_work_ptr(self) -> *mut IrqWork;

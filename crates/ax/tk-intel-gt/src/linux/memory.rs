@@ -58,6 +58,24 @@ pub fn kmalloc(size: usize, flags: u32) -> *mut c_void {
     allocate(size, align_of::<usize>(), flags, flags & __GFP_ZERO != 0).cast()
 }
 
+/// Linux `kmemdup_array()` with the kernel's checked element-count
+/// multiplication and exact byte copy semantics.
+pub unsafe fn kmemdup_array(
+    source: *const c_void,
+    count: usize,
+    element_size: usize,
+    flags: u32,
+) -> *mut c_void {
+    let Some(bytes) = count.checked_mul(element_size) else {
+        return core::ptr::null_mut();
+    };
+    let copy = kmalloc(bytes, flags);
+    if !copy.is_null() && bytes != 0 {
+        unsafe { core::ptr::copy_nonoverlapping(source.cast::<u8>(), copy.cast::<u8>(), bytes) };
+    }
+    copy
+}
+
 /// Allocate and zero raw bytes like Linux `kzalloc`.
 pub fn kzalloc(size: usize, flags: u32) -> *mut c_void {
     allocate(size, align_of::<usize>(), flags, true).cast()

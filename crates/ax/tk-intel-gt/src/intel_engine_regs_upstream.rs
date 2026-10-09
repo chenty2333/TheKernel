@@ -437,4 +437,15 @@ pub const fn VDBOX_CGCTL3F1C(base: u32) -> I915RegT {
 }
 pub const MFXPIPE_CLKGATE_DIS: u32 = 1 << 3;
 
+pub const XEHP_CCS_MODE_CSLICE_MASK: u32 = 0x7;
+pub const fn XEHP_CCS_MODE_CSLICE(cslice: u32, ccs: u32) -> u32 {
+    ccs << (cslice * 3)
+}
+pub const fn L3_GENERAL_PRIO_CREDITS(value: u32) -> u32 {
+    (value >> 1) << 19
+}
+pub const fn L3_HIGH_PRIO_CREDITS(value: u32) -> u32 {
+    (value >> 1) << 14
+}
+
 const _: [(); 4] = [(); core::mem::size_of::<I915RegT>()];

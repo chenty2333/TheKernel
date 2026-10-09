@@ -377,7 +377,10 @@ pub struct IntelRuntimeInfo {
 /// `is_dgfx` is bit 2 in the first byte of `DEV_INFO_FOR_EACH_FLAG`.
 #[repr(C)]
 pub struct IntelDeviceInfoOverlay {
-    _prefix: [u8; 24],
+    _prefix: [u8; 16],
+    pub gt: u8,
+    _pad_gt: [u8; 3],
+    pub platform_engine_mask: u32,
     pub memory_regions: u32,
     pub flags: [u8; 5],
     _pad: [u8; 3],
@@ -386,6 +389,8 @@ pub struct IntelDeviceInfoOverlay {
     pub max_pat_index: u32,
 }
 const _: [(); 96] = [(); size_of::<IntelDeviceInfoOverlay>()];
+const _: [(); 16] = [(); offset_of!(IntelDeviceInfoOverlay, gt)];
+const _: [(); 20] = [(); offset_of!(IntelDeviceInfoOverlay, platform_engine_mask)];
 const _: [(); 24] = [(); offset_of!(IntelDeviceInfoOverlay, memory_regions)];
 const _: [(); 28] = [(); offset_of!(IntelDeviceInfoOverlay, flags)];
 const _: [(); 72] = [(); offset_of!(IntelDeviceInfoOverlay, cachelevel_to_pat)];
@@ -396,6 +401,19 @@ pub unsafe fn INTEL_INFO<P: I915PrivatePtr>(i915: P) -> *const IntelDeviceInfoOv
     (*(i915.as_i915_private().cast::<DrmI915Private>()))
         .info
         .cast::<IntelDeviceInfoOverlay>()
+}
+
+/// Source `HAS_L3_CCS_READ(i915)` from the device-info flag bitfield.
+#[allow(non_snake_case)]
+pub unsafe fn HAS_L3_CCS_READ<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = unsafe { INTEL_INFO(i915) };
+    !info.is_null() && (unsafe { (*info).flags[2] } & 1) != 0
+}
+
+/// `tuning_thread_rr_after_dep` is flag index 34 in DEV_INFO_FOR_EACH_FLAG.
+pub unsafe fn tuning_thread_rr_after_dep<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = unsafe { INTEL_INFO(i915) };
+    !info.is_null() && (unsafe { (*info).flags[4] } & (1 << 2)) != 0
 }
 
 /// `HAS_FLAT_CCS(i915)` from i915_drv.h; source flag bit 9.

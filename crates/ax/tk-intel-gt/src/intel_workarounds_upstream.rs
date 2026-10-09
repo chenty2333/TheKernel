@@ -13,16 +13,23 @@ pub use crate::intel_workarounds_types_upstream::{
     I915McrRegT as I915McrReg, I915RegT as I915Reg, I915Wa, I915WaList, I915WaReg,
 };
 use crate::{
-    i915_gem_object_header_upstream::{i915_gem_object_unpin_map, i915_gem_object_lock},
+    i915_gem_object_header_upstream::{i915_gem_object_lock, i915_gem_object_unpin_map},
     i915_gem_pages_upstream::i915_gem_object_pin_map,
-    i915_gem_ww_upstream::{i915_gem_ww_ctx_backoff, i915_gem_ww_ctx_fini, i915_gem_ww_ctx_init, I915GemWwCtx},
-    i915_request_upstream::{i915_request_add, i915_request_create, i915_request_wait},
+    i915_gem_ww_upstream::{
+        I915GemWwCtx, i915_gem_ww_ctx_backoff, i915_gem_ww_ctx_fini, i915_gem_ww_ctx_init,
+    },
     i915_request_types_upstream::I915Request,
-    i915_vma_api_upstream::{i915_vma_is_ggtt, i915_vma_move_to_active, i915_vma_pin_ww, i915_vma_put, i915_vma_unpin},
+    i915_request_upstream::{i915_request_add, i915_request_create, i915_request_wait},
+    i915_vma_api_upstream::{
+        i915_vma_is_ggtt, i915_vma_move_to_active, i915_vma_pin_ww, i915_vma_put, i915_vma_unpin,
+    },
     i915_vma_types_upstream::I915Vma,
     intel_context_types_upstream::IntelContext,
-    intel_ring_upstream::intel_ring_begin,
-    intel_sseu_types_upstream::{intel_slicemask_from_xehp_dssmask, intel_sseu_find_first_xehp_dss, intel_sseu_get_hsw_subslices},
+    intel_engine_regs_upstream::{
+        BLIT_CCTL, BLIT_CCTL_MOCS, CMD_CCTL_MOCS_OVERRIDE, ECOSKPD, L3_GENERAL_PRIO_CREDITS,
+        L3_HIGH_PRIO_CREDITS, VDBOX_CGCTL3F1C, VDBOX_CGCTL3F10, XEHP_CCS_MODE_CSLICE,
+        XEHP_CCS_MODE_CSLICE_MASK,
+    },
     intel_engine_types_upstream::{
         COMPUTE_CLASS, COPY_ENGINE_CLASS, I915_MAX_CCS, IntelEngineCs, RENDER_CLASS,
         VIDEO_DECODE_CLASS,
@@ -30,12 +37,12 @@ use crate::{
     intel_gt_mcr_upstream::{
         intel_gt_mcr_multicast_write_fw, intel_gt_mcr_read_any_fw, intel_gt_mcr_report_steering,
     },
-    intel_gtt_api_upstream::__vm_create_scratch_for_read,
     intel_gt_types_upstream::{IntelGt, IntelMmioRange as I915MmioRange},
-    intel_engine_regs_upstream::{
-        BLIT_CCTL, BLIT_CCTL_MOCS, CMD_CCTL_MOCS_OVERRIDE, ECOSKPD, L3_GENERAL_PRIO_CREDITS,
-        L3_HIGH_PRIO_CREDITS, VDBOX_CGCTL3F10, VDBOX_CGCTL3F1C,
-        XEHP_CCS_MODE_CSLICE, XEHP_CCS_MODE_CSLICE_MASK,
+    intel_gtt_api_upstream::__vm_create_scratch_for_read,
+    intel_ring_upstream::intel_ring_begin,
+    intel_sseu_types_upstream::{
+        intel_slicemask_from_xehp_dssmask, intel_sseu_find_first_xehp_dss,
+        intel_sseu_get_hsw_subslices,
     },
     intel_uncore_types_upstream::*,
     linux::{
@@ -126,7 +133,12 @@ unsafe fn wal_get_fw_for_rmw(uncore: *mut IntelUncore, wal: *const I915WaList) -
     let mut fw = 0;
     for i in 0..(*wal).count {
         let wa = &*(*wal).list.add(i as usize);
-        fw |= intel_uncore_forcewake_for_reg(uncore, wa.reg(), crate::intel_uncore_types_upstream::FW_REG_READ | crate::intel_uncore_types_upstream::FW_REG_WRITE);
+        fw |= intel_uncore_forcewake_for_reg(
+            uncore,
+            wa.reg(),
+            crate::intel_uncore_types_upstream::FW_REG_READ
+                | crate::intel_uncore_types_upstream::FW_REG_WRITE,
+        );
     }
     fw
 }
@@ -137,7 +149,9 @@ unsafe fn _wa_add(wal: *mut I915WaList, wa: *const I915Wa) {
     let i915 = (*(*wal).gt).i915;
     let (mut start, mut end) = (0usize, (*wal).count as usize);
     if (*wal).count as usize % WA_LIST_CHUNK == 0 {
-        let list = kmalloc_objs::<I915Wa, usize>(((*wal).count as usize + WA_LIST_CHUNK) & !(WA_LIST_CHUNK - 1));
+        let list = kmalloc_objs::<I915Wa, usize>(
+            ((*wal).count as usize + WA_LIST_CHUNK) & !(WA_LIST_CHUNK - 1),
+        );
         if list.is_null() {
             drm_err!(i915, "No space for workaround init!\n");
             return;
@@ -399,7 +413,9 @@ unsafe fn skl_tune_iz_hashing(engine: *mut IntelEngineCs, wal: *mut I915WaList) 
         wal,
         GEN7_GT_MODE,
         GEN9_IZ_HASHING_MASK(2) | GEN9_IZ_HASHING_MASK(1) | GEN9_IZ_HASHING_MASK(0),
-        GEN9_IZ_HASHING(2, vals[2] as u32) | GEN9_IZ_HASHING(1, vals[1] as u32) | GEN9_IZ_HASHING(0, vals[0] as u32),
+        GEN9_IZ_HASHING(2, vals[2] as u32)
+            | GEN9_IZ_HASHING(1, vals[1] as u32)
+            | GEN9_IZ_HASHING(0, vals[0] as u32),
     );
 }
 // upstream: intel_workarounds.c skl_ctx_workarounds_init()
@@ -893,7 +909,8 @@ unsafe fn icl_wa_init_mcr(gt: *mut IntelGt, wal: *mut I915WaList) {
 unsafe fn xehp_init_mcr(gt: *mut IntelGt, wal: *mut I915WaList) {
     let sseu = &(*gt).info.sseu;
     let mut lncf_mask = 0u64;
-    let mut slice_mask = intel_slicemask_from_xehp_dssmask(sseu.subslice_mask, GEN_DSS_PER_GSLICE as i32) as u64;
+    let mut slice_mask =
+        intel_slicemask_from_xehp_dssmask(sseu.subslice_mask, GEN_DSS_PER_GSLICE as i32) as u64;
     for i in for_each_set_bit((*gt).info.mslice_mask, GEN12_MAX_MSLICES) {
         lncf_mask |= 3 << (i * 2);
     }
@@ -906,8 +923,9 @@ unsafe fn xehp_init_mcr(gt: *mut IntelGt, wal: *mut I915WaList) {
         (*gt).steering_table[MSLICE] = core::ptr::null_mut();
     }
     let slice = __ffs(slice_mask) as u32;
-    let subslice =
-        intel_sseu_find_first_xehp_dss(sseu, GEN_DSS_PER_GSLICE as i32, slice as i32) as u32 % GEN_DSS_PER_GSLICE;
+    let subslice = intel_sseu_find_first_xehp_dss(sseu, GEN_DSS_PER_GSLICE as i32, slice as i32)
+        as u32
+        % GEN_DSS_PER_GSLICE;
     __add_mcr_wa(gt, wal, slice, subslice);
     __set_mcr_steering(wal, MCFG_MCR_SELECTOR, 0, 2);
     __set_mcr_steering(wal, SF_MCR_SELECTOR, 0, 2);
@@ -1386,7 +1404,12 @@ unsafe fn xelpg_whitelist_build(engine: *mut IntelEngineCs) {
 pub(crate) unsafe fn intel_engine_init_whitelist(engine: *mut IntelEngineCs) {
     let i915 = (*engine).i915;
     let w = &mut (*engine).whitelist;
-    wa_init_start(w, (*engine).gt, c"whitelist".as_ptr(), (*engine).name.as_ptr());
+    wa_init_start(
+        w,
+        (*engine).gt,
+        c"whitelist".as_ptr(),
+        (*engine).name.as_ptr(),
+    );
     if (*(*engine).gt).type_ == GT_MEDIA { /* none yet */
     } else if IS_GFX_GT_IP_RANGE((*engine).gt, IP_VER(12, 70), IP_VER(12, 74)) {
         xelpg_whitelist_build(engine);
@@ -1845,7 +1868,12 @@ unsafe fn engine_init_workarounds(engine: *mut IntelEngineCs, wal: *mut I915WaLi
 // upstream: intel_workarounds.c intel_engine_init_workarounds()
 pub(crate) unsafe fn intel_engine_init_workarounds(engine: *mut IntelEngineCs) {
     let wal = &mut (*engine).wa_list;
-    wa_init_start(wal, (*engine).gt, c"engine".as_ptr(), (*engine).name.as_ptr());
+    wa_init_start(
+        wal,
+        (*engine).gt,
+        c"engine".as_ptr(),
+        (*engine).name.as_ptr(),
+    );
     engine_init_workarounds(engine, wal);
     wa_init_finish(wal);
 }
@@ -2075,7 +2103,13 @@ unsafe fn engine_wa_list_verify(
                 for i in 0..(*wal).count {
                     let wa = &*(*wal).list.add(i as usize);
                     if !mcr_range((*rq).i915, i915_mmio_reg_offset(wa.reg()))
-                        && !wa_verify((*wal).gt, wa, *results.cast::<u32>().add(i as usize), (*wal).name, from)
+                        && !wa_verify(
+                            (*wal).gt,
+                            wa,
+                            *results.cast::<u32>().add(i as usize),
+                            (*wal).name,
+                            from,
+                        )
                     {
                         err = -ENXIO;
                     }

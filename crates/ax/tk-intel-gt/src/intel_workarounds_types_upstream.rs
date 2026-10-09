@@ -32,6 +32,7 @@ pub struct I915McrRegT {
 pub type i915_mcr_reg_t = I915McrRegT;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub union I915WaReg {
     pub reg: I915RegT,
     pub mcr_reg: I915McrRegT,
@@ -41,6 +42,7 @@ pub union I915WaReg {
 /// 32-bit storage word at offset 16. The unassigned bits are preserved by
 /// read/modify/write operations through `flags`.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct I915Wa {
     pub reg: I915WaReg,
     pub clr: u32,

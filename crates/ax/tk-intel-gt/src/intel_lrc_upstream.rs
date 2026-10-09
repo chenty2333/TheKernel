@@ -9,15 +9,41 @@
 use core::{ffi::c_void, mem::size_of};
 
 use crate::{
+    i915_gem_object_api_upstream::{i915_gem_object_lock, i915_gem_object_unpin_map},
+    i915_gem_object_header_upstream::i915_gem_object_put,
+    i915_gem_object_upstream::i915_gem_object_set_cache_coherency,
+    i915_gem_pages_upstream::{
+        __i915_gem_object_flush_map, __i915_gem_object_release_map, i915_gem_object_pin_map,
+        page_mask_bits, page_unmask_bits,
+    },
+    i915_gem_shmem_upstream::i915_gem_object_create_shmem,
+    i915_gem_ww_upstream::{
+        I915GemWwCtx, i915_gem_ww_ctx_backoff, i915_gem_ww_ctx_fini, i915_gem_ww_ctx_init,
+    },
     i915_request_types_upstream::*,
     i915_scheduler_types_upstream::*,
+    i915_vma_api_upstream::{
+        i915_ggtt_pin, i915_vma_get, i915_vma_instance, i915_vma_is_pinned, i915_vma_offset,
+        i915_vma_put, i915_vma_unpin, i915_vma_unpin_and_release,
+    },
+    intel_context_api_upstream::intel_context_has_own_state,
     intel_context_types_upstream::*,
     intel_context_upstream::*,
     intel_engine_cs_upstream::*,
     intel_engine_types_upstream::{I915WaCtxBb, IntelEngineCs, intel_engine_has_relative_mmio},
+    intel_gt_api_upstream::{
+        intel_gt_coherent_map_type, intel_gt_needs_wa_22016122933, intel_gt_scratch_offset,
+    },
     intel_gt_types_upstream::IntelGt,
+    intel_gtt_api_upstream::{
+        I915Ppgtt, i915_ggtt_has_aperture, i915_is_ggtt, i915_vm_is_4lvl, i915_vm_to_ggtt,
+        i915_vm_to_ppgtt,
+    },
     intel_ring::{CACHELINE_BYTES, PAGE_SIZE},
+    intel_ring_upstream::{intel_engine_create_ring, intel_ring_put, intel_ring_reset},
+    intel_sseu_types_upstream::intel_sseu_make_rpcs,
     intel_timeline_types_upstream::IntelTimeline,
+    intel_timeline_upstream::{intel_timeline_create, intel_timeline_create_from_engine},
     linux::average::ewma_runtime_add,
     linux_config::*,
     linux_list::*,
@@ -862,7 +888,7 @@ unsafe fn lrc_ring_mi_mode(engine: *const IntelEngineCs) -> i32 {
         0x60
     } else if graphics_ver((*engine).i915) >= 9 {
         0x54
-    } else if (*engine).class == RENDER_CLASS {
+    } else if (*engine).class == RENDER_CLASS as u8 {
         0x58
     } else {
         -1
@@ -877,7 +903,7 @@ unsafe fn lrc_ring_bb_offset(engine: *const IntelEngineCs) -> i32 {
         0x70
     } else if graphics_ver((*engine).i915) >= 9 {
         0x64
-    } else if graphics_ver((*engine).i915) >= 8 && (*engine).class == RENDER_CLASS {
+    } else if graphics_ver((*engine).i915) >= 8 && (*engine).class == RENDER_CLASS as u8 {
         0xc4
     } else {
         -1
@@ -892,7 +918,7 @@ unsafe fn lrc_ring_gpr0(engine: *const IntelEngineCs) -> i32 {
         0x74
     } else if graphics_ver((*engine).i915) >= 9 {
         0x68
-    } else if (*engine).class == RENDER_CLASS {
+    } else if (*engine).class == RENDER_CLASS as u8 {
         0xd8
     } else {
         -1
@@ -903,7 +929,7 @@ unsafe fn lrc_ring_gpr0(engine: *const IntelEngineCs) -> i32 {
 unsafe fn lrc_ring_wa_bb_per_ctx(engine: *const IntelEngineCs) -> i32 {
     if graphics_ver((*engine).i915) >= 12 {
         0x12
-    } else if graphics_ver((*engine).i915) >= 9 || (*engine).class == RENDER_CLASS {
+    } else if graphics_ver((*engine).i915) >= 9 || (*engine).class == RENDER_CLASS as u8 {
         0x18
     } else {
         -1
@@ -933,7 +959,7 @@ unsafe fn lrc_ring_cmd_buf_cctl(engine: *const IntelEngineCs) -> i32 {
     if graphics_ver_full((*engine).i915) >= IP_VER(12, 55) {
         // CSFE has a dummy CMD_BUF_CCTL slot to match the RCS image layout.
         0xc6
-    } else if (*engine).class != RENDER_CLASS {
+    } else if (*engine).class != RENDER_CLASS as u8 {
         -1
     } else if graphics_ver((*engine).i915) >= 12 {
         0xb6
@@ -982,7 +1008,7 @@ unsafe fn lrc_setup_indirect_ctx(
     GEM_BUG_ON!(!IS_ALIGNED(size, CACHELINE_BYTES));
     let ptr = lrc_ring_indirect_ptr(engine);
     GEM_BUG_ON!(ptr == -1);
-    *regs.add((ptr + 1) as usize) = ctx_bb_ggtt_addr | (size / CACHELINE_BYTES);
+    *regs.add((ptr + 1) as usize) = ctx_bb_ggtt_addr | (size / CACHELINE_BYTES as u32);
 
     let offset = lrc_ring_indirect_offset(engine);
     GEM_BUG_ON!(offset == -1);
@@ -994,10 +1020,11 @@ unsafe fn ctx_needs_runalone(ce: *const IntelContext) -> bool {
     let mut ctx_is_protected = false;
     // Wa_14019159160 - Case 2. Protected PXP contexts need LRC run-alone mode.
     if graphics_ver_full((*(*ce).engine).i915) >= IP_VER(12, 70)
-        && ((*(*ce).engine).class == COMPUTE_CLASS || (*(*ce).engine).class == RENDER_CLASS)
+        && ((*(*ce).engine).class == COMPUTE_CLASS as u8
+            || (*(*ce).engine).class == RENDER_CLASS as u8)
     {
         rcu_read_lock();
-        let gem_ctx = rcu_dereference((*ce).gem_context);
+        let gem_ctx = rcu_dereference!((*ce).gem_context);
         if !gem_ctx.is_null() {
             ctx_is_protected = (*gem_ctx).uses_protected_content;
         }
@@ -1069,7 +1096,7 @@ unsafe fn init_ppgtt_regs(regs: *mut u32, ppgtt: *const I915Ppgtt) {
 // upstream: intel_lrc.c vm_alias()
 unsafe fn vm_alias(vm: *mut I915AddressSpace) -> *mut I915Ppgtt {
     if i915_is_ggtt(vm) {
-        i915_vm_to_ggtt(vm).alias
+        (*i915_vm_to_ggtt(vm)).alias
     } else {
         i915_vm_to_ppgtt(vm)
     }
@@ -1127,7 +1154,11 @@ unsafe fn set_redzone(mut vaddr: *mut c_void, engine: *const IntelEngineCs) {
         .cast::<u8>()
         .add((*engine).context_size as usize)
         .cast::<c_void>();
-    memset(vaddr, CONTEXT_REDZONE as i32, I915_GTT_PAGE_SIZE);
+    memset(
+        vaddr,
+        crate::intel_context_types_upstream::CONTEXT_REDZONE as i32,
+        I915_GTT_PAGE_SIZE,
+    );
 }
 
 // upstream: intel_lrc.c check_redzone()
@@ -1139,7 +1170,13 @@ unsafe fn check_redzone(mut vaddr: *const c_void, engine: *const IntelEngineCs) 
         .cast::<u8>()
         .add((*engine).context_size as usize)
         .cast::<c_void>();
-    if !memchr_inv(vaddr, CONTEXT_REDZONE as i32, I915_GTT_PAGE_SIZE).is_null() {
+    if !memchr_inv(
+        vaddr,
+        crate::intel_context_types_upstream::CONTEXT_REDZONE as i32,
+        I915_GTT_PAGE_SIZE,
+    )
+    .is_null()
+    {
         drm_err_once!(
             &(*(*engine).i915).drm,
             "%s context redzone overwritten!\n",
@@ -1150,7 +1187,7 @@ unsafe fn check_redzone(mut vaddr: *const c_void, engine: *const IntelEngineCs) 
 
 // upstream: intel_lrc.c context_wa_bb_offset()
 unsafe fn context_wa_bb_offset(ce: *const IntelContext) -> u32 {
-    PAGE_SIZE as u32 * (*ce).wa_bb_page
+    PAGE_SIZE as u32 * (*ce).wa_bb_page as u32
 }
 
 // upstream: intel_lrc.c context_wabb()
@@ -1210,7 +1247,7 @@ unsafe fn setup_predicate_disable_wa(ce: *const IntelContext, mut cs: *mut u32) 
     // If predication is active, this will be noop'ed.
     *cs = MI_STORE_DWORD_IMM_GEN4 | MI_USE_GGTT | (4 - 2);
     cs = cs.add(1);
-    *cs = lrc_indirect_bb(ce) + DG2_PREDICATE_RESULT_WA;
+    *cs = lrc_indirect_bb(ce) + DG2_PREDICATE_RESULT_WA as u32;
     cs = cs.add(1);
     *cs = 0;
     cs = cs.add(1);
@@ -1226,7 +1263,7 @@ unsafe fn setup_predicate_disable_wa(ce: *const IntelContext, mut cs: *mut u32) 
     // Instructions are no longer predicated (disabled), so proceed.
     *cs = MI_STORE_DWORD_IMM_GEN4 | MI_USE_GGTT | (4 - 2);
     cs = cs.add(1);
-    *cs = lrc_indirect_bb(ce) + DG2_PREDICATE_RESULT_WA;
+    *cs = lrc_indirect_bb(ce) + DG2_PREDICATE_RESULT_WA as u32;
     cs = cs.add(1);
     *cs = 0;
     cs = cs.add(1);
@@ -1235,32 +1272,36 @@ unsafe fn setup_predicate_disable_wa(ce: *const IntelContext, mut cs: *mut u32) 
 
     *cs = MI_BATCH_BUFFER_END;
     cs = cs.add(1);
-    GEM_BUG_ON!(offset_in_page(cs) > DG2_PREDICATE_RESULT_WA);
+    GEM_BUG_ON!(offset_in_page(cs as usize) > DG2_PREDICATE_RESULT_WA as usize);
     cs
 }
 
 // upstream: intel_lrc.c __lrc_alloc_state()
 unsafe fn __lrc_alloc_state(ce: *mut IntelContext, engine: *mut IntelEngineCs) -> *mut I915Vma {
-    let mut context_size = round_up((*engine).context_size, I915_GTT_PAGE_SIZE);
+    let mut context_size = round_up((*engine).context_size as usize, I915_GTT_PAGE_SIZE);
     if IS_ENABLED!(CONFIG_DRM_I915_DEBUG_GEM) {
         context_size += I915_GTT_PAGE_SIZE; // for redzone
     }
     if graphics_ver((*engine).i915) >= 12 {
-        (*ce).wa_bb_page = context_size / PAGE_SIZE;
+        (*ce).wa_bb_page = (context_size / PAGE_SIZE) as u8;
         // INDIRECT_CTX and PER_CTX_BB need separate pages.
         context_size += PAGE_SIZE * 2;
     }
     if intel_context_is_parent(ce) && intel_engine_uses_guc(engine) {
-        (*ce).parallel.guc.parent_page = context_size / PAGE_SIZE;
+        (*ce).parallel.guc.parent_page = (context_size / PAGE_SIZE) as u8;
         context_size += PARENT_SCRATCH_SIZE;
     }
 
     let mut obj =
-        i915_gem_object_create_lmem((*engine).i915, context_size, I915_BO_ALLOC_PM_VOLATILE);
+        i915_gem_object_create_lmem(
+            (*engine).i915,
+            context_size as u64,
+            I915_BO_ALLOC_PM_VOLATILE,
+        );
     if IS_ERR(obj) {
-        obj = i915_gem_object_create_shmem((*engine).i915, context_size);
+        obj = i915_gem_object_create_shmem((*engine).i915, context_size as u64);
         if IS_ERR(obj) {
-            return ERR_CAST(obj);
+            return obj.cast::<I915Vma>();
         }
 
         // Wa_22016122933: Media 13.0 shared memory is WC on CPU and UC/PAT2 on GPU.
@@ -1269,7 +1310,11 @@ unsafe fn __lrc_alloc_state(ce: *mut IntelContext, engine: *mut IntelEngineCs) -
         }
     }
 
-    let vma = i915_vma_instance(obj, &(*(*(*engine).gt).ggtt).vm, core::ptr::null_mut());
+    let vma = i915_vma_instance(
+        obj,
+        &mut (*(*(*engine).gt).ggtt).vm,
+        core::ptr::null_mut(),
+    );
     if IS_ERR(vma) {
         i915_gem_object_put(obj);
         return vma;
@@ -1280,7 +1325,7 @@ unsafe fn __lrc_alloc_state(ce: *mut IntelContext, engine: *mut IntelEngineCs) -
 // upstream: intel_lrc.c pinned_timeline()
 unsafe fn pinned_timeline(ce: *mut IntelContext, engine: *mut IntelEngineCs) -> *mut IntelTimeline {
     let tl = fetch_and_zero(&mut (*ce).timeline);
-    intel_timeline_create_from_engine(engine, page_unmask_bits(tl))
+    intel_timeline_create_from_engine(engine, page_unmask_bits(tl) as usize as u32)
 }
 
 // upstream: intel_lrc.c lrc_alloc()
@@ -1295,21 +1340,21 @@ pub(crate) unsafe fn lrc_alloc(ce: *mut IntelContext, engine: *mut IntelEngineCs
         return PTR_ERR(vma);
     }
 
-    let ring = intel_engine_create_ring(engine, (*ce).ring_size);
+    let ring = intel_engine_create_ring(engine, (*ce).ring_size as i32);
     if IS_ERR(ring) {
         let err = PTR_ERR(ring);
         i915_vma_put(vma);
         return err;
     }
 
-    if !page_mask_bits((*ce).timeline).is_null() {
+    if !page_mask_bits((*ce).timeline.cast()).is_null() {
         // Existing pinned timeline is retained.
     } else {
         let tl = if unlikely(!(*ce).timeline.is_null()) {
             // Static global HWSP for kernel context; dynamic cacheline otherwise.
             pinned_timeline(ce, engine)
         } else {
-            intel_timeline_create((*(*engine).gt))
+            intel_timeline_create((*engine).gt)
         };
         if IS_ERR(tl) {
             let err = PTR_ERR(tl);
@@ -1397,7 +1442,7 @@ pub(crate) unsafe fn lrc_fini(ce: *mut IntelContext) {
 
 // upstream: intel_lrc.c lrc_destroy()
 pub(crate) unsafe fn lrc_destroy(kref: *mut Kref) {
-    let ce = container_of!(kref, IntelContext, ref_);
+    let ce = container_of!(kref, IntelContext, r#ref);
     GEM_BUG_ON!(!i915_active_is_idle(&mut (*ce).active));
     GEM_BUG_ON!(intel_context_is_pinned(ce));
     lrc_fini(ce);
@@ -1908,7 +1953,7 @@ pub(crate) unsafe fn lrc_init_wa_ctx(engine: *mut IntelEngineCs) {
         &mut wa_ctx.per_ctx as *mut I915WaCtxBb,
     ];
     let mut wa_bb_fn: [Option<WaBbFunc>; 2] = [None, None];
-    let mut ww = I915GemWwCtx::zeroed();
+    let mut ww = I915GemWwCtx::default();
     let mut batch: *mut c_void;
     let mut batch_ptr: *mut u8;
     let mut i: usize;

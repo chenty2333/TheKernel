@@ -14,6 +14,11 @@ use crate::{
     linux_locks::{spin_lock_irqsave, spin_unlock_irqrestore},
 };
 
+/// `might_sleep()` is compiled out for this Linux 7.2.3 target because
+/// CONFIG_DEBUG_ATOMIC_SLEEP is disabled.
+#[inline]
+pub fn might_sleep() {}
+
 pub const TASK_INTERRUPTIBLE: u32 = 1;
 pub const TASK_UNINTERRUPTIBLE: u32 = 2;
 pub const TASK_RUNNING: u32 = 0;

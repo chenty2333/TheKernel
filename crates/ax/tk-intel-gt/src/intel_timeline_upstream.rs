@@ -32,6 +32,7 @@ use crate::{
     intel_engine_types_upstream::IntelEngineCs,
     intel_gt_types_upstream::IntelGt,
     intel_ring::PAGE_SIZE,
+    intel_ring_upstream::i915_gem_object_create_internal,
     intel_timeline_types_upstream::IntelTimeline,
     linux_config::*,
     linux_list::*,
@@ -49,7 +50,7 @@ unsafe fn hwsp_alloc(gt: *mut IntelGt) -> *mut I915Vma {
     let obj: *mut DrmI915GemObject;
     let vma: *mut I915Vma;
 
-    obj = i915_gem_object_create_internal(i915, PAGE_SIZE);
+    obj = i915_gem_object_create_internal(i915, PAGE_SIZE as u64);
     if IS_ERR(obj) {
         return obj.cast::<I915Vma>();
     }
@@ -138,7 +139,7 @@ unsafe fn intel_timeline_init(
 
     GEM_BUG_ON!((*timeline).hwsp_offset as u64 >= (*hwsp).size);
 
-    (*timeline).fence_context = dma_fence_context_alloc(1);
+    (*timeline).fence_context = crate::linux::requests::dma_fence_context_alloc(1);
 
     mutex_init(&mut (*timeline).mutex);
 
@@ -225,6 +226,12 @@ pub unsafe fn intel_timeline_create_from_engine(
     mutex_unlock(&mut (*(*hwsp).vm).mutex);
 
     tl
+}
+
+// upstream: intel_timeline.h intel_timeline_create()
+#[inline]
+pub unsafe fn intel_timeline_create(gt: *mut IntelGt) -> *mut IntelTimeline {
+    unsafe { __intel_timeline_create(gt, core::ptr::null_mut(), 0) }
 }
 
 // upstream: intel_timeline.c __intel_timeline_pin()

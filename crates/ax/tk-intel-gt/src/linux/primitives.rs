@@ -11,6 +11,18 @@ use core::{
     sync::atomic::{Ordering, fence},
 };
 
+/// Linux `hweight32()`: population count of the low 32 bits.
+#[inline]
+pub const fn hweight32(value: u32) -> u32 {
+    value.count_ones()
+}
+
+/// Linux `hweight8()`: population count of the low eight bits.
+#[inline]
+pub const fn hweight8(value: u8) -> u32 {
+    value.count_ones()
+}
+
 pub trait LinuxUnsigned: Copy + Ord {
     const ZERO: Self;
     const ONE: Self;

@@ -45,7 +45,17 @@ use core::{
 
 use kernel_guard::{BaseGuard, IrqSave, NoPreempt};
 
-use crate::intel_engine_cs_upstream::Spinlock;
+use crate::{intel_context_upstream::PinCookie, intel_engine_cs_upstream::Spinlock};
+
+/// `lockdep_pin_lock()` is a no-op in the target's CONFIG_LOCKDEP=n build.
+#[inline]
+pub fn lockdep_pin_lock<T>(_lock: &mut T) -> PinCookie {
+    PinCookie
+}
+
+/// `lockdep_unpin_lock()` is a no-op in the target's CONFIG_LOCKDEP=n build.
+#[inline]
+pub fn lockdep_unpin_lock<T>(_lock: &mut T, _cookie: PinCookie) {}
 
 #[cfg(all(target_os = "none", not(target_arch = "x86_64")))]
 compile_error!("the translated i915 GT spinlock layout is the wt-dev x86_64 layout");
@@ -268,6 +278,22 @@ pub fn local_irq_enable() {
     }
     #[cfg(not(target_os = "none"))]
     {}
+}
+
+/// Query x86's IF bit without changing interrupt state.
+#[inline]
+pub fn irqs_disabled() -> bool {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        let flags: usize;
+        // SAFETY: reading RFLAGS does not modify architectural state.
+        unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) flags) };
+        flags & (1 << 9) == 0
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    {
+        false
+    }
 }
 
 /// Acquire a spin lock through a Linux-style raw pointer.

@@ -32,6 +32,19 @@ use crate::{
 /// `I915_VMA_RELEASE_MAP` from `i915_vma.h:48-49`.
 pub const I915_VMA_RELEASE_MAP: u32 = 1 << 0;
 
+// upstream: i915_vma.h __i915_vma_offset()
+#[inline]
+pub unsafe fn __i915_vma_offset(vma: *const I915Vma) -> u64 {
+    unsafe { (*vma).node.start + (*vma).guard as u64 }
+}
+
+// upstream: i915_vma.h i915_vma_offset()
+#[inline]
+pub unsafe fn i915_vma_offset(vma: *const I915Vma) -> u64 {
+    GEM_BUG_ON!(!unsafe { crate::linux::gem_memory::drm_mm_node_allocated(&(*vma).node) });
+    unsafe { __i915_vma_offset(vma) }
+}
+
 unsafe extern "C" {
     /// `i915_vma_instance()` (`i915_vma.h:43-46`).
     pub fn i915_vma_instance(

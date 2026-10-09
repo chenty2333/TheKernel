@@ -6,7 +6,7 @@
 
 #![allow(unsafe_code)]
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use kernel_guard::BaseGuard;
 
@@ -14,6 +14,7 @@ use crate::intel_context_upstream::RcuHead;
 
 static RCU_READERS: AtomicUsize = AtomicUsize::new(0);
 static RCU_PENDING: AtomicUsize = AtomicUsize::new(0);
+static RCU_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 pub fn rcu_read_lock() {
@@ -25,7 +26,29 @@ pub fn rcu_read_lock() {
 pub fn rcu_read_unlock() {
     let old = RCU_READERS.fetch_sub(1, Ordering::Release);
     assert!(old != 0, "unbalanced rcu_read_unlock");
+    if old == 1 {
+        RCU_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
     kernel_guard::NoPreempt::release(());
+}
+
+/// Snapshot the current quiescent-state epoch for `cond_synchronize_rcu()`.
+#[inline]
+pub fn get_state_synchronize_rcu() -> u64 {
+    RCU_EPOCH.load(Ordering::Acquire)
+}
+
+/// Wait for readers from the observed epoch to leave. The implementation is
+/// deliberately conservative: it waits for an empty reader population before
+/// advancing the epoch, which is stronger than Linux's queued grace period.
+pub fn cond_synchronize_rcu(state: u64) {
+    if RCU_EPOCH.load(Ordering::Acquire) != state {
+        return;
+    }
+    while RCU_READERS.load(Ordering::Acquire) != 0 {
+        axtask::yield_now();
+    }
+    RCU_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Header initializer for `struct rcu_head`.

@@ -138,6 +138,18 @@ pub unsafe fn list_add_rcu(new: *mut ListHead, head: *mut ListHead) {
     (*next).prev = new;
 }
 
+/// Add an entry to the tail of an RCU-visible list, preserving the kernel's
+/// publication order for readers that traverse from the head.
+#[inline]
+pub unsafe fn list_add_tail_rcu(new: *mut ListHead, head: *mut ListHead) {
+    let prev = (*head).prev;
+    (*new).next = head;
+    (*new).prev = prev;
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+    (*prev).next = new;
+    (*head).prev = new;
+}
+
 pub unsafe fn list_del_rcu(entry: *mut ListHead) {
     let next = (*entry).next;
     let prev = (*entry).prev;
@@ -216,15 +228,15 @@ macro_rules! llist_entry {
 macro_rules! list_first_entry {
     ($head:expr, $container:ty, $($member:tt)+) => {{
         let head = ($head) as *const _ as *mut $crate::intel_engine_cs_upstream::ListHead;
-        container_of!((*head).next, $container, $($member)+)
+        unsafe { container_of!((*head).next, $container, $($member)+) }
     }};
 }
 
 macro_rules! list_first_entry_or_null {
     ($head:expr, $container:ty, $($member:tt)+) => {{
         let head = ($head) as *const _ as *mut $crate::intel_engine_cs_upstream::ListHead;
-        if core::ptr::eq((*head).next, head) { core::ptr::null_mut() }
-        else { container_of!((*head).next, $container, $($member)+) }
+        if unsafe { core::ptr::eq((*head).next, head) } { core::ptr::null_mut() }
+        else { unsafe { container_of!((*head).next, $container, $($member)+) } }
     }};
 }
 
@@ -303,7 +315,7 @@ macro_rules! priolist_for_each_request_consume {
         list_for_each_entry_safe!(
             $request,
             $next,
-            unsafe { core::ptr::addr_of_mut!((*__priolist).requests) },
+            unsafe { core::ptr::addr_of!((*__priolist).requests) as *mut _ },
             sched.link,
             $body
         );
@@ -427,7 +439,7 @@ macro_rules! for_each_child_safe {
         let mut $child: *mut $crate::intel_context_upstream::IntelContext = core::ptr::null_mut();
         let mut $next: *mut $crate::intel_context_upstream::IntelContext = core::ptr::null_mut();
         let head = unsafe {
-            core::ptr::addr_of_mut!((*$parent).parallel.children.child_list)
+            core::ptr::addr_of!((*$parent).parallel.children.child_list) as *mut _
                 as *mut $crate::intel_engine_cs_upstream::ListHead
         };
         list_for_each_entry_safe!($child, $next, head, parallel.children.child_link, $body);

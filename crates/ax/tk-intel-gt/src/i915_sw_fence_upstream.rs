@@ -134,7 +134,7 @@ pub unsafe fn i915_sw_fence_fini(fence: *mut I915SwFence) {
 
 // Linux 7.2.3 include/linux/gfp.h inline helper for the supplied config.
 #[inline]
-fn gfpflags_allow_blocking(gfp: c_ulong) -> bool {
+pub(crate) fn gfpflags_allow_blocking(gfp: c_ulong) -> bool {
     let flags = gfp as u32;
     flags & (1 << 10) != 0 && flags & GFP_ATOMIC != GFP_ATOMIC
 }
@@ -288,6 +288,15 @@ pub unsafe fn __i915_sw_fence_init(
         (*fence).fn_ = fn_;
         i915_sw_fence_reinit(fence);
     }
+}
+
+/// Lockdep-disabled `i915_sw_fence_init()` header wrapper. The configured
+/// target discards the optional source name and class key in the common body.
+pub unsafe fn i915_sw_fence_init(
+    fence: *mut I915SwFence,
+    fn_: Option<unsafe extern "C" fn(*mut I915SwFence, I915SwFenceNotify) -> c_int>,
+) {
+    unsafe { __i915_sw_fence_init(fence, fn_, core::ptr::null(), core::ptr::null_mut()) }
 }
 
 // upstream: i915_sw_fence.c i915_sw_fence_reinit()

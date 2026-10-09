@@ -82,6 +82,13 @@ pub fn clear_bit<I: BitIndex, W: BitWord>(bit: I, word: &mut W) {
     let _ = W::fetch_and(word, !(1u64 << bit));
 }
 
+/// Release-ordered Linux `clear_bit_unlock()` primitive.
+#[inline]
+pub fn clear_bit_unlock<I: BitIndex, W: BitWord>(bit: I, word: &mut W) {
+    let bit = bit.index() % (core::mem::size_of::<W>() as u32 * 8);
+    let _ = W::fetch_and(word, !(1u64 << bit));
+}
+
 #[inline]
 pub fn test_and_set_bit<I: BitIndex, W: BitWord>(bit: I, word: &mut W) -> bool {
     let bit = bit.index() % (core::mem::size_of::<W>() as u32 * 8);

@@ -27,14 +27,23 @@ pub use crate::intel_engine_types_upstream::{
     VECS2, VECS3, VIDEO_DECODE_CLASS, VIDEO_ENHANCEMENT_CLASS, VIRTUAL_ENGINES,
 };
 use crate::{
+    i915_gem_context_upstream::fput,
+    i915_gem_object_header_upstream::{
+        assert_object_held, i915_gem_object_has_pages, i915_gem_object_lock, i915_gem_object_put,
+        i915_gem_object_unpin_map,
+    },
     i915_gem_object_types_upstream::DrmI915GemObject,
     i915_gem_object_upstream::i915_gem_object_set_cache_coherency,
+    i915_gem_pages_upstream::{i915_gem_object_pin_map, page_pack_bits},
+    i915_gem_ww_upstream::{i915_gem_ww_ctx_backoff, i915_gem_ww_ctx_fini, i915_gem_ww_ctx_init},
     i915_request_types_upstream::*,
+    i915_request_upstream::i915_request_slab_cache,
     i915_scheduler_types_upstream::*,
+    i915_scheduler_upstream::i915_sched_engine_create,
     i915_vma_api_upstream::*,
     intel_breadcrumbs_types_upstream::IntelBreadcrumbs,
     intel_breadcrumbs_upstream::intel_engine_print_breadcrumbs,
-    intel_context_types_upstream::*,
+    intel_context_types_upstream::{IntelWakerefT, *},
     intel_context_upstream::*,
     intel_engine_regs_upstream,
     intel_execlists_submission_upstream::{
@@ -43,10 +52,16 @@ use crate::{
     },
     intel_gt_api_upstream::intel_gt_check_and_clear_faults,
     intel_gt_mcr_upstream::*,
+    intel_gtt_api_upstream::{
+        i915_ggtt_has_aperture, i915_ggtt_require_binder, i915_vm_get, i915_vm_put,
+    },
+    intel_guc_fwif_types_upstream::{
+        MAKE_GUC_ID, engine_class_to_guc_class, guc_policy_max_preempt_timeout_ms,
+    },
     intel_guc_submission_types_upstream::{
         intel_guc_dump_active_requests, intel_guc_submission_is_wanted, intel_guc_submission_setup,
     },
-    intel_ring::intel_ring_update_space,
+    intel_ring_upstream::{i915_gem_object_create_internal, intel_ring_update_space},
     intel_sseu_types_upstream::{
         SseuDevInfo, intel_slicemask_from_xehp_dssmask, intel_sseu_from_device_info,
     },
@@ -65,6 +80,7 @@ use crate::{
     linux::{
         average::{ewma__engine_latency_init, ewma__engine_latency_read},
         i915::{CCS_MASK, HAS_ENGINE, HAS_EXECLISTS, RCS_MASK, VDBOX_MASK, VEBOX_MASK},
+        primitives::hweight32,
     },
     linux_config::*,
     linux_heap::kmem_cache_free,
@@ -256,12 +272,12 @@ struct MeasureBreadcrumb {
     cs: [u32; 2048],
 }
 
-const HSW_CXT_TOTAL_SIZE: u32 = 17 * PAGE_SIZE;
-const DEFAULT_LR_CONTEXT_RENDER_SIZE: u32 = 22 * PAGE_SIZE;
-const GEN8_LR_CONTEXT_RENDER_SIZE: u32 = 20 * PAGE_SIZE;
-const GEN9_LR_CONTEXT_RENDER_SIZE: u32 = 22 * PAGE_SIZE;
-const GEN11_LR_CONTEXT_RENDER_SIZE: u32 = 14 * PAGE_SIZE;
-const GEN8_LR_CONTEXT_OTHER_SIZE: u32 = 2 * PAGE_SIZE;
+const HSW_CXT_TOTAL_SIZE: u32 = 17 * PAGE_SIZE as u32;
+const DEFAULT_LR_CONTEXT_RENDER_SIZE: u32 = 22 * PAGE_SIZE as u32;
+const GEN8_LR_CONTEXT_RENDER_SIZE: u32 = 20 * PAGE_SIZE as u32;
+const GEN9_LR_CONTEXT_RENDER_SIZE: u32 = 22 * PAGE_SIZE as u32;
+const GEN11_LR_CONTEXT_RENDER_SIZE: u32 = 14 * PAGE_SIZE as u32;
+const GEN8_LR_CONTEXT_OTHER_SIZE: u32 = 2 * PAGE_SIZE as u32;
 const MAX_MMIO_BASES: usize = 3;
 // C stores this enum's values in the header's u8 engine-info class field;
 // these aliases preserve the cast required at the Rust ABI boundary.
@@ -290,7 +306,7 @@ const EMPTY_ENGINE_MMIO_BASE: EngineMmioBase = EngineMmioBase {
     base: 0,
 };
 
-static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
+static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES as usize] = [
     EngineInfo {
         class: RENDER_CLASS as u8,
         instance: 0,
@@ -617,7 +633,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
     },
     EngineInfo {
         class: OTHER_CLASS as u8,
-        instance: OTHER_GSC_INSTANCE,
+        instance: OTHER_GSC_INSTANCE as u8,
         mmio_bases: [
             EngineMmioBase {
                 graphics_ver: 12,
@@ -646,12 +662,12 @@ pub unsafe fn intel_engine_context_size(gt: *mut IntelGt, class: u8) -> u32 {
                     HSW_CXT_TOTAL_SIZE
                 } else {
                     cxt_size = intel_uncore_read(uncore, GEN7_CXT_SIZE);
-                    round_up(GEN7_CXT_TOTAL_SIZE(cxt_size) * 64, PAGE_SIZE)
+                    round_up(GEN7_CXT_TOTAL_SIZE(cxt_size) * 64, PAGE_SIZE as u32)
                 }
             }
             6 => {
                 cxt_size = intel_uncore_read(uncore, CXT_SIZE);
-                round_up(GEN6_CXT_TOTAL_SIZE(cxt_size) * 64, PAGE_SIZE)
+                round_up(GEN6_CXT_TOTAL_SIZE(cxt_size) * 64, PAGE_SIZE as u32)
             }
             5 | 4 => {
                 cxt_size = intel_uncore_read(uncore, CXT_SIZE) + 1;
@@ -662,7 +678,7 @@ pub unsafe fn intel_engine_context_size(gt: *mut IntelGt, class: u8) -> u32 {
                     cxt_size * 64,
                     cxt_size - 1,
                 );
-                round_up(cxt_size * 64, PAGE_SIZE)
+                round_up(cxt_size * 64, PAGE_SIZE as u32)
             }
             3 | 2 | 1 => 0,
             ver => {
@@ -717,7 +733,7 @@ unsafe fn __sprint_engine_name(engine: *mut IntelEngineCs) {
             "%s'%u",
             intel_engine_class_repr((*engine).class),
             (*engine).instance,
-        ) >= size_of_val(&(*engine).name),
+        ) >= size_of_val(&(*engine).name) as i32,
     );
 }
 
@@ -730,7 +746,7 @@ pub unsafe fn intel_engine_set_hwsp_writemask(engine: *mut IntelEngineCs, mask: 
     if GRAPHICS_VER((*engine).i915) >= 3 {
         ENGINE_WRITE!(engine, intel_engine_regs_upstream::RING_HWSTAM, mask);
     } else {
-        ENGINE_WRITE16!(engine, intel_engine_regs_upstream::RING_HWSTAM, mask);
+        ENGINE_WRITE16!(engine, intel_engine_regs_upstream::RING_HWSTAM, mask as u16);
     }
 }
 
@@ -740,7 +756,7 @@ unsafe fn intel_engine_sanitize_mmio(engine: *mut IntelEngineCs) {
 }
 
 // upstream: intel_engine_cs.c nop_irq_handler()
-unsafe fn nop_irq_handler(engine: *mut IntelEngineCs, iir: u16) {
+unsafe extern "C" fn nop_irq_handler(engine: *mut IntelEngineCs, iir: u16) {
     GEM_DEBUG_WARN_ON!(iir);
 }
 
@@ -794,26 +810,27 @@ unsafe fn get_reset_domain(ver: u8, id: IntelEngineId) -> u32 {
 
 // upstream: intel_engine_cs.c intel_engine_setup()
 unsafe fn intel_engine_setup(gt: *mut IntelGt, id: IntelEngineId, logical_instance: u8) -> i32 {
-    let info = &INTEL_ENGINES[id];
+    let info = &INTEL_ENGINES[id as usize];
     let i915 = (*gt).i915;
     let mut engine: *mut IntelEngineCs;
     let guc_class: u8;
 
     BUILD_BUG_ON!(MAX_ENGINE_CLASS >= BIT!(GEN11_ENGINE_CLASS_WIDTH));
     BUILD_BUG_ON!(MAX_ENGINE_INSTANCE >= BIT!(GEN11_ENGINE_INSTANCE_WIDTH));
-    BUILD_BUG_ON!(I915_MAX_VCS > (MAX_ENGINE_INSTANCE + 1));
-    BUILD_BUG_ON!(I915_MAX_VECS > (MAX_ENGINE_INSTANCE + 1));
+    BUILD_BUG_ON!(I915_MAX_VCS as usize > (MAX_ENGINE_INSTANCE as usize + 1));
+    BUILD_BUG_ON!(I915_MAX_VECS as usize > (MAX_ENGINE_INSTANCE as usize + 1));
 
-    if GEM_DEBUG_WARN_ON!(id >= ARRAY_SIZE((*gt).engine)) {
+    if GEM_DEBUG_WARN_ON!(id as usize >= ARRAY_SIZE((*gt).engine)) {
         return -EINVAL;
     }
-    if GEM_DEBUG_WARN_ON!(info.class > MAX_ENGINE_CLASS) {
+    if GEM_DEBUG_WARN_ON!(info.class as i32 > MAX_ENGINE_CLASS) {
         return -EINVAL;
     }
-    if GEM_DEBUG_WARN_ON!(info.instance > MAX_ENGINE_INSTANCE) {
+    if GEM_DEBUG_WARN_ON!(info.instance as i32 > MAX_ENGINE_INSTANCE) {
         return -EINVAL;
     }
-    if GEM_DEBUG_WARN_ON!((*gt).engine_class[info.class][info.instance].is_null()) {
+    if GEM_DEBUG_WARN_ON!((*gt).engine_class[info.class as usize][info.instance as usize].is_null())
+    {
         return -EINVAL;
     }
 
@@ -827,13 +844,13 @@ unsafe fn intel_engine_setup(gt: *mut IntelGt, id: IntelEngineId, logical_instan
     INIT_LIST_HEAD!(&mut (*engine).pinned_contexts_list);
     (*engine).id = id;
     (*engine).legacy_idx = INVALID_ENGINE;
-    (*engine).mask = BIT!(id);
+    (*engine).mask = BIT!(id as usize);
     (*engine).reset_domain = get_reset_domain(GRAPHICS_VER((*gt).i915), id);
     (*engine).i915 = i915;
     (*engine).gt = gt;
     (*engine).uncore = (*gt).uncore;
     guc_class = engine_class_to_guc_class(info.class);
-    (*engine).guc_id = MAKE_GUC_ID(guc_class, info.instance);
+    (*engine).guc_id = MAKE_GUC_ID(guc_class as u32, info.instance as u32);
     (*engine).mmio_base = __engine_mmio_base(i915, info.mmio_bases.as_ptr());
 
     (*engine).irq_handler = Some(nop_irq_handler);
@@ -844,7 +861,7 @@ unsafe fn intel_engine_setup(gt: *mut IntelGt, id: IntelEngineId, logical_instan
     __sprint_engine_name(engine);
 
     if ((*engine).class as i32 == COMPUTE_CLASS || (*engine).class as i32 == RENDER_CLASS)
-        && __ffs(CCS_MASK((*engine).gt) | RCS_MASK((*engine).gt)) == (*engine).instance
+        && __ffs(CCS_MASK((*engine).gt) | RCS_MASK((*engine).gt)) as u8 == (*engine).instance
     {
         (*engine).flags |= I915_ENGINE_FIRST_RENDER_COMPUTE;
     }
@@ -903,8 +920,8 @@ unsafe fn intel_engine_setup(gt: *mut IntelGt, id: IntelEngineId, logical_instan
 
     intel_engine_sanitize_mmio(engine);
 
-    (*gt).engine_class[info.class][info.instance] = engine;
-    (*gt).engine[id] = engine;
+    (*gt).engine_class[info.class as usize][info.instance as usize] = engine;
+    (*gt).engine[id as usize] = engine;
 
     0
 }
@@ -923,7 +940,7 @@ pub unsafe fn intel_clamp_max_busywait_duration_ns(
     _engine: *mut IntelEngineCs,
     mut value: u64,
 ) -> u64 {
-    value = core::cmp::min(value, jiffies_to_nsecs(2));
+    value = core::cmp::min(value, jiffies_to_nsecs(2u32));
     value
 }
 
@@ -1022,7 +1039,10 @@ pub unsafe fn intel_engine_free_request_pool(engine: *mut IntelEngineCs) {
         return;
     }
 
-    kmem_cache_free(i915_request_slab_cache(), (*engine).request_pool);
+    kmem_cache_free(
+        i915_request_slab_cache(),
+        (*engine).request_pool.cast::<c_void>(),
+    );
 }
 
 // upstream: intel_engine_cs.c intel_engines_free()
@@ -1035,7 +1055,7 @@ pub unsafe fn intel_engines_free(gt: *mut IntelGt) {
     for_each_engine!(engine, id, gt, {
         intel_engine_free_request_pool(engine);
         kfree(engine);
-        (*gt).engine[id] = core::ptr::null_mut();
+        (*gt).engine[id as usize] = core::ptr::null_mut();
     });
 }
 
@@ -1062,8 +1082,8 @@ unsafe fn gen11_vdbox_has_sfc(
 // upstream: intel_engine_cs.c engine_mask_apply_media_fuses()
 unsafe fn engine_mask_apply_media_fuses(gt: *mut IntelGt) {
     let i915 = (*gt).i915;
-    let mut logical_vdbox = 0;
-    let mut i;
+    let mut logical_vdbox = 0u32;
+    let mut i: usize;
     let mut media_fuse: u32;
     let mut fuse1: u32;
     let mut vdbox_mask: u16;
@@ -1078,30 +1098,30 @@ unsafe fn engine_mask_apply_media_fuses(gt: *mut IntelGt) {
         media_fuse = !media_fuse;
     }
 
-    vdbox_mask = REG_FIELD_GET(GEN11_GT_VDBOX_DISABLE_MASK, media_fuse);
-    vebox_mask = REG_FIELD_GET(GEN11_GT_VEBOX_DISABLE_MASK, media_fuse);
+    vdbox_mask = REG_FIELD_GET(GEN11_GT_VDBOX_DISABLE_MASK, media_fuse) as u16;
+    vebox_mask = REG_FIELD_GET(GEN11_GT_VEBOX_DISABLE_MASK, media_fuse) as u16;
 
     if MEDIA_VER_FULL(i915) >= IP_VER(12, 55) {
         fuse1 = intel_uncore_read((*gt).uncore, HSW_PAVP_FUSE1);
-        (*gt).info.sfc_mask = REG_FIELD_GET(XEHP_SFC_ENABLE_MASK, fuse1);
+        (*gt).info.sfc_mask = REG_FIELD_GET(XEHP_SFC_ENABLE_MASK, fuse1) as u8;
     } else {
         (*gt).info.sfc_mask = !0;
     }
 
     for i in 0..I915_MAX_VCS {
-        if !HAS_ENGINE(gt, _VCS(i)) {
-            vdbox_mask &= !BIT!(i);
+        if !HAS_ENGINE(gt, _VCS(i as i32)) {
+            vdbox_mask &= !(BIT!(i) as u16);
             continue;
         }
 
         if (BIT!(i) & vdbox_mask) == 0 {
-            (*gt).info.engine_mask &= !BIT!(_VCS(i));
+            (*gt).info.engine_mask &= !BIT!(_VCS(i as i32));
             gt_dbg!(gt, "vcs%u fused off\n", i);
             continue;
         }
 
-        if gen11_vdbox_has_sfc(gt, i, logical_vdbox, vdbox_mask) {
-            (*gt).info.vdbox_sfc_access |= BIT!(i);
+        if gen11_vdbox_has_sfc(gt, i as u32, logical_vdbox as u32, vdbox_mask) {
+            (*gt).info.vdbox_sfc_access |= BIT!(i) as u8;
         }
         logical_vdbox += 1;
     }
@@ -1111,16 +1131,16 @@ unsafe fn engine_mask_apply_media_fuses(gt: *mut IntelGt) {
         vdbox_mask,
         VDBOX_MASK(gt)
     );
-    GEM_BUG_ON!(vdbox_mask != VDBOX_MASK(gt));
+    GEM_BUG_ON!(vdbox_mask as u32 != VDBOX_MASK(gt));
 
     for i in 0..I915_MAX_VECS {
-        if !HAS_ENGINE(gt, _VECS(i)) {
-            vebox_mask &= !BIT!(i);
+        if !HAS_ENGINE(gt, _VECS(i as i32)) {
+            vebox_mask &= !(BIT!(i) as u16);
             continue;
         }
 
         if (BIT!(i) & vebox_mask) == 0 {
-            (*gt).info.engine_mask &= !BIT!(_VECS(i));
+            (*gt).info.engine_mask &= !BIT!(_VECS(i as i32));
             gt_dbg!(gt, "vecs%u fused off\n", i);
         }
     }
@@ -1130,28 +1150,29 @@ unsafe fn engine_mask_apply_media_fuses(gt: *mut IntelGt) {
         vebox_mask,
         VEBOX_MASK(gt)
     );
-    GEM_BUG_ON!(vebox_mask != VEBOX_MASK(gt));
+    GEM_BUG_ON!(vebox_mask as u32 != VEBOX_MASK(gt));
 }
 
 // upstream: intel_engine_cs.c engine_mask_apply_compute_fuses()
 unsafe fn engine_mask_apply_compute_fuses(gt: *mut IntelGt) {
     let i915 = (*gt).i915;
     let info = &mut (*gt).info;
-    let ss_per_ccs = info.sseu.max_subslices / I915_MAX_CCS;
+    let ss_per_ccs = info.sseu.max_subslices / I915_MAX_CCS as u8;
     let mut ccs_mask: u64;
-    let mut i;
+    let mut i: usize;
 
     if GRAPHICS_VER(i915) < 11 {
         return;
     }
 
-    if hweight32(CCS_MASK(gt)) <= 1 {
+    if hweight32(CCS_MASK(gt) as u32) <= 1 {
         return;
     }
 
-    ccs_mask = intel_slicemask_from_xehp_dssmask(info.sseu.compute_subslice_mask, ss_per_ccs);
+    ccs_mask = intel_slicemask_from_xehp_dssmask(info.sseu.compute_subslice_mask, ss_per_ccs as i32)
+        as u64;
     for_each_clear_bit!(i, &ccs_mask, I915_MAX_CCS, {
-        info.engine_mask &= !BIT!(_CCS(i));
+        info.engine_mask &= !BIT!(_CCS(i as i32));
         gt_dbg!(gt, "ccs%u fused off\n", i);
     });
 }
@@ -1165,7 +1186,7 @@ unsafe fn init_engine_mask(gt: *mut IntelGt) -> IntelEngineMask {
     engine_mask_apply_media_fuses(gt);
     engine_mask_apply_compute_fuses(gt);
 
-    if __HAS_ENGINE(info.engine_mask, GSC0) && !intel_uc_wants_gsc_uc(&mut (*gt).uc) {
+    if info.engine_mask & BIT!(GSC0 as usize) != 0 && !intel_uc_wants_gsc_uc(&mut (*gt).uc) {
         gt_notice!(gt, "No GSC FW selected, disabling GSC CS and media C6\n");
         info.engine_mask &= !BIT!(GSC0);
     }
@@ -1175,7 +1196,7 @@ unsafe fn init_engine_mask(gt: *mut IntelGt) -> IntelEngineMask {
         (*gt).ccs.cslices = CCS_MASK(gt);
 
         info.engine_mask &= !GENMASK!(CCS3, CCS0);
-        info.engine_mask |= BIT!(_CCS(first_ccs));
+        info.engine_mask |= BIT!(_CCS(first_ccs as i32));
     }
 
     info.engine_mask
@@ -1210,13 +1231,13 @@ unsafe fn populate_logical_ids(
 unsafe fn setup_logical_ids(gt: *mut IntelGt, logical_ids: *mut u8, class: u8) {
     if MEDIA_VER((*gt).i915) >= 11 && class as i32 == VIDEO_DECODE_CLASS {
         let map: [u8; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
-        populate_logical_ids(gt, logical_ids, class, map.as_ptr(), ARRAY_SIZE(map));
+        populate_logical_ids(gt, logical_ids, class, map.as_ptr(), ARRAY_SIZE(map) as u8);
     } else {
-        let mut map: [u8; MAX_ENGINE_INSTANCE + 1] = [0; MAX_ENGINE_INSTANCE + 1];
-        for i in 0..MAX_ENGINE_INSTANCE + 1 {
+        let mut map: [u8; MAX_ENGINE_INSTANCE as usize + 1] = [0; MAX_ENGINE_INSTANCE as usize + 1];
+        for i in 0..MAX_ENGINE_INSTANCE as usize + 1 {
             map[i] = i as u8;
         }
-        populate_logical_ids(gt, logical_ids, class, map.as_ptr(), ARRAY_SIZE(map));
+        populate_logical_ids(gt, logical_ids, class, map.as_ptr(), ARRAY_SIZE(map) as u8);
     }
 }
 
@@ -1224,35 +1245,35 @@ unsafe fn setup_logical_ids(gt: *mut IntelGt, logical_ids: *mut u8, class: u8) {
 pub unsafe fn intel_engines_init_mmio(gt: *mut IntelGt) -> i32 {
     let i915 = (*gt).i915;
     let engine_mask = init_engine_mask(gt);
-    let mut mask = 0;
-    let mut i;
-    let mut class;
-    let mut logical_ids: [u8; MAX_ENGINE_INSTANCE + 1] = [0; MAX_ENGINE_INSTANCE + 1];
+    let mut mask: u32 = 0;
+    let mut i: usize;
+    let mut logical_ids: [u8; MAX_ENGINE_INSTANCE as usize + 1] =
+        [0; MAX_ENGINE_INSTANCE as usize + 1];
     let mut err;
 
     drm_WARN_ON!(&mut (*i915).drm, engine_mask == 0);
     drm_WARN_ON!(
         &mut (*i915).drm,
-        engine_mask & GENMASK!(BITS_PER_TYPE(mask) - 1, I915_NUM_ENGINES) != 0,
+        engine_mask & GENMASK!(BITS_PER_TYPE!(mask) - 1, I915_NUM_ENGINES) != 0,
     );
 
     err = (|| {
         for class in 0..MAX_ENGINE_CLASS + 1 {
-            setup_logical_ids(gt, logical_ids.as_mut_ptr(), class);
+            setup_logical_ids(gt, logical_ids.as_mut_ptr(), class as u8);
 
             for i in 0..INTEL_ENGINES.len() {
                 let instance = INTEL_ENGINES[i].instance;
 
-                if INTEL_ENGINES[i].class != class || !HAS_ENGINE(gt, i) {
+                if INTEL_ENGINES[i].class != class as u8 || !HAS_ENGINE(gt, i) {
                     continue;
                 }
 
-                let setup_err = intel_engine_setup(gt, i, logical_ids[instance]);
+                let setup_err = intel_engine_setup(gt, i as i32, logical_ids[instance as usize]);
                 if setup_err != 0 {
                     return setup_err;
                 }
 
-                mask |= BIT!(i);
+                mask |= BIT!(i) as u32;
             }
         }
         0
@@ -1266,7 +1287,7 @@ pub unsafe fn intel_engines_init_mmio(gt: *mut IntelGt) -> i32 {
         (*gt).info.engine_mask = mask;
     }
 
-    (*gt).info.num_engines = hweight32(mask);
+    (*gt).info.num_engines = hweight32(mask) as u8;
 
     intel_gt_check_and_clear_faults(gt);
     intel_setup_engine_capabilities(gt);
@@ -1280,8 +1301,13 @@ pub unsafe fn intel_engine_init_execlists(engine: *mut IntelEngineCs) {
     let execlists = &mut (*engine).execlists;
 
     execlists.port_mask = 1;
-    GEM_BUG_ON!(!is_power_of_2(execlists_num_ports(execlists)));
-    GEM_BUG_ON!(execlists_num_ports(execlists) > EXECLIST_MAX_PORTS);
+    GEM_BUG_ON!(!is_power_of_2(
+        crate::intel_engine_api_upstream::execlists_num_ports(execlists) as u32
+    ));
+    GEM_BUG_ON!(
+        crate::intel_engine_api_upstream::execlists_num_ports(execlists)
+            > EXECLIST_MAX_PORTS as u32
+    );
 
     memset(
         execlists.pending.as_mut_ptr() as *mut c_void,
@@ -1329,7 +1355,7 @@ unsafe fn pin_ggtt_status_page(
         flags = PIN_HIGH;
     }
 
-    i915_ggtt_pin(vma, ww, 0, flags)
+    i915_ggtt_pin(vma, ww, 0, flags as u32)
 }
 
 // upstream: intel_engine_cs.c init_status_page()
@@ -1342,7 +1368,7 @@ unsafe fn init_status_page(engine: *mut IntelEngineCs) -> i32 {
 
     INIT_LIST_HEAD!(&mut (*engine).status_page.timelines);
 
-    obj = i915_gem_object_create_internal((*engine).i915, PAGE_SIZE);
+    obj = i915_gem_object_create_internal((*engine).i915, PAGE_SIZE as u64);
     if IS_ERR(obj) {
         gt_err!((*engine).gt, "Failed to allocate status page\n");
         return PTR_ERR(obj);
@@ -1448,32 +1474,32 @@ unsafe fn intel_engine_init_tlb_invalidation(engine: *mut IntelEngineCs) -> i32 
 
     match table {
         TlbInvRegTable::Gen8 => match class {
-            RENDER_CLASS_U8 => reg.reg.reg = GEN8_RTCR,
-            VIDEO_DECODE_CLASS_U8 => reg.reg.reg = GEN8_M1TCR,
-            VIDEO_ENHANCEMENT_CLASS_U8 => reg.reg.reg = GEN8_VTCR,
-            COPY_ENGINE_CLASS_U8 => reg.reg.reg = GEN8_BTCR,
+            RENDER_CLASS_U8 => reg.reg = GEN8_RTCR,
+            VIDEO_DECODE_CLASS_U8 => reg.reg = GEN8_M1TCR,
+            VIDEO_ENHANCEMENT_CLASS_U8 => reg.reg = GEN8_VTCR,
+            COPY_ENGINE_CLASS_U8 => reg.reg = GEN8_BTCR,
             _ => (),
         },
         TlbInvRegTable::Gen12 => match class {
-            RENDER_CLASS_U8 => reg.reg.reg = GEN12_GFX_TLB_INV_CR,
-            VIDEO_DECODE_CLASS_U8 => reg.reg.reg = GEN12_VD_TLB_INV_CR,
-            VIDEO_ENHANCEMENT_CLASS_U8 => reg.reg.reg = GEN12_VE_TLB_INV_CR,
-            COPY_ENGINE_CLASS_U8 => reg.reg.reg = GEN12_BLT_TLB_INV_CR,
-            COMPUTE_CLASS_U8 => reg.reg.reg = GEN12_COMPCTX_TLB_INV_CR,
+            RENDER_CLASS_U8 => reg.reg = GEN12_GFX_TLB_INV_CR,
+            VIDEO_DECODE_CLASS_U8 => reg.reg = GEN12_VD_TLB_INV_CR,
+            VIDEO_ENHANCEMENT_CLASS_U8 => reg.reg = GEN12_VE_TLB_INV_CR,
+            COPY_ENGINE_CLASS_U8 => reg.reg = GEN12_BLT_TLB_INV_CR,
+            COMPUTE_CLASS_U8 => reg.reg = GEN12_COMPCTX_TLB_INV_CR,
             _ => (),
         },
         TlbInvRegTable::Xehp => match class {
-            RENDER_CLASS_U8 => reg.mcr_reg.reg = XEHP_GFX_TLB_INV_CR,
-            VIDEO_DECODE_CLASS_U8 => reg.mcr_reg.reg = XEHP_VD_TLB_INV_CR,
-            VIDEO_ENHANCEMENT_CLASS_U8 => reg.mcr_reg.reg = XEHP_VE_TLB_INV_CR,
-            COPY_ENGINE_CLASS_U8 => reg.mcr_reg.reg = XEHP_BLT_TLB_INV_CR,
-            COMPUTE_CLASS_U8 => reg.mcr_reg.reg = XEHP_COMPCTX_TLB_INV_CR,
+            RENDER_CLASS_U8 => reg.mcr_reg = XEHP_GFX_TLB_INV_CR,
+            VIDEO_DECODE_CLASS_U8 => reg.mcr_reg = XEHP_VD_TLB_INV_CR,
+            VIDEO_ENHANCEMENT_CLASS_U8 => reg.mcr_reg = XEHP_VE_TLB_INV_CR,
+            COPY_ENGINE_CLASS_U8 => reg.mcr_reg = XEHP_BLT_TLB_INV_CR,
+            COMPUTE_CLASS_U8 => reg.mcr_reg = XEHP_COMPCTX_TLB_INV_CR,
             _ => (),
         },
         TlbInvRegTable::Xelpmp => match class {
-            VIDEO_DECODE_CLASS_U8 => reg.reg.reg = GEN12_VD_TLB_INV_CR,
-            VIDEO_ENHANCEMENT_CLASS_U8 => reg.reg.reg = GEN12_VE_TLB_INV_CR,
-            OTHER_CLASS_U8 => reg.reg.reg = XELPMP_GSC_TLB_INV_CR,
+            VIDEO_DECODE_CLASS_U8 => reg.reg = GEN12_VD_TLB_INV_CR,
+            VIDEO_ENHANCEMENT_CLASS_U8 => reg.reg = GEN12_VE_TLB_INV_CR,
+            OTHER_CLASS_U8 => reg.reg = XELPMP_GSC_TLB_INV_CR,
             _ => (),
         },
         TlbInvRegTable::None => (),
@@ -1481,19 +1507,19 @@ unsafe fn intel_engine_init_tlb_invalidation(engine: *mut IntelEngineCs) -> i32 
 
     if gt_WARN_ON_ONCE!(
         (*engine).gt,
-        class >= num || (reg.reg.reg == 0 && reg.mcr_reg.reg == 0),
+        class as i32 >= num || (reg.reg.reg == 0 && reg.mcr_reg.reg == 0),
     ) {
         return -ERANGE;
     }
 
     if table == TlbInvRegTable::Xelpmp && class as i32 == OTHER_CLASS {
-        GEM_WARN_ON!(instance != OTHER_GSC_INSTANCE);
+        GEM_WARN_ON!(instance as u32 != OTHER_GSC_INSTANCE);
         val = 1;
     } else if table == TlbInvRegTable::Gen8 && class as i32 == VIDEO_DECODE_CLASS && instance == 1 {
-        reg.reg.reg = GEN8_M2TCR;
+        reg.reg = GEN8_M2TCR;
         val = 0;
     } else {
-        val = instance;
+        val = instance as u32;
     }
 
     val = BIT!(val);
@@ -1539,14 +1565,15 @@ unsafe fn engine_setup_common(engine: *mut IntelEngineCs) -> i32 {
         return err;
     }
 
-    (*engine).sched_engine = i915_sched_engine_create(ENGINE_PHYSICAL);
+    (*engine).sched_engine =
+        i915_sched_engine_create(crate::intel_engine_api_upstream::ENGINE_PHYSICAL as u32);
     if (*engine).sched_engine.is_null() {
         err = -ENOMEM;
         intel_breadcrumbs_put((*engine).breadcrumbs);
         cleanup_status_page(engine);
         return err;
     }
-    (*(*engine).sched_engine).private_data = engine;
+    (*(*engine).sched_engine).private_data = engine.cast::<c_void>();
 
     err = intel_engine_init_cmd_parser(engine);
     if err != 0 {
@@ -1592,10 +1619,10 @@ unsafe fn measure_breadcrumb_dw(ce: *mut IntelContext) -> i32 {
     rcu_assign_pointer!(&mut (*frame).rq.timeline, (*ce).timeline);
     (*frame).rq.hwsp_seqno = (*(*ce).timeline).hwsp_seqno;
 
-    (*frame).ring.vaddr = (*frame).cs.as_mut_ptr();
-    (*frame).ring.size = size_of_val(&(*frame).cs);
+    (*frame).ring.vaddr = (*frame).cs.as_mut_ptr().cast::<c_void>();
+    (*frame).ring.size = size_of_val(&(*frame).cs) as u32;
     (*frame).ring.wrap = BITS_PER_TYPE!((*frame).ring.size) - ilog2((*frame).ring.size);
-    (*frame).ring.effective_size = (*frame).ring.size;
+    (*frame).ring.effective_size = (*frame).ring.size as u32;
     intel_ring_update_space(&mut (*frame).ring);
     (*frame).rq.ring = &mut (*frame).ring;
 
@@ -1620,7 +1647,7 @@ pub unsafe fn intel_engine_create_pinned_context(
     vm: *mut I915AddressSpace,
     ring_size: u32,
     hwsp: u32,
-    key: *mut LockClassKey,
+    key: *mut crate::intel_engine_api_upstream::LockClassKey,
     name: *const c_char,
 ) -> *mut IntelContext {
     let mut ce: *mut IntelContext;
@@ -1632,7 +1659,7 @@ pub unsafe fn intel_engine_create_pinned_context(
     }
 
     __set_bit(CONTEXT_BARRIER_BIT, &mut (*ce).flags);
-    (*ce).timeline = page_pack_bits(core::ptr::null_mut(), hwsp);
+    (*ce).timeline = page_pack_bits(core::ptr::null_mut(), hwsp).cast::<IntelTimeline>();
     (*ce).ring = core::ptr::null_mut();
     (*ce).ring_size = ring_size;
 
@@ -1672,13 +1699,14 @@ pub unsafe fn intel_engine_destroy_pinned_context(ce: *mut IntelContext) {
 
 // upstream: intel_engine_cs.c create_ggtt_bind_context()
 unsafe fn create_ggtt_bind_context(engine: *mut IntelEngineCs) -> *mut IntelContext {
-    static mut KERNEL: LockClassKey = unsafe { core::mem::zeroed() };
+    static mut KERNEL: crate::intel_engine_api_upstream::LockClassKey =
+        unsafe { core::mem::zeroed() };
 
     intel_engine_create_pinned_context(
         engine,
         (*(*engine).gt).vm,
-        SZ_512K,
-        I915_GEM_HWS_GGTT_BIND_ADDR,
+        SZ_512K as u32,
+        crate::intel_engine_api_upstream::I915_GEM_HWS_GGTT_BIND_ADDR as u32,
         &mut KERNEL,
         c"ggtt_bind_context".as_ptr(),
     )
@@ -1686,13 +1714,14 @@ unsafe fn create_ggtt_bind_context(engine: *mut IntelEngineCs) -> *mut IntelCont
 
 // upstream: intel_engine_cs.c create_kernel_context()
 unsafe fn create_kernel_context(engine: *mut IntelEngineCs) -> *mut IntelContext {
-    static mut KERNEL: LockClassKey = unsafe { core::mem::zeroed() };
+    static mut KERNEL: crate::intel_engine_api_upstream::LockClassKey =
+        unsafe { core::mem::zeroed() };
 
     intel_engine_create_pinned_context(
         engine,
         (*(*engine).gt).vm,
-        SZ_4K,
-        I915_GEM_HWS_SEQNO_ADDR,
+        SZ_4K as u32,
+        crate::intel_engine_api_upstream::I915_GEM_HWS_SEQNO_ADDR as u32,
         &mut KERNEL,
         c"kernel_context".as_ptr(),
     )
@@ -1729,7 +1758,7 @@ unsafe fn engine_init_common(engine: *mut IntelEngineCs) -> i32 {
         return ret;
     }
 
-    (*engine).emit_fini_breadcrumb_dw = ret;
+    (*engine).emit_fini_breadcrumb_dw = ret as u32;
     (*engine).kernel_context = ce;
     (*engine).bind_context = bce;
 
@@ -1738,7 +1767,7 @@ unsafe fn engine_init_common(engine: *mut IntelEngineCs) -> i32 {
 
 // upstream: intel_engine_cs.c intel_engines_init()
 pub unsafe fn intel_engines_init(gt: *mut IntelGt) -> i32 {
-    let mut setup: unsafe fn(*mut IntelEngineCs) -> i32;
+    let mut setup: unsafe extern "C" fn(*mut IntelEngineCs) -> i32;
     let mut engine: *mut IntelEngineCs;
     let mut id: IntelEngineId;
     let mut err: i32;
@@ -1790,7 +1819,7 @@ pub unsafe fn intel_engine_cleanup_common(engine: *mut IntelEngineCs) {
     intel_engine_cleanup_cmd_parser(engine);
 
     if !(*engine).default_state.is_null() {
-        fput((*engine).default_state);
+        fput((*engine).default_state.cast());
     }
 
     if !(*engine).kernel_context.is_null() {
@@ -1889,10 +1918,10 @@ unsafe fn __intel_engine_stop_cs(
     err = __intel_wait_for_register_fw(
         (*engine).uncore,
         mode,
-        MODE_IDLE,
-        MODE_IDLE,
-        fast_timeout_us,
-        slow_timeout_ms,
+        intel_engine_regs_upstream::MODE_IDLE,
+        intel_engine_regs_upstream::MODE_IDLE,
+        fast_timeout_us as u32,
+        slow_timeout_ms as u32,
         core::ptr::null_mut(),
     );
 
@@ -2098,7 +2127,9 @@ unsafe fn ring_is_idle(engine: *mut IntelEngineCs) -> bool {
     }
 
     if GRAPHICS_VER((*engine).i915) > 2
-        && (ENGINE_READ!(engine, intel_engine_regs_upstream::RING_MI_MODE) & MODE_IDLE) == 0
+        && (ENGINE_READ!(engine, intel_engine_regs_upstream::RING_MI_MODE)
+            & intel_engine_regs_upstream::MODE_IDLE)
+            == 0
     {
         idle = false;
     }
@@ -2112,14 +2143,14 @@ unsafe fn ring_is_idle(engine: *mut IntelEngineCs) -> bool {
 pub unsafe fn __intel_engine_flush_submission(engine: *mut IntelEngineCs, sync: bool) {
     let t = &mut (*(*engine).sched_engine).tasklet;
 
-    if t.callback.is_none() {
+    if t.callbacks.callback.is_none() {
         return;
     }
 
     local_bh_disable();
     if tasklet_trylock(t) {
         if __tasklet_is_enabled(t) {
-            (t.callback.unwrap())(t);
+            (t.callbacks.callback.unwrap())(t);
         }
         tasklet_unlock(t);
     }
@@ -2178,9 +2209,9 @@ pub unsafe fn intel_engine_irq_enable(engine: *mut IntelEngineCs) -> bool {
         return false;
     }
 
-    spin_lock((*(*engine).gt).irq_lock);
+    spin_lock(&mut *(*(*engine).gt).irq_lock);
     ((*engine).irq_enable.unwrap())(engine);
-    spin_unlock((*(*engine).gt).irq_lock);
+    spin_unlock(&mut *(*(*engine).gt).irq_lock);
 
     true
 }
@@ -2191,9 +2222,9 @@ pub unsafe fn intel_engine_irq_disable(engine: *mut IntelEngineCs) {
         return;
     }
 
-    spin_lock((*(*engine).gt).irq_lock);
+    spin_lock(&mut *(*(*engine).gt).irq_lock);
     ((*engine).irq_disable.unwrap())(engine);
-    spin_unlock((*(*engine).gt).irq_lock);
+    spin_unlock(&mut *(*(*engine).gt).irq_lock);
 }
 
 // upstream: intel_engine_cs.c intel_engines_reset_default_submission()
@@ -2325,7 +2356,11 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
     let mut addr: u64;
 
     if (*engine).id == RENDER_CLASS && IS_GRAPHICS_VER(i915, 4, 7) {
-        drm_printf!(m, "\tCCID: 0x%08x\n", ENGINE_READ!(engine, CCID));
+        drm_printf!(
+            m,
+            "\tCCID: 0x%08x\n",
+            ENGINE_READ!(engine, intel_engine_regs_upstream::CCID)
+        );
     }
     if HAS_EXECLISTS(i915) {
         drm_printf!(
@@ -2375,7 +2410,10 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
             m,
             "\tRING_MODE:  0x%08x%s\n",
             ENGINE_READ!(engine, intel_engine_regs_upstream::RING_MI_MODE),
-            if ENGINE_READ!(engine, intel_engine_regs_upstream::RING_MI_MODE) & MODE_IDLE != 0 {
+            if ENGINE_READ!(engine, intel_engine_regs_upstream::RING_MI_MODE)
+                & intel_engine_regs_upstream::MODE_IDLE
+                != 0
+            {
                 " [idle]"
             } else {
                 ""
@@ -2453,10 +2491,13 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
         drm_printf!(m, "\tIPEHR: 0x%08x\n", ENGINE_READ!(engine, IPEHR));
     }
 
-    if HAS_EXECLISTS(i915) && !intel_engine_uses_guc(engine) {
+    if HAS_EXECLISTS(i915) && !crate::intel_engine_api_upstream::intel_engine_uses_guc(engine) {
         let mut port: *const *mut I915Request;
         let mut rq: *mut I915Request;
-        let hws = (*engine).status_page.addr.add(I915_HWS_CSB_BUF0_INDEX);
+        let hws = (*engine)
+            .status_page
+            .addr
+            .add(crate::intel_engine_api_upstream::I915_HWS_CSB_BUF0_INDEX as usize);
         let num_entries = execlists.csb_size;
         let mut idx: u32;
         let mut read: u8;
@@ -2644,7 +2685,7 @@ unsafe fn print_request_ring(m: *mut DrmPrinter, rq: *mut I915Request) {
         let mut len = 0usize;
 
         if (*rq).tail < head as u32 {
-            len = (*(*rq).ring).size - head;
+            len = (*(*rq).ring).size as usize - head;
             memcpy(ring, vaddr.cast::<u8>().add(head).cast::<c_void>(), len);
             head = 0;
         }
@@ -2737,7 +2778,11 @@ unsafe fn engine_dump_request(rq: *mut I915Request, m: *mut DrmPrinter, msg: *co
 
     if !(*(*rq).context).lrc_reg_state.is_null() {
         drm_printf!(m, "Logical Ring Context:\n");
-        hexdump(m, (*(*rq).context).lrc_reg_state, PAGE_SIZE);
+        hexdump(
+            m,
+            (*(*rq).context).lrc_reg_state.cast::<c_void>(),
+            PAGE_SIZE,
+        );
     }
 }
 
@@ -2757,7 +2802,7 @@ pub unsafe fn intel_engine_dump_active_requests(
         }
 
         state = i915_test_request_state(rq);
-        if state < I915_REQUEST_QUEUED {
+        if (state as u32) < (I915_REQUEST_QUEUED as u32) {
             continue;
         }
 
@@ -2806,7 +2851,7 @@ pub unsafe fn intel_engine_dump(
 ) {
     let error = &mut (*(*engine).i915).gpu_error;
     let mut rq: *mut I915Request;
-    let mut wakeref: IntelWakeref;
+    let mut wakeref: IntelWakerefT;
     let mut dummy: Ktime;
 
     if !header.is_null() {
@@ -2848,7 +2893,7 @@ pub unsafe fn intel_engine_dump(
         drm_printf!(
             m,
             "\tHeartbeat: %d ms ago\n",
-            jiffies_to_msecs(jiffies - (*rq).emitted_jiffies),
+            jiffies_to_msecs(jiffies() - (*rq).emitted_jiffies),
         );
     }
     rcu_read_unlock();
@@ -2864,7 +2909,7 @@ pub unsafe fn intel_engine_dump(
 
     drm_printf!(m, "\tMMIO base:  0x%08x\n", (*engine).mmio_base);
     wakeref = intel_runtime_pm_get_if_in_use((*(*engine).uncore).rpm);
-    if wakeref != 0 {
+    if !wakeref.is_null() {
         intel_engine_print_registers(engine, m);
         intel_runtime_pm_put((*(*engine).uncore).rpm, wakeref);
     } else {
@@ -2895,12 +2940,12 @@ pub unsafe fn intel_engine_create_virtual(
         return ERR_PTR(-EINVAL);
     }
 
-    if count == 1 && flags & FORCE_VIRTUAL == 0 {
+    if count == 1 && flags & crate::intel_engine_api_upstream::FORCE_VIRTUAL == 0 {
         return intel_context_create(*siblings);
     }
 
-    GEM_BUG_ON!((*(*siblings).cops).create_virtual.is_none());
-    ((*(*siblings).cops).create_virtual.unwrap())(siblings, count, flags)
+    GEM_BUG_ON!((*(*(*siblings)).cops).create_virtual.is_none());
+    ((*(*(*siblings)).cops).create_virtual.unwrap())(siblings, count, flags)
 }
 
 // upstream: intel_engine_cs.c engine_execlist_find_hung_request()
@@ -2955,7 +3000,7 @@ pub unsafe fn intel_engine_get_hung_entity(
     ce: *mut *mut IntelContext,
     rq: *mut *mut I915Request,
 ) {
-    let mut flags: c_ulong;
+    let mut flags: c_ulong = 0;
 
     *ce = intel_engine_get_hung_context(engine);
     if !(*ce).is_null() {

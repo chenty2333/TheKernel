@@ -122,11 +122,16 @@ unsafe fn object_size(obj: *mut DrmI915GemObject) -> u64 {
     unsafe { (*gem_base(obj)).size }
 }
 #[inline]
-fn page_mask_bits(ptr_: *mut c_void) -> *mut c_void {
+pub fn page_mask_bits(ptr_: *mut c_void) -> *mut c_void {
     ((ptr_ as usize) & !((1usize << PAGE_SHIFT) - 1)) as *mut c_void
 }
+// upstream: i915_ptr_util.h page_unmask_bits()
 #[inline]
-fn page_pack_bits(ptr_: *mut c_void, bits: I915MapType) -> *mut c_void {
+pub fn page_unmask_bits<T>(ptr_: *mut T) -> *mut T {
+    ((ptr_ as usize) & !((1usize << PAGE_SHIFT) - 1)) as *mut T
+}
+#[inline]
+pub fn page_pack_bits(ptr_: *mut c_void, bits: I915MapType) -> *mut c_void {
     assert_eq!((bits as usize) & !((1usize << PAGE_SHIFT) - 1), 0);
     ((ptr_ as usize) | bits as usize) as *mut c_void
 }

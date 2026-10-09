@@ -59,7 +59,7 @@ unsafe fn object_base_const(obj: *const DrmI915GemObject) -> *const gem::DrmGemO
 }
 
 #[inline]
-unsafe fn assert_object_held(_obj: *const DrmI915GemObject) {
+pub unsafe fn assert_object_held(_obj: *const DrmI915GemObject) {
     // CONFIG_LOCKDEP=n: dma_resv_assert_held() compiles away.
 }
 
