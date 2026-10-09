@@ -259,6 +259,9 @@ pub mod i915_freq_upstream;
 pub mod intel_gt_mcr_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_gt_pm_irq_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_gt_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
