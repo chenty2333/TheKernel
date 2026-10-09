@@ -11,15 +11,6 @@ use crate::{
     linux_config::PAGE_SHIFT,
 };
 
-#[repr(C)]
-struct SgTableLayout {
-    sgl: *mut Scatterlist,
-    nents: u32,
-    orig_nents: u32,
-}
-
-const _: [(); 16] = [(); core::mem::size_of::<SgTableLayout>()];
-
 /// Iterator corresponding to a page walk of the mapped segments in an sg_table.
 pub struct SgTablePages {
     sg: *mut Scatterlist,
@@ -44,10 +35,9 @@ impl Iterator for SgTablePages {
 
 /// Walk each DMA-mapped sg segment's starting page.
 pub unsafe fn sg_table_pages(table: *mut SgTable) -> SgTablePages {
-    let layout = unsafe { &*table.cast::<SgTableLayout>() };
     SgTablePages {
-        sg: layout.sgl,
-        remaining: layout.nents,
+        sg: unsafe { (*table).sgl },
+        remaining: unsafe { (*table).nents },
     }
 }
 

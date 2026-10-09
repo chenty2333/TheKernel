@@ -258,8 +258,13 @@ pub struct I915VmaOps {
 }
 #[repr(C)]
 pub struct SgTable {
-    _opaque: [u8; 0],
+    pub sgl: *mut crate::i915_gem_pages_upstream::Scatterlist,
+    pub nents: u32,
+    pub orig_nents: u32,
 }
+const _: [(); 16] = [(); core::mem::size_of::<SgTable>()];
+const _: [(); 0] = [(); core::mem::offset_of!(SgTable, sgl)];
+const _: [(); 8] = [(); core::mem::offset_of!(SgTable, nents)];
 #[repr(C)]
 pub struct SgEntry {
     _opaque: [u8; 0],
