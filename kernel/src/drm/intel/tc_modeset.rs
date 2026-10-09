@@ -108,12 +108,6 @@ fn ddi_buf_ctl(port: TcPort) -> Result<u32, String> {
     // ADL-P maps PORT_D/PORT_E to TC1/TC2, at the DDI_CTL register stride.
     Ok(0x64000 + (3 + port.index()) * 0x100)
 }
-fn trans_clock_select(port: TcPort) -> Result<u32, String> {
-    tc_phy(port)?;
-    // Display13 maps D/E (TC1/2) to PHY_F/PHY_G, not DDI D/E.
-    Ok((6 + port.index()) << 28)
-}
-
 fn dkl_io<R: Registers>(registers: &R) -> DklRegisterIo<'_, R> {
     DklRegisterIo { registers }
 }
@@ -457,6 +451,7 @@ struct TcTranscoderFuncIo<'a, R> {
     func_ctl: Option<Register>,
     func_ctl2: Option<Register>,
     buffer_ctl: Option<Register>,
+    clock_sel: Option<Register>,
     timer: Option<&'a dyn PollTimer>,
     read_failed: bool,
     write_failed: bool,
@@ -470,6 +465,7 @@ impl<'a, R: Registers> TcTranscoderFuncIo<'a, R> {
             func_ctl: Some(ddi::TRANS_DDI_FUNC_CTL_A),
             func_ctl2: Some(ddi::TRANS_DDI_FUNC_CTL2_A),
             buffer_ctl: None,
+            clock_sel: None,
             timer: None,
             read_failed: false,
             write_failed: false,
@@ -483,6 +479,7 @@ impl<'a, R: Registers> TcTranscoderFuncIo<'a, R> {
             func_ctl: None,
             func_ctl2: None,
             buffer_ctl: Some(buffer_ctl),
+            clock_sel: None,
             timer: Some(timer),
             read_failed: false,
             write_failed: false,
@@ -490,11 +487,30 @@ impl<'a, R: Registers> TcTranscoderFuncIo<'a, R> {
         }
     }
 
+    fn clock(registers: &'a R, clock_sel: Register) -> Self {
+        Self {
+            registers,
+            func_ctl: None,
+            func_ctl2: None,
+            buffer_ctl: None,
+            clock_sel: Some(clock_sel),
+            timer: None,
+            read_failed: false,
+            write_failed: false,
+            wait_timed_out: false,
+        }
+    }
+
     fn register(&self, offset: u32) -> Option<Register> {
-        [self.func_ctl, self.func_ctl2, self.buffer_ctl]
-            .into_iter()
-            .flatten()
-            .find(|register| register.offset() == offset)
+        [
+            self.func_ctl,
+            self.func_ctl2,
+            self.buffer_ctl,
+            self.clock_sel,
+        ]
+        .into_iter()
+        .flatten()
+        .find(|register| register.offset() == offset)
     }
 }
 
@@ -633,8 +649,16 @@ fn source_tc_encoder(port: TcPort) -> Result<intel_display::intel_ddi_full::DdiE
             ));
         }
     };
+    let phy = match port {
+        TcPort::Tc1 => 5, // PHY_F
+        TcPort::Tc2 => 6, // PHY_G
+        TcPort::Tc3 | TcPort::Tc4 => {
+            return Err(String::from("translated DDI path only admits TC1/TC2"));
+        }
+    };
     Ok(i915::DdiEncoder {
         port: source_port,
+        phy,
         output: i915::OutputType::Hdmi,
         display: i915::Platform {
             display_ver: 13,
@@ -644,6 +668,34 @@ fn source_tc_encoder(port: TcPort) -> Result<intel_display::intel_ddi_full::DdiE
         is_tc: true,
         ..i915::DdiEncoder::default()
     })
+}
+
+fn enable_pipe_a_transcoder_clock<R: Registers>(registers: &R, port: TcPort) -> Result<(), String> {
+    use intel_display::intel_ddi_full as i915;
+
+    let encoder = source_tc_encoder(port)?;
+    let state = i915::CrtcState {
+        cpu_transcoder: i915::Transcoder::A,
+        output: i915::OutputType::Hdmi,
+        ..i915::CrtcState::default()
+    };
+    let mut io = TcTranscoderFuncIo::clock(registers, ddi::TRANS_CLK_SEL_A);
+    i915::intel_ddi_enable_transcoder_clock(&mut io, &encoder, &state);
+    if io.write_failed {
+        return Err(String::from(
+            "translated Pipe-A transcoder clock write failed",
+        ));
+    }
+    let readback = registers
+        .read(ddi::TRANS_CLK_SEL_A)
+        .ok_or_else(|| String::from("Pipe-A transcoder clock readback unavailable"))?;
+    let expected = (6 + u32::from(port.index())) << 28;
+    if readback != expected {
+        return Err(format!(
+            "translated transcoder clock readback mismatch {readback:#x}, expected {expected:#x}"
+        ));
+    }
+    Ok(())
 }
 
 fn disable_pipe_a_transcoder<R: Registers>(registers: &R) -> Result<(), String> {
@@ -893,7 +945,7 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     }
 
     dkl_pll_on(r, timer, port, pll, afc_startup)?;
-    write(r, 0x46140, trans_clock_select(port)?)?;
+    enable_pipe_a_transcoder_clock(r, port)?;
     let avi_control = read(r, 0x60200)?;
     write(r, 0x60200, avi_control & !AVI_ENABLE)?;
     for (word, value) in avi.iter().copied().enumerate() {
@@ -1070,6 +1122,20 @@ mod tests {
                     (1 << 16) | (1 << 17)
                 ),
             ]
+        );
+
+        registers.writes.borrow_mut().clear();
+        super::enable_pipe_a_transcoder_clock(&registers, super::TcPort::Tc1).unwrap();
+        assert_eq!(
+            registers
+                .values
+                .borrow()
+                .get(&super::ddi::TRANS_CLK_SEL_A.offset()),
+            Some(&(6 << 28))
+        );
+        assert_eq!(
+            *registers.writes.borrow(),
+            [(super::ddi::TRANS_CLK_SEL_A.offset(), 6 << 28)]
         );
     }
 
