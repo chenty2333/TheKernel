@@ -2222,7 +2222,7 @@ fn intel_guc_submission_reset_finish(guc: &mut intel_guc) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_tlb_invalidation_is_available()
-fn intel_guc_tlb_invalidation_is_available(guc: &intel_guc) -> bool {
+pub(crate) fn intel_guc_tlb_invalidation_is_available(guc: &intel_guc) -> bool {
     return (unsafe { HAS_GUC_TLB_INVALIDATION((*guc_to_gt_const(guc)).i915) })
         && (unsafe { intel_guc_is_ready(guc) });
 }
@@ -4806,7 +4806,7 @@ pub(crate) fn intel_guc_invalidate_tlb_engines(guc: &mut intel_guc) -> i32 {
 }
 
 // upstream: intel_guc_submission.c intel_guc_invalidate_tlb_guc()
-fn intel_guc_invalidate_tlb_guc(guc: &mut intel_guc) -> i32 {
+pub(crate) fn intel_guc_invalidate_tlb_guc(guc: &mut intel_guc) -> i32 {
     guc_send_invalidate_tlb(
         guc,
         intel_guc_tlb_invalidation_type::INTEL_GUC_TLB_INVAL_GUC,

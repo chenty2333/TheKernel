@@ -1597,7 +1597,7 @@ pub unsafe fn __i915_request_queue_bh(rq: *mut I915Request) {
 
 // upstream i915_request.c:1823
 // upstream: i915_request.c __i915_request_queue()
-unsafe fn __i915_request_queue(rq: *mut I915Request, attr: *const I915SchedAttr) {
+pub(crate) unsafe fn __i915_request_queue(rq: *mut I915Request, attr: *const I915SchedAttr) {
     let engine = unsafe { (*rq).engine };
     if !attr.is_null() {
         if let Some(schedule) = unsafe { (*(*engine).sched_engine).schedule } {

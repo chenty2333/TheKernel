@@ -1382,7 +1382,7 @@ unsafe fn intel_guc_capture_get_matching_node(
         guc,
         "No register capture node found for 0x%04X / 0x%08X\n",
         unsafe { (*ce).guc_id.id },
-        unsafe { (*ce).lrc.lrca }
+        unsafe { (&(*ce).lrc).lrca }
     );
 }
 
@@ -1427,7 +1427,7 @@ pub unsafe extern "C" fn intel_guc_capture_destroy(guc: *mut IntelGuc) {
         guc_capture_delete_prealloc_nodes(guc);
         guc_capture_free_extlists((*gc).extlists.cast());
         kfree((*gc).extlists);
-        free_reglist_groups((*gc).reglists.cast_mut());
+        free_reglist_groups((*gc).reglists.cast_mut().cast::<CaptureRegGroup>());
         kfree(gc);
         (*guc).capture = ptr::null_mut();
     }

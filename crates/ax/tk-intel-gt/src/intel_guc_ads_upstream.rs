@@ -35,7 +35,7 @@ use crate::{
     intel_uncore_types_upstream::intel_uncore_read,
     intel_workarounds_types_upstream::{I915McrRegT, I915RegT, I915Wa},
     linux::{
-        config::{ENOMEM, EOPNOTSUPP, GFP_KERNEL},
+        config::{ENOMEM, EOPNOTSUPP, ERR_PTR, GFP_KERNEL},
         i915::{
             GRAPHICS_VER, GRAPHICS_VER_FULL, IP_VER, IS_DG2, IS_DGFX, IS_GFX_GT_IP_RANGE,
             IS_MEDIA_GT_IP_RANGE,
@@ -816,7 +816,7 @@ unsafe fn shmem_read_to_iosys_map(
 // upstream: intel_guc_ads.c guc_init_golden_context()
 unsafe fn guc_init_golden_context(guc: *mut IntelGuc) {
     let gt = unsafe { guc_to_gt(guc) };
-    if !unsafe { intel_uc_uses_guc_submission(ptr::addr_of!((*gt).uc)) } {
+    if !unsafe { intel_uc_uses_guc_submission(ptr::addr_of_mut!((*gt).uc)) } {
         return;
     }
     GEM_BUG_ON!(unsafe { map_is_null(ptr::addr_of!((*guc).ads_map)) });
@@ -968,11 +968,11 @@ unsafe fn guc_capture_prep_lists(guc: *mut IntelGuc) -> i32 {
             let engine_mask = unsafe { guc_get_capture_engine_mask(&mut info_map, class) };
             let class_field = ads_offset(
                 offset_of!(guc_ads, capture_class)
-                    + (index * GUC_MAX_ENGINE_CLASSES as u32 + class) as usize * 4,
+                    + (index * GUC_MAX_ENGINE_CLASSES + class as usize) * size_of::<u32>(),
             );
             let instance_field = ads_offset(
                 offset_of!(guc_ads, capture_instance)
-                    + (index * GUC_MAX_ENGINE_CLASSES as u32 + class) as usize * 4,
+                    + (index * GUC_MAX_ENGINE_CLASSES + class as usize) * size_of::<u32>(),
             );
             if engine_mask == 0 {
                 if mapped {
@@ -1168,10 +1168,10 @@ unsafe fn guc_waklv_enable_simple(
 // upstream: intel_guc_ads.c guc_waklv_init()
 unsafe fn guc_waklv_init(guc: *mut IntelGuc) {
     let gt = unsafe { guc_to_gt(guc) };
-    if !unsafe { intel_uc_uses_guc_submission(ptr::addr_of!((*gt).uc)) } {
+    if !unsafe { intel_uc_uses_guc_submission(ptr::addr_of_mut!((*gt).uc)) } {
         return;
     }
-    let version = unsafe { (*guc).fw.version };
+    let version = unsafe { (*guc).fw.file_selected.ver };
     if (version.major, version.minor, version.patch) < (70, 10, 0) {
         return;
     }

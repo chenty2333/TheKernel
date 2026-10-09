@@ -86,15 +86,15 @@
 1. `intel_uc_fw.c`：默认 `uc.rs` 的 firmware policy/phase 子集 ↔ feature `intel_uc_fw_upstream.rs`（38/38）。前者保留 N305 loader state owner；feature 版尚未成为调用者。
 2. `intel_guc.c`：默认 `guc_fw.rs` / `guc_config.rs` 的 Gen12 CT/notify/parameter slice ↔ feature `intel_guc_upstream.rs`（38/38）。default helper marker 已移除以免伪装成逐函数 source translation；运行时仍由自有 GT owner调用。
 3. `intel_guc_submission.c`：默认 `guc_submission.rs` 的单 LRC/CTB 状态子集 ↔ feature `guc_submission_upstream.rs` source-order 翻译。默认路径尚在 `gt/copy.rs`。
-4. `intel_guc_capture.c`：默认 `guc_capture.rs` 的 parser/cache slice ↔ feature `intel_guc_capture_upstream.rs` source-order helpers。默认 diagnostics cache lifecycle/IRQ caller并不完整。
+4. `intel_guc_capture.c`：默认 `guc_capture.rs` parser/cache slice ↔ feature `intel_guc_capture_upstream.rs` (49/49)。后者保留 source-order 注册/读取/析构逻辑；default diagnostics cache lifecycle/IRQ caller并不完整。
 5. `intel_lrc.c`：默认 `lrc.rs` 的 Gen12 XCS image helpers ↔ feature `intel_lrc_upstream.rs`。前者只支撑 N305自有 BCS/RCS 子集；两者有不同类型/owner契约。
 6. `intel_execlists_submission.c`：默认 `execlists.rs` 两端口/CSB polling 子集 ↔ feature `intel_execlists_submission_upstream.rs`。未切换完整 request queue/CSB IRQ state machine。
 7. `intel_wopcm.c`：默认 `wopcm.rs` Gen12 partition helper ↔ feature `intel_wopcm_upstream.rs`（10/10）。前者被当前 N305固件上传路径调用。
 8. `intel_huc.c`（pending）：默认 `huc.rs` Gen11+/GuC auth slice；完整 source-order 模块待补齐后须选择唯一运行 owner。
 9. `intel_guc_ct.c`：默认 `guc_ct.rs` 手写同步 CTB/HXG slice ↔ feature `intel_guc_ct_upstream.rs` (44/44)；两个实现都不是对方的 runtime delegation，接线时必须二选一。
-10. `intel_guc_ads.c`（pending）：默认 `guc_ads.rs` 运行期 ABI builder；完整 source-order function module待补。未来 translation仅应作为验证/参考，不能成为第二个 ADS backing owner。
+10. `intel_guc_ads.c`：默认 `guc_ads.rs` 运行期 ABI builder ↔ feature `intel_guc_ads_upstream.rs` (40/40)。feature 版为源翻译/验证 owner，尚未切换成 default runtime backing。
 
-**当前重复所有者条目：10 条**（8 条已有两个源代码 owner；2 条是待补模块后的 owner gate）。
+**当前重复所有者条目：10 条**（9 条已有两个源代码 owner；1 条是 HUC 待补模块后的 owner gate）。
 
 ## 接线时 kernel 侧必须提供的接口点
 
