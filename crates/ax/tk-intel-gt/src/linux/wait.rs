@@ -34,6 +34,34 @@ pub fn cond_resched() {
     axtask::resched_if_needed();
 }
 
+/// Linux `schedule_timeout()` for the non-interruptible i915 wait paths.
+/// This task backend exposes timed sleep rather than Linux task-state
+/// scheduling; a completed timed wait therefore returns zero remaining ticks.
+pub fn schedule_timeout(timeout: i64) -> i64 {
+    if timeout <= 0 {
+        return 0;
+    }
+    let ticks = timeout as u64;
+    let nanos = ticks
+        .saturating_mul(axhal::time::NANOS_PER_SEC as u64 / CONFIG_HZ as u64);
+    if axtask::sleep(core::time::Duration::from_nanos(nanos)).is_err() {
+        wait_until(nanos, || false, true);
+    }
+    0
+}
+
+/// Linux `msleep()` backed by the task timer; if called outside a sleepable
+/// task context, retain the requested minimum delay via cooperative polling.
+pub fn msleep(milliseconds: u32) {
+    if milliseconds == 0 {
+        return;
+    }
+    let nanos = u64::from(milliseconds).saturating_mul(1_000_000);
+    if axtask::sleep(core::time::Duration::from_nanos(nanos)).is_err() {
+        wait_until(nanos, || false, true);
+    }
+}
+
 pub type WaitQueueFunc = unsafe extern "C" fn(*mut WaitQueueEntry, u32, i32, *mut c_void) -> i32;
 
 pub fn init_waitqueue_head(head: &mut WaitQueueHead) {

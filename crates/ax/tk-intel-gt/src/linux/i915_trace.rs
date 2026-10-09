@@ -8,8 +8,12 @@
 //! that configuration-selected header interface only.
 
 use crate::{
-    intel_context_types_upstream::IntelContext, linux_config::CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS,
+    i915_gem_object_types_upstream::DrmI915GemObject,
+    intel_context_types_upstream::IntelContext,
+    linux_i915_private::DrmI915Private,
+    linux_config::CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS,
 };
+use core::ffi::c_ulong;
 
 const _: () = assert!(!CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS);
 
@@ -23,3 +27,20 @@ pub fn trace_intel_context_do_pin(_context: *mut IntelContext) {}
 pub fn trace_intel_context_do_unpin(_context: *mut IntelContext) {}
 #[inline]
 pub fn trace_intel_context_free(_context: *mut IntelContext) {}
+
+// These additional trace-event wrappers are also compile-time no-ops for the
+// configured target, where CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS is disabled.
+#[inline]
+pub fn trace_intel_context_set_prio(_context: &IntelContext) {}
+#[inline]
+pub fn trace_intel_context_fence_release(_context: &IntelContext) {}
+#[inline]
+pub fn trace_intel_context_deregister_done(_context: &IntelContext) {}
+#[inline]
+pub fn trace_intel_context_sched_done(_context: &IntelContext) {}
+#[inline]
+pub fn trace_intel_context_reset(_context: &IntelContext) {}
+#[inline]
+pub fn trace_i915_gem_object_destroy(_object: *mut DrmI915GemObject) {}
+#[inline]
+pub fn trace_i915_gem_shrink(_i915: *mut DrmI915Private, _target: c_ulong, _shrink: u32) {}
