@@ -1947,6 +1947,20 @@ mod tests {
         );
 
         dp.dpcd[2] = DP_TPS3_SUPPORTED;
+        io.source_tps3 = false;
+        assert_eq!(
+            intel_dp_training_pattern(&dp, &io, &state, DpPhy::Dprx),
+            DP_TRAINING_PATTERN_2 as u32
+        );
+
+        dp.dpcd[2] = 0;
+        io.source_tps3 = true;
+        assert_eq!(
+            intel_dp_training_pattern(&dp, &io, &state, DpPhy::Dprx),
+            DP_TRAINING_PATTERN_2 as u32
+        );
+
+        dp.dpcd[2] = DP_TPS3_SUPPORTED;
         io.source_tps3 = true;
         assert_eq!(
             intel_dp_training_pattern(&dp, &io, &state, DpPhy::Dprx),
