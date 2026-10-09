@@ -47,6 +47,8 @@ pub fn configure_pci_intx(vector: usize) -> bool {
 }
 
 static IRQ_HOOK: AtomicUsize = AtomicUsize::new(0);
+static MSI_OWNED: [core::sync::atomic::AtomicBool; 256] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; 256];
 const CONTEXT_INSTALLING: usize = 1;
 static IRQ_CONTEXT: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
 
@@ -307,8 +309,14 @@ pub fn unregister(irq: usize) -> Option<axplat::irq::IrqHandler> {
     if irq < IRQ_CONTEXT.len() && IRQ_CONTEXT[irq].load(Ordering::Acquire) != 0 {
         None
     } else {
-        if let Ok(vector) = u8::try_from(irq) {
-            let _ = tk_vtd::platform_unmap_msi(vector);
+        if let Ok(vector) = u8::try_from(irq)
+            && MSI_OWNED[usize::from(vector)].swap(false, Ordering::AcqRel)
+            && tk_vtd::platform_unmap_msi(vector).is_err()
+        {
+            // Keep the vector owned if its translation could not be retired;
+            // unregistering it could let a later device reuse a live entry.
+            MSI_OWNED[usize::from(vector)].store(true, Ordering::Release);
+            return None;
         }
         axplat::irq::unregister(irq)
     }
@@ -930,10 +938,20 @@ pub fn allocate_msi(
     #[cfg(all(target_os = "none", feature = "defplat", not(feature = "myplat")))]
     {
         let (address, data, vector) = axplat_x86_pc::allocate_msi(handler)?;
+        let Some(index) = u8::try_from(vector).ok() else {
+            let _ = axplat_x86_pc::unregister_msi_vector(vector);
+            return None;
+        };
         let destination = (((address >> 12) & 0xff) | ((address >> 32) & 0xffff_ff00)) as u32;
-        match tk_vtd::platform_map_msi(requester, vector as u8, destination) {
-            Ok(Some((mapped_address, mapped_data))) => Some((mapped_address, mapped_data, vector)),
-            Ok(None) => Some((address, data, vector)),
+        match tk_vtd::platform_map_msi(requester, index, destination) {
+            Ok(Some((mapped_address, mapped_data))) => {
+                MSI_OWNED[usize::from(index)].store(true, Ordering::Release);
+                Some((mapped_address, mapped_data, vector))
+            }
+            Ok(None) => {
+                MSI_OWNED[usize::from(index)].store(true, Ordering::Release);
+                Some((address, data, vector))
+            }
             Err(_) => {
                 let _ = axplat_x86_pc::unregister_msi_vector(vector);
                 None
