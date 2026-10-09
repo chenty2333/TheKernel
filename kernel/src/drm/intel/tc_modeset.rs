@@ -73,9 +73,9 @@ fn write(r: &impl Registers, offset: u32, value: u32) -> Result<(), String> {
         Err(format!("TC modeset write {offset:#x} refused"))
     }
 }
-fn poll(
+fn poll<T: PollTimer + ?Sized>(
     r: &impl Registers,
-    timer: &impl PollTimer,
+    timer: &T,
     offset: u32,
     mask: u32,
     expected: u32,
@@ -454,27 +454,53 @@ pub(super) fn source_hdmi_tmds_clock_with_limit(
 /// follow-up FUNC_CTL write; the caller verifies both writes by readback.
 struct TcTranscoderFuncIo<'a, R> {
     registers: &'a R,
+    func_ctl: Option<Register>,
+    func_ctl2: Option<Register>,
+    buffer_ctl: Option<Register>,
+    timer: Option<&'a dyn PollTimer>,
     read_failed: bool,
     write_failed: bool,
+    wait_timed_out: bool,
 }
 
 impl<'a, R: Registers> TcTranscoderFuncIo<'a, R> {
     fn new(registers: &'a R) -> Self {
         Self {
             registers,
+            func_ctl: Some(ddi::TRANS_DDI_FUNC_CTL_A),
+            func_ctl2: Some(ddi::TRANS_DDI_FUNC_CTL2_A),
+            buffer_ctl: None,
+            timer: None,
             read_failed: false,
             write_failed: false,
+            wait_timed_out: false,
         }
+    }
+
+    fn buffer(registers: &'a R, buffer_ctl: Register, timer: &'a dyn PollTimer) -> Self {
+        Self {
+            registers,
+            func_ctl: None,
+            func_ctl2: None,
+            buffer_ctl: Some(buffer_ctl),
+            timer: Some(timer),
+            read_failed: false,
+            write_failed: false,
+            wait_timed_out: false,
+        }
+    }
+
+    fn register(&self, offset: u32) -> Option<Register> {
+        [self.func_ctl, self.func_ctl2, self.buffer_ctl]
+            .into_iter()
+            .flatten()
+            .find(|register| register.offset() == offset)
     }
 }
 
 impl<R: Registers> intel_display::intel_ddi_full::DdiIo for TcTranscoderFuncIo<'_, R> {
     fn read(&mut self, reg: u32) -> u32 {
-        let typed = if reg == ddi::TRANS_DDI_FUNC_CTL_A.offset() {
-            ddi::TRANS_DDI_FUNC_CTL_A
-        } else if reg == ddi::TRANS_DDI_FUNC_CTL2_A.offset() {
-            ddi::TRANS_DDI_FUNC_CTL2_A
-        } else {
+        let Some(typed) = self.register(reg) else {
             self.read_failed = true;
             return u32::MAX;
         };
@@ -488,11 +514,7 @@ impl<R: Registers> intel_display::intel_ddi_full::DdiIo for TcTranscoderFuncIo<'
     }
 
     fn write(&mut self, reg: u32, value: u32) {
-        let typed = if reg == ddi::TRANS_DDI_FUNC_CTL_A.offset() {
-            ddi::TRANS_DDI_FUNC_CTL_A
-        } else if reg == ddi::TRANS_DDI_FUNC_CTL2_A.offset() {
-            ddi::TRANS_DDI_FUNC_CTL2_A
-        } else {
+        let Some(typed) = self.register(reg) else {
             self.write_failed = true;
             return;
         };
@@ -563,6 +585,65 @@ impl<R: Registers> intel_display::intel_ddi_full::DdiIo for TcTranscoderFuncIo<'
         _value: u32,
     ) {
     }
+
+    fn wait_set(&mut self, reg: u32, mask: u32, timeout_ms: u32) -> bool {
+        self.wait_for_buffer_state(reg, mask, mask, u64::from(timeout_ms) * 1_000)
+    }
+
+    fn wait_clear(&mut self, reg: u32, mask: u32, timeout_ms: u32) -> bool {
+        self.wait_for_buffer_state(reg, mask, 0, u64::from(timeout_ms) * 1_000)
+    }
+}
+
+impl<R: Registers> TcTranscoderFuncIo<'_, R> {
+    fn wait_for_buffer_state(
+        &mut self,
+        reg: u32,
+        mask: u32,
+        expected: u32,
+        timeout_us: u64,
+    ) -> bool {
+        if self.buffer_ctl.is_none_or(|buffer| buffer.offset() != reg) || mask != DDI_IDLE {
+            self.wait_timed_out = true;
+            return true;
+        }
+        let Some(timer) = self.timer else {
+            self.wait_timed_out = true;
+            return true;
+        };
+        let result = poll(self.registers, timer, reg, mask, expected, timeout_us);
+        if result.is_err() {
+            self.wait_timed_out = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn source_tc_encoder(port: TcPort) -> Result<intel_display::intel_ddi_full::DdiEncoder, String> {
+    use intel_display::intel_ddi_full as i915;
+
+    let source_port = match port {
+        TcPort::Tc1 => i915::Port::D,
+        TcPort::Tc2 => i915::Port::E,
+        TcPort::Tc3 | TcPort::Tc4 => {
+            return Err(String::from(
+                "translated DDI buffer path only admits TC1/TC2",
+            ));
+        }
+    };
+    Ok(i915::DdiEncoder {
+        port: source_port,
+        output: i915::OutputType::Hdmi,
+        display: i915::Platform {
+            display_ver: 13,
+            alderlake_p: true,
+            ..i915::Platform::default()
+        },
+        is_tc: true,
+        ..i915::DdiEncoder::default()
+    })
 }
 
 fn disable_pipe_a_transcoder<R: Registers>(registers: &R) -> Result<(), String> {
@@ -614,26 +695,8 @@ fn enable_pipe_a_transcoder<R: Registers>(
     // The source encoder's `port` enum encodes DDI selectors 1..N. On this
     // display-13 DKL route, TC1/TC2 occupy selector values 4/5, corresponding
     // to source enum entries D/E (see `tgl_transcoder_port_select`).
-    let source_port = match port {
-        TcPort::Tc1 => i915::Port::D,
-        TcPort::Tc2 => i915::Port::E,
-        TcPort::Tc3 | TcPort::Tc4 => {
-            return Err(String::from(
-                "translated Pipe-A TC transcoder only admits TC1/TC2",
-            ));
-        }
-    };
-    let encoder = i915::DdiEncoder {
-        port: source_port,
-        output: i915::OutputType::Hdmi,
-        display: i915::Platform {
-            display_ver: 13,
-            alderlake_p: true,
-            ..i915::Platform::default()
-        },
-        is_tc: true,
-        ..i915::DdiEncoder::default()
-    };
+    let encoder = source_tc_encoder(port)?;
+    let source_port = encoder.port;
     let state = i915::CrtcState {
         cpu_transcoder: i915::Transcoder::A,
         output: i915::OutputType::Hdmi,
@@ -801,9 +864,27 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     )?;
     poll(r, timer, p::PIPECONF_A.offset(), PIPE_RUNNING, 0, 100_000)?;
     disable_pipe_a_transcoder(r)?;
-    let current_buf = read(r, control_offset)?;
-    write(r, control_offset, current_buf & !(DDI_ENABLE | DDI_IDLE))?;
-    poll(r, timer, control_offset, DDI_IDLE, DDI_IDLE, 100_000)?;
+    let source_encoder = source_tc_encoder(port)?;
+    let source_state = intel_display::intel_ddi_full::CrtcState {
+        output: intel_display::intel_ddi_full::OutputType::Hdmi,
+        ..intel_display::intel_ddi_full::CrtcState::default()
+    };
+    let source_buffer = mmio_register(control_offset, true);
+    let mut source_io = TcTranscoderFuncIo::buffer(r, source_buffer, timer);
+    intel_display::intel_ddi_full::intel_ddi_buf_disable(
+        &mut source_io,
+        &source_encoder,
+        &source_state,
+    );
+    if source_io.read_failed || source_io.write_failed || source_io.wait_timed_out {
+        return Err(String::from("translated DDI buffer disable failed"));
+    }
+    let idle_buffer = read(r, control_offset)?;
+    if idle_buffer & DDI_ENABLE != 0 || idle_buffer & DDI_IDLE == 0 {
+        return Err(format!(
+            "translated DDI buffer disable readback mismatch {idle_buffer:#x}"
+        ));
+    }
     write(r, 0x46140, 0)?;
     dkl_pll_off(r, timer, port)?;
 
@@ -841,9 +922,18 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     }
     // HDMI on ADL-P/DKL has zero DP lanes and retains board lane reversal. TC
     // PHY ownership remains asserted; no inferred swing or USB-C mux is set.
-    let output = (buffer & DDI_LANE_REVERSAL) | DDI_TC_PHY_OWNERSHIP | DDI_ENABLE;
-    write(r, control_offset, output)?;
-    poll(r, timer, control_offset, DDI_IDLE, 0, 100_000)?;
+    let output = (buffer & DDI_LANE_REVERSAL) | DDI_TC_PHY_OWNERSHIP;
+    let mut source_io = TcTranscoderFuncIo::buffer(r, source_buffer, timer);
+    intel_display::intel_ddi_full::intel_ddi_buf_enable(&mut source_io, &source_encoder, output);
+    if source_io.read_failed || source_io.write_failed || source_io.wait_timed_out {
+        return Err(String::from("translated DDI buffer enable failed"));
+    }
+    let active_buffer = read(r, control_offset)?;
+    if active_buffer & DDI_ENABLE == 0 || active_buffer & DDI_IDLE != 0 {
+        return Err(format!(
+            "translated DDI buffer enable readback mismatch {active_buffer:#x}"
+        ));
+    }
     write(
         r,
         p::PIPECONF_A.offset(),
@@ -908,10 +998,27 @@ mod tests {
         }
 
         fn write(&self, register: super::Register, value: u32) -> bool {
+            let value = if register.offset() == 0x64300 {
+                if value & super::DDI_ENABLE != 0 {
+                    value & !super::DDI_IDLE
+                } else {
+                    value | super::DDI_IDLE
+                }
+            } else {
+                value
+            };
             self.values.borrow_mut().insert(register.offset(), value);
             self.writes.borrow_mut().push((register.offset(), value));
             true
         }
+    }
+
+    struct Timer;
+    impl super::PollTimer for Timer {
+        fn now_micros(&self) -> u64 {
+            0
+        }
+        fn pause(&self) {}
     }
 
     #[test]
@@ -963,6 +1070,44 @@ mod tests {
                     (1 << 16) | (1 << 17)
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn active_tc_path_uses_source_ddi_buffer_handshakes() {
+        use intel_display::intel_ddi_full as i915;
+
+        let registers = TranscoderModel::default();
+        let buffer = super::mmio_register(0x64300, true);
+        registers
+            .values
+            .borrow_mut()
+            .insert(buffer.offset(), super::DDI_IDLE | (1 << 16));
+        let encoder = super::source_tc_encoder(super::TcPort::Tc1).unwrap();
+        let state = i915::CrtcState {
+            output: i915::OutputType::Hdmi,
+            ..i915::CrtcState::default()
+        };
+        let timer = Timer;
+        let mut io = super::TcTranscoderFuncIo::buffer(&registers, buffer, &timer);
+
+        i915::intel_ddi_buf_disable(&mut io, &encoder, &state);
+        assert!(!io.read_failed && !io.write_failed && !io.wait_timed_out);
+        assert_eq!(
+            registers.values.borrow().get(&buffer.offset()),
+            Some(&((1 << 16) | super::DDI_IDLE))
+        );
+
+        registers.writes.borrow_mut().clear();
+        i915::intel_ddi_buf_enable(&mut io, &encoder, (1 << 16) | (1 << 6));
+        assert!(!io.read_failed && !io.write_failed && !io.wait_timed_out);
+        assert_eq!(
+            registers.values.borrow().get(&buffer.offset()),
+            Some(&((1 << 16) | (1 << 6) | super::DDI_ENABLE))
+        );
+        assert_eq!(
+            *registers.writes.borrow(),
+            [(buffer.offset(), (1 << 16) | (1 << 6) | super::DDI_ENABLE)]
         );
     }
 

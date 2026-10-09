@@ -29,3 +29,8 @@ The kernel register-model test covers TC1 FUNC_CTL2-before-FUNC_CTL ordering,
 polarity/port encoding and the matching disable masks; it type-checks with the
 kernel test target, while execution is blocked by the current host linker’s
 bare-metal per-CPU `R_X86_64_32S` relocations.
+The active TC transaction also calls the translated `intel_ddi_buf_disable()`
+and `intel_ddi_buf_enable()` for the source D/E selectors, preserving the
+source posting-read and 10-ms idle/active handshakes. Their adapter is bounded
+to the one selected DDI_BUF_CTL and does not expose DP FEC or PHY registers;
+the model test covers the source wait paths and writes.
