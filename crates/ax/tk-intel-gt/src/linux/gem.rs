@@ -3,30 +3,107 @@
 // Linux v7.2.3 DRM/i915 GEM shared layout records.
 
 use core::{
-    ffi::c_void,
+    ffi::{c_long, c_ulong, c_void},
     mem::{align_of, offset_of, size_of},
 };
 
 use crate::{
     i915_gem_context_types_upstream::I915GemContext,
+    intel_context_types_upstream::File,
+    linux_i915_private::Inode,
     i915_gem_ww_upstream::WwAcquireCtx,
-    intel_context_upstream::DrmGemObjectBaseLayout,
+    intel_context_upstream::{DrmGemObjectBaseLayout, DrmVmaOffsetNode},
     intel_engine_cs_upstream::ListHead,
     linux::ww_mutex::{
         WwMutex, ww_mutex_lock, ww_mutex_lock_slow, ww_mutex_trylock, ww_mutex_unlock,
     },
 };
 
+use crate::intel_context_upstream::DmaFence;
+
 /// The C type name used by DRM/i915 call sites for the 480-byte base union.
 /// Accessed `drm_gem_object` fields use the Linux 7.2.3 x86_64 record layout;
 /// opaque storage preserves the larger `ttm_buffer_object` union size.
 pub type DrmGemObject = DrmGemObjectBaseLayout;
+
+/// `drm_gem_is_imported()` from `include/drm/drm_gem.h`.
+#[inline]
+pub unsafe fn drm_gem_is_imported(obj: *const DrmGemObject) -> bool {
+    !unsafe { (*obj).import_attach }.is_null()
+}
+
+/// `drm_vma_node_start()` from `include/drm/drm_vma_manager.h`.
+#[cfg(feature = "upstream-gt")]
+#[inline]
+pub unsafe fn drm_vma_node_start(node: *const DrmVmaOffsetNode) -> c_ulong {
+    unsafe { (*node).vm_node.start as c_ulong }
+}
+
+/// `drm_vma_node_offset_addr()` from `include/drm/drm_vma_manager.h`.
+#[cfg(feature = "upstream-gt")]
+#[inline]
+pub unsafe fn drm_vma_node_offset_addr(node: *const DrmVmaOffsetNode) -> u64 {
+    unsafe { ((*node).vm_node.start as u64) << crate::linux_config::PAGE_SHIFT }
+}
+
+/// `drm_vma_node_reset()` from `include/drm/drm_vma_manager.h` for the
+/// configured LOCKDEP=n, PREEMPT_RT=n target. In this configuration the
+/// unlocked `rwlock_t` initializer and `RB_ROOT` are all-zero representations.
+/// The source precondition applies: `node` must not currently be allocated in
+/// a VMA-offset manager.
+#[cfg(feature = "upstream-gt")]
+#[inline]
+pub unsafe fn drm_vma_node_reset(node: *mut DrmVmaOffsetNode) {
+    unsafe { core::ptr::write_bytes(node, 0, 1) };
+}
 
 /// Linux v7.2.3 `struct dma_resv` for CONFIG_PREEMPT_RT=n and LOCKDEP=n.
 #[repr(C)]
 pub struct DmaResv {
     pub lock: WwMutex,
     pub fences: *mut c_void,
+}
+
+unsafe extern "C" {
+    #[link_name = "dma_resv_fini"]
+    fn __dma_resv_fini(resv: *mut DmaResv);
+    #[link_name = "dma_resv_get_singleton"]
+    fn __dma_resv_get_singleton(
+        resv: *mut DmaResv,
+        usage: i32,
+        fence: *mut *mut DmaFence,
+    ) -> i32;
+    #[link_name = "dma_resv_wait_timeout"]
+    fn __dma_resv_wait_timeout(
+        resv: *mut DmaResv,
+        usage: i32,
+        intr: bool,
+        timeout: c_long,
+    ) -> c_long;
+}
+
+/// Linux reservation-object API from `include/linux/dma-resv.h`.
+pub unsafe fn dma_resv_fini(resv: *mut DmaResv) {
+    unsafe { __dma_resv_fini(resv) };
+}
+
+/// Linux reservation-object API from `include/linux/dma-resv.h`.
+pub unsafe fn dma_resv_get_singleton(
+    resv: *mut DmaResv,
+    usage: u32,
+    fence: *mut *mut DmaFence,
+) -> i32 {
+    unsafe { __dma_resv_get_singleton(resv, usage as i32, fence) }
+}
+
+/// Linux reservation-object API from `include/linux/dma-resv.h`.
+pub unsafe fn dma_resv_wait_timeout(
+    resv: *mut DmaResv,
+    usage: u32,
+    intr: bool,
+    timeout: c_long,
+) -> c_long {
+    unsafe { __dma_resv_wait_timeout(resv, usage as i32, intr, timeout) }
 }
 
 const _: [(); 40] = [(); size_of::<DmaResv>()];
@@ -103,11 +180,42 @@ const _: [(); 8] = [(); align_of::<TtmBufferObjectLayout>()];
 /// GEM handle close paths. Later DRM file fields are not accessed here.
 #[repr(C)]
 pub struct DrmFile {
-    _prefix: [u8; 136],
+    _before_minor: [u8; 72],
+    pub minor: *mut DrmMinor,
+    _before_driver_priv: [u8; 56],
     pub driver_priv: *mut core::ffi::c_void,
+    _tail: [u8; 224],
 }
 
+#[repr(C)]
+pub struct DrmMinor {
+    _index: i32,
+    _type: i32,
+    _kdev: *mut core::ffi::c_void,
+    pub dev: *mut core::ffi::c_void,
+}
+
+const _: [(); 72] = [(); offset_of!(DrmFile, minor)];
 const _: [(); 136] = [(); offset_of!(DrmFile, driver_priv)];
+const _: [(); 368] = [(); size_of::<DrmFile>()];
+const _: [(); 16] = [(); offset_of!(DrmMinor, dev)];
+
+/// Linux 7.2.3 `file_operations` record for the configured x86_64 build.
+/// Unused entries preserve the source table positions; `release` is the
+/// callback consumed by the singleton i915 mmap file.
+#[repr(C)]
+pub struct FileOperations {
+    pub owner: *mut core::ffi::c_void,
+    fop_flags: u32,
+    _flags_pad: u32,
+    _before_release: [*const core::ffi::c_void; 13],
+    pub release: Option<unsafe extern "C" fn(*mut Inode, *mut File) -> i32>,
+    _after_release: [*const core::ffi::c_void; 18],
+}
+
+unsafe impl Sync for FileOperations {}
+const _: [(); 120] = [(); offset_of!(FileOperations, release)];
+const _: [(); 272] = [(); size_of::<FileOperations>()];
 
 /// `struct i915_lut_handle` from `gem/i915_gem_object_types.h`.
 #[repr(C)]
