@@ -1971,3 +1971,19 @@ this target is Gen12, where the upstream selector returns null.
 `intel_gt_irq_upstream.rs` translates all 21 definitions in Linux 7.2.3
 `drivers/gpu/drm/i915/gt/intel_gt_irq.c` (MIT, Copyright © 2019 Intel
 Corporation); display interrupt dispatch remains a kernel-provided callback boundary.
+
+`intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
+Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.
+
+`intel_gt_pm_upstream.rs` translates all 20 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_gt_pm.c` (MIT, Copyright © 2019 Intel
+Corporation); runtime-PM, display-power, RC6/RPS, request, and system-PM services remain explicit owner boundaries.
+
+`intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
+Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.
+
+`intel_gt_pm_upstream.rs` translates all 20 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_gt_pm.c` (MIT, Copyright © 2019 Intel
+Corporation); runtime-PM, display-power, RC6/RPS, request, and system-PM services remain explicit owner boundaries.

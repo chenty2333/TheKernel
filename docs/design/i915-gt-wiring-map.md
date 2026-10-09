@@ -24,7 +24,7 @@
 | `intel_gt_init_hw()` / `intel_gt_init()` | **仅声明**：`intel_gt_api_upstream.rs:171-173`；`intel_gt.c` 函数体仍缺。默认 N305 `initialize()` 直接执行保守 reset 和 `copy::run()`，不是这些函数的适配器。 | reset、MMIO、DMA retirement 必须由真实 GT owner 执行；不可由 host 测试模型替代。 |
 | `intel_uc_init_early()` / `intel_uc_init_late()` / `intel_uc_init_mmio()` | **feature**：`intel_uc_upstream.rs:308,327,344`（`intel_uc.c`，36/36）。不从默认路径调用。 | firmware/workqueue/locks 为 LinuxKPI 产品服务；uC 回调指向 GuC/HuC/GSC owner，部分目前仅有声明或未与 kernel owner 连通。 |
 | `__uc_init_hw()` / uC firmware fetch、upload | **feature**：`intel_uc_upstream.rs:456,690`；`intel_uc_fw_upstream.rs`（`intel_uc_fw.c`，38/38）；`intel_wopcm_upstream.rs`（10/10）；`intel_huc_fw_upstream.rs`（6/6）。 | rootfs firmware：`linux/firmware.rs` 通过 `axdriver_base::firmware` 的真实文件读取器，保留尺寸/缺失错误；`on_rootfs_ready` 由 kernel 注册。MMIO/DMA/WOPCM 仍需要真实 kernel GT owner。 |
-| GuC 固件启动 / `intel_guc_init()` | **部分 feature**：`intel_guc_upstream.rs` 为 `intel_guc.c` 的 20/38；`guc_fw.rs:175-205,457-548` 是默认构建的 Gen12 upload/RSA/status 子集。全量 feature 翻译仍在进行。 | DMA、MMIO、firmware 真实产品服务；固件/GGTT lease 生命周期由当前自有 GT owner 管理，和 upstream GEM 类型尚未贯通。 |
+| GuC 固件启动 / `intel_guc_init()` | **feature**：`intel_guc_upstream.rs:584`（`intel_guc.c`，38/38）；`intel_uc_upstream.rs:690` 是上游 uC init-hw。`guc_fw.rs:175-205,457-548` 仍是默认构建的 Gen12 upload/RSA/status 子集，源码模块尚未接默认 owner。 | DMA、MMIO、firmware 为产品服务；PCI revision 经 `linux/i915.rs:27-48` 的安装式 reader 实际读取，缺 provider 时 fail-closed。固件/GGTT lease 与 upstream GEM 类型尚未贯通。 |
 | `intel_guc_submission_enable()` / engine 注册 | **feature**：`guc_submission_upstream.rs:4570` 起有 upstream 定义；`intel_uc_upstream.rs:787` 调用该定义。默认手写子集在 `guc_submission.rs:542` `submit_request()`，运行时调用从 `gt/copy.rs:1225` 的 `submit_guc_context_request()` 进入。upstream 的 `intel_gt.c` / engine init 调用者仍缺。 | CTB 默认子集用真实 MMIO/GGTT 与有限同步轮询；feature LinuxKPI tasklet/workqueue/RCU 是 axtask 运行时适配器（不等于 Linux softirq/per-queue 并行），尚未成为 kernel 的上游 engine 调度路径。 |
 
 ## 2. 中断：GT、GuC CT 与 breadcrumbs
@@ -32,7 +32,7 @@
 | 上游调用 | 对应 Rust 函数（文件:行 / 构建路径） | LinuxKPI/内核服务依赖及状态 |
 |---|---|---|
 | `gen11_irq_handler()` / display IRQ 分发 | `i915_irq.c` 本轮仅计划翻译 Gen11+ top-level 和 GT 分发；Rust callback 接口尚缺。当前 `kernel/src/drm/intel/irq.rs:526` `display_irq_handler()`、`:665` `dispatch()` 是**默认 display-only** 分发，不处理 GT/GuC CT。 | PCI INTx/MSI 和 display IRQ handler 是 kernel 实际 IRQ 路径；GT vector/共享 master enable 尚未交给 upstream-gt。display 分发必须由 callback 保留，不能在 GT 翻译里重复 ACK display 状态。 |
-| `gen11_gt_irq_handler()` / GT identity 分发 | **feature**：正在集成的 `intel_gt_irq_upstream.rs:399`（`intel_gt_irq.c`，21/21）；`:250` 的 `guc_irq_handler()`。当前 kernel 入口 `irq.rs` 未调用它。 | `linux/irq.rs` 的 `irq_work` 使用 axtask 延迟执行（产品实现、非 Linux softirq）；tasklet 用持久 axtask worker（产品 task-context 近似，不是 host-only fake）；尚未接 GT 硬件 IRQ。 |
+| `gen11_gt_irq_handler()` / GT identity 分发 | **feature**：`intel_gt_irq_upstream.rs:399`（`intel_gt_irq.c`，21/21，已注册/编译/测试）；`:250` 的 `guc_irq_handler()`。当前 kernel 入口 `irq.rs` 未调用它。 | `linux/irq.rs:85` 的 `irq_work_queue()` 使用 axtask 延迟执行（产品实现、非 Linux softirq）；`linux/tasklet.rs:570` `tasklet_schedule()` 用持久 axtask worker（产品 task-context 近似，不是 host-only fake）；尚未接 GT 硬件 IRQ。 |
 | GT PM IRQ mask/reset | **feature**：`intel_gt_pm_irq_upstream.rs:24-116`（8/8）。没有 kernel 中断安装/dispatch caller。 | spinlock/IRQ-save 是 `kernel_guard` 产品实现，host 下 guard 为 NoOp；硬件 mask/ACK 仍需 kernel 提供唯一 owner。 |
 | GuC CT receive / `ct_receive()` / `ct_handle_msg()` | **缺少 `intel_guc_ct.c` source-order 模块**；当前 default `guc_ct.rs:353` `send_busy_loop()` 与 `gt/copy.rs` 的 CTB/G2H polling 仅支持受限同步消息。`intel_guc_ct_types_upstream.rs` 仅有布局/API owner，不是接收实现。 | `wait.rs` 基于 axtask sleep/wakeup（产品路径）；tasklet/workqueue 采用 task-context worker 适配；CTB IRQ handler/异步 G2H event caller 尚未接。 |
 | `intel_breadcrumbs` / fence completion | **无 upstream IRQ completion caller**。默认 N305 `gt/copy.rs:2443-2532` 消费 Gen12 CSB 与 HWS scratch，作为受限同步作业完成路径；不提升 Linux `i915_request`/timeline fences。 | atomic、wait queue 和 task wakeup 为产品代码；不构成 Linux RCU/softirq/fence scheduler 的等价证明。 |
@@ -60,11 +60,11 @@
 
 | 上游调用 | 对应 Rust 函数（文件:行 / 构建路径） | LinuxKPI/内核服务依赖及状态 |
 |---|---|---|
-| `intel_gt_pm_get()/put()` | **feature helper**：`crates/ax/tk-intel-gt/src/linux/pm.rs:85,92`。目前没有 kernel GT owner 安装 `RuntimePmOps`，无真实 callback 时 fail-fast。默认 `gt.rs` 所有者以自己的 awake/lease 状态管理，不调用 upstream wakeref。 | runtime PM callback ABI 存在，接线缺失；不能把 host test callback 当成电源域控制。 |
-| GT unpark/park / `POWER_DOMAIN_GT_IRQ` | `intel_gt_pm.c` 当前未翻译。Linux 上游 unpark 同时拿 display GT IRQ power domain；TheKernel `kernel/src/drm/intel/native_power.rs` 是 display domain owner，但没有 GT IRQ acquire/async-put adapter。 | `linux/pm.rs` 的 GT wakeref 是有边界的产品实现；display power domain 是独立 kernel 产品实现，二者还未接通。 |
+| `intel_gt_pm_get()/put()` | **feature**：LinuxKPI `linux/pm.rs:85,92`；`intel_gt_pm_upstream.rs:241-585` 翻译 `intel_gt_pm.c` 全 20/20。kernel GT owner 尚未安装 `RuntimePmOps`，无真实 callback 时 fail-fast。默认 `gt.rs` owner 以自己的 awake/lease 状态管理，不调用 upstream wakeref。 | runtime PM callback ABI 存在，接线缺失；不能把 host test callback 当成电源域控制。 |
+| GT unpark/park / `POWER_DOMAIN_GT_IRQ` | **feature**：`intel_gt_pm_upstream.rs:241,262` 保留上游取/异步释放 display IRQ power-domain 顺序；`kernel/src/drm/intel/native_power.rs:24-28,129-133` 是 display domain owner，但没有 GT IRQ acquire/async-put adapter。 | `linux/pm.rs` 的 GT wakeref 是产品 callback boundary；display power domain 是独立 kernel 产品实现，二者还未接通。 |
 | RC6 enable/disable/sanitize | `intel_rc6.c` 上游实现仍待翻译；当前 `intel_rc6_types_upstream.rs` 只有类型。默认 N305不接 RC6 自动状态机。 | GT/display 共享低功耗状态可能影响唯一 console scanout；无独立 host-only 模型可替代硬件域仲裁。 |
 | RPS/SLPC | `intel_rps_upstream.rs` 当前只翻译 5/134；`intel_guc_slpc_upstream.rs` 存在 source-order 模块。默认路径不启用 upstream RPS/SLPC。 | MMIO/GuC CT/workqueue/runtime PM 均须有真实 owner；SLPC 调频只可在 GuC firmware 已确认拥有提交与功率策略后启用。 |
-| system suspend/resume | `intel_uc_upstream.rs:924-1026` 提供 uC suspend/resume source functions；GT 总体 `intel_gt_pm.c` 尚缺，kernel `gt.rs` 无系统 PM suspend/resume hook。 | timer/workqueue/GT wakeref/firmware state 必须跨 suspend 有真实生命周期；当前只支持引导后受限 GT owner 生命周期。 |
+| system suspend/resume | `intel_gt_pm_upstream.rs:520-585` 翻译 GT suspend/runtime-PM 与 awake-time函数，`intel_uc_upstream.rs:924-1026` 提供 uC suspend/resume；kernel `gt.rs` 尚无系统 PM hook。 | timer/workqueue/GT wakeref/firmware state 必须跨 suspend 有真实生命周期；当前只支持引导后受限 GT owner 生命周期。 |
 
 ## LinuxKPI 服务真实性索引
 
@@ -80,25 +80,27 @@
 
 ## 重复的所有者
 
-切换时必须以同一条 source-of-truth 只保留一个调用 owner；默认手写/受限实现和 `upstream-gt` 来源翻译**并行存在不构成已经切换**。当前可确认的直接重叠包括：
+切换时必须以同一条 source-of-truth 只保留一个调用 owner；默认手写/受限实现和 `upstream-gt` 来源翻译**并行存在不构成已经切换**。已存在的双实现列为 confirmed；计划补齐的同源文件列为 pending owner gate：
 
 1. `intel_uc_fw.c`：默认 `uc.rs` 的 firmware policy/phase 子集 ↔ feature `intel_uc_fw_upstream.rs`（38/38）。前者保留 N305 loader state owner；feature 版尚未成为调用者。
-2. `intel_guc_submission.c`：默认 `guc_submission.rs` 的单 LRC/CTB 状态子集 ↔ feature `guc_submission_upstream.rs` source-order 翻译。默认路径尚在 `gt/copy.rs`。
-3. `intel_guc_capture.c`：默认 `guc_capture.rs` 的 parser/cache slice ↔ feature `intel_guc_capture_upstream.rs` source-order helpers。默认 diagnostics cache lifecycle/IRQ caller并不完整。
-4. `intel_lrc.c`：默认 `lrc.rs` 的 Gen12 XCS image helpers ↔ feature `intel_lrc_upstream.rs`。前者只支撑 N305自有 BCS/RCS 子集；两者有不同类型/owner契约。
-5. `intel_execlists_submission.c`：默认 `execlists.rs` 两端口/CSB polling 子集 ↔ feature `intel_execlists_submission_upstream.rs`。未切换完整 request queue/CSB IRQ state machine。
-6. `intel_wopcm.c`：默认 `wopcm.rs` Gen12 partition helper ↔ feature `intel_wopcm_upstream.rs`（10/10）。前者被当前 N305固件上传路径调用。
-7. `intel_guc_ct.c`：默认 `guc_ct.rs` 手写同步 CTB/HXG slice；当前 feature 只有 `intel_guc_ct_types_upstream.rs` ABI layout，**还没有**同名完整 C translation。完成翻译后必须二选一，或由一个 owner显式委托另一个。
-8. `intel_guc_ads.c`：默认 `guc_ads.rs` 运行期 ABI builder；当前还没有 source-order function module。未来 translation仅应作为验证/参考，不能成为第二个 ADS backing owner。
+2. `intel_guc.c`：默认 `guc_fw.rs` / `guc_config.rs` 的 Gen12 CT/notify/parameter slice ↔ feature `intel_guc_upstream.rs`（38/38）。default helper marker 已移除以免伪装成逐函数 source translation；运行时仍由自有 GT owner调用。
+3. `intel_guc_submission.c`：默认 `guc_submission.rs` 的单 LRC/CTB 状态子集 ↔ feature `guc_submission_upstream.rs` source-order 翻译。默认路径尚在 `gt/copy.rs`。
+4. `intel_guc_capture.c`：默认 `guc_capture.rs` 的 parser/cache slice ↔ feature `intel_guc_capture_upstream.rs` source-order helpers。默认 diagnostics cache lifecycle/IRQ caller并不完整。
+5. `intel_lrc.c`：默认 `lrc.rs` 的 Gen12 XCS image helpers ↔ feature `intel_lrc_upstream.rs`。前者只支撑 N305自有 BCS/RCS 子集；两者有不同类型/owner契约。
+6. `intel_execlists_submission.c`：默认 `execlists.rs` 两端口/CSB polling 子集 ↔ feature `intel_execlists_submission_upstream.rs`。未切换完整 request queue/CSB IRQ state machine。
+7. `intel_wopcm.c`：默认 `wopcm.rs` Gen12 partition helper ↔ feature `intel_wopcm_upstream.rs`（10/10）。前者被当前 N305固件上传路径调用。
+8. `intel_huc.c`（pending）：默认 `huc.rs` Gen11+/GuC auth slice；完整 source-order 模块待补齐后须选择唯一运行 owner。
+9. `intel_guc_ct.c`（pending）：默认 `guc_ct.rs` 手写同步 CTB/HXG slice；当前 feature 只有 `intel_guc_ct_types_upstream.rs` ABI layout。完成翻译后必须二选一，或由一个 owner显式委托另一个。
+10. `intel_guc_ads.c`（pending）：默认 `guc_ads.rs` 运行期 ABI builder；完整 source-order function module待补。未来 translation仅应作为验证/参考，不能成为第二个 ADS backing owner。
 
-**当前重复所有者条目：8 条**（其中 6 条已有双方代码、2 条记录需在继续翻译后做 owner gate；如后续模块新增/移除，此计数应随表更新）。
+**当前重复所有者条目：10 条**（7 条已有两个源代码 owner；3 条是待补模块后的 owner gate）。
 
 ## 接线时 kernel 侧必须提供的接口点
 
 1. **MMIO owner**：受校验的 GT BAR/window，带 read/write/posting-read 与 terminal I/O failure 传播；同时声明 display 与 GT 的 BAR/寄存器 ownership。
 2. **GGTT / display scanout 保留区**：GT 与 display 使用同一设备 aperture；kernel需暴露受保护的 scanout/firmware framebuffer范围、GGTT allocator、bind/unbind 与 DMA retirement。不能覆盖当前唯一 console framebuffer。
 3. **IRQ/MSI**：共享 PCI function 的 GT/display vector ownership、mask/ack ordering 与 top-level handler；Gen11+ GT handler须接 display handler callback，不能重复处理 display bits。
-4. **forcewake 与 runtime PM**：安装真实芯片的 `IntelUncoreFwGet` acquire/ack callback，`RuntimePmOps` 需与现有设备/runtime power owner一致；未安装必须拒绝 GT MMIO。
+4. **forcewake 与 runtime PM**：安装真实芯片的 `IntelUncoreFwGet` acquire/ack callback，`RuntimePmOps` 需与现有设备/runtime power owner一致；安装 PCI revision reader供 `INTEL_REVID(i915)` 使用；未安装必须拒绝 GT MMIO/uC init。
 5. **rootfs firmware**：保留 `firmware::on_rootfs_ready()` callback 与 `/lib/firmware/i915/...` rootfs path；避免在 PCI probe 早期同步读 rootfs。
 6. **reset、DMA 与执行 fences**：reset域须声明影响的 engine/display；要求有 completion/fence、device DMA停止证明后才能解绑/释放对象页；未知状态要 quarantine。
 7. **power-domain callback**：GT unpark/park 需与 display `POWER_DOMAIN_GT_IRQ` 对接，且 asynchronous put 保留 display power ref生命周期。
