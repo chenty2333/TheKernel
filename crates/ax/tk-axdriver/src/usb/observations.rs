@@ -192,6 +192,11 @@ mod tests {
                 interface: 2,
             })
         );
+        let identity = input_identity(3, location, 1, 2).unwrap();
+        assert_eq!(
+            crate::InputBusIdentity::usb_physical_path(identity),
+            "usb3/3-4.2:1.2/input"
+        );
         assert_eq!(
             input_identity(
                 3,

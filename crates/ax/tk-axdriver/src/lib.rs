@@ -224,6 +224,16 @@ impl InputBusIdentity {
         }
         name
     }
+
+    pub fn usb_physical_path(identity: UsbInputIdentity) -> alloc::string::String {
+        alloc::format!(
+            "usb{}/{}:{}.{:x}/input",
+            identity.bus,
+            Self::usb_device_name(identity),
+            identity.configuration,
+            identity.interface,
+        )
+    }
 }
 
 /// Reconciles supported PCI/USB input transports and delivers additions and

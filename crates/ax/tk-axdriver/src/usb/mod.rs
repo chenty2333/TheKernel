@@ -7,7 +7,7 @@ mod root_partition;
 mod storage;
 mod sync;
 
-use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::{
     future::Future,
     pin::pin,
@@ -607,34 +607,39 @@ fn process_connected(
                 return Ok(());
             }
             if interface.class == 3 {
+                let identity = location.and_then(|location| {
+                    observations::input_identity(
+                        controller.bus,
+                        location,
+                        config.configuration_value,
+                        interface.interface_number,
+                    )
+                });
+                if track_hid && identity.is_none() {
+                    warn!(
+                        "USB HID interface {} has no valid observed port identity; not publishing \
+                         input",
+                        interface.interface_number
+                    );
+                    return Ok(());
+                }
+                let physical_location = identity.map_or_else(String::new, |identity| {
+                    InputBusIdentity::usb_physical_path(identity)
+                });
                 let input = UsbInput::new(
                     controller.host.clone(),
                     device.clone(),
                     session,
                     interface,
                     dma_quiesced.clone(),
+                    physical_location,
                 )?;
                 if !track_hid && boot {
                     devices.push(input_device(input));
                     return Ok(());
                 }
-                // A route-less HID remains owned by this controller but is
-                // not published under a synthetic PCI/virtio identity.
-                let Some(location) = location else {
-                    warn!("USB HID interface has no observed port identity; not publishing input");
-                    return Ok(());
-                };
-                let Some(identity) = observations::input_identity(
-                    controller.bus,
-                    location,
-                    config.configuration_value,
-                    interface.interface_number,
-                ) else {
-                    warn!(
-                        "USB HID interface has invalid observed port identity; not publishing \
-                         input"
-                    );
-                    return Ok(());
+                let Some(identity) = identity else {
+                    unreachable!()
                 };
                 managed.interfaces.insert(
                     interface.interface_number,

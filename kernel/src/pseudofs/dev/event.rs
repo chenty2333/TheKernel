@@ -1984,12 +1984,9 @@ fn input_transport_path(identity: axdriver::InputBusIdentity) -> String {
 
 fn input_physical_path(identity: axdriver::InputBusIdentity) -> String {
     match identity {
-        axdriver::InputBusIdentity::Usb(identity) => format!(
-            "{}:{}.{:x}/input",
-            input_transport_path(axdriver::InputBusIdentity::Usb(identity)),
-            identity.configuration,
-            identity.interface,
-        ),
+        axdriver::InputBusIdentity::Usb(identity) => {
+            axdriver::InputBusIdentity::usb_physical_path(identity)
+        }
         _ => format!("{}/input", input_transport_path(identity)),
     }
 }

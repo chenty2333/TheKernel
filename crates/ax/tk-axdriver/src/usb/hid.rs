@@ -1,5 +1,5 @@
 //! USB HID report protocol using the bounded shared descriptor decoder.
-use alloc::collections::VecDeque;
+use alloc::{collections::VecDeque, string::String};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use axdriver_base::{BaseDriverOps, DeviceType};
@@ -11,6 +11,7 @@ use super::*;
 pub struct UsbInput {
     state: Mutex<InputState>,
     id: InputDeviceId,
+    physical_location: String,
 }
 struct InputState {
     host: Arc<Host>,
@@ -30,6 +31,7 @@ impl UsbInput {
         session: InterfaceSession,
         interface: &InterfaceDescriptor,
         dma_quiesced: Arc<AtomicBool>,
+        physical_location: String,
     ) -> DevResult<Self> {
         let descriptor = interface
             .endpoints
@@ -77,6 +79,7 @@ impl UsbInput {
         )?);
         Ok(Self {
             id,
+            physical_location,
             state: Mutex::new(InputState {
                 host,
                 _owner: DeviceOwner {
@@ -123,9 +126,7 @@ impl InputDriverOps for UsbInput {
         self.id
     }
     fn physical_location(&self) -> &str {
-        // The input subsystem derives the stable physical path from the
-        // retained USB bus/port/interface identity rather than a generic tag.
-        ""
+        &self.physical_location
     }
     fn unique_id(&self) -> &str {
         ""
