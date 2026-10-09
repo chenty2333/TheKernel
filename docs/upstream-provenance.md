@@ -1899,3 +1899,8 @@ threshold 40: `(0, 0, 0, 414, 405, 0, 0)`; threshold 25:
 `(18, 15, 4, 1318, 1303, 0, 0)`, in the CI baseline's seven-column order.
 Other scopes are unchanged. The feature remains default-off; compilation and
 host tests do not constitute native hardware or runtime integration acceptance.
+
+`intel_gt_requests_upstream.rs` is a complete source-order translation of all 15
+function definitions in Linux 7.2.3 `drivers/gpu/drm/i915/gt/intel_gt_requests.c`
+(MIT, Copyright © 2019 Intel Corporation). Its LinuxKPI additions are the
+source-semantic fence wait dispatcher and relative jiffies rounding helper.

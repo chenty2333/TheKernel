@@ -40,6 +40,27 @@ pub unsafe fn dma_fence_put(fence: *mut DmaFence) {
     }
 }
 
+/// Linux `dma_fence_wait_timeout()` dispatch for the source-owned i915 fence
+/// operations. A signaled fence preserves Linux's timeout return convention;
+/// otherwise the driver's wait op performs the ordered enable/wait protocol.
+pub unsafe fn dma_fence_wait_timeout(
+    fence: *mut DmaFence,
+    interruptible: bool,
+    timeout: core::ffi::c_long,
+) -> core::ffi::c_long {
+    assert!(!fence.is_null());
+    if crate::linux::bits::test_bit(
+        crate::linux::requests::DMA_FENCE_FLAG_SIGNALED_BIT,
+        unsafe { &(*fence).flags },
+    ) {
+        return timeout;
+    }
+    let ops = unsafe { (*fence).ops.cast::<DmaFenceOps>() };
+    assert!(!ops.is_null(), "dma_fence has no operations table");
+    let wait = unsafe { (*ops).wait }.expect("i915 dma_fence missing wait operation");
+    unsafe { wait(fence, interruptible, timeout) }
+}
+
 unsafe extern "C" fn dma_fence_release_i915(refcount: *mut Kref) {
     if refcount.is_null() {
         return;
