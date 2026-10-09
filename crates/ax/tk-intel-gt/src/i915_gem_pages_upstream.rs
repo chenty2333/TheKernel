@@ -163,6 +163,7 @@ fn is_err_or_null(ptr: *const c_void) -> bool {
 // bindings rather than success-returning stand-ins. The final section reports
 // the precise lower-layer symbols still required by this translation.
 unsafe extern "C" {
+    fn sg_alloc_table(sgt: *mut SgTable, nents: u32, gfp_mask: u32) -> c_int;
     pub(crate) fn i915_gem_object_release_mmap_offset(obj: *mut DrmI915GemObject);
     fn intel_gt_invalidate_tlb_full(gt: *mut IntelGt, seqno: u32);
     pub(crate) fn drm_clflush_sg(pages: *mut SgTable);
@@ -195,6 +196,61 @@ unsafe extern "C" {
     fn set_page_dirty(page: *mut Page);
     fn pat_enabled() -> bool;
     fn might_sleep();
+}
+
+#[repr(C)]
+struct SgTableLayout {
+    sgl: *mut Scatterlist,
+    nents: u32,
+    orig_nents: u32,
+}
+const _: [(); 16] = [(); size_of::<SgTableLayout>()];
+
+/// `i915_sg_trim()` (`i915_scatterlist.c`): replace an over-allocated SG
+/// table with one sized to its mapped entries, retaining page and DMA values.
+// upstream: i915_scatterlist.c i915_sg_trim()
+pub(crate) unsafe fn i915_sg_trim(orig_st: *mut SgTable) -> bool {
+    let orig = unsafe { &*orig_st.cast::<SgTableLayout>() };
+    if orig.nents == orig.orig_nents {
+        return false;
+    }
+
+    let mut new_st = core::mem::MaybeUninit::<SgTableLayout>::uninit();
+    let new_st_ptr = new_st.as_mut_ptr().cast::<SgTable>();
+    let gfp = crate::linux_config::GFP_KERNEL | crate::linux_config::__GFP_NOWARN;
+    if unsafe { sg_alloc_table(new_st_ptr, orig.nents, gfp) } != 0 {
+        return false;
+    }
+    let new_layout = unsafe { new_st.assume_init_mut() };
+    let mut sg = orig.sgl;
+    let mut new_sg = new_layout.sgl;
+    for _ in 0..orig.nents {
+        assert!(!sg.is_null() && !new_sg.is_null(), "invalid SG table bounds");
+        unsafe {
+            sg_set_page(new_sg, sg_page(sg), (*sg).length, 0);
+            (*new_sg).dma_address = (*sg).dma_address;
+            (*new_sg).dma_length = (*sg).dma_length;
+            sg = sg_next(sg);
+            new_sg = sg_next(new_sg);
+        }
+    }
+    assert!(new_sg.is_null(), "SG clone did not end at nents");
+
+    unsafe {
+        crate::i915_gem_userptr_upstream::sg_free_table(orig_st);
+        ptr::copy_nonoverlapping(new_st.as_ptr(), orig_st.cast::<SgTableLayout>(), 1);
+    }
+    true
+}
+
+#[inline]
+unsafe fn sg_set_page(sg: *mut Scatterlist, page: *mut Page, len: u32, offset: u32) {
+    assert_eq!((page as usize) & SG_PAGE_LINK_MASK, 0);
+    unsafe {
+        (*sg).page_link = ((*sg).page_link & SG_PAGE_LINK_MASK) | page as usize;
+        (*sg).offset = offset;
+        (*sg).length = len;
+    }
 }
 
 // `CONFIG_HIGHMEM` is not selectable for the target's x86_64 Linux 7.2.3
@@ -334,6 +390,34 @@ unsafe fn radix_tree_next_slot(
 #[inline]
 pub(crate) unsafe fn sg_page(sg: *mut Scatterlist) -> *mut Page {
     unsafe { ((*sg).page_link & !SG_PAGE_LINK_MASK) as *mut Page }
+}
+
+/// Linux `sg_mark_end()` header helper: set the terminal bit and clear a
+/// possible chain marker without disturbing the encoded page pointer.
+#[inline]
+pub(crate) unsafe fn sg_mark_end(sg: *mut Scatterlist) {
+    unsafe {
+        (*sg).page_link |= SG_END;
+        (*sg).page_link &= !SG_CHAIN;
+    }
+}
+
+/// Linux `sg_set_folio()` header helper. `struct folio` begins with its
+/// embedded `struct page`; the caller supplies the source `size_t` length and
+/// offset, which Linux stores in the unsigned-int scatterlist fields.
+#[inline]
+pub(crate) unsafe fn sg_set_folio(
+    sg: *mut Scatterlist,
+    folio: *mut c_void,
+    len: usize,
+    offset: usize,
+) {
+    unsafe {
+        let page = folio.cast::<Page>();
+        (*sg).page_link = ((*sg).page_link & SG_PAGE_LINK_MASK) | page as usize;
+        (*sg).offset = offset as u32;
+        (*sg).length = len as u32;
+    }
 }
 #[inline]
 unsafe fn sg_dma_address(sg: *mut Scatterlist) -> u64 {
