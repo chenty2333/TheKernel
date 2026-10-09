@@ -14,18 +14,38 @@ use crate::{
     intel_engine_cs_upstream::{AtomicT, IntelEngineCs, IntelGt, Spinlock},
     intel_context_upstream::Kref,
     linux::{gem_memory::I915GemMm, i915::IntelRuntimeInfo},
+    intel_wakeref_types_upstream::IntelWakerefAuto,
     linux_memory::{atomic_inc, atomic_read},
 };
 
-/// The opaque storage of the leading `struct drm_device` in the target
-/// x86_64 wt-dev configuration. No drm_device members are accessed through
-/// this representation; its size/alignment preserve the following offsets.
+/// Linux DRM inode prefix used for the anon-inode file mapping.
+#[repr(C, align(8))]
+pub struct Inode {
+    _before_i_mapping: [u8; 48],
+    pub i_mapping: *mut c_void,
+    _tail: [u8; 488],
+}
+
+#[repr(C)]
+pub struct DrmVmaOffsetManager {
+    _opaque: [u8; 0],
+}
+
+/// Target-layout fields used from the leading `struct drm_device`; gaps
+/// remain opaque but are bounded by the configured Linux 7.2.3 C offsets.
 #[repr(C, align(8))]
 pub struct DrmDevicePrefix {
     if_version: i32,
     refcount: Kref,
     pub dev: *mut c_void,
-    _bytes: [u8; DRM_DEVICE_SIZE - 16],
+    pub dma_dev: *mut c_void,
+    _before_unplugged: [u8; 92],
+    pub unplugged: bool,
+    _anon_inode_pad: [u8; 3],
+    pub anon_inode: *mut Inode,
+    _before_vma_offset_manager: [u8; 1360],
+    pub vma_offset_manager: *mut DrmVmaOffsetManager,
+    _tail: [u8; 56],
 }
 
 pub const DRM_DEVICE_SIZE: usize = 1552;
@@ -65,7 +85,8 @@ pub struct I915GpuError {
 /// callers pass its address to an installed opaque runtime-PM backend.
 #[repr(C, align(8))]
 pub struct IntelRuntimePmPrefix {
-    _opaque: [u8; 8],
+    _before_userfault_wakeref: [u8; 40],
+    pub userfault_wakeref: IntelWakerefAuto,
 }
 
 /// Source-derived Linux 7.2.3 `drm_i915_private` ABI overlay for the x86_64
@@ -97,7 +118,7 @@ pub struct DrmI915Private {
     pub suspend_count: u32,
     pub vlv_s0ix_state: *mut c_void,
     pub runtime_pm: IntelRuntimePmPrefix,
-    _before_gt: [u8; 344],
+    _before_gt: [u8; 248],
     pub gt: [*mut IntelGt; I915_MAX_GT],
     pub sysfs_gt: *mut c_void,
     pub media_gt: *mut IntelGt,
@@ -150,8 +171,15 @@ pub unsafe fn i915_reset_engine_count(
 }
 
 const _: [(); 1552] = [(); size_of::<DrmDevicePrefix>()];
+const _: [(); 104] = [(); size_of::<IntelRuntimePmPrefix>()];
+const _: [(); 40] = [(); offset_of!(IntelRuntimePmPrefix, userfault_wakeref)];
 const _: [(); 8] = [(); offset_of!(DrmDevicePrefix, dev)];
 const _: [(); 8] = [(); align_of::<DrmDevicePrefix>()];
+const _: [(); 544] = [(); size_of::<Inode>()];
+const _: [(); 48] = [(); offset_of!(Inode, i_mapping)];
+const _: [(); 116] = [(); offset_of!(DrmDevicePrefix, unplugged)];
+const _: [(); 120] = [(); offset_of!(DrmDevicePrefix, anon_inode)];
+const _: [(); 1488] = [(); offset_of!(DrmDevicePrefix, vma_offset_manager)];
 
 const _: [(); 80] = [(); size_of::<I915Params>()];
 const _: [(); 8] = [(); align_of::<I915Params>()];
@@ -193,4 +221,5 @@ const _: [(); 3608] = [(); offset_of!(DrmI915Private, _overlay)];
 const _: [(); 5928] = [(); size_of::<DrmI915Private>()];
 const _: [(); 5928] = [(); size_of::<DrmI915Private>()];
 const _: [(); 40] = [(); size_of::<I915GpuError>()];
-const _: [(); 8] = [(); size_of::<IntelRuntimePmPrefix>()];
+const _: [(); 104] = [(); size_of::<IntelRuntimePmPrefix>()];
+const _: [(); 40] = [(); offset_of!(IntelRuntimePmPrefix, userfault_wakeref)];
