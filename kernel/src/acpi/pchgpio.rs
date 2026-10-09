@@ -1565,7 +1565,11 @@ mod tests {
         // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         unsafe { write_volatile(pad0, CONF_RXSTATE) };
         assert_eq!(controller.read_pin(0), Some(true));
-        assert!(controller.write_pin(26, true));
+        // Pin 26 lies in the gap between GPP_B (gpiobase 0..=25) and GPP_T
+        // (gpiobase 32); it has no pad, so the write is refused.
+        assert!(!controller.write_pin(26, true));
+        // GPP_T's first pad is pad index 26 (base 26) at gpiobase 32.
+        assert!(controller.write_pin(32, true));
         let pad26 = (addresses[0] + 0x400 + 26 * 16) as *const u32;
         // SAFETY: this pointer is derived from a checked MMIO window or test BAR backing.
         assert_ne!(unsafe { read_volatile(pad26) } & CONF_TXSTATE, 0);
