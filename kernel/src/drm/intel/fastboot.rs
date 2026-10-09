@@ -318,6 +318,35 @@ pub(super) struct PowerPin {
 }
 
 impl PowerPin {
+    /// Adopt only an already requested live TC route. Unlike `acquire`, this
+    /// observation never sets a power request bit or writes any display MMIO;
+    /// GT-only startup uses it to prove the active scanout before switching
+    /// the GPU's VT-d requester context.
+    fn observe(r: &impl Registers, port: TcPort) -> Result<Self, Error> {
+        if port.index() > 1 || read(r, 0x45504)? & super::power::DC_STATE_MASK != 0 {
+            return Err(Error::Refused);
+        }
+        let offsets = [0x45404, 0x45454, 0x45444];
+        let masks = [
+            2 | (2 << 2) | (2 << 10),
+            2 << ((3 + port.index()) * 2),
+            2 << ((3 + port.index()) * 2),
+        ];
+        let mut before = [0; 3];
+        for i in 0..3 {
+            before[i] = read(r, offsets[i])?;
+            if before[i] & (masks[i] | (masks[i] >> 1)) != masks[i] | (masks[i] >> 1) {
+                return Err(Error::Refused);
+            }
+        }
+        Ok(Self {
+            port,
+            offsets,
+            before,
+            masks,
+        })
+    }
+
     pub(super) fn acquire(r: &impl Registers, port: TcPort) -> Result<Self, Error> {
         // i915 XELPD power map: PW1, PW2 and PWA; DDI_IO and legacy AUX.
         // AUX is the ADL-P legacy TC-cold blocker. No cold-exit/enable sequence
@@ -684,18 +713,18 @@ fn capture(
 /// actual GGTT PTEs are the scanout authority, as in i915 initial-plane setup.
 fn ownership(
     gtt: &Gtt,
-    f: &Firmware,
+    plane: &intel_display::universal_plane::InitialPlaneConfig,
     boot: Option<&axhal::boot::BootFramebuffer>,
     aperture: u64,
     stolen: core::ops::Range<u64>,
     allocatable: &[(u64, u64)],
 ) -> Result<Vec<u64>, Error> {
-    let address = u64::from(f.plane.surface_raw & 0xffff_f000);
+    let address = u64::from(plane.surface_raw & 0xffff_f000);
     let boot_matches = boot.is_some_and(|boot| {
         Some(boot.address) == aperture.checked_add(address)
-            && boot.width == f.plane.width
-            && boot.height == f.plane.height
-            && boot.pitch == f.plane.pitch
+            && boot.width == plane.width
+            && boot.height == plane.height
+            && boot.pitch == plane.pitch
             && boot.bpp == 32
             && boot.red.position == 16
             && boot.red.size == 8
@@ -703,7 +732,7 @@ fn ownership(
             && boot.green.size == 8
             && boot.blue.position == 0
             && boot.blue.size == 8
-            && boot.byte_len().map(|len| len as u64) == Some(f.plane.main_size)
+            && boot.byte_len().map(|len| len as u64) == Some(plane.main_size)
     });
     if !boot_matches {
         if let Some(boot) = boot {
@@ -715,9 +744,9 @@ fn ownership(
                 boot.height,
                 boot.pitch,
                 boot.address,
-                f.plane.width,
-                f.plane.height,
-                f.plane.pitch
+                plane.width,
+                plane.height,
+                plane.pitch
             );
         } else {
             axlog::warn!(
@@ -727,22 +756,21 @@ fn ownership(
         }
     }
     if address == 0
-        || f.plane.main_size == 0
-        || f.plane.main_size
-            < u64::from(f.plane.pitch)
-                .checked_mul(u64::from(f.plane.height))
+        || plane.main_size == 0
+        || plane.main_size
+            < u64::from(plane.pitch)
+                .checked_mul(u64::from(plane.height))
                 .ok_or(Error::Refused)?
-        || f.plane.main_size.div_ceil(4096) > stolen.end.saturating_sub(stolen.start).div_ceil(4096)
+        || plane.main_size.div_ceil(4096) > stolen.end.saturating_sub(stolen.start).div_ceil(4096)
     {
         return Err(Error::Refused);
     }
-    let page_count =
-        usize::try_from(f.plane.main_size.div_ceil(4096)).map_err(|_| Error::Refused)?;
+    let page_count = usize::try_from(plane.main_size.div_ceil(4096)).map_err(|_| Error::Refused)?;
     let mut live_pages = Vec::new();
     live_pages
         .try_reserve_exact(page_count)
         .map_err(|_| Error::Refused)?;
-    for i in 0..f.plane.main_size.div_ceil(4096) {
+    for i in 0..plane.main_size.div_ceil(4096) {
         let pte = gtt.entry(address + i * 4096).map_err(|_| Error::Refused)?;
         let p = pte.address();
         let end = p.checked_add(4096).ok_or(Error::Refused)?;
@@ -761,6 +789,180 @@ fn ownership(
     }
     Ok(live_pages)
 }
+
+/// Read only the active firmware Pipe-A scanout that the GT requester lease
+/// must preserve. This intentionally avoids DKL/PHY and DMC paths: those may
+/// perform selector or power-request writes even when called for readout.
+fn read_only_live_scanout<R: Registers>(
+    r: &R,
+    pin: &PowerPin,
+    port: TcPort,
+) -> Result<
+    (
+        intel_display::pipe_config::PipeConfig,
+        intel_display::universal_plane::InitialPlaneConfig,
+    ),
+    Error,
+> {
+    use intel_display::{ddi, pipe_config, universal_plane};
+
+    pin.held(r)?;
+    let io = PinnedIo { registers: r, port };
+    let pipe = pipe_config::read_pipe_config(&io, Pipe::A)?.ok_or(Error::Refused)?;
+    pipe.timings.validate()?;
+    if pipe.transconf & (3 << 30) != 3 << 30
+        || pipe.transconf & (3 << 21) != 0
+        || !pipe.dss.uncompressed()
+        || pipe.vrr.enabled
+        || pipe.vrr.raw_control & ((1 << 29) | (1 << 27) | (1 << 28)) != 0
+        || pipe.misc.output != pipe_config::OutputFormat::Rgb
+        || pipe.misc.bpc != Some(8)
+        || pipe.misc.raw & ((1 << 23) | (1 << 4)) != 0
+        || pipe.pixel_multiplier != 1
+        || pipe.source != (pipe.timings.hdisplay, pipe.timings.vdisplay)
+    {
+        return Err(Error::Refused);
+    }
+
+    // Do not switch the requester while another pipe, sprite or cursor can
+    // still fetch an unenumerated surface from the same GPU.
+    let power = read(r, 0x45404)?;
+    for i in 1..4 {
+        if power & (1 << ((5 + i) * 2)) != 0 && read(r, 0x70008 + i * 0x1000)? & (3 << 30) != 0 {
+            return Err(Error::Refused);
+        }
+    }
+    for i in 1..5 {
+        if read(r, 0x70180 + i * 0x100)? & (1 << 31) != 0 {
+            return Err(Error::Refused);
+        }
+    }
+    if read(r, 0x70080)? & 0x3f != 0 {
+        return Err(Error::Refused);
+    }
+
+    let plane = universal_plane::skl_get_initial_plane_config(
+        &io,
+        Pipe::A,
+        universal_plane::Plane::PRIMARY,
+    )?
+    .ok_or(Error::Refused)?;
+    if !plane.native_linear_rgb()
+        || plane.offset != 0
+        || (plane.width, plane.height) != pipe.source
+        || read(r, 0x7018c)? != 0
+        || read(r, 0x701ac)? & 0xffff_f000 != plane.surface_raw & 0xffff_f000
+    {
+        return Err(Error::Refused);
+    }
+    let ddi = ddi::read_function_control(&io, Pipe::A)?;
+    let expected_port = if port == TcPort::Tc1 {
+        Port::Tc1
+    } else {
+        Port::Tc2
+    };
+    if !ddi.enabled
+        || ddi.port != Some(expected_port)
+        || ddi.mode != intel_display::ddi::DdiMode::Hdmi
+        || ddi.bpp != Some(24)
+        || ddi.port_sync
+        || ddi.hdmi_scrambling
+        || ddi.high_tmds_ratio
+    {
+        return Err(Error::Refused);
+    }
+    pin.held(r)?;
+    Ok((pipe, plane))
+}
+
+#[cfg(target_os = "none")]
+fn stolen_range(
+    ecam: &impl super::pci::ConfigSpace,
+    r: &impl Registers,
+    bdf: super::pci::Bdf,
+) -> Result<core::ops::Range<u64>, Error> {
+    let stolen_base = u64::from(read(r, 0x1080c0)?) | (u64::from(read(r, 0x1080c4)?) << 32);
+    let stolen_base = stolen_base & 0xffff_ffff_fff0_0000;
+    let gmch = ecam.read_u32(bdf, 0x50).ok_or(Error::Refused)?;
+    let code = (gmch >> 8) & 255;
+    // Original decoder of documented Gen9+ GMS facts; no GPL source text.
+    let mb = match code {
+        1..=0xef => code * 32,
+        0xf0..=0xfe => (code - 0xef) * 4,
+        _ => return Err(Error::Refused),
+    };
+    let stolen_end = stolen_base
+        .checked_add(u64::from(mb) * 1024 * 1024)
+        .ok_or(Error::Refused)?;
+    if stolen_base == 0 || stolen_base >= stolen_end {
+        return Err(Error::Refused);
+    }
+    Ok(stolen_base..stolen_end)
+}
+
+/// Establish the narrow DMA lease for an explicit GT-only boot without
+/// enabling display power, programming the DMC, or mutating any display
+/// register. Only a live, stable TC1/TC2 firmware primary plane wholly backed
+/// by verified stolen pages is eligible; unsupported or cold display state
+/// leaves GT startup fail-closed.
+#[cfg(target_os = "none")]
+pub(super) fn admit_read_only_identity_lease(
+    bdf: super::pci::Bdf,
+    window: &super::regs::RegisterWindow,
+    gtt: &Gtt,
+) -> Result<(), Error> {
+    use super::{dma, pci::ConfigSpace};
+
+    if gtt.has_identity_lease(bdf) {
+        return Ok(());
+    }
+    let ecam = super::pci::Ecam::platform().ok_or(Error::Refused)?;
+    let info = super::pci::DeviceInfo::read(&ecam, bdf).ok_or(Error::Refused)?;
+    if !super::i915_port::native_device_supported(info.vendor_id, info.device_id, info.revision) {
+        return Err(Error::Refused);
+    }
+    let aperture = match info.bars[2].kind {
+        super::pci::BarKind::Memory { address, .. } if address != 0 => address,
+        _ => return Err(Error::Refused),
+    };
+    let function = read(window, 0x60400)?;
+    let port = match intel_display::ddi::decode_function_control(function).port {
+        Some(Port::Tc1) => TcPort::Tc1,
+        Some(Port::Tc2) => TcPort::Tc2,
+        _ => return Err(Error::Refused),
+    };
+    let pin = PowerPin::observe(window, port)?;
+    let (pipe, plane) = read_only_live_scanout(window, &pin, port)?;
+    let stolen = stolen_range(&ecam, window, bdf)?;
+    let allocatable: Vec<_> = axhal::mem::phys_ram_ranges()
+        .iter()
+        .map(|&(base, size)| (base as u64, size as u64))
+        .collect();
+    let live_pages = ownership(
+        gtt,
+        &plane,
+        axhal::boot::framebuffer().as_ref(),
+        aperture,
+        stolen,
+        &allocatable,
+    )?;
+
+    // Bracket the page-table walk with a second read-only snapshot. A changed
+    // live surface is not a lease candidate, and nothing has been written yet.
+    if read_only_live_scanout(window, &pin, port)? != (pipe, plane) {
+        return Err(Error::Refused);
+    }
+    let lease = dma::acquire_identity_lease(bdf, &live_pages)?;
+    gtt.install_identity_lease(lease)
+        .map_err(|_| Error::Refused)?;
+    // Recheck after the VT-d context transition. If firmware changed scanout
+    // concurrently, the new lease remains owned but no GT MMIO is attempted.
+    if read_only_live_scanout(window, &pin, port)? != (pipe, plane) {
+        return Err(Error::Refused);
+    }
+    Ok(())
+}
+
 fn mode(f: &Firmware) -> Result<DrmMode, Error> {
     let t = f.pipe.timings;
     let hz = u64::from(f.pixel_clock) * 1_000_000 / (u64::from(t.htotal) * u64::from(t.vtotal));
@@ -2831,24 +3033,7 @@ pub(super) fn init(
         {
             return Err(Error::Refused);
         }
-        let stolen_base =
-            u64::from(read(&window, 0x1080c0)?) | (u64::from(read(&window, 0x1080c4)?) << 32);
-        let stolen_base = stolen_base & 0xffff_ffff_fff0_0000;
-        let gmch = ecam.read_u32(bdf, 0x50).ok_or(Error::Refused)?;
-        let code = (gmch >> 8) & 255;
-        // Original decoder of documented Gen9+ GMS facts; no GPL source text.
-        let mb = match code {
-            1..=0xef => code * 32,
-            0xf0..=0xfe => (code - 0xef) * 4,
-            _ => return Err(Error::Refused),
-        };
-        let stolen = stolen_base
-            ..stolen_base
-                .checked_add(u64::from(mb) * 1024 * 1024)
-                .ok_or(Error::Refused)?;
-        if stolen.start == 0 {
-            return Err(Error::Refused);
-        }
+        let stolen = stolen_range(&ecam, &window, bdf)?;
         // Firmware PTEs must avoid usable RAM altogether, not merely free
         // allocator entries: kernel/module reservations are not stolen memory.
         let allocatable: Vec<_> = axhal::mem::phys_ram_ranges()
@@ -2969,8 +3154,14 @@ pub(super) fn init(
             if first.plane.pitch != (first.plane.width * 4).div_ceil(64) * 64 {
                 return Err(Error::Refused);
             }
-            let live_pages =
-                ownership(&gtt, &first, boot.as_ref(), aperture, stolen, &allocatable)?;
+            let live_pages = ownership(
+                &gtt,
+                &first.plane,
+                boot.as_ref(),
+                aperture,
+                stolen,
+                &allocatable,
+            )?;
             // Preserve the active firmware scanout before changing this GPU's
             // requester context. The VT-d owner adds only matching GPU RMRRs
             // and this separately verified set of stolen pages.
@@ -4043,6 +4234,23 @@ mod tests {
     }
 
     #[test]
+    fn gt_only_live_scanout_readout_never_writes_display_registers() {
+        let r = Model::new();
+        let pin = PowerPin::acquire(&r, TcPort::Tc1).unwrap();
+        let writes = r.inner.lock().writes;
+        assert!(PowerPin::observe(&r, TcPort::Tc1).is_ok());
+        let live = read_only_live_scanout(&r, &pin, TcPort::Tc1).unwrap();
+        assert_eq!(live.1.width, 64);
+        assert_eq!(live.1.height, 64);
+        assert_eq!(r.inner.lock().writes, writes);
+
+        let current = read(&r, 0x45404).unwrap();
+        r.set(0x45404, current & !(2 << 2));
+        assert!(PowerPin::observe(&r, TcPort::Tc1).is_err());
+        assert_eq!(r.inner.lock().writes, writes);
+    }
+
+    #[test]
     fn dpll_pin_context_is_read_only_and_rechecks_clock_dc_state_and_route() {
         let r = Model::new();
         let pin = PowerPin::acquire(&r, TcPort::Tc1).unwrap();
@@ -4093,7 +4301,7 @@ mod tests {
         assert_eq!(
             ownership(
                 &a.gtt,
-                &a.baseline,
+                &a.baseline.plane,
                 Some(&boot),
                 0xc0000000,
                 0x80000000..0x90000000,
@@ -4105,7 +4313,7 @@ mod tests {
         assert!(
             ownership(
                 &a.gtt,
-                &a.baseline,
+                &a.baseline.plane,
                 Some(&different_gop),
                 0xc0000000,
                 0x80000000..0x90000000,
@@ -4117,7 +4325,7 @@ mod tests {
         assert!(
             ownership(
                 &a.gtt,
-                &a.baseline,
+                &a.baseline.plane,
                 None,
                 0xc0000000,
                 0x80000000..0x90000000,
@@ -4134,7 +4342,7 @@ mod tests {
         assert!(
             ownership(
                 &a.gtt,
-                &a.baseline,
+                &a.baseline.plane,
                 Some(&boot),
                 0xc0000000,
                 0x80000000..0x90000000,
@@ -4145,7 +4353,7 @@ mod tests {
         assert!(
             ownership(
                 &a.gtt,
-                &a.baseline,
+                &a.baseline.plane,
                 Some(&boot),
                 0xc0000000,
                 0x80001000..0x90000000,
@@ -4158,7 +4366,7 @@ mod tests {
         assert!(
             ownership(
                 &a.gtt,
-                &a.baseline,
+                &a.baseline.plane,
                 Some(&boot),
                 0xc0000000,
                 0x80000000..0x90000000,

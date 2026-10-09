@@ -504,9 +504,18 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
     let shared_gtt = super::shared_ggtt(bdf)
         .map_err(|_| String::from("GT requires the display owner's shared GGTT; no writes"))?;
     if !shared_gtt.has_identity_lease(bdf) {
+        super::fastboot::admit_read_only_identity_lease(bdf, &window, &shared_gtt).map_err(
+            |error| {
+                format!(
+                    "GT requires read-only live TC scanout/GMS ownership before switching the \
+                     requester context: {error:?}; no GT/display register writes"
+                )
+            },
+        )?;
+    }
+    if !shared_gtt.has_identity_lease(bdf) {
         return Err(String::from(
-            "GT requires a verified GPU requester identity-DMA lease preserving live firmware \
-             scanout; no writes",
+            "GT requires a verified GPU requester identity-DMA lease; no GT writes",
         ));
     }
     let bus = Bus {
