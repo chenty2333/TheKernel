@@ -80,6 +80,14 @@ pub fn page_align<T: LinuxUnsigned>(value: T) -> T {
     round_up(value, T::from_u64(4096))
 }
 
+/// Linux `smp_store_mb()`: single-copy store followed by a full memory
+/// barrier, as specified by the Linux memory model.
+#[inline]
+pub unsafe fn smp_store_mb<T>(place: *mut T, value: T) {
+    unsafe { core::ptr::write_volatile(place, value) };
+    fence(Ordering::SeqCst);
+}
+
 /// `is_power_of_2()` from include/linux/log2.h.
 #[inline]
 pub fn is_power_of_2<T: LinuxUnsigned>(value: T) -> bool {
