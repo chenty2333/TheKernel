@@ -15,9 +15,43 @@ use crate::{
         i915::intel_timeline_put,
         list::list_empty,
         mutex::{mutex_trylock, mutex_unlock},
-        workqueue::{flush_work, INIT_WORK_C},
+        workqueue::{flush_work, queue_work, INIT_WORK_C},
     },
 };
+use core::sync::atomic::{AtomicPtr, Ordering};
+
+// upstream: intel_gt_requests.c intel_engine_add_retire()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_add_retire(
+    engine: *mut IntelEngineCs,
+    timeline: *mut IntelTimeline,
+) {
+    const STUB: *mut IntelTimeline = 1usize as *mut IntelTimeline;
+    GEM_BUG_ON!(unsafe { crate::intel_engine_types_upstream::intel_engine_is_virtual(engine) });
+
+    let timeline_retire = unsafe { &*core::ptr::addr_of!((*timeline).retire).cast::<AtomicPtr<IntelTimeline>>() };
+    if timeline_retire.compare_exchange(
+        core::ptr::null_mut(), STUB, Ordering::AcqRel, Ordering::Acquire,
+    ).is_err() {
+        return;
+    }
+
+    unsafe { crate::intel_timeline_upstream::intel_timeline_get(timeline) };
+    let engine_retire = unsafe { &*core::ptr::addr_of!((*engine).retire).cast::<AtomicPtr<IntelTimeline>>() };
+    let mut first = engine_retire.load(Ordering::Acquire);
+    loop {
+        unsafe { (*timeline).retire = ((first as usize) | 1) as *mut IntelTimeline };
+        match engine_retire.compare_exchange_weak(first, timeline, Ordering::Release, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(actual) => first = actual,
+        }
+    }
+
+    if first.is_null() {
+        let wq = unsafe { (*(*engine).i915).unordered_wq };
+        unsafe { queue_work(wq, core::ptr::addr_of_mut!((*engine).retire_work)) };
+    }
+}
 
 // upstream: intel_gt_requests.c retire_requests()
 unsafe fn retire_requests(tl: *mut IntelTimeline) -> bool {
@@ -77,4 +111,3 @@ pub unsafe fn intel_engine_fini_retire(engine: *mut IntelEngineCs) {
     unsafe { flush_work(&mut (*engine).retire_work) };
     GEM_BUG_ON!(unsafe { !(*engine).retire.is_null() });
 }
-

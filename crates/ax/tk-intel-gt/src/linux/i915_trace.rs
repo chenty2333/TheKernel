@@ -14,8 +14,14 @@ use crate::{
     linux_config::CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS,
 };
 use core::ffi::c_ulong;
+use crate::intel_context_upstream::DmaFence;
 
 const _: () = assert!(!CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS);
+
+/// Linux tracepoint symbol; with low-level tracepoints disabled, calls have
+/// no runtime effect, matching the configured Linux trace header.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trace_dma_fence_signaled(_fence: *mut DmaFence) {}
 
 #[inline]
 pub fn trace_intel_context_ban(_context: *mut IntelContext) {}

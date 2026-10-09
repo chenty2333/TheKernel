@@ -779,13 +779,21 @@ def build_cmd(args: argparse.Namespace) -> int:
 
 
 def lint_cmd(args: argparse.Namespace) -> int:
-    lint_kernel(artifacts_for(args), workspace=args.workspace,
+    artifacts = artifacts_for(args)
+    lint_kernel(artifacts, workspace=args.workspace,
                 deny_warnings=args.deny_warnings)
     # Keep the opt-in source translations buildable without enabling them in
     # the product. Use host flags/cache, not the kernel's bare-metal linker.
     run_checked(["cargo", "check", "--locked", "-p", "tk-intel-gt",
                  "--features", "upstream-gt"],
-                env=_lint_env(artifacts_for(args), workspace=True))
+                env=_lint_env(artifacts, workspace=True))
+    # Link the product kernel with the opt-in translation feature. Keep the
+    # normal profile untouched: this is an additional, non-default gate.
+    generate_config(artifacts)
+    run_checked(["cargo", "build", "--locked", "-p", "tk-kernel",
+                 "--target", TARGET, "--release", "--features",
+                 f"{kernel_features(artifacts)},intel-upstream-gt"],
+                env=command_env(artifacts))
     return 0
 
 
