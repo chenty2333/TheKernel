@@ -111,7 +111,9 @@ impl<H: Hal> Drop for Dma<H> {
         // Safe because the memory was previously allocated by `dma_alloc` in `Dma::new`, not yet
         // deallocated, and we are passing the values from then.
         let err = unsafe { H::dma_dealloc_for(self.requester, self.paddr, self.vaddr, self.pages) };
-        assert_eq!(err, 0, "failed to deallocate DMA");
+        if err != 0 {
+            log::error!("virtio: DMA deallocation failed; retaining allocation {:#x}", self.paddr);
+        }
     }
 }
 
@@ -194,9 +196,10 @@ pub unsafe trait Hal {
     unsafe fn unmap_physical(mapping: DmaMapping, direction: BufferDirection);
 
     /// Requester-aware physical unmap matching [`Self::map_physical_for`].
-    unsafe fn unmap_physical_for(requester: Option<DmaRequester>, mapping: DmaMapping, direction: BufferDirection) {
+    unsafe fn unmap_physical_for(requester: Option<DmaRequester>, mapping: DmaMapping, direction: BufferDirection) -> Result<()> {
         let _ = requester;
-        unsafe { Self::unmap_physical(mapping, direction) }
+        unsafe { Self::unmap_physical(mapping, direction) };
+        Ok(())
     }
 
     /// Converts a physical address used for MMIO to a virtual address which the driver can access.
@@ -230,9 +233,9 @@ pub unsafe trait Hal {
     unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> PhysAddr;
 
     /// Requester-aware shared-buffer map; defaults to the legacy HAL hook.
-    unsafe fn share_for(requester: Option<DmaRequester>, buffer: NonNull<[u8]>, direction: BufferDirection) -> PhysAddr {
+    unsafe fn share_for(requester: Option<DmaRequester>, buffer: NonNull<[u8]>, direction: BufferDirection) -> Result<PhysAddr> {
         let _ = requester;
-        unsafe { Self::share(buffer, direction) }
+        Ok(unsafe { Self::share(buffer, direction) })
     }
 
     /// Unshares the given memory range from the device and (if necessary) copies it back to the
@@ -246,9 +249,10 @@ pub unsafe trait Hal {
     unsafe fn unshare(paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection);
 
     /// Requester-aware shared-buffer unmap matching [`Self::share_for`].
-    unsafe fn unshare_for(requester: Option<DmaRequester>, paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) {
+    unsafe fn unshare_for(requester: Option<DmaRequester>, paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) -> Result<()> {
         let _ = requester;
-        unsafe { Self::unshare(paddr, buffer, direction) }
+        unsafe { Self::unshare(paddr, buffer, direction) };
+        Ok(())
     }
 }
 

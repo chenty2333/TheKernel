@@ -238,15 +238,17 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         }
 
         #[cfg(feature = "alloc")]
-        let head = if self.indirect && descriptors_needed > 1 {
-            self.add_indirect(inputs, outputs)
-        } else {
-            self.add_direct(inputs, outputs)
-        };
+        {
+            if self.indirect && descriptors_needed > 1 {
+                self.add_indirect(inputs, outputs)
+            } else {
+                self.add_direct(inputs, outputs)
+            }
+        }
         #[cfg(not(feature = "alloc"))]
-        let head = self.add_direct(inputs, outputs);
-
-        Ok(head)
+        {
+            self.add_direct(inputs, outputs)
+        }
     }
 
     /// Adds a direct descriptor chain containing normal virtual header/status
@@ -324,7 +326,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                     (*input).into(),
                     BufferDirection::DriverToDevice,
                     DescFlags::NEXT,
-                );
+                )?;
             }
             last = current;
             current = self.desc_shadow[usize::from(current)].next;
@@ -352,7 +354,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                     (*output).into(),
                     BufferDirection::DeviceToDriver,
                     DescFlags::NEXT,
-                );
+                )?;
             }
             last = current;
             current = self.desc_shadow[usize::from(current)].next;
@@ -393,7 +395,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                     (*input).into(),
                     BufferDirection::DriverToDevice,
                     DescFlags::NEXT,
-                );
+                )?;
             }
             index += 1;
         }
@@ -414,7 +416,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                     (*output).into(),
                     BufferDirection::DeviceToDriver,
                     DescFlags::NEXT,
-                );
+                )?;
             }
             index += 1;
         }
@@ -444,7 +446,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                 Box::leak(indirect_list).as_bytes().into(),
                 BufferDirection::DriverToDevice,
                 DescFlags::INDIRECT,
-            );
+            )?;
         }
         self.write_desc(head);
         self.num_used = self
@@ -532,10 +534,12 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         &mut self,
         inputs: &'a [&'b [u8]],
         outputs: &'a mut [&'b mut [u8]],
-    ) -> u16 {
+    ) -> Result<u16> {
         // allocate descriptors from free list
         let head = self.free_head;
         let mut last = self.free_head;
+        let mut mapped_slots = [0u16; SIZE];
+        let mut mapped_count = 0usize;
 
         for (buffer, direction) in InputOutputIter::new(inputs, outputs) {
             assert_ne!(buffer.len(), 0);
@@ -544,10 +548,40 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             let desc = &mut self.desc_shadow[usize::from(self.free_head)];
             // Safe because our caller promises that the buffers live at least until `pop_used`
             // returns them.
-            unsafe {
-                desc.set_buf::<H>(self.requester, buffer, direction, DescFlags::NEXT);
+            let set_result = unsafe {
+                desc.set_buf::<H>(self.requester, buffer, direction, DescFlags::NEXT)
+            };
+            if let Err(error) = set_result {
+                let mut rollback_failed = false;
+                for index in (0..mapped_count).rev() {
+                    let desc_index = mapped_slots[index];
+                    let (mapped_buffer, mapped_direction) =
+                        InputOutputIter::new(inputs, outputs).nth(index).unwrap();
+                    let descriptor = &mut self.desc_shadow[usize::from(desc_index)];
+                    if unsafe {
+                        H::unshare_for(
+                            self.requester,
+                            descriptor.addr as usize,
+                            mapped_buffer,
+                            mapped_direction,
+                        )
+                    }
+                    .is_err()
+                    {
+                        rollback_failed = true;
+                    }
+                    descriptor.unset_buf();
+                }
+                self.free_head = head;
+                return Err(if rollback_failed {
+                    Error::Quarantined
+                } else {
+                    error
+                });
             }
             last = self.free_head;
+            mapped_slots[mapped_count] = last;
+            mapped_count += 1;
             self.free_head = desc.next;
 
             self.write_desc(last);
@@ -564,7 +598,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             .checked_add((inputs.len() + outputs.len()) as u16)
             .expect("virtqueue descriptor count overflow");
 
-        head
+        Ok(head)
     }
 
     #[cfg(feature = "alloc")]
@@ -572,18 +606,41 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         &mut self,
         inputs: &'a [&'b [u8]],
         outputs: &'a mut [&'b mut [u8]],
-    ) -> u16 {
+    ) -> Result<u16> {
         let head = self.free_head;
 
         // Allocate and fill in indirect descriptor list.
         let mut indirect_list = Descriptor::new_box_slice_zeroed(inputs.len() + outputs.len());
+        let mut mapped_count = 0usize;
         for (i, (buffer, direction)) in InputOutputIter::new(inputs, outputs).enumerate() {
             let desc = &mut indirect_list[i];
             // Safe because our caller promises that the buffers live at least until `pop_used`
             // returns them.
-            unsafe {
-                desc.set_buf::<H>(self.requester, buffer, direction, DescFlags::NEXT);
+            let set_result = unsafe {
+                desc.set_buf::<H>(self.requester, buffer, direction, DescFlags::NEXT)
+            };
+            if let Err(error) = set_result {
+                let mut rollback_failed = false;
+                for index in (0..mapped_count).rev() {
+                    let (mapped_buffer, mapped_direction) =
+                        InputOutputIter::new(inputs, outputs).nth(index).unwrap();
+                    if unsafe {
+                        H::unshare_for(
+                            self.requester,
+                            indirect_list[index].addr as usize,
+                            mapped_buffer,
+                            mapped_direction,
+                        )
+                    }
+                    .is_err()
+                    {
+                        rollback_failed = true;
+                    }
+                    indirect_list[index].unset_buf();
+                }
+                return Err(if rollback_failed { Error::Quarantined } else { error });
             }
+            mapped_count += 1;
             desc.next = (i + 1) as u16;
         }
         indirect_list
@@ -595,28 +652,52 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         // Need to store pointer to indirect_list too, because direct_desc.set_buf will only store
         // the physical DMA address which might be different.
         assert!(self.indirect_lists[usize::from(head)].is_none());
-        self.indirect_lists[usize::from(head)] = Some(indirect_list.as_mut().into());
+        let indirect_pointer = NonNull::from(indirect_list.as_mut());
 
         // Write a descriptor pointing to indirect descriptor list. We use Box::leak to prevent the
         // indirect list from being freed when this function returns; recycle_descriptors is instead
         // responsible for freeing the memory after the buffer chain is popped.
         let direct_desc = &mut self.desc_shadow[usize::from(head)];
-        self.free_head = direct_desc.next;
-        unsafe {
+        let next_free = direct_desc.next;
+        let direct_result = unsafe {
             direct_desc.set_buf::<H>(
                 self.requester,
-                Box::leak(indirect_list).as_bytes().into(),
+                indirect_list.as_bytes_mut().into(),
                 BufferDirection::DriverToDevice,
                 DescFlags::INDIRECT,
-            );
+            )
+        };
+        if let Err(error) = direct_result {
+            let mut rollback_failed = false;
+            for index in (0..mapped_count).rev() {
+                let (mapped_buffer, mapped_direction) =
+                    InputOutputIter::new(inputs, outputs).nth(index).unwrap();
+                if unsafe {
+                    H::unshare_for(
+                        self.requester,
+                        indirect_list[index].addr as usize,
+                        mapped_buffer,
+                        mapped_direction,
+                    )
+                }
+                .is_err()
+                {
+                    rollback_failed = true;
+                }
+                indirect_list[index].unset_buf();
+            }
+            return Err(if rollback_failed { Error::Quarantined } else { error });
         }
+        self.indirect_lists[usize::from(head)] = Some(indirect_pointer);
+        self.free_head = next_free;
+        let _ = Box::leak(indirect_list);
         self.write_desc(head);
         self.num_used = self
             .num_used
             .checked_add(1)
             .expect("virtqueue descriptor count overflow");
 
-        head
+        Ok(head)
     }
 
     /// Add the given buffers to the virtqueue, notifies the device, blocks until the device uses
@@ -883,7 +964,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                 head_desc.next = original_free_head;
 
                 unsafe {
-                    H::unshare_for(
+                    let _ = H::unshare_for(
                         self.requester,
                         paddr as usize,
                         indirect_list.as_bytes_mut().into(),
@@ -901,7 +982,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                     unsafe {
                         // Unshare the buffer (and perhaps copy its contents back to the original
                         // buffer).
-                        H::unshare_for(self.requester, indirect_list[i].addr as usize, buffer, direction);
+                        let _ = H::unshare_for(self.requester, indirect_list[i].addr as usize, buffer, direction);
                     }
                 }
                 drop(indirect_list);
@@ -929,7 +1010,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                 // from which we got `paddr`.
                 unsafe {
                     // Unshare the buffer (and perhaps copy its contents back to the original buffer).
-                    H::unshare_for(self.requester, paddr as usize, buffer, direction);
+                    let _ = H::unshare_for(self.requester, paddr as usize, buffer, direction);
                 }
             }
 
@@ -972,7 +1053,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             self.num_used -= 1;
             head_desc.next = original_free_head;
             unsafe {
-                H::unshare_for(
+                let _ = H::unshare_for(
                     self.requester,
                     paddr as usize,
                     indirect_list.as_bytes_mut().into(),
@@ -986,7 +1067,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             let mut index = 0usize;
             for input in inputs {
                 unsafe {
-                    H::unshare_for(
+                    let _ = H::unshare_for(
                         self.requester,
                         indirect_list[index].addr as usize,
                         (*input).into(),
@@ -998,7 +1079,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             index += physical_inputs.len() + physical_outputs.len();
             for output in outputs {
                 unsafe {
-                    H::unshare_for(
+                    let _ = H::unshare_for(
                         self.requester,
                         indirect_list[index].addr as usize,
                         (*output).into(),
@@ -1127,7 +1208,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         if let Some((buffer, direction)) = virtual_buffer {
             // SAFETY: The caller supplied the exact virtual buffer used when
             // the descriptor was installed, and the device is quiescent.
-            unsafe { H::unshare_for(self.requester, paddr, buffer, direction) };
+            unsafe { let _ = H::unshare_for(self.requester, paddr, buffer, direction); }
         }
     }
 
@@ -1433,10 +1514,13 @@ impl Descriptor {
         buf: NonNull<[u8]>,
         direction: BufferDirection,
         extra_flags: DescFlags,
-    ) {
+    ) -> Result<()> {
         // Safe because our caller promises that the buffer is valid.
         unsafe {
-            self.addr = H::share_for(requester, buf, direction) as u64;
+            self.addr = H::share_for(requester, buf, direction)? as u64;
+        }
+        if self.addr == 0 {
+            return Err(Error::DmaError);
         }
         self.len = buf.len().try_into().unwrap();
         self.flags = extra_flags
@@ -1447,6 +1531,7 @@ impl Descriptor {
                     panic!("Buffer passed to device should never use BufferDirection::Both.")
                 }
             };
+        Ok(())
     }
 
     /// Sets the buffer address and length to 0.

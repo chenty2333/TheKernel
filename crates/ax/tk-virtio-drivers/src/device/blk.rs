@@ -823,7 +823,7 @@ impl PendingBlkRequest {
         };
         for mapping in mappings[..count].iter().rev().flatten().copied() {
             // SAFETY: This method is called only before publication.
-            unsafe { H::unmap_physical_for(self.requester, mapping, direction) };
+            let _ = unsafe { H::unmap_physical_for(self.requester, mapping, direction) };
         }
     }
 
@@ -833,7 +833,7 @@ impl PendingBlkRequest {
     /// unmapping them before reset would turn a protocol violation into an
     /// ordinary completion and could let the device retain an untracked DMA
     /// owner.
-    fn release_physical_mappings<H: Hal>(&mut self) {
+    fn release_physical_mappings<H: Hal>(&mut self) -> Result<()> {
         let (mappings, count, direction) = match &mut self.buffer {
             PendingBlkBuffer::PhysicalRead {
                 mappings, count, ..
@@ -841,16 +841,23 @@ impl PendingBlkRequest {
             PendingBlkBuffer::PhysicalWrite {
                 mappings, count, ..
             } => (mappings, *count, BufferDirection::DriverToDevice),
-            _ => return,
+            _ => return Ok(()),
         };
         for mapping in mappings[..count].iter_mut().rev() {
-            let Some(mapping_value) = mapping.take() else {
+            let Some(mapping_value) = *mapping else {
                 continue;
             };
             // SAFETY: the caller invokes this only after a valid used entry or
             // a reset proof has stopped device access to the mapping.
-            unsafe { H::unmap_physical_for(self.requester, mapping_value, direction) };
+            if unsafe { H::unmap_physical_for(self.requester, mapping_value, direction) }.is_err() {
+                // Keep the mapping record in the pending owner. The caller
+                // quarantines this device, so its source buffers remain pinned
+                // rather than being returned with an active IOMMU mapping.
+                return Err(Error::Quarantined);
+            }
+            *mapping = None;
         }
+        Ok(())
     }
 
     /// Rolls back a descriptor chain that was installed but not published.
@@ -1150,7 +1157,7 @@ impl PendingBlkRequest {
         // used length has passed protocol validation.  A malformed entry has
         // already been consumed, but `done` must remain false so reset can
         // recycle the retained pending owner after transport quiescence.
-        self.release_physical_mappings::<H>();
+        self.release_physical_mappings::<H>()?;
         self.completion_bytes = completion_bytes;
         self.done = true;
         if let Some(resp) = self.legacy_resp {
@@ -1961,7 +1968,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             };
             if mapping.source != segment.paddr || mapping.len != segment.len || mapping.device == 0
             {
-                unsafe { H::unmap_physical_for(self.requester, mapping, direction) };
+                let _ = unsafe { H::unmap_physical_for(self.requester, mapping, direction) };
                 Self::unmap_physical_mappings(self.requester, &mappings, index, direction);
                 return Err(Error::DmaError);
             }
@@ -1981,7 +1988,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         direction: BufferDirection,
     ) {
         for mapping in mappings[..count].iter().rev().flatten().copied() {
-            unsafe { H::unmap_physical_for(requester, mapping, direction) };
+            let _ = unsafe { H::unmap_physical_for(requester, mapping, direction) };
         }
     }
 

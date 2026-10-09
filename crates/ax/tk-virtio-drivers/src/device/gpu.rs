@@ -1317,9 +1317,14 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                 Ok((id, submission))
             }
             Err(error) => {
-                self.unmap_backing_entries(&mappings);
-                self.forget_resource(id);
-                Err(error)
+                if self.unmap_backing_entries(&mappings) {
+                    self.forget_resource(id);
+                    Err(error)
+                } else {
+                    self.resource_mut(id)?.backing_mappings.extend_from_slice(&mappings);
+                    self.control_faulted = true;
+                    Err(Error::Quarantined)
+                }
             }
         }
     }
@@ -1459,8 +1464,13 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                 Ok(submission)
             }
             Err(error) => {
-                self.unmap_backing_entries(&mappings);
-                Err(error)
+                if self.unmap_backing_entries(&mappings) {
+                    Err(error)
+                } else {
+                    self.resource_mut(id)?.backing_mappings.extend_from_slice(&mappings);
+                    self.control_faulted = true;
+                    Err(Error::Quarantined)
+                }
             }
         }
     }
@@ -2148,9 +2158,16 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         // stopped using resource backing addresses after an uncertain command.
         let requester = self.control_queue.dma_requester();
         for resource in &mut self.resources {
-            for mapping in resource.backing_mappings.drain(..).rev() {
+            while let Some(mapping) = resource.backing_mappings.last().copied() {
                 // SAFETY: transport reset above quiesced all device DMA.
-                unsafe { H::unmap_physical_for(requester, mapping, BufferDirection::Both) };
+                if unsafe {
+                    H::unmap_physical_for(requester, mapping, BufferDirection::Both)
+                }
+                .is_err()
+                {
+                    return 0;
+                }
+                resource.backing_mappings.pop();
             }
             resource.backing = BackingState::Detached;
             resource.mapped = false;
@@ -2192,8 +2209,11 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                 || physical % PAGE_SIZE as u64 != 0
                 || !length.is_multiple_of(PAGE_SIZE)
             {
-                self.unmap_backing_entries(&mappings);
-                return Err(Error::InvalidParam);
+                return Err(if self.unmap_backing_entries(&mappings) {
+                    Error::InvalidParam
+                } else {
+                    Error::Quarantined
+                });
             }
             // SAFETY: caller keeps each physical range pinned until resource
             // detach/unref completes; the returned mapping is retained below.
@@ -2202,8 +2222,11 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             } {
                 Ok(mapping) => mapping,
                 Err(_) => {
-                    self.unmap_backing_entries(&mappings);
-                    return Err(Error::DmaError);
+                    return Err(if self.unmap_backing_entries(&mappings) {
+                        Error::DmaError
+                    } else {
+                        Error::Quarantined
+                    });
                 }
             };
             if mapping.source as u64 != physical
@@ -2213,33 +2236,42 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             {
                 // SAFETY: the just-created mapping must be retired before the
                 // caller is allowed to reuse its pinned source pages.
-                unsafe {
-                    H::unmap_physical_for(requester, mapping, BufferDirection::Both);
-                }
-                self.unmap_backing_entries(&mappings);
-                return Err(Error::DmaError);
+                let current_unmapped = unsafe {
+                    H::unmap_physical_for(requester, mapping, BufferDirection::Both).is_ok()
+                };
+                let previous_unmapped = self.unmap_backing_entries(&mappings);
+                return Err(if current_unmapped && previous_unmapped {
+                    Error::DmaError
+                } else {
+                    Error::Quarantined
+                });
             }
             mappings.push(mapping);
         }
         Ok(mappings)
     }
 
-    fn unmap_backing_entries(&self, mappings: &[DmaMapping]) {
+    fn unmap_backing_entries(&self, mappings: &[DmaMapping]) -> bool {
         let requester = self.control_queue.dma_requester();
+        let mut success = true;
         for mapping in mappings.iter().rev().copied() {
             // SAFETY: callers invoke this only after queue publication failed,
             // a detach/unref completion retired host access, or transport reset.
-            unsafe { H::unmap_physical_for(requester, mapping, BufferDirection::Both) };
+            if unsafe { H::unmap_physical_for(requester, mapping, BufferDirection::Both) }.is_err() {
+                success = false;
+            }
         }
+        success
     }
 
     fn release_resource_backing(&mut self, id: ResourceId) -> Result {
         let requester = self.control_queue.dma_requester();
         let resource = self.resource_mut(id)?;
-        for mapping in resource.backing_mappings.drain(..).rev() {
+        while let Some(mapping) = resource.backing_mappings.last().copied() {
             // SAFETY: detach/unref completion or transport reset proves the
             // host no longer owns these resource pages.
-            unsafe { H::unmap_physical_for(requester, mapping, BufferDirection::Both) };
+            unsafe { H::unmap_physical_for(requester, mapping, BufferDirection::Both) }?;
+            resource.backing_mappings.pop();
         }
         Ok(())
     }

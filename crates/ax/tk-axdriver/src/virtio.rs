@@ -369,14 +369,11 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
         unsafe { Self::unmap_physical_for(None, mapping, _direction) }
     }
 
-    unsafe fn unmap_physical_for(requester: Option<DmaRequester>, mapping: DmaMapping, _direction: BufferDirection) {
-        if platform_unmap_for(requester, mapping.device as u64, mapping.len).is_err() {
-            panic!(
-                "virtio: failed to invalidate DMA mapping {:#x}+{:#x}; backing memory remains \
-                 owned",
-                mapping.device, mapping.len
-            );
-        }
+    unsafe fn unmap_physical_for(requester: Option<DmaRequester>, mapping: DmaMapping, _direction: BufferDirection) -> VirtIoResult<()> {
+        platform_unmap_for(requester, mapping.device as u64, mapping.len).map_err(|error| {
+            log::error!("virtio: failed to invalidate DMA mapping {:#x}+{:#x}; backing remains quarantined: {error:?}", mapping.device, mapping.len);
+            VirtIoError::DmaError
+        })
     }
 
     #[inline]
@@ -389,12 +386,17 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
         unsafe { Self::share_for(None, buffer, direction) }
     }
 
-    unsafe fn share_for(requester: Option<DmaRequester>, buffer: NonNull<[u8]>, direction: BufferDirection) -> PhysAddr {
+    unsafe fn share_for(requester: Option<DmaRequester>, buffer: NonNull<[u8]>, direction: BufferDirection) -> VirtIoResult<PhysAddr> {
         let _ = direction;
         let vaddr = buffer.as_ptr() as *mut u8 as usize;
         let physical = virt_to_phys(vaddr.into()).as_usize();
         let length = unsafe { buffer.as_ref().len() };
-        platform_map_for(requester, physical as u64, length).map_or(0, |address| address as usize)
+        platform_map_for(requester, physical as u64, length)
+            .map(|address| address as usize)
+            .map_err(|error| {
+                log::error!("virtio: shared DMA map failed requester={requester:?} {physical:#x}+{length:#x}: {error:?}");
+                VirtIoError::DmaError
+            })
     }
 
     #[inline]
@@ -402,11 +404,12 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
         unsafe { Self::unshare_for(None, paddr, buffer, direction) }
     }
 
-    unsafe fn unshare_for(requester: Option<DmaRequester>, paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) {
+    unsafe fn unshare_for(requester: Option<DmaRequester>, paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) -> VirtIoResult<()> {
         let _ = direction;
         let length = unsafe { buffer.as_ref().len() };
-        if let Err(error) = platform_unmap_for(requester, paddr as u64, length) {
-            panic!("virtio: failed to retire shared DMA mapping requester={requester:?} {paddr:#x}+{length:#x}: {error:?}");
-        }
+        platform_unmap_for(requester, paddr as u64, length).map_err(|error| {
+            log::error!("virtio: failed to retire shared DMA mapping requester={requester:?} {paddr:#x}+{length:#x}; buffer must remain quarantined: {error:?}");
+            VirtIoError::DmaError
+        })
     }
 }
