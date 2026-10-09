@@ -1165,6 +1165,13 @@ pub fn intel_dp_128b132b_intra_hop<I: LinkTrainingIo>(
     })
 }
 
+/// Complete the stop side of a started DP link-training session.
+///
+/// After `intel_dp_start_link_train()` returns an `Ok` outcome, the caller must
+/// invoke this function even when the outcome is `RetryDeferred`: it releases
+/// the HPD block and queues the next link check unless the platform's
+/// `ignore_long_hpd()` policy suppresses that work. AUX/source-pattern failure
+/// is returned only after the HPD block has been released.
 // upstream: intel_dp_link_training.c intel_dp_stop_link_train()
 pub fn intel_dp_stop_link_train<I: LinkTrainingIo>(
     dp: &mut IntelDpLinkTraining,
@@ -1545,6 +1552,11 @@ pub fn intel_dp_128b132b_link_train<I: LinkTrainingIo>(
     finish_link_training(io, DpPhy::Dprx, passed)
 }
 
+/// Begin DP link training and block hotplug processing for the training window.
+///
+/// A successful outcome intentionally leaves HPD blocked; its caller must pair
+/// the session with `intel_dp_stop_link_train()`. Early capability/setup errors
+/// release HPD before returning `Err` themselves.
 // upstream: intel_dp_link_training.c intel_dp_start_link_train()
 pub fn intel_dp_start_link_train<I: LinkTrainingIo>(
     dp: &mut IntelDpLinkTraining,
