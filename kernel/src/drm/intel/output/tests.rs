@@ -125,6 +125,38 @@ fn ready_mock() -> MockRegisters {
     ready_mock_for(ComboPhy::A)
 }
 
+#[test]
+fn transcoder_disable_clears_request_and_waits_for_status() {
+    let regs = MockRegisters::new();
+    let pipeconf = super::pipe::PIPECONF_B;
+    regs.set(pipeconf, (1 << 31) | (1 << 30) | 0x1234);
+    regs.derive(pipeconf, |value| value & !(1 << 30));
+
+    super::disable_transcoder(&regs, super::super::pipe::Pipe::B)
+        .expect("transcoder state should clear after disable request");
+
+    assert_eq!(
+        regs.writes(),
+        alloc::vec![("PIPECONF_B", (1 << 30) | 0x1234)]
+    );
+}
+
+#[test]
+fn transcoder_disable_reports_stuck_status() {
+    let regs = MockRegisters::new();
+    let pipeconf = super::pipe::PIPECONF_C;
+    regs.set(pipeconf, (1 << 31) | (1 << 30));
+
+    assert!(matches!(
+        super::disable_transcoder(&regs, super::super::pipe::Pipe::C),
+        Err(OutputError::TranscoderDidNotDisable {
+            register: "PIPECONF_C",
+            readback,
+            timeout_us: 3_000,
+        }) if readback & (1 << 30) != 0
+    ));
+}
+
 // -- the computed values ----------------------------------------------------
 
 /// The reference's worked example, to the hex digit.

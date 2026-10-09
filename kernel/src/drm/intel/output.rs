@@ -244,6 +244,9 @@ const TRANSCONF_ENABLE: u32 = 1 << 31;
 /// is where the document gives the bit its status meaning.
 const TRANSCONF_STATE_ENABLE_STATUS: u32 = 1 << 30;
 
+/// Maximum wait for the transcoder state bit to clear on CRTC disable.
+const TRANSCONF_DISABLE_TIMEOUT_US: u32 = 3_000;
+
 /// `DDI_BUF_CTL`'s `ENABLE` bit.  Reference §8.4.
 const DDI_BUF_CTL_ENABLE: u32 = 1 << 31;
 
@@ -1769,6 +1772,42 @@ pub(crate) fn program(
 // Errors.
 // ---------------------------------------------------------------------------
 
+/// Disable one CPU transcoder and wait for hardware to report it inactive.
+/// Plane and scaler shutdown must precede this call; the enclosing CRTC
+/// disable callback owns that ordering.
+pub(crate) fn disable_transcoder(
+    regs: &impl Registers,
+    pipe_id: super::pipe::Pipe,
+) -> Result<(), OutputError> {
+    let transcoder = match pipe_id {
+        super::pipe::Pipe::A => pipe::PIPECONF_A,
+        super::pipe::Pipe::B => pipe::PIPECONF_B,
+        super::pipe::Pipe::C => pipe::PIPECONF_C,
+        super::pipe::Pipe::D => pipe::PIPECONF_D,
+    };
+    let current = read(regs, transcoder)?;
+    if current & TRANSCONF_ENABLE != 0 {
+        write(regs, transcoder, current & !TRANSCONF_ENABLE)?;
+    }
+    match poll(
+        regs,
+        transcoder,
+        TRANSCONF_STATE_ENABLE_STATUS,
+        0,
+        TRANSCONF_DISABLE_TIMEOUT_US,
+    ) {
+        Some(true) => Ok(()),
+        Some(false) => Err(OutputError::TranscoderDidNotDisable {
+            register: transcoder.name(),
+            readback: read(regs, transcoder)?,
+            timeout_us: TRANSCONF_DISABLE_TIMEOUT_US,
+        }),
+        None => Err(OutputError::Unreadable {
+            register: transcoder.name(),
+        }),
+    }
+}
+
 /// What can go wrong programming the output path.
 ///
 /// Every variant is a thing a person can act on, in the style of
@@ -1857,6 +1896,12 @@ pub(crate) enum OutputError {
         /// The reference the arithmetic used, in kHz.
         wrpll_ref_khz: u32,
         /// The poll budget in microseconds.
+        timeout_us: u32,
+    },
+    /// The transcoder's state bit remained set after an explicit disable.
+    TranscoderDidNotDisable {
+        register: &'static str,
+        readback: u32,
         timeout_us: u32,
     },
     /// The DDI-IO power well did not come up.  Carries `power.rs`'s error.
@@ -2002,6 +2047,15 @@ impl OutputError {
                  reference that was not divided by two (38.4 -> 19.2 MHz) and a fraction \
                  workaround that was skipped -- re-read SKL_DSSM and compare the symbol rate in \
                  the plan against the mode's pixel clock before suspecting the PHY"
+            ),
+            Self::TranscoderDidNotDisable {
+                register,
+                readback,
+                timeout_us,
+            } => format!(
+                "{register}'s transcoder state remained enabled for {timeout_us} us after clearing \
+                 TRANSCONF_ENABLE; it reads {readback:#010x}.  Keep dependent clock and power \
+                 domains held and inspect the active pipe before continuing CRTC disable"
             ),
             Self::Well(error) => {
                 format!(
