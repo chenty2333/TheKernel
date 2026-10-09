@@ -366,7 +366,10 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
     }
 
     unsafe fn unmap_physical(mapping: DmaMapping, _direction: BufferDirection) {
+        // Legacy hook: no caller reaches it (all use the `_for` variants).
+        // Failure must not free backing memory, so it is fatal here.
         unsafe { Self::unmap_physical_for(None, mapping, _direction) }
+            .expect("virtio: legacy DMA unmap failed; backing memory remains owned");
     }
 
     unsafe fn unmap_physical_for(requester: Option<DmaRequester>, mapping: DmaMapping, _direction: BufferDirection) -> VirtIoResult<()> {
@@ -383,7 +386,9 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
 
     #[inline]
     unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> PhysAddr {
+        // Legacy hook: fail closed rather than returning a bogus address.
         unsafe { Self::share_for(None, buffer, direction) }
+            .expect("virtio: legacy shared DMA map failed")
     }
 
     unsafe fn share_for(requester: Option<DmaRequester>, buffer: NonNull<[u8]>, direction: BufferDirection) -> VirtIoResult<PhysAddr> {
@@ -402,6 +407,7 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
     #[inline]
     unsafe fn unshare(paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) {
         unsafe { Self::unshare_for(None, paddr, buffer, direction) }
+            .expect("virtio: legacy shared DMA unmap failed; buffer remains quarantined")
     }
 
     unsafe fn unshare_for(requester: Option<DmaRequester>, paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) -> VirtIoResult<()> {
