@@ -26,6 +26,12 @@
 //! source-derived ABI.
 #![allow(unsafe_code, unsafe_op_in_unsafe_fn, non_snake_case)]
 
+use crate::linux::mm_native::{vm_mmap, find_vma, mmap_write_lock_killable, mmap_write_unlock};
+use crate::linux::i915_trace::trace_i915_gem_object_fault;
+use crate::linux::gem::{drm_vma_offset_lock_lookup,drm_vma_offset_unlock_lookup};
+
+use crate::i915_mm_upstream::{remap_io_mapping,remap_io_sg};
+
 use core::ffi::{c_int, c_long, c_ulong, c_void};
 
 use crate::{
@@ -242,7 +248,7 @@ pub unsafe fn i915_gem_mmap_ioctl(
         }
 
         if (*args).flags & I915_MMAP_WC as u64 != 0 {
-            let mm = current().mm;
+            let mm = crate::linux::mm_native::current_mm();
             if mmap_write_lock_killable(mm) != 0 {
                 return Err(-EINTR);
             }

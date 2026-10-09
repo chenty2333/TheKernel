@@ -3785,7 +3785,10 @@ version = "0.1.0"
 dependencies = [
  "axlog",
  "kernel_guard",
+ "memory_addr",
+ "spin 0.9.9",
  "tk-axhal",
+ "tk-axmm",
  "tk-axtask",
 ]
 

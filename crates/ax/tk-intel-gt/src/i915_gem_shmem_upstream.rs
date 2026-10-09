@@ -10,6 +10,9 @@
 
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
 
+use crate::linux::shmem::{AddressSpace, File, FileOperations, Folio, FolioBatch, Inode, IovIter, Kiocb, VfsMount, WritebackControl,
+ pfn_to_page,check_move_unevictable_folios,__folio_batch_release,mapping_clear_unevictable,folio_batch_init,page_folio,folio_mark_dirty,folio_mark_accessed,folio_batch_add,mapping_set_unevictable,mapping_gfp_constraint,shmem_read_folio_gfp,mapping_gfp_mask,folio_nr_pages,shmem_truncate_range,writeback_iter,folio_mapped,folio_redirty_for_writepage,shmem_writeout,init_sync_kiocb,iov_iter_ubuf,shmem_file_setup_with_mnt,shmem_file_setup,force_o_largefile,mapping_set_gfp_mask,kernel_write,totalram_pages,dev_warn};
+
 use core::{
     ffi::{c_char, c_int, c_long, c_ulong, c_void, CStr},
     ptr,
@@ -31,8 +34,8 @@ use crate::{
     i915_gem_pages_upstream::drm_clflush_sg,
     i915_gem_userptr_upstream::{drm_gem_private_object_init, i915_gem_gtt_finish_pages, sg_free_table},
     i915_gem_core_upstream::{access_ok, u64_to_user_ptr},
-    i915_gem_context_upstream::fput,
-    linux::gem::DrmGemObject,
+    linux::shmem::fput,
+    linux::gem::{DrmGemObject,drm_gem_get_huge_mnt,drm_gem_huge_mnt_create},
     i915_gem_shrinker_upstream::i915_gem_shrink,
     i915_gem_tiling_upstream::i915_gem_object_needs_bit17_swizzle,
     intel_ggtt_fencing_upstream::{i915_gem_object_do_bit_17_swizzle, i915_gem_object_save_bit_17_swizzle},
@@ -136,107 +139,31 @@ unsafe fn drm_notice<T>(device: *mut T, format: *const c_char, argument: *const 
 // Linux records passed through pointers remain opaque here. The records whose
 // source members this file accesses are represented by source-derived prefixes.
 #[repr(C)]
-struct Folio {
-    _opaque: [u8; 0],
-}
-#[repr(C)]
-#[repr(C)]
-pub struct AddressSpace {
-    _opaque: [u8; 0],
-}
-#[repr(C)]
-struct File {
-    _f_lock: [u8; 4],
-    f_mode: u32,
-    f_op: *const FileOperations,
-    f_mapping: *mut AddressSpace,
-    _private_data: *mut c_void,
-    f_inode: *mut Inode,
-    f_flags: u32,
-    _f_iocb_flags: u32,
-}
-#[repr(C)]
-struct VfsMount {
-    _opaque: [u8; 0],
-}
-#[repr(C)]
-struct FolioBatch {
-    nr: u8,
-    i: u8,
-    percpu_pvec_drained: bool,
-    _pad: [u8; 5],
-    folios: [*mut Folio; 15],
-}
-#[repr(C)]
 struct SgtIter {
     sgp: *mut ScatterList,
     pfn: c_ulong,
     curr: u32,
     max: u32,
 }
-#[repr(C)]
-struct WritebackControl {
-    nr_to_write: c_long,
-    pages_skipped: c_long,
-    range_start: u64,
-    range_end: u64,
-    sync_mode: c_int,
-    _flags: u32,
-    fbatch: FolioBatch,
-    index: u64,
-    saved_err: c_int,
-    _cgroup_writeback: [u8; 64],
-}
-#[repr(C)]
-struct Kiocb {
-    ki_filp: *mut File,
-    ki_pos: i64,
-    ki_complete: Option<unsafe extern "C" fn(*mut Kiocb, c_long)>,
-    private: *mut c_void,
-    ki_flags: c_int,
-    ki_ioprio: u16,
-    ki_write_stream: u8,
-    _pad: u8,
-    ki_waitq: *mut c_void,
-}
-#[repr(C)]
-struct FileOperations {
-    owner: *mut c_void,
-    fop_flags: u32,
-    _pad: u32,
-    _llseek: *const c_void,
-    _read: *const c_void,
-    _write: *const c_void,
-    _read_iter: *const c_void,
-    write_iter: Option<unsafe extern "C" fn(*mut Kiocb, *mut IovIter) -> isize>,
-}
 const _: [(); 8] = [(); core::mem::offset_of!(File, f_op)];
 const _: [(); 16] = [(); core::mem::offset_of!(File, f_mapping)];
 const _: [(); 40] = [(); core::mem::offset_of!(File, f_flags)];
 const _: [(); 48] = [(); core::mem::offset_of!(FileOperations, write_iter)];
 #[repr(C)]
-struct Inode {
-    _opaque: [u8; 0],
-}
-#[repr(C)]
-struct IovIter {
-    _opaque: [usize; 8],
-}
-#[repr(C)]
 pub struct DrmI915GemPwrite {
-    handle: u32,
+    pub(crate) handle: u32,
     _pad: u32,
-    offset: u64,
-    size: u64,
-    data_ptr: u64,
+    pub(crate) offset: u64,
+    pub(crate) size: u64,
+    pub(crate) data_ptr: u64,
 }
 #[repr(C)]
 pub struct DrmI915GemPread {
-    handle: u32,
+    pub(crate) handle: u32,
     _pad: u32,
-    offset: u64,
-    size: u64,
-    data_ptr: u64,
+    pub(crate) offset: u64,
+    pub(crate) size: u64,
+    pub(crate) data_ptr: u64,
 }
 
 #[repr(C)]
@@ -548,7 +475,7 @@ pub unsafe fn shmem_sg_alloc_table(
             }
 
             (*sgt_layout(st)).nents += 1;
-            sg_set_folio(sg, folio, nr_pages * PAGE_SIZE as c_ulong, 0);
+            sg_set_folio(sg, folio, nr_pages as usize * PAGE_SIZE, 0);
         } else {
             nr_pages = core::cmp::min(
                 nr_pages,
@@ -832,7 +759,7 @@ unsafe extern "C" fn shmem_pwrite(
     kiocb.ki_pos = (*arg).offset as i64;
     iov_iter_ubuf(
         &mut iter,
-        ITER_SOURCE,
+        ITER_SOURCE as u32,
         user_data.cast::<c_void>(),
         size as usize,
     );

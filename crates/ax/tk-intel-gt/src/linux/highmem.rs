@@ -5,20 +5,9 @@
 use core::ffi::c_void;
 use crate::i915_gem_object_types_upstream::Page;
 
-unsafe extern "C" {
-    /// Map a struct page into the kernel address space (Linux highmem API).
-    pub fn kmap(page: *mut Page) -> *mut c_void;
-    /// Release a mapping created by `kmap`.
-    pub fn kunmap(page: *mut Page);
-}
-
-// Linux x86_64 wt-dev is built with CONFIG_HIGHMEM=n. These are the exact
-// `highmem-internal.h` inline expansions for this configuration.
-unsafe extern "C" {
-    fn page_address(page: *mut Page) -> *mut c_void;
-    pub fn put_page(page: *mut Page);
-    pub fn mark_page_accessed(page: *mut Page);
-}
+pub use crate::linux::shmem::{page_address,put_page,mark_page_accessed};
+pub unsafe fn kmap(page:*mut Page)->*mut c_void {unsafe {page_address(page)}}
+pub unsafe fn kunmap(_page:*mut Page) {}
 
 #[inline]
 pub unsafe fn kmap_local_page(page: *mut Page) -> *mut c_void {

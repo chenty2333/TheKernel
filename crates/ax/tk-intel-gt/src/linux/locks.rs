@@ -479,3 +479,30 @@ mod tests {
         spin_unlock_irqrestore(&mut lock, flags);
     }
 }
+
+/// Native reader/writer lock in the four-byte, zero-initialized rwlock storage.
+/// All LinuxKPI users of that storage use this implementation, never mix it
+/// with Linux qrwlock instructions. Reader guards retain native preemption
+/// exclusion until read_unlock, as required for DRM lookup atomic sections.
+pub unsafe fn read_lock(lock: *mut core::sync::atomic::AtomicU32) {
+    NoPreempt::acquire();
+    loop {
+        let old = unsafe {(*lock).load(Ordering::Relaxed)};
+        if old & (1 << 31) == 0 && old < (1 << 31) - 1
+            && unsafe {(*lock).compare_exchange_weak(old,old+1,Ordering::Acquire,Ordering::Relaxed)}.is_ok() {break;}
+        core::hint::spin_loop();
+    }
+}
+pub unsafe fn read_unlock(lock: *mut core::sync::atomic::AtomicU32) {
+    let old=unsafe {(*lock).fetch_sub(1,Ordering::Release)};
+    assert!(old!=0 && old&(1<<31)==0);
+    NoPreempt::release(());
+}
+pub unsafe fn write_lock(lock:*mut core::sync::atomic::AtomicU32) {
+    NoPreempt::acquire();
+    while unsafe {(*lock).compare_exchange_weak(0,1<<31,Ordering::Acquire,Ordering::Relaxed)}.is_err(){core::hint::spin_loop();}
+}
+pub unsafe fn write_unlock(lock:*mut core::sync::atomic::AtomicU32) {
+    assert_eq!(unsafe {(*lock).swap(0,Ordering::Release)},1<<31);
+    NoPreempt::release(());
+}

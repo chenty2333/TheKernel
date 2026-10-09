@@ -28,8 +28,12 @@ pub struct Inode {
 
 #[repr(C)]
 pub struct DrmVmaOffsetManager {
-    _opaque: [u8; 0],
+    pub vm_lock: core::sync::atomic::AtomicU32,
+    _padding: u32,
+    pub vm_addr_space: crate::linux::gem_memory::DrmMm,
 }
+const _: [(); 248] = [(); size_of::<DrmVmaOffsetManager>()];
+const _: [(); 0] = [(); offset_of!(DrmVmaOffsetManager, vm_lock)];
 
 /// Target-layout fields used from the leading `struct drm_device`; gaps
 /// remain opaque but are bounded by the configured Linux 7.2.3 C offsets.

@@ -7,10 +7,7 @@ use core::ffi::c_ulong;
 use crate::i915_gem_object_types_upstream::Page;
 use crate::linux_config::PAGE_SHIFT;
 
-unsafe extern "C" {
-    /// Linux `page_to_phys()` from `linux/mm.h`.
-    pub fn page_to_phys(page: *const Page) -> usize;
-}
+pub use crate::linux::shmem::page_to_phys;
 
 /// `page_to_pfn()` derives the page-frame number from the physical address.
 #[inline]

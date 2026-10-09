@@ -1504,3 +1504,11 @@ The `crates/linux` and `kernel/src` scan totals are unchanged from the CI
 baseline. Matching Rust expressions in the MIT i915 translations are counted,
 not exempted; a scanner match is a measurement, not a license classification.
 The feature remains default-off; compilation is not runtime acceptance.
+
+G2 follow-up: `i915_mm_upstream.rs` translates Linux 7.2.3 MIT `i915_mm.c`
+`sgt_pfn`, `remap_sg`, `remap_pfn`, `remap_io_mapping`, `remap_io_sg`; copyright
+© 2014 Intel Corporation, full grant in `tk-intel-gt/LICENSE-MIT`. Native
+`linux/{mm_native,shmem}.rs` are original LinuxKPI implementations over axmm,
+axtask, the native allocator and axhal physical-address translation, not copied
+Linux GPL MM/fs implementations. The C layout probe confirms the VMA manager
+lock at offset 0, size 248, and CONFIG_TRANSPARENT_HUGEPAGE=n (no huge_mnt field).

@@ -55,3 +55,11 @@ pub mod rcu_work;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod mmu_notifier;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod mm_native;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod shmem;

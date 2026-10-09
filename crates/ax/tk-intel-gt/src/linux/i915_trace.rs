@@ -44,3 +44,9 @@ pub fn trace_intel_context_reset(_context: &IntelContext) {}
 pub fn trace_i915_gem_object_destroy(_object: *mut DrmI915GemObject) {}
 #[inline]
 pub fn trace_i915_gem_shrink(_i915: *mut DrmI915Private, _target: c_ulong, _shrink: u32) {}
+
+/// Trace delivery is not enabled in this LinuxKPI configuration.
+#[inline]
+pub fn trace_i915_gem_object_fault(_obj: *mut DrmI915GemObject, _page: c_ulong, _gtt: bool, _write: bool) {}
+#[inline]
+pub fn trace_i915_gem_object_clflush(_obj: *mut DrmI915GemObject) {}

@@ -421,3 +421,7 @@ pub(crate) fn wait(
     }
     Err(Error::Timeout(reg))
 }
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_mm_upstream;

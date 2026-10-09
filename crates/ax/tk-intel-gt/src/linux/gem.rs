@@ -352,3 +352,19 @@ const _: [(); 8] = [(); align_of::<I915LutHandle>()];
 const _: [(); 0] = [(); offset_of!(I915LutHandle, obj_link)];
 const _: [(); 16] = [(); offset_of!(I915LutHandle, ctx)];
 const _: [(); 24] = [(); offset_of!(I915LutHandle, handle)];
+
+// upstream: drm_vma_manager.h drm_vma_offset_lock_lookup()
+pub unsafe fn drm_vma_offset_lock_lookup(manager:*mut DrmVmaOffsetManager) {
+    unsafe {crate::linux::locks::read_lock(manager.cast())};
+}
+// upstream: drm_vma_manager.h drm_vma_offset_unlock_lookup()
+pub unsafe fn drm_vma_offset_unlock_lookup(manager:*mut DrmVmaOffsetManager) {
+    unsafe {crate::linux::locks::read_unlock(manager.cast())};
+}
+// The configured Linux 7.2.3 C probe has CONFIG_TRANSPARENT_HUGEPAGE=n:
+// drm_device has no huge_mnt field in this ABI. Preserve the actual MIT header
+// branches instead of inventing a mount or an unmeasured field offset.
+// upstream: drm_gem.h drm_gem_get_huge_mnt()
+pub fn drm_gem_get_huge_mnt<T,U>(_dev:*mut T)->*mut U {core::ptr::null_mut()}
+// upstream: drm_gem.h drm_gem_huge_mnt_create()
+pub fn drm_gem_huge_mnt_create<T>(_dev:*mut T,_value:*const c_char)->c_int {0}

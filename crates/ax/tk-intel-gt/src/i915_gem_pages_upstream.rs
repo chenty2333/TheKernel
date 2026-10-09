@@ -84,12 +84,12 @@ const _: [(); 104] = [(); core::mem::offset_of!(DrmScanoutBuffer, set_pixel)];
 const _: [(); 112] = [(); core::mem::offset_of!(DrmScanoutBuffer, private)];
 #[repr(C)]
 pub struct Scatterlist {
-    page_link: usize,
-    offset: u32,
-    length: u32,
-    dma_address: u64,
-    dma_length: u32,
-    _dma_flags_or_padding: u32,
+    pub(crate) page_link: usize,
+    pub(crate) offset: u32,
+    pub(crate) length: u32,
+    pub(crate) dma_address: u64,
+    pub(crate) dma_length: u32,
+    pub(crate) _dma_flags_or_padding: u32,
 }
 const _: [(); 32] = [(); size_of::<Scatterlist>()];
 const _: [(); 16] = [(); core::mem::offset_of!(Scatterlist, dma_address)];

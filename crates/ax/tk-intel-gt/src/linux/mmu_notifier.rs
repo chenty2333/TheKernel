@@ -47,10 +47,8 @@ pub struct MmuNotifierRange {
 pub struct MmuIntervalNotifierFinish {
     _opaque: [u8; 0],
 }
-#[repr(C)]
-pub struct MmStruct {
-    _opaque: [u8; 0],
-}
+pub use crate::linux::mm_native::{MmStruct, current_mm, mmap_read_lock, mmap_read_unlock, VmaIterator, vma_find};
+pub use crate::linux::shmem::trylock_page;
 
 const _: [(); 24] = [(); core::mem::size_of::<MmuIntervalNotifierOps>()];
 const _: [(); 88] = [(); core::mem::size_of::<MmuIntervalNotifier>()];
