@@ -21,9 +21,11 @@ use crate::{
     i915_vma_types_upstream::{I915_VMA_CAN_FENCE_BIT, I915_VMA_GGTT_WRITE_BIT, I915Vma},
     intel_context_upstream::{I915AddressSpace, I915GemWwCtx, I915GttView, Kref},
     intel_engine_cs_upstream::{AtomicT, IntelEngineCs},
-    intel_gt_types_upstream::{I915Ggtt, IntelGt},
+    intel_gt_types_upstream::IntelGt,
+    intel_gtt_api_upstream::{I915Ggtt, i915_ggtt_has_aperture},
     intel_ring_types_upstream::{CACHELINE_BYTES, IntelRing},
     intel_timeline_types_upstream::IntelTimeline,
+    linux::memory::{kref_get, kref_put},
     linux_i915_private::DrmI915Private,
 };
 
@@ -42,7 +44,7 @@ unsafe extern "C" {
     ) -> *mut DrmI915GemObject;
     fn i915_gem_object_create_stolen(i915: *mut DrmI915Private, size: u64)
     -> *mut DrmI915GemObject;
-    fn i915_gem_object_create_internal(
+    pub fn i915_gem_object_create_internal(
         i915: *mut DrmI915Private,
         size: u64,
     ) -> *mut DrmI915GemObject;
@@ -220,7 +222,7 @@ unsafe fn create_ring_vma(ggtt: *mut I915Ggtt, size: i32) -> *mut I915Vma {
     };
 
     if crate::linux_config::IS_ERR(obj)
-        && crate::intel_gt_api_upstream::i915_ggtt_has_aperture(ggtt)
+        && i915_ggtt_has_aperture(ggtt)
         && !unsafe { crate::linux::i915::HAS_LLC(i915) }
     {
         obj = unsafe { i915_gem_object_create_stolen(i915, size as u64) };
@@ -295,12 +297,27 @@ pub unsafe fn intel_engine_create_ring(engine: *mut IntelEngineCs, size: i32) ->
 }
 
 // upstream: intel_ring.c intel_ring_free()
-pub unsafe fn intel_ring_free(reference: *mut Kref) {
+pub unsafe extern "C" fn intel_ring_free(reference: *mut Kref) {
     // `ref` is the first `intel_ring` member.
     let ring = reference.cast::<IntelRing>();
     unsafe {
         i915_vma_put((*ring).vma);
         crate::linux::memory::kfree(ring);
+    }
+}
+
+// upstream: intel_ring.h intel_ring_get()
+#[inline]
+pub unsafe fn intel_ring_get(ring: *mut IntelRing) -> *mut IntelRing {
+    unsafe { kref_get(core::ptr::addr_of_mut!((*ring).ref_)) };
+    ring
+}
+
+// upstream: intel_ring.h intel_ring_put()
+#[inline]
+pub unsafe fn intel_ring_put(ring: *mut IntelRing) {
+    unsafe {
+        kref_put(core::ptr::addr_of_mut!((*ring).ref_), intel_ring_free);
     }
 }
 
