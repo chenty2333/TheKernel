@@ -679,7 +679,7 @@ pub(crate) unsafe fn intel_engine_init_ctx_wa(engine: *mut IntelEngineCs) {
 }
 
 // upstream: intel_workarounds.c intel_engine_emit_ctx_wa()
-unsafe fn intel_engine_emit_ctx_wa(rq: *mut I915Request) -> i32 {
+pub(crate) unsafe fn intel_engine_emit_ctx_wa(rq: *mut I915Request) -> i32 {
     let wal = &mut (*(*rq).engine).ctx_wa_list;
     let uncore = (*(*rq).engine).uncore;
     if wal.count == 0 {
@@ -2134,6 +2134,6 @@ unsafe fn engine_wa_list_verify(
     err
 }
 // upstream: intel_workarounds.c intel_engine_verify_workarounds()
-unsafe fn intel_engine_verify_workarounds(engine: *mut IntelEngineCs, from: *const i8) -> i32 {
+pub(crate) unsafe fn intel_engine_verify_workarounds(engine: *mut IntelEngineCs, from: *const i8) -> i32 {
     engine_wa_list_verify((*engine).kernel_context, &(*engine).wa_list, from)
 }

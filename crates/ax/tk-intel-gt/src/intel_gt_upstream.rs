@@ -16,7 +16,7 @@ use crate::{
     i915_gem_object_types_upstream::DrmI915GemObject,
     i915_request_types_upstream::{DrmPrinter, I915Request},
     intel_context_types_upstream::IntelContext,
-    intel_engine_cs_upstream::{BCS0, I915_NUM_ENGINES, Spinlock},
+    intel_engine_cs_upstream::{BCS0, I915_NUM_ENGINES, Spinlock, intel_engines_init_mmio},
     intel_engine_types_upstream::{IntelEngineCs, IntelEngineMask},
     intel_gt_api_upstream::gt_is_root,
     intel_gt_buffer_pool_types_upstream::I915MapType,
@@ -133,7 +133,6 @@ unsafe extern "C" {
     fn i915_ggtt_create(i915: *mut DrmI915Private) -> *mut I915Ggtt;
     fn intel_gt_init_clock_frequency(gt: *mut IntelGt);
     fn intel_sseu_info_init(gt: *mut IntelGt);
-    fn intel_engines_init_mmio(gt: *mut IntelGt) -> i32;
     fn intel_gt_apply_workarounds(gt: *mut IntelGt);
     fn intel_gt_verify_workarounds(gt: *mut IntelGt, where_: *const c_char);
     fn intel_gt_init_swizzling(gt: *mut IntelGt);

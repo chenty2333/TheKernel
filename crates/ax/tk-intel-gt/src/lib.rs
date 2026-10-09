@@ -280,6 +280,9 @@ pub mod intel_gt_clock_utils_upstream;
 pub mod intel_gtt_api_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_gt_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_ppgtt_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
