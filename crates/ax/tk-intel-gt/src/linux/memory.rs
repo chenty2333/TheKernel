@@ -45,6 +45,7 @@ struct AllocationHeader {
     base: *mut u8,
     layout_size: usize,
     layout_align: usize,
+    payload_size: usize,
 }
 
 /// Allocate raw bytes like Linux `kmalloc`.
@@ -116,6 +117,77 @@ pub unsafe fn kfree<T>(object: *mut T) {
     let layout = Layout::from_size_align(metadata.layout_size, metadata.layout_align)
         .expect("kfree received corrupt allocation metadata");
     unsafe { dealloc(metadata.base, layout) };
+}
+
+/// Linux `kvmalloc_array()` for CPU-only buffers. The kernel allocator supplies
+/// virtual addressability but not DMA-contiguous backing, matching Linux's
+/// fallback allocation contract; overflowing dimensions fail without wrap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kvmalloc_array(
+    count: usize,
+    element_size: usize,
+    flags: u32,
+) -> *mut c_void {
+    let Some(size) = count.checked_mul(element_size) else {
+        return ptr::null_mut();
+    };
+    kmalloc(size, flags)
+}
+
+/// Linux `kmalloc_array()` with checked multiplication and exact caller GFP
+/// policy. Atomic allocations remain fail-closed in this global-allocator
+/// implementation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kmalloc_array(
+    count: usize,
+    element_size: usize,
+    flags: u32,
+) -> *mut c_void {
+    let Some(size) = count.checked_mul(element_size) else {
+        return ptr::null_mut();
+    };
+    kmalloc(size, flags)
+}
+
+/// Linux `kvfree()` accepts either kmalloc or vmalloc backing. This owner uses
+/// a single virtual allocator for both paths, so both share the same header.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kvfree(object: *mut c_void) {
+    unsafe { kfree(object) };
+}
+
+/// Linux `krealloc()` with the old allocation's exact payload length retained
+/// by the private allocator header. On allocation failure, the old allocation
+/// remains live, as in Linux.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krealloc(
+    object: *mut c_void,
+    new_size: usize,
+    flags: u32,
+) -> *mut c_void {
+    if object.is_null() {
+        return kmalloc(new_size, flags);
+    }
+    if object as usize == ZERO_SIZE_PTR {
+        return kmalloc(new_size, flags);
+    }
+    if new_size == 0 {
+        unsafe { kfree(object) };
+        return ZERO_SIZE_PTR as *mut c_void;
+    }
+    let header = unsafe {
+        (object.cast::<u8>().sub(size_of::<AllocationHeader>())).cast::<AllocationHeader>()
+    };
+    let old_size = unsafe { (*header).payload_size };
+    let replacement = kmalloc(new_size, flags);
+    if replacement.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(object.cast::<u8>(), replacement.cast::<u8>(), old_size.min(new_size));
+        kfree(object);
+    }
+    replacement
 }
 
 /// Allocate one uninitialized object with the requested GFP policy.
@@ -514,6 +586,7 @@ fn allocate(size: usize, alignment: usize, flags: u32, zero: bool) -> *mut u8 {
                 base,
                 layout_size: layout.size(),
                 layout_align: layout.align(),
+                payload_size: size,
             },
         );
     }

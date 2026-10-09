@@ -197,6 +197,24 @@ pub unsafe fn list_splice(list: *mut ListHead, head: *mut ListHead) {
     }
 }
 
+/// Insert all entries from `list` immediately before `head`, matching Linux
+/// `list_splice_tail()` without reinitializing the source list.
+#[inline]
+pub unsafe fn list_splice_tail(list: *mut ListHead, head: *mut ListHead) {
+    if unsafe { list_empty(&*list) } {
+        return;
+    }
+    let first = unsafe { (*list).next };
+    let last = unsafe { (*list).prev };
+    let prev = unsafe { (*head).prev };
+    unsafe {
+        (*prev).next = first;
+        (*first).prev = prev;
+        (*last).next = head;
+        (*head).prev = last;
+    }
+}
+
 pub unsafe fn list_replace(old: *mut ListHead, new: *mut ListHead) {
     (*new).next = (*old).next;
     (*(*new).next).prev = new;

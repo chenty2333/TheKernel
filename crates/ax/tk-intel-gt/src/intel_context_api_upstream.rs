@@ -26,6 +26,49 @@ use crate::{
     linux::{bits, memory, mutex, pm, primitives},
 };
 
+/// `intel_context_first_child()` source header iterator over the parent's
+/// intrusive child list.
+pub unsafe fn intel_context_first_child(parent: *mut IntelContext) -> *mut IntelContext {
+    if parent.is_null() {
+        return core::ptr::null_mut();
+    }
+    let head = unsafe {
+        core::ptr::addr_of_mut!((*parent).parallel.children.child_list)
+            .cast::<crate::intel_engine_cs_upstream::ListHead>()
+    };
+    let node = unsafe { (*head).next };
+    if node == head {
+        core::ptr::null_mut()
+    } else {
+        container_of!(node, IntelContext, parallel.children.child_link).cast()
+    }
+}
+
+/// `intel_context_next_child()` source header iterator over the parent's
+/// intrusive child list.
+pub unsafe fn intel_context_next_child(
+    parent: *mut IntelContext,
+    child: *mut IntelContext,
+) -> *mut IntelContext {
+    if parent.is_null() || child.is_null() {
+        return core::ptr::null_mut();
+    }
+    let head = unsafe {
+        core::ptr::addr_of_mut!((*parent).parallel.children.child_list)
+            .cast::<crate::intel_engine_cs_upstream::ListHead>()
+    };
+    let node = unsafe {
+        core::ptr::addr_of_mut!((*child).parallel.children.child_link)
+            .cast::<crate::intel_engine_cs_upstream::ListHead>()
+    };
+    let next = unsafe { (*node).next };
+    if next == head {
+        core::ptr::null_mut()
+    } else {
+        container_of!(next, IntelContext, parallel.children.child_link).cast()
+    }
+}
+
 unsafe extern "C" {
     pub fn mutex_lock_interruptible(lock: *mut Mutex) -> c_int;
 }

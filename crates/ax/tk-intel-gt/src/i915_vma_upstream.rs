@@ -1076,7 +1076,7 @@ unsafe fn i915_vma_verify_bind_complete(vma: *mut I915Vma) -> c_int {
 }
 
 #[inline]
-unsafe fn i915_vma_resource_get(vma_res: *mut I915VmaResource) -> *mut I915VmaResource {
+pub(crate) unsafe fn i915_vma_resource_get(vma_res: *mut I915VmaResource) -> *mut I915VmaResource {
     unsafe { dma_fence_get(ptr::addr_of_mut!((*vma_res).unbind_fence)) };
     vma_res
 }
@@ -1280,7 +1280,7 @@ pub unsafe extern "C" fn i915_vma_pin_iomap(vma: *mut I915Vma) -> *mut c_void {
             iomap = unsafe {
                 io_mapping_map_wc(
                     ptr::addr_of_mut!((*ggtt).iomap).cast(),
-                    vma_offset(vma) as i64,
+                    vma_offset(vma) as c_ulong,
                     vma_size(vma) as usize,
                 )
             };

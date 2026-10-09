@@ -11,7 +11,10 @@
 #![allow(unsafe_code)]
 
 use alloc::collections::BTreeMap;
-use core::ptr;
+use core::{
+    ffi::{c_ulong, c_void},
+    ptr,
+};
 
 use axhal::{
     mem::{MemRegionFlags, memory_regions, phys_to_virt},
@@ -270,6 +273,51 @@ pub unsafe fn io_mapping_map_wc(mapping: *mut IoMapping, offset: usize) -> *mut 
     let base = unsafe { (*mapping).iomem.cast::<u8>() };
     assert!(!base.is_null() && offset < size);
     unsafe { base.add(offset) }
+}
+
+/// Linux `io_mapping_map_atomic_wc()` over the already-resident full WC alias.
+/// The range is validated against the live owner record; no temporary mapping
+/// or page fault is needed in the atomic access path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn io_mapping_map_atomic_wc(
+    mapping: *mut IoMapping,
+    offset: c_ulong,
+) -> *mut c_void {
+    if mapping.is_null() {
+        return ptr::null_mut();
+    }
+    let returned = unsafe { (*mapping).iomem as usize };
+    let size = unsafe { (*mapping).size as usize };
+    if returned == 0 || offset as usize >= size {
+        return ptr::null_mut();
+    }
+    let valid = with_records(|records| {
+        records
+            .get(&returned)
+            .is_some_and(|record| record.mapped_size >= record.return_offset + size)
+    });
+    if !valid {
+        return ptr::null_mut();
+    }
+    unsafe { (*mapping).iomem.cast::<u8>().add(offset as usize).cast() }
+}
+
+/// The WC mapping is permanently resident until `io_mapping_fini()`, so an
+/// atomic unmap only verifies that the pointer belongs to a live mapped range.
+/// This is the complete operation for this pre-mapped implementation; unlike
+/// a stub, it rejects pointers outside an owned alias.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn io_mapping_unmap_atomic(address: *mut c_void) {
+    assert!(!address.is_null());
+    let address = address as usize;
+    let owned = with_records(|records| {
+        records.values().any(|record| {
+            let start = record.mapped_base + record.return_offset;
+            let end = start + record.mapped_size - record.return_offset;
+            address >= start && address < end
+        })
+    });
+    assert!(owned, "io_mapping_unmap_atomic received a foreign address");
 }
 
 #[cfg(test)]

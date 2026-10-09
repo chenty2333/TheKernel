@@ -158,9 +158,9 @@ unsafe extern "C" {
     fn __copy_to_user_inatomic(to: *mut c_void, from: *const c_void, n: usize) -> usize;
     fn copy_from_user_inatomic_nontemporal(to: *mut c_void, from: *const c_void, n: usize) -> usize;
     fn copy_from_user(to: *mut c_void, from: *const c_void, n: usize) -> usize;
-    fn io_mapping_map_atomic_wc(mapping: *mut c_void, offset: c_long) -> *mut c_void;
+    fn io_mapping_map_atomic_wc(mapping: *mut c_void, offset: c_ulong) -> *mut c_void;
     fn io_mapping_unmap_atomic(addr: *mut c_void);
-    pub(crate) fn io_mapping_map_wc(mapping: *mut c_void, offset: c_long, size: usize) -> *mut c_void;
+    pub(crate) fn io_mapping_map_wc(mapping: *mut c_void, offset: c_ulong, size: usize) -> *mut c_void;
     pub(crate) fn io_mapping_unmap(addr: *mut c_void);
     pub(crate) fn access_ok(addr: *const c_void, size: u64) -> bool;
     fn trace_i915_gem_object_pread(obj: *mut DrmI915GemObject, offset: u64, size: u64);
@@ -279,7 +279,7 @@ fn offset_in_page(offset: u64) -> usize {
 }
 
 #[inline]
-fn range_overflows_t_u64(start: u64, size: u64, limit: u64) -> bool {
+pub(crate) fn range_overflows_t_u64(start: u64, size: u64, limit: u64) -> bool {
     start.checked_add(size).is_none_or(|end| end > limit)
 }
 
@@ -500,7 +500,7 @@ unsafe fn gtt_user_read(
     user_data: *mut c_char,
     length: c_int,
 ) -> bool {
-    let mut vaddr = io_mapping_map_atomic_wc(mapping, base);
+    let mut vaddr = io_mapping_map_atomic_wc(mapping, base as c_ulong);
     let mut unwritten = __copy_to_user_inatomic(
         user_data.cast(),
         vaddr.add(offset as usize),
@@ -508,7 +508,7 @@ unsafe fn gtt_user_read(
     );
     io_mapping_unmap_atomic(vaddr);
     if unwritten != 0 {
-        vaddr = io_mapping_map_wc(mapping, base, PAGE_SIZE as usize);
+        vaddr = io_mapping_map_wc(mapping, base as c_ulong, PAGE_SIZE as usize);
         unwritten = copy_to_user(
             user_data.cast(),
             vaddr.add(offset as usize),
@@ -717,7 +717,7 @@ unsafe fn ggtt_write(
     user_data: *mut c_char,
     length: c_int,
 ) -> bool {
-    let mut vaddr = io_mapping_map_atomic_wc(mapping, base);
+    let mut vaddr = io_mapping_map_atomic_wc(mapping, base as c_ulong);
     let mut unwritten = copy_from_user_inatomic_nontemporal(
         vaddr.add(offset as usize),
         user_data.cast(),
@@ -725,7 +725,7 @@ unsafe fn ggtt_write(
     );
     io_mapping_unmap_atomic(vaddr);
     if unwritten != 0 {
-        vaddr = io_mapping_map_wc(mapping, base, PAGE_SIZE as usize);
+        vaddr = io_mapping_map_wc(mapping, base as c_ulong, PAGE_SIZE as usize);
         unwritten = copy_from_user(
             vaddr.add(offset as usize),
             user_data.cast(),

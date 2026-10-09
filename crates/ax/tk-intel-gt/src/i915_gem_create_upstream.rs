@@ -162,7 +162,7 @@ unsafe extern "C" {
     fn i915_user_extensions(
         extensions: *mut I915UserExtension,
         funcs: *const I915UserExtensionFn,
-        count: usize,
+        count: u32,
         data: *mut c_void,
     ) -> c_int;
 }
@@ -622,7 +622,7 @@ pub unsafe extern "C" fn i915_gem_create_ext_ioctl(
         i915_user_extensions(
             u64_to_user_ptr(args.extensions).cast(),
             CREATE_EXTENSIONS.as_ptr(),
-            CREATE_EXTENSIONS.len(),
+            CREATE_EXTENSIONS.len() as u32,
             (&mut ext_data as *mut CreateExt).cast(),
         )
     };

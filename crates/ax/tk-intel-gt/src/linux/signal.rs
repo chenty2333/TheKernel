@@ -14,6 +14,7 @@ use core::{
     ptr,
     sync::atomic::{AtomicPtr, Ordering},
 };
+use alloc::sync::Arc;
 
 pub type SignalPendingState = unsafe extern "C" fn(state: i32, task: *mut c_void) -> bool;
 
@@ -46,4 +47,18 @@ pub unsafe extern "C" fn signal_pending_state(state: i32, task: *mut c_void) -> 
     assert!(!task.is_null(), "signal_pending_state received a null task");
     let provider: SignalPendingState = unsafe { core::mem::transmute(provider) };
     unsafe { provider(state, task) }
+}
+
+/// Linux `signal_pending()` for translated interruptible execbuffer waits.
+pub unsafe fn signal_pending(task: *mut c_void) -> bool {
+    unsafe { signal_pending_state(crate::linux::wait::TASK_INTERRUPTIBLE as i32, task) }
+}
+
+/// Check the current task using its stable kernel task pointer for the duration
+/// of the callback. The local Arc clone pins that task while the provider reads
+/// its signal state.
+pub fn signal_pending_current() -> bool {
+    let task = axtask::current().clone();
+    let task_ptr = Arc::as_ptr(&task).cast_mut().cast::<c_void>();
+    unsafe { signal_pending(task_ptr) }
 }

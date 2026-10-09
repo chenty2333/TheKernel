@@ -470,6 +470,13 @@ pub unsafe fn HWS_NEEDS_PHYSICAL<P: I915PrivatePtr>(i915: P) -> bool {
     !info.is_null() && (unsafe { (*info).flags[4] } & (1 << 4)) != 0
 }
 
+/// Source device-info bit `unfenced_needs_alignment`, flag index 35 in
+/// `DEV_INFO_FOR_EACH_FLAG` (byte 4, bit 3 of the packed flag array).
+pub unsafe fn unfenced_needs_alignment<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = unsafe { INTEL_INFO(i915) };
+    !info.is_null() && (unsafe { (*info).flags[4] } & (1 << 3)) != 0
+}
+
 /// Source `HAS_64BIT_RELOC(i915)` from `i915_drv.h` and the
 /// `has_64bit_reloc` device-info flag (flag index 3 in Linux 7.2.3).
 #[allow(non_snake_case)]

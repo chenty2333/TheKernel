@@ -121,6 +121,9 @@ pub mod i915_gem_context_upstream;
 pub mod i915_gem_core_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub(crate) mod i915_gem_execbuffer_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub(crate) mod i915_gem_busy_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]

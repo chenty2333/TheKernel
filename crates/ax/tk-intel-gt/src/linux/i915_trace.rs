@@ -10,6 +10,7 @@
 use core::ffi::c_ulong;
 
 use crate::{
+    i915_request_types_upstream::I915Request,
     i915_gem_object_types_upstream::DrmI915GemObject, intel_context_types_upstream::IntelContext,
     intel_context_upstream::DmaFence, intel_gtt_api_upstream::I915AddressSpace,
     linux_config::CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS, linux_i915_private::DrmI915Private,
@@ -61,6 +62,10 @@ pub fn trace_i915_gem_object_fault(
 }
 #[inline]
 pub fn trace_i915_gem_object_clflush(_obj: *mut DrmI915GemObject) {}
+#[inline]
+pub fn trace_i915_request_queue(_request: *mut I915Request, _flags: u32) {}
+#[inline]
+pub fn trace_i915_request_add(_request: *mut I915Request) {}
 
 /// `i915_ppgtt_create` is a trace event from `i915_trace.h`; the configured
 /// TheKernel target has no i915 tracepoint sink, so this event compiles away.

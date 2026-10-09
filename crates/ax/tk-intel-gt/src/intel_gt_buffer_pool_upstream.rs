@@ -13,7 +13,10 @@ use core::{
 };
 
 use crate::{
-    i915_active_upstream::{__i915_active_init, i915_active_acquire, i915_active_fini},
+    i915_active_upstream::{
+        __i915_active_init, i915_active_acquire, i915_active_add_request, i915_active_fini,
+        i915_active_release,
+    },
     i915_gem_object_header_upstream::{
         __i915_gem_object_pin_pages, assert_object_held, i915_gem_object_set_readonly,
         i915_gem_object_unpin_pages,
@@ -28,6 +31,7 @@ use crate::{
     intel_gt_buffer_pool_types_upstream::{I915MapType, IntelGtBufferPool, IntelGtBufferPoolNode},
     intel_gt_types_upstream::IntelGt,
     intel_ring_upstream::i915_gem_object_create_internal,
+    i915_request_types_upstream::I915Request,
     linux::{
         bits::cmpxchg,
         list::{list_add_rcu, list_del_rcu, list_empty, list_is_last},
@@ -209,6 +213,20 @@ pub unsafe extern "C" fn intel_gt_buffer_pool_mark_used(node: *mut IntelGtBuffer
         i915_gem_object_make_unshrinkable((*node).obj);
         (*node).pinned = 1;
     }
+}
+
+// upstream: intel_gt_buffer_pool.h intel_gt_buffer_pool_mark_active()
+pub unsafe fn intel_gt_buffer_pool_mark_active(
+    node: *mut IntelGtBufferPoolNode,
+    rq: *mut I915Request,
+) -> c_int {
+    unsafe { GEM_WARN_ON!((*node).pinned == 0) };
+    unsafe { i915_active_add_request(ptr::addr_of_mut!((*node).active), rq) }
+}
+
+// upstream: intel_gt_buffer_pool.h intel_gt_buffer_pool_put()
+pub unsafe fn intel_gt_buffer_pool_put(node: *mut IntelGtBufferPoolNode) {
+    unsafe { i915_active_release(ptr::addr_of_mut!((*node).active)) };
 }
 
 // upstream: intel_gt_buffer_pool.c node_create()

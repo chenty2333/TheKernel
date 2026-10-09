@@ -73,6 +73,12 @@ pub unsafe fn ww_acquire_init(ctx: *mut WwAcquireCtx) {
     }
 }
 
+/// Mark the end of the acquire phase. The configured Linux build has
+/// DEBUG_WW_MUTEXES and lockdep disabled, so the upstream inline is a no-op.
+pub unsafe fn ww_acquire_done(ctx: *mut WwAcquireCtx) {
+    assert!(!ctx.is_null());
+}
+
 /// Finish after all locks held by the context were released.
 pub unsafe fn ww_acquire_fini(ctx: *mut WwAcquireCtx) {
     assert!(!ctx.is_null());

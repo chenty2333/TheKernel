@@ -85,7 +85,7 @@ static mut slab_objects: *mut c_void = core::ptr::null_mut();
 // Adjacent source C bitfields in `drm_i915_gem_object` are represented by
 // one u32 in the canonical owner. Update only each field's own bit range.
 #[inline]
-unsafe fn object_pat_index(obj: *const DrmI915GemObject) -> u32 {
+pub(crate) unsafe fn object_pat_index(obj: *const DrmI915GemObject) -> u32 {
     ((*obj).cache_state_bits & 0x3f) as u32
 }
 
@@ -632,7 +632,7 @@ unsafe fn i915_gem_object_read_from_page_iomap(
     let src_map = io_mapping_map_wc(
         (&mut (*(*obj).mm.region).iomap as *mut crate::linux::gem_memory::IoMapping)
             .cast::<c_void>(),
-        (dma - (*(*obj).mm.region).region.start) as i64,
+        (dma - (*(*obj).mm.region).region.start) as c_ulong,
         PAGE_SIZE as usize,
     );
     let src_ptr: *mut u8 = src_map.cast::<u8>().add(offset_in_page(offset) as usize);

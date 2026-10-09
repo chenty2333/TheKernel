@@ -6,8 +6,9 @@
 
 use core::{
     ffi::{c_long, c_void},
+    mem::{ManuallyDrop, MaybeUninit},
     ptr,
-    sync::atomic::{AtomicI32, Ordering},
+    sync::atomic::{AtomicI32, AtomicPtr, Ordering},
     time::Duration,
 };
 
@@ -15,11 +16,17 @@ use crate::{
     i915_request_types_upstream::I915Request,
     i915_request_upstream::DmaFenceOps,
     intel_context_types_upstream::I915Active,
-    intel_context_upstream::{DmaFence, I915GemWwCtx, Kref, RcuHead},
+    intel_context_upstream::{
+        DmaFence, DmaFenceCb, DmaFenceTimestamp, I915GemWwCtx, IrqWork, Kref, RcuHead,
+    },
+    intel_engine_cs_upstream::AtomicT,
     intel_ring_types_upstream::IntelRing,
+    intel_timeline_types_upstream::IntelTimeline,
     linux::{
         contexts::IntelContextPtr,
-        memory::{atomic_add_unless, atomic_inc, atomic_read, kref_get_unless_zero, kref_put},
+        memory::{
+            atomic_add_unless, atomic_inc, atomic_read, kref_get_unless_zero, kref_init, kref_put,
+        },
     },
 };
 
@@ -602,4 +609,568 @@ pub fn i915_request_put<R: I915RequestPtr>(request: R) {
             crate::linux::rcu::rcu_read_unlock();
         }
     }
+}
+
+// Linux i915 pointer-tag helpers from i915_ptr_util.h. The tag occupies the
+// low `nbits` of an aligned kernel pointer; callers retain the same pointer
+// type and are responsible for providing a pointer with those bits clear.
+#[inline]
+pub fn ptr_pack_bits<T>(pointer: *mut T, bits: u32, nbits: u32) -> *mut T {
+    assert!(nbits < usize::BITS);
+    let mask = (1usize << nbits) - 1;
+    assert_eq!(
+        (bits as usize) & !mask,
+        0,
+        "pointer tag exceeds its allocated bits"
+    );
+    assert_eq!(
+        (pointer as usize) & mask,
+        0,
+        "tagged pointer is not aligned"
+    );
+    ((pointer as usize) | bits as usize) as *mut T
+}
+
+#[inline]
+pub fn ptr_unpack_bits<T>(pointer: *mut T, bits: &mut u32, nbits: u32) -> *mut T {
+    assert!(nbits < usize::BITS);
+    let mask = (1usize << nbits) - 1;
+    *bits = (pointer as usize & mask) as u32;
+    ((pointer as usize) & !mask) as *mut T
+}
+
+#[inline]
+pub fn ptr_mask_bits<T>(pointer: *mut T, nbits: u32) -> *mut T {
+    assert!(nbits < usize::BITS);
+    ((pointer as usize) & !((1usize << nbits) - 1)) as *mut T
+}
+
+// `i915_request_next()` from i915_request.h. The timeline's intrusive list
+// contains requests by their `link` member and uses the list head as sentinel.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_request_next(
+    request: *mut I915Request,
+    timeline: *mut IntelTimeline,
+) -> *mut I915Request {
+    if request.is_null() || timeline.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        let link = ptr::addr_of_mut!((*request).link);
+        let next = (*link).next;
+        let head = ptr::addr_of_mut!((*timeline).requests);
+        if next == head {
+            ptr::null_mut()
+        } else {
+            next.cast::<u8>()
+                .sub(core::mem::offset_of!(I915Request, link))
+                .cast()
+        }
+    }
+}
+
+// Generic Linux dma-fence containers used by execbuffer's sync-file fences.
+// Their ABI layouts follow include/linux/dma-fence-{array,chain}.h.
+const DMA_FENCE_ENABLE_SIGNAL_BIT: u32 = 5;
+const DMA_FENCE_ARRAY_PENDING_ERROR: i32 = 1;
+
+#[repr(C)]
+struct DmaFenceArrayCallback {
+    callback: DmaFenceCb,
+    array: *mut DmaFenceArray,
+}
+
+#[repr(C)]
+pub struct DmaFenceArray {
+    pub base: DmaFence,
+    num_fences: u32,
+    num_pending: AtomicT,
+    fences: *mut *mut DmaFence,
+    work: IrqWork,
+    callbacks: [MaybeUninit<DmaFenceArrayCallback>; 0],
+}
+
+#[repr(C)]
+struct DmaFenceChain {
+    base: DmaFence,
+    prev: *mut DmaFence,
+    prev_seqno: u64,
+    fence: *mut DmaFence,
+    // Linux overlays the chain callback and irq_work at this exact offset.
+    work: IrqWork,
+}
+
+const _: [(); 32] = [(); core::mem::size_of::<DmaFenceArrayCallback>()];
+const _: [(); 112] = [(); core::mem::size_of::<DmaFenceArray>()];
+const _: [(); 120] = [(); core::mem::size_of::<DmaFenceChain>()];
+const _: [(); 80] = [(); core::mem::offset_of!(DmaFenceArray, work)];
+const _: [(); 112] = [(); core::mem::offset_of!(DmaFenceArray, callbacks)];
+const _: [(); 88] = [(); core::mem::offset_of!(DmaFenceChain, work)];
+
+fn dma_fence_chain_is(fence: *const DmaFence) -> bool {
+    !fence.is_null()
+        && unsafe { (*fence).ops == ptr::addr_of!(dma_fence_chain_ops).cast::<c_void>() }
+}
+
+unsafe fn dma_fence_chain_contained(fence: *mut DmaFence) -> *mut DmaFence {
+    if dma_fence_chain_is(fence) {
+        unsafe { (*fence.cast::<DmaFenceChain>()).fence }
+    } else {
+        fence
+    }
+}
+
+#[unsafe(no_mangle)]
+pub static dma_fence_array_ops: DmaFenceOps = DmaFenceOps {
+    get_driver_name: Some(dma_fence_array_driver_name),
+    get_timeline_name: Some(dma_fence_array_timeline_name),
+    enable_signaling: Some(dma_fence_array_enable_signaling),
+    signaled: Some(dma_fence_array_signaled),
+    wait: Some(dma_fence_default_wait),
+    release: Some(dma_fence_array_release),
+    set_deadline: Some(dma_fence_array_set_deadline),
+};
+
+#[unsafe(no_mangle)]
+pub static dma_fence_chain_ops: DmaFenceOps = DmaFenceOps {
+    get_driver_name: Some(dma_fence_chain_driver_name),
+    get_timeline_name: Some(dma_fence_chain_timeline_name),
+    enable_signaling: Some(dma_fence_chain_enable_signaling),
+    signaled: Some(dma_fence_chain_signaled),
+    wait: Some(dma_fence_default_wait),
+    release: Some(dma_fence_chain_release),
+    set_deadline: Some(dma_fence_chain_set_deadline),
+};
+
+unsafe extern "C" fn dma_fence_array_driver_name(_: *mut DmaFence) -> *const core::ffi::c_char {
+    c"dma_fence_array".as_ptr()
+}
+
+unsafe extern "C" fn dma_fence_array_timeline_name(_: *mut DmaFence) -> *const core::ffi::c_char {
+    c"unbound".as_ptr()
+}
+
+unsafe extern "C" fn dma_fence_chain_driver_name(_: *mut DmaFence) -> *const core::ffi::c_char {
+    c"dma_fence_chain".as_ptr()
+}
+
+unsafe extern "C" fn dma_fence_chain_timeline_name(_: *mut DmaFence) -> *const core::ffi::c_char {
+    c"unbound".as_ptr()
+}
+
+unsafe fn dma_fence_container_init(
+    fence: *mut DmaFence,
+    ops: *const DmaFenceOps,
+    context: u64,
+    seqno: u64,
+) {
+    assert!(!fence.is_null() && !ops.is_null());
+    unsafe {
+        let lock = ptr::addr_of_mut!((*fence).lock.inline_lock);
+        crate::linux::locks::spin_lock_init(&mut *lock);
+        (*fence).ops = ops.cast();
+        (*fence).timestamp_union = DmaFenceTimestamp {
+            cb_list: ManuallyDrop::new(crate::intel_engine_cs_upstream::ListHead {
+                next: ptr::null_mut(),
+                prev: ptr::null_mut(),
+            }),
+        };
+        crate::linux::list::INIT_LIST_HEAD(
+            ptr::addr_of_mut!((*fence).timestamp_union.cb_list).cast(),
+        );
+        (*fence).context = context;
+        (*fence).seqno = seqno;
+        (*fence).flags = 0;
+        kref_init(ptr::addr_of_mut!((*fence).refcount));
+        (*fence).error = 0;
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_fence_array_create(
+    num_fences: u32,
+    fences: *mut *mut DmaFence,
+    context: u64,
+    seqno: u32,
+) -> *mut DmaFenceArray {
+    if num_fences == 0 || fences.is_null() {
+        return ptr::null_mut();
+    }
+    let Some(callback_bytes) =
+        (num_fences as usize).checked_mul(core::mem::size_of::<DmaFenceArrayCallback>())
+    else {
+        return ptr::null_mut();
+    };
+    let Some(bytes) = core::mem::size_of::<DmaFenceArray>().checked_add(callback_bytes) else {
+        return ptr::null_mut();
+    };
+    let array = crate::linux::memory::kzalloc(bytes, crate::linux_config::GFP_KERNEL)
+        .cast::<DmaFenceArray>();
+    if array.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        (*array).num_fences = num_fences;
+        (*array).num_pending.counter = num_fences as i32;
+        (*array).fences = fences;
+        crate::linux::irq::init_irq_work(ptr::addr_of_mut!((*array).work), dma_fence_array_work);
+        dma_fence_container_init(
+            ptr::addr_of_mut!((*array).base),
+            ptr::addr_of!(dma_fence_array_ops),
+            context,
+            u64::from(seqno),
+        );
+        (*array).base.error = DMA_FENCE_ARRAY_PENDING_ERROR;
+    }
+    array
+}
+
+unsafe extern "C" fn dma_fence_array_work(work: *mut IrqWork) {
+    let array = unsafe {
+        work.cast::<u8>()
+            .sub(core::mem::offset_of!(DmaFenceArray, work))
+            .cast::<DmaFenceArray>()
+    };
+    unsafe {
+        dma_fence_array_clear_pending_error(array);
+        crate::i915_gem_clflush_upstream::dma_fence_signal(ptr::addr_of_mut!((*array).base));
+        dma_fence_put(ptr::addr_of_mut!((*array).base));
+    }
+}
+
+unsafe extern "C" fn dma_fence_array_callback(fence: *mut DmaFence, callback: *mut DmaFenceCb) {
+    let array_cb = unsafe { callback.cast::<DmaFenceArrayCallback>() };
+    let array = unsafe { (*array_cb).array };
+    unsafe {
+        dma_fence_array_set_pending_error(array, (*fence).error);
+        if crate::linux::memory::atomic_sub_and_test(1, &mut (*array).num_pending) {
+            crate::linux::irq::irq_work_queue(ptr::addr_of_mut!((*array).work));
+        } else {
+            dma_fence_put(ptr::addr_of_mut!((*array).base));
+        }
+    }
+}
+
+unsafe extern "C" fn dma_fence_array_enable_signaling(fence: *mut DmaFence) -> bool {
+    let array = fence.cast::<DmaFenceArray>();
+    for index in 0..unsafe { (*array).num_fences } {
+        let callback = unsafe {
+            ptr::addr_of_mut!((*array).callbacks)
+                .cast::<DmaFenceArrayCallback>()
+                .add(index as usize)
+        };
+        unsafe {
+            (*callback).array = array;
+            dma_fence_get(ptr::addr_of_mut!((*array).base));
+            let child = *(*array).fences.add(index as usize);
+            let err = crate::i915_gem_clflush_upstream::dma_fence_add_callback(
+                child,
+                ptr::addr_of_mut!((*callback).callback),
+                dma_fence_array_callback,
+            );
+            if err != 0 {
+                dma_fence_array_set_pending_error(array, (*child).error);
+                dma_fence_put(ptr::addr_of_mut!((*array).base));
+                if crate::linux::memory::atomic_sub_and_test(1, &mut (*array).num_pending) {
+                    dma_fence_array_clear_pending_error(array);
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+unsafe extern "C" fn dma_fence_array_signaled(fence: *mut DmaFence) -> bool {
+    let array = fence.cast::<DmaFenceArray>();
+    let mut pending = unsafe { crate::linux::memory::atomic_read(&(*array).num_pending) };
+    if crate::linux::bits::test_bit(DMA_FENCE_ENABLE_SIGNAL_BIT, unsafe { &(*fence).flags }) {
+        if pending <= 0 {
+            unsafe { dma_fence_array_clear_pending_error(array) };
+            return true;
+        }
+        return false;
+    }
+    for index in 0..unsafe { (*array).num_fences } {
+        let child = unsafe { *(*array).fences.add(index as usize) };
+        if unsafe { crate::i915_gem_clflush_upstream::dma_fence_is_signaled(child) } {
+            pending -= 1;
+            if pending == 0 {
+                unsafe { dma_fence_array_clear_pending_error(array) };
+                return true;
+            }
+        }
+    }
+    false
+}
+
+unsafe fn dma_fence_array_set_pending_error(array: *mut DmaFenceArray, error: i32) {
+    if error != 0 {
+        unsafe {
+            let err = AtomicI32::from_ptr(ptr::addr_of_mut!((*array).base.error));
+            let _ = err.compare_exchange(
+                DMA_FENCE_ARRAY_PENDING_ERROR,
+                error,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
+unsafe fn dma_fence_array_clear_pending_error(array: *mut DmaFenceArray) {
+    unsafe {
+        let err = AtomicI32::from_ptr(ptr::addr_of_mut!((*array).base.error));
+        let _ = err.compare_exchange(
+            DMA_FENCE_ARRAY_PENDING_ERROR,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+unsafe extern "C" fn dma_fence_array_release(fence: *mut DmaFence) {
+    let array = fence.cast::<DmaFenceArray>();
+    unsafe {
+        for index in 0..(*array).num_fences {
+            dma_fence_put(*(*array).fences.add(index as usize));
+        }
+        crate::linux::memory::kfree((*array).fences);
+        crate::i915_gem_clflush_upstream::dma_fence_free(fence);
+    }
+}
+
+unsafe extern "C" fn dma_fence_array_set_deadline(fence: *mut DmaFence, deadline: i64) {
+    let array = fence.cast::<DmaFenceArray>();
+    unsafe {
+        for index in 0..(*array).num_fences {
+            dma_fence_set_deadline(*(*array).fences.add(index as usize), deadline);
+        }
+    }
+}
+
+unsafe extern "C" fn dma_fence_chain_enable_signaling(fence: *mut DmaFence) -> bool {
+    let chain = fence.cast::<DmaFenceChain>();
+    let base = unsafe { ptr::addr_of_mut!((*chain).base) };
+    dma_fence_get(base);
+    let mut iter = dma_fence_get(fence);
+    while !iter.is_null() {
+        let child = unsafe { dma_fence_chain_contained(iter) };
+        if child.is_null() {
+            iter = unsafe { dma_fence_chain_walk(iter) };
+            continue;
+        }
+        dma_fence_get(child);
+        let err = unsafe {
+            crate::i915_gem_clflush_upstream::dma_fence_add_callback(
+                child,
+                ptr::addr_of_mut!((*chain).work).cast::<DmaFenceCb>(),
+                dma_fence_chain_callback,
+            )
+        };
+        if err == 0 {
+            unsafe { dma_fence_put(iter) };
+            return true;
+        }
+        unsafe { dma_fence_put(child) };
+        iter = unsafe { dma_fence_chain_walk(iter) };
+    }
+    unsafe { dma_fence_put(base) };
+    false
+}
+
+unsafe extern "C" fn dma_fence_chain_callback(fence: *mut DmaFence, callback: *mut DmaFenceCb) {
+    let chain = unsafe {
+        callback
+            .cast::<u8>()
+            .sub(core::mem::offset_of!(DmaFenceChain, work))
+            .cast::<DmaFenceChain>()
+    };
+    unsafe {
+        crate::linux::irq::init_irq_work(ptr::addr_of_mut!((*chain).work), dma_fence_chain_work);
+        crate::linux::irq::irq_work_queue(ptr::addr_of_mut!((*chain).work));
+        dma_fence_put(fence);
+    }
+}
+
+unsafe extern "C" fn dma_fence_chain_work(work: *mut IrqWork) {
+    let chain = unsafe {
+        work.cast::<u8>()
+            .sub(core::mem::offset_of!(DmaFenceChain, work))
+            .cast::<DmaFenceChain>()
+    };
+    unsafe {
+        if !dma_fence_chain_enable_signaling(ptr::addr_of_mut!((*chain).base)) {
+            crate::i915_gem_clflush_upstream::dma_fence_signal(ptr::addr_of_mut!((*chain).base));
+        }
+        dma_fence_put(ptr::addr_of_mut!((*chain).base));
+    }
+}
+
+unsafe extern "C" fn dma_fence_chain_signaled(fence: *mut DmaFence) -> bool {
+    let mut iter = dma_fence_get(fence);
+    while !iter.is_null() {
+        let child = unsafe { dma_fence_chain_contained(iter) };
+        if child.is_null()
+            || !unsafe { crate::i915_gem_clflush_upstream::dma_fence_is_signaled(child) }
+        {
+            unsafe { dma_fence_put(iter) };
+            return false;
+        }
+        iter = unsafe { dma_fence_chain_walk(iter) };
+    }
+    true
+}
+
+unsafe extern "C" fn dma_fence_chain_release(fence: *mut DmaFence) {
+    let chain = fence.cast::<DmaFenceChain>();
+    let mut prev = unsafe { (*chain).prev };
+    while !prev.is_null() {
+        if !dma_fence_chain_is(prev) || unsafe { crate::linux::memory::kref_read(&(*prev).refcount) } > 1 {
+            break;
+        }
+        let prev_chain = prev.cast::<DmaFenceChain>();
+        let next = unsafe { (*prev_chain).prev };
+        unsafe {
+            (*chain).prev = next;
+            (*prev_chain).prev = ptr::null_mut();
+            dma_fence_put(prev);
+        }
+        prev = next;
+    }
+    unsafe {
+        dma_fence_put(prev);
+        dma_fence_put((*chain).fence);
+        crate::i915_gem_clflush_upstream::dma_fence_free(fence);
+    }
+}
+
+unsafe extern "C" fn dma_fence_chain_set_deadline(fence: *mut DmaFence, deadline: i64) {
+    let mut iter = dma_fence_get(fence);
+    while !iter.is_null() {
+        let child = unsafe { dma_fence_chain_contained(iter) };
+        if !child.is_null() {
+            unsafe { dma_fence_set_deadline(child, deadline) };
+        }
+        iter = unsafe { dma_fence_chain_walk(iter) };
+    }
+}
+
+unsafe fn dma_fence_set_deadline(fence: *mut DmaFence, deadline: i64) {
+    if fence.is_null() {
+        return;
+    }
+    let ops = unsafe { (*fence).ops.cast::<DmaFenceOps>() };
+    if !ops.is_null() {
+        if let Some(set_deadline) = unsafe { (*ops).set_deadline } {
+            unsafe { set_deadline(fence, deadline) };
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_fence_chain_walk(fence: *mut DmaFence) -> *mut DmaFence {
+    if !dma_fence_chain_is(fence) {
+        unsafe { dma_fence_put(fence) };
+        return ptr::null_mut();
+    }
+    let chain = fence.cast::<DmaFenceChain>();
+    let mut result = ptr::null_mut();
+    loop {
+        crate::linux::rcu::rcu_read_lock();
+        let prev = unsafe { AtomicPtr::from_ptr(ptr::addr_of_mut!((*chain).prev)) }
+            .load(Ordering::Acquire);
+        let prev_ref = dma_fence_get_rcu(prev);
+        crate::linux::rcu::rcu_read_unlock();
+        if prev_ref.is_null() {
+            break;
+        }
+        let replacement = if dma_fence_chain_is(prev_ref) {
+            let previous = prev_ref.cast::<DmaFenceChain>();
+            let child = unsafe { (*previous).fence };
+            if child.is_null()
+                || !unsafe { crate::i915_gem_clflush_upstream::dma_fence_is_signaled(child) }
+            {
+                result = prev_ref;
+                break;
+            }
+            crate::linux::rcu::rcu_read_lock();
+            let replacement = unsafe {
+                dma_fence_get_rcu(
+                    AtomicPtr::from_ptr(ptr::addr_of_mut!((*previous).prev))
+                        .load(Ordering::Acquire),
+                )
+            };
+            crate::linux::rcu::rcu_read_unlock();
+            replacement
+        } else if unsafe { !crate::i915_gem_clflush_upstream::dma_fence_is_signaled(prev_ref) } {
+            result = prev_ref;
+            break;
+        } else {
+            ptr::null_mut()
+        };
+        let result = unsafe {
+            AtomicPtr::from_ptr(ptr::addr_of_mut!((*chain).prev)).compare_exchange(
+                prev_ref,
+                replacement,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+        };
+        if result.is_ok() {
+            unsafe { dma_fence_put(prev_ref) };
+        } else {
+            unsafe { dma_fence_put(replacement) };
+        }
+        unsafe { dma_fence_put(prev_ref) };
+    }
+    unsafe { dma_fence_put(fence) };
+    result
+}
+
+pub fn dma_fence_chain_alloc<T>() -> *mut T {
+    crate::linux::memory::kmalloc(
+        core::mem::size_of::<DmaFenceChain>(),
+        crate::linux_config::GFP_KERNEL,
+    )
+    .cast()
+}
+
+pub unsafe fn dma_fence_chain_free<T>(chain: *mut T) {
+    if !chain.is_null() {
+        unsafe { crate::linux::memory::kfree(chain) };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_fence_chain_find_seqno(fence: *mut *mut DmaFence, seqno: u64) -> i32 {
+    if seqno == 0 {
+        return 0;
+    }
+    if fence.is_null() || unsafe { (*fence).is_null() } {
+        return -(crate::linux_config::EINVAL as i32);
+    }
+    let start = unsafe { *fence };
+    if !dma_fence_chain_is(start) || unsafe { (*start).seqno < seqno } {
+        return -(crate::linux_config::EINVAL as i32);
+    }
+    let root = start.cast::<DmaFenceChain>();
+    let context = unsafe { (*root).base.context };
+    let mut iter = dma_fence_get(start);
+    loop {
+        if !dma_fence_chain_is(iter) {
+            break;
+        }
+        let current = iter.cast::<DmaFenceChain>();
+        if unsafe { (*iter).context != context || (*current).prev_seqno < seqno } {
+            break;
+        }
+        iter = unsafe { dma_fence_chain_walk(iter) };
+    }
+    unsafe {
+        *fence = iter;
+        dma_fence_put(start);
+    }
+    0
 }
