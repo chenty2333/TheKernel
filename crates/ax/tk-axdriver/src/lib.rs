@@ -94,13 +94,18 @@ mod virtio;
 
 #[cfg(feature = "usb-xhci")]
 mod usb;
+pub use tk_bt_hci::{
+    AclReassembler as BluetoothAclReassembler, smp as bluetooth_smp,
+    smp_crypto as bluetooth_smp_crypto,
+};
+#[cfg(feature = "usb-xhci")]
+pub use tk_bt_hci::{
+    Channel as BluetoothChannel, Error as BluetoothError, PacketType as BluetoothPacketType,
+};
 #[cfg(feature = "usb-xhci")]
 pub use usb::observations as usb_observations;
 #[cfg(feature = "usb-xhci")]
 pub use usb::{UsbBluetoothHci, bluetooth_devices};
-#[cfg(feature = "usb-xhci")]
-pub use tk_bt_hci::{Channel as BluetoothChannel, Error as BluetoothError, PacketType as BluetoothPacketType};
-pub use tk_bt_hci::smp as bluetooth_smp;
 
 #[cfg(feature = "input")]
 #[path = "usb/hid_report.rs"]
@@ -568,7 +573,10 @@ impl AllDevices {
 
             #[cfg(feature = "vtd")]
             if !tk_vtd::platform_pci_dma_allowed() {
-                error!("pci: DMA admission unavailable after ACPI VT-d initialization; refusing PCI probe");
+                error!(
+                    "pci: DMA admission unavailable after ACPI VT-d initialization; refusing PCI \
+                     probe"
+                );
                 return;
             }
             self.probe_bus_devices();

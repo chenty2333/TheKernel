@@ -11,6 +11,7 @@ pub const SMP_CID: u16 = 0x0006;
 pub const PAIRING_REQUEST: u8 = 0x01;
 pub const PAIRING_RESPONSE: u8 = 0x02;
 pub const PAIRING_FAILED: u8 = 0x05;
+pub const SECURITY_REQUEST: u8 = 0x0b;
 pub const PAIRING_PUBLIC_KEY: u8 = 0x0c;
 
 /// Frame one complete SMP PDU in an HCI ACL packet and its L2CAP header.
@@ -93,8 +94,7 @@ impl PairingFeatures {
         ])
     }
 
-    /// Choose Just Works or the implemented Secure Connections Numeric
-    /// Comparison flow. OOB and Passkey Entry fail closed.
+    /// Select the LE association model supported by local and peer I/O.
     pub fn negotiate(self, peer: Self) -> Result<Negotiated, PairingError> {
         if peer.initiator_key_distribution & !self.initiator_key_distribution != 0
             || peer.responder_key_distribution & !self.responder_key_distribution != 0
@@ -110,12 +110,20 @@ impl PairingFeatures {
             && secure_connections
             && matches!(self.io_capability, 1 | 4)
             && matches!(peer.io_capability, 1 | 4);
-        if mitm && !numeric_comparison {
+        let local_displays = matches!(self.io_capability, 0 | 1 | 4);
+        let local_inputs = matches!(self.io_capability, 2 | 4);
+        let peer_displays = matches!(peer.io_capability, 0 | 1 | 4);
+        let peer_inputs = matches!(peer.io_capability, 2 | 4);
+        let passkey_entry = mitm
+            && !numeric_comparison
+            && ((local_displays && peer_inputs) || (local_inputs && peer_displays));
+        if mitm && !numeric_comparison && !passkey_entry {
             return Err(PairingError::AuthenticationUnsupported);
         }
         Ok(Negotiated {
             secure_connections,
             numeric_comparison,
+            passkey_entry,
             bonding: self.auth_req & 0x03 != 0 && peer.auth_req & 0x03 != 0,
             key_size: self.max_key_size.min(peer.max_key_size),
             initiator_key_distribution: self.initiator_key_distribution
@@ -126,10 +134,20 @@ impl PairingFeatures {
     }
 }
 
+/// Parse the fixed-size peripheral Security Request payload and return its
+/// authentication flags for the central-side pairing decision.
+pub fn parse_security_request(pdu: &[u8]) -> Result<u8, PairingError> {
+    if pdu.len() != 2 || pdu[0] != SECURITY_REQUEST || pdu[1] & !0x0f != 0 {
+        return Err(PairingError::InvalidPdu);
+    }
+    Ok(pdu[1])
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Negotiated {
     pub secure_connections: bool,
     pub numeric_comparison: bool,
+    pub passkey_entry: bool,
     pub bonding: bool,
     pub key_size: u8,
     pub initiator_key_distribution: u8,
@@ -153,7 +171,7 @@ pub enum PairingError {
 /// Appendix D octet order: `[address-type, six address octets]`.
 ///
 /// This low-level exchange supports Just Works and Secure Connections Numeric
-/// Comparison. Passkey/OOB and peripheral-role flows remain unsupported. The caller is
+/// Comparison. OOB and peripheral-role flows remain unsupported. The caller is
 /// responsible for the HCI ACL/L2CAP path, encryption transition and key
 /// distribution; no pairing success is implied by merely constructing it.
 pub struct Initiator {
@@ -164,6 +182,9 @@ pub struct Initiator {
     peer_address: [u8; 7],
     local_random: [u8; 16], // raw SMP wire order
     private_key: [u8; 32],
+    passkey_randoms: [[u8; 16]; 20],
+    passkey_round: u8,
+    passkey: Option<u32>,
     local_public: Option<([u8; 32], [u8; 32])>,
     peer_public: Option<([u8; 32], [u8; 32])>,
     peer_random: Option<[u8; 16]>,
@@ -184,6 +205,7 @@ enum Phase {
     AwaitConfirm,
     AwaitRandom,
     AwaitUserConfirmation,
+    AwaitPasskey,
     AwaitDhKeyCheck,
     AwaitEncryption,
     DistributingKeys,
@@ -195,6 +217,11 @@ enum Phase {
 pub enum Action {
     Send(Vec<u8>),
     ConfirmNumeric(u32),
+    RequestPasskey,
+    DisplayPasskey {
+        passkey: u32,
+        pdu: Vec<u8>,
+    },
     StartEncryption([u8; 16]),
     Paired {
         secure_connections: bool,
@@ -211,6 +238,24 @@ impl Initiator {
         local_random: [u8; 16],
         private_key: [u8; 32],
     ) -> Result<Self, PairingError> {
+        Self::new_with_passkey_entropy(
+            local,
+            local_address,
+            peer_address,
+            local_random,
+            private_key,
+            [[0; 16]; 20],
+        )
+    }
+
+    pub fn new_with_passkey_entropy(
+        local: PairingFeatures,
+        local_address: [u8; 7],
+        peer_address: [u8; 7],
+        local_random: [u8; 16],
+        private_key: [u8; 32],
+        passkey_randoms: [[u8; 16]; 20],
+    ) -> Result<Self, PairingError> {
         let request = local.encode(PAIRING_REQUEST)?;
         if local.oob_data {
             return Err(PairingError::AuthenticationUnsupported);
@@ -223,6 +268,9 @@ impl Initiator {
             peer_address,
             local_random,
             private_key,
+            passkey_randoms,
+            passkey_round: 0,
+            passkey: None,
             local_public: None,
             peer_public: None,
             peer_random: None,
@@ -306,6 +354,10 @@ impl Initiator {
                     public.extend_from_slice(&to_wire(&y));
                     Ok(Action::Send(public))
                 } else {
+                    if negotiated.passkey_entry {
+                        self.phase = Phase::AwaitPasskey;
+                        return Ok(self.passkey_prompt());
+                    }
                     let random = from_wire::<16>(&self.local_random)?;
                     let confirm = legacy_confirm(
                         &[0; 16],
@@ -338,6 +390,10 @@ impl Initiator {
                     return Err(PairingError::InvalidPublicKey);
                 }
                 self.peer_public = Some((peer_x, peer_y));
+                if self.negotiated.is_some_and(|n| n.passkey_entry) {
+                    self.phase = Phase::AwaitPasskey;
+                    return Ok(self.passkey_prompt());
+                }
                 let local_x = self.local_public.ok_or(PairingError::InvalidState)?.0;
                 let nonce = from_wire::<16>(&self.local_random)?;
                 let confirm = smp_crypto::f4(&local_x, &peer_x, &nonce, 0);
@@ -351,7 +407,10 @@ impl Initiator {
                 let confirm = from_wire::<16>(&pdu[1..])?;
                 self.peer_confirm = Some(confirm);
                 self.phase = Phase::AwaitRandom;
-                Ok(Action::Send(pdu_with_wire(0x04, &self.local_random)))
+                Ok(Action::Send(pdu_with_wire(
+                    0x04,
+                    self.current_local_nonce(),
+                )))
             }
             Phase::AwaitRandom if !self.secure_connections => {
                 if pdu.len() != 17 || pdu[0] != 0x04 {
@@ -360,8 +419,9 @@ impl Initiator {
                 let peer_random_wire: [u8; 16] =
                     pdu[1..].try_into().map_err(|_| PairingError::InvalidPdu)?;
                 let peer_random = from_wire::<16>(&peer_random_wire)?;
+                let tk = self.passkey.map(passkey_tk).unwrap_or([0; 16]);
                 let expected = legacy_confirm(
-                    &[0; 16],
+                    &tk,
                     &peer_random,
                     &self.request,
                     &self.response.ok_or(PairingError::InvalidState)?,
@@ -371,9 +431,9 @@ impl Initiator {
                 if Some(expected) != self.peer_confirm || Some(expected) == self.local_confirm {
                     return Err(PairingError::ConfirmFailed);
                 }
-                let local_random = from_wire::<16>(&self.local_random)?;
+                let local_random = from_wire::<16>(self.current_local_nonce())?;
                 let key = smp_crypto::s1(
-                    &[0; 16],
+                    &tk,
                     peer_random[8..]
                         .try_into()
                         .map_err(|_| PairingError::InvalidPdu)?,
@@ -393,15 +453,32 @@ impl Initiator {
                     pdu[1..].try_into().map_err(|_| PairingError::InvalidPdu)?;
                 let (local_x, _) = self.local_public.ok_or(PairingError::InvalidState)?;
                 let (peer_x, _) = self.peer_public.ok_or(PairingError::InvalidState)?;
+                let z = if self.negotiated.is_some_and(|n| n.passkey_entry) {
+                    0x80 | (self.passkey.unwrap_or(0) >> self.passkey_round & 1) as u8
+                } else {
+                    0
+                };
                 let expected =
-                    smp_crypto::f4(&peer_x, &local_x, &from_wire::<16>(&peer_random)?, 0);
+                    smp_crypto::f4(&peer_x, &local_x, &from_wire::<16>(&peer_random)?, z);
                 if Some(expected) != self.peer_confirm {
                     return Err(PairingError::ConfirmFailed);
                 }
                 self.peer_random = Some(peer_random);
+                if self.negotiated.is_some_and(|n| n.passkey_entry) {
+                    if self.passkey_round < 19 {
+                        self.passkey_round += 1;
+                        let nonce = from_wire::<16>(self.current_local_nonce())?;
+                        let bit = self.passkey.unwrap_or(0) >> self.passkey_round & 1;
+                        let confirm = smp_crypto::f4(&local_x, &peer_x, &nonce, 0x80 | bit as u8);
+                        self.local_confirm = Some(confirm);
+                        self.phase = Phase::AwaitConfirm;
+                        return Ok(Action::Send(pdu_with_key(0x03, &confirm)));
+                    }
+                    return self.finish_secure_connections();
+                }
                 if self.negotiated.is_some_and(|n| n.numeric_comparison) {
                     let local_x = self.local_public.ok_or(PairingError::InvalidState)?.0;
-                    let nonce = from_wire::<16>(&self.local_random)?;
+                    let nonce = from_wire::<16>(self.current_local_nonce())?;
                     let peer_nonce = from_wire::<16>(&peer_random)?;
                     let value = smp_crypto::g2(&local_x, &peer_x, &nonce, &peer_nonce);
                     self.phase = Phase::AwaitUserConfirmation;
@@ -416,7 +493,7 @@ impl Initiator {
                 }
                 let peer_check = from_wire::<16>(&pdu[1..])?;
                 let mac_key = self.mac_key.ok_or(PairingError::InvalidState)?;
-                let n1 = from_wire::<16>(&self.local_random)?;
+                let n1 = from_wire::<16>(self.current_local_nonce())?;
                 let n2 = from_wire::<16>(&self.peer_random.ok_or(PairingError::InvalidState)?)?;
                 let response = self.response.ok_or(PairingError::InvalidState)?;
                 let peer_iocap = [response[3], response[2], response[1]];
@@ -424,7 +501,7 @@ impl Initiator {
                     &mac_key,
                     &n2,
                     &n1,
-                    &[0; 16],
+                    &self.passkey.map(passkey_tk).unwrap_or([0; 16]),
                     &peer_iocap,
                     &self.peer_address,
                     &self.local_address,
@@ -446,6 +523,87 @@ impl Initiator {
 
     pub fn awaiting_user_confirmation(&self) -> bool {
         self.phase == Phase::AwaitUserConfirmation
+    }
+
+    pub fn awaiting_passkey(&self) -> bool {
+        self.phase == Phase::AwaitPasskey
+    }
+
+    /// Supply the passkey requested by the association model. A display-capable
+    /// local side gets a generated six-digit value from its secure nonce pool.
+    pub fn provide_passkey(&mut self, passkey: u32) -> Action {
+        if self.phase != Phase::AwaitPasskey || passkey > 999_999 {
+            return Action::Failed(PairingError::InvalidState);
+        }
+        if self.secure_connections && self.passkey_randoms.iter().all(|nonce| *nonce == [0; 16]) {
+            self.phase = Phase::Failed;
+            return Action::Failed(PairingError::AuthenticationUnsupported);
+        }
+        self.passkey = Some(passkey);
+        if self.secure_connections {
+            let Some((local_x, _)) = self.local_public else {
+                return Action::Failed(PairingError::InvalidState);
+            };
+            let Some((peer_x, _)) = self.peer_public else {
+                return Action::Failed(PairingError::InvalidState);
+            };
+            let nonce = match from_wire::<16>(self.current_local_nonce()) {
+                Ok(nonce) => nonce,
+                Err(error) => return Action::Failed(error),
+            };
+            let confirm = smp_crypto::f4(&local_x, &peer_x, &nonce, 0x80 | (passkey as u8 & 1));
+            self.local_confirm = Some(confirm);
+            self.phase = Phase::AwaitConfirm;
+            Action::Send(pdu_with_key(0x03, &confirm))
+        } else {
+            let Some(response) = self.response else {
+                return Action::Failed(PairingError::InvalidState);
+            };
+            let confirm = legacy_confirm(
+                &passkey_tk(passkey),
+                &self.local_random,
+                &self.request,
+                &response,
+                &self.local_address,
+                &self.peer_address,
+            );
+            self.local_confirm = Some(confirm);
+            self.phase = Phase::AwaitConfirm;
+            Action::Send(pdu_with_key(0x03, &confirm))
+        }
+    }
+
+    fn passkey_prompt(&mut self) -> Action {
+        let peer_io = self.response.map(|response| response[1]).unwrap_or(3);
+        let local_displays = matches!(self.local.io_capability, 0 | 1 | 4);
+        let peer_inputs = matches!(peer_io, 2 | 4);
+        if local_displays && peer_inputs {
+            let cutoff = ((u64::from(u32::MAX) + 1) / 1_000_000) * 1_000_000;
+            let Some(passkey) = self
+                .local_random
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])))
+                .find(|value| u64::from(*value) < cutoff)
+                .map(|value| value % 1_000_000)
+            else {
+                self.phase = Phase::Failed;
+                return Action::Failed(PairingError::AuthenticationUnsupported);
+            };
+            match self.provide_passkey(passkey) {
+                Action::Send(pdu) => Action::DisplayPasskey { passkey, pdu },
+                other => other,
+            }
+        } else {
+            Action::RequestPasskey
+        }
+    }
+
+    fn current_local_nonce(&self) -> &[u8; 16] {
+        if self.secure_connections && self.negotiated.is_some_and(|n| n.passkey_entry) {
+            &self.passkey_randoms[usize::from(self.passkey_round)]
+        } else {
+            &self.local_random
+        }
     }
 
     pub fn user_confirmation(&mut self, accept: bool) -> Action {
@@ -470,7 +628,7 @@ impl Initiator {
         let (peer_x, peer_y) = self.peer_public.ok_or(PairingError::InvalidState)?;
         let dh_key = smp_crypto::p256_ecdh(&self.private_key, &peer_x, &peer_y)
             .ok_or(PairingError::InvalidPublicKey)?;
-        let n1 = from_wire::<16>(&self.local_random)?;
+        let n1 = from_wire::<16>(self.current_local_nonce())?;
         let n2 = from_wire::<16>(&self.peer_random.ok_or(PairingError::InvalidState)?)?;
         let a1 = self.local_address;
         let a2 = self.peer_address;
@@ -481,7 +639,7 @@ impl Initiator {
             &mac_key,
             &n1,
             &n2,
-            &[0; 16],
+            &self.passkey.map(passkey_tk).unwrap_or([0; 16]),
             &[self.local.auth_req, 0, self.local.io_capability],
             &a1,
             &a2,
@@ -508,6 +666,12 @@ fn pdu_with_wire(opcode: u8, value: &[u8; 16]) -> Vec<u8> {
 fn mask_key(mut key: [u8; 16], size: u8) -> [u8; 16] {
     let keep = usize::from(size.clamp(7, 16));
     key[..16 - keep].fill(0);
+    key
+}
+
+fn passkey_tk(passkey: u32) -> [u8; 16] {
+    let mut key = [0; 16];
+    key[..4].copy_from_slice(&passkey.to_le_bytes());
     key
 }
 
@@ -568,6 +732,7 @@ mod tests {
             Ok(Negotiated {
                 secure_connections: true,
                 numeric_comparison: false,
+                passkey_entry: false,
                 bonding: true,
                 key_size: 12,
                 initiator_key_distribution: 3,
@@ -597,6 +762,19 @@ mod tests {
                 .negotiate(numeric_peer)
                 .unwrap()
                 .numeric_comparison
+        );
+    }
+
+    #[test]
+    fn peripheral_security_request_is_two_octets_and_preserves_auth_flags() {
+        assert_eq!(parse_security_request(&[SECURITY_REQUEST, 0x0d]), Ok(0x0d));
+        assert_eq!(
+            parse_security_request(&[SECURITY_REQUEST]),
+            Err(PairingError::InvalidPdu)
+        );
+        assert_eq!(
+            parse_security_request(&[SECURITY_REQUEST, 0x80]),
+            Err(PairingError::InvalidPdu)
         );
     }
 
@@ -830,5 +1008,140 @@ mod tests {
         );
         assert!(session.awaiting_user_confirmation());
         assert!(matches!(session.user_confirmation(true), Action::Send(pdu) if pdu[0] == 0x0d));
+    }
+
+    #[test]
+    fn secure_connections_passkey_entry_runs_all_twenty_confirm_rounds() {
+        let local = PairingFeatures {
+            io_capability: 2, // keyboard-only: local user enters the passkey
+            oob_data: false,
+            auth_req: 0x0d,
+            max_key_size: 16,
+            initiator_key_distribution: 0,
+            responder_key_distribution: 0,
+        };
+        let peer = PairingFeatures {
+            io_capability: 0, // display-only
+            ..local
+        };
+        let local_private = [1u8; 32];
+        let (local_x, _local_y) = smp_crypto::p256_public(&local_private).unwrap();
+        let peer_private = [2u8; 32];
+        let (peer_x, peer_y) = smp_crypto::p256_public(&peer_private).unwrap();
+        let rounds = core::array::from_fn(|round| [round as u8 + 1; 16]);
+        let mut initiator = Initiator::new_with_passkey_entropy(
+            local,
+            [0, 1, 2, 3, 4, 5, 6],
+            [0, 6, 5, 4, 3, 2, 1],
+            [0x31; 16],
+            local_private,
+            rounds,
+        )
+        .unwrap();
+        assert!(matches!(
+            initiator.handle(&peer.encode(PAIRING_RESPONSE).unwrap()),
+            Action::Send(_)
+        ));
+        let mut public = vec![PAIRING_PUBLIC_KEY];
+        public.extend_from_slice(&to_wire(&peer_x));
+        public.extend_from_slice(&to_wire(&peer_y));
+        assert_eq!(initiator.handle(&public), Action::RequestPasskey);
+        let passkey = 123_456u32;
+        assert!(matches!(
+            initiator.provide_passkey(passkey),
+            Action::Send(_)
+        ));
+        for round in 0..20u8 {
+            let peer_nonce = [0xa0 + round; 16];
+            let bit = (passkey >> round) & 1;
+            let peer_confirm = smp_crypto::f4(&peer_x, &local_x, &peer_nonce, 0x80 | bit as u8);
+            let mut confirm_pdu = vec![0x03];
+            confirm_pdu.extend_from_slice(&to_wire(&peer_confirm));
+            assert!(matches!(initiator.handle(&confirm_pdu), Action::Send(_)));
+            let mut random_pdu = vec![0x04];
+            random_pdu.extend_from_slice(&peer_nonce);
+            let action = initiator.handle(&random_pdu);
+            if round < 19 {
+                assert!(matches!(action, Action::Send(_)));
+            } else {
+                assert!(matches!(action, Action::Send(ref pdu) if pdu[0] == 0x0d));
+            }
+        }
+        let local_nonce = from_wire::<16>(&rounds[19]).unwrap();
+        let peer_nonce = from_wire::<16>(&[0xb3; 16]).unwrap();
+        let dh_key = smp_crypto::p256_ecdh(&local_private, &peer_x, &peer_y).unwrap();
+        let (mac_key, _) = smp_crypto::f5(
+            &dh_key,
+            &local_nonce,
+            &peer_nonce,
+            &initiator.local_address,
+            &initiator.peer_address,
+        );
+        let peer_check = smp_crypto::f6(
+            &mac_key,
+            &peer_nonce,
+            &local_nonce,
+            &passkey_tk(passkey),
+            &[peer.auth_req, 0, peer.io_capability],
+            &initiator.peer_address,
+            &initiator.local_address,
+        );
+        assert!(matches!(
+            initiator.handle(&pdu_with_key(0x0d, &peer_check)),
+            Action::StartEncryption(_)
+        ));
+    }
+
+    #[test]
+    fn legacy_passkey_entry_uses_user_passkey_as_tk() {
+        let local = PairingFeatures {
+            io_capability: 0, // this central displays
+            oob_data: false,
+            auth_req: 0x05,
+            max_key_size: 16,
+            initiator_key_distribution: 1,
+            responder_key_distribution: 1,
+        };
+        let peer = PairingFeatures {
+            io_capability: 2, // peer enters the displayed passkey
+            ..local
+        };
+        let local_address = [0, 1, 2, 3, 4, 5, 6];
+        let peer_address = [0, 6, 5, 4, 3, 2, 1];
+        let local_random = [0x11; 16];
+        let request = local.encode(PAIRING_REQUEST).unwrap();
+        let response = peer.encode(PAIRING_RESPONSE).unwrap();
+        let mut initiator =
+            Initiator::new(local, local_address, peer_address, local_random, [1; 32]).unwrap();
+        let Action::DisplayPasskey { passkey, pdu } = initiator.handle(&response) else {
+            panic!("display passkey association expected");
+        };
+        assert_eq!(pdu[0], 0x03);
+        let tk = passkey_tk(passkey);
+        let peer_random = [0x22; 16];
+        let confirm = legacy_confirm(
+            &tk,
+            &peer_random,
+            &request,
+            &response,
+            &local_address,
+            &peer_address,
+        );
+        let mut confirm_pdu = vec![0x03];
+        confirm_pdu.extend_from_slice(&to_wire(&confirm));
+        assert!(matches!(initiator.handle(&confirm_pdu), Action::Send(_)));
+        let mut random_pdu = vec![0x04];
+        random_pdu.extend_from_slice(&peer_random);
+        let Action::StartEncryption(key) = initiator.handle(&random_pdu) else {
+            panic!("valid legacy passkey should derive the STK");
+        };
+        let local_nonce = from_wire::<16>(&local_random).unwrap();
+        let peer_nonce = from_wire::<16>(&peer_random).unwrap();
+        let expected = smp_crypto::s1(
+            &tk,
+            peer_nonce[8..].try_into().unwrap(),
+            local_nonce[8..].try_into().unwrap(),
+        );
+        assert_eq!(key, expected);
     }
 }

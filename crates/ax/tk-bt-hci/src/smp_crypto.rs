@@ -152,6 +152,21 @@ pub fn ah(irk: &Key, prand: &[u8; 3]) -> [u8; 3] {
     encrypted[13..].try_into().expect("three octets")
 }
 
+/// Resolve a random-address byte array as carried in HCI (least significant
+/// octet first) with an IRK also stored in SMP/UAPI wire order. Returns false
+/// for non-RPAs, including static random addresses.
+pub fn resolves_rpa(irk_wire: &Key, address: &[u8; 6]) -> bool {
+    if address[5] & 0xc0 != 0x40 {
+        return false;
+    }
+    let mut key = *irk_wire;
+    key.reverse();
+    let prand = [address[5], address[4], address[3]];
+    let mut hash = ah(&key, &prand);
+    hash.reverse();
+    address[..3] == hash
+}
+
 /// Return the P-256 public key as uncompressed x/y coordinates (big endian).
 pub fn p256_public(private: &[u8; 32]) -> Option<([u8; 32], [u8; 32])> {
     let secret = SecretKey::from_slice(private).ok()?;
@@ -211,6 +226,11 @@ mod tests {
         assert_eq!(g2(&u, &v, &x, &n2), 938554);
         let irk = hex("ec0234a357c8ad05341010a60a397d9b");
         assert_eq!(ah(&irk, &[0x70, 0x81, 0x94]), [0x0d, 0xfb, 0xaa]);
+        let wire_address = [0xaa, 0xfb, 0x0d, 0x94, 0x81, 0x70];
+        let mut irk_wire = irk;
+        irk_wire.reverse();
+        assert!(resolves_rpa(&irk_wire, &wire_address));
+        assert!(!resolves_rpa(&irk_wire, &[1, 2, 3, 4, 5, 6]));
     }
 
     #[test]

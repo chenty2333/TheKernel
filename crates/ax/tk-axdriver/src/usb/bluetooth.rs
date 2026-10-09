@@ -313,6 +313,17 @@ impl UsbBluetoothHci {
             }
             if let Ok(capabilities) = self.adapter.read_capabilities() {
                 self.address = capabilities.address;
+                let mtu = [capabilities.acl_mtu, capabilities.le_acl_mtu]
+                    .into_iter()
+                    .filter(|mtu| *mtu != 0)
+                    .min()
+                    .unwrap_or(1024);
+                let packet_limits = [capabilities.acl_packets, capabilities.le_acl_packets]
+                    .into_iter()
+                    .filter(|packets| *packets != 0)
+                    .min()
+                    .unwrap_or(1);
+                self.adapter.configure_acl_flow_control(mtu, packet_limits);
                 self.capabilities = capabilities;
             }
             let mut event = [0u8; 16];
@@ -395,6 +406,9 @@ impl UsbBluetoothHci {
     }
     pub fn management_settings(&self) -> u32 {
         self.management_settings
+    }
+    pub fn management_io_capability(&self) -> u8 {
+        self.io_capability
     }
     /// Replace the host key database from a Linux mgmt LOAD_* command.
     /// The wire records are validated by the socket layer before this method.
@@ -512,6 +526,27 @@ impl UsbBluetoothHci {
         self.local_irk
     }
 
+    /// Resolve an HCI-wire random address against IRKs loaded by bluetoothd
+    /// or learned through LE SMP. The stored peer tuple is returned in mgmt
+    /// identity-address order.
+    pub fn management_resolve_private_address(
+        &self,
+        address_type: u8,
+        address: [u8; 6],
+    ) -> Option<(u8, [u8; 6])> {
+        if address_type != 2 || address[5] & 0xc0 != 0x40 {
+            return None;
+        }
+        self.irks.iter().find_map(|record| {
+            let key: [u8; 16] = record[7..23].try_into().ok()?;
+            if tk_bt_hci::smp_crypto::resolves_rpa(&key, &address) {
+                Some((record[6], record[..6].try_into().ok()?))
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn management_store_local_irk(&mut self, irk: [u8; 16]) -> Result<(), Error> {
         let previous = self.local_irk;
         self.local_irk = irk;
@@ -583,6 +618,60 @@ impl UsbBluetoothHci {
         Ok(())
     }
 
+    /// Cancel a controller Create Connection procedure for the matching
+    /// management address type. This only cancels the pending controller
+    /// attempt; established ACL links must be disconnected separately.
+    pub fn management_cancel_pair_device(
+        &mut self,
+        address: [u8; 6],
+        address_type: u8,
+    ) -> Result<(), Error> {
+        if !self.adapter.is_up() {
+            return Err(Error::NotUp);
+        }
+        if let Some((_, _, handle)) = self
+            .connections
+            .iter()
+            .find(|(peer, kind, _)| *peer == address && *kind == address_type)
+            .copied()
+        {
+            let mut command = [0u8; 6];
+            command[..2].copy_from_slice(&0x0406u16.to_le_bytes());
+            command[2] = 3;
+            command[3..5].copy_from_slice(&handle.to_le_bytes());
+            command[5] = 0x13;
+            self.adapter.command_status(&command, &mut [0u8; 16])?;
+            self.pending_pairing
+                .retain(|(peer, kind, _)| *peer != address || *kind != address_type);
+            return Ok(());
+        }
+        let pending = self
+            .pending_pairing
+            .iter()
+            .any(|(peer, kind, _)| *peer == address && *kind == address_type);
+        if !pending {
+            return Err(Error::Unsupported);
+        }
+        let mut event = [0u8; 16];
+        match address_type {
+            0 => {
+                let mut command = [0u8; 9];
+                command[..2].copy_from_slice(&0x0408u16.to_le_bytes());
+                command[2] = 6;
+                command[3..].copy_from_slice(&address);
+                self.adapter.command_complete(&command, &mut event)?;
+            }
+            1 | 2 => {
+                self.adapter
+                    .command_complete(&[0x0e, 0x20, 0], &mut event)?;
+            }
+            _ => return Err(Error::InvalidLength),
+        };
+        self.pending_pairing
+            .retain(|(peer, kind, _)| *peer != address || *kind != address_type);
+        Ok(())
+    }
+
     /// Send one complete L2CAP SMP PDU on an established LE ACL connection.
     pub fn management_send_smp(&mut self, handle: u16, pdu: &[u8]) -> Result<(), Error> {
         let packet = tk_bt_hci::smp::build_acl_packet(handle, pdu)?;
@@ -597,16 +686,38 @@ impl UsbBluetoothHci {
         handle: u16,
         key: &[u8; 16],
     ) -> Result<(), Error> {
-        if handle > 0x0fff {
-            return Err(Error::InvalidLength);
-        }
-        let mut command = [0u8; 31];
-        command[..2].copy_from_slice(&0x2019u16.to_le_bytes());
-        command[2] = 28;
-        command[3..5].copy_from_slice(&handle.to_le_bytes());
-        command[5..15].fill(0);
-        command[15..31].copy_from_slice(key);
+        let command = tk_bt_hci::le_start_encryption_command(handle, &[0; 8], 0, key)?;
         self.command_status(&command)
+    }
+
+    /// Start LE encryption after a peer Security Request when bluetoothd has
+    /// loaded the matching LTK through MGMT_LOAD_LONG_TERM_KEYS.
+    pub fn management_start_encryption_from_loaded_ltk(
+        &mut self,
+        handle: u16,
+        address: [u8; 6],
+        address_type: u8,
+    ) -> Result<bool, Error> {
+        if !self.adapter.is_up() || handle > 0x0fff {
+            return Err(if self.adapter.is_up() {
+                Error::InvalidLength
+            } else {
+                Error::NotUp
+            });
+        }
+        let Some(material) =
+            tk_bt_hci::find_management_ltk(&self.long_term_keys, address, address_type)
+        else {
+            return Ok(false);
+        };
+        let command = tk_bt_hci::le_start_encryption_command(
+            handle,
+            &material.random,
+            material.ediv,
+            &material.key,
+        )?;
+        self.command_status(&command)?;
+        Ok(true)
     }
     pub fn management_set_io_capability(&mut self, io_capability: u8) -> Result<(), Error> {
         if io_capability > 4 {
@@ -1078,6 +1189,15 @@ impl UsbBluetoothHci {
                 let mut address = [0; 6];
                 address.copy_from_slice(&event[8..14]);
                 self.update_connection(address, kind, handle, status == 0);
+                let identity = (status == 0 && kind == 2)
+                    .then(|| self.management_resolve_private_address(kind, address))
+                    .flatten();
+                self.pending_pairing.retain(|(peer, peer_kind, _)| {
+                    !(*peer == address && *peer_kind == kind
+                        || identity.is_some_and(|(identity_kind, identity_address)| {
+                            *peer == identity_address && *peer_kind == identity_kind
+                        }))
+                });
             }
             // HCI LE Long Term Key Request: look up the exact address,
             // address type, EDIV and Rand tuple supplied in the mgmt key.

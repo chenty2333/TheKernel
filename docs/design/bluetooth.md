@@ -61,6 +61,36 @@ Core Appendix D vectors cover CMAC, f4-f6, g2, and ah; P-256 ECDH has symmetry
 and invalid-point checks. The SMP core is now a bounded central-side engine: it validates the Pairing Feature exchange, supports Legacy Just Works and Secure Connections Just Works / Numeric Comparison, validates public keys and confirmation/DHKey checks, and produces an encryption-key action. MITM requests are only accepted for Secure Connections Numeric Comparison when both IO capabilities can display/confirm; OOB and Passkey Entry fail closed. The HCI integration carries complete ACL/L2CAP CID 0x0006 SMP PDUs, starts encryption, distributes legacy LTK/EDIV/Rand and identity keys or Secure Connections identity keys, caches the generated/received LTK and IRK, updates the resolving list where enabled, and emits mgmt `NEW_LONG_TERM_KEY`/`NEW_IRK` after key distribution. BlueZ `USER_CONFIRM_REQUEST` and `USER_CONFIRM_REPLY/NEG_REPLY` route the Numeric Comparison decision into the SMP state machine. `READ_COMMANDS` advertises both key events (22 commands, 11 events). RFC/Core crypto vectors and state-machine tests pass, as do product feature checks. This is still not hardware acceptance: no physical controller was tested. ACL continuation-fragment reassembly, peripheral-role pairing, OOB and Passkey Entry, pairing timeout/cancel, remote RPA-to-identity connection matching, and crash-safe persistence remain open; unavailable/invalid cases fail without reporting a successful bond.
 
 The latest no-controller QEMU smoke (Q35/KVM, VT-d/intremap) passed after the
-management event table update: 22 commands/11 events, empty index list,
+management event table update: 25 commands/13 events, empty index list,
 no-device ioctl errors, `hciconfig` empty enumeration and BlueZ's no-controller
 startup path. This does not exercise ACL SMP against a peer.
+
+## Final ACL, timeout, passkey and identity follow-up (2026-10-09)
+
+This section supersedes the earlier open-items paragraph above. The HCI adapter
+queries both `Read_Buffer_Size` and `LE_Read_Buffer_Size`, segments oversized
+outbound L2CAP/ACL PDUs at a conservative controller ACL MTU, and limits
+in-flight packets to the reported packet buffer count. HCI
+`Number_Of_Completed_Packets` replenishes credits and resumes a bounded send
+queue. Received PB start/continuation sequences are reassembled per handle
+before CID 0x0006 reaches SMP. Unit protocol traces cover fragmentation, credit
+release, and reassembly; raw HCI sockets retain controller fragment semantics.
+
+LE pairing now has a 30-second timer, standard `CANCEL_PAIR_DEVICE` handling,
+and pairing/reassembly cleanup on encryption failure and disconnect. Central
+Passkey Entry covers legacy TK/c1/s1 and Secure Connections' 20 f4 confirm
+rounds, `USER_PASSKEY_REQUEST`/reply/negative-reply and `PASSKEY_NOTIFY` mgmt
+messages. A peer `Security Request` first attempts encryption with the matching
+`LOAD_LONG_TERM_KEYS` record; if none is loaded, it begins host pairing. When an
+LE connection completes with an RPA, loaded or learned IRKs are checked with
+Core `ah`; a match updates the connection identity reported by
+`DEVICE_CONNECTED`. `READ_COMMANDS` now reports 25 commands and 13 events.
+
+The user daemon remains responsible for durable keys and reloads them through
+`LOAD_LINK_KEYS`, `LOAD_LONG_TERM_KEYS`, and `LOAD_IRKS`; kernel storage is
+volatile. LE peripheral/responder pairing and advertising admission are still
+not implemented by this HCI management path. OOB is intentionally rejected
+because no user-space OOB-data exchange is available, so the kernel does not
+silently downgrade authentication. These deterministic protocol tests are not
+controller-in-loop evidence; physical controller, peripheral, and RPA
+resolution behavior remain unverified.

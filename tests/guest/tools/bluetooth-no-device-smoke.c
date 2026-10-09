@@ -125,12 +125,12 @@ int main(void) {
     if (send(mgmt, read_commands, sizeof(read_commands), 0) != sizeof(read_commands)) return fail("mgmt READ_COMMANDS send");
     response_len = recv(mgmt, response, sizeof(response), 0);
     const uint8_t commands_reply[] = {
-        1, 0, 0xff, 0xff, 73, 0, 2, 0, 0, 22, 0, 11, 0,
+        1, 0, 0xff, 0xff, 83, 0, 2, 0, 0, 25, 0, 13, 0,
         3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 9, 0, 11, 0, 13, 0,
-        18, 0, 19, 0, 20, 0, 22, 0, 23, 0, 24, 0, 25, 0, 28, 0, 29, 0,
-        35, 0, 36, 0, 42, 0, 47, 0, 48, 0,
-        6, 0, 9, 0, 0x0a, 0, 0x0b, 0, 0x0c, 0, 0x0e, 0, 0x0f, 0, 0x11, 0, 0x12, 0,
-        0x13, 0, 0x18, 0,
+        18, 0, 19, 0, 20, 0, 22, 0, 23, 0, 24, 0, 25, 0, 26, 0, 28, 0, 29, 0,
+        32, 0, 33, 0, 35, 0, 36, 0, 42, 0, 47, 0, 48, 0,
+        6, 0, 9, 0, 0x0a, 0, 0x0b, 0, 0x0c, 0, 0x0e, 0, 0x0f, 0, 0x10, 0, 0x11, 0,
+        0x12, 0, 0x13, 0, 0x17, 0, 0x18, 0,
     };
     if (response_len != sizeof(commands_reply) || memcmp(response, commands_reply, sizeof(commands_reply))) {
         fprintf(stderr, "mgmt READ_COMMANDS response length=%ld bytes:", (long)response_len);
@@ -150,6 +150,8 @@ int main(void) {
     const uint8_t pin_reply[] = { 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     const uint8_t pin_negative[] = { 0, 0, 0, 0, 0, 0, 0 };
     const uint8_t confirm[] = { 0, 0, 0, 0, 0, 0, 0 };
+    const uint8_t passkey_reply[] = { 0, 0, 0, 0, 0, 0, 1, 0x3f, 0x42, 0x0f, 0 };
+    const uint8_t passkey_negative[] = { 0, 0, 0, 0, 0, 0, 1 };
     if (mgmt_no_controller_command(mgmt, 5, enabled, sizeof(enabled)) ||
         mgmt_no_controller_command(mgmt, 6, discoverable, sizeof(discoverable)) ||
         mgmt_no_controller_command(mgmt, 7, enabled, sizeof(enabled)) ||
@@ -163,11 +165,14 @@ int main(void) {
         mgmt_no_controller_command(mgmt, 19, no_ltk, sizeof(no_ltk)) ||
         mgmt_no_controller_command(mgmt, 0x30, no_irks, sizeof(no_irks)) ||
         mgmt_no_controller_command(mgmt, 0x19, peer, sizeof(peer)) ||
+        mgmt_no_controller_command(mgmt, 0x1a, peer, 7) ||
         mgmt_no_controller_command(mgmt, 0x14, peer, 7) ||
         mgmt_no_controller_command(mgmt, 0x16, pin_reply, sizeof(pin_reply)) ||
         mgmt_no_controller_command(mgmt, 0x17, pin_negative, sizeof(pin_negative)) ||
         mgmt_no_controller_command(mgmt, 0x1c, confirm, sizeof(confirm)) ||
         mgmt_no_controller_command(mgmt, 0x1d, confirm, sizeof(confirm)) ||
+        mgmt_no_controller_command(mgmt, 0x20, passkey_reply, sizeof(passkey_reply)) ||
+        mgmt_no_controller_command(mgmt, 0x21, passkey_negative, sizeof(passkey_negative)) ||
         mgmt_no_controller_command(mgmt, 0x23, discovery_type, sizeof(discovery_type)) ||
         mgmt_no_controller_command(mgmt, 0x24, discovery_type, sizeof(discovery_type))) {
         return 1;

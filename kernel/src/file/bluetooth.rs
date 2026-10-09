@@ -13,7 +13,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axio::{IoBuf, Read, Write};
+use axio::IoBuf;
 use axpoll::{IoEvents, PollRegistration, PollSet, Pollable, PreparedPollRegistration};
 use bytemuck::{Pod, Zeroable};
 use linux_raw_sys::net::{SOCK_RAW, sockaddr};
@@ -37,6 +37,10 @@ const HCI_OPT_PASS_CREDENTIALS: u32 = 0x1_0000;
 pub(crate) const HCI_CMSG_DIR: u32 = 1;
 pub(crate) const HCI_CMSG_TSTAMP: u32 = 2;
 const MAX_HCI_PACKET: usize = 65_536;
+#[cfg(feature = "input")]
+const SMP_PAIR_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(30);
+#[cfg(feature = "input")]
+const SMP_PAIR_TIMEOUT_NANOS: u64 = 30_000_000_000;
 const HCI_UP: u32 = 1 << 0;
 #[cfg(feature = "input")]
 const MAX_SMP_SESSIONS: usize = 8;
@@ -47,6 +51,8 @@ struct PendingSmpPairing {
     address: [u8; 6],
     address_type: u8,
     io_capability: u8,
+    started_at: u64,
+    peer_auth_req: Option<u8>,
 }
 
 #[cfg(feature = "input")]
@@ -72,12 +78,17 @@ struct SmpSession {
     local_distribution: u8,
     distribution_started: bool,
     pending_confirmation: bool,
+    pending_passkey: bool,
+    started_at: u64,
 }
 
 #[cfg(feature = "input")]
 static SMP_PENDING: SpinMutex<Vec<PendingSmpPairing>> = SpinMutex::new(Vec::new());
 #[cfg(feature = "input")]
 static SMP_SESSIONS: SpinMutex<Vec<SmpSession>> = SpinMutex::new(Vec::new());
+#[cfg(feature = "input")]
+static SMP_ACL_REASSEMBLER: SpinMutex<axdriver::BluetoothAclReassembler> =
+    SpinMutex::new(axdriver::BluetoothAclReassembler::new());
 
 #[cfg(feature = "input")]
 type UsbAdapter = Arc<SpinMutex<axdriver::UsbBluetoothHci>>;
@@ -258,23 +269,55 @@ mod tests {
     }
 
     #[test]
+    fn cancel_pair_device_has_linux_management_wire_shape() {
+        let reply = management_response(&[0x1a, 0, 0, 0, 7, 0, 1, 2, 3, 4, 5, 6, 2]).unwrap();
+        assert_eq!(&reply[..9], &[1, 0, 0, 0, 3, 0, 0x1a, 0, 0x11]);
+        assert_eq!(reply.len(), 9);
+    }
+
+    #[test]
+    fn passkey_management_commands_validate_wire_parameters_without_device() {
+        let reply = management_response(&[
+            0x20, 0, 0, 0, 11, 0, 1, 2, 3, 4, 5, 6, 1, 0x3f, 0x42, 0x0f, 0,
+        ])
+        .unwrap();
+        assert_eq!(&reply[..9], &[1, 0, 0, 0, 3, 0, 0x20, 0, 0x11]);
+        let rejected = management_response(&[0x21, 0, 0, 0, 7, 0, 1, 2, 3, 4, 5, 6, 1]).unwrap();
+        assert_eq!(&rejected[..9], &[1, 0, 0, 0, 3, 0, 0x21, 0, 0x11]);
+        let out_of_range = management_response(&[
+            0x20, 0, 0, 0, 11, 0, 1, 2, 3, 4, 5, 6, 1, 0x40, 0x42, 0x0f, 0x01,
+        ])
+        .unwrap();
+        assert_eq!(out_of_range[8], 0x0d);
+    }
+
+    #[cfg(feature = "input")]
+    #[test]
+    fn smp_timeout_uses_thirty_second_monotonic_deadline() {
+        assert!(!smp_timeout_expired(30_000_000_000, 1_000_000_000));
+        assert!(smp_timeout_expired(31_000_000_000, 1_000_000_000));
+        assert!(!smp_timeout_expired(5, 6));
+    }
+
+    #[test]
     fn management_commands_advertise_only_supported_operations() {
         let commands = management_response(&[2, 0, 0xff, 0xff, 0, 0]).unwrap();
-        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 22);
-        assert_eq!(u16::from_le_bytes([commands[11], commands[12]]), 11);
-        assert_eq!(commands.len(), 9 + 4 + 2 * 33);
+        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 25);
+        assert_eq!(u16::from_le_bytes([commands[11], commands[12]]), 13);
+        assert_eq!(commands.len(), 9 + 4 + 2 * 38);
         assert_eq!(
-            &commands[13..57],
+            &commands[13..63],
             &[
                 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 9, 0, 11, 0, 13, 0, 18, 0, 19, 0, 20, 0, 22, 0, 23,
-                0, 24, 0, 25, 0, 28, 0, 29, 0, 35, 0, 36, 0, 42, 0, 47, 0, 48, 0,
+                0, 24, 0, 25, 0, 26, 0, 28, 0, 29, 0, 32, 0, 33, 0, 35, 0, 36, 0, 42, 0, 47, 0, 48,
+                0,
             ]
         );
         assert_eq!(
-            &commands[57..],
+            &commands[63..],
             &[
-                6, 0, 9, 0, 0x0a, 0, 0x0b, 0, 0x0c, 0, 0x0e, 0, 0x0f, 0, 0x11, 0, 0x12, 0, 0x13, 0,
-                0x18, 0
+                6, 0, 9, 0, 0x0a, 0, 0x0b, 0, 0x0c, 0, 0x0e, 0, 0x0f, 0, 0x10, 0, 0x11, 0, 0x12, 0,
+                0x13, 0, 0x17, 0, 0x18, 0
             ]
         );
     }
@@ -1006,17 +1049,23 @@ fn mgmt_event_packet(code: u16, index: u16, parameters: &[u8]) -> AxResult<Vec<u
 
 #[cfg(feature = "input")]
 fn start_pending_le_smp(index: u16, handle: u16, peer: [u8; 6], hci_address_type: u8) {
+    let Some(adapter) = usb_adapter(index) else {
+        return;
+    };
+    let resolved_identity = adapter
+        .lock()
+        .management_resolve_private_address(hci_address_type.saturating_add(1), peer);
     let Some(pending) = SMP_PENDING.lock().iter().position(|entry| {
         entry.index == index
-            && entry.address == peer
-            && entry.address_type == hci_address_type.saturating_add(1)
+            && ((entry.address == peer && entry.address_type == hci_address_type.saturating_add(1))
+                || resolved_identity.is_some_and(|identity| {
+                    entry.address == identity.1 && entry.address_type == identity.0
+                }))
     }) else {
         return;
     };
     let pending = SMP_PENDING.lock().remove(pending);
-    let Some(adapter) = usb_adapter(index) else {
-        return;
-    };
+    let started_at = axhal::time::monotonic_time_nanos();
     let local = adapter.lock().address();
     let mut local_address = [0u8; 7];
     local_address[1..].copy_from_slice(&local);
@@ -1025,7 +1074,7 @@ fn start_pending_le_smp(index: u16, handle: u16, peer: [u8; 6], hci_address_type
     peer_address[0] = hci_address_type & 1;
     peer_address[1..].copy_from_slice(&peer);
     peer_address[1..].reverse();
-    let mut entropy = [0u8; 48];
+    let mut entropy = [0u8; 368];
     if crate::random::fill_secure(&mut entropy).is_err() {
         emit_smp_auth_failed(index, peer, pending.address_type, 0x03);
         return;
@@ -1034,7 +1083,10 @@ fn start_pending_le_smp(index: u16, handle: u16, peer: [u8; 6], hci_address_type
         io_capability: pending.io_capability,
         oob_data: false,
         auth_req: 0x09
-            | if matches!(pending.io_capability, 1 | 4) {
+            | pending.peer_auth_req.unwrap_or(0)
+            | if matches!(pending.io_capability, 0 | 1 | 2 | 4)
+                || pending.peer_auth_req.is_some_and(|auth| auth & 0x04 != 0)
+            {
                 0x04
             } else {
                 0
@@ -1043,12 +1095,17 @@ fn start_pending_le_smp(index: u16, handle: u16, peer: [u8; 6], hci_address_type
         initiator_key_distribution: 0x03, // encryption + identity
         responder_key_distribution: 0x03,
     };
-    let initiator = match axdriver::bluetooth_smp::Initiator::new(
+    let passkey_randoms = core::array::from_fn(|round| {
+        let start = 48 + round * 16;
+        entropy[start..start + 16].try_into().unwrap_or([0; 16])
+    });
+    let initiator = match axdriver::bluetooth_smp::Initiator::new_with_passkey_entropy(
         local,
         local_address,
         peer_address,
         entropy[..16].try_into().unwrap_or([0; 16]),
-        entropy[16..].try_into().unwrap_or([0; 32]),
+        entropy[16..48].try_into().unwrap_or([0; 32]),
+        passkey_randoms,
     ) {
         Ok(initiator) => initiator,
         Err(_) => {
@@ -1068,7 +1125,7 @@ fn start_pending_le_smp(index: u16, handle: u16, peer: [u8; 6], hci_address_type
         sessions.push(SmpSession {
             index,
             handle,
-            address: peer,
+            address: pending.address,
             address_type: pending.address_type,
             initiator,
             ltk: None,
@@ -1087,7 +1144,23 @@ fn start_pending_le_smp(index: u16, handle: u16, peer: [u8; 6], hci_address_type
             local_distribution: 0,
             distribution_started: false,
             pending_confirmation: false,
+            pending_passkey: false,
+            started_at,
         });
+    }
+    if !schedule_smp_pair_timeout(
+        index,
+        handle,
+        pending.address,
+        pending.address_type,
+        started_at,
+        adapter.clone(),
+    ) {
+        SMP_SESSIONS
+            .lock()
+            .retain(|session| session.index != index || session.handle != handle);
+        emit_smp_auth_failed(index, pending.address, pending.address_type, 0x08);
+        return;
     }
     if adapter
         .lock()
@@ -1099,6 +1172,49 @@ fn start_pending_le_smp(index: u16, handle: u16, peer: [u8; 6], hci_address_type
             .retain(|session| session.index != index || session.handle != handle);
         emit_smp_auth_failed(index, peer, pending.address_type, 0x03);
     }
+}
+
+#[cfg(feature = "input")]
+fn schedule_smp_pair_timeout(
+    index: u16,
+    handle: u16,
+    address: [u8; 6],
+    address_type: u8,
+    started_at: u64,
+    adapter: UsbAdapter,
+) -> bool {
+    axtask::spawn_with_name(
+        move || {
+            if axtask::sleep(SMP_PAIR_TIMEOUT).is_err()
+                || !smp_timeout_expired(axhal::time::monotonic_time_nanos(), started_at)
+            {
+                return;
+            }
+            let expired = {
+                let mut sessions = SMP_SESSIONS.lock();
+                let Some(position) = sessions.iter().position(|session| {
+                    session.index == index
+                        && session.handle == handle
+                        && session.started_at == started_at
+                }) else {
+                    return;
+                };
+                sessions.remove(position)
+            };
+            let _ = adapter.lock().management_send_smp(handle, &[0x05, 0x08]);
+            let _ = adapter
+                .lock()
+                .management_disconnect(expired.address, expired.address_type);
+            emit_smp_auth_failed(index, address, address_type, 0x08);
+        },
+        alloc::string::String::from("bt-smp-timeout"),
+    )
+    .is_ok()
+}
+
+#[cfg(feature = "input")]
+fn smp_timeout_expired(now: u64, started_at: u64) -> bool {
+    now.saturating_sub(started_at) >= SMP_PAIR_TIMEOUT_NANOS
 }
 
 #[cfg(feature = "input")]
@@ -1114,6 +1230,10 @@ fn emit_smp_auth_failed(index: u16, address: [u8; 6], address_type: u8, reason: 
 
 #[cfg(feature = "input")]
 fn process_smp_acl(index: u16, adapter: &UsbAdapter, packet: &[u8]) {
+    let Some(reassembled) = SMP_ACL_REASSEMBLER.lock().push(packet) else {
+        return;
+    };
+    let packet = reassembled.as_slice();
     if packet.len() < 8 {
         return;
     }
@@ -1129,6 +1249,48 @@ fn process_smp_acl(index: u16, adapter: &UsbAdapter, packet: &[u8]) {
         return;
     }
     let pdu = &packet[8..];
+    if axdriver::bluetooth_smp::parse_security_request(pdu).is_ok()
+        && !SMP_SESSIONS
+            .lock()
+            .iter()
+            .any(|session| session.index == index && session.handle == handle)
+    {
+        let (peer, address_type, io_capability) = {
+            let adapter_guard = adapter.lock();
+            let Some((peer, address_type)) = adapter_guard.management_peer_for_handle(handle)
+            else {
+                return;
+            };
+            (peer, address_type, adapter_guard.management_io_capability())
+        };
+        match adapter
+            .lock()
+            .management_start_encryption_from_loaded_ltk(handle, peer, address_type)
+        {
+            Ok(true) => return,
+            Err(_) => {
+                emit_smp_auth_failed(index, peer, address_type, 0x08);
+                return;
+            }
+            Ok(false) => {}
+        }
+        let started_at = axhal::time::monotonic_time_nanos();
+        let mut pending = SMP_PENDING.lock();
+        pending.retain(|entry| entry.index != index || entry.address != peer);
+        if pending.len() < MAX_SMP_SESSIONS && pending.try_reserve(1).is_ok() {
+            pending.push(PendingSmpPairing {
+                index,
+                address: peer,
+                address_type,
+                io_capability,
+                started_at,
+                peer_auth_req: axdriver::bluetooth_smp::parse_security_request(pdu).ok(),
+            });
+            drop(pending);
+            start_pending_le_smp(index, handle, peer, address_type.saturating_sub(1));
+        }
+        return;
+    }
     let phase_three = SMP_SESSIONS.lock().iter().any(|session| {
         session.index == index
             && session.handle == handle
@@ -1175,6 +1337,44 @@ fn process_smp_acl(index: u16, adapter: &UsbAdapter, packet: &[u8]) {
             };
             if let Some(parameters) = parameters {
                 if let Ok(event) = mgmt_event_packet(0x000f, index, &parameters) {
+                    fanout_mgmt_event(event);
+                }
+            }
+        }
+        axdriver::bluetooth_smp::Action::RequestPasskey => {
+            let parameters = {
+                let mut sessions = SMP_SESSIONS.lock();
+                sessions
+                    .iter_mut()
+                    .find(|session| session.index == index && session.handle == handle)
+                    .map(|session| {
+                        session.pending_passkey = true;
+                        let mut parameters = Vec::with_capacity(7);
+                        parameters.extend_from_slice(&session.address);
+                        parameters.push(session.address_type);
+                        parameters
+                    })
+            };
+            if let Some(parameters) = parameters
+                && let Ok(event) = mgmt_event_packet(0x0010, index, &parameters)
+            {
+                fanout_mgmt_event(event);
+            }
+        }
+        axdriver::bluetooth_smp::Action::DisplayPasskey { passkey, pdu } => {
+            let (address, address_type) = SMP_SESSIONS
+                .lock()
+                .iter()
+                .find(|session| session.index == index && session.handle == handle)
+                .map(|session| (session.address, session.address_type))
+                .unwrap_or(([0; 6], 0));
+            if adapter.lock().management_send_smp(handle, &pdu).is_ok() {
+                let mut parameters = Vec::with_capacity(12);
+                parameters.extend_from_slice(&address);
+                parameters.push(address_type);
+                parameters.extend_from_slice(&passkey.to_le_bytes());
+                parameters.push(0); // no digits entered by the peer yet
+                if let Ok(event) = mgmt_event_packet(0x0017, index, &parameters) {
                     fanout_mgmt_event(event);
                 }
             }
@@ -1582,7 +1782,7 @@ fn fanout_hci_management_events(index: u16, event: &[u8]) {
     if event.len() < 2 || event.len() != usize::from(event[1]) + 2 {
         return;
     }
-    let mut publish = |code, parameters: &[u8]| {
+    let publish = |code, parameters: &[u8]| {
         if let Ok(packet) = mgmt_event_packet(code, index, parameters) {
             fanout_mgmt_event(packet);
         }
@@ -1594,20 +1794,43 @@ fn fanout_hci_management_events(index: u16, event: &[u8]) {
         }
     } else if event[0] == 0x08 && event.len() >= 5 && event[2] != 0 {
         let handle = u16::from_le_bytes([event[3], event[4]]) & 0x0fff;
-        SMP_SESSIONS
-            .lock()
-            .retain(|session| session.index != index || session.handle != handle);
+        let failed = {
+            let mut sessions = SMP_SESSIONS.lock();
+            let position = sessions
+                .iter()
+                .position(|session| session.index == index && session.handle == handle);
+            position.map(|position| sessions.remove(position))
+        };
+        if let Some(session) = failed {
+            emit_smp_auth_failed(index, session.address, session.address_type, event[2]);
+        }
     } else if event[0] == 0x05 && event.len() >= 6 {
         let handle = u16::from_le_bytes([event[3], event[4]]) & 0x0fff;
-        SMP_SESSIONS
-            .lock()
-            .retain(|session| session.index != index || session.handle != handle);
+        let disconnected = {
+            let mut sessions = SMP_SESSIONS.lock();
+            let position = sessions
+                .iter()
+                .position(|session| session.index == index && session.handle == handle);
+            position.map(|position| sessions.remove(position))
+        };
+        if let Some(session) = disconnected {
+            emit_smp_auth_failed(index, session.address, session.address_type, 0x08);
+        }
+        SMP_ACL_REASSEMBLER.lock().clear_handle(handle);
     }
     if event[0] == 0x3e && event.len() >= 21 && event[2] == 0x01 && event[3] == 0 {
         let handle = u16::from_le_bytes([event[4], event[5]]) & 0x0fff;
         let mut address = [0; 6];
         address.copy_from_slice(&event[8..14]);
         start_pending_le_smp(index, handle, address, event[7]);
+    } else if event[0] == 0x3e && event.len() >= 21 && event[2] == 0x01 && event[3] != 0 {
+        let address_type = event[7].saturating_add(1);
+        let mut address = [0; 6];
+        address.copy_from_slice(&event[8..14]);
+        SMP_PENDING.lock().retain(|entry| {
+            entry.index != index || entry.address != address || entry.address_type != address_type
+        });
+        emit_smp_auth_failed(index, address, address_type, event[3]);
     }
     match event[0] {
         // HCI Connection Complete -> Device Connected.
@@ -1626,8 +1849,31 @@ fn fanout_hci_management_events(index: u16, event: &[u8]) {
                 1 => 2, // random LE address
                 _ => return,
             };
+            let handle = u16::from_le_bytes([event[4], event[5]]) & 0x0fff;
+            let mut peer = [0; 6];
+            peer.copy_from_slice(&event[8..14]);
+            let identity = (address_type == 2)
+                .then(|| usb_adapter(index))
+                .flatten()
+                .and_then(|adapter| {
+                    adapter
+                        .lock()
+                        .management_resolve_private_address(address_type, peer)
+                });
+            let (peer, address_type) = if let Some((identity_type, identity)) = identity {
+                if let Some(adapter) = usb_adapter(index) {
+                    adapter.lock().management_set_identity_for_handle(
+                        handle,
+                        identity,
+                        identity_type,
+                    );
+                }
+                (identity, identity_type)
+            } else {
+                (peer, address_type)
+            };
             let mut parameters = Vec::with_capacity(13);
-            parameters.extend_from_slice(&event[8..14]);
+            parameters.extend_from_slice(&peer);
             parameters.push(address_type);
             parameters.extend_from_slice(&0u32.to_le_bytes());
             parameters.extend_from_slice(&0u16.to_le_bytes());
@@ -1800,10 +2046,13 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     const PIN_CODE_NEG_REPLY: u16 = 0x17;
     const USER_CONFIRM_REPLY: u16 = 0x1c;
     const USER_CONFIRM_NEG_REPLY: u16 = 0x1d;
+    const USER_PASSKEY_REPLY: u16 = 0x20;
+    const USER_PASSKEY_NEG_REPLY: u16 = 0x21;
     const LOAD_LINK_KEYS: u16 = 18;
     const LOAD_LONG_TERM_KEYS: u16 = 19;
     const LOAD_IRKS: u16 = 0x30;
     const PAIR_DEVICE: u16 = 0x19;
+    const CANCEL_PAIR_DEVICE: u16 = 0x1a;
     const DISCONNECT: u16 = 0x14;
     const SET_BREDR: u16 = 0x2a;
     const SET_PRIVACY: u16 = 0x2f;
@@ -1849,8 +2098,11 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
                 PIN_CODE_NEG_REPLY,
                 SET_IO_CAPABILITY,
                 PAIR_DEVICE,
+                CANCEL_PAIR_DEVICE,
                 USER_CONFIRM_REPLY,
                 USER_CONFIRM_NEG_REPLY,
+                USER_PASSKEY_REPLY,
+                USER_PASSKEY_NEG_REPLY,
                 START_DISCOVERY,
                 STOP_DISCOVERY,
                 SET_BREDR,
@@ -1858,7 +2110,7 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
                 LOAD_IRKS,
             ];
             let events = [
-                6u16, 0x09, 0x0a, 0x0b, 0x0c, 0x0e, 0x0f, 0x11, 0x12, 0x13, 0x18,
+                6u16, 0x09, 0x0a, 0x0b, 0x0c, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x17, 0x18,
             ];
             data.extend_from_slice(&(commands.len() as u16).to_le_bytes());
             data.extend_from_slice(&(events.len() as u16).to_le_bytes());
@@ -1949,6 +2201,9 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
         PAIR_DEVICE if parameters.len() == 8 && parameters[6] <= 2 && parameters[7] <= 4 => {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
         }
+        CANCEL_PAIR_DEVICE if parameters.len() == 7 && parameters[6] <= 2 => {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
         DISCONNECT if parameters.len() == 7 && parameters[6] <= 2 => {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
         }
@@ -1961,6 +2216,17 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
         USER_CONFIRM_REPLY | USER_CONFIRM_NEG_REPLY
             if parameters.len() == 7 && parameters[6] <= 2 =>
         {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
+        USER_PASSKEY_REPLY
+            if parameters.len() == 11
+                && parameters[6] <= 2
+                && u32::from_le_bytes(parameters[7..11].try_into().unwrap_or([0; 4]))
+                    <= 999_999 =>
+        {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
+        USER_PASSKEY_NEG_REPLY if parameters.len() == 7 && parameters[6] <= 2 => {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
         }
         START_DISCOVERY if parameters.len() == 1 && matches!(parameters[0], 1 | 6) => {
@@ -1988,11 +2254,14 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
                 | LOAD_LONG_TERM_KEYS
                 | LOAD_IRKS
                 | PAIR_DEVICE
+                | CANCEL_PAIR_DEVICE
                 | DISCONNECT
                 | PIN_CODE_REPLY
                 | PIN_CODE_NEG_REPLY
                 | USER_CONFIRM_REPLY
                 | USER_CONFIRM_NEG_REPLY
+                | USER_PASSKEY_REPLY
+                | USER_PASSKEY_NEG_REPLY
                 | START_DISCOVERY
                 | STOP_DISCOVERY
         ) =>
@@ -2030,10 +2299,13 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
     const PIN_CODE_NEG_REPLY: u16 = 0x17;
     const USER_CONFIRM_REPLY: u16 = 0x1c;
     const USER_CONFIRM_NEG_REPLY: u16 = 0x1d;
+    const USER_PASSKEY_REPLY: u16 = 0x20;
+    const USER_PASSKEY_NEG_REPLY: u16 = 0x21;
     const LOAD_LINK_KEYS: u16 = 18;
     const LOAD_LONG_TERM_KEYS: u16 = 19;
     const LOAD_IRKS: u16 = 0x30;
     const PAIR_DEVICE: u16 = 0x19;
+    const CANCEL_PAIR_DEVICE: u16 = 0x1a;
     const DISCONNECT: u16 = 0x14;
     const SET_BREDR: u16 = 0x2a;
     const SET_PRIVACY: u16 = 0x2f;
@@ -2077,6 +2349,54 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
             None,
         )));
     }
+    if opcode == CANCEL_PAIR_DEVICE && parameters.len() == 7 && parameters[6] <= 2 {
+        let Some(adapter) = usb_adapter(index) else {
+            return Ok(None);
+        };
+        let mut address = [0u8; 6];
+        address.copy_from_slice(&parameters[..6]);
+        let address_type = parameters[6];
+        SMP_PENDING.lock().retain(|entry| {
+            entry.index != index || entry.address != address || entry.address_type != address_type
+        });
+        let session = {
+            let mut sessions = SMP_SESSIONS.lock();
+            let position = sessions.iter().position(|session| {
+                session.index == index
+                    && session.address == address
+                    && session.address_type == address_type
+            });
+            position.map(|position| sessions.remove(position))
+        };
+        let result = if let Some(session) = session {
+            let _ = adapter
+                .lock()
+                .management_send_smp(session.handle, &[0x05, 0x08]);
+            adapter
+                .lock()
+                .management_cancel_pair_device(address, address_type)
+        } else {
+            adapter
+                .lock()
+                .management_cancel_pair_device(address, address_type)
+        };
+        let status = match result {
+            Ok(()) => 0,
+            Err(axdriver::BluetoothError::NotUp) => 0x0f,
+            Err(axdriver::BluetoothError::NoDevice) => INVALID_INDEX,
+            Err(axdriver::BluetoothError::Unsupported) => 0x02,
+            Err(_) => FAILED,
+        };
+        let data = if status == 0 {
+            parameters.to_vec()
+        } else {
+            Vec::new()
+        };
+        return Ok(Some((
+            management_command_complete(index, opcode, status, &data)?,
+            None,
+        )));
+    }
     if opcode == PAIR_DEVICE && parameters.len() == 8 && parameters[6] <= 2 && parameters[7] <= 4 {
         let Some(adapter) = usb_adapter(index) else {
             return Ok(None);
@@ -2102,6 +2422,8 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
                 address,
                 address_type: parameters[6],
                 io_capability: parameters[7],
+                started_at: axhal::time::monotonic_time_nanos(),
+                peer_auth_req: None,
             });
         }
         let status =
@@ -2122,6 +2444,40 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
                     || entry.address != address
                     || entry.address_type != parameters[6]
             });
+        }
+        if status == 0 && pending_le {
+            let started_at = SMP_PENDING
+                .lock()
+                .iter()
+                .find(|entry| {
+                    entry.index == index
+                        && entry.address == address
+                        && entry.address_type == parameters[6]
+                })
+                .map(|entry| entry.started_at);
+            if let Some(started_at) = started_at
+                && !schedule_pending_pair_timeout(
+                    index,
+                    address,
+                    parameters[6],
+                    started_at,
+                    adapter.clone(),
+                )
+            {
+                SMP_PENDING.lock().retain(|entry| {
+                    entry.index != index
+                        || entry.address != address
+                        || entry.address_type != parameters[6]
+                });
+                let _ = adapter
+                    .lock()
+                    .management_cancel_pair_device(address, parameters[6]);
+                emit_smp_auth_failed(index, address, parameters[6], 0x08);
+                return Ok(Some((
+                    management_command_complete(index, opcode, 7, &[])?,
+                    None,
+                )));
+            }
         }
         let data = if status == 0 {
             parameters[..7].to_vec()
@@ -2205,6 +2561,86 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
             None
         };
         return Ok(Some((response, event)));
+    }
+    if opcode == USER_PASSKEY_REPLY || opcode == USER_PASSKEY_NEG_REPLY {
+        let valid = if opcode == USER_PASSKEY_REPLY {
+            parameters.len() == 11
+                && parameters[6] <= 2
+                && u32::from_le_bytes(parameters[7..11].try_into().unwrap_or([0; 4])) <= 999_999
+        } else {
+            parameters.len() == 7 && parameters[6] <= 2
+        };
+        if !valid {
+            return Ok(None);
+        }
+        let Some(adapter) = usb_adapter(index) else {
+            return Ok(None);
+        };
+        let mut address = [0; 6];
+        address.copy_from_slice(&parameters[..6]);
+        let address_type = parameters[6];
+        let session_action = if address_type == 0 {
+            None
+        } else {
+            let mut sessions = SMP_SESSIONS.lock();
+            let Some(session) = sessions.iter_mut().find(|session| {
+                session.index == index
+                    && session.address == address
+                    && session.address_type == address_type
+                    && session.pending_passkey
+            }) else {
+                return Ok(Some((
+                    management_command_complete(index, opcode, 0x02, &[])?,
+                    None,
+                )));
+            };
+            session.pending_passkey = false;
+            if opcode == USER_PASSKEY_REPLY {
+                Some((
+                    session.handle,
+                    session.initiator.provide_passkey(u32::from_le_bytes(
+                        parameters[7..11].try_into().unwrap_or([0; 4]),
+                    )),
+                ))
+            } else {
+                let handle = session.handle;
+                sessions.retain(|entry| entry.index != index || entry.handle != handle);
+                Some((
+                    handle,
+                    axdriver::bluetooth_smp::Action::Failed(
+                        axdriver::bluetooth_smp::PairingError::UserRejected,
+                    ),
+                ))
+            }
+        };
+        let status = if let Some((handle, action)) = session_action {
+            match action {
+                axdriver::bluetooth_smp::Action::Send(pdu) => {
+                    if adapter.lock().management_send_smp(handle, &pdu).is_ok() {
+                        0
+                    } else {
+                        FAILED
+                    }
+                }
+                axdriver::bluetooth_smp::Action::Failed(_) => {
+                    let _ = adapter.lock().management_send_smp(handle, &[0x05, 0x01]);
+                    emit_smp_auth_failed(index, address, address_type, 0x01);
+                    0
+                }
+                _ => FAILED,
+            }
+        } else {
+            NOT_SUPPORTED
+        };
+        let data = if status == 0 {
+            parameters[..7].to_vec()
+        } else {
+            Vec::new()
+        };
+        return Ok(Some((
+            management_command_complete(index, opcode, status, &data)?,
+            None,
+        )));
     }
     if opcode == USER_CONFIRM_REPLY || opcode == USER_CONFIRM_NEG_REPLY {
         if parameters.len() != 7 || parameters[6] > 2 {
@@ -2436,6 +2872,43 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
         None
     };
     Ok(Some((response, event)))
+}
+
+#[cfg(feature = "input")]
+fn schedule_pending_pair_timeout(
+    index: u16,
+    address: [u8; 6],
+    address_type: u8,
+    started_at: u64,
+    adapter: UsbAdapter,
+) -> bool {
+    axtask::spawn_with_name(
+        move || {
+            if axtask::sleep(SMP_PAIR_TIMEOUT).is_err()
+                || !smp_timeout_expired(axhal::time::monotonic_time_nanos(), started_at)
+            {
+                return;
+            }
+            let expired = {
+                let mut pending = SMP_PENDING.lock();
+                let Some(position) = pending.iter().position(|entry| {
+                    entry.index == index
+                        && entry.address == address
+                        && entry.address_type == address_type
+                        && entry.started_at == started_at
+                }) else {
+                    return;
+                };
+                pending.remove(position)
+            };
+            let _ = adapter
+                .lock()
+                .management_cancel_pair_device(expired.address, expired.address_type);
+            emit_smp_auth_failed(index, address, address_type, 0x08);
+        },
+        alloc::string::String::from("bt-pair-timeout"),
+    )
+    .is_ok()
 }
 
 #[cfg(not(feature = "input"))]

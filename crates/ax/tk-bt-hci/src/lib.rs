@@ -104,6 +104,189 @@ impl<'a> Packet<'a> {
     }
 }
 
+/// Split an outbound HCI ACL packet whose payload contains one complete
+/// L2CAP PDU into controller-MTU-sized HCI packets. The first fragment uses
+/// PB=2; continuations use PB=1, as required by the HCI ACL packet format.
+pub fn fragment_acl_packet(packet: &[u8], mtu: usize) -> Result<Vec<Vec<u8>>, Error> {
+    Packet::parse(PacketType::Acl, packet)?;
+    let payload = &packet[4..];
+    if mtu == 0 || payload.len() <= mtu {
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(packet.len())
+            .map_err(|_| Error::NoMemory)?;
+        copy.extend_from_slice(packet);
+        return Ok(alloc::vec![copy]);
+    }
+    let raw_flags = u16::from_le_bytes([packet[0], packet[1]]);
+    let handle_bc = (raw_flags & 0x0fff) | (raw_flags & 0xc000);
+    let original_pb = (raw_flags >> 12) & 3;
+    if original_pb != 1 {
+        if !matches!(original_pb, 0 | 2) || payload.len() < 4 {
+            return Err(Error::InvalidLength);
+        }
+        let l2cap_payload = usize::from(u16::from_le_bytes([payload[0], payload[1]]));
+        if l2cap_payload.checked_add(4) != Some(payload.len()) {
+            return Err(Error::InvalidLength);
+        }
+    }
+    let count = payload.len().div_ceil(mtu);
+    let mut fragments = Vec::new();
+    fragments
+        .try_reserve_exact(count)
+        .map_err(|_| Error::NoMemory)?;
+    for (index, chunk) in payload.chunks(mtu).enumerate() {
+        let pb = if original_pb == 1 || index != 0 {
+            0x1000
+        } else {
+            0x2000
+        };
+        let mut fragment = Vec::new();
+        fragment
+            .try_reserve_exact(4 + chunk.len())
+            .map_err(|_| Error::NoMemory)?;
+        fragment.extend_from_slice(&(handle_bc | pb).to_le_bytes());
+        fragment.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+        fragment.extend_from_slice(chunk);
+        fragments.push(fragment);
+    }
+    Ok(fragments)
+}
+
+/// Construct LE Start Encryption (0x2019) using a bluetoothd-loaded LTK
+/// material tuple. LE HCI uses little-endian handle/Rand/EDIV/key bytes.
+pub fn le_start_encryption_command(
+    handle: u16,
+    random: &[u8; 8],
+    ediv: u16,
+    key: &[u8; 16],
+) -> Result<[u8; 31], Error> {
+    if handle > 0x0fff {
+        return Err(Error::InvalidLength);
+    }
+    let mut command = [0u8; 31];
+    command[..2].copy_from_slice(&0x2019u16.to_le_bytes());
+    command[2] = 28;
+    command[3..5].copy_from_slice(&handle.to_le_bytes());
+    command[5..13].copy_from_slice(random);
+    command[13..15].copy_from_slice(&ediv.to_le_bytes());
+    command[15..31].copy_from_slice(key);
+    Ok(command)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagementLtk {
+    pub random: [u8; 8],
+    pub ediv: u16,
+    pub key: [u8; 16],
+}
+
+/// Select the LE master key for an identity loaded by MGMT_LOAD_LONG_TERM_KEYS
+/// (`mgmt_ltk_info`: address/type/authenticated/master/size/EDIV/Rand/value).
+pub fn find_management_ltk(
+    records: &[[u8; 36]],
+    address: [u8; 6],
+    address_type: u8,
+) -> Option<ManagementLtk> {
+    records
+        .iter()
+        .find(|record| {
+            record[..6] == address
+                && record[6] == address_type
+                && record[8] != 0
+                && (7..=16).contains(&record[9])
+        })
+        .map(|record| ManagementLtk {
+            random: record[12..20].try_into().unwrap_or([0; 8]),
+            ediv: u16::from_le_bytes([record[10], record[11]]),
+            key: record[20..36].try_into().unwrap_or([0; 16]),
+        })
+}
+
+/// Bounded per-handle reassembly for incoming ACL packets. A completed value
+/// is a normalized HCI ACL packet containing one complete L2CAP frame.
+#[derive(Default)]
+pub struct AclReassembler {
+    partial: Vec<(u16, usize, Vec<u8>)>,
+}
+
+impl AclReassembler {
+    pub const fn new() -> Self {
+        Self {
+            partial: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
+        if Packet::parse(PacketType::Acl, packet).is_err() {
+            return None;
+        }
+        let raw_flags = u16::from_le_bytes([packet[0], packet[1]]);
+        let handle = raw_flags & 0x0fff;
+        let pb = (raw_flags >> 12) & 3;
+        let payload = &packet[4..];
+        match pb {
+            0 | 2 | 3 => {
+                self.partial.retain(|(old, ..)| *old != handle);
+                if payload.len() < 4 {
+                    return None;
+                }
+                let expected = usize::from(u16::from_le_bytes([payload[0], payload[1]])) + 4;
+                if payload.len() > expected {
+                    return None;
+                }
+                if payload.len() == expected {
+                    return normalize_acl(handle, payload);
+                }
+                if pb == 3 {
+                    return None;
+                }
+                if self.partial.len() >= 16 {
+                    self.partial.remove(0);
+                }
+                self.partial.try_reserve(1).ok()?;
+                let mut bytes = Vec::new();
+                bytes.try_reserve_exact(payload.len()).ok()?;
+                bytes.extend_from_slice(payload);
+                self.partial.push((handle, expected, bytes));
+                None
+            }
+            1 => {
+                let position = self.partial.iter().position(|(old, ..)| *old == handle)?;
+                let (_, expected, bytes) = &mut self.partial[position];
+                if bytes.len().saturating_add(payload.len()) > *expected {
+                    self.partial.remove(position);
+                    return None;
+                }
+                bytes.try_reserve(payload.len()).ok()?;
+                bytes.extend_from_slice(payload);
+                if bytes.len() == *expected {
+                    let (_, _, bytes) = self.partial.remove(position);
+                    normalize_acl(handle, &bytes)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                self.partial.retain(|(old, ..)| *old != handle);
+                None
+            }
+        }
+    }
+
+    pub fn clear_handle(&mut self, handle: u16) {
+        self.partial.retain(|(old, ..)| *old != handle);
+    }
+}
+
+fn normalize_acl(handle: u16, payload: &[u8]) -> Option<Vec<u8>> {
+    let mut packet = Vec::new();
+    packet.try_reserve_exact(4 + payload.len()).ok()?;
+    packet.extend_from_slice(&(handle | 0x2000).to_le_bytes());
+    packet.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    packet.extend_from_slice(payload);
+    Some(packet)
+}
+
 /// USB Bluetooth transport uses control endpoint for HCI commands, interrupt
 /// IN for events, bulk IN/OUT for ACL, and optional isochronous for SCO/ISO.
 pub trait UsbTransport {
@@ -168,6 +351,8 @@ pub struct HciCapabilities {
     pub manufacturer: u16,
     pub acl_mtu: u16,
     pub acl_packets: u16,
+    pub le_acl_mtu: u16,
+    pub le_acl_packets: u16,
     pub sco_mtu: u16,
     pub sco_packets: u16,
 }
@@ -185,6 +370,10 @@ pub struct Adapter<T> {
     observed_events: VecDeque<Vec<u8>>,
     observed_acls: VecDeque<Vec<u8>>,
     stats: Statistics,
+    acl_mtu: usize,
+    acl_packet_limit: usize,
+    acl_in_flight: usize,
+    pending_acl_out: VecDeque<Vec<u8>>,
 }
 
 struct IncomingPacket {
@@ -207,6 +396,10 @@ impl<T: UsbTransport> Adapter<T> {
             observed_events: VecDeque::new(),
             observed_acls: VecDeque::new(),
             stats: Statistics::default(),
+            acl_mtu: 1024,
+            acl_packet_limit: 4,
+            acl_in_flight: 0,
+            pending_acl_out: VecDeque::new(),
         }
     }
     pub fn index(&self) -> u16 {
@@ -217,6 +410,17 @@ impl<T: UsbTransport> Adapter<T> {
     }
     pub fn statistics(&self) -> Statistics {
         self.stats
+    }
+    /// Configure packet size/credit limits from Read Buffer Size and
+    /// LE_Read_Buffer_Size. Credits are replenished by Number Of Completed
+    /// Packets; only the controller-facing writer consumes them.
+    pub fn configure_acl_flow_control(&mut self, mtu: u16, packets: u16) {
+        self.acl_mtu = usize::from(mtu.max(1));
+        self.acl_packet_limit = usize::from(packets.max(1));
+        self.acl_in_flight = self.acl_in_flight.min(self.acl_packet_limit);
+    }
+    pub fn pending_acl_packets(&self) -> usize {
+        self.pending_acl_out.len()
     }
     /// Query the standard controller address, feature bitmap and ACL/SCO
     /// buffer limits for HCIGETDEVINFO. Values are device replies, not guesses.
@@ -251,6 +455,14 @@ impl<T: UsbTransport> Adapter<T> {
         capabilities.sco_mtu = u16::from(event[8]);
         capabilities.acl_packets = u16::from_le_bytes([event[9], event[10]]);
         capabilities.sco_packets = u16::from_le_bytes([event[11], event[12]]);
+        if let Ok(length) = self.command_complete(&[0x02, 0x20, 0], &mut event)
+            && length >= 10
+            && event[0] == 0x0e
+            && event[5] == 0
+        {
+            capabilities.le_acl_mtu = u16::from_le_bytes([event[6], event[7]]);
+            capabilities.le_acl_packets = u16::from_le_bytes([event[8], event[9]]);
+        }
         Ok(capabilities)
     }
     pub fn open(&mut self, channel: Channel) -> Result<(), Error> {
@@ -319,14 +531,12 @@ impl<T: UsbTransport> Adapter<T> {
                 Ok(())
             }
             PacketType::Acl => {
-                if let Err(error) = self.transport.bulk_acl_out(bytes) {
-                    self.stats.err_tx = self.stats.err_tx.saturating_add(1);
-                    return Err(error);
+                let fragments = fragment_acl_packet(bytes, self.acl_mtu)?;
+                if self.pending_acl_out.len().saturating_add(fragments.len()) > 256 {
+                    return Err(Error::Busy);
                 }
-                self.queue_monitor(4, bytes);
-                self.stats.acl_tx = self.stats.acl_tx.saturating_add(1);
-                self.stats.byte_tx = self.stats.byte_tx.saturating_add(bytes.len() as u32);
-                Ok(())
+                self.pending_acl_out.extend(fragments);
+                self.flush_acl_out()
             }
             _ => Err(Error::Unsupported),
         }
@@ -442,6 +652,7 @@ impl<T: UsbTransport> Adapter<T> {
         }
         match kind {
             PacketType::Event => {
+                self.observe_acl_completions(&bytes[..length]);
                 self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
                 self.queue_monitor(3, bytes);
             }
@@ -475,6 +686,7 @@ impl<T: UsbTransport> Adapter<T> {
         }
         match kind {
             PacketType::Event => {
+                self.observe_acl_completions(&bytes[..length]);
                 self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
                 self.queue_monitor(3, &bytes[..length]);
                 if self.observed_events.len() == 64 {
@@ -646,6 +858,7 @@ impl<T: UsbTransport> Adapter<T> {
         Err(Error::Again)
     }
     fn queue_incoming_event(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.observe_acl_completions(bytes);
         if self.incoming.len() >= 64 {
             self.stats.err_rx = self.stats.err_rx.saturating_add(1);
             return Err(Error::Busy);
@@ -659,6 +872,38 @@ impl<T: UsbTransport> Adapter<T> {
             self.observed_events.pop_front();
         }
         self.observed_events.push_back(Vec::from(bytes));
+        Ok(())
+    }
+    fn observe_acl_completions(&mut self, event: &[u8]) {
+        if event.len() < 3 || event[0] != 0x13 || event.len() != usize::from(event[1]) + 2 {
+            return;
+        }
+        let handles = usize::from(event[2]);
+        if event.len() != 3 + handles * 4 {
+            return;
+        }
+        let completed: usize = event[3..]
+            .chunks_exact(4)
+            .map(|record| usize::from(u16::from_le_bytes([record[2], record[3]])))
+            .sum();
+        self.acl_in_flight = self.acl_in_flight.saturating_sub(completed);
+        let _ = self.flush_acl_out();
+    }
+    fn flush_acl_out(&mut self) -> Result<(), Error> {
+        while self.acl_in_flight < self.acl_packet_limit {
+            let Some(packet) = self.pending_acl_out.pop_front() else {
+                break;
+            };
+            if let Err(error) = self.transport.bulk_acl_out(&packet) {
+                self.pending_acl_out.push_front(packet);
+                self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+                return Err(error);
+            }
+            self.queue_monitor(4, &packet);
+            self.stats.acl_tx = self.stats.acl_tx.saturating_add(1);
+            self.stats.byte_tx = self.stats.byte_tx.saturating_add(packet.len() as u32);
+            self.acl_in_flight += 1;
+        }
         Ok(())
     }
     /// Query the Intel firmware version using vendor command 0xfc05.
@@ -771,6 +1016,7 @@ impl<T: UsbTransport> Adapter<T> {
                 self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
                 self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
                 self.queue_monitor(3, &event[..length]);
+                self.observe_acl_completions(&event[..length]);
                 if received.payload[0] != expected_code || received.payload[2..] != *expected {
                     return Err(Error::InvalidLength);
                 }
@@ -1228,6 +1474,111 @@ mod tests {
     }
 
     #[test]
+    fn acl_packet_is_fragmented_at_mtu_and_reassembled_by_pb() {
+        let mut l2cap = vec![0u8; 30];
+        l2cap[..2].copy_from_slice(&26u16.to_le_bytes());
+        l2cap[2..4].copy_from_slice(&4u16.to_le_bytes());
+        for (i, byte) in l2cap[4..].iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        let mut packet = vec![0x01, 0x20];
+        packet.extend_from_slice(&(l2cap.len() as u16).to_le_bytes());
+        packet.extend_from_slice(&l2cap);
+        let fragments = fragment_acl_packet(&packet, 12).unwrap();
+        assert_eq!(fragments.len(), 3);
+        assert_eq!(
+            (u16::from_le_bytes([fragments[0][0], fragments[0][1]]) >> 12) & 3,
+            2
+        );
+        assert_eq!(
+            (u16::from_le_bytes([fragments[1][0], fragments[1][1]]) >> 12) & 3,
+            1
+        );
+        let mut reassembler = AclReassembler::default();
+        assert_eq!(reassembler.push(&fragments[0]), None);
+        assert_eq!(reassembler.push(&fragments[1]), None);
+        let rebuilt = reassembler.push(&fragments[2]).unwrap();
+        assert_eq!(
+            Packet::parse(PacketType::Acl, &rebuilt)
+                .unwrap()
+                .payload
+                .len(),
+            34
+        );
+        assert_eq!(&rebuilt[4..], &l2cap);
+    }
+
+    #[test]
+    fn acl_transmit_waits_for_controller_completed_packet_credits() {
+        let mut adapter = Adapter::new(
+            Fake {
+                stopped: false,
+                commands: 0,
+                acl: 0,
+            },
+            0,
+        );
+        adapter.set_up(true).unwrap();
+        adapter.configure_acl_flow_control(8, 1);
+        let mut l2cap = vec![0u8; 20];
+        l2cap[..2].copy_from_slice(&16u16.to_le_bytes());
+        l2cap[2..4].copy_from_slice(&4u16.to_le_bytes());
+        let mut packet = vec![0x01, 0x20];
+        packet.extend_from_slice(&(l2cap.len() as u16).to_le_bytes());
+        packet.extend_from_slice(&l2cap);
+        adapter
+            .submit(Channel::Raw, PacketType::Acl, &packet)
+            .unwrap();
+        assert_eq!(adapter.pending_acl_packets(), 2);
+        let completed = [0x13, 5, 1, 1, 0, 1, 0];
+        adapter.observe_acl_completions(&completed);
+        assert_eq!(adapter.pending_acl_packets(), 1);
+        let fake = adapter.into_transport();
+        assert_eq!(fake.acl, 2);
+    }
+
+    #[test]
+    fn loaded_ltk_is_framed_as_hci_le_start_encryption() {
+        let command =
+            le_start_encryption_command(0x0123, &[1, 2, 3, 4, 5, 6, 7, 8], 0x4567, &[9; 16])
+                .unwrap();
+        assert_eq!(&command[..5], &[0x19, 0x20, 28, 0x23, 0x01]);
+        assert_eq!(&command[5..13], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&command[13..15], &[0x67, 0x45]);
+        assert_eq!(&command[15..], &[9; 16]);
+        assert_eq!(
+            le_start_encryption_command(0x1000, &[0; 8], 0, &[0; 16]),
+            Err(Error::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn management_loaded_ltk_record_selects_and_starts_the_matching_link() {
+        let mut record = [0u8; 36];
+        record[..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        record[6] = 2;
+        record[7] = 1; // authenticated
+        record[8] = 1; // local device is master/central
+        record[9] = 16;
+        record[10..12].copy_from_slice(&0x1234u16.to_le_bytes());
+        record[12..20].copy_from_slice(&[8, 7, 6, 5, 4, 3, 2, 1]);
+        record[20..36].copy_from_slice(&[0xa5; 16]);
+        let ltk = find_management_ltk(&[record], [1, 2, 3, 4, 5, 6], 2).unwrap();
+        assert_eq!(ltk.ediv, 0x1234);
+        assert_eq!(ltk.random, [8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(ltk.key, [0xa5; 16]);
+        assert_eq!(
+            &le_start_encryption_command(0x0123, &ltk.random, ltk.ediv, &ltk.key).unwrap()[..15],
+            &[
+                0x19, 0x20, 28, 0x23, 0x01, 8, 7, 6, 5, 4, 3, 2, 1, 0x34, 0x12
+            ]
+        );
+        assert_eq!(find_management_ltk(&[record], [0; 6], 2), None);
+        record[8] = 0;
+        assert_eq!(find_management_ltk(&[record], [1, 2, 3, 4, 5, 6], 2), None);
+    }
+
+    #[test]
     fn background_acl_observer_tap_preserves_packet_for_socket_reader() {
         let packet = vec![1, 0, 2, 0, 0xaa, 0xbb];
         let mut adapter = Adapter::new(
@@ -1488,6 +1839,7 @@ mod tests {
                         0x0e, 12, 1, 0x01, 0x10, 0, 0x0c, 0x34, 0x12, 0x0c, 2, 0, 0, 0,
                     ],
                     vec![0x0e, 11, 1, 0x05, 0x10, 0, 0x40, 0, 0x20, 2, 0, 1, 0],
+                    vec![0x0e, 8, 1, 0x02, 0x20, 0, 0x40, 0, 2, 0],
                 ]),
                 bulk: Vec::new(),
             },
@@ -1504,6 +1856,8 @@ mod tests {
                 manufacturer: 2,
                 acl_mtu: 64,
                 acl_packets: 2,
+                le_acl_mtu: 64,
+                le_acl_packets: 2,
                 sco_mtu: 32,
                 sco_packets: 1,
             })
