@@ -1,4 +1,5 @@
 //! PCI/platform seam for the shared RTL8125B / RTL8168H driver.
+use alloc::sync::Arc;
 use core::{
     ptr::NonNull,
     sync::atomic::{AtomicBool, Ordering},
@@ -6,26 +7,85 @@ use core::{
 
 use axalloc::{UsageKind, global_allocator};
 use axdriver_net::rtl8125::{
-    self, Hal,
+    self, Hal, HalError,
     nic::RtlNic,
     regs::{Bus, Width},
 };
-use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
+use axdriver_pci::{BarInfo, Command, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::{PhysAddr, virt_to_phys};
 
 use crate::drivers::BusProbeResult;
 static FOUND: AtomicBool = AtomicBool::new(false);
-pub struct PlatformHal;
+pub struct PlatformHal {
+    requester: tk_vtd::PciRequester,
+}
+
+fn set_bus_master(root: &mut PciRoot, bdf: DeviceFunction, enabled: bool) -> bool {
+    let (_, command) = root.get_status_command(bdf);
+    let command = if enabled {
+        command | Command::BUS_MASTER
+    } else {
+        command & !Command::BUS_MASTER
+    };
+    root.set_command(bdf, command);
+    let (_, observed) = root.get_status_command(bdf);
+    observed.contains(Command::BUS_MASTER) == enabled
+}
+
 impl Hal for PlatformHal {
-    fn allocate(pages: usize) -> Option<(u64, NonNull<u8>)> {
+    fn allocate(&self, pages: usize) -> Result<(u64, NonNull<u8>), HalError> {
         let address = global_allocator()
             .alloc_pages(pages, 4096, UsageKind::Dma)
-            .ok()?;
-        let pointer = NonNull::new(address as *mut u8)?;
-        Some((virt_to_phys(address.into()).as_usize() as u64, pointer))
+            .map_err(|_| HalError::NoMemory)?;
+        let Some(pointer) = NonNull::new(address as *mut u8) else {
+            global_allocator().dealloc_pages(address, pages, UsageKind::Dma);
+            return Err(HalError::Failed);
+        };
+        let Some(length) = pages.checked_mul(4096) else {
+            global_allocator().dealloc_pages(address, pages, UsageKind::Dma);
+            return Err(HalError::Failed);
+        };
+        let physical = virt_to_phys(address.into()).as_usize() as u64;
+        match tk_vtd::platform_map_for(self.requester, physical, length) {
+            Ok(device_address) => Ok((device_address, pointer)),
+            Err(tk_vtd::Error::Quarantined) => {
+                // The requester map may be live despite the error. Allocation::new
+                // retains this per-device HAL owner; the backing pages stay pinned.
+                Err(HalError::Quarantined)
+            }
+            Err(error) => {
+                global_allocator().dealloc_pages(address, pages, UsageKind::Dma);
+                log::warn!(
+                    "r8169: requester {:?} DMA map {physical:#x}+{length:#x} failed: {error:?}",
+                    self.requester
+                );
+                Err(HalError::Failed)
+            }
+        }
     }
-    unsafe fn deallocate(_address: u64, pointer: NonNull<u8>, pages: usize) {
+    unsafe fn deallocate(
+        &self,
+        address: u64,
+        pointer: NonNull<u8>,
+        pages: usize,
+    ) -> Result<(), HalError> {
+        let Some(length) = pages.checked_mul(4096) else {
+            return Err(HalError::Failed);
+        };
+        if let Err(error) = tk_vtd::platform_unmap_for(self.requester, address, length) {
+            log::warn!(
+                "r8169: requester {:?} DMA unmap {address:#x}+{length:#x} failed: {error:?}; \
+                 backing retained",
+                self.requester
+            );
+            return Err(if error == tk_vtd::Error::Quarantined {
+                HalError::Quarantined
+            } else {
+                HalError::Failed
+            });
+        }
         global_allocator().dealloc_pages(pointer.as_ptr() as usize, pages, UsageKind::Dma);
+        Ok(())
     }
 }
 pub struct Window {
@@ -36,7 +96,11 @@ pub struct Window {
 }
 impl Bus for Window {
     fn now_millis(&self) -> Option<u64> {
-        Some(axhal::time::monotonic_time().as_millis().min(u128::from(u64::MAX)) as u64)
+        Some(
+            axhal::time::monotonic_time()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        )
     }
     fn irq_num(&self) -> Option<usize> {
         #[cfg(all(feature = "rtl8168", target_os = "none"))]
@@ -123,6 +187,14 @@ pub(crate) fn probe(
     if info.class != 2 || info.subclass != 0 {
         return BusProbeResult::Claimed;
     }
+    // The common PCI enumerator enables bus mastering before driver probe.
+    // Stop PXE/firmware DMA before the MAC reset and keep it stopped through
+    // all requester mappings and ring programming. Re-enable only once the
+    // NIC constructor has completed successfully.
+    if !set_bus_master(root, bdf, false) {
+        log::warn!("r8169: {bdf}: could not stop PCI bus mastering; no requester remap");
+        return BusProbeResult::Claimed;
+    }
     // Both admitted chips use BAR2; 8168H maps 4 KiB, not 8125's 64 KiB.
     let length = if info.device_id == 0x8168 {
         0x1000
@@ -167,8 +239,27 @@ pub(crate) fn probe(
             window.interrupts_available()
         );
     }
-    match RtlNic::<PlatformHal, _, 256>::new(window) {
+    let hal = match Arc::try_new(PlatformHal {
+        requester: tk_vtd::PciRequester {
+            segment: axhal::pci::ecam_segment(),
+            bus: bdf.bus,
+            device: bdf.device,
+            function: bdf.function,
+        },
+    }) {
+        Ok(hal) => hal,
+        Err(_) => {
+            log::warn!("r8169: {bdf}: no memory for requester DMA owner");
+            return BusProbeResult::Claimed;
+        }
+    };
+    match RtlNic::<PlatformHal, _, 256>::new(window, hal) {
         Ok(mut nic) => {
+            if !set_bus_master(root, bdf, true) {
+                log::warn!("r8169: {bdf}: bus-master enable readback failed; NIC not published");
+                drop(nic); // Drop resets first and retains DMA if quiescence is uncertain.
+                return BusProbeResult::Claimed;
+            }
             log::info!(
                 "r8169: {bdf}: phase 1/2 rings enabled, link={}, polling, hardware packet \
                  transfer unverified",

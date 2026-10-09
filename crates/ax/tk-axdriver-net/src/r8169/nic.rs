@@ -1,9 +1,10 @@
 //! Device-owned DMA storage and checked buffer loans. See the design note for
 //! warm-PHY assumptions and why an unconfirmed reset retains the allocation.
-use core::{marker::PhantomData, mem::ManuallyDrop, ptr::NonNull};
+use alloc::sync::Arc;
+use core::{mem::ManuallyDrop, ptr::NonNull};
 
 use super::{
-    Hal, bringup,
+    Hal, HalError, bringup,
     desc::{self as d, Descriptor},
     ids::Chip,
     probe,
@@ -20,20 +21,33 @@ const FREE: u8 = 0;
 const CALLER: u8 = 1;
 const DMA: u8 = 2;
 struct Allocation<H: Hal> {
-    address: u64,
+    device_address: u64,
     pointer: NonNull<u8>,
     pages: usize,
-    hal: PhantomData<H>,
+    hal: Arc<H>,
+    released: bool,
 }
 impl<H: Hal> Allocation<H> {
-    fn new(bytes: usize) -> DevResult<Self> {
+    fn new(hal: Arc<H>, bytes: usize) -> DevResult<Self> {
         let pages = bytes.div_ceil(PAGE);
-        let (address, pointer) = H::allocate(pages).ok_or(DevError::NoMemory)?;
+        let (address, pointer) = match hal.allocate(pages) {
+            Ok(allocation) => allocation,
+            Err(HalError::NoMemory) => return Err(DevError::NoMemory),
+            Err(HalError::Failed) => return Err(DevError::Io),
+            Err(HalError::Quarantined) => {
+                // No Allocation value can own a mapping whose IOVA is not
+                // known. Retain the per-requester HAL owner along with the
+                // allocator's deliberately pinned pages.
+                core::mem::forget(hal.clone());
+                return Err(DevError::Io);
+            }
+        };
         let allocation = Self {
-            address,
+            device_address: address,
             pointer,
             pages,
-            hal: PhantomData,
+            hal,
+            released: false,
         };
         if address & (PAGE as u64 - 1) != 0
             || pointer.as_ptr() as usize & (PAGE - 1) != 0
@@ -46,6 +60,20 @@ impl<H: Hal> Allocation<H> {
             pointer.as_ptr().write_bytes(0, pages * PAGE);
         }
         Ok(allocation)
+    }
+    fn release(&mut self) -> DevResult {
+        if self.released {
+            return Ok(());
+        }
+        // SAFETY: callers release only unexposed allocations or after a
+        // confirmed MAC reset with all packet loans returned.
+        unsafe {
+            self.hal
+                .deallocate(self.device_address, self.pointer, self.pages)
+        }
+        .map_err(|_| DevError::Io)?;
+        self.released = true;
+        Ok(())
     }
     fn slot(&self, index: usize) -> NonNull<u8> {
         // SAFETY: caller bounds index to its ring size and the allocation holds
@@ -66,8 +94,11 @@ impl<H: Hal> Allocation<H> {
 }
 impl<H: Hal> Drop for Allocation<H> {
     fn drop(&mut self) {
-        unsafe {
-            H::deallocate(self.address, self.pointer, self.pages);
+        if !self.released && self.release().is_err() {
+            // The backing pointer intentionally remains allocated on HAL
+            // failure. Retain this device's requester owner as well; the VTD
+            // service separately retains any ambiguous mapping state.
+            core::mem::forget(self.hal.clone());
         }
     }
 }
@@ -100,16 +131,20 @@ pub struct RtlNic<H: Hal, B: Bus, const N: usize> {
 unsafe impl<H: Hal, B: Bus, const N: usize> Send for RtlNic<H, B, N> {}
 unsafe impl<H: Hal, B: Bus + Sync, const N: usize> Sync for RtlNic<H, B, N> {}
 impl<H: Hal, B: Bus, const N: usize> RtlNic<H, B, N> {
-    pub fn new(mut bus: B) -> DevResult<Self> {
+    pub fn new(mut bus: B, hal: Arc<H>) -> DevResult<Self> {
         if N < 2 || N > 256 || !N.is_power_of_two() {
             return Err(DevError::InvalidParam);
         }
         let (chip, mac) = probe::identify(&mut bus)?;
-        // No published addresses until all four allocations have succeeded.
-        let tx_desc = Allocation::new(N * size_of::<Descriptor>())?;
-        let rx_desc = Allocation::new(N * size_of::<Descriptor>())?;
-        let tx_data = Allocation::new(N * d::BUFFER)?;
-        let rx_data = Allocation::new(N * d::BUFFER)?;
+        // Quiesce any firmware/PXE-owned DMA before installing this
+        // requester's translations or allocating/publishing replacement rings.
+        bringup::reset(&mut bus, chip)?;
+        // The HAL instance carries this NIC's requester identity. Each buffer
+        // retains the Arc so teardown cannot discard its owner prematurely.
+        let tx_desc = Allocation::new(hal.clone(), N * size_of::<Descriptor>())?;
+        let rx_desc = Allocation::new(hal.clone(), N * size_of::<Descriptor>())?;
+        let tx_data = Allocation::new(hal.clone(), N * d::BUFFER)?;
+        let rx_data = Allocation::new(hal, N * d::BUFFER)?;
         let mut nic = Self {
             bus,
             mac,
@@ -131,11 +166,15 @@ impl<H: Hal, B: Bus, const N: usize> RtlNic<H, B, N> {
             firmware_stage: "warm-PXE-no-firmware-attempt",
             data_path_ready: false,
         };
-        bringup::reset(&mut nic.bus, chip)?;
         for index in 0..N {
             nic.arm_rx(index);
         }
-        bringup::program(&mut nic.bus, chip, nic.tx_desc.address, nic.rx_desc.address)?;
+        bringup::program(
+            &mut nic.bus,
+            chip,
+            nic.tx_desc.device_address,
+            nic.rx_desc.device_address,
+        )?;
         nic.data_path_ready = true;
         Ok(nic)
     }
@@ -224,7 +263,7 @@ impl<H: Hal, B: Bus, const N: usize> RtlNic<H, B, N> {
         unsafe {
             d::publish(
                 self.descriptor(true, index),
-                self.rx_data.address + (index * d::BUFFER) as u64,
+                self.rx_data.device_address + (index * d::BUFFER) as u64,
                 d::OWN | end | d::BUFFER as u32,
             );
         }
@@ -239,8 +278,23 @@ impl<H: Hal, B: Bus, const N: usize> Drop for RtlNic<H, B, N> {
             log::warn!("r8169: DMA stop or packet-loan release unconfirmed; retaining DMA memory");
             return;
         }
+        // Retire each requester mapping before its backing is released. If
+        // any unmap/IOTLB operation fails, return with every remaining
+        // ManuallyDrop allocation (including its requester HAL owner) pinned.
+        for allocation in [
+            &mut *self.tx_desc,
+            &mut *self.rx_desc,
+            &mut *self.tx_data,
+            &mut *self.rx_data,
+        ] {
+            if allocation.release().is_err() {
+                log::warn!("r8169: DMA unmap unconfirmed; retaining remaining requester backing");
+                return;
+            }
+        }
         // SAFETY: reset completed, so no DMA can access these allocations;
-        // all CPU packet loans were returned. They are dropped exactly once.
+        // all CPU packet loans returned and every VTD unmap completed. They
+        // are dropped exactly once; Allocation::drop observes `released`.
         unsafe {
             ManuallyDrop::drop(&mut self.tx_desc);
             ManuallyDrop::drop(&mut self.rx_desc);
@@ -321,8 +375,8 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
                 bringup::program(
                     &mut self.bus,
                     self.chip,
-                    self.tx_desc.address,
-                    self.rx_desc.address,
+                    self.tx_desc.device_address,
+                    self.rx_desc.device_address,
                 ),
             )?;
             self.firmware_stage = "ready-after-firmware";
@@ -408,7 +462,7 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
         unsafe {
             d::publish(
                 self.descriptor(false, slot),
-                self.tx_data.address + (index * d::BUFFER) as u64,
+                self.tx_data.device_address + (index * d::BUFFER) as u64,
                 d::OWN | d::FIRST | d::LAST | end | buffer.packet_len().max(60) as u32,
             );
         }
@@ -473,13 +527,19 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
         super::fake::{FakeBus, FakeHal},
         *,
     };
+
+    fn nic(bus: FakeBus) -> RtlNic<FakeHal, FakeBus, 4> {
+        RtlNic::<FakeHal, _, 4>::new(bus, Arc::new(FakeHal::new(1))).unwrap()
+    }
     #[test]
     fn health_snapshot_preserves_irq_status_mac_and_descriptor_ownership() {
-        let mut nic = RtlNic::<FakeHal, _, 4>::new(FakeBus::h8168()).unwrap();
+        let mut nic = nic(FakeBus::h8168());
         nic.bus.set_register(0x3e, 0x0027);
         nic.bus.set_register(0x6c, 0xc3);
         let prior = nic.bus.writes.len();
@@ -509,7 +569,7 @@ mod tests {
 
     #[test]
     fn firmware_parse_and_busy_failures_preserve_the_running_warm_path() {
-        let mut nic = RtlNic::<FakeHal, _, 4>::new(FakeBus::h8168()).unwrap();
+        let mut nic = nic(FakeBus::h8168());
         assert!(nic.can_transmit());
         assert!(nic.load_firmware(&[1]).is_err());
         assert!(nic.can_transmit());
@@ -525,7 +585,7 @@ mod tests {
     #[test]
     fn firmware_failures_after_reset_fence_new_dma_until_explicit_success() {
         for stuck_reset in [false, true] {
-            let mut nic = RtlNic::<FakeHal, _, 4>::new(FakeBus::h8168()).unwrap();
+            let mut nic = nic(FakeBus::h8168());
             nic.bus.stuck_reset = stuck_reset;
             nic.bus.stuck_indirect = !stuck_reset;
             assert!(nic.load_firmware(&minimal_firmware()).is_err());
@@ -546,7 +606,7 @@ mod tests {
 
     #[test]
     fn firmware_reset_restarts_both_hardware_and_software_tx_at_slot_zero() {
-        let mut nic = RtlNic::<FakeHal, _, 4>::new(FakeBus::h8168()).unwrap();
+        let mut nic = nic(FakeBus::h8168());
         let packet = nic.alloc_tx_buffer(42).unwrap();
         nic.transmit(packet).unwrap();
         // SAFETY: fake hardware completes the sole outstanding descriptor.
@@ -578,26 +638,113 @@ mod tests {
         let (a, f) = FakeHal::counts();
         FakeHal::fail_after(2);
         assert!(matches!(
-            RtlNic::<FakeHal, _, 4>::new(FakeBus::new()),
+            RtlNic::<FakeHal, _, 4>::new(FakeBus::new(), Arc::new(FakeHal::new(1))),
             Err(DevError::NoMemory)
         ));
         assert_eq!(FakeHal::counts(), (a + 2, f + 2));
         let (a, f) = FakeHal::counts();
         let mut bus = FakeBus::new();
         bus.stuck_reset = true;
+        let hal = Arc::new(FakeHal::new(2));
         assert!(matches!(
-            RtlNic::<FakeHal, _, 4>::new(bus),
+            RtlNic::<FakeHal, _, 4>::new(bus, hal.clone()),
             Err(DevError::Io)
         ));
-        assert_eq!(FakeHal::counts(), (a + 4, f));
+        assert_eq!(FakeHal::counts(), (a, f));
+        assert!(hal.mappings().is_empty());
         let (a, f) = FakeHal::counts();
-        drop(RtlNic::<FakeHal, _, 4>::new(FakeBus::new()).unwrap());
+        drop(nic(FakeBus::new()));
         assert_eq!(FakeHal::counts(), (a + 4, f + 4));
     }
 
     #[test]
+    fn requester_mappings_are_per_nic_and_descriptors_use_nonidentity_iovas() {
+        let hal_a = Arc::new(FakeHal::new(0x31));
+        let hal_b = Arc::new(FakeHal::new(0x32));
+        let mut a = RtlNic::<FakeHal, _, 4>::new(FakeBus::new(), hal_a.clone()).unwrap();
+        let b = RtlNic::<FakeHal, _, 4>::new(FakeBus::h8168(), hal_b.clone()).unwrap();
+        let a_maps = hal_a.mappings();
+        let b_maps = hal_b.mappings();
+        assert_eq!(a_maps.len(), 4);
+        assert_eq!(b_maps.len(), 4);
+        assert!(a_maps.iter().all(|mapping| mapping.requester == 0x31));
+        assert!(b_maps.iter().all(|mapping| mapping.requester == 0x32));
+        assert!(
+            a_maps
+                .iter()
+                .all(|mapping| mapping.device_address >> 24 == 0x80 + 0x31)
+        );
+        assert!(
+            b_maps
+                .iter()
+                .all(|mapping| mapping.device_address >> 24 == 0x80 + 0x32)
+        );
+        assert_ne!(a.tx_desc.device_address, a.tx_desc.pointer.as_ptr() as u64);
+        assert_ne!(b.tx_desc.device_address, b.tx_desc.pointer.as_ptr() as u64);
+
+        let packet = a.alloc_tx_buffer(60).unwrap();
+        unsafe {
+            packet.packet_ptr().as_ptr().write_bytes(0xa5, 60);
+        }
+        let slot = a.tx_tail;
+        a.transmit(packet).unwrap();
+        let descriptor = unsafe { &*a.descriptor(false, slot) };
+        assert_eq!(descriptor.address as u64, a.tx_data.device_address);
+        // The descriptor carries the NIC's IOVA while the stack continues to
+        // use its CPU virtual pointer for packet contents.
+        assert_ne!(
+            descriptor.address as usize,
+            a.tx_data.slot(0).as_ptr() as usize
+        );
+        assert_eq!(unsafe { a.tx_data.slot(0).as_ptr().read() }, 0xa5);
+
+        drop(a);
+        drop(b);
+        assert!(hal_a.mappings().is_empty());
+        assert!(hal_b.mappings().is_empty());
+        assert!(
+            hal_a
+                .unmaps()
+                .iter()
+                .all(|(requester, ..)| *requester == 0x31)
+        );
+        assert!(
+            hal_b
+                .unmaps()
+                .iter()
+                .all(|(requester, ..)| *requester == 0x32)
+        );
+    }
+
+    #[test]
+    fn map_quarantine_and_failed_unmap_retain_requester_owner_and_backing() {
+        let hal = Arc::new(FakeHal::new(0x41));
+        hal.fail_next_map(HalError::Quarantined);
+        let (allocated, freed) = FakeHal::counts();
+        assert!(matches!(
+            RtlNic::<FakeHal, _, 4>::new(FakeBus::new(), hal.clone()),
+            Err(DevError::Io)
+        ));
+        assert_eq!(FakeHal::counts(), (allocated + 1, freed));
+        assert_eq!(hal.mappings().len(), 1);
+        assert_eq!(hal.mappings()[0].requester, 0x41);
+        assert!(Arc::strong_count(&hal) >= 2); // leaked owner pins ambiguous mapping/backing
+
+        let hal = Arc::new(FakeHal::new(0x42));
+        let nic = RtlNic::<FakeHal, _, 4>::new(FakeBus::new(), hal.clone()).unwrap();
+        let (allocated, freed) = FakeHal::counts();
+        hal.fail_next_unmap(HalError::Quarantined);
+        drop(nic);
+        assert_eq!(FakeHal::counts(), (allocated, freed));
+        assert_eq!(hal.unmaps().len(), 1);
+        assert_eq!(hal.unmaps()[0].0, 0x42);
+        assert_eq!(hal.mappings().len(), 4);
+        assert!(Arc::strong_count(&hal) >= 5); // all ManuallyDrop buffers retain owner
+    }
+
+    #[test]
     fn rings_recycle_wrap_and_refuse_duplicate_loans() {
-        let mut nic = RtlNic::<FakeHal, _, 4>::new(FakeBus::new()).unwrap();
+        let mut nic = nic(FakeBus::new());
         for _ in 0..10 {
             let buffer = nic.alloc_tx_buffer(42).unwrap();
             let pointer = NonNull::new(buffer.raw_ptr::<u8>()).unwrap();
@@ -632,7 +779,7 @@ mod tests {
     }
     #[test]
     fn h8168_packets_use_the_shared_ring_and_byte_doorbell() {
-        let mut nic = RtlNic::<FakeHal, _, 4>::new(FakeBus::h8168()).unwrap();
+        let mut nic = nic(FakeBus::h8168());
         assert_eq!(nic.device_name(), "rtl8168");
         for _ in 0..12 {
             let packet = nic.alloc_tx_buffer(42).unwrap();
@@ -643,7 +790,12 @@ mod tests {
             nic.transmit(packet).unwrap();
             assert_eq!(nic.bus.writes.last(), Some(&(0x38, Byte, 0x40)));
             unsafe {
-                let data = (*nic.descriptor(false, slot)).address as *const u8;
+                let buffer_index = nic.tx_slots[slot];
+                let data = nic.tx_data.slot(buffer_index).as_ptr();
+                assert_eq!(
+                    (*nic.descriptor(false, slot)).address as u64,
+                    nic.tx_data.device_address + (buffer_index * d::BUFFER) as u64
+                );
                 assert_eq!(core::slice::from_raw_parts(data, 42), &[0xa5; 42]);
                 assert_eq!(core::slice::from_raw_parts(data.add(42), 18), &[0; 18]);
                 (*nic.descriptor(false, slot)).options &= !d::OWN;
@@ -665,7 +817,7 @@ mod tests {
     }
     #[test]
     fn malformed_receive_is_rearmed_and_ring_full_is_bounded() {
-        let mut nic = RtlNic::<FakeHal, _, 4>::new(FakeBus::new()).unwrap();
+        let mut nic = nic(FakeBus::new());
         unsafe {
             (*nic.descriptor(true, 0)).options = d::ERROR | d::FIRST | d::LAST | 64;
         }

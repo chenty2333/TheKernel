@@ -2,39 +2,127 @@ use core::ptr::NonNull;
 use std::{
     alloc::{Layout, alloc_zeroed, dealloc},
     collections::BTreeMap,
+    sync::Mutex,
 };
 
 use super::{
-    Hal,
+    Hal, HalError,
     regs::{self as r, Bus, Width},
 };
 std::thread_local! {
     static COUNTS: core::cell::Cell<(usize,usize)> = const { core::cell::Cell::new((0,0)) };
     static FAIL_AT: core::cell::Cell<usize> = const { core::cell::Cell::new(usize::MAX) };
 }
-pub struct FakeHal;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FakeMapping {
+    pub requester: u16,
+    pub device_address: u64,
+    pub pointer: usize,
+    pub pages: usize,
+}
+
+pub struct FakeHal {
+    requester: u16,
+    next_offset: Mutex<u64>,
+    mappings: Mutex<std::vec::Vec<FakeMapping>>,
+    unmaps: Mutex<std::vec::Vec<(u16, u64, usize)>>,
+    map_error: Mutex<Option<HalError>>,
+    unmap_error: Mutex<Option<HalError>>,
+}
 impl FakeHal {
+    pub fn new(requester: u16) -> Self {
+        Self {
+            requester,
+            next_offset: Mutex::new(0),
+            mappings: Mutex::new(std::vec::Vec::new()),
+            unmaps: Mutex::new(std::vec::Vec::new()),
+            map_error: Mutex::new(None),
+            unmap_error: Mutex::new(None),
+        }
+    }
     pub fn counts() -> (usize, usize) {
         COUNTS.get()
     }
     pub fn fail_after(successes: usize) {
         FAIL_AT.set(COUNTS.get().0 + successes);
     }
+    pub fn mappings(&self) -> std::vec::Vec<FakeMapping> {
+        self.mappings.lock().unwrap().clone()
+    }
+    pub fn unmaps(&self) -> std::vec::Vec<(u16, u64, usize)> {
+        self.unmaps.lock().unwrap().clone()
+    }
+    pub fn fail_next_map(&self, error: HalError) {
+        *self.map_error.lock().unwrap() = Some(error);
+    }
+    pub fn fail_next_unmap(&self, error: HalError) {
+        *self.unmap_error.lock().unwrap() = Some(error);
+    }
 }
 impl Hal for FakeHal {
-    fn allocate(pages: usize) -> Option<(u64, NonNull<u8>)> {
+    fn allocate(&self, pages: usize) -> Result<(u64, NonNull<u8>), HalError> {
         let (allocated, freed) = COUNTS.get();
         if FAIL_AT.get() == allocated {
             FAIL_AT.set(usize::MAX);
-            return None;
+            return Err(HalError::NoMemory);
         }
+        let length = pages.checked_mul(4096).ok_or(HalError::Failed)?;
+        let layout = Layout::from_size_align(length, 4096).map_err(|_| HalError::Failed)?;
+        let mut next = self.next_offset.lock().unwrap();
+        let device_address = 0x8000_0000u64
+            .checked_add(u64::from(self.requester) << 24)
+            .and_then(|base| base.checked_add(*next))
+            .ok_or(HalError::Failed)?;
+        *next = next.checked_add(length as u64).ok_or(HalError::Failed)?;
+        let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(HalError::NoMemory)?;
         COUNTS.set((allocated + 1, freed));
-        let pointer = NonNull::new(unsafe {
-            alloc_zeroed(Layout::from_size_align(pages * 4096, 4096).ok()?)
-        })?;
-        Some((pointer.as_ptr() as u64, pointer))
+        let mapping = FakeMapping {
+            requester: self.requester,
+            device_address,
+            pointer: pointer.as_ptr() as usize,
+            pages,
+        };
+        self.mappings.lock().unwrap().push(mapping);
+        if let Some(error) = self.map_error.lock().unwrap().take() {
+            if error == HalError::Quarantined {
+                return Err(error);
+            }
+            self.mappings
+                .lock()
+                .unwrap()
+                .retain(|mapped| mapped.device_address != device_address);
+            let (allocated, freed) = COUNTS.get();
+            COUNTS.set((allocated, freed + 1));
+            unsafe {
+                dealloc(pointer.as_ptr(), layout);
+            }
+            return Err(error);
+        }
+        Ok((device_address, pointer))
     }
-    unsafe fn deallocate(_address: u64, pointer: NonNull<u8>, pages: usize) {
+    unsafe fn deallocate(
+        &self,
+        address: u64,
+        pointer: NonNull<u8>,
+        pages: usize,
+    ) -> Result<(), HalError> {
+        self.unmaps
+            .lock()
+            .unwrap()
+            .push((self.requester, address, pages * 4096));
+        if let Some(error) = self.unmap_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        let mut mappings = self.mappings.lock().unwrap();
+        let Some(index) = mappings.iter().position(|mapping| {
+            mapping.requester == self.requester
+                && mapping.device_address == address
+                && mapping.pointer == pointer.as_ptr() as usize
+                && mapping.pages == pages
+        }) else {
+            return Err(HalError::Failed);
+        };
+        mappings.remove(index);
         let (allocated, freed) = COUNTS.get();
         COUNTS.set((allocated, freed + 1));
         unsafe {
@@ -43,6 +131,7 @@ impl Hal for FakeHal {
                 Layout::from_size_align(pages * 4096, 4096).unwrap(),
             );
         }
+        Ok(())
     }
 }
 pub struct FakeBus {
