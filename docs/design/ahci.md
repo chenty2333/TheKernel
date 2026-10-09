@@ -70,3 +70,8 @@ be applied by this driver until the platform IOMMU provides a bus-wide DMA
 identity/domain API. PHY-change events on an existing disk force link reset and
 IDENTIFY fingerprint validation. A periodic controller worker also attaches and
 publishes media discovered on ports empty at boot through the runtime registry.
+
+The block error path now uses an explicit `ahci_reset()` adapter matching the
+upstream reset order: prove FIS/command-engine DMA stop, attempt CLO without
+making CLO timeout fatal, reset PHY, then restart FIS and command processing.
+The block caller completes its request rather than CAM-freezing/requeueing CCBs.

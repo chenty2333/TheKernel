@@ -813,30 +813,32 @@ impl<I: AhciIo> AhciDisk<I> {
         }
     }
 
-    fn timeout_command(&mut self) -> bool {
+    // FreeBSD `ahci_reset()` stops DMA, attempts CLO, resets the SATA PHY,
+    // and restarts FIS/command processing. CAM queue freezing/requeueing is
+    // omitted; the BlockDriverOps caller owns the in-flight request result.
+    // upstream: ahci.c ahci_reset()
+    fn ahci_reset(&mut self) -> bool {
         let fis_stopped = self.controller.ahci_stop_fr(&self.port);
         let command_stopped = self.controller.ahci_stop(&mut self.port);
-        if fis_stopped && command_stopped {
-            if !self.recover_port() {
-                self.poisoned = true;
-            }
-        } else {
+        if !fis_stopped || !command_stopped {
             self.poisoned = true;
+            return false;
         }
-        fis_stopped && command_stopped
-    }
-
-    fn recover_port(&mut self) -> bool {
         if !self.controller.ahci_clo(&self.port) {
             // FreeBSD logs CLO failure but continues the reset/restart path.
             log::warn!("ahci: CLO timed out during reset; continuing");
         }
         if !self.controller.ahci_sata_phy_reset(&mut self.port) {
-            return false;
+            self.poisoned = true;
+            return true;
         }
         self.controller.ahci_start_fr(&self.port);
         self.controller.ahci_start(&mut self.port, true);
         true
+    }
+
+    fn timeout_command(&mut self) -> bool {
+        self.ahci_reset()
     }
 
     /// FreeBSD `ahci_execute_transaction()`'s serialized completion path.
@@ -900,11 +902,7 @@ impl<I: AhciIo> AhciDisk<I> {
         } else {
             self.ncq_error_tag = None;
         }
-        let _ = self.controller.ahci_stop_fr(&self.port);
-        if !self.controller.ahci_stop(&mut self.port) {
-            return false;
-        }
-        self.recover_port()
+        self.ahci_reset()
     }
 
     fn read_ncq_error_log(&mut self) -> Option<u8> {
