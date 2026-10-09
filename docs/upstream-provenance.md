@@ -2020,6 +2020,12 @@ source path.
 Corporation), preserving suspend/freeze/resume order and TTM calls behind the
 upstream local-memory-region type checks.
 
+`i915_gem_dmabuf_upstream.rs` translates the 13 ctags definitions in Linux
+7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_dmabuf.c` (MIT, Copyright 2012 Red
+Hat Inc). The `dma_buf` ABI views and Linux PRIME/DMA mappings keep
+their source layout; generic DMA-BUF, DMA map, and VMA services remain external
+LinuxKPI/kernel ownership boundaries.
+
 `intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
 `drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
 Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.
