@@ -2051,7 +2051,7 @@ unsafe fn gen8_csb_parse(csb: u64) -> bool {
 
 // upstream: intel_execlists_submission.c wa_csb_read()
 unsafe fn wa_csb_read(engine: *const IntelEngineCs, csb: *const u64) -> u64 {
-    let mut entry: u64;
+    let mut entry: u64 = 0;
 
     // A HWSP read can detect a stale entry. Since the HWSP write is broken,
     // do not trust the HW at all: the MMIO entry can also be unordered, so
@@ -3722,7 +3722,9 @@ unsafe fn rcs_submission_override(engine: *mut IntelEngineCs) {
 }
 
 // upstream: intel_execlists_submission.c intel_execlists_submission_setup()
-pub(crate) unsafe extern "C" fn intel_execlists_submission_setup(engine: *mut IntelEngineCs) -> i32 {
+pub(crate) unsafe extern "C" fn intel_execlists_submission_setup(
+    engine: *mut IntelEngineCs,
+) -> i32 {
     let execlists = &mut (*engine).execlists;
     let i915 = (*engine).i915;
     let uncore = (*engine).uncore;
@@ -4290,7 +4292,7 @@ unsafe extern "C" fn execlists_create_virtual(
 pub(crate) unsafe fn intel_execlists_show_requests(
     engine: *mut IntelEngineCs,
     m: *mut DrmPrinter,
-    show_request: unsafe fn(*mut DrmPrinter, *const I915Request, *const c_char, i32),
+    show_request: unsafe extern "C" fn(*mut DrmPrinter, *const I915Request, *const c_char, i32),
     max: u32,
 ) {
     let execlists = &(*engine).execlists;
