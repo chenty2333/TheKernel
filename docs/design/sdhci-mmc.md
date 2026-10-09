@@ -115,3 +115,7 @@ HS200/HS400 transitions are named and sequenced by the corresponding upstream
 functions. `mmc_discover_cards()` is the one-selected-card form of FreeBSD's
 multi-child discovery loop. The bus-wide scan/child lifecycle remains outside
 this block-driver model.
+
+Card hotplug now follows the upstream task/poll/present split by source function
+name. The slot table lock is acquired for one slot at a time; long card command
+polls no longer hold the lock while unrelated slots are inspected.

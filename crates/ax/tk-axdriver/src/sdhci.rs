@@ -582,7 +582,7 @@ fn start_hotplug_worker() {
         return;
     }
     if let Err(error) = axtask::spawn_raw(
-        sdhci_hotplug_worker,
+        sdhci_card_task,
         "sdhci_hotplug".into(),
         axconfig::TASK_STACK_SIZE,
     ) {
@@ -591,61 +591,75 @@ fn start_hotplug_worker() {
     }
 }
 
-// upstream: sdhci.c sdhci_card_poll(), sdhci_card_task(), sdhci_handle_card_present(), sdhci_handle_card_present_locked()
-fn sdhci_hotplug_worker() {
+// upstream: sdhci.c sdhci_card_task()
+fn sdhci_card_task() {
     loop {
-        {
-            let mut slots = SDHCI_HOTPLUG_SLOTS.lock();
-            for slot in slots.iter_mut() {
-                let mut host = SdhciHost::new_with_quirks(
-                    slot.io.clone(),
-                    slot.capabilities,
-                    slot.capabilities2,
-                    slot.version,
-                    slot.quirks,
-                );
-                if !host.media_present() {
-                    slot.present = false;
-                    continue;
-                }
-                if slot.present {
-                    continue;
-                }
-                if slot.vendor_id == QEMU_SDHCI_VID && slot.device_id == QEMU_SDHCI_DID {
-                    host = host.with_single_block_only();
-                }
-                if dma_supported(slot.capabilities, slot.quirks)
-                    && slot.quirks & axdriver_block::sdhci::SDHCI_QUIRK_BROKEN_DMA == 0
-                    && let Some(region) = allocate_dma_buffer()
-                {
-                    host = host.with_dma_region(region);
-                }
-                let Ok(mut disk) = SdhciDisk::attach(host) else {
-                    continue;
-                };
-                disk.log_card();
-                let read_only = disk.is_read_only();
-                let areas = disk.into_partition_devices(read_only, slot.disk_index);
-                let user_name = alloc::format!("mmcblk{}", slot.disk_index);
-                let mut published_user = false;
-                for area in areas {
-                    let is_user = area.device_name() == user_name;
-                    let raw = wrap_sdhci_partition(area);
-                    if crate::publish_runtime_block_device(raw) {
-                        if is_user {
-                            published_user = true;
-                        }
-                    } else if is_user {
-                        break;
-                    }
-                }
-                if published_user {
-                    slot.present = true;
-                    info!("sdhci: card inserted, published /dev/{user_name}");
-                }
-            }
-        }
+        sdhci_card_poll();
         let _ = axtask::sleep(core::time::Duration::from_millis(500));
+    }
+}
+
+// upstream: sdhci.c sdhci_card_poll()
+fn sdhci_card_poll() {
+    let count = SDHCI_HOTPLUG_SLOTS.lock().len();
+    for index in 0..count {
+        sdhci_handle_card_present(index);
+    }
+}
+
+// upstream: sdhci.c sdhci_handle_card_present()
+fn sdhci_handle_card_present(index: usize) {
+    let mut slots = SDHCI_HOTPLUG_SLOTS.lock();
+    if let Some(slot) = slots.get_mut(index) {
+        sdhci_handle_card_present_locked(slot);
+    }
+}
+
+// upstream: sdhci.c sdhci_handle_card_present_locked()
+fn sdhci_handle_card_present_locked(slot: &mut SdhciHotplugSlot) {
+    let mut host = SdhciHost::new_with_quirks(
+        slot.io.clone(),
+        slot.capabilities,
+        slot.capabilities2,
+        slot.version,
+        slot.quirks,
+    );
+    if !host.media_present() {
+        slot.present = false;
+        return;
+    }
+    if slot.present {
+        return;
+    }
+    if slot.vendor_id == QEMU_SDHCI_VID && slot.device_id == QEMU_SDHCI_DID {
+        host = host.with_single_block_only();
+    }
+    if dma_supported(slot.capabilities, slot.quirks)
+        && slot.quirks & axdriver_block::sdhci::SDHCI_QUIRK_BROKEN_DMA == 0
+        && let Some(region) = allocate_dma_buffer()
+    {
+        host = host.with_dma_region(region);
+    }
+    let Ok(mut disk) = SdhciDisk::attach(host) else {
+        return;
+    };
+    disk.log_card();
+    let read_only = disk.is_read_only();
+    let areas = disk.into_partition_devices(read_only, slot.disk_index);
+    let user_name = alloc::format!("mmcblk{}", slot.disk_index);
+    let mut published_user = false;
+    for area in areas {
+        let is_user = area.device_name() == user_name;
+        let raw = wrap_sdhci_partition(area);
+        if crate::publish_runtime_block_device(raw) {
+            published_user |= is_user;
+        } else if is_user {
+            break;
+        }
+    }
+    if published_user {
+        slot.present = true;
+        info!("sdhci: card inserted, published /dev/{user_name}");
     }
 }
 
