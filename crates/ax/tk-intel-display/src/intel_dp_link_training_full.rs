@@ -1126,15 +1126,18 @@ pub fn intel_dp_stop_post_lt_adj_req<I: LinkTrainingIo>(
     dp: &IntelDpLinkTraining,
     io: &mut I,
     state: &LinkTrainingCrtcState,
-) {
+) -> Result<(), LinkTrainingError> {
     if !intel_dp_use_post_lt_adj_req(dp, io, state) {
-        return;
+        return Ok(());
     }
     let mut lane_count = state.lane_count;
     if state.enhanced_framing {
         lane_count |= DP_LANE_COUNT_ENHANCED_FRAME_EN;
     }
-    let _ = io.aux_write(DP_LANE_COUNT_SET, &[lane_count]);
+    if io.aux_write(DP_LANE_COUNT_SET, &[lane_count])? != 1 {
+        return Err(LinkTrainingError::Aux);
+    }
+    Ok(())
 }
 
 // upstream: intel_dp_link_training.c intel_dp_disable_dpcd_training_pattern()
@@ -1362,7 +1365,9 @@ pub fn intel_dp_link_train_all_phys<I: LinkTrainingIo>(
     if passed {
         passed = intel_dp_post_lt_adj_req(dp, io, state);
     }
-    intel_dp_stop_post_lt_adj_req(dp, io, state);
+    if intel_dp_stop_post_lt_adj_req(dp, io, state).is_err() {
+        passed = false;
+    }
     passed
 }
 
@@ -1826,6 +1831,26 @@ mod tests {
         // The initial downspread write is short; link bandwidth/lane count
         // programming must not proceed after that failed prerequisite.
         assert_eq!(io.aux_writes, 1);
+    }
+
+    #[test]
+    fn failed_post_adjustment_cleanup_is_not_reported_as_success() {
+        let mut io = SourcePhyFailureIo {
+            short_aux_write: true,
+            ..Default::default()
+        };
+        let mut dp = IntelDpLinkTraining::default();
+        dp.set_idle_link_train = true;
+        dp.dpcd[2] = DP_POST_LT_ADJ_REQ_SUPPORTED;
+        let state = LinkTrainingCrtcState {
+            lane_count: 4,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            intel_dp_stop_post_lt_adj_req(&dp, &mut io, &state),
+            Err(LinkTrainingError::Aux)
+        );
     }
 
     #[test]
