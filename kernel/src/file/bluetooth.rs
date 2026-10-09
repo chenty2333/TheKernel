@@ -252,13 +252,19 @@ mod tests {
 
     #[test]
     fn management_read_version_and_empty_index_list_match_wire_abi() {
-        let version = management_response(&[1, 0, 0, 0, 0, 0]).unwrap();
+        // Controller-less commands are sent with MGMT_INDEX_NONE (0xffff) and
+        // the Command Complete reply echoes that index.
+        let version = management_response(&[1, 0, 0xff, 0xff, 0, 0]).unwrap();
         assert_eq!(&version[..9], &[1, 0, 0xff, 0xff, 6, 0, 1, 0, 0]);
         assert_eq!(&version[9..], &[1, 0, 0]);
 
         let indices = management_response(&[3, 0, 0xff, 0xff, 0, 0]).unwrap();
         assert_eq!(&indices[..9], &[1, 0, 0xff, 0xff, 5, 0, 3, 0, 0]);
         assert_eq!(&indices[9..], &[0, 0]);
+
+        // Linux rejects a real index on these commands with INVALID_INDEX.
+        let bound = management_response(&[1, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(bound, &[1, 0, 0, 0, 3, 0, 1, 0, 0x11]);
     }
 
     #[test]
@@ -2078,6 +2084,12 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     let mut status = 0u8;
     let mut data = Vec::new();
     match opcode {
+        // Linux hci_mgmt_cmd() requires MGMT_INDEX_NONE for HCI_MGMT_NO_HDEV
+        // commands (mgmt.c read_version/read_commands/read_index_list) and
+        // answers any other index with MGMT_STATUS_INVALID_INDEX.
+        READ_VERSION | READ_COMMANDS | READ_INDEX_LIST if index != MGMT_INDEX_NONE => {
+            status = INVALID_INDEX;
+        }
         READ_VERSION if parameters.is_empty() => data.extend_from_slice(&[1, 0, 0]),
         READ_COMMANDS if parameters.is_empty() => {
             // Linux excludes READ_VERSION/READ_COMMANDS from the advertised
