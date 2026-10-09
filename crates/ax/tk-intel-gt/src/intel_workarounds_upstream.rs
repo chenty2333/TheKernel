@@ -7,19 +7,42 @@
 
 // Header-owned types come from intel_workarounds_types_upstream; the C source
 // provides these construction helpers only.
+use core::ffi::c_void;
+
 pub use crate::intel_workarounds_types_upstream::{
     I915McrRegT as I915McrReg, I915RegT as I915Reg, I915Wa, I915WaList, I915WaReg,
 };
 use crate::{
-    intel_context_upstream::{I915GemWwCtx, I915Request, I915Vma, IntelContext},
+    i915_gem_object_header_upstream::{i915_gem_object_unpin_map, i915_gem_object_lock},
+    i915_gem_pages_upstream::i915_gem_object_pin_map,
+    i915_gem_ww_upstream::{i915_gem_ww_ctx_backoff, i915_gem_ww_ctx_fini, i915_gem_ww_ctx_init, I915GemWwCtx},
+    i915_request_upstream::{i915_request_add, i915_request_create, i915_request_wait},
+    i915_request_types_upstream::I915Request,
+    i915_vma_api_upstream::{i915_vma_is_ggtt, i915_vma_move_to_active, i915_vma_pin_ww, i915_vma_put, i915_vma_unpin},
+    i915_vma_types_upstream::I915Vma,
+    intel_context_types_upstream::IntelContext,
+    intel_ring_upstream::intel_ring_begin,
+    intel_sseu_types_upstream::{intel_slicemask_from_xehp_dssmask, intel_sseu_find_first_xehp_dss, intel_sseu_get_hsw_subslices},
     intel_engine_types_upstream::{
-        COMPUTE_CLASS, COPY_ENGINE_CLASS, IntelEngineCs, RENDER_CLASS, VIDEO_DECODE_CLASS,
+        COMPUTE_CLASS, COPY_ENGINE_CLASS, I915_MAX_CCS, IntelEngineCs, RENDER_CLASS,
+        VIDEO_DECODE_CLASS,
     },
     intel_gt_mcr_upstream::{
         intel_gt_mcr_multicast_write_fw, intel_gt_mcr_read_any_fw, intel_gt_mcr_report_steering,
     },
+    intel_gtt_api_upstream::__vm_create_scratch_for_read,
     intel_gt_types_upstream::{IntelGt, IntelMmioRange as I915MmioRange},
+    intel_engine_regs_upstream::{
+        BLIT_CCTL, BLIT_CCTL_MOCS, CMD_CCTL_MOCS_OVERRIDE, ECOSKPD, L3_GENERAL_PRIO_CREDITS,
+        L3_HIGH_PRIO_CREDITS, VDBOX_CGCTL3F10, VDBOX_CGCTL3F1C,
+        XEHP_CCS_MODE_CSLICE, XEHP_CCS_MODE_CSLICE_MASK,
+    },
     intel_uncore_types_upstream::*,
+    linux::{
+        i915::{CCS_MASK, HAS_L3_CCS_READ, tuning_thread_rr_after_dep},
+        memory::kmemdup_array,
+        primitives::hweight8,
+    },
     linux_config::*,
     linux_list::*,
 };
@@ -76,14 +99,14 @@ unsafe fn wa_init_start(
 unsafe fn wa_init_finish(wal: *mut I915WaList) {
     if (*wal).count as usize % WA_LIST_CHUNK != 0 {
         let list = kmemdup_array(
-            (*wal).list,
+            (*wal).list.cast::<c_void>(),
             (*wal).count as usize,
             core::mem::size_of::<I915Wa>(),
             GFP_KERNEL,
         );
         if !list.is_null() {
             kfree((*wal).list);
-            (*wal).list = list;
+            (*wal).list = list.cast::<I915Wa>();
         }
     }
     if (*wal).count == 0 {
@@ -103,7 +126,7 @@ unsafe fn wal_get_fw_for_rmw(uncore: *mut IntelUncore, wal: *const I915WaList) -
     let mut fw = 0;
     for i in 0..(*wal).count {
         let wa = &*(*wal).list.add(i as usize);
-        fw |= intel_uncore_forcewake_for_reg(uncore, wa.reg(), FW_REG_READ | FW_REG_WRITE);
+        fw |= intel_uncore_forcewake_for_reg(uncore, wa.reg(), crate::intel_uncore_types_upstream::FW_REG_READ | crate::intel_uncore_types_upstream::FW_REG_WRITE);
     }
     fw
 }
@@ -114,9 +137,9 @@ unsafe fn _wa_add(wal: *mut I915WaList, wa: *const I915Wa) {
     let i915 = (*(*wal).gt).i915;
     let (mut start, mut end) = (0usize, (*wal).count as usize);
     if (*wal).count as usize % WA_LIST_CHUNK == 0 {
-        let list = kmalloc_objs::<I915Wa>(align((*wal).count as usize + 1, WA_LIST_CHUNK));
+        let list = kmalloc_objs::<I915Wa, usize>(((*wal).count as usize + WA_LIST_CHUNK) & !(WA_LIST_CHUNK - 1));
         if list.is_null() {
-            drm_err(i915, "No space for workaround init!\n");
+            drm_err!(i915, "No space for workaround init!\n");
             return;
         }
         if !(*wal).list.is_null() {
@@ -127,7 +150,7 @@ unsafe fn _wa_add(wal: *mut I915WaList, wa: *const I915Wa) {
             );
             kfree((*wal).list);
         }
-        (*wal).list = list;
+        (*wal).list = list.cast::<I915Wa>();
     }
     while start < end {
         let mid = start + (end - start) / 2;
@@ -139,7 +162,7 @@ unsafe fn _wa_add(wal: *mut I915WaList, wa: *const I915Wa) {
             end = mid;
         } else {
             if (item.clr | (*wa).clr) != 0 && ((*wa).clr & !item.clr) == 0 {
-                drm_err(
+                drm_err!(
                     i915,
                     "Discarding overwritten w/a for reg {:04x} (clear: {:08x}, set: {:08x})\n",
                     current,
@@ -245,11 +268,11 @@ unsafe fn wa_mcr_masked_dis(wal: *mut I915WaList, reg: I915McrReg, val: u32) {
 }
 // upstream: intel_workarounds.c wa_masked_field_set()
 unsafe fn wa_masked_field_set(wal: *mut I915WaList, reg: I915Reg, mask: u32, val: u32) {
-    wa_add(wal, reg, 0, REG_MASKED_FIELD(mask, val), mask, true);
+    wa_add(wal, reg, 0, REG_MASKED_FIELD!(mask, val), mask, true);
 }
 // upstream: intel_workarounds.c wa_mcr_masked_field_set()
 unsafe fn wa_mcr_masked_field_set(wal: *mut I915WaList, reg: I915McrReg, mask: u32, val: u32) {
-    wa_mcr_add(wal, reg, 0, REG_MASKED_FIELD(mask, val), mask, true);
+    wa_mcr_add(wal, reg, 0, REG_MASKED_FIELD!(mask, val), mask, true);
 }
 
 // upstream: intel_workarounds.c gen6_ctx_workarounds_init()
@@ -288,7 +311,7 @@ unsafe fn bdw_ctx_workarounds_init(engine: *mut IntelEngineCs, wal: *mut I915WaL
     wa_mcr_masked_en(wal, GEN8_ROW_CHICKEN, STALL_DOP_GATING_DISABLE);
     wa_mcr_masked_en(wal, GEN8_ROW_CHICKEN2, DOP_CLOCK_GATING_DISABLE);
     wa_mcr_masked_en(wal, GEN8_HALF_SLICE_CHICKEN3, GEN8_SAMPLER_POWER_BYPASS_DIS);
-    let disable_slm = if INTEL_INFO((*engine).i915).gt == 3 {
+    let disable_slm = if (*INTEL_INFO((*engine).i915)).gt == 3 {
         HDC_FENCE_DEST_SLM_DISABLE
     } else {
         0
@@ -366,8 +389,8 @@ unsafe fn skl_tune_iz_hashing(engine: *mut IntelEngineCs, wal: *mut I915WaList) 
         if !is_power_of_2(eu) {
             continue;
         }
-        let ss = ffs(eu) - 1;
-        vals[i] = 3 - ss;
+        let ss = ffs(eu as u32) - 1;
+        vals[i] = (3 - ss) as u8;
     }
     if vals == [0, 0, 0] {
         return;
@@ -376,7 +399,7 @@ unsafe fn skl_tune_iz_hashing(engine: *mut IntelEngineCs, wal: *mut I915WaList) 
         wal,
         GEN7_GT_MODE,
         GEN9_IZ_HASHING_MASK(2) | GEN9_IZ_HASHING_MASK(1) | GEN9_IZ_HASHING_MASK(0),
-        GEN9_IZ_HASHING(2, vals[2]) | GEN9_IZ_HASHING(1, vals[1]) | GEN9_IZ_HASHING(0, vals[0]),
+        GEN9_IZ_HASHING(2, vals[2] as u32) | GEN9_IZ_HASHING(1, vals[1] as u32) | GEN9_IZ_HASHING(0, vals[0] as u32),
     );
 }
 // upstream: intel_workarounds.c skl_ctx_workarounds_init()
@@ -568,13 +591,13 @@ unsafe fn fakewa_disable_nestedbb_mode(engine: *mut IntelEngineCs, wal: *mut I91
 }
 // upstream: intel_workarounds.c gen12_ctx_gt_mocs_init()
 unsafe fn gen12_ctx_gt_mocs_init(engine: *mut IntelEngineCs, wal: *mut I915WaList) {
-    if (*engine).class == COPY_ENGINE_CLASS {
+    if (*engine).class as i32 == COPY_ENGINE_CLASS {
         let mocs = (*(*engine).gt).mocs.uc_index;
         wa_write_clr_set(
             wal,
             BLIT_CCTL((*engine).mmio_base),
             BLIT_CCTL_MASK,
-            BLIT_CCTL_MOCS(mocs, mocs),
+            BLIT_CCTL_MOCS(mocs as u32, mocs as u32),
         );
     }
 }
@@ -593,11 +616,11 @@ unsafe fn __intel_engine_init_ctx_wa(
     name: *const i8,
 ) {
     let i915 = (*engine).i915;
-    wa_init_start(wal, (*engine).gt, name, (*engine).name);
+    wa_init_start(wal, (*engine).gt, name, (*engine).name.as_ptr());
     if GRAPHICS_VER(i915) >= 12 {
         gen12_ctx_gt_fake_wa_init(engine, wal);
     }
-    if (*engine).class != RENDER_CLASS {
+    if (*engine).class as i32 != RENDER_CLASS {
         wa_init_finish(wal);
         return;
     }
@@ -646,13 +669,13 @@ unsafe fn intel_engine_emit_ctx_wa(rq: *mut I915Request) -> i32 {
     if wal.count == 0 {
         return 0;
     }
-    let mut ret = ((*(*rq).engine).emit_flush)(rq, EMIT_BARRIER);
+    let mut ret = ((*(*rq).engine).emit_flush.unwrap())(rq, EMIT_BARRIER);
     if ret != 0 {
         return ret;
     }
     let mesh = (IS_GFX_GT_IP_RANGE((*(*rq).engine).gt, IP_VER(12, 70), IP_VER(12, 74))
         || IS_DG2((*rq).i915))
-        && (*(*rq).engine).class == RENDER_CLASS;
+        && (*(*rq).engine).class as i32 == RENDER_CLASS;
     let mut cs = intel_ring_begin(rq, wal.count * 2 + if mesh { 6 } else { 2 });
     if IS_ERR(cs) {
         return PTR_ERR(cs);
@@ -699,7 +722,7 @@ unsafe fn intel_engine_emit_ctx_wa(rq: *mut I915Request) -> i32 {
     spin_unlock(&mut (*uncore).lock);
     intel_gt_mcr_unlock(wal.gt, flags);
     intel_ring_advance(rq, cs);
-    ret = ((*(*rq).engine).emit_flush)(rq, EMIT_BARRIER);
+    ret = ((*(*rq).engine).emit_flush.unwrap())(rq, EMIT_BARRIER);
     if ret != 0 {
         return ret;
     }
@@ -755,12 +778,12 @@ unsafe fn hsw_gt_workarounds_init(_gt: *mut IntelGt, wal: *mut I915WaList) {
 unsafe fn gen9_wa_init_mcr(i915: *mut DrmI915Private, wal: *mut I915WaList) {
     let sseu = &(*to_gt(i915)).info.sseu;
     GEM_BUG_ON!(GRAPHICS_VER(i915) != 9);
-    let slice = ffs(sseu.slice_mask) - 1;
-    GEM_BUG_ON!(slice >= ARRAY_SIZE(sseu.subslice_mask.hsw));
-    let subslices = intel_sseu_get_hsw_subslices(sseu, slice);
+    let slice = ffs(sseu.slice_mask as u32) - 1;
+    GEM_BUG_ON!(slice as usize >= ARRAY_SIZE(sseu.subslice_mask.hsw));
+    let subslices = intel_sseu_get_hsw_subslices(sseu, slice as u8);
     GEM_BUG_ON!(subslices == 0);
     let subslice = ffs(subslices) - 1;
-    let mcr = GEN8_MCR_SLICE(slice) | GEN8_MCR_SUBSLICE(subslice);
+    let mcr = GEN8_MCR_SLICE(slice as u32) | GEN8_MCR_SUBSLICE(subslice as u32);
     let mcr_mask = GEN8_MCR_SLICE_MASK | GEN8_MCR_SUBSLICE_MASK;
     drm_dbg!(
         i915,
@@ -851,8 +874,8 @@ unsafe fn debug_dump_steering(gt: *mut IntelGt) {
 unsafe fn __add_mcr_wa(gt: *mut IntelGt, wal: *mut I915WaList, slice: u32, subslice: u32) {
     let i915 = (*gt).i915;
     __set_mcr_steering(wal, GEN8_MCR_SELECTOR, slice, subslice);
-    (*gt).default_steering.groupid = slice;
-    (*gt).default_steering.instanceid = subslice;
+    (*gt).default_steering.groupid = slice as u8;
+    (*gt).default_steering.instanceid = subslice as u8;
     debug_dump_steering(gt);
 }
 // upstream: intel_workarounds.c icl_wa_init_mcr()
@@ -860,17 +883,17 @@ unsafe fn icl_wa_init_mcr(gt: *mut IntelGt, wal: *mut I915WaList) {
     let sseu = &(*gt).info.sseu;
     GEM_BUG_ON!(GRAPHICS_VER((*gt).i915) < 11);
     GEM_BUG_ON!(hweight8(sseu.slice_mask) > 1);
-    let subslice = __ffs(intel_sseu_get_hsw_subslices(sseu, 0));
+    let subslice = __ffs(intel_sseu_get_hsw_subslices(sseu, 0u8));
     if ((*gt).info.l3bank_mask & BIT!(subslice)) != 0 {
         (*gt).steering_table[L3BANK] = core::ptr::null_mut();
     }
-    __add_mcr_wa(gt, wal, 0, subslice);
+    __add_mcr_wa(gt, wal, 0, subslice as u32);
 }
 // upstream: intel_workarounds.c xehp_init_mcr()
 unsafe fn xehp_init_mcr(gt: *mut IntelGt, wal: *mut I915WaList) {
     let sseu = &(*gt).info.sseu;
-    let mut lncf_mask = 0u32;
-    let mut slice_mask = intel_slicemask_from_xehp_dssmask(sseu.subslice_mask, GEN_DSS_PER_GSLICE);
+    let mut lncf_mask = 0u64;
+    let mut slice_mask = intel_slicemask_from_xehp_dssmask(sseu.subslice_mask, GEN_DSS_PER_GSLICE as i32) as u64;
     for i in for_each_set_bit((*gt).info.mslice_mask, GEN12_MAX_MSLICES) {
         lncf_mask |= 3 << (i * 2);
     }
@@ -882,9 +905,9 @@ unsafe fn xehp_init_mcr(gt: *mut IntelGt, wal: *mut I915WaList) {
         slice_mask &= (*gt).info.mslice_mask;
         (*gt).steering_table[MSLICE] = core::ptr::null_mut();
     }
-    let slice = __ffs(slice_mask);
+    let slice = __ffs(slice_mask) as u32;
     let subslice =
-        intel_sseu_find_first_xehp_dss(sseu, GEN_DSS_PER_GSLICE, slice) % GEN_DSS_PER_GSLICE;
+        intel_sseu_find_first_xehp_dss(sseu, GEN_DSS_PER_GSLICE as i32, slice as i32) as u32 % GEN_DSS_PER_GSLICE;
     __add_mcr_wa(gt, wal, slice, subslice);
     __set_mcr_steering(wal, MCFG_MCR_SELECTOR, 0, 2);
     __set_mcr_steering(wal, SF_MCR_SELECTOR, 0, 2);
@@ -936,7 +959,7 @@ unsafe fn icl_gt_workarounds_init(gt: *mut IntelGt, wal: *mut I915WaList) {
 // upstream: intel_workarounds.c wa_14011060649()
 unsafe fn wa_14011060649(gt: *mut IntelGt, wal: *mut I915WaList) {
     for engine in for_each_engine(gt) {
-        if engine.class != VIDEO_DECODE_CLASS || engine.instance % 2 != 0 {
+        if engine.class as i32 != VIDEO_DECODE_CLASS || engine.instance % 2 != 0 {
             continue;
         }
         wa_write_or(wal, VDBOX_CGCTL3F10(engine.mmio_base), IECPUNIT_CLKGATE_DIS);
@@ -1010,7 +1033,7 @@ unsafe fn xelpg_gt_workarounds_init(gt: *mut IntelGt, wal: *mut I915WaList) {
 // upstream: intel_workarounds.c wa_16021867713()
 unsafe fn wa_16021867713(gt: *mut IntelGt, wal: *mut I915WaList) {
     for engine in for_each_engine(gt) {
-        if engine.class == VIDEO_DECODE_CLASS {
+        if engine.class as i32 == VIDEO_DECODE_CLASS {
             wa_write_or(wal, VDBOX_CGCTL3F1C(engine.mmio_base), MFXPIPE_CLKGATE_DIS);
         }
     }
@@ -1241,7 +1264,7 @@ unsafe fn gen9_whitelist_build(w: *mut I915WaList) {
 // upstream: intel_workarounds.c skl_whitelist_build()
 unsafe fn skl_whitelist_build(engine: *mut IntelEngineCs) {
     let w = &mut (*engine).whitelist;
-    if (*engine).class != RENDER_CLASS {
+    if (*engine).class as i32 != RENDER_CLASS {
         return;
     }
     gen9_whitelist_build(w);
@@ -1249,14 +1272,14 @@ unsafe fn skl_whitelist_build(engine: *mut IntelEngineCs) {
 }
 // upstream: intel_workarounds.c bxt_whitelist_build()
 unsafe fn bxt_whitelist_build(engine: *mut IntelEngineCs) {
-    if (*engine).class == RENDER_CLASS {
+    if (*engine).class as i32 == RENDER_CLASS {
         gen9_whitelist_build(&mut (*engine).whitelist);
     }
 }
 // upstream: intel_workarounds.c kbl_whitelist_build()
 unsafe fn kbl_whitelist_build(engine: *mut IntelEngineCs) {
     let w = &mut (*engine).whitelist;
-    if (*engine).class != RENDER_CLASS {
+    if (*engine).class as i32 != RENDER_CLASS {
         return;
     }
     gen9_whitelist_build(w);
@@ -1265,7 +1288,7 @@ unsafe fn kbl_whitelist_build(engine: *mut IntelEngineCs) {
 // upstream: intel_workarounds.c glk_whitelist_build()
 unsafe fn glk_whitelist_build(engine: *mut IntelEngineCs) {
     let w = &mut (*engine).whitelist;
-    if (*engine).class != RENDER_CLASS {
+    if (*engine).class as i32 != RENDER_CLASS {
         return;
     }
     gen9_whitelist_build(w);
@@ -1274,7 +1297,7 @@ unsafe fn glk_whitelist_build(engine: *mut IntelEngineCs) {
 // upstream: intel_workarounds.c cfl_whitelist_build()
 unsafe fn cfl_whitelist_build(engine: *mut IntelEngineCs) {
     let w = &mut (*engine).whitelist;
-    if (*engine).class != RENDER_CLASS {
+    if (*engine).class as i32 != RENDER_CLASS {
         return;
     }
     gen9_whitelist_build(w);
@@ -1287,7 +1310,7 @@ unsafe fn cfl_whitelist_build(engine: *mut IntelEngineCs) {
 // upstream: intel_workarounds.c allow_read_ctx_timestamp()
 unsafe fn allow_read_ctx_timestamp(engine: *mut IntelEngineCs) {
     let w = &mut (*engine).whitelist;
-    if (*engine).class != RENDER_CLASS {
+    if (*engine).class as i32 != RENDER_CLASS {
         whitelist_reg_ext(
             w,
             RING_CTX_TIMESTAMP((*engine).mmio_base),
@@ -1304,7 +1327,7 @@ unsafe fn cml_whitelist_build(engine: *mut IntelEngineCs) {
 unsafe fn icl_whitelist_build(engine: *mut IntelEngineCs) {
     let w = &mut (*engine).whitelist;
     allow_read_ctx_timestamp(engine);
-    if (*engine).class == RENDER_CLASS {
+    if (*engine).class as i32 == RENDER_CLASS {
         whitelist_mcr_reg(w, GEN9_HALF_SLICE_CHICKEN7);
         whitelist_mcr_reg(w, GEN10_SAMPLER_MODE);
         whitelist_reg(w, GEN9_SLICE_COMMON_ECO_CHICKEN1);
@@ -1313,7 +1336,7 @@ unsafe fn icl_whitelist_build(engine: *mut IntelEngineCs) {
             PS_INVOCATION_COUNT,
             RING_FORCE_TO_NONPRIV_ACCESS_RD | RING_FORCE_TO_NONPRIV_RANGE_4,
         );
-    } else if (*engine).class == VIDEO_DECODE_CLASS {
+    } else if (*engine).class as i32 == VIDEO_DECODE_CLASS {
         whitelist_reg_ext(
             w,
             _MMIO(0x2000 + (*engine).mmio_base),
@@ -1336,7 +1359,7 @@ unsafe fn icl_whitelist_build(engine: *mut IntelEngineCs) {
 unsafe fn tgl_whitelist_build(engine: *mut IntelEngineCs) {
     let w = &mut (*engine).whitelist;
     allow_read_ctx_timestamp(engine);
-    if (*engine).class == RENDER_CLASS {
+    if (*engine).class as i32 == RENDER_CLASS {
         whitelist_reg_ext(
             w,
             PS_INVOCATION_COUNT,
@@ -1350,7 +1373,7 @@ unsafe fn tgl_whitelist_build(engine: *mut IntelEngineCs) {
 // upstream: intel_workarounds.c dg2_whitelist_build()
 unsafe fn dg2_whitelist_build(engine: *mut IntelEngineCs) {
     let w = &mut (*engine).whitelist;
-    if (*engine).class == RENDER_CLASS {
+    if (*engine).class as i32 == RENDER_CLASS {
         whitelist_mcr_reg(w, XEHP_COMMON_SLICE_CHICKEN3);
         whitelist_reg(w, GEN7_COMMON_SLICE_CHICKEN1);
     }
@@ -1363,7 +1386,7 @@ unsafe fn xelpg_whitelist_build(engine: *mut IntelEngineCs) {
 pub(crate) unsafe fn intel_engine_init_whitelist(engine: *mut IntelEngineCs) {
     let i915 = (*engine).i915;
     let w = &mut (*engine).whitelist;
-    wa_init_start(w, (*engine).gt, c"whitelist".as_ptr(), (*engine).name);
+    wa_init_start(w, (*engine).gt, c"whitelist".as_ptr(), (*engine).name.as_ptr());
     if (*(*engine).gt).type_ == GT_MEDIA { /* none yet */
     } else if IS_GFX_GT_IP_RANGE((*engine).gt, IP_VER(12, 70), IP_VER(12, 74)) {
         xelpg_whitelist_build(engine);
@@ -1417,7 +1440,7 @@ unsafe fn engine_fake_wa_init(engine: *mut IntelEngineCs, wal: *mut I915WaList) 
     if GRAPHICS_VER((*engine).i915) >= 12 {
         let mut mocs_w = (*(*engine).gt).mocs.uc_index;
         let mut mocs_r = mocs_w;
-        if HAS_L3_CCS_READ((*engine).i915) && (*engine).class == COMPUTE_CLASS {
+        if HAS_L3_CCS_READ((*engine).i915) && (*engine).class as i32 == COMPUTE_CLASS {
             mocs_r = (*(*engine).gt).mocs.wb_index;
             drm_WARN_ON!((*engine).i915, mocs_r == 0);
         }
@@ -1425,7 +1448,7 @@ unsafe fn engine_fake_wa_init(engine: *mut IntelEngineCs, wal: *mut I915WaList) 
             wal,
             RING_CMD_CCTL((*engine).mmio_base),
             CMD_CCTL_MOCS_MASK,
-            CMD_CCTL_MOCS_OVERRIDE(mocs_w, mocs_r),
+            CMD_CCTL_MOCS_OVERRIDE(mocs_w as u32, mocs_r as u32),
         );
     }
 }
@@ -1605,7 +1628,7 @@ unsafe fn rcs_engine_wa_init(engine: *mut IntelEngineCs, wal: *mut I915WaList) {
             GEN7_FF_SCHED_MASK,
             GEN7_FF_TS_SCHED_HW | GEN7_FF_VS_SCHED_HW | GEN7_FF_DS_SCHED_HW,
         );
-        if INTEL_INFO(i915).gt == 1 {
+        if (*INTEL_INFO(i915)).gt == 1 {
             wa_masked_en(
                 wal,
                 GEN7_HALF_SLICE_CHICKEN1,
@@ -1667,13 +1690,39 @@ unsafe fn rcs_engine_wa_init(engine: *mut IntelEngineCs, wal: *mut I915WaList) {
     }
 }
 
+// Source helpers from intel_gt.h and intel_gt_ccs_mode.c, kept in this
+// source-order unit to avoid a placeholder layer.
+unsafe fn needs_fastcolor_blt_wabb(engine: *mut IntelEngineCs) -> bool {
+    IS_GFX_GT_IP_RANGE((*engine).gt, IP_VER(12, 55), IP_VER(12, 71))
+        && (*engine).class as i32 == COPY_ENGINE_CLASS
+        && (*engine).instance == 0
+}
+
+unsafe fn intel_gt_apply_ccs_mode(gt: *mut IntelGt) -> u32 {
+    if !IS_DG2((*gt).i915) {
+        return 0;
+    }
+
+    let first_ccs = __ffs(CCS_MASK(gt)) as u32;
+    let mut mode = 0u32;
+    for cslice in 0..I915_MAX_CCS {
+        let target = if (*gt).ccs.cslices & BIT!(cslice) != 0 {
+            first_ccs
+        } else {
+            XEHP_CCS_MODE_CSLICE_MASK
+        };
+        mode |= XEHP_CCS_MODE_CSLICE(cslice as u32, target);
+    }
+    mode
+}
+
 // upstream: intel_workarounds.c xcs_engine_wa_init()
 unsafe fn xcs_engine_wa_init(engine: *mut IntelEngineCs, wal: *mut I915WaList) {
     let i915 = (*engine).i915;
     if IS_KABYLAKE(i915) && IS_GRAPHICS_STEP(i915, STEP_A0, STEP_F0) {
         wa_write(wal, RING_SEMA_WAIT_POLL((*engine).mmio_base), 1);
     }
-    if NEEDS_FASTCOLOR_BLT_WABB(engine) {
+    if needs_fastcolor_blt_wabb(engine) {
         wa_masked_field_set(
             wal,
             ECOSKPD((*engine).mmio_base),
@@ -1691,7 +1740,7 @@ unsafe fn add_render_compute_tuning_settings(gt: *mut IntelGt, wal: *mut I915WaL
     if IS_GFX_GT_IP_RANGE(gt, IP_VER(12, 70), IP_VER(12, 74)) || IS_DG2(i915) {
         wa_mcr_write_clr_set(wal, RT_CTRL, STACKID_CTRL, STACKID_CTRL_512);
     }
-    if INTEL_INFO(i915).tuning_thread_rr_after_dep {
+    if tuning_thread_rr_after_dep(i915) {
         wa_mcr_masked_field_set(
             wal,
             GEN9_ROW_CHICKEN4,
@@ -1785,9 +1834,9 @@ unsafe fn engine_init_workarounds(engine: *mut IntelEngineCs, wal: *mut I915WaLi
         general_render_compute_wa_init(engine, wal);
         ccs_engine_wa_mode(engine, wal);
     }
-    if (*engine).class == COMPUTE_CLASS {
+    if (*engine).class as i32 == COMPUTE_CLASS {
         ccs_engine_wa_init(engine, wal);
-    } else if (*engine).class == RENDER_CLASS {
+    } else if (*engine).class as i32 == RENDER_CLASS {
         rcs_engine_wa_init(engine, wal);
     } else {
         xcs_engine_wa_init(engine, wal);
@@ -1796,7 +1845,7 @@ unsafe fn engine_init_workarounds(engine: *mut IntelEngineCs, wal: *mut I915WaLi
 // upstream: intel_workarounds.c intel_engine_init_workarounds()
 pub(crate) unsafe fn intel_engine_init_workarounds(engine: *mut IntelEngineCs) {
     let wal = &mut (*engine).wa_list;
-    wa_init_start(wal, (*engine).gt, c"engine".as_ptr(), (*engine).name);
+    wa_init_start(wal, (*engine).gt, c"engine".as_ptr(), (*engine).name.as_ptr());
     engine_init_workarounds(engine, wal);
     wa_init_finish(wal);
 }
@@ -1966,14 +2015,15 @@ unsafe fn engine_wa_list_verify(
     }
     let engine = (*ce).engine;
     let vma = __vm_create_scratch_for_read(
-        &mut (*(*engine).gt).ggtt.vm,
-        (*wal).count * core::mem::size_of::<u32>(),
+        &mut (*(*(*engine).gt).ggtt).vm,
+        (*wal).count as u64 * core::mem::size_of::<u32>() as u64,
     );
     if IS_ERR(vma) {
         return PTR_ERR(vma);
     }
     intel_engine_pm_get(engine);
-    let mut ww = I915GemWwCtx::new(false);
+    let mut ww: I915GemWwCtx = core::mem::zeroed();
+    i915_gem_ww_ctx_init(&mut ww, false);
     let mut err;
     'retry: loop {
         err = i915_gem_object_lock((*vma).obj, &mut ww);
@@ -2005,7 +2055,7 @@ unsafe fn engine_wa_list_verify(
             intel_context_unpin(ce);
             break;
         }
-        err = i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
+        err = i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE as u32);
         if err == 0 {
             err = wa_list_srm(rq, wal, vma);
         }
@@ -2014,7 +2064,7 @@ unsafe fn engine_wa_list_verify(
             i915_request_set_error_once(rq, err);
         }
         i915_request_add(rq);
-        if err == 0 && i915_request_wait(rq, 0, HZ / 5) < 0 {
+        if err == 0 && i915_request_wait(rq, 0, (HZ / 5) as i64) < 0 {
             err = -ETIME;
         }
         if err == 0 {
@@ -2025,7 +2075,7 @@ unsafe fn engine_wa_list_verify(
                 for i in 0..(*wal).count {
                     let wa = &*(*wal).list.add(i as usize);
                     if !mcr_range((*rq).i915, i915_mmio_reg_offset(wa.reg()))
-                        && !wa_verify((*wal).gt, wa, *results.add(i as usize), (*wal).name, from)
+                        && !wa_verify((*wal).gt, wa, *results.cast::<u32>().add(i as usize), (*wal).name, from)
                     {
                         err = -ENXIO;
                     }
