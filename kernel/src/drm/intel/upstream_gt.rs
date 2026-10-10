@@ -19,7 +19,7 @@ use alloc::boxed::Box;
 use core::{
     ffi::{c_char, c_int, c_void},
     ptr,
-    sync::atomic::{AtomicPtr, Ordering},
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
 use intel_gt::linux_platform::{I915PlatformOps, install_i915_platform_ops};
@@ -32,6 +32,7 @@ use super::pci::{ConfigSpace, ConfigWriteSpace};
 const EIO: c_int = 5;
 const EINVAL: c_int = 22;
 const EOPNOTSUPP: c_int = 95;
+const ENODEV: c_int = 19;
 
 /// PCI STATUS register (word at 0x06). Its bits are write-one-to-clear, so a
 /// byte or word read-modify-write of the adjacent COMMAND word must never
@@ -50,8 +51,14 @@ pub(super) struct NativePciDevice {
 /// GT-capable device on the supported platforms, so this runs once at probe.
 #[allow(dead_code)] // called by the probe owner when it constructs the i915 layout
 pub(super) fn native_pci_device(bdf: pci::Bdf) -> *mut c_void {
+    *GT_PCI_IDENTITY.lock() = Some(bdf);
     Box::into_raw(Box::new(NativePciDevice { bdf })).cast()
 }
+
+/// The single GT-capable PCI function the probe owner created. The PCI
+/// revision reader reads its configuration space; TheKernel supports one GT
+/// device per boot, so there is no per-device lookup.
+static GT_PCI_IDENTITY: spin::Mutex<Option<pci::Bdf>> = spin::Mutex::new(None);
 
 fn bdf_of(device: *mut c_void) -> Option<pci::Bdf> {
     if device.is_null() {
@@ -294,7 +301,100 @@ unsafe extern "C" fn kernel_map_tlb_sync() {
 pub(super) fn install_providers() -> Result<(), &'static str> {
     install_i915_platform_ops(&PLATFORM_OPS)?;
     axmm::install_kernel_map_tlb_sync(kernel_map_tlb_sync)
-        .map_err(|_| "kernel-map TLB synchronizer already installed with another owner")
+        .map_err(|_| "kernel-map TLB synchronizer already installed with another owner")?;
+    intel_gt::linux_pm::install_runtime_pm_ops(&RUNTIME_PM_OPS)?;
+    intel_gt::linux::signal::install_signal_pending_state(kernel_signal_pending_state)?;
+    let reader: intel_gt::linux::i915::I915PciRevisionReader =
+        // SAFETY: both types are `unsafe extern "C" fn` pointers of identical
+        // ABI; the reader ignores its `i915` argument (single GT device).
+        unsafe { core::mem::transmute(kernel_pci_revision as unsafe extern "C" fn(*mut c_void, *mut u8) -> i32) };
+    intel_gt::linux::i915::install_pci_revision_reader(Some(reader));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Task signal state (`linux/signal.rs`)
+// ---------------------------------------------------------------------------
+
+const TASK_INTERRUPTIBLE: c_int = 0x0001;
+const TASK_WAKEKILL: c_int = 0x0100;
+
+/// Linux `signal_pending_state()`: an interruptible sleep is interrupted by any
+/// deliverable signal; a `TASK_WAKEKILL` sleep only by a fatal one. Only the
+/// calling task can be asked (upstream waits never name another task), so any
+/// other pointer fails closed.
+unsafe extern "C" fn kernel_signal_pending_state(state: c_int, task: *mut c_void) -> bool {
+    use crate::task::AsThread;
+
+    if state & (TASK_INTERRUPTIBLE | TASK_WAKEKILL) == 0 {
+        return false;
+    }
+    let current = axtask::current();
+    assert!(
+        ptr::eq(alloc::sync::Arc::as_ptr(&current.clone()).cast::<c_void>(), task.cast_const()),
+        "signal_pending_state: upstream GT may only query the current task"
+    );
+    // A kernel thread has no signal state, so nothing can be pending on it.
+    let Some(thread) = current.try_as_thread() else {
+        return false;
+    };
+    if !crate::task::has_pending_syscall_signal(thread) {
+        return false;
+    }
+    state & TASK_INTERRUPTIBLE != 0 || crate::task::has_pending_fatal_signal(thread)
+}
+
+// ---------------------------------------------------------------------------
+// Runtime PM (`linux/pm.rs`)
+// ---------------------------------------------------------------------------
+
+/// Outstanding runtime-PM references on the GT device. TheKernel never
+/// runtime-suspends the GPU, so a reference only has to pair with its put;
+/// the device stays powered for as long as any reference exists and always.
+static RUNTIME_PM_DEPTH: AtomicUsize = AtomicUsize::new(0);
+/// Opaque, non-null wakeref cookie. Linux only hands it back to the put.
+static RUNTIME_PM_COOKIE: u8 = 0;
+
+unsafe fn kernel_runtime_get(rpm: *mut c_void) -> intel_gt::intel_context_upstream::IntelWakerefHandle {
+    assert!(!rpm.is_null(), "runtime PM get on a null device");
+    RUNTIME_PM_DEPTH.fetch_add(1, Ordering::AcqRel);
+    ptr::addr_of!(RUNTIME_PM_COOKIE).cast_mut().cast()
+}
+
+unsafe fn kernel_runtime_put(
+    rpm: *mut c_void,
+    wakeref: intel_gt::intel_context_upstream::IntelWakerefHandle,
+) {
+    assert!(!rpm.is_null() && !wakeref.is_null(), "runtime PM put with a null handle");
+    RUNTIME_PM_DEPTH
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| depth.checked_sub(1))
+        .unwrap_or_else(|_| panic!("runtime PM put without a matching get"));
+}
+
+static RUNTIME_PM_OPS: intel_gt::linux_pm::RuntimePmOps = intel_gt::linux_pm::RuntimePmOps {
+    runtime_get: kernel_runtime_get,
+    runtime_put: kernel_runtime_put,
+};
+
+// ---------------------------------------------------------------------------
+// PCI revision (`linux/i915.rs`)
+// ---------------------------------------------------------------------------
+
+/// PCI config-space REVISION_ID (byte 0x08 of the class/revision dword).
+const PCI_REVISION_ID: u16 = 0x08;
+
+/// Linux `INTEL_REVID` source: the revision byte of the GT's own PCI function.
+unsafe extern "C" fn kernel_pci_revision(_i915: *mut c_void, revision: *mut u8) -> c_int {
+    assert!(!revision.is_null(), "PCI revision read into a null buffer");
+    let Some(bdf) = *GT_PCI_IDENTITY.lock() else {
+        return -ENODEV;
+    };
+    let Some(dword) = config_read_u32(bdf, PCI_REVISION_ID & !0x3) else {
+        return -ENODEV;
+    };
+    let shift = u32::from(PCI_REVISION_ID & 0x3) * 8;
+    unsafe { *revision = (dword >> shift) as u8 };
+    0
 }
 
 // ---------------------------------------------------------------------------
