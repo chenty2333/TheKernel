@@ -19,6 +19,9 @@ use x86_64::instructions::port::Port;
 
 use self::vectors::*;
 
+#[cfg(feature = "irq")]
+mod ipi;
+
 pub(super) mod vectors {
     /// First vector reserved for local-APIC-only uses. PMU overflow uses
     /// delivery-mode NMI (architectural vector 2), not this vector field.
@@ -781,40 +784,25 @@ mod irq_impl {
                 // device is exactly what they came to look for.
                 ratelimit::warn_ratelimited!("Unhandled IRQ {vector}");
             }
-            unsafe { super::local_apic().end_of_interrupt() };
+            super::ipi::end_of_interrupt();
             Some(vector)
         }
 
         /// Sends an inter-processor interrupt (IPI) to the specified target CPU or all CPUs.
         fn send_ipi(irq_num: usize, target: IpiTarget) {
-            match target {
-                IpiTarget::Current { cpu_id: _ } => {
-                    unsafe {
-                        super::local_apic().send_ipi_self(irq_num as _);
-                    };
-                }
+            use super::ipi::Destination;
+            let vector = u8::try_from(irq_num).expect("IPI vector exceeds architectural range");
+            let destination = match target {
+                IpiTarget::Current { .. } => Destination::Current,
                 IpiTarget::Other { cpu_id } => {
                     let apic_id = crate::cpu::apic_id_for_logical(cpu_id).unwrap_or_else(|| {
                         panic!("logical CPU {cpu_id} has no APIC identity in the MADT topology")
                     });
-                    let apic_destination = super::raw_apic_id(apic_id).unwrap_or_else(|| {
-                        panic!("logical CPU {cpu_id} APIC ID {apic_id:#x} cannot be addressed")
-                    });
-                    unsafe {
-                        super::local_apic().send_ipi(irq_num as _, apic_destination);
-                    };
+                    Destination::Apic(apic_id)
                 }
-                IpiTarget::AllExceptCurrent {
-                    cpu_id: _,
-                    cpu_num: _,
-                } => {
-                    use x2apic::lapic::IpiAllShorthand;
-                    unsafe {
-                        super::local_apic()
-                            .send_ipi_all(irq_num as _, IpiAllShorthand::AllExcludingSelf);
-                    };
-                }
-            }
+                IpiTarget::AllExceptCurrent { .. } => Destination::Others,
+            };
+            super::ipi::send(vector, destination);
         }
     }
 }
