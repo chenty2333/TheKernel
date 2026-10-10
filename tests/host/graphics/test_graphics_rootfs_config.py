@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import shlex
+import shutil
 import socket
 import tempfile
 from tests.support import test_tmpdir
@@ -448,16 +449,39 @@ sleep() { echo wait; }
         rootfs_wrapper = (ROOT / "scripts/build-graphics-rootfs.sh").read_text()
 
         self.assertTrue(header.is_file())
-        self.assertIn("#include <drm/drm.h>", client)
-        self.assertIn("#include <drm/i915_drm.h>", client)
+        self.assertIn("#include <drm.h>", client)
+        self.assertIn("#include <i915_drm.h>", client)
         self.assertIn('#include "intel-rcs-page.h"', client)
         self.assertIn('"$source_dir/tests/guest/tools/intel-bcs-smoke.c"', builder)
         self.assertIn('"$target/usr/local/bin/intel-bcs-smoke"', builder)
+        self.assertIn('-I"$STAGING_DIR/usr/include/libdrm"', builder)
+        shell_builder = (ROOT / "scripts/build-rootfs.sh").read_text()
+        self.assertIn('pkg-config --cflags libdrm', shell_builder)
+        self.assertIn('"${tool_cflags[@]}" "$source"', shell_builder)
         self.assertIn('printf \'%s\\n\' intel-bcs-smoke', rootfs_wrapper)
         self.assertIn('"$REPO_ROOT/tests/guest/tools/intel-bcs-smoke.c"', rootfs_wrapper)
         self.assertIn('"$REPO_ROOT/tests/guest/tools/intel-rcs-page.h"', rootfs_wrapper)
         self.assertIn('[ -x "$target/usr/local/bin/intel-bcs-smoke" ]', rootfs_wrapper)
         self.assertFalse((ROOT / "tests/guest/graphics/intel-bcs-smoke.c").exists())
+
+    def test_intel_bcs_client_compiles_against_libdrm(self) -> None:
+        if not shutil.which("pkg-config") or subprocess.run(
+                ["pkg-config", "--exists", "libdrm"], check=False).returncode:
+            if os.environ.get("THEKERNEL_DEV_CONTAINER") == "1":
+                self.fail("the development image must provide libdrm headers")
+            self.skipTest("libdrm development headers are not installed")
+        flags = shlex.split(subprocess.check_output(
+            ["pkg-config", "--cflags", "libdrm"], text=True))
+        with test_tmpdir() as directory:
+            client = pathlib.Path(directory) / "intel-bcs-smoke"
+            subprocess.run(["gcc", "-O2", "-static", "-std=c11", "-Wall",
+                            "-Wextra", "-Werror", *flags,
+                            str(ROOT / "tests/guest/tools/intel-bcs-smoke.c"),
+                            "-o", str(client)], check=True, capture_output=True)
+            # No DRM node or explicit execute mode: only exercise its inert usage path.
+            result = subprocess.run([str(client)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("usage: intel-bcs-smoke", result.stderr)
 
     def test_n305_graphics_builder_reuses_base_and_optional_iris_guest_check(self) -> None:
         builder = (ROOT / "scripts/build-n305-graphics-rootfs.sh").read_text()

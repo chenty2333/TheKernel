@@ -344,12 +344,18 @@ esac
     "$REPO_ROOT/tests/guest/system-init.c" \
     -o "$STAGE/sbin/init"
 
+drm_cflags=$(pkg-config --cflags libdrm)
+read -r -a drm_include_flags <<< "$drm_cflags"
 for source in "$REPO_ROOT"/tests/guest/tools/*.c; do
     [ -f "$source" ] || continue
     name=${source##*/}
     name=${name%.c}
+    tool_cflags=()
+    if [ "$name" = intel-bcs-smoke ]; then
+        tool_cflags=("${drm_include_flags[@]}")
+    fi
     "${CROSS_COMPILE}gcc" -O2 -static -s -std=c11 -Wall -Wextra -Werror \
-        -pthread "$source" \
+        -pthread "${tool_cflags[@]}" "$source" \
         -o "$STAGE/opt/thekernel-tests/bin/thekernel-$name"
 done
 

@@ -108,6 +108,7 @@ RUN sed -i \
       iproute2 \
       less \
       libclang-dev \
+      libdrm-dev \
       libelf-dev \
       libegl1 \
       libegl-mesa0 \

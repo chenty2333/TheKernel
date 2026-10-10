@@ -11,7 +11,7 @@ expect_cmd() {
 QEMU_EXPECTED_VERSION="${THEKERNEL_QEMU_VERSION:-10.2.2}"
 for cmd in \
     bc bison flex cpio patch \
-    python3 \
+    python3 pkg-config \
     ip unshare \
     qemu-system-x86_64 \
     mke2fs debugfs fakeroot truncate mkfs.vfat mkimage \
@@ -20,6 +20,8 @@ for cmd in \
 do
     expect_cmd "$cmd"
 done
+
+pkg-config --exists libdrm
 
 # Building the pinned Linux ABI oracles also requires ELF development
 # headers for objtool; command checks alone cannot detect that package.

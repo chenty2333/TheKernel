@@ -50,6 +50,7 @@ done
 # Build that same canonical source into the graphics image's established path;
 # it remains inert unless the user passes an explicit execute mode and DRM node.
 "$compiler" -O2 -std=c11 -Wall -Wextra -Werror \
+    -I"$STAGING_DIR/usr/include/libdrm" \
     "$source_dir/tests/guest/tools/intel-bcs-smoke.c" \
     -o "$target/usr/local/bin/intel-bcs-smoke"
 installed="$installed $target/usr/local/bin/intel-bcs-smoke"
