@@ -2,6 +2,8 @@
 name = "tk-bt-hci"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
 license = "BSD-2-Clause"
 publish.workspace = true
 
@@ -12,3 +14,6 @@ workspace = true
 aes = { version = "0.8.4", default-features = false }
 cipher = { version = "0.4.4", default-features = false }
 p256 = { version = "0.13.2", default-features = false, features = ["ecdh"] }
+
+[package.metadata.thekernel]
+layer = "mechanism"

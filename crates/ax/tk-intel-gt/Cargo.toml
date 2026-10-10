@@ -10,7 +10,11 @@ description = "N305 Gen12 BCS i915 translations with explicit execution ownershi
 repository.workspace = true
 
 [package.metadata.thekernel]
-layer = "mechanism"
+# The translated driver now consumes the allocator, HAL, memory and task runtime.
+layer = "platform"
+
+[package.metadata.thekernel.host-test]
+selected = true
 
 [lints]
 workspace = true

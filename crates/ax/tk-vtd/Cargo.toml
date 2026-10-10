@@ -2,6 +2,8 @@
 name = "tk-vtd"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
 license = "BSD-2-Clause"
 publish.workspace = true
 
@@ -10,3 +12,6 @@ workspace = true
 
 [dependencies]
 crate_interface = "0.1"
+
+[package.metadata.thekernel]
+layer = "mechanism"

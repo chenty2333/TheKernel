@@ -1,7 +1,10 @@
 [package]
 name = "tk-net80211"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
 license = "BSD-3-Clause"
 
 [lints]
