@@ -575,7 +575,7 @@ static FRAMEWORK: I915FrameworkOps = I915FrameworkOps {
     i915_params_copy: {
         // SAFETY: the table's `struct i915_params *` and this `*mut c_void` are
         // the same thin pointer; `i915_params_copy` names its own layout.
-        unsafe { core::mem::transmute(i915_params_copy as unsafe extern "C" fn(*mut c_void)) }
+        unsafe { core::mem::transmute::<unsafe extern "C" fn(*mut c_void), unsafe extern "C" fn(*mut intel_gt::linux_i915_private::I915Params)>(i915_params_copy) }
     },
     display_parent_interface: no_display_parent_interface,
     display_probe_defer: display_never_defers,
