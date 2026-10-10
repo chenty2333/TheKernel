@@ -144,6 +144,20 @@ static IRQ_WAITERS: WaitQueue = WaitQueue::new();
 #[cfg(target_os = "none")]
 static IRQ_WINDOW: Mutex<Option<RegisterWindow>> = Mutex::new(None);
 
+/// The PCI function and MSI vector that `install_n305` left live. Recorded only
+/// after the whole display-IRQ install succeeds, so a rolled-back attempt never
+/// leaves a stale vector behind.
+#[cfg(target_os = "none")]
+static DISPLAY_MSI_OWNER: Mutex<Option<(pci::Bdf, usize)>> = Mutex::new(None);
+
+/// The MSI vector already reserved for `bdf` by the display IRQ owner, if any.
+/// PCI MSI enable consumes this vector instead of programming a new one.
+#[cfg(target_os = "none")]
+pub(super) fn msi_vector_for(bdf: pci::Bdf) -> Option<usize> {
+    let owner = *DISPLAY_MSI_OWNER.lock();
+    owner.and_then(|(owner, vector)| (owner == bdf).then_some(vector))
+}
+
 /// Whether the dedicated MSI owner is live and has not faulted.
 pub(super) fn online() -> bool {
     EVENTS.online.load(Ordering::Acquire) && !EVENTS.faulted.load(Ordering::Acquire)
@@ -481,6 +495,7 @@ pub(super) fn install_n305(
             )),
         };
     }
+    *DISPLAY_MSI_OWNER.lock() = Some((bdf, vector as usize));
     Ok(())
 }
 

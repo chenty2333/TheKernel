@@ -282,6 +282,21 @@ pub fn primary_device() -> Option<Arc<DrmDevice>> {
     PRIMARY_DEVICE.lock().as_ref().map(Arc::clone)
 }
 
+/// Gives up the firmware (simpledrm) primary device so a native GPU can own the
+/// boot aperture. Returns whether a firmware device was released; a native
+/// primary device is never touched.
+#[cfg(feature = "intel-upstream-gt")]
+pub(crate) fn release_firmware_primary() -> bool {
+    let mut primary = PRIMARY_DEVICE.lock();
+    let firmware = primary
+        .as_ref()
+        .is_some_and(|device| device.adapter.driver_name() == "simpledrm");
+    if firmware {
+        *primary = None;
+    }
+    firmware
+}
+
 #[derive(Clone)]
 pub struct Scanout {
     pub backing: Arc<dyn GemBacking>,
