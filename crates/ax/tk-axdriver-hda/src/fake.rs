@@ -134,11 +134,14 @@ use core::ptr::NonNull;
 use std::{
     alloc::{Layout, alloc_zeroed, dealloc},
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use crate::{
-    Controller, Hal,
+    Controller, Hal, Playback, PlaybackConfig, PlaybackError, PlaybackToken, SampleFormat,
     desc::PERIOD,
     regs::{self, Bus},
 };
@@ -160,6 +163,25 @@ unsafe impl Hal for Host {
                 Layout::from_size_align(pages * 4096, 4096).unwrap(),
             );
         }
+    }
+}
+
+static TRACKED_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static TRACKED_RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+struct TrackedHost;
+// SAFETY: this wrapper preserves Host's unique, aligned allocation contract.
+unsafe impl Hal for TrackedHost {
+    fn allocate(pages: usize) -> Option<(u64, NonNull<u8>)> {
+        let allocation = Host::allocate(pages)?;
+        TRACKED_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        Some(allocation)
+    }
+
+    unsafe fn release(address: u64, pointer: NonNull<u8>, pages: usize) {
+        // SAFETY: the controller calls this only after a proven shutdown.
+        unsafe { Host::release(address, pointer, pages) };
+        TRACKED_RELEASES.fetch_add(1, Ordering::Relaxed);
     }
 }
 #[derive(Default)]
@@ -554,4 +576,124 @@ fn abort_stops_before_discarding_and_allows_a_fresh_stream() {
     c.prepare(4096, 4).unwrap();
     c.submit(&[0x77; PERIOD]).unwrap();
     c.abort().unwrap();
+}
+
+#[test]
+fn rdif_playback_copies_periods_retains_order_and_supports_reprepare() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let mut controller = Controller::<Host, _>::new(Fake(state.clone())).unwrap();
+    let config = PlaybackConfig {
+        sample_format: SampleFormat::S16Le,
+        sample_rate_hz: 48_000,
+        channels: 2,
+        period_frames: 1024,
+        period_count: 4,
+    };
+    assert_eq!(controller.configurations(), &[config]);
+    assert_eq!(config.period_bytes(), Some(PERIOD));
+    assert_eq!(controller.max_poll_interval_ns(), 10_000_000);
+
+    let wrong_config = PlaybackConfig {
+        sample_rate_hz: 44_100,
+        ..config
+    };
+    let writes = state.lock().unwrap().writes;
+    assert_eq!(
+        Playback::prepare(&mut controller, wrong_config),
+        Err(PlaybackError::Unsupported)
+    );
+    assert_eq!(state.lock().unwrap().writes, writes);
+    Playback::prepare(&mut controller, config).unwrap();
+
+    let mut first_pcm = alloc::vec![0x55; PERIOD];
+    let first = Playback::submit(&mut controller, &first_pcm).unwrap();
+    first_pcm.fill(0x66);
+    let second = Playback::submit(&mut controller, &[0x77; PERIOD]).unwrap();
+    {
+        let observed = state.lock().unwrap();
+        let bdl = Fake::address(&observed, 0xb8);
+        // SAFETY: the fake controller only reads the driver's live DMA pages.
+        unsafe {
+            let first_desc = (bdl as *const BufferDescriptor).read();
+            let second_desc = (bdl as *const BufferDescriptor).add(1).read();
+            assert_eq!(*(first_desc.address as *const u8), 0x55);
+            assert_eq!(*(second_desc.address as *const u8), 0x77);
+        }
+    }
+
+    {
+        let mut observed = state.lock().unwrap();
+        observed.regs.insert(0xa4, (PERIOD * 2) as u32);
+        observed.now += 22_000_000;
+    }
+    assert_eq!(
+        Playback::complete(&mut controller).unwrap(),
+        Some(PlaybackToken(first.0))
+    );
+    Playback::release(&mut controller).unwrap();
+    assert_eq!(
+        Playback::complete(&mut controller).unwrap(),
+        Some(PlaybackToken(second.0)),
+        "release must preserve a completed but uncollected token"
+    );
+
+    Playback::prepare(&mut controller, config).unwrap();
+    let cancelled = Playback::submit(&mut controller, &[0x33; PERIOD]).unwrap();
+    Playback::abort(&mut controller).unwrap();
+    assert_eq!(Playback::complete(&mut controller).unwrap(), None);
+    Playback::prepare(&mut controller, config).unwrap();
+    let _fresh = Playback::submit(&mut controller, &[0x44; PERIOD]).unwrap();
+    assert_ne!(cancelled, _fresh);
+    Playback::shutdown(&mut controller).unwrap();
+    assert_eq!(state.lock().unwrap().regs[&regs::GCTL], 0);
+    assert_eq!(
+        Playback::prepare(&mut controller, config),
+        Err(PlaybackError::BadState)
+    );
+}
+
+#[test]
+fn shutdown_releases_only_buffers_with_engine_stop_proof() {
+    let allocations_before = TRACKED_ALLOCATIONS.load(Ordering::Relaxed);
+    let releases_before = TRACKED_RELEASES.load(Ordering::Relaxed);
+    let state = Arc::new(Mutex::new(State::default()));
+    let mut controller = Controller::<TrackedHost, _>::new(Fake(state.clone())).unwrap();
+    assert_eq!(
+        TRACKED_ALLOCATIONS.load(Ordering::Relaxed) - allocations_before,
+        4
+    );
+    Playback::shutdown(&mut controller).unwrap();
+    assert_eq!(TRACKED_RELEASES.load(Ordering::Relaxed), releases_before);
+    drop(controller);
+    assert_eq!(
+        TRACKED_RELEASES.load(Ordering::Relaxed) - releases_before,
+        4,
+        "the four owned DMA allocations release only after shutdown"
+    );
+
+    let allocations_before = TRACKED_ALLOCATIONS.load(Ordering::Relaxed);
+    let releases_before = TRACKED_RELEASES.load(Ordering::Relaxed);
+    let state = Arc::new(Mutex::new(State::default()));
+    let mut controller = Controller::<TrackedHost, _>::new(Fake(state.clone())).unwrap();
+    assert_eq!(
+        TRACKED_ALLOCATIONS.load(Ordering::Relaxed) - allocations_before,
+        4
+    );
+    controller.prepare(PERIOD as u32, 4).unwrap();
+    controller.submit(&[0x55; PERIOD]).unwrap();
+    state
+        .lock()
+        .unwrap()
+        .ignored_writes
+        .extend([0xa0, regs::GCTL]);
+    assert_eq!(
+        Playback::shutdown(&mut controller),
+        Err(PlaybackError::Device)
+    );
+    drop(controller);
+    assert_eq!(
+        TRACKED_RELEASES.load(Ordering::Relaxed),
+        releases_before + 2,
+        "stopped CORB/RIRB buffers release, while active stream DMA stays quarantined"
+    );
 }

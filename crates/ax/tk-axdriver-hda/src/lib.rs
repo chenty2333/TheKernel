@@ -8,8 +8,14 @@ pub mod eld;
 #[cfg(test)]
 mod fake;
 pub mod ids;
+mod rdif;
 pub mod regs;
 use core::ptr::NonNull;
+
+pub use tk_rdif_audio::{
+    DriverGeneric as AudioDriverGeneric, Playback, PlaybackConfig, PlaybackError, PlaybackToken,
+    SampleFormat,
+};
 /// Coherent page-aligned DMA contract.
 /// # Safety
 /// Allocations are contiguous in the device DMA domain and uniquely owned.

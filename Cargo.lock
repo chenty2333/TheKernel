@@ -3355,6 +3355,7 @@ dependencies = [
  "tk-i2c-hid",
  "tk-net80211",
  "tk-ratelimit",
+ "tk-rdif-audio",
  "tk-vtd",
 ]
 
@@ -3388,6 +3389,7 @@ name = "tk-axdriver-hda"
 version = "0.1.0"
 dependencies = [
  "tk-axdriver-base",
+ "tk-rdif-audio",
 ]
 
 [[package]]
@@ -4141,6 +4143,10 @@ version = "0.2.0-preview.2"
 dependencies = [
  "log",
 ]
+
+[[package]]
+name = "tk-rdif-audio"
+version = "0.1.0"
 
 [[package]]
 name = "tk-readiness-adapter"

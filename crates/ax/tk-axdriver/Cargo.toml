@@ -31,7 +31,7 @@ license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
 repository.workspace = true
 
 [features]
-intel-hda = ["bus-pci", "dep:axdriver_hda", "dep:axalloc", "dep:axhal", "dep:spin"]
+intel-hda = ["bus-pci", "dep:axdriver_hda", "dep:tk_rdif_audio", "dep:axalloc", "dep:axhal", "dep:spin"]
 nvme = ["block", "bus-pci", "dep:axdriver_nvme", "dep:axalloc", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq", "dep:tk-vtd"]
 usb-dbc = ["usb-xhci", "dep:axdriver_dbc"]
 itco = ["dep:axdriver_watchdog", "dep:kspin", "dep:axhal", "dep:axklib"]
@@ -346,6 +346,11 @@ optional = true
 [dependencies.axdriver_hda]
 package = "tk-axdriver-hda"
 path = "../tk-axdriver-hda"
+optional = true
+
+[dependencies.tk_rdif_audio]
+package = "tk-rdif-audio"
+path = "../tk-rdif-audio"
 optional = true
 
 [dependencies.axdriver_watchdog]

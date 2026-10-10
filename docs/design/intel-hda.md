@@ -18,6 +18,22 @@ sources are consulted for facts only, with no GPL implementation body ported.
 QEMU's CORB/RIRB response-count behavior was checked against
 <https://github.com/qemu/qemu/blob/master/hw/audio/intel-hda.c>.
 
+## Portable playback boundary
+
+The existing controller implements `tk-rdif-audio::Playback`, adapted from
+TGOSKits' portable PCM contract. The platform sound entry points consume that
+capability rather than bypassing it. Configuration is advertised explicitly:
+S16LE, 48 kHz, stereo, 1024-frame periods, four periods. Unsupported selections
+are rejected before hardware writes. Submission copies the caller's period;
+ordered tokens survive `release` until collected, and `prepare` cannot discard
+uncollected tokens. `abort` proves stream stop before cancellation/reuse.
+
+This remains a task-context polling capability, not an IRQ audio runtime.
+Permanent shutdown stops the stream and command rings, verifies their readbacks
+and holds global reset. Each DMA owner can be released only after its engine's
+stop is proved; uncertain engines keep their backing even on Drop. None of this
+removes the existing HDMI/ELD routes or changes ALSA/OSS userspace layouts.
+
 ## Native ALSA and retained OSS
 
 `/dev/snd/controlC0` and `/dev/snd/pcmC0D0p` now expose the native Linux

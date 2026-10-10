@@ -8,6 +8,7 @@ license = "Apache-2.0"
 publish = false
 [dependencies]
 axdriver_base = { package = "tk-axdriver-base", path = "../tk-axdriver-base" }
+tk-rdif-audio = { path = "../tk-rdif-audio" }
 [package.metadata.thekernel]
 layer = "platform"
 [package.metadata.thekernel.host-test]

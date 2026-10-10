@@ -1,4 +1,4 @@
-//! Intel HDA platform seam; generic analog codec graph, no DSP/HDMI writes.
+//! Intel HDA platform seam for codec playback and existing display-ELD routing.
 use core::ptr::NonNull;
 
 use axalloc::{UsageKind, global_allocator};
@@ -6,6 +6,7 @@ use axdriver_base::{DevError, DevResult};
 use axdriver_hda::{Controller, Hal, regs::Bus};
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use spin::Mutex;
+use tk_rdif_audio::{Playback, PlaybackError, PlaybackToken};
 
 use crate::drivers::{BusProbeResult, DriverProbe};
 pub struct PlatformHal;
@@ -126,20 +127,47 @@ fn with_device<T>(f: impl FnOnce(&mut Sound) -> DevResult<T>) -> DevResult<T> {
     f(DEVICE.lock().as_mut().ok_or(DevError::Unsupported)?)
 }
 pub fn prepare(period: u32, periods: u32) -> DevResult {
-    with_device(|d| d.prepare(period, periods))
+    with_device(|device| {
+        let config = Playback::configurations(device)
+            .iter()
+            .copied()
+            .find(|config| {
+                config
+                    .period_bytes()
+                    .and_then(|bytes| u32::try_from(bytes).ok())
+                    == Some(period)
+                    && u32::from(config.period_count) == periods
+            })
+            .ok_or(DevError::InvalidParam)?;
+        Playback::prepare(device, config).map_err(playback_error)
+    })
 }
 pub fn submit(bytes: &[u8]) -> DevResult<u16> {
-    with_device(|d| d.submit(bytes))
+    with_device(|device| {
+        Playback::submit(device, bytes)
+            .map(|PlaybackToken(token)| token)
+            .map_err(playback_error)
+    })
 }
 pub fn complete() -> DevResult<Option<u16>> {
-    with_device(|d| d.complete())
+    with_device(|device| {
+        Playback::complete(device)
+            .map(|token| token.map(|PlaybackToken(token)| token))
+            .map_err(playback_error)
+    })
 }
 pub fn release() -> DevResult {
-    with_device(|d| d.release())
+    with_device(|device| Playback::release(device).map_err(playback_error))
 }
 
 pub fn abort() -> DevResult {
-    with_device(|d| d.abort())
+    with_device(|device| Playback::abort(device).map_err(playback_error))
+}
+
+/// Permanently stop the HDA controller. It releases DMA allocations only when
+/// all engines acknowledge stop and the controller is held in reset.
+pub fn shutdown() -> DevResult {
+    with_device(|device| Playback::shutdown(device).map_err(playback_error))
 }
 
 /// Deliver/unpublish the active Intel display sink ELD and select its matching
@@ -147,4 +175,15 @@ pub fn abort() -> DevResult {
 /// powered, stable DDI link is active; link teardown calls it before power-down.
 pub fn set_display_eld(port: u8, eld: Option<&[u8]>) -> DevResult {
     with_device(|device| device.set_display_eld(port, eld))
+}
+
+fn playback_error(error: PlaybackError) -> DevError {
+    match error {
+        PlaybackError::Unsupported => DevError::Unsupported,
+        PlaybackError::InvalidPeriod => DevError::InvalidParam,
+        PlaybackError::BadState => DevError::BadState,
+        PlaybackError::Busy => DevError::ResourceBusy,
+        PlaybackError::Again => DevError::Again,
+        PlaybackError::Device => DevError::Io,
+    }
 }

@@ -177,6 +177,17 @@ pub fn abort(tokens: &[u16]) -> DevResult {
     })
 }
 
+/// Permanently shuts down the HDA controller and releases its DMA memory only
+/// after controller readback proves every engine is quiescent. VirtIO sound
+/// currently has no permanent-shutdown operation through this legacy ABI.
+pub fn shutdown() -> DevResult {
+    #[cfg(feature = "intel-hda")]
+    if crate::hda::available() {
+        return crate::hda::shutdown();
+    }
+    Err(DevError::Unsupported)
+}
+
 /// Publish an already validated display ELD to the HDA digital codec route.
 /// VirtIO and HDA-free builds return Unsupported; display remains usable.
 pub fn set_display_eld(port: u8, eld: Option<&[u8]>) -> DevResult {

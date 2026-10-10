@@ -80,6 +80,7 @@ pub struct Controller<H: Hal, B: Bus> {
     running: bool,
     prepared: bool,
     live: bool,
+    shutdown: bool,
     sequence: u16,
     last_poll: u64,
 }
@@ -112,6 +113,7 @@ impl<H: Hal, B: Bus> Controller<H, B> {
             running: false,
             prepared: false,
             live: true,
+            shutdown: false,
             present: 0,
             hdmi_route: None,
             hdmi_eld: None,
@@ -195,7 +197,7 @@ impl<H: Hal, B: Bus> Controller<H, B> {
     /// was retired by that transition, the extant playback owner sees one I/O
     /// error rather than waiting forever for a token that can no longer arrive.
     pub fn set_display_eld(&mut self, port: u8, bytes: Option<&[u8]>) -> DevResult {
-        if !self.live {
+        if !self.live || self.shutdown {
             return Err(DevError::Io);
         }
         let pin = display_pin_for_port(port)?;
@@ -298,6 +300,9 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         Ok(())
     }
     pub fn prepare(&mut self, period: u32, periods: u32) -> DevResult {
+        if self.shutdown {
+            return Err(DevError::BadState);
+        }
         if !self.live || period as usize != PERIOD || periods as usize != PERIODS {
             return Err(DevError::InvalidParam);
         }
@@ -347,6 +352,9 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         // newly submitted period.
         if self.route_invalidated {
             return Err(DevError::Io);
+        }
+        if self.shutdown {
+            return Err(DevError::BadState);
         }
         if !self.live || !self.prepared || bytes.len() != PERIOD {
             return Err(DevError::InvalidParam);
@@ -398,7 +406,7 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         Ok(token)
     }
     pub fn complete(&mut self) -> DevResult<Option<u16>> {
-        if !self.live {
+        if !self.live || self.shutdown {
             return Err(DevError::Io);
         }
         if self.route_invalidated {
@@ -461,6 +469,9 @@ impl<H: Hal, B: Bus> Controller<H, B> {
     }
     /// Cancel playback only after RUN readback proves that DMA stopped.
     pub fn abort(&mut self) -> DevResult {
+        if self.shutdown {
+            return Err(DevError::BadState);
+        }
         if let Err(error) = self.stop() {
             self.live = false;
             return Err(error);
@@ -479,6 +490,9 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         Ok(())
     }
     pub fn release(&mut self) -> DevResult {
+        if self.shutdown {
+            return Err(DevError::BadState);
+        }
         if !self.pending.is_empty() {
             return Err(DevError::ResourceBusy);
         }
@@ -494,6 +508,53 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         }
         self.stop()?;
         self.prepared = false;
+        Ok(())
+    }
+
+    /// Permanently stop all HDA DMA engines before allowing their buffers to be
+    /// released. Each allocation is retired only after its own engine's stop
+    /// readback; Drop retries shutdown but never treats timeout as proof.
+    pub fn shutdown(&mut self) -> DevResult {
+        if self.shutdown {
+            return Ok(());
+        }
+
+        let stream_stopped = self.stop().is_ok();
+        self.bus.write(regs::CORBCTL, 1, 0);
+        self.bus.write(regs::RIRBCTL, 1, 0);
+        let corb_stopped = wait(&mut self.bus, regs::CORBCTL, 1, 2, 0).is_ok();
+        let rirb_stopped = wait(&mut self.bus, regs::RIRBCTL, 1, 3, 0).is_ok();
+        self.bus.write(regs::GCTL, 4, 0);
+        let controller_reset = wait(&mut self.bus, regs::GCTL, 4, 1, 0).is_ok();
+
+        // Retire each allocation according to its owning engine's explicit
+        // stop readback. A reset failure must not leak buffers whose engine is
+        // known stopped, but it must not release memory still reachable by an
+        // engine that ignored its stop command.
+        if corb_stopped {
+            self.corb.safe = true;
+        }
+        if rirb_stopped {
+            self.rirb.safe = true;
+        }
+        if stream_stopped {
+            self.bdl.safe = true;
+            self.audio.safe = true;
+        }
+
+        self.live = false;
+        if !(stream_stopped && corb_stopped && rirb_stopped && controller_reset) {
+            return Err(DevError::Io);
+        }
+
+        // No token can still refer to a hardware-owned buffer after every
+        // engine acknowledged stop and the controller is held in reset.
+        self.pending.clear();
+        self.retired.clear();
+        self.prepared = false;
+        self.running = false;
+        self.route_invalidated = false;
+        self.shutdown = true;
         Ok(())
     }
 }
@@ -569,15 +630,6 @@ fn display_pin_for_port(port: u8) -> DevResult<u8> {
 }
 impl<H: Hal, B: Bus> Drop for Controller<H, B> {
     fn drop(&mut self) {
-        let stopped = self.stop().is_ok();
-        self.bus.write(regs::CORBCTL, 1, 0);
-        self.bus.write(regs::RIRBCTL, 1, 0);
-        self.bus.write(regs::GCTL, 4, 0);
-        if stopped && wait(&mut self.bus, regs::GCTL, 4, 1, 0).is_ok() {
-            self.corb.safe = true;
-            self.rirb.safe = true;
-            self.bdl.safe = true;
-            self.audio.safe = true;
-        }
+        let _ = self.shutdown();
     }
 }
