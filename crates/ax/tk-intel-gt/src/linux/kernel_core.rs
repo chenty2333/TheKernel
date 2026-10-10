@@ -216,6 +216,36 @@ pub unsafe extern "C" fn aperture_remove_conflicting_pci_devices(
     unsafe { (pci_core().aperture_remove_conflicting)(pdev, name) }
 }
 
+/// Kernel PCI bus-topology and config-space operations used by the GMCH
+/// (north-bridge) path. `dev` is a native PCI device identity.
+#[repr(C)]
+pub struct PciBusOps {
+    /// Host bridge at bus 0, device 0, function 0 of `dev`'s PCI domain
+    /// (`pci_domain_nr()` + `pci_get_domain_bus_and_slot()`), with a
+    /// reference held, or NULL when the bridge is absent.
+    pub domain_host_bridge: unsafe extern "C" fn(dev: *mut c_void) -> *mut c_void,
+    /// `pci_dev_put()`.
+    pub pci_dev_put: unsafe extern "C" fn(dev: *mut c_void),
+    /// `pci_read_config_dword()`: 0 or a negative errno.
+    pub read_config_dword: unsafe extern "C" fn(dev: *mut c_void, offset: u32, value: *mut u32) -> c_int,
+    /// `pci_write_config_dword()`: 0 or a negative errno.
+    pub write_config_dword: unsafe extern "C" fn(dev: *mut c_void, offset: u32, value: u32) -> c_int,
+    /// `pci_bus_alloc_resource(dev->bus, res, size, align, PCIBIOS_MIN_MEM,
+    /// 0, pcibios_align_resource, dev)` for a memory window of `size`
+    /// bytes. On success `res->start`/`res->end` are set and 0 is returned.
+    pub bus_alloc_mem_resource:
+        unsafe extern "C" fn(dev: *mut c_void, res: *mut c_void, size: u64, align: u64) -> c_int,
+    /// `release_resource()`.
+    pub release_resource: unsafe extern "C" fn(res: *mut c_void),
+}
+
+pub static PCI_BUS: ProviderSlot<PciBusOps> = ProviderSlot::new();
+
+/// Install the kernel PCI bus-topology table. The table must be `'static`.
+pub fn install_pci_bus_ops(ops: &'static PciBusOps) -> Result<(), &'static str> {
+    PCI_BUS.install(ops)
+}
+
 /// Kernel IRQ registration. `irq` is the device's interrupt vector (the value
 /// `crate::linux::dma::device_irq()` reports), and `dev_id` is the cookie that
 /// the handler receives and that `free_irq` matches.
