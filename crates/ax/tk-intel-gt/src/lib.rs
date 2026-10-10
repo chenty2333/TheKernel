@@ -604,3 +604,10 @@ pub(crate) mod i915_gpu_error_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod i915_cmd_parser_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod gt_header_inline_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_guc_log_upstream;

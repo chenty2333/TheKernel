@@ -368,8 +368,10 @@ pub(crate) unsafe fn intel_timeline_is_last(tl: *const IntelTimeline, rq: *const
     }
 }
 
+// upstream: i915_scheduler.h i915_priolist_free()
 #[inline]
-unsafe fn i915_priolist_free(pl: *mut I915Priolist) {
+#[unsafe(no_mangle)]
+unsafe extern "C" fn i915_priolist_free(pl: *mut I915Priolist) {
     if !pl.is_null() {
         unsafe { __i915_priolist_free(pl) };
     }

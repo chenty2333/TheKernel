@@ -1000,7 +1000,8 @@ extern "C" fn intel_guc_wait_for_pending_msg(
 
 // upstream: intel_guc_submission.c intel_guc_wait_for_idle()
 #[unsafe(no_mangle)]
-extern "C" fn intel_guc_wait_for_idle(guc: &intel_guc, timeout: i64) -> i32 {
+extern "C" fn intel_guc_wait_for_idle(guc: *mut intel_guc, timeout: i64) -> i32 {
+    let guc: &intel_guc = unsafe { &*guc };
     let gt = guc_to_gt_const(guc);
     let uc = unsafe { core::ptr::addr_of!((*gt).uc).cast_mut() };
     if !unsafe { intel_uc_uses_guc_submission(uc) } {

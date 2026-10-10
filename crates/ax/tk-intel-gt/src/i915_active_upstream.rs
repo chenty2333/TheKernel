@@ -88,7 +88,7 @@ unsafe extern "C" {
     fn intel_engine_flush_barriers(engine: *mut IntelEngineCs) -> c_int;
     fn intel_engine_pm_get(engine: *mut IntelEngineCs);
     fn intel_engine_pm_put(engine: *mut IntelEngineCs);
-    fn intel_engine_pm_put_delay(engine: *mut IntelEngineCs, delay: u32);
+    fn intel_engine_pm_put_delay(engine: *mut IntelEngineCs, delay: u64);
     fn intel_engine_pm_is_awake(engine: *mut IntelEngineCs) -> bool;
     fn intel_engine_is_virtual(engine: *mut IntelEngineCs) -> bool;
     fn intel_context_is_barrier(

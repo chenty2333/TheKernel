@@ -242,7 +242,8 @@ pub unsafe fn intel_context_get(ce: *mut IntelContext) -> *mut IntelContext {
 }
 
 // upstream: intel_context.h intel_context_put()
-pub unsafe fn intel_context_put(ce: *mut IntelContext) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_context_put(ce: *mut IntelContext) {
     unsafe {
         let release = (*(*ce).ops).destroy.unwrap();
         memory::kref_put(
@@ -279,7 +280,8 @@ pub unsafe fn intel_context_timeline_unlock(tl: *mut IntelTimeline) {
 }
 
 // upstream: intel_context.h intel_context_is_barrier()
-pub unsafe fn intel_context_is_barrier(ce: *const IntelContext) -> bool {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_context_is_barrier(ce: *const IntelContext) -> bool {
     bits::test_bit(CONTEXT_BARRIER_BIT, unsafe { &(*ce).flags })
 }
 
