@@ -54,6 +54,7 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # statements verbatim (`shrinker_register(shrinker);` and a second
 # `kmem_cache_destroy(cache);` in tk-intel-gt's linux/ test modules); see
 # docs/upstream-provenance.md, 2026-10-10 L1 entry.
+# crates/ax outside-fence/code totals are 763/589 at >=40 and 1996/1816 at >=25.
 # `crates/ax` at 25 also includes 4 `nullfs.rs` lines, 14 smoltcp RFC bit-ruler
 # rows reprinted by Linux headers, and 25 common Intel/SDHCI register/control
 # lines in the newly translated FreeBSD drivers and the OpenBSD iwx/net80211
@@ -61,6 +62,7 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # provenance, not Linux provenance; see `docs/upstream-provenance.md`.
     ("crates/ax", 25): (18, 15, 4, 2001, 1820, 0, 0),
     ("crates/ax", 25): (18, 15, 4, 1990, 1810, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 1996, 1816, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their

@@ -9,7 +9,7 @@ use core::ffi::{CStr, c_char, c_int, c_void};
 use crate::{
     i915_gem_region_upstream::IntelMemoryRegionOps,
     linux::{
-        gem_memory::{IntelMemoryRegion, Resource},
+        gem_memory::{INTEL_MEMORY_LOCAL, IntelMemoryRegion, Resource},
         i915_private::DrmI915Private,
         memory::{kfree, kzalloc_obj},
         mutex::mutex_init,
@@ -211,4 +211,57 @@ pub unsafe fn intel_memory_region_set_name(
         &mut (*mem).name,
         &crate::linux::print::format_c_message(&format, args),
     );
+}
+
+// upstream: intel_memory_region.c intel_memory_region_by_type()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_memory_region_by_type(
+    i915: *mut DrmI915Private,
+    mem_type: u16,
+) -> *mut IntelMemoryRegion {
+    let regions = unsafe { core::ptr::addr_of!((*i915).mm.regions) };
+    for id in 0..unsafe { (*regions).len() } {
+        let mr = unsafe { (*regions)[id] };
+        if !mr.is_null() && unsafe { (*mr).r#type } == mem_type {
+            return mr;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+// upstream: intel_memory_region.c intel_memory_region_lookup()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_memory_region_lookup(
+    i915: *mut DrmI915Private,
+    class: u16,
+    instance: u16,
+) -> *mut IntelMemoryRegion {
+    let regions = unsafe { core::ptr::addr_of!((*i915).mm.regions) };
+    for id in 0..unsafe { (*regions).len() } {
+        let mr = unsafe { (*regions)[id] };
+        if !mr.is_null() && unsafe { (*mr).r#type } == class && unsafe { (*mr).instance } == instance {
+            return mr;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+// upstream: intel_memory_region.c intel_memory_region_avail()
+//
+// Non-local (system) regions report their full `total`. LOCAL (LMEM) regions
+// need the TTM buddy manager's free accounting, which TheKernel does not
+// support, so they fail closed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_memory_region_avail(
+    mr: *mut IntelMemoryRegion,
+    avail: *mut u64,
+    visible_avail: *mut u64,
+) {
+    unsafe {
+        if (*mr).r#type == INTEL_MEMORY_LOCAL {
+            panic!("intel_memory_region_avail: LMEM (TTM buddy) is not supported by TheKernel");
+        }
+        *avail = (*mr).total;
+        *visible_avail = (*mr).total;
+    }
 }

@@ -88,7 +88,8 @@ fn seqno_later(a: u32, b: u32) -> bool {
 }
 
 // upstream: i915_syncmap.c i915_syncmap_is_later()
-pub unsafe fn i915_syncmap_is_later(root: *mut *mut I915Syncmap, id: u64, seqno: u32) -> bool {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_syncmap_is_later(root: *mut *mut I915Syncmap, id: u64, seqno: u32) -> bool {
     let mut p = unsafe { *root }.cast::<SyncmapNode>();
     if p.is_null() {
         return false;
@@ -254,7 +255,8 @@ unsafe fn __sync_set(root: *mut *mut I915Syncmap, id: u64, seqno: u32) -> i32 {
 }
 
 // upstream: i915_syncmap.c i915_syncmap_set()
-pub unsafe fn i915_syncmap_set(root: *mut *mut I915Syncmap, id: u64, seqno: u32) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_syncmap_set(root: *mut *mut I915Syncmap, id: u64, seqno: u32) -> i32 {
     let p = unsafe { *root }.cast::<SyncmapNode>();
     if !p.is_null() && unsafe { __sync_leaf_prefix(p, id) == (*p).prefix } {
         unsafe { __sync_set_seqno(p, id, seqno) };

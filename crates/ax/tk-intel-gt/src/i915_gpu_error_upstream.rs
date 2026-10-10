@@ -131,7 +131,8 @@ unsafe fn i915_gpu_coredump_put(error: *mut GpuCoredump) {
     kfree(error);
 }
 // upstream: i915_gpu_error.c i915_error_state_store()
-unsafe fn i915_error_state_store(error: *mut GpuCoredump) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_error_state_store(error: *mut GpuCoredump) {
     if error.is_null() || is_err(error) {
         return;
     }

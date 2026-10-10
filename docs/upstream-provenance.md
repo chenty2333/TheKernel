@@ -2135,3 +2135,25 @@ translation. The scan baseline, the tk-intel-gt NOTICE, and this entry are
 reconciled in the same change.
 - P: `src/i915_driver_upstream.rs` (i915_probe_error variadic, Linux 7.2.3 i915_utils.h drm_err path; intel_gt_probe_error helper) and `src/i915_pci_upstream.rs` (i915_pci_resource_valid, i915_pci.c L936-948) are MIT translations of drivers/gpu/drm/i915/{i915_utils.h,i915_pci.c}; Copyright © 2016 Intel Corporation.
 - P: `src/intel_device_info_types_upstream.rs`, `src/intel_device_info_upstream.rs` (intel_device_info.c and intel_step_name() from intel_step.c), `src/intel_pciids_upstream.rs` (include/drm/intel/pciids.h), `src/i915_pci_upstream.rs` (i915_pci.c), `src/i915_driver_upstream.rs` (i915_driver.c), `src/i915_ioctl_upstream.rs` (i915_ioctls[] of i915_driver.c), `src/i915_probe_provider_upstream.rs`: MIT transcriptions of drivers/gpu/drm/i915/{intel_device_info.c,intel_device_info.h,i915_pci.c,i915_driver.c} and include/drm/intel/pciids.h, intel_step.c, Copyright © 2016 Intel Corporation.
+whole-scope crates/ax totals are threshold >=40 `(0,0,0,763,589,0,0)` and
+threshold >=25 `(18,15,4,1996,1816,0,0)` in the test's seven-column order.
+The corresponding tk-intel-gt NOTICE and CI scan baseline were reconciled in
+the same change; MIT i915 text remains counted rather than exempted.
+Wire stage 1 (M): `i915_memcpy.c` (MIT, Copyright 2016 Intel Corporation) is
+translated in `i915_memcpy_upstream.rs`, with the movntdqa key left disabled
+because TheKernel has no kernel-FPU guard. `i915_vgpu.c` (MIT) is translated in
+`i915_vgpu_upstream.rs`; the GVT-g guest balloon path fails closed. The
+`i915_gem_gtt.c` reserve/insert functions are added to `i915_gem_gtt_upstream.rs`,
+the `intel_memory_region.c` lookup/avail functions to
+`intel_memory_region_upstream.rs`, and `i915_utils.c` `i915_direct_stolen_access()`
+to `i915_utils_upstream.rs`. `intel_clock_gating.c` (MIT, Copyright 2021 Intel
+Corporation) contributes the Gen12 hook dispatch and nop body in
+`intel_clock_gating_upstream.rs`.
+Wire stage 1 (M), second batch: `i915_vma_resource.c` (MIT, Copyright 2021 Intel
+Corporation) is translated in `i915_vma_resource_upstream.rs`; its interval-tree
+pending-unbind set is walked in key order over the same red-black tree.
+`gt/uc/intel_guc_fw.c` (MIT, Copyright 2014-2018 Intel Corporation) is translated
+in `intel_guc_fw_upstream.rs`. Fail-closed definitions for LMEM/TTM, migrate,
+GSC/HECI/PXP, MTL sa_media, gen6/7 PPGTT, GMCH GGTT, ring submission, OA perf and
+debugfs are collected in `intel_unsupported_hw_upstream.rs`, one line per function
+in the source comments.

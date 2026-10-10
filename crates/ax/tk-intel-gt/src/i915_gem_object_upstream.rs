@@ -218,7 +218,8 @@ pub unsafe fn i915_gem_object_has_cache_level(obj: *const DrmI915GemObject, lvl:
 }
 
 // upstream: i915_gem_object.c i915_gem_object_alloc()
-pub unsafe fn i915_gem_object_alloc() -> *mut DrmI915GemObject {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_object_alloc() -> *mut DrmI915GemObject {
     let obj = kmem_cache_zalloc(slab_objects.cast::<KmCache>(), GFP_KERNEL) as *mut DrmI915GemObject;
     if obj.is_null() {
         return core::ptr::null_mut();
@@ -235,7 +236,8 @@ pub unsafe fn i915_gem_object_free(obj: *mut DrmI915GemObject) {
 }
 
 // upstream: i915_gem_object.c i915_gem_object_init()
-pub unsafe fn i915_gem_object_init(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_object_init(
     obj: *mut DrmI915GemObject,
     ops: *const DrmI915GemObjectOps,
     key: *mut LockClassKey,
@@ -287,7 +289,8 @@ pub unsafe fn __i915_gem_object_fini(obj: *mut DrmI915GemObject) {
 }
 
 // upstream: i915_gem_object.c i915_gem_object_set_cache_coherency()
-pub unsafe fn i915_gem_object_set_cache_coherency(obj: *mut DrmI915GemObject, cache_level: u32) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_object_set_cache_coherency(obj: *mut DrmI915GemObject, cache_level: u32) {
     let i915 = to_i915((&(*obj).base.base).dev);
 
     object_set_pat_index(obj, i915_gem_get_pat_index(i915, cache_level));
@@ -337,7 +340,8 @@ pub unsafe fn i915_gem_object_set_pat_index(obj: *mut DrmI915GemObject, pat_inde
 }
 
 // upstream: i915_gem_object.c i915_gem_object_can_bypass_llc()
-pub unsafe fn i915_gem_object_can_bypass_llc(obj: *mut DrmI915GemObject) -> bool {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_object_can_bypass_llc(obj: *mut DrmI915GemObject) -> bool {
     let i915 = to_i915((&(*obj).base.base).dev);
 
     // This is purely from a security perspective, so ignore non-user objects.

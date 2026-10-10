@@ -2200,7 +2200,8 @@ unsafe extern "C" {
 }
 
 // upstream: i915_gem_context.c i915_gem_context_open()
-pub unsafe fn i915_gem_context_open(i915: *mut DrmI915Private, file: *mut DrmFile) -> c_int {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_context_open(i915: *mut DrmI915Private, file: *mut DrmFile) -> c_int {
     let fpriv = unsafe { (*file).driver_priv.cast::<DrmI915FilePrivate>() };
     let view = unsafe { file_private_view(fpriv) };
     crate::linux::mutex::mutex_init(unsafe { &mut (*view).proto_context_lock });

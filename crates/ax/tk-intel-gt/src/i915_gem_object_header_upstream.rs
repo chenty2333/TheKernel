@@ -103,13 +103,15 @@ pub unsafe fn i915_gem_object_lookup(
 }
 
 // upstream: i915_gem_object.h i915_gem_object_get()
-pub unsafe fn i915_gem_object_get(obj: *mut DrmI915GemObject) -> *mut DrmI915GemObject {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_object_get(obj: *mut DrmI915GemObject) -> *mut DrmI915GemObject {
     unsafe { memory::kref_get(core::ptr::addr_of_mut!((*object_base(obj)).refcount)) };
     obj
 }
 
 // upstream: i915_gem_object.h i915_gem_object_put()
-pub unsafe fn i915_gem_object_put(obj: *mut DrmI915GemObject) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_object_put(obj: *mut DrmI915GemObject) {
     unsafe {
         memory::kref_put(
             core::ptr::addr_of_mut!((*object_base(obj)).refcount),

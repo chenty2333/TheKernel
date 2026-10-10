@@ -779,7 +779,8 @@ pub unsafe fn i915_vm_to_ppgtt(vm: *mut I915AddressSpace) -> *mut I915Ppgtt {
 }
 
 // upstream: intel_gtt.h i915_vm_get()
-pub unsafe fn i915_vm_get(vm: *mut I915AddressSpace) -> *mut I915AddressSpace {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_vm_get(vm: *mut I915AddressSpace) -> *mut I915AddressSpace {
     unsafe { kref_get(ptr::addr_of_mut!((*vm).r#ref)) };
     vm
 }
@@ -805,7 +806,8 @@ pub unsafe fn i915_vm_resv_get(vm: *mut I915AddressSpace) -> *mut c_void {
 }
 
 // upstream: intel_gtt.h i915_vm_put()
-pub unsafe fn i915_vm_put(vm: *mut I915AddressSpace) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_vm_put(vm: *mut I915AddressSpace) {
     unsafe { kref_put(ptr::addr_of_mut!((*vm).r#ref), i915_vm_release) };
 }
 
