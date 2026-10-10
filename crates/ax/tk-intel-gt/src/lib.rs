@@ -5,7 +5,6 @@
 #![no_std]
 #![feature(c_variadic)]
 #![deny(unsafe_code)]
-#![cfg_attr(feature = "upstream-gt", feature(c_variadic))]
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
