@@ -75,7 +75,7 @@ static DEVICE_IDENTITIES: spin::Mutex<BTreeMap<(u8, u8, u8), usize>> =
 /// device per boot, so there is no per-device lookup.
 static GT_PCI_IDENTITY: spin::Mutex<Option<pci::Bdf>> = spin::Mutex::new(None);
 
-fn bdf_of(device: *mut c_void) -> Option<pci::Bdf> {
+pub(super) fn bdf_of(device: *mut c_void) -> Option<pci::Bdf> {
     if device.is_null() {
         return None;
     }
@@ -324,7 +324,8 @@ pub(super) fn install_providers() -> Result<(), &'static str> {
         // ABI; the reader ignores its `i915` argument (single GT device).
         unsafe { core::mem::transmute(kernel_pci_revision as unsafe extern "C" fn(*mut c_void, *mut u8) -> i32) };
     intel_gt::linux::i915::install_pci_revision_reader(Some(reader));
-    install_k2_tables()
+    install_k2_tables()?;
+    super::upstream_drm::install()
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +453,12 @@ static DISPLAY_WINDOW: spin::Mutex<Option<super::regs::RegisterWindow>> = spin::
 #[allow(dead_code)] // set by the stage-two probe owner
 pub(super) fn register_display_window(window: super::regs::RegisterWindow) {
     *DISPLAY_WINDOW.lock() = Some(window);
+}
+
+/// The display register window the probe registered, for upstream reads of
+/// BAR0 before the probe maps MMIO (`I915ProbeOps::early_gmd_read`).
+pub(super) fn display_window() -> Option<super::regs::RegisterWindow> {
+    *DISPLAY_WINDOW.lock()
 }
 
 fn gt_irq_domain(domain: i32) -> intel_display::power_map::PowerDomain {
