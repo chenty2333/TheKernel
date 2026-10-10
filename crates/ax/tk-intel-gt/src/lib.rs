@@ -53,7 +53,7 @@ pub(crate) mod linux_tasklet;
 #[allow(unsafe_code)]
 #[macro_use]
 #[path = "linux/pm.rs"]
-pub(crate) mod linux_pm;
+pub mod linux_pm;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 #[path = "linux/i915_private.rs"]
@@ -319,7 +319,7 @@ pub mod intel_gt_irq_upstream;
 
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
-pub(crate) mod i915_irq_upstream;
+pub mod i915_irq_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_gt_pm_upstream;
@@ -498,7 +498,7 @@ pub mod intel_workarounds_types_upstream;
 pub mod intel_workarounds_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
-pub(crate) mod linux;
+pub mod linux;
 pub mod lrc;
 pub mod ppgtt;
 pub mod rcs;
@@ -627,10 +627,10 @@ pub(crate) mod intel_guc_log_upstream;
 
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
-pub(crate) mod i915_driver_upstream;
+pub mod i915_driver_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
-pub(crate) mod i915_pci_upstream;
+pub mod i915_pci_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod intel_device_info_types_upstream;
@@ -642,11 +642,13 @@ pub(crate) mod intel_device_info_upstream;
 pub(crate) mod intel_pciids_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
-pub(crate) mod i915_probe_provider_upstream;
+pub mod i915_probe_provider_upstream;
 
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod i915_ioctl_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub(crate) mod i915_memcpy_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
