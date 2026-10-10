@@ -196,7 +196,6 @@ unsafe extern "C" {
     pub fn intel_uncore_prune_engine_fw_domains(uncore: *mut IntelUncore, gt: *mut IntelGt);
     pub fn intel_uncore_unclaimed_mmio(uncore: *mut IntelUncore) -> bool;
     pub fn intel_uncore_arm_unclaimed_mmio_detection(uncore: *mut IntelUncore) -> bool;
-    pub fn intel_uncore_cleanup_mmio(uncore: *mut IntelUncore);
     pub fn intel_uncore_fini_mmio(dev: *mut DrmDevice, data: *mut c_void);
     pub fn intel_uncore_suspend(uncore: *mut IntelUncore);
     pub fn intel_uncore_resume_early(uncore: *mut IntelUncore);

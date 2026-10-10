@@ -385,7 +385,7 @@ unsafe fn intel_runtime_pm_suspended(rpm: *mut IntelRuntimePm) -> bool {
 }
 
 #[inline]
-unsafe fn assert_rpm_device_not_suspended(rpm: *mut IntelRuntimePm) {
+pub(crate) unsafe fn assert_rpm_device_not_suspended(rpm: *mut IntelRuntimePm) {
     crate::linux_assert::warn_on(unsafe { intel_runtime_pm_suspended(rpm) });
 }
 
@@ -404,7 +404,7 @@ pub(crate) unsafe fn assert_rpm_wakelock_held(rpm: *mut IntelRuntimePm) {
 }
 
 #[inline]
-unsafe fn disable_rpm_wakeref_asserts(rpm: *mut IntelRuntimePm) {
+pub(crate) unsafe fn disable_rpm_wakeref_asserts(rpm: *mut IntelRuntimePm) {
     unsafe {
         atomic_add(
             INTEL_RPM_WAKELOCK_BIAS + 1,
@@ -414,7 +414,7 @@ unsafe fn disable_rpm_wakeref_asserts(rpm: *mut IntelRuntimePm) {
 }
 
 #[inline]
-unsafe fn enable_rpm_wakeref_asserts(rpm: *mut IntelRuntimePm) {
+pub(crate) unsafe fn enable_rpm_wakeref_asserts(rpm: *mut IntelRuntimePm) {
     unsafe {
         atomic_add(
             -(INTEL_RPM_WAKELOCK_BIAS + 1),

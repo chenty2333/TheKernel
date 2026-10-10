@@ -230,7 +230,7 @@ unsafe extern "C" {
     fn intel_uncore_init_early(uncore: *mut IntelUncore, gt: *mut IntelGt);
     fn intel_uncore_setup_mmio(uncore: *mut IntelUncore, phys: PhysAddrT) -> i32;
     fn intel_sa_mediagt_setup(gt: *mut IntelGt, phys: PhysAddrT, gsi: u32) -> i32;
-    fn intel_mmio_bar(graphics_ver: u32) -> u32;
+    fn intel_mmio_bar(graphics_ver: i32) -> i32;
     fn pci_resource_start(dev: *mut c_void, bar: u32) -> PhysAddrT;
     fn pci_resource_len(dev: *mut c_void, bar: u32) -> u64;
     fn to_pci_dev(dev: *mut c_void) -> *mut c_void;
@@ -1227,7 +1227,7 @@ pub unsafe extern "C" fn intel_gt_probe_all(i915: *mut DrmI915Private) -> i32 {
         (*gt).name = c"Primary GT".as_ptr();
         (*gt).info.engine_mask = (*info).platform_engine_mask;
     }
-    let bar = unsafe { intel_mmio_bar(GRAPHICS_VER(i915) as u32) };
+    let bar = unsafe { intel_mmio_bar(GRAPHICS_VER(i915) as i32) } as u32;
     let phys = unsafe { pci_resource_start(pdev, bar) };
     gt_dbg!(gt, "Setting up %s\n", (*gt).name);
     let mut ret = unsafe { intel_gt_tile_setup(gt, phys) };

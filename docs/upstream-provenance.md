@@ -2109,3 +2109,5 @@ whole-scope crates/ax totals are threshold >=40 `(0,0,0,763,589,0,0)` and
 threshold >=25 `(18,15,4,1988,1808,0,0)` in the test's seven-column order.
 The corresponding tk-intel-gt NOTICE and CI scan baseline were reconciled in
 the same change; MIT i915 text remains counted rather than exempted.
+
+`intel_uncore_upstream.rs` translates all 88 function definitions of Linux 7.2.3 `drivers/gpu/drm/i915/intel_uncore.c` (MIT, Copyright © 2013 Intel Corporation) and the generated forcewake range/shadow tables; i915 private offsets and IOSF MBI/display services are owner-installed through `UncoreKernelOps`.
