@@ -4,6 +4,7 @@
 //! firmware load or userspace command stream. Kernel intel.gt=1 owns invocation.
 #![no_std]
 #![deny(unsafe_code)]
+#![cfg_attr(feature = "upstream-gt", feature(c_variadic))]
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
@@ -604,3 +605,10 @@ pub(crate) mod i915_gpu_error_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod i915_cmd_parser_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_driver_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_pci_upstream;

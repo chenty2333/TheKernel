@@ -2109,3 +2109,5 @@ whole-scope crates/ax totals are threshold >=40 `(0,0,0,763,589,0,0)` and
 threshold >=25 `(18,15,4,1988,1808,0,0)` in the test's seven-column order.
 The corresponding tk-intel-gt NOTICE and CI scan baseline were reconciled in
 the same change; MIT i915 text remains counted rather than exempted.
+
+- P: `src/i915_driver_upstream.rs` (i915_probe_error variadic, Linux 7.2.3 i915_utils.h drm_err path; intel_gt_probe_error helper) and `src/i915_pci_upstream.rs` (i915_pci_resource_valid, i915_pci.c L936-948) are MIT translations of drivers/gpu/drm/i915/{i915_utils.h,i915_pci.c}; Copyright © 2016 Intel Corporation.
