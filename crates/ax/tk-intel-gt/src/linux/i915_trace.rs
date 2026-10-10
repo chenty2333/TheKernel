@@ -79,10 +79,11 @@ pub fn trace_i915_ppgtt_create(_vm: *mut I915AddressSpace) {}
 #[inline]
 pub fn trace_i915_ppgtt_release(_vm: *mut I915AddressSpace) {}
 
-// Tracepoint symbols referenced by the source-order i915 translations. Linux
-// emits these as `trace_<event>()` calls. With CONFIG_TRACEPOINTS providing no
-// registered probe on this target, each call is a static-key check that does
-// nothing, so the bodies are empty and the arguments are not evaluated.
+// Tracepoint symbols referenced by the source-order i915 translations. The oracle
+// configuration sets CONFIG_TRACEPOINTS, but this kernel registers no probe for
+// these events. Linux emits these as `trace_<event>()` calls; with no probe
+// registered each call is a static-key check that does nothing, so the bodies
+// are empty and the arguments are not evaluated.
 // Pointer arguments are ABI-identical to the `*mut` forms in the declaring
 // translations, so opaque `c_void` is used where the record types are not
 // otherwise needed here.

@@ -16,7 +16,7 @@ use core::{
 
 use crate::{
     intel_context_upstream::{DmaFence, DmaFenceCb},
-    intel_engine_cs_upstream::{ListHead, Spinlock},
+    intel_engine_cs_upstream::Spinlock,
     linux::{
         locks::{spin_lock_irqsave_raw, spin_unlock_irqrestore_raw},
         requests::{dma_fence_array_create, dma_fence_get, dma_fence_put},
