@@ -171,4 +171,3 @@ unsafe fn list_splice_tail(list: *mut ListHead, head: *mut ListHead) {
 unsafe extern "C" {
     fn trace_i915_gem_object_create(obj: *mut DrmI915GemObject);
 }
-

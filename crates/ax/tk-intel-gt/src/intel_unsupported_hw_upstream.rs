@@ -500,4 +500,3 @@ pub unsafe extern "C" fn i915_perf_oa_timestamp_frequency(_i915: *mut crate::lin
 pub unsafe extern "C" fn i915_vma_unlink_ctx(_vma: *mut c_void) {
     panic!("i915_vma_unlink_ctx: has no definition in Linux 7.2.3");
 }
-

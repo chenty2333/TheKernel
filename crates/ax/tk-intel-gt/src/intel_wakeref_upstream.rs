@@ -318,4 +318,3 @@ pub unsafe extern "C" fn intel_wakeref_auto_fini(wf: *mut IntelWakerefAuto) {
     unsafe { intel_wakeref_auto(wf, 0) };
     // INTEL_WAKEREF_BUG_ON(wf->wakeref) compiles out.
 }
-
