@@ -132,6 +132,8 @@ mod tc_modeset;
 mod timing;
 #[cfg(feature = "intel-upstream-gt")]
 mod upstream_gt;
+#[cfg(all(feature = "intel-upstream-gt", target_os = "none"))]
+mod upstream_probe;
 
 #[cfg(test)]
 mod testbus;

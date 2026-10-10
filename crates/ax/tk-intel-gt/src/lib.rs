@@ -680,3 +680,6 @@ pub(crate) mod vlv_suspend_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod i915_gmch_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_renderstate_data_upstream;

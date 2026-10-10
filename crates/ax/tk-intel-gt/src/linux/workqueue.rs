@@ -88,6 +88,17 @@ pub const system_dfl_wq: *mut WorkqueueStruct =
 pub const system_highpri_wq: *mut WorkqueueStruct =
     core::ptr::addr_of!(SYSTEM_HIGHPRI_WORKQUEUE).cast_mut();
 
+/// A workqueue pointer published as a C data symbol.
+#[repr(transparent)]
+pub struct ExportedWorkqueue(*mut WorkqueueStruct);
+// SAFETY: the pointer names an immutable static handle.
+unsafe impl Sync for ExportedWorkqueue {}
+
+/// Linux `struct workqueue_struct *system_dfl_wq` (kernel/workqueue.c), read
+/// by C-ABI callers such as `i915_active.c`.
+#[unsafe(export_name = "system_dfl_wq")]
+pub static SYSTEM_DFL_WQ_SYMBOL: ExportedWorkqueue = ExportedWorkqueue(system_dfl_wq);
+
 /// Failure from an operation which needs the asynchronous work runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkqueueError {

@@ -470,22 +470,37 @@ pub(super) fn init_at_boot() {
     if let Err(error) = super::upstream_gt::install_providers() {
         axlog::warn!("intel-gt: upstream providers not installed: {error}");
     }
-    if axhal::boot::command_line_value("intel.gt") != Some("1") {
+    // On by default; `intel.gt=0` keeps the GT untouched.
+    if axhal::boot::command_line_value("intel.gt") == Some("0") {
         return;
     }
     let windows = super::mapped_windows();
+    if windows.is_empty() {
+        return;
+    }
     let result = if windows.len() != 1 {
         Err(String::from(
-            "intel.gt=1 refused: require one mapped supported Gen12 GPU",
+            "intel.gt refused: require one mapped supported Gen12 GPU",
         ))
     } else {
         let (bdf, window) = windows[0];
-        initialize(bdf, window)
+        // The translated i915 driver is the only GT owner when it is built in.
+        // Its probe fetches GuC/HuC firmware itself, so it runs once the
+        // rootfs is mounted.
+        #[cfg(feature = "intel-upstream-gt")]
+        let result = super::upstream_probe::defer(bdf, window);
+        #[cfg(not(feature = "intel-upstream-gt"))]
+        let result = initialize(bdf, window);
+        result
     };
     let initialized = result.is_ok();
     let text = result.unwrap_or_else(|s| s);
     axlog::info!("{text}");
-    if initialized && !axdriver::prelude::firmware::on_rootfs_ready(load_uc_firmware) {
+    // The upstream owner fetches its own firmware through intel_uc_fw.c.
+    if initialized
+        && cfg!(not(feature = "intel-upstream-gt"))
+        && !axdriver::prelude::firmware::on_rootfs_ready(load_uc_firmware)
+    {
         axlog::warn!("intel-gt: rootfs firmware callback table is full; GuC/HuC left unloaded");
     }
     if let Some((bdf, _)) = windows.first() {

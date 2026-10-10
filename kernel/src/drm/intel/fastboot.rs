@@ -888,7 +888,7 @@ fn read_only_live_scanout<R: Registers>(
 }
 
 #[cfg(target_os = "none")]
-fn stolen_range(
+pub(super) fn stolen_range(
     ecam: &impl super::pci::ConfigSpace,
     r: &impl Registers,
     bdf: super::pci::Bdf,
