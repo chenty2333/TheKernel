@@ -331,12 +331,11 @@ pub(crate) fn bring_up_at_boot() {
     if let Some((device, revision)) = identified_device_and_revision() {
         dmc::request_for_device(device, revision);
     }
-    if axhal::boot::command_line_value("intel.modeset") != Some("1") {
-        axlog::warn!(
-            "intel-gpu: native display writes disabled by default; firmware console unchanged"
-        );
+    // On by default; `intel.modeset=0` keeps the firmware console untouched.
+    if axhal::boot::command_line_value("intel.modeset") == Some("0") {
+        axlog::warn!("intel-gpu: native display writes disabled by intel.modeset=0");
         *MODESET.lock() = Some(String::from(
-            "not attempted: intel.modeset=1 absent; no display register writes\n",
+            "not attempted: intel.modeset=0; no display register writes\n",
         ));
         return;
     }
