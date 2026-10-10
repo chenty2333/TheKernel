@@ -49,12 +49,18 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     ("kernel/src", 25): (159, 52, 26, 317, 21, 0, 0),
 # GP GT/GEM/power source-order translations are included in the 2026-10-10 re-scan.
 # crates/ax outside-fence/code totals are 768/594 at >=40 and 2001/1820 at >=25.
+# crates/ax outside-fence/code totals are 763/589 at >=40 and 1990/1810 at >=25.
+# The +2/+2 since 1988/1808 are two L1 LinuxKPI test lines that reproduce Linux
+# statements verbatim (`shrinker_register(shrinker);` and a second
+# `kmem_cache_destroy(cache);` in tk-intel-gt's linux/ test modules); see
+# docs/upstream-provenance.md, 2026-10-10 L1 entry.
 # `crates/ax` at 25 also includes 4 `nullfs.rs` lines, 14 smoltcp RFC bit-ruler
 # rows reprinted by Linux headers, and 25 common Intel/SDHCI register/control
 # lines in the newly translated FreeBSD drivers and the OpenBSD iwx/net80211
 # translations, plus one FreeBSD ig4 register line. Those have BSD-source
 # provenance, not Linux provenance; see `docs/upstream-provenance.md`.
     ("crates/ax", 25): (18, 15, 4, 2001, 1820, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 1990, 1810, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their

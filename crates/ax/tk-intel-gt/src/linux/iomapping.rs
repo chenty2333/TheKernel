@@ -10,7 +10,7 @@
 
 #![allow(unsafe_code)]
 
-use alloc::collections::BTreeMap;
+use alloc::{boxed::Box, collections::BTreeMap};
 use core::{
     ffi::{c_ulong, c_void},
     ptr,
@@ -25,7 +25,10 @@ use memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange};
 use spin::Mutex;
 
 use crate::{
-    linux::{gem_memory::IoMapping, vm::PAGE_KERNEL_WC},
+    linux::{
+        gem_memory::{IoMapping, PgProt},
+        vm::PAGE_KERNEL_WC,
+    },
     linux_config::PAGE_SIZE,
 };
 
@@ -318,6 +321,86 @@ pub unsafe extern "C" fn io_mapping_unmap_atomic(address: *mut c_void) {
         })
     });
     assert!(owned, "io_mapping_unmap_atomic received a foreign address");
+}
+
+/// Linux `io_mapping_map_wc(mapping, offset, size)`. Linux creates a fresh WC
+/// `ioremap` per call; here the WC alias is already resident for the mapping's
+/// lifetime, so the same bytes are returned at `iomem + offset` with the same
+/// attributes and no new page-table state. The range must lie inside the
+/// mapping, otherwise NULL is returned.
+#[unsafe(export_name = "io_mapping_map_wc")]
+pub unsafe extern "C" fn io_mapping_map_wc_c(
+    mapping: *mut IoMapping,
+    offset: c_ulong,
+    size: usize,
+) -> *mut c_void {
+    if mapping.is_null() {
+        return ptr::null_mut();
+    }
+    let mapping_size = unsafe { (*mapping).size } as usize;
+    let base = unsafe { (*mapping).iomem };
+    let Some(end) = (offset as usize).checked_add(size) else {
+        return ptr::null_mut();
+    };
+    if base.is_null() || offset as usize >= mapping_size || end > mapping_size {
+        return ptr::null_mut();
+    }
+    unsafe { base.cast::<u8>().add(offset as usize).cast() }
+}
+
+/// Linux `io_mapping_unmap(vaddr)`, which is `iounmap()` for the per-call
+/// mappings of Linux. The resident alias is released with its mapping, so
+/// this only verifies that `vaddr` belongs to a live WC mapping.
+#[unsafe(export_name = "io_mapping_unmap")]
+pub unsafe extern "C" fn io_mapping_unmap_c(address: *mut c_void) {
+    unsafe { io_mapping_unmap_atomic(address) };
+}
+
+/// Heap-owned `IoMapping` descriptors behind [`ioremap_wc`] results, keyed by
+/// the returned kernel address, so `iounmap` can find and free them.
+static IOREMAP_WC_OWNERS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// Linux `ioremap_wc(phys, size)`: a write-combining kernel mapping of the
+/// physical range `[base, base + size)`. Returns NULL when the range is not
+/// admissible (not firmware-reserved/device memory, PAT1/WC not ready, or no
+/// kernel VA window). Release with [`ioremap_wc_release`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ioremap_wc(base: u64, size: u64) -> *mut c_void {
+    let Ok(size) = usize::try_from(size) else {
+        return ptr::null_mut();
+    };
+    let descriptor = Box::into_raw(Box::new(IoMapping {
+        base: 0,
+        size: 0,
+        prot: PgProt { pgprot: 0 },
+        iomem: ptr::null_mut(),
+    }));
+    if !unsafe { io_mapping_init_wc(descriptor, base, size) } {
+        drop(unsafe { Box::from_raw(descriptor) });
+        return ptr::null_mut();
+    }
+    let returned = unsafe { (*descriptor).iomem };
+    IOREMAP_WC_OWNERS
+        .lock()
+        .insert(returned as usize, descriptor as usize);
+    returned
+}
+
+/// Release a mapping created by [`ioremap_wc`]. Returns `false` when `addr`
+/// was not produced by `ioremap_wc`, so the caller can try its other owners.
+///
+/// # Safety
+/// `addr` must not be used after a successful release.
+pub unsafe fn ioremap_wc_release(addr: *mut c_void) -> bool {
+    let Some(descriptor) = IOREMAP_WC_OWNERS.lock().remove(&(addr as usize)) else {
+        return false;
+    };
+    let descriptor = descriptor as *mut IoMapping;
+    unsafe {
+        io_mapping_fini(descriptor);
+        drop(Box::from_raw(descriptor));
+    }
+    true
 }
 
 #[cfg(test)]

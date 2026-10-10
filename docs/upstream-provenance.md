@@ -2115,3 +2115,21 @@ the same change; MIT i915 text remains counted rather than exempted.
 `intel_pcode_upstream.rs` translates all 11 functions and the display pcode table of Linux 7.2.3 `drivers/gpu/drm/i915/intel_pcode.c` (MIT, Copyright © 2013-2021 Intel Corporation); the mailbox lock uses the `i915->sb_lock` offset probed from the oracle build. `intel_wakeref_upstream.rs` translates all 8 functions of Linux 7.2.3 `intel_wakeref.c` (MIT, Copyright © 2019 Intel Corporation) for the oracle configuration (no lockdep, no wakeref debug tracker). `vlv_iosf_sb_upstream.rs` declares the four VLV/CHV sideband entry points of Linux 7.2.3 `vlv_iosf_sb.c` (MIT, Copyright © 2013-2021 Intel Corporation) as fail-closed, because those paths serve only unsupported hardware.
 `crates/ax/tk-intel-gt/src/intel_guc_log_upstream.rs`: partial port of Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc_log.c` (MIT, Copyright © 2014-2019 Intel Corporation): section sizing, log vma create/destroy, default level, init_early and flush-event dispatch; relay/debugfs channel omitted (fail-closed flush work).
 `crates/ax/tk-intel-gt/src/gt_header_inline_upstream.rs`: C-ABI wrappers for i915 header `static inline` helpers (`i915_request.h`, `gt/intel_engine_pm.h`, `i915_gpu_error.h`, `gt/intel_workarounds.h`, `gt/uc/intel_guc_ct.h`, `gt/uc/intel_guc.h`), MIT, Copyright © 2019 Intel Corporation, bodies per header text.
+### L1 LinuxKPI re-scan (2026-10-10)
+
+The L1 LinuxKPI change (tk-intel-gt: user copy, pinning, page/DMA/sg, vmap and
+WC mappings, PAT cache modes, notifiers and shrinker objects, kmem_cache, PM and
+task/file/PCI provider tables) moves the whole-scope crates/ax totals as
+measured by `scripts/ci/scan_linux_excerpts.py --scope crates/ax --threshold 25`:
+
+- before: `(18,15,4,1988,1808,0,0)`;
+- after: `(18,15,4,1990,1810,0,0)`; threshold 40 is unchanged at `(0,0,0,763,589,0,0)`.
+
+The two new matches are test-only statements that equal Linux 7.2.3 source lines
+byte for byte once whitespace is removed: `shrinker_register(shrinker);`
+(`linux/memory.rs`) and a second `kmem_cache_destroy(cache);` (`linux/heap.rs`
+test). No Linux function body was copied into the change; the LinuxKPI
+implementations are written from the Linux behaviour contract, and the new
+symbols carry no `// upstream:` marker because none is a line-by-line
+translation. The scan baseline, the tk-intel-gt NOTICE, and this entry are
+reconciled in the same change.

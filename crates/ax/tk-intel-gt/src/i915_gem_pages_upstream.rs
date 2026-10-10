@@ -193,7 +193,7 @@ unsafe extern "C" {
     fn vmap_pfn(pfns: *mut c_ulong, count: u32, prot: PgProt) -> *mut c_void;
     fn kvmalloc_array(count: usize, size: usize, flags: u32) -> *mut c_void;
     fn kvfree(ptr: *mut c_void);
-    fn set_page_dirty(page: *mut Page);
+    fn set_page_dirty(page: *mut Page) -> bool;
     fn pat_enabled() -> bool;
     fn might_sleep();
 }

@@ -21,9 +21,22 @@ pub struct CpuFreqPolicy {
     _after_cpuinfo: [u8; 716],
 }
 
-unsafe extern "C" {
-    pub fn cpufreq_cpu_get(cpu: c_uint) -> *mut CpuFreqPolicy;
-    pub fn cpufreq_cpu_put(policy: *mut CpuFreqPolicy);
+/// Linux `cpufreq_cpu_get(cpu)`: a referenced policy for `cpu`, or NULL when
+/// no cpufreq driver manages that CPU. TheKernel has no cpufreq subsystem, so
+/// no CPU has a policy; callers take their documented no-policy fallback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cpufreq_cpu_get(_cpu: c_uint) -> *mut CpuFreqPolicy {
+    core::ptr::null_mut()
+}
+
+/// Linux `cpufreq_cpu_put(policy)`. Never reached with a non-NULL policy,
+/// because [`cpufreq_cpu_get`] never returns one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cpufreq_cpu_put(policy: *mut CpuFreqPolicy) {
+    assert!(
+        policy.is_null(),
+        "cpufreq_cpu_put received a policy this kernel never issues"
+    );
 }
 
 // Linux v7.2.3 target oracle: CONFIG_CPU_FREQ=y, cpumask_var_t is pointer-
