@@ -72,7 +72,11 @@ fn new_channels(
     let (server_tx, client_rx) = new_uni_channel()?;
     let (client_segments_tx, server_segments_rx) = try_bounded(STREAM_ANCILLARY_SEGMENTS)?;
     let (server_segments_tx, client_segments_rx) = try_bounded(STREAM_ANCILLARY_SEGMENTS)?;
-    let poll_update = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+    // Each endpoint has its own wait set.  Stream data changes the peer's
+    // readiness, so waking a shared set would spuriously re-arm local OUT
+    // waiters on every send/receive.
+    let left_poll = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+    let right_poll = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
     let left_close = Arc::try_new(AtomicU8::new(0)).map_err(|_| AxError::NoMemory)?;
     let right_close = Arc::try_new(AtomicU8::new(0)).map_err(|_| AxError::NoMemory)?;
     let left_passcred = Arc::try_new(AtomicBool::new(false)).map_err(|_| AxError::NoMemory)?;
@@ -85,7 +89,8 @@ fn new_channels(
             segments_rx: Some(client_segments_rx),
             tx_offset: 0,
             rx_offset: 0,
-            poll_update: poll_update.clone(),
+            poll_update: left_poll.clone(),
+            peer_poll_update: right_poll.clone(),
             peer_credentials: right_credentials,
             local_credentials: left_credentials,
             local_passcred: left_passcred.clone(),
@@ -100,7 +105,8 @@ fn new_channels(
             segments_rx: Some(server_segments_rx),
             tx_offset: 0,
             rx_offset: 0,
-            poll_update,
+            poll_update: right_poll,
+            peer_poll_update: left_poll,
             peer_credentials: left_credentials,
             local_credentials: right_credentials,
             local_passcred: right_passcred,
@@ -126,6 +132,8 @@ struct Channel {
     rx_offset: usize,
     // TODO: granularity
     poll_update: Arc<PollSet>,
+    /// The peer endpoint's `poll_update`.
+    peer_poll_update: Arc<PollSet>,
     peer_credentials: SocketCredentials,
     local_credentials: SocketCredentials,
     local_passcred: Arc<AtomicBool>,
@@ -193,14 +201,14 @@ impl Channel {
 
     fn close_orderly_and_wake(self) {
         self.publish_orderly_close();
-        let poll_update = self.poll_update.clone();
+        let poll_update = self.peer_poll_update.clone();
         drop(self);
         poll_update.wake();
     }
 
     fn reset_and_wake(self) {
         self.publish_reset();
-        let poll_update = self.poll_update.clone();
+        let poll_update = self.peer_poll_update.clone();
         drop(self);
         poll_update.wake();
     }
@@ -888,13 +896,17 @@ impl Configurable for StreamTransport {
 
         if let SetSocketOption::PassCredentials(enabled) = opt {
             self.passcred.store(*enabled, Ordering::Release);
-            let poll = self
+            let polls = self
                 .channel
                 .lock()
                 .as_ref()
-                .map(|chan| chan.poll_update.clone());
-            if let Some(poll) = poll {
-                poll.wake();
+                .map(|chan| (chan.poll_update.clone(), chan.peer_poll_update.clone()));
+            if let Some((local_poll, peer_poll)) = polls {
+                // This changes ancillary capacity at both endpoints: the
+                // local writer consults `self.passcred`, while the peer sees
+                // this flag through `peer_passcred`.
+                local_poll.wake();
+                peer_poll.wake();
             }
             return Ok(true);
         }
@@ -1047,7 +1059,7 @@ impl TransportOps for StreamTransport {
                 // this endpoint owns the sole producer.
                 unsafe { tx.advance_write_index(count) };
                 total += count;
-                let poll_update = (count > 0).then(|| chan.poll_update.clone());
+                let poll_update = (count > 0).then(|| chan.peer_poll_update.clone());
                 let result = finish_stream_send(total, size, effective_nonblocking);
                 drop(guard);
                 if let Some(poll_update) = poll_update {
@@ -1203,7 +1215,7 @@ impl TransportOps for StreamTransport {
                         }
                     }
                 }
-                let poll_update = (count > 0).then(|| chan.poll_update.clone());
+                let poll_update = (count > 0).then(|| chan.peer_poll_update.clone());
                 let result = if count > 0 {
                     Ok(count)
                 } else if peer_write_closed || self.rx_closed.load(Ordering::Acquire) {
@@ -1256,7 +1268,7 @@ impl TransportOps for StreamTransport {
                     }
                     let (_, retired_segments_tx) =
                         channel.retire_ancillary(false, how.has_write());
-                    (retired_segments_tx, Some(channel.poll_update.clone()))
+                    (retired_segments_tx, Some(channel.peer_poll_update.clone()))
                 }
                 None => (None, None),
             };
@@ -1377,10 +1389,152 @@ impl Drop for StreamTransport {
 
 #[cfg(test)]
 mod tests {
-    use core::future::Future;
+    use core::{
+        future::Future,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Waker},
+    };
+
+    use alloc::task::Wake;
 
     use super::*;
     use crate::SendFlags;
+
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct PollOnWake {
+        transport: Arc<StreamTransport>,
+        expected: IoEvents,
+        wakes: AtomicUsize,
+        saw_published_state: AtomicBool,
+    }
+
+    impl PollOnWake {
+        fn record(&self) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+            if self.transport.poll().contains(self.expected) {
+                self.saw_published_state.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl Wake for PollOnWake {
+        fn wake(self: Arc<Self>) {
+            self.record();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.record();
+        }
+    }
+
+    fn observe(
+        transport: &StreamTransport,
+        events: IoEvents,
+    ) -> (Arc<WakeCount>, PollRegistration<'_>) {
+        let count = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let mut context = Context::from_waker(&waker);
+        let registration = transport.register(&mut context, events).unwrap();
+        (count, registration)
+    }
+
+    fn observe_publication(
+        transport: &Arc<StreamTransport>,
+        events: IoEvents,
+    ) -> (Arc<PollOnWake>, PollRegistration<'_>) {
+        let probe = Arc::new(PollOnWake {
+            transport: transport.clone(),
+            expected: events,
+            wakes: AtomicUsize::new(0),
+            saw_published_state: AtomicBool::new(false),
+        });
+        let waker = Waker::from(probe.clone());
+        let mut context = Context::from_waker(&waker);
+        let registration = transport.register(&mut context, events).unwrap();
+        (probe, registration)
+    }
+
+    #[test]
+    fn stream_data_wakes_only_peer_readiness_and_peer_write_room() {
+        let (left, right) = StreamTransport::new_pair(SocketCredentials::UNKNOWN).unwrap();
+        let (left_out, _left_out_registration) = observe(&left, IoEvents::WRITABLE);
+        let (right_in, _right_in_registration) = observe(&right, IoEvents::READABLE);
+        assert_eq!(
+            left.send(&b"ping"[..], SendOptions::default()),
+            Ok(4)
+        );
+        assert_eq!(right_in.0.load(Ordering::SeqCst), 1);
+        assert_eq!(left_out.0.load(Ordering::SeqCst), 0);
+
+        let mut output = [0; 4];
+        assert_eq!(right.recv(&mut output[..], RecvOptions::default()), Ok(4));
+        assert_eq!(&output, b"ping");
+        assert_eq!(left_out.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn half_shutdown_publishes_peer_read_hangup_before_waking() {
+        let (writer, reader) = StreamTransport::new_pair(SocketCredentials::UNKNOWN).unwrap();
+        let reader = Arc::new(reader);
+        let events = IoEvents::READABLE | IoEvents::READ_HANGUP;
+        let (probe, _registration) = observe_publication(&reader, events);
+
+        writer.shutdown(Shutdown::Write).unwrap();
+
+        assert_eq!(probe.wakes.load(Ordering::SeqCst), 1);
+        assert!(probe.saw_published_state.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn read_shutdown_wakes_local_readiness_waiters() {
+        let (_peer, reader) = StreamTransport::new_pair(SocketCredentials::UNKNOWN).unwrap();
+        let reader = Arc::new(reader);
+        let (probe, _registration) = observe_publication(&reader, IoEvents::READABLE);
+
+        reader.shutdown(Shutdown::Read).unwrap();
+
+        assert_eq!(probe.wakes.load(Ordering::SeqCst), 1);
+        assert!(probe.saw_published_state.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn peer_drop_publishes_read_hangup_before_waking() {
+        let _guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
+        let (writer, reader) = StreamTransport::new_pair(SocketCredentials::UNKNOWN).unwrap();
+        let reader = Arc::new(reader);
+        let events = IoEvents::READABLE | IoEvents::READ_HANGUP;
+        let (probe, _registration) = observe_publication(&reader, events);
+
+        drop(writer);
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+
+        assert_eq!(probe.wakes.load(Ordering::SeqCst), 1);
+        assert!(probe.saw_published_state.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn readiness_published_before_registration_remains_level_visible() {
+        let (writer, reader) = StreamTransport::new_pair(SocketCredentials::UNKNOWN).unwrap();
+        writer.send(&b"ready"[..], SendOptions::default()).unwrap();
+
+        let (reader_in, _registration) = observe(&reader, IoEvents::READABLE);
+
+        assert_eq!(reader_in.0.load(Ordering::SeqCst), 0);
+        assert!(reader.poll().contains(IoEvents::READABLE));
+    }
 
     #[test]
     fn failed_ancillary_peek_preserves_control_output_and_receive_segment() {
