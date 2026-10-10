@@ -2109,3 +2109,5 @@ whole-scope crates/ax totals are threshold >=40 `(0,0,0,763,589,0,0)` and
 threshold >=25 `(18,15,4,1988,1808,0,0)` in the test's seven-column order.
 The corresponding tk-intel-gt NOTICE and CI scan baseline were reconciled in
 the same change; MIT i915 text remains counted rather than exempted.
+`crates/ax/tk-intel-gt/src/intel_guc_log_upstream.rs`: partial port of Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc_log.c` (MIT, Copyright © 2014-2019 Intel Corporation): section sizing, log vma create/destroy, default level, init_early and flush-event dispatch; relay/debugfs channel omitted (fail-closed flush work).
+`crates/ax/tk-intel-gt/src/gt_header_inline_upstream.rs`: C-ABI wrappers for i915 header `static inline` helpers (`i915_request.h`, `gt/intel_engine_pm.h`, `i915_gpu_error.h`, `gt/intel_workarounds.h`, `gt/uc/intel_guc_ct.h`, `gt/uc/intel_guc.h`), MIT, Copyright © 2019 Intel Corporation, bodies per header text.
