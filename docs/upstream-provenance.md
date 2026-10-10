@@ -2105,7 +2105,11 @@ The intel_gt.c body and source-location markers are present in the feature owner
 ### Whole-crates/ax Linux excerpt re-scan (2026-10-10)
 
 After registering the GT/GEM/power source-order translations, the scanner's
-whole-scope crates/ax totals are threshold >=40 `(0,0,0,763,589,0,0)` and
-threshold >=25 `(18,15,4,1988,1808,0,0)` in the test's seven-column order.
+whole-scope crates/ax totals are threshold >=40 `(0,0,0,768,594,0,0)` and
+threshold >=25 `(18,15,4,2001,1820,0,0)` in the test's seven-column order.
 The corresponding tk-intel-gt NOTICE and CI scan baseline were reconciled in
 the same change; MIT i915 text remains counted rather than exempted.
+
+`intel_uncore_upstream.rs` translates all 88 function definitions of Linux 7.2.3 `drivers/gpu/drm/i915/intel_uncore.c` (MIT, Copyright © 2013 Intel Corporation) and the generated forcewake range/shadow tables; i915 private offsets and IOSF MBI/display services are owner-installed through `UncoreKernelOps`.
+
+`intel_pcode_upstream.rs` translates all 11 functions and the display pcode table of Linux 7.2.3 `drivers/gpu/drm/i915/intel_pcode.c` (MIT, Copyright © 2013-2021 Intel Corporation); the mailbox lock uses the `i915->sb_lock` offset probed from the oracle build. `intel_wakeref_upstream.rs` translates all 8 functions of Linux 7.2.3 `intel_wakeref.c` (MIT, Copyright © 2019 Intel Corporation) for the oracle configuration (no lockdep, no wakeref debug tracker). `vlv_iosf_sb_upstream.rs` declares the four VLV/CHV sideband entry points of Linux 7.2.3 `vlv_iosf_sb.c` (MIT, Copyright © 2013-2021 Intel Corporation) as fail-closed, because those paths serve only unsupported hardware.
