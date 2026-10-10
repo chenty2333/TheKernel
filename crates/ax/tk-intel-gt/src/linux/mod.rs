@@ -90,3 +90,7 @@ pub(crate) mod iomapping;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod dma;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod kernel_services;

@@ -195,4 +195,7 @@ Current whole crates/ax totals supersede the merge measurement above (re-scanned
 2026-10-10 after the GT/GEM/power source translations; all Linux-identical MIT
 lines remain counted):
 threshold 40: 0 fenced, 763 outside-fence (589 code); threshold 25:
-18 fenced lines / 15 blocks / 4 files, 1988 outside-fence (1808 code).
+18 fenced lines / 15 blocks / 4 files, 1990 outside-fence (1810 code).
+The +2 / +2 since the previous re-scan are two test-only LinuxKPI lines
+(L1, 2026-10-10) that match Linux statements verbatim; see
+docs/upstream-provenance.md, 2026-10-10 L1 entry.

@@ -51,7 +51,7 @@ unsafe extern "C" {
     fn pm_runtime_get_sync(dev: *mut c_void) -> i32;
     fn pm_runtime_get_if_active(dev: *mut c_void) -> i32;
     fn pm_runtime_get_if_in_use(dev: *mut c_void) -> i32;
-    fn pm_runtime_get_noresume(dev: *mut c_void) -> i32;
+    fn pm_runtime_get_noresume(dev: *mut c_void);
     fn pm_runtime_put_autosuspend(dev: *mut c_void) -> i32;
     fn pm_runtime_put(dev: *mut c_void) -> i32;
     fn pm_runtime_mark_last_busy(dev: *mut c_void);

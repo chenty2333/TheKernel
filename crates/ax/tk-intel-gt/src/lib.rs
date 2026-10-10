@@ -3,6 +3,7 @@
 //! N305 GT/media A0 is independent of display D0. No implicit hardware access,
 //! firmware load or userspace command stream. Kernel intel.gt=1 owns invocation.
 #![no_std]
+#![feature(c_variadic)]
 #![deny(unsafe_code)]
 extern crate alloc;
 #[cfg(test)]

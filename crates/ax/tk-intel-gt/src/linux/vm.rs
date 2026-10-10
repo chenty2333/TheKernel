@@ -8,7 +8,7 @@
 
 use alloc::collections::BTreeMap;
 use core::{
-    ffi::{c_ulong, c_void},
+    ffi::{c_int, c_ulong, c_void},
     ptr,
 };
 
@@ -108,68 +108,34 @@ fn release_page_array(pages: *mut *mut Page, count: usize) {
     unsafe { kfree(pages) };
 }
 
-/// Linux `vmap()` for the LinuxKPI-owned kernel address space. This target
-/// intentionally supports WB `PAGE_KERNEL` and the explicitly enabled PAT1/WC
-/// form of `pgprot_writecombine(PAGE_KERNEL)`, plus the two source flag forms
-/// used by i915 (`0` and `VM_MAP_PUT_PAGES`). UC and unknown pgprots fail
-/// closed. Unsupported pgprots or flags fail without consuming the caller's
-/// page references or array. Axmm's generic PTE flags encode the same
-/// supervisor RW, NX, and WB/WC cache mode; the source `_PAGE_GLOBAL` bit is
-/// omitted because its only effect here is a TLB caching optimization, while
-/// axmm's shared kernel root is already common to all task address spaces.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vmap(
-    pages: *mut *mut Page,
-    count: u32,
-    flags: c_ulong,
-    prot: PgProt,
-) -> *mut c_void {
-    let wc = prot.pgprot == PAGE_KERNEL_WC.pgprot;
-    if pages.is_null()
-        || count == 0
-        || (flags != 0 && flags != VM_MAP_PUT_PAGES)
-        || (!wc && prot.pgprot != PAGE_KERNEL.pgprot)
-        || (wc && !axhal::boot::intel_cpu_mmap_ready())
-        || !axmm::kernel_map_tlb_sync_installed()
-    {
-        return ptr::null_mut();
+/// Validate a `vmap()`-family pgprot. Returns `Some(wc)` for the two admitted
+/// forms (`PAGE_KERNEL` and its PAT1/WC variant) when that mode is usable;
+/// anything else (UC, unknown bits) is refused.
+fn admitted_kernel_prot(prot: PgProt) -> Option<bool> {
+    if prot.pgprot == PAGE_KERNEL_WC.pgprot {
+        axhal::boot::intel_cpu_mmap_ready().then_some(true)
+    } else if prot.pgprot == PAGE_KERNEL.pgprot {
+        Some(false)
+    } else {
+        None
     }
-    let Some(size) = (count as usize).checked_mul(PAGE_SIZE) else {
-        return ptr::null_mut();
-    };
-    let Some((hint, limit)) = vmap_search_window() else {
-        return ptr::null_mut();
-    };
+}
 
-    // Resolve and validate page identities before taking the shared kernel
-    // address-space lock; this avoids nesting its lock with the shmem registry.
-    let physical_pages = kvmalloc_objs::<usize, usize>(count as usize);
-    if physical_pages.is_null() {
-        return ptr::null_mut();
-    }
-    for index in 0..count as usize {
-        let page = unsafe { pages.add(index).read() };
-        if page.is_null() || crate::linux_config::IS_ERR(page) {
-            unsafe { kfree(physical_pages) };
-            return ptr::null_mut();
-        }
-        let Some(physical) = (unsafe { try_page_to_phys(page) }) else {
-            unsafe { kfree(physical_pages) };
-            return ptr::null_mut();
-        };
-        unsafe { physical_pages.add(index).write(physical) };
-    }
+/// Map `count` physical frames (`frames[i]` is page-aligned) into the kernel
+/// VA window, optionally with PAT1/WC leaves, and return the base address.
+/// Caller keeps ownership of `frames`. The mapping is complete only after the
+/// shared kernel-map TLB grace period.
+unsafe fn map_frames(frames: *const usize, count: usize, wc: bool) -> Option<usize> {
+    let size = count.checked_mul(PAGE_SIZE)?;
+    let (hint, limit) = vmap_search_window()?;
 
     let mut mapped = 0usize;
     let mut map_failed = false;
     let start = {
         let mut aspace = axmm::kernel_aspace().lock();
-        let Some(start) = aspace.find_free_area(hint, size, limit) else {
-            unsafe { kfree(physical_pages) };
-            return ptr::null_mut();
-        };
-        for index in 0..count as usize {
-            let physical = unsafe { physical_pages.add(index).read() };
+        let start = aspace.find_free_area(hint, size, limit)?;
+        for index in 0..count {
+            let physical = unsafe { frames.add(index).read() };
             let paddr = PhysAddr::from_usize(physical);
             let vaddr = VirtAddr::from_usize(start.as_usize() + index * PAGE_SIZE);
             if aspace
@@ -207,7 +173,6 @@ pub unsafe extern "C" fn vmap(
         }
         start
     };
-    unsafe { kfree(physical_pages) };
 
     if map_failed {
         if mapped != 0 {
@@ -218,20 +183,24 @@ pub unsafe extern "C" fn vmap(
                 "failed to release partial-vmap address reservation"
             );
         }
-        return ptr::null_mut();
+        return None;
     }
 
     axmm::synchronize_kernel_map_tlb().expect("kernel-map TLB synchronizer disappeared after vmap");
-    let address = start.as_usize();
-    let put_pages = flags == VM_MAP_PUT_PAGES;
+    Some(start.as_usize())
+}
+
+/// Record a region produced by [`map_frames`] so `vfree`/`vunmap` can retire
+/// it. `page_array` is only meaningful when `put_pages` is set.
+fn record_vmap_region(address: usize, count: usize, page_array: usize, put_pages: bool) {
     with_vmap_records(|records| {
         assert!(
             records
                 .insert(
                     address,
                     VmapRecord {
-                        page_array: if put_pages { pages as usize } else { 0 },
-                        page_count: count as usize,
+                        page_array: if put_pages { page_array } else { 0 },
+                        page_count: count,
                         put_pages,
                         retiring: false,
                     },
@@ -240,7 +209,181 @@ pub unsafe extern "C" fn vmap(
             "vmap address reused while an earlier owner was registered"
         );
     });
+}
+
+/// Linux `vmap()` for the LinuxKPI-owned kernel address space. This target
+/// intentionally supports WB `PAGE_KERNEL` and the explicitly enabled PAT1/WC
+/// form of `pgprot_writecombine(PAGE_KERNEL)`, plus the two source flag forms
+/// used by i915 (`0` and `VM_MAP_PUT_PAGES`). UC and unknown pgprots fail
+/// closed. Unsupported pgprots or flags fail without consuming the caller's
+/// page references or array. Axmm's generic PTE flags encode the same
+/// supervisor RW, NX, and WB/WC cache mode; the source `_PAGE_GLOBAL` bit is
+/// omitted because its only effect here is a TLB caching optimization, while
+/// axmm's shared kernel root is already common to all task address spaces.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vmap(
+    pages: *mut *mut Page,
+    count: u32,
+    flags: c_ulong,
+    prot: PgProt,
+) -> *mut c_void {
+    let Some(wc) = admitted_kernel_prot(prot) else {
+        return ptr::null_mut();
+    };
+    if pages.is_null()
+        || count == 0
+        || (flags != 0 && flags != VM_MAP_PUT_PAGES)
+        || !axmm::kernel_map_tlb_sync_installed()
+    {
+        return ptr::null_mut();
+    }
+
+    // Resolve and validate page identities before taking the shared kernel
+    // address-space lock; this avoids nesting its lock with the shmem registry.
+    let physical_pages = kvmalloc_objs::<usize, usize>(count as usize);
+    if physical_pages.is_null() {
+        return ptr::null_mut();
+    }
+    for index in 0..count as usize {
+        let page = unsafe { pages.add(index).read() };
+        if page.is_null() || crate::linux_config::IS_ERR(page) {
+            unsafe { kfree(physical_pages) };
+            return ptr::null_mut();
+        }
+        let Some(physical) = (unsafe { try_page_to_phys(page) }) else {
+            unsafe { kfree(physical_pages) };
+            return ptr::null_mut();
+        };
+        unsafe { physical_pages.add(index).write(physical) };
+    }
+
+    let mapped = unsafe { map_frames(physical_pages, count as usize, wc) };
+    unsafe { kfree(physical_pages) };
+    let Some(address) = mapped else {
+        return ptr::null_mut();
+    };
+    record_vmap_region(
+        address,
+        count as usize,
+        pages as usize,
+        flags == VM_MAP_PUT_PAGES,
+    );
     address as *mut c_void
+}
+
+/// Linux `vmap_pfn(pfns, count, prot)`: map raw page-frame numbers (no page
+/// references are taken). Released with `vunmap`/`vfree`, which then leave
+/// the frames untouched. Accepts the same pgprot forms as [`vmap`].
+///
+/// # Safety
+/// `pfns` must hold `count` frame numbers the caller is allowed to map.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vmap_pfn(pfns: *mut c_ulong, count: u32, prot: PgProt) -> *mut c_void {
+    let Some(wc) = admitted_kernel_prot(prot) else {
+        return ptr::null_mut();
+    };
+    if pfns.is_null() || count == 0 || !axmm::kernel_map_tlb_sync_installed() {
+        return ptr::null_mut();
+    }
+    let frames = kvmalloc_objs::<usize, usize>(count as usize);
+    if frames.is_null() {
+        return ptr::null_mut();
+    }
+    for index in 0..count as usize {
+        let pfn = unsafe { pfns.add(index).read() } as usize;
+        let Some(physical) = pfn.checked_mul(PAGE_SIZE) else {
+            unsafe { kfree(frames) };
+            return ptr::null_mut();
+        };
+        unsafe { frames.add(index).write(physical) };
+    }
+    let mapped = unsafe { map_frames(frames, count as usize, wc) };
+    unsafe { kfree(frames) };
+    let Some(address) = mapped else {
+        return ptr::null_mut();
+    };
+    record_vmap_region(address, count as usize, 0, false);
+    address as *mut c_void
+}
+
+/// Linux `is_vmalloc_addr(ptr)` for the regions this owner maps: true when
+/// `ptr` lies inside a live `vmap()`/`vmap_pfn()` region.
+///
+/// # Safety
+/// Only compares addresses; never dereferences `ptr`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn is_vmalloc_addr(ptr: *const c_void) -> bool {
+    let address = ptr as usize;
+    with_vmap_records(|records| {
+        records
+            .range(..=address)
+            .next_back()
+            .is_some_and(|(base, record)| {
+                address < base.saturating_add(record.page_count * PAGE_SIZE)
+            })
+    })
+}
+
+/// x86 `cachemode2protval()` for the PAT palette this kernel programs
+/// (index = PAT<<2 | PCD<<1 | PWT: 0 WB, 1 WC, 2 UC-, 3 UC, 5 WT). Cache mode
+/// numbering follows Linux `_PAGE_CACHE_MODE_*`. Modes outside the palette
+/// (WP) are refused with a panic rather than encoding an unintended cache type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cachemode2protval(cache_mode: i32) -> c_ulong {
+    const PWT: c_ulong = 1 << 3;
+    const PCD: c_ulong = 1 << 4;
+    const PAT: c_ulong = 1 << 7;
+    match cache_mode {
+        0 => 0,         // _PAGE_CACHE_MODE_WB: PAT index 0
+        1 => PWT,       // _PAGE_CACHE_MODE_WC: PAT index 1
+        2 => PCD,       // _PAGE_CACHE_MODE_UC_MINUS: PAT index 2
+        3 => PCD | PWT, // _PAGE_CACHE_MODE_UC: PAT index 3
+        4 => PAT | PWT, // _PAGE_CACHE_MODE_WT: PAT index 5
+        other => panic!("cachemode2protval: cache mode {other} is not in the PAT palette"),
+    }
+}
+
+/// x86 `pgprot_writecombine(prot)`: the source protection with the WC cache
+/// mode bits from [`cachemode2protval`] applied.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pgprot_writecombine(prot: PgProt) -> PgProt {
+    PgProt {
+        pgprot: prot.pgprot | unsafe { cachemode2protval(1) },
+    }
+}
+
+/// Linux `pat_enabled()`: true once the WC palette is confirmed on every
+/// startup CPU, which is the only state in which WC leaves are emitted.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pat_enabled() -> bool {
+    axhal::boot::intel_cpu_mmap_ready()
+}
+
+/// Linux `arch_phys_wc_add(base, size)`: with PAT enabled the WC attribute is
+/// carried by page-table bits and no MTRR entry is needed, so this returns 0
+/// (the Linux PAT-path result). Without PAT there is no MTRR driver, so the
+/// request fails with -ENODEV.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arch_phys_wc_add(_base: u64, _size: u64) -> c_int {
+    if unsafe { pat_enabled() } {
+        0
+    } else {
+        -crate::linux_config::ENODEV
+    }
+}
+
+/// Linux `arch_phys_wc_del(handle)`: releases an MTRR entry. TheKernel never
+/// creates MTRR entries (see [`arch_phys_wc_add`]), so there is nothing to
+/// release for any handle this owner returned.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arch_phys_wc_del(_mtrr: c_int) {}
+
+/// Linux `boot_cpu_data.x86_clflush_size`: the CLFLUSH line size in bytes,
+/// from CPUID leaf 1 EBX[15:8] (in 8-byte units).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn boot_cpu_data_clflush_size() -> usize {
+    let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
+    (((leaf1.ebx >> 8) & 0xff) as usize) * 8
 }
 
 /// Retire a region returned by [`vmap`]. The VA remains reserved between PTE
@@ -312,4 +455,32 @@ pub unsafe extern "C" fn vfree(address: *mut c_void) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vunmap(address: *mut c_void) {
     unsafe { vunmap_inner(address, false) };
+}
+
+#[cfg(test)]
+mod cache_mode_tests {
+    use super::*;
+
+    #[test]
+    fn writecombine_of_kernel_prot_is_the_pat1_variant() {
+        let wc = unsafe { pgprot_writecombine(PAGE_KERNEL) };
+        assert_eq!(wc.pgprot, PAGE_KERNEL_WC.pgprot);
+    }
+
+    #[test]
+    fn cache_modes_map_to_palette_indices() {
+        unsafe {
+            assert_eq!(cachemode2protval(0), 0);
+            assert_eq!(cachemode2protval(1), 1 << 3);
+            assert_eq!(cachemode2protval(2), 1 << 4);
+            assert_eq!(cachemode2protval(3), (1 << 4) | (1 << 3));
+            assert_eq!(cachemode2protval(4), (1 << 7) | (1 << 3));
+        }
+    }
+
+    #[test]
+    fn unknown_vmap_pgprot_is_refused() {
+        assert_eq!(admitted_kernel_prot(PgProt { pgprot: 0 }), None);
+        assert_eq!(admitted_kernel_prot(PAGE_KERNEL), Some(false));
+    }
 }

@@ -2109,3 +2109,22 @@ whole-scope crates/ax totals are threshold >=40 `(0,0,0,763,589,0,0)` and
 threshold >=25 `(18,15,4,1988,1808,0,0)` in the test's seven-column order.
 The corresponding tk-intel-gt NOTICE and CI scan baseline were reconciled in
 the same change; MIT i915 text remains counted rather than exempted.
+
+### L1 LinuxKPI re-scan (2026-10-10)
+
+The L1 LinuxKPI change (tk-intel-gt: user copy, pinning, page/DMA/sg, vmap and
+WC mappings, PAT cache modes, notifiers and shrinker objects, kmem_cache, PM and
+task/file/PCI provider tables) moves the whole-scope crates/ax totals as
+measured by `scripts/ci/scan_linux_excerpts.py --scope crates/ax --threshold 25`:
+
+- before: `(18,15,4,1988,1808,0,0)`;
+- after: `(18,15,4,1990,1810,0,0)`; threshold 40 is unchanged at `(0,0,0,763,589,0,0)`.
+
+The two new matches are test-only statements that equal Linux 7.2.3 source lines
+byte for byte once whitespace is removed: `shrinker_register(shrinker);`
+(`linux/memory.rs`) and a second `kmem_cache_destroy(cache);` (`linux/heap.rs`
+test). No Linux function body was copied into the change; the LinuxKPI
+implementations are written from the Linux behaviour contract, and the new
+symbols carry no `// upstream:` marker because none is a line-by-line
+translation. The scan baseline, the tk-intel-gt NOTICE, and this entry are
+reconciled in the same change.
