@@ -17,9 +17,11 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -753,6 +755,103 @@ static void case_recvmmsg_deadline(void) {
     mark("PARTIAL_BATCH_REMAINING",
          timeout.tv_sec >= 0 && timeout.tv_sec <= 5 && timeout.tv_nsec >= 0 &&
          timeout.tv_nsec < 1000000000L && (timeout.tv_sec != 0 || timeout.tv_nsec != 0));
+
+    /* A later mmsghdr import fault still returns the received prefix through
+     * the common epilogue, which must copy the remaining writable timeout. */
+    long page_size = sysconf(_SC_PAGESIZE);
+    mark("PAGE_SIZE", page_size > (long)sizeof(struct mmsghdr));
+    void *guarded = mmap(NULL, (size_t)page_size * 2, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mark("GUARD_MAPPING", guarded != MAP_FAILED);
+    struct mmsghdr *guarded_first = (struct mmsghdr *)((char *)guarded + page_size -
+                                                       sizeof(struct mmsghdr));
+    struct iovec guarded_iov = {.iov_base = batch.buffers[0], .iov_len = RECORD_CAPACITY};
+    memset(guarded_first, 0, sizeof(*guarded_first));
+    guarded_first->msg_hdr.msg_iov = &guarded_iov;
+    guarded_first->msg_hdr.msg_iovlen = 1;
+    mark("GUARD_PROTECT", mprotect((char *)guarded + page_size, (size_t)page_size, PROT_NONE) == 0);
+    struct timespec guarded_timeout = {.tv_sec = 30};
+    int guard_receiver = -1;
+    int guard_sender = -1;
+    udp_pair(&guard_receiver, &guard_sender);
+    mark("GUARD_QUEUE", send(guard_sender, "g", 1, 0) == 1);
+    errno = 0;
+    count = recvmmsg(guard_receiver, guarded_first, 2, MSG_DONTWAIT, &guarded_timeout);
+    mark("GUARD_PARTIAL_COUNT", count == 1 && guarded_first->msg_len == 1 && batch.buffers[0][0] == 'g');
+    mark("GUARD_REMAINING_TIMEOUT",
+         guarded_timeout.tv_sec >= 0 && guarded_timeout.tv_sec < 30 &&
+         guarded_timeout.tv_nsec >= 0 && guarded_timeout.tv_nsec < 1000000000L);
+    close(guard_receiver);
+    close(guard_sender);
+    mark("GUARD_UNMAP", munmap(guarded, (size_t)page_size * 2) == 0);
+
+    /* The second mmsghdr remains readable, but its msg_len output field lies
+     * on a read-only page. Its receive still commits; timeout copyout must not
+     * be skipped when publishing the earlier completed prefix. */
+    void *readonly_result = mmap(NULL, (size_t)page_size * 2, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mark("MSG_LEN_MAPPING", readonly_result != MAP_FAILED);
+    struct mmsghdr *readonly_second = (struct mmsghdr *)((char *)readonly_result + page_size -
+                                                         offsetof(struct mmsghdr, msg_len));
+    struct mmsghdr *readonly_first = (struct mmsghdr *)((char *)readonly_second -
+                                                        sizeof(*readonly_second));
+    char result_payloads[2][RECORD_CAPACITY] = {{0}};
+    struct iovec result_iovs[2] = {
+        {.iov_base = result_payloads[0], .iov_len = RECORD_CAPACITY},
+        {.iov_base = result_payloads[1], .iov_len = RECORD_CAPACITY},
+    };
+    memset(readonly_first, 0, 2 * sizeof(*readonly_first));
+    readonly_first->msg_hdr.msg_iov = &result_iovs[0];
+    readonly_first->msg_hdr.msg_iovlen = 1;
+    readonly_second->msg_hdr.msg_iov = &result_iovs[1];
+    readonly_second->msg_hdr.msg_iovlen = 1;
+    readonly_second->msg_len = 0x5a5a;
+    mark("MSG_LEN_PROTECT",
+         mprotect((char *)readonly_result + page_size, (size_t)page_size, PROT_READ) == 0);
+    struct timespec result_timeout = {.tv_sec = 30};
+    int result_receiver = -1;
+    int result_sender = -1;
+    udp_pair(&result_receiver, &result_sender);
+    mark("MSG_LEN_QUEUE", send(result_sender, "a", 1, 0) == 1 &&
+                             send(result_sender, "b", 1, 0) == 1);
+    errno = 0;
+    count = recvmmsg(result_receiver, readonly_first, 2, MSG_DONTWAIT, &result_timeout);
+    mark("MSG_LEN_PARTIAL_COUNT",
+         count == 1 && readonly_first->msg_len == 1 && result_payloads[0][0] == 'a');
+    mark("MSG_LEN_REMAINING_TIMEOUT",
+         result_timeout.tv_sec >= 0 && result_timeout.tv_sec < 30 &&
+         result_timeout.tv_nsec >= 0 && result_timeout.tv_nsec < 1000000000L);
+    mark("MSG_LEN_FAULT_CONSUMED",
+         readonly_second->msg_len == 0x5a5a && result_payloads[1][0] == 'b');
+    close(result_receiver);
+    close(result_sender);
+    mark("MSG_LEN_UNMAP", munmap(readonly_result, (size_t)page_size * 2) == 0);
+
+    /* A failing timeout copyout takes precedence over the positive receive
+     * count, while the already-published message result remains committed. */
+    void *readonly_timeout_page = mmap(NULL, (size_t)page_size, PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mark("TIMEOUT_MAPPING", readonly_timeout_page != MAP_FAILED);
+    struct timespec *readonly_timeout = readonly_timeout_page;
+    *readonly_timeout = (struct timespec){.tv_sec = 30};
+    mark("TIMEOUT_PROTECT",
+         mprotect(readonly_timeout_page, (size_t)page_size, PROT_READ) == 0);
+    struct mmsghdr readonly_timeout_message = {0};
+    struct iovec readonly_timeout_iov = {.iov_base = result_payloads[0], .iov_len = RECORD_CAPACITY};
+    readonly_timeout_message.msg_hdr.msg_iov = &readonly_timeout_iov;
+    readonly_timeout_message.msg_hdr.msg_iovlen = 1;
+    int timeout_receiver = -1;
+    int timeout_sender = -1;
+    udp_pair(&timeout_receiver, &timeout_sender);
+    mark("TIMEOUT_QUEUE", send(timeout_sender, "t", 1, 0) == 1);
+    errno = 0;
+    count = recvmmsg(timeout_receiver, &readonly_timeout_message, 1, MSG_DONTWAIT, readonly_timeout);
+    mark("READONLY_TIMEOUT_EFAULT", count == -1 && errno == EFAULT);
+    mark("READONLY_TIMEOUT_RECEIVE_COMMITTED",
+         readonly_timeout_message.msg_len == 1 && result_payloads[0][0] == 't');
+    close(timeout_receiver);
+    close(timeout_sender);
+    mark("TIMEOUT_UNMAP", munmap(readonly_timeout_page, (size_t)page_size) == 0);
 
     /* poll_select_set_timeout() keeps a zero timeout at zero, so the deadline
      * is already expired after the first datagram. */

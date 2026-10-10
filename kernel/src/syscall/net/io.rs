@@ -2486,6 +2486,23 @@ fn recvmmsg_timeout(
     Ok(Some(timeout))
 }
 
+/// Finalizes a receive batch after its loop has stopped, including on a
+/// partial-result condition. Linux copies the reduced relative timeout after
+/// `do_recvmmsg()` returns a positive datagram count, even when a later
+/// message header/result copy prevented another iteration.
+fn finish_recvmmsg_batch(
+    received: usize,
+    remaining: Option<Timespec64>,
+    write_timeout: impl FnOnce(Timespec64) -> AxResult<()>,
+) -> AxResult<isize> {
+    if received != 0 {
+        if let Some(remaining) = remaining {
+            write_timeout(remaining)?;
+        }
+    }
+    Ok(received as isize)
+}
+
 fn monotonic_timespec64() -> Timespec64 {
     let nanos = monotonic_time().as_nanos() as u64;
     Timespec64::new(
@@ -2555,7 +2572,9 @@ pub fn sys_recvmmsg(
         let ptr = match mmsg_address(base, idx) {
             Ok(ptr) => ptr,
             Err(_err) if received != 0 => {
-                return Ok(received as isize);
+                // Defer the partial result to the common epilogue so the
+                // reduced timeout is still copied back after prior receives.
+                break;
             }
             Err(err) => return Err(err),
         };
@@ -2568,7 +2587,9 @@ pub fn sys_recvmmsg(
             match ImportedRecvMessage::import(&capability, msg, defer_payload_fault) {
                 Ok(imported) => imported,
                 Err(_err) if received != 0 => {
-                    return Ok(received as isize);
+                    // Linux returns the completed prefix, then writes the
+                    // remaining timeout from its common syscall epilogue.
+                    break;
                 }
                 Err(err) => return Err(err),
             }
@@ -2620,7 +2641,9 @@ pub fn sys_recvmmsg(
                     len as u32,
                 ) {
                     if received != 0 {
-                        return Ok(received as isize);
+                        // `do_recvmmsg()` returns its completed prefix here;
+                        // its caller still writes the remaining timeout.
+                        break;
                     }
                     return Err(err);
                 }
@@ -2652,9 +2675,7 @@ pub fn sys_recvmmsg(
     // `__sys_recvmmsg()` writes the possibly shortened interval back only when
     // the batch produced at least one datagram, and turns a failing copyout
     // into EFAULT even though datagrams were received.
-    if let Some(remaining) = remaining
-        && received != 0
-    {
+    finish_recvmmsg_batch(received, remaining, |remaining| {
         write_user_copy(
             &capability,
             UserPtr::<timespec>::from(timeout.address().as_usize()),
@@ -2662,9 +2683,8 @@ pub fn sys_recvmmsg(
                 tv_sec: remaining.sec,
                 tv_nsec: remaining.nsec,
             },
-        )?;
-    }
-    Ok(received as isize)
+        )
+    })
 }
 
 #[cfg(test)]
@@ -3050,6 +3070,30 @@ mod tests {
         assert!(!recvmmsg_consumes_pending_error(
             MSG_ERRQUEUE | MSG_DONTWAIT
         ));
+    }
+
+    #[test]
+    fn recvmmsg_partial_batch_writes_remaining_timeout() {
+        use core::cell::Cell;
+
+        let timeout_written = Cell::new(false);
+        let remaining = Timespec64::new(2, 345);
+        let result = finish_recvmmsg_batch(1, Some(remaining), |_| {
+            timeout_written.set(true);
+            Ok(())
+        });
+
+        assert_eq!(result, Ok(1));
+        assert!(timeout_written.get());
+    }
+
+    #[test]
+    fn recvmmsg_partial_batch_timeout_copy_fault_overrides_count() {
+        let result = finish_recvmmsg_batch(2, Some(Timespec64::new(0, 0)), |_| {
+            Err(AxError::BadAddress)
+        });
+
+        assert_eq!(result, Err(AxError::BadAddress));
     }
 
     #[test]
