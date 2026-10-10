@@ -2119,3 +2119,11 @@ the `intel_memory_region.c` lookup/avail functions to
 to `i915_utils_upstream.rs`. `intel_clock_gating.c` (MIT, Copyright 2021 Intel
 Corporation) contributes the Gen12 hook dispatch and nop body in
 `intel_clock_gating_upstream.rs`.
+Wire stage 1 (M), second batch: `i915_vma_resource.c` (MIT, Copyright 2021 Intel
+Corporation) is translated in `i915_vma_resource_upstream.rs`; its interval-tree
+pending-unbind set is walked in key order over the same red-black tree.
+`gt/uc/intel_guc_fw.c` (MIT, Copyright 2014-2018 Intel Corporation) is translated
+in `intel_guc_fw_upstream.rs`. Fail-closed definitions for LMEM/TTM, migrate,
+GSC/HECI/PXP, MTL sa_media, gen6/7 PPGTT, GMCH GGTT, ring submission, OA perf and
+debugfs are collected in `intel_unsupported_hw_upstream.rs`, one line per function
+in the source comments.
