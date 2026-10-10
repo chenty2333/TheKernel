@@ -2106,7 +2106,7 @@ The intel_gt.c body and source-location markers are present in the feature owner
 
 After registering the GT/GEM/power source-order translations, the scanner's
 whole-scope crates/ax totals are threshold >=40 `(0,0,0,763,589,0,0)` and
-threshold >=25 `(18,15,4,1988,1808,0,0)` in the test's seven-column order.
+threshold >=25 `(18,15,4,1996,1816,0,0)` in the test's seven-column order.
 The corresponding tk-intel-gt NOTICE and CI scan baseline were reconciled in
 the same change; MIT i915 text remains counted rather than exempted.
 Wire stage 1 (M): `i915_memcpy.c` (MIT, Copyright 2016 Intel Corporation) is
