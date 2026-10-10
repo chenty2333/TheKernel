@@ -2161,3 +2161,4 @@ in the source comments.
 | drivers/gpu/drm/i915/i915_params.c | i915_params_upstream.rs | i915_params_free(); MIT, Copyright © 2018 Intel Corporation |
 | drivers/gpu/drm/i915/intel_step.c | intel_step_upstream.rs | intel_step_init() with the revid tables; MIT, Copyright © 2019 Intel Corporation |
 | drivers/gpu/drm/i915/i915_vgpu.c | i915_vgpu_upstream.rs | intel_vgpu_detect/register/has_*(); PVINFO detection reads BAR0 through the probe provider; balloon paths fail closed for an active vGPU; MIT, Copyright © 2014 Intel Corporation |
+| drivers/gpu/drm/i915/vlv_suspend.c | vlv_suspend_upstream.rs | VLV/CHV S0ix entry points: upstream non-VLV early returns kept, VLV/CHV branches fail closed (482-line file outside the unsupported-hardware budget); MIT, Copyright © 2014 Intel Corporation |

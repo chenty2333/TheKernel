@@ -34,3 +34,21 @@ pub unsafe extern "C" fn vlv_iosf_sb_read(_drm: *mut c_void, _unit: u32, _addr: 
 pub unsafe extern "C" fn vlv_iosf_sb_write(_drm: *mut c_void, _unit: u32, _addr: u32, _val: u32) -> i32 {
     panic!("vlv_iosf_sb_write: VLV/CHV 不受 TheKernel 支持");
 }
+
+// upstream: vlv_iosf_sb.c vlv_iosf_sb_init()
+// The mutex and the PM QoS request are created only for VLV/CHV. On other
+// platforms the upstream function does nothing, which is the faithful path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vlv_iosf_sb_init(i915: *mut crate::linux_i915_private::DrmI915Private) {
+    if unsafe { crate::linux::i915::IS_VALLEYVIEW(i915) || crate::linux::i915::IS_CHERRYVIEW(i915) } {
+        panic!("vlv_iosf_sb_init({i915:p}): VLV/CHV 不受 TheKernel 支持");
+    }
+}
+
+// upstream: vlv_iosf_sb.c vlv_iosf_sb_fini()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vlv_iosf_sb_fini(i915: *mut crate::linux_i915_private::DrmI915Private) {
+    if unsafe { crate::linux::i915::IS_VALLEYVIEW(i915) || crate::linux::i915::IS_CHERRYVIEW(i915) } {
+        panic!("vlv_iosf_sb_fini({i915:p}): VLV/CHV 不受 TheKernel 支持");
+    }
+}

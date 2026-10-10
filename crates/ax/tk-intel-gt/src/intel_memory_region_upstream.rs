@@ -265,3 +265,152 @@ pub unsafe extern "C" fn intel_memory_region_avail(
         *visible_avail = (*mr).total;
     }
 }
+
+// ---------------------------------------------------------------------------
+// intel_memory_regions_hw_probe() / intel_memory_regions_driver_release() and
+// intel_memory_region_destroy() (intel_memory_region.c).
+// ---------------------------------------------------------------------------
+
+use crate::{
+    i915_gem_region_upstream::IntelMemoryRegionOps as RegionOps,
+    i915_gem_shmem_upstream::i915_gem_shmem_setup,
+    i915_gem_stolen_upstream::{i915_gem_stolen_lmem_setup, i915_gem_stolen_smem_setup},
+    intel_device_info_types_upstream::IntelDeviceInfo,
+    linux::{gem_memory::INTEL_MEMORY_STOLEN_LOCAL, i915::IS_DGFX, mutex::mutex_destroy as rust_mutex_destroy},
+    linux_config::{ENODEV, ERR_PTR, IS_ERR, PTR_ERR},
+};
+
+// enum intel_region_id (intel_memory_region.h)
+const INTEL_REGION_SMEM: usize = 0;
+const INTEL_REGION_LMEM_0: usize = 1;
+const INTEL_REGION_STOLEN_SMEM: usize = 5;
+const INTEL_REGION_STOLEN_LMEM: usize = 6;
+const INTEL_REGION_UNKNOWN: usize = 7;
+
+// upstream: intel_memory_region.c intel_region_map[]: (class, instance)
+const INTEL_REGION_MAP: [(u16, u16); INTEL_REGION_UNKNOWN] = [
+    (crate::linux::gem_memory::INTEL_MEMORY_SYSTEM, 0),
+    (crate::linux::gem_memory::INTEL_MEMORY_LOCAL, 0),
+    (crate::linux::gem_memory::INTEL_MEMORY_LOCAL, 1),
+    (crate::linux::gem_memory::INTEL_MEMORY_LOCAL, 2),
+    (crate::linux::gem_memory::INTEL_MEMORY_LOCAL, 3),
+    (crate::linux::gem_memory::INTEL_MEMORY_STOLEN_SYSTEM, 0),
+    (INTEL_MEMORY_STOLEN_LOCAL, 0),
+];
+
+// upstream: i915_drv.h HAS_REGION(i915, id): INTEL_INFO(i915)->memory_regions & BIT(id)
+unsafe fn has_region(i915: *mut DrmI915Private, id: usize) -> bool {
+    unsafe {
+        let info = &*((*i915).info as *const IntelDeviceInfo);
+        info.memory_regions & (1u32 << id) != 0
+    }
+}
+
+// upstream: intel_memory_region.c intel_memory_region_destroy()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_memory_region_destroy(mem: *mut IntelMemoryRegion) {
+    unsafe {
+        let ops = (*mem).ops.cast::<RegionOps>();
+        let ret = match (*ops).release {
+            Some(release) => release(mem),
+            None => 0,
+        };
+
+        GEM_WARN_ON!(
+            (*mem).objects.list.next != core::ptr::addr_of_mut!((*mem).objects.list).cast()
+        );
+        rust_mutex_destroy(&mut (*mem).objects.lock);
+        if ret == 0 {
+            kfree(mem);
+        }
+    }
+}
+
+// upstream: intel_memory_region.c intel_memory_regions_driver_release()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_memory_regions_driver_release(i915: *mut DrmI915Private) {
+    unsafe {
+        for i in 0..INTEL_REGION_UNKNOWN {
+            let region = core::mem::replace(&mut (*i915).mm.regions[i], core::ptr::null_mut());
+            if !region.is_null() {
+                intel_memory_region_destroy(region);
+            }
+        }
+    }
+}
+
+// upstream: intel_memory_region.c intel_memory_regions_hw_probe()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_memory_regions_hw_probe(i915: *mut DrmI915Private) -> c_int {
+    unsafe {
+        for i in 0..INTEL_REGION_UNKNOWN {
+            let mut mem: *mut IntelMemoryRegion = ERR_PTR(-ENODEV);
+
+            if !has_region(i915, i) {
+                continue;
+            }
+
+            let (kind, instance) = INTEL_REGION_MAP[i];
+            match i {
+                INTEL_REGION_SMEM => {
+                    if IS_DGFX(i915) {
+                        // DGFX system memory is TTM-backed (i915_gem_ttm_system_setup);
+                        // TheKernel does not support discrete graphics.
+                        panic!("i915_gem_ttm_system_setup({i915:p}): DGFX system region 不受 TheKernel 支持");
+                    }
+                    mem = i915_gem_shmem_setup(i915, kind, instance);
+                }
+                INTEL_REGION_STOLEN_LMEM => {
+                    mem = i915_gem_stolen_lmem_setup(i915, kind, instance);
+                    if !IS_ERR(mem) {
+                        (*i915).mm.stolen_region = mem;
+                    }
+                }
+                INTEL_REGION_STOLEN_SMEM => {
+                    mem = i915_gem_stolen_smem_setup(i915, kind, instance);
+                    if !IS_ERR(mem) {
+                        (*i915).mm.stolen_region = mem;
+                    }
+                }
+                _ => continue,
+            }
+
+            if IS_ERR(mem) {
+                let err = PTR_ERR(mem);
+                let kind_value = i32::from(kind);
+                drm_err!(
+                    &(*i915).drm,
+                    "Failed to setup region(%d) type=%d\n",
+                    err,
+                    kind_value
+                );
+                intel_memory_regions_driver_release(i915);
+                return err;
+            }
+
+            if !mem.is_null() {
+                (*mem).id = i as c_int;
+                (*i915).mm.regions[i] = mem;
+            }
+        }
+
+        // upstream prints each region's range with drm_dbg(); the %pR range
+        // formatting is omitted here, so only the id, class and size are logged.
+        for i in 0..INTEL_REGION_UNKNOWN {
+            let mem = (*i915).mm.regions[i];
+            if mem.is_null() {
+                continue;
+            }
+            let region_mib = (*mem).total >> 20;
+            let mem_id = (*mem).id;
+            drm_dbg!(
+                &(*i915).drm,
+                "Memory region(%d): class %d: %llu MiB\n",
+                mem_id,
+                i32::from((*mem).r#type),
+                region_mib
+            );
+        }
+        0
+    }
+}

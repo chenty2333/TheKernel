@@ -311,3 +311,208 @@ pub unsafe fn dg1_irq_postinstall<H: Gen11DisplayIrqHooks>(
         intel_uncore_posting_read(uncore, DG1_MSTR_TILE_INTR);
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// intel_irq_init/fini/install/uninstall (i915_irq.c 1003-1158) and the
+// dispatch they use. Gen11+ (including DG1-class 12.10) is translated; the
+// pre-gen11 handlers are gen2-gen10 paths that TheKernel does not support and
+// fail closed in the dispatch.
+// ---------------------------------------------------------------------------
+
+use crate::{
+    linux::{
+        dma::device_irq,
+        i915::{GRAPHICS_VER, GRAPHICS_VER_FULL, HAS_GT_UC, IP_VER, to_gt},
+        kernel_core::IRQ_CORE,
+        kernel_services::ProviderSlot,
+    },
+    intel_engine_cs_upstream::WorkStruct,
+    linux_workqueue::INIT_WORK_C,
+};
+use core::ffi::c_int;
+
+/// Display-IRQ owner callbacks: the `Gen11DisplayIrqHooks` methods, provided
+/// by the kernel display owner (`display` is `i915->display`).
+#[repr(C)]
+pub struct DisplayIrqOps {
+    pub display_irq_handler: unsafe extern "C" fn(display: *mut c_void),
+    pub gu_misc_irq_ack: unsafe extern "C" fn(display: *mut c_void, master_ctl: u32) -> u32,
+    pub gu_misc_irq_handler: unsafe extern "C" fn(display: *mut c_void, gu_misc_iir: u32),
+    pub display_irq_reset: unsafe extern "C" fn(display: *mut c_void),
+    pub display_irq_postinstall: unsafe extern "C" fn(display: *mut c_void),
+    pub pmu_irq_stats: unsafe extern "C" fn(i915: *mut DrmI915Private),
+}
+
+pub static DISPLAY_IRQ: ProviderSlot<DisplayIrqOps> = ProviderSlot::new();
+
+/// Install the kernel display-IRQ owner table. The table must be `'static`.
+pub fn install_display_irq_ops(ops: &'static DisplayIrqOps) -> Result<(), &'static str> {
+    DISPLAY_IRQ.install(ops)
+}
+
+fn display_irq() -> &'static DisplayIrqOps {
+    DISPLAY_IRQ.require("display IRQ")
+}
+
+/// `Gen11DisplayIrqHooks` backed by the installed display-IRQ owner.
+struct KernelDisplayIrqHooks;
+
+impl Gen11DisplayIrqHooks for KernelDisplayIrqHooks {
+    unsafe fn display_irq_handler(&mut self, display: *mut c_void) {
+        unsafe { (display_irq().display_irq_handler)(display) }
+    }
+    unsafe fn gu_misc_irq_ack(&mut self, display: *mut c_void, master_ctl: u32) -> u32 {
+        unsafe { (display_irq().gu_misc_irq_ack)(display, master_ctl) }
+    }
+    unsafe fn gu_misc_irq_handler(&mut self, display: *mut c_void, gu_misc_iir: u32) {
+        unsafe { (display_irq().gu_misc_irq_handler)(display, gu_misc_iir) }
+    }
+    unsafe fn display_irq_reset(&mut self, display: *mut c_void) {
+        unsafe { (display_irq().display_irq_reset)(display) }
+    }
+    unsafe fn display_irq_postinstall(&mut self, display: *mut c_void) {
+        unsafe { (display_irq().display_irq_postinstall)(display) }
+    }
+    unsafe fn pmu_irq_stats(&mut self, i915: *mut DrmI915Private) {
+        unsafe { (display_irq().pmu_irq_stats)(i915) }
+    }
+}
+
+// Byte offset of `struct intel_l3_parity l3_parity` in `struct drm_i915_private`
+// (x86_64 oracle, pahole on i915_layout_probe.o): remap_info[2]@0, error_work@16.
+const I915_L3_PARITY_OFFSET: usize = 3056;
+// intel_gt_irq / intel_guc_regs.h: GUC_INTR_GUC2HOST is BIT(15).
+const GUC_INTR_GUC2HOST: u32 = 1 << 15;
+const MAX_L3_SLICES: usize = 2;
+
+// upstream: i915_irq.c ivb_parity_work() (Gen7 L3 parity, IVB only)
+unsafe extern "C" fn ivb_parity_work(_work: *mut WorkStruct) {
+    panic!("ivb_parity_work: Gen7 L3 parity interrupt is not supported by TheKernel");
+}
+
+type IrqHandler = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
+
+// upstream: i915_irq.c gen11_irq_handler()/dg1_irq_handler() via the
+// irq_handler_t wrappers that intel_irq_handler() selects.
+unsafe extern "C" fn gen11_irq_entry(_irq: c_int, data: *mut c_void) -> c_int {
+    let mut hooks = KernelDisplayIrqHooks;
+    unsafe { gen11_irq_handler(data.cast::<DrmI915Private>(), &mut hooks) }
+}
+
+unsafe extern "C" fn dg1_irq_entry(_irq: c_int, data: *mut c_void) -> c_int {
+    let mut hooks = KernelDisplayIrqHooks;
+    unsafe { dg1_irq_handler(data.cast::<DrmI915Private>(), &mut hooks) }
+}
+
+// upstream: i915_irq.c intel_irq_handler()
+unsafe fn intel_irq_handler_for(i915: *mut DrmI915Private) -> IrqHandler {
+    unsafe {
+        if GRAPHICS_VER_FULL(i915) >= IP_VER(12, 10) {
+            dg1_irq_entry
+        } else if GRAPHICS_VER(i915) >= 11 {
+            gen11_irq_entry
+        } else {
+            panic!("intel_irq_handler: pre-gen11 interrupt path is not supported by TheKernel");
+        }
+    }
+}
+
+// upstream: i915_irq.c intel_irq_reset()
+unsafe fn intel_irq_reset_hw(i915: *mut DrmI915Private) {
+    let mut hooks = KernelDisplayIrqHooks;
+    unsafe {
+        if GRAPHICS_VER_FULL(i915) >= IP_VER(12, 10) {
+            dg1_irq_reset(i915, &mut hooks);
+        } else if GRAPHICS_VER(i915) >= 11 {
+            gen11_irq_reset(i915, &mut hooks);
+        } else {
+            panic!("intel_irq_reset: pre-gen11 interrupt path is not supported by TheKernel");
+        }
+    }
+}
+
+// upstream: i915_irq.c intel_irq_postinstall()
+unsafe fn intel_irq_postinstall_hw(i915: *mut DrmI915Private) {
+    let mut hooks = KernelDisplayIrqHooks;
+    unsafe {
+        if GRAPHICS_VER_FULL(i915) >= IP_VER(12, 10) {
+            dg1_irq_postinstall(i915, &mut hooks);
+        } else if GRAPHICS_VER(i915) >= 11 {
+            gen11_irq_postinstall(i915, &mut hooks);
+        } else {
+            panic!("intel_irq_postinstall: pre-gen11 interrupt path is not supported by TheKernel");
+        }
+    }
+}
+
+// upstream: i915_irq.c intel_irq_init()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_irq_init(dev_priv: *mut DrmI915Private) {
+    unsafe {
+        let l3 = (dev_priv as *mut u8).add(I915_L3_PARITY_OFFSET);
+        INIT_WORK_C(&mut *(l3.add(16).cast::<WorkStruct>()), ivb_parity_work);
+        for i in 0..MAX_L3_SLICES {
+            *l3.cast::<*mut c_void>().add(i) = core::ptr::null_mut();
+        }
+
+        // pre-gen11 the guc irqs bits are in the upper 16 bits of the pm reg
+        if HAS_GT_UC(dev_priv) && GRAPHICS_VER(dev_priv) < 11 {
+            (*to_gt(dev_priv)).pm_guc_events = GUC_INTR_GUC2HOST << 16;
+        }
+    }
+}
+
+// upstream: i915_irq.c intel_irq_fini()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_irq_fini(i915: *mut DrmI915Private) {
+    unsafe extern "C" {
+        fn kfree(ptr: *mut c_void);
+    }
+    unsafe {
+        let l3 = (i915 as *mut u8).add(I915_L3_PARITY_OFFSET);
+        for i in 0..MAX_L3_SLICES {
+            let slot = l3.cast::<*mut c_void>().add(i);
+            // kfree(NULL) is a no-op in Linux.
+            if !(*slot).is_null() {
+                kfree(*slot);
+            }
+        }
+    }
+}
+
+// upstream: i915_irq.c intel_irq_install()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_irq_install(dev_priv: *mut DrmI915Private) -> c_int {
+    unsafe {
+        let irq = device_irq((*dev_priv).drm.dev);
+        // Interrupt sources are enabled in postinstall, so mark interrupts as
+        // enabled before that to match upstream's ordering.
+        (*dev_priv).irqs_enabled = true;
+        intel_irq_reset_hw(dev_priv);
+
+        let handler = intel_irq_handler_for(dev_priv);
+        let ret = (IRQ_CORE.require("IRQ").request_irq)(irq, handler, dev_priv.cast());
+        if ret < 0 {
+            (*dev_priv).irqs_enabled = false;
+            return ret;
+        }
+
+        intel_irq_postinstall_hw(dev_priv);
+        ret
+    }
+}
+
+// upstream: i915_irq.c intel_irq_uninstall()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_irq_uninstall(dev_priv: *mut DrmI915Private) {
+    unsafe {
+        let irq = device_irq((*dev_priv).drm.dev);
+        if drm_WARN_ON!(&(*dev_priv).drm, !(*dev_priv).irqs_enabled) {
+            return;
+        }
+        intel_irq_reset_hw(dev_priv);
+        (IRQ_CORE.require("IRQ").free_irq)(irq, dev_priv.cast());
+        (*dev_priv).irqs_enabled = false;
+    }
+}

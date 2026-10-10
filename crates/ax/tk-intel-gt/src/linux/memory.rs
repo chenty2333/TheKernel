@@ -194,6 +194,9 @@ pub unsafe extern "C" fn drmm_kzalloc_c(drm: *mut c_void, size: usize, flags: u3
 /// `drm` must be the device passed to earlier `drmm_kzalloc_c` calls and no
 /// returned object may be used after this call.
 pub unsafe fn drmm_release_all(drm: *mut c_void) {
+    // drmm actions run before the managed allocations are freed, as in Linux's
+    // drm_managed_release().
+    unsafe { crate::linux::kernel_core::drmm_run_actions(drm) };
     let owned = DRMM_ALLOCATIONS.lock().remove(&(drm as usize));
     for object in owned.into_iter().flatten() {
         unsafe { kfree(object as *mut c_void) };

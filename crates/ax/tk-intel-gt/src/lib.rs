@@ -674,3 +674,6 @@ pub(crate) mod i915_params_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod intel_step_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod vlv_suspend_upstream;

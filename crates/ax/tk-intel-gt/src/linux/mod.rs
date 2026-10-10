@@ -97,3 +97,6 @@ pub mod dma;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod kernel_services;
+
+/// Linux core APIs with kernel-installed PCI/DMA providers (see PROVIDERS.md).
+pub mod kernel_core;

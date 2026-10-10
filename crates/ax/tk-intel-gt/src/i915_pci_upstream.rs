@@ -30,7 +30,7 @@ const TAINT_USER: u32 = 6;
 unsafe extern "C" {
     fn pci_get_drvdata(pdev: *mut c_void) -> *mut c_void;
     fn pci_set_drvdata(pdev: *mut c_void, data: *mut c_void);
-    fn add_taint(flag: u32, lockdep_ok: u32);
+    fn add_taint(flag: u32, lockdep_ok: i32);
     /// `pci_resource_flags()`, owned by the LinuxKPI PCI layer (L1).
     fn pci_resource_flags(pdev: *mut c_void, bar: c_int) -> u64;
     /// `pci_resource_len()`, owned by the LinuxKPI PCI layer (L1).
@@ -531,7 +531,7 @@ pub unsafe fn i915_pci_probe(pdev: *mut c_void, device: u16, info: &IntelDeviceI
             "Force probing unsupported Device ID {:04x}, tainting kernel",
             device
         );
-        unsafe { add_taint(TAINT_USER, LOCKDEP_STILL_OK) };
+        unsafe { add_taint(TAINT_USER, LOCKDEP_STILL_OK as i32) };
     }
 
     // Only bind to function 0 of the device. Early generations used function
