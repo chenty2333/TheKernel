@@ -5,6 +5,26 @@
 #![no_std]
 #![feature(c_variadic)]
 #![deny(unsafe_code)]
+// The `upstream-gt` modules are line-by-line translations of C: their unsafe
+// blocks mirror the C statements and carry `// upstream:` provenance rather
+// than per-block SAFETY prose, and their own `#![allow(unsafe_code)]` repeats
+// the gate on the module declaration.
+#![cfg_attr(
+    feature = "upstream-gt",
+    allow(
+        clippy::undocumented_unsafe_blocks,
+        clippy::duplicated_attributes,
+        // C pointer-taking functions, `goto`-as-loop, GEM_BUG_ON range checks
+        // and `(0 << n)` field constants are kept as written upstream.
+        clippy::not_unsafe_ptr_arg_deref,
+        clippy::macro_metavars_in_unsafe,
+        clippy::never_loop,
+        clippy::absurd_extreme_comparisons,
+        clippy::swap_ptr_to_ref,
+        clippy::erasing_op,
+        clippy::empty_line_after_doc_comments
+    )
+)]
 extern crate alloc;
 #[cfg(test)]
 extern crate std;

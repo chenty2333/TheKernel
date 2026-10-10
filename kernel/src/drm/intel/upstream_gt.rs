@@ -22,6 +22,7 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
+use intel_gt::linux::gem_memory::NotifierBlock;
 use intel_gt::linux_platform::{I915PlatformOps, install_i915_platform_ops};
 
 use super::pci;
@@ -407,6 +408,7 @@ unsafe extern "C" fn kernel_pci_revision(_i915: *mut c_void, revision: *mut u8) 
         return -ENODEV;
     };
     let shift = u32::from(PCI_REVISION_ID & 0x3) * 8;
+    // SAFETY: the caller passes a writable u8 out-parameter (Linux `pci_read_config_byte` contract).
     unsafe { *revision = (dword >> shift) as u8 };
     0
 }
@@ -920,6 +922,7 @@ unsafe extern "C" fn kernel_task_comm(task: *const c_void, buf: *mut c_char) {
     assert!(!buf.is_null(), "task_comm into a null buffer");
     assert_current_task(task);
     let bytes = current_comm_bytes();
+    // SAFETY: Linux `get_task_comm` callers pass a buffer of TASK_COMM_LEN bytes.
     let out = unsafe { core::slice::from_raw_parts_mut(buf.cast::<u8>(), TASK_COMM_LEN) };
     out.fill(0);
     out[..bytes.len()].copy_from_slice(&bytes);
@@ -948,6 +951,7 @@ unsafe extern "C" fn kernel_task_pid(task: *mut c_void, _pid_type: c_int) -> *mu
 
 unsafe extern "C" fn kernel_pid_nr(pid: *const c_void) -> c_int {
     assert!(!pid.is_null(), "pid_nr on a null pid");
+    // SAFETY: non-null pids come from `get_task_pid`, which boxes a c_int.
     unsafe { *pid.cast::<c_int>() }
 }
 
@@ -955,6 +959,7 @@ unsafe extern "C" fn kernel_put_pid(pid: *mut c_void) {
     if pid.is_null() {
         return;
     }
+    // SAFETY: `put_pid` releases the box `get_task_pid` leaked; each pid is put once.
     drop(unsafe { Box::from_raw(pid.cast::<c_int>()) });
 }
 
@@ -1003,10 +1008,12 @@ struct AnonFile {
 // SAFETY: the LinuxKPI file is only released through `fput`, which is itself
 // safe to call from any thread once the reference is owned here.
 unsafe impl Send for AnonFile {}
+// SAFETY: the LinuxKPI file is only reached through its refcounted fput/get API, which is thread-safe.
 unsafe impl Sync for AnonFile {}
 
 impl Drop for AnonFile {
     fn drop(&mut self) {
+        // SAFETY: this wrapper owns one file reference, dropped exactly once here.
         unsafe { intel_gt::linux::shmem::fput(self.file as *mut c_void) };
     }
 }
@@ -1048,10 +1055,12 @@ unsafe extern "C" fn kernel_anon_inode_getfile(
     private_data: *mut c_void,
     flags: c_int,
 ) -> *mut c_void {
+    // SAFETY: `name` is the caller's NUL-terminated C string (Linux `anon_inode_getfile` contract).
     let file = unsafe { intel_gt::linux::shmem::shmem_file_setup(name, 0, 0) };
     if intel_gt::linux_config::IS_ERR(file) {
         return file.cast();
     }
+    // SAFETY: `file` was just returned non-null by `shmem_file_setup` and is not yet shared.
     unsafe {
         (*file).f_op = fops.cast();
         (*file)._private_data = private_data;
@@ -1149,6 +1158,7 @@ unsafe extern "C" fn kernel_request_mem_region(
     };
     let mut claims = CLAIMED_REGIONS.lock();
     let overlaps = claims.iter().any(|(&claimed_start, &resource)| {
+        // SAFETY: every claim value is a live boxed Resource owned by the claims map.
         let claimed_end = unsafe { (*(resource as *const Resource)).end };
         claimed_start <= end && start <= claimed_end
     });
@@ -1158,6 +1168,7 @@ unsafe extern "C" fn kernel_request_mem_region(
     let label = if name.is_null() {
         CString::default()
     } else {
+        // SAFETY: non-null names are NUL-terminated C strings from the Linux caller.
         CString::from(unsafe { core::ffi::CStr::from_ptr(name) })
     };
     let resource = Box::into_raw(Box::new(Resource {
@@ -1434,6 +1445,7 @@ unsafe extern "C" fn kernel_read_config_dword(
     }
     match with_config_read(|config| config.read_u32(bdf, offset)) {
         Some(word) => {
+            // SAFETY: the caller passes a writable u16 out-parameter (Linux `pci_read_config_word` contract).
             unsafe { *value = word };
             0
         }
@@ -1471,12 +1483,15 @@ unsafe extern "C" fn kernel_release_resource(res: *mut c_void) {
     if res.is_null() {
         return;
     }
+    // SAFETY: `res` is a Resource returned by `request_mem_region` and not yet released.
     let start = unsafe { (*res.cast::<Resource>()).start };
     let mut claims = CLAIMED_REGIONS.lock();
     if claims.get(&start).copied() == Some(res as usize) {
         claims.remove(&start);
+        // SAFETY: the claim was found in the map, so this box is still owned here and released once.
         let resource = unsafe { Box::from_raw(res.cast::<Resource>()) };
         if !resource.name.is_null() {
+            // SAFETY: the name was leaked from a CString when the region was claimed.
             drop(unsafe { CString::from_raw(resource.name.cast_mut()) });
         }
     }
@@ -1558,6 +1573,7 @@ unsafe extern "C" fn kernel_pm_suspended(_dev: *mut c_void) -> bool {
 // flags only steer when runtime suspend is attempted. TheKernel never runs
 // that policy, so these accept the call and keep no state.
 unsafe extern "C" fn kernel_pm_put_autosuspend(dev: *mut c_void) -> c_int {
+    // SAFETY: same contract as `pm_runtime_put` for the caller's device.
     unsafe { kernel_pm_put(dev) }
 }
 unsafe extern "C" fn kernel_pm_mark_last_busy(_dev: *mut c_void) {}
@@ -1619,6 +1635,7 @@ fn smp_ipi_handler() {
     // SAFETY: `func` was stored from a live `extern "C" fn(*mut c_void)` by
     // the caller, which waits for this CPU's completion before returning.
     let func: unsafe extern "C" fn(*mut c_void) = unsafe { core::mem::transmute(func) };
+    // SAFETY: the IPI argument carries the C callback and argument published by `call_on_other_cpus`.
     unsafe { func(arg) };
     SMP_DONE.fetch_add(1, Ordering::AcqRel);
 }
@@ -1677,12 +1694,14 @@ unsafe extern "C" fn kernel_stop_machine(
     let _serial = SMP_SERIAL.lock();
     let others = other_cpu_count();
     if others == 0 {
+        // SAFETY: `func`/`data` are the stop_machine callback and its argument from the Linux caller.
         return unsafe { func(data) };
     }
     SMP_MODE.store(SMP_MODE_STOP, Ordering::Release);
     SMP_RESUME.store(false, Ordering::Release);
     send_ipi_to_others();
     wait_until(|| SMP_PARKED.load(Ordering::Acquire) == others);
+    // SAFETY: as above; the other CPUs are parked in the IPI until it returns.
     let result = unsafe { func(data) };
     SMP_RESUME.store(true, Ordering::Release);
     wait_until(|| SMP_PARKED.load(Ordering::Acquire) == 0);
@@ -1779,7 +1798,7 @@ unsafe extern "C" fn kernel_punit_assert_acquired() {
 /// Entries are the notifier blocks registered by their owners.
 static PMIC_NOTIFIERS: spin::Mutex<Vec<usize>> = spin::Mutex::new(Vec::new());
 
-unsafe extern "C" fn kernel_register_pmic_bus_access_notifier(nb: *mut c_void) -> c_int {
+unsafe extern "C" fn kernel_register_pmic_bus_access_notifier(nb: *mut NotifierBlock) -> c_int {
     assert!(!nb.is_null(), "PMIC notifier registered with a null block");
     let mut chain = PMIC_NOTIFIERS.lock();
     if chain.contains(&(nb as usize)) {
@@ -1789,7 +1808,7 @@ unsafe extern "C" fn kernel_register_pmic_bus_access_notifier(nb: *mut c_void) -
     0
 }
 
-unsafe extern "C" fn kernel_unregister_pmic_bus_access_notifier_unlocked(nb: *mut c_void) -> c_int {
+unsafe extern "C" fn kernel_unregister_pmic_bus_access_notifier_unlocked(nb: *mut NotifierBlock) -> c_int {
     let mut chain = PMIC_NOTIFIERS.lock();
     match chain.iter().position(|&entry| entry == nb as usize) {
         Some(index) => {
@@ -1807,24 +1826,12 @@ unsafe extern "C" fn kernel_display_has_fpga_dbg(_display: *mut c_void) -> bool 
     true
 }
 
-/// The uncore table takes `*mut NotifierBlock`, a `tk-intel-gt` type this
-/// crate cannot name. The notifier functions only ever compare and store the
-/// pointer, so the `*mut c_void` form has the same ABI and is converted here.
 static UNCORE_KERNEL_OPS: UncoreKernelOps = UncoreKernelOps {
     punit_acquire: kernel_punit_acquire,
     punit_release: kernel_punit_release,
     punit_assert_acquired: kernel_punit_assert_acquired,
-    register_pmic_bus_access_notifier: unsafe {
-        core::mem::transmute(
-            kernel_register_pmic_bus_access_notifier as unsafe extern "C" fn(*mut c_void) -> c_int,
-        )
-    },
-    unregister_pmic_bus_access_notifier_unlocked: unsafe {
-        core::mem::transmute(
-            kernel_unregister_pmic_bus_access_notifier_unlocked
-                as unsafe extern "C" fn(*mut c_void) -> c_int,
-        )
-    },
+    register_pmic_bus_access_notifier: kernel_register_pmic_bus_access_notifier,
+    unregister_pmic_bus_access_notifier_unlocked: kernel_unregister_pmic_bus_access_notifier_unlocked,
     display_has_fpga_dbg: kernel_display_has_fpga_dbg,
 };
 

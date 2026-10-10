@@ -88,6 +88,7 @@ pub(super) fn probe(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, Str
     }
     let device_info = pci_match_id(info.device_id)
         .ok_or_else(|| format!("upstream i915: device {:04x} not in pciidlist", info.device_id))?;
+    // SAFETY: boot-time single-threaded writes to the x86 data symbols before any reader (the probe) runs.
     unsafe {
         tsc_khz = u32::try_from(axhal::time::nanos_to_ticks(1_000_000)).unwrap_or(u32::MAX);
         if let Ok(range) = super::fastboot::stolen_range(&ecam, &window, bdf) {
@@ -100,10 +101,12 @@ pub(super) fn probe(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, Str
     upstream_gt::register_display_window(window);
     super::irq::upstream::install(bdf).map_err(|e| format!("upstream i915: {e}"))?;
     let pdev = upstream_gt::native_pci_device(bdf);
+    // SAFETY: `pdev` is the native PCI identity for `bdf`; `device_info` matches its device id.
     let ret = unsafe { i915_pci_probe(pdev, info.device_id, device_info) };
     if ret != 0 {
         return Err(format!("upstream i915: i915_pci_probe({:04x}) failed: {ret}", info.device_id));
     }
+    // SAFETY: a successful probe stored the i915 device as the drvdata of `pdev`.
     let i915 = unsafe { pci_get_drvdata(pdev) };
     upstream_gt::register_upstream_i915(i915).map_err(|e| format!("upstream i915: {e}"))?;
     Ok(format!("upstream i915: probed {:04x} rev {:02x}", info.device_id, info.revision))

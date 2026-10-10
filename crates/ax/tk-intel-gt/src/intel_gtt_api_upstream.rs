@@ -474,7 +474,9 @@ unsafe fn sg_next(sg: *mut SgEntry) -> *mut SgEntry {
     if page_link & SG_END != 0 {
         return ptr::null_mut();
     }
-    let next = unsafe { sg.add(1) };
+    // `SgEntry` is an opaque zero-sized handle: step by the real
+    // `struct scatterlist` size, as `sg + 1` does in C.
+    let next = unsafe { sg.cast::<ScatterListDmaView>().add(1).cast::<SgEntry>() };
     let next_flags = unsafe { (*next.cast::<ScatterListDmaView>()).page_link } & SG_PAGE_LINK_MASK;
     if next_flags & SG_CHAIN != 0 {
         (unsafe { (*next.cast::<ScatterListDmaView>()).page_link } & !SG_PAGE_LINK_MASK)

@@ -25,7 +25,7 @@ pub(crate) mod fields;
 #[allow(unsafe_code)]
 pub(crate) mod firmware;
 pub(crate) mod gem;
-pub(crate) mod gem_memory;
+pub mod gem_memory;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod highmem;

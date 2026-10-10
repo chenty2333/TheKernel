@@ -825,8 +825,10 @@ pub(super) mod upstream {
         if handler == 0 {
             return false;
         }
-        let handler: Handler = unsafe { core::mem::transmute(handler) };
+        // SAFETY: HANDLER only ever holds a `Handler` stored by `request_irq`.
+        let handler: Handler = unsafe { core::mem::transmute::<usize, Handler>(handler) };
         let dev_id = DEV_ID.load(Ordering::Acquire) as *mut c_void;
+        // SAFETY: the handler and its dev_id were registered together by `request_irq`; Linux calls it in hard-IRQ context exactly like this.
         let _ = unsafe { handler(0, dev_id) } == IRQ_HANDLED;
         true
     }
