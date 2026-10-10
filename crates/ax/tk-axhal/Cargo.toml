@@ -167,3 +167,6 @@ layer = "platform"
 [package.metadata.thekernel.host-test]
 selected = true
 features = ["ipi", "pmu"]
+
+[dev-dependencies.crate_interface]
+version = "0.1"

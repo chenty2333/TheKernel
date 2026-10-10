@@ -3548,6 +3548,7 @@ dependencies = [
  "axconfig",
  "axplat",
  "cfg-if",
+ "crate_interface 0.1.4",
  "fdt-parser",
  "heapless 0.9.3",
  "kernel_guard",

@@ -60,6 +60,11 @@
 #![feature(associated_type_defaults)]
 #![cfg_attr(feature = "dyn", feature(used_with_arg))]
 
+// A standalone component test has no kernel to own the DMA services.
+#[cfg(test)]
+#[path = "../../tk-vtd/tests/support/identity.rs"]
+mod hosted_identity;
+
 #[macro_use]
 extern crate log;
 

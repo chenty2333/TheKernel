@@ -34,6 +34,11 @@ compile_error!("axhal supports x86_64 targets only");
 #[cfg(test)]
 extern crate std;
 
+// Standalone HAL tests have no kernel interrupt-remapping service.
+#[cfg(test)]
+#[path = "../../tk-vtd/tests/support/identity.rs"]
+mod hosted_identity;
+
 #[allow(unused_imports)]
 #[macro_use]
 extern crate log;
