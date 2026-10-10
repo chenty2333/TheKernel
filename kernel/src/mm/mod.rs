@@ -18,7 +18,7 @@ pub(crate) mod vm_events;
 mod swap;
 pub(crate) mod swap_io_events;
 mod thp;
-mod tlb;
+pub(crate) mod tlb;
 mod usercopy;
 mod userfaultfd;
 

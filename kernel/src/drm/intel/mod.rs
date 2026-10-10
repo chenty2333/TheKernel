@@ -130,6 +130,8 @@ mod sink;
 mod swing;
 mod tc_modeset;
 mod timing;
+#[cfg(feature = "intel-upstream-gt")]
+mod upstream_gt;
 
 #[cfg(test)]
 mod testbus;
