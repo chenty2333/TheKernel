@@ -346,7 +346,6 @@ unsafe extern "C" {
         count: u32,
         data: *mut c_void,
     ) -> c_int;
-    fn i915_gem_context_is_banned(i915: *mut DrmI915Private) -> bool;
     fn intel_gt_terminally_wedged(gt: *mut IntelGt) -> c_int;
     fn i915_reset_count(error: *const crate::linux_i915_private::I915GpuError) -> u32;
     fn xa_store(xa: *mut XArray, index: c_ulong, entry: *mut c_void, gfp: u32) -> *mut c_void;

@@ -190,7 +190,6 @@ unsafe extern "C" {
         max_eus_per_subslice: u8,
     );
     pub fn intel_sseu_subslice_total(sseu: *const SseuDevInfo) -> u32;
-    pub fn intel_sseu_get_compute_subslices(sseu: *const SseuDevInfo) -> IntelSseuSsMask;
     pub fn intel_sseu_info_init(gt: *mut IntelGt);
     pub fn intel_sseu_make_rpcs(gt: *mut IntelGt, req_sseu: *const IntelSseu) -> u32;
     pub fn intel_sseu_dump(sseu: *const SseuDevInfo, printer: *mut DrmPrinter);
