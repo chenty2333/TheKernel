@@ -2157,3 +2157,7 @@ in `intel_guc_fw_upstream.rs`. Fail-closed definitions for LMEM/TTM, migrate,
 GSC/HECI/PXP, MTL sa_media, gen6/7 PPGTT, GMCH GGTT, ring submission, OA perf and
 debugfs are collected in `intel_unsupported_hw_upstream.rs`, one line per function
 in the source comments.
+| drivers/gpu/drm/i915/i915_edram.c | i915_edram_upstream.rs | i915_edram_detect(); MIT, Copyright © 2025 Intel Corporation |
+| drivers/gpu/drm/i915/i915_params.c | i915_params_upstream.rs | i915_params_free(); MIT, Copyright © 2018 Intel Corporation |
+| drivers/gpu/drm/i915/intel_step.c | intel_step_upstream.rs | intel_step_init() with the revid tables; MIT, Copyright © 2019 Intel Corporation |
+| drivers/gpu/drm/i915/i915_vgpu.c | i915_vgpu_upstream.rs | intel_vgpu_detect/register/has_*(); PVINFO detection reads BAR0 through the probe provider; balloon paths fail closed for an active vGPU; MIT, Copyright © 2014 Intel Corporation |

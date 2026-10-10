@@ -36,6 +36,8 @@ pub unsafe extern "C" fn i915_memcpy_from_wc(dst: *mut c_void, src: *const c_voi
 // Linux enables the key only with SSE4.1 and without a hypervisor. TheKernel
 // has no kernel-FPU guard, so enabling it is not representable yet; the key
 // remains off and the checked fallback is used.
-pub fn i915_memcpy_init_early() {
+// upstream: i915_memcpy.c i915_memcpy_init_early()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_memcpy_init_early(_dev_priv: *mut crate::linux_i915_private::DrmI915Private) {
     HAS_MOVNTDQA.store(false, Ordering::Release);
 }
