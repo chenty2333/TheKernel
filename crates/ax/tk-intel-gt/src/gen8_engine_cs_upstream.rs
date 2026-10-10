@@ -138,7 +138,8 @@ pub(crate) unsafe fn gen8_emit_ggtt_write(
 unsafe fn ptr_err<T>(p: *mut T) -> i32 { p as isize as i32 }
 
 // upstream: gen8_engine_cs.c gen8_emit_flush_rcs()
-pub unsafe fn gen8_emit_flush_rcs(rq: *mut I915Request, mode: u32) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen8_emit_flush_rcs(rq: *mut I915Request, mode: u32) -> i32 {
     let mut vf_flush_wa = false;
     let mut dc_flush_wa = false;
     let mut flags = 0;
@@ -169,7 +170,8 @@ pub unsafe fn gen8_emit_flush_rcs(rq: *mut I915Request, mode: u32) -> i32 {
 }
 
 // upstream: gen8_engine_cs.c gen8_emit_flush_xcs()
-pub unsafe fn gen8_emit_flush_xcs(rq: *mut I915Request, mode: u32) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen8_emit_flush_xcs(rq: *mut I915Request, mode: u32) -> i32 {
     let mut cs = intel_ring_begin(rq, 4);
     if IS_ERR(cs) { return ptr_err(cs); }
     let mut cmd = MI_FLUSH_DW + 1;
@@ -187,7 +189,8 @@ pub unsafe fn gen8_emit_flush_xcs(rq: *mut I915Request, mode: u32) -> i32 {
 }
 
 // upstream: gen8_engine_cs.c gen11_emit_flush_rcs()
-pub unsafe fn gen11_emit_flush_rcs(rq: *mut I915Request, mode: u32) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen11_emit_flush_rcs(rq: *mut I915Request, mode: u32) -> i32 {
     if mode & EMIT_FLUSH != 0 {
         let flags = PIPE_CONTROL_CS_STALL | PIPE_CONTROL_TILE_CACHE_FLUSH
             | PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH | PIPE_CONTROL_DEPTH_CACHE_FLUSH
@@ -258,7 +261,8 @@ unsafe fn mtl_dummy_pipe_control(rq: *mut I915Request) -> i32 {
 }
 
 // upstream: gen8_engine_cs.c gen12_emit_flush_rcs()
-pub unsafe fn gen12_emit_flush_rcs(rq: *mut I915Request, mode: u32) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen12_emit_flush_rcs(rq: *mut I915Request, mode: u32) -> i32 {
     let engine = (*rq).engine;
     if mode & EMIT_FLUSH != 0 || gen12_needs_ccs_aux_inv(engine) {
         let mut bit_group_0 = PIPE_CONTROL0_HDC_PIPELINE_FLUSH;
@@ -296,7 +300,8 @@ pub unsafe fn gen12_emit_flush_rcs(rq: *mut I915Request, mode: u32) -> i32 {
 }
 
 // upstream: gen8_engine_cs.c gen12_emit_flush_xcs()
-pub unsafe fn gen12_emit_flush_xcs(rq: *mut I915Request, mode: u32) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen12_emit_flush_xcs(rq: *mut I915Request, mode: u32) -> i32 {
     let mut cmd = 4;
     if mode & EMIT_INVALIDATE != 0 { cmd += 2; if gen12_needs_ccs_aux_inv((*rq).engine) { cmd += 8; } }
     let mut cs = intel_ring_begin(rq, cmd); if IS_ERR(cs) { return ptr_err(cs); }
@@ -326,7 +331,8 @@ unsafe fn hwsp_offset(rq: *const I915Request) -> u32 {
 }
 
 // upstream: gen8_engine_cs.c gen8_emit_init_breadcrumb()
-pub unsafe fn gen8_emit_init_breadcrumb(rq: *mut I915Request) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen8_emit_init_breadcrumb(rq: *mut I915Request) -> i32 {
     GEM_BUG_ON!(i915_request_has_initial_breadcrumb(rq));
     if !(*i915_request_timeline(rq)).has_initial_breadcrumb { return 0; }
     let mut cs = intel_ring_begin(rq, 6); if IS_ERR(cs) { return ptr_err(cs); }
@@ -350,18 +356,22 @@ unsafe fn __xehp_emit_bb_start(rq: *mut I915Request, offset: u64, _len: u32, fla
     *cs=MI_ARB_ON_OFF|MI_ARB_DISABLE; cs=cs.add(1); intel_ring_advance(rq,cs); 0
 }
 // upstream: gen8_engine_cs.c xehp_emit_bb_start_noarb()
-pub unsafe fn xehp_emit_bb_start_noarb(rq:*mut I915Request,offset:u64,len:u32,flags:u32)->i32 { __xehp_emit_bb_start(rq,offset,len,flags,MI_ARB_DISABLE) }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xehp_emit_bb_start_noarb(rq:*mut I915Request,offset:u64,len:u32,flags:u32)->i32 { __xehp_emit_bb_start(rq,offset,len,flags,MI_ARB_DISABLE) }
 // upstream: gen8_engine_cs.c xehp_emit_bb_start()
-pub unsafe fn xehp_emit_bb_start(rq:*mut I915Request,offset:u64,len:u32,flags:u32)->i32 { __xehp_emit_bb_start(rq,offset,len,flags,MI_ARB_ENABLE) }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xehp_emit_bb_start(rq:*mut I915Request,offset:u64,len:u32,flags:u32)->i32 { __xehp_emit_bb_start(rq,offset,len,flags,MI_ARB_ENABLE) }
 
 // upstream: gen8_engine_cs.c gen8_emit_bb_start_noarb()
-pub unsafe fn gen8_emit_bb_start_noarb(rq:*mut I915Request,offset:u64,_len:u32,flags:u32)->i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen8_emit_bb_start_noarb(rq:*mut I915Request,offset:u64,_len:u32,flags:u32)->i32 {
     let mut cs=intel_ring_begin(rq,4); if IS_ERR(cs){return ptr_err(cs);}
     *cs=MI_ARB_ON_OFF|MI_ARB_DISABLE; cs=cs.add(1); *cs=MI_BATCH_BUFFER_START_GEN8|if flags&I915_DISPATCH_SECURE!=0{0}else{BIT!(8)}; cs=cs.add(1);
     *cs=offset as u32; cs=cs.add(1); *cs=(offset>>32) as u32; cs=cs.add(1); intel_ring_advance(rq,cs); 0
 }
 // upstream: gen8_engine_cs.c gen8_emit_bb_start()
-pub unsafe fn gen8_emit_bb_start(rq:*mut I915Request,offset:u64,len:u32,flags:u32)->i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen8_emit_bb_start(rq:*mut I915Request,offset:u64,len:u32,flags:u32)->i32 {
     if test_bit(crate::i915_request_types_upstream::I915_FENCE_FLAG_NOPREEMPT, &(*rq).fence.flags){return gen8_emit_bb_start_noarb(rq,offset,len,flags);}
     let mut cs=intel_ring_begin(rq,6); if IS_ERR(cs){return ptr_err(cs);}
     *cs=MI_ARB_ON_OFF|MI_ARB_ENABLE; cs=cs.add(1); *cs=MI_BATCH_BUFFER_START_GEN8|if flags&I915_DISPATCH_SECURE!=0{0}else{BIT!(8)}; cs=cs.add(1);
@@ -386,14 +396,17 @@ unsafe fn gen8_emit_fini_breadcrumb_tail(rq:*mut I915Request,mut cs:*mut u32)->*
 // upstream: gen8_engine_cs.c emit_xcs_breadcrumb()
 unsafe fn emit_xcs_breadcrumb(rq:*mut I915Request,cs:*mut u32)->*mut u32 {gen8_emit_ggtt_write(cs,(*rq).fence.seqno as u32,hwsp_offset(rq),0)}
 // upstream: gen8_engine_cs.c gen8_emit_fini_breadcrumb_xcs()
-pub unsafe fn gen8_emit_fini_breadcrumb_xcs(rq:*mut I915Request,cs:*mut u32)->*mut u32 {gen8_emit_fini_breadcrumb_tail(rq,emit_xcs_breadcrumb(rq,cs))}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen8_emit_fini_breadcrumb_xcs(rq:*mut I915Request,cs:*mut u32)->*mut u32 {gen8_emit_fini_breadcrumb_tail(rq,emit_xcs_breadcrumb(rq,cs))}
 // upstream: gen8_engine_cs.c gen8_emit_fini_breadcrumb_rcs()
-pub unsafe fn gen8_emit_fini_breadcrumb_rcs(rq:*mut I915Request,mut cs:*mut u32)->*mut u32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen8_emit_fini_breadcrumb_rcs(rq:*mut I915Request,mut cs:*mut u32)->*mut u32 {
     cs=gen8_emit_pipe_control(cs,PIPE_CONTROL_CS_STALL|PIPE_CONTROL_TLB_INVALIDATE|PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH|PIPE_CONTROL_DEPTH_CACHE_FLUSH|PIPE_CONTROL_DC_FLUSH_ENABLE,0);
     cs=gen8_emit_ggtt_write_rcs(cs,(*rq).fence.seqno as u32,hwsp_offset(rq),PIPE_CONTROL_FLUSH_ENABLE|PIPE_CONTROL_CS_STALL);gen8_emit_fini_breadcrumb_tail(rq,cs)
 }
 // upstream: gen8_engine_cs.c gen11_emit_fini_breadcrumb_rcs()
-pub unsafe fn gen11_emit_fini_breadcrumb_rcs(rq:*mut I915Request,mut cs:*mut u32)->*mut u32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen11_emit_fini_breadcrumb_rcs(rq:*mut I915Request,mut cs:*mut u32)->*mut u32 {
     cs=gen8_emit_pipe_control(cs,PIPE_CONTROL_CS_STALL|PIPE_CONTROL_TLB_INVALIDATE|PIPE_CONTROL_TILE_CACHE_FLUSH|PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH|PIPE_CONTROL_DEPTH_CACHE_FLUSH|PIPE_CONTROL_DC_FLUSH_ENABLE,0);
     cs=gen8_emit_ggtt_write_rcs(cs,(*rq).fence.seqno as u32,hwsp_offset(rq),PIPE_CONTROL_FLUSH_ENABLE|PIPE_CONTROL_CS_STALL);gen8_emit_fini_breadcrumb_tail(rq,cs)
 }
@@ -418,9 +431,11 @@ unsafe fn gen12_emit_fini_breadcrumb_tail(rq:*mut I915Request,mut cs:*mut u32)->
     (*rq).tail=intel_ring_offset(rq,cs.cast());assert_ring_tail_valid((*rq).ring,(*rq).tail);gen8_emit_wa_tail(rq,cs)
 }
 // upstream: gen8_engine_cs.c gen12_emit_fini_breadcrumb_xcs()
-pub unsafe fn gen12_emit_fini_breadcrumb_xcs(rq:*mut I915Request,mut cs:*mut u32)->*mut u32 {cs=emit_xcs_breadcrumb(rq,__gen8_emit_flush_dw(cs,0,0,0));gen12_emit_fini_breadcrumb_tail(rq,cs)}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen12_emit_fini_breadcrumb_xcs(rq:*mut I915Request,mut cs:*mut u32)->*mut u32 {cs=emit_xcs_breadcrumb(rq,__gen8_emit_flush_dw(cs,0,0,0));gen12_emit_fini_breadcrumb_tail(rq,cs)}
 // upstream: gen8_engine_cs.c gen12_emit_fini_breadcrumb_rcs()
-pub unsafe fn gen12_emit_fini_breadcrumb_rcs(rq:*mut I915Request,mut cs:*mut u32)->*mut u32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen12_emit_fini_breadcrumb_rcs(rq:*mut I915Request,mut cs:*mut u32)->*mut u32 {
     let i915=(*rq).i915;let gt=(*(*rq).engine).gt;
     let mut flags=PIPE_CONTROL_CS_STALL|PIPE_CONTROL_TLB_INVALIDATE|PIPE_CONTROL_TILE_CACHE_FLUSH|PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH|PIPE_CONTROL_DEPTH_CACHE_FLUSH|PIPE_CONTROL_DC_FLUSH_ENABLE|PIPE_CONTROL_FLUSH_ENABLE;
     if graphics_ver_full(i915)<IP_VER(12,70){flags|=PIPE_CONTROL_FLUSH_L3;}

@@ -951,7 +951,8 @@ fn guc_submission_send_busy_loop(
 }
 
 // upstream: intel_guc_submission.c intel_guc_wait_for_pending_msg()
-fn intel_guc_wait_for_pending_msg(
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_wait_for_pending_msg(
     guc: &intel_guc,
     wait_var: &atomic_t,
     interruptible: bool,
@@ -998,7 +999,8 @@ fn intel_guc_wait_for_pending_msg(
 }
 
 // upstream: intel_guc_submission.c intel_guc_wait_for_idle()
-fn intel_guc_wait_for_idle(guc: &intel_guc, timeout: i64) -> i32 {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_wait_for_idle(guc: &intel_guc, timeout: i64) -> i32 {
     let gt = guc_to_gt_const(guc);
     let uc = unsafe { core::ptr::addr_of!((*gt).uc).cast_mut() };
     if !unsafe { intel_uc_uses_guc_submission(uc) } {
@@ -1818,7 +1820,8 @@ fn guc_fini_engine_stats(guc: &mut intel_guc) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_busyness_park()
-fn intel_guc_busyness_park(gt: &mut intel_gt) {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_busyness_park(gt: &mut intel_gt) {
     let guc = unsafe { &mut *gt_to_guc(gt as *mut _) };
     if !guc_submission_initialized(guc) {
         return;
@@ -1840,7 +1843,8 @@ fn intel_guc_busyness_park(gt: &mut intel_gt) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_busyness_unpark()
-fn intel_guc_busyness_unpark(gt: &mut intel_gt) {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_busyness_unpark(gt: &mut intel_gt) {
     let guc = unsafe { &mut *gt_to_guc(gt as *mut _) };
     let mut flags: c_ulong = 0;
     let mut unused = ktime_t::default();
@@ -1905,12 +1909,14 @@ fn guc_flush_submissions(guc: &mut intel_guc) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_submission_flush_work()
-fn intel_guc_submission_flush_work(guc: &mut intel_guc) {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_submission_flush_work(guc: &mut intel_guc) {
     unsafe { flush_work(&mut guc.submission_state.destroyed_worker) };
 }
 
 // upstream: intel_guc_submission.c intel_guc_submission_reset_prepare()
-fn intel_guc_submission_reset_prepare(guc: &mut intel_guc) {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_submission_reset_prepare(guc: &mut intel_guc) {
     if unlikely(!guc_submission_initialized(guc)) {
         // Reset may be called during driver load, before GuC initialization.
         return;
@@ -2079,7 +2085,8 @@ fn __guc_reset_context(mut ce: &mut intel_context, stalled: intel_engine_mask_t)
 }
 
 // upstream: intel_guc_submission.c wake_up_all_tlb_invalidate()
-fn wake_up_all_tlb_invalidate(guc: &mut intel_guc) {
+#[unsafe(no_mangle)]
+extern "C" fn wake_up_all_tlb_invalidate(guc: &mut intel_guc) {
     if !intel_guc_tlb_invalidation_is_available(guc) {
         return;
     }
@@ -2093,7 +2100,8 @@ fn wake_up_all_tlb_invalidate(guc: &mut intel_guc) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_submission_reset()
-fn intel_guc_submission_reset(guc: &mut intel_guc, stalled: intel_engine_mask_t) {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_submission_reset(guc: &mut intel_guc, stalled: intel_engine_mask_t) {
     let mut index = 0usize;
     let mut flags: c_ulong = 0;
     if unlikely(!guc_submission_initialized(guc)) {
@@ -2163,7 +2171,8 @@ fn guc_cancel_sched_engine_requests(sched_engine: Option<&mut i915_sched_engine>
 }
 
 // upstream: intel_guc_submission.c intel_guc_submission_cancel_requests()
-fn intel_guc_submission_cancel_requests(guc: &mut intel_guc) {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_submission_cancel_requests(guc: &mut intel_guc) {
     let mut index = 0usize;
     let mut flags: c_ulong = 0;
     xa_lock_irqsave(&mut guc.context_lookup, &mut flags);
@@ -2189,7 +2198,8 @@ fn intel_guc_submission_cancel_requests(guc: &mut intel_guc) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_submission_reset_finish()
-fn intel_guc_submission_reset_finish(guc: &mut intel_guc) {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_submission_reset_finish(guc: &mut intel_guc) {
     if unlikely(
         !guc_submission_initialized(guc)
             || !unsafe { intel_guc_is_fw_running(guc) }
@@ -2215,7 +2225,8 @@ fn intel_guc_submission_reset_finish(guc: &mut intel_guc) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_tlb_invalidation_is_available()
-pub(crate) fn intel_guc_tlb_invalidation_is_available(guc: &intel_guc) -> bool {
+#[unsafe(no_mangle)]
+pub(crate) extern "C" fn intel_guc_tlb_invalidation_is_available(guc: &intel_guc) -> bool {
     return (unsafe { HAS_GUC_TLB_INVALIDATION((*guc_to_gt_const(guc)).i915) })
         && (unsafe { intel_guc_is_ready(guc) });
 }
@@ -2261,7 +2272,8 @@ fn fini_tlb_lookup(guc: &mut intel_guc) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_submission_init()
-fn intel_guc_submission_init(guc: &mut intel_guc) -> i32 {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_submission_init(guc: &mut intel_guc) -> i32 {
     let gt = unsafe { guc_to_gt(guc) };
     let mut ret;
     if guc.submission_initialized {
@@ -2292,7 +2304,8 @@ fn intel_guc_submission_init(guc: &mut intel_guc) -> i32 {
 }
 
 // upstream: intel_guc_submission.c intel_guc_submission_fini()
-fn intel_guc_submission_fini(guc: &mut intel_guc) {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_submission_fini(guc: &mut intel_guc) {
     if !guc.submission_initialized {
         return;
     }
@@ -4404,7 +4417,8 @@ unsafe fn guc_submission_tasklet_rust(tasklet: *mut tasklet_struct) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_submission_setup()
-fn intel_guc_submission_setup(engine: &mut intel_engine_cs) -> i32 {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_submission_setup(engine: &mut intel_engine_cs) -> i32 {
     let i915 = engine.i915;
     let guc = unsafe { gt_to_guc(engine.gt) };
     // These setup assumptions (including always-enabled IRQs) hold only gen11+.
@@ -4560,7 +4574,8 @@ fn guc_route_semaphores(guc: &mut intel_guc, to_guc: bool) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_submission_enable()
-fn intel_guc_submission_enable(guc: &mut intel_guc) -> i32 {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_submission_enable(guc: &mut intel_guc) -> i32 {
     // Enable semaphore interrupts and route them to GuC.
     guc_route_semaphores(guc, true);
     let ret = guc_init_submission(guc);
@@ -4583,7 +4598,8 @@ fn intel_guc_submission_enable(guc: &mut intel_guc) -> i32 {
 }
 
 // upstream: intel_guc_submission.c intel_guc_submission_disable()
-fn intel_guc_submission_disable(guc: &mut intel_guc) {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_submission_disable(guc: &mut intel_guc) {
     // GuC may already have reset by the time this runs.
     guc_cancel_busyness_worker(guc);
     // Disable semaphore interrupts and route them to host.
@@ -4614,7 +4630,8 @@ fn intel_guc_sched_disable_gucid_threshold_max(guc: &intel_guc) -> i32 {
 const SCHED_DISABLE_DELAY_MS: u64 = 34;
 
 // upstream: intel_guc_submission.c intel_guc_submission_init_early()
-fn intel_guc_submission_init_early(guc: &mut intel_guc) {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_submission_init_early(guc: &mut intel_guc) {
     xa_init_flags(&mut guc.context_lookup, XA_FLAGS_LOCK_IRQ);
     spin_lock_init(&mut guc.submission_state.lock);
     unsafe { INIT_LIST_HEAD(&mut guc.submission_state.guc_id_list) };
@@ -4675,7 +4692,8 @@ fn wait_wake_outstanding_tlb_g2h(guc: &mut intel_guc, seqno: u32) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_tlb_invalidation_done()
-fn intel_guc_tlb_invalidation_done(guc: &mut intel_guc, payload: &[u32], len: u32) -> i32 {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_tlb_invalidation_done(guc: &mut intel_guc, payload: &[u32], len: u32) -> i32 {
     if len < 1 {
         return -EPROTO;
     }
@@ -4791,7 +4809,8 @@ fn guc_send_invalidate_tlb(guc: &mut intel_guc, ty: intel_guc_tlb_invalidation_t
 }
 
 // upstream: intel_guc_submission.c intel_guc_invalidate_tlb_engines()
-pub(crate) fn intel_guc_invalidate_tlb_engines(guc: &mut intel_guc) -> i32 {
+#[unsafe(no_mangle)]
+pub(crate) extern "C" fn intel_guc_invalidate_tlb_engines(guc: &mut intel_guc) -> i32 {
     guc_send_invalidate_tlb(
         guc,
         intel_guc_tlb_invalidation_type::INTEL_GUC_TLB_INVAL_ENGINES,
@@ -4799,7 +4818,8 @@ pub(crate) fn intel_guc_invalidate_tlb_engines(guc: &mut intel_guc) -> i32 {
 }
 
 // upstream: intel_guc_submission.c intel_guc_invalidate_tlb_guc()
-pub(crate) fn intel_guc_invalidate_tlb_guc(guc: &mut intel_guc) -> i32 {
+#[unsafe(no_mangle)]
+pub(crate) extern "C" fn intel_guc_invalidate_tlb_guc(guc: &mut intel_guc) -> i32 {
     guc_send_invalidate_tlb(
         guc,
         intel_guc_tlb_invalidation_type::INTEL_GUC_TLB_INVAL_GUC,
@@ -4807,7 +4827,8 @@ pub(crate) fn intel_guc_invalidate_tlb_guc(guc: &mut intel_guc) -> i32 {
 }
 
 // upstream: intel_guc_submission.c intel_guc_deregister_done_process_msg()
-fn intel_guc_deregister_done_process_msg(guc: &mut intel_guc, msg: &[u32], len: u32) -> i32 {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_deregister_done_process_msg(guc: &mut intel_guc, msg: &[u32], len: u32) -> i32 {
     if unlikely(len < 1) {
         guc_err!(guc, "Invalid length %u\n", len);
         return -EPROTO;
@@ -4843,7 +4864,8 @@ fn intel_guc_deregister_done_process_msg(guc: &mut intel_guc, msg: &[u32], len: 
 }
 
 // upstream: intel_guc_submission.c intel_guc_sched_done_process_msg()
-fn intel_guc_sched_done_process_msg(guc: &mut intel_guc, msg: &[u32], len: u32) -> i32 {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_sched_done_process_msg(guc: &mut intel_guc, msg: &[u32], len: u32) -> i32 {
     if unlikely(len < 2) {
         guc_err!(guc, "Invalid length %u\n", len);
         return -EPROTO;
@@ -4970,7 +4992,8 @@ fn guc_handle_context_reset(guc: &mut intel_guc, ce: &mut intel_context) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_context_reset_process_msg()
-fn intel_guc_context_reset_process_msg(guc: &mut intel_guc, msg: &[u32], len: u32) -> i32 {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_context_reset_process_msg(guc: &mut intel_guc, msg: &[u32], len: u32) -> i32 {
     if unlikely(len != 1) {
         guc_err!(guc, "Invalid length %u", len);
         return -EPROTO;
@@ -4994,7 +5017,8 @@ fn intel_guc_context_reset_process_msg(guc: &mut intel_guc, msg: &[u32], len: u3
 }
 
 // upstream: intel_guc_submission.c intel_guc_error_capture_process_msg()
-fn intel_guc_error_capture_process_msg(guc: &mut intel_guc, msg: &[u32], len: u32) -> i32 {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_error_capture_process_msg(guc: &mut intel_guc, msg: &[u32], len: u32) -> i32 {
     if unlikely(len != 1) {
         guc_dbg!(guc, "Invalid length %u", len);
         return -EPROTO;
@@ -5045,7 +5069,8 @@ fn reset_fail_worker_func(w: &mut work_struct) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_engine_failure_process_msg()
-fn intel_guc_engine_failure_process_msg(guc: &mut intel_guc, msg: &[u32], len: u32) -> i32 {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_engine_failure_process_msg(guc: &mut intel_guc, msg: &[u32], len: u32) -> i32 {
     if unlikely(len != 3) {
         guc_err!(guc, "Invalid length %u", len);
         return -EPROTO;
@@ -5077,7 +5102,8 @@ fn intel_guc_engine_failure_process_msg(guc: &mut intel_guc, msg: &[u32], len: u
 }
 
 // upstream: intel_guc_submission.c intel_guc_find_hung_context()
-fn intel_guc_find_hung_context(engine: &mut intel_engine_cs) {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_find_hung_context(engine: &mut intel_engine_cs) {
     let guc = unsafe { &mut *gt_to_guc(engine.gt) };
     if unlikely(!guc_submission_initialized(guc)) {
         // Reset during load, before GuC initialization.
@@ -5125,7 +5151,8 @@ fn intel_guc_find_hung_context(engine: &mut intel_engine_cs) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_dump_active_requests()
-fn intel_guc_dump_active_requests(
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_dump_active_requests(
     engine: &mut intel_engine_cs,
     hung_rq: &mut i915_request,
     m: &mut drm_printer,
@@ -5169,7 +5196,8 @@ fn intel_guc_dump_active_requests(
 }
 
 // upstream: intel_guc_submission.c intel_guc_submission_print_info()
-fn intel_guc_submission_print_info(guc: &mut intel_guc, p: &mut drm_printer) {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_submission_print_info(guc: &mut intel_guc, p: &mut drm_printer) {
     let sched_engine = guc.sched_engine;
     if sched_engine.is_null() {
         return;
@@ -5266,7 +5294,8 @@ fn guc_log_context(p: &mut drm_printer, ce: &mut intel_context) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_submission_print_context_info()
-fn intel_guc_submission_print_context_info(guc: &mut intel_guc, p: &mut drm_printer) {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_submission_print_context_info(guc: &mut intel_guc, p: &mut drm_printer) {
     for (_, entry) in crate::linux::xarray::xa_snapshot(&mut guc.context_lookup) {
         let ce = unsafe { &mut *entry.cast::<intel_context>() };
         gem_bug_on!(intel_context_is_child(&mut *ce));
@@ -5725,7 +5754,8 @@ fn guc_create_virtual(
 }
 
 // upstream: intel_guc_submission.c intel_guc_virtual_engine_has_heartbeat()
-fn intel_guc_virtual_engine_has_heartbeat(ve: &intel_engine_cs) -> bool {
+#[unsafe(no_mangle)]
+extern "C" fn intel_guc_virtual_engine_has_heartbeat(ve: &intel_engine_cs) -> bool {
     let mut heartbeat = false;
     for_each_engine_masked!(engine, tmp, ve.gt, ve.mask, {
         if unsafe { READ_ONCE!((*engine).props.heartbeat_interval_ms) } != 0 {

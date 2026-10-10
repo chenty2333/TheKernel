@@ -142,7 +142,8 @@ unsafe fn engine_from_uabi(node: *const u8) -> *mut IntelEngineCs {
 }
 
 // upstream: intel_engine_user.c intel_engine_lookup_user()
-pub unsafe fn intel_engine_lookup_user(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_lookup_user(
     i915: *mut DrmI915Private,
     class: u8,
     instance: u8,
@@ -375,7 +376,8 @@ unsafe fn engine_rename(engine: *mut IntelEngineCs, name: *const c_char, instanc
 }
 
 // upstream: intel_engine_user.c intel_engines_driver_register()
-pub unsafe fn intel_engines_driver_register(i915: *mut DrmI915Private) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engines_driver_register(i915: *mut DrmI915Private) {
     let mut other_instance = 0u16;
     let mut ring = LegacyRing {
         gt: ptr::null_mut(),

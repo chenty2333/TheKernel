@@ -158,7 +158,8 @@ unsafe fn guc_hwconfig_init(gt: *mut IntelGt) -> i32 {
 }
 
 // upstream: intel_guc_hwconfig.c intel_gt_init_hwconfig()
-pub unsafe fn intel_gt_init_hwconfig(gt: *mut IntelGt) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_gt_init_hwconfig(gt: *mut IntelGt) -> i32 {
     if !unsafe { intel_uc_uses_guc(ptr::addr_of_mut!((*gt).uc)) } {
         return 0;
     }
@@ -166,7 +167,8 @@ pub unsafe fn intel_gt_init_hwconfig(gt: *mut IntelGt) -> i32 {
 }
 
 // upstream: intel_guc_hwconfig.c intel_gt_fini_hwconfig()
-pub unsafe fn intel_gt_fini_hwconfig(gt: *mut IntelGt) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_gt_fini_hwconfig(gt: *mut IntelGt) {
     let hwconfig = unsafe { ptr::addr_of_mut!((*gt).info.hwconfig) };
     unsafe {
         kfree((*hwconfig).ptr);

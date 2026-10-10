@@ -276,7 +276,8 @@ unsafe fn retire_work_handler(work: *mut WorkStruct) {
 }
 
 // upstream: intel_gt_requests.c intel_gt_init_requests()
-pub unsafe fn intel_gt_init_requests(gt: *mut IntelGt) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_gt_init_requests(gt: *mut IntelGt) {
     unsafe {
         INIT_DELAYED_WORK(&mut (*gt).requests.retire_work, |work| {
             retire_work_handler(work as *mut WorkStruct)
@@ -302,7 +303,8 @@ pub unsafe fn intel_gt_unpark_requests(gt: *mut IntelGt) {
 }
 
 // upstream: intel_gt_requests.c intel_gt_fini_requests()
-pub unsafe fn intel_gt_fini_requests(gt: *mut IntelGt) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_gt_fini_requests(gt: *mut IntelGt) {
     unsafe {
         cancel_delayed_work_sync(core::ptr::addr_of_mut!((*gt).requests.retire_work));
         flush_work(core::ptr::addr_of_mut!((*gt).watchdog.work));

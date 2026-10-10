@@ -158,7 +158,8 @@ unsafe fn intel_timeline_init(
 }
 
 // upstream: intel_timeline.c intel_gt_init_timelines()
-pub unsafe fn intel_gt_init_timelines(gt: *mut IntelGt) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_gt_init_timelines(gt: *mut IntelGt) {
     let timelines = &mut (*gt).timelines;
 
     spin_lock_init(&mut timelines.lock);
@@ -472,7 +473,8 @@ pub unsafe fn __intel_timeline_free(kref: *mut Kref) {
 }
 
 // upstream: intel_timeline.c intel_gt_fini_timelines()
-pub unsafe fn intel_gt_fini_timelines(gt: *mut IntelGt) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_gt_fini_timelines(gt: *mut IntelGt) {
     let timelines = &mut (*gt).timelines;
 
     GEM_BUG_ON!(!list_empty(&timelines.active_list));

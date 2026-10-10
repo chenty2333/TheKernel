@@ -242,7 +242,8 @@ unsafe fn __i915_sw_fence_complete(fence: *mut I915SwFence, continuation: *mut c
 }
 
 // upstream: i915_sw_fence.c i915_sw_fence_complete()
-pub unsafe fn i915_sw_fence_complete(fence: *mut I915SwFence) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_sw_fence_complete(fence: *mut I915SwFence) {
     unsafe {
         debug_fence_assert(fence);
         if crate::linux::assertion::warn_on(crate::linux::sw_fence::i915_sw_fence_done(&*fence)) {
@@ -253,7 +254,8 @@ pub unsafe fn i915_sw_fence_complete(fence: *mut I915SwFence) {
 }
 
 // upstream: i915_sw_fence.c i915_sw_fence_await()
-pub unsafe fn i915_sw_fence_await(fence: *mut I915SwFence) -> bool {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_sw_fence_await(fence: *mut I915SwFence) -> bool {
     unsafe {
         let pending = AtomicI32::from_ptr(core::ptr::addr_of_mut!((*fence).pending.counter));
         let mut observed = pending.load(Ordering::Relaxed);
@@ -518,7 +520,8 @@ unsafe extern "C" fn free_timer_cb_rcu(head: *mut RcuHead) {
 }
 
 // upstream: i915_sw_fence.c i915_sw_fence_await_dma_fence()
-pub unsafe fn i915_sw_fence_await_dma_fence(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_sw_fence_await_dma_fence(
     fence: *mut I915SwFence,
     dma: *mut DmaFence,
     timeout: c_ulong,
