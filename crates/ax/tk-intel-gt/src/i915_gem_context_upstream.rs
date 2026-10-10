@@ -2196,6 +2196,7 @@ unsafe fn gem_context_register(ctx: *mut I915GemContext, fpriv: *mut DrmI915File
 }
 
 unsafe extern "C" {
+    #[link_name = "tk_linux_snprintf"]
     fn snprintf(buf: *mut c_char, size: usize, fmt: *const c_char, ...) -> c_int;
 }
 

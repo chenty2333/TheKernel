@@ -1136,7 +1136,11 @@ unsafe fn copy_truncated(buf: *mut c_char, size: usize, bytes: &[u8]) -> usize {
 ///
 /// # Safety
 /// Same contract as C `snprintf()`.
-#[unsafe(no_mangle)]
+///
+/// Exported as `tk_linux_snprintf`: the product also links ACPICA, whose C
+/// runtime already defines `snprintf`, so LinuxKPI callers bind this name via
+/// `#[link_name]`.
+#[unsafe(export_name = "tk_linux_snprintf")]
 pub unsafe extern "C" fn snprintf(
     buf: *mut c_char,
     size: usize,
