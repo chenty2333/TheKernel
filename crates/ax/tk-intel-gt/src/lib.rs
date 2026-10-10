@@ -5,6 +5,7 @@
 #![no_std]
 #![feature(c_variadic)]
 #![deny(unsafe_code)]
+#![cfg_attr(feature = "upstream-gt", feature(c_variadic))]
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
@@ -624,3 +625,26 @@ pub(crate) mod gt_header_inline_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod intel_guc_log_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_driver_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_pci_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_device_info_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_device_info_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_pciids_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_probe_provider_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_ioctl_upstream;

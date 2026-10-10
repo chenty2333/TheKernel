@@ -43,13 +43,19 @@ pub struct DrmDevicePrefix {
     refcount: Kref,
     pub dev: *mut c_void,
     pub dma_dev: *mut c_void,
-    _before_unplugged: [u8; 92],
+    _before_driver: [u8; 32],
+    /// `struct drm_device.driver` at offset 56 (x86_64 Linux 7.2.3).
+    pub driver: *mut c_void,
+    _before_unplugged: [u8; 52],
     pub unplugged: bool,
     _anon_inode_pad: [u8; 3],
     pub anon_inode: *mut Inode,
     _before_vma_offset_manager: [u8; 1360],
     pub vma_offset_manager: *mut DrmVmaOffsetManager,
-    _tail: [u8; 56],
+    _before_switch_power_state: [u8; 8],
+    /// `enum switch_power_state` at offset 1504 (4 bytes).
+    pub switch_power_state: i32,
+    _tail: [u8; 44],
 }
 
 pub const DRM_DEVICE_SIZE: usize = 1552;
@@ -106,9 +112,15 @@ pub struct DrmI915Private {
     pub params: I915Params,
     pub info: *const c_void,
     pub runtime: IntelRuntimeInfo,
-    _before_irqs_enabled: [u8; 704],
+    _before_uncore: [u8; 148],
+    /// Embedded `struct intel_uncore uncore` (offset 1840, size 352).
+    pub uncore: [u8; 352],
+    _before_irqs_enabled: [u8; 204],
     pub irqs_enabled: bool,
-    _after_irqs_enabled: [u8; 135],
+    _after_irqs_enabled: [u8; 107],
+    /// `struct mutex sb_lock` at offset 2504 (size 24).
+    pub sb_lock: [u8; 24],
+    _after_sb_lock: [u8; 4],
     /// Source `preserve_bios_swizzle` field (verified at offset 2532 against
     /// the configured Linux 7.2.3 x86_64 C layout).
     pub preserve_bios_swizzle: bool,
@@ -183,6 +195,11 @@ pub unsafe fn i915_reset_engine_count(
 }
 
 const _: [(); 1552] = [(); size_of::<DrmDevicePrefix>()];
+const _: [(); 56] = [(); offset_of!(DrmDevicePrefix, driver)];
+const _: [(); 1504] = [(); offset_of!(DrmDevicePrefix, switch_power_state)];
+const _: [(); 1840] = [(); offset_of!(DrmI915Private, uncore)];
+const _: [(); 2504] = [(); offset_of!(DrmI915Private, sb_lock)];
+const _: [(); 2396] = [(); offset_of!(DrmI915Private, irqs_enabled)];
 const _: [(); 104] = [(); size_of::<IntelRuntimePmPrefix>()];
 const _: [(); 40] = [(); offset_of!(IntelRuntimePmPrefix, userfault_wakeref)];
 const _: [(); 8] = [(); offset_of!(DrmDevicePrefix, dev)];

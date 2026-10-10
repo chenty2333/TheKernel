@@ -241,12 +241,7 @@ unsafe extern "C" {
         name: *const c_char,
         ret: i32,
     );
-    fn i915_probe_error(
-        i915: *mut DrmI915Private,
-        fmt: *const c_char,
-        name: *const c_char,
-        ret: i32,
-    );
+    fn i915_probe_error(i915: *mut DrmI915Private, fmt: *const c_char, ...);
     fn intel_ggtt_gmch_flush();
     fn signal_pending_state(state: i32, task: *mut c_void) -> bool;
 }
