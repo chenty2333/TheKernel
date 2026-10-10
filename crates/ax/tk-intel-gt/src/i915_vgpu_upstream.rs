@@ -22,12 +22,6 @@ pub unsafe extern "C" fn intel_vgpu_active(_dev_priv: *mut DrmI915Private) -> bo
     VGPU_ACTIVE
 }
 
-// upstream: i915_vgpu.h i915_vgpu_active() (caller spelling used by intel_rps_upstream.rs)
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn i915_vgpu_active(dev_priv: *mut DrmI915Private) -> bool {
-    unsafe { intel_vgpu_active(dev_priv) }
-}
-
 // upstream: i915_vgpu.c intel_vgpu_has_huge_gtt()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_vgpu_has_huge_gtt(_dev_priv: *mut DrmI915Private) -> bool {

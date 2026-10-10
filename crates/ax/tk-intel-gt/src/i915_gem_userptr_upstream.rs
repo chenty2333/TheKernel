@@ -77,7 +77,6 @@ unsafe extern "C" {
         pages: *mut SgTable,
         mark_dirty: bool,
     );
-    fn i915_gem_object_gtt_prepare_pages(obj: *mut DrmI915GemObject, pages: *mut SgTable) -> i32;
     pub(crate) fn i915_gem_gtt_finish_pages(obj: *mut DrmI915GemObject, pages: *mut SgTable);
     fn i915_gem_object_can_bypass_llc(obj: *mut DrmI915GemObject) -> bool;
     fn ____i915_gem_object_get_pages(obj: *mut DrmI915GemObject) -> i32;
@@ -304,7 +303,7 @@ unsafe extern "C" fn i915_gem_userptr_get_pages(obj: *mut DrmI915GemObject) -> i
             break;
         }
 
-        ret = unsafe { i915_gem_object_gtt_prepare_pages(obj, st) };
+        ret = unsafe { crate::i915_gem_gtt_upstream::i915_gem_gtt_prepare_pages(obj, st) };
         if ret == 0 {
             break;
         }

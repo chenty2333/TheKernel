@@ -501,11 +501,3 @@ pub unsafe extern "C" fn i915_vma_unlink_ctx(_vma: *mut c_void) {
     panic!("i915_vma_unlink_ctx: has no definition in Linux 7.2.3");
 }
 
-// upstream: i915_gem_gtt.c i915_gem_gtt_prepare_pages(), named as called from i915_gem_userptr_upstream.rs
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn i915_gem_object_gtt_prepare_pages(
-    obj: *mut DrmI915GemObject,
-    pages: *mut crate::intel_context_upstream::SgTable,
-) -> i32 {
-    unsafe { crate::i915_gem_gtt_upstream::i915_gem_gtt_prepare_pages(obj, pages) }
-}

@@ -225,7 +225,7 @@ unsafe extern "C" fn i915_vma_resource_unbind_work(work: *mut WorkStruct) {
     }
 }
 
-unsafe fn i915_vma_resource_put(vma_res: *mut I915VmaResource) {
+pub(crate) unsafe fn i915_vma_resource_put(vma_res: *mut I915VmaResource) {
     unsafe { dma_fence_put(ptr::addr_of_mut!((*vma_res).unbind_fence)) };
 }
 

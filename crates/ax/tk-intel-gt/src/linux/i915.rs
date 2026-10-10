@@ -543,7 +543,7 @@ impl I915PrivatePtr for *mut DrmI915Private {
 }
 
 #[inline]
-unsafe fn runtime_info<P: I915PrivatePtr>(i915: P) -> *const IntelRuntimeInfo {
+pub unsafe fn runtime_info<P: I915PrivatePtr>(i915: P) -> *const IntelRuntimeInfo {
     core::ptr::addr_of!((*i915.as_i915_private().cast::<DrmI915RuntimeOverlay>()).runtime)
 }
 
