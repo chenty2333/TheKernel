@@ -827,3 +827,29 @@ pub unsafe extern "C" fn flush_workqueue(_wq: *mut c_void) {
 pub unsafe extern "C" fn drain_workqueue(_wq: *mut c_void) {
     flush_all_work();
 }
+
+/// Linux `alloc_workqueue()`. The format arguments name the queue for debug
+/// output; the one ordered worker serves every queue, so the name is not kept.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn alloc_workqueue(
+    _fmt: *const core::ffi::c_char,
+    _flags: u32,
+    _max_active: core::ffi::c_int,
+    _args: ...
+) -> *mut c_void {
+    let queue = alloc::boxed::Box::new(WorkqueueStruct { _identity: 2 });
+    alloc::boxed::Box::into_raw(queue).cast()
+}
+
+/// Linux `destroy_workqueue()`: drain queued work, then release the handle.
+/// The shared system queues are never destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn destroy_workqueue(wq: *mut c_void) {
+    assert!(!wq.is_null(), "destroy_workqueue(NULL)");
+    assert!(
+        wq.cast::<WorkqueueStruct>() != system_dfl_wq && wq.cast::<WorkqueueStruct>() != system_highpri_wq,
+        "destroy_workqueue on a system workqueue"
+    );
+    flush_all_work();
+    drop(unsafe { alloc::boxed::Box::from_raw(wq.cast::<WorkqueueStruct>()) });
+}

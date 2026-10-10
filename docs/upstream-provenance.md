@@ -2158,3 +2158,9 @@ GSC/HECI/PXP, MTL sa_media, gen6/7 PPGTT, GMCH GGTT, ring submission, OA perf an
 debugfs are collected in `intel_unsupported_hw_upstream.rs`, one line per function
 in the source comments.
 `crates/ax/tk-intel-gt/src/i915_gpu_error_upstream.rs` (round 2): now uses the upstream `struct i915_gpu_coredump` / `intel_gt_coredump` / `intel_engine_coredump` layout. Translated from Linux 7.2.3 `drivers/gpu/drm/i915/i915_gpu_error.c` (MIT, Copyright (c) 2008 Intel Corporation): coredump alloc/free, engine/GT register capture, VMA page capture (non-compressing, `CONFIG_DRM_I915_COMPRESS_ERROR` unset), GuC capture path via `__i915_gpu_coredump`, store/reset/disable. debugfs/sysfs and scatterlist printing are not translated; display snapshot is left NULL.
+| drivers/gpu/drm/i915/i915_edram.c | i915_edram_upstream.rs | i915_edram_detect(); MIT, Copyright © 2025 Intel Corporation |
+| drivers/gpu/drm/i915/i915_params.c | i915_params_upstream.rs | i915_params_free(); MIT, Copyright © 2018 Intel Corporation |
+| drivers/gpu/drm/i915/intel_step.c | intel_step_upstream.rs | intel_step_init() with the revid tables; MIT, Copyright © 2019 Intel Corporation |
+| drivers/gpu/drm/i915/i915_vgpu.c | i915_vgpu_upstream.rs | intel_vgpu_detect/register/has_*(); PVINFO detection reads BAR0 through the probe provider; balloon paths fail closed for an active vGPU; MIT, Copyright © 2014 Intel Corporation |
+| drivers/gpu/drm/i915/vlv_suspend.c | vlv_suspend_upstream.rs | VLV/CHV S0ix entry points: upstream non-VLV early returns kept, VLV/CHV branches fail closed (482-line file outside the unsupported-hardware budget); MIT, Copyright © 2014 Intel Corporation |
+| drivers/gpu/drm/i915/i915_gmch.c | i915_gmch_upstream.rs | i915_gmch_bridge_setup/bar_setup/bar_teardown: full translation; PCI bus access through PciBusOps (kernel); CONFIG_PNP unset so the PnP reservation check is absent; MIT, Copyright 2014 Intel Corporation |

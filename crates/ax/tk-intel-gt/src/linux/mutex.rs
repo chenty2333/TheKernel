@@ -209,6 +209,13 @@ pub unsafe extern "C" fn c_mutex_destroy(lock: *mut Mutex) {
 }
 
 /// Linux `__mutex_init()`: lockdep and debug names are compiled out.
+/// Linux `mutex_init()`: the C macro expands to `__mutex_init()` with the
+/// debug name and key compiled out, so only the lock is initialized.
+#[unsafe(export_name = "mutex_init")]
+pub unsafe extern "C" fn c_mutex_init(lock: *mut core::ffi::c_void) {
+    unsafe { mutex_init(lock.cast::<Mutex>()) };
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __mutex_init(
     lock: *mut Mutex,

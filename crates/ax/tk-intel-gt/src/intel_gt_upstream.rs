@@ -1397,3 +1397,9 @@ pub unsafe extern "C" fn intel_gt_is_bind_context_ready(gt: *mut IntelGt) -> boo
     let engine = unsafe { (*gt).engine[BCS0 as usize] };
     !engine.is_null() && unsafe { (*engine).bind_context_ready }
 }
+
+// upstream: intel_gt_types.h intel_gt_support_legacy_fencing() (macro)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_gt_support_legacy_fencing(gt: *mut IntelGt) -> bool {
+    unsafe { (*(*gt).ggtt).num_fences > 0 }
+}

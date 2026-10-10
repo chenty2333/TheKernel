@@ -364,7 +364,6 @@ unsafe extern "C" {
     pub fn vlv_suspend_cleanup(i915: *mut DrmI915Private);
     pub fn vlv_suspend_complete(dev_priv: *mut DrmI915Private) -> c_int;
     pub fn vlv_suspend_init(i915: *mut DrmI915Private) -> c_int;
-    pub fn intel_runtime_pm_put_dummy_unused();
 }
 
 unsafe fn drm_atomic_helper_shutdown(dev: *mut c_void) {
