@@ -11,6 +11,7 @@ use core::{
 
 use crate::{
     intel_context_types_upstream::File,
+    linux::ttm::TtmDevice,
     intel_engine_cs_upstream::{AtomicT, IntelEngineCs, IntelGt, Spinlock},
     intel_context_upstream::Kref,
     linux::{gem_memory::I915GemMm, i915::IntelRuntimeInfo},
@@ -148,7 +149,10 @@ pub struct DrmI915Private {
     /// Source `struct intel_pxp *pxp` (opaque lower owner).
     pub pxp: *mut c_void,
     _overlay: *mut c_void,
-    _configuration_sensitive_tail: [u8; 2312],
+    _before_bdev: [u8; 632],
+    /// Embedded `struct ttm_device bdev` at offset 4248 (x86_64 Linux 7.2.3).
+    pub bdev: TtmDevice,
+    _after_bdev: [u8; 8],
 }
 
 #[repr(C)]
@@ -250,7 +254,8 @@ const _: [(); 3584] = [(); offset_of!(DrmI915Private, gem) + offset_of!(I915GemP
 const _: [(); 3600] = [(); offset_of!(DrmI915Private, pxp)];
 const _: [(); 3608] = [(); offset_of!(DrmI915Private, _overlay)];
 const _: [(); 5928] = [(); size_of::<DrmI915Private>()];
-const _: [(); 5928] = [(); size_of::<DrmI915Private>()];
+const _: [(); 4248] = [(); offset_of!(DrmI915Private, bdev)];
+const _: [(); 1672] = [(); size_of::<TtmDevice>()];
 const _: [(); 40] = [(); size_of::<I915GpuError>()];
 const _: [(); 104] = [(); size_of::<IntelRuntimePmPrefix>()];
 const _: [(); 40] = [(); offset_of!(IntelRuntimePmPrefix, userfault_wakeref)];

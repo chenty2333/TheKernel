@@ -569,6 +569,10 @@ pub(crate) mod intel_memory_region_upstream;
 
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub(crate) mod intel_region_ttm_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub(crate) mod i915_gem_phys_upstream;
 
 #[cfg(feature = "upstream-gt")]
