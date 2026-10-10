@@ -7,6 +7,7 @@ use core::num::NonZeroU64;
 
 mod area;
 mod backend;
+mod gaps;
 mod set;
 
 #[cfg(test)]

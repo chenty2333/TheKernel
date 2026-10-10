@@ -1,9 +1,9 @@
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
-use memory_addr::{va_range, MemoryAddr, VirtAddr};
+use memory_addr::{MemoryAddr, VirtAddr, va_range};
 
 use crate::{
     DeferredUnmapBackend, MappingBackend, MappingError, MappingLineage, MemoryArea, MemorySet,
@@ -1307,6 +1307,64 @@ fn test_find_free_area() {
 
     let addr = set.find_free_area(0xf001.into(), 0x1000, va_range!(0..MAX_ADDR), 0x1000);
     assert_eq!(addr, None);
+}
+
+#[test]
+fn find_free_area_rejects_bad_alignment_and_address_overflow() {
+    let set = MockMemorySet::new();
+    let ordinary = va_range!(0..MAX_ADDR);
+    assert_eq!(set.find_free_area(0.into(), 0x1000, ordinary, 0), None);
+    assert_eq!(set.find_free_area(0.into(), 0x1000, ordinary, 3), None);
+    assert_eq!(set.find_free_area(0.into(), 0, ordinary, 1), None);
+
+    let near_max = va_range!((usize::MAX - 8)..usize::MAX);
+    assert_eq!(
+        set.find_free_area((usize::MAX - 2).into(), 1, near_max, 1),
+        Some((usize::MAX - 2).into())
+    );
+    assert_eq!(
+        set.find_free_area((usize::MAX - 2).into(), 4, near_max, 4),
+        None
+    );
+}
+
+#[test]
+fn failed_unmap_preflight_does_not_publish_a_free_gap() {
+    let mut set = MemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    let signals = Arc::new(AtomicUsize::new(0));
+    let unmap_calls = Arc::new(AtomicUsize::new(0));
+    let backend = |reject_start| RejectingUnmapBackend {
+        preflight_calls: signals.clone(),
+        unmap_calls: unmap_calls.clone(),
+        reject_start,
+    };
+
+    assert_ok!(set.map(
+        tracked_area(0x1000.into(), 0x1000, 1, backend(0x1000)),
+        &mut pt,
+        false,
+    ));
+    assert_ok!(set.map(
+        tracked_area(0x3000.into(), 0x1000, 1, backend(0x3000)),
+        &mut pt,
+        false,
+    ));
+    assert_eq!(
+        set.find_free_area(0x1000.into(), 0x1000, va_range!(0..MAX_ADDR), 0x1000),
+        Some(0x2000.into())
+    );
+
+    assert_eq!(
+        set.unmap(0x1000.into(), 0x1000, &mut pt),
+        Err(MappingError::BadState)
+    );
+    assert_eq!(
+        set.find_free_area(0x1000.into(), 0x1000, va_range!(0..MAX_ADDR), 0x1000),
+        Some(0x2000.into())
+    );
+    assert_eq!(set.len(), 2);
+    assert_eq!(unmap_calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]

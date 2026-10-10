@@ -8,6 +8,7 @@ use core::{
 
 use memory_addr::{AddrRange, MemoryAddr};
 
+use super::gaps::GapIndex;
 use crate::{
     DeferredUnmapBackend, MappingBackend, MappingError, MappingLineage, MappingResult, MemoryArea,
 };
@@ -43,6 +44,7 @@ struct PreparedMetadataAction<A> {
 pub struct PreparedMetadataUpdate<B: MappingBackend> {
     revision: u64,
     replacement: BTreeMap<B::Addr, MemoryArea<B>>,
+    replacement_gaps: GapIndex,
     changed: bool,
 }
 
@@ -67,10 +69,12 @@ impl<B: MappingBackend> PreparedMetadataUpdate<B> {
             return Err(MappingError::BadState);
         }
         let old_areas = mem::replace(&mut set.areas, self.replacement);
+        let old_gaps = mem::replace(&mut set.gaps, self.replacement_gaps);
         set.bump_revision();
         Ok(CommittedMetadataUpdate {
             set,
             old_areas: Some(old_areas),
+            old_gaps: Some(old_gaps),
         })
     }
 }
@@ -86,6 +90,7 @@ impl<B: MappingBackend> PreparedMetadataUpdate<B> {
 pub struct CommittedMetadataUpdate<'a, B: MappingBackend> {
     set: &'a mut MemorySet<B>,
     old_areas: Option<BTreeMap<B::Addr, MemoryArea<B>>>,
+    old_gaps: Option<GapIndex>,
 }
 
 impl<B: MappingBackend> CommittedMetadataUpdate<'_, B> {
@@ -97,13 +102,19 @@ impl<B: MappingBackend> CommittedMetadataUpdate<'_, B> {
     /// Makes the prepared replacement permanent and releases the old tree.
     pub fn finish(mut self) {
         let _ = self.old_areas.take();
+        let _ = self.old_gaps.take();
     }
 
     fn rollback_inner(&mut self) {
         let Some(old_areas) = self.old_areas.take() else {
             return;
         };
+        let old_gaps = self
+            .old_gaps
+            .take()
+            .expect("committed metadata update lost its old gap index");
         let replacement = mem::replace(&mut self.set.areas, old_areas);
+        self.set.gaps = old_gaps;
         self.set.bump_revision();
         drop(replacement);
     }
@@ -264,6 +275,7 @@ pub struct PreparedFixedReplacement<B: DeferredUnmapBackend> {
     replacement_flags: B::Flags,
     incoming_map: B::Retirement,
     replacement_tree: BTreeMap<B::Addr, MemoryArea<B>>,
+    replacement_gaps: GapIndex,
     restores: Vec<FixedReplacementRestore<B>>,
     // Both Vec capacities are admitted while preparation is still private.
     // Commit only fills this preallocated token vector; it must not allocate
@@ -307,11 +319,15 @@ impl<B: DeferredUnmapBackend> PreparedFixedReplacement<B> {
                 // withdrawn fixed replacement, so this is fail-stop and the
                 // already-detached ownership must not be released.
                 mem::forget(retirement);
-                panic!("mapping backend failed after successful fixed-replace prepared-unmap admission");
+                panic!(
+                    "mapping backend failed after successful fixed-replace prepared-unmap \
+                     admission"
+                );
             }
         }
 
         let old_areas = mem::replace(&mut set.areas, self.replacement_tree);
+        let old_gaps = mem::replace(&mut set.gaps, self.replacement_gaps);
         set.bump_revision();
         Ok(CommittedFixedReplacement {
             replacement_start: self.replacement_start,
@@ -320,6 +336,7 @@ impl<B: DeferredUnmapBackend> PreparedFixedReplacement<B> {
             incoming_map: Some(self.incoming_map),
             restores: self.restores,
             old_areas: Some(old_areas),
+            old_gaps: Some(old_gaps),
             retirement: Some(retirement),
             installed: false,
         })
@@ -339,6 +356,7 @@ pub struct CommittedFixedReplacement<B: DeferredUnmapBackend> {
     incoming_map: Option<B::Retirement>,
     restores: Vec<FixedReplacementRestore<B>>,
     old_areas: Option<BTreeMap<B::Addr, MemoryArea<B>>>,
+    old_gaps: Option<GapIndex>,
     retirement: Option<UnmapRetirement<B>>,
     installed: bool,
 }
@@ -414,6 +432,10 @@ impl<B: DeferredUnmapBackend> CommittedFixedReplacement<B> {
             .old_areas
             .take()
             .expect("fixed replacement rolled back after ownership was consumed");
+        let old_gaps = self
+            .old_gaps
+            .take()
+            .expect("fixed replacement lost its old gap index");
 
         if self.installed {
             let replacement = set
@@ -429,6 +451,7 @@ impl<B: DeferredUnmapBackend> CommittedFixedReplacement<B> {
                     mem::forget(retirement);
                 }
                 mem::forget(old_areas);
+                mem::forget(old_gaps);
                 panic!("mapping backend failed while rolling back fixed replacement");
             }
             self.installed = false;
@@ -458,11 +481,16 @@ impl<B: DeferredUnmapBackend> CommittedFixedReplacement<B> {
                 mem::forget(tokens);
                 mem::forget(retirement);
                 mem::forget(old_areas);
-                panic!("mapping backend failed after successful fixed-replace deferred-restore preflight");
+                mem::forget(old_gaps);
+                panic!(
+                    "mapping backend failed after successful fixed-replace deferred-restore \
+                     preflight"
+                );
             }
         }
 
         let replacement_tree = mem::replace(&mut set.areas, old_areas);
+        let _replacement_gaps = mem::replace(&mut set.gaps, old_gaps);
         set.bump_revision();
         drop(retirement);
         FixedReplacementRollbackRetirement {
@@ -589,6 +617,8 @@ impl<B: DeferredUnmapBackend> UnmapMode<B> for DeferredUnmap<B> {
 /// A container that maintains memory mappings ([`MemoryArea`]).
 pub struct MemorySet<B: MappingBackend> {
     areas: BTreeMap<B::Addr, MemoryArea<B>>,
+    // Derived free-range coverage, mutated in the same operation as `areas`.
+    gaps: GapIndex,
     // Prepared metadata commits use this to reject a tree assembled from a
     // stale topology. The committing guard then keeps `&mut self`, making its
     // rollback immune to intervening normal MemorySet operations.
@@ -638,6 +668,7 @@ impl<B: MappingBackend> MemorySet<B> {
     pub const fn new() -> Self {
         Self {
             areas: BTreeMap::new(),
+            gaps: GapIndex::new(),
             revision: 0,
         }
     }
@@ -791,8 +822,9 @@ impl<B: MappingBackend> MemorySet<B> {
     /// # Notes
     /// The `align` parameter specifies the alignment of the start address and
     /// the size of the area. The start address of the resulting area will
-    /// be aligned to this value. Also, the size of the area must be a multiple
-    /// of this value.
+    /// be aligned to this power-of-two value. Also, the size of the area must
+    /// be a multiple of this value. Invalid alignment or overflowing bounds
+    /// return `None`.
     ///
     /// # Returns
     /// Returns the start address of the free area. Returns `None` if no such
@@ -804,29 +836,9 @@ impl<B: MappingBackend> MemorySet<B> {
         limit: AddrRange<B::Addr>,
         align: usize,
     ) -> Option<B::Addr> {
-        if size % align != 0 {
-            // size must be a multiple of align.
-            return None;
-        }
-        // brute force: try each area's end address as the start.
-        let mut last_end: <B as MappingBackend>::Addr = hint.max(limit.start).align_up(align);
-        if let Some((_, area)) = self.areas.range(..last_end).last() {
-            last_end = last_end.max(area.end()).align_up(align);
-        }
-        for (&addr, area) in self.areas.range(last_end..) {
-            if last_end.checked_add(size).is_some_and(|end| end <= addr) {
-                return Some(last_end);
-            }
-            last_end = area.end().align_up(align);
-        }
-        if last_end
-            .checked_add(size)
-            .is_some_and(|end| end <= limit.end)
-        {
-            Some(last_end)
-        } else {
-            None
-        }
+        self.gaps
+            .find(hint.max(limit.start).into(), limit.end.into(), size, align)
+            .map(Into::into)
     }
 
     /// Finds an append-biased free area at or after the highest occupied end
@@ -910,6 +922,9 @@ impl<B: MappingBackend> MemorySet<B> {
 
         let area_start = area.start();
         area.map_area(page_table)?;
+        let start: usize = area.start().into();
+        let end: usize = area.end().into();
+        self.gaps.occupy(start..end);
         assert!(self.areas.insert(area_start, area).is_none());
         self.merge_adjacent_at(area_start);
         self.bump_revision();
@@ -1083,6 +1098,8 @@ impl<B: MappingBackend> MemorySet<B> {
                 .areas
                 .get(&area_start)
                 .expect("selected mapping area disappeared during unmap commit");
+            let start: usize = area.start().into();
+            let end: usize = area.end().into();
             assert!(
                 mode.unmap(area.backend(), area.start(), area.size(), page_table),
                 "mapping backend failed after successful matching-unmap preflight"
@@ -1091,6 +1108,7 @@ impl<B: MappingBackend> MemorySet<B> {
                 .areas
                 .remove(&area_start)
                 .expect("selected mapping area disappeared during retirement");
+            self.gaps.release(start..end);
             mode.retire_area(area);
         }
         if selected_count != 0 {
@@ -1140,6 +1158,8 @@ impl<B: MappingBackend> MemorySet<B> {
                 .areas
                 .get(area_start)
                 .expect("preflighted selected mapping area disappeared during commit");
+            let start: usize = area.start().into();
+            let end: usize = area.end().into();
             assert!(
                 mode.unmap(area.backend(), area.start(), area.size(), page_table),
                 "mapping backend failed after successful selected-unmap preflight"
@@ -1148,6 +1168,7 @@ impl<B: MappingBackend> MemorySet<B> {
                 .areas
                 .remove(area_start)
                 .expect("preflighted selected mapping area disappeared during retirement");
+            self.gaps.release(start..end);
             mode.retire_area(area);
         }
         if !selected.is_empty() {
@@ -1258,9 +1279,16 @@ impl<B: MappingBackend> MemorySet<B> {
         let replacement_start = replacement.start();
         let replacement_size = replacement.size();
         let replacement_flags = replacement.flags();
-        assert!(replacement_tree
-            .insert(replacement_start, replacement)
-            .is_none());
+        assert!(
+            replacement_tree
+                .insert(replacement_start, replacement)
+                .is_none()
+        );
+        let replacement_gaps = GapIndex::from_areas(replacement_tree.values().map(|area| {
+            let start: usize = area.start().into();
+            let end: usize = area.end().into();
+            start..end
+        }));
 
         Ok(PreparedFixedReplacement {
             revision: self.revision,
@@ -1274,6 +1302,7 @@ impl<B: MappingBackend> MemorySet<B> {
             // the replacement's backend and lineage exact until a later,
             // ordinary VMA operation deliberately coalesces it.
             replacement_tree,
+            replacement_gaps,
             restores,
             retirement,
         })
@@ -1400,6 +1429,9 @@ impl<B: MappingBackend> MemorySet<B> {
 
         self.merge_adjacent_at(start);
         self.merge_adjacent_at(end);
+        let range_start: usize = start.into();
+        let range_end: usize = end.into();
+        self.gaps.release(range_start..range_end);
 
         self.bump_revision();
 
@@ -1436,6 +1468,7 @@ impl<B: MappingBackend> MemorySet<B> {
         for area in mem::take(&mut self.areas).into_values() {
             mode.retire_area(area);
         }
+        self.gaps = GapIndex::new();
         self.bump_revision();
         Ok(mode.finish())
     }
@@ -1771,6 +1804,7 @@ impl<B: MappingBackend> MemorySet<B> {
         }
         let mut staged = MemorySet {
             areas: replacement,
+            gaps: self.gaps.clone(),
             revision: self.revision,
         };
         for anchor in anchors {
@@ -1780,6 +1814,7 @@ impl<B: MappingBackend> MemorySet<B> {
         Ok(PreparedMetadataUpdate {
             revision: self.revision,
             replacement: staged.areas,
+            replacement_gaps: staged.gaps,
             changed: !actions.is_empty(),
         })
     }
@@ -1830,6 +1865,7 @@ impl<B: MappingBackend> MemorySet<B> {
 
         let mut staged = MemorySet {
             areas: replacement,
+            gaps: self.gaps.clone(),
             revision: self.revision,
         };
         for anchor in anchors {
@@ -1839,6 +1875,7 @@ impl<B: MappingBackend> MemorySet<B> {
         Ok(PreparedMetadataUpdate {
             revision: self.revision,
             replacement: staged.areas,
+            replacement_gaps: staged.gaps,
             changed,
         })
     }
