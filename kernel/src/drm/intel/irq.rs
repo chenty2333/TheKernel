@@ -524,6 +524,13 @@ fn rollback_install(
 
 #[cfg(target_os = "none")]
 fn display_irq_handler() {
+    // Once the translated i915 driver has requested this vector, its
+    // gen11_irq_handler() owns GFX_MSTR_IRQ and calls back into
+    // `dispatch_display` for the display half.
+    #[cfg(feature = "intel-upstream-gt")]
+    if upstream::forward() {
+        return;
+    }
     let base = EVENTS.base.load(Ordering::Acquire);
     if base == 0 || !EVENTS.online.load(Ordering::Acquire) {
         return;
@@ -686,64 +693,7 @@ fn dispatch(io: &impl IrqIo, events: &Events) -> bool {
     if master & GEN11_MASTER_IRQ == 0 || master & !GEN11_MASTER_IRQ != GEN11_DISPLAY_IRQ {
         return fault();
     }
-    let Some(display) = io.read(GEN11_DISPLAY_INT_CTL) else {
-        return fault();
-    };
-    let display_sources = display & !DISPLAY_IRQ_ENABLE;
-    if display_sources == 0
-        || display_sources & !(DISPLAY_PIPE_A | DISPLAY_DE_HPD | DISPLAY_PCH) != 0
-    {
-        return fault();
-    }
-    if !io.write(GEN11_DISPLAY_INT_CTL, 0) {
-        return fault();
-    }
-
-    let mut handled = false;
-    if display_sources & DISPLAY_PIPE_A != 0 {
-        let Some(status) = io.read(PIPE_A_IIR) else {
-            return fault();
-        };
-        let owned = status & PIPE_VBLANK;
-        if owned == 0 || status & !PIPE_VBLANK != 0 || !io.write(PIPE_A_IIR, owned) {
-            return fault();
-        }
-        events.vblank.fetch_add(1, Ordering::Release);
-        handled = true;
-    }
-    if display_sources & DISPLAY_DE_HPD != 0 {
-        let Some(status) = io.read(DE_HPD_IIR) else {
-            return fault();
-        };
-        let allowed = events.hpd_de_mask.load(Ordering::Acquire);
-        let owned = status & allowed;
-        if allowed == 0 || owned == 0 || status & !allowed != 0 || !io.write(DE_HPD_IIR, owned) {
-            return fault();
-        }
-        if !dispatch_gen11_tc_hotplug(io, events, owned) {
-            return fault();
-        }
-        handled = true;
-    }
-    if display_sources & DISPLAY_PCH != 0 {
-        let Some(status) = io.read(SDE_IIR) else {
-            return fault();
-        };
-        let allowed = events.hpd_sde_mask.load(Ordering::Acquire);
-        let owned = status & allowed;
-        if allowed == 0 || owned == 0 || status & !allowed != 0 || !io.write(SDE_IIR, owned) {
-            return fault();
-        }
-        events.hpd.fetch_or(owned >> 24, Ordering::Release);
-        handled = true;
-    }
-    if !handled || !events.online.load(Ordering::Acquire) {
-        return fault();
-    }
-    if !io.write(GEN11_DISPLAY_INT_CTL, DISPLAY_IRQ_ENABLE) {
-        return fault();
-    }
-    if !events.online.load(Ordering::Acquire) {
+    if !dispatch_display(io, events) {
         return fault();
     }
     if !io.write(GFX_MSTR_IRQ, GEN11_MASTER_IRQ) {
@@ -751,6 +701,246 @@ fn dispatch(io: &impl IrqIo, events: &Events) -> bool {
     }
     notify_task_context();
     true
+}
+
+
+/// Display half of the Gen11 top-level handler (`gen11_display_irq_handler()`
+/// in Linux): gate GEN11_DISPLAY_INT_CTL, acknowledge only owned sources, and
+/// re-enable it. The caller owns GFX_MSTR_IRQ. Returns false when the source
+/// state is outside what this owner enabled; the caller then faults.
+fn dispatch_display(io: &impl IrqIo, events: &Events) -> bool {
+    let Some(display) = io.read(GEN11_DISPLAY_INT_CTL) else {
+        return false;
+    };
+    let display_sources = display & !DISPLAY_IRQ_ENABLE;
+    if display_sources == 0
+        || display_sources & !(DISPLAY_PIPE_A | DISPLAY_DE_HPD | DISPLAY_PCH) != 0
+    {
+        return false;
+    }
+    if !io.write(GEN11_DISPLAY_INT_CTL, 0) {
+        return false;
+    }
+
+    let mut handled = false;
+    if display_sources & DISPLAY_PIPE_A != 0 {
+        let Some(status) = io.read(PIPE_A_IIR) else {
+            return false;
+        };
+        let owned = status & PIPE_VBLANK;
+        if owned == 0 || status & !PIPE_VBLANK != 0 || !io.write(PIPE_A_IIR, owned) {
+            return false;
+        }
+        events.vblank.fetch_add(1, Ordering::Release);
+        handled = true;
+    }
+    if display_sources & DISPLAY_DE_HPD != 0 {
+        let Some(status) = io.read(DE_HPD_IIR) else {
+            return false;
+        };
+        let allowed = events.hpd_de_mask.load(Ordering::Acquire);
+        let owned = status & allowed;
+        if allowed == 0 || owned == 0 || status & !allowed != 0 || !io.write(DE_HPD_IIR, owned) {
+            return false;
+        }
+        if !dispatch_gen11_tc_hotplug(io, events, owned) {
+            return false;
+        }
+        handled = true;
+    }
+    if display_sources & DISPLAY_PCH != 0 {
+        let Some(status) = io.read(SDE_IIR) else {
+            return false;
+        };
+        let allowed = events.hpd_sde_mask.load(Ordering::Acquire);
+        let owned = status & allowed;
+        if allowed == 0 || owned == 0 || status & !allowed != 0 || !io.write(SDE_IIR, owned) {
+            return false;
+        }
+        events.hpd.fetch_or(owned >> 24, Ordering::Release);
+        handled = true;
+    }
+    if !handled || !events.online.load(Ordering::Acquire) {
+        return false;
+    }
+    if !io.write(GEN11_DISPLAY_INT_CTL, DISPLAY_IRQ_ENABLE) {
+        return false;
+    }
+    if !events.online.load(Ordering::Acquire) {
+        return false;
+    }
+    true
+}
+
+/// Interrupt glue for the translated i915 driver (`intel-upstream-gt`).
+///
+/// Ownership: the translated `gen11_irq_handler()` owns GFX_MSTR_IRQ and the
+/// GT sources; the native display owner above keeps GEN11_DISPLAY_INT_CTL and
+/// every display source register it programmed in `install_n305`. Both run on
+/// the one MSI vector of the GPU function.
+#[cfg(all(feature = "intel-upstream-gt", target_os = "none"))]
+pub(super) mod upstream {
+    use core::ffi::{c_int, c_void};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use intel_gt::i915_irq_upstream::{DisplayIrqOps, install_display_irq_ops};
+    use intel_gt::linux::kernel_core::{IrqCoreOps, install_irq_core_ops};
+    use intel_gt::linux_i915_private::DrmI915Private;
+
+    use super::{EVENTS, GU_MISC_IIR, VolatileIo, dispatch_display, pci};
+    use crate::drm::intel::pci::N305DisplayMsi;
+
+    type Handler = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
+
+    /// `dev_id` is published before the handler, so a reader that sees the
+    /// handler also sees its argument.
+    static HANDLER: AtomicUsize = AtomicUsize::new(0);
+    static DEV_ID: AtomicUsize = AtomicUsize::new(0);
+    static OWN_VECTOR: AtomicUsize = AtomicUsize::new(0);
+    static BDF: spin::Mutex<Option<pci::Bdf>> = spin::Mutex::new(None);
+
+    const IRQ_HANDLED: c_int = 1;
+    const ENODEV: c_int = 19;
+    const EBUSY: c_int = 16;
+    const GEN11_GU_MISC_IRQ: u32 = 1 << 29;
+    const GEN11_GU_MISC_GSE: u32 = 1 << 27;
+
+    pub(super) fn forward() -> bool {
+        let handler = HANDLER.load(Ordering::Acquire);
+        if handler == 0 {
+            return false;
+        }
+        let handler: Handler = unsafe { core::mem::transmute(handler) };
+        let dev_id = DEV_ID.load(Ordering::Acquire) as *mut c_void;
+        let _ = unsafe { handler(0, dev_id) } == IRQ_HANDLED;
+        true
+    }
+
+    /// The probe calls this before `i915_pci_probe()` with the GPU function.
+    pub(in crate::drm::intel) fn install(bdf: pci::Bdf) -> Result<(), &'static str> {
+        *BDF.lock() = Some(bdf);
+        install_irq_core_ops(&IRQ_CORE_OPS)?;
+        install_display_irq_ops(&DISPLAY_IRQ_OPS)
+    }
+
+    static IRQ_CORE_OPS: IrqCoreOps = IrqCoreOps { request_irq, free_irq };
+
+    /// `request_irq()` for the GPU function. If the native display owner has
+    /// already routed the function's MSI, share that vector; otherwise reserve
+    /// and route one now, exactly as `install_n305` does for the display.
+    unsafe extern "C" fn request_irq(_irq: usize, handler: Handler, dev_id: *mut c_void) -> c_int {
+        if HANDLER.load(Ordering::Acquire) != 0 {
+            return -EBUSY;
+        }
+        if EVENTS.base.load(Ordering::Acquire) == 0 {
+            let Some(bdf) = *BDF.lock() else {
+                return -ENODEV;
+            };
+            let Some((address, data, vector)) = axhal::irq::allocate_msi(
+                tk_vtd::PciRequester {
+                    segment: axhal::pci::ecam_segment(),
+                    bus: bdf.bus,
+                    device: bdf.device,
+                    function: bdf.function,
+                },
+                super::display_irq_handler,
+            ) else {
+                return -EBUSY;
+            };
+            DEV_ID.store(dev_id as usize, Ordering::Release);
+            HANDLER.store(handler as usize, Ordering::Release);
+            let routed = (|| {
+                let mut ecam = pci::Ecam::platform().ok_or("PCI facts unavailable")?;
+                let msi = ecam
+                    .prepare_n305_display_msi(bdf, address, data)
+                    .map_err(|_| "MSI prepare failed")?;
+                ecam.activate_n305_display_msi(&msi).map_err(|_| "MSI activate failed")?;
+                ecam.unmask_n305_display_msi(&msi).map_err(|_| "MSI unmask failed")
+            })();
+            if let Err(error) = routed {
+                axlog::warn!("intel-gt: upstream request_irq: {error}");
+                HANDLER.store(0, Ordering::Release);
+                let _ = axhal::irq::unregister(vector);
+                return -EBUSY;
+            }
+            OWN_VECTOR.store(vector, Ordering::Release);
+            return 0;
+        }
+        DEV_ID.store(dev_id as usize, Ordering::Release);
+        HANDLER.store(handler as usize, Ordering::Release);
+        0
+    }
+
+    unsafe extern "C" fn free_irq(_irq: usize, dev_id: *mut c_void) {
+        if DEV_ID.load(Ordering::Acquire) != dev_id as usize {
+            return;
+        }
+        HANDLER.store(0, Ordering::Release);
+        let vector = OWN_VECTOR.swap(0, Ordering::AcqRel);
+        if vector != 0 {
+            let _ = axhal::irq::unregister(vector);
+        }
+    }
+
+    static DISPLAY_IRQ_OPS: DisplayIrqOps = DisplayIrqOps {
+        display_irq_handler,
+        gu_misc_irq_ack,
+        gu_misc_irq_handler,
+        display_irq_reset,
+        display_irq_postinstall,
+        pmu_irq_stats,
+    };
+
+    /// `gen11_display_irq_handler()`: the native owner's display half. A
+    /// source outside what it enabled takes the display offline, as in the
+    /// native top-level handler.
+    unsafe extern "C" fn display_irq_handler(_display: *mut c_void) {
+        let base = EVENTS.base.load(Ordering::Acquire);
+        if base == 0 || !EVENTS.online.load(Ordering::Acquire) {
+            return;
+        }
+        let io = VolatileIo { base };
+        if dispatch_display(&io, &EVENTS) {
+            super::notify_task_context();
+        } else {
+            let _ = super::IrqIo::write(&io, super::GEN11_DISPLAY_INT_CTL, 0);
+            EVENTS.faulted.store(true, Ordering::Release);
+            EVENTS.online.store(false, Ordering::Release);
+            super::notify_task_context();
+        }
+    }
+
+    /// `gen11_gu_misc_irq_ack()`.
+    unsafe extern "C" fn gu_misc_irq_ack(_display: *mut c_void, master_ctl: u32) -> u32 {
+        let base = EVENTS.base.load(Ordering::Acquire);
+        if master_ctl & GEN11_GU_MISC_IRQ == 0 || base == 0 {
+            return 0;
+        }
+        let io = VolatileIo { base };
+        let iir = super::IrqIo::read(&io, GU_MISC_IIR).unwrap_or(0);
+        if iir != 0 {
+            let _ = super::IrqIo::write(&io, GU_MISC_IIR, iir);
+        }
+        iir
+    }
+
+    /// `gen11_gu_misc_irq_handler()`: GSE is the OpRegion ASLE request, which
+    /// TheKernel's display owner does not service.
+    unsafe extern "C" fn gu_misc_irq_handler(_display: *mut c_void, iir: u32) {
+        if iir & GEN11_GU_MISC_GSE != 0 {
+            axlog::warn!("intel-gpu: OpRegion ASLE interrupt ignored");
+        }
+    }
+
+    /// Display IRQ registers belong to the native owner, which programs and
+    /// rolls them back itself (`install_n305`); the translated reset and
+    /// postinstall therefore leave them alone.
+    unsafe extern "C" fn display_irq_reset(_display: *mut c_void) {}
+    unsafe extern "C" fn display_irq_postinstall(_display: *mut c_void) {}
+
+    /// `pmu_irq_stats()` only feeds i915 PMU counters; CONFIG_PERF_EVENTS
+    /// for i915 is off.
+    unsafe extern "C" fn pmu_irq_stats(_i915: *mut DrmI915Private) {}
 }
 
 #[cfg(test)]

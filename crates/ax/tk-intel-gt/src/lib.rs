@@ -57,7 +57,7 @@ pub mod linux_pm;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 #[path = "linux/i915_private.rs"]
-pub(crate) mod linux_i915_private;
+pub mod linux_i915_private;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 #[path = "linux/mutex.rs"]

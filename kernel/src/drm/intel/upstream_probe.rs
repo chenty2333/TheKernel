@@ -98,6 +98,7 @@ pub(super) fn probe(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, Str
     // The power-domain callbacks need the display window before the probe
     // reaches intel_gt_init() and its first GT unpark.
     upstream_gt::register_display_window(window);
+    super::irq::upstream::install(bdf).map_err(|e| format!("upstream i915: {e}"))?;
     let pdev = upstream_gt::native_pci_device(bdf);
     let ret = unsafe { i915_pci_probe(pdev, info.device_id, device_info) };
     if ret != 0 {
