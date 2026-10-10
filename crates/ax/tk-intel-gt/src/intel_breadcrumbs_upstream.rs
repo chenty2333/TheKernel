@@ -155,7 +155,11 @@ unsafe fn check_signal_order(ce: *mut IntelContext, rq: *mut I915Request) -> boo
 
 // upstream: intel_breadcrumbs.c __dma_fence_signal()
 unsafe fn __dma_fence_signal(fence: *mut DmaFence) -> bool {
-    !test_and_set_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &mut (*fence).flags)
+    let already_signaled = test_and_set_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &mut (*fence).flags);
+    if !already_signaled {
+        crate::linux::requests::wake_dma_fence_waiters();
+    }
+    !already_signaled
 }
 
 // upstream: intel_breadcrumbs.c __dma_fence_signal__timestamp()

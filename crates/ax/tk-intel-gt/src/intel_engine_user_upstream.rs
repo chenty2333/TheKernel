@@ -105,6 +105,17 @@ pub(crate) unsafe fn engine_uabi_tree(i915: *mut DrmI915Private) -> *mut RbRoot 
     ptr::addr_of_mut!((*engine_uabi_view(i915)).engines.tree)
 }
 
+/// Read the header-owned legacy UABI engine count by class.
+pub(crate) unsafe fn engine_uabi_class_count(
+    i915: *mut DrmI915Private,
+    class: usize,
+) -> u32 {
+    if class >= I915_UABI_ENGINE_CLASS_COUNT {
+        return 0;
+    }
+    unsafe { (*engine_uabi_view(i915)).engine_uabi_class_count[class] }
+}
+
 #[inline]
 pub(crate) unsafe fn engine_uabi_llist(
     i915: *mut DrmI915Private,

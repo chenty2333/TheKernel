@@ -33,6 +33,12 @@ pub const fn hweight8(value: u8) -> u32 {
     value.count_ones()
 }
 
+/// Linux `hweight16()`: population count of the low sixteen bits.
+#[inline]
+pub const fn hweight16(value: u16) -> u32 {
+    value.count_ones()
+}
+
 pub trait LinuxUnsigned: Copy + Ord {
     const ZERO: Self;
     const ONE: Self;
@@ -181,6 +187,23 @@ pub fn jiffies() -> u64 {
     let second = axhal::time::NANOS_PER_SEC as u64;
     let hz = crate::linux_config::CONFIG_HZ as u64;
     (nanos / second) * hz + (nanos % second) * hz / second
+}
+
+/// Linux `round_jiffies_up_relative()` policy: align a relative deadline to
+/// the next second boundary, with the Linux per-CPU three-tick skew. Rounding
+/// is only retained when the wrapped absolute deadline is still in the future.
+pub fn round_jiffies_up_relative(delta: u64) -> u64 {
+    let now = jiffies();
+    let hz = crate::linux_config::CONFIG_HZ as u64;
+    let cpu_skew = (axhal::percpu::this_cpu_id() as u64).wrapping_mul(3);
+    let target = now.wrapping_add(delta).wrapping_add(cpu_skew);
+    let rem = target % hz;
+    let rounded = target
+        .wrapping_sub(rem)
+        .wrapping_add(hz)
+        .wrapping_sub(cpu_skew);
+    let relative = rounded.wrapping_sub(now);
+    if relative as i64 > 0 { relative } else { delta }
 }
 
 #[inline]

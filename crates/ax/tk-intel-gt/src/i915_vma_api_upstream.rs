@@ -405,6 +405,20 @@ pub unsafe fn i915_vma_unpin_fence(vma: *mut I915Vma) {
     }
 }
 
+/// Source-inline `__i915_vma_unpin_fence()` used by execbuffer rollback.
+pub unsafe fn __i915_vma_unpin_fence(vma: *mut I915Vma) {
+    let fence = unsafe { (*vma).fence };
+    GEM_BUG_ON!(fence.is_null());
+    GEM_BUG_ON!(unsafe { crate::linux::memory::atomic_read(&(*fence).pin_count) } <= 0);
+    unsafe { crate::linux::memory::atomic_dec(&mut (*fence).pin_count) };
+}
+
+/// `i915_vma_size()` returns the effective address range without guard pages.
+pub unsafe fn i915_vma_size(vma: *const I915Vma) -> u64 {
+    GEM_BUG_ON!(!unsafe { crate::linux::gem_memory::drm_mm_node_allocated(&(*vma).node) });
+    unsafe { (*vma).node.size - 2 * u64::from((*vma).guard) }
+}
+
 /// `i915_vma_is_scanout()` (`i915_vma.h:409-412`).
 ///
 /// # Safety

@@ -59,13 +59,6 @@ const I915_PRIORITY_BARRIER: i32 = i32::MAX - 1;
 unsafe extern "C" {
     fn round_jiffies_up_relative(j: c_ulong) -> c_ulong;
     fn intel_guc_find_hung_context(engine: *mut IntelEngineCs);
-    fn intel_gt_handle_error(
-        gt: *mut IntelGt,
-        engine_mask: IntelEngineMask,
-        flags: c_ulong,
-        fmt: *const c_char,
-        ...
-    );
 }
 
 // upstream: intel_engine_heartbeat.c next_heartbeat()
@@ -217,12 +210,12 @@ fn reset_engine(engine: *mut IntelEngineCs, rq: *mut I915Request) {
     }
 
     unsafe {
-        intel_gt_handle_error(
+        crate::intel_reset_upstream::intel_gt_handle_error_format(
             (*engine).gt,
             (*engine).mask,
             crate::linux::registers::I915_ERROR_CAPTURE as c_ulong,
             b"stopped heartbeat on %s\0".as_ptr().cast(),
-            (*engine).name.as_ptr(),
+            &[&(*engine).name.as_ptr() as &dyn crate::linux::print::CFormatArg],
         );
     }
 }
@@ -326,12 +319,12 @@ fn heartbeat(wrk: *mut WorkStruct) {
             };
             if blocked == serial as u64 {
                 unsafe {
-                    intel_gt_handle_error(
+                    crate::intel_reset_upstream::intel_gt_handle_error_format(
                         (*engine).gt,
                         (*engine).mask,
                         crate::linux::registers::I915_ERROR_CAPTURE as c_ulong,
                         b"no heartbeat on %s\0".as_ptr().cast(),
-                        (*engine).name.as_ptr(),
+                        &[&(*engine).name.as_ptr() as &dyn crate::linux::print::CFormatArg],
                     );
                 }
             }

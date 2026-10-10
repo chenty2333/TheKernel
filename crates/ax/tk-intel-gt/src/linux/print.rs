@@ -854,6 +854,25 @@ macro_rules! guc_err {
     }};
 }
 
+/// Linux `guc_info()` / `guc_printk(..., info, ...)` logging path.
+macro_rules! guc_info {
+    ($guc:expr, $format:literal $(, $argument:expr)* $(,)?) => {{
+        let __guc = $guc;
+        let _ = __guc;
+        let __args: &[&dyn $crate::linux_print::CFormatArg] = &[
+            $(&($argument) as &dyn $crate::linux_print::CFormatArg),*
+        ];
+        let __message = $crate::linux_print::format_message(concat!("GUC: ", $format), __args);
+        $crate::linux_print::drm_log_at(
+            $crate::linux_print::DrmLogLevel::Info,
+            "i915 GuC info",
+            file!(),
+            line!(),
+            &__message,
+        );
+    }};
+}
+
 macro_rules! pr_err {
     ($format:expr $(, $argument:expr)* $(,)?) => {{
         let __args: &[&dyn $crate::linux_print::CFormatArg] = &[
@@ -953,6 +972,20 @@ macro_rules! gt_notice {
             line!(),
             &__message,
         );
+    }};
+}
+
+/// `guc_notice()` from `intel_guc_print.h`: retain the GuC tag/prefix while
+/// logging through the owning GT at Linux's notice level.
+macro_rules! guc_notice {
+    ($guc:expr, $format:literal $(, $argument:expr)* $(,)?) => {{
+        let __guc = $guc;
+        let __gt = unsafe {
+            $crate::intel_gt_api_upstream::guc_to_gt(
+                __guc as *mut $crate::intel_guc_types_upstream::IntelGuc,
+            )
+        };
+        gt_notice!(__gt, concat!("GUC: ", $format) $(, $argument)*);
     }};
 }
 

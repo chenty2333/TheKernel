@@ -331,13 +331,6 @@ unsafe extern "C" {
     fn intel_pxp_start(pxp: *mut c_void) -> c_int;
     fn intel_context_reconfigure_sseu(ce: *mut IntelContext, sseu: *const IntelSseu) -> c_int;
     fn intel_engine_pulse(engine: *mut IntelEngineCs) -> c_int;
-    fn intel_gt_handle_error(
-        gt: *mut IntelGt,
-        mask: IntelEngineMask,
-        flags: u32,
-        fmt: *const c_char,
-        ...
-    );
     fn i915_request_get_rcu(rq: *mut I915Request) -> bool;
     fn i915_request_put(rq: *mut I915Request);
     fn i915_request_active_engine(rq: *mut I915Request, engine: *mut *mut IntelEngineCs) -> bool;
@@ -350,7 +343,7 @@ unsafe extern "C" {
     fn i915_user_extensions(
         extensions: *mut I915UserExtension,
         funcs: *const Option<unsafe extern "C" fn(*mut I915UserExtension, *mut c_void) -> c_int>,
-        count: usize,
+        count: u32,
         data: *mut c_void,
     ) -> c_int;
     fn i915_gem_context_is_banned(i915: *mut DrmI915Private) -> bool;
@@ -392,6 +385,17 @@ static mut SLAB_LUTS: *mut crate::linux::heap::KmCache = ptr::null_mut();
 
 unsafe fn file_private_view(file_priv: *mut DrmI915FilePrivate) -> *mut I915FilePrivateView {
     file_priv.cast()
+}
+
+pub(crate) unsafe fn i915_gem_file_bsd_engine(file_priv: *mut DrmI915FilePrivate) -> i32 {
+    unsafe { (*file_private_view(file_priv)).bsd_engine as i32 }
+}
+
+pub(crate) unsafe fn i915_gem_file_set_bsd_engine(
+    file_priv: *mut DrmI915FilePrivate,
+    engine: u32,
+) {
+    unsafe { (*file_private_view(file_priv)).bsd_engine = engine };
 }
 
 unsafe fn client_view(client: *mut I915DrmClient) -> *mut I915ClientView {
@@ -522,19 +526,19 @@ unsafe fn i915_gem_context_no_error_capture(ctx: *const I915GemContext) -> bool 
 unsafe fn i915_gem_context_is_bannable(ctx: *const I915GemContext) -> bool {
     test_bit(UCONTEXT_BANNABLE, unsafe { &(*ctx).user_flags })
 }
-unsafe fn i915_gem_context_is_recoverable(ctx: *const I915GemContext) -> bool {
+pub(crate) unsafe fn i915_gem_context_is_recoverable(ctx: *const I915GemContext) -> bool {
     test_bit(UCONTEXT_RECOVERABLE, unsafe { &(*ctx).user_flags })
 }
 unsafe fn i915_gem_context_is_persistent(ctx: *const I915GemContext) -> bool {
     test_bit(UCONTEXT_PERSISTENCE, unsafe { &(*ctx).user_flags })
 }
-unsafe fn i915_gem_context_user_engines(ctx: *const I915GemContext) -> bool {
+pub(crate) unsafe fn i915_gem_context_user_engines(ctx: *const I915GemContext) -> bool {
     test_bit(CONTEXT_USER_ENGINES, unsafe { &(*ctx).flags })
 }
-unsafe fn i915_gem_context_is_closed(ctx: *const I915GemContext) -> bool {
+pub(crate) unsafe fn i915_gem_context_is_closed(ctx: *const I915GemContext) -> bool {
     test_bit(CONTEXT_CLOSED, unsafe { &(*ctx).flags })
 }
-unsafe fn i915_gem_context_uses_protected_content(ctx: *const I915GemContext) -> bool {
+pub(crate) unsafe fn i915_gem_context_uses_protected_content(ctx: *const I915GemContext) -> bool {
     unsafe { (*ctx).uses_protected_content }
 }
 
@@ -547,7 +551,7 @@ unsafe fn i915_gem_context_get_eb_vm(ctx: *mut I915GemContext) -> *mut I915Addre
     unsafe { i915_vm_get(vm) }
 }
 
-unsafe fn i915_gem_context_has_full_ppgtt(ctx: *mut I915GemContext) -> bool {
+pub(crate) unsafe fn i915_gem_context_has_full_ppgtt(ctx: *mut I915GemContext) -> bool {
     !unsafe { vm_pointer(ctx) }.is_null()
 }
 
@@ -576,7 +580,10 @@ unsafe fn i915_gem_context_set_closed(ctx: *mut I915GemContext) {
     set_bit(CONTEXT_CLOSED, unsafe { &mut (*ctx).flags });
 }
 
-unsafe fn i915_gem_context_get_engine(ctx: *mut I915GemContext, index: u32) -> *mut IntelContext {
+pub(crate) unsafe fn i915_gem_context_get_engine(
+    ctx: *mut I915GemContext,
+    index: u32,
+) -> *mut IntelContext {
     unsafe { context_engine(ctx, index) }
 }
 
@@ -1274,7 +1281,7 @@ unsafe fn set_proto_ctx_engines(
             i915_user_extensions(
                 u64_to_user_ptr(extensions).cast(),
                 SET_PROTO_CTX_ENGINES_EXTENSIONS.as_ptr(),
-                SET_PROTO_CTX_ENGINES_EXTENSIONS.len(),
+                SET_PROTO_CTX_ENGINES_EXTENSIONS.len() as u32,
                 ptr::addr_of_mut!(set).cast(),
             )
         };
@@ -1807,12 +1814,12 @@ unsafe fn __context_engines_static(ctx: *const I915GemContext) -> *mut I915GemEn
 unsafe fn __reset_context(ctx: *mut I915GemContext, engine: *mut IntelEngineCs) {
     let message = b"context closure in %s\0";
     unsafe {
-        intel_gt_handle_error(
+        crate::intel_reset_upstream::intel_gt_handle_error_format(
             (*engine).gt,
             (*engine).mask,
             0,
             message.as_ptr().cast(),
-            (*ctx).name.as_ptr(),
+            &[&(*ctx).name.as_ptr() as &dyn crate::linux::print::CFormatArg],
         );
     }
 }
@@ -2760,7 +2767,7 @@ pub unsafe fn i915_gem_context_create_ioctl(
             i915_user_extensions(
                 u64_to_user_ptr((*args).extensions).cast(),
                 CREATE_EXTENSIONS.as_ptr(),
-                CREATE_EXTENSIONS.len(),
+                CREATE_EXTENSIONS.len() as u32,
                 ptr::addr_of_mut!(ext_data).cast(),
             )
         };

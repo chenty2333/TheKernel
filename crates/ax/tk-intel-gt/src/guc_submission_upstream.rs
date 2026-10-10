@@ -148,7 +148,7 @@ unsafe extern "C" {
         g2h_len_dw: u32,
         loop_on_busy: bool,
     ) -> i32;
-    fn dma_fence_context_alloc(num: usize) -> u64;
+    fn dma_fence_context_alloc(num: u32) -> u64;
     fn intel_engine_reset_pinned_contexts(engine: *mut intel_engine_cs);
     fn intel_mocs_init_engine(engine: *mut intel_engine_cs);
     fn gen8_emit_flush_xcs(rq: *mut i915_request, mode: u32) -> i32;
@@ -184,13 +184,6 @@ unsafe extern "C" {
         timeout: i64,
         remaining_timeout: *mut i64,
     ) -> i64;
-    fn intel_gt_handle_error(
-        gt: *mut intel_gt,
-        engine_mask: u32,
-        flags: c_ulong,
-        fmt: *const c_char,
-        ...
-    );
 }
 
 #[allow(non_snake_case)]
@@ -2222,7 +2215,7 @@ fn intel_guc_submission_reset_finish(guc: &mut intel_guc) {
 }
 
 // upstream: intel_guc_submission.c intel_guc_tlb_invalidation_is_available()
-fn intel_guc_tlb_invalidation_is_available(guc: &intel_guc) -> bool {
+pub(crate) fn intel_guc_tlb_invalidation_is_available(guc: &intel_guc) -> bool {
     return (unsafe { HAS_GUC_TLB_INVALIDATION((*guc_to_gt_const(guc)).i915) })
         && (unsafe { intel_guc_is_ready(guc) });
 }
@@ -4798,7 +4791,7 @@ fn guc_send_invalidate_tlb(guc: &mut intel_guc, ty: intel_guc_tlb_invalidation_t
 }
 
 // upstream: intel_guc_submission.c intel_guc_invalidate_tlb_engines()
-fn intel_guc_invalidate_tlb_engines(guc: &mut intel_guc) -> i32 {
+pub(crate) fn intel_guc_invalidate_tlb_engines(guc: &mut intel_guc) -> i32 {
     guc_send_invalidate_tlb(
         guc,
         intel_guc_tlb_invalidation_type::INTEL_GUC_TLB_INVAL_ENGINES,
@@ -4806,7 +4799,7 @@ fn intel_guc_invalidate_tlb_engines(guc: &mut intel_guc) -> i32 {
 }
 
 // upstream: intel_guc_submission.c intel_guc_invalidate_tlb_guc()
-fn intel_guc_invalidate_tlb_guc(guc: &mut intel_guc) -> i32 {
+pub(crate) fn intel_guc_invalidate_tlb_guc(guc: &mut intel_guc) -> i32 {
     guc_send_invalidate_tlb(
         guc,
         intel_guc_tlb_invalidation_type::INTEL_GUC_TLB_INVAL_GUC,
@@ -5040,12 +5033,12 @@ fn reset_fail_worker_func(w: &mut work_struct) {
             intel_guc_find_hung_context(unsafe { &mut *engine });
         });
         unsafe {
-            intel_gt_handle_error(
+            crate::intel_reset_upstream::intel_gt_handle_error_format(
                 gt,
                 reset_fail_mask,
                 I915_ERROR_CAPTURE as c_ulong,
                 c"GuC failed to reset engine mask=0x%x".as_ptr(),
-                reset_fail_mask,
+                &[&reset_fail_mask as &dyn crate::linux::print::CFormatArg],
             )
         };
     }

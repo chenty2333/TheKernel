@@ -84,7 +84,6 @@ pub struct GucOptions {
     pub revision: u8,
 }
 
-/// upstream: intel_guc.c guc_ctl_debug_flags()
 pub fn guc_ctl_debug_flags(level: u8) -> u32 {
     if level <= 1 {
         GUC_LOG_DISABLED
@@ -93,7 +92,6 @@ pub fn guc_ctl_debug_flags(level: u8) -> u32 {
     }
 }
 
-/// upstream: intel_guc.c guc_ctl_feature_flags()
 pub fn guc_ctl_feature_flags(submission: bool, slpc: bool, pxp: bool) -> u32 {
     let mut flags = 0;
     if pxp {
@@ -108,7 +106,6 @@ pub fn guc_ctl_feature_flags(submission: bool, slpc: bool, pxp: bool) -> u32 {
     flags
 }
 
-/// upstream: intel_guc.c guc_ctl_log_params_flags()
 pub fn guc_ctl_log_params_flags(log: LogConfig) -> Result<u32, Error> {
     if log.ggtt_address == 0 || log.ggtt_address & 0xfff != 0 {
         return Err(Error::Refused);
@@ -133,7 +130,6 @@ pub fn guc_ctl_log_params_flags(log: LogConfig) -> Result<u32, Error> {
         | (offset << GUC_LOG_BUF_ADDR_SHIFT))
 }
 
-/// upstream: intel_guc.c guc_ctl_ads_flags()
 pub fn guc_ctl_ads_flags(ads_ggtt_address: u32) -> Result<u32, Error> {
     if ads_ggtt_address == 0 || ads_ggtt_address & 0xfff != 0 {
         return Err(Error::Refused);
@@ -145,7 +141,6 @@ pub fn guc_ctl_ads_flags(ads_ggtt_address: u32) -> Result<u32, Error> {
     Ok(pages << GUC_ADS_ADDR_SHIFT)
 }
 
-/// upstream: intel_guc.c guc_ctl_wa_flags()
 pub fn guc_ctl_wa_flags(wa: GucWaInfo, firmware_version: (u8, u8, u8)) -> u32 {
     let mut flags = 0;
     if wa.graphics_ip.major >= 11
@@ -193,12 +188,10 @@ pub fn guc_ctl_wa_flags(wa: GucWaInfo, firmware_version: (u8, u8, u8)) -> u32 {
     flags
 }
 
-/// upstream: intel_guc.c guc_ctl_devid()
 pub const fn guc_ctl_devid(device_id: u16, revision: u8) -> u32 {
     ((device_id as u32) << 16) | revision as u32
 }
 
-/// upstream: intel_guc.c guc_init_params()
 pub fn guc_init_params(options: GucOptions) -> Result<[u32; GUC_CTL_MAX_DWORDS], Error> {
     if options.log_level > 5 || options.ads_ggtt_address == 0 {
         return Err(Error::Refused);
@@ -214,12 +207,10 @@ pub fn guc_init_params(options: GucOptions) -> Result<[u32; GUC_CTL_MAX_DWORDS],
     Ok(params)
 }
 
-/// upstream: intel_guc.c intel_guc_write_params()
 pub fn write_params(io: &impl GtIo, params: &[u32; GUC_CTL_MAX_DWORDS]) -> Result<(), Error> {
     write_params_with_base(io, SOFT_SCRATCH_BASE, params)
 }
 
-/// upstream: intel_guc.c intel_guc_write_params() selected GT scratch bank.
 pub fn write_params_with_regs(
     io: &impl GtIo,
     regs: crate::guc_fw::GucSendRegs,
@@ -240,7 +231,6 @@ pub fn write_params_with_base(
     Ok(())
 }
 
-/// upstream: intel_guc.c Gen12 platform/default GuC options in guc_init_params().
 pub fn gen12_options(
     platform: Platform,
     device_id: u16,

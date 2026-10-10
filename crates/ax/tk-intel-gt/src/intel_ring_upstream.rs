@@ -107,7 +107,7 @@ unsafe fn i915_gem_object_unpin_map(obj: *mut DrmI915GemObject) {
 
 /// Source-header `__intel_ring_space()` helper; C unsigned arithmetic wraps.
 #[inline]
-fn intel_ring_space(head: u32, tail: u32, size: u32) -> u32 {
+pub(crate) fn intel_ring_space(head: u32, tail: u32, size: u32) -> u32 {
     GEM_BUG_ON!(size == 0 || !size.is_power_of_two());
     head.wrapping_sub(tail).wrapping_sub(CACHELINE_BYTES as u32) & size.wrapping_sub(1)
 }

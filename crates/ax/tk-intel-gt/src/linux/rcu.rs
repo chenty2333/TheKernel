@@ -6,7 +6,7 @@
 
 #![allow(unsafe_code)]
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use kernel_guard::BaseGuard;
 
@@ -30,6 +30,25 @@ pub fn rcu_read_unlock() {
         RCU_EPOCH.fetch_add(1, Ordering::AcqRel);
     }
     kernel_guard::NoPreempt::release(());
+}
+
+/// Linux `rcu_access_pointer()` for an RCU-published raw pointer slot. The
+/// pointer is read atomically without acquiring the referent; callers must
+/// still hold the lifetime protection required by their source path.
+#[inline]
+pub unsafe fn rcu_access_pointer<T>(slot: *const *mut T) -> *mut T {
+    assert!(!slot.is_null());
+    let atomic = unsafe { AtomicPtr::from_ptr(slot.cast_mut().cast::<*mut T>()) };
+    atomic.load(Ordering::Relaxed)
+}
+
+/// Linux `rcu_dereference()` pointer load, paired with the release publication
+/// in `rcu_assign_pointer!()` and followed by the caller's RCU read-side lock.
+#[inline]
+pub unsafe fn rcu_dereference<T>(slot: *const *mut T) -> *mut T {
+    assert!(!slot.is_null());
+    let atomic = unsafe { AtomicPtr::from_ptr(slot.cast_mut().cast::<*mut T>()) };
+    atomic.load(Ordering::Acquire)
 }
 
 /// Snapshot the current quiescent-state epoch for `cond_synchronize_rcu()`.

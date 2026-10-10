@@ -1899,3 +1899,213 @@ threshold 40: `(0, 0, 0, 414, 405, 0, 0)`; threshold 25:
 `(18, 15, 4, 1318, 1303, 0, 0)`, in the CI baseline's seven-column order.
 Other scopes are unchanged. The feature remains default-off; compilation and
 host tests do not constitute native hardware or runtime integration acceptance.
+
+`intel_gt_requests_upstream.rs` is a complete source-order translation of all 15
+function definitions in Linux 7.2.3 `drivers/gpu/drm/i915/gt/intel_gt_requests.c`
+(MIT, Copyright © 2019 Intel Corporation). Its LinuxKPI additions are the
+source-semantic fence wait dispatcher and relative jiffies rounding helper.
+
+### GT preparation source-order translations
+
+| Source | Rust owner / translated scope |
+|---|---|
+| `gt/intel_gt_buffer_pool.c` | `intel_gt_buffer_pool_upstream.rs`: all 11 functions; RCU reclamation, delayed work, intrusive-list and GEM object behavior retain source ordering. Its `__list_del_many()` helper follows `i915_list_util.h` (MIT, Copyright © 2025 Intel Corporation). |
+| `gt/intel_gt_clock_utils.c` | `intel_gt_clock_utils_upstream.rs`: all 16 functions including Gen4–Gen11 frequency selection and interval conversions; `i9xx_fsb_freq()` is the companion `i915_freq.c` dependency. |
+| `gt/intel_sseu.c` | `intel_sseu_upstream.rs`: all 26 C functions; the existing `intel_sseu_get_hsw_subslices()` definition remains in `intel_sseu_types_upstream.rs` to avoid duplicate ownership. |
+
+`linux/seq_file.rs` implements the Linux 7.2.3 `seq_file` buffer-prefix,
+`seq_printf`/`seq_write` count and overflow behavior as original LinuxKPI, using
+the crate's typed C-format formatter. GPL `fs/seq_file.c` function bodies were
+not copied.
+
+`i915_freq_upstream.rs` translates the three MIT functions from Linux 7.2.3
+`drivers/gpu/drm/i915/i915_freq.c` (Copyright © 2025 Intel Corporation), which
+are required by the Gen4 clock-frequency branch in `intel_gt_clock_utils.c`.
+`linux/firmware.rs` supplies a fail-closed `request_firmware_nowarn` adapter
+backed by `tk-axdriver-base` rootfs firmware reads; request size is capped at
+8 MiB, and ownership is released through the matching adapter.
+
+`intel_wopcm_upstream.rs` translates all 10 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_wopcm.c` (MIT, Copyright © 2017-2019 Intel
+Corporation), including Gen9 layout restrictions, locked-register verification,
+and GuC/HuC capacity checks.
+
+`intel_context_sseu_upstream.rs` translates all 3 definitions in Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_context_sseu.c` (MIT, Copyright © 2019 Intel
+Corporation); it uses the source header's kernel-context request helper.
+
+`intel_tlb_upstream.rs` translates all 6 definitions in Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_tlb.c` (MIT, Copyright © 2023 Intel Corporation);
+its diagnostic path applies a monotonic five-second error rate limit.
+
+`intel_gt_pm_irq_upstream.rs` translates all 8 functions in Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_gt_pm_irq.c` (MIT, Copyright © 2019 Intel
+Corporation), retaining mask/update, repeated reset writes, and posting-read order.
+
+`intel_gt_mcr_impl_upstream.rs` translates all 21 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_gt_mcr.c` (MIT, Copyright © 2022 Intel
+Corporation); common steering and multicast behavior follows the source.
+
+`linux/forcewake.rs` implements the Linux 7.2.3 i915 forcewake reference-count,
+domain-selection, callback, and release-register behavior based on the MIT
+`drivers/gpu/drm/i915/intel_uncore.c` implementation (Copyright © 2013 Intel
+Corporation).
+
+`intel_huc_fw_upstream.rs` translates all 6 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/uc/intel_huc_fw.c` (MIT, Copyright © 2014-2019 Intel
+Corporation), preserving firmware state transitions and HECI/PXP message layout.
+
+`intel_guc_hwconfig_upstream.rs` translates all 7 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/uc/intel_guc_hwconfig.c` (MIT, Copyright © 2022 Intel
+Corporation), retaining KLV parsing, temporary VMA lifecycle, and failure order.
+
+`intel_uc_upstream.rs` translates all 36 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/uc/intel_uc.c` (MIT, Copyright © 2016-2019 Intel
+Corporation), preserving uC policy selection, lifecycle, rollback, and suspend/resume ordering.
+
+`intel_renderstate_upstream.rs` translates all 5 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_renderstate.c` (MIT, Copyright © 2014 Intel
+Corporation). Gen6-Gen9 immutable render-state table data is not included because
+this target is Gen12, where the upstream selector returns null.
+
+`intel_gt_irq_upstream.rs` translates all 21 definitions in Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_gt_irq.c` (MIT, Copyright © 2019 Intel
+Corporation); display interrupt dispatch remains a kernel-provided callback boundary.
+
+`intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
+Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.
+
+`intel_gt_pm_upstream.rs` translates all 20 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_gt_pm.c` (MIT, Copyright © 2019 Intel
+Corporation); runtime-PM, display-power, RC6/RPS, request, and system-PM services remain explicit owner boundaries.
+
+`gen8_ppgtt_upstream.rs` translates all 30 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/gen8_ppgtt.c` (MIT, Copyright © 2020 Intel
+Corporation), retaining source-order page-table allocation, insertion, and
+cleanup. The target build disables GVT and the i915 PPGTT selftests; no
+GVT-specific locking behavior is claimed.
+
+`shmem_utils_upstream.rs` translates all 8 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/shmem_utils.c` (MIT, Copyright © 2020 Intel
+Corporation). `linux/vm.rs` supplies its vmap/vfree dependencies through axmm
+and fails closed until the kernel owner installs an acknowledged global TLB
+shootdown callback; it is not a runtime-ready vmap path by itself.
+
+`i915_gem_busy_upstream.rs` translates all 6 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gem/i915_gem_busy.c` (MIT, Copyright © 2014-2016 Intel
+Corporation), including reservation restart handling and the engine-class uABI
+busy-bit encoding.
+
+`i915_gem_internal_upstream.rs` translates all 5 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gem/i915_gem_internal.c` (MIT, Copyright © 2014-2016
+Intel Corporation), preserving page-allocation fallback and SG/object cleanup.
+
+`i915_gem_wait_upstream.rs` translates all 12 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gem/i915_gem_wait.c` (MIT, Copyright © 2016 Intel
+Corporation), including request prioritization and reservation wait order.
+
+`i915_gem_create_upstream.rs` translates all 13 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gem/i915_gem_create.c` (MIT, Copyright © 2020 Intel
+Corporation), preserving placement selection, user-extension validation, and
+GEM handle publication/error order.
+
+`i915_gem_throttle_upstream.rs` translates the sole definition in Linux 7.2.3
+`drivers/gpu/drm/i915/gem/i915_gem_throttle.c` (MIT, Copyright © 2014-2016
+Intel Corporation); context/engine/timeline locks and wait ordering follow the
+source path.
+
+`i915_gem_pm_upstream.rs` translates all 9 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gem/i915_gem_pm.c` (MIT, Copyright © 2019 Intel
+Corporation), preserving suspend/freeze/resume order and TTM calls behind the
+upstream local-memory-region type checks.
+
+`i915_gem_dmabuf_upstream.rs` translates all 12 actual C functions in Linux
+7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_dmabuf.c` (MIT, Copyright 2012 Red
+Hat Inc); ctags reports one additional `I915_SELFTEST_DECLARE` macro pseudo-tag.
+The `dma_buf` ABI views and Linux PRIME/DMA mappings keep
+their source layout; generic DMA-BUF, DMA map, and VMA services remain external
+LinuxKPI/kernel ownership boundaries.
+
+`i915_gem_object_frontbuffer_upstream.rs` translates all 12 functions from
+Linux 7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_object_frontbuffer.c` (MIT,
+Copyright © 2025 Intel Corporation). The frontbuffer interface preserves the
+display-owned init/fini/flush/invalidate calls as external owner boundaries.
+
+`i915_getparam_upstream.rs` translates the sole definition in Linux 7.2.3
+`drivers/gpu/drm/i915/i915_getparam.c` (MIT; its source header has no
+copyright line), preserving the complete 59-parameter switch and checked
+userspace result write.
+
+`i915_gem_stolen_upstream.rs` translates all 44 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gem/i915_gem_stolen.c` (MIT, Copyright © 2008-2012 Intel
+Corporation), preserving platform-specific stolen-memory discovery, reserved
+region handling, and GEM object lifetime branches. `linux/iomapping.rs` supplies
+the configured x86 WC mapping with PAT1 readiness, reserved-range admission,
+and acknowledged TLB retirement; it fails closed until the kernel owner installs
+the shared-map shootdown callback.
+
+`i915_query_upstream.rs` translates all 16 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/i915_query.c` (MIT, Copyright © 2018 Intel Corporation),
+including topology, engine, memory-region, HWConfig, GuC submission-version,
+and PERF query paths. PERF ownership calls remain real service dependencies;
+the separate `i915_perf.c` translation is deferred to the end of the task.
+
+`i915_gem_evict_upstream.rs` translates all 9 actual definitions in Linux
+7.2.3 `drivers/gpu/drm/i915/i915_gem_evict.c` (MIT, Copyright © 2008-2010
+Intel Corporation). Ctags reports the same number of entries but one is an
+`I915_SELFTEST_DECLARE` data pseudo-tag and it misses the actual `dying_vma()`;
+all nine function bodies are translated and only function bodies carry markers.
+
+`i915_vma_upstream.rs` translates all 74 source definitions in Linux 7.2.3
+`drivers/gpu/drm/i915/i915_vma.c` (MIT, Copyright © 2016 Intel Corporation).
+There are 73 unique function names because the mutually exclusive
+`vma_print_allocator()` preprocessor variants are both retained and marked in
+their original source order.
+
+`intel_guc_rc_upstream.rs` translates all 7 definitions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/uc/intel_guc_rc.c` (MIT, Copyright © 2021 Intel
+Corporation), using the existing GuC CT action transport and preserving RC
+support/selection checks.
+
+`intel_guc_upstream.rs` translates all 38 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/uc/intel_guc.c` (MIT, Copyright © 2014-2019 Intel
+Corporation), including GuC parameter construction, PCI revision handling, MMIO/CT helpers, and suspend/auth lifecycle.
+
+`intel_gt_pm_upstream.rs` translates all 20 functions from Linux 7.2.3
+`drivers/gpu/drm/i915/gt/intel_gt_pm.c` (MIT, Copyright © 2019 Intel
+Corporation); runtime-PM, display-power, RC6/RPS, request, and system-PM services remain explicit owner boundaries.
+
+### GP GT/GEM/power coverage provenance (Linux 7.2.3)
+
+The following MIT source files were completed for the default-off upstream-gt
+preparation. Copyright notices are retained in each Rust owner; GPL DRM/MM
+framework bodies are not copied. The i915_irq.c owner additionally retains the
+complete Tungsten Graphics permission and warranty text.
+
+| Upstream source | Rust owner | Scope / source copyright |
+|---|---|---|
+| drivers/gpu/drm/i915/gt/intel_gt.c | intel_gt_upstream.rs | 42/42 functions; MIT, Copyright © 2019 Intel Corporation |
+| drivers/gpu/drm/i915/gt/intel_ggtt.c | intel_ggtt_upstream.rs | 74/74 functions; MIT, Copyright © 2020 Intel Corporation |
+| drivers/gpu/drm/i915/gt/intel_gtt.c | intel_gtt_upstream.rs | 33/33 functions; MIT, Copyright © 2020 Intel Corporation |
+| drivers/gpu/drm/i915/gt/intel_ppgtt.c | intel_ppgtt_upstream.rs | 18/18 functions; MIT, Copyright © 2020 Intel Corporation |
+| drivers/gpu/drm/i915/gt/intel_mocs.c | intel_mocs_upstream.rs | 15/15 functions; MIT, Copyright © 2015 Intel Corporation |
+| drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c | intel_uc_fw_upstream.rs | 38/38 functions; MIT, Copyright © 2016-2019 Intel Corporation |
+| drivers/gpu/drm/i915/gt/uc/intel_guc_ct.c | intel_guc_ct_upstream.rs | 44/44 functions; MIT, Copyright © 2016-2019 Intel Corporation |
+| drivers/gpu/drm/i915/gt/uc/intel_guc_ads.c | intel_guc_ads_upstream.rs | 40/40 functions; MIT, Copyright © 2014-2019 Intel Corporation |
+| drivers/gpu/drm/i915/gt/uc/intel_huc.c | intel_huc_upstream.rs | 29/29 functions; MIT, Copyright © 2016-2019 Intel Corporation |
+| drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c | i915_gem_execbuffer_upstream.rs | 90/90 functions; MIT, Copyright © 2008, 2010 Intel Corporation |
+| drivers/gpu/drm/i915/gt/intel_rc6.c | intel_rc6_upstream.rs | 30/30 functions; MIT, Copyright © 2019 Intel Corporation |
+| drivers/gpu/drm/i915/gt/intel_rps.c | intel_rps_upstream.rs | 134/134 functions; MIT, Copyright © 2019 Intel Corporation |
+| drivers/gpu/drm/i915/gt/intel_reset.c | intel_reset_upstream.rs | 67/67 functions; MIT, Copyright © 2008-2018 Intel Corporation |
+| drivers/gpu/drm/i915/i915_irq.c | i915_irq_upstream.rs | 13/55 selected Gen11+/DG1 GT/top-level functions per task scope; MIT permission text retained; Copyright © 2003 Tungsten Graphics, Inc. |
+
+The intel_gt.c body and source-location markers are present in the feature owner.
+
+### Whole-crates/ax Linux excerpt re-scan (2026-10-10)
+
+After registering the GT/GEM/power source-order translations, the scanner's
+whole-scope crates/ax totals are threshold >=40 `(0,0,0,763,589,0,0)` and
+threshold >=25 `(18,15,4,1988,1808,0,0)` in the test's seven-column order.
+The corresponding tk-intel-gt NOTICE and CI scan baseline were reconciled in
+the same change; MIT i915 text remains counted rather than exempted.

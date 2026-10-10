@@ -8,7 +8,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use kernel_guard::NoPreempt;
+use kernel_guard::{BaseGuard, NoPreempt};
 
 use crate::{
     intel_breadcrumbs_types_upstream::IntelBreadcrumbs, intel_context_upstream::IrqWork,
@@ -145,7 +145,17 @@ pub fn in_atomic() -> bool {
 }
 
 // upstream: i915_irq.c intel_synchronize_hardirq()
-pub unsafe fn intel_synchronize_hardirq(i915:*mut crate::linux_i915_private::DrmI915Private) {
-    let vector=crate::linux::dma::device_irq(unsafe {(*i915).drm.dev});
+pub unsafe fn intel_synchronize_hardirq(i915: *mut crate::linux_i915_private::DrmI915Private) {
+    let vector = crate::linux::dma::device_irq(unsafe { (*i915).drm.dev });
     axhal::irq::synchronize_hardirq(vector);
+}
+
+/// Linux i915 `intel_synchronize_irq()` for this kernel's single-stage IRQ
+/// dispatch. TheKernel has no threaded-IRQ handler queue, so waiting for the
+/// in-flight hard handler is the complete registered-handler grace period.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_synchronize_irq(
+    i915: *mut crate::linux_i915_private::DrmI915Private,
+) {
+    unsafe { intel_synchronize_hardirq(i915) };
 }

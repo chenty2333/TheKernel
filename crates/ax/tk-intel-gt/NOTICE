@@ -191,6 +191,8 @@ G2 LinuxKPI follow-up (2026-10-09) additionally translates MIT
 Intel Corporation copyrights and MIT grants are retained in source and
 LICENSE-MIT; docs/upstream-provenance.md records full versus partial scope.
 Linux-core LinuxKPI implementations are original TheKernel code, not GPL copies.
-Current whole crates/ax totals supersede the merge measurement above:
-threshold 40: 0 fenced, 414 outside-fence (405 code); threshold 25:
-18 fenced lines / 15 blocks / 4 files, 1318 outside-fence (1303 code).
+Current whole crates/ax totals supersede the merge measurement above (re-scanned
+2026-10-10 after the GT/GEM/power source translations; all Linux-identical MIT
+lines remain counted):
+threshold 40: 0 fenced, 763 outside-fence (589 code); threshold 25:
+18 fenced lines / 15 blocks / 4 files, 1988 outside-fence (1808 code).

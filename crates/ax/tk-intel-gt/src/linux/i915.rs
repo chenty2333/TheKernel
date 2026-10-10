@@ -9,6 +9,7 @@ use core::{
     ffi::{c_ulong, c_void},
     marker::PhantomData,
     mem::{offset_of, size_of},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use crate::{
@@ -21,6 +22,43 @@ use crate::{
     intel_workarounds_upstream::{I915McrReg, I915Reg, I915WaList},
     linux_i915_private::DrmI915Private,
 };
+
+/// Kernel-side PCI owner callback for Linux `INTEL_REVID(i915)`.
+///
+/// The GT crate deliberately does not mirror `struct pci_dev`; the kernel
+/// adapter reads the PCI config-space revision from the actual owning device.
+/// Return 0 and write the revision on success, or return a negative errno.
+pub type I915PciRevisionReader = unsafe extern "C" fn(*mut DrmI915Private, *mut u8) -> i32;
+
+static I915_PCI_REVISION_READER: AtomicUsize = AtomicUsize::new(0);
+
+/// Install or clear the PCI revision reader supplied by the kernel device
+/// owner. Clearing it makes future reads fail closed with `-ENODEV`.
+pub fn install_pci_revision_reader(reader: Option<I915PciRevisionReader>) {
+    let address = reader.map_or(0, |read| read as *const () as usize);
+    I915_PCI_REVISION_READER.store(address, Ordering::Release);
+}
+
+/// Read the actual PCI config-space revision corresponding to Linux
+/// `INTEL_REVID(i915)`. It never substitutes a graphics/media stepping.
+pub unsafe fn i915_pci_revision(i915: *mut DrmI915Private) -> Result<u8, i32> {
+    assert!(!i915.is_null());
+    let address = I915_PCI_REVISION_READER.load(Ordering::Acquire);
+    if address == 0 {
+        return Err(-crate::linux::config::ENODEV);
+    }
+
+    // Function pointers are pointer-width values on TheKernel's x86_64-only
+    // target. A zero address is rejected above before reconstituting one.
+    let read: I915PciRevisionReader = unsafe { core::mem::transmute(address) };
+    let mut revision = 0;
+    let result = unsafe { read(i915, &mut revision) };
+    if result == 0 {
+        Ok(revision)
+    } else {
+        Err(result)
+    }
+}
 
 /// Iterator for Linux's `for_each_engine(gt, engine)` idiom. The `gt` pointer
 /// and its engine array must remain alive and immutable for the iterator's
@@ -432,6 +470,21 @@ pub unsafe fn HWS_NEEDS_PHYSICAL<P: I915PrivatePtr>(i915: P) -> bool {
     !info.is_null() && (unsafe { (*info).flags[4] } & (1 << 4)) != 0
 }
 
+/// Source device-info bit `unfenced_needs_alignment`, flag index 35 in
+/// `DEV_INFO_FOR_EACH_FLAG` (byte 4, bit 3 of the packed flag array).
+pub unsafe fn unfenced_needs_alignment<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = unsafe { INTEL_INFO(i915) };
+    !info.is_null() && (unsafe { (*info).flags[4] } & (1 << 3)) != 0
+}
+
+/// Source `HAS_64BIT_RELOC(i915)` from `i915_drv.h` and the
+/// `has_64bit_reloc` device-info flag (flag index 3 in Linux 7.2.3).
+#[allow(non_snake_case)]
+pub unsafe fn HAS_64BIT_RELOC<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = unsafe { INTEL_INFO(i915) };
+    !info.is_null() && (unsafe { (*info).flags[0] } & (1 << 3)) != 0
+}
+
 /// `HAS_FLAT_CCS(i915)` from i915_drv.h; source flag bit 9.
 #[allow(non_snake_case)]
 pub unsafe fn HAS_FLAT_CCS<P: I915PrivatePtr>(i915: P) -> bool {
@@ -577,6 +630,7 @@ const INTEL_ALDERLAKE_S: u32 = 34;
 const INTEL_ALDERLAKE_P: u32 = 35;
 const INTEL_DG2: u32 = 36;
 const INTEL_METEORLAKE: u32 = 37;
+const INTEL_PINEVIEW: u32 = 10;
 
 /// Source semantics of `HAS_EXECLISTS(i915)`/`HAS_LOGICAL_RING_CONTEXTS`: the
 /// device-info bit is flag index 19 (byte 2, bit 3) in Linux v7.2.3.
@@ -705,6 +759,34 @@ pub unsafe fn IS_DGFX<P: I915PrivatePtr>(i915: P) -> bool {
     let info = unsafe { (*i915).info.cast::<IntelDeviceInfoOverlay>() };
     assert!(!info.is_null());
     unsafe { (*info).flags[0] & (1 << 2) != 0 }
+}
+
+/// `IS_MOBILE()` from i915_drv.h; the first `DEV_INFO_FOR_EACH_FLAG` bit is
+/// `is_mobile` in the Linux x86_64 `intel_device_info` layout.
+#[allow(non_snake_case)]
+pub unsafe fn IS_MOBILE<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = unsafe { INTEL_INFO(i915) };
+    !info.is_null() && unsafe { (*info).flags[0] & 1 != 0 }
+}
+
+/// `IS_PINEVIEW()` platform test used by the i915 FSB clock helper.
+#[allow(non_snake_case)]
+pub unsafe fn IS_PINEVIEW<P: I915PrivatePtr>(i915: P) -> bool {
+    unsafe { IS_PLATFORM(i915, INTEL_PINEVIEW) }
+}
+
+/// `HAS_GT_UC(i915)` from i915_drv.h (DEV_INFO_FOR_EACH_FLAG bit 11).
+#[allow(non_snake_case)]
+pub unsafe fn HAS_GT_UC<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = unsafe { INTEL_INFO(i915) };
+    !info.is_null() && unsafe { (*info).flags[1] & (1 << 3) != 0 }
+}
+
+/// `HAS_GUC_DEPRIVILEGE(i915)` from i915_drv.h (flag bit 14).
+#[allow(non_snake_case)]
+pub unsafe fn HAS_GUC_DEPRIVILEGE<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = unsafe { INTEL_INFO(i915) };
+    !info.is_null() && unsafe { (*info).flags[1] & (1 << 6) != 0 }
 }
 
 /// `HAS_128_BYTE_Y_TILING()` from i915_drv.h.

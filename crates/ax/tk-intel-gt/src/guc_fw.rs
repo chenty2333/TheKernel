@@ -62,7 +62,6 @@ pub const MEDIA_GUC_SEND_REGS: GucSendRegs = GucSendRegs {
     count: GEN11_GUC_SEND_COUNT,
 };
 
-// upstream: intel_guc.c guc_send_reg().
 fn send_reg_offset(regs: GucSendRegs, index: usize) -> Result<u32, Error> {
     if index >= regs.count {
         return Err(Error::Refused);
@@ -70,7 +69,6 @@ fn send_reg_offset(regs: GucSendRegs, index: usize) -> Result<u32, Error> {
     Ok(regs.scratch_base + index as u32 * 4)
 }
 
-// upstream: intel_guc.c intel_guc_notify()
 pub fn notify(io: &impl GtIo) -> Result<(), Error> {
     notify_with_regs(io, GT_GUC_SEND_REGS)
 }
@@ -82,7 +80,6 @@ pub fn notify_with_regs(io: &impl GtIo, regs: GucSendRegs) -> Result<(), Error> 
 /// Suspend the GuC after device-idle coordination: issue CLIENT_SOFT_RESET
 /// only when submission is active, ignore its response failure as upstream
 /// does, then reset the GuC domain to sanitize firmware state.
-/// upstream: intel_guc.c intel_guc_suspend().
 pub fn suspend_guc(
     io: &impl GtIo,
     ready: bool,
@@ -100,7 +97,6 @@ pub fn suspend_guc(
 }
 
 /// GuC has no extra resume action after sanitize/reinitialization.
-/// upstream: intel_guc.c intel_guc_resume().
 pub const fn resume_guc() {}
 
 /// Caller must keep the firmware bytes and their GGTT binding alive until this
@@ -309,7 +305,6 @@ pub fn wait_huc_auth(io: &impl GtIo) -> Result<u32, Error> {
     Err(Error::Timeout(GEN11_HUC_KERNEL_LOAD_INFO))
 }
 
-// upstream: intel_guc.c intel_guc_send_mmio()
 /// Gen11+ four-dword MMIO transport. The caller serializes the send path and
 /// owns forcewake.
 pub fn send_mmio(
@@ -320,8 +315,6 @@ pub fn send_mmio(
     send_mmio_with_regs(io, GT_GUC_SEND_REGS, request, response_buf)
 }
 
-/// upstream: intel_guc.c intel_guc_send_mmio() with GT-specific scratch and
-/// host-interrupt register selection (`GEN11_SOFT_SCRATCH` vs `MEDIA_*`).
 pub fn send_mmio_with_regs(
     io: &impl GtIo,
     regs: GucSendRegs,
@@ -381,7 +374,6 @@ pub fn send_mmio_with_regs(
     }
 }
 
-// upstream: intel_guc.c intel_guc_auth_huc()
 /// Ask the running GuC to authenticate HuC firmware's RSA data in GGTT.
 pub fn authenticate_huc(io: &impl GtIo, rsa_offset: u32) -> Result<u32, Error> {
     authenticate_huc_with_regs(io, GT_GUC_SEND_REGS, rsa_offset)
@@ -395,7 +387,6 @@ pub fn authenticate_huc_with_regs(
     send_mmio_with_regs(io, regs, &[ACTION_AUTHENTICATE_HUC, rsa_offset], None)
 }
 
-// upstream: intel_guc.c __guc_action_self_cfg()
 pub fn self_config(io: &impl GtIo, key: u16, len: u16, value: u64) -> Result<(), Error> {
     self_config_with_regs(io, GT_GUC_SEND_REGS, key, len, value)
 }
@@ -426,12 +417,10 @@ pub fn self_config_with_regs(
     Ok(())
 }
 
-// upstream: intel_guc.c intel_guc_self_cfg32()
 pub fn self_config32(io: &impl GtIo, key: u16, value: u32) -> Result<(), Error> {
     self_config32_with_regs(io, GT_GUC_SEND_REGS, key, value)
 }
 
-// upstream: intel_guc.c intel_guc_self_cfg64()
 pub fn self_config64(io: &impl GtIo, key: u16, value: u64) -> Result<(), Error> {
     self_config64_with_regs(io, GT_GUC_SEND_REGS, key, value)
 }

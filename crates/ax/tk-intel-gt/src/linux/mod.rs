@@ -19,6 +19,12 @@ pub(crate) mod contexts;
 #[cfg(feature = "upstream-gt")]
 pub(crate) mod cpufreq;
 pub(crate) mod fields;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod forcewake;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod firmware;
 pub(crate) mod gem;
 pub(crate) mod gem_memory;
 #[cfg(feature = "upstream-gt")]
@@ -43,8 +49,17 @@ pub(crate) mod rcu;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod scatterlist;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod seq_file;
 pub(crate) mod registers;
 pub(crate) mod requests;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod user_extensions;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod signal;
 pub(crate) mod srcu;
 pub(crate) mod ww_mutex;
 
@@ -63,6 +78,14 @@ pub mod mm_native;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod shmem;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod vm;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod iomapping;
 
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]

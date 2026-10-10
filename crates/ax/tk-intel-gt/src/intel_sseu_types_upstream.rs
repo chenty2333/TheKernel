@@ -83,6 +83,22 @@ pub struct SseuDevInfo {
     pub max_eus_per_subslice: u8,
 }
 
+// upstream: intel_sseu.c intel_sseu_get_hsw_subslices()
+/// Linux 7.2.3 `gt/intel_sseu.c` Haswell-style subslice mask helper.
+/// The source warns on Xe_HP topology and invalid slice indices, then returns
+/// the Haswell-style byte mask (zero on an invalid slice).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_sseu_get_hsw_subslices(sseu: *const SseuDevInfo, slice: u8) -> u32 {
+    if unsafe { (*sseu).has_xehp_dss() } {
+        WARN_ON!(true);
+    }
+    if slice >= unsafe { (*sseu).max_slices } {
+        WARN_ON!(true);
+        return 0;
+    }
+    unsafe { (*sseu).subslice_mask.hsw[slice as usize] as u32 }
+}
+
 impl SseuDevInfo {
     pub const fn has_slice_pg(&self) -> bool {
         self.power_gating & 1 != 0
@@ -174,7 +190,6 @@ unsafe extern "C" {
         max_eus_per_subslice: u8,
     );
     pub fn intel_sseu_subslice_total(sseu: *const SseuDevInfo) -> u32;
-    pub fn intel_sseu_get_hsw_subslices(sseu: *const SseuDevInfo, slice: u8) -> u32;
     pub fn intel_sseu_get_compute_subslices(sseu: *const SseuDevInfo) -> IntelSseuSsMask;
     pub fn intel_sseu_info_init(gt: *mut IntelGt);
     pub fn intel_sseu_make_rpcs(gt: *mut IntelGt, req_sseu: *const IntelSseu) -> u32;

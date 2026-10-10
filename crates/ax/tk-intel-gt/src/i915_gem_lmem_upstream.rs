@@ -2,6 +2,8 @@
 // Copyright © 2019 Intel Corporation.
 // Source-faithful Linux 7.2.3 drivers/gpu/drm/i915/gem/i915_gem_lmem.c.
 
+use core::ffi::c_ulong;
+
 use crate::{
     i915_gem_object_api_upstream::i915_gem_object_put,
     i915_gem_object_header_upstream::{i915_gem_object_flush_map, i915_gem_object_is_contiguous},
@@ -20,7 +22,7 @@ pub unsafe fn i915_gem_object_lmem_io_map(obj: *mut DrmI915GemObject, n: usize, 
     GEM_BUG_ON!(!unsafe { i915_gem_object_is_contiguous(obj) });
     let mut offset = unsafe { __i915_gem_object_get_dma_address(obj, n as u64) };
     offset -= unsafe { (*(*obj).mm.region).region.start };
-    unsafe { crate::i915_gem_core_upstream::io_mapping_map_wc(core::ptr::addr_of_mut!((*(*obj).mm.region).iomap).cast(), offset as i64, size) }
+    unsafe { crate::i915_gem_core_upstream::io_mapping_map_wc(core::ptr::addr_of_mut!((*(*obj).mm.region).iomap).cast(), offset as c_ulong, size) }
 }
 
 /// Whether an object is currently resident in device-local memory. Migratable
@@ -57,4 +59,3 @@ pub unsafe fn i915_gem_object_create_lmem_from_data(i915: *mut DrmI915Private, d
     unsafe { __i915_gem_object_release_map(obj) };
     obj
 }
-

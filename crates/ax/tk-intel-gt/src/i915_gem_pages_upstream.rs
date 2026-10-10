@@ -176,12 +176,12 @@ unsafe extern "C" {
         root: *mut crate::intel_context_upstream::RadixTreeRoot,
         index: u64,
     ) -> *mut c_void;
-    fn radix_tree_insert(
+    pub(crate) fn radix_tree_insert(
         root: *mut crate::intel_context_upstream::RadixTreeRoot,
         index: u64,
         item: *mut c_void,
     ) -> c_int;
-    fn radix_tree_lookup(
+    pub(crate) fn radix_tree_lookup(
         root: *mut crate::intel_context_upstream::RadixTreeRoot,
         index: u64,
     ) -> *mut c_void;

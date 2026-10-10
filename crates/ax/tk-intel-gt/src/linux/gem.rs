@@ -298,7 +298,9 @@ pub unsafe fn i915_gem_to_ttm(obj: *mut crate::i915_gem_object_types_upstream::D
 pub struct DrmFile {
     _before_minor: [u8; 72],
     pub minor: *mut DrmMinor,
-    _before_driver_priv: [u8; 56],
+    pub object_idr: [u8; 24],
+    pub filp: *mut crate::linux::shmem::File,
+    _before_driver_priv: [u8; 24],
     pub driver_priv: *mut core::ffi::c_void,
     _tail: [u8; 224],
 }
@@ -312,6 +314,8 @@ pub struct DrmMinor {
 }
 
 const _: [(); 72] = [(); offset_of!(DrmFile, minor)];
+const _: [(); 80] = [(); offset_of!(DrmFile, object_idr)];
+const _: [(); 104] = [(); offset_of!(DrmFile, filp)];
 const _: [(); 136] = [(); offset_of!(DrmFile, driver_priv)];
 const _: [(); 368] = [(); size_of::<DrmFile>()];
 const _: [(); 16] = [(); offset_of!(DrmMinor, dev)];

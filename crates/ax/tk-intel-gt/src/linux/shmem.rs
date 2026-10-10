@@ -374,15 +374,20 @@ fn find_record(registry: &PageRegistry, page: *const Page) -> *mut PageRecord {
     ptr::null_mut()
 }
 
-/// Bridge called by `linux::page::page_to_pfn` and the scatterlist iterator.
-pub unsafe fn page_to_phys(page: *const Page) -> usize {
+/// Try to resolve a page identity registered by the LinuxKPI shmem allocator.
+pub unsafe fn try_page_to_phys(page: *const Page) -> Option<usize> {
     let registry = PAGE_REGISTRY.lock();
     let record = find_record(&registry, page);
-    assert!(
-        !record.is_null(),
-        "page_to_phys received an unregistered Page"
-    );
-    unsafe { (*record).physical }
+    if record.is_null() {
+        None
+    } else {
+        Some(unsafe { (*record).physical })
+    }
+}
+
+/// Bridge called by `linux::page::page_to_pfn` and the scatterlist iterator.
+pub unsafe fn page_to_phys(page: *const Page) -> usize {
+    unsafe { try_page_to_phys(page) }.expect("page_to_phys received an unregistered Page")
 }
 
 /// Bridge called by the source-derived PFN-to-page path.
@@ -840,6 +845,17 @@ pub unsafe fn fput_file(file: *mut File) {
 /// opaque file-pointer type.
 pub unsafe fn fput(file: *mut c_void) {
     unsafe { fput_file(file.cast()) };
+}
+
+/// Return the inode size for a LinuxKPI shmem file through its page-cache
+/// mapping. This is the Rust-side equivalent of `file->f_mapping->host->i_size`.
+pub unsafe fn file_size(file: *mut File) -> u64 {
+    assert!(!file.is_null());
+    let mapping = unsafe { (*file).f_mapping };
+    assert!(!mapping.is_null());
+    let inode = unsafe { (*mapping).host.load(Ordering::Acquire) };
+    assert!(!inode.is_null());
+    unsafe { (*inode).size.load(Ordering::Acquire) }
 }
 
 /// Return the page-cache folio at @index, creating a zeroed page on a miss.

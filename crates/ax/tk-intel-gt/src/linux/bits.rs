@@ -2,9 +2,12 @@
 // Copyright © 2026 Intel Corporation and TheKernel contributors.
 // Linux bitops/bitfield operations used by the v7.2.3 i915 headers.
 
-use core::sync::atomic::{
-    AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+use core::{
+    ffi::c_ulong,
+    sync::atomic::{AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
+
+static BIT_WAITERS: axtask::WaitQueue = axtask::WaitQueue::new();
 
 pub trait BitWord: Copy {
     fn to_u64(self) -> u64;
@@ -87,6 +90,42 @@ pub fn clear_bit<I: BitIndex, W: BitWord>(bit: I, word: &mut W) {
 pub fn clear_bit_unlock<I: BitIndex, W: BitWord>(bit: I, word: &mut W) {
     let bit = bit.index() % (core::mem::size_of::<W>() as u32 * 8);
     let _ = W::fetch_and(word, !(1u64 << bit));
+}
+
+/// Linux `clear_and_wake_up_bit()` with a shared waiter queue. Waking waiters
+/// on unrelated bits is permitted; every waiter rechecks its own bit predicate.
+pub fn clear_and_wake_up_bit_inner<I: BitIndex, W: BitWord>(bit: I, word: &mut W) {
+    clear_bit_unlock(bit, word);
+    BIT_WAITERS.notify_all(false);
+}
+
+/// Linux `clear_and_wake_up_bit()` C ABI. The wait-queue key is shared across
+/// bit addresses; collisions only wake waiters to recheck their own predicate.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clear_and_wake_up_bit(bit: i32, word: *mut c_ulong) {
+    assert!(bit >= 0 && !word.is_null());
+    clear_and_wake_up_bit_inner(bit as u32, unsafe { &mut *word });
+}
+
+/// Linux `wait_on_bit()` over the same predicate-checked LinuxKPI wait queue.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wait_on_bit(word: *mut c_ulong, bit: i32, state: i32) -> i32 {
+    if word.is_null() || bit < 0 {
+        return -crate::linux_config::EINVAL;
+    }
+    let word = unsafe { &*word };
+    let condition = || !test_bit(bit as u32, word);
+    if state as u32 & crate::linux::wait::TASK_INTERRUPTIBLE != 0 {
+        match BIT_WAITERS.wait_until_interruptible(condition) {
+            Ok(()) => 0,
+            Err(axtask::WaitError::Interrupted) => -crate::linux_config::EINTR,
+            Err(_) => -crate::linux_config::EIO,
+        }
+    } else {
+        BIT_WAITERS
+            .wait_until(condition)
+            .map_or(-crate::linux_config::EIO, |_| 0)
+    }
 }
 
 #[inline]

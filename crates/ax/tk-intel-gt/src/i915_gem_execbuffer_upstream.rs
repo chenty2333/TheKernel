@@ -7,7 +7,200 @@
 //! user-copy, dma-resv, and syncobj operations are integration bindings; they
 //! are intentionally not replaced by weaker local policy.
 
-use core::ffi::c_void;
+use core::ffi::{c_char, c_int, c_long, c_ulong, c_void};
+
+use crate::{
+    guc_ads::PAGE_SIZE,
+    guc_submission::MAX_ENGINE_INSTANCE,
+    i915_cmd_parser_upstream::{
+        gen8_canonical_addr, hash_32, hlist_add_head, intel_engine_cmd_parser,
+    },
+    i915_gem_clflush_upstream::{
+        dma_fence_get, dma_fence_put, dma_resv_reserve_fences, drm_clflush_virt_range,
+        i915_gem_clflush_object,
+    },
+    i915_gem_context_types_upstream::{
+        DrmI915FilePrivate, DrmI915Private, DrmSyncobj, I915GemContext,
+    },
+    i915_gem_context_upstream::{
+        I915UserExtension, i915_gem_context_get_engine, i915_gem_context_has_full_ppgtt,
+        i915_gem_context_is_closed, i915_gem_context_is_recoverable, i915_gem_context_lookup,
+        i915_gem_context_put, i915_gem_context_user_engines,
+        i915_gem_context_uses_protected_content, i915_gem_file_bsd_engine,
+        i915_gem_file_set_bsd_engine, i915_lut_handle_alloc, i915_lut_handle_free,
+    },
+    i915_gem_core_upstream::{
+        access_ok, i915_gem_object_ggtt_pin_ww, range_overflows_t_u64, u64_to_user_ptr,
+    },
+    i915_gem_domain_upstream::{i915_gem_object_prepare_write, i915_gem_object_set_to_gtt_domain},
+    i915_gem_evict_upstream::i915_gem_evict_vm,
+    i915_gem_object_api_upstream::{
+        i915_gem_object_finish_access, i915_gem_object_lock, i915_gem_object_put,
+    },
+    i915_gem_object_header_upstream::{
+        i915_gem_object_is_protected, i915_gem_object_is_tiled, i915_gem_object_is_userptr,
+        i915_gem_object_lookup, i915_gem_object_lookup_rcu, i915_gem_object_set_readonly,
+    },
+    i915_gem_object_types_upstream::{
+        I915_MAP_WB, I915CacheLevel::I915_CACHE_NONE, intel_bo_to_drm_bo,
+    },
+    i915_gem_object_upstream::{
+        i915_gem_get_pat_index, i915_gem_object_has_cache_level, i915_gem_object_has_struct_page,
+        object_pat_index,
+    },
+    i915_gem_pages_upstream::{
+        __i915_gem_object_get_dma_address as i915_gem_object_get_dma_address,
+        __i915_gem_object_get_page as i915_gem_object_get_page, radix_tree_delete,
+        radix_tree_insert, radix_tree_lookup,
+    },
+    i915_gem_userptr_upstream::i915_gem_object_userptr_submit_init,
+    i915_gem_ww_upstream::{i915_gem_ww_ctx_backoff, i915_gem_ww_ctx_fini, i915_gem_ww_ctx_init},
+    i915_request_types_upstream::{
+        I915_FENCE_FLAG_COMPOSITE, I915_FENCE_FLAG_NOPREEMPT, I915_FENCE_FLAG_SKIP_PARALLEL,
+        I915_FENCE_FLAG_SUBMIT_PARALLEL, I915CaptureList, I915Request, i915_request_timeline,
+    },
+    i915_request_upstream::{
+        __i915_request_commit, __i915_request_queue, __i915_request_skip,
+        i915_request_await_dma_fence, i915_request_await_execution, i915_request_await_object,
+        i915_request_create, i915_request_free_capture_list, i915_request_retire,
+        i915_request_set_error_once, i915_request_wait,
+    },
+    i915_scheduler_types_upstream::I915SchedAttr,
+    i915_vma_api_upstream::{
+        __i915_vma_offset, __i915_vma_unpin_fence, _i915_vma_move_to_active, i915_vma_bind,
+        i915_vma_close, i915_vma_get, i915_vma_instance, i915_vma_is_bound,
+        i915_vma_is_map_and_fenceable, i915_vma_misplaced, i915_vma_offset, i915_vma_pin_fence,
+        i915_vma_pin_ww, i915_vma_put, i915_vma_reopen, i915_vma_size, i915_vma_tryget,
+        i915_vma_unbind, i915_vma_unpin,
+    },
+    i915_vma_types_upstream::I915_VMA_GLOBAL_BIND,
+    i915_vma_upstream::{
+        PIN_MAPPABLE, PIN_NOEVICT, PIN_NONBLOCK, PIN_OFFSET_BIAS, PIN_OFFSET_FIXED,
+        PIN_OFFSET_MASK, PIN_USER, PIN_VALIDATE, PIN_ZONE_4G, i915_vma_resource_get,
+    },
+    intel_context_api_upstream::{
+        intel_context_enter, intel_context_exit, intel_context_first_child, intel_context_get,
+        intel_context_is_banned, intel_context_is_closed, intel_context_is_parallel,
+        intel_context_is_parent, intel_context_next_child, intel_context_nopreempt,
+        intel_context_pin_ww, intel_context_put, intel_context_timeline_lock,
+        intel_context_timeline_unlock, intel_context_unpin, mutex_lock_interruptible,
+    },
+    intel_context_types_upstream::{CONTEXT_ALLOC_BIT, IntelContext},
+    intel_context_upstream::{
+        DmaFence, DrmI915GemObject, DrmMmNode, I915GemWwCtx, I915Vma, intel_context_alloc_state,
+    },
+    intel_engine_cs_upstream::{HlistHead, HlistNode, IntelEngineCs, ListHead},
+    intel_engine_types_upstream::{
+        _VCS, BCS0, I915_DISPATCH_PINNED, I915_DISPATCH_SECURE, RCS0, VCS0, VECS0,
+        intel_engine_requires_cmd_parser, intel_engine_using_cmd_parser,
+    },
+    intel_engine_user_upstream::engine_uabi_class_count,
+    intel_gt_api_upstream::{intel_gt_chipset_flush, intel_gt_flush_ggtt_writes},
+    intel_gt_buffer_pool_types_upstream::IntelGtBufferPoolNode,
+    intel_gt_buffer_pool_upstream::{
+        intel_gt_buffer_pool_mark_active, intel_gt_buffer_pool_mark_used, intel_gt_buffer_pool_put,
+        intel_gt_get_buffer_pool,
+    },
+    intel_gt_types_upstream::IntelGt,
+    intel_gtt_api_upstream::{
+        I915_GTT_PAGE_MASK, I915AddressSpace, I915Ggtt, i915_is_ggtt, i915_vm_put, i915_vm_tryget,
+    },
+    intel_reset_upstream::intel_gt_terminally_wedged,
+    intel_ring::MI_NOOP,
+    intel_ring_upstream::{
+        intel_ring_begin, intel_ring_space as __intel_ring_space, intel_ring_update_space,
+    },
+    intel_timeline_types_upstream::IntelTimeline,
+    linux::{
+        bits::{__set_bit, IS_ALIGNED, lower_32_bits, set_bit, test_bit},
+        fields::i915_gem_object_cache_dirty,
+        gem::{DrmDevice, DrmFile},
+        gem_memory::drm_mm_node_allocated,
+        highmem::{kmap_local_page, kunmap_local},
+        i915::{
+            GRAPHICS_VER, GRAPHICS_VER_FULL, HAS_64BIT_RELOC, HAS_LLC, INTEL_INFO, IP_VER, IS_DGFX,
+            IS_TIGERLAKE, i915_ggtt_offset, i915_mmio_reg_offset, to_gt, to_i915,
+        },
+        i915_trace::{trace_i915_request_add, trace_i915_request_queue},
+        iomapping::{io_mapping_map_atomic_wc, io_mapping_unmap_atomic},
+        mm_native::{
+            __copy_from_user, __copy_from_user_inatomic, __get_user, __put_user, copy_from_user,
+            pagefault_disable, pagefault_enable, u64_to_ptr, unsafe_put_user, user_access_begin,
+            user_access_end, user_write_access_begin, user_write_access_end,
+        },
+        primitives::{__GFP_NOWARN, ilog2, is_power_of_2_u64, mb, offset_in_page},
+        rcu::{rcu_read_lock, rcu_read_unlock},
+        registers::{MI_LOAD_REGISTER_IMM, PIN_GLOBAL},
+        requests::{
+            dma_fence_array_create, dma_fence_chain_alloc, dma_fence_chain_find_seqno,
+            dma_fence_chain_free, i915_request_get, i915_request_next, i915_request_put,
+            intel_ring_advance, ptr_mask_bits, ptr_pack_bits, ptr_unpack_bits,
+        },
+        signal::signal_pending_current,
+        user_extensions::i915_user_extensions,
+    },
+    linux_assert::lockdep_assert_held,
+    linux_config::{
+        __GFP_NORETRY, CAP_SYS_ADMIN, EAGAIN, EBADSLT, EDEADLK, EEXIST, EFAULT, EINTR, EINVAL, EIO,
+        ENODEV, ENOENT, ENOMEM, ENOSPC, EPERM, ERESTARTSYS, ERR_PTR, EWOULDBLOCK, GFP_KERNEL,
+        IS_ERR, MAX_SCHEDULE_TIMEOUT, PAGE_SHIFT, PTR_ERR, current,
+    },
+    linux_list::{INIT_LIST_HEAD, list_add, list_add_tail, list_empty, list_splice_tail},
+    linux_locks::{lockdep_unpin_lock, spin_lock, spin_unlock},
+    linux_memory::{
+        atomic_fetch_inc, kfree, kmalloc_array, kmalloc_obj, krealloc, kvfree, kvmalloc_array,
+        kzalloc,
+    },
+    linux_mutex::{mutex_lock, mutex_unlock},
+    linux_pm::{intel_gt_pm_get, intel_gt_pm_put},
+    linux_wait::cond_resched,
+};
+
+unsafe extern "C" {
+    fn drm_syncobj_find(file: *mut DrmFile, handle: u32) -> *mut DrmSyncobj;
+    fn drm_syncobj_put(syncobj: *mut DrmSyncobj);
+    fn drm_syncobj_fence_get(syncobj: *mut DrmSyncobj) -> *mut DmaFence;
+    fn drm_syncobj_add_point(
+        syncobj: *mut DrmSyncobj,
+        chain: *mut DmaFenceChain,
+        fence: *mut DmaFence,
+        point: u64,
+    );
+    fn drm_syncobj_replace_fence(syncobj: *mut DrmSyncobj, fence: *mut DmaFence);
+    fn sync_file_create(fence: *mut DmaFence) -> *mut SyncFile;
+    fn sync_file_get_fence(fd: c_int) -> *mut DmaFence;
+    fn get_unused_fd_flags(flags: c_int) -> c_int;
+    fn put_unused_fd(fd: c_int);
+    fn fd_install(fd: c_int, file: *mut c_void);
+    fn fput(file: *mut c_void);
+    fn drm_is_current_master(file: *mut DrmFile) -> bool;
+    fn capable(capability: c_int) -> bool;
+    fn intel_pxp_key_check(object: *mut c_void, assign: bool) -> c_int;
+    fn get_random_u32_below(range: u32) -> u32;
+    fn set_page_dirty(page: *mut crate::i915_gem_object_types_upstream::Page);
+    fn drm_mm_remove_node(node: *mut DrmMmNode);
+    fn drm_mm_insert_node_in_range(
+        mm: *mut crate::linux::gem_memory::DrmMm,
+        node: *mut DrmMmNode,
+        size: u64,
+        alignment: u64,
+        color: c_ulong,
+        start: u64,
+        end: u64,
+        mode: u32,
+    ) -> c_int;
+}
+
+unsafe fn assert_vma_held(vma: *const I915Vma) {
+    if crate::linux_config::CONFIG_LOCKDEP {
+        assert!(!vma.is_null());
+    }
+}
+
+#[allow(non_snake_case)]
+fn CMDPARSER_USES_GGTT(i915: *mut DrmI915Private) -> bool {
+    unsafe { GRAPHICS_VER(i915) == 7 }
+}
 
 // Linux i915 ABI/internal flags from i915_gem_execbuffer.c and i915_vma.h.
 pub const FORCE_CPU_RELOC: i32 = 1;
@@ -27,8 +220,93 @@ pub const EXEC_USERPTR_USED: u32 = 1 << 29;
 pub const EXEC_INTERNAL_FLAGS: u32 = !0u32 << 29;
 pub const UPDATE: u64 = PIN_OFFSET_FIXED;
 pub const BATCH_OFFSET_BIAS: u64 = 256 * 1024;
+pub const EXEC_OBJECT_NEEDS_FENCE: u32 = 1 << 0;
+pub const EXEC_OBJECT_NEEDS_GTT: u32 = 1 << 1;
+pub const EXEC_OBJECT_SUPPORTS_48B_ADDRESS: u32 = 1 << 3;
+pub const EXEC_OBJECT_PINNED: u32 = 1 << 4;
+pub const EXEC_OBJECT_PAD_TO_SIZE: u32 = 1 << 5;
+pub const EXEC_OBJECT_ASYNC: u32 = 1 << 6;
+pub const EXEC_OBJECT_CAPTURE: u32 = 1 << 7;
+pub const EXEC_OBJECT_WRITE: u32 = 1 << 2;
+pub const EXEC_OBJECT_UNKNOWN_FLAGS: u32 = !((EXEC_OBJECT_CAPTURE << 1) - 1);
+pub const EXEC_OBJECT_NO_REQUEST_AWAIT: u32 = 1 << 30;
+pub const EXEC_OBJECT_NO_RESERVE: u32 = 1 << 31;
+pub const I915_EXEC_RING_MASK: u64 = 0x3f;
+pub const I915_EXEC_RENDER: u64 = 1 << 0;
+pub const I915_EXEC_BSD: u64 = 2 << 0;
+pub const I915_EXEC_CONSTANTS_MASK: u64 = 3 << 6;
+pub const I915_EXEC_GEN7_SOL_RESET: u64 = 1 << 8;
+pub const I915_EXEC_SECURE: u64 = 1 << 9;
+pub const I915_EXEC_IS_PINNED: u64 = 1 << 10;
+pub const I915_EXEC_NO_RELOC: u64 = 1 << 11;
+pub const I915_EXEC_HANDLE_LUT: u64 = 1 << 12;
+pub const I915_EXEC_BSD_SHIFT: u32 = 13;
+pub const I915_EXEC_BSD_MASK: u64 = 3 << I915_EXEC_BSD_SHIFT;
+pub const I915_EXEC_BSD_DEFAULT: u32 = 0;
+pub const I915_EXEC_BSD_RING1: u32 = 1 << I915_EXEC_BSD_SHIFT;
+pub const I915_EXEC_BSD_RING2: u32 = 2 << I915_EXEC_BSD_SHIFT;
+pub const I915_EXEC_RESOURCE_STREAMER: u64 = 1 << 15;
+pub const I915_EXEC_FENCE_IN: u64 = 1 << 16;
+pub const I915_EXEC_FENCE_OUT: u64 = 1 << 17;
+pub const I915_EXEC_BATCH_FIRST: u64 = 1 << 18;
+pub const I915_EXEC_FENCE_ARRAY: u64 = 1 << 19;
+pub const I915_EXEC_FENCE_SUBMIT: u64 = 1 << 20;
+pub const I915_EXEC_USE_EXTENSIONS: u64 = 1 << 21;
+pub const I915_EXEC_UNKNOWN_FLAGS: u64 = !((I915_EXEC_USE_EXTENSIONS << 1) - 1);
+pub const I915_EXEC_FENCE_WAIT: u32 = 1;
+pub const I915_EXEC_FENCE_SIGNAL: u32 = 2;
+pub const I915_EXEC_FENCE_UNKNOWN_FLAGS: u32 = !3;
+pub const I915_ENGINE_CLASS_VIDEO: usize = 2;
+pub const I915_GEM_DOMAIN_INSTRUCTION: u32 = 0x10;
+pub const I915_GEM_GPU_DOMAINS: u32 = 0x3e;
+pub const I915_CMD_PARSER_TRAMPOLINE_SIZE: u32 = 8;
+pub const I915_WAIT_INTERRUPTIBLE: u32 = 1;
+pub const I915_COLOR_UNEVICTABLE: i32 = -1;
+pub const DRM_MM_INSERT_LOW: u32 = 1;
+pub const PAGE_MASK: u64 = !(4096u64 - 1);
+pub const ULONG_MAX: u64 = u64::MAX;
+pub const CLFLUSH_BEFORE: u32 = 1;
+pub const CLFLUSH_AFTER: u32 = 2;
+pub const CLFLUSH_FLAGS: usize = (CLFLUSH_BEFORE | CLFLUSH_AFTER) as usize;
+pub const O_NONBLOCK: i32 = 0x800;
+pub const O_CLOEXEC: i32 = 0x80000;
+const I915_GEM_DOMAIN_RENDER: u32 = 0x2;
+const I915_GEM_DOMAIN_SAMPLER: u32 = 0x4;
+const I915_GEM_DOMAIN_COMMAND: u32 = 0x8;
+const I915_GEM_DOMAIN_VERTEX: u32 = 0x20;
+const _: [(); 1] = [(); (I915_GEM_GPU_DOMAINS
+    == (I915_GEM_DOMAIN_RENDER
+        | I915_GEM_DOMAIN_SAMPLER
+        | I915_GEM_DOMAIN_COMMAND
+        | I915_GEM_DOMAIN_INSTRUCTION
+        | I915_GEM_DOMAIN_VERTEX)) as usize];
 pub const I915_EXEC_ILLEGAL_FLAGS: u64 =
     I915_EXEC_UNKNOWN_FLAGS | I915_EXEC_CONSTANTS_MASK | I915_EXEC_RESOURCE_STREAMER;
+
+const _: () = assert!(EXEC_INTERNAL_FLAGS & !(I915_EXEC_ILLEGAL_FLAGS as u32) == 0);
+const _: () = assert!(EXEC_OBJECT_INTERNAL_FLAGS & !EXEC_OBJECT_UNKNOWN_FLAGS == 0);
+
+#[inline]
+pub const fn gen8_noncanonical_addr(address: u64) -> u64 {
+    address & GENMASK_ULL(47, 0)
+}
+
+#[allow(non_snake_case)]
+const fn GENMASK_ULL(high: u32, low: u32) -> u64 {
+    (u64::MAX >> (63 - high)) & (u64::MAX << low)
+}
+
+#[allow(non_snake_case)]
+const fn GEN7_SO_WRITE_OFFSET(index: u32) -> crate::intel_workarounds_types_upstream::I915RegT {
+    crate::intel_workarounds_types_upstream::I915RegT {
+        reg: 0x5280 + index * 4,
+    }
+}
+
+#[allow(non_snake_case)]
+fn HAS_SECURE_BATCHES(i915: *mut crate::linux_i915_private::DrmI915Private) -> bool {
+    unsafe { crate::linux::i915::GRAPHICS_VER(i915) < 6 }
+}
 
 // Binding-layout records corresponding to the C records in this source and
 // its i915 headers. Pointers deliberately mirror the source ownership rules.
@@ -70,8 +348,8 @@ pub struct I915Execbuffer {
     pub gt: *mut IntelGt,
     pub context: *mut IntelContext,
     pub gem_context: *mut I915GemContext,
-    pub wakeref: u64,
-    pub wakeref_gt0: u64,
+    pub wakeref: crate::intel_context_types_upstream::intel_wakeref_t,
+    pub wakeref_gt0: crate::intel_context_types_upstream::intel_wakeref_t,
     pub requests: [*mut I915Request; MAX_ENGINE_INSTANCE + 1],
     pub batches: [*mut EbVma; MAX_ENGINE_INSTANCE + 1],
     pub trampoline: *mut I915Vma,
@@ -92,6 +370,102 @@ pub struct I915Execbuffer {
     pub fences: *mut EbFence,
     pub num_fences: usize,
     pub capture_lists: [*mut I915CaptureList; MAX_ENGINE_INSTANCE + 1],
+}
+
+/// UAPI `drm_i915_gem_relocation_entry` from the MIT i915 DRM header.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DrmI915GemRelocationEntry {
+    pub target_handle: u32,
+    pub delta: u32,
+    pub offset: u64,
+    pub presumed_offset: u64,
+    pub read_domains: u32,
+    pub write_domain: u32,
+}
+const _: [(); 32] = [(); core::mem::size_of::<DrmI915GemRelocationEntry>()];
+
+/// UAPI `drm_i915_gem_exec_object2`; `pad_to_size` aliases the header's
+/// reserved `rsvd1` union member at the same offset.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DrmI915GemExecObject2 {
+    pub handle: u32,
+    pub relocation_count: u32,
+    pub relocs_ptr: u64,
+    pub alignment: u64,
+    pub offset: u64,
+    pub flags: u64,
+    pub pad_to_size: u64,
+    pub rsvd2: u64,
+}
+const _: [(); 56] = [(); core::mem::size_of::<DrmI915GemExecObject2>()];
+
+/// UAPI `drm_i915_gem_execbuffer2` from Linux v7.2.3.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DrmI915GemExecbuffer2 {
+    pub buffers_ptr: u64,
+    pub buffer_count: u32,
+    pub batch_start_offset: u32,
+    pub batch_len: u32,
+    pub DR1: u32,
+    pub DR4: u32,
+    pub num_cliprects: u32,
+    pub cliprects_ptr: u64,
+    pub flags: u64,
+    pub rsvd1: u64,
+    pub rsvd2: u64,
+}
+const _: [(); 64] = [(); core::mem::size_of::<DrmI915GemExecbuffer2>()];
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct DrmI915GemExecFence {
+    pub handle: u32,
+    pub flags: u32,
+}
+const _: [(); 8] = [(); core::mem::size_of::<DrmI915GemExecFence>()];
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DrmI915GemExecbufferExtTimelineFences {
+    pub base: crate::i915_gem_context_upstream::I915UserExtension,
+    pub fence_count: u64,
+    pub handles_ptr: u64,
+    pub values_ptr: u64,
+}
+const _: [(); 56] = [(); core::mem::size_of::<DrmI915GemExecbufferExtTimelineFences>()];
+
+/// Linux `sync_file` fields used by the execbuffer ioctl; the file pointer is
+/// the first member in the native Linux structure.
+#[repr(C)]
+pub struct SyncFile {
+    pub file: *mut c_void,
+}
+
+#[repr(C)]
+pub struct DmaFenceChain {
+    _opaque: [u8; 0],
+}
+
+#[inline]
+fn ERR_CAST<T>(ptr: *mut T) -> *mut SyncFile {
+    ptr.cast()
+}
+
+/// Dispatch through the engine's source-owned BB-start method.
+unsafe fn intel_engine_emit_bb_start(
+    engine: *mut IntelEngineCs,
+    rq: *mut I915Request,
+    offset: u64,
+    len: u32,
+    flags: u32,
+) -> c_int {
+    match unsafe { (*engine).emit_bb_start } {
+        Some(emit) => unsafe { emit(rq, offset, len, flags) },
+        None => -ENODEV,
+    }
 }
 
 // UAPI and header records are supplied by the surrounding i915 translation
@@ -206,7 +580,7 @@ pub unsafe fn eb_pin_vma(
         return err;
     }
     if err != 0 {
-        if (*entry).flags & EXEC_OBJECT_PINNED != 0 {
+        if (*entry).flags & EXEC_OBJECT_PINNED as u64 != 0 {
             return err;
         }
         err = i915_vma_pin_ww(
@@ -261,12 +635,12 @@ pub unsafe fn eb_validate_vma(
     if (*entry).alignment != 0 && !is_power_of_2_u64((*entry).alignment) {
         return -EINVAL;
     }
-    if (*entry).flags & EXEC_OBJECT_PINNED != 0
+    if (*entry).flags & EXEC_OBJECT_PINNED as u64 != 0
         && (*entry).offset != gen8_canonical_addr((*entry).offset & I915_GTT_PAGE_MASK)
     {
         return -EINVAL;
     }
-    if (*entry).flags & EXEC_OBJECT_PAD_TO_SIZE != 0 {
+    if (*entry).flags & EXEC_OBJECT_PAD_TO_SIZE as u64 != 0 {
         if offset_in_page((*entry).pad_to_size) != 0 {
             return -EINVAL;
         }
@@ -275,11 +649,12 @@ pub unsafe fn eb_validate_vma(
     }
     (*entry).offset = gen8_noncanonical_addr((*entry).offset);
     if !(*eb).reloc_cache.has_fence {
-        (*entry).flags &= !EXEC_OBJECT_NEEDS_FENCE;
-    } else if ((*entry).flags & EXEC_OBJECT_NEEDS_FENCE != 0 || (*eb).reloc_cache.needs_unfenced)
+        (*entry).flags &= !(EXEC_OBJECT_NEEDS_FENCE as u64);
+    } else if ((*entry).flags & EXEC_OBJECT_NEEDS_FENCE as u64 != 0
+        || (*eb).reloc_cache.needs_unfenced)
         && i915_gem_object_is_tiled((*vma).obj)
     {
-        (*entry).flags |= EXEC_OBJECT_NEEDS_GTT | EXEC_OBJECT_NEEDS_MAP;
+        (*entry).flags |= EXEC_OBJECT_NEEDS_GTT as u64 | EXEC_OBJECT_NEEDS_MAP as u64;
     }
     0
 }
@@ -306,7 +681,7 @@ pub unsafe fn eb_add_vma(
     let ev = (*eb).vma.add(i as usize);
     (*ev).vma = vma;
     (*ev).exec = entry;
-    (*ev).flags = (*entry).flags;
+    (*ev).flags = (*entry).flags as u32;
     if (*eb).lut_size > 0 {
         (*ev).handle = (*entry).handle;
         hlist_add_head(
@@ -328,7 +703,7 @@ pub unsafe fn eb_add_vma(
         }
         (*eb).batches[*current_batch as usize] = ev;
         if (*ev).flags & EXEC_OBJECT_WRITE != 0 {
-            drm_dbg(
+            drm_dbg!(
                 &mut (*i915).drm,
                 "Attempting to use self-modifying batch buffer\n",
             );
@@ -336,20 +711,20 @@ pub unsafe fn eb_add_vma(
         }
         if range_overflows_t_u64(
             (*eb).batch_start_offset as u64,
-            (*(*eb).args).batch_len,
+            (*(*eb).args).batch_len as u64,
             (*vma).size,
         ) {
-            drm_dbg(&mut (*i915).drm, "Attempting to use out-of-bounds batch\n");
+            drm_dbg!(&mut (*i915).drm, "Attempting to use out-of-bounds batch\n");
             return -EINVAL;
         }
         if (*(*eb).args).batch_len == 0 {
             (*eb).batch_len[*current_batch as usize] =
                 (*vma).size - (*eb).batch_start_offset as u64;
         } else {
-            (*eb).batch_len[*current_batch as usize] = (*(*eb).args).batch_len;
+            (*eb).batch_len[*current_batch as usize] = (*(*eb).args).batch_len as u64;
         }
         if (*eb).batch_len[*current_batch as usize] == 0 {
-            drm_dbg(&mut (*i915).drm, "Invalid batch length\n");
+            drm_dbg!(&mut (*i915).drm, "Invalid batch length\n");
             return -EINVAL;
         }
         *current_batch += 1;
@@ -369,8 +744,8 @@ pub unsafe fn use_cpu_reloc(cache: *const RelocCache, obj: *const DrmI915GemObje
         return 0;
     }
     if (*cache).has_llc
-        || (*obj).cache_dirty
-        || !i915_gem_object_has_cache_level(obj, I915_CACHE_NONE)
+        || i915_gem_object_cache_dirty(obj)
+        || !i915_gem_object_has_cache_level(obj, I915_CACHE_NONE as u32)
     {
         1
     } else {
@@ -413,7 +788,7 @@ pub unsafe fn eb_reserve_vma(eb: *mut I915Execbuffer, ev: *mut EbVma, pin_flags:
         }
     }
     (*ev).flags |= EXEC_OBJECT_HAS_PIN;
-    GEM_BUG_ON(eb_vma_misplaced(entry, vma, (*ev).flags));
+    GEM_BUG_ON!(eb_vma_misplaced(entry, vma, (*ev).flags));
     0
 }
 
@@ -421,7 +796,10 @@ pub unsafe fn eb_reserve_vma(eb: *mut I915Execbuffer, ev: *mut EbVma, pin_flags:
 pub unsafe fn eb_unbind(eb: *mut I915Execbuffer, force: bool) -> bool {
     let count = (*eb).buffer_count;
     let mut unpinned = false;
-    let mut last = ListHead::default();
+    let mut last = ListHead {
+        next: core::ptr::null_mut(),
+        prev: core::ptr::null_mut(),
+    };
     INIT_LIST_HEAD(&mut (*eb).unbound);
     INIT_LIST_HEAD(&mut last);
     for i in 0..count {
@@ -458,10 +836,10 @@ pub unsafe fn eb_reserve(eb: *mut I915Execbuffer) -> i32 {
             eb_unbind(eb, pass >= 2);
         }
         if pass == 2 {
-            err = mutex_lock_interruptible(&mut (*(*eb).context).vm.mutex);
+            err = mutex_lock_interruptible(&mut (*(*(*eb).context).vm).mutex);
             if err == 0 {
                 err = i915_gem_evict_vm((*(*eb).context).vm, &mut (*eb).ww, core::ptr::null_mut());
-                mutex_unlock(&mut (*(*eb).context).vm.mutex);
+                mutex_unlock(&mut (*(*(*eb).context).vm).mutex);
             }
             if err != 0 {
                 return err;
@@ -469,11 +847,11 @@ pub unsafe fn eb_reserve(eb: *mut I915Execbuffer) -> i32 {
         }
         if pass == 3 {
             loop {
-                err = mutex_lock_interruptible(&mut (*(*eb).context).vm.mutex);
+                err = mutex_lock_interruptible(&mut (*(*(*eb).context).vm).mutex);
                 if err == 0 {
                     let mut busy_bo: *mut DrmI915GemObject = core::ptr::null_mut();
                     err = i915_gem_evict_vm((*(*eb).context).vm, &mut (*eb).ww, &mut busy_bo);
-                    mutex_unlock(&mut (*(*eb).context).vm.mutex);
+                    mutex_unlock(&mut (*(*(*eb).context).vm).mutex);
                     if err != 0 && !busy_bo.is_null() {
                         err = i915_gem_object_lock(busy_bo, &mut (*eb).ww);
                         i915_gem_object_put(busy_bo);
@@ -506,7 +884,7 @@ pub unsafe fn eb_reserve(eb: *mut I915Execbuffer) -> i32 {
 
 // upstream: i915_gem_execbuffer.c eb_select_context()
 pub unsafe fn eb_select_context(eb: *mut I915Execbuffer) -> i32 {
-    let ctx = i915_gem_context_lookup((*(*eb).file).driver_priv, (*(*eb).args).rsvd1);
+    let ctx = i915_gem_context_lookup((*(*eb).file).driver_priv.cast(), (*(*eb).args).rsvd1 as u32);
     if IS_ERR(ctx) {
         return PTR_ERR(ctx);
     }
@@ -533,17 +911,17 @@ pub unsafe fn __eb_add_lut(eb: *mut I915Execbuffer, handle: u32, vma: *mut I915V
     let mut err = -EINTR;
     if mutex_lock_interruptible(&mut (*ctx).lut_mutex) == 0 {
         if !i915_gem_context_is_closed(ctx) {
-            err = radix_tree_insert(&mut (*ctx).handles_vma, handle, vma);
+            err = radix_tree_insert(&mut (*ctx).handles_vma, handle as u64, vma.cast());
         } else {
             err = -ENOENT;
         }
         if err == 0 {
             let obj = (*vma).obj;
             spin_lock(&mut (*obj).lut_lock);
-            if idr_find(&(*(*eb).file).object_idr, handle) == obj {
+            if i915_gem_object_lookup_rcu((*eb).file.cast(), handle) == obj {
                 list_add(&mut (*lut).obj_link, &mut (*obj).lut_list);
             } else {
-                radix_tree_delete(&mut (*ctx).handles_vma, handle);
+                radix_tree_delete(&mut (*ctx).handles_vma, handle as u64);
                 err = -ENOENT;
             }
             spin_unlock(&mut (*obj).lut_lock);
@@ -564,7 +942,11 @@ pub unsafe fn eb_lookup_vma(eb: *mut I915Execbuffer, handle: u32) -> *mut I915Vm
     let vm = (*(*eb).context).vm;
     loop {
         rcu_read_lock();
-        let mut vma = radix_tree_lookup(&(*(*eb).gem_context).handles_vma, handle);
+        let mut vma = radix_tree_lookup(
+            core::ptr::addr_of_mut!((*(*eb).gem_context).handles_vma),
+            handle as u64,
+        )
+        .cast::<I915Vma>();
         if !vma.is_null() {
             vma = i915_vma_tryget(vma);
         }
@@ -572,14 +954,14 @@ pub unsafe fn eb_lookup_vma(eb: *mut I915Execbuffer, handle: u32) -> *mut I915Vm
         if !vma.is_null() {
             return vma;
         }
-        let obj = i915_gem_object_lookup((*eb).file, handle);
+        let obj = i915_gem_object_lookup((*eb).file.cast(), handle);
         if obj.is_null() {
             return ERR_PTR(-ENOENT);
         }
         if i915_gem_context_uses_protected_content((*eb).gem_context)
             && i915_gem_object_is_protected(obj)
         {
-            let err = intel_pxp_key_check(intel_bo_to_drm_bo(obj), true);
+            let err = intel_pxp_key_check(intel_bo_to_drm_bo(obj).cast(), true);
             if err != 0 {
                 i915_gem_object_put(obj);
                 return ERR_PTR(err);
@@ -674,11 +1056,14 @@ pub unsafe fn eb_validate_vmas(eb: *mut I915Execbuffer) -> i32 {
                 }
             }
         }
-        err = dma_resv_reserve_fences((*(*vma).obj).base.resv, (*eb).num_batches);
+        err = dma_resv_reserve_fences(
+            unsafe { (&(*(*vma).obj).base.base).resv.cast() },
+            (*eb).num_batches,
+        );
         if err != 0 {
             return err;
         }
-        GEM_BUG_ON(
+        GEM_BUG_ON!(
             drm_mm_node_allocated(&(*vma).node) && eb_vma_misplaced(entry, vma, (*ev).flags),
         );
     }
@@ -747,11 +1132,11 @@ pub unsafe fn relocation_target(
 pub unsafe fn reloc_cache_init(cache: *mut RelocCache, i915: *mut DrmI915Private) {
     (*cache).page = usize::MAX;
     (*cache).vaddr = 0;
-    (*cache).graphics_ver = GRAPHICS_VER(i915);
+    (*cache).graphics_ver = GRAPHICS_VER(i915) as u32;
     (*cache).has_llc = HAS_LLC(i915);
     (*cache).use_64bit_reloc = HAS_64BIT_RELOC(i915);
     (*cache).has_fence = (*cache).graphics_ver < 4;
-    (*cache).needs_unfenced = (*INTEL_INFO(i915)).unfenced_needs_alignment;
+    (*cache).needs_unfenced = crate::linux::i915::unfenced_needs_alignment(i915);
     (*cache).node.flags = 0;
 }
 
@@ -794,7 +1179,7 @@ pub unsafe fn reloc_cache_remap(cache: *mut RelocCache, obj: *mut DrmI915GemObje
         return;
     }
     if (*cache).vaddr & KMAP != 0 {
-        let page = i915_gem_object_get_page(obj, (*cache).page);
+        let page = i915_gem_object_get_page(obj, (*cache).page as u64);
         let vaddr = kmap_local_page(page);
         (*cache).vaddr = unmask_flags((*cache).vaddr) | vaddr as usize;
     } else {
@@ -803,7 +1188,7 @@ pub unsafe fn reloc_cache_remap(cache: *mut RelocCache, obj: *mut DrmI915GemObje
         if !drm_mm_node_allocated(&(*cache).node) {
             offset += ((*cache).page << PAGE_SHIFT) as u64;
         }
-        (*cache).vaddr = io_mapping_map_atomic_wc(&mut (*ggtt).iomap, offset) as usize;
+        (*cache).vaddr = io_mapping_map_atomic_wc(&mut (*ggtt).iomap, offset as c_ulong) as usize;
     }
 }
 
@@ -825,7 +1210,10 @@ pub unsafe fn reloc_cache_reset(cache: *mut RelocCache, _eb: *mut I915Execbuffer
         intel_gt_flush_ggtt_writes((*ggtt).vm.gt);
         io_mapping_unmap_atomic(vaddr);
         if drm_mm_node_allocated(&(*cache).node) {
-            ((*(*ggtt).vm.clear_range)(&mut (*ggtt).vm, (*cache).node.start, (*cache).node.size));
+            let clear_range = (*ggtt).vm.clear_range.unwrap_or_else(|| {
+                panic!("GGTT clear_range callback missing from active address space")
+            });
+            clear_range(&mut (*ggtt).vm, (*cache).node.start, (*cache).node.size);
             mutex_lock(&mut (*ggtt).vm.mutex);
             drm_mm_remove_node(&mut (*cache).node);
             mutex_unlock(&mut (*ggtt).vm.mutex);
@@ -854,13 +1242,13 @@ pub unsafe fn reloc_kmap(
         BUILD_BUG_ON!(KMAP & CLFLUSH_FLAGS != 0);
         BUILD_BUG_ON!((KMAP | CLFLUSH_FLAGS) & PAGE_MASK as usize != 0);
         (*cache).vaddr = flushes as usize | KMAP;
-        (*cache).node.mm = obj as *mut c_void;
+        (*cache).node.mm = obj.cast();
         if flushes != 0 {
             mb();
         }
     }
-    let page = i915_gem_object_get_page(obj, pageno);
-    if !(*obj).mm.dirty {
+    let page = i915_gem_object_get_page(obj, pageno as u64);
+    if !(*obj).mm.is_dirty() {
         set_page_dirty(page);
     }
     let vaddr = kmap_local_page(page);
@@ -905,7 +1293,7 @@ pub unsafe fn reloc_iomap(
             );
         }
         if vma == ERR_PTR(-EDEADLK) {
-            return vma;
+            return vma.cast();
         }
         if IS_ERR(vma) {
             core::ptr::write_bytes(&mut cache.node, 0, 1);
@@ -915,7 +1303,7 @@ pub unsafe fn reloc_iomap(
                 &mut cache.node,
                 PAGE_SIZE as u64,
                 0,
-                I915_COLOR_UNEVICTABLE,
+                I915_COLOR_UNEVICTABLE as c_ulong,
                 0,
                 (*ggtt).mappable_end,
                 DRM_MM_INSERT_LOW,
@@ -925,23 +1313,26 @@ pub unsafe fn reloc_iomap(
                 return core::ptr::null_mut();
             }
         } else {
-            cache.node.start = i915_ggtt_offset(vma);
-            cache.node.mm = vma as *mut c_void;
+            cache.node.start = i915_ggtt_offset(vma) as u64;
+            cache.node.mm = vma.cast();
         }
     }
     offset = cache.node.start;
     if drm_mm_node_allocated(&cache.node) {
-        ((*(*ggtt).vm.insert_page)(
+        let insert_page = (*ggtt).vm.insert_page.unwrap_or_else(|| {
+            panic!("GGTT insert_page callback missing from active address space")
+        });
+        insert_page(
             &mut (*ggtt).vm,
-            i915_gem_object_get_dma_address(obj, page),
+            i915_gem_object_get_dma_address(obj, page as u64),
             offset,
-            i915_gem_get_pat_index((*ggtt).vm.i915, I915_CACHE_NONE),
+            i915_gem_get_pat_index((*ggtt).vm.i915, I915_CACHE_NONE as u32),
             0,
-        ));
+        );
     } else {
         offset += (page << PAGE_SHIFT) as u64;
     }
-    let vaddr = io_mapping_map_atomic_wc(&mut (*ggtt).iomap, offset);
+    let vaddr = io_mapping_map_atomic_wc(&mut (*ggtt).iomap, offset as c_ulong);
     cache.page = page;
     cache.vaddr = vaddr as usize;
     vaddr
@@ -968,11 +1359,11 @@ pub unsafe fn reloc_vaddr(vma: *mut I915Vma, eb: *mut I915Execbuffer, page: usiz
 pub unsafe fn clflush_write32(addr: *mut u32, value: u32, flushes: u32) {
     if flushes & (CLFLUSH_BEFORE | CLFLUSH_AFTER) != 0 {
         if flushes & CLFLUSH_BEFORE != 0 {
-            drm_clflush_virt_range(addr as *const c_void, 4);
+            drm_clflush_virt_range(addr.cast(), 4);
         }
         *addr = value;
         if flushes & CLFLUSH_AFTER != 0 {
-            drm_clflush_virt_range(addr as *const c_void, 4);
+            drm_clflush_virt_range(addr.cast(), 4);
         }
     } else {
         *addr = value;
@@ -994,7 +1385,7 @@ pub unsafe fn relocate_entry(
         if IS_ERR(vaddr) {
             return PTR_ERR(vaddr) as u64;
         }
-        GEM_BUG_ON(!IS_ALIGNED(offset, core::mem::size_of::<u32>() as u64));
+        GEM_BUG_ON!(!IS_ALIGNED(offset, core::mem::size_of::<u32>() as u64));
         clflush_write32(
             vaddr.add(offset_in_page(offset) as usize) as *mut u32,
             lower_32_bits(target_addr),
@@ -1022,7 +1413,7 @@ pub unsafe fn eb_relocate_entry(
         return (-ENOENT) as u64;
     }
     if (*reloc).write_domain & ((*reloc).write_domain - 1) != 0 {
-        drm_dbg(
+        drm_dbg!(
             &mut (*i915).drm,
             "reloc with multiple write domains: target %d offset %d read %08x write %08x\n",
             (*reloc).target_handle,
@@ -1033,7 +1424,7 @@ pub unsafe fn eb_relocate_entry(
         return (-EINVAL) as u64;
     }
     if ((*reloc).write_domain | (*reloc).read_domains) & !I915_GEM_GPU_DOMAINS != 0 {
-        drm_dbg(
+        drm_dbg!(
             &mut (*i915).drm,
             "reloc with read/write non-GPU domains: target %d offset %d read %08x write %08x\n",
             (*reloc).target_handle,
@@ -1047,19 +1438,19 @@ pub unsafe fn eb_relocate_entry(
         (*target).flags |= EXEC_OBJECT_WRITE;
         if (*reloc).write_domain == I915_GEM_DOMAIN_INSTRUCTION
             && GRAPHICS_VER(i915) == 6
-            && !i915_vma_is_bound((*target).vma, I915_VMA_GLOBAL_BIND)
+            && !i915_vma_is_bound((*target).vma, I915_VMA_GLOBAL_BIND as u32)
         {
             let vma = (*target).vma;
             reloc_cache_unmap(&mut (*eb).reloc_cache);
-            mutex_lock(&mut (*vma).vm.mutex);
+            mutex_lock(&mut (*(*vma).vm).mutex);
             let err = i915_vma_bind(
                 (*target).vma,
-                (*(*vma).obj).pat_index,
-                PIN_GLOBAL,
+                object_pat_index((*vma).obj),
+                PIN_GLOBAL as u32,
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),
             );
-            mutex_unlock(&mut (*vma).vm.mutex);
+            mutex_unlock(&mut (*(*vma).vm).mutex);
             reloc_cache_remap(&mut (*eb).reloc_cache, (*(*ev).vma).obj);
             if err != 0 {
                 return err as u64;
@@ -1079,7 +1470,7 @@ pub unsafe fn eb_relocate_entry(
                 4
             }
     {
-        drm_dbg(
+        drm_dbg!(
             &mut (*i915).drm,
             "Relocation beyond object bounds: target %d offset %d size %d.\n",
             (*reloc).target_handle,
@@ -1089,7 +1480,7 @@ pub unsafe fn eb_relocate_entry(
         return (-EINVAL) as u64;
     }
     if (*reloc).offset & 3 != 0 {
-        drm_dbg(
+        drm_dbg!(
             &mut (*i915).drm,
             "Relocation not 4-byte aligned: target %d offset %d.\n",
             (*reloc).target_handle,
@@ -1113,7 +1504,7 @@ pub unsafe fn eb_relocate_vma(eb: *mut I915Execbuffer, ev: *mut EbVma) -> i32 {
     }
     if !access_ok(
         urelocs as *const c_void,
-        remain * core::mem::size_of::<DrmI915GemRelocationEntry>(),
+        (remain * core::mem::size_of::<DrmI915GemRelocationEntry>()) as u64,
     ) {
         return -EFAULT;
     }
@@ -1188,7 +1579,7 @@ pub unsafe fn check_relocations(entry: *const DrmI915GemExecObject2) -> i32 {
     }
     let addr = u64_to_user_ptr((*entry).relocs_ptr) as *mut u8;
     size *= core::mem::size_of::<DrmI915GemRelocationEntry>();
-    if !access_ok(addr as *const c_void, size) {
+    if !access_ok(addr as *const c_void, size as u64) {
         return -EFAULT;
     }
     let end = addr.add(size);
@@ -1232,7 +1623,12 @@ pub unsafe fn eb_copy_relocations(eb: *const I915Execbuffer) -> i32 {
         let mut copied = 0usize;
         while copied < size {
             let len = core::cmp::min(1usize << 31, size - copied);
-            if __copy_from_user(relocs.cast::<u8>().add(copied), urelocs.add(copied), len) != 0 {
+            if __copy_from_user(
+                relocs.cast::<u8>().add(copied).cast(),
+                urelocs.add(copied).cast(),
+                len,
+            ) != 0
+            {
                 break;
             }
             copied += len;
@@ -1242,7 +1638,7 @@ pub unsafe fn eb_copy_relocations(eb: *const I915Execbuffer) -> i32 {
             err = -EFAULT;
             break;
         }
-        if !user_access_begin(urelocs.cast(), size) {
+        if !user_write_access_begin(urelocs.cast(), size) {
             kvfree(relocs.cast());
             err = -EFAULT;
             break;
@@ -1250,12 +1646,14 @@ pub unsafe fn eb_copy_relocations(eb: *const I915Execbuffer) -> i32 {
         let mut copied_reloc = 0;
         while copied_reloc < nreloc as usize {
             if unsafe_put_user(
-                -1i64,
-                &mut (*(urelocs as *mut DrmI915GemRelocationEntry).add(copied_reloc))
-                    .presumed_offset,
+                u64::MAX,
+                core::ptr::addr_of_mut!(
+                    (*(urelocs as *mut DrmI915GemRelocationEntry).add(copied_reloc))
+                        .presumed_offset
+                ),
             ) != 0
             {
-                user_access_end();
+                user_write_access_end();
                 kvfree(relocs.cast());
                 err = -EFAULT;
                 break;
@@ -1265,7 +1663,7 @@ pub unsafe fn eb_copy_relocations(eb: *const I915Execbuffer) -> i32 {
         if err != 0 {
             break;
         }
-        user_access_end();
+        user_write_access_end();
         (*(*eb).exec.add(i as usize)).relocs_ptr = relocs as usize as u64;
         i += 1;
     }
@@ -1321,7 +1719,7 @@ pub unsafe fn eb_relocate_parse_slow(eb: *mut I915Execbuffer) -> i32 {
     let mut have_copy = false;
     let mut err = 0;
     'repeat: loop {
-        if signal_pending(current()) {
+        if signal_pending_current() {
             err = -ERESTARTSYS;
             break;
         }
@@ -1344,49 +1742,52 @@ pub unsafe fn eb_relocate_parse_slow(eb: *mut I915Execbuffer) -> i32 {
             break;
         }
         'repeat_validate: loop {
-            err = eb_pin_engine(eb, false);
-            if err != 0 {
-                break;
-            }
-            err = eb_validate_vmas(eb);
-            if err != 0 {
-                break;
-            }
-            GEM_BUG_ON!((*eb).batches[0].is_null());
-            let mut node = (*eb).relocs.next;
-            while node != &mut (*eb).relocs as *mut ListHead {
-                let ev = container_of!(node, EbVma, reloc_link);
-                err = if !have_copy {
-                    eb_relocate_vma(eb, ev)
-                } else {
-                    eb_relocate_vma_slow(eb, ev)
-                };
+            loop {
+                err = eb_pin_engine(eb, false);
                 if err != 0 {
                     break;
                 }
-                node = (*node).next;
+                err = eb_validate_vmas(eb);
+                if err != 0 {
+                    break;
+                }
+                GEM_BUG_ON!((*eb).batches[0].is_null());
+                let mut node = (*eb).relocs.next;
+                while node != &mut (*eb).relocs as *mut ListHead {
+                    let ev = container_of!(node, EbVma, reloc_link);
+                    err = if !have_copy {
+                        eb_relocate_vma(eb, ev)
+                    } else {
+                        eb_relocate_vma_slow(eb, ev)
+                    };
+                    if err != 0 {
+                        break;
+                    }
+                    node = (*node).next;
+                }
+                if err == -EDEADLK {
+                    break;
+                }
+                if err != 0 && !have_copy {
+                    continue 'repeat;
+                }
+                if err != 0 {
+                    break;
+                }
+                err = eb_parse(eb);
+                if err == 0 {
+                    break;
+                }
+                break;
             }
             if err == -EDEADLK {
-                break;
-            }
-            if err != 0 && !have_copy {
-                continue 'repeat;
-            }
-            if err != 0 {
-                break;
-            }
-            err = eb_parse(eb);
-            if err == 0 {
-                break;
+                eb_release_vmas(eb, false);
+                err = i915_gem_ww_ctx_backoff(&mut (*eb).ww);
+                if err == 0 {
+                    continue 'repeat_validate;
+                }
             }
             break;
-        }
-        if err == -EDEADLK {
-            eb_release_vmas(eb, false);
-            err = i915_gem_ww_ctx_backoff(&mut (*eb).ww);
-            if err == 0 {
-                continue 'repeat_validate;
-            }
         }
         if err == -EAGAIN {
             continue 'repeat;
@@ -1474,7 +1875,7 @@ pub unsafe fn eb_find_first_request_added(eb: *mut I915Execbuffer) -> *mut I915R
         }
         i -= 1;
     }
-    GEM_BUG_ON!("Request not found");
+    GEM_BUG_ON!(true);
     core::ptr::null_mut()
 }
 
@@ -1571,7 +1972,9 @@ pub unsafe fn eb_move_to_gpu(eb: *mut I915Execbuffer) -> i32 {
         let mut flags = (*ev).flags;
         let obj = (*vma).obj;
         assert_vma_held(vma);
-        if (*obj).cache_dirty & !(*obj).cache_coherent != 0 {
+        if i915_gem_object_cache_dirty(obj)
+            && crate::linux::fields::i915_gem_object_cache_coherent(obj) & 1 == 0
+        {
             if i915_gem_clflush_object(obj, 0) {
                 flags &= !EXEC_OBJECT_ASYNC;
             }
@@ -1648,7 +2051,7 @@ pub unsafe fn i915_gem_check_execbuffer(
         return -EINVAL;
     }
     if (*exec).DR4 == 0xffff_ffff {
-        drm_dbg(&mut (*i915).drm, "UXA submitting garbage DR4, fixing up\n");
+        drm_dbg!(&mut (*i915).drm, "UXA submitting garbage DR4, fixing up\n");
         (*exec).DR4 = 0;
     }
     if (*exec).DR1 != 0 || (*exec).DR4 != 0 {
@@ -1663,7 +2066,7 @@ pub unsafe fn i915_gem_check_execbuffer(
 // upstream: i915_gem_execbuffer.c i915_reset_gen7_sol_offsets()
 pub unsafe fn i915_reset_gen7_sol_offsets(rq: *mut I915Request) -> i32 {
     if GRAPHICS_VER((*rq).i915) != 7 || (*(*rq).engine).id != RCS0 {
-        drm_dbg(&mut (*(*rq).i915).drm, "sol reset is gen7/rcs only\n");
+        drm_dbg!(&mut (*(*rq).i915).drm, "sol reset is gen7/rcs only\n");
         return -EINVAL;
     }
     let mut cs = intel_ring_begin(rq, 4 * 2 + 2);
@@ -1695,7 +2098,7 @@ pub unsafe fn shadow_batch_pin(
     if IS_ERR(vma) {
         return vma;
     }
-    let err = i915_vma_pin_ww(vma, &mut (*eb).ww, 0, 0, flags | PIN_VALIDATE);
+    let err = i915_vma_pin_ww(vma, &mut (*eb).ww, 0, 0, flags as u64 | PIN_VALIDATE);
     if err != 0 {
         return ERR_PTR(err);
     }
@@ -1747,15 +2150,15 @@ pub unsafe fn eb_parse(eb: *mut I915Execbuffer) -> i32 {
     }
     len = (*eb).batch_len[0] as usize;
     if !CMDPARSER_USES_GGTT((*eb).i915) {
-        if !(*(*(*eb).context).vm).has_read_only {
-            drm_dbg(
+        if (*(*(*eb).context).vm).vm_flags & (1 << 2) == 0 {
+            drm_dbg!(
                 &mut (*i915).drm,
                 "Cannot prevent post-scan tampering without RO capable vm\n",
             );
             return -EINVAL;
         }
     } else {
-        len += I915_CMD_PARSER_TRAMPOLINE_SIZE;
+        len += I915_CMD_PARSER_TRAMPOLINE_SIZE as usize;
     }
     if len < (*eb).batch_len[0] as usize {
         return -EINVAL;
@@ -1771,7 +2174,7 @@ pub unsafe fn eb_parse(eb: *mut I915Execbuffer) -> i32 {
     if err != 0 {
         return err;
     }
-    shadow = shadow_batch_pin(eb, (*pool).obj, (*(*eb).context).vm, PIN_USER);
+    shadow = shadow_batch_pin(eb, (*pool).obj, (*(*eb).context).vm, PIN_USER as u32);
     if IS_ERR(shadow) {
         return PTR_ERR(shadow);
     }
@@ -1781,7 +2184,12 @@ pub unsafe fn eb_parse(eb: *mut I915Execbuffer) -> i32 {
     trampoline = core::ptr::null_mut();
     if CMDPARSER_USES_GGTT((*eb).i915) {
         trampoline = shadow;
-        shadow = shadow_batch_pin(eb, (*pool).obj, &mut (*(*(*eb).gt).ggtt).vm, PIN_GLOBAL);
+        shadow = shadow_batch_pin(
+            eb,
+            (*pool).obj,
+            &mut (*(*(*eb).gt).ggtt).vm,
+            PIN_GLOBAL as u32,
+        );
         if IS_ERR(shadow) {
             return PTR_ERR(shadow);
         }
@@ -1792,17 +2200,17 @@ pub unsafe fn eb_parse(eb: *mut I915Execbuffer) -> i32 {
     if IS_ERR(batch) {
         return PTR_ERR(batch);
     }
-    err = dma_resv_reserve_fences((*(*shadow).obj).base.resv, 1);
+    err = dma_resv_reserve_fences(unsafe { (&(*(*shadow).obj).base.base).resv.cast() }, 1);
     if err != 0 {
         return err;
     }
     err = intel_engine_cmd_parser(
         (*(*eb).context).engine,
         (*(*eb).batches[0]).vma,
-        (*eb).batch_start_offset,
-        (*eb).batch_len[0],
+        (*eb).batch_start_offset as c_ulong,
+        (*eb).batch_len[0] as c_ulong,
         shadow,
-        trampoline,
+        !trampoline.is_null(),
     );
     if err != 0 {
         return err;
@@ -1851,7 +2259,7 @@ pub unsafe fn eb_request_submit(
         (*(*rq).context).engine,
         rq,
         i915_vma_offset(batch) + (*eb).batch_start_offset as u64,
-        batch_len,
+        batch_len as u32,
         (*eb).batch_flags,
     );
     if err != 0 {
@@ -1893,12 +2301,15 @@ pub unsafe fn eb_submit(eb: *mut I915Execbuffer) -> i32 {
 // upstream: i915_gem_execbuffer.c gen8_dispatch_bsd_engine()
 pub unsafe fn gen8_dispatch_bsd_engine(i915: *mut DrmI915Private, file: *mut DrmFile) -> u32 {
     let file_priv = (*file).driver_priv as *mut DrmI915FilePrivate;
-    if (*file_priv).bsd_engine < 0 {
-        (*file_priv).bsd_engine =
-            get_random_u32_below((*i915).engine_uabi_class_count[I915_ENGINE_CLASS_VIDEO as usize])
-                as i32;
+    if unsafe { i915_gem_file_bsd_engine(file_priv) } < 0 {
+        unsafe {
+            i915_gem_file_set_bsd_engine(
+                file_priv,
+                get_random_u32_below(engine_uabi_class_count(i915, I915_ENGINE_CLASS_VIDEO)),
+            )
+        };
     }
-    (*file_priv).bsd_engine as u32
+    unsafe { i915_gem_file_bsd_engine(file_priv) as u32 }
 }
 
 pub const USER_RING_MAP: [i32; 5] = [RCS0, RCS0, BCS0, VCS0, VECS0];
@@ -1944,8 +2355,12 @@ pub unsafe fn eb_pin_timeline(
     };
     intel_context_timeline_unlock(tl);
     if !rq.is_null() {
-        let nonblock = (*(*(*eb).file).filp).f_flags & O_NONBLOCK != 0;
-        let timeout = if nonblock { 0 } else { MAX_SCHEDULE_TIMEOUT };
+        let nonblock = (*(*(*eb).file).filp).f_flags & O_NONBLOCK as u32 != 0;
+        let timeout = if nonblock {
+            0
+        } else {
+            MAX_SCHEDULE_TIMEOUT as c_long
+        };
         if i915_request_wait(rq, I915_WAIT_INTERRUPTIBLE, timeout) < 0 {
             i915_request_put(rq);
             mutex_lock(&mut (*(*ce).timeline).mutex);
@@ -2039,7 +2454,7 @@ pub unsafe fn eb_select_legacy_ring(eb: *mut I915Execbuffer) -> u32 {
     let args = (*eb).args;
     let user_ring_id = ((*args).flags & I915_EXEC_RING_MASK) as usize;
     if user_ring_id != I915_EXEC_BSD as usize && (*args).flags & I915_EXEC_BSD_MASK != 0 {
-        drm_dbg(
+        drm_dbg!(
             &mut (*i915).drm,
             "execbuf with non bsd ring but with invalid bsd dispatch flags: %d\n",
             (*args).flags as i32,
@@ -2047,7 +2462,7 @@ pub unsafe fn eb_select_legacy_ring(eb: *mut I915Execbuffer) -> u32 {
         return u32::MAX;
     }
     if user_ring_id == I915_EXEC_BSD as usize
-        && (*i915).engine_uabi_class_count[I915_ENGINE_CLASS_VIDEO as usize] > 1
+        && engine_uabi_class_count(i915, I915_ENGINE_CLASS_VIDEO) > 1
     {
         let mut bsd_idx = ((*args).flags & I915_EXEC_BSD_MASK) as u32;
         if bsd_idx == I915_EXEC_BSD_DEFAULT {
@@ -2056,7 +2471,7 @@ pub unsafe fn eb_select_legacy_ring(eb: *mut I915Execbuffer) -> u32 {
             bsd_idx >>= I915_EXEC_BSD_SHIFT;
             bsd_idx -= 1;
         } else {
-            drm_dbg(
+            drm_dbg!(
                 &mut (*i915).drm,
                 "execbuf with unknown bsd ring: %u\n",
                 bsd_idx,
@@ -2066,7 +2481,7 @@ pub unsafe fn eb_select_legacy_ring(eb: *mut I915Execbuffer) -> u32 {
         return _VCS(bsd_idx as i32) as u32;
     }
     if user_ring_id >= USER_RING_MAP.len() {
-        drm_dbg(
+        drm_dbg!(
             &mut (*i915).drm,
             "execbuf with unknown ring: %u\n",
             user_ring_id as u32,
@@ -2089,7 +2504,7 @@ pub unsafe fn eb_select_engine(eb: *mut I915Execbuffer) -> i32 {
     }
     let mut child = core::ptr::null_mut();
     if intel_context_is_parallel(ce) {
-        if (*eb).buffer_count < (*ce).parallel.number_children + 1 {
+        if (*eb).buffer_count < (*ce).parallel.number_children as u32 + 1 {
             intel_context_put(ce);
             return -EINVAL;
         }
@@ -2098,7 +2513,7 @@ pub unsafe fn eb_select_engine(eb: *mut I915Execbuffer) -> i32 {
             return -EINVAL;
         }
     }
-    (*eb).num_batches = (*ce).parallel.number_children + 1;
+    (*eb).num_batches = (*ce).parallel.number_children as u32 + 1;
     let gt = (*(*ce).engine).gt;
     child = intel_context_first_child(ce);
     while !child.is_null() {
@@ -2130,7 +2545,7 @@ pub unsafe fn eb_select_engine(eb: *mut I915Execbuffer) -> i32 {
     if err != 0 {
         return eb_select_engine_err(eb, ce, gt, err);
     }
-    if !i915_vm_tryget((*ce).vm) {
+    if i915_vm_tryget((*ce).vm).is_null() {
         return eb_select_engine_err(eb, ce, gt, -ENOENT);
     }
     (*eb).context = ce;
@@ -2178,7 +2593,7 @@ pub unsafe fn eb_put_engine(eb: *mut I915Execbuffer) {
 pub unsafe fn __free_fence_array(fences: *mut EbFence, mut n: u32) {
     while n != 0 {
         n -= 1;
-        drm_syncobj_put(ptr_mask_bits((*fences.add(n as usize)).syncobj, 2));
+        drm_syncobj_put(ptr_mask_bits((*fences.add(n as usize)).syncobj, 2).cast());
         dma_fence_put((*fences.add(n as usize)).dma_fence);
         dma_fence_chain_free((*fences.add(n as usize)).chain_fence);
     }
@@ -2204,20 +2619,20 @@ pub unsafe fn add_timeline_fence_array(
     }
     if !access_ok(
         user_fences.cast(),
-        nfences as usize * core::mem::size_of::<DrmI915GemExecFence>(),
+        (nfences as usize * core::mem::size_of::<DrmI915GemExecFence>()) as u64,
     ) {
         return -EFAULT;
     }
     let mut user_values = u64_to_user_ptr((*timeline_fences).values_ptr) as *mut u64;
     if !access_ok(
         user_values.cast(),
-        nfences as usize * core::mem::size_of::<u64>(),
+        (nfences as usize * core::mem::size_of::<u64>()) as u64,
     ) {
         return -EFAULT;
     }
     let total = (*eb).num_fences + nfences as usize;
     let mut f = krealloc(
-        (*eb).fences,
+        (*eb).fences.cast(),
         total * core::mem::size_of::<EbFence>(),
         __GFP_NOWARN | GFP_KERNEL,
     ) as *mut EbFence;
@@ -2249,7 +2664,7 @@ pub unsafe fn add_timeline_fence_array(
         user_values = user_values.add(1);
         let syncobj = drm_syncobj_find((*eb).file, user_fence.handle);
         if syncobj.is_null() {
-            drm_dbg(&mut (*(*eb).i915).drm, "Invalid syncobj handle provided\n");
+            drm_dbg!(&mut (*(*eb).i915).drm, "Invalid syncobj handle provided\n");
             return -ENOENT;
         }
         let mut fence = drm_syncobj_fence_get(syncobj);
@@ -2257,36 +2672,36 @@ pub unsafe fn add_timeline_fence_array(
             && user_fence.flags != 0
             && user_fence.flags & I915_EXEC_FENCE_SIGNAL == 0
         {
-            drm_dbg(&mut (*(*eb).i915).drm, "Syncobj handle has no fence\n");
-            drm_syncobj_put(syncobj);
+            drm_dbg!(&mut (*(*eb).i915).drm, "Syncobj handle has no fence\n");
+            drm_syncobj_put(syncobj.cast());
             return -EINVAL;
         }
         if !fence.is_null() {
             err = dma_fence_chain_find_seqno(&mut fence, point);
         }
         if err != 0 && user_fence.flags & I915_EXEC_FENCE_SIGNAL == 0 {
-            drm_dbg(
+            drm_dbg!(
                 &mut (*(*eb).i915).drm,
                 "Syncobj handle missing requested point %llu\n",
                 point,
             );
             dma_fence_put(fence);
-            drm_syncobj_put(syncobj);
+            drm_syncobj_put(syncobj.cast());
             return err;
         }
         if fence.is_null() && user_fence.flags & I915_EXEC_FENCE_SIGNAL == 0 {
-            drm_syncobj_put(syncobj);
+            drm_syncobj_put(syncobj.cast());
             continue;
         }
-        let chain_fence;
+        let chain_fence: *mut DmaFenceChain;
         if point != 0 && user_fence.flags & I915_EXEC_FENCE_SIGNAL != 0 {
             if user_fence.flags & I915_EXEC_FENCE_WAIT != 0 {
-                drm_dbg(
+                drm_dbg!(
                     &mut (*(*eb).i915).drm,
                     "Trying to wait & signal the same timeline point.\n",
                 );
                 dma_fence_put(fence);
-                drm_syncobj_put(syncobj);
+                drm_syncobj_put(syncobj.cast());
                 return -EINVAL;
             }
             chain_fence = dma_fence_chain_alloc();
@@ -2298,7 +2713,7 @@ pub unsafe fn add_timeline_fence_array(
         } else {
             chain_fence = core::ptr::null_mut();
         }
-        (*f).syncobj = ptr_pack_bits(syncobj, user_fence.flags, 2);
+        (*f).syncobj = ptr_pack_bits(syncobj.cast(), user_fence.flags, 2);
         (*f).dma_fence = fence;
         (*f).value = point;
         (*f).chain_fence = chain_fence;
@@ -2326,13 +2741,13 @@ pub unsafe fn add_fence_array(eb: *mut I915Execbuffer) -> i32 {
     }
     if !access_ok(
         user.cast(),
-        num_fences * core::mem::size_of::<DrmI915GemExecFence>(),
+        (num_fences * core::mem::size_of::<DrmI915GemExecFence>()) as u64,
     ) {
         return -EFAULT;
     }
     let total = (*eb).num_fences + num_fences;
     let mut f = krealloc(
-        (*eb).fences,
+        (*eb).fences.cast(),
         total * core::mem::size_of::<EbFence>(),
         __GFP_NOWARN | GFP_KERNEL,
     ) as *mut EbFence;
@@ -2358,19 +2773,19 @@ pub unsafe fn add_fence_array(eb: *mut I915Execbuffer) -> i32 {
         }
         let syncobj = drm_syncobj_find((*eb).file, user_fence.handle);
         if syncobj.is_null() {
-            drm_dbg(&mut (*(*eb).i915).drm, "Invalid syncobj handle provided\n");
+            drm_dbg!(&mut (*(*eb).i915).drm, "Invalid syncobj handle provided\n");
             return -ENOENT;
         }
         let mut fence = core::ptr::null_mut();
         if user_fence.flags & I915_EXEC_FENCE_WAIT != 0 {
             fence = drm_syncobj_fence_get(syncobj);
             if fence.is_null() {
-                drm_dbg(&mut (*(*eb).i915).drm, "Syncobj handle has no fence\n");
-                drm_syncobj_put(syncobj);
+                drm_dbg!(&mut (*(*eb).i915).drm, "Syncobj handle has no fence\n");
+                drm_syncobj_put(syncobj.cast());
                 return -EINVAL;
             }
         }
-        (*f).syncobj = ptr_pack_bits(syncobj, user_fence.flags, 2);
+        (*f).syncobj = ptr_pack_bits(syncobj.cast(), user_fence.flags, 2);
         (*f).dma_fence = fence;
         (*f).value = 0;
         (*f).chain_fence = core::ptr::null_mut();
@@ -2407,7 +2822,7 @@ pub unsafe fn signal_fence_array(eb: *const I915Execbuffer, fence: *mut DmaFence
     for n in 0..(*eb).num_fences {
         let f = (*eb).fences.add(n);
         let mut flags = 0u32;
-        let syncobj = ptr_unpack_bits((*f).syncobj, &mut flags, 2);
+        let syncobj = ptr_unpack_bits((*f).syncobj, &mut flags, 2).cast::<DrmSyncobj>();
         if flags & I915_EXEC_FENCE_SIGNAL == 0 {
             continue;
         }
@@ -2421,7 +2836,10 @@ pub unsafe fn signal_fence_array(eb: *const I915Execbuffer, fence: *mut DmaFence
 }
 
 // upstream: i915_gem_execbuffer.c parse_timeline_fences()
-pub unsafe fn parse_timeline_fences(ext: *mut I915UserExtension, data: *mut c_void) -> i32 {
+pub unsafe extern "C" fn parse_timeline_fences(
+    ext: *mut I915UserExtension,
+    data: *mut c_void,
+) -> i32 {
     let eb = data as *mut I915Execbuffer;
     let mut timeline_fences: DrmI915GemExecbufferExtTimelineFences = core::mem::zeroed();
     if copy_from_user(
@@ -2455,9 +2873,9 @@ pub unsafe fn eb_request_add(
     last_parallel: bool,
 ) -> i32 {
     let tl = i915_request_timeline(rq);
-    let mut attr = I915SchedAttr::default();
+    let mut attr = I915SchedAttr { priority: 0 };
     lockdep_assert_held(&(*tl).mutex);
-    lockdep_unpin_lock(&(*tl).mutex, (*rq).cookie);
+    lockdep_unpin_lock(&mut (*tl).mutex, (*rq).cookie);
     trace_i915_request_add(rq);
     let prev = __i915_request_commit(rq);
     if !intel_context_is_closed((*eb).context) {
@@ -2498,8 +2916,9 @@ pub unsafe fn eb_requests_add(eb: *mut I915Execbuffer, mut err: i32) -> i32 {
 }
 
 // DRM_I915_GEM_EXECBUFFER_EXT_TIMELINE_FENCES extension callback table.
-pub static EXECBUF_EXTENSIONS: [Option<unsafe fn(*mut I915UserExtension, *mut c_void) -> i32>; 1] =
-    [Some(parse_timeline_fences)];
+pub static EXECBUF_EXTENSIONS: [Option<
+    unsafe extern "C" fn(*mut I915UserExtension, *mut c_void) -> i32,
+>; 1] = [Some(parse_timeline_fences)];
 
 // upstream: i915_gem_execbuffer.c parse_execbuf2_extensions()
 pub unsafe fn parse_execbuf2_extensions(
@@ -2518,7 +2937,7 @@ pub unsafe fn parse_execbuf2_extensions(
     i915_user_extensions(
         u64_to_user_ptr((*args).cliprects_ptr) as *mut I915UserExtension,
         EXECBUF_EXTENSIONS.as_ptr(),
-        EXECBUF_EXTENSIONS.len(),
+        EXECBUF_EXTENSIONS.len() as u32,
         eb.cast(),
     )
 }
@@ -2574,7 +2993,7 @@ pub unsafe fn eb_composite_fence_create(
     );
     (*(*eb).context).parallel.seqno += 1;
     if fence_array.is_null() {
-        kfree(fences.cast());
+        kfree(fences.cast::<c_void>());
         return ERR_PTR(-ENOMEM);
     }
     for i in 0..(*eb).num_batches as usize {
@@ -2656,7 +3075,7 @@ pub unsafe fn eb_find_context(
         }
         child = intel_context_next_child((*eb).context, child);
     }
-    GEM_BUG_ON!("Context not found");
+    GEM_BUG_ON!(true);
     core::ptr::null_mut()
 }
 
@@ -2699,7 +3118,7 @@ pub unsafe fn i915_gem_do_execbuffer(
     args: *mut DrmI915GemExecbuffer2,
     exec: *mut DrmI915GemExecObject2,
 ) -> i32 {
-    let i915 = to_i915(dev);
+    let i915 = to_i915(dev.cast());
     let mut eb: I915Execbuffer = core::mem::zeroed();
     let mut in_fence: *mut DmaFence = core::ptr::null_mut();
     let mut out_fence: *mut SyncFile = core::ptr::null_mut();
@@ -2711,12 +3130,8 @@ pub unsafe fn i915_gem_do_execbuffer(
     let mut vmas_acquired = false;
     let mut ww_initialized = false;
     let mut request_path = false;
-    if EXEC_INTERNAL_FLAGS & !I915_EXEC_ILLEGAL_FLAGS != 0 {
-        build_bug();
-    }
-    if EXEC_OBJECT_INTERNAL_FLAGS & !EXEC_OBJECT_UNKNOWN_FLAGS != 0 {
-        build_bug();
-    }
+    BUILD_BUG_ON!(EXEC_INTERNAL_FLAGS & !(I915_EXEC_ILLEGAL_FLAGS as u32) != 0);
+    BUILD_BUG_ON!(EXEC_OBJECT_INTERNAL_FLAGS & !EXEC_OBJECT_UNKNOWN_FLAGS != 0);
     eb.i915 = i915;
     eb.file = file;
     eb.args = args;
@@ -2803,7 +3218,7 @@ pub unsafe fn i915_gem_do_execbuffer(
         }
     }
     if err == 0 {
-        ww_acquire_done(&mut eb.ww.ctx);
+        crate::linux::ww_mutex::ww_acquire_done(&mut eb.ww.ctx);
         err = eb_capture_stage(&mut eb);
     }
     if err == 0 {
@@ -2860,7 +3275,7 @@ pub unsafe fn i915_gem_do_execbuffer(
     // refs before entering err_engine.
     if ww_initialized {
         eb_release_vmas(&mut eb, true);
-        WARN_ON(err == -EDEADLK);
+        WARN_ON!(err == -EDEADLK);
         i915_gem_ww_ctx_fini(&mut eb.ww);
     } else if vmas_acquired {
         eb_release_vmas(&mut eb, true);
@@ -2903,11 +3318,11 @@ pub unsafe fn i915_gem_execbuffer2_ioctl(
     data: *mut c_void,
     file: *mut DrmFile,
 ) -> i32 {
-    let i915 = to_i915(dev);
+    let i915 = to_i915(dev.cast());
     let args = data as *mut DrmI915GemExecbuffer2;
     let count = (*args).buffer_count as usize;
     if !check_buffer_count(count) {
-        drm_dbg(&mut (*i915).drm, "execbuf2 with %zd buffers\n", count);
+        drm_dbg!(&mut (*i915).drm, "execbuf2 with %zd buffers\n", count);
         return -EINVAL;
     }
     let mut err = i915_gem_check_execbuffer(i915, args);
@@ -2917,7 +3332,7 @@ pub unsafe fn i915_gem_execbuffer2_ioctl(
     let exec2_list = kvmalloc_array(count + 2, eb_element_size(), __GFP_NOWARN | GFP_KERNEL)
         as *mut DrmI915GemExecObject2;
     if exec2_list.is_null() {
-        drm_dbg(
+        drm_dbg!(
             &mut (*i915).drm,
             "Failed to allocate exec list for %zd buffers\n",
             count,
@@ -2930,7 +3345,7 @@ pub unsafe fn i915_gem_execbuffer2_ioctl(
         core::mem::size_of::<DrmI915GemExecObject2>() * count,
     ) != 0
     {
-        drm_dbg(&mut (*i915).drm, "copy %zd exec entries failed\n", count);
+        drm_dbg!(&mut (*i915).drm, "copy %zd exec entries failed\n", count);
         kvfree(exec2_list.cast());
         return -EFAULT;
     }

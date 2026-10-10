@@ -2471,13 +2471,13 @@ fn cmd_header_key(header: u32) -> u32 {
 }
 
 // The kernel hashtable helpers use hash_32() and hlist_add_head().
-fn hash_32(value: u32, bits: u32) -> usize {
+pub(crate) fn hash_32(value: u32, bits: u32) -> usize {
     value
         .wrapping_mul(HASH_GOLDEN_RATIO_32)
         .wrapping_shr(32 - bits) as usize
 }
 
-unsafe fn hlist_add_head(node: *mut HlistNode, head: *mut HlistHead) {
+pub(crate) unsafe fn hlist_add_head(node: *mut HlistNode, head: *mut HlistHead) {
     unsafe {
         let first = (*head).first;
         (*node).next = first;

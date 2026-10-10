@@ -116,22 +116,86 @@ LinuxKPI 的核心 MM/file/folio/DMA/IRQ API 采用原生实现，不翻译 GPL 
 MIT 下层依赖、完整 command parser 与 engine_pm 已补齐；其他文件仅补齐本阶段
 所需函数，详见 provenance。feature 保持默认关闭，以下运行时接线仍未推进。
 
+## GP 上游翻译覆盖率（2026-10-10）
+
+下表记录 PROMPT-GT-PREP 所列 MIT 文件的 source-order 覆盖与每个文件的函数数。upstream-gt 始终默认关闭。i915_irq.c 按任务范围只翻译 Gen11+/DG1 GT/顶层部分。
+
+### A. GT 初始化、中断与 uC
+
+| 上游文件 | 覆盖 |
+|---|---:|---|
+| gt/intel_gt.c | 42/42 |
+| gt/intel_gt_pm.c | 20/20 |
+| gt/intel_gt_irq.c | 21/21 |
+| gt/intel_gt_pm_irq.c | 8/8 |
+| gt/intel_gt_mcr.c | 21/21 |
+| gt/intel_gt_clock_utils.c | 16/16 |
+| gt/intel_gt_buffer_pool.c | 11/11 |
+| gt/intel_ggtt.c | 74/74 |
+| gt/intel_gtt.c | 33/33 |
+| gt/gen8_ppgtt.c | 30/30 |
+| gt/intel_ppgtt.c | 18/18 |
+| gt/intel_mocs.c | 15/15 |
+| gt/intel_sseu.c | 26/26 |
+| gt/intel_context_sseu.c | 3/3 |
+| gt/intel_tlb.c | 6/6 |
+| gt/intel_renderstate.c | 5/5 |
+| gt/shmem_utils.c | 8/8 |
+| gt/uc/intel_guc_hwconfig.c | 7/7 |
+| gt/uc/intel_uc.c | 36/36 |
+| gt/uc/intel_uc_fw.c | 38/38 |
+| gt/uc/intel_guc.c | 38/38 |
+| gt/uc/intel_guc_ct.c | 44/44 |
+| gt/uc/intel_guc_ads.c | 40/40 |
+| gt/uc/intel_huc.c | 29/29 |
+| gt/uc/intel_huc_fw.c | 6/6 |
+| gt/uc/intel_guc_capture.c | 49/49 |
+| gt/intel_wopcm.c | 10/10 |
+| gt/intel_gt_requests.c | 15/15 |
+| i915_irq.c | 13/55 selected |
+
+### B. GEM
+
+| 上游文件 | 覆盖 |
+|---|---:|---|
+| gem/i915_gem_create.c | 13/13 |
+| gem/i915_gem_wait.c | 12/12 |
+| gem/i915_gem_busy.c | 6/6 |
+| gem/i915_gem_internal.c | 5/5 |
+| gem/i915_gem_stolen.c | 44/44 |
+| gem/i915_gem_dmabuf.c | 12/12 actual C functions |
+| gem/i915_gem_pm.c | 9/9 |
+| gem/i915_gem_throttle.c | 1/1 |
+| gem/i915_gem_object_frontbuffer.c | 12/12 |
+| i915_gem_evict.c | 9/9 actual C functions |
+| i915_vma.c | 74/74 definitions |
+| i915_query.c | 16/16 |
+| i915_getparam.c | 1/1 |
+| gem/i915_gem_execbuffer.c | 90/90 |
+| i915_active.c | 67/67 |
+
+### C. 电源
+
+| 上游文件 | 覆盖 |
+|---|---:|---|
+| gt/intel_rc6.c | 30/30 |
+| gt/uc/intel_guc_rc.c | 7/7 |
+| gt/intel_rps.c | 134/134 |
+| gt/uc/intel_guc_slpc.c | 46/46 |
+| gt/intel_reset.c | 67/67 |
+
+### 未翻译或受限范围
+
+- i915_irq.c 其余 42/55 函数属旧代/display 管理；本任务要求 display 继续由 kernel/src/drm/intel/irq.rs 负责，GT 翻译通过 Gen11DisplayIrqHooks 交接。
+- i915_perf.c（OA 性能查询）是任务指定 optional-last 项，本轮未翻译。
+- intel_renderstate.c 的 Gen6–9 静态 renderstate tables 未搬；目标 Gen12 的 render_state_get_rodata() 返回 NULL。
+- 按任务明确排除：*debugfs*.c、*sysfs*.c、sysfs_engines.c、Gen6/7/8 之前路径、intel_ring_submission.c、intel_migrate.c/lmem/TTM、MTL 之后的 intel_gt_ccs_mode.c/intel_sa_media.c、GSC/PXP。
+
 ## 剩余工作
 
-本收尾阶段保留 `upstream-gt` 默认关闭，不推进以下运行时接线或功能；上游路径均相对于 Linux 7.2.3 `drivers/gpu/drm/i915/`。
+本次 source translations、feature cargo check、tk-intel-gt 全量测试、默认 crate check 与 lint 中的产品 release-link gate 均通过；这不是运行时接线或 N305 硬件验收。upstream-gt 必须继续默认关闭，接线由协调者携 N305 完成。
 
-- 去掉 `upstream-gt` feature gate：待全部下层接口具备；涉及本 crate 模块注册及下列上游实现。
-- 切换 GuC 提交路径：`gt/uc/intel_uc.c`、`gt/uc/intel_guc_submission.c`。
-- GEM execbuffer 完整接线：`gem/i915_gem_execbuffer.c`。
-- GEM mman / mmap offset / GTT 缺页接线：`gem/i915_gem_mman.c`、`i915_mm.c`。
-- GEM tiling 与 fence 接线：`gem/i915_gem_tiling.c`、`gt/intel_ggtt_fencing.c`。
-- GEM evict 接线：`gem/i915_gem_evict.c`。
-- GEM shrinker 接线：`gem/i915_gem_shrinker.c`。
-- GEM context 参数接线：`gem/i915_gem_context.c`。
-- RPS 接线：`gt/intel_rps.c`。
-- RC6 接线：`gt/intel_rc6.c`。
-- reset 接线：`gt/intel_reset.c`。
-- heartbeat 接线：`gt/intel_engine_heartbeat.c`。
-- query 用户态接口：`i915_query.c`。
-- getparam 用户态接口：`i915_getparam.c`。
-- 链接级缺口：`cargo check` 不检查链接，`upstream-gt` 仍有 3 个只声明未定义的外部符号：`intel_engine_add_retire`（`gt/intel_gt_requests.c`，MIT，待翻译）、`trace_dma_fence_signaled`（tracepoint，映射为空操作）、`intel_sseu_get_hsw_subslices`（`gt/intel_sseu.c`，MIT，待翻译）。去掉 feature gate 之前必须补齐。
+- 安装并验证唯一 kernel owner 的 upstream MMIO/forcewake、GGTT/VM、DMA retirement、IRQ/MSI/display callback、RuntimePmOps/GT IRQ power-domain、PCI identity/revision 与 firmware-ready interfaces；缺 provider 时保持 fail-closed。
+- 将完整 execbuffer/GEM/VMA/WW/syncobj/fence 服务接到 kernel DrmFile、真实用户地址空间与 GEM 对象 owner；不能以 host 模型或未安装的 LinuxKPI callback 宣称已运行。
+- 保护现有 display scanout/GGTT pins；GT reset、电源域及 display IRQ ACK 必须与 kernel display owner 协调。唯一 console scanout 尚未证明可恢复前，不扩大 reset/电源操作范围。
+- i915_perf.c 只在后续明确投入 OA 工作时补；本轮未做硬件实验、QEMU 或默认功能开关变更。

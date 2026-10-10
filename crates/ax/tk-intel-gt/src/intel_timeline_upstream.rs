@@ -84,7 +84,7 @@ unsafe extern "C" fn __timeline_active(active: *mut I915Active) -> i32 {
 
 // upstream: intel_timeline.h intel_timeline_get()
 #[inline]
-unsafe fn intel_timeline_get(timeline: *mut IntelTimeline) -> *mut IntelTimeline {
+pub(crate) unsafe fn intel_timeline_get(timeline: *mut IntelTimeline) -> *mut IntelTimeline {
     unsafe {
         crate::linux::memory::kref_get(core::ptr::addr_of_mut!((*timeline).kref));
         timeline
