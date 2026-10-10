@@ -34,6 +34,11 @@ class CargoDependencyLayersTests(unittest.TestCase):
     def test_metadata_required(self):
         self.assertEqual(self.check([package("queue", None)]), ["queue: missing or invalid package.metadata.thekernel.layer"])
 
+    def test_null_metadata_rejected_without_crashing(self):
+        p = package("queue", "mechanism")
+        p["metadata"] = None  # Cargo emits null when the manifest has no metadata.
+        self.assertEqual(self.check([p]), ["queue: missing or invalid package.metadata.thekernel.layer"])
+
     def test_uncontrolled_optional_dependency_rejected(self):
         p = package("queue", "mechanism", ["outside"])
         p["dependencies"][0]["optional"] = True

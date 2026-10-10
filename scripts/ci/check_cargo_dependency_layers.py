@@ -27,7 +27,7 @@ def violations(data: dict, root: Path) -> list[str]:
     names = {p["name"] for p in local.values()}
     libraries = {t["name"] for p in local.values() for t in p["targets"] if "lib" in t["kind"]}
     for identifier, package in local.items():
-        layer = package.get("metadata", {}).get("thekernel", {}).get("layer")
+        layer = (package.get("metadata") or {}).get("thekernel", {}).get("layer")
         if layer not in ALLOWED:
             errors.append(f'{package["name"]}: missing or invalid package.metadata.thekernel.layer')
         else:
