@@ -24,20 +24,6 @@ pub(super) fn begin_file_node_writeback_mutation(
     Ok(Some(guard))
 }
 
-pub(super) fn writeback_cached_page_data(
-    file: &FileNode,
-    pn: u32,
-    page: &mut PageCache,
-) -> VfsResult<usize> {
-    let native_mutation = begin_file_node_writeback_mutation(file)?;
-    writeback_cached_page_data_with_held_native_gate(
-        file,
-        pn,
-        page,
-        held_native_writeback_gate(&native_mutation),
-    )
-}
-
 /// Writes a staged dirty page.  A multi-inode reflink/dedupe transaction may
 /// already own this inode's fileattr gate in ObjectKey order; in that case the
 /// caller supplies the admission and this helper must not re-enter it.
@@ -141,6 +127,34 @@ pub(super) fn cached_dirty_page_numbers(shared: &CachedFileShared) -> Vec<u32> {
         .iter()
         .filter_map(|(pn, page)| page.is_dirty().then_some(*pn))
         .collect()
+}
+
+fn partition_dirty_page_numbers(
+    shared: &CachedFileShared,
+    candidates: &[u32],
+) -> VfsResult<(Vec<u32>, Vec<u32>)> {
+    let guard = shared.page_cache.lock();
+    let mut ready = Vec::new();
+    let mut busy = Vec::new();
+    ready
+        .try_reserve_exact(candidates.len())
+        .map_err(|_| VfsError::NoMemory)?;
+    busy.try_reserve_exact(candidates.len())
+        .map_err(|_| VfsError::NoMemory)?;
+    for pn in candidates {
+        let Some(page) = guard.peek(pn) else {
+            continue;
+        };
+        if !page.is_dirty() {
+            continue;
+        }
+        if page.is_writeback() {
+            busy.push(*pn);
+        } else {
+            ready.push(*pn);
+        }
+    }
+    Ok((ready, busy))
 }
 
 pub(super) fn copy_dirty_writeback_run(
@@ -554,186 +568,211 @@ pub(super) fn flush_dirty_page_list_locked_with_held_native_gate(
 ) -> Result<(), DirtyWritebackError> {
     let file_len = file.len()?;
     dirty_pages.sort_unstable();
+    let mut retry_scope = Vec::new();
+    retry_scope
+        .try_reserve_exact(dirty_pages.len())
+        .map_err(|_| DirtyWritebackError::from(VfsError::NoMemory))?;
+    retry_scope.extend_from_slice(&dirty_pages);
 
-    let mut start = 0;
-    while start < dirty_pages.len() {
-        let async_enabled = virtio_async_block_enabled();
-        let dirty_run_limit = if async_enabled
-            && async_dirty_flush_sg_enabled()
-            && virtio_async_block_wait_policy() == AsyncBlockWaitPolicy::InterruptFirst
-        {
-            IRQ_FIRST_DIRTY_WRITEBACK_PAGES
-        } else {
-            MAX_DIRTY_WRITEBACK_PAGES
-        };
-        let end_limit = (start + dirty_run_limit).min(dirty_pages.len());
-        let mut end = start + 1;
-        while end < end_limit && dirty_pages[end] == dirty_pages[end - 1] + 1 {
-            end += 1;
-        }
-
-        if async_enabled && async_dirty_flush_sg_enabled() {
-            let sg_begin = {
-                let mut guard = shared.page_cache.lock();
-                begin_sg_dirty_writeback_run(
-                    shared,
-                    &mut guard,
-                    &dirty_pages[start..end],
-                    file_len,
-                )?
+    loop {
+        let (ready, busy) = partition_dirty_page_numbers(shared, &retry_scope)?;
+        dirty_pages = ready;
+        let mut start = 0;
+        let mut saw_busy_page = !busy.is_empty();
+        while start < dirty_pages.len() {
+            let async_enabled = virtio_async_block_enabled();
+            let dirty_run_limit = if async_enabled
+                && async_dirty_flush_sg_enabled()
+                && virtio_async_block_wait_policy() == AsyncBlockWaitPolicy::InterruptFirst
+            {
+                IRQ_FIRST_DIRTY_WRITEBACK_PAGES
+            } else {
+                MAX_DIRTY_WRITEBACK_PAGES
             };
-            match sg_begin {
-                DirtySgWritebackBegin::Run(run) => {
-                    let slices = run
-                        .pages
-                        .iter()
-                        .map(|page| unsafe { core::slice::from_raw_parts(page.ptr, page.len) })
-                        .collect::<Vec<_>>();
-                    let mut accepted_async_submit = false;
-                    let write_result =
-                        match file.try_write_at_vectored_async(&slices, run.page_start) {
-                            Ok(AsyncVectoredWriteOutcome::Completed(written)) => {
-                                accepted_async_submit = true;
-                                Ok(written)
+            let end_limit = (start + dirty_run_limit).min(dirty_pages.len());
+            let mut end = start + 1;
+            while end < end_limit && dirty_pages[end] == dirty_pages[end - 1] + 1 {
+                end += 1;
+            }
+
+            if async_enabled && async_dirty_flush_sg_enabled() {
+                let sg_begin = {
+                    let mut guard = shared.page_cache.lock();
+                    begin_sg_dirty_writeback_run(
+                        shared,
+                        &mut guard,
+                        &dirty_pages[start..end],
+                        file_len,
+                    )?
+                };
+                match sg_begin {
+                    DirtySgWritebackBegin::Run(run) => {
+                        let slices = run
+                            .pages
+                            .iter()
+                            .map(|page| unsafe { core::slice::from_raw_parts(page.ptr, page.len) })
+                            .collect::<Vec<_>>();
+                        let mut accepted_async_submit = false;
+                        let write_result =
+                            match file.try_write_at_vectored_async(&slices, run.page_start) {
+                                Ok(AsyncVectoredWriteOutcome::Completed(written)) => {
+                                    accepted_async_submit = true;
+                                    Ok(written)
+                                }
+                                Ok(AsyncVectoredWriteOutcome::CompletionError(error)) => {
+                                    accepted_async_submit = true;
+                                    Err(error)
+                                }
+                                Ok(AsyncVectoredWriteOutcome::NotSubmitted) => {
+                                    file.write_at_vectored(&slices, run.page_start)
+                                }
+                                Err(error) => Err(error),
+                            };
+                        if let Ok(written) = write_result.as_ref() {
+                            crate::account_backing_write(*written);
+                        }
+                        match write_result {
+                            Ok(written) if written == run.bytes => {
+                                record_dirty_writeback(
+                                    range_flush,
+                                    run.pages.len(),
+                                    run.bytes,
+                                    true,
+                                );
+                                record_async_dirty_flush_sg(run.pages.len());
+                                if accepted_async_submit {
+                                    record_async_dirty_flush_sg_async_submit(run.pages.len());
+                                }
+                                finish_sg_dirty_writeback_run(shared, &run, true);
                             }
-                            Ok(AsyncVectoredWriteOutcome::CompletionError(error)) => {
-                                accepted_async_submit = true;
-                                Err(error)
+                            Ok(_) => {
+                                record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
+                                if accepted_async_submit {
+                                    publish_async_dirty_writeback_completion_error(
+                                        file,
+                                        VfsError::Io,
+                                    );
+                                }
+                                finish_sg_dirty_writeback_run(shared, &run, false);
+                                return Err(DirtyWritebackError {
+                                    error: VfsError::Io,
+                                    errseq_published: accepted_async_submit,
+                                    worker_must_publish: false,
+                                });
                             }
-                            Ok(AsyncVectoredWriteOutcome::NotSubmitted) => {
-                                file.write_at_vectored(&slices, run.page_start)
+                            Err(err) => {
+                                record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
+                                if accepted_async_submit {
+                                    publish_async_dirty_writeback_completion_error(file, err);
+                                }
+                                finish_sg_dirty_writeback_run(shared, &run, false);
+                                return Err(DirtyWritebackError {
+                                    error: err,
+                                    errseq_published: accepted_async_submit,
+                                    worker_must_publish: false,
+                                });
                             }
-                            Err(error) => Err(error),
-                        };
-                    if let Ok(written) = write_result.as_ref() {
-                        crate::account_backing_write(*written);
+                        }
+                        start = end;
+                        continue;
                     }
-                    match write_result {
-                        Ok(written) if written == run.bytes => {
-                            record_dirty_writeback(range_flush, run.pages.len(), run.bytes, true);
-                            record_async_dirty_flush_sg(run.pages.len());
-                            if accepted_async_submit {
-                                record_async_dirty_flush_sg_async_submit(run.pages.len());
-                            }
-                            finish_sg_dirty_writeback_run(shared, &run, true);
-                        }
-                        Ok(_) => {
-                            record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
-                            if accepted_async_submit {
-                                publish_async_dirty_writeback_completion_error(file, VfsError::Io);
-                            }
-                            finish_sg_dirty_writeback_run(shared, &run, false);
-                            return Err(DirtyWritebackError {
-                                error: VfsError::Io,
-                                errseq_published: accepted_async_submit,
-                                worker_must_publish: false,
-                            });
-                        }
-                        Err(err) => {
-                            record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
-                            if accepted_async_submit {
-                                publish_async_dirty_writeback_completion_error(file, err);
-                            }
-                            finish_sg_dirty_writeback_run(shared, &run, false);
-                            return Err(DirtyWritebackError {
-                                error: err,
-                                errseq_published: accepted_async_submit,
-                                worker_must_publish: false,
-                            });
-                        }
+                    DirtySgWritebackBegin::Empty => {
+                        start = end;
+                        continue;
                     }
+                    DirtySgWritebackBegin::Busy => {
+                        record_async_dirty_flush_writeback_restart();
+                        saw_busy_page = true;
+                        start = end;
+                        continue;
+                    }
+                    DirtySgWritebackBegin::Fallback => {
+                        record_async_dirty_flush_bounce_fallback();
+                    }
+                }
+            }
+
+            let copy = {
+                let mut guard = shared.page_cache.lock();
+                copy_dirty_writeback_run(shared, &mut guard, &dirty_pages[start..end], file_len)
+            }?;
+            let run = match copy {
+                DirtyWritebackCopy::Run(run) => run,
+                DirtyWritebackCopy::Empty => {
                     start = end;
                     continue;
                 }
-                DirtySgWritebackBegin::Empty => {
-                    start = end;
-                    continue;
-                }
-                DirtySgWritebackBegin::Busy => {
+                DirtyWritebackCopy::Busy => {
                     record_async_dirty_flush_writeback_restart();
-                    wait_for_dirty_pages_writeback_clear(shared, &dirty_pages[start..end]);
-                    dirty_pages = cached_dirty_page_numbers(shared);
+                    saw_busy_page = true;
+                    start = end;
+                    continue;
+                }
+                DirtyWritebackCopy::Stale => {
+                    let (ready, busy) = partition_dirty_page_numbers(shared, &retry_scope)?;
+                    dirty_pages = ready;
+                    saw_busy_page |= !busy.is_empty();
                     start = 0;
                     continue;
                 }
-                DirtySgWritebackBegin::Fallback => {
-                    record_async_dirty_flush_bounce_fallback();
+            };
+
+            if let Err(error) = begin_dirty_writeback_run(shared, &run) {
+                if error == VfsError::ResourceBusy {
+                    record_async_dirty_flush_writeback_restart();
+                    saw_busy_page = true;
+                    start = end;
+                    continue;
                 }
-            }
-        }
-
-        let copy = {
-            let mut guard = shared.page_cache.lock();
-            copy_dirty_writeback_run(shared, &mut guard, &dirty_pages[start..end], file_len)
-        }?;
-        let run = match copy {
-            DirtyWritebackCopy::Run(run) => run,
-            DirtyWritebackCopy::Empty => {
-                start = end;
-                continue;
-            }
-            DirtyWritebackCopy::Busy => {
-                record_async_dirty_flush_writeback_restart();
-                wait_for_dirty_pages_writeback_clear(shared, &dirty_pages[start..end]);
-                dirty_pages = cached_dirty_page_numbers(shared);
-                start = 0;
-                continue;
-            }
-            DirtyWritebackCopy::Stale => {
-                dirty_pages = cached_dirty_page_numbers(shared);
-                start = 0;
-                continue;
-            }
-        };
-
-        if let Err(error) = begin_dirty_writeback_run(shared, &run) {
-            if error == VfsError::ResourceBusy {
-                record_async_dirty_flush_writeback_restart();
-                wait_for_dirty_pages_writeback_clear(shared, &dirty_pages[start..end]);
-                dirty_pages = cached_dirty_page_numbers(shared);
-                start = 0;
-                continue;
-            }
-            return Err(error.into());
-        }
-
-        let aliases = match prepare_dirty_writeback_aliases(shared, &run) {
-            Ok(aliases) => aliases,
-            Err(error) => {
-                finish_dirty_writeback_run(shared, &run, false);
                 return Err(error.into());
             }
-        };
-        let segments = build_dirty_writeback_segments(&run);
-        let slices = segments.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let write_result = file.write_at_vectored(&slices, run.page_start);
-        if let Ok(written) = write_result.as_ref() {
-            crate::account_backing_write(*written);
-        }
-        match write_result {
-            Ok(written) if written == run.bytes => {
-                record_dirty_writeback(range_flush, run.pages.len(), run.bytes, async_enabled);
-                finish_dirty_writeback_run(shared, &run, true);
-                // The next mapped write must fault and dirty the page again,
-                // including when it occurs after this fsync has returned.
-                aliases.commit();
-            }
-            Ok(_) => {
-                finish_dirty_writeback_run(shared, &run, false);
-                if async_enabled {
-                    record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
+
+            let aliases = match prepare_dirty_writeback_aliases(shared, &run) {
+                Ok(aliases) => aliases,
+                Err(error) => {
+                    finish_dirty_writeback_run(shared, &run, false);
+                    return Err(error.into());
                 }
-                return Err(DirtyWritebackError::completion(VfsError::Io, false));
+            };
+            let segments = build_dirty_writeback_segments(&run);
+            let slices = segments.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let write_result = file.write_at_vectored(&slices, run.page_start);
+            if let Ok(written) = write_result.as_ref() {
+                crate::account_backing_write(*written);
             }
-            Err(err) => {
-                finish_dirty_writeback_run(shared, &run, false);
-                if async_enabled {
-                    record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
+            match write_result {
+                Ok(written) if written == run.bytes => {
+                    record_dirty_writeback(range_flush, run.pages.len(), run.bytes, async_enabled);
+                    finish_dirty_writeback_run(shared, &run, true);
+                    // The next mapped write must fault and dirty the page again,
+                    // including when it occurs after this fsync has returned.
+                    aliases.commit();
                 }
-                return Err(DirtyWritebackError::completion(err, false));
+                Ok(_) => {
+                    finish_dirty_writeback_run(shared, &run, false);
+                    if async_enabled {
+                        record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
+                    }
+                    return Err(DirtyWritebackError::completion(VfsError::Io, false));
+                }
+                Err(err) => {
+                    finish_dirty_writeback_run(shared, &run, false);
+                    if async_enabled {
+                        record_cached_file_counter(&ASYNC_DIRTY_FLUSH_ERRORS, 1);
+                    }
+                    return Err(DirtyWritebackError::completion(err, false));
+                }
             }
+            start = end;
         }
-        start = end;
+        if !saw_busy_page {
+            break;
+        }
+        // A busy run does not stop unrelated dirty runs from making forward
+        // progress. Once those are submitted, wait only for the original
+        // selection, then retry any pages that remain dirty (including pages
+        // redirtied while their previous writeback was in flight).
+        wait_for_dirty_pages_writeback_clear(shared, &retry_scope);
     }
     release_cached_file_writeback_anchor_if_clean(shared);
     Ok(())

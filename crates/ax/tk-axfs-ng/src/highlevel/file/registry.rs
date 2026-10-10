@@ -393,25 +393,6 @@ impl FileCacheShadowStore {
         Ok(())
     }
 
-    pub(super) fn ensure_unreserved_slot(
-        &mut self,
-    ) -> Result<bool, alloc::collections::TryReserveError> {
-        // Outstanding pageout credits own the corresponding logical slots as
-        // well as their physical Vec capacity.  A best-effort eviction may
-        // not displace a retained shadow merely to borrow one of those slots.
-        let committed = self.entries.len().saturating_add(self.reservations);
-        if committed >= self.cap.get() {
-            return Ok(false);
-        }
-        let required = committed.saturating_add(1);
-        if required > self.entries.capacity() {
-            // `try_reserve_exact` is relative to len, not current capacity.
-            self.entries
-                .try_reserve_exact(required.saturating_sub(self.entries.len()))?;
-        }
-        Ok(true)
-    }
-
     /// Reserve the storage for one new publication.  A full cache reuses its
     /// LRU entry, while a non-full cache reserves the exact forthcoming vec
     /// slot now.  Therefore `publish_reserved` cannot allocate.
@@ -553,30 +534,6 @@ pub(super) fn file_cache_shadow_is_recent(
     age.wrapping_sub(evicted_at) <= recent_threshold
 }
 
-pub(super) fn record_file_cache_shadow(shared: &CachedFileShared, page: u32) {
-    let mut shadows = file_cache_shadows().lock();
-    if shadows.set_budget(file_cache_shadow_budget()).is_err() {
-        return;
-    }
-    // Ordinary eviction is best effort, but never relies on an infallible
-    // allocator in the way a detached pageout transaction must not.
-    if !matches!(shadows.ensure_unreserved_slot(), Ok(true)) {
-        return;
-    }
-    // Allocate age and publish the LRU entry under the same domain lock.  On
-    // wrap, old ages cannot be compared safely, so expire the domain and
-    // restart its generation instead of manufacturing recent refaults.
-    advance_file_cache_nonresident_age_locked(&mut shadows);
-    let age = current_file_cache_nonresident_age();
-    shadows.put_prepared(
-        CachedFileShadowKey {
-            identity: shared.registry_key,
-            page,
-        },
-        age,
-    );
-}
-
 /// Reserve the global shadow-store entry before a page is detached.  The
 /// returned credit is consumed by commit or released by transaction rollback.
 pub(super) fn prepare_file_cache_shadow_publication(
@@ -601,19 +558,6 @@ pub(super) fn consume_file_cache_shadow(shared: &CachedFileShared, page: u32) ->
         identity: shared.registry_key,
         page,
     })
-}
-
-pub(super) fn clear_file_cache_shadows<I>(shared: &CachedFileShared, pages: I)
-where
-    I: IntoIterator<Item = u32>,
-{
-    let mut shadows = file_cache_shadows().lock();
-    for page in pages {
-        shadows.pop(&CachedFileShadowKey {
-            identity: shared.registry_key,
-            page,
-        });
-    }
 }
 
 pub(super) fn clear_file_cache_shadow_domain(

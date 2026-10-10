@@ -83,9 +83,6 @@ impl CachedFile {
         self.shared.cachestat(first_page, last_page)
     }
 
-    pub(super) fn record_eviction(&self, page_no: u32) {
-        record_file_cache_shadow(&self.shared, page_no);
-    }
     /// Returns an existing cached file for `location`, or creates a new one.
     pub fn get_or_create(location: Location) -> Self {
         let in_memory = cached_file_is_in_memory(&location);
@@ -517,40 +514,6 @@ impl CachedFile {
         let mut guard = self.shared.evict_listeners.lock();
         let mut cursor = unsafe { guard.cursor_mut_from_ptr(handle as *const EvictListener) };
         cursor.remove();
-    }
-
-    pub(super) fn evict_cache(
-        &self,
-        file: &FileNode,
-        listeners: &[EvictListenerSnapshot],
-        pn: u32,
-        page: &mut PageCache,
-    ) -> VfsResult<()> {
-        if page.is_pinned() {
-            return Err(VfsError::ResourceBusy);
-        }
-        let mut reservations = CachedPageEvictionReservations::reserve(listeners.len())?;
-        reservations.prepare(
-            listeners,
-            CachedPageEviction {
-                identity: self.identity(),
-                page_number: pn,
-                paddr: page.paddr(),
-                writeback_only: false,
-            },
-        )?;
-        let _ = writeback_cached_page_data(file, pn, page)?;
-        reservations.commit();
-        page.clear_dirty();
-        // Retiring an untouched readahead page is not a workingset eviction:
-        // it has never been consumed by the caller.  In particular, do not
-        // let an older shadow survive this explicit retirement.
-        if page.is_unused_prefetched() {
-            clear_file_cache_shadows(&self.shared, [pn]);
-        } else {
-            self.record_eviction(pn);
-        }
-        Ok(())
     }
 
     pub(super) fn drain_cache(&self, file: &FileNode) -> VfsResult<()> {

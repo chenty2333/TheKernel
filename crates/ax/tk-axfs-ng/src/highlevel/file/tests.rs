@@ -12,6 +12,7 @@ use core::{
 use std::{
     sync::{Barrier, Mutex as StdMutex, Once as StdOnce, mpsc},
     thread,
+    time::Instant,
 };
 
 use axfs_ng_vfs::{
@@ -26,7 +27,7 @@ use lru::LruCache;
 
 use super::{
     ALIGNED_BYPASS_CHUNK, CLOSED_FILE_CACHE_RETAINED_PAGES, CachedFile, CachedFileEvictionOwner,
-    CachedFileReclaimStats, CachedFileShared, CachedPageEviction, CachedPageEvictionReservation,
+    CachedFileReclaimStats, CachedFileShared, CachedPageEvictionReservation,
     CachedPageInvalidationTransaction, FADVISE_NOREUSE, FADVISE_RANDOM,
     FADVISE_READAHEAD_QUEUE_CAPACITY, FADVISE_SEQUENTIAL, FadviseReadaheadQueue,
     FadviseReadaheadRequest, File, FileBackend, FileFlags, FileUserData,
@@ -234,6 +235,86 @@ fn range_cache_leases_enforce_overlap_modes_and_allow_disjoint_direct_io() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn pending_page_fills_coalesce_overlaps_and_retire_cancelled_owners() {
+    let shared = CachedFileShared::new(
+        super::CachedFileIdentity {
+            device: 1,
+            inode: 2,
+            object: 30,
+        },
+        false,
+    );
+    let super::PendingPageFillAdmission::Load(owner) =
+        shared.pending_page_fills.admit(&shared, 4, 4).unwrap()
+    else {
+        panic!("first fill did not acquire ownership");
+    };
+    let super::PendingPageFillAdmission::Wait(waiter) =
+        shared.pending_page_fills.admit(&shared, 6, 4).unwrap()
+    else {
+        panic!("overlapping fill did not join its owner");
+    };
+    assert_eq!(owner.range(), 4..8);
+
+    let super::PendingPageFillAdmission::Load(prefix) =
+        shared.pending_page_fills.admit(&shared, 2, 4).unwrap()
+    else {
+        panic!("non-overlapping prefix should have an owner");
+    };
+    assert_eq!(prefix.range(), 2..4);
+    assert_eq!(owner.finish(Err(VfsError::Io)), Err(VfsError::Io));
+    assert_eq!(waiter.wait(), Err(VfsError::Io));
+    drop(prefix);
+    assert_eq!(shared.pending_page_fills.len(), 0);
+
+    let super::PendingPageFillAdmission::Load(cancelled) =
+        shared.pending_page_fills.admit(&shared, 4, 1).unwrap()
+    else {
+        panic!("retired fill range was not reusable");
+    };
+    let super::PendingPageFillAdmission::Wait(waiter) =
+        shared.pending_page_fills.admit(&shared, 4, 1).unwrap()
+    else {
+        panic!("second demand did not wait for its owner");
+    };
+    drop(cancelled);
+    assert_eq!(waiter.wait(), Err(VfsError::Interrupted));
+}
+
+#[test]
+fn pending_page_fill_capacity_is_released_by_any_finished_owner() {
+    let shared = CachedFileShared::new(
+        super::CachedFileIdentity {
+            device: 1,
+            inode: 2,
+            object: 31,
+        },
+        false,
+    );
+    let mut owners = Vec::new();
+    for page in 0..16 {
+        let super::PendingPageFillAdmission::Load(owner) =
+            shared.pending_page_fills.admit(&shared, page, 1).unwrap()
+        else {
+            panic!("independent fill did not reserve an owner");
+        };
+        owners.push(owner);
+    }
+    assert!(matches!(
+        shared.pending_page_fills.admit(&shared, 100, 1),
+        Ok(super::PendingPageFillAdmission::Capacity)
+    ));
+    let capacity_epoch = shared.pending_page_fills.capacity_epoch();
+    owners.remove(7).finish(Ok(())).unwrap();
+    assert_eq!(
+        shared.pending_page_fills.wait_for_capacity(capacity_epoch),
+        Ok(())
+    );
+    drop(owners);
+    assert_eq!(shared.pending_page_fills.len(), 0);
 }
 
 #[test]
@@ -493,6 +574,7 @@ struct AppendTestState {
     set_len_failure_atomic: AtomicBool,
     full_page_io: AtomicBool,
     stored_first_byte: AtomicU8,
+    before_read: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     append_markers: StdMutex<Vec<u8>>,
     user_data: NodeUserData,
 }
@@ -522,6 +604,7 @@ impl AppendTestState {
             set_len_failure_atomic: AtomicBool::new(true),
             full_page_io: AtomicBool::new(false),
             stored_first_byte: AtomicU8::new(0),
+            before_read: StdMutex::new(None),
             append_markers: StdMutex::new(Vec::new()),
             user_data: NodeUserData::new(),
         })
@@ -606,6 +689,9 @@ impl Pollable for AppendTestFile {
 
 impl FileNodeOps for AppendTestFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        if let Some(hook) = self.state.before_read.lock().unwrap().take() {
+            hook();
+        }
         self.state
             .last_read_buf
             .store(buf.as_ptr() as usize, Ordering::Release);
@@ -913,8 +999,7 @@ fn buffered_cache_reclaim_calls_listeners_without_the_page_cache_lock() {
 fn seed_cached_page(cached: &CachedFile, pn: u32, byte: u8, dirty: bool) -> axhal::mem::PhysAddr {
     let mut paddr = None;
     cached
-        .with_page_or_insert(pn, |page, evicted| {
-            assert!(evicted.is_none());
+        .with_page_or_insert(pn, |page| {
             page.data().fill(byte);
             if dirty {
                 page.mark_dirty();
@@ -1297,12 +1382,7 @@ fn cachestat_zero_resident_window_only_marks_same_age_shadow_recent() {
 #[test]
 fn cachestat_active_window_excludes_single_touch_cache_pages() {
     let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
-    cached
-        .with_page_or_insert(0, |_, evicted| {
-            assert!(evicted.is_none());
-            Ok(())
-        })
-        .unwrap();
+    cached.with_page_or_insert(0, |_| Ok(())).unwrap();
     {
         let mut cache = cached.shared.page_cache.lock();
         let page = cache.get(&0).unwrap();
@@ -1937,6 +2017,73 @@ fn transactional_sync_read_never_calls_async_lower_hook() {
     assert!(output.iter().all(|byte| *byte == 0));
 }
 
+#[test]
+fn range_writeback_skips_busy_runs_until_other_dirty_runs_progress() {
+    let (cached, _location, state) = cached_append_test_file(3 * PAGE_SIZE as u64);
+    state.full_page_io.store(true, Ordering::Release);
+    seed_cached_page(&cached, 0, 0x31, true);
+    seed_cached_page(&cached, 2, 0x32, true);
+    cached
+        .shared
+        .page_cache
+        .lock()
+        .get_mut(&0)
+        .unwrap()
+        .begin_writeback()
+        .unwrap();
+
+    let writer = cached.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let operation = thread::spawn(move || {
+        done_tx
+            .send(writer.sync_range(0, 3 * PAGE_SIZE as u64, false))
+            .unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !state
+        .write_offsets
+        .lock()
+        .iter()
+        .any(|offset| *offset == 2 * PAGE_SIZE as u64)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "busy page blocked later dirty run"
+        );
+        thread::yield_now();
+    }
+    assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+    cached
+        .shared
+        .page_cache
+        .lock()
+        .get_mut(&0)
+        .unwrap()
+        .end_writeback();
+    assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)), Ok(Ok(())));
+    operation.join().unwrap();
+    assert_eq!(state.write_calls.load(Ordering::Acquire), 2);
+    assert!(!cached.shared.page_cache.lock().get(&0).unwrap().is_dirty());
+    assert!(!cached.shared.page_cache.lock().get(&2).unwrap().is_dirty());
+}
+
+#[test]
+fn cache_miss_backing_read_runs_without_page_cache_lock() {
+    let (cached, _location, state) = cached_append_test_file(PAGE_SIZE as u64);
+    state.full_page_io.store(true, Ordering::Release);
+    let shared = Arc::downgrade(&cached.shared);
+    *state.before_read.lock().unwrap() = Some(Box::new(move || {
+        let shared = shared.upgrade().expect("cache handle remains live");
+        assert!(shared.page_cache.try_lock().is_some());
+    }));
+
+    let mut byte = [0];
+    assert_eq!(cached.read_at_sync(&mut &mut byte[..], 0), Ok(1));
+    assert_eq!(state.read_calls.load(Ordering::Acquire), 1);
+    assert!(cached.is_page_cached(0));
+}
+
 #[cfg(feature = "ext4")]
 #[test]
 fn pinned_fallback_policy_never_calls_async_lower_hook() {
@@ -2100,7 +2247,7 @@ fn concurrent_buffered_cache_users_share_admission() {
 
     let first_cached = cached.clone();
     let first = thread::spawn(move || {
-        first_cached.with_page_or_insert(0, |_, _| {
+        first_cached.with_page_or_insert(0, |_| {
             holding_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             Ok(())
@@ -2112,7 +2259,7 @@ fn concurrent_buffered_cache_users_share_admission() {
     let second_cached = cached.clone();
     let second = thread::spawn(move || {
         started_tx.send(()).unwrap();
-        second_cached.with_page_or_insert(0, |_, _| Ok(()))
+        second_cached.with_page_or_insert(0, |_| Ok(()))
     });
     started_rx.recv().unwrap();
 

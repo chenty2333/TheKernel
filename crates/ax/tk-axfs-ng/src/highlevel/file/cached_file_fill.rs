@@ -486,102 +486,27 @@ impl CachedFile {
         Ok(Some(written))
     }
 
-    pub(super) fn ensure_page_cached(
+    /// Allocates, reads, and initializes one cache window without holding the
+    /// page-cache index. Publication is a separate short critical section so
+    /// readers cannot observe a partially filled page.
+    fn prepare_page_window(
         &self,
         file: &FileNode,
-        cache: &mut LruCache<u32, PageCache>,
-        pn: u32,
-    ) -> VfsResult<Option<EvictedPage>> {
-        self.ensure_page_cached_with(file, cache, pn, true, true, true)
-    }
-
-    pub(super) fn ensure_page_cached_with(
-        &self,
-        file: &FileNode,
-        cache: &mut LruCache<u32, PageCache>,
-        pn: u32,
-        load_from_file: bool,
+        range: Range<u64>,
         allow_async_page_fill: bool,
-        readahead: bool,
-    ) -> VfsResult<Option<EvictedPage>> {
-        self.ensure_page_cached_with_window(
-            file,
-            cache,
-            pn,
-            load_from_file,
-            allow_async_page_fill,
-            if readahead { READAHEAD_PAGES } else { 1 },
-        )
-    }
-
-    pub(super) fn ensure_page_cached_with_window(
-        &self,
-        file: &FileNode,
-        cache: &mut LruCache<u32, PageCache>,
-        pn: u32,
-        load_from_file: bool,
-        allow_async_page_fill: bool,
-        readahead_pages: usize,
-    ) -> VfsResult<Option<EvictedPage>> {
-        if let Some(page) = cache.get_mut(&pn) {
-            if load_from_file && page.clear_prefetched() {
-                record_readahead_hit();
-            } else if !load_from_file {
-                page.clear_prefetched();
-            }
-            file_cache_record_page_reference(page);
-            return Ok(None);
-        }
-        let readahead_enabled = load_from_file && readahead_pages > 1 && cached_readahead_enabled();
-        if readahead_enabled {
-            record_readahead_miss();
-        }
-        let cap = cache.cap().get();
-        let mut evicted = None;
-        // Make room for the requested page. The caller may receive this
-        // EvictedPage; any further evictions done for readahead below are
-        // written back and dropped.
-        if cache.len() >= cap {
-            let listeners = evict_listeners_snapshot(&self.shared)?;
-            if let Some((epn, mut epage)) = pop_unused_readahead_lru_page(cache) {
-                if let Err(error) = self.evict_cache(file, &listeners, epn, &mut epage) {
-                    restore_popped_cache_page(cache, epn, epage);
-                    return Err(error);
-                }
-            } else if let Some((epn, mut epage)) = pop_unpinned_lru_page(cache)? {
-                if let Err(error) = self.evict_cache(file, &listeners, epn, &mut epage) {
-                    restore_popped_cache_page(cache, epn, epage);
-                    return Err(error);
-                }
-                evicted = Some(EvictedPage { pn: epn });
-            }
-        }
-
-        if !load_from_file {
+    ) -> VfsResult<Vec<(u32, PageCache)>> {
+        let count = usize::try_from(range.end - range.start).map_err(|_| VfsError::InvalidInput)?;
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(count)
+            .map_err(|_| VfsError::NoMemory)?;
+        for _ in 0..count {
             let mut page = PageCache::new(self.shared.in_memory)?;
             page.data().fill(0);
-            page.record_reference();
-            file_cache_apply_refault(&self.shared, pn, &mut page);
-            cache.put(pn, page);
-            file_cache_resident_add(1);
-            record_cached_file_counter(&WRITE_NO_READ_INSERT_PAGES, 1);
-            record_cached_file_counter(&WRITE_NO_READ_INSERT_BYTES, PAGE_SIZE as u64);
-            return Ok(evicted);
+            pages.push(page);
         }
 
-        // Readahead: allocate private page-cache pages, read into those pages
-        // while they are still unpublished, then insert only completed data.
-        // This keeps readers from observing partial page-fill state.
-        let avail = cap.saturating_sub(cache.len());
-        let ra = if readahead_enabled {
-            readahead_pages
-                .min(MMAP_SEQUENTIAL_READAHEAD_PAGES)
-                .min(avail)
-                .max(1)
-        } else {
-            1
-        };
-        let base = pn as u64 * PAGE_SIZE as u64;
+        let offset = range.start * PAGE_SIZE as u64;
         let async_page_fill = allow_async_page_fill && {
             #[cfg(feature = "ext4")]
             {
@@ -592,152 +517,166 @@ impl CachedFile {
                 false
             }
         };
-        if !async_page_fill {
-            let bytes = ra.checked_mul(PAGE_SIZE).ok_or(VfsError::NoMemory)?;
-            let mut buf = Vec::new();
-            buf.try_reserve_exact(bytes)
-                .map_err(|_| VfsError::NoMemory)?;
-            buf.resize(bytes, 0);
-            let read = file.read_at(&mut buf, base)?;
-            if !self.shared.in_memory {
-                crate::account_backing_read(read);
-            }
-
-            let mut page = PageCache::new(self.shared.in_memory)?;
-            let data = page.data();
-            data.fill(0);
-            let n0 = read.min(PAGE_SIZE);
-            data[..n0].copy_from_slice(&buf[..n0]);
-            page.record_reference();
-            file_cache_apply_refault(&self.shared, pn, &mut page);
-            cache.put(pn, page);
-            file_cache_resident_add(1);
-
-            let mut loaded_readahead_pages = 0usize;
-            for i in 1..ra {
-                let off = i * PAGE_SIZE;
-                if off >= read {
-                    break;
-                }
-                let Some(next_pn) =
-                    pn.checked_add(u32::try_from(i).expect("readahead window fits u32"))
-                else {
-                    break;
-                };
-                if cache.contains(&next_pn) {
-                    continue;
-                }
-                if cache.len() >= cap {
-                    let listeners = evict_listeners_snapshot(&self.shared)?;
-                    if let Some((epn, mut epage)) = pop_unused_readahead_lru_page(cache) {
-                        if let Err(error) = self.evict_cache(file, &listeners, epn, &mut epage) {
-                            restore_popped_cache_page(cache, epn, epage);
-                            return Err(error);
-                        }
-                    } else if let Some((epn, mut epage)) = pop_unpinned_lru_page(cache)? {
-                        if let Err(error) = self.evict_cache(file, &listeners, epn, &mut epage) {
-                            restore_popped_cache_page(cache, epn, epage);
-                            return Err(error);
-                        }
-                    }
-                }
-                let mut np = PageCache::new(self.shared.in_memory)?;
-                let nd = np.data();
-                nd.fill(0);
-                let chunk_end = (off + PAGE_SIZE).min(read);
-                nd[..chunk_end - off].copy_from_slice(&buf[off..chunk_end]);
-                np.mark_prefetched();
-                file_cache_apply_refault(&self.shared, next_pn, &mut np);
-                cache.put(next_pn, np);
-                file_cache_resident_add(1);
-                cache.demote(&next_pn);
-                loaded_readahead_pages += 1;
-            }
-            if readahead_enabled {
-                record_readahead_window(loaded_readahead_pages);
-            }
-
-            return Ok(evicted);
-        }
-
-        let mut pages = Vec::new();
-        pages
-            .try_reserve_exact(ra)
-            .map_err(|_| VfsError::NoMemory)?;
-        for _ in 0..ra {
-            let mut page = PageCache::new(self.shared.in_memory)?;
-            page.data().fill(0);
-            pages.push(page);
-        }
         let read = {
-            let mut bufs = pages.iter_mut().map(|page| page.data()).collect::<Vec<_>>();
-            match file.try_read_at_vectored_async(&mut bufs, base)? {
-                Some(read) => read,
-                None => file.read_at_vectored(&mut bufs, base)?,
+            let mut bufs = Vec::new();
+            bufs.try_reserve_exact(count)
+                .map_err(|_| VfsError::NoMemory)?;
+            bufs.extend(pages.iter_mut().map(PageCache::data));
+            if async_page_fill {
+                match file.try_read_at_vectored_async(&mut bufs, offset)? {
+                    Some(read) => read,
+                    None => file.read_at_vectored(&mut bufs, offset)?,
+                }
+            } else {
+                file.read_at_vectored(&mut bufs, offset)?
             }
         };
+        let bytes = count.checked_mul(PAGE_SIZE).ok_or(VfsError::InvalidInput)?;
+        if read > bytes {
+            return Err(VfsError::Io);
+        }
         if !self.shared.in_memory {
             crate::account_backing_read(read);
         }
 
-        #[cfg(feature = "ext4")]
-        let mut async_filled_pages = 0usize;
-        let mut loaded_readahead_pages = 0usize;
-        for (i, page) in pages.into_iter().enumerate() {
-            let off = i * PAGE_SIZE;
-            if i > 0 && off >= read {
-                break; // reached EOF
-            }
-            let Some(target_pn) =
-                pn.checked_add(u32::try_from(i).expect("readahead window fits u32"))
-            else {
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(count)
+            .map_err(|_| VfsError::NoMemory)?;
+        for (index, page) in pages.into_iter().enumerate() {
+            let byte_offset = index * PAGE_SIZE;
+            if index != 0 && byte_offset >= read {
                 break;
-            };
-            if i > 0 && cache.contains(&target_pn) {
+            }
+            let number = range
+                .start
+                .checked_add(index as u64)
+                .and_then(|number| u32::try_from(number).ok())
+                .ok_or(VfsError::InvalidInput)?;
+            prepared.push((number, page));
+        }
+        #[cfg(feature = "ext4")]
+        if async_page_fill {
+            lwext4_rust::record_readahead_async_pages(read.div_ceil(PAGE_SIZE).min(prepared.len()));
+        }
+        Ok(prepared)
+    }
+
+    fn publish_page_window(
+        &self,
+        cache: &mut LruCache<u32, PageCache>,
+        mut pages: Vec<(u32, PageCache)>,
+        demand: u32,
+        readahead_enabled: bool,
+    ) -> VfsResult<usize> {
+        // Publish the demand page first. Readahead is best effort and must not
+        // consume the last available cache slot ahead of the requested page.
+        if let Some(index) = pages.iter().position(|(number, _)| *number == demand) {
+            let page = pages.remove(index);
+            pages.insert(0, page);
+        }
+        let mut loaded_readahead_pages = 0usize;
+        let mut demand_inserted = false;
+        for (number, mut page) in pages {
+            if cache.contains(&number) {
                 continue;
             }
-            if i > 0 && cache.len() >= cap {
-                let listeners = evict_listeners_snapshot(&self.shared)?;
-                if let Some((epn, mut epage)) = pop_unused_readahead_lru_page(cache) {
-                    if let Err(error) = self.evict_cache(file, &listeners, epn, &mut epage) {
-                        restore_popped_cache_page(cache, epn, epage);
-                        return Err(error);
-                    }
-                } else if let Some((epn, mut epage)) = pop_unpinned_lru_page(cache)? {
-                    if let Err(error) = self.evict_cache(file, &listeners, epn, &mut epage) {
-                        restore_popped_cache_page(cache, epn, epage);
-                        return Err(error);
-                    }
+            if cache.len() >= cache.cap().get() {
+                if number == demand {
+                    return Err(VfsError::ResourceBusy);
                 }
+                continue;
             }
-            #[cfg(feature = "ext4")]
-            if off < read {
-                async_filled_pages += 1;
-            }
-            let mut page = page;
-            if i > 0 {
+            if number != demand {
                 page.mark_prefetched();
-            } else {
-                page.record_reference();
             }
-            file_cache_apply_refault(&self.shared, target_pn, &mut page);
-            cache.put(target_pn, page);
+            file_cache_apply_refault(&self.shared, number, &mut page);
+            if cache.put(number, page).is_some() {
+                unreachable!("cache-fill publication replaced an existing page");
+            }
             file_cache_resident_add(1);
-            if i > 0 {
-                cache.demote(&target_pn);
+            demand_inserted |= number == demand;
+            if number != demand {
+                cache.demote(&number);
                 loaded_readahead_pages += 1;
             }
-        }
-
-        #[cfg(feature = "ext4")]
-        {
-            lwext4_rust::record_readahead_async_pages(async_filled_pages);
         }
         if readahead_enabled {
             record_readahead_window(loaded_readahead_pages);
         }
+        Ok(usize::from(demand_inserted))
+    }
 
-        Ok(evicted)
+    fn populate_missing_page(
+        &self,
+        file: &FileNode,
+        pn: u32,
+        load_from_file: bool,
+        allow_async_page_fill: bool,
+        readahead_pages: usize,
+    ) -> VfsResult<()> {
+        let readahead_enabled = load_from_file && readahead_pages > 1 && cached_readahead_enabled();
+        if readahead_enabled {
+            record_readahead_miss();
+        }
+        let requested_pages = if readahead_enabled {
+            readahead_pages.min(MMAP_SEQUENTIAL_READAHEAD_PAGES)
+        } else {
+            1
+        };
+
+        loop {
+            let capacity_epoch = self.shared.pending_page_fills.capacity_epoch();
+            let admission =
+                self.shared
+                    .pending_page_fills
+                    .admit(&self.shared, pn, requested_pages)?;
+            match admission {
+                PendingPageFillAdmission::Present => return Ok(()),
+                PendingPageFillAdmission::Wait(fill) => fill.wait()?,
+                PendingPageFillAdmission::Capacity => {
+                    self.shared
+                        .pending_page_fills
+                        .wait_for_capacity(capacity_epoch)?;
+                }
+                PendingPageFillAdmission::Full => return Err(VfsError::ResourceBusy),
+                PendingPageFillAdmission::Load(owner) => {
+                    let range = owner.range();
+                    let prepared = if load_from_file {
+                        self.prepare_page_window(file, range, allow_async_page_fill)
+                    } else {
+                        PageCache::new(self.shared.in_memory).and_then(|mut page| {
+                            page.data().fill(0);
+                            let mut pages = Vec::new();
+                            pages.try_reserve_exact(1).map_err(|_| VfsError::NoMemory)?;
+                            pages.push((pn, page));
+                            Ok(pages)
+                        })
+                    };
+                    let result = match prepared {
+                        Ok(pages) => {
+                            let mut cache = self.shared.page_cache.lock();
+                            let result =
+                                self.publish_page_window(&mut cache, pages, pn, readahead_enabled);
+                            if !load_from_file
+                                && result.as_ref().is_ok_and(|inserted| *inserted != 0)
+                            {
+                                record_cached_file_counter(&WRITE_NO_READ_INSERT_PAGES, 1);
+                                record_cached_file_counter(
+                                    &WRITE_NO_READ_INSERT_BYTES,
+                                    PAGE_SIZE as u64,
+                                );
+                            }
+                            drop(cache);
+                            owner.finish(result.map(|_| ()))
+                        }
+                        Err(error) => owner.finish(Err(error)),
+                    };
+                    result?;
+                    return Ok(());
+                }
+            }
+        }
     }
 
     /// Observes residency without accessing page data or waiting for writeback.
@@ -806,36 +745,51 @@ impl CachedFile {
     }
 
     /// Invokes `f` with the cached page at `pn`, loading it from disk if absent.
-    ///
-    /// If loading the page causes an eviction, the evicted page is also passed
-    /// to `f`.
+    /// Cache pressure uses staged reclamation with all cache locks dropped.
     pub fn with_page_or_insert<R>(
         &self,
         pn: u32,
-        f: impl FnOnce(&mut PageCache, Option<EvictedPage>) -> VfsResult<R>,
+        f: impl FnOnce(&mut PageCache) -> VfsResult<R>,
     ) -> VfsResult<R> {
-        let _cache_user = self.begin_cache_user_range(
-            page_range(u64::from(pn), 1),
-            RangeCacheLeaseKind::CachedWrite,
-        )?;
         let mut f = Some(f);
+        let mut reclaimed = 0usize;
         loop {
-            let mut guard = self.shared.page_cache.lock();
-            let evicted = self.ensure_page_cached(self.inner.entry().as_file()?, &mut guard, pn)?;
-            if guard.get(&pn).is_some_and(PageCache::is_writeback) {
-                drop(evicted);
-                drop(guard);
-                wait_for_page_writeback_clear(&self.shared, pn);
-                continue;
+            let attempt = self.with_page_or_insert_without_reclaim_with_options(
+                pn,
+                true,
+                true,
+                READAHEAD_PAGES,
+                true,
+                |page| f.take().expect("page callback was consumed")(page),
+            );
+            match attempt {
+                Ok(value) => return Ok(value),
+                Err(VfsError::ResourceBusy) if f.is_some() => {
+                    let (cache_full, writeback) = {
+                        let cache = self.shared.page_cache.lock();
+                        (
+                            !cache.contains(&pn) && cache.len() == cache.cap().get(),
+                            cache.peek(&pn).is_some_and(PageCache::is_writeback),
+                        )
+                    };
+                    if writeback {
+                        wait_for_page_writeback_clear(&self.shared, pn);
+                        continue;
+                    }
+                    if !cache_full || reclaimed == LOCK_EXTERNAL_INSERT_RECLAIM_RETRY_LIMIT {
+                        return Err(VfsError::ResourceBusy);
+                    }
+                    // Reclaim only after the cache-user guard from the failed
+                    // insertion attempt has dropped. This keeps independent
+                    // buffered users concurrent while retaining staged alias
+                    // teardown at capacity.
+                    if !self.reclaim_one()? {
+                        return Err(VfsError::ResourceBusy);
+                    }
+                    reclaimed += 1;
+                }
+                Err(error) => return Err(error),
             }
-            let page = guard.get_mut(&pn).unwrap();
-            let result = f.take().unwrap()(page, evicted);
-            let dirty = guard.get(&pn).is_some_and(PageCache::is_dirty);
-            drop(guard);
-            if dirty {
-                retain_cached_file_writeback_anchor_if_dirty(&self.inner, &self.shared);
-            }
-            return result;
         }
     }
 
@@ -859,15 +813,12 @@ impl CachedFile {
     /// Loads a page from task context, reclaiming through a fully staged
     /// cache-eviction transaction when the cache is full.
     ///
-    /// This is intentionally separate from [`Self::with_page_or_insert`]:
-    /// that older helper can invoke reverse-map eviction callbacks while its
-    /// cache mutex is held.  Here insertion is first attempted under the
-    /// direct-I/O exclusion lock without replacement.  On a full cache both
-    /// locks have been dropped before [`Self::reclaim_one`] stages a page,
-    /// prepares every alias reservation, and commits its eviction.  The
-    /// insertion is then retried from scratch.  Callers must not hold an mm
-    /// lock, because reclamation prepares mappings in arbitrary address
-    /// spaces.
+    /// Insertion is first attempted under the direct-I/O exclusion lock
+    /// without replacement. On a full cache both locks have been dropped
+    /// before [`Self::reclaim_one`] stages a page, prepares every alias
+    /// reservation, and commits its eviction. The insertion is then retried
+    /// from scratch. Callers must not hold an mm lock, because reclamation
+    /// prepares mappings in arbitrary address spaces.
     pub fn with_page_or_insert_lock_external_reclaim<R>(
         &self,
         pn: u32,
@@ -1000,32 +951,41 @@ impl CachedFile {
             page_range(u64::from(pn), 1),
             RangeCacheLeaseKind::CachedWrite,
         )?;
-        let mut guard = self.shared.page_cache.lock();
-        if !guard.contains(&pn) && guard.len() == guard.cap().get() {
-            return Err(VfsError::ResourceBusy);
+        let file = self.inner.entry().as_file()?;
+        let mut f = Some(f);
+        loop {
+            {
+                let mut cache = self.shared.page_cache.lock();
+                if let Some(page) = cache.get_mut(&pn) {
+                    if page.clear_prefetched() && load_from_file {
+                        record_readahead_hit();
+                    }
+                    file_cache_record_page_reference(page);
+                    if reject_writeback && page.is_writeback() {
+                        return Err(VfsError::ResourceBusy);
+                    } else {
+                        let result = f.take().unwrap()(page);
+                        let dirty = cache.get(&pn).is_some_and(PageCache::is_dirty);
+                        drop(cache);
+                        if dirty {
+                            retain_cached_file_writeback_anchor_if_dirty(&self.inner, &self.shared);
+                        }
+                        return result;
+                    }
+                } else {
+                    if cache.len() >= cache.cap().get() {
+                        return Err(VfsError::ResourceBusy);
+                    }
+                }
+            }
+            self.populate_missing_page(
+                file,
+                pn,
+                load_from_file,
+                allow_async_page_fill,
+                readahead_pages.max(1),
+            )?;
         }
-        let _evicted = self.ensure_page_cached_with_window(
-            self.inner.entry().as_file()?,
-            &mut guard,
-            pn,
-            load_from_file,
-            allow_async_page_fill,
-            readahead_pages.max(1),
-        )?;
-        debug_assert!(
-            _evicted.is_none(),
-            "no-reclaim cache insertion must not evict while holding the cache lock"
-        );
-        if reject_writeback && guard.get(&pn).is_some_and(PageCache::is_writeback) {
-            return Err(VfsError::ResourceBusy);
-        }
-        let result = f(guard.get_mut(&pn).unwrap());
-        let dirty = guard.get(&pn).is_some_and(PageCache::is_dirty);
-        drop(guard);
-        if dirty {
-            retain_cached_file_writeback_anchor_if_dirty(&self.inner, &self.shared);
-        }
-        result
     }
 
     /// Runs `f` while direct I/O is excluded from this inode's page cache.

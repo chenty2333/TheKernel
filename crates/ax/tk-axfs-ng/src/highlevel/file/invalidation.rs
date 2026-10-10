@@ -549,34 +549,6 @@ pub(super) fn request_unlinked_cached_file_cleanup(shared: &Arc<CachedFileShared
     attempt_unlinked_cached_file_cleanup(shared)
 }
 
-pub(super) fn pop_unpinned_lru_page(
-    cache: &mut LruCache<u32, PageCache>,
-) -> VfsResult<Option<(u32, PageCache)>> {
-    let mut skipped = 0;
-    let limit = cache.len();
-    while skipped < limit {
-        let Some((pn, page)) = cache.peek_lru() else {
-            return Ok(None);
-        };
-        let pn = *pn;
-        if page.is_pinned() {
-            cache.promote(&pn);
-            skipped += 1;
-            continue;
-        }
-        let popped = cache.pop_lru();
-        if let Some((_, page)) = &popped {
-            file_cache_remove_page(page);
-        }
-        return Ok(popped);
-    }
-    if limit == 0 {
-        Ok(None)
-    } else {
-        Err(VfsError::ResourceBusy)
-    }
-}
-
 #[derive(Default)]
 pub(super) struct CleanPageScan {
     pub(super) page: Option<(u32, PageCache)>,
@@ -633,43 +605,6 @@ pub(super) fn pop_clean_unpinned_lru_page(
         }
     }
     scan
-}
-
-pub(super) fn pop_unused_readahead_lru_page(
-    cache: &mut LruCache<u32, PageCache>,
-) -> Option<(u32, PageCache)> {
-    // NOREUSE pages are explicitly reclaim-priority candidates, not merely
-    // a hint that happens to work when they reach the LRU head. Rotate each
-    // noncandidate once so a bounded cache walk finds one anywhere in LRU.
-    for _ in 0..cache.len() {
-        let Some((pn, page)) = cache.peek_lru() else {
-            return None;
-        };
-        let pn = *pn;
-        if page.is_unused_prefetched() {
-            let popped = cache.pop_lru();
-            if let Some((_, page)) = &popped {
-                file_cache_remove_page(page);
-                record_readahead_retired_unused_page();
-            }
-            return popped;
-        }
-        cache.promote(&pn);
-    }
-    None
-}
-
-pub(super) fn restore_popped_cache_page(
-    cache: &mut LruCache<u32, PageCache>,
-    pn: u32,
-    page: PageCache,
-) {
-    file_cache_restore_page(&page);
-    assert!(
-        cache.put(pn, page).is_none(),
-        "restoring an evicted cache page replaced page {pn}"
-    );
-    cache.demote(&pn); // LRU recency only; preserves PageCache::active.
 }
 
 /// Moves selected keys to the LRU end while retaining their encounter order.

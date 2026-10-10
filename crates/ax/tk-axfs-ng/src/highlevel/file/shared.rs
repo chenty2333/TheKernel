@@ -2,19 +2,6 @@
 
 use super::*;
 
-/// A page evicted while inserting a new cached file page.
-#[must_use = "eviction metadata must be observed by the cache caller"]
-pub struct EvictedPage {
-    pub(super) pn: u32,
-}
-
-impl EvictedPage {
-    /// Returns the file page number that was evicted.
-    pub fn page_number(&self) -> u32 {
-        self.pn
-    }
-}
-
 pub(super) fn per_file_page_cache_capacity() -> NonZeroUsize {
     pub(super) const MIB: usize = 1024 * 1024;
     pub(super) const GIB: usize = 1024 * MIB;
@@ -166,6 +153,10 @@ pub(super) struct CachedFileShared {
     /// pages can be faulted back, so global pressure reclaim must skip them.
     pub(super) in_memory: bool,
     pub(super) page_cache: Mutex<LruCache<u32, PageCache>>,
+    /// In-flight cache misses are coalesced by page range. The backing read
+    /// runs without `page_cache` held; its owner publishes the pages once
+    /// initialized and wakes every overlapping reader.
+    pub(super) pending_page_fills: PendingPageFills,
     /// Remaining entries in the current bounded pressure-scan cycle. The LRU
     /// rotation is the cursor; this counter prevents an all-ineligible inode
     /// from requesting active retries forever.
@@ -222,6 +213,182 @@ pub(super) struct FadviseReadaheadQueue {
     pub(super) head: usize,
     pub(super) len: usize,
     pub(super) pending: [Option<FadviseReadaheadRequest>; FADVISE_READAHEAD_QUEUE_CAPACITY],
+}
+
+/// Bounded ownership for pages being read into the cache. The cache index is
+/// deliberately not held while a filesystem read is in flight; one owner
+/// publishes initialized pages and overlapping misses join its completion.
+const MAX_PENDING_PAGE_FILLS: usize = 16;
+const MAX_PAGE_FILL_WINDOW: usize = 32;
+
+pub(super) struct PendingPageFills {
+    fills: Mutex<Vec<Arc<PendingPageFill>>>,
+    capacity: WaitQueue,
+    capacity_epoch: AtomicU64,
+}
+
+pub(super) enum PendingPageFillAdmission<'a> {
+    Present,
+    Wait(Arc<PendingPageFill>),
+    Capacity,
+    Full,
+    Load(PendingPageFillOwner<'a>),
+}
+
+pub(super) struct PendingPageFill {
+    range: Range<u64>,
+    complete: AtomicBool,
+    result: Mutex<Option<VfsResult<()>>>,
+    waiters: WaitQueue,
+}
+
+pub(super) struct PendingPageFillOwner<'a> {
+    registry: &'a PendingPageFills,
+    fill: Arc<PendingPageFill>,
+    finished: bool,
+}
+
+impl PendingPageFills {
+    pub(super) const fn new() -> Self {
+        Self {
+            fills: Mutex::new(Vec::new()),
+            capacity: WaitQueue::new(),
+            capacity_epoch: AtomicU64::new(0),
+        }
+    }
+
+    /// Reserves a short forward window. Lock order is fills -> page cache;
+    /// completion always drops the page-cache lock before retiring its ticket.
+    pub(super) fn admit(
+        &self,
+        shared: &CachedFileShared,
+        first: u32,
+        requested_pages: usize,
+    ) -> VfsResult<PendingPageFillAdmission<'_>> {
+        let first = u64::from(first);
+        let mut fills = self.fills.lock();
+        let cache = shared.page_cache.lock();
+        if cache.contains(&(first as u32)) {
+            return Ok(PendingPageFillAdmission::Present);
+        }
+        if let Some(fill) = fills.iter().find(|fill| fill.range.contains(&first)) {
+            return Ok(PendingPageFillAdmission::Wait(fill.clone()));
+        }
+        if cache.len() >= cache.cap().get() {
+            return Ok(PendingPageFillAdmission::Full);
+        }
+        if fills.len() >= MAX_PENDING_PAGE_FILLS {
+            return Ok(PendingPageFillAdmission::Capacity);
+        }
+
+        let reserved_pages = fills.iter().fold(0usize, |total, fill| {
+            total.saturating_add((fill.range.end - fill.range.start) as usize)
+        });
+        let available = cache
+            .cap()
+            .get()
+            .saturating_sub(cache.len().saturating_add(reserved_pages));
+        if available == 0 {
+            return Ok(PendingPageFillAdmission::Capacity);
+        }
+        let mut end = first
+            .saturating_add(
+                requested_pages
+                    .clamp(1, MAX_PAGE_FILL_WINDOW)
+                    .min(available) as u64,
+            )
+            .min(u64::from(u32::MAX) + 1);
+        for candidate in first + 1..end {
+            if cache.contains(&(candidate as u32))
+                || fills.iter().any(|fill| fill.range.contains(&candidate))
+            {
+                end = candidate;
+                break;
+            }
+        }
+        if end <= first {
+            return Ok(PendingPageFillAdmission::Present);
+        }
+        fills.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+        let fill = Arc::try_new(PendingPageFill {
+            range: first..end,
+            complete: AtomicBool::new(false),
+            result: Mutex::new(None),
+            waiters: WaitQueue::new(),
+        })
+        .map_err(|_| VfsError::NoMemory)?;
+        fills.push(fill.clone());
+        Ok(PendingPageFillAdmission::Load(PendingPageFillOwner {
+            registry: self,
+            fill,
+            finished: false,
+        }))
+    }
+
+    pub(super) fn capacity_epoch(&self) -> u64 {
+        self.capacity_epoch.load(Ordering::Acquire)
+    }
+
+    pub(super) fn wait_for_capacity(&self, observed_epoch: u64) -> VfsResult<()> {
+        self.capacity
+            .wait_until(|| self.capacity_epoch.load(Ordering::Acquire) != observed_epoch)
+            .map_err(|_| VfsError::Interrupted)
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.fills.lock().len()
+    }
+}
+
+impl PendingPageFill {
+    #[cfg(test)]
+    pub(super) fn range(&self) -> Range<u64> {
+        self.range.clone()
+    }
+
+    pub(super) fn wait(&self) -> VfsResult<()> {
+        self.waiters
+            .wait_until(|| self.complete.load(Ordering::Acquire))
+            .map_err(|_| VfsError::Interrupted)?;
+        self.result
+            .lock()
+            .as_ref()
+            .copied()
+            .ok_or(VfsError::BadState)?
+    }
+}
+
+impl PendingPageFillOwner<'_> {
+    pub(super) fn range(&self) -> Range<u64> {
+        self.fill.range.clone()
+    }
+
+    pub(super) fn finish(mut self, result: VfsResult<()>) -> VfsResult<()> {
+        self.publish(result);
+        result
+    }
+
+    fn publish(&mut self, result: VfsResult<()>) {
+        *self.fill.result.lock() = Some(result);
+        self.fill.complete.store(true, Ordering::Release);
+        self.registry
+            .fills
+            .lock()
+            .retain(|fill| !Arc::ptr_eq(fill, &self.fill));
+        self.registry.capacity_epoch.fetch_add(1, Ordering::Release);
+        self.finished = true;
+        self.registry.capacity.notify_all(false);
+        self.fill.waiters.notify_all(false);
+    }
+}
+
+impl Drop for PendingPageFillOwner<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.publish(Err(VfsError::Interrupted));
+        }
+    }
 }
 
 impl FadviseReadaheadQueue {
@@ -415,6 +582,7 @@ impl CachedFileShared {
             identity_lease,
             in_memory,
             page_cache: Mutex::new(page_cache),
+            pending_page_fills: PendingPageFills::new(),
             pressure_reclaim_scan_remaining: AtomicUsize::new(0),
             pressure_reclaim_scan_epoch: AtomicU64::new(0),
             eviction_completion_epoch: AtomicU64::new(0),
@@ -852,13 +1020,29 @@ impl CachedPageInvalidationTransaction {
                     .pages
                     .first()
                     .expect("pageout commit without a staged page");
-                record_prepared_file_cache_shadow(
-                    self.shadow_publication
-                        .take()
-                        .expect("pageout commit without shadow reservation"),
-                    &self.shared,
-                    *pn,
-                );
+                let (_, page) = self
+                    .pages
+                    .first()
+                    .expect("pageout commit without a staged page");
+                if page.is_unused_prefetched() {
+                    // An untouched prefetch/NOREUSE page is not a workingset
+                    // eviction. Release the reserved shadow credit instead
+                    // of publishing a refault allowance for it.
+                    drop(
+                        self.shadow_publication
+                            .take()
+                            .expect("pageout commit without shadow reservation"),
+                    );
+                    record_readahead_retired_unused_page();
+                } else {
+                    record_prepared_file_cache_shadow(
+                        self.shadow_publication
+                            .take()
+                            .expect("pageout commit without shadow reservation"),
+                        &self.shared,
+                        *pn,
+                    );
+                }
             }
         }
         for (_, page) in &mut self.pages {
