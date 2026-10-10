@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
-//! LinuxKPI `drm_mm` range allocator for the i915 GGTT, PPGTT and stolen
-//! memory managers (Linux 7.2.3 `drivers/gpu/drm/drm_mm.c` semantics).
-//!
-//! Free space is derived from the address-ordered `node_list`, which is the
-//! same circular list Linux threads through `head_node`. Each hole is the gap
-//! between a node and its successor (the head sentinel supplies both ends), so
-//! hole discovery, the insertion placement rules and the eviction scanner
-//! match Linux's search results. Linux additionally keeps size-, address- and
-//! free-order rb-trees for its hole searches; this backend walks the list
-//! instead and orders the `DRM_MM_INSERT_EVICT` search best-fit.
+//! Translation of Linux 7.2.3 `drivers/gpu/drm/drm_mm.c` (MIT). The hole
+//! trees (`holes_size`, `holes_addr`), the interval tree over allocated nodes,
+//! the `hole_stack` used by the eviction order and the scanner follow the
+//! upstream structure function by function. Upstream `DRM_MM_BUG_ON()` checks
+//! and the `CONFIG_DRM_DEBUG_MM` leak tracking are compiled out, matching the
+//! oracle configuration.
 
 #![allow(unsafe_code)]
+#![allow(non_snake_case)]
 
 use core::{
     ffi::{c_int, c_ulong},
@@ -20,15 +17,23 @@ use core::{
 
 use crate::{
     intel_context_upstream::DrmMmNode,
-    intel_engine_cs_upstream::ListHead,
-    linux::gem_memory::DrmMm,
+    intel_engine_cs_upstream::{ListHead, RbNode, RbRoot, RbRootCached},
+    linux::{
+        gem_memory::DrmMm,
+        rbtree::{
+            RbAugment, rb_erase_augmented, rb_erase_augmented_cached, rb_erase_cached,
+            rb_first_cached, rb_insert_augmented, rb_insert_augmented_cached,
+            rb_insert_color_cached, rb_link_node, rb_parent, rb_prev, RB_EMPTY_NODE,
+        },
+    },
+    linux_config::ENOSPC,
+    linux_list::{list_add, list_del},
 };
 
-/// `DRM_MM_NODE_ALLOCATED_BIT` and `DRM_MM_NODE_SCANNED_BIT` from drm_mm.h.
 const DRM_MM_NODE_ALLOCATED_BIT: u32 = 0;
 const DRM_MM_NODE_SCANNED_BIT: u32 = 1;
 
-/// `enum drm_mm_insert_mode` values from include/drm/drm_mm.h.
+/// `enum drm_mm_insert_mode` and `DRM_MM_INSERT_ONCE` from include/drm/drm_mm.h.
 const DRM_MM_INSERT_BEST: u32 = 0;
 const DRM_MM_INSERT_LOW: u32 = 1;
 const DRM_MM_INSERT_HIGH: u32 = 2;
@@ -51,180 +56,540 @@ pub struct DrmMmScan {
 }
 const _: () = assert!(core::mem::size_of::<DrmMmScan>() == 80);
 
-#[inline]
-unsafe fn node_from_list(list: *mut ListHead) -> *mut DrmMmNode {
-    unsafe { list.cast::<u8>().sub(offset_of!(DrmMmNode, node_list)).cast::<DrmMmNode>() }
-}
+// ---------------------------------------------------------------------------
+// Container helpers (`rb_entry`, `list_entry`) and the node accessors used
+// throughout drm_mm.c.
+// ---------------------------------------------------------------------------
 
 #[inline]
-unsafe fn head_of(mm: *mut DrmMm) -> *mut DrmMmNode {
-    unsafe { core::ptr::addr_of_mut!((*mm).head_node) }
+unsafe fn node_of_rb(rb: *mut RbNode) -> *mut DrmMmNode {
+    unsafe { rb.cast::<u8>().sub(offset_of!(DrmMmNode, rb)).cast() }
+}
+#[inline]
+unsafe fn node_of_hole_size(rb: *mut RbNode) -> *mut DrmMmNode {
+    unsafe { rb.cast::<u8>().sub(offset_of!(DrmMmNode, rb_hole_size)).cast() }
+}
+#[inline]
+unsafe fn node_of_hole_addr(rb: *mut RbNode) -> *mut DrmMmNode {
+    unsafe { rb.cast::<u8>().sub(offset_of!(DrmMmNode, rb_hole_addr)).cast() }
+}
+#[inline]
+unsafe fn node_of_node_list(list: *mut ListHead) -> *mut DrmMmNode {
+    unsafe { list.cast::<u8>().sub(offset_of!(DrmMmNode, node_list)).cast() }
+}
+#[inline]
+unsafe fn node_of_hole_stack(list: *mut ListHead) -> *mut DrmMmNode {
+    unsafe { list.cast::<u8>().sub(offset_of!(DrmMmNode, hole_stack)).cast() }
 }
 
+/// `rb_hole_addr_to_node()` / `rb_hole_size_to_node()`: NULL-safe `rb_entry`.
 #[inline]
-unsafe fn next_node(node: *mut DrmMmNode) -> *mut DrmMmNode {
-    unsafe { node_from_list((*node).node_list.next) }
+unsafe fn hole_addr_node_or_null(rb: *mut RbNode) -> *mut DrmMmNode {
+    if rb.is_null() { core::ptr::null_mut() } else { unsafe { node_of_hole_addr(rb) } }
 }
-
 #[inline]
-unsafe fn prev_node(node: *mut DrmMmNode) -> *mut DrmMmNode {
-    unsafe { node_from_list((*node).node_list.prev) }
-}
-
-/// Start of the hole that follows `node` (`__drm_mm_hole_node_start`).
-#[inline]
-unsafe fn hole_start(node: *mut DrmMmNode) -> u64 {
-    unsafe { (*node).start.wrapping_add((*node).size) }
-}
-
-/// End of the hole that follows `node` (`__drm_mm_hole_node_end`).
-#[inline]
-unsafe fn hole_end(node: *mut DrmMmNode) -> u64 {
-    unsafe { (*next_node(node)).start }
+unsafe fn hole_size_node_or_null(rb: *mut RbNode) -> *mut DrmMmNode {
+    if rb.is_null() { core::ptr::null_mut() } else { unsafe { node_of_hole_size(rb) } }
 }
 
 #[inline]
 unsafe fn node_allocated(node: *const DrmMmNode) -> bool {
     unsafe { (*node).flags & (1 << DRM_MM_NODE_ALLOCATED_BIT) != 0 }
 }
-
 #[inline]
-unsafe fn node_scanned(node: *const DrmMmNode) -> bool {
+unsafe fn node_scanned_block(node: *const DrmMmNode) -> bool {
     unsafe { (*node).flags & (1 << DRM_MM_NODE_SCANNED_BIT) != 0 }
 }
+#[inline]
+unsafe fn hole_follows(node: *const DrmMmNode) -> bool {
+    unsafe { (*node).hole_size != 0 }
+}
+#[inline]
+unsafe fn hole_node_start(node: *const DrmMmNode) -> u64 {
+    unsafe { (*node).start.wrapping_add((*node).size) }
+}
+#[inline]
+unsafe fn hole_node_end(node: *const DrmMmNode) -> u64 {
+    unsafe { (*node_of_node_list((*node).node_list.next)).start }
+}
+#[inline]
+unsafe fn node_last(node: *const DrmMmNode) -> u64 {
+    unsafe { (*node).start.wrapping_add((*node).size).wrapping_sub(1) }
+}
 
-/// Link `node` into the list directly after `after`.
-unsafe fn list_insert_after(node: *mut DrmMmNode, after: *mut DrmMmNode) {
+#[inline]
+unsafe fn head_node(mm: *mut DrmMm) -> *mut DrmMmNode {
+    unsafe { core::ptr::addr_of_mut!((*mm).head_node) }
+}
+
+// ---------------------------------------------------------------------------
+// Augmented red-black callbacks: RB_DECLARE_CALLBACKS_MAX over the hole
+// addresses, and the interval tree's `subtree_last` (INTERVAL_TREE_DEFINE).
+// Propagation walks to `stop` (or the root) without an early exit, so the
+// summaries stay exact after structural changes.
+// ---------------------------------------------------------------------------
+
+unsafe fn hole_addr_compute(node: *mut DrmMmNode) -> u64 {
     unsafe {
-        let new = core::ptr::addr_of_mut!((*node).node_list);
-        let at = core::ptr::addr_of_mut!((*after).node_list);
-        let next = (*at).next;
-        (*new).next = next;
-        (*new).prev = at;
-        (*next).prev = new;
-        (*at).next = new;
+        let mut max = (*node).hole_size;
+        let left = hole_addr_node_or_null((*node).rb_hole_addr.left);
+        if !left.is_null() && (*left).subtree_max_hole > max {
+            max = (*left).subtree_max_hole;
+        }
+        let right = hole_addr_node_or_null((*node).rb_hole_addr.right);
+        if !right.is_null() && (*right).subtree_max_hole > max {
+            max = (*right).subtree_max_hole;
+        }
+        max
     }
 }
 
-/// Unlink `node` from the list while keeping its own pointers, as Linux's
-/// scanner does, so the node can be restored at the same place.
-unsafe fn list_unlink_keep(node: *mut DrmMmNode) {
-    unsafe {
-        let entry = core::ptr::addr_of_mut!((*node).node_list);
-        (*(*entry).prev).next = (*entry).next;
-        (*(*entry).next).prev = (*entry).prev;
+unsafe fn hole_addr_propagate(rb: *mut RbNode, stop: *mut RbNode) {
+    let mut rb = rb;
+    while !rb.is_null() && rb != stop {
+        let node = unsafe { node_of_hole_addr(rb) };
+        unsafe { (*node).subtree_max_hole = hole_addr_compute(node) };
+        rb = unsafe { rb_parent(rb) };
     }
 }
 
-/// Visit holes in address order. A hole is the node whose successor bounds it.
-unsafe fn holes_in_order(mm: *mut DrmMm, mut visit: impl FnMut(*mut DrmMmNode) -> bool) {
+unsafe fn hole_addr_copy(old: *mut RbNode, new: *mut RbNode) {
     unsafe {
-        let head = head_of(mm);
-        let mut node = head;
+        (*node_of_hole_addr(new)).subtree_max_hole = (*node_of_hole_addr(old)).subtree_max_hole;
+    }
+}
+
+unsafe fn hole_addr_rotate(old: *mut RbNode, new: *mut RbNode) {
+    unsafe {
+        hole_addr_copy(old, new);
+        let old_node = node_of_hole_addr(old);
+        (*old_node).subtree_max_hole = hole_addr_compute(old_node);
+    }
+}
+
+static AUGMENT_CALLBACKS: RbAugment = RbAugment {
+    propagate: hole_addr_propagate,
+    copy: hole_addr_copy,
+    rotate: hole_addr_rotate,
+};
+
+unsafe fn interval_compute_last(node: *mut DrmMmNode) -> u64 {
+    unsafe {
+        let mut max = node_last(node);
+        let left = if (*node).rb.left.is_null() { core::ptr::null_mut() } else { node_of_rb((*node).rb.left) };
+        if !left.is_null() && (*left).subtree_last > max {
+            max = (*left).subtree_last;
+        }
+        let right = if (*node).rb.right.is_null() { core::ptr::null_mut() } else { node_of_rb((*node).rb.right) };
+        if !right.is_null() && (*right).subtree_last > max {
+            max = (*right).subtree_last;
+        }
+        max
+    }
+}
+
+unsafe fn interval_propagate(rb: *mut RbNode, stop: *mut RbNode) {
+    let mut rb = rb;
+    while !rb.is_null() && rb != stop {
+        let node = unsafe { node_of_rb(rb) };
+        unsafe { (*node).subtree_last = interval_compute_last(node) };
+        rb = unsafe { rb_parent(rb) };
+    }
+}
+
+unsafe fn interval_copy(old: *mut RbNode, new: *mut RbNode) {
+    unsafe { (*node_of_rb(new)).subtree_last = (*node_of_rb(old)).subtree_last };
+}
+
+unsafe fn interval_rotate(old: *mut RbNode, new: *mut RbNode) {
+    unsafe {
+        interval_copy(old, new);
+        let old_node = node_of_rb(old);
+        (*old_node).subtree_last = interval_compute_last(old_node);
+    }
+}
+
+static INTERVAL_AUGMENT: RbAugment = RbAugment {
+    propagate: interval_propagate,
+    copy: interval_copy,
+    rotate: interval_rotate,
+};
+
+/// INTERVAL_TREE_DEFINE: the first node overlapping `[start, last]`, or NULL.
+unsafe fn interval_iter_first(root: *mut RbRootCached, start: u64, last: u64) -> *mut DrmMmNode {
+    unsafe {
+        if (*root).root.node.is_null() {
+            return core::ptr::null_mut();
+        }
+        let node = node_of_rb((*root).root.node);
+        if (*node).subtree_last < start {
+            return core::ptr::null_mut();
+        }
+        let leftmost = node_of_rb((*root).leftmost);
+        if (*leftmost).start > last {
+            return core::ptr::null_mut();
+        }
+        let mut node = node;
         loop {
-            if hole_start(node) < hole_end(node) && !visit(node) {
-                return;
+            if !(*node).rb.left.is_null() {
+                let left = node_of_rb((*node).rb.left);
+                if (*left).subtree_last >= start {
+                    node = left;
+                    continue;
+                }
             }
-            node = next_node(node);
-            if node == head {
-                return;
+            if (*node).start <= last {
+                if node_last(node) >= start {
+                    return node;
+                }
+                if !(*node).rb.right.is_null() {
+                    node = node_of_rb((*node).rb.right);
+                    if (*node).subtree_last >= start {
+                        continue;
+                    }
+                }
             }
+            return core::ptr::null_mut();
         }
     }
 }
 
-/// Linux `drm_mm_init()`: an empty allocator over `[start, start + size)`.
-/// The head sentinel stores the range end in its start and `-size` in its
-/// size, so both range boundaries are holes' edges.
+/// `interval_tree_remove()` from INTERVAL_TREE_DEFINE.
+unsafe fn interval_tree_remove(node: *mut DrmMmNode, root: *mut RbRootCached) {
+    unsafe { rb_erase_augmented_cached(core::ptr::addr_of_mut!((*node).rb), root, &INTERVAL_AUGMENT) };
+}
+
+/// `drm_mm_interval_tree_add_node()`.
+unsafe fn drm_mm_interval_tree_add_node(hole_node: *mut DrmMmNode, node: *mut DrmMmNode) {
+    unsafe {
+        let mm = (*hole_node).mm;
+        (*node).subtree_last = node_last(node);
+        let mut rb: *mut RbNode;
+        let mut link: *mut *mut RbNode;
+        let mut leftmost: bool;
+        if node_allocated(hole_node) {
+            rb = core::ptr::addr_of_mut!((*hole_node).rb);
+            while !rb.is_null() {
+                let parent = node_of_rb(rb);
+                if (*parent).subtree_last >= (*node).subtree_last {
+                    break;
+                }
+                (*parent).subtree_last = (*node).subtree_last;
+                rb = rb_parent(rb);
+            }
+            rb = core::ptr::addr_of_mut!((*hole_node).rb);
+            link = core::ptr::addr_of_mut!((*hole_node).rb.right);
+            leftmost = false;
+        } else {
+            rb = core::ptr::null_mut();
+            link = core::ptr::addr_of_mut!((*mm).interval_tree.root.node);
+            leftmost = true;
+        }
+        while !(*link).is_null() {
+            rb = *link;
+            let parent = node_of_rb(rb);
+            if (*parent).subtree_last < (*node).subtree_last {
+                (*parent).subtree_last = (*node).subtree_last;
+            }
+            if (*node).start < (*parent).start {
+                link = core::ptr::addr_of_mut!((*rb).left);
+            } else {
+                link = core::ptr::addr_of_mut!((*rb).right);
+                leftmost = false;
+            }
+        }
+        rb_link_node(core::ptr::addr_of_mut!((*node).rb), rb, link);
+        rb_insert_augmented_cached(
+            core::ptr::addr_of_mut!((*node).rb),
+            core::ptr::addr_of_mut!((*mm).interval_tree),
+            leftmost,
+            &INTERVAL_AUGMENT,
+        );
+    }
+}
+
+/// `drm_mm_interval_tree_remove()`.
+unsafe fn drm_mm_interval_tree_remove(node: *mut DrmMmNode, root: *mut RbRootCached) {
+    unsafe { interval_tree_remove(node, root) };
+}
+
+// ---------------------------------------------------------------------------
+// Hole trees.
+// ---------------------------------------------------------------------------
+
+unsafe fn insert_hole_size(root: *mut RbRootCached, node: *mut DrmMmNode) {
+    unsafe {
+        let mut link: *mut *mut RbNode = core::ptr::addr_of_mut!((*root).root.node);
+        let mut rb: *mut RbNode = core::ptr::null_mut();
+        let x = (*node).hole_size;
+        let mut first = true;
+        while !(*link).is_null() {
+            rb = *link;
+            if x > (*node_of_hole_size(rb)).hole_size {
+                link = core::ptr::addr_of_mut!((*rb).left);
+            } else {
+                link = core::ptr::addr_of_mut!((*rb).right);
+                first = false;
+            }
+        }
+        rb_link_node(core::ptr::addr_of_mut!((*node).rb_hole_size), rb, link);
+        rb_insert_color_cached(core::ptr::addr_of_mut!((*node).rb_hole_size), root, first);
+    }
+}
+
+unsafe fn insert_hole_addr(root: *mut RbRoot, node: *mut DrmMmNode) {
+    unsafe {
+        let mut link: *mut *mut RbNode = core::ptr::addr_of_mut!((*root).node);
+        let mut rb_parent_node: *mut RbNode = core::ptr::null_mut();
+        let start = hole_node_start(node);
+        let subtree_max_hole = (*node).subtree_max_hole;
+        while !(*link).is_null() {
+            rb_parent_node = *link;
+            let parent = node_of_hole_addr(rb_parent_node);
+            if (*parent).subtree_max_hole < subtree_max_hole {
+                (*parent).subtree_max_hole = subtree_max_hole;
+            }
+            if start < hole_node_start(parent) {
+                link = core::ptr::addr_of_mut!((*rb_parent_node).left);
+            } else {
+                link = core::ptr::addr_of_mut!((*rb_parent_node).right);
+            }
+        }
+        rb_link_node(core::ptr::addr_of_mut!((*node).rb_hole_addr), rb_parent_node, link);
+        rb_insert_augmented(core::ptr::addr_of_mut!((*node).rb_hole_addr), root, &AUGMENT_CALLBACKS);
+    }
+}
+
+unsafe fn add_hole(node: *mut DrmMmNode) {
+    unsafe {
+        let mm = (*node).mm;
+        (*node).hole_size = hole_node_end(node).wrapping_sub(hole_node_start(node));
+        (*node).subtree_max_hole = (*node).hole_size;
+        insert_hole_size(core::ptr::addr_of_mut!((*mm).holes_size), node);
+        insert_hole_addr(core::ptr::addr_of_mut!((*mm).holes_addr), node);
+        list_add(
+            core::ptr::addr_of_mut!((*node).hole_stack),
+            core::ptr::addr_of_mut!((*mm).hole_stack),
+        );
+    }
+}
+
+unsafe fn rm_hole(node: *mut DrmMmNode) {
+    unsafe {
+        list_del(core::ptr::addr_of_mut!((*node).hole_stack));
+        let mm = (*node).mm;
+        rb_erase_cached(
+            core::ptr::addr_of_mut!((*node).rb_hole_size),
+            &mut *core::ptr::addr_of_mut!((*mm).holes_size),
+        );
+        rb_erase_augmented(
+            core::ptr::addr_of_mut!((*node).rb_hole_addr),
+            core::ptr::addr_of_mut!((*mm).holes_addr),
+            &AUGMENT_CALLBACKS,
+        );
+        (*node).hole_size = 0;
+        (*node).subtree_max_hole = 0;
+    }
+}
+
+unsafe fn best_hole(mm: *mut DrmMm, size: u64) -> *mut DrmMmNode {
+    unsafe {
+        let mut rb = (*mm).holes_size.root.node;
+        let mut best: *mut DrmMmNode = core::ptr::null_mut();
+        while !rb.is_null() {
+            let node = node_of_hole_size(rb);
+            if size <= (*node).hole_size {
+                best = node;
+                rb = (*rb).right;
+            } else {
+                rb = (*rb).left;
+            }
+        }
+        best
+    }
+}
+
+#[inline]
+unsafe fn usable_hole_addr(rb: *mut RbNode, size: u64) -> bool {
+    unsafe { !rb.is_null() && (*node_of_hole_addr(rb)).subtree_max_hole >= size }
+}
+
+unsafe fn find_hole_addr(mm: *mut DrmMm, addr: u64, size: u64) -> *mut DrmMmNode {
+    unsafe {
+        let mut rb = (*mm).holes_addr.node;
+        let mut node: *mut DrmMmNode = core::ptr::null_mut();
+        while !rb.is_null() {
+            if !usable_hole_addr(rb, size) {
+                break;
+            }
+            node = node_of_hole_addr(rb);
+            let hole_start = hole_node_start(node);
+            if addr < hole_start {
+                rb = (*node).rb_hole_addr.left;
+            } else if addr > hole_start.wrapping_add((*node).hole_size) {
+                rb = (*node).rb_hole_addr.right;
+            } else {
+                break;
+            }
+        }
+        node
+    }
+}
+
+unsafe fn first_hole(mm: *mut DrmMm, start: u64, end: u64, size: u64, mode: u32) -> *mut DrmMmNode {
+    unsafe {
+        match mode {
+            DRM_MM_INSERT_LOW => find_hole_addr(mm, start, size),
+            DRM_MM_INSERT_HIGH => find_hole_addr(mm, end, size),
+            DRM_MM_INSERT_EVICT => {
+                let first = (*mm).hole_stack.next;
+                if first == core::ptr::addr_of_mut!((*mm).hole_stack) {
+                    core::ptr::null_mut()
+                } else {
+                    node_of_hole_stack(first)
+                }
+            }
+            _ => best_hole(mm, size),
+        }
+    }
+}
+
+/// `DECLARE_NEXT_HOLE_ADDR(name, first, last)`.
+unsafe fn next_hole_addr(entry: *mut DrmMmNode, size: u64, high: bool) -> *mut DrmMmNode {
+    unsafe {
+        if entry.is_null() || RB_EMPTY_NODE(core::ptr::addr_of_mut!((*entry).rb_hole_addr)) {
+            return core::ptr::null_mut();
+        }
+        let first = |n: *mut RbNode| if high { (*n).left } else { (*n).right };
+        let last = |n: *mut RbNode| if high { (*n).right } else { (*n).left };
+        let mut node = core::ptr::addr_of_mut!((*entry).rb_hole_addr);
+        if usable_hole_addr(first(node), size) {
+            node = first(node);
+            while usable_hole_addr(last(node), size) {
+                node = last(node);
+            }
+            return node_of_hole_addr(node);
+        }
+        let mut parent;
+        loop {
+            parent = rb_parent(node);
+            if parent.is_null() {
+                break;
+            }
+            let parent_first = if high { (*parent).left } else { (*parent).right };
+            if node != parent_first {
+                break;
+            }
+            node = parent;
+        }
+        hole_addr_node_or_null(parent)
+    }
+}
+
+unsafe fn next_hole(mm: *mut DrmMm, node: *mut DrmMmNode, size: u64, mode: u32) -> *mut DrmMmNode {
+    unsafe {
+        match mode {
+            DRM_MM_INSERT_LOW => next_hole_addr(node, size, false),
+            DRM_MM_INSERT_HIGH => next_hole_addr(node, size, true),
+            DRM_MM_INSERT_EVICT => {
+                let next = (*node).hole_stack.next;
+                if next == core::ptr::addr_of_mut!((*mm).hole_stack) {
+                    core::ptr::null_mut()
+                } else {
+                    node_of_hole_stack(next)
+                }
+            }
+            _ => hole_size_node_or_null(rb_prev(core::ptr::addr_of_mut!((*node).rb_hole_size))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API.
+// ---------------------------------------------------------------------------
+
+/// Linux `__drm_mm_interval_first()`: the first allocated node overlapping
+/// `[start, last]`, or the head node when there is none.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __drm_mm_interval_first(mm: *const DrmMm, start: u64, last: u64) -> *mut DrmMmNode {
+    let mm = mm.cast_mut();
+    let node = unsafe { interval_iter_first(core::ptr::addr_of_mut!((*mm).interval_tree), start, last) };
+    if node.is_null() { unsafe { head_node(mm) } } else { node }
+}
+
+/// Linux `drm_mm_init()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_mm_init(mm: *mut DrmMm, start: u64, size: u64) {
     assert!(!mm.is_null());
     assert!(start.checked_add(size).is_some(), "drm_mm range wraps");
     unsafe {
         core::ptr::write_bytes(mm.cast::<u8>(), 0, core::mem::size_of::<DrmMm>());
-        let head = head_of(mm);
-        (*head).node_list.next = core::ptr::addr_of_mut!((*head).node_list);
-        (*head).node_list.prev = core::ptr::addr_of_mut!((*head).node_list);
-        (*head).hole_stack.next = core::ptr::addr_of_mut!((*head).hole_stack);
-        (*head).hole_stack.prev = core::ptr::addr_of_mut!((*head).hole_stack);
+        (*mm).color_adjust = None;
+        let stack = core::ptr::addr_of_mut!((*mm).hole_stack);
+        (*stack).next = stack;
+        (*stack).prev = stack;
+        let head = head_node(mm);
+        let head_list = core::ptr::addr_of_mut!((*head).node_list);
+        (*head_list).next = head_list;
+        (*head_list).prev = head_list;
         (*head).flags = 0;
         (*head).mm = mm;
         (*head).start = start.wrapping_add(size);
         (*head).size = size.wrapping_neg();
-        (*mm).hole_stack.next = core::ptr::addr_of_mut!((*mm).hole_stack);
-        (*mm).hole_stack.prev = core::ptr::addr_of_mut!((*mm).hole_stack);
+        add_hole(head);
+        (*mm).scan_active = 0;
     }
 }
 
-/// Linux `drm_mm_takedown()`: the allocator must be empty.
+/// Linux `drm_mm_takedown()`: warn when nodes remain.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_mm_takedown(mm: *mut DrmMm) {
     assert!(!mm.is_null());
-    let head = unsafe { head_of(mm) };
-    assert!(
-        unsafe { next_node(head) } == head,
-        "drm_mm_takedown() with nodes still allocated"
-    );
+    let head = unsafe { core::ptr::addr_of_mut!((*head_node(mm)).node_list) };
+    if unsafe { (*head).next } != head {
+        axlog::warn!("Memory manager not clean during takedown.");
+    }
 }
 
-/// Linux `drm_mm_reserve_node()`: allocate the exact range of `node`.
-/// Returns -ENOSPC when the range is not wholly free.
+/// Linux `drm_mm_reserve_node()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_mm_reserve_node(mm: *mut DrmMm, node: *mut DrmMmNode) -> c_int {
-    assert!(!mm.is_null() && !node.is_null());
-    let start = unsafe { (*node).start };
-    let size = unsafe { (*node).size };
-    if size == 0 || start.checked_add(size).is_none() {
-        return -crate::linux_config::EINVAL;
-    }
-    let end = start + size;
-    let mut placed_after = None;
     unsafe {
-        holes_in_order(mm, |hole| {
-            if hole_start(hole) <= start && end <= hole_end(hole) {
-                placed_after = Some(hole);
-                false
-            } else {
-                true
-            }
-        });
-    }
-    let Some(after) = placed_after else {
-        return -crate::linux_config::ENOSPC;
-    };
-    unsafe {
+        let end = (*node).start.wrapping_add((*node).size);
+        if end <= (*node).start {
+            return -ENOSPC;
+        }
+        let hole = find_hole_addr(mm, (*node).start, 0);
+        if hole.is_null() {
+            return -ENOSPC;
+        }
+        let hole_start = hole_node_start(hole);
+        let hole_end = hole_start.wrapping_add((*hole).hole_size);
+        let mut adj_start = hole_start;
+        let mut adj_end = hole_end;
+        if let Some(adjust) = (*mm).color_adjust {
+            adjust(hole, (*node).color, &mut adj_start, &mut adj_end);
+        }
+        if adj_start > (*node).start || adj_end < end {
+            return -ENOSPC;
+        }
         (*node).mm = mm;
-        (*node).color = 0;
         (*node).flags |= 1 << DRM_MM_NODE_ALLOCATED_BIT;
-        list_insert_after(node, after);
-    }
-    0
-}
-
-/// Linux `drm_mm_remove_node()`: release an allocated node.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_mm_remove_node(node: *mut DrmMmNode) {
-    assert!(!node.is_null());
-    assert!(
-        unsafe { node_allocated(node) },
-        "drm_mm_remove_node() on a free node"
-    );
-    unsafe {
-        list_unlink_keep(node);
-        (*node).node_list.next = core::ptr::null_mut();
-        (*node).node_list.prev = core::ptr::null_mut();
-        (*node).flags &= !(1 << DRM_MM_NODE_ALLOCATED_BIT);
+        list_add(core::ptr::addr_of_mut!((*node).node_list), core::ptr::addr_of_mut!((*hole).node_list));
+        drm_mm_interval_tree_add_node(hole, node);
+        (*node).hole_size = 0;
+        rm_hole(hole);
+        if (*node).start > hole_start {
+            add_hole(hole);
+        }
+        if end < hole_end {
+            add_hole(node);
+        }
+        0
     }
 }
 
 /// Linux `drm_mm_insert_node_in_range()`.
-///
-/// Searches holes that intersect `[range_start, range_end)` for room for
-/// `size` bytes at `alignment`, with `color_adjust` applied to each hole.
-/// `DRM_MM_INSERT_LOW` and `DRM_MM_INSERT_HIGH` take the lowest or highest
-/// fitting hole; `DRM_MM_INSERT_BEST` and `DRM_MM_INSERT_EVICT` take the
-/// smallest fitting hole. `DRM_MM_INSERT_ONCE` tries only the first hole
-/// the mode selects.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_mm_insert_node_in_range(
     mm: *mut DrmMm,
@@ -236,116 +601,105 @@ pub unsafe extern "C" fn drm_mm_insert_node_in_range(
     range_end: u64,
     mode: u32,
 ) -> c_int {
-    assert!(!mm.is_null() && !node.is_null());
-    assert!(range_start <= range_end);
-    if size == 0 || range_end - range_start < size {
-        return -crate::linux_config::ENOSPC;
-    }
-    let alignment = if alignment <= 1 { 0 } else { alignment };
-    let once = mode & DRM_MM_INSERT_ONCE != 0;
-    let mode = mode & !DRM_MM_INSERT_ONCE;
-    let remainder_mask = if alignment.is_power_of_two() {
-        alignment - 1
-    } else {
-        0
-    };
-
-    // Candidate holes in the order the mode prefers, collected first so the
-    // list can be walked without mutating it.
-    let mut holes: alloc::vec::Vec<*mut DrmMmNode> = alloc::vec::Vec::new();
     unsafe {
-        holes_in_order(mm, |hole| {
-            holes.push(hole);
-            true
-        });
-    }
-    if once {
-        holes.truncate(1);
-    }
-    match mode {
-        DRM_MM_INSERT_LOW => {}
-        DRM_MM_INSERT_HIGH => holes.reverse(),
-        _ => unsafe {
-            holes.sort_by_key(|&hole| (hole_end(hole).wrapping_sub(hole_start(hole)), hole_start(hole)));
-        },
-    }
+        if size == 0 || range_end.wrapping_sub(range_start) < size {
+            return -ENOSPC;
+        }
+        let largest = hole_size_node_or_null(rb_first_cached(&*core::ptr::addr_of!((*mm).holes_size)));
+        if largest.is_null() || (*largest).hole_size < size {
+            return -ENOSPC;
+        }
+        let alignment = if alignment <= 1 { 0 } else { alignment };
+        let once = mode & DRM_MM_INSERT_ONCE != 0;
+        let mode = mode & !DRM_MM_INSERT_ONCE;
+        let remainder_mask = if alignment.is_power_of_two() { alignment - 1 } else { 0 };
 
-    for hole in holes {
-        let hole_start_addr = unsafe { hole_start(hole) };
-        let hole_end_addr = unsafe { hole_end(hole) };
-        if mode == DRM_MM_INSERT_LOW && hole_start_addr >= range_end {
-            break;
-        }
-        if mode == DRM_MM_INSERT_HIGH && hole_end_addr <= range_start {
-            break;
-        }
-        let mut col_start = hole_start_addr;
-        let mut col_end = hole_end_addr;
-        if let Some(adjust) = unsafe { (*mm).color_adjust } {
-            unsafe { adjust(hole, color, &mut col_start, &mut col_end) };
-        }
-        let adj_start0 = col_start.max(range_start);
-        let adj_end = col_end.min(range_end);
-        if adj_end <= adj_start0 || adj_end - adj_start0 < size {
-            continue;
-        }
-        let mut adj_start = adj_start0;
-        if mode == DRM_MM_INSERT_HIGH {
-            adj_start = adj_end - size;
-        }
-        if alignment != 0 {
-            let rem = if remainder_mask != 0 {
-                adj_start & remainder_mask
-            } else {
-                adj_start % alignment
-            };
-            if rem != 0 {
-                adj_start -= rem;
-                if mode != DRM_MM_INSERT_HIGH {
-                    adj_start += alignment;
+        let mut hole = first_hole(mm, range_start, range_end, size, mode);
+        while !hole.is_null() {
+            let hole_start = hole_node_start(hole);
+            let hole_end = hole_start.wrapping_add((*hole).hole_size);
+            if mode == DRM_MM_INSERT_LOW && hole_start >= range_end {
+                break;
+            }
+            if mode == DRM_MM_INSERT_HIGH && hole_end <= range_start {
+                break;
+            }
+            let mut col_start = hole_start;
+            let mut col_end = hole_end;
+            if let Some(adjust) = (*mm).color_adjust {
+                adjust(hole, color, &mut col_start, &mut col_end);
+            }
+            let mut adj_start = col_start.max(range_start);
+            let adj_end = col_end.min(range_end);
+            let placeable = !(adj_end <= adj_start || adj_end - adj_start < size);
+            if placeable {
+                if mode == DRM_MM_INSERT_HIGH {
+                    adj_start = adj_end - size;
                 }
-                if adj_start < col_start.max(range_start)
-                    || col_end.min(range_end) - adj_start < size
-                {
-                    continue;
+                let mut ok = true;
+                if alignment != 0 {
+                    let rem = if remainder_mask != 0 {
+                        adj_start & remainder_mask
+                    } else {
+                        adj_start % alignment
+                    };
+                    if rem != 0 {
+                        adj_start -= rem;
+                        if mode != DRM_MM_INSERT_HIGH {
+                            adj_start += alignment;
+                        }
+                        if adj_start < col_start.max(range_start)
+                            || col_end.min(range_end) - adj_start < size
+                        {
+                            ok = false;
+                        }
+                        if ok && (adj_end <= adj_start || adj_end - adj_start < size) {
+                            ok = false;
+                        }
+                    }
                 }
-                if adj_end <= adj_start || adj_end - adj_start < size {
-                    continue;
+                if ok {
+                    (*node).mm = mm;
+                    (*node).size = size;
+                    (*node).start = adj_start;
+                    (*node).color = color;
+                    (*node).hole_size = 0;
+                    (*node).flags |= 1 << DRM_MM_NODE_ALLOCATED_BIT;
+                    list_add(core::ptr::addr_of_mut!((*node).node_list), core::ptr::addr_of_mut!((*hole).node_list));
+                    drm_mm_interval_tree_add_node(hole, node);
+                    rm_hole(hole);
+                    if adj_start > hole_start {
+                        add_hole(hole);
+                    }
+                    if adj_start.wrapping_add(size) < hole_end {
+                        add_hole(node);
+                    }
+                    return 0;
                 }
             }
+            hole = if once { core::ptr::null_mut() } else { next_hole(mm, hole, size, mode) };
         }
-        unsafe {
-            (*node).mm = mm;
-            (*node).size = size;
-            (*node).start = adj_start;
-            (*node).color = color;
-            (*node).flags |= 1 << DRM_MM_NODE_ALLOCATED_BIT;
-            list_insert_after(node, hole);
-        }
-        return 0;
+        -ENOSPC
     }
-    -crate::linux_config::ENOSPC
 }
 
-/// Linux `__drm_mm_interval_first()`: the lowest-addressed allocated node that
-/// overlaps `[start, last]`, or NULL.
+/// Linux `drm_mm_remove_node()`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __drm_mm_interval_first(
-    mm: *const DrmMm,
-    start: u64,
-    last: u64,
-) -> *mut DrmMmNode {
-    let mm = mm.cast_mut();
-    let head = unsafe { head_of(mm) };
-    let mut node = unsafe { next_node(head) };
-    while node != head {
-        let node_last = unsafe { (*node).start.wrapping_add((*node).size).wrapping_sub(1) };
-        if unsafe { (*node).start } <= last && node_last >= start {
-            return node;
+pub unsafe extern "C" fn drm_mm_remove_node(node: *mut DrmMmNode) {
+    unsafe {
+        let mm = (*node).mm;
+        let prev_node = node_of_node_list((*node).node_list.prev);
+        if hole_follows(node) {
+            rm_hole(node);
         }
-        node = unsafe { next_node(node) };
+        drm_mm_interval_tree_remove(node, core::ptr::addr_of_mut!((*mm).interval_tree));
+        list_del(core::ptr::addr_of_mut!((*node).node_list));
+        if hole_follows(prev_node) {
+            rm_hole(prev_node);
+        }
+        add_hole(prev_node);
+        (*node).flags &= !(1 << DRM_MM_NODE_ALLOCATED_BIT);
     }
-    core::ptr::null_mut()
 }
 
 /// Linux `drm_mm_scan_init_with_range()`.
@@ -360,138 +714,128 @@ pub unsafe extern "C" fn drm_mm_scan_init_with_range(
     end: u64,
     mode: c_int,
 ) {
-    assert!(!scan.is_null() && !mm.is_null());
-    assert!(start < end && size != 0 && size <= end - start);
     unsafe {
+        let alignment = if alignment <= 1 { 0 } else { alignment };
+        (*scan).color = color;
+        (*scan).alignment = alignment;
+        (*scan).remainder_mask = if alignment.is_power_of_two() { alignment - 1 } else { 0 };
+        (*scan).size = size;
+        (*scan).mode = mode as u32;
         (*scan).mm = mm;
         (*scan).range_start = start;
         (*scan).range_end = end;
-        (*scan).size = size;
-        (*scan).alignment = alignment;
-        (*scan).remainder_mask = if alignment.is_power_of_two() {
-            alignment - 1
-        } else {
-            0
-        };
         (*scan).hit_start = u64::MAX;
         (*scan).hit_end = 0;
-        (*scan).color = color;
-        (*scan).mode = mode as u32;
     }
 }
 
-/// Linux `drm_mm_scan_add_block()`: temporarily remove `node` from the list so
-/// its hole grows, then report whether the enlarged hole fits the request.
+/// Linux `drm_mm_scan_add_block()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_mm_scan_add_block(scan: *mut DrmMmScan, node: *mut DrmMmNode) -> bool {
-    assert!(!scan.is_null() && !node.is_null());
-    let mm = unsafe { (*scan).mm };
     unsafe {
-        assert!(node_allocated(node) && !node_scanned(node));
+        let mm = (*scan).mm;
         (*node).flags |= 1 << DRM_MM_NODE_SCANNED_BIT;
         (*mm).scan_active += 1;
-        let hole = prev_node(node);
-        list_unlink_keep(node);
+        let hole = node_of_node_list((*node).node_list.prev);
+        // __list_del_entry(): unlink without poisoning the node's own links.
+        let entry = core::ptr::addr_of_mut!((*node).node_list);
+        (*(*entry).prev).next = (*entry).next;
+        (*(*entry).next).prev = (*entry).prev;
 
-        let hs = hole_start(hole);
-        let he = hole_end(hole);
-        let mut col_start = hs;
-        let mut col_end = he;
+        let hole_start = hole_node_start(hole);
+        let hole_end = hole_node_end(hole);
+        let mut col_start = hole_start;
+        let mut col_end = hole_end;
         if let Some(adjust) = (*mm).color_adjust {
             adjust(hole, (*scan).color, &mut col_start, &mut col_end);
         }
-        let range_start = (*scan).range_start;
-        let range_end = (*scan).range_end;
-        let size = (*scan).size;
-        let alignment = (*scan).alignment;
-        let mut adj_start = col_start.max(range_start);
-        let adj_end = col_end.min(range_end);
-        if adj_end <= adj_start || adj_end - adj_start < size {
+        let mut adj_start = col_start.max((*scan).range_start);
+        let adj_end = col_end.min((*scan).range_end);
+        if adj_end <= adj_start || adj_end - adj_start < (*scan).size {
             return false;
         }
         if (*scan).mode == DRM_MM_INSERT_HIGH {
-            adj_start = adj_end - size;
+            adj_start = adj_end - (*scan).size;
         }
-        if alignment != 0 {
+        if (*scan).alignment != 0 {
             let rem = if (*scan).remainder_mask != 0 {
                 adj_start & (*scan).remainder_mask
             } else {
-                adj_start % alignment
+                adj_start % (*scan).alignment
             };
             if rem != 0 {
                 adj_start -= rem;
                 if (*scan).mode != DRM_MM_INSERT_HIGH {
-                    adj_start += alignment;
+                    adj_start += (*scan).alignment;
                 }
-                if adj_start < col_start.max(range_start)
-                    || col_end.min(range_end) - adj_start < size
+                if adj_start < col_start.max((*scan).range_start)
+                    || col_end.min((*scan).range_end) - adj_start < (*scan).size
                 {
                     return false;
                 }
-                if adj_end <= adj_start || adj_end - adj_start < size {
+                if adj_end <= adj_start || adj_end - adj_start < (*scan).size {
                     return false;
                 }
             }
         }
         (*scan).hit_start = adj_start;
-        (*scan).hit_end = adj_start + size;
+        (*scan).hit_end = adj_start + (*scan).size;
+        true
     }
-    true
 }
 
-/// Linux `drm_mm_scan_remove_block()`: restore `node` into the list and report
-/// whether it overlaps the hole found by the scan.
+/// Linux `drm_mm_scan_remove_block()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_mm_scan_remove_block(scan: *mut DrmMmScan, node: *mut DrmMmNode) -> bool {
-    assert!(!scan.is_null() && !node.is_null());
     unsafe {
-        assert!(node_scanned(node));
         (*node).flags &= !(1 << DRM_MM_NODE_SCANNED_BIT);
-        let mm = (*scan).mm;
-        assert!((*mm).scan_active != 0);
+        let mm = (*node).mm;
         (*mm).scan_active -= 1;
-        let prev = prev_node(node);
-        list_insert_after(node, prev);
-        (*node).start.wrapping_add((*node).size) > (*scan).hit_start
-            && (*node).start < (*scan).hit_end
+        let prev_node = node_of_node_list((*node).node_list.prev);
+        list_add(core::ptr::addr_of_mut!((*node).node_list), core::ptr::addr_of_mut!((*prev_node).node_list));
+        (*node).start.wrapping_add((*node).size) > (*scan).hit_start && (*node).start < (*scan).hit_end
     }
 }
 
-/// Linux `drm_mm_scan_color_evict()`: when `color_adjust` leaves nodes
-/// overlapping the found hole, return one of them for eviction.
+/// Linux `drm_mm_scan_color_evict()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_mm_scan_color_evict(scan: *mut DrmMmScan) -> *mut DrmMmNode {
-    assert!(!scan.is_null());
-    let mm = unsafe { (*scan).mm };
-    let Some(adjust) = (unsafe { (*mm).color_adjust }) else {
-        return core::ptr::null_mut();
-    };
-    let (hit_start, hit_end) = unsafe { ((*scan).hit_start, (*scan).hit_end) };
-    let mut found: *mut DrmMmNode = core::ptr::null_mut();
     unsafe {
-        holes_in_order(mm, |hole| {
-            if hole_start(hole) <= hit_start && hole_end(hole) >= hit_end {
-                found = hole;
-                false
-            } else {
-                true
+        let mm = (*scan).mm;
+        if (*mm).color_adjust.is_none() {
+            return core::ptr::null_mut();
+        }
+        let stack = core::ptr::addr_of_mut!((*mm).hole_stack);
+        let mut link = (*stack).next;
+        let mut hole: *mut DrmMmNode = core::ptr::null_mut();
+        while link != stack {
+            let candidate = node_of_hole_stack(link);
+            let hole_start = hole_node_start(candidate);
+            let hole_end = hole_start.wrapping_add((*candidate).hole_size);
+            if hole_start <= (*scan).hit_start && hole_end >= (*scan).hit_end {
+                hole = candidate;
+                break;
             }
-        });
+            link = (*link).next;
+        }
+        if hole.is_null() {
+            return core::ptr::null_mut();
+        }
+        let mut hole_start = hole_node_start(hole);
+        let mut hole_end = hole_start.wrapping_add((*hole).hole_size);
+        if let Some(adjust) = (*mm).color_adjust {
+            adjust(hole, (*scan).color, &mut hole_start, &mut hole_end);
+        }
+        if hole_start > (*scan).hit_start {
+            return hole;
+        }
+        if hole_end < (*scan).hit_end {
+            return node_of_node_list((*hole).node_list.next);
+        }
+        core::ptr::null_mut()
     }
-    if found.is_null() {
-        return core::ptr::null_mut();
-    }
-    let mut start = unsafe { hole_start(found) };
-    let mut end = unsafe { hole_end(found) };
-    unsafe { adjust(found, (*scan).color, &mut start, &mut end) };
-    if start > hit_start {
-        return found;
-    }
-    if end < hit_end {
-        return unsafe { next_node(found) };
-    }
-    core::ptr::null_mut()
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -517,7 +861,7 @@ mod tests {
         let mut c = new_node();
         c.start = 0x1800;
         c.size = 0x1000;
-        assert_eq!(unsafe { drm_mm_reserve_node(mm, &mut c) }, -crate::linux_config::ENOSPC);
+        assert_eq!(unsafe { drm_mm_reserve_node(mm, &mut c) }, -ENOSPC);
         let mut d = new_node();
         d.start = 0x8000;
         d.size = 0x1000;
@@ -540,8 +884,6 @@ mod tests {
         let mut scan = MaybeUninit::<DrmMmScan>::zeroed();
         let scan = scan.as_mut_ptr();
         unsafe { drm_mm_scan_init_with_range(scan, mm, 0x2000, 0, 0, 0, u64::MAX, 0) };
-        // One 0x1000 block frees 0x1000, which is too small; the second
-        // adjacent block makes a 0x2000 hole.
         assert!(!unsafe { drm_mm_scan_add_block(scan, &mut nodes[0]) });
         assert!(unsafe { drm_mm_scan_add_block(scan, &mut nodes[1]) });
         assert_eq!(unsafe { (*scan).hit_start }, 0);
@@ -553,6 +895,38 @@ mod tests {
         for node in nodes.iter_mut() {
             unsafe { drm_mm_remove_node(node) };
         }
+        unsafe { drm_mm_takedown(mm) };
+    }
+
+    #[test]
+    fn hole_trees_track_free_space_after_churn() {
+        let mut mm = MaybeUninit::<DrmMm>::zeroed();
+        let mm = mm.as_mut_ptr();
+        unsafe { drm_mm_init(mm, 0, 0x100000) };
+        let mut nodes: alloc::vec::Vec<DrmMmNode> = (0..64).map(|_| new_node()).collect();
+        for (i, node) in nodes.iter_mut().enumerate() {
+            let size = 0x1000 * (1 + (i as u64 % 5));
+            assert_eq!(unsafe { drm_mm_insert_node_in_range(mm, node, size, 0x1000, 0, 0, u64::MAX, DRM_MM_INSERT_BEST) }, 0);
+        }
+        for i in (0..64).step_by(2) {
+            unsafe { drm_mm_remove_node(&mut nodes[i]) };
+        }
+        // Allocated nodes must never overlap.
+        let mut sorted: alloc::vec::Vec<(u64, u64)> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, n)| (n.start, n.size))
+            .collect();
+        sorted.sort();
+        for pair in sorted.windows(2) {
+            assert!(pair[0].0 + pair[0].1 <= pair[1].0);
+        }
+        for i in (1..64).step_by(2) {
+            unsafe { drm_mm_remove_node(&mut nodes[i]) };
+        }
+        assert_eq!(unsafe { drm_mm_insert_node_in_range(mm, &mut nodes[0], 0x100000, 0, 0, 0, u64::MAX, DRM_MM_INSERT_BEST) }, 0);
+        unsafe { drm_mm_remove_node(&mut nodes[0]) };
         unsafe { drm_mm_takedown(mm) };
     }
 }

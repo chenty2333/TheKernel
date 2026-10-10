@@ -110,22 +110,43 @@ unsafe fn replace_node(root: *mut *mut RbNode, old: *mut RbNode, new: *mut RbNod
     set_parent(new, p);
 }
 
-unsafe fn rotate_left(root: *mut *mut RbNode, node: *mut RbNode) {
+/// Augmentation hooks for trees whose nodes carry a subtree summary, as Linux
+/// `struct rb_augment_callbacks`. `propagate(node, stop)` recomputes the summary
+/// from `node` upward until `stop` (or the root); `copy(old, new)` gives `new`
+/// the summary of `old`; `rotate(old, new)` is called after a rotation that
+/// moved `new` above `old`.
+#[repr(C)]
+pub struct RbAugment {
+    pub propagate: unsafe fn(*mut RbNode, *mut RbNode),
+    pub copy: unsafe fn(*mut RbNode, *mut RbNode),
+    pub rotate: unsafe fn(*mut RbNode, *mut RbNode),
+}
+
+#[inline]
+unsafe fn augment_rotate(aug: *const RbAugment, old: *mut RbNode, new: *mut RbNode) {
+    if !aug.is_null() {
+        unsafe { ((*aug).rotate)(old, new) };
+    }
+}
+
+unsafe fn rotate_left(root: *mut *mut RbNode, node: *mut RbNode, aug: *const RbAugment) {
     let right = (*node).right;
     (*node).right = (*right).left;
     set_parent((*right).left, node);
     replace_node(root, node, right);
     (*right).left = node;
     set_parent(node, right);
+    unsafe { augment_rotate(aug, node, right) };
 }
 
-unsafe fn rotate_right(root: *mut *mut RbNode, node: *mut RbNode) {
+unsafe fn rotate_right(root: *mut *mut RbNode, node: *mut RbNode, aug: *const RbAugment) {
     let left = (*node).left;
     (*node).left = (*left).right;
     set_parent((*left).right, node);
     replace_node(root, node, left);
     (*left).right = node;
     set_parent(node, left);
+    unsafe { augment_rotate(aug, node, left) };
 }
 
 /// Link a node into an ordinary Linux rb-tree at a caller-selected slot.
@@ -153,6 +174,12 @@ pub unsafe extern "C" fn rb_link_node(
 /// invariants using the crate's intrusive-node representation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rb_insert_color(node: *mut RbNode, root: *mut RbRoot) {
+    unsafe { insert_color(node, root, core::ptr::null()) };
+}
+
+/// Insert fixup for a node already linked by `rb_link_node()`, reporting
+/// rotations to `aug` when it is non-null (Linux `rb_insert_augmented()`).
+pub unsafe fn insert_color(node: *mut RbNode, root: *mut RbRoot, aug: *const RbAugment) {
     let mut node = node;
     let root = unsafe { core::ptr::addr_of_mut!((*root).node) };
 
@@ -181,14 +208,14 @@ pub unsafe extern "C" fn rb_insert_color(node: *mut RbNode, root: *mut RbRoot) {
 
             if core::ptr::eq(node, unsafe { (*p).right }) {
                 node = p;
-                unsafe { rotate_left(root, node) };
+                unsafe { rotate_left(root, node, aug) };
             }
             let p = unsafe { parent(node) };
             let g = unsafe { parent(p) };
             unsafe {
                 set_color(p, RB_BLACK);
                 set_color(g, RB_RED);
-                rotate_right(root, g);
+                rotate_right(root, g, aug);
             }
         } else {
             let u = unsafe { (*g).left };
@@ -204,14 +231,14 @@ pub unsafe extern "C" fn rb_insert_color(node: *mut RbNode, root: *mut RbRoot) {
 
             if core::ptr::eq(node, unsafe { (*p).left }) {
                 node = p;
-                unsafe { rotate_right(root, node) };
+                unsafe { rotate_right(root, node, aug) };
             }
             let p = unsafe { parent(node) };
             let g = unsafe { parent(p) };
             unsafe {
                 set_color(p, RB_BLACK);
                 set_color(g, RB_RED);
-                rotate_left(root, g);
+                rotate_left(root, g, aug);
             }
         }
         break;
@@ -258,7 +285,7 @@ pub unsafe fn rb_first(root: *const RbRoot) -> *mut RbNode {
     node
 }
 
-unsafe fn erase_fixup(root: *mut *mut RbNode, mut node: *mut RbNode, mut p: *mut RbNode) {
+unsafe fn erase_fixup(root: *mut *mut RbNode, mut node: *mut RbNode, mut p: *mut RbNode, aug: *const RbAugment) {
     while !core::ptr::eq(node, *root) && color(node) == RB_BLACK {
         if p.is_null() {
             break;
@@ -268,7 +295,7 @@ unsafe fn erase_fixup(root: *mut *mut RbNode, mut node: *mut RbNode, mut p: *mut
             if color(sibling) == RB_RED {
                 set_color(sibling, RB_BLACK);
                 set_color(p, RB_RED);
-                rotate_left(root, p);
+                rotate_left(root, p, aug);
                 sibling = (*p).right;
             }
             if sibling.is_null()
@@ -281,13 +308,13 @@ unsafe fn erase_fixup(root: *mut *mut RbNode, mut node: *mut RbNode, mut p: *mut
                 if color((*sibling).right) == RB_BLACK {
                     set_color((*sibling).left, RB_BLACK);
                     set_color(sibling, RB_RED);
-                    rotate_right(root, sibling);
+                    rotate_right(root, sibling, aug);
                     sibling = (*p).right;
                 }
                 set_color(sibling, color(p));
                 set_color(p, RB_BLACK);
                 set_color((*sibling).right, RB_BLACK);
-                rotate_left(root, p);
+                rotate_left(root, p, aug);
                 node = *root;
                 p = core::ptr::null_mut();
             }
@@ -296,7 +323,7 @@ unsafe fn erase_fixup(root: *mut *mut RbNode, mut node: *mut RbNode, mut p: *mut
             if color(sibling) == RB_RED {
                 set_color(sibling, RB_BLACK);
                 set_color(p, RB_RED);
-                rotate_right(root, p);
+                rotate_right(root, p, aug);
                 sibling = (*p).left;
             }
             if sibling.is_null()
@@ -309,13 +336,13 @@ unsafe fn erase_fixup(root: *mut *mut RbNode, mut node: *mut RbNode, mut p: *mut
                 if color((*sibling).left) == RB_BLACK {
                     set_color((*sibling).right, RB_BLACK);
                     set_color(sibling, RB_RED);
-                    rotate_left(root, sibling);
+                    rotate_left(root, sibling, aug);
                     sibling = (*p).left;
                 }
                 set_color(sibling, color(p));
                 set_color(p, RB_BLACK);
                 set_color((*sibling).left, RB_BLACK);
-                rotate_right(root, p);
+                rotate_right(root, p, aug);
                 node = *root;
                 p = core::ptr::null_mut();
             }
@@ -324,7 +351,7 @@ unsafe fn erase_fixup(root: *mut *mut RbNode, mut node: *mut RbNode, mut p: *mut
     set_color(node, RB_BLACK);
 }
 
-unsafe fn erase(node: *mut RbNode, root: *mut *mut RbNode) {
+unsafe fn erase(node: *mut RbNode, root: *mut *mut RbNode, aug: *const RbAugment) {
     let mut moved = node;
     let mut moved_color = color(moved);
     let child;
@@ -362,7 +389,19 @@ unsafe fn erase(node: *mut RbNode, root: *mut *mut RbNode) {
     }
 
     if moved_color == RB_BLACK {
-        erase_fixup(root, child, child_parent);
+        erase_fixup(root, child, child_parent, aug);
+    }
+    if !aug.is_null() {
+        // Structure changed around `child_parent` and `moved`; recompute the
+        // summaries on both paths to the root (exact, independent of shape).
+        unsafe {
+            if !child_parent.is_null() {
+                ((*aug).propagate)(child_parent, core::ptr::null_mut());
+            }
+            if !moved.is_null() && moved != node {
+                ((*aug).propagate)(moved, core::ptr::null_mut());
+            }
+        }
     }
     (*node).left = core::ptr::null_mut();
     (*node).right = core::ptr::null_mut();
@@ -396,7 +435,7 @@ impl RbNodePtr for &RbNode {
 pub unsafe fn rb_erase_impl<N: RbNodePtr>(node: N, root: &mut RbRoot) {
     let node = node.rb_node_ptr();
     assert!(!node.is_null());
-    unsafe { erase(node, core::ptr::addr_of_mut!(root.node)) };
+    unsafe { erase(node, core::ptr::addr_of_mut!(root.node), core::ptr::null()) };
 }
 
 pub fn rb_erase_cached<N: RbNodePtr>(node: N, root: &mut RbRootCached) {
@@ -406,7 +445,7 @@ pub fn rb_erase_cached<N: RbNodePtr>(node: N, root: &mut RbRootCached) {
         if core::ptr::eq(root.leftmost, node) {
             root.leftmost = rb_next(node);
         }
-        erase(node, core::ptr::addr_of_mut!(root.root.node));
+        erase(node, core::ptr::addr_of_mut!(root.root.node), core::ptr::null());
     }
 }
 
@@ -490,4 +529,106 @@ mod tests {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rb_erase(node: *mut RbNode, root: *mut RbRoot) {
     unsafe { self::rb_erase_impl(node, &mut *root) };
+}
+
+/// Linux `rb_insert_augmented()`: rebalance after `rb_link_node()`, keeping the
+/// subtree summaries in `aug` current across rotations.
+///
+/// # Safety
+/// `node` must be linked into `root` and `aug` must describe the node type.
+pub unsafe fn rb_insert_augmented(node: *mut RbNode, root: *mut RbRoot, aug: *const RbAugment) {
+    unsafe { insert_color(node, root, aug) };
+}
+
+/// Linux `rb_insert_augmented_cached()` with `rb_insert_color_cached()`'s
+/// leftmost tracking.
+///
+/// # Safety
+/// As [`rb_insert_augmented`]; `leftmost` must be true iff `node` is the new
+/// leftmost node.
+pub unsafe fn rb_insert_augmented_cached(
+    node: *mut RbNode,
+    root: *mut RbRootCached,
+    leftmost: bool,
+    aug: *const RbAugment,
+) {
+    unsafe {
+        if leftmost {
+            (*root).leftmost = node;
+        }
+        insert_color(node, core::ptr::addr_of_mut!((*root).root), aug);
+    }
+}
+
+/// Linux `rb_erase_augmented()`.
+///
+/// # Safety
+/// `node` must be in `root`; `aug` must describe the node type.
+pub unsafe fn rb_erase_augmented(node: *mut RbNode, root: *mut RbRoot, aug: *const RbAugment) {
+    unsafe { erase(node, core::ptr::addr_of_mut!((*root).node), aug) };
+}
+
+/// Linux `rb_erase_augmented_cached()`: also keeps the cached leftmost node.
+///
+/// # Safety
+/// As [`rb_erase_augmented`].
+pub unsafe fn rb_erase_augmented_cached(
+    node: *mut RbNode,
+    root: *mut RbRootCached,
+    aug: *const RbAugment,
+) {
+    unsafe {
+        if (*root).leftmost == node {
+            (*root).leftmost = rb_next(node);
+        }
+        erase(node, core::ptr::addr_of_mut!((*root).root.node), aug);
+    }
+}
+
+/// Linux `rb_parent()`.
+///
+/// # Safety
+/// `node` must be a valid node.
+pub unsafe fn rb_parent(node: *mut RbNode) -> *mut RbNode {
+    unsafe { parent(node) }
+}
+
+/// Linux `rb_prev()`: the in-order predecessor, or NULL.
+///
+/// # Safety
+/// `node` must be a node of a valid tree.
+pub unsafe fn rb_prev(node: *mut RbNode) -> *mut RbNode {
+    if node.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        if !(*node).left.is_null() {
+            let mut prev = (*node).left;
+            while !(*prev).right.is_null() {
+                prev = (*prev).right;
+            }
+            return prev;
+        }
+        let mut current = node;
+        let mut p = parent(current);
+        while !p.is_null() && core::ptr::eq((*p).left, current) {
+            current = p;
+            p = parent(p);
+        }
+        p
+    }
+}
+
+/// Linux `rb_insert_color_cached()`: rebalance after `rb_link_node()`, with
+/// the cached leftmost pointer updated when the new node is leftmost.
+///
+/// # Safety
+/// `node` must be linked into `root`.
+pub unsafe fn rb_insert_color_cached(node: *mut RbNode, root: *mut RbRootCached, leftmost: bool) {
+    unsafe {
+        if leftmost {
+            (*root).leftmost = node;
+        }
+        insert_color(node, core::ptr::addr_of_mut!((*root).root), core::ptr::null());
+    }
 }

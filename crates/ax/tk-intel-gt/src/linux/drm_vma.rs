@@ -108,7 +108,9 @@ pub unsafe extern "C" fn drm_vma_offset_lookup_locked(
             last,
         )
     };
-    if vm_node.is_null() {
+    // `__drm_mm_interval_first()` returns the head sentinel when nothing
+    // overlaps, as the upstream callers expect.
+    if vm_node.is_null() || vm_node == unsafe { core::ptr::addr_of_mut!((*mgr).vm_addr_space.head_node) } {
         return core::ptr::null_mut();
     }
     let spans = unsafe {
