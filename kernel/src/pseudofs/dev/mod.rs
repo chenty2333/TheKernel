@@ -170,6 +170,12 @@ impl SimpleDirOps for DevRoot {
         false
     }
 
+    fn is_cacheable_child(&self, name: &FsName) -> bool {
+        // `/dev` mixes stable built-ins with runtime sockets and block-device
+        // names. Cache only built-ins; dynamic children remain live lookups.
+        self.static_entries.contains_name(name)
+    }
+
     fn namespace_epoch(&self) -> u64 {
         self.namespace_epoch.load(Ordering::Acquire)
     }
@@ -997,6 +1003,45 @@ mod tests {
 
         root.unlink(name, false).unwrap();
         assert!(matches!(root.lookup(name), Err(VfsError::NotFound)));
+    }
+
+    #[test]
+    fn devfs_caches_static_names_but_revalidates_runtime_sockets() {
+        let devfs = new_test_devfs();
+        let root = devfs.root_dir();
+        let root = root.as_dir().unwrap();
+
+        let static_name = FsName::new(b"null");
+        let static_entry = root.lookup(static_name).unwrap();
+        assert!(
+            root.lookup_cache(static_name)
+                .is_some_and(|cached| cached.ptr_eq(&static_entry)),
+            "stable built-in /dev entries should use the positive dentry cache"
+        );
+
+        let socket_name = FsName::new(b"runtime-socket");
+        let socket = root
+            .create(
+                socket_name,
+                NodeType::Socket,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        assert!(root.lookup_cache(static_name).is_none());
+        let refreshed_static = root.lookup(static_name).unwrap();
+        assert_eq!(refreshed_static.object_key(), static_entry.object_key());
+        assert!(root.lookup_cache(static_name).is_some());
+
+        assert!(root.lookup_cache(socket_name).is_none());
+        assert_eq!(
+            root.lookup(socket_name).unwrap().object_key(),
+            socket.object_key()
+        );
+        assert!(root.lookup_cache(socket_name).is_none());
+
+        root.unlink(socket_name, false).unwrap();
+        assert!(matches!(root.lookup(socket_name), Err(VfsError::NotFound)));
+        assert!(root.lookup_cache(socket_name).is_none());
     }
 
     #[test]

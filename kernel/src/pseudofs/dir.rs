@@ -44,6 +44,13 @@ pub trait SimpleDirOps: Send + Sync + 'static {
         true
     }
 
+    /// Returns whether one named child has a stable dentry identity.
+    /// Mixed pseudo-directories may cache permanent children while
+    /// re-resolving generated names on every lookup.
+    fn is_cacheable_child(&self, _name: &FsName) -> bool {
+        self.is_cacheable()
+    }
+
     /// Returns the current namespace generation for dynamic directories.
     /// Static pseudo-directories retain the zero default.
     fn namespace_epoch(&self) -> u64 {
@@ -113,6 +120,10 @@ impl DirMapping {
             .expect("simple pseudo-filesystem entry names must be valid");
         self.0.insert(name, ops.into());
     }
+
+    pub(crate) fn contains_name(&self, name: &FsName) -> bool {
+        self.0.contains_key(name)
+    }
 }
 
 impl Default for DirMapping {
@@ -138,9 +149,16 @@ impl<A: SimpleDirOps, B: SimpleDirOps> SimpleDirOps for ChainedDirOps<A, B> {
     }
 
     fn is_cacheable(&self) -> bool {
-        // TODO: If one of the ops is not cacheable while the other is, the
-        // behavior is undefined.
+        // Conservatively disable whole-directory caching unless both
+        // providers mark the directory stable. The child policy below can
+        // narrow this further, but cannot infer which provider owns a name.
         self.0.is_cacheable() && self.1.is_cacheable()
+    }
+
+    fn is_cacheable_child(&self, name: &FsName) -> bool {
+        // The chain cannot know which provider owns `name` without performing
+        // a lookup (which may be dynamic), so require both policies to agree.
+        self.0.is_cacheable_child(name) && self.1.is_cacheable_child(name)
     }
 }
 
@@ -250,6 +268,10 @@ impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
 
     fn is_cacheable(&self) -> bool {
         self.ops.is_cacheable()
+    }
+
+    fn is_cacheable_child(&self, name: &FsName) -> bool {
+        self.ops.is_cacheable_child(name)
     }
 
     fn namespace_epoch(&self) -> u64 {

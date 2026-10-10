@@ -77,6 +77,15 @@ pub trait DirNodeOps: NodeOps {
         true
     }
 
+    /// Returns whether this particular child has a stable dentry identity.
+    /// Mixed directories may cache stable names while resolving dynamic names
+    /// on every lookup. Backends must keep this policy stable for the
+    /// directory object's lifetime; namespace changes still advance
+    /// [`Self::namespace_epoch`] as usual.
+    fn is_cacheable_child(&self, _name: &FsName) -> bool {
+        self.is_cacheable()
+    }
+
     /// Returns the current backend namespace epoch for this physical
     /// directory.
     ///
@@ -630,7 +639,7 @@ impl DirNode {
     }
 
     fn prepare_cache_name(&self, name: &FsName) -> Option<FsNameBuf> {
-        if !self.ops.is_cacheable() {
+        if !self.ops.is_cacheable_child(name) {
             return None;
         }
         let mut bytes = alloc::vec::Vec::new();
@@ -701,7 +710,7 @@ impl DirNode {
         if name.len() > MAX_NAME_LEN {
             return Err(VfsError::NameTooLong);
         }
-        if !self.ops.is_cacheable() {
+        if !self.ops.is_cacheable_child(name) {
             return self.ops.lookup(name).inspect(|entry| {
                 Self::defer_uncached_directory(entry);
             });
@@ -729,7 +738,7 @@ impl DirNode {
 
     /// Looks up a directory entry by name in cache.
     pub fn lookup_cache(&self, name: &FsName) -> Option<DirEntry> {
-        if self.ops.is_cacheable() {
+        if self.ops.is_cacheable_child(name) {
             let backend_epoch = self.ops.namespace_epoch();
             let mut cache = self.cache.lock();
             if self.cache_retired.load(Ordering::Acquire) {
@@ -749,7 +758,7 @@ impl DirNode {
 
     /// Inserts a directory entry into the cache.
     pub fn insert_cache(&self, name: FsNameBuf, entry: DirEntry) -> Option<DirEntry> {
-        if self.ops.is_cacheable() {
+        if self.ops.is_cacheable_child(&name) {
             let backend_epoch = self.ops.namespace_epoch();
             let mut cache = self.cache.lock();
             if self.cache_retired.load(Ordering::Acquire) {
