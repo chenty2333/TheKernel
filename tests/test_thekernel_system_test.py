@@ -150,7 +150,7 @@ class SystemTestGateTests(unittest.TestCase):
                 "iwlwifi-so-a0-gf-a0-89.ucode", "iwlwifi-so-a0-gf-a0.pnvm",
                 "LICENCE.iwlwifi_firmware"),
             "THEKERNEL_I915_UC_FIRMWARE_DIR": (
-                "tgl_guc_70.bin", "tgl_huc.bin", "LICENSE.i915"),
+                "adlp_guc_70.bin", "tgl_guc_70.bin", "tgl_huc.bin", "LICENSE.i915"),
             "THEKERNEL_I915_DMC_FIRMWARE_DIR": (
                 "adlp_dmc.bin", "adlp_dmc_ver2_16.bin", "adls_dmc_ver2_01.bin",
                 "rkl_dmc_ver2_03.bin", "tgl_dmc_ver2_12.bin", "LICENSE.i915"),
