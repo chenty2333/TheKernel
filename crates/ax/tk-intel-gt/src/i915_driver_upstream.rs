@@ -233,7 +233,7 @@ unsafe fn enable_rpm_wakeref_asserts<T>(rpm: *mut T) {
 }
 
 /// `atomic_read(&rpm->wakeref_count)`.
-unsafe fn atomic_read_rpm_wakeref(rpm: *mut IntelRuntimePm) -> i32 {
+pub(crate) unsafe fn atomic_read_rpm_wakeref(rpm: *mut IntelRuntimePm) -> i32 {
     unsafe { atomic_read(&(*rpm.cast::<IntelRuntimePmLayout>()).wakeref_count) }
 }
 

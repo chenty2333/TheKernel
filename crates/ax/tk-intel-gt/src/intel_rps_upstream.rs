@@ -659,7 +659,7 @@ unsafe extern "C" {
         val1: u32,
         timeout: u32,
     ) -> i32;
-    fn i915_vgpu_active(i915: *mut DrmI915Private) -> bool;
+    fn intel_vgpu_active(i915: *mut DrmI915Private) -> bool;
 }
 const IOSF_SB_PUNIT: u32 = 8;
 const IOSF_SB_NC: u32 = 7;

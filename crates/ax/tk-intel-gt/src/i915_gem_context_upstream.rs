@@ -520,7 +520,7 @@ pub unsafe fn i915_gem_context_put(ctx: *mut I915GemContext) {
     unsafe { kref_put(ptr::addr_of_mut!((*ctx).r#ref), i915_gem_context_release) };
 }
 
-unsafe fn i915_gem_context_no_error_capture(ctx: *const I915GemContext) -> bool {
+pub(crate) unsafe fn i915_gem_context_no_error_capture(ctx: *const I915GemContext) -> bool {
     test_bit(UCONTEXT_NO_ERROR_CAPTURE, unsafe { &(*ctx).user_flags })
 }
 unsafe fn i915_gem_context_is_bannable(ctx: *const I915GemContext) -> bool {

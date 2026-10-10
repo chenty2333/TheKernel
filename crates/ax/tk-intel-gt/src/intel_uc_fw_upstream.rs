@@ -467,7 +467,7 @@ unsafe fn is_adlp_n(i915: *mut DrmI915Private) -> bool {
     matches!(id, 0x46d0..=0x46d4)
 }
 
-unsafe fn has_gt_uc(i915: *mut DrmI915Private) -> bool {
+pub(crate) unsafe fn has_gt_uc(i915: *mut DrmI915Private) -> bool {
     let info = unsafe { (*i915).info.cast::<IntelDeviceInfoOverlay>() };
     !info.is_null() && unsafe { (*info).flags[1] & (1 << 3) != 0 }
 }

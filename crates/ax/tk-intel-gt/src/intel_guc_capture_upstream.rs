@@ -69,14 +69,8 @@ pub struct ParsedOutput {
     pub reginfo: [RegInfo; 3],
 }
 
-#[repr(C)]
-struct IntelEngineCoredumpView {
-    engine: *mut IntelEngineCs,
-    capture: *mut IntelGucStateCapture,
-    guc_capture_node: *mut ParsedOutput,
-    ipehr: u32,
-    instdone: u32,
-}
+/// `struct intel_engine_coredump` (the upstream layout lives in i915_gpu_error_upstream).
+pub(crate) type IntelEngineCoredumpView = crate::i915_gpu_error_upstream::IntelEngineCoredump;
 
 #[repr(C)]
 struct CaptureRegDescriptor {
@@ -1293,19 +1287,19 @@ unsafe fn guc_capture_find_ecode(engine_dump: *mut IntelEngineCoredumpView) {
         if reg.offset == crate::intel_engine_regs_upstream::RING_IPEHR(0).reg {
             unsafe { (*engine_dump).ipehr = reg.value };
         } else if reg.offset == crate::intel_engine_regs_upstream::RING_INSTDONE(0).reg {
-            unsafe { (*engine_dump).instdone = reg.value };
+            unsafe { (*engine_dump).instdone.instdone = reg.value };
         }
     }
 }
 
 // upstream: intel_guc_capture.c intel_guc_capture_free_node()
-unsafe fn intel_guc_capture_free_node(engine_dump: *mut IntelEngineCoredumpView) {
+pub(crate) unsafe fn intel_guc_capture_free_node(engine_dump: *mut IntelEngineCoredumpView) {
     if engine_dump.is_null() || unsafe { (*engine_dump).guc_capture_node.is_null() } {
         return;
     }
     unsafe {
-        guc_capture_add_node_to_cachelist((*engine_dump).capture, (*engine_dump).guc_capture_node);
-        (*engine_dump).capture = ptr::null_mut();
+        guc_capture_add_node_to_cachelist((*engine_dump).guc_capture, (*engine_dump).guc_capture_node);
+        (*engine_dump).guc_capture = ptr::null_mut();
         (*engine_dump).guc_capture_node = ptr::null_mut();
     }
 }
@@ -1340,7 +1334,7 @@ pub unsafe fn intel_guc_capture_is_matching_engine(
 }
 
 // upstream: intel_guc_capture.c intel_guc_capture_get_matching_node()
-unsafe fn intel_guc_capture_get_matching_node(
+pub(crate) unsafe fn intel_guc_capture_get_matching_node(
     gt: *mut IntelGt,
     engine_dump: *mut IntelEngineCoredumpView,
     ce: *mut IntelContext,
@@ -1371,7 +1365,7 @@ unsafe fn intel_guc_capture_get_matching_node(
             unsafe {
                 list_del(&mut (*output).link);
                 (*engine_dump).guc_capture_node = output;
-                (*engine_dump).capture = gc;
+                (*engine_dump).guc_capture = gc;
                 guc_capture_find_ecode(engine_dump);
             }
             return;

@@ -145,7 +145,7 @@ unsafe fn drm_notice<T>(device: *mut T, format: *const c_char, argument: *const 
 // Linux records passed through pointers remain opaque here. The records whose
 // source members this file accesses are represented by source-derived prefixes.
 #[repr(C)]
-struct SgtIter {
+pub(crate) struct SgtIter {
     sgp: *mut ScatterList,
     pfn: c_ulong,
     curr: u32,
@@ -280,7 +280,7 @@ fn resource_size(resource: &Resource) -> u64 {
 }
 
 #[inline]
-unsafe fn sgt_iter_init(sg: *mut ScatterList) -> SgtIter {
+pub(crate) unsafe fn sgt_iter_init(sg: *mut ScatterList) -> SgtIter {
     let mut iter = SgtIter {
         sgp: sg,
         pfn: 0,
@@ -298,7 +298,7 @@ unsafe fn sgt_iter_init(sg: *mut ScatterList) -> SgtIter {
 /// Rust expansion of i915's `for_each_sgt_page` macro. This preserves its
 /// PFN sentinel, byte offset, page-size advance and sg-next transition.
 #[inline]
-unsafe fn sgt_iter_next_page(iter: &mut SgtIter) -> *mut Page {
+pub(crate) unsafe fn sgt_iter_next_page(iter: &mut SgtIter) -> *mut Page {
     if iter.sgp.is_null() || iter.pfn == 0 {
         return ptr::null_mut();
     }

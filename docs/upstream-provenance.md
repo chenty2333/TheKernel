@@ -2157,3 +2157,4 @@ in `intel_guc_fw_upstream.rs`. Fail-closed definitions for LMEM/TTM, migrate,
 GSC/HECI/PXP, MTL sa_media, gen6/7 PPGTT, GMCH GGTT, ring submission, OA perf and
 debugfs are collected in `intel_unsupported_hw_upstream.rs`, one line per function
 in the source comments.
+`crates/ax/tk-intel-gt/src/i915_gpu_error_upstream.rs` (round 2): now uses the upstream `struct i915_gpu_coredump` / `intel_gt_coredump` / `intel_engine_coredump` layout. Translated from Linux 7.2.3 `drivers/gpu/drm/i915/i915_gpu_error.c` (MIT, Copyright (c) 2008 Intel Corporation): coredump alloc/free, engine/GT register capture, VMA page capture (non-compressing, `CONFIG_DRM_I915_COMPRESS_ERROR` unset), GuC capture path via `__i915_gpu_coredump`, store/reset/disable. debugfs/sysfs and scatterlist printing are not translated; display snapshot is left NULL.

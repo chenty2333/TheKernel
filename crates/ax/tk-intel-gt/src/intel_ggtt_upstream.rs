@@ -146,7 +146,7 @@ unsafe fn intel_ppgtt_type(i915: *mut DrmI915Private) -> i32 {
     unsafe { (*info).runtime.ppgtt_type }
 }
 
-unsafe fn has_ppgtt(i915: *mut DrmI915Private) -> bool {
+pub(crate) unsafe fn has_ppgtt(i915: *mut DrmI915Private) -> bool {
     unsafe { intel_ppgtt_type(i915) != I915_PPGTT_NONE }
 }
 
