@@ -466,6 +466,10 @@ pub(super) fn render_registered() -> bool {
 /// Independent boot hook; default path never writes forcewake or resets GT.
 #[cfg(target_os = "none")]
 pub(super) fn init_at_boot() {
+    #[cfg(feature = "intel-upstream-gt")]
+    if let Err(error) = super::upstream_gt::install_providers() {
+        axlog::warn!("intel-gt: upstream providers not installed: {error}");
+    }
     if axhal::boot::command_line_value("intel.gt") != Some("1") {
         return;
     }
