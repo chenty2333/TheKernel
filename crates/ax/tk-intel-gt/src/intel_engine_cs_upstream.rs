@@ -701,7 +701,8 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES as usize] = [
 ];
 
 // upstream: intel_engine_cs.c intel_engine_context_size()
-pub unsafe fn intel_engine_context_size(gt: *mut IntelGt, class: u8) -> u32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_context_size(gt: *mut IntelGt, class: u8) -> u32 {
     let uncore = (*gt).uncore;
     let mut cxt_size: u32;
 
@@ -793,7 +794,8 @@ unsafe fn __sprint_engine_name(engine: *mut IntelEngineCs) {
 }
 
 // upstream: intel_engine_cs.c intel_engine_set_hwsp_writemask()
-pub unsafe fn intel_engine_set_hwsp_writemask(engine: *mut IntelEngineCs, mask: u32) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_set_hwsp_writemask(engine: *mut IntelEngineCs, mask: u32) {
     if GRAPHICS_VER((*engine).i915) < 6 && (*engine).class as i32 != RENDER_CLASS {
         return;
     }
@@ -982,7 +984,8 @@ unsafe fn intel_engine_setup(gt: *mut IntelGt, id: IntelEngineId, logical_instan
 }
 
 // upstream: intel_engine_cs.c intel_clamp_heartbeat_interval_ms()
-pub unsafe fn intel_clamp_heartbeat_interval_ms(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_clamp_heartbeat_interval_ms(
     _engine: *mut IntelEngineCs,
     mut value: u64,
 ) -> u64 {
@@ -991,7 +994,8 @@ pub unsafe fn intel_clamp_heartbeat_interval_ms(
 }
 
 // upstream: intel_engine_cs.c intel_clamp_max_busywait_duration_ns()
-pub unsafe fn intel_clamp_max_busywait_duration_ns(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_clamp_max_busywait_duration_ns(
     _engine: *mut IntelEngineCs,
     mut value: u64,
 ) -> u64 {
@@ -1000,7 +1004,8 @@ pub unsafe fn intel_clamp_max_busywait_duration_ns(
 }
 
 // upstream: intel_engine_cs.c intel_clamp_preempt_timeout_ms()
-pub unsafe fn intel_clamp_preempt_timeout_ms(engine: *mut IntelEngineCs, mut value: u64) -> u64 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_clamp_preempt_timeout_ms(engine: *mut IntelEngineCs, mut value: u64) -> u64 {
     if intel_guc_submission_is_wanted(gt_to_guc((*engine).gt)) {
         value = core::cmp::min(value, guc_policy_max_preempt_timeout_ms() as u64);
     }
@@ -1009,13 +1014,15 @@ pub unsafe fn intel_clamp_preempt_timeout_ms(engine: *mut IntelEngineCs, mut val
 }
 
 // upstream: intel_engine_cs.c intel_clamp_stop_timeout_ms()
-pub unsafe fn intel_clamp_stop_timeout_ms(_engine: *mut IntelEngineCs, mut value: u64) -> u64 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_clamp_stop_timeout_ms(_engine: *mut IntelEngineCs, mut value: u64) -> u64 {
     value = core::cmp::min(value, jiffies_to_msecs(MAX_SCHEDULE_TIMEOUT) as u64);
     value
 }
 
 // upstream: intel_engine_cs.c intel_clamp_timeslice_duration_ms()
-pub unsafe fn intel_clamp_timeslice_duration_ms(engine: *mut IntelEngineCs, mut value: u64) -> u64 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_clamp_timeslice_duration_ms(engine: *mut IntelEngineCs, mut value: u64) -> u64 {
     if intel_guc_submission_is_wanted(gt_to_guc((*engine).gt)) {
         value = core::cmp::min(value, guc_policy_max_exec_quantum_ms() as u64);
     }
@@ -1058,7 +1065,8 @@ unsafe fn intel_setup_engine_capabilities(gt: *mut IntelGt) {
 }
 
 // upstream: intel_engine_cs.c intel_engines_release()
-pub unsafe fn intel_engines_release(gt: *mut IntelGt) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engines_release(gt: *mut IntelGt) {
     let mut engine: *mut IntelEngineCs;
     let mut id: IntelEngineId;
 
@@ -1089,7 +1097,8 @@ pub unsafe fn intel_engines_release(gt: *mut IntelGt) {
 }
 
 // upstream: intel_engine_cs.c intel_engine_free_request_pool()
-pub unsafe fn intel_engine_free_request_pool(engine: *mut IntelEngineCs) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_free_request_pool(engine: *mut IntelEngineCs) {
     if (*engine).request_pool.is_null() {
         return;
     }
@@ -1101,7 +1110,8 @@ pub unsafe fn intel_engine_free_request_pool(engine: *mut IntelEngineCs) {
 }
 
 // upstream: intel_engine_cs.c intel_engines_free()
-pub unsafe fn intel_engines_free(gt: *mut IntelGt) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engines_free(gt: *mut IntelGt) {
     let mut engine: *mut IntelEngineCs;
     let mut id: IntelEngineId;
 
@@ -1297,7 +1307,8 @@ unsafe fn setup_logical_ids(gt: *mut IntelGt, logical_ids: *mut u8, class: u8) {
 }
 
 // upstream: intel_engine_cs.c intel_engines_init_mmio()
-pub unsafe fn intel_engines_init_mmio(gt: *mut IntelGt) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engines_init_mmio(gt: *mut IntelGt) -> i32 {
     let i915 = (*gt).i915;
     let engine_mask = init_engine_mask(gt);
     let mut mask: u32 = 0;
@@ -1352,7 +1363,8 @@ pub unsafe fn intel_engines_init_mmio(gt: *mut IntelGt) -> i32 {
 }
 
 // upstream: intel_engine_cs.c intel_engine_init_execlists()
-pub unsafe fn intel_engine_init_execlists(engine: *mut IntelEngineCs) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_init_execlists(engine: *mut IntelEngineCs) {
     let execlists = &mut (*engine).execlists;
 
     execlists.port_mask = 1;
@@ -1697,7 +1709,8 @@ unsafe fn measure_breadcrumb_dw(ce: *mut IntelContext) -> i32 {
 }
 
 // upstream: intel_engine_cs.c intel_engine_create_pinned_context()
-pub unsafe fn intel_engine_create_pinned_context(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_create_pinned_context(
     engine: *mut IntelEngineCs,
     vm: *mut I915AddressSpace,
     ring_size: u32,
@@ -1741,7 +1754,8 @@ pub unsafe fn intel_engine_create_pinned_context(
 }
 
 // upstream: intel_engine_cs.c intel_engine_destroy_pinned_context()
-pub unsafe fn intel_engine_destroy_pinned_context(ce: *mut IntelContext) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_destroy_pinned_context(ce: *mut IntelContext) {
     let engine = (*ce).engine;
     let hwsp = (*engine).status_page.vma;
 
@@ -1825,7 +1839,8 @@ unsafe fn engine_init_common(engine: *mut IntelEngineCs) -> i32 {
 }
 
 // upstream: intel_engine_cs.c intel_engines_init()
-pub unsafe fn intel_engines_init(gt: *mut IntelGt) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engines_init(gt: *mut IntelGt) -> i32 {
     let mut setup: unsafe extern "C" fn(*mut IntelEngineCs) -> i32;
     let mut engine: *mut IntelEngineCs;
     let mut id: IntelEngineId;
@@ -1868,7 +1883,8 @@ pub unsafe fn intel_engines_init(gt: *mut IntelGt) -> i32 {
 }
 
 // upstream: intel_engine_cs.c intel_engine_cleanup_common()
-pub unsafe fn intel_engine_cleanup_common(engine: *mut IntelEngineCs) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_cleanup_common(engine: *mut IntelEngineCs) {
     GEM_BUG_ON!(!list_empty(&(*(*engine).sched_engine).requests));
 
     i915_sched_engine_put((*engine).sched_engine);
@@ -1898,14 +1914,16 @@ pub unsafe fn intel_engine_cleanup_common(engine: *mut IntelEngineCs) {
 }
 
 // upstream: intel_engine_cs.c intel_engine_resume()
-pub unsafe fn intel_engine_resume(engine: *mut IntelEngineCs) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_resume(engine: *mut IntelEngineCs) -> i32 {
     intel_engine_apply_workarounds(engine);
     intel_engine_apply_whitelist(engine);
     ((*engine).resume.unwrap())(engine)
 }
 
 // upstream: intel_engine_cs.c intel_engine_get_active_head()
-pub unsafe fn intel_engine_get_active_head(engine: *const IntelEngineCs) -> u64 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_get_active_head(engine: *const IntelEngineCs) -> u64 {
     let i915 = (*engine).i915;
     let acthd: u64;
 
@@ -1925,7 +1943,8 @@ pub unsafe fn intel_engine_get_active_head(engine: *const IntelEngineCs) -> u64 
 }
 
 // upstream: intel_engine_cs.c intel_engine_get_last_batch_head()
-pub unsafe fn intel_engine_get_last_batch_head(engine: *const IntelEngineCs) -> u64 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_get_last_batch_head(engine: *const IntelEngineCs) -> u64 {
     let bbaddr: u64;
 
     if GRAPHICS_VER((*engine).i915) >= 8 {
@@ -1989,7 +2008,8 @@ unsafe fn __intel_engine_stop_cs(
 }
 
 // upstream: intel_engine_cs.c intel_engine_stop_cs()
-pub unsafe fn intel_engine_stop_cs(engine: *mut IntelEngineCs) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_stop_cs(engine: *mut IntelEngineCs) -> i32 {
     let mut err = 0;
 
     if GRAPHICS_VER((*engine).i915) < 3 {
@@ -2020,7 +2040,8 @@ pub unsafe fn intel_engine_stop_cs(engine: *mut IntelEngineCs) -> i32 {
 }
 
 // upstream: intel_engine_cs.c intel_engine_cancel_stop_cs()
-pub unsafe fn intel_engine_cancel_stop_cs(engine: *mut IntelEngineCs) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_cancel_stop_cs(engine: *mut IntelEngineCs) {
     ENGINE_TRACE!(engine, "\n");
     ENGINE_WRITE_FW!(
         engine,
@@ -2082,7 +2103,8 @@ unsafe fn __gpm_wait_for_fw_complete(gt: *mut IntelGt, fw_mask: u32) {
 }
 
 // upstream: intel_engine_cs.c intel_engine_wait_for_pending_mi_fw()
-pub unsafe fn intel_engine_wait_for_pending_mi_fw(engine: *mut IntelEngineCs) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_wait_for_pending_mi_fw(engine: *mut IntelEngineCs) {
     let fw_pending = __cs_pending_mi_force_wakes(engine);
 
     if fw_pending != 0 {
@@ -2091,7 +2113,8 @@ pub unsafe fn intel_engine_wait_for_pending_mi_fw(engine: *mut IntelEngineCs) {
 }
 
 // upstream: intel_engine_cs.c intel_engine_get_instdone()
-pub unsafe fn intel_engine_get_instdone(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_get_instdone(
     engine: *const IntelEngineCs,
     instdone: *mut IntelInstdone,
 ) {
@@ -2199,7 +2222,8 @@ unsafe fn ring_is_idle(engine: *mut IntelEngineCs) -> bool {
 }
 
 // upstream: intel_engine_cs.c __intel_engine_flush_submission()
-pub unsafe fn __intel_engine_flush_submission(engine: *mut IntelEngineCs, sync: bool) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __intel_engine_flush_submission(engine: *mut IntelEngineCs, sync: bool) {
     let t = &mut (*(*engine).sched_engine).tasklet;
 
     if t.callbacks.callback.is_none() {
@@ -2221,7 +2245,8 @@ pub unsafe fn __intel_engine_flush_submission(engine: *mut IntelEngineCs, sync: 
 }
 
 // upstream: intel_engine_cs.c intel_engine_is_idle()
-pub unsafe fn intel_engine_is_idle(engine: *mut IntelEngineCs) -> bool {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_is_idle(engine: *mut IntelEngineCs) -> bool {
     if intel_gt_is_wedged((*engine).gt) {
         return true;
     }
@@ -2241,7 +2266,8 @@ pub unsafe fn intel_engine_is_idle(engine: *mut IntelEngineCs) -> bool {
 }
 
 // upstream: intel_engine_cs.c intel_engines_are_idle()
-pub unsafe fn intel_engines_are_idle(gt: *mut IntelGt) -> bool {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engines_are_idle(gt: *mut IntelGt) -> bool {
     let mut engine: *mut IntelEngineCs;
     let mut id: IntelEngineId;
 
@@ -2263,7 +2289,8 @@ pub unsafe fn intel_engines_are_idle(gt: *mut IntelGt) -> bool {
 }
 
 // upstream: intel_engine_cs.c intel_engine_irq_enable()
-pub unsafe fn intel_engine_irq_enable(engine: *mut IntelEngineCs) -> bool {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_irq_enable(engine: *mut IntelEngineCs) -> bool {
     if (*engine).irq_enable.is_none() {
         return false;
     }
@@ -2276,7 +2303,8 @@ pub unsafe fn intel_engine_irq_enable(engine: *mut IntelEngineCs) -> bool {
 }
 
 // upstream: intel_engine_cs.c intel_engine_irq_disable()
-pub unsafe fn intel_engine_irq_disable(engine: *mut IntelEngineCs) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_irq_disable(engine: *mut IntelEngineCs) {
     if (*engine).irq_disable.is_none() {
         return;
     }
@@ -2287,7 +2315,8 @@ pub unsafe fn intel_engine_irq_disable(engine: *mut IntelEngineCs) {
 }
 
 // upstream: intel_engine_cs.c intel_engines_reset_default_submission()
-pub unsafe fn intel_engines_reset_default_submission(gt: *mut IntelGt) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engines_reset_default_submission(gt: *mut IntelGt) {
     let mut engine: *mut IntelEngineCs;
     let mut id: IntelEngineId;
 
@@ -2303,7 +2332,8 @@ pub unsafe fn intel_engines_reset_default_submission(gt: *mut IntelGt) {
 }
 
 // upstream: intel_engine_cs.c intel_engine_can_store_dword()
-pub unsafe fn intel_engine_can_store_dword(engine: *mut IntelEngineCs) -> bool {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_can_store_dword(engine: *mut IntelEngineCs) -> bool {
     match GRAPHICS_VER((*engine).i915) {
         2 => false,
         3 => !(IS_I915G((*engine).i915) || IS_I915GM((*engine).i915)),
@@ -2846,7 +2876,8 @@ unsafe fn engine_dump_request(rq: *mut I915Request, m: *mut DrmPrinter, msg: *co
 }
 
 // upstream: intel_engine_cs.c intel_engine_dump_active_requests()
-pub unsafe fn intel_engine_dump_active_requests(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_dump_active_requests(
     requests: *mut ListHead,
     hung_rq: *mut I915Request,
     m: *mut DrmPrinter,
@@ -2902,12 +2933,16 @@ unsafe fn engine_dump_active_requests(engine: *mut IntelEngineCs, m: *mut DrmPri
 }
 
 // upstream: intel_engine_cs.c intel_engine_dump()
-pub unsafe fn intel_engine_dump(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_dump(
     engine: *mut IntelEngineCs,
     m: *mut DrmPrinter,
     header: *const c_char,
-    ap: *mut VaList,
+    mut args: ...
 ) {
+    // C `intel_engine_dump(engine, m, header, ...)` forwards its variadic
+    // tail as a `va_list` to drm_vprintf(); the printer receives it opaque.
+    let ap: *mut VaList = core::ptr::addr_of_mut!(args).cast();
     let error = &mut (*(*engine).i915).gpu_error;
     let mut rq: *mut I915Request = core::ptr::null_mut();
     let mut wakeref: IntelWakerefT;
@@ -2985,12 +3020,14 @@ pub unsafe fn intel_engine_dump(
 }
 
 // upstream: intel_engine_cs.c intel_engine_get_busy_time()
-pub unsafe fn intel_engine_get_busy_time(engine: *mut IntelEngineCs, now: *mut Ktime) -> Ktime {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_get_busy_time(engine: *mut IntelEngineCs, now: *mut Ktime) -> Ktime {
     ((*engine).busyness.unwrap())(engine, now)
 }
 
 // upstream: intel_engine_cs.c intel_engine_create_virtual()
-pub unsafe fn intel_engine_create_virtual(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_create_virtual(
     siblings: *mut *mut IntelEngineCs,
     count: u32,
     flags: c_ulong,
@@ -3054,7 +3091,8 @@ unsafe fn engine_execlist_find_hung_request(engine: *mut IntelEngineCs) -> *mut 
 }
 
 // upstream: intel_engine_cs.c intel_engine_get_hung_entity()
-pub unsafe fn intel_engine_get_hung_entity(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_get_hung_entity(
     engine: *mut IntelEngineCs,
     ce: *mut *mut IntelContext,
     rq: *mut *mut I915Request,
@@ -3082,7 +3120,8 @@ pub unsafe fn intel_engine_get_hung_entity(
 }
 
 // upstream: intel_engine_cs.c xehp_enable_ccs_engines()
-pub unsafe fn xehp_enable_ccs_engines(engine: *mut IntelEngineCs) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xehp_enable_ccs_engines(engine: *mut IntelEngineCs) {
     if CCS_MASK((*engine).gt) == 0 {
         return;
     }

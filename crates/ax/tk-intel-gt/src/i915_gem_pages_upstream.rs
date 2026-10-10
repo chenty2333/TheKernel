@@ -193,7 +193,7 @@ unsafe extern "C" {
     fn vmap_pfn(pfns: *mut c_ulong, count: u32, prot: PgProt) -> *mut c_void;
     fn kvmalloc_array(count: usize, size: usize, flags: u32) -> *mut c_void;
     fn kvfree(ptr: *mut c_void);
-    fn set_page_dirty(page: *mut Page);
+    fn set_page_dirty(page: *mut Page) -> bool;
     fn pat_enabled() -> bool;
     fn might_sleep();
 }
@@ -550,7 +550,8 @@ unsafe fn i915_gem_object_get_sg_dma(
 }
 
 // upstream: i915_gem_pages.c __i915_gem_object_set_pages()
-pub unsafe fn __i915_gem_object_set_pages(obj: *mut DrmI915GemObject, pages: *mut SgTable) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __i915_gem_object_set_pages(obj: *mut DrmI915GemObject, pages: *mut SgTable) {
     unsafe {
         let i915 = crate::linux::i915::to_i915((*gem_base(obj)).dev);
         let supported = (*(*i915).info.cast::<IntelDeviceInfoOverlay>())
@@ -617,7 +618,8 @@ pub unsafe fn __i915_gem_object_set_pages(obj: *mut DrmI915GemObject, pages: *mu
     }
 }
 // upstream: i915_gem_pages.c ____i915_gem_object_get_pages()
-pub unsafe fn ____i915_gem_object_get_pages(obj: *mut DrmI915GemObject) -> c_int {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ____i915_gem_object_get_pages(obj: *mut DrmI915GemObject) -> c_int {
     unsafe {
         let i915 = crate::linux::i915::to_i915((*gem_base(obj)).dev);
         assert_object_held_shared(obj);
@@ -631,7 +633,8 @@ pub unsafe fn ____i915_gem_object_get_pages(obj: *mut DrmI915GemObject) -> c_int
     }
 }
 // upstream: i915_gem_pages.c __i915_gem_object_get_pages()
-pub unsafe fn __i915_gem_object_get_pages(obj: *mut DrmI915GemObject) -> c_int {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __i915_gem_object_get_pages(obj: *mut DrmI915GemObject) -> c_int {
     unsafe {
         assert_object_held(obj);
         assert_object_held_shared(obj);
@@ -733,7 +736,8 @@ unsafe fn flush_tlb_invalidate(obj: *mut DrmI915GemObject) {
     }
 }
 // upstream: i915_gem_pages.c __i915_gem_object_unset_pages()
-pub unsafe fn __i915_gem_object_unset_pages(obj: *mut DrmI915GemObject) -> *mut SgTable {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __i915_gem_object_unset_pages(obj: *mut DrmI915GemObject) -> *mut SgTable {
     unsafe {
         assert_object_held_shared(obj);
         let pages = crate::linux::primitives::fetch_and_zero(&mut (*obj).mm.pages);
@@ -954,7 +958,8 @@ pub unsafe fn i915_gem_object_panic_finish(panic: *mut IntelPanic) {
     }
 }
 // upstream: i915_gem_pages.c i915_gem_object_pin_map()
-pub unsafe fn i915_gem_object_pin_map(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_object_pin_map(
     obj: *mut DrmI915GemObject,
     type_: I915MapType,
 ) -> *mut c_void {

@@ -21,16 +21,15 @@ pub(crate) mod cpufreq;
 pub(crate) mod fields;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
-pub(crate) mod forcewake;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod firmware;
 pub(crate) mod gem;
-pub(crate) mod gem_memory;
+pub mod gem_memory;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod highmem;
-pub(crate) mod i915;
+pub mod i915;
 pub(crate) mod i915_trace;
 pub(crate) mod idr;
 pub(crate) mod iosys_map;
@@ -43,7 +42,11 @@ pub(crate) mod mm;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod page;
-pub(crate) mod primitives;
+pub mod primitives;
+pub(crate) mod drm_mm;
+pub(crate) mod drm_vma;
+pub(crate) mod dma_fence_core;
+pub mod drm_core;
 pub(crate) mod rbtree;
 pub(crate) mod rcu;
 #[cfg(feature = "upstream-gt")]
@@ -59,7 +62,7 @@ pub(crate) mod requests;
 pub(crate) mod user_extensions;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
-pub(crate) mod signal;
+pub mod signal;
 pub(crate) mod srcu;
 pub(crate) mod ww_mutex;
 
@@ -90,3 +93,11 @@ pub(crate) mod iomapping;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod dma;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod kernel_services;
+
+/// Linux core APIs with kernel-installed PCI/DMA providers (see PROVIDERS.md).
+pub mod kernel_core;
+pub mod ttm;

@@ -474,7 +474,9 @@ unsafe fn sg_next(sg: *mut SgEntry) -> *mut SgEntry {
     if page_link & SG_END != 0 {
         return ptr::null_mut();
     }
-    let next = unsafe { sg.add(1) };
+    // `SgEntry` is an opaque zero-sized handle: step by the real
+    // `struct scatterlist` size, as `sg + 1` does in C.
+    let next = unsafe { sg.cast::<ScatterListDmaView>().add(1).cast::<SgEntry>() };
     let next_flags = unsafe { (*next.cast::<ScatterListDmaView>()).page_link } & SG_PAGE_LINK_MASK;
     if next_flags & SG_CHAIN != 0 {
         (unsafe { (*next.cast::<ScatterListDmaView>()).page_link } & !SG_PAGE_LINK_MASK)
@@ -779,7 +781,8 @@ pub unsafe fn i915_vm_to_ppgtt(vm: *mut I915AddressSpace) -> *mut I915Ppgtt {
 }
 
 // upstream: intel_gtt.h i915_vm_get()
-pub unsafe fn i915_vm_get(vm: *mut I915AddressSpace) -> *mut I915AddressSpace {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_vm_get(vm: *mut I915AddressSpace) -> *mut I915AddressSpace {
     unsafe { kref_get(ptr::addr_of_mut!((*vm).r#ref)) };
     vm
 }
@@ -805,7 +808,8 @@ pub unsafe fn i915_vm_resv_get(vm: *mut I915AddressSpace) -> *mut c_void {
 }
 
 // upstream: intel_gtt.h i915_vm_put()
-pub unsafe fn i915_vm_put(vm: *mut I915AddressSpace) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_vm_put(vm: *mut I915AddressSpace) {
     unsafe { kref_put(ptr::addr_of_mut!((*vm).r#ref), i915_vm_release) };
 }
 

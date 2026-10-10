@@ -507,3 +507,77 @@ pub unsafe fn write_unlock(lock:*mut core::sync::atomic::AtomicU32) {
     assert_eq!(unsafe {(*lock).swap(0,Ordering::Release)},1<<31);
     NoPreempt::release(());
 }
+
+// ---------------------------------------------------------------------------
+// C ABI entry points used by the source-order i915 translations.
+//
+// Lock-debugging subclasses are ignored because CONFIG_LOCKDEP is disabled, so
+// the `_nested` variants are the plain operations. Rust helpers that already
+// carry the same name keep their identifiers; the C symbol is attached with
+// `export_name`.
+// ---------------------------------------------------------------------------
+
+/// Linux `spin_unlock()`.
+#[unsafe(export_name = "spin_unlock")]
+pub unsafe extern "C" fn c_spin_unlock(lock: *mut Spinlock) {
+    unsafe { spin_unlock_raw(lock) };
+}
+
+/// Linux `spin_lock_nested()`; the subclass only feeds lockdep.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spin_lock_nested(lock: *mut Spinlock, _subclass: u32) {
+    unsafe { spin_lock_raw(lock) };
+}
+
+/// Linux `spin_lock_irq()`.
+#[unsafe(export_name = "spin_lock_irq")]
+pub unsafe extern "C" fn c_spin_lock_irq(lock: *mut Spinlock) {
+    unsafe { spin_lock_irq_raw(lock) };
+}
+
+/// Linux `spin_unlock_irq()`.
+#[unsafe(export_name = "spin_unlock_irq")]
+pub unsafe extern "C" fn c_spin_unlock_irq(lock: *mut Spinlock) {
+    unsafe { spin_unlock_irq_raw(lock) };
+}
+
+/// Linux `spin_lock_irqsave()`.
+#[unsafe(export_name = "spin_lock_irqsave")]
+pub unsafe extern "C" fn c_spin_lock_irqsave(lock: *mut Spinlock, flags: *mut c_ulong) {
+    unsafe { spin_lock_irqsave_raw(lock, &mut *flags) };
+}
+
+/// Linux `spin_lock_irqsave_nested()`; the subclass only feeds lockdep.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spin_lock_irqsave_nested(
+    lock: *mut Spinlock,
+    flags: *mut c_ulong,
+    _subclass: u32,
+) {
+    unsafe { spin_lock_irqsave_raw(lock, &mut *flags) };
+}
+
+/// Linux `spin_unlock_irqrestore()`.
+#[unsafe(export_name = "spin_unlock_irqrestore")]
+pub unsafe extern "C" fn c_spin_unlock_irqrestore(lock: *mut Spinlock, flags: c_ulong) {
+    unsafe { spin_unlock_irqrestore_raw(lock, flags) };
+}
+
+/// Linux `cpu_relax()`: a spin-wait hint with no architectural side effects.
+#[unsafe(no_mangle)]
+pub extern "C" fn cpu_relax() {
+    core::hint::spin_loop();
+}
+
+/// Linux `__cond_resched_lock()`: when a reschedule is pending, drop the
+/// spinlock, yield, retake the lock, and return 1; otherwise return 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __cond_resched_lock(lock: *mut Spinlock) -> i32 {
+    if !crate::linux::wait::need_resched() {
+        return 0;
+    }
+    unsafe { spin_unlock_raw(lock) };
+    crate::linux::wait::cond_resched();
+    unsafe { spin_lock_raw(lock) };
+    1
+}

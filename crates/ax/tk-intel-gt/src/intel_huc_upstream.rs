@@ -79,7 +79,7 @@ unsafe extern "C" {
     fn bus_unregister_notifier(
         bus: *const crate::intel_huc_types_upstream::BusType,
         nb: *mut NotifierBlock,
-    );
+    ) -> c_int;
     fn hrtimer_cancel(timer: *mut Hrtimer) -> c_int;
     fn intel_rps_read_actual_frequency(rps: *mut crate::intel_rps_types_upstream::IntelRps) -> u32;
     fn intel_rps_get_requested_frequency(

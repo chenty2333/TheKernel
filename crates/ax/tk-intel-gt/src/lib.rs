@@ -3,7 +3,28 @@
 //! N305 GT/media A0 is independent of display D0. No implicit hardware access,
 //! firmware load or userspace command stream. Kernel intel.gt=1 owns invocation.
 #![no_std]
+#![feature(c_variadic)]
 #![deny(unsafe_code)]
+// The `upstream-gt` modules are line-by-line translations of C: their unsafe
+// blocks mirror the C statements and carry `// upstream:` provenance rather
+// than per-block SAFETY prose, and their own `#![allow(unsafe_code)]` repeats
+// the gate on the module declaration.
+#![cfg_attr(
+    feature = "upstream-gt",
+    allow(
+        clippy::undocumented_unsafe_blocks,
+        clippy::duplicated_attributes,
+        // C pointer-taking functions, `goto`-as-loop, GEM_BUG_ON range checks
+        // and `(0 << n)` field constants are kept as written upstream.
+        clippy::not_unsafe_ptr_arg_deref,
+        clippy::macro_metavars_in_unsafe,
+        clippy::never_loop,
+        clippy::absurd_extreme_comparisons,
+        clippy::swap_ptr_to_ref,
+        clippy::erasing_op,
+        clippy::empty_line_after_doc_comments
+    )
+)]
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
@@ -52,11 +73,11 @@ pub(crate) mod linux_tasklet;
 #[allow(unsafe_code)]
 #[macro_use]
 #[path = "linux/pm.rs"]
-pub(crate) mod linux_pm;
+pub mod linux_pm;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 #[path = "linux/i915_private.rs"]
-pub(crate) mod linux_i915_private;
+pub mod linux_i915_private;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 #[path = "linux/mutex.rs"]
@@ -318,7 +339,7 @@ pub mod intel_gt_irq_upstream;
 
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
-pub(crate) mod i915_irq_upstream;
+pub mod i915_irq_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_gt_pm_upstream;
@@ -497,7 +518,7 @@ pub mod intel_workarounds_types_upstream;
 pub mod intel_workarounds_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
-pub(crate) mod linux;
+pub mod linux;
 pub mod lrc;
 pub mod ppgtt;
 pub mod rcs;
@@ -568,6 +589,10 @@ pub(crate) mod intel_memory_region_upstream;
 
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub(crate) mod intel_region_ttm_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub(crate) mod i915_gem_phys_upstream;
 
 #[cfg(feature = "upstream-gt")]
@@ -604,3 +629,81 @@ pub(crate) mod i915_gpu_error_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod i915_cmd_parser_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_uncore_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_pcode_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_wakeref_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod vlv_iosf_sb_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod gt_header_inline_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_guc_log_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod i915_driver_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod i915_pci_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_device_info_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_device_info_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_pciids_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod i915_probe_provider_upstream;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_ioctl_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_memcpy_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_vgpu_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_clock_gating_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_vma_resource_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_guc_fw_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_unsupported_hw_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_edram_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_params_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_step_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod vlv_suspend_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod i915_gmch_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_renderstate_data_upstream;

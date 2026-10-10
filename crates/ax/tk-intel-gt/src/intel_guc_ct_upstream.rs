@@ -141,13 +141,6 @@ unsafe fn ct_msg_data(msg: *mut CtIncomingMsg) -> *mut u32 {
 }
 
 unsafe extern "C" {
-    fn intel_guc_ct_send_mmio(
-        guc: *mut IntelGuc,
-        action: *const u32,
-        len: u32,
-        response: *mut u32,
-        response_len: u32,
-    ) -> i32;
     fn intel_guc_deregister_done_process_msg(guc: *mut IntelGuc, msg: *const u32, len: u32) -> i32;
     fn intel_guc_sched_done_process_msg(guc: *mut IntelGuc, msg: *const u32, len: u32) -> i32;
     fn intel_guc_context_reset_process_msg(guc: *mut IntelGuc, msg: *const u32, len: u32) -> i32;
@@ -155,7 +148,6 @@ unsafe extern "C" {
     fn intel_guc_engine_failure_process_msg(guc: *mut IntelGuc, msg: *const u32, len: u32) -> i32;
     fn intel_guc_log_handle_flush_event(log: *mut crate::intel_guc_log_types_upstream::IntelGucLog);
     fn intel_guc_tlb_invalidation_done(guc: *mut IntelGuc, msg: *const u32, len: u32) -> i32;
-    fn intel_guc_fast_response_selftest(guc: *mut IntelGuc) -> bool;
 }
 
 macro_rules! CT_ERROR {

@@ -643,8 +643,8 @@ unsafe extern "C" {
     fn intel_synchronize_irq(i915: *mut DrmI915Private);
     fn ilk_display_rps_enable(display: *mut c_void);
     fn ilk_display_rps_disable(display: *mut c_void);
-    fn vlv_iosf_sb_get(drm: *mut c_void, domains: u32);
-    fn vlv_iosf_sb_put(drm: *mut c_void, domains: u32);
+    fn vlv_iosf_sb_get(drm: *mut c_void, domains: core::ffi::c_ulong);
+    fn vlv_iosf_sb_put(drm: *mut c_void, domains: core::ffi::c_ulong);
     fn vlv_iosf_sb_read(drm: *mut c_void, unit: u32, reg: u32) -> u32;
     fn vlv_iosf_sb_write(drm: *mut c_void, unit: u32, reg: u32, val: u32) -> i32;
     fn vlv_clock_get_gpll(drm: *mut c_void) -> u16;
@@ -652,14 +652,8 @@ unsafe extern "C" {
     fn ilk_fsb_freq(i915: *mut DrmI915Private) -> u32;
     fn ilk_mem_freq(i915: *mut DrmI915Private) -> u32;
     fn snb_pcode_read(uncore: *mut IntelUncore, mbox: u32, val: *mut u32, val1: *mut u32) -> i32;
-    fn snb_pcode_write_timeout(
-        uncore: *mut IntelUncore,
-        mbox: u32,
-        val: u32,
-        val1: u32,
-        timeout: u32,
-    ) -> i32;
-    fn i915_vgpu_active(i915: *mut DrmI915Private) -> bool;
+    fn snb_pcode_write_timeout(uncore: *mut IntelUncore, mbox: u32, val: u32, timeout_ms: i32) -> i32;
+    fn intel_vgpu_active(i915: *mut DrmI915Private) -> bool;
 }
 const IOSF_SB_PUNIT: u32 = 8;
 const IOSF_SB_NC: u32 = 7;
@@ -1095,9 +1089,9 @@ unsafe fn vlv_rps_set(rps: *mut IntelRps, val: u8) -> i32 {
     let i = unsafe { rps_to_i915(rps) };
     let drm = unsafe { ptr::addr_of_mut!((*i).drm) }.cast::<c_void>();
     unsafe {
-        vlv_iosf_sb_get(drm, bit(IOSF_SB_PUNIT));
+        vlv_iosf_sb_get(drm, (bit(IOSF_SB_PUNIT)) as core::ffi::c_ulong);
         let e = vlv_iosf_sb_write(drm, IOSF_SB_PUNIT, PUNIT_REG_GPU_FREQ_REQ, val as u32);
-        vlv_iosf_sb_put(drm, bit(IOSF_SB_PUNIT));
+        vlv_iosf_sb_put(drm, (bit(IOSF_SB_PUNIT)) as core::ffi::c_ulong);
         e
     }
 }
@@ -1577,11 +1571,11 @@ unsafe fn chv_rps_enable(rps: *mut IntelRps) -> bool {
         (*rps).pm_events =
             GEN6_PM_RP_UP_THRESHOLD | GEN6_PM_RP_DOWN_THRESHOLD | GEN6_PM_RP_DOWN_TIMEOUT;
         let drm = ptr::addr_of_mut!((*i).drm).cast();
-        vlv_iosf_sb_get(drm, bit(IOSF_SB_PUNIT));
+        vlv_iosf_sb_get(drm, (bit(IOSF_SB_PUNIT)) as core::ffi::c_ulong);
         let v = VLV_OVERRIDE_EN | VLV_SOC_TDP_EN | CHV_BIAS_CPU_50_SOC_50;
         let _ = vlv_iosf_sb_write(drm, IOSF_SB_PUNIT, VLV_TURBO_SOC_OVERRIDE, v);
         let sts = vlv_iosf_sb_read(drm, IOSF_SB_PUNIT, PUNIT_REG_GPU_FREQ_STS);
-        vlv_iosf_sb_put(drm, bit(IOSF_SB_PUNIT));
+        vlv_iosf_sb_put(drm, (bit(IOSF_SB_PUNIT)) as core::ffi::c_ulong);
         drm_warn_once(&CHV_GPLL_WARNED, drm, sts & GPLLENABLE == 0);
         drm_dbg!(drm, "GPLL enabled? {}\n", str_yes_no(sts & GPLLENABLE != 0));
         drm_dbg!(drm, "GPU status: 0x{:08x}\n", sts);
@@ -1657,11 +1651,11 @@ unsafe fn vlv_rps_enable(rps: *mut IntelRps) -> bool {
         );
         (*rps).pm_events = GEN6_PM_RP_UP_EI_EXPIRED;
         let drm = ptr::addr_of_mut!((*i).drm).cast();
-        vlv_iosf_sb_get(drm, bit(IOSF_SB_PUNIT));
+        vlv_iosf_sb_get(drm, (bit(IOSF_SB_PUNIT)) as core::ffi::c_ulong);
         let v = VLV_OVERRIDE_EN | VLV_SOC_TDP_EN | VLV_BIAS_CPU_125_SOC_875;
         let _ = vlv_iosf_sb_write(drm, IOSF_SB_PUNIT, VLV_TURBO_SOC_OVERRIDE, v);
         let sts = vlv_iosf_sb_read(drm, IOSF_SB_PUNIT, PUNIT_REG_GPU_FREQ_STS);
-        vlv_iosf_sb_put(drm, bit(IOSF_SB_PUNIT));
+        vlv_iosf_sb_put(drm, (bit(IOSF_SB_PUNIT)) as core::ffi::c_ulong);
         drm_warn_once(&CHV_GPLL_WARNED, drm, sts & GPLLENABLE == 0);
         drm_dbg!(drm, "GPLL enabled? {}\n", str_yes_no(sts & GPLLENABLE != 0));
         drm_dbg!(drm, "GPU status: 0x{:08x}\n", sts);
@@ -1847,13 +1841,13 @@ unsafe fn vlv_rps_init(rps: *mut IntelRps) {
     let drm = unsafe { ptr::addr_of_mut!((*i).drm) }.cast();
     unsafe {
         vlv_init_gpll_ref_freq(rps);
-        vlv_iosf_sb_get(drm, bit(IOSF_SB_PUNIT) | bit(IOSF_SB_NC) | bit(IOSF_SB_CCK));
+        vlv_iosf_sb_get(drm, (bit(IOSF_SB_PUNIT) | bit(IOSF_SB_NC) | bit(IOSF_SB_CCK)) as core::ffi::c_ulong);
         (*rps).max_freq = vlv_rps_max_freq(rps) as u8;
         (*rps).rp0_freq = (*rps).max_freq;
         (*rps).efficient_freq = vlv_rps_rpe_freq(rps) as u8;
         (*rps).rp1_freq = vlv_rps_guar_freq(rps) as u8;
         (*rps).min_freq = vlv_rps_min_freq(rps) as u8;
-        vlv_iosf_sb_put(drm, bit(IOSF_SB_PUNIT) | bit(IOSF_SB_NC) | bit(IOSF_SB_CCK));
+        vlv_iosf_sb_put(drm, (bit(IOSF_SB_PUNIT) | bit(IOSF_SB_NC) | bit(IOSF_SB_CCK)) as core::ffi::c_ulong);
     }
 }
 // upstream: intel_rps.c chv_rps_init()
@@ -1862,13 +1856,13 @@ unsafe fn chv_rps_init(rps: *mut IntelRps) {
     let drm = unsafe { ptr::addr_of_mut!((*i).drm) }.cast();
     unsafe {
         vlv_init_gpll_ref_freq(rps);
-        vlv_iosf_sb_get(drm, bit(IOSF_SB_PUNIT) | bit(IOSF_SB_NC) | bit(IOSF_SB_CCK));
+        vlv_iosf_sb_get(drm, (bit(IOSF_SB_PUNIT) | bit(IOSF_SB_NC) | bit(IOSF_SB_CCK)) as core::ffi::c_ulong);
         (*rps).max_freq = chv_rps_max_freq(rps) as u8;
         (*rps).rp0_freq = (*rps).max_freq;
         (*rps).efficient_freq = chv_rps_rpe_freq(rps) as u8;
         (*rps).rp1_freq = chv_rps_guar_freq(rps) as u8;
         (*rps).min_freq = chv_rps_min_freq(rps) as u8;
-        vlv_iosf_sb_put(drm, bit(IOSF_SB_PUNIT) | bit(IOSF_SB_NC) | bit(IOSF_SB_CCK));
+        vlv_iosf_sb_put(drm, (bit(IOSF_SB_PUNIT) | bit(IOSF_SB_NC) | bit(IOSF_SB_CCK)) as core::ffi::c_ulong);
         let odd =
             ((*rps).max_freq | (*rps).efficient_freq | (*rps).rp1_freq | (*rps).min_freq) & 1 != 0;
         drm_warn_once(&CHV_ODD_FREQ_WARNED, drm, odd);
@@ -2217,9 +2211,9 @@ unsafe fn __read_cagf(rps: *mut IntelRps, take_fw: bool) -> u32 {
     } else if unsafe { IS_VALLEYVIEW(i) || IS_CHERRYVIEW(i) } {
         let drm = unsafe { ptr::addr_of_mut!((*i).drm) }.cast();
         unsafe {
-            vlv_iosf_sb_get(drm, bit(IOSF_SB_PUNIT));
+            vlv_iosf_sb_get(drm, (bit(IOSF_SB_PUNIT)) as core::ffi::c_ulong);
             freq = vlv_iosf_sb_read(drm, IOSF_SB_PUNIT, PUNIT_REG_GPU_FREQ_STS);
-            vlv_iosf_sb_put(drm, bit(IOSF_SB_PUNIT));
+            vlv_iosf_sb_put(drm, (bit(IOSF_SB_PUNIT)) as core::ffi::c_ulong);
         }
     } else if GRAPHICS_VER(i) >= 6 {
         reg = GEN6_RPSTAT1;

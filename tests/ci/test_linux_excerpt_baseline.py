@@ -44,17 +44,21 @@ WINDOW = 14
 SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     ("crates/linux", 40): (110, 49, 20, 25, 0, 18, 21),
     ("kernel/src", 40): (86, 42, 20, 142, 9, 0, 0),
-    ("crates/ax", 40): (0, 0, 0, 763, 589, 0, 0),
+    ("crates/ax", 40): (0, 0, 0, 895, 721, 0, 0),
     ("crates/linux", 25): (211, 59, 22, 41, 3, 20, 21),
-    ("kernel/src", 25): (159, 52, 26, 317, 21, 0, 0),
+    ("kernel/src", 25): (159, 52, 26, 319, 23, 0, 0),
 # GP GT/GEM/power source-order translations are included in the 2026-10-10 re-scan.
-# crates/ax outside-fence/code totals are 763/589 at >=40 and 1988/1808 at >=25.
+# The 2026-10-10 GT wiring re-scan adds the MIT i915 probe/uncore/workaround
+# translations and the MIT sides of drm_mm.c and ttm_device.c (crates/ax at 40:
+# 895/721, at 25: 2155/1974), plus two generic BAR-flag statements in
+# kernel/src/drm/intel/upstream_gt.rs (`flags |= IORESOURCE_PREFETCH;` and
+# `flags |= IORESOURCE_MEM_64;`).
 # `crates/ax` at 25 also includes 4 `nullfs.rs` lines, 14 smoltcp RFC bit-ruler
 # rows reprinted by Linux headers, and 25 common Intel/SDHCI register/control
 # lines in the newly translated FreeBSD drivers and the OpenBSD iwx/net80211
 # translations, plus one FreeBSD ig4 register line. Those have BSD-source
 # provenance, not Linux provenance; see `docs/upstream-provenance.md`.
-    ("crates/ax", 25): (18, 15, 4, 1988, 1808, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 2155, 1974, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their

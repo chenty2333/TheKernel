@@ -2105,7 +2105,69 @@ The intel_gt.c body and source-location markers are present in the feature owner
 ### Whole-crates/ax Linux excerpt re-scan (2026-10-10)
 
 After registering the GT/GEM/power source-order translations, the scanner's
-whole-scope crates/ax totals are threshold >=40 `(0,0,0,763,589,0,0)` and
-threshold >=25 `(18,15,4,1988,1808,0,0)` in the test's seven-column order.
+whole-scope crates/ax totals are threshold >=40 `(0,0,0,768,594,0,0)` and
+threshold >=25 `(18,15,4,2001,1820,0,0)` in the test's seven-column order.
 The corresponding tk-intel-gt NOTICE and CI scan baseline were reconciled in
 the same change; MIT i915 text remains counted rather than exempted.
+
+`intel_uncore_upstream.rs` translates all 88 function definitions of Linux 7.2.3 `drivers/gpu/drm/i915/intel_uncore.c` (MIT, Copyright © 2013 Intel Corporation) and the generated forcewake range/shadow tables; i915 private offsets and IOSF MBI/display services are owner-installed through `UncoreKernelOps`.
+
+`intel_pcode_upstream.rs` translates all 11 functions and the display pcode table of Linux 7.2.3 `drivers/gpu/drm/i915/intel_pcode.c` (MIT, Copyright © 2013-2021 Intel Corporation); the mailbox lock uses the `i915->sb_lock` offset probed from the oracle build. `intel_wakeref_upstream.rs` translates all 8 functions of Linux 7.2.3 `intel_wakeref.c` (MIT, Copyright © 2019 Intel Corporation) for the oracle configuration (no lockdep, no wakeref debug tracker). `vlv_iosf_sb_upstream.rs` declares the four VLV/CHV sideband entry points of Linux 7.2.3 `vlv_iosf_sb.c` (MIT, Copyright © 2013-2021 Intel Corporation) as fail-closed, because those paths serve only unsupported hardware.
+`crates/ax/tk-intel-gt/src/intel_guc_log_upstream.rs`: partial port of Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc_log.c` (MIT, Copyright © 2014-2019 Intel Corporation): section sizing, log vma create/destroy, default level, init_early and flush-event dispatch; relay/debugfs channel omitted (fail-closed flush work).
+`crates/ax/tk-intel-gt/src/gt_header_inline_upstream.rs`: C-ABI wrappers for i915 header `static inline` helpers (`i915_request.h`, `gt/intel_engine_pm.h`, `i915_gpu_error.h`, `gt/intel_workarounds.h`, `gt/uc/intel_guc_ct.h`, `gt/uc/intel_guc.h`), MIT, Copyright © 2019 Intel Corporation, bodies per header text.
+### L1 LinuxKPI re-scan (2026-10-10)
+
+The L1 LinuxKPI change (tk-intel-gt: user copy, pinning, page/DMA/sg, vmap and
+WC mappings, PAT cache modes, notifiers and shrinker objects, kmem_cache, PM and
+task/file/PCI provider tables) moves the whole-scope crates/ax totals as
+measured by `scripts/ci/scan_linux_excerpts.py --scope crates/ax --threshold 25`:
+
+- before: `(18,15,4,1988,1808,0,0)`;
+- after: `(18,15,4,1990,1810,0,0)`; threshold 40 is unchanged at `(0,0,0,763,589,0,0)`.
+
+The two new matches are test-only statements that equal Linux 7.2.3 source lines
+byte for byte once whitespace is removed: `shrinker_register(shrinker);`
+(`linux/memory.rs`) and a second `kmem_cache_destroy(cache);` (`linux/heap.rs`
+test). No Linux function body was copied into the change; the LinuxKPI
+implementations are written from the Linux behaviour contract, and the new
+symbols carry no `// upstream:` marker because none is a line-by-line
+translation. The scan baseline, the tk-intel-gt NOTICE, and this entry are
+reconciled in the same change.
+- P: `src/i915_driver_upstream.rs` (i915_probe_error variadic, Linux 7.2.3 i915_utils.h drm_err path; intel_gt_probe_error helper) and `src/i915_pci_upstream.rs` (i915_pci_resource_valid, i915_pci.c L936-948) are MIT translations of drivers/gpu/drm/i915/{i915_utils.h,i915_pci.c}; Copyright © 2016 Intel Corporation.
+- P: `src/intel_device_info_types_upstream.rs`, `src/intel_device_info_upstream.rs` (intel_device_info.c and intel_step_name() from intel_step.c), `src/intel_pciids_upstream.rs` (include/drm/intel/pciids.h), `src/i915_pci_upstream.rs` (i915_pci.c), `src/i915_driver_upstream.rs` (i915_driver.c), `src/i915_ioctl_upstream.rs` (i915_ioctls[] of i915_driver.c), `src/i915_probe_provider_upstream.rs`: MIT transcriptions of drivers/gpu/drm/i915/{intel_device_info.c,intel_device_info.h,i915_pci.c,i915_driver.c} and include/drm/intel/pciids.h, intel_step.c, Copyright © 2016 Intel Corporation.
+whole-scope crates/ax totals are threshold >=40 `(0,0,0,763,589,0,0)` and
+threshold >=25 `(18,15,4,1996,1816,0,0)` in the test's seven-column order.
+The corresponding tk-intel-gt NOTICE and CI scan baseline were reconciled in
+the same change; MIT i915 text remains counted rather than exempted.
+Wire stage 1 (M): `i915_memcpy.c` (MIT, Copyright 2016 Intel Corporation) is
+translated in `i915_memcpy_upstream.rs`, with the movntdqa key left disabled
+because TheKernel has no kernel-FPU guard. `i915_vgpu.c` (MIT) is translated in
+`i915_vgpu_upstream.rs`; the GVT-g guest balloon path fails closed. The
+`i915_gem_gtt.c` reserve/insert functions are added to `i915_gem_gtt_upstream.rs`,
+the `intel_memory_region.c` lookup/avail functions to
+`intel_memory_region_upstream.rs`, and `i915_utils.c` `i915_direct_stolen_access()`
+to `i915_utils_upstream.rs`. `intel_clock_gating.c` (MIT, Copyright 2021 Intel
+Corporation) contributes the Gen12 hook dispatch and nop body in
+`intel_clock_gating_upstream.rs`.
+Wire stage 1 (M), second batch: `i915_vma_resource.c` (MIT, Copyright 2021 Intel
+Corporation) is translated in `i915_vma_resource_upstream.rs`; its interval-tree
+pending-unbind set is walked in key order over the same red-black tree.
+`gt/uc/intel_guc_fw.c` (MIT, Copyright 2014-2018 Intel Corporation) is translated
+in `intel_guc_fw_upstream.rs`. Fail-closed definitions for LMEM/TTM, migrate,
+GSC/HECI/PXP, MTL sa_media, gen6/7 PPGTT, GMCH GGTT, ring submission, OA perf and
+debugfs are collected in `intel_unsupported_hw_upstream.rs`, one line per function
+in the source comments.
+`crates/ax/tk-intel-gt/src/i915_gpu_error_upstream.rs` (round 2): now uses the upstream `struct i915_gpu_coredump` / `intel_gt_coredump` / `intel_engine_coredump` layout. Translated from Linux 7.2.3 `drivers/gpu/drm/i915/i915_gpu_error.c` (MIT, Copyright (c) 2008 Intel Corporation): coredump alloc/free, engine/GT register capture, VMA page capture (non-compressing, `CONFIG_DRM_I915_COMPRESS_ERROR` unset), GuC capture path via `__i915_gpu_coredump`, store/reset/disable. debugfs/sysfs and scatterlist printing are not translated; display snapshot is left NULL.
+| drivers/gpu/drm/i915/i915_edram.c | i915_edram_upstream.rs | i915_edram_detect(); MIT, Copyright © 2025 Intel Corporation |
+| drivers/gpu/drm/i915/i915_params.c | i915_params_upstream.rs | i915_params_free(); MIT, Copyright © 2018 Intel Corporation |
+| drivers/gpu/drm/i915/intel_step.c | intel_step_upstream.rs | intel_step_init() with the revid tables; MIT, Copyright © 2019 Intel Corporation |
+| drivers/gpu/drm/i915/i915_vgpu.c | i915_vgpu_upstream.rs | intel_vgpu_detect/register/has_*(); PVINFO detection reads BAR0 through the probe provider; balloon paths fail closed for an active vGPU; MIT, Copyright © 2014 Intel Corporation |
+| drivers/gpu/drm/i915/vlv_suspend.c | vlv_suspend_upstream.rs | VLV/CHV S0ix entry points: upstream non-VLV early returns kept, VLV/CHV branches fail closed (482-line file outside the unsupported-hardware budget); MIT, Copyright © 2014 Intel Corporation |
+| drivers/gpu/drm/i915/i915_gmch.c | i915_gmch_upstream.rs | i915_gmch_bridge_setup/bar_setup/bar_teardown: full translation; PCI bus access through PciBusOps (kernel); CONFIG_PNP unset so the PnP reservation check is absent; MIT, Copyright 2014 Intel Corporation |
+- 2026-10-10 `crates/ax/tk-intel-gt/src/intel_renderstate_data_upstream.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/gen{6,7,8,9}_renderstate.c` (MIT, Copyright © 2014 Intel Corporation), generated data tables translated by script.
+| drivers/gpu/drm/i915/intel_region_ttm.c | intel_region_ttm_upstream.rs | intel_region_ttm_device_init/fini() and the i915_ttm_bo_driver table (fail-closed LMEM/TTM BO hooks); LMEM-only functions (intel_region_ttm_init/fini, resource alloc/free, to_ttm_type) not translated, callers are gt/intel_region_lmem.c and selftests; MIT, Copyright © 2021 Intel Corporation |
+| drivers/gpu/drm/ttm/ttm_device.c | linux/ttm.rs | ttm_device_init/fini(), ttm_global_init/release(); GPL-2.0 OR MIT, MIT option; Copyright (c) 2006-2009 VMware, Inc., Palo Alto, CA., USA; Copyright 2020 Advanced Micro Devices, Inc. |
+| drivers/gpu/drm/ttm/ttm_pool.c | linux/ttm.rs | ttm_pool_init/fini(), ttm_pool_type init/fini, ttm_pool_mgr_init/fini(), shrinker count/scan; page alloc/free/shrink not ported; GPL-2.0 OR MIT, MIT option; Copyright 2020 Advanced Micro Devices, Inc. |
+| drivers/gpu/drm/ttm/ttm_tt.c | linux/ttm.rs | ttm_tt_mgr_init(); GPL-2.0 OR MIT, MIT option; Copyright (c) 2006-2009 VMware, Inc., Palo Alto, CA., USA |
+| drivers/gpu/drm/ttm/ttm_resource.c | linux/ttm.rs | ttm_resource_manager_init(), ttm_resource_manager_set_used() (header inline); MIT permission text, Copyright 2020 Advanced Micro Devices, Inc. |
+| drivers/gpu/drm/ttm/ttm_sys_manager.c | linux/ttm.rs | ttm_sys_man_init(); the alloc/free hooks fail closed (ttm_resource_init not ported); GPL-2.0 OR MIT, MIT option; Copyright (c) 2006-2009 VMware, Inc., Palo Alto, CA., USA |

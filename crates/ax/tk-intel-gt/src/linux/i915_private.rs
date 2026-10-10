@@ -11,6 +11,7 @@ use core::{
 
 use crate::{
     intel_context_types_upstream::File,
+    linux::ttm::TtmDevice,
     intel_engine_cs_upstream::{AtomicT, IntelEngineCs, IntelGt, Spinlock},
     intel_context_upstream::Kref,
     linux::{gem_memory::I915GemMm, i915::IntelRuntimeInfo},
@@ -43,13 +44,19 @@ pub struct DrmDevicePrefix {
     refcount: Kref,
     pub dev: *mut c_void,
     pub dma_dev: *mut c_void,
-    _before_unplugged: [u8; 92],
+    _before_driver: [u8; 32],
+    /// `struct drm_device.driver` at offset 56 (x86_64 Linux 7.2.3).
+    pub driver: *mut c_void,
+    _before_unplugged: [u8; 52],
     pub unplugged: bool,
     _anon_inode_pad: [u8; 3],
     pub anon_inode: *mut Inode,
     _before_vma_offset_manager: [u8; 1360],
     pub vma_offset_manager: *mut DrmVmaOffsetManager,
-    _tail: [u8; 56],
+    _before_switch_power_state: [u8; 8],
+    /// `enum switch_power_state` at offset 1504 (4 bytes).
+    pub switch_power_state: i32,
+    _tail: [u8; 44],
 }
 
 pub const DRM_DEVICE_SIZE: usize = 1552;
@@ -106,9 +113,15 @@ pub struct DrmI915Private {
     pub params: I915Params,
     pub info: *const c_void,
     pub runtime: IntelRuntimeInfo,
-    _before_irqs_enabled: [u8; 704],
+    _before_uncore: [u8; 148],
+    /// Embedded `struct intel_uncore uncore` (offset 1840, size 352).
+    pub uncore: [u8; 352],
+    _before_irqs_enabled: [u8; 204],
     pub irqs_enabled: bool,
-    _after_irqs_enabled: [u8; 135],
+    _after_irqs_enabled: [u8; 107],
+    /// `struct mutex sb_lock` at offset 2504 (size 24).
+    pub sb_lock: [u8; 24],
+    _after_sb_lock: [u8; 4],
     /// Source `preserve_bios_swizzle` field (verified at offset 2532 against
     /// the configured Linux 7.2.3 x86_64 C layout).
     pub preserve_bios_swizzle: bool,
@@ -136,7 +149,10 @@ pub struct DrmI915Private {
     /// Source `struct intel_pxp *pxp` (opaque lower owner).
     pub pxp: *mut c_void,
     _overlay: *mut c_void,
-    _configuration_sensitive_tail: [u8; 2312],
+    _before_bdev: [u8; 632],
+    /// Embedded `struct ttm_device bdev` at offset 4248 (x86_64 Linux 7.2.3).
+    pub bdev: TtmDevice,
+    _after_bdev: [u8; 8],
 }
 
 #[repr(C)]
@@ -183,6 +199,11 @@ pub unsafe fn i915_reset_engine_count(
 }
 
 const _: [(); 1552] = [(); size_of::<DrmDevicePrefix>()];
+const _: [(); 56] = [(); offset_of!(DrmDevicePrefix, driver)];
+const _: [(); 1504] = [(); offset_of!(DrmDevicePrefix, switch_power_state)];
+const _: [(); 1840] = [(); offset_of!(DrmI915Private, uncore)];
+const _: [(); 2504] = [(); offset_of!(DrmI915Private, sb_lock)];
+const _: [(); 2396] = [(); offset_of!(DrmI915Private, irqs_enabled)];
 const _: [(); 104] = [(); size_of::<IntelRuntimePmPrefix>()];
 const _: [(); 40] = [(); offset_of!(IntelRuntimePmPrefix, userfault_wakeref)];
 const _: [(); 8] = [(); offset_of!(DrmDevicePrefix, dev)];
@@ -233,7 +254,8 @@ const _: [(); 3584] = [(); offset_of!(DrmI915Private, gem) + offset_of!(I915GemP
 const _: [(); 3600] = [(); offset_of!(DrmI915Private, pxp)];
 const _: [(); 3608] = [(); offset_of!(DrmI915Private, _overlay)];
 const _: [(); 5928] = [(); size_of::<DrmI915Private>()];
-const _: [(); 5928] = [(); size_of::<DrmI915Private>()];
+const _: [(); 4248] = [(); offset_of!(DrmI915Private, bdev)];
+const _: [(); 1672] = [(); size_of::<TtmDevice>()];
 const _: [(); 40] = [(); size_of::<I915GpuError>()];
 const _: [(); 104] = [(); size_of::<IntelRuntimePmPrefix>()];
 const _: [(); 40] = [(); offset_of!(IntelRuntimePmPrefix, userfault_wakeref)];

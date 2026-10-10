@@ -65,3 +65,7 @@ optional = true
 [dependencies.tk-vtd]
 path = "../tk-vtd"
 optional = true
+
+[dependencies.printf-compat]
+version = "0.4"
+default-features = false

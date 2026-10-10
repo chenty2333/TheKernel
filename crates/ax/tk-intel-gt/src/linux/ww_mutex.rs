@@ -106,6 +106,12 @@ unsafe fn publish_acquisition(lock: *mut WwMutex, ctx: *mut WwAcquireCtx) {
 /// Wound/wait acquisition. Older contexts wound younger owners; younger
 /// contexts return `-EDEADLK` so the caller can release and back off.
 pub unsafe fn ww_mutex_lock(lock: *mut WwMutex, ctx: *mut WwAcquireCtx) -> i32 {
+    unsafe { ww_mutex_lock_inner(lock, ctx, false) }
+}
+
+/// Interruptible wound/wait acquisition; `-EINTR` is returned when a signal
+/// interrupts the sleep, leaving the lock unacquired.
+unsafe fn ww_mutex_lock_inner(lock: *mut WwMutex, ctx: *mut WwAcquireCtx, interruptible: bool) -> i32 {
     assert!(!lock.is_null());
     if is_wounded(ctx) {
         return -crate::linux_config::EDEADLK;
@@ -131,7 +137,16 @@ pub unsafe fn ww_mutex_lock(lock: *mut WwMutex, ctx: *mut WwAcquireCtx) -> i32 {
     }
     metadata_unlock(metadata_guard);
 
-    unsafe { mutex_lock(core::ptr::addr_of_mut!((*lock).base)) };
+    if interruptible {
+        let err = unsafe {
+            crate::linux::mutex::mutex_lock_interruptible_impl(core::ptr::addr_of_mut!((*lock).base))
+        };
+        if err != 0 {
+            return err;
+        }
+    } else {
+        unsafe { mutex_lock(core::ptr::addr_of_mut!((*lock).base)) };
+    }
     if is_wounded(ctx) {
         unsafe { mutex_unlock(core::ptr::addr_of_mut!((*lock).base)) };
         return -crate::linux_config::EDEADLK;
@@ -173,4 +188,16 @@ pub unsafe fn ww_mutex_unlock(lock: *mut WwMutex) {
     }
     metadata_unlock(metadata_guard);
     unsafe { mutex_unlock(core::ptr::addr_of_mut!((*lock).base)) };
+}
+
+/// Linux `ww_mutex_lock_interruptible()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ww_mutex_lock_interruptible(lock: *mut c_void, ctx: *mut c_void) -> i32 {
+    unsafe { ww_mutex_lock_inner(lock.cast::<WwMutex>(), ctx.cast::<WwAcquireCtx>(), true) }
+}
+
+/// Linux `ww_mutex_unlock()`; the Rust helper keeps its identifier.
+#[unsafe(export_name = "ww_mutex_unlock")]
+pub unsafe extern "C" fn c_ww_mutex_unlock(lock: *mut c_void) {
+    unsafe { ww_mutex_unlock(lock.cast::<WwMutex>()) };
 }

@@ -41,7 +41,8 @@ pub unsafe fn __i915_gem_object_create_lmem_with_ps(i915: *mut DrmI915Private, s
 }
 
 // upstream: i915_gem_lmem.c i915_gem_object_create_lmem()
-pub unsafe fn i915_gem_object_create_lmem(i915: *mut DrmI915Private, size: u64, flags: u32) -> *mut DrmI915GemObject {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_object_create_lmem(i915: *mut DrmI915Private, size: u64, flags: u32) -> *mut DrmI915GemObject {
     unsafe { __i915_gem_object_create_lmem_with_ps(i915, size, 0, flags) }
 }
 

@@ -7,8 +7,8 @@
 #![allow(unsafe_code)]
 
 use core::{
-    ffi::{c_char, c_long, c_ulong, c_void},
-    sync::atomic::{Ordering, fence},
+    ffi::{c_char, c_int, c_long, c_ulong, c_void},
+    sync::atomic::{AtomicI32, AtomicU64, Ordering, fence},
 };
 
 #[inline]
@@ -456,4 +456,221 @@ mod tests {
 #[inline]
 pub const fn time_after(a: c_ulong, b: c_ulong) -> bool {
     (b.wrapping_sub(a) as c_long) < 0
+}
+
+// ---------------------------------------------------------------------------
+// kref and the uniform random helper used by the GT scheduler.
+// ---------------------------------------------------------------------------
+
+/// Linux `kref_get()`: `refcount_inc()` on a live object.
+///
+/// # Safety
+/// `kref` must point to a live `struct kref`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kref_get(kref: *mut crate::intel_context_upstream::Kref) {
+    assert!(!kref.is_null());
+    let counter = unsafe { &*core::ptr::addr_of!((*kref).refcount.refs.counter).cast::<AtomicI32>() };
+    let previous = counter.fetch_add(1, Ordering::Relaxed);
+    assert!(previous > 0, "kref_get() on a released object");
+}
+
+/// Linux `kref_put()`: drops one reference and runs `release` when it was the
+/// last one. Returns true when `release` ran.
+///
+/// # Safety
+/// `kref` must point to a live `struct kref` owned by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kref_put(
+    kref: *mut crate::intel_context_upstream::Kref,
+    release: Option<unsafe extern "C" fn(*mut crate::intel_context_upstream::Kref)>,
+) -> bool {
+    assert!(!kref.is_null());
+    let counter = unsafe { &*core::ptr::addr_of!((*kref).refcount.refs.counter).cast::<AtomicI32>() };
+    let previous = counter.fetch_sub(1, Ordering::AcqRel);
+    assert!(previous > 0, "kref_put() on a released object");
+    if previous != 1 {
+        return false;
+    }
+    let release = release.expect("kref_put() reached zero without a release function");
+    unsafe { release(kref) };
+    true
+}
+
+static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
+
+/// Non-cryptographic 32-bit random value (xorshift64*, seeded from the TSC).
+fn random_u32() -> u32 {
+    let mut state = RANDOM_STATE.load(Ordering::Relaxed);
+    if state == 0 {
+        // SAFETY: RDTSC has no memory effects and is always available on x86_64.
+        state = unsafe { core::arch::x86_64::_rdtsc() } | 1;
+    }
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    RANDOM_STATE.store(state, Ordering::Relaxed);
+    (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+}
+
+/// Linux `get_random_u32_below()`: uniform in `[0, range)`, using the same
+/// multiply-and-reject construction as the kernel.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_random_u32_below(range: u32) -> u32 {
+    let mut mult = u64::from(range) * u64::from(random_u32());
+    if (mult as u32) < range {
+        let bound = range.wrapping_neg() % range;
+        while (mult as u32) < bound {
+            mult = u64::from(range) * u64::from(random_u32());
+        }
+    }
+    (mult >> 32) as u32
+}
+
+// ---------------------------------------------------------------------------
+// Debug-object, ref-tracker and stack-depot hooks in the oracle configuration.
+// ---------------------------------------------------------------------------
+
+/// Linux `debug_object_init()`. The oracle configuration has
+/// CONFIG_DEBUG_OBJECTS unset, where debugobjects.h defines this as an empty
+/// inline function.
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_object_init(_addr: *mut c_void, _desc: *const c_void) {}
+
+/// Linux `debug_object_activate()`; empty with CONFIG_DEBUG_OBJECTS unset.
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_object_activate(_addr: *mut c_void, _desc: *const c_void) {}
+
+/// Linux `debug_object_deactivate()`; empty with CONFIG_DEBUG_OBJECTS unset.
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_object_deactivate(_addr: *mut c_void, _desc: *const c_void) {}
+
+/// Linux `debug_object_assert_init()`; empty with CONFIG_DEBUG_OBJECTS unset.
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_object_assert_init(_addr: *mut c_void, _desc: *const c_void) {}
+
+/// Linux `debug_object_free()`; empty with CONFIG_DEBUG_OBJECTS unset.
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_object_free(_addr: *mut c_void, _desc: *const c_void) {}
+
+/// Linux `ref_tracker_alloc()`. The oracle configuration has CONFIG_REF_TRACKER
+/// unset, where ref_tracker.h defines this as `return 0`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ref_tracker_alloc(_dir: *mut c_void, _trackerp: *mut *mut c_void, _gfp: u32) -> i32 {
+    0
+}
+
+/// Linux `ref_tracker_free()`; `return 0` with CONFIG_REF_TRACKER unset.
+#[unsafe(no_mangle)]
+pub extern "C" fn ref_tracker_free(_dir: *mut c_void, _trackerp: *mut *mut c_void) -> i32 {
+    0
+}
+
+/// Linux `stack_depot_snprint()`. Stack handles come from `stack_depot_save()`,
+/// which has no producer in this kernel, so every handle is 0 and names an
+/// empty trace. The output is an empty, NUL-terminated string as Linux prints
+/// for an empty trace.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stack_depot_snprint(
+    _handle: u32,
+    buf: *mut c_char,
+    size: usize,
+    _spaces: u32,
+) -> usize {
+    if size > 0 && !buf.is_null() {
+        unsafe { *buf = 0 };
+    }
+    0
+}
+
+/// Linux `atomic_notifier_call_chain()`: call each notifier in priority order
+/// until one returns `NOTIFY_STOP_MASK`, and return the last result. `head`
+/// is a `struct atomic_notifier_head` whose chain pointer follows its lock.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atomic_notifier_call_chain(
+    head: *mut c_void,
+    value: c_ulong,
+    data: *mut c_void,
+) -> c_int {
+    use crate::intel_engine_cs_upstream::AtomicNotifierHead;
+    use crate::linux::gem_memory::NotifierBlock;
+    const NOTIFY_DONE: c_int = 0;
+    const NOTIFY_STOP_MASK: c_int = 0x8000;
+    assert!(!head.is_null());
+    let mut ret = NOTIFY_DONE;
+    let mut block = unsafe { (*head.cast::<AtomicNotifierHead>()).head.cast::<NotifierBlock>() };
+    while !block.is_null() {
+        let call = unsafe { (*block).notifier_call }
+            .expect("notifier block without a notifier_call function");
+        ret = unsafe { call(block, value, data) };
+        if ret & NOTIFY_STOP_MASK != 0 {
+            break;
+        }
+        block = unsafe { (*block).next };
+    }
+    ret
+}
+
+/// Linux `memcpy_fromio()`: copy from device memory one volatile byte at a
+/// time, so each read reaches the device exactly once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcpy_fromio(dst: *mut c_void, src: *const c_void, len: usize) {
+    let dst = dst.cast::<u8>();
+    let src = src.cast::<u8>();
+    for offset in 0..len {
+        unsafe { *dst.add(offset) = core::ptr::read_volatile(src.add(offset)) };
+    }
+}
+
+/// Kernel provider for uncached MMIO mappings, installed by the kernel's
+/// memory-management side. `ioremap` returns NULL when the mapping cannot be
+/// made; `iounmap` releases a mapping returned by `ioremap`.
+#[repr(C)]
+pub struct IoremapProvider {
+    pub ioremap: unsafe extern "C" fn(phys: u64, size: u64) -> *mut c_void,
+    pub iounmap: unsafe extern "C" fn(addr: *mut c_void),
+}
+
+static IOREMAP_PROVIDER: core::sync::atomic::AtomicPtr<IoremapProvider> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Install the MMIO mapping provider. It can be installed once.
+pub fn install_ioremap_provider(provider: &'static IoremapProvider) -> Result<(), &'static str> {
+    IOREMAP_PROVIDER
+        .compare_exchange(
+            core::ptr::null_mut(),
+            core::ptr::from_ref(provider).cast_mut(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|_| ())
+        .map_err(|_| "ioremap provider already installed")
+}
+
+fn ioremap_provider() -> Option<&'static IoremapProvider> {
+    let provider = IOREMAP_PROVIDER.load(Ordering::Acquire);
+    if provider.is_null() {
+        None
+    } else {
+        // SAFETY: only `install_ioremap_provider` stores a non-null pointer, and it
+        // stores a `'static` reference.
+        Some(unsafe { &*provider })
+    }
+}
+
+/// Linux `ioremap()`: an uncached kernel mapping of physical `base`. Returns
+/// NULL when no provider is installed, which callers already treat as failure.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ioremap(base: u64, size: u64) -> *mut c_void {
+    match ioremap_provider() {
+        Some(provider) => unsafe { (provider.ioremap)(base, size) },
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// Linux `iounmap()`. A mapping cannot exist without a provider, so reaching
+/// this without one is an invariant violation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iounmap(addr: *mut c_void) {
+    let provider = ioremap_provider().expect("iounmap() without an ioremap provider");
+    unsafe { (provider.iounmap)(addr) };
 }

@@ -322,8 +322,8 @@ unsafe extern "C" {
     fn __i915_drm_client_free(kref: *mut Kref);
     fn intel_engine_lookup_user(
         i915: *mut DrmI915Private,
-        class: u16,
-        instance: u16,
+        class: u8,
+        instance: u8,
     ) -> *mut IntelEngineCs;
     fn intel_has_reset_engine(gt: *const IntelGt) -> bool;
     fn intel_pxp_is_enabled(pxp: *const c_void) -> bool;
@@ -331,10 +331,10 @@ unsafe extern "C" {
     fn intel_pxp_start(pxp: *mut c_void) -> c_int;
     fn intel_context_reconfigure_sseu(ce: *mut IntelContext, sseu: *const IntelSseu) -> c_int;
     fn intel_engine_pulse(engine: *mut IntelEngineCs) -> c_int;
-    fn i915_request_get_rcu(rq: *mut I915Request) -> bool;
+    fn i915_request_get_rcu(rq: *mut I915Request) -> *mut I915Request;
     fn i915_request_put(rq: *mut I915Request);
     fn i915_request_active_engine(rq: *mut I915Request, engine: *mut *mut IntelEngineCs) -> bool;
-    fn i915_gem_object_get(obj: *mut DrmI915GemObject);
+    fn i915_gem_object_get(obj: *mut DrmI915GemObject) -> *mut DrmI915GemObject;
     fn i915_vma_close(vma: *mut I915Vma);
     fn drm_syncobj_create(syncobj: *mut *mut c_void, flags: u32, fence: *mut DmaFence) -> c_int;
     fn drm_syncobj_put(syncobj: *mut c_void);
@@ -346,7 +346,6 @@ unsafe extern "C" {
         count: u32,
         data: *mut c_void,
     ) -> c_int;
-    fn i915_gem_context_is_banned(i915: *mut DrmI915Private) -> bool;
     fn intel_gt_terminally_wedged(gt: *mut IntelGt) -> c_int;
     fn i915_reset_count(error: *const crate::linux_i915_private::I915GpuError) -> u32;
     fn xa_store(xa: *mut XArray, index: c_ulong, entry: *mut c_void, gfp: u32) -> *mut c_void;
@@ -520,7 +519,7 @@ pub unsafe fn i915_gem_context_put(ctx: *mut I915GemContext) {
     unsafe { kref_put(ptr::addr_of_mut!((*ctx).r#ref), i915_gem_context_release) };
 }
 
-unsafe fn i915_gem_context_no_error_capture(ctx: *const I915GemContext) -> bool {
+pub(crate) unsafe fn i915_gem_context_no_error_capture(ctx: *const I915GemContext) -> bool {
     test_bit(UCONTEXT_NO_ERROR_CAPTURE, unsafe { &(*ctx).user_flags })
 }
 unsafe fn i915_gem_context_is_bannable(ctx: *const I915GemContext) -> bool {
@@ -736,7 +735,7 @@ unsafe fn lookup_user_engine(
     }
     let idx = if !user_engines {
         let engine = unsafe {
-            intel_engine_lookup_user((*ctx).i915, (*ci).engine_class, (*ci).engine_instance)
+            intel_engine_lookup_user((*ctx).i915, (*ci).engine_class as u8, (*ci).engine_instance as u8)
         };
         if engine.is_null() {
             return ERR_PTR(-EINVAL);
@@ -1042,7 +1041,7 @@ unsafe extern "C" fn set_proto_ctx_engines_balance(
             unsafe { kfree(siblings) };
             return -EFAULT;
         }
-        let engine = unsafe { intel_engine_lookup_user(i915, ci.engine_class, ci.engine_instance) };
+        let engine = unsafe { intel_engine_lookup_user(i915, ci.engine_class as u8, ci.engine_instance as u8) };
         if engine.is_null() {
             unsafe { kfree(siblings) };
             return -EINVAL;
@@ -1105,7 +1104,7 @@ unsafe extern "C" fn set_proto_ctx_engines_bond(
     if unsafe { copy_from_user(&mut ci, ptr::addr_of!((*ext).master).cast(), size_of::<I915EngineClassInstance>()) } != 0 {
         return -EFAULT;
     }
-    let master = unsafe { intel_engine_lookup_user(i915, ci.engine_class, ci.engine_instance) };
+    let master = unsafe { intel_engine_lookup_user(i915, ci.engine_class as u8, ci.engine_instance as u8) };
     if master.is_null() {
         return -EINVAL;
     }
@@ -1120,7 +1119,7 @@ unsafe extern "C" fn set_proto_ctx_engines_bond(
         if unsafe { copy_from_user(&mut ci, ptr::addr_of!((*ext).engines).cast::<I915EngineClassInstance>().add(n).cast(), size_of::<I915EngineClassInstance>()) } != 0 {
             return -EFAULT;
         }
-        if unsafe { intel_engine_lookup_user(i915, ci.engine_class, ci.engine_instance) }.is_null() {
+        if unsafe { intel_engine_lookup_user(i915, ci.engine_class as u8, ci.engine_instance as u8) }.is_null() {
             return -EINVAL;
         }
     }
@@ -1190,7 +1189,7 @@ unsafe extern "C" fn set_proto_ctx_engines_parallel_submit(
                 unsafe { kfree(siblings) };
                 return -EFAULT;
             }
-            let engine = unsafe { intel_engine_lookup_user(i915, ci.engine_class, ci.engine_instance) };
+            let engine = unsafe { intel_engine_lookup_user(i915, ci.engine_class as u8, ci.engine_instance as u8) };
             if engine.is_null() {
                 unsafe { kfree(siblings) };
                 return -EINVAL;
@@ -1263,7 +1262,7 @@ unsafe fn set_proto_ctx_engines(
             unsafe { (*engines.add(n)).r#type = I915GemEngineType::Invalid };
             continue;
         }
-        let engine = unsafe { intel_engine_lookup_user(i915, ci.engine_class, ci.engine_instance) };
+        let engine = unsafe { intel_engine_lookup_user(i915, ci.engine_class as u8, ci.engine_instance as u8) };
         if engine.is_null() {
             unsafe { kfree(engines) };
             return -ENOENT;
@@ -1841,7 +1840,7 @@ unsafe fn active_engine(ce: *mut IntelContext) -> *mut IntelEngineCs {
     let mut rq = ptr::null_mut::<I915Request>();
     crate::linux::rcu::rcu_read_lock();
     list_for_each_entry_reverse!(rq, unsafe { ptr::addr_of_mut!((*(*ce).timeline).requests) }, link, {
-        if !unsafe { i915_request_get_rcu(rq) } {
+        if unsafe { i915_request_get_rcu(rq) }.is_null() {
             break;
         }
         let mut found = true;
@@ -2196,11 +2195,13 @@ unsafe fn gem_context_register(ctx: *mut I915GemContext, fpriv: *mut DrmI915File
 }
 
 unsafe extern "C" {
+    #[link_name = "tk_linux_snprintf"]
     fn snprintf(buf: *mut c_char, size: usize, fmt: *const c_char, ...) -> c_int;
 }
 
 // upstream: i915_gem_context.c i915_gem_context_open()
-pub unsafe fn i915_gem_context_open(i915: *mut DrmI915Private, file: *mut DrmFile) -> c_int {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_context_open(i915: *mut DrmI915Private, file: *mut DrmFile) -> c_int {
     let fpriv = unsafe { (*file).driver_priv.cast::<DrmI915FilePrivate>() };
     let view = unsafe { file_private_view(fpriv) };
     crate::linux::mutex::mutex_init(unsafe { &mut (*view).proto_context_lock });

@@ -4,7 +4,7 @@
 
 本文按 Linux 7.2.3 `drivers/gpu/drm/i915/` 的调用结构，记录当前 TheKernel 的默认执行路径、`upstream-gt` 源顺序翻译，以及真正切换运行路径时尚需提供的边界。ADL-N 使用 GT/display 分离：GT 为 Gen12 A0、GuC 提交；display 为 13.x D0。两者仍共享 PCI 设备、MMIO BAR、GGTT、IRQ/电源控制边界。
 
-**`upstream-gt` 是默认关闭的翻译/编译分支，不是已经接入的运行路径。当前 GP 所列模块的 feature crate check、全量 `gt-test.sh`、默认 crate check 与 `lint` 中的产品 release-link gate 均通过；这不构成 kernel runtime 调用或 N305 硬件验收。** 目前 kernel 运行使用 `kernel/src/drm/intel/gt.rs` 与 `gt/copy.rs` 的受限 N305 所有者。`gt::init_at_boot()` 仍要求显式 `intel.gt=1`；默认启动不执行 GT 写入。下表中 `upstream-gt` 一栏标出源函数已有翻译、类型声明或缺失实现，均不应解读为已被默认驱动调用。
+**2026-10-10 起，`intel-upstream-gt` 已编入产品构建并默认启用。** `gt::init_at_boot()`（`intel.gt` 默认开启，`intel.gt=0` 关闭）在 rootfs 挂载后调用 `kernel/src/drm/intel/upstream_probe.rs` → `i915_pci_probe()`，翻译版 i915 是唯一的 GT owner，手写的 N305 BCS/GuC owner 只在不带该 feature 的构建里运行。kernel 侧 provider 在 `upstream_gt.rs`/`upstream_drm.rs`，GPU MSI 由翻译版 `gen11_irq_handler()` 持有 GFX_MSTR_IRQ，display 部分回调 `irq.rs::dispatch_display()`。产品链接会解析整棵调用树（无未定义符号）。尚未完成：上游 GEM/execbuffer ioctl 到 kernel DRM 文件的路由（DrmCoreProvider 的 GEM handle/dma-buf/syncobj 入口仍 fail-closed）；N305 真机未验证。下文各表保留接线前的对照，"默认"一栏指不带 feature 的构建。
 
 状态标记：
 - **默认**：普通产品构建里的实际 TheKernel 路径。

@@ -167,7 +167,6 @@ unsafe extern "C" {
     fn trace_i915_gem_object_pwrite(obj: *mut DrmI915GemObject, offset: u64, size: u64);
     fn i915_gem_suspend_late(i915: *mut DrmI915Private);
     fn i915_gem_context_open(i915: *mut DrmI915Private, file: *mut c_void) -> c_int;
-    fn i915_gem_context_init(i915: *mut DrmI915Private);
     fn intel_engines_driver_register(i915: *mut DrmI915Private);
     fn i915_probe_error(i915: *mut DrmI915Private, fmt: *const c_char, ...);
     fn intel_clock_gating_init(dev: *mut c_void);
@@ -177,7 +176,6 @@ unsafe extern "C" {
     fn flush_work(work: *mut c_void);
     fn flush_workqueue(wq: *mut c_void);
     fn drain_workqueue(wq: *mut c_void);
-    static jiffies: c_ulong;
 }
 
 // Inline helpers from i915_gem_object_frontbuffer.h. rcu_access_pointer()
@@ -357,7 +355,8 @@ pub unsafe fn i915_gem_get_aperture_ioctl(
 }
 
 // upstream: i915_gem.c i915_gem_object_unbind()
-pub unsafe fn i915_gem_object_unbind(obj: *mut DrmI915GemObject, flags: c_ulong) -> c_int {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_object_unbind(obj: *mut DrmI915GemObject, flags: c_ulong) -> c_int {
     let i915 = to_i915((*gem_base(obj)).dev);
     let rpm = core::ptr::addr_of_mut!((*i915).runtime_pm);
     let vm_trylock = flags & I915_GEM_OBJECT_UNBIND_VM_TRYLOCK != 0;
@@ -1290,7 +1289,7 @@ unsafe fn i915_gem_init__mm(i915: *mut DrmI915Private) {
 // upstream: i915_gem.c i915_gem_init_early()
 pub unsafe fn i915_gem_init_early(dev_priv: *mut DrmI915Private) {
     i915_gem_init__mm(dev_priv);
-    i915_gem_context_init(dev_priv);
+    crate::i915_gem_context_upstream::i915_gem_init__contexts(dev_priv);
     spin_lock_init(&mut (*private_tail(dev_priv)).frontbuffer_lock);
 }
 
@@ -1321,7 +1320,7 @@ pub unsafe fn i915_gem_open(i915: *mut DrmI915Private, file: *mut c_void) -> c_i
     (*file_priv).file_or_rcu.file = file;
     (*file_priv).client = client;
     (*file_priv).bsd_engine = u32::MAX;
-    (*file_priv).hang_timestamp = jiffies;
+    (*file_priv).hang_timestamp = crate::linux::primitives::jiffies() as c_ulong;
     let ret = i915_gem_context_open(i915, file);
     if ret != 0 {
         i915_drm_client_put(client);

@@ -317,7 +317,8 @@ fn irq_work_imm(wrk: *mut IrqWork) -> bool {
 
 // upstream i915_request.c:217
 // upstream: i915_request.c i915_request_notify_execute_cb_imm()
-pub unsafe fn i915_request_notify_execute_cb_imm(rq: *mut I915Request) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_request_notify_execute_cb_imm(rq: *mut I915Request) {
     unsafe { __notify_execute_cb(rq, irq_work_imm) };
 }
 
@@ -338,7 +339,8 @@ unsafe fn __i915_request_fill(rq: *mut I915Request, value: u8) {
 
 // upstream i915_request.c:245
 // upstream: i915_request.c i915_request_active_engine()
-pub unsafe fn i915_request_active_engine(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_request_active_engine(
     rq: *mut I915Request,
     active: *mut *mut IntelEngineCs,
 ) -> bool {
@@ -934,7 +936,8 @@ pub unsafe fn __i915_request_create(ce: *mut IntelContext, gfp: u32) -> *mut I91
 
 // upstream i915_request.c:1030
 // upstream: i915_request.c i915_request_create()
-pub unsafe fn i915_request_create(ce: *mut IntelContext) -> *mut I915Request {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_request_create(ce: *mut IntelContext) -> *mut I915Request {
     let tl = unsafe { intel_context_timeline_lock(ce) };
     if IS_ERR(tl) {
         return tl.cast();
@@ -993,7 +996,7 @@ unsafe fn i915_request_await_start(rq: *mut I915Request, signal: *mut I915Reques
                 &mut (*rq).submit,
                 fence,
                 0 as c_ulong,
-                I915_FENCE_GFP as c_ulong,
+                I915_FENCE_GFP as u32,
             )
         }
     } else {
@@ -1089,7 +1092,7 @@ unsafe fn emit_semaphore_wait(to: *mut I915Request, from: *mut I915Request, gfp:
         unsafe { (*to).sched.semaphores |= mask };
         wait = ptr::addr_of_mut!((*to).semaphore);
     }
-    unsafe { i915_sw_fence_await_dma_fence(wait, &mut (*from).fence, 0, I915_FENCE_GFP as c_ulong) }
+    unsafe { i915_sw_fence_await_dma_fence(wait, &mut (*from).fence, 0, I915_FENCE_GFP as u32) }
 }
 
 // upstream i915_request.c:1264
@@ -1219,7 +1222,7 @@ unsafe fn __i915_request_await_external(rq: *mut I915Request, fence: *mut DmaFen
             &mut (*rq).submit,
             fence,
             i915_fence_context_timeout((*fence).context),
-            I915_FENCE_GFP as c_ulong,
+            I915_FENCE_GFP as u32,
         )
     }
 }
@@ -1354,7 +1357,8 @@ unsafe fn i915_request_await_request(to: *mut I915Request, from: *mut I915Reques
 
 // upstream i915_request.c:1500
 // upstream: i915_request.c i915_request_await_dma_fence()
-pub unsafe fn i915_request_await_dma_fence(rq: *mut I915Request, mut fence: *mut DmaFence) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_request_await_dma_fence(rq: *mut I915Request, mut fence: *mut DmaFence) -> i32 {
     let mut child = ptr::addr_of_mut!(fence);
     let mut nchild = 1u32;
     if unsafe { dma_fence_is_array(fence) } {
@@ -1611,7 +1615,8 @@ pub(crate) unsafe fn __i915_request_queue(rq: *mut I915Request, attr: *const I91
 
 // upstream i915_request.c:1845
 // upstream: i915_request.c i915_request_add()
-pub unsafe fn i915_request_add(rq: *mut I915Request) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_request_add(rq: *mut I915Request) {
     let tl = unsafe { i915_request_timeline(rq) };
     lockdep_assert_held(unsafe { &(*tl).mutex });
     unsafe { lockdep_unpin_lock(&mut (*tl).mutex, (*rq).cookie) };
@@ -1925,7 +1930,8 @@ unsafe fn match_ring(rq: *mut I915Request) -> bool {
 
 // upstream i915_request.c:2265
 // upstream: i915_request.c i915_test_request_state()
-pub unsafe fn i915_test_request_state(rq: *mut I915Request) -> I915RequestState {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_test_request_state(rq: *mut I915Request) -> I915RequestState {
     if i915_request_completed(unsafe { &*rq }) {
         return I915RequestState::Complete;
     }

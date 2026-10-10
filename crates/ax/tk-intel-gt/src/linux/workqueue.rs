@@ -88,6 +88,17 @@ pub const system_dfl_wq: *mut WorkqueueStruct =
 pub const system_highpri_wq: *mut WorkqueueStruct =
     core::ptr::addr_of!(SYSTEM_HIGHPRI_WORKQUEUE).cast_mut();
 
+/// A workqueue pointer published as a C data symbol.
+#[repr(transparent)]
+pub struct ExportedWorkqueue(*mut WorkqueueStruct);
+// SAFETY: the pointer names an immutable static handle.
+unsafe impl Sync for ExportedWorkqueue {}
+
+/// Linux `struct workqueue_struct *system_dfl_wq` (kernel/workqueue.c), read
+/// by C-ABI callers such as `i915_active.c`.
+#[unsafe(export_name = "system_dfl_wq")]
+pub static SYSTEM_DFL_WQ_SYMBOL: ExportedWorkqueue = ExportedWorkqueue(system_dfl_wq);
+
 /// Failure from an operation which needs the asynchronous work runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkqueueError {
@@ -756,4 +767,100 @@ pub unsafe fn cancel_work_sync<W: WorkStructPtr>(work: W) -> bool {
             .expect("cancel_work_sync could not wait for the worker");
     }
     cancelled || was_active
+}
+
+/// Set the PENDING bit for a caller that queues the item later (RCU-deferred
+/// queueing). Returns false when the item was already pending.
+///
+/// # Safety
+/// `work` must be a live, initialized work item.
+pub(crate) unsafe fn mark_work_pending(work: *mut WorkStruct) -> bool {
+    let old = unsafe { work_data(work) }.fetch_or(WORK_PENDING, Ordering::AcqRel);
+    old & WORK_PENDING == 0
+}
+
+/// Enqueue a work item whose PENDING bit the caller already set. The pending
+/// bit stays set until the worker dequeues the item.
+///
+/// # Safety
+/// `work` must be live, initialized, marked pending and not on the queue.
+pub(crate) unsafe fn enqueue_marked_work(work: *mut WorkStruct) {
+    {
+        let mut queue = WORK_QUEUE.lock();
+        unsafe { queue.push(work) };
+    }
+    notify_workers();
+}
+
+/// Block until the work runtime has no queued or running item.
+///
+/// The runtime is one FIFO served by one worker. Waiting for it to drain
+/// covers every item queued before the call, which is the Linux guarantee of
+/// `flush_workqueue()` / `drain_workqueue()`; it may additionally wait for items
+/// queued after the call.
+pub fn flush_all_work() {
+    if !axtask::can_block_current() {
+        panic!("flush_workqueue requires blockable task context");
+    }
+    WORK_STATE_WAKE
+        .wait_until(|| {
+            WORK_QUEUE.lock().head.is_null() && ACTIVE_WORK.load(Ordering::Acquire).is_null()
+        })
+        .expect("flush_workqueue could not wait for the worker");
+}
+
+// ---------------------------------------------------------------------------
+// C ABI entry points.
+// ---------------------------------------------------------------------------
+
+/// Linux `queue_work()`. Returns false when the item is already pending.
+#[unsafe(export_name = "queue_work")]
+pub unsafe extern "C" fn c_queue_work(wq: *mut c_void, work: *mut WorkStruct) -> bool {
+    unsafe { queue_work(wq, work) }
+}
+
+/// Linux `flush_work()`.
+#[unsafe(export_name = "flush_work")]
+pub unsafe extern "C" fn c_flush_work(work: *mut WorkStruct) -> bool {
+    unsafe { flush_work(work) }
+}
+
+/// Linux `flush_workqueue()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flush_workqueue(_wq: *mut c_void) {
+    flush_all_work();
+}
+
+/// Linux `drain_workqueue()`: flushes until no work remains. Re-queueing
+/// after the drain is not rejected, which is the one difference from Linux's
+/// `__WQ_DRAINING` warning path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drain_workqueue(_wq: *mut c_void) {
+    flush_all_work();
+}
+
+/// Linux `alloc_workqueue()`. The format arguments name the queue for debug
+/// output; the one ordered worker serves every queue, so the name is not kept.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn alloc_workqueue(
+    _fmt: *const core::ffi::c_char,
+    _flags: u32,
+    _max_active: core::ffi::c_int,
+    _args: ...
+) -> *mut c_void {
+    let queue = alloc::boxed::Box::new(WorkqueueStruct { _identity: 2 });
+    alloc::boxed::Box::into_raw(queue).cast()
+}
+
+/// Linux `destroy_workqueue()`: drain queued work, then release the handle.
+/// The shared system queues are never destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn destroy_workqueue(wq: *mut c_void) {
+    assert!(!wq.is_null(), "destroy_workqueue(NULL)");
+    assert!(
+        wq.cast::<WorkqueueStruct>() != system_dfl_wq && wq.cast::<WorkqueueStruct>() != system_highpri_wq,
+        "destroy_workqueue on a system workqueue"
+    );
+    flush_all_work();
+    drop(unsafe { alloc::boxed::Box::from_raw(wq.cast::<WorkqueueStruct>()) });
 }

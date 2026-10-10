@@ -137,8 +137,10 @@ unsafe fn firmware_status_to_error(status: i32) -> i32 {
     }
 }
 
+// upstream: gt/uc/intel_guc_ct.h intel_guc_ct_enabled()
 #[inline]
-unsafe fn intel_guc_ct_enabled(ct: *const IntelGucCt) -> bool {
+#[unsafe(no_mangle)]
+unsafe extern "C" fn intel_guc_ct_enabled(ct: *const IntelGucCt) -> bool {
     unsafe { (*ct).enabled }
 }
 #[inline]
@@ -176,8 +178,8 @@ unsafe extern "C" {
     fn intel_guc_suspend(guc: *mut IntelGuc) -> i32;
     fn intel_guc_resume(guc: *mut IntelGuc) -> i32;
     fn intel_guc_tlb_invalidation_is_available(guc: *mut IntelGuc) -> bool;
-    fn intel_guc_invalidate_tlb_engines(guc: *mut IntelGuc);
-    fn intel_guc_invalidate_tlb_guc(guc: *mut IntelGuc);
+    fn intel_guc_invalidate_tlb_engines(guc: *mut IntelGuc) -> core::ffi::c_int;
+    fn intel_guc_invalidate_tlb_guc(guc: *mut IntelGuc) -> core::ffi::c_int;
     fn wake_up_all_tlb_invalidate(guc: *mut IntelGuc);
     fn intel_rps_raise_unslice(rps: *mut crate::intel_rps_types_upstream::IntelRps);
     fn intel_rps_lower_unslice(rps: *mut crate::intel_rps_types_upstream::IntelRps);

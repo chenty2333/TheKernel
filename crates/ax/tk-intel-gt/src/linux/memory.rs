@@ -14,12 +14,14 @@
 #![allow(unsafe_code)]
 
 use alloc::alloc::{Layout, alloc, alloc_zeroed, dealloc};
+use alloc::{collections::BTreeMap, vec::Vec};
 use core::{
-    ffi::c_void,
+    ffi::{c_int, c_void},
     mem::{align_of, size_of},
     ptr,
     sync::atomic::{AtomicBool, AtomicI32, Ordering, fence},
 };
+use spin::Mutex;
 
 use crate::{
     intel_context_upstream::{Kref, RefcountT},
@@ -117,6 +119,203 @@ pub unsafe fn kfree<T>(object: *mut T) {
     let layout = Layout::from_size_align(metadata.layout_size, metadata.layout_align)
         .expect("kfree received corrupt allocation metadata");
     unsafe { dealloc(metadata.base, layout) };
+}
+
+/// Linux `kmalloc(size, flags)` ABI entry. Same allocator and GFP policy as
+/// [`kmalloc`].
+///
+/// # Safety
+/// Callers follow the Linux `kmalloc` contract; the returned pointer is freed
+/// with [`kfree_c`] or `kvfree`.
+#[unsafe(export_name = "kmalloc")]
+pub unsafe extern "C" fn kmalloc_c(size: usize, flags: u32) -> *mut c_void {
+    kmalloc(size, flags)
+}
+
+/// Linux `kfree(ptr)` ABI entry. NULL and ZERO_SIZE_PTR are no-ops.
+///
+/// # Safety
+/// `object` must be NULL or a live pointer returned by this allocator.
+#[unsafe(export_name = "kfree")]
+pub unsafe extern "C" fn kfree_c(object: *mut c_void) {
+    unsafe { kfree(object) };
+}
+
+/// Linux `memdup_user(src, len)`: allocate `len` bytes and copy them from the
+/// current user address space. Failure returns `ERR_PTR(-ENOMEM)` or
+/// `ERR_PTR(-EFAULT)`, never NULL.
+///
+/// # Safety
+/// `src` is an untrusted user pointer; the copy is fault-checked by the
+/// native usercopy path.
+#[unsafe(export_name = "memdup_user")]
+pub unsafe extern "C" fn memdup_user(src: *const c_void, len: usize) -> *mut c_void {
+    let copy = kmalloc(len, GFP_KERNEL);
+    if copy.is_null() {
+        return crate::linux_config::ERR_PTR(-crate::linux_config::ENOMEM);
+    }
+    if len != 0 && unsafe { crate::linux::mm_native::copy_from_user(copy, src, len) } != 0 {
+        unsafe { kfree(copy) };
+        return crate::linux_config::ERR_PTR(-crate::linux_config::EFAULT);
+    }
+    copy
+}
+
+/// Linux `drmm_kzalloc()` bookkeeping: each allocation is owned by the DRM
+/// device it was requested for and is released by [`drmm_release_all`].
+static DRMM_ALLOCATIONS: Mutex<BTreeMap<usize, Vec<usize>>> = Mutex::new(BTreeMap::new());
+
+/// Linux `drmm_kzalloc(drm, size, flags)`. Returns NULL on failure. The
+/// allocation lives until the DRM device's managed resources are released.
+///
+/// # Safety
+/// `drm` must be a live DRM device identity.
+#[unsafe(export_name = "drmm_kzalloc")]
+pub unsafe extern "C" fn drmm_kzalloc_c(drm: *mut c_void, size: usize, flags: u32) -> *mut c_void {
+    if drm.is_null() {
+        return ptr::null_mut();
+    }
+    let object = kzalloc(size, flags);
+    if object.is_null() {
+        return object;
+    }
+    DRMM_ALLOCATIONS
+        .lock()
+        .entry(drm as usize)
+        .or_default()
+        .push(object as usize);
+    object
+}
+
+/// Release every `drmm_kzalloc()` allocation owned by `drm`, as Linux does
+/// when the DRM device's managed-resource list is finalized.
+///
+/// # Safety
+/// `drm` must be the device passed to earlier `drmm_kzalloc_c` calls and no
+/// returned object may be used after this call.
+pub unsafe fn drmm_release_all(drm: *mut c_void) {
+    // drmm actions run before the managed allocations are freed, as in Linux's
+    // drm_managed_release().
+    unsafe { crate::linux::kernel_core::drmm_run_actions(drm) };
+    let owned = DRMM_ALLOCATIONS.lock().remove(&(drm as usize));
+    for object in owned.into_iter().flatten() {
+        unsafe { kfree(object as *mut c_void) };
+    }
+}
+
+/// Registered `struct shrinker` objects. TheKernel has no reclaim pass that
+/// calls `scan_objects`: the global allocator never reports pressure, so a
+/// registered shrinker is retained and never invoked, as Linux does with no
+/// memory pressure.
+static SHRINKERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Linux `shrinker_alloc(flags, fmt, ...)`: a zeroed `struct shrinker`. The
+/// name format is only used by Linux's debugfs/sysfs naming and is ignored.
+///
+/// # Safety
+/// The returned object is released with [`shrinker_free`].
+#[unsafe(export_name = "shrinker_alloc")]
+pub unsafe extern "C" fn shrinker_alloc(
+    _flags: u32,
+    _fmt: *const core::ffi::c_char,
+    mut _args: ...
+) -> *mut crate::linux::gem_memory::Shrinker {
+    kzalloc(size_of::<crate::linux::gem_memory::Shrinker>(), GFP_KERNEL).cast()
+}
+
+/// Linux `shrinker_register(shrinker)`.
+///
+/// # Safety
+/// `shrinker` must come from [`shrinker_alloc`] and be initialized.
+#[unsafe(export_name = "shrinker_register")]
+pub unsafe extern "C" fn shrinker_register(shrinker: *mut crate::linux::gem_memory::Shrinker) {
+    let mut registered = SHRINKERS.lock();
+    assert!(
+        !registered.contains(&(shrinker as usize)),
+        "shrinker registered twice"
+    );
+    registered.push(shrinker as usize);
+}
+
+/// Linux `shrinker_free(shrinker)`: unregisters if needed and frees the object.
+///
+/// # Safety
+/// `shrinker` must come from [`shrinker_alloc`] and not be used afterwards.
+#[unsafe(export_name = "shrinker_free")]
+pub unsafe extern "C" fn shrinker_free(shrinker: *mut crate::linux::gem_memory::Shrinker) {
+    if shrinker.is_null() {
+        return;
+    }
+    SHRINKERS.lock().retain(|&entry| entry != shrinker as usize);
+    unsafe { kfree(shrinker) };
+}
+
+/// Notifier chains that TheKernel never fires: no OOM killer and no lazy
+/// vmap purge exist in this kernel. Registration is kept so a later event
+/// source sees the same chain Linux would.
+static OOM_NOTIFIERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static VMAP_PURGE_NOTIFIERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn notifier_register(chain: &Mutex<Vec<usize>>, nb: *mut crate::linux::gem_memory::NotifierBlock) -> c_int {
+    if nb.is_null() {
+        return -crate::linux_config::EINVAL;
+    }
+    let mut chain = chain.lock();
+    if !chain.contains(&(nb as usize)) {
+        chain.push(nb as usize);
+    }
+    0
+}
+
+fn notifier_unregister(chain: &Mutex<Vec<usize>>, nb: *mut crate::linux::gem_memory::NotifierBlock) -> c_int {
+    let mut chain = chain.lock();
+    let before = chain.len();
+    chain.retain(|&entry| entry != nb as usize);
+    if chain.len() == before {
+        -crate::linux_config::ENOENT
+    } else {
+        0
+    }
+}
+
+/// Linux `register_oom_notifier(nb)`.
+///
+/// # Safety
+/// `nb` must stay valid until unregistered.
+#[unsafe(export_name = "register_oom_notifier")]
+pub unsafe extern "C" fn register_oom_notifier(nb: *mut crate::linux::gem_memory::NotifierBlock) -> c_int {
+    notifier_register(&OOM_NOTIFIERS, nb)
+}
+
+/// Linux `unregister_oom_notifier(nb)`: `-ENOENT` if `nb` was not registered.
+///
+/// # Safety
+/// `nb` must be a block previously passed to `register_oom_notifier`.
+#[unsafe(export_name = "unregister_oom_notifier")]
+pub unsafe extern "C" fn unregister_oom_notifier(nb: *mut crate::linux::gem_memory::NotifierBlock) -> c_int {
+    notifier_unregister(&OOM_NOTIFIERS, nb)
+}
+
+/// Linux `register_vmap_purge_notifier(nb)`.
+///
+/// # Safety
+/// `nb` must stay valid until unregistered.
+#[unsafe(export_name = "register_vmap_purge_notifier")]
+pub unsafe extern "C" fn register_vmap_purge_notifier(
+    nb: *mut crate::linux::gem_memory::NotifierBlock,
+) -> c_int {
+    notifier_register(&VMAP_PURGE_NOTIFIERS, nb)
+}
+
+/// Linux `unregister_vmap_purge_notifier(nb)`.
+///
+/// # Safety
+/// `nb` must be a block previously passed to `register_vmap_purge_notifier`.
+#[unsafe(export_name = "unregister_vmap_purge_notifier")]
+pub unsafe extern "C" fn unregister_vmap_purge_notifier(
+    nb: *mut crate::linux::gem_memory::NotifierBlock,
+) -> c_int {
+    notifier_unregister(&VMAP_PURGE_NOTIFIERS, nb)
 }
 
 /// Linux `kvmalloc_array()` for CPU-only buffers. The kernel allocator supplies
@@ -749,5 +948,51 @@ mod tests {
         assert!(!refcount_dec_and_test(&mut reference));
         assert!(refcount_dec_and_test(&mut reference));
         assert!(!refcount_inc_not_zero(&mut reference));
+    }
+}
+
+#[cfg(test)]
+mod kernel_service_tests {
+    use super::*;
+    use crate::linux::gem_memory::NotifierBlock;
+    use crate::linux_config::ENOENT;
+
+    #[test]
+    fn drmm_allocations_are_zeroed_and_released_per_device() {
+        unsafe {
+            let drm = 0x5000_0000usize as *mut c_void;
+            let first = drmm_kzalloc_c(drm, 64, GFP_KERNEL).cast::<u8>();
+            assert!(!first.is_null());
+            assert!((0..64).all(|offset| *first.add(offset) == 0));
+            assert!(drmm_kzalloc_c(ptr::null_mut(), 8, GFP_KERNEL).is_null());
+            drmm_release_all(drm);
+            assert!(DRMM_ALLOCATIONS.lock().get(&(drm as usize)).is_none());
+        }
+    }
+
+    #[test]
+    fn oom_and_vmap_purge_chains_track_registration() {
+        unsafe {
+            let oom = 0x5100_0000usize as *mut NotifierBlock;
+            assert_eq!(register_oom_notifier(oom), 0);
+            assert_eq!(unregister_oom_notifier(oom), 0);
+            assert_eq!(unregister_oom_notifier(oom), -ENOENT);
+
+            let purge = 0x5200_0000usize as *mut NotifierBlock;
+            assert_eq!(register_vmap_purge_notifier(purge), 0);
+            assert_eq!(unregister_vmap_purge_notifier(purge), 0);
+            assert_eq!(unregister_vmap_purge_notifier(purge), -ENOENT);
+        }
+    }
+
+    #[test]
+    fn shrinker_objects_round_trip_through_register_and_free() {
+        unsafe {
+            let shrinker = shrinker_alloc(0, c"test".as_ptr());
+            assert!(!shrinker.is_null());
+            shrinker_register(shrinker);
+            shrinker_free(shrinker);
+            assert!(SHRINKERS.lock().is_empty());
+        }
     }
 }

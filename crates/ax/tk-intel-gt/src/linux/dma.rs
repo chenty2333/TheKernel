@@ -131,6 +131,35 @@ pub unsafe fn dma_unmap_sg_attrs(
         }
     }
 }
+/// Linux `dma_map_sgtable(dev, sgt, dir, attrs)`: maps the table's original
+/// entries and records the mapped count in `sgt->nents`. Returns 0 or a
+/// negative errno. An unregistered device or exhausted translation space
+/// fails the mapping with -ENOMEM (retryable), as Linux reports it.
+///
+/// # Safety
+/// `sgt` must describe a valid, unmapped scatterlist.
+#[unsafe(export_name = "dma_map_sgtable")]
+pub unsafe extern "C" fn dma_map_sgtable(
+    dev: *mut c_void,
+    sgt: *mut crate::intel_context_upstream::SgTable,
+    direction: i32,
+    attrs: u64,
+) -> i32 {
+    if sgt.is_null() {
+        return -crate::linux_config::EINVAL;
+    }
+    let (sgl, orig) = unsafe { ((*sgt).sgl, (*sgt).orig_nents) };
+    if sgl.is_null() || orig == 0 {
+        return -crate::linux_config::EINVAL;
+    }
+    let mapped = unsafe { dma_map_sg_attrs(dev, sgl, orig, direction as u32, attrs) };
+    if mapped == 0 {
+        return -crate::linux_config::ENOMEM;
+    }
+    unsafe { (*sgt).nents = mapped };
+    0
+}
+
 pub unsafe fn dma_alloc_coherent(
     dev: *mut c_void,
     size: usize,

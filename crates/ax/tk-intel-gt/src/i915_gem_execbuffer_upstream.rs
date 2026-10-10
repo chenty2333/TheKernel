@@ -177,7 +177,7 @@ unsafe extern "C" {
     fn capable(capability: c_int) -> bool;
     fn intel_pxp_key_check(object: *mut c_void, assign: bool) -> c_int;
     fn get_random_u32_below(range: u32) -> u32;
-    fn set_page_dirty(page: *mut crate::i915_gem_object_types_upstream::Page);
+    fn set_page_dirty(page: *mut crate::i915_gem_object_types_upstream::Page) -> bool;
     fn drm_mm_remove_node(node: *mut DrmMmNode);
     fn drm_mm_insert_node_in_range(
         mm: *mut crate::linux::gem_memory::DrmMm,

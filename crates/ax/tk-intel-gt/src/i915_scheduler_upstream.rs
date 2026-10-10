@@ -201,7 +201,8 @@ pub unsafe fn i915_sched_lookup_priolist(
 }
 
 // upstream: i915_scheduler.c __i915_priolist_free()
-pub unsafe fn __i915_priolist_free(priolist: *mut I915Priolist) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __i915_priolist_free(priolist: *mut I915Priolist) {
     unsafe { kmem_cache_free(SLAB_PRIORITIES, priolist.cast::<c_void>()) };
 }
 

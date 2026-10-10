@@ -134,7 +134,7 @@ unsafe extern "C" {
     fn intel_gt_init_clock_frequency(gt: *mut IntelGt);
     fn intel_sseu_info_init(gt: *mut IntelGt);
     fn intel_gt_apply_workarounds(gt: *mut IntelGt);
-    fn intel_gt_verify_workarounds(gt: *mut IntelGt, where_: *const c_char);
+    fn intel_gt_verify_workarounds(gt: *mut IntelGt, where_: *const c_char) -> bool;
     fn intel_gt_init_swizzling(gt: *mut IntelGt);
     fn i915_ppgtt_init_hw(gt: *mut IntelGt) -> i32;
     fn intel_uc_init_hw(uc: *mut c_void) -> i32;
@@ -148,7 +148,7 @@ unsafe extern "C" {
     fn intel_gt_resume(gt: *mut IntelGt) -> i32;
     fn intel_gt_init_hwconfig(gt: *mut IntelGt) -> i32;
     fn intel_uc_init_late(uc: *mut c_void);
-    fn intel_migrate_init(migrate: *mut c_void, gt: *mut IntelGt);
+    fn intel_migrate_init(migrate: *mut c_void, gt: *mut IntelGt) -> core::ffi::c_int;
     fn intel_gt_set_wedged(gt: *mut IntelGt);
     fn intel_gt_set_wedged_on_init(gt: *mut IntelGt);
     fn intel_gt_set_wedged_on_fini(gt: *mut IntelGt);
@@ -171,7 +171,7 @@ unsafe extern "C" {
     fn intel_rps_driver_unregister(rps: *mut c_void);
     fn intel_gsc_fini(gsc: *mut c_void);
     fn intel_gsc_uc_flush_work(gsc: *mut c_void);
-    fn intel_gt_reset_all_engines(gt: *mut IntelGt);
+    fn intel_gt_reset_all_engines(gt: *mut IntelGt) -> core::ffi::c_int;
     fn intel_wa_list_free(list: *mut c_void);
     fn intel_uc_driver_late_release(uc: *mut c_void);
     fn intel_gt_fini_requests(gt: *mut IntelGt);
@@ -201,7 +201,7 @@ unsafe extern "C" {
     fn i915_ggtt_pin(
         vma: *mut crate::i915_vma_types_upstream::I915Vma,
         ww: *mut c_void,
-        size: u64,
+        align: u32,
         flags: u32,
     ) -> i32;
     fn i915_vma_make_unshrinkable(
@@ -230,7 +230,7 @@ unsafe extern "C" {
     fn intel_uncore_init_early(uncore: *mut IntelUncore, gt: *mut IntelGt);
     fn intel_uncore_setup_mmio(uncore: *mut IntelUncore, phys: PhysAddrT) -> i32;
     fn intel_sa_mediagt_setup(gt: *mut IntelGt, phys: PhysAddrT, gsi: u32) -> i32;
-    fn intel_mmio_bar(graphics_ver: u32) -> u32;
+    fn intel_mmio_bar(graphics_ver: i32) -> i32;
     fn pci_resource_start(dev: *mut c_void, bar: u32) -> PhysAddrT;
     fn pci_resource_len(dev: *mut c_void, bar: u32) -> u64;
     fn to_pci_dev(dev: *mut c_void) -> *mut c_void;
@@ -241,12 +241,7 @@ unsafe extern "C" {
         name: *const c_char,
         ret: i32,
     );
-    fn i915_probe_error(
-        i915: *mut DrmI915Private,
-        fmt: *const c_char,
-        name: *const c_char,
-        ret: i32,
-    );
+    fn i915_probe_error(i915: *mut DrmI915Private, fmt: *const c_char, ...);
     fn intel_ggtt_gmch_flush();
     fn signal_pending_state(state: i32, task: *mut c_void) -> bool;
 }
@@ -1227,7 +1222,7 @@ pub unsafe extern "C" fn intel_gt_probe_all(i915: *mut DrmI915Private) -> i32 {
         (*gt).name = c"Primary GT".as_ptr();
         (*gt).info.engine_mask = (*info).platform_engine_mask;
     }
-    let bar = unsafe { intel_mmio_bar(GRAPHICS_VER(i915) as u32) };
+    let bar = unsafe { intel_mmio_bar(GRAPHICS_VER(i915) as i32) } as u32;
     let phys = unsafe { pci_resource_start(pdev, bar) };
     gt_dbg!(gt, "Setting up %s\n", (*gt).name);
     let mut ret = unsafe { intel_gt_tile_setup(gt, phys) };
@@ -1401,4 +1396,10 @@ pub unsafe extern "C" fn intel_gt_bind_context_set_unready(gt: *mut IntelGt) {
 pub unsafe extern "C" fn intel_gt_is_bind_context_ready(gt: *mut IntelGt) -> bool {
     let engine = unsafe { (*gt).engine[BCS0 as usize] };
     !engine.is_null() && unsafe { (*engine).bind_context_ready }
+}
+
+// upstream: intel_gt_types.h intel_gt_support_legacy_fencing() (macro)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_gt_support_legacy_fencing(gt: *mut IntelGt) -> bool {
+    unsafe { (*(*gt).ggtt).num_fences > 0 }
 }

@@ -173,7 +173,6 @@ fn show_heartbeat(rq: *const I915Request, engine: *mut IntelEngineCs) {
                 engine,
                 &mut printer,
                 core::ptr::null(),
-                core::ptr::null_mut(),
             );
         }
     } else {
@@ -190,7 +189,6 @@ fn show_heartbeat(rq: *const I915Request, engine: *mut IntelEngineCs) {
                 engine,
                 &mut printer,
                 core::ptr::null(),
-                core::ptr::null_mut(),
             );
         }
     }
@@ -503,7 +501,8 @@ pub fn intel_engine_set_heartbeat(engine: *mut IntelEngineCs, delay: c_ulong) ->
 }
 
 // upstream: intel_engine_heartbeat.c intel_engine_pulse()
-pub fn intel_engine_pulse(engine: *mut IntelEngineCs) -> i32 {
+#[unsafe(no_mangle)]
+pub extern "C" fn intel_engine_pulse(engine: *mut IntelEngineCs) -> i32 {
     let ce = unsafe { (*engine).kernel_context };
     let mut err: i32;
 
@@ -527,7 +526,8 @@ pub fn intel_engine_pulse(engine: *mut IntelEngineCs) -> i32 {
 }
 
 // upstream: intel_engine_heartbeat.c intel_engine_flush_barriers()
-pub fn intel_engine_flush_barriers(engine: *mut IntelEngineCs) -> i32 {
+#[unsafe(no_mangle)]
+pub extern "C" fn intel_engine_flush_barriers(engine: *mut IntelEngineCs) -> i32 {
     let attr = I915SchedAttr {
         priority: I915_PRIORITY_MIN,
     };

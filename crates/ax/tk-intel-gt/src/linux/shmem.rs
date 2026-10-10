@@ -112,6 +112,19 @@ impl<T> Drop for SpinLockGuard<'_, T> {
     }
 }
 
+/// Ordinary page: owns its own `PAGE_LAYOUT` allocation.
+const PAGE_KIND_OWNED: u8 = 0;
+/// Head subpage of a contiguous `alloc_pages(order > 0)` block; owns `block`.
+const PAGE_KIND_COMPOUND_HEAD: u8 = 1;
+/// Non-head subpage of a compound block; memory belongs to the head.
+const PAGE_KIND_COMPOUND_TAIL: u8 = 2;
+/// Pinned frame of another owner (user memory); never freed here.
+const PAGE_KIND_FOREIGN: u8 = 3;
+/// Largest order accepted by `alloc_pages()` (Linux MAX_PAGE_ORDER on x86_64).
+const MAX_PAGE_ORDER: u32 = 10;
+/// Linux `___GFP_DIRECT_RECLAIM_BIT` in the wt-dev configuration.
+const GFP_DIRECT_RECLAIM: u32 = 1 << 10;
+
 #[repr(C)]
 struct PageRecord {
     magic: u64,
@@ -122,6 +135,9 @@ struct PageRecord {
     index: AtomicU64,
     mapping: AtomicPtr<AddressSpace>,
     next: *mut PageRecord,
+    kind: u8,
+    order: u32,
+    block: *mut u8,
 }
 
 unsafe impl Send for PageRecord {}
@@ -332,6 +348,9 @@ unsafe fn alloc_page(mapping: *mut AddressSpace, index: u64) -> *mut Page {
             index: AtomicU64::new(index),
             mapping: AtomicPtr::new(mapping),
             next: ptr::null_mut(),
+            kind: PAGE_KIND_OWNED,
+            order: 0,
+            block: ptr::null_mut(),
         })
     };
     if record.is_null() {
@@ -447,6 +466,11 @@ pub unsafe fn put_page(page: *mut Page) {
         }
         assert!(!current.is_null(), "put_page received an unregistered Page");
         let record = current;
+        let kind = unsafe { (*record).kind };
+        assert!(
+            kind == PAGE_KIND_OWNED || kind == PAGE_KIND_FOREIGN,
+            "compound page subpages are released only by __free_pages"
+        );
         let old = unsafe { (*record).refs.fetch_sub(1, Ordering::AcqRel) };
         assert!(old != 0, "page reference underflow");
         if old == 1 {
@@ -457,11 +481,232 @@ pub unsafe fn put_page(page: *mut Page) {
         record
     };
     if free {
+        let kind = unsafe { (*record).kind };
         unsafe {
             (*record).magic = 0;
-            dealloc((*record).address, PAGE_LAYOUT);
+            // A foreign record only describes frames owned by another subsystem.
+            if kind == PAGE_KIND_OWNED {
+                dealloc((*record).address, PAGE_LAYOUT);
+            }
             free_object(record);
         }
+    }
+}
+
+/// Linux `alloc_pages(gfp, order)`: returns `2^order` physically contiguous,
+/// zeroed pages. Non-reclaiming allocations fail closed, as the global
+/// allocator cannot honour them. Returns NULL when the block is not
+/// physically contiguous, so the caller can fall back to a smaller order.
+pub unsafe fn alloc_pages(gfp: u32, order: u32) -> *mut Page {
+    if gfp & GFP_DIRECT_RECLAIM == 0 || order > MAX_PAGE_ORDER {
+        return ptr::null_mut();
+    }
+    if order == 0 {
+        return unsafe { alloc_page(ptr::null_mut(), 0) };
+    }
+    let count = 1usize << order;
+    let bytes = PAGE_SIZE << order;
+    let Ok(layout) = core::alloc::Layout::from_size_align(bytes, PAGE_SIZE) else {
+        return ptr::null_mut();
+    };
+    let block = unsafe { alloc_zeroed(layout) };
+    if block.is_null() {
+        return ptr::null_mut();
+    }
+    let base_physical = phys_addr(block);
+    let contiguous = (0..count).all(|index| {
+        phys_addr(unsafe { block.add(index * PAGE_SIZE) }) == base_physical + index * PAGE_SIZE
+    });
+    if !contiguous {
+        unsafe { dealloc(block, layout) };
+        return ptr::null_mut();
+    }
+
+    let mut records = alloc::vec::Vec::with_capacity(count);
+    for index in 0..count {
+        let record = unsafe {
+            alloc_object(PageRecord {
+                magic: PAGE_MAGIC,
+                address: block.add(index * PAGE_SIZE),
+                physical: base_physical + index * PAGE_SIZE,
+                refs: AtomicUsize::new(1),
+                flags: AtomicU32::new(PAGE_UPTODATE),
+                index: AtomicU64::new(index as u64),
+                mapping: AtomicPtr::new(ptr::null_mut()),
+                next: ptr::null_mut(),
+                kind: if index == 0 {
+                    PAGE_KIND_COMPOUND_HEAD
+                } else {
+                    PAGE_KIND_COMPOUND_TAIL
+                },
+                order: if index == 0 { order } else { 0 },
+                block: if index == 0 { block } else { ptr::null_mut() },
+            })
+        };
+        if record.is_null() {
+            for created in records {
+                unsafe { free_object(created) };
+            }
+            unsafe { dealloc(block, layout) };
+            return ptr::null_mut();
+        }
+        records.push(record);
+    }
+
+    let mut registry = PAGE_REGISTRY.lock();
+    let duplicate = records.iter().any(|record| {
+        let physical = unsafe { (**record).physical };
+        let mut current = registry.first;
+        while !current.is_null() {
+            if unsafe { (*current).physical } == physical {
+                return true;
+            }
+            current = unsafe { (*current).next };
+        }
+        false
+    });
+    if duplicate {
+        drop(registry);
+        for record in records {
+            unsafe { free_object(record) };
+        }
+        unsafe { dealloc(block, layout) };
+        return ptr::null_mut();
+    }
+    for record in &records {
+        unsafe { (**record).next = registry.first };
+        registry.first = *record;
+        registry.count += 1;
+    }
+    records[0].cast::<Page>()
+}
+
+/// Linux `__free_pages(page, order)`. The page must be the head returned by
+/// [`alloc_pages`] with no outstanding references besides the allocation's
+/// own; the whole block is released together.
+///
+/// # Safety
+/// `page` must be a live page from [`alloc_pages`] with the same `order`.
+pub unsafe fn free_pages(page: *mut Page, order: u32) {
+    if page.is_null() {
+        return;
+    }
+    if order == 0 {
+        unsafe { put_page(page) };
+        return;
+    }
+    let mut registry = PAGE_REGISTRY.lock();
+    let head = find_record(&registry, page);
+    assert!(
+        !head.is_null(),
+        "__free_pages received an unregistered Page"
+    );
+    assert!(
+        unsafe { (*head).kind == PAGE_KIND_COMPOUND_HEAD && (*head).order == order },
+        "__free_pages order does not match the allocation"
+    );
+    assert!(
+        unsafe { (*head).refs.load(Ordering::Acquire) } == 1,
+        "__free_pages on a referenced compound page"
+    );
+    let block = unsafe { (*head).block };
+    let head_physical = unsafe { (*head).physical };
+    let count = 1usize << order;
+    let mut released = alloc::vec::Vec::with_capacity(count);
+    for index in 0..count {
+        let physical = head_physical + index * PAGE_SIZE;
+        let mut link = &mut registry.first as *mut *mut PageRecord;
+        let mut current = unsafe { *link };
+        while !current.is_null() && unsafe { (*current).physical } != physical {
+            link = unsafe { ptr::addr_of_mut!((*current).next) };
+            current = unsafe { *link };
+        }
+        assert!(
+            !current.is_null(),
+            "compound page subpage missing from registry"
+        );
+        unsafe { *link = (*current).next };
+        registry.count -= 1;
+        released.push(current);
+    }
+    drop(registry);
+    let layout = core::alloc::Layout::from_size_align(PAGE_SIZE << order, PAGE_SIZE)
+        .expect("compound page layout");
+    unsafe {
+        dealloc(block, layout);
+        for record in released {
+            (*record).magic = 0;
+            free_object(record);
+        }
+    }
+}
+
+/// Return the registered page for a physical frame, taking one reference. A
+/// frame that has no record yet becomes a `FOREIGN` record for the duration of
+/// the pin; the frame itself stays owned by its original allocator.
+pub unsafe fn pin_physical_frame(physical: usize) -> *mut Page {
+    let frame = physical & !(PAGE_SIZE - 1);
+    {
+        let registry = PAGE_REGISTRY.lock();
+        let mut current = registry.first;
+        while !current.is_null() {
+            if unsafe { (*current).physical } == frame {
+                unsafe { (*current).refs.fetch_add(1, Ordering::AcqRel) };
+                return current.cast::<Page>();
+            }
+            current = unsafe { (*current).next };
+        }
+    }
+    let address = direct_map_address(frame);
+    if address.is_null() {
+        return ptr::null_mut();
+    }
+    let record = unsafe {
+        alloc_object(PageRecord {
+            magic: PAGE_MAGIC,
+            address,
+            physical: frame,
+            refs: AtomicUsize::new(1),
+            flags: AtomicU32::new(PAGE_UPTODATE),
+            index: AtomicU64::new(0),
+            mapping: AtomicPtr::new(ptr::null_mut()),
+            next: ptr::null_mut(),
+            kind: PAGE_KIND_FOREIGN,
+            order: 0,
+            block: ptr::null_mut(),
+        })
+    };
+    if record.is_null() {
+        return ptr::null_mut();
+    }
+    let mut registry = PAGE_REGISTRY.lock();
+    let mut current = registry.first;
+    while !current.is_null() {
+        if unsafe { (*current).physical } == frame {
+            // Lost a race with another pin of the same frame; use that record.
+            unsafe { (*current).refs.fetch_add(1, Ordering::AcqRel) };
+            drop(registry);
+            unsafe { free_object(record) };
+            return current.cast::<Page>();
+        }
+        current = unsafe { (*current).next };
+    }
+    unsafe { (*record).next = registry.first };
+    registry.first = record;
+    registry.count += 1;
+    record.cast::<Page>()
+}
+
+/// Kernel direct-map alias of a physical frame.
+fn direct_map_address(physical: usize) -> *mut u8 {
+    #[cfg(target_os = "none")]
+    {
+        use memory_addr::{MemoryAddr, PhysAddr};
+        axhal::mem::phys_to_virt(PhysAddr::from_usize(physical)).as_usize() as *mut u8
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        physical as *mut u8
     }
 }
 
@@ -1241,6 +1486,102 @@ pub fn dev_warn<T, A: CFormatArg>(device: *mut T, format: &str, argument: A) {
         line!(),
         &message,
     );
+}
+
+/// Linux `fput(file)` ABI entry.
+///
+/// # Safety
+/// `file` must hold one reference taken by this owner.
+#[unsafe(export_name = "fput")]
+pub unsafe extern "C" fn fput_c(file: *mut c_void) {
+    unsafe { fput(file) };
+}
+
+/// Linux `get_file_active(&slot)`: takes a reference on the file currently in
+/// `*slot` if it is still live (refcount non-zero), else returns NULL.
+///
+/// # Safety
+/// `slot` must be a valid pointer to a file pointer slot.
+#[unsafe(export_name = "get_file_active")]
+pub unsafe extern "C" fn get_file_active(slot: *mut *mut File) -> *mut File {
+    let file = unsafe { *slot };
+    if file.is_null() || crate::linux_config::IS_ERR(file) {
+        return ptr::null_mut();
+    }
+    let refs = unsafe { &(*file).refs };
+    let mut current = refs.load(Ordering::Acquire);
+    loop {
+        if current == 0 {
+            return ptr::null_mut();
+        }
+        match refs.compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return file,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Linux `alloc_pages(gfp_mask, order)` ABI entry.
+///
+/// # Safety
+/// Follows the Linux allocator contract; release with `__free_pages`.
+#[unsafe(export_name = "alloc_pages")]
+pub unsafe extern "C" fn alloc_pages_c(gfp_mask: u32, order: u32) -> *mut Page {
+    unsafe { alloc_pages(gfp_mask, order) }
+}
+
+/// Linux `__free_pages(page, order)` ABI entry.
+///
+/// # Safety
+/// `page` must come from `alloc_pages_c` with the same `order`.
+#[unsafe(export_name = "__free_pages")]
+pub unsafe extern "C" fn __free_pages_c(page: *mut Page, order: u32) {
+    unsafe { free_pages(page, order) };
+}
+
+/// Linux `page_address(page)` ABI entry for registered pages.
+///
+/// # Safety
+/// `page` must be a page known to this allocator.
+#[unsafe(export_name = "page_address")]
+pub unsafe extern "C" fn page_address_c(page: *mut Page) -> *mut c_void {
+    unsafe { page_address(page) }
+}
+
+/// Linux `mark_page_accessed(page)` ABI entry.
+///
+/// # Safety
+/// `page` must be a page known to this allocator.
+#[unsafe(export_name = "mark_page_accessed")]
+pub unsafe extern "C" fn mark_page_accessed_c(page: *mut Page) {
+    unsafe { mark_page_accessed(page) };
+}
+
+/// Linux `unlock_page(page)` ABI entry.
+///
+/// # Safety
+/// `page` must be locked by the caller.
+#[unsafe(export_name = "unlock_page")]
+pub unsafe extern "C" fn unlock_page_c(page: *mut Page) {
+    unsafe { unlock_page(page) };
+}
+
+/// Linux `set_page_dirty(page)`: marks the page dirty and reports whether this
+/// call changed its state.
+///
+/// # Safety
+/// `page` must be a page known to this allocator.
+#[unsafe(export_name = "set_page_dirty")]
+pub unsafe extern "C" fn set_page_dirty_c(page: *mut Page) -> bool {
+    unsafe { folio_mark_dirty(page.cast()) }
+}
+
+/// Linux `get_nr_swap_pages()`. TheKernel has no swap device, so the number of
+/// free swap slots is zero by definition.
+#[unsafe(export_name = "get_nr_swap_pages")]
+pub extern "C" fn get_nr_swap_pages() -> c_long {
+    0
 }
 
 #[cfg(test)]

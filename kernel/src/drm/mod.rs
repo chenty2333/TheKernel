@@ -34,6 +34,8 @@ mod virtio;
 /// `/dev/fb0`, and the registry a display driver enters it through.
 pub(crate) mod screen;
 
+#[cfg(feature = "intel-upstream-gt")]
+pub(crate) use device::release_firmware_primary;
 pub use device::{
     AdapterMetrics, DisplayAdapter, DrmDevice, DrmError, DrmMetrics, DrmResult, Scanout,
     primary_device, register_primary_device,

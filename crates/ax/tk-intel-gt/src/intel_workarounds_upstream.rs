@@ -1122,7 +1122,8 @@ unsafe fn gt_init_workarounds(gt: *mut IntelGt, wal: *mut I915WaList) {
     }
 }
 // upstream: intel_workarounds.c intel_gt_init_workarounds()
-unsafe fn intel_gt_init_workarounds(gt: *mut IntelGt) {
+#[unsafe(no_mangle)]
+unsafe extern "C" fn intel_gt_init_workarounds(gt: *mut IntelGt) {
     let wal = &mut (*gt).wa_list;
     wa_init_start(wal, gt, c"GT".as_ptr(), c"global".as_ptr());
     gt_init_workarounds(gt, wal);
@@ -1198,7 +1199,8 @@ unsafe fn wa_list_apply(wal: *const I915WaList) {
     intel_gt_mcr_unlock(gt, flags);
 }
 // upstream: intel_workarounds.c intel_gt_apply_workarounds()
-unsafe fn intel_gt_apply_workarounds(gt: *mut IntelGt) {
+#[unsafe(no_mangle)]
+unsafe extern "C" fn intel_gt_apply_workarounds(gt: *mut IntelGt) {
     wa_list_apply(&(*gt).wa_list);
 }
 // upstream: intel_workarounds.c wa_list_verify()
@@ -1225,7 +1227,8 @@ unsafe fn wa_list_verify(gt: *mut IntelGt, wal: *const I915WaList, from: *const 
     ok
 }
 // upstream: intel_workarounds.c intel_gt_verify_workarounds()
-unsafe fn intel_gt_verify_workarounds(gt: *mut IntelGt, from: *const i8) -> bool {
+#[unsafe(no_mangle)]
+unsafe extern "C" fn intel_gt_verify_workarounds(gt: *mut IntelGt, from: *const i8) -> bool {
     wa_list_verify(gt, &(*gt).wa_list, from)
 }
 

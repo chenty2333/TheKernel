@@ -146,7 +146,7 @@ unsafe fn intel_ppgtt_type(i915: *mut DrmI915Private) -> i32 {
     unsafe { (*info).runtime.ppgtt_type }
 }
 
-unsafe fn has_ppgtt(i915: *mut DrmI915Private) -> bool {
+pub(crate) unsafe fn has_ppgtt(i915: *mut DrmI915Private) -> bool {
     unsafe { intel_ppgtt_type(i915) != I915_PPGTT_NONE }
 }
 
@@ -171,7 +171,7 @@ unsafe extern "C" {
     fn pci_read_config_word(dev: *mut c_void, offset: u32, value: *mut u16) -> c_int;
     fn pci_resource_start(dev: *mut c_void, bar: u32) -> u64;
     fn pci_resource_len(dev: *mut c_void, bar: u32) -> u64;
-    fn i915_pci_resource_valid(dev: *mut c_void, bar: u32) -> bool;
+    fn i915_pci_resource_valid(dev: *mut c_void, bar: c_int) -> bool;
     fn i915_direct_stolen_access(i915: *mut DrmI915Private) -> bool;
     fn intel_ggtt_gmch_probe(ggtt: *mut I915Ggtt) -> c_int;
     fn intel_ggtt_gmch_enable_hw(i915: *mut DrmI915Private) -> c_int;
@@ -1776,7 +1776,7 @@ unsafe fn gen8_gmch_probe(ggtt: *mut I915Ggtt) -> c_int {
     let i915 = unsafe { (*vm).i915 };
     let pdev = unsafe { to_pci_dev((*i915).drm.dev) };
     if !unsafe { HAS_LMEM(i915) || has_lmembar_smem_stolen(i915) } {
-        if !unsafe { i915_pci_resource_valid(pdev, GEN4_GMADR_BAR) } {
+        if !unsafe { i915_pci_resource_valid(pdev, GEN4_GMADR_BAR as c_int) } {
             return -ENXIO;
         }
         unsafe {
@@ -1911,7 +1911,7 @@ unsafe fn gen6_gmch_probe(ggtt: *mut I915Ggtt) -> c_int {
     let vm = unsafe { core::ptr::addr_of_mut!((*ggtt).vm) };
     let i915 = unsafe { (*vm).i915 };
     let pdev = unsafe { to_pci_dev((*i915).drm.dev) };
-    if !unsafe { i915_pci_resource_valid(pdev, GEN4_GMADR_BAR) } {
+    if !unsafe { i915_pci_resource_valid(pdev, GEN4_GMADR_BAR as c_int) } {
         return -ENXIO;
     }
     unsafe {

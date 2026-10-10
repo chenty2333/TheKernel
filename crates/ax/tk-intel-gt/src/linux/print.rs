@@ -16,7 +16,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{
-    ffi::{CStr, c_char},
+    ffi::{CStr, c_char, c_int, c_void},
     sync::atomic::{AtomicU32, Ordering},
 };
 
@@ -1093,4 +1093,101 @@ mod tests {
             "val=0"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// C variadic printf family used by the translated i915 code.
+//
+// The format is parsed by `printf-compat`, which reads each argument from the
+// C `va_list` with the width its conversion names.
+// ---------------------------------------------------------------------------
+
+/// Format a C printf string from `args` into an owned string.
+///
+/// # Safety
+/// `fmt` must be a NUL-terminated format string whose conversions match the
+/// variadic arguments, as in C.
+unsafe fn c_format(fmt: *const c_char, args: core::ffi::VaList<'_>) -> String {
+    let mut out = String::new();
+    // A malformed format returns an error; the text formatted so far is kept,
+    // which matches the partial output of C's printf family on the same input.
+    let _ = unsafe { printf_compat::format(fmt, args, printf_compat::output::fmt_write(&mut out)) };
+    out
+}
+
+/// Copy at most `size - 1` bytes plus a NUL terminator; return the number of
+/// bytes copied before the terminator.
+///
+/// # Safety
+/// `buf` must be valid for `size` bytes when `size` is non-zero.
+unsafe fn copy_truncated(buf: *mut c_char, size: usize, bytes: &[u8]) -> usize {
+    if buf.is_null() || size == 0 {
+        return 0;
+    }
+    let copied = bytes.len().min(size - 1);
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast::<u8>(), copied);
+        *buf.add(copied) = 0;
+    }
+    copied
+}
+
+/// Linux `snprintf()`: returns the length the full output would have had.
+///
+/// # Safety
+/// Same contract as C `snprintf()`.
+///
+/// Exported as `tk_linux_snprintf`: the product also links ACPICA, whose C
+/// runtime already defines `snprintf`, so LinuxKPI callers bind this name via
+/// `#[link_name]`.
+#[unsafe(export_name = "tk_linux_snprintf")]
+pub unsafe extern "C" fn snprintf(
+    buf: *mut c_char,
+    size: usize,
+    fmt: *const c_char,
+    mut args: ...
+) -> c_int {
+    let text = unsafe { c_format(fmt, args.clone()) };
+    unsafe { copy_truncated(buf, size, text.as_bytes()) };
+    text.len() as c_int
+}
+
+/// Linux `scnprintf()`: returns the number of characters actually written.
+///
+/// # Safety
+/// Same contract as C `snprintf()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn scnprintf(
+    buf: *mut c_char,
+    size: usize,
+    fmt: *const c_char,
+    mut args: ...
+) -> c_int {
+    let text = unsafe { c_format(fmt, args.clone()) };
+    unsafe { copy_truncated(buf, size, text.as_bytes()) as c_int }
+}
+
+/// Linux `seq_printf()`: append formatted output to a seq_file.
+///
+/// # Safety
+/// `m` must be a live seq_file and `fmt` a valid format for its arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn seq_printf(
+    m: *mut crate::linux::seq_file::SeqFile,
+    fmt: *const c_char,
+    mut args: ...
+) -> c_int {
+    let text = unsafe { c_format(fmt, args.clone()) };
+    unsafe { crate::linux::seq_file::seq_write(m, text.as_bytes()) };
+    0
+}
+
+/// Linux `_dev_err()`: report a device error through the kernel log.
+///
+/// # Safety
+/// `format` must be a valid format for its variadic arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _dev_err(_device: *const c_void, fmt: *const c_char, mut args: ...) {
+    let text = unsafe { c_format(fmt, args.clone()) };
+    axlog::error!("{}", text.trim_end());
 }

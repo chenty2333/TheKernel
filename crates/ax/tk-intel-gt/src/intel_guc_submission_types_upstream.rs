@@ -19,8 +19,6 @@ unsafe extern "C" {
     pub fn intel_guc_submission_enable(guc: *mut IntelGuc) -> i32;
     pub fn intel_guc_submission_disable(guc: *mut IntelGuc);
     pub fn intel_guc_submission_fini(guc: *mut IntelGuc);
-    pub fn intel_guc_preempt_work_create(guc: *mut IntelGuc) -> i32;
-    pub fn intel_guc_preempt_work_destroy(guc: *mut IntelGuc);
     pub fn intel_guc_submission_setup(engine: *mut IntelEngineCs) -> i32;
     pub fn intel_guc_submission_print_info(guc: *mut IntelGuc, printer: *mut DrmPrinter);
     pub fn intel_guc_submission_print_context_info(guc: *mut IntelGuc, printer: *mut DrmPrinter);

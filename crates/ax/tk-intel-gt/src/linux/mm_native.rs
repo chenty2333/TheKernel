@@ -19,7 +19,12 @@ use super::{
     mm::{VM_WRITE, VmAreaStruct},
     shmem,
 };
-use crate::{i915_gem_object_types_upstream::Page, intel_context_types_upstream::File};
+use crate::{
+    i915_gem_object_types_upstream::Page,
+    intel_context_types_upstream::File,
+    linux::mmu_notifier::{MmuIntervalNotifier, MmuIntervalNotifierOps, MmuNotifierRange},
+    linux_config::PAGE_SIZE,
+};
 
 pub struct MmStruct {
     aspace: UnsafeCell<axmm::AddrSpace>,
@@ -28,6 +33,10 @@ pub struct MmStruct {
     user_access_owner: AtomicU64,
     user_access_start: AtomicUsize,
     user_access_end: AtomicUsize,
+    /// `struct mmu_interval_notifier *` registered on this mm.
+    interval_notifiers: spin::Mutex<Vec<usize>>,
+    /// Sequence stamped into each invalidated notifier (`mm->notifier_seq`).
+    notifier_seq: AtomicU64,
 }
 struct NativeVma {
     area: Box<VmAreaStruct>,
@@ -58,6 +67,8 @@ impl MmStruct {
             user_access_owner: AtomicU64::new(u64::MAX),
             user_access_start: AtomicUsize::new(0),
             user_access_end: AtomicUsize::new(0),
+            interval_notifiers: spin::Mutex::new(Vec::new()),
+            notifier_seq: AtomicU64::new(0),
         })
     }
 }
@@ -180,6 +191,9 @@ pub unsafe fn map_pfn(mm: *mut MmStruct, addr: usize, pfn: usize, prot: u64) -> 
     if mm.is_null() || addr & 4095 != 0 {
         return -crate::linux_config::EINVAL;
     }
+    if unsafe { (&*(*mm).aspace.get()).query_leaf(addr.into()).is_ok() } {
+        unsafe { invalidate_interval_notifiers(mm, addr, 4096, MMU_NOTIFY_CLEAR) };
+    }
     let space = unsafe { &mut *(*mm).aspace.get() };
     if space.query_leaf(addr.into()).is_ok() && space.unmap(addr.into(), 4096).is_err() {
         return -crate::linux_config::EIO;
@@ -192,8 +206,74 @@ pub unsafe fn map_pfn(mm: *mut MmStruct, addr: usize, pfn: usize, prot: u64) -> 
         Err(_) => -crate::linux_config::ENOMEM,
     }
 }
+/// Range record handed to interval-notifier callbacks. Field order follows
+/// Linux `struct mmu_notifier_range` (CONFIG_MMU_NOTIFIER).
+#[repr(C)]
+struct NotifierRange {
+    mm: *mut MmStruct,
+    start: c_ulong,
+    end: c_ulong,
+    flags: u32,
+    event: u32,
+    owner: *mut c_void,
+}
+
+const MMU_NOTIFY_UNMAP: u32 = 0;
+const MMU_NOTIFY_CLEAR: u32 = 1;
+
+/// Linux `mmu_notifier_invalidate_range_start()` for interval notifiers: every
+/// notifier whose interval overlaps `[start, start + size)` is invalidated
+/// before the PTEs go away. Each invalidation takes a fresh `notifier_seq`,
+/// which the callback stores into the notifier's `invalidate_seq`, so readers
+/// that sampled an earlier sequence see the retry.
+unsafe fn invalidate_interval_notifiers(mm: *mut MmStruct, start: usize, size: usize, event: u32) {
+    let subscribers = unsafe { (*mm).interval_notifiers.lock().clone() };
+    if subscribers.is_empty() || size == 0 {
+        return;
+    }
+    let Some(end) = start.checked_add(size) else {
+        return;
+    };
+    let cur_seq = unsafe { (*mm).notifier_seq.fetch_add(1, Ordering::AcqRel) } + 1;
+    let range = NotifierRange {
+        mm,
+        start: start as c_ulong,
+        end: end as c_ulong,
+        flags: 0,
+        event,
+        owner: ptr::null_mut(),
+    };
+    for raw in subscribers {
+        let notifier = raw as *mut MmuIntervalNotifier;
+        let (first, last) = unsafe {
+            (
+                (*notifier).interval_tree.start,
+                (*notifier).interval_tree.last,
+            )
+        };
+        if first >= end || start > last {
+            continue;
+        }
+        let ops = unsafe { (*notifier).ops };
+        let invalidate =
+            unsafe { (*ops).invalidate }.expect("interval notifier without invalidate");
+        let blockable = unsafe {
+            invalidate(
+                notifier,
+                ptr::addr_of!(range).cast::<MmuNotifierRange>(),
+                cur_seq as c_ulong,
+            )
+        };
+        assert!(
+            blockable,
+            "blockable interval-notifier invalidation refused"
+        );
+    }
+}
+
 pub unsafe fn zap_range(mm: *mut MmStruct, addr: usize, size: usize) {
     assert!(!mm.is_null());
+    unsafe { invalidate_interval_notifiers(mm, addr, size, MMU_NOTIFY_UNMAP) };
     let space = unsafe { &mut *(*mm).aspace.get() };
     if size != 0 {
         let page_size = crate::linux_config::PAGE_SIZE;
@@ -416,6 +496,73 @@ pub unsafe fn copy_to_user(to: *mut c_void, from: *const c_void, size: usize) ->
     if result.is_ok() { 0 } else { size }
 }
 
+/// Linux `copy_from_user()` ABI entry; see [`copy_from_user`].
+#[unsafe(export_name = "copy_from_user")]
+pub unsafe extern "C" fn copy_from_user_c(to: *mut c_void, from: *const c_void, n: usize) -> usize {
+    unsafe { copy_from_user(to, from, n) }
+}
+
+/// Linux `copy_to_user()` ABI entry; see [`copy_to_user`].
+#[unsafe(export_name = "copy_to_user")]
+pub unsafe extern "C" fn copy_to_user_c(to: *mut c_void, from: *const c_void, n: usize) -> usize {
+    unsafe { copy_to_user(to, from, n) }
+}
+
+/// Linux `__copy_to_user()`: the caller has already performed `access_ok()`;
+/// the native backend still performs the checked address-space write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __copy_to_user(to: *mut c_void, from: *const c_void, n: usize) -> usize {
+    unsafe { copy_to_user(to, from, n) }
+}
+
+/// Linux `__copy_to_user_inatomic()`: never sleeps or faults in. If the
+/// address space lock is contended the whole copy is reported as uncopied,
+/// which is the value Linux's inatomic callers already retry on.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __copy_to_user_inatomic(
+    to: *mut c_void,
+    from: *const c_void,
+    n: usize,
+) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mm = current_mm();
+    if mm.is_null() || !mmap_read_trylock(mm) {
+        return n;
+    }
+    let result = unsafe {
+        (&*(*mm).aspace.get()).write(
+            (to as usize).into(),
+            core::slice::from_raw_parts(from.cast(), n),
+        )
+    };
+    unsafe { mmap_read_unlock(mm) };
+    if result.is_ok() { 0 } else { n }
+}
+
+/// Linux `copy_from_user_inatomic_nontemporal()`. The non-temporal store hint
+/// only selects the cache allocation policy of the destination writes; the
+/// copied bytes and the uncopied-byte result are those of the inatomic copy.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copy_from_user_inatomic_nontemporal(
+    to: *mut c_void,
+    from: *const c_void,
+    n: usize,
+) -> usize {
+    unsafe { __copy_from_user_inatomic(to, from, n) }
+}
+
+/// Linux `access_ok()` on x86_64: a user range is admissible when it does not
+/// wrap and ends at or below `TASK_SIZE_MAX`. This only range-checks the
+/// pointer; the copy itself is still checked page by page by axmm.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn access_ok(addr: *const c_void, size: u64) -> bool {
+    const TASK_SIZE_MAX: u64 = 0x0000_7fff_ffff_f000;
+    let addr = addr as u64;
+    addr <= TASK_SIZE_MAX && size <= TASK_SIZE_MAX - addr
+}
+
 /// Linux usercopy ABI. The native MM implementation walks the current
 /// process's checked address space directly and returns the uncopied byte
 /// count, rather than dereferencing an unchecked userspace virtual address.
@@ -452,6 +599,151 @@ pub unsafe extern "C" fn __copy_from_user_inatomic(
     };
     unsafe { mmap_read_unlock(mm) };
     if result.is_ok() { 0 } else { size }
+}
+
+/// Linux `pin_user_pages_fast(start, nr_pages, gup_flags, pages)`. Each page
+/// is resolved through the current process's checked address space, must be
+/// readable (and writable under `FOLL_WRITE`), and receives one page
+/// reference that `unpin_user_pages` drops. A short pin returns the number
+/// pinned; a failure before the first page returns a negative errno.
+#[unsafe(export_name = "pin_user_pages_fast")]
+pub unsafe extern "C" fn pin_user_pages_fast_c(
+    start: c_ulong,
+    nr_pages: i32,
+    gup_flags: u32,
+    pages: *mut *mut Page,
+) -> i32 {
+    const FOLL_WRITE: u32 = 1 << 0;
+    if nr_pages <= 0 {
+        return 0;
+    }
+    if pages.is_null() {
+        return -crate::linux_config::EINVAL;
+    }
+    let mm = current_mm();
+    if mm.is_null() {
+        return -crate::linux_config::EFAULT;
+    }
+    let count = nr_pages as usize;
+    let mut pinned = 0usize;
+    let mut failure = 0i32;
+    unsafe { mmap_read_lock(mm) };
+    {
+        let aspace = unsafe { &*(*mm).aspace.get() };
+        for index in 0..count {
+            let Some(address) = (start as usize).checked_add(index * PAGE_SIZE) else {
+                failure = -crate::linux_config::EFAULT;
+                break;
+            };
+            let Ok((physical, flags, _)) = aspace.query_leaf(address.into()) else {
+                failure = -crate::linux_config::EFAULT;
+                break;
+            };
+            let writable_ok = gup_flags & FOLL_WRITE == 0 || flags.contains(MappingFlags::WRITE);
+            if !flags.contains(MappingFlags::READ) || !writable_ok {
+                failure = -crate::linux_config::EFAULT;
+                break;
+            }
+            let page = unsafe { shmem::pin_physical_frame(physical.as_usize()) };
+            if page.is_null() {
+                failure = -crate::linux_config::ENOMEM;
+                break;
+            }
+            unsafe { pages.add(index).write(page) };
+            pinned += 1;
+        }
+    }
+    unsafe { mmap_read_unlock(mm) };
+    if pinned == 0 && failure != 0 {
+        return failure;
+    }
+    pinned as i32
+}
+
+/// Linux `unpin_user_pages(pages, npages)`: drops the references taken by
+/// [`pin_user_pages_fast_c`].
+///
+/// # Safety
+/// Every non-NULL entry must be a page returned by a pin and not yet unpinned.
+#[unsafe(export_name = "unpin_user_pages")]
+pub unsafe extern "C" fn unpin_user_pages_c(pages: *mut *mut Page, npages: c_ulong) {
+    for index in 0..npages as usize {
+        let page = unsafe { pages.add(index).read() };
+        if !page.is_null() {
+            unsafe { shmem::put_page(page) };
+        }
+    }
+}
+
+/// Linux `mmu_interval_notifier_insert()`: subscribe `notifier` to
+/// invalidations of `[start, start + length)` in `mm`. Its sequence starts at
+/// the mm's current `notifier_seq`.
+///
+/// # Safety
+/// `notifier` must stay valid until [`mmu_interval_notifier_remove`].
+#[unsafe(export_name = "mmu_interval_notifier_insert")]
+pub unsafe extern "C" fn mmu_interval_notifier_insert(
+    notifier: *mut MmuIntervalNotifier,
+    mm: *mut MmStruct,
+    start: c_ulong,
+    length: c_ulong,
+    ops: *const MmuIntervalNotifierOps,
+) -> c_int {
+    if notifier.is_null() || mm.is_null() || ops.is_null() || length == 0 {
+        return -crate::linux_config::EINVAL;
+    }
+    let Some(last) = (start as usize).checked_add(length as usize - 1) else {
+        return -crate::linux_config::EINVAL;
+    };
+    unsafe {
+        let mut subscribers = (*mm).interval_notifiers.lock();
+        if subscribers.contains(&(notifier as usize)) {
+            return -crate::linux_config::EINVAL;
+        }
+        (*notifier).interval_tree.start = start as usize;
+        (*notifier).interval_tree.last = last;
+        (*notifier).interval_tree.subtree_last = last;
+        (*notifier).ops = ops;
+        (*notifier).mm = mm;
+        (*notifier).invalidate_seq = (*mm).notifier_seq.load(Ordering::Acquire) as c_ulong;
+        subscribers.push(notifier as usize);
+    }
+    0
+}
+
+/// Linux `mmu_interval_notifier_remove()`. Invalidations are synchronous in
+/// this owner, so no callback can still be running when the subscription is
+/// dropped.
+///
+/// # Safety
+/// `notifier` must have been inserted and not yet removed.
+#[unsafe(export_name = "mmu_interval_notifier_remove")]
+pub unsafe extern "C" fn mmu_interval_notifier_remove(notifier: *mut MmuIntervalNotifier) {
+    if notifier.is_null() {
+        return;
+    }
+    let mm = unsafe { (*notifier).mm };
+    if mm.is_null() {
+        return;
+    }
+    unsafe {
+        (*mm)
+            .interval_notifiers
+            .lock()
+            .retain(|&entry| entry != notifier as usize);
+        (*notifier).mm = ptr::null_mut();
+    }
+}
+
+/// Linux `mmu_interval_read_begin()`: the sequence a reader samples before it
+/// pins pages. A later invalidation stores a different value, which
+/// `mmu_interval_read_retry` detects.
+///
+/// # Safety
+/// `notifier` must be an inserted notifier.
+#[unsafe(export_name = "mmu_interval_read_begin")]
+pub unsafe extern "C" fn mmu_interval_read_begin(notifier: *mut MmuIntervalNotifier) -> c_ulong {
+    unsafe { ptr::addr_of!((*notifier).invalidate_seq).read_volatile() }
 }
 
 /// `get_user()` / `__get_user()` for one typed value.
@@ -629,4 +921,20 @@ pub fn pagefault_enable() {}
 /// Linux u64 pointer conversion for internal, non-user ABI pointers.
 pub fn u64_to_ptr<T>(address: u64) -> *mut T {
     address as usize as *mut T
+}
+
+#[cfg(test)]
+mod usercopy_range_tests {
+    use super::*;
+
+    #[test]
+    fn access_ok_bounds_the_user_address_space() {
+        let top = 0x0000_7fff_ffff_f000usize as *const c_void;
+        unsafe {
+            assert!(access_ok(0x1000 as *const c_void, 0x1000));
+            assert!(access_ok(top, 0));
+            assert!(!access_ok(top, 1));
+            assert!(!access_ok(0x1000 as *const c_void, u64::MAX));
+        }
+    }
 }

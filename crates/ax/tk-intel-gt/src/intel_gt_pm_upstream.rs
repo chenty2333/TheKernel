@@ -99,7 +99,7 @@ unsafe extern "C" {
     fn i915_pmu_gt_unparked(gt: *mut IntelGt);
     fn i915_pmu_gt_parked(gt: *mut IntelGt);
     fn intel_gt_set_wedged(gt: *mut IntelGt);
-    fn intel_gt_unset_wedged(gt: *mut IntelGt);
+    fn intel_gt_unset_wedged(gt: *mut IntelGt) -> bool;
 }
 
 /// `intel_display_power_put_async()` header inline for the configured DRM PM

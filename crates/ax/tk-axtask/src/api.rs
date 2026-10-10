@@ -1650,3 +1650,18 @@ mod rr_timeslice_tests {
         assert_eq!(rr_timeslice_ms(), RR_TIMESLICE_MS_DEFAULT);
     }
 }
+
+/// Returns whether the current task has a pending reschedule request.
+///
+/// Read-only: the request is left in place, so the next preemption point
+/// still honours it. Linux `need_resched()` for LinuxKPI callers.
+#[cfg(feature = "preempt")]
+pub fn current_need_resched() -> bool {
+    current().preempt_pending()
+}
+
+/// Without preemption support there is never a pending reschedule.
+#[cfg(not(feature = "preempt"))]
+pub fn current_need_resched() -> bool {
+    false
+}
