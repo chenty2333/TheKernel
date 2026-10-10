@@ -266,7 +266,7 @@ unsafe fn is_haswell_early_sdv(i915: *mut DrmI915Private) -> bool {
 /// `drmm_add_action_or_reset()` (DRM provider).
 unsafe fn drmm_add_action_or_reset(
     drm: *mut c_void,
-    action: unsafe extern "C" fn(*mut c_void),
+    action: unsafe extern "C" fn(*mut c_void, *mut c_void),
     data: *mut c_void,
 ) -> c_int {
     unsafe { (framework().drmm_add_action_or_reset)(drm, action, data) }
@@ -281,10 +281,6 @@ unsafe fn intel_clock_gating_init(dev: *mut c_void) {
     unsafe { (framework().intel_clock_gating_init)(dev) }
 }
 
-/// `intel_uncore_fini_mmio` as a drmm action (`void (*)(void *)`).
-unsafe extern "C" fn intel_uncore_fini_mmio_action(data: *mut c_void) {
-    unsafe { intel_uncore_fini_mmio(data) }
-}
 
 /// `CONFIG_DRM_I915_DEBUG_GEM` (linux/config.rs: disabled).
 const CONFIG_DRM_I915_DEBUG_GEM: bool = false;
@@ -307,7 +303,7 @@ unsafe extern "C" {
 
 unsafe extern "C" {
     pub fn alloc_workqueue(fmt: *const c_char, flags: u32, max_active: c_int, ...) -> *mut c_void;
-    pub fn intel_uncore_fini_mmio(uncore: *mut c_void);
+    pub fn intel_uncore_fini_mmio(dev: *mut c_void, data: *mut c_void);
     pub fn pci_set_drvdata(pdev: *mut c_void, data: *mut c_void);
     pub fn pci_get_drvdata(pdev: *mut c_void) -> *mut c_void;
     pub fn pci_enable_device(pdev: *mut c_void) -> c_int;
@@ -931,7 +927,7 @@ unsafe fn i915_driver_mmio_probe(dev_priv: *mut DrmI915Private) -> i32 {
         ret = unsafe {
             drmm_add_action_or_reset(
                 core::ptr::addr_of_mut!((*dev_priv).drm).cast(),
-                intel_uncore_fini_mmio_action,
+                intel_uncore_fini_mmio,
                 (*gt).uncore.cast(),
             )
         };

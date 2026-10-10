@@ -76,7 +76,7 @@ pub unsafe extern "C" fn i915_gem_gtt_reserve(
     size: u64,
     offset: u64,
     color: c_ulong,
-    flags: u64,
+    flags: u32,
 ) -> c_int {
     GEM_BUG_ON!(size == 0);
     GEM_BUG_ON!(size % I915_GTT_PAGE_SIZE != 0);
@@ -95,7 +95,7 @@ pub unsafe extern "C" fn i915_gem_gtt_reserve(
         return err;
     }
 
-    if flags & PIN_NOEVICT != 0 {
+    if u64::from(flags) & PIN_NOEVICT != 0 {
         return -ENOSPC;
     }
 
@@ -204,7 +204,7 @@ pub unsafe extern "C" fn i915_gem_gtt_insert(
             if alignment != 0 { alignment } else { I915_GTT_MIN_ALIGNMENT },
         )
     };
-    err = unsafe { i915_gem_gtt_reserve(vm, ww, node, size, offset, color, flags) };
+    err = unsafe { i915_gem_gtt_reserve(vm, ww, node, size, offset, color, flags as u32) };
     if err != -ENOSPC {
         return err;
     }

@@ -525,7 +525,7 @@ pub unsafe extern "C" fn i915_sw_fence_await_dma_fence(
     fence: *mut I915SwFence,
     dma: *mut DmaFence,
     timeout: c_ulong,
-    gfp: c_ulong,
+    gfp: u32,
 ) -> c_int {
     unsafe {
         debug_fence_assert(fence);
@@ -543,7 +543,7 @@ pub unsafe extern "C" fn i915_sw_fence_await_dma_fence(
         )
         .cast::<I915SwDmaFenceCb>();
         if cb.is_null() {
-            if !gfpflags_allow_blocking(gfp) {
+            if !gfpflags_allow_blocking(gfp as c_ulong) {
                 return -ENOMEM;
             }
             let ret = dma_fence_wait(dma, false);
@@ -619,7 +619,7 @@ pub unsafe fn i915_sw_fence_await_reservation(
     resv: *mut DmaResv,
     write: bool,
     timeout: c_ulong,
-    gfp: c_ulong,
+    gfp: u32,
 ) -> c_int {
     unsafe {
         debug_fence_assert(fence);

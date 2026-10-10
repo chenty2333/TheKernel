@@ -652,13 +652,7 @@ unsafe extern "C" {
     fn ilk_fsb_freq(i915: *mut DrmI915Private) -> u32;
     fn ilk_mem_freq(i915: *mut DrmI915Private) -> u32;
     fn snb_pcode_read(uncore: *mut IntelUncore, mbox: u32, val: *mut u32, val1: *mut u32) -> i32;
-    fn snb_pcode_write_timeout(
-        uncore: *mut IntelUncore,
-        mbox: u32,
-        val: u32,
-        val1: u32,
-        timeout: u32,
-    ) -> i32;
+    fn snb_pcode_write_timeout(uncore: *mut IntelUncore, mbox: u32, val: u32, timeout_ms: i32) -> i32;
     fn intel_vgpu_active(i915: *mut DrmI915Private) -> bool;
 }
 const IOSF_SB_PUNIT: u32 = 8;

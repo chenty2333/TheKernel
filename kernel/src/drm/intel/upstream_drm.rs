@@ -467,21 +467,14 @@ unsafe extern "C" fn kfree_rcu_file_priv(_file: *mut c_void) {
     panic!("kfree_rcu_file_priv: upstream drm_file is not bound to a kernel DrmFile yet");
 }
 
-/// `drmm_add_action_or_reset()`: the kernel's DRM-managed action registry. The
-/// table declares a one-argument action, but Linux calls the action with
-/// `(drm, data)`, which is the signature the registry uses.
+/// `drmm_add_action_or_reset()`: the kernel's DRM-managed action registry.
 unsafe extern "C" fn drmm_add_action(
     drm: *mut c_void,
-    action: unsafe extern "C" fn(*mut c_void),
+    action: unsafe extern "C" fn(*mut c_void, *mut c_void),
     data: *mut c_void,
 ) -> c_int {
-    // SAFETY: both are thin `extern "C"` function pointers with the same calling
-    // convention; the registry invokes the action with `(drm, data)`, the Linux
-    // prototype, so the two-argument view is the one it calls.
-    let action: unsafe extern "C" fn(*mut c_void, *mut c_void) =
-        unsafe { core::mem::transmute(action) };
-    // SAFETY: the registry is the kernel's `drmm_add_action_or_reset`, which takes
-    // ownership of `action` and `data` exactly as Linux does.
+    // SAFETY: the registry is the LinuxKPI `drmm_add_action_or_reset`, which
+    // takes ownership of `action` and `data` exactly as Linux does.
     unsafe { drmm_add_action_or_reset(drm, action, data) }
 }
 

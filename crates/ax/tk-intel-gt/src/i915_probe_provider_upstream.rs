@@ -124,7 +124,7 @@ pub struct I915FrameworkOps {
     pub kfree_rcu_file_priv: unsafe extern "C" fn(file: *mut c_void),
     pub pci_register_driver: unsafe extern "C" fn(drv: *const c_void) -> c_int,
     pub pci_unregister_driver: unsafe extern "C" fn(drv: *const c_void),
-    pub drmm_add_action_or_reset: unsafe extern "C" fn(drm: *mut c_void, action: unsafe extern "C" fn(*mut c_void), data: *mut c_void) -> c_int,
+    pub drmm_add_action_or_reset: unsafe extern "C" fn(drm: *mut c_void, action: unsafe extern "C" fn(*mut c_void, *mut c_void), data: *mut c_void) -> c_int,
     pub intel_clock_gating_init: unsafe extern "C" fn(dev: *mut c_void),
     pub intel_display_device_probe: unsafe extern "C" fn(pdev: *mut c_void, parent: *const c_void) -> *mut c_void,
 }

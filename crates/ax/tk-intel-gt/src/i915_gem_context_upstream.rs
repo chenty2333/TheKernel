@@ -322,8 +322,8 @@ unsafe extern "C" {
     fn __i915_drm_client_free(kref: *mut Kref);
     fn intel_engine_lookup_user(
         i915: *mut DrmI915Private,
-        class: u16,
-        instance: u16,
+        class: u8,
+        instance: u8,
     ) -> *mut IntelEngineCs;
     fn intel_has_reset_engine(gt: *const IntelGt) -> bool;
     fn intel_pxp_is_enabled(pxp: *const c_void) -> bool;
@@ -334,7 +334,7 @@ unsafe extern "C" {
     fn i915_request_get_rcu(rq: *mut I915Request) -> *mut I915Request;
     fn i915_request_put(rq: *mut I915Request);
     fn i915_request_active_engine(rq: *mut I915Request, engine: *mut *mut IntelEngineCs) -> bool;
-    fn i915_gem_object_get(obj: *mut DrmI915GemObject);
+    fn i915_gem_object_get(obj: *mut DrmI915GemObject) -> *mut DrmI915GemObject;
     fn i915_vma_close(vma: *mut I915Vma);
     fn drm_syncobj_create(syncobj: *mut *mut c_void, flags: u32, fence: *mut DmaFence) -> c_int;
     fn drm_syncobj_put(syncobj: *mut c_void);
@@ -735,7 +735,7 @@ unsafe fn lookup_user_engine(
     }
     let idx = if !user_engines {
         let engine = unsafe {
-            intel_engine_lookup_user((*ctx).i915, (*ci).engine_class, (*ci).engine_instance)
+            intel_engine_lookup_user((*ctx).i915, (*ci).engine_class as u8, (*ci).engine_instance as u8)
         };
         if engine.is_null() {
             return ERR_PTR(-EINVAL);
@@ -1041,7 +1041,7 @@ unsafe extern "C" fn set_proto_ctx_engines_balance(
             unsafe { kfree(siblings) };
             return -EFAULT;
         }
-        let engine = unsafe { intel_engine_lookup_user(i915, ci.engine_class, ci.engine_instance) };
+        let engine = unsafe { intel_engine_lookup_user(i915, ci.engine_class as u8, ci.engine_instance as u8) };
         if engine.is_null() {
             unsafe { kfree(siblings) };
             return -EINVAL;
@@ -1104,7 +1104,7 @@ unsafe extern "C" fn set_proto_ctx_engines_bond(
     if unsafe { copy_from_user(&mut ci, ptr::addr_of!((*ext).master).cast(), size_of::<I915EngineClassInstance>()) } != 0 {
         return -EFAULT;
     }
-    let master = unsafe { intel_engine_lookup_user(i915, ci.engine_class, ci.engine_instance) };
+    let master = unsafe { intel_engine_lookup_user(i915, ci.engine_class as u8, ci.engine_instance as u8) };
     if master.is_null() {
         return -EINVAL;
     }
@@ -1119,7 +1119,7 @@ unsafe extern "C" fn set_proto_ctx_engines_bond(
         if unsafe { copy_from_user(&mut ci, ptr::addr_of!((*ext).engines).cast::<I915EngineClassInstance>().add(n).cast(), size_of::<I915EngineClassInstance>()) } != 0 {
             return -EFAULT;
         }
-        if unsafe { intel_engine_lookup_user(i915, ci.engine_class, ci.engine_instance) }.is_null() {
+        if unsafe { intel_engine_lookup_user(i915, ci.engine_class as u8, ci.engine_instance as u8) }.is_null() {
             return -EINVAL;
         }
     }
@@ -1189,7 +1189,7 @@ unsafe extern "C" fn set_proto_ctx_engines_parallel_submit(
                 unsafe { kfree(siblings) };
                 return -EFAULT;
             }
-            let engine = unsafe { intel_engine_lookup_user(i915, ci.engine_class, ci.engine_instance) };
+            let engine = unsafe { intel_engine_lookup_user(i915, ci.engine_class as u8, ci.engine_instance as u8) };
             if engine.is_null() {
                 unsafe { kfree(siblings) };
                 return -EINVAL;
@@ -1262,7 +1262,7 @@ unsafe fn set_proto_ctx_engines(
             unsafe { (*engines.add(n)).r#type = I915GemEngineType::Invalid };
             continue;
         }
-        let engine = unsafe { intel_engine_lookup_user(i915, ci.engine_class, ci.engine_instance) };
+        let engine = unsafe { intel_engine_lookup_user(i915, ci.engine_class as u8, ci.engine_instance as u8) };
         if engine.is_null() {
             unsafe { kfree(engines) };
             return -ENOENT;

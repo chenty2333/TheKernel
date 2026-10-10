@@ -996,7 +996,7 @@ unsafe fn i915_request_await_start(rq: *mut I915Request, signal: *mut I915Reques
                 &mut (*rq).submit,
                 fence,
                 0 as c_ulong,
-                I915_FENCE_GFP as c_ulong,
+                I915_FENCE_GFP as u32,
             )
         }
     } else {
@@ -1092,7 +1092,7 @@ unsafe fn emit_semaphore_wait(to: *mut I915Request, from: *mut I915Request, gfp:
         unsafe { (*to).sched.semaphores |= mask };
         wait = ptr::addr_of_mut!((*to).semaphore);
     }
-    unsafe { i915_sw_fence_await_dma_fence(wait, &mut (*from).fence, 0, I915_FENCE_GFP as c_ulong) }
+    unsafe { i915_sw_fence_await_dma_fence(wait, &mut (*from).fence, 0, I915_FENCE_GFP as u32) }
 }
 
 // upstream i915_request.c:1264
@@ -1222,7 +1222,7 @@ unsafe fn __i915_request_await_external(rq: *mut I915Request, fence: *mut DmaFen
             &mut (*rq).submit,
             fence,
             i915_fence_context_timeout((*fence).context),
-            I915_FENCE_GFP as c_ulong,
+            I915_FENCE_GFP as u32,
         )
     }
 }

@@ -457,7 +457,7 @@ pub unsafe extern "C" fn i915_vma_resource_bind_dep_await(
     let mut node = unsafe { vma_res_itree_iter_first(pending, offset, last) };
     while !node.is_null() {
         let mut ret = unsafe {
-            i915_sw_fence_await_dma_fence(sw_fence, ptr::addr_of_mut!((*node).unbind_fence), 0, gfp as c_ulong)
+            i915_sw_fence_await_dma_fence(sw_fence, ptr::addr_of_mut!((*node).unbind_fence), 0, gfp as u32)
         };
         if ret < 0 {
             ret = unsafe { dma_fence_wait(ptr::addr_of_mut!((*node).unbind_fence), intr) };

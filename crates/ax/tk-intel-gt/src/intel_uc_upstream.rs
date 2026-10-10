@@ -178,8 +178,8 @@ unsafe extern "C" {
     fn intel_guc_suspend(guc: *mut IntelGuc) -> i32;
     fn intel_guc_resume(guc: *mut IntelGuc) -> i32;
     fn intel_guc_tlb_invalidation_is_available(guc: *mut IntelGuc) -> bool;
-    fn intel_guc_invalidate_tlb_engines(guc: *mut IntelGuc);
-    fn intel_guc_invalidate_tlb_guc(guc: *mut IntelGuc);
+    fn intel_guc_invalidate_tlb_engines(guc: *mut IntelGuc) -> core::ffi::c_int;
+    fn intel_guc_invalidate_tlb_guc(guc: *mut IntelGuc) -> core::ffi::c_int;
     fn wake_up_all_tlb_invalidate(guc: *mut IntelGuc);
     fn intel_rps_raise_unslice(rps: *mut crate::intel_rps_types_upstream::IntelRps);
     fn intel_rps_lower_unslice(rps: *mut crate::intel_rps_types_upstream::IntelRps);

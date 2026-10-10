@@ -2938,8 +2938,11 @@ pub unsafe extern "C" fn intel_engine_dump(
     engine: *mut IntelEngineCs,
     m: *mut DrmPrinter,
     header: *const c_char,
-    ap: *mut VaList,
+    mut args: ...
 ) {
+    // C `intel_engine_dump(engine, m, header, ...)` forwards its variadic
+    // tail as a `va_list` to drm_vprintf(); the printer receives it opaque.
+    let ap: *mut VaList = core::ptr::addr_of_mut!(args).cast();
     let error = &mut (*(*engine).i915).gpu_error;
     let mut rq: *mut I915Request = core::ptr::null_mut();
     let mut wakeref: IntelWakerefT;

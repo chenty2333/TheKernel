@@ -297,10 +297,10 @@ unsafe extern "C" {
     fn mutex_lock_interruptible_nested(lock: *mut Mutex, subclass: u32) -> i32;
     fn rb_insert_color(node: *mut RbNode, root: *mut RbRoot);
     fn drm_mm_remove_node(node: *mut DrmMmNode);
-    fn i915_gem_fence_size(i915: *mut DrmI915Private, size: u64, tiling: u32, stride: u32) -> u32;
+    fn i915_gem_fence_size(i915: *mut DrmI915Private, size: u32, tiling: u32, stride: u32) -> u32;
     fn i915_gem_fence_alignment(
         i915: *mut DrmI915Private,
-        size: u64,
+        size: u32,
         tiling: u32,
         stride: u32,
     ) -> u32;
@@ -311,7 +311,7 @@ unsafe extern "C" {
         size: u64,
         start: u64,
         color: c_ulong,
-        flags: u64,
+        flags: u32,
     ) -> i32;
     fn i915_gem_gtt_insert(
         vm: *mut I915AddressSpace,
@@ -868,7 +868,7 @@ unsafe fn vma_create(
         let tiling = unsafe { i915_gem_object_get_tiling(obj) };
         let stride = unsafe { i915_gem_object_get_stride(obj) };
         unsafe {
-            (*vma).fence_size = i915_gem_fence_size(i915, (*vma).size, tiling, stride);
+            (*vma).fence_size = i915_gem_fence_size(i915, (*vma).size as u32, tiling, stride);
         }
         if unsafe {
             ((*vma).fence_size as u64) < (*vma).size || ((*vma).fence_size as u64) > (*vm).total
@@ -885,7 +885,7 @@ unsafe fn vma_create(
             I915_GTT_MIN_ALIGNMENT
         ));
         unsafe {
-            (*vma).fence_alignment = i915_gem_fence_alignment(i915, (*vma).size, tiling, stride);
+            (*vma).fence_alignment = i915_gem_fence_alignment(i915, (*vma).size as u32, tiling, stride);
         }
         GEM_BUG_ON!(!is_power_of_2(unsafe { (*vma).fence_alignment }));
         unsafe { atomic_or(ptr::addr_of_mut!((*vma).flags), I915_VMA_GGTT) };
@@ -1515,7 +1515,7 @@ unsafe fn i915_vma_insert(
                 size + 2 * guard,
                 offset - guard,
                 color,
-                flags,
+                flags as u32,
             )
         };
         if ret != 0 {

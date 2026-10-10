@@ -75,7 +75,7 @@ unsafe extern "C" {
     fn i915_error_state_store(error: *mut I915GpuCoredump);
     fn __i915_gpu_coredump_free(kref: *mut crate::intel_context_upstream::Kref);
     fn current_comm() -> *const c_char;
-    fn dma_fence_context_alloc(num: usize) -> u64;
+    fn dma_fence_context_alloc(num: u32) -> u64;
     fn clear_and_wake_up_bit(bit: i32, word: *mut c_ulong);
     fn queue_rcu_work(wq: *mut c_void, rcu: *mut RcuWork) -> bool;
     fn get_random_u32_below(range: u32) -> u32;

@@ -789,7 +789,7 @@ pub unsafe fn i915_gem_clflush_object(obj: *mut DrmI915GemObject, flags: u32) ->
                 resv.cast::<crate::i915_sw_fence_upstream::DmaResv>(),
                 true,
                 i915_fence_timeout(),
-                I915_FENCE_GFP as c_ulong,
+                I915_FENCE_GFP as u32,
             );
             dma_resv_add_fence(
                 resv,

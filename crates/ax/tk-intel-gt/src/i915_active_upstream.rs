@@ -75,7 +75,7 @@ unsafe extern "C" {
     fn i915_sw_fence_await_dma_fence(
         sw: *mut I915SwFence,
         fence: *mut DmaFence,
-        flags: u32,
+        timeout: core::ffi::c_ulong,
         gfp: u32,
     ) -> c_int;
     fn i915_sw_fence_await(sw: *mut I915SwFence) -> bool;

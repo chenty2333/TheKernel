@@ -173,7 +173,6 @@ fn show_heartbeat(rq: *const I915Request, engine: *mut IntelEngineCs) {
                 engine,
                 &mut printer,
                 core::ptr::null(),
-                core::ptr::null_mut(),
             );
         }
     } else {
@@ -190,7 +189,6 @@ fn show_heartbeat(rq: *const I915Request, engine: *mut IntelEngineCs) {
                 engine,
                 &mut printer,
                 core::ptr::null(),
-                core::ptr::null_mut(),
             );
         }
     }
