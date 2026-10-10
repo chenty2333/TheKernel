@@ -7,7 +7,7 @@
 #![allow(unsafe_code)]
 
 use core::{
-    ffi::{c_char, c_long, c_ulong, c_void},
+    ffi::{c_char, c_int, c_long, c_ulong, c_void},
     sync::atomic::{AtomicI32, AtomicU64, Ordering, fence},
 };
 
@@ -524,4 +524,153 @@ pub extern "C" fn get_random_u32_below(range: u32) -> u32 {
         }
     }
     (mult >> 32) as u32
+}
+
+// ---------------------------------------------------------------------------
+// Debug-object, ref-tracker and stack-depot hooks in the oracle configuration.
+// ---------------------------------------------------------------------------
+
+/// Linux `debug_object_init()`. The oracle configuration has
+/// CONFIG_DEBUG_OBJECTS unset, where debugobjects.h defines this as an empty
+/// inline function.
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_object_init(_addr: *mut c_void, _desc: *const c_void) {}
+
+/// Linux `debug_object_activate()`; empty with CONFIG_DEBUG_OBJECTS unset.
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_object_activate(_addr: *mut c_void, _desc: *const c_void) {}
+
+/// Linux `debug_object_deactivate()`; empty with CONFIG_DEBUG_OBJECTS unset.
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_object_deactivate(_addr: *mut c_void, _desc: *const c_void) {}
+
+/// Linux `debug_object_assert_init()`; empty with CONFIG_DEBUG_OBJECTS unset.
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_object_assert_init(_addr: *mut c_void, _desc: *const c_void) {}
+
+/// Linux `debug_object_free()`; empty with CONFIG_DEBUG_OBJECTS unset.
+#[unsafe(no_mangle)]
+pub extern "C" fn debug_object_free(_addr: *mut c_void, _desc: *const c_void) {}
+
+/// Linux `ref_tracker_alloc()`. The oracle configuration has CONFIG_REF_TRACKER
+/// unset, where ref_tracker.h defines this as `return 0`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ref_tracker_alloc(_dir: *mut c_void, _trackerp: *mut *mut c_void, _gfp: u32) -> i32 {
+    0
+}
+
+/// Linux `ref_tracker_free()`; `return 0` with CONFIG_REF_TRACKER unset.
+#[unsafe(no_mangle)]
+pub extern "C" fn ref_tracker_free(_dir: *mut c_void, _trackerp: *mut *mut c_void) -> i32 {
+    0
+}
+
+/// Linux `stack_depot_snprint()`. Stack handles come from `stack_depot_save()`,
+/// which has no producer in this kernel, so every handle is 0 and names an
+/// empty trace. The output is an empty, NUL-terminated string as Linux prints
+/// for an empty trace.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stack_depot_snprint(
+    _handle: u32,
+    buf: *mut c_char,
+    size: usize,
+    _spaces: u32,
+) -> usize {
+    if size > 0 && !buf.is_null() {
+        unsafe { *buf = 0 };
+    }
+    0
+}
+
+/// Linux `atomic_notifier_call_chain()`: call each notifier in priority order
+/// until one returns `NOTIFY_STOP_MASK`, and return the last result. `head`
+/// is a `struct atomic_notifier_head` whose chain pointer follows its lock.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atomic_notifier_call_chain(
+    head: *mut c_void,
+    value: c_ulong,
+    data: *mut c_void,
+) -> c_int {
+    use crate::intel_engine_cs_upstream::AtomicNotifierHead;
+    use crate::linux::gem_memory::NotifierBlock;
+    const NOTIFY_DONE: c_int = 0;
+    const NOTIFY_STOP_MASK: c_int = 0x8000;
+    assert!(!head.is_null());
+    let mut ret = NOTIFY_DONE;
+    let mut block = unsafe { (*head.cast::<AtomicNotifierHead>()).head.cast::<NotifierBlock>() };
+    while !block.is_null() {
+        let call = unsafe { (*block).notifier_call }
+            .expect("notifier block without a notifier_call function");
+        ret = unsafe { call(block, value, data) };
+        if ret & NOTIFY_STOP_MASK != 0 {
+            break;
+        }
+        block = unsafe { (*block).next };
+    }
+    ret
+}
+
+/// Linux `memcpy_fromio()`: copy from device memory one volatile byte at a
+/// time, so each read reaches the device exactly once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcpy_fromio(dst: *mut c_void, src: *const c_void, len: usize) {
+    let dst = dst.cast::<u8>();
+    let src = src.cast::<u8>();
+    for offset in 0..len {
+        unsafe { *dst.add(offset) = core::ptr::read_volatile(src.add(offset)) };
+    }
+}
+
+/// Kernel provider for uncached MMIO mappings, installed by the kernel's
+/// memory-management side. `ioremap` returns NULL when the mapping cannot be
+/// made; `iounmap` releases a mapping returned by `ioremap`.
+#[repr(C)]
+pub struct IoremapProvider {
+    pub ioremap: unsafe extern "C" fn(phys: u64, size: u64) -> *mut c_void,
+    pub iounmap: unsafe extern "C" fn(addr: *mut c_void),
+}
+
+static IOREMAP_PROVIDER: core::sync::atomic::AtomicPtr<IoremapProvider> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Install the MMIO mapping provider. It can be installed once.
+pub fn install_ioremap_provider(provider: &'static IoremapProvider) -> Result<(), &'static str> {
+    IOREMAP_PROVIDER
+        .compare_exchange(
+            core::ptr::null_mut(),
+            core::ptr::from_ref(provider).cast_mut(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|_| ())
+        .map_err(|_| "ioremap provider already installed")
+}
+
+fn ioremap_provider() -> Option<&'static IoremapProvider> {
+    let provider = IOREMAP_PROVIDER.load(Ordering::Acquire);
+    if provider.is_null() {
+        None
+    } else {
+        // SAFETY: only `install_ioremap_provider` stores a non-null pointer, and it
+        // stores a `'static` reference.
+        Some(unsafe { &*provider })
+    }
+}
+
+/// Linux `ioremap()`: an uncached kernel mapping of physical `base`. Returns
+/// NULL when no provider is installed, which callers already treat as failure.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ioremap(base: u64, size: u64) -> *mut c_void {
+    match ioremap_provider() {
+        Some(provider) => unsafe { (provider.ioremap)(base, size) },
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// Linux `iounmap()`. A mapping cannot exist without a provider, so reaching
+/// this without one is an invariant violation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iounmap(addr: *mut c_void) {
+    let provider = ioremap_provider().expect("iounmap() without an ioremap provider");
+    unsafe { (provider.iounmap)(addr) };
 }

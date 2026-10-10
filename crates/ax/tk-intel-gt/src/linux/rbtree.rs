@@ -393,7 +393,7 @@ impl RbNodePtr for &RbNode {
 }
 
 /// Remove a node from an ordinary Linux rb_root.
-pub unsafe fn rb_erase<N: RbNodePtr>(node: N, root: &mut RbRoot) {
+pub unsafe fn rb_erase_impl<N: RbNodePtr>(node: N, root: &mut RbRoot) {
     let node = node.rb_node_ptr();
     assert!(!node.is_null());
     unsafe { erase(node, core::ptr::addr_of_mut!(root.node)) };
@@ -484,4 +484,10 @@ mod tests {
         assert!(core::ptr::eq(root.leftmost, &mut second));
         assert!(core::ptr::eq(root.root.node, &mut second));
     }
+}
+
+/// Linux `rb_erase()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rb_erase(node: *mut RbNode, root: *mut RbRoot) {
+    unsafe { self::rb_erase_impl(node, &mut *root) };
 }
