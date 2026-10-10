@@ -16,7 +16,11 @@
 //! declaration in `mod.rs` is gated on the `intel-upstream-gt` feature.
 
 use alloc::boxed::Box;
-use core::ffi::{c_char, c_int, c_void};
+use core::{
+    ffi::{c_char, c_int, c_void},
+    ptr,
+    sync::atomic::{AtomicPtr, Ordering},
+};
 
 use intel_gt::linux_platform::{I915PlatformOps, install_i915_platform_ops};
 
@@ -99,6 +103,31 @@ fn config_read_u16(_bdf: pci::Bdf, _offset: u16) -> Option<u16> {
 #[cfg(not(target_os = "none"))]
 fn config_write_u16(_bdf: pci::Bdf, _offset: u16, _value: u16) -> Option<()> {
     None
+}
+
+/// The upstream i915 device whose GT interrupt path the display IRQ handler
+/// may delegate to. Stage two registers it once the probe owns the layout.
+/// Nothing reads it until `irq.rs` gains the `gen11_irq_handler` branch, which
+/// needs `tk-intel-gt` to export that handler and its hooks trait.
+static UPSTREAM_I915: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+
+/// Register the upstream device. Re-registering the same pointer is accepted;
+/// a different device is refused.
+#[allow(dead_code)] // consumed by the stage-two IRQ branch
+pub(super) fn register_upstream_i915(i915: *mut c_void) -> Result<(), &'static str> {
+    if i915.is_null() {
+        return Err("null upstream i915 device");
+    }
+    match UPSTREAM_I915.compare_exchange(
+        ptr::null_mut(),
+        i915,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(()),
+        Err(existing) if existing == i915 => Ok(()),
+        Err(_) => Err("a different upstream i915 device is already registered"),
+    }
 }
 
 // ---------------------------------------------------------------------------
