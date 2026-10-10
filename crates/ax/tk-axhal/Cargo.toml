@@ -108,6 +108,11 @@ version = "0.3.1-pre.6"
 path = "../tk-vtd"
 version = "0.1.0"
 
+[dependencies.irq-framework]
+package = "tk-irq-framework"
+path = "../tk-irq-framework"
+version = "0.2.0-preview.2"
+
 [dependencies.cfg-if]
 version = "1.0"
 

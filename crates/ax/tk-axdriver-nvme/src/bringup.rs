@@ -1,4 +1,7 @@
-//! Reset, Identify, queue negotiation and synchronous NVM operations.
+//! Reset, Identify and owned, batched NVM queues.
+
+#[path = "io_queue.rs"]
+mod io_queue;
 use alloc::vec::Vec;
 use core::{
     marker::PhantomData,
@@ -7,6 +10,7 @@ use core::{
 };
 
 use axdriver_block::{BaseDriverOps, BlockDriverOps, DevError, DevResult, DeviceType};
+use io_queue::RequestSlot;
 
 use crate::{
     Hal,
@@ -69,9 +73,15 @@ struct Queue<H: Hal> {
     head: u16,
     phase: u16,
     cid: u16,
+    slots: Vec<Option<RequestSlot<H>>>,
 }
 impl<H: Hal> Queue<H> {
     fn new(id: u16, requester: Option<tk_vtd::PciRequester>) -> DevResult<Self> {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(usize::from(DEPTH))
+            .map_err(|_| DevError::NoMemory)?;
+        slots.resize_with(usize::from(DEPTH), || None);
         Ok(Self {
             sq: Dma::new(1, requester)?,
             cq: Dma::new(1, requester)?,
@@ -80,6 +90,7 @@ impl<H: Hal> Queue<H> {
             head: 0,
             phase: 1,
             cid: 0,
+            slots,
         })
     }
     fn submit<B: Bus>(&mut self, bus: &mut B, stride: usize, mut cmd: Command) -> DevResult<u32> {
@@ -155,7 +166,6 @@ pub struct Controller<H: Hal, B: Bus> {
     admin: Queue<H>,
     queues: Vec<Queue<H>>,
     data: Dma<H>,
-    list: Dma<H>,
     stride: usize,
     timeout: u32,
     blocks: u64,
@@ -164,6 +174,8 @@ pub struct Controller<H: Hal, B: Bus> {
     allow_write: bool,
     live: bool,
     next: usize,
+    next_handle: u64,
+    observed_irq: u64,
     max_transfer: usize,
 }
 impl<H: Hal, B: Bus> Controller<H, B> {
@@ -189,8 +201,7 @@ impl<H: Hal, B: Bus> Controller<H, B> {
             bus,
             admin: Queue::new(0, requester)?,
             queues: Vec::new(),
-            data: Dma::new(TRANSFER / PAGE, requester)?,
-            list: Dma::new(1, requester)?,
+            data: Dma::new(1, requester)?,
             stride,
             timeout,
             blocks: 0,
@@ -199,12 +210,13 @@ impl<H: Hal, B: Bus> Controller<H, B> {
             allow_write,
             live: false,
             next: 0,
+            next_handle: 1,
+            observed_irq: 0,
             max_transfer: TRANSFER,
         };
         this.admin.sq.safe = false;
         this.admin.cq.safe = false;
         this.data.safe = false;
-        this.list.safe = false;
         this.bus.write32(regs::AQA, u32::from(DEPTH - 1) * 0x10001);
         this.bus.write64(regs::ASQ, this.admin.sq.address);
         this.bus.write64(regs::ACQ, this.admin.cq.address);
@@ -260,7 +272,7 @@ impl<H: Hal, B: Bus> Controller<H, B> {
     }
     fn bytes(&self) -> &[u8] {
         // SAFETY: no DMA is outstanding after a synchronous completion.
-        unsafe { core::slice::from_raw_parts(self.data.pointer.as_ptr(), TRANSFER) }
+        unsafe { core::slice::from_raw_parts(self.data.pointer.as_ptr(), PAGE) }
     }
     fn admin_cmd(&mut self, command: Command) -> DevResult<u32> {
         let result = self.admin.submit(&mut self.bus, self.stride, command);
@@ -274,64 +286,6 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         c.pointer(6, self.data.address);
         c.0[10] = cns;
         self.admin_cmd(c).map(|_| ())
-    }
-    fn command(&mut self, command: Command) -> DevResult {
-        if !self.live {
-            return Err(DevError::BadState);
-        }
-        let index = self.next % self.queues.len();
-        self.next += 1;
-        let result = self.queues[index]
-            .submit(&mut self.bus, self.stride, command)
-            .map(|_| ());
-        if matches!(result, Err(DevError::BadState)) {
-            self.live = false;
-        }
-        result
-    }
-    fn transfer(
-        &mut self,
-        block: u64,
-        length: usize,
-        write: bool,
-        mut copy: impl FnMut(*mut u8, usize, usize),
-    ) -> DevResult {
-        if write && !self.allow_write {
-            return Err(DevError::Unsupported);
-        }
-        if !self.live {
-            return Err(DevError::BadState);
-        }
-        if !length.is_multiple_of(self.block_size)
-            || block > self.blocks
-            || (length / self.block_size) as u64 > self.blocks - block
-        {
-            return Err(DevError::InvalidParam);
-        }
-        let mut offset = 0;
-        while offset < length {
-            let size = (length - offset).min(self.max_transfer);
-            if write {
-                copy(self.data.pointer.as_ptr(), offset, size);
-            }
-            // SAFETY: list allocation holds PAGE/8 entries and is not currently device-owned.
-            let entries = unsafe {
-                core::slice::from_raw_parts_mut(self.list.pointer.as_ptr().cast::<u64>(), PAGE / 8)
-            };
-            let (first, second) = prps(self.data.address, size, self.list.address, entries)?;
-            let lba = block + (offset / self.block_size) as u64;
-            let mut c = Command::new(if write { 1 } else { 2 }, self.nsid);
-            c.pointer(6, first);
-            c.pointer(8, second);
-            c.pointer(10, lba);
-            c.0[12] = (size / self.block_size - 1) as u32;
-            self.command(c)?;
-            if !write {
-                copy(self.data.pointer.as_ptr(), offset, size);
-            }
-            offset += size;
-        }
-        Ok(())
     }
 }
 /// MDTS is expressed in minimum controller pages (CAP.MPSMIN=0 here).
@@ -387,10 +341,12 @@ impl<H: Hal, B: Bus> Drop for Controller<H, B> {
             self.admin.sq.safe = true;
             self.admin.cq.safe = true;
             self.data.safe = true;
-            self.list.safe = true;
             for q in &mut self.queues {
                 q.sq.safe = true;
                 q.cq.safe = true;
+                for slot in q.slots.iter_mut().flatten() {
+                    slot.quiesced();
+                }
             }
         }
     }
@@ -414,25 +370,79 @@ impl<H: Hal, B: Bus> BlockDriverOps for Controller<H, B> {
         !self.allow_write
     }
     fn read_block(&mut self, block: u64, buf: &mut [u8]) -> DevResult {
-        self.transfer(block, buf.len(), false, |pointer, offset, size| {
-            // SAFETY: disjoint owned bounce and caller slices, both cover size bytes.
-            unsafe {
-                core::ptr::copy_nonoverlapping(pointer, buf.as_mut_ptr().add(offset), size);
-            }
-        })
+        self.transfer_segments(
+            block,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+            axdriver_block::BlockAsyncOp::Read,
+        )
     }
     fn write_block(&mut self, block: u64, buf: &[u8]) -> DevResult {
-        self.transfer(block, buf.len(), true, |pointer, offset, size| {
-            // SAFETY: disjoint owned bounce and caller slices, both cover size bytes.
-            unsafe {
-                core::ptr::copy_nonoverlapping(buf.as_ptr().add(offset), pointer, size);
-            }
-        })
+        self.transfer_segments(
+            block,
+            buf.as_ptr() as usize,
+            buf.len(),
+            axdriver_block::BlockAsyncOp::Write,
+        )
     }
     fn flush(&mut self) -> DevResult {
         if !self.allow_write {
             return Ok(());
         }
-        self.command(Command::new(0, self.nsid))
+        self.fence()?;
+        let mut request = axdriver_block::BlockQueueRequest {
+            op: axdriver_block::BlockAsyncOp::Flush,
+            block_id: 0,
+            segments: &[],
+            handle: None,
+        };
+        let report = self.submit_sync_batch(core::slice::from_mut(&mut request))?;
+        if report.submitted != 1 {
+            return Err(DevError::Again);
+        }
+        self.wait_async_all(&[request.handle.ok_or(DevError::BadState)?])
+    }
+    fn async_queue_caps(&self) -> Option<axdriver_block::BlockQueueCaps> {
+        self.live.then_some(axdriver_block::BlockQueueCaps {
+            max_requests: self.queues.len() * (usize::from(DEPTH) - 1),
+            max_descriptors: self.queues.len() * (usize::from(DEPTH) - 1),
+            default_depth: 8,
+            max_request_bytes: Some(self.max_transfer),
+            ..Default::default()
+        })
+    }
+    fn submit_async_batch(
+        &mut self,
+        requests: &mut [axdriver_block::BlockQueueRequest<'_>],
+    ) -> DevResult<axdriver_block::BlockSubmitReport> {
+        self.submit_owned_batch(requests)
+    }
+    fn drain_async_completions(
+        &mut self,
+        output: &mut [axdriver_block::BlockCompletion],
+    ) -> DevResult<axdriver_block::BlockCompletionDrain> {
+        self.drain_owned(output)
+    }
+    fn wait_async_all(&mut self, handles: &[axdriver_block::BlockRequestHandle]) -> DevResult {
+        self.wait_owned(handles)
+    }
+    fn reset_device(&mut self) -> DevResult<axdriver_block::BlockResetOutcome> {
+        Ok(self.stop_owned())
+    }
+    fn fence(&mut self) -> DevResult {
+        self.wait_hardware_idle()
+    }
+    fn fence_async(&mut self) -> DevResult {
+        self.wait_hardware_idle()
+    }
+    fn install_completion_notifier(
+        &mut self,
+        notifier: Option<axdriver_block::BlockCompletionNotifier>,
+        context: usize,
+    ) -> DevResult {
+        self.bus.install_completion_notifier(notifier, context)
+    }
+    fn is_irq_enabled(&self) -> bool {
+        self.bus.interrupt_enabled()
     }
 }

@@ -42,8 +42,16 @@ struct Fake {
     namespace: [u8; 4096],
     timeout: bool,
     irq: bool,
+    suppress_irq: bool,
+    bootstrap_poll: bool,
+    clock: std::sync::Arc<core::sync::atomic::AtomicU64>,
     delay_io: bool,
-    pending: Option<u16>,
+    pending: std::collections::VecDeque<u16>,
+    targets: BTreeMap<u16, usize>,
+    io_status: u16,
+    corrupt_cid: bool,
+    reset_stuck: bool,
+    notifications: std::sync::Arc<core::sync::atomic::AtomicUsize>,
     delivered: std::sync::Arc<core::sync::atomic::AtomicU64>,
 }
 impl Fake {
@@ -64,8 +72,16 @@ impl Fake {
             commands: vec![],
             timeout: false,
             irq: false,
+            suppress_irq: false,
+            bootstrap_poll: false,
+            clock: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
             delay_io: false,
-            pending: None,
+            pending: std::collections::VecDeque::new(),
+            targets: BTreeMap::new(),
+            io_status: 0,
+            corrupt_cid: false,
+            reset_stuck: false,
+            notifications: std::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0)),
             delivered: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -139,10 +155,22 @@ impl Fake {
         unsafe {
             let out = (cq as *mut u32).add(head * 4);
             out.write(result);
-            out.add(2).write(u32::from(id) << 16);
-            out.add(3).write((c[0] >> 16) | (u32::from(phase) << 16));
+            out.add(2)
+                .write((u32::from(id) << 16) | ((tail + 1) % 32) as u32);
+            let cid = if self.corrupt_cid && id != 0 {
+                0xffff
+            } else {
+                c[0] >> 16
+            };
+            let status = if id == 0 {
+                0
+            } else {
+                u32::from(self.io_status)
+            };
+            out.add(3)
+                .write(cid | (u32::from(phase) << 16) | (status << 17));
         }
-        if self.irq {
+        if self.irq && !self.suppress_irq {
             self.delivered
                 .fetch_add(1, core::sync::atomic::Ordering::Release);
         }
@@ -166,7 +194,9 @@ impl Bus for Fake {
     fn write32(&mut self, offset: usize, value: u32) {
         self.registers.insert(offset, value);
         if offset == CC {
-            self.registers.insert(CSTS, value & 1);
+            if !(self.reset_stuck && value & 1 == 0) {
+                self.registers.insert(CSTS, value & 1);
+            }
             if value & 1 != 0 {
                 self.queues
                     .insert(0, (self.addr(ASQ), self.addr(ACQ), 0, 0, 1));
@@ -174,23 +204,40 @@ impl Bus for Fake {
         }
         if offset >= DBS && (offset - DBS).is_multiple_of(8) && !self.timeout {
             let id = ((offset - DBS) / 8) as u16;
+            self.targets.insert(id, value as usize);
+            if id != 0 {
+                self.notifications
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
             if self.delay_io && id != 0 {
-                self.pending = Some(id);
+                if !self.pending.contains(&id) {
+                    self.pending.push_back(id);
+                }
             } else {
-                self.execute(id);
+                while self.queues[&id].2 != value as usize {
+                    self.execute(id);
+                }
             }
         }
     }
     fn delay_us(&mut self, _: u32) {}
+    fn now_us(&self) -> Option<u64> {
+        Some(self.clock.load(core::sync::atomic::Ordering::Acquire))
+    }
     fn interrupt_enabled(&self) -> bool {
         self.irq
+    }
+    fn requires_interrupt_event(&self) -> bool {
+        self.irq && !self.bootstrap_poll
     }
     fn interrupt_generation(&self) -> u64 {
         self.delivered.load(core::sync::atomic::Ordering::Acquire)
     }
     fn wait_completion(&mut self, _: u64) {
-        if let Some(id) = self.pending.take() {
-            self.execute(id);
+        if let Some(id) = self.pending.pop_front() {
+            while self.queues[&id].2 != self.targets[&id] {
+                self.execute(id);
+            }
         }
     }
 }
@@ -246,7 +293,7 @@ fn prp_offset_boundaries() {
 }
 
 #[test]
-fn interrupts_and_lost_interrupt_polling_keep_one_cq_owner() {
+fn interrupt_and_explicit_polling_profiles_keep_one_cq_owner() {
     for interrupt in [true, false] {
         let mut bus = Fake::new();
         bus.irq = interrupt;
@@ -363,4 +410,355 @@ fn small_mdts_splits_transfers_without_losing_content() {
     controller.write_block(0, &input).unwrap();
     controller.read_block(0, &mut output).unwrap();
     assert_eq!(input, output);
+}
+
+fn queue_request<'a>(
+    op: axdriver_block::BlockAsyncOp,
+    block: u64,
+    segments: &'a [axdriver_block::BlockSegment],
+) -> axdriver_block::BlockQueueRequest<'a> {
+    axdriver_block::BlockQueueRequest {
+        op,
+        block_id: block,
+        segments,
+        handle: None,
+    }
+}
+
+#[test]
+fn accepted_batch_is_owned_and_committed_once_per_queue() {
+    use axdriver_block::{BlockAsyncOp, BlockSegment, BlockSegmentDirection};
+    let bus = Fake::new();
+    let notifications = bus.notifications.clone();
+    let mut controller = Controller::<Host, _>::new(bus, true, 0x2000).unwrap();
+    let mut input: alloc::vec::Vec<alloc::vec::Vec<u8>> = vec![
+        vec![0x31; 4096],
+        vec![0x72; 4096],
+        vec![0xa3; 4096],
+        vec![0xe4; 4096],
+    ];
+    let segments: alloc::vec::Vec<_> = input
+        .iter()
+        .map(|b| BlockSegment {
+            addr: b.as_ptr() as usize,
+            len: b.len(),
+            direction: BlockSegmentDirection::MemoryToDevice,
+        })
+        .collect();
+    let mut requests: alloc::vec::Vec<_> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| queue_request(BlockAsyncOp::Write, i as u64 * 8, core::slice::from_ref(s)))
+        .collect();
+    let before = notifications.load(core::sync::atomic::Ordering::Relaxed);
+    let report = controller.submit_async_batch(&mut requests).unwrap();
+    assert_eq!(report.submitted, 4);
+    assert_eq!(
+        notifications.load(core::sync::atomic::Ordering::Relaxed) - before,
+        2
+    );
+    let handles: alloc::vec::Vec<_> = requests.iter().map(|r| r.handle.unwrap()).collect();
+    for data in &mut input {
+        data.fill(0);
+    }
+    controller.wait_async_all(&handles).unwrap();
+    for (i, value) in [0x31, 0x72, 0xa3, 0xe4].into_iter().enumerate() {
+        let mut out = [0; 4096];
+        controller.read_block(i as u64 * 8, &mut out).unwrap();
+        assert_eq!(out, [value; 4096]);
+    }
+    assert!(matches!(
+        controller.wait_async_all(&handles),
+        Err(DevError::InvalidParam)
+    ));
+}
+
+#[test]
+fn full_batch_accepts_only_a_bounded_prefix_and_handles_do_not_alias() {
+    use axdriver_block::{BlockAsyncOp, BlockSegment, BlockSegmentDirection};
+    let mut controller = Controller::<Host, _>::new(Fake::new(), true, 0x2000).unwrap();
+    let input = [0x65_u8; 512];
+    let segment = BlockSegment {
+        addr: input.as_ptr() as usize,
+        len: input.len(),
+        direction: BlockSegmentDirection::MemoryToDevice,
+    };
+    let mut requests: alloc::vec::Vec<_> = (0..70)
+        .map(|i| queue_request(BlockAsyncOp::Write, i, core::slice::from_ref(&segment)))
+        .collect();
+    let report = controller.submit_async_batch(&mut requests).unwrap();
+    assert_eq!(report.submitted, 62);
+    assert!(report.queue_full);
+    assert!(requests[62..].iter().all(|r| r.handle.is_none()));
+    let handles: alloc::vec::Vec<_> = requests[..62].iter().map(|r| r.handle.unwrap()).collect();
+    controller.wait_async_all(&handles).unwrap();
+    controller.submit_async_batch(&mut requests[62..]).unwrap();
+    let next: alloc::vec::Vec<_> = requests[62..].iter().map(|r| r.handle.unwrap()).collect();
+    assert!(next.iter().all(|h| !handles.contains(h)));
+    controller.wait_async_all(&next).unwrap();
+}
+
+#[test]
+fn invalid_suffix_leaves_whole_prepared_prefix_unpublished() {
+    use axdriver_block::{BlockAsyncOp, BlockSegment, BlockSegmentDirection};
+    let bus = Fake::new();
+    let notifications = bus.notifications.clone();
+    let mut controller = Controller::<Host, _>::new(bus, true, 0x2000).unwrap();
+    let input = [0x55_u8; 512];
+    let segment = BlockSegment {
+        addr: input.as_ptr() as usize,
+        len: 512,
+        direction: BlockSegmentDirection::MemoryToDevice,
+    };
+    let mut requests = [
+        queue_request(BlockAsyncOp::Write, 0, core::slice::from_ref(&segment)),
+        queue_request(BlockAsyncOp::Write, 2048, core::slice::from_ref(&segment)),
+    ];
+    assert!(matches!(
+        controller.submit_async_batch(&mut requests),
+        Err(DevError::InvalidParam)
+    ));
+    assert!(requests.iter().all(|r| r.handle.is_none()));
+    assert_eq!(notifications.load(core::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[test]
+fn read_retirement_is_exact_and_failed_reads_do_not_copy() {
+    use axdriver_block::{BlockAsyncOp, BlockSegment, BlockSegmentDirection};
+    for status in [0, 1] {
+        let mut bus = Fake::new();
+        bus.io_status = status;
+        let mut controller = Controller::<Host, _>::new(bus, true, 0x2000).unwrap();
+        let mut one = [0xcc_u8; 512];
+        let mut two = [0xdd_u8; 512];
+        let segments = [
+            BlockSegment {
+                addr: one.as_mut_ptr() as usize,
+                len: 512,
+                direction: BlockSegmentDirection::DeviceToMemory,
+            },
+            BlockSegment {
+                addr: two.as_mut_ptr() as usize,
+                len: 512,
+                direction: BlockSegmentDirection::DeviceToMemory,
+            },
+        ];
+        let mut requests = [
+            queue_request(BlockAsyncOp::Read, 0, &segments[..1]),
+            queue_request(BlockAsyncOp::Read, 1, &segments[1..]),
+        ];
+        controller.submit_async_batch(&mut requests).unwrap();
+        let result = controller.wait_async_all(&[requests[0].handle.unwrap()]);
+        assert!(matches!(
+            (status, result),
+            (0, Ok(())) | (1, Err(DevError::Io))
+        ));
+        assert_eq!(two, [0xdd_u8; 512]);
+        assert_eq!(
+            one,
+            if status == 0 {
+                [0; 512]
+            } else {
+                [0xcc_u8; 512]
+            }
+        );
+        let _ = controller.wait_async_all(&[requests[1].handle.unwrap()]);
+    }
+}
+
+#[test]
+fn flush_is_an_admission_barrier_between_write_batches() {
+    use axdriver_block::{BlockAsyncOp, BlockSegment, BlockSegmentDirection};
+    let mut bus = Fake::new();
+    bus.delay_io = true;
+    let mut controller = Controller::<Host, _>::new(bus, true, 0x2000).unwrap();
+    let data = [0x12_u8; 512];
+    let segment = BlockSegment {
+        addr: data.as_ptr() as usize,
+        len: 512,
+        direction: BlockSegmentDirection::MemoryToDevice,
+    };
+    let mut write = queue_request(BlockAsyncOp::Write, 0, core::slice::from_ref(&segment));
+    controller
+        .submit_async_batch(core::slice::from_mut(&mut write))
+        .unwrap();
+    let mut flush = queue_request(BlockAsyncOp::Flush, 0, &[]);
+    assert_eq!(
+        controller
+            .submit_async_batch(core::slice::from_mut(&mut flush))
+            .unwrap()
+            .submitted,
+        0
+    );
+    controller.wait_async_all(&[write.handle.unwrap()]).unwrap();
+    assert_eq!(
+        controller
+            .submit_async_batch(core::slice::from_mut(&mut flush))
+            .unwrap()
+            .submitted,
+        1
+    );
+    let mut after = queue_request(BlockAsyncOp::Write, 1, core::slice::from_ref(&segment));
+    assert_eq!(
+        controller
+            .submit_async_batch(core::slice::from_mut(&mut after))
+            .unwrap()
+            .submitted,
+        0
+    );
+    controller.wait_async_all(&[flush.handle.unwrap()]).unwrap();
+    assert_eq!(
+        controller
+            .submit_async_batch(core::slice::from_mut(&mut after))
+            .unwrap()
+            .submitted,
+        1
+    );
+    controller.wait_async_all(&[after.handle.unwrap()]).unwrap();
+}
+
+#[test]
+fn unexpected_cid_retires_controller_instead_of_reusing_dma() {
+    let mut bus = Fake::new();
+    bus.corrupt_cid = true;
+    let mut controller = Controller::<Host, _>::new(bus, true, 0x2000).unwrap();
+    assert!(matches!(
+        controller.write_block(0, &[0x11; 512]),
+        Err(DevError::BadState)
+    ));
+    assert!(matches!(
+        controller.write_block(0, &[0x22; 512]),
+        Err(DevError::BadState)
+    ));
+}
+
+#[test]
+fn unproven_reset_quarantines_owned_dma_and_never_copies_read_destinations() {
+    use axdriver_block::{BlockAsyncOp, BlockResetOutcome, BlockSegment, BlockSegmentDirection};
+    let mut bus = Fake::new();
+    bus.corrupt_cid = true;
+    bus.reset_stuck = true;
+    let mut controller = Controller::<Host, _>::new(bus, true, 0x2000).unwrap();
+    let mut output = [0xaa_u8; 512];
+    let segment = BlockSegment {
+        addr: output.as_mut_ptr() as usize,
+        len: 512,
+        direction: BlockSegmentDirection::DeviceToMemory,
+    };
+    let mut read = queue_request(BlockAsyncOp::Read, 0, core::slice::from_ref(&segment));
+    controller
+        .submit_async_batch(core::slice::from_mut(&mut read))
+        .unwrap();
+    assert!(matches!(
+        controller.wait_async_all(&[read.handle.unwrap()]),
+        Err(DevError::BadState)
+    ));
+    assert_eq!(output, [0xaa_u8; 512]);
+    assert_eq!(
+        controller.reset_device().unwrap(),
+        BlockResetOutcome::Quarantined
+    );
+}
+
+#[test]
+fn irq_owned_drain_reaches_deadline_without_polling_or_copying_on_lost_delivery() {
+    use axdriver_block::{
+        BlockAsyncOp, BlockCompletion, BlockCompletionOwner, BlockCompletionStatus, BlockSegment,
+        BlockSegmentDirection,
+    };
+    let mut bus = Fake::new();
+    bus.irq = true;
+    bus.suppress_irq = true;
+    let clock = bus.clock.clone();
+    let mut controller = Controller::<Host, _>::new(bus, true, 0x2000).unwrap();
+    let mut output = [0xaa_u8; 512];
+    let segment = BlockSegment {
+        addr: output.as_mut_ptr() as usize,
+        len: 512,
+        direction: BlockSegmentDirection::DeviceToMemory,
+    };
+    let mut request = queue_request(BlockAsyncOp::Read, 0, core::slice::from_ref(&segment));
+    controller
+        .submit_async_batch(core::slice::from_mut(&mut request))
+        .unwrap();
+    let mut record = [BlockCompletion {
+        handle: request.handle.unwrap(),
+        owner: BlockCompletionOwner::Ordinary,
+        cookie: 0,
+        status: BlockCompletionStatus::Success,
+        bytes: 0,
+    }];
+    assert_eq!(
+        controller
+            .drain_async_completions(&mut record)
+            .unwrap()
+            .completed,
+        0
+    );
+    assert_eq!(output, [0xaa; 512]);
+    clock.store(5_000_000, core::sync::atomic::Ordering::Release);
+    assert!(matches!(
+        controller.drain_async_completions(&mut record),
+        Err(DevError::BadState)
+    ));
+    assert_eq!(output, [0xaa; 512]);
+    assert!(controller.async_queue_caps().is_none());
+}
+
+#[test]
+fn bootstrap_owner_can_poll_before_configured_irq_delivery_is_serviceable() {
+    let mut bus = Fake::new();
+    bus.irq = true;
+    bus.suppress_irq = true;
+    bus.bootstrap_poll = true;
+    let mut controller = Controller::<Host, _>::new(bus, true, 0x2000).unwrap();
+    let input = [0x47; 8192];
+    let mut output = [0; 8192];
+    controller.write_block(8, &input).unwrap();
+    controller.read_block(8, &mut output).unwrap();
+    assert_eq!(input, output);
+}
+
+#[test]
+fn ordinary_drain_returns_nonzero_unique_cookie_for_shared_runtime_authentication() {
+    use axdriver_block::{
+        BlockAsyncOp, BlockCompletion, BlockCompletionOwner, BlockCompletionStatus,
+        BlockRequestHandle, BlockSegment, BlockSegmentDirection,
+    };
+    let mut controller = Controller::<Host, _>::new(Fake::new(), true, 0x2000).unwrap();
+    let bytes = [0x63_u8; 512];
+    let segment = BlockSegment {
+        addr: bytes.as_ptr() as usize,
+        len: 512,
+        direction: BlockSegmentDirection::MemoryToDevice,
+    };
+    let mut requests = [
+        queue_request(BlockAsyncOp::Write, 0, core::slice::from_ref(&segment)),
+        queue_request(BlockAsyncOp::Write, 1, core::slice::from_ref(&segment)),
+    ];
+    controller.submit_async_batch(&mut requests).unwrap();
+    let mut output = [BlockCompletion {
+        handle: BlockRequestHandle { raw: 0 },
+        owner: BlockCompletionOwner::Ordinary,
+        cookie: 0,
+        status: BlockCompletionStatus::Success,
+        bytes: 0,
+    }; 2];
+    assert_eq!(
+        controller
+            .drain_async_completions(&mut output)
+            .unwrap()
+            .completed,
+        2
+    );
+    assert!(output.iter().all(|r| r.cookie != 0
+        && r.cookie == r.handle.raw
+        && r.bytes == 512
+        && r.status == BlockCompletionStatus::Success));
+    assert_ne!(output[0].cookie, output[1].cookie);
+    assert!(output.iter().all(|r| {
+        requests
+            .iter()
+            .any(|request| request.handle == Some(r.handle))
+    }));
 }

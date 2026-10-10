@@ -1,13 +1,52 @@
 //! NVMe platform seam. No disk writes without the exact boot parameter.
+use alloc::sync::Arc;
 use core::{
     ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 static CLAIMED: AtomicBool = AtomicBool::new(false);
-static IRQ_GENERATION: AtomicU64 = AtomicU64::new(0);
-static IRQ_OBSERVED: AtomicBool = AtomicBool::new(false);
-fn irq_handler() {
-    IRQ_GENERATION.fetch_add(1, Ordering::Release);
+/// Stable IRQ-owned publication state; no queue or DMA owner enters hard IRQ.
+struct IrqState {
+    generation: AtomicU64,
+    observed: AtomicBool,
+    notifier: AtomicUsize,
+    context: AtomicUsize,
+    readers: AtomicUsize,
+}
+impl IrqState {
+    fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            observed: AtomicBool::new(false),
+            notifier: AtomicUsize::new(0),
+            context: AtomicUsize::new(0),
+            readers: AtomicUsize::new(0),
+        }
+    }
+    fn notify(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.readers.fetch_add(1, Ordering::SeqCst);
+        let callback = self.notifier.load(Ordering::SeqCst);
+        if callback != 0 {
+            let context = self.context.load(Ordering::Acquire);
+            // SAFETY: install publishes the matching bounded callback/context
+            // and waits out every reader before its owner can be destroyed.
+            let callback = unsafe {
+                core::mem::transmute::<usize, axdriver_block::BlockCompletionNotifier>(callback)
+            };
+            callback(context);
+        }
+        self.readers.fetch_sub(1, Ordering::SeqCst);
+    }
+    fn install(&self, notifier: Option<axdriver_block::BlockCompletionNotifier>, context: usize) {
+        self.notifier.store(0, Ordering::SeqCst);
+        while self.readers.load(Ordering::SeqCst) != 0 {
+            core::hint::spin_loop();
+        }
+        self.context.store(context, Ordering::Release);
+        self.notifier
+            .store(notifier.map_or(0, |f| f as usize), Ordering::SeqCst);
+    }
 }
 
 use axalloc::{UsageKind, global_allocator};
@@ -77,7 +116,8 @@ unsafe impl Hal for PlatformHal {
 pub struct Window {
     base: usize,
     size: usize,
-    irq: Option<usize>,
+    irq: Option<Msix>,
+    irq_state: Arc<IrqState>,
     requester: tk_vtd::PciRequester,
 }
 impl Bus for Window {
@@ -106,14 +146,30 @@ impl Bus for Window {
     fn interrupt_enabled(&self) -> bool {
         self.irq.is_some()
     }
+    fn requires_interrupt_event(&self) -> bool {
+        self.irq.is_some() && axtask::can_block_current()
+    }
     fn interrupt_generation(&self) -> u64 {
-        IRQ_GENERATION.load(Ordering::Acquire)
+        self.irq_state.generation.load(Ordering::Acquire)
+    }
+    fn install_completion_notifier(
+        &mut self,
+        notifier: Option<axdriver_block::BlockCompletionNotifier>,
+        context: usize,
+    ) -> axdriver_block::DevResult {
+        self.irq_state.install(notifier, context);
+        Ok(())
     }
     fn now_us(&self) -> Option<u64> {
         Some(axhal::time::monotonic_time_nanos() / 1000)
     }
     fn wait_completion(&mut self, observed: u64) {
-        let Some(vector) = self.irq.filter(|_| axtask::can_block_current()) else {
+        let Some(vector) = self
+            .irq
+            .as_ref()
+            .map(|route| route.vector)
+            .filter(|_| axtask::can_block_current())
+        else {
             self.delay_us(10);
             return;
         };
@@ -126,7 +182,7 @@ impl Bus for Window {
         let _ = block_on(timeout(
             Some(Duration::from_micros(100)),
             poll_fn(|cx| {
-                if IRQ_GENERATION.load(Ordering::Acquire) != observed {
+                if self.irq_state.generation.load(Ordering::Acquire) != observed {
                     return Poll::Ready(());
                 }
                 if let Some(existing) = token {
@@ -139,7 +195,7 @@ impl Bus for Window {
                         Err(_) => return Poll::Ready(()),
                     }
                 }
-                if IRQ_GENERATION.load(Ordering::Acquire) != observed {
+                if self.irq_state.generation.load(Ordering::Acquire) != observed {
                     Poll::Ready(())
                 } else {
                     Poll::Pending
@@ -149,13 +205,10 @@ impl Bus for Window {
         if let Some(token) = token {
             let _ = cancel_irq_waker(token);
         }
-        if IRQ_GENERATION.load(Ordering::Acquire) != observed
-            && !IRQ_OBSERVED.swap(true, Ordering::AcqRel)
+        if self.irq_state.generation.load(Ordering::Acquire) != observed
+            && !self.irq_state.observed.swap(true, Ordering::AcqRel)
         {
-            log::info!(
-                "nvme: MSI-X completion wake observed on vector {vector:#x}; polling fallback \
-                 remains armed"
-            );
+            log::info!("nvme: MSI-X task completion wake observed on vector {vector:#x}");
         }
     }
 }
@@ -164,6 +217,7 @@ struct Msix {
     capability: u8,
     control: u16,
     vector: usize,
+    handle: axhal::irq::dynamic::IrqHandle,
 }
 impl Msix {
     fn disable(root: &mut PciRoot, bdf: DeviceFunction) {
@@ -176,7 +230,7 @@ impl Msix {
             let _ = root.read_config_dword(bdf, cap.offset);
         }
     }
-    fn prepare(root: &mut PciRoot, bdf: DeviceFunction) -> Option<Self> {
+    fn prepare(root: &mut PciRoot, bdf: DeviceFunction, state: Arc<IrqState>) -> Option<Self> {
         let capability = root
             .capabilities(bdf)
             .take(48)
@@ -195,17 +249,22 @@ impl Msix {
             .ok()?
             .as_usize();
         let table = base.checked_add(layout.offset)?;
-        let (message, data, vector) = axhal::irq::allocate_msi(
+        let (message, data, handle) = axhal::irq::dynamic::allocate_msi_dynamic(
             tk_vtd::PciRequester {
                 segment: axhal::pci::ecam_segment(),
                 bus: bdf.bus,
                 device: bdf.device,
                 function: bdf.function,
             },
-            irq_handler,
+            axhal::irq::dynamic::IrqRequest::new(move |_| {
+                state.notify();
+                axhal::irq::dynamic::IrqReturn::Handled
+            }),
         )?;
+        let vector = handle.irq().hwirq.0 as usize;
         let control = capability.private_header | 0xc000;
         if !root.write_config_u16(bdf, capability.offset + 2, control) {
+            let _ = axhal::irq::dynamic::free_device(handle);
             return None;
         }
         // SAFETY: the complete MSI-X table was bounds-checked in a mapped memory BAR.
@@ -224,16 +283,34 @@ impl Msix {
             capability: capability.offset,
             control,
             vector,
+            handle,
         })
     }
-    fn enable(&self, root: &mut PciRoot, bdf: DeviceFunction) {
+    fn enable(&self, root: &mut PciRoot, bdf: DeviceFunction) -> bool {
         // SAFETY: entry zero's message and permanent handler are installed; controller
         // initialization completed with every other entry still masked.
         unsafe {
             ((self.table + 12) as *mut u32).write_volatile(0);
         }
-        root.write_config_u16(bdf, self.capability + 2, self.control & !0x4000);
-        let _ = root.read_config_dword(bdf, self.capability);
+        if !root.write_config_u16(bdf, self.capability + 2, self.control & !0x4000) {
+            return false;
+        }
+        root.read_config_dword(bdf, self.capability)
+            .is_some_and(|value| (value >> 16) as u16 & 0xc000 == 0x8000)
+    }
+}
+
+impl Drop for Msix {
+    fn drop(&mut self) {
+        // SAFETY: this route owns the checked, permanently mapped MSI-X entry.
+        // Mask and read back before detaching its callback and remapping owner.
+        unsafe {
+            ((self.table + 12) as *mut u32).write_volatile(1);
+            let _ = ((self.table + 12) as *const u32).read_volatile();
+        }
+        if let Err(error) = axhal::irq::dynamic::free_device(self.handle) {
+            log::warn!("nvme: IRQ route retained after detach failure: {error:?}");
+        }
     }
 }
 
@@ -272,16 +349,25 @@ impl DriverProbe for NvmeDriver {
             );
         }
         Msix::disable(root, bdf);
+        let irq_state = Arc::new(IrqState::new());
         let msix = if axhal::boot::command_line_value("nvme.poll") == Some("1") {
             None
         } else {
-            Msix::prepare(root, bdf)
+            Msix::prepare(root, bdf, irq_state.clone())
         };
+        let uses_irq = msix.is_some();
+        if let Some(route) = &msix {
+            if !route.enable(root, bdf) {
+                log::warn!("nvme: {bdf} MSI-X enable readback failed; probe stopped");
+                return BusProbeResult::Claimed;
+            }
+        }
         match NvmeDevice::new(
             Window {
                 base: base.as_usize(),
                 size: size as usize,
-                irq: msix.as_ref().map(|route| route.vector),
+                irq: msix,
+                irq_state,
                 requester: tk_vtd::PciRequester {
                     segment: axhal::pci::ecam_segment(),
                     bus: bdf.bus,
@@ -293,9 +379,6 @@ impl DriverProbe for NvmeDriver {
             size as usize,
         ) {
             Ok(device) => {
-                if let Some(route) = &msix {
-                    route.enable(root, bdf);
-                }
                 log::info!(
                     "nvme: {bdf} {:04x}:{:04x} /dev/nvme0n1 queues={} read_only={} completion={}; \
                      未在硬件上验证",
@@ -303,8 +386,8 @@ impl DriverProbe for NvmeDriver {
                     info.device_id,
                     device.queue_count(),
                     device.read_only(),
-                    if msix.is_some() {
-                        "MSI-X+poll-fallback"
+                    if uses_irq {
+                        "MSI-X owned/batched"
                     } else {
                         "polling"
                     }

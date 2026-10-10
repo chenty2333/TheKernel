@@ -1426,10 +1426,12 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
         (!self.poisoned).then_some(BlockQueueCaps {
             max_requests: slots,
             max_descriptors: slots
-                * ((COMMAND_TABLE_SLOT_BYTES - COMMAND_TABLE_HEADER_BYTES) / PRD_BYTES),
+                .saturating_mul((COMMAND_TABLE_SLOT_BYTES - COMMAND_TABLE_HEADER_BYTES) / PRD_BYTES)
+                .min(MAX_ASYNC_SEGMENTS),
             supports_indirect: false,
             supports_event_idx: false,
             default_depth: 1,
+            max_request_bytes: Some(self.workspace().bounce.len),
         })
     }
 

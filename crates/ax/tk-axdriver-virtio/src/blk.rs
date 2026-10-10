@@ -1852,6 +1852,7 @@ impl<H: Hal, T: Transport + Send> BlockDriverOps for VirtIoBlkDev<H, T> {
             supports_indirect: inner.supports_indirect_desc(),
             supports_event_idx: inner.supports_event_idx(),
             default_depth: inner.async_default_depth(),
+            max_request_bytes: None,
         })
     }
 

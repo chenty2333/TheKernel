@@ -6,26 +6,34 @@
 
 The x86 platform reserves a handler-table vector strictly above every
 implemented IOAPIC pin's vector and below the LAPIC/IPI reserved range.
-BSP destination must be representable without interrupt remapping. No IOAPIC
-entry is enabled or repurposed. Ownership lasts until reboot: delayed device
-messages cannot target a replacement handler, including failed initialization.
+No IOAPIC entry is enabled or repurposed. The requester identity crosses the
+existing VT-d interrupt-remapping boundary when that platform mode is active.
+The dynamic IRQ handle owns the callback, native vector and remapping entry.
+Teardown masks/readbacks the device's MSI-X entry, synchronizes in-flight
+callbacks and trap boundaries, and only then releases the route. A failed
+remapping release retains ownership rather than allowing vector reuse.
 
 Native PCI capability access is bounded and halfword-correct. Probe first
 masks/disables inherited MSI-X state. It checks the entire capability table
 against its memory BAR, masks all entries/function delivery, installs one
-permanent vector and its entry zero message, then creates the controller/CQs.
+owned dynamic vector and its entry zero message before creating controller/CQs.
 Admin and both I/O CQs use vector zero; I/O CQ IEN is set only with an admitted
-route. After successful initialization, entry zero/function delivery unmask.
-Failure leaves the function masked and DMA follows the driver's reset/retain
-contract. INTx remains disabled. `nvme.poll=1` explicitly tests fallback.
+route. The callback's per-device state is installed before entry zero/function
+delivery unmask, including initialization-time events. Failure drops the route
+only after masking its entry; DMA follows the driver's reset/retain contract.
+INTx remains disabled. `nvme.poll=1` explicitly selects polling.
 
-IRQ context only increments an atomic generation; the existing IRQ-safe task
-waker registry performs wake delivery. The single task-context CQ owner keeps
-phase/CID/SQID verification and CQ-head acknowledgment. Check-register-check
-prevents a missed wake. A bounded timer, repeated CQ reads and an absolute
-five-second command deadline preserve progress if an IRQ is missing, IRQs are
-disabled during early boot, or a task cannot sleep. No separate IRQ ring drain
-races the synchronous owner. RO/write gating is unchanged.
+IRQ context increments a per-device atomic generation and invokes the bounded
+shared-runtime notifier; it never drains CQ or accesses DMA owners. Task context
+keeps phase/CID/SQID verification and CQ-head acknowledgment. Check-register-check
+prevents missed wake registration. In serviceable IRQ mode CQ is inspected only after an
+event generation changes; bootstrap owners with interrupts masked explicitly
+inspect CQ, before sharing the controller; an absolute five-second command deadline fails closed
+on lost delivery instead of polling the IRQ-owned queue. Explicit polling mode
+and route-less devices use bounded CQ reads. RO/write gating is unchanged.
+
+The original 2026-10-04 validation below predates dynamic route ownership and
+owned batches; it is historical transport coverage, not acceptance of new code.
 
 Host tests validate table bounds, exclusion of IOAPIC/LAPIC vectors, IEN/vector
 encoding, delayed IRQ completion and lost-interrupt polling with identical

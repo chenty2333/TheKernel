@@ -326,6 +326,9 @@ pub struct BlockQueueCaps {
     pub supports_event_idx: bool,
     /// Runtime default queue-depth cap for this architecture/device.
     pub default_depth: usize,
+    /// Optional byte ceiling for an individual request. Drivers with no
+    /// independent transfer-size limit leave this as `None`.
+    pub max_request_bytes: Option<usize>,
 }
 
 /// Opaque handle for a submitted async block request.

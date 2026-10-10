@@ -3563,6 +3563,7 @@ dependencies = [
  "tk-axcpu",
  "tk-axgpu",
  "tk-axplat-x86-pc",
+ "tk-irq-framework",
  "tk-page-table-multiarch",
  "tk-vtd",
 ]
@@ -3798,6 +3799,10 @@ dependencies = [
  "tk-axtask",
  "tk-vtd",
 ]
+
+[[package]]
+name = "tk-irq-framework"
+version = "0.2.0-preview.2"
 
 [[package]]
 name = "tk-kernel"

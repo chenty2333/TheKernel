@@ -1,0 +1,20 @@
+[package]
+publish.workspace = true
+rust-version.workspace = true
+name = "tk-irq-framework"
+version.workspace = true
+edition.workspace = true
+authors = ["RCore Team <yuchen@tsinghua.edu.cn>"]
+description = "A no_std dynamic IRQ registration and dispatch framework"
+license = "Apache-2.0"
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "irq_framework"
+path = "src/lib.rs"
+
+[package.metadata.thekernel]
+layer = "mechanism"

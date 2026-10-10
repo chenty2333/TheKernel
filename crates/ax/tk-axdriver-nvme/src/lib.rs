@@ -1,5 +1,6 @@
 //! Original NVMe PCI transport. Linux 7.2.3 pci.c/core.c and NVMe 1.4b
-//! are behavioral references only. Coherent 4-KiB DMA; bounded polling.
+//! are behavioral references only. Coherent 4-KiB DMA; owned batch queues.
+//! Request slot/commit/drain design also follows TGOSKits nvme-driver.
 #![no_std]
 extern crate alloc;
 pub mod bringup;

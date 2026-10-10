@@ -20,9 +20,10 @@ use crate::{
         BaseDriverOps, BlockAsyncOp, BlockCapabilities, BlockCompletion,
         BlockCompletionAvailability, BlockCompletionDrain, BlockCompletionNotifier,
         BlockCompletionOwner, BlockCompletionStatus, BlockCompletionTerminalNotifier,
-        BlockDriverOps, BlockPhysicalCompletionRoute, BlockPhysicalRequest, BlockPhysicalSegment,
-        BlockPhysicalSgOutcome, BlockQueueCaps, BlockQueueRequest, BlockRange, BlockRequestHandle,
-        BlockResetOutcome, BlockSegment, BlockSubmitReport, DevError, DevResult, DeviceType,
+        BlockDriverOps, BlockGeometry, BlockPhysicalCompletionRoute, BlockPhysicalRequest,
+        BlockPhysicalSegment, BlockPhysicalSgOutcome, BlockQueueCaps, BlockQueueRequest,
+        BlockRange, BlockRequestHandle, BlockResetOutcome, BlockSegment, BlockSubmitReport,
+        DevError, DevResult, DeviceType,
     },
 };
 
@@ -35,6 +36,134 @@ const PHYSICAL_ROUTE_CAPACITY: usize = 32;
 /// lower route bound paired with the upper physical extent cap.
 const PHYSICAL_ROUTE_CHILD_CAPACITY: usize = 16;
 const COMPLETION_WAIT_SLICE: Duration = Duration::from_micros(100);
+const UNBOUNDED_BOUNCE_CHUNK_BYTES: usize = 1024 * 1024;
+
+fn prefer_task_async_queue(can_block: bool, caps: Option<BlockQueueCaps>) -> bool {
+    can_block && caps.is_some()
+}
+
+fn validate_owned_io_range(geometry: BlockGeometry, block_id: u64, bytes: usize) -> DevResult<()> {
+    if geometry.block_size == 0 || bytes == 0 || !bytes.is_multiple_of(geometry.block_size) {
+        return Err(DevError::InvalidParam);
+    }
+    let blocks = u64::try_from(bytes / geometry.block_size).map_err(|_| DevError::InvalidParam)?;
+    if block_id
+        .checked_add(blocks)
+        .is_none_or(|end| end > geometry.blocks)
+    {
+        return Err(DevError::InvalidParam);
+    }
+    Ok(())
+}
+
+/// Returns a whole-block request limit. A driver-advertised byte limit is
+/// authoritative; vectored calls that need a linear bounce buffer also use a
+/// bounded fallback window when the queue has no independent byte ceiling.
+fn owned_request_chunk_limit(
+    total_bytes: usize,
+    block_size: usize,
+    max_request_bytes: Option<usize>,
+    needs_bounce: bool,
+) -> DevResult<usize> {
+    if block_size == 0 || total_bytes == 0 {
+        return Err(DevError::InvalidParam);
+    }
+    let requested = max_request_bytes.unwrap_or_else(|| {
+        if needs_bounce {
+            UNBOUNDED_BOUNCE_CHUNK_BYTES.max(block_size)
+        } else {
+            total_bytes
+        }
+    });
+    let limit = requested / block_size * block_size;
+    if limit == 0 {
+        return Err(DevError::InvalidParam);
+    }
+    Ok(limit)
+}
+
+fn next_owned_request_chunk(remaining: usize, limit: usize, block_size: usize) -> DevResult<usize> {
+    if block_size == 0 || limit < block_size {
+        return Err(DevError::InvalidParam);
+    }
+    let chunk = remaining.min(limit) / block_size * block_size;
+    if chunk == 0 {
+        return Err(DevError::InvalidParam);
+    }
+    Ok(chunk)
+}
+
+fn copy_owned_segments_to_linear(
+    segments: &[BlockSegment],
+    logical_offset: usize,
+    output: &mut [u8],
+) -> DevResult<()> {
+    let mut skip = logical_offset;
+    let mut copied = 0usize;
+    for segment in segments {
+        if segment.direction != crate::prelude::BlockSegmentDirection::MemoryToDevice {
+            return Err(DevError::InvalidParam);
+        }
+        if skip >= segment.len {
+            skip -= segment.len;
+            continue;
+        }
+        let len = (segment.len - skip).min(output.len() - copied);
+        let address = segment
+            .addr
+            .checked_add(skip)
+            .ok_or(DevError::InvalidParam)?;
+        // SAFETY: these segments were built from caller-owned immutable slices
+        // and remain borrowed for the complete synchronous owned operation.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                address as *const u8,
+                output.as_mut_ptr().add(copied),
+                len,
+            );
+        }
+        copied += len;
+        skip = 0;
+        if copied == output.len() {
+            return Ok(());
+        }
+    }
+    Err(DevError::BadState)
+}
+
+fn copy_linear_to_owned_segments(
+    input: &[u8],
+    segments: &[BlockSegment],
+    logical_offset: usize,
+) -> DevResult<()> {
+    let mut skip = logical_offset;
+    let mut copied = 0usize;
+    for segment in segments {
+        if segment.direction != crate::prelude::BlockSegmentDirection::DeviceToMemory {
+            return Err(DevError::InvalidParam);
+        }
+        if skip >= segment.len {
+            skip -= segment.len;
+            continue;
+        }
+        let len = (segment.len - skip).min(input.len() - copied);
+        let address = segment
+            .addr
+            .checked_add(skip)
+            .ok_or(DevError::InvalidParam)?;
+        // SAFETY: these segments were built from caller-owned mutable slices;
+        // the exact lower handle has completed before this scatter copy.
+        unsafe {
+            core::ptr::copy_nonoverlapping(input.as_ptr().add(copied), address as *mut u8, len);
+        }
+        copied += len;
+        skip = 0;
+        if copied == input.len() {
+            return Ok(());
+        }
+    }
+    Err(DevError::BadState)
+}
 
 #[inline]
 fn completion_progress_observed(observed: u64, current: u64, terminal: bool) -> bool {
@@ -994,57 +1123,31 @@ pub struct SharedBlockDeviceGuard<'a> {
 }
 
 impl SharedBlockDeviceGuard<'_> {
-    /// Reads through the idle device's legacy synchronous owner. Once any
-    /// route/credit/mailbox custody exists, the operation uses the typed
-    /// shared owner instead; that path never falls back after publication.
+    /// Reads through the typed shared owner in blocking task context when an
+    /// async queue is available; otherwise uses the idle legacy synchronous
+    /// owner. The async path never falls back after publication.
     pub fn read_block(&mut self, block_id: u64, buf: &mut [u8]) -> DevResult {
-        if let Some(result) = self
-            .device
-            .try_legacy_io(crate::block_statistics::Operation::Read, Some(buf.len() as u64), |device| BlockDriverOps::read_block(device, block_id, buf))
-        {
-            return result;
-        }
         self.device.read_block_owned(block_id, buf)
     }
 
     /// Write counterpart to [`Self::read_block`].
     pub fn write_block(&mut self, block_id: u64, buf: &[u8]) -> DevResult {
-        if let Some(result) = self
-            .device
-            .try_legacy_io(crate::block_statistics::Operation::Write, Some(buf.len() as u64), |device| BlockDriverOps::write_block(device, block_id, buf))
-        {
-            return result;
-        }
         self.device.write_block_owned(block_id, buf)
     }
 
     /// Vectored ordinary read counterpart.
     pub fn read_block_vectored(&mut self, block_id: u64, bufs: &mut [&mut [u8]]) -> DevResult {
-        if let Some(result) = self
-            .device
-            .try_legacy_io(crate::block_statistics::Operation::Read, bufs.iter().try_fold(0u64, |sum, buf| sum.checked_add(buf.len() as u64)), |device| BlockDriverOps::read_block_vectored(device, block_id, bufs))
-        {
-            return result;
-        }
         self.device.read_block_vectored_owned(block_id, bufs)
     }
 
     /// Vectored ordinary write counterpart.
     pub fn write_block_vectored(&mut self, block_id: u64, bufs: &[&[u8]]) -> DevResult {
-        if let Some(result) = self
-            .device
-            .try_legacy_io(crate::block_statistics::Operation::Write, bufs.iter().try_fold(0u64, |sum, buf| sum.checked_add(buf.len() as u64)), |device| BlockDriverOps::write_block_vectored(device, block_id, bufs))
-        {
-            return result;
-        }
         self.device.write_block_vectored_owned(block_id, bufs)
     }
 
-    /// Flushes through the idle legacy owner or the typed shared owner.
+    /// Flushes through the typed shared owner when task context can wait on an
+    /// available async queue, or through the idle legacy owner otherwise.
     pub fn flush(&mut self) -> DevResult {
-        if let Some(result) = self.device.try_legacy_io(crate::block_statistics::Operation::Flush, Some(0), BlockDriverOps::flush) {
-            return result;
-        }
         {
             let mut shared = self.device.clone();
             return BlockDriverOps::flush(&mut shared);
@@ -1152,9 +1255,275 @@ impl SharedBlockDevice {
         self.inner.statistics.snapshot()
     }
 
-    fn try_legacy_io<R>(&self, op: crate::block_statistics::Operation, bytes: Option<u64>,
-        operation: impl FnOnce(&mut AxBlockDevice) -> DevResult<R>) -> Option<DevResult<R>> {
-        self.try_legacy_sync(|device| self.inner.statistics.legacy(op, bytes, || operation(device)))
+    fn try_legacy_io<R>(
+        &self,
+        op: crate::block_statistics::Operation,
+        bytes: Option<u64>,
+        operation: impl FnOnce(&mut AxBlockDevice) -> DevResult<R>,
+    ) -> Option<DevResult<R>> {
+        self.try_legacy_sync(|device| {
+            self.inner
+                .statistics
+                .legacy(op, bytes, || operation(device))
+        })
+    }
+
+    fn queue_caps_snapshot(&self) -> Option<BlockQueueCaps> {
+        if self.completion_unavailable() {
+            return None;
+        }
+        self.lock_raw().async_queue_caps()
+    }
+
+    fn geometry_snapshot(&self) -> DevResult<BlockGeometry> {
+        self.lock_raw().block_geometry()
+    }
+
+    fn submit_owned_request(
+        &self,
+        op: BlockAsyncOp,
+        block_id: u64,
+        segments: &[BlockSegment],
+        expected_bytes: usize,
+    ) -> DevResult<bool> {
+        let mut request = BlockQueueRequest {
+            op,
+            block_id,
+            segments,
+            handle: None,
+        };
+        let Some(report) = self.submit_sync_batch_owned(core::slice::from_mut(&mut request))?
+        else {
+            return Ok(false);
+        };
+        if report.submitted != 1 || report.bytes != expected_bytes {
+            self.inner
+                .completion_quarantined
+                .store(true, Ordering::Release);
+            self.notify_progress();
+            return Err(DevError::BadState);
+        }
+        let handle = request.handle.ok_or(DevError::BadState)?;
+        self.wait_async_all_owned(core::slice::from_ref(&handle))?;
+        Ok(true)
+    }
+
+    fn submit_owned_buffer_chunks(
+        &self,
+        op: BlockAsyncOp,
+        block_id: u64,
+        buf: &mut [u8],
+        block_size: usize,
+        chunk_limit: usize,
+    ) -> DevResult<bool> {
+        let mut offset = 0usize;
+        while offset < buf.len() {
+            let len = next_owned_request_chunk(buf.len() - offset, chunk_limit, block_size)?;
+            let block = block_id
+                .checked_add((offset / block_size) as u64)
+                .ok_or(DevError::InvalidParam)?;
+            let segment = match op {
+                BlockAsyncOp::Read => BlockSegment::from_read_buf(&mut buf[offset..offset + len]),
+                BlockAsyncOp::Write => BlockSegment::from_write_buf(&buf[offset..offset + len]),
+                BlockAsyncOp::Flush => return Err(DevError::InvalidParam),
+            };
+            if !self.submit_owned_request(op, block, core::slice::from_ref(&segment), len)? {
+                return if offset == 0 {
+                    Ok(false)
+                } else {
+                    Err(DevError::BadState)
+                };
+            }
+            offset += len;
+        }
+        Ok(true)
+    }
+
+    fn submit_owned_write_chunks(
+        &self,
+        block_id: u64,
+        buf: &[u8],
+        block_size: usize,
+        chunk_limit: usize,
+    ) -> DevResult<bool> {
+        let mut offset = 0usize;
+        while offset < buf.len() {
+            let len = next_owned_request_chunk(buf.len() - offset, chunk_limit, block_size)?;
+            let block = block_id
+                .checked_add((offset / block_size) as u64)
+                .ok_or(DevError::InvalidParam)?;
+            let segment = BlockSegment::from_write_buf(&buf[offset..offset + len]);
+            if !self.submit_owned_request(
+                BlockAsyncOp::Write,
+                block,
+                core::slice::from_ref(&segment),
+                len,
+            )? {
+                return if offset == 0 {
+                    Ok(false)
+                } else {
+                    Err(DevError::BadState)
+                };
+            }
+            offset += len;
+        }
+        Ok(true)
+    }
+
+    fn submit_owned_vectored_chunks(
+        &self,
+        op: BlockAsyncOp,
+        block_id: u64,
+        segments: &[BlockSegment],
+        total_bytes: usize,
+        geometry: BlockGeometry,
+        caps: Option<BlockQueueCaps>,
+    ) -> DevResult<bool> {
+        if segments.is_empty() || !matches!(op, BlockAsyncOp::Read | BlockAsyncOp::Write) {
+            return Err(DevError::InvalidParam);
+        }
+        let segment_bytes = segments
+            .iter()
+            .try_fold(0usize, |total, segment| total.checked_add(segment.len))
+            .ok_or(DevError::InvalidParam)?;
+        if segment_bytes != total_bytes {
+            return Err(DevError::InvalidParam);
+        }
+        validate_owned_io_range(geometry, block_id, total_bytes)?;
+        if caps.is_some_and(|caps| caps.max_descriptors == 0) {
+            return Err(DevError::InvalidParam);
+        }
+        let block_size = geometry.block_size;
+        let direction = if op == BlockAsyncOp::Read {
+            crate::prelude::BlockSegmentDirection::DeviceToMemory
+        } else {
+            crate::prelude::BlockSegmentDirection::MemoryToDevice
+        };
+        if segments.iter().any(|segment| {
+            segment.direction != direction
+                || segment.len == 0
+                || segment.addr == 0
+                || segment.addr.checked_add(segment.len).is_none()
+        }) {
+            return Err(DevError::InvalidParam);
+        }
+        let needs_bounce = segments
+            .iter()
+            .any(|segment| !segment.len.is_multiple_of(block_size));
+        let chunk_limit = owned_request_chunk_limit(
+            total_bytes,
+            block_size,
+            caps.and_then(|caps| caps.max_request_bytes),
+            needs_bounce,
+        )?;
+
+        if !needs_bounce {
+            let descriptor_limit = match caps {
+                Some(caps) => caps.max_descriptors.min(segments.len()),
+                None => segments.len(),
+            };
+            if descriptor_limit == 0 {
+                return Err(DevError::InvalidParam);
+            }
+            let mut chunk_segments = Vec::new();
+            chunk_segments
+                .try_reserve_exact(descriptor_limit)
+                .map_err(|_| DevError::NoMemory)?;
+            let mut segment_index = 0usize;
+            let mut segment_offset = 0usize;
+            let mut completed_bytes = 0usize;
+            while completed_bytes < total_bytes {
+                chunk_segments.clear();
+                let mut chunk_bytes = 0usize;
+                while segment_index < segments.len()
+                    && chunk_segments.len() < descriptor_limit
+                    && chunk_bytes < chunk_limit
+                {
+                    let source = segments[segment_index];
+                    let available = source.len - segment_offset;
+                    let take = available.min(chunk_limit - chunk_bytes);
+                    let take = take / block_size * block_size;
+                    if take == 0 {
+                        break;
+                    }
+                    chunk_segments.push(BlockSegment {
+                        addr: source
+                            .addr
+                            .checked_add(segment_offset)
+                            .ok_or(DevError::InvalidParam)?,
+                        len: take,
+                        direction,
+                    });
+                    chunk_bytes = chunk_bytes
+                        .checked_add(take)
+                        .ok_or(DevError::InvalidParam)?;
+                    segment_offset += take;
+                    if segment_offset == source.len {
+                        segment_index += 1;
+                        segment_offset = 0;
+                    }
+                }
+                if chunk_bytes == 0 {
+                    return Err(DevError::BadState);
+                }
+                let block = block_id
+                    .checked_add((completed_bytes / block_size) as u64)
+                    .ok_or(DevError::InvalidParam)?;
+                if !self.submit_owned_request(op, block, &chunk_segments, chunk_bytes)? {
+                    return if completed_bytes == 0 {
+                        Ok(false)
+                    } else {
+                        Err(DevError::BadState)
+                    };
+                }
+                completed_bytes += chunk_bytes;
+            }
+            return Ok(true);
+        }
+
+        // A lower queue may require every descriptor length to be a whole
+        // logical block. If the caller's scatter boundaries split blocks,
+        // coalesce only one bounded aligned window at a time.
+        let mut scratch = Vec::new();
+        let scratch_bytes = total_bytes.min(chunk_limit);
+        scratch
+            .try_reserve_exact(scratch_bytes)
+            .map_err(|_| DevError::NoMemory)?;
+        scratch.resize(scratch_bytes, 0);
+        let mut completed_bytes = 0usize;
+        while completed_bytes < total_bytes {
+            let chunk_bytes =
+                next_owned_request_chunk(total_bytes - completed_bytes, chunk_limit, block_size)?;
+            let chunk = &mut scratch[..chunk_bytes];
+            if op == BlockAsyncOp::Write {
+                copy_owned_segments_to_linear(segments, completed_bytes, chunk)?;
+            }
+            let segment = match op {
+                BlockAsyncOp::Read => BlockSegment::from_read_buf(chunk),
+                BlockAsyncOp::Write => BlockSegment::from_write_buf(chunk),
+                BlockAsyncOp::Flush => unreachable!(),
+            };
+            let block = block_id
+                .checked_add((completed_bytes / block_size) as u64)
+                .ok_or(DevError::InvalidParam)?;
+            if !self.submit_owned_request(
+                op,
+                block,
+                core::slice::from_ref(&segment),
+                chunk_bytes,
+            )? {
+                return if completed_bytes == 0 {
+                    Ok(false)
+                } else {
+                    Err(DevError::BadState)
+                };
+            }
+            if op == BlockAsyncOp::Read {
+                copy_linear_to_owned_segments(chunk, segments, completed_bytes)?;
+            }
+            completed_bytes += chunk_bytes;
+        }
+        Ok(true)
     }
 
     /// Returns a restricted ordinary-device guard.  Completion and reset
@@ -2879,62 +3248,91 @@ impl SharedBlockDevice {
         if buf.is_empty() {
             return Ok(());
         }
-        if let Some(result) =
-            self.try_legacy_io(crate::block_statistics::Operation::Read, Some(buf.len() as u64), |device| BlockDriverOps::read_block(device, block_id, buf))
-        {
-            return result;
-        }
-        let segment = BlockSegment::from_read_buf(buf);
-        let mut request = BlockQueueRequest {
-            op: BlockAsyncOp::Read,
-            block_id,
-            segments: core::slice::from_ref(&segment),
-            handle: None,
+        let can_block = axtask::can_block_current();
+        let caps_snapshot = if can_block {
+            self.queue_caps_snapshot()
+        } else {
+            None
         };
-        if let Some(report) = self.submit_sync_batch_owned(core::slice::from_mut(&mut request))? {
-            if report.submitted != 1 || report.bytes != buf.len() {
-                self.inner
-                    .completion_quarantined
-                    .store(true, Ordering::Release);
-                self.notify_progress();
-                return Err(DevError::BadState);
+        let preferred_caps = prefer_task_async_queue(can_block, caps_snapshot)
+            .then_some(caps_snapshot)
+            .flatten();
+        if preferred_caps.is_none() {
+            if let Some(result) = self.try_legacy_io(
+                crate::block_statistics::Operation::Read,
+                Some(buf.len() as u64),
+                |device| BlockDriverOps::read_block(device, block_id, buf),
+            ) {
+                return result;
             }
-            let handle = request.handle.ok_or(DevError::BadState)?;
-            return self.wait_async_all_owned(core::slice::from_ref(&handle));
         }
-        self.try_legacy_io(crate::block_statistics::Operation::Read, Some(buf.len() as u64), |device| BlockDriverOps::read_block(device, block_id, buf))
-            .unwrap_or(Err(DevError::BadState))
+        let caps = preferred_caps.or_else(|| self.queue_caps_snapshot());
+        let geometry = self.geometry_snapshot()?;
+        validate_owned_io_range(geometry, block_id, buf.len())?;
+        let chunk_limit = owned_request_chunk_limit(
+            buf.len(),
+            geometry.block_size,
+            caps.and_then(|caps| caps.max_request_bytes),
+            false,
+        )?;
+        if self.submit_owned_buffer_chunks(
+            BlockAsyncOp::Read,
+            block_id,
+            buf,
+            geometry.block_size,
+            chunk_limit,
+        )? {
+            return Ok(());
+        }
+
+        self.try_legacy_io(
+            crate::block_statistics::Operation::Read,
+            Some(buf.len() as u64),
+            |device| BlockDriverOps::read_block(device, block_id, buf),
+        )
+        .unwrap_or(Err(DevError::BadState))
     }
 
     fn write_block_owned(&self, block_id: u64, buf: &[u8]) -> DevResult {
         if buf.is_empty() {
             return Ok(());
         }
-        if let Some(result) =
-            self.try_legacy_io(crate::block_statistics::Operation::Write, Some(buf.len() as u64), |device| BlockDriverOps::write_block(device, block_id, buf))
-        {
-            return result;
-        }
-        let segment = BlockSegment::from_write_buf(buf);
-        let mut request = BlockQueueRequest {
-            op: BlockAsyncOp::Write,
-            block_id,
-            segments: core::slice::from_ref(&segment),
-            handle: None,
+        let can_block = axtask::can_block_current();
+        let caps_snapshot = if can_block {
+            self.queue_caps_snapshot()
+        } else {
+            None
         };
-        if let Some(report) = self.submit_sync_batch_owned(core::slice::from_mut(&mut request))? {
-            if report.submitted != 1 || report.bytes != buf.len() {
-                self.inner
-                    .completion_quarantined
-                    .store(true, Ordering::Release);
-                self.notify_progress();
-                return Err(DevError::BadState);
+        let preferred_caps = prefer_task_async_queue(can_block, caps_snapshot)
+            .then_some(caps_snapshot)
+            .flatten();
+        if preferred_caps.is_none() {
+            if let Some(result) = self.try_legacy_io(
+                crate::block_statistics::Operation::Write,
+                Some(buf.len() as u64),
+                |device| BlockDriverOps::write_block(device, block_id, buf),
+            ) {
+                return result;
             }
-            let handle = request.handle.ok_or(DevError::BadState)?;
-            return self.wait_async_all_owned(core::slice::from_ref(&handle));
         }
-        self.try_legacy_io(crate::block_statistics::Operation::Write, Some(buf.len() as u64), |device| BlockDriverOps::write_block(device, block_id, buf))
-            .unwrap_or(Err(DevError::BadState))
+        let caps = preferred_caps.or_else(|| self.queue_caps_snapshot());
+        let geometry = self.geometry_snapshot()?;
+        validate_owned_io_range(geometry, block_id, buf.len())?;
+        let chunk_limit = owned_request_chunk_limit(
+            buf.len(),
+            geometry.block_size,
+            caps.and_then(|caps| caps.max_request_bytes),
+            false,
+        )?;
+        if self.submit_owned_write_chunks(block_id, buf, geometry.block_size, chunk_limit)? {
+            return Ok(());
+        }
+        self.try_legacy_io(
+            crate::block_statistics::Operation::Write,
+            Some(buf.len() as u64),
+            |device| BlockDriverOps::write_block(device, block_id, buf),
+        )
+        .unwrap_or(Err(DevError::BadState))
     }
 
     fn read_block_vectored_owned(&self, block_id: u64, bufs: &mut [&mut [u8]]) -> DevResult {
@@ -2951,30 +3349,44 @@ impl SharedBlockDevice {
         if bytes == 0 {
             return Ok(());
         }
-        if let Some(result) = self
-            .try_legacy_io(crate::block_statistics::Operation::Read, bufs.iter().try_fold(0u64, |sum, buf| sum.checked_add(buf.len() as u64)), |device| BlockDriverOps::read_block_vectored(device, block_id, bufs))
-        {
-            return result;
-        }
-        let mut request = BlockQueueRequest {
-            op: BlockAsyncOp::Read,
-            block_id,
-            segments: &segments,
-            handle: None,
+        let legacy_bytes = u64::try_from(bytes).map_err(|_| DevError::InvalidParam)?;
+        let can_block = axtask::can_block_current();
+        let caps_snapshot = if can_block {
+            self.queue_caps_snapshot()
+        } else {
+            None
         };
-        if let Some(report) = self.submit_sync_batch_owned(core::slice::from_mut(&mut request))? {
-            if report.submitted != 1 || report.bytes != bytes {
-                self.inner
-                    .completion_quarantined
-                    .store(true, Ordering::Release);
-                self.notify_progress();
-                return Err(DevError::BadState);
+        let preferred_caps = prefer_task_async_queue(can_block, caps_snapshot)
+            .then_some(caps_snapshot)
+            .flatten();
+        if preferred_caps.is_none() {
+            if let Some(result) = self.try_legacy_io(
+                crate::block_statistics::Operation::Read,
+                Some(legacy_bytes),
+                |device| BlockDriverOps::read_block_vectored(device, block_id, bufs),
+            ) {
+                return result;
             }
-            let handle = request.handle.ok_or(DevError::BadState)?;
-            return self.wait_async_all_owned(core::slice::from_ref(&handle));
         }
-        self.try_legacy_io(crate::block_statistics::Operation::Read, bufs.iter().try_fold(0u64, |sum, buf| sum.checked_add(buf.len() as u64)), |device| BlockDriverOps::read_block_vectored(device, block_id, bufs))
-            .unwrap_or(Err(DevError::BadState))
+        let caps = preferred_caps.or_else(|| self.queue_caps_snapshot());
+        let geometry = self.geometry_snapshot()?;
+        validate_owned_io_range(geometry, block_id, bytes)?;
+        if self.submit_owned_vectored_chunks(
+            BlockAsyncOp::Read,
+            block_id,
+            &segments,
+            bytes,
+            geometry,
+            caps,
+        )? {
+            return Ok(());
+        }
+        self.try_legacy_io(
+            crate::block_statistics::Operation::Read,
+            Some(legacy_bytes),
+            |device| BlockDriverOps::read_block_vectored(device, block_id, bufs),
+        )
+        .unwrap_or(Err(DevError::BadState))
     }
 
     fn write_block_vectored_owned(&self, block_id: u64, bufs: &[&[u8]]) -> DevResult {
@@ -2991,30 +3403,44 @@ impl SharedBlockDevice {
         if bytes == 0 {
             return Ok(());
         }
-        if let Some(result) = self
-            .try_legacy_io(crate::block_statistics::Operation::Write, bufs.iter().try_fold(0u64, |sum, buf| sum.checked_add(buf.len() as u64)), |device| BlockDriverOps::write_block_vectored(device, block_id, bufs))
-        {
-            return result;
-        }
-        let mut request = BlockQueueRequest {
-            op: BlockAsyncOp::Write,
-            block_id,
-            segments: &segments,
-            handle: None,
+        let legacy_bytes = u64::try_from(bytes).map_err(|_| DevError::InvalidParam)?;
+        let can_block = axtask::can_block_current();
+        let caps_snapshot = if can_block {
+            self.queue_caps_snapshot()
+        } else {
+            None
         };
-        if let Some(report) = self.submit_sync_batch_owned(core::slice::from_mut(&mut request))? {
-            if report.submitted != 1 || report.bytes != bytes {
-                self.inner
-                    .completion_quarantined
-                    .store(true, Ordering::Release);
-                self.notify_progress();
-                return Err(DevError::BadState);
+        let preferred_caps = prefer_task_async_queue(can_block, caps_snapshot)
+            .then_some(caps_snapshot)
+            .flatten();
+        if preferred_caps.is_none() {
+            if let Some(result) = self.try_legacy_io(
+                crate::block_statistics::Operation::Write,
+                Some(legacy_bytes),
+                |device| BlockDriverOps::write_block_vectored(device, block_id, bufs),
+            ) {
+                return result;
             }
-            let handle = request.handle.ok_or(DevError::BadState)?;
-            return self.wait_async_all_owned(core::slice::from_ref(&handle));
         }
-        self.try_legacy_io(crate::block_statistics::Operation::Write, bufs.iter().try_fold(0u64, |sum, buf| sum.checked_add(buf.len() as u64)), |device| BlockDriverOps::write_block_vectored(device, block_id, bufs))
-            .unwrap_or(Err(DevError::BadState))
+        let caps = preferred_caps.or_else(|| self.queue_caps_snapshot());
+        let geometry = self.geometry_snapshot()?;
+        validate_owned_io_range(geometry, block_id, bytes)?;
+        if self.submit_owned_vectored_chunks(
+            BlockAsyncOp::Write,
+            block_id,
+            &segments,
+            bytes,
+            geometry,
+            caps,
+        )? {
+            return Ok(());
+        }
+        self.try_legacy_io(
+            crate::block_statistics::Operation::Write,
+            Some(legacy_bytes),
+            |device| BlockDriverOps::write_block_vectored(device, block_id, bufs),
+        )
+        .unwrap_or(Err(DevError::BadState))
     }
 
     /// Direct physical read that publishes under the finite device lock and
@@ -3496,8 +3922,21 @@ impl BlockDriverOps for SharedBlockDevice {
     }
 
     fn flush(&mut self) -> DevResult {
-        if let Some(result) = self.try_legacy_io(crate::block_statistics::Operation::Flush, Some(0), BlockDriverOps::flush) {
-            return result;
+        let can_block = axtask::can_block_current();
+        let caps = if can_block {
+            self.queue_caps_snapshot()
+        } else {
+            None
+        };
+        let prefer_async = prefer_task_async_queue(can_block, caps);
+        if !prefer_async {
+            if let Some(result) = self.try_legacy_io(
+                crate::block_statistics::Operation::Flush,
+                Some(0),
+                BlockDriverOps::flush,
+            ) {
+                return result;
+            }
         }
         let segments: [BlockSegment; 0] = [];
         let mut request = BlockQueueRequest {
@@ -3517,13 +3956,21 @@ impl BlockDriverOps for SharedBlockDevice {
             let handle = request.handle.ok_or(DevError::BadState)?;
             return self.wait_async_all_owned(core::slice::from_ref(&handle));
         }
-        self.try_legacy_io(crate::block_statistics::Operation::Flush, Some(0), BlockDriverOps::flush)
-            .unwrap_or(Err(DevError::BadState))
+        self.try_legacy_io(
+            crate::block_statistics::Operation::Flush,
+            Some(0),
+            BlockDriverOps::flush,
+        )
+        .unwrap_or(Err(DevError::BadState))
     }
 
     fn write_block_fua(&mut self, block_id: u64, buf: &[u8]) -> DevResult {
-        self.try_legacy_io(crate::block_statistics::Operation::Write, Some(buf.len() as u64), |device| BlockDriverOps::write_block_fua(device, block_id, buf))
-            .unwrap_or(Err(DevError::Unsupported))
+        self.try_legacy_io(
+            crate::block_statistics::Operation::Write,
+            Some(buf.len() as u64),
+            |device| BlockDriverOps::write_block_fua(device, block_id, buf),
+        )
+        .unwrap_or(Err(DevError::Unsupported))
     }
 
     fn fence(&mut self) -> DevResult {
@@ -3533,24 +3980,29 @@ impl BlockDriverOps for SharedBlockDevice {
     fn discard_blocks(&mut self, range: BlockRange) -> DevResult {
         self.try_legacy_sync(|device| {
             let bytes = range.blocks.checked_mul(device.block_size() as u64);
-            self.inner.statistics.legacy(crate::block_statistics::Operation::Discard, bytes,
-                || BlockDriverOps::discard_blocks(device, range))
-        }).unwrap_or(Err(DevError::Unsupported))
+            self.inner
+                .statistics
+                .legacy(crate::block_statistics::Operation::Discard, bytes, || {
+                    BlockDriverOps::discard_blocks(device, range)
+                })
+        })
+        .unwrap_or(Err(DevError::Unsupported))
     }
 
     fn write_zeroes(&mut self, range: BlockRange) -> DevResult {
         self.try_legacy_sync(|device| {
             let bytes = range.blocks.checked_mul(device.block_size() as u64);
-            self.inner.statistics.legacy(crate::block_statistics::Operation::Write, bytes,
-                || BlockDriverOps::write_zeroes(device, range))
-        }).unwrap_or(Err(DevError::Unsupported))
+            self.inner
+                .statistics
+                .legacy(crate::block_statistics::Operation::Write, bytes, || {
+                    BlockDriverOps::write_zeroes(device, range)
+                })
+        })
+        .unwrap_or(Err(DevError::Unsupported))
     }
 
     fn async_queue_caps(&self) -> Option<BlockQueueCaps> {
-        if self.completion_unavailable() {
-            return None;
-        }
-        self.lock_raw().async_queue_caps()
+        self.queue_caps_snapshot()
     }
 
     fn submit_async_batch(
@@ -4405,6 +4857,39 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn owned_request_chunks_respect_transfer_and_block_limits() {
+        assert_eq!(
+            owned_request_chunk_limit(8192, 512, Some(1536), false).unwrap(),
+            1536
+        );
+        assert_eq!(
+            owned_request_chunk_limit(8192, 512, Some(1500), false).unwrap(),
+            1024
+        );
+        assert_eq!(
+            owned_request_chunk_limit(8192, 512, None, true).unwrap(),
+            UNBOUNDED_BOUNCE_CHUNK_BYTES
+        );
+        assert_eq!(next_owned_request_chunk(4096, 1536, 512).unwrap(), 1536);
+        assert_eq!(next_owned_request_chunk(1024, 1536, 512).unwrap(), 1024);
+        assert!(matches!(
+            owned_request_chunk_limit(4096, 512, Some(511), false),
+            Err(DevError::InvalidParam)
+        ));
+    }
+
+    #[test]
+    fn blocking_task_prefers_advertised_async_queue() {
+        let caps = BlockQueueCaps {
+            max_requests: 1,
+            ..BlockQueueCaps::default()
+        };
+        assert!(prefer_task_async_queue(true, Some(caps)));
+        assert!(!prefer_task_async_queue(false, Some(caps)));
+        assert!(!prefer_task_async_queue(true, None));
+    }
+
     fn patterned_device(bytes: usize) -> (SharedBlockDevice, Vec<u8>) {
         let contents = (0..bytes)
             .map(|index| (index % 251) as u8)
@@ -4414,22 +4899,33 @@ mod tests {
         // driver *is* `RamDisk`, so it wraps straight into `Existing`.  This
         // module had drifted out of compilation, so the change that introduced
         // the enum never had to update it.
-        let device =
-            SharedBlockDevice::new(crate::structs::StaticBlockDevice::Existing(RamDisk::from(
-                contents.as_slice(),
-            )));
+        let device = SharedBlockDevice::new(crate::structs::StaticBlockDevice::Existing(
+            RamDisk::from(contents.as_slice()),
+        ));
         (device, contents)
     }
 
     #[test]
     fn statistics_never_fetch_geometry_before_quarantined_io_admission() {
         let (device, _) = patterned_device(4096);
-        device.inner.completion_quarantined.store(true, Ordering::Release);
+        device
+            .inner
+            .completion_quarantined
+            .store(true, Ordering::Release);
         let _lower_held = device.inner.device.lock();
         let mut caller = device.clone();
-        let range = BlockRange { start: 0, blocks: 1 };
-        assert!(matches!(caller.discard_blocks(range), Err(DevError::BadState)));
-        assert!(matches!(caller.write_zeroes(range), Err(DevError::BadState)));
+        let range = BlockRange {
+            start: 0,
+            blocks: 1,
+        };
+        assert!(matches!(
+            caller.discard_blocks(range),
+            Err(DevError::BadState)
+        ));
+        assert!(matches!(
+            caller.write_zeroes(range),
+            Err(DevError::BadState)
+        ));
         assert!(caller.statistics().is_none());
     }
 

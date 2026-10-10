@@ -16,8 +16,22 @@ pub trait Bus: Send + Sync {
     fn interrupt_enabled(&self) -> bool {
         false
     }
+    /// Whether this task context can rely on acknowledged IRQ events.
+    /// Bootstrap owners with interrupts masked may explicitly inspect CQ;
+    /// this is distinct from the route/IEN negotiated for the controller.
+    fn requires_interrupt_event(&self) -> bool {
+        self.interrupt_enabled()
+    }
     fn interrupt_generation(&self) -> u64 {
         0
+    }
+    fn install_completion_notifier(
+        &mut self,
+        notifier: Option<axdriver_block::BlockCompletionNotifier>,
+        context: usize,
+    ) -> axdriver_block::DevResult {
+        let _ = (notifier, context);
+        Err(axdriver_block::DevError::Unsupported)
     }
     fn now_us(&self) -> Option<u64> {
         None

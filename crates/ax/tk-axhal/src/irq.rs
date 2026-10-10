@@ -15,6 +15,9 @@ pub use axplat::irq::IpiTarget;
 use axplat::irq::handle;
 use percpu::def_percpu;
 
+/// Dynamic, handle-based registration for device IRQs.
+pub mod dynamic;
+
 /// Install one immutable shared-source dispatcher before direct IRQ handlers.
 /// Reinstalling the same function is idempotent. The callback runs in IRQ
 /// context and must perform only bounded, non-blocking work.
@@ -270,6 +273,10 @@ static IPI_REASON_MAILBOXES: [IpiReasonMailbox; axconfig::plat::MAX_CPU_NUM] =
 
 #[def_percpu]
 static IRQ_DEPTH: usize = 0;
+#[def_percpu]
+static CURRENT_IRQ_VECTOR: usize = usize::MAX;
+#[def_percpu]
+static CURRENT_IRQ_ORIGIN: usize = 0;
 
 /// Enables or disables a device interrupt line.
 ///
@@ -288,9 +295,14 @@ pub fn set_enable(irq: usize, enabled: bool) {
 /// [`register_ipi_reason`].
 #[must_use]
 pub fn register(irq: usize, handler: axplat::irq::IrqHandler) -> bool {
-    if !ensure_irq_boundary_hook() { return false; }
+    if !ensure_irq_boundary_hook() {
+        return false;
+    }
     #[cfg(feature = "ipi")]
     if irq == IPI_IRQ {
+        return false;
+    }
+    if dynamic::owns(irq) {
         return false;
     }
     if irq >= IRQ_CONTEXT.len() || IRQ_CONTEXT[irq].load(Ordering::Acquire) == 0 {
@@ -309,6 +321,19 @@ pub fn unregister(irq: usize) -> Option<axplat::irq::IrqHandler> {
     if irq == IPI_IRQ {
         return None;
     }
+    if dynamic::owns(irq) {
+        return None;
+    }
+    unregister_platform(irq)
+}
+
+/// Removes the platform callback for a dynamic action after its owner has
+/// masked the device source and synchronized both framework and trap activity.
+fn unregister_dynamic(irq: usize) -> Option<axplat::irq::IrqHandler> {
+    unregister_platform(irq)
+}
+
+fn unregister_platform(irq: usize) -> Option<axplat::irq::IrqHandler> {
     if irq < IRQ_CONTEXT.len() && IRQ_CONTEXT[irq].load(Ordering::Acquire) != 0 {
         None
     } else {
@@ -351,6 +376,9 @@ pub fn register_with_context(
         return false;
     }
     if vector >= IRQ_CONTEXT.len() || observer as usize == CONTEXT_INSTALLING {
+        return false;
+    }
+    if dynamic::owns(vector) {
         return false;
     }
     let slot = &IRQ_CONTEXT[vector];
@@ -599,9 +627,20 @@ fn irq_context(boundary: IrqBoundary, vector: usize, frame: &TrapFrame) {
     let active = &IRQ_ACTIVE[vector & 0xff];
     if boundary != IrqBoundary::Enter {
         assert!(active.fetch_sub(1, Ordering::Release) != 0);
+        // Device IRQs use an interrupt gate, so their platform callback runs
+        // before this matching exit hook. A nested IRQ has its own saved frame
+        // but cannot run while the local interrupt flag is clear.
+        // SAFETY: the trap boundary executes on the owning CPU before its IRQ
+        // nesting count is decremented and local interrupts remain masked.
+        unsafe { *CURRENT_IRQ_ORIGIN.current_ref_mut_raw() = 0 };
         return;
     }
     active.fetch_add(1, Ordering::Acquire);
+    // The selector RPL records whether this hardware IRQ interrupted user
+    // mode. The dynamic framework consumes it from the platform callback.
+    // SAFETY: the trap boundary executes on the owning CPU before enabling
+    // interrupts or returning to the interrupted context.
+    unsafe { *CURRENT_IRQ_ORIGIN.current_ref_mut_raw() = usize::from(frame.cs & 3 != 0) };
     let address = IRQ_CONTEXT[vector & 0xff].load(Ordering::Acquire);
     if address != 0 && address != CONTEXT_INSTALLING {
         // SAFETY: registration publishes an immutable function pointer.
@@ -685,7 +724,24 @@ pub fn irq_handler(vector: usize) -> bool {
     let guard = kernel_guard::NoPreempt::new();
     statistics::record_irq(crate::percpu::this_cpu_id(), vector);
 
-    if let Some(irq) = handle(vector) {
+    // Platform callbacks have a no-argument ABI. Publish this CPU's active
+    // vector around the synchronous platform dispatch so the dynamic bridge
+    // can select the matching registry descriptor without global state.
+    // SAFETY: the trap handler runs on the current CPU, and this per-CPU slot
+    // is restored before returning from the synchronous platform dispatch.
+    let current_vector = unsafe { CURRENT_IRQ_VECTOR.current_ref_mut_raw() as *mut usize };
+    // SAFETY: IRQ entry pins the CPU and masks local interrupts. Use a raw
+    // slot rather than retaining an exclusive reference across callbacks:
+    // the dynamic trampoline reads this same per-CPU value during dispatch.
+    let handled_irq = unsafe {
+        let previous_vector = current_vector.read();
+        current_vector.write(vector);
+        let handled_irq = handle(vector);
+        current_vector.write(previous_vector);
+        handled_irq
+    };
+
+    if let Some(irq) = handled_irq {
         let hook = IRQ_HOOK.load(Ordering::SeqCst);
         if hook != 0 {
             let hook = unsafe { core::mem::transmute::<usize, fn(usize)>(hook) };
@@ -866,7 +922,10 @@ mod tests {
         // thing.  Pick the lowest genuinely unassigned bit instead, and when
         // the mask is saturated assert that saturation explicitly so this
         // test resumes probing the moment a lane is retired.
-        match (0..u8::BITS).map(|bit| 1u8 << bit).find(|bit| all & bit == 0) {
+        match (0..u8::BITS)
+            .map(|bit| 1u8 << bit)
+            .find(|bit| all & bit == 0)
+        {
             Some(unknown) => {
                 assert_eq!(super::visit_pending_reasons(unknown, |_| {}), Err(unknown));
             }
@@ -1075,8 +1134,14 @@ fn clear_context_on_unpublished_msi(vector: usize, observer: fn(usize, &TrapFram
 /// masking by the caller; this does not disable the device or wait task work.
 pub fn synchronize_hardirq(vector: usize) {
     assert!(vector < IRQ_ACTIVE.len());
-    assert!(!in_irq_context(), "cannot synchronize a hard IRQ from its handler");
-    assert!(ensure_irq_boundary_hook(), "IRQ boundary ownership is unavailable");
+    assert!(
+        !in_irq_context(),
+        "cannot synchronize a hard IRQ from its handler"
+    );
+    assert!(
+        ensure_irq_boundary_hook(),
+        "IRQ boundary ownership is unavailable"
+    );
     while IRQ_ACTIVE[vector].load(Ordering::Acquire) != 0 {
         core::hint::spin_loop();
     }

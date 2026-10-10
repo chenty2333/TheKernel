@@ -20,10 +20,11 @@ update, write-zeroes, or security commands are implemented.
 
 `tk-axdriver-nvme` owns controller registers, descriptors, DMA, reset, admin
 queue, Identify controller/active namespace list/namespace, Number of Queues,
-Create CQ/SQ, NVM read/write and Flush. 4-KiB coherent identity DMA is the
-current x86 platform contract; no IOMMU mapping is claimed. Queue depth 32,
-up to two negotiated I/O queues, synchronous round-robin operations, 128-KiB
-bounce buffer capped by controller MDTS, PRP1/PRP2 or one PRP-list page. Whole
+Create CQ/SQ, NVM read/write and Flush. The x86 adapter binds each allocation
+to its PCI requester through the existing VT-d DMA contract. Queue depth 32,
+up to two negotiated I/O queues, at most 31 owned requests per queue, and a
+per-request bounce buffer capped by controller MDTS and 128 KiB. PRP1/PRP2 or
+one PRP-list page describe that buffer. Whole
 512–4096-byte LBAs only; metadata/protection formats are rejected. Only the
 first active namespace of one controller is exposed, with a stable n1 name.
 Identify uses the full six-bit FLBAS format index and validates it against
@@ -32,17 +33,38 @@ overflow as well as shift count; large limits retain the bounded bounce-buffer
 limit rather than wrapping to zero. A namespace must fit at least one LBA
 within the effective transfer limit.
 
-CC reset waits for CSTS.RDY to clear, CAP.TO bounds enable/reset, I/O polling
-is bounded to five seconds. Timeout/protocol identity failure poisons further
+CC reset waits for CSTS.RDY to clear, CAP.TO bounds enable/reset, and I/O
+completion waits are bounded to five seconds. Timeout/protocol identity failure poisons further
 commands. Owned DMA survives until reset proves RDY=0; an unresponsive device
 quarantines allocations rather than letting a late DMA corrupt reused memory.
 No retry that could duplicate an uncertain write is performed.
 
-MSI-X is preferred when a validated capability/table and permanently owned
-vector are available; task-context CQ ownership is preserved and bounded
-polling remains armed. Early boot and missing IRQ delivery fall back safely.
-`nvme.poll=1` selects diagnostic polling explicitly. The ownership/table/
-wakeup contract and measured transport tests are in `nvme-msix.md`.
+MSI-X uses an owned dynamic IRQ registration when a validated capability/table
+and requester-bound vector are available. The callback only publishes the
+device's generation and bounded wake notification; it never touches CQ or DMA
+owners. Serviceable task context drains CQ only after an IRQ generation changes;
+bootstrap ownership with interrupts masked explicitly inspects CQ. A lost
+interrupt reaches the deadline and fails closed rather than silently polling
+an IRQ-owned queue. Route-less devices and `nvme.poll=1` explicitly use bounded
+polling. Teardown masks and reads back the MSI-X entry before synchronizing and
+freeing its IRQ action and interrupt-remapping owner.
+
+## Owned batches
+
+The queue state follows TGOSKits `nvme-driver`'s stage/commit/drain model, adapted
+to the existing `BlockDriverOps` and `SharedBlockDevice` task-side runtime.
+All fallible prefix preparation occurs before publication. Each accepted CID
+owns its data and PRP allocations, and a monotonic handle prevents stale callers
+from consuming a reused CID. Writes are copied before acceptance; read segment
+leases remain with their handle until the task copies a successful result.
+One doorbell commits each hardware queue's batch. Failed or malformed completions
+never copy read data; unproven reset quarantines DMA backing.
+
+A flush is admitted only after earlier hardware work has finished and prevents
+later data admission until its terminal completion. Exact waits retain unrelated
+completion owners; bounded drains return concrete handle/status records to the
+existing shared runtime. Unsupported physical zero-copy paths remain unsupported:
+this change does not invent a second raw-DMA ownership model.
 
 The static block wrapper already had BootModule/Existing/USB variants. NVMe
 adds a peer variant and independent feature-gated probe; it deliberately does
