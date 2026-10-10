@@ -176,7 +176,6 @@ unsafe extern "C" {
     fn flush_work(work: *mut c_void);
     fn flush_workqueue(wq: *mut c_void);
     fn drain_workqueue(wq: *mut c_void);
-    static jiffies: c_ulong;
 }
 
 // Inline helpers from i915_gem_object_frontbuffer.h. rcu_access_pointer()
@@ -1321,7 +1320,7 @@ pub unsafe fn i915_gem_open(i915: *mut DrmI915Private, file: *mut c_void) -> c_i
     (*file_priv).file_or_rcu.file = file;
     (*file_priv).client = client;
     (*file_priv).bsd_engine = u32::MAX;
-    (*file_priv).hang_timestamp = jiffies;
+    (*file_priv).hang_timestamp = crate::linux::primitives::jiffies() as c_ulong;
     let ret = i915_gem_context_open(i915, file);
     if ret != 0 {
         i915_drm_client_put(client);

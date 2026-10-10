@@ -41,8 +41,6 @@ use crate::{
 };
 
 unsafe extern "C" {
-    /// Linux `jiffies`: the tick counter read by the wakeref auto timer.
-    static jiffies: core::ffi::c_ulong;
 }
 
 /// `GFP_NOWAIT` (Linux 7.2.3).
@@ -307,7 +305,7 @@ pub unsafe extern "C" fn intel_wakeref_auto(wf: *mut IntelWakerefAuto, timeout: 
 
     // If we extend a pending timer we get a single timer callback, so cancel the
     // local inc by running the elided callback to keep wf->count balanced.
-    let expires = unsafe { jiffies } + timeout;
+    let expires = crate::linux::primitives::jiffies() as core::ffi::c_ulong + timeout;
     if unsafe { mod_timer(ptr::addr_of_mut!((*wf).timer), expires) } {
         unsafe { wakeref_auto_timeout(ptr::addr_of_mut!((*wf).timer)) };
     }
