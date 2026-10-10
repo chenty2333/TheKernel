@@ -106,7 +106,8 @@ unsafe extern "C" {
 
 /// `intel_uc_wait_for_idle()`.
 #[inline]
-pub unsafe fn intel_uc_wait_for_idle(uc: *mut IntelUc, timeout: c_long) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_uc_wait_for_idle(uc: *mut IntelUc, timeout: c_long) -> i32 {
     assert!(!uc.is_null());
     // SAFETY: caller passes a live uC object and the imported GuC routine owns
     // waiting/timeout behavior.
@@ -117,7 +118,8 @@ pub unsafe fn intel_uc_wait_for_idle(uc: *mut IntelUc, timeout: c_long) -> i32 {
 macro_rules! dispatch_int_op {
     ($name:ident, $field:ident) => {
         #[inline]
-        pub unsafe fn $name(uc: *mut IntelUc) -> i32 {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name(uc: *mut IntelUc) -> i32 {
             assert!(!uc.is_null());
             // SAFETY: mirrors `uc->ops->_field` and callback invocation.
             unsafe {
@@ -134,7 +136,8 @@ macro_rules! dispatch_int_op {
 macro_rules! dispatch_void_op {
     ($name:ident, $field:ident) => {
         #[inline]
-        pub unsafe fn $name(uc: *mut IntelUc) {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name(uc: *mut IntelUc) {
             assert!(!uc.is_null());
             // SAFETY: mirrors `uc->ops->_field` and callback invocation.
             unsafe {

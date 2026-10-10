@@ -543,7 +543,8 @@ pub unsafe fn intel_engine_has_timeslices(engine: *const IntelEngineCs) -> bool 
 }
 
 #[inline]
-pub unsafe fn intel_engine_is_virtual(engine: *const IntelEngineCs) -> bool {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_is_virtual(engine: *const IntelEngineCs) -> bool {
     (*engine).flags & I915_ENGINE_IS_VIRTUAL != 0
 }
 

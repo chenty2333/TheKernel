@@ -331,7 +331,7 @@ unsafe extern "C" {
     fn intel_pxp_start(pxp: *mut c_void) -> c_int;
     fn intel_context_reconfigure_sseu(ce: *mut IntelContext, sseu: *const IntelSseu) -> c_int;
     fn intel_engine_pulse(engine: *mut IntelEngineCs) -> c_int;
-    fn i915_request_get_rcu(rq: *mut I915Request) -> bool;
+    fn i915_request_get_rcu(rq: *mut I915Request) -> *mut I915Request;
     fn i915_request_put(rq: *mut I915Request);
     fn i915_request_active_engine(rq: *mut I915Request, engine: *mut *mut IntelEngineCs) -> bool;
     fn i915_gem_object_get(obj: *mut DrmI915GemObject);
@@ -1841,7 +1841,7 @@ unsafe fn active_engine(ce: *mut IntelContext) -> *mut IntelEngineCs {
     let mut rq = ptr::null_mut::<I915Request>();
     crate::linux::rcu::rcu_read_lock();
     list_for_each_entry_reverse!(rq, unsafe { ptr::addr_of_mut!((*(*ce).timeline).requests) }, link, {
-        if !unsafe { i915_request_get_rcu(rq) } {
+        if unsafe { i915_request_get_rcu(rq) }.is_null() {
             break;
         }
         let mut found = true;

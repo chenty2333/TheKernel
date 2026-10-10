@@ -461,7 +461,8 @@ unsafe fn insert_breadcrumb(rq: *mut I915Request) {
 }
 
 // upstream: intel_breadcrumbs.c i915_request_enable_breadcrumb()
-unsafe fn i915_request_enable_breadcrumb(rq: *mut I915Request) -> bool {
+#[unsafe(no_mangle)]
+unsafe extern "C" fn i915_request_enable_breadcrumb(rq: *mut I915Request) -> bool {
     let ce = (*rq).context;
 
     // Serialises with i915_request_retire() using rq->lock
@@ -487,7 +488,8 @@ unsafe fn i915_request_enable_breadcrumb(rq: *mut I915Request) -> bool {
 }
 
 // upstream: intel_breadcrumbs.c i915_request_cancel_breadcrumb()
-unsafe fn i915_request_cancel_breadcrumb(rq: *mut I915Request) {
+#[unsafe(no_mangle)]
+unsafe extern "C" fn i915_request_cancel_breadcrumb(rq: *mut I915Request) {
     let b = READ_ONCE!((*(*rq).engine).breadcrumbs);
     let ce = (*rq).context;
     let release: bool;

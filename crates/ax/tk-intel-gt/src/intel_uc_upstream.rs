@@ -137,8 +137,10 @@ unsafe fn firmware_status_to_error(status: i32) -> i32 {
     }
 }
 
+// upstream: gt/uc/intel_guc_ct.h intel_guc_ct_enabled()
 #[inline]
-unsafe fn intel_guc_ct_enabled(ct: *const IntelGucCt) -> bool {
+#[unsafe(no_mangle)]
+unsafe extern "C" fn intel_guc_ct_enabled(ct: *const IntelGucCt) -> bool {
     unsafe { (*ct).enabled }
 }
 #[inline]

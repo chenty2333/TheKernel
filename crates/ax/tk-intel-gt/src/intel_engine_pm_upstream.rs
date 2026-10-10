@@ -209,7 +209,8 @@ pub unsafe fn intel_engine_init__pm(engine: *mut IntelEngineCs) {
     intel_gsc_idle_msg_enable(engine);
 }
 // upstream: intel_engine_pm.c intel_engine_reset_pinned_contexts()
-pub unsafe fn intel_engine_reset_pinned_contexts(engine: *mut IntelEngineCs) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_engine_reset_pinned_contexts(engine: *mut IntelEngineCs) {
     let head =
         &mut (*engine).pinned_contexts_list as *mut crate::intel_engine_cs_upstream::ListHead;
     let mut node = (*head).next;

@@ -88,7 +88,7 @@ unsafe extern "C" {
     fn intel_engine_flush_barriers(engine: *mut IntelEngineCs) -> c_int;
     fn intel_engine_pm_get(engine: *mut IntelEngineCs);
     fn intel_engine_pm_put(engine: *mut IntelEngineCs);
-    fn intel_engine_pm_put_delay(engine: *mut IntelEngineCs, delay: u32);
+    fn intel_engine_pm_put_delay(engine: *mut IntelEngineCs, delay: u64);
     fn intel_engine_pm_is_awake(engine: *mut IntelEngineCs) -> bool;
     fn intel_engine_is_virtual(engine: *mut IntelEngineCs) -> bool;
     fn intel_context_is_barrier(
@@ -537,7 +537,8 @@ unsafe fn active_instance(ref_: *mut I915Active, idx: u64) -> *mut I915ActiveFen
     }
 }
 // upstream: i915_active.c __i915_active_init()
-pub unsafe fn __i915_active_init(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __i915_active_init(
     ref_: *mut I915Active,
     active: Option<unsafe extern "C" fn(*mut I915Active) -> i32>,
     retire: Option<unsafe extern "C" fn(*mut I915Active)>,
@@ -763,7 +764,8 @@ unsafe fn flush_lazy_signals(ref_: *mut I915Active) -> c_int {
     }
 }
 // upstream: i915_active.c __i915_active_wait()
-pub unsafe fn __i915_active_wait(ref_: *mut I915Active, state: c_int) -> c_int {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __i915_active_wait(ref_: *mut I915Active, state: c_int) -> c_int {
     unsafe {
         if i915_active_acquire_if_busy(ref_) {
             let err = flush_lazy_signals(ref_);
@@ -911,7 +913,8 @@ pub unsafe fn i915_sw_fence_await_active(
     unsafe { await_active(ref_, flags, sw_await_fence, fence.cast(), fence) }
 }
 // upstream: i915_active.c i915_active_fini()
-pub unsafe fn i915_active_fini(ref_: *mut I915Active) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_active_fini(ref_: *mut I915Active) {
     unsafe {
         debug_active_fini(ref_);
         assert_eq!(atomic_read(&(*ref_).count), 0);
