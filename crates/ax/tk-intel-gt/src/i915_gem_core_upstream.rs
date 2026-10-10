@@ -357,7 +357,8 @@ pub unsafe fn i915_gem_get_aperture_ioctl(
 }
 
 // upstream: i915_gem.c i915_gem_object_unbind()
-pub unsafe fn i915_gem_object_unbind(obj: *mut DrmI915GemObject, flags: c_ulong) -> c_int {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_object_unbind(obj: *mut DrmI915GemObject, flags: c_ulong) -> c_int {
     let i915 = to_i915((*gem_base(obj)).dev);
     let rpm = core::ptr::addr_of_mut!((*i915).runtime_pm);
     let vm_trylock = flags & I915_GEM_OBJECT_UNBIND_VM_TRYLOCK != 0;

@@ -126,7 +126,8 @@ fn roundup(value: u32, divisor: u32) -> u32 {
 /// Return the required global GTT size for a fence (view of a tiled object),
 /// taking into account potential fence register mapping.
 // upstream: i915_gem_tiling.c i915_gem_fence_size()
-pub unsafe fn i915_gem_fence_size(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_fence_size(
     i915: *mut DrmI915Private,
     size: u32,
     tiling: u32,
@@ -171,7 +172,8 @@ pub unsafe fn i915_gem_fence_size(
 /// Return the required global GTT alignment for a fence (a view of a tiled
 /// object), taking into account potential fence register mapping.
 // upstream: i915_gem_tiling.c i915_gem_fence_alignment()
-pub unsafe fn i915_gem_fence_alignment(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_fence_alignment(
     i915: *mut DrmI915Private,
     size: u32,
     tiling: u32,

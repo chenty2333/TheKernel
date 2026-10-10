@@ -628,7 +628,8 @@ pub unsafe fn i915_gem_object_release_mmap_gtt(obj: *mut DrmI915GemObject) {
 }
 
 // upstream: i915_gem_mman.c i915_gem_object_runtime_pm_release_mmap_offset()
-pub unsafe fn i915_gem_object_runtime_pm_release_mmap_offset(obj: *mut DrmI915GemObject) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_object_runtime_pm_release_mmap_offset(obj: *mut DrmI915GemObject) {
     // MISSING TTM LAYOUT BINDING: `i915_gem_to_ttm()` needs the source-derived
     // TtmBufferObject/DrmGemObject prefix and device mapping owner.
     let bo = i915_gem_to_ttm(obj);
@@ -640,7 +641,8 @@ pub unsafe fn i915_gem_object_runtime_pm_release_mmap_offset(obj: *mut DrmI915Ge
 }
 
 // upstream: i915_gem_mman.c i915_gem_object_release_mmap_offset()
-pub unsafe fn i915_gem_object_release_mmap_offset(obj: *mut DrmI915GemObject) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_object_release_mmap_offset(obj: *mut DrmI915GemObject) {
     if let Some(unmap_virtual) = (*(*obj).ops).unmap_virtual { unmap_virtual(obj); }
     spin_lock(&mut (*obj).mmo.lock);
     // Linux's `rbtree_postorder_for_each_entry_safe()` computes the next node

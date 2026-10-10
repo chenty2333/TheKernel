@@ -652,7 +652,8 @@ unsafe extern "C" fn shmem_shrink(obj: *mut DrmI915GemObject, flags: u32) -> c_i
 }
 
 // upstream: i915_gem_shmem.c __i915_gem_object_release_shmem()
-pub unsafe fn __i915_gem_object_release_shmem(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __i915_gem_object_release_shmem(
     obj: *mut DrmI915GemObject,
     pages: *mut SgTable,
     needs_clflush: bool,

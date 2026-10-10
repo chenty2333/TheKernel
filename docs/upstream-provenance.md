@@ -2109,3 +2109,13 @@ whole-scope crates/ax totals are threshold >=40 `(0,0,0,763,589,0,0)` and
 threshold >=25 `(18,15,4,1988,1808,0,0)` in the test's seven-column order.
 The corresponding tk-intel-gt NOTICE and CI scan baseline were reconciled in
 the same change; MIT i915 text remains counted rather than exempted.
+Wire stage 1 (M): `i915_memcpy.c` (MIT, Copyright 2016 Intel Corporation) is
+translated in `i915_memcpy_upstream.rs`, with the movntdqa key left disabled
+because TheKernel has no kernel-FPU guard. `i915_vgpu.c` (MIT) is translated in
+`i915_vgpu_upstream.rs`; the GVT-g guest balloon path fails closed. The
+`i915_gem_gtt.c` reserve/insert functions are added to `i915_gem_gtt_upstream.rs`,
+the `intel_memory_region.c` lookup/avail functions to
+`intel_memory_region_upstream.rs`, and `i915_utils.c` `i915_direct_stolen_access()`
+to `i915_utils_upstream.rs`. `intel_clock_gating.c` (MIT, Copyright 2021 Intel
+Corporation) contributes the Gen12 hook dispatch and nop body in
+`intel_clock_gating_upstream.rs`.

@@ -445,7 +445,8 @@ unsafe fn fence_update(fence: *mut I915FenceReg, vma: *mut I915Vma) -> i32 {
 
 /// `i915_vma_revoke_fence()` (`intel_ggtt_fencing.c:294`).
 // upstream: intel_ggtt_fencing.c i915_vma_revoke_fence()
-pub unsafe fn i915_vma_revoke_fence(vma: *mut I915Vma) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_vma_revoke_fence(vma: *mut I915Vma) {
     let fence = unsafe { (*vma).fence };
     if fence.is_null() {
         return;
@@ -524,7 +525,8 @@ unsafe fn fence_find(ggtt: *mut I915Ggtt) -> *mut I915FenceReg {
 
 /// `__i915_vma_pin_fence()` (`intel_ggtt_fencing.c:366`).
 // upstream: intel_ggtt_fencing.c __i915_vma_pin_fence()
-pub unsafe fn __i915_vma_pin_fence(vma: *mut I915Vma) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __i915_vma_pin_fence(vma: *mut I915Vma) -> i32 {
     let ggtt = unsafe { i915_vm_to_ggtt((*vma).vm) };
     let mut fence: *mut I915FenceReg;
     let set = if unsafe { crate::linux::fields::i915_gem_object_is_tiled((*vma).obj) } {
@@ -582,7 +584,8 @@ pub unsafe fn __i915_vma_pin_fence(vma: *mut I915Vma) -> i32 {
 
 /// `i915_vma_pin_fence()` (`intel_ggtt_fencing.c:427`).
 // upstream: intel_ggtt_fencing.c i915_vma_pin_fence()
-pub unsafe fn i915_vma_pin_fence(vma: *mut I915Vma) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_vma_pin_fence(vma: *mut I915Vma) -> i32 {
     if unsafe {
         (*vma).fence.is_null() && !crate::linux::fields::i915_gem_object_is_tiled((*vma).obj)
     } {
@@ -603,7 +606,8 @@ pub unsafe fn i915_vma_pin_fence(vma: *mut I915Vma) -> i32 {
 
 /// `i915_reserve_fence()` (`intel_ggtt_fencing.c:458`).
 // upstream: intel_ggtt_fencing.c i915_reserve_fence()
-pub unsafe fn i915_reserve_fence(ggtt: *mut I915Ggtt) -> *mut I915FenceReg {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_reserve_fence(ggtt: *mut I915Ggtt) -> *mut I915FenceReg {
     let mut count = 0;
     let mut fence: *mut I915FenceReg = ptr::null_mut();
     lockdep_assert_held!(unsafe { &(*ggtt).vm.mutex });
@@ -633,7 +637,8 @@ pub unsafe fn i915_reserve_fence(ggtt: *mut I915Ggtt) -> *mut I915FenceReg {
 
 /// `i915_unreserve_fence()` (`intel_ggtt_fencing.c:495`).
 // upstream: intel_ggtt_fencing.c i915_unreserve_fence()
-pub unsafe fn i915_unreserve_fence(fence: *mut I915FenceReg) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_unreserve_fence(fence: *mut I915FenceReg) {
     let ggtt = unsafe { (*fence).ggtt };
     lockdep_assert_held!(unsafe { &(*ggtt).vm.mutex });
     unsafe { crate::linux_list::list_add(&mut (*fence).link, &mut (*ggtt).fence_list) };
@@ -641,7 +646,8 @@ pub unsafe fn i915_unreserve_fence(fence: *mut I915FenceReg) {
 
 /// `intel_ggtt_restore_fences()` (`intel_ggtt_fencing.c:512`).
 // upstream: intel_ggtt_fencing.c intel_ggtt_restore_fences()
-pub unsafe fn intel_ggtt_restore_fences(ggtt: *mut I915Ggtt) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_ggtt_restore_fences(ggtt: *mut I915Ggtt) {
     for i in 0..unsafe { (*ggtt).num_fences } {
         unsafe { fence_write((*ggtt).fence_regs.add(i as usize)) };
     }
@@ -770,7 +776,8 @@ unsafe fn swizzle_page(page: *mut Page) {
 
 /// `i915_gem_object_do_bit_17_swizzle()` (`intel_ggtt_fencing.c:773`).
 // upstream: intel_ggtt_fencing.c i915_gem_object_do_bit_17_swizzle()
-pub unsafe fn i915_gem_object_do_bit_17_swizzle(obj: *mut DrmI915GemObject, pages: *mut SgTable) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_object_do_bit_17_swizzle(obj: *mut DrmI915GemObject, pages: *mut SgTable) {
     let bitmap = unsafe { (*obj).bit_17 };
     if bitmap.is_null() {
         return;
@@ -794,7 +801,8 @@ pub unsafe fn i915_gem_object_do_bit_17_swizzle(obj: *mut DrmI915GemObject, page
 
 /// `i915_gem_object_save_bit_17_swizzle()` (`intel_ggtt_fencing.c:809`).
 // upstream: intel_ggtt_fencing.c i915_gem_object_save_bit_17_swizzle()
-pub unsafe fn i915_gem_object_save_bit_17_swizzle(obj: *mut DrmI915GemObject, pages: *mut SgTable) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i915_gem_object_save_bit_17_swizzle(obj: *mut DrmI915GemObject, pages: *mut SgTable) {
     let gem_obj = unsafe { crate::i915_gem_object_types_upstream::intel_bo_to_drm_bo(obj) };
     let page_count = (unsafe { (*gem_obj).size } >> PAGE_SHIFT) as usize;
     let mut bitmap = unsafe { (*obj).bit_17 };
@@ -826,7 +834,8 @@ pub unsafe fn i915_gem_object_save_bit_17_swizzle(obj: *mut DrmI915GemObject, pa
 
 /// `intel_ggtt_init_fences()` (`intel_ggtt_fencing.c:842`).
 // upstream: intel_ggtt_fencing.c intel_ggtt_init_fences()
-pub unsafe fn intel_ggtt_init_fences(ggtt: *mut I915Ggtt) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_ggtt_init_fences(ggtt: *mut I915Ggtt) {
     let i915 = unsafe { (*ggtt).vm.i915 };
     let uncore = unsafe { (*(*ggtt).vm.gt).uncore };
     unsafe {
@@ -885,7 +894,8 @@ pub unsafe fn intel_ggtt_init_fences(ggtt: *mut I915Ggtt) {
 
 /// `intel_ggtt_fini_fences()` (`intel_ggtt_fencing.c:887`).
 // upstream: intel_ggtt_fencing.c intel_ggtt_fini_fences()
-pub unsafe fn intel_ggtt_fini_fences(ggtt: *mut I915Ggtt) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_ggtt_fini_fences(ggtt: *mut I915Ggtt) {
     for i in 0..unsafe { (*ggtt).num_fences } {
         let fence = unsafe { (*ggtt).fence_regs.add(i as usize) };
         unsafe { i915_active_fini(&mut (*fence).active) };
@@ -895,7 +905,8 @@ pub unsafe fn intel_ggtt_fini_fences(ggtt: *mut I915Ggtt) {
 
 /// `intel_gt_init_swizzling()` (`intel_ggtt_fencing.c:900`).
 // upstream: intel_ggtt_fencing.c intel_gt_init_swizzling()
-pub unsafe fn intel_gt_init_swizzling(gt: *mut IntelGt) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_gt_init_swizzling(gt: *mut IntelGt) {
     let i915 = unsafe { (*gt).i915 };
     let uncore = unsafe { (*gt).uncore };
     let ggtt = unsafe { (*gt).ggtt };

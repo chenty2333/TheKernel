@@ -358,7 +358,8 @@ pub unsafe fn intel_context_free(ce: *mut IntelContext) {
 }
 
 // upstream: intel_context.c intel_context_create()
-pub unsafe fn intel_context_create(engine: *mut IntelEngineCs) -> *mut IntelContext {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_context_create(engine: *mut IntelEngineCs) -> *mut IntelContext {
     let ce = intel_context_alloc();
     if ce.is_null() {
         return ERR_PTR(-ENOMEM);
