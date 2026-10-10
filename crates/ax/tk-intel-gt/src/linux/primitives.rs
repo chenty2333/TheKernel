@@ -8,7 +8,7 @@
 
 use core::{
     ffi::{c_char, c_long, c_ulong, c_void},
-    sync::atomic::{Ordering, fence},
+    sync::atomic::{AtomicI32, AtomicU64, Ordering, fence},
 };
 
 #[inline]
@@ -456,4 +456,72 @@ mod tests {
 #[inline]
 pub const fn time_after(a: c_ulong, b: c_ulong) -> bool {
     (b.wrapping_sub(a) as c_long) < 0
+}
+
+// ---------------------------------------------------------------------------
+// kref and the uniform random helper used by the GT scheduler.
+// ---------------------------------------------------------------------------
+
+/// Linux `kref_get()`: `refcount_inc()` on a live object.
+///
+/// # Safety
+/// `kref` must point to a live `struct kref`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kref_get(kref: *mut crate::intel_context_upstream::Kref) {
+    assert!(!kref.is_null());
+    let counter = unsafe { &*core::ptr::addr_of!((*kref).refcount.refs.counter).cast::<AtomicI32>() };
+    let previous = counter.fetch_add(1, Ordering::Relaxed);
+    assert!(previous > 0, "kref_get() on a released object");
+}
+
+/// Linux `kref_put()`: drops one reference and runs `release` when it was the
+/// last one. Returns true when `release` ran.
+///
+/// # Safety
+/// `kref` must point to a live `struct kref` owned by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kref_put(
+    kref: *mut crate::intel_context_upstream::Kref,
+    release: Option<unsafe extern "C" fn(*mut crate::intel_context_upstream::Kref)>,
+) -> bool {
+    assert!(!kref.is_null());
+    let counter = unsafe { &*core::ptr::addr_of!((*kref).refcount.refs.counter).cast::<AtomicI32>() };
+    let previous = counter.fetch_sub(1, Ordering::AcqRel);
+    assert!(previous > 0, "kref_put() on a released object");
+    if previous != 1 {
+        return false;
+    }
+    let release = release.expect("kref_put() reached zero without a release function");
+    unsafe { release(kref) };
+    true
+}
+
+static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
+
+/// Non-cryptographic 32-bit random value (xorshift64*, seeded from the TSC).
+fn random_u32() -> u32 {
+    let mut state = RANDOM_STATE.load(Ordering::Relaxed);
+    if state == 0 {
+        // SAFETY: RDTSC has no memory effects and is always available on x86_64.
+        state = unsafe { core::arch::x86_64::_rdtsc() } | 1;
+    }
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    RANDOM_STATE.store(state, Ordering::Relaxed);
+    (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+}
+
+/// Linux `get_random_u32_below()`: uniform in `[0, range)`, using the same
+/// multiply-and-reject construction as the kernel.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_random_u32_below(range: u32) -> u32 {
+    let mut mult = u64::from(range) * u64::from(random_u32());
+    if (mult as u32) < range {
+        let bound = range.wrapping_neg() % range;
+        while (mult as u32) < bound {
+            mult = u64::from(range) * u64::from(random_u32());
+        }
+    }
+    (mult >> 32) as u32
 }

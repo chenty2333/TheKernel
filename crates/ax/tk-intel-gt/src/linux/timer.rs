@@ -34,16 +34,6 @@ pub const CLOCK_MONOTONIC: i32 = 1;
 pub const NSEC_PER_USEC: u64 = 1_000;
 pub const NSEC_PER_MSEC: u64 = 1_000_000;
 
-unsafe extern "C" {
-    pub fn hrtimer_setup(
-        timer: *mut Hrtimer,
-        function: Option<unsafe extern "C" fn(*mut Hrtimer) -> i32>,
-        clock_id: i32,
-        mode: i32,
-    );
-    pub fn hrtimer_start_range_ns(timer: *mut Hrtimer, time: KtimeT, range_ns: u64, mode: i32);
-    pub fn hrtimer_try_to_cancel(timer: *mut Hrtimer) -> i32;
-}
 
 /// Linux `ns_to_ktime()` for the target's scalar `ktime_t` representation.
 #[inline]
@@ -475,4 +465,144 @@ fn timer_worker() {
                 .expect("timer worker could not register its deadline");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// High-resolution timers and jiffies rounding.
+//
+// An hrtimer is an embedded timer-list entry plus its callback and absolute
+// monotonic deadline. The timer-list worker dispatches it at the first jiffy
+// whose tick covers the deadline; the trampoline re-arms when the deadline has
+// not been reached yet, so the callback never runs early. Resolution is one
+// tick (CONFIG_HZ), which is coarser than Linux's hrtimer clock.
+// ---------------------------------------------------------------------------
+
+const HRTIMER_MODE_ABS_VALUE: i32 = 0;
+const NSEC_PER_JIFFY: u64 = 1_000_000_000 / crate::linux_config::CONFIG_HZ as u64;
+
+#[repr(C)]
+struct HrtimerImpl {
+    timer: TimerList,
+    function: Option<unsafe extern "C" fn(*mut Hrtimer) -> i32>,
+    expires_ns: i64,
+    _reserved: u64,
+}
+const _: () = assert!(core::mem::size_of::<HrtimerImpl>() <= core::mem::size_of::<Hrtimer>());
+const _: () = assert!(core::mem::align_of::<HrtimerImpl>() <= core::mem::align_of::<Hrtimer>());
+
+/// Arm the timer-list entry of `h` for its absolute deadline.
+unsafe fn arm_hrtimer(h: *mut HrtimerImpl) -> bool {
+    let expires_ns = unsafe { (*h).expires_ns };
+    let now_ns = axhal::time::monotonic_time_nanos() as i64;
+    let now_jiffies = crate::linux::primitives::jiffies();
+    let target = if expires_ns <= now_ns {
+        now_jiffies
+    } else {
+        let delta = (expires_ns - now_ns) as u64;
+        now_jiffies.wrapping_add(delta.div_ceil(NSEC_PER_JIFFY))
+    };
+    unsafe { mod_timer(h.cast::<TimerList>(), target as c_ulong) }
+}
+
+unsafe extern "C" fn hrtimer_timer_fn(timer: *mut TimerList) {
+    let h = timer.cast::<HrtimerImpl>();
+    let now_ns = axhal::time::monotonic_time_nanos() as i64;
+    if now_ns < unsafe { (*h).expires_ns } {
+        let _ = unsafe { arm_hrtimer(h) };
+        return;
+    }
+    if let Some(function) = unsafe { (*h).function } {
+        let _ = unsafe { function(h.cast::<Hrtimer>()) };
+    }
+}
+
+/// Linux `hrtimer_setup()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hrtimer_setup(
+    timer: *mut Hrtimer,
+    function: Option<unsafe extern "C" fn(*mut Hrtimer) -> i32>,
+    _clock_id: i32,
+    _mode: i32,
+) {
+    let h = timer.cast::<HrtimerImpl>();
+    unsafe {
+        (*h).function = function;
+        (*h).expires_ns = 0;
+        timer_setup(h.cast::<TimerList>(), hrtimer_timer_fn, 0);
+    }
+}
+
+/// Linux `hrtimer_start_range_ns()`. `range_ns` is accepted for the slack
+/// window; the timer fires at the earliest deadline, which is within it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hrtimer_start_range_ns(
+    timer: *mut Hrtimer,
+    time: KtimeT,
+    _range_ns: u64,
+    mode: i32,
+) {
+    let h = timer.cast::<HrtimerImpl>();
+    let now_ns = axhal::time::monotonic_time_nanos() as i64;
+    unsafe {
+        (*h).expires_ns = if mode == HRTIMER_MODE_ABS_VALUE {
+            time
+        } else {
+            now_ns.saturating_add(time)
+        };
+        let _ = arm_hrtimer(h);
+    }
+}
+
+/// Linux `hrtimer_try_to_cancel()`: 1 when a pending timer was cancelled, 0
+/// when it was not armed, -1 when its callback is running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hrtimer_try_to_cancel(timer: *mut Hrtimer) -> i32 {
+    let h = timer.cast::<TimerList>();
+    if unsafe { del_timer(h) } {
+        1
+    } else if TIMER_ACTIVE.load(Ordering::Acquire) == h {
+        -1
+    } else {
+        0
+    }
+}
+
+/// Linux `hrtimer_cancel()`: cancel and wait for a running callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hrtimer_cancel(timer: *mut Hrtimer) -> i32 {
+    unsafe { del_timer_sync(timer.cast::<TimerList>()) as i32 }
+}
+
+/// Linux `timer_shutdown_sync()`: synchronous deletion. Returns whether the
+/// timer was pending. Re-arming after shutdown is not rejected here.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn timer_shutdown_sync(timer: *mut TimerList) -> i32 {
+    unsafe { del_timer_sync(timer) as i32 }
+}
+
+/// Linux `round_jiffies_common()` for CPU 0 with `force_up` semantics: round
+/// `j` up to the next whole second when it is still in the future.
+fn round_jiffies_up_abs(j: u64) -> u64 {
+    let hz = crate::linux_config::CONFIG_HZ as u64;
+    let now = crate::linux::primitives::jiffies();
+    let rem = j % hz;
+    let rounded = j - rem + hz;
+    if (now.wrapping_sub(rounded) as i64) < 0 {
+        rounded
+    } else {
+        j
+    }
+}
+
+/// Linux `round_jiffies_up()`.
+#[unsafe(no_mangle)]
+pub extern "C" fn round_jiffies_up(j: c_ulong) -> c_ulong {
+    round_jiffies_up_abs(j as u64) as c_ulong
+}
+
+/// Linux `round_jiffies_up_relative()`.
+#[unsafe(no_mangle)]
+pub extern "C" fn round_jiffies_up_relative(j: c_ulong) -> c_ulong {
+    let now = crate::linux::primitives::jiffies();
+    round_jiffies_up_abs(now.wrapping_add(j as u64)).wrapping_sub(now) as c_ulong
 }
