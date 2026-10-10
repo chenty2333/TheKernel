@@ -607,3 +607,12 @@ pub(crate) mod i915_cmd_parser_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod intel_uncore_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_pcode_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod intel_wakeref_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub(crate) mod vlv_iosf_sb_upstream;

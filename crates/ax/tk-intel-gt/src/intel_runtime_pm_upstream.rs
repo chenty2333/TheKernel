@@ -270,12 +270,14 @@ unsafe fn __intel_runtime_pm_get_if_active(
 }
 
 // upstream: intel_runtime_pm.c intel_runtime_pm_get_if_in_use()
-pub unsafe fn intel_runtime_pm_get_if_in_use(rpm: *mut IntelRuntimePm) -> IntelWakerefT {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_runtime_pm_get_if_in_use(rpm: *mut IntelRuntimePm) -> IntelWakerefT {
     unsafe { __intel_runtime_pm_get_if_active(rpm, false) }
 }
 
 // upstream: intel_runtime_pm.c intel_runtime_pm_get_if_active()
-pub unsafe fn intel_runtime_pm_get_if_active(rpm: *mut IntelRuntimePm) -> IntelWakerefT {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_runtime_pm_get_if_active(rpm: *mut IntelRuntimePm) -> IntelWakerefT {
     unsafe { __intel_runtime_pm_get_if_active(rpm, true) }
 }
 
@@ -304,6 +306,12 @@ pub unsafe fn intel_runtime_pm_put_raw(rpm: *mut IntelRuntimePm, wref: IntelWake
 // upstream: intel_runtime_pm.c intel_runtime_pm_put_unchecked()
 pub unsafe fn intel_runtime_pm_put_unchecked(rpm: *mut IntelRuntimePm) {
     unsafe { __intel_runtime_pm_put(rpm, INTEL_WAKEREF_DEF, true) };
+}
+
+// upstream: intel_runtime_pm.h intel_runtime_pm_put() (CONFIG_DRM_I915_DEBUG_RUNTIME_PM=n)
+#[inline]
+pub unsafe fn intel_runtime_pm_put(rpm: *mut IntelRuntimePm, _wref: IntelWakerefT) {
+    unsafe { intel_runtime_pm_put_unchecked(rpm) };
 }
 
 // upstream: intel_runtime_pm.c intel_runtime_pm_enable()
