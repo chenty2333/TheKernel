@@ -323,21 +323,74 @@ pub unsafe extern "C" fn intel_has_pending_fb_unpin(_display: *mut c_void) -> bo
     false
 }
 
-// upstream: display/intel_display_power.c intel_display_power_get()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_display_power_get(_display: *mut c_void, _domain: i32) -> *mut c_void {
-    panic!("intel_display_power_get: upstream power domain is not mapped to TheKernel's PowerDomain owner");
+/// `enum intel_display_power_domain` value of `POWER_DOMAIN_GT_IRQ` in Linux
+/// 7.2.3 `intel_display_power.h` (sequential enum, no explicit values). It is
+/// the only display domain the GT path takes: `__gt_unpark()` holds it while
+/// the GT is awake so DC states cannot delay GT interrupts.
+const POWER_DOMAIN_GT_IRQ: i32 = 72;
+
+/// Display register window the power-domain owner programs. Stage two sets it
+/// together with the upstream device; until then GT power references refuse.
+static DISPLAY_WINDOW: spin::Mutex<Option<super::regs::RegisterWindow>> = spin::Mutex::new(None);
+
+#[allow(dead_code)] // set by the stage-two probe owner
+pub(super) fn register_display_window(window: super::regs::RegisterWindow) {
+    *DISPLAY_WINDOW.lock() = Some(window);
 }
 
+fn gt_irq_domain(domain: i32) -> intel_display::power_map::PowerDomain {
+    assert!(
+        domain == POWER_DOMAIN_GT_IRQ,
+        "display power domain {domain}: the upstream GT path only takes POWER_DOMAIN_GT_IRQ"
+    );
+    intel_display::power_map::PowerDomain::GtIrq
+}
+
+/// Take a reference on the display `GT_IRQ` domain through the kernel's single
+/// power-domain owner (`POWER`), so the GT shares the display refcount instead
+/// of writing power-well registers itself. The returned wakeref is an opaque
+/// non-null cookie; Linux only compares it and hands it back to the put.
+// upstream: display/intel_display_power.c intel_display_power_get()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_display_power_get(_display: *mut c_void, domain: i32) -> *mut c_void {
+    let domain = gt_irq_domain(domain);
+    let window = DISPLAY_WINDOW
+        .lock()
+        .expect("intel_display_power_get: display register window is not registered");
+    let mut power = super::POWER.lock();
+    let state = power
+        .as_mut()
+        .expect("intel_display_power_get: display power owner is not initialized");
+    state
+        .get_domain(&window, domain)
+        .unwrap_or_else(|e| panic!("intel_display_power_get(GT_IRQ): {e:?}"));
+    ptr::NonNull::<u8>::dangling().as_ptr().cast()
+}
+
+/// Linux defers the final put of an async release by `delay_ms` so a quick
+/// re-unpark does not toggle DC states. The kernel owner has no delayed-put
+/// worker, so the reference is dropped immediately: the same final refcount,
+/// only an earlier possible DC entry.
 // upstream: display/intel_display_power.c __intel_display_power_put_async()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __intel_display_power_put_async(
     _display: *mut c_void,
-    _domain: i32,
-    _wakeref: *mut c_void,
+    domain: i32,
+    wakeref: *mut c_void,
     _delay_ms: i32,
 ) {
-    panic!("__intel_display_power_put_async: no matching reference from intel_display_power_get");
+    assert!(!wakeref.is_null(), "__intel_display_power_put_async: null wakeref");
+    let domain = gt_irq_domain(domain);
+    let window = DISPLAY_WINDOW
+        .lock()
+        .expect("__intel_display_power_put_async: display register window is not registered");
+    let mut power = super::POWER.lock();
+    let state = power
+        .as_mut()
+        .expect("__intel_display_power_put_async: display power owner is not initialized");
+    state
+        .put_domain(&window, domain)
+        .unwrap_or_else(|e| panic!("__intel_display_power_put_async(GT_IRQ): {e:?}"));
 }
 
 // upstream: display/intel_frontbuffer.c intel_frontbuffer_init()
