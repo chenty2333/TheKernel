@@ -2,7 +2,7 @@
 use alloc::{borrow::Cow, format, string::String, sync::Arc, vec::Vec};
 
 use axfs_ng_vfs::{FsName, FsNameBuf, VfsError, VfsResult};
-use axnet::DeviceStats;
+use axnet::{DeviceStats, NetRxQueueStats};
 
 use super::{
     ChildNames, DirMaker, DirMapping, NodeOpsMux, SimpleDir, SimpleDirOps, SimpleFile, SimpleFs,
@@ -20,6 +20,21 @@ const COUNTERS: [&str; 8] = [
     "tx_errors",
     "tx_dropped",
 ];
+// Software datapath diagnostics, kept separate from the standard hardware-
+// facing netdev counters above. Each value belongs to this interface's
+// namespace-local Router::poll / RX-worker path; none represents a NIC queue
+// or CPU-affinity measurement. Counter units are events and values are
+// cumulative since interface creation.
+const RX_QUEUE_COUNTERS: [&str; 8] = [
+    "rx_sw_poll_attempts",
+    "rx_sw_poll_idle",
+    "rx_sw_frames_consumed",
+    "rx_sw_frames_delivered",
+    "rx_worker_arm_attempts",
+    "rx_worker_arm_successes",
+    "rx_worker_arm_unavailable",
+    "rx_worker_arm_failures",
+];
 fn counter_text(stats: DeviceStats, name: &str) -> VfsResult<String> {
     let value = match name {
         "rx_bytes" => stats.rx_bytes,
@@ -30,6 +45,21 @@ fn counter_text(stats: DeviceStats, name: &str) -> VfsResult<String> {
         "tx_packets" => stats.tx_packets,
         "tx_errors" => stats.tx_errors,
         "tx_dropped" => stats.tx_dropped,
+        _ => return Err(VfsError::NotFound),
+    };
+    Ok(format!("{value}\n"))
+}
+
+fn rx_queue_counter_text(stats: NetRxQueueStats, name: &str) -> VfsResult<String> {
+    let value = match name {
+        "rx_sw_poll_attempts" => stats.rx_sw_poll_attempts,
+        "rx_sw_poll_idle" => stats.rx_sw_poll_idle,
+        "rx_sw_frames_consumed" => stats.rx_sw_frames_consumed,
+        "rx_sw_frames_delivered" => stats.rx_sw_frames_delivered,
+        "rx_worker_arm_attempts" => stats.rx_worker_arm_attempts,
+        "rx_worker_arm_successes" => stats.rx_worker_arm_successes,
+        "rx_worker_arm_unavailable" => stats.rx_worker_arm_unavailable,
+        "rx_worker_arm_failures" => stats.rx_worker_arm_failures,
         _ => return Err(VfsError::NotFound),
     };
     Ok(format!("{value}\n"))
@@ -73,6 +103,19 @@ impl SimpleDirOps for NetClass {
                         .interface_statistics(index)
                         .ok_or(VfsError::NotFound)?;
                     counter_text(stats, name)
+                }),
+            );
+        }
+        for name in RX_QUEUE_COUNTERS {
+            let namespace = self.namespace.clone();
+            statistics.add(
+                name,
+                SimpleFile::new_regular(self.fs.clone(), move || {
+                    let stats = namespace
+                        .stack()
+                        .net_rx_queue_statistics(index)
+                        .ok_or(VfsError::NotFound)?;
+                    rx_queue_counter_text(stats, name)
                 }),
             );
         }
@@ -192,5 +235,27 @@ mod tests {
             assert_eq!(counter_text(stats, name).unwrap(), format!("{value}\n"));
         }
         assert!(counter_text(stats, "rx_crc_errors").is_err());
+    }
+
+    #[test]
+    fn software_rx_poll_counters_use_explicit_units_and_no_hardware_aliases() {
+        let stats = NetRxQueueStats {
+            rx_sw_poll_attempts: u64::MAX,
+            rx_sw_poll_idle: 3,
+            rx_sw_frames_consumed: 5,
+            rx_sw_frames_delivered: 7,
+            rx_worker_arm_attempts: 11,
+            rx_worker_arm_successes: 13,
+            rx_worker_arm_unavailable: 17,
+            rx_worker_arm_failures: 19,
+        };
+        let expected = [u64::MAX, 3, 5, 7, 11, 13, 17, 19];
+        for (name, value) in RX_QUEUE_COUNTERS.into_iter().zip(expected) {
+            assert_eq!(
+                rx_queue_counter_text(stats, name).unwrap(),
+                format!("{value}\n")
+            );
+        }
+        assert!(rx_queue_counter_text(stats, "rx_queue0_packets").is_err());
     }
 }

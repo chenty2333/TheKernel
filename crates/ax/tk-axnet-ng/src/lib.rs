@@ -113,8 +113,8 @@ pub use self::{
     net_stack::{NetPollStatus, NetRxTerminalReason, NetStack, NetStackServicePermit},
     packet::{PacketChecksum, PacketChecksumContext},
     router::{
-        EgressPass, MAX_DEVICES, PacketAction, PacketContext, PacketDefragQuery, PacketHook,
-        PacketHookPoint, RouteInfo, Rule, RxPass,
+        EgressPass, MAX_DEVICES, NetRxQueueSnapshot, NetRxQueueStats, PacketAction,
+        PacketContext, PacketDefragQuery, PacketHook, PacketHookPoint, RouteInfo, Rule, RxPass,
     },
     socket::*,
 };

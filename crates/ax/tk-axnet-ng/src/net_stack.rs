@@ -32,7 +32,10 @@ use crate::{
         PacketBroker, PacketDeviceCapabilities, PacketEndpoint, PacketRecord, PacketResult,
         PacketSelector, PacketSendRequest,
     },
-    router::{RawRoutePlan, RouteInfo, Router, Rule, RxWakeRegistration},
+    router::{
+        NetRxQueueSnapshot, NetRxQueueStats, RawRoutePlan, RouteInfo, Router, Rule,
+        RxWakeRegistration,
+    },
     service::{Service, ServicePoll},
     unix::UnixNamespace,
     wrapper::{SocketSetWrapper, Transport},
@@ -1776,6 +1779,22 @@ impl NetStack {
     /// No polling or queue consumption; removal cannot alias a reused name.
     pub fn interface_statistics(&self, interface_index: u32) -> Option<DeviceStats> {
         self.service.lock().router.interface_statistics(interface_index)
+    }
+
+    /// Snapshot namespace-local software receive-poll endpoints.
+    ///
+    /// Entries identify interfaces by stable ifindex; they do not imply a
+    /// one-to-one mapping to physical hardware queues or CPU ownership.
+    pub fn net_rx_queue_snapshots(&self) -> Vec<NetRxQueueSnapshot> {
+        self.service.lock().router.net_rx_queue_snapshots()
+    }
+
+    /// Read the software receive-poll counters for one stable interface.
+    pub fn net_rx_queue_statistics(&self, interface_index: u32) -> Option<NetRxQueueStats> {
+        self.service
+            .lock()
+            .router
+            .net_rx_queue_statistics(interface_index)
     }
 
     /// Snapshot the interfaces currently owned by this network stack.

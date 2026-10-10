@@ -183,6 +183,48 @@ pub enum RxPass {
     Continuation { consumed: usize, delivered: usize },
 }
 
+/// Per-interface software receive-poll and wake-owner counters.
+///
+/// These describe calls made by this namespace's bounded `Router::poll` and
+/// receive-worker arm path. They are not hardware queue or CPU-affinity
+/// counters. `rx_sw_frames_consumed` includes both delivered and consumed
+/// (for example, ARP-handled or dropped) frames; delivered is its subset.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NetRxQueueStats {
+    /// Calls to the device receive function from software `Router::poll`.
+    pub rx_sw_poll_attempts: u64,
+    /// Receive calls which reported no frame.
+    pub rx_sw_poll_idle: u64,
+    /// Frames consumed by the receive path, including delivered frames.
+    pub rx_sw_frames_consumed: u64,
+    /// Consumed frames accepted for protocol delivery.
+    pub rx_sw_frames_delivered: u64,
+    /// Eligible attempts to register/rearm this device with the RX worker.
+    pub rx_worker_arm_attempts: u64,
+    /// Successful RX worker registrations/rearms.
+    pub rx_worker_arm_successes: u64,
+    /// Attempts where the device has no worker-wake source.
+    pub rx_worker_arm_unavailable: u64,
+    /// Failed RX worker registrations/rearms.
+    pub rx_worker_arm_failures: u64,
+}
+
+/// A namespace-local software receive-poll endpoint snapshot.
+///
+/// `ifindex` is the stable identity; `name` is the current, mutable link name.
+/// A router currently has at most one such software polling endpoint per
+/// interface, independent of the NIC's physical queue topology.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetRxQueueSnapshot {
+    pub ifindex: u32,
+    pub name: String,
+    pub link_up: bool,
+    /// The poll path is fenced either by device protocol quarantine or a
+    /// terminal failure to arm its wake source.
+    pub receive_quarantined: bool,
+    pub stats: NetRxQueueStats,
+}
+
 impl RxPass {
     pub(crate) const fn is_continuation(self) -> bool {
         matches!(self, Self::Continuation { .. })
@@ -340,6 +382,8 @@ pub(crate) struct LinkState {
     pub(crate) mtu: usize,
     pub(crate) up: bool,
     pub(crate) peer: Option<u32>,
+    /// Software receive-poll telemetry is guarded by the router/service lock.
+    pub(crate) rx_stats: NetRxQueueStats,
 }
 impl Router {
     pub fn try_new_loopback_only(listen_table: Arc<ListenTable>) -> AxResult<Self> {
@@ -596,6 +640,7 @@ impl Router {
             mtu,
             up,
             peer: None,
+            rx_stats: NetRxQueueStats::default(),
         });
         Ok(ifindex)
     }
@@ -821,13 +866,27 @@ impl Router {
             {
                 continue;
             }
+            self.links[index].rx_stats.rx_worker_arm_attempts = self.links[index]
+                .rx_stats
+                .rx_worker_arm_attempts
+                .saturating_add(1);
             match device.register_rx_waker(waker) {
-                Ok(RxWakeSource::Armed) => result.armed += 1,
+                Ok(RxWakeSource::Armed) => {
+                    self.links[index].rx_stats.rx_worker_arm_successes = self.links[index]
+                        .rx_stats
+                        .rx_worker_arm_successes
+                        .saturating_add(1);
+                    result.armed += 1;
+                }
                 Ok(RxWakeSource::Unavailable) => {
                     // No source was consumed, so this is not a protocol
                     // quarantine. Remember it to keep later worker passes
                     // bounded while leaving task-context polling available.
                     self.rx_wake_unavailable |= 1u64 << index;
+                    self.links[index].rx_stats.rx_worker_arm_unavailable = self.links[index]
+                        .rx_stats
+                        .rx_worker_arm_unavailable
+                        .saturating_add(1);
                     result.unavailable += 1;
                 }
                 Err(error) => {
@@ -840,6 +899,10 @@ impl Router {
                     device.stop_rx_waker();
                     let bit = 1u64 << index;
                     self.rx_wake_quarantine |= bit;
+                    self.links[index].rx_stats.rx_worker_arm_failures = self.links[index]
+                        .rx_stats
+                        .rx_worker_arm_failures
+                        .saturating_add(1);
                     // Rearm failure is discovered while the worker is in its
                     // check-arm-check window, before the next Service::poll
                     // can observe the sticky level. Publish the edge now;
@@ -920,6 +983,27 @@ impl Router {
     pub(crate) fn interface_statistics(&self, index: u32) -> Option<DeviceStats> {
         let slot = self.device_slot(index)?;
         self.devices.get(slot).map(|device| device.stats())
+    }
+
+    /// Snapshot the software receive-poll endpoint with a stable ifindex.
+    pub(crate) fn net_rx_queue_snapshots(&self) -> Vec<NetRxQueueSnapshot> {
+        self.devices
+            .iter()
+            .enumerate()
+            .map(|(slot, device)| NetRxQueueSnapshot {
+                ifindex: self.ifindices[slot],
+                name: self.links[slot].name.clone(),
+                link_up: self.links[slot].up,
+                receive_quarantined: self.rx_wake_quarantined(slot) || device.is_quarantined(),
+                stats: self.links[slot].rx_stats,
+            })
+            .collect()
+    }
+
+    /// Read software receive-poll counters by stable interface identity.
+    pub(crate) fn net_rx_queue_statistics(&self, ifindex: u32) -> Option<NetRxQueueStats> {
+        let slot = self.device_slot(ifindex)?;
+        self.links.get(slot).map(|link| link.rx_stats)
     }
 
     pub(crate) fn interfaces(&self) -> Vec<InterfaceInfo> {
@@ -1200,24 +1284,48 @@ impl Router {
             self.rx_cursor = (index + 1) % device_count;
             let context =
                 PacketDeviceContext::new(self.ifindices[index], self.packet_broker.as_ref(), None);
-            let step = if self.rx_wake_quarantined(index)
-                || self.devices[index].is_quarantined()
-                || !self.links[index].up
-            {
+            let polled = !self.rx_wake_quarantined(index)
+                && !self.devices[index].is_quarantined()
+                && self.links[index].up;
+            let step = if !polled {
                 // A fenced queue is terminal for this device only. Do not
                 // touch its used ring, but continue the bounded pass so
                 // healthy interfaces remain serviceable.
                 RxStep::Idle
             } else {
+                self.links[index].rx_stats.rx_sw_poll_attempts = self.links[index]
+                    .rx_stats
+                    .rx_sw_poll_attempts
+                    .saturating_add(1);
                 self.devices[index].recv(context, &mut self.rx_buffer, timestamp)
             };
             match step {
-                RxStep::Idle => idle_devices += 1,
+                RxStep::Idle => {
+                    if polled {
+                        self.links[index].rx_stats.rx_sw_poll_idle = self.links[index]
+                            .rx_stats
+                            .rx_sw_poll_idle
+                            .saturating_add(1);
+                    }
+                    idle_devices += 1;
+                }
                 RxStep::Consumed => {
+                    self.links[index].rx_stats.rx_sw_frames_consumed = self.links[index]
+                        .rx_stats
+                        .rx_sw_frames_consumed
+                        .saturating_add(1);
                     consumed += 1;
                     idle_devices = 0;
                 }
                 RxStep::Delivered => {
+                    self.links[index].rx_stats.rx_sw_frames_consumed = self.links[index]
+                        .rx_stats
+                        .rx_sw_frames_consumed
+                        .saturating_add(1);
+                    self.links[index].rx_stats.rx_sw_frames_delivered = self.links[index]
+                        .rx_stats
+                        .rx_sw_frames_delivered
+                        .saturating_add(1);
                     consumed += 1;
                     delivered += 1;
                     idle_devices = 0;
@@ -2152,6 +2260,7 @@ mod tests {
         name: String,
         steps: VecDeque<RxStep>,
         seen: Arc<Mutex<Vec<u32>>>,
+        fail_rx_registration: bool,
     }
 
     impl FakeDevice {
@@ -2165,9 +2274,15 @@ mod tests {
                     name: name.into(),
                     steps: steps.into_iter().collect(),
                     seen: seen.clone(),
+                    fail_rx_registration: false,
                 },
                 seen,
             )
+        }
+
+        fn with_rx_registration_failure(mut self) -> Self {
+            self.fail_rx_registration = true;
+            self
         }
     }
 
@@ -2217,7 +2332,11 @@ mod tests {
         }
 
         fn register_waker(&self, _waker: &Waker) -> Result<(), axpoll::PollRegistrationError> {
-            Ok(())
+            if self.fail_rx_registration {
+                Err(PollRegistrationError::InvalidState)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -2378,11 +2497,30 @@ mod tests {
         assert_eq!(router.rx_poll_interval_micros(), Some(10_000));
         let result = router.register_rx_waker(Waker::noop());
         assert_eq!(result.unavailable, 1);
+        let stats = router.net_rx_queue_statistics(index).unwrap();
+        assert_eq!(stats.rx_worker_arm_attempts, 1);
+        assert_eq!(stats.rx_worker_arm_unavailable, 1);
         assert!(!router.has_quarantined_device());
         router
             .configure_link(index, None, None, Some(false))
             .unwrap();
         assert_eq!(router.rx_poll_interval_micros(), None);
+    }
+
+    #[test]
+    fn failed_rx_wake_arm_is_visible_in_endpoint_snapshot() {
+        let (device, _) = FakeDevice::new("arm-failure", core::iter::empty());
+        let mut router = router_with_devices([Box::new(
+            device.with_rx_registration_failure(),
+        ) as Box<dyn Device>]);
+
+        let result = router.register_rx_waker(Waker::noop());
+        assert_eq!(result.failed, 1);
+        let snapshots = router.net_rx_queue_snapshots();
+        let snapshot = &snapshots[0];
+        assert!(snapshot.receive_quarantined);
+        assert_eq!(snapshot.stats.rx_worker_arm_attempts, 1);
+        assert_eq!(snapshot.stats.rx_worker_arm_failures, 1);
     }
 
     #[test]
@@ -2447,6 +2585,56 @@ mod tests {
             }
         );
         assert_eq!(seen.lock().unwrap().len(), 41);
+    }
+
+    #[test]
+    fn software_rx_poll_stats_follow_stable_interface_identity() {
+        let (first, _) = FakeDevice::new("fake0", [RxStep::Delivered, RxStep::Idle]);
+        let (second, _) = FakeDevice::new("fake1", [RxStep::Consumed, RxStep::Idle]);
+        let mut router = router_with_devices([
+            Box::new(first) as Box<dyn Device>,
+            Box::new(second) as Box<dyn Device>,
+        ]);
+
+        assert_eq!(
+            router.poll(Instant::ZERO),
+            RxPass::Quiescent {
+                consumed: 2,
+                delivered: 1,
+            }
+        );
+        let first_stats = router.net_rx_queue_statistics(1).unwrap();
+        assert_eq!(first_stats.rx_sw_poll_attempts, 2);
+        assert_eq!(first_stats.rx_sw_poll_idle, 1);
+        assert_eq!(first_stats.rx_sw_frames_consumed, 1);
+        assert_eq!(first_stats.rx_sw_frames_delivered, 1);
+        let second_stats = router.net_rx_queue_statistics(2).unwrap();
+        assert_eq!(second_stats.rx_sw_poll_attempts, 2);
+        assert_eq!(second_stats.rx_sw_poll_idle, 1);
+        assert_eq!(second_stats.rx_sw_frames_consumed, 1);
+        assert_eq!(second_stats.rx_sw_frames_delivered, 0);
+
+        router
+            .configure_link(1, Some("renamed".into()), None, None)
+            .unwrap();
+        let renamed = router.net_rx_queue_snapshots();
+        assert_eq!(renamed[0].ifindex, 1);
+        assert_eq!(renamed[0].name, "renamed");
+        assert_eq!(renamed[0].stats, first_stats);
+
+        // Removal/replacement cannot inherit counters merely because a name
+        // is reused; the new endpoint receives a fresh monotonic ifindex.
+        router.remove_device(1).unwrap();
+        let (replacement, _) = FakeDevice::new("renamed", core::iter::empty());
+        let replacement_ifindex = router
+            .try_add_device(Box::new(replacement))
+            .unwrap();
+        assert_eq!(replacement_ifindex, 3);
+        assert_eq!(
+            router.net_rx_queue_statistics(replacement_ifindex),
+            Some(NetRxQueueStats::default())
+        );
+        assert_eq!(router.net_rx_queue_statistics(2), Some(second_stats));
     }
 
     #[test]
