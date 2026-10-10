@@ -569,14 +569,15 @@ pub extern "C" fn cpu_relax() {
     core::hint::spin_loop();
 }
 
-/// Linux `__cond_resched_lock()`.
-///
-/// Linux drops the spinlock, reschedules and retakes it when a reschedule is
-/// pending. This runtime does not expose the scheduler's pending-reschedule
-/// flag to LinuxKPI (see `need_resched()` in `wait.rs`), so the lock is never
-/// dropped here: returning 0 keeps the spinning waiter from yielding while the
-/// holder is off-CPU, which would otherwise be a livelock on one CPU.
+/// Linux `__cond_resched_lock()`: when a reschedule is pending, drop the
+/// spinlock, yield, retake the lock, and return 1; otherwise return 0.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __cond_resched_lock(_lock: *mut Spinlock) -> i32 {
-    0
+pub unsafe extern "C" fn __cond_resched_lock(lock: *mut Spinlock) -> i32 {
+    if !crate::linux::wait::need_resched() {
+        return 0;
+    }
+    unsafe { spin_unlock_raw(lock) };
+    crate::linux::wait::cond_resched();
+    unsafe { spin_lock_raw(lock) };
+    1
 }

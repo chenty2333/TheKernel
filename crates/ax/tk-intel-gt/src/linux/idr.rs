@@ -114,6 +114,32 @@ unsafe fn radix_slots_ref<'a>(root: *const RadixTreeRoot) -> Option<&'a RadixSlo
     }
 }
 
+/// Free the slot storage of `root` once it holds no entries, so an emptied
+/// tree does not keep its map allocated.
+unsafe fn radix_release_if_empty(root: *mut RadixTreeRoot) {
+    unsafe {
+        let rnode = (*root).rnode;
+        if !rnode.is_null() && (*rnode.cast::<RadixSlots>()).slots.is_empty() {
+            drop(Box::from_raw(rnode.cast::<RadixSlots>()));
+            (*root).rnode = core::ptr::null_mut();
+        }
+    }
+}
+
+/// Linux `radix_tree_destroy()`: free the tree's internal storage. The entries
+/// are the caller's and are not released.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn radix_tree_destroy(root: *mut RadixTreeRoot) {
+    assert!(!root.is_null());
+    unsafe {
+        let rnode = (*root).rnode;
+        if !rnode.is_null() {
+            drop(Box::from_raw(rnode.cast::<RadixSlots>()));
+            (*root).rnode = core::ptr::null_mut();
+        }
+    }
+}
+
 /// Linux `radix_tree_insert()`: 0 on success, -EEXIST when `index` is taken.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn radix_tree_insert(
@@ -154,10 +180,12 @@ pub unsafe extern "C" fn radix_tree_delete(root: *mut RadixTreeRoot, index: u64)
     match unsafe { radix_slots_ref(root) } {
         Some(_) => {
             let slots = unsafe { radix_slots_mut(root) };
-            slots
+            let removed = slots
                 .slots
                 .remove(&index)
-                .map_or(core::ptr::null_mut(), |slot| *slot)
+                .map_or(core::ptr::null_mut(), |slot| *slot);
+            unsafe { radix_release_if_empty(root) };
+            removed
         }
         None => core::ptr::null_mut(),
     }
@@ -236,6 +264,7 @@ pub unsafe extern "C" fn radix_tree_iter_delete(
             unsafe { *slot = core::ptr::null_mut() };
         }
     }
+    unsafe { radix_release_if_empty(root) };
 }
 
 /// Linux `idr_find()`: `struct idr` begins with its radix-tree root, followed

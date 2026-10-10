@@ -176,12 +176,18 @@ pub unsafe fn mutex_lock_interruptible_impl<M: MutexPointer>(mutex: M) -> i32 {
                 panic!("recursive Linux mutex lock");
             }
             Err(_) => {
-                let woke = MUTEX_WAITERS.wait_until_interruptible(|| {
-                    owner.load(Ordering::Acquire) == 0
-                });
-                if woke.is_err() {
+                // Re-check the signal state every tick, since a signal does
+                // not notify the mutex waiters.
+                if crate::linux::signal::signal_pending_current() {
                     return -crate::linux_config::EINTR;
                 }
+                let _ = MUTEX_WAITERS.wait_timeout_until(
+                    core::time::Duration::from_millis(10),
+                    || {
+                        owner.load(Ordering::Acquire) == 0
+                            || crate::linux::signal::signal_pending_current()
+                    },
+                );
             }
         }
     }

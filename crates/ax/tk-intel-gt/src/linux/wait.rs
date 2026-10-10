@@ -357,14 +357,12 @@ pub extern "C" fn __set_current_state(state: i32) {
     set_task_state(current_task_key(), state as u32);
 }
 
-/// Linux `need_resched()`.
-///
-/// The scheduler's pending-reschedule flag is not exported to LinuxKPI. Callers
-/// use this only as a preemption hint in polling loops that are bounded by
-/// their own timeouts, so reporting no pending reschedule is conservative.
+/// Linux `need_resched()`: whether the current task has a pending reschedule.
+/// The request is only read here; it is consumed by the scheduler at the next
+/// preemption point, as in Linux.
 #[unsafe(no_mangle)]
 pub extern "C" fn need_resched() -> bool {
-    false
+    axtask::current_need_resched()
 }
 
 /// Linux `might_sleep()`: compiled out with CONFIG_DEBUG_ATOMIC_SLEEP off.
@@ -507,6 +505,10 @@ pub unsafe extern "C" fn linux_wait_var_event_interruptible(addr: *mut c_void, s
     };
     loop {
         unsafe { prepare_to_wait(wq, &mut entry, state) };
+        if state as u32 == TASK_INTERRUPTIBLE && crate::linux::signal::signal_pending_current() {
+            unsafe { finish_wait(wq, &mut entry) };
+            return -crate::linux_config::EINTR;
+        }
         if crate::linux::requests::i915_active_is_idle(addr.cast_const().cast::<crate::intel_context_types_upstream::I915Active>()) {
             unsafe { finish_wait(wq, &mut entry) };
             return 0;
