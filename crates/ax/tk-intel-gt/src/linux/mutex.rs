@@ -161,3 +161,71 @@ mod tests {
         assert!(!unsafe { mutex_is_locked(mutex_ptr) });
     }
 }
+
+/// Interruptible acquire: sleeps like [`mutex_lock`], and gives up with
+/// `-EINTR` when the sleeping task is interrupted by a signal, as
+/// `mutex_lock_interruptible()` does.
+pub unsafe fn mutex_lock_interruptible_impl<M: MutexPointer>(mutex: M) -> i32 {
+    let task = current_owner();
+    let mutex = mutex.mutex_ptr();
+    let owner = unsafe { owner_word(mutex) };
+    loop {
+        match owner.compare_exchange(0, task, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => return 0,
+            Err(held_by) if held_by == task => {
+                panic!("recursive Linux mutex lock");
+            }
+            Err(_) => {
+                // Re-check the signal state every tick, since a signal does
+                // not notify the mutex waiters.
+                if crate::linux::signal::signal_pending_current() {
+                    return -crate::linux_config::EINTR;
+                }
+                let _ = MUTEX_WAITERS.wait_timeout_until(
+                    core::time::Duration::from_millis(10),
+                    || {
+                        owner.load(Ordering::Acquire) == 0
+                            || crate::linux::signal::signal_pending_current()
+                    },
+                );
+            }
+        }
+    }
+}
+
+// C ABI names. The Rust helpers above keep their identifiers, so the exported
+// symbols are attached with `export_name`.
+
+/// Linux `mutex_unlock()`.
+#[unsafe(export_name = "mutex_unlock")]
+pub unsafe extern "C" fn c_mutex_unlock(lock: *mut Mutex) {
+    unsafe { mutex_unlock(lock) };
+}
+
+/// Linux `mutex_destroy()`.
+#[unsafe(export_name = "mutex_destroy")]
+pub unsafe extern "C" fn c_mutex_destroy(lock: *mut Mutex) {
+    mutex_destroy(unsafe { &mut *lock });
+}
+
+/// Linux `__mutex_init()`: lockdep and debug names are compiled out.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __mutex_init(
+    lock: *mut Mutex,
+    _name: *const u8,
+    _key: *mut core::ffi::c_void,
+) {
+    unsafe { mutex_init(lock) };
+}
+
+/// Linux `mutex_lock_interruptible()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mutex_lock_interruptible(lock: *mut Mutex) -> i32 {
+    unsafe { mutex_lock_interruptible_impl(lock) }
+}
+
+/// Linux `mutex_lock_interruptible_nested()`; the subclass only feeds lockdep.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mutex_lock_interruptible_nested(lock: *mut Mutex, _subclass: u32) -> i32 {
+    unsafe { mutex_lock_interruptible_impl(lock) }
+}

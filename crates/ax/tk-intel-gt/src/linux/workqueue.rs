@@ -757,3 +757,73 @@ pub unsafe fn cancel_work_sync<W: WorkStructPtr>(work: W) -> bool {
     }
     cancelled || was_active
 }
+
+/// Set the PENDING bit for a caller that queues the item later (RCU-deferred
+/// queueing). Returns false when the item was already pending.
+///
+/// # Safety
+/// `work` must be a live, initialized work item.
+pub(crate) unsafe fn mark_work_pending(work: *mut WorkStruct) -> bool {
+    let old = unsafe { work_data(work) }.fetch_or(WORK_PENDING, Ordering::AcqRel);
+    old & WORK_PENDING == 0
+}
+
+/// Enqueue a work item whose PENDING bit the caller already set. The pending
+/// bit stays set until the worker dequeues the item.
+///
+/// # Safety
+/// `work` must be live, initialized, marked pending and not on the queue.
+pub(crate) unsafe fn enqueue_marked_work(work: *mut WorkStruct) {
+    {
+        let mut queue = WORK_QUEUE.lock();
+        unsafe { queue.push(work) };
+    }
+    notify_workers();
+}
+
+/// Block until the work runtime has no queued or running item.
+///
+/// The runtime is one FIFO served by one worker. Waiting for it to drain
+/// covers every item queued before the call, which is the Linux guarantee of
+/// `flush_workqueue()` / `drain_workqueue()`; it may additionally wait for items
+/// queued after the call.
+pub fn flush_all_work() {
+    if !axtask::can_block_current() {
+        panic!("flush_workqueue requires blockable task context");
+    }
+    WORK_STATE_WAKE
+        .wait_until(|| {
+            WORK_QUEUE.lock().head.is_null() && ACTIVE_WORK.load(Ordering::Acquire).is_null()
+        })
+        .expect("flush_workqueue could not wait for the worker");
+}
+
+// ---------------------------------------------------------------------------
+// C ABI entry points.
+// ---------------------------------------------------------------------------
+
+/// Linux `queue_work()`. Returns false when the item is already pending.
+#[unsafe(export_name = "queue_work")]
+pub unsafe extern "C" fn c_queue_work(wq: *mut c_void, work: *mut WorkStruct) -> bool {
+    unsafe { queue_work(wq, work) }
+}
+
+/// Linux `flush_work()`.
+#[unsafe(export_name = "flush_work")]
+pub unsafe extern "C" fn c_flush_work(work: *mut WorkStruct) -> bool {
+    unsafe { flush_work(work) }
+}
+
+/// Linux `flush_workqueue()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flush_workqueue(_wq: *mut c_void) {
+    flush_all_work();
+}
+
+/// Linux `drain_workqueue()`: flushes until no work remains. Re-queueing
+/// after the drain is not rejected, which is the one difference from Linux's
+/// `__WQ_DRAINING` warning path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drain_workqueue(_wq: *mut c_void) {
+    flush_all_work();
+}

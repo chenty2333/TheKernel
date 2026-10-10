@@ -7,7 +7,7 @@
 //! preserves the public load/store/erase/allocation and lock contracts.
 
 use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
-use core::{ffi::c_void, mem::offset_of};
+use core::{ffi::{c_ulong, c_void}, mem::offset_of};
 
 use crate::{
     intel_engine_cs_upstream::Spinlock,
@@ -303,4 +303,168 @@ macro_rules! xa_for_each {
             $body
         }
     }};
+}
+
+// ---------------------------------------------------------------------------
+// C ABI XArray entry points.
+//
+// Indices are stored as `u32` in this backend. Larger Linux indices cannot be
+// represented and fail with -EINVAL (store) or find nothing (lookups).
+// Marks are never set by this backend, so only `XA_PRESENT` filters match.
+// ---------------------------------------------------------------------------
+
+/// Linux `XA_PRESENT`: matches any present entry.
+const XA_PRESENT: u32 = 8;
+
+/// Encode a negative errno as an error pointer, as `xa_err()` does.
+#[inline]
+fn xa_err(errno: i32) -> *mut c_void {
+    (errno as isize) as *mut c_void
+}
+
+/// Run `f` with the XArray lock held, using the irq-safe form when the array
+/// was created with `XA_FLAGS_LOCK_IRQ`.
+unsafe fn with_xa_lock<R>(xa: *mut XArray, f: impl FnOnce() -> R) -> R {
+    let array = unsafe { &mut *xa };
+    if array.xa_flags & XA_FLAGS_LOCK_IRQ != 0 {
+        let mut flags = 0u64;
+        xa_lock_irqsave(array, &mut flags);
+        let result = f();
+        xa_unlock_irqrestore(array, flags);
+        result
+    } else {
+        xa_lock(array);
+        let result = f();
+        xa_unlock(array);
+        result
+    }
+}
+
+/// Linux `xa_store()`: store `entry` at `index` and return the previous entry.
+/// A NULL entry erases the index.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xa_store(
+    xa: *mut XArray,
+    index: c_ulong,
+    entry: *mut c_void,
+    _gfp: u32,
+) -> *mut c_void {
+    assert!(!xa.is_null());
+    if index > u64::from(u32::MAX) {
+        return xa_err(-crate::linux_config::EINVAL);
+    }
+    unsafe {
+        with_xa_lock(xa, || {
+            if entry.is_null() {
+                __xa_erase::<XArray, c_void>(&mut *xa, index as u32)
+            } else {
+                __xa_store(&mut *xa, index as u32, entry, 0)
+            }
+        })
+    }
+}
+
+/// Linux `xa_erase()`: remove `index` and return the previous entry.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xa_erase(xa: *mut XArray, index: c_ulong) -> *mut c_void {
+    assert!(!xa.is_null());
+    if index > u64::from(u32::MAX) {
+        return core::ptr::null_mut();
+    }
+    unsafe { with_xa_lock(xa, || __xa_erase::<XArray, c_void>(&mut *xa, index as u32)) }
+}
+
+/// Shared search for `xa_find()` and `xa_find_after()`.
+unsafe fn xa_find_from(
+    xa: *mut XArray,
+    index: *mut c_ulong,
+    max: c_ulong,
+    filter: u32,
+    start: u64,
+) -> *mut c_void {
+    if filter != XA_PRESENT || start > max || start > u64::from(u32::MAX) {
+        return core::ptr::null_mut();
+    }
+    let last = max.min(u64::from(u32::MAX)) as u32;
+    let first = start as u32;
+    unsafe {
+        with_xa_lock(xa, || {
+            let head = entries(xa, false);
+            if head.is_null() {
+                return core::ptr::null_mut();
+            }
+            for (&key, &value) in (*head).entries.range(first..=last) {
+                if !value.is_null() {
+                    *index = c_ulong::from(key);
+                    return value;
+                }
+            }
+            core::ptr::null_mut()
+        })
+    }
+}
+
+/// Linux `xa_find()`: first present entry at or after `*index`, up to `max`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xa_find(
+    xa: *mut XArray,
+    index: *mut c_ulong,
+    max: c_ulong,
+    filter: u32,
+) -> *mut c_void {
+    assert!(!xa.is_null() && !index.is_null());
+    unsafe { xa_find_from(xa, index, max, filter, *index as u64) }
+}
+
+/// Linux `xa_find_after()`: first present entry strictly after `*index`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xa_find_after(
+    xa: *mut XArray,
+    index: *mut c_ulong,
+    max: c_ulong,
+    filter: u32,
+) -> *mut c_void {
+    assert!(!xa.is_null() && !index.is_null());
+    let Some(start) = (*index).checked_add(1) else {
+        return core::ptr::null_mut();
+    };
+    unsafe { xa_find_from(xa, index, max, filter, start) }
+}
+
+/// Linux `__xa_alloc()`: store `entry` at the lowest free id in `limit`. The
+/// caller holds the XArray lock. Returns 0, -ENOMEM, or -EBUSY when `limit`
+/// has no free id.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __xa_alloc(
+    xa: *mut XArray,
+    id: *mut u32,
+    entry: *mut c_void,
+    limit: XaLimit,
+    _gfp: u32,
+) -> i32 {
+    assert!(!xa.is_null() && !id.is_null());
+    if entry.is_null() {
+        // Reserving an id without an entry needs a zero-entry marker that this
+        // backend does not store.
+        return -crate::linux_config::EINVAL;
+    }
+    if limit.min > limit.max {
+        return -crate::linux_config::EBUSY;
+    }
+    unsafe {
+        let head = entries(xa, true);
+        let mut candidate = u64::from(limit.min);
+        for (&key, _) in (*head).entries.range(limit.min..=limit.max) {
+            if u64::from(key) != candidate {
+                break;
+            }
+            candidate += 1;
+        }
+        if candidate > u64::from(limit.max) {
+            return -crate::linux_config::EBUSY;
+        }
+        (*head).entries.insert(candidate as u32, entry);
+        *id = candidate as u32;
+    }
+    0
 }

@@ -3786,6 +3786,7 @@ dependencies = [
  "axlog",
  "kernel_guard",
  "memory_addr",
+ "printf-compat",
  "spin 0.9.9",
  "tk-axalloc",
  "tk-axdriver-base",

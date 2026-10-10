@@ -43,6 +43,10 @@ pub(crate) mod mm;
 #[allow(unsafe_code)]
 pub(crate) mod page;
 pub(crate) mod primitives;
+pub(crate) mod drm_mm;
+pub(crate) mod drm_vma;
+pub(crate) mod dma_fence_core;
+pub(crate) mod drm_core;
 pub(crate) mod rbtree;
 pub(crate) mod rcu;
 #[cfg(feature = "upstream-gt")]
