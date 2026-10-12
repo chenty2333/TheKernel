@@ -33,3 +33,10 @@ syncobj_stub!(drm_syncobj_reset_ioctl);
 syncobj_stub!(drm_syncobj_signal_ioctl);
 syncobj_stub!(drm_syncobj_timeline_signal_ioctl);
 syncobj_stub!(drm_syncobj_query_ioctl);
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_syncobj_open(_file_priv: *mut DrmFile) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_syncobj_release(_file_priv: *mut DrmFile) {}
+

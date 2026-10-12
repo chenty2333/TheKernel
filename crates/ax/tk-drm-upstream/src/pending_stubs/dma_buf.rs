@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
+//! TEMPORARY definitions for dma-buf core (drivers/dma-buf/).
+//! Replaced by dma_buf_upstream.rs when the dma-buf batch lands.
+
+#![allow(non_snake_case, dead_code, unsafe_code)]
+#![allow(clippy::missing_safety_doc)]
+
+use core::ffi::{c_int, c_void};
+use core::sync::atomic::{AtomicPtr, Ordering};
+use tk_linux_kapi::config::{EINVAL, ENOMEM, GFP_KERNEL};
+use tk_linux_kapi::memory::{kfree, kmalloc};
+use tk_linux_kapi::types::{File, SgTable};
+
+use crate::drm_prime_upstream::{DmaBuf, DmaBufAttachment, DmaBufExportInfo};
+
+const MAX_FD: usize = 256;
+static DMABUF_FD_MAP: [AtomicPtr<DmaBuf>; MAX_FD] = [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_FD];
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_buf_register_fd(fd: c_int, dmabuf: *mut DmaBuf) {
+    if fd >= 0 && (fd as usize) < MAX_FD {
+        DMABUF_FD_MAP[fd as usize].store(dmabuf, Ordering::SeqCst);
+    }
+}
+
+// upstream: drivers/dma-buf/dma-buf.c dma_buf_export()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_buf_export(exp_info: *const DmaBufExportInfo) -> *mut DmaBuf {
+    unsafe {
+        if exp_info.is_null() {
+            return (-EINVAL as isize) as *mut DmaBuf;
+        }
+        let dmabuf = kmalloc(core::mem::size_of::<DmaBuf>(), GFP_KERNEL).cast::<DmaBuf>();
+        if dmabuf.is_null() {
+            return (-ENOMEM as isize) as *mut DmaBuf;
+        }
+        core::ptr::write_bytes(dmabuf, 0, 1);
+        (*dmabuf).size = (*exp_info).size;
+        (*dmabuf).ops = (*exp_info).ops;
+        (*dmabuf).r#priv = (*exp_info).r#priv;
+        (*dmabuf).resv = (*exp_info).resv;
+
+        let filp = kmalloc(core::mem::size_of::<File>(), GFP_KERNEL).cast::<File>();
+        if !filp.is_null() {
+            core::ptr::write_bytes(filp, 0, 1);
+            (*filp).private_data = dmabuf.cast();
+        }
+        (*dmabuf).file = filp;
+
+        dmabuf
+    }
+}
+
+// upstream: drivers/dma-buf/dma-buf.c dma_buf_get()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_buf_get(fd: c_int) -> *mut DmaBuf {
+    if fd >= 0 && (fd as usize) < MAX_FD {
+        let ptr = DMABUF_FD_MAP[fd as usize].load(Ordering::SeqCst);
+        if !ptr.is_null() {
+            return ptr;
+        }
+    }
+    (-EINVAL as isize) as *mut DmaBuf
+}
+
+// upstream: drivers/dma-buf/dma-buf.c dma_buf_map_attachment_unlocked()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_buf_map_attachment_unlocked(
+    attach: *mut DmaBufAttachment,
+    direction: c_int,
+) -> *mut SgTable {
+    unsafe {
+        if attach.is_null() || (*attach).dmabuf.is_null() {
+            return (-EINVAL as isize) as *mut SgTable;
+        }
+        let dmabuf = (*attach).dmabuf;
+        if let Some(ops) = (*dmabuf).ops.as_ref() {
+            if let Some(map) = ops.map_dma_buf {
+                return map(attach, direction);
+            }
+        }
+        let sg = kmalloc(core::mem::size_of::<SgTable>(), GFP_KERNEL).cast::<SgTable>();
+        if !sg.is_null() {
+            core::ptr::write_bytes(sg, 0, 1);
+        }
+        sg
+    }
+}
+
+// upstream: drivers/dma-buf/dma-buf.c dma_buf_unmap_attachment_unlocked()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_buf_unmap_attachment_unlocked(
+    attach: *mut DmaBufAttachment,
+    sgt: *mut SgTable,
+    direction: c_int,
+) {
+    unsafe {
+        if !attach.is_null() && !(*attach).dmabuf.is_null() {
+            let dmabuf = (*attach).dmabuf;
+            if let Some(ops) = (*dmabuf).ops.as_ref() {
+                if let Some(unmap) = ops.unmap_dma_buf {
+                    unmap(attach, sgt, direction);
+                    return;
+                }
+            }
+        }
+        if !sgt.is_null() {
+            kfree(sgt.cast::<c_void>());
+        }
+    }
+}

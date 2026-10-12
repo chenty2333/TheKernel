@@ -91,55 +91,10 @@ fn err_ptr(errno: c_int) -> *mut c_void {
 // drm_dev_enter, drm_dev_exit, drm_dev_get, drm_dev_put, drm_is_current_master
 // now ported and provided by tk-drm-upstream.
 
-/// Linux `drm_print_memory_stats()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_print_memory_stats(
-printer: *mut c_void,
-stats: *const c_void,
-supported_status: c_int,
-region: *const c_char,
-) {
-unsafe { (required("drm_print_memory_stats").print_memory_stats)(printer, stats, supported_status, region) };
-}
-
-// drm_gem_free_mmap_offset, drm_gem_handle_create, drm_gem_object_free, drm_gem_private_object_init
+// drm_print_memory_stats, drm_gem_dmabuf_export, drm_gem_dmabuf_release,
+// drm_gem_prime_mmap, drm_gem_unmap_dma_buf, drm_prime_gem_destroy
 // now ported and provided by tk-drm-upstream.
 
-/// Linux `drm_gem_dmabuf_export()`: an error pointer when no provider exists.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_gem_dmabuf_export(dev: *mut c_void, info: *mut c_void) -> *mut c_void {
-match provider() {
-    Some(p) => unsafe { (p.gem_dmabuf_export)(dev, info) },
-    None => err_ptr(-ENODEV),
-}
-}
-
-/// Linux `drm_gem_dmabuf_release()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_gem_dmabuf_release(dmabuf: *mut c_void) {
-unsafe { (required("drm_gem_dmabuf_release").gem_dmabuf_release)(dmabuf) };
-}
-
-/// Linux `drm_gem_prime_mmap()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_gem_prime_mmap(obj: *mut c_void, vma: *mut c_void) -> c_int {
-match provider() {
-    Some(p) => unsafe { (p.gem_prime_mmap)(obj, vma) },
-    None => -ENODEV,
-}
-}
-
-/// Linux `drm_gem_unmap_dma_buf()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_gem_unmap_dma_buf(attach: *mut c_void, sgt: *mut c_void, direction: c_int) {
-unsafe { (required("drm_gem_unmap_dma_buf").gem_unmap_dma_buf)(attach, sgt, direction) };
-}
-
-/// Linux `drm_prime_gem_destroy()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_prime_gem_destroy(obj: *mut c_void, sg: *mut c_void) {
-unsafe { (required("drm_prime_gem_destroy").prime_gem_destroy)(obj, sg) };
-}
 
 /// Linux `dma_buf_attach()`.
 #[unsafe(no_mangle)]
