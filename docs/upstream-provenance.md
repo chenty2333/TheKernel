@@ -2192,14 +2192,14 @@ in the source comments.
 
 ## 2026-10-12 DRM core B1 and i915 display B2.5 reconciliation
 
-The uncommitted DRM core translations (`crates/ax/tk-drm-upstream`, batches B1a-B1d)
+The uncommitted DRM core translations (`crates/ax/tk-drm-upstream`, batches B1a-B1d, and BI)
 and the i915 display `*_types_upstream.rs` / `*_regs_upstream.rs` modules in
 `crates/ax/tk-intel-gt` (B2.5) add verbatim-Linux lines that the excerpt scanner
 counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned
-`crates/ax` totals: threshold >=40 `(0,0,0,807,777,0,0)` (was 707/678), threshold
->=25 `(18,15,4,2178,2140,0,0)` (was 1897/1861). `crates/linux` and `kernel/src`
+`crates/ax` totals: threshold >=40 `(0,0,0,809,779,0,0)` (was 807/777), threshold
+>=25 `(18,15,4,2198,2160,0,0)` (was 2178/2140). `crates/linux` and `kernel/src`
 are unchanged. At >=40 the new code lines are in `tk-intel-gt` (670 code lines in
-the scope) and `tk-drm-upstream` (93).
+the scope) and `tk-drm-upstream` (95).
 
 Licensing of the translated DRM sources (checked against `/home/ava/Desktop/linux-7.2.3`):
 
