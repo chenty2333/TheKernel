@@ -25,7 +25,7 @@ use intel_gt::{
     i915_driver_upstream::DrmDriverDesc,
     intel_context_upstream::DrmGemObjectBaseLayout,
     linux::gem,
-    linux_i915_private::DrmDevicePrefix,
+    linux_i915_private::DrmDevice,
 };
 use spin::Mutex;
 
@@ -91,7 +91,7 @@ impl UpstreamFile {
         let device = super::upstream_drm::registered_device().ok_or(AxError::NoSuchDevice)?;
         // SAFETY: registered_device() returns the live registered DRM device;
         // its prefix is the layout consumed by the LinuxKPI DRM bridge.
-        let driver = unsafe { (*device.cast::<DrmDevicePrefix>()).driver };
+        let driver = unsafe { (*device.cast::<DrmDevice>()).driver };
         if driver.is_null() {
             return Err(AxError::NoSuchDevice);
         }

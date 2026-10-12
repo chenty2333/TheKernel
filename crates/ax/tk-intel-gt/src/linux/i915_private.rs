@@ -27,59 +27,32 @@ pub struct Inode {
     _tail: [u8; 488],
 }
 
-#[repr(C)]
-pub struct DrmVmaOffsetManager {
-    pub vm_lock: core::sync::atomic::AtomicU32,
-    _padding: u32,
-    pub vm_addr_space: crate::linux::gem_memory::DrmMm,
-}
-const _: [(); 248] = [(); size_of::<DrmVmaOffsetManager>()];
-const _: [(); 0] = [(); offset_of!(DrmVmaOffsetManager, vm_lock)];
+/// `struct drm_vma_offset_manager` (tk-drm-upstream mirror; `vm_lock` is a
+/// `rwlock_t` at offset 0, size 248 in total).
+pub use tk_drm_upstream::drm_vma_manager_types::DrmVmaOffsetManager;
 
-/// Target-layout fields used from the leading `struct drm_device`; gaps
-/// remain opaque but are bounded by the configured Linux 7.2.3 C offsets.
-#[repr(C, align(8))]
-pub struct DrmDevicePrefix {
-    if_version: i32,
-    refcount: Kref,
-    pub dev: *mut c_void,
-    pub dma_dev: *mut c_void,
-    _before_driver: [u8; 32],
-    /// `struct drm_device.driver` at offset 56 (x86_64 Linux 7.2.3).
-    pub driver: *mut c_void,
-    _before_unplugged: [u8; 52],
-    pub unplugged: bool,
-    _anon_inode_pad: [u8; 3],
-    pub anon_inode: *mut Inode,
-    _before_vma_offset_manager: [u8; 1360],
-    pub vma_offset_manager: *mut DrmVmaOffsetManager,
-    _before_switch_power_state: [u8; 8],
-    /// `enum switch_power_state` at offset 1504 (4 bytes).
-    pub switch_power_state: i32,
-    _tail: [u8; 44],
-}
+/// `struct drm_device`: the full Linux 7.2.3 x86_64 record, from the
+/// tk-drm-upstream type mirror (oracle layout, THP enabled: 1560 bytes).
+pub use tk_drm_upstream::drm_device_types::DrmDevice;
 
-impl DrmDevicePrefix {
-    /// Initialize the DRM-core identity before any i915 probe reader runs.
-    /// The parent and the GEM resources must outlive this device.
-    pub fn initialize(
-        &mut self,
-        parent: *mut c_void,
-        driver: *mut c_void,
-        inode: *mut Inode,
-        manager: *mut DrmVmaOffsetManager,
-    ) {
-        self.refcount.refcount.refs.counter = 1;
-        self.dev = parent;
-        self.dma_dev = parent;
-        self.driver = driver;
-        self.anon_inode = inode;
-        self.vma_offset_manager = manager;
-        self.switch_power_state = 0; // DRM_SWITCH_POWER_ON
-    }
+/// Linux `drm_device_initialize()`-equivalent identity setup performed before
+/// any i915 probe reader runs. The parent and the GEM resources must outlive
+/// this device.
+pub fn initialize_drm_device(
+    dev: &mut DrmDevice,
+    parent: *mut c_void,
+    driver: *mut c_void,
+    inode: *mut Inode,
+    manager: *mut DrmVmaOffsetManager,
+) {
+    dev.r#ref.refcount.refs.counter = 1;
+    dev.dev = parent.cast();
+    dev.dma_dev = parent.cast();
+    dev.driver = driver.cast();
+    dev.anon_inode = inode.cast();
+    dev.vma_offset_manager = manager;
+    dev.switch_power_state = 0; // DRM_SWITCH_POWER_ON
 }
-
-pub const DRM_DEVICE_SIZE: usize = 1552;
 
 /// Complete `struct i915_params` member sequence from i915_params.h.
 #[repr(C)]
@@ -126,7 +99,7 @@ pub struct IntelRuntimePmPrefix {
 /// Regenerate the asserted offsets when the Linux config/compiler changes.
 #[repr(C)]
 pub struct DrmI915Private {
-    pub drm: DrmDevicePrefix,
+    pub drm: DrmDevice,
     pub display: *mut c_void,
     pub do_release: bool,
     _align_params: [u8; 7],
@@ -219,32 +192,24 @@ pub unsafe fn i915_reset_engine_count(
     atomic_read(unsafe { &(*error).reset_engine_count[class] }) as u32
 }
 
-const _: [(); 1552] = [(); size_of::<DrmDevicePrefix>()];
-const _: [(); 56] = [(); offset_of!(DrmDevicePrefix, driver)];
-const _: [(); 1504] = [(); offset_of!(DrmDevicePrefix, switch_power_state)];
-const _: [(); 1840] = [(); offset_of!(DrmI915Private, uncore)];
-const _: [(); 2504] = [(); offset_of!(DrmI915Private, sb_lock)];
-const _: [(); 2396] = [(); offset_of!(DrmI915Private, irqs_enabled)];
+const _: [(); 1848] = [(); offset_of!(DrmI915Private, uncore)];
+const _: [(); 2512] = [(); offset_of!(DrmI915Private, sb_lock)];
+const _: [(); 2404] = [(); offset_of!(DrmI915Private, irqs_enabled)];
 const _: [(); 104] = [(); size_of::<IntelRuntimePmPrefix>()];
 const _: [(); 40] = [(); offset_of!(IntelRuntimePmPrefix, userfault_wakeref)];
-const _: [(); 8] = [(); offset_of!(DrmDevicePrefix, dev)];
-const _: [(); 8] = [(); align_of::<DrmDevicePrefix>()];
 const _: [(); 544] = [(); size_of::<Inode>()];
 const _: [(); 48] = [(); offset_of!(Inode, i_mapping)];
-const _: [(); 116] = [(); offset_of!(DrmDevicePrefix, unplugged)];
-const _: [(); 120] = [(); offset_of!(DrmDevicePrefix, anon_inode)];
-const _: [(); 1488] = [(); offset_of!(DrmDevicePrefix, vma_offset_manager)];
 
 const _: [(); 80] = [(); size_of::<I915Params>()];
 const _: [(); 8] = [(); align_of::<I915Params>()];
-const _: [(); 2536] = [(); offset_of!(DrmI915Private, wq)];
-const _: [(); 2396] = [(); offset_of!(DrmI915Private, irqs_enabled)];
-const _: [(); 2544] = [(); offset_of!(DrmI915Private, unordered_wq)];
-const _: [(); 2532] = [(); offset_of!(DrmI915Private, preserve_bios_swizzle)];
-const _: [(); 2560] = [(); offset_of!(DrmI915Private, gem_quirks)];
-const _: [(); 2568] = [(); offset_of!(DrmI915Private, mm)];
-const _: [(); 3112] = [(); offset_of!(DrmI915Private, edram_size_mb)];
-const _: [(); 3120] = [(); offset_of!(DrmI915Private, gpu_error)];
+const _: [(); 2544] = [(); offset_of!(DrmI915Private, wq)];
+const _: [(); 2404] = [(); offset_of!(DrmI915Private, irqs_enabled)];
+const _: [(); 2552] = [(); offset_of!(DrmI915Private, unordered_wq)];
+const _: [(); 2540] = [(); offset_of!(DrmI915Private, preserve_bios_swizzle)];
+const _: [(); 2568] = [(); offset_of!(DrmI915Private, gem_quirks)];
+const _: [(); 2576] = [(); offset_of!(DrmI915Private, mm)];
+const _: [(); 3120] = [(); offset_of!(DrmI915Private, edram_size_mb)];
+const _: [(); 3128] = [(); offset_of!(DrmI915Private, gpu_error)];
 const _: [(); 4] = [(); offset_of!(I915Params, enable_guc)];
 const _: [(); 8] = [(); offset_of!(I915Params, guc_log_level)];
 const _: [(); 16] = [(); offset_of!(I915Params, guc_firmware_path)];
@@ -256,29 +221,40 @@ const _: [(); 64] = [(); offset_of!(I915Params, request_timeout_ms)];
 const _: [(); 76] = [(); offset_of!(I915Params, enable_hangcheck)];
 
 const _: [(); 0] = [(); offset_of!(DrmI915Private, drm)];
-const _: [(); 1552] = [(); offset_of!(DrmI915Private, display)];
-const _: [(); 1560] = [(); offset_of!(DrmI915Private, do_release)];
-const _: [(); 1568] = [(); offset_of!(DrmI915Private, params)];
-const _: [(); 1572] = [(); offset_of!(DrmI915Private, params.enable_guc)];
-const _: [(); 1648] = [(); offset_of!(DrmI915Private, info)];
-const _: [(); 1656] = [(); offset_of!(DrmI915Private, runtime)];
-const _: [(); 2396] = [(); offset_of!(DrmI915Private, irqs_enabled)];
-const _: [(); 2544] = [(); offset_of!(DrmI915Private, unordered_wq)];
-const _: [(); 3120] = [(); offset_of!(DrmI915Private, gpu_error)];
-const _: [(); 3176] = [(); offset_of!(DrmI915Private, runtime_pm)];
-const _: [(); 3528] = [(); offset_of!(DrmI915Private, gt)];
+const _: [(); 1560] = [(); offset_of!(DrmI915Private, display)];
+const _: [(); 1568] = [(); offset_of!(DrmI915Private, do_release)];
+const _: [(); 1576] = [(); offset_of!(DrmI915Private, params)];
+const _: [(); 1580] = [(); offset_of!(DrmI915Private, params.enable_guc)];
+const _: [(); 1656] = [(); offset_of!(DrmI915Private, info)];
+const _: [(); 1664] = [(); offset_of!(DrmI915Private, runtime)];
+const _: [(); 2404] = [(); offset_of!(DrmI915Private, irqs_enabled)];
+const _: [(); 2552] = [(); offset_of!(DrmI915Private, unordered_wq)];
+const _: [(); 3128] = [(); offset_of!(DrmI915Private, gpu_error)];
+const _: [(); 3184] = [(); offset_of!(DrmI915Private, runtime_pm)];
+const _: [(); 3536] = [(); offset_of!(DrmI915Private, gt)];
 // These target x86_64 Linux 7.2.3 offsets were measured from the configured
 // wt-dev oracle's i915_driver.o compile command and offsetof() C probe.
 const _: [(); 32] = [(); size_of::<I915GemPrivate>()];
-const _: [(); 3560] = [(); offset_of!(DrmI915Private, gem)];
-const _: [(); 3584] = [(); offset_of!(DrmI915Private, gem) + offset_of!(I915GemPrivate, mmap_singleton)];
-const _: [(); 3600] = [(); offset_of!(DrmI915Private, pxp)];
-const _: [(); 3608] = [(); offset_of!(DrmI915Private, _overlay)];
-const _: [(); 5928] = [(); size_of::<DrmI915Private>()];
-const _: [(); 4248] = [(); offset_of!(DrmI915Private, bdev)];
+const _: [(); 3568] = [(); offset_of!(DrmI915Private, gem)];
+const _: [(); 3592] = [(); offset_of!(DrmI915Private, gem) + offset_of!(I915GemPrivate, mmap_singleton)];
+const _: [(); 3608] = [(); offset_of!(DrmI915Private, pxp)];
+const _: [(); 3616] = [(); offset_of!(DrmI915Private, _overlay)];
+const _: [(); 5936] = [(); size_of::<DrmI915Private>()];
+const _: [(); 4256] = [(); offset_of!(DrmI915Private, bdev)];
 const _: [(); 1672] = [(); size_of::<TtmDevice>()];
 const _: [(); 40] = [(); size_of::<I915GpuError>()];
 const _: [(); 104] = [(); size_of::<IntelRuntimePmPrefix>()];
 const _: [(); 40] = [(); offset_of!(IntelRuntimePmPrefix, userfault_wakeref)];
 
-const _: [(); 1692] = [(); offset_of!(DrmI915Private, caps)];
+const _: [(); 1700] = [(); offset_of!(DrmI915Private, caps)];
+
+// Oracle DrmDevice offsets (THP enabled): `huge_mnt` shifts members after
+// `driver_features` by 8 bytes relative to the THP-off wt-dev probe.
+const _: [(); 1560] = [(); size_of::<DrmDevice>()];
+const _: [(); 8] = [(); offset_of!(DrmDevice, dev)];
+const _: [(); 56] = [(); offset_of!(DrmDevice, driver)];
+const _: [(); 124] = [(); offset_of!(DrmDevice, unplugged)];
+const _: [(); 128] = [(); offset_of!(DrmDevice, anon_inode)];
+const _: [(); 1496] = [(); offset_of!(DrmDevice, vma_offset_manager)];
+const _: [(); 1512] = [(); offset_of!(DrmDevice, switch_power_state)];
+const _: [(); 8] = [(); align_of::<DrmDevice>()];

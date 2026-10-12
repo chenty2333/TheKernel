@@ -2662,7 +2662,7 @@ pub unsafe extern "C" fn i915_vma_revoke_mmap(vma: *mut I915Vma) {
     let partial_offset = unsafe { ptr::read_unaligned(ptr::addr_of!((*partial).offset)) };
     let vma_offset = (partial_offset as u64) << PAGE_SHIFT;
     let i915 = unsafe { (*(*vma).vm).i915 };
-    let inode = unsafe { (*i915).drm.anon_inode };
+    let inode = unsafe { (*i915).drm.anon_inode.cast::<crate::linux_i915_private::Inode>() };
     unsafe {
         unmap_mapping_range(
             (*inode).i_mapping,

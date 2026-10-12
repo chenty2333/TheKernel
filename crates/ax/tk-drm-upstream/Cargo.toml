@@ -1,0 +1,29 @@
+[package]
+name = "tk-drm-upstream"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license = "MIT"
+authors = ["TheKernel contributors"]
+description = "Faithful Rust ports of the Linux DRM core (KMS objects, atomic, helpers, DP/HDMI) for x86_64"
+repository.workspace = true
+
+[package.metadata.thekernel]
+# Depends only on the generic kernel-API shims; no GPU-driver object types.
+layer = "platform"
+
+[package.metadata.thekernel.host-test]
+selected = true
+# The kapi shims reach per-CPU state through axtask, so the test binary needs
+# the percpu linker image.
+percpu-linker = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+tk-linux-kapi = { path = "../tk-linux-kapi" }

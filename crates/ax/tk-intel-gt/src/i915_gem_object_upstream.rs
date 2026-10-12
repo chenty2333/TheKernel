@@ -59,7 +59,7 @@ use crate::{
         rcu::*,
         workqueue::*,
     },
-    linux_i915_private::{DrmDevicePrefix, DrmI915Private},
+    linux_i915_private::{DrmDevice, DrmI915Private},
 };
 
 // Linux DRM API entry points whose C implementations live below this GEM
@@ -466,7 +466,7 @@ unsafe fn __i915_gem_object_free_mmaps(obj: *mut DrmI915GemObject) {
             mmo_offset,
             |mmo: *mut I915MmapOffset, _mn| {
                 drm_vma_offset_remove(
-                    (*(&(*obj).base.base).dev.cast::<DrmDevicePrefix>()).vma_offset_manager,
+                    (*(&(*obj).base.base).dev.cast::<DrmDevice>()).vma_offset_manager,
                     &mut (*mmo).vma_node,
                 );
                 kfree(mmo.cast::<c_void>());

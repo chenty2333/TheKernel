@@ -144,18 +144,18 @@ pub struct IntelDisplayStolenInterface {
     insert_node: Option<unsafe extern "C" fn(*mut IntelStolenNode, u64, u32) -> c_int>,
     remove_node: Option<unsafe extern "C" fn(*mut IntelStolenNode)>,
     initialized:
-        Option<unsafe extern "C" fn(*mut crate::linux::i915_private::DrmDevicePrefix) -> bool>,
+        Option<unsafe extern "C" fn(*mut crate::linux::i915_private::DrmDevice) -> bool>,
     node_allocated: Option<unsafe extern "C" fn(*const IntelStolenNode) -> bool>,
     node_offset: Option<unsafe extern "C" fn(*const IntelStolenNode) -> u64>,
     area_address:
-        Option<unsafe extern "C" fn(*mut crate::linux::i915_private::DrmDevicePrefix) -> u64>,
+        Option<unsafe extern "C" fn(*mut crate::linux::i915_private::DrmDevice) -> u64>,
     area_size:
-        Option<unsafe extern "C" fn(*mut crate::linux::i915_private::DrmDevicePrefix) -> u64>,
+        Option<unsafe extern "C" fn(*mut crate::linux::i915_private::DrmDevice) -> u64>,
     node_address: Option<unsafe extern "C" fn(*const IntelStolenNode) -> u64>,
     node_size: Option<unsafe extern "C" fn(*const IntelStolenNode) -> u64>,
     node_alloc: Option<
         unsafe extern "C" fn(
-            *mut crate::linux::i915_private::DrmDevicePrefix,
+            *mut crate::linux::i915_private::DrmDevice,
         ) -> *mut IntelStolenNode,
     >,
     node_free: Option<unsafe extern "C" fn(*const IntelStolenNode)>,
@@ -881,7 +881,7 @@ unsafe fn gem_obj_i915(obj: *mut DrmI915GemObject) -> *mut DrmI915Private {
 
 // upstream: i915_gem_stolen.c i915_pages_create_for_stolen()
 unsafe fn i915_pages_create_for_stolen(
-    dev: *mut crate::linux::i915_private::DrmDevicePrefix,
+    dev: *mut crate::linux::i915_private::DrmDevice,
     offset: u64,
     size: u64,
 ) -> *mut SgTable {
@@ -1341,7 +1341,7 @@ pub unsafe extern "C" fn i915_gem_object_is_stolen(obj: *const DrmI915GemObject)
 
 // upstream: i915_gem_stolen.c i915_gem_stolen_initialized()
 unsafe extern "C" fn i915_gem_stolen_initialized(
-    drm: *mut crate::linux::i915_private::DrmDevicePrefix,
+    drm: *mut crate::linux::i915_private::DrmDevice,
 ) -> bool {
     let i915 = unsafe { to_i915(drm.cast::<c_void>()) };
     unsafe { drm_mm_initialized(&(*i915).mm.stolen) }
@@ -1349,7 +1349,7 @@ unsafe extern "C" fn i915_gem_stolen_initialized(
 
 // upstream: i915_gem_stolen.c i915_gem_stolen_area_address()
 unsafe extern "C" fn i915_gem_stolen_area_address(
-    drm: *mut crate::linux::i915_private::DrmDevicePrefix,
+    drm: *mut crate::linux::i915_private::DrmDevice,
 ) -> u64 {
     let i915 = unsafe { to_i915(drm.cast::<c_void>()) };
     unsafe { (*dsm(i915)).stolen.start }
@@ -1357,7 +1357,7 @@ unsafe extern "C" fn i915_gem_stolen_area_address(
 
 // upstream: i915_gem_stolen.c i915_gem_stolen_area_size()
 unsafe extern "C" fn i915_gem_stolen_area_size(
-    drm: *mut crate::linux::i915_private::DrmDevicePrefix,
+    drm: *mut crate::linux::i915_private::DrmDevice,
 ) -> u64 {
     let i915 = unsafe { to_i915(drm.cast::<c_void>()) };
     unsafe { resource_size(&(*dsm(i915)).stolen) }
@@ -1390,7 +1390,7 @@ unsafe extern "C" fn i915_gem_stolen_node_size(node: *const IntelStolenNode) -> 
 
 // upstream: i915_gem_stolen.c i915_gem_stolen_node_alloc()
 unsafe extern "C" fn i915_gem_stolen_node_alloc(
-    drm: *mut crate::linux::i915_private::DrmDevicePrefix,
+    drm: *mut crate::linux::i915_private::DrmDevice,
 ) -> *mut IntelStolenNode {
     let i915 = unsafe { to_i915(drm.cast::<c_void>()) };
     let node = kzalloc_obj::<IntelStolenNode>();

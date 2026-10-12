@@ -83,7 +83,7 @@ pub unsafe extern "C" fn intel_region_ttm_device_init(dev_priv: *mut DrmI915Priv
         core::ptr::addr_of_mut!((*dev_priv).bdev),
         i915_ttm_driver(),
         (*drm).dev,
-        (*(*drm).anon_inode).i_mapping,
+        (*(*drm).anon_inode.cast::<crate::linux_i915_private::Inode>()).i_mapping,
         (*drm).vma_offset_manager.cast::<c_void>(),
         0,
     )

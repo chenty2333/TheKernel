@@ -50,7 +50,7 @@ use crate::{
             GRAPHICS_VER, INTEL_INFO, IP_VER, IS_BROADWELL, IS_CHERRYVIEW, IS_DG1, IS_GEN9_LP,
             IS_METEORLAKE, IS_SKYLAKE, IS_VALLEYVIEW,
         },
-        i915_private::{DrmDevicePrefix, DrmI915Private},
+        i915_private::{DrmDevice, DrmI915Private},
         locks::spin_lock_irqsave,
         memory::kref_read,
         primitives::fetch_and_zero,
@@ -222,7 +222,7 @@ unsafe extern "C" {
     fn intel_vgpu_active(i915: *mut DrmI915Private) -> bool;
     fn pm_runtime_get_sync(dev: *mut c_void) -> c_int;
     fn pm_runtime_put(dev: *mut c_void) -> c_int;
-    fn vlv_clock_get_czclk(drm: *mut DrmDevicePrefix) -> c_int;
+    fn vlv_clock_get_czclk(drm: *mut DrmDevice) -> c_int;
     fn snb_pcode_read(uncore: *mut IntelUncore, mbox: u32, val: *mut u32, val1: *mut u32) -> c_int;
     fn snb_pcode_write_timeout(
         uncore: *mut IntelUncore,
@@ -965,7 +965,7 @@ pub unsafe extern "C" fn intel_rc6_residency_ns(rc6: *mut IntelRc6, id: IntelRc6
     }
     if unsafe { IS_VALLEYVIEW(i915) || IS_CHERRYVIEW(i915) } {
         mul = 1_000_000;
-        div = unsafe { vlv_clock_get_czclk((&mut (*i915).drm) as *mut DrmDevicePrefix) as u32 };
+        div = unsafe { vlv_clock_get_czclk((&mut (*i915).drm) as *mut DrmDevice) as u32 };
         overflow_hw = 1u64 << 40;
         time_hw = unsafe { vlv_residency_raw(uncore, reg) };
     } else {

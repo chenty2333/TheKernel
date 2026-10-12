@@ -839,7 +839,7 @@ unsafe fn __create_shmem(
     let mut huge_mnt: *mut VfsMount;
     let filp: *mut File;
 
-    drm_gem_private_object_init((&mut (*i915).drm as *mut crate::linux_i915_private::DrmDevicePrefix).cast::<c_void>(), obj, size as usize);
+    drm_gem_private_object_init((&mut (*i915).drm as *mut crate::linux_i915_private::DrmDevice).cast::<c_void>(), obj, size as usize);
 
     // __shmem_file_setup() returns -EINVAL when size exceeds MAX_LFS_FILESIZE.
     // Match other i915 size checks by returning -E2BIG for oversized objects.

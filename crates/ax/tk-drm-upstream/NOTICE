@@ -1,0 +1,18 @@
+tk-drm-upstream: Linux DRM core type definitions and ports (x86_64, v7.2.3)
+==========================================================================
+
+Layer: platform. Depends only on tk-linux-kapi (kernel-API shims).
+
+Type modules (`*_types.rs`) are field-for-field mirrors of the C definitions
+in the Linux 7.2.3 headers named in each module's header comment (MIT-licensed
+data layouts; Linux headers are GPL-2.0-only and are cited, not copied).
+Layouts were generated from the DWARF of the configured Linux oracle
+(config/linux/7.2.3-q35-graphics.config, THP enabled) and every size and field
+offset is pinned by a compile-time assertion.
+
+Function ports (`*_upstream.rs`) mirror the Linux `.c` files named in their
+header comments. Each stub is filled by its owning batch (see the module
+header comment).
+
+Linux sources are GPL-2.0-only; these files are MIT translations of the
+structure and function behaviour and are not verbatim copies of the C text.

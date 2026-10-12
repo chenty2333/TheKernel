@@ -91,7 +91,7 @@ const _: [(); 88] = [(); core::mem::size_of::<I915DrmClientView>()];
 const _: [(); 2376] = [(); offset_of!(I915EngineUabiClassCountView, count)];
 const _: [(); 20] = [(); core::mem::size_of::<[u32; 5]>()];
 const _: [(); 4] = [(); core::mem::size_of::<Kref>()];
-const _: [(); 2536] = [(); offset_of!(DrmI915Private, wq)];
+const _: [(); 2544] = [(); offset_of!(DrmI915Private, wq)];
 
 const DRM_GEM_OBJECT_RESIDENT: c_int = 1 << 0;
 const DRM_GEM_OBJECT_PURGEABLE: c_int = 1 << 1;

@@ -235,7 +235,7 @@ const _: [(); 24] = [(); size_of::<I915Idr>()];
 const _: [(); 40] = [(); offset_of!(I915PerfMetricsPrefix, metrics_idr)];
 const I915_PERF_OFFSET: usize =
     offset_of!(DrmI915Private, runtime_pm) + size_of::<IntelRuntimePmPrefix>() + 48;
-const _: [(); 3328] = [(); I915_PERF_OFFSET];
+const _: [(); 3336] = [(); I915_PERF_OFFSET];
 const _: [(); 8] = [(); offset_of!(I915OaConfigView, uuid)];
 const _: [(); 48] = [(); offset_of!(I915OaConfigView, id)];
 const _: [(); 56] = [(); offset_of!(I915OaConfigView, mux_regs)];

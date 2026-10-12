@@ -3769,6 +3769,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tk-drm-upstream"
+version = "0.1.0"
+dependencies = [
+ "tk-linux-kapi",
+]
+
+[[package]]
 name = "tk-i2c"
 version = "0.1.0"
 
@@ -3793,6 +3800,7 @@ dependencies = [
  "tk-axhal",
  "tk-axmm",
  "tk-axtask",
+ "tk-drm-upstream",
  "tk-linux-kapi",
  "tk-mmu-notifier",
  "tk-vtd",

@@ -28,6 +28,7 @@ axlog = { workspace = true }
 axdriver_base = { package = "tk-axdriver-base", path = "../tk-axdriver-base", version = "0.1.0" }
 mmu_notifier = { workspace = true }
 tk-linux-kapi = { path = "../tk-linux-kapi" }
+tk-drm-upstream = { path = "../tk-drm-upstream" }
 
 [dependencies.kernel_guard]
 version = "0.1"

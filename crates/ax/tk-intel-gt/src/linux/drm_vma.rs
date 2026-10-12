@@ -53,12 +53,12 @@ pub unsafe extern "C" fn drm_vma_offset_add(
 ) -> c_int {
     assert!(!mgr.is_null() && !node.is_null());
     unsafe {
-        write_lock(core::ptr::addr_of_mut!((*mgr).vm_lock));
+        write_lock(core::ptr::addr_of_mut!((*mgr).vm_lock).cast());
         let vm_node = core::ptr::addr_of_mut!((*node).vm_node);
         let mut ret = 0;
         if !crate::linux::gem_memory::drm_mm_node_allocated(vm_node) {
             ret = drm_mm_insert_node_in_range(
-                core::ptr::addr_of_mut!((*mgr).vm_addr_space),
+                core::ptr::addr_of_mut!((*mgr).vm_addr_space_mm),
                 vm_node,
                 pages as u64,
                 0,
@@ -68,7 +68,7 @@ pub unsafe extern "C" fn drm_vma_offset_add(
                 DRM_MM_INSERT_BEST,
             );
         }
-        write_unlock(core::ptr::addr_of_mut!((*mgr).vm_lock));
+        write_unlock(core::ptr::addr_of_mut!((*mgr).vm_lock).cast());
         ret
     }
 }
@@ -81,13 +81,13 @@ pub unsafe extern "C" fn drm_vma_offset_remove(
 ) {
     assert!(!mgr.is_null() && !node.is_null());
     unsafe {
-        write_lock(core::ptr::addr_of_mut!((*mgr).vm_lock));
+        write_lock(core::ptr::addr_of_mut!((*mgr).vm_lock).cast());
         let vm_node = core::ptr::addr_of_mut!((*node).vm_node);
         if crate::linux::gem_memory::drm_mm_node_allocated(vm_node) {
             drm_mm_remove_node(vm_node);
             core::ptr::write_bytes(vm_node, 0, 1);
         }
-        write_unlock(core::ptr::addr_of_mut!((*mgr).vm_lock));
+        write_unlock(core::ptr::addr_of_mut!((*mgr).vm_lock).cast());
     }
 }
 
@@ -103,14 +103,14 @@ pub unsafe extern "C" fn drm_vma_offset_lookup_locked(
     let last = (start as u64).wrapping_add(pages as u64).wrapping_sub(1);
     let vm_node = unsafe {
         __drm_mm_interval_first(
-            core::ptr::addr_of!((*mgr).vm_addr_space),
+            core::ptr::addr_of!((*mgr).vm_addr_space_mm),
             start as u64,
             last,
         )
     };
     // `__drm_mm_interval_first()` returns the head sentinel when nothing
     // overlaps, as the upstream callers expect.
-    if vm_node.is_null() || vm_node == unsafe { core::ptr::addr_of_mut!((*mgr).vm_addr_space.head_node) } {
+    if vm_node.is_null() || vm_node == unsafe { core::ptr::addr_of_mut!((*mgr).vm_addr_space_mm.head_node) } {
         return core::ptr::null_mut();
     }
     let spans = unsafe {

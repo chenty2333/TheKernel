@@ -15,10 +15,7 @@ use crate::{
     linux_i915_private::DrmI915Private,
 };
 
-#[repr(C)]
-pub struct DrmDevice {
-    _opaque: [u8; 0],
-}
+pub use tk_drm_upstream::drm_device_types::DrmDevice;
 
 #[repr(C)]
 pub struct IntelRuntimePm {

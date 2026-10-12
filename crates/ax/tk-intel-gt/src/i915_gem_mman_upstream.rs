@@ -83,7 +83,7 @@ use crate::{
         MAX_SCHEDULE_TIMEOUT, PIN_MAPPABLE, PIN_NONBLOCK, PIN_NOEVICT,
         PIN_NOSEARCH, I915_GTT_VIEW_NORMAL,
     },
-    linux_i915_private::{DrmDevicePrefix, DrmI915Private},
+    linux_i915_private::DrmI915Private,
     linux_macros::unlikely,
     linux::gem_memory::{pgprot_decrypted, pgprot_noncached, PgProt},
     i915_gem_object_header_upstream::{
@@ -253,7 +253,7 @@ pub unsafe fn i915_mmap_page_set(
     if minor.is_null() || unsafe { (*minor).dev }.is_null() {
         return Err(-EINVAL);
     }
-    let dev = unsafe { (*minor).dev.cast::<DrmDevicePrefix>() };
+    let dev = unsafe { (*minor).dev.cast::<DrmDevice>() };
     if unsafe { drm_dev_is_unplugged(dev.cast()) } {
         return Err(-ENODEV);
     }
@@ -892,7 +892,7 @@ pub unsafe extern "C" fn i915_gem_object_release_mmap_offset(obj: *mut DrmI915Ge
             continue;
         }
         spin_unlock(&mut (*obj).mmo.lock);
-        drm_vma_node_unmap(&mut (*mmo).vma_node, (*(*(&(*obj).base.base).dev.cast::<DrmDevicePrefix>()).anon_inode).i_mapping);
+        drm_vma_node_unmap(&mut (*mmo).vma_node, (*(*(&(*obj).base.base).dev.cast::<DrmDevice>()).anon_inode.cast::<crate::linux_i915_private::Inode>()).i_mapping);
         spin_lock(&mut (*obj).mmo.lock);
         rb = next;
     }
@@ -922,7 +922,7 @@ unsafe fn insert_mmo(obj: *mut DrmI915GemObject, mmo: *mut I915MmapOffset) -> *m
         let pos = rb_entry!(rb, I915MmapOffset, offset);
         if (*pos).mmap_type == (*mmo).mmap_type {
             spin_unlock(&mut (*obj).mmo.lock);
-            drm_vma_offset_remove((*(&(*obj).base.base).dev.cast::<DrmDevicePrefix>()).vma_offset_manager, &mut (*mmo).vma_node);
+            drm_vma_offset_remove((*(&(*obj).base.base).dev.cast::<DrmDevice>()).vma_offset_manager, &mut (*mmo).vma_node);
             kfree(mmo.cast::<c_void>());
             return pos;
         }
@@ -946,7 +946,7 @@ unsafe fn mmap_offset_attach(obj: *mut DrmI915GemObject, mmap_type: I915MmapType
         (*mmo).mmap_type = mmap_type;
         drm_vma_node_reset(&mut (*mmo).vma_node);
 
-        let manager = (*(&(*obj).base.base).dev.cast::<DrmDevicePrefix>()).vma_offset_manager;
+        let manager = (*(&(*obj).base.base).dev.cast::<DrmDevice>()).vma_offset_manager;
         let mut err = drm_vma_offset_add(manager, &mut (*mmo).vma_node,
             (&(*obj).base.base).size / PAGE_SIZE_U64);
         if unlikely(err != 0) {
@@ -1093,7 +1093,7 @@ unsafe fn mmap_singleton(i915: *mut DrmI915Private) -> *mut File {
     if !file.is_null() { return file; }
     file = anon_inode_getfile(c"i915.gem".as_ptr(), &singleton_fops, i915.cast(), O_RDWR);
     if is_err(file) { return file; }
-    (*file).f_mapping = (*(*i915).drm.anon_inode).i_mapping;
+    (*file).f_mapping = (*(*i915).drm.anon_inode.cast::<crate::linux_i915_private::Inode>()).i_mapping;
     crate::linux::primitives::smp_store_mb(&mut (*i915).gem.mmap_singleton, file);
     drm_dev_get(core::ptr::addr_of_mut!((*i915).drm).cast());
     file
@@ -1134,7 +1134,7 @@ unsafe fn i915_gem_object_mmap(obj: *mut DrmI915GemObject, mmo: *mut I915MmapOff
 // upstream: i915_gem_mman.c i915_gem_mmap()
 pub unsafe fn i915_gem_mmap(filp: *mut File, vma: *mut VmAreaStruct) -> c_int {
     let priv_ = (*filp).private_data.cast::<DrmFile>();
-    let dev = (*(*priv_).minor).dev.cast::<DrmDevicePrefix>();
+    let dev = (*(*priv_).minor).dev.cast::<DrmDevice>();
     let mut obj: *mut DrmI915GemObject = core::ptr::null_mut();
     let mut mmo: *mut I915MmapOffset = core::ptr::null_mut();
     if drm_dev_is_unplugged(dev.cast()) { return -ENODEV; }

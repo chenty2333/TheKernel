@@ -99,10 +99,7 @@ struct DrmI915GemSetDomain {
     write_domain: u32,
 }
 
-#[repr(C)]
-pub struct DrmDevice {
-    _opaque: [u8; 0],
-}
+pub use tk_drm_upstream::drm_device_types::DrmDevice;
 
 #[repr(C)]
 pub struct DrmFile {

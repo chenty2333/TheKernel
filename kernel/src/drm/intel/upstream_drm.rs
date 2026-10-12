@@ -36,7 +36,7 @@ use intel_gt::{
         drm_core::{DrmCoreProvider, install_drm_core_provider},
         shmem,
     },
-    linux_i915_private::{DrmDevicePrefix, DrmVmaOffsetManager, Inode},
+    linux_i915_private::{DrmDevice, DrmVmaOffsetManager, Inode, initialize_drm_device},
 };
 
 #[cfg(target_os = "none")]
@@ -443,11 +443,12 @@ unsafe extern "C" fn devm_drm_dev_alloc_i915(
         (*allocation).inode.i_mapping = (*file).f_mapping.cast();
         let manager = ptr::addr_of_mut!((*allocation).vma);
         drm_mm_init(
-            ptr::addr_of_mut!((*manager).vm_addr_space),
+            ptr::addr_of_mut!((*manager).vm_addr_space_mm),
             DRM_FILE_PAGE_OFFSET_START,
             DRM_FILE_PAGE_OFFSET_SIZE,
         );
-        (*allocation).i915.drm.initialize(
+        initialize_drm_device(
+            &mut (*allocation).i915.drm,
             pdev,
             ptr::addr_of_mut!((*allocation).driver).cast(),
             ptr::addr_of_mut!((*allocation).inode),
@@ -793,7 +794,7 @@ unsafe extern "C" fn gem_free_mmap_offset(obj: *mut c_void) {
     }
     // SAFETY: DRM calls this release hook with the still-live GEM object whose
     // final reference triggered cleanup.
-    let device = unsafe { (*obj).dev.cast::<DrmDevicePrefix>() };
+    let device = unsafe { (*obj).dev.cast::<DrmDevice>() };
     let manager = if device.is_null() {
         ptr::null_mut()
     } else {
@@ -1118,7 +1119,7 @@ mod tests {
                 assert_eq!(drm.dev, parent);
                 assert_eq!(drm.dma_dev, parent);
                 assert!(!drm.driver.is_null());
-                let mapping = (*drm.anon_inode).i_mapping;
+                let mapping = (*drm.anon_inode.cast::<Inode>()).i_mapping;
                 assert_eq!(mapping, (*(*allocation).mapping_file).f_mapping.cast());
                 assert!(!mapping.is_null());
                 let mut node = core::mem::zeroed();
@@ -1130,7 +1131,7 @@ mod tests {
                 assert_eq!((*i915).bdev.dev_mapping, mapping);
                 assert_eq!((*i915).bdev.vma_manager, drm.vma_offset_manager.cast());
                 intel_region_ttm_device_fini(i915);
-                drm_mm_takedown(ptr::addr_of_mut!((*allocation).vma.vm_addr_space));
+                drm_mm_takedown(ptr::addr_of_mut!((*allocation).vma.vm_addr_space_mm));
                 shmem::fput_file((*allocation).mapping_file);
                 kfree(allocation.cast());
             }

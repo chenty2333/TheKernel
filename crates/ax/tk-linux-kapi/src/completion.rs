@@ -22,16 +22,27 @@ use crate::{
 /// `UINT_MAX`: the saturated `done` count written by `complete_all()`.
 pub const UINT_MAX: u32 = u32::MAX;
 
-/// `struct completion` from include/linux/completion.h.
-#[repr(C)]
+/// `struct completion` from include/linux/completion.h, with the x86_64
+/// layout the DRM ports embed (`done` at 0, `struct swait_queue_head wait`
+/// at 8; size 32, align 8). The swait head is opaque here: waiters poll
+/// `done` (see the module note), so only its size and alignment are kept.
+#[repr(C, align(8))]
 pub struct Completion {
     done: AtomicU32,
+    _pad: u32,
+    /// `struct swait_queue_head` (24 bytes: raw spinlock plus list head).
+    _swait: [u8; 24],
 }
+
+const _: [(); 32] = [(); core::mem::size_of::<Completion>()];
+const _: [(); 8] = [(); core::mem::offset_of!(Completion, _swait)];
 
 /// Linux `init_completion()`: a fresh completion has no pending completions.
 pub const fn init_completion() -> Completion {
     Completion {
         done: AtomicU32::new(0),
+        _pad: 0,
+        _swait: [0; 24],
     }
 }
 

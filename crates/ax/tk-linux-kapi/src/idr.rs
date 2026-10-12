@@ -20,6 +20,17 @@ use crate::{
 // its surrounding RCU read-side section.
 static RADIX_SLOTS_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
+/// `struct idr` (include/linux/idr.h): an xarray plus the allocation base and
+/// next-free cursor. Oracle DWARF size 24, align 8.
+#[repr(C)]
+pub struct Idr {
+    pub idr_rt: XArray,
+    pub idr_base: u32,
+    pub idr_next: u32,
+}
+const _: [(); 24] = [(); core::mem::size_of::<Idr>()];
+const _: [(); 16] = [(); core::mem::offset_of!(Idr, idr_base)];
+
 /// Linux `struct ida` embeds one `struct xarray` as its complete ABI.
 #[repr(C)]
 pub struct Ida {

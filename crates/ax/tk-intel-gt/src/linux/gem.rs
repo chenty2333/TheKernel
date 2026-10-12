@@ -209,17 +209,8 @@ pub unsafe extern "C" fn thekernel_dma_resv_unlock(resv: *mut c_void) {
     unsafe { dma_resv_unlock(resv) };
 }
 
-/// The `struct drm_device` member used by `drm_dev_to_dev()`.
-///
-/// Linux v7.2.3 places `dev` after `if_version` and the embedded `kref`;
-/// both fields occupy eight bytes in the configured x86_64 ABI.
-#[repr(C)]
-pub struct DrmDevice {
-    _if_version: i32,
-    _pad: u32,
-    _ref: crate::intel_context_upstream::Kref,
-    pub dev: *mut core::ffi::c_void,
-}
+/// `struct drm_device` (tk-drm-upstream mirror); `dev` is at offset 8.
+pub use tk_drm_upstream::drm_device_types::DrmDevice;
 
 #[inline]
 pub unsafe fn drm_device_device(drm: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
@@ -465,8 +456,8 @@ pub struct I915LutHandle {
 const _: [(); 480] = [(); size_of::<DrmGemObject>()];
 const _: [(); 8] = [(); align_of::<DrmGemObject>()];
 const _: [(); 8] = [(); offset_of!(DrmGemObject, dev)];
-const _: [(); 24] = [(); size_of::<DrmDevice>()];
-const _: [(); 16] = [(); offset_of!(DrmDevice, dev)];
+const _: [(); 1560] = [(); size_of::<DrmDevice>()];
+const _: [(); 8] = [(); offset_of!(DrmDevice, dev)];
 
 const _: [(); 32] = [(); size_of::<I915LutHandle>()];
 const _: [(); 8] = [(); align_of::<I915LutHandle>()];

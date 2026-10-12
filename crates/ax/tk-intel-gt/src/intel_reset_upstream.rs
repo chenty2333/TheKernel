@@ -833,7 +833,7 @@ unsafe fn revoke_mmaps(gt: *mut IntelGt) {
     if ggtt.is_null() {
         return;
     }
-    let anon = unsafe { (*(*(*gt).i915).drm.anon_inode).i_mapping };
+    let anon = unsafe { (*(*(*gt).i915).drm.anon_inode.cast::<crate::linux_i915_private::Inode>()).i_mapping };
     for index in 0..unsafe { (*ggtt).num_fences as usize } {
         let fence = unsafe { (*ggtt).fence_regs.add(index) };
         let vma = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*fence).vma)) };

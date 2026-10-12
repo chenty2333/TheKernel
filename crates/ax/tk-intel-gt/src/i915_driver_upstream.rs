@@ -1177,7 +1177,7 @@ unsafe fn i915_driver_hw_probe(dev_priv: *mut DrmI915Private) -> i32 {
         return ret;
     }
 
-    let driver_name = unsafe { driver_name_of((*dev_priv).drm.driver) };
+    let driver_name = unsafe { driver_name_of((*dev_priv).drm.driver.cast()) };
     ret = unsafe { aperture_remove_conflicting_pci_devices(pdev, driver_name) };
     if ret != 0 {
         unsafe { i915_ggtt_driver_release(dev_priv) };
@@ -1901,7 +1901,7 @@ pub unsafe fn i915_driver_shutdown(i915: *mut DrmI915Private) {
 }
 
 /// `DRM_SWITCH_POWER_OFF` (enum switch_power_state, drm_device.h).
-const DRM_SWITCH_POWER_OFF: i32 = 1;
+const DRM_SWITCH_POWER_OFF: u32 = 1;
 /// `PCI_D0`, `PCI_D1`, `PCI_D3hot`, `PCI_D3cold` (enum pci_power_t).
 const PCI_D0: u32 = 0;
 const PCI_D1: u32 = 1;

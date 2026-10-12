@@ -106,6 +106,14 @@ pub struct AtomicT {
     pub counter: i32,
 }
 
+/// `struct atomic64_t` (include/linux/atomic/atomic-long.h): one s64 counter.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub struct AtomicT64 {
+    pub counter: i64,
+}
+const _: [(); 8] = [(); core::mem::size_of::<AtomicT64>()];
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Seqcount {
@@ -115,6 +123,24 @@ pub struct Seqcount {
 // CONFIG_LOCKDEP and CONFIG_PREEMPT_RT are disabled in the source kernel
 // configuration used for this translation, so seqcount_mutex_t is seqcount_t.
 pub type SeqcountMutex = Seqcount;
+
+/// `rwlock_t` storage for the non-RT, non-debug x86_64 configuration
+/// (asserted against the oracle DWARF size of 8 bytes, align 4).
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+pub struct Rwlock {
+    _opaque: [u8; 8],
+}
+const _: [(); 8] = [(); core::mem::size_of::<Rwlock>()];
+
+/// `seqlock_t` (include/linux/seqlock_types.h): a seqcount plus a spinlock.
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+pub struct Seqlock {
+    pub seqcount: Seqcount,
+    pub lock: Spinlock,
+}
+const _: [(); 8] = [(); core::mem::size_of::<Seqlock>()];
 
 #[repr(C, align(4))]
 #[derive(Clone, Copy)]
