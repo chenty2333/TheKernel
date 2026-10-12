@@ -90,6 +90,11 @@ pub(crate) fn ready() -> bool {
         && READY.load(Ordering::Acquire) == (1usize << count) - 1
 }
 
+/// Bitmask of CPUs that have confirmed their PAT installation.
+pub(crate) fn ready_mask() -> usize {
+    READY.load(Ordering::Acquire)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1597,28 +1597,42 @@ mod globals_tests {
 /// # Safety
 /// `pdev` must be a live PCI device accepted by `i915_pci_probe`.
 pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDeviceInfo) -> i32 {
+    tk_linux_kapi::kernel_services::boot_trace_enter("gt:i915_driver_probe");
+    tk_linux_kapi::kernel_services::boot_trace_enter("gt:i915_globals_init");
     let ret = unsafe { i915_globals_init() };
+    tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_globals_init");
     if ret != 0 {
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
         return ret;
     }
     let mut ret = unsafe { pci_enable_device(pdev) };
     if ret != 0 {
         axlog::error!("Failed to enable graphics device: {}", ret);
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
         return ret;
     }
 
+    tk_linux_kapi::kernel_services::boot_trace_enter("gt:i915_driver_create");
     let i915 = match unsafe { i915_driver_create(pdev, device, info) } {
-        Ok(i915) => i915,
+        Ok(i915) => {
+            tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_create");
+            i915
+        }
         Err(err) => {
+            tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_create");
             unsafe { pci_disable_device(pdev) };
+            tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
             return err;
         }
     };
     let display = unsafe { (*i915).display };
 
     axlog::info!("i915-probe: software and TTM initialization");
+    tk_linux_kapi::kernel_services::boot_trace_enter("gt:i915_driver_early_probe");
     ret = unsafe { i915_driver_early_probe(i915) };
+    tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_early_probe");
     if ret < 0 {
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
         return unsafe { out_pci_disable(pdev, i915, ret) };
     }
 
@@ -1628,22 +1642,31 @@ pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDevi
     unsafe { intel_vgpu_detect(i915) };
 
     axlog::info!("i915-probe: GT discovery");
+    tk_linux_kapi::kernel_services::boot_trace_enter("gt:intel_gt_probe_all");
     ret = unsafe { intel_gt_probe_all(i915) };
+    tk_linux_kapi::kernel_services::boot_trace_exit("gt:intel_gt_probe_all");
     if ret < 0 {
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
         return unsafe { out_runtime_pm_put(pdev, i915, ret) };
     }
 
     axlog::info!("i915-probe: MMIO initialization");
+    tk_linux_kapi::kernel_services::boot_trace_enter("gt:i915_driver_mmio_probe");
     ret = unsafe { i915_driver_mmio_probe(i915) };
+    tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_mmio_probe");
     if ret < 0 {
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
         return unsafe { out_runtime_pm_put(pdev, i915, ret) };
     }
 
     axlog::info!("i915-probe: hardware and GGTT initialization");
+    tk_linux_kapi::kernel_services::boot_trace_enter("gt:i915_driver_hw_probe");
     ret = unsafe { i915_driver_hw_probe(i915) };
+    tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_hw_probe");
     if ret < 0 {
         // out_cleanup_mmio
         unsafe { i915_driver_mmio_release(i915) };
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
         return unsafe { out_runtime_pm_put(pdev, i915, ret) };
     }
 
@@ -1652,6 +1675,7 @@ pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDevi
         // out_cleanup_hw
         unsafe { out_cleanup_hw(i915) };
         unsafe { i915_driver_mmio_release(i915) };
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
         return unsafe { out_runtime_pm_put(pdev, i915, ret) };
     }
 
@@ -1662,6 +1686,7 @@ pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDevi
         unsafe { intel_gvt_driver_remove(i915) };
         unsafe { out_cleanup_hw(i915) };
         unsafe { i915_driver_mmio_release(i915) };
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
         return unsafe { out_runtime_pm_put(pdev, i915, ret) };
     }
 
@@ -1673,6 +1698,7 @@ pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDevi
         unsafe { intel_gvt_driver_remove(i915) };
         unsafe { out_cleanup_hw(i915) };
         unsafe { i915_driver_mmio_release(i915) };
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
         return unsafe { out_runtime_pm_put(pdev, i915, ret) };
     }
 
@@ -1684,11 +1710,14 @@ pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDevi
         unsafe { intel_gvt_driver_remove(i915) };
         unsafe { out_cleanup_hw(i915) };
         unsafe { i915_driver_mmio_release(i915) };
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
         return unsafe { out_runtime_pm_put(pdev, i915, ret) };
     }
 
     axlog::info!("i915-probe: GEM initialization");
+    tk_linux_kapi::kernel_services::boot_trace_enter("gt:i915_gem_init");
     ret = unsafe { i915_gem_init(i915) };
+    tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_gem_init");
     if ret != 0 {
         // out_cleanup_modeset2
         unsafe { intel_display_driver_remove(display) };
@@ -1698,6 +1727,7 @@ pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDevi
         unsafe { intel_gvt_driver_remove(i915) };
         unsafe { out_cleanup_hw(i915) };
         unsafe { i915_driver_mmio_release(i915) };
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
         return unsafe { out_runtime_pm_put(pdev, i915, ret) };
     }
 
@@ -1712,12 +1742,14 @@ pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDevi
 
     ret = unsafe { intel_display_driver_probe(display) };
     if ret != 0 {
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
         return unsafe { out_cleanup_gem(pdev, i915, display, ret) };
     }
 
     axlog::info!("i915-probe: DRM registration");
     ret = unsafe { i915_driver_register(i915) };
     if ret != 0 {
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
         return unsafe { out_cleanup_gem(pdev, i915, display, ret) };
     }
 
@@ -1726,6 +1758,7 @@ pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDevi
     };
     unsafe { i915_welcome_messages(i915) };
     unsafe { (*i915).do_release = true };
+    tk_linux_kapi::kernel_services::boot_trace_exit("gt:i915_driver_probe");
     0
 }
 

@@ -656,23 +656,50 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     info!("Primary CPU {cpu_id} init OK.");
     INITED_CPUS.fetch_add(1, Ordering::Release);
 
-    while !is_init_ok() {
-        core::hint::spin_loop();
+    boot_progress::trace_enter("axruntime:ap_barrier");
+    if boot_progress::boot_trace_enabled() {
+        let deadline = axhal::time::monotonic_time() + core::time::Duration::from_secs(2);
+        while !is_init_ok() {
+            if axhal::time::monotonic_time() >= deadline {
+                let cpu = axhal::percpu::this_cpu_id();
+                let total = axhal::cpu_num();
+                let ack = INITED_CPUS.load(Ordering::Acquire);
+                let expected_mask = (1usize << total) - 1;
+                panic!(
+                    "cross-CPU AP barrier timed out on CPU {cpu}: expected mask {expected_mask:#x} ({total} CPUs), acknowledged {ack}"
+                );
+            }
+            core::hint::spin_loop();
+        }
+    } else {
+        while !is_init_ok() {
+            core::hint::spin_loop();
+        }
     }
+    boot_progress::trace_exit("axruntime:ap_barrier");
 
     // Spawning allocates task state and may trigger cross-CPU TLB work.  All
     // secondary CPUs must pass their initialization barrier before the input
     // reconciliation worker can submit that work.
     #[cfg(all(feature = "input", feature = "multitask", feature = "irq"))]
-    start_input_reconcile_worker();
+    {
+        boot_progress::trace_enter("axruntime:start_input_reconcile");
+        start_input_reconcile_worker();
+        boot_progress::trace_exit("axruntime:start_input_reconcile");
+    }
 
     // Everything before `main` is now done, including every step which could
     // have stopped the machine without a console to say so.  From here the
     // kernel's own device filesystem, and with it the framebuffer console,
     // takes the screen over.
     boot_progress::cpu_phase(cpu_id,7);
+    boot_progress::trace_enter("axruntime:early_screen_kernel_main");
     early_screen_milestone("kernel main");
+    boot_progress::trace_exit("axruntime:early_screen_kernel_main");
+
+    boot_progress::trace_enter("axruntime:main");
     unsafe { main() };
+    boot_progress::trace_exit("axruntime:main");
 
     #[cfg(feature = "multitask")]
     axtask::exit(0);
@@ -849,6 +876,7 @@ fn timer_irq_context(_vector: usize, frame: &axhal::context::TrapFrame) {
 fn timer_irq_handler() {
     let now_ns = axhal::time::monotonic_time_nanos();
     if boot_progress::enabled() { boot_progress::timer(axhal::percpu::this_cpu_id(),now_ns); }
+    if boot_progress::boot_trace_enabled() { boot_progress::heartbeat(now_ns); }
     let periodic_due = advance_periodic_deadline(now_ns);
     let early_due = consume_early_deadline(now_ns);
 
