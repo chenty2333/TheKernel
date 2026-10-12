@@ -25,7 +25,7 @@ The unit is a `use crate::…` *statement*, not every path expression:
   module it names — `use crate::mm::{self as memory, SharedPages};` is the edge
   `mm`, not two edges — and `use crate::{self as k, syscall};` is `syscall`.
 - The source module is the first path component under `kernel/src`
-  (`:39-44`), so `drm/intel/fb.rs` and `drm/gem.rs` are both `drm`.
+  (`:39-44`), so `drm/intel/initial_plane.rs` and `drm/gem.rs` are both `drm`.
 - A module reaching its own subtree is not coupling and is dropped (`:99`).
 
 Because the unit is the import, retiring a baseline edge proves the `use` line
@@ -86,7 +86,7 @@ something it contains.  All five recorded edges point that way, and one of them
 runs both directions at once:
 
 - `crate::file` — `kernel/src/drm/dmabuf.rs:12` and
-  `kernel/src/drm/syncobj.rs:10` both `use crate::file::{FileLike, Kstat}`,
+  `kernel/src/drm/syncobj/{mod,chain,sync_file}.rs` both `use crate::file::{FileLike, Kstat}`,
   where `FileLike` is the kernel-wide file-object trait
   (`kernel/src/file/types.rs:612`) and `Kstat` its stat shape
   (`kernel/src/file/types.rs:30`).  A DRM object *is* a file object in this

@@ -1,19 +1,20 @@
 # Licensing map
 
-> **2026-10-12 (i915 unification phase 1).** The `tk-intel-display` crate
-> (Linux 7.2.3 display translations) and the native display/GT modules under
-> `kernel/src/drm/intel/` (modeset, fastboot, GTT, native GEM, hotplug, DMC,
-> GMBUS, and the rest) were deleted. Paths and attribution rows below that
-> name them describe removed code and are kept as the record of what was
-> shipped before this change. The i915 port in `crates/ax/tk-intel-gt`, its
-> `NOTICE` and `LICENSE-MIT`, remain the attribution for the GPU code that
-> ships. The Linux-excerpt baseline in `tests/ci/test_linux_excerpt_baseline.py`
-> was measured before the deletion and must be re-scanned.
-
 Measured on the `dev` worktree, commit `d38a2db7` plus uncommitted WIP,
 2026-09-21. This file states what the repository actually contains and what a
 redistributor must do. It does not change any license expression, feature
 wiring, or dependency edge; where a change is needed, it says who owns it.
+
+Under the current design (i915 unification), the native Intel display and GT
+stack under `kernel/src/drm/intel/` (modeset, fastboot, GTT, native GEM, hotplug,
+DMC, GMBUS, and the rest) and the `tk-intel-display` crate were removed. The Linux
+i915 port in `crates/ax/tk-intel-gt` is the sole GPU owner, while
+`kernel/src/drm/intel/initial_plane.rs` keeps the firmware framebuffer console;
+the Linux display port is pending on `dev`. Paths and attribution rows below
+that name the removed display components describe historical code and are kept
+as the record of what was shipped before this change. The i915 port in
+`crates/ax/tk-intel-gt`, its `NOTICE`, and `LICENSE-MIT`, remain the active
+attribution for the GPU code that ships.
 
 ## 1. License map
 
@@ -344,7 +345,13 @@ the merged baseline image remains 160 MiB. It contains no OEM firmware tables.
 
 ## MIT i915 display translation (Codex D, 2026-10-05)
 
-`crates/ax/tk-intel-display` is MIT Rust translated from the individually checked
+In the current design, the native Intel display/GT stack and the `tk-intel-display` crate
+have been removed (the i915 port in `crates/ax/tk-intel-gt` is the sole GPU owner,
+`kernel/src/drm/intel/initial_plane.rs` keeps the firmware framebuffer, and the Linux display
+port is pending on `dev`). The record below is preserved as historical licensing documentation
+of those translations.
+
+`crates/ax/tk-intel-display` was MIT Rust translated from the individually checked
 MIT files of Linux 7.2.3 i915, not part of the earlier “original Rust only” rule.
 Its `NOTICE` lists the exact included functions; each translation file names
 its source and retains the upstream copyright. `LICENSE-MIT` ships the full
@@ -779,7 +786,7 @@ Intel); its SPDX tag and crate `LICENSE-MIT` preserve the grant.
 `tk-intel-display/src/intel_display_modeset_full.rs` translates 223 of 273
 mode/modeset functions in Linux 7.2.3 `intel_display.c` (MIT, © 2006-2007
 Intel); the target-inapplicable generations and framework/debug boundaries
-are named in `docs/design/intel-display-modeset-full.md`. Its SPDX tag and
+are named in `docs/history/intel-display-modeset-full.md`. Its SPDX tag and
 crate `LICENSE-MIT` preserve the grant.
 
 `kernel/src/drm/color_mgmt_full.rs` translates 26 color-management functions
