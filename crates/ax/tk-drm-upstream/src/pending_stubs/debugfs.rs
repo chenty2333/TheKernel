@@ -17,3 +17,14 @@ pub unsafe extern "C" fn drm_debugfs_crtc_add(_crtc: *mut DrmCrtc) {}
 // upstream: drivers/gpu/drm/drm_debugfs.c drm_debugfs_crtc_remove()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_debugfs_crtc_remove(_crtc: *mut DrmCrtc) {}
+
+// upstream: drivers/gpu/drm/drm_debugfs_crc.c drm_crtc_add_crc_entry()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_crtc_add_crc_entry(
+    _crtc: *mut DrmCrtc,
+    _has_frame: bool,
+    _frame: u32,
+    _crcs: *const u32,
+) -> i32 {
+    -tk_linux_kapi::config::EINVAL
+}

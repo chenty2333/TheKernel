@@ -8,6 +8,7 @@
 pub mod atomic_b2a;
 pub mod bridge;
 pub mod debugfs;
+pub mod dp_b2d;
 pub mod drm_client_probe;
 pub mod drm_file_events;
 pub mod drm_lease;
