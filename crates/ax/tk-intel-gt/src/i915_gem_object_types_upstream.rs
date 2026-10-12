@@ -42,10 +42,6 @@ pub struct I915Frontbuffer {
     _opaque: [u8; 0],
 }
 pub use crate::linux::mm::VmOperationsStruct;
-#[repr(C)]
-pub struct Page {
-    _opaque: [u8; 0],
-}
 
 // `struct i915_lut_handle` at i915_gem_object_types.h:31-35.
 #[repr(C)]
@@ -442,3 +438,6 @@ const _: [(); 928] = [(); core::mem::offset_of!(DrmI915GemObject, ttm)];
 const _: [(); 1008] = [(); core::mem::offset_of!(DrmI915GemObject, pxp_key_instance)];
 const _: [(); 1016] = [(); core::mem::offset_of!(DrmI915GemObject, bit_17)];
 const _: [(); 1024] = [(); core::mem::offset_of!(DrmI915GemObject, backing)];
+
+// Kernel layouts owned by tk-linux-kapi (generic Linux records; see its types.rs).
+pub use tk_linux_kapi::types::{Page};

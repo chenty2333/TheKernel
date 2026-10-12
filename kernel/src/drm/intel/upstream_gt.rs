@@ -340,7 +340,7 @@ pub(super) fn install_providers() -> Result<(), &'static str> {
     axmm::install_kernel_map_tlb_sync(kernel_map_tlb_sync)
         .map_err(|_| "kernel-map TLB synchronizer already installed with another owner")?;
     intel_gt::linux_pm::install_runtime_pm_ops(&RUNTIME_PM_OPS)?;
-    intel_gt::linux::signal::install_signal_pending_state(kernel_signal_pending_state)?;
+    tk_linux_kapi::signal::install_signal_pending_state(kernel_signal_pending_state)?;
     let reader: intel_gt::linux::i915::I915PciRevisionReader =
         // SAFETY: both types are `unsafe extern "C" fn` pointers of identical
         // ABI; the reader ignores its `i915` argument (single GT device).
@@ -1121,7 +1121,7 @@ unsafe impl Sync for AnonFile {}
 impl Drop for AnonFile {
     fn drop(&mut self) {
         // SAFETY: this wrapper owns one file reference, dropped exactly once here.
-        unsafe { intel_gt::linux::shmem::fput(self.file as *mut c_void) };
+        unsafe { tk_linux_kapi::shmem::fput(self.file as *mut c_void) };
     }
 }
 
@@ -1165,8 +1165,8 @@ unsafe extern "C" fn kernel_anon_inode_getfile(
     flags: c_int,
 ) -> *mut c_void {
     // SAFETY: `name` is the caller's NUL-terminated C string (Linux `anon_inode_getfile` contract).
-    let file = unsafe { intel_gt::linux::shmem::shmem_file_setup(name, 0, 0) };
-    if intel_gt::linux_config::IS_ERR(file) {
+    let file = unsafe { tk_linux_kapi::shmem::shmem_file_setup(name, 0, 0) };
+    if tk_linux_kapi::config::IS_ERR(file) {
         return file.cast();
     }
     // SAFETY: `file` was just returned non-null by `shmem_file_setup` and is not yet shared.
@@ -1421,7 +1421,7 @@ unsafe extern "C" fn kernel_pci_enable_msi(dev: *mut c_void) -> c_int {
         return -ENODEV_;
     };
     match irq_msi_vector(bdf) {
-        Some(vector) if intel_gt::linux::dma::device_irq(dev) == vector => 0,
+        Some(vector) if tk_linux_kapi::dma::device_irq(dev) == vector => 0,
         None => -ENOSPC,
         Some(_) => -ENOSPC,
     }
@@ -1567,13 +1567,13 @@ unsafe extern "C" fn kernel_pci_resource_flags(dev: *mut c_void, bar: c_int) -> 
 /// Enforce the advertised DMA masks in the owner that publishes each SG or
 /// coherent mapping, rather than accepting an address width without using it.
 unsafe extern "C" fn kernel_dma_set_mask(dev: *mut c_void, mask: u64) -> c_int {
-    intel_gt::linux::dma::set_mask(dev, mask, false).map_or(-EIO_, |()| 0)
+    tk_linux_kapi::dma::set_mask(dev, mask, false).map_or(-EIO_, |()| 0)
 }
 unsafe extern "C" fn kernel_dma_set_coherent_mask(dev: *mut c_void, mask: u64) -> c_int {
-    intel_gt::linux::dma::set_mask(dev, mask, true).map_or(-EIO_, |()| 0)
+    tk_linux_kapi::dma::set_mask(dev, mask, true).map_or(-EIO_, |()| 0)
 }
 unsafe extern "C" fn kernel_dma_set_max_seg_size(dev: *mut c_void, size: u32) {
-    intel_gt::linux::dma::set_max_segment(dev, size).expect("i915: invalid DMA segment owner/limit");
+    tk_linux_kapi::dma::set_max_segment(dev, size).expect("i915: invalid DMA segment owner/limit");
 }
 
 /// The upstream GT does not own display takeover. Native KMS publishes its
@@ -2060,7 +2060,7 @@ static UNCORE_KERNEL_OPS: UncoreKernelOps = UncoreKernelOps {
 
 /// Install every round-4 K2 table. Called from `install_providers()`.
 fn install_k2_tables() -> Result<(), &'static str> {
-    intel_gt::linux::kernel_services::install_task_ops(&TASK_OPS)?;
+    tk_linux_kapi::kernel_services::install_task_ops(&TASK_OPS)?;
     install_file_ops(&FILE_OPS)?;
     install_pci_ops(&PCI_OPS)?;
     install_pm_ops(&PM_OPS)?;

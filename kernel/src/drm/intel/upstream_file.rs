@@ -111,10 +111,10 @@ impl UpstreamFile {
         }
         // SAFETY: the static C string is NUL-terminated and remains live for the call.
         let filp = unsafe {
-            intel_gt::linux::shmem::shmem_file_setup(c"i915-drm-ofd".as_ptr(), 0, 0)
+            tk_linux_kapi::shmem::shmem_file_setup(c"i915-drm-ofd".as_ptr(), 0, 0)
         };
-        if intel_gt::linux_config::IS_ERR(filp) {
-            let error = linux_errno(intel_gt::linux_config::PTR_ERR(filp));
+        if tk_linux_kapi::config::IS_ERR(filp) {
+            let error = linux_errno(tk_linux_kapi::config::PTR_ERR(filp));
             // SAFETY: both allocations and the shmem file are still owned here.
             unsafe {
                 kfree(drm_file.cast());
@@ -151,7 +151,7 @@ impl UpstreamFile {
                 unsafe {
                     kfree(drm_file.cast());
                     kfree(minor.cast());
-                    intel_gt::linux::shmem::fput_file(filp);
+                    tk_linux_kapi::shmem::fput_file(filp);
                 }
                 return Err(error);
             }
@@ -167,7 +167,7 @@ impl UpstreamFile {
             unsafe {
                 kfree(drm_file.cast());
                 kfree(minor.cast());
-                intel_gt::linux::shmem::fput_file(filp);
+                tk_linux_kapi::shmem::fput_file(filp);
             }
             return Err(linux_errno(result));
         }
@@ -194,7 +194,7 @@ impl UpstreamFile {
         let _active = NativeFileBinding::bind(self.drm_file, native)?;
         // SAFETY: self retains the live shmem file until close(); the native file is borrowed.
         unsafe {
-            (*(self.filp as *mut intel_gt::linux::shmem::File)).f_flags = native.open_flags();
+            (*(self.filp as *mut tk_linux_kapi::shmem::File)).f_flags = native.open_flags();
         }
         let size = ((cmd >> 16) & 0x3fff) as usize;
         if size == 0 || size > MAX_IOCTL_BYTES {
@@ -274,7 +274,7 @@ impl UpstreamFile {
         .map_err(|_| DrmError::Busy)?;
         // SAFETY: self owns the still-live shmem file; native is borrowed for this call.
         unsafe {
-            (*(self.filp as *mut intel_gt::linux::shmem::File)).f_flags = native.open_flags();
+            (*(self.filp as *mut tk_linux_kapi::shmem::File)).f_flags = native.open_flags();
         }
         let result = delete_file_handle(
             self.drm_file as *mut gem::DrmFile,
@@ -298,7 +298,7 @@ impl UpstreamFile {
         let _active = NativeFileBinding::bind(self.drm_file, native).map_err(|_| -16)?;
         // SAFETY: self owns the still-live shmem file; native is borrowed for this call.
         unsafe {
-            (*(self.filp as *mut intel_gt::linux::shmem::File)).f_flags = native.open_flags();
+            (*(self.filp as *mut tk_linux_kapi::shmem::File)).f_flags = native.open_flags();
         }
         let drm_file = self.drm_file as *mut gem::DrmFile;
         {
@@ -389,7 +389,7 @@ impl UpstreamFile {
         let _active = NativeFileBinding::bind(self.drm_file, native).ok();
         // SAFETY: self still owns the live shmem file and native is borrowed for this close.
         unsafe {
-            (*(self.filp as *mut intel_gt::linux::shmem::File)).f_flags = native.open_flags();
+            (*(self.filp as *mut tk_linux_kapi::shmem::File)).f_flags = native.open_flags();
         }
         let handles = FILES
             .lock()
@@ -410,7 +410,7 @@ impl UpstreamFile {
         FILES.lock().remove(&self.drm_file);
         // SAFETY: close owns these allocations and the shmem file after postclose returned.
         unsafe {
-            intel_gt::linux::shmem::fput_file(self.filp as *mut intel_gt::linux::shmem::File);
+            tk_linux_kapi::shmem::fput_file(self.filp as *mut tk_linux_kapi::shmem::File);
             kfree(self.drm_file as *mut c_void);
             kfree(self.minor as *mut c_void);
         }

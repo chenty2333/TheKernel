@@ -21,16 +21,6 @@ use crate::{
     linux_list::{INIT_LIST_HEAD, list_add_tail, list_del_init},
 };
 
-/// `struct ww_acquire_ctx` storage for the selected x86_64 config:
-/// RT/debug WW/lockdep disabled.
-#[repr(C, align(8))]
-pub struct WwAcquireCtx {
-    pub task: *mut c_void,
-    pub stamp: u64,
-    pub acquired: u32,
-    pub wounded: u16,
-    pub is_wait_die: u16,
-}
 
 /// `struct i915_gem_ww_ctx` from the MIT `i915_gem_ww.h` owner header.
 #[repr(C)]
@@ -127,3 +117,6 @@ pub unsafe fn i915_gem_ww_ctx_backoff(ww: *mut I915GemWwCtx) -> i32 {
     unsafe { (*ww).contended = core::ptr::null_mut() };
     ret
 }
+
+// Kernel layouts owned by tk-linux-kapi (generic Linux records; see its types.rs).
+pub use tk_linux_kapi::types::{WwAcquireCtx};

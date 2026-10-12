@@ -91,70 +91,18 @@ use crate::{
 // CONFIG_DRM_I915_SW_FENCE_CHECK_DAG are unset, so those conditional fields
 // are absent here.
 
-#[repr(C)]
-pub struct RefcountT {
-    pub refs: AtomicT,
-}
 
-#[repr(C)]
-pub struct Kref {
-    pub refcount: RefcountT,
-}
 
-#[repr(C, align(8))]
-pub struct RcuHead {
-    pub next: *mut RcuHead,
-    pub func: Option<unsafe extern "C" fn(*mut RcuHead)>,
-}
 
-#[repr(C)]
-pub union DmaFenceLock {
-    pub extern_lock: *mut Spinlock,
-    pub inline_lock: Spinlock,
-}
 
-#[repr(C)]
-pub union DmaFenceTimestamp {
-    pub cb_list: ManuallyDrop<ListHead>,
-    pub timestamp: i64,
-    pub rcu: ManuallyDrop<RcuHead>,
-}
 
-#[repr(C)]
-pub struct DmaFence {
-    pub lock: DmaFenceLock,
-    pub ops: *const c_void,
-    pub timestamp_union: DmaFenceTimestamp,
-    pub context: u64,
-    pub seqno: u64,
-    pub flags: c_ulong,
-    pub refcount: Kref,
-    pub error: i32,
-}
 
-impl core::ops::Deref for DmaFence {
-    type Target = DmaFenceTimestamp;
-
-    fn deref(&self) -> &Self::Target {
-        &self.timestamp_union
-    }
-}
 
 const _: [(); 64] = [(); core::mem::size_of::<DmaFence>()];
 const _: [(); 48] = [(); core::mem::offset_of!(DmaFence, flags)];
 const _: [(); 56] = [(); core::mem::offset_of!(DmaFence, refcount)];
 
-#[repr(C)]
-pub struct DmaFenceCb {
-    pub node: ListHead,
-    pub func: Option<unsafe extern "C" fn(*mut DmaFence, *mut DmaFenceCb)>,
-}
 
-#[repr(C)]
-pub struct WaitQueueHead {
-    pub lock: Spinlock,
-    pub head: ListHead,
-}
 
 #[repr(C)]
 pub struct I915ActiveFence {
@@ -162,35 +110,7 @@ pub struct I915ActiveFence {
     pub cb: DmaFenceCb,
 }
 
-#[repr(C)]
-pub struct XArray {
-    pub xa_lock: Spinlock,
-    pub xa_flags: u32,
-    pub xa_head: *mut c_void,
-}
-const _: [(); 16] = [(); core::mem::size_of::<XArray>()];
 
-// Linux v7.2.3 framework records embedded by value in i915_vma and
-// i915_request. Their storage is kernel-owned; only their ABI size/alignment
-// is needed by this source file.
-#[repr(C, align(8))]
-pub struct DrmMmNode {
-    pub color: c_ulong,
-    pub start: u64,
-    pub size: u64,
-    pub mm: *mut crate::linux::gem_memory::DrmMm,
-    pub node_list: ListHead,
-    pub hole_stack: ListHead,
-    pub rb: RbNode,
-    pub rb_hole_size: RbNode,
-    pub rb_hole_addr: RbNode,
-    pub subtree_last: u64,
-    pub hole_size: u64,
-    pub subtree_max_hole: u64,
-    pub flags: c_ulong,
-}
-const _: [(); 168] = [(); core::mem::size_of::<DrmMmNode>()];
-const _: [(); 160] = [(); core::mem::offset_of!(DrmMmNode, flags)];
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -217,37 +137,10 @@ const _: [(); 8] = [(); core::mem::offset_of!(IntelPartialInfo, size)];
 const _: [(); 4] = [(); core::mem::align_of::<I915GttView>()];
 const _: [(); 4] = [(); core::mem::offset_of!(I915GttView, info)];
 
-#[repr(C, align(8))]
-pub struct IrqWork {
-    pub node: IrqWorkNode,
-    pub func: Option<unsafe extern "C" fn(*mut IrqWork)>,
-    pub irqwait: *mut c_void,
-}
 
-#[repr(C)]
-pub struct IrqWorkNode {
-    pub next: *mut IrqWorkNode,
-    pub flags: AtomicT,
-    pub src: u16,
-    pub dst: u16,
-}
 
-#[repr(C, align(8))]
-pub struct Hrtimer {
-    _opaque: [u8; 80],
-}
 
-#[repr(C, align(8))]
-pub struct WaitQueueEntry {
-    pub flags: u32,
-    pub private: *mut c_void,
-    pub func: Option<unsafe extern "C" fn(*mut WaitQueueEntry, u32, i32, *mut c_void) -> i32>,
-    pub entry: ListHead,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PinCookie;
 
 // Pointer-only Linux types. These are intentionally incomplete just like C
 // forward declarations; fields embedded in the records below have explicit
@@ -256,15 +149,6 @@ pub struct PinCookie;
 pub struct I915VmaOps {
     _opaque: [u8; 0],
 }
-#[repr(C)]
-pub struct SgTable {
-    pub sgl: *mut crate::i915_gem_pages_upstream::Scatterlist,
-    pub nents: u32,
-    pub orig_nents: u32,
-}
-const _: [(); 16] = [(); core::mem::size_of::<SgTable>()];
-const _: [(); 0] = [(); core::mem::offset_of!(SgTable, sgl)];
-const _: [(); 8] = [(); core::mem::offset_of!(SgTable, nents)];
 #[repr(C)]
 pub struct SgEntry {
     _opaque: [u8; 0],
@@ -281,25 +165,7 @@ const _: [(); 232] = [(); core::mem::size_of::<I915MmapOffset>()];
 const _: [(); 192] = [(); core::mem::offset_of!(I915MmapOffset, obj)];
 const _: [(); 208] = [(); core::mem::offset_of!(I915MmapOffset, offset)];
 
-#[repr(C, align(8))]
-pub struct DrmVmaOffsetNode {
-    _vm_lock: [u8; 8],
-    pub vm_node: DrmMmNode,
-    pub vm_files: crate::intel_engine_cs_upstream::RbRoot,
-    pub driver_private: *mut c_void,
-}
-const _: [(); 192] = [(); core::mem::size_of::<DrmVmaOffsetNode>()];
-const _: [(); 8] = [(); core::mem::offset_of!(DrmVmaOffsetNode, vm_node)];
-const _: [(); 176] = [(); core::mem::offset_of!(DrmVmaOffsetNode, vm_files)];
-const _: [(); 184] = [(); core::mem::offset_of!(DrmVmaOffsetNode, driver_private)];
 
-#[repr(C)]
-pub struct RadixTreeRoot {
-    pub height: u32,
-    pub gfp_mask: u32,
-    pub rnode: *mut c_void,
-}
-const _: [(); 16] = [(); core::mem::size_of::<RadixTreeRoot>()];
 
 /// Exact Linux v7.2.3 x86_64 `drm_gem_object` fields accessed by the i915 GEM
 /// paths. Its 480-byte storage reflects the C union with `ttm_buffer_object`;
@@ -1005,3 +871,6 @@ pub unsafe fn intel_context_revoke(ce: *mut IntelContext) -> bool {
 
 // Upstream's trailing CONFIG_DRM_I915_SELFTEST include is not an intel_context.c
 // function; the test implementation remains in the separate source file.
+
+// Kernel layouts owned by tk-linux-kapi (generic Linux records; see its types.rs).
+pub use tk_linux_kapi::types::{RefcountT, Kref, RcuHead, DmaFenceLock, DmaFenceTimestamp, DmaFence, DmaFenceCb, WaitQueueHead, XArray, DrmMmNode, Hrtimer, WaitQueueEntry, PinCookie, SgTable, DrmVmaOffsetNode, RadixTreeRoot, IrqWork, IrqWorkNode};

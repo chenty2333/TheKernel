@@ -53,23 +53,7 @@ pub struct I915Dependency {
     pub flags: c_ulong,
 }
 
-#[repr(C)]
-pub union TaskletCallbacks {
-    pub func: Option<unsafe extern "C" fn(c_ulong)>,
-    pub callback: Option<unsafe extern "C" fn(*mut TaskletStruct)>,
-}
 
-/// `struct tasklet_struct` from linux/interrupt.h, embedded by the scheduler
-/// engine header.
-#[repr(C)]
-pub struct TaskletStruct {
-    pub next: *mut TaskletStruct,
-    pub state: c_ulong,
-    pub count: AtomicT,
-    pub use_callback: bool,
-    pub callbacks: TaskletCallbacks,
-    pub data: c_ulong,
-}
 
 /// `struct i915_priolist` from i915_priolist_types.h, embedded by value in
 /// `i915_sched_engine`.
@@ -125,3 +109,6 @@ const _: [(); 208] = [(); core::mem::offset_of!(I915SchedEngine, schedule)];
 
 /// C tag alias used by `i915_priolist_types.h` consumers.
 pub type i915_priolist = I915Priolist;
+
+// Kernel layouts owned by tk-linux-kapi (generic Linux records; see its types.rs).
+pub use tk_linux_kapi::types::{TaskletStruct, TaskletCallbacks};

@@ -184,115 +184,22 @@ macro_rules! opaque_c_layout {
 
 opaque_c_layout!(Kobject, 64, 8);
 opaque_c_layout!(I915PerfGt, 40, 8);
-opaque_c_layout!(Mutex, 24, 8);
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ListHead {
-    pub next: *mut ListHead,
-    pub prev: *mut ListHead,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct LlistNode {
-    pub next: *mut LlistNode,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct LlistHead {
-    pub first: *mut LlistNode,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct HlistNode {
-    pub next: *mut HlistNode,
-    pub pprev: *mut *mut HlistNode,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct HlistHead {
-    pub first: *mut HlistNode,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct RbNode {
-    pub parent_color: usize,
-    pub right: *mut RbNode,
-    pub left: *mut RbNode,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct RbRoot {
-    pub node: *mut RbNode,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct RbRootCached {
-    pub root: RbRoot,
-    pub leftmost: *mut RbNode,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct TimerList {
-    pub entry: HlistNode,
-    pub expires: c_ulong,
-    pub function: Option<unsafe extern "C" fn(*mut TimerList)>,
-    pub flags: u32,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct WorkStruct {
-    pub data: c_ulong,
-    pub entry: ListHead,
-    pub function: Option<unsafe extern "C" fn(*mut WorkStruct)>,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct DelayedWork {
-    pub work: WorkStruct,
-    pub timer: TimerList,
-    pub workqueue: *mut c_void,
-    pub cpu: i32,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct AtomicT {
-    pub counter: i32,
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Seqcount {
-    pub sequence: u32,
-}
 
-// CONFIG_LOCKDEP and CONFIG_PREEMPT_RT are disabled in the source kernel
-// configuration used for this translation, so seqcount_mutex_t is seqcount_t.
-pub type SeqcountMutex = Seqcount;
 
-#[repr(C, align(4))]
-#[derive(Clone, Copy)]
-pub struct Spinlock {
-    _opaque: [u8; 4],
-}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct AtomicNotifierHead {
-    pub lock: Spinlock,
-    pub head: *mut c_void,
-}
 
 // Guard the two source-derived top-level bindings against accidental layout
 // drift for the configured x86_64 Linux v7.2.3 structures.
@@ -3132,3 +3039,6 @@ pub unsafe extern "C" fn xehp_enable_ccs_engines(engine: *mut IntelEngineCs) {
         REG_MASKED_FIELD_ENABLE!(GEN12_RCU_MODE_CCS_ENABLE),
     );
 }
+
+// Kernel layouts owned by tk-linux-kapi (generic Linux records; see its types.rs).
+pub use tk_linux_kapi::types::{Mutex, ListHead, LlistNode, LlistHead, HlistNode, HlistHead, RbNode, RbRoot, RbRootCached, TimerList, WorkStruct, DelayedWork, AtomicT, Seqcount, SeqcountMutex, Spinlock, AtomicNotifierHead};

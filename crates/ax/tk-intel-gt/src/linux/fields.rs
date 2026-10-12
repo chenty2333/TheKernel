@@ -14,6 +14,7 @@ use core::{
 
 // The LinuxKPI field prelude re-exports the canonical i915 header record; do
 // not keep a second, subtly different breadcrumb layout here.
+pub use tk_linux_kapi::fields::*;
 pub use crate::intel_breadcrumbs_types_upstream::{IntelBreadcrumbs, intel_breadcrumbs};
 use crate::{
     intel_context_upstream::{DrmI915GemObject, IrqWork, Kref},
@@ -108,12 +109,6 @@ pub struct I915GpuCoredump {
 /// `struct intel_wakeref` used by `intel_engine_cs`.
 pub type IntelWakerefT = Option<NonNull<c_void>>;
 
-/// `ktime_t` from `include/linux/ktime.h` on the source x86_64 ABI.
-pub type KtimeT = i64;
-
-/// Rust spelling used for the same source `ktime_t` value by the engine file.
-pub type Ktime = KtimeT;
-
 /// `intel_engine_mask_t` from `gt/intel_engine_types.h`.
 pub type IntelEngineMaskT = IntelEngineMask;
 
@@ -136,49 +131,6 @@ pub use crate::i915_request_types_upstream::{
     I915_REQUEST_UNKNOWN, I915RequestState,
 };
 
-/// `struct lock_class_key` with `CONFIG_LOCKDEP=n` in the task's Linux config.
-/// Linux declares this as an empty C extension struct in that configuration;
-/// its Rust representation is consequently zero-sized and is never embedded
-/// in any runtime record here.
-#[repr(C)]
-pub struct LockClassKey {}
-
-/// `va_format` from include/linux/kernel.h, used by DRM printer callbacks.
-#[repr(C)]
-pub struct VaFormat {
-    pub fmt: *const c_char,
-    pub va: *mut VaList,
-}
-
-/// Opaque C `va_list` storage; it is passed through to the configured printer
-/// callback but never inspected or formatted by Rust.
-#[repr(C)]
-pub struct VaList {
-    _opaque: [u8; 0],
-}
-
-/// `struct drm_printer` from include/drm/drm_print.h. Its callbacks and opaque
-/// argument are the Linux ABI boundary; keep Rust-owned buffers out of this
-/// record so source pointers retain the exact C layout.
-#[repr(C)]
-pub struct DrmPrinter {
-    pub printfn: Option<unsafe extern "C" fn(*mut DrmPrinter, *mut VaFormat)>,
-    pub puts: Option<unsafe extern "C" fn(*mut DrmPrinter, *const c_char)>,
-    pub arg: *mut c_void,
-    pub origin: *const c_void,
-    pub prefix: *const c_char,
-    pub line: DrmPrinterLine,
-}
-
-#[repr(C)]
-pub struct DrmPrinterLine {
-    pub series: u32,
-    pub counter: u32,
-}
-
-const _: [(); 48] = [(); size_of::<DrmPrinter>()];
-const _: [(); 40] = [(); offset_of!(DrmPrinter, line)];
-const _: [(); 8] = [(); size_of::<DrmPrinterLine>()];
 
 /// Forward-declared in `i915_gpu_error.h`; the execlists translation only
 /// passes/tests this opaque pointer and does not access its private fields.

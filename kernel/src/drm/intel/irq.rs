@@ -84,7 +84,7 @@ pub(super) mod upstream {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use intel_gt::i915_irq_upstream::{DisplayIrqOps, install_display_irq_ops};
-    use intel_gt::linux::kernel_core::{IrqCoreOps, install_irq_core_ops};
+    use tk_linux_kapi::kernel_core::{IrqCoreOps, install_irq_core_ops};
     use intel_gt::linux_i915_private::DrmI915Private;
 
     use super::{
@@ -152,7 +152,7 @@ pub(super) mod upstream {
             None => reserve_upstream_msi(bdf)?,
         };
         let device = super::super::upstream_gt::native_pci_device(bdf);
-        if intel_gt::linux::dma::set_device_irq(device, vector).is_err() {
+        if tk_linux_kapi::dma::set_device_irq(device, vector).is_err() {
             disable_msi(bdf);
             return Err("DMA device did not accept the reserved MSI vector");
         }

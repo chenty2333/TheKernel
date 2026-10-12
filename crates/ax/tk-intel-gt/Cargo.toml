@@ -27,6 +27,7 @@ drm-i915-capture-error = []
 axlog = { workspace = true }
 axdriver_base = { package = "tk-axdriver-base", path = "../tk-axdriver-base", version = "0.1.0" }
 mmu_notifier = { workspace = true }
+tk-linux-kapi = { path = "../tk-linux-kapi" }
 
 [dependencies.kernel_guard]
 version = "0.1"

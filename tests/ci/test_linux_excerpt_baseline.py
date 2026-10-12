@@ -44,9 +44,13 @@ WINDOW = 14
 SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     ("crates/linux", 40): (110, 49, 20, 25, 0, 18, 21),
     ("kernel/src", 40): (85, 41, 19, 142, 9, 0, 0),
-    ("crates/ax", 40): (0, 0, 0, 706, 677, 0, 0),
+    ("crates/ax", 40): (0, 0, 0, 707, 678, 0, 0),
     ("crates/linux", 25): (211, 59, 22, 41, 3, 20, 21),
     ("kernel/src", 25): (157, 50, 24, 321, 25, 0, 0),
+# 2026-10-12 (B0, tk-linux-kapi extraction): the generic shims moved from
+# tk-intel-gt into crates/ax/tk-linux-kapi with their Linux code lines unchanged;
+# the scan moves by the new i2c.rs flag line (identical Linux text) at >= 40
+# (706/677 -> 707/678) and by three lines at >= 25 (1894/1858 -> 1897/1861).
 # 2026-10-12 (i915 unification phase 1): the `tk-intel-display` crate and the
 # native display/GT modules were deleted. Re-scan moves: crates/ax at 40 895/721
 # -> 706/677, at 25 2155/1974 -> 1894/1858; kernel/src at 40 86/42/20 -> 85/41/19
@@ -63,7 +67,7 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # lines in the newly translated FreeBSD drivers and the OpenBSD iwx/net80211
 # translations, plus one FreeBSD ig4 register line. Those have BSD-source
 # provenance, not Linux provenance; see `docs/upstream-provenance.md`.
-    ("crates/ax", 25): (18, 15, 4, 1894, 1858, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 1897, 1861, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their

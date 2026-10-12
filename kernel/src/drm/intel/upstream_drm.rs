@@ -55,7 +55,7 @@ unsafe extern "C" {
     /// Linux `kmalloc()`, exported under its C name by `tk-intel-gt`.
     fn kmalloc(size: usize, flags: u32) -> *mut c_void;
     fn kfree(object: *mut c_void);
-    fn drm_mm_init(mm: *mut intel_gt::linux::gem_memory::DrmMm, start: u64, size: u64);
+    fn drm_mm_init(mm: *mut tk_linux_kapi::types::DrmMm, start: u64, size: u64);
     fn drm_vma_offset_remove(
         manager: *mut DrmVmaOffsetManager,
         node: *mut intel_gt::intel_context_upstream::DrmVmaOffsetNode,
@@ -422,7 +422,7 @@ unsafe extern "C" fn devm_drm_dev_alloc_i915(
     // SAFETY: the name is a static NUL-terminated string and the LinuxKPI
     // shmem helper accepts a zero-sized file to be grown on later faults.
     let file = unsafe { shmem::shmem_file_setup(c"drm".as_ptr(), 0, 0) };
-    if intel_gt::linux_config::IS_ERR(file) {
+    if tk_linux_kapi::config::IS_ERR(file) {
         if !err.is_null() {
             // SAFETY: a non-null `err` is the writable errno slot supplied to
             // this allocator callback, checked above before storing here.
@@ -1092,7 +1092,7 @@ mod tests {
         unsafe extern "C" {
             fn intel_region_ttm_device_init(i915: *mut DrmI915Private) -> c_int;
             fn intel_region_ttm_device_fini(i915: *mut DrmI915Private);
-            fn drm_mm_takedown(mm: *mut intel_gt::linux::gem_memory::DrmMm);
+            fn drm_mm_takedown(mm: *mut tk_linux_kapi::types::DrmMm);
             fn drm_vma_offset_add(
                 manager: *mut DrmVmaOffsetManager,
                 node: *mut intel_gt::intel_context_upstream::DrmVmaOffsetNode,

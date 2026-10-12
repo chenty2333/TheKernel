@@ -1,0 +1,35 @@
+tk-linux-kapi: generic Linux kernel-API shims (LinuxKPI layer)
+================================================================
+
+Moved from crates/ax/tk-intel-gt/src/linux/ (Linux 7.2.3 translations
+originally cited there, licence carried unchanged):
+
+  assert.rs, bitmap.rs, bits.rs, config.rs (generic part), dma.rs,
+  drm_mm.rs, firmware.rs, gem_memory.rs (generic records), heap.rs, idr.rs,
+  iomapping.rs, kernel_core.rs, kernel_services.rs, list.rs, locks.rs,
+  memory.rs, mm.rs, mm_native.rs, mmu_notifier.rs, mutex.rs, print.rs
+  (printk and drm_printf basics), rbtree.rs, rcu.rs, rcu_work.rs,
+  scatterlist.rs, seq_file.rs, shmem.rs, signal.rs, srcu.rs, tasklet.rs,
+  timer.rs, vm.rs, wait.rs, workqueue.rs, ww_mutex.rs, xarray.rs,
+  fields.rs (generic records), primitives.rs (generic helpers).
+
+New translations in this crate:
+
+  completion.rs   kernel/sched/completion.c, include/linux/completion.h
+                  (waiters poll `done`; see module note)
+  seq_buf.rs      lib/seq_buf.c, include/linux/seq_buf.h (subset)
+  iopoll.rs       include/linux/iopoll.h (poll_timeout_us and the
+                  read/readx families)
+  i2c.rs          drivers/i2c/i2c-core-base.c subset (adapter, msgs,
+                  quirks, add/del, transfer, bus lock) with
+                  include/uapi/linux/i2c.h flags
+  i2c_algo_bit.rs drivers/i2c/algos/i2c-algo-bit.c and
+                  include/linux/i2c-algo-bit.h (full)
+
+Linux sources are GPL-2.0-only. These files are MIT translations of the
+function structure and are not verbatim copies of the C text; the header
+of each file cites the Linux file it follows.
+
+GPU-driver specific code (i915 and intel GT records, GuC/GuC-log and
+GMBUS-specific helpers, the i915 wait-var active-reference wait, and the
+i915 GEM/list macros) stays in tk-intel-gt and is not part of this crate.

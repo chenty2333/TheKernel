@@ -13,72 +13,59 @@ pub(crate) use crate::{
     linux_workqueue as workqueue, linux_xarray as xarray,
 };
 pub(crate) mod average;
-pub(crate) mod bitmap;
-pub(crate) mod bits;
+pub use tk_linux_kapi::bitmap;
+pub use tk_linux_kapi::bits;
 pub(crate) mod contexts;
 pub(crate) mod cpufreq;
 pub(crate) mod fields;
-#[allow(unsafe_code)]
-#[allow(unsafe_code)]
-pub(crate) mod firmware;
+pub(crate) mod wait_var;
+pub use tk_linux_kapi::firmware;
 pub mod gem;
 pub mod gem_memory;
 #[allow(unsafe_code)]
 pub mod highmem;
 pub mod i915;
 pub(crate) mod i915_trace;
-pub(crate) mod idr;
+pub use tk_linux_kapi::idr;
 pub(crate) mod iosys_map;
 pub(crate) mod irq;
-#[allow(unsafe_code)]
-pub(crate) mod mm;
+pub use tk_linux_kapi::mm;
 #[allow(unsafe_code)]
 pub(crate) mod page;
 pub mod primitives;
-pub mod drm_mm;
+pub use tk_linux_kapi::drm_mm;
 pub(crate) mod drm_vma;
 pub(crate) mod dma_fence_core;
 pub mod drm_core;
-pub(crate) mod rbtree;
-pub(crate) mod rcu;
-#[allow(unsafe_code)]
-pub(crate) mod scatterlist;
-#[allow(unsafe_code)]
-pub(crate) mod seq_file;
+pub use tk_linux_kapi::rbtree;
+pub use tk_linux_kapi::rcu;
+pub use tk_linux_kapi::scatterlist;
+pub use tk_linux_kapi::seq_file;
 pub(crate) mod registers;
 pub(crate) mod requests;
 #[allow(unsafe_code)]
 pub(crate) mod user_extensions;
-#[allow(unsafe_code)]
-pub mod signal;
-pub(crate) mod srcu;
-pub(crate) mod ww_mutex;
+pub use tk_linux_kapi::signal;
+pub use tk_linux_kapi::srcu;
+pub use tk_linux_kapi::ww_mutex;
 
-#[allow(unsafe_code)]
-pub mod rcu_work;
+pub use tk_linux_kapi::rcu_work;
 
-#[allow(unsafe_code)]
-pub mod mmu_notifier;
+pub use tk_linux_kapi::mmu_notifier;
 
-#[allow(unsafe_code)]
-pub mod mm_native;
+pub use tk_linux_kapi::mm_native;
 
-#[allow(unsafe_code)]
-pub mod shmem;
+pub use tk_linux_kapi::shmem;
 
-#[allow(unsafe_code)]
-pub(crate) mod vm;
+pub use tk_linux_kapi::vm;
 
-#[allow(unsafe_code)]
-pub(crate) mod iomapping;
+pub use tk_linux_kapi::iomapping;
 
-#[allow(unsafe_code)]
-pub mod dma;
+pub use tk_linux_kapi::dma;
 pub mod ggtt_owner;
 
-#[allow(unsafe_code)]
-pub mod kernel_services;
+pub use tk_linux_kapi::kernel_services;
 
 /// Linux core APIs with kernel-installed PCI/DMA providers (see PROVIDERS.md).
-pub mod kernel_core;
+pub use tk_linux_kapi::kernel_core;
 pub mod ttm;

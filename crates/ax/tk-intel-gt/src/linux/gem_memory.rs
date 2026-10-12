@@ -14,6 +14,8 @@ use core::{
     mem::{align_of, offset_of, size_of},
 };
 
+pub use tk_linux_kapi::gem_memory::*;
+
 use crate::{
     intel_context_upstream::{DrmI915GemObject, DrmMmNode},
     intel_engine_cs_upstream::{
@@ -45,56 +47,12 @@ pub const fn intel_memory_type_is_local(memory_type: u16) -> bool {
     memory_type == INTEL_MEMORY_LOCAL || memory_type == INTEL_MEMORY_STOLEN_LOCAL
 }
 
-/// Source `struct drm_mm` from `include/drm/drm_mm.h`.
-#[repr(C)]
-pub struct DrmMm {
-    pub color_adjust: Option<unsafe extern "C" fn(*const DrmMmNode, c_ulong, *mut u64, *mut u64)>,
-    pub hole_stack: ListHead,
-    pub head_node: DrmMmNode,
-    pub interval_tree: RbRootCached,
-    pub holes_size: RbRootCached,
-    pub holes_addr: RbRoot,
-    pub scan_active: c_ulong,
-}
 
-const DRM_MM_NODE_ALLOCATED_BIT: u32 = 0;
 
-/// Source `drm_mm_node_allocated()` from include/drm/drm_mm.h.
-#[inline]
-pub unsafe fn drm_mm_node_allocated(node: *const DrmMmNode) -> bool {
-    unsafe { (*node).flags & (1 << DRM_MM_NODE_ALLOCATED_BIT) != 0 }
-}
 
-/// `struct notifier_block` from `include/linux/notifier.h`.
-#[repr(C)]
-pub struct NotifierBlock {
-    pub notifier_call:
-        Option<unsafe extern "C" fn(*mut NotifierBlock, c_ulong, *mut c_void) -> c_int>,
-    pub next: *mut NotifierBlock,
-    pub priority: c_int,
-}
 
-/// Opaque target-configuration storage for `struct shrinker`. `i915_gem_mm`
-/// stores only its pointer; keep its source size/alignment for users that need
-/// the complete enclosing layout without inventing shrinker behavior here.
-#[repr(C, align(8))]
-pub struct Shrinker {
-    _opaque: [u8; 120],
-}
 
-/// x86_64 `pgprot_t` from `arch/x86/include/asm/pgtable_types.h`.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PgProt {
-    pub pgprot: c_ulong,
-}
 
-/// x86 `pgprot_decrypted()` is an identity for this configured target:
-/// `CONFIG_AMD_MEM_ENCRYPT` is disabled in the wt-dev kernel configuration.
-#[inline]
-pub fn pgprot_decrypted(prot: PgProt) -> PgProt {
-    prot
-}
 
 // `cachemode2protval()` is an exported x86 helper. `pgprot_noncached()` is
 // the x86 header macro selecting UC-minus (cache mode 2) on supported CPUs.
@@ -102,35 +60,8 @@ unsafe extern "C" {
     fn cachemode2protval(cache_mode: i32) -> c_ulong;
 }
 
-#[inline]
-pub fn pgprot_noncached(prot: PgProt) -> PgProt {
-    let uc_minus = unsafe { cachemode2protval(2) };
-    PgProt {
-        pgprot: prot.pgprot | uc_minus,
-    }
-}
 
-/// Linux `struct io_mapping` from `include/linux/io-mapping.h`.
-#[repr(C)]
-pub struct IoMapping {
-    pub base: u64,
-    pub size: c_ulong,
-    pub prot: PgProt,
-    pub iomem: *mut c_void,
-}
 
-/// Linux `struct resource` from `include/linux/ioport.h` on x86_64.
-#[repr(C)]
-pub struct Resource {
-    pub start: u64,
-    pub end: u64,
-    pub name: *const c_char,
-    pub flags: c_ulong,
-    pub desc: c_ulong,
-    pub parent: *mut Resource,
-    pub sibling: *mut Resource,
-    pub child: *mut Resource,
-}
 
 /// The anonymous `objects` member nested in `struct intel_memory_region`.
 #[repr(C)]
@@ -255,3 +186,6 @@ const _: [(); 236] = [(); offset_of!(IntelMemoryRegion, private)];
 const _: [(); 240] = [(); offset_of!(IntelMemoryRegion, objects)];
 const _: [(); 280] = [(); offset_of!(IntelMemoryRegion, is_range_manager)];
 const _: [(); 288] = [(); offset_of!(IntelMemoryRegion, region_private)];
+
+// Kernel layouts owned by tk-linux-kapi (generic Linux records; see its types.rs).
+pub use tk_linux_kapi::types::{DrmMm};

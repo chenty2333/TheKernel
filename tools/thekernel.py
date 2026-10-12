@@ -859,7 +859,7 @@ def lint_cmd(args: argparse.Namespace) -> int:
                 deny_warnings=args.deny_warnings)
     # The i915 source translations are part of the product; check them with
     # host flags/cache, not the kernel's bare-metal linker.
-    run_checked(["cargo", "check", "--locked", "-p", "tk-intel-gt"],
+    run_checked(["cargo", "check", "--locked", "-p", "tk-linux-kapi", "-p", "tk-intel-gt"],
                 env=_lint_env(artifacts, workspace=True))
     return 0
 

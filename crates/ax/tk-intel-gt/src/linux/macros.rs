@@ -449,3 +449,414 @@ macro_rules! rcu_assign_pointer {
         __atomic.store(__value, core::sync::atomic::Ordering::Release);
     }};
 }
+
+macro_rules! gt_dbg {
+    ($gt:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
+        let __gt = $gt;
+        let _ = __gt;
+        if ::tk_linux_kapi::print::drm_debug_enabled(::tk_linux_kapi::print::DRM_UT_DRIVER) {
+            let __args: &[&dyn ::tk_linux_kapi::print::CFormatArg] = &[
+                $(&($argument) as &dyn ::tk_linux_kapi::print::CFormatArg),*
+            ];
+            let __message = ::tk_linux_kapi::print::format_message($format, __args);
+            ::tk_linux_kapi::print::drm_log_at(
+                ::tk_linux_kapi::print::DrmLogLevel::Debug,
+                "i915 GT debug",
+                file!(),
+                line!(),
+                &__message,
+            );
+        }
+    }};
+}
+
+macro_rules! guc_err {
+    ($guc:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
+        let __guc = $guc;
+        let _ = __guc;
+        let __args: &[&dyn ::tk_linux_kapi::print::CFormatArg] = &[
+            $(&($argument) as &dyn ::tk_linux_kapi::print::CFormatArg),*
+        ];
+        let __message = ::tk_linux_kapi::print::format_message($format, __args);
+        ::tk_linux_kapi::print::drm_log_at(
+            ::tk_linux_kapi::print::DrmLogLevel::Error,
+            "i915 GuC error",
+            file!(),
+            line!(),
+            &__message,
+        );
+    }};
+}
+
+/// Linux `guc_info()` / `guc_printk(..., info, ...)` logging path.
+macro_rules! guc_info {
+    ($guc:expr, $format:literal $(, $argument:expr)* $(,)?) => {{
+        let __guc = $guc;
+        let _ = __guc;
+        let __args: &[&dyn ::tk_linux_kapi::print::CFormatArg] = &[
+            $(&($argument) as &dyn ::tk_linux_kapi::print::CFormatArg),*
+        ];
+        let __message = ::tk_linux_kapi::print::format_message(concat!("GUC: ", $format), __args);
+        ::tk_linux_kapi::print::drm_log_at(
+            ::tk_linux_kapi::print::DrmLogLevel::Info,
+            "i915 GuC info",
+            file!(),
+            line!(),
+            &__message,
+        );
+    }};
+}
+
+macro_rules! GEM_TRACE_ERR {
+    ($format:expr $(, $argument:expr)* $(,)?) => {{
+        let __args: &[&dyn ::tk_linux_kapi::print::CFormatArg] = &[
+            $(&($argument) as &dyn ::tk_linux_kapi::print::CFormatArg),*
+        ];
+        let __message = ::tk_linux_kapi::print::format_message($format, __args);
+        ::tk_linux_kapi::print::drm_log_at(
+            ::tk_linux_kapi::print::DrmLogLevel::Error,
+            "i915 GEM trace",
+            file!(),
+            line!(),
+            &__message,
+        );
+    }};
+}
+
+macro_rules! guc_warn {
+    ($guc:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
+        let __guc = $guc;
+        let _ = __guc;
+        let __args: &[&dyn ::tk_linux_kapi::print::CFormatArg] = &[
+            $(&($argument) as &dyn ::tk_linux_kapi::print::CFormatArg),*
+        ];
+        let __message = ::tk_linux_kapi::print::format_message($format, __args);
+        ::tk_linux_kapi::print::drm_log_at(
+            ::tk_linux_kapi::print::DrmLogLevel::Warn,
+            "i915 GuC warning",
+            file!(),
+            line!(),
+            &__message,
+        );
+    }};
+}
+
+macro_rules! gt_err {
+    ($gt:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
+        let __gt = $gt;
+        let __id = unsafe { (*__gt).info.id };
+        let __args: &[&dyn ::tk_linux_kapi::print::CFormatArg] = &[
+            $(&($argument) as &dyn ::tk_linux_kapi::print::CFormatArg),*
+        ];
+        let __message = ::tk_linux_kapi::print::format_message($format, __args);
+        ::tk_linux_kapi::print::drm_log_at(
+            ::tk_linux_kapi::print::DrmLogLevel::Error,
+            &alloc::format!("GT{__id}"),
+            file!(),
+            line!(),
+            &__message,
+        );
+    }};
+}
+
+macro_rules! gt_notice {
+    ($gt:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
+        let __gt = $gt;
+        let __id = unsafe { (*__gt).info.id };
+        let __args: &[&dyn ::tk_linux_kapi::print::CFormatArg] = &[
+            $(&($argument) as &dyn ::tk_linux_kapi::print::CFormatArg),*
+        ];
+        let __message = ::tk_linux_kapi::print::format_message($format, __args);
+        ::tk_linux_kapi::print::drm_log_at(
+            ::tk_linux_kapi::print::DrmLogLevel::Info,
+            &alloc::format!("GT{__id}"),
+            file!(),
+            line!(),
+            &__message,
+        );
+    }};
+}
+
+/// `guc_notice()` from `intel_guc_print.h`: retain the GuC tag/prefix while
+/// logging through the owning GT at Linux's notice level.
+macro_rules! guc_notice {
+    ($guc:expr, $format:literal $(, $argument:expr)* $(,)?) => {{
+        let __guc = $guc;
+        let __gt = unsafe {
+            $crate::intel_gt_api_upstream::guc_to_gt(
+                __guc as *mut $crate::intel_guc_types_upstream::IntelGuc,
+            )
+        };
+        gt_notice!(__gt, concat!("GUC: ", $format) $(, $argument)*);
+    }};
+}
+
+macro_rules! gt_dbg {
+    ($gt:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
+        let __gt = $gt;
+        if ::tk_linux_kapi::print::drm_debug_enabled(::tk_linux_kapi::print::DRM_UT_DRIVER) {
+            let __id = unsafe { (*__gt).info.id };
+            let __args: &[&dyn ::tk_linux_kapi::print::CFormatArg] = &[
+                $(&($argument) as &dyn ::tk_linux_kapi::print::CFormatArg),*
+            ];
+            let __message = ::tk_linux_kapi::print::format_message($format, __args);
+            ::tk_linux_kapi::print::drm_log_at(
+                ::tk_linux_kapi::print::DrmLogLevel::Debug,
+                &alloc::format!("GT{__id}"),
+                file!(),
+                line!(),
+                &__message,
+            );
+        }
+    }};
+}
+
+macro_rules! guc_probe_error {
+    ($guc:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
+        let __guc = $guc;
+        let __gt = unsafe {
+            $crate::linux::i915::guc_to_gt(__guc as *mut _)
+        };
+        let __id = unsafe { (*__gt).info.id };
+        let __args: &[&dyn ::tk_linux_kapi::print::CFormatArg] = &[
+            $(&($argument) as &dyn ::tk_linux_kapi::print::CFormatArg),*
+        ];
+        let __message = ::tk_linux_kapi::print::format_message($format, __args);
+        ::tk_linux_kapi::print::drm_log_at(
+            ::tk_linux_kapi::print::DrmLogLevel::Error,
+            &alloc::format!("GT{__id} GuC probe"),
+            file!(),
+            line!(),
+            &__message,
+        );
+    }};
+}
+
+macro_rules! guc_dbg {
+    ($guc:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
+        let __guc = $guc;
+        let _ = __guc;
+        if ::tk_linux_kapi::print::drm_debug_enabled(::tk_linux_kapi::print::DRM_UT_DRIVER) {
+            let __args: &[&dyn ::tk_linux_kapi::print::CFormatArg] = &[
+                $(&($argument) as &dyn ::tk_linux_kapi::print::CFormatArg),*
+            ];
+            let __message = ::tk_linux_kapi::print::format_message($format, __args);
+            ::tk_linux_kapi::print::drm_log_at(
+                ::tk_linux_kapi::print::DrmLogLevel::Debug,
+                "i915 GuC debug",
+                file!(),
+                line!(),
+                &__message,
+            );
+        }
+    }};
+}
+
+macro_rules! GEM_BUG_ON {
+    ($condition:expr $(,)?) => {{
+        let __condition = $condition;
+        if __condition {
+            panic!(
+                "i915 GEM_BUG_ON({}) at {}:{}",
+                stringify!($condition),
+                file!(),
+                line!()
+            );
+        }
+    }};
+}
+
+macro_rules! gem_bug_on {
+    ($condition:expr $(,)?) => {{ GEM_BUG_ON!($condition) }};
+}
+
+macro_rules! gem_warn_on {
+    ($condition:expr $(,)?) => {{ GEM_WARN_ON!($condition) }};
+}
+
+macro_rules! gt_WARN_ONCE {
+    ($gt:expr, $condition:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
+        static __WARNED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        let __gt = $gt;
+        let __condition = $condition;
+        if __condition && !__WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            let __args: &[&dyn ::tk_linux_kapi::print::CFormatArg] = &[
+                $(&($argument) as &dyn ::tk_linux_kapi::print::CFormatArg),*
+            ];
+            let __message = ::tk_linux_kapi::print::format_message($format, __args);
+            ::tk_linux_kapi::print::drm_log_at(
+                ::tk_linux_kapi::print::DrmLogLevel::Warn,
+                "i915 GT WARN_ONCE",
+                file!(),
+                line!(),
+                &__message,
+            );
+        }
+        let _ = __gt;
+        __condition
+    }};
+}
+
+macro_rules! gt_WARN_ON_ONCE {
+    ($gt:expr, $condition:expr $(,)?) => {{
+        static __WARNED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        let __gt = $gt;
+        let __condition = $condition;
+        if __condition && !__WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            ::tk_linux_kapi::print::drm_log_at(
+                ::tk_linux_kapi::print::DrmLogLevel::Warn,
+                "i915 GT WARN_ON_ONCE",
+                file!(),
+                line!(),
+                "condition was true",
+            );
+        }
+        let _ = __gt;
+        __condition
+    }};
+}
+
+macro_rules! GEM_WARN_ON {
+    ($condition:expr $(,)?) => {{ WARN_ON!($condition) }};
+}
+
+macro_rules! GEM_DEBUG_WARN_ON {
+    ($condition:expr $(,)?) => {{
+        if crate::linux_config::CONFIG_DRM_I915_DEBUG_GEM {
+            WARN_ON!($condition)
+        } else {
+            false
+        }
+    }};
+}
+
+macro_rules! list_next_entry {
+    ($entry:expr,signal_link) => {{
+        let entry = ($entry) as *mut $crate::i915_request_types_upstream::I915Request;
+        let member = unsafe { core::ptr::addr_of_mut!((*entry).signal_link) }
+            as *mut ::tk_linux_kapi::types::ListHead;
+        let offset = (member as usize).wrapping_sub(entry as usize);
+        let next = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*member).next)) };
+        ::tk_linux_kapi::list::entry_from_link::<$crate::i915_request_types_upstream::I915Request>(
+            next, offset,
+        )
+    }};
+    ($entry:expr,parallel.children.child_link) => {{
+        let entry = ($entry) as *mut $crate::intel_context_types_upstream::IntelContext;
+        let member = unsafe { core::ptr::addr_of_mut!((*entry).parallel.children.child_link) }
+            as *mut ::tk_linux_kapi::types::ListHead;
+        let offset = (member as usize).wrapping_sub(entry as usize);
+        let next = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*member).next)) };
+        unsafe {
+            &mut *::tk_linux_kapi::list::entry_from_link::<
+                $crate::intel_context_types_upstream::IntelContext,
+            >(next, offset)
+        }
+    }};
+    ($entry:expr,sched.link) => {{
+        let entry = ($entry) as *mut $crate::i915_request_types_upstream::I915Request;
+        let member = unsafe { core::ptr::addr_of_mut!((*entry).sched.link) }
+            as *mut ::tk_linux_kapi::types::ListHead;
+        let offset = (member as usize).wrapping_sub(entry as usize);
+        let next = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*member).next)) };
+        ::tk_linux_kapi::list::entry_from_link::<$crate::i915_request_types_upstream::I915Request>(
+            next, offset,
+        )
+    }};
+}
+
+macro_rules! list_prev_entry {
+    ($entry:expr,signal_link) => {{
+        let entry = ($entry) as *mut $crate::i915_request_types_upstream::I915Request;
+        let member = unsafe { core::ptr::addr_of_mut!((*entry).signal_link) }
+            as *mut ::tk_linux_kapi::types::ListHead;
+        let offset = (member as usize).wrapping_sub(entry as usize);
+        let prev = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*member).prev)) };
+        ::tk_linux_kapi::list::entry_from_link::<$crate::i915_request_types_upstream::I915Request>(
+            prev, offset,
+        )
+    }};
+}
+
+macro_rules! priolist_for_each_request_consume {
+    ($request:ident, $next:ident, $plist:expr, $body:block) => {{
+        let mut $request: *mut $crate::i915_request_types_upstream::I915Request =
+            core::ptr::null_mut();
+        let mut $next: *mut $crate::i915_request_types_upstream::I915Request =
+            core::ptr::null_mut();
+        let __priolist =
+            ($plist) as *const _ as *mut $crate::i915_scheduler_types_upstream::I915Priolist;
+        list_for_each_entry_safe!(
+            $request,
+            $next,
+            unsafe { core::ptr::addr_of_mut!((*__priolist).requests) },
+            sched.link,
+            $body
+        );
+    }};
+}
+
+macro_rules! priolist_for_each_request {
+    ($request:ident, $plist:expr, $body:block) => {{
+        let mut $request: *mut $crate::i915_request_types_upstream::I915Request =
+            core::ptr::null_mut();
+        let __priolist =
+            ($plist) as *const _ as *mut $crate::i915_scheduler_types_upstream::I915Priolist;
+        list_for_each_entry!(
+            $request,
+            unsafe { core::ptr::addr_of_mut!((*__priolist).requests) },
+            sched.link,
+            $body
+        );
+    }};
+}
+
+macro_rules! for_each_child_safe {
+    ($parent:ident, $child:ident, $next:ident, $body:block) => {{
+        let mut $child: *mut $crate::intel_context_types_upstream::IntelContext =
+            core::ptr::null_mut();
+        let mut $next: *mut $crate::intel_context_types_upstream::IntelContext =
+            core::ptr::null_mut();
+        let $parent =
+            ($parent) as *const _ as *mut $crate::intel_context_types_upstream::IntelContext;
+        let head = unsafe {
+            core::ptr::addr_of_mut!((*$parent).parallel.children.child_list)
+                as *mut ::tk_linux_kapi::types::ListHead
+        };
+        list_for_each_entry_safe!($child, $next, head, parallel.children.child_link, $body);
+    }};
+}
+
+macro_rules! for_each_child {
+    ($parent:ident, $child:ident, $($body:tt)+) => {{
+        let mut $child: *mut $crate::intel_context_types_upstream::IntelContext = core::ptr::null_mut();
+        let $parent = ($parent) as *const _ as *mut $crate::intel_context_types_upstream::IntelContext;
+        let head = unsafe {
+            core::ptr::addr_of!((*$parent).parallel.children.child_list)
+                as *mut ::tk_linux_kapi::types::ListHead
+        };
+        list_for_each_entry!($child, head, parallel.children.child_link, { $($body)+ });
+    }};
+}
+
+macro_rules! wait_for {
+    ($condition:expr, $timeout_ms:expr $(,)?) => {{
+        ::tk_linux_kapi::wait::wait_until(
+            ($timeout_ms as u64).saturating_mul(1_000_000),
+            || $condition,
+            true,
+        )
+    }};
+}
+
+macro_rules! wait_for_atomic_us {
+    ($condition:expr, $timeout_us:expr $(,)?) => {{
+        ::tk_linux_kapi::wait::wait_until(
+            ($timeout_us as u64).saturating_mul(1_000),
+            || $condition,
+            false,
+        )
+    }};
+}

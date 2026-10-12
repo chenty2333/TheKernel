@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use axerrno::AxError;
 use axhal::paging::MappingFlags;
 use axsync::Mutex;
-use intel_gt::linux::mm_native::{
+use tk_linux_kapi::mm_native::{
     CurrentUserAddressSpace, PinnedFrames, UserAddressSpace, install_current_user_address_space,
 };
 use memory_addr::{PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};

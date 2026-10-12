@@ -33,10 +33,7 @@ use crate::{
     linux_i915_private::DrmI915Private,
 };
 
-#[repr(C)]
-pub struct LockClassKey {
-    _opaque: [u8; 0],
-}
+pub use tk_linux_kapi::fields::LockClassKey;
 
 pub const CACHELINE_BYTES: usize = 64;
 pub const CACHELINE_DWORDS: usize = CACHELINE_BYTES / size_of::<u32>();

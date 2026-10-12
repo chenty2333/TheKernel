@@ -1,0 +1,68 @@
+[package]
+name = "tk-linux-kapi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license = "MIT"
+authors = ["TheKernel contributors"]
+description = "Generic Linux kernel-API shims (lists, waits, workqueues, timers, dma-fence core, i2c, completions) shared by the GPU ports"
+repository.workspace = true
+
+[package.metadata.thekernel]
+# Lower than the GPU ports that consume it; depends only on mechanism and
+# platform services (HAL, task runtime, allocator, mm).
+layer = "platform"
+
+[package.metadata.thekernel.host-test]
+selected = true
+# The task and timer shims reach per-CPU state through axtask, so the test
+# binary needs the percpu linker image.
+percpu-linker = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+axlog = { workspace = true }
+axdriver_base = { package = "tk-axdriver-base", path = "../tk-axdriver-base", version = "0.1.0" }
+mmu_notifier = { workspace = true }
+
+[dependencies.kernel_guard]
+version = "0.1"
+features = ["preempt"]
+
+[dependencies.axhal]
+package = "tk-axhal"
+path = "../tk-axhal"
+version = "0.1.0"
+features = ["irq"]
+
+[dependencies.axtask]
+package = "tk-axtask"
+path = "../tk-axtask"
+version = "0.1.0"
+features = ["multitask", "preempt"]
+
+[dependencies.axmm]
+workspace = true
+
+[dependencies.memory_addr]
+version = "0.4"
+
+[dependencies.spin]
+version = "0.9"
+
+[dependencies.axalloc]
+package = "tk-axalloc"
+path = "../tk-axalloc"
+
+[dependencies.tk-vtd]
+path = "../tk-vtd"
+
+[dependencies.printf-compat]
+version = "0.4"
+default-features = false

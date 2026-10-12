@@ -6,17 +6,16 @@
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
+pub use tk_linux_kapi::config::*;
+pub(crate) use axtask::current;
+
 pub const CONFIG_DRM_I915_CAPTURE_ERROR: bool = true;
 pub const CONFIG_DRM_I915_USERFAULT_AUTOSUSPEND: u32 = 250;
-pub const CONFIG_PM: bool = true;
 pub const CONFIG_DRM_I915_DEBUG_GEM: bool = false;
 pub const CONFIG_DRM_I915_GVT: bool = false;
 pub const CONFIG_DRM_I915_SELFTEST: bool = false;
 pub const CONFIG_DRM_I915_SW_FENCE_CHECK_DAG: bool = false;
-pub const CONFIG_LOCKDEP: bool = false;
 pub const CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS: bool = false;
-pub const CONFIG_DEBUG_MUTEXES: bool = false;
-pub const CONFIG_PREEMPT_RT: bool = false;
 
 pub const CONFIG_DRM_I915_HEARTBEAT_INTERVAL: u64 = 2500;
 pub const CONFIG_DRM_I915_MAX_REQUEST_BUSYWAIT: u64 = 8000;
@@ -24,15 +23,6 @@ pub const CONFIG_DRM_I915_PREEMPT_TIMEOUT: u64 = 640;
 pub const CONFIG_DRM_I915_PREEMPT_TIMEOUT_COMPUTE: u64 = 7500;
 pub const CONFIG_DRM_I915_STOP_TIMEOUT: u64 = 100;
 pub const CONFIG_DRM_I915_TIMESLICE_DURATION: u64 = 1;
-pub const BITS_PER_LONG: u32 = 64;
-pub const CONFIG_HZ: u32 = 100;
-pub const HZ: u32 = CONFIG_HZ;
-pub(crate) use axtask::current;
-pub const GFP_KERNEL: u32 = 0x0cc0;
-pub const GFP_ATOMIC: u32 = 0x0820;
-pub const GFP_NOWAIT: u32 = 0x2800;
-pub const __GFP_NOWARN: u32 = 1 << 13;
-pub const __GFP_NORETRY: u32 = 1 << 16;
 pub const DMA_RESV_USAGE_KERNEL: u32 = 0;
 pub const FW_REG_READ: u32 = 1;
 pub const FW_REG_WRITE: u32 = 2;
@@ -95,35 +85,6 @@ pub(crate) use crate::{
 
 // Linux 7.2.3 errno values and i915 GEM flags/enums used by the imported GT
 // sources. `I915_CACHE_LLC` is enum value 1; write-back map mode is 0.
-pub const PAGE_SIZE: usize = 4096;
-pub const PAGE_SHIFT: u32 = 12;
-pub type PgoffT = u64;
-pub const MAX_SCHEDULE_TIMEOUT: u64 = i64::MAX as u64 >> 1;
-pub const EAGAIN: i32 = 11;
-pub const EWOULDBLOCK: i32 = EAGAIN;
-pub const CAP_SYS_ADMIN: i32 = 21;
-pub const EPERM: i32 = 1;
-pub const EEXIST: i32 = 17;
-pub const EBADSLT: i32 = 57;
-pub const ERESTARTSYS: i32 = 512;
-pub const EINTR: i32 = 4;
-pub const ENOMEM: i32 = 12;
-pub const ENOEXEC: i32 = 8;
-pub const EFAULT: i32 = 14;
-pub const EBUSY: i32 = 16;
-pub const ENODEV: i32 = 19;
-pub const EINVAL: i32 = 22;
-pub const E2BIG: i32 = 7;
-pub const EPIPE: i32 = 32;
-pub const EDEADLK: i32 = 35;
-pub const EALREADY: i32 = 114;
-pub const EPROTO: i32 = 71;
-pub const EOVERFLOW: i32 = 75;
-pub const ETIME: i32 = 62;
-pub const ETIMEDOUT: i32 = 110;
-pub const EOPNOTSUPP: i32 = 95;
-pub const EBADMSG: i32 = 74;
-pub const EMSGSIZE: i32 = 90;
 
 // i915 UAPI / VMA-view values from Linux v7.2.3.
 pub const I915_MADV_WILLNEED: u32 = 0;
@@ -150,23 +111,6 @@ pub const INTEL_MEMORY_STOLEN_SYSTEM: i32 = 2;
 pub const INTEL_MEMORY_STOLEN_LOCAL: i32 = 3;
 pub const INTEL_MEMORY_MOCK: i32 = 4;
 pub type IntelMemoryType = i32;
-// `arch/x86/include/asm/cpufeatures.h`: CPUID feature word 0, bit 19.
-pub const X86_FEATURE_CLFLUSH: u32 = 19;
-
-/// Target's x86 `static_cpu_has(X86_FEATURE_CLFLUSH)` query.
-///
-/// The i915 source path currently uses only feature word 0, bit 19. Linux
-/// captures this boot-CPU capability in its static feature bitmap; on this
-/// x86_64 target the architectural CPUID.1 EDX bit is the corresponding
-/// immutable capability source.
-#[inline]
-pub fn static_cpu_has(feature: u32) -> bool {
-    assert_eq!(
-        feature, X86_FEATURE_CLFLUSH,
-        "unbound x86 CPU feature index"
-    );
-    core::arch::x86_64::__cpuid(1).edx & (1 << 19) != 0
-}
 
 /// `i915_gem_tile_height()` from gem/i915_gem_object.h.
 #[inline]
@@ -183,11 +127,6 @@ mod gem_value_tests {
         assert_eq!(super::i915_gem_tile_height(2), 32);
     }
 }
-pub const EIO: i32 = 5;
-pub const ENOENT: i32 = 2;
-pub const ENXIO: i32 = 6;
-pub const ERANGE: i32 = 34;
-pub const ENOSPC: i32 = 28;
 pub const I915_CACHE_LLC: u32 = 1;
 pub const I915_MAP_WB: u32 = 0;
 pub const I915_ENGINE_IS_VIRTUAL: u32 = 1 << 5;
@@ -197,30 +136,4 @@ pub const PIN_NOSEARCH: u64 = 1 << 1;
 pub const PIN_NONBLOCK: u64 = 1 << 2;
 pub const PIN_MAPPABLE: u64 = 1 << 3;
 pub const PIN_ZONE_4G: u64 = 1 << 4;
-
-#[allow(non_snake_case)]
-pub const fn IS_ENABLED(enabled: bool) -> bool {
-    enabled
-}
-
-#[allow(non_snake_case)]
-pub fn IS_ERR<T>(pointer: *const T) -> bool {
-    pointer as usize >= usize::MAX - 4094
-}
-
-#[allow(non_snake_case)]
-pub fn PTR_ERR<T>(pointer: *const T) -> i32 {
-    pointer as isize as i32
-}
-
-/// `PTR_ERR_OR_ZERO()` from include/linux/err.h.
-#[inline]
-pub fn PTR_ERR_OR_ZERO<T>(pointer: *const T) -> i32 {
-    if IS_ERR(pointer) { PTR_ERR(pointer) } else { 0 }
-}
-
-#[allow(non_snake_case)]
-pub fn ERR_PTR<T>(error: i32) -> *mut T {
-    error as isize as usize as *mut T
-}
 pub use crate::linux_tasklet::*;

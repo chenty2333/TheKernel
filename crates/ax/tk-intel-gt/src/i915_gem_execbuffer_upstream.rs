@@ -7,6 +7,7 @@
 //! user-copy, dma-resv, and syncobj operations are integration bindings; they
 //! are intentionally not replaced by weaker local policy.
 
+use crate::linux_config::__GFP_NOWARN;
 use core::ffi::{c_char, c_int, c_long, c_ulong, c_void};
 
 use crate::{
@@ -128,7 +129,7 @@ use crate::{
             __copy_from_user, __copy_from_user_inatomic, __get_user, __put_user, copy_from_user,
             pagefault_disable, pagefault_enable, u64_to_ptr, unsafe_put_user, user_write_access_begin, user_write_access_end,
         },
-        primitives::{__GFP_NOWARN, ilog2, is_power_of_2_u64, mb, offset_in_page},
+        primitives::{ilog2, is_power_of_2_u64, mb, offset_in_page},
         rcu::{rcu_read_lock, rcu_read_unlock},
         registers::{MI_LOAD_REGISTER_IMM, PIN_GLOBAL},
         requests::{

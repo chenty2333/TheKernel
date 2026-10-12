@@ -31,7 +31,7 @@ const DMA_RESV_USAGE_WRITE: u32 = 1;
 const EIO: c_int = 5;
 const EINVAL: c_int = 22;
 const ENOMEM: c_int = 12;
-const MAX_SCHEDULE_TIMEOUT: c_long = intel_gt::linux_config::MAX_SCHEDULE_TIMEOUT as c_long;
+const MAX_SCHEDULE_TIMEOUT: c_long = tk_linux_kapi::config::MAX_SCHEDULE_TIMEOUT as c_long;
 
 /// The DRM provider has several void Linux ABI callbacks. A failed bridge in
 /// one of those paths must stop the kernel rather than let GPU/KMS work
@@ -77,7 +77,7 @@ impl Drop for InstalledSyncFile {
         // SAFETY: taking this resource transfers the wrapper's single shmem-file
         // reference to the OFD; its final drop releases that same live reference.
         unsafe {
-            intel_gt::linux::shmem::fput_file(self.upstream.file as *mut _);
+            tk_linux_kapi::shmem::fput_file(self.upstream.file as *mut _);
         }
     }
 }
@@ -210,7 +210,7 @@ unsafe extern "C" fn native_fence_wait(
         return 0;
     }
     let bridge = fence.cast::<NativeDmaFence>();
-    let tick_ns = axhal::time::NANOS_PER_SEC / intel_gt::linux_config::CONFIG_HZ as u64;
+    let tick_ns = axhal::time::NANOS_PER_SEC / tk_linux_kapi::config::CONFIG_HZ as u64;
     let unbounded = timeout >= MAX_SCHEDULE_TIMEOUT;
     let duration = if unbounded {
         None
@@ -414,9 +414,9 @@ pub(crate) unsafe fn sync_file_create(fence: *mut c_void) -> *mut c_void {
     };
     // SAFETY: the C string is static and NUL-terminated for the shmem constructor.
     let file = unsafe {
-        intel_gt::linux::shmem::shmem_file_setup(c"thekernel-sync-file".as_ptr(), 0, 0)
+        tk_linux_kapi::shmem::shmem_file_setup(c"thekernel-sync-file".as_ptr(), 0, 0)
     };
-    if file.is_null() || intel_gt::linux_config::IS_ERR(file) {
+    if file.is_null() || tk_linux_kapi::config::IS_ERR(file) {
         return ptr::null_mut();
     }
     let wrapper = match Box::try_new(UpstreamSyncFile {
@@ -426,7 +426,7 @@ pub(crate) unsafe fn sync_file_create(fence: *mut c_void) -> *mut c_void {
         Ok(wrapper) => wrapper,
         Err(_) => {
             // SAFETY: file is the live reference returned by shmem_file_setup above.
-            unsafe { intel_gt::linux::shmem::fput_file(file) };
+            unsafe { tk_linux_kapi::shmem::fput_file(file) };
             return ptr::null_mut();
         }
     };
@@ -435,7 +435,7 @@ pub(crate) unsafe fn sync_file_create(fence: *mut c_void) -> *mut c_void {
     if files.try_reserve(1).is_err() {
         drop(files);
         // SAFETY: no wrapper was published, so this function still owns file's ref.
-        unsafe { intel_gt::linux::shmem::fput_file(file) };
+        unsafe { tk_linux_kapi::shmem::fput_file(file) };
         return ptr::null_mut();
     }
     files.push(wrapper);

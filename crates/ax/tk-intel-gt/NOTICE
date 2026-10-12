@@ -201,3 +201,8 @@ threshold 40: 0 fenced, 763 outside-fence (589 code); threshold 25:
 The +2 / +2 since the previous re-scan are two test-only LinuxKPI lines
 (L1, 2026-10-10) that match Linux statements verbatim; see
 docs/upstream-provenance.md, 2026-10-10 L1 entry.
+
+Generic Linux kernel-API shims (lists, waits, workqueues, timers, locks, mm,
+dma, firmware, printk basics, completion, seq_buf, iopoll, I2C core) moved to
+crates/ax/tk-linux-kapi, which carries its own LICENSE-MIT and NOTICE. The
+linux/ modules that remain here are the i915/intel-specific translations.

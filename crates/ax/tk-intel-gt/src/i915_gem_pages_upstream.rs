@@ -82,18 +82,6 @@ pub struct DrmScanoutBuffer {
 const _: [(); 120] = [(); size_of::<DrmScanoutBuffer>()];
 const _: [(); 104] = [(); core::mem::offset_of!(DrmScanoutBuffer, set_pixel)];
 const _: [(); 112] = [(); core::mem::offset_of!(DrmScanoutBuffer, private)];
-#[repr(C)]
-pub struct Scatterlist {
-    pub(crate) page_link: usize,
-    pub(crate) offset: u32,
-    pub(crate) length: u32,
-    pub(crate) dma_address: u64,
-    pub(crate) dma_length: u32,
-    pub(crate) _dma_flags_or_padding: u32,
-}
-const _: [(); 32] = [(); size_of::<Scatterlist>()];
-const _: [(); 16] = [(); core::mem::offset_of!(Scatterlist, dma_address)];
-const _: [(); 24] = [(); core::mem::offset_of!(Scatterlist, dma_length)];
 // Source-derived display layout: drm_framebuffer is 192 bytes for the
 // configured x86_64 ABI, intel_fb_view is 136 bytes, followed by intel DPT,
 // alignment/guard, then the panic tiling callback and private panic record.
@@ -373,9 +361,6 @@ struct RadixTreeIter {
     node: *mut c_void,
 }
 const RADIX_TREE_ITER_CONTIG: u32 = 0x20;
-const SG_CHAIN: usize = 1;
-const SG_END: usize = 2;
-const SG_PAGE_LINK_MASK: usize = SG_CHAIN | SG_END;
 
 #[inline]
 fn xa_mk_value(value: u64) -> *mut c_void {
@@ -416,84 +401,8 @@ unsafe fn radix_tree_next_slot(
     }
 }
 
-#[inline]
-pub(crate) unsafe fn sg_page(sg: *mut Scatterlist) -> *mut Page {
-    unsafe { ((*sg).page_link & !SG_PAGE_LINK_MASK) as *mut Page }
-}
 
-/// Linux `sg_mark_end()` header helper: set the terminal bit and clear a
-/// possible chain marker without disturbing the encoded page pointer.
-#[inline]
-pub(crate) unsafe fn sg_mark_end(sg: *mut Scatterlist) {
-    unsafe {
-        (*sg).page_link |= SG_END;
-        (*sg).page_link &= !SG_CHAIN;
-    }
-}
 
-/// Linux `sg_set_folio()` header helper. `struct folio` begins with its
-/// embedded `struct page`; the caller supplies the source `size_t` length and
-/// offset, which Linux stores in the unsigned-int scatterlist fields.
-#[inline]
-pub(crate) unsafe fn sg_set_folio<T>(
-    sg: *mut Scatterlist,
-    folio: *mut T,
-    len: usize,
-    offset: usize,
-) {
-    unsafe {
-        let page = folio.cast::<Page>();
-        (*sg).page_link = ((*sg).page_link & SG_PAGE_LINK_MASK) | page as usize;
-        (*sg).offset = offset as u32;
-        (*sg).length = len as u32;
-    }
-}
-#[inline]
-unsafe fn sg_dma_address(sg: *mut Scatterlist) -> u64 {
-    unsafe { (*sg).dma_address }
-}
-#[inline]
-unsafe fn sg_dma_len(sg: *mut Scatterlist) -> u32 {
-    unsafe { (*sg).dma_length }
-}
-#[inline]
-unsafe fn sg_page_count(sg: *mut Scatterlist) -> u32 {
-    unsafe { (*sg).length >> PAGE_SHIFT }
-}
-#[inline]
-unsafe fn sg_dma_page_count(sg: *mut Scatterlist) -> u32 {
-    unsafe { (*sg).dma_length >> PAGE_SHIFT }
-}
-#[inline]
-unsafe fn sg_chain_ptr(sg: *mut Scatterlist) -> *mut Scatterlist {
-    unsafe { ((*sg).page_link & !SG_PAGE_LINK_MASK) as *mut Scatterlist }
-}
-#[inline]
-pub(crate) unsafe fn sg_next(sg: *mut Scatterlist) -> *mut Scatterlist {
-    unsafe {
-        if sg.is_null() || (*sg).page_link & SG_END != 0 {
-            return ptr::null_mut();
-        }
-        let next = sg.add(1);
-        if (*next).page_link & SG_CHAIN != 0 {
-            sg_chain_ptr(next)
-        } else {
-            next
-        }
-    }
-}
-// i915_scatterlist.h's ____sg_next() deliberately does not stop at SG_END.
-#[inline]
-unsafe fn ____sg_next(sg: *mut Scatterlist) -> *mut Scatterlist {
-    unsafe {
-        let next = sg.add(1);
-        if (*next).page_link & SG_CHAIN != 0 {
-            sg_chain_ptr(next)
-        } else {
-            next
-        }
-    }
-}
 unsafe fn i915_sg_dma_sizes(mut sg: *mut Scatterlist) -> u32 {
     unsafe {
         let mut sizes = 0;
@@ -1508,3 +1417,10 @@ mod pin_map_integration_tests {
         assert_eq!(fixture.pin_count(), 0);
     }
 }
+
+// Kernel layouts owned by tk-linux-kapi (generic Linux records; see its types.rs).
+pub use tk_linux_kapi::types::{Scatterlist};
+
+// Scatterlist helpers consumed by the i915 page path (tk-intel-gt) live here with
+// the rest of the generic sg API.
+pub use tk_linux_kapi::scatterlist::{SG_CHAIN, SG_END, SG_PAGE_LINK_MASK, ____sg_next, sg_chain_ptr, sg_dma_address, sg_dma_len, sg_dma_page_count, sg_mark_end, sg_next, sg_page, sg_page_count, sg_set_folio};

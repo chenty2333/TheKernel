@@ -3793,6 +3793,7 @@ dependencies = [
  "tk-axhal",
  "tk-axmm",
  "tk-axtask",
+ "tk-linux-kapi",
  "tk-mmu-notifier",
  "tk-vtd",
 ]
@@ -3884,6 +3885,7 @@ dependencies = [
  "tk-linux-futex",
  "tk-linux-io-uring",
  "tk-linux-ipc",
+ "tk-linux-kapi",
  "tk-linux-keyring",
  "tk-linux-landlock",
  "tk-linux-mm",
@@ -3980,6 +3982,24 @@ version = "0.1.0"
 [[package]]
 name = "tk-linux-ipc"
 version = "0.1.0"
+
+[[package]]
+name = "tk-linux-kapi"
+version = "0.1.0"
+dependencies = [
+ "axlog",
+ "kernel_guard",
+ "memory_addr",
+ "printf-compat",
+ "spin 0.9.9",
+ "tk-axalloc",
+ "tk-axdriver-base",
+ "tk-axhal",
+ "tk-axmm",
+ "tk-axtask",
+ "tk-mmu-notifier",
+ "tk-vtd",
+]
 
 [[package]]
 name = "tk-linux-keyring"

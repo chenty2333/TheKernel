@@ -25,6 +25,17 @@
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
+
+// Generic Linux kernel-API shims live in tk-linux-kapi (below every GPU port).
+// Re-exported under their historical `linux_*` names so the i915 translations
+// keep their `crate::linux_*` paths; `#[macro_export]` macros are imported here.
+#[macro_use]
+extern crate tk_linux_kapi;
+pub use tk_linux_kapi::{
+    assert as linux_assert, heap as linux_heap, list as linux_list, locks as linux_locks,
+    memory as linux_memory, mutex as linux_mutex, print as linux_print, tasklet as linux_tasklet,
+    timer as linux_timer, wait as linux_wait, workqueue as linux_workqueue, xarray as linux_xarray,
+};
 #[path = "linux/config.rs"]
 pub mod linux_config;
 #[allow(unsafe_code)]
@@ -33,57 +44,14 @@ pub mod linux_config;
 mod linux_macros;
 #[allow(unsafe_code)]
 #[macro_use]
-#[path = "linux/heap.rs"]
-pub(crate) mod linux_heap;
-#[allow(unsafe_code)]
-#[macro_use]
-#[path = "linux/list.rs"]
-pub(crate) mod linux_list;
-#[allow(unsafe_code)]
-#[macro_use]
-#[path = "linux/memory.rs"]
-pub(crate) mod linux_memory;
-#[allow(unsafe_code)]
-#[path = "linux/locks.rs"]
-pub(crate) mod linux_locks;
-#[allow(unsafe_code)]
-#[macro_use]
-#[path = "linux/xarray.rs"]
-pub(crate) mod linux_xarray;
-#[allow(unsafe_code)]
-#[macro_use]
-#[path = "linux/wait.rs"]
-pub(crate) mod linux_wait;
-#[allow(unsafe_code)]
-#[path = "linux/tasklet.rs"]
-pub(crate) mod linux_tasklet;
-#[allow(unsafe_code)]
-#[macro_use]
 #[path = "linux/pm.rs"]
 pub mod linux_pm;
 #[allow(unsafe_code)]
 #[path = "linux/i915_private.rs"]
 pub mod linux_i915_private;
 #[allow(unsafe_code)]
-#[path = "linux/mutex.rs"]
-pub(crate) mod linux_mutex;
-#[allow(unsafe_code)]
 #[path = "linux/sw_fence.rs"]
 pub(crate) mod linux_sw_fence;
-#[allow(unsafe_code)]
-#[path = "linux/timer.rs"]
-pub(crate) mod linux_timer;
-#[allow(unsafe_code)]
-#[path = "linux/workqueue.rs"]
-pub(crate) mod linux_workqueue;
-#[allow(unsafe_code)]
-#[macro_use]
-#[path = "linux/assert.rs"]
-mod linux_assert;
-#[allow(unsafe_code)]
-#[macro_use]
-#[path = "linux/print.rs"]
-mod linux_print;
 #[allow(unsafe_code)]
 #[path = "linux/platform.rs"]
 pub mod linux_platform;

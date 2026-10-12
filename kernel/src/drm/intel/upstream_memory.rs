@@ -182,7 +182,7 @@ pub(super) fn prepare(
         .map_err(|e| format!("upstream i915: identity DMA lease refused: {e:?}"))?;
     let lease = Arc::try_new(lease)
         .map_err(|_| String::from("upstream i915: identity DMA lease allocation failed"))?;
-    intel_gt::linux::dma::register_identity_device(device, lease).map_err(String::from)?;
+    tk_linux_kapi::dma::register_identity_device(device, lease).map_err(String::from)?;
     ggtt_owner::install(&CALLBACKS).map_err(String::from)?;
     *owner = Some(Owner {
         ranges,
