@@ -21,3 +21,21 @@ pub unsafe extern "C" fn drm_kms_helper_poll_disable(_dev: *mut DrmDevice) {}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_kms_helper_poll_enable(_dev: *mut DrmDevice) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_client_dev_restore(_dev: *mut DrmDevice, _restore: bool) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_client_dev_unregister(_dev: *mut DrmDevice) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_client_sysrq_register(_dev: *mut DrmDevice) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_client_sysrq_unregister(_dev: *mut DrmDevice) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_panic_register(_dev: *mut DrmDevice) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_panic_unregister(_dev: *mut DrmDevice) {}

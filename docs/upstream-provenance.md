@@ -2192,13 +2192,12 @@ in the source comments.
 
 ## 2026-10-12 DRM core B1 and i915 display B2.5 reconciliation
 
-The DRM core translations (`crates/ax/tk-drm-upstream`, batches B1a-B1d, B2a)
-and the i915 display `*_types_upstream.rs` / `*_regs_upstream.rs` modules in
+The DRM core translations (`crates/ax/tk-drm-upstream`, batches B1a-B1d, B2a,
+BI) and the i915 display `*_types_upstream.rs` / `*_regs_upstream.rs` modules in
 `crates/ax/tk-intel-gt` (B2.5) add verbatim-Linux lines that the excerpt scanner
-counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned
-`crates/ax` totals: threshold >=40 `(0,0,0,825,795,0,0)` (was 807/777), threshold
->=25 `(18,15,4,2215,2177,0,0)` (was 2178/2140). `crates/linux` and `kernel/src`
-are unchanged.
+counts. The current pinned `crates/ax` totals and the per-batch increments are
+recorded next to `SCAN_BASELINE` in `tests/ci/test_linux_excerpt_baseline.py`.
+`crates/linux` and `kernel/src` are unchanged.
 
 Licensing of the translated DRM sources (checked against `/home/ava/Desktop/linux-7.2.3`):
 
@@ -2249,4 +2248,9 @@ Licensing:
 - `drivers/gpu/drm/display/drm_dp_helper.c`: MIT (SPDX-License-Identifier: MIT).
 - `drivers/gpu/drm/display/drm_dp_dual_mode_helper.c`: MIT (SPDX-License-Identifier: MIT).
 Both files carry MIT licenses in upstream Linux 7.2.3 and are recorded in `crates/ax/tk-drm-upstream/NOTICE`.
+
+## 2026-10-13 DRM infrastructure core BI reconciliation
+
+The Linux DRM infrastructure core translations (`crates/ax/tk-drm-upstream`, batch BI: `drm_drv_upstream.rs`, `drm_file_upstream.rs`, `drm_gem_upstream.rs`, `drm_prime_upstream.rs`, `drm_ioctl_upstream.rs`, `drm_auth_upstream.rs`, `drm_vma_manager_upstream.rs`, `drm_lease_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned `crates/ax` totals: threshold >=40 `(0,0,0,850,820,0,0)` (was 837/807), threshold >=25 `(18,15,4,2288,2250,0,0)` (was 2238/2200). `crates/linux` and `kernel/src` are unchanged.
+
 

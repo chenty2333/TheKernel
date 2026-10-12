@@ -13,9 +13,11 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::drm_file_types::DrmFile;
-use crate::drm_gem_types::DrmGemObject;
+use tk_linux_kapi::config::GFP_KERNEL;
+use tk_linux_kapi::memory::{kfree, kmalloc};
 use tk_linux_kapi::types::{DmaFence, Spinlock};
+
+use crate::drm_prime_upstream::{DmaBuf, DmaBufAttachment};
 
 static FENCE_CONTEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -44,15 +46,64 @@ pub unsafe extern "C" fn dma_fence_init(
     }
 }
 
+// upstream: drivers/dma-buf/dma-buf.c dma_buf_attach()
 #[cfg(test)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_gem_handle_create(_file_priv: *mut DrmFile, _obj: *mut c_void, _handlep: *mut u32) -> i32 { -tk_linux_kapi::config::EOPNOTSUPP }
+pub unsafe extern "C" fn dma_buf_attach(dmabuf: *mut DmaBuf, dev: *mut c_void) -> *mut DmaBufAttachment {
+    unsafe {
+        let attach = kmalloc(core::mem::size_of::<DmaBufAttachment>(), GFP_KERNEL).cast::<DmaBufAttachment>();
+        if attach.is_null() {
+            return (-12isize) as *mut DmaBufAttachment;
+        }
+        core::ptr::write_bytes(attach, 0, 1);
+        (*attach).dmabuf = dmabuf;
+        (*attach).dev = dev;
+        if !dmabuf.is_null() {
+            if let Some(ops) = (*dmabuf).ops.as_ref() {
+                if let Some(att) = ops.attach {
+                    att(dmabuf, attach);
+                }
+            }
+        }
+        attach
+    }
+}
 
-// upstream: drm_auth.c (no owner yet)
+// upstream: drivers/dma-buf/dma-buf.c dma_buf_detach()
 #[cfg(test)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_is_current_master(_file_priv: *mut DrmFile) -> bool {
-    true
+pub unsafe extern "C" fn dma_buf_detach(dmabuf: *mut DmaBuf, attach: *mut DmaBufAttachment) {
+    unsafe {
+        if !dmabuf.is_null() && !attach.is_null() {
+            if let Some(ops) = (*dmabuf).ops.as_ref() {
+                if let Some(det) = ops.detach {
+                    det(dmabuf, attach);
+                }
+            }
+        }
+        if !attach.is_null() {
+            kfree(attach.cast::<c_void>());
+        }
+    }
+}
+
+// upstream: drivers/dma-buf/dma-buf.c dma_buf_put()
+#[cfg(test)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_buf_put(dmabuf: *mut DmaBuf) {
+    unsafe {
+        if !dmabuf.is_null() {
+            if let Some(ops) = (*dmabuf).ops.as_ref() {
+                if let Some(rel) = ops.release {
+                    rel(dmabuf);
+                }
+            }
+            if !(*dmabuf).file.is_null() {
+                kfree((*dmabuf).file.cast::<c_void>());
+            }
+            kfree(dmabuf.cast::<c_void>());
+        }
+    }
 }
 
 // upstream: drivers/dma-buf/dma-fence.c dma_fence_put()

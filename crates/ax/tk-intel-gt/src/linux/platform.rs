@@ -161,8 +161,3 @@ pub unsafe extern "C" fn kobject_uevent_env(
     unsafe { (ops().kobject_uevent_env)(kobj, action, envp) }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_dev_wedged_event(drm: *mut c_void, recovery: u32, data: *mut c_void) {
-    assert!(!drm.is_null());
-    unsafe { (ops().drm_dev_wedged_event)(drm, recovery, data) };
-}

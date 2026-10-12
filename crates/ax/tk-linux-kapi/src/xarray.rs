@@ -23,8 +23,19 @@ use crate::{
 pub struct XArray {
     pub xa_lock: Spinlock,
     pub xa_flags: u32,
-    xa_head: *mut XaEntries,
+    pub xa_head: *mut c_void,
 }
+
+impl XArray {
+    pub const fn new(flags: u32) -> Self {
+        Self {
+            xa_lock: Spinlock::new(),
+            xa_flags: flags,
+            xa_head: core::ptr::null_mut(),
+        }
+    }
+}
+
 
 type XArrayHeader = XArray;
 
@@ -55,9 +66,9 @@ unsafe fn header<T>(array: *mut T) -> *mut XArrayHeader {
 unsafe fn entries<T>(array: *mut T, allocate: bool) -> *mut XaEntries {
     let head = core::ptr::addr_of_mut!((*header(array)).xa_head);
     if (*head).is_null() && allocate {
-        *head = Box::into_raw(Box::new(XaEntries::default()));
+        *head = Box::into_raw(Box::new(XaEntries::default())).cast();
     }
-    *head
+    (*head).cast()
 }
 
 pub fn xa_init_flags<T>(array: &mut T, flags: u32) {
@@ -71,7 +82,7 @@ pub fn xa_destroy<T>(array: &mut T) {
     unsafe {
         let head = core::ptr::addr_of_mut!((*header(array)).xa_head);
         if !(*head).is_null() {
-            drop(Box::from_raw(*head));
+            drop(Box::from_raw((*head).cast::<XaEntries>()));
             *head = core::ptr::null_mut();
         }
     }
