@@ -116,3 +116,5 @@ pub mod i2c;
 pub mod i2c_algo_bit;
 #[allow(unsafe_code)]
 pub mod dma_fence_chain;
+#[allow(unsafe_code)]
+pub mod pci;
