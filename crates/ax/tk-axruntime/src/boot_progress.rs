@@ -136,11 +136,43 @@ pub fn record_trace_exit(_step: &'static str) {
     LAST_ENTER_STEP.store(core::ptr::null_mut(), Ordering::Release);
 }
 
+struct StackBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackBuf<N> {
+    const fn new() -> Self {
+        Self {
+            buf: [0u8; N],
+            len: 0,
+        }
+    }
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl<const N: usize> core::fmt::Write for StackBuf<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let remaining = N.saturating_sub(self.len);
+        let bytes = s.as_bytes();
+        let to_copy = bytes.len().min(remaining);
+        self.buf[self.len..self.len + to_copy].copy_from_slice(&bytes[..to_copy]);
+        self.len += to_copy;
+        Ok(())
+    }
+}
+
 #[inline]
 pub fn trace_enter(step: &'static str) {
     if boot_trace_enabled() {
         record_trace_enter(step);
         axlog::warn!("BT> {step}");
+        let mut buf = StackBuf::<96>::new();
+        use core::fmt::Write;
+        let _ = write!(buf, "BT> {step}");
+        crate::early_screen_milestone(buf.as_str());
     }
 }
 
@@ -149,6 +181,10 @@ pub fn trace_exit(step: &'static str) {
     if boot_trace_enabled() {
         record_trace_exit(step);
         axlog::warn!("BT< {step}");
+        let mut buf = StackBuf::<96>::new();
+        use core::fmt::Write;
+        let _ = write!(buf, "BT< {step}");
+        crate::early_screen_milestone(buf.as_str());
     }
 }
 
@@ -172,6 +208,10 @@ pub fn heartbeat(now_ns: u64) {
             };
             let cpu = axhal::percpu::this_cpu_id();
             axlog::warn!("BT~ heartbeat CPU {cpu}: stuck in {step} for {elapsed_s}s");
+            let mut buf = StackBuf::<96>::new();
+            use core::fmt::Write;
+            let _ = write!(buf, "BT~ CPU {cpu}: {step} {elapsed_s}s");
+            crate::early_screen_milestone(buf.as_str());
         }
     }
 }

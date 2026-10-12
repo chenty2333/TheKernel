@@ -123,10 +123,11 @@ pub(crate) fn invoke_panic_screen_hook(
 
 /// Report that `name` is the initialization step now starting.
 ///
-/// Called once per step of [`rust_main`], never per log record and never from
-/// an interrupt.  On a host build the kernel crate is not linked and there is
-/// no screen to paint, so the call compiles away rather than failing to link.
-fn early_screen_milestone(name: &str) {
+/// Called on each initialization milestone of [`rust_main`], on boot trace
+/// markers and timer heartbeats in trace mode, but never per normal log record.
+/// On a host build the kernel crate is not linked and there is no screen to
+/// paint, so the call compiles away rather than failing to link.
+pub fn early_screen_milestone(name: &str) {
     use boot_progress::Stage;
     boot_progress::mark(match name {
         "runtime entry"=>Stage::Runtime,"heap allocator"=>Stage::Heap,"memory management"=>Stage::Paging,
@@ -693,13 +694,8 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     // kernel's own device filesystem, and with it the framebuffer console,
     // takes the screen over.
     boot_progress::cpu_phase(cpu_id,7);
-    boot_progress::trace_enter("axruntime:early_screen_kernel_main");
     early_screen_milestone("kernel main");
-    boot_progress::trace_exit("axruntime:early_screen_kernel_main");
-
-    boot_progress::trace_enter("axruntime:main");
     unsafe { main() };
-    boot_progress::trace_exit("axruntime:main");
 
     #[cfg(feature = "multitask")]
     axtask::exit(0);
