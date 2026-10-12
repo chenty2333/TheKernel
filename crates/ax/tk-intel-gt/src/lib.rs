@@ -641,3 +641,9 @@ pub mod intel_bo_upstream;
 pub mod intel_de_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_params_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_wa_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_clock_gating_upstream;
+#[allow(unsafe_code)]
+pub mod intel_quirks_upstream;
