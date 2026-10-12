@@ -44,9 +44,13 @@ WINDOW = 14
 SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     ("crates/linux", 40): (110, 49, 20, 25, 0, 18, 21),
     ("kernel/src", 40): (85, 41, 19, 142, 9, 0, 0),
-    ("crates/ax", 40): (0, 0, 0, 807, 777, 0, 0),
+    ("crates/ax", 40): (0, 0, 0, 825, 795, 0, 0),
     ("crates/linux", 25): (211, 59, 22, 41, 3, 20, 21),
     ("kernel/src", 25): (157, 50, 24, 321, 25, 0, 0),
+# 2026-10-12 (B2a DRM atomic core ports in tk-drm-upstream): crates/ax moves
+# from 807/777 to 825/795 at >= 40 and from 2178/2140 to 2215/2177 at >= 25.
+# These are MIT translations of MIT Linux sources (drm_atomic.c, drm_atomic_uapi.c,
+# drm_atomic_state_helper.c).
 # 2026-10-12 (B1 DRM core ports in tk-drm-upstream, B2.5 i915 display
 # *_regs/*_types ports in tk-intel-gt): crates/ax moves from 707/678 to 807/777
 # at >= 40 (tk-drm-upstream 93 code lines, tk-intel-gt display tables) and from
@@ -73,7 +77,7 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # lines in the newly translated FreeBSD drivers and the OpenBSD iwx/net80211
 # translations, plus one FreeBSD ig4 register line. Those have BSD-source
 # provenance, not Linux provenance; see `docs/upstream-provenance.md`.
-    ("crates/ax", 25): (18, 15, 4, 2178, 2140, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 2215, 2177, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their
