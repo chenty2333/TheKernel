@@ -182,6 +182,23 @@ pub unsafe extern "C" fn dmi_first_match(_list: *const c_void) -> *const c_void 
     core::ptr::null()
 }
 
+// upstream: include/linux/i2c.h !CONFIG_ACPI i2c_acpi_get_i2c_resource()
+// !CONFIG_ACPI fallback returns false.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i2c_acpi_get_i2c_resource(
+    _ares: *mut c_void,
+    _i2c: *mut *mut c_void,
+) -> bool {
+    false
+}
+
+// upstream: include/linux/i2c.h !CONFIG_ACPI i2c_acpi_find_adapter_by_handle()
+// !CONFIG_ACPI fallback returns NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn i2c_acpi_find_adapter_by_handle(_handle: *mut c_void) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +259,10 @@ mod tests {
 
         assert_eq!(unsafe { dmi_check_system(core::ptr::null()) }, 0);
         assert!(unsafe { dmi_first_match(core::ptr::null()) }.is_null());
+
+        assert!(!unsafe {
+            i2c_acpi_get_i2c_resource(core::ptr::null_mut(), core::ptr::null_mut())
+        });
+        assert!(unsafe { i2c_acpi_find_adapter_by_handle(core::ptr::null_mut()) }.is_null());
     }
 }

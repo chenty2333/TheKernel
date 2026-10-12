@@ -541,6 +541,8 @@ mod tests {
         assert!(time_before_eq(past, now));
         assert!(time_before_eq(now, now));
         assert!(!time_before_eq(future, now));
+        assert!(time_in_range(now, past, future));
+        assert!(!time_in_range(past, now, future));
 
         // Wrap-around across unsigned boundary
         let wrap_past: c_ulong = c_ulong::MAX - 10;
@@ -600,6 +602,12 @@ pub const fn time_after_eq(a: c_ulong, b: c_ulong) -> bool {
 #[inline]
 pub const fn time_before_eq(a: c_ulong, b: c_ulong) -> bool {
     time_after_eq(b, a)
+}
+
+/// Linux jiffies `time_in_range(a, b, c)` wrap-safe check whether `a` is in `[b, c]`.
+#[inline]
+pub const fn time_in_range(a: c_ulong, b: c_ulong, c: c_ulong) -> bool {
+    time_after_eq(a, b) && time_before_eq(a, c)
 }
 
 /// Linux `usecs_to_jiffies()`.
