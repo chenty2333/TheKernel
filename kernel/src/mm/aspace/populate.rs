@@ -712,13 +712,49 @@ impl AddrSpace {
         })
     }
 
-    /// To write data to the address space.
+    /// Writes data to the address space with write intent, breaking copy-on-write
+    /// following Linux `__access_remote_vm` / `FOLL_WRITE | FOLL_FORCE` semantics.
     ///
-    /// # Arguments
+    /// For private mappings, write intent breaks copy-on-write even if the user VMA
+    /// itself is read-only (forced write, e.g. for ptrace or remote VM access).
+    /// Shared read-only mappings reject writes with `PermissionDenied`.
+    pub fn write(&mut self, start: VirtAddr, buf: &[u8]) -> AxResult {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if !self.contains_range(start, buf.len()) {
+            return Err(AxError::BadAddress);
+        }
+        if self.has_secret_mapping(start, buf.len()) {
+            return Err(AxError::BadAddress);
+        }
+        let end = start.checked_add(buf.len()).ok_or(AxError::BadAddress)?;
+
+        // Validate permissions: FOLL_FORCE allows writing to read-only private mappings
+        // by breaking COW, but has no effect on shared mappings (Linux can_follow_write_common).
+        let mut cursor = start;
+        while cursor < end {
+            let area = self.areas.find(cursor).ok_or(AxError::BadAddress)?;
+            if !area.flags().contains(MappingFlags::WRITE) && !area.backend().is_private_cow() {
+                return Err(AxError::PermissionDenied);
+            }
+            cursor = area.end();
+        }
+
+        let page_start = start.align_down_4k();
+        let page_end =
+            VirtAddr::from(checked_align_up_4k(end.as_usize()).ok_or(AxError::BadAddress)?);
+        self.populate_area(page_start, page_end.sub_addr(page_start), MappingFlags::WRITE)?;
+        self.write_bypassing_cow(start, buf)
+    }
+
+    /// Low-level write directly through to the currently mapped physical frame
+    /// without populating or breaking copy-on-write.
     ///
-    /// * `start_vaddr` - The start virtual address to write.
-    /// * `buf` - The buffer to write to the address space.
-    pub fn write(&self, start: VirtAddr, buf: &[u8]) -> AxResult {
+    /// SAFETY/PRECONDITION: The caller must guarantee that the target frames are
+    /// already populated and private, or that shared modification of existing frames
+    /// is explicitly intended.
+    pub fn write_bypassing_cow(&self, start: VirtAddr, buf: &[u8]) -> AxResult {
         let synchronize_instruction_stream = start.checked_add(buf.len()).is_some_and(|end| {
             self.areas.iter().any(|area| {
                 area.start() < end

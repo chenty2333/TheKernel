@@ -2351,3 +2351,96 @@ fn vm_and_resident_highwater_survive_unmap_that_lowers_the_totals() {
     // Reads of the peak never report less than what was observed.
     assert_eq!(aspace.merge_vm_highwater(4), 16);
 }
+
+#[test]
+fn write_breaks_cow_after_fork_and_preserves_child_view() {
+    let start = VirtAddr::from(0x1000);
+    let mut parent = AddrSpace::new_empty(start, TEST_SPACE_SIZE).unwrap();
+    let user = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+    parent
+        .map(
+            start,
+            PAGE_SIZE_4K,
+            user,
+            false,
+            Backend::new_alloc(start, PageSize::Size4K),
+        )
+        .unwrap();
+
+    let initial = [0x11, 0x22, 0x33, 0x44];
+    parent.write(start, &initial).unwrap();
+    let mut buf = [0u8; 4];
+    parent.read(start, &mut buf).unwrap();
+    assert_eq!(buf, initial);
+
+    // Fork makes the private page copy-on-write shared with child.
+    let child = parent.try_clone().unwrap();
+    child.lock().read(start, &mut buf).unwrap();
+    assert_eq!(buf, initial);
+    assert_eq!(
+        parent.user_leaf(start).unwrap().0,
+        child.lock().user_leaf(start).unwrap().0
+    );
+
+    // Writing through parent's AddrSpace::write must break COW.
+    let modified = [0x99, 0x88, 0x77, 0x66];
+    parent.write(start, &modified).unwrap();
+
+    // Parent sees the new data, child retains the original data.
+    parent.read(start, &mut buf).unwrap();
+    assert_eq!(buf, modified);
+    child.lock().read(start, &mut buf).unwrap();
+    assert_eq!(buf, initial);
+
+    // Physical frames must now be distinct.
+    assert_ne!(
+        parent.user_leaf(start).unwrap().0,
+        child.lock().user_leaf(start).unwrap().0
+    );
+}
+
+#[test]
+fn write_forced_into_readonly_private_mapping_breaks_cow() {
+    let start = VirtAddr::from(0x2000);
+    let mut parent = AddrSpace::new_empty(start, TEST_SPACE_SIZE).unwrap();
+    let ro_user = MappingFlags::USER | MappingFlags::READ;
+    parent
+        .map(
+            start,
+            PAGE_SIZE_4K,
+            ro_user,
+            false,
+            Backend::new_alloc(start, PageSize::Size4K),
+        )
+        .unwrap();
+
+    parent.populate_area(start, PAGE_SIZE_4K, ro_user).unwrap();
+    let initial = [0xaa, 0xbb, 0xcc, 0xdd];
+    parent.write_bypassing_cow(start, &initial).unwrap();
+
+    // Fork creates a COW sibling.
+    let child = parent.try_clone().unwrap();
+    let mut buf = [0u8; 4];
+    child.lock().read(start, &mut buf).unwrap();
+    assert_eq!(buf, initial);
+
+    // Ptrace-style forced write into the read-only private mapping.
+    let forced = [0x42, 0x43, 0x44, 0x45];
+    parent.write(start, &forced).unwrap();
+
+    // Parent's view is updated, child's view is unchanged.
+    parent.read(start, &mut buf).unwrap();
+    assert_eq!(buf, forced);
+    child.lock().read(start, &mut buf).unwrap();
+    assert_eq!(buf, initial);
+
+    // User PTE remains read-only (does not gain WRITE flag).
+    let (paddr, pte_flags) = parent.user_leaf(start).unwrap();
+    assert!(!pte_flags.contains(MappingFlags::WRITE));
+    assert!(pte_flags.contains(MappingFlags::READ));
+
+    // Frame was duplicated via COW.
+    let (child_paddr, child_flags) = child.lock().user_leaf(start).unwrap();
+    assert_ne!(paddr, child_paddr);
+    assert!(!child_flags.contains(MappingFlags::WRITE));
+}
