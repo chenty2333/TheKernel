@@ -13,6 +13,7 @@ use spin::MutexGuard;
 
 use super::{
     POWER,
+    fastboot::PowerPin,
     gmbus::{Pin, PollTimer, Rate},
     regs::{
         GMBUS0, GMBUS1, GMBUS2, GMBUS3, GMBUS4, GMBUS5, GPIO_B, GPIO_C, GPIO_D, GPIO_J, GPIO_K,
@@ -26,10 +27,18 @@ const I2C_CLOCK_STRETCH_TIMEOUT_US: u32 = 2_200;
 static I2C_BITBANG_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 static GMBUS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PowerReferenceOwner {
+    Global,
+    FastbootTc,
+}
+
 /// Maps the C transaction engine's offset and I/O hooks onto typed registers.
 pub(crate) struct KernelGmbusIo<'a, R: Registers, T: PollTimer> {
     registers: &'a R,
     timer: &'a T,
+    pin: Pin,
+    fastboot_power_pin: Option<&'a PowerPin>,
     display: GmbusDisplay,
     bus: GmbusBus,
     last_status: u32,
@@ -37,12 +46,18 @@ pub(crate) struct KernelGmbusIo<'a, R: Registers, T: PollTimer> {
     idle_timeout: bool,
     was_in_use: bool,
     stale_two_byte_index: bool,
-    power_held: bool,
+    power_owner: Option<PowerReferenceOwner>,
     mutex_guard: Option<MutexGuard<'static, ()>>,
 }
 
 impl<'a, R: Registers, T: PollTimer> KernelGmbusIo<'a, R, T> {
-    pub(crate) fn new(registers: &'a R, timer: &'a T, pin: Pin, rate: Rate) -> Self {
+    pub(crate) fn new(
+        registers: &'a R,
+        timer: &'a T,
+        pin: Pin,
+        rate: Rate,
+        fastboot_power_pin: Option<&'a PowerPin>,
+    ) -> Self {
         let display = GmbusDisplay {
             mmio_base: GMBUS_MMIO_BASE,
             display_version: 13,
@@ -81,6 +96,8 @@ impl<'a, R: Registers, T: PollTimer> KernelGmbusIo<'a, R, T> {
         Self {
             registers,
             timer,
+            pin,
+            fastboot_power_pin,
             display,
             bus,
             last_status: 0,
@@ -88,7 +105,7 @@ impl<'a, R: Registers, T: PollTimer> KernelGmbusIo<'a, R, T> {
             idle_timeout: false,
             was_in_use: false,
             stale_two_byte_index: false,
-            power_held: false,
+            power_owner: None,
             mutex_guard: None,
         }
     }
@@ -337,15 +354,30 @@ impl<R: Registers, T: PollTimer> GmbusIo for KernelGmbusIo<'_, R, T> {
     }
 
     fn display_power_get(&mut self) -> Result<(), SourceError> {
-        #[cfg(target_os = "none")]
-        {
-            let mut power = POWER.lock();
-            let state = power.as_mut().ok_or(SourceError::Power)?;
-            state
-                .get_domain(self.registers, PowerDomain::Gmbus)
-                .map_err(|_| SourceError::Power)?;
+        let fastboot_power_pin = self.fastboot_power_pin;
+        if let Some(pin) = fastboot_power_pin {
+            if pin.verify_gmbus_context(self.registers, self.pin).is_err() {
+                self.io_failure =
+                    Some(super::gmbus::GmbusError::PowerLeaseInvalid { pin: self.pin });
+                return Err(SourceError::Power);
+            }
+            if super::power::fastboot_gmbus_power_get(self.registers).is_err() {
+                self.io_failure =
+                    Some(super::gmbus::GmbusError::PowerReferenceFailed { pin: self.pin });
+                return Err(SourceError::Power);
+            }
+            self.power_owner = Some(PowerReferenceOwner::FastbootTc);
+        } else {
+            #[cfg(target_os = "none")]
+            {
+                let mut power = POWER.lock();
+                let state = power.as_mut().ok_or(SourceError::Power)?;
+                state
+                    .get_domain(self.registers, PowerDomain::Gmbus)
+                    .map_err(|_| SourceError::Power)?;
+                self.power_owner = Some(PowerReferenceOwner::Global);
+            }
         }
-        self.power_held = true;
         if let Ok(status) = self.read32(GMBUS_MMIO_BASE + 0x5108, Access::Firmware) {
             self.was_in_use = status & (1 << 15) != 0;
         }
@@ -373,17 +405,35 @@ impl<R: Registers, T: PollTimer> GmbusIo for KernelGmbusIo<'_, R, T> {
     }
 
     fn display_power_put(&mut self) {
-        if !self.power_held {
-            return;
-        }
-        #[cfg(target_os = "none")]
-        {
-            let mut power = POWER.lock();
-            if let Some(state) = power.as_mut() {
-                let _ = state.put_domain(self.registers, PowerDomain::Gmbus);
+        match self.power_owner.take() {
+            Some(PowerReferenceOwner::FastbootTc) => {
+                if super::power::fastboot_gmbus_power_put(self.registers).is_err()
+                    && self.io_failure.is_none()
+                {
+                    self.io_failure =
+                        Some(super::gmbus::GmbusError::PowerReferenceFailed { pin: self.pin });
+                }
             }
+            Some(PowerReferenceOwner::Global) => {
+                #[cfg(target_os = "none")]
+                {
+                    let mut power = POWER.lock();
+                    if let Some(state) = power.as_mut() {
+                        if state
+                            .put_domain(self.registers, PowerDomain::Gmbus)
+                            .is_err()
+                            && self.io_failure.is_none()
+                        {
+                            self.io_failure =
+                                Some(super::gmbus::GmbusError::PowerReferenceFailed {
+                                    pin: self.pin,
+                                });
+                        }
+                    }
+                }
+            }
+            None => {}
         }
-        self.power_held = false;
     }
 
     fn gmbus_mutex_lock(&mut self) {
@@ -454,9 +504,10 @@ pub(crate) fn read_edid_block<R: Registers, T: PollTimer>(
     offset: u8,
     output: &mut [u8],
     force_bit: u32,
+    power_pin: Option<&PowerPin>,
 ) -> GMBusTransfer {
     let start = timer.now_micros();
-    let mut io = KernelGmbusIo::new(registers, timer, pin, rate);
+    let mut io = KernelGmbusIo::new(registers, timer, pin, rate, power_pin);
     let mut bus = io.bus();
     bus.force_bit = force_bit;
     let mut register_index = [offset];

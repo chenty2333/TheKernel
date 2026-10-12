@@ -50,10 +50,44 @@ const DDI_IDLE: u32 = 1 << 7;
 const DDI_TC_PHY_OWNERSHIP: u32 = 1 << 6;
 const DDI_LANE_REVERSAL: u32 = 1 << 16;
 const UNDERRUN: u32 = 1 << 31;
-const MODE_SHADOW: [u32; 14] = [
+const MODE_SHADOW: [u32; 24] = [
     0x70030, 0x70028, 0x6007c, 0x60000, 0x60004, 0x60008, 0x6000c, 0x60010, 0x60014, 0x6001c,
     0x70188, 0x7018c, 0x70190, 0x701cc,
+    0x7027c, 0x70240, 0x70244, 0x70248, 0x7024c, 0x70250, 0x70254,
+    0x70268, 0x70258, 0x7025c,
 ];
+
+/// Exact primary-plane WM/DDB image, used for target verification and for
+/// replaying the firmware before-image on legacy rollback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PrimaryWatermarkImage {
+    pub wm: intel_display::watermark::PlaneWatermarks,
+    pub ddb: intel_display::watermark::DdbEntry,
+}
+impl PrimaryWatermarkImage {
+    pub(super) fn from_program(program: &pipe::PipeProgram) -> Self {
+        use intel_display::watermark::{PlaneWatermarks, skl_ddb_entry_init_from_hw, skl_wm_level_from_reg_val};
+        Self {
+            wm: PlaneWatermarks {
+                levels: core::array::from_fn(|i| skl_wm_level_from_reg_val(program.watermark.levels()[i].register_value())),
+                transition: skl_wm_level_from_reg_val(program.watermark.transition_value()),
+                sagv: skl_wm_level_from_reg_val(program.watermark.sagv_value()),
+                sagv_transition: skl_wm_level_from_reg_val(program.watermark.sagv_transition_value()),
+            },
+            ddb: skl_ddb_entry_init_from_hw(program.ddb.register_value()),
+        }
+    }
+    fn register_value(&self, offset: u32) -> Option<u32> {
+        match offset {
+            0x7027c => Some(self.ddb.raw),
+            0x70240..=0x70254 if offset.is_multiple_of(4) => Some(self.wm.levels[((offset - 0x70240) / 4) as usize].raw),
+            0x70268 => Some(self.wm.transition.raw),
+            0x70258 => Some(self.wm.sagv.raw),
+            0x7025c => Some(self.wm.sagv_transition.raw),
+            _ => None,
+        }
+    }
+}
 
 fn mmio_register(offset: u32, write: bool) -> Register {
     if write {
@@ -1172,9 +1206,9 @@ fn enable_pipe_a_transcoder<R: Registers>(
 
 /// Program one validated progressive RGB/XRGB timing on an already-active,
 /// already-owned legacy TC port. No cold transition or new PHY ownership is
-/// attempted. The DDB allocation and DBUF slice programming remain the
-/// source's whole-buffer first-light-up policy, but primary-plane watermarks
-/// are calculated from the PCode-derived latency table for the target mode.
+/// attempted. The caller supplies the already powered primary DDB range;
+/// primary-plane watermarks are calculated from the PCode-derived latency
+/// table for the target mode. Rollback replays the exact WM/DDB before-image.
 pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     r: &R,
     timer: &T,
@@ -1183,13 +1217,14 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     pitch: u32,
     pixel_format: u32,
     surface: u32,
-    watermark: Option<pipe::WatermarkConfig>,
+    watermark: Option<(pipe::WatermarkConfig, pipe::DdbAllocation)>,
     pll: &DklPllState,
     afc_startup: Option<u8>,
     avi: &[u32; 8],
     edid: &[u8],
     restore_pipe_misc: Option<u32>,
     restore_plane_ctl: Option<u32>,
+    restore_watermarks: Option<&PrimaryWatermarkImage>,
     retire_audio_before_link: bool,
     restore_phy: Option<&intel_display::tc::DklPhyState>,
     mut dpll_lifecycle: Option<&mut dyn DpllLifecycle>,
@@ -1252,12 +1287,13 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         stride_bytes: pitch,
     };
     let pipe_program = match watermark {
-        Some(watermark) => pipe::compute_with_watermarks_format(
+        Some((watermark, ddb)) => pipe::compute_with_watermarks_format(
             pipe::Pipe::A,
             mode,
             plane_surface,
             watermark,
             pixel_format,
+            ddb,
         ),
         None => {
             #[cfg(test)]
@@ -1281,9 +1317,8 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     let _old_clock = read(r, 0x46140)?;
     let _old_pipeconf = read(r, p::PIPECONF_A.offset())?;
     // Pipe shadow values are all calculated and all heap space is reserved
-    // before the first MMIO write. The DDB allocation remains the one-pipe
-    // whole-buffer first-light-up policy; its source-derived WM values above
-    // were calculated for this exact target before entering this function.
+    // before the first MMIO write. Source-derived WM values fit the supplied
+    // powered DDB allocation and were calculated for this exact target.
     let all_shadow = pipe_program.writes(pipe_misc, arb);
     let mut shadow = Vec::new();
     shadow
@@ -1296,7 +1331,7 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         let value = if planned.register.offset() == p::PIPE_MISC_A.offset() {
             restore_pipe_misc.unwrap_or(planned.value)
         } else {
-            planned.value
+            restore_watermarks.and_then(|image| image.register_value(planned.register.offset())).unwrap_or(planned.value)
         };
         shadow.push(super::pipe::PlannedWrite { value, ..planned });
     }
@@ -1420,7 +1455,8 @@ pub(super) fn program_native<R: Registers + Send + Sync, T: PollTimer>(
     pitch: u32,
     pixel_format: u32,
     surface: u32,
-    watermark: Option<pipe::WatermarkConfig>,
+    watermark: Option<(pipe::WatermarkConfig, pipe::DdbAllocation)>,
+    current_scalers: &[intel_display::scaler::Scaler; 2],
     avi: &[u32; 8],
     edid: &[u8],
     mut dpll_lifecycle: Option<&mut dyn DpllLifecycle>,
@@ -1477,12 +1513,13 @@ pub(super) fn program_native<R: Registers + Send + Sync, T: PollTimer>(
         stride_bytes: pitch,
     };
     let pipe_program = match watermark {
-        Some(watermark) => pipe::compute_with_watermarks_format(
+        Some((watermark, ddb)) => pipe::compute_with_watermarks_format(
             pipe::Pipe::A,
             mode,
             plane_surface,
             watermark,
             pixel_format,
+            ddb,
         ),
         None => {
             #[cfg(test)]
@@ -1506,9 +1543,8 @@ pub(super) fn program_native<R: Registers + Send + Sync, T: PollTimer>(
     let _old_clock = read(r, 0x46140)?;
     let _old_pipeconf = read(r, p::PIPECONF_A.offset())?;
     // Pipe shadow values are all calculated and all heap space is reserved
-    // before the first MMIO write. The DDB allocation remains the one-pipe
-    // whole-buffer first-light-up policy; its source-derived WM values above
-    // were calculated for this exact target before entering this function.
+    // before the first MMIO write. Source-derived WM values fit the supplied
+    // powered DDB allocation and were calculated for this exact target.
     let all_shadow = pipe_program.writes(pipe_misc, arb);
     let mut shadow = Vec::new();
     shadow
@@ -1544,6 +1580,7 @@ pub(super) fn program_native<R: Registers + Send + Sync, T: PollTimer>(
         buffer,
         old_plane,
         old_surface,
+        detach_scalers: current_scalers.iter().any(|scaler| scaler.enabled()),
         shadow,
         pipe_program,
         encoder: encoder_ops,
@@ -1578,6 +1615,7 @@ struct TcNativeTail<'a, R, T> {
     buffer: u32,
     old_plane: u32,
     old_surface: u32,
+    detach_scalers: bool,
     shadow: Vec<pipe::PlannedWrite>,
     pipe_program: pipe::PipeProgram,
     encoder: TcHdmiEncoderOps<'a, R, T>,
@@ -1627,6 +1665,10 @@ impl<R: Registers + Send + Sync, T: PollTimer> super::native_modeset_ops::Native
         )?;
         write(self.r, p::PLANE_SURF_A.offset(), self.old_surface)?;
         wait_two_frames(self.r, self.timer)?;
+        if self.detach_scalers {
+            super::native_scaler::disable_pipe_scalers(self.r, pipe::Pipe::A, false)
+                .map_err(|error| format!("firmware scaler detach failed: {error:?}"))?;
+        }
         write(
             self.r,
             p::PIPECONF_A.offset(),

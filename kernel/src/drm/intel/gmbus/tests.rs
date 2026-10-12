@@ -19,8 +19,16 @@
 
 use alloc::{vec, vec::Vec};
 
+use intel_display::dkl_phy::TcPort;
+
 use super::*;
-use crate::{drm::intel::regs::PROBE_WINDOW, test_support::scheduler_test_context};
+use crate::{
+    drm::intel::{
+        fastboot::PowerPin,
+        regs::{HSW_PWR_WELL_CTL2, ICL_PWR_WELL_CTL_DDI2, PROBE_WINDOW},
+    },
+    test_support::scheduler_test_context,
+};
 
 /// A register file standing in for the aperture, and a device model on top of
 /// it, with every knob a bring-up needs to turn but cannot turn on real
@@ -499,6 +507,15 @@ fn read(controller: &FakeController, pin: Pin) -> (Result<EdidBytes, GmbusError>
     let mut notes = BusNotes::default();
     let result = read_edid_with(controller, &clock, pin, &mut notes);
     (result, notes)
+}
+
+fn observed_tc_power_pin(controller: &FakeController, port: TcPort) -> PowerPin {
+    let port_request = 2 << ((3 + u32::from(port == TcPort::Tc2)) * 2);
+    let tc_control = port_request | (port_request >> 1);
+    controller.set_word(HSW_PWR_WELL_CTL2, 0xc0f);
+    controller.set_word(ICL_PWR_WELL_CTL_DDI2, tc_control);
+    controller.set_word(ICL_PWR_WELL_CTL_AUX2, tc_control);
+    PowerPin::observe(controller, port).expect("fixture contains the complete live TC lease")
 }
 
 #[test]
@@ -998,7 +1015,7 @@ fn a_window_that_does_not_reach_gmbus_at_all_refuses_the_write() {
 fn reading_a_later_block_asks_the_eeprom_for_that_offset_and_takes_its_checksum() {
     let _guard = scheduler_test_context();
     let base = valid_edid(1);
-    let extension = {
+    let extension_bytes = {
         let mut block = valid_edid(0);
         block[0x14] = 0x5a;
         let sum = block[..EDID_BLOCK_LEN - 1]
@@ -1012,7 +1029,7 @@ fn reading_a_later_block_asks_the_eeprom_for_that_offset_and_takes_its_checksum(
     // at 0x80.
     let mut eeprom = alloc::vec![0u8; 2 * EDID_BLOCK_LEN];
     eeprom[..EDID_BLOCK_LEN].copy_from_slice(&base);
-    eeprom[EDID_BLOCK_LEN..].copy_from_slice(&extension);
+    eeprom[EDID_BLOCK_LEN..].copy_from_slice(&extension_bytes);
     controller.load_eeprom(&eeprom);
 
     let clock = FakeClock::new();
@@ -1021,13 +1038,14 @@ fn reading_a_later_block_asks_the_eeprom_for_that_offset_and_takes_its_checksum(
         &controller,
         &clock,
         Pin::DdiA,
+        None,
         DDC_ADDRESS,
         EDID_EXTENSION_OFFSET,
         Block::Extension,
         &mut notes,
     )
     .expect("the extension block must read");
-    assert_eq!(block.bytes(), &extension);
+    assert_eq!(block.bytes(), &extension_bytes);
     // The second transaction's index cycle carried 0x80.  The *last* command
     // is the stop cycle, so this looks for the last transfer command.
     let command = controller
@@ -1070,6 +1088,104 @@ fn the_extension_read_follows_the_count_in_the_base_block() {
         .expect("a base block with no extensions is a valid answer");
     assert_eq!(none, None);
     assert_eq!(plain.transactions(), 1);
+}
+
+#[test]
+fn tc1_route_reads_base_and_extension_without_switching_ddc_pins() {
+    let _guard = scheduler_test_context();
+    let base = valid_edid(1);
+    let extension_bytes = {
+        let mut block = valid_edid(0);
+        block[0x14] = 0xc7;
+        let sum = block[..EDID_BLOCK_LEN - 1]
+            .iter()
+            .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        block[EDID_BLOCK_LEN - 1] = 0u8.wrapping_sub(sum);
+        block
+    };
+    let controller = FakeController::with_monitor(Pin::Tc1, &base);
+    let mut eeprom = alloc::vec![0u8; 2 * EDID_BLOCK_LEN];
+    eeprom[..EDID_BLOCK_LEN].copy_from_slice(&base);
+    eeprom[EDID_BLOCK_LEN..].copy_from_slice(&extension_bytes);
+    controller.load_eeprom(&eeprom);
+    let power_pin = observed_tc_power_pin(&controller, TcPort::Tc1);
+    let refs_before = super::super::power::fastboot_gmbus_power_use_count();
+
+    let clock = FakeClock::new();
+    let mut base_notes = BusNotes::default();
+    let base = read_edid_with_tc_power(&controller, &clock, Pin::Tc1, &power_pin, &mut base_notes)
+        .expect("TC1 base EDID must validate");
+    let mut extension_notes = BusNotes::default();
+    let extension_edid = read_edid_extension_from_base_tc_power_with(
+        &controller,
+        &clock,
+        Pin::Tc1,
+        &base,
+        &mut extension_notes,
+        &power_pin,
+    )
+    .expect("TC1 extension transaction must validate")
+    .expect("the base block advertises an extension");
+
+    assert_eq!(base.extension_count(), 1);
+    assert_eq!(*extension_edid.bytes(), extension_bytes);
+    assert_eq!(controller.transactions(), 2);
+    assert_eq!(
+        super::super::power::fastboot_gmbus_power_use_count(),
+        refs_before,
+        "each source GMBUS get must be balanced by its put"
+    );
+    assert!(controller.writes_to(GMBUS0).contains(&Pin::Tc1.index()));
+    assert_eq!(
+        (controller.last_transfer_command().unwrap() & GMBUS1_SLAVE_INDEX_MASK)
+            >> GMBUS1_SLAVE_INDEX_SHIFT,
+        u32::from(EDID_EXTENSION_OFFSET)
+    );
+}
+
+#[test]
+fn tc_gmbus_rejects_wrong_or_lost_power_lease_without_leaking_a_ref() {
+    let _guard = scheduler_test_context();
+    let controller = FakeController::bare();
+    let tc2_lease = observed_tc_power_pin(&controller, TcPort::Tc2);
+    let before = super::super::power::fastboot_gmbus_power_use_count();
+    let mut notes = BusNotes::default();
+    assert_eq!(
+        read_edid_with_tc_power(
+            &controller,
+            &FakeClock::new(),
+            Pin::Tc1,
+            &tc2_lease,
+            &mut notes,
+        ),
+        Err(GmbusError::PowerLeaseInvalid { pin: Pin::Tc1 })
+    );
+    assert_eq!(
+        super::super::power::fastboot_gmbus_power_use_count(),
+        before
+    );
+
+    let tc1_lease = observed_tc_power_pin(&controller, TcPort::Tc1);
+    // Firmware/another owner withdrew the retained AUX request after lease
+    // capture. The transfer must fail before touching GMBUS and must not
+    // acquire a domain reference.
+    controller.set_word(ICL_PWR_WELL_CTL_AUX2, 0);
+    notes = BusNotes::default();
+    assert_eq!(
+        read_edid_with_tc_power(
+            &controller,
+            &FakeClock::new(),
+            Pin::Tc1,
+            &tc1_lease,
+            &mut notes,
+        ),
+        Err(GmbusError::PowerLeaseInvalid { pin: Pin::Tc1 })
+    );
+    assert_eq!(
+        super::super::power::fastboot_gmbus_power_use_count(),
+        before
+    );
+    assert_eq!(controller.transactions(), 0);
 }
 
 #[test]

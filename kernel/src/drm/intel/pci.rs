@@ -163,7 +163,7 @@ pub(crate) fn config_address(
         return None;
     }
     let offset = usize::from(offset);
-    if offset & 3 != 0 || width == 0 || width > 4 {
+    if !matches!(width, 1 | 2 | 4) || !offset.is_multiple_of(width) {
         return None;
     }
     if offset.checked_add(width)? > CONFIG_WINDOW {
@@ -174,6 +174,28 @@ pub(crate) fn config_address(
         .checked_add(usize::from(bdf.device) << 15)?
         .checked_add(usize::from(bdf.function) << 12)?
         .checked_add(offset)
+}
+
+/// Write one 16-bit configuration field through a mapped ECAM window.
+///
+/// # Safety
+/// `mapped` must point to a live, writable mapping of the segment-zero ECAM
+/// window covering every bus through `bus_end`. The caller must own the
+/// addressed function and serialize writes to that function.
+unsafe fn write_ecam_u16(
+    mapped: usize,
+    bus_end: u8,
+    bdf: Bdf,
+    offset: u16,
+    value: u16,
+) -> Result<(), String> {
+    let address = config_address(mapped, bus_end, bdf, offset, 2)
+        .ok_or_else(|| String::from("PCI MSI 16-bit write is out of ECAM bounds"))?;
+    // SAFETY: provided by the caller; config_address checked BDF, natural
+    // 16-bit alignment, the full access width, and arithmetic overflow.
+    unsafe { core::ptr::write_volatile(address as *mut u16, value) };
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    Ok(())
 }
 
 /// A bus whose functions can be interrogated.
@@ -451,6 +473,19 @@ pub(super) trait N305DisplayMsi: ConfigWriteSpace {
             return Err(String::from(
                 "display MSI enable/INTx-disable readback differs",
             ));
+        }
+        Ok(())
+    }
+
+    /// Stop new messages before synchronizing hard IRQs. INTx remains
+    /// disabled, and address/data/PVM state is retained for a shared owner.
+    fn mask_n305_display_msi(&mut self, before: &DisplayMsiBefore) -> Result<(), String> {
+        let control = self.read_u16(before.bdf, before.capability + 2)
+            .ok_or_else(|| String::from("display MSI: control unreadable at mask"))?;
+        let disabled = control & !1;
+        self.write_u16(before.bdf, before.capability + 2, disabled)?;
+        if self.read_u16(before.bdf, before.capability + 2) != Some(disabled) {
+            return Err(String::from("display MSI mask readback differs"));
         }
         Ok(())
     }
@@ -1038,11 +1073,18 @@ impl Ecam {
         if info.command & 4 != 0 {
             return Some(false);
         }
-        let address = config_address(self.mapped, self.bus_end, bdf, offset::COMMAND, 2)?;
-        // SAFETY: checked exact-N305 COMMAND word in this live ECAM mapping.
-        // Caller holds exclusive opt-in GT ownership; no other PCI bit changes.
-        unsafe { core::ptr::write_volatile(address as *mut u16, info.command | 4) };
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // SAFETY: platform() established the live ECAM mapping, and this
+        // caller holds exclusive opt-in GT ownership of the exact N305 device.
+        unsafe {
+            write_ecam_u16(
+                self.mapped,
+                self.bus_end,
+                bdf,
+                offset::COMMAND,
+                info.command | 4,
+            )
+        }
+        .ok()?;
         (self.read_u16(bdf, offset::COMMAND)? == info.command | 4).then_some(true)
     }
 
@@ -1077,13 +1119,10 @@ impl ConfigSpace for Ecam {
 #[cfg(target_os = "none")]
 impl ConfigWriteSpace for Ecam {
     fn write_u16(&mut self, bdf: Bdf, offset: u16, value: u16) -> Result<(), String> {
-        let address = config_address(self.mapped, self.bus_end, bdf, offset, 2)
-            .ok_or_else(|| String::from("PCI MSI 16-bit write is out of ECAM bounds"))?;
-        // SAFETY: platform() mapped this exact ECAM range and the aligned
-        // offset was bounded above. Only the named MSI/COMMAND word changes.
-        unsafe { core::ptr::write_volatile(address as *mut u16, value) };
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        Ok(())
+        // SAFETY: platform() mapped this exact ECAM range; the MSI owner has
+        // exclusive access for the transaction. Keep the native-width store
+        // so neighboring PCI Status W1C bits are never echoed back.
+        unsafe { write_ecam_u16(self.mapped, self.bus_end, bdf, offset, value) }
     }
 
     fn write_u32(&mut self, bdf: Bdf, offset: u16, value: u32) -> Result<(), String> {
@@ -1240,6 +1279,132 @@ mod tests {
             self.insert(offset, value);
             self.finish_write(landed_failure)
         }
+    }
+
+    /// A host-memory ECAM aperture used to exercise the production address
+    /// calculation and volatile access widths, rather than the word-merging
+    /// `MsiModel` above.
+    #[repr(align(4096))]
+    struct ConfigWindow([u8; CONFIG_WINDOW]);
+
+    struct MappedEcamModel {
+        bdf: Bdf,
+        window: ConfigWindow,
+    }
+
+    impl MappedEcamModel {
+        fn n305() -> Self {
+            let bdf = Bdf::new(0, 0, 0);
+            let mut model = Self {
+                bdf,
+                window: ConfigWindow([0; CONFIG_WINDOW]),
+            };
+            for (offset, value) in [
+                (0x00, 0x46d0_8086),
+                // PCI COMMAND=0x0006 and adjacent STATUS=0x0010
+                // (Capabilities List). Real 16-bit writes must not touch it.
+                (0x04, 0xf810_0006),
+                (0x08, 0x0300_0000),
+                (0x0c, 0),
+                (0x34, 0x40),
+                (0x40, (0x0180u32 << 16) | 0x05),
+                (0x44, 0xaabb_ccdd),
+                (0x48, 0x1122_3344),
+                (0x4c, 0x0000_0067),
+                (0x50, 0xa5a5_a5a4),
+            ] {
+                model.write_dword(offset, value);
+            }
+            model
+        }
+
+        fn base(&self) -> usize {
+            self.window.0.as_ptr() as usize
+        }
+
+        fn write_dword(&mut self, offset: u16, value: u32) {
+            let address = config_address(self.base(), 0, self.bdf, offset, 4).unwrap();
+            // SAFETY: the aligned test aperture spans the entire function.
+            unsafe { core::ptr::write_volatile(address as *mut u32, value) };
+        }
+
+        fn bytes(&self) -> &[u8; CONFIG_WINDOW] {
+            &self.window.0
+        }
+    }
+
+    impl ConfigSpace for MappedEcamModel {
+        fn read_u32(&self, bdf: Bdf, offset: u16) -> Option<u32> {
+            if bdf != self.bdf {
+                return None;
+            }
+            let address = config_address(self.base(), 0, bdf, offset, 4)?;
+            // SAFETY: config_address bounded this aligned dword to the live
+            // test aperture, which remains borrowed for the access.
+            Some(unsafe { core::ptr::read_volatile(address as *const u32) })
+        }
+    }
+
+    impl ConfigWriteSpace for MappedEcamModel {
+        fn write_u16(&mut self, bdf: Bdf, offset: u16, value: u16) -> Result<(), String> {
+            if bdf != self.bdf {
+                return Err(String::from("test ECAM BDF mismatch"));
+            }
+            // SAFETY: this aligned byte array models the complete writable
+            // segment-zero ECAM aperture for bus zero.
+            unsafe { write_ecam_u16(self.base(), 0, bdf, offset, value) }
+        }
+
+        fn write_u32(&mut self, bdf: Bdf, offset: u16, value: u32) -> Result<(), String> {
+            if bdf != self.bdf {
+                return Err(String::from("test ECAM BDF mismatch"));
+            }
+            let address = config_address(self.base(), 0, bdf, offset, 4)
+                .ok_or_else(|| String::from("test ECAM dword out of bounds"))?;
+            // SAFETY: config_address checked the aligned dword in this window.
+            unsafe { core::ptr::write_volatile(address as *mut u32, value) };
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn n305_msi_transaction_uses_real_ecam_halfword_offsets_and_widths() {
+        let mut model = MappedEcamModel::n305();
+        let original = *model.bytes();
+        let before = model
+            .prepare_n305_display_msi(model.bdf, 0x1234_5678_9abc_def0, 0x45)
+            .unwrap();
+
+        assert_eq!(model.read_u16(model.bdf, 0x42), Some(0x0180));
+        assert_eq!(model.read_u16(model.bdf, 0x04), Some(0x0406));
+        assert_eq!(
+            model.read_u16(model.bdf, 0x06),
+            Some(0xf810),
+            "writing PCI COMMAND must not overwrite adjacent W1C STATUS"
+        );
+        assert_eq!(model.read_u16(model.bdf, 0x4c), Some(0x0045));
+        assert_eq!(model.read_u32(model.bdf, 0x50), Some(0xa5a5_a5a5));
+
+        model.activate_n305_display_msi(&before).unwrap();
+        assert_eq!(model.read_u16(model.bdf, 0x42), Some(0x01_81));
+        model.unmask_n305_display_msi(&before).unwrap();
+        assert_eq!(model.read_u32(model.bdf, 0x50), Some(0xa5a5_a5a4));
+        model.restore_n305_display_msi(&before).unwrap();
+        assert_eq!(model.bytes(), &original);
+    }
+
+    #[test]
+    fn msi_mask_preserves_route_and_can_resume_the_shared_display_owner() {
+        let mut model = MappedEcamModel::n305();
+        let before = model.prepare_n305_display_msi(model.bdf, 0xfee0_0000, 0x45).unwrap();
+        model.activate_n305_display_msi(&before).unwrap();
+        model.unmask_n305_display_msi(&before).unwrap();
+        let active = *model.bytes();
+        model.mask_n305_display_msi(&before).unwrap();
+        assert_eq!(model.read_u16(model.bdf, before.capability + 2).unwrap() & 1, 0);
+        assert_ne!(model.read_u16(model.bdf, offset::COMMAND).unwrap() & (1 << 10), 0);
+        model.activate_n305_display_msi(&before).unwrap();
+        assert_eq!(model.bytes(), &active);
     }
 
     fn msi_control(model: &MsiModel) -> u16 {
@@ -1471,8 +1636,22 @@ mod tests {
             config_address(base, 0xff, Bdf::new(0, 0, 0), 0x1000, 4),
             None
         );
-        // Only aligned 1-, 2- and 4-byte accesses exist.
-        assert_eq!(config_address(base, 0xff, Bdf::new(0, 0, 0), 2, 2), None);
+        // Accesses require only their natural 1-, 2- or 4-byte alignment;
+        // capability control at offset 0x42 is a valid 16-bit ECAM word.
+        assert_eq!(
+            config_address(base, 0xff, Bdf::new(0, 0, 0), 0x42, 2),
+            Some(base + 0x42)
+        );
+        assert_eq!(config_address(base, 0xff, Bdf::new(0, 0, 0), 0x41, 2), None);
+        assert_eq!(
+            config_address(base, 0xff, Bdf::new(0, 0, 0), 0xffe, 2),
+            Some(base + 0xffe)
+        );
+        assert_eq!(config_address(base, 0xff, Bdf::new(0, 0, 0), 0xfff, 2), None);
+        assert_eq!(
+            config_address(base, 0xff, Bdf::new(0, 0, 0), 0xfff, 1),
+            Some(base + 0xfff)
+        );
         assert_eq!(config_address(base, 0xff, Bdf::new(0, 0, 0), 0, 8), None);
         assert_eq!(config_address(base, 0xff, Bdf::new(0, 0, 0), 0, 0), None);
         // The arithmetic refuses to wrap rather than landing back inside.

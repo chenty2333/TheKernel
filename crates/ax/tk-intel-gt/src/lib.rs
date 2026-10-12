@@ -670,7 +670,7 @@ pub mod i915_probe_provider_upstream;
 
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
-pub(crate) mod i915_ioctl_upstream;
+pub mod i915_ioctl_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod i915_memcpy_upstream;

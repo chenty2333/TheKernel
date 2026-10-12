@@ -147,6 +147,10 @@ pub struct SharedPages {
     /// lease pins the PCI aperture/resource mapping until the last VMA/GEM
     /// reference goes away; final drop must never return these frames to RAM.
     external_lease: Option<Arc<ExternalPageLease>>,
+    /// Ordinary cacheable RAM pages retained through an external page-cache
+    /// reference owner. These are not allocator-owned `SharedPages` frames;
+    /// their owner drops the Linux page references instead.
+    page_cache_owner: Option<Arc<dyn Send + Sync>>,
     /// Immutable cache/type attributes supplied by the external owner.
     /// They are merged into every PTE publication and cannot be removed by
     /// mprotect or a later remap.
@@ -255,6 +259,7 @@ impl SharedPages {
             direct_view_pins: AtomicUsize::new(0),
             resident_charge: None,
             external_lease: None,
+            page_cache_owner: None,
             allocation_owner: Mutex::new(None),
             external_mapping_flags: MappingFlags::empty(),
         })
@@ -267,6 +272,52 @@ impl SharedPages {
     /// publication. All frames and vector capacity are acquired by this call.
     pub fn new_fixed(size: usize, page_size: PageSize) -> AxResult<Self> {
         Self::new_with_growth(size, page_size, false)
+    }
+
+    /// Builds an immutable shared backing over ordinary cacheable 4 KiB RAM
+    /// pages retained by a Linux page-cache owner. The caller supplies one
+    /// live reference per frame; the owner must release those references when
+    /// its final Arc is dropped. Unlike device pages, these frames use normal
+    /// RAM cache attributes and may be read and written through direct maps.
+    /// # Safety
+    /// Every address must identify a 4 KiB cacheable system-RAM page (not an
+    /// MMIO/device frame), and `owner` must retain a page reference or pin for
+    /// every entry until the final `SharedPages` clone is dropped. Callers
+    /// must not publish the backing unless those lifetime and cacheability
+    /// guarantees hold. Synthetic PFNs may only be used by isolated tests
+    /// that drop the backing without mapping, populating, or reading it.
+    pub unsafe fn new_page_cache_4k(
+        pages: Vec<PhysAddr>,
+        owner: Arc<dyn Send + Sync>,
+    ) -> AxResult<Self> {
+        if pages.is_empty()
+            || pages
+                .iter()
+                .any(|page| !PageSize::Size4K.is_aligned(page.as_usize()))
+        {
+            return Err(AxError::InvalidInput);
+        }
+        let page_count = pages.len();
+        Ok(Self {
+            allocation_owner: Mutex::new(None),
+            backing_key: SharedBackingKey::allocate()?,
+            phys_pages: Mutex::new(SharedPageStorage {
+                pages: pages.into_iter().map(Some).collect(),
+                folios: Vec::new(),
+            }),
+            secret_frames: None,
+            secret_size: None,
+            secret_growth: None,
+            published_len: AtomicUsize::new(page_count),
+            logical_eof: AtomicUsize::new(page_count * PAGE_SIZE_4K),
+            size: PageSize::Size4K,
+            fixed: true,
+            direct_view_pins: AtomicUsize::new(0),
+            resident_charge: None,
+            external_lease: None,
+            page_cache_owner: Some(owner),
+            external_mapping_flags: MappingFlags::empty(),
+        })
     }
 
     /// Allocates SysV shared pages and charges only frames that were actually
@@ -302,11 +353,15 @@ impl SharedPages {
         let mut phys_pages = Vec::<Option<PhysAddr>>::new();
         phys_pages
             .try_reserve_exact(num_pages)
-            .map_err(|_| AxError::NoMemory)?;
+            .map_err(|_| {
+                axlog::warn!("shared-pages: metadata allocation failed pages={num_pages} bytes={} frame_size={}", num_pages.saturating_mul(core::mem::size_of::<Option<PhysAddr>>()), page_size as usize);
+                AxError::NoMemory
+            })?;
         for _ in 0..num_pages {
             match alloc_frame(true, page_size) {
                 Ok(frame) => phys_pages.push(Some(frame)),
                 Err(err) => {
+                    axlog::warn!("shared-pages: frame allocation failed acquired={} requested={num_pages} frame_size={} error={err:?}", phys_pages.len(), page_size as usize);
                     for frame in phys_pages.into_iter().flatten() {
                         dealloc_frame(frame, page_size);
                     }
@@ -334,6 +389,7 @@ impl SharedPages {
             direct_view_pins: AtomicUsize::new(0),
             resident_charge,
             external_lease: None,
+            page_cache_owner: None,
             allocation_owner: Mutex::new(None),
             external_mapping_flags: MappingFlags::empty(),
         })
@@ -373,6 +429,7 @@ impl SharedPages {
             direct_view_pins: AtomicUsize::new(0),
             resident_charge: None,
             external_lease: Some(lease),
+            page_cache_owner: None,
             allocation_owner: Mutex::new(None),
             external_mapping_flags: MappingFlags::DEVICE | MappingFlags::UNCACHED,
         })
@@ -1485,7 +1542,7 @@ impl Drop for SharedPages {
     fn drop(&mut self) {
         // Dropping SecretFrame performs window zeroing, restores the direct
         // alias only after the wipe, and finally returns the frame.
-        if self.secret_frames.is_some() || self.is_external() {
+        if self.secret_frames.is_some() || self.is_external() || self.page_cache_owner.is_some() {
             return;
         }
         let storage = self.phys_pages.lock();
@@ -2038,6 +2095,65 @@ fn access_flags() -> MappingFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PageOwnerDropCounter(Arc<AtomicUsize>);
+
+    impl Drop for PageOwnerDropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn page_owner(counter: &Arc<AtomicUsize>) -> Arc<dyn Send + Sync> {
+        Arc::new(PageOwnerDropCounter(counter.clone()))
+    }
+
+    #[test]
+    fn page_cache_owner_lives_until_last_shared_pages_clone_and_rejects_invalid_pages() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        // These synthetic addresses are only stored and then dropped: this
+        // regression never maps or dereferences them. Production callers must
+        // provide pinned cacheable RAM pages with a matching owner lease.
+        let pages = unsafe {
+            SharedPages::new_page_cache_4k(
+                alloc::vec![PhysAddr::from_usize(0x1000), PhysAddr::from_usize(0x2000)],
+                page_owner(&dropped),
+            )
+        }
+        .unwrap();
+        let pages = Arc::new(pages);
+        let clone = pages.clone();
+        drop(pages);
+        assert_eq!(dropped.load(Ordering::Acquire), 0);
+        // The synthetic aligned PFNs have no allocator records. A successful
+        // final drop proves the page-cache owner path never calls dealloc_frame.
+        drop(clone);
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+
+        let empty_owner_dropped = Arc::new(AtomicUsize::new(0));
+        assert!(matches!(
+            unsafe {
+                SharedPages::new_page_cache_4k(
+                    Vec::new(),
+                    page_owner(&empty_owner_dropped),
+                )
+            },
+            Err(AxError::InvalidInput)
+        ));
+        assert_eq!(empty_owner_dropped.load(Ordering::Acquire), 1);
+
+        let misaligned_owner_dropped = Arc::new(AtomicUsize::new(0));
+        assert!(matches!(
+            unsafe {
+                SharedPages::new_page_cache_4k(
+                    alloc::vec![PhysAddr::from_usize(0x1001)],
+                    page_owner(&misaligned_owner_dropped),
+                )
+            },
+            Err(AxError::InvalidInput)
+        ));
+        assert_eq!(misaligned_owner_dropped.load(Ordering::Acquire), 1);
+    }
 
     #[test]
     fn fixed_shared_cpu_cache_type_survives_fault_protect_and_clone() {

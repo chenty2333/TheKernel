@@ -64,8 +64,18 @@ fn physical_extent(base: usize, size: usize) -> Option<(usize, usize, usize)> {
     ))
 }
 
-/// Return true only when the full byte range is firmware-reserved and not
-/// part of the page allocator's free physical ranges.
+/// Return true only when no byte of the range is RAM.
+#[cfg(not(target_os = "none"))]
+fn wc_physical_range_allowed(_base: usize, _size: usize) -> bool {
+    // No firmware-reserved physical ranges exist in a host process.
+    false
+}
+
+/// Linux `ioremap_wc()` refuses only ranges that are RAM (`__ioremap_check_ram`).
+/// A 64-bit PCI BAR such as ADL-N's GMADR at 256 GiB lies in no firmware
+/// memory-map entry at all, so an uncovered gap is device space; every region
+/// the range does overlap must still be reserved or device memory, never RAM.
+#[cfg(target_os = "none")]
 fn wc_physical_range_allowed(base: usize, size: usize) -> bool {
     let Some(end) = base.checked_add(size) else {
         return false;
@@ -73,13 +83,12 @@ fn wc_physical_range_allowed(base: usize, size: usize) -> bool {
     if base >= end {
         return false;
     }
-    let mut cursor = base;
     for region in memory_regions() {
         let start = region.paddr.as_usize();
         let Some(region_end) = start.checked_add(region.size) else {
             return false;
         };
-        if region_end <= cursor || start > cursor {
+        if region_end <= base || start >= end {
             continue;
         }
         if region.flags.contains(MemRegionFlags::FREE)
@@ -89,14 +98,18 @@ fn wc_physical_range_allowed(base: usize, size: usize) -> bool {
         {
             return false;
         }
-        cursor = end.min(region_end);
-        if cursor == end {
-            return true;
-        }
     }
-    false
+    !axhal::mem::phys_ram_ranges()
+        .iter()
+        .any(|&(start, len)| start < end && start.saturating_add(len) > base)
 }
 
+#[cfg(not(target_os = "none"))]
+fn vmap_search_window() -> Option<(VirtAddr, VirtAddrRange)> {
+    None
+}
+
+#[cfg(target_os = "none")]
 fn vmap_search_window() -> Option<(VirtAddr, VirtAddrRange)> {
     let mut max_phys_end = 0usize;
     for region in memory_regions() {

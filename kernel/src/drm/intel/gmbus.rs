@@ -555,6 +555,12 @@ pub(crate) enum GmbusError {
     /// The register window refused a register it had an address for.  This is
     /// a bug in the register table, not a hardware condition.
     RegisterRefused { register: &'static str },
+    /// The caller supplied a TC power lease for a different port, or the
+    /// retained request/state bits no longer prove that lease is live.
+    PowerLeaseInvalid { pin: Pin },
+    /// The source GMBUS power-domain reference could not be acquired or
+    /// released under the verified TC lease.
+    PowerReferenceFailed { pin: Pin },
     /// `GMBUS2.INUSE` was set when the transaction began: something else is
     /// driving the controller.
     BusInUse { pin: Pin, status: u32 },
@@ -652,6 +658,13 @@ impl GmbusError {
             Self::RegisterRefused { register } => format!(
                 "{register} is declared read-only or is not in the bus table, which is a bug in \
                  this kernel rather than a hardware condition"
+            ),
+            Self::PowerLeaseInvalid { pin } => format!(
+                "the retained TC power lease does not own {pin}, or its request/state bits are no \
+                 longer live; no GMBUS transaction was started"
+            ),
+            Self::PowerReferenceFailed { pin } => format!(
+                "the source GMBUS power-domain reference could not be balanced for {pin}"
             ),
             Self::BusInUse { pin, status } => format!(
                 "GMBUS was already in use when the transaction on {pin} began (GMBUS2 = \
@@ -1348,6 +1361,7 @@ fn read_block_once<R: Registers, T: PollTimer>(
     registers: &R,
     timer: &T,
     pin: Pin,
+    power_pin: Option<&super::fastboot::PowerPin>,
     rate: Rate,
     address: u8,
     offset: u8,
@@ -1365,6 +1379,7 @@ fn read_block_once<R: Registers, T: PollTimer>(
         offset,
         &mut bytes,
         if notes.force_bitbang { 1 << 31 } else { 0 },
+        power_pin,
     );
     notes.was_in_use |= transfer.was_in_use;
     notes.stale_two_byte_index |= transfer.stale_two_byte_index;
@@ -1467,6 +1482,7 @@ fn read_block<R: Registers, T: PollTimer>(
     registers: &R,
     timer: &T,
     pin: Pin,
+    power_pin: Option<&super::fastboot::PowerPin>,
     address: u8,
     offset: u8,
     kind: Block,
@@ -1477,7 +1493,9 @@ fn read_block<R: Registers, T: PollTimer>(
     loop {
         attempt += 1;
         notes.attempts = attempt;
-        match read_block_once(registers, timer, pin, rate, address, offset, kind, notes) {
+        match read_block_once(
+            registers, timer, pin, power_pin, rate, address, offset, kind, notes,
+        ) {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
                 let retry = if attempt < MAX_ATTEMPTS && error.worth_retrying() {
@@ -1539,6 +1557,29 @@ pub(crate) fn read_edid_with<R: Registers, T: PollTimer>(
         registers,
         timer,
         pin,
+        None,
+        DDC_ADDRESS,
+        EDID_BASE_OFFSET,
+        Block::Base,
+        notes,
+    )
+}
+
+/// Read the EDID base block while a TC fastboot caller holds the source-mapped
+/// `PowerPin` lease for this exact connector. Unlike the generic path above,
+/// this does not depend on a non-TC global `POWER` singleton.
+pub(crate) fn read_edid_with_tc_power<R: Registers, T: PollTimer>(
+    registers: &R,
+    timer: &T,
+    pin: Pin,
+    power_pin: &super::fastboot::PowerPin,
+    notes: &mut BusNotes,
+) -> Result<EdidBytes, GmbusError> {
+    read_block(
+        registers,
+        timer,
+        pin,
+        Some(power_pin),
         DDC_ADDRESS,
         EDID_BASE_OFFSET,
         Block::Base,
@@ -1570,15 +1611,44 @@ pub(crate) fn read_edid_extension_with<R: Registers, T: PollTimer>(
     pin: Pin,
 ) -> Result<Option<EdidBytes>, GmbusError> {
     let mut notes = BusNotes::default();
-    let base = read_block(
-        registers,
-        timer,
-        pin,
-        DDC_ADDRESS,
-        EDID_BASE_OFFSET,
-        Block::Base,
-        &mut notes,
-    )?;
+    let base = read_edid_with(registers, timer, pin, &mut notes)?;
+    read_edid_extension_from_base_with(registers, timer, pin, &base, &mut notes)
+}
+
+/// Read the first advertised extension using the already validated base
+/// block. This keeps a caller's complete route transaction on the same DDC
+/// pin without issuing a redundant second base-block read.
+pub(crate) fn read_edid_extension_from_base_with<R: Registers, T: PollTimer>(
+    registers: &R,
+    timer: &T,
+    pin: Pin,
+    base: &EdidBytes,
+    notes: &mut BusNotes,
+) -> Result<Option<EdidBytes>, GmbusError> {
+    read_edid_extension_from_base_powered_with(registers, timer, pin, base, notes, None)
+}
+
+/// TC fastboot variant of [`read_edid_extension_from_base_with`], preserving
+/// the same validated power lease across the extension transaction.
+pub(crate) fn read_edid_extension_from_base_tc_power_with<R: Registers, T: PollTimer>(
+    registers: &R,
+    timer: &T,
+    pin: Pin,
+    base: &EdidBytes,
+    notes: &mut BusNotes,
+    power_pin: &super::fastboot::PowerPin,
+) -> Result<Option<EdidBytes>, GmbusError> {
+    read_edid_extension_from_base_powered_with(registers, timer, pin, base, notes, Some(power_pin))
+}
+
+fn read_edid_extension_from_base_powered_with<R: Registers, T: PollTimer>(
+    registers: &R,
+    timer: &T,
+    pin: Pin,
+    base: &EdidBytes,
+    notes: &mut BusNotes,
+    power_pin: Option<&super::fastboot::PowerPin>,
+) -> Result<Option<EdidBytes>, GmbusError> {
     if base.extension_count() == 0 {
         return Ok(None);
     }
@@ -1586,10 +1656,11 @@ pub(crate) fn read_edid_extension_with<R: Registers, T: PollTimer>(
         registers,
         timer,
         pin,
+        power_pin,
         DDC_ADDRESS,
         EDID_EXTENSION_OFFSET,
         Block::Extension,
-        &mut notes,
+        notes,
     )?;
     Ok(Some(extension))
 }

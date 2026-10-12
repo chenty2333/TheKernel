@@ -26,6 +26,7 @@ from tools.product_state import (
     MACHINE_PROFILES, machine_profile,
     state_root, validate_storage, state_lock, serialized_build, isolated_run,
     artifact_config_stamp, artifact_config_key, artifact_input_key, validate_artifact_config,
+    effective_backtrace,
     rootfs_stamp_path, rootfs_fingerprint, rootfs_image_fingerprint,
     TOOL_PAYLOADS, selected_tool_payload, rootfs_image_bytes,
     guest_tools_dir, guest_tools_fingerprint,
@@ -76,6 +77,12 @@ PRODUCT_MAX_CPUS = machine_profile("q35-uefi").max_cpus
 SYSTEM_TEST_SHUTDOWN_COMMANDS = "/bin/busybox poweroff -f\nexit\n"
 MAX_KERNEL_BYTES = 800 * 1024 * 1024
 KERNEL_LOAD_PADDR = 2 * 1024 * 1024
+DWARF_SECTIONS = (
+    ".debug_abbrev", ".debug_addr", ".debug_aranges", ".debug_info", ".debug_line",
+    ".debug_line_str", ".debug_ranges", ".debug_rnglists", ".debug_str",
+    ".debug_str_offsets",
+)
+DWARF_REQUIRED_SECTIONS = {".debug_abbrev", ".debug_info", ".debug_line", ".debug_str"}
 GIB = 1024 * 1024 * 1024
 # Q35 reserves the 2--4 GiB PCI hole.  QEMU keeps this amount below 4 GiB
 # and places all remaining guest RAM at the high-memory base below.
@@ -156,6 +163,7 @@ def command_env(artifacts: Artifacts) -> dict[str, str]:
         "-C force-frame-pointers -C debuginfo=2 -C strip=none"
     )
     inherited_rustflags = os.environ.get("RUSTFLAGS", "").strip()
+    backtrace = effective_backtrace(artifacts)
     env = {
         **os.environ,
         "CARGO_BUILD_JOBS": os.environ.get("CARGO_BUILD_JOBS") or "2",
@@ -167,7 +175,10 @@ def command_env(artifacts: Artifacts) -> dict[str, str]:
         # where the harness captures it as `kernel.log` -- so logs stay off the
         # interactive COM1 terminal on any machine with a second port.
         "AX_LOG": os.environ.get("AX_LOG") or "info",
-        "AX_BACKTRACE": os.environ.get("AX_BACKTRACE") or "n",
+        "AX_BACKTRACE": backtrace,
+        # axhal's linker script reserves loadable section storage only when
+        # the matching runtime DWARF support is compiled into the image.
+        "DWARF": "y" if backtrace == "y" else "n",
         # QEMU user networking defaults; the N305 target opts out below.
         # axnet-ng consumes optional static configuration at compile time.
         "AX_IP": "10.0.2.15",
@@ -265,6 +276,58 @@ def generate_config(artifacts: Artifacts) -> None:
     temp_path.replace(artifacts.config_path)
 
 
+def embed_dwarf_sections(objcopy: Path, source: Path, output: Path,
+                         output_dir: Path, env: dict[str, str]) -> None:
+    """Copy linker-resolved DWARF into axhal's reserved loadable sections."""
+    readelf = shutil.which("readelf")
+    if readelf is None:
+        raise ProductError("readelf is required to identify linked DWARF sections")
+    try:
+        sections = subprocess.run(
+            [readelf, "-W", "-S", str(source)], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+    except OSError as error:
+        raise ProductError(f"could not inspect kernel DWARF sections: {error}") from error
+    if sections.returncode:
+        detail = sections.stderr.strip() or f"exit status {sections.returncode}"
+        raise ProductError(f"could not inspect kernel DWARF sections: {detail}")
+
+    present = set(re.findall(
+        r"^\s*\[\s*\d+\]\s+(\.debug_[A-Za-z0-9_]+)\s+",
+        sections.stdout,
+        re.MULTILINE,
+    ))
+    missing = DWARF_REQUIRED_SECTIONS - present
+    if missing:
+        raise ProductError(
+            "N305 backtrace ELF is missing required DWARF sections: "
+            + ", ".join(sorted(missing))
+        )
+
+    with tempfile.TemporaryDirectory(prefix=".dwarf-", dir=output_dir) as temp:
+        raw_sections = {name: Path(temp) / f"{name[1:]}.bin"
+                        for name in DWARF_SECTIONS if name in present}
+        dump = [str(objcopy)]
+        for name, path in raw_sections.items():
+            dump.extend(("--dump-section", f"{name}={path}"))
+        dump.append(str(source))
+        run_checked(dump, env=env)
+
+        for name in DWARF_REQUIRED_SECTIONS:
+            if raw_sections[name].stat().st_size == 0:
+                raise ProductError(f"N305 backtrace DWARF section is empty: {name}")
+
+        update = [str(objcopy), "--strip-all"]
+        for name, path in raw_sections.items():
+            if path.stat().st_size:
+                # The linker script reserves an ALLOC/LOAD section without the
+                # leading dot; the original dot-prefixed section is non-loadable.
+                update.extend(("--update-section", f"{name[1:]}={path}"))
+        update.extend((str(source), str(output)))
+        run_checked(update, env=env)
+
+
 def kernel_features(artifacts: Artifacts) -> str:
     variant = artifacts.variant
     # Keep the product hardware surface explicit and centralized.  The
@@ -272,6 +335,8 @@ def kernel_features(artifacts: Artifacts) -> str:
     # runtime no-op, so a single product ELF still boots on non-Intel and
     # virtualized machines.
     features = [PRODUCT_FEATURE]
+    if effective_backtrace(artifacts) == "y":
+        features.append("axfeat/dwarf")
     features.append("nvme")
     features.append("ahci")
     features.append("sdhci")
@@ -340,10 +405,20 @@ def build_kernel(
     artifacts.output_dir.mkdir(parents=True, exist_ok=True)
     staged_kernel = artifacts.kernel.with_name(artifacts.kernel.name + ".tmp")
     staged_kernel.unlink(missing_ok=True)
-    run_checked(
-        [str(llvm_objcopy()), "--strip-all", str(artifacts.cargo_elf), str(staged_kernel)],
-        env=env,
-    )
+    objcopy = llvm_objcopy()
+    if env["DWARF"] == "y":
+        embed_dwarf_sections(
+            objcopy,
+            artifacts.cargo_elf,
+            staged_kernel,
+            artifacts.output_dir,
+            env,
+        )
+    else:
+        run_checked(
+            [str(objcopy), "--strip-all", str(artifacts.cargo_elf), str(staged_kernel)],
+            env=env,
+        )
     if not staged_kernel.is_file() or staged_kernel.stat().st_size == 0:
         raise ProductError(f"kernel output is empty: {staged_kernel}")
     if staged_kernel.stat().st_size > MAX_KERNEL_BYTES:

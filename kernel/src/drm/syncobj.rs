@@ -130,6 +130,12 @@ impl Syncobj {
     pub fn fence(&self) -> AxResult<Arc<Fence>> {
         self.fence.lock().clone().ok_or(AxError::NotFound)
     }
+    /// Current Linux-style payload: the binary fence, or the latest timeline
+    /// chain view when one has been submitted.
+    pub(crate) fn latest_fence(&self) -> Option<Arc<Fence>> {
+        let binary = self.fence.lock().clone();
+        self.timeline.lock().head.clone().or(binary)
+    }
     pub fn reset(&self) {
         *self.fence.lock() = None;
         let mut timeline = self.timeline.lock();
@@ -377,6 +383,9 @@ impl Pollable for SyncobjFile {
 impl SyncFile {
     pub fn new(fence: Arc<Fence>) -> Arc<Self> {
         Arc::new(Self { fence })
+    }
+    pub(crate) fn try_new(fence: Arc<Fence>) -> AxResult<Arc<Self>> {
+        Arc::try_new(Self { fence }).map_err(|_| AxError::NoMemory)
     }
     pub fn fence(&self) -> Arc<Fence> {
         self.fence.clone()
@@ -744,6 +753,28 @@ mod tests {
     }
 
     #[test]
+    fn sync_file_poll_tracks_deferred_completion_error_and_shared_fence_identity() {
+        let pending = Fence::new(false);
+        let file = SyncFile::new(pending.clone());
+        let duplicate = file.clone();
+        assert!(file.poll().is_empty());
+        assert!(Arc::ptr_eq(&file.fence(), &duplicate.fence()));
+
+        // A sync_file snapshots one fence: terminal completion becomes
+        // pollable only after that producer fence signals.
+        pending.signal();
+        assert!(file.poll().contains(IoEvents::READABLE));
+        assert!(!file.poll().contains(IoEvents::ERROR));
+
+        let failed = Fence::new(false);
+        let error_file = SyncFile::new(failed.clone());
+        assert!(error_file.poll().is_empty());
+        failed.signal_error();
+        assert!(error_file.poll().contains(IoEvents::ERROR));
+        assert!(!error_file.poll().contains(IoEvents::READABLE));
+    }
+
+    #[test]
     fn binary_wait_any_reports_the_signaled_member() {
         let first = Fence::new(false);
         let second = Fence::new(true);
@@ -874,7 +905,7 @@ mod tests {
         let object = Syncobj::new(false);
         let gpu = Fence::new(false);
         let reservation = super::super::fence::Reservation::new();
-        reservation.publish(gpu.clone());
+        reservation.publish(gpu.clone()).unwrap();
         object.import_fence(gpu.clone());
         let snapshot = SyncFile::new(gpu.clone());
         object.signal();

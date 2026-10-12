@@ -21,6 +21,7 @@ import tempfile
 
 REPO = Path(__file__).resolve().parents[1]
 MAX_UPLOAD = 96 * 1024 * 1024
+DEFAULT_GFXMODE = "3840x2160x32,auto"
 
 
 def write(path: Path, content: str, executable: bool = False) -> None:
@@ -34,14 +35,20 @@ insmod net
 insmod tftp
 insmod all_video
 terminal_output console
+set gfxmode={gfxmode}
 set gfxpayload={gfxmode}
 echo "N305 PXE: requesting DHCP"
 net_bootp
 set root=(tftp)
 '''
     if mode == "kernel":
+        # multiboot2's framebuffer-header handling resets gfxpayload (our
+        # zero-sized request selects "auto"). Override it *after* loading the
+        # kernel, before boot actually selects the video mode. gfxmode alone
+        # only controls gfxterm, not the console terminal used here.
         return header + f'''echo "N305 PXE: loading TheKernel"
 multiboot2 /TheKernel.elf quiet loglevel={loglevel} n305.net=dhcp n305.netconsole={address}:6666
+set gfxpayload={gfxmode}
 echo "N305 PXE: loading rootfs; this can take a minute"
 module2 /rootfs-x86.img rootfs
 echo "N305 PXE: starting kernel (hardware drivers unverified)"
@@ -384,7 +391,11 @@ def main() -> None:
     prep.add_argument("--apks", type=Path, help="local signed APK repository, with APKINDEX.tar.gz")
     prep.add_argument("--loglevel", choices=("error", "warn", "info", "debug", "trace"), default="info")
     prep.add_argument("--kernel-cmdline", help="kernel mode: append literal diagnostic arguments")
-    prep.add_argument("--gfxmode", default="1920x1080x32,auto")
+    # The measured N305 firmware scans out 3840x2160, but the previous GRUB
+    # 1920x1080,auto boot handed off an 800x600 GOP plane scaled by the display
+    # engine. Prefer the measured native plane but keep `auto` as a boot-safe
+    # fallback; Intel KMS still refuses unsupported scaled state.
+    prep.add_argument("--gfxmode", default=DEFAULT_GFXMODE)
     serve = sub.add_parser("serve"); serve.add_argument("--out", type=Path, required=True)
     serve.add_argument("--bind", required=True)
     args = parser.parse_args()

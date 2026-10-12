@@ -7,31 +7,42 @@
 // symbols are declared extern "C" below. The complete MIT grant is retained in
 // ../LICENSE-MIT.
 
-#![allow(unsafe_code, non_snake_case, non_upper_case_globals, dead_code, unused_variables, unused_unsafe, clashing_extern_declarations)]
+#![allow(
+    unsafe_code,
+    non_snake_case,
+    non_upper_case_globals,
+    dead_code,
+    unused_variables,
+    unused_unsafe,
+    clashing_extern_declarations
+)]
 
 use core::ffi::{CStr, VaList, c_char, c_int, c_long, c_ulong, c_void};
 
 use crate::{
+    i915_ioctl_upstream::DrmIoctlDesc,
     i915_probe_provider_upstream as provider,
     i915_probe_provider_upstream::framework,
-    intel_gt_types_upstream::I915_MAX_GT,
-    intel_engine_cs_upstream::Spinlock,
-    linux::memory::{atomic_add},
-    linux::pm::intel_runtime_pm_put,
-    linux::locks::spin_lock_init,
     i915_utils_upstream::i915_vtd_active,
     intel_device_info_types_upstream::*,
     intel_device_info_upstream::*,
+    intel_engine_cs_upstream::Spinlock,
+    intel_gt_types_upstream::{I915_MAX_GT, IntelGt},
     intel_pciids_upstream::*,
-    linux::i915::*,
-    linux::primitives::str_yes_no,
-    linux::memory::atomic_read,
-    linux_i915_private::{DrmI915Private, I915Params},
-    linux_print::{CFormatArg, DrmLogLevel, drm_log_at, drm_printer, format_message, drm_debug_enabled, drm_dbg_printer},
-    i915_ioctl_upstream::DrmIoctlDesc,
-    intel_gt_types_upstream::IntelGt,
-    intel_uncore_types_upstream::{IntelUncore, IntelRuntimePm},
     intel_runtime_pm_upstream::IntelRuntimePmLayout,
+    intel_uncore_types_upstream::{IntelRuntimePm, IntelUncore},
+    linux::{
+        i915::*,
+        locks::spin_lock_init,
+        memory::{atomic_add, atomic_read},
+        pm::intel_runtime_pm_put,
+        primitives::str_yes_no,
+    },
+    linux_i915_private::{DrmI915Private, I915Params},
+    linux_print::{
+        CFormatArg, DrmLogLevel, drm_dbg_printer, drm_debug_enabled, drm_log_at, drm_printer,
+        format_message,
+    },
 };
 /// Owned value for one printf conversion pulled from the C va_list.
 type OwnedArg = alloc::boxed::Box<dyn CFormatArg>;
@@ -74,7 +85,13 @@ unsafe fn collect_c_args(format: &[u8], args: &mut VaList<'_>) -> alloc::vec::Ve
         // length modifiers
         let mut long_len = false;
         while i < format.len() && b"hlLqjzt".contains(&format[i]) {
-            if format[i] == b'l' || format[i] == b'L' || format[i] == b'q' || format[i] == b'j' || format[i] == b'z' || format[i] == b't' {
+            if format[i] == b'l'
+                || format[i] == b'L'
+                || format[i] == b'q'
+                || format[i] == b'j'
+                || format[i] == b'z'
+                || format[i] == b't'
+            {
                 long_len = true;
             }
             i += 1;
@@ -94,7 +111,9 @@ unsafe fn collect_c_args(format: &[u8], args: &mut VaList<'_>) -> alloc::vec::Ve
             }
             b'u' | b'x' | b'X' | b'o' => {
                 if long_len {
-                    out.push(alloc::boxed::Box::new(unsafe { args.next_arg::<c_ulong>() }));
+                    out.push(alloc::boxed::Box::new(unsafe {
+                        args.next_arg::<c_ulong>()
+                    }));
                 } else {
                     out.push(alloc::boxed::Box::new(unsafe { args.next_arg::<u32>() }));
                 }
@@ -107,7 +126,9 @@ unsafe fn collect_c_args(format: &[u8], args: &mut VaList<'_>) -> alloc::vec::Ve
                 out.push(alloc::boxed::Box::new(text));
             }
             b'p' => {
-                out.push(alloc::boxed::Box::new(unsafe { args.next_arg::<*const c_void>() } as usize));
+                out.push(alloc::boxed::Box::new(
+                    unsafe { args.next_arg::<*const c_void>() } as usize,
+                ));
             }
             _ => {}
         }
@@ -133,7 +154,10 @@ pub unsafe extern "C" fn i915_probe_error(
     }
     let format_bytes = unsafe { CStr::from_ptr(fmt) }.to_bytes();
     let owned = unsafe { collect_c_args(format_bytes, &mut args) };
-    let refs: alloc::vec::Vec<&dyn CFormatArg> = owned.iter().map(|a| a.as_ref() as &dyn CFormatArg).collect();
+    let refs: alloc::vec::Vec<&dyn CFormatArg> = owned
+        .iter()
+        .map(|a| a.as_ref() as &dyn CFormatArg)
+        .collect();
     let format = match core::str::from_utf8(format_bytes) {
         Ok(text) => text,
         Err(_) => return,
@@ -170,7 +194,10 @@ pub unsafe extern "C" fn intel_gt_probe_error(
         Err(_) => return,
     };
     let name_text = unsafe { c_str_arg(name) };
-    let message = format_message(format, &[&name_text as &dyn CFormatArg, &ret as &dyn CFormatArg]);
+    let message = format_message(
+        format,
+        &[&name_text as &dyn CFormatArg, &ret as &dyn CFormatArg],
+    );
     drm_log_at(
         DrmLogLevel::Error,
         "i915 DRM error",
@@ -180,25 +207,46 @@ pub unsafe extern "C" fn intel_gt_probe_error(
     );
 }
 
-
-
-
-
-use crate::i915_drm_client_upstream::{i915_drm_client_put};
-use crate::i915_gem_context_upstream::{i915_gem_context_close};
-use crate::i915_gem_core_upstream::{i915_gem_cleanup_early, i915_gem_drain_freed_objects, i915_gem_driver_register, i915_gem_driver_release, i915_gem_driver_remove, i915_gem_driver_unregister, i915_gem_init, i915_gem_init_early, i915_gem_open, i915_gem_runtime_suspend};
-use crate::i915_gem_object_upstream::{i915_gem_flush_free_objects};
-use crate::i915_gem_pm_upstream::{i915_gem_backup_suspend, i915_gem_freeze, i915_gem_freeze_late, i915_gem_resume, i915_gem_suspend, i915_gem_suspend_late};
-use crate::i915_gem_wait_upstream::{i915_gem_fence_wait_priority_display};
-use crate::i915_gpu_error_upstream::{i915_reset_error_state};
-use crate::intel_device_info_upstream::{intel_device_info_driver_create, intel_device_info_print, intel_device_info_runtime_init, intel_device_info_runtime_init_early, intel_platform_name};
-use crate::intel_ggtt_upstream::{i915_ggtt_driver_late_release, i915_ggtt_driver_release, i915_ggtt_enable_hw, i915_ggtt_init_hw, i915_ggtt_probe_hw, i915_ggtt_resume, i915_ggtt_suspend};
-use crate::intel_gt_pm_upstream::{intel_gt_resume_early, intel_gt_runtime_resume, intel_gt_runtime_suspend};
-use crate::intel_gt_upstream::{intel_gt_driver_late_release_all, intel_gt_driver_register, intel_gt_driver_unregister, intel_gt_info_print, intel_gt_init_mmio, intel_gt_probe_all, intel_gt_tiles_init, intel_root_gt_init_early};
-use crate::intel_gtt_upstream::{setup_private_pat};
-use crate::intel_reset_hw_upstream::{intel_gt_reset_all_engines};
-use crate::intel_reset_upstream::{intel_gt_gpu_reset_clobbers_display};
-use crate::intel_runtime_pm_upstream::{intel_runtime_pm_disable, intel_runtime_pm_driver_last_release, intel_runtime_pm_driver_release, intel_runtime_pm_enable, intel_runtime_pm_get, intel_runtime_pm_init_early};
+use crate::{
+    i915_drm_client_upstream::i915_drm_client_put,
+    i915_gem_context_upstream::i915_gem_context_close,
+    i915_gem_core_upstream::{
+        i915_gem_cleanup_early, i915_gem_drain_freed_objects, i915_gem_driver_register,
+        i915_gem_driver_release, i915_gem_driver_remove, i915_gem_driver_unregister, i915_gem_init,
+        i915_gem_init_early, i915_gem_open, i915_gem_runtime_suspend,
+    },
+    i915_gem_object_upstream::i915_gem_flush_free_objects,
+    i915_gem_pm_upstream::{
+        i915_gem_backup_suspend, i915_gem_freeze, i915_gem_freeze_late, i915_gem_resume,
+        i915_gem_suspend, i915_gem_suspend_late,
+    },
+    i915_gem_wait_upstream::i915_gem_fence_wait_priority_display,
+    i915_gpu_error_upstream::i915_reset_error_state,
+    intel_device_info_upstream::{
+        intel_device_info_driver_create, intel_device_info_print, intel_device_info_runtime_init,
+        intel_device_info_runtime_init_early, intel_platform_name,
+    },
+    intel_ggtt_upstream::{
+        i915_ggtt_driver_late_release, i915_ggtt_driver_release, i915_ggtt_enable_hw,
+        i915_ggtt_init_hw, i915_ggtt_probe_hw, i915_ggtt_resume, i915_ggtt_suspend,
+    },
+    intel_gt_pm_upstream::{
+        intel_gt_resume_early, intel_gt_runtime_resume, intel_gt_runtime_suspend,
+    },
+    intel_gt_upstream::{
+        intel_gt_driver_late_release_all, intel_gt_driver_register, intel_gt_driver_unregister,
+        intel_gt_info_print, intel_gt_init_mmio, intel_gt_probe_all, intel_gt_tiles_init,
+        intel_root_gt_init_early,
+    },
+    intel_gtt_upstream::setup_private_pat,
+    intel_reset_hw_upstream::intel_gt_reset_all_engines,
+    intel_reset_upstream::intel_gt_gpu_reset_clobbers_display,
+    intel_runtime_pm_upstream::{
+        intel_runtime_pm_disable, intel_runtime_pm_driver_last_release,
+        intel_runtime_pm_driver_release, intel_runtime_pm_enable, intel_runtime_pm_get,
+        intel_runtime_pm_init_early,
+    },
+};
 
 /// `drm_info()` equivalent for the printk level used by this file.
 macro_rules! drm_info {
@@ -224,12 +272,22 @@ const INTEL_RPM_WAKELOCK_BIAS_I915: i32 = 1 << 16;
 
 /// `disable_rpm_wakeref_asserts()` (intel_runtime_pm.h).
 unsafe fn disable_rpm_wakeref_asserts<T>(rpm: *mut T) {
-    unsafe { atomic_add(INTEL_RPM_WAKELOCK_BIAS_I915 + 1, &mut (*rpm.cast::<IntelRuntimePmLayout>()).wakeref_count) };
+    unsafe {
+        atomic_add(
+            INTEL_RPM_WAKELOCK_BIAS_I915 + 1,
+            &mut (*rpm.cast::<IntelRuntimePmLayout>()).wakeref_count,
+        )
+    };
 }
 
 /// `enable_rpm_wakeref_asserts()` (intel_runtime_pm.h).
 unsafe fn enable_rpm_wakeref_asserts<T>(rpm: *mut T) {
-    unsafe { atomic_add(-(INTEL_RPM_WAKELOCK_BIAS_I915 + 1), &mut (*rpm.cast::<IntelRuntimePmLayout>()).wakeref_count) };
+    unsafe {
+        atomic_add(
+            -(INTEL_RPM_WAKELOCK_BIAS_I915 + 1),
+            &mut (*rpm.cast::<IntelRuntimePmLayout>()).wakeref_count,
+        )
+    };
 }
 
 /// `atomic_read(&rpm->wakeref_count)`.
@@ -239,7 +297,16 @@ pub(crate) unsafe fn atomic_read_rpm_wakeref(rpm: *mut IntelRuntimePm) -> i32 {
 
 /// `&i915->uncore`.
 unsafe fn uncore_of(i915: *mut DrmI915Private) -> *mut IntelUncore {
-    unsafe { uncore_of(i915).cast() }
+    unsafe { core::ptr::addr_of_mut!((*i915).uncore).cast() }
+}
+
+/// A GT stores an uncore pointer, unlike i915's embedded uncore record.
+/// Keep this typed: casting the address of the pointer slot would hide a
+/// pointer-indirection error and make MMIO treat adjacent GT fields as i915.
+unsafe fn gt_uncore(gt: *mut IntelGt) -> *mut IntelUncore {
+    let uncore = unsafe { (*gt).uncore };
+    assert!(!uncore.is_null(), "GT has no initialized uncore owner");
+    uncore
 }
 
 /// `INTEL_REVID(i915)` = `to_pci_dev(i915->drm.dev)->revision`.
@@ -281,7 +348,6 @@ unsafe fn intel_clock_gating_init(dev: *mut c_void) {
     unsafe { (framework().intel_clock_gating_init)(dev) }
 }
 
-
 /// `CONFIG_DRM_I915_DEBUG_GEM` (linux/config.rs: disabled).
 const CONFIG_DRM_I915_DEBUG_GEM: bool = false;
 
@@ -317,7 +383,8 @@ unsafe extern "C" {
     pub fn mutex_init(lock: *mut c_void);
     pub fn mutex_destroy(lock: *mut c_void);
     pub fn to_pci_dev(dev: *mut c_void) -> *mut c_void;
-    pub fn aperture_remove_conflicting_pci_devices(pdev: *mut c_void, name: *const c_char) -> c_int;
+    pub fn aperture_remove_conflicting_pci_devices(pdev: *mut c_void, name: *const c_char)
+    -> c_int;
     pub fn i915_edram_detect(i915: *mut DrmI915Private);
     pub fn i915_gmch_bar_setup(i915: *mut DrmI915Private);
     pub fn i915_gmch_bar_teardown(i915: *mut DrmI915Private);
@@ -714,7 +781,6 @@ unsafe fn skl_watermark_ipc_update(display: *mut c_void) {
     unsafe { (framework().skl_watermark_ipc_update)(display) }
 }
 
-
 // ---------------------------------------------------------------------------
 // i915_driver.c: workqueues, pre-production detection, early/mmio/hw probe.
 // ---------------------------------------------------------------------------
@@ -741,11 +807,7 @@ unsafe fn i915_workqueues_init(dev_priv: *mut DrmI915Private) -> i32 {
     // requests. All tasks on the workqueue acquire the dev mutex, so one
     // ordered instance is enough.
     unsafe {
-        (*dev_priv).wq = alloc_workqueue(
-            c"i915".as_ptr(),
-            WQ_UNBOUND | __WQ_ORDERED,
-            1,
-        );
+        (*dev_priv).wq = alloc_workqueue(c"i915".as_ptr(), WQ_UNBOUND | __WQ_ORDERED, 1);
     }
     if unsafe { (*dev_priv).wq }.is_null() {
         drm_err!(dev_priv, "Failed to allocate workqueues.\n");
@@ -841,7 +903,9 @@ unsafe fn i915_driver_early_probe(dev_priv: *mut DrmI915Private) -> i32 {
     unsafe { intel_device_info_runtime_init_early(dev_priv) };
     unsafe { intel_step_init(dev_priv) };
     unsafe { intel_uncore_mmio_debug_init_early(dev_priv) };
-    unsafe { spin_lock_init(&mut *core::ptr::addr_of_mut!((*dev_priv).gpu_error.lock).cast::<Spinlock>()) };
+    unsafe {
+        spin_lock_init(&mut *core::ptr::addr_of_mut!((*dev_priv).gpu_error.lock).cast::<Spinlock>())
+    };
     unsafe { intel_sbi_init(display) };
     unsafe { vlv_iosf_sb_init(dev_priv) };
     unsafe { mutex_init(core::ptr::addr_of_mut!((*dev_priv).sb_lock).cast::<c_void>()) };
@@ -920,7 +984,8 @@ unsafe fn i915_driver_mmio_probe(dev_priv: *mut DrmI915Private) -> i32 {
         if gt.is_null() {
             continue;
         }
-        ret = unsafe { intel_uncore_init_mmio(core::ptr::addr_of_mut!((*gt).uncore).cast()) };
+        let uncore = unsafe { gt_uncore(gt) };
+        ret = unsafe { intel_uncore_init_mmio(uncore) };
         if ret != 0 {
             return ret;
         }
@@ -928,7 +993,7 @@ unsafe fn i915_driver_mmio_probe(dev_priv: *mut DrmI915Private) -> i32 {
             drmm_add_action_or_reset(
                 core::ptr::addr_of_mut!((*dev_priv).drm).cast(),
                 intel_uncore_fini_mmio,
-                (*gt).uncore.cast(),
+                uncore.cast(),
             )
         };
         if ret != 0 {
@@ -1019,7 +1084,9 @@ const fn dma_bit_mask(n: u32) -> u64 {
 unsafe fn i915_enable_g8(i915: *mut DrmI915Private) {
     let p = i915.cast::<c_void>();
     if unsafe { IS_DG2(p) } {
-        if unsafe { IS_SUBPLATFORM(p, INTEL_DG2, INTEL_SUBPLATFORM_D) } && !unsafe { intel_match_g8_cpu() } {
+        if unsafe { IS_SUBPLATFORM(p, INTEL_DG2, INTEL_SUBPLATFORM_D) }
+            && !unsafe { intel_match_g8_cpu() }
+        {
             return;
         }
         unsafe {
@@ -1070,15 +1137,24 @@ unsafe fn i915_driver_hw_probe(dev_priv: *mut DrmI915Private) -> i32 {
     let mut ret: i32;
 
     if unsafe { has_ppgtt(dev_priv) } {
-        if unsafe { intel_vgpu_active(dev_priv) } && !unsafe { intel_vgpu_has_full_ppgtt(dev_priv) } {
-            drm_err!(dev_priv, "incompatible vGPU found, support for isolated ppGTT required\n");
+        if unsafe { intel_vgpu_active(dev_priv) } && !unsafe { intel_vgpu_has_full_ppgtt(dev_priv) }
+        {
+            drm_err!(
+                dev_priv,
+                "incompatible vGPU found, support for isolated ppGTT required\n"
+            );
             return -crate::linux_config::ENXIO;
         }
     }
 
     if unsafe { HAS_EXECLISTS(p) } {
-        if unsafe { intel_vgpu_active(dev_priv) } && !unsafe { intel_vgpu_has_hwsp_emulation(dev_priv) } {
-            drm_err!(dev_priv, "old vGPU host found, support for HWSP emulation required\n");
+        if unsafe { intel_vgpu_active(dev_priv) }
+            && !unsafe { intel_vgpu_has_hwsp_emulation(dev_priv) }
+        {
+            drm_err!(
+                dev_priv,
+                "old vGPU host found, support for HWSP emulation required\n"
+            );
             return -crate::linux_config::ENXIO;
         }
     }
@@ -1246,9 +1322,7 @@ unsafe fn i915_driver_register(dev_priv: *mut DrmI915Private) -> i32 {
     unsafe { i915_hwmon_register(dev_priv) };
     unsafe { intel_display_driver_register(display) };
     unsafe { intel_display_power_enable(display) };
-    unsafe {
-        intel_runtime_pm_enable(core::ptr::addr_of_mut!((*dev_priv).runtime_pm).cast())
-    };
+    unsafe { intel_runtime_pm_enable(core::ptr::addr_of_mut!((*dev_priv).runtime_pm).cast()) };
 
     if unsafe { i915_switcheroo_register(dev_priv) } != 0 {
         drm_err!(dev_priv, "Failed to register vga switcheroo!\n");
@@ -1264,9 +1338,7 @@ unsafe fn i915_driver_unregister(dev_priv: *mut DrmI915Private) {
     let display = unsafe { (*dev_priv).display };
 
     unsafe { i915_switcheroo_unregister(dev_priv) };
-    unsafe {
-        intel_runtime_pm_disable(core::ptr::addr_of_mut!((*dev_priv).runtime_pm).cast())
-    };
+    unsafe { intel_runtime_pm_disable(core::ptr::addr_of_mut!((*dev_priv).runtime_pm).cast()) };
     unsafe { intel_display_power_disable(display) };
     unsafe { intel_display_driver_unregister(display) };
     unsafe { intel_pxp_fini(dev_priv) };
@@ -1319,7 +1391,13 @@ const PLATFORM_MASK_PBITS_I915: u32 = 32 - INTEL_SUBPLATFORM_BITS;
 unsafe fn i915_welcome_messages(dev_priv: *mut DrmI915Private) {
     let p_dev = core::ptr::addr_of_mut!((*dev_priv).drm).cast::<c_void>();
     if unsafe { drm_debug_enabled(DRM_UT_DRIVER) } {
-        let mut p = unsafe { drm_dbg_printer(&mut (*dev_priv).drm, DRM_UT_DRIVER, c"device info:".as_ptr()) };
+        let mut p = unsafe {
+            drm_dbg_printer(
+                &mut (*dev_priv).drm,
+                DRM_UT_DRIVER,
+                c"device info:".as_ptr(),
+            )
+        };
         let info = unsafe { (*dev_priv).info.cast::<IntelDeviceInfo>() };
         let runtime = unsafe { core::ptr::addr_of!((*dev_priv).runtime) };
         let pp: *mut drm_printer = &mut p;
@@ -1434,12 +1512,95 @@ unsafe fn i915_driver_create(
     Ok(i915)
 }
 
+// 0 = retryable, 1 = initializing, 2 = ready. Never race global cache writes.
+static GLOBALS_READY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Initialize module-global caches before any GEM allocation. Roll back only
+/// successfully initialized stages, in reverse order, just like module exit.
+///
+/// # Safety
+/// The heap must be initialized and no caller may independently initialize
+/// or destroy the module caches owned by this once-only sequence.
+pub unsafe fn i915_globals_init() -> i32 {
+    // VMA resources use kzalloc/kfree directly in this implementation and
+    // therefore have no module-global cache to initialize.
+    let stages: &[(unsafe fn() -> i32, unsafe fn())] = &[
+        (crate::i915_active_upstream::i915_active_module_init, crate::i915_active_upstream::i915_active_module_exit),
+        (crate::intel_context_upstream::i915_context_module_init, crate::intel_context_upstream::i915_context_module_exit),
+        (crate::i915_gem_context_upstream::i915_gem_context_module_init, crate::i915_gem_context_upstream::i915_gem_context_module_exit),
+        (crate::i915_gem_object_upstream::i915_objects_module_init, crate::i915_gem_object_upstream::i915_objects_module_exit),
+        (crate::i915_request_upstream::i915_request_module_init, crate::i915_request_upstream::i915_request_module_exit),
+        (crate::i915_scheduler_upstream::i915_scheduler_module_init, crate::i915_scheduler_upstream::i915_scheduler_module_exit),
+        (|| unsafe { crate::i915_vma_upstream::i915_vma_module_init() },
+         || unsafe { crate::i915_vma_upstream::i915_vma_module_exit() }),
+    ];
+    initialize_globals_once(&GLOBALS_READY, stages.len(),
+        |index| unsafe { (stages[index].0)() },
+        |index| unsafe { (stages[index].1)() },
+    )
+}
+
+fn initialize_globals_once(
+    state: &core::sync::atomic::AtomicU8,
+    count: usize,
+    mut init: impl FnMut(usize) -> i32,
+    mut exit: impl FnMut(usize),
+) -> i32 {
+    use core::sync::atomic::Ordering;
+    match state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {},
+        Err(2) => return 0,
+        Err(_) => return -16,
+    }
+    for index in 0..count {
+        let ret = init(index);
+        if ret != 0 {
+            for completed in (0..index).rev() { exit(completed); }
+            state.store(0, Ordering::Release);
+            axlog::error!("i915: global cache stage {} failed: {}", index, ret);
+            return ret;
+        }
+    }
+    state.store(2, Ordering::Release);
+    0
+}
+
+#[cfg(test)]
+mod globals_tests {
+    use super::initialize_globals_once;
+    use core::{cell::RefCell, sync::atomic::AtomicU8};
+    #[test]
+    fn failed_globals_unwind_reverse_and_retry_once() {
+        for fail in 0..7 {
+            let state = AtomicU8::new(0);
+            let events = RefCell::new(alloc::vec::Vec::new());
+            assert_eq!(initialize_globals_once(&state, 7,
+                |index| { events.borrow_mut().push((true, index)); if index == fail { -12 } else { 0 } },
+                |index| events.borrow_mut().push((false, index))), -12);
+            let expected: alloc::vec::Vec<_> = (0..=fail).map(|i| (true, i))
+                .chain((0..fail).rev().map(|i| (false, i))).collect();
+            assert_eq!(*events.borrow(), expected);
+            assert_eq!(initialize_globals_once(&state, 7, |_| 0, |_| panic!("successful retry unwound")), 0);
+            assert_eq!(initialize_globals_once(&state, 7, |_| panic!("initialized twice"), |_| panic!("unexpected exit")), 0);
+        }
+    }
+    #[test]
+    fn concurrent_probe_cannot_touch_in_progress_caches() {
+        let state = AtomicU8::new(1);
+        assert_eq!(initialize_globals_once(&state, 7, |_| panic!("racing init"), |_| panic!("racing exit")), -16);
+    }
+}
+
 /// `i915_driver_probe()`: the PCI probe chain. `device` is `pdev->device` and
 /// `info` is the matched device info.
 ///
 /// # Safety
 /// `pdev` must be a live PCI device accepted by `i915_pci_probe`.
 pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDeviceInfo) -> i32 {
+    let ret = unsafe { i915_globals_init() };
+    if ret != 0 {
+        return ret;
+    }
     let mut ret = unsafe { pci_enable_device(pdev) };
     if ret != 0 {
         axlog::error!("Failed to enable graphics device: {}", ret);
@@ -1455,24 +1616,30 @@ pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDevi
     };
     let display = unsafe { (*i915).display };
 
+    axlog::info!("i915-probe: software and TTM initialization");
     ret = unsafe { i915_driver_early_probe(i915) };
     if ret < 0 {
         return unsafe { out_pci_disable(pdev, i915, ret) };
     }
 
-    unsafe { disable_rpm_wakeref_asserts(core::ptr::addr_of_mut!((*i915).runtime_pm).cast::<c_void>()) };
+    unsafe {
+        disable_rpm_wakeref_asserts(core::ptr::addr_of_mut!((*i915).runtime_pm).cast::<c_void>())
+    };
     unsafe { intel_vgpu_detect(i915) };
 
+    axlog::info!("i915-probe: GT discovery");
     ret = unsafe { intel_gt_probe_all(i915) };
     if ret < 0 {
         return unsafe { out_runtime_pm_put(pdev, i915, ret) };
     }
 
+    axlog::info!("i915-probe: MMIO initialization");
     ret = unsafe { i915_driver_mmio_probe(i915) };
     if ret < 0 {
         return unsafe { out_runtime_pm_put(pdev, i915, ret) };
     }
 
+    axlog::info!("i915-probe: hardware and GGTT initialization");
     ret = unsafe { i915_driver_hw_probe(i915) };
     if ret < 0 {
         // out_cleanup_mmio
@@ -1488,6 +1655,7 @@ pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDevi
         return unsafe { out_runtime_pm_put(pdev, i915, ret) };
     }
 
+    axlog::info!("i915-probe: display attachment");
     ret = unsafe { intel_display_driver_probe_noirq(display) };
     if ret < 0 {
         // out_cleanup_gvt
@@ -1497,6 +1665,7 @@ pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDevi
         return unsafe { out_runtime_pm_put(pdev, i915, ret) };
     }
 
+    axlog::info!("i915-probe: IRQ installation");
     ret = unsafe { intel_irq_install(i915) };
     if ret != 0 {
         // out_cleanup_modeset
@@ -1518,6 +1687,7 @@ pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDevi
         return unsafe { out_runtime_pm_put(pdev, i915, ret) };
     }
 
+    axlog::info!("i915-probe: GEM initialization");
     ret = unsafe { i915_gem_init(i915) };
     if ret != 0 {
         // out_cleanup_modeset2
@@ -1545,12 +1715,15 @@ pub unsafe fn i915_driver_probe(pdev: *mut c_void, device: u16, info: &IntelDevi
         return unsafe { out_cleanup_gem(pdev, i915, display, ret) };
     }
 
+    axlog::info!("i915-probe: DRM registration");
     ret = unsafe { i915_driver_register(i915) };
     if ret != 0 {
         return unsafe { out_cleanup_gem(pdev, i915, display, ret) };
     }
 
-    unsafe { enable_rpm_wakeref_asserts(core::ptr::addr_of_mut!((*i915).runtime_pm).cast::<c_void>()) };
+    unsafe {
+        enable_rpm_wakeref_asserts(core::ptr::addr_of_mut!((*i915).runtime_pm).cast::<c_void>())
+    };
     unsafe { i915_welcome_messages(i915) };
     unsafe { (*i915).do_release = true };
     0
@@ -1604,7 +1777,9 @@ unsafe fn out_cleanup_hw(i915: *mut DrmI915Private) {
 /// # Safety
 /// `i915` must be a live `DrmI915Private` whose early probe has run.
 unsafe fn out_runtime_pm_put(pdev: *mut c_void, i915: *mut DrmI915Private, ret: i32) -> i32 {
-    unsafe { enable_rpm_wakeref_asserts(core::ptr::addr_of_mut!((*i915).runtime_pm).cast::<c_void>()) };
+    unsafe {
+        enable_rpm_wakeref_asserts(core::ptr::addr_of_mut!((*i915).runtime_pm).cast::<c_void>())
+    };
     unsafe { i915_driver_late_release(i915) };
     unsafe { out_pci_disable(pdev, i915, ret) }
 }
@@ -1615,11 +1790,7 @@ unsafe fn out_runtime_pm_put(pdev: *mut c_void, i915: *mut DrmI915Private, ret: 
 /// `pdev` must be a live PCI device and `i915` a live private object.
 unsafe fn out_pci_disable(pdev: *mut c_void, i915: *mut DrmI915Private, ret: i32) -> i32 {
     unsafe { pci_disable_device(pdev) };
-    i915_probe_error(
-        i915,
-        c"Device initialization failed (%d)\n".as_ptr(),
-        ret,
-    );
+    i915_probe_error(i915, c"Device initialization failed (%d)\n".as_ptr(), ret);
     ret
 }
 
@@ -1804,7 +1975,11 @@ unsafe fn i915_drm_suspend(dev: *mut c_void) -> i32 {
     unsafe { intel_dpt_suspend(display) };
     unsafe { i915_ggtt_suspend((*to_gt(dev_priv.cast::<c_void>())).ggtt.cast()) };
     unsafe { i9xx_display_sr_save(display) };
-    let opregion_target_state = if unsafe { suspend_to_idle(dev_priv) } { PCI_D1 } else { PCI_D3COLD };
+    let opregion_target_state = if unsafe { suspend_to_idle(dev_priv) } {
+        PCI_D1
+    } else {
+        PCI_D3COLD
+    };
     unsafe { intel_opregion_suspend(display, opregion_target_state) };
     unsafe { (*dev_priv).suspend_count += 1 };
     unsafe { intel_dmc_suspend(display) };
@@ -1869,7 +2044,10 @@ pub unsafe fn i915_driver_suspend_switcheroo(i915: *mut DrmI915Private, event: i
     let drm = core::ptr::addr_of_mut!((*i915).drm).cast::<c_void>();
 
     if event != PM_EVENT_SUSPEND && event != PM_EVENT_FREEZE {
-        axlog::warn!("i915_driver_suspend_switcheroo: unexpected PM event {}", event);
+        axlog::warn!(
+            "i915_driver_suspend_switcheroo: unexpected PM event {}",
+            event
+        );
         return -crate::linux_config::EINVAL;
     }
 
@@ -2164,7 +2342,8 @@ unsafe extern "C" fn i915_pm_freeze(kdev: *mut c_void) -> i32 {
 unsafe extern "C" fn i915_pm_freeze_late(kdev: *mut c_void) -> i32 {
     let i915 = unsafe { pm_i915(kdev) };
     if unsafe { (*i915).drm.switch_power_state } != DRM_SWITCH_POWER_OFF {
-        let ret = unsafe { i915_drm_suspend_late(core::ptr::addr_of_mut!((*i915).drm).cast(), true) };
+        let ret =
+            unsafe { i915_drm_suspend_late(core::ptr::addr_of_mut!((*i915).drm).cast(), true) };
         if ret != 0 {
             return ret;
         }
@@ -2473,4 +2652,32 @@ pub unsafe fn i915_gem_reject_pin_ioctl(
 ) -> c_int {
     let _ = (dev, data, file);
     -crate::linux_config::ENODEV
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::*;
+
+    #[test]
+    fn embedded_uncore_and_gt_pointer_resolve_to_the_same_owner() {
+        let mut i915 = alloc::boxed::Box::new(unsafe { core::mem::zeroed::<DrmI915Private>() });
+        let mut gt = alloc::boxed::Box::new(unsafe { core::mem::zeroed::<IntelGt>() });
+        let embedded = core::ptr::addr_of_mut!(i915.uncore).cast::<IntelUncore>();
+        gt.uncore = embedded;
+        unsafe {
+            assert_eq!(uncore_of(&mut *i915), embedded);
+            assert_eq!(gt_uncore(&mut *gt), embedded);
+            assert_ne!(
+                gt_uncore(&mut *gt),
+                core::ptr::addr_of_mut!(gt.uncore).cast()
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "GT has no initialized uncore owner")]
+    fn missing_gt_uncore_is_rejected_before_mmio() {
+        let mut gt = alloc::boxed::Box::new(unsafe { core::mem::zeroed::<IntelGt>() });
+        unsafe { gt_uncore(&mut *gt) };
+    }
 }

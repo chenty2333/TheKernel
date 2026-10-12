@@ -329,6 +329,35 @@ unsafe fn goto_err_unpin(obj: *mut DrmI915GemObject, _ptr: *mut c_void) {
     unsafe { atomic_dec(&mut (*obj).mm.pages_pin_count) }
 }
 
+/// Acquire the pages reference used by `i915_gem_object_pin_map`.
+///
+/// The loader must only populate backing pages; this helper owns the single
+/// pin-count increment for the map operation, including the cold-load path.
+/// Returns true when the object had no outstanding pin before this call.
+///
+/// # Safety
+/// `obj` must be a live i915 GEM object locked by its reservation. `get_pages`
+/// must follow the `____i915_gem_object_get_pages` contract: populate pages but
+/// do not increment `pages_pin_count` itself.
+unsafe fn pin_map_acquire_pages(
+    obj: *mut DrmI915GemObject,
+    get_pages: impl FnOnce(*mut DrmI915GemObject) -> c_int,
+) -> Result<bool, c_int> {
+    if unsafe { atomic_inc_not_zero(&mut (*obj).mm.pages_pin_count) } {
+        return Ok(false);
+    }
+    if !unsafe { i915_gem_object_has_pages(obj) } {
+        assert!(!unsafe { i915_gem_object_has_pinned_pages(obj) });
+        let error = get_pages(obj);
+        if error != 0 {
+            return Err(error);
+        }
+        smp_mb__before_atomic();
+    }
+    unsafe { atomic_inc(&mut (*obj).mm.pages_pin_count) };
+    Ok(true)
+}
+
 #[repr(C)]
 struct SgTablePrefix {
     sgl: *mut Scatterlist,
@@ -973,16 +1002,19 @@ pub unsafe extern "C" fn i915_gem_object_pin_map(
         assert_object_held(obj);
         let mut pinned = type_ & I915_MAP_OVERRIDE == 0;
         let mut type_ = type_ & !I915_MAP_OVERRIDE;
-        if !atomic_inc_not_zero(&mut (*obj).mm.pages_pin_count) {
-            if !i915_gem_object_has_pages(obj) {
-                assert!(!i915_gem_object_has_pinned_pages(obj));
-                let err = __i915_gem_object_get_pages(obj);
-                if err != 0 {
-                    return err_ptr(err);
-                }
-                smp_mb__before_atomic();
-            }
-            atomic_inc(&mut (*obj).mm.pages_pin_count);
+        // SAFETY: obj is the live, reservation-locked object checked above. The
+        // backend function loads the SG pages but leaves pin accounting to this helper.
+        let newly_pinned = match unsafe {
+            pin_map_acquire_pages(obj, |obj| {
+                // SAFETY: pin_map holds obj's reservation and the upstream backend
+                // contract populates pages without taking an additional page pin.
+                unsafe { ____i915_gem_object_get_pages(obj) }
+            })
+        } {
+            Ok(newly_pinned) => newly_pinned,
+            Err(error) => return err_ptr(error),
+        };
+        if newly_pinned {
             pinned = false;
         }
         assert!(i915_gem_object_has_pages(obj));
@@ -1211,4 +1243,268 @@ pub unsafe fn __i915_gem_object_get_dma_address_len(
 // upstream: i915_gem_pages.c __i915_gem_object_get_dma_address()
 pub unsafe fn __i915_gem_object_get_dma_address(obj: *mut DrmI915GemObject, n: u64) -> u64 {
     unsafe { __i915_gem_object_get_dma_address_len(obj, n, ptr::null_mut()) }
+}
+
+#[cfg(test)]
+mod pin_map_integration_tests {
+    use super::{Scatterlist, i915_gem_object_pin_map};
+    use alloc::boxed::Box;
+    use crate::{
+        i915_gem_object_api_upstream::i915_gem_object_unpin_map,
+        i915_gem_object_types_upstream::{
+            DrmI915GemObject, DrmI915GemObjectOps, I915_BO_FLAG_IOMEM,
+            I915_BO_FLAG_STRUCT_PAGE,
+        },
+        intel_context_upstream::{DrmGemObjectBaseLayout, SgTable},
+        intel_engine_cs_upstream::AtomicT,
+        linux::i915::IntelDeviceInfoOverlay,
+        linux_i915_private::DrmI915Private,
+    };
+    use core::{ffi::c_void, mem::MaybeUninit, ptr};
+
+    #[repr(align(4096))]
+    struct MappingStorage([u8; 4096]);
+
+    unsafe extern "C" fn populate_sg_table(object: *mut DrmI915GemObject) -> i32 {
+        // SAFETY: fixture setup stores its live SgTable pointer in this union arm.
+        let table = unsafe { (*object).backing.stolen.cast::<SgTable>() };
+        if table.is_null() {
+            return -12;
+        }
+        // SAFETY: the fixture keeps table alive until after pin_map returns.
+        unsafe { ptr::addr_of_mut!((*object).mm.pages).write(table) };
+        0
+    }
+
+    unsafe extern "C" fn fail_sg_table(_object: *mut DrmI915GemObject) -> i32 {
+        -12
+    }
+
+    fn object_ops(
+        get_pages: unsafe extern "C" fn(*mut DrmI915GemObject) -> i32,
+    ) -> DrmI915GemObjectOps {
+        DrmI915GemObjectOps {
+            flags: 0,
+            get_pages: Some(get_pages),
+            put_pages: None,
+            truncate: None,
+            shrink: None,
+            pread: None,
+            pwrite: None,
+            mmap_offset: None,
+            unmap_virtual: None,
+            dmabuf_export: None,
+            adjust_lru: None,
+            delayed_free: None,
+            migrate: None,
+            release: None,
+            mmap_ops: ptr::null(),
+            name: c"pin-map-regression".as_ptr(),
+        }
+    }
+
+    struct SgFixture {
+        _page_storage: Box<[u64; 1]>,
+        _sg: Box<Scatterlist>,
+        table: Box<SgTable>,
+    }
+
+    impl SgFixture {
+        fn new() -> Self {
+            let mut page_storage = Box::new([0u64; 1]);
+            let mut sg = Box::new(Scatterlist {
+                page_link: page_storage.as_mut_ptr().cast::<u8>() as usize,
+                offset: 0,
+                length: 4096,
+                dma_address: 0,
+                dma_length: 4096,
+                _dma_flags_or_padding: 0,
+            });
+            let table = Box::new(SgTable {
+                sgl: &mut *sg as *mut Scatterlist,
+                nents: 1,
+                orig_nents: 1,
+            });
+            Self {
+                _page_storage: page_storage,
+                _sg: sg,
+                table,
+            }
+        }
+
+        fn table_ptr(&mut self) -> *mut SgTable {
+            &mut *self.table as *mut SgTable
+        }
+    }
+
+    struct PinMapFixture {
+        object: Box<MaybeUninit<DrmI915GemObject>>,
+        _ops: Box<DrmI915GemObjectOps>,
+        _i915: Box<MaybeUninit<DrmI915Private>>,
+        _info: Box<MaybeUninit<IntelDeviceInfoOverlay>>,
+        _sg: SgFixture,
+        _mapping: Option<Box<MappingStorage>>,
+    }
+
+    impl PinMapFixture {
+        fn new(
+            get_pages: unsafe extern "C" fn(*mut DrmI915GemObject) -> i32,
+            mem_flags: u32,
+            pages_present: bool,
+            pin_count: i32,
+            mapping_present: bool,
+        ) -> Self {
+            let mut sg = SgFixture::new();
+            let table = sg.table_ptr();
+            let ops = Box::new(object_ops(get_pages));
+            let mut i915 = Box::new(MaybeUninit::<DrmI915Private>::uninit());
+            let mut info = Box::new(MaybeUninit::<IntelDeviceInfoOverlay>::uninit());
+            // SAFETY: IS_DGFX reads only i915.info and info.flags[0], initialized
+            // here before the actual pin_map function reaches that branch.
+            let i915_ptr = unsafe {
+                let i915_ptr = i915.as_mut_ptr();
+                let info_ptr = info.as_mut_ptr();
+                ptr::addr_of_mut!((*info_ptr).flags).write([0; 5]);
+                ptr::addr_of_mut!((*i915_ptr).info).write(info_ptr as *const c_void);
+                i915_ptr
+            };
+            let mapping = mapping_present.then(|| Box::new(MappingStorage([0; 4096])));
+            let mapping_ptr = mapping
+                .as_ref()
+                .map(|storage| storage.0.as_ptr() as *mut c_void)
+                .unwrap_or(ptr::null_mut());
+            let pages = if pages_present { table } else { ptr::null_mut() };
+            let mut object = Box::new(MaybeUninit::<DrmI915GemObject>::uninit());
+            // SAFETY: the boxed addresses are stable, and this initializes every
+            // object field read by the i915 GEM map/get-pages path below.
+            unsafe {
+                let object_ptr = object.as_mut_ptr();
+                let base = object_ptr.cast::<DrmGemObjectBaseLayout>();
+                ptr::addr_of_mut!((*base).dev).write(i915_ptr.cast());
+                ptr::addr_of_mut!((*base).size).write(4096);
+                ptr::addr_of_mut!((*object_ptr).ops).write(ops.as_ref() as *const _);
+                ptr::addr_of_mut!((*object_ptr).mem_flags).write(mem_flags);
+                ptr::addr_of_mut!((*object_ptr).flags).write(0);
+                ptr::addr_of_mut!((*object_ptr).mm.pages).write(pages);
+                ptr::addr_of_mut!((*object_ptr).mm.pages_pin_count).write(AtomicT { counter: pin_count });
+                ptr::addr_of_mut!((*object_ptr).mm.n_placements).write(0);
+                ptr::addr_of_mut!((*object_ptr).mm.mapping).write(mapping_ptr);
+                ptr::addr_of_mut!((*object_ptr).mm.madv_dirty_bits).write(0); // I915_MADV_WILLNEED
+                ptr::addr_of_mut!((*object_ptr).backing.stolen).write(table.cast());
+            }
+            Self {
+                object,
+                _ops: ops,
+                _i915: i915,
+                _info: info,
+                _sg: sg,
+                _mapping: mapping,
+            }
+        }
+
+        fn object_ptr(&mut self) -> *mut DrmI915GemObject {
+            self.object.as_mut_ptr()
+        }
+
+        fn mapping_ptr(&self) -> *mut c_void {
+            self._mapping
+                .as_ref()
+                .map(|storage| storage.0.as_ptr() as *mut c_void)
+                .unwrap_or(ptr::null_mut())
+        }
+
+        fn pin_count(&mut self) -> i32 {
+            // SAFETY: the fixture initializes and retains this counter.
+            unsafe { (*self.object.as_mut_ptr()).mm.pages_pin_count.counter }
+        }
+    }
+
+    fn assert_error(pointer: *mut c_void, expected: i32) {
+        assert!(crate::linux_config::IS_ERR(pointer));
+        assert_eq!(crate::linux_config::PTR_ERR(pointer), expected);
+    }
+
+    #[test]
+    fn cold_pin_map_calls_real_get_pages_wrapper_and_acquires_one_pin() {
+        let mut fixture = PinMapFixture::new(
+            populate_sg_table,
+            I915_BO_FLAG_STRUCT_PAGE,
+            false,
+            0,
+            true,
+        );
+        let object = fixture.object_ptr();
+        let mapping = fixture.mapping_ptr();
+
+        // SAFETY: fixture supplies a live GEM object and aligned cached mapping;
+        // the real pin_map path still invokes ____get_pages to populate missing SG pages.
+        assert_eq!(unsafe { i915_gem_object_pin_map(object, 0) }, mapping);
+        // SAFETY: pin_map just initialized mm.pages and fixture retains the object.
+        assert!(unsafe { crate::i915_gem_object_api_upstream::i915_gem_object_has_pages(object) });
+        assert_eq!(fixture.pin_count(), 1);
+
+        // SAFETY: release the single page reference acquired by the map operation.
+        unsafe { i915_gem_object_unpin_map(object) };
+        assert_eq!(fixture.pin_count(), 0);
+    }
+
+    #[test]
+    fn hot_pin_map_and_unpin_balance_while_preserving_the_owner_pin() {
+        let mut fixture = PinMapFixture::new(
+            fail_sg_table,
+            I915_BO_FLAG_STRUCT_PAGE,
+            true,
+            1,
+            true,
+        );
+        let object = fixture.object_ptr();
+        let mapping = fixture.mapping_ptr();
+
+        for _ in 0..3 {
+            // SAFETY: existing pages and mapping make this a hot pin; fail_sg_table
+            // must not be called, and the fixture retains both until loop completion.
+            assert_eq!(unsafe { i915_gem_object_pin_map(object, 0) }, mapping);
+            assert_eq!(fixture.pin_count(), 2);
+            // SAFETY: release only the reference acquired by this pin_map iteration.
+            unsafe { i915_gem_object_unpin_map(object) };
+            assert_eq!(fixture.pin_count(), 1);
+        }
+        // SAFETY: release the fixture's persistent owner pin.
+        unsafe { i915_gem_object_unpin_map(object) };
+        assert_eq!(fixture.pin_count(), 0);
+    }
+
+    #[test]
+    fn failed_get_pages_does_not_leak_a_pin() {
+        let mut fixture = PinMapFixture::new(
+            fail_sg_table,
+            I915_BO_FLAG_STRUCT_PAGE,
+            false,
+            0,
+            true,
+        );
+        let object = fixture.object_ptr();
+
+        // SAFETY: fixture object is live; failing get_pages returns before pin increment.
+        assert_error(unsafe { i915_gem_object_pin_map(object, 0) }, -12);
+        assert_eq!(fixture.pin_count(), 0);
+    }
+
+    #[test]
+    fn map_failure_after_cold_page_load_releases_its_single_pin() {
+        let mut fixture = PinMapFixture::new(
+            populate_sg_table,
+            I915_BO_FLAG_STRUCT_PAGE | I915_BO_FLAG_IOMEM,
+            false,
+            0,
+            false,
+        );
+        let object = fixture.object_ptr();
+
+        // IOMEM placement without a placement list rejects WB after loading pages;
+        // the real pin_map error path must undo exactly its one new pin.
+        // SAFETY: fixture is valid and this branch returns before vmap/fence waiting.
+        assert_error(unsafe { i915_gem_object_pin_map(object, 0) }, -19);
+        assert_eq!(fixture.pin_count(), 0);
+    }
 }

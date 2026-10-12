@@ -16,7 +16,7 @@ use intel_display::Error;
 
 fn gpu_requester(bdf: super::pci::Bdf) -> Result<tk_vtd::PciRequester, Error> {
     if (bdf.bus, bdf.device, bdf.function) != (0, 2, 0) {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     Ok(tk_vtd::PciRequester {
         segment: 0,
@@ -37,7 +37,7 @@ pub(super) fn acquire_identity_lease(
     initial_pages: &[u64],
 ) -> Result<tk_vtd::IdentityDmaLease, Error> {
     let requester = requester(bdf)?;
-    tk_vtd::platform_acquire_identity_dma(requester, initial_pages).map_err(|_| Error::Refused)
+    tk_vtd::platform_acquire_identity_dma(requester, initial_pages).map_err(|_| super::traced_refusal())
 }
 
 #[cfg(target_os = "none")]
@@ -50,7 +50,7 @@ pub(super) fn firmware_bytes(physical: u64, len: usize) -> Result<Vec<u8>, Error
     // Observed firmware pointers only, bounded before dereference, no alias of
     // usable RAM (including kernel/modules). Boot API doesn't retain all NVS.
     use axhal::mem::{PhysAddr, phys_ram_ranges};
-    let end = physical.checked_add(len as u64).ok_or(Error::Refused)?;
+    let end = physical.checked_add(len as u64).ok_or_else(|| super::traced_refusal())?;
     if physical < 0x1000
         || end > 1 << 52
         || len > 1 << 20
@@ -58,13 +58,13 @@ pub(super) fn firmware_bytes(physical: u64, len: usize) -> Result<Vec<u8>, Error
             physical < (base as u64).saturating_add(size as u64) && end > base as u64
         })
     {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     let mut data = Vec::new();
-    data.try_reserve_exact(len).map_err(|_| Error::Refused)?;
+    data.try_reserve_exact(len).map_err(|_| super::traced_refusal())?;
     data.resize(len, 0);
-    let physical = usize::try_from(physical).map_err(|_| Error::Refused)?;
-    let mapping = axmm::iomap(PhysAddr::from_usize(physical), len).map_err(|_| Error::Refused)?;
+    let physical = usize::try_from(physical).map_err(|_| super::traced_refusal())?;
+    let mapping = axmm::iomap(PhysAddr::from_usize(physical), len).map_err(|_| super::traced_refusal())?;
     for (i, b) in data.iter_mut().enumerate() {
         // SAFETY: checked extent at observed firmware pointer; live UC mapping.
         *b = unsafe { mapping.as_ptr().add(i).read_volatile() };

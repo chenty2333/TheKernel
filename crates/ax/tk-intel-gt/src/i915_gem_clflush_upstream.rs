@@ -250,6 +250,11 @@ pub unsafe extern "C" fn dma_resv_add_fence(resv: *mut DmaResv, fence: *mut DmaF
     }
     requests_dma_fence_get(fence);
     entries.push(ReservedFence { fence, usage });
+    drop(entries);
+    // The native kernel may also own a display/KMS alias of this exact GEM
+    // object. Mirror only through the installed DRM-core provider, which
+    // rejects reservations that were not explicitly registered as aliases.
+    unsafe { crate::linux::drm_core::drm_resv_fence_add(resv.cast(), fence.cast(), usage) };
 }
 
 /// Iterate reservation fences with Linux's usage ordering and a live cursor

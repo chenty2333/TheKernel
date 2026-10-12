@@ -219,7 +219,7 @@ unsafe extern "C" {
 // upstream: intel_reset.c client_mark_guilty()
 unsafe fn client_mark_guilty(ctx: *mut I915GemContext, banned: bool) {
     let file_priv = unsafe { (*ctx).file_priv };
-    if file_priv.is_null() || (file_priv as isize) < 0 {
+    if file_priv.is_null() || crate::linux_config::IS_ERR(file_priv) {
         return;
     }
     let view = file_priv.cast::<I915FilePrivateView>();

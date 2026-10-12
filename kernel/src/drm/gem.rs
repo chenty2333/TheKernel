@@ -18,6 +18,13 @@ pub trait GemBacking: Send + Sync {
     fn host_resource(&self) -> Option<HostResource> {
         None
     }
+    /// Upstream i915 object identity, when this backing aliases a real
+    /// i915 GEM object. PRIME imports on the same GPU can then install the
+    /// identical per-file handle in both DRM views instead of inventing a
+    /// second object namespace.
+    fn upstream_i915_object(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Typed resource identity determines whether scanout needs a CPU upload,
@@ -91,7 +98,7 @@ pub(crate) struct GemObject {
     pub(crate) backing: Arc<dyn GemBacking>,
     pub(crate) size: u64,
     pub(crate) mmap_offset: MmapOffset,
-    pub(crate) reservation: super::fence::Reservation,
+    pub(crate) reservation: alloc::sync::Arc<super::fence::Reservation>,
     /// Nonzero only for a legacy virgl resource owned by this GEM object.
     pub(crate) render_resource: Option<u32>,
     pub(crate) render_meta: Option<super::render::RenderResource>,
@@ -100,11 +107,25 @@ pub(crate) struct GemObject {
 
 impl GemObject {
     pub(crate) fn new(backing: Arc<dyn GemBacking>, size: u64, mmap_offset: MmapOffset) -> Self {
+        Self::new_with_reservation(
+            backing,
+            size,
+            mmap_offset,
+            alloc::sync::Arc::new(super::fence::Reservation::new()),
+        )
+    }
+
+    pub(crate) fn new_with_reservation(
+        backing: Arc<dyn GemBacking>,
+        size: u64,
+        mmap_offset: MmapOffset,
+        reservation: alloc::sync::Arc<super::fence::Reservation>,
+    ) -> Self {
         Self {
             backing,
             size,
             mmap_offset,
-            reservation: super::fence::Reservation::new(),
+            reservation,
             render_resource: None,
             render_meta: None,
             render_blob_mem: None,
@@ -123,7 +144,7 @@ impl GemObject {
             backing,
             size,
             mmap_offset,
-            reservation: super::fence::Reservation::new(),
+            reservation: alloc::sync::Arc::new(super::fence::Reservation::new()),
             render_resource: Some(resource),
             render_meta: Some(meta),
             render_blob_mem: blob_mem,
@@ -135,6 +156,10 @@ impl GemObject {
 // separate from handle statistics: exported buffers and VMAs outlive handles.
 use core::sync::atomic::{AtomicUsize, Ordering};
 static PINNED_GEM_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn pinned_gem_bytes() -> usize {
+    PINNED_GEM_BYTES.load(Ordering::Acquire)
+}
 
 pub(crate) struct GemMemoryCharge {
     owner: Arc<AtomicUsize>,
@@ -161,7 +186,10 @@ impl GemMemoryCharge {
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|next| *next <= file_limit)
             })
-            .map_err(|_| super::DrmError::NoMemory)?;
+            .map_err(|used| {
+                axlog::warn!("drm-gem: file quota refused bytes={bytes} used={used} limit={file_limit} global_used={} global_limit={global_limit}", pinned_gem_bytes());
+                super::DrmError::NoMemory
+            })?;
         if PINNED_GEM_BYTES
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|next| *next <= global_limit)
@@ -169,9 +197,15 @@ impl GemMemoryCharge {
             .is_err()
         {
             owner.fetch_sub(bytes, Ordering::AcqRel);
+            axlog::warn!("drm-gem: global quota refused bytes={bytes} used={} limit={global_limit}", pinned_gem_bytes());
             return Err(super::DrmError::NoMemory);
         }
-        Arc::try_new(Self { owner, bytes }).map_err(|_| super::DrmError::NoMemory)
+        // try_new drops its input on allocation failure, refunding BOTH
+        // counters via GemMemoryCharge::drop; do not refund a second time.
+        Arc::try_new(Self { owner, bytes }).map_err(|_| {
+            axlog::warn!("drm-gem: charge owner allocation failed bytes={bytes} global_used={}", pinned_gem_bytes());
+            super::DrmError::NoMemory
+        })
     }
 }
 impl Drop for GemMemoryCharge {

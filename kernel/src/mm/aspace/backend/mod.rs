@@ -190,7 +190,11 @@ fn alloc_frame(zeroed: bool, size: PageSize) -> AxResult<PhysAddr> {
     let page_size = size as usize;
     let num_pages = page_size / PAGE_SIZE_4K;
     let vaddr =
-        VirtAddr::from(global_allocator().alloc_pages(num_pages, page_size, UsageKind::VirtMem)?);
+        VirtAddr::from(global_allocator().alloc_pages(num_pages, page_size, UsageKind::VirtMem).map_err(|error| {
+            let allocator = global_allocator();
+            axlog::warn!("alloc-frame: failed pages={num_pages} align={page_size} free_pages={} heap_used={} heap_free={} error={error:?}", allocator.available_pages(), allocator.used_bytes(), allocator.available_bytes());
+            error
+        })?);
     if zeroed {
         // Zero with a u64 store loop instead of core::ptr::write_bytes. Under
         // QEMU TCG the compiler-emitted memset for write_bytes runs ~4x slower

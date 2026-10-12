@@ -65,7 +65,10 @@ pub(super) fn defer(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, Str
         PENDING.lock().take();
         return Err(String::from("upstream i915: rootfs callback table is full; GT left untouched"));
     }
-    Ok(String::from("upstream i915: probe queued until the rootfs is mounted"))
+    let status = super::gt::upstream_probe_schedule_text(
+        axdriver::prelude::firmware::rootfs_ready(),
+    );
+    Ok(String::from(status))
 }
 
 fn run_pending() {
@@ -99,11 +102,13 @@ pub(super) fn probe(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, Str
     // The power-domain callbacks need the display window before the probe
     // reaches intel_gt_init() and its first GT unpark.
     upstream_gt::register_display_window(window);
-    super::irq::upstream::install(bdf).map_err(|e| format!("upstream i915: {e}"))?;
     let pdev = upstream_gt::native_pci_device(bdf);
+    super::upstream_memory::prepare(bdf, &window, pdev)?;
+    super::irq::upstream::install(bdf).map_err(|e| format!("upstream i915: {e}"))?;
     // SAFETY: `pdev` is the native PCI identity for `bdf`; `device_info` matches its device id.
     let ret = unsafe { i915_pci_probe(pdev, info.device_id, device_info) };
     if ret != 0 {
+        super::irq::upstream::disable_msi(bdf);
         return Err(format!("upstream i915: i915_pci_probe({:04x}) failed: {ret}", info.device_id));
     }
     // SAFETY: a successful probe stored the i915 device as the drvdata of `pdev`.

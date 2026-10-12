@@ -997,7 +997,7 @@ pub fn fatal(args: fmt::Arguments<'_>) -> ! {
         }
     }
     write_now(&text);
-    axhal::power::system_off()
+    crate::terminate_on_fatal()
 }
 /// Legacy ax_print fragments are diagnostics, never terminal output.
 pub fn record(bytes: &[u8]) {

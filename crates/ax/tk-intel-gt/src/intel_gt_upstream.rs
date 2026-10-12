@@ -822,9 +822,26 @@ unsafe fn intel_gt_fini_scratch(gt: *mut IntelGt) {
     }
 }
 
+/// Resolve the embedded VM only after validating the allocation result.
+unsafe fn ppgtt_vm_or_error(
+    ppgtt: *mut crate::intel_gtt_api_upstream::I915Ppgtt,
+) -> Result<*mut I915AddressSpace, i32> {
+    const _: [(); 0] = [(); core::mem::offset_of!(
+        crate::intel_gtt_api_upstream::I915Ppgtt,
+        vm
+    )];
+    if crate::linux_config::IS_ERR(ppgtt) {
+        return Err(crate::linux_config::PTR_ERR(ppgtt));
+    }
+    if ppgtt.is_null() {
+        return Err(-crate::linux_config::ENOMEM);
+    }
+    Ok(unsafe { core::ptr::addr_of_mut!((*ppgtt).vm) })
+}
+
 /// `kernel_vm()` — choose full PPGTT or retain the GGTT for aliasing mode.
 // upstream: intel_gt.c kernel_vm()
-unsafe fn kernel_vm(gt: *mut IntelGt) -> *mut I915AddressSpace {
+unsafe fn kernel_vm(gt: *mut IntelGt) -> Result<*mut I915AddressSpace, i32> {
     let info = unsafe {
         (*(*gt).i915)
             .info
@@ -832,11 +849,18 @@ unsafe fn kernel_vm(gt: *mut IntelGt) -> *mut I915AddressSpace {
     };
     if unsafe { (*info).runtime.ppgtt_type as u32 > INTEL_PPGTT_ALIASING } {
         unsafe {
-            i915_ppgtt_create(gt, crate::linux_config::I915_BO_ALLOC_PM_EARLY as u64)
-                .cast::<I915AddressSpace>()
+            ppgtt_vm_or_error(i915_ppgtt_create(
+                gt,
+                crate::linux_config::I915_BO_ALLOC_PM_EARLY as u64,
+            ))
         }
     } else {
-        unsafe { i915_vm_get(core::ptr::addr_of_mut!((*(*gt).ggtt).vm)) }
+        let vm = unsafe { i915_vm_get(core::ptr::addr_of_mut!((*(*gt).ggtt).vm)) };
+        if vm.is_null() {
+            Err(-crate::linux_config::ENOMEM)
+        } else {
+            Ok(vm)
+        }
     }
 }
 
@@ -1022,27 +1046,31 @@ pub unsafe extern "C" fn intel_gt_init(gt: *mut IntelGt) -> i32 {
             intel_gt_pm_init(gt);
         }
         cleanup_stage = 1;
-        unsafe {
-            (*gt).vm = kernel_vm(gt);
-        }
-        if unsafe { (*gt).vm.is_null() } {
-            err = -crate::linux_config::ENOMEM;
-        } else {
-            unsafe {
-                intel_set_mocs_index(gt);
+        match unsafe { kernel_vm(gt) } {
+            Err(error) => err = error,
+            Ok(vm) => {
+                unsafe { (*gt).vm = vm };
+                // From here on the address space exists and engine setup may
+                // have partially initialized resources that need release.
+                cleanup_stage = 2;
+                unsafe {
+                    intel_set_mocs_index(gt);
+                }
+                err = unsafe { intel_engines_init(gt) };
             }
-            err = unsafe { intel_engines_init(gt) };
         }
     }
     if err == 0 {
         err = unsafe { intel_uc_init(core::ptr::addr_of_mut!((*gt).uc).cast()) };
     }
     if err == 0 {
-        cleanup_stage = 2;
+        // uC is initialized from here on: err_uc_init (intel_uc_fini) level.
+        cleanup_stage = 3;
         err = unsafe { intel_gt_resume(gt) };
     }
     if err == 0 {
-        cleanup_stage = 3;
+        // GT resumed: err_gt (intel_uc_fini_hw + __intel_gt_disable) level.
+        cleanup_stage = 4;
         let hwconfig_err = unsafe { intel_gt_init_hwconfig(gt) };
         if hwconfig_err != 0 {
             gt_err!(gt, "Failed to retrieve hwconfig table: %d\n", hwconfig_err);
@@ -1059,19 +1087,21 @@ pub unsafe extern "C" fn intel_gt_init(gt: *mut IntelGt) -> i32 {
         }
     } else {
         unsafe {
-            if cleanup_stage >= 3 {
+            if cleanup_stage >= 4 {
                 __intel_gt_disable(gt);
                 intel_uc_fini_hw(core::ptr::addr_of_mut!((*gt).uc).cast());
             }
-            if cleanup_stage >= 2 {
+            if cleanup_stage >= 3 {
                 intel_uc_fini(core::ptr::addr_of_mut!((*gt).uc).cast());
             }
-            if cleanup_stage >= 1 {
+            if cleanup_stage >= 2 {
                 intel_engines_release(gt);
                 let vm = core::mem::replace(&mut (*gt).vm, ptr::null_mut());
                 if !vm.is_null() {
                     i915_vm_put(vm);
                 }
+            }
+            if cleanup_stage >= 1 {
                 intel_gt_pm_fini(gt);
                 intel_gt_fini_scratch(gt);
             }
@@ -1336,6 +1366,22 @@ pub unsafe extern "C" fn intel_gt_coherent_map_type(
         I915_MAP_WB
     } else {
         I915_MAP_WC
+    }
+}
+
+#[cfg(test)]
+mod kernel_vm_tests {
+    use super::*;
+
+    #[test]
+    fn kernel_vm_propagates_ppgtt_error_pointer() {
+        let failed = crate::linux_config::ERR_PTR::<crate::intel_gtt_api_upstream::I915Ppgtt>(
+            -crate::linux_config::ENOMEM,
+        );
+        assert_eq!(
+            unsafe { ppgtt_vm_or_error(failed) },
+            Err(-crate::linux_config::ENOMEM)
+        );
     }
 }
 

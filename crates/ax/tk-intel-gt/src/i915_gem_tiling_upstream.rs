@@ -440,7 +440,7 @@ pub unsafe fn i915_gem_set_tiling_ioctl(
         return -EOPNOTSUPP;
     }
 
-    obj = i915_gem_object_lookup((*file).driver_priv.cast::<DrmFileObjectLookup>(), (*args).handle);
+    obj = i915_gem_object_lookup(file.cast::<DrmFileObjectLookup>(), (*args).handle);
     if obj.is_null() {
         return -ENOENT;
     }
@@ -521,7 +521,7 @@ pub unsafe fn i915_gem_get_tiling_ioctl(
     }
 
     rcu_read_lock();
-    obj = i915_gem_object_lookup_rcu((*file).driver_priv.cast::<DrmFileObjectLookup>(), (*args).handle);
+    obj = i915_gem_object_lookup_rcu(file.cast::<DrmFileObjectLookup>(), (*args).handle);
     if !obj.is_null() {
         (*args).tiling_mode = READ_ONCE!((*obj).tiling_and_stride) & TILING_MASK;
         err = 0;

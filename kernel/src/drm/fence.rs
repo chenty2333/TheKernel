@@ -64,25 +64,104 @@ impl Reservation {
     /// the same lock. KMS uses this at commit admission so render submission
     /// can observe neither an unqueued scanout nor a queued scanout without
     /// its completion dependency.
-    pub fn replace(&self, fence: Arc<Fence>) -> Option<Arc<Fence>> {
-        self.exclusive.lock().replace(fence)
+    pub fn replace(&self, fence: Arc<Fence>) -> AxResult<Option<Arc<Fence>>> {
+        #[cfg(feature = "intel-upstream-gt")]
+        let upstream = crate::drm::intel::upstream_sync::prepare_native_reservation_update(
+            &[self],
+            fence.clone(),
+        )?;
+        let previous = self.exclusive.lock().replace(fence.clone());
+        let changed = previous
+            .as_ref()
+            .is_none_or(|previous| !Arc::ptr_eq(previous, &fence));
+        #[cfg(feature = "intel-upstream-gt")]
+        if changed {
+            if let Some(upstream) = upstream {
+                upstream.publish();
+            }
+        }
+        Ok(previous)
     }
 
     /// Add an external synchronization dependency without discarding a
     /// dependency already owned by this reservation. Unlike `replace`, this
     /// does not wait: future implicit consumers wait for both fence leaves.
     pub fn append(&self, fence: Arc<Fence>) -> AxResult<()> {
-        let mut reservations = [(self, true)];
-        let predecessors = Self::replace_many_with_async(&mut reservations, fence)?;
-        debug_assert!(predecessors.is_empty());
-        Ok(())
+        for _ in 0..8 {
+            let previous = self.predecessor();
+            let replacement = match &previous {
+                Some(previous) => Fence::join(&[previous.clone(), fence.clone()])?,
+                None => fence.clone(),
+            };
+            if previous
+                .as_ref()
+                .is_some_and(|previous| Arc::ptr_eq(previous, &replacement))
+            {
+                return Ok(());
+            }
+            #[cfg(feature = "intel-upstream-gt")]
+            let upstream = crate::drm::intel::upstream_sync::prepare_native_reservation_update(
+                &[self],
+                fence.clone(),
+            )?;
+            let mut exclusive = self.exclusive.lock();
+            let unchanged = match (exclusive.as_ref(), previous.as_ref()) {
+                (None, None) => true,
+                (Some(current), Some(previous)) => Arc::ptr_eq(current, previous),
+                _ => false,
+            };
+            if !unchanged {
+                drop(exclusive);
+                #[cfg(feature = "intel-upstream-gt")]
+                drop(upstream);
+                continue;
+            }
+            *exclusive = Some(replacement);
+            drop(exclusive);
+            #[cfg(feature = "intel-upstream-gt")]
+            if let Some(upstream) = upstream {
+                upstream.publish();
+            }
+            return Ok(());
+        }
+        Err(AxError::WouldBlock)
+    }
+
+    /// Import an upstream dma-fence edge without publishing it back into the
+    /// same Linux reservation object. The upstream side owns that edge already.
+    pub(crate) fn append_from_upstream(&self, fence: Arc<Fence>) -> AxResult<()> {
+        for _ in 0..8 {
+            let previous = self.exclusive.lock().clone();
+            if previous
+                .as_ref()
+                .is_some_and(|previous| Arc::ptr_eq(previous, &fence))
+            {
+                return Ok(());
+            }
+            let replacement = match &previous {
+                Some(previous) => Fence::join(&[previous.clone(), fence.clone()])?,
+                None => fence.clone(),
+            };
+            let mut exclusive = self.exclusive.lock();
+            let unchanged = match (exclusive.as_ref(), previous.as_ref()) {
+                (None, None) => true,
+                (Some(current), Some(previous)) => Arc::ptr_eq(current, previous),
+                _ => false,
+            };
+            if unchanged {
+                *exclusive = Some(replacement);
+                return Ok(());
+            }
+        }
+        Err(AxError::WouldBlock)
     }
 
     /// Install the initial resource-ready dependency. Resource construction
     /// has no predecessor; later GPU/KMS submissions use `replace_many`.
-    pub fn publish(&self, fence: Arc<Fence>) {
+    pub fn publish(&self, fence: Arc<Fence>) -> AxResult<()> {
         debug_assert!(self.exclusive.lock().is_none());
-        let _ = self.replace(fence);
+        self.replace(fence)?;
+        Ok(())
     }
 
     /// Roll back a failed admission only if no later submission has already
@@ -124,7 +203,13 @@ impl Reservation {
             .try_reserve_exact(reservations.len())
             .map_err(|_| AxError::NoMemory)?;
 
-        for reservation in reservations {
+        #[cfg(feature = "intel-upstream-gt")]
+        let upstream = crate::drm::intel::upstream_sync::prepare_native_reservation_update(
+            reservations,
+            fence.clone(),
+        )?;
+
+        for reservation in reservations.iter() {
             guards.push(reservation.exclusive.lock());
         }
         for guard in &mut guards {
@@ -133,6 +218,10 @@ impl Reservation {
             }
         }
         drop(guards);
+        #[cfg(feature = "intel-upstream-gt")]
+        if let Some(upstream) = upstream {
+            upstream.publish();
+        }
         Ok(predecessors)
     }
 
@@ -182,6 +271,16 @@ impl Reservation {
             .try_reserve_exact(reservations.len())
             .map_err(|_| AxError::NoMemory)?;
 
+        #[cfg(feature = "intel-upstream-gt")]
+        let mut reservation_refs = Vec::new();
+        #[cfg(feature = "intel-upstream-gt")]
+        {
+            reservation_refs
+                .try_reserve_exact(reservations.len())
+                .map_err(|_| AxError::NoMemory)?;
+            reservation_refs.extend(reservations.iter().map(|(reservation, _)| *reservation));
+        }
+
         for _ in 0..8 {
             snapshots.clear();
             for (reservation, _) in reservations.iter() {
@@ -202,6 +301,12 @@ impl Reservation {
                 replacements.push(replacement);
             }
 
+            #[cfg(feature = "intel-upstream-gt")]
+            let upstream = crate::drm::intel::upstream_sync::prepare_native_reservation_update(
+                &reservation_refs,
+                fence.clone(),
+            )?;
+
             guards.clear();
             for (reservation, _) in reservations.iter() {
                 guards.push(reservation.exclusive.lock());
@@ -215,6 +320,8 @@ impl Reservation {
             });
             if !unchanged {
                 guards.clear();
+                #[cfg(feature = "intel-upstream-gt")]
+                drop(upstream);
                 continue;
             }
 
@@ -225,7 +332,13 @@ impl Reservation {
                 }
                 *guards[index] = Some(replacements[index].clone());
             }
-            return Ok(core::mem::take(&mut predecessors));
+            let predecessors = core::mem::take(&mut predecessors);
+            drop(guards);
+            #[cfg(feature = "intel-upstream-gt")]
+            if let Some(upstream) = upstream {
+                upstream.publish();
+            }
+            return Ok(predecessors);
         }
 
         Err(AxError::WouldBlock)
@@ -534,8 +647,8 @@ mod tests {
         let first = Reservation::new();
         let second = Reservation::new();
         let predecessor = Fence::new(false);
-        first.replace(predecessor.clone());
-        second.replace(predecessor.clone());
+        first.replace(predecessor.clone()).unwrap();
+        second.replace(predecessor.clone()).unwrap();
         let completion = Fence::new(false);
         let mut reservations = [&second, &first];
 
@@ -552,8 +665,8 @@ mod tests {
         let synchronous = Reservation::new();
         let async_prior = Fence::new(false);
         let sync_prior = Fence::new(false);
-        asynchronous.replace(async_prior.clone());
-        synchronous.replace(sync_prior.clone());
+        asynchronous.replace(async_prior.clone()).unwrap();
+        synchronous.replace(sync_prior.clone()).unwrap();
         let completion = Fence::new(false);
         let mut reservations = [(&synchronous, false), (&asynchronous, true)];
 
@@ -582,10 +695,10 @@ mod tests {
     fn failed_admission_restores_the_exact_predecessor() {
         let reservation = Reservation::new();
         let predecessor = Fence::new(true);
-        reservation.replace(predecessor.clone());
+        reservation.replace(predecessor.clone()).unwrap();
         let rejected = Fence::new(false);
 
-        let prior = reservation.replace(rejected.clone());
+        let prior = reservation.replace(rejected.clone()).unwrap();
         reservation.restore_if_current(&rejected, prior);
 
         assert!(Arc::ptr_eq(
@@ -598,9 +711,9 @@ mod tests {
     fn failed_admission_does_not_clobber_a_later_publisher() {
         let reservation = Reservation::new();
         let rejected = Fence::new(false);
-        let prior = reservation.replace(rejected.clone());
+        let prior = reservation.replace(rejected.clone()).unwrap();
         let later = Fence::new(false);
-        reservation.replace(later.clone());
+        reservation.replace(later.clone()).unwrap();
 
         reservation.restore_if_current(&rejected, prior);
 

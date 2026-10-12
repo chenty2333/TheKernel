@@ -244,7 +244,7 @@ unsafe fn __intel_uc_reset_hw(uc: *mut IntelUc) -> i32 {
     let gt = unsafe { uc_to_gt(uc) };
     let ret = unsafe { intel_reset_guc(gt) };
     if ret != 0 {
-        gt_err!(gt, "Failed to reset GuC, ret = %d\\n", ret);
+        gt_err!(gt, "Failed to reset GuC, ret = %d\n", ret);
         return ret;
     }
     let status = unsafe { intel_uncore_read((*gt).uncore, GUC_STATUS) };
@@ -252,7 +252,7 @@ unsafe fn __intel_uc_reset_hw(uc: *mut IntelUc) -> i32 {
         uc_gt_log!(
             DrmLogLevel::Warn,
             gt,
-            "GuC status: 0x%x, MIA core expected to be in reset\\n",
+            "GuC status: 0x%x, MIA core expected to be in reset\n",
             status
         );
     }
@@ -265,7 +265,7 @@ unsafe fn __confirm_options(uc: *mut IntelUc) {
     let i915 = unsafe { (*gt).i915 };
     gt_dbg!(
         gt,
-        "enable_guc=%d (guc:%s submission:%s huc:%s slpc:%s)\\n",
+        "enable_guc=%d (guc:%s submission:%s huc:%s slpc:%s)\n",
         unsafe { (*i915).params.enable_guc },
         str_yes_no(unsafe { intel_uc_wants_guc(uc) }),
         str_yes_no(unsafe { intel_uc_wants_guc_submission(uc) }),
@@ -282,7 +282,7 @@ unsafe fn __confirm_options(uc: *mut IntelUc) {
     if !unsafe { intel_uc_supports_guc(uc) } {
         uc_gt_info!(
             gt,
-            "Incompatible option enable_guc=%d - %s\\n",
+            "Incompatible option enable_guc=%d - %s\n",
             unsafe { (*i915).params.enable_guc },
             "GuC is not supported!"
         );
@@ -292,7 +292,7 @@ unsafe fn __confirm_options(uc: *mut IntelUc) {
     {
         uc_gt_info!(
             gt,
-            "Incompatible option enable_guc=%d - %s\\n",
+            "Incompatible option enable_guc=%d - %s\n",
             unsafe { (*i915).params.enable_guc },
             "GuC submission is N/A"
         );
@@ -300,7 +300,7 @@ unsafe fn __confirm_options(uc: *mut IntelUc) {
     if unsafe { (*i915).params.enable_guc } & !ENABLE_GUC_MASK != 0 {
         uc_gt_info!(
             gt,
-            "Incompatible option enable_guc=%d - %s\\n",
+            "Incompatible option enable_guc=%d - %s\n",
             unsafe { (*i915).params.enable_guc },
             "undocumented flag"
         );
@@ -440,7 +440,7 @@ unsafe fn guc_enable_communication(guc: *mut IntelGuc) -> i32 {
         intel_guc_ct_event_handler(ct);
         spin_unlock_irq(&mut *gt_irq_lock);
     }
-    guc_dbg!(guc, "communication enabled\\n");
+    guc_dbg!(guc, "communication enabled\n");
     0
 }
 
@@ -452,7 +452,7 @@ unsafe fn guc_disable_communication(guc: *mut IntelGuc) {
         intel_guc_ct_disable(ptr::addr_of_mut!((*guc).ct));
         guc_get_mmio_msg(guc);
     }
-    guc_dbg!(guc, "communication disabled\\n");
+    guc_dbg!(guc, "communication disabled\n");
 }
 
 // upstream: intel_uc.c __uc_fetch_firmwares()
@@ -463,7 +463,7 @@ unsafe extern "C" fn __uc_fetch_firmwares(uc: *mut IntelUc) {
     let err = unsafe { crate::intel_uc_fw_upstream::intel_uc_fw_fetch(guc_fw) };
     if err != 0 {
         if unsafe { intel_uc_wants_huc(uc) } {
-            gt_dbg!(gt, "Failed to fetch GuC fw (%d) disabling HuC\\n", err);
+            gt_dbg!(gt, "Failed to fetch GuC fw (%d) disabling HuC\n", err);
             unsafe {
                 crate::intel_uc_fw_upstream::intel_uc_fw_change_status(
                     ptr::addr_of_mut!((*uc).huc.fw),
@@ -472,7 +472,7 @@ unsafe extern "C" fn __uc_fetch_firmwares(uc: *mut IntelUc) {
             }
         }
         if unsafe { intel_uc_wants_gsc_uc(uc) } {
-            gt_dbg!(gt, "Failed to fetch GuC fw (%d) disabling GSC\\n", err);
+            gt_dbg!(gt, "Failed to fetch GuC fw (%d) disabling GSC\n", err);
             unsafe {
                 crate::intel_uc_fw_upstream::intel_uc_fw_change_status(
                     ptr::addr_of_mut!((*uc).gsc.fw),
@@ -559,7 +559,7 @@ unsafe fn uc_init_wopcm(uc: *mut IntelUc) -> i32 {
         0
     };
     if base == 0 || size == 0 {
-        uc_gt_probe_error!(gt, "Unsuccessful WOPCM partitioning\\n");
+        uc_gt_probe_error!(gt, "Unsuccessful WOPCM partitioning\n");
         return -E2BIG;
     }
     GEM_BUG_ON!(!unsafe { intel_uc_supports_guc(uc) });
@@ -603,7 +603,7 @@ unsafe fn uc_init_wopcm(uc: *mut IntelUc) -> i32 {
 }
 
 unsafe fn uc_init_wopcm_error(gt: *mut IntelGt, uncore: *mut IntelUncore, err: i32) -> i32 {
-    uc_gt_probe_error!(gt, "Failed to init uC WOPCM registers!\\n");
+    uc_gt_probe_error!(gt, "Failed to init uC WOPCM registers!\n");
     let offset = unsafe {
         intel_uncore_read(
             uncore,
@@ -622,12 +622,12 @@ unsafe fn uc_init_wopcm_error(gt: *mut IntelGt, uncore: *mut IntelUncore, err: i
     };
     uc_gt_probe_error!(
         gt,
-        "%s(%#x)=%#x\\n",
+        "%s(%#x)=%#x\n",
         "DMA_GUC_WOPCM_OFFSET",
         DMA_GUC_WOPCM_OFFSET,
         offset
     );
-    uc_gt_probe_error!(gt, "%s(%#x)=%#x\\n", "GUC_WOPCM_SIZE", GUC_WOPCM_SIZE, size);
+    uc_gt_probe_error!(gt, "%s(%#x)=%#x\n", "GUC_WOPCM_SIZE", GUC_WOPCM_SIZE, size);
     err
 }
 
@@ -672,7 +672,7 @@ unsafe fn print_fw_ver(gt: *mut IntelGt, fw: *mut IntelUcFw) {
     let path = unsafe { firmware_path((*fw).file_selected.path) };
     uc_gt_info!(
         gt,
-        "%s firmware %s version %u.%u.%u\\n",
+        "%s firmware %s version %u.%u.%u\n",
         firmware_type_repr(unsafe { (*fw).r#type }),
         path,
         unsafe { (*fw).file_selected.ver.major },
@@ -762,7 +762,7 @@ unsafe extern "C" fn __uc_init_hw(uc: *mut IntelUc) -> i32 {
             }
             gt_dbg!(
                 gt,
-                "GuC fw load failed (%d) will reset and retry %d more time(s)\\n",
+                "GuC fw load failed (%d) will reset and retry %d more time(s)\n",
                 ret,
                 attempts
             );
@@ -808,12 +808,12 @@ unsafe extern "C" fn __uc_init_hw(uc: *mut IntelUc) -> i32 {
         }
         uc_guc_info!(
             guc,
-            "submission %s\\n",
+            "submission %s\n",
             enabled_disabled(unsafe { intel_uc_uses_guc_submission(uc) })
         );
         uc_guc_info!(
             guc,
-            "SLPC %s\\n",
+            "SLPC %s\n",
             enabled_disabled(unsafe { intel_uc_uses_guc_slpc(uc) })
         );
         initialized = true;
@@ -844,10 +844,10 @@ unsafe extern "C" fn __uc_init_hw(uc: *mut IntelUc) -> i32 {
         __uc_sanitize(uc);
     }
     if ret == 0 {
-        gt_notice!(gt, "GuC is uninitialized\\n");
+        gt_notice!(gt, "GuC is uninitialized\n");
         return 0;
     }
-    uc_gt_probe_error!(gt, "GuC initialization failed %d\\n", ret);
+    uc_gt_probe_error!(gt, "GuC initialization failed %d\n", ret);
     -EIO
 }
 
@@ -970,7 +970,7 @@ pub unsafe extern "C" fn intel_uc_suspend(uc: *mut IntelUc) {
     if !wakeref.is_null() {
         let err = unsafe { intel_guc_suspend(guc) };
         if err != 0 {
-            guc_dbg!(guc, "Failed to suspend, %d\\n", err);
+            guc_dbg!(guc, "Failed to suspend, %d\n", err);
         }
         unsafe { crate::linux_pm::intel_runtime_pm_put(&*rpm, wakeref) };
     }
@@ -1004,7 +1004,7 @@ unsafe fn __uc_resume(uc: *mut IntelUc, enable_communication: bool) -> i32 {
     }
     let err = unsafe { intel_guc_resume(guc) };
     if err != 0 {
-        guc_dbg!(guc, "Failed to resume, %d\\n", err);
+        guc_dbg!(guc, "Failed to resume, %d\n", err);
         return err;
     }
     unsafe {

@@ -4,12 +4,14 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/klog.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 int main(int argc, char **argv) {
-    if (argc != 3) { fprintf(stderr, "usage: thekernel-netconsole HOST_IP PORT\n"); return 2; }
+    int from_stdin = argc == 4 && !strcmp(argv[3], "--stdin");
+    if (argc != 3 && !from_stdin) { fprintf(stderr, "usage: thekernel-netconsole HOST_IP PORT [--stdin]\n"); return 2; }
     char *end;
     long port = strtol(argv[2], &end, 10);
     struct sockaddr_in destination = { .sin_family = AF_INET };
@@ -17,9 +19,21 @@ int main(int argc, char **argv) {
     destination.sin_port = htons((unsigned short)port);
     int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) { perror("netconsole socket"); return 1; }
+    char buffer[1200];
+    if (from_stdin) {
+        /* Explicit userspace probe output; never write it into kernel logs. */
+        int failed = 0;
+        while (fgets(buffer, sizeof buffer, stdin)) {
+            size_t length = strlen(buffer);
+            if (sendto(fd, buffer, length, 0, (struct sockaddr *)&destination, sizeof destination) != (ssize_t)length)
+                failed = 1;
+        }
+        failed |= ferror(stdin) != 0;
+        close(fd);
+        return failed;
+    }
     puts("N305_NETCONSOLE_READY userspace relay; early boot/panic delivery not guaranteed");
     fflush(stdout);
-    char buffer[1200];
     int warned = 0;
     for (;;) {
         /* SYSLOG_ACTION_READ has its own cursor, not the screen's cursor. */

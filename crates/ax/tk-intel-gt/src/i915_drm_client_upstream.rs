@@ -11,7 +11,7 @@
 use core::{
     ffi::{c_char, c_int, c_void},
     mem::offset_of,
-    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
 
 use crate::{
@@ -37,18 +37,6 @@ struct Idr {
     _radix_tree_root: crate::intel_context_upstream::RadixTreeRoot,
     _base: u32,
     _next: u32,
-}
-
-/// `drm_file` prefix to the members used by `show_meminfo()` (`drm_file.h`).
-#[repr(C)]
-struct DrmFileView {
-    _prefix: [u8; 80],
-    object_idr: Idr,
-    table_lock: Spinlock,
-    _xa_alignment: [u8; 4],
-    _syncobj_xa: [u8; 16],
-    _filp: *mut c_void,
-    driver_priv: *mut DrmI915FilePrivate,
 }
 
 /// `drm_i915_file_private` fields accessed by this file (`i915_file_private.h`).
@@ -89,10 +77,11 @@ struct I915EngineUabiClassCountView {
     count: [u32; 5],
 }
 
-const _: [(); 80] = [(); offset_of!(DrmFileView, object_idr)];
-const _: [(); 104] = [(); offset_of!(DrmFileView, table_lock)];
-const _: [(); 112] = [(); offset_of!(DrmFileView, _syncobj_xa)];
-const _: [(); 136] = [(); offset_of!(DrmFileView, driver_priv)];
+const _: [(); 80] = [(); offset_of!(gem::DrmFile, object_idr)];
+const _: [(); 104] = [(); offset_of!(gem::DrmFile, table_lock)];
+const _: [(); 112] = [(); offset_of!(gem::DrmFile, _syncobj_xa)];
+const _: [(); 128] = [(); offset_of!(gem::DrmFile, filp)];
+const _: [(); 136] = [(); offset_of!(gem::DrmFile, driver_priv)];
 const _: [(); 0] = [(); offset_of!(DrmI915FilePrivateView, i915)];
 const _: [(); 112] = [(); offset_of!(DrmI915FilePrivateView, client)];
 const _: [(); 24] = [(); offset_of!(I915DrmClientView, objects_lock)];
@@ -128,7 +117,7 @@ unsafe fn client_view(client: *mut I915DrmClient) -> *mut I915DrmClientView {
 }
 
 #[inline]
-unsafe fn file_private_view(file: *mut DrmFileView) -> *mut DrmI915FilePrivateView {
+unsafe fn file_private_view(file: *mut gem::DrmFile) -> *mut DrmI915FilePrivateView {
     unsafe { (*file).driver_priv.cast() }
 }
 
@@ -210,7 +199,10 @@ unsafe fn obj_meminfo(obj: *mut DrmI915GemObject, stats: *mut DrmMemoryStats) {
         let size = (*object_gem_base(obj)).size;
         let base = object_gem_base(obj);
         // drm_gem_object_is_shared_for_memory_stats(): handle_count > 1 || dma_buf.
-        let handle_count = core::ptr::read_volatile(base.cast::<u8>().add(4).cast::<u32>());
+        // Handles can be opened on distinct DRM files concurrently, so the
+        // canonical GEM handle count is accessed atomically across files.
+        let handle_count = AtomicU32::from_ptr(base.cast::<u8>().add(4).cast::<u32>())
+            .load(Ordering::Acquire);
         if handle_count > 1 || !(*base).dma_buf.is_null() {
             (*stats.add(region)).shared = (*stats.add(region)).shared.wrapping_add(size);
         } else {
@@ -230,7 +222,7 @@ unsafe fn obj_meminfo(obj: *mut DrmI915GemObject, stats: *mut DrmMemoryStats) {
 }
 
 // upstream: i915_drm_client.c show_meminfo()
-unsafe fn show_meminfo(printer: *mut DrmPrinter, file: *mut DrmFileView) {
+unsafe fn show_meminfo(printer: *mut DrmPrinter, file: *mut gem::DrmFile) {
     unsafe {
         let mut stats = [DrmMemoryStats::default(); INTEL_REGION_UNKNOWN as usize];
         let file_priv = file_private_view(file);
@@ -241,7 +233,7 @@ unsafe fn show_meminfo(printer: *mut DrmPrinter, file: *mut DrmFileView) {
         locks::spin_lock(&mut (*file).table_lock);
         let mut id = 0;
         loop {
-            let obj = idr_get_next(core::ptr::addr_of_mut!((*file).object_idr), &mut id)
+            let obj = idr_get_next(core::ptr::addr_of_mut!((*file).object_idr).cast::<Idr>(), &mut id)
                 .cast::<DrmI915GemObject>();
             if obj.is_null() {
                 break;
@@ -347,7 +339,7 @@ unsafe fn show_client_class(
 
 // upstream: i915_drm_client.c i915_drm_client_fdinfo()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn i915_drm_client_fdinfo(printer: *mut DrmPrinter, file: *mut DrmFileView) {
+pub unsafe extern "C" fn i915_drm_client_fdinfo(printer: *mut DrmPrinter, file: *mut gem::DrmFile) {
     unsafe {
         let file_priv = file_private_view(file);
         let i915 = (*file_priv).i915;

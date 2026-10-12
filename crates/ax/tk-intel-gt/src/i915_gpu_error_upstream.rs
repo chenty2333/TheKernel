@@ -1110,9 +1110,9 @@ unsafe fn capture_gen(error: *mut I915GpuCoredump) {
         core::ptr::addr_of_mut!((*error).runtime_info).cast::<u8>(),
         size_of::<crate::linux::i915::IntelRuntimeInfo>(),
     );
-    // intel_driver_caps immediately follows __runtime (see i915_getparam_upstream).
+    // The source-layout private record owns the typed driver capabilities.
     core::ptr::copy_nonoverlapping(
-        i915.cast::<u8>().add(offset_of!(DrmI915Private, runtime) + size_of::<crate::linux::i915::IntelRuntimeInfo>()),
+        core::ptr::addr_of!((*i915).caps).cast::<u8>(),
         core::ptr::addr_of_mut!((*error).driver_caps).cast::<u8>(),
         size_of::<IntelDriverCaps>(),
     );

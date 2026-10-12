@@ -4,7 +4,11 @@
 
 本文按 Linux 7.2.3 `drivers/gpu/drm/i915/` 的调用结构，记录当前 TheKernel 的默认执行路径、`upstream-gt` 源顺序翻译，以及真正切换运行路径时尚需提供的边界。ADL-N 使用 GT/display 分离：GT 为 Gen12 A0、GuC 提交；display 为 13.x D0。两者仍共享 PCI 设备、MMIO BAR、GGTT、IRQ/电源控制边界。
 
-**2026-10-10 起，`intel-upstream-gt` 已编入产品构建并默认启用。** `gt::init_at_boot()`（`intel.gt` 默认开启，`intel.gt=0` 关闭）在 rootfs 挂载后调用 `kernel/src/drm/intel/upstream_probe.rs` → `i915_pci_probe()`，翻译版 i915 是唯一的 GT owner，手写的 N305 BCS/GuC owner 只在不带该 feature 的构建里运行。kernel 侧 provider 在 `upstream_gt.rs`/`upstream_drm.rs`，GPU MSI 由翻译版 `gen11_irq_handler()` 持有 GFX_MSTR_IRQ，display 部分回调 `irq.rs::dispatch_display()`。产品链接会解析整棵调用树（无未定义符号）。尚未完成：上游 GEM/execbuffer ioctl 到 kernel DRM 文件的路由（DrmCoreProvider 的 GEM handle/dma-buf/syncobj 入口仍 fail-closed）；N305 真机未验证。下文各表保留接线前的对照，"默认"一栏指不带 feature 的构建。
+**2026-10-10 起，`intel-upstream-gt` 已编入产品构建并默认启用。** `gt::init_at_boot()`（`intel.gt` 默认开启，`intel.gt=0` 关闭）在 rootfs 挂载后调用 `kernel/src/drm/intel/upstream_probe.rs` → `i915_pci_probe()`，翻译版 i915 是唯一的 GT owner，手写的 N305 BCS/GuC owner 只在不带该 feature 的构建里运行。kernel 侧 provider 在 `upstream_gt.rs`/`upstream_drm.rs`，GPU MSI 由翻译版 `gen11_irq_handler()` 持有 GFX_MSTR_IRQ，display 部分回调 `irq.rs::dispatch_display()`。产品链接会解析整棵调用树（无未定义符号）。2026-10-11 已接入上游 GEM/execbuffer ioctl 到 kernel DRM 文件的路由：GEM/PRIME/KMS 共用句柄及页所有者，WB mmap 保持 i915 page pin，二进制/时间线 syncobj、sync_file 与原生 reservation 共用完成状态。跨 owner 发布依赖前锁定 Linux dma_resv，不能以异步镜像代替提交时的同步。N305 上的新链路仍须真机验收；编译或主机模型通过不代表 Mesa 硬件渲染已通过。下文各表保留接线前的对照，"默认"一栏指不带 feature 的构建。
+
+当前共享硬件边界：GT 复用原生显示已经验证的 VT-d shared-identity lease，不切换 PCI requester 的翻译上下文；原生 GGTT 分配器保留高区，上游 DRM-MM 在首次分配前保留该区及所有已有 present PTE。整表回滚在分区后被拒绝。MSI 使用同一个实际向量，失败时只撤销 GT 自己新建的路由，不拆除原生显示的中断或 framebuffer。
+
+原生 KMS 仍要求精确的 Pipe-A/TC1/TC2、线性 RGB 和无 scaler 的已验证状态。N305 PXE 优先请求 3840×2160 GOP；若 firmware 回退到 800×600 缩放状态，继续保留 firmware 显示并拒绝接管，不能把一次配置请求当作已支持任意 scaler takeover。用户态桥接仅将已验证的系统 RAM/WB 映射为普通共享页，不伪装 WC/GGTT/local-memory 映射。
 
 状态标记：
 - **默认**：普通产品构建里的实际 TheKernel 路径。

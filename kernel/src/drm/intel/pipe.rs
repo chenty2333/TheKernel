@@ -793,7 +793,7 @@ impl DdbAllocation {
     };
 
     /// Make a half-open allocation after checking it fits the display buffer.
-    fn checked(start: u32, end: u32) -> Result<Self, PipeError> {
+    pub(crate) fn checked(start: u32, end: u32) -> Result<Self, PipeError> {
         if start >= end || end > DDB_BLOCKS {
             return Err(PipeError::DdbAllocationOutOfBounds { start, end });
         }
@@ -2050,8 +2050,8 @@ pub(crate) fn compute_with_watermarks_format(
     surface: PlaneSurface,
     config: WatermarkConfig,
     pixel_format: u32,
+    ddb: DdbAllocation,
 ) -> Result<PipeProgram, PipeError> {
-    let ddb = DdbAllocation::WHOLE_BUFFER;
     let watermark = WatermarkProgram::from_i915(ddb, mode, config, pixel_format)?;
     compute_with_program(pipe, mode, surface, ddb, watermark, pixel_format)
 }

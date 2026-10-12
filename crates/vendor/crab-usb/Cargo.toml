@@ -43,6 +43,10 @@ default = []
 libusb = ["umod"]
 umod = ["libusb1-sys"]
 
+[dev-dependencies.ax-sync]
+version = "0.5"
+features = ["host-test"]
+
 [lib]
 name = "crab_usb"
 path = "src/lib.rs"

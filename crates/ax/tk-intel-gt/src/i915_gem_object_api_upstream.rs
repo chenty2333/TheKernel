@@ -135,7 +135,7 @@ pub unsafe fn i915_gem_object_unlock(obj: *mut DrmI915GemObject) {
 #[inline]
 pub unsafe fn i915_gem_object_has_pages(obj: *const DrmI915GemObject) -> bool {
     let pages = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*obj).mm.pages)) };
-    (pages.is_null() || crate::linux_config::IS_ERR(pages))
+    !pages.is_null() && !crate::linux_config::IS_ERR(pages)
 }
 
 // upstream: i915_gem_object.h i915_gem_object_pin_pages()
@@ -185,4 +185,59 @@ pub unsafe fn i915_gem_object_unpin_map(obj: *mut DrmI915GemObject) {
 #[inline]
 pub unsafe fn i915_gem_object_finish_access(obj: *mut DrmI915GemObject) {
     unsafe { i915_gem_object_unpin_pages(obj) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::i915_gem_object_has_pages;
+    use crate::{
+        i915_gem_object_header_upstream,
+        i915_gem_object_types_upstream::DrmI915GemObject,
+        i915_gem_pages_upstream::Scatterlist,
+        intel_context_upstream::SgTable,
+    };
+    use core::{mem::MaybeUninit, ptr};
+
+    fn has_pages_in_both_inline_helpers(pages: *mut SgTable) -> (bool, bool) {
+        // The helpers inspect only mm.pages; keeping the rest uninitialized makes
+        // this fixture independent of unrelated GEM locks and callbacks.
+        let mut object = MaybeUninit::<DrmI915GemObject>::uninit();
+        let object_ptr = object.as_mut_ptr();
+        // SAFETY: object_ptr points into a writable MaybeUninit allocation and
+        // this exact field is initialized before either helper reads it.
+        unsafe { ptr::addr_of_mut!((*object_ptr).mm.pages).write(pages) };
+        // SAFETY: mm.pages is initialized above and both helpers read only that field.
+        let api = unsafe { i915_gem_object_has_pages(object_ptr) };
+        // SAFETY: same initialized field and lifetime; the header helper delegates
+        // to the API helper so both public inline surfaces share semantics.
+        let header = unsafe {
+            i915_gem_object_header_upstream::i915_gem_object_has_pages(object_ptr)
+        };
+        (api, header)
+    }
+
+    #[test]
+    fn has_pages_rejects_null_and_error_pointers_but_accepts_an_sg_table() {
+        assert_eq!(has_pages_in_both_inline_helpers(ptr::null_mut()), (false, false));
+        let error = crate::linux_config::ERR_PTR::<SgTable>(-12);
+        assert_eq!(has_pages_in_both_inline_helpers(error), (false, false));
+
+        // A stack SG record is a non-null, non-error pointer with a plausible
+        // first entry; the predicate must accept it without dereferencing it.
+        let mut page_storage = [0u64; 1];
+        let mut scatterlist = Scatterlist {
+            page_link: page_storage.as_mut_ptr().cast::<u8>() as usize,
+            offset: 0,
+            length: 4096,
+            dma_address: 0,
+            dma_length: 4096,
+            _dma_flags_or_padding: 0,
+        };
+        let mut table = SgTable {
+            sgl: &mut scatterlist,
+            nents: 1,
+            orig_nents: 1,
+        };
+        assert_eq!(has_pages_in_both_inline_helpers(&mut table), (true, true));
+    }
 }

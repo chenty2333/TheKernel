@@ -14,7 +14,7 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{DeviceId, Location, NodeFlags, VfsResult};
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
-use linux_raw_sys::general::{O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY, S_IFCHR};
+use linux_raw_sys::general::{O_ACCMODE, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, S_IFCHR};
 
 use crate::{
     drm::{DrmDevice, DrmFile},
@@ -292,9 +292,10 @@ struct DrmFileAdapter {
 
 impl DrmFileAdapter {
     fn new(file: DrmFile, render: bool, flags: u32) -> Self {
+        file.set_open_flags(flags);
         Self {
             file,
-            nonblocking: AtomicBool::new(false),
+            nonblocking: AtomicBool::new(flags & O_NONBLOCK != 0),
             render,
             access_mode: flags & O_ACCMODE,
         }
@@ -449,6 +450,7 @@ impl FileLike for DrmFileAdapter {
 
     fn set_nonblocking(&self, nonblocking: bool) -> AxResult<()> {
         self.nonblocking.store(nonblocking, Ordering::Release);
+        self.file.set_nonblocking_flag(nonblocking);
         Ok(())
     }
 }

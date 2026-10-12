@@ -99,6 +99,18 @@ pub fn call_rcu(head: *mut RcuHead, callback: unsafe extern "C" fn(*mut RcuHead)
     }
 }
 
+/// Cross-crate LinuxKPI entry used by native DRM fence wrappers whose final
+/// put may happen from an upstream callback or another non-sleepable context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thekernel_call_rcu(
+    head: *mut RcuHead,
+    callback: Option<unsafe extern "C" fn(*mut RcuHead)>,
+) {
+    if let Some(callback) = callback {
+        call_rcu(head, callback);
+    }
+}
+
 pub fn rcu_barrier() {
     while RCU_PENDING.load(Ordering::Acquire) != 0 {
         axtask::yield_now();

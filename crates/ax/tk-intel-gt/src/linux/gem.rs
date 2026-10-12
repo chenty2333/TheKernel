@@ -5,22 +5,20 @@
 use core::{
     ffi::{c_char, c_int, c_long, c_ulong, c_void},
     mem::{align_of, offset_of, size_of},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use crate::{
     i915_gem_context_types_upstream::I915GemContext,
-    intel_context_types_upstream::File,
-    linux_i915_private::Inode,
     i915_gem_ww_upstream::WwAcquireCtx,
-    intel_context_upstream::{DrmGemObjectBaseLayout, DrmVmaOffsetNode, Kref},
-    intel_engine_cs_upstream::ListHead,
-    linux_i915_private::DrmVmaOffsetManager,
+    intel_context_types_upstream::File,
+    intel_context_upstream::{DmaFence, DrmGemObjectBaseLayout, DrmVmaOffsetNode, Kref},
+    intel_engine_cs_upstream::{ListHead, Spinlock},
     linux::ww_mutex::{
         WwMutex, ww_mutex_lock, ww_mutex_lock_slow, ww_mutex_trylock, ww_mutex_unlock,
     },
+    linux_i915_private::{DrmVmaOffsetManager, Inode},
 };
-
-use crate::intel_context_upstream::DmaFence;
 
 /// The C type name used by DRM/i915 call sites for the 480-byte base union.
 /// Accessed `drm_gem_object` fields use the Linux 7.2.3 x86_64 record layout;
@@ -117,11 +115,7 @@ unsafe extern "C" {
     #[link_name = "dma_resv_fini"]
     fn __dma_resv_fini(resv: *mut DmaResv);
     #[link_name = "dma_resv_get_singleton"]
-    fn __dma_resv_get_singleton(
-        resv: *mut DmaResv,
-        usage: i32,
-        fence: *mut *mut DmaFence,
-    ) -> i32;
+    fn __dma_resv_get_singleton(resv: *mut DmaResv, usage: i32, fence: *mut *mut DmaFence) -> i32;
     #[link_name = "dma_resv_wait_timeout"]
     fn __dma_resv_wait_timeout(
         resv: *mut DmaResv,
@@ -195,6 +189,28 @@ pub unsafe fn dma_resv_lock_slow_interruptible(resv: *mut c_void, ctx: *mut WwAc
 pub unsafe fn dma_resv_unlock(resv: *mut c_void) {
     let lock = unsafe { core::ptr::addr_of_mut!((*resv.cast::<DmaResv>()).lock) };
     unsafe { ww_mutex_unlock(lock) };
+}
+
+/// Cross-crate native DRM helper: acquire a Linux reservation without a WW
+/// context when publishing a native KMS fence. The helper's caller must pair
+/// this with `thekernel_dma_resv_unlock` on every success/error path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thekernel_dma_resv_lock(resv: *mut c_void) -> i32 {
+    unsafe { dma_resv_lock(resv, core::ptr::null_mut(), false, false) }
+}
+
+/// Try-acquire helper used by native cross-layer transactions. Multi-object
+/// callers always release all acquired reservations on contention instead of
+/// sleeping while holding a prefix with a conflicting i915 WW lock order.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thekernel_dma_resv_trylock(resv: *mut c_void) -> i32 {
+    unsafe { dma_resv_lock(resv, core::ptr::null_mut(), false, true) }
+}
+
+/// Cross-crate pair for `thekernel_dma_resv_lock`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thekernel_dma_resv_unlock(resv: *mut c_void) {
+    unsafe { dma_resv_unlock(resv) };
 }
 
 /// The `struct drm_device` member used by `drm_dev_to_dev()`.
@@ -288,19 +304,25 @@ pub unsafe fn ttm_device_dev_mapping(bdev: *mut core::ffi::c_void) -> *mut core:
 /// alternate arm of the GEM object's base union, at the same address.
 #[cfg(feature = "upstream-gt")]
 #[inline]
-pub unsafe fn i915_gem_to_ttm(obj: *mut crate::i915_gem_object_types_upstream::DrmI915GemObject) -> *mut TtmBufferObjectLayout {
+pub unsafe fn i915_gem_to_ttm(
+    obj: *mut crate::i915_gem_object_types_upstream::DrmI915GemObject,
+) -> *mut TtmBufferObjectLayout {
     unsafe { core::ptr::addr_of_mut!((*obj).base.__do_not_access).cast() }
 }
 
-/// Source-layout prefix through `drm_file::driver_priv`, the member used by
-/// GEM handle close paths. Later DRM file fields are not accessed here.
+/// Linux 7.2.3 `struct drm_file` prefix through `driver_priv`.
+///
+/// Keep this canonical view shared by i915 paths that inspect DRM object
+/// handles, per-file driver data, or the backing `struct file`.
 #[repr(C)]
 pub struct DrmFile {
     _before_minor: [u8; 72],
     pub minor: *mut DrmMinor,
     pub object_idr: [u8; 24],
+    pub table_lock: Spinlock,
+    _syncobj_xa_alignment: u32,
+    pub(crate) _syncobj_xa: [u64; 2],
     pub filp: *mut crate::linux::shmem::File,
-    _before_driver_priv: [u8; 24],
     pub driver_priv: *mut core::ffi::c_void,
     _tail: [u8; 224],
 }
@@ -313,9 +335,109 @@ pub struct DrmMinor {
     pub dev: *mut core::ffi::c_void,
 }
 
+/// Serialize access to the canonical Linux `drm_file.object_idr` while a
+/// caller updates the GEM handle table.
+///
+/// # Safety
+/// `file` must be a live, initialized `DrmFile` held for the lock lifetime.
+pub unsafe fn drm_file_table_lock(file: *mut DrmFile) {
+    unsafe { crate::linux::locks::spin_lock(&mut (*file).table_lock) };
+}
+
+/// Unlock the canonical Linux `drm_file.object_idr` table lock.
+///
+/// # Safety
+/// `file` must be live and its `table_lock` must be held by the current CPU.
+pub unsafe fn drm_file_table_unlock(file: *mut DrmFile) {
+    unsafe { crate::linux::locks::spin_unlock(&mut (*file).table_lock) };
+}
+
+/// Add the object reference and per-object handle count for one IDR handle.
+/// All caller-side IDR modifications must use `drm_file_table_lock` and the
+/// backend's IDR serialization gate.
+///
+/// # Safety
+/// `object` must be a live DRM GEM object with an owned reference.
+pub unsafe fn drm_gem_handle_get(object: *mut DrmGemObject) -> Result<(), i32> {
+    if object.is_null() {
+        return Err(-22);
+    }
+    let count =
+        unsafe { AtomicU32::from_ptr(object.cast::<u8>().add(size_of::<Kref>()).cast::<u32>()) };
+    if count
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .is_err()
+    {
+        return Err(-24);
+    }
+    unsafe { crate::linux_memory::kref_get(&mut (*object).refcount) };
+    Ok(())
+}
+
+/// Drop the object reference and handle count previously acquired by
+/// `drm_gem_handle_get`.
+///
+/// # Safety
+/// `object` must have a live GEM reference corresponding to one handle.
+pub unsafe fn drm_gem_handle_put(object: *mut DrmGemObject) {
+    unsafe extern "C" fn release(refcount: *mut Kref) {
+        unsafe { crate::linux::drm_core::drm_gem_object_free(refcount.cast()) };
+    }
+    let count =
+        unsafe { AtomicU32::from_ptr(object.cast::<u8>().add(size_of::<Kref>()).cast::<u32>()) };
+    count
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_sub(1)
+        })
+        .expect("GEM handle count underflow");
+    unsafe { crate::linux_memory::kref_put(&mut (*object).refcount, release) };
+}
+
+#[repr(C)]
+struct DrmGemObjectFuncsPrefix {
+    free: *const c_void,
+    open: *const c_void,
+    close: *const c_void,
+}
+
+/// Run the optional object-specific DRM open hook after publishing a handle.
+///
+/// # Safety
+/// `object` and `file` must be live Linux DRM objects; the caller must already
+/// have installed the handle and retained its object reference.
+pub unsafe fn drm_gem_object_open(object: *mut DrmGemObject, file: *mut DrmFile) -> c_int {
+    let funcs = unsafe { (*object).funcs.cast::<DrmGemObjectFuncsPrefix>() };
+    if funcs.is_null() || unsafe { (*funcs).open.is_null() } {
+        return 0;
+    }
+    let open: unsafe extern "C" fn(*mut DrmGemObject, *mut DrmFile) -> c_int =
+        unsafe { core::mem::transmute((*funcs).open) };
+    unsafe { open(object, file) }
+}
+
+/// Run the optional object-specific DRM close hook before dropping a handle.
+///
+/// # Safety
+/// `object` and `file` must be live Linux DRM objects; the caller must already
+/// have removed this handle from the file's IDR while retaining its object ref.
+pub unsafe fn drm_gem_object_close(object: *mut DrmGemObject, file: *mut DrmFile) {
+    let funcs = unsafe { (*object).funcs.cast::<DrmGemObjectFuncsPrefix>() };
+    if funcs.is_null() || unsafe { (*funcs).close.is_null() } {
+        return;
+    }
+    let close: unsafe extern "C" fn(*mut DrmGemObject, *mut DrmFile) =
+        unsafe { core::mem::transmute((*funcs).close) };
+    unsafe { close(object, file) };
+}
+
+
 const _: [(); 72] = [(); offset_of!(DrmFile, minor)];
 const _: [(); 80] = [(); offset_of!(DrmFile, object_idr)];
-const _: [(); 104] = [(); offset_of!(DrmFile, filp)];
+const _: [(); 104] = [(); offset_of!(DrmFile, table_lock)];
+const _: [(); 112] = [(); offset_of!(DrmFile, _syncobj_xa)];
+const _: [(); 128] = [(); offset_of!(DrmFile, filp)];
 const _: [(); 136] = [(); offset_of!(DrmFile, driver_priv)];
 const _: [(); 368] = [(); size_of::<DrmFile>()];
 const _: [(); 16] = [(); offset_of!(DrmMinor, dev)];
@@ -358,17 +480,21 @@ const _: [(); 16] = [(); offset_of!(I915LutHandle, ctx)];
 const _: [(); 24] = [(); offset_of!(I915LutHandle, handle)];
 
 // upstream: drm_vma_manager.h drm_vma_offset_lock_lookup()
-pub unsafe fn drm_vma_offset_lock_lookup(manager:*mut DrmVmaOffsetManager) {
-    unsafe {crate::linux::locks::read_lock(manager.cast())};
+pub unsafe fn drm_vma_offset_lock_lookup(manager: *mut DrmVmaOffsetManager) {
+    unsafe { crate::linux::locks::read_lock(manager.cast()) };
 }
 // upstream: drm_vma_manager.h drm_vma_offset_unlock_lookup()
-pub unsafe fn drm_vma_offset_unlock_lookup(manager:*mut DrmVmaOffsetManager) {
-    unsafe {crate::linux::locks::read_unlock(manager.cast())};
+pub unsafe fn drm_vma_offset_unlock_lookup(manager: *mut DrmVmaOffsetManager) {
+    unsafe { crate::linux::locks::read_unlock(manager.cast()) };
 }
 // The configured Linux 7.2.3 C probe has CONFIG_TRANSPARENT_HUGEPAGE=n:
 // drm_device has no huge_mnt field in this ABI. Preserve the actual MIT header
 // branches instead of inventing a mount or an unmeasured field offset.
 // upstream: drm_gem.h drm_gem_get_huge_mnt()
-pub fn drm_gem_get_huge_mnt<T,U>(_dev:*mut T)->*mut U {core::ptr::null_mut()}
+pub fn drm_gem_get_huge_mnt<T, U>(_dev: *mut T) -> *mut U {
+    core::ptr::null_mut()
+}
 // upstream: drm_gem.h drm_gem_huge_mnt_create()
-pub fn drm_gem_huge_mnt_create<T>(_dev:*mut T,_value:*const c_char)->c_int {0}
+pub fn drm_gem_huge_mnt_create<T>(_dev: *mut T, _value: *const c_char) -> c_int {
+    0
+}

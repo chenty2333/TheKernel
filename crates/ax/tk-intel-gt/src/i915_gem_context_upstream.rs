@@ -415,22 +415,15 @@ unsafe fn context_registry(i915: *mut DrmI915Private) -> *mut I915ClientContexts
 }
 
 unsafe fn scheduler_caps(i915: *mut DrmI915Private) -> u32 {
-    // i915_drv.h places intel_driver_caps immediately after runtime_info.
-    let offset =
-        offset_of!(DrmI915Private, runtime) + size_of::<crate::linux::i915::IntelRuntimeInfo>();
-    unsafe { *i915.cast::<u8>().add(offset).cast::<u32>() }
+    unsafe { (*i915).caps.scheduler }
 }
 
 pub(crate) unsafe fn set_has_logical_contexts(i915: *mut DrmI915Private) {
-    let offset =
-        offset_of!(DrmI915Private, runtime) + size_of::<crate::linux::i915::IntelRuntimeInfo>() + 4;
-    unsafe { *i915.cast::<u8>().add(offset) = 1 };
+    unsafe { (*i915).caps.has_logical_contexts = true };
 }
 
 unsafe fn has_logical_contexts(i915: *mut DrmI915Private) -> bool {
-    let offset =
-        offset_of!(DrmI915Private, runtime) + size_of::<crate::linux::i915::IntelRuntimeInfo>() + 4;
-    unsafe { *i915.cast::<u8>().add(offset) != 0 }
+    unsafe { (*i915).caps.has_logical_contexts }
 }
 
 unsafe fn i915_vm_get(vm: *mut I915AddressSpace) -> *mut I915AddressSpace {

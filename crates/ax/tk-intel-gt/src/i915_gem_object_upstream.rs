@@ -78,6 +78,12 @@ fn cond_resched_lock(lock: &mut Spinlock) -> bool {
     unsafe { __cond_resched_lock(lock) != 0 }
 }
 
+/// Recover a containing record from a member pointer and a byte offset.
+#[inline]
+fn container_of_byte_offset<T, U>(member: *mut U, offset: usize) -> *mut T {
+    member.cast::<u8>().wrapping_sub(offset).cast::<T>()
+}
+
 // Linux i915 GEM allocation cache and the private GEM object callback table.
 // The table layout is supplied by the surrounding DRM integration binding.
 static mut slab_objects: *mut c_void = core::ptr::null_mut();
@@ -181,11 +187,11 @@ unsafe fn rbtree_postorder_for_each_entry_safe<T>(
     let mut node = rb_first_postorder(root);
     while !node.is_null() {
         let next_node = rb_next_postorder(node);
-        let entry = node.wrapping_sub(member_offset) as *mut T;
+        let entry = container_of_byte_offset::<T, _>(node, member_offset);
         let next = if next_node.is_null() {
             core::ptr::null_mut()
         } else {
-            next_node.wrapping_sub(member_offset) as *mut T
+            container_of_byte_offset::<T, _>(next_node, member_offset)
         };
         body(entry, next);
         node = next_node;
@@ -372,7 +378,7 @@ unsafe extern "C" fn i915_gem_close_object(gem: *mut DrmGemObject, file: *mut Dr
     let mut cursor = (*head).next;
     while cursor != head {
         let next_link = (*cursor).next;
-        let lut = cursor.wrapping_sub(member_offset) as *mut I915LutHandle;
+        let lut = container_of_byte_offset::<I915LutHandle, _>(cursor, member_offset);
         let ctx = (*lut).ctx;
 
         if !ctx.is_null() && (*ctx).file_priv == fpriv.cast::<DrmI915FilePrivate>() {
@@ -536,20 +542,27 @@ pub unsafe fn __i915_gem_free_object(obj: *mut DrmI915GemObject) {
     __i915_gem_object_fini(obj);
 }
 
+// Walk the detached list before invoking disposal, which may invalidate the node.
+unsafe fn for_each_freed_object(
+    mut node: *mut LlistNode,
+    mut dispose: impl FnMut(*mut DrmI915GemObject),
+) {
+    let member_offset = core::mem::offset_of!(DrmI915GemObject, rcu_or_freed.freed);
+    while !node.is_null() {
+        let next = unsafe { (*node).next };
+        let obj = container_of_byte_offset::<DrmI915GemObject, _>(node, member_offset);
+        dispose(obj);
+        node = next;
+    }
+}
+
 // upstream: i915_gem_object.c __i915_gem_free_objects()
 unsafe fn __i915_gem_free_objects(i915: *mut DrmI915Private, freed: *mut LlistNode) {
-    let member_offset = core::mem::offset_of!(DrmI915GemObject, rcu_or_freed.freed);
-    let mut node = freed;
-
-    while !node.is_null() {
-        let next = (*node).next;
-        let obj = node.wrapping_sub(member_offset) as *mut DrmI915GemObject;
-
+    unsafe { for_each_freed_object(freed, |obj| {
         might_sleep();
         if let Some(delayed_free) = (*(*obj).ops).delayed_free {
             delayed_free(obj);
-            node = next;
-            continue;
+            return;
         }
 
         __i915_gem_object_pages_fini(obj);
@@ -561,8 +574,7 @@ unsafe fn __i915_gem_free_objects(i915: *mut DrmI915Private, freed: *mut LlistNo
             __i915_gem_free_object_rcu,
         );
         cond_resched();
-        node = next;
-    }
+    }) };
     let _ = i915;
 }
 
@@ -1014,4 +1026,113 @@ pub unsafe fn i915_gem_object_has_unknown_state(obj: *mut DrmI915GemObject) -> b
     // Pairs with dma_fence_signal() in __memcpy_work().
     smp_rmb();
     (*obj).mm.unknown_state
+}
+
+#[cfg(test)]
+mod pointer_offset_tests {
+    use super::*;
+    use alloc::boxed::Box;
+    use crate::i915_gem_object_types_upstream::{DrmI915GemObjectOps, I915MmapOffset};
+    use core::mem::{MaybeUninit, offset_of};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static FREED_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static FREED_FIRST: AtomicUsize = AtomicUsize::new(0);
+    static FREED_SECOND: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn record_delayed_free(obj: *mut DrmI915GemObject) {
+        match FREED_COUNT.fetch_add(1, Ordering::Relaxed) {
+            0 => FREED_FIRST.store(obj as usize, Ordering::Relaxed),
+            1 => FREED_SECOND.store(obj as usize, Ordering::Relaxed),
+            _ => {}
+        }
+    }
+
+    static DELAYED_FREE_OPS: DrmI915GemObjectOps = DrmI915GemObjectOps {
+        flags: 0,
+        get_pages: None,
+        put_pages: None,
+        truncate: None,
+        shrink: None,
+        pread: None,
+        pwrite: None,
+        mmap_offset: None,
+        unmap_virtual: None,
+        dmabuf_export: None,
+        adjust_lru: None,
+        delayed_free: Some(record_delayed_free),
+        migrate: None,
+        release: None,
+        mmap_ops: core::ptr::null(),
+        name: core::ptr::null(),
+    };
+
+    #[test]
+    fn freed_objects_walk_uses_byte_offsets_for_real_llist_members() {
+        let mut first_storage = Box::new(MaybeUninit::<DrmI915GemObject>::uninit());
+        let mut second_storage = Box::new(MaybeUninit::<DrmI915GemObject>::uninit());
+        let first = first_storage.as_mut_ptr();
+        let second = second_storage.as_mut_ptr();
+        let first_node = unsafe {
+            core::ptr::addr_of_mut!((*first).rcu_or_freed.freed).cast::<LlistNode>()
+        };
+        let second_node = unsafe {
+            core::ptr::addr_of_mut!((*second).rcu_or_freed.freed).cast::<LlistNode>()
+        };
+        let offset = offset_of!(DrmI915GemObject, rcu_or_freed.freed);
+
+        assert_eq!(offset, 592);
+        unsafe {
+            (*first).ops = &DELAYED_FREE_OPS;
+            (*second).ops = &DELAYED_FREE_OPS;
+            (*first_node).next = second_node;
+            (*second_node).next = core::ptr::null_mut();
+        }
+
+        FREED_FIRST.store(0, Ordering::Relaxed);
+        FREED_SECOND.store(0, Ordering::Relaxed);
+        FREED_COUNT.store(0, Ordering::Relaxed);
+        // Exercise the exact production traversal without linking the hardware
+        // disposal backends into a host unit test.
+        unsafe {
+            for_each_freed_object(first_node, |object| {
+                ((*(*object).ops).delayed_free.unwrap())(object);
+                // The iterator must have saved next before disposal changes it.
+                (*core::ptr::addr_of_mut!((*object).rcu_or_freed.freed).cast::<LlistNode>()).next = core::ptr::null_mut();
+            });
+        };
+
+        assert_eq!(FREED_COUNT.load(Ordering::Relaxed), 2);
+        assert_eq!(FREED_FIRST.load(Ordering::Relaxed), first as usize);
+        assert_eq!(FREED_SECOND.load(Ordering::Relaxed), second as usize);
+    }
+
+    #[test]
+    fn mmap_postorder_walk_recovers_nonzero_offset_entry() {
+        let mut storage = MaybeUninit::<I915MmapOffset>::uninit();
+        let entry = storage.as_mut_ptr();
+        let node = unsafe { core::ptr::addr_of_mut!((*entry).offset) };
+        let offset = offset_of!(I915MmapOffset, offset);
+        let mut root = RbRoot { node };
+        unsafe {
+            (*node).parent_color = 0;
+            (*node).right = core::ptr::null_mut();
+            (*node).left = core::ptr::null_mut();
+        }
+        let mut seen: *mut I915MmapOffset = core::ptr::null_mut();
+
+        assert_ne!(offset, 0);
+        unsafe {
+            rbtree_postorder_for_each_entry_safe::<I915MmapOffset>(
+                &mut root,
+                offset,
+                |current, next| {
+                    assert!(seen.is_null());
+                    assert!(next.is_null());
+                    seen = current;
+                },
+            )
+        };
+        assert_eq!(seen, entry);
+    }
 }

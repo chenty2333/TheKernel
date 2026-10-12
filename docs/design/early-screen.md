@@ -13,6 +13,18 @@ that machine does not have.
 This document states what now reports, which page-table mapping the screen writes through
 at each point, what the panic path relies on, and what is still invisible.
 
+For physical bring-up, `boot.progress=1` adds filesystem ownership, GPT,
+rootfs-callback, network, display, and input checkpoints. Rootfs callbacks
+also log their slot and function address, which must be resolved against the
+unstripped ELF from that exact build. Intel display admission failures log
+their source location without relaxing the admission checks.
+
+`panic=halt` keeps a fatal boot stopped instead of entering the normal power-off
+path. The panic screen and emergency diagnostic output run first, and an
+installed crash-kexec hook still takes precedence. This does not guarantee a
+visible picture if the framebuffer mapping or display hardware is unavailable.
+Without this explicit option, the existing power-off policy is unchanged.
+
 ---
 
 ## 1. What draws, and where it lives

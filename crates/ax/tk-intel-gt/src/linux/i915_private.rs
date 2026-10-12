@@ -59,6 +59,26 @@ pub struct DrmDevicePrefix {
     _tail: [u8; 44],
 }
 
+impl DrmDevicePrefix {
+    /// Initialize the DRM-core identity before any i915 probe reader runs.
+    /// The parent and the GEM resources must outlive this device.
+    pub fn initialize(
+        &mut self,
+        parent: *mut c_void,
+        driver: *mut c_void,
+        inode: *mut Inode,
+        manager: *mut DrmVmaOffsetManager,
+    ) {
+        self.refcount.refcount.refs.counter = 1;
+        self.dev = parent;
+        self.dma_dev = parent;
+        self.driver = driver;
+        self.anon_inode = inode;
+        self.vma_offset_manager = manager;
+        self.switch_power_state = 0; // DRM_SWITCH_POWER_ON
+    }
+}
+
 pub const DRM_DEVICE_SIZE: usize = 1552;
 
 /// Complete `struct i915_params` member sequence from i915_params.h.
@@ -113,7 +133,8 @@ pub struct DrmI915Private {
     pub params: I915Params,
     pub info: *const c_void,
     pub runtime: IntelRuntimeInfo,
-    _before_uncore: [u8; 148],
+    pub caps: crate::intel_device_info_types_upstream::IntelDriverCaps,
+    _before_uncore: [u8; 140],
     /// Embedded `struct intel_uncore uncore` (offset 1840, size 352).
     pub uncore: [u8; 352],
     _before_irqs_enabled: [u8; 204],
@@ -259,3 +280,5 @@ const _: [(); 1672] = [(); size_of::<TtmDevice>()];
 const _: [(); 40] = [(); size_of::<I915GpuError>()];
 const _: [(); 104] = [(); size_of::<IntelRuntimePmPrefix>()];
 const _: [(); 40] = [(); offset_of!(IntelRuntimePmPrefix, userfault_wakeref)];
+
+const _: [(); 1692] = [(); offset_of!(DrmI915Private, caps)];

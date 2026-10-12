@@ -561,6 +561,72 @@ class SystemTestGateTests(unittest.TestCase):
             with patch.dict(os.environ, {"AX_LOG": "debug", "AX_BACKTRACE": "n", "RUSTFLAGS": ""}):
                 self.assertNotEqual(before, product.artifact_input_key(artifacts, None, "module"))
 
+    def test_n305_backtrace_default_matches_build_and_reuse_settings(self) -> None:
+        product = load_product()
+        with test_tmpdir() as directory:
+            artifacts = product.Artifacts(Path(directory), product.Variant("2G"),
+                                          "shell", product.machine_profile("n305"))
+            artifacts.rootfs.parent.mkdir(parents=True)
+            artifacts.rootfs.write_bytes(b"rootfs")
+            with patch.dict(os.environ, {"AX_BACKTRACE": ""}):
+                env = product.command_env(artifacts)
+                self.assertEqual(env["AX_BACKTRACE"], "y")
+                self.assertEqual(env["DWARF"], "y")
+                self.assertIn("axfeat/dwarf", product.kernel_features(artifacts))
+                default = product.artifact_input_key(artifacts, None, "module")
+            with patch.dict(os.environ, {"AX_BACKTRACE": "y"}):
+                self.assertEqual(default, product.artifact_input_key(artifacts, None, "module"))
+            with patch.dict(os.environ, {"AX_BACKTRACE": "n"}):
+                env = product.command_env(artifacts)
+                self.assertEqual(env["AX_BACKTRACE"], "n")
+                self.assertEqual(env["DWARF"], "n")
+                self.assertNotIn("axfeat/dwarf", product.kernel_features(artifacts))
+                self.assertNotEqual(default, product.artifact_input_key(artifacts, None, "module"))
+
+    def test_dwarf_embedding_replaces_allocated_sections_after_symbol_strip(self) -> None:
+        product = load_product()
+        from types import SimpleNamespace
+
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            source = root / "cargo-elf"
+            output = root / "kernel"
+            source.write_bytes(b"source ELF")
+            section_headers = "\n".join(
+                f"  [ {index}] {name} PROGBITS 0000000000000000 000000 000010 00  0 0 1"
+                for index, name in enumerate((".debug_abbrev", ".debug_info", ".debug_line",
+                                               ".debug_str", ".debug_rnglists"), 1)
+            )
+            commands = []
+
+            def execute(argv, **_kwargs):
+                commands.append(argv)
+                if "--dump-section" in argv:
+                    for option, section in zip(argv[1::2], argv[2::2]):
+                        if option != "--dump-section":
+                            continue
+                        _, destination = section.split("=", 1)
+                        Path(destination).write_bytes(b"linked DWARF")
+                else:
+                    Path(argv[-1]).write_bytes(b"stripped ELF with loadable DWARF")
+
+            with patch.object(product.shutil, "which", return_value="readelf"), \
+                    patch.object(product.subprocess, "run", return_value=SimpleNamespace(
+                        returncode=0, stdout=section_headers, stderr="")), \
+                    patch.object(product, "run_checked", side_effect=execute):
+                product.embed_dwarf_sections(Path("objcopy"), source, output, root, {})
+
+            self.assertEqual(len(commands), 2)
+            self.assertIn("--strip-all", commands[1])
+            updated = [commands[1][index + 1]
+                       for index, arg in enumerate(commands[1][:-1])
+                       if arg == "--update-section"]
+            self.assertEqual(len(updated), 5)
+            self.assertEqual({item.split("=", 1)[0] for item in updated},
+                             {"debug_abbrev", "debug_info", "debug_line", "debug_str",
+                              "debug_rnglists"})
+            self.assertEqual(output.read_bytes(), b"stripped ELF with loadable DWARF")
+
     def test_rootfs_cache_tracks_explicit_uapi_header_locations(self) -> None:
         product = load_product()
         for name in ("THEKERNEL_MUSL_LINUX_UAPI_INCLUDE", "THEKERNEL_MUSL_LINUX_ARCH_INCLUDE"):

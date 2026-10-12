@@ -1324,6 +1324,11 @@ pub unsafe fn i915_gem_open(i915: *mut DrmI915Private, file: *mut c_void) -> c_i
     let ret = i915_gem_context_open(i915, file);
     if ret != 0 {
         i915_drm_client_put(client);
+        // `drm_file::driver_priv` is published before context-open, matching
+        // upstream's callback ordering. The DRM core may inspect/release the
+        // file after this callback fails, so clear the pointer before freeing
+        // its allocation rather than leaving a dangling per-file owner.
+        (*file.cast::<DrmFile>()).driver_priv = core::ptr::null_mut();
         kfree(file_priv.cast::<c_void>());
         return ret;
     }

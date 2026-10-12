@@ -216,6 +216,13 @@ pub unsafe extern "C" fn intel_renderstate_init(
     'retry: loop {
         err = unsafe { intel_context_pin_ww(ce, ptr::addr_of_mut!((*so).ww)) };
         if err != 0 {
+            // Linux `goto err_fini`: the EDEADLK backoff/retry also applies to a pin failure.
+            if err == -crate::linux_config::EDEADLK {
+                err = unsafe { i915_gem_ww_ctx_backoff(ptr::addr_of_mut!((*so).ww)) };
+                if err == 0 {
+                    continue 'retry;
+                }
+            }
             break;
         }
         if unsafe { (*so).rodata.is_null() } {

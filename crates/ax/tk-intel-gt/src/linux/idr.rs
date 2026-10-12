@@ -13,6 +13,13 @@ use crate::{
     },
 };
 
+// The source DRM `idr` is accessed by i915 under RCU while handles are added
+// and removed by other threads. This LinuxKPI implementation stores stable
+// slots in a BTreeMap rather than a lockless radix tree, so serialize slot
+// lookup/mutation and let the caller acquire the GEM reference before leaving
+// its surrounding RCU read-side section.
+static RADIX_SLOTS_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 /// Linux `struct ida` embeds one `struct xarray` as its complete ABI.
 #[repr(C)]
 pub struct Ida {
@@ -131,6 +138,7 @@ unsafe fn radix_release_if_empty(root: *mut RadixTreeRoot) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn radix_tree_destroy(root: *mut RadixTreeRoot) {
     assert!(!root.is_null());
+    let _guard = RADIX_SLOTS_LOCK.lock();
     unsafe {
         let rnode = (*root).rnode;
         if !rnode.is_null() {
@@ -151,6 +159,7 @@ pub unsafe extern "C" fn radix_tree_insert(
     if item.is_null() {
         return -EINVAL_ERRNO;
     }
+    let _guard = RADIX_SLOTS_LOCK.lock();
     let slots = unsafe { radix_slots_mut(root) };
     if slots
         .slots
@@ -167,6 +176,7 @@ pub unsafe extern "C" fn radix_tree_insert(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn radix_tree_lookup(root: *mut RadixTreeRoot, index: u64) -> *mut c_void {
     assert!(!root.is_null());
+    let _guard = RADIX_SLOTS_LOCK.lock();
     match unsafe { radix_slots_ref(root) } {
         Some(slots) => slots.slots.get(&index).map_or(core::ptr::null_mut(), |slot| **slot),
         None => core::ptr::null_mut(),
@@ -177,6 +187,7 @@ pub unsafe extern "C" fn radix_tree_lookup(root: *mut RadixTreeRoot, index: u64)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn radix_tree_delete(root: *mut RadixTreeRoot, index: u64) -> *mut c_void {
     assert!(!root.is_null());
+    let _guard = RADIX_SLOTS_LOCK.lock();
     match unsafe { radix_slots_ref(root) } {
         Some(_) => {
             let slots = unsafe { radix_slots_mut(root) };
@@ -201,6 +212,7 @@ pub unsafe extern "C" fn radix_tree_next_chunk(
     flags: u32,
 ) -> *mut *mut c_void {
     assert!(!root.is_null() && !iter.is_null());
+    let _guard = RADIX_SLOTS_LOCK.lock();
     if flags & RADIX_TREE_ITER_TAGGED != 0 {
         return core::ptr::null_mut();
     }
@@ -253,6 +265,7 @@ pub unsafe extern "C" fn radix_tree_iter_delete(
     slot: *mut *mut c_void,
 ) {
     assert!(!root.is_null() && !iter.is_null());
+    let _guard = RADIX_SLOTS_LOCK.lock();
     if unsafe { radix_slots_ref(root) }.is_none() {
         return;
     }
@@ -291,6 +304,7 @@ pub unsafe extern "C" fn idr_find(idr: *const c_void, id: c_ulong) -> *mut c_voi
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn idr_get_next(idr: *mut c_void, nextid: *mut c_int) -> *mut c_void {
     assert!(!idr.is_null() && !nextid.is_null());
+    let _guard = RADIX_SLOTS_LOCK.lock();
     let layout = idr.cast::<IdrLayout>();
     let base = unsafe { (*layout).base } as u64;
     let id = unsafe { *nextid } as u32 as u64;

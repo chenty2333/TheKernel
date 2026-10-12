@@ -6,6 +6,7 @@ use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 
 use axdriver_base::{DevError, DevResult};
 use axpoll::PollSet;
+use axsync::Mutex as TaskMutex;
 use crab_usb::{
     device::{Device, InterfaceSession},
     usb_if::{
@@ -1465,45 +1466,11 @@ impl UsbTransport for Transport {
         Ok(())
     }
     fn begin_command_transaction(&mut self) -> Result<(), Error> {
-        // A persistent event-IN request may already own the endpoint. Reap
-        // it first; otherwise cancel and wait for the exact request token
-        // before issuing the synchronous command-complete read.
-        self.reclaim_event()?;
-        if let Some(id) = self.event_request.take() {
-            if self.event.cancel(id).is_err() {
-                if let Some(completion) = self.host.reclaim(&self.event, id).map_err(|_| {
-                    self.host.halt();
-                    Error::NoDevice
-                })? {
-                    if completion.status != TransferStatus::Completed {
-                        return Err(Error::NoDevice);
-                    }
-                    self.event_ready = Some(completion.actual_length);
-                } else {
-                    self.host.halt();
-                    return Err(Error::NoDevice);
-                }
-            } else {
-                loop {
-                    if self.host.pump().is_err() {
-                        self.host.halt();
-                        return Err(Error::NoDevice);
-                    }
-                    if let Some(completion) = self.host.reclaim(&self.event, id).map_err(|_| {
-                        self.host.halt();
-                        Error::NoDevice
-                    })? {
-                        if completion.status != TransferStatus::Completed {
-                            return Err(Error::NoDevice);
-                        }
-                        self.event_ready = Some(completion.actual_length);
-                        break;
-                    }
-                    core::hint::spin_loop();
-                }
-            }
-        }
-        Ok(())
+        // The HCI owner serializes commands and the receive pump. Keep an
+        // outstanding event-IN TD: it is the correct destination for this
+        // command's response. xHCI cancel() only marks a TD, so waiting for
+        // cancellation on a quiet IN endpoint can otherwise spin forever.
+        self.reclaim_event()
     }
     fn end_command_transaction(&mut self) {
         let _ = self.submit_event();
@@ -1517,6 +1484,20 @@ impl UsbTransport for Transport {
     }
     // upstream: ng_ubt.c ubt_intr_read_callback()
     fn read_interrupt_event(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        if self.event_ready.is_none() {
+            self.submit_event()?;
+            let id = self.event_request.ok_or(Error::NoDevice)?;
+            let completion = self
+                .host
+                .wait(self.event.wait_submitted(id))
+                .map_err(|_| Error::NoDevice)?;
+            self.event_request = None;
+            let completion = completion.map_err(|_| Error::NoDevice)?;
+            if completion.status != TransferStatus::Completed {
+                return Err(Error::NoDevice);
+            }
+            self.event_ready = Some(completion.actual_length);
+        }
         if let Some(length) = self.event_ready.take() {
             if length > out.len() {
                 return Err(Error::Truncated);
@@ -1524,9 +1505,7 @@ impl UsbTransport for Transport {
             out[..length].copy_from_slice(&self.event_buffer[..length]);
             return Ok(length);
         }
-        self.host
-            .transfer(&self.event, TransferRequest::interrupt_in(out))
-            .map_err(|_| Error::NoDevice)
+        Err(Error::NoDevice)
     }
     // upstream: ng_ubt.c ubt_bulk_read_callback()
     fn read_bulk_acl(&mut self, out: &mut [u8]) -> Result<usize, Error> {
@@ -1588,11 +1567,13 @@ impl UsbTransport for Transport {
     }
 }
 
-pub type RegisteredHci = Arc<Mutex<UsbBluetoothHci>>;
+// Firmware file reads and HCI operations may block. A competing receive task
+// must sleep rather than spin on the BSP while the owning task is suspended.
+pub type RegisteredHci = Arc<TaskMutex<UsbBluetoothHci>>;
 static DEVICES: spin::Once<Mutex<Vec<RegisteredHci>>> = spin::Once::new();
 pub(super) fn register(device: UsbBluetoothHci) {
     let intel = device.family_hint != tk_bt_hci::DeviceFamily::Unknown;
-    let Ok(device) = Arc::try_new(Mutex::new(device)) else {
+    let Ok(device) = Arc::try_new(TaskMutex::new(device)) else {
         warn!("USB Bluetooth adapter registry allocation failed");
         return;
     };
@@ -1604,7 +1585,9 @@ pub(super) fn register(device: UsbBluetoothHci) {
     let receive_device = device.clone();
     if let Err(error) = axtask::spawn(move || {
         loop {
-            match receive_device.lock().pump_receive() {
+            // Never keep the adapter guard through the idle sleep below.
+            let received = receive_device.lock().pump_receive();
+            match received {
                 Ok(true) => {
                     readiness.wake();
                 }

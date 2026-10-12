@@ -57,23 +57,33 @@ const MAX_ROWS: usize = 128;
 /// Columns of text one frame may address, for the same reason as [`MAX_ROWS`].
 const MAX_COLS: usize = 512;
 
+/// The UHD framebuffer is normally reduced to 1920x1080 by inexpensive
+/// capture devices. Triple the early font so its 8x16 source bitmap occupies
+/// 12x24 captured pixels after the 2:1 reduction.
+const UHD_WIDTH: u32 = 3840;
+const UHD_HEIGHT: u32 = 2160;
+const UHD_GLYPH_SCALE: usize = 3;
+
 /// Bytes of the kernel log tail one frame reads.
 const TAIL_BYTES: usize = 4096;
 
 /// Bytes of panic message text one frame formats.
 const MESSAGE_BYTES: usize = 2048;
 
-/// Bytes of backtrace text one frame formats.
-const TRACE_BYTES: usize = 2048;
+/// Bytes of backtrace text one frame formats. Keep this as a fixed stack
+/// buffer large enough for many address frames without allocating on panic.
+const TRACE_BYTES: usize = 4096;
 
 /// Longest status line one frame composes.
 const STATUS_BYTES: usize = 128;
 
-/// Rows of panic message shown before the log tail is protected.
-const MESSAGE_ROWS: usize = 8;
+/// Rows reserved for the panic's first line and multiline fault/register detail.
+/// The message buffer fits within this many rows at UHD capture geometry.
+const MESSAGE_ROWS: usize = 16;
 
-/// Rows of backtrace shown before the log tail is protected.
-const TRACE_ROWS: usize = 6;
+/// Maximum backtrace rows; surface height and the protected log tail provide
+/// the tighter bound on ordinary displays.
+const TRACE_ROWS: usize = MAX_ROWS;
 
 /// Rows of log tail a frame always tries to keep.
 ///
@@ -247,12 +257,30 @@ struct TextView {
 }
 
 impl TextView {
+    /// Keep the established pixel font on smaller displays; enlarge only the
+    /// UHD path used by the 2:1 4K-to-1080p capture route.
+    fn glyph_scale(&self) -> usize {
+        if self.width >= UHD_WIDTH && self.height >= UHD_HEIGHT {
+            UHD_GLYPH_SCALE
+        } else {
+            1
+        }
+    }
+
+    fn cell_width(&self) -> usize {
+        GLYPH_WIDTH * self.glyph_scale()
+    }
+
+    fn cell_height(&self) -> usize {
+        GLYPH_HEIGHT * self.glyph_scale()
+    }
+
     fn cols(&self) -> usize {
-        (self.width as usize / GLYPH_WIDTH).min(MAX_COLS)
+        (self.width as usize / self.cell_width()).min(MAX_COLS)
     }
 
     fn rows(&self) -> usize {
-        (self.height as usize / GLYPH_HEIGHT).min(MAX_ROWS)
+        (self.height as usize / self.cell_height()).min(MAX_ROWS)
     }
 
     /// The encoded bytes of one pixel, or `None` for a layout this renderer
@@ -336,12 +364,15 @@ impl TextView {
             return;
         };
         let bits = glyph(byte);
-        let x0 = col * GLYPH_WIDTH;
-        let y0 = row * GLYPH_HEIGHT;
-        for dy in 0..GLYPH_HEIGHT {
-            let line = bits.map_or(0, |rows| rows[dy]);
-            for dx in 0..GLYPH_WIDTH {
-                let pattern = if line & (0x80 >> dx) != 0 {
+        let scale = self.glyph_scale();
+        let cell_width = GLYPH_WIDTH * scale;
+        let cell_height = GLYPH_HEIGHT * scale;
+        let x0 = col * cell_width;
+        let y0 = row * cell_height;
+        for dy in 0..cell_height {
+            let line = bits.map_or(0, |rows| rows[dy / scale]);
+            for dx in 0..cell_width {
+                let pattern = if line & (0x80 >> (dx / scale)) != 0 {
                     &foreground
                 } else {
                     &background
@@ -428,17 +459,20 @@ fn paint(
     let pinned = message.count + trace.count;
     let tail = wrap_rows(content.tail, cols, body - pinned, true);
 
-    let used = 1 + pinned + tail.count;
+    // The tail ring retains more rows than the visible tail budget. Count only
+    // the rows drawn by newest() below when clearing the following frame.
+    let used = 1 + pinned + tail.count.min(body - pinned);
     // The first frame clears the whole surface, not just the lines its own
     // cells occupy: whatever the firmware drew also covers the strips of a
     // scan line and a screen edge that no glyph cell lands on.
+    let cell_height = view.cell_height();
     let dirty = previous.map_or(view.height as usize, |previous| {
-        (previous * GLYPH_HEIGHT).max(used * GLYPH_HEIGHT)
+        (previous * cell_height).max(used * cell_height)
     });
     view.fill_rows(dst, 0, dirty, BACKGROUND);
 
     let bar = if content.alert { PANIC_BAR } else { STATUS_BAR };
-    view.fill_rows(dst, 0, GLYPH_HEIGHT, bar);
+    view.fill_rows(dst, 0, cell_height, bar);
     view.draw_row(dst, 0, content.status, cols, STATUS_TEXT, bar);
 
     let mut row = 1;
@@ -768,10 +802,7 @@ pub(crate) fn report_milestone(name: &str) {
 }
 
 /// Repaint the screen from the panic handler.
-pub(crate) fn report_panic(
-    info: &core::panic::PanicInfo<'_>,
-    backtrace: &fmt::Arguments<'_>,
-) {
+pub(crate) fn report_panic(info: &core::panic::PanicInfo<'_>, backtrace: &fmt::Arguments<'_>) {
     let mut message = BoundedText::<MESSAGE_BYTES>::new();
     let _ = write!(message, "{info}");
     let mut trace = BoundedText::<TRACE_BYTES>::new();

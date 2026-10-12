@@ -117,6 +117,7 @@ usb-xhci = [
     "dep:ax-crate-interface",
     "dep:kernel_guard",
     "dep:axtask",
+    "dep:axsync",
     "axtask/multitask",
     "dep:axpoll",
 ]

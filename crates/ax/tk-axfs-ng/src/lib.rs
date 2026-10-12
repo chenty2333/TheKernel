@@ -877,7 +877,10 @@ pub fn new_btrfs_filesystem_with_members(
 }
 
 /// Initializes the filesystem subsystem using the first available block device.
-pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
+pub fn init_filesystems(
+    mut block_devs: AxDeviceContainer<AxBlockDevice>,
+    progress: fn(&str),
+) {
     info!("Initialize filesystem subsystem...");
     debug!(
         "axfs init_filesystems: detected {} block device(s)",
@@ -902,9 +905,9 @@ pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
     };
     let dev = block_devs.remove(root_index);
     if axdriver::block_device_is_read_only(&dev) {
-        init_filesystems_with_root_read_only(dev, block_devs);
+        init_filesystems_with_root_read_only(dev, block_devs, progress);
     } else {
-        init_filesystems_with_root(dev, block_devs);
+        init_filesystems_with_root(dev, block_devs, progress);
     }
 }
 
@@ -989,8 +992,9 @@ mod root_selection_tests {
 pub fn init_filesystems_with_root(
     dev: AxBlockDevice,
     block_devs: AxDeviceContainer<AxBlockDevice>,
+    progress: fn(&str),
 ) {
-    init_filesystems_with_root_mode(dev, block_devs, false);
+    init_filesystems_with_root_mode(dev, block_devs, false, progress);
 }
 
 /// Like [`init_filesystems_with_root`], but publishes immutable boot media as
@@ -998,14 +1002,16 @@ pub fn init_filesystems_with_root(
 pub fn init_filesystems_with_root_read_only(
     dev: AxBlockDevice,
     block_devs: AxDeviceContainer<AxBlockDevice>,
+    progress: fn(&str),
 ) {
-    init_filesystems_with_root_mode(dev, block_devs, true);
+    init_filesystems_with_root_mode(dev, block_devs, true, progress);
 }
 
 fn init_filesystems_with_root_mode(
     dev: AxBlockDevice,
     mut block_devs: AxDeviceContainer<AxBlockDevice>,
     root_read_only: bool,
+    progress: fn(&str),
 ) {
     let root_index = 0;
     info!(
@@ -1014,6 +1020,7 @@ fn init_filesystems_with_root_mode(
         dev.num_blocks()
     );
 
+    progress("filesystems: root device owner");
     let root_removable = axdriver::block_device_removable(&dev);
     let root_device = SharedBlockDevice::new(dev);
     ROOT_BLOCK_DEVICE.call_once(|| RegisteredBlockDevice {
@@ -1033,6 +1040,7 @@ fn init_filesystems_with_root_mode(
     let mut index = 1;
     while !block_devs.is_empty() {
         let dev = block_devs.remove(0);
+        progress("filesystems: extra device owner");
         debug!(
             "axfs init_filesystems: registering extra block device {} as {}",
             dev.device_name(),
@@ -1045,6 +1053,7 @@ fn init_filesystems_with_root_mode(
         let removable = axdriver::block_device_removable(&dev);
         let device = SharedBlockDevice::new(dev);
         let partitions = if name.starts_with("nvme") {
+            progress("filesystems: NVMe GPT discovery");
             match axdriver::discover_gpt_partitions(&device, &name, read_only) {
                 Ok(partitions) => partitions,
                 Err(error) => { warn!("GPT discovery on {name} rejected: {error:?}; whole disk retained"); Vec::new() }
@@ -1075,6 +1084,7 @@ fn init_filesystems_with_root_mode(
         }
         index += 1;
     }
+    progress("filesystems: publish block inventory");
     EXTRA_BLOCK_DEVICES.call_once(|| Mutex::new(extras));
     // A conflicting owner only loses runtime hotplug publication; the boot
     // root must still mount, so this warns rather than aborting.
@@ -1085,9 +1095,12 @@ fn init_filesystems_with_root_mode(
         );
     }
 
+    progress("filesystems: open root device");
     let root_device = open_block_device(ROOT_BLOCK_DEVICE_NAME)
         .expect("failed to claim root block device for filesystem mount");
+    progress("filesystems: mount root");
     let fs = fs::new_default(root_device).expect("Failed to initialize filesystem");
+    progress("filesystems: bind root filesystem");
     let root_device = raw_block_device(ROOT_BLOCK_DEVICE_NAME)
         .expect("root block device disappeared during filesystem initialization");
     register_filesystem_block_binding(&fs, &root_device)
@@ -1100,6 +1113,7 @@ fn init_filesystems_with_root_mode(
     // attached on top of it.  `current->fs->root` is the rootfs, so "/" still
     // resolves to the mutable tree while the absolute root underneath stays
     // permanently in place.
+    progress("filesystems: mount namespace");
     let nullfs = axfs_ng_vfs::nullfs::filesystem().expect("Failed to create nullfs");
     let namespace_root = axfs_ng_vfs::Mountpoint::new_root(&nullfs);
     // The extension slot must stay free: the kernel installs this mount's

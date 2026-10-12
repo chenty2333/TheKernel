@@ -100,12 +100,12 @@ struct DrmI915GemSetDomain {
 }
 
 #[repr(C)]
-struct DrmDevice {
+pub struct DrmDevice {
     _opaque: [u8; 0],
 }
 
 #[repr(C)]
-struct DrmFile {
+pub struct DrmFile {
     _opaque: [u8; 0],
 }
 

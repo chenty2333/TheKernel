@@ -463,12 +463,28 @@ pub(super) fn render_registered() -> bool {
         .is_some_and(|o| registered() && !o.lost && o.render_ready)
 }
 
+/// A successful upstream-probe registration is transient; the registered
+/// rootfs callback publishes its own final result. Persist initialization
+/// text only for non-upstream owners or failed callback registration.
+fn should_record_gt_init_result(upstream_feature: bool, registration_succeeded: bool) -> bool {
+    !(upstream_feature && registration_succeeded)
+}
+
+pub(super) fn upstream_probe_schedule_text(rootfs_ready: bool) -> &'static str {
+    if rootfs_ready {
+        "upstream i915: rootfs ready; probe callback dispatched"
+    } else {
+        "upstream i915: probe queued until the rootfs is mounted"
+    }
+}
+
 /// Independent boot hook; default path never writes forcewake or resets GT.
 #[cfg(target_os = "none")]
 pub(super) fn init_at_boot() {
     #[cfg(feature = "intel-upstream-gt")]
     if let Err(error) = super::upstream_gt::install_providers() {
         axlog::warn!("intel-gt: upstream providers not installed: {error}");
+        return;
     }
     // On by default; `intel.gt=0` keeps the GT untouched.
     if axhal::boot::command_line_value("intel.gt") == Some("0") {
@@ -493,6 +509,11 @@ pub(super) fn init_at_boot() {
         let result = initialize(bdf, window);
         result
     };
+    // The upstream callback records the final probe result when it runs. A
+    // successful registration is only a transient scheduling state; do not
+    // preserve its "queued" text beside the eventual probe verdict.
+    let record_init_result =
+        should_record_gt_init_result(cfg!(feature = "intel-upstream-gt"), result.is_ok());
     let initialized = result.is_ok();
     let text = result.unwrap_or_else(|s| s);
     axlog::info!("{text}");
@@ -503,7 +524,9 @@ pub(super) fn init_at_boot() {
     {
         axlog::warn!("intel-gt: rootfs firmware callback table is full; GuC/HuC left unloaded");
     }
-    if let Some((bdf, _)) = windows.first() {
+    if record_init_result
+        && let Some((bdf, _)) = windows.first()
+    {
         super::GT_REPORT.lock().push((*bdf, text));
     }
 }
@@ -792,6 +815,23 @@ mod tests {
     use alloc::vec;
 
     use super::*;
+
+    #[test]
+    fn successful_upstream_callback_registration_is_not_a_final_gt_report() {
+        assert!(!should_record_gt_init_result(true, true));
+        assert!(should_record_gt_init_result(true, false));
+        assert!(should_record_gt_init_result(false, true));
+        assert!(should_record_gt_init_result(false, false));
+        assert_eq!(
+            upstream_probe_schedule_text(false),
+            "upstream i915: probe queued until the rootfs is mounted"
+        );
+        assert_eq!(
+            upstream_probe_schedule_text(true),
+            "upstream i915: rootfs ready; probe callback dispatched"
+        );
+    }
+
     #[test]
     fn unknown_or_busy_media_is_refused_before_shared_policy_and_media_writes_are_forbidden() {
         let mut words = vec![0u32; 0x200000 / 4];

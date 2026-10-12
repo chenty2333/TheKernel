@@ -202,6 +202,11 @@ impl GlobalAllocator {
                         Err(err) => {
                             try_size /= 2;
                             if try_size < min_size {
+                                let heap_used = balloc.used_bytes();
+                                let heap_free = balloc.available_bytes();
+                                // Logging must never run while holding the heap lock.
+                                drop(balloc);
+                                log::warn!("heap: expansion failed request={} align={} heap_total={old_size} heap_used={heap_used} heap_free={heap_free} free_pages={} error={err:?}", layout.size(), layout.align(), self.available_pages());
                                 return Err(err);
                             }
                             continue;

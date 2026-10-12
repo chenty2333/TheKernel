@@ -79,10 +79,18 @@ use intel_display::{
     dmc::DmcPlatform,
     power_domains::{PowerDomainIo, PowerDomainState},
     power_map::{
-        PowerDomain, PowerWellGroup, PowerWellInstance, WellControl, WellOps, power_wells,
+        DomainList, PowerDomain, PowerWellGroup, PowerWellInstance, WellControl, WellOps,
+        power_wells,
     },
     skl_watermark_full::{self, DisplayCaps as WatermarkDisplayCaps, WmLatencyIo},
 };
+
+/// The TC fastboot path intentionally has no global [`PowerState`]: it keeps a
+/// narrower `PowerPin` lease instead. Still retain i915's short-lived GMBUS
+/// domain references in the same map-backed ledger. ADL-N maps GMBUS to no
+/// physical well, so this ledger tracks balanced users without requesting or
+/// releasing any of the wells owned by `PowerPin`.
+static FASTBOOT_GMBUS_DOMAINS: spin::Mutex<Option<PowerDomainState>> = spin::Mutex::new(None);
 
 use super::{
     clk,
@@ -773,6 +781,67 @@ pub(crate) struct DcStateControl {
     pub(crate) psr_dc5_dc6_notifications: u32,
 }
 
+/// Take i915's short-lived GMBUS domain reference under an already-verified
+/// TC `PowerPin` lease. This uses the ADL-N source power-domain map rather
+/// than treating firmware's ON bits as a substitute for a reference. The
+/// GMBUS domain is currently not attached to any XELPD physical well, so the
+/// operation updates only its mapped use count; the TC wells remain owned by
+/// `PowerPin`.
+pub(crate) fn fastboot_gmbus_power_get<R: Registers>(regs: &R) -> Result<(), PowerError> {
+    fastboot_gmbus_power_ref(regs, true)
+}
+
+/// Release the balanced GMBUS domain reference acquired above.
+pub(crate) fn fastboot_gmbus_power_put<R: Registers>(regs: &R) -> Result<(), PowerError> {
+    fastboot_gmbus_power_ref(regs, false)
+}
+
+fn fastboot_gmbus_power_ref<R: Registers>(regs: &R, acquire: bool) -> Result<(), PowerError> {
+    let platform = DmcPlatform::AlderLakeN;
+    let map = power_wells(platform);
+    // These refs are nested below `PowerPin`, which owns PW1/PW2/PWA, DDI_IO
+    // and AUX_TC1/2. If a future map binds GMBUS to a physical well, fail
+    // closed until that well is explicitly included in the lease policy.
+    let has_controllable_gmbus_well = map.iter().any(|group| {
+        group.instances.iter().any(|instance| {
+            let owns_domain = match instance.domains {
+                DomainList::All => true,
+                DomainList::None => false,
+                DomainList::Set(domains) => domains.contains(&PowerDomain::Gmbus),
+            };
+            owns_domain && !instance.always_on && group.ops != WellOps::AlwaysOn
+        })
+    });
+    if has_controllable_gmbus_well {
+        return Err(PowerError::PowerDomain(String::from(
+            "ADL-N GMBUS domain unexpectedly maps to a physical power well",
+        )));
+    }
+
+    let mut owner = FASTBOOT_GMBUS_DOMAINS.lock();
+    let domains = owner.get_or_insert_with(|| PowerDomainState::new(map));
+    let mut io = MappedPowerWellIo {
+        regs,
+        platform,
+        dc: None,
+        dmc_payload_loaded: super::dmc::has_payload(),
+    };
+    let result = if acquire {
+        domains.get(map, PowerDomain::Gmbus, &mut io)
+    } else {
+        domains.put(map, PowerDomain::Gmbus, &mut io)
+    };
+    result.map_err(|error| PowerError::PowerDomain(format!("{error:?}")))
+}
+
+#[cfg(test)]
+pub(crate) fn fastboot_gmbus_power_use_count() -> u32 {
+    FASTBOOT_GMBUS_DOMAINS
+        .lock()
+        .as_ref()
+        .map_or(0, |domains| domains.domain_use_count(PowerDomain::Gmbus))
+}
+
 impl PowerState {
     fn power_map(&self) -> &'static [PowerWellGroup] {
         power_wells(self.platform)
@@ -1275,7 +1344,7 @@ impl<R: Registers> intel_display::RegisterIo for HswPowerWellAdapter<'_, R> {
         if self.regs.write(register, value) {
             Ok(())
         } else {
-            Err(intel_display::Error::Refused)
+            Err(super::traced_refusal())
         }
     }
 }
@@ -1310,7 +1379,7 @@ impl<R: Registers> intel_display::power_well::HswPowerWellIo for HswPowerWellAda
             // The source resets/initializes every pipe's DE IRQ block here.
             // This owner currently supports Pipe A only at install time; do
             // not silently skip a live IRQ transition.
-            Err(intel_display::Error::Refused)
+            Err(super::traced_refusal())
         }
     }
 
@@ -1321,7 +1390,7 @@ impl<R: Registers> intel_display::power_well::HswPowerWellIo for HswPowerWellAda
             // The i915 path masks/acks the pipe source and synchronizes the
             // parent IRQ before the well drops. Keep this fail-closed until
             // the per-well IRQ teardown path is translated.
-            Err(intel_display::Error::Refused)
+            Err(super::traced_refusal())
         }
     }
 }
@@ -1727,9 +1796,9 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
             return Ok(());
         }
         if !matches!(group.ops, WellOps::Hsw | WellOps::Ddi | WellOps::Aux) {
-            return Err(intel_display::Error::Refused);
+            return Err(super::traced_refusal());
         }
-        let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
+        let well = mapped_hsw_well(instance).ok_or_else(|| super::traced_refusal())?;
         let adapter = HswPowerWellAdapter { regs: self.regs };
         intel_display::power_well::hsw_power_well_sync_hw(
             &adapter,
@@ -1758,13 +1827,13 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
             let dc = self
                 .dc
                 .as_deref_mut()
-                .ok_or(intel_display::Error::Refused)?;
+                .ok_or_else(|| super::traced_refusal())?;
             return runtime_set_dc_state(self.regs, dc, DC_STATE_DISABLE)
                 .map(|_| ())
                 .map_err(|_| intel_display::Error::Unavailable(regs::DC_STATE_EN.offset()));
         }
         if !matches!(group.ops, WellOps::Hsw | WellOps::Ddi | WellOps::Aux) {
-            return Err(intel_display::Error::Refused);
+            return Err(super::traced_refusal());
         }
         // Linux `icl_tc_phy_aux_power_well_enable()` clears TBT_IO in the
         // source-selected AUX D/E control before requesting the Type-C AUX
@@ -1783,7 +1852,7 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
                 return Err(intel_display::Error::Unavailable(control.offset()));
             }
         }
-        let mut well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
+        let mut well = mapped_hsw_well(instance).ok_or_else(|| super::traced_refusal())?;
         if let Some(timeout_ms) = group.enable_timeout_ms {
             well.timeout_us = u32::from(timeout_ms).saturating_mul(1_000);
         }
@@ -1816,15 +1885,15 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
             let dc = self
                 .dc
                 .as_deref_mut()
-                .ok_or(intel_display::Error::Refused)?;
+                .ok_or_else(|| super::traced_refusal())?;
             return runtime_set_dc_state(self.regs, dc, dc.target_dc_state)
                 .map(|_| ())
                 .map_err(|_| intel_display::Error::Unavailable(regs::DC_STATE_EN.offset()));
         }
         if !matches!(group.ops, WellOps::Hsw | WellOps::Ddi | WellOps::Aux) {
-            return Err(intel_display::Error::Refused);
+            return Err(super::traced_refusal());
         }
-        let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
+        let well = mapped_hsw_well(instance).ok_or_else(|| super::traced_refusal())?;
         disable_well(self.regs, well, self.platform)
             .map_err(|_| intel_display::Error::Unavailable(well.register.offset()))
     }
@@ -1840,7 +1909,7 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
         if group.ops == WellOps::DcOff {
             return dc_off_well_is_enabled(self.regs);
         }
-        let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
+        let well = mapped_hsw_well(instance).ok_or_else(|| super::traced_refusal())?;
         let adapter = HswPowerWellAdapter { regs: self.regs };
         intel_display::power_well::hsw_power_well_enabled(
             &adapter,

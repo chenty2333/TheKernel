@@ -308,6 +308,11 @@ unsafe fn ggtt_init_hw(ggtt: *mut I915Ggtt) -> c_int {
             (*vm).mm.color_adjust = Some(i915_ggtt_color_adjust);
         }
     }
+    let owner_ret = unsafe { crate::linux::ggtt_owner::attach(vm) };
+    if owner_ret != 0 {
+        // i915_driver_hw_probe's GGTT unwind owns scratch/VM teardown.
+        return owner_ret;
+    }
     if unsafe { (*ggtt).mappable_end != 0 } {
         if !unsafe {
             io_mapping_init_wc(
@@ -316,10 +321,16 @@ unsafe fn ggtt_init_hw(ggtt: *mut I915Ggtt) -> c_int {
                 (*ggtt).mappable_end as c_ulong,
             )
         } {
+            // Leave the initialized VM and reservations to the caller's
+            // single GGTT unwind; early cleanup here would free scratch twice.
             unsafe {
-                if let Some(cleanup) = (*vm).cleanup {
-                    cleanup(vm);
-                }
+                drm_err!(
+                    &(*i915).drm,
+                    "ggtt_init_hw: io_mapping_init_wc(GMADR base=%llx size=%llx) failed, returning %d\n",
+                    (*ggtt).gmadr.start,
+                    (*ggtt).mappable_end,
+                    -EIO
+                );
             }
             return -EIO;
         }
@@ -1573,6 +1584,7 @@ pub unsafe extern "C" fn i915_init_ggtt(i915: *mut DrmI915Private) -> c_int {
             unsafe {
                 cleanup_init_ggtt(ggtt);
             }
+            return ret;
         }
     }
     0
@@ -1618,6 +1630,7 @@ unsafe fn ggtt_cleanup_hw(ggtt: *mut I915Ggtt) {
             cleanup(vm);
         }
         mutex_unlock(core::ptr::addr_of_mut!((*vm).mutex));
+        crate::linux::ggtt_owner::detach(vm);
         i915_address_space_fini(vm);
         arch_phys_wc_del((*ggtt).mtrr);
         if (*ggtt).iomap.size != 0 {

@@ -144,18 +144,30 @@ static IRQ_WAITERS: WaitQueue = WaitQueue::new();
 #[cfg(target_os = "none")]
 static IRQ_WINDOW: Mutex<Option<RegisterWindow>> = Mutex::new(None);
 
-/// The PCI function and MSI vector that `install_n305` left live. Recorded only
-/// after the whole display-IRQ install succeeds, so a rolled-back attempt never
-/// leaves a stale vector behind.
+/// The PCI function and MSI vector that `install_n305` currently owns. The
+/// reservation is published immediately and cleared only after a verified
+/// rollback, so a partially failed display setup cannot race the GT into
+/// programming a second message on the same function.
 #[cfg(target_os = "none")]
 static DISPLAY_MSI_OWNER: Mutex<Option<(pci::Bdf, usize)>> = Mutex::new(None);
+#[cfg(target_os = "none")]
+static DISPLAY_MSI_BEFORE: Mutex<Option<pci::DisplayMsiBefore>> = Mutex::new(None);
+/// MSI reserved by the upstream GT owner when native display IRQ setup did
+/// not already own the GPU function's one message.
+#[cfg(target_os = "none")]
+static UPSTREAM_MSI_OWNER: Mutex<Option<(pci::Bdf, usize)>> = Mutex::new(None);
 
 /// The MSI vector already reserved for `bdf` by the display IRQ owner, if any.
 /// PCI MSI enable consumes this vector instead of programming a new one.
 #[cfg(target_os = "none")]
 pub(super) fn msi_vector_for(bdf: pci::Bdf) -> Option<usize> {
     let owner = *DISPLAY_MSI_OWNER.lock();
-    owner.and_then(|(owner, vector)| (owner == bdf).then_some(vector))
+    owner
+        .and_then(|(owner, vector)| (owner == bdf).then_some(vector))
+        .or_else(|| {
+            let owner = *UPSTREAM_MSI_OWNER.lock();
+            owner.and_then(|(owner, vector)| (owner == bdf).then_some(vector))
+        })
 }
 
 /// Whether the dedicated MSI owner is live and has not faulted.
@@ -323,6 +335,17 @@ fn source_image_idle(mut read: impl FnMut(u32) -> Option<u32>) -> bool {
 }
 
 #[cfg(target_os = "none")]
+fn release_display_irq_vector(bdf: pci::Bdf, vector: usize) {
+    let mut owner = DISPLAY_MSI_OWNER.lock();
+    if *owner == Some((bdf, vector)) {
+        *owner = None;
+    }
+    drop(owner);
+    *DISPLAY_MSI_BEFORE.lock() = None;
+    let _ = axhal::irq::unregister(vector);
+}
+
+#[cfg(target_os = "none")]
 pub(super) fn install_n305(
     ecam: &mut pci::Ecam,
     bdf: pci::Bdf,
@@ -358,6 +381,7 @@ pub(super) fn install_n305(
         display_irq_handler,
     )
     .ok_or_else(|| String::from("display MSI vector could not be reserved"))?;
+    *DISPLAY_MSI_OWNER.lock() = Some((bdf, vector as usize));
     // The callback's raw base is backed by this permanent window owner; a
     // later DRM registration/worker failure cannot invalidate an installed
     // MSI callback or leave it pointing at a dropped mapping token.
@@ -380,7 +404,7 @@ pub(super) fn install_n305(
             }
             EVENTS.base.store(0, Ordering::Release);
             IRQ_WINDOW.lock().take();
-            let _ = axhal::irq::unregister(vector);
+            release_display_irq_vector(bdf, vector as usize);
             return Err(error.message);
         }
     };
@@ -394,7 +418,7 @@ pub(super) fn install_n305(
             Ok(()) => {
                 EVENTS.base.store(0, Ordering::Release);
                 IRQ_WINDOW.lock().take();
-                let _ = axhal::irq::unregister(vector);
+                release_display_irq_vector(bdf, vector as usize);
                 return Err(error);
             }
             Err(rollback) => {
@@ -420,7 +444,7 @@ pub(super) fn install_n305(
             Ok(()) => {
                 EVENTS.base.store(0, Ordering::Release);
                 IRQ_WINDOW.lock().take();
-                let _ = axhal::irq::unregister(vector);
+                release_display_irq_vector(bdf, vector as usize);
                 return Err(error);
             }
             Err(rollback) => {
@@ -455,7 +479,7 @@ pub(super) fn install_n305(
             Ok(()) => {
                 EVENTS.base.store(0, Ordering::Release);
                 IRQ_WINDOW.lock().take();
-                let _ = axhal::irq::unregister(vector);
+                release_display_irq_vector(bdf, vector as usize);
                 Err(format!("{error}; display IRQ before-image restored"))
             }
             Err(failure) => {
@@ -469,6 +493,7 @@ pub(super) fn install_n305(
         };
     }
 
+    *DISPLAY_MSI_BEFORE.lock() = Some(msi);
     // A PVM-capable message stays masked until the global/display source tree
     // has been installed; the final master write may now cause an owned IRQ.
     EVENTS.online.store(true, Ordering::Release);
@@ -481,7 +506,7 @@ pub(super) fn install_n305(
                 if may_release_failed_owner(true, master_write_attempted) {
                     EVENTS.base.store(0, Ordering::Release);
                     IRQ_WINDOW.lock().take();
-                    let _ = axhal::irq::unregister(vector);
+                    release_display_irq_vector(bdf, vector as usize);
                     Err(format!("{error}; display IRQ before-image restored"))
                 } else {
                     Err(format!(
@@ -495,7 +520,6 @@ pub(super) fn install_n305(
             )),
         };
     }
-    *DISPLAY_MSI_OWNER.lock() = Some((bdf, vector as usize));
     Ok(())
 }
 
@@ -802,7 +826,10 @@ pub(super) mod upstream {
     use intel_gt::linux::kernel_core::{IrqCoreOps, install_irq_core_ops};
     use intel_gt::linux_i915_private::DrmI915Private;
 
-    use super::{EVENTS, GU_MISC_IIR, VolatileIo, dispatch_display, pci};
+    use super::{
+        DISPLAY_MSI_OWNER, EVENTS, GU_MISC_IIR, UPSTREAM_MSI_OWNER, VolatileIo,
+        dispatch_display, pci,
+    };
     use crate::drm::intel::pci::N305DisplayMsi;
 
     type Handler = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
@@ -811,7 +838,8 @@ pub(super) mod upstream {
     /// handler also sees its argument.
     static HANDLER: AtomicUsize = AtomicUsize::new(0);
     static DEV_ID: AtomicUsize = AtomicUsize::new(0);
-    static OWN_VECTOR: AtomicUsize = AtomicUsize::new(0);
+    static IRQ_NUMBER: AtomicUsize = AtomicUsize::new(0);
+    static MSI_BEFORE: spin::Mutex<Option<pci::DisplayMsiBefore>> = spin::Mutex::new(None);
     static BDF: spin::Mutex<Option<pci::Bdf>> = spin::Mutex::new(None);
 
     const IRQ_HANDLED: c_int = 1;
@@ -828,74 +856,193 @@ pub(super) mod upstream {
         // SAFETY: HANDLER only ever holds a `Handler` stored by `request_irq`.
         let handler: Handler = unsafe { core::mem::transmute::<usize, Handler>(handler) };
         let dev_id = DEV_ID.load(Ordering::Acquire) as *mut c_void;
-        // SAFETY: the handler and its dev_id were registered together by `request_irq`; Linux calls it in hard-IRQ context exactly like this.
-        let _ = unsafe { handler(0, dev_id) } == IRQ_HANDLED;
+        let irq = IRQ_NUMBER.load(Ordering::Acquire) as c_int;
+        // SAFETY: `request_irq` publishes the handler and `dev_id` as a pair;
+        // the registered Linux IRQ owner masks and synchronizes this vector
+        // before `free_irq` retires the argument.
+        let _ = unsafe { handler(irq, dev_id) } == IRQ_HANDLED;
         true
     }
 
-    /// The probe calls this before `i915_pci_probe()` with the GPU function.
+    /// The probe calls this after identity-DMA registration and before
+    /// `i915_pci_probe()`. Reserve/reuse exactly one MSI vector now so both
+    /// Linux's early `pci_enable_msi()` and later `request_irq()` observe the
+    /// same owner and vector.
     pub(in crate::drm::intel) fn install(bdf: pci::Bdf) -> Result<(), &'static str> {
         *BDF.lock() = Some(bdf);
-        install_irq_core_ops(&IRQ_CORE_OPS)?;
-        install_display_irq_ops(&DISPLAY_IRQ_OPS)
+        let vector = match super::msi_vector_for(bdf) {
+            Some(vector) => vector,
+            None => reserve_upstream_msi(bdf)?,
+        };
+        let device = super::super::upstream_gt::native_pci_device(bdf);
+        if intel_gt::linux::dma::set_device_irq(device, vector).is_err() {
+            // The native display owner retains its shared vector. A GT-only
+            // route is ours to roll back before the probe begins.
+            disable_msi(bdf);
+            return Err("DMA device did not accept the reserved MSI vector");
+        }
+        if install_irq_core_ops(&IRQ_CORE_OPS).is_err() {
+            disable_msi(bdf);
+            return Err("LinuxKPI IRQ owner is already installed");
+        }
+        if install_display_irq_ops(&DISPLAY_IRQ_OPS).is_err() {
+            disable_msi(bdf);
+            return Err("upstream display IRQ callbacks are already installed");
+        }
+        Ok(())
+    }
+
+    /// Reserve and program MSI when native display IRQ setup did not already
+    /// route this function. Retain the exact PCI before-image until the
+    /// driver's matching `pci_disable_msi()` teardown.
+    fn reserve_upstream_msi(bdf: pci::Bdf) -> Result<usize, &'static str> {
+        let requester = tk_vtd::PciRequester {
+            segment: axhal::pci::ecam_segment(),
+            bus: bdf.bus,
+            device: bdf.device,
+            function: bdf.function,
+        };
+        let Some((address, data, vector)) =
+            axhal::irq::allocate_msi(requester, super::display_irq_handler)
+        else {
+            return Err("upstream GT MSI vector could not be reserved");
+        };
+        let mut ecam = match pci::Ecam::platform() {
+            Some(ecam) => ecam,
+            None => {
+                let _ = axhal::irq::unregister(vector);
+                return Err("upstream GT MSI needs PCI ECAM");
+            }
+        };
+        let before = match ecam.prepare_n305_display_msi(bdf, address, data) {
+            Ok(before) => before,
+            Err(error) => {
+                if !error.rollback_verified {
+                    *UPSTREAM_MSI_OWNER.lock() = Some((bdf, vector));
+                } else {
+                    let _ = axhal::irq::unregister(vector);
+                }
+                axlog::warn!("intel-gt: upstream MSI setup refused: {}", error.message);
+                return Err("upstream GT MSI setup refused");
+            }
+        };
+        if let Err(error) = ecam
+            .activate_n305_display_msi(&before)
+            .and_then(|()| ecam.unmask_n305_display_msi(&before))
+        {
+            if let Err(rollback) = ecam.restore_n305_display_msi(&before) {
+                *MSI_BEFORE.lock() = Some(before);
+                *UPSTREAM_MSI_OWNER.lock() = Some((bdf, vector));
+                axlog::warn!("intel-gt: upstream MSI rollback unverified: {error}; {rollback}");
+                return Err("upstream GT MSI rollback was not verified");
+            }
+            let _ = axhal::irq::unregister(vector);
+            axlog::warn!("intel-gt: upstream MSI setup failed: {error}; PCI state restored");
+            return Err("upstream GT MSI could not be activated");
+        }
+        *MSI_BEFORE.lock() = Some(before);
+        *UPSTREAM_MSI_OWNER.lock() = Some((bdf, vector));
+        Ok(vector)
+    }
+
+    /// Retire only the MSI owned by this module. Native display MSI belongs
+    /// to `install_n305` and remains active for the display owner's lifetime.
+    pub(in crate::drm::intel) fn disable_msi(bdf: pci::Bdf) {
+        let display_owner = *DISPLAY_MSI_OWNER.lock();
+        if display_owner.is_some_and(|(owner, _)| owner == bdf) {
+            return;
+        }
+        let upstream_owner = *UPSTREAM_MSI_OWNER.lock();
+        if upstream_owner.is_none_or(|(owner, _)| owner != bdf) {
+            return;
+        }
+        if HANDLER.load(Ordering::Acquire) != 0 {
+            axlog::warn!("intel-gt: retaining MSI owner while request_irq handler remains live");
+            return;
+        }
+        let Some(before) = *MSI_BEFORE.lock() else {
+            // An unverified partial prepare has no complete before-image and
+            // intentionally keeps its callback/vector quarantined.
+            axlog::warn!("intel-gt: retaining MSI vector without a verified before-image");
+            return;
+        };
+        let Some(mut ecam) = pci::Ecam::platform() else {
+            axlog::warn!("intel-gt: retaining MSI vector; PCI ECAM unavailable at teardown");
+            return;
+        };
+        if let Err(error) = ecam.restore_n305_display_msi(&before) {
+            axlog::warn!("intel-gt: retaining MSI vector; PCI restore failed: {error}");
+            return;
+        }
+        let owner = UPSTREAM_MSI_OWNER.lock().take();
+        if let Some((owner_bdf, vector)) = owner {
+            if owner_bdf == bdf {
+                let _ = axhal::irq::unregister(vector);
+            } else {
+                *UPSTREAM_MSI_OWNER.lock() = Some((owner_bdf, vector));
+            }
+        }
+        *MSI_BEFORE.lock() = None;
     }
 
     static IRQ_CORE_OPS: IrqCoreOps = IrqCoreOps { request_irq, free_irq };
 
-    /// `request_irq()` for the GPU function. If the native display owner has
-    /// already routed the function's MSI, share that vector; otherwise reserve
-    /// and route one now, exactly as `install_n305` does for the display.
-    unsafe extern "C" fn request_irq(_irq: usize, handler: Handler, dev_id: *mut c_void) -> c_int {
+    /// `request_irq()` for the GPU function. MSI was routed by `install()` and
+    /// this callback only publishes the translated handler on that same vector.
+    unsafe extern "C" fn request_irq(irq: usize, handler: Handler, dev_id: *mut c_void) -> c_int {
         if HANDLER.load(Ordering::Acquire) != 0 {
             return -EBUSY;
         }
-        if EVENTS.base.load(Ordering::Acquire) == 0 {
-            let Some(bdf) = *BDF.lock() else {
-                return -ENODEV;
-            };
-            let Some((address, data, vector)) = axhal::irq::allocate_msi(
-                tk_vtd::PciRequester {
-                    segment: axhal::pci::ecam_segment(),
-                    bus: bdf.bus,
-                    device: bdf.device,
-                    function: bdf.function,
-                },
-                super::display_irq_handler,
-            ) else {
-                return -EBUSY;
-            };
-            DEV_ID.store(dev_id as usize, Ordering::Release);
-            HANDLER.store(handler as usize, Ordering::Release);
-            let routed = (|| {
-                let mut ecam = pci::Ecam::platform().ok_or("PCI facts unavailable")?;
-                let msi = ecam
-                    .prepare_n305_display_msi(bdf, address, data)
-                    .map_err(|_| "MSI prepare failed")?;
-                ecam.activate_n305_display_msi(&msi).map_err(|_| "MSI activate failed")?;
-                ecam.unmask_n305_display_msi(&msi).map_err(|_| "MSI unmask failed")
-            })();
-            if let Err(error) = routed {
-                axlog::warn!("intel-gt: upstream request_irq: {error}");
-                HANDLER.store(0, Ordering::Release);
-                let _ = axhal::irq::unregister(vector);
-                return -EBUSY;
-            }
-            OWN_VECTOR.store(vector, Ordering::Release);
-            return 0;
+        let Some(bdf) = *BDF.lock() else { return -ENODEV };
+        if super::msi_vector_for(bdf) != Some(irq) {
+            return -ENODEV;
         }
+        IRQ_NUMBER.store(irq, Ordering::Release);
         DEV_ID.store(dev_id as usize, Ordering::Release);
         HANDLER.store(handler as usize, Ordering::Release);
         0
     }
 
-    unsafe extern "C" fn free_irq(_irq: usize, dev_id: *mut c_void) {
+    unsafe extern "C" fn free_irq(irq: usize, dev_id: *mut c_void) {
         if DEV_ID.load(Ordering::Acquire) != dev_id as usize {
             return;
         }
+        if IRQ_NUMBER.load(Ordering::Acquire) != irq {
+            return;
+        }
+        // The source reset precedes this callback, but a hard handler already
+        // executing may re-enable the root on exit. Mask the actual PCI MSI
+        // route before waiting, without destroying the shared display route.
+        let display = *super::DISPLAY_MSI_BEFORE.lock();
+        let before = display.or(*MSI_BEFORE.lock());
+        let mut ecam = pci::Ecam::platform();
+        let masked = match (ecam.as_mut(), before.as_ref()) {
+            (Some(ecam), Some(before)) => ecam.mask_n305_display_msi(before).is_ok(),
+            _ => false,
+        };
+        let base = EVENTS.base.load(Ordering::Acquire);
+        if !masked {
+            axlog::warn!("intel-gt: MSI mask unverified; disabling display/GT root");
+            if base != 0 { let _ = super::checked_write(base, super::GFX_MSTR_IRQ, 0); }
+            EVENTS.online.store(false, Ordering::Release);
+        }
         HANDLER.store(0, Ordering::Release);
-        let vector = OWN_VECTOR.swap(0, Ordering::AcqRel);
-        if vector != 0 {
-            let _ = axhal::irq::unregister(vector);
+        // Match Linux free_irq(): after this returns no hard-IRQ invocation
+        // may still hold the translated handler or its dev_id.
+        axhal::irq::synchronize_hardirq(irq);
+        DEV_ID.store(0, Ordering::Release);
+        IRQ_NUMBER.store(0, Ordering::Release);
+        // No translated handler can now undo this final root mask. A live
+        // native display keeps its own HPD/vblank route after GT teardown.
+        if base != 0 { let _ = super::checked_write(base, super::GFX_MSTR_IRQ, 0); }
+        if masked && display.is_some() && EVENTS.online.load(Ordering::Acquire) {
+            let resumed = super::checked_write(base, super::GFX_MSTR_IRQ, super::GEN11_MASTER_IRQ)
+                .and_then(|()| ecam.as_mut().unwrap().activate_n305_display_msi(display.as_ref().unwrap()));
+            if let Err(error) = resumed {
+                EVENTS.online.store(false, Ordering::Release);
+                EVENTS.faulted.store(true, Ordering::Release);
+                axlog::warn!("intel-gt: shared display IRQ resume failed: {error}");
+            }
         }
     }
 

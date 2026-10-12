@@ -30,5 +30,5 @@ fn panic(info: &PanicInfo) -> ! {
     crate::invoke_panic_screen_hook(info, &format_args!("{backtrace}"));
     axhal::console::emergency_diagnostic_print(format_args!("{}\n", info));
     axhal::console::emergency_diagnostic_print(format_args!("{backtrace}\n"));
-    axhal::power::system_off()
+    crate::terminate_on_fatal()
 }

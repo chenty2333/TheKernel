@@ -352,6 +352,22 @@ pub(crate) fn dkl_state_matches_source_readout(
     dpll::icl_compare_hw_state(&expected, dispatched)
 }
 
+/// Restore the hardware-decoded MG PLL image after the source `compute`
+/// callback has synthesized a candidate for a new atomic state.  During
+/// initial readout the currently active MG PLL is not a newly-computed mode:
+/// Linux's `intel_ddi_tc_get_clock()` imports the exact image returned by
+/// `intel_dpll_get_hw_state()` into this slot before reserving it.  Keep the
+/// caller's decoded port clock as well; it came from that active image.
+fn import_active_mg_readout(
+    crtc: &mut dpll::CrtcState,
+    hw_state: dpll::IntelDpllHwState,
+    port_clock: u32,
+) {
+    crtc.icl_port_dplls[dpll::PortDpllId::MgPhy as usize].hw_state = hw_state;
+    crtc.dpll_hw_state = hw_state;
+    crtc.port_clock = port_clock;
+}
+
 fn verify_adln_pin_map(port: dpll::TcPort) -> Result<(), DpllFailure> {
     let (lane, io, aux, ddi_control, aux_control) = match port {
         dpll::TcPort::Tc1 => (
@@ -655,7 +671,10 @@ impl SharedDpllState {
             display.crtc_states = crtcs;
             dpll::intel_dpll_readout_hw_state(hooks, display);
         });
-        result?;
+        if let Err(error) = result {
+            axlog::warn!("intel-dpll: hardware readout failed: {error:?}");
+            return Err(error);
+        }
         self.readout_done = true;
 
         // The generic DPLL readout establishes the active DKL PLL ownership,
@@ -690,6 +709,14 @@ impl SharedDpllState {
             if old.pipe != 0 || old.output != dpll::OutputType::Hdmi || old.port_clock == 0 {
                 return Err(DpllFailure::InvalidCrtc);
             }
+            let index = old.intel_dpll.ok_or(DpllFailure::InvalidCrtc)?;
+            let observed = self
+                .display
+                .dplls
+                .get(index)
+                .ok_or(DpllFailure::InvalidCrtc)?
+                .state
+                .hw_state;
             self.check_crtc_pll_power_domains(registers, power, &old)?;
             let encoder = dpll::IntelEncoder {
                 output: old.output,
@@ -708,19 +735,82 @@ impl SharedDpllState {
             let mut atomic = dpll::IntelAtomicState::default();
             atomic.old_crtcs = initial_crtcs;
             atomic.new_crtcs = initial_crtcs;
-            self.compute(registers, timer, power, &mut atomic, &crtc, &encoder)?;
-            self.release(registers, timer, power, &mut atomic, &crtc)?;
-            self.reserve(registers, timer, power, &mut atomic, &crtc, &encoder)?;
+            if let Err(error) = self.compute(registers, timer, power, &mut atomic, &crtc, &encoder)
+            {
+                axlog::warn!(
+                    "intel-dpll: firmware reservation import failed at compute: {error:?}"
+                );
+                return Err(error);
+            }
+            if let Err(error) = self.release(registers, timer, power, &mut atomic, &crtc) {
+                axlog::warn!(
+                    "intel-dpll: firmware reservation import failed at release: {error:?}"
+                );
+                return Err(error);
+            }
+
+            // `compute` above is needed to construct the TBT default slot,
+            // but it also recalculates MG parameters for a future commit.
+            // Readout reservation must instead retain the current firmware
+            // DKL/MG image exactly as upstream's DDI readout does.
+            let mg_slot = dpll::PortDpllId::MgPhy as usize;
+            import_active_mg_readout(
+                &mut atomic.new_crtcs[usize::from(old.pipe)],
+                observed,
+                old.port_clock,
+            );
+
+            if let Err(error) = self.reserve(registers, timer, power, &mut atomic, &crtc, &encoder)
+            {
+                let candidate = atomic.new_crtcs[usize::from(old.pipe)].icl_port_dplls[mg_slot]
+                    .hw_state
+                    .icl;
+                let observed_icl = observed.icl;
+                axlog::warn!(
+                    "intel-dpll: firmware reservation import failed at reserve: {error:?}, \
+                     pll={index} port_clock={}",
+                    old.port_clock
+                );
+                axlog::warn!(
+                    "intel-dpll: MG candidate hsclk={:#010x} div0={:#010x} div1={:#010x}; \
+                     observed hsclk={:#010x} div0={:#010x} div1={:#010x}",
+                    candidate.mg_clktop2_hsclkctl,
+                    candidate.mg_pll_div0,
+                    candidate.mg_pll_div1,
+                    observed_icl.mg_clktop2_hsclkctl,
+                    observed_icl.mg_pll_div0,
+                    observed_icl.mg_pll_div1,
+                );
+                return Err(error);
+            }
             let new = atomic.new_crtcs[usize::from(old.pipe)];
-            let index = new.intel_dpll.ok_or(DpllFailure::InvalidCrtc)?;
-            let observed = self
-                .display
-                .dplls
-                .get(index)
-                .ok_or(DpllFailure::InvalidCrtc)?
-                .state
-                .hw_state;
+            if new.intel_dpll != Some(index) {
+                axlog::warn!(
+                    "intel-dpll: firmware reservation selected unexpected PLL expected={index} \
+                     actual={:?}",
+                    new.intel_dpll
+                );
+                return Err(DpllFailure::UnexpectedState);
+            }
             if !dpll::icl_compare_hw_state(&new.dpll_hw_state, &observed) {
+                let candidate = new.dpll_hw_state.icl;
+                let observed = observed.icl;
+                axlog::warn!(
+                    "intel-dpll: firmware readout state mismatch at verify, pll={index} \
+                     active={:?} port_clock={}",
+                    new.intel_dpll,
+                    old.port_clock
+                );
+                axlog::warn!(
+                    "intel-dpll: MG expected hsclk={:#010x} div0={:#010x} div1={:#010x}; observed \
+                     hsclk={:#010x} div0={:#010x} div1={:#010x}",
+                    candidate.mg_clktop2_hsclkctl,
+                    candidate.mg_pll_div0,
+                    candidate.mg_pll_div1,
+                    observed.mg_clktop2_hsclkctl,
+                    observed.mg_pll_div0,
+                    observed.mg_pll_div1,
+                );
                 return Err(DpllFailure::UnexpectedState);
             }
             self.swap_atomic(&mut atomic)?;
@@ -2089,6 +2179,43 @@ mod tests {
             &mismatched,
             false
         ));
+    }
+
+    #[test]
+    fn active_mg_readout_keeps_equivalent_firmware_dividers_for_reservation() {
+        const HSDIV_MASK: u32 = 3 << 12;
+        const DSDIV_MASK: u32 = 0xf << 8;
+        const HSDIV_2: u32 = 0 << 12;
+        const HSDIV_5: u32 = 2 << 12;
+
+        // The calculator prefers /5 then /2 for this HDMI DCO, while the
+        // hardware can use /2 then /5 with the same product and port clock.
+        let mut computed = dpll::IntelDpllHwState::default();
+        computed.icl.mg_clktop2_hsclkctl = HSDIV_5 | (2 << 8);
+        let mut firmware = computed;
+        firmware.icl.mg_clktop2_hsclkctl =
+            (firmware.icl.mg_clktop2_hsclkctl & !(HSDIV_MASK | DSDIV_MASK)) | HSDIV_2 | (5 << 8);
+        assert_ne!(
+            computed.icl.mg_clktop2_hsclkctl,
+            firmware.icl.mg_clktop2_hsclkctl
+        );
+        let dco_khz = 7_425_000;
+        assert_eq!(dco_khz / (5 * 5 * 2), 148_500);
+        assert_eq!(dco_khz / (5 * 2 * 5), 148_500);
+
+        let mut crtc = dpll::CrtcState::default();
+        crtc.icl_port_dplls[dpll::PortDpllId::MgPhy as usize].hw_state = computed;
+        crtc.dpll_hw_state = computed;
+        crtc.port_clock = 297_000;
+
+        import_active_mg_readout(&mut crtc, firmware, 148_500);
+
+        assert!(dpll::icl_compare_hw_state(
+            &crtc.icl_port_dplls[dpll::PortDpllId::MgPhy as usize].hw_state,
+            &firmware
+        ));
+        assert!(dpll::icl_compare_hw_state(&crtc.dpll_hw_state, &firmware));
+        assert_eq!(crtc.port_clock, 148_500);
     }
 
     #[test]

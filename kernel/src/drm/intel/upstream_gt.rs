@@ -12,8 +12,8 @@
 //! upstream caller already has a "not supported" branch, the function returns
 //! the value that branch expects.
 //!
-//! Nothing in this file is reachable from the default build: the module
-//! declaration in `mod.rs` is gated on the `intel-upstream-gt` feature.
+//! This module is gated on `intel-upstream-gt`, enabled in the product build.
+//! The translated GT is the sole owner when the feature is present.
 
 use alloc::{boxed::Box, collections::BTreeMap};
 use core::{
@@ -22,12 +22,14 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
-use intel_gt::linux::gem_memory::NotifierBlock;
-use intel_gt::linux_platform::{I915PlatformOps, install_i915_platform_ops};
+use intel_gt::{
+    linux::gem_memory::NotifierBlock,
+    linux_platform::{I915PlatformOps, install_i915_platform_ops},
+};
 
-use super::pci;
 #[cfg(target_os = "none")]
-use super::pci::{ConfigSpace, ConfigWriteSpace};
+use super::pci::ConfigWriteSpace;
+use super::pci::{self, ConfigSpace};
 
 /// Linux errno values used by the platform callbacks.
 const EIO: c_int = 5;
@@ -61,9 +63,9 @@ pub(super) fn native_pci_device(bdf: pci::Bdf) -> *mut c_void {
 /// has nothing to release and repeated lookups return the same pointer.
 fn identity_for(bdf: pci::Bdf) -> *mut c_void {
     let mut map = DEVICE_IDENTITIES.lock();
-    let address = *map.entry((bdf.bus, bdf.device, bdf.function)).or_insert_with(|| {
-        Box::into_raw(Box::new(NativePciDevice { bdf })) as usize
-    });
+    let address = *map
+        .entry((bdf.bus, bdf.device, bdf.function))
+        .or_insert_with(|| Box::into_raw(Box::new(NativePciDevice { bdf })) as usize);
     address as *mut c_void
 }
 
@@ -74,6 +76,10 @@ static DEVICE_IDENTITIES: spin::Mutex<BTreeMap<(u8, u8, u8), usize>> =
 /// revision reader reads its configuration space; TheKernel supports one GT
 /// device per boot, so there is no per-device lookup.
 static GT_PCI_IDENTITY: spin::Mutex<Option<pci::Bdf>> = spin::Mutex::new(None);
+
+pub(super) fn registered_bdf() -> Option<pci::Bdf> {
+    *GT_PCI_IDENTITY.lock()
+}
 
 pub(super) fn bdf_of(device: *mut c_void) -> Option<pci::Bdf> {
     if device.is_null() {
@@ -140,12 +146,8 @@ pub(super) fn register_upstream_i915(i915: *mut c_void) -> Result<(), &'static s
     if i915.is_null() {
         return Err("null upstream i915 device");
     }
-    match UPSTREAM_I915.compare_exchange(
-        ptr::null_mut(),
-        i915,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
+    match UPSTREAM_I915.compare_exchange(ptr::null_mut(), i915, Ordering::AcqRel, Ordering::Acquire)
+    {
         Ok(_) => Ok(()),
         Err(existing) if existing == i915 => Ok(()),
         Err(_) => Err("a different upstream i915 device is already registered"),
@@ -253,11 +255,17 @@ unsafe extern "C" fn platform_display_reset_supported(_display: *mut c_void) -> 
 }
 
 unsafe extern "C" fn platform_display_reset_prepare(_display: *mut c_void) {
-    panic!("intel_display_reset_prepare: TheKernel has no display reset; upstream must check intel_display_reset_supported() first");
+    panic!(
+        "intel_display_reset_prepare: TheKernel has no display reset; upstream must check \
+         intel_display_reset_supported() first"
+    );
 }
 
 unsafe extern "C" fn platform_display_reset_finish(_display: *mut c_void, _reset: bool) {
-    panic!("intel_display_reset_finish: TheKernel has no display reset; upstream must check intel_display_reset_supported() first");
+    panic!(
+        "intel_display_reset_finish: TheKernel has no display reset; upstream must check \
+         intel_display_reset_supported() first"
+    );
 }
 
 /// CI taint flags have no kernel taint mask in TheKernel. Record the event so
@@ -325,7 +333,28 @@ pub(super) fn install_providers() -> Result<(), &'static str> {
         unsafe { core::mem::transmute(kernel_pci_revision as unsafe extern "C" fn(*mut c_void, *mut u8) -> i32) };
     intel_gt::linux::i915::install_pci_revision_reader(Some(reader));
     install_k2_tables()?;
-    super::upstream_drm::install()
+    super::upstream_drm::install()?;
+    #[cfg(target_os = "none")]
+    if axhal::boot::command_line_value("intel.gt.smp_smoke") == Some("1") {
+        let completed = AtomicUsize::new(0);
+        unsafe extern "C" fn count_remote(arg: *mut c_void) {
+            // SAFETY: the sender retains this stack counter until every
+            // remote callback completes; a terminal panic never unwinds it.
+            let completed = unsafe { &*arg.cast::<AtomicUsize>() };
+            completed.fetch_add(1, Ordering::AcqRel);
+        }
+        // SAFETY: count_remote performs only an atomic increment; the counter
+        // stays alive until kernel_call_on_other_cpus acknowledges all CPUs.
+        unsafe {
+            kernel_call_on_other_cpus(count_remote, ptr::from_ref(&completed).cast_mut().cast())
+        };
+        assert_eq!(completed.load(Ordering::Acquire), other_cpu_count());
+        axlog::info!(
+            "intel-gt: SMP provider smoke completed on {} remote CPUs",
+            completed.load(Ordering::Acquire)
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +376,10 @@ unsafe extern "C" fn kernel_signal_pending_state(state: c_int, task: *mut c_void
     }
     let current = axtask::current();
     assert!(
-        ptr::eq(alloc::sync::Arc::as_ptr(&current.clone()).cast::<c_void>(), task.cast_const()),
+        ptr::eq(
+            alloc::sync::Arc::as_ptr(&current.clone()).cast::<c_void>(),
+            task.cast_const()
+        ),
         "signal_pending_state: upstream GT may only query the current task"
     );
     // A kernel thread has no signal state, so nothing can be pending on it.
@@ -371,7 +403,9 @@ static RUNTIME_PM_DEPTH: AtomicUsize = AtomicUsize::new(0);
 /// Opaque, non-null wakeref cookie. Linux only hands it back to the put.
 static RUNTIME_PM_COOKIE: u8 = 0;
 
-unsafe fn kernel_runtime_get(rpm: *mut c_void) -> intel_gt::intel_context_upstream::IntelWakerefHandle {
+unsafe fn kernel_runtime_get(
+    rpm: *mut c_void,
+) -> intel_gt::intel_context_upstream::IntelWakerefHandle {
     assert!(!rpm.is_null(), "runtime PM get on a null device");
     RUNTIME_PM_DEPTH.fetch_add(1, Ordering::AcqRel);
     ptr::addr_of!(RUNTIME_PM_COOKIE).cast_mut().cast()
@@ -381,9 +415,14 @@ unsafe fn kernel_runtime_put(
     rpm: *mut c_void,
     wakeref: intel_gt::intel_context_upstream::IntelWakerefHandle,
 ) {
-    assert!(!rpm.is_null() && !wakeref.is_null(), "runtime PM put with a null handle");
+    assert!(
+        !rpm.is_null() && !wakeref.is_null(),
+        "runtime PM put with a null handle"
+    );
     RUNTIME_PM_DEPTH
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| depth.checked_sub(1))
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+            depth.checked_sub(1)
+        })
         .unwrap_or_else(|_| panic!("runtime PM put without a matching get"));
 }
 
@@ -475,7 +514,10 @@ fn gt_irq_domain(domain: i32) -> intel_display::power_map::PowerDomain {
 /// non-null cookie; Linux only compares it and hands it back to the put.
 // upstream: display/intel_display_power.c intel_display_power_get()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_display_power_get(_display: *mut c_void, domain: i32) -> *mut c_void {
+pub unsafe extern "C" fn intel_display_power_get(
+    _display: *mut c_void,
+    domain: i32,
+) -> *mut c_void {
     let domain = gt_irq_domain(domain);
     let window = DISPLAY_WINDOW
         .lock()
@@ -502,7 +544,10 @@ pub unsafe extern "C" fn __intel_display_power_put_async(
     wakeref: *mut c_void,
     _delay_ms: i32,
 ) {
-    assert!(!wakeref.is_null(), "__intel_display_power_put_async: null wakeref");
+    assert!(
+        !wakeref.is_null(),
+        "__intel_display_power_put_async: null wakeref"
+    );
     let domain = gt_irq_domain(domain);
     let window = DISPLAY_WINDOW
         .lock()
@@ -519,19 +564,30 @@ pub unsafe extern "C" fn __intel_display_power_put_async(
 // upstream: display/intel_frontbuffer.c intel_frontbuffer_init()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_frontbuffer_init(_front: *mut c_void, _drm: *mut c_void) {
-    panic!("intel_frontbuffer_init: TheKernel's scanout owner does not track upstream frontbuffers");
+    panic!(
+        "intel_frontbuffer_init: TheKernel's scanout owner does not track upstream frontbuffers"
+    );
 }
 
 // upstream: display/intel_frontbuffer.c intel_frontbuffer_fini()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_frontbuffer_fini(_front: *mut c_void) {
-    panic!("intel_frontbuffer_fini: no frontbuffer exists because intel_frontbuffer_init fails closed");
+    panic!(
+        "intel_frontbuffer_fini: no frontbuffer exists because intel_frontbuffer_init fails closed"
+    );
 }
 
 // upstream: display/intel_frontbuffer.c __intel_frontbuffer_flush()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __intel_frontbuffer_flush(_front: *mut c_void, _origin: c_int, _bits: u32) {
-    panic!("__intel_frontbuffer_flush: no frontbuffer exists because intel_frontbuffer_init fails closed");
+pub unsafe extern "C" fn __intel_frontbuffer_flush(
+    _front: *mut c_void,
+    _origin: c_int,
+    _bits: u32,
+) {
+    panic!(
+        "__intel_frontbuffer_flush: no frontbuffer exists because intel_frontbuffer_init fails \
+         closed"
+    );
 }
 
 // upstream: display/intel_frontbuffer.c __intel_frontbuffer_invalidate()
@@ -541,7 +597,10 @@ pub unsafe extern "C" fn __intel_frontbuffer_invalidate(
     _origin: c_int,
     _bits: u32,
 ) {
-    panic!("__intel_frontbuffer_invalidate: no frontbuffer exists because intel_frontbuffer_init fails closed");
+    panic!(
+        "__intel_frontbuffer_invalidate: no frontbuffer exists because intel_frontbuffer_init \
+         fails closed"
+    );
 }
 
 // upstream: display/intel_overlay.c intel_overlay_available()
@@ -594,7 +653,8 @@ pub unsafe extern "C" fn intel_gt_sysfs_unregister(_gt: *mut c_void) {}
 /// With `CONFIG_HWMON` off, Linux's header provides an empty inline. The
 /// caller's `was_enabled` is left as the caller set it.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn i915_hwmon_power_max_disable(_i915: *mut c_void, _was_enabled: *mut bool) {}
+pub unsafe extern "C" fn i915_hwmon_power_max_disable(_i915: *mut c_void, _was_enabled: *mut bool) {
+}
 
 // upstream: i915_hwmon.h i915_hwmon_power_max_restore() (CONFIG_HWMON off)
 #[unsafe(no_mangle)]
@@ -618,10 +678,9 @@ pub unsafe extern "C" fn i915_pmu_gt_unparked(_gt: *mut c_void) {}
 use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::AtomicBool;
 
-use axhal::{
-    irq::{IpiReason, IpiTarget},
-    mem::PhysAddr,
-};
+use axfs_ng_vfs::FsPath;
+use axhal::mem::PhysAddr;
+use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use intel_gt::{
     intel_uncore_upstream::{UncoreKernelOps, install_uncore_kernel_ops},
     linux::{
@@ -633,9 +692,6 @@ use intel_gt::{
         primitives::{IoremapProvider, install_ioremap_provider},
     },
 };
-
-use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
-use axfs_ng_vfs::FsPath;
 
 use crate::{
     file::{FileDescription, FileLike, ReservedFd},
@@ -789,10 +845,15 @@ fn bar_size(ecam: &mut pci::Ecam, bdf: pci::Bdf, slot: u8) -> Option<u64> {
     let low = ecam.read_u32(bdf, offset)?;
     let is_io = low & 1 != 0;
     let is_64 = !is_io && (low >> 1) & 0x3 == 0x2;
-    let high = if is_64 { ecam.read_u32(bdf, offset + 4)? } else { 0 };
+    let high = if is_64 {
+        ecam.read_u32(bdf, offset + 4)?
+    } else {
+        0
+    };
 
     let sized = (|| {
-        ecam.write_u16(bdf, 0x04, command & !(CMD_IO | CMD_MEM)).ok()?;
+        ecam.write_u16(bdf, 0x04, command & !(CMD_IO | CMD_MEM))
+            .ok()?;
         ecam.write_u32(bdf, offset, u32::MAX).ok()?;
         let mask_low = ecam.read_u32(bdf, offset)?;
         let mut mask = u64::from(mask_low) & if is_io { !0x3 } else { !0xf };
@@ -840,8 +901,14 @@ fn root_port_of(bdf: pci::Bdf) -> Option<pci::Bdf> {
             'scan: for scan_bus in 0..=bus_end {
                 for device in 0..32u8 {
                     for function in 0..8u8 {
-                        let candidate = pci::Bdf { bus: scan_bus, device, function };
-                        let Some(vendor) = ecam.read_u32(candidate, 0x00) else { continue };
+                        let candidate = pci::Bdf {
+                            bus: scan_bus,
+                            device,
+                            function,
+                        };
+                        let Some(vendor) = ecam.read_u32(candidate, 0x00) else {
+                            continue;
+                        };
                         if vendor & 0xffff == 0xffff {
                             continue;
                         }
@@ -1041,7 +1108,9 @@ impl Pollable for AnonFile {
 
 impl FileLike for AnonFile {
     fn path(&self) -> axerrno::AxResult<alloc::borrow::Cow<'_, FsPath>> {
-        Ok(alloc::borrow::Cow::Borrowed(FsPath::new(b"anon_inode:[i915.gem]")))
+        Ok(alloc::borrow::Cow::Borrowed(FsPath::new(
+            b"anon_inode:[i915.gem]",
+        )))
     }
 
     fn set_nonblocking(&self, _nonblocking: bool) -> axerrno::AxResult {
@@ -1105,8 +1174,21 @@ unsafe extern "C" fn kernel_fd_install(fd: c_int, file: *mut c_void) {
         .lock()
         .remove(&fd)
         .unwrap_or_else(|| panic!("fd_install({fd}) without a reservation"));
-    let description = FileDescription::new(Arc::new(AnonFile { file: file as usize }))
-        .unwrap_or_else(|error| panic!("fd_install({fd}): {error:?}"));
+    let description = match super::upstream_sync::take_sync_file_for_install(file) {
+        Ok(Some((native_file, resource))) => {
+            crate::file::prepare_file_description_with_resource(
+                native_file,
+                0,
+                None,
+                Some(resource),
+            )
+        }
+        Ok(None) => FileDescription::new(Arc::new(AnonFile {
+            file: file as usize,
+        })),
+        Err(error) => Err(error),
+    }
+    .unwrap_or_else(|error| panic!("fd_install({fd}): {error:?}"));
     // The reservation publishes the descriptor into the caller's table.
     if let Err(error) = reservation.publish(description) {
         panic!("fd_install({fd}) publication failed: {error:?}");
@@ -1132,17 +1214,20 @@ fn device_bdf(dev: *mut c_void) -> Option<pci::Bdf> {
 
 unsafe extern "C" fn kernel_pci_resource_start(dev: *mut c_void, bar: u32) -> u64 {
     let Some(bdf) = device_bdf(dev) else { return 0 };
-    let Ok(slot) = u8::try_from(bar) else { return 0 };
+    let Ok(slot) = u8::try_from(bar) else {
+        return 0;
+    };
     if slot > 5 {
         return 0;
     }
-    with_config_read(|config| bar_decode(config, bdf, slot))
-        .map_or(0, |(base, _)| base)
+    with_config_read(|config| bar_decode(config, bdf, slot)).map_or(0, |(base, _)| base)
 }
 
 unsafe extern "C" fn kernel_pci_resource_len(dev: *mut c_void, bar: u32) -> u64 {
     let Some(bdf) = device_bdf(dev) else { return 0 };
-    let Ok(slot) = u8::try_from(bar) else { return 0 };
+    let Ok(slot) = u8::try_from(bar) else {
+        return 0;
+    };
     if slot > 5 {
         return 0;
     }
@@ -1200,12 +1285,12 @@ static PCI_OPS: PciOps = PciOps {
 /// Run `read` over the ECAM window. Without a mapped window the answer is
 /// `None` and callers report `-ENODEV`.
 #[cfg(target_os = "none")]
-fn with_config_read<R>(read: impl FnOnce(&pci::Ecam) -> Option<R>) -> Option<R> {
+fn with_config_read<R>(read: impl FnOnce(&dyn ConfigSpace) -> Option<R>) -> Option<R> {
     with_config(|ecam| read(&*ecam))
 }
 
 #[cfg(not(target_os = "none"))]
-fn with_config_read<R>(_read: impl FnOnce(&pci::Ecam) -> Option<R>) -> Option<R> {
+fn with_config_read<R>(_read: impl FnOnce(&dyn ConfigSpace) -> Option<R>) -> Option<R> {
     None
 }
 
@@ -1219,27 +1304,73 @@ fn bar_size_for(bdf: pci::Bdf, slot: u8) -> Option<u64> {
     bar_size_host(bdf, slot)
 }
 
+// The GT and native display share this PCI function. A failed GT probe must
+// restore the pre-probe bus-master/decode bits, not disable a live display.
+#[derive(Clone, Copy)]
+struct PciEnableState {
+    original: u16,
+    references: usize,
+}
+
+static PCI_COMMAND_BEFORE: spin::Mutex<BTreeMap<(u8, u8, u8), PciEnableState>> =
+    spin::Mutex::new(BTreeMap::new());
+
 unsafe extern "C" fn kernel_pci_enable_device(dev: *mut c_void) -> c_int {
-    let Some(bdf) = device_bdf(dev) else { return -ENODEV_ };
+    let Some(bdf) = device_bdf(dev) else {
+        return -ENODEV_;
+    };
     // Memory decode for the GT BARs, and I/O decode when the function has an
     // I/O BAR. Bus mastering is a separate call (`pci_set_master`).
     let has_io = (0..6u8).any(|slot| {
         with_config_read(|config| bar_decode(config, bdf, slot))
             .is_some_and(|(_, flags)| flags & IORESOURCE_IO != 0)
     });
+    let mut before = PCI_COMMAND_BEFORE.lock();
+    let key = (bdf.bus, bdf.device, bdf.function);
+    if let Some(state) = before.get_mut(&key) {
+        if state.references != 0 {
+            let Some(references) = state.references.checked_add(1) else { return -75; };
+            state.references = references;
+            return 0;
+        }
+        // A failed final disable retained only a rollback obligation, not
+        // an active reference. Retry hardware enable without losing the
+        // original pre-probe command bits.
+    }
+    let mut original = None;
     match config_update_command(bdf, |command| {
+        original = Some(command);
         command | CMD_MEM | if has_io { CMD_IO } else { 0 }
     }) {
-        Some(()) => 0,
+        Some(()) => {
+            before.entry(key).and_modify(|state| state.references = 1)
+                .or_insert(PciEnableState { original: original.unwrap(), references: 1 });
+            0
+        }
         None => -EIO_,
     }
 }
 
 unsafe extern "C" fn kernel_pci_disable_device(dev: *mut c_void) {
-    // Linux's `pci_disable_device()` clears bus mastering and leaves decode
-    // alone, so the BARs stay mapped for the owner that disabled the device.
     if let Some(bdf) = device_bdf(dev) {
-        let _ = config_update_command(bdf, |command| command & !CMD_MASTER);
+        let mut before = PCI_COMMAND_BEFORE.lock();
+        let key = (bdf.bus, bdf.device, bdf.function);
+        if let Some(state) = before.get_mut(&key) {
+            if state.references > 1 {
+                state.references -= 1;
+                return;
+            }
+            state.references = 0;
+            let original = state.original;
+            if config_update_command(bdf, |command| {
+                (command & !(CMD_IO | CMD_MEM | CMD_MASTER))
+                    | (original & (CMD_IO | CMD_MEM | CMD_MASTER))
+            }).is_some() {
+                before.remove(&key);
+            } else {
+                axlog::warn!("intel-gt: PCI command rollback unverified; retaining retryable before-image");
+            }
+        }
     }
 }
 
@@ -1248,15 +1379,18 @@ unsafe extern "C" fn kernel_pci_set_master(dev: *mut c_void) {
     let _ = config_update_command(bdf, |command| command | CMD_MASTER);
 }
 
-/// `pci_enable_msi()`. The display IRQ owner reserved this function's MSI
-/// vector and programmed the message (`irq.rs::install_n305`). Enabling MSI
-/// consumes that vector; it does not program a second one. The vector number
-/// is read back by the IRQ registration through `IrqCoreOps`.
+/// `pci_enable_msi()`. Before the translated probe starts, the IRQ owner has
+/// either reused the native display vector or reserved/programmed one GT-only
+/// message. Enabling MSI consumes that same vector; it must never allocate a
+/// second one or report success for an unowned PCI route.
 unsafe extern "C" fn kernel_pci_enable_msi(dev: *mut c_void) -> c_int {
-    let Some(bdf) = device_bdf(dev) else { return -ENODEV_ };
+    let Some(bdf) = device_bdf(dev) else {
+        return -ENODEV_;
+    };
     match irq_msi_vector(bdf) {
-        Some(_) => 0,
+        Some(vector) if intel_gt::linux::dma::device_irq(dev) == vector => 0,
         None => -ENOSPC,
+        Some(_) => -ENOSPC,
     }
 }
 
@@ -1270,14 +1404,23 @@ fn irq_msi_vector(_bdf: pci::Bdf) -> Option<usize> {
     None
 }
 
-/// `pci_disable_msi()`. The vector stays reserved by the IRQ owner, which is
-/// the only place it is torn down, so disabling MSI here only clears the
-/// function's own enable bit path, which the owner already controls.
-unsafe extern "C" fn kernel_pci_disable_msi(_dev: *mut c_void) {}
+/// `pci_disable_msi()`. The IRQ owner restores and retires only a GT-created
+/// route after `free_irq()` has removed the translated handler. The separate
+/// native display owner keeps its shared vector active across GT teardown.
+unsafe extern "C" fn kernel_pci_disable_msi(dev: *mut c_void) {
+    #[cfg(target_os = "none")]
+    if let Some(bdf) = device_bdf(dev) {
+        super::irq::upstream::disable_msi(bdf);
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = dev;
+}
 
 /// `pci_save_state()`: snapshot the standard configuration header.
 unsafe extern "C" fn kernel_pci_save_state(dev: *mut c_void) -> c_int {
-    let Some(bdf) = device_bdf(dev) else { return -ENODEV_ };
+    let Some(bdf) = device_bdf(dev) else {
+        return -ENODEV_;
+    };
     let header = with_config_read(|config| {
         let mut words = [0u32; 16];
         for (index, word) in words.iter_mut().enumerate() {
@@ -1287,7 +1430,9 @@ unsafe extern "C" fn kernel_pci_save_state(dev: *mut c_void) -> c_int {
     });
     match header {
         Some(words) => {
-            SAVED_HEADERS.lock().insert((bdf.bus, bdf.device, bdf.function), words);
+            SAVED_HEADERS
+                .lock()
+                .insert((bdf.bus, bdf.device, bdf.function), words);
             0
         }
         None => -ENODEV_,
@@ -1299,13 +1444,20 @@ unsafe extern "C" fn kernel_pci_save_state(dev: *mut c_void) -> c_int {
 /// read-only vendor/device word is skipped.
 unsafe extern "C" fn kernel_pci_restore_state(dev: *mut c_void) {
     let Some(bdf) = device_bdf(dev) else { return };
-    let Some(words) = SAVED_HEADERS.lock().get(&(bdf.bus, bdf.device, bdf.function)).copied()
+    let Some(words) = SAVED_HEADERS
+        .lock()
+        .get(&(bdf.bus, bdf.device, bdf.function))
+        .copied()
     else {
         return;
     };
     for (index, word) in words.iter().enumerate().skip(1) {
         let offset = (index * 4) as u16;
-        let value = if offset == 0x04 { *word & 0xffff } else { *word };
+        let value = if offset == 0x04 {
+            *word & 0xffff
+        } else {
+            *word
+        };
         let _ = config_write_u32(bdf, offset, value);
     }
 }
@@ -1313,7 +1465,9 @@ unsafe extern "C" fn kernel_pci_restore_state(dev: *mut c_void) {
 /// `pci_set_power_state()`. D0 is the only state TheKernel's GT path enters;
 /// D3hot is written when requested. Without a PM capability only D0 exists.
 unsafe extern "C" fn kernel_pci_set_power_state(dev: *mut c_void, state: u32) -> c_int {
-    let Some(bdf) = device_bdf(dev) else { return -ENODEV_ };
+    let Some(bdf) = device_bdf(dev) else {
+        return -ENODEV_;
+    };
     if state > 3 {
         return -EINVAL_;
     }
@@ -1342,18 +1496,24 @@ unsafe extern "C" fn kernel_pci_set_power_state(dev: *mut c_void, state: u32) ->
 
 unsafe extern "C" fn kernel_pci_d3cold_enable(dev: *mut c_void) {
     if let Some(bdf) = device_bdf(dev) {
-        D3COLD_ALLOWED.lock().insert((bdf.bus, bdf.device, bdf.function), true);
+        D3COLD_ALLOWED
+            .lock()
+            .insert((bdf.bus, bdf.device, bdf.function), true);
     }
 }
 
 unsafe extern "C" fn kernel_pci_d3cold_disable(dev: *mut c_void) {
     if let Some(bdf) = device_bdf(dev) {
-        D3COLD_ALLOWED.lock().insert((bdf.bus, bdf.device, bdf.function), false);
+        D3COLD_ALLOWED
+            .lock()
+            .insert((bdf.bus, bdf.device, bdf.function), false);
     }
 }
 
 unsafe extern "C" fn kernel_pci_find_root_port(dev: *mut c_void) -> *mut c_void {
-    let Some(bdf) = device_bdf(dev) else { return core::ptr::null_mut() };
+    let Some(bdf) = device_bdf(dev) else {
+        return core::ptr::null_mut();
+    };
     match root_port_of(bdf) {
         Some(port) => identity_for(port),
         None => core::ptr::null_mut(),
@@ -1362,36 +1522,31 @@ unsafe extern "C" fn kernel_pci_find_root_port(dev: *mut c_void) -> *mut c_void 
 
 unsafe extern "C" fn kernel_pci_resource_flags(dev: *mut c_void, bar: c_int) -> u64 {
     let Some(bdf) = device_bdf(dev) else { return 0 };
-    let Ok(slot) = u8::try_from(bar) else { return 0 };
+    let Ok(slot) = u8::try_from(bar) else {
+        return 0;
+    };
     if slot > 5 {
         return 0;
     }
     with_config_read(|config| bar_decode(config, bdf, slot)).map_or(0, |(_, flags)| flags)
 }
 
-/// Linux `DMA_BIT_MASK(32)`. TheKernel's DMA is physically addressed, so the
-/// only limit a device can hit is the width of its address register; the GT
-/// programs 32-bit-or-wider addresses everywhere it uses DMA.
-const DMA_MIN_MASK: u64 = 0xffff_ffff;
-
-unsafe extern "C" fn kernel_dma_set_mask(_dev: *mut c_void, mask: u64) -> c_int {
-    if mask >= DMA_MIN_MASK { 0 } else { -EIO_ }
+/// Enforce the advertised DMA masks in the owner that publishes each SG or
+/// coherent mapping, rather than accepting an address width without using it.
+unsafe extern "C" fn kernel_dma_set_mask(dev: *mut c_void, mask: u64) -> c_int {
+    intel_gt::linux::dma::set_mask(dev, mask, false).map_or(-EIO_, |()| 0)
 }
-
-unsafe extern "C" fn kernel_dma_set_coherent_mask(_dev: *mut c_void, mask: u64) -> c_int {
-    if mask >= DMA_MIN_MASK { 0 } else { -EIO_ }
+unsafe extern "C" fn kernel_dma_set_coherent_mask(dev: *mut c_void, mask: u64) -> c_int {
+    intel_gt::linux::dma::set_mask(dev, mask, true).map_or(-EIO_, |()| 0)
 }
-
 unsafe extern "C" fn kernel_dma_set_max_seg_size(dev: *mut c_void, size: u32) {
-    // Recorded per device for the scatter-gather builder. The LinuxKPI DMA
-    // path does not split segments, so the value is an upper bound that the
-    // upstream code only ever uses to size its own segments.
-    let _ = (dev, size);
+    intel_gt::linux::dma::set_max_segment(dev, size).expect("i915: invalid DMA segment owner/limit");
 }
 
-/// `aperture_remove_conflicting_pci_devices()`. The firmware framebuffer is
-/// the simpledrm surface; when the native device takes the aperture, that
-/// surface is released so the console is owned by one device.
+/// The upstream GT does not own display takeover. Native KMS publishes its
+/// primary only after validating scanout; until then simpledrm must survive
+/// even a failed GT probe. This split has no conflicting GT framebuffer to
+/// remove, unlike Linux where i915 also registers the replacement display.
 unsafe extern "C" fn kernel_aperture_remove_conflicting(
     dev: *mut c_void,
     _name: *const c_char,
@@ -1399,7 +1554,6 @@ unsafe extern "C" fn kernel_aperture_remove_conflicting(
     if device_bdf(dev).is_none() {
         return -ENODEV_;
     }
-    crate::drm::release_firmware_primary();
     0
 }
 
@@ -1427,7 +1581,11 @@ unsafe extern "C" fn kernel_domain_host_bridge(dev: *mut c_void) -> *mut c_void 
     if device_bdf(dev).is_none() {
         return core::ptr::null_mut();
     }
-    let host = pci::Bdf { bus: 0, device: 0, function: 0 };
+    let host = pci::Bdf {
+        bus: 0,
+        device: 0,
+        function: 0,
+    };
     match with_config_read(|config| config.read_u32(host, 0x00)) {
         Some(vendor) if vendor & 0xffff != 0xffff => identity_for(host),
         _ => core::ptr::null_mut(),
@@ -1445,8 +1603,12 @@ unsafe extern "C" fn kernel_read_config_dword(
     value: *mut u32,
 ) -> c_int {
     assert!(!value.is_null(), "config read into a null value");
-    let Some(bdf) = device_bdf(dev) else { return -ENODEV_ };
-    let Ok(offset) = u16::try_from(offset) else { return -EINVAL_ };
+    let Some(bdf) = device_bdf(dev) else {
+        return -ENODEV_;
+    };
+    let Ok(offset) = u16::try_from(offset) else {
+        return -EINVAL_;
+    };
     if offset & 3 != 0 || offset >= 0x1000 {
         return -EINVAL_;
     }
@@ -1461,8 +1623,12 @@ unsafe extern "C" fn kernel_read_config_dword(
 }
 
 unsafe extern "C" fn kernel_write_config_dword(dev: *mut c_void, offset: u32, value: u32) -> c_int {
-    let Some(bdf) = device_bdf(dev) else { return -ENODEV_ };
-    let Ok(offset) = u16::try_from(offset) else { return -EINVAL_ };
+    let Some(bdf) = device_bdf(dev) else {
+        return -ENODEV_;
+    };
+    let Ok(offset) = u16::try_from(offset) else {
+        return -EINVAL_;
+    };
     if offset & 3 != 0 || offset >= 0x1000 {
         return -EINVAL_;
     }
@@ -1556,7 +1722,12 @@ unsafe extern "C" fn kernel_pm_get_if_active(dev: *mut c_void) -> c_int {
 
 unsafe extern "C" fn kernel_pm_get_if_in_use(dev: *mut c_void) -> c_int {
     // Only a device that already holds a reference gains another.
-    let in_use = DEVICE_PM_USAGE.lock().get(&(dev as usize)).copied().unwrap_or(0) > 0;
+    let in_use = DEVICE_PM_USAGE
+        .lock()
+        .get(&(dev as usize))
+        .copied()
+        .unwrap_or(0)
+        > 0;
     if in_use {
         match pm_usage_add(dev, 1) {
             Some(_) => 1,
@@ -1654,18 +1825,18 @@ fn other_cpu_count() -> usize {
 
 /// One `CallFunction` IPI to every CPU except this one.
 fn send_ipi_to_others() {
-    let cpu_num = axhal::cpu_num();
-    let cpu_id = axhal::percpu::this_cpu_id();
-    if let Err(error) = axhal::irq::send_ipi_reason(
-        IpiReason::CallFunction,
-        IpiTarget::AllExceptCurrent { cpu_id, cpu_num },
-    ) {
+    if let Err(error) = axruntime::call_function_extension_other_cpus() {
         panic!("cross-CPU call: CallFunction IPI could not be sent: {error:?}");
     }
 }
 
 fn wait_until(mut done: impl FnMut() -> bool) {
+    let deadline = axhal::time::monotonic_time() + core::time::Duration::from_secs(5);
     while !done() {
+        assert!(
+            axhal::time::monotonic_time() < deadline,
+            "upstream GT cross-CPU callback acknowledgement timed out"
+        );
         core::hint::spin_loop();
     }
 }
@@ -1677,6 +1848,7 @@ unsafe extern "C" fn kernel_call_on_other_cpus(
     arg: *mut c_void,
 ) {
     let _serial = SMP_SERIAL.lock();
+    let _cpu_guard = kernel_guard::NoPreemptIrqSave::new();
     let others = other_cpu_count();
     if others == 0 {
         return;
@@ -1699,6 +1871,7 @@ unsafe extern "C" fn kernel_stop_machine(
     _cpus: *const c_void,
 ) -> c_int {
     let _serial = SMP_SERIAL.lock();
+    let _cpu_guard = kernel_guard::NoPreemptIrqSave::new();
     let others = other_cpu_count();
     if others == 0 {
         // SAFETY: `func`/`data` are the stop_machine callback and its argument from the Linux caller.
@@ -1736,7 +1909,10 @@ unsafe extern "C" fn kernel_ioremap(phys: u64, size: u64) -> *mut c_void {
         return core::ptr::null_mut();
     }
     let start = phys & !0xfff;
-    let Some(end) = phys.checked_add(size).and_then(|end| end.checked_add(0xfff)) else {
+    let Some(end) = phys
+        .checked_add(size)
+        .and_then(|end| end.checked_add(0xfff))
+    else {
         return core::ptr::null_mut();
     };
     let length = (end & !0xfff) - start;
@@ -1815,7 +1991,9 @@ unsafe extern "C" fn kernel_register_pmic_bus_access_notifier(nb: *mut NotifierB
     0
 }
 
-unsafe extern "C" fn kernel_unregister_pmic_bus_access_notifier_unlocked(nb: *mut NotifierBlock) -> c_int {
+unsafe extern "C" fn kernel_unregister_pmic_bus_access_notifier_unlocked(
+    nb: *mut NotifierBlock,
+) -> c_int {
     let mut chain = PMIC_NOTIFIERS.lock();
     match chain.iter().position(|&entry| entry == nb as usize) {
         Some(index) => {
@@ -1838,7 +2016,8 @@ static UNCORE_KERNEL_OPS: UncoreKernelOps = UncoreKernelOps {
     punit_release: kernel_punit_release,
     punit_assert_acquired: kernel_punit_assert_acquired,
     register_pmic_bus_access_notifier: kernel_register_pmic_bus_access_notifier,
-    unregister_pmic_bus_access_notifier_unlocked: kernel_unregister_pmic_bus_access_notifier_unlocked,
+    unregister_pmic_bus_access_notifier_unlocked:
+        kernel_unregister_pmic_bus_access_notifier_unlocked,
     display_has_fpga_dbg: kernel_display_has_fpga_dbg,
 };
 
@@ -1857,8 +2036,8 @@ fn install_k2_tables() -> Result<(), &'static str> {
     install_pci_bus_ops(&PCI_BUS_OPS)?;
     install_ioremap_provider(&IOREMAP_PROVIDER)?;
     install_uncore_kernel_ops(&UNCORE_KERNEL_OPS)?;
-    if !axhal::irq::register_ipi_reason(IpiReason::CallFunction, smp_ipi_handler) {
-        return Err("CallFunction IPI consumer already registered");
+    if !axruntime::register_call_function_extension(smp_ipi_handler) {
+        return Err("CallFunction extension already registered with another owner");
     }
     Ok(())
 }

@@ -45,6 +45,8 @@ pub(crate) use fbdev::drm_scanout;
 pub(crate) use fence::metrics as fence_metrics;
 pub use file::{DrmEvent, DrmFile, OpenId};
 pub use gem::{DumbBuffer, DumbRequest, GemBacking, GemHandle, MmapOffset};
+#[cfg(feature = "intel-upstream-gt")]
+pub(crate) use gem::GemMemoryCharge;
 pub use kms::{ConnectorInfo, CrtcInfo, FramebufferId, KmsResources, Mode, PageFlip};
 pub use render::RenderAdapter;
 

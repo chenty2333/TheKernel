@@ -239,6 +239,13 @@ class Artifacts:
         return self.root / "out" / "rootfs" / "x86" / name
 
 
+def effective_backtrace(artifacts: Artifacts) -> str:
+    # N305 bring-up has no early UART; panic must retain frame addresses for
+    # symbolization against the corresponding unstripped ELF. Explicit user
+    # overrides still apply, including disabling it for a measurement run.
+    return os.environ.get("AX_BACKTRACE") or ("y" if artifacts.machine.name == "n305" else "n")
+
+
 def artifact_config_stamp(artifacts: Artifacts, transport: str) -> Path:
     return artifacts.esp_for_rootfs_transport(transport).with_suffix(".config-stamp")
 
@@ -257,7 +264,7 @@ def artifact_input_key(artifacts: Artifacts, rootfs: Path | None, transport: str
     with image.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
-    settings = (os.environ.get("AX_LOG") or "info", os.environ.get("AX_BACKTRACE") or "n",
+    settings = (os.environ.get("AX_LOG") or "info", effective_backtrace(artifacts),
                 os.environ.get("RUSTFLAGS", "").strip())
     digest.update(repr(settings).encode())
     return digest.hexdigest()

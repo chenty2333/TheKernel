@@ -42,9 +42,18 @@ pub unsafe extern "C" fn tk_linux_firmware_request_nowarn(
     }
     unsafe { *firmware = ptr::null() };
 
-    let path = match unsafe { CStr::from_ptr(name) }.to_str() {
+    let name = match unsafe { CStr::from_ptr(name) }.to_str() {
         Ok(path) if !path.is_empty() => path,
         _ => return -crate::linux_config::EINVAL,
+    };
+    // Linux request_firmware() names are relative to /lib/firmware; the rootfs
+    // reader resolves paths from "/", so prepend the search root here.
+    let prefixed;
+    let path = if name.starts_with('/') {
+        name
+    } else {
+        prefixed = alloc::format!("/lib/firmware/{name}");
+        prefixed.as_str()
     };
     let Some(bytes) = axdriver_base::firmware::request(path, MAX_I915_FIRMWARE_BYTES) else {
         return -crate::linux_config::ENOENT;

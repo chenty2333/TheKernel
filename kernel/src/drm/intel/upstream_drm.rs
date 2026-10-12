@@ -31,18 +31,22 @@ use core::{
 };
 
 use intel_gt::{
+    i915_driver_upstream::{DrmDriverDesc, i915_drm_driver},
     i915_gem_context_types_upstream::DrmI915Private,
     i915_probe_provider_upstream::{
         I915FrameworkOps, I915ProbeOps, install_i915_framework_ops, install_i915_probe_ops,
     },
     intel_context_upstream::{DmaFence, DrmGemObjectBaseLayout, Kref},
-    linux::drm_core::{DrmCoreProvider, install_drm_core_provider},
+    linux::{
+        drm_core::{DrmCoreProvider, install_drm_core_provider},
+        shmem,
+    },
+    linux_i915_private::{DrmDevicePrefix, DrmVmaOffsetManager, Inode},
 };
-
-use super::{pci, upstream_gt};
 
 #[cfg(target_os = "none")]
 use super::pci::{ConfigSpace, Ecam};
+use super::{pci, upstream_gt};
 
 const ENODEV: c_int = 19;
 const EBUSY: c_int = 16;
@@ -55,6 +59,12 @@ const GFP_ZERO: u32 = 0x0100;
 unsafe extern "C" {
     /// Linux `kmalloc()`, exported under its C name by `tk-intel-gt`.
     fn kmalloc(size: usize, flags: u32) -> *mut c_void;
+    fn kfree(object: *mut c_void);
+    fn drm_mm_init(mm: *mut intel_gt::linux::gem_memory::DrmMm, start: u64, size: u64);
+    fn drm_vma_offset_remove(
+        manager: *mut DrmVmaOffsetManager,
+        node: *mut intel_gt::intel_context_upstream::DrmVmaOffsetNode,
+    );
     /// Linux `dma_resv_init()`, exported under its C name by `tk-intel-gt`.
     fn dma_resv_init(resv: *mut c_void);
     /// Linux `drmm_add_action_or_reset()`, exported by `tk-intel-gt`.
@@ -77,7 +87,8 @@ fn err_ptr(errno: c_int) -> *mut c_void {
 
 /// The upstream `drm_device` attached to the kernel's native Intel DRM device.
 /// TheKernel registers one primary device (`crate::drm::primary_device`); the
-/// upstream i915 is attached to it and is never registered as a second device.
+/// upstream i915 shares its file dispatcher and is never a second KMS device.
+/// GT registration may precede primary KMS registration (including fallback).
 static BOUND_DRM: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 /// Set by `drm_dev_unplug()`. `drm_dev_enter()` then reports the device gone.
 static UNPLUGGED: AtomicBool = AtomicBool::new(false);
@@ -89,10 +100,9 @@ unsafe extern "C" fn drm_dev_register(dev: *mut c_void, _flags: c_ulong) -> c_in
     if dev.is_null() {
         return -EINVAL;
     }
-    if crate::drm::primary_device().is_none() {
-        axlog::error!("upstream i915: no native primary DRM device to attach to");
-        return -ENODEV;
-    }
+    // GT registration is independent of KMS takeover. A failed native
+    // fastboot may leave the firmware KMS primary to be registered later;
+    // neither that ordering nor a headless machine invalidates this GT.
     match BOUND_DRM.compare_exchange(ptr::null_mut(), dev, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {
             UNPLUGGED.store(false, Ordering::Release);
@@ -361,28 +371,90 @@ unsafe extern "C" fn modparam_force_probe() -> *const c_char {
     EMPTY_FORCE_PROBE.as_ptr().cast()
 }
 
-/// `devm_drm_dev_alloc_i915()`: allocate the zeroed `drm_i915_private` and point
-/// its DRM device at the native PCI identity, as `devm_drm_dev_alloc()` does
-/// with the parent device.
-unsafe extern "C" fn devm_drm_dev_alloc_i915(pdev: *mut c_void, err: *mut c_int) -> *mut DrmI915Private {
-    let size = size_of::<DrmI915Private>();
-    // SAFETY: `kmalloc` with `__GFP_ZERO` returns `size` zeroed bytes or NULL;
-    // the cast is to the allocation's own type.
-    let i915 = unsafe { kmalloc(size, GFP_KERNEL | GFP_ZERO) }.cast::<DrmI915Private>();
-    if i915.is_null() {
+/// The DRM device and its GEM resources have one kernel-lifetime owner, just
+/// like the native PCI identity. The inode is the upstream-layout view; its
+/// mapping is owned by the existing LinuxKPI anonymous file, not an opaque
+/// token. The VMA manager uses the same drm_mm allocator as GEM mmap offsets.
+#[repr(C)]
+struct I915Allocation {
+    i915: DrmI915Private,
+    inode: Inode,
+    vma: DrmVmaOffsetManager,
+    driver: DrmDriverDesc,
+    mapping_file: *mut shmem::File,
+}
+
+const DRM_FILE_PAGE_OFFSET_START: u64 = (u32::MAX as u64 >> 12) + 1;
+const DRM_FILE_PAGE_OFFSET_SIZE: u64 = (u32::MAX as u64 >> 12) * 256;
+
+/// Native `devm_drm_dev_alloc()` + the GEM portion of `drm_dev_init()`.
+/// Zeroing i915 alone is insufficient: early TTM init dereferences the DRM
+/// anonymous inode, and subsequent GEM users need a live mmap-offset manager.
+unsafe extern "C" fn devm_drm_dev_alloc_i915(
+    pdev: *mut c_void,
+    err: *mut c_int,
+) -> *mut DrmI915Private {
+    if !err.is_null() {
+        // SAFETY: the DRM allocation callback contract supplies `err` as NULL
+        // or a writable errno slot; this branch checks the nullable case.
+        unsafe { *err = -ENOMEM };
+    }
+    if pdev.is_null() {
         if !err.is_null() {
-            // SAFETY: the caller passes a writable `int` for the error code.
-            unsafe { *err = -ENOMEM };
+            // SAFETY: as above, a non-null `err` is the caller's writable
+            // errno slot and is checked before storing.
+            unsafe { *err = -EINVAL };
         }
         return ptr::null_mut();
     }
-    // SAFETY: `i915` is a fresh, zeroed, exclusively owned allocation of
-    // `DrmI915Private`, and `pdev` is the native PCI identity the caller owns.
-    unsafe {
-        (*i915).drm.dev = pdev;
-        (*i915).drm.dma_dev = pdev;
+    let size = size_of::<I915Allocation>();
+    // SAFETY: `kmalloc` with `__GFP_ZERO` returns `size` zeroed bytes or NULL;
+    // the cast is to the allocation's own type.
+    let allocation = unsafe { kmalloc(size, GFP_KERNEL | GFP_ZERO) }.cast::<I915Allocation>();
+    if allocation.is_null() {
+        return ptr::null_mut();
     }
-    i915
+    // Reuse the real page-cache owner. This file is retained with the device;
+    // no pages are allocated until requested through its mapping.
+    // SAFETY: the name is a static NUL-terminated string and the LinuxKPI
+    // shmem helper accepts a zero-sized file to be grown on later faults.
+    let file = unsafe { shmem::shmem_file_setup(c"drm".as_ptr(), 0, 0) };
+    if intel_gt::linux_config::IS_ERR(file) {
+        if !err.is_null() {
+            // SAFETY: a non-null `err` is the writable errno slot supplied to
+            // this allocator callback, checked above before storing here.
+            unsafe { *err = file as isize as c_int };
+        }
+        // SAFETY: `allocation` is still our live, unshared kmalloc block; the
+        // failed shmem setup did not take ownership of it.
+        unsafe { kfree(allocation.cast()) };
+        return ptr::null_mut();
+    }
+    // SAFETY: `pdev` is the live PCI device supplied by i915's allocator
+    // callback. All resources are exclusively owned and initialized in their
+    // final addresses (drm_mm contains self-linked sentinels). Publish them
+    // only after their owners exist; no GT hardware is accessed here.
+    unsafe {
+        ptr::write(ptr::addr_of_mut!((*allocation).driver), i915_drm_driver());
+        (*allocation).mapping_file = file;
+        (*allocation).inode.i_mapping = (*file).f_mapping.cast();
+        let manager = ptr::addr_of_mut!((*allocation).vma);
+        drm_mm_init(
+            ptr::addr_of_mut!((*manager).vm_addr_space),
+            DRM_FILE_PAGE_OFFSET_START,
+            DRM_FILE_PAGE_OFFSET_SIZE,
+        );
+        (*allocation).i915.drm.initialize(
+            pdev,
+            ptr::addr_of_mut!((*allocation).driver).cast(),
+            ptr::addr_of_mut!((*allocation).inode),
+            manager,
+        );
+        if !err.is_null() {
+            *err = 0;
+        }
+    }
+    allocation.cast()
 }
 
 /// Field-for-field view of `struct i915_params` (`i915_params.h`). The owning
@@ -457,14 +529,41 @@ unsafe extern "C" fn dma_fence_is_i915(fence: *mut c_void) -> bool {
 /// `drm_file` is opaque here, and the kernel's `DrmFile` is bound to it only
 /// when the ioctl owner routes requests. The postclose path that calls this is
 /// therefore unreachable until that binding exists, so it panics if reached.
-unsafe extern "C" fn file_client(_file: *mut c_void) -> *mut c_void {
-    panic!("file_client: upstream drm_file is not bound to a kernel DrmFile yet");
+unsafe extern "C" fn file_client(file: *mut c_void) -> *mut c_void {
+    if file.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: i915 invokes this callback with its live LinuxKPI `drm_file`,
+    // whose allocation remains owned by the active open/close callback.
+    let private = unsafe { (*file.cast::<intel_gt::linux::gem::DrmFile>()).driver_priv };
+    if private.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: `driver_priv` is the i915 file-private allocation attached to
+    // this live `drm_file`; the pinned Linux 7.2.3 x86_64 layout places its
+    // `client` pointer at byte 112 and includes that field in the allocation.
+    unsafe { private.cast::<u8>().add(112).cast::<*mut c_void>().read() }
 }
 
 /// `kfree_rcu_file_priv()`: frees the private data of a closed `drm_file`. The
 /// same binding gap as [`file_client`] applies.
-unsafe extern "C" fn kfree_rcu_file_priv(_file: *mut c_void) {
-    panic!("kfree_rcu_file_priv: upstream drm_file is not bound to a kernel DrmFile yet");
+unsafe extern "C" fn kfree_rcu_file_priv(file: *mut c_void) {
+    if file.is_null() {
+        return;
+    }
+    let drm_file = file.cast::<intel_gt::linux::gem::DrmFile>();
+    // SAFETY: the DRM postclose callback supplies this live LinuxKPI file, and
+    // the file-private allocation remains owned by it until this callback.
+    let private = unsafe { (*drm_file).driver_priv };
+    if !private.is_null() {
+        // SAFETY: `private` is the kmalloc-backed driver-private block owned by
+        // this file; clearing the slot first prevents a second close from
+        // freeing it again.
+        unsafe {
+            (*drm_file).driver_priv = ptr::null_mut();
+            kfree(private);
+        }
+    }
 }
 
 /// `drmm_add_action_or_reset()`: the kernel's DRM-managed action registry.
@@ -575,7 +674,12 @@ static FRAMEWORK: I915FrameworkOps = I915FrameworkOps {
     i915_params_copy: {
         // SAFETY: the table's `struct i915_params *` and this `*mut c_void` are
         // the same thin pointer; `i915_params_copy` names its own layout.
-        unsafe { core::mem::transmute::<unsafe extern "C" fn(*mut c_void), unsafe extern "C" fn(*mut intel_gt::linux_i915_private::I915Params)>(i915_params_copy) }
+        unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(*mut c_void),
+                unsafe extern "C" fn(*mut intel_gt::linux_i915_private::I915Params),
+            >(i915_params_copy)
+        }
     },
     display_parent_interface: no_display_parent_interface,
     display_probe_defer: display_never_defers,
@@ -601,7 +705,11 @@ static FRAMEWORK: I915FrameworkOps = I915FrameworkOps {
 /// `early_gmd_read()`: reads one dword of BAR0 at `offset` through the display
 /// register window that the probe registered. Returns false when the window is
 /// not registered or the offset does not fit in it.
-unsafe extern "C" fn early_gmd_read(_i915: *mut DrmI915Private, offset: u32, value: *mut u32) -> bool {
+unsafe extern "C" fn early_gmd_read(
+    _i915: *mut DrmI915Private,
+    offset: u32,
+    value: *mut u32,
+) -> bool {
     let Some(window) = upstream_gt::display_window() else {
         return false;
     };
@@ -650,8 +758,13 @@ unsafe extern "C" fn dev_put(_dev: *mut c_void) {}
 
 /// `drm_is_current_master()`: no upstream `drm_file` is bound to a kernel
 /// `DrmFile`, so no file can be shown to be master. Privileged paths refuse.
-unsafe extern "C" fn is_current_master(_file: *mut c_void) -> bool {
-    false
+unsafe extern "C" fn is_current_master(file: *mut c_void) -> bool {
+    let Some(native) = super::upstream_file::native_file(file) else {
+        return false;
+    };
+    // SAFETY: `native_file` returns a pointer only for an active file binding;
+    // the binding keeps the native `DrmFile` borrowed for this callback.
+    unsafe { (&*native.cast::<crate::drm::DrmFile>()).is_current_master() }
 }
 
 /// `drm_print_memory_stats()`: fdinfo output. TheKernel exposes no fdinfo, so
@@ -669,17 +782,41 @@ unsafe extern "C" fn print_memory_stats(
 /// nothing to release.
 unsafe extern "C" fn gem_free_mmap_offset(obj: *mut c_void) {
     let obj = obj.cast::<DrmGemObjectBaseLayout>();
-    // SAFETY: the caller passes a live `drm_gem_object`; only `vma_node` is read.
-    if unsafe { (*obj).vma_node.vm_node.start } != 0 {
-        panic!("drm_gem_free_mmap_offset: mmap offset was allocated outside the bound DRM core");
+    if obj.is_null() {
+        return;
+    }
+    // SAFETY: DRM calls this release hook with the still-live GEM object whose
+    // final reference triggered cleanup.
+    let device = unsafe { (*obj).dev.cast::<DrmDevicePrefix>() };
+    let manager = if device.is_null() {
+        ptr::null_mut()
+    } else {
+        // SAFETY: a non-null object device is its live DRM device, whose
+        // vma-offset manager was initialized before GEM objects were exposed.
+        unsafe { (*device).vma_offset_manager }
+    };
+    // SAFETY: `obj` is still live during its final-reference callback, so its
+    // embedded VMA node may be inspected before deciding whether it was added.
+    let node_is_registered = !unsafe { (*obj).vma_node.vm_node.mm }.is_null();
+    if !manager.is_null() && node_is_registered {
+        // SAFETY: the non-null `mm` marker proves this node was registered in
+        // the device manager, and both objects remain live in this callback.
+        unsafe { drm_vma_offset_remove(manager, ptr::addr_of_mut!((*obj).vma_node)) };
     }
 }
 
 /// `drm_gem_handle_create()`: a GEM handle lives in the file's handle table,
 /// and that table is the kernel `DrmFile`. No upstream file is bound to one yet,
 /// so the call fails with `-ENODEV`.
-unsafe extern "C" fn gem_handle_create(_file: *mut c_void, _obj: *mut c_void, _handle: *mut u32) -> c_int {
-    -ENODEV
+unsafe extern "C" fn gem_handle_create(
+    file: *mut c_void,
+    obj: *mut c_void,
+    handle: *mut u32,
+) -> c_int {
+    // SAFETY: Linux's GEM-handle callback provides a live object and writable
+    // output slot; the bridge rejects null inputs and requires an active file
+    // binding before it dereferences any of these pointers.
+    unsafe { super::upstream_file::gem_handle_create(file, obj, handle) }
 }
 
 /// `drm_gem_object_free()`: the final put of a GEM object. The object's
@@ -717,7 +854,10 @@ unsafe extern "C" fn gem_private_object_init(dev: *mut c_void, obj: *mut c_void,
         // `kref_init()`: one reference, held by the caller.
         (*obj).refcount.refcount.refs.counter = 1;
         // `handle_count` is the u32 immediately after the kref.
-        obj.cast::<u8>().add(size_of::<Kref>()).cast::<u32>().write(0);
+        obj.cast::<u8>()
+            .add(size_of::<Kref>())
+            .cast::<u32>()
+            .write(0);
         (*obj).dev = dev;
         (*obj).filp = ptr::null_mut();
         (*obj).size = size as u64;
@@ -775,12 +915,19 @@ unsafe extern "C" fn dma_buf_detach(_dmabuf: *mut c_void, _attach: *mut c_void) 
 }
 
 /// `dma_buf_map_attachment()`: no attachment can exist.
-unsafe extern "C" fn dma_buf_map_attachment(_attach: *mut c_void, _direction: c_int) -> *mut c_void {
+unsafe extern "C" fn dma_buf_map_attachment(
+    _attach: *mut c_void,
+    _direction: c_int,
+) -> *mut c_void {
     err_ptr(-ENODEV)
 }
 
 /// `dma_buf_unmap_attachment()`: no attachment can exist.
-unsafe extern "C" fn dma_buf_unmap_attachment(_attach: *mut c_void, _sgt: *mut c_void, _direction: c_int) {
+unsafe extern "C" fn dma_buf_unmap_attachment(
+    _attach: *mut c_void,
+    _sgt: *mut c_void,
+    _direction: c_int,
+) {
     panic!("dma_buf_unmap_attachment: no upstream dma-buf attachment exists; import is not bound");
 }
 
@@ -789,48 +936,95 @@ unsafe extern "C" fn dma_buf_put(_dmabuf: *mut c_void) {
     panic!("dma_buf_put: no upstream dma-buf exists; export is not bound");
 }
 
-/// `sync_file_create()`: a sync_file wraps a kernel fence and an fd. The upstream
-/// fence has no kernel `Fence` bound, so NULL reports the failure.
-unsafe extern "C" fn sync_file_create(_fence: *mut c_void) -> *mut c_void {
-    ptr::null_mut()
+/// `sync_file_create()`: bind the upstream dma_fence to the native sync_file
+/// and retain the LinuxKPI ABI wrapper until fd_install/fput.
+unsafe extern "C" fn sync_file_create(fence: *mut c_void) -> *mut c_void {
+    // SAFETY: i915 passes a live dma_fence reference to this callback; the
+    // bridge obtains the ownership it needs before returning the sync_file.
+    unsafe { super::upstream_sync::sync_file_create(fence) }
 }
 
-/// `sync_file_get_fence()`: the fence behind an fd. No upstream sync_file is
-/// bound, so no fd resolves to one.
-unsafe extern "C" fn sync_file_get_fence(_fd: c_int) -> *mut c_void {
-    ptr::null_mut()
+/// `sync_file_get_fence()`: return an owned upstream reference to the native
+/// fence behind a sync_file descriptor.
+unsafe extern "C" fn sync_file_get_fence(fd: c_int) -> *mut c_void {
+    // SAFETY: `fd` is the descriptor requested by i915; the bridge resolves it
+    // through the kernel file table and returns an owned fence or NULL.
+    unsafe { super::upstream_sync::sync_file_get_fence(fd) }
 }
 
-/// `drm_syncobj_find()`: a syncobj handle in the file's table. No upstream file
-/// is bound, so no handle resolves.
-unsafe extern "C" fn syncobj_find(_file: *mut c_void, _handle: u32) -> *mut c_void {
-    ptr::null_mut()
+/// Final `fput()` hook for a sync_file wrapper not transferred to fd_install.
+unsafe extern "C" fn sync_file_release(file: *mut c_void) {
+    // SAFETY: LinuxKPI calls this hook for the live sync_file wrapper created
+    // by the paired bridge callback, which removes and releases that owner.
+    unsafe { super::upstream_sync::sync_file_release(file) }
 }
 
-/// `drm_syncobj_create()`: a syncobj lives in the kernel's syncobj table, and no
-/// upstream object can be bound to it yet.
-unsafe extern "C" fn syncobj_create(_out: *mut *mut c_void, _flags: u32, _fence: *mut c_void) -> c_int {
-    -ENODEV
+/// `drm_syncobj_find()`: resolve the upstream file/handle to the native
+/// per-file syncobj and return one owned bridge reference.
+unsafe extern "C" fn syncobj_find(file: *mut c_void, handle: u32) -> *mut c_void {
+    // SAFETY: i915 supplies the active DRM file and handle; the bridge checks
+    // its file binding/handle table before returning an owned syncobj ref.
+    unsafe { super::upstream_sync::syncobj_find(file, handle) }
 }
 
-/// `drm_syncobj_add_point()`: no syncobj can be created.
-unsafe extern "C" fn syncobj_add_point(_syncobj: *mut c_void, _chain: *mut c_void, _fence: *mut c_void, _point: u64) {
-    panic!("drm_syncobj_add_point: no upstream syncobj exists; creation is not bound");
+/// `drm_syncobj_create()`: create a native binary syncobj for i915 contexts.
+unsafe extern "C" fn syncobj_create(
+    out: *mut *mut c_void,
+    flags: u32,
+    fence: *mut c_void,
+) -> c_int {
+    // SAFETY: i915 provides a writable output slot and either NULL or a live
+    // fence per the syncobj-create ABI; the bridge validates flags and inputs
+    // before publishing the result.
+    unsafe { super::upstream_sync::syncobj_create(out, flags, fence) }
 }
 
-/// `drm_syncobj_replace_fence()`: no syncobj can be created.
-unsafe extern "C" fn syncobj_replace_fence(_syncobj: *mut c_void, _fence: *mut c_void) {
-    panic!("drm_syncobj_replace_fence: no upstream syncobj exists; creation is not bound");
+/// `drm_syncobj_add_point()`: publish a native timeline point.
+unsafe extern "C" fn syncobj_add_point(
+    syncobj: *mut c_void,
+    chain: *mut c_void,
+    fence: *mut c_void,
+    point: u64,
+) {
+    // SAFETY: i915 passes a live syncobj, timeline-chain slot and fence under
+    // the syncobj ABI; the bridge validates bridge-owned objects before use.
+    unsafe { super::upstream_sync::syncobj_add_point(syncobj, chain, fence, point) }
 }
 
-/// `drm_syncobj_fence_get()`: no syncobj can be created.
-unsafe extern "C" fn syncobj_fence_get(_syncobj: *mut c_void) -> *mut c_void {
-    ptr::null_mut()
+/// `drm_syncobj_replace_fence()`: publish a native binary completion edge.
+unsafe extern "C" fn syncobj_replace_fence(syncobj: *mut c_void, fence: *mut c_void) {
+    // SAFETY: i915 supplies the syncobj and replacement fence per the DRM
+    // callback contract; the bridge resolves its owned syncobj before update.
+    unsafe { super::upstream_sync::syncobj_replace_fence(syncobj, fence) }
 }
 
-/// `drm_syncobj_put()`: no syncobj can be created.
-unsafe extern "C" fn syncobj_put(_syncobj: *mut c_void) {
-    panic!("drm_syncobj_put: no upstream syncobj exists; creation is not bound");
+/// `drm_syncobj_fence_get()`: obtain a Linux fence wrapper for native state.
+unsafe extern "C" fn syncobj_fence_get(syncobj: *mut c_void) -> *mut c_void {
+    // SAFETY: the callback receives the syncobj reference returned by the
+    // bridge; the helper verifies the registered object and takes a fence ref.
+    unsafe { super::upstream_sync::syncobj_fence_get(syncobj) }
+}
+
+/// `drm_syncobj_put()`: release one bridge reference.
+unsafe extern "C" fn syncobj_put(syncobj: *mut c_void) {
+    // SAFETY: the caller releases exactly one bridge-owned syncobj reference;
+    // the helper's registry/refcount accounting makes the matching put.
+    unsafe { super::upstream_sync::syncobj_put(syncobj) }
+}
+
+/// Mirror only explicitly registered i915 GEM aliases back into the native
+/// reservation graph. All other Linux reservation objects remain untouched.
+unsafe extern "C" fn resv_fence_add(resv: *mut c_void, fence: *mut c_void, usage: u32) {
+    super::upstream_sync::upstream_reservation_fence_add(resv, fence.cast(), usage);
+}
+
+/// Resolve timeline point requests on native syncobj fences; return the
+/// not-handled sentinel for ordinary upstream chain fences.
+unsafe extern "C" fn syncobj_timeline_fence_find(fence: *mut *mut c_void, point: u64) -> c_int {
+    // SAFETY: i915 supplies its writable fence slot to this lookup callback;
+    // the bridge changes it only when it identifies its own native timeline
+    // fence and leaves ordinary upstream fences to the caller.
+    unsafe { super::upstream_sync::syncobj_timeline_fence_find(fence, point) }
 }
 
 static DRM_CORE: DrmCoreProvider = DrmCoreProvider {
@@ -856,12 +1050,15 @@ static DRM_CORE: DrmCoreProvider = DrmCoreProvider {
     dma_buf_put,
     sync_file_create,
     sync_file_get_fence,
+    sync_file_release,
     syncobj_find,
     syncobj_create,
     syncobj_add_point,
     syncobj_replace_fence,
     syncobj_fence_get,
     syncobj_put,
+    resv_fence_add,
+    syncobj_timeline_fence_find,
 };
 
 /// Installs the framework, probe and DRM-core tables. Called once from
@@ -871,4 +1068,99 @@ pub(super) fn install() -> Result<(), &'static str> {
     install_i915_probe_ops(&PROBE)?;
     install_drm_core_provider(&DRM_CORE)?;
     Ok(())
+}
+
+/// i915's published DRM device after a successful driver registration. This
+/// is also the readiness gate for exposing upstream file/ioctl services.
+pub(super) fn registered_device() -> Option<*mut c_void> {
+    let dev = BOUND_DRM.load(Ordering::Acquire);
+    (!dev.is_null() && !UNPLUGGED.load(Ordering::Acquire)).then_some(dev)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drm_allocation_has_live_mapping_vma_manager_and_ttm_parent() {
+        unsafe extern "C" {
+            fn intel_region_ttm_device_init(i915: *mut DrmI915Private) -> c_int;
+            fn intel_region_ttm_device_fini(i915: *mut DrmI915Private);
+            fn drm_mm_takedown(mm: *mut intel_gt::linux::gem_memory::DrmMm);
+            fn drm_vma_offset_add(
+                manager: *mut DrmVmaOffsetManager,
+                node: *mut intel_gt::intel_context_upstream::DrmVmaOffsetNode,
+                pages: c_ulong,
+            ) -> c_int;
+            fn drm_vma_offset_remove(
+                manager: *mut DrmVmaOffsetManager,
+                node: *mut intel_gt::intel_context_upstream::DrmVmaOffsetNode,
+            );
+        }
+        // These are the production allocator and the exact TTM entry point
+        // which faulted on hardware, not synthetic non-null pointer checks.
+        let mut parent = 0u64;
+        let parent = ptr::from_mut(&mut parent).cast();
+        for _ in 0..2 {
+            unsafe {
+                let mut error = 123;
+                let i915 = devm_drm_dev_alloc_i915(parent, &mut error);
+                assert!(!i915.is_null());
+                assert_eq!(error, 0);
+                let allocation = i915.cast::<I915Allocation>();
+                let drm = &(*i915).drm;
+                assert_eq!(drm.dev, parent);
+                assert_eq!(drm.dma_dev, parent);
+                assert!(!drm.driver.is_null());
+                let mapping = (*drm.anon_inode).i_mapping;
+                assert_eq!(mapping, (*(*allocation).mapping_file).f_mapping.cast());
+                assert!(!mapping.is_null());
+                let mut node = core::mem::zeroed();
+                assert_eq!(drm_vma_offset_add(drm.vma_offset_manager, &mut node, 3), 0);
+                assert!(node.vm_node.start >= DRM_FILE_PAGE_OFFSET_START);
+                assert_eq!(node.vm_node.size, 3);
+                drm_vma_offset_remove(drm.vma_offset_manager, &mut node);
+                assert_eq!(intel_region_ttm_device_init(i915), 0);
+                assert_eq!((*i915).bdev.dev_mapping, mapping);
+                assert_eq!((*i915).bdev.vma_manager, drm.vma_offset_manager.cast());
+                intel_region_ttm_device_fini(i915);
+                drm_mm_takedown(ptr::addr_of_mut!((*allocation).vma.vm_addr_space));
+                shmem::fput_file((*allocation).mapping_file);
+                kfree(allocation.cast());
+            }
+        }
+    }
+
+    #[test]
+    fn initialized_globals_supply_the_first_gem_object() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        // SAFETY: the host allocator is live; the production once-only
+        // initializer owns all cache initialization in this test process.
+        assert_eq!(unsafe { intel_gt::i915_driver_upstream::i915_globals_init() }, 0);
+        // SAFETY: global object cache was initialized above.
+        let object = unsafe { intel_gt::i915_gem_object_upstream::i915_gem_object_alloc() };
+        assert!(!object.is_null());
+        // SAFETY: the uninitialized GEM payload has no users or references.
+        unsafe { intel_gt::i915_gem_object_upstream::i915_gem_object_free(object) };
+        // SAFETY: repeat initialization exercises the production ready gate.
+        assert_eq!(unsafe { intel_gt::i915_driver_upstream::i915_globals_init() }, 0);
+    }
+
+    #[test]
+    fn gt_registration_does_not_require_fastboot_primary() {
+        let mut token = 0u64;
+        let dev = ptr::from_mut(&mut token).cast::<c_void>();
+        assert_eq!(unsafe { drm_dev_register(dev, 0) }, 0);
+        assert_eq!(registered_device(), Some(dev));
+        assert_eq!(unsafe { drm_dev_register(dev, 0) }, 0);
+        unsafe { drm_dev_unregister(dev) };
+        assert_eq!(registered_device(), None);
+    }
+
+    #[test]
+    fn drm_allocation_rejects_missing_parent() {
+        let mut error = 0;
+        assert!(unsafe { devm_drm_dev_alloc_i915(ptr::null_mut(), &mut error) }.is_null());
+        assert_eq!(error, -EINVAL);
+    }
 }

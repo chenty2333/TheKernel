@@ -2998,7 +2998,7 @@ mod tests {
         }
         let reservation = super::super::fence::Reservation::new();
         let predecessor = Fence::new(false);
-        reservation.publish(predecessor.clone());
+        reservation.publish(predecessor.clone()).unwrap();
         let completion = Fence::new(false);
         let mut calls = 0;
         let mut prepare = || {

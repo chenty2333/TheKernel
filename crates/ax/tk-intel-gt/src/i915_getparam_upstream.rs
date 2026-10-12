@@ -104,12 +104,6 @@ struct DrmI915GetParam {
 const _: [(); 16] = [(); size_of::<DrmI915GetParam>()];
 const _: [(); 8] = [(); offset_of!(DrmI915GetParam, value)];
 
-#[repr(C)]
-struct IntelDriverCapsView {
-    scheduler: u32,
-}
-const _: [(); 0] = [(); offset_of!(IntelDriverCapsView, scheduler)];
-
 unsafe extern "C" {
     fn capable(capability: c_int) -> bool;
     fn intel_overlay_available(display: *mut c_void) -> bool;
@@ -122,23 +116,13 @@ unsafe extern "C" {
 
 #[inline]
 unsafe fn i915_scheduler_caps(i915: *mut DrmI915Private) -> u32 {
-    // In Linux 7.2.3, intel_driver_caps immediately follows __runtime.
-    let caps = unsafe {
-        i915.cast::<u8>()
-            .add(offset_of!(DrmI915Private, runtime) + size_of::<IntelRuntimeInfo>())
-            .cast::<IntelDriverCapsView>()
-    };
-    unsafe { ptr::read_volatile(ptr::addr_of!((*caps).scheduler)) }
+    unsafe { ptr::read_volatile(ptr::addr_of!((*i915).caps.scheduler)) }
 }
 
 #[inline]
 unsafe fn has_coherent_ggtt(i915: *mut DrmI915Private) -> bool {
     let info = unsafe { INTEL_INFO(i915) };
-    assert!(
-        !info.is_null(),
-        "INTEL_INFO is unavailable after device setup"
-    );
-    unsafe { (*info).flags[4] & (1 << 1) != 0 }
+    !info.is_null() && unsafe { (*info).flags[4] & (1 << 1) != 0 }
 }
 
 // upstream: i915_getparam.c i915_getparam_ioctl()

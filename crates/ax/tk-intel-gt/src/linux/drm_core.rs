@@ -46,12 +46,15 @@ pub dma_buf_unmap_attachment: unsafe extern "C" fn(attach: *mut c_void, sgt: *mu
 pub dma_buf_put: unsafe extern "C" fn(dmabuf: *mut c_void),
 pub sync_file_create: unsafe extern "C" fn(fence: *mut c_void) -> *mut c_void,
 pub sync_file_get_fence: unsafe extern "C" fn(fd: c_int) -> *mut c_void,
+pub sync_file_release: unsafe extern "C" fn(file: *mut c_void),
 pub syncobj_find: unsafe extern "C" fn(file: *mut c_void, handle: u32) -> *mut c_void,
 pub syncobj_create: unsafe extern "C" fn(out: *mut *mut c_void, flags: u32, fence: *mut c_void) -> c_int,
 pub syncobj_add_point: unsafe extern "C" fn(syncobj: *mut c_void, chain: *mut c_void, fence: *mut c_void, point: u64),
 pub syncobj_replace_fence: unsafe extern "C" fn(syncobj: *mut c_void, fence: *mut c_void),
 pub syncobj_fence_get: unsafe extern "C" fn(syncobj: *mut c_void) -> *mut c_void,
 pub syncobj_put: unsafe extern "C" fn(syncobj: *mut c_void),
+pub resv_fence_add: unsafe extern "C" fn(resv: *mut c_void, fence: *mut c_void, usage: u32),
+pub syncobj_timeline_fence_find: unsafe extern "C" fn(fence: *mut *mut c_void, point: u64) -> c_int,
 }
 
 static DRM_CORE_PROVIDER: AtomicPtr<DrmCoreProvider> = AtomicPtr::new(core::ptr::null_mut());
@@ -252,6 +255,15 @@ match provider() {
 }
 }
 
+/// Final release hook for a LinuxKPI file returned by `sync_file_create`.
+/// Ordinary shmem files are ignored by the installed DRM provider.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_sync_file_release(file: *mut c_void) {
+if let Some(p) = provider() {
+    unsafe { (p.sync_file_release)(file) };
+}
+}
+
 /// Linux `drm_syncobj_find()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_syncobj_find(file: *mut c_void, handle: u32) -> *mut c_void {
@@ -295,6 +307,21 @@ match provider() {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_syncobj_put(syncobj: *mut c_void) {
 unsafe { (required("drm_syncobj_put").syncobj_put)(syncobj) };
+}
+
+/// Kernel-side alias notification after LinuxKPI inserts a dma-reservation fence.
+pub unsafe fn drm_resv_fence_add(resv: *mut c_void, fence: *mut c_void, usage: u32) {
+if let Some(provider) = provider() {
+    unsafe { (provider.resv_fence_add)(resv, fence, usage) };
+}
+}
+
+/// Resolve a timeline point carried by one of the kernel's native fence wrappers.
+pub unsafe fn drm_syncobj_timeline_fence_find(fence: *mut *mut c_void, point: u64) -> c_int {
+match provider() {
+    Some(provider) => unsafe { (provider.syncobj_timeline_fence_find)(fence, point) },
+    None => 1,
+}
 }
 
 /// Linux `shmem_read_mapping_page_gfp()` (mm/shmem.c) C entry point; the Rust

@@ -73,17 +73,11 @@ struct I915EngineUabiView {
     engine_uabi_class_count: [u32; I915_UABI_ENGINE_CLASS_COUNT],
 }
 
-#[repr(C)]
-struct IntelDriverCapsView {
-    scheduler: u32,
-}
-
 const _: [(); 16] = [(); size_of::<I915UabiEngines>()];
 const _: [(); 2360] = [(); offset_of!(I915EngineUabiView, engines)];
 const _: [(); I915_UABI_ENGINE_CLASS_COUNT_OFFSET] =
     [(); offset_of!(I915EngineUabiView, engine_uabi_class_count)];
 const _: [(); 36] = [(); size_of::<IntelRuntimeInfo>()];
-const _: [(); 0] = [(); offset_of!(IntelDriverCapsView, scheduler)];
 
 unsafe extern "C" {
     fn list_sort(
@@ -125,13 +119,7 @@ pub(crate) unsafe fn engine_uabi_llist(
 
 #[inline]
 unsafe fn i915_scheduler_caps(i915: *mut DrmI915Private) -> *mut u32 {
-    // `intel_driver_caps caps` immediately follows `intel_runtime_info __runtime`
-    // in i915_drv.h; both its prefix and the runtime size are source-owned.
-    let caps = i915
-        .cast::<u8>()
-        .add(offset_of!(DrmI915Private, runtime) + size_of::<IntelRuntimeInfo>())
-        .cast::<IntelDriverCapsView>();
-    ptr::addr_of_mut!((*caps).scheduler)
+    ptr::addr_of_mut!((*i915).caps.scheduler)
 }
 
 #[inline]

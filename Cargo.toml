@@ -7,6 +7,8 @@ members = [
     "crates/ax/*",
     "crates/linux/*",
 ]
+# Vendored dependencies retain their standalone upstream unit-test manifests.
+exclude = ["crates/vendor/crab-usb"]
 
 # Lint policy for TheKernel-owned packages. Reusable components retain their
 # explicit component lint policy.

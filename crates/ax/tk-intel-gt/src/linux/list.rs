@@ -97,11 +97,7 @@ pub unsafe fn list_add(new: *mut ListHead, head: *mut ListHead) {
 pub unsafe extern "C" fn list_sort(
     priv_: *mut core::ffi::c_void,
     head: *mut ListHead,
-    cmp: unsafe extern "C" fn(
-        *mut core::ffi::c_void,
-        *const ListHead,
-        *const ListHead,
-    ) -> i32,
+    cmp: unsafe extern "C" fn(*mut core::ffi::c_void, *const ListHead, *const ListHead) -> i32,
 ) {
     let mut node = unsafe { (*head).next };
     unsafe {
@@ -296,6 +292,15 @@ pub(crate) unsafe fn offset_from_slot<T, U>(
     (field(base) as usize).wrapping_sub(base as usize)
 }
 
+/// Recover the containing entry from a list node and its byte offset.
+///
+/// Keep the subtraction on a byte pointer: applying a byte offset directly to
+/// `*mut ListHead` scales it by `size_of::<ListHead>()`.
+#[inline]
+pub(crate) fn entry_from_link<T>(link: *mut ListHead, offset: usize) -> *mut T {
+    link.cast::<u8>().wrapping_sub(offset).cast::<T>()
+}
+
 macro_rules! INIT_LIST_HEAD {
     ($head:expr) => {{
         unsafe {
@@ -341,36 +346,50 @@ macro_rules! list_first_entry_or_null {
 }
 
 macro_rules! list_next_entry {
-    ($entry:expr, signal_link) => {{
+    ($entry:expr,signal_link) => {{
         let entry = ($entry) as *mut $crate::i915_request_types_upstream::I915Request;
-        let member = unsafe { core::ptr::addr_of_mut!((*entry).signal_link) } as *mut $crate::intel_engine_cs_upstream::ListHead;
+        let member = unsafe { core::ptr::addr_of_mut!((*entry).signal_link) }
+            as *mut $crate::intel_engine_cs_upstream::ListHead;
         let offset = (member as usize).wrapping_sub(entry as usize);
         let next = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*member).next)) };
-        next.wrapping_sub(offset) as *mut $crate::i915_request_types_upstream::I915Request
+        $crate::linux_list::entry_from_link::<$crate::i915_request_types_upstream::I915Request>(
+            next, offset,
+        )
     }};
-    ($entry:expr, parallel.children.child_link) => {{
+    ($entry:expr,parallel.children.child_link) => {{
         let entry = ($entry) as *mut $crate::intel_context_types_upstream::IntelContext;
-        let member = unsafe { core::ptr::addr_of_mut!((*entry).parallel.children.child_link) } as *mut $crate::intel_engine_cs_upstream::ListHead;
+        let member = unsafe { core::ptr::addr_of_mut!((*entry).parallel.children.child_link) }
+            as *mut $crate::intel_engine_cs_upstream::ListHead;
         let offset = (member as usize).wrapping_sub(entry as usize);
         let next = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*member).next)) };
-        unsafe { &mut *(next.wrapping_sub(offset) as *mut $crate::intel_context_types_upstream::IntelContext) }
+        unsafe {
+            &mut *$crate::linux_list::entry_from_link::<
+                $crate::intel_context_types_upstream::IntelContext,
+            >(next, offset)
+        }
     }};
-    ($entry:expr, sched.link) => {{
+    ($entry:expr,sched.link) => {{
         let entry = ($entry) as *mut $crate::i915_request_types_upstream::I915Request;
-        let member = unsafe { core::ptr::addr_of_mut!((*entry).sched.link) } as *mut $crate::intel_engine_cs_upstream::ListHead;
+        let member = unsafe { core::ptr::addr_of_mut!((*entry).sched.link) }
+            as *mut $crate::intel_engine_cs_upstream::ListHead;
         let offset = (member as usize).wrapping_sub(entry as usize);
         let next = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*member).next)) };
-        next.wrapping_sub(offset) as *mut $crate::i915_request_types_upstream::I915Request
+        $crate::linux_list::entry_from_link::<$crate::i915_request_types_upstream::I915Request>(
+            next, offset,
+        )
     }};
 }
 
 macro_rules! list_prev_entry {
-    ($entry:expr, signal_link) => {{
+    ($entry:expr,signal_link) => {{
         let entry = ($entry) as *mut $crate::i915_request_types_upstream::I915Request;
-        let member = unsafe { core::ptr::addr_of_mut!((*entry).signal_link) } as *mut $crate::intel_engine_cs_upstream::ListHead;
+        let member = unsafe { core::ptr::addr_of_mut!((*entry).signal_link) }
+            as *mut $crate::intel_engine_cs_upstream::ListHead;
         let offset = (member as usize).wrapping_sub(entry as usize);
         let prev = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*member).prev)) };
-        prev.wrapping_sub(offset) as *mut $crate::i915_request_types_upstream::I915Request
+        $crate::linux_list::entry_from_link::<$crate::i915_request_types_upstream::I915Request>(
+            prev, offset,
+        )
     }};
 }
 
@@ -387,7 +406,7 @@ macro_rules! list_for_each_entry {
         while !core::ptr::eq(cursor, head) {
             let current = cursor;
             cursor = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*cursor).next)) };
-            $pos = current.wrapping_sub(offset) as *mut _;
+            $pos = $crate::linux_list::entry_from_link(current, offset);
             $body
         }
     }};
@@ -407,8 +426,8 @@ macro_rules! list_for_each_entry_safe {
             let current = cursor;
             let next = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*cursor).next)) };
             cursor = next;
-            $pos = current.wrapping_sub(offset) as *mut _;
-            $tmp = next.wrapping_sub(offset) as *mut _;
+            $pos = $crate::linux_list::entry_from_link(current, offset);
+            $tmp = $crate::linux_list::entry_from_link(next, offset);
             $body
         }
     }};
@@ -419,9 +438,12 @@ macro_rules! list_for_each_entry_safe {
 // remove the current request, matching list_for_each_entry_safe().
 macro_rules! priolist_for_each_request_consume {
     ($request:ident, $next:ident, $plist:expr, $body:block) => {{
-        let mut $request: *mut $crate::i915_request_types_upstream::I915Request = core::ptr::null_mut();
-        let mut $next: *mut $crate::i915_request_types_upstream::I915Request = core::ptr::null_mut();
-        let __priolist = ($plist) as *const _ as *mut $crate::i915_scheduler_types_upstream::I915Priolist;
+        let mut $request: *mut $crate::i915_request_types_upstream::I915Request =
+            core::ptr::null_mut();
+        let mut $next: *mut $crate::i915_request_types_upstream::I915Request =
+            core::ptr::null_mut();
+        let __priolist =
+            ($plist) as *const _ as *mut $crate::i915_scheduler_types_upstream::I915Priolist;
         list_for_each_entry_safe!(
             $request,
             $next,
@@ -434,8 +456,10 @@ macro_rules! priolist_for_each_request_consume {
 
 macro_rules! priolist_for_each_request {
     ($request:ident, $plist:expr, $body:block) => {{
-        let mut $request: *mut $crate::i915_request_types_upstream::I915Request = core::ptr::null_mut();
-        let __priolist = ($plist) as *const _ as *mut $crate::i915_scheduler_types_upstream::I915Priolist;
+        let mut $request: *mut $crate::i915_request_types_upstream::I915Request =
+            core::ptr::null_mut();
+        let __priolist =
+            ($plist) as *const _ as *mut $crate::i915_scheduler_types_upstream::I915Priolist;
         list_for_each_entry!(
             $request,
             unsafe { core::ptr::addr_of_mut!((*__priolist).requests) },
@@ -460,7 +484,7 @@ macro_rules! list_for_each_entry_reverse {
         while !core::ptr::eq(cursor, head) {
             let current = cursor;
             cursor = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*cursor).prev)) };
-            $pos = current.wrapping_sub(offset) as *mut _;
+            $pos = $crate::linux_list::entry_from_link(current, offset);
             $body
         }
     }};
@@ -486,8 +510,8 @@ macro_rules! list_for_each_entry_safe_reverse {
             let current = cursor;
             let prev = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*cursor).prev)) };
             cursor = prev;
-            $pos = current.wrapping_sub(offset) as *mut _;
-            $tmp = prev.wrapping_sub(offset) as *mut _;
+            $pos = $crate::linux_list::entry_from_link(current, offset);
+            $tmp = $crate::linux_list::entry_from_link(prev, offset);
             $body
         }
     }};
@@ -506,7 +530,7 @@ macro_rules! list_for_each_entry_from_reverse {
         while !core::ptr::eq(cursor, head) {
             let current = cursor;
             cursor = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*cursor).prev)) };
-            $pos = current.wrapping_sub(offset) as *mut _;
+            $pos = $crate::linux_list::entry_from_link(current, offset);
             $body
         }
     }};
@@ -546,9 +570,12 @@ macro_rules! llist_for_each_safe {
 
 macro_rules! for_each_child_safe {
     ($parent:ident, $child:ident, $next:ident, $body:block) => {{
-        let mut $child: *mut $crate::intel_context_types_upstream::IntelContext = core::ptr::null_mut();
-        let mut $next: *mut $crate::intel_context_types_upstream::IntelContext = core::ptr::null_mut();
-        let $parent = ($parent) as *const _ as *mut $crate::intel_context_types_upstream::IntelContext;
+        let mut $child: *mut $crate::intel_context_types_upstream::IntelContext =
+            core::ptr::null_mut();
+        let mut $next: *mut $crate::intel_context_types_upstream::IntelContext =
+            core::ptr::null_mut();
+        let $parent =
+            ($parent) as *const _ as *mut $crate::intel_context_types_upstream::IntelContext;
         let head = unsafe {
             core::ptr::addr_of_mut!((*$parent).parallel.children.child_list)
                 as *mut $crate::intel_engine_cs_upstream::ListHead
@@ -580,6 +607,13 @@ mod tests {
         serial: u32,
     }
 
+    #[repr(C)]
+    struct OffsetEntry {
+        prefix: [u64; 3],
+        link: ListHead,
+        value: u32,
+    }
+
     unsafe extern "C" fn by_key(
         _priv: *mut core::ffi::c_void,
         a: *const ListHead,
@@ -598,9 +632,30 @@ mod tests {
         };
         unsafe { INIT_LIST_HEAD(&mut head) };
         let mut entries = [
-            Entry { link: ListHead { next: core::ptr::null_mut(), prev: core::ptr::null_mut() }, key: 2, serial: 0 },
-            Entry { link: ListHead { next: core::ptr::null_mut(), prev: core::ptr::null_mut() }, key: 1, serial: 1 },
-            Entry { link: ListHead { next: core::ptr::null_mut(), prev: core::ptr::null_mut() }, key: 2, serial: 2 },
+            Entry {
+                link: ListHead {
+                    next: core::ptr::null_mut(),
+                    prev: core::ptr::null_mut(),
+                },
+                key: 2,
+                serial: 0,
+            },
+            Entry {
+                link: ListHead {
+                    next: core::ptr::null_mut(),
+                    prev: core::ptr::null_mut(),
+                },
+                key: 1,
+                serial: 1,
+            },
+            Entry {
+                link: ListHead {
+                    next: core::ptr::null_mut(),
+                    prev: core::ptr::null_mut(),
+                },
+                key: 2,
+                serial: 2,
+            },
         ];
         for entry in &mut entries {
             unsafe { list_add_tail(core::ptr::addr_of_mut!(entry.link), &mut head) };
@@ -619,5 +674,107 @@ mod tests {
         }
         assert!(core::ptr::eq(link, &mut head));
         assert_eq!(got, [(1, 1), (2, 0), (2, 2)]);
+    }
+
+    #[test]
+    fn list_iteration_macros_use_byte_offsets_for_embedded_links() {
+        assert_ne!(core::mem::offset_of!(OffsetEntry, link), 0);
+
+        let mut head = ListHead {
+            next: core::ptr::null_mut(),
+            prev: core::ptr::null_mut(),
+        };
+        unsafe { INIT_LIST_HEAD(&mut head) };
+        let mut entries = [
+            OffsetEntry {
+                prefix: [0; 3],
+                link: ListHead {
+                    next: core::ptr::null_mut(),
+                    prev: core::ptr::null_mut(),
+                },
+                value: 10,
+            },
+            OffsetEntry {
+                prefix: [0; 3],
+                link: ListHead {
+                    next: core::ptr::null_mut(),
+                    prev: core::ptr::null_mut(),
+                },
+                value: 20,
+            },
+            OffsetEntry {
+                prefix: [0; 3],
+                link: ListHead {
+                    next: core::ptr::null_mut(),
+                    prev: core::ptr::null_mut(),
+                },
+                value: 30,
+            },
+        ];
+        for entry in &mut entries {
+            unsafe { list_add_tail(core::ptr::addr_of_mut!(entry.link), &mut head) };
+        }
+
+        let mut forward = [0; 3];
+        let mut forward_count = 0;
+        let mut pos: *mut OffsetEntry = core::ptr::null_mut();
+        list_for_each_entry!(pos, &mut head, link, {
+            forward[forward_count] = unsafe { (*pos).value };
+            forward_count += 1;
+        });
+        assert_eq!(forward_count, forward.len());
+        assert_eq!(forward, [10, 20, 30]);
+
+        let mut reverse = [0; 3];
+        let mut reverse_count = 0;
+        let mut pos: *mut OffsetEntry = core::ptr::null_mut();
+        list_for_each_entry_reverse!(pos, &mut head, link, {
+            reverse[reverse_count] = unsafe { (*pos).value };
+            reverse_count += 1;
+        });
+        assert_eq!(reverse_count, reverse.len());
+        assert_eq!(reverse, [30, 20, 10]);
+
+        let mut removed = [0; 3];
+        let mut removed_count = 0;
+        let mut pos: *mut OffsetEntry = core::ptr::null_mut();
+        let mut next: *mut OffsetEntry = core::ptr::null_mut();
+        list_for_each_entry_safe!(pos, next, &mut head, link, {
+            removed[removed_count] = unsafe { (*pos).value };
+            removed_count += 1;
+            unsafe { list_del(core::ptr::addr_of_mut!((*pos).link)) };
+        });
+        assert_eq!(removed_count, removed.len());
+        assert_eq!(removed, [10, 20, 30]);
+        assert!(core::ptr::eq(head.next, &mut head));
+        assert!(core::ptr::eq(head.prev, &mut head));
+    }
+
+    #[test]
+    fn list_iteration_macros_leave_empty_lists_empty() {
+        let mut head = ListHead {
+            next: core::ptr::null_mut(),
+            prev: core::ptr::null_mut(),
+        };
+        unsafe { INIT_LIST_HEAD(&mut head) };
+        let mut visits = 0;
+
+        let mut pos: *mut OffsetEntry = core::ptr::null_mut();
+        list_for_each_entry!(pos, &mut head, link, {
+            visits += 1;
+        });
+        let mut pos: *mut OffsetEntry = core::ptr::null_mut();
+        list_for_each_entry_reverse!(pos, &mut head, link, {
+            visits += 1;
+        });
+        let mut pos: *mut OffsetEntry = core::ptr::null_mut();
+        let mut next: *mut OffsetEntry = core::ptr::null_mut();
+        list_for_each_entry_safe!(pos, next, &mut head, link, {
+            visits += 1;
+        });
+
+        assert_eq!(visits, 0);
+        assert!(core::ptr::eq(head.next, &mut head));
+        assert!(core::ptr::eq(head.prev, &mut head));
     }
 }

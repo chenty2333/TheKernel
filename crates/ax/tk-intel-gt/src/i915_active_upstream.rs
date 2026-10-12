@@ -138,7 +138,7 @@ pub unsafe fn i915_active_fence_get(active: *mut I915ActiveFence) -> *mut DmaFen
     unsafe {
         rcu_read_lock();
         let fence = ptr::read_volatile(&(*active).fence);
-        let held = if fence.is_null() || (fence as isize) < 0 {
+        let held = if fence.is_null() || crate::linux_config::IS_ERR(fence) {
             fence
         } else {
             crate::linux::requests::dma_fence_get_rcu(fence)
@@ -246,7 +246,7 @@ unsafe fn fetch_node(node: *mut RbNode) -> *mut ActiveNode {
 // upstream: i915_active.c is_barrier()
 #[inline]
 unsafe fn is_barrier(active: *const I915ActiveFence) -> bool {
-    unsafe { ((*(active.cast_mut())).fence as isize) < 0 }
+    unsafe { crate::linux_config::IS_ERR((*(active.cast_mut())).fence) }
 }
 // upstream: i915_active.c barrier_to_ll()
 #[inline]

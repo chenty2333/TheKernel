@@ -1,9 +1,11 @@
 //! N305 firmware-preserving KMS with a restricted TC1/TC2 legacy-HDMI timing
 //! transition. The first scanout preserves the firmware display image; later
 //! admitted modes may change the DKL PLL, transcoder timing, and plane while
-//! retaining the captured WM/DDB policy. Uses MIT i915 readouts/programming in
+//! retaining the powered DDB range and programming target-derived watermarks. Uses MIT i915 readouts/programming in
 //! `tk-intel-display`; adapter/ownership policy is original TheKernel code.
-//! Only pipe-A, opaque linear XR24/RG16, no scaling/color/DSC/VRR is admitted.
+//! Only pipe-A opaque linear XR24/RG16 without color/DSC/VRR is admitted. A
+//! single exact 800x600-to-3840x2160 firmware scaler profile is captured only
+//! so an opt-in NativeAtomic first present can detach it transactionally.
 //! Hardware writes remain opt-in.
 use alloc::{format, string::String, sync::Arc, vec::Vec};
 use core::{
@@ -25,7 +27,7 @@ use spin::Mutex;
 
 use super::{
     gmbus::PollTimer,
-    gtt::{Binding, Gtt},
+    gtt::{Binding, Gtt, PAGE_SIZE, PTE_ADDRESS_MASK, PTE_PRESENT},
     regs::{self, Meaning, Register, Registers, pipe as p},
 };
 use crate::{
@@ -73,7 +75,7 @@ fn firmware_timing(f: &Firmware) -> Result<crate::drm::modes::Mode, Error> {
         .into_iter()
         .any(|count| count > u32::from(u16::MAX))
     {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     let hblank = t.htotal - t.hdisplay;
     let hfront = t.hsync_start - t.hdisplay;
@@ -96,7 +98,7 @@ fn firmware_timing(f: &Firmware) -> Result<crate::drm::modes::Mode, Error> {
     )
     .with_polarity(f.ddi.positive_hsync, f.ddi.positive_vsync);
     if !mode.is_well_formed() {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     Ok(mode)
 }
@@ -143,12 +145,12 @@ fn native_modes(
     f: &Firmware,
 ) -> Result<(Vec<NativeMode>, NativeMode, NativeMode), Error> {
     use crate::drm::modes::{Edid, ModeList, collect_modes};
-    let edid = Edid::parse_lossy(edid_bytes).map_err(|_| Error::Refused)?;
+    let edid = Edid::parse_lossy(edid_bytes).map_err(|_| super::traced_refusal())?;
     let sink_tmds_limit = edid.max_tmds_clock_khz();
     let mut candidates = ModeList::new();
     collect_modes(&edid, &mut candidates);
     let current_timing = firmware_timing(f)?;
-    let current_vic = cta_vic(&current_timing).ok_or(Error::Refused)?;
+    let current_vic = cta_vic(&current_timing).ok_or_else(|| super::traced_refusal())?;
     let current = NativeMode {
         timing: current_timing,
         kms: drm_mode(current_timing),
@@ -264,7 +266,7 @@ impl<R: Registers> RegisterIo for PinnedIo<'_, R> {
     fn write32(&self, offset: u32, value: u32) -> Result<(), Error> {
         // Discovery only mutates/restores the shared HIP selector, never PHY.
         if offset != 0x1010a0 {
-            return Err(Error::Refused);
+            return Err(super::traced_refusal());
         }
         write(self.registers, offset, value)
     }
@@ -322,9 +324,9 @@ impl PowerPin {
     /// observation never sets a power request bit or writes any display MMIO;
     /// GT-only startup uses it to prove the active scanout before admitting
     /// its pages to the retained shared boot identity aperture.
-    fn observe(r: &impl Registers, port: TcPort) -> Result<Self, Error> {
+    pub(super) fn observe(r: &impl Registers, port: TcPort) -> Result<Self, Error> {
         if port.index() > 1 || read(r, 0x45504)? & super::power::DC_STATE_MASK != 0 {
-            return Err(Error::Refused);
+            return Err(super::traced_refusal());
         }
         let offsets = [0x45404, 0x45454, 0x45444];
         let masks = [
@@ -336,7 +338,7 @@ impl PowerPin {
         for i in 0..3 {
             before[i] = read(r, offsets[i])?;
             if before[i] & (masks[i] | (masks[i] >> 1)) != masks[i] | (masks[i] >> 1) {
-                return Err(Error::Refused);
+                return Err(super::traced_refusal());
             }
         }
         Ok(Self {
@@ -352,7 +354,7 @@ impl PowerPin {
         // AUX is the ADL-P legacy TC-cold blocker. No cold-exit/enable sequence
         // is attempted: every required well must already be live before writes.
         if port.index() > 1 || read(r, 0x45504)? & super::power::DC_STATE_MASK != 0 {
-            return Err(Error::Refused);
+            return Err(super::traced_refusal());
         }
         let offsets = [0x45404, 0x45454, 0x45444];
         let masks = [
@@ -364,7 +366,7 @@ impl PowerPin {
         for i in 0..3 {
             before[i] = read(r, offsets[i])?;
             if before[i] & (masks[i] >> 1) != masks[i] >> 1 {
-                return Err(Error::Refused);
+                return Err(super::traced_refusal());
             }
         }
         let pin = Self {
@@ -389,7 +391,7 @@ impl PowerPin {
         // state must stay live. Persistent capture checks requests separately.
         for i in 0..3 {
             if read(r, self.offsets[i])? & (self.masks[i] >> 1) != self.masks[i] >> 1 {
-                return Err(Error::Refused);
+                return Err(super::traced_refusal());
             }
         }
         Ok(())
@@ -399,8 +401,32 @@ impl PowerPin {
             if read(r, self.offsets[i])? & (self.masks[i] | (self.masks[i] >> 1))
                 != self.masks[i] | (self.masks[i] >> 1)
             {
-                return Err(Error::Refused);
+                return Err(super::traced_refusal());
             }
+        }
+        Ok(())
+    }
+
+    /// Verify that this retained TC power lease is the owner for the GMBUS
+    /// pin the transfer is about to use. GMBUS does not acquire TC wells by
+    /// itself; its short-lived source power reference is nested under this
+    /// already-held, route-specific lease.
+    pub(super) fn verify_gmbus_context(
+        &self,
+        r: &impl Registers,
+        pin: super::gmbus::Pin,
+    ) -> Result<(), Error> {
+        let expected = match pin {
+            super::gmbus::Pin::Tc1 => TcPort::Tc1,
+            super::gmbus::Pin::Tc2 => TcPort::Tc2,
+            _ => return Err(super::traced_refusal()),
+        };
+        if self.port != expected || self.port.index() > 1 {
+            return Err(super::traced_refusal());
+        }
+        self.held(r)?;
+        if read(r, 0x45504)? & super::power::DC_STATE_MASK != 0 {
+            return Err(super::traced_refusal());
         }
         Ok(())
     }
@@ -417,11 +443,11 @@ impl PowerPin {
         reference_khz: u32,
     ) -> Result<(), Error> {
         if self.port != port || port.index() > 1 {
-            return Err(Error::Refused);
+            return Err(super::traced_refusal());
         }
         self.held(r)?;
         if read(r, 0x45504)? & super::power::DC_STATE_MASK != 0 {
-            return Err(Error::Refused);
+            return Err(super::traced_refusal());
         }
         let reference = match r
             .read(regs::SKL_DSSM)
@@ -431,10 +457,10 @@ impl PowerPin {
             0 => 24_000,
             1 => 19_200,
             2 => 38_400,
-            _ => return Err(Error::Refused),
+            _ => return Err(super::traced_refusal()),
         };
         if reference != reference_khz {
-            return Err(Error::Refused);
+            return Err(super::traced_refusal());
         }
         Ok(())
     }
@@ -510,7 +536,7 @@ impl<R: Registers> super::power::NativePowerOps for NativeTcPower<'_, R> {
                 if read(self.registers, 0x45504)? & super::power::DC_STATE_MASK == 0 {
                     Ok(())
                 } else {
-                    Err(Error::Refused)
+                    Err(super::traced_refusal())
                 }
             })
             .map_err(|e| super::power::PowerError::PowerDomain(format!("TC DC-off lease: {e:?}")))
@@ -547,6 +573,54 @@ struct Firmware {
     afc_startup: Option<u8>,
 }
 
+const N305_SCALED_FIRMWARE_SOURCE: (u32, u32) = (800, 600);
+const N305_SCALED_FIRMWARE_TIMING: (u32, u32) = (3840, 2160);
+const SCALER_MODE_MASK: u32 = 3 << 28;
+const SCALER_Y_PLANE_BINDING_MASK: u32 = 7 << 5;
+
+fn has_enabled_scaler(scalers: &[intel_display::scaler::Scaler; 2]) -> bool {
+    scalers.iter().any(|scaler| scaler.enabled())
+}
+
+/// Accept only the two unscaled readouts or the measured, single-full-screen
+/// GOP fit. The latter must be attached to the pipe or primary plane, and the
+/// primary fetch must exactly cover PIPE_SOURCE with an opaque linear format.
+/// No other scaler topology, crop, offset, overlay, or resolution is inferred.
+fn firmware_scalers_supported(
+    pipe: &intel_display::pipe_config::PipeConfig,
+    plane: &intel_display::universal_plane::InitialPlaneConfig,
+    scalers: &[intel_display::scaler::Scaler; 2],
+) -> bool {
+    let timing = (pipe.timings.hdisplay, pipe.timings.vdisplay);
+    if (plane.width, plane.height) != pipe.source {
+        return false;
+    }
+    if pipe.source == timing {
+        return !has_enabled_scaler(scalers);
+    }
+    if pipe.source != N305_SCALED_FIRMWARE_SOURCE || timing != N305_SCALED_FIRMWARE_TIMING {
+        return false;
+    }
+
+    let expected_size = (timing.0 << 16) | timing.1;
+    let mut active = 0;
+    for scaler in scalers.iter().copied().filter(|scaler| scaler.enabled()) {
+        // This measured GOP profile is admitted only as a pipe-fitter scaler.
+        // A plane-bound scaler also needs a proven full-pipe output projection;
+        // no such hardware readout is available for this handoff.
+        if scaler.binding() != 0
+            || scaler.ctl & SCALER_MODE_MASK != 0
+            || scaler.ctl & SCALER_Y_PLANE_BINDING_MASK != 0
+            || scaler.position != Some(0)
+            || scaler.size != Some(expected_size)
+        {
+            return false;
+        }
+        active += 1;
+    }
+    active == 1
+}
+
 /// The identity lease admits only the primary plane's exact GGTT PTE pages in
 /// the retained shared boot identity aperture. Refuse any other display
 /// fetcher or compression side buffer rather than inferring its address or
@@ -555,12 +629,12 @@ fn require_only_primary_display_fetch(r: &impl Registers) -> Result<(), Error> {
     let power = read(r, 0x45404)?;
     for i in 1..4 {
         if power & (1 << ((5 + i) * 2)) != 0 && read(r, 0x70008 + i * 0x1000)? & (3 << 30) != 0 {
-            return Err(Error::Refused);
+            return Err(super::traced_refusal());
         }
     }
     for i in 1..5 {
         if read(r, 0x70180 + i * 0x100)? & (1 << 31) != 0 {
-            return Err(Error::Refused);
+            return Err(super::traced_refusal());
         }
     }
 
@@ -571,7 +645,7 @@ fn require_only_primary_display_fetch(r: &impl Registers) -> Result<(), Error> {
     // independent active-fetch state; don't reject stale config with mode 0.
     let cursor = read(r, 0x70080)?;
     if cursor & intel_display::intel_cursor_full::MCURSOR_MODE_MASK != 0 {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
 
     // Linux 7.2.3 selects ivb_fbc_funcs for display version >= 7, including
@@ -581,7 +655,7 @@ fn require_only_primary_display_fetch(r: &impl Registers) -> Result<(), Error> {
     // the upstream deactivate/sanitize path, so nonzero STATUS2 alone is not
     // evidence of an active fetcher.
     if read(r, 0x43208)? & intel_display::intel_fbc_full::DPFC_CTL_EN != 0 {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     Ok(())
 }
@@ -597,7 +671,16 @@ fn capture(
     };
     pin.held(r)?;
     let io = PinnedIo { registers: r, port };
-    let pipe = pipe_config::read_pipe_config(&io, Pipe::A)?.ok_or(Error::Refused)?;
+    #[cfg(target_os = "none")]
+    if axhal::boot::command_line_value("boot.progress") == Some("1") {
+        axlog::info!(
+            "intel-display: firmware pipe-A transconf={:#x} plane={:#x}",
+            read(r, 0x70008)?,
+            read(r, 0x70180)?
+        );
+    }
+    let pipe =
+        pipe_config::read_pipe_config(&io, Pipe::A)?.ok_or_else(|| super::traced_refusal())?;
     pipe.timings.validate()?;
     if pipe.transconf & (3 << 30) != 3 << 30
         || pipe.transconf & (3 << 21) != 0
@@ -608,9 +691,12 @@ fn capture(
         || pipe.misc.bpc != Some(8)
         || pipe.misc.raw & ((1 << 23) | (1 << 4)) != 0
         || pipe.pixel_multiplier != 1
-        || pipe.source != (pipe.timings.hdisplay, pipe.timings.vdisplay)
     {
-        return Err(Error::Refused);
+        #[cfg(target_os = "none")]
+        if axhal::boot::command_line_value("boot.progress") == Some("1") {
+            axlog::warn!("intel-display: rejected firmware pipe configuration: {pipe:?}");
+        }
+        return Err(super::traced_refusal());
     }
     require_only_primary_display_fetch(r)?;
     let plane = universal_plane::skl_get_initial_plane_config(
@@ -618,14 +704,25 @@ fn capture(
         Pipe::A,
         universal_plane::Plane::PRIMARY,
     )?
-    .ok_or(Error::Refused)?;
+    .ok_or_else(|| super::traced_refusal())?;
+    let scalers = scaler::read_all_scalers(&io, Pipe::A)?.ok_or_else(|| super::traced_refusal())?;
+    #[cfg(target_os = "none")]
+    if pipe.source != (pipe.timings.hdisplay, pipe.timings.vdisplay)
+        && axhal::boot::command_line_value("boot.progress") == Some("1")
+    {
+        // Keep each diagnostic below the UDP logger's single-record limit.
+        axlog::warn!("intel-display: scaled Pipe-A {pipe:?}");
+        axlog::warn!("intel-display: scaled primary {plane:?}");
+        axlog::warn!("intel-display: scaled scalers {scalers:?}");
+    }
     if !plane.native_linear_xrgb()
         || plane.offset != 0
         || (plane.width, plane.height) != pipe.source
         || read(r, 0x7018c)? != 0
         || read(r, 0x701ac)? & 0xffff_f000 != plane.surface_raw & 0xffff_f000
+        || !firmware_scalers_supported(&pipe, &plane, &scalers)
     {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     let ddi = ddi::read_function_control(&io, Pipe::A)?;
     let expected = if port == TcPort::Tc1 {
@@ -641,63 +738,59 @@ fn capture(
         || ddi.hdmi_scrambling
         || ddi.high_tmds_ratio
     {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     if !tc::adlp_tc_phy_is_ready(&io, port)?
         || !tc::adlp_tc_phy_is_owned(&io, port)?
         || read(r, tc::buffer_register(port))? & (1 << 31) == 0
     {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     let fia = tc::read_fia_state(&io, port)?;
     let clock = ddi::read_tc_clock_state(&io, port)?;
     let trans_clock = read(r, 0x46140)?;
     if !clock.enabled || clock.pll != ddi::TcPllKind::Dkl {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     let refclk = match read(r, 0x51004)? >> 29 {
         0 => 24000,
         1 => 19200,
         2 => 38400,
-        _ => return Err(Error::Refused),
+        _ => return Err(super::traced_refusal()),
     };
     let pll = dpll_mgr::dkl_pll_get_hw_state(&io, port, refclk, afc_startup.is_some())?
-        .ok_or(Error::Refused)?;
+        .ok_or_else(|| super::traced_refusal())?;
     if afc_startup.is_some_and(|value| ((pll.state.div0 >> 25) & 7) != u32::from(value)) {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     if pll.enable & ((1 << 31) | (1 << 30) | (1 << 27) | (1 << 26))
         != (1 << 31) | (1 << 30) | (1 << 27) | (1 << 26)
     {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     let pixel_clock = dpll_mgr::icl_ddi_mg_pll_get_freq(&pll.state, refclk)?;
     if !(25000..=300000).contains(&pixel_clock) {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     let phy = tc::read_dkl_phy_state(&io, port)?;
     if phy.uc_dw27 & (1 << 15) == 0 {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     let hdmi = hdmi::read_hdmi_state(&io, Pipe::A)?;
     // Preserve normal AVI/SPD/GCP only; HDR, 3D, VSC/AS/PPS are not this path.
     if hdmi.control & ((1 << 28) | (1 << 24) | (1 << 23) | (1 << 20) | (1 << 8) | (1 << 4)) != 0 {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     for packet in hdmi.frames.iter().flatten() {
         if let intel_display::hdmi_packet::Infoframe::Avi(avi) = packet.unpack()?
             && (avi.colorspace != 0 || avi.pixel_repeat != 0)
         {
-            return Err(Error::Refused);
+            return Err(super::traced_refusal());
         }
     }
     let color = color::intel_color_get_config(&io, Pipe::A, false, &mut [], &mut [])?;
     if !color.bypassed() {
-        return Err(Error::Refused);
-    }
-    let scalers = scaler::read_all_scalers(&io, Pipe::A)?.ok_or(Error::Refused)?;
-    if scalers.iter().any(|s| s.enabled()) {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     let wm = watermark::skl_pipe_wm_get_hw_state(&io, Pipe::A)?;
     let ddb = watermark::skl_pipe_ddb_get_hw_state(&io, Pipe::A)?;
@@ -707,10 +800,10 @@ fn capture(
         .iter()
         .any(|v| v & (1 << 30) != 0 && v & (1 << 31) == 0)
     {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     if dbuf.enabled_slices == 0 || !wm[0].levels[0].enable || ddb[0].blocks() == 0 {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     pin.held(r)?;
     Ok(Firmware {
@@ -781,37 +874,116 @@ fn ownership(
             );
         }
     }
-    if address == 0
+    // GGTT address zero is a valid aperture offset: firmware can and does
+    // place a stolen-memory scanout in PTE[0]. It is not a physical address,
+    // and it is admitted only below after proving that PTE present and its
+    // backing page lies wholly inside the reserved stolen range.
+    let visible_len = u64::from(plane.pitch)
+        .checked_mul(u64::from(plane.height))
+        .ok_or_else(|| super::traced_refusal())?;
+    if plane.pitch == 0
+        || plane.height == 0
         || plane.main_size == 0
-        || plane.main_size
-            < u64::from(plane.pitch)
-                .checked_mul(u64::from(plane.height))
-                .ok_or(Error::Refused)?
-        || plane.main_size.div_ceil(4096) > stolen.end.saturating_sub(stolen.start).div_ceil(4096)
+        || plane.main_size < visible_len
+        || stolen.start == 0
+        || stolen.start >= stolen.end
+        || !stolen.start.is_multiple_of(PAGE_SIZE)
+        || !stolen.end.is_multiple_of(PAGE_SIZE)
     {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
-    let page_count = usize::try_from(plane.main_size.div_ceil(4096)).map_err(|_| Error::Refused)?;
+    let page_count_u64 = plane.main_size.div_ceil(PAGE_SIZE);
+    let stolen_len = stolen
+        .end
+        .checked_sub(stolen.start)
+        .ok_or_else(|| super::traced_refusal())?;
+    if page_count_u64 > stolen_len / PAGE_SIZE {
+        return Err(super::traced_refusal());
+    }
+    let page_span = page_count_u64
+        .checked_mul(PAGE_SIZE)
+        .ok_or_else(|| super::traced_refusal())?;
+    let aperture_end = address
+        .checked_add(page_span)
+        .ok_or_else(|| super::traced_refusal())?;
+    if aperture_end > gtt.aperture() {
+        return Err(super::traced_refusal());
+    }
+    // A malformed RAM range must not become a false negative through a
+    // saturating end calculation.
+    if allocatable
+        .iter()
+        .any(|&(base, size)| base.checked_add(size).is_none())
+    {
+        return Err(super::traced_refusal());
+    }
+    let page_count = usize::try_from(page_count_u64).map_err(|_| super::traced_refusal())?;
     let mut live_pages = Vec::new();
     live_pages
         .try_reserve_exact(page_count)
-        .map_err(|_| Error::Refused)?;
-    for i in 0..plane.main_size.div_ceil(4096) {
-        let pte = gtt.entry(address + i * 4096).map_err(|_| Error::Refused)?;
+        .map_err(|_| super::traced_refusal())?;
+    for i in 0..page_count_u64 {
+        let ggtt_address = address
+            .checked_add(
+                i.checked_mul(PAGE_SIZE)
+                    .ok_or_else(|| super::traced_refusal())?,
+            )
+            .ok_or_else(|| super::traced_refusal())?;
+        let pte = gtt
+            .entry(ggtt_address)
+            .map_err(|_| super::traced_refusal())?;
         let p = pte.address();
-        let end = p.checked_add(4096).ok_or(Error::Refused)?;
+        let end = p
+            .checked_add(PAGE_SIZE)
+            .ok_or_else(|| super::traced_refusal())?;
+        let overlaps_ram = allocatable
+            .iter()
+            .any(|&(base, size)| size != 0 && p < base + size && end > base);
         if !pte.is_present()
             || pte.is_local_memory()
-            || pte.raw() & !(super::gtt::PTE_ADDRESS_MASK | 1) != 0
+            || pte.raw() & !(PTE_ADDRESS_MASK | PTE_PRESENT) != 0
             || p < stolen.start
             || end > stolen.end
-            || allocatable
-                .iter()
-                .any(|&(base, size)| p < base.saturating_add(size) && end > base)
+            || overlaps_ram
         {
-            return Err(Error::Refused);
+            #[cfg(target_os = "none")]
+            if axhal::boot::command_line_value("boot.progress") == Some("1") {
+                axlog::warn!(
+                    "intel-scanout: PTE refused ggtt={ggtt_address:#x} raw={:#x} phys={p:#x} \
+                     stolen={:#x}..{:#x} present={} local={} flags_ok={} \
+                     ram_overlap={overlaps_ram}",
+                    pte.raw(),
+                    stolen.start,
+                    stolen.end,
+                    pte.is_present(),
+                    pte.is_local_memory(),
+                    pte.raw() & !(PTE_ADDRESS_MASK | PTE_PRESENT) == 0,
+                );
+            }
+            return Err(super::traced_refusal());
         }
         live_pages.push(p);
+    }
+    // Firmware owns this mapping while scanout is live. Bracket the walk too,
+    // so a concurrent or unstable GGTT update cannot turn the returned physical
+    // pages into a different mapping before the caller establishes its lease.
+    for (i, &physical) in live_pages.iter().enumerate() {
+        let ggtt_address = address
+            .checked_add(
+                u64::try_from(i)
+                    .map_err(|_| super::traced_refusal())?
+                    .checked_mul(PAGE_SIZE)
+                    .ok_or_else(|| super::traced_refusal())?,
+            )
+            .ok_or_else(|| super::traced_refusal())?;
+        if gtt
+            .entry(ggtt_address)
+            .map_err(|_| super::traced_refusal())?
+            .raw()
+            != (physical | PTE_PRESENT)
+        {
+            return Err(super::traced_refusal());
+        }
     }
     Ok(live_pages)
 }
@@ -828,14 +1000,16 @@ fn read_only_live_scanout<R: Registers>(
     (
         intel_display::pipe_config::PipeConfig,
         intel_display::universal_plane::InitialPlaneConfig,
+        [intel_display::scaler::Scaler; 2],
     ),
     Error,
 > {
-    use intel_display::{ddi, pipe_config, universal_plane};
+    use intel_display::{ddi, pipe_config, scaler, universal_plane};
 
     pin.held(r)?;
     let io = PinnedIo { registers: r, port };
-    let pipe = pipe_config::read_pipe_config(&io, Pipe::A)?.ok_or(Error::Refused)?;
+    let pipe =
+        pipe_config::read_pipe_config(&io, Pipe::A)?.ok_or_else(|| super::traced_refusal())?;
     pipe.timings.validate()?;
     if pipe.transconf & (3 << 30) != 3 << 30
         || pipe.transconf & (3 << 21) != 0
@@ -846,9 +1020,8 @@ fn read_only_live_scanout<R: Registers>(
         || pipe.misc.bpc != Some(8)
         || pipe.misc.raw & ((1 << 23) | (1 << 4)) != 0
         || pipe.pixel_multiplier != 1
-        || pipe.source != (pipe.timings.hdisplay, pipe.timings.vdisplay)
     {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
 
     require_only_primary_display_fetch(r)?;
@@ -858,14 +1031,16 @@ fn read_only_live_scanout<R: Registers>(
         Pipe::A,
         universal_plane::Plane::PRIMARY,
     )?
-    .ok_or(Error::Refused)?;
+    .ok_or_else(|| super::traced_refusal())?;
+    let scalers = scaler::read_all_scalers(&io, Pipe::A)?.ok_or_else(|| super::traced_refusal())?;
     if !plane.native_linear_xrgb()
         || plane.offset != 0
         || (plane.width, plane.height) != pipe.source
         || read(r, 0x7018c)? != 0
         || read(r, 0x701ac)? & 0xffff_f000 != plane.surface_raw & 0xffff_f000
+        || !firmware_scalers_supported(&pipe, &plane, &scalers)
     {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     let ddi = ddi::read_function_control(&io, Pipe::A)?;
     let expected_port = if port == TcPort::Tc1 {
@@ -881,10 +1056,10 @@ fn read_only_live_scanout<R: Registers>(
         || ddi.hdmi_scrambling
         || ddi.high_tmds_ratio
     {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     pin.held(r)?;
-    Ok((pipe, plane))
+    Ok((pipe, plane, scalers))
 }
 
 #[cfg(target_os = "none")]
@@ -895,19 +1070,21 @@ pub(super) fn stolen_range(
 ) -> Result<core::ops::Range<u64>, Error> {
     let stolen_base = u64::from(read(r, 0x1080c0)?) | (u64::from(read(r, 0x1080c4)?) << 32);
     let stolen_base = stolen_base & 0xffff_ffff_fff0_0000;
-    let gmch = ecam.read_u32(bdf, 0x50).ok_or(Error::Refused)?;
+    let gmch = ecam
+        .read_u32(bdf, 0x50)
+        .ok_or_else(|| super::traced_refusal())?;
     let code = (gmch >> 8) & 255;
     // Original decoder of documented Gen9+ GMS facts; no GPL source text.
     let mb = match code {
         1..=0xef => code * 32,
         0xf0..=0xfe => (code - 0xef) * 4,
-        _ => return Err(Error::Refused),
+        _ => return Err(super::traced_refusal()),
     };
     let stolen_end = stolen_base
         .checked_add(u64::from(mb) * 1024 * 1024)
-        .ok_or(Error::Refused)?;
+        .ok_or_else(|| super::traced_refusal())?;
     if stolen_base == 0 || stolen_base >= stolen_end {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     Ok(stolen_base..stolen_end)
 }
@@ -928,23 +1105,23 @@ pub(super) fn admit_read_only_identity_lease(
     if gtt.has_identity_lease(bdf) {
         return Ok(());
     }
-    let ecam = super::pci::Ecam::platform().ok_or(Error::Refused)?;
-    let info = super::pci::DeviceInfo::read(&ecam, bdf).ok_or(Error::Refused)?;
+    let ecam = super::pci::Ecam::platform().ok_or_else(|| super::traced_refusal())?;
+    let info = super::pci::DeviceInfo::read(&ecam, bdf).ok_or_else(|| super::traced_refusal())?;
     if !super::i915_port::native_device_supported(info.vendor_id, info.device_id, info.revision) {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     let aperture = match info.bars[2].kind {
         super::pci::BarKind::Memory { address, .. } if address != 0 => address,
-        _ => return Err(Error::Refused),
+        _ => return Err(super::traced_refusal()),
     };
     let function = read(window, 0x60400)?;
     let port = match intel_display::ddi::decode_function_control(function).port {
         Some(Port::Tc1) => TcPort::Tc1,
         Some(Port::Tc2) => TcPort::Tc2,
-        _ => return Err(Error::Refused),
+        _ => return Err(super::traced_refusal()),
     };
     let pin = PowerPin::observe(window, port)?;
-    let (pipe, plane) = read_only_live_scanout(window, &pin, port)?;
+    let (pipe, plane, scalers) = read_only_live_scanout(window, &pin, port)?;
     let stolen = stolen_range(&ecam, window, bdf)?;
     let allocatable: Vec<_> = axhal::mem::phys_ram_ranges()
         .iter()
@@ -955,50 +1132,254 @@ pub(super) fn admit_read_only_identity_lease(
         &plane,
         axhal::boot::framebuffer().as_ref(),
         aperture,
-        stolen,
+        stolen.clone(),
         &allocatable,
     )?;
 
     // Bracket the page-table walk with a second read-only snapshot. A changed
     // live surface is not a lease candidate, and nothing has been written yet.
-    if read_only_live_scanout(window, &pin, port)? != (pipe, plane) {
-        return Err(Error::Refused);
+    if read_only_live_scanout(window, &pin, port)? != (pipe, plane, scalers) {
+        return Err(super::traced_refusal());
     }
     let lease = dma::acquire_identity_lease(bdf, &live_pages)?;
     gtt.install_identity_lease(lease)
-        .map_err(|_| Error::Refused)?;
+        .map_err(|_| super::traced_refusal())?;
     // Recheck after bookkeeping admission into the retained shared boot
     // identity aperture. No requester context transition or GPU isolation is
     // performed. If firmware changed scanout concurrently, keep the lease
     // owned but do not attempt GT MMIO.
-    if read_only_live_scanout(window, &pin, port)? != (pipe, plane) {
-        return Err(Error::Refused);
+    if read_only_live_scanout(window, &pin, port)? != (pipe, plane, scalers) {
+        return Err(super::traced_refusal());
+    }
+    let revalidated_pages = ownership(
+        gtt,
+        &plane,
+        axhal::boot::framebuffer().as_ref(),
+        aperture,
+        stolen,
+        &allocatable,
+    )?;
+    if revalidated_pages != live_pages {
+        return Err(super::traced_refusal());
     }
     Ok(())
+}
+
+/// The GGTT range of the live firmware Pipe-A primary surface, read with the
+/// same bracketed readout and PTE walk the identity lease admission uses. The
+/// caller keeps this range and may treat every other GGTT entry as stale.
+#[cfg(target_os = "none")]
+pub(super) fn live_scanout_ggtt_range(
+    bdf: super::pci::Bdf,
+    window: &super::regs::RegisterWindow,
+    gtt: &Gtt,
+) -> Result<core::ops::Range<u64>, Error> {
+    let ecam = super::pci::Ecam::platform().ok_or_else(|| super::traced_refusal())?;
+    let info = super::pci::DeviceInfo::read(&ecam, bdf).ok_or_else(|| super::traced_refusal())?;
+    let aperture = match info.bars[2].kind {
+        super::pci::BarKind::Memory { address, .. } if address != 0 => address,
+        _ => return Err(super::traced_refusal()),
+    };
+    let function = read(window, 0x60400)?;
+    let port = match intel_display::ddi::decode_function_control(function).port {
+        Some(Port::Tc1) => TcPort::Tc1,
+        Some(Port::Tc2) => TcPort::Tc2,
+        _ => return Err(super::traced_refusal()),
+    };
+    let pin = PowerPin::observe(window, port)?;
+    let (pipe, plane, scalers) = read_only_live_scanout(window, &pin, port)?;
+    let stolen = stolen_range(&ecam, window, bdf)?;
+    let allocatable: Vec<_> = axhal::mem::phys_ram_ranges()
+        .iter()
+        .map(|&(base, size)| (base as u64, size as u64))
+        .collect();
+    let pages = ownership(
+        gtt,
+        &plane,
+        axhal::boot::framebuffer().as_ref(),
+        aperture,
+        stolen,
+        &allocatable,
+    )?;
+    if read_only_live_scanout(window, &pin, port)? != (pipe, plane, scalers) {
+        return Err(super::traced_refusal());
+    }
+    let start = u64::from(plane.surface_raw & 0xffff_f000);
+    let len = u64::try_from(pages.len())
+        .ok()
+        .and_then(|count| count.checked_mul(PAGE_SIZE))
+        .ok_or_else(|| super::traced_refusal())?;
+    let end = start.checked_add(len).ok_or_else(|| super::traced_refusal())?;
+    Ok(start..end)
+}
+
+/// Log a bounded, read-only cross-check of the currently scanned-out surface
+/// immediately before upstream partitions the shared GGTT. The plane geometry
+/// comes from the same Linux-shaped readout used for admission, never from a
+/// fixed address or a GOP guess.
+#[cfg(target_os = "none")]
+pub(super) fn log_active_scanout_gtt_samples(
+    bdf: super::pci::Bdf,
+    window: &super::regs::RegisterWindow,
+    gtt: &Gtt,
+    identity_lease_preexisting: bool,
+) {
+    let result = (|| -> Result<(), Error> {
+        use super::pci::ConfigSpace;
+
+        let ecam = super::pci::Ecam::platform().ok_or_else(|| super::traced_refusal())?;
+        let function = read(window, 0x60400)?;
+        let port = match intel_display::ddi::decode_function_control(function).port {
+            Some(Port::Tc1) => TcPort::Tc1,
+            Some(Port::Tc2) => TcPort::Tc2,
+            _ => return Err(super::traced_refusal()),
+        };
+        let pin = PowerPin::observe(window, port)?;
+        let (pipe, plane, scalers) = read_only_live_scanout(window, &pin, port)?;
+        let stolen = stolen_range(&ecam, window, bdf)?;
+        let dsm_base_raw =
+            u64::from(read(window, 0x1080c0)?) | (u64::from(read(window, 0x1080c4)?) << 32);
+        let gmch = ecam
+            .read_u32(bdf, 0x50)
+            .ok_or_else(|| super::traced_refusal())?;
+        let surface_live = read(window, p::PLANE_SURFLIVE_A.offset())?;
+        let surface = u64::from(plane.surface());
+        let surface_match = surface_live & 0xffff_f000 == plane.surface_raw & 0xffff_f000;
+        let pages = plane.main_size.div_ceil(PAGE_SIZE);
+        if pages == 0 {
+            return Err(super::traced_refusal());
+        }
+        let allocatable: Vec<_> = axhal::mem::phys_ram_ranges()
+            .iter()
+            .map(|&(base, size)| (base as u64, size as u64))
+            .collect();
+        if allocatable
+            .iter()
+            .any(|&(base, size)| base.checked_add(size).is_none())
+        {
+            return Err(super::traced_refusal());
+        }
+
+        axlog::info!(
+            "intel-ggtt-scanout: pipe-source={}x{} ctl={:#010x} surf={:#010x} surflive={:#010x} \
+             stride={:#010x} size={:#010x} decoded={}x{} pitch={} main_size={:#x} pages={} \
+             surface_match={} admission={} GGC={:#010x} DSMBASE={:#018x} stolen={:#x}..{:#x}",
+            pipe.source.0,
+            pipe.source.1,
+            plane.ctl,
+            plane.surface_raw,
+            surface_live,
+            plane.stride_raw,
+            plane.size_raw,
+            plane.width,
+            plane.height,
+            plane.pitch,
+            plane.main_size,
+            pages,
+            surface_match,
+            if identity_lease_preexisting {
+                "preexisting-lease-shortcut"
+            } else {
+                "current-full-walk"
+            },
+            gmch,
+            dsm_base_raw,
+            stolen.start,
+            stolen.end,
+        );
+
+        let samples = [("first", 0), ("middle", pages / 2), ("last", pages - 1)];
+        for (label, page) in samples {
+            let ggtt_address = surface
+                .checked_add(
+                    page.checked_mul(PAGE_SIZE)
+                        .ok_or_else(|| super::traced_refusal())?,
+                )
+                .ok_or_else(|| super::traced_refusal())?;
+            let pte = gtt
+                .entry(ggtt_address)
+                .map_err(|_| super::traced_refusal())?;
+            let physical = pte.address();
+            let page_end = physical
+                .checked_add(PAGE_SIZE)
+                .ok_or_else(|| super::traced_refusal())?;
+            let in_stolen = stolen.start <= physical && page_end <= stolen.end;
+            let overlaps_ram = allocatable
+                .iter()
+                .any(|&(base, size)| size != 0 && physical < base + size && page_end > base);
+            let flags_ok = pte.raw() & !(PTE_ADDRESS_MASK | PTE_PRESENT) == 0;
+            let legal = pte.is_present()
+                && !pte.is_local_memory()
+                && flags_ok
+                && in_stolen
+                && !overlaps_ram;
+            axlog::info!(
+                "intel-ggtt-scanout: {label} page={page:#x} ggtt={ggtt_address:#x} raw={:#018x} \
+                 phys={physical:#x} present={} local={} flags_ok={flags_ok} in_stolen={in_stolen} \
+                 ram_overlap={overlaps_ram} legal={legal}",
+                pte.raw(),
+                pte.is_present(),
+                pte.is_local_memory(),
+            );
+        }
+
+        // Make sure the sampled plane was stable across the MMIO/PTE reads.
+        if read_only_live_scanout(window, &pin, port)? != (pipe, plane, scalers) {
+            return Err(super::traced_refusal());
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        axlog::warn!("intel-ggtt-scanout: bounded PTE comparison unavailable: {error:?}");
+    }
 }
 
 fn mode(f: &Firmware) -> Result<DrmMode, Error> {
     let t = f.pipe.timings;
     let hz = u64::from(f.pixel_clock) * 1_000_000 / (u64::from(t.htotal) * u64::from(t.vtotal));
     if !(25_000..=240_000).contains(&hz) {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     Ok(DrmMode {
         width: t.hdisplay,
         height: t.vdisplay,
-        refresh_millihz: hz.try_into().map_err(|_| Error::Refused)?,
+        refresh_millihz: hz.try_into().map_err(|_| super::traced_refusal())?,
     })
 }
 fn read_route_edid<R: Registers, T: PollTimer>(
     registers: &R,
     timer: &T,
     pin: super::gmbus::Pin,
+    power_pin: &PowerPin,
 ) -> Result<Vec<u8>, Error> {
+    let log_failure =
+        |stage: &str, error: super::gmbus::GmbusError, notes: super::gmbus::BusNotes| {
+            axlog::warn!(
+                "intel-fastboot: route EDID {stage} failed on {pin:?}: {error:?}; attempts={} \
+                 rate={} inuse={} stale-index={} bitbang={}",
+                notes.attempts,
+                notes.last_rate,
+                notes.was_in_use,
+                notes.stale_two_byte_index,
+                notes.force_bitbang,
+            );
+        };
+
     let mut notes = super::gmbus::BusNotes::default();
-    let base = super::gmbus::read_edid_with(registers, timer, pin, &mut notes)
-        .map_err(|_| Error::Refused)?;
+    let base =
+        match super::gmbus::read_edid_with_tc_power(registers, timer, pin, power_pin, &mut notes) {
+            Ok(base) => base,
+            Err(error) => {
+                log_failure("base block", error, notes);
+                return Err(super::traced_refusal());
+            }
+        };
     if base.extension_count() > 1 {
-        return Err(Error::Refused);
+        axlog::warn!(
+            "intel-fastboot: route EDID on {pin:?} declares unsupported extension count {}",
+            base.extension_count()
+        );
+        return Err(super::traced_refusal());
     }
     let mut bytes = Vec::new();
     bytes
@@ -1006,16 +1387,48 @@ fn read_route_edid<R: Registers, T: PollTimer>(
         .map_err(|_| Error::Unavailable(0))?;
     bytes.extend_from_slice(base.as_slice());
     if base.extension_count() == 1 {
-        let extension = super::gmbus::read_edid_extension_with(registers, timer, pin)
-            .map_err(|_| Error::Refused)?
-            .ok_or(Error::Refused)?;
+        let mut extension_notes = super::gmbus::BusNotes::default();
+        let extension = match super::gmbus::read_edid_extension_from_base_tc_power_with(
+            registers,
+            timer,
+            pin,
+            &base,
+            &mut extension_notes,
+            power_pin,
+        ) {
+            Ok(Some(extension)) => extension,
+            Ok(None) => {
+                axlog::warn!("intel-fastboot: route EDID extension disappeared on {pin:?}");
+                return Err(super::traced_refusal());
+            }
+            Err(error) => {
+                log_failure("extension block", error, extension_notes);
+                return Err(super::traced_refusal());
+            }
+        };
         bytes.extend_from_slice(extension.as_slice());
     }
     let mut verify_notes = super::gmbus::BusNotes::default();
-    let verify = super::gmbus::read_edid_with(registers, timer, pin, &mut verify_notes)
-        .map_err(|_| Error::Refused)?;
+    let verify = match super::gmbus::read_edid_with_tc_power(
+        registers,
+        timer,
+        pin,
+        power_pin,
+        &mut verify_notes,
+    ) {
+        Ok(verify) => verify,
+        Err(error) => {
+            log_failure("base block recheck", error, verify_notes);
+            return Err(super::traced_refusal());
+        }
+    };
     if verify != base {
-        return Err(Error::Refused);
+        axlog::warn!(
+            "intel-fastboot: route EDID base changed between reads on {pin:?}; extensions {} -> {}",
+            base.extension_count(),
+            verify.extension_count()
+        );
+        return Err(super::traced_refusal());
     }
     Ok(bytes)
 }
@@ -1065,6 +1478,10 @@ struct Native<R, T> {
     port: TcPort,
     pci: axdriver_display::DisplayPciIdentity,
     irq_event_sequence: AtomicU32,
+    #[cfg(test)]
+    test_native_atomic: bool,
+    #[cfg(test)]
+    test_last_native_error: Mutex<Option<String>>,
     state: Mutex<State>,
 }
 
@@ -1769,7 +2186,7 @@ fn latch(r: &impl Registers, timer: &impl PollTimer, address: u32) -> Result<(),
     let start = timer.now_micros();
     write(r, 0x7019c, address)?;
     if read(r, 0x7019c)? != address {
-        return Err(Error::Refused);
+        return Err(super::traced_refusal());
     }
     // A store/posted read is not completion. Observe a hardware frame AFTER
     // SURFLIVE matches, then another fresh frame; old DMA may retire only then.
@@ -1791,7 +2208,7 @@ fn latch(r: &impl Registers, timer: &impl PollTimer, address: u32) -> Result<(),
         }
         timer.pause();
     }
-    Err(Error::Refused)
+    Err(super::traced_refusal())
 }
 
 fn cpp_for_format(format: u32) -> Option<u32> {
@@ -1829,6 +2246,38 @@ fn retained_watermark_budget(baseline: &Firmware, target: NativeMode, pitch: u32
         && baseline.wm[0].levels[0].enable
 }
 
+/// A scaled firmware surface has a smaller primary fetch width than the
+/// native target, so the old no-worse proof does not apply. For that one
+/// profile, admit only the identical 4K30 output and require the source-derived
+/// target DDB/watermark plan to be computable before the transaction starts.
+fn native_target_watermark_supported(
+    baseline: &Firmware,
+    target: NativeMode,
+    pitch: u32,
+    watermarks: super::pipe::WatermarkConfig,
+) -> bool {
+    if !has_enabled_scaler(&baseline.scalers) {
+        return retained_watermark_budget(baseline, target, pitch);
+    }
+    let Ok(source_mode) = firmware_timing(baseline) else {
+        return false;
+    };
+    let Some(expected_pitch) = pitch_for(target.kms.width, 4) else {
+        return false;
+    };
+    firmware_scalers_supported(&baseline.pipe, &baseline.plane, &baseline.scalers)
+        && target.timing.same_timing(&source_mode)
+        && (
+            u32::from(target.timing.hdisplay),
+            u32::from(target.timing.vdisplay),
+        ) == N305_SCALED_FIRMWARE_TIMING
+        && pitch == expected_pitch
+        && baseline.dbuf.enabled_slices != 0
+        && baseline.ddb[0].blocks() != 0
+        && baseline.wm[0].levels[0].enable
+        && target_watermarks(baseline, target, pitch, intel_display::universal_plane::XRGB8888, watermarks).is_ok()
+}
+
 fn avi_frame(words: [u32; 8]) -> intel_display::hdmi::RawInfoframe {
     let mut raw = [0; 32];
     for (word, bytes) in words.into_iter().zip(raw.chunks_exact_mut(4)) {
@@ -1838,6 +2287,28 @@ fn avi_frame(words: [u32; 8]) -> intel_display::hdmi::RawInfoframe {
         raw,
         kind: intel_display::hdmi::FrameType::Avi,
     }
+}
+
+fn primary_watermarks(firmware: &Firmware) -> super::tc_modeset::PrimaryWatermarkImage {
+    super::tc_modeset::PrimaryWatermarkImage { wm: firmware.wm[0], ddb: firmware.ddb[0] }
+}
+
+fn retained_ddb(firmware: &Firmware) -> Result<super::pipe::DdbAllocation, super::pipe::PipeError> {
+    // Do not allocate inactive DBUF slices or steal another plane's range.
+    // Recompute WMs for the target using the already powered primary range.
+    super::pipe::DdbAllocation::checked(u32::from(firmware.ddb[0].start), u32::from(firmware.ddb[0].end))
+}
+
+fn target_watermarks(
+    firmware: &Firmware, mode: NativeMode, pitch: u32, pixel_format: u32,
+    config: super::pipe::WatermarkConfig,
+) -> Result<super::tc_modeset::PrimaryWatermarkImage, super::pipe::PipeError> {
+    let program = super::pipe::compute_with_watermarks_format(
+        super::pipe::Pipe::A, &mode.timing,
+        super::pipe::PlaneSurface { ggtt_address: 0x1000, stride_bytes: pitch },
+        config, pixel_format, retained_ddb(firmware)?,
+    )?;
+    Ok(super::tc_modeset::PrimaryWatermarkImage::from_program(&program))
 }
 
 fn same_mode_state(
@@ -1851,6 +2322,7 @@ fn same_mode_state(
     port: TcPort,
     expected_avi: intel_display::hdmi::RawInfoframe,
     expected_phy: &intel_display::tc::DklPhyState,
+    expected_watermarks: super::tc_modeset::PrimaryWatermarkImage,
 ) -> bool {
     let t = mode.timing;
     let pipe = observed.pipe;
@@ -1910,13 +2382,27 @@ fn same_mode_state(
         && observed.hdmi.gcp == baseline.hdmi.gcp
         && observed.hdmi.frames[0] == Some(expected_avi)
         && observed.hdmi.frames[1..] == baseline.hdmi.frames[1..]
-        && observed.wm == baseline.wm
-        && observed.ddb == baseline.ddb
+        && primary_watermarks(observed) == expected_watermarks
+        && observed.wm[1..] == baseline.wm[1..]
+        && observed.ddb[1..] == baseline.ddb[1..]
         && observed.dbuf == baseline.dbuf
         && observed.color == baseline.color
-        && observed.scalers == baseline.scalers
+        && target_scalers_match(observed.scalers, baseline.scalers)
         && observed.fia == baseline.fia
         && observed.phy == *expected_phy
+}
+
+fn target_scalers_match(
+    observed: [intel_display::scaler::Scaler; 2],
+    baseline: [intel_display::scaler::Scaler; 2],
+) -> bool {
+    if has_enabled_scaler(&baseline) {
+        observed
+            .iter()
+            .all(|scaler| scaler.ctl == 0 && scaler.position.is_none() && scaler.size.is_none())
+    } else {
+        observed == baseline
+    }
 }
 
 impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for Native<R, T> {
@@ -1995,7 +2481,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
         } else {
             super::gmbus::Pin::Tc2
         };
-        let observed = read_route_edid(&self.registers, &self.timer, pin);
+        let observed = read_route_edid(&self.registers, &self.timer, pin, &self.power);
         let mut unsupported_sink = false;
         let sample_matches = match observed {
             Ok(bytes) if bytes == self.sink_edid => true,
@@ -2196,12 +2682,21 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             .map_err(|_| DrmError::NoMemory)
     }
     fn present(&self, s: Scanout) -> DrmResult<Arc<Fence>> {
+        #[cfg(test)]
+        let native_atomic = self.test_native_atomic;
+        #[cfg(not(test))]
         let native_atomic =
             select_native_modeset_path(axhal::boot::command_line_value("intel.native_modeset"))
                 == NativeModesetPath::NativeAtomic;
         let Some(target) = self.modes.iter().find(|mode| mode.kms == s.mode).copied() else {
             return Err(DrmError::Unsupported);
         };
+        if has_enabled_scaler(&self.baseline.scalers) && !native_atomic {
+            // The legacy writer can latch SURF without replacing the scaler's
+            // old 800x600 phase/plane state. Never treat that as a native 4K
+            // framebuffer takeover when the scaler transaction is opted out.
+            return Err(DrmError::Unsupported);
+        }
         let Some(cpp) = cpp_for_format(s.format) else {
             return Err(DrmError::Unsupported);
         };
@@ -2241,15 +2736,24 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
         if target != state.current_mode && state.counter_epoch == u64::MAX {
             return Err(DrmError::Overflow);
         }
+        // WM admission precedes GGTT binding so a rejected target cannot
+        // strand a candidate mapping. Keep the powered primary DDB range.
+        let target_ddb = retained_ddb(&state.firmware).map_err(|_| DrmError::Unsupported)?;
+        let expected_watermarks = target_watermarks(&state.firmware, target, s.pitch, s.format, self.watermark)
+            .map_err(|_| DrmError::Unsupported)?;
         // Allocate every recovery/quarantine slot before touching hardware.
-        state
-            .quarantine
-            .try_reserve(2)
-            .map_err(|_| DrmError::NoMemory)?;
-        state
-            .unbound_quarantine
-            .try_reserve(1)
-            .map_err(|_| DrmError::NoMemory)?;
+        if state.quarantine.try_reserve(2).is_err() {
+            axlog::warn!(
+                "intel-display: scanout recovery quarantine allocation failed before capture"
+            );
+            return Err(DrmError::NoMemory);
+        }
+        if state.unbound_quarantine.try_reserve(1).is_err() {
+            axlog::warn!(
+                "intel-display: scanout unbound-page quarantine allocation failed before capture"
+            );
+            return Err(DrmError::NoMemory);
+        }
         let complete = Fence::new(false);
         if self.power.held(&self.registers).is_err() {
             state.lost = true;
@@ -2302,11 +2806,31 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
         {
             current.binding.address
         } else {
-            let pin = pages.fixed_view().map_err(|_| DrmError::Invalid)?;
+            let pin = match pages.fixed_view() {
+                Ok(pin) => pin,
+                Err(error) => {
+                    axlog::warn!(
+                        "intel-display: scanout fixed-page view creation failed: {error:?}"
+                    );
+                    complete.signal_error();
+                    return Err(if matches!(error, axerrno::AxError::NoMemory) {
+                        DrmError::NoMemory
+                    } else {
+                        DrmError::Invalid
+                    });
+                }
+            };
             let mut physical = Vec::new();
-            physical
-                .try_reserve_exact(pages.len())
-                .map_err(|_| DrmError::NoMemory)?;
+            if physical.try_reserve_exact(pages.len()).is_err() {
+                axlog::warn!(
+                    "intel-display: scanout physical-page vector allocation failed: pages={} \
+                     bytes={}",
+                    pages.len(),
+                    pages.len().saturating_mul(core::mem::size_of::<u64>()),
+                );
+                complete.signal_error();
+                return Err(DrmError::NoMemory);
+            }
             for i in 0..pages.len() {
                 let p = pages.paddr_at(i).map_err(|_| DrmError::Invalid)?.as_usize() as u64;
                 if p >= 1 << 39 {
@@ -2319,14 +2843,49 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                 .bind_pages(&physical, Some((pages.clone(), pin.clone())))
             {
                 Ok(b) => b,
-                Err(
-                    super::gtt::GttError::CheckpointUnavailable
-                    | super::gtt::GttError::ApertureExhausted { .. },
-                ) => {
+                Err(error @ super::gtt::GttError::CheckpointUnavailable) => {
+                    axlog::warn!(
+                        "intel-display: GGTT scanout bind metadata allocation failed: pages={} \
+                         padding_entries={} error={error:?}",
+                        physical.len(),
+                        super::gtt::SCANOUT_PADDING_ENTRIES,
+                    );
                     complete.signal_error();
                     return Err(DrmError::NoMemory);
                 }
-                Err(_) => {
+                Err(error @ super::gtt::GttError::ApertureExhausted { .. }) => {
+                    let stats = self.gtt.native_partition_stats();
+                    if let Some((present, absent, largest_run)) = stats {
+                        axlog::warn!(
+                            "intel-display: GGTT scanout aperture exhausted: payload_pages={} \
+                             padding_entries={} alignment={:#x} partition_present_pages={} \
+                             partition_absent_pages={} partition_largest_aligned_payload_pages={} \
+                             error={error:?}",
+                            physical.len(),
+                            super::gtt::SCANOUT_PADDING_ENTRIES,
+                            super::gtt::SCANOUT_ALIGNMENT,
+                            present,
+                            absent,
+                            largest_run,
+                        );
+                    } else {
+                        axlog::warn!(
+                            "intel-display: GGTT scanout aperture exhausted before shared \
+                             partition stats were available: payload_pages={} padding_entries={} \
+                             error={error:?}",
+                            physical.len(),
+                            super::gtt::SCANOUT_PADDING_ENTRIES,
+                        );
+                    }
+                    complete.signal_error();
+                    return Err(DrmError::NoMemory);
+                }
+                Err(error) => {
+                    axlog::warn!(
+                        "intel-display: GGTT scanout bind refused before safe publication: \
+                         pages={} error={error:?}",
+                        physical.len(),
+                    );
                     state.unbound_quarantine.push((pages, pin));
                     state.lost = true;
                     complete.signal_error();
@@ -2423,8 +2982,8 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             }
             state.firmware.plane.surface_raw = surface;
         } else {
-            if !retained_watermark_budget(&self.baseline, target, s.pitch)
-                || state.firmware.wm != self.baseline.wm
+            if !native_target_watermark_supported(&self.baseline, target, s.pitch, self.watermark)
+                || state.firmware.wm[1..] != self.baseline.wm[1..]
                 || state.firmware.ddb != self.baseline.ddb
                 || state.firmware.dbuf != self.baseline.dbuf
             {
@@ -2564,6 +3123,8 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             let old_surface = before;
             let old_pitch = old_firmware.plane.pitch;
             let watermark = self.watermark;
+            let ddb = target_ddb;
+            let old_watermarks = primary_watermarks(&old_firmware);
             let mut display_writes_started = false;
             let mut dpll_undo = None;
             let mut dpll_states = None;
@@ -2637,6 +3198,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                                 self.port,
                                 expected_target_avi,
                                 &expected_target_phy,
+                                expected_watermarks,
                             ) {
                                 return Err(String::from("native target image mismatch"));
                             }
@@ -2666,7 +3228,8 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                             s.pitch,
                             s.format,
                             surface,
-                            Some(watermark),
+                            Some((watermark, ddb)),
+                            &observed.scalers,
                             &avi_words,
                             &self.sink_edid,
                             Some(&mut lifecycle),
@@ -2685,11 +3248,12 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                             s.pitch,
                             s.format,
                             surface,
-                            Some(watermark),
+                            Some((watermark, ddb)),
                             &target_pll,
                             self.afc_startup,
                             &avi_words,
                             &self.sink_edid,
+                            None,
                             None,
                             None,
                             true,
@@ -2735,6 +3299,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                         self.port,
                         expected_target_avi,
                         &expected_target_phy,
+                        expected_watermarks,
                     ) {
                         return Err(String::from(
                             "TC modeset state did not match the full target image",
@@ -2798,6 +3363,10 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                     // Never retry the legacy writer after an explicit native commit.
                     // A failed native transaction leaves the display quiesced; the
                     // runner already unwound hardware and its candidate mapping.
+                    #[cfg(test)]
+                    {
+                        *self.test_last_native_error.lock() = Some(original.clone());
+                    }
                     self.shared_dpll
                         .lock()
                         .quarantine_after_unverified_rollback();
@@ -2828,13 +3397,14 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                             old_pitch,
                             old_firmware.plane.fourcc,
                             old_surface,
-                            Some(watermark),
+                            Some((watermark, ddb)),
                             &old_firmware.pll.state,
                             self.afc_startup,
                             &old_avi,
                             &self.sink_edid,
                             Some(old_firmware.pipe.misc.raw),
                             Some(old_firmware.plane.ctl),
+                            Some(&old_watermarks),
                             false,
                             Some(&old_firmware.phy),
                             None,
@@ -2870,6 +3440,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                                 self.port,
                                 old_avi_frame.unwrap(),
                                 &old_firmware.phy,
+                                old_watermarks,
                             ) {
                                 return Err(String::from(
                                     "TC rollback did not restore the old image",
@@ -2961,28 +3532,29 @@ pub(super) fn init(
         ));
     }
     let setup = || -> Result<_, Error> {
-        let ecam = super::pci::Ecam::platform().ok_or(Error::Refused)?;
-        let info = super::pci::DeviceInfo::read(&ecam, bdf).ok_or(Error::Refused)?;
+        let ecam = super::pci::Ecam::platform().ok_or_else(|| super::traced_refusal())?;
+        let info =
+            super::pci::DeviceInfo::read(&ecam, bdf).ok_or_else(|| super::traced_refusal())?;
         if !super::i915_port::native_device_supported(info.vendor_id, info.device_id, info.revision)
         {
-            return Err(Error::Refused);
+            return Err(super::traced_refusal());
         }
         let boot = axhal::boot::framebuffer();
         let aperture = match info.bars[2].kind {
             super::pci::BarKind::Memory { address, .. } if address != 0 => address,
-            _ => return Err(Error::Refused),
+            _ => return Err(super::traced_refusal()),
         };
         let ctl = read(&window, 0x60400)?;
         let port = match intel_display::ddi::decode_function_control(ctl).port {
             Some(Port::Tc1) => TcPort::Tc1,
             Some(Port::Tc2) => TcPort::Tc2,
-            _ => return Err(Error::Refused),
+            _ => return Err(super::traced_refusal()),
         };
         // Acquire the actual board route via read-only ASLS, not a captured
         // prior Linux state or hardcoded claim that every TC port is HDMI.
         let asls = ecam
             .read_u32(bdf, intel_display::opregion::ASLS)
-            .ok_or(Error::Refused)?;
+            .ok_or_else(|| super::traced_refusal())?;
         let data = firmware_bytes(u64::from(asls), intel_display::opregion::SIZE)?;
         let op = intel_display::opregion::OpRegion::parse(&data, u64::from(asls))?;
         let external = match map_external_vbt(&op, |v| firmware_bytes(v.physical, v.size)) {
@@ -3029,7 +3601,7 @@ pub(super) fn init(
                     Port::Tc2
                 })
             })
-            .ok_or(Error::Refused)?;
+            .ok_or_else(|| super::traced_refusal())?;
         if !route.supports_hdmi()
             || route.usb_type_c
             || route.thunderbolt
@@ -3038,14 +3610,14 @@ pub(super) fn init(
             || route.hdmi_level_shift != 5
             || route.gmbus_pin() != Some(if port == TcPort::Tc1 { 9 } else { 10 })
         {
-            return Err(Error::Refused);
+            return Err(super::traced_refusal());
         }
         let preflight = read(&window, 0x45404)?;
         if preflight & ((1 << 0) | (1 << 2) | (1 << 10)) != (1 << 0) | (1 << 2) | (1 << 10)
             || read(&window, 0x70180)? & (1 << 31) == 0
             || read(&window, 0x701a4)? != 0
         {
-            return Err(Error::Refused);
+            return Err(super::traced_refusal());
         }
         let stolen = stolen_range(&ecam, &window, bdf)?;
         // Firmware PTEs must avoid usable RAM altogether, not merely free
@@ -3062,7 +3634,7 @@ pub(super) fn init(
                         axlog::warn!(
                             "intel-fastboot: source watermark profile unavailable: {error}"
                         );
-                        Error::Refused
+                        super::traced_refusal()
                     })?;
             let first = capture(&window, &pin, port, afc_startup)?;
             // Scope the translated shared-DPLL manager to the power-proven
@@ -3076,14 +3648,14 @@ pub(super) fn init(
             )
             .map_err(|error| {
                 axlog::warn!("intel-fastboot: shared DPLL identity refused: {error:?}");
-                Error::Refused
+                super::traced_refusal()
             })?;
             let mut shared_dpll = super::shared_dpll::SharedDpllState::new(dpll_identity, 0);
             shared_dpll
                 .set_afc_startup_override(afc_startup)
                 .map_err(|error| {
                     axlog::warn!("intel-fastboot: VBT DKL AFC override refused: {error:?}");
-                    Error::Refused
+                    super::traced_refusal()
                 })?;
             let mut dpll_power =
                 super::shared_dpll::PinnedDpllPower::new(&pin, dpll_identity, first.refclk)
@@ -3091,24 +3663,24 @@ pub(super) fn init(
                         axlog::warn!(
                             "intel-fastboot: shared DPLL power context refused: {error:?}"
                         );
-                        Error::Refused
+                        super::traced_refusal()
                     })?;
             shared_dpll
                 .init(&window, &super::gmbus::MonotonicTimer, &mut dpll_power)
                 .map_err(|error| {
                     axlog::warn!("intel-fastboot: shared DPLL manager init refused: {error:?}");
-                    Error::Refused
+                    super::traced_refusal()
                 })?;
             let source_tc_port = match port {
                 TcPort::Tc1 => intel_display::intel_dpll_mgr_full::TcPort::Tc1,
                 TcPort::Tc2 => intel_display::intel_dpll_mgr_full::TcPort::Tc2,
-                _ => return Err(Error::Refused),
+                _ => return Err(super::traced_refusal()),
             };
             let dpll_index = shared_dpll
                 .limit_to_tc_port(source_tc_port)
                 .map_err(|error| {
                     axlog::warn!("intel-fastboot: shared DPLL port scope refused: {error:?}");
-                    Error::Refused
+                    super::traced_refusal()
                 })?;
             let mut crtc_states = [intel_display::intel_dpll_mgr_full::CrtcState::default();
                 intel_display::intel_dpll_mgr_full::MAX_PIPES];
@@ -3135,7 +3707,7 @@ pub(super) fn init(
                     axlog::warn!(
                         "intel-fastboot: translated DPLL manager readout refused: {error:?}"
                     );
-                    Error::Refused
+                    super::traced_refusal()
                 })?;
             let (manager_pll_on, manager_state) = shared_dpll
                 .get_hw_state(
@@ -3148,7 +3720,7 @@ pub(super) fn init(
                     axlog::warn!(
                         "intel-fastboot: translated shared DPLL readout refused: {error:?}"
                     );
-                    Error::Refused
+                    super::traced_refusal()
                 })?;
             if manager_pll_on != (first.pll.enable != 0)
                 || !super::shared_dpll::dkl_state_matches_source_readout(
@@ -3163,7 +3735,7 @@ pub(super) fn init(
                     first.pll.enable,
                     manager_pll_on
                 );
-                return Err(Error::Refused);
+                return Err(super::traced_refusal());
             }
             let live_pages = ownership(
                 &gtt,
@@ -3179,17 +3751,17 @@ pub(super) fn init(
             // not replace the context or isolate this requester.
             let identity_lease = super::dma::acquire_identity_lease(bdf, &live_pages)?;
             gtt.install_identity_lease(identity_lease)
-                .map_err(|_| Error::Refused)?;
+                .map_err(|_| super::traced_refusal())?;
             super::dmc::display_power_ready(window, intel_display::dmc::DmcPlatform::AlderLakeN);
             let ddc = if port == TcPort::Tc1 {
                 super::gmbus::Pin::Tc1
             } else {
                 super::gmbus::Pin::Tc2
             };
-            let sink_edid = read_route_edid(&window, &super::gmbus::MonotonicTimer, ddc)?;
+            let sink_edid = read_route_edid(&window, &super::gmbus::MonotonicTimer, ddc, &pin)?;
             let second = capture(&window, &pin, port, afc_startup)?;
             if first != second {
-                return Err(Error::Refused);
+                return Err(super::traced_refusal());
             }
             let (modes, preferred, current) = native_modes(&sink_edid, &first)?;
             Ok((
@@ -3260,6 +3832,10 @@ pub(super) fn init(
         port,
         pci,
         irq_event_sequence: AtomicU32::new(0),
+        #[cfg(test)]
+        test_native_atomic: false,
+        #[cfg(test)]
+        test_last_native_error: Mutex::new(None),
         state: Mutex::new(State {
             current_format: firmware.plane.fourcc,
             firmware,
@@ -3339,7 +3915,7 @@ pub(super) fn init(
     }
     Ok(format!(
         "intel-fastboot: TC1/TC2 legacy-HDMI KMS registered preferred={preferred:?} \
-         firmware_mode={:?}; supported_modes={:?}; firmware WM/DDB retained; TC modeset rollback \
+         firmware_mode={:?}; supported_modes={:?}; powered DDB retained, target WM programmed; TC modeset rollback \
          and pageflip completion require fresh SURFLIVE/hardware frames; 未在硬件上验证",
         current_mode.kms,
         adapter
@@ -3543,6 +4119,7 @@ mod tests {
         fail_offset: Option<u32>,
         stall: bool,
         fail_surface: bool,
+        stuck_pipe_running: bool,
         frame_pixel_pending: bool,
     }
     impl Model {
@@ -3696,6 +4273,7 @@ mod tests {
                     fail_offset: None,
                     stall: false,
                     fail_surface: false,
+                    stuck_pipe_running: false,
                     frame_pixel_pending: false,
                 })),
             }
@@ -3761,9 +4339,13 @@ mod tests {
                 }
                 s.words.insert(r, value);
             } else if r == 0x70008 {
+                let was_running = s.words.get(&r).copied().unwrap_or(0) & (1 << 30) != 0;
+                let stuck_pipe_running = s.stuck_pipe_running;
                 s.words.insert(
                     r,
                     if v & (1 << 31) != 0 {
+                        v | (1 << 30)
+                    } else if stuck_pipe_running && was_running {
                         v | (1 << 30)
                     } else {
                         v & !(1 << 30)
@@ -3900,6 +4482,8 @@ mod tests {
                 revision: 0,
             },
             irq_event_sequence: AtomicU32::new(0),
+            test_native_atomic: false,
+            test_last_native_error: Mutex::new(None),
             state: Mutex::new(State {
                 current_format: firmware.plane.fourcc,
                 firmware,
@@ -3941,7 +4525,45 @@ mod tests {
         Model,
         super::super::gtt::mock::MockPageTable,
     ) {
+        native_4k30_to_1080p60_with_native_atomic(false)
+    }
+
+    fn native_4k30_to_1080p60_with_native_atomic(
+        native_atomic: bool,
+    ) -> (
+        Arc<Native<Model, Timer>>,
+        Model,
+        super::super::gtt::mock::MockPageTable,
+    ) {
+        native_4k30_fixture(native_atomic, None)
+    }
+
+    fn native_4k30_scaled_with_native_atomic(
+        native_atomic: bool,
+        scaler_binding: u32,
+    ) -> (
+        Arc<Native<Model, Timer>>,
+        Model,
+        super::super::gtt::mock::MockPageTable,
+    ) {
+        native_4k30_fixture(native_atomic, Some(scaler_binding))
+    }
+
+    fn native_4k30_fixture(
+        native_atomic: bool,
+        scaler_binding: Option<u32>,
+    ) -> (
+        Arc<Native<Model, Timer>>,
+        Model,
+        super::super::gtt::mock::MockPageTable,
+    ) {
         let r = Model::new();
+        // The 4K30 firmware pipe cannot be live below its 297 MHz pixel rate.
+        // Keep a legal 312 MHz ADL-N CDCLK (24 MHz refclk, ratio 26, CD2X /2)
+        // in this source-shaped fixture; Model::new()'s 176 MHz setting is
+        // appropriate for the tiny/1080p fixtures only.
+        r.set(0x46000, (7 << 19) | 620);
+        r.set(0x46070, (1 << 31) | (1 << 30) | 26);
         let pair = |a: u32, b: u32| (a - 1) | ((b - 1) << 16);
         for (offset, value) in [
             (0x60000, pair(3840, 4400)),
@@ -3955,6 +4577,15 @@ mod tests {
             (0x70188, 15_360 / 64),
         ] {
             r.set(offset, value);
+        }
+        if let Some(binding) = scaler_binding {
+            r.set(0x6001c, ((800 - 1) << 16) | (600 - 1));
+            r.set(0x70190, pair(800, 600));
+            r.set(0x70188, 3200 / 64);
+            r.set(0x68180, (1 << 31) | (binding << 25));
+            r.set(0x68170, 0);
+            // PS_WIN_SZ encodes pixel counts, not size-minus-one fields.
+            r.set(0x68174, (3840 << 16) | 2160);
         }
         let baseline_pll =
             intel_display::dpll_mgr::icl_calc_mg_pll_state(297_000, 24_000, None).unwrap();
@@ -3986,13 +4617,18 @@ mod tests {
             ),
             (297_000, 3840, 4400)
         );
+        let expected_plane = if scaler_binding.is_some() {
+            (800, 600, 3_200)
+        } else {
+            (3840, 2160, 15_360)
+        };
         assert_eq!(
             (
                 firmware.plane.width,
                 firmware.plane.height,
                 firmware.plane.pitch
             ),
-            (3840, 2160, 15_360)
+            expected_plane
         );
         let current_mode = NativeMode {
             timing: current_timing,
@@ -4050,6 +4686,8 @@ mod tests {
                 revision: 0,
             },
             irq_event_sequence: AtomicU32::new(0),
+            test_native_atomic: native_atomic,
+            test_last_native_error: Mutex::new(None),
             state: Mutex::new(State {
                 current_format: firmware.plane.fourcc,
                 firmware,
@@ -4071,6 +4709,103 @@ mod tests {
         });
         (adapter, r, array)
     }
+
+    fn set_scaled_firmware(r: &Model, binding: u32) {
+        let pair = |width: u32, height: u32| (width - 1) | ((height - 1) << 16);
+        r.set(0x6001c, ((800 - 1) << 16) | (600 - 1));
+        r.set(0x70190, pair(800, 600));
+        r.set(0x70188, 3200 / 64);
+        r.set(0x68180, (1 << 31) | (binding << 25));
+        r.set(0x68170, 0);
+        r.set(0x68174, (3840 << 16) | 2160);
+    }
+
+    #[test]
+    fn firmware_scaled_gop_profile_is_captured_read_only_and_rejects_other_geometries() {
+        for binding in [0] {
+            let (adapter, registers, _) = native_4k30_to_1080p60();
+            set_scaled_firmware(&registers, binding);
+            let pin = &adapter.power;
+            let writes_before = registers.inner.lock().writes;
+
+            let live = read_only_live_scanout(&registers, pin, TcPort::Tc1).unwrap();
+            assert_eq!(live.0.source, N305_SCALED_FIRMWARE_SOURCE);
+            assert_eq!(
+                (live.0.timings.hdisplay, live.0.timings.vdisplay),
+                N305_SCALED_FIRMWARE_TIMING
+            );
+            assert_eq!((live.1.width, live.1.height), N305_SCALED_FIRMWARE_SOURCE);
+            assert_eq!(live.2.iter().filter(|s| s.enabled()).count(), 1);
+            assert_eq!(
+                live.2.iter().find(|s| s.enabled()).unwrap().binding(),
+                binding
+            );
+            assert_eq!(registers.inner.lock().writes, writes_before);
+
+            let firmware = capture(&registers, pin, TcPort::Tc1, None).unwrap();
+            assert_eq!(
+                firmware,
+                capture(&registers, pin, TcPort::Tc1, None).unwrap()
+            );
+            assert_eq!(firmware.scalers, live.2);
+            assert!(firmware_scalers_supported(
+                &firmware.pipe,
+                &firmware.plane,
+                &firmware.scalers
+            ));
+            assert!(native_target_watermark_supported(
+                &firmware,
+                adapter.modes[0],
+                3840 * 4,
+                adapter.watermark
+            ));
+        }
+
+        for (binding, position, size, extra_scaler, source_width) in [
+            (1, 0, (3840 << 16) | 2160, false, 800),
+            (2, 0, (3840 << 16) | 2160, false, 800),
+            (0, 1 << 16, (3840 << 16) | 2160, false, 800),
+            (0, 0, (3839 << 16) | 2160, false, 800),
+            (0, 0, (3840 << 16) | 2160, true, 800),
+            (0, 0, (3840 << 16) | 2160, false, 801),
+        ] {
+            let (adapter, registers, _) = native_4k30_to_1080p60();
+            set_scaled_firmware(&registers, binding);
+            registers.set(0x68170, position);
+            registers.set(0x68174, size);
+            if extra_scaler {
+                registers.set(0x68280, (1 << 31) | (1 << 25));
+                registers.set(0x68270, 0);
+                registers.set(0x68274, (3840 << 16) | 2160);
+            }
+            if source_width != 800 {
+                registers.set(0x6001c, ((source_width - 1) << 16) | 599);
+            }
+            let writes_before = registers.inner.lock().writes;
+            assert!(read_only_live_scanout(&registers, &adapter.power, TcPort::Tc1).is_err());
+            assert!(capture(&registers, &adapter.power, TcPort::Tc1, None).is_err());
+            assert_eq!(
+                registers.inner.lock().writes,
+                writes_before,
+                "unsupported firmware scaler geometry must be refused read-only"
+            );
+        }
+
+        for unsupported_ctrl in [1 << 28, 2 << 28, 1 << 5, 1 << 7] {
+            let (adapter, registers, _) = native_4k30_to_1080p60();
+            set_scaled_firmware(&registers, 0);
+            registers.set(0x68180, (1 << 31) | unsupported_ctrl);
+            let writes_before = registers.inner.lock().writes;
+            assert!(read_only_live_scanout(&registers, &adapter.power, TcPort::Tc1).is_err());
+            assert!(capture(&registers, &adapter.power, TcPort::Tc1, None).is_err());
+            assert_eq!(
+                registers.inner.lock().writes,
+                writes_before,
+                "non-normal scaler mode or Y-plane binding must be refused before writes"
+            );
+        }
+    }
+
     fn edid_with_1080p60_vic16() -> Vec<u8> {
         edid_with_1080p60_vic16_and_max_tmds(None)
     }
@@ -4325,7 +5060,7 @@ mod tests {
         // 256-byte minimum for this 64-pixel XRGB test surface.
         r.set(0x70188, 5);
 
-        let (pipe, plane) = read_only_live_scanout(&r, &pin, TcPort::Tc1).unwrap();
+        let (pipe, plane, _) = read_only_live_scanout(&r, &pin, TcPort::Tc1).unwrap();
         assert_eq!(plane.pitch, 320);
         assert_eq!(plane.main_size, 320 * u64::from(plane.height));
         assert_eq!(plane.width, pipe.source.0);
@@ -4421,6 +5156,96 @@ mod tests {
             0x80000001,
             "live scanout PTE remains untouched while ownership is admitted"
         );
+
+        // Zero is a GGTT byte offset, not a physical address. It is valid
+        // only when PTE[0..4] independently prove a present stolen backing.
+        let mut zero_surface = a.baseline.plane;
+        zero_surface.surface_raw = 0;
+        for i in 0..4 {
+            array.write(i, 0x8000_0001 + (i as u64) * 4096);
+        }
+        assert_eq!(
+            ownership(
+                &a.gtt,
+                &zero_surface,
+                None,
+                0xc0000000,
+                0x80000000..0x90000000,
+                &[]
+            )
+            .unwrap(),
+            vec![0x8000_0000, 0x8000_1000, 0x8000_2000, 0x8000_3000],
+            "a zero GGTT offset is admitted only through verified PTEs"
+        );
+        array.write(0, 0);
+        assert!(
+            ownership(
+                &a.gtt,
+                &zero_surface,
+                None,
+                0xc0000000,
+                0x80000000..0x90000000,
+                &[]
+            )
+            .is_err(),
+            "an absent PTE at the valid zero offset is still refused"
+        );
+        array.write(0, 0x8000_0003);
+        assert!(
+            ownership(
+                &a.gtt,
+                &zero_surface,
+                None,
+                0xc0000000,
+                0x80000000..0x90000000,
+                &[]
+            )
+            .is_err(),
+            "a present PTE with unsupported flag bits is refused"
+        );
+        array.write(0, 0x8000_0001);
+        assert!(
+            ownership(
+                &a.gtt,
+                &zero_surface,
+                None,
+                0xc0000000,
+                0x80000000..0x90000000,
+                &[(0x80000000, 4096)]
+            )
+            .is_err(),
+            "the zero GGTT offset does not relax the non-RAM backing requirement"
+        );
+        let mut outside_aperture = zero_surface;
+        outside_aperture.surface_raw = 0xffff_f000;
+        assert!(
+            ownership(
+                &a.gtt,
+                &outside_aperture,
+                None,
+                0xc0000000,
+                0x80000000..0x90000000,
+                &[]
+            )
+            .is_err(),
+            "checked GGTT end must remain inside the hardware aperture"
+        );
+        let mut overflowing_span = zero_surface;
+        overflowing_span.surface_raw = 0xffff_f000;
+        let wide_stolen = PAGE_SIZE..(u64::MAX & !(PAGE_SIZE - 1));
+        overflowing_span.main_size = wide_stolen.end - wide_stolen.start;
+        assert!(
+            ownership(
+                &a.gtt,
+                &overflowing_span,
+                None,
+                0xc0000000,
+                wide_stolen,
+                &[]
+            )
+            .is_err(),
+            "GGTT start plus a valid stolen-sized page span must reject overflow"
+        );
         assert!(
             ownership(
                 &a.gtt,
@@ -4484,6 +5309,180 @@ mod tests {
     }
 
     #[test]
+    fn native_atomic_initial_exact_4k_fbdev_commit_runs_the_real_tc_tail() {
+        let _context = crate::test_support::scheduler_test_context();
+        let (a, r, array) = native_4k30_to_1080p60_with_native_atomic(true);
+        let initial = a.modes[0];
+        assert_eq!(initial, a.state.lock().current_mode);
+        let scanout = scanout_for_full_mode(&a, initial);
+        let pages = scanout.backing.shared_pages().unwrap();
+
+        let done = match a.present(scanout) {
+            Ok(done) => done,
+            Err(error) => panic!(
+                "first exact-source 4K fbdev frame must complete NativeAtomic: \
+                 drm_error={error:?}, native_reason={:?}, mmio={:?}",
+                a.test_last_native_error.lock().as_ref(),
+                r.inner.lock().log.clone()
+            ),
+        };
+        assert!(done.is_signaled() && !done.is_failed());
+        let state = a.state.lock();
+        assert!(!state.lost);
+        assert_eq!(state.current_mode, initial);
+        let binding = state.current.as_ref().expect("initial framebuffer bound");
+        let surface = u32::try_from(binding.binding.address).unwrap();
+        assert_eq!(
+            read(&r, 0x701ac).unwrap() & 0xffff_f000,
+            surface & 0xffff_f000
+        );
+        assert_eq!(
+            capture(&r, &a.power, a.port, a.afc_startup)
+                .unwrap()
+                .plane
+                .width,
+            3840
+        );
+        drop(state);
+
+        let writes = r.inner.lock().log.clone();
+        assert!(writes.iter().any(|(offset, _)| *offset == 0x70008));
+        assert!(writes.iter().any(|(offset, _)| *offset == 0x70180));
+        assert!(
+            writes.iter().any(|(offset, _)| *offset == 0x60000),
+            "NativeAtomic must execute the real timing/plane transaction, not only latch SURF"
+        );
+        for index in 0..pages.len() {
+            assert_eq!(
+                array.raw(surface as usize / 4096 + index),
+                pages.paddr_at(index).unwrap().as_usize() as u64 | 1,
+                "candidate GGTT page must remain bound through the verified commit"
+            );
+        }
+    }
+
+    #[test]
+    fn native_atomic_detaches_the_validated_firmware_scaler_before_native_4k_plane_arm() {
+        let _context = crate::test_support::scheduler_test_context();
+        let (a, r, _) = native_4k30_scaled_with_native_atomic(true, 0);
+        let initial = a.modes[0];
+        let done = a
+            .present(scanout_for_full_mode(&a, initial))
+            .expect("native 4K present must consume the validated firmware scale");
+        assert!(done.is_signaled() && !done.is_failed());
+
+        let state = a.state.lock();
+        assert!(!state.lost);
+        assert_eq!(state.current_mode, initial);
+        assert_eq!(state.firmware.plane.width, 3840);
+        assert!(state.firmware.scalers.iter().all(|scaler| scaler.ctl == 0));
+        assert!(target_scalers_match(
+            state.firmware.scalers,
+            a.baseline.scalers
+        ));
+        drop(state);
+
+        let writes = r.inner.lock().log.clone();
+        let plane_disable = writes
+            .iter()
+            .position(|(offset, value)| *offset == 0x70180 && value & (1 << 31) == 0)
+            .expect("old primary is disabled before scaler detach");
+        let scaler_disable = writes
+            .iter()
+            .position(|(offset, value)| *offset == 0x68180 && *value == 0)
+            .expect("firmware scaler is detached");
+        let timing_update = writes
+            .iter()
+            .position(|(offset, _)| *offset == 0x60000)
+            .expect("native timing update is programmed");
+        let native_plane_enable = writes
+            .iter()
+            .rposition(|(offset, value)| *offset == 0x70180 && value & (1 << 31) != 0)
+            .expect("native primary is armed");
+        assert!(plane_disable < scaler_disable);
+        assert!(scaler_disable < timing_update);
+        assert!(timing_update < native_plane_enable);
+    }
+
+    #[test]
+    fn scaler_detach_write_failure_stops_pipe_before_releasing_candidate() {
+        let _context = crate::test_support::scheduler_test_context();
+        let (a, r, array) = native_4k30_scaled_with_native_atomic(true, 0);
+        let initial = a.modes[0];
+        let scanout = scanout_for_full_mode(&a, initial);
+        let pages = scanout.backing.shared_pages().unwrap();
+        let candidate_page = pages.paddr_at(0).unwrap().as_usize() as u64 | 1;
+        r.inner.lock().fail_offset = Some(0x68180);
+
+        match a.present(scanout) {
+            Err(error) => assert_eq!(error, DrmError::DeviceLost),
+            Ok(_) => panic!("failed scaler detach must fail the native transaction"),
+        }
+
+        let writes = r.inner.lock().log.clone();
+        assert!(
+            writes
+                .iter()
+                .any(|(offset, value)| *offset == 0x68180 && *value == 0)
+        );
+        assert!(
+            !writes
+                .iter()
+                .any(|(offset, value)| *offset == 0x70180 && value & (1 << 31) != 0),
+            "candidate plane must not be armed after scaler detach failure"
+        );
+        assert_eq!(read(&r, 0x70008).unwrap() & ((1 << 31) | (1 << 30)), 0);
+        let state = a.state.lock();
+        assert!(state.lost);
+        assert!(state.current.is_none());
+        assert!(state.quarantine.is_empty());
+        drop(state);
+        assert!(
+            (0..65_536).all(|index| array.raw(index) != candidate_page),
+            "confirmed stopped pipe must release candidate GGTT mappings"
+        );
+    }
+
+    #[test]
+    fn firmware_scaling_requires_native_atomic_surface_handoff() {
+        let _context = crate::test_support::scheduler_test_context();
+        let (a, r, _) = native_4k30_scaled_with_native_atomic(false, 0);
+        let before = r.inner.lock().writes;
+        match a.present(scanout_for_full_mode(&a, a.modes[0])) {
+            Err(error) => assert_eq!(error, DrmError::Unsupported),
+            Ok(_) => panic!("scaled firmware must not use the legacy SURF-only latch"),
+        }
+        assert_eq!(r.inner.lock().writes, before);
+        assert!(!a.state.lock().lost);
+    }
+
+    #[test]
+    fn native_atomic_unverified_pipe_stop_quarantines_candidate_ggtt_mapping() {
+        let _context = crate::test_support::scheduler_test_context();
+        let (a, r, array) = native_4k30_to_1080p60_with_native_atomic(true);
+        r.inner.lock().stuck_pipe_running = true;
+        let initial = a.modes[0];
+        let err = match a.present(scanout_for_full_mode(&a, initial)) {
+            Ok(_) => panic!("failed PIPE_RUNNING readback must fail the native commit"),
+            Err(error) => error,
+        };
+        assert_eq!(err, DrmError::DeviceLost);
+        assert_ne!(read(&r, 0x70008).unwrap() & (1 << 30), 0);
+        let state = a.state.lock();
+        assert!(state.lost);
+        assert!(state.current.is_none());
+        assert_eq!(state.quarantine.len(), 1);
+        let candidate = &state.quarantine[0];
+        let first = candidate.binding.address as usize / 4096;
+        assert_ne!(
+            array.raw(first),
+            0,
+            "possibly scanned-out candidate PTE retained"
+        );
+        assert_eq!(read(&r, 0x701ac).unwrap() & 0xffff_f000, 0x200000);
+    }
+
+    #[test]
     fn tc_modeset_publishes_only_after_full_image_and_fresh_frame_readback() {
         let _context = crate::test_support::scheduler_test_context();
         let (probe, probe_registers, _) = native_4k30_to_1080p60();
@@ -4517,11 +5516,12 @@ mod tests {
             probe_pitch,
             probe_baseline.plane.fourcc,
             probe_surface,
-            None,
+            Some((probe.watermark, retained_ddb(&probe_baseline).unwrap())),
             &probe_pll,
             None,
             &probe_avi,
             &[],
+            None,
             None,
             None,
             true,
@@ -4555,6 +5555,7 @@ mod tests {
                     probe.port,
                     probe_target.timing.clock_khz
                 ),
+                target_watermarks(&probe_baseline, probe_target, probe_pitch, probe_baseline.plane.fourcc, probe.watermark).unwrap(),
             ),
             "TC readback mismatch: {probe_observed:#?}"
         );
@@ -4604,6 +5605,7 @@ mod tests {
                     .unwrap()
                 ),
                 &expected_phy(&a.baseline.phy, a.port, target.timing.clock_khz),
+                target_watermarks(&a.baseline, target, pitch, intel_display::universal_plane::XRGB8888, a.watermark).unwrap(),
             )
         );
         assert!(
@@ -4676,6 +5678,7 @@ mod tests {
                 a.port,
                 original.hdmi.frames[0].unwrap(),
                 &original.phy,
+                primary_watermarks(&original),
             ));
             assert_eq!(read(&r, 0x46140), Ok(original.trans_clock));
             let baseline_pages = original.plane.main_size.div_ceil(4096) as usize;

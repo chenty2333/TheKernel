@@ -156,6 +156,18 @@ pub(super) fn dispatch(
         uapi::DRM_IOCTL_DROP_MASTER => file.drop_master().map_err(AxError::from)?,
         uapi::DRM_IOCTL_GEM_CLOSE => {
             let request: uapi::DrmGemClose = read_pod(copy, arg)?;
+            #[cfg(feature = "intel-upstream-gt")]
+            if file.has_intel_gt()
+                && file
+                    .close_upstream_gem_handle(request.handle)
+                    .map_err(AxError::from)?
+            {
+                // The i915 IDR reference and the kernel DRM alias are both
+                // retired by close_upstream_gem_handle().
+            } else {
+                file.close_handle(request.handle).map_err(AxError::from)?;
+            }
+            #[cfg(not(feature = "intel-upstream-gt"))]
             file.close_handle(request.handle).map_err(AxError::from)?;
         }
         uapi::DRM_IOCTL_MODE_DESTROY_DUMB => destroy_dumb(file, copy, arg)?,
@@ -295,7 +307,14 @@ pub(super) fn dispatch(
         // commands must work here as well as on the dedicated render node.
         _ => {
             return if file.has_intel_gt() {
-                super::intel::gem_exec::dispatch_native(file, context, cmd, arg)
+                #[cfg(feature = "intel-upstream-gt")]
+                {
+                    Err(AxError::OperationNotSupported)
+                }
+                #[cfg(not(feature = "intel-upstream-gt"))]
+                {
+                    super::intel::gem_exec::dispatch_native(file, context, cmd, arg)
+                }
             } else {
                 super::render::dispatch(file, context, cmd, arg)
             };
@@ -317,7 +336,14 @@ pub(super) fn render_dispatch(
     if render_allows_core_ioctl(cmd as u64) {
         dispatch(file, context, cmd, arg)
     } else if file.has_intel_gt() {
-        super::intel::gem_exec::dispatch_native(file, context, cmd, arg)
+        #[cfg(feature = "intel-upstream-gt")]
+        {
+            Err(AxError::OperationNotSupported)
+        }
+        #[cfg(not(feature = "intel-upstream-gt"))]
+        {
+            super::intel::gem_exec::dispatch_native(file, context, cmd, arg)
+        }
     } else {
         super::render::dispatch(file, context, cmd, arg)
     }
@@ -499,7 +525,19 @@ fn prime_fd_to_handle(
         return Err(AxError::InvalidInput);
     }
     let object = dmabuf::import(context, request.fd)?;
-    request.handle = file.import_gem(object).map_err(AxError::from)?;
+    #[cfg(feature = "intel-upstream-gt")]
+    {
+        request.handle = if file.has_intel_gt() {
+            file.bind_imported_upstream_handle(object)
+                .map_err(AxError::from)?
+        } else {
+            file.import_gem(object).map_err(AxError::from)?
+        };
+    }
+    #[cfg(not(feature = "intel-upstream-gt"))]
+    {
+        request.handle = file.import_gem(object).map_err(AxError::from)?;
+    }
     write_pod(copy, arg, &request)
 }
 

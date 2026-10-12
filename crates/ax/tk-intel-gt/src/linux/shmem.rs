@@ -1077,6 +1077,11 @@ pub unsafe fn fput_file(file: *mut File) {
     if old != 1 {
         return;
     }
+    // `sync_file_create()` uses the LinuxKPI file as the stable ownership
+    // token for a kernel-native sync_file. Let the DRM provider release its
+    // wrapper before freeing the shmem allocation; all other files are a
+    // no-op in that registry.
+    unsafe { crate::linux::drm_core::drm_sync_file_release(file.cast()) };
     let mapping = unsafe { (*file).f_mapping };
     let inode = unsafe { (*file).f_inode };
     unsafe {

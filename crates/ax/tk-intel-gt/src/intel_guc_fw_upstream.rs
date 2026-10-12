@@ -217,12 +217,13 @@ unsafe fn guc_wait_ucode(guc: *mut IntelGuc) -> c_int {
 
     while count < GUC_LOAD_RETRY_LIMIT {
         // wait_for(guc_load_done(...), 1000): 0 on success, -ETIMEDOUT on timeout.
-        let done = wait_until(
+        // wait_until() returns true on timeout.
+        let timed_out = wait_until(
             1000u64 * 1_000_000,
             || unsafe { guc_load_done(uncore, &mut status, &mut success) },
             true,
         );
-        ret = if done { 0 } else { -ETIMEDOUT };
+        ret = if timed_out { -ETIMEDOUT } else { 0 };
         if ret == 0 || !success {
             break;
         }

@@ -91,7 +91,7 @@ static SMP_ACL_REASSEMBLER: SpinMutex<axdriver::BluetoothAclReassembler> =
     SpinMutex::new(axdriver::BluetoothAclReassembler::new());
 
 #[cfg(feature = "input")]
-type UsbAdapter = Arc<SpinMutex<axdriver::UsbBluetoothHci>>;
+type UsbAdapter = Arc<axsync::Mutex<axdriver::UsbBluetoothHci>>;
 #[cfg(not(feature = "input"))]
 type UsbAdapter = ();
 

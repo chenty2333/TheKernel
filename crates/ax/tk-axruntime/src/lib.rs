@@ -164,6 +164,24 @@ pub mod klog;
 /// Opt-in, lock-free boot and console progress observations.
 pub mod boot_progress;
 
+#[cfg(any(test, all(feature = "irq", feature = "multitask", feature = "ipi")))]
+mod call_function;
+
+static PANIC_HALT: AtomicUsize = AtomicUsize::new(0);
+
+fn panic_halt_requested(value: Option<&str>) -> bool {
+    value == Some("halt")
+}
+
+/// Keep a screen-only hardware failure visible when explicitly requested.
+/// The cached policy is safe to read even when panic interrupted a boot lock.
+pub(crate) fn terminate_on_fatal() -> ! {
+    if PANIC_HALT.load(Ordering::Relaxed) != 0 {
+        axhal::power::system_halt()
+    }
+    axhal::power::system_off()
+}
+
 #[cfg(all(target_os = "none", not(test)))]
 mod lang_items;
 
@@ -260,11 +278,8 @@ static INPUT_RECONCILE_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 const INPUT_RECONCILE_INTERVAL: core::time::Duration = core::time::Duration::from_secs(1);
 
 #[cfg(all(feature = "irq", feature = "multitask", feature = "ipi"))]
-const CALL_FUNCTION_TIMER_EVENT_RETRIGGER: usize = 1 << 0;
-
-#[cfg(all(feature = "irq", feature = "multitask", feature = "ipi"))]
-static CALL_FUNCTION_WORK: [AtomicUsize; axconfig::plat::MAX_CPU_NUM] =
-    [const { AtomicUsize::new(0) }; axconfig::plat::MAX_CPU_NUM];
+static CALL_FUNCTION_WORK: call_function::CallFunctionWork<{ axconfig::plat::MAX_CPU_NUM }> =
+    call_function::CallFunctionWork::new();
 
 fn is_init_ok() -> bool {
     INITED_CPUS.load(Ordering::Acquire) == axhal::cpu_num()
@@ -373,15 +388,32 @@ fn retrigger_local_timer_events() {
 #[cfg(all(feature = "irq", feature = "multitask", feature = "ipi"))]
 fn call_function_ipi_handler() {
     let cpu = axhal::percpu::this_cpu_id();
-    let pending = CALL_FUNCTION_WORK[cpu].swap(0, Ordering::AcqRel);
-    if pending & CALL_FUNCTION_TIMER_EVENT_RETRIGGER != 0 {
-        retrigger_local_timer_events();
+    CALL_FUNCTION_WORK.dispatch(cpu, retrigger_local_timer_events)
+        .unwrap_or_else(|unknown| panic!("unknown bounded call-function work: {unknown:#x}"));
+}
+
+/// Register the single static driver extension without replacing timer work.
+/// The handler runs only when its own coalescible work bit is published.
+#[cfg(all(feature = "irq", feature = "multitask", feature = "ipi"))]
+pub fn register_call_function_extension(handler: fn()) -> bool {
+    CALL_FUNCTION_WORK.register_extension(handler)
+}
+
+/// Publish the registered extension on all remote CPUs. The caller must pin
+/// its current CPU and keep callback state alive until those CPUs acknowledge.
+#[cfg(all(feature = "irq", feature = "multitask", feature = "ipi"))]
+pub fn call_function_extension_other_cpus() -> Result<(), axhal::irq::IpiReasonError> {
+    let cpu_id = axhal::percpu::this_cpu_id();
+    let cpu_num = axhal::cpu_num();
+    for cpu in 0..cpu_num {
+        if cpu != cpu_id {
+            assert!(CALL_FUNCTION_WORK.publish_extension(cpu), "call-function extension not installed");
+        }
     }
-    let unknown = pending & !CALL_FUNCTION_TIMER_EVENT_RETRIGGER;
-    assert_eq!(
-        unknown, 0,
-        "unknown bounded call-function work: {unknown:#x}"
-    );
+    axhal::irq::send_ipi_reason(
+        axhal::irq::IpiReason::CallFunction,
+        axhal::irq::IpiTarget::AllExceptCurrent { cpu_id, cpu_num },
+    )
 }
 
 /// Retriggers the ordinary timer-event callback chain on every online CPU.
@@ -399,8 +431,7 @@ pub fn retrigger_timer_events_all() {
         let cpu_num = axhal::cpu_num();
         for cpu in 0..cpu_num {
             if cpu != current_cpu {
-                CALL_FUNCTION_WORK[cpu]
-                    .fetch_or(CALL_FUNCTION_TIMER_EVENT_RETRIGGER, Ordering::Release);
+                CALL_FUNCTION_WORK.publish_timer(cpu);
             }
         }
         (current_cpu, cpu_num)
@@ -436,6 +467,7 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     unsafe { axhal::mem::clear_bss() };
     axhal::percpu::init_primary(cpu_id);
     axhal::init_early(cpu_id, arg);
+    PANIC_HALT.store(usize::from(panic_halt_requested(axhal::boot::command_line_value("panic"))), Ordering::Relaxed);
     boot_progress::init();
     boot_progress::cpu_phase(cpu_id,1);
     // The bootloader's `loglevel=` wins over the compile-time default.  On a
@@ -873,6 +905,17 @@ pub trait PlatformServices {
 }
 
 
+/// Refresh the screen only for an explicitly requested detailed boot trace.
+#[cfg(feature = "axdriver")]
+fn device_boot_progress(name: &str) {
+    if axhal::boot::command_line_value("boot.progress") != Some("1") {
+        return;
+    }
+    info!("boot-step: {name}");
+    #[cfg(all(target_os = "none", not(test)))]
+    crate_interface::call_interface!(EarlyScreen::milestone, name);
+}
+
 // Keep the large device ownership transfer out of the long-lived boot frame.
 #[cfg(feature = "axdriver")]
 #[inline(never)]
@@ -886,17 +929,25 @@ fn init_device_subsystems() {
         #[cfg(feature = "fs-ng")]
         early_screen_milestone("filesystems");
         #[cfg(feature = "fs-ng")]
-        axfs_ng::init_filesystems(all_devices.block);
+        axfs_ng::init_filesystems(all_devices.block, device_boot_progress);
         #[cfg(feature = "fs-ng")]
         {
             axdriver::prelude::firmware::set_reader(read_rootfs_firmware);
-            axdriver::prelude::firmware::run_rootfs_ready();
+            device_boot_progress("rootfs: firmware callbacks");
+            axdriver::prelude::firmware::run_rootfs_ready(|slot, address| {
+                if axhal::boot::command_line_value("boot.progress") == Some("1") {
+                    info!("rootfs firmware callback slot={slot} address={address:#x}");
+                }
+                device_boot_progress("rootfs: firmware callback");
+            });
+            device_boot_progress("rootfs: firmware callbacks done");
         }
         #[cfg(all(feature = "fs-ng", feature = "net-ng"))]
         for device in all_devices.net.iter_mut() {
             #[allow(unused_imports)]
             use axdriver::prelude::NetDriverOps;
             if let Some(path) = device.firmware_path() {
+                device_boot_progress("rootfs: NIC firmware");
                 match read_network_firmware(path) {
                     Some(bytes) => match device.load_firmware(&bytes) {
                         Ok(()) => info!("NIC firmware {path}: applied; hardware-unverified"),
@@ -921,12 +972,14 @@ fn init_device_subsystems() {
                     network_devices.push(device);
                 }
             }
+            device_boot_progress("network: initialize wired devices");
             if let Err(error) = axnet_ng::init_network(network_devices) {
                 klog::fatal(format_args!(
                     "Network subsystem initialization failed: {error:?}"
                 ));
             }
             for device in wireless_devices {
+                device_boot_progress("network: publish wireless device");
                 if let Err(error) = axnet_ng::register_wireless_device(device) {
                     warn!("wireless interface publication failed: {error:?}");
                 }
@@ -937,9 +990,15 @@ fn init_device_subsystems() {
         }
 
         #[cfg(feature = "display")]
-        axdisplay::init_display(all_devices.display);
+        {
+            device_boot_progress("display: initialize");
+            axdisplay::init_display(all_devices.display);
+        }
 
         #[cfg(feature = "input")]
-        axinput::init_input(all_devices.input);
+        {
+            device_boot_progress("input: initialize");
+            axinput::init_input(all_devices.input);
+        }
 
 }

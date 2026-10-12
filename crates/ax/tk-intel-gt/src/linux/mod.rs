@@ -24,7 +24,7 @@ pub(crate) mod fields;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub(crate) mod firmware;
-pub(crate) mod gem;
+pub mod gem;
 pub mod gem_memory;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
@@ -43,7 +43,7 @@ pub(crate) mod mm;
 #[allow(unsafe_code)]
 pub(crate) mod page;
 pub mod primitives;
-pub(crate) mod drm_mm;
+pub mod drm_mm;
 pub(crate) mod drm_vma;
 pub(crate) mod dma_fence_core;
 pub mod drm_core;
@@ -93,6 +93,7 @@ pub(crate) mod iomapping;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod dma;
+pub mod ggtt_owner;
 
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]

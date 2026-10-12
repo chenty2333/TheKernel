@@ -38,6 +38,20 @@ pub struct DrmFbdev {
     yoffset: Mutex<u32>,
 }
 
+fn allocation_stage<T>(stage: &str, result: DrmResult<T>) -> DrmResult<T> {
+    if let Err(error) = &result {
+        let allocator = axalloc::global_allocator();
+        axlog::warn!(
+            "drm-fbdev: stage={stage} error={error:?} pinned={} free_pages={} heap_used={} heap_free={}",
+            super::gem::pinned_gem_bytes(), allocator.available_pages(),
+            allocator.used_bytes(), allocator.available_bytes(),
+        );
+    } else {
+        axlog::info!("drm-fbdev: stage={stage} complete");
+    }
+    result
+}
+
 impl DrmFbdev {
     pub fn new(device: Arc<DrmDevice>) -> DrmResult<Self> {
         let mode = device.preferred_mode();
@@ -45,16 +59,18 @@ impl DrmFbdev {
             return Err(DrmError::Invalid);
         }
         let file = device.open_fbdev_primary();
-        file.become_master()?;
+        allocation_stage("master", file.become_master())?;
         let virtual_height = mode.height.checked_mul(2).ok_or(DrmError::Overflow)?;
-        let dumb = file.create_dumb(DumbRequest {
+        axlog::info!("drm-fbdev: allocate {}x{} bpp=32 pinned={}", mode.width, virtual_height, super::gem::pinned_gem_bytes());
+        let dumb = allocation_stage("create_dumb", file.create_dumb(DumbRequest {
             width: mode.width,
             height: virtual_height,
             bpp: 32,
-        })?;
+        }))?;
         let framebuffer =
-            file.add_framebuffer(dumb.handle, mode.width, virtual_height, dumb.pitch, 32)?;
-        let pages = file.gem(dumb.handle)?.backing.shared_pages()?;
+            allocation_stage("add_framebuffer", file.add_framebuffer(dumb.handle, mode.width, virtual_height, dumb.pitch, 32))?;
+        let object = allocation_stage("gem_lookup", file.gem(dumb.handle))?;
+        let pages = allocation_stage("shared_pages", object.backing.shared_pages())?;
         let size = usize::try_from(dumb.size).map_err(|_| DrmError::Overflow)?;
         let fbdev = Self {
             file,
@@ -66,7 +82,19 @@ impl DrmFbdev {
             pages,
             yoffset: Mutex::new(0),
         };
-        fbdev.commit_mode()?;
+        if let Err(error) = allocation_stage("commit_mode", fbdev.commit_mode()) {
+            axlog::warn!(
+                "drm-fbdev: initial KMS present failed: mode={}x{} virtual_height={} pitch={} \
+                 bytes={} pages={} error={error:?}",
+                fbdev.mode.width,
+                fbdev.mode.height,
+                fbdev.virtual_height,
+                fbdev.pitch,
+                fbdev.size,
+                fbdev.pages.len(),
+            );
+            return Err(error);
+        }
         Ok(fbdev)
     }
 

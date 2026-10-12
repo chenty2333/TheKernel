@@ -1027,7 +1027,9 @@ unsafe extern "C" fn dma_fence_chain_release(fence: *mut DmaFence) {
     let chain = fence.cast::<DmaFenceChain>();
     let mut prev = unsafe { (*chain).prev };
     while !prev.is_null() {
-        if !dma_fence_chain_is(prev) || unsafe { crate::linux::memory::kref_read(&(*prev).refcount) } > 1 {
+        if !dma_fence_chain_is(prev)
+            || unsafe { crate::linux::memory::kref_read(&(*prev).refcount) } > 1
+        {
             break;
         }
         let prev_chain = prev.cast::<DmaFenceChain>();
@@ -1137,7 +1139,8 @@ pub fn dma_fence_chain_alloc<T>() -> *mut T {
     .cast()
 }
 
-pub unsafe fn dma_fence_chain_free<T>(chain: *mut T) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_fence_chain_free(chain: *mut c_void) {
     if !chain.is_null() {
         unsafe { crate::linux::memory::kfree(chain) };
     }
@@ -1150,6 +1153,11 @@ pub unsafe extern "C" fn dma_fence_chain_find_seqno(fence: *mut *mut DmaFence, s
     }
     if fence.is_null() || unsafe { (*fence).is_null() } {
         return -(crate::linux_config::EINVAL as i32);
+    }
+    let native =
+        unsafe { crate::linux::drm_core::drm_syncobj_timeline_fence_find(fence.cast(), seqno) };
+    if native != 1 {
+        return native;
     }
     let start = unsafe { *fence };
     if !dma_fence_chain_is(start) || unsafe { (*start).seqno < seqno } {

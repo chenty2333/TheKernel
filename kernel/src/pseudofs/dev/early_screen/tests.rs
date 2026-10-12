@@ -7,8 +7,9 @@
 use alloc::{vec, vec::Vec};
 
 use super::{
-    BACKGROUND, BoundedText, Content, LOG_TEXT, MAX_ROWS, MESSAGE_TEXT, PANIC_BAR, RowRef, Rows,
-    STATUS_BAR, TRACE_TEXT, TextView, paint, wrap_rows,
+    BACKGROUND, BoundedText, Content, LOG_TEXT, MAX_ROWS, MESSAGE_ROWS, MESSAGE_TEXT, PANIC_BAR,
+    RowRef, Rows, STATUS_BAR, TAIL_ROWS_MIN, TRACE_ROWS, TRACE_TEXT, TextView, UHD_GLYPH_SCALE,
+    paint, wrap_rows,
 };
 use crate::pseudofs::dev::{
     console_font::{GLYPH_HEIGHT, GLYPH_WIDTH, glyph},
@@ -97,6 +98,7 @@ fn is_ink(view: &TextView, bytes: &[u8], x: usize, y: usize, background: u32) ->
 /// space, which is what the renderer drew.
 fn rendered_row(view: &TextView, bytes: &[u8], row: usize, background: u32) -> Vec<u8> {
     let mut out = Vec::new();
+    let scale = view.glyph_scale();
     for col in 0..view.cols() {
         let cell: Vec<u8> = (0..GLYPH_HEIGHT)
             .map(|dy| {
@@ -105,8 +107,8 @@ fn rendered_row(view: &TextView, bytes: &[u8], row: usize, background: u32) -> V
                     if is_ink(
                         view,
                         bytes,
-                        col * GLYPH_WIDTH + dx,
-                        row * GLYPH_HEIGHT + dy,
+                        col * view.cell_width() + dx * scale,
+                        row * view.cell_height() + dy * scale,
                         background,
                     ) {
                         line |= 0x80 >> dx;
@@ -211,6 +213,154 @@ fn a_24_bit_surface_takes_three_bytes_per_pixel() {
 }
 
 #[test]
+fn uhd_early_screen_scales_glyphs_and_recomputes_the_layout() {
+    let pitch = 3840 * 4;
+    let mut view = view(3840, 2160, pitch, B8G8R8A8);
+    assert_eq!(view.glyph_scale(), 3);
+    assert_eq!(view.cell_width(), 24);
+    assert_eq!(view.cell_height(), 48);
+    assert_eq!(view.cols(), 160);
+    assert_eq!(view.rows(), 45);
+
+    // Only the first three logical rows are needed here; retaining the UHD
+    // geometry while bounding the test backing also checks clipped writes.
+    view.len = pitch as usize * (3 * view.cell_height());
+    let mut bytes = surface(&view);
+    let content = Content::milestone(b"UHD", b"A\nB");
+    let first = paint(&view, &mut bytes, &content, None);
+    assert_eq!(first.used, 3, "status and two body rows");
+    assert_eq!(first.dirty, view.height as usize);
+    assert_eq!(rendered_row(&view, &bytes, 0, STATUS_BAR), b"UHD");
+    assert_eq!(rendered_row(&view, &bytes, 1, BACKGROUND), b"A");
+    assert_eq!(rendered_row(&view, &bytes, 2, BACKGROUND), b"B");
+
+    // Each set source-font bit becomes a complete 3x3 native block. After a
+    // 2:1 capture downscale, the source glyph remains visibly larger.
+    let (dx, dy) = first_ink(b'A');
+    let x = dx * UHD_GLYPH_SCALE;
+    let y = view.cell_height() + dy * UHD_GLYPH_SCALE;
+    for block_y in 0..UHD_GLYPH_SCALE {
+        for block_x in 0..UHD_GLYPH_SCALE {
+            assert_eq!(
+                pixel(&view, &bytes, x + block_x, y + block_y),
+                LOG_TEXT.to_le_bytes()
+            );
+        }
+    }
+
+    let shorter = paint(
+        &view,
+        &mut bytes,
+        &Content::milestone(b"UHD", b"A"),
+        Some(first.used),
+    );
+    assert_eq!(shorter.used, 2);
+    assert_eq!(shorter.dirty, 3 * view.cell_height());
+    assert_eq!(rendered_row(&view, &bytes, 2, BACKGROUND), b"");
+
+    let panic = Content {
+        status: b"*** PANIC ***",
+        alert: true,
+        message: b"Unhandled #PF @ 0xffffffff80001000, fault_vaddr=0x0",
+        trace: b"",
+        tail: b"hardware and GGTT initialization",
+    };
+    paint(&view, &mut bytes, &panic, Some(shorter.used));
+    assert_eq!(rendered_row(&view, &bytes, 0, PANIC_BAR), panic.status);
+    assert_eq!(rendered_row(&view, &bytes, 1, BACKGROUND), panic.message);
+    assert_eq!(rendered_row(&view, &bytes, 2, BACKGROUND), panic.tail);
+    assert_eq!(pixel(&view, &bytes, 3839, 31), PANIC_BAR.to_le_bytes());
+}
+
+fn repeated_lines(byte: u8, count: usize) -> Vec<u8> {
+    (0..count).flat_map(|_| [byte, b'\n']).collect()
+}
+
+#[test]
+fn uhd_panic_keeps_multiline_fault_detail_and_more_than_six_trace_rows() {
+    let pitch = 3840 * 4;
+    let mut view = view(3840, 2160, pitch, B8G8R8A8);
+    // Screen rows: status 0, reserved message 1..16, then at least seven
+    // backtrace rows. Back only that prefix instead of allocating a 4K image.
+    let trace_probe_row = MESSAGE_ROWS + 1 + 6;
+    view.len = pitch as usize * (trace_probe_row + 1) * view.cell_height();
+    let mut bytes = surface(&view);
+    let message = repeated_lines(b'M', MESSAGE_ROWS + 2);
+    let trace = repeated_lines(b'T', TRACE_ROWS);
+    let content = Content {
+        status: b"*** PANIC ***",
+        alert: true,
+        message: &message,
+        trace: &trace,
+        tail: b"old\nolder\nnew\nnewest\nextra\n",
+    };
+
+    let body = view.rows() - 1;
+    let pinned_budget = body - TAIL_ROWS_MIN.min(body);
+    let message_rows = wrap_rows(
+        content.message,
+        view.cols(),
+        pinned_budget.min(MESSAGE_ROWS),
+        false,
+    );
+    let trace_rows = wrap_rows(
+        content.trace,
+        view.cols(),
+        pinned_budget
+            .saturating_sub(message_rows.count)
+            .min(TRACE_ROWS),
+        false,
+    );
+    let tail_rows = wrap_rows(
+        content.tail,
+        view.cols(),
+        body - message_rows.count - trace_rows.count,
+        true,
+    );
+    assert_eq!(message_rows.count, MESSAGE_ROWS);
+    assert_eq!(
+        trace_rows.count, 24,
+        "all but status, detail and four tail rows"
+    );
+    let newest_tail: Vec<RowRef> = tail_rows.newest(TAIL_ROWS_MIN).collect();
+    assert_eq!(newest_tail.len(), 4);
+    assert_eq!(
+        &content.tail[newest_tail[3].range()],
+        b"extra",
+        "the protected tail keeps the most recent log row"
+    );
+
+    let painted = paint(&view, &mut bytes, &content, None);
+    assert_eq!(painted.used, view.rows());
+    assert_eq!(
+        rendered_row(&view, &bytes, MESSAGE_ROWS, BACKGROUND),
+        b"M",
+        "the final reserved fault-detail line remains visible"
+    );
+    assert_eq!(
+        rendered_row(&view, &bytes, MESSAGE_ROWS + 1, BACKGROUND),
+        b"T",
+        "the backtrace follows complete panic detail"
+    );
+    assert_eq!(
+        rendered_row(&view, &bytes, trace_probe_row, BACKGROUND),
+        b"T",
+        "the backtrace budget exceeds the former six-row cap"
+    );
+    assert!(TRACE_ROWS >= view.rows());
+}
+
+#[test]
+fn non_uhd_early_screen_keeps_the_original_cell_size() {
+    let view = view(1920, 1080, 1920 * 4, B8G8R8A8);
+    assert_eq!(view.glyph_scale(), 1);
+    assert_eq!(view.cell_width(), GLYPH_WIDTH);
+    assert_eq!(view.cell_height(), GLYPH_HEIGHT);
+    assert_eq!(view.cols(), 240);
+    assert_eq!(view.rows(), 67);
+}
+
+#[test]
 fn a_line_longer_than_the_screen_wraps_at_the_column_limit() {
     // Two columns of text, so five bytes need three rows.
     let view = view(16, 80, 64, B8G8R8A8);
@@ -308,7 +458,12 @@ fn the_first_frame_erases_everything_the_firmware_left() {
     // indistinguishable from a kernel which never booted.
     let view = view(48, 80, 224, B8G8R8A8);
     let mut bytes = surface(&view);
-    let painted = paint(&view, &mut bytes, &Content::milestone(b"boot", b"log\n"), None);
+    let painted = paint(
+        &view,
+        &mut bytes,
+        &Content::milestone(b"boot", b"log\n"),
+        None,
+    );
     assert_eq!(
         painted.dirty, view.height as usize,
         "the first frame clears the whole surface"
@@ -333,15 +488,27 @@ fn a_panic_frame_shows_the_message_the_backtrace_and_the_log_tail() {
         tail: b"last log line\n",
     };
     let painted = paint(&view, &mut bytes, &content, None);
-    assert_eq!(painted.used, 6, "status, two message rows, two frames, one log row");
+    assert_eq!(
+        painted.used, 6,
+        "status, two message rows, two frames, one log row"
+    );
     assert_eq!(rendered_row(&view, &bytes, 0, PANIC_BAR), b"*** PANIC ***");
     assert_eq!(
         rendered_row(&view, &bytes, 1, BACKGROUND),
         b"panicked at src/main.rs:1:1:"
     );
-    assert_eq!(rendered_row(&view, &bytes, 2, BACKGROUND), b"no boot device");
-    assert_eq!(rendered_row(&view, &bytes, 3, BACKGROUND), b"fp=0x1, ip=0x2");
-    assert_eq!(rendered_row(&view, &bytes, 4, BACKGROUND), b"fp=0x3, ip=0x4");
+    assert_eq!(
+        rendered_row(&view, &bytes, 2, BACKGROUND),
+        b"no boot device"
+    );
+    assert_eq!(
+        rendered_row(&view, &bytes, 3, BACKGROUND),
+        b"fp=0x1, ip=0x2"
+    );
+    assert_eq!(
+        rendered_row(&view, &bytes, 4, BACKGROUND),
+        b"fp=0x3, ip=0x4"
+    );
     assert_eq!(rendered_row(&view, &bytes, 5, BACKGROUND), b"last log line");
 }
 

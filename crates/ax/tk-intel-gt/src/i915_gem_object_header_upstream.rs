@@ -339,10 +339,10 @@ pub unsafe fn i915_gem_object_pin_pages(obj: *mut DrmI915GemObject) -> c_int {
 }
 // upstream: i915_gem_object.h i915_gem_object_has_pages()
 pub unsafe fn i915_gem_object_has_pages(obj: *mut DrmI915GemObject) -> bool {
-    unsafe {
-        let pages = core::ptr::read_volatile(core::ptr::addr_of!((*obj).mm.pages));
-        !pages.is_null() && !crate::linux_config::IS_ERR(pages)
-    }
+    // Keep the header-facing API as a signature-compatible adapter to the
+    // canonical object_api implementation; divergent copies broke page-map
+    // admission by treating NULL as populated backing.
+    unsafe { crate::i915_gem_object_api_upstream::i915_gem_object_has_pages(obj) }
 }
 // upstream: i915_gem_object.h __i915_gem_object_pin_pages()
 pub unsafe fn __i915_gem_object_pin_pages(obj: *mut DrmI915GemObject) {

@@ -70,6 +70,13 @@ fn with_vmap_records<T>(f: impl FnOnce(&mut BTreeMap<usize, VmapRecord>) -> T) -
     f(&mut records)
 }
 
+#[cfg(not(target_os = "none"))]
+fn vmap_search_window() -> Option<(VirtAddr, VirtAddrRange)> {
+    // A host process has no kernel direct map or physical-memory inventory.
+    None
+}
+
+#[cfg(target_os = "none")]
 fn vmap_search_window() -> Option<(VirtAddr, VirtAddrRange)> {
     let mut max_phys_end = 0usize;
     for region in axhal::mem::memory_regions() {

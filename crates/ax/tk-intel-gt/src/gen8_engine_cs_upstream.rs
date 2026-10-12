@@ -315,7 +315,9 @@ pub unsafe extern "C" fn gen12_emit_flush_xcs(rq: *mut I915Request, mode: u32) -
     }
     *cs=cmd; cs=cs.add(1); *cs=crate::intel_lrc_types_upstream::LRC_PPHWSP_SCRATCH_ADDR as u32; cs=cs.add(1);
     *cs=0; cs=cs.add(1); *cs=0; cs=cs.add(1);
-    cs=gen12_emit_aux_table_inv((*rq).engine,cs);
+    // The 8 AUX dwords are reserved only for EMIT_INVALIDATE; a flush-only
+    // call must not emit them past the intel_ring_begin() span.
+    if mode & EMIT_INVALIDATE != 0 { cs=gen12_emit_aux_table_inv((*rq).engine,cs); }
     if mode & EMIT_INVALIDATE != 0 { *cs=preparser_disable(false); cs=cs.add(1); }
     intel_ring_advance(rq,cs); 0
 }

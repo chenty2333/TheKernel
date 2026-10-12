@@ -170,9 +170,7 @@
 //!   says why.
 
 use alloc::sync::Arc;
-#[cfg(target_os = "none")]
-use core::sync::atomic::AtomicBool;
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, compiler_fence};
 
 use spin::Mutex;
 
@@ -509,6 +507,10 @@ impl MappedArray {
             usize::try_from(physical).map_err(|_| GttError::WindowUnmappable { physical })?;
         let mapped = axmm::iomap(axhal::mem::PhysAddr::from_usize(address), GGTT_ARRAY_BYTES)
             .map_err(|_| GttError::WindowUnmappable { physical })?;
+        axlog::info!(
+            "intel-gtt: table phys={:#x} virt={:#x} bytes={:#x} PTE bytes={}",
+            physical, mapped.as_usize(), GGTT_ARRAY_BYTES, PTE_BYTES,
+        );
         Ok(Self {
             base: mapped.as_usize(),
             entries: GGTT_ARRAY_BYTES / PTE_BYTES,
@@ -876,6 +878,18 @@ pub(crate) struct Gtt {
     /// The next address to hand out, counted downwards from below the GuC
     /// limit and the prefetch guard.
     next: Mutex<u64>,
+    /// Native display allocation floor after sharing GGTT with upstream DRM-MM.
+    allocation_floor: AtomicU64,
+    /// Summary computed while partitioning the native half of the GGTT.  This
+    /// lets a later failed scanout allocation explain whether the live PTEs
+    /// left a suitably large hole without rescanning the MMIO page table.
+    native_absent_pages: AtomicU64,
+    native_present_pages: AtomicU64,
+    native_largest_run_pages: AtomicU64,
+    native_partition_stats_valid: AtomicBool,
+    /// Native bindings published by [`Self::bind_pages`] and not yet released.
+    /// [`Self::scrub_stale_entries`] refuses to run while any exist.
+    live_bindings: AtomicUsize,
     /// The single requester-scoped DMA owner shared by display and GT.
     #[cfg(target_os = "none")]
     identity_lease: Mutex<Option<Arc<tk_vtd::IdentityDmaLease>>>,
@@ -986,6 +1000,9 @@ impl Gtt {
     /// Capture before *any* display/GGTT mutation. Does not write the table.
     pub(crate) fn checkpoint(&self) -> Result<Checkpoint, GttError> {
         let cursor = self.next.lock();
+        if self.allocation_floor.load(Ordering::Acquire) != RESERVED_LOW_APERTURE {
+            return Err(GttError::CheckpointMismatch);
+        }
         let mut entries = alloc::vec::Vec::new();
         entries
             .try_reserve_exact(self.entries)
@@ -1024,6 +1041,10 @@ impl Gtt {
             return Err(GttError::CheckpointMismatch);
         }
         let mut cursor = self.next.lock();
+        // A whole-table before-image cannot roll back a live upstream GT.
+        if self.allocation_floor.load(Ordering::Acquire) != RESERVED_LOW_APERTURE {
+            return Err(GttError::CheckpointMismatch);
+        }
         for (index, &value) in image.entries.iter().enumerate().rev() {
             if self.array.read(index) != value {
                 self.array.write(index, value);
@@ -1074,6 +1095,12 @@ impl Gtt {
             size,
             scratch: Pte::encode(zero_page_physical())?,
             next: Mutex::new(allocatable_end(aperture)),
+            allocation_floor: AtomicU64::new(RESERVED_LOW_APERTURE),
+            native_absent_pages: AtomicU64::new(0),
+            native_present_pages: AtomicU64::new(0),
+            native_largest_run_pages: AtomicU64::new(0),
+            native_partition_stats_valid: AtomicBool::new(false),
+            live_bindings: AtomicUsize::new(0),
             #[cfg(target_os = "none")]
             identity_lease: Mutex::new(None),
             #[cfg(target_os = "none")]
@@ -1147,6 +1174,177 @@ impl Gtt {
         }
     }
 
+    /// Clear stale GGTT entries left in the page table by power-on, keeping
+    /// only the proven live firmware scanout `keep`.
+    ///
+    /// The GGTT lives in stolen memory that firmware never initializes beyond
+    /// the entries it uses, so a cold table reads as noise with the present
+    /// bit set on about half the entries. `[I915]` gt/intel_ggtt.c init_ggtt()
+    /// therefore clears every hole that is not a preallocated (initial plane)
+    /// node. Here the cleared entries become absent, which is what the native
+    /// allocator searches for; the [`SCANOUT_PADDING_ENTRIES`] entries after
+    /// `keep` are bound to the zero page, as for a native surface. Upstream
+    /// later rewrites its own holes with its scratch page.
+    ///
+    /// Refused once ownership is split or while a native binding is live, so
+    /// no entry this driver published can be cleared. Returns how many stale
+    /// entries were cleared.
+    pub(crate) fn scrub_stale_entries(&self, keep: core::ops::Range<u64>) -> Result<u64, GttError> {
+        let _next = self.next.lock();
+        if self.allocation_floor.load(Ordering::Acquire) != RESERVED_LOW_APERTURE
+            || self.live_bindings.load(Ordering::Acquire) != 0
+            || keep.is_empty()
+            || !keep.start.is_multiple_of(PAGE_SIZE)
+            || !keep.end.is_multiple_of(PAGE_SIZE)
+            || keep.end > self.allocation_end()
+        {
+            return Err(GttError::CheckpointMismatch);
+        }
+        let first = (RESERVED_LOW_APERTURE / PAGE_SIZE) as usize;
+        let end = (self.allocation_end() / PAGE_SIZE) as usize;
+        let keep_first = (keep.start / PAGE_SIZE) as usize;
+        let keep_end = (keep.end / PAGE_SIZE) as usize;
+        let padding_end = (keep_end + SCANOUT_PADDING_ENTRIES as usize).min(end);
+        let mut cleared = 0u64;
+        for index in first..end {
+            if (keep_first..keep_end).contains(&index) {
+                continue;
+            }
+            let wrote = if (keep_end..padding_end).contains(&index) {
+                self.scratch.raw()
+            } else if self.array.read(index) & PTE_PRESENT != 0 {
+                cleared += 1;
+                0
+            } else {
+                continue;
+            };
+            self.array.write(index, wrote);
+            let read = self.array.read(index);
+            if read != wrote {
+                return Err(GttError::ReadBackMismatch { index, wrote, read });
+            }
+        }
+        Ok(cleared)
+    }
+
+    /// Split ownership before upstream can allocate any GGTT node. Native
+    /// display keeps the upper half below the GuC/prefetch guard; upstream
+    /// DRM-MM reserves that entire interval and the guard through the aperture
+    /// end, plus every firmware-present PTE. Thus neither allocator can reuse
+    /// the other's holes, and future native scanout flips never race an
+    /// upstream allocation or eviction.
+    ///
+    /// The split is permanent even if probing later fails. No hardware PTE is
+    /// changed here; returned ranges must be reserved before upstream writes.
+    #[cfg(any(feature = "intel-upstream-gt", test))]
+    pub(crate) fn partition_for_upstream(
+        &self,
+    ) -> Result<alloc::vec::Vec<core::ops::Range<u64>>, GttError> {
+        let next = self.next.lock();
+        let end = self.allocation_end();
+        let floor = (end / 2 / SCANOUT_ALIGNMENT) * SCANOUT_ALIGNMENT;
+        if floor <= RESERVED_LOW_APERTURE
+            || *next < floor
+            || self.allocation_floor.load(Ordering::Acquire) != RESERVED_LOW_APERTURE
+        {
+            return Err(GttError::CheckpointMismatch);
+        }
+        let mut ranges = alloc::vec::Vec::new();
+        let mut run = None;
+        let native_first = (floor / PAGE_SIZE) as usize;
+        let native_end = (end / PAGE_SIZE) as usize;
+        let mut native_run = None;
+        let mut absent_pages = 0u64;
+        let mut present_pages = 0u64;
+        let mut largest_run_pages = 0u64;
+        for index in 0..self.entries {
+            let address = index as u64 * PAGE_SIZE;
+            let present = self.array.read(index) & PTE_PRESENT != 0;
+            if (native_first..native_end).contains(&index) {
+                if present {
+                    present_pages += 1;
+                    if let Some(start) = native_run.take() {
+                        largest_run_pages =
+                            largest_run_pages.max(aligned_run_payload_pages(start, index));
+                    }
+                } else {
+                    absent_pages += 1;
+                    native_run.get_or_insert(index);
+                }
+            }
+            let reserved = address < RESERVED_LOW_APERTURE
+                || (floor..self.aperture).contains(&address)
+                || present;
+            if reserved && run.is_none() {
+                run = Some(address);
+            }
+            if !reserved && let Some(start) = run.take() {
+                ranges
+                    .try_reserve(1)
+                    .map_err(|_| GttError::CheckpointUnavailable)?;
+                ranges.push(start..address);
+            }
+        }
+        if let Some(start) = native_run {
+            largest_run_pages = largest_run_pages.max(aligned_run_payload_pages(start, native_end));
+        }
+        if let Some(start) = run {
+            ranges
+                .try_reserve(1)
+                .map_err(|_| GttError::CheckpointUnavailable)?;
+            ranges.push(start..self.aperture);
+        }
+        self.native_absent_pages
+            .store(absent_pages, Ordering::Relaxed);
+        self.native_present_pages
+            .store(present_pages, Ordering::Relaxed);
+        self.native_largest_run_pages
+            .store(largest_run_pages, Ordering::Relaxed);
+        self.native_partition_stats_valid
+            .store(true, Ordering::Relaxed);
+        self.allocation_floor.store(floor, Ordering::Release);
+        axlog::info!(
+            "intel-gtt: native GGTT window {:#x}..{:#x}: {} present, {} absent PTEs; largest \
+             aligned allocatable payload={} pages (64 padding entries required)",
+            floor,
+            end,
+            present_pages,
+            absent_pages,
+            largest_run_pages,
+        );
+        if largest_run_pages == 0 && native_first < native_end {
+            // Read-only bounded samples help distinguish valid firmware mappings
+            // from a malformed table window without claiming ownership of a PTE.
+            axlog::info!(
+                "intel-gtt: exhausted native window raw PTEs: [{:#x}]={:#018x} \
+                 [{:#x}]={:#018x} [{:#x}]={:#018x}",
+                floor,
+                self.array.read(native_first),
+                floor + PAGE_SIZE,
+                self.array.read(native_first + 1),
+                end - PAGE_SIZE,
+                self.array.read(native_end - 1),
+            );
+        }
+        Ok(ranges)
+    }
+
+    /// Partition-time native-window summary; deliberately does not reread the
+    /// device page table. `None` means ownership has not been split yet or a
+    /// native allocation has made that initial snapshot stale.
+    pub(crate) fn native_partition_stats(&self) -> Option<(u64, u64, u64)> {
+        if self.allocation_floor.load(Ordering::Acquire) == RESERVED_LOW_APERTURE
+            || !self.native_partition_stats_valid.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        Some((
+            self.native_present_pages.load(Ordering::Relaxed),
+            self.native_absent_pages.load(Ordering::Relaxed),
+            self.native_largest_run_pages.load(Ordering::Relaxed),
+        ))
+    }
+
     /// Exclusive upper bound for new display and GT bindings.
     fn allocation_end(&self) -> u64 {
         allocatable_end(self.aperture)
@@ -1211,7 +1409,7 @@ impl Gtt {
         let _allocation = self.next.lock();
         let mut available = 0u64;
         let end = (self.allocation_end() / PAGE_SIZE) as usize;
-        for index in (RESERVED_LOW_APERTURE / PAGE_SIZE) as usize..end {
+        for index in (self.allocation_floor.load(Ordering::Acquire) / PAGE_SIZE) as usize..end {
             if !Pte::from_raw(self.array.read(index)).is_present() {
                 available += PAGE_SIZE;
             }
@@ -1574,6 +1772,7 @@ impl Gtt {
                 }
             }
         }
+        self.live_bindings.fetch_add(1, Ordering::AcqRel);
         Ok(Binding {
             address,
             before,
@@ -1608,6 +1807,7 @@ impl Gtt {
         }
         // Search still checks every present entry, including live bindings.
         *next = self.allocation_end();
+        self.live_bindings.fetch_sub(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -1625,20 +1825,21 @@ impl Gtt {
         // this shared GGTT, including the display owner. The `min` also keeps
         // that true if a caller ever hands in a stale or invalid cursor.
         let ceiling = self.allocation_end();
+        let floor = self.allocation_floor.load(Ordering::Acquire);
         let mut end = (*next).min(ceiling);
         loop {
             // A block ending at `end` would start at `end - block`, rounded
             // down to the alignment, and nothing below [`RESERVED_LOW_APERTURE`]
             // is handed out.  When `end` is below that there is no room left in
             // the aperture, however many free entries below it happen to be.
-            if end < RESERVED_LOW_APERTURE + block {
+            if end < floor + block {
                 return Err(GttError::ApertureExhausted {
                     pages,
                     aperture: self.aperture,
                 });
             }
             let start = ((end - block) / SCANOUT_ALIGNMENT) * SCANOUT_ALIGNMENT;
-            if start < RESERVED_LOW_APERTURE {
+            if start < floor {
                 return Err(GttError::ApertureExhausted {
                     pages,
                     aperture: self.aperture,
@@ -1653,6 +1854,10 @@ impl Gtt {
                 None => {
                     debug_assert!(start + block <= end);
                     *next = start;
+                    if floor != RESERVED_LOW_APERTURE {
+                        self.native_partition_stats_valid
+                            .store(false, Ordering::Release);
+                    }
                     return Ok(start);
                 }
                 // Occupied: the block restarts below this entry, which is what
@@ -1686,6 +1891,16 @@ impl Gtt {
         debug_assert!(index < self.window_entries);
         Ok(index)
     }
+}
+
+/// Largest useful scanout payload that fits in a free PTE interval `[start,
+/// end)`, respecting the same address alignment and trailing scratch padding
+/// as `reserve_run`. Indices are in 4 KiB pages.
+fn aligned_run_payload_pages(start: usize, end: usize) -> u64 {
+    let alignment_pages = (SCANOUT_ALIGNMENT / PAGE_SIZE) as usize;
+    let aligned_start = start.div_ceil(alignment_pages) * alignment_pages;
+    end.saturating_sub(aligned_start)
+        .saturating_sub(SCANOUT_PADDING_ENTRIES as usize) as u64
 }
 
 // The two numbers a reader will want to check against the reference, as
@@ -1768,6 +1983,134 @@ mod tests;
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;
+
+    #[test]
+    fn partition_summary_matches_the_native_allocator_and_fails_closed_without_a_contiguous_surface_run()
+     {
+        let table = mock::MockPageTable::new(65_536);
+        let gtt = Gtt::over(alloc::boxed::Box::new(table.clone())).unwrap();
+        let end = gtt.allocation_end();
+        let floor = (end / 2 / SCANOUT_ALIGNMENT) * SCANOUT_ALIGNMENT;
+        for index in (floor / PAGE_SIZE) as usize..(end / PAGE_SIZE) as usize {
+            table.write(index, PTE_PRESENT | (0x1000 + index as u64 * PAGE_SIZE));
+        }
+
+        gtt.partition_for_upstream().unwrap();
+        assert_eq!(
+            gtt.native_partition_stats(),
+            Some(((end - floor) / PAGE_SIZE, 0, 0)),
+            "present firmware PTEs remain owned and are never considered allocator holes"
+        );
+
+        let mut cursor = end;
+        assert_eq!(
+            gtt.reserve_run(&mut cursor, 16_200),
+            Err(GttError::ApertureExhausted {
+                pages: 16_200,
+                aperture: 65_536 * PAGE_SIZE,
+            }),
+            "a 4K double-buffer fbdev surface plus padding must refuse if no contiguous run \
+             remains"
+        );
+    }
+
+    #[test]
+    fn scrub_keeps_live_scanout_and_clears_power_on_noise_so_the_native_window_allocates() {
+        let table = mock::MockPageTable::new(65_536);
+        let gtt = Gtt::over(alloc::boxed::Box::new(table.clone())).unwrap();
+        let end = gtt.allocation_end();
+        // Firmware scanout in PTE[0..4]; every odd entry above it is noise
+        // with the present bit set, as on a cold ADL-N table.
+        for index in 0..4 {
+            table.write(index, PTE_PRESENT | (0x7c80_0000 + index as u64 * PAGE_SIZE));
+        }
+        for index in (5..(end / PAGE_SIZE) as usize).step_by(2) {
+            table.write(index, 0xc80b_c80b_c80b_c80b);
+        }
+        let top = (end / PAGE_SIZE) as usize;
+        table.write(top, 0x405d_405d_405d_405d);
+
+        assert!(gtt.scrub_stale_entries(0..4 * PAGE_SIZE).unwrap() > 0);
+        for index in 0..4 {
+            assert_eq!(table.raw(index), PTE_PRESENT | (0x7c80_0000 + index as u64 * PAGE_SIZE));
+        }
+        for index in 4..4 + SCANOUT_PADDING_ENTRIES as usize {
+            assert_eq!(table.raw(index), gtt.scratch_entry().raw());
+        }
+        assert_eq!(table.raw(4 + SCANOUT_PADDING_ENTRIES as usize + 1), 0);
+        // Entries above the allocation end are outside this owner's range.
+        assert_eq!(table.raw(top), 0x405d_405d_405d_405d);
+
+        let ranges = gtt.partition_for_upstream().unwrap();
+        assert_eq!(ranges.first(), Some(&(0..(4 + SCANOUT_PADDING_ENTRIES) * PAGE_SIZE)));
+        let mut cursor = gtt.allocation_end();
+        assert!(gtt.reserve_run(&mut cursor, 1_024).is_ok());
+        // Ownership is split: a second scrub must not run.
+        assert!(gtt.scrub_stale_entries(0..4 * PAGE_SIZE).is_err());
+    }
+
+    #[test]
+    fn scrub_refuses_while_a_native_binding_is_live() {
+        let table = mock::MockPageTable::new(65_536);
+        let gtt = Gtt::over(alloc::boxed::Box::new(table.clone())).unwrap();
+        let binding = gtt.bind_pages(&[0x10_0000], None).unwrap();
+        assert!(gtt.scrub_stale_entries(0..PAGE_SIZE).is_err());
+        // SAFETY: host mock; no hardware consumer exists.
+        unsafe { gtt.release_binding(&binding).unwrap() };
+        assert!(gtt.scrub_stale_entries(0..PAGE_SIZE).is_ok());
+    }
+
+    #[test]
+    fn partition_largest_run_accounts_for_alignment_and_padding() {
+        assert_eq!(aligned_run_payload_pages(448, 700), 188);
+        assert_eq!(aligned_run_payload_pages(701, 800), 32);
+        assert_eq!(aligned_run_payload_pages(801, 1_023), 127);
+    }
+
+    #[test]
+    fn upstream_partition_preserves_present_entries_and_native_allocation_bounds() {
+        let array = mock::MockPageTable::new(65536);
+        array.write(1, 0x12345001);
+        array.write(2, 0x12346001);
+        let gtt = Gtt::over(alloc::boxed::Box::new(array.clone())).unwrap();
+        let before = gtt.checkpoint().unwrap();
+        let ranges = gtt.partition_for_upstream().unwrap();
+        let floor = gtt.allocation_floor.load(Ordering::Acquire);
+        assert!(
+            ranges
+                .iter()
+                .any(|range| range.start == 0 && range.end >= 3 * PAGE_SIZE),
+            "upstream owns the absent low GGTT page and adjacent firmware PTEs"
+        );
+        let allocation_end = gtt.allocation_end();
+        assert!(
+            ranges
+                .iter()
+                .any(|range| range.start <= floor && range.end >= allocation_end)
+        );
+        assert!(
+            ranges
+                .iter()
+                .any(|range| range.start <= allocation_end && range.end >= gtt.aperture()),
+            "upstream owns the GuC-top and prefetch guard through the aperture end"
+        );
+        assert!(gtt.native_partition_stats().is_some());
+        let address = gtt.map_linear(0x400000, 8192).unwrap();
+        assert!(address >= floor);
+        assert!(
+            gtt.native_partition_stats().is_none(),
+            "the partition snapshot cannot be reported as current after native allocation"
+        );
+        assert_eq!(array.read(1), 0x12345001);
+        assert_eq!(array.read(2), 0x12346001);
+        // An old whole-GGTT rollback must not erase later GT page tables.
+        assert!(gtt.checkpoint().is_err());
+        assert!(unsafe { gtt.restore_checkpoint(&before) }.is_err());
+        let mut cursor = floor;
+        assert!(gtt.reserve_run(&mut cursor, 1).is_err());
+        assert!(gtt.partition_for_upstream().is_err());
+    }
+
     #[test]
     fn checkpoint_is_read_only_and_restores_exact_firmware_and_absent_bits() {
         let array = mock::MockPageTable::new(65536);

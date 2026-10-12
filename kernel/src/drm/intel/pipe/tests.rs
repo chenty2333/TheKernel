@@ -64,6 +64,7 @@ fn source_watermark_and_plane_registers_admit_linear_rgb565() {
         },
         config,
         intel_display::universal_plane::RGB565,
+        DdbAllocation::WHOLE_BUFFER,
     )
     .unwrap();
     assert_eq!(program.plane.stride_bytes, 3840);

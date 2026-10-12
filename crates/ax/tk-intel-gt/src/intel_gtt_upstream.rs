@@ -72,8 +72,8 @@ use crate::{
         workqueue::{INIT_WORK_C, queue_work},
     },
     linux_config::{
-        CONFIG_DRM_I915_DEBUG_GEM, ENOMEM, INTEL_MEMORY_LOCAL, INTEL_MEMORY_STOLEN_LOCAL,
-        PAGE_SHIFT, PAGE_SIZE,
+        CONFIG_DRM_I915_DEBUG_GEM, EINVAL, ENOMEM, INTEL_MEMORY_LOCAL,
+        INTEL_MEMORY_STOLEN_LOCAL, IS_ERR, PAGE_SHIFT, PAGE_SIZE, PTR_ERR,
     },
     linux_i915_private::DrmI915Private,
     linux_list::{INIT_LIST_HEAD, list_del_init, list_empty},
@@ -445,6 +445,10 @@ unsafe fn poison_scratch_page(scratch: *mut DrmI915GemObject) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn setup_scratch_page(vm: *mut I915AddressSpace) -> c_int {
     let mut size = I915_GTT_PAGE_SIZE_4K;
+    let i915 = unsafe { (*vm).i915 };
+    let mut last_error = -ENOMEM;
+    let mut last_stage = "scratch allocation";
+    let mut last_value = 0u64;
     if unsafe { i915_vm_is_4lvl(vm) }
         && unsafe { vm_has_page_sizes((*vm).i915, I915_GTT_PAGE_SIZE_64K) }
         && !unsafe { has_64k_pages((*vm).i915) }
@@ -457,22 +461,58 @@ pub unsafe extern "C" fn setup_scratch_page(vm: *mut I915AddressSpace) -> c_int 
                 .alloc_scratch_dma
                 .expect("scratch DMA allocator is not initialized")(vm, size as c_int)
         };
-        if crate::linux_config::IS_ERR(obj) {
-            // Keep Linux's shared skip path below.
-        } else if unsafe { map_pt_dma(vm, obj) } != 0 {
-            unsafe { i915_gem_object_put(obj) };
-        } else if unsafe { (*obj).mm.page_sizes.sg } < size as u32 {
-            unsafe { i915_gem_object_put(obj) };
-        } else if unsafe { __px_dma(obj) } & (size - 1) != 0 {
-            unsafe { i915_gem_object_put(obj) };
+        if obj.is_null() || IS_ERR(obj) {
+            last_stage = "GEM object allocation";
+            last_error = if obj.is_null() { -ENOMEM } else { PTR_ERR(obj) };
+            last_value = size as u64;
         } else {
-            unsafe { poison_scratch_page(obj) };
-            unsafe { (*vm).scratch[0] = obj };
-            unsafe { (*vm).scratch_order = get_order(size) };
-            return 0;
+            let map_error = unsafe { map_pt_dma(vm, obj) };
+            if map_error != 0 {
+                last_stage = "GEM pin-map/DMA-page preparation";
+                last_error = map_error;
+                last_value = size as u64;
+            } else {
+                let page_sizes = unsafe { (*obj).mm.page_sizes.sg };
+                if page_sizes < size as u32 {
+                    last_stage = "DMA scatterlist page-size coverage";
+                    last_error = -ENOMEM;
+                    last_value = u64::from(page_sizes);
+                } else {
+                    let dma = unsafe { __px_dma(obj) };
+                    if dma & (size - 1) != 0 {
+                        last_stage = "DMA address alignment";
+                        last_error = -EINVAL;
+                        last_value = dma;
+                    } else {
+                        unsafe { poison_scratch_page(obj) };
+                        unsafe { (*vm).scratch[0] = obj };
+                        unsafe { (*vm).scratch_order = get_order(size) };
+                        return 0;
+                    }
+                }
+            }
+            // Log before put(): the free worker can run on another CPU before
+            // this thread reaches the final failure or the smaller-page retry.
+            drm_err!(
+                &(*i915).drm,
+                "GGTT scratch attempt rejected at %s: requested=%zu detail=%#llx errno=%d; releasing object\n",
+                last_stage,
+                size,
+                last_value,
+                last_error
+            );
+            unsafe { i915_gem_object_put(obj) };
         }
         if size == I915_GTT_PAGE_SIZE_4K {
-            return -ENOMEM;
+            drm_err!(
+                &(*i915).drm,
+                "GGTT scratch setup failed at %s: requested=%zu detail=%#llx errno=%d\n",
+                last_stage,
+                size,
+                last_value,
+                last_error
+            );
+            return last_error;
         }
         size = I915_GTT_PAGE_SIZE_4K;
     }

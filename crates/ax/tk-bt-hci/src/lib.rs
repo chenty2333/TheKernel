@@ -296,7 +296,8 @@ pub trait UsbTransport {
     fn read_bulk_acl(&mut self, out: &mut [u8]) -> Result<usize, Error>;
     /// Temporarily claim the HCI event endpoint for a synchronous command
     /// transaction. Drivers with a persistent asynchronous event read must
-    /// quiesce that request here and restore it in `end_command_transaction`.
+    /// either reuse that exact request for the command response or quiesce it
+    /// before starting a different read, then restore reception afterwards.
     fn begin_command_transaction(&mut self) -> Result<(), Error> {
         Ok(())
     }

@@ -3,7 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use core::{
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     task::Context,
 };
 
@@ -58,6 +58,9 @@ pub struct DrmFile {
     render_node: bool,
     seat_revoked: Arc<AtomicBool>,
     seat_owned_primary: bool,
+    open_flags: AtomicU32,
+    #[cfg(feature = "intel-upstream-gt")]
+    upstream_i915_file: axsync::Mutex<Option<super::intel::upstream_file::UpstreamFile>>,
 }
 
 struct FileState {
@@ -240,6 +243,26 @@ impl DrmFile {
             render_node,
             seat_revoked: Arc::new(AtomicBool::new(false)),
             seat_owned_primary,
+            open_flags: AtomicU32::new(0),
+            #[cfg(feature = "intel-upstream-gt")]
+            upstream_i915_file: axsync::Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn set_open_flags(&self, flags: u32) {
+        self.open_flags.store(flags, Ordering::Release);
+    }
+
+    pub(crate) fn open_flags(&self) -> u32 {
+        self.open_flags.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_nonblocking_flag(&self, nonblocking: bool) {
+        const O_NONBLOCK: u32 = linux_raw_sys::general::O_NONBLOCK;
+        if nonblocking {
+            self.open_flags.fetch_or(O_NONBLOCK, Ordering::AcqRel);
+        } else {
+            self.open_flags.fetch_and(!O_NONBLOCK, Ordering::AcqRel);
         }
     }
 
@@ -391,7 +414,20 @@ impl DrmFile {
         let mut reservation_predecessors = sync.predecessors;
         let reservation_rollback = match (&fb, &scanout_fence) {
             (Some(fb), Some(fence)) => {
-                let predecessor = fb.object.reservation.replace(fence.clone());
+                let predecessor = match fb.object.reservation.replace(fence.clone()) {
+                    Ok(predecessor) => predecessor,
+                    Err(error) => {
+                        if let Some(token) = event {
+                            self.events.discard(token);
+                        }
+                        fence.signal_error();
+                        return Err(match error {
+                            axerrno::AxError::NoMemory => DrmError::NoMemory,
+                            axerrno::AxError::WouldBlock => DrmError::Busy,
+                            _ => DrmError::DeviceLost,
+                        });
+                    }
+                };
                 reservation_predecessors.clear();
                 if let Some(predecessor) = &predecessor {
                     reservation_predecessors.push(predecessor.clone());
@@ -537,6 +573,12 @@ impl DrmFile {
         arg: usize,
     ) -> AxResult<usize> {
         self.require_live_seat_lease().map_err(AxError::from)?;
+        #[cfg(feature = "intel-upstream-gt")]
+        if self.has_intel_gt()
+            && let Some(result) = self.upstream_i915_ioctl(context, cmd, arg)
+        {
+            return result;
+        }
         if self.render_node {
             super::ioctl::render_dispatch(self, context, cmd, arg)
         } else {
@@ -680,6 +722,149 @@ impl DrmFile {
         Ok(())
     }
 
+    /// Install the kernel DRM view of an upstream i915 GEM handle. The same
+    /// numeric handle is then inserted into upstream drm_file.object_idr by
+    /// the DRM-core provider; KMS, PRIME and mmap all resolve this one entry.
+    #[cfg(feature = "intel-upstream-gt")]
+    pub(crate) fn create_upstream_gem_handle(
+        &self,
+        object: *mut core::ffi::c_void,
+        size: u64,
+    ) -> DrmResult<GemHandle> {
+        let bytes = usize::try_from(size).map_err(|_| DrmError::Overflow)?;
+        let charge = self.reserve_render_memory(bytes)?;
+        let (backing, reservation) =
+            super::intel::upstream_file::new_gem_backing(object, size, charge)?;
+        let handle = {
+            let mut state = self.state.lock();
+            let handle = state.next_handle;
+            state.next_handle = handle.checked_add(1).ok_or(DrmError::Overflow)?;
+            state
+                .handles
+                .insert(
+                    handle,
+                    Arc::new(GemObject::new_with_reservation(
+                        backing,
+                        size,
+                        0,
+                        reservation,
+                    )),
+                );
+            handle
+        };
+        self.device.gem_handle_opened(size, false);
+        Ok(handle)
+    }
+
+    #[cfg(feature = "intel-upstream-gt")]
+    pub(crate) fn bind_upstream_mmap(
+        &self,
+        handle: GemHandle,
+        offset: MmapOffset,
+        cache: u8,
+    ) -> DrmResult<()> {
+        let mut state = self.state.lock();
+        let object = state.handles.get(&handle).cloned().ok_or(DrmError::NotFound)?;
+        if object.backing.upstream_i915_object().is_none() {
+            return Err(DrmError::Invalid);
+        }
+        if offset == 0 || !offset.is_multiple_of(4096) || !matches!(cache, 1..=3) {
+            return Err(DrmError::Invalid);
+        }
+        state.intel_mmaps.retain(|_, (owner, _)| owner.strong_count() != 0);
+        if let Some((owner, existing_cache)) = state.intel_mmaps.get(&offset) {
+            if *existing_cache != cache || !core::ptr::eq(owner.as_ptr(), Arc::as_ptr(&object)) {
+                return Err(DrmError::Invalid);
+            }
+            return Ok(());
+        }
+        if state.intel_mmaps.len() >= 65536 {
+            return Err(DrmError::NoMemory);
+        }
+        state.intel_mmaps.insert(offset, (Arc::downgrade(&object), cache));
+        Ok(())
+    }
+
+    #[cfg(feature = "intel-upstream-gt")]
+    pub(crate) fn bind_imported_upstream_handle(
+        &self,
+        object: Arc<GemObject>,
+    ) -> DrmResult<GemHandle> {
+        let upstream = object
+            .backing
+            .upstream_i915_object()
+            .ok_or(DrmError::Unsupported)?;
+        let already_owned = self
+            .state
+            .lock()
+            .handles
+            .values()
+            .any(|existing| Arc::ptr_eq(existing, &object));
+        let handle = self.import_gem(object)?;
+        let mut file = self.upstream_i915_file.lock();
+        if file.is_none() {
+            match super::intel::upstream_file::UpstreamFile::new(self) {
+                Ok(upstream) => *file = Some(upstream),
+                Err(error) => {
+                    if !already_owned {
+                        let _ = self.close_handle(handle);
+                    }
+                    return Err(match error {
+                        AxError::NoMemory => DrmError::NoMemory,
+                        AxError::NotFound | AxError::NoSuchDevice => DrmError::DeviceLost,
+                        AxError::PermissionDenied => DrmError::PermissionDenied,
+                        AxError::ResourceBusy => DrmError::Busy,
+                        AxError::OperationNotSupported => DrmError::Unsupported,
+                        AxError::InvalidInput => DrmError::Invalid,
+                        _ => DrmError::DeviceLost,
+                    });
+                }
+            }
+        }
+        let result = file.as_ref()
+            .expect("upstream i915 file initialized")
+            .bind_existing_handle(self, handle, upstream)
+            .map_err(|_| DrmError::Busy);
+        drop(file);
+        if let Err(error) = result {
+            if !already_owned {
+                let _ = self.close_handle(handle);
+            }
+            return Err(error);
+        }
+        Ok(handle)
+    }
+
+    #[cfg(feature = "intel-upstream-gt")]
+    pub(crate) fn upstream_i915_ioctl(
+        &self,
+        context: &crate::file::IoctlContext,
+        cmd: u32,
+        arg: usize,
+    ) -> Option<AxResult<usize>> {
+        if !super::intel::upstream_file::supports_ioctl(cmd) {
+            return None;
+        }
+        Some((|| {
+            let mut file = self.upstream_i915_file.lock();
+            if file.is_none() {
+                *file = Some(super::intel::upstream_file::UpstreamFile::new(self)?);
+            }
+            file.as_ref()
+                .expect("upstream i915 file initialized")
+                .ioctl(self, context, cmd, arg)
+        })())
+    }
+
+    #[cfg(feature = "intel-upstream-gt")]
+    pub(crate) fn close_upstream_gem_handle(&self, handle: GemHandle) -> DrmResult<bool> {
+        let mut file = self.upstream_i915_file.lock();
+        let Some(file) = file.as_mut() else {
+            return Ok(false);
+        };
+        file.close_gem_handle(self, handle)
+    }
+
     pub(crate) fn gem(&self, handle: GemHandle) -> DrmResult<Arc<GemObject>> {
         self.state
             .lock()
@@ -687,6 +872,10 @@ impl DrmFile {
             .get(&handle)
             .cloned()
             .ok_or(DrmError::NotFound)
+    }
+
+    pub(crate) fn is_current_master(&self) -> bool {
+        self.device.state.lock().master == Some(self.id)
     }
 
     /// Existing per-file GEM namespace for a system-memory driver object.
@@ -873,7 +1062,7 @@ impl DrmFile {
             .lock()
             .handles
             .values()
-            .find(|object| object.mmap_offset == offset)
+            .find(|object| object.mmap_offset != 0 && object.mmap_offset == offset)
             .map(|object| Arc::clone(&object.backing))
             .ok_or(DrmError::NotFound)
     }
@@ -929,8 +1118,11 @@ impl DrmFile {
             .lock()
             .handles
             .get(&handle)
-            .map(|object| object.mmap_offset)
             .ok_or(DrmError::NotFound)
+            .and_then(|object| {
+                if object.mmap_offset == 0 { Err(DrmError::Unsupported) }
+                else { Ok(object.mmap_offset) }
+            })
     }
 
     pub fn add_framebuffer(
@@ -1244,7 +1436,7 @@ impl DrmFile {
             if let Some(object) = state
                 .handles
                 .values()
-                .find(|object| object.mmap_offset == request.offset())
+                .find(|object| object.mmap_offset != 0 && object.mmap_offset == request.offset())
                 .cloned()
             {
                 (object, 2)
@@ -1360,6 +1552,17 @@ impl Drop for DrmFile {
         drop(device);
         if restore_console {
             crate::pseudofs::dev::restore_console_after_master_close();
+        }
+        #[cfg(feature = "intel-upstream-gt")]
+        {
+            // Close mirrored i915 IDR handles before accounting the remaining
+            // native handles; this retires both views exactly once.
+            // Final ownership is exclusive; do not require a scheduler just
+            // to drop an unused sidecar (or reacquire its sleeping mutex).
+            let upstream = self.upstream_i915_file.get_mut().take();
+            if let Some(mut upstream) = upstream {
+                upstream.close(self);
+            }
         }
         let released_handles = {
             let state = self.state.lock();
@@ -1523,6 +1726,28 @@ mod tests {
     fn device() -> Arc<DrmDevice> {
         DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4)
     }
+    #[cfg(feature = "intel-upstream-gt")]
+    #[test]
+    fn upstream_zero_offset_is_not_a_dumb_token_and_cache_aliases_coexist() {
+        struct UpstreamBacking;
+        impl super::super::GemBacking for UpstreamBacking {
+            fn shared_pages(&self) -> DrmResult<Arc<crate::mm::SharedPages>> { Err(DrmError::Unsupported) }
+            fn upstream_i915_object(&self) -> Option<usize> { Some(1) }
+        }
+        let file = device().open_primary();
+        let object = Arc::new(GemObject::new(Arc::new(UpstreamBacking), 4096, 0));
+        file.state.lock().handles.insert(1, object);
+        assert_eq!(file.map_dumb(1), Err(DrmError::Unsupported));
+        assert!(matches!(file.mmap_object(0), Err(DrmError::NotFound)));
+        assert_eq!(file.bind_upstream_mmap(1, 0, 2), Err(DrmError::Invalid));
+        for cache in 1..=3 {
+            file.bind_upstream_mmap(1, 0x1_0000_0000 + u64::from(cache) * 4096, cache).unwrap();
+        }
+        assert_eq!(file.state.lock().intel_mmaps.len(), 3);
+        assert_eq!(file.bind_upstream_mmap(1, 0x1_0000_1000, 2), Err(DrmError::Invalid));
+        assert_eq!(file.state.lock().intel_mmaps.len(), 3);
+    }
+
     #[test]
     fn fixed_mode_is_rejected_in_proposal_without_advertising_a_cursor() {
         struct Fixed;

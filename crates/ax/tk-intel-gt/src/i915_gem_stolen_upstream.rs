@@ -919,8 +919,8 @@ unsafe extern "C" fn i915_gem_object_get_pages_stolen(obj: *mut DrmI915GemObject
     let base = obj.cast::<crate::intel_context_upstream::DrmGemObjectBaseLayout>();
     let pages =
         unsafe { i915_pages_create_for_stolen((*base).dev.cast(), (*node).start, (*node).size) };
-    if (pages as isize) < 0 {
-        return pages as isize as c_int;
+    if crate::linux_config::IS_ERR(pages) {
+        return crate::linux_config::PTR_ERR(pages);
     }
     unsafe {
         let sg = (*pages).sgl;

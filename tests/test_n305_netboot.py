@@ -3,6 +3,7 @@ import http.client
 import http.server
 import io
 import os
+import socket
 import subprocess
 from pathlib import Path
 import tarfile
@@ -10,11 +11,62 @@ import tempfile
 import threading
 import unittest
 
-from tools.n305_netboot import CaptureHandler, generate_session_scripts, grub_config
+from tools.n305_netboot import DEFAULT_GFXMODE, CaptureHandler, generate_session_scripts, grub_config
 
 ROOT = Path(__file__).resolve().parents[1]
 
 class NetbootTests(unittest.TestCase):
+    def test_userspace_probe_log_relay_uses_udp_without_kernel_log_access(self):
+        from tests.support import test_tmpdir
+        with test_tmpdir() as directory:
+            relay = Path(directory) / 'netconsole'
+            subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror',
+                            str(ROOT / 'tests/guest/tools/netconsole.c'), '-o', str(relay)], check=True)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+                receiver.bind(('127.0.0.1', 0))
+                receiver.settimeout(1)
+                payload = b'N305_GPU_SMOKE state=NOT_RUN\n' + b'x' * 1500 + b'\n'
+                subprocess.run([str(relay), '127.0.0.1', str(receiver.getsockname()[1]), '--stdin'],
+                               input=payload, check=True, timeout=3)
+                received = b''
+                while len(received) < len(payload):
+                    packet = receiver.recv(2048)
+                    self.assertLessEqual(len(packet), 1199)
+                    received += packet
+                self.assertEqual(received, payload)
+            invalid = subprocess.run([str(relay), '127.0.0.1', '0', '--stdin'], input=b'', timeout=3)
+            self.assertEqual(invalid.returncode, 2)
+
+    def test_opt_in_mesa_probe_reports_skip_exit_and_deadline_without_stalling_shell(self):
+        from tests.support import test_tmpdir
+        source = (ROOT / "tests/guest/shell-init.sh").read_text()
+        probe = source.split('# The existing Mesa client', 1)[1].split('# Emit readiness', 1)[0]
+        # Execute the real optional block, substituting only external resources
+        # and the wall-clock budget. No GPU/rendering success is simulated here.
+        probe = '# The existing Mesa client' + probe
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            client, log = root / "client", root / "log"
+            block = probe.replace('client=/usr/local/bin/intel-mesa-smoke', f'client={client}')
+            block = block.replace('node=/dev/dri/renderD128', 'node=/dev/null')
+            block = block.replace('mkdir -p /run', ':')
+            block = block.replace('/run/n305-gpu-smoke.log', str(log)).replace('sleep 45 &', 'sleep 0.1 &')
+            def run(enabled):
+                subprocess.run(['sh', '-eu', '-c', f'gpu_smoke={enabled}\nnetconsole=""\n{block}\nwait'],
+                               check=True, timeout=3)
+            run(0)
+            self.assertFalse(log.exists())
+            run(1)
+            self.assertIn('state=NOT_RUN', log.read_text())
+            client.write_text('#!/bin/sh\nexit 7\n')
+            client.chmod(0o755)
+            run(1)
+            self.assertIn('state=EXIT status=7', log.read_text())
+            client.write_text('#!/bin/sh\nexec sleep 5\n')
+            run(1)
+            self.assertIn('state=DEADLINE', log.read_text())
+            self.assertIn('state=EXIT status=137', log.read_text())
+
     def test_n305_has_no_compile_time_slirp_address_or_default_gateway(self):
         from tools import thekernel as product
         parser=product.build_parser()
@@ -48,9 +100,22 @@ class NetbootTests(unittest.TestCase):
         self.assertIn("scripts/ci/n305-dhcp.script", ROOTFS_INPUT_FILES)
 
     def test_grub_uses_explicit_mode_not_keep_and_preserves_diagnostics(self):
-        text = grub_config("kernel", "192.168.10.1", 8080, "debug", "1920x1080x32,auto")
+        self.assertEqual(DEFAULT_GFXMODE, "3840x2160x32,auto")
+        text = grub_config("kernel", "192.168.10.1", 8080, "debug", DEFAULT_GFXMODE)
         self.assertIn("quiet loglevel=debug", text)
         self.assertNotIn("gfxpayload=keep", text)
+        self.assertIn("set gfxmode=3840x2160x32,auto\n", text)
+        self.assertIn("set gfxpayload=3840x2160x32,auto\n", text)
+        # GRUB's multiboot2 command derives gfxpayload from the ELF header,
+        # replacing an earlier assignment with auto for a 0x0 request.
+        payload = None
+        for line in text.splitlines():
+            if line.startswith("multiboot2 "):
+                payload = "auto"
+            elif line.startswith("set gfxpayload="):
+                payload = line.split("=", 1)[1]
+            elif line == "boot":
+                self.assertEqual(payload, DEFAULT_GFXMODE)
         self.assertIn("module2", text)
         capture = grub_config("capture", "192.168.10.1", 8080, "info", "auto")
         self.assertIn("apkovl=http://192.168.10.1:8080/", capture)

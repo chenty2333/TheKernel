@@ -133,9 +133,15 @@ mod timing;
 #[cfg(feature = "intel-upstream-gt")]
 mod upstream_drm;
 #[cfg(feature = "intel-upstream-gt")]
+pub(crate) mod upstream_file;
+#[cfg(feature = "intel-upstream-gt")]
+pub(crate) mod upstream_sync;
+#[cfg(feature = "intel-upstream-gt")]
 mod upstream_gt;
 #[cfg(all(feature = "intel-upstream-gt", target_os = "none"))]
 mod upstream_probe;
+#[cfg(feature = "intel-upstream-gt")]
+mod upstream_memory;
 
 #[cfg(test)]
 mod testbus;
@@ -1391,6 +1397,17 @@ mod tests {
     }
 }
 
+/// Name the failing native admission site during opt-in hardware diagnosis.
+#[track_caller]
+pub(super) fn traced_refusal() -> intel_display::Error {
+    #[cfg(target_os = "none")]
+    if axhal::boot::command_line_value("boot.progress") == Some("1") {
+        let at = core::panic::Location::caller();
+        axlog::warn!("intel-display: refusal at {}:{}", at.file(), at.line());
+    }
+    intel_display::Error::Refused
+}
+
 /// GT bring-up is independent of HDMI modesetting, HPD, DMC and audio.
 pub(crate) fn bring_up_gt_at_boot() {
     #[cfg(target_os = "none")]
@@ -1398,10 +1415,44 @@ pub(crate) fn bring_up_gt_at_boot() {
 }
 
 pub(super) fn gt_registered() -> bool {
-    gt::registered()
+    #[cfg(feature = "intel-upstream-gt")]
+    {
+        upstream_drm::registered_device().is_some()
+    }
+    #[cfg(not(feature = "intel-upstream-gt"))]
+    {
+        gt::registered()
+    }
 }
 
 /// PCI identity of the live, independently admitted render engine owner.
 pub(crate) fn gt_pci_identity() -> Option<axdriver_display::DisplayPciIdentity> {
-    gt::pci_identity()
+    #[cfg(feature = "intel-upstream-gt")]
+    {
+        if !gt_registered() {
+            return None;
+        }
+        let bdf = upstream_gt::registered_bdf()?;
+        let report = REPORT.lock();
+        let info = report
+            .as_ref()?
+            .displays
+            .iter()
+            .find(|display| display.info.bdf == bdf)?
+            .info;
+        Some(axdriver_display::DisplayPciIdentity {
+            bus: bdf.bus,
+            device: bdf.device,
+            function: bdf.function,
+            vendor_id: info.vendor_id,
+            device_id: info.device_id,
+            subsystem_vendor: info.subsystem_vendor_id,
+            subsystem_device: info.subsystem_id,
+            revision: info.revision,
+        })
+    }
+    #[cfg(not(feature = "intel-upstream-gt"))]
+    {
+        gt::pci_identity()
+    }
 }

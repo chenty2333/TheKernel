@@ -128,6 +128,18 @@ impl EndpointHandle {
         request: TransferRequest,
     ) -> Result<TransferCompletion, TransferError> {
         let id = self.submit(request)?;
+        self.wait_submitted(id).await
+    }
+
+    /// Wait for the exact request previously submitted to this endpoint.
+    /// This consumes its completion without submitting a second transfer or
+    /// cancelling an outstanding IN request which may not receive any data.
+    /// Dropping this future does not cancel the request: its submitted buffer
+    /// must remain owned until completion or proven controller shutdown.
+    pub async fn wait_submitted(
+        &self,
+        id: RequestId,
+    ) -> Result<TransferCompletion, TransferError> {
         EndpointRequestFuture { id, endpoint: self }.await
     }
 
@@ -177,6 +189,88 @@ impl Future for EndpointRequestFuture<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         this.endpoint.poll_request(this.id, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use core::task::Waker;
+    use usb_if::endpoint::{EndpointAddress, TransferStatus};
+
+    struct PendingIn {
+        submissions: Arc<AtomicUsize>,
+        ready: Arc<AtomicBool>,
+        pending: Option<RequestId>,
+    }
+
+    impl EndpointOp for PendingIn {
+        fn submit_request(&mut self, _: TransferRequest) -> Result<RequestId, TransferError> {
+            assert!(self.pending.is_none(), "a second IN request was submitted");
+            let id = RequestId::new(self.submissions.fetch_add(1, Ordering::SeqCst) as u64 + 1);
+            self.pending = Some(id);
+            Ok(id)
+        }
+
+        fn reclaim_request(
+            &mut self,
+            id: RequestId,
+        ) -> Option<Result<TransferCompletion, TransferError>> {
+            if self.pending != Some(id) || !self.ready.load(Ordering::SeqCst) {
+                return None;
+            }
+            self.pending = None;
+            Some(Ok(TransferCompletion {
+                request_id: id,
+                status: TransferStatus::Completed,
+                actual_length: 3,
+                iso_packets: Vec::new(),
+            }))
+        }
+
+        fn register_waker(&self, _: RequestId, _: &mut Context<'_>) {}
+
+        fn cancel_request(&mut self, _: RequestId) -> Result<(), TransferError> {
+            panic!("a quiet event-IN request must not be cancelled before sending the command")
+        }
+    }
+
+    #[test]
+    fn wait_submitted_reuses_pending_in_and_reclaims_each_response_once() {
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicBool::new(false));
+        let endpoint = EndpointHandle::new(
+            EndpointInfo {
+                address: EndpointAddress::new(0x81),
+                transfer_type: EndpointType::Interrupt,
+                direction: usb_if::transfer::Direction::In,
+                max_packet_size: 16,
+                packets_per_microframe: 1,
+                interval: 1,
+            },
+            PendingIn {
+                submissions: submissions.clone(),
+                ready: ready.clone(),
+                pending: None,
+            },
+        );
+        let mut context = Context::from_waker(Waker::noop());
+        for expected in 1..=2 {
+            ready.store(false, Ordering::SeqCst);
+            let mut buffer = [0; 16];
+            let id = endpoint.submit(TransferRequest::interrupt_in(&mut buffer)).unwrap();
+            let mut wait = core::pin::pin!(endpoint.wait_submitted(id));
+            assert!(wait.as_mut().poll(&mut context).is_pending());
+            assert_eq!(submissions.load(Ordering::SeqCst), expected);
+            ready.store(true, Ordering::SeqCst);
+            let Poll::Ready(Ok(completion)) = wait.as_mut().poll(&mut context) else {
+                panic!("the exact pending response was not reclaimed");
+            };
+            assert_eq!(completion.request_id, id);
+            assert_eq!(completion.actual_length, 3);
+            assert!(endpoint.reclaim(id).unwrap().is_none());
+        }
     }
 }
 

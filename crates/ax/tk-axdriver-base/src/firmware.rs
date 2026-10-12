@@ -62,16 +62,42 @@ pub fn on_rootfs_ready(callback: fn()) -> bool {
 }
 
 /// Runs and clears the registered callbacks. Called once by the runtime after
-/// [`set_reader`].
-pub fn run_rootfs_ready() {
+/// [`set_reader`]. The observer receives the slot and function address before
+/// each call, allowing a screen-only boot to identify a stalled callback.
+pub fn run_rootfs_ready(mut before_callback: impl FnMut(usize, usize)) {
     READY.store(true, Ordering::Release);
-    for slot in &CALLBACKS {
+    for (index, slot) in CALLBACKS.iter().enumerate() {
         let raw = slot.swap(0, Ordering::AcqRel);
         if raw != 0 {
+            before_callback(index, raw);
             // SAFETY: slots only ever hold `fn()` values stored by
             // `on_rootfs_ready`.
             let callback: fn() = unsafe { core::mem::transmute::<usize, fn()>(raw) };
             callback();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ready_observer_precedes_callback_and_slots_are_consumed_once() {
+        static CALLED: AtomicUsize = AtomicUsize::new(0);
+        fn callback() {
+            CALLED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        assert!(on_rootfs_ready(callback));
+        let mut observed = alloc::vec::Vec::new();
+        run_rootfs_ready(|slot, address| {
+            assert!(rootfs_ready());
+            observed.push((slot, address, CALLED.load(Ordering::SeqCst)));
+        });
+        assert_eq!(observed, [(0, callback as *const () as usize, 0)]);
+        assert_eq!(CALLED.load(Ordering::SeqCst), 1);
+        run_rootfs_ready(|_, _| panic!("consumed callback was reported twice"));
+        assert_eq!(CALLED.load(Ordering::SeqCst), 1);
     }
 }

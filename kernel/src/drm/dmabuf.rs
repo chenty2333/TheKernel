@@ -180,7 +180,7 @@ mod tests {
         assert!(empty.is_signaled());
 
         let prior = Fence::new(false);
-        object.reservation.publish(prior.clone());
+        object.reservation.publish(prior.clone()).unwrap();
         assert!(Arc::ptr_eq(
             &export_sync_fence(&object, DMA_BUF_SYNC_WRITE).unwrap(),
             &prior

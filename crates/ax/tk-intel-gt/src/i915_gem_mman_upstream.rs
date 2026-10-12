@@ -186,6 +186,242 @@ struct DrmI915GemMmapOffset {
     extensions: u64,
 }
 
+/// A stable set of pages from one pinned i915 system-memory GEM object.
+/// The opaque owner keeps the object alive and its backing pages pinned for
+/// every VMA which maps these physical frames.
+pub struct MmapPageSet {
+    object: usize,
+    pages: alloc::vec::Vec<usize>,
+}
+
+// The GEM reference and page pin are atomic LinuxKPI lifetime operations; the
+// page vector is immutable after construction. It is therefore safe to retain
+// this owner behind the kernel's cross-thread `SharedPages` Arc.
+unsafe impl Send for MmapPageSet {}
+unsafe impl Sync for MmapPageSet {}
+
+impl MmapPageSet {
+    pub fn physical_pages(&self) -> &[usize] {
+        &self.pages
+    }
+}
+
+impl Drop for MmapPageSet {
+    fn drop(&mut self) {
+        let obj = self.object as *mut DrmI915GemObject;
+        if !obj.is_null() {
+            unsafe {
+                i915_gem_object_unpin_pages(obj);
+                i915_gem_object_put(obj);
+            }
+        }
+    }
+}
+
+/// Resolve and pin the cacheable system-RAM pages for a userspace GEM mmap.
+/// This is the kernel VM adapter's physical-page view of the same i915 shmem
+/// pages; it preserves the upstream VMA-offset file allowlist and rejects the
+/// GGTT/WC/UC and device-local mappings whose distinct cache/I/O semantics are
+/// not represented by the kernel's shared-RAM VMA backend.
+///
+/// # Safety
+/// `file` must be the live upstream DRM file whose VMA manager and allowlist
+/// are protected by the normal file-description lifetime.
+pub unsafe fn i915_mmap_page_set(
+    file: *mut DrmFile,
+    byte_offset: u64,
+    byte_len: usize,
+    writable: bool,
+) -> Result<MmapPageSet, c_int> {
+    if file.is_null()
+        || byte_len == 0
+        || !byte_offset.is_multiple_of(PAGE_SIZE_U64)
+        || !byte_len.is_multiple_of(PAGE_SIZE)
+    {
+        return Err(-EINVAL);
+    }
+    let pages = byte_len / PAGE_SIZE;
+    // Bound per-mapping page-reference metadata independently of the user's
+    // object size, and reserve before taking any DRM/GEM locks.
+    if pages == 0 || pages > (1 << 20) {
+        return Err(-ENOMEM);
+    }
+    let mut physical = alloc::vec::Vec::new();
+    physical.try_reserve_exact(pages).map_err(|_| -ENOMEM)?;
+
+    let minor = unsafe { (*file).minor };
+    if minor.is_null() || unsafe { (*minor).dev }.is_null() {
+        return Err(-EINVAL);
+    }
+    let dev = unsafe { (*minor).dev.cast::<DrmDevicePrefix>() };
+    if unsafe { drm_dev_is_unplugged(dev.cast()) } {
+        return Err(-ENODEV);
+    }
+    let manager = unsafe { (*dev).vma_offset_manager };
+    if manager.is_null() {
+        return Err(-ENODEV);
+    }
+
+    let first_page = byte_offset >> PAGE_SHIFT;
+    let count = pages as u64;
+    let Some(last_page) = first_page.checked_add(count) else {
+        return Err(-EINVAL);
+    };
+    let mut obj = core::ptr::null_mut::<DrmI915GemObject>();
+    let mut relative_page = 0u64;
+    let mut mmap_type = I915MmapType::I915_MMAP_TYPE_FIXED;
+    unsafe {
+        rcu_read_lock();
+        drm_vma_offset_lock_lookup(manager);
+        let node = drm_vma_offset_lookup_locked(manager, first_page as c_ulong, pages as c_ulong);
+        if !node.is_null()
+            && drm_vma_node_is_allowed(node, file)
+            && (*node).driver_private.is_null()
+        {
+            let mmo = node.cast::<I915MmapOffset>();
+            let candidate = (*mmo).obj;
+            let start = (*node).vm_node.start;
+            if !candidate.is_null()
+                && start <= first_page
+                && (*node).vm_node.start.wrapping_add((*node).vm_node.size) >= last_page
+            {
+                obj = i915_gem_object_get_rcu(candidate);
+                relative_page = first_page - start;
+                mmap_type = (*mmo).mmap_type;
+            }
+        }
+        drm_vma_offset_unlock_lookup(manager);
+        rcu_read_unlock();
+    }
+    if obj.is_null() {
+        return Err(-EACCES);
+    }
+    if mmap_type != I915MmapType::I915_MMAP_TYPE_WB
+        || !unsafe { i915_gem_object_has_struct_page(obj) }
+        || relative_page
+            .checked_add(count)
+            .is_none_or(|end| end > unsafe { (&(*obj).base.base).size >> PAGE_SHIFT })
+        || (writable && unsafe { i915_gem_object_is_readonly(obj) })
+    {
+        unsafe { i915_gem_object_put(obj) };
+        return Err(-ENODEV);
+    }
+
+    let mut err = unsafe { i915_gem_object_lock_interruptible(obj, core::ptr::null_mut()) };
+    if err == 0 {
+        err = unsafe { i915_gem_object_pin_pages(obj) };
+        if err == 0 && writable {
+            // The Linux CPU-fault handler marks the object dirty on the first
+            // writable fault. The fixed-page adapter has no per-fault
+            // callback, so retain that state for the complete writable VMA.
+            unsafe { (*obj).mm.madv_dirty_bits |= 1 << 2 };
+        }
+        unsafe { i915_gem_object_unlock(obj) };
+    }
+    if err != 0 {
+        unsafe { i915_gem_object_put(obj) };
+        return Err(err);
+    }
+
+    for index in relative_page..relative_page + count {
+        let page = unsafe { crate::i915_gem_pages_upstream::__i915_gem_object_get_page(obj, index) };
+        if page.is_null() {
+            unsafe {
+                i915_gem_object_unpin_pages(obj);
+                i915_gem_object_put(obj);
+            }
+            return Err(-ENODEV);
+        }
+        let phys = unsafe { crate::linux::page::page_to_phys(page) } as usize;
+        if phys & (PAGE_SIZE - 1) != 0 {
+            unsafe {
+                i915_gem_object_unpin_pages(obj);
+                i915_gem_object_put(obj);
+            }
+            return Err(-EINVAL);
+        }
+        physical.push(phys);
+    }
+    Ok(MmapPageSet {
+        object: obj as usize,
+        pages: physical,
+    })
+}
+
+/// Pin a complete cacheable system-RAM object for a kernel GEM backing alias.
+/// The caller retains the returned owner in its `SharedPages` allocation
+/// owner, so PRIME, native scanout and VMAs all keep the exact i915 pages live.
+///
+/// # Safety
+/// `obj` must be a live i915 GEM object held by the caller.
+pub unsafe fn i915_object_page_set(obj: *mut DrmI915GemObject) -> Result<MmapPageSet, c_int> {
+    if obj.is_null() {
+        return Err(-EINVAL);
+    }
+    let obj = unsafe { i915_gem_object_get(obj) };
+    let bytes = unsafe { (&(*obj).base.base).size };
+    if bytes == 0
+        || !bytes.is_multiple_of(PAGE_SIZE_U64)
+        || !unsafe { i915_gem_object_has_struct_page(obj) }
+    {
+        unsafe { i915_gem_object_put(obj) };
+        return Err(-ENODEV);
+    }
+    let pages = usize::try_from(bytes >> PAGE_SHIFT).map_err(|_| {
+        unsafe { i915_gem_object_put(obj) };
+        -ENOMEM
+    })?;
+    if pages == 0 || pages > (1 << 20) {
+        unsafe { i915_gem_object_put(obj) };
+        return Err(-ENOMEM);
+    }
+    let mut physical = alloc::vec::Vec::new();
+    if physical.try_reserve_exact(pages).is_err() {
+        unsafe { i915_gem_object_put(obj) };
+        return Err(-ENOMEM);
+    }
+
+    let mut err = unsafe { i915_gem_object_lock_interruptible(obj, core::ptr::null_mut()) };
+    if err == 0 {
+        err = unsafe { i915_gem_object_pin_pages(obj) };
+        if err == 0 {
+            // Kernel mappings are writable and bypass Linux's per-fault
+            // dirty hook; conservatively retain the same GEM dirty state.
+            unsafe { (*obj).mm.madv_dirty_bits |= 1 << 2 };
+        }
+        unsafe { i915_gem_object_unlock(obj) };
+    }
+    if err != 0 {
+        unsafe { i915_gem_object_put(obj) };
+        return Err(err);
+    }
+    for index in 0..pages {
+        let page = unsafe {
+            crate::i915_gem_pages_upstream::__i915_gem_object_get_page(obj, index as u64)
+        };
+        if page.is_null() {
+            unsafe {
+                i915_gem_object_unpin_pages(obj);
+                i915_gem_object_put(obj);
+            }
+            return Err(-ENODEV);
+        }
+        let phys = unsafe { crate::linux::page::page_to_phys(page) } as usize;
+        if phys & (PAGE_SIZE - 1) != 0 {
+            unsafe {
+                i915_gem_object_unpin_pages(obj);
+                i915_gem_object_put(obj);
+            }
+            return Err(-EINVAL);
+        }
+        physical.push(phys);
+    }
+    Ok(MmapPageSet {
+        object: obj as usize,
+        pages: physical,
+    })
+}
+
 // The source's `__vma_matches()` is intentionally kept local: the missing MM
 // owner must expose these exact `vm_area_struct` fields.
 // upstream: i915_gem_mman.c __vma_matches()

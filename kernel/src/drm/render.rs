@@ -675,9 +675,11 @@ fn create(file: &DrmFile, copy: &impl super::ioctl::UserCopy, arg: usize) -> AxR
     // ready fence into the initial reservation so every transfer/EXECBUFFER
     // observes the guest-reserved resource only after it is host-live.
     let (_, object) = file.render_resource(handle).map_err(drm)?;
-    object
-        .reservation
-        .publish(a.resource_ready(resource).map_err(drm)?);
+    if let Err(error) = a.resource_ready(resource).map_err(drm)
+        .and_then(|fence| object.reservation.publish(fence)) {
+        let _ = file.close_handle(handle);
+        return Err(error);
+    }
     r.bo_handle = handle;
     r.res_handle = resource;
     write(copy, arg, &r)
@@ -811,9 +813,11 @@ fn create_blob(file: &DrmFile, copy: &impl super::ioctl::UserCopy, arg: usize) -
         .map_err(drm)?;
     let adapter = file.render_adapter().map_err(drm)?;
     let (_, object) = file.render_resource(handle).map_err(drm)?;
-    object
-        .reservation
-        .publish(adapter.resource_ready(resource).map_err(drm)?);
+    if let Err(error) = adapter.resource_ready(resource).map_err(drm)
+        .and_then(|fence| object.reservation.publish(fence)) {
+        let _ = file.close_handle(handle);
+        return Err(error);
+    }
     r.bo_handle = handle;
     r.res_handle = resource;
     write(copy, arg, &r)
@@ -907,7 +911,7 @@ fn transfer(
     let c = file.render_context().map_err(drm)?;
     let completion = Fence::new(false);
     let guard = FenceFailureGuard(Some(completion.clone()));
-    let mut reservations = [&obj.reservation];
+    let mut reservations = [obj.reservation.as_ref()];
     let predecessors =
         match super::fence::Reservation::replace_many(&mut reservations, completion.clone()) {
             Ok(predecessors) => predecessors,
@@ -994,7 +998,7 @@ fn exec(file: &DrmFile, context: &crate::file::IoctlContext, arg: usize) -> AxRe
         .try_reserve_exact(objects.len())
         .map_err(|_| AxError::NoMemory)?;
     for (_, object) in &objects {
-        reservations.push(&object.reservation);
+        reservations.push(object.reservation.as_ref());
     }
 
     // Publish before waiting.  `replace_many` snapshots all predecessors and

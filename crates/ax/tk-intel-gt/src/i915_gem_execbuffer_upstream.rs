@@ -493,12 +493,13 @@ pub unsafe fn eb_create(eb: *mut I915Execbuffer) -> i32 {
             if !(*eb).buckets.is_null() {
                 break;
             }
+            // Linux: do { ... } while (--size); size 0 is never attempted.
+            size -= 1;
             if size == 0 {
                 break;
             }
-            size -= 1;
         }
-        if size == 0 {
+        if (*eb).buckets.is_null() {
             return -ENOMEM;
         }
         (*eb).lut_size = size as i32;
@@ -2595,7 +2596,7 @@ pub unsafe fn __free_fence_array(fences: *mut EbFence, mut n: u32) {
         n -= 1;
         drm_syncobj_put(ptr_mask_bits((*fences.add(n as usize)).syncobj, 2).cast());
         dma_fence_put((*fences.add(n as usize)).dma_fence);
-        dma_fence_chain_free((*fences.add(n as usize)).chain_fence);
+        dma_fence_chain_free((*fences.add(n as usize)).chain_fence.cast());
     }
     kvfree(fences.cast());
 }
@@ -2641,9 +2642,11 @@ pub unsafe fn add_timeline_fence_array(
     }
     (*eb).fences = f;
     f = f.add((*eb).num_fences);
-    let mut err = 0;
     while nfences != 0 {
         nfences -= 1;
+        // Reset per entry: a stale error from an earlier SIGNAL entry must not
+        // leak into a later entry whose fence is NULL.
+        let mut err = 0;
         let mut user_fence: DrmI915GemExecFence = core::mem::zeroed();
         if __copy_from_user(
             &mut user_fence as *mut _ as *mut c_void,
@@ -2928,7 +2931,10 @@ pub unsafe fn parse_execbuf2_extensions(
     if (*args).flags & I915_EXEC_USE_EXTENSIONS == 0 {
         return 0;
     }
-    if (*eb).args.as_ref().unwrap().flags & I915_EXEC_FENCE_ARRAY != 0 {
+    if (*eb).args.is_null() {
+        return -EINVAL;
+    }
+    if (*(*eb).args).flags & I915_EXEC_FENCE_ARRAY != 0 {
         return -EINVAL;
     }
     if (*args).num_cliprects != 0 {
@@ -3175,7 +3181,8 @@ pub unsafe fn i915_gem_do_execbuffer(
     if err == 0 {
         let in_fences = (*args).flags & (I915_EXEC_FENCE_IN | I915_EXEC_FENCE_SUBMIT);
         if in_fences == (I915_EXEC_FENCE_IN | I915_EXEC_FENCE_SUBMIT) {
-            return -EINVAL;
+            // Route through err_ext so eb.fences (syncobj refs from add_fence_array) are put.
+            err = -EINVAL;
         } else if in_fences != 0 {
             in_fence = sync_file_get_fence(lower_32_bits((*args).rsvd2) as i32);
             if in_fence.is_null() {

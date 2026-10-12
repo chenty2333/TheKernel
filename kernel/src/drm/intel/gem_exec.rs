@@ -264,7 +264,7 @@ const _: () = {
 };
 fn cpu_admit(object: &GemObject) -> AxResult<CpuCompletion> {
     let fence = Fence::new(false);
-    if let Some(prior) = object.reservation.replace(fence.clone())
+    if let Some(prior) = object.reservation.replace(fence.clone())?
         && let Err(error) = prior.wait(Some(Duration::from_millis(500)))
     {
         fence.signal_error();
@@ -335,7 +335,7 @@ fn data(file: &DrmFile, copy: &impl UserCopy, arg: usize, write: bool) -> AxResu
         copy.read(address, dst)?;
     }
     let fence = Fence::new(false);
-    if let Some(prior) = object.reservation.replace(fence.clone())
+    if let Some(prior) = object.reservation.replace(fence.clone())?
         && let Err(error) = prior.wait(Some(Duration::from_millis(500)))
     {
         fence.signal_error();
@@ -622,7 +622,7 @@ pub(super) fn exec_request(
     refs.try_reserve_exact(objects.len())
         .map_err(|_| AxError::NoMemory)?;
     for (index, object) in objects.iter().enumerate() {
-        refs.push((&object.reservation, records[index].flags & ASYNC != 0));
+        refs.push((object.reservation.as_ref(), records[index].flags & ASYNC != 0));
     }
     let predecessors = match Reservation::replace_many_with_async(&mut refs, completion.clone()) {
         Ok(p) => p,
@@ -1240,7 +1240,7 @@ pub(super) mod tests {
             let async_handle = [source, destination, batch][async_index];
             let async_object = object(&file, async_handle).unwrap();
             let async_prior = Fence::new(false);
-            async_object.reservation.publish(async_prior.clone());
+            async_object.reservation.publish(async_prior.clone()).unwrap();
             let record_offset = 256 + async_index * size_of::<Object>();
             let mut async_record: Object = read_pod(&copy, record_offset).unwrap();
             async_record.flags |= ASYNC;
@@ -1791,7 +1791,7 @@ pub(super) mod tests {
         let o = object(&file, h).unwrap();
         assert!(o.reservation.predecessor().is_none());
         let pending = Fence::new(false);
-        o.reservation.publish(pending.clone());
+        o.reservation.publish(pending.clone()).unwrap();
         write_pod(
             &copy,
             0,
