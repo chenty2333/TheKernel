@@ -2250,3 +2250,8 @@ Licensing:
 - `drivers/gpu/drm/display/drm_dp_dual_mode_helper.c`: MIT (SPDX-License-Identifier: MIT).
 Both files carry MIT licenses in upstream Linux 7.2.3 and are recorded in `crates/ax/tk-drm-upstream/NOTICE`.
 
+## 2026-10-13 DRM infrastructure core BI reconciliation
+
+The Linux DRM infrastructure core translations (`crates/ax/tk-drm-upstream`, batch BI: `drm_drv_upstream.rs`, `drm_file_upstream.rs`, `drm_gem_upstream.rs`, `drm_prime_upstream.rs`, `drm_ioctl_upstream.rs`, `drm_auth_upstream.rs`, `drm_vma_manager_upstream.rs`, `drm_lease_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned `crates/ax` totals: threshold >=40 `(0,0,0,850,820,0,0)` (was 837/807), threshold >=25 `(18,15,4,2288,2250,0,0)` (was 2238/2200). `crates/linux` and `kernel/src` are unchanged.
+
+
