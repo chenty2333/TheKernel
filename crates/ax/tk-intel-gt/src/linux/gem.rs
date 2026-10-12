@@ -473,10 +473,10 @@ pub unsafe fn drm_vma_offset_lock_lookup(manager: *mut DrmVmaOffsetManager) {
 pub unsafe fn drm_vma_offset_unlock_lookup(manager: *mut DrmVmaOffsetManager) {
     unsafe { crate::linux::locks::read_unlock(manager.cast()) };
 }
-// The default configured Linux 7.2.3 graphics oracle has
-// CONFIG_TRANSPARENT_HUGEPAGE=n: drm_device has no huge_mnt field in this ABI
-// (the ABI oracle enables THP and has one; the i915 mirror tracks the default). Preserve the actual MIT header
-// branches instead of inventing a mount or an unmeasured field offset.
+// Both Linux 7.2.3 oracles build with CONFIG_TRANSPARENT_HUGEPAGE=y, so
+// drm_device carries huge_mnt (tk_drm_upstream::drm_device_types). i915 never
+// creates a huge shmem mount here, so the mount stays NULL as in a Linux build
+// that has not called drm_gem_huge_mnt_create().
 // upstream: drm_gem.h drm_gem_get_huge_mnt()
 pub fn drm_gem_get_huge_mnt<T, U>(_dev: *mut T) -> *mut U {
     core::ptr::null_mut()

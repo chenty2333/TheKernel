@@ -20,7 +20,20 @@
     clippy::absurd_extreme_comparisons,
     clippy::swap_ptr_to_ref,
     clippy::erasing_op,
-    clippy::empty_line_after_doc_comments
+    clippy::empty_line_after_doc_comments,
+    // Translated C keeps upstream identifiers, casts, branch shapes and
+    // initialize-then-overwrite locals; extern blocks pass C-layout records.
+    clippy::missing_safety_doc,
+    improper_ctypes,
+    clippy::tabs_in_doc_comments,
+    unused_unsafe,
+    non_snake_case,
+    non_camel_case_types,
+    clippy::unnecessary_cast,
+    clippy::collapsible_if,
+    unused_assignments,
+    clippy::needless_borrow,
+    clippy::manual_is_multiple_of
 )]
 extern crate alloc;
 #[cfg(test)]
