@@ -25,7 +25,10 @@ pub use self::shared::{ExternalPageLease, SharedAtomicU32, SharedPages, shmem_re
 #[cfg(feature = "perf-sampling")]
 pub use self::shared::{SharedAtomicU64, SharedFixedView};
 pub(crate) use self::{
-    cow::{PreparedCowHugeFrame, PreparedCowPage, register_demoted_huge_backing},
+    cow::{
+        PreparedCowHugeFrame, PreparedCowPage, cow_frame_owner_count,
+        register_demoted_huge_backing,
+    },
     file::{FixedWritableMappingAdmission, WritableMappingAdmission},
     phys_pin::{
         PhysicalFramePins, PreparedPhysicalFramePins, any_frame_pinned,
@@ -373,6 +376,7 @@ pub trait BackendOps {
         _flags: MappingFlags,
         _access_flags: MappingFlags,
         _pt: &mut PageTableCursor,
+        _aspace_id: tk_linux_mm::AddressSpaceId,
     ) -> PopulateOutcome {
         PopulateOutcome::immediate(Ok(0))
     }

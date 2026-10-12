@@ -2,7 +2,7 @@
 
 use alloc::{sync::Arc, vec::Vec};
 use core::{
-    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     task::Context,
     time::Duration,
 };
@@ -34,6 +34,14 @@ pub struct Fence {
     // Flattened leaf snapshots only: no recursive chain, producer mutation or
     // reference cycle. Empty for device-owned completion fences.
     dependencies: Vec<Arc<Fence>>,
+    // Present for a dma-fence-chain node (a timeline point). Its `dependencies`
+    // are the pending leaves of the whole chain, as dma_fence_chain_signaled()
+    // observes them, and its error state is never propagated.
+    chain: Option<ChainLink>,
+    // Set once a composite has subscribed to its leaves' callbacks.
+    subscribed: AtomicBool,
+    // dma_fence_add_callback() equivalents, run once, outside every lock.
+    callbacks: spin::Mutex<Vec<(u64, FenceCallback)>>,
     state: axgpu::Fence,
     // 0 pending, 1 success, 2 error.  A single CAS-owned terminal state
     // makes success/error races deterministic and wakes observers once.
@@ -41,6 +49,38 @@ pub struct Fence {
     deadline: spin::Mutex<Option<axhal::time::TimeValue>>,
     waiters: WaitQueue,
     poll_waiters: PollSet,
+}
+
+/// A one-shot completion callback, run after the fence reaches a terminal state.
+pub(crate) type FenceCallback = alloc::boxed::Box<dyn FnOnce() + Send>;
+static CALLBACK_IDS: AtomicU64 = AtomicU64::new(1);
+
+/// The dma_fence_chain fields of one timeline point. `prev` is replaced only
+/// by the chain walk that garbage-collects signaled predecessors.
+pub(crate) struct ChainLink {
+    pub(crate) context: u64,
+    pub(crate) seqno: u64,
+    pub(crate) prev_seqno: u64,
+    prev: spin::Mutex<Option<Arc<Fence>>>,
+    contained: Arc<Fence>,
+}
+
+impl ChainLink {
+    pub(crate) fn prev(&self) -> Option<Arc<Fence>> {
+        self.prev.lock().clone()
+    }
+    /// cmpxchg(&chain->prev, prev, replacement): install only if `prev` is
+    /// still the current predecessor.
+    pub(crate) fn replace_prev_if(&self, prev: &Arc<Fence>, replacement: Option<Arc<Fence>>) {
+        let mut current = self.prev.lock();
+        if current.as_ref().is_some_and(|c| Arc::ptr_eq(c, prev)) {
+            *current = replacement;
+        }
+    }
+    /// dma_fence_chain_contained(): the device or software fence of this point.
+    pub(crate) fn contained(&self) -> &Arc<Fence> {
+        &self.contained
+    }
 }
 
 /// Per-GEM reservation state.  Submissions replace the exclusive completion
@@ -65,7 +105,6 @@ impl Reservation {
     /// can observe neither an unqueued scanout nor a queued scanout without
     /// its completion dependency.
     pub fn replace(&self, fence: Arc<Fence>) -> AxResult<Option<Arc<Fence>>> {
-        #[cfg(feature = "intel-upstream-gt")]
         let upstream = crate::drm::intel::upstream_sync::prepare_native_reservation_update(
             &[self],
             fence.clone(),
@@ -74,7 +113,6 @@ impl Reservation {
         let changed = previous
             .as_ref()
             .is_none_or(|previous| !Arc::ptr_eq(previous, &fence));
-        #[cfg(feature = "intel-upstream-gt")]
         if changed {
             if let Some(upstream) = upstream {
                 upstream.publish();
@@ -99,7 +137,6 @@ impl Reservation {
             {
                 return Ok(());
             }
-            #[cfg(feature = "intel-upstream-gt")]
             let upstream = crate::drm::intel::upstream_sync::prepare_native_reservation_update(
                 &[self],
                 fence.clone(),
@@ -112,13 +149,11 @@ impl Reservation {
             };
             if !unchanged {
                 drop(exclusive);
-                #[cfg(feature = "intel-upstream-gt")]
                 drop(upstream);
                 continue;
             }
             *exclusive = Some(replacement);
             drop(exclusive);
-            #[cfg(feature = "intel-upstream-gt")]
             if let Some(upstream) = upstream {
                 upstream.publish();
             }
@@ -203,7 +238,6 @@ impl Reservation {
             .try_reserve_exact(reservations.len())
             .map_err(|_| AxError::NoMemory)?;
 
-        #[cfg(feature = "intel-upstream-gt")]
         let upstream = crate::drm::intel::upstream_sync::prepare_native_reservation_update(
             reservations,
             fence.clone(),
@@ -218,7 +252,6 @@ impl Reservation {
             }
         }
         drop(guards);
-        #[cfg(feature = "intel-upstream-gt")]
         if let Some(upstream) = upstream {
             upstream.publish();
         }
@@ -271,9 +304,7 @@ impl Reservation {
             .try_reserve_exact(reservations.len())
             .map_err(|_| AxError::NoMemory)?;
 
-        #[cfg(feature = "intel-upstream-gt")]
         let mut reservation_refs = Vec::new();
-        #[cfg(feature = "intel-upstream-gt")]
         {
             reservation_refs
                 .try_reserve_exact(reservations.len())
@@ -301,7 +332,6 @@ impl Reservation {
                 replacements.push(replacement);
             }
 
-            #[cfg(feature = "intel-upstream-gt")]
             let upstream = crate::drm::intel::upstream_sync::prepare_native_reservation_update(
                 &reservation_refs,
                 fence.clone(),
@@ -320,7 +350,6 @@ impl Reservation {
             });
             if !unchanged {
                 guards.clear();
-                #[cfg(feature = "intel-upstream-gt")]
                 drop(upstream);
                 continue;
             }
@@ -334,7 +363,6 @@ impl Reservation {
             }
             let predecessors = core::mem::take(&mut predecessors);
             drop(guards);
-            #[cfg(feature = "intel-upstream-gt")]
             if let Some(upstream) = upstream {
                 upstream.publish();
             }
@@ -352,6 +380,9 @@ impl Fence {
         }
         Arc::new(Self {
             dependencies: Vec::new(),
+            chain: None,
+            subscribed: AtomicBool::new(false),
+            callbacks: spin::Mutex::new(Vec::new()),
             state: axgpu::Fence::new(signaled),
             terminal: AtomicU8::new(if signaled { 1 } else { 0 }),
             deadline: spin::Mutex::new(None),
@@ -398,6 +429,9 @@ impl Fence {
         // exactly as dropping a never-submitted ordinary fence does.
         Arc::try_new(Self {
             dependencies,
+            chain: None,
+            subscribed: AtomicBool::new(false),
+            callbacks: spin::Mutex::new(Vec::new()),
             state: axgpu::Fence::new(false),
             terminal: AtomicU8::new(0),
             deadline: spin::Mutex::new(None),
@@ -406,11 +440,128 @@ impl Fence {
         })
         .map_err(|_| AxError::NoMemory)
     }
+
+    /// Collect the not-yet-signaled leaves of `fence` into `out`, the set a
+    /// chain or composite must still wait for. Error state is not inspected.
+    pub(crate) fn collect_pending(
+        fence: &Arc<Self>,
+        out: &mut Vec<Arc<Self>>,
+    ) -> AxResult<()> {
+        if fence.is_signaled() {
+            return Ok(());
+        }
+        let leaves = if fence.dependencies.is_empty() {
+            core::slice::from_ref(fence)
+        } else {
+            &fence.dependencies
+        };
+        out.try_reserve(leaves.len()).map_err(|_| AxError::NoMemory)?;
+        for leaf in leaves {
+            if !leaf.is_signaled() && !out.iter().any(|old| Arc::ptr_eq(old, leaf)) {
+                out.push(leaf.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Build one dma-fence-chain node for timeline `seqno` whose predecessor is
+    /// `prev`. Its pending leaves are the predecessor's plus `contained`'s.
+    pub(crate) fn chain_node(
+        prev: Option<Arc<Self>>,
+        contained: Arc<Self>,
+        context: u64,
+        seqno: u64,
+        prev_seqno: u64,
+    ) -> AxResult<Arc<Self>> {
+        let mut pending = Vec::new();
+        if let Some(prev) = &prev {
+            Self::collect_pending(prev, &mut pending)?;
+        }
+        Self::collect_pending(&contained, &mut pending)?;
+        let signaled = pending.is_empty();
+        if !signaled {
+            PENDING_FENCES.fetch_add(1, Ordering::Relaxed);
+        }
+        let link = ChainLink {
+            context,
+            seqno,
+            prev_seqno,
+            prev: spin::Mutex::new(prev),
+            contained,
+        };
+        Arc::try_new(Self {
+            dependencies: pending,
+            chain: Some(link),
+            subscribed: AtomicBool::new(false),
+            callbacks: spin::Mutex::new(Vec::new()),
+            state: axgpu::Fence::new(signaled),
+            terminal: AtomicU8::new(u8::from(signaled)),
+            deadline: spin::Mutex::new(None),
+            waiters: WaitQueue::new(),
+            poll_waiters: PollSet::new(),
+        })
+        .map_err(|_| {
+            if !signaled {
+                PENDING_FENCES.fetch_sub(1, Ordering::Relaxed);
+            }
+            AxError::NoMemory
+        })
+    }
+
+    /// The dma-fence-chain fields, or None for an ordinary fence.
+    pub(crate) fn chain(&self) -> Option<&ChainLink> {
+        self.chain.as_ref()
+    }
+
+    /// dma_fence_add_callback(): `None` means the fence is already signaled
+    /// and the callback was not registered (Linux -ENOENT).
+    pub(crate) fn add_callback(self: &Arc<Self>, callback: FenceCallback) -> Option<u64> {
+        if self.is_signaled() {
+            return None;
+        }
+        let id = CALLBACK_IDS.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut callbacks = self.callbacks.lock();
+            // signal() publishes the terminal state before draining under this
+            // same lock, so a callback is either refused here or drained there.
+            if self.terminal.load(Ordering::Acquire) != 0 {
+                return None;
+            }
+            callbacks.push((id, callback));
+        }
+        if !self.dependencies.is_empty() && !self.subscribed.swap(true, Ordering::AcqRel) {
+            for leaf in &self.dependencies {
+                let weak = Arc::downgrade(self);
+                let _ = leaf.add_callback(alloc::boxed::Box::new(move || {
+                    if let Some(composite) = weak.upgrade() {
+                        composite.refresh_dependencies();
+                    }
+                }));
+            }
+            self.refresh_dependencies();
+        }
+        Some(id)
+    }
+
+    /// dma_fence_remove_callback(): drop a registration that has not run.
+    pub(crate) fn remove_callback(&self, id: u64) {
+        self.callbacks.lock().retain(|(old, _)| *old != id);
+    }
+
+    fn run_callbacks(&self) {
+        let callbacks = core::mem::take(&mut *self.callbacks.lock());
+        for (_, callback) in callbacks {
+            callback();
+        }
+    }
     fn refresh_dependencies(&self) {
         if self.terminal.load(Ordering::Acquire) != 0 || self.dependencies.is_empty() {
             return;
         }
         if self.dependencies.iter().all(|leaf| leaf.is_signaled()) {
+            // Deliberate deviation from Linux dma_fence_chain: a failed contained
+            // submission must stay visible on the timeline point, since exec
+            // outputs and sync_file consumers rely on it. Waits still complete.
             if self.dependencies.iter().any(|leaf| leaf.is_failed()) {
                 self.signal_error();
             } else {
@@ -437,6 +588,7 @@ impl Fence {
             self.waiters.notify_all(false);
             FENCE_SET_WAITERS.notify_all(false);
             self.poll_waiters.wake();
+            self.run_callbacks();
         }
     }
     /// Terminally fail a fence. Failure is also a wakeup, but waiters and
@@ -453,6 +605,7 @@ impl Fence {
             self.waiters.notify_all(false);
             FENCE_SET_WAITERS.notify_all(false);
             self.poll_waiters.wake();
+            self.run_callbacks();
         }
     }
     /// A DRM deadline is a scheduling hint, not a second completion state.

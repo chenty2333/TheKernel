@@ -4,6 +4,9 @@
 //! this provider owns only the distinct namespace, capacity reservation and
 //! superblock identity.  It never aliases a hugetlbfs mount to tmpfs.
 
+use alloc::{format, string::String};
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{Filesystem, Location, NodePermission};
 use axhal::paging::PageSize;
@@ -18,6 +21,64 @@ use crate::{
 pub const HUGETLB_PAGE_SIZE: u64 = 2 * 1024 * 1024;
 pub const HUGETLB_1G_PAGE_SIZE: u64 = 1024 * 1024 * 1024;
 const DEFAULT_HUGETLB_PAGES: u64 = 8;
+
+/// Linux `struct hstate` pool counters for one hugetlb page size.
+///
+/// Linux `mm/hugetlb.c:hugetlb_report_meminfo()` and
+/// `mm/hugetlb_sysfs.c:hstate_attrs[]` read these fields.  TheKernel has no
+/// boot-time pool: hugetlbfs mounts draw physical folios from their own
+/// capacity rather than from `nr_hugepages`, so `nr_hugepages` stays at zero
+/// (the state of a Linux system whose pool allocation failed) and the
+/// counters report that empty pool.
+pub(crate) struct Hstate {
+    pub(crate) size_bytes: u64,
+    /// Directory name under `/sys/kernel/mm/hugepages/`.
+    pub(crate) name: &'static str,
+    pub(crate) nr_hugepages: AtomicU64,
+    pub(crate) nr_overcommit_hugepages: AtomicU64,
+    pub(crate) free_hugepages: AtomicU64,
+    pub(crate) resv_hugepages: AtomicU64,
+    pub(crate) surplus_hugepages: AtomicU64,
+}
+
+impl Hstate {
+    const fn new(size_bytes: u64, name: &'static str) -> Self {
+        Self {
+            size_bytes,
+            name,
+            nr_hugepages: AtomicU64::new(0),
+            nr_overcommit_hugepages: AtomicU64::new(0),
+            free_hugepages: AtomicU64::new(0),
+            resv_hugepages: AtomicU64::new(0),
+            surplus_hugepages: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Linux `hstates[]`; index 0 is `default_hstate` (2 MiB on x86_64).
+pub(crate) static HSTATES: [Hstate; 2] = [
+    Hstate::new(HUGETLB_PAGE_SIZE, "hugepages-2048kB"),
+    Hstate::new(HUGETLB_1G_PAGE_SIZE, "hugepages-1048576kB"),
+];
+
+/// Linux `hugetlb_report_meminfo()`: the `HugePages_*`, `Hugepagesize` and
+/// `Hugetlb` lines of `/proc/meminfo`, with the same field widths.
+pub(crate) fn hugetlb_meminfo_lines() -> String {
+    let default = &HSTATES[0];
+    let total: u64 = HSTATES
+        .iter()
+        .map(|h| h.size_bytes / 1024 * h.nr_hugepages.load(Ordering::Relaxed))
+        .sum();
+    format!(
+        "HugePages_Total:   {:>5}\nHugePages_Free:    {:>5}\nHugePages_Rsvd:    {:>5}\nHugePages_Surp:    {:>5}\nHugepagesize:   {:>8} kB\nHugetlb:        {:>8} kB\n",
+        default.nr_hugepages.load(Ordering::Relaxed),
+        default.free_hugepages.load(Ordering::Relaxed),
+        default.resv_hugepages.load(Ordering::Relaxed),
+        default.surplus_hugepages.load(Ordering::Relaxed),
+        default.size_bytes / 1024,
+        total,
+    )
+}
 
 #[derive(Clone, Copy)]
 struct MountOptions {

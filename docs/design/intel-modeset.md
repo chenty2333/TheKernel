@@ -1,5 +1,13 @@
 # The Intel modeset — phases 3 to 6, and what "prove it" means here
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 **Target hardware:** Intel Core i3-N305 (Alder Lake-N), display device `8086:46d0`, one monitor on
 HDMI, no serial port — the screen is the only output device.
 **Scope:** reference `docs/design/intel-display-registers.md` §11 phases 3 to 6: choose a mode,

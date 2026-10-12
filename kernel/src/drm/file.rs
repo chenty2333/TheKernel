@@ -48,7 +48,6 @@ pub enum DrmEvent {
 }
 
 pub struct DrmFile {
-    pub(crate) intel_contexts: super::intel::gem_context::Contexts,
     pinned_memory: Arc<AtomicUsize>,
     device: Arc<DrmDevice>,
     id: OpenId,
@@ -59,7 +58,6 @@ pub struct DrmFile {
     seat_revoked: Arc<AtomicBool>,
     seat_owned_primary: bool,
     open_flags: AtomicU32,
-    #[cfg(feature = "intel-upstream-gt")]
     upstream_i915_file: axsync::Mutex<Option<super::intel::upstream_file::UpstreamFile>>,
 }
 
@@ -68,7 +66,6 @@ struct FileState {
     handles: BTreeMap<GemHandle, Arc<GemObject>>,
     intel_mmaps: BTreeMap<MmapOffset, (Weak<GemObject>, u8)>,
     cursor_framebuffers: BTreeMap<GemHandle, FramebufferId>,
-    next_syncobj: super::syncobj::SyncobjHandle,
     syncobjs: BTreeMap<super::syncobj::SyncobjHandle, Arc<super::syncobj::Syncobj>>,
     atomic_enabled: bool,
     render_context: Option<u32>,
@@ -222,7 +219,6 @@ impl DrmFile {
         seat_owned_primary: bool,
     ) -> Self {
         Self {
-            intel_contexts: super::intel::gem_context::Contexts::new(),
             pinned_memory: Arc::new(AtomicUsize::new(0)),
             device,
             id,
@@ -231,7 +227,6 @@ impl DrmFile {
                 handles: BTreeMap::new(),
                 intel_mmaps: BTreeMap::new(),
                 cursor_framebuffers: BTreeMap::new(),
-                next_syncobj: 1,
                 syncobjs: BTreeMap::new(),
                 atomic_enabled: false,
                 render_context: None,
@@ -244,7 +239,6 @@ impl DrmFile {
             seat_revoked: Arc::new(AtomicBool::new(false)),
             seat_owned_primary,
             open_flags: AtomicU32::new(0),
-            #[cfg(feature = "intel-upstream-gt")]
             upstream_i915_file: axsync::Mutex::new(None),
         }
     }
@@ -573,7 +567,6 @@ impl DrmFile {
         arg: usize,
     ) -> AxResult<usize> {
         self.require_live_seat_lease().map_err(AxError::from)?;
-        #[cfg(feature = "intel-upstream-gt")]
         if self.has_intel_gt()
             && let Some(result) = self.upstream_i915_ioctl(context, cmd, arg)
         {
@@ -725,7 +718,6 @@ impl DrmFile {
     /// Install the kernel DRM view of an upstream i915 GEM handle. The same
     /// numeric handle is then inserted into upstream drm_file.object_idr by
     /// the DRM-core provider; KMS, PRIME and mmap all resolve this one entry.
-    #[cfg(feature = "intel-upstream-gt")]
     pub(crate) fn create_upstream_gem_handle(
         &self,
         object: *mut core::ffi::c_void,
@@ -756,7 +748,6 @@ impl DrmFile {
         Ok(handle)
     }
 
-    #[cfg(feature = "intel-upstream-gt")]
     pub(crate) fn bind_upstream_mmap(
         &self,
         handle: GemHandle,
@@ -785,7 +776,6 @@ impl DrmFile {
         Ok(())
     }
 
-    #[cfg(feature = "intel-upstream-gt")]
     pub(crate) fn bind_imported_upstream_handle(
         &self,
         object: Arc<GemObject>,
@@ -835,7 +825,6 @@ impl DrmFile {
         Ok(handle)
     }
 
-    #[cfg(feature = "intel-upstream-gt")]
     pub(crate) fn upstream_i915_ioctl(
         &self,
         context: &crate::file::IoctlContext,
@@ -856,7 +845,6 @@ impl DrmFile {
         })())
     }
 
-    #[cfg(feature = "intel-upstream-gt")]
     pub(crate) fn close_upstream_gem_handle(&self, handle: GemHandle) -> DrmResult<bool> {
         let mut file = self.upstream_i915_file.lock();
         let Some(file) = file.as_mut() else {
@@ -1015,25 +1003,33 @@ impl DrmFile {
         Ok(handle)
     }
 
+    /// `xa_alloc()` with XA_FLAGS_ALLOC1: the lowest unused handle, from 1.
+    fn next_syncobj_handle(
+        syncobjs: &BTreeMap<super::syncobj::SyncobjHandle, Arc<super::syncobj::Syncobj>>,
+    ) -> DrmResult<super::syncobj::SyncobjHandle> {
+        let mut handle: super::syncobj::SyncobjHandle = 1;
+        for &used in syncobjs.keys() {
+            if used != handle {
+                break;
+            }
+            handle = handle.checked_add(1).ok_or(DrmError::Overflow)?;
+        }
+        Ok(handle)
+    }
+
     pub(crate) fn create_syncobj(
         &self,
         signaled: bool,
     ) -> DrmResult<super::syncobj::SyncobjHandle> {
-        let mut state = self.state.lock();
-        let handle = state.next_syncobj;
-        state.next_syncobj = handle.checked_add(1).ok_or(DrmError::Overflow)?;
-        state
-            .syncobjs
-            .insert(handle, super::syncobj::Syncobj::new(signaled));
-        Ok(handle)
+        let object = super::syncobj::Syncobj::create(signaled, None).map_err(|_| DrmError::NoMemory)?;
+        self.import_syncobj(object)
     }
     pub(crate) fn import_syncobj(
         &self,
         object: Arc<super::syncobj::Syncobj>,
     ) -> DrmResult<super::syncobj::SyncobjHandle> {
         let mut state = self.state.lock();
-        let handle = state.next_syncobj;
-        state.next_syncobj = handle.checked_add(1).ok_or(DrmError::Overflow)?;
+        let handle = Self::next_syncobj_handle(&state.syncobjs)?;
         state.syncobjs.insert(handle, object);
         Ok(handle)
     }
@@ -1553,7 +1549,6 @@ impl Drop for DrmFile {
         if restore_console {
             crate::pseudofs::dev::restore_console_after_master_close();
         }
-        #[cfg(feature = "intel-upstream-gt")]
         {
             // Close mirrored i915 IDR handles before accounting the remaining
             // native handles; this retires both views exactly once.
@@ -1726,7 +1721,6 @@ mod tests {
     fn device() -> Arc<DrmDevice> {
         DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4)
     }
-    #[cfg(feature = "intel-upstream-gt")]
     #[test]
     fn upstream_zero_offset_is_not_a_dumb_token_and_cache_aliases_coexist() {
         struct UpstreamBacking;

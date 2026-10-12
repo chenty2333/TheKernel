@@ -1,5 +1,13 @@
 # GMBUS, DDC/EDID transport and hotplug detect
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 Status: implemented on `dev` (commits `3bcb93ed`, `155771f8`, `eb1031a6`, the
 last of which added the sink step and the boot wiring).  This document describes
 what the GMBUS transport, the hotplug block and the sink step do, what is

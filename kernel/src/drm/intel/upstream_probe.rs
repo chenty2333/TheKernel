@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See the repository MIT license.
-//! Boot entry for the translated i915 driver (`intel-upstream-gt`).
+//! Boot entry for the translated i915 driver.
 //!
-//! With the feature built, the translated `i915_pci_probe()` is the single GT
-//! owner: `gt::init_at_boot()` calls [`probe`] instead of the hand-written
-//! N305 BCS/GuC owner, so the two never touch the same hardware.
+//! The translated `i915_pci_probe()` is the only GT owner: `gt::init_at_boot()`
+//! defers [`probe`] to the rootfs-ready callback.
 
 use alloc::{format, string::String};
 use core::ffi::c_void;
@@ -35,7 +34,7 @@ const IORESOURCE_MEM: core::ffi::c_ulong = 0x0000_0200;
 
 /// x86 `intel_graphics_stolen_res`: Linux fills it from the BDSM/GMS early
 /// quirk before any driver runs; here the probe fills it from the same two
-/// registers (see `fastboot::stolen_range`) before `i915_pci_probe()`. An
+/// registers (see `initial_plane::stolen_range`) before `i915_pci_probe()`. An
 /// empty resource (start 0, end 0) is what Linux leaves when no stolen memory
 /// was found, and i915 then runs without stolen memory.
 #[unsafe(no_mangle)]
@@ -94,14 +93,12 @@ pub(super) fn probe(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, Str
     // SAFETY: boot-time single-threaded writes to the x86 data symbols before any reader (the probe) runs.
     unsafe {
         tsc_khz = u32::try_from(axhal::time::nanos_to_ticks(1_000_000)).unwrap_or(u32::MAX);
-        if let Ok(range) = super::fastboot::stolen_range(&ecam, &window, bdf) {
+        if let Some(range) = super::initial_plane::stolen_range(&ecam, &window, bdf) {
             intel_graphics_stolen_res.start = range.start;
             intel_graphics_stolen_res.end = range.end - 1;
         }
     }
-    // The power-domain callbacks need the display window before the probe
-    // reaches intel_gt_init() and its first GT unpark.
-    upstream_gt::register_display_window(window);
+    upstream_gt::register_gpu_window(window);
     let pdev = upstream_gt::native_pci_device(bdf);
     super::upstream_memory::prepare(bdf, &window, pdev)?;
     super::irq::upstream::install(bdf).map_err(|e| format!("upstream i915: {e}"))?;

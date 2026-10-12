@@ -1,175 +1,73 @@
-//! The Intel display driver's foundation: find the device, identify it, read
-//! its registers, and say what happened.
+// SPDX-License-Identifier: MIT
+// Copyright 2026 TheKernel contributors. See the repository MIT license.
+//! The Intel GPU, as the kernel sees it.
 //!
-//! This is the first Intel-specific code in the kernel.  It exists to answer
-//! one question honestly -- *is this kernel talking to a real Intel GPU?* --
-//! before anything is built on top of the answer.  It does that without
-//! programming the device on the default path: it reads PCI configuration space, matches
-//! what it finds against a table of known parts, maps the register aperture
-//! read-only in effect, and reads the handful of registers that are safe to
-//! read on a part whose display engine the firmware is still driving.
-//!
-//! ## Layout
+//! The i915 port (`tk-intel-gt`, reached through the `upstream_*` modules) is
+//! the only owner of the GPU. This module holds what is needed to find the
+//! device, read its identity, and hand it to i915:
 //!
 //! | module | what it owns |
 //! |---|---|
 //! | [`pci`] | BDF arithmetic, ECAM configuration-space reads, header and BAR decoding |
-//! | [`id`] | the device table: device ids, generations, display versions, steppings, quirks, apertures |
-//! | [`regs`] | the register table, the mapped window, typed 32-bit access and its ordering |
-//! | [`pipe`] | reference section 11 phases 3.4 and 4: the timing registers, the DDB, the watermarks, the primary plane, and the pipe-side read-backs of phase 6 |
-//! | [`probe`] | the walk, the identity decision, the register reads, and the report |
+//! | [`id`] | the device table: device ids, generations, steppings |
+//! | [`regs`] | the register window and typed 32-bit access |
+//! | [`probe`] | the boot-time PCI walk, the identity decision, and the report |
+//! | [`gt_probe`] | the read-only GT forcewake/ack observation written into the report |
 //! | [`debugfs`] | the report, exposed as a file in the DRM debug filesystem |
+//! | [`initial_plane`] | the firmware framebuffer's plane and stolen pages, read before i915 takes the GGTT |
+//! | [`upstream_probe`] | the deferred i915 probe, run once the rootfs has the GuC/HuC firmware |
+//! | [`upstream_memory`] | the GGTT reservation of the firmware console and its DMA identity lease |
+//! | [`upstream_gt`], [`upstream_drm`], [`upstream_file`], [`upstream_sync`] | the kernel providers i915 calls into |
+//! | [`irq`] | MSI for the GPU and the GT interrupt forwarder |
+//! | [`power`] | the `POWER_DOMAIN_GT_IRQ` reference rule for a device without a display |
 //!
-//! The modeset is a second group: the memory it scans out of, the output it
-//! scans through, and the sequence that ties them together.  The design is
-//! `docs/design/intel-modeset.md`.
-//!
-//! | module | what it owns |
-//! |---|---|
-//! | [`gtt`] | the GGTT page table: the entry layout, a run of entries for a physical range, and the read-back that proves the run landed |
-//! | [`fb`] | a framebuffer the display engine can read: geometry, the allocation, and the failure path |
-//! | [`scanout`] | that framebuffer as the console's [`crate::pseudofs::dev::scanout::ScanoutSurface`], offered to [`crate::drm::screen`] |
-//! | [`output`] | reference section 11 phase 5: the port PLL, the DDI, the transcoder, and the read-backs that say the DDI is alive |
-//! | [`pattern`] | section 11 phase 6.5: the colour-bar test pattern written into a linear XRGB8888 framebuffer |
-//! | [`modeset`] | section 11 phases 3 to 6 in one sequence: the mode choice, the pipe, the output, and the proof that the result is scanning out |
-//!
-//! ## What it proves, and what it does not
-//!
-//! A successful probe proves that the platform's configuration space was read,
-//! that a device matching the table is present at a specific bus address, that
-//! its register aperture was mapped, and that the registers answered with
-//! values -- which is a different claim from "the values are correct", and a
-//! much weaker one than "the display engine works". On default boot no mode is set, no plane
-//! is enabled, no pixel is scanned out.  On a machine that has never run this
-//! code against a real Gen12 part, the register *values* in the report have
-//! never been observed: the decoding around them has been tested against
-//! synthetic configuration space, and that is the limit of what the tests say.
-//!
-//! Opt-in boot modesetting is now a separate guarded transaction: it captures
-//! the complete supported firmware footprint/GGTT, preserves calibration and
-//! CDCLK, restores failures in dependency order and verifies original scanout
-//! identity/progression. See `intel-firmware-rollback.md`. This native path and
-//! its hardware recovery remain 未在硬件上验证; unsupported topology is refused.
-//!
-//! ## Where the display driver plugs in
-//!
-//! Nothing here precludes a modeset driver, and two decisions are there to
-//! make one possible:
-//!
-//! * The identity layer is the only place that knows what a device *is*
-//!   ([`id::DisplayDevice`]), so a mode-setting driver asks it for the
-//!   apertures, the stepping and the quirks instead of switching on a device
-//!   id of its own.
-//! * The register window is mapped once, here, and stays mapped in the kernel
-//!   address space.  A driver that later owns the device reuses the same
-//!   window through the same [`regs::RegisterWindow`] type.
-//!
-//! The scanout side is deliberately untouched: `pseudofs::dev::scanout`
-//! defines the surface a framebuffer console consumes, and an Intel display
-//! driver would implement it once it can program a pipe.  This module supplies
-//! the device identity and register access that implementation will need, and
-//! nothing else.
-//!
-//! ## After the boot: the hotplug watch
-//!
-//! [`probe_at_boot`] and [`bring_up_at_boot`] each run once and report what
-//! they found.  A monitor plugged in afterwards is invisible to both, so this
-//! module also owns the one thing that looks again: a task that sleeps, reads
-//! the south display's live connect state, and re-runs the sink step for the
-//! device when that state changes.  It is described in
-//! `docs/design/intel-hotplug.md`; the short version is that the poll is two
-//! register reads that write nothing, and every expensive step happens in task
-//! context after the read.
+//! There is no KMS modesetting on Intel yet. The screen is the firmware (GOP)
+//! framebuffer console, registered by [`crate::drm::linear`]. i915 runs with
+//! `HAS_DISPLAY() == false` for everything display-related, as Linux does for a
+//! device without display pipes.
 
-pub(super) mod atomic_modeset_wiring;
-mod audio;
-mod clk;
-mod combo_phy_full;
-mod connect;
-mod cursor;
-mod ddi;
-mod de_io;
 pub(crate) mod debugfs;
 mod dma;
-mod dmc;
-mod dp_aux;
-mod fastboot;
-pub(crate) mod fb;
-mod firmware_scanout;
-mod firmware_snapshot;
-pub(super) mod gem_context;
-pub(super) mod gem_exec;
-mod gmbus;
-mod gmbus_full;
 mod gt;
 mod gt_probe;
-pub(crate) mod gtt;
-mod hpd;
-mod i915_port;
 mod id;
+mod initial_plane;
+#[cfg(target_os = "none")]
 mod irq;
-mod modeset;
-mod native_kms_projection;
-mod native_modeset_ops;
-mod native_pipe;
-mod native_scaler;
-mod output;
-mod pattern;
 mod pci;
-mod pcode;
-mod phy;
-mod pipe;
-mod pll;
 mod power;
 mod probe;
 mod regs;
-mod rollback;
-pub(crate) mod scanout;
-mod shared_dpll;
-mod sink;
-mod swing;
-mod tc_modeset;
-mod timing;
-#[cfg(feature = "intel-upstream-gt")]
-mod upstream_drm;
-#[cfg(feature = "intel-upstream-gt")]
 pub(crate) mod upstream_file;
-#[cfg(feature = "intel-upstream-gt")]
 pub(crate) mod upstream_sync;
-#[cfg(feature = "intel-upstream-gt")]
+mod upstream_drm;
 mod upstream_gt;
-#[cfg(all(feature = "intel-upstream-gt", target_os = "none"))]
+#[cfg(target_os = "none")]
 mod upstream_probe;
-#[cfg(feature = "intel-upstream-gt")]
 mod upstream_memory;
 
 #[cfg(test)]
 mod testbus;
+mod upstream_mm;
 
-#[cfg(target_os = "none")]
-use alloc::sync::Arc;
 use alloc::{string::String, vec::Vec};
 
 use spin::Mutex;
 
-/// The machine's own clock, which only the watch needs: the poll decides what
-/// to do, and the machine's clock is what the log line is stamped with.
-#[cfg(target_os = "none")]
-use self::gmbus::MonotonicTimer;
 use self::{
-    gmbus::PollTimer,
-    pci::Bdf,
     probe::{BusFacts, ProbeReport, WindowStatus},
-    regs::{RegisterWindow, Registers},
+    regs::{RegisterWindow},
 };
-/// The aperture type and the window length are named only by the bare-metal
-/// half: [`mapped_facts`] answers with the one and [`open_register_window`]
-/// maps the other, and no host-test caller names either.  They are gated here
-/// rather than in the group below so that the group stays a list of what both
-/// builds have in common.
 #[cfg(target_os = "none")]
-use self::{id::Aperture, regs::PROBE_WINDOW};
-use crate::drm::modes::Narration;
+use self::regs::PROBE_WINDOW;
+#[cfg(target_os = "none")]
+use self::id::Aperture;
+
+/// Why the Intel path refused a step. The reason is logged where it happens.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Error {
+    Refused,
+}
 
 /// The report of the one probe this kernel runs, kept for the debug file.
 ///
@@ -179,97 +77,8 @@ use crate::drm::modes::Narration;
 /// traffic.
 static REPORT: Mutex<Option<ProbeReport>> = Mutex::new(None);
 
-/// What the power step of the bring-up order found, kept for the debug file.
-///
-/// `None` means either that the step did not run -- there was no identified
-/// device, or its register window could not be mapped -- or that it ran and
-/// failed, in which case [`POWER_FAILURE`] holds the reason.  The two are kept
-/// apart on purpose: "the display was never powered" and "the display could not
-/// be powered" are different facts and the log says which one happened.
-static POWER: Mutex<Option<power::PowerState>> = Mutex::new(None);
-
-/// Why the power step did not produce a state, when it was attempted and
-/// failed.  Reference §11 phase 1: everything after this point is behind the
-/// power wells, so a failure here is reported once, in full, rather than
-/// re-derived by every later step that then fails for an unrelated-looking
-/// reason.
-static POWER_FAILURE: Mutex<Option<String>> = Mutex::new(None);
-
-/// What the connector step of the bring-up order found, kept for the debug
-/// file.
-///
-/// This is the connector the modeset will take: the pin a monitor answered on,
-/// the DDI it carries, the validated EDID, the mode layer's plan and the live
-/// hotplug state, plus what phase 2.1 found for the AUX/DDC power wells.  It is
-/// the composition of reference §11 phases 2.1, 2.2 and 2.3, and it is kept for
-/// the same reason the probe's report is: on a machine whose only console is
-/// the screen, an EDID -- and the well that explains a bus which would not
-/// produce one -- is worth being able to read twice.
-static CONNECT: Mutex<Option<connect::ConnectReport>> = Mutex::new(None);
-
-/// How often the after-boot hotplug watch reads the live connect state.
-///
-/// This number *is* the detection latency: a sleeping task notices a monitor
-/// at the first poll after the electrical event, so the delay is between zero
-/// and one interval (plus whatever scheduling delay the task sees -- nothing
-/// here is a real-time guarantee).  Two hundred and fifty milliseconds is four
-/// uncached reads a second of two always-on registers, against a delay nobody
-/// watching a screen would notice.
-///
-/// The alternative considered and not built is a 100 Hz timer callback that
-/// reads `SDEISR` in interrupt context and publishes an edge for a task to act
-/// on.  It buys ten-millisecond resolution at a hundred times the register
-/// traffic, and it adds state two contexts have to agree about, for a
-/// difference no person can see.  The reasoning is written down in
-/// `docs/design/intel-hotplug.md` rather than left in this comment alone,
-/// because "why is it a task and not an interrupt" is the first question a
-/// reader asks.
-const HOTPLUG_POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(250);
-
-/// The most transitions the after-boot watch keeps for the debug file.
-///
-/// A connector whose cable makes intermittent contact can produce a transition
-/// on every poll, so an unbounded list would be a way for a loose plug to
-/// exhaust kernel memory.  The most recent [`HOTPLUG_EVENT_LIMIT`] transitions
-/// are kept and the rest are counted, so the file shows both the tail of the
-/// flap and the fact that there was more of it.  This is a bound on what is
-/// *remembered*, not storm mitigation: the work each transition calls for
-/// still happens, because the first thing a flapping connector needs is a log
-/// of the flap (see the design note).
-const HOTPLUG_EVENT_LIMIT: usize = 32;
-
-/// What the after-boot hotplug watch has seen since bring-up, kept for the
-/// debug file.
-///
-/// `None` means the watch never started, which is a different fact from "the
-/// watch is running and has seen nothing"; the two are reported in different
-/// words, because on a machine with no mapped register window the second would
-/// be a claim this kernel cannot make.
-static HOTPLUG: Mutex<Option<HotplugWatch>> = Mutex::new(None);
-
-/// What the modeset observed, as the text a reader works from afterwards.
-///
-/// Kept beside the probe's report for the reason the probe's is kept: phase 6's
-/// readings are the only evidence that the display engine is scanning this
-/// kernel's framebuffer out, and on a machine whose console is the screen a
-/// boot log scrolls away.  A run that did not happen, and a run that failed,
-/// both leave their reason here rather than leaving the file silent about it.
-static MODESET: Mutex<Option<String>> = Mutex::new(None);
-/// Serializes the shared ADL-P HIP selector across firmware readout, PLL
-/// programming and the optional display-audio register handoff.
-pub(super) static DKL_ACCESS_LOCK: Mutex<()> = Mutex::new(());
+/// What each GPU's GT bring-up said, kept for the debug file.
 static GT_REPORT: Mutex<Vec<(pci::Bdf, String)>> = Mutex::new(Vec::new());
-static FIRMWARE_STATE: Mutex<Vec<(pci::Bdf, firmware_snapshot::Snapshot)>> = Mutex::new(Vec::new());
-
-/// What the graphics address space turned out to be, as text.
-///
-/// The aperture is read from the device (`ApertureSize`), not inferred from the
-/// BAR split, and the number decides how much address space may be handed out
-/// at all -- so it belongs next to the modeset in the file a person reads back,
-/// not only in a boot log that has scrolled away.
-static GTT: Mutex<Option<String>> = Mutex::new(None);
-#[cfg(target_os = "none")]
-static ADDRESS_SPACE: Mutex<Option<(pci::Bdf, Arc<gtt::Gtt>)>> = Mutex::new(None);
 
 /// A value as grouped hexadecimal, the way a register dump is written down.
 ///
@@ -294,12 +103,9 @@ pub(crate) fn hex(value: u64, digits: usize) -> String {
 
 /// Run the Intel display probe once and print what it found.
 ///
-/// The console is the only output device on the target machine, so the report
-/// goes to the log as it is produced: a person who was not watching the boot
-/// can read the same text back from [`debugfs`] afterwards.
+/// The report goes to the log as it is produced, and [`debugfs`] serves the
+/// same text afterwards.
 ///
-/// The probe runs first and alone; the bring-up order's later steps are run
-/// from [`bring_up_at_boot`], which needs the window this produces.
 pub(crate) fn probe_at_boot() {
     let report = platform_probe();
     report.log();
@@ -313,375 +119,6 @@ pub(crate) fn probe_at_boot() {
         })
         .collect();
     *GT_REPORT.lock() = observations;
-}
-
-/// Run the rest of the bring-up order against the device the probe found.
-///
-/// This is reference §11 phases 1 and 2, in the order the reference gives them,
-/// and each step is attempted only on a device whose register window the probe
-/// mapped -- a device this kernel has a model for.  On a machine with no Intel
-/// display, or one whose window could not be mapped, nothing here runs and it
-/// says so rather than reporting a half-run sequence as a result.
-///
-/// The order is the point.  Power comes before the DDC pin pair because GMBUS
-/// is a channel behind the AUX/DDC power well and a well cannot be requested
-/// before `PW_1` is up; the well comes before the EDID read because a channel
-/// behind a shut gate NAKs every address, which is indistinguishable from an
-/// empty port; the sink comes before any mode because a timing computed from a
-/// guessed EDID is worse than no timing at all.  Each step logs as it goes, for
-/// the same reason the probe does.
-pub(crate) fn bring_up_at_boot() {
-    let windows = mapped_windows();
-    if windows.is_empty() {
-        axlog::info!("intel-gpu: no mapped display; no writes");
-        return;
-    }
-    if let Some((device, revision)) = identified_device_and_revision() {
-        dmc::request_for_device(device, revision);
-    }
-    // On by default; `intel.modeset=0` keeps the firmware console untouched.
-    if axhal::boot::command_line_value("intel.modeset") == Some("0") {
-        axlog::warn!("intel-gpu: native display writes disabled by intel.modeset=0");
-        *MODESET.lock() = Some(String::from(
-            "not attempted: intel.modeset=0; no display register writes\n",
-        ));
-        return;
-    }
-    #[cfg(target_os = "none")]
-    {
-        if windows.len() != 1 {
-            axlog::warn!("intel-gpu: multiple displays unsupported by boot rollback; no writes");
-            return;
-        }
-        let (bdf, window) = windows[0];
-        match bring_up_native(bdf, &window) {
-            Ok(text) => {
-                axlog::info!("{text}");
-                *MODESET.lock() = Some(text);
-            }
-            Err(text) => {
-                axlog::warn!("{text}");
-                *MODESET.lock() = Some(text);
-            }
-        }
-    }
-}
-
-/// One allocator for display and the separately opted-in GT, never two
-/// independently locked cursors over the same hardware PTE array.
-#[cfg(target_os = "none")]
-fn shared_ggtt(bdf: pci::Bdf) -> Result<Arc<gtt::Gtt>, String> {
-    let mut owner = ADDRESS_SPACE.lock();
-    if let Some((owned, gtt)) = &*owner {
-        return if *owned == bdf {
-            Ok(gtt.clone())
-        } else {
-            Err(String::from("different GGTT device; no writes"))
-        };
-    }
-    let (_, aperture, physical) = mapped_facts(bdf)
-        .ok_or_else(|| String::from("Intel mapped facts unavailable; no writes"))?;
-    let bar_len = aperture
-        .size
-        .ok_or_else(|| String::from("Intel GGTT aperture unknown; no writes"))?;
-    let ecam = pci::Ecam::platform()
-        .ok_or_else(|| String::from("PCI runtime mapping unavailable; no writes"))?;
-    let size = gtt::ApertureSize::read(&ecam, bdf);
-    if matches!(
-        size,
-        gtt::ApertureSize::NotObserved
-            | gtt::ApertureSize::Unreadable
-            | gtt::ApertureSize::Unmodelled { .. }
-    ) {
-        return Err(String::from("Intel GGTT size not measured; no writes"));
-    }
-    let gtt = Arc::try_new(gtt::Gtt::map(physical, bar_len, size).map_err(|e| e.describe())?)
-        .map_err(|_| String::from("GGTT owner allocation failed; no writes"))?;
-    *owner = Some((bdf, gtt.clone()));
-    Ok(gtt)
-}
-
-/// All allocation/capture precedes the first write. No after-boot programming
-/// bypasses this transaction; hotplug modesetting remains a separate follow-up.
-#[cfg(target_os = "none")]
-fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, String> {
-    let supported = REPORT.lock().as_ref().is_some_and(|report| {
-        report.displays.iter().any(|found| {
-            found.info.bdf == bdf
-                && i915_port::native_device_supported(
-                    found.info.vendor_id,
-                    found.info.device_id,
-                    found.info.revision,
-                )
-        })
-    });
-    if !supported {
-        return Err(String::from(
-            "intel.modeset=1 REFUSED: rollback validated only for ADL-N 8086:46d0 exact display \
-             D0; no writes",
-        ));
-    }
-    let gtt = shared_ggtt(bdf)?;
-    // TC fastboot has its own restricted transaction. It never routes TC
-    // through the old combo-PHY modeset/rollback sequence.
-    let function = window.read(regs::ddi::TRANS_DDI_FUNC_CTL_A).unwrap_or(0);
-    if matches!(
-        intel_display::ddi::decode_function_control(function).port,
-        Some(intel_display::device::Port::Tc1 | intel_display::device::Port::Tc2)
-    ) {
-        return fastboot::init(bdf, *window, gtt);
-    }
-    // The non-TC path still needs an initial live-plane/stolen-memory proof
-    // before admitting its pages to the retained shared boot identity
-    // aperture. It has no such proof yet, so do not quiesce or program a
-    // physical GGTT surface.
-    if !gtt.has_identity_lease(bdf) {
-        return Err(String::from(
-            "intel.modeset=1 REFUSED before writes: non-TC scanout has no verified shared boot \
-             identity aperture lease",
-        ));
-    }
-    let image = gtt.checkpoint().map_err(|e| e.describe())?;
-    *FIRMWARE_STATE.lock() = alloc::vec![(bdf, firmware_snapshot::Snapshot::capture(window))];
-    let tx = rollback::Transaction::begin(window, &gmbus::MonotonicTimer).map_err(|e| {
-        alloc::format!("intel.modeset=1 REFUSED before writes: {e}; firmware unchanged")
-    })?;
-    // Read the MIT timing slice only after live firmware pipe-A admission.
-    let timings = i915_port::read_admitted_timings(&tx)?;
-    axlog::info!("intel-i915-readout: {timings:?}; timing slice only, not fastboot ownership");
-    *FIRMWARE_STATE.lock() = alloc::vec![(bdf, tx.before.clone())];
-    *GTT.lock() = Some(gtt.describe());
-    if let Some(value) = axhal::boot::command_line_value("intel.modeset.fail_write") {
-        let attempt = value
-            .parse::<usize>()
-            .map_err(|_| String::from("invalid intel.modeset.fail_write; no writes"))?;
-        tx.inject_failure(attempt)?;
-    }
-    let reusable = tx.reusable_phys.clone();
-    let result = (|| {
-        tx.quiesce(&gmbus::MonotonicTimer)?;
-        let state = power::bring_up_preserving_phys(&tx, reusable).map_err(|e| e.describe())?;
-        *POWER.lock() = Some(state);
-        dmc::display_power_ready(*window, intel_display::dmc::DmcPlatform::AlderLakeN);
-        let resolved = connect::resolve_device(bdf, &tx, &gmbus::MonotonicTimer);
-        let mut report = connect::ConnectReport::default();
-        report.hotplug.push((bdf, resolved.hotplug));
-        let connector = resolved.outcome.map_err(|e| e.describe())?;
-        if connector.ddi != tx.ddi {
-            return Err(String::from(
-                "live EDID route differs from saved firmware combo port",
-            ));
-        }
-        report.connectors.push(connector);
-        *CONNECT.lock() = Some(report);
-        modeset_at_boot(&tx, &gtt, tx.pll_id)
-    })();
-    match result {
-        Ok(text) => Ok(alloc::format!(
-            "intel-modeset: committed opt-in native mode after {} writes; {text}; 未在硬件上验证",
-            tx.attempts()
-        )),
-        Err(original) => {
-            let recovery = tx.restore(&gmbus::MonotonicTimer, &gtt, &image);
-            let text = match recovery {
-                Ok(proof) => {
-                    alloc::format!(
-                        "intel-modeset: failed: {original}; ROLLBACK_MMIO_VERIFIED: {proof}"
-                    )
-                }
-                Err(error) => alloc::format!(
-                    "intel-modeset: failed: {original}; ROLLBACK_FAILED: {error}; DMA \
-                     quarantined; scanout recovery NOT proven; no further display writes"
-                ),
-            };
-            if let Some((_, state)) = FIRMWARE_STATE.lock().first_mut() {
-                state.restoration = Some(text.clone());
-            }
-            Err(text)
-        }
-    }
-}
-
-/// Allocate the exact live EDID mode, program through the boot transaction,
-/// and publish only a proven native scanout. Any error returns to the outer
-/// dependency-aware rollback. Both failed and successful DMA surfaces remain
-/// owned; no old-GOP-console claim is made merely from an allocation/address.
-#[cfg(target_os = "none")]
-fn modeset_at_boot<R: Registers>(
-    tx: &rollback::Transaction<'_, R>,
-    gtt: &gtt::Gtt,
-    pll_id: u8,
-) -> Result<String, String> {
-    use alloc::sync::Arc;
-    let regs = tx;
-    let report = CONNECT
-        .lock()
-        .take()
-        .ok_or_else(|| String::from("connector report absent"))?;
-    let mut runtime_cdclk_transition = None;
-    let result = (|| {
-        let connector = report
-            .connectors
-            .first()
-            .ok_or_else(|| String::from("no live EDID connector"))?;
-        let mut edid = Vec::new();
-        edid.try_reserve_exact(256)
-            .map_err(|_| String::from("EDID staging allocation failed"))?;
-        edid.extend_from_slice(connector.edid.as_slice());
-        if let Some(extension) = &connector.extension {
-            edid.extend_from_slice(extension.as_slice());
-        }
-        let clock_before = clk::observe(regs).map_err(|error| error.describe())?;
-        if !clock_before.usable() {
-            return Err(clock_before.describe());
-        }
-        // Pipe A was quiesced by this transaction. Raise CDCLK only if every
-        // pipe is now disabled; otherwise mode choice stays bounded by the
-        // live firmware clock and no transition is attempted.
-        let can_reclock = tx.pipes_disabled();
-        let selection_cdclk = if can_reclock {
-            clk::maximum_cdclk(clock_before.reference).unwrap_or(clock_before.cdclk_khz)
-        } else {
-            clock_before.cdclk_khz
-        };
-        let (_, mode) = modeset::preflight_mode_at_cdclk(&connector.plan, &edid, selection_cdclk)
-            .map_err(|error| error.describe())?;
-        if mode.clock_khz > clock_before.cdclk_khz {
-            if !can_reclock {
-                return Err(String::from(
-                    "CDCLK increase refused while any display pipe is active or unreadable",
-                ));
-            }
-            let target =
-                clk::entry_at_least(clock_before.reference, mode.clock_khz).ok_or_else(|| {
-                    alloc::format!(
-                        "no source CDCLK row can carry selected mode clock {} kHz",
-                        mode.clock_khz
-                    )
-                })?;
-            let timer = gmbus::MonotonicTimer;
-            let transition = tx.transition_cdclk(&timer, target)?;
-            if transition.after.cdclk_khz < mode.clock_khz {
-                return Err(alloc::format!(
-                    "CDCLK transition read back {} kHz, below selected mode {} kHz",
-                    transition.after.cdclk_khz,
-                    mode.clock_khz
-                ));
-            }
-            axlog::info!(
-                "intel-cdclk: raised CDCLK from {} to {} kHz before modeset ({:?}, unlock timeout \
-                 {}, lock timeout {}, crawl ACK timeout {})",
-                clock_before.cdclk_khz,
-                transition.after.cdclk_khz,
-                transition.method,
-                transition.unlock_timed_out,
-                transition.lock_timed_out,
-                transition.crawl_ack_timed_out,
-            );
-            runtime_cdclk_transition = Some(transition);
-        }
-        axlog::info!(
-            "intel-modeset: EDID selected {}x{} clock={} kHz",
-            mode.hdisplay,
-            mode.vdisplay,
-            mode.clock_khz
-        );
-        let surface = fb::Surface::allocate(
-            gtt,
-            u32::from(mode.hdisplay),
-            u32::from(mode.vdisplay),
-            fb::Format::Xrgb8888,
-        )
-        .map_err(|e| e.describe())?;
-        let watermark = POWER
-            .lock()
-            .as_ref()
-            .map(power::PowerState::watermark_config)
-            .ok_or_else(|| String::from("PCode-derived watermark state absent"))?;
-        let mut request = modeset::ModeRequest::new(
-            connector.ddi,
-            pipe::Pipe::A,
-            &connector.plan,
-            &edid,
-            &surface,
-            pll::PllFieldEncoding::Named,
-        );
-        request = request.with_watermark(watermark);
-        request.pll_id = pll_id;
-        request.swing = swing::read_firmware_swing(regs, connector.ddi).ok();
-        request.link_rate = output::LinkRate::NoSourcedEncoding;
-        let outcome = modeset::set_mode(regs, &gmbus::MonotonicTimer, &request);
-        // Both success and failure retain the allocation until the controller
-        // and its PTEs prove retirement; never free a failed native scanout.
-        match outcome {
-            Ok(outcome) => {
-                let text = outcome.render();
-                let verdict = if outcome.prove.verdict().is_scanning_out() {
-                    outcome
-                        .prove
-                        .surflive()
-                        .map(|surflive| scanout::Verdict::Scanning { surflive })
-                } else {
-                    None
-                };
-                let success = verdict.is_some();
-                scanout::register(
-                    Arc::new(surface),
-                    verdict.unwrap_or_else(|| scanout::Verdict::NotScanning {
-                        reason: text.clone(),
-                    }),
-                );
-                if success {
-                    if let Some(transition) = runtime_cdclk_transition {
-                        if let Some(state) = POWER.lock().as_mut() {
-                            state.runtime_cdclk_transition = Some(transition);
-                        }
-                    }
-                    Ok(text)
-                } else {
-                    Err(alloc::format!("native scanout not proven: {text}"))
-                }
-            }
-            Err(error) => {
-                let text = error.describe();
-                scanout::register(
-                    Arc::new(surface),
-                    scanout::Verdict::NotScanning {
-                        reason: text.clone(),
-                    },
-                );
-                Err(text)
-            }
-        }
-    })();
-    *CONNECT.lock() = Some(report);
-    result
-}
-
-/// The mapped window, the aperture the probe mapped it from, and the BAR's
-/// physical base, for one device.
-///
-/// Read back out of the probe's report rather than carried along: the report is
-/// what the debug file shows a reader, so a device the probe refused to map
-/// cannot be programmed by a later step that kept its own copy of the facts.
-#[cfg(target_os = "none")]
-fn mapped_facts(bdf: pci::Bdf) -> Option<(RegisterWindow, &'static Aperture, u64)> {
-    let report = REPORT.lock();
-    let report = report.as_ref()?;
-    for found in &report.displays {
-        if found.info.bdf != bdf {
-            continue;
-        }
-        if let WindowStatus::Mapped {
-            window,
-            aperture,
-            physical,
-        } = found.status
-        {
-            return Some((window, aperture, physical));
-        }
-    }
-    None
 }
 
 /// The devices whose register window the probe mapped, with those windows.
@@ -704,340 +141,7 @@ fn mapped_windows() -> alloc::vec::Vec<(pci::Bdf, RegisterWindow)> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// The after-boot hotplug watch.
-//
-// Everything below this line runs *after* the bring-up order, and the whole of
-// its read-and-decide half is a plain function so that a host test can drive
-// the poll, the edge compare and the re-probe through a model of the
-// controller.  Only the thread is a thread, and only the thread is
-// `target_os = "none"`.
-//
-// Nothing here touches a register on the poll path.  The writes this path does
-// make are the re-probe's, and they are phase 2's own: `HPD_ENABLE`, already
-// set, and the GMBUS controller's control registers.  The poll itself writes
-// nothing at all -- `SDEISR` is write-one-to-clear, so a poll that wrote it
-// would destroy the state it came to read.
-// ---------------------------------------------------------------------------
-
-/// One transition the watch saw, and the millisecond it was seen at.
-struct HotplugEvent {
-    /// Milliseconds since the platform's monotonic clock started.  A number
-    /// rather than a formatted duration, because the log line is written where
-    /// the clock is read and the file is rendered much later.
-    millis: u64,
-    transition: hpd::DdiTransition,
-}
-
-/// What the after-boot watch has seen, for the debug file.
-struct HotplugWatch {
-    /// The device whose register window is polled.
-    ///
-    /// One watch follows one device.  A machine with two display devices this
-    /// kernel had mapped would get a watch for the first, and the log says so
-    /// when that happens: two watches would need a report with a heading per
-    /// device, and the target machine has one display function.
-    bdf: Bdf,
-    /// The transitions, oldest first, at most [`HOTPLUG_EVENT_LIMIT`] of them.
-    events: Vec<HotplugEvent>,
-    /// How many transitions were dropped off the front of that list.
-    dropped: u64,
-    /// What the phase-2 probe re-run after the most recent transition found.
-    /// `None` until a transition has happened.
-    last_probe: Option<sink::DeviceSink>,
-}
-
-impl HotplugWatch {
-    fn new(bdf: Bdf) -> Self {
-        Self {
-            bdf,
-            events: Vec::new(),
-            dropped: 0,
-            last_probe: None,
-        }
-    }
-
-    /// Take one pass: keep what changed, and keep the re-probe it called for.
-    ///
-    /// The logging is the caller's and happens before this, outside the lock:
-    /// a console write has no business happening while a lock a debug-file read
-    /// also wants is held.
-    fn record(&mut self, millis: u64, pass: ReconcilePass) {
-        for transition in pass.transitions.iter().flatten() {
-            if self.events.len() == HOTPLUG_EVENT_LIMIT {
-                self.events.remove(0);
-                self.dropped += 1;
-            }
-            self.events.push(HotplugEvent {
-                millis,
-                transition: *transition,
-            });
-        }
-        // A pass produces a re-probe exactly when it produces a transition, so
-        // this is the same condition -- but it is written as its own so that a
-        // pass with no probe cannot silently clear the last one.
-        if let Some(device) = pass.probe {
-            self.last_probe = Some(device);
-        }
-    }
-
-    /// The lines the debug file carries.
-    fn render(&self) -> String {
-        let mut out = alloc::format!(
-            "\n--- hotplug after boot (reference section 11 phase 2.2) ---\nwatching {}: one \
-             SDEISR read every {} ms.  The poll writes no register; a transition re-runs the \
-             phase-2 sink probe.\n",
-            self.bdf,
-            HOTPLUG_POLL_INTERVAL.as_millis(),
-        );
-        if self.events.is_empty() {
-            out.push_str("  no transition since the state the sink step read at boot\n");
-        }
-        for event in &self.events {
-            out.push_str(&alloc::format!(
-                "  {} ms: {}\n",
-                event.millis,
-                event.transition.describe()
-            ));
-        }
-        if self.dropped != 0 {
-            out.push_str(&alloc::format!(
-                "  {} older transitions are not listed: this file keeps the most recent {}\n",
-                self.dropped,
-                HOTPLUG_EVENT_LIMIT,
-            ));
-        }
-        if let Some(device) = &self.last_probe {
-            out.push_str("  the phase-2 sink probe re-run after the last transition:\n");
-            device.render_into(&mut out);
-        }
-        out
-    }
-}
-
-/// What one pass of the watch found.
-struct ReconcilePass {
-    /// The register that refused, when one did.  Never set together with a
-    /// transition: a state that could not be read is not a state that changed.
-    failure: Option<hpd::HpdError>,
-    /// The transitions this pass produced, at most one per DDI.
-    transitions: [Option<hpd::DdiTransition>; 4],
-    /// The phase-2 sink probe, when a transition called for one.
-    probe: Option<sink::DeviceSink>,
-}
-
-impl ReconcilePass {
-    /// How many transitions this pass produced.
-    fn changed(&self) -> usize {
-        self.transitions.iter().flatten().count()
-    }
-}
-
-/// Read the live connect state once, and do what a change calls for.
-///
-/// This is the whole of the watch that is not a thread, and the order is the
-/// point:
-///
-/// 1. One pair of register reads, writing nothing ([`hpd::poll_connect`]).
-/// 2. An edge compare against the state the last answered poll left
-///    ([`hpd::ConnectTracker`]).  A register that did not answer produces
-///    neither an event nor a re-probe: "I could not look" is not "nothing is
-///    there".
-/// 3. Only when something changed, the phase-2 sink probe for this device, in
-///    the context of whatever task called this.  That is why the watch is a
-///    sleeping task and not a timer callback: the step that follows a change
-///    waits on GMBUS and allocates, and neither belongs in an interrupt.
-///
-/// Step 3 is the *same* composition bring-up runs, deliberately.  A monitor
-/// found after boot is probed by the code that probed the one found at boot, so
-/// the two results are comparable and there is one implementation of "find out
-/// what is on this port" instead of two that drift apart.  It reads the EDID
-/// and it writes what phase 2 writes -- `HPD_ENABLE`, already set, and the
-/// GMBUS controller's control registers -- which is not the poll path: the
-/// poll path is step 1, and step 1 wrote nothing.
-///
-/// The re-probe is the *last* thing a pass does, so the transitions a pass
-/// found are logged before the bus work starts and a slow GMBUS transaction
-/// delays the next poll rather than the report of what was seen.
-fn reconcile_once<R: Registers, T: PollTimer>(
-    bdf: Bdf,
-    regs: &R,
-    timer: &T,
-    tracker: &mut hpd::ConnectTracker,
-) -> ReconcilePass {
-    let poll = hpd::poll_connect(regs);
-    let mut transitions = [None; 4];
-    let mut changed = 0;
-    for state in poll.states().into_iter().flatten() {
-        let Some(transition) = tracker.observe(state) else {
-            continue;
-        };
-        // One poll produces at most one state per DDI and each state at most
-        // one transition, so `changed` cannot reach the end of this array.  The
-        // guard is here anyway: a hotplug is no place for an index panic, and
-        // what it would drop is one more line in a report, not a decision.
-        let Some(slot) = transitions.get_mut(changed) else {
-            break;
-        };
-        *slot = Some(transition);
-        changed += 1;
-    }
-    let probe = if changed == 0 {
-        None
-    } else {
-        // A re-probe programs nothing -- `HotplugWatch::record` keeps the answer
-        // for the debug file -- so the pass prints the transition it re-probed
-        // for and leaves the probe's own narration to that file.
-        Some(sink::probe_one(bdf, regs, timer, Narration::Watch))
-    };
-    ReconcilePass {
-        failure: poll.failure(),
-        transitions,
-        probe,
-    }
-}
-
-/// The baseline the watch starts from: what the phase-2 pass already reported.
-///
-/// A watch that reported the state it found on its first poll would be
-/// reporting its own first look as a hotplug.  The connector step read every
-/// DDI once and logged each one, so that reading is the baseline and only a
-/// change from it is an event.  A DDI the boot read could not answer for gets
-/// no baseline, and its first answered poll is adopted in silence -- see
-/// [`hpd::ConnectTracker`], which is where that rule and its reason live.
-fn boot_baseline(report: &connect::ConnectReport, bdf: Bdf) -> hpd::ConnectTracker {
-    let mut tracker = hpd::ConnectTracker::new();
-    for (device, statuses) in &report.hotplug {
-        if *device != bdf {
-            continue;
-        }
-        for status in statuses {
-            tracker.seed(status.ddi, status.effective_connect());
-        }
-    }
-    tracker
-}
-
-/// Start the after-boot hotplug watch, once, for the first device phase 1
-/// brought up.
-///
-/// The call site is the end of [`bring_up_at_boot`], and the ordering is the
-/// whole of the safety argument for polling: by the time this runs the register
-/// window is mapped, the display is powered, hotplug detection is enabled, and
-/// the states the sink step read are there to be the baseline.  On a machine
-/// with no mapped window [`bring_up_at_boot`] has already returned and nothing
-/// polls at all.
-#[cfg(target_os = "none")]
-fn start_hotplug_watch(powered: &[(Bdf, RegisterWindow)]) {
-    use core::sync::atomic::{AtomicBool, Ordering};
-
-    /// Set once, so that a second call cannot start a second watch: two watches
-    /// would each see the same edge and log it twice.
-    static STARTED: AtomicBool = AtomicBool::new(false);
-
-    if STARTED.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let Some((bdf, window)) = powered.first().copied() else {
-        axlog::info!(
-            "intel-hpd: no display device reached phase 1, so nothing polls the hotplug status \
-             registers after boot"
-        );
-        return;
-    };
-    if powered.len() > 1 {
-        axlog::info!(
-            "intel-hpd: {} display devices came up; the after-boot hotplug watch follows {bdf} \
-             only",
-            powered.len()
-        );
-    }
-    // The baseline is taken before the task starts, and the lock is released
-    // before anything that allocates.
-    let tracker = match &*CONNECT.lock() {
-        Some(report) => boot_baseline(report, bdf),
-        None => hpd::ConnectTracker::new(),
-    };
-    // Published before the task starts, so the debug file says "watching and
-    // nothing yet" rather than "the watch never started" in the window between
-    // the spawn and the first poll.
-    *HOTPLUG.lock() = Some(HotplugWatch::new(bdf));
-    let name = String::from("intel-hotplug");
-    match axtask::spawn_with_name(move || watch_hotplug(bdf, window, tracker), name) {
-        Ok(_) => axlog::info!(
-            "intel-hpd: watching {bdf} for hotplug: one SDEISR read every {} ms, and the poll \
-             itself writes no register",
-            HOTPLUG_POLL_INTERVAL.as_millis()
-        ),
-        Err(error) => {
-            // Put the state back the way it was: a watch that did not start
-            // must not leave a file claiming one is running.
-            STARTED.store(false, Ordering::Release);
-            *HOTPLUG.lock() = None;
-            axlog::warn!(
-                "intel-hpd: the after-boot hotplug watch could not start, so a monitor plugged in \
-                 after boot will not be noticed: {error:?}"
-            );
-        }
-    }
-}
-
-/// Follow one display device's hotplug state for the rest of the boot.
-///
-/// A task that sleeps, polls and then does the work a change calls for in its
-/// own context.  Everything expensive or blocking -- the sleep, the GMBUS
-/// transactions of the re-probe, the allocation a report line needs -- is on
-/// this side of the boundary, which is the reason the watch is a task rather
-/// than a timer callback.
-#[cfg(target_os = "none")]
-fn watch_hotplug(bdf: Bdf, window: RegisterWindow, mut tracker: hpd::ConnectTracker) {
-    // The failure reported last time, so that a window which does not reach
-    // `SDEISR` is reported once rather than four times a second.
-    let mut reported: Option<hpd::HpdError> = None;
-    loop {
-        if axtask::sleep(HOTPLUG_POLL_INTERVAL).is_err() {
-            // A timer admission that is temporarily exhausted must not stop the
-            // watch; yielding keeps the task live and keeps the loop from
-            // becoming a tight poll, exactly as the PCI input reconcile worker
-            // does.
-            axtask::yield_now();
-        }
-        let pass = reconcile_once(bdf, &window, &MonotonicTimer, &mut tracker);
-        match pass.failure {
-            Some(failure) if reported != Some(failure) => {
-                axlog::warn!(
-                    "intel-hpd: the after-boot watch cannot read the live connect state, so it \
-                     cannot see a monitor arrive: {}",
-                    failure.describe()
-                );
-                reported = Some(failure);
-            }
-            // The same refusal again: already said, and saying it every poll
-            // would fill the log with one line.
-            Some(_) => {}
-            None => reported = None,
-        }
-        if pass.changed() == 0 {
-            continue;
-        }
-        // The clock is read, and the lock is taken, only once there is
-        // something to record.  The lines go to the log before the lock: the
-        // raw words are what a person sees as it happens, and a console write
-        // holds nothing.
-        let millis = axhal::time::monotonic_time_nanos() / 1_000_000;
-        for transition in pass.transitions.iter().flatten() {
-            axlog::info!(
-                "intel-hpd: hotplug at {millis} ms: {}",
-                transition.describe()
-            );
-        }
-        let mut slot = HOTPLUG.lock();
-        let watch = slot.get_or_insert_with(|| HotplugWatch::new(bdf));
-        watch.record(millis, pass);
-    }
-}
-
-/// The report of the boot probe as text.
+/// The boot report as text: the probe, then each GPU's GT bring-up.
 pub(crate) fn report_text() -> String {
     let mut text = match &*REPORT.lock() {
         Some(report) => report.render(),
@@ -1046,45 +150,57 @@ pub(crate) fn report_text() -> String {
              initialization path, so this file is empty only if that path never executed\n",
         ),
     };
-    // The locks are taken one at a time: nothing holds two at once.
     for (bdf, report) in GT_REPORT.lock().iter() {
         text.push_str(&alloc::format!("{bdf}: {report}"));
-    }
-    for (bdf, state) in FIRMWARE_STATE.lock().iter() {
-        text.push_str(&alloc::format!("intel-firmware: {bdf}\n"));
-        text.push_str(&state.render());
-    }
-    if let Some(failure) = &*POWER_FAILURE.lock() {
-        text.push_str(failure);
-        text.push('\n');
-    }
-    if let Some(state) = &*POWER.lock() {
-        text.push_str(&state.render());
-    }
-    if let Some(connect) = &*CONNECT.lock() {
-        text.push_str(&connect.render());
-    }
-    if let Some(gtt) = &*GTT.lock() {
-        text.push_str(gtt);
-    }
-    if let Some(modeset) = &*MODESET.lock() {
-        text.push_str(modeset);
-    }
-    if let Some(watch) = &*HOTPLUG.lock() {
-        text.push_str(&watch.render());
     }
     text
 }
 
-/// Whether the boot probe found a display device it could identify.
-pub(crate) fn identified_device_and_revision() -> Option<(&'static id::DisplayDevice, u8)> {
+/// The refusal a step returns, with its call site logged when boot tracing is on.
+#[track_caller]
+pub(super) fn traced_refusal() -> Error {
+    #[cfg(target_os = "none")]
+    if axhal::boot::command_line_value("boot.progress") == Some("1") {
+        let at = core::panic::Location::caller();
+        axlog::warn!("intel: refusal at {}:{}", at.file(), at.line());
+    }
+    Error::Refused
+}
+
+/// Bring up the GT path on the device the probe mapped: i915 is deferred to the
+/// rootfs-ready callback, which fetches its GuC/HuC firmware.
+pub(crate) fn bring_up_gt_at_boot() {
+    #[cfg(target_os = "none")]
+    gt::init_at_boot();
+}
+
+/// Whether the translated i915 driver has registered its DRM device.
+pub(super) fn gt_registered() -> bool {
+    upstream_drm::registered_device().is_some()
+}
+
+/// PCI identity of the live GT owner (the render node's device).
+pub(crate) fn gt_pci_identity() -> Option<axdriver_display::DisplayPciIdentity> {
+    if !gt_registered() {
+        return None;
+    }
+    let bdf = upstream_gt::registered_bdf()?;
     let report = REPORT.lock();
-    let report = report.as_ref()?;
-    report.displays.iter().find_map(|found| {
-        found
-            .identity
-            .device()
-            .map(|device| (device, found.info.revision))
+    let info = report
+        .as_ref()?
+        .displays
+        .iter()
+        .find(|display| display.info.bdf == bdf)?
+        .info;
+    Some(axdriver_display::DisplayPciIdentity {
+        bus: bdf.bus,
+        device: bdf.device,
+        function: bdf.function,
+        vendor_id: info.vendor_id,
+        device_id: info.device_id,
+        subsystem_vendor: info.subsystem_vendor_id,
+        subsystem_device: info.subsystem_id,
+        revision: info.revision,
     })
 }
 
@@ -1122,13 +238,6 @@ fn platform_probe() -> ProbeReport {
     )
 }
 
-/// Map the register aperture of a device the table has a model for.
-///
-/// This is the only place the probe turns an address from configuration space
-/// into memory it can read, so it is where every refusal belongs: a device
-/// with no memory BAR where the table puts the registers, a BAR that decodes
-/// no address, and a BAR whose address contradicts the modelled aperture size
-/// are all refused rather than mapped and interpreted.
 #[cfg(target_os = "none")]
 fn open_register_window(info: &pci::DeviceInfo, aperture: &'static Aperture) -> WindowStatus {
     let Some(bar) = info.memory_bar(aperture.bar) else {
@@ -1155,304 +264,3 @@ fn open_register_window(info: &pci::DeviceInfo, aperture: &'static Aperture) -> 
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use alloc::{format, vec};
-
-    use super::*;
-    use crate::{
-        drm::intel::{
-            gmbus::{
-                Pin,
-                tests::{FakeClock, FakeController, valid_edid},
-            },
-            hpd::Ddi,
-            regs::SDEISR,
-        },
-        test_support::scheduler_test_context,
-    };
-
-    /// A `Bdf` for a display function, for the report lines.
-    fn bdf() -> Bdf {
-        Bdf::new(0, 2, 0)
-    }
-
-    /// A controller with a monitor wired to `pin`, and nothing else attached.
-    fn controller_with_monitor_on(pin: Pin) -> FakeController {
-        FakeController::with_monitor(pin, &valid_edid(0))
-    }
-
-    #[test]
-    fn hexadecimal_is_grouped_the_way_register_dumps_are() {
-        assert_eq!(hex(0x0000_000c, 8), "0x0000_000c");
-        assert_eq!(hex(0x6000_0000_0000, 16), "0x0000_6000_0000_0000");
-        assert_eq!(hex(0xffff_ffff, 8), "0xffff_ffff");
-        assert_eq!(hex(0, 8), "0x0000_0000");
-        assert_eq!(hex(0, 16), "0x0000_0000_0000_0000");
-        assert_eq!(hex(0x300, 4), "0x0300");
-        assert_eq!(hex(0x46d0, 4), "0x46d0");
-        // A request for more digits than a value has still produces a
-        // fixed-width field, which is what makes a column of them line up.
-        assert_eq!(hex(0x46d0, 8), "0x0000_46d0");
-        // And a request for fewer digits than the value needs does not
-        // truncate it.
-        assert_eq!(hex(0xdead_beef, 4), "0xdead_beef");
-    }
-
-    /// The baseline a watch starts from, for a controller the test owns: the
-    /// states the sink step reported at boot, in the shape the connector step
-    /// keeps them in.
-    fn boot_report(controller: &FakeController) -> connect::ConnectReport {
-        let device = sink::probe_one(bdf(), controller, &FakeClock::new(), Narration::Boot);
-        connect::ConnectReport {
-            hotplug: vec![(device.bdf, device.hotplug.clone())],
-            ..connect::ConnectReport::default()
-        }
-    }
-
-    #[test]
-    fn the_baseline_is_the_state_the_boot_step_already_reported() {
-        let _guard = scheduler_test_context();
-        let controller = controller_with_monitor_on(Pin::DdiC);
-        controller.set_word(SDEISR, Ddi::C.live_bit());
-        let mut tracker = boot_baseline(&boot_report(&controller), bdf());
-
-        // The boot step read DDI C's live bit and logged it, so the first poll
-        // finds the same state and has nothing to report: a watch that reported
-        // its own first look would say a monitor arrived that was there all
-        // along.
-        let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
-        assert_eq!(pass.changed(), 0);
-        assert!(pass.probe.is_none(), "no change, no re-probe");
-        assert!(pass.failure.is_none());
-
-        // And the baseline is DDI C's state, not "everything connected":
-        // unplugging the word alone is a transition on DDI C.
-        controller.set_word(SDEISR, 0);
-        let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
-        let transition = pass
-            .transitions
-            .iter()
-            .flatten()
-            .next()
-            .expect("a transition");
-        assert_eq!(transition.ddi, Ddi::C);
-        assert!(transition.from);
-        assert!(!transition.state.connected);
-    }
-
-    #[test]
-    fn a_monitor_plugged_in_after_boot_is_seen_and_the_sink_is_probed_again() {
-        let _guard = scheduler_test_context();
-        // Nothing is attached, and the status word agrees.  The monitor's EEPROM
-        // image is loaded from the start, so "plugged in" is only the pin being
-        // wired up and the connect bit being set.
-        let controller = controller_with_monitor_on(Pin::DdiB);
-        controller.detach();
-        let mut tracker = boot_baseline(&boot_report(&controller), bdf());
-        let mut watch = HotplugWatch::new(bdf());
-
-        // A steady state is not an event, and, more than that, it costs the bus
-        // nothing: no GMBUS transaction is started by a poll that found no
-        // change.
-        let transactions = controller.transactions();
-        let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
-        assert_eq!(pass.changed(), 0);
-        assert!(pass.probe.is_none());
-        assert_eq!(controller.transactions(), transactions);
-
-        // A monitor arrives: the sink answers on DDI B's DDC pin, and the live
-        // connect bit for DDI B is set.
-        controller.attach(Pin::DdiB);
-        controller.set_word(SDEISR, Ddi::B.live_bit());
-        let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
-        assert_eq!(pass.changed(), 1);
-        let transition = pass.transitions.iter().flatten().next().unwrap();
-        assert_eq!(transition.ddi, Ddi::B);
-        assert!(!transition.from);
-        let probe = pass.probe.as_ref().expect("a change re-probes the sink");
-        assert_eq!(probe.monitor, Some(Pin::DdiB));
-
-        watch.record(1234, pass);
-        let text = watch.render();
-        // The report a reader gets has the transition, the raw words it came
-        // from, and the phase-2 result behind it.
-        assert!(text.contains("hotplug after boot"), "{text}");
-        assert!(text.contains(&format!("{} ms:", 1234)), "{text}");
-        assert!(text.contains("DDI B: disconnected -> connected"), "{text}");
-        assert!(
-            text.contains(&format!("SDEISR {:#010x}", Ddi::B.live_bit())),
-            "{text}"
-        );
-        assert!(text.contains("SOUTH_CHICKEN1 0x00000000"), "{text}");
-        assert!(
-            text.contains("the phase-2 sink probe re-run after the last transition"),
-            "{text}"
-        );
-        assert!(text.contains("monitor on pin 2"), "{text}");
-
-        // And the same poll again is not an event, which is the whole of "the
-        // same read twice is not a hotplug".
-        let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
-        assert_eq!(pass.changed(), 0);
-
-        // Unplugged: the other edge, probed again, and the report says the sink
-        // is gone.
-        controller.detach();
-        controller.set_word(SDEISR, 0);
-        let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
-        assert_eq!(pass.changed(), 1);
-        let transition = pass.transitions.iter().flatten().next().unwrap();
-        assert!(transition.from);
-        assert!(!transition.state.connected);
-        assert!(pass.probe.as_ref().unwrap().monitor.is_none());
-        watch.record(2000, pass);
-        let text = watch.render();
-        assert!(text.contains("DDI B: connected -> disconnected"), "{text}");
-        assert!(text.contains("no monitor"), "{text}");
-        // The log line for the first transition is still there: the file keeps
-        // the history, not only the last state.
-        assert!(text.contains("DDI B: disconnected -> connected"), "{text}");
-    }
-
-    #[test]
-    fn a_poll_that_cannot_read_the_registers_does_nothing_and_says_why_once() {
-        let _guard = scheduler_test_context();
-        let controller = FakeController::bare();
-        controller.detach();
-        controller.set_window_len(0x1000);
-        let mut tracker = boot_baseline(&boot_report(&controller), bdf());
-        let mut watch = HotplugWatch::new(bdf());
-
-        // The window does not reach the hotplug block: no state, no event, no
-        // re-probe, and a reason named by register.
-        let transactions = controller.transactions();
-        let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
-        assert_eq!(pass.changed(), 0);
-        assert!(pass.probe.is_none());
-        assert_eq!(controller.transactions(), transactions);
-        let failure = pass.failure.expect("a read that failed must be named");
-        assert!(
-            failure.describe().contains("SDEISR"),
-            "{}",
-            failure.describe()
-        );
-
-        // Nothing is recorded, so the file says the watch is running and has
-        // seen nothing -- not that a monitor came or went.
-        assert!(pass.probe.is_none());
-        watch.record(0, pass);
-        let text = watch.render();
-        assert!(text.contains("no transition"), "{text}");
-        assert!(!text.contains(" -> "), "{text}");
-    }
-
-    #[test]
-    fn the_event_list_is_bounded_and_counts_what_it_dropped() {
-        let _guard = scheduler_test_context();
-        let controller = FakeController::bare();
-        controller.detach();
-        let mut tracker = boot_baseline(&boot_report(&controller), bdf());
-        let mut watch = HotplugWatch::new(bdf());
-
-        // A connector that makes and breaks contact on every poll.  What is
-        // kept is bounded; what is counted is not, so the file says both what
-        // happened last and that there was more of it.
-        for step in 0..(HOTPLUG_EVENT_LIMIT + 3) {
-            let connected = step % 2 == 0;
-            controller.set_word(SDEISR, if connected { Ddi::B.live_bit() } else { 0 });
-            let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
-            assert_eq!(pass.changed(), 1, "step {step}");
-            watch.record(step as u64, pass);
-        }
-        assert_eq!(watch.events.len(), HOTPLUG_EVENT_LIMIT);
-        assert_eq!(watch.dropped, 3);
-        let text = watch.render();
-        assert!(
-            text.contains("3 older transitions are not listed"),
-            "{text}"
-        );
-        // The most recent one is kept, so the file ends on the current state.
-        assert!(
-            text.contains(&format!("{} ms: DDI B: ", HOTPLUG_EVENT_LIMIT + 2)),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn a_watch_that_has_seen_nothing_says_that_rather_than_nothing_at_all() {
-        // Nothing in this test touches the statics: the file's hotplug section
-        // is produced by `HotplugWatch`, and a watch that does not exist
-        // produces no section at all.  What the test pins down is that "no
-        // section" and "a section saying nothing happened" are different texts,
-        // which is why the watch publishes itself before its first poll.
-        let watch = HotplugWatch::new(bdf());
-        let text = watch.render();
-        assert!(
-            text.contains("no transition since the state the sink step read at boot"),
-            "{text}"
-        );
-        assert!(text.contains("every 250 ms"), "{text}");
-        assert!(text.contains("The poll writes no register"), "{text}");
-    }
-}
-
-/// Name the failing native admission site during opt-in hardware diagnosis.
-#[track_caller]
-pub(super) fn traced_refusal() -> intel_display::Error {
-    #[cfg(target_os = "none")]
-    if axhal::boot::command_line_value("boot.progress") == Some("1") {
-        let at = core::panic::Location::caller();
-        axlog::warn!("intel-display: refusal at {}:{}", at.file(), at.line());
-    }
-    intel_display::Error::Refused
-}
-
-/// GT bring-up is independent of HDMI modesetting, HPD, DMC and audio.
-pub(crate) fn bring_up_gt_at_boot() {
-    #[cfg(target_os = "none")]
-    gt::init_at_boot();
-}
-
-pub(super) fn gt_registered() -> bool {
-    #[cfg(feature = "intel-upstream-gt")]
-    {
-        upstream_drm::registered_device().is_some()
-    }
-    #[cfg(not(feature = "intel-upstream-gt"))]
-    {
-        gt::registered()
-    }
-}
-
-/// PCI identity of the live, independently admitted render engine owner.
-pub(crate) fn gt_pci_identity() -> Option<axdriver_display::DisplayPciIdentity> {
-    #[cfg(feature = "intel-upstream-gt")]
-    {
-        if !gt_registered() {
-            return None;
-        }
-        let bdf = upstream_gt::registered_bdf()?;
-        let report = REPORT.lock();
-        let info = report
-            .as_ref()?
-            .displays
-            .iter()
-            .find(|display| display.info.bdf == bdf)?
-            .info;
-        Some(axdriver_display::DisplayPciIdentity {
-            bus: bdf.bus,
-            device: bdf.device,
-            function: bdf.function,
-            vendor_id: info.vendor_id,
-            device_id: info.device_id,
-            subsystem_vendor: info.subsystem_vendor_id,
-            subsystem_device: info.subsystem_id,
-            revision: info.revision,
-        })
-    }
-    #[cfg(not(feature = "intel-upstream-gt"))]
-    {
-        gt::pci_identity()
-    }
-}

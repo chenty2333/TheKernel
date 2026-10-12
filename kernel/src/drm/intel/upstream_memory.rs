@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
-//! Shared native-display/upstream-GT DMA and GGTT ownership. Both drivers use
-//! the same retained boot identity lease; disjoint allocation ranges prevent
-//! the upstream DRM-MM allocator from overwriting firmware or native scanout.
+//! i915 is the only GGTT and DMA owner of the GPU. Before its probe, the
+//! firmware's initial planes are read ([`super::initial_plane`]) so that their
+//! GGTT ranges can be reserved in i915's DRM-MM as soon as it exists, before
+//! `init_ggtt()` clears every other hole -- the job Linux's initial-plane vma
+//! pin does until the display code is ported.
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{ops::Range, ptr};
 
@@ -10,8 +12,6 @@ use intel_gt::{
     intel_gtt_api_upstream::I915AddressSpace,
     linux::{drm_mm, ggtt_owner},
 };
-
-use super::gtt::Gtt;
 
 // Each allocation must retain a stable address while its node is linked into
 // the C DRM-MM tree; Vec<DrmMmNode> would relocate nodes on growth.
@@ -27,7 +27,6 @@ struct Attached {
 // detach are only admitted outside active GT submissions.
 unsafe impl Send for Attached {}
 struct Owner {
-    gtt: Arc<Gtt>,
     ranges: Vec<Range<u64>>,
     attached: Option<Attached>,
 }
@@ -112,11 +111,6 @@ unsafe fn attach(vm: *mut I915AddressSpace) -> i32 {
     if vm.is_null() {
         return -22;
     }
-    // SAFETY: this upstream callback is called with an initialized live address
-    // space; owner registration is serialized and persists through VM teardown.
-    if unsafe { (*vm).total } != owner.gtt.aperture() {
-        return -22;
-    }
     if owner.attached.is_some() {
         return -16;
     }
@@ -148,10 +142,9 @@ unsafe fn detach(vm: *mut I915AddressSpace) {
 }
 static CALLBACKS: ggtt_owner::GgttOwner = ggtt_owner::GgttOwner { attach, detach };
 
-/// Prove live firmware DMA ownership before installing IRQs, allocating any
-/// upstream pages, or allowing a second GGTT allocator to initialize. This is
-/// a once-per-boot admission: failed probes retain their partition and lease;
-/// no retry may reuse these hardware owners without a complete device reset.
+/// Read the firmware's initial planes, take the requester's identity DMA
+/// lease with their stolen pages, and install the GGTT reservation callback.
+/// Once per boot; nothing here writes the device.
 #[cfg(target_os = "none")]
 pub(super) fn prepare(
     bdf: super::pci::Bdf,
@@ -159,47 +152,39 @@ pub(super) fn prepare(
     device: *mut core::ffi::c_void,
 ) -> Result<(), alloc::string::String> {
     use alloc::{format, string::String};
-    let gtt = super::shared_ggtt(bdf)?;
-    let identity_lease_preexisting = gtt.has_identity_lease(bdf);
-    super::fastboot::admit_read_only_identity_lease(bdf, window, &gtt)
-        .map_err(|e| format!("upstream i915: shared scanout DMA admission refused: {e:?}"))?;
-    // Keep this immediately before the ownership split: compare the live
-    // firmware scanout's actual GGTT PTEs with the partition's raw contents.
-    // This diagnostic is read-only and cannot change admission or ownership.
-    super::fastboot::log_active_scanout_gtt_samples(bdf, window, &gtt, identity_lease_preexisting);
-    let lease = gtt
-        .identity_lease()
-        .ok_or_else(|| String::from("upstream i915: no shared DMA lease"))?;
+
     let mut owner = OWNER.lock();
     if owner.is_some() {
         return Err(String::from("upstream i915: GGTT already owned"));
     }
-    // Power-on leaves noise in every GGTT entry firmware did not program;
-    // keep only the live scanout and clear the rest before either allocator
-    // reads presence as ownership. A refusal keeps the table unchanged.
-    match super::fastboot::live_scanout_ggtt_range(bdf, window, &gtt) {
-        Ok(keep) => match gtt.scrub_stale_entries(keep.clone()) {
-            Ok(cleared) => axlog::info!(
-                "intel-gtt: kept firmware scanout {:#x}..{:#x}, cleared {} stale PTEs",
-                keep.start,
-                keep.end,
-                cleared
-            ),
-            Err(error) => axlog::warn!(
-                "intel-gtt: stale PTE scrub refused: {}",
-                error.describe()
-            ),
-        },
-        Err(error) => {
-            axlog::warn!("intel-gtt: stale PTE scrub skipped, no live scanout range: {error:?}")
+    let ecam = super::pci::Ecam::platform()
+        .ok_or_else(|| String::from("upstream i915: PCI facts unavailable"))?;
+    let info = super::pci::DeviceInfo::read(&ecam, bdf)
+        .ok_or_else(|| String::from("upstream i915: PCI device unavailable"))?;
+    let bar0 = info.bars[0]
+        .address()
+        .filter(|&address| address != 0)
+        .ok_or_else(|| String::from("upstream i915: GTTMMADR unassigned"))?;
+    let planes = match super::initial_plane::stolen_range(&ecam, window, bdf) {
+        Some(stolen) => super::initial_plane::read_initial_planes(window, bar0, &stolen),
+        None => {
+            axlog::warn!("upstream i915: stolen memory not decoded; no initial plane kept");
+            Vec::new()
         }
+    };
+    let mut pages = Vec::new();
+    let mut ranges = Vec::new();
+    for plane in &planes {
+        pages.extend_from_slice(&plane.pages);
+        ranges.push(plane.ggtt.clone());
     }
-    let ranges = gtt.partition_for_upstream().map_err(|e| e.describe())?;
-    // No hardware write occurs until all three owners have been published.
+    let lease = super::dma::acquire_identity_lease(bdf, &pages)
+        .map_err(|e| format!("upstream i915: identity DMA lease refused: {e:?}"))?;
+    let lease = Arc::try_new(lease)
+        .map_err(|_| String::from("upstream i915: identity DMA lease allocation failed"))?;
     intel_gt::linux::dma::register_identity_device(device, lease).map_err(String::from)?;
     ggtt_owner::install(&CALLBACKS).map_err(String::from)?;
     *owner = Some(Owner {
-        gtt,
         ranges,
         attached: None,
     });

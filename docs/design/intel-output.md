@@ -1,5 +1,13 @@
 # The Intel output path: phase 5 of the bring-up order
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 **What this covers:** reference section 11 phase 5 — the PLL that makes the port clock, the mapping
 from a DDI to that PLL, the lane power and buffer translation, `TRANS_CLK_SEL`,
 `TRANS_DDI_FUNC_CTL`, `TRANSCONF`, `DDI_BUF_CTL` and the `IS_IDLE` poll. Phases 1 to 4 are the

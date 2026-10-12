@@ -16,6 +16,7 @@ mod dir;
 mod file;
 mod fs;
 mod graphics_metrics;
+mod mm_sysfs;
 pub(crate) mod hugetlb;
 pub(crate) mod mqueue;
 mod pci_sysfs;

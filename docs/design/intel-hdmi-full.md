@@ -1,5 +1,13 @@
 # Intel HDMI source translation
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 `crates/ax/tk-intel-display/src/intel_hdmi_full.rs` translates 114/120
 function definitions in Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_hdmi.c`
 (MIT, Dave Airlie 2006 and Intel 2006–2009). It contains the source-ordered

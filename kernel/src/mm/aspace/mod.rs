@@ -74,6 +74,7 @@ mod populate;
 mod protect_types;
 mod query;
 mod observations;
+pub(crate) use self::observations::ProcVmaObservations;
 mod setup;
 mod thp;
 mod tlb;

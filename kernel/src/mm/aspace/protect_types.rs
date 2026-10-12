@@ -280,6 +280,8 @@ impl<'a> PreparedProtectSegment<'a> {
 /// split/protect/merge path.
 #[must_use = "a prepared protection must be committed explicitly or dropped to abort"]
 pub(crate) struct PreparedProtect<'a> {
+    /// Core address-space identity whose MMU notifiers bracket the commit.
+    pub(super) address_space_id: u64,
     pub(super) transaction: PreparedAreaProtect<'a, Backend>,
     pub(super) growdown_starts: &'a mut BTreeSet<VirtAddr>,
     pub(super) topology_generation: &'a mut MappingGeneration,
@@ -496,7 +498,16 @@ impl PreparedProtect<'_> {
     /// Commits the already-preflighted request through MemorySet's staged
     /// split/protect/rollback/merge transaction.
     pub(crate) fn commit(self) -> AxResult<DeferredUffdWake> {
+        // mprotect: Linux mprotect_fixup() raises MMU_NOTIFY_PROTECTION_VMA
+        // before the VMA's PTE protections change.
+        let _mmu_scope = mmu_notifier::invalidate_range_start(
+            self.address_space_id,
+            self.transaction.start.as_usize(),
+            self.transaction.end.as_usize(),
+            mmu_notifier::Event::ProtectionVma,
+        );
         let Self {
+            address_space_id: _,
             transaction,
             growdown_starts,
             topology_generation,

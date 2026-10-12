@@ -418,12 +418,11 @@ fn madvise_advice_table_refuses_unavailable_linux_advice() {
     // have returned had it ever been reached.
     assert!(!advice_valid(MADV_MERGEABLE));
     assert!(!advice_valid(MADV_UNMERGEABLE));
-    // CONFIG_TRANSPARENT_HUGEPAGE=n: `#ifdef CONFIG_TRANSPARENT_HUGEPAGE`
-    // lists MADV_HUGEPAGE, MADV_NOHUGEPAGE and MADV_COLLAPSE, so a kernel
-    // whose oracle never sets VMA_HUGEPAGE_BIT answers -EINVAL to all three.
-    assert!(!advice_valid(MADV_HUGEPAGE));
-    assert!(!advice_valid(MADV_NOHUGEPAGE));
-    assert!(!advice_valid(MADV_COLLAPSE));
+    // CONFIG_TRANSPARENT_HUGEPAGE: TheKernel runs the THP engine, so the
+    // `#ifdef` block's advice values are accepted and implemented.
+    assert!(advice_valid(MADV_HUGEPAGE));
+    assert!(advice_valid(MADV_NOHUGEPAGE));
+    assert!(advice_valid(MADV_COLLAPSE));
     // CONFIG_MEMORY_FAILURE=n: `#ifdef CONFIG_MEMORY_FAILURE` lists both, so
     // MADV_HWPOISON may not silently discard a page and MADV_SOFT_OFFLINE may
     // not claim the content-preserving migration this kernel lacks.
@@ -457,13 +456,13 @@ fn madvise_advice_table_refuses_unavailable_linux_advice() {
     for advice in [
         Advice::Mergeable,
         Advice::Unmergeable,
-        Advice::HugePage,
-        Advice::NoHugePage,
-        Advice::Collapse,
         Advice::HwPoison,
         Advice::SoftOffline,
     ] {
         assert_eq!(advice.availability(), AdviceAvailability::Unavailable);
+    }
+    for advice in [Advice::HugePage, Advice::NoHugePage, Advice::Collapse] {
+        assert_eq!(advice.availability(), AdviceAvailability::Impl);
     }
 
     // mm/madvise.c:process_madvise_remote_valid()

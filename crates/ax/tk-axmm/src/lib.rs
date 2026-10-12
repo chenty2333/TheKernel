@@ -10,6 +10,7 @@ extern crate std;
 
 mod aspace;
 mod backend;
+pub mod memtype;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 

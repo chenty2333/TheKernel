@@ -43,10 +43,15 @@ WINDOW = 14
 # to i915 here. See the dated reconciliation in docs/upstream-provenance.md.
 SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     ("crates/linux", 40): (110, 49, 20, 25, 0, 18, 21),
-    ("kernel/src", 40): (86, 42, 20, 142, 9, 0, 0),
-    ("crates/ax", 40): (0, 0, 0, 895, 721, 0, 0),
+    ("kernel/src", 40): (85, 41, 19, 142, 9, 0, 0),
+    ("crates/ax", 40): (0, 0, 0, 706, 677, 0, 0),
     ("crates/linux", 25): (211, 59, 22, 41, 3, 20, 21),
-    ("kernel/src", 25): (159, 52, 26, 319, 23, 0, 0),
+    ("kernel/src", 25): (157, 50, 24, 321, 25, 0, 0),
+# 2026-10-12 (i915 unification phase 1): the `tk-intel-display` crate and the
+# native display/GT modules were deleted. Re-scan moves: crates/ax at 40 895/721
+# -> 706/677, at 25 2155/1974 -> 1894/1858; kernel/src at 40 86/42/20 -> 85/41/19
+# and at 25 159/52/26/319/23 -> 157/50/24/321/25 (the kernel/src moves also
+# include other in-tree edits landing in the same tree).
 # GP GT/GEM/power source-order translations are included in the 2026-10-10 re-scan.
 # The 2026-10-10 GT wiring re-scan adds the MIT i915 probe/uncore/workaround
 # translations and the MIT sides of drm_mm.c and ttm_device.c (crates/ax at 40:
@@ -58,7 +63,7 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # lines in the newly translated FreeBSD drivers and the OpenBSD iwx/net80211
 # translations, plus one FreeBSD ig4 register line. Those have BSD-source
 # provenance, not Linux provenance; see `docs/upstream-provenance.md`.
-    ("crates/ax", 25): (18, 15, 4, 2155, 1974, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 1894, 1858, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their

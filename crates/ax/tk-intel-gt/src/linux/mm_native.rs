@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors.
-//! Original LinuxKPI MM operations over native axmm address spaces. No Linux
-//! MM implementation is copied. A process owner binds its native address space
-//! explicitly; kernel tasks without a binding cannot create user mappings.
+//! Linux MM shim over the calling process's real address space. No Linux MM
+//! implementation is copied. `current_mm()` resolves the current task's
+//! process address space through a provider that the kernel installs; every
+//! operation (usercopy, mapping, pinning, interval notifiers) goes through the
+//! same `UserAddressSpace` that the core mm uses, so the core invalidation
+//! hooks deliver to the interval subscribers registered here.
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{
+    any::Any,
     cell::UnsafeCell,
     ffi::{c_int, c_long, c_ulong, c_void},
     mem::size_of,
@@ -13,12 +17,13 @@ use core::{
 };
 
 use axhal::paging::MappingFlags;
-use memory_addr::{MemoryAddr, VirtAddrRange};
 
 use super::{
     mm::{VM_WRITE, VmAreaStruct},
     shmem,
 };
+use mmu_notifier::{self, Event, Range as NotifierSpan, Subscriber};
+
 use crate::{
     i915_gem_object_types_upstream::Page,
     intel_context_types_upstream::File,
@@ -26,17 +31,76 @@ use crate::{
     linux_config::PAGE_SIZE,
 };
 
+/// One process address space as the Linux mm shim sees it. The kernel
+/// implements this over its per-process `AddrSpace` and holds it weakly: the
+/// shim never keeps process memory alive. Once the process exits,
+/// `alive()` is false, every operation fails closed, and the core
+/// `mmu_notifier::release` has already invalidated the interval subscribers.
+pub trait UserAddressSpace: Send + Sync {
+    /// Core notifier-domain key (the address space's `AddressSpaceId`).
+    fn id(&self) -> u64;
+    /// False once the process address space has been destroyed.
+    fn alive(&self) -> bool;
+    /// `(base, end)` of the user virtual address range.
+    fn bounds(&self) -> (usize, usize);
+    fn contains_range(&self, addr: usize, size: usize) -> bool;
+    /// First free area at or after `hint` (or the base when `hint` is 0).
+    fn find_free_area(&self, hint: usize, size: usize) -> Option<usize>;
+    /// Current 4 KiB-page leaf for `addr`: physical base and flags.
+    fn query(&self, addr: usize) -> Option<(usize, MappingFlags)>;
+    /// Fault-checked read; `false` if any byte is unmapped or unreadable.
+    fn read(&self, addr: usize, dst: &mut [u8]) -> bool;
+    /// Fault-checked write; `false` if any byte is unmapped or unwritable.
+    fn write(&self, addr: usize, src: &[u8]) -> bool;
+    fn map_linear(&self, addr: usize, paddr: usize, size: usize, flags: MappingFlags) -> bool;
+    fn unmap(&self, addr: usize, size: usize) -> bool;
+    /// Faults in and pins the page-aligned range `[addr, addr + size)` with the
+    /// core long-term pin owner. The returned frames are the physical pages the
+    /// process maps. They stay allocated, and a COW break or unmap defers their
+    /// release, until `hold` is dropped.
+    fn pin(&self, addr: usize, size: usize, write: bool) -> Result<PinnedFrames, c_int>;
+}
+
+/// Physical 4 KiB frames of a pinned user range, plus the owner that keeps
+/// them pinned.
+pub struct PinnedFrames {
+    pub frames: Vec<usize>,
+    pub hold: Box<dyn Any + Send>,
+}
+
+/// Installed once by kernel glue: returns the calling task's process address
+/// space, or `None` for kernel threads and uninitialised tasks.
+pub type CurrentUserAddressSpace = fn() -> Option<Arc<dyn UserAddressSpace>>;
+
+static CURRENT_USER_ADDRESS_SPACE: spin::Once<CurrentUserAddressSpace> = spin::Once::new();
+
+/// Installs the provider behind [`current_mm`]. A second installation is
+/// refused: the provider is process-global.
+pub fn install_current_user_address_space(
+    provider: CurrentUserAddressSpace,
+) -> Result<(), &'static str> {
+    let mut installed = false;
+    CURRENT_USER_ADDRESS_SPACE.call_once(|| {
+        installed = true;
+        provider
+    });
+    if installed {
+        Ok(())
+    } else {
+        Err("current user address space provider already installed")
+    }
+}
+
 pub struct MmStruct {
-    aspace: UnsafeCell<axmm::AddrSpace>,
+    space: Arc<dyn UserAddressSpace>,
     vmas: UnsafeCell<BTreeMap<usize, NativeVma>>,
     locked: AtomicBool,
     user_access_owner: AtomicU64,
     user_access_start: AtomicUsize,
     user_access_end: AtomicUsize,
-    /// `struct mmu_interval_notifier *` registered on this mm.
-    interval_notifiers: spin::Mutex<Vec<usize>>,
-    /// Sequence stamped into each invalidated notifier (`mm->notifier_seq`).
-    notifier_seq: AtomicU64,
+    /// Key of this address space's notifier domain in `tk_mmu_notifier`. The
+    /// core mm raises its invalidations under the same key.
+    aspace_key: u64,
 }
 struct NativeVma {
     area: Box<VmAreaStruct>,
@@ -57,45 +121,48 @@ impl Drop for NativeVma {
 // current-task binding owns an Arc until the process explicitly unbinds it.
 unsafe impl Send for MmStruct {}
 unsafe impl Sync for MmStruct {}
+/// One `MmStruct` per live process address space, keyed by its notifier
+/// domain. An entry is pruned only after its address space has died and no
+/// notifier owner holds it.
 static MAPPINGS: spin::Mutex<BTreeMap<u64, Arc<MmStruct>>> = spin::Mutex::new(BTreeMap::new());
+
+/// Notifier records hold their MM alive (Linux `mmgrab()` on
+/// `notifier.mm`) until `mmu_interval_notifier_remove()`.
+static NOTIFIER_OWNERS: spin::Mutex<BTreeMap<usize, Arc<MmStruct>>> =
+    spin::Mutex::new(BTreeMap::new());
+
 impl MmStruct {
-    pub fn new(aspace: axmm::AddrSpace) -> Arc<Self> {
+    fn new(space: Arc<dyn UserAddressSpace>) -> Arc<Self> {
+        let aspace_key = space.id();
         Arc::new(Self {
-            aspace: UnsafeCell::new(aspace),
+            space,
             vmas: UnsafeCell::new(BTreeMap::new()),
             locked: AtomicBool::new(false),
             user_access_owner: AtomicU64::new(u64::MAX),
             user_access_start: AtomicUsize::new(0),
             user_access_end: AtomicUsize::new(0),
-            interval_notifiers: spin::Mutex::new(Vec::new()),
-            notifier_seq: AtomicU64::new(0),
+            aspace_key,
         })
     }
 }
-/// Process-lifetime binding, not automatically installed by the GT feature.
-pub fn bind_current_mm(mm: Arc<MmStruct>) -> Result<(), &'static str> {
-    let task = axtask::current_may_uninit().ok_or("no current task")?;
-    let mut mappings = MAPPINGS.lock();
-    if mappings.contains_key(&task.id().as_u64()) {
-        return Err("task already has an MM binding");
-    }
-    mappings.insert(task.id().as_u64(), mm);
-    Ok(())
-}
-/// Call only after all userptr/MM users of the process have quiesced.
-pub unsafe fn unbind_current_mm() {
-    if let Some(task) = axtask::current_may_uninit() {
-        MAPPINGS.lock().remove(&task.id().as_u64());
-    }
-}
+
+/// Linux `current->mm`: the MM of the calling task's process, or null when
+/// the task has no user address space.
 pub fn current_mm() -> *mut MmStruct {
-    let Some(task) = axtask::current_may_uninit() else {
+    let Some(provider) = CURRENT_USER_ADDRESS_SPACE.get() else {
         return ptr::null_mut();
     };
-    MAPPINGS
-        .lock()
-        .get(&task.id().as_u64())
-        .map_or(ptr::null_mut(), |mm| Arc::as_ptr(mm).cast_mut())
+    let Some(space) = provider() else {
+        return ptr::null_mut();
+    };
+    if !space.alive() {
+        return ptr::null_mut();
+    }
+    let key = space.id();
+    let mut mappings = MAPPINGS.lock();
+    mappings.retain(|_, mm| mm.space.alive() || Arc::strong_count(mm) > 1);
+    let mm = mappings.entry(key).or_insert_with(|| MmStruct::new(space));
+    Arc::as_ptr(mm).cast_mut()
 }
 pub unsafe fn mmap_read_lock(mm: *mut MmStruct) {
     assert!(!mm.is_null(), "mmap lock without a user address space");
@@ -191,20 +258,25 @@ pub unsafe fn map_pfn(mm: *mut MmStruct, addr: usize, pfn: usize, prot: u64) -> 
     if mm.is_null() || addr & 4095 != 0 {
         return -crate::linux_config::EINVAL;
     }
-    if unsafe { (&*(*mm).aspace.get()).query_leaf(addr.into()).is_ok() } {
-        unsafe { invalidate_interval_notifiers(mm, addr, 4096, MMU_NOTIFY_CLEAR) };
-    }
-    let space = unsafe { &mut *(*mm).aspace.get() };
-    if space.query_leaf(addr.into()).is_ok() && space.unmap(addr.into(), 4096).is_err() {
-        return -crate::linux_config::EIO;
-    }
-    match space.map_linear(addr.into(), (pfn << 12).into(), 4096, map_flags(prot)) {
-        Ok(()) => {
-            unsafe { axhal::asm::flush_tlb(Some(addr.into())) };
-            0
+    let space = unsafe { &(*mm).space };
+    if space.query(addr).is_some() {
+        let _invalidation = unsafe {
+            mmu_notifier::invalidate_range_start(
+                (*mm).aspace_key,
+                addr,
+                addr + 4096,
+                Event::Clear,
+            )
+        };
+        if !space.unmap(addr, 4096) {
+            return -crate::linux_config::EIO;
         }
-        Err(_) => -crate::linux_config::ENOMEM,
     }
+    if !space.map_linear(addr, pfn << 12, 4096, map_flags(prot)) {
+        return -crate::linux_config::ENOMEM;
+    }
+    unsafe { axhal::asm::flush_tlb(Some(addr.into())) };
+    0
 }
 /// Range record handed to interval-notifier callbacks. Field order follows
 /// Linux `struct mmu_notifier_range` (CONFIG_MMU_NOTIFIER).
@@ -218,72 +290,76 @@ struct NotifierRange {
     owner: *mut c_void,
 }
 
-const MMU_NOTIFY_UNMAP: u32 = 0;
-const MMU_NOTIFY_CLEAR: u32 = 1;
+/// Adapts one `struct mmu_interval_notifier` to the core notifier domain. The
+/// domain holds the subscriber's record address as its token; the driver's
+/// `ops->invalidate` runs with the sequence the domain published.
+struct IntervalSubscriber {
+    notifier: *mut MmuIntervalNotifier,
+}
 
-/// Linux `mmu_notifier_invalidate_range_start()` for interval notifiers: every
-/// notifier whose interval overlaps `[start, start + size)` is invalidated
-/// before the PTEs go away. Each invalidation takes a fresh `notifier_seq`,
-/// which the callback stores into the notifier's `invalidate_seq`, so readers
-/// that sampled an earlier sequence see the retry.
-unsafe fn invalidate_interval_notifiers(mm: *mut MmStruct, start: usize, size: usize, event: u32) {
-    let subscribers = unsafe { (*mm).interval_notifiers.lock().clone() };
-    if subscribers.is_empty() || size == 0 {
-        return;
-    }
-    let Some(end) = start.checked_add(size) else {
-        return;
-    };
-    let cur_seq = unsafe { (*mm).notifier_seq.fetch_add(1, Ordering::AcqRel) } + 1;
-    let range = NotifierRange {
-        mm,
-        start: start as c_ulong,
-        end: end as c_ulong,
-        flags: 0,
-        event,
-        owner: ptr::null_mut(),
-    };
-    for raw in subscribers {
-        let notifier = raw as *mut MmuIntervalNotifier;
-        let (first, last) = unsafe {
-            (
-                (*notifier).interval_tree.start,
-                (*notifier).interval_tree.last,
-            )
+// SAFETY: the notifier record is owned by its driver object and stays valid
+// until `mmu_interval_notifier_remove()`, which waits for in-flight
+// invalidations. Its fields are accessed through the domain's protocol.
+unsafe impl Send for IntervalSubscriber {}
+unsafe impl Sync for IntervalSubscriber {}
+
+impl Subscriber for IntervalSubscriber {
+    fn invalidate(&self, range: &NotifierSpan, seq: u64) -> bool {
+        let notifier = self.notifier;
+        let (ops, mm) = unsafe { ((*notifier).ops, (*notifier).mm) };
+        let raw = NotifierRange {
+            mm,
+            start: range.start as c_ulong,
+            end: range.end as c_ulong,
+            flags: 0,
+            event: range.event as u32,
+            owner: ptr::null_mut(),
         };
-        if first >= end || start > last {
-            continue;
-        }
-        let ops = unsafe { (*notifier).ops };
         let invalidate =
             unsafe { (*ops).invalidate }.expect("interval notifier without invalidate");
         let blockable = unsafe {
             invalidate(
                 notifier,
-                ptr::addr_of!(range).cast::<MmuNotifierRange>(),
-                cur_seq as c_ulong,
+                ptr::addr_of!(raw).cast::<MmuNotifierRange>(),
+                seq as c_ulong,
             )
         };
         assert!(
             blockable,
             "blockable interval-notifier invalidation refused"
         );
+        blockable
+    }
+
+    fn seq(&self) -> u64 {
+        unsafe { ptr::addr_of!((*self.notifier).invalidate_seq).read_volatile() as u64 }
+    }
+
+    fn set_seq(&self, seq: u64) {
+        // Source mmu_interval_set_seq() is WRITE_ONCE on invalidate_seq.
+        unsafe {
+            ptr::addr_of_mut!((*self.notifier).invalidate_seq).write_volatile(seq as c_ulong)
+        };
     }
 }
 
 pub unsafe fn zap_range(mm: *mut MmStruct, addr: usize, size: usize) {
     assert!(!mm.is_null());
-    unsafe { invalidate_interval_notifiers(mm, addr, size, MMU_NOTIFY_UNMAP) };
-    let space = unsafe { &mut *(*mm).aspace.get() };
+    let end = addr.checked_add(size).expect("zap range wraps the address space");
+    let _invalidation = unsafe {
+        mmu_notifier::invalidate_range_start((*mm).aspace_key, addr, end, Event::Unmap)
+    };
+    let space = unsafe { &(*mm).space };
     if size != 0 {
         let page_size = crate::linux_config::PAGE_SIZE;
         let mut offset = 0usize;
         while offset < size {
             let page = addr + offset;
-            if space.query_leaf(page.into()).is_ok() {
-                space
-                    .unmap(page.into(), page_size)
-                    .expect("native MM lost a mapped leaf during zap");
+            if space.query(page).is_some() {
+                assert!(
+                    space.unmap(page, page_size),
+                    "native MM lost a mapped leaf during zap"
+                );
             }
             offset = offset.saturating_add(page_size);
         }
@@ -379,19 +455,10 @@ pub unsafe fn vm_mmap(
     }
     unsafe { mmap_read_lock(mm) };
     let result = (|| -> Result<usize, c_int> {
-        let space = unsafe { &mut *(*mm).aspace.get() };
+        let space = unsafe { &(*mm).space };
         let start = space
-            .find_free_area(
-                if addr == 0 {
-                    space.base()
-                } else {
-                    (addr as usize).into()
-                },
-                size as usize,
-                VirtAddrRange::new(space.base(), space.end()),
-            )
-            .ok_or(-crate::linux_config::ENOMEM)?
-            .as_usize();
+            .find_free_area(addr as usize, size as usize)
+            .ok_or(-crate::linux_config::ENOMEM)?;
         let file = file.cast::<shmem::File>();
         let mapping = unsafe { (*file).f_mapping };
         let mut pages = Vec::new();
@@ -469,13 +536,12 @@ pub unsafe fn copy_from_user(to: *mut c_void, from: *const c_void, size: usize) 
     }
     unsafe { mmap_read_lock(mm) };
     let result = unsafe {
-        (&*(*mm).aspace.get()).read(
-            (from as usize).into(),
-            core::slice::from_raw_parts_mut(to.cast(), size),
-        )
+        (*mm)
+            .space
+            .read(from as usize, core::slice::from_raw_parts_mut(to.cast(), size))
     };
     unsafe { mmap_read_unlock(mm) };
-    if result.is_ok() { 0 } else { size }
+    if result { 0 } else { size }
 }
 pub unsafe fn copy_to_user(to: *mut c_void, from: *const c_void, size: usize) -> usize {
     if size == 0 {
@@ -487,13 +553,12 @@ pub unsafe fn copy_to_user(to: *mut c_void, from: *const c_void, size: usize) ->
     }
     unsafe { mmap_read_lock(mm) };
     let result = unsafe {
-        (&*(*mm).aspace.get()).write(
-            (to as usize).into(),
-            core::slice::from_raw_parts(from.cast(), size),
-        )
+        (*mm)
+            .space
+            .write(to as usize, core::slice::from_raw_parts(from.cast(), size))
     };
     unsafe { mmap_read_unlock(mm) };
-    if result.is_ok() { 0 } else { size }
+    if result { 0 } else { size }
 }
 
 /// Linux `copy_from_user()` ABI entry; see [`copy_from_user`].
@@ -532,13 +597,12 @@ pub unsafe extern "C" fn __copy_to_user_inatomic(
         return n;
     }
     let result = unsafe {
-        (&*(*mm).aspace.get()).write(
-            (to as usize).into(),
-            core::slice::from_raw_parts(from.cast(), n),
-        )
+        (*mm)
+            .space
+            .write(to as usize, core::slice::from_raw_parts(from.cast(), n))
     };
     unsafe { mmap_read_unlock(mm) };
-    if result.is_ok() { 0 } else { n }
+    if result { 0 } else { n }
 }
 
 /// Linux `copy_from_user_inatomic_nontemporal()`. The non-temporal store hint
@@ -555,7 +619,7 @@ pub unsafe extern "C" fn copy_from_user_inatomic_nontemporal(
 
 /// Linux `access_ok()` on x86_64: a user range is admissible when it does not
 /// wrap and ends at or below `TASK_SIZE_MAX`. This only range-checks the
-/// pointer; the copy itself is still checked page by page by axmm.
+/// pointer; the copy itself is still checked page by page by the core mm.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn access_ok(addr: *const c_void, size: u64) -> bool {
     const TASK_SIZE_MAX: u64 = 0x0000_7fff_ffff_f000;
@@ -592,20 +656,30 @@ pub unsafe extern "C" fn __copy_from_user_inatomic(
         return size;
     }
     let result = unsafe {
-        (&*(*mm).aspace.get()).read(
-            (from as usize).into(),
-            core::slice::from_raw_parts_mut(to.cast(), size),
-        )
+        (*mm)
+            .space
+            .read(from as usize, core::slice::from_raw_parts_mut(to.cast(), size))
     };
     unsafe { mmap_read_unlock(mm) };
-    if result.is_ok() { 0 } else { size }
+    if result { 0 } else { size }
 }
 
-/// Linux `pin_user_pages_fast(start, nr_pages, gup_flags, pages)`. Each page
-/// is resolved through the current process's checked address space, must be
-/// readable (and writable under `FOLL_WRITE`), and receives one page
-/// reference that `unpin_user_pages` drops. A short pin returns the number
-/// pinned; a failure before the first page returns a negative errno.
+/// A pin record: the `Page` references handed out by one
+/// `pin_user_pages_fast` call, and the core owner that keeps the frames pinned
+/// until the matching `unpin_user_pages` call.
+struct PinRecord {
+    pages: Vec<usize>,
+    _hold: Box<dyn Any + Send>,
+}
+
+static PIN_RECORDS: spin::Mutex<Vec<PinRecord>> = spin::Mutex::new(Vec::new());
+
+/// Linux `pin_user_pages_fast(start, nr_pages, gup_flags, pages)`. The range
+/// is faulted in and pinned by the core long-term pin owner of the calling
+/// process (writable under `FOLL_WRITE`, which breaks COW first). Each page
+/// receives one `Page` reference, and the pin lasts until
+/// `unpin_user_pages` drops those references. Pinning is all-or-nothing: a
+/// failure returns a negative errno and pins nothing.
 #[unsafe(export_name = "pin_user_pages_fast")]
 pub unsafe extern "C" fn pin_user_pages_fast_c(
     start: c_ulong,
@@ -625,59 +699,70 @@ pub unsafe extern "C" fn pin_user_pages_fast_c(
         return -crate::linux_config::EFAULT;
     }
     let count = nr_pages as usize;
-    let mut pinned = 0usize;
-    let mut failure = 0i32;
-    unsafe { mmap_read_lock(mm) };
-    {
-        let aspace = unsafe { &*(*mm).aspace.get() };
-        for index in 0..count {
-            let Some(address) = (start as usize).checked_add(index * PAGE_SIZE) else {
-                failure = -crate::linux_config::EFAULT;
-                break;
-            };
-            let Ok((physical, flags, _)) = aspace.query_leaf(address.into()) else {
-                failure = -crate::linux_config::EFAULT;
-                break;
-            };
-            let writable_ok = gup_flags & FOLL_WRITE == 0 || flags.contains(MappingFlags::WRITE);
-            if !flags.contains(MappingFlags::READ) || !writable_ok {
-                failure = -crate::linux_config::EFAULT;
-                break;
+    let base = (start as usize) & !(PAGE_SIZE - 1);
+    let Some(size) = count.checked_mul(PAGE_SIZE) else {
+        return -crate::linux_config::EFAULT;
+    };
+    let pinned = unsafe { (*mm).space.pin(base, size, gup_flags & FOLL_WRITE != 0) };
+    let PinnedFrames { frames, hold } = match pinned {
+        Ok(pinned) => pinned,
+        Err(err) => return -err,
+    };
+    let mut refs = Vec::new();
+    if refs.try_reserve_exact(count).is_err() {
+        return -crate::linux_config::ENOMEM;
+    }
+    for (index, paddr) in frames.iter().copied().enumerate() {
+        let page = unsafe { shmem::pin_physical_frame(paddr) };
+        if page.is_null() {
+            for taken in refs {
+                unsafe { shmem::put_page(taken as *mut Page) };
             }
-            let page = unsafe { shmem::pin_physical_frame(physical.as_usize()) };
-            if page.is_null() {
-                failure = -crate::linux_config::ENOMEM;
-                break;
-            }
-            unsafe { pages.add(index).write(page) };
-            pinned += 1;
+            return -crate::linux_config::ENOMEM;
         }
+        refs.push(page as usize);
+        unsafe { pages.add(index).write(page) };
     }
-    unsafe { mmap_read_unlock(mm) };
-    if pinned == 0 && failure != 0 {
-        return failure;
-    }
-    pinned as i32
+    PIN_RECORDS.lock().push(PinRecord {
+        pages: refs,
+        _hold: hold,
+    });
+    count as i32
 }
 
 /// Linux `unpin_user_pages(pages, npages)`: drops the references taken by
-/// [`pin_user_pages_fast_c`].
+/// [`pin_user_pages_fast_c`] and releases the core pin of that call.
 ///
 /// # Safety
 /// Every non-NULL entry must be a page returned by a pin and not yet unpinned.
 #[unsafe(export_name = "unpin_user_pages")]
 pub unsafe extern "C" fn unpin_user_pages_c(pages: *mut *mut Page, npages: c_ulong) {
-    for index in 0..npages as usize {
-        let page = unsafe { pages.add(index).read() };
-        if !page.is_null() {
-            unsafe { shmem::put_page(page) };
+    let count = npages as usize;
+    if pages.is_null() || count == 0 {
+        return;
+    }
+    let slice = unsafe { core::slice::from_raw_parts(pages, count) };
+    let refs: Vec<usize> = slice.iter().map(|page| *page as usize).collect();
+    // Release the record first: its pin is the one that keeps these frames
+    // from being reused while the references are being dropped.
+    let record = {
+        let mut records = PIN_RECORDS.lock();
+        records
+            .iter()
+            .position(|record| record.pages == refs)
+            .map(|index| records.swap_remove(index))
+    };
+    for page in refs {
+        if page != 0 {
+            unsafe { shmem::put_page(page as *mut Page) };
         }
     }
+    drop(record);
 }
 
 /// Linux `mmu_interval_notifier_insert()`: subscribe `notifier` to
-/// invalidations of `[start, start + length)` in `mm`. Its sequence starts at
-/// the mm's current `notifier_seq`.
+/// invalidations of `[start, start + length)` in `mm`. The subscription lives in
+/// the core notifier domain of the mm's address space.
 ///
 /// # Safety
 /// `notifier` must stay valid until [`mmu_interval_notifier_remove`].
@@ -696,19 +781,32 @@ pub unsafe extern "C" fn mmu_interval_notifier_insert(
         return -crate::linux_config::EINVAL;
     };
     unsafe {
-        let mut subscribers = (*mm).interval_notifiers.lock();
-        if subscribers.contains(&(notifier as usize)) {
-            return -crate::linux_config::EINVAL;
-        }
         (*notifier).interval_tree.start = start as usize;
         (*notifier).interval_tree.last = last;
         (*notifier).interval_tree.subtree_last = last;
         (*notifier).ops = ops;
         (*notifier).mm = mm;
-        (*notifier).invalidate_seq = (*mm).notifier_seq.load(Ordering::Acquire) as c_ulong;
-        subscribers.push(notifier as usize);
+        let subscriber = alloc::sync::Arc::new(IntervalSubscriber { notifier });
+        match mmu_notifier::subscribe(
+            (*mm).aspace_key,
+            notifier as usize,
+            start as usize,
+            last,
+            subscriber,
+        ) {
+            Ok(()) => {
+                // mmgrab(): the record keeps its MM alive until remove.
+                Arc::increment_strong_count(mm.cast_const());
+                let owner = Arc::from_raw(mm.cast_const());
+                NOTIFIER_OWNERS.lock().insert(notifier as usize, owner);
+                0
+            }
+            Err(_) => {
+                (*notifier).mm = ptr::null_mut();
+                -crate::linux_config::EINVAL
+            }
+        }
     }
-    0
 }
 
 /// Linux `mmu_interval_notifier_remove()`. Invalidations are synchronous in
@@ -727,12 +825,12 @@ pub unsafe extern "C" fn mmu_interval_notifier_remove(notifier: *mut MmuInterval
         return;
     }
     unsafe {
-        (*mm)
-            .interval_notifiers
-            .lock()
-            .retain(|&entry| entry != notifier as usize);
+        mmu_notifier::unsubscribe((*mm).aspace_key, notifier as usize);
         (*notifier).mm = ptr::null_mut();
     }
+    // mmdrop(): release the record's MM reference after its subscription ends.
+    let owner = NOTIFIER_OWNERS.lock().remove(&(notifier as usize));
+    drop(owner);
 }
 
 /// Linux `mmu_interval_read_begin()`: the sequence a reader samples before it
@@ -743,7 +841,12 @@ pub unsafe extern "C" fn mmu_interval_notifier_remove(notifier: *mut MmuInterval
 /// `notifier` must be an inserted notifier.
 #[unsafe(export_name = "mmu_interval_read_begin")]
 pub unsafe extern "C" fn mmu_interval_read_begin(notifier: *mut MmuIntervalNotifier) -> c_ulong {
-    unsafe { ptr::addr_of!((*notifier).invalidate_seq).read_volatile() }
+    let mm = unsafe { (*notifier).mm };
+    let subscriber = IntervalSubscriber { notifier };
+    if mm.is_null() {
+        return subscriber.seq() as c_ulong;
+    }
+    mmu_notifier::read_begin(unsafe { (*mm).aspace_key }, &subscriber) as c_ulong
 }
 
 /// `get_user()` / `__get_user()` for one typed value.
@@ -790,12 +893,11 @@ pub unsafe fn unsafe_put_user<T: Copy>(value: T, to: *mut T) -> c_int {
         return -crate::linux_config::EFAULT;
     }
     let result = unsafe {
-        (&*(*mm).aspace.get()).write(
-            address.into(),
-            core::slice::from_raw_parts(ptr::addr_of!(value).cast::<u8>(), size),
-        )
+        (*mm)
+            .space
+            .write(address, core::slice::from_raw_parts(ptr::addr_of!(value).cast::<u8>(), size))
     };
-    if result.is_ok() {
+    if result {
         0
     } else {
         -crate::linux_config::EFAULT
@@ -803,7 +905,7 @@ pub unsafe fn unsafe_put_user<T: Copy>(value: T, to: *mut T) -> c_int {
 }
 
 /// Check every leaf covered by the complete byte range, not only its first
-/// address. `query_leaf()` resolves large-page leaves too, so stepping by the
+/// address. `query()` resolves large-page leaves too, so stepping by the
 /// native base page safely covers the range independent of leaf size.
 fn user_write_range_mapped(mm: *mut MmStruct, address: usize, size: usize) -> bool {
     if mm.is_null() || size == 0 {
@@ -812,15 +914,15 @@ fn user_write_range_mapped(mm: *mut MmStruct, address: usize, size: usize) -> bo
     let Some(last_byte) = address.checked_add(size - 1) else {
         return false;
     };
-    let space = unsafe { &*(*mm).aspace.get() };
-    if !space.contains_range(address.into(), size) {
+    let space = unsafe { &(*mm).space };
+    if !space.contains_range(address, size) {
         return false;
     }
     let page_size = crate::linux_config::PAGE_SIZE;
     let mut page = address & !(page_size - 1);
     let last_page = last_byte & !(page_size - 1);
     loop {
-        let Ok((_, flags, _)) = space.query_leaf(page.into()) else {
+        let Some((_, flags)) = space.query(page) else {
             return false;
         };
         if !flags.contains(MappingFlags::WRITE) {
@@ -936,5 +1038,113 @@ mod usercopy_range_tests {
             assert!(!access_ok(top, 1));
             assert!(!access_ok(0x1000 as *const c_void, u64::MAX));
         }
+    }
+}
+
+#[cfg(test)]
+mod process_pin_tests {
+    use alloc::{collections::BTreeMap, sync::Arc};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// Process address space with a fixed set of resident 4 KiB leaves.
+    struct FakeSpace {
+        leaves: BTreeMap<usize, usize>,
+        pins: AtomicUsize,
+        released: Arc<AtomicUsize>,
+    }
+
+    /// Stands for the core long-term pin owner: dropping it releases the pin.
+    struct HoldProbe(Arc<AtomicUsize>);
+
+    impl Drop for HoldProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl UserAddressSpace for FakeSpace {
+        fn id(&self) -> u64 {
+            7
+        }
+        fn alive(&self) -> bool {
+            true
+        }
+        fn bounds(&self) -> (usize, usize) {
+            (0x1000, 0x8000_0000)
+        }
+        fn contains_range(&self, _addr: usize, _size: usize) -> bool {
+            true
+        }
+        fn find_free_area(&self, hint: usize, _size: usize) -> Option<usize> {
+            Some(hint)
+        }
+        fn query(&self, addr: usize) -> Option<(usize, MappingFlags)> {
+            self.leaves
+                .get(&addr)
+                .map(|paddr| (*paddr, MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE))
+        }
+        fn read(&self, _addr: usize, _dst: &mut [u8]) -> bool {
+            true
+        }
+        fn write(&self, _addr: usize, _src: &[u8]) -> bool {
+            true
+        }
+        fn map_linear(&self, _addr: usize, _paddr: usize, _size: usize, _flags: MappingFlags) -> bool {
+            true
+        }
+        fn unmap(&self, _addr: usize, _size: usize) -> bool {
+            true
+        }
+        fn pin(&self, addr: usize, size: usize, _write: bool) -> Result<PinnedFrames, c_int> {
+            let mut frames = Vec::new();
+            for page in (addr..addr + size).step_by(PAGE_SIZE) {
+                frames.push(*self.leaves.get(&page).ok_or(-crate::linux_config::EFAULT)?);
+            }
+            self.pins.fetch_add(1, Ordering::AcqRel);
+            Ok(PinnedFrames {
+                frames,
+                hold: Box::new(HoldProbe(self.released.clone())),
+            })
+        }
+    }
+
+    static FAKE: spin::Once<Arc<FakeSpace>> = spin::Once::new();
+
+    fn provider() -> Option<Arc<dyn UserAddressSpace>> {
+        let space = FAKE.get()?.clone();
+        Some(space)
+    }
+
+    #[test]
+    fn pin_user_pages_fast_returns_the_mapped_frames_until_unpinned() {
+        FAKE.call_once(|| {
+            let mut leaves = BTreeMap::new();
+            leaves.insert(0x10000, 0x80000);
+            leaves.insert(0x11000, 0x90000);
+            Arc::new(FakeSpace {
+                leaves,
+                pins: AtomicUsize::new(0),
+                released: Arc::new(AtomicUsize::new(0)),
+            })
+        });
+        let space = FAKE.get().unwrap().clone();
+        // Installed once for this test binary; this is the only installer.
+        let _ = install_current_user_address_space(provider);
+
+        let mut pages: [*mut Page; 2] = [ptr::null_mut(); 2];
+        let pinned = unsafe { pin_user_pages_fast_c(0x10000, 2, 1, pages.as_mut_ptr()) };
+        assert_eq!(pinned, 2);
+        let frames: Vec<usize> = pages
+            .iter()
+            .map(|page| unsafe { shmem::page_to_phys(*page) })
+            .collect();
+        assert_eq!(frames, [0x80000, 0x90000]);
+        assert_eq!(space.pins.load(Ordering::Acquire), 1);
+        assert_eq!(space.released.load(Ordering::Acquire), 0);
+
+        unsafe { unpin_user_pages_c(pages.as_mut_ptr(), 2) };
+        assert_eq!(space.released.load(Ordering::Acquire), 1);
     }
 }

@@ -1816,6 +1816,7 @@ impl BackendOps for SharedBackend {
         flags: MappingFlags,
         access_flags: MappingFlags,
         pt: &mut PageTableCursor,
+        _aspace_id: tk_linux_mm::AddressSpaceId,
     ) -> PopulateOutcome {
         let result = self.pages.with_external_mapping(|| {
             let offset = range

@@ -1,5 +1,13 @@
 # The Intel pipe: timings, DDB, watermarks and the primary plane
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 **Status: none of this has run on the target machine.** The target is an Acer
 蜂鸟mini (SQM2270) with an i3-N305 (`8086:46d0`, ADL-N, display IP version 13).
 Every number below comes from `docs/design/intel-display-registers.md`, from the

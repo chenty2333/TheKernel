@@ -462,10 +462,10 @@ fn interpret(register: Register, value: u64) -> String {
             }
         }
         // A bring-up register, a bus register or a hotplug register is decoded
-        // where it is used -- by `power`, `clk` and `phy`, which hold the state
-        // a decode depends on (which reference frequency is in force, which
-        // well is being enabled), or by `gmbus` and `hpd`, whose registers only
-        // mean something inside a transaction or a detection procedure.  A
+        // where it is used, by the code that holds the state a decode depends
+        // on (which reference frequency is in force, which well is being
+        // enabled, or whether a bus transaction or a detection procedure is
+        // in progress).  A
         // second decoding here would be a second place to be wrong, and the
         // probe never reads one of these anyway: none is in `NAMED`.
         Meaning::BusController | Meaning::Hotplug | Meaning::PowerWell | Meaning::BringUp => {

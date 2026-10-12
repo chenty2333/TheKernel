@@ -1,5 +1,13 @@
 # N305 display acceptance: the hardware procedure for the Intel bring-up
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 **Target machine:** Acer 蜂鸟 mini (SQM2270), Intel Core i3-N305 (Alder Lake-N), display device
 `8086:46d0`, 16 GB RAM, 512 GB NVMe, no operating system installed, **no serial port**. The screen
 is the only output device the machine has.

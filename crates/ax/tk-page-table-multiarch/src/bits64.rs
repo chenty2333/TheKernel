@@ -1548,6 +1548,35 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
     ///
     /// Returns [`Err(PagingError::NotMapped)`](PagingError::NotMapped) if the
     /// mapping is not present.
+    /// Models the CPU setting the accessed bit of the leaf at `vaddr`.
+    pub fn set_accessed(&mut self, vaddr: M::VirtAddr) -> PagingResult<()> {
+        let (entry, _size) = self.inner.get_entry_mut(vaddr)?;
+        if entry.is_unused() || !entry.is_present() {
+            return Err(PagingError::NotMapped);
+        }
+        entry.set_accessed();
+        Ok(())
+    }
+
+    /// Returns whether the leaf at `vaddr` had its hardware accessed bit set,
+    /// clearing it and queueing a TLB flush so the next access sets it again.
+    /// This is the page-table half of Linux `ptep_test_and_clear_young()`.
+    ///
+    /// Returns [`Err(PagingError::NotMapped)`](PagingError::NotMapped) if the
+    /// mapping is not present.
+    pub fn test_and_clear_young(&mut self, vaddr: M::VirtAddr) -> PagingResult<bool> {
+        let (entry, _size) = self.inner.get_entry_mut(vaddr)?;
+        if entry.is_unused() || !entry.is_present() {
+            return Err(PagingError::NotMapped);
+        }
+        let young = entry.is_accessed();
+        if young {
+            entry.clear_accessed();
+            self.push(vaddr);
+        }
+        Ok(young)
+    }
+
     pub fn protect(&mut self, vaddr: M::VirtAddr, flags: MappingFlags) -> PagingResult<PageSize> {
         let (entry, size) = self.inner.get_entry_mut(vaddr)?;
         if entry.is_unused() {

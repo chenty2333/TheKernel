@@ -12,6 +12,9 @@ pub struct AddrSpace {
     /// owners and remote memory operations all observe the same Linux
     /// process-wide high-water mark.
     pub(super) maxrss_kb: AtomicU64,
+    /// Historical peak of mapped user VM (`mm->hiwater_vm`, /proc VmPeak),
+    /// published with `maxrss_kb` before any mutation can lower it.
+    pub(super) maxvm_kb: AtomicU64,
     /// Shared mm-level OOM-reaper ownership.  This is part of the address
     /// space rather than ProcessData because separate CLONE_VM process groups
     /// must never concurrently retire the same PTE/backing ownership.
@@ -95,6 +98,9 @@ impl fmt::Debug for AddrSpace {
 
 impl Drop for AddrSpace {
     fn drop(&mut self) {
+        // exit_mmap(): Linux mmu_notifier_release() tells every interval
+        // subscriber that the address space is gone before its PTEs are torn down.
+        mmu_notifier::release(self.address_space_id.get());
         debug_assert_eq!(self.user_io_pins.progress().total(), 0);
         debug_assert!(self.active_long_term_cow_pins.is_empty());
         if let Err(err) = self.clear_areas_with_tlb_grace() {

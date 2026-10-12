@@ -8,7 +8,7 @@ const ACK_VDBOX0: u32 = 0xd50;
 const ACK_VEBOX0: u32 = 0xd70;
 const MEDIA_DISABLE: u32 = 0x9140;
 const BCS_CTL: u32 = 0x2203c;
-/// Deliberately has no write operation, unlike the modeset register interface.
+/// Deliberately has no write operation.
 trait ReadOnly {
     fn read(&self, offset: u32) -> Option<u32>;
 }

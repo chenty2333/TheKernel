@@ -3,7 +3,7 @@ use alloc::{sync::Arc, vec::Vec};
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{CachedFile, FileBackend, FileFlags};
 use axfs_ng_vfs::Location;
-use axhal::paging::{MappingFlags, PageSize, PreparedPageTableFrames};
+use axhal::paging::{MappingFlags, PageSize};
 use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::general::*;
@@ -3065,7 +3065,7 @@ pub(crate) fn process_madvise_collapse(
             return process_madvise_collapse(aspace_handle, addr, length);
         }
         let Some((mut cursor, end)) = collapse_full_pmd_range(addr, length)? else {
-            return Ok(());
+            return collapse_short_range_eligibility(&aspace, addr, length);
         };
         // Select from the first *eligible PMD*, not the raw user address:
         // MADV_COLLAPSE deliberately permits a leading partial VMA.
@@ -3492,14 +3492,36 @@ fn process_madvise_collapse_shared_locked(
     Ok(())
 }
 
+/// Linux `madvise_collapse()` runs `collapse_possible()` on the VMA before it
+/// looks for a full PMD. A range without one is therefore -EINVAL when its VMA
+/// cannot hold an aligned PMD or THP is disabled for it, and a no-op otherwise.
+fn collapse_short_range_eligibility(aspace: &AddrSpace, addr: usize, length: usize) -> AxResult {
+    if length == 0 {
+        return Ok(());
+    }
+    let (page_start, page_length) = validate_page_aligned_range(addr, length)?;
+    if aspace.forced_thp_collapse_allowed(VirtAddr::from(page_start), page_length) {
+        Ok(())
+    } else {
+        Err(AxError::InvalidInput)
+    }
+}
+
 fn process_madvise_collapse_locked(aspace: &mut AddrSpace, addr: usize, length: usize) -> AxResult {
     // MADV_COLLAPSE takes ordinary page-granular user ranges. Only PMD units
     // wholly enclosed by the page-rounded range are candidates; a partial
     // leading or trailing PMD retains its 4 KiB representation. This is
     // deliberately not a nonzero/multiple-of-2MiB argument gate.
     let Some((mut cursor, end)) = collapse_full_pmd_range(addr, length)? else {
-        return Ok(());
+        return collapse_short_range_eligibility(aspace, addr, length);
     };
+    // `mm/khugepaged.c:madvise_collapse()` begins with
+    // `if (!collapse_possible(vma, vma->vm_flags, TVA_FORCED_COLLAPSE))
+    // return -EINVAL;`, before any PMD is touched.  A disabled mm or a
+    // VM_NOHUGEPAGE VMA therefore fails the whole call with -EINVAL.
+    if !aspace.forced_thp_collapse_allowed(VirtAddr::from(cursor), end - cursor) {
+        return Err(AxError::InvalidInput);
+    }
     let unit = PageSize::Size2M as usize;
     let mut first_error = None;
     while cursor < end {
@@ -3637,11 +3659,8 @@ pub(super) fn apply_madvise_run(
     }
 
     if advice == MADV_COLLAPSE {
-        // Unreachable through `madvise(2)` on this kernel:
-        // `madvise_behavior_valid()` refuses MADV_COLLAPSE because
-        // CONFIG_TRANSPARENT_HUGEPAGE is off in the configuration this ABI is
-        // measured against.  The behaviour is kept intact for a kernel built
-        // with transparent huge pages.
+        // Linux `mm/khugepaged.c:madvise_collapse()`, reached through
+        // `madvise_vma_behavior()` for the VMA clip of this run.
         drop(aspace);
         return process_madvise_collapse(aspace_handle, addr, length);
     }
@@ -3753,8 +3772,10 @@ pub(super) fn apply_madvise_run(
         }
         MADV_COLD => process_madvise_cold(&mut aspace, addr, length),
         MADV_HUGEPAGE | MADV_NOHUGEPAGE => {
-            // Unreachable through this kernel's advice table: both are inside
-            // `#ifdef CONFIG_TRANSPARENT_HUGEPAGE`.
+            // Linux `mm/khugepaged.c:hugepage_madvise()`: HUGEPAGE clears
+            // VM_NOHUGEPAGE and sets VM_HUGEPAGE, NOHUGEPAGE does the reverse.
+            // Linux also calls khugepaged_enter_vma() for HUGEPAGE; the THP
+            // worker here scans every live mm, so no registration is needed.
             aspace.set_madvise_thp(
                 start,
                 length,

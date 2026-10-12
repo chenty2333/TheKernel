@@ -32,6 +32,34 @@ pub fn in_memory_page_cache_pages() -> usize {
     IN_MEMORY_PAGE_CACHE_RESIDENT_PAGES.load(Ordering::Acquire)
 }
 
+/// Global `NR_FILE_DIRTY`: disk-backed page-cache pages whose dirty bit is
+/// set. In-memory (tmpfs) pages are never counted, as in Linux.
+static DIRTY_FILE_PAGE_CACHE_PAGES: AtomicUsize = AtomicUsize::new(0);
+/// Global `NR_WRITEBACK`: page-cache pages with at least one writeback
+/// reference in flight.
+static WRITEBACK_PAGE_CACHE_PAGES: AtomicUsize = AtomicUsize::new(0);
+
+pub fn dirty_file_page_cache_pages() -> usize {
+    DIRTY_FILE_PAGE_CACHE_PAGES.load(Ordering::Acquire)
+}
+
+pub fn writeback_page_cache_pages() -> usize {
+    WRITEBACK_PAGE_CACHE_PAGES.load(Ordering::Acquire)
+}
+
+fn adjust_dirty_counter(shmem: bool, dirty: bool) {
+    if shmem {
+        return;
+    }
+    if dirty {
+        DIRTY_FILE_PAGE_CACHE_PAGES.fetch_add(1, Ordering::AcqRel);
+    } else {
+        let _ = DIRTY_FILE_PAGE_CACHE_PAGES.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            n.checked_sub(1)
+        });
+    }
+}
+
 impl PageCache {
     pub(super) fn new(shmem: bool) -> VfsResult<Self> {
         let addr = global_allocator()
@@ -65,7 +93,10 @@ impl PageCache {
         self.prefetched = false;
         self.noreuse = false;
         self.referenced = true;
-        self.dirty = true;
+        if !self.dirty {
+            self.dirty = true;
+            adjust_dirty_counter(self.shmem, true);
+        }
     }
 
     pub(super) fn is_dirty(&self) -> bool {
@@ -158,6 +189,9 @@ impl PageCache {
         self.pin()?;
         match self.writeback.checked_add(1) {
             Some(writeback) => {
+                if writeback == 1 {
+                    WRITEBACK_PAGE_CACHE_PAGES.fetch_add(1, Ordering::AcqRel);
+                }
                 self.writeback = writeback;
                 Ok(())
             }
@@ -171,11 +205,21 @@ impl PageCache {
     pub(super) fn end_writeback(&mut self) {
         assert!(self.writeback > 0, "ending inactive page cache writeback");
         self.writeback -= 1;
+        if self.writeback == 0 {
+            let _ = WRITEBACK_PAGE_CACHE_PAGES.try_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |n| n.checked_sub(1),
+            );
+        }
         self.unpin();
     }
 
     pub(super) fn clear_dirty(&mut self) {
-        self.dirty = false;
+        if self.dirty {
+            self.dirty = false;
+            adjust_dirty_counter(self.shmem, false);
+        }
     }
 
     /// Returns a mutable slice over the page data.
@@ -188,12 +232,18 @@ impl Drop for PageCache {
     fn drop(&mut self) {
         if self.is_writeback() {
             warn!("page cache entry dropped with writeback in flight");
+            let _ = WRITEBACK_PAGE_CACHE_PAGES.try_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |n| n.checked_sub(1),
+            );
         }
         if self.is_pinned() {
             warn!("pinned page cache entry dropped");
         }
         if self.dirty {
             warn!("dirty page dropped without flushing");
+            adjust_dirty_counter(self.shmem, false);
         }
         global_allocator().dealloc_pages(self.addr.as_usize(), 1, UsageKind::PageCache);
         if self.shmem {

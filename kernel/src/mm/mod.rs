@@ -3,6 +3,7 @@
 mod access;
 mod asid;
 mod aspace;
+mod dirty_writeback;
 mod fault;
 mod io;
 pub(crate) mod ldt;
@@ -11,13 +12,14 @@ mod elf_bounds;
 mod elf_placement;
 mod mapping_finalizer;
 mod pressure;
+mod reclaim;
 mod remap;
 pub(crate) mod secret;
 mod stats;
 pub(crate) mod vm_events;
 mod swap;
 pub(crate) mod swap_io_events;
-mod thp;
+pub(crate) mod thp;
 pub(crate) mod tlb;
 mod usercopy;
 mod userfaultfd;
@@ -28,12 +30,14 @@ pub use self::{
 pub(crate) use self::{
     elf_bounds::ElfBounds,
     asid::init as init_hardware_asids,
+    dirty_writeback::init_dirty_writeback,
     fault::handle_user_page_fault,
     mapping_finalizer::{
         DeferredMappingFinalizer, MappingFinalizer, drain_deferred_mapping_finalizers,
         has_deferred_mapping_finalizer_work,
     },
     pressure::init_memory_pressure,
+    reclaim::{reclaim_counters, set_swappiness, swappiness},
     remap::remap_user_mapping,
     thp::init_khugepaged,
     tlb::{

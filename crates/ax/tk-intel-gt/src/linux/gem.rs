@@ -32,14 +32,12 @@ pub unsafe fn drm_gem_is_imported(obj: *const DrmGemObject) -> bool {
 }
 
 /// `drm_vma_node_start()` from `include/drm/drm_vma_manager.h`.
-#[cfg(feature = "upstream-gt")]
 #[inline]
 pub unsafe fn drm_vma_node_start(node: *const DrmVmaOffsetNode) -> c_ulong {
     unsafe { (*node).vm_node.start as c_ulong }
 }
 
 /// `drm_vma_node_offset_addr()` from `include/drm/drm_vma_manager.h`.
-#[cfg(feature = "upstream-gt")]
 #[inline]
 pub unsafe fn drm_vma_node_offset_addr(node: *const DrmVmaOffsetNode) -> u64 {
     unsafe { ((*node).vm_node.start as u64) << crate::linux_config::PAGE_SHIFT }
@@ -50,7 +48,6 @@ pub unsafe fn drm_vma_node_offset_addr(node: *const DrmVmaOffsetNode) -> u64 {
 /// unlocked `rwlock_t` initializer and `RB_ROOT` are all-zero representations.
 /// The source precondition applies: `node` must not currently be allocated in
 /// a VMA-offset manager.
-#[cfg(feature = "upstream-gt")]
 #[inline]
 pub unsafe fn drm_vma_node_reset(node: *mut DrmVmaOffsetNode) {
     unsafe { core::ptr::write_bytes(node, 0, 1) };
@@ -58,7 +55,6 @@ pub unsafe fn drm_vma_node_reset(node: *mut DrmVmaOffsetNode) {
 
 /// Linux `drm_vma_node_unmap()` header helper. Preserve private COW mappings
 /// when invalidating the DRM object's shared mapping (`even_cows = 1`).
-#[cfg(feature = "upstream-gt")]
 pub unsafe fn drm_vma_node_unmap(node: *mut DrmVmaOffsetNode, mapping: *mut c_void) {
     let mm_node = unsafe { &(*node).vm_node };
     if !mm_node.mm.is_null() {
@@ -302,7 +298,6 @@ pub unsafe fn ttm_device_dev_mapping(bdev: *mut core::ffi::c_void) -> *mut core:
 
 /// `i915_gem_to_ttm()` from `gem/i915_gem_ttm.h`: the TTM BO is the
 /// alternate arm of the GEM object's base union, at the same address.
-#[cfg(feature = "upstream-gt")]
 #[inline]
 pub unsafe fn i915_gem_to_ttm(
     obj: *mut crate::i915_gem_object_types_upstream::DrmI915GemObject,
@@ -487,8 +482,9 @@ pub unsafe fn drm_vma_offset_lock_lookup(manager: *mut DrmVmaOffsetManager) {
 pub unsafe fn drm_vma_offset_unlock_lookup(manager: *mut DrmVmaOffsetManager) {
     unsafe { crate::linux::locks::read_unlock(manager.cast()) };
 }
-// The configured Linux 7.2.3 C probe has CONFIG_TRANSPARENT_HUGEPAGE=n:
-// drm_device has no huge_mnt field in this ABI. Preserve the actual MIT header
+// The default configured Linux 7.2.3 graphics oracle has
+// CONFIG_TRANSPARENT_HUGEPAGE=n: drm_device has no huge_mnt field in this ABI
+// (the ABI oracle enables THP and has one; the i915 mirror tracks the default). Preserve the actual MIT header
 // branches instead of inventing a mount or an unmeasured field offset.
 // upstream: drm_gem.h drm_gem_get_huge_mnt()
 pub fn drm_gem_get_huge_mnt<T, U>(_dev: *mut T) -> *mut U {

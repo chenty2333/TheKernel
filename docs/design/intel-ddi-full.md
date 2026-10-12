@@ -1,5 +1,13 @@
 # Intel DDI source translation
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 `crates/ax/tk-intel-display/src/intel_ddi_full.rs` is a source-ordered Rust
 translation of Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_ddi.c` (MIT,
 2012 Intel copyright), with 208/208 function definitions represented. Register

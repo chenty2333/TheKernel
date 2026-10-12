@@ -97,4 +97,14 @@ pub trait GenericPTE: fmt::Debug + Clone + Copy + Sync + Send + Sized {
     fn is_huge(&self) -> bool;
     /// Set this entry to zero.
     fn clear(&mut self);
+    /// Returns whether the hardware accessed bit is set. Architectures without
+    /// an accessed bit report `false`.
+    fn is_accessed(&self) -> bool {
+        false
+    }
+    /// Clears the hardware accessed bit, retaining every other entry bit.
+    fn clear_accessed(&mut self) {}
+    /// Sets the hardware accessed bit, as the CPU does on a translation's
+    /// first use. Used to model accesses in tests.
+    fn set_accessed(&mut self) {}
 }

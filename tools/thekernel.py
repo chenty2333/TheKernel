@@ -340,7 +340,6 @@ def kernel_features(artifacts: Artifacts) -> str:
     features.append("nvme")
     features.append("ahci")
     features.append("sdhci")
-    features.append("intel-upstream-gt")
     features.append("e1000")
     features.append("intel-hda")
     features.append("watchdog-itco")
@@ -858,10 +857,9 @@ def lint_cmd(args: argparse.Namespace) -> int:
     artifacts = artifacts_for(args)
     lint_kernel(artifacts, workspace=args.workspace,
                 deny_warnings=args.deny_warnings)
-    # Keep the opt-in source translations buildable without enabling them in
-    # the product. Use host flags/cache, not the kernel's bare-metal linker.
-    run_checked(["cargo", "check", "--locked", "-p", "tk-intel-gt",
-                 "--features", "upstream-gt"],
+    # The i915 source translations are part of the product; check them with
+    # host flags/cache, not the kernel's bare-metal linker.
+    run_checked(["cargo", "check", "--locked", "-p", "tk-intel-gt"],
                 env=_lint_env(artifacts, workspace=True))
     return 0
 

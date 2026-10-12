@@ -192,6 +192,9 @@ pub(super) fn release_cached_file_writeback_anchor_if_clean(shared: &CachedFileS
     if page_cache.iter().any(|(_pn, page)| page.is_dirty()) {
         return;
     }
+    // Under the page-cache lock no writer can stamp a new dirty episode, so
+    // the clean edge resets the age exactly once.
+    shared.dirtied_when.store(0, Ordering::Release);
 
     let released = {
         let mut registry = file_cache_registry().lock();

@@ -41,6 +41,21 @@ impl AddrSpace {
         if self.fork_fragment_count()? > MAX_VMA_FRAGMENTS {
             return Err(AxError::NoMemory);
         }
+        // fork write-protects the parent's COW PTEs. Linux copy_page_range()
+        // raises MMU_NOTIFY_PROTECTION_PAGE over the parent's VMAs first.
+        let _mmu_scope = self
+            .areas
+            .iter()
+            .map(|area| (area.start().as_usize(), area.end().as_usize()))
+            .reduce(|(s0, e0), (s1, e1)| (s0.min(s1), e0.max(e1)))
+            .map(|(start, end)| {
+                mmu_notifier::invalidate_range_start(
+                    self.address_space_id.get(),
+                    start,
+                    end,
+                    mmu_notifier::Event::ProtectionPage,
+                )
+            });
         #[cfg(target_arch = "x86_64")]
         if let Some(owner) = borrowed_shadow_stack.as_ref() {
             // A vfork borrow is an exact lease from this source mm.  Validate

@@ -1,5 +1,13 @@
 # Intel Gen12 / Xe-LP Display Registers — Implementation Reference
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 **Target hardware:** Intel Core i3-N305 (Alder Lake-N), integrated GPU, PCI `8086:46d0`.
 **Goal:** bring the display engine up from scratch — no vendor driver, no firmware framebuffer —
 until the kernel's own linear framebuffer is scanned out on a real monitor with correct timings.

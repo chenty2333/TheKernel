@@ -975,17 +975,21 @@ static void madvise_extra_case(void) {
     mark("FREE_LOCKED_EINVAL");
     /* Advice whose feature the oracle kernel's .config does not enable is
        EINVAL from the availability table (mm/madvise.c:1517-1559), not
-       success: KSM, transparent huge pages and memory failure are all off. */
+       success: KSM and memory failure are off. The ABI oracle enables
+       transparent huge pages, so the THP advice values are accepted. */
     ERROR(syscall(NR_MADVISE, anon, PAGE, MADV_MERGEABLE), EINVAL,
           "madvise-mergeable-unavailable");
     ERROR(syscall(NR_MADVISE, anon, PAGE, MADV_UNMERGEABLE), EINVAL,
           "madvise-unmergeable-unavailable");
-    ERROR(syscall(NR_MADVISE, anon, PAGE, MADV_HUGEPAGE), EINVAL,
-          "madvise-hugepage-unavailable");
-    ERROR(syscall(NR_MADVISE, anon, PAGE, MADV_NOHUGEPAGE), EINVAL,
-          "madvise-nohugepage-unavailable");
+    /* With CONFIG_TRANSPARENT_HUGEPAGE=y, mm/madvise.c accepts these. MADV_COLLAPSE
+       is still EINVAL here: a single 4 KiB VMA cannot hold an aligned PMD, so
+       collapse_possible() in mm/khugepaged.c fails before any range math. */
+    check(syscall(NR_MADVISE, anon, PAGE, MADV_HUGEPAGE) == 0,
+          "madvise-hugepage-thp-ok");
+    check(syscall(NR_MADVISE, anon, PAGE, MADV_NOHUGEPAGE) == 0,
+          "madvise-nohugepage-thp-ok");
     ERROR(syscall(NR_MADVISE, anon, PAGE, MADV_COLLAPSE), EINVAL,
-          "madvise-collapse-unavailable");
+          "madvise-collapse-small-vma");
     ERROR(syscall(NR_MADVISE, anon, PAGE, MADV_HWPOISON), EINVAL,
           "madvise-hwpoison-unavailable");
     ERROR(syscall(NR_MADVISE, anon, PAGE, MADV_SOFT_OFFLINE), EINVAL,

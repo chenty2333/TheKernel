@@ -701,7 +701,7 @@ pub unsafe fn pin_physical_frame(physical: usize) -> *mut Page {
 fn direct_map_address(physical: usize) -> *mut u8 {
     #[cfg(target_os = "none")]
     {
-        use memory_addr::{MemoryAddr, PhysAddr};
+        use memory_addr::PhysAddr;
         axhal::mem::phys_to_virt(PhysAddr::from_usize(physical)).as_usize() as *mut u8
     }
     #[cfg(not(target_os = "none"))]

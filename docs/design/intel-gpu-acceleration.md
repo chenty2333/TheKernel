@@ -1,5 +1,13 @@
 # ADL-N GPU 加速路线评估
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 2026-10-05；D4 的路线评估，**实现尚未完成、未在硬件上验证**。
 以本地 Linux 7.2.3 和已缓存 Mesa 26.1.2 源码为准；不把版本外的行为
 当作承诺。GT 与显示按实际依赖独立推进；完整 HDMI/DMC/audio 不是 BCS 前置条件。

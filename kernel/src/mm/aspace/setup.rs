@@ -313,6 +313,7 @@ impl AddrSpace {
             address_space_id,
             hardware_asid,
             maxrss_kb: AtomicU64::new(0),
+            maxvm_kb: AtomicU64::new(0),
             oom_reap_state: AtomicU8::new(0),
             thp_disable_mode: ThpDisableMode::Enabled,
             tlb: Arc::try_new(TlbState::new()).map_err(|_| AxError::NoMemory)?,

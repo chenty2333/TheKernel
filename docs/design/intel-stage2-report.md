@@ -1,5 +1,13 @@
 # Stage 2: the Intel display engine
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 This is the review entry point for the Intel display work originally developed
 on `dev`. Read this first; it says what was built, what
 was measured, what is still unverified, and where every claim is written down.

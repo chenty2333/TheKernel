@@ -34,8 +34,6 @@ mod virtio;
 /// `/dev/fb0`, and the registry a display driver enters it through.
 pub(crate) mod screen;
 
-#[cfg(feature = "intel-upstream-gt")]
-pub(crate) use device::release_firmware_primary;
 pub use device::{
     AdapterMetrics, DisplayAdapter, DrmDevice, DrmError, DrmMetrics, DrmResult, Scanout,
     primary_device, register_primary_device,
@@ -45,7 +43,6 @@ pub(crate) use fbdev::drm_scanout;
 pub(crate) use fence::metrics as fence_metrics;
 pub use file::{DrmEvent, DrmFile, OpenId};
 pub use gem::{DumbBuffer, DumbRequest, GemBacking, GemHandle, MmapOffset};
-#[cfg(feature = "intel-upstream-gt")]
 pub(crate) use gem::GemMemoryCharge;
 pub use kms::{ConnectorInfo, CrtcInfo, FramebufferId, KmsResources, Mode, PageFlip};
 pub use render::RenderAdapter;
@@ -57,13 +54,10 @@ pub fn init_virtio_gpu() -> DrmResult<bool> {
     // read, so that its report reaches the console on a machine that has no
     // other way to show one.
     //
-    // The bring-up order's later steps run immediately after, in the same place
-    // and for the same reason.  They are separate calls because they are
-    // separate claims: the probe can succeed on a device whose power never
-    // comes up, and saying which of the two happened is the difference between
-    // a log a person can act on and one that only says "no display".
+    // The GT bring-up runs immediately after the probe, in the same place and
+    // for the same reason. There is no KMS takeover on Intel: the screen stays
+    // on the firmware (GOP) framebuffer registered below.
     intel::probe_at_boot();
-    intel::bring_up_at_boot();
     intel::bring_up_gt_at_boot();
     if primary_device().is_some() {
         return Ok(true);

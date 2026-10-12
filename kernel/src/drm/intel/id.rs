@@ -1,7 +1,7 @@
 //! What an Intel display device *is*, as data.
 //!
-//! Everything above the probe -- the register window, the modeset path, the
-//! display engine, the power wells -- differs between Intel graphics
+//! Everything above the probe -- the register window, the GT, the display
+//! engine, the power wells -- differs between Intel graphics
 //! generations in ways that are known before any register is read: which PCI
 //! device ids exist, which graphics generation and display version they carry,
 //! how a PCI revision maps onto a silicon stepping, which aperture holds the
@@ -245,26 +245,65 @@ pub(crate) struct DisplayDevice {
     pub(crate) steppings: &'static [SteppingEntry],
 }
 
+/// The display-12/13 platforms the pre-GMD_ID revision maps cover.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreGmdPlatform {
+    TigerLake,
+    RocketLake,
+    AlderLakeS,
+    AlderLakeP,
+    AlderLakeN,
+}
+
+/// The stepping for `device_id` at `revision`, and whether the revision is an
+/// exact map entry (`false` for the next/future fallback). `None` when the PCI
+/// id is not in a display-12/13 family.
+///
+/// Port of `intel_display_device.c` `find_platform_desc()` and
+/// `get_pre_gmdid_step()`: the PCI id groups and the revision maps are Linux's.
+fn pre_gmdid_stepping(device_id: u16, revision: u8) -> Option<(DisplayStepping, bool)> {
+    let platform = match device_id {
+        0x9a40 | 0x9a49 | 0x9a59 | 0x9a78 | 0x9ac0 | 0x9ac9 | 0x9ad9 | 0x9af8 | 0x9a60 | 0x9a68
+        | 0x9a70 => PreGmdPlatform::TigerLake,
+        0x4c80 | 0x4c8a | 0x4c8b | 0x4c8c | 0x4c90 | 0x4c9a => PreGmdPlatform::RocketLake,
+        0x4680 | 0x4682 | 0x4688 | 0x468a | 0x468b | 0x4690 | 0x4692 | 0x4693 => {
+            PreGmdPlatform::AlderLakeS
+        }
+        0x46d0..=0x46d4 => PreGmdPlatform::AlderLakeN,
+        0x46a0..=0x46a3 | 0x46a6 | 0x46a8 | 0x46aa | 0x462a | 0x4626 | 0x4628 | 0x46b0..=0x46b3
+        | 0x46c0..=0x46c3 => PreGmdPlatform::AlderLakeP,
+        _ => return None,
+    };
+    use DisplayStepping::{A0, A2, B0, C0, D0};
+    let map: &[(u8, DisplayStepping)] = match (platform, device_id) {
+        (
+            PreGmdPlatform::TigerLake,
+            0x9a40 | 0x9a49 | 0x9a59 | 0x9a78 | 0x9ac0 | 0x9ac9 | 0x9ad9 | 0x9af8,
+        ) => &[(0, A0), (1, C0), (2, C0), (3, D0)],
+        (PreGmdPlatform::TigerLake, _) => &[(0, B0), (1, D0)],
+        (PreGmdPlatform::RocketLake, _) => &[(0, A0), (1, B0), (4, C0)],
+        (PreGmdPlatform::AlderLakeS, _) => &[(0, A0), (1, A2), (4, B0), (8, B0), (12, C0)],
+        (PreGmdPlatform::AlderLakeP, _) => &[(0, A0), (4, B0), (8, C0), (12, D0)],
+        (PreGmdPlatform::AlderLakeN, _) => &[(0, D0)],
+    };
+    Some(
+        map.iter()
+            .find(|(r, _)| *r >= revision)
+            .map(|(r, stepping)| (*stepping, *r == revision))
+            .unwrap_or((DisplayStepping::Unknown(revision), false)),
+    )
+}
+
 impl DisplayDevice {
     /// The stepping this device is at the given PCI revision.
     pub(crate) fn stepping(&self, revision: u8) -> DisplayStepping {
-        // The MIT port is the single display-12/13 revision-map authority. Keep an
-        // inexact upstream next/future result diagnostic-only, not a known WA
-        // stepping for native programming.
-        if let Ok(device) =
-            intel_display::device::Device::identify(0x8086, self.device_id, revision)
-        {
-            if !device.exact_step {
+        // Linux `intel_display_device.c` pre-GMD_ID revision maps. An inexact
+        // (next/future) result is diagnostic only, not a known stepping.
+        if let Some((stepping, exact)) = pre_gmdid_stepping(self.device_id, revision) {
+            if !exact {
                 return DisplayStepping::Unknown(revision);
             }
-            return match device.step {
-                intel_display::device::Step::A0 => DisplayStepping::A0,
-                intel_display::device::Step::A2 => DisplayStepping::A2,
-                intel_display::device::Step::B0 => DisplayStepping::B0,
-                intel_display::device::Step::C0 => DisplayStepping::C0,
-                intel_display::device::Step::D0 => DisplayStepping::D0,
-                intel_display::device::Step::Future => DisplayStepping::Unknown(revision),
-            };
+            return stepping;
         }
         self.steppings
             .iter()
@@ -354,7 +393,7 @@ const fn alder_lake_n(device_id: u16) -> DisplayDevice {
         device_id,
         name: "Alder Lake-N integrated graphics",
         generation: Generation::Gen12,
-        display_version: Some(intel_display::device::Device::DISPLAY_VERSION),
+        display_version: Some(13),
         apertures: INTEGRATED_APERTURES,
         // Gen12 gates most of the register aperture behind forcewake, which is
         // why the probe restricts itself to the bands that do not need it.

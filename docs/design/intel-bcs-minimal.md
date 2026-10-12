@@ -1,5 +1,13 @@
 # Alder Lake-N: minimal BCS path and read-only GT preparation
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 2026-10-04. **No command submission or GT state writes in this round.
 未在硬件上验证.** QEMU cannot emulate the N305 Intel GT.
 

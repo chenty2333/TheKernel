@@ -775,6 +775,7 @@ pub(super) fn retain_cached_file_writeback_anchor_if_dirty(
     if !page_cache.iter().any(|(_pn, page)| page.is_dirty()) {
         return;
     }
+    shared.note_dirtied(writeback_clock_ms());
 
     let key = cached_file_registry_key(location);
     let mut candidate_anchor = Some(location.writeback_anchor());

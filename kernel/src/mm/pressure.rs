@@ -1,8 +1,8 @@
 //! Bounded first-stage system memory-pressure handling.
 //!
-//! This deliberately reclaims only clean disk-backed file-cache pages. It
-//! does not claim anonymous reclaim, swap, PSI, or OOM policy; those require a
-//! unified page ownership model that this kernel does not have yet.
+//! Reclaims clean disk-backed file-cache pages first, then cold anonymous
+//! pages through the two-list LRU in `reclaim` (kswapd role). Dirty file pages
+//! are not written back here, and PSI and OOM policy are not implemented.
 
 use alloc::string::String;
 use core::{
@@ -11,6 +11,8 @@ use core::{
 };
 
 use axalloc::global_allocator;
+
+use super::reclaim::{self, ReclaimContext};
 
 const LOW_WATERMARK_DIVISOR: usize = 50;
 const MIN_LOW_WATERMARK_PAGES: usize = 64;
@@ -131,8 +133,19 @@ fn reclaim_memory_pressure_once() -> MemoryPressurePass {
         .saturating_sub(free_pages)
         .min(RECLAIM_BATCH_PAGES);
     let report = axfs::reclaim_clean_cached_file_pages(target);
+    // Linux `get_scan_count()`, reduced to its gate: clean file cache is
+    // scanned first, and anonymous memory is scanned for the remainder when
+    // `vm.swappiness` allows it or no clean file cache was reclaimable.
+    let anonymous_reclaimed = if report.reclaimed_pages < target
+        && (reclaim::swappiness() != 0 || report.reclaimed_pages == 0)
+    {
+        reclaim::reclaim_anonymous(target - report.reclaimed_pages, ReclaimContext::Kswapd)
+    } else {
+        0
+    };
+    let reclaimed_pages = report.reclaimed_pages.saturating_add(anonymous_reclaimed);
     RECLAIM_PASSES.fetch_add(1, Ordering::Relaxed);
-    RECLAIMED_PAGES.fetch_add(report.reclaimed_pages as u64, Ordering::Relaxed);
+    RECLAIMED_PAGES.fetch_add(reclaimed_pages as u64, Ordering::Relaxed);
     VISITED_REGISTRY_ENTRIES.fetch_add(report.visited_registry_entries as u64, Ordering::Relaxed);
     SCANNED_FILES.fetch_add(report.scanned_files as u64, Ordering::Relaxed);
     SCANNED_PAGES.fetch_add(report.scanned_pages as u64, Ordering::Relaxed);
@@ -144,12 +157,12 @@ fn reclaim_memory_pressure_once() -> MemoryPressurePass {
     SCAN_BUDGET_EXHAUSTED_FILES
         .fetch_add(report.scan_budget_exhausted_files as u64, Ordering::Relaxed);
     SNAPSHOT_TRUNCATIONS.fetch_add(u64::from(report.snapshot_truncated), Ordering::Relaxed);
-    if report.reclaimed_pages == 0 {
+    if reclaimed_pages == 0 {
         NO_PROGRESS_PASSES.fetch_add(1, Ordering::Relaxed);
     }
     MemoryPressurePass {
         under_pressure: true,
-        reclaimed_pages: report.reclaimed_pages,
+        reclaimed_pages,
         visited_registry_entries: report.visited_registry_entries,
         registry_entries: report.registry_entries,
         more_inode_scan_work: report.scan_budget_exhausted_files != 0,

@@ -200,6 +200,9 @@ pub(super) struct CachedFileShared {
     /// querying the provider, and therefore returns EAGAIN until it is known.
     pub(super) known_file_len: AtomicU64,
     pub(super) known_file_len_valid: AtomicBool,
+    /// `now_ms + 1` of the clean-to-dirty edge; 0 when no page is dirty.
+    /// Drives dirty-expire aging in the periodic writeback pass.
+    pub(super) dirtied_when: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -597,6 +600,7 @@ impl CachedFileShared {
             direct_io_lock: SleepingMutex::new(()),
             writeback_lock: RwLock::new(()),
             append_lock: RwLock::new(()),
+            dirtied_when: AtomicU64::new(0),
             range_cache_leases: Mutex::new(RangeCacheLeaseTable::new()),
             range_writeback: RangeWritebackState::new(),
             fadvise_readahead: FadviseReadaheadState {

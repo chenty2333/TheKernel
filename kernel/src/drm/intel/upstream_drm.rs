@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See the repository MIT license.
 //! Kernel providers for the i915 framework, probe and DRM-core tables of
-//! `tk-intel-gt` (`intel-upstream-gt`).
+//! `tk-intel-gt`.
 //!
 //! [`install`] installs three tables:
 //!
@@ -14,14 +14,9 @@
 //!   (see the comment on each). They are reachable only through ioctl or
 //!   export paths that the ioctl owner has not bound yet.
 //!
-//! Display callbacks belong to the native display owner
-//! (`kernel/src/drm/intel/{fastboot,native_*,hpd,gmbus,dmc,pipe}.rs`), which is
-//! initialized before the upstream probe runs. Upstream display code is never
-//! run, so those callbacks record the owner split and return the value the
-//! upstream caller expects from a display that is already initialized.
-//!
-//! Nothing here is reachable from the default build: the module declaration in
-//! `mod.rs` is gated on the `intel-upstream-gt` feature.
+//! Display callbacks belong to no one: the device has no display pipes
+//! (`HAS_DISPLAY()` is false), so the `no_display_*` entries do what Linux's
+//! early returns do for such a device.
 
 use core::{
     ffi::{c_char, c_int, c_ulong, c_void},
@@ -128,32 +123,36 @@ unsafe extern "C" fn drm_dev_unplug(_dev: *mut c_void) {
 // ---------------------------------------------------------------------------
 
 // Each group below is named for the reason its callbacks do nothing:
-// - `owned_by_native_*`: the native owner already performs the step on the
-//   display path, so the upstream call has nothing left to do.
+// - `no_display_*`: the device has no display pipes (`HAS_DISPLAY()` is false,
+//   `pipe_mask == 0`). Linux's display entry points return early for such a
+//   device (`intel_display_driver.c`, `intel_display_power.c`,
+//   `intel_display_irq.c`, `intel_display_device.c`), so each of these does the
+//   same: nothing, or the value Linux's early return gives.
 // - `not_configured_*`: the configured Linux build compiles the subsystem out,
 //   and the Linux stub does nothing or returns success.
 // - `pxp_*`, `not_dg2_cpu`: the feature is absent on the ADL-N target, and the
 //   Linux code reports that absence through its own return value.
 
-/// Native display owner: power domains, HPD, GMBUS, DMC, PPS, PCH SBI, DPT,
-/// encoder and pipe state, clock gating, watermark and bandwidth setup, and the
-/// display user-access and lifecycle steps. These run on the native path in
-/// `kernel/src/drm/intel/`, which is initialized before this callback runs.
-unsafe extern "C" fn owned_by_native_display(_display: *mut c_void) {}
+/// No-display entry point with no work to do. Linux `intel_display_driver_*`,
+/// `intel_display_power_*`, `intel_hpd_*`, `intel_dmc_*`, `intel_dpt_*`,
+/// `intel_opregion_*`, `intel_pps_*`, `intel_pxp_*` and `intel_sbi_*` return
+/// early when `!HAS_DISPLAY()`; there is no display state to set up or tear down.
+unsafe extern "C" fn no_display_noop(_display: *mut c_void) {}
 
-/// Native display owner, for callbacks that return success to the upstream
-/// caller (display probe, display suspend, OpRegion setup).
-unsafe extern "C" fn owned_by_native_display_ok(_display: *mut c_void) -> c_int {
+/// No-display entry point that returns success to the upstream caller, as Linux
+/// `intel_display_driver_probe()` and its siblings do with `!HAS_DISPLAY()`.
+unsafe extern "C" fn no_display_ok(_display: *mut c_void) -> c_int {
     0
 }
 
-/// Native display owner: the panel is present on the native path.
-unsafe extern "C" fn native_display_present(_display: *mut c_void) -> bool {
-    true
+/// `intel_display_device_present()` is `display && HAS_DISPLAY(display)`
+/// (`intel_display_device.c`). This device has no display pipes, so it is false,
+/// and the suspend and resume paths take their no-display branches.
+unsafe extern "C" fn no_display_present(_display: *mut c_void) -> bool {
+    false
 }
 
-/// `intel_opregion_suspend()`: TheKernel has no ACPI OpRegion, and the native
-/// owner suspends its own state.
+/// `intel_opregion_suspend()`: TheKernel has no ACPI OpRegion.
 unsafe extern "C" fn no_opregion_suspend(_display: *mut c_void, _state: u32) {}
 
 /// `intel_opregion_notify_adapter()`: no OpRegion means no adapter to notify.
@@ -162,9 +161,9 @@ unsafe extern "C" fn no_opregion_notify(_display: *mut c_void, _state: u32) -> c
     0
 }
 
-/// `intel_display_power_suspend_late()`: the native power owner handles late
-/// suspend, and it makes the keep-powered decision on its own path.
-unsafe extern "C" fn owned_by_native_display_suspend_late(_display: *mut c_void, _keep: bool) {}
+/// `intel_display_power_suspend_late()` with `!HAS_DISPLAY()`: no display wells
+/// to keep powered.
+unsafe extern "C" fn no_display_suspend_late(_display: *mut c_void, _keep: bool) {}
 
 /// `intel_match_g8_cpu()`: selects a DG2 workaround for specific CPU steppings.
 /// ADL-N is not DG2, so the workaround is never selected.
@@ -195,37 +194,41 @@ unsafe extern "C" fn pxp_not_on_platform(_i915: *mut DrmI915Private) -> c_int {
 /// is no PXP state to tear down or to suspend and resume.
 unsafe extern "C" fn pxp_absent(_i915: *mut DrmI915Private) {}
 
-/// `intel_dram_detect()`: the native display path reads the DRAM parameters it
-/// needs for watermark and bandwidth setup, so the upstream detect step
-/// succeeds.
-unsafe extern "C" fn native_dram_detect(_display: *mut c_void) -> c_int {
+/// `intel_dram_detect()`: the DRAM parameters feed display watermarks and
+/// bandwidth only. Without display there is nothing to read them for, so the
+/// step succeeds. Linux `intel_dram_detect()` is display-side as well.
+unsafe extern "C" fn no_display_dram_detect(_display: *mut c_void) -> c_int {
     0
 }
 
-/// The display object the upstream probe stores as `i915->display`. The native
-/// display owner is the only display in this kernel, and every upstream display
-/// callback that receives this pointer is native-owned and does not
-/// dereference it. The token is a static address: non-null, and not an
-/// `ERR_PTR` value.
-static NATIVE_DISPLAY_OWNER: u8 = 0;
+/// The display object the upstream probe stores as `i915->display`, for a
+/// device with no display pipes. Linux `intel_display_device.c` `no_display`
+/// gives such a device a non-NULL display whose `info.pipe_mask` is 0, so
+/// `HAS_DISPLAY()` is false (`intel_display_device.c:1767-1770`). The object is
+/// all-zero: `pipe_mask` is 0 at any offset, and no plane, CRTC or DISPLAY_INFO
+/// pointer is set. Every entry point that receives it is a `no_display_*` stub
+/// that does not read it. The object is sized generously because the Linux
+/// `struct intel_display` layout is not modelled here.
+#[repr(C, align(16))]
+struct NoDisplay([u64; 512]);
+static mut NO_DISPLAY: NoDisplay = NoDisplay([0; 512]);
 
-/// `intel_display_device_probe()`: returns the native display token.
-unsafe extern "C" fn native_display_device_probe(
+/// `intel_display_device_probe()`: the no-display object.
+unsafe extern "C" fn no_display_device_probe(
     _pdev: *mut c_void,
     _parent: *const c_void,
 ) -> *mut c_void {
-    ptr::addr_of!(NATIVE_DISPLAY_OWNER).cast_mut().cast()
+    // SAFETY: the object is only addressed, never read or written through here.
+    ptr::addr_of_mut!(NO_DISPLAY).cast()
 }
 
-/// `display_parent_interface()`: the table that upstream display code would use
-/// to reach parent services. The native owner never runs upstream display code,
-/// so there is no reader, and NULL is what the table reports.
+/// `display_parent_interface()`: the table upstream display code uses to reach
+/// parent services. No display code runs here, so there is no reader.
 unsafe extern "C" fn no_display_parent_interface() -> *const c_void {
     ptr::null()
 }
 
-/// `display_probe_defer()`: the native display is brought up with the GT probe
-/// on the rootfs callback, so the upstream probe never has to defer.
+/// `display_probe_defer()`: a device without display has nothing to wait for.
 unsafe extern "C" fn display_never_defers(_pdev: *mut c_void) -> bool {
     false
 }
@@ -454,6 +457,9 @@ unsafe extern "C" fn devm_drm_dev_alloc_i915(
             *err = 0;
         }
     }
+    // The GT_IRQ power reference reaches the device's uncore before the probe
+    // has registered it, from inside `i915_pci_probe()`.
+    upstream_gt::note_allocated_device(allocation.cast());
     allocation.cast()
 }
 
@@ -582,15 +588,15 @@ unsafe extern "C" fn drmm_add_action(
 // ---------------------------------------------------------------------------
 
 static FRAMEWORK: I915FrameworkOps = I915FrameworkOps {
-    drm_atomic_helper_shutdown: owned_by_native_display,
-    drm_client_dev_resume: owned_by_native_display,
-    drm_client_dev_suspend: owned_by_native_display,
+    drm_atomic_helper_shutdown: no_display_noop,
+    drm_client_dev_resume: no_display_noop,
+    drm_client_dev_suspend: no_display_noop,
     drm_dev_register,
     drm_dev_unplug,
     drm_dev_unregister,
-    drm_kms_helper_poll_disable: owned_by_native_display,
-    drm_kms_helper_poll_enable: owned_by_native_display,
-    drm_mode_config_reset: owned_by_native_display,
+    drm_kms_helper_poll_disable: no_display_noop,
+    drm_kms_helper_poll_enable: no_display_noop,
+    drm_mode_config_reset: no_display_noop,
     i915_debugfs_register: not_configured_i915,
     i915_hwmon_register: not_configured_i915,
     i915_hwmon_unregister: not_configured_i915,
@@ -604,72 +610,72 @@ static FRAMEWORK: I915FrameworkOps = I915FrameworkOps {
     i915_switcheroo_register: not_configured_ok,
     i915_switcheroo_unregister: not_configured_i915,
     i915_teardown_sysfs: not_configured_i915,
-    i9xx_display_sr_restore: owned_by_native_display,
-    i9xx_display_sr_save: owned_by_native_display,
-    intel_bw_init_hw: owned_by_native_display,
-    intel_clock_gating_hooks_init: owned_by_native_display,
-    intel_display_device_info_runtime_init: owned_by_native_display,
-    intel_display_device_present: native_display_present,
-    intel_display_device_remove: owned_by_native_display,
-    intel_display_driver_disable_user_access: owned_by_native_display,
-    intel_display_driver_early_probe: owned_by_native_display,
-    intel_display_driver_enable_user_access: owned_by_native_display,
-    intel_display_driver_init_hw: owned_by_native_display,
-    intel_display_driver_probe: owned_by_native_display_ok,
-    intel_display_driver_probe_nogem: owned_by_native_display_ok,
-    intel_display_driver_probe_noirq: owned_by_native_display_ok,
-    intel_display_driver_register: owned_by_native_display,
-    intel_display_driver_remove: owned_by_native_display,
-    intel_display_driver_remove_nogem: owned_by_native_display,
-    intel_display_driver_remove_noirq: owned_by_native_display,
-    intel_display_driver_resume: owned_by_native_display,
-    intel_display_driver_resume_access: owned_by_native_display,
-    intel_display_driver_suspend: owned_by_native_display_ok,
-    intel_display_driver_suspend_access: owned_by_native_display,
-    intel_display_driver_unregister: owned_by_native_display,
-    intel_display_power_cleanup: owned_by_native_display,
-    intel_display_power_disable: owned_by_native_display,
-    intel_display_power_driver_remove: owned_by_native_display,
-    intel_display_power_enable: owned_by_native_display,
-    intel_display_power_resume_early: owned_by_native_display,
-    intel_display_power_runtime_resume: owned_by_native_display,
-    intel_display_power_runtime_suspend: owned_by_native_display,
-    intel_display_power_suspend_late: owned_by_native_display_suspend_late,
-    intel_dmc_resume: owned_by_native_display,
-    intel_dmc_suspend: owned_by_native_display,
-    intel_dp_mst_suspend: owned_by_native_display,
-    intel_dpt_resume: owned_by_native_display,
-    intel_dpt_suspend: owned_by_native_display,
-    intel_dram_detect: native_dram_detect,
-    intel_encoder_shutdown_all: owned_by_native_display,
-    intel_encoder_suspend_all: owned_by_native_display,
-    intel_gmbus_reset: owned_by_native_display,
+    i9xx_display_sr_restore: no_display_noop,
+    i9xx_display_sr_save: no_display_noop,
+    intel_bw_init_hw: no_display_noop,
+    intel_clock_gating_hooks_init: no_display_noop,
+    intel_display_device_info_runtime_init: no_display_noop,
+    intel_display_device_present: no_display_present,
+    intel_display_device_remove: no_display_noop,
+    intel_display_driver_disable_user_access: no_display_noop,
+    intel_display_driver_early_probe: no_display_noop,
+    intel_display_driver_enable_user_access: no_display_noop,
+    intel_display_driver_init_hw: no_display_noop,
+    intel_display_driver_probe: no_display_ok,
+    intel_display_driver_probe_nogem: no_display_ok,
+    intel_display_driver_probe_noirq: no_display_ok,
+    intel_display_driver_register: no_display_noop,
+    intel_display_driver_remove: no_display_noop,
+    intel_display_driver_remove_nogem: no_display_noop,
+    intel_display_driver_remove_noirq: no_display_noop,
+    intel_display_driver_resume: no_display_noop,
+    intel_display_driver_resume_access: no_display_noop,
+    intel_display_driver_suspend: no_display_ok,
+    intel_display_driver_suspend_access: no_display_noop,
+    intel_display_driver_unregister: no_display_noop,
+    intel_display_power_cleanup: no_display_noop,
+    intel_display_power_disable: no_display_noop,
+    intel_display_power_driver_remove: no_display_noop,
+    intel_display_power_enable: no_display_noop,
+    intel_display_power_resume_early: no_display_noop,
+    intel_display_power_runtime_resume: no_display_noop,
+    intel_display_power_runtime_suspend: no_display_noop,
+    intel_display_power_suspend_late: no_display_suspend_late,
+    intel_dmc_resume: no_display_noop,
+    intel_dmc_suspend: no_display_noop,
+    intel_dp_mst_suspend: no_display_noop,
+    intel_dpt_resume: no_display_noop,
+    intel_dpt_suspend: no_display_noop,
+    intel_dram_detect: no_display_dram_detect,
+    intel_encoder_shutdown_all: no_display_noop,
+    intel_encoder_suspend_all: no_display_noop,
+    intel_gmbus_reset: no_display_noop,
     intel_gvt_driver_remove: not_configured_i915,
     intel_gvt_init: not_configured_ok,
     intel_gvt_resume: not_configured_i915,
-    intel_hpd_cancel_work: owned_by_native_display,
-    intel_hpd_init: owned_by_native_display,
-    intel_hpd_poll_disable: owned_by_native_display,
-    intel_hpd_poll_enable: owned_by_native_display,
-    intel_init_pch_refclk: owned_by_native_display,
+    intel_hpd_cancel_work: no_display_noop,
+    intel_hpd_init: no_display_noop,
+    intel_hpd_poll_disable: no_display_noop,
+    intel_hpd_poll_enable: no_display_noop,
+    intel_init_pch_refclk: no_display_noop,
     intel_match_g8_cpu: not_dg2_cpu,
-    intel_opregion_cleanup: owned_by_native_display,
+    intel_opregion_cleanup: no_display_noop,
     intel_opregion_notify_adapter: no_opregion_notify,
-    intel_opregion_resume: owned_by_native_display,
-    intel_opregion_setup: owned_by_native_display_ok,
+    intel_opregion_resume: no_display_noop,
+    intel_opregion_setup: no_display_ok,
     intel_opregion_suspend: no_opregion_suspend,
-    intel_pps_unlock_regs_wa: owned_by_native_display,
-    intel_pxp_debugfs_register: owned_by_native_display,
+    intel_pps_unlock_regs_wa: no_display_noop,
+    intel_pxp_debugfs_register: no_display_noop,
     intel_pxp_fini: pxp_absent,
     intel_pxp_init: pxp_not_on_platform,
-    intel_pxp_resume_complete: owned_by_native_display,
-    intel_pxp_runtime_resume: owned_by_native_display,
-    intel_pxp_runtime_suspend: owned_by_native_display,
-    intel_pxp_suspend: owned_by_native_display,
-    intel_pxp_suspend_prepare: owned_by_native_display,
-    intel_sbi_fini: owned_by_native_display,
-    intel_sbi_init: owned_by_native_display,
-    skl_watermark_ipc_update: owned_by_native_display,
+    intel_pxp_resume_complete: no_display_noop,
+    intel_pxp_runtime_resume: no_display_noop,
+    intel_pxp_runtime_suspend: no_display_noop,
+    intel_pxp_suspend: no_display_noop,
+    intel_pxp_suspend_prepare: no_display_noop,
+    intel_sbi_fini: no_display_noop,
+    intel_sbi_init: no_display_noop,
+    skl_watermark_ipc_update: no_display_noop,
     devm_drm_dev_alloc_i915,
     i915_params_copy: {
         // SAFETY: the table's `struct i915_params *` and this `*mut c_void` are
@@ -694,8 +700,8 @@ static FRAMEWORK: I915FrameworkOps = I915FrameworkOps {
     pci_register_driver,
     pci_unregister_driver,
     drmm_add_action_or_reset: drmm_add_action,
-    intel_clock_gating_init: owned_by_native_display,
-    intel_display_device_probe: native_display_device_probe,
+    intel_clock_gating_init: no_display_noop,
+    intel_display_device_probe: no_display_device_probe,
 };
 
 // ---------------------------------------------------------------------------
@@ -710,7 +716,7 @@ unsafe extern "C" fn early_gmd_read(
     offset: u32,
     value: *mut u32,
 ) -> bool {
-    let Some(window) = upstream_gt::display_window() else {
+    let Some(window) = upstream_gt::gpu_window() else {
         return false;
     };
     let offset = offset as usize;

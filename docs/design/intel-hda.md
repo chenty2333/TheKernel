@@ -1,5 +1,13 @@
 # Intel HDA analog and bounded HDMI playback (2026-10-06)
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 ## Facts, boundaries and references
 
 N305 is `8086:54c8`, class 0403 / interface 00; subsystem `10ec:12ec` is

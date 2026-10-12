@@ -1,5 +1,13 @@
 # Intel CDCLK and PLL transition work
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 `crates/ax/tk-intel-display/src/intel_cdclk_full.rs` now translates the full
 Linux 7.2.3 `intel_cdclk.c`: 152/152 ctags functions in source order. Its
 `IntelCdclkIo` backend makes MMIO, PCI, PCODE, atomic and platform operations

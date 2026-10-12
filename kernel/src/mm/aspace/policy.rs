@@ -647,6 +647,16 @@ impl AddrSpace {
         if self.thp_disable_mode == ThpDisableMode::Disabled {
             return false;
         }
+        // Linux `mm/khugepaged.c:hugepage_vma_check()`: the global
+        // `/sys/kernel/mm/transparent_hugepage/enabled` mode is consulted in
+        // addition to the per-mm PR_SET_THP_DISABLE mode.  `madvise` admits only
+        // VM_HUGEPAGE VMAs, `never` admits none.  Forced MADV_COLLAPSE does not
+        // reach this function, matching Linux's TVA_FORCED_COLLAPSE.
+        let global = match crate::mm::thp::global_enabled() {
+            crate::mm::thp::GlobalEnabled::Never => return false,
+            crate::mm::thp::GlobalEnabled::Madvise => true,
+            crate::mm::thp::GlobalEnabled::Always => false,
+        };
         let Some(end) = start.checked_add(COLLAPSE_2M_SIZE) else {
             return false;
         };
@@ -661,7 +671,13 @@ impl AddrSpace {
             let allowed = match self.thp_disable_mode {
                 ThpDisableMode::Disabled => false,
                 ThpDisableMode::ExceptAdvised => area.backend().madvise_thp() == MadviseThp::Huge,
-                ThpDisableMode::Enabled => area.backend().madvise_thp() != MadviseThp::NoHuge,
+                ThpDisableMode::Enabled => {
+                    if global {
+                        area.backend().madvise_thp() == MadviseThp::Huge
+                    } else {
+                        area.backend().madvise_thp() != MadviseThp::NoHuge
+                    }
+                }
             };
             if !allowed {
                 return false;
@@ -686,6 +702,18 @@ impl AddrSpace {
                 return false;
             };
             if area.start() > cursor || area.backend().madvise_thp() == MadviseThp::NoHuge {
+                return false;
+            }
+            // Linux thp_vma_suitable_order(): the VMA must hold an aligned
+            // PMD, haddr = ALIGN_DOWN(vm_end - PMD) >= vm_start. Otherwise
+            // collapse_possible() fails and madvise_collapse() is -EINVAL.
+            let holds_aligned_pmd = area
+                .end()
+                .as_usize()
+                .checked_sub(COLLAPSE_2M_SIZE)
+                .map(|last| last & !(COLLAPSE_2M_SIZE - 1))
+                .is_some_and(|haddr| haddr >= area.start().as_usize());
+            if !holds_aligned_pmd {
                 return false;
             }
             cursor = area.end().min(end);

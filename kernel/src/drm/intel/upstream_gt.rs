@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See the repository MIT license.
-//! Kernel-side owners for the upstream i915 GT path (`intel-upstream-gt`).
+//! Kernel-side owners for the upstream i915 GT path.
 //!
 //! The translated GT code in `tk-intel-gt` declares C symbols it expects the
 //! kernel to define. This module is where those definitions live, together
@@ -12,8 +12,7 @@
 //! upstream caller already has a "not supported" branch, the function returns
 //! the value that branch expects.
 //!
-//! This module is gated on `intel-upstream-gt`, enabled in the product build.
-//! The translated GT is the sole owner when the feature is present.
+//! The translated GT is the sole owner of the GPU.
 
 use alloc::{boxed::Box, collections::BTreeMap};
 use core::{
@@ -29,6 +28,20 @@ use intel_gt::{
 
 #[cfg(target_os = "none")]
 use super::pci::ConfigWriteSpace;
+
+/// Widest linear surface stride the display path reports to upstream: the
+/// `PLANE_STRIDE` field is `[11:0]` in units of 64 bytes.
+const STRIDE_UNIT: u32 = 64;
+const MAX_STRIDE: u32 = 4095 * STRIDE_UNIT;
+
+use super::power;
+use intel_gt::{
+    intel_uncore_types_upstream::{IntelUncore, intel_uncore_read, intel_uncore_write},
+    intel_workarounds_types_upstream::I915RegT,
+};
+
+/// `DC_STATE_EN` (display MMIO 0x45504).
+const DC_STATE_EN: I915RegT = I915RegT { reg: 0x4_5504 };
 use super::pci::{self, ConfigSpace};
 
 /// Linux errno values used by the platform callbacks.
@@ -322,6 +335,7 @@ unsafe extern "C" fn kernel_map_tlb_sync() {
 /// Install every kernel-owned provider this module can supply. Called once
 /// from `gt::init_at_boot()`. Reinstalling the same table is accepted.
 pub(super) fn install_providers() -> Result<(), &'static str> {
+    super::upstream_mm::install()?;
     install_i915_platform_ops(&PLATFORM_OPS)?;
     axmm::install_kernel_map_tlb_sync(kernel_map_tlb_sync)
         .map_err(|_| "kernel-map TLB synchronizer already installed with another owner")?;
@@ -467,7 +481,7 @@ pub unsafe extern "C" fn intel_dumb_fb_max_stride(
     _pixel_format: u32,
     _modifier: u64,
 ) -> u32 {
-    super::fb::MAX_STRIDE
+    MAX_STRIDE
 }
 
 // upstream: display/intel_display.c intel_has_pending_fb_unpin()
@@ -485,57 +499,78 @@ pub unsafe extern "C" fn intel_has_pending_fb_unpin(_display: *mut c_void) -> bo
 /// the GT is awake so DC states cannot delay GT interrupts.
 const POWER_DOMAIN_GT_IRQ: i32 = 72;
 
-/// Display register window the power-domain owner programs. Stage two sets it
-/// together with the upstream device; until then GT power references refuse.
-static DISPLAY_WINDOW: spin::Mutex<Option<super::regs::RegisterWindow>> = spin::Mutex::new(None);
+/// The GPU's MMIO window (BAR0), registered once the probe maps it. Used for the
+/// BAR0 peek before the upstream probe has MMIO (`I915ProbeOps::early_gmd_read`).
+static GPU_WINDOW: spin::Mutex<Option<super::regs::RegisterWindow>> = spin::Mutex::new(None);
 
-#[allow(dead_code)] // set by the stage-two probe owner
-pub(super) fn register_display_window(window: super::regs::RegisterWindow) {
-    *DISPLAY_WINDOW.lock() = Some(window);
+pub(super) fn register_gpu_window(window: super::regs::RegisterWindow) {
+    *GPU_WINDOW.lock() = Some(window);
 }
 
-/// The display register window the probe registered, for upstream reads of
-/// BAR0 before the probe maps MMIO (`I915ProbeOps::early_gmd_read`).
-pub(super) fn display_window() -> Option<super::regs::RegisterWindow> {
-    *DISPLAY_WINDOW.lock()
+/// The GPU register window the probe registered; see [`GPU_WINDOW`].
+pub(super) fn gpu_window() -> Option<super::regs::RegisterWindow> {
+    *GPU_WINDOW.lock()
 }
 
-fn gt_irq_domain(domain: i32) -> intel_display::power_map::PowerDomain {
-    assert!(
-        domain == POWER_DOMAIN_GT_IRQ,
-        "display power domain {domain}: the upstream GT path only takes POWER_DOMAIN_GT_IRQ"
-    );
-    intel_display::power_map::PowerDomain::GtIrq
+/// The translated device's `intel_uncore`, the MMIO path the upstream code uses
+/// for display-side registers. `None` until the allocator has returned the device.
+/// The i915 device returned by the translated allocator. Set before the probe
+/// registers the device, because `i915_pci_probe()` takes its first GT unpark
+/// (and so `POWER_DOMAIN_GT_IRQ`) before it returns.
+static ALLOCATED_I915: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+
+pub(super) fn note_allocated_device(i915: *mut c_void) {
+    ALLOCATED_I915.store(i915, Ordering::Release);
 }
 
-/// Take a reference on the display `GT_IRQ` domain through the kernel's single
-/// power-domain owner (`POWER`), so the GT shares the display refcount instead
-/// of writing power-well registers itself. The returned wakeref is an opaque
-/// non-null cookie; Linux only compares it and hands it back to the put.
+fn gt_uncore() -> Option<*mut IntelUncore> {
+    let i915 = ALLOCATED_I915.load(Ordering::Acquire).cast::<intel_gt::linux_i915_private::DrmI915Private>();
+    if i915.is_null() {
+        return None;
+    }
+    // SAFETY: `i915` is the device the probe registered and it lives for the
+    // kernel's lifetime; `uncore` is the embedded `struct intel_uncore`.
+    Some(unsafe { ptr::addr_of!((*i915).uncore).cast::<IntelUncore>().cast_mut() })
+}
+
+/// Take one reference on `POWER_DOMAIN_GT_IRQ`.
+///
+/// Linux `get_allowed_dc_mask()` returns 0 when the device has no display
+/// (`!HAS_DISPLAY`), so no well is ever requested for this domain and the
+/// reference is a plain count. The one hardware effect is that the first
+/// reference clears any DC state request left by firmware, the way Linux
+/// `gen9_set_dc_state(DC_STATE_DISABLE)` does at init: a DC entry would delay
+/// GT interrupts.
 // upstream: display/intel_display_power.c intel_display_power_get()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_display_power_get(
     _display: *mut c_void,
     domain: i32,
 ) -> *mut c_void {
-    let domain = gt_irq_domain(domain);
-    let window = DISPLAY_WINDOW
-        .lock()
-        .expect("intel_display_power_get: display register window is not registered");
-    let mut power = super::POWER.lock();
-    let state = power
-        .as_mut()
-        .expect("intel_display_power_get: display power owner is not initialized");
-    state
-        .get_domain(&window, domain)
-        .unwrap_or_else(|e| panic!("intel_display_power_get(GT_IRQ): {e:?}"));
+    assert!(
+        domain == POWER_DOMAIN_GT_IRQ,
+        "display power domain {domain}: the upstream GT path only takes POWER_DOMAIN_GT_IRQ"
+    );
+    let mut refs = GT_IRQ_REFS.lock();
+    if *refs == 0 {
+        let uncore = gt_uncore().expect("intel_display_power_get: GT uncore is not registered");
+        // SAFETY: `uncore` is the live device uncore (see `gt_uncore`), and the
+        // accessors are the translated `intel_uncore` MMIO path.
+        power::disable_dc_states(
+            || unsafe { intel_uncore_read(uncore, DC_STATE_EN) },
+            |value| unsafe { intel_uncore_write(uncore, DC_STATE_EN, value) },
+        );
+    }
+    *refs += 1;
     ptr::NonNull::<u8>::dangling().as_ptr().cast()
 }
 
+/// Number of live `POWER_DOMAIN_GT_IRQ` references.
+static GT_IRQ_REFS: spin::Mutex<u32> = spin::Mutex::new(0);
+
 /// Linux defers the final put of an async release by `delay_ms` so a quick
-/// re-unpark does not toggle DC states. The kernel owner has no delayed-put
-/// worker, so the reference is dropped immediately: the same final refcount,
-/// only an earlier possible DC entry.
+/// re-unpark does not toggle DC states. With no display there are no DC states
+/// to toggle, so the reference is dropped immediately.
 // upstream: display/intel_display_power.c __intel_display_power_put_async()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __intel_display_power_put_async(
@@ -548,18 +583,16 @@ pub unsafe extern "C" fn __intel_display_power_put_async(
         !wakeref.is_null(),
         "__intel_display_power_put_async: null wakeref"
     );
-    let domain = gt_irq_domain(domain);
-    let window = DISPLAY_WINDOW
-        .lock()
-        .expect("__intel_display_power_put_async: display register window is not registered");
-    let mut power = super::POWER.lock();
-    let state = power
-        .as_mut()
-        .expect("__intel_display_power_put_async: display power owner is not initialized");
-    state
-        .put_domain(&window, domain)
-        .unwrap_or_else(|e| panic!("__intel_display_power_put_async(GT_IRQ): {e:?}"));
+    assert!(
+        domain == POWER_DOMAIN_GT_IRQ,
+        "display power domain {domain}: the upstream GT path only takes POWER_DOMAIN_GT_IRQ"
+    );
+    let mut refs = GT_IRQ_REFS.lock();
+    *refs = refs
+        .checked_sub(1)
+        .expect("__intel_display_power_put_async(GT_IRQ): reference underflow");
 }
+
 
 // upstream: display/intel_frontbuffer.c intel_frontbuffer_init()
 #[unsafe(no_mangle)]
@@ -687,7 +720,7 @@ use intel_gt::{
         kernel_core::{PciBusOps, PciCoreOps, install_pci_bus_ops, install_pci_core_ops},
         kernel_services::{
             FileOps, PciOps, PmOps, SmpOps, TaskOps, install_file_ops, install_pci_ops,
-            install_pm_ops, install_smp_ops, install_task_ops,
+            install_pm_ops, install_smp_ops,
         },
         primitives::{IoremapProvider, install_ioremap_provider},
     },

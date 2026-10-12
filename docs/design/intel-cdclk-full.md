@@ -1,5 +1,13 @@
 # i915 CDCLK source translation
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 `crates/ax/tk-intel-display/src/intel_cdclk_full.rs` translates Linux 7.2.3
 `drivers/gpu/drm/i915/display/intel_cdclk.c` (MIT, Intel, 152/152 ctags
 functions, source order) with no source function omissions. Register/PCI

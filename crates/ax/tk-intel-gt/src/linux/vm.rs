@@ -14,7 +14,7 @@ use core::{
 
 use axhal::paging::MappingFlags;
 use kernel_guard::NoPreemptIrqSave;
-use memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange};
+use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
 use spin::Mutex;
 
 use crate::{
@@ -331,31 +331,43 @@ pub unsafe extern "C" fn is_vmalloc_addr(ptr: *const c_void) -> bool {
     })
 }
 
-/// x86 `cachemode2protval()` for the PAT palette this kernel programs
-/// (index = PAT<<2 | PCD<<1 | PWT: 0 WB, 1 WC, 2 UC-, 3 UC, 5 WT). Cache mode
-/// numbering follows Linux `_PAGE_CACHE_MODE_*`. Modes outside the palette
-/// (WP) are refused with a panic rather than encoding an unintended cache type.
+/// Linux `_PAGE_CACHE_MODE_*` numbering, as the i915 callers pass it.
+fn cache_mode_from_linux(cache_mode: i32) -> Option<axmm::memtype::CacheMode> {
+    usize::try_from(cache_mode)
+        .ok()
+        .and_then(|index| axmm::memtype::CacheMode::ALL.get(index).copied())
+}
+
+/// PTE cache bits (PWT, PCD, PAT) of a 4 KiB leaf.
+const PTE_CACHE_BITS: c_ulong = (1 << 3) | (1 << 4) | (1 << 7);
+
+/// Linux `pgprot_modify_cachemode`: replace the cache bits of a raw PTE
+/// protection with the bits that select `mode` in `tables`.
+fn pgprot_with_cache(prot: c_ulong, tables: &axmm::memtype::CacheTables, mode: axmm::memtype::CacheMode) -> c_ulong {
+    (prot & !PTE_CACHE_BITS) | tables.pte_bits(mode) as c_ulong
+}
+
+/// Linux `cachemode2protval(mode)`: the 4 KiB PTE cache bits that select `mode`
+/// in the palette this kernel is running with (`memtype::tables()`).
+/// Without the PAT palette, WC falls back to UC- as Linux does.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cachemode2protval(cache_mode: i32) -> c_ulong {
-    const PWT: c_ulong = 1 << 3;
-    const PCD: c_ulong = 1 << 4;
-    const PAT: c_ulong = 1 << 7;
-    match cache_mode {
-        0 => 0,         // _PAGE_CACHE_MODE_WB: PAT index 0
-        1 => PWT,       // _PAGE_CACHE_MODE_WC: PAT index 1
-        2 => PCD,       // _PAGE_CACHE_MODE_UC_MINUS: PAT index 2
-        3 => PCD | PWT, // _PAGE_CACHE_MODE_UC: PAT index 3
-        4 => PAT | PWT, // _PAGE_CACHE_MODE_WT: PAT index 5
-        other => panic!("cachemode2protval: cache mode {other} is not in the PAT palette"),
-    }
+    let Some(mode) = cache_mode_from_linux(cache_mode) else {
+        panic!("cachemode2protval: cache mode {cache_mode} does not exist");
+    };
+    axmm::memtype::tables().pte_bits(mode) as c_ulong
 }
 
 /// x86 `pgprot_writecombine(prot)`: the source protection with the WC cache
-/// mode bits from [`cachemode2protval`] applied.
+/// selection of the active palette (PAT1/PWT, or UC- without PAT).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pgprot_writecombine(prot: PgProt) -> PgProt {
     PgProt {
-        pgprot: prot.pgprot | unsafe { cachemode2protval(1) },
+        pgprot: pgprot_with_cache(
+            prot.pgprot,
+            &axmm::memtype::tables(),
+            axmm::memtype::CacheMode::Wc,
+        ),
     }
 }
 
@@ -363,20 +375,15 @@ pub unsafe extern "C" fn pgprot_writecombine(prot: PgProt) -> PgProt {
 /// startup CPU, which is the only state in which WC leaves are emitted.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pat_enabled() -> bool {
-    axhal::boot::intel_cpu_mmap_ready()
+    axmm::memtype::pat_enabled()
 }
 
-/// Linux `arch_phys_wc_add(base, size)`: with PAT enabled the WC attribute is
-/// carried by page-table bits and no MTRR entry is needed, so this returns 0
-/// (the Linux PAT-path result). Without PAT there is no MTRR driver, so the
-/// request fails with -ENODEV.
+/// Linux `arch_phys_wc_add(base, size)`: with PAT the WC attribute is carried
+/// by page-table bits, so no MTRR entry is needed and this returns 0. Without
+/// PAT there is no MTRR driver, and the request fails with -ENODEV.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn arch_phys_wc_add(_base: u64, _size: u64) -> c_int {
-    if unsafe { pat_enabled() } {
-        0
-    } else {
-        -crate::linux_config::ENODEV
-    }
+pub unsafe extern "C" fn arch_phys_wc_add(base: u64, size: u64) -> c_int {
+    axmm::memtype::arch_phys_wc_add(base, size) as c_int
 }
 
 /// Linux `arch_phys_wc_del(handle)`: releases an MTRR entry. TheKernel never
@@ -470,19 +477,32 @@ mod cache_mode_tests {
 
     #[test]
     fn writecombine_of_kernel_prot_is_the_pat1_variant() {
-        let wc = unsafe { pgprot_writecombine(PAGE_KERNEL) };
-        assert_eq!(wc.pgprot, PAGE_KERNEL_WC.pgprot);
+        let palette = axmm::memtype::CacheTables::from_pat(axmm::memtype::PAT_LINUX_FULL);
+        let wc = pgprot_with_cache(PAGE_KERNEL.pgprot, &palette, axmm::memtype::CacheMode::Wc);
+        assert_eq!(wc, PAGE_KERNEL_WC.pgprot);
+        // Replacing the cache bits must not disturb the other protection bits.
+        let uc = pgprot_with_cache(PAGE_KERNEL_WC.pgprot, &palette, axmm::memtype::CacheMode::Uc);
+        assert_eq!(uc, PAGE_KERNEL.pgprot | (1 << 3) | (1 << 4));
     }
 
     #[test]
-    fn cache_modes_map_to_palette_indices() {
-        unsafe {
-            assert_eq!(cachemode2protval(0), 0);
-            assert_eq!(cachemode2protval(1), 1 << 3);
-            assert_eq!(cachemode2protval(2), 1 << 4);
-            assert_eq!(cachemode2protval(3), (1 << 4) | (1 << 3));
-            assert_eq!(cachemode2protval(4), (1 << 7) | (1 << 3));
-        }
+    fn cache_modes_map_to_linux_full_palette_indices() {
+        use axmm::memtype::{CacheMode, CacheTables, PAT_LINUX_FULL};
+        let palette = CacheTables::from_pat(PAT_LINUX_FULL);
+        // Index 0 WB, 1 WC (PWT), 2 UC- (PCD), 3 UC (PCD|PWT), 7 WT (PAT|PCD|PWT).
+        assert_eq!(palette.pte_bits(CacheMode::Wb), 0);
+        assert_eq!(palette.pte_bits(CacheMode::Wc), 1 << 3);
+        assert_eq!(palette.pte_bits(CacheMode::UcMinus), 1 << 4);
+        assert_eq!(palette.pte_bits(CacheMode::Uc), (1 << 4) | (1 << 3));
+        assert_eq!(palette.pte_bits(CacheMode::Wt), (1 << 7) | (1 << 4) | (1 << 3));
+    }
+
+    #[test]
+    fn cachemode_numbering_is_linux_and_bounded() {
+        assert_eq!(cache_mode_from_linux(1), Some(axmm::memtype::CacheMode::Wc));
+        assert_eq!(cache_mode_from_linux(5), Some(axmm::memtype::CacheMode::Wp));
+        assert_eq!(cache_mode_from_linux(6), None);
+        assert_eq!(cache_mode_from_linux(-1), None);
     }
 
     #[test]

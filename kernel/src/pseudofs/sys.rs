@@ -1,10 +1,10 @@
 use alloc::{
     format,
-    string::{String, ToString},
+    string::String,
     sync::Arc,
 };
 
-use axfs_ng_vfs::{DeviceId, Filesystem, NodeType, VfsResult};
+use axfs_ng_vfs::{DeviceId, Filesystem, VfsResult};
 
 use crate::{
     pmu_registry::{PMU_EVENTS, PmuEvents, registered_pmus},
@@ -57,6 +57,7 @@ fn kernel_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     debug.add("tracing", empty_dir(fs.clone()));
     kernel.add("debug", SimpleDir::new_maker(fs.clone(), Arc::new(debug)));
     kernel.add("tracing", empty_dir(fs.clone()));
+    kernel.add("mm", super::mm_sysfs::mm_dir(fs.clone()));
     kernel.add(
         "kexec_loaded",
         SimpleFile::new_regular(fs.clone(), || -> VfsResult<String> {

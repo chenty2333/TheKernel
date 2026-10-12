@@ -24,7 +24,7 @@ use crate::{
     },
     i915_gem_context_upstream::{
         I915UserExtension, i915_gem_context_get_engine, i915_gem_context_has_full_ppgtt,
-        i915_gem_context_is_closed, i915_gem_context_is_recoverable, i915_gem_context_lookup,
+        i915_gem_context_is_closed, i915_gem_context_lookup,
         i915_gem_context_put, i915_gem_context_user_engines,
         i915_gem_context_uses_protected_content, i915_gem_file_bsd_engine,
         i915_gem_file_set_bsd_engine, i915_lut_handle_alloc, i915_lut_handle_free,
@@ -53,7 +53,9 @@ use crate::{
         __i915_gem_object_get_page as i915_gem_object_get_page, radix_tree_delete,
         radix_tree_insert, radix_tree_lookup,
     },
-    i915_gem_userptr_upstream::i915_gem_object_userptr_submit_init,
+    i915_gem_userptr_upstream::{
+        i915_gem_object_userptr_submit_done, i915_gem_object_userptr_submit_init,
+    },
     i915_gem_ww_upstream::{i915_gem_ww_ctx_backoff, i915_gem_ww_ctx_fini, i915_gem_ww_ctx_init},
     i915_request_types_upstream::{
         I915_FENCE_FLAG_COMPOSITE, I915_FENCE_FLAG_NOPREEMPT, I915_FENCE_FLAG_SKIP_PARALLEL,
@@ -62,7 +64,7 @@ use crate::{
     i915_request_upstream::{
         __i915_request_commit, __i915_request_queue, __i915_request_skip,
         i915_request_await_dma_fence, i915_request_await_execution, i915_request_await_object,
-        i915_request_create, i915_request_free_capture_list, i915_request_retire,
+        i915_request_create, i915_request_retire,
         i915_request_set_error_once, i915_request_wait,
     },
     i915_scheduler_types_upstream::I915SchedAttr,
@@ -118,15 +120,13 @@ use crate::{
         gem_memory::drm_mm_node_allocated,
         highmem::{kmap_local_page, kunmap_local},
         i915::{
-            GRAPHICS_VER, GRAPHICS_VER_FULL, HAS_64BIT_RELOC, HAS_LLC, INTEL_INFO, IP_VER, IS_DGFX,
-            IS_TIGERLAKE, i915_ggtt_offset, i915_mmio_reg_offset, to_gt, to_i915,
+            GRAPHICS_VER, HAS_64BIT_RELOC, HAS_LLC, IS_TIGERLAKE, i915_ggtt_offset, i915_mmio_reg_offset, to_gt, to_i915,
         },
         i915_trace::{trace_i915_request_add, trace_i915_request_queue},
         iomapping::{io_mapping_map_atomic_wc, io_mapping_unmap_atomic},
         mm_native::{
             __copy_from_user, __copy_from_user_inatomic, __get_user, __put_user, copy_from_user,
-            pagefault_disable, pagefault_enable, u64_to_ptr, unsafe_put_user, user_access_begin,
-            user_access_end, user_write_access_begin, user_write_access_end,
+            pagefault_disable, pagefault_enable, u64_to_ptr, unsafe_put_user, user_write_access_begin, user_write_access_end,
         },
         primitives::{__GFP_NOWARN, ilog2, is_power_of_2_u64, mb, offset_in_page},
         rcu::{rcu_read_lock, rcu_read_unlock},
@@ -143,12 +143,11 @@ use crate::{
     linux_config::{
         __GFP_NORETRY, CAP_SYS_ADMIN, EAGAIN, EBADSLT, EDEADLK, EEXIST, EFAULT, EINTR, EINVAL, EIO,
         ENODEV, ENOENT, ENOMEM, ENOSPC, EPERM, ERESTARTSYS, ERR_PTR, EWOULDBLOCK, GFP_KERNEL,
-        IS_ERR, MAX_SCHEDULE_TIMEOUT, PAGE_SHIFT, PTR_ERR, current,
-    },
+        IS_ERR, MAX_SCHEDULE_TIMEOUT, PAGE_SHIFT, PTR_ERR, },
     linux_list::{INIT_LIST_HEAD, list_add, list_add_tail, list_empty, list_splice_tail},
     linux_locks::{lockdep_unpin_lock, spin_lock, spin_unlock},
     linux_memory::{
-        atomic_fetch_inc, kfree, kmalloc_array, kmalloc_obj, krealloc, kvfree, kvmalloc_array,
+        atomic_fetch_inc, kfree, kmalloc_array, krealloc, kvfree, kvmalloc_array,
         kzalloc,
     },
     linux_mutex::{mutex_lock, mutex_unlock},
@@ -2011,7 +2010,7 @@ pub unsafe fn eb_move_to_gpu(eb: *mut I915Execbuffer) -> i32 {
             j -= 1;
         }
     }
-    #[cfg(feature = "mmu-notifier")]
+    // Linux gates this on CONFIG_MMU_NOTIFIER, which TheKernel always builds.
     if err == 0 && (*(*eb).args).flags & EXEC_USERPTR_USED as u64 != 0 {
         for i in 0..count {
             let obj = (*(*(*eb).vma.add(i as usize)).vma).obj;

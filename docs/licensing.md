@@ -1,5 +1,15 @@
 # Licensing map
 
+> **2026-10-12 (i915 unification phase 1).** The `tk-intel-display` crate
+> (Linux 7.2.3 display translations) and the native display/GT modules under
+> `kernel/src/drm/intel/` (modeset, fastboot, GTT, native GEM, hotplug, DMC,
+> GMBUS, and the rest) were deleted. Paths and attribution rows below that
+> name them describe removed code and are kept as the record of what was
+> shipped before this change. The i915 port in `crates/ax/tk-intel-gt`, its
+> `NOTICE` and `LICENSE-MIT`, remain the attribution for the GPU code that
+> ships. The Linux-excerpt baseline in `tests/ci/test_linux_excerpt_baseline.py`
+> was measured before the deletion and must be re-scanned.
+
 Measured on the `dev` worktree, commit `d38a2db7` plus uncommitted WIP,
 2026-09-21. This file states what the repository actually contains and what a
 redistributor must do. It does not change any license expression, feature

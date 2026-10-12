@@ -1,5 +1,13 @@
 # The Intel swing read-back: getting phase 5's buffer-translation values off the PHY
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 **What this covers:** reference §8.5's voltage-swing / buffer-translation values — the numbers phase 5
 writes into the combo PHY's `PORT_TX_DW2`/`DW4`/`DW5`/`DW7` — and the one honest route to them:
 reading back what the firmware already programmed for this board. §8.3 (combo PHY initialisation),

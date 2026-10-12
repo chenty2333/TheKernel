@@ -5,8 +5,9 @@
 //! Unlike a device/UC `iomap`, i915 stolen-memory mappings require PAT WC.
 //! This owner creates a dedicated kernel VA alias with PAT1/WC leaves and
 //! keeps the VA reserved until the kernel's acknowledged global shootdown has
-//! completed. The service admits only reserved or device physical ranges, so
-//! it never creates a WC alias over allocator-owned normal RAM.
+//! completed. The physical range is reserved through `axmm::memtype` (Linux
+//! `__ioremap_caller`): system RAM is refused, and the grant must be exactly
+//! WC, so the alias can never carry a mode other than the one requested.
 
 #![allow(unsafe_code)]
 
@@ -16,12 +17,10 @@ use core::{
     ptr,
 };
 
-use axhal::{
-    mem::{MemRegionFlags, memory_regions, phys_to_virt},
-    paging::MappingFlags,
-};
+use axhal::paging::MappingFlags;
+use axmm::memtype::ioremap::IoremapReservation;
 use kernel_guard::NoPreemptIrqSave;
-use memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange};
+use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
 use spin::Mutex;
 
 use crate::{
@@ -40,6 +39,7 @@ struct IoMappingRecord {
     mapped_base: usize,
     mapped_size: usize,
     return_offset: usize,
+    memtype: IoremapReservation,
 }
 
 static IO_MAPPINGS: Mutex<BTreeMap<usize, IoMappingRecord>> = Mutex::new(BTreeMap::new());
@@ -64,46 +64,6 @@ fn physical_extent(base: usize, size: usize) -> Option<(usize, usize, usize)> {
     ))
 }
 
-/// Return true only when no byte of the range is RAM.
-#[cfg(not(target_os = "none"))]
-fn wc_physical_range_allowed(_base: usize, _size: usize) -> bool {
-    // No firmware-reserved physical ranges exist in a host process.
-    false
-}
-
-/// Linux `ioremap_wc()` refuses only ranges that are RAM (`__ioremap_check_ram`).
-/// A 64-bit PCI BAR such as ADL-N's GMADR at 256 GiB lies in no firmware
-/// memory-map entry at all, so an uncovered gap is device space; every region
-/// the range does overlap must still be reserved or device memory, never RAM.
-#[cfg(target_os = "none")]
-fn wc_physical_range_allowed(base: usize, size: usize) -> bool {
-    let Some(end) = base.checked_add(size) else {
-        return false;
-    };
-    if base >= end {
-        return false;
-    }
-    for region in memory_regions() {
-        let start = region.paddr.as_usize();
-        let Some(region_end) = start.checked_add(region.size) else {
-            return false;
-        };
-        if region_end <= base || start >= end {
-            continue;
-        }
-        if region.flags.contains(MemRegionFlags::FREE)
-            || !region
-                .flags
-                .intersects(MemRegionFlags::RESERVED | MemRegionFlags::DEVICE)
-        {
-            return false;
-        }
-    }
-    !axhal::mem::phys_ram_ranges()
-        .iter()
-        .any(|&(start, len)| start < end && start.saturating_add(len) > base)
-}
-
 #[cfg(not(target_os = "none"))]
 fn vmap_search_window() -> Option<(VirtAddr, VirtAddrRange)> {
     None
@@ -112,7 +72,7 @@ fn vmap_search_window() -> Option<(VirtAddr, VirtAddrRange)> {
 #[cfg(target_os = "none")]
 fn vmap_search_window() -> Option<(VirtAddr, VirtAddrRange)> {
     let mut max_phys_end = 0usize;
-    for region in memory_regions() {
+    for region in axhal::mem::memory_regions() {
         let end = region.paddr.as_usize().checked_add(region.size)?;
         max_phys_end = max_phys_end.max(end);
     }
@@ -169,9 +129,50 @@ pub unsafe fn io_mapping_init_wc(mapping: *mut IoMapping, base: u64, size: usize
     else {
         return false;
     };
-    if !wc_physical_range_allowed(physical_base, mapped_size) {
+    // Linux `__ioremap_caller()`: refuse system RAM and reserve the memtype of
+    // the page extent. The grant must be exactly PAT WC, otherwise the leaf
+    // encoding would alias a different cache mode.
+    let Ok(memtype) = axmm::memtype::ioremap::reserve(
+        physical_base as u64,
+        mapped_size as u64,
+        axmm::memtype::CacheMode::Wc,
+    ) else {
+        return false;
+    };
+    if memtype.mode != axmm::memtype::CacheMode::Wc
+        || memtype.flags != MappingFlags::WRITE_COMBINING
+    {
+        let _ = axmm::memtype::ioremap::free(&memtype);
         return false;
     }
+    if unsafe {
+        install_wc_alias(
+            mapping,
+            base,
+            size,
+            physical_base,
+            mapped_size,
+            return_offset,
+            memtype,
+        )
+    } {
+        return true;
+    }
+    let _ = axmm::memtype::ioremap::free(&memtype);
+    false
+}
+
+/// Map the WC alias for a range whose memtype is already reserved. The caller
+/// releases the reservation when this returns `false`.
+unsafe fn install_wc_alias(
+    mapping: *mut IoMapping,
+    base: u64,
+    size: usize,
+    physical_base: usize,
+    mapped_size: usize,
+    return_offset: usize,
+    memtype: IoremapReservation,
+) -> bool {
     let Some((hint, limit)) = vmap_search_window() else {
         return false;
     };
@@ -225,6 +226,7 @@ pub unsafe fn io_mapping_init_wc(mapping: *mut IoMapping, base: u64, size: usize
         mapped_base: start.as_usize(),
         mapped_size,
         return_offset,
+        memtype,
     };
     let inserted = with_records(|records| records.insert(returned, record).is_none());
     if !inserted {
@@ -275,6 +277,8 @@ pub unsafe fn io_mapping_fini(mapping: *mut IoMapping) {
             .unmap(start, record.mapped_size)
             .is_ok()
     );
+    axmm::memtype::ioremap::free(&record.memtype)
+        .expect("WC iomap memtype was not reserved");
     unsafe {
         (*mapping).base = 0;
         (*mapping).size = 0;

@@ -111,6 +111,7 @@ pub fn init(args: &[String], envs: &[String]) {
     axfs::set_automount_trigger_policy(crate::mounts::trigger_automount);
     crate::deferred_work::init();
     crate::mm::init_memory_pressure();
+    crate::mm::init_dirty_writeback();
     crate::mm::init_khugepaged();
     crate::file::inotify::init_filesystem_release_notifications();
     let security_registry = match crate::task::security::init() {

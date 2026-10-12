@@ -1,0 +1,20 @@
+[package]
+name = "tk-mmu-notifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Per-address-space MMU-notifier domains: Linux mm/mmu_notifier.c interval-subscription sequencing"
+license.workspace = true
+repository.workspace = true
+publish = []
+
+[lib]
+name = "mmu_notifier"
+path = "src/lib.rs"
+
+[dependencies]
+spin = "0.10"
+
+[package.metadata.thekernel]
+layer = "mechanism"

@@ -44,7 +44,7 @@ use crate::{
         set_key_root_maxkeys,
     },
     mm::{
-        AddrSpace, Backend, BackendOps, commit_limit_bytes, committed_as_bytes, memfd_noexec_scope,
+        AddrSpace, Backend, BackendOps, memfd_noexec_scope,
         memory_pressure_snapshot, memory_watermarks, overcommit_memory_policy, overcommit_ratio,
         set_memfd_noexec_scope, set_overcommit_memory_policy, set_overcommit_ratio,
         set_unprivileged_userfaultfd, system_memory_stats_with_reclaimable_file_cache,
@@ -1388,28 +1388,6 @@ impl Pollable for ProcUserNamespaceFile {
     }
 }
 
-fn real_meminfo() -> String {
-    let reclaim = axfs::cached_file_reclaim_estimate();
-    let stats = system_memory_stats_with_reclaimable_file_cache(reclaim.reclaimable_pages);
-    let total_kb = stats.total_bytes / 1024;
-    let free_kb = stats.free_bytes / 1024;
-    let available_kb = stats.available_bytes / 1024;
-    let cached_kb = stats.cached_bytes / 1024;
-    let page_tables_kb = stats.page_table_bytes / 1024;
-    let commit_limit_kb = commit_limit_bytes() / 1024;
-    let committed_kb = committed_as_bytes() / 1024;
-    let swap_usage = crate::mm::swap_usage();
-    let swap_total_kb = swap_usage.total_bytes / 1024;
-    let swap_free_kb = swap_usage.free_bytes / 1024;
-    format!(
-        "MemTotal:       {total_kb:>8} kB\nMemFree:        {free_kb:>8} kB\nMemAvailable:   \
-         {available_kb:>8} kB\nBuffers:               0 kB\nCached:         {cached_kb:>8} \
-         kB\nSwapCached:            0 kB\nSwapTotal:      {swap_total_kb:>8} kB\nSwapFree:       {swap_free_kb:>8} \
-         kB\nPageTables:     {page_tables_kb:>8} kB\nCommitLimit:    {commit_limit_kb:>8} \
-         kB\nCommitted_AS:   {committed_kb:>8} kB\n"
-    )
-}
-
 fn real_memory_pressure() -> String {
     let snapshot = memory_pressure_snapshot();
     let reclaim = axfs::cached_file_reclaim_estimate();
@@ -1654,20 +1632,11 @@ fn task_status(
 ) -> VfsResult<String> {
     let thread = task.as_thread();
     let proc_data = &thread.proc_data;
-    let (vm_size_kb, vm_rss_kb, locked_kb, swapped_kb) = {
+    let mem_block = {
         let aspace_handle = proc_data.aspace();
         let aspace = aspace_handle.lock();
-        let vm_size = aspace
-            .areas()
-            .filter(|area| area.flags().contains(MappingFlags::USER))
-            .map(|area| area.size())
-            .sum::<usize>();
-        (
-            vm_size / 1024,
-            aspace.resident_user_bytes() / 1024,
-            aspace.locked_bytes() / 1024,
-            aspace.total_swapped_bytes() / 1024,
-        )
+        let layout = proc_data.mm_layout();
+        super::proc_task_memory::task_mem_status(&aspace, &layout)
     };
     let state = task_state(task);
     let state_name = match state {
@@ -1724,10 +1693,7 @@ fn task_status(
         PPid:\t{}\n\
         Uid:\t{} {} {} {}\n\
         Gid:\t{} {} {} {}\n\
-        VmSize:\t{} kB\n\
-        VmRSS:\t{} kB\n\
-        VmLck:\t{} kB\n\
-        VmSwap:\t{} kB\n\
+        {mem_block}\
         Threads:\t{}\n\
         NoNewPrivs:\t{}\n\
         Seccomp:\t{}\n\
@@ -1757,10 +1723,6 @@ fn task_status(
         viewer_user_ns.from_kgid_munged(ids.egid),
         viewer_user_ns.from_kgid_munged(ids.sgid),
         viewer_user_ns.from_kgid_munged(ids.fsgid),
-        vm_size_kb,
-        vm_rss_kb,
-        locked_kb,
-        swapped_kb,
         threads,
         cred.no_new_privs() as u8,
         seccomp.mode() as u8,
@@ -1810,18 +1772,43 @@ fn render_task_limits(task: &AxTaskRef) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// Which /proc/<pid>/{maps,smaps,smaps_rollup} record shape to render.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapsView {
+    Maps,
+    Smaps,
+    Rollup,
+}
+
+struct MapRow {
+    start: usize,
+    end: usize,
+    flags: MappingFlags,
+    shared: bool,
+    file: Option<(Location, u64)>,
+    stats: super::proc_task_memory::MemSizeStats,
+    vm_flags: String,
+    thp_eligible: bool,
+}
+
 fn render_task_maps(
     aspace_handle: &Arc<Mutex<AddrSpace>>,
     layout: &crate::task::ProcessMmLayout,
-    include_smaps: bool,
+    view: MapsView,
 ) -> VfsResult<String> {
+    use super::proc_task_memory::{
+        MemSizeStats, PageKind, account_vma_leaves, page_kind, push_smap_record,
+        push_smaps_rollup, vm_flags_text,
+    };
+    let include_smaps = view != MapsView::Maps;
     // Only snapshot VMA/PTE data under the mm lock. Filesystem metadata and
     // pathname resolution can block and must never retain that lock.
-    let rows = {
+    let (rows, rollup) = {
         let aspace = aspace_handle.lock();
         let mut rows = Vec::new();
         rows.try_reserve_exact(aspace.areas().count())
             .map_err(|_| VfsError::NoMemory)?;
+        let mut rollup = MemSizeStats::default();
         for area in aspace.areas() {
             if !area.flags().contains(MappingFlags::USER) {
                 continue;
@@ -1842,40 +1829,64 @@ fn render_task_maps(
                     _ => None,
                 });
             let file = file.map(|(location, offset)| (location.clone(), offset));
-            let (resident_bytes, locked_bytes) = if include_smaps {
-                let page_size = area.backend().page_size() as usize;
-                let mut resident_bytes = 0;
-                let mut cursor = area.start();
-                while cursor < area.end() {
-                    let step = page_size.min(area.end().sub_addr(cursor));
-                    if aspace.page_table().query_mapped(cursor).is_ok() {
-                        resident_bytes += step;
-                    }
-                    cursor += page_size;
-                }
-                let locked_bytes = aspace.locked_bytes_in_range(area.start(), area.size());
-                (resident_bytes, locked_bytes)
-            } else {
-                (0, 0)
-            };
-            let swapped_bytes = if include_smaps {
-                aspace.swapped_bytes_in_range(area.start(), area.size())
-            } else { 0 };
-            rows.push((
-                area.start().as_usize(),
-                area.end().as_usize(),
-                area.flags(),
-                is_shared_user_mapping(area.backend()),
+            let shared = is_shared_user_mapping(area.backend());
+            let mut stats = MemSizeStats::default();
+            let mut vm_flags = String::new();
+            let mut thp_eligible = false;
+            if include_smaps {
+                let kind = page_kind(area.backend());
+                account_vma_leaves(
+                    &mut stats,
+                    (area.start().as_usize(), area.end().as_usize()),
+                    area.backend().page_size() as usize,
+                    kind,
+                    shared,
+                    |va| aspace.page_table().query_mapped(va).ok().map(|(pa, _, size)| (pa, size)),
+                    |base, size| aspace.mapped_frame_owner_count(base, size),
+                );
+                stats.locked = aspace.locked_bytes_in_range(area.start(), area.size());
+                stats.swap = aspace.swapped_bytes_in_range(area.start(), area.size());
+                stats.swap_pss = stats.swap;
+                let obs = aspace.proc_vma_observations(area.start(), area.size());
+                stats.lazyfree = obs.lazyfree_bytes;
+                let thp = area.backend().madvise_thp();
+                thp_eligible = kind == PageKind::Anon
+                    && obs.thp_enabled
+                    && !matches!(thp, crate::mm::MadviseThp::NoHuge);
+                vm_flags = vm_flags_text(area.flags(), shared, &obs, thp);
+                rollup.merge(&stats);
+            }
+            rows.push(MapRow {
+                start: area.start().as_usize(),
+                end: area.end().as_usize(),
+                flags: area.flags(),
+                shared,
                 file,
-                resident_bytes,
-                locked_bytes,
-                swapped_bytes,
-            ));
+                stats,
+                vm_flags,
+                thp_eligible,
+            });
         }
-        rows
+        (rows, rollup)
     };
     let mut out = String::new();
-    for (start, end, flags, shared, file, resident_bytes, locked_bytes, swapped_bytes) in rows {
+    if view == MapsView::Rollup {
+        let vma_start = rows.first().map_or(0, |row| row.start);
+        let vma_end = rows.last().map_or(0, |row| row.end);
+        push_smaps_rollup(&mut out, vma_start, vma_end, &rollup);
+        return Ok(out);
+    }
+    for row in rows {
+        let MapRow {
+            start,
+            end,
+            flags,
+            shared,
+            file,
+            stats,
+            vm_flags,
+            thp_eligible,
+        } = row;
         let r = if flags.contains(MappingFlags::READ) {
             'r'
         } else {
@@ -1928,7 +1939,7 @@ fn render_task_maps(
         );
 
         if include_smaps {
-            super::proc_task_memory::smaps_base(&mut out, end-start, resident_bytes, swapped_bytes, locked_bytes);
+            push_smap_record(&mut out, end - start, &stats, thp_eligible, &vm_flags);
         }
     }
 
@@ -2881,6 +2892,7 @@ impl SimpleDirOps for ThreadDir {
                 self.show_task_dir.then_some(b"task".as_slice()),
                 Some(b"maps".as_slice()),
                 Some(b"smaps".as_slice()),
+                Some(b"smaps_rollup".as_slice()),
                 Some(b"numa_maps".as_slice()),
                 Some(b"pagemap".as_slice()),
                 Some(b"mounts".as_slice()),
@@ -3014,14 +3026,20 @@ impl SimpleDirOps for ThreadDir {
                 let aspace = proc_image_access(&task, process_view)?.into_aspace();
                 let layout = task.as_thread().proc_data.mm_layout();
                 validate_proc_fd_image(&task, &aspace)?;
-                SimpleFile::new_regular(fs, move || render_task_maps(&aspace, &layout, false))
+                SimpleFile::new_regular(fs, move || render_task_maps(&aspace, &layout, MapsView::Maps))
                     .into()
             }
             b"smaps" => {
                 let aspace = proc_image_access(&task, process_view)?.into_aspace();
                 let layout = task.as_thread().proc_data.mm_layout();
                 validate_proc_fd_image(&task, &aspace)?;
-                SimpleFile::new_regular(fs, move || render_task_maps(&aspace, &layout, true)).into()
+                SimpleFile::new_regular(fs, move || render_task_maps(&aspace, &layout, MapsView::Smaps)).into()
+            }
+            b"smaps_rollup" => {
+                let aspace = proc_image_access(&task, process_view)?.into_aspace();
+                let layout = task.as_thread().proc_data.mm_layout();
+                validate_proc_fd_image(&task, &aspace)?;
+                SimpleFile::new_regular(fs, move || render_task_maps(&aspace, &layout, MapsView::Rollup)).into()
             }
             b"numa_maps" => {
                 let aspace = proc_image_access(&task, process_view)?.into_aspace();
@@ -3434,7 +3452,7 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
     });
     root.add(
         "meminfo",
-        SimpleFile::new_regular(fs.clone(), || Ok(real_meminfo())),
+        SimpleFile::new_regular(fs.clone(), || Ok(super::proc_memory::meminfo_text())),
     );
     root.add(
         "memory_pressure",
@@ -3751,6 +3769,147 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
                 ),
             );
 
+            // Linux v7.2.3 `mm/page-writeback.c` and `fs/fs-writeback.c`: the vm.dirty_*
+            // family. Byte and ratio pairs are mutually exclusive, as in Linux.
+            vm.add(
+                "swappiness",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", crate::mm::swappiness()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = write_proc_u32(data)?;
+                            crate::mm::set_swappiness(value).map_err(|_| VfsError::InvalidInput)?;
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            vm.add(
+                "dirty_background_ratio",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", axfs::dirty_writeback_tunables().background_ratio()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = write_proc_u32(data)?;
+                            axfs::dirty_writeback_tunables().set_background_ratio(value)?;
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            vm.add(
+                "dirty_ratio",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", axfs::dirty_writeback_tunables().dirty_ratio()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = write_proc_u32(data)?;
+                            axfs::dirty_writeback_tunables().set_dirty_ratio(value)?;
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            vm.add(
+                "dirty_background_bytes",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", axfs::dirty_writeback_tunables().background_bytes()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = str::from_utf8(data)
+                                .ok()
+                                .map(str::trim)
+                                .and_then(|it| it.parse::<u64>().ok())
+                                .ok_or(VfsError::InvalidInput)?;
+                            axfs::dirty_writeback_tunables().set_background_bytes(value)?;
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            vm.add(
+                "dirty_bytes",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", axfs::dirty_writeback_tunables().dirty_bytes()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = str::from_utf8(data)
+                                .ok()
+                                .map(str::trim)
+                                .and_then(|it| it.parse::<u64>().ok())
+                                .ok_or(VfsError::InvalidInput)?;
+                            axfs::dirty_writeback_tunables().set_dirty_bytes(value)?;
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            vm.add(
+                "dirty_writeback_centisecs",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", axfs::dirty_writeback_tunables().writeback_centisecs()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            axfs::dirty_writeback_tunables().set_writeback_centisecs(write_proc_u32(data)?);
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            vm.add(
+                "dirty_expire_centisecs",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", axfs::dirty_writeback_tunables().expire_centisecs()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            axfs::dirty_writeback_tunables().set_expire_centisecs(write_proc_u32(data)?);
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
             // Linux v7.2.3 `mm/userfaultfd.c`: mode 0644, bounds 0..=1,
             // default 0.  It gates only creations that ask for kernel-mode
             // fault handling without UFFD_USER_MODE_ONLY.

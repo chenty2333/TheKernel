@@ -2079,3 +2079,275 @@ fn fork_preserves_unfaulted_writable_file_bss_holes() {
     assert!(matches!(parent.page_table().query(start), Err(PagingError::NotMapped)));
     assert!(matches!(child.lock().page_table().query(start), Err(PagingError::NotMapped)));
 }
+
+/// Interval subscriber that counts invalidations and remembers the last event.
+struct NotifierProbe {
+    hits: core::sync::atomic::AtomicUsize,
+    last_event: core::sync::atomic::AtomicU32,
+}
+
+impl NotifierProbe {
+    fn new() -> alloc::sync::Arc<Self> {
+        alloc::sync::Arc::new(Self {
+            hits: core::sync::atomic::AtomicUsize::new(0),
+            last_event: core::sync::atomic::AtomicU32::new(u32::MAX),
+        })
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    fn last(&self) -> u32 {
+        self.last_event.load(core::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl mmu_notifier::Subscriber for NotifierProbe {
+    fn invalidate(&self, range: &mmu_notifier::Range, seq: u64) -> bool {
+        assert_eq!(seq & 1, 1);
+        self.last_event
+            .store(range.event as u32, core::sync::atomic::Ordering::Release);
+        self.hits.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        true
+    }
+
+    fn seq(&self) -> u64 {
+        0
+    }
+
+    fn set_seq(&self, _seq: u64) {}
+}
+
+#[test]
+fn notifier_fires_on_overlapping_discard_protect_and_unmap_only() {
+    use mmu_notifier::Event;
+
+    let base = VirtAddr::from(0x1000);
+    let mut aspace =
+        AddrSpace::new_empty(VirtAddr::from(0x1000), TEST_SPACE_SIZE - 0x1000).unwrap();
+    let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+    aspace
+        .map(
+            base,
+            PAGE_SIZE_4K * 4,
+            flags,
+            true,
+            Backend::new_alloc(base, PageSize::Size4K),
+        )
+        .unwrap();
+    let key = aspace.address_space_id().get();
+    let probe = NotifierProbe::new();
+    // Subscribes to the page at 0x2000 only.
+    mmu_notifier::subscribe(key, 0xabc, 0x2000, 0x2fff, probe.clone()).unwrap();
+
+    // Disjoint MADV_DONTNEED-style discard of 0x4000 does not fire.
+    aspace
+        .discard_pages(VirtAddr::from(0x4000), PAGE_SIZE_4K)
+        .unwrap();
+    assert_eq!(probe.hits(), 0);
+
+    // Overlapping discard fires with the Clear event.
+    aspace
+        .discard_pages(VirtAddr::from(0x2000), PAGE_SIZE_4K)
+        .unwrap();
+    assert_eq!(probe.hits(), 1);
+    assert_eq!(probe.last(), Event::Clear as u32);
+
+    // Overlapping mprotect fires with the ProtectionVma event.
+    aspace
+        .prepare_protect(
+            VirtAddr::from(0x2000),
+            PAGE_SIZE_4K,
+            MappingFlags::USER | MappingFlags::READ,
+        )
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert_eq!(probe.hits(), 2);
+    assert_eq!(probe.last(), Event::ProtectionVma as u32);
+
+    // Unmapping the disjoint page leaves the subscriber alone.
+    aspace
+        .unmap(VirtAddr::from(0x4000), PAGE_SIZE_4K)
+        .unwrap()
+        .finish();
+    assert_eq!(probe.hits(), 2);
+
+    // Overlapping munmap fires with the Unmap event.
+    aspace
+        .unmap(VirtAddr::from(0x2000), PAGE_SIZE_4K)
+        .unwrap()
+        .finish();
+    assert_eq!(probe.hits(), 3);
+    assert_eq!(probe.last(), Event::Unmap as u32);
+
+    mmu_notifier::unsubscribe(key, 0xabc);
+}
+
+#[test]
+fn notifier_sees_fork_write_protect_and_release_on_drop() {
+    use mmu_notifier::Event;
+
+    let base = VirtAddr::from(0x1000);
+    let mut aspace =
+        AddrSpace::new_empty(VirtAddr::from(0x1000), TEST_SPACE_SIZE - 0x1000).unwrap();
+    let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+    aspace
+        .map(
+            base,
+            PAGE_SIZE_4K * 2,
+            flags,
+            true,
+            Backend::new_alloc(base, PageSize::Size4K),
+        )
+        .unwrap();
+    let key = aspace.address_space_id().get();
+    let probe = NotifierProbe::new();
+    mmu_notifier::subscribe(key, 0xdef, 0x1000, 0x1fff, probe.clone()).unwrap();
+
+    let child = aspace.try_clone().unwrap();
+    assert_eq!(probe.hits(), 1);
+    assert_eq!(probe.last(), Event::ProtectionPage as u32);
+    drop(child);
+
+    // exit_mmap: dropping the address space releases its notifier domain.
+    drop(aspace);
+    assert_eq!(probe.hits(), 2);
+    assert_eq!(probe.last(), Event::Release as u32);
+}
+
+/// Maps two resident private pages and returns the shared address-space handle.
+fn userptr_test_space() -> alloc::sync::Arc<axsync::Mutex<AddrSpace>> {
+    let base = VirtAddr::from(0x1000);
+    let mut aspace =
+        AddrSpace::new_empty(VirtAddr::from(0x1000), TEST_SPACE_SIZE - 0x1000).unwrap();
+    let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+    aspace
+        .map(
+            base,
+            PAGE_SIZE_4K * 2,
+            flags,
+            true,
+            Backend::new_alloc(base, PageSize::Size4K),
+        )
+        .unwrap();
+    aspace.write(base, &[0x5a; PAGE_SIZE_4K * 2]).unwrap();
+    alloc::sync::Arc::new(axsync::Mutex::new(aspace))
+}
+
+#[test]
+fn userptr_subscriber_sees_munmap_and_cow_break_of_pinned_private_page() {
+    use mmu_notifier::Event;
+
+    let base = VirtAddr::from(0x1000);
+    let space = userptr_test_space();
+    let key = space.lock().address_space_id().get();
+    // The userptr interval covers only the first page.
+    let probe = NotifierProbe::new();
+    mmu_notifier::subscribe(key, 0x7001, 0x1000, 0x1fff, probe.clone()).unwrap();
+
+    // Fork shares the private page COW: the parent's PTE becomes read-only.
+    let child = space.lock().try_clone().unwrap();
+    assert_eq!(probe.last(), Event::ProtectionPage as u32);
+    let hits_after_fork = probe.hits();
+    assert_eq!(hits_after_fork, 1);
+
+    // Pin the shared page read-only, as a GPU userptr object does for reads.
+    let capability = crate::mm::UserMemoryCapability::new(space.clone());
+    let pin = crate::mm::pin_user_segments_from_user_longterm_with(
+        &capability,
+        base.as_usize() as *const u8,
+        PAGE_SIZE_4K,
+    )
+    .unwrap();
+    let pinned_frame = pin.segments()[0].paddr;
+    // The pin names the frame the process maps.
+    assert_eq!(
+        space.lock().user_leaf(base).map(|(paddr, _)| paddr.as_usize()),
+        Some(pinned_frame)
+    );
+    assert_eq!(probe.hits(), hits_after_fork);
+
+    // The parent's store breaks COW on the pinned page: the PTE moves to a new
+    // frame under a Clear invalidation, and the pinned frame stays allocated.
+    // Use the user-store path: the raw `AddrSpace::write` copies into the
+    // frame without faulting and must not be used on a COW-shared page.
+    capability.write_bytes(base.as_usize(), &[0xa5]).unwrap();
+    assert_eq!(probe.hits(), hits_after_fork + 1);
+    assert_eq!(probe.last(), Event::Clear as u32);
+    let remapped = space.lock().user_leaf(base).unwrap().0.as_usize();
+    assert_ne!(remapped, pinned_frame);
+    assert!(super::backend::any_frame_pinned([PhysAddr::from(pinned_frame)]));
+    drop(child);
+
+    // munmap of the (now private) page is an overlapping Unmap invalidation.
+    space
+        .lock()
+        .unmap(base, PAGE_SIZE_4K)
+        .unwrap()
+        .finish();
+    assert_eq!(probe.hits(), hits_after_fork + 2);
+    assert_eq!(probe.last(), Event::Unmap as u32);
+
+    drop(pin);
+    mmu_notifier::unsubscribe(key, 0x7001);
+}
+
+#[test]
+fn pinned_user_frame_is_not_freed_by_unmap_until_unpinned() {
+    let base = VirtAddr::from(0x1000);
+    let space = userptr_test_space();
+    let capability = crate::mm::UserMemoryCapability::new(space.clone());
+    let pin = crate::mm::pin_user_segments_to_user_longterm_with(
+        &capability,
+        base.as_usize() as *mut u8,
+        PAGE_SIZE_4K,
+    )
+    .unwrap();
+    let frame = pin.segments()[0].paddr;
+    assert_eq!(
+        space.lock().user_leaf(base).map(|(paddr, _)| paddr.as_usize()),
+        Some(frame)
+    );
+
+    // Unmapping the process's last reference must not release the frame.
+    space
+        .lock()
+        .unmap(base, PAGE_SIZE_4K)
+        .unwrap()
+        .finish();
+    assert!(space.lock().user_leaf(base).is_none());
+    assert!(super::backend::any_frame_pinned([PhysAddr::from(frame)]));
+
+    // Dropping the last pin releases the deferred frame.
+    drop(pin);
+    assert!(!super::backend::any_frame_pinned([PhysAddr::from(frame)]));
+}
+
+#[test]
+fn vm_and_resident_highwater_survive_unmap_that_lowers_the_totals() {
+    let start = VirtAddr::from(0x1000);
+    let mut aspace = AddrSpace::new_empty(start, TEST_SPACE_SIZE).unwrap();
+    let user = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+    aspace
+        .map(
+            start,
+            PAGE_SIZE_4K * 4,
+            user,
+            false,
+            Backend::new_alloc(start, PageSize::Size4K),
+        )
+        .unwrap();
+    aspace.populate_area(start, PAGE_SIZE_4K * 2, user).unwrap();
+    assert_eq!(aspace.current_mapping_bytes(), PAGE_SIZE_4K * 4);
+
+    // The unmap lowers both totals; the peak must be published first.
+    aspace.unmap(start, PAGE_SIZE_4K * 4).unwrap();
+    assert_eq!(aspace.current_mapping_bytes(), 0);
+    assert_eq!(aspace.resident_user_bytes(), 0);
+    assert_eq!(aspace.maxvm_kb.load(Ordering::Acquire), 16);
+    assert_eq!(aspace.maxrss_kb.load(Ordering::Acquire), 8);
+    // Reads of the peak never report less than what was observed.
+    assert_eq!(aspace.merge_vm_highwater(4), 16);
+}

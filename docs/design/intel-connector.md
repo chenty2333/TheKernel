@@ -1,5 +1,13 @@
 # The connector: phase 2.1 and the pin a monitor answered on
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 Status: implemented on `feat/intel-connect` (commits `2c46a26b`, `08d99ca4`,
 `80d87d29`, and this document).  This document describes what the AUX/DDC
 power-well step (reference §11 phase 2.1) does, why it comes before GMBUS, the

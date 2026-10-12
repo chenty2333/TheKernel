@@ -19,7 +19,7 @@ fi
 
 # intel_uc_fw.c selects adlp_guc_70.bin and tgl_huc.bin for ADL-N (an
 # ALDERLAKE_P subplatform); the hand-written GT owner of builds without
-# intel-upstream-gt loads tgl_guc_70.bin. Keep them explicit rootfs inputs
+# The i915 port (tk-intel-gt) loads tgl_guc_70.bin. Keep them explicit rootfs inputs
 # rather than assuming DMC also supplies GT code.
 if [ -n "${THEKERNEL_I915_UC_FIRMWARE_DIR:-}" ]; then
     uc_dir=$THEKERNEL_I915_UC_FIRMWARE_DIR

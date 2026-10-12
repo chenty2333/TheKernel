@@ -43,8 +43,7 @@ pub const FW_REG_WRITE: u32 = 2;
 pub(crate) use crate::{
     execlists::EL_CTRL_LOAD,
     guc_submission::{
-        CONTEXT_REGISTRATION_FLAG_KMD, PARENT_SCRATCH_SIZE, WQ_GUC_ID_MASK, WQ_RING_TAIL_MASK,
-        WQ_STATUS_ACTIVE, WQ_TYPE_MULTI_LRC,
+        PARENT_SCRATCH_SIZE,
     },
     i915_request_types_upstream::I915Request,
     intel_breadcrumbs_upstream::{
@@ -65,11 +64,11 @@ pub(crate) use crate::{
         lrc_init_wa_ctx, lrc_pin, lrc_post_unpin, lrc_pre_pin, lrc_reset, lrc_reset_regs,
         lrc_unpin, lrc_update_offsets, lrc_update_regs, lrc_update_runtime,
     },
-    intel_ring::{PIN_OFFSET_BIAS, intel_engine_create_ring},
+    intel_ring::PIN_OFFSET_BIAS,
     intel_timeline_upstream::{
         intel_timeline_enter, intel_timeline_exit, intel_timeline_reset_seqno,
     },
-    intel_workarounds_upstream::{I915McrReg, I915Reg},
+    intel_workarounds_upstream::I915Reg,
     linux::{
         bits::*, contexts::*, fields::*, i915::*, irq::*, primitives::*, rbtree::*, rcu::*,
         registers::*, requests::*, sw_fence::*,
@@ -160,7 +159,6 @@ pub const X86_FEATURE_CLFLUSH: u32 = 19;
 /// captures this boot-CPU capability in its static feature bitmap; on this
 /// x86_64 target the architectural CPUID.1 EDX bit is the corresponding
 /// immutable capability source.
-#[cfg(feature = "upstream-gt")]
 #[inline]
 pub fn static_cpu_has(feature: u32) -> bool {
     assert_eq!(

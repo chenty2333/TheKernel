@@ -847,6 +847,24 @@ impl AddrSpace {
     /// The caller already owns the address-space lock.
     pub(super) fn publish_resident_highwater(&self) {
         self.merge_resident_highwater(self.resident_user_bytes() as u64 / 1024);
+        self.merge_vm_highwater(self.current_mapping_bytes() as u64 / 1024);
+    }
+
+    /// Merges an observed total-VM peak (kB) into `mm->hiwater_vm`.
+    pub(crate) fn merge_vm_highwater(&self, vm_kb: u64) -> u64 {
+        let mut current = self.maxvm_kb.load(Ordering::Acquire);
+        while vm_kb > current {
+            match self.maxvm_kb.compare_exchange_weak(
+                current,
+                vm_kb,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return vm_kb,
+                Err(observed) => current = observed,
+            }
+        }
+        current
     }
 
     pub fn lock_current_mappings(&mut self) {
@@ -895,6 +913,15 @@ impl AddrSpace {
             ax_bail!(InvalidInput, "address is not aligned");
         }
         Ok(())
+    }
+
+    /// Physical base and flags of the leaf that maps `vaddr`, if any. Used by
+    /// device-driver MM shims that must act on the mapped frame itself.
+    pub(crate) fn user_leaf(&self, vaddr: VirtAddr) -> Option<(PhysAddr, MappingFlags)> {
+        match self.pt.query(vaddr.align_down_4k()) {
+            Ok((paddr, flags, _)) => Some((paddr, flags)),
+            Err(_) => None,
+        }
     }
 
     /// Finds a free area that can accommodate the given size.

@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See the repository MIT license.
-//! Intel GPU DMA identity-lease admission and checked firmware reads.
+//! Intel GPU DMA identity-lease admission.
 //!
-//! N305's native display and GT paths keep physical GGTT/PPGTT addresses. They
-//! therefore rely on the existing shared boot DID1 identity aperture; this
-//! lease does not switch the GPU context or provide requester isolation. The
-//! exact firmware scanout and kernel-owned backing pages are checked against
-//! that aperture and held in lease tokens while pinned. Firmware scanout pages
-//! are admitted by `fastboot::ownership`; kernel-owned tokens are retired only
-//! after hardware retirement.
-#[cfg(target_os = "none")]
-use alloc::vec::Vec;
+//! The i915 port keeps physical GGTT addresses, so it relies on the shared boot
+//! identity aperture; this lease does not switch the GPU context or provide
+//! requester isolation. The firmware console pages the GGTT reservation maps
+//! are the ones admitted here ([`super::initial_plane`]).
 
-use intel_display::Error;
+use super::{Error, pci::Bdf, traced_refusal};
 
-fn gpu_requester(bdf: super::pci::Bdf) -> Result<tk_vtd::PciRequester, Error> {
+/// The only requester the lease is taken for: the N305 integrated GPU at
+/// 00:02.0. Any other function is refused.
+fn gpu_requester(bdf: Bdf) -> Result<tk_vtd::PciRequester, Error> {
     if (bdf.bus, bdf.device, bdf.function) != (0, 2, 0) {
-        return Err(super::traced_refusal());
+        return Err(traced_refusal());
     }
     Ok(tk_vtd::PciRequester {
         segment: 0,
@@ -27,49 +24,19 @@ fn gpu_requester(bdf: super::pci::Bdf) -> Result<tk_vtd::PciRequester, Error> {
 }
 
 #[cfg(target_os = "none")]
-pub(super) fn requester(bdf: super::pci::Bdf) -> Result<tk_vtd::PciRequester, Error> {
+pub(super) fn requester(bdf: Bdf) -> Result<tk_vtd::PciRequester, Error> {
     gpu_requester(bdf)
 }
 
+/// Take the identity DMA lease for the GPU, covering the firmware console's
+/// stolen pages.
 #[cfg(target_os = "none")]
 pub(super) fn acquire_identity_lease(
-    bdf: super::pci::Bdf,
+    bdf: Bdf,
     initial_pages: &[u64],
 ) -> Result<tk_vtd::IdentityDmaLease, Error> {
     let requester = requester(bdf)?;
-    tk_vtd::platform_acquire_identity_dma(requester, initial_pages).map_err(|_| super::traced_refusal())
-}
-
-#[cfg(target_os = "none")]
-pub(super) fn lease_matches(lease: &tk_vtd::IdentityDmaLease, bdf: super::pci::Bdf) -> bool {
-    requester(bdf).is_ok_and(|requester| lease.requester() == requester)
-}
-
-#[cfg(target_os = "none")]
-pub(super) fn firmware_bytes(physical: u64, len: usize) -> Result<Vec<u8>, Error> {
-    // Observed firmware pointers only, bounded before dereference, no alias of
-    // usable RAM (including kernel/modules). Boot API doesn't retain all NVS.
-    use axhal::mem::{PhysAddr, phys_ram_ranges};
-    let end = physical.checked_add(len as u64).ok_or_else(|| super::traced_refusal())?;
-    if physical < 0x1000
-        || end > 1 << 52
-        || len > 1 << 20
-        || phys_ram_ranges().iter().any(|&(base, size)| {
-            physical < (base as u64).saturating_add(size as u64) && end > base as u64
-        })
-    {
-        return Err(super::traced_refusal());
-    }
-    let mut data = Vec::new();
-    data.try_reserve_exact(len).map_err(|_| super::traced_refusal())?;
-    data.resize(len, 0);
-    let physical = usize::try_from(physical).map_err(|_| super::traced_refusal())?;
-    let mapping = axmm::iomap(PhysAddr::from_usize(physical), len).map_err(|_| super::traced_refusal())?;
-    for (i, b) in data.iter_mut().enumerate() {
-        // SAFETY: checked extent at observed firmware pointer; live UC mapping.
-        *b = unsafe { mapping.as_ptr().add(i).read_volatile() };
-    }
-    Ok(data)
+    tk_vtd::platform_acquire_identity_dma(requester, initial_pages).map_err(|_| traced_refusal())
 }
 
 #[cfg(test)]
@@ -78,7 +45,7 @@ mod tests {
 
     #[test]
     fn only_the_measured_n305_integrated_gpu_is_a_dma_lease_requester() {
-        let gpu = super::super::pci::Bdf::new(0, 2, 0);
+        let gpu = Bdf::new(0, 2, 0);
         assert_eq!(
             gpu_requester(gpu),
             Ok(tk_vtd::PciRequester {
@@ -88,11 +55,7 @@ mod tests {
                 function: 0,
             })
         );
-        for other in [
-            super::super::pci::Bdf::new(0, 0, 0),
-            super::super::pci::Bdf::new(0, 2, 1),
-            super::super::pci::Bdf::new(1, 2, 0),
-        ] {
+        for other in [Bdf::new(0, 0, 0), Bdf::new(0, 2, 1), Bdf::new(1, 2, 0)] {
             assert_eq!(gpu_requester(other), Err(Error::Refused));
         }
     }

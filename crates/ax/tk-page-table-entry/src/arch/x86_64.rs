@@ -197,6 +197,18 @@ impl GenericPTE for X64PTE {
         PTF::from_bits_truncate(self.0).contains(PTF::HUGE_PAGE)
     }
 
+    fn is_accessed(&self) -> bool {
+        PTF::from_bits_truncate(self.0).contains(PTF::ACCESSED)
+    }
+
+    fn clear_accessed(&mut self) {
+        self.0 &= !PTF::ACCESSED.bits();
+    }
+
+    fn set_accessed(&mut self) {
+        self.0 |= PTF::ACCESSED.bits();
+    }
+
     fn clear(&mut self) {
         self.0 = 0
     }

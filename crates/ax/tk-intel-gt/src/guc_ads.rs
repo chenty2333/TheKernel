@@ -1179,7 +1179,6 @@ pub fn engine_usage_record_offset(guc_class: u8, logical_index: u8) -> Result<us
 /// Initialize the policy fields through the configured tagged ADS mapping,
 /// preserving the `IOSYS_MAP` I/O-memory arm and returning the policy GGTT
 /// address published in the fixed ADS header.
-#[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub unsafe fn runtime_policy_init(
     map: *mut crate::linux::iosys_map::IosysMap,

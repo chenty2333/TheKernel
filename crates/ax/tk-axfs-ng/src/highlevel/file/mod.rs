@@ -93,6 +93,7 @@ mod handle_positioned;
 mod handle_setup;
 mod invalidation;
 mod open;
+mod periodic_writeback;
 mod owned_io;
 mod page_cache;
 mod physical_effect;
@@ -104,7 +105,7 @@ mod shared;
 pub(crate) use self::dirty_writeback::*;
 pub use self::{
     cached_file::*, handle::*, invalidation::*, open::*, owned_io::*, page_cache::*,
-    physical_effect::*, pinned::*, reclaim::*, registry::*, shared::*,
+    physical_effect::*, periodic_writeback::*, pinned::*, reclaim::*, registry::*, shared::*,
 };
 
 #[cfg(test)]

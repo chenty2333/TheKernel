@@ -14,7 +14,6 @@ repository.workspace = true
 workspace = true
 
 [features]
-intel-upstream-gt = ["intel_gt/upstream-gt"]
 intel-hda = ["axfeat/driver-intel-hda"]
 nvme = ["axfeat/driver-nvme"]
 ahci = ["axfeat/driver-ahci", "axdriver/ahci-pci"]
@@ -46,7 +45,6 @@ io-submit-batch = []
 io-notify-fastpath = []
 
 [dependencies]
-intel_display = { package = "tk-intel-display", path = "../crates/ax/tk-intel-display" }
 intel_gt = { package = "tk-intel-gt", path = "../crates/ax/tk-intel-gt" }
 axfeat = { workspace = true, features = [
     "fp-simd",
@@ -82,6 +80,7 @@ axhal = { workspace = true, features = ["fp-simd", "pkeys"] }
 axinput = { workspace = true, optional = true }
 axlog.workspace = true
 ratelimit.workspace = true
+mmu_notifier.workspace = true
 axmm.workspace = true
 axnet.workspace = true
 axruntime = { workspace = true, features = ["irq-exit", "platform-services"] }

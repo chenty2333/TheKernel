@@ -1,5 +1,13 @@
 # Native Intel atomic-modeset projection
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 `kernel/src/drm/intel/atomic_modeset_wiring.rs` builds a narrow translated
 `AtomicState` projection from the current Native mode-change request and invokes
 only pure source checks whose inputs are fully modeled: digital-port conflict,

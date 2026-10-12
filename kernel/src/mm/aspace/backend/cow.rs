@@ -182,6 +182,16 @@ impl FrameTableRefCount {
 // from an interrupt and does not require a process-wide Once side lock.
 static FRAME_TABLE: SpinNoIrq<Option<FrameTableRefCount>> = SpinNoIrq::new(None);
 
+/// Number of CoW owners of one ordinary frame, for procfs PSS accounting.
+/// Frames never shared by fork have no table entry and report one owner.
+pub(crate) fn cow_frame_owner_count(paddr: PhysAddr, size: PageSize) -> usize {
+    let registry_guard = FRAME_TABLE.lock();
+    registry_guard
+        .as_ref()
+        .and_then(|registry| registry.table.get(&(paddr.as_usize(), size as usize)))
+        .map_or(1, |frame| frame.lock().references as usize)
+}
+
 /// One original huge allocation which may simultaneously have unsplit huge
 /// PTEs (fork siblings) and demoted P1 children.  Both domains retain the
 /// same allocation; the final releaser returns it with its original size.
@@ -1311,6 +1321,7 @@ impl CowBackend {
         page_size: PageSize,
         flags: MappingFlags,
         pt: &mut PageTableCursor,
+        aspace_id: tk_linux_mm::AddressSpaceId,
     ) -> AxResult {
         let exclusive = {
             let mut registry_guard = FRAME_TABLE.lock();
@@ -1339,6 +1350,16 @@ impl CowBackend {
                 page_size as _,
             );
         }
+        // Linux wp_page_copy(): the PTE moves from the shared frame to the copy
+        // under an MMU_NOTIFY_CLEAR range. A device pin of the old frame (for
+        // example an i915 userptr) is told to re-fault before the swap, and the
+        // invalidation stays open until the flush and frame retirement finish.
+        let _invalidation = mmu_notifier::invalidate_range_start(
+            aspace_id.get(),
+            vaddr.as_usize(),
+            vaddr.as_usize() + page_size as usize,
+            mmu_notifier::Event::Clear,
+        );
         if let Err(err) = pt.remap(vaddr, new_frame, page_table_flags(flags)) {
             dealloc_frame(new_frame, page_size);
             return Err(err.into());
@@ -1696,6 +1717,7 @@ impl BackendOps for CowBackend {
         flags: MappingFlags,
         access_flags: MappingFlags,
         pt: &mut PageTableCursor,
+        aspace_id: tk_linux_mm::AddressSpaceId,
     ) -> PopulateOutcome {
         PopulateOutcome::immediate((|| {
             let mut pages = 0;
@@ -1713,7 +1735,7 @@ impl BackendOps for CowBackend {
                         if access_flags.contains(MappingFlags::WRITE)
                             && !page_flags.contains(MappingFlags::WRITE)
                         {
-                            self.handle_cow_fault(addr, paddr, page_size, flags, pt)?;
+                            self.handle_cow_fault(addr, paddr, page_size, flags, pt, aspace_id)?;
                             pages += 1;
                         } else if page_flags.contains(access_flags) {
                             pages += 1;

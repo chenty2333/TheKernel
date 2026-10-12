@@ -1,5 +1,13 @@
 # i915 display 12/13 port map
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 Source baseline: Linux `v7.2.3`, `drivers/gpu/drm/i915/display/`. Scope is display versions 12/13 (TGL, RKL, ADL-S/P/N); device-specific tables and behavior must remain gated by the existing `DisplayDevice`/platform data. This is a working map and will be extended as modules are translated.
 
 ## Existing Rust layout and planned source mapping

@@ -1,3 +1,7 @@
+use super::periodic_writeback::{
+    BALANCE_MAX_PAUSES, DirtyLimits, DirtyWritebackTunables, balance_dirty_pages_with,
+    run_periodic_dirty_writeback_at, write_back_oldest_first,
+};
 use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
@@ -3974,4 +3978,194 @@ fn final_shared_release_preserves_writeback_anchor() {
     }
     let retired = file_cache_registry().lock().remove(&key);
     drop(retired);
+}
+
+#[test]
+fn dirty_writeback_tunables_follow_linux_sysctl_rules() {
+    let tunables = DirtyWritebackTunables::new();
+    assert_eq!(tunables.writeback_centisecs(), 500);
+    assert_eq!(tunables.expire_centisecs(), 3000);
+    assert_eq!(
+        tunables.limits(1000),
+        DirtyLimits {
+            background: 100,
+            dirty: 200,
+        }
+    );
+
+    // A byte limit zeroes its ratio, and a ratio zeroes its byte limit.
+    tunables.set_dirty_bytes(8 * PAGE_SIZE as u64).unwrap();
+    assert_eq!(tunables.dirty_ratio(), 0);
+    assert_eq!(tunables.limits(1000).dirty, 8);
+    tunables.set_dirty_ratio(20).unwrap();
+    assert_eq!(tunables.dirty_bytes(), 0);
+
+    // Linux rejects ratios above 100 and dirty_bytes below two pages.
+    assert_eq!(tunables.set_dirty_ratio(101), Err(VfsError::InvalidInput));
+    assert_eq!(
+        tunables.set_dirty_bytes(PAGE_SIZE as u64),
+        Err(VfsError::InvalidInput)
+    );
+    assert_eq!(tunables.dirty_ratio(), 20);
+
+    // Background is clamped to half of dirty when it would reach it.
+    tunables.set_background_ratio(50).unwrap();
+    assert_eq!(tunables.background_bytes(), 0);
+    assert_eq!(
+        tunables.limits(1000),
+        DirtyLimits {
+            background: 100,
+            dirty: 200,
+        }
+    );
+    tunables.set_background_bytes(PAGE_SIZE as u64 * 300).unwrap();
+    assert_eq!(tunables.background_ratio(), 0);
+    assert_eq!(tunables.limits(1000).background, 100);
+}
+
+#[test]
+fn periodic_writeback_flushes_dirty_file_only_after_dirty_expire() {
+    init_test_page_allocator();
+    let (cached, _location, state) = cached_append_test_file(PAGE_SIZE as u64);
+    state.full_page_io.store(true, Ordering::Release);
+    cached.write_at_slice(&[0x5a; 100], 10).unwrap();
+    assert_eq!(cached.cachestat(0, 1).nr_dirty, 1);
+    let dirtied = cached
+        .shared
+        .dirtied_at_ms()
+        .expect("a dirtying write stamps the dirty episode");
+
+    let tunables = DirtyWritebackTunables::new();
+    let expire_ms = u64::from(tunables.expire_centisecs()) * 10;
+    let dirtyable = 1 << 20;
+    run_periodic_dirty_writeback_at(dirtied + expire_ms - 1, &tunables, dirtyable, 1);
+    assert_eq!(state.write_calls.load(Ordering::Acquire), 0);
+    assert_eq!(cached.cachestat(0, 1).nr_dirty, 1);
+
+    run_periodic_dirty_writeback_at(dirtied + expire_ms, &tunables, dirtyable, 1);
+    assert_eq!(state.write_calls.load(Ordering::Acquire), 1);
+    assert_eq!(cached.cachestat(0, 1).nr_dirty, 0);
+    assert!(cached.shared.dirtied_at_ms().is_none());
+}
+
+#[test]
+fn periodic_writeback_disabled_interval_skips_expired_flush_but_not_background() {
+    init_test_page_allocator();
+    let (cached, _location, state) = cached_append_test_file(PAGE_SIZE as u64);
+    state.full_page_io.store(true, Ordering::Release);
+    cached.write_at_slice(&[0x6b; 100], 10).unwrap();
+    let dirtied = cached.shared.dirtied_at_ms().unwrap();
+    let tunables = DirtyWritebackTunables::new();
+    tunables.set_writeback_centisecs(0);
+
+    run_periodic_dirty_writeback_at(dirtied + 1_000_000, &tunables, 1 << 20, 1);
+    assert_eq!(state.write_calls.load(Ordering::Acquire), 0);
+    assert_eq!(cached.cachestat(0, 1).nr_dirty, 1);
+    cached.sync(true).unwrap();
+}
+
+#[test]
+fn balance_dirty_pages_writes_oldest_file_down_to_background_limit() {
+    init_test_page_allocator();
+    let (older, _older_location, older_state) = cached_append_test_file(2 * PAGE_SIZE as u64);
+    let (newer, _newer_location, newer_state) = cached_append_test_file(2 * PAGE_SIZE as u64);
+    older_state.full_page_io.store(true, Ordering::Release);
+    newer_state.full_page_io.store(true, Ordering::Release);
+    // Drain dirty state left by earlier tests so the budget is ours alone.
+    write_back_oldest_first(usize::MAX);
+
+    older.write_at_slice(&[1; 2 * PAGE_SIZE - 2], 1).unwrap();
+    newer.write_at_slice(&[2; 2 * PAGE_SIZE - 2], 1).unwrap();
+    assert_eq!(older.cachestat(0, 2).nr_dirty, 2);
+    assert_eq!(newer.cachestat(0, 2).nr_dirty, 2);
+    older.shared.dirtied_when.store(100, Ordering::Release);
+    newer.shared.dirtied_when.store(200, Ordering::Release);
+
+    let tunables = DirtyWritebackTunables::new();
+    tunables.set_dirty_bytes(3 * PAGE_SIZE as u64).unwrap();
+    tunables.set_background_bytes(2 * PAGE_SIZE as u64).unwrap();
+    let total_dirty = || older.cachestat(0, 2).nr_dirty + newer.cachestat(0, 2).nr_dirty;
+    balance_dirty_pages_with(&tunables, 1 << 20, &total_dirty, &|| {
+        panic!("a writer must not pause while the oldest file can be written")
+    });
+
+    // Dirty total 4 is over the limit of 3, so the older file is written
+    // down to the background limit of 2 and the newer file keeps its pages.
+    assert_eq!(older.cachestat(0, 2).nr_dirty, 0);
+    assert_eq!(newer.cachestat(0, 2).nr_dirty, 2);
+    assert_eq!(total_dirty(), 2);
+    write_back_oldest_first(usize::MAX);
+}
+
+#[test]
+fn balance_dirty_pages_pauses_are_bounded_when_nothing_can_be_written() {
+    init_test_page_allocator();
+    write_back_oldest_first(usize::MAX);
+    let tunables = DirtyWritebackTunables::new();
+    tunables.set_dirty_bytes(2 * PAGE_SIZE as u64).unwrap();
+    let pauses = AtomicUsize::new(0);
+    balance_dirty_pages_with(&tunables, 1 << 20, &|| 10, &|| {
+        pauses.fetch_add(1, Ordering::AcqRel);
+    });
+    assert_eq!(pauses.load(Ordering::Acquire), BALANCE_MAX_PAUSES);
+}
+
+#[test]
+fn background_writeback_error_is_published_to_errseq_and_keeps_pages_dirty() {
+    init_test_page_allocator();
+    let (cached, location, state) = cached_append_test_file(PAGE_SIZE as u64);
+    state.full_page_io.store(true, Ordering::Release);
+    state.fail_write_call.store(0, Ordering::Release);
+    cached.write_at_slice(&[0x7c; 100], 10).unwrap();
+    let errors = location.writeback_error_state().unwrap();
+    let mut cursor = errors.sample();
+    let dirtied = cached.shared.dirtied_at_ms().unwrap();
+    let tunables = DirtyWritebackTunables::new();
+    let expire_ms = u64::from(tunables.expire_centisecs()) * 10;
+
+    run_periodic_dirty_writeback_at(dirtied + expire_ms, &tunables, 1 << 20, 1);
+
+    // The writer that dirtied the page has already returned, so the failure
+    // reaches a later fsync through the errseq cursor and the page stays dirty
+    // for retry.
+    assert_eq!(
+        errors.check_and_advance(&mut cursor),
+        Some(VfsError::InvalidInput)
+    );
+    assert_eq!(cached.cachestat(0, 1).nr_dirty, 1);
+    cached.shared.dirtied_when.store(0, Ordering::Release);
+}
+
+#[test]
+fn page_cache_dirty_and_writeback_counters_follow_page_state() {
+    use super::page_cache::{dirty_file_page_cache_pages, writeback_page_cache_pages};
+    init_test_page_allocator();
+    let dirty_before = dirty_file_page_cache_pages();
+    let writeback_before = writeback_page_cache_pages();
+
+    let mut page = PageCache::new(false).unwrap();
+    page.mark_dirty();
+    assert_eq!(dirty_file_page_cache_pages(), dirty_before + 1);
+    // Re-dirtying an already dirty page must not double count it.
+    page.mark_dirty();
+    assert_eq!(dirty_file_page_cache_pages(), dirty_before + 1);
+
+    page.begin_writeback().unwrap();
+    assert_eq!(writeback_page_cache_pages(), writeback_before + 1);
+    page.clear_dirty();
+    assert_eq!(dirty_file_page_cache_pages(), dirty_before);
+    page.end_writeback();
+    assert_eq!(writeback_page_cache_pages(), writeback_before);
+
+    // Dropping a still-dirty page releases its contribution.
+    page.mark_dirty();
+    assert_eq!(dirty_file_page_cache_pages(), dirty_before + 1);
+    drop(page);
+    assert_eq!(dirty_file_page_cache_pages(), dirty_before);
+
+    // tmpfs pages are never counted as file dirty, as in Linux NR_FILE_DIRTY.
+    let mut shmem = PageCache::new(true).unwrap();
+    shmem.mark_dirty();
+    assert_eq!(dirty_file_page_cache_pages(), dirty_before);
+    drop(shmem);
 }

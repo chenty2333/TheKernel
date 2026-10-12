@@ -112,13 +112,20 @@ impl AddrSpace {
             let range = VirtAddrRange::new(start, area_end.min(end));
             let area_flags = area.flags();
             let resident_before = self.pt.mapped_bytes(range.start, range.size());
-            let outcome =
-                area.backend()
-                    .populate(range, area_flags, access_flags, &mut self.pt.cursor());
+            let outcome = area.backend().populate(
+                range,
+                area_flags,
+                access_flags,
+                &mut self.pt.cursor(),
+                self.address_space_id,
+            );
             let result = outcome.finish(self);
             // A backend may have published a valid executable prefix before a
             // later page fails, so synchronize before propagating the error.
             synchronize_executable_publication(area_flags);
+            // Linux `lru_add`: anonymous leaves published by this population
+            // join the inactive list.
+            self.lru_track_anonymous_pages(range.start, range.size());
             // Usercopy also visits already-resident pages. Avoid walking every
             // VMA and PTE in the mm when this range did not gain resident pages.
             // Check before propagating errors: a populated prefix still counts
@@ -193,10 +200,32 @@ impl AddrSpace {
         }
     }
 
+    /// Opens the MMU-notifier invalidation that brackets a PTE change of
+    /// `[start, start + size)`, as Linux `mmu_notifier_invalidate_range_start()`
+    /// does before the change. Keep the returned scope alive until the change
+    /// is complete: dropping it ends the invalidation.
+    pub(crate) fn mmu_notifier_scope(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        event: mmu_notifier::Event,
+    ) -> mmu_notifier::InvalidationScope {
+        let start = start.as_usize();
+        mmu_notifier::invalidate_range_start(
+            self.address_space_id.get(),
+            start,
+            start.saturating_add(size),
+            event,
+        )
+    }
+
     pub fn discard_pages(&mut self, mut start: VirtAddr, size: usize) -> AxResult {
         self.validate_region(start, size)?;
         self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Discard)?;
         self.ensure_4k_granularity(start, size)?;
+        // MADV_DONTNEED / MADV_FREE zap: Linux zap_page_range_single() brackets
+        // the PTE clearing with MMU_NOTIFY_CLEAR.
+        let _mmu_scope = self.mmu_notifier_scope(start, size, mmu_notifier::Event::Clear);
         self.publish_resident_highwater();
         let next_generation = self.next_topology_generation()?;
         // Backend discard can make partial progress before reporting a later
@@ -551,6 +580,8 @@ impl AddrSpace {
         }
         self.check_no_seal_overlap(start, size)?;
         self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Unmap)?;
+        // Linux updates mm->hiwater_rss/hiwater_vm before any unmap lowers them.
+        self.publish_resident_highwater();
         // Clearing a middle slice of one DONTDUMP interval creates one extra
         // suffix record. Reserve it before any uprobe/PTE/VMA mutation.
         self.dontdump_ranges
@@ -590,6 +621,9 @@ impl AddrSpace {
             }
         };
 
+        // munmap teardown: Linux unmap_vmas() raises MMU_NOTIFY_UNMAP before
+        // any PTE is cleared, and the scope lasts through the teardown.
+        let _mmu_scope = self.mmu_notifier_scope(start, size, mmu_notifier::Event::Unmap);
         if let Err(error) = self.unmap_areas_with_tlb_grace(start, size) {
             if let Some(plan) = uffd_plan {
                 self.uffd

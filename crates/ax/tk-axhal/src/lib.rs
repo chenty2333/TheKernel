@@ -217,8 +217,9 @@ pub mod boot {
         None
     }
 
-    /// CPU WC/UC mmap types are admitted only after every startup CPU confirms
-    /// the explicitly opted-in Intel palette; hosted models have no such proof.
+    /// PAT-backed WC/UC mapping types are admitted only after every startup CPU
+    /// has read back the Linux full-PAT palette (`pat_bp_init`); hosted models
+    /// have no such proof, so they report false and WC requests are refused.
     pub fn intel_cpu_mmap_ready() -> bool {
         #[cfg(all(target_os = "none", feature = "defplat"))]
         { axplat_x86_pc::intel_cpu_mmap_ready() }

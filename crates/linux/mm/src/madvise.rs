@@ -196,7 +196,7 @@ impl Advice {
     /// ```
     ///
     /// so it is `-EINVAL`, never a silent success.  The reference oracle runs
-    /// with `CONFIG_KSM=n`, `CONFIG_TRANSPARENT_HUGEPAGE=n` and
+    /// with `CONFIG_KSM=n` and
     /// `CONFIG_MEMORY_FAILURE=n`, so the compiled-out set is exactly:
     ///
     /// ```c
@@ -215,6 +215,11 @@ impl Advice {
     /// #endif
     /// ```
     ///
+    /// This kernel runs the THP engine (`crate::mm::thp`, the per-VMA
+    /// `MadviseThp` policy and the sysfs knobs), so `MADV_HUGEPAGE`,
+    /// `MADV_NOHUGEPAGE` and `MADV_COLLAPSE` are implemented rather than refused.
+    /// KSM and memory-failure remain compiled out.
+    ///
     /// The stubs those configurations leave behind are unreachable from
     /// `madvise(2)`: `mm/ksm.h`'s `!CONFIG_KSM` `ksm_madvise()` and
     /// `mm/madvise.c`'s `!CONFIG_MEMORY_FAILURE` `madvise_inject_error()` both
@@ -227,13 +232,9 @@ impl Advice {
     /// destroys.
     pub const fn availability(self) -> AdviceAvailability {
         match self {
-            Self::Mergeable
-            | Self::Unmergeable
-            | Self::HugePage
-            | Self::NoHugePage
-            | Self::Collapse
-            | Self::HwPoison
-            | Self::SoftOffline => AdviceAvailability::Unavailable,
+            Self::Mergeable | Self::Unmergeable | Self::HwPoison | Self::SoftOffline => {
+                AdviceAvailability::Unavailable
+            }
             _ => AdviceAvailability::Impl,
         }
     }

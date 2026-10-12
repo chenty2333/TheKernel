@@ -75,6 +75,7 @@ impl AddrSpace {
             .any(|(area, _, _, flags)| adds_execute_permission(area.flags(), flags));
 
         Ok(PreparedProtect {
+            address_space_id: address_space_id.get(),
             transaction,
             growdown_starts,
             topology_generation,
@@ -467,6 +468,10 @@ impl AddrSpace {
         {
             return Ok(AnonymousReclaim::NotEligible);
         }
+        // Reclaim clears the PTE of a resident page: Linux try_to_unmap_one()
+        // raises MMU_NOTIFY_CLEAR before it does so, so a device still holding
+        // this frame through a notifier is told to drop it.
+        let _mmu_scope = self.mmu_notifier_scope(page, PAGE_SIZE_4K, mmu_notifier::Event::Clear);
         let (_, leaf_flags, leaf_size) = self.pt.cursor().unmap(page).map_err(AxError::from)?;
         if leaf_size != PageSize::Size4K {
             return Err(AxError::BadState);
@@ -769,6 +774,7 @@ impl AddrSpace {
                     match restored {
                         Ok(()) => {
                             self.swapped.remove(&page);
+                            self.lru_track_anonymous_pages(page, PAGE_SIZE_4K);
                             self.publish_resident_highwater();
                             return PageFaultResult::Handled;
                         }
@@ -831,16 +837,32 @@ impl AddrSpace {
                     // violate both boundaries, so fail closed.
                     return PageFaultResult::Failed(PageFaultFailure::InternalInconsistency);
                 }
-                let populate_outcome = backend.populate(
-                    VirtAddrRange::from_start_size(start, len),
-                    flags,
-                    populate_access,
-                    &mut self.pt.cursor(),
-                );
-                let populate_result = populate_outcome.finish(self);
+                let mut direct_reclaimed = false;
+                let populate_result = loop {
+                    let populate_outcome = backend.populate(
+                        VirtAddrRange::from_start_size(start, len),
+                        flags,
+                        populate_access,
+                        &mut self.pt.cursor(),
+                        self.address_space_id,
+                    );
+                    let result = populate_outcome.finish(self);
+                    // Linux `__alloc_pages_slowpath()` direct reclaim: a
+                    // failed anonymous population reclaims once and retries.
+                    if !direct_reclaimed
+                        && matches!(&result, Err(error) if error.canonicalize() == AxError::NoMemory)
+                    {
+                        direct_reclaimed = true;
+                        if crate::mm::reclaim::direct_reclaim_anonymous() != 0 {
+                            continue;
+                        }
+                    }
+                    break result;
+                };
                 // Synchronize even on error: a multi-page populate may have
                 // installed a valid executable prefix before the failure.
                 synchronize_executable_publication(flags);
+                self.lru_track_anonymous_pages(start, len);
                 self.publish_resident_highwater();
                 match populate_result {
                     Ok(n) => {
@@ -887,5 +909,89 @@ impl AddrSpace {
             thread.account_resolved_page_fault(read_before);
         }
         handled
+    }
+}
+
+impl AddrSpace {
+    /// Returns the frame of a present 4 KiB leaf at `page` when the reclaimer
+    /// may swap it out: the backend is anonymous and the frame has a single
+    /// owner. This is the forward check of the reverse-map record kept in
+    /// `reclaim`, the local equivalent of Linux `folio_mapcount() == 1`.
+    fn reclaimable_anonymous_frame(&self, page: VirtAddr) -> Option<PhysAddr> {
+        let area = self.areas.find(page)?;
+        let backend = area.backend();
+        if backend.page_size() != PageSize::Size4K {
+            return None;
+        }
+        let Ok((paddr, _, PageSize::Size4K)) = self.pt.query(page) else {
+            return None;
+        };
+        backend.swap_reclaimable(paddr).then_some(paddr)
+    }
+
+    /// Linux `lru_add()` for the anonymous leaves in `[start, start + size)`:
+    /// records each reclaimable leaf's (frame, owner, vaddr) on the anonymous
+    /// inactive list. Re-adding an already tracked leaf is a no-op.
+    pub(crate) fn lru_track_anonymous_pages(&self, start: VirtAddr, size: usize) {
+        let end = start + size;
+        let mut page = start.align_down(PAGE_SIZE_4K);
+        while page < end {
+            if let Some(paddr) = self.reclaimable_anonymous_frame(page) {
+                crate::mm::reclaim::lru_add_anonymous(paddr, self.address_space_id.get(), page);
+            }
+            page += PAGE_SIZE_4K;
+        }
+    }
+
+    /// Reverse-map validation: whether the leaf at `page` is still the
+    /// reclaimable anonymous mapping of `paddr`. Linux `rmap_walk` re-checks
+    /// the PTE it found the same way.
+    pub(crate) fn anonymous_frame_is(&self, page: VirtAddr, paddr: PhysAddr) -> bool {
+        self.reclaimable_anonymous_frame(page) == Some(paddr)
+    }
+
+    /// Linux `ptep_test_and_clear_young()`: returns whether the leaf at `page`
+    /// was referenced since the previous test. A cleared bit is flushed so the
+    /// next access sets it again.
+    pub(crate) fn test_and_clear_young(&mut self, page: VirtAddr) -> AxResult<bool> {
+        let young = {
+            let mut cursor = self.pt.cursor();
+            cursor.test_and_clear_young(page)
+        }
+        .map_err(AxError::from)?;
+        if young {
+            drop(self.synchronize_tlb_after_mutation());
+        }
+        Ok(young)
+    }
+
+    /// Swaps out the anonymous leaf at `page` through the pageout path shared
+    /// with `MADV_PAGEOUT`, reporting the outcome to the reclaimer.
+    pub(crate) fn reclaim_resident_anonymous_page(
+        &mut self,
+        page: VirtAddr,
+    ) -> AxResult<crate::mm::reclaim::VictimReclaim> {
+        use crate::mm::reclaim::VictimReclaim;
+        Ok(match self.reclaim_anonymous_page_at(page)? {
+            AnonymousReclaim::Reclaimed | AnonymousReclaim::Dropped => VictimReclaim::Reclaimed,
+            AnonymousReclaim::NoSwapArea => VictimReclaim::NoSwapArea,
+            AnonymousReclaim::NotEligible => VictimReclaim::NotEligible,
+        })
+    }
+
+    /// Models the CPU's accessed-bit update for a use of `page` in tests.
+    #[cfg(test)]
+    pub(crate) fn set_accessed_for_test(&mut self, page: VirtAddr) {
+        self.pt.cursor().set_accessed(page).unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pt_query_for_test(&self, page: VirtAddr) -> PhysAddr {
+        self.pt.query(page).unwrap().0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_swapped_for_test(&self, page: VirtAddr) -> bool {
+        self.swapped.contains_key(&page)
     }
 }

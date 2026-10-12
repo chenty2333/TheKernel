@@ -1,6 +1,6 @@
 //! Typed DRM ioctl decoding.  Devfs only adapts [`IoctlContext`] to [`UserCopy`].
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::{
     mem::{MaybeUninit, size_of},
     slice,
@@ -156,7 +156,6 @@ pub(super) fn dispatch(
         uapi::DRM_IOCTL_DROP_MASTER => file.drop_master().map_err(AxError::from)?,
         uapi::DRM_IOCTL_GEM_CLOSE => {
             let request: uapi::DrmGemClose = read_pod(copy, arg)?;
-            #[cfg(feature = "intel-upstream-gt")]
             if file.has_intel_gt()
                 && file
                     .close_upstream_gem_handle(request.handle)
@@ -167,8 +166,6 @@ pub(super) fn dispatch(
             } else {
                 file.close_handle(request.handle).map_err(AxError::from)?;
             }
-            #[cfg(not(feature = "intel-upstream-gt"))]
-            file.close_handle(request.handle).map_err(AxError::from)?;
         }
         uapi::DRM_IOCTL_MODE_DESTROY_DUMB => destroy_dumb(file, copy, arg)?,
         uapi::DRM_IOCTL_GET_CAP => {
@@ -189,6 +186,7 @@ pub(super) fn dispatch(
         uapi::DRM_IOCTL_SYNCOBJ_QUERY => syncobj_query(file, copy, arg)?,
         uapi::DRM_IOCTL_SYNCOBJ_TRANSFER => syncobj_transfer(file, copy, arg)?,
         uapi::DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL => syncobj_timeline_signal(file, copy, arg)?,
+        uapi::DRM_IOCTL_SYNCOBJ_EVENTFD => syncobj_eventfd(file, context, arg)?,
         uapi::DRM_IOCTL_SET_CLIENT_CAP => {
             let request: uapi::DrmSetClientCap = read_pod(copy, arg)?;
             match request.capability {
@@ -307,14 +305,8 @@ pub(super) fn dispatch(
         // commands must work here as well as on the dedicated render node.
         _ => {
             return if file.has_intel_gt() {
-                #[cfg(feature = "intel-upstream-gt")]
-                {
-                    Err(AxError::OperationNotSupported)
-                }
-                #[cfg(not(feature = "intel-upstream-gt"))]
-                {
-                    super::intel::gem_exec::dispatch_native(file, context, cmd, arg)
-                }
+                // i915 owns every Intel ioctl; one it does not implement is refused.
+                Err(AxError::OperationNotSupported)
             } else {
                 super::render::dispatch(file, context, cmd, arg)
             };
@@ -336,14 +328,7 @@ pub(super) fn render_dispatch(
     if render_allows_core_ioctl(cmd as u64) {
         dispatch(file, context, cmd, arg)
     } else if file.has_intel_gt() {
-        #[cfg(feature = "intel-upstream-gt")]
-        {
-            Err(AxError::OperationNotSupported)
-        }
-        #[cfg(not(feature = "intel-upstream-gt"))]
-        {
-            super::intel::gem_exec::dispatch_native(file, context, cmd, arg)
-        }
+        Err(AxError::OperationNotSupported)
     } else {
         super::render::dispatch(file, context, cmd, arg)
     }
@@ -525,19 +510,12 @@ fn prime_fd_to_handle(
         return Err(AxError::InvalidInput);
     }
     let object = dmabuf::import(context, request.fd)?;
-    #[cfg(feature = "intel-upstream-gt")]
-    {
-        request.handle = if file.has_intel_gt() {
-            file.bind_imported_upstream_handle(object)
-                .map_err(AxError::from)?
-        } else {
-            file.import_gem(object).map_err(AxError::from)?
-        };
-    }
-    #[cfg(not(feature = "intel-upstream-gt"))]
-    {
-        request.handle = file.import_gem(object).map_err(AxError::from)?;
-    }
+    request.handle = if file.has_intel_gt() {
+        file.bind_imported_upstream_handle(object)
+            .map_err(AxError::from)?
+    } else {
+        file.import_gem(object).map_err(AxError::from)?
+    };
     write_pod(copy, arg, &request)
 }
 
@@ -548,26 +526,24 @@ fn syncobj_create(file: &DrmFile, context: &crate::file::IoctlContext, arg: usiz
     write_pod(context, arg, &request)
 }
 
+/// `drm_syncobj_destroy_ioctl()`: a handle that is not open reports EINVAL.
 fn syncobj_destroy(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let request: uapi::DrmSyncobjDestroy = read_pod(copy, arg)?;
     if request.pad != 0 {
         return Err(AxError::InvalidInput);
     }
-    let handle = request.validate().map_err(|_| AxError::InvalidInput)?;
-    file.destroy_syncobj(handle).map_err(AxError::from)
+    file.destroy_syncobj(request.handle)
+        .map_err(|_| AxError::InvalidInput)
 }
 
-fn syncobj_array(file: &DrmFile, copy: &impl UserCopy, arg: usize, signal: bool) -> AxResult<()> {
-    let request: uapi::DrmSyncobjArray = read_pod(copy, arg)?;
-    if request.pad != 0 || request.count_handles == 0 {
-        return Err(AxError::InvalidInput);
-    }
-    let handles = read_array::<u32>(
-        copy,
-        request.handles,
-        request.count_handles as usize,
-        MAX_SYNCOBJ_HANDLES,
-    )?;
+/// `drm_syncobj_array_find()`: resolve every handle, failing with ENOENT.
+fn syncobj_array_find(
+    file: &DrmFile,
+    copy: &impl UserCopy,
+    handles: u64,
+    count: u32,
+) -> AxResult<Vec<Arc<syncobj::Syncobj>>> {
+    let handles = read_array::<u32>(copy, handles, count as usize, MAX_SYNCOBJ_HANDLES)?;
     let mut objects = Vec::new();
     objects
         .try_reserve_exact(handles.len())
@@ -575,6 +551,30 @@ fn syncobj_array(file: &DrmFile, copy: &impl UserCopy, arg: usize, signal: bool)
     for handle in handles {
         objects.push(file.syncobj(handle).map_err(AxError::from)?);
     }
+    Ok(objects)
+}
+
+/// Timeline point array; a null pointer means every point is zero, as in
+/// `drm_syncobj_array_wait_timeout()`.
+fn syncobj_points(copy: &impl UserCopy, points: u64, count: u32) -> AxResult<Vec<u64>> {
+    if points == 0 {
+        let mut zeros = Vec::new();
+        zeros
+            .try_reserve_exact(count as usize)
+            .map_err(|_| AxError::NoMemory)?;
+        zeros.resize(count as usize, 0);
+        return Ok(zeros);
+    }
+    read_array::<u64>(copy, points, count as usize, MAX_SYNCOBJ_HANDLES)
+}
+
+/// `drm_syncobj_reset_ioctl()` and `drm_syncobj_signal_ioctl()`.
+fn syncobj_array(file: &DrmFile, copy: &impl UserCopy, arg: usize, signal: bool) -> AxResult<()> {
+    let request: uapi::DrmSyncobjArray = read_pod(copy, arg)?;
+    if request.pad != 0 || request.count_handles == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let objects = syncobj_array_find(file, copy, request.handles, request.count_handles)?;
     for object in objects {
         if signal {
             object.signal();
@@ -585,137 +585,127 @@ fn syncobj_array(file: &DrmFile, copy: &impl UserCopy, arg: usize, signal: bool)
     Ok(())
 }
 
+/// The absolute `WAIT_DEADLINE` hint, if requested.
+fn syncobj_wait_deadline(flags: u32, deadline_nsec: u64) -> Option<axhal::time::TimeValue> {
+    (flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE != 0)
+        .then(|| core::time::Duration::from_nanos(deadline_nsec))
+}
+
+/// `drm_syncobj_wait_ioctl()`: a zero-handle wait succeeds immediately.
 fn syncobj_wait(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let mut request: uapi::DrmSyncobjWait = read_pod(copy, arg)?;
     let allowed = uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
         | uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
         | uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE;
-    if request.count_handles == 0 || request.flags & !allowed != 0 || request.pad != 0 {
+    if request.flags & !allowed != 0 {
         return Err(AxError::InvalidInput);
     }
-    let deadline_hint = syncobj_deadline_hint(request.flags, request.deadline_nsec)?;
-    let handles = read_array::<u32>(
-        copy,
-        request.handles,
-        request.count_handles as usize,
-        MAX_SYNCOBJ_HANDLES,
-    )?;
-    let mut objects = Vec::new();
-    objects
-        .try_reserve_exact(handles.len())
-        .map_err(|_| AxError::NoMemory)?;
-    for handle in handles {
-        objects.push((file.syncobj(handle).map_err(AxError::from)?, 0));
+    if request.count_handles == 0 {
+        return Ok(());
     }
-    request.first_signaled = syncobj::timeline_wait(
+    let objects = syncobj_array_find(file, copy, request.handles, request.count_handles)?;
+    let points = vec![0u64; objects.len()];
+    request.first_signaled = syncobj::array_wait(
         &objects,
-        request.flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0,
-        request.flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0,
-        false,
+        &points,
+        request.flags,
         request.timeout_nsec,
-        deadline_hint,
-    )? as u32;
+        syncobj_wait_deadline(request.flags, request.deadline_nsec),
+    )?;
     write_pod(copy, arg, &request)
 }
 
-// Both fd conversions share the same flag bits. Without SYNC_FILE the fd
-// carries the syncobj itself, so a nonzero point is invalid. Binary sync_file
-// conversions ignore point unless TIMELINE is explicitly selected, as Linux does.
-fn syncobj_fd_point(request: &uapi::DrmSyncobjHandle) -> AxResult<Option<u64>> {
-    let sync_file = uapi::DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE;
-    let timeline = uapi::DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE;
-    if request.pad != 0 || request.flags & !(sync_file | timeline) != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if request.flags & sync_file != 0 {
-        Ok(Some(if request.flags & timeline != 0 {
-            request.point
-        } else {
-            0
-        }))
-    } else if request.point != 0 {
-        Err(AxError::InvalidInput)
-    } else {
-        Ok(None)
-    }
-}
-
+/// `drm_syncobj_handle_to_fd_ioctl()`.
 fn syncobj_handle_to_fd(
     file: &DrmFile,
     context: &crate::file::IoctlContext,
     arg: usize,
 ) -> AxResult<()> {
     let mut request: uapi::DrmSyncobjHandle = read_pod(context, arg)?;
-    let point = syncobj_fd_point(&request)?;
-    let object = file.syncobj(request.handle).map_err(AxError::from)?;
-    request.fd = match point {
-        None => syncobj::export_syncobj(object, context, false)?,
-        Some(point) => syncobj::export(object.fence_at(point)?, context, false)?,
-    };
+    let valid = uapi::DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE
+        | uapi::DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE;
+    if request.pad != 0 || request.flags & !valid != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if request.flags & uapi::DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE != 0 {
+        let point = if request.flags & uapi::DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE != 0 {
+            request.point
+        } else {
+            0
+        };
+        let object = file.syncobj(request.handle).map_err(AxError::from)?;
+        request.fd = syncobj::export_sync_file(&object, point, context)?;
+    } else {
+        if request.point != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        let object = file
+            .syncobj(request.handle)
+            .map_err(|_| AxError::InvalidInput)?;
+        request.fd = syncobj::export_syncobj(object, context)?;
+    }
     write_pod(context, arg, &request)
 }
 
+/// `drm_syncobj_fd_to_handle_ioctl()`.
 fn syncobj_fd_to_handle(
     file: &DrmFile,
     context: &crate::file::IoctlContext,
     arg: usize,
 ) -> AxResult<()> {
     let mut request: uapi::DrmSyncobjHandle = read_pod(context, arg)?;
-    match syncobj_fd_point(&request)? {
-        None => {
-            request.handle = file
-                .import_syncobj(syncobj::import_syncobj(context, request.fd)?)
-                .map_err(AxError::from)?;
+    let valid = uapi::DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE
+        | uapi::DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE;
+    if request.pad != 0 || request.flags & !valid != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if request.flags & uapi::DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE != 0 {
+        let point = if request.flags & uapi::DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE != 0 {
+            request.point
+        } else {
+            0
+        };
+        // sync_file_get_fence() failure is EINVAL, before the handle lookup.
+        let fence = syncobj::import(context, request.fd).map_err(|_| AxError::InvalidInput)?;
+        let object = file.syncobj(request.handle).map_err(AxError::from)?;
+        object.submit_point(point, fence)?;
+    } else {
+        if request.point != 0 {
+            return Err(AxError::InvalidInput);
         }
-        Some(point) => {
-            file.syncobj(request.handle)
-                .map_err(AxError::from)?
-                .submit_point(point, syncobj::import(context, request.fd)?)?;
-        }
+        let object = syncobj::import_syncobj(context, request.fd)
+            .map_err(|_| AxError::InvalidInput)?;
+        request.handle = file.import_syncobj(object).map_err(AxError::from)?;
     }
     write_pod(context, arg, &request)
 }
 
+/// `drm_syncobj_timeline_wait_ioctl()`.
 fn syncobj_timeline_wait(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let mut request: uapi::DrmSyncobjTimelineWait = read_pod(copy, arg)?;
     let allowed = uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
         | uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
         | uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE
         | uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE;
-    if request.count_handles == 0 || request.flags & !allowed != 0 || request.pad != 0 {
+    if request.flags & !allowed != 0 {
         return Err(AxError::InvalidInput);
     }
-    let deadline_hint = syncobj_deadline_hint(request.flags, request.deadline_nsec)?;
-    let handles = read_array::<u32>(
-        copy,
-        request.handles,
-        request.count_handles as usize,
-        MAX_SYNCOBJ_HANDLES,
-    )?;
-    let points = read_array::<u64>(
-        copy,
-        request.points,
-        request.count_handles as usize,
-        MAX_SYNCOBJ_HANDLES,
-    )?;
-    let mut objects = Vec::new();
-    objects
-        .try_reserve_exact(handles.len())
-        .map_err(|_| AxError::NoMemory)?;
-    for (handle, point) in handles.into_iter().zip(points) {
-        objects.push((file.syncobj(handle).map_err(AxError::from)?, point));
+    if request.count_handles == 0 {
+        return Ok(());
     }
-    request.first_signaled = syncobj::timeline_wait(
+    let objects = syncobj_array_find(file, copy, request.handles, request.count_handles)?;
+    let points = syncobj_points(copy, request.points, request.count_handles)?;
+    request.first_signaled = syncobj::array_wait(
         &objects,
-        request.flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0,
-        request.flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0,
-        request.flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0,
+        &points,
+        request.flags,
         request.timeout_nsec,
-        deadline_hint,
-    )? as u32;
+        syncobj_wait_deadline(request.flags, request.deadline_nsec),
+    )?;
     write_pod(copy, arg, &request)
 }
 
+/// `drm_syncobj_query_ioctl()`.
 fn syncobj_query(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let request: uapi::DrmSyncobjTimelineArray = read_pod(copy, arg)?;
     if request.count_handles == 0
@@ -723,82 +713,65 @@ fn syncobj_query(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<(
     {
         return Err(AxError::InvalidInput);
     }
-    let handles = read_array::<u32>(
-        copy,
-        request.handles,
-        request.count_handles as usize,
-        MAX_SYNCOBJ_HANDLES,
-    )?;
-    for (index, handle) in handles.into_iter().enumerate() {
-        let point = file
-            .syncobj(handle)
-            .map_err(AxError::from)?
-            .query_point(request.flags & uapi::DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0);
+    let objects = syncobj_array_find(file, copy, request.handles, request.count_handles)?;
+    let last_submitted = request.flags & uapi::DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0;
+    for (index, object) in objects.iter().enumerate() {
         write_u64(
             copy,
             array_at(request.points, index, size_of::<u64>() as u64)?,
-            point,
+            object.query_point(last_submitted),
         )?;
     }
     Ok(())
 }
 
+/// `drm_syncobj_transfer_ioctl()`: the destination is resolved before the
+/// source fence, as in Linux.
 fn syncobj_transfer(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let request: uapi::DrmSyncobjTransfer = read_pod(copy, arg)?;
-    if request.flags & !uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0 || request.pad != 0 {
+    if request.pad != 0 {
         return Err(AxError::InvalidInput);
     }
-    let source = file.syncobj(request.src_handle).map_err(AxError::from)?;
     let destination = file.syncobj(request.dst_handle).map_err(AxError::from)?;
-    let fence = source.wait_fence_for_submit(
+    let source = file.syncobj(request.src_handle).map_err(AxError::from)?;
+    syncobj::transfer(
+        &source,
+        &destination,
         request.src_point,
-        request.flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0,
-        None,
-    )?;
-    destination.submit_point(request.dst_point, fence)
+        request.dst_point,
+        request.flags,
+    )
 }
 
-fn syncobj_deadline_hint(
-    flags: u32,
-    deadline_nsec: u64,
-) -> AxResult<Option<axhal::time::TimeValue>> {
-    if flags & uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE == 0 {
-        if deadline_nsec != 0 {
-            return Err(AxError::InvalidInput);
-        }
-        return Ok(None);
-    }
-    if deadline_nsec == 0 {
+/// `drm_syncobj_eventfd_ioctl()`.
+fn syncobj_eventfd(
+    file: &DrmFile,
+    context: &crate::file::IoctlContext,
+    arg: usize,
+) -> AxResult<()> {
+    let request: uapi::DrmSyncobjEventfd = read_pod(context, arg)?;
+    if request.flags & !uapi::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0 || request.pad != 0 {
         return Err(AxError::InvalidInput);
     }
-    Ok(Some(core::time::Duration::from_nanos(deadline_nsec)))
+    let object = file.syncobj(request.handle).map_err(AxError::from)?;
+    // eventfd_ctx_fdget(): any other kind of descriptor is EINVAL.
+    let eventfd = context
+        .get_file_like(request.fd)?
+        .downcast::<crate::file::event::EventFd>()
+        .map_err(|_| AxError::InvalidInput)?;
+    object.eventfd(request.point, request.flags, eventfd);
+    Ok(())
 }
 
+/// `drm_syncobj_timeline_signal_ioctl()`.
 fn syncobj_timeline_signal(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let request: uapi::DrmSyncobjTimelineArray = read_pod(copy, arg)?;
     if request.count_handles == 0 || request.flags != 0 {
         return Err(AxError::InvalidInput);
     }
-    let handles = read_array::<u32>(
-        copy,
-        request.handles,
-        request.count_handles as usize,
-        MAX_SYNCOBJ_HANDLES,
-    )?;
-    let points = read_array::<u64>(
-        copy,
-        request.points,
-        request.count_handles as usize,
-        MAX_SYNCOBJ_HANDLES,
-    )?;
-    let mut objects = Vec::new();
-    objects
-        .try_reserve_exact(handles.len())
-        .map_err(|_| AxError::NoMemory)?;
-    for (handle, point) in handles.into_iter().zip(points) {
-        objects.push((file.syncobj(handle).map_err(AxError::from)?, point));
-    }
-    for (object, point) in objects {
+    let objects = syncobj_array_find(file, copy, request.handles, request.count_handles)?;
+    let points = syncobj_points(copy, request.points, request.count_handles)?;
+    for (object, point) in objects.iter().zip(points) {
         object.signal_point(point)?;
     }
     Ok(())
@@ -1774,28 +1747,6 @@ mod tests {
         assert_eq!(fd_flags(0x80002), Ok(true));
         assert_eq!(fd_flags(1), Err(AxError::InvalidInput));
         assert_eq!(fd_flags(0x80003), Err(AxError::InvalidInput));
-    }
-
-    #[test]
-    fn syncobj_fd_conversion_validates_flags_and_selects_binary_or_timeline_point() {
-        for (flags, point, expected) in [
-            (0, 0, Ok(None)),
-            (2, 0, Ok(None)),
-            (0, 7, Err(AxError::InvalidInput)),
-            (2, 7, Err(AxError::InvalidInput)),
-            (1, 7, Ok(Some(0))),
-            (3, 7, Ok(Some(7))),
-            (4, 0, Err(AxError::InvalidInput)),
-        ] {
-            let mut request = uapi::DrmSyncobjHandle {
-                flags,
-                point,
-                ..Default::default()
-            };
-            assert_eq!(syncobj_fd_point(&request), expected);
-            request.pad = 1;
-            assert_eq!(syncobj_fd_point(&request), Err(AxError::InvalidInput));
-        }
     }
 
     struct Image(RefCell<alloc::vec::Vec<u8>>);

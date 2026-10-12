@@ -282,21 +282,6 @@ pub fn primary_device() -> Option<Arc<DrmDevice>> {
     PRIMARY_DEVICE.lock().as_ref().map(Arc::clone)
 }
 
-/// Gives up the firmware (simpledrm) primary device so a native GPU can own the
-/// boot aperture. Returns whether a firmware device was released; a native
-/// primary device is never touched.
-#[cfg(feature = "intel-upstream-gt")]
-pub(crate) fn release_firmware_primary() -> bool {
-    let mut primary = PRIMARY_DEVICE.lock();
-    let firmware = primary
-        .as_ref()
-        .is_some_and(|device| device.adapter.driver_name() == "simpledrm");
-    if firmware {
-        *primary = None;
-    }
-    firmware
-}
-
 #[derive(Clone)]
 pub struct Scanout {
     pub backing: Arc<dyn GemBacking>,
@@ -698,22 +683,14 @@ impl DrmDevice {
         Ok(super::DrmFile::new(Arc::clone(self), id, true, false))
     }
 
+    /// Whether the translated i915 GT is live. Userspace reaches it through
+    /// this primary device's render node, whichever device the firmware console
+    /// is on: the GT is registered independently of KMS (`drm_dev_register`
+    /// needs no primary), so the decision rests on the GT alone.
     pub(crate) fn has_intel_gt(&self) -> bool {
         self.render.is_none()
             && super::intel::gt_registered()
-            && match self.adapter.pci_identity() {
-                Some(p) => {
-                    (
-                        p.vendor_id,
-                        p.device_id,
-                        p.revision,
-                        p.bus,
-                        p.device,
-                        p.function,
-                    ) == (0x8086, 0x46d0, 0, 0, 2, 0)
-                }
-                None => self.adapter.driver_name() == "simpledrm", /* same boot's firmware surface, not another GPU. */
-            }
+            && super::intel::gt_pci_identity().is_some()
     }
     pub fn has_render(&self) -> bool {
         self.render.is_some() || self.has_intel_gt()

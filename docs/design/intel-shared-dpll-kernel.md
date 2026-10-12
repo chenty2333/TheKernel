@@ -1,5 +1,13 @@
 # ADL-N shared-DPLL kernel adapter
 
+> **Status (2026-10-12, i915 unification phase 1): historical.** The native
+> Intel display and GT stack this note describes (`kernel/src/drm/intel/`
+> modesetting, fastboot, GTT, GEM and hotplug modules, and the
+> `tk-intel-display` crate) has been removed. The Linux i915 port in
+> `crates/ax/tk-intel-gt` is the only owner of the GPU, and the screen is the
+> firmware (GOP) framebuffer console until the display code is ported. See
+> `i915-gt-wiring-map.md` for the current wiring.
+
 `kernel/src/drm/intel/shared_dpll.rs` implements a typed kernel backend for
 the translated `intel_dpll_mgr_full` source manager. It admits only known
 ADL-N device/revision identities; maps combo DPLL0/1, TBT, and TC1/TC2 DKL

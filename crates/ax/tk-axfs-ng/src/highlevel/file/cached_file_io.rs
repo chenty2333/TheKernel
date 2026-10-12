@@ -565,13 +565,20 @@ impl CachedFile {
     pub fn write_at(&self, mut buf: impl Read + IoBuf, offset: u64) -> VfsResult<usize> {
         let len = buf.remaining();
         if let Some(written) = self.try_write_aligned_bypass(&mut buf, offset, len)? {
+            self.throttle_dirty_writer();
             return Ok(written);
         }
         let native_mutation = begin_source_location_writeback_mutation(&self.inner)?;
         let native_gate = Some(held_native_writeback_gate(&native_mutation));
-        let _direct_guard = self.shared.direct_io_lock.lock();
-        let _guard = self.shared.append_lock.read();
-        self.write_at_locked(buf, offset, native_gate)
+        let written = {
+            let _direct_guard = self.shared.direct_io_lock.lock();
+            let _guard = self.shared.append_lock.read();
+            self.write_at_locked(buf, offset, native_gate)?
+        };
+        // Throttle only after every cache, direct-I/O and native lock is gone.
+        drop(native_mutation);
+        self.throttle_dirty_writer();
+        Ok(written)
     }
 
     pub(super) fn write_at_with_held_native_mutation(
@@ -596,6 +603,7 @@ impl CachedFile {
 
     pub fn write_at_slice(&self, src: &[u8], offset: u64) -> VfsResult<usize> {
         if let Some(written) = self.try_write_aligned_slice_bypass(src, offset)? {
+            self.throttle_dirty_writer();
             return Ok(written);
         }
         self.write_at(src, offset)

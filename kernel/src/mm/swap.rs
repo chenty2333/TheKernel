@@ -312,6 +312,12 @@ pub(crate) fn try_live_address_spaces() -> AxResult<Vec<Arc<Mutex<AddrSpace>>>> 
     Ok(spaces)
 }
 
+/// Resolves the owner of a reverse-map record for the reclaimer. Returns
+/// `None` once the address space has been torn down.
+pub(crate) fn live_address_space(id: u64) -> Option<Arc<Mutex<AddrSpace>>> {
+    LIVE_ADDRESS_SPACES.lock().entries.get(&id)?.0.upgrade()
+}
+
 fn for_each_live_address_space(mut visit: impl FnMut(Arc<Mutex<AddrSpace>>)) {
     // Address-space IDs are monotonic and never reused. Walking one weak entry
     // at a time avoids allocating a global snapshot for revocation callers.

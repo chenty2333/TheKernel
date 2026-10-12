@@ -1,5 +1,15 @@
 # Upstream provenance
 
+> **2026-10-12 (i915 unification phase 1).** The `tk-intel-display` crate
+> (Linux 7.2.3 display translations) and the native display/GT modules under
+> `kernel/src/drm/intel/` (modeset, fastboot, GTT, native GEM, hotplug, DMC,
+> GMBUS, and the rest) were deleted. Paths and attribution rows below that
+> name them describe removed code and are kept as the record of what was
+> shipped before this change. The i915 port in `crates/ax/tk-intel-gt`, its
+> `NOTICE` and `LICENSE-MIT`, remain the attribution for the GPU code that
+> ships. The Linux-excerpt baseline in `tests/ci/test_linux_excerpt_baseline.py`
+> was measured before the deletion and must be re-scanned.
+
 Measured on the `dev` worktree at commit `d38a2db7` plus uncommitted WIP,
 re-scanned 2026-09-21, against the Linux 7.2.3 reference tree at
 `/home/ava/Desktop/linux-7.2.3` and the repository's own `Cargo.lock`. Nothing
@@ -1858,7 +1868,7 @@ G2 follow-up: `i915_mm_upstream.rs` translates Linux 7.2.3 MIT `i915_mm.c`
 `linux/{mm_native,shmem}.rs` are original LinuxKPI implementations over axmm,
 axtask, the native allocator and axhal physical-address translation, not copied
 Linux GPL MM/fs implementations. The C layout probe confirms the VMA manager
-lock at offset 0, size 248, and CONFIG_TRANSPARENT_HUGEPAGE=n (no huge_mnt field).
+lock at offset 0, size 248, and CONFIG_TRANSPARENT_HUGEPAGE=n in the default graphics oracle (no huge_mnt field). The ABI oracle (config/linux/7.2.3-q35-abi.config) enables THP; its drm_device layout therefore differs by the huge_mnt member and is not the layout the i915 mirror measures.
 
 G2 follow-up: Linux 7.2.3 MIT `gem/i915_gem_phys.c` all nine functions are in
 `i915_gem_phys_upstream.rs` (copyright © 2014-2016 Intel Corporation);

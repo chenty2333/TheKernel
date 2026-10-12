@@ -248,7 +248,7 @@ impl UpstreamFile {
                 if let Some(predecessor) = predecessor {
                     predecessor.wait(Some(core::time::Duration::from_millis(500)))?;
                 }
-                super::gt::copy::sync_cpu_pages(object.backing.shared_pages().map_err(AxError::from)?)
+                sync_cpu_pages(object.backing.shared_pages().map_err(AxError::from)?)
                     .map_err(|_| AxError::Io)?;
                 native.bind_upstream_mmap(request.handle, request.offset, request.flags as u8)
                     .map_err(AxError::from)
@@ -443,6 +443,52 @@ fn ioctl_copies_to_user(cmd: u32) -> bool {
     ((cmd >> 30) & IOC_READ) != 0
 }
 
+/// Flush the CPU-cached system-RAM pages behind a GEM object before the GPU reads
+/// them or the CPU reads GPU output, so the non-snooping engine sees the bytes.
+pub(crate) fn sync_cpu_pages(pages: Arc<SharedPages>) -> Result<(), intel_gt::Error> {
+    use core::sync::atomic::{Ordering, fence};
+
+    use intel_gt::Error;
+    const PAGE: usize = 4096;
+    // The same fixed system-RAM cache synchronization serves rendering and
+    // display pin-to-GTT preparation. Do not apply the <=16MiB execution-BO
+    // limit to a 4K scanout (or its double-height dumb backing).
+    if pages.is_external() || pages.page_size() != axhal::paging::PageSize::Size4K {
+        return Err(Error::Refused);
+    }
+    let pin = pages.fixed_view().map_err(|_| Error::Refused)?;
+    let count = pin.len() / PAGE;
+    if count == 0 || count > 16_384 {
+        return Err(Error::Refused);
+    }
+    // CLFLUSH is optional in the architecture; admit the actual executing
+    // CPU's capability/line size before accessing any page. This target is
+    // N305 only, not a cache-maintenance fallback for unknown CPU layouts.
+    let cpu = core::arch::x86_64::__cpuid(1);
+    if cpu.edx & (1 << 19) == 0 || ((cpu.ebx >> 8) & 0xff) * 8 != 64 {
+        return Err(Error::Refused);
+    }
+    for index in 0..count {
+        intel_gt::ppgtt::physical(
+            pages
+                .paddr_at(index)
+                .map_err(|_| Error::Refused)?
+                .as_usize() as u64,
+        )?;
+    }
+    for index in 0..count {
+        let physical = pages.paddr_at(index).map_err(|_| Error::Refused)?;
+        let base = axhal::mem::phys_to_virt(physical).as_usize();
+        for offset in (0..PAGE).step_by(64) {
+            // SAFETY: an ordinary allocator-owned, physically validated 4K
+            // page retained by `pages` and its fixed-view pin. CLFLUSH invalidates
+            // the WB alias before the non-snooping display/GT reads; no MMIO.
+            unsafe { core::arch::x86_64::_mm_clflush((base + offset) as *const u8) };
+        }
+    }
+    fence(Ordering::SeqCst);
+    Ok(())
+}
 pub(crate) fn native_file(file: *mut c_void) -> Option<*mut c_void> {
     FILES
         .lock()
