@@ -114,3 +114,19 @@ pub mod iopoll;
 pub mod i2c;
 #[allow(unsafe_code)]
 pub mod i2c_algo_bit;
+#[allow(unsafe_code)]
+pub mod dma_fence_chain;
+#[allow(unsafe_code)]
+pub mod pci;
+#[allow(unsafe_code)]
+pub mod acpi;
+#[allow(unsafe_code)]
+pub mod backlight;
+#[allow(unsafe_code)]
+pub mod pwm;
+#[allow(unsafe_code)]
+pub mod component;
+#[allow(unsafe_code)]
+pub mod vga;
+#[allow(unsafe_code)]
+pub mod debugfs;

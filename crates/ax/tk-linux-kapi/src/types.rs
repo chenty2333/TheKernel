@@ -148,6 +148,18 @@ pub struct Spinlock {
     _opaque: [u8; 4],
 }
 
+impl Spinlock {
+    pub const fn new() -> Self {
+        Self { _opaque: [0; 4] }
+    }
+}
+
+impl Default for Spinlock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AtomicNotifierHead {
@@ -209,6 +221,17 @@ pub struct DmaFenceCb {
     pub node: ListHead,
     pub func: Option<unsafe extern "C" fn(*mut DmaFence, *mut DmaFenceCb)>,
 }
+
+#[repr(C)]
+pub struct DmaFenceChain {
+    pub base: DmaFence,
+    pub prev: *mut DmaFence,
+    pub prev_seqno: u64,
+    pub fence: *mut DmaFence,
+    pub cb: DmaFenceCb,
+    pub _pad: [u8; 8],
+}
+const _: [(); 120] = [(); core::mem::size_of::<DmaFenceChain>()];
 
 #[repr(C)]
 pub struct WaitQueueHead {
