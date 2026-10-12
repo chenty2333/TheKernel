@@ -113,16 +113,6 @@ pub unsafe extern "C" fn dma_fence_put(_fence: *mut DmaFence) {}
 
 #[cfg(test)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_dev_get(dev: *mut crate::drm_device_types::DrmDevice) -> *mut crate::drm_device_types::DrmDevice {
-    dev
-}
-
-#[cfg(test)]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_dev_put(_dev: *mut crate::drm_device_types::DrmDevice) {}
-
-#[cfg(test)]
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn sync_file_create(_fence: *mut DmaFence) -> *mut c_void {
     core::ptr::null_mut()
 }
