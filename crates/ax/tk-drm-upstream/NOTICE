@@ -22,8 +22,9 @@ its own source:
   drm_framebuffer, drm_rect, drm_print, drm_displayid, drm_eld, drm_modeset_lock,
   drm_modeset_helper, drm_color_mgmt, drm_damage_helper (GPL-2.0 OR MIT, MIT option),
   drm_vblank, drm_vblank_work, drm_plane_helper, drm_plane, drm_crtc, drm_connector,
-  drm_encoder, drm_mode_config, drm_mode_object, drm_property, drm_edid, and
-  drivers/video/hdmi.c. Copyright lines are those of each Linux file.
+  drm_encoder, drm_mode_config, drm_mode_object, drm_property, drm_edid,
+  drivers/video/hdmi.c, drm_scdc_helper, drm_hdmi_helper, and
+  drm_hdmi_state_helper. Copyright lines are those of each Linux file.
 - GPL-2.0 only, NOT covered by the MIT grant: `drivers/gpu/drm/drm_managed.c`
   (translated in `drm_managed_upstream.rs`). Its translation is flagged for
   rework before this crate ships; it must not be relied on as MIT until resolved.

@@ -139,6 +139,8 @@ pub use drm_atomic_types::DrmAtomicCommit as DrmAtomicState;
 mod tests;
 #[cfg(test)]
 mod b1b_tests;
+#[cfg(test)]
+mod b2e_tests;
 
 /// Host-test helpers shared by the batch test modules (test drm_device setup).
 #[cfg(test)]

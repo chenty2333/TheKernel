@@ -13,7 +13,6 @@ pub mod drm_file_events;
 pub mod drm_lease;
 pub mod fbdev_cmdline;
 pub mod gem_handles;
-pub mod hdmi_b2e;
 pub mod hrtimer;
 #[cfg(test)]
 pub mod host_test_links;
