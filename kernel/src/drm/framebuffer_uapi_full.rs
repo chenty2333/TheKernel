@@ -25,7 +25,6 @@
 //! Framework operations (IDR, GEM handles, copy-from-user, locks and workqueues)
 //! are represented by explicit state transitions and injectable operation results.
 
-#![no_std]
 extern crate alloc;
 
 use alloc::{format, string::String, vec, vec::Vec};

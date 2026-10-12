@@ -33,7 +33,6 @@
 //      Dave Airlie <airlied@linux.ie>
 //      Jesse Barnes <jesse.barnes@intel.com>
 
-#![no_std]
 extern crate alloc;
 
 use alloc::{format, string::String, vec::Vec};

@@ -28,7 +28,6 @@
 //! as explicit state and `PropertyUapiIo` operations so callers can bind the
 //! algorithms to the kernel framework without changing their decisions.
 
-#![no_std]
 extern crate alloc;
 
 use alloc::vec::Vec;

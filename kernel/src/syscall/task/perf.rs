@@ -1581,6 +1581,7 @@ pub(crate) fn sys_perf_event_open(
         }
         (NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed), group)
     };
+    #[cfg(feature = "pmu")]
     let mut probe_name = None;
     #[cfg(feature = "pmu")]
     let event = if let Some(source) = registry_dynamic {
@@ -1706,10 +1707,9 @@ pub(crate) fn sys_perf_event_open(
         }
     };
     #[cfg(not(feature = "pmu"))]
-    let event = {
+    let (event, probe_name) = {
         let lowered = systemwide_event_with_uprobe(plan.event, raw_core_type, &memory)?;
-        probe_name = lowered.probe_name;
-        lowered.event
+        (lowered.event, lowered.probe_name)
     };
     // Sampling, output routing and read-format extensions are not fabricated.
     if !matches!(event, PerfEvent::Software(SoftwareEvent::BpfOutput))

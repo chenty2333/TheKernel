@@ -25,7 +25,6 @@
 //! DRM object registration/destruction, lock primitives, deferred connector
 //! freeing, and userspace memory access are explicit integration hooks.
 
-#![no_std]
 extern crate alloc;
 
 use alloc::{format, string::String, vec::Vec};

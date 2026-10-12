@@ -4,6 +4,11 @@
 //! A timeline syncobj holds the newest chain node. Each node names its
 //! predecessor, its own point's fence and the sequence number of that
 //! predecessor, so the node for a point is found by walking backwards.
+// Machine-translated Linux C: preserve upstream symbol and type naming conventions
+#![allow(non_snake_case)]
+#![allow(non_camel_case_types)]
+// Machine-translated Linux C: preserve upstream control flow structure for parity audits
+#![allow(clippy::collapsible_if)]
 
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};

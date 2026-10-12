@@ -1830,7 +1830,7 @@ impl Manager {
         }
         let domain_count = self.units[unit_index].domain_count;
         let id = take_domain_id(&mut self.units[unit_index].next_domain_id, domain_count)?;
-        let mut page_table = SecondLevel::new(KernelPageMemory {
+        let page_table = SecondLevel::new(KernelPageMemory {
             pages: Vec::new(),
             cache_flush: self.cache_flush,
         })?;
@@ -2362,7 +2362,7 @@ impl Manager {
 
 fn next_monotonic_id(counter: &AtomicU64) -> Result<u64, Error> {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
         .map_err(|_| Error::OutOfMemory)
 }
 

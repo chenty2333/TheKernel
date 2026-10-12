@@ -1493,8 +1493,8 @@ impl PerfGroup {
         &self,
         slot_mask: u64,
         slot_base: &mut usize,
-        ip: u64,
-        user: bool,
+        _ip: u64,
+        _user: bool,
     ) {
         let state = self.state.lock();
         if !state.active.running {
@@ -1508,7 +1508,7 @@ impl PerfGroup {
                 if slot_mask & (1 << *slot_base) != 0 {
                     #[cfg(feature = "perf-sampling")]
                     if file.sampling.is_some() {
-                        file.emit_source_raw_at(ip, user, &[], axhal::time::monotonic_time_nanos());
+                        file.emit_source_raw_at(_ip, _user, &[], axhal::time::monotonic_time_nanos());
                     } else {
                         file.add_count(1);
                     }
@@ -3072,7 +3072,7 @@ impl PerfGroup {
         &self,
         _state: &mut GroupState,
         file: &PerfEventFile,
-        settled: bool,
+        _settled: bool,
     ) -> AxResult<Sample> {
         if file.invalid() {
             return Err(AxError::Io);
@@ -3082,7 +3082,7 @@ impl PerfGroup {
         // live read therefore reports the settled prefix rather than risking
         // a cross-CPU MSR access.
         #[cfg(feature = "pmu")]
-        let live = if !settled
+        let live = if !_settled
             && file.event.uses_external_counter()
             && file.running()
             && file.external_running.load(Ordering::Acquire)
@@ -3657,27 +3657,27 @@ impl PerfEventFile {
             cpu: 0,
         })
     }
-    fn emit_record(&self, record: &[u8]) {
+    fn emit_record(&self, _record: &[u8]) {
         if !self.enabled() {
             return;
         }
         #[cfg(feature = "perf-sampling")]
         if let Some(backend) = &self.sampling {
-            let _ = backend.emit_metadata_record(record);
+            let _ = backend.emit_metadata_record(_record);
         }
     }
     /// Source hooks call this only after matching an enabled/running event.
     /// The backend owns a preallocated mmap ring; a missing mapping converts
     /// to its normal LOST/unsupported behavior and never changes the count.
-    fn emit_source_raw_at(&self, ip: u64, user: bool, raw: &[u8], timestamp: u64) {
+    fn emit_source_raw_at(&self, _ip: u64, _user: bool, _raw: &[u8], _timestamp: u64) {
         #[cfg(feature = "perf-sampling")]
         if let Some(backend) = &self.sampling {
             let _ = backend.emit_source_raw_record_at(
                 current().id().as_u64() as u32,
-                ip,
-                user,
-                raw,
-                timestamp,
+                _ip,
+                _user,
+                _raw,
+                _timestamp,
             );
         }
     }
@@ -3935,24 +3935,24 @@ impl PerfEventFile {
                 .as_ref()
                 .ok_or(AxError::OperationNotSupported)?;
             source.share_output_from_transaction(destination)?;
+            let previous = self.output_target.lock().replace(target);
+            let current = self
+                .output_target
+                .lock()
+                .as_ref()
+                .expect("output target was just installed")
+                .clone();
+            current.output_users.fetch_add(1, Ordering::AcqRel);
+            let finalize =
+                previous.filter(|previous| previous.output_users.fetch_sub(1, Ordering::AcqRel) == 1);
+            drop(_routing);
+            if let Some(previous) = finalize {
+                previous.finish_output_target_close();
+            }
+            Ok(())
         }
         #[cfg(not(feature = "perf-sampling"))]
-        return Err(AxError::OperationNotSupported);
-        let previous = self.output_target.lock().replace(target);
-        let current = self
-            .output_target
-            .lock()
-            .as_ref()
-            .expect("output target was just installed")
-            .clone();
-        current.output_users.fetch_add(1, Ordering::AcqRel);
-        let finalize =
-            previous.filter(|previous| previous.output_users.fetch_sub(1, Ordering::AcqRel) == 1);
-        drop(_routing);
-        if let Some(previous) = finalize {
-            previous.finish_output_target_close();
-        }
-        Ok(())
+        Err(AxError::OperationNotSupported)
     }
 
     fn clear_output_target(&self) {
@@ -4591,7 +4591,7 @@ impl PerfEventFile {
         ) {
             return;
         }
-        let elapsed = {
+        let _elapsed = {
             let mut state = self.state.lock();
             if !state.running || !state.enabled {
                 return;
@@ -4610,7 +4610,7 @@ impl PerfEventFile {
         };
         #[cfg(feature = "perf-sampling")]
         if let Some(backend) = self.sampling.as_ref() {
-            let _ = backend.account_source_time(current().id().as_u64() as u32, elapsed, user);
+            let _ = backend.account_source_time(current().id().as_u64() as u32, _elapsed, user);
         }
     }
 
@@ -4888,11 +4888,11 @@ impl FileLike for PerfEventFile {
     }
     fn prepare_mmap(
         &self,
-        request: crate::file::FileMmapRequest,
+        _request: crate::file::FileMmapRequest,
     ) -> AxResult<Option<crate::file::PreparedFileMmap>> {
         #[cfg(feature = "perf-sampling")]
         if let Some(backend) = &self.sampling {
-            let mapping = backend.prepare_mmap(request)?;
+            let mapping = backend.prepare_mmap(_request)?;
             if let Some(group) = self.group() {
                 group.reconfigure_current();
             }
@@ -5105,12 +5105,12 @@ impl Pollable for PerfEventFile {
     }
     fn register<'a>(
         &'a self,
-        cx: &mut Context<'_>,
-        events: IoEvents,
+        _cx: &mut Context<'_>,
+        _events: IoEvents,
     ) -> Result<PollRegistration<'a>, PollRegistrationError> {
         #[cfg(feature = "perf-sampling")]
         if let Some(backend) = &self.sampling {
-            return backend.register(cx, events);
+            return backend.register(_cx, _events);
         }
         PollRegistration::empty()
     }
