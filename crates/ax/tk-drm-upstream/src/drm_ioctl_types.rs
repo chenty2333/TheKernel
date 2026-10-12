@@ -26,6 +26,9 @@ pub const DRM_MASTER: DrmIoctlFlags = 2;
 pub const DRM_ROOT_ONLY: DrmIoctlFlags = 4;
 pub const DRM_RENDER_ALLOW: DrmIoctlFlags = 32;
 
+unsafe impl Sync for DrmIoctlDesc {}
+unsafe impl Send for DrmIoctlDesc {}
+
 const _: () = assert!(size_of::<DrmIoctlDesc>() == 24);
 const _: () = assert!(core::mem::offset_of!(DrmIoctlDesc, cmd) == 0);
 const _: () = assert!(core::mem::offset_of!(DrmIoctlDesc, flags) == 4);
