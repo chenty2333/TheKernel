@@ -119,6 +119,92 @@ pub struct DrmAtomicCommit {
     pub commit_work: WorkStruct,
 }
 
+impl DrmAtomicCommit {
+    #[inline]
+    pub fn allow_modeset(&self) -> bool {
+        (self._bitfields_16[0] & 1) != 0
+    }
+
+    #[inline]
+    pub fn set_allow_modeset(&mut self, val: bool) {
+        if val {
+            self._bitfields_16[0] |= 1;
+        } else {
+            self._bitfields_16[0] &= !1;
+        }
+    }
+
+    #[inline]
+    pub fn legacy_cursor_update(&self) -> bool {
+        (self._bitfields_16[0] & (1 << 1)) != 0
+    }
+
+    #[inline]
+    pub fn set_legacy_cursor_update(&mut self, val: bool) {
+        if val {
+            self._bitfields_16[0] |= 1 << 1;
+        } else {
+            self._bitfields_16[0] &= !(1 << 1);
+        }
+    }
+
+    #[inline]
+    pub fn async_update(&self) -> bool {
+        (self._bitfields_16[0] & (1 << 2)) != 0
+    }
+
+    #[inline]
+    pub fn set_async_update(&mut self, val: bool) {
+        if val {
+            self._bitfields_16[0] |= 1 << 2;
+        } else {
+            self._bitfields_16[0] &= !(1 << 2);
+        }
+    }
+
+    #[inline]
+    pub fn duplicated(&self) -> bool {
+        (self._bitfields_16[0] & (1 << 3)) != 0
+    }
+
+    #[inline]
+    pub fn set_duplicated(&mut self, val: bool) {
+        if val {
+            self._bitfields_16[0] |= 1 << 3;
+        } else {
+            self._bitfields_16[0] &= !(1 << 3);
+        }
+    }
+
+    #[inline]
+    pub fn checked(&self) -> bool {
+        (self._bitfields_16[0] & (1 << 4)) != 0
+    }
+
+    #[inline]
+    pub fn set_checked(&mut self, val: bool) {
+        if val {
+            self._bitfields_16[0] |= 1 << 4;
+        } else {
+            self._bitfields_16[0] &= !(1 << 4);
+        }
+    }
+
+    #[inline]
+    pub fn plane_color_pipeline(&self) -> bool {
+        (self._bitfields_16[0] & (1 << 5)) != 0
+    }
+
+    #[inline]
+    pub fn set_plane_color_pipeline(&mut self, val: bool) {
+        if val {
+            self._bitfields_16[0] |= 1 << 5;
+        } else {
+            self._bitfields_16[0] &= !(1 << 5);
+        }
+    }
+}
+
 #[repr(C)]
 pub struct DrmBusCfg {
     pub format: u32,

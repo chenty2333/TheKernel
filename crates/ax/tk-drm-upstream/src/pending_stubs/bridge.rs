@@ -13,3 +13,17 @@ use core::ffi::c_void;
 // upstream: drm_bridge.c (no owner yet): the bridge chain is always empty here.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_bridge_detach(_bridge: *mut c_void) {}
+
+// upstream: drm_writeback.c (no owner yet)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_writeback_cleanup_job(_job: *mut c_void) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_writeback_set_fb(_conn_state: *mut c_void, _fb: *mut c_void) -> i32 {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_writeback_get_out_fence(_wb_conn: *mut c_void) -> *mut tk_linux_kapi::types::DmaFence {
+    core::ptr::null_mut()
+}
