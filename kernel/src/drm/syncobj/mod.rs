@@ -5,6 +5,13 @@
 //! and are woken by replace/add operations, exactly as the Linux `cb_list` and
 //! `ev_fd_list` do. Lock order is always syncobj lock, then fence internals;
 //! no callback re-enters a syncobj.
+// Machine-translated Linux C: preserve upstream symbol and type naming conventions
+#![allow(non_snake_case)]
+#![allow(non_camel_case_types)]
+// Machine-translated Linux C: retain original upstream documentation and tab indentation
+#![allow(clippy::tabs_in_doc_comments)]
+// Machine-translated Linux C: preserve upstream control flow structure for parity audits
+#![allow(clippy::collapsible_if)]
 
 mod chain;
 mod sync_file;

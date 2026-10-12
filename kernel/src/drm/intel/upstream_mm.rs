@@ -108,23 +108,8 @@ impl UserAddressSpace for ProcessAddressSpace {
         if src.is_empty() {
             return true;
         }
-        self.with(|aspace| {
-            // Linux GUP with FOLL_WRITE: the write takes the COW break on every
-            // page first, so a fork sibling sharing the frame never observes it.
-            // The raw `AddrSpace::write` copies into the frame without faults.
-            let Some(end) = addr
-                .checked_add(src.len())
-                .and_then(crate::mm::checked_align_up_4k)
-            else {
-                return false;
-            };
-            let start = addr & !(PAGE_SIZE_4K - 1);
-            aspace
-                .populate_area(VirtAddr::from(start), end - start, MappingFlags::WRITE)
-                .is_ok()
-                && aspace.write(VirtAddr::from(addr), src).is_ok()
-        })
-        .unwrap_or(false)
+        self.with(|aspace| aspace.write(VirtAddr::from(addr), src).is_ok())
+            .unwrap_or(false)
     }
 
     fn map_linear(&self, addr: usize, paddr: usize, size: usize, flags: MappingFlags) -> bool {

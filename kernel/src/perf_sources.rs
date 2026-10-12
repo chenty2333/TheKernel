@@ -1000,7 +1000,7 @@ fn trace_common(out: &mut [u8], kind: u16) {
 pub(crate) fn emit_raw_syscall_enter(
     number: u64,
     args: [u64; 6],
-    regs: &axcpu::uspace::LinuxPtRegs,
+    _regs: &axcpu::uspace::LinuxPtRegs,
 ) {
     let Some(consumers) = RawSyscallConsumers::current() else {
         return;
@@ -1020,7 +1020,7 @@ pub(crate) fn emit_raw_syscall_enter(
         // snapshot. The interpreter dereferences it only through the bounded
         // custom capability installed for this synchronous call.
         let mut regs_bytes = [0u8; axcpu::uspace::LinuxPtRegs::BYTE_LEN];
-        regs.write_native_bytes(&mut regs_bytes);
+        _regs.write_native_bytes(&mut regs_bytes);
         let mut raw_args = [0u8; 16];
         // The VM recognizes the 64-bit ctx[0] field as the bounded registers
         // capability. Keep its scalar bits zero so narrower scalar loads
@@ -1039,7 +1039,7 @@ pub(crate) fn emit_raw_syscall_enter(
     }
 }
 
-pub(crate) fn emit_raw_syscall_exit(number: u64, result: i64, regs: &axcpu::uspace::LinuxPtRegs) {
+pub(crate) fn emit_raw_syscall_exit(number: u64, result: i64, _regs: &axcpu::uspace::LinuxPtRegs) {
     let Some(consumers) = RawSyscallConsumers::current() else {
         return;
     };
@@ -1052,7 +1052,7 @@ pub(crate) fn emit_raw_syscall_exit(number: u64, result: i64, regs: &axcpu::uspa
     if consumers.bpf {
         // Prototype: `(struct pt_regs *regs, long ret)`.
         let mut regs_bytes = [0u8; axcpu::uspace::LinuxPtRegs::BYTE_LEN];
-        regs.write_native_bytes(&mut regs_bytes);
+        _regs.write_native_bytes(&mut regs_bytes);
         let mut raw_args = [0u8; 16];
         // See sys_enter: ctx[0] is capability-typed only for an exact u64
         // load and must never disclose the host snapshot address as a scalar.

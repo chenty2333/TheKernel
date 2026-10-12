@@ -434,7 +434,7 @@ unsafe fn kernel_runtime_put(
         "runtime PM put with a null handle"
     );
     RUNTIME_PM_DEPTH
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
             depth.checked_sub(1)
         })
         .unwrap_or_else(|_| panic!("runtime PM put without a matching get"));

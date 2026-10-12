@@ -325,8 +325,7 @@ impl UpstreamFile {
                 )
             };
             if result != 0 {
-                // SAFETY: the just-acquired GEM handle reference must be released on insertion failure.
-                unsafe { put_gem_object(object as *mut c_void) };
+                put_gem_object(object as *mut c_void);
                 return Err(result);
             }
         }

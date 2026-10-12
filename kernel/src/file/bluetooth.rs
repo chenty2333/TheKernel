@@ -581,7 +581,7 @@ impl HciSocket {
     }
 
     pub(crate) fn receive_into(&self, out: &mut [u8]) -> AxResult<HciReceiveInfo> {
-        let (channel, adapter) = self
+        let (channel, _adapter) = self
             .binding
             .lock()
             .as_ref()
@@ -606,7 +606,7 @@ impl HciSocket {
             });
         }
         #[cfg(feature = "input")]
-        if let Some(adapter) = &adapter {
+        if let Some(adapter) = &_adapter {
             let (length, timestamp_nanos) = adapter
                 .lock()
                 .receive_channel_packet(channel, out, self.nonblocking.load(Ordering::Acquire))
@@ -714,10 +714,10 @@ impl HciSocket {
     }
 
     fn close_binding(&self) {
-        if let Some(binding) = self.binding.lock().take() {
+        if let Some(_binding) = self.binding.lock().take() {
             #[cfg(feature = "input")]
-            if let Some(adapter) = binding.adapter {
-                adapter.lock().close_channel(binding.channel);
+            if let Some(adapter) = _binding.adapter {
+                adapter.lock().close_channel(_binding.channel);
             }
         }
     }

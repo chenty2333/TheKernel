@@ -741,23 +741,25 @@ impl<T: GpuTransport> AdapterState<T> {
         {
             self.retirement_worker_started
                 .store(true, Ordering::Release);
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(test))]
-        if !self.retirement_worker_started.swap(true, Ordering::AcqRel) {
-            let state = self.clone();
-            if axtask::try_spawn_with_name(
-                move || retirement_worker(state),
-                "drm-gpu-retire".into(),
-            )
-            .is_err()
-            {
-                self.retirement_worker_started
-                    .store(false, Ordering::Release);
-                return Err(DrmError::NoMemory);
+        {
+            if !self.retirement_worker_started.swap(true, Ordering::AcqRel) {
+                let state = self.clone();
+                if axtask::try_spawn_with_name(
+                    move || retirement_worker(state),
+                    "drm-gpu-retire".into(),
+                )
+                .is_err()
+                {
+                    self.retirement_worker_started
+                        .store(false, Ordering::Release);
+                    return Err(DrmError::NoMemory);
+                }
             }
+            Ok(())
         }
-        Ok(())
     }
 
     /// Gather independent, short-held queue locks. This is observability only:

@@ -4,19 +4,19 @@
 
 上游基线为 Linux `7.2.3`（`/home/ava/Desktop/linux-7.2.3/drivers/gpu/drm/i915`），平台为 Tiger Lake、Rocket Lake、Alder Lake-S/P/N。逐文件核对 SPDX 后再翻译：本任务列出的 GT/GEM/查询文件大部分为 `MIT`；`i915_perf.c` 及若干头文件/辅助文件需单独核验，若为 GPL-2.0 则不复制，只按 ABI/硬件规范实现或暂略。任何 GPL-only 的 DRM 框架、调度器和内存管理代码均不搬入。
 
-Rust 侧复用 `kernel/src/drm/intel/{gt.rs,gt_probe.rs,gem_exec.rs,gem_context.rs,gtt.rs}`、`kernel/src/drm/intel/gt/`、`kernel/src/drm/intel/gtt/`、`kernel/src/drm/{render,dmabuf,fence,syncobj.rs,syncobj/}` 与 `crates/ax/tk-intel-gt/`。GPU 引擎寄存器访问、PCI/DMA/IRQ 继续映射到 TheKernel 现有设备接口；用户 ABI 映射到现有 DRM ioctl/GEM、fence 与 syncobj 接口。不得整体移植 Linux DRM 核心。
+Rust 侧复用 `kernel/src/drm/intel/{gt.rs,gt_probe.rs,initial_plane.rs,upstream_*.rs}`、`kernel/src/drm/{render,dmabuf,fence,syncobj/{mod,chain,sync_file}.rs}` 与 `crates/ax/tk-intel-gt/`（原生 display/GT 模块如 `gem_exec.rs`、`gem_context.rs`、`gtt.rs` 等已删除）。GPU 引擎寄存器访问、PCI/DMA/IRQ 继续映射到 TheKernel 现有设备接口；用户 ABI 映射到现有 DRM ioctl/GEM、fence 与 syncobj 接口。不得整体移植 Linux DRM 核心。
 
 ## 文件映射
 
 | 上游文件/模块（Linux i915） | SPDX/处理 | TheKernel 对应与状态 |
 |---|---|---|
 | `gt/uc/{intel_uc.c,intel_uc_fw.c,intel_guc.c,intel_guc_fw.c,intel_guc_ads.c,intel_guc_ct.c,intel_guc_log.c,intel_huc.c,intel_huc_fw.c}` | 所列 `.c` 文件 SPDX 均为 MIT；平台固件名/版本取自 `intel_uc_fw.c` | 部分已落地：默认策略、设备 ID 到 uC 平台选择、固件候选与 CSS/version 校验、rootfs request、Gen12 DMA staging/upload、GuC READY poll、Gen11+ GuC MMIO auth；GSC/CT/ADS/log 与完整生命周期仍缺 |
-| `gt/intel_wopcm.c` | MIT, Copyright © 2017-2019 Intel Corporation | `tk-intel-gt/wopcm.rs` 推导 Gen12 GuC/HuC WOPCM partition、验证固件/reserved range 和锁定寄存器；`gt/copy.rs` 在 DMA 上传前编程并验证 WOPCM，未接 media-GT/deprivileged layout |
-| `gt/{intel_execlists_submission.c,intel_engine_cs.c,intel_context.c,intel_lrc.c,intel_ring.c,intel_timeline.c,intel_breadcrumbs.c,intel_engine_heartbeat.c}`、`gt/uc/intel_guc_submission.c` | 这些 `.c` 文件 SPDX 为 MIT；提交策略以 `gt/uc/intel_uc.c` 平台默认值为准 | `kernel/src/drm/intel/gt/`、`gt.rs`、`crates/ax/tk-intel-gt/{lrc,rcs,bcs}.rs`；扩展引擎队列、抢占/时间片、VCS/VECS 与完成通知 |
-| `gem/{i915_gem_execbuffer.c,i915_gem_object.c,i915_gem_shmem.c,i915_gem_userptr.c,i915_gem_stolen.c,i915_gem_mman.c,i915_gem_tiling.c,i915_gem_domain.c,i915_gem_shrinker.c,i915_gem_context.c}` 及 `gt/intel_gt.c`（eviction） | 上述 GEM `.c` 文件 SPDX 均为 MIT；文件名/函数边界按上游目录 | `gem_exec.rs`, `gem_context.rs`, `gtt.rs`, `gtt/`, `render.rs`, `dmabuf.rs`, `fence.rs`, `syncobj/`；去除非上游限制，映射用户指针与 mmap 到现有 VM/DMA 能力 |
+| `gt/intel_wopcm.c` | MIT, Copyright © 2017-2019 Intel Corporation | `tk-intel-gt/wopcm.rs` 推导 Gen12 GuC/HuC WOPCM partition、验证固件/reserved range 和锁定寄存器；在 DMA 上传前编程并验证 WOPCM，未接 media-GT/deprivileged layout |
+| `gt/{intel_execlists_submission.c,intel_engine_cs.c,intel_context.c,intel_lrc.c,intel_ring.c,intel_timeline.c,intel_breadcrumbs.c,intel_engine_heartbeat.c}`、`gt/uc/intel_guc_submission.c` | 这些 `.c` 文件 SPDX 为 MIT；提交策略以 `gt/uc/intel_uc.c` 平台默认值为准 | `kernel/src/drm/intel/gt.rs`、`crates/ax/tk-intel-gt/{lrc,rcs,bcs}.rs`；扩展引擎队列、抢占/时间片、VCS/VECS 与完成通知 |
+| `gem/{i915_gem_execbuffer.c,i915_gem_object.c,i915_gem_shmem.c,i915_gem_userptr.c,i915_gem_stolen.c,i915_gem_mman.c,i915_gem_tiling.c,i915_gem_domain.c,i915_gem_shrinker.c,i915_gem_context.c}` 及 `gt/intel_gt.c`（eviction） | 上述 GEM `.c` 文件 SPDX 均为 MIT；文件名/函数边界按上游目录 | `render.rs`, `dmabuf.rs`, `fence.rs`, `syncobj/{mod,chain,sync_file}.rs`，结合 `upstream_file.rs`、`upstream_memory.rs` 等（原生 `gem_exec.rs`、`gem_context.rs`、`gtt.rs` 已删除）；去除非上游限制，映射用户指针与 mmap 到现有 VM/DMA 能力 |
 | `gt/intel_rps.c`, `intel_rc6.c`, `intel_gt_pm.c`, `intel_llc.c`, `intel_workarounds.c`, `intel_reset.c` | 目标 `.c` 文件 SPDX 为 MIT | GT 新增电源、Gen12 workarounds、引擎/整卡复位；复用 `gt_probe.rs`、`tk-intel-gt/reset.rs` 与寄存器访问 |
 | `i915_query.c`, `i915_getparam.c`, `i915_perf.c` | 前两者有 MIT SPDX；`i915_perf.c` 头部带完整 MIT 许可文本（无 SPDX 行） | `render.rs` 与 DRM ioctl/UAPI；实现 ABI 可见 query/getparam 和 OA 可行部分 |
-| Linux `drivers/gpu/drm/` 通用 DRM/GEM/VM/调度器框架 | 不移植框架层 | 映射到 `kernel/src/drm/{render,dmabuf,fence,syncobj.rs,syncobj/}` 和现有 VM、DMA、文件描述符接口；确需通用能力时新增最小接口 |
+| Linux `drivers/gpu/drm/` 通用 DRM/GEM/VM/调度器框架 | 不移植框架层 | 映射到 `kernel/src/drm/{render,dmabuf,fence,syncobj/{mod,chain,sync_file}.rs}` 和现有 VM、DMA、文件描述符接口；确需通用能力时新增最小接口 |
 | 用户态载荷：Mesa anv、`vulkaninfo`、intel-media-driver、libva、`vainfo` | 各仓库/文件独立核许可证；iHD 按 MIT 处理 | 在现有 N305 iris smoke payload 旁增加可复现构建/guest 加载检查；无设备时只验证预期拒绝行为 |
 
 ### GuC submission 切片
@@ -197,5 +197,5 @@ MIT 下层依赖、完整 command parser 与 engine_pm 已补齐；其他文件�
 
 - 安装并验证唯一 kernel owner 的 upstream MMIO/forcewake、GGTT/VM、DMA retirement、IRQ/MSI/display callback、RuntimePmOps/GT IRQ power-domain、PCI identity/revision 与 firmware-ready interfaces；缺 provider 时保持 fail-closed。
 - 将完整 execbuffer/GEM/VMA/WW/syncobj/fence 服务接到 kernel DrmFile、真实用户地址空间与 GEM 对象 owner；不能以 host 模型或未安装的 LinuxKPI callback 宣称已运行。
-- 保护现有 display scanout/GGTT pins；GT reset、电源域及 display IRQ ACK 必须与 kernel display owner 协调。唯一 console scanout 尚未证明可恢复前，不扩大 reset/电源操作范围。
+- 保护现有 display scanout/GGTT pins（由 initial_plane.rs 保留固件 framebuffer scanout，原生 display 栈已删除，Linux display port 尚在 dev 分支待移植）；GT reset、电源域及 display IRQ ACK 必须与 kernel 协调。唯一 console scanout 尚未证明可恢复前，不扩大 reset/电源操作范围。
 - i915_perf.c 只在后续明确投入 OA 工作时补；本轮未做硬件实验、QEMU 或默认功能开关变更。

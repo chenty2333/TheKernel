@@ -478,17 +478,13 @@ fn poke_word(target: &Thread, session: PtraceSession, addr: usize, data: usize) 
     if memory.write_value(addr as *mut usize, data).is_ok() {
         return Ok(0);
     }
-    // Debugger text stores force a private executable COW copy, not a user
-    // writable/executable VMA. Reuse the existing instruction-patch primitive;
-    // shared and secret mappings fail its admission, never reach an inode write.
+    // Debugger memory stores force a private COW copy (Linux FOLL_FORCE | FOLL_WRITE),
+    // breaking copy-on-write without making user VMAs or PTEs writable.
     let mut aspace = memory.address_space().lock();
-    for (offset, byte) in data.to_ne_bytes().into_iter().enumerate() {
-        let address = addr.checked_add(offset).ok_or_else(ptrace_io_error)?;
-        aspace.private_executable_cow_patch_byte(axhal::mem::VirtAddr::from_usize(address), byte)
-            .map_err(|_| ptrace_io_error())?;
-    }
-
-    Ok(0)
+    aspace
+        .write(axhal::mem::VirtAddr::from_usize(addr), &data.to_ne_bytes())
+        .map(|_| 0)
+        .map_err(|_| ptrace_io_error())
 }
 
 #[cfg(target_arch = "x86_64")]
