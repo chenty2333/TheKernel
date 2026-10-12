@@ -88,44 +88,8 @@ fn err_ptr(errno: c_int) -> *mut c_void {
 (errno as isize) as *mut c_void
 }
 
-/// Linux `drm_dev_enter()`: false when no provider can admit the device.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_dev_enter(dev: *mut c_void, idx: *mut c_int) -> bool {
-match provider() {
-    Some(p) => unsafe { (p.dev_enter)(dev, idx) },
-    None => false,
-}
-}
-
-/// Linux `drm_dev_exit()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_dev_exit(idx: c_int) {
-unsafe { (required("drm_dev_exit").dev_exit)(idx) };
-}
-
-/// Linux `drm_dev_get()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_dev_get(dev: *mut c_void) -> *mut c_void {
-match provider() {
-    Some(p) => unsafe { (p.dev_get)(dev) },
-    None => core::ptr::null_mut(),
-}
-}
-
-/// Linux `drm_dev_put()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_dev_put(dev: *mut c_void) {
-unsafe { (required("drm_dev_put").dev_put)(dev) };
-}
-
-/// Linux `drm_is_current_master()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_is_current_master(file: *mut c_void) -> bool {
-match provider() {
-    Some(p) => unsafe { (p.is_current_master)(file) },
-    None => false,
-}
-}
+// drm_dev_enter, drm_dev_exit, drm_dev_get, drm_dev_put, drm_is_current_master
+// now ported and provided by tk-drm-upstream.
 
 /// Linux `drm_print_memory_stats()`.
 #[unsafe(no_mangle)]
@@ -138,32 +102,8 @@ region: *const c_char,
 unsafe { (required("drm_print_memory_stats").print_memory_stats)(printer, stats, supported_status, region) };
 }
 
-/// Linux `drm_gem_free_mmap_offset()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_gem_free_mmap_offset(obj: *mut c_void) {
-unsafe { (required("drm_gem_free_mmap_offset").gem_free_mmap_offset)(obj) };
-}
-
-/// Linux `drm_gem_handle_create()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_gem_handle_create(file: *mut c_void, obj: *mut c_void, handle: *mut u32) -> c_int {
-match provider() {
-    Some(p) => unsafe { (p.gem_handle_create)(file, obj, handle) },
-    None => -ENODEV,
-}
-}
-
-/// Linux `drm_gem_object_free()`: final-reference release of a GEM object.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_gem_object_free(refcount: *mut c_void) {
-unsafe { (required("drm_gem_object_free").gem_object_free)(refcount) };
-}
-
-/// Linux `drm_gem_private_object_init()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_gem_private_object_init(dev: *mut c_void, obj: *mut c_void, size: usize) {
-unsafe { (required("drm_gem_private_object_init").gem_private_object_init)(dev, obj, size) };
-}
+// drm_gem_free_mmap_offset, drm_gem_handle_create, drm_gem_object_free, drm_gem_private_object_init
+// now ported and provided by tk-drm-upstream.
 
 /// Linux `drm_gem_dmabuf_export()`: an error pointer when no provider exists.
 #[unsafe(no_mangle)]
