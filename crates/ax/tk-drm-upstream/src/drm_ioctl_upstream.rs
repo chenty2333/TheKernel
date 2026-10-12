@@ -634,6 +634,21 @@ pub unsafe extern "C" fn drm_ioctl(
     }
 }
 
+// upstream: drivers/gpu/drm/drm_ioctl.c drm_ioctl_flags()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_ioctl_flags(nr: c_uint, flags: *mut c_uint) -> bool {
+    if nr >= DRM_COMMAND_BASE as c_uint && nr < DRM_COMMAND_END as c_uint {
+        return false;
+    }
+    if nr as usize >= DRM_IOCTLS.len() {
+        return false;
+    }
+    if !flags.is_null() {
+        unsafe { *flags = DRM_IOCTLS[nr as usize].flags };
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
