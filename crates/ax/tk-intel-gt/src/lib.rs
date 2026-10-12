@@ -483,3 +483,129 @@ pub(crate) mod vlv_suspend_upstream;
 pub(crate) mod i915_gmch_upstream;
 #[allow(unsafe_code)]
 pub(crate) mod intel_renderstate_data_upstream;
+
+// Display header layouts and register definitions (B2.5a-c), generated from the oracle headers.
+#[allow(unsafe_code)]
+pub mod bxt_dpio_phy_regs_upstream;
+#[allow(unsafe_code)]
+pub mod i915_external_placeholder_types_upstream;
+#[allow(unsafe_code)]
+pub mod i915_gtt_view_types_upstream;
+#[allow(unsafe_code)]
+pub mod i9xx_plane_regs_upstream;
+#[allow(unsafe_code)]
+pub mod icl_dsi_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_audio_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_backlight_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_bios_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_casf_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_cdclk_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_cmtg_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_color_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_combo_phy_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_cursor_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_cx0_phy_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_ddi_buf_trans_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_core_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_device_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_irq_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_limits_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_params_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_power_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_power_well_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_reg_defs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dkl_phy_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dmc_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dmc_wl_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dp_aux_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dp_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dpio_phy_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dpll_mgr_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dram_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dsb_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dsi_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dsi_vbt_defs_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_fbc_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_fdi_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_frontbuffer_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_global_state_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_gmbus_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_hdcp_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_hdcp_shim_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_hti_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_link_bw_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_lvds_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_mg_phy_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_pch_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_pipe_crc_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_pps_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_psr_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_sprite_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_vblank_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_vbt_defs_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_vdsc_regs_upstream;
+#[allow(unsafe_code)]
+pub mod intel_wm_types_upstream;
+#[allow(unsafe_code)]
+pub mod skl_prefill_types_upstream;
+#[allow(unsafe_code)]
+pub mod skl_universal_plane_regs_upstream;
+#[allow(unsafe_code)]
+pub mod skl_watermark_regs_upstream;
+#[allow(unsafe_code)]
+pub mod vlv_dpio_phy_regs_upstream;
+#[allow(unsafe_code)]
+pub mod vlv_dsi_regs_upstream;

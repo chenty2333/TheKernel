@@ -128,7 +128,7 @@ pub struct DrmModeSet {
     pub mode: *mut DrmDisplayMode,
     pub x: u32,
     pub y: u32,
-    pub connectors: *mut DrmConnector,
+    pub connectors: *mut *mut DrmConnector,
     pub num_connectors: usize,
 }
 

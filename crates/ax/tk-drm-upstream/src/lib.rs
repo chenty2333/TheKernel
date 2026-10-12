@@ -6,7 +6,23 @@
 //!
 //! The crate is `no_std`; host unit tests run under `cfg(test)`.
 #![no_std]
-#![allow(clippy::too_many_arguments)]
+#![feature(c_variadic)]
+// Machine-translated from Linux C (see each module header). Unsafe blocks mirror
+// the C statements and carry `// upstream:` provenance rather than per-block
+// SAFETY prose, the same policy tk-intel-gt applies to its i915 ports.
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::too_many_arguments,
+    // C-shaped signatures and `goto`-as-loop control flow are kept as written upstream.
+    clippy::not_unsafe_ptr_arg_deref,
+    clippy::macro_metavars_in_unsafe,
+    clippy::never_loop,
+    clippy::absurd_extreme_comparisons,
+    clippy::erasing_op,
+    clippy::empty_line_after_doc_comments
+)]
+
+extern crate alloc;
 
 #[cfg(test)]
 extern crate std;
@@ -112,9 +128,18 @@ pub mod drm_vblank_upstream;
 pub mod drm_vblank_work_upstream;
 pub mod hdmi_upstream;
 
+// TEMPORARY batch B1b stubs for not-yet-landed owners (see pending_stubs/).
+pub mod pending_stubs;
+
 /// Linux 7.2.3 renamed  to 
 /// (include/drm/drm_atomic.h); the old name is kept for call-site readability.
 pub use drm_atomic_types::DrmAtomicCommit as DrmAtomicState;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod b1b_tests;
+
+/// Host-test helpers shared by the batch test modules (test drm_device setup).
+#[cfg(test)]
+pub mod test_support;

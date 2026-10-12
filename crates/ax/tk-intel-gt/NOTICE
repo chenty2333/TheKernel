@@ -206,3 +206,15 @@ Generic Linux kernel-API shims (lists, waits, workqueues, timers, locks, mm,
 dma, firmware, printk basics, completion, seq_buf, iopoll, I2C core) moved to
 crates/ax/tk-linux-kapi, which carries its own LICENSE-MIT and NOTICE. The
 linux/ modules that remain here are the i915/intel-specific translations.
+
+Display register and type definitions (2026-10-12, batch B2.5): the
+`*_regs_upstream.rs` and `*_types_upstream.rs` modules under `src/` are field and
+macro transcriptions of Linux 7.2.3 `drivers/gpu/drm/i915/display/*.h` and of the
+shared DRM headers they include (`include/drm/display/drm_dp_mst_helper.h`).
+Each source is under the MIT grant, either as `SPDX-License-Identifier: MIT` or
+as the MIT permission text in the header without an SPDX line (intel_bios.h,
+intel_display_types.h, intel_dpll_mgr.h, intel_dsi.h, intel_frontbuffer.h,
+intel_vbt_defs.h). Intel copyright years span 2008-2025 across the set; each
+header's own copyright lines are the attribution. `tests/intel_display_regs_upstream.rs`
+pins 35 macro and register values against the C preprocessor output; it pins
+`GMBUS_SW_CLR_INT` as the unsigned register value 0x80000000 (C `1 << 31`).

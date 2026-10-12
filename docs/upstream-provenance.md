@@ -2181,3 +2181,54 @@ in the source comments.
 | drivers/gpu/drm/ttm/ttm_tt.c | linux/ttm.rs | ttm_tt_mgr_init(); GPL-2.0 OR MIT, MIT option; Copyright (c) 2006-2009 VMware, Inc., Palo Alto, CA., USA |
 | drivers/gpu/drm/ttm/ttm_resource.c | linux/ttm.rs | ttm_resource_manager_init(), ttm_resource_manager_set_used() (header inline); MIT permission text, Copyright 2020 Advanced Micro Devices, Inc. |
 | drivers/gpu/drm/ttm/ttm_sys_manager.c | linux/ttm.rs | ttm_sys_man_init(); the alloc/free hooks fail closed (ttm_resource_init not ported); GPL-2.0 OR MIT, MIT option; Copyright (c) 2006-2009 VMware, Inc., Palo Alto, CA., USA |
+
+## 2026-10-12 DRM core B1 and i915 display B2.5 reconciliation
+
+The uncommitted DRM core translations (`crates/ax/tk-drm-upstream`, batches B1a-B1d)
+and the i915 display `*_types_upstream.rs` / `*_regs_upstream.rs` modules in
+`crates/ax/tk-intel-gt` (B2.5) add verbatim-Linux lines that the excerpt scanner
+counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned
+`crates/ax` totals: threshold >=40 `(0,0,0,807,777,0,0)` (was 707/678), threshold
+>=25 `(18,15,4,2178,2140,0,0)` (was 1897/1861). `crates/linux` and `kernel/src`
+are unchanged. At >=40 the new code lines are in `tk-intel-gt` (670 code lines in
+the scope) and `tk-drm-upstream` (93).
+
+Licensing of the translated DRM sources (checked against `/home/ava/Desktop/linux-7.2.3`):
+
+- MIT or MIT-compatible X11-style permission: `drm_blend`, `drm_modes`,
+  `drm_fourcc`, `drm_framebuffer`, `drm_rect`, `drm_print`, `drm_displayid`,
+  `drm_eld`, `drm_modeset_lock`, `drm_modeset_helper`, `drm_color_mgmt`,
+  `drm_vblank`, `drm_vblank_work`, `drm_plane`, `drm_plane_helper`, `drm_crtc`,
+  `drm_connector`, `drm_encoder`, `drm_mode_config`, `drm_mode_object`,
+  `drm_property`, `drm_edid`; `drm_damage_helper` is `GPL-2.0 OR MIT` (MIT option).
+  Several have no SPDX line but carry the permission text; their copyright
+  lines are recorded in `crates/ax/tk-drm-upstream/NOTICE`.
+- **GPL-2.0 only, flagged:** `drivers/gpu/drm/drm_managed.c` is `SPDX-License-Identifier: GPL-2.0`.
+  `drm_managed_upstream.rs` (B1b) translates it and must be reworked from the
+  managed-resource contract, or removed, before the crate's MIT claim holds for that file.
+- **GPL-2.0-or-later, no translation yet:** `drm_gem_atomic_helper.c` and
+  `drm_gem_framebuffer_helper.c`. Their `*_upstream.rs` files are placeholders and
+  must stay that way unless the license question is resolved.
+- The NOTICE sentence "Linux sources are GPL-2.0-only" was too broad; `tk-drm-upstream/NOTICE` now states the per-file status.
+- The B2.5 display headers are MIT (SPDX or permission text). `tk-intel-gt/NOTICE` records them.
+
+Test fixtures: the EDID blobs that B1d copied from Linux `drm_kunit_edid.h`
+(GPL-2.0) were removed. `drm_edid_upstream.rs` builds every fixture in code
+(`edid_dvi_1080p`, `edid_hdmi_audio`, `edid_hdmi_4k_y420_scdc`) from explicit
+timing and data-block values, and the same host assertions still pass.
+
+Wound/wait mutexes (`tk-linux-kapi/src/ww_mutex.rs`) were reviewed against
+`kernel/locking/ww_mutex.h` and `mutex.c __ww_mutex_lock`. The port now has two
+class kinds: `RESERVATION_WW_CLASS` (`DEFINE_WD_CLASS`, `drivers/dma-buf/dma-resv.c`,
+used by `i915_gem_ww.c`) and `CRTC_WW_CLASS` (`DEFINE_WW_CLASS`,
+`drivers/gpu/drm/drm_modeset_lock.c`). Wait-die and wound-wait predicates follow
+`__ww_mutex_check_kill`, `__ww_mutex_die`, `__ww_mutex_wound`, and the waiter
+checks in `ww_mutex_lock_acquired`. A blocked context re-checks its kill
+condition on every wake, so a wounded holder no longer sleeps through the wound.
+
+Pending stubs: the temporary definitions in `crates/ax/tk-drm-upstream/src/pending_stubs/`
+are one file per owning batch (`atomic_b2a`, `drm_lease`, `drm_file_events`,
+`gem_handles`, `bridge`, `privacy_screen`, `panel_quirks`, `fbdev_cmdline`,
+`debugfs`, `kthread`, `hrtimer`, `hdmi_b2e`, `drm_client_probe`). Each module
+header names the Linux source that will replace it. `host_test_links` (cfg(test)
+only) and `test_records` are test infrastructure.

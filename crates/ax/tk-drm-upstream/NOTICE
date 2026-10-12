@@ -14,5 +14,27 @@ Function ports (`*_upstream.rs`) mirror the Linux `.c` files named in their
 header comments. Each stub is filled by its owning batch (see the module
 header comment).
 
-Linux sources are GPL-2.0-only; these files are MIT translations of the
-structure and function behaviour and are not verbatim copies of the C text.
+Linux sources are licensed per file, and each translation follows the license of
+its own source:
+
+- MIT or MIT-compatible X11-style permission (no SPDX line, or `MIT`, or
+  `GPL-2.0 OR MIT` with the MIT option taken): drm_blend, drm_modes, drm_fourcc,
+  drm_framebuffer, drm_rect, drm_print, drm_displayid, drm_eld, drm_modeset_lock,
+  drm_modeset_helper, drm_color_mgmt, drm_damage_helper (GPL-2.0 OR MIT, MIT option),
+  drm_vblank, drm_vblank_work, drm_plane_helper, drm_plane, drm_crtc, drm_connector,
+  drm_encoder, drm_mode_config, drm_mode_object, drm_property, drm_edid, and
+  drivers/video/hdmi.c. Copyright lines are those of each Linux file.
+- GPL-2.0 only, NOT covered by the MIT grant: `drivers/gpu/drm/drm_managed.c`
+  (translated in `drm_managed_upstream.rs`). Its translation is flagged for
+  rework before this crate ships; it must not be relied on as MIT until resolved.
+- GPL-2.0-or-later, no code translated yet: `drm_gem_atomic_helper.c` and
+  `drm_gem_framebuffer_helper.c` (the `*_upstream.rs` files are placeholders).
+
+The Linux sources are not verbatim copies of the C text except where a line is
+marked `// upstream:`; these files are MIT translations of structure and behaviour.
+
+Test fixtures: every EDID used by the host tests is built in code
+(`drm_edid_upstream.rs`, `tests` module). No Linux test data is copied.
+
+Pending-stub definitions (`src/pending_stubs/`) are temporary, owned by later
+batches, and each names its replacing Linux file in its module header.

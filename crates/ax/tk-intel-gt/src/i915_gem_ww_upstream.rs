@@ -16,7 +16,7 @@ use crate::{
     intel_engine_cs_upstream::ListHead,
     linux::{
         gem::{dma_resv_lock_slow, dma_resv_lock_slow_interruptible},
-        ww_mutex::{ww_acquire_fini, ww_acquire_init},
+        ww_mutex::{ww_acquire_fini, ww_acquire_init, RESERVATION_WW_CLASS},
     },
     linux_list::{INIT_LIST_HEAD, list_add_tail, list_del_init},
 };
@@ -49,7 +49,7 @@ const _: [(); 48] = [(); offset_of!(I915GemWwCtx, intr)];
 
 // upstream: i915_gem_ww.c i915_gem_ww_ctx_init()
 pub unsafe fn i915_gem_ww_ctx_init(ww: *mut I915GemWwCtx, intr: bool) {
-    unsafe { ww_acquire_init(core::ptr::addr_of_mut!((*ww).ctx)) };
+    unsafe { ww_acquire_init(core::ptr::addr_of_mut!((*ww).ctx), &RESERVATION_WW_CLASS) };
     unsafe { INIT_LIST_HEAD(core::ptr::addr_of_mut!((*ww).obj_list)) };
     unsafe { (*ww).intr = intr };
     unsafe { (*ww).contended = core::ptr::null_mut() };

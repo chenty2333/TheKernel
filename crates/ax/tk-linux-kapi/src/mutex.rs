@@ -16,6 +16,12 @@ use crate::{types::Mutex, config::CONFIG_DEBUG_MUTEXES};
 
 static MUTEX_WAITERS: axtask::WaitQueue = axtask::WaitQueue::new();
 
+/// The wait queue shared by contended Linux mutexes and the wound/wait
+/// `ww_mutex` waiters; both recheck their predicate after every wake.
+pub(crate) fn mutex_wait_queue() -> &'static axtask::WaitQueue {
+    &MUTEX_WAITERS
+}
+
 const _: [(); 24] = [(); size_of::<Mutex>()];
 const OWNER_OFFSET: usize = 0;
 const _: [(); 0] = [(); OWNER_OFFSET];
@@ -66,6 +72,12 @@ impl MutexPointer for &Mutex {
     fn mutex_ptr(self) -> *mut Mutex {
         self as *const Mutex as *mut Mutex
     }
+}
+
+fn current_task_identity() -> usize {
+    let task = axhal::percpu::current_task_ptr::<()>();
+    assert!(!task.is_null(), "Linux mutex has no current task owner");
+    task as usize
 }
 
 fn current_owner() -> usize {
@@ -122,7 +134,9 @@ pub unsafe fn mutex_lock<M: MutexPointer>(mutex: M) {
 
 /// Release the mutex, checking that only its owner unlocks it.
 pub unsafe fn mutex_unlock<M: MutexPointer>(mutex: M) {
-    let task = current_owner();
+    // Linux mutex_unlock() never sleeps; it only checks that the caller is the
+    // owner, so it needs the current task identity and not a blocking context.
+    let task = current_task_identity();
     let mutex = mutex.mutex_ptr();
     let owner = unsafe { owner_word(mutex) };
     assert_eq!(
