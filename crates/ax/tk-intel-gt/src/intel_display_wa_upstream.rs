@@ -8,7 +8,10 @@ use crate::intel_de_upstream::intel_de_rmw;
 use crate::intel_display_core_types_upstream::IntelDisplay;
 use crate::intel_display_regs_upstream::{
     DDI_CLOCK_REG_ACCESS, DPCE_GATING_DIS, GEN8_CHICKEN_DCPR_1, GEN9_CLKGATE_DIS_5,
+    ICL_DELAY_PMRSP,
 };
+
+// ... enum IntelDisplayWa ...
 
 #[repr(u32)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -49,6 +52,20 @@ pub enum IntelDisplayWa {
     Wa22021048059,
 }
 
+// upstream: intel_display_wa.c gen11_display_wa_apply()
+unsafe fn gen11_display_wa_apply(display: *mut IntelDisplay) {
+    // Wa_14010594013
+    intel_de_rmw(display, GEN8_CHICKEN_DCPR_1, 0, ICL_DELAY_PMRSP);
+}
+
+// upstream: intel_display_wa.c xe_d_display_wa_apply()
+// skipped: not display 13
+unsafe fn xe_d_display_wa_apply(_display: *mut IntelDisplay) {}
+
+// upstream: intel_display_wa.c xe3plpd_display_wa_apply()
+// skipped: not display 13
+unsafe fn xe3plpd_display_wa_apply(_display: *mut IntelDisplay) {}
+
 // upstream: intel_display_wa.c adlp_display_wa_apply()
 unsafe fn adlp_display_wa_apply(display: *mut IntelDisplay) {
     // Wa_22011091694:adlp
@@ -65,12 +82,25 @@ pub unsafe extern "C" fn intel_display_wa_apply(display: *mut IntelDisplay) {
         return;
     }
     let ver = (*display).info.__runtime_info.ip.ver;
-    let is_adlp = (*display).platform._anon_0_0.bitmap[0] & (1 << 3) != 0; // alderlake_p bit
+    let is_adlp = (*display).platform._anon_0_0.bitmap[0] & (1u64 << 52) != 0; // alderlake_p bit 52
 
-    if is_adlp || ver == 13 {
+    if ver == 35 {
+        xe3plpd_display_wa_apply(display);
+    } else if is_adlp {
         adlp_display_wa_apply(display);
+    } else if ver == 12 {
+        xe_d_display_wa_apply(display);
+    } else if ver == 11 {
+        gen11_display_wa_apply(display);
     }
-    // skipped: not display 13 (xe3plpd, xe_d, gen11)
+}
+
+// upstream: intel_display_wa.c intel_display_needs_wa_16025573575()
+unsafe fn intel_display_needs_wa_16025573575(display: *mut IntelDisplay) -> bool {
+    let ver = (*display).info.__runtime_info.ip.ver;
+    let rel = (*display).info.__runtime_info.ip.rel;
+    let ver_x100 = (ver as u32) * 100 + (rel as u32);
+    ver_x100 == 3000 || ver_x100 == 3002 || ver_x100 == 3500
 }
 
 // upstream: intel_display_wa.c intel_display_needs_wa_16023588340()
@@ -92,7 +122,7 @@ pub unsafe extern "C" fn __intel_display_wa(
     }
     let ver = (*display).info.__runtime_info.ip.ver;
     let step = (*display).info.__runtime_info.step;
-    let is_adlp = (*display).platform._anon_0_0.bitmap[0] & (1 << 3) != 0;
+    let is_adlp = (*display).platform._anon_0_0.bitmap[0] & (1u64 << 52) != 0;
 
     match wa {
         IntelDisplayWa::Wa14011503030
@@ -102,15 +132,17 @@ pub unsafe extern "C" fn __intel_display_wa(
         IntelDisplayWa::Wa14011508470 => (12..=13).contains(&ver),
 
         IntelDisplayWa::Wa16011303918 | IntelDisplayWa::Wa22011320316 => {
-            is_adlp && step <= 1 // STEP_B0
+            is_adlp && step <= 5 // STEP_B0
         }
         IntelDisplayWa::Wa16011342517 => {
-            is_adlp && step <= 3 // STEP_D0
+            is_adlp && step <= 13 // STEP_D0
         }
         IntelDisplayWa::Wa22012278275 => {
-            is_adlp && step <= 4 // STEP_E0
+            is_adlp && step <= 17 // STEP_E0
         }
         IntelDisplayWa::Wa16011863758 => ver >= 11,
+        IntelDisplayWa::Wa16023588340 => intel_display_needs_wa_16023588340(display),
+        IntelDisplayWa::Wa16025573575 => intel_display_needs_wa_16025573575(display),
         IntelDisplayWa::Wa22010947358 => is_adlp,
         IntelDisplayWa::Wa22014263786 => (11..=14).contains(&ver),
         // other workarounds skipped (not display 13 / ADL-P)

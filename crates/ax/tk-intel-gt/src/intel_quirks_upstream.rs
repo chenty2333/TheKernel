@@ -4,8 +4,9 @@
 
 #![allow(non_snake_case, dead_code, unsafe_code)]
 
-use core::ffi::c_void;
+use core::ffi::{c_char, c_void};
 use crate::intel_display_core_types_upstream::IntelDisplay;
+use crate::intel_display_types_upstream::IntelDp;
 
 #[repr(C)]
 pub struct PciDev {
@@ -17,6 +18,22 @@ pub struct PciDev {
     pub subsystem_device: u16,
     pub class: u32,
     pub revision: u8,
+}
+
+#[repr(C)]
+pub struct DrmDpDpcdIdent {
+    pub oui: [u8; 3],
+    pub device_id: [u8; 6],
+    pub hw_rev: u8,
+    pub sw_major_rev: u8,
+    pub sw_minor_rev: u8,
+}
+
+#[repr(C)]
+pub struct DmiSystemId {
+    pub callback: Option<unsafe extern "C" fn(*const DmiSystemId) -> i32>,
+    pub ident: *const c_char,
+    pub matches: [*const c_char; 8],
 }
 
 #[repr(u32)]
@@ -37,43 +54,80 @@ pub enum IntelQuirkId {
 const PCI_ANY_ID: i32 = -1;
 const DEVICE_ID_ANY: i32 = 0;
 
+// upstream: intel_quirks.c intel_set_quirk()
 #[inline]
 unsafe fn intel_set_quirk(display: *mut IntelDisplay, quirk: IntelQuirkId) {
     if !display.is_null() {
-        (*display).quirks.mask |= 1u64 << (quirk as u32);
+        unsafe { (*display).quirks.mask |= 1u64 << (quirk as u32) };
     }
 }
 
+// upstream: intel_quirks.c intel_set_dpcd_quirk()
+#[inline]
+unsafe fn intel_set_dpcd_quirk(intel_dp: *mut IntelDp, quirk: IntelQuirkId) {
+    if !intel_dp.is_null() {
+        unsafe { (*intel_dp).quirks.mask |= 1u64 << (quirk as u32) };
+    }
+}
+
+// upstream: intel_quirks.c quirk_ssc_force_disable()
 unsafe fn quirk_ssc_force_disable(display: *mut IntelDisplay) {
-    intel_set_quirk(display, IntelQuirkId::QuirkLvdsSscDisable);
+    unsafe { intel_set_quirk(display, IntelQuirkId::QuirkLvdsSscDisable) };
 }
 
+// upstream: intel_quirks.c quirk_invert_brightness()
 unsafe fn quirk_invert_brightness(display: *mut IntelDisplay) {
-    intel_set_quirk(display, IntelQuirkId::QuirkInvertBrightness);
+    unsafe { intel_set_quirk(display, IntelQuirkId::QuirkInvertBrightness) };
 }
 
+// upstream: intel_quirks.c quirk_backlight_present()
 unsafe fn quirk_backlight_present(display: *mut IntelDisplay) {
-    intel_set_quirk(display, IntelQuirkId::QuirkBacklightPresent);
+    unsafe { intel_set_quirk(display, IntelQuirkId::QuirkBacklightPresent) };
 }
 
+// upstream: intel_quirks.c quirk_increase_t12_delay()
 unsafe fn quirk_increase_t12_delay(display: *mut IntelDisplay) {
-    intel_set_quirk(display, IntelQuirkId::QuirkIncreaseT12Delay);
+    unsafe { intel_set_quirk(display, IntelQuirkId::QuirkIncreaseT12Delay) };
 }
 
+// upstream: intel_quirks.c quirk_increase_ddi_disabled_time()
 unsafe fn quirk_increase_ddi_disabled_time(display: *mut IntelDisplay) {
-    intel_set_quirk(display, IntelQuirkId::QuirkIncreaseDdiDisabledTime);
+    unsafe { intel_set_quirk(display, IntelQuirkId::QuirkIncreaseDdiDisabledTime) };
 }
 
+// upstream: intel_quirks.c quirk_no_pps_backlight_power_hook()
 unsafe fn quirk_no_pps_backlight_power_hook(display: *mut IntelDisplay) {
-    intel_set_quirk(display, IntelQuirkId::QuirkNoPpsBacklightPowerHook);
+    unsafe { intel_set_quirk(display, IntelQuirkId::QuirkNoPpsBacklightPowerHook) };
 }
 
+// upstream: intel_quirks.c quirk_fw_sync_len()
+unsafe fn quirk_fw_sync_len(intel_dp: *mut IntelDp) {
+    unsafe { intel_set_dpcd_quirk(intel_dp, IntelQuirkId::QuirkFwSyncLen) };
+}
+
+// upstream: intel_quirks.c quirk_edp_limit_rate_hbr2()
 unsafe fn quirk_edp_limit_rate_hbr2(display: *mut IntelDisplay) {
-    intel_set_quirk(display, IntelQuirkId::QuirkEdpLimitRateHbr2);
+    unsafe { intel_set_quirk(display, IntelQuirkId::QuirkEdpLimitRateHbr2) };
 }
 
+// upstream: intel_quirks.c quirk_disable_edp_panel_replay()
+unsafe fn quirk_disable_edp_panel_replay(intel_dp: *mut IntelDp) {
+    unsafe { intel_set_dpcd_quirk(intel_dp, IntelQuirkId::QuirkDisableEdpPanelReplay) };
+}
+
+// upstream: intel_quirks.c quirk_disable_psr2()
 unsafe fn quirk_disable_psr2(display: *mut IntelDisplay) {
-    intel_set_quirk(display, IntelQuirkId::QuirkDisablePsr2);
+    unsafe { intel_set_quirk(display, IntelQuirkId::QuirkDisablePsr2) };
+}
+
+// upstream: intel_quirks.c intel_dmi_reverse_brightness()
+unsafe extern "C" fn intel_dmi_reverse_brightness(_id: *const DmiSystemId) -> i32 {
+    1
+}
+
+// upstream: intel_quirks.c intel_dmi_no_pps_backlight()
+unsafe extern "C" fn intel_dmi_no_pps_backlight(_id: *const DmiSystemId) -> i32 {
+    1
 }
 
 struct IntelQuirk {
@@ -82,6 +136,72 @@ struct IntelQuirk {
     subsystem_device: i32,
     hook: unsafe fn(*mut IntelDisplay),
 }
+
+struct IntelDmiQuirk {
+    hook: unsafe fn(*mut IntelDisplay),
+    dmi_id_list: *const DmiSystemId,
+}
+
+struct IntelDpcdQuirk {
+    device: i32,
+    subsystem_vendor: i32,
+    subsystem_device: i32,
+    sink_oui: [u8; 3],
+    sink_device_id: [u8; 6],
+    hook: unsafe fn(*mut IntelDp),
+}
+
+unsafe impl Sync for IntelQuirk {}
+unsafe impl Sync for IntelDmiQuirk {}
+unsafe impl Sync for IntelDpcdQuirk {}
+unsafe impl Sync for DmiSystemId {}
+
+static DMI_REVERSE_BRIGHTNESS_LIST: [DmiSystemId; 3] = [
+    DmiSystemId {
+        callback: Some(intel_dmi_reverse_brightness),
+        ident: c"NCR Corporation".as_ptr(),
+        matches: [core::ptr::null(); 8],
+    },
+    DmiSystemId {
+        callback: Some(intel_dmi_reverse_brightness),
+        ident: c"Thundersoft TST178 tablet".as_ptr(),
+        matches: [core::ptr::null(); 8],
+    },
+    DmiSystemId {
+        callback: None,
+        ident: core::ptr::null(),
+        matches: [core::ptr::null(); 8],
+    },
+];
+
+static DMI_NO_PPS_BACKLIGHT_LIST: [DmiSystemId; 3] = [
+    DmiSystemId {
+        callback: Some(intel_dmi_no_pps_backlight),
+        ident: c"Google Lillipup sku524294".as_ptr(),
+        matches: [core::ptr::null(); 8],
+    },
+    DmiSystemId {
+        callback: Some(intel_dmi_no_pps_backlight),
+        ident: c"Google Lillipup sku524295".as_ptr(),
+        matches: [core::ptr::null(); 8],
+    },
+    DmiSystemId {
+        callback: None,
+        ident: core::ptr::null(),
+        matches: [core::ptr::null(); 8],
+    },
+];
+
+static INTEL_DMI_QUIRKS: &[IntelDmiQuirk] = &[
+    IntelDmiQuirk {
+        hook: quirk_invert_brightness,
+        dmi_id_list: DMI_REVERSE_BRIGHTNESS_LIST.as_ptr(),
+    },
+    IntelDmiQuirk {
+        hook: quirk_no_pps_backlight_power_hook,
+        dmi_id_list: DMI_NO_PPS_BACKLIGHT_LIST.as_ptr(),
+    },
+];
 
 static INTEL_QUIRKS: &[IntelQuirk] = &[
     // Lenovo U160 cannot use SSC on LVDS
@@ -135,37 +255,119 @@ static INTEL_QUIRKS: &[IntelQuirk] = &[
     IntelQuirk { device: 0xb081, subsystem_vendor: 0x1d72, subsystem_device: 0x2424, hook: quirk_disable_psr2 },
 ];
 
+static INTEL_DPCD_QUIRKS: &[IntelDpcdQuirk] = &[
+    // Dell Precision 5490
+    IntelDpcdQuirk {
+        device: 0x7d55,
+        subsystem_vendor: 0x1028,
+        subsystem_device: 0x0cc7,
+        sink_oui: [0x38, 0xec, 0x11],
+        sink_device_id: [0; 6],
+        hook: quirk_fw_sync_len,
+    },
+    // Dell XPS 14 DA14260
+    IntelDpcdQuirk {
+        device: DEVICE_ID_ANY,
+        subsystem_vendor: 0x1028,
+        subsystem_device: 0x0db9,
+        sink_oui: [0x00, 0x22, 0xb9],
+        sink_device_id: [0; 6],
+        hook: quirk_disable_edp_panel_replay,
+    },
+    // Dell XPS 16 DA16260
+    IntelDpcdQuirk {
+        device: DEVICE_ID_ANY,
+        subsystem_vendor: 0x1028,
+        subsystem_device: 0x0dba,
+        sink_oui: [0x00, 0x22, 0xb9],
+        sink_device_id: [0; 6],
+        hook: quirk_disable_edp_panel_replay,
+    },
+];
+
 // upstream: intel_quirks.c intel_init_quirks()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_init_quirks(display: *mut IntelDisplay) {
-    if display.is_null() || (*display).drm.is_null() {
+    if display.is_null() || unsafe { (*display).drm.is_null() } {
         return;
     }
-    let dev = (*(*display).drm).dev;
+    let dev = unsafe { (*(*display).drm).dev };
     if dev.is_null() {
         return;
     }
     let d = dev.cast::<PciDev>();
-    let device = (*d).device as i32;
-    let sub_vendor = (*d).subsystem_vendor as i32;
-    let sub_device = (*d).subsystem_device as i32;
+    let device = unsafe { (*d).device as i32 };
+    let sub_vendor = unsafe { (*d).subsystem_vendor as i32 };
+    let sub_device = unsafe { (*d).subsystem_device as i32 };
 
     for q in INTEL_QUIRKS.iter() {
         if (q.device == DEVICE_ID_ANY || q.device == device)
             && (q.subsystem_vendor == PCI_ANY_ID || q.subsystem_vendor == sub_vendor)
             && (q.subsystem_device == PCI_ANY_ID || q.subsystem_device == sub_device)
         {
-            (q.hook)(display);
+            unsafe { (q.hook)(display) };
         }
+    }
+
+    for q in INTEL_DMI_QUIRKS.iter() {
+        if unsafe { crate::display_pending_stubs::kapi_display::dmi_check_system(q.dmi_id_list.cast()) } != 0 {
+            unsafe { (q.hook)(display) };
+        }
+    }
+}
+
+unsafe fn dp_to_dig_port(intel_dp: *mut IntelDp) -> *mut crate::intel_display_types_upstream::IntelDigitalPort {
+    (intel_dp.cast::<u8>().sub(504)).cast()
+}
+
+unsafe fn to_intel_display_from_dp(intel_dp: *mut IntelDp) -> *mut IntelDisplay {
+    if intel_dp.is_null() {
+        return core::ptr::null_mut();
+    }
+    let dig = unsafe { dp_to_dig_port(intel_dp) };
+    let dev = unsafe { (*dig).base.base.dev };
+    if dev.is_null() {
+        core::ptr::null_mut()
+    } else {
+        unsafe { (*dev).dev_private.cast() }
     }
 }
 
 // upstream: intel_quirks.c intel_init_dpcd_quirks()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_init_dpcd_quirks(
-    _intel_dp: *mut c_void,
-    _ident: *const c_void,
+    intel_dp: *mut IntelDp,
+    ident: *const DrmDpDpcdIdent,
 ) {
+    if intel_dp.is_null() || ident.is_null() {
+        return;
+    }
+    let display = unsafe { to_intel_display_from_dp(intel_dp) };
+    let d = if !display.is_null() && !unsafe { (*display).drm.is_null() } && !unsafe { (*(*display).drm).dev.is_null() } {
+        unsafe { (*(*display).drm).dev.cast::<PciDev>() }
+    } else {
+        core::ptr::null()
+    };
+
+    let (device, sub_vendor, sub_device) = if !d.is_null() {
+        unsafe { ((*d).device as i32, (*d).subsystem_vendor as i32, (*d).subsystem_device as i32) }
+    } else {
+        (0, 0, 0)
+    };
+
+    let ident_oui = unsafe { (*ident).oui };
+    let ident_dev = unsafe { (*ident).device_id };
+
+    for q in INTEL_DPCD_QUIRKS.iter() {
+        if (q.device == DEVICE_ID_ANY || q.device == device)
+            && (q.subsystem_vendor == PCI_ANY_ID || q.subsystem_vendor == sub_vendor)
+            && (q.subsystem_device == PCI_ANY_ID || q.subsystem_device == sub_device)
+            && q.sink_oui == ident_oui
+            && (q.sink_device_id == ident_dev || q.sink_device_id == [0; 6])
+        {
+            unsafe { (q.hook)(intel_dp) };
+        }
+    }
 }
 
 // upstream: intel_quirks.c intel_has_quirk()
@@ -174,15 +376,19 @@ pub unsafe extern "C" fn intel_has_quirk(display: *mut IntelDisplay, quirk: Inte
     if display.is_null() {
         false
     } else {
-        ((*display).quirks.mask & (1u64 << (quirk as u32))) != 0
+        unsafe { ((*display).quirks.mask & (1u64 << (quirk as u32))) != 0 }
     }
 }
 
 // upstream: intel_quirks.c intel_has_dpcd_quirk()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_has_dpcd_quirk(
-    _intel_dp: *mut c_void,
-    _quirk: IntelQuirkId,
+    intel_dp: *mut IntelDp,
+    quirk: IntelQuirkId,
 ) -> bool {
-    false
+    if intel_dp.is_null() {
+        false
+    } else {
+        unsafe { ((*intel_dp).quirks.mask & (1u64 << (quirk as u32))) != 0 }
+    }
 }

@@ -123,3 +123,13 @@ pub unsafe extern "C" fn drm_atomic_commit_put(_state: *mut DrmAtomicCommit) {}
 pub unsafe extern "C" fn hypervisor_is_type(_type_: u32) -> bool {
     true
 }
+
+// upstream: drivers/gpu/drm/drm_atomic_helper.c drm_atomic_helper_suspend()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_atomic_helper_suspend(_dev: *mut DrmDevice) -> *mut DrmAtomicCommit {
+    core::ptr::null_mut()
+}
+
+// upstream: drivers/gpu/drm/drm_atomic_helper.c drm_atomic_helper_shutdown()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_atomic_helper_shutdown(_dev: *mut DrmDevice) {}

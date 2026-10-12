@@ -13,22 +13,29 @@ use crate::intel_display_types_upstream::IntelCrtc;
 use crate::intel_workarounds_types_upstream::I915RegT;
 use tk_drm_upstream::drm_atomic_types::DrmAtomicCommit;
 use tk_drm_upstream::drm_device_types::DrmDevice;
+use tk_drm_upstream::drm_file_types::DrmFile;
+use tk_drm_upstream::drm_fourcc_types::DrmFormatInfo;
 use tk_drm_upstream::drm_framebuffer_types::DrmFramebuffer;
+use tk_drm_upstream::uapi_drm_mode_types::DrmModeFbCmd2;
 
 // upstream: intel_fb.c intel_user_framebuffer_create()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_user_framebuffer_create(
     _dev: *mut DrmDevice,
-    _filp: *mut c_void,
-    _user_mode_cmd: *const c_void,
+    _filp: *mut DrmFile,
+    _info: *mut DrmFormatInfo,
+    _user_mode_cmd: *mut DrmModeFbCmd2,
 ) -> *mut DrmFramebuffer {
     core::ptr::null_mut()
 }
 
 // upstream: intel_fb.c intel_fb_get_format_info()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_fb_get_format_info(_cmd: *const c_void) -> *const c_void {
-    core::ptr::null()
+pub unsafe extern "C" fn intel_fb_get_format_info(
+    _pixel_format: u32,
+    _modifier: u64,
+) -> *mut DrmFormatInfo {
+    core::ptr::null_mut()
 }
 
 // upstream: intel_atomic.c intel_atomic_check()

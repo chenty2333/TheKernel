@@ -649,3 +649,7 @@ pub mod intel_display_clock_gating_upstream;
 pub mod intel_quirks_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_device_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_driver_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_reset_upstream;

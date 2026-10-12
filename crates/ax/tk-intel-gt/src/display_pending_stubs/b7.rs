@@ -10,12 +10,16 @@ use core::ffi::c_void;
 
 use crate::intel_display_core_types_upstream::IntelDisplay;
 use tk_drm_upstream::drm_device_types::DrmDevice;
+use tk_drm_upstream::drm_modes_types::{DrmDisplayMode, DrmModeStatus, MODE_OK};
 use tk_drm_upstream::drm_modeset_lock_types::DrmModesetAcquireCtx;
 
 // upstream: intel_display.c intel_mode_valid()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_mode_valid(_dev: *mut DrmDevice, _mode: *const c_void) -> i32 {
-    0
+pub unsafe extern "C" fn intel_mode_valid(
+    _dev: *mut DrmDevice,
+    _mode: *mut DrmDisplayMode,
+) -> DrmModeStatus {
+    MODE_OK
 }
 
 // upstream: intel_display.c intel_init_display_hooks()
