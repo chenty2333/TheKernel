@@ -215,13 +215,37 @@ pub fn jiffies_to_msecs<T: LinuxUnsigned>(ticks: T) -> u64 {
 /// Linux `udelay()` through the kernel HAL's calibrated busy-wait primitive.
 #[inline]
 pub fn udelay(micros: u32) {
-    axhal::time::busy_wait(core::time::Duration::from_micros(micros as u64));
+    crate::clock::delay_us(micros);
+}
+
+/// Linux `mdelay()`: millisecond busy wait.
+#[inline]
+pub fn mdelay(millis: u32) {
+    crate::clock::delay_us(millis.saturating_mul(1000));
+}
+
+/// Linux `ndelay()`: nanosecond busy wait.
+#[inline]
+pub fn ndelay(nanos: u32) {
+    crate::clock::delay_us((nanos + 999) / 1000);
 }
 
 /// Linux `ktime_to_ms()` for the i915 nanosecond `ktime_t` representation.
 #[inline]
 pub const fn ktime_to_ms(nanoseconds: i64) -> i64 {
     nanoseconds / 1_000_000
+}
+
+/// Linux `ktime_to_us()`.
+#[inline]
+pub const fn ktime_to_us(nanoseconds: i64) -> i64 {
+    nanoseconds / 1_000
+}
+
+/// Linux `ktime_to_ns()`.
+#[inline]
+pub const fn ktime_to_ns(nanoseconds: i64) -> i64 {
+    nanoseconds
 }
 
 /// Linux `DIV_ROUND_CLOSEST_ULL(n, d)` for unsigned 64-bit quantities.
@@ -370,7 +394,17 @@ pub fn max<T: Ord>(left: T, right: T) -> T {
 
 #[inline]
 pub fn ktime_get() -> i64 {
-    axhal::time::monotonic_time_nanos() as i64
+    crate::clock::now_ns() as i64
+}
+
+#[inline]
+pub fn ktime_get_boottime() -> i64 {
+    ktime_get()
+}
+
+#[inline]
+pub fn ktime_get_raw() -> i64 {
+    ktime_get()
 }
 
 /// Linux `ktime_get_raw_fast_ns()` binding. The configured TheKernel time
@@ -378,7 +412,52 @@ pub fn ktime_get() -> i64 {
 /// adjustment, matching the raw monotonic domain required by i915's LRC stats.
 #[inline]
 pub fn ktime_get_raw_fast_ns() -> u64 {
-    axhal::time::monotonic_time_nanos()
+    crate::clock::now_ns()
+}
+
+#[inline]
+pub const fn ktime_set(secs: i64, nsecs: c_long) -> i64 {
+    secs.saturating_mul(1_000_000_000).saturating_add(nsecs as i64)
+}
+
+#[inline]
+pub const fn ktime_sub(lhs: i64, rhs: i64) -> i64 {
+    lhs - rhs
+}
+
+#[inline]
+pub const fn ktime_add(lhs: i64, rhs: i64) -> i64 {
+    lhs.saturating_add(rhs)
+}
+
+#[inline]
+pub const fn ktime_add_ms(kt: i64, ms: i64) -> i64 {
+    kt.saturating_add(ms.saturating_mul(1_000_000))
+}
+
+#[inline]
+pub const fn ktime_add_us(kt: i64, us: i64) -> i64 {
+    kt.saturating_add(us.saturating_mul(1_000))
+}
+
+#[inline]
+pub const fn ktime_after(cmp1: i64, cmp2: i64) -> bool {
+    cmp1 > cmp2
+}
+
+#[inline]
+pub const fn ktime_before(cmp1: i64, cmp2: i64) -> bool {
+    cmp1 < cmp2
+}
+
+#[inline]
+pub const fn ktime_ms_delta(later: i64, earlier: i64) -> i64 {
+    ktime_to_ms(ktime_sub(later, earlier))
+}
+
+#[inline]
+pub const fn ktime_us_delta(later: i64, earlier: i64) -> i64 {
+    ktime_to_us(ktime_sub(later, earlier))
 }
 
 /// `ARRAY_SIZE(array)` for fixed C-layout Rust arrays.
@@ -446,12 +525,108 @@ mod tests {
         assert!(!is_power_of_2(3u64));
         assert_eq!(offset_in_page(0x1234usize), 0x234);
     }
+
+    #[test]
+    fn test_time_comparisons() {
+        let now: c_ulong = 1000;
+        let past: c_ulong = 900;
+        let future: c_ulong = 1100;
+        assert!(time_after(now, past));
+        assert!(!time_after(now, future));
+        assert!(time_before(past, now));
+        assert!(!time_before(future, now));
+        assert!(time_after_eq(now, past));
+        assert!(time_after_eq(now, now));
+        assert!(!time_after_eq(now, future));
+        assert!(time_before_eq(past, now));
+        assert!(time_before_eq(now, now));
+        assert!(!time_before_eq(future, now));
+
+        // Wrap-around across unsigned boundary
+        let wrap_past: c_ulong = c_ulong::MAX - 10;
+        let wrap_now: c_ulong = 10;
+        assert!(time_after(wrap_now, wrap_past));
+        assert!(time_before(wrap_past, wrap_now));
+    }
+
+    #[test]
+    fn test_ktime_helpers() {
+        let kt = ktime_set(2, 500_000_000);
+        assert_eq!(kt, 2_500_000_000);
+        assert_eq!(ktime_to_ms(kt), 2500);
+        assert_eq!(ktime_to_us(kt), 2_500_000);
+        assert_eq!(ktime_to_ns(kt), 2_500_000_000);
+
+        let later = ktime_add_ms(kt, 100);
+        assert_eq!(later, 2_600_000_000);
+        assert!(ktime_after(later, kt));
+        assert!(ktime_before(kt, later));
+        assert_eq!(ktime_ms_delta(later, kt), 100);
+        assert_eq!(ktime_us_delta(later, kt), 100_000);
+
+        let added_us = ktime_add_us(kt, 50);
+        assert_eq!(added_us, 2_500_050_000);
+        assert_eq!(ktime_sub(added_us, kt), 50_000);
+    }
+
+    #[test]
+    fn test_jiffies_helpers() {
+        let j = usecs_to_jiffies(10_000); // 10ms at HZ=100 -> 1 tick
+        assert_eq!(j, 1);
+        let j_to = msecs_to_jiffies_timeout(10);
+        assert!(j_to >= 1);
+    }
 }
 
 /// Linux jiffies `time_after(a, b)` wrap-safe comparison.
 #[inline]
 pub const fn time_after(a: c_ulong, b: c_ulong) -> bool {
     (b.wrapping_sub(a) as c_long) < 0
+}
+
+/// Linux jiffies `time_before(a, b)` wrap-safe comparison.
+#[inline]
+pub const fn time_before(a: c_ulong, b: c_ulong) -> bool {
+    time_after(b, a)
+}
+
+/// Linux jiffies `time_after_eq(a, b)` wrap-safe comparison.
+#[inline]
+pub const fn time_after_eq(a: c_ulong, b: c_ulong) -> bool {
+    (a.wrapping_sub(b) as c_long) >= 0
+}
+
+/// Linux jiffies `time_before_eq(a, b)` wrap-safe comparison.
+#[inline]
+pub const fn time_before_eq(a: c_ulong, b: c_ulong) -> bool {
+    time_after_eq(b, a)
+}
+
+/// Linux `usecs_to_jiffies()`.
+#[inline]
+pub fn usecs_to_jiffies(usecs: u32) -> c_ulong {
+    let hz = crate::config::CONFIG_HZ as u64;
+    ((usecs as u64).saturating_mul(hz).saturating_add(999_999) / 1_000_000) as c_ulong
+}
+
+/// Linux `msecs_to_jiffies_timeout()`.
+#[inline]
+pub fn msecs_to_jiffies_timeout(milliseconds: u32) -> c_ulong {
+    let j = msecs_to_jiffies(milliseconds);
+    min_t(j + 1, crate::config::MAX_SCHEDULE_TIMEOUT) as c_ulong
+}
+
+/// Linux `wait_remaining_ms_from_jiffies()` from intel_display_jiffies.h.
+#[inline]
+pub fn wait_remaining_ms_from_jiffies(timestamp_jiffies: u64, to_wait_ms: i32) {
+    let tmp_jiffies = jiffies();
+    let target_jiffies = timestamp_jiffies.wrapping_add(msecs_to_jiffies_timeout(to_wait_ms.max(0) as u32));
+    if time_after(target_jiffies as c_ulong, tmp_jiffies as c_ulong) {
+        let mut remaining_jiffies = target_jiffies.wrapping_sub(tmp_jiffies) as i64;
+        while remaining_jiffies > 0 {
+            remaining_jiffies = unsafe { crate::wait::schedule_timeout_uninterruptible(remaining_jiffies) };
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

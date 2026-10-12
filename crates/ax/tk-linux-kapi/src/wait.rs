@@ -153,6 +153,13 @@ pub fn schedule_timeout(timeout: i64) -> i64 {
     (timeout - (elapsed / tick_ns.max(1)) as i64).max(0)
 }
 
+/// Linux `schedule_timeout_uninterruptible()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn schedule_timeout_uninterruptible(timeout: i64) -> i64 {
+    set_task_state(current_task_key(), TASK_UNINTERRUPTIBLE);
+    schedule_timeout(timeout)
+}
+
 /// Linux `msleep()` backed by the task timer; if called outside a sleepable
 /// task context, retain the requested minimum delay via cooperative polling.
 pub fn msleep(milliseconds: u32) {
