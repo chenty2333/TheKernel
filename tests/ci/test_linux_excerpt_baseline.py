@@ -44,9 +44,12 @@ WINDOW = 14
 SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     ("crates/linux", 40): (110, 49, 20, 25, 0, 18, 21),
     ("kernel/src", 40): (85, 41, 19, 142, 9, 0, 0),
-    ("crates/ax", 40): (0, 0, 0, 807, 777, 0, 0),
+    ("crates/ax", 40): (0, 0, 0, 837, 807, 0, 0),
     ("crates/linux", 25): (211, 59, 22, 41, 3, 20, 21),
     ("kernel/src", 25): (157, 50, 24, 321, 25, 0, 0),
+# 2026-10-12 (B2d DisplayPort core helpers in tk-drm-upstream: drm_dp_helper,
+# drm_dp_dual_mode_helper): crates/ax moves from 807/777 to 837/807 at >= 40
+# (30 code lines) and from 2178/2140 to 2238/2200 at >= 25 (60 code lines).
 # 2026-10-12 (B1 DRM core ports in tk-drm-upstream, B2.5 i915 display
 # *_regs/*_types ports in tk-intel-gt): crates/ax moves from 707/678 to 807/777
 # at >= 40 (tk-drm-upstream 93 code lines, tk-intel-gt display tables) and from
@@ -73,7 +76,7 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # lines in the newly translated FreeBSD drivers and the OpenBSD iwx/net80211
 # translations, plus one FreeBSD ig4 register line. Those have BSD-source
 # provenance, not Linux provenance; see `docs/upstream-provenance.md`.
-    ("crates/ax", 25): (18, 15, 4, 2178, 2140, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 2238, 2200, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their

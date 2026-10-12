@@ -2240,3 +2240,13 @@ are one file per owning batch (`atomic_b2a`, `drm_lease`, `drm_file_events`,
 `debugfs`, `kthread`, `hrtimer`, `hdmi_b2e`, `drm_client_probe`). Each module
 header names the Linux source that will replace it. `host_test_links` (cfg(test)
 only) and `test_records` are test infrastructure.
+
+## 2026-10-12 DRM DisplayPort core helpers B2d reconciliation
+
+The Linux DisplayPort helper translations (`crates/ax/tk-drm-upstream`, batch B2d: `drm_dp_helper_upstream.rs` and `drm_dp_dual_mode_helper_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned `crates/ax` totals: threshold >=40 `(0,0,0,837,807,0,0)` (was 807/777), threshold >=25 `(18,15,4,2238,2200,0,0)` (was 2178/2140). `crates/linux` and `kernel/src` are unchanged.
+
+Licensing:
+- `drivers/gpu/drm/display/drm_dp_helper.c`: MIT (SPDX-License-Identifier: MIT).
+- `drivers/gpu/drm/display/drm_dp_dual_mode_helper.c`: MIT (SPDX-License-Identifier: MIT).
+Both files carry MIT licenses in upstream Linux 7.2.3 and are recorded in `crates/ax/tk-drm-upstream/NOTICE`.
+
