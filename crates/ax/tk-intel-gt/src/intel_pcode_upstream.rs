@@ -22,7 +22,7 @@ use crate::{
 
 /// `struct mutex sb_lock` inside `struct drm_i915_private` (x86_64, oracle
 /// wt-dev build; `offsetof` from the i915 headers). It serialises the mailbox.
-const I915_SB_LOCK_OFFSET: usize = 2504;
+const I915_SB_LOCK_OFFSET: usize = core::mem::offset_of!(crate::linux_i915_private::DrmI915Private, sb_lock);
 
 /// `EPROBE_DEFER`.
 const EPROBE_DEFER: i32 = 517;

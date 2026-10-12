@@ -106,7 +106,7 @@ const SZ_8M: u64 = 8 * 1024 * 1024;
 const SZ_256M: u64 = 256 * 1024 * 1024;
 const SZ_1G: u64 = 1024 * 1024 * 1024;
 const IORESOURCE_MEM: c_ulong = 0x200;
-const DSM_OFFSET: usize = 1704;
+const DSM_OFFSET: usize = core::mem::offset_of!(crate::linux_i915_private::DrmI915Private, dsm);
 const PCI_DEV_OFFSET: usize = 200;
 const PCI_RESOURCE_OFFSET: usize = 968;
 
