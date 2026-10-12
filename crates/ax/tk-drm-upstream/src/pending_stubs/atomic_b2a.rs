@@ -102,3 +102,22 @@ pub unsafe extern "C" fn drm_atomic_helper_check_plane_state(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_atomic_helper_suspend(_dev: *mut DrmDevice) -> *mut DrmAtomicCommit { core::ptr::null_mut() }
+
+// upstream: drivers/gpu/drm/drm_atomic.c drm_atomic_get_plane_state()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_atomic_get_plane_state(
+    _state: *mut DrmAtomicCommit,
+    _plane: *mut crate::drm_plane_types::DrmPlane,
+) -> *mut DrmPlaneState {
+    tk_linux_kapi::config::ERR_PTR::<DrmPlaneState>(-tk_linux_kapi::config::EOPNOTSUPP)
+}
+
+// upstream: drivers/gpu/drm/drm_atomic_uapi.c drm_mode_atomic_ioctl()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_mode_atomic_ioctl(
+    _dev: *mut DrmDevice,
+    _data: *mut core::ffi::c_void,
+    _file_priv: *mut DrmFile,
+) -> i32 {
+    -tk_linux_kapi::config::EOPNOTSUPP
+}

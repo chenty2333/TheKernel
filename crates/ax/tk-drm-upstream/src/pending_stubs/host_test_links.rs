@@ -13,8 +13,6 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::drm_file_types::DrmFile;
-use crate::drm_gem_types::DrmGemObject;
 use tk_linux_kapi::types::{DmaFence, Spinlock};
 
 static FENCE_CONTEXT: AtomicU64 = AtomicU64::new(1);
@@ -42,15 +40,4 @@ pub unsafe extern "C" fn dma_fence_init(
         (*fence).context = context;
         (*fence).seqno = seqno;
     }
-}
-
-#[cfg(test)]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_gem_handle_create(_file_priv: *mut DrmFile, _obj: *mut c_void, _handlep: *mut u32) -> i32 { -tk_linux_kapi::config::EOPNOTSUPP }
-
-// upstream: drm_auth.c (no owner yet)
-#[cfg(test)]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_is_current_master(_file_priv: *mut DrmFile) -> bool {
-    true
 }
