@@ -148,6 +148,18 @@ pub struct Spinlock {
     _opaque: [u8; 4],
 }
 
+impl Spinlock {
+    pub const fn new() -> Self {
+        Self { _opaque: [0; 4] }
+    }
+}
+
+impl Default for Spinlock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AtomicNotifierHead {

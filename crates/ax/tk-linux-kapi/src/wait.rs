@@ -111,7 +111,7 @@ pub fn schedule_timeout(timeout: i64) -> i64 {
         return 0;
     }
     let task = current_task_key();
-    let tick_ns = axhal::time::NANOS_PER_SEC as u64 / CONFIG_HZ as u64;
+    let tick_ns = 1_000_000_000 / CONFIG_HZ as u64;
     let unbounded = timeout as u64 >= MAX_SCHEDULE_TIMEOUT;
     let nanos = if unbounded {
         u64::MAX
@@ -119,7 +119,7 @@ pub fn schedule_timeout(timeout: i64) -> i64 {
         (timeout as u64).saturating_mul(tick_ns)
     };
     let wake_pending = || peek_task_state(task) == Some(TASK_RUNNING);
-    let start = axhal::time::monotonic_time_nanos();
+    let start = crate::clock::now_ns();
     match peek_task_state(task) {
         Some(TASK_RUNNING) => {
             take_task_state(task);
@@ -149,7 +149,7 @@ pub fn schedule_timeout(timeout: i64) -> i64 {
     if unbounded {
         return 0;
     }
-    let elapsed = axhal::time::monotonic_time_nanos().saturating_sub(start);
+    let elapsed = crate::clock::now_ns().saturating_sub(start);
     (timeout - (elapsed / tick_ns.max(1)) as i64).max(0)
 }
 
@@ -244,19 +244,20 @@ pub unsafe extern "C" fn woken_wake_function(
 /// Wait until a condition becomes true or its monotonic deadline expires.
 /// Return true on timeout, matching Linux `wait_for()` call sites.
 pub fn wait_until(timeout_ns: u64, mut condition: impl FnMut() -> bool, yield_task: bool) -> bool {
-    let start = axhal::time::monotonic_time_nanos();
+    let start = crate::clock::now_ns();
     let deadline = start.saturating_add(timeout_ns);
     loop {
         if condition() {
             return false;
         }
-        if axhal::time::monotonic_time_nanos() >= deadline {
+        let now = crate::clock::now_ns();
+        if now >= deadline {
             return true;
         }
-        if yield_task {
+        if yield_task && axtask::can_block_current() {
             axtask::yield_now();
         } else {
-            core::hint::spin_loop();
+            crate::clock::relax();
         }
     }
 }
@@ -265,19 +266,19 @@ pub fn wait_woken(entry: &mut WaitQueueEntry, _state: u32, timeout: i64) -> i64 
     if timeout <= 0 {
         return 0;
     }
+    let tick_ns = 1_000_000_000 / CONFIG_HZ as u64;
     let timeout_ns = if timeout as u64 >= MAX_SCHEDULE_TIMEOUT {
         u64::MAX
     } else {
-        (timeout as u64).saturating_mul(axhal::time::NANOS_PER_SEC as u64 / CONFIG_HZ as u64)
+        (timeout as u64).saturating_mul(tick_ns)
     };
-    let start = axhal::time::monotonic_time_nanos();
+    let start = crate::clock::now_ns();
     let timed_out = wait_until(timeout_ns, || entry.flags & WQ_FLAG_WOKEN != 0, true);
     if timed_out {
         return 0;
     }
     entry.flags &= !WQ_FLAG_WOKEN;
-    let elapsed = axhal::time::monotonic_time_nanos().saturating_sub(start);
-    let tick_ns = axhal::time::NANOS_PER_SEC as u64 / CONFIG_HZ as u64;
+    let elapsed = crate::clock::now_ns().saturating_sub(start);
     timeout
         .saturating_sub((elapsed / tick_ns.max(1)) as i64)
         .max(1)
@@ -313,6 +314,28 @@ macro_rules! DEFINE_WAIT_FUNC {
     }};
 }
 
+pub trait AsWaitQueueHeadPtr {
+    fn as_wq_head_ptr(&mut self) -> *mut WaitQueueHead;
+}
+
+impl AsWaitQueueHeadPtr for WaitQueueHead {
+    fn as_wq_head_ptr(&mut self) -> *mut WaitQueueHead {
+        self as *mut _
+    }
+}
+
+impl AsWaitQueueHeadPtr for *mut WaitQueueHead {
+    fn as_wq_head_ptr(&mut self) -> *mut WaitQueueHead {
+        *self
+    }
+}
+
+impl AsWaitQueueHeadPtr for &mut WaitQueueHead {
+    fn as_wq_head_ptr(&mut self) -> *mut WaitQueueHead {
+        (*self) as *mut _
+    }
+}
+
 #[macro_export]
 macro_rules! wait_event_lock_irq {
     ($wait_queue:expr, $condition:expr, $lock:expr $(,)?) => {{
@@ -320,6 +343,161 @@ macro_rules! wait_event_lock_irq {
             unsafe { $crate::locks::spin_unlock_irq(&mut $lock) };
             axtask::yield_now();
             unsafe { $crate::locks::spin_lock_irq(&mut $lock) };
+        }
+    }};
+}
+
+/// Linux `wait_event_timeout()` macro: sleeps until condition evaluates to true
+/// or the timeout in jiffies expires.
+///
+/// Returns:
+/// - 0 if condition evaluated to false after timeout elapsed;
+/// - 1 if condition evaluated to true after timeout elapsed;
+/// - remaining jiffies (at least 1) if condition evaluated to true before timeout elapsed.
+#[macro_export]
+macro_rules! wait_event_timeout {
+    ($wq:expr, $condition:expr, $timeout:expr $(,)?) => {{
+        let mut __ret: i64 = $timeout as i64;
+        $crate::wait::might_sleep();
+        if !{
+            let __cond = $condition;
+            if __cond && __ret == 0 {
+                __ret = 1;
+            }
+            __cond || __ret == 0
+        } {
+            let mut __entry = $crate::DEFINE_WAIT!();
+            unsafe {
+                $crate::wait::init_wait_entry(core::ptr::addr_of_mut!(__entry), 0);
+            }
+            let __wq_ptr = $crate::wait::AsWaitQueueHeadPtr::as_wq_head_ptr(&mut ($wq));
+            loop {
+                let _ = unsafe {
+                    $crate::wait::prepare_to_wait_event(
+                        __wq_ptr,
+                        core::ptr::addr_of_mut!(__entry),
+                        $crate::wait::TASK_UNINTERRUPTIBLE as i32,
+                    )
+                };
+                let __cond = $condition;
+                if __cond && __ret == 0 {
+                    __ret = 1;
+                }
+                if __cond || __ret == 0 {
+                    break;
+                }
+                __ret = $crate::wait::schedule_timeout(__ret);
+                let __cond = $condition;
+                if __cond && __ret == 0 {
+                    __ret = 1;
+                }
+                if __cond || __ret == 0 {
+                    break;
+                }
+            }
+            unsafe {
+                $crate::wait::finish_wait(
+                    __wq_ptr,
+                    core::ptr::addr_of_mut!(__entry),
+                );
+            }
+        }
+        __ret
+    }};
+}
+
+/// Linux `wait_event_interruptible_timeout()` macro.
+#[macro_export]
+macro_rules! wait_event_interruptible_timeout {
+    ($wq:expr, $condition:expr, $timeout:expr $(,)?) => {{
+        let mut __ret: i64 = $timeout as i64;
+        $crate::wait::might_sleep();
+        if !{
+            let __cond = $condition;
+            if __cond && __ret == 0 {
+                __ret = 1;
+            }
+            __cond || __ret == 0
+        } {
+            let mut __entry = $crate::DEFINE_WAIT!();
+            unsafe {
+                $crate::wait::init_wait_entry(core::ptr::addr_of_mut!(__entry), 0);
+            }
+            let __wq_ptr = $crate::wait::AsWaitQueueHeadPtr::as_wq_head_ptr(&mut ($wq));
+            loop {
+                let __int = unsafe {
+                    $crate::wait::prepare_to_wait_event(
+                        __wq_ptr,
+                        core::ptr::addr_of_mut!(__entry),
+                        $crate::wait::TASK_INTERRUPTIBLE as i32,
+                    )
+                };
+                let __cond = $condition;
+                if __cond && __ret == 0 {
+                    __ret = 1;
+                }
+                if __cond || __ret == 0 {
+                    break;
+                }
+                if __int != 0 {
+                    __ret = __int;
+                    break;
+                }
+                __ret = $crate::wait::schedule_timeout(__ret);
+                let __cond = $condition;
+                if __cond && __ret == 0 {
+                    __ret = 1;
+                }
+                if __cond || __ret == 0 {
+                    break;
+                }
+            }
+            unsafe {
+                $crate::wait::finish_wait(
+                    __wq_ptr,
+                    core::ptr::addr_of_mut!(__entry),
+                );
+            }
+        }
+        __ret
+    }};
+}
+
+/// Linux `wait_event_interruptible_locked()` macro.
+#[macro_export]
+macro_rules! wait_event_interruptible_locked {
+    ($wq:expr, $condition:expr $(,)?) => {{
+        if $condition {
+            0i32
+        } else {
+            let mut __wait = $crate::DEFINE_WAIT!();
+            unsafe {
+                $crate::wait::init_wait_entry(core::ptr::addr_of_mut!(__wait), 0);
+            }
+            let __wq_ptr = $crate::wait::AsWaitQueueHeadPtr::as_wq_head_ptr(&mut ($wq));
+            let mut __ret = 0i32;
+            loop {
+                __ret = unsafe {
+                    $crate::wait::do_wait_intr(
+                        __wq_ptr,
+                        core::ptr::addr_of_mut!(__wait),
+                    )
+                };
+                if __ret != 0 {
+                    break;
+                }
+                if $condition {
+                    break;
+                }
+            }
+            unsafe {
+                $crate::wait::__remove_wait_queue(
+                    __wq_ptr,
+                    core::ptr::addr_of_mut!(__wait),
+                );
+                $crate::wait::__set_current_state($crate::wait::TASK_RUNNING as i32);
+            }
+            __ret
         }
     }};
 }
@@ -390,7 +568,7 @@ pub unsafe extern "C" fn prepare_to_wait(
 pub unsafe extern "C" fn finish_wait(wq: *const WaitQueueHead, entry: *mut WaitQueueEntry) {
     assert!(!wq.is_null() && !entry.is_null());
     set_task_state(current_task_key(), TASK_RUNNING);
-    if !list_empty(unsafe { &(*entry).entry }) {
+    if !(*entry).entry.next.is_null() && !list_empty(unsafe { &(*entry).entry }) {
         let mut flags = 0u64;
         let head = wq.cast_mut();
         unsafe { spin_lock_irqsave(&mut (*head).lock, &mut flags) };
@@ -469,5 +647,209 @@ pub extern "C" fn __var_waitqueue(addr: *mut c_void) -> *mut WaitQueueHead {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wake_up_var(addr: *mut c_void) {
     unsafe { wake_up_all(&mut *__var_waitqueue(addr)) };
+}
+
+// upstream: kernel/sched/wait.c init_wait_entry()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn init_wait_entry(
+    wq_entry: *mut WaitQueueEntry,
+    flags: i32,
+) {
+    if !wq_entry.is_null() {
+        unsafe {
+            (*wq_entry).flags = flags as u32;
+            (*wq_entry).private = current_task_key() as *mut c_void;
+            (*wq_entry).func = Some(default_wake_function);
+            INIT_LIST_HEAD(core::ptr::addr_of_mut!((*wq_entry).entry));
+        }
+    }
+}
+
+// upstream: kernel/sched/wait.c prepare_to_wait_event()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prepare_to_wait_event(
+    wq_head: *mut WaitQueueHead,
+    wq_entry: *mut WaitQueueEntry,
+    state: i32,
+) -> i64 {
+    assert!(!wq_head.is_null() && !wq_entry.is_null());
+    let mut flags = 0u64;
+    unsafe { spin_lock_irqsave(&mut (*wq_head).lock, &mut flags) };
+    let mut ret = 0i64;
+    unsafe {
+        if (*wq_entry).private.is_null() {
+            (*wq_entry).private = current_task_key() as *mut c_void;
+        }
+        if (*wq_entry).func.is_none() {
+            (*wq_entry).func = Some(default_wake_function);
+        }
+    }
+    let pending = if (state as u32 & (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE)) == TASK_INTERRUPTIBLE {
+        crate::signal::signal_pending_current()
+    } else {
+        false
+    };
+    if pending {
+        unsafe { list_del_init(core::ptr::addr_of_mut!((*wq_entry).entry)) };
+        ret = -crate::config::ERESTARTSYS as i64;
+    } else {
+        unsafe {
+            if (*wq_entry).entry.next.is_null() {
+                INIT_LIST_HEAD(core::ptr::addr_of_mut!((*wq_entry).entry));
+            }
+            if list_empty(&(*wq_entry).entry) {
+                if (*wq_entry).flags & WQ_FLAG_EXCLUSIVE != 0 {
+                    list_add_tail(
+                        core::ptr::addr_of_mut!((*wq_entry).entry),
+                        core::ptr::addr_of_mut!((*wq_head).head),
+                    );
+                } else {
+                    crate::list::list_add(
+                        core::ptr::addr_of_mut!((*wq_entry).entry),
+                        core::ptr::addr_of_mut!((*wq_head).head),
+                    );
+                }
+            }
+        }
+        set_task_state(current_task_key(), state as u32);
+    }
+    unsafe { spin_unlock_irqrestore(&mut (*wq_head).lock, flags) };
+    ret
+}
+
+// upstream: kernel/sched/wait.c do_wait_intr()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn do_wait_intr(
+    wq: *mut WaitQueueHead,
+    wait: *mut WaitQueueEntry,
+) -> core::ffi::c_int {
+    assert!(!wq.is_null() && !wait.is_null());
+    unsafe {
+        if (*wait).entry.next.is_null() {
+            INIT_LIST_HEAD(core::ptr::addr_of_mut!((*wait).entry));
+        }
+        if list_empty(&(*wait).entry) {
+            list_add_tail(
+                core::ptr::addr_of_mut!((*wait).entry),
+                core::ptr::addr_of_mut!((*wq).head),
+            );
+        }
+    }
+    set_task_state(current_task_key(), TASK_INTERRUPTIBLE);
+    if crate::signal::signal_pending_current() {
+        return -crate::config::ERESTARTSYS;
+    }
+    unsafe {
+        crate::locks::spin_unlock(&mut (*wq).lock);
+        if axtask::can_block_current() {
+            axtask::yield_now();
+        } else {
+            core::hint::spin_loop();
+        }
+        crate::locks::spin_lock(&mut (*wq).lock);
+    }
+    0
+}
+
+// upstream: kernel/sched/wait.c do_wait_intr_irq()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn do_wait_intr_irq(
+    wq: *mut WaitQueueHead,
+    wait: *mut WaitQueueEntry,
+) -> core::ffi::c_int {
+    assert!(!wq.is_null() && !wait.is_null());
+    unsafe {
+        if (*wait).entry.next.is_null() {
+            INIT_LIST_HEAD(core::ptr::addr_of_mut!((*wait).entry));
+        }
+        if list_empty(&(*wait).entry) {
+            list_add_tail(
+                core::ptr::addr_of_mut!((*wait).entry),
+                core::ptr::addr_of_mut!((*wq).head),
+            );
+        }
+    }
+    set_task_state(current_task_key(), TASK_INTERRUPTIBLE);
+    if crate::signal::signal_pending_current() {
+        return -crate::config::ERESTARTSYS;
+    }
+    unsafe {
+        crate::locks::spin_unlock_irq(&mut (*wq).lock);
+        if axtask::can_block_current() {
+            axtask::yield_now();
+        } else {
+            core::hint::spin_loop();
+        }
+        crate::locks::spin_lock_irq(&mut (*wq).lock);
+    }
+    0
+}
+
+// upstream: include/linux/wait.h __remove_wait_queue()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __remove_wait_queue(
+    _wq: *mut WaitQueueHead,
+    wait: *mut WaitQueueEntry,
+) {
+    if !wait.is_null() {
+        unsafe { list_del_init(core::ptr::addr_of_mut!((*wait).entry)) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wait_event_timeout_contract() {
+        let mut wq = WaitQueueHead {
+            lock: crate::types::Spinlock::new(),
+            head: crate::types::ListHead {
+                next: core::ptr::null_mut(),
+                prev: core::ptr::null_mut(),
+            },
+        };
+        init_waitqueue_head(&mut wq);
+
+        // 1. Condition already true: returns remaining jiffies (timeout >= 1)
+        let ret = wait_event_timeout!(wq, true, 100);
+        assert_eq!(ret, 100);
+
+        // 2. Condition remains false across timeout: returns 0
+        let ret = wait_event_timeout!(wq, false, 1);
+        assert_eq!(ret, 0);
+
+        // 3. Condition becomes true at timeout: returns 1
+        let mut checked = false;
+        let ret = wait_event_timeout!(wq, {
+            if checked {
+                true
+            } else {
+                checked = true;
+                false
+            }
+        }, 1);
+        assert_eq!(ret, 1);
+
+        // 4. Interruptible timeout variant
+        let ret_intr = wait_event_interruptible_timeout!(wq, true, 50);
+        assert_eq!(ret_intr, 50);
+        let ret_intr_to = wait_event_interruptible_timeout!(wq, false, 1);
+        assert_eq!(ret_intr_to, 0);
+
+        // 5. Interruptible locked variant
+        let ret_locked = wait_event_interruptible_locked!(wq, true);
+        assert_eq!(ret_locked, 0);
+        let mut locked_checked = false;
+        let ret_locked2 = wait_event_interruptible_locked!(wq, {
+            if locked_checked {
+                true
+            } else {
+                locked_checked = true;
+                false
+            }
+        });
+        assert_eq!(ret_locked2, 0);
+    }
 }
 

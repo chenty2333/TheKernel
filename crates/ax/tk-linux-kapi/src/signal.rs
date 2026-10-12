@@ -58,7 +58,10 @@ pub unsafe fn signal_pending(task: *mut c_void) -> bool {
 /// of the callback. The local Arc clone pins that task while the provider reads
 /// its signal state.
 pub fn signal_pending_current() -> bool {
-    let task = axtask::current().clone();
+    let Some(task) = axtask::current_may_uninit() else {
+        return false;
+    };
+    let task = task.clone();
     let task_ptr = Arc::as_ptr(&task).cast_mut().cast::<c_void>();
     unsafe { signal_pending(task_ptr) }
 }
