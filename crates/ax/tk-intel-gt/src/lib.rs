@@ -637,3 +637,7 @@ pub mod intel_display_rpm_upstream;
 pub mod intel_display_rps_upstream;
 #[allow(unsafe_code)]
 pub mod intel_bo_upstream;
+#[allow(unsafe_code)]
+pub mod intel_de_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_params_upstream;
