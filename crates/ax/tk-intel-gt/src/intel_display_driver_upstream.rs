@@ -8,6 +8,7 @@ use core::ffi::{c_int, c_void};
 use crate::intel_display_core_types_upstream::IntelDisplay;
 use crate::intel_display_device_upstream::intel_display_device_present;
 use tk_drm_upstream::drm_atomic_types::DrmAtomicCommit;
+use tk_drm_upstream::drm_device_types::DrmDevice;
 use tk_drm_upstream::drm_mode_config_types::DrmModeConfigFuncs;
 use tk_drm_upstream::drm_modeset_helper_vtables_types::DrmModeConfigHelperFuncs;
 use tk_drm_upstream::drm_modeset_lock_types::DrmModesetAcquireCtx;
@@ -433,7 +434,10 @@ pub unsafe extern "C" fn intel_display_driver_suspend(display: *mut IntelDisplay
     if !has_display(display) {
         return 0;
     }
-    let state = unsafe { crate::display_pending_stubs::kapi_display::drm_atomic_helper_suspend((*display).drm) };
+    unsafe extern "C" {
+        fn drm_atomic_helper_suspend(dev: *mut DrmDevice) -> *mut DrmAtomicCommit;
+    }
+    let state = unsafe { drm_atomic_helper_suspend((*display).drm) };
     if is_err(state) {
         return -1;
     }
