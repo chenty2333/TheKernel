@@ -2196,10 +2196,10 @@ The uncommitted DRM core translations (`crates/ax/tk-drm-upstream`, batches B1a-
 and the i915 display `*_types_upstream.rs` / `*_regs_upstream.rs` modules in
 `crates/ax/tk-intel-gt` (B2.5) add verbatim-Linux lines that the excerpt scanner
 counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned
-`crates/ax` totals: threshold >=40 `(0,0,0,807,777,0,0)` (was 707/678), threshold
->=25 `(18,15,4,2178,2140,0,0)` (was 1897/1861). `crates/linux` and `kernel/src`
+`crates/ax` totals: threshold >=40 `(0,0,0,811,781,0,0)` (was 807/777 after B2e; originally 707/678), threshold
+>=25 `(18,15,4,2188,2150,0,0)` (was 2178/2140 after B2e; originally 1897/1861). `crates/linux` and `kernel/src`
 are unchanged. At >=40 the new code lines are in `tk-intel-gt` (670 code lines in
-the scope) and `tk-drm-upstream` (93).
+the scope) and `tk-drm-upstream` (97).
 
 Licensing of the translated DRM sources (checked against `/home/ava/Desktop/linux-7.2.3`):
 
@@ -2208,7 +2208,8 @@ Licensing of the translated DRM sources (checked against `/home/ava/Desktop/linu
   `drm_eld`, `drm_modeset_lock`, `drm_modeset_helper`, `drm_color_mgmt`,
   `drm_vblank`, `drm_vblank_work`, `drm_plane`, `drm_plane_helper`, `drm_crtc`,
   `drm_connector`, `drm_encoder`, `drm_mode_config`, `drm_mode_object`,
-  `drm_property`, `drm_edid`; `drm_damage_helper` is `GPL-2.0 OR MIT` (MIT option).
+  `drm_property`, `drm_edid`, `drivers/video/hdmi.c`, `drm_scdc_helper`,
+  `drm_hdmi_helper`, `drm_hdmi_state_helper`; `drm_damage_helper` is `GPL-2.0 OR MIT` (MIT option).
   Several have no SPDX line but carry the permission text; their copyright
   lines are recorded in `crates/ax/tk-drm-upstream/NOTICE`.
 - **GPL-2.0 only, flagged:** `drivers/gpu/drm/drm_managed.c` is `SPDX-License-Identifier: GPL-2.0`.
