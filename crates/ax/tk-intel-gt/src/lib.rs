@@ -624,3 +624,16 @@ pub mod vlv_dpio_phy_regs_upstream;
 pub mod vlv_dsi_regs_upstream;
 
 pub mod display_pending_stubs;
+
+#[allow(unsafe_code)]
+pub mod intel_display_conversion_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_utils_upstream;
+#[allow(unsafe_code)]
+pub mod intel_parent_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_rpm_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_rps_upstream;
+#[allow(unsafe_code)]
+pub mod intel_bo_upstream;
