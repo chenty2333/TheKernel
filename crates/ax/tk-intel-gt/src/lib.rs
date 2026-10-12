@@ -622,3 +622,5 @@ pub mod skl_watermark_regs_upstream;
 pub mod vlv_dpio_phy_regs_upstream;
 #[allow(unsafe_code)]
 pub mod vlv_dsi_regs_upstream;
+
+pub mod display_pending_stubs;
