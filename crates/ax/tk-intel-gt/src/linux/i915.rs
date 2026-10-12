@@ -499,16 +499,7 @@ pub unsafe fn HAS_3D_PIPELINE<P: I915PrivatePtr>(i915: P) -> bool {
     !info.is_null() && (unsafe { (*info).flags[1] } & 1) != 0
 }
 
-/// Prefix overlay for `drm_i915_private.__runtime`. Offset and runtime size
-/// were obtained from the source kernel's x86_64 v7.2.3 compile configuration.
-#[repr(C)]
-pub struct DrmI915RuntimeOverlay {
-    _prefix: [u8; 1656],
-    pub runtime: IntelRuntimeInfo,
-}
-
 const _: [(); 36] = [(); size_of::<IntelRuntimeInfo>()];
-const _: [(); 1656] = [(); offset_of!(DrmI915RuntimeOverlay, runtime)];
 const _: [(); 3] = [(); offset_of!(IntelRuntimeInfo, media)];
 const _: [(); 8] = [(); offset_of!(IntelRuntimeInfo, platform_mask)];
 const _: [(); 16] = [(); offset_of!(IntelRuntimeInfo, device_id)];
@@ -544,7 +535,9 @@ impl I915PrivatePtr for *mut DrmI915Private {
 
 #[inline]
 pub unsafe fn runtime_info<P: I915PrivatePtr>(i915: P) -> *const IntelRuntimeInfo {
-    core::ptr::addr_of!((*i915.as_i915_private().cast::<DrmI915RuntimeOverlay>()).runtime)
+    // Through the asserted DrmI915Private layout, never a fixed-offset prefix:
+    // `runtime` moves whenever `drm_device` does.
+    core::ptr::addr_of!((*i915.as_i915_private().cast::<DrmI915Private>()).runtime)
 }
 
 #[allow(non_snake_case)]
@@ -888,34 +881,35 @@ pub unsafe fn guc_to_gt(guc: *mut crate::intel_guc_types_upstream::IntelGuc) -> 
 mod tests {
     use super::*;
 
-    #[repr(C)]
-    struct RuntimeFixture {
-        _prefix: [u8; 1656],
-        runtime: IntelRuntimeInfo,
+    #[test]
+    fn runtime_info_reads_the_drm_i915_private_runtime_field() {
+        let storage = alloc::boxed::Box::<core::mem::MaybeUninit<DrmI915Private>>::new_zeroed();
+        let i915 = storage.as_ptr().cast::<DrmI915Private>();
+        let runtime = unsafe { runtime_info(i915) } as usize;
+        assert_eq!(runtime - i915 as usize, offset_of!(DrmI915Private, runtime));
     }
 
     #[test]
     fn runtime_version_and_platform_masks_follow_i915_layout() {
-        let mut fixture = RuntimeFixture {
-            _prefix: [0; 1656],
-            runtime: IntelRuntimeInfo::default(),
-        };
-        fixture.runtime.graphics.ip = IntelIpVersion {
+        let mut storage = alloc::boxed::Box::<core::mem::MaybeUninit<DrmI915Private>>::new_zeroed();
+        let fixture = storage.as_mut_ptr().cast::<DrmI915Private>();
+        let runtime = unsafe { &mut (*fixture).runtime };
+        runtime.graphics.ip = IntelIpVersion {
             ver: 12,
             rel: 55,
             step: 0,
         };
-        fixture.runtime.media.ip = IntelIpVersion {
+        runtime.media.ip = IntelIpVersion {
             ver: 12,
             rel: 0,
             step: 0,
         };
-        fixture.runtime.step.graphics_step = STEP_A0;
+        runtime.step.graphics_step = STEP_A0;
         let dg2_index = INTEL_DG2 / PLATFORM_MASK_BITS;
         let dg2_bit = INTEL_DG2 % PLATFORM_MASK_BITS + 4;
-        fixture.runtime.platform_mask[dg2_index as usize] = (1 << dg2_bit) | 1;
+        runtime.platform_mask[dg2_index as usize] = (1 << dg2_bit) | 1;
 
-        let i915 = (&mut fixture as *mut RuntimeFixture).cast::<c_void>();
+        let i915 = fixture.cast::<c_void>();
         unsafe {
             assert_eq!(GRAPHICS_VER(i915), 12);
             assert_eq!(GRAPHICS_VER_FULL(i915), IP_VER(12, 55));
