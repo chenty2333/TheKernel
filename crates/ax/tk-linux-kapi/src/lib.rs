@@ -114,3 +114,5 @@ pub mod iopoll;
 pub mod i2c;
 #[allow(unsafe_code)]
 pub mod i2c_algo_bit;
+#[allow(unsafe_code)]
+pub mod dma_fence_chain;
