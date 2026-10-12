@@ -54,3 +54,30 @@ pub unsafe extern "C" fn drm_gem_handle_create(_file_priv: *mut DrmFile, _obj: *
 pub unsafe extern "C" fn drm_is_current_master(_file_priv: *mut DrmFile) -> bool {
     true
 }
+
+// upstream: drivers/dma-buf/dma-fence.c dma_fence_put()
+#[cfg(test)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_fence_put(_fence: *mut DmaFence) {}
+
+#[cfg(test)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_dev_get(dev: *mut crate::drm_device_types::DrmDevice) -> *mut crate::drm_device_types::DrmDevice {
+    dev
+}
+
+#[cfg(test)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_dev_put(_dev: *mut crate::drm_device_types::DrmDevice) {}
+
+#[cfg(test)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sync_file_create(_fence: *mut DmaFence) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+#[cfg(test)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sync_file_get_fence(_fd: i32) -> *mut DmaFence {
+    core::ptr::null_mut()
+}

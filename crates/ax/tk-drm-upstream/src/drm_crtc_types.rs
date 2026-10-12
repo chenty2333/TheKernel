@@ -56,6 +56,92 @@ pub struct DrmCrtcState {
     pub state: *mut DrmAtomicCommit,
 }
 
+impl DrmCrtcState {
+    #[inline]
+    pub fn planes_changed(&self) -> bool {
+        (self._bitfields_10[0] & 1) != 0
+    }
+
+    #[inline]
+    pub fn set_planes_changed(&mut self, val: bool) {
+        if val {
+            self._bitfields_10[0] |= 1;
+        } else {
+            self._bitfields_10[0] &= !1;
+        }
+    }
+
+    #[inline]
+    pub fn mode_changed(&self) -> bool {
+        (self._bitfields_10[0] & (1 << 1)) != 0
+    }
+
+    #[inline]
+    pub fn set_mode_changed(&mut self, val: bool) {
+        if val {
+            self._bitfields_10[0] |= 1 << 1;
+        } else {
+            self._bitfields_10[0] &= !(1 << 1);
+        }
+    }
+
+    #[inline]
+    pub fn active_changed(&self) -> bool {
+        (self._bitfields_10[0] & (1 << 2)) != 0
+    }
+
+    #[inline]
+    pub fn set_active_changed(&mut self, val: bool) {
+        if val {
+            self._bitfields_10[0] |= 1 << 2;
+        } else {
+            self._bitfields_10[0] &= !(1 << 2);
+        }
+    }
+
+    #[inline]
+    pub fn connectors_changed(&self) -> bool {
+        (self._bitfields_10[0] & (1 << 3)) != 0
+    }
+
+    #[inline]
+    pub fn set_connectors_changed(&mut self, val: bool) {
+        if val {
+            self._bitfields_10[0] |= 1 << 3;
+        } else {
+            self._bitfields_10[0] &= !(1 << 3);
+        }
+    }
+
+    #[inline]
+    pub fn zpos_changed(&self) -> bool {
+        (self._bitfields_10[0] & (1 << 4)) != 0
+    }
+
+    #[inline]
+    pub fn set_zpos_changed(&mut self, val: bool) {
+        if val {
+            self._bitfields_10[0] |= 1 << 4;
+        } else {
+            self._bitfields_10[0] &= !(1 << 4);
+        }
+    }
+
+    #[inline]
+    pub fn color_mgmt_changed(&self) -> bool {
+        (self._bitfields_10[0] & (1 << 5)) != 0
+    }
+
+    #[inline]
+    pub fn set_color_mgmt_changed(&mut self, val: bool) {
+        if val {
+            self._bitfields_10[0] |= 1 << 5;
+        } else {
+            self._bitfields_10[0] &= !(1 << 5);
+        }
+    }
+}
+
 #[repr(C)]
 pub struct DrmCrtcFuncs {
     pub reset: Option<unsafe extern "C" fn(*mut DrmCrtc)>,

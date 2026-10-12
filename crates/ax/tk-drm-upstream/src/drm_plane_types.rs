@@ -61,6 +61,22 @@ pub struct DrmPlaneState {
     pub _bitfields_176: [u8; 1],
 }
 
+impl DrmPlaneState {
+    #[inline]
+    pub fn color_mgmt_changed(&self) -> bool {
+        (self._bitfields_176[0] & 1) != 0
+    }
+
+    #[inline]
+    pub fn set_color_mgmt_changed(&mut self, val: bool) {
+        if val {
+            self._bitfields_176[0] |= 1;
+        } else {
+            self._bitfields_176[0] &= !1;
+        }
+    }
+}
+
 #[repr(C)]
 pub struct DrmPlaneFuncs {
     pub update_plane: Option<unsafe extern "C" fn(*mut DrmPlane, *mut DrmCrtc, *mut DrmFramebuffer, i32, i32, u32, u32, u32, u32, u32, u32, *mut DrmModesetAcquireCtx) -> i32>,
