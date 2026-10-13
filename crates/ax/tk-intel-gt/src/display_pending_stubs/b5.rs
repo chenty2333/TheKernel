@@ -8,9 +8,8 @@
 
 use crate::intel_display_core_types_upstream::IntelDisplay;
 
-// upstream: intel_dkl_phy.c intel_dkl_phy_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dkl_phy_init(_display: *mut IntelDisplay) {}
+pub use crate::intel_combo_phy_upstream::{intel_combo_phy_init, intel_combo_phy_uninit};
+pub use crate::intel_dkl_phy_upstream::intel_dkl_phy_init;
 
 // upstream: intel_dpll.c intel_dpll_init_clock_hook()
 #[unsafe(no_mangle)]
@@ -23,11 +22,3 @@ pub unsafe extern "C" fn intel_dpll_init(_display: *mut IntelDisplay) {}
 // upstream: intel_dpll.c intel_dpll_update_ref_clks()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_dpll_update_ref_clks(_display: *mut IntelDisplay) {}
-
-// upstream: intel_combo_phy.c intel_combo_phy_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_combo_phy_init(_display: *mut IntelDisplay) {}
-
-// upstream: intel_combo_phy.c intel_combo_phy_uninit()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_combo_phy_uninit(_display: *mut IntelDisplay) {}

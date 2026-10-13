@@ -712,6 +712,14 @@ pub mod intel_display_power_map_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_power_upstream;
 #[allow(unsafe_code)]
+pub mod intel_combo_phy_upstream;
+#[allow(unsafe_code)]
+pub mod intel_ddi_buf_trans_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dkl_phy_upstream;
+#[allow(unsafe_code)]
+pub mod intel_tc_upstream;
+#[allow(unsafe_code)]
 pub mod intel_dmc_upstream;
 #[allow(unsafe_code)]
 pub mod intel_dmc_wl_upstream;
