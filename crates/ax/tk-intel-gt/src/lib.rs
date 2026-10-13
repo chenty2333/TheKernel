@@ -539,6 +539,8 @@ pub mod intel_display_irq_types_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_limits_types_upstream;
 #[allow(unsafe_code)]
+pub mod intel_display_upstream;
+#[allow(unsafe_code)]
 pub mod intel_display_params_types_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_power_types_upstream;

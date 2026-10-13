@@ -14,13 +14,12 @@ use tk_drm_upstream::{
     uapi_drm_mode_types::DrmModeFbCmd2,
 };
 
-use crate::{
-    intel_display_core_types_upstream::IntelDisplay, 
-    intel_workarounds_types_upstream::I915RegT,
-};
 pub use crate::{
-    intel_atomic_upstream::{intel_atomic_state_alloc, intel_atomic_state_clear, intel_atomic_state_free},
+    intel_atomic_upstream::{
+        intel_atomic_state_alloc, intel_atomic_state_clear, intel_atomic_state_free,
+    },
     intel_crtc_upstream::{intel_crtc_for_pipe, intel_crtc_init},
+    intel_display_upstream::intel_atomic_check,
     intel_wm_upstream::{
         intel_atomic_update_watermarks, intel_compute_global_watermarks, intel_initial_watermarks,
         intel_optimize_watermarks, intel_print_wm_latency, intel_update_watermarks,
@@ -41,7 +40,9 @@ pub use crate::{
         skl_wm_get_hw_state, skl_wm_init, skl_wm_plane_disable_noatomic, skl_wm_sanitize,
         skl_wm0_prefill_lines, skl_wm0_prefill_lines_worst,
     },
-
+};
+use crate::{
+    intel_display_core_types_upstream::IntelDisplay, intel_workarounds_types_upstream::I915RegT,
 };
 
 // upstream: intel_fb.c intel_user_framebuffer_create()
@@ -65,17 +66,6 @@ pub unsafe extern "C" fn intel_fb_get_format_info(
     core::ptr::null_mut()
 }
 
-// The ADL-P atomic validation and commit callbacks are owned by B7a's
-// intel_display.c translation. Fail closed until that complete path is wired;
-// returning success here would falsely accept an unchecked state.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_atomic_check(
-    _dev: *mut DrmDevice,
-    _state: *mut DrmAtomicCommit,
-) -> i32 {
-    -tk_linux_kapi::config::EOPNOTSUPP
-}
-
 // B7a also owns intel_atomic_commit(); never claim a no-op commit succeeded.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_atomic_commit(
@@ -89,9 +79,6 @@ pub unsafe extern "C" fn intel_atomic_commit(
 // upstream: intel_cursor.c intel_cursor_mode_config_init()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_cursor_mode_config_init(_display: *mut IntelDisplay) {}
-
-
-
 
 // upstream: intel_initial_plane.c intel_initial_plane_config()
 #[unsafe(no_mangle)]
