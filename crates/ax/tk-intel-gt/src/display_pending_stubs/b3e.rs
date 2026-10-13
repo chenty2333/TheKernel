@@ -46,3 +46,11 @@ pub unsafe extern "C" fn intel_cdclk_clock_changed(
 ) -> bool {
     false
 }
+
+// upstream: intel_cdclk.c intel_cdclk_init_hw()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_init_hw(_display: *mut IntelDisplay) {}
+
+// upstream: intel_cdclk.c intel_cdclk_uninit_hw()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_uninit_hw(_display: *mut IntelDisplay) {}

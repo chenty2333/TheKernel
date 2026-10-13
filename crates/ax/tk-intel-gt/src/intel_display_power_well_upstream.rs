@@ -21,14 +21,20 @@ use crate::intel_display_power_well_types_upstream::{
     SKL_DISP_PW_2, SKL_DISP_PW_MISC_IO, TGL_DISP_PW_TC_COLD_OFF,
 };
 use crate::intel_display_regs_upstream::{
-    DC_STATE_DISABLE, DC_STATE_EN, DC_STATE_EN_DC3CO, DC_STATE_EN_UPTO_DC5,
-    DC_STATE_EN_UPTO_DC5_DC6_MASK, DC_STATE_EN_UPTO_DC6, GEN8_CHICKEN_DCPR_1,
-    HSW_PWR_WELL_CTL1, HSW_PWR_WELL_CTL2, HSW_PWR_WELL_CTL3, HSW_PWR_WELL_CTL4,
-    HSW_PWR_WELL_CTL_REQ, HSW_PWR_WELL_CTL_STATE, ICL_PW_CTL_IDX_PW_1,
-    ICL_PWR_WELL_CTL_AUX1, ICL_PWR_WELL_CTL_AUX2, ICL_PWR_WELL_CTL_AUX4,
-    ICL_PWR_WELL_CTL_DDI1, ICL_PWR_WELL_CTL_DDI2, ICL_PWR_WELL_CTL_DDI4,
-    SKL_FUSE_STATUS, SKL_PW_CTL_IDX_PW_1,
+    CLKGATE_DIS_DSSDSC, DC_STATE_DC3CO_STATUS, DC_STATE_DISABLE, DC_STATE_EN, DC_STATE_EN_DC3CO,
+    DC_STATE_EN_DC9, DC_STATE_EN_UPTO_DC5, DC_STATE_EN_UPTO_DC5_DC6_MASK, DC_STATE_EN_UPTO_DC6,
+    DSS_PIPE_A_GATING_DISABLED, DSS_PIPE_B_GATING_DISABLED, DSS_PIPE_C_GATING_DISABLED,
+    DSS_PIPE_D_GATING_DISABLED, GEN8_CHICKEN_DCPR_1, HSW_PWR_WELL_CTL1, HSW_PWR_WELL_CTL2,
+    HSW_PWR_WELL_CTL3, HSW_PWR_WELL_CTL4, HSW_PWR_WELL_CTL_REQ, HSW_PWR_WELL_CTL_STATE,
+    ICL_PW_CTL_IDX_AUX_A, ICL_PW_CTL_IDX_AUX_B, ICL_PW_CTL_IDX_AUX_TBT1, ICL_PW_CTL_IDX_PW_1,
+    ICL_PWR_WELL_CTL_AUX1, ICL_PWR_WELL_CTL_AUX2, ICL_PWR_WELL_CTL_AUX4, ICL_PWR_WELL_CTL_DDI1,
+    ICL_PWR_WELL_CTL_DDI2, ICL_PWR_WELL_CTL_DDI4, SKL_FUSE_STATUS, SKL_PW_CTL_IDX_PW_1,
 };
+use crate::intel_combo_phy_regs_upstream::{
+    ICL_PORT_CL_DW12, ICL_LANE_ENABLE_AUX, ICL_PORT_TX_DW6_AUX, O_FUNC_OVRD_EN, O_LDO_BYPASS_CRI,
+};
+use crate::intel_display_wa_upstream::{__intel_display_wa, IntelDisplayWa};
+use crate::intel_dp_aux_regs_upstream::{DP_AUX_CH_CTL, DP_AUX_CH_CTL_TBT_IO};
 use crate::intel_display_reg_defs_upstream::mmio;
 use crate::intel_parent_upstream::intel_parent_pcode_read;
 use crate::intel_workarounds_types_upstream::I915RegT;
@@ -452,6 +458,230 @@ unsafe fn pw_idx_to_pg(display: *mut IntelDisplay, pw_idx: i32) -> u32 {
     (pw_idx - pw1_idx + 1) as u32
 }
 
+// upstream: intel_display_power_well.c dss_pipe_gating_bits()
+unsafe fn dss_pipe_gating_bits(irq_pipe_mask: u8) -> u32 {
+    let mut bits = 0u32;
+    if (irq_pipe_mask & (1 << 0)) != 0 {
+        bits |= DSS_PIPE_A_GATING_DISABLED;
+    }
+    if (irq_pipe_mask & (1 << 1)) != 0 {
+        bits |= DSS_PIPE_B_GATING_DISABLED;
+    }
+    if (irq_pipe_mask & (1 << 2)) != 0 {
+        bits |= DSS_PIPE_C_GATING_DISABLED;
+    }
+    if (irq_pipe_mask & (1 << 3)) != 0 {
+        bits |= DSS_PIPE_D_GATING_DISABLED;
+    }
+    bits
+}
+
+// upstream: intel_display_power_well.c dss_pipe_gating_enable_disable()
+unsafe fn dss_pipe_gating_enable_disable(
+    display: *mut IntelDisplay,
+    irq_pipe_mask: u8,
+    disable: bool,
+) {
+    let bits = dss_pipe_gating_bits(irq_pipe_mask);
+    if bits == 0 {
+        return;
+    }
+    let set = if disable { bits } else { 0 };
+    let clear = if disable { 0 } else { bits };
+    intel_de_rmw(display, CLKGATE_DIS_DSSDSC, clear, set);
+}
+
+// upstream: intel_display_power_well.c hsw_power_well_post_enable()
+unsafe fn hsw_power_well_post_enable(display: *mut IntelDisplay, irq_pipe_mask: u8) {
+    if irq_pipe_mask != 0 {
+        gen8_irq_power_well_post_enable(display, irq_pipe_mask);
+        if __intel_display_wa(display, IntelDisplayWa::Wa22021048059, core::ptr::null()) {
+            dss_pipe_gating_enable_disable(display, irq_pipe_mask, false);
+        }
+    }
+}
+
+// upstream: intel_display_power_well.c hsw_power_well_pre_disable()
+unsafe fn hsw_power_well_pre_disable(display: *mut IntelDisplay, irq_pipe_mask: u8) {
+    if irq_pipe_mask != 0 {
+        if __intel_display_wa(display, IntelDisplayWa::Wa22021048059, core::ptr::null()) {
+            dss_pipe_gating_enable_disable(display, irq_pipe_mask, true);
+        }
+        gen8_irq_power_well_pre_disable(display, irq_pipe_mask);
+    }
+}
+
+// upstream: intel_display_power_well.c icl_aux_pw_to_ch()
+unsafe fn icl_aux_pw_to_ch(power_well: *const I915PowerWell) -> i32 {
+    if power_well.is_null() {
+        return 0;
+    }
+    let pw_idx = unsafe { pw_hsw_idx(power_well) };
+    let is_tc_tbt = unsafe { !(*power_well).desc.is_null() && desc_is_tc_tbt((*power_well).desc) };
+    if is_tc_tbt {
+        (pw_idx.saturating_sub(ICL_PW_CTL_IDX_AUX_TBT1) + 2) as i32
+    } else {
+        pw_idx.saturating_sub(ICL_PW_CTL_IDX_AUX_A) as i32
+    }
+}
+
+// upstream: intel_display_power_well.c aux_ch_to_digital_port()
+unsafe fn aux_ch_to_digital_port(
+    _display: *mut IntelDisplay,
+    _aux_ch: i32,
+) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+// upstream: intel_display_power_well.c icl_aux_pw_to_encoder()
+unsafe fn icl_aux_pw_to_encoder(
+    display: *mut IntelDisplay,
+    power_well: *const I915PowerWell,
+) -> *mut c_void {
+    let aux_ch = icl_aux_pw_to_ch(power_well);
+    aux_ch_to_digital_port(display, aux_ch)
+}
+
+// upstream: intel_display_power_well.c icl_aux_pw_to_phy()
+unsafe fn icl_aux_pw_to_phy(
+    _display: *mut IntelDisplay,
+    power_well: *const I915PowerWell,
+) -> u32 {
+    if power_well.is_null() {
+        return 0;
+    }
+    let pw_idx = unsafe { pw_hsw_idx(power_well) };
+    pw_idx.saturating_sub(ICL_PW_CTL_IDX_AUX_A)
+}
+
+// upstream: intel_display_power_well.c icl_aux_pw_is_tc_phy()
+unsafe fn icl_aux_pw_is_tc_phy(
+    _display: *mut IntelDisplay,
+    _power_well: *const I915PowerWell,
+) -> bool {
+    false
+}
+
+// upstream: intel_display_power_well.c intel_aux_ch_is_edp()
+unsafe fn intel_aux_ch_is_edp(_display: *mut IntelDisplay, _aux_ch: i32) -> bool {
+    false
+}
+
+// upstream: intel_display_power_well.c icl_combo_phy_aux_power_well_enable()
+unsafe fn icl_combo_phy_aux_power_well_enable(
+    display: *mut IntelDisplay,
+    power_well: *mut I915PowerWell,
+) {
+    let ops = unsafe { (*(*power_well).desc).ops as *const I915PowerWellOps };
+    let regs = unsafe { (*ops).regs };
+    if regs.is_null() {
+        return;
+    }
+    let pw_idx = unsafe { pw_hsw_idx(power_well) };
+
+    intel_de_rmw(display, (*regs).driver, 0, HSW_PWR_WELL_CTL_REQ(pw_idx));
+    intel_de_rmw(
+        display,
+        ICL_PORT_CL_DW12(pw_idx.saturating_sub(ICL_PW_CTL_IDX_AUX_A)),
+        0,
+        ICL_LANE_ENABLE_AUX,
+    );
+    hsw_wait_for_power_well_enable(display, power_well, false);
+
+    if pw_idx >= ICL_PW_CTL_IDX_AUX_A
+        && pw_idx <= ICL_PW_CTL_IDX_AUX_B
+        && !intel_aux_ch_is_edp(display, (pw_idx - ICL_PW_CTL_IDX_AUX_A) as i32)
+    {
+        intel_de_rmw(
+            display,
+            ICL_PORT_TX_DW6_AUX(pw_idx - ICL_PW_CTL_IDX_AUX_A),
+            0,
+            O_FUNC_OVRD_EN | O_LDO_BYPASS_CRI,
+        );
+    }
+}
+
+// upstream: intel_display_power_well.c icl_combo_phy_aux_power_well_disable()
+unsafe fn icl_combo_phy_aux_power_well_disable(
+    display: *mut IntelDisplay,
+    power_well: *mut I915PowerWell,
+) {
+    let ops = unsafe { (*(*power_well).desc).ops as *const I915PowerWellOps };
+    let regs = unsafe { (*ops).regs };
+    if regs.is_null() {
+        return;
+    }
+    let pw_idx = unsafe { pw_hsw_idx(power_well) };
+
+    intel_de_rmw(
+        display,
+        ICL_PORT_CL_DW12(pw_idx.saturating_sub(ICL_PW_CTL_IDX_AUX_A)),
+        ICL_LANE_ENABLE_AUX,
+        0,
+    );
+    intel_de_rmw(display, (*regs).driver, HSW_PWR_WELL_CTL_REQ(pw_idx), 0);
+    hsw_wait_for_power_well_disable(display, power_well);
+}
+
+// upstream: intel_display_power_well.c icl_tc_port_assert_ref_held()
+unsafe fn icl_tc_port_assert_ref_held(
+    _display: *mut IntelDisplay,
+    _power_well: *mut I915PowerWell,
+    _dig_port: *mut c_void,
+) {}
+
+// upstream: intel_display_power_well.c icl_tc_cold_exit()
+unsafe fn icl_tc_cold_exit(display: *mut IntelDisplay) {
+    let mut tries = 0;
+    while tries < 3 {
+        let ret = crate::intel_parent_upstream::intel_parent_pcode_write(
+            display,
+            0x26, // ICL_PCODE_EXIT_TCCOLD
+            0,
+        );
+        if ret != -11 {
+            break;
+        }
+        tries += 1;
+    }
+}
+
+// upstream: intel_display_power_well.c icl_tc_phy_aux_power_well_enable()
+unsafe fn icl_tc_phy_aux_power_well_enable(
+    display: *mut IntelDisplay,
+    power_well: *mut I915PowerWell,
+) {
+    let aux_ch = icl_aux_pw_to_ch(power_well);
+    let dig_port = aux_ch_to_digital_port(display, aux_ch);
+    let ops = unsafe { (*(*power_well).desc).ops as *const I915PowerWellOps };
+    let regs = unsafe { (*ops).regs };
+    if regs.is_null() {
+        return;
+    }
+    let is_tbt = unsafe { !(*power_well).desc.is_null() && desc_is_tc_tbt((*power_well).desc) };
+
+    icl_tc_port_assert_ref_held(display, power_well, dig_port);
+
+    intel_de_rmw(
+        display,
+        DP_AUX_CH_CTL(aux_ch as u32),
+        DP_AUX_CH_CTL_TBT_IO,
+        if is_tbt { DP_AUX_CH_CTL_TBT_IO } else { 0 },
+    );
+    intel_de_rmw(
+        display,
+        (*regs).driver,
+        0,
+        HSW_PWR_WELL_CTL_REQ(pw_hsw_idx(power_well)),
+    );
+
+    if display_ver(display) == 11 {
+        icl_tc_cold_exit(display);
+    }
+
+    hsw_wait_for_power_well_enable(display, power_well, is_tbt);
+}
+
 unsafe extern "C" fn hsw_power_well_enable(
     display: *mut IntelDisplay,
     power_well: *mut I915PowerWell,
@@ -482,9 +712,7 @@ unsafe extern "C" fn hsw_power_well_enable(
         }
 
         let irq_mask = desc_irq_pipe_mask((*power_well).desc);
-        if irq_mask != 0 {
-            gen8_irq_power_well_post_enable(display, irq_mask);
-        }
+        hsw_power_well_post_enable(display, irq_mask);
     }
 }
 
@@ -499,9 +727,7 @@ unsafe extern "C" fn hsw_power_well_disable(
 
     unsafe {
         let irq_mask = desc_irq_pipe_mask((*power_well).desc);
-        if irq_mask != 0 {
-            gen8_irq_power_well_pre_disable(display, irq_mask);
-        }
+        hsw_power_well_pre_disable(display, irq_mask);
 
         intel_de_rmw(display, (*regs).driver, HSW_PWR_WELL_CTL_REQ(pw_idx), 0);
         hsw_wait_for_power_well_disable(display, power_well);
@@ -544,18 +770,36 @@ unsafe extern "C" fn hsw_power_well_enabled(
     }
 }
 
+// upstream: intel_display_power_well.c icl_aux_power_well_enable()
 unsafe extern "C" fn icl_aux_power_well_enable(
     display: *mut IntelDisplay,
     power_well: *mut I915PowerWell,
 ) {
-    hsw_power_well_enable(display, power_well);
+    unsafe {
+        if icl_aux_pw_is_tc_phy(display, power_well) {
+            icl_tc_phy_aux_power_well_enable(display, power_well);
+        } else if (*display).platform._anon_0_0.bitmap[0] & (1u64 << 51) != 0 {
+            icl_combo_phy_aux_power_well_enable(display, power_well);
+        } else {
+            hsw_power_well_enable(display, power_well);
+        }
+    }
 }
 
+// upstream: intel_display_power_well.c icl_aux_power_well_disable()
 unsafe extern "C" fn icl_aux_power_well_disable(
     display: *mut IntelDisplay,
     power_well: *mut I915PowerWell,
 ) {
-    hsw_power_well_disable(display, power_well);
+    unsafe {
+        if icl_aux_pw_is_tc_phy(display, power_well) {
+            hsw_power_well_disable(display, power_well);
+        } else if (*display).platform._anon_0_0.bitmap[0] & (1u64 << 51) != 0 {
+            icl_combo_phy_aux_power_well_disable(display, power_well);
+        } else {
+            hsw_power_well_disable(display, power_well);
+        }
+    }
 }
 
 unsafe extern "C" fn gen9_dc_off_power_well_enable(
@@ -720,80 +964,293 @@ pub static tgl_tc_cold_off_ops: I915PowerWellOps = I915PowerWellOps {
     is_enabled: Some(tgl_tc_cold_off_power_well_is_enabled),
 };
 
+// upstream: intel_display_power_well.c bxt_dpio_cmn_power_well_enable()
+// skipped: not display 13
+unsafe extern "C" fn bxt_dpio_cmn_power_well_enable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c bxt_dpio_cmn_power_well_disable()
+// skipped: not display 13
+unsafe extern "C" fn bxt_dpio_cmn_power_well_disable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c bxt_dpio_cmn_power_well_enabled()
+// skipped: not display 13
+unsafe extern "C" fn bxt_dpio_cmn_power_well_enabled(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) -> bool {
+    false
+}
+
+// upstream: intel_display_power_well.c bxt_verify_dpio_phy_power_wells()
+// skipped: not display 13
+unsafe fn bxt_verify_dpio_phy_power_wells(_display: *mut IntelDisplay) {}
+
+// upstream: intel_display_power_well.c chv_dpio_cmn_power_well_enable()
+// skipped: not display 13
+unsafe extern "C" fn chv_dpio_cmn_power_well_enable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c chv_dpio_cmn_power_well_disable()
+// skipped: not display 13
+unsafe extern "C" fn chv_dpio_cmn_power_well_disable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c chv_pipe_power_well_enable()
+// skipped: not display 13
+unsafe extern "C" fn chv_pipe_power_well_enable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c chv_pipe_power_well_disable()
+// skipped: not display 13
+unsafe extern "C" fn chv_pipe_power_well_disable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c chv_pipe_power_well_enabled()
+// skipped: not display 13
+unsafe extern "C" fn chv_pipe_power_well_enabled(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) -> bool {
+    false
+}
+
+// upstream: intel_display_power_well.c chv_pipe_power_well_sync_hw()
+// skipped: not display 13
+unsafe extern "C" fn chv_pipe_power_well_sync_hw(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c chv_set_pipe_power_well()
+// skipped: not display 13
+unsafe fn chv_set_pipe_power_well(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell, _enable: bool) {}
+
+// upstream: intel_display_power_well.c assert_chv_phy_powergate()
+// skipped: not display 13
+unsafe fn assert_chv_phy_powergate(_display: *mut IntelDisplay, _phy: u32, _ch: u32, _override_val: bool, _mask: u32) {}
+
+// upstream: intel_display_power_well.c assert_chv_phy_status()
+// skipped: not display 13
+unsafe fn assert_chv_phy_status(_display: *mut IntelDisplay) {}
+
+// upstream: intel_display_power_well.c i830_pipes_power_well_enable()
+// skipped: not display 13
+unsafe extern "C" fn i830_pipes_power_well_enable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c i830_pipes_power_well_disable()
+// skipped: not display 13
+unsafe extern "C" fn i830_pipes_power_well_disable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c i830_pipes_power_well_enabled()
+// skipped: not display 13
+unsafe extern "C" fn i830_pipes_power_well_enabled(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) -> bool {
+    false
+}
+
+// upstream: intel_display_power_well.c i830_pipes_power_well_sync_hw()
+// skipped: not display 13
+unsafe extern "C" fn i830_pipes_power_well_sync_hw(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c vlv_display_power_well_init()
+// skipped: not display 13
+unsafe fn vlv_display_power_well_init(_display: *mut IntelDisplay) {}
+
+// upstream: intel_display_power_well.c vlv_display_power_well_deinit()
+// skipped: not display 13
+unsafe fn vlv_display_power_well_deinit(_display: *mut IntelDisplay) {}
+
+// upstream: intel_display_power_well.c vlv_display_power_well_enable()
+// skipped: not display 13
+unsafe extern "C" fn vlv_display_power_well_enable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c vlv_display_power_well_disable()
+// skipped: not display 13
+unsafe extern "C" fn vlv_display_power_well_disable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c vlv_dpio_cmn_power_well_enable()
+// skipped: not display 13
+unsafe extern "C" fn vlv_dpio_cmn_power_well_enable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c vlv_dpio_cmn_power_well_disable()
+// skipped: not display 13
+unsafe extern "C" fn vlv_dpio_cmn_power_well_disable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c vlv_init_display_clock_gating()
+// skipped: not display 13
+unsafe fn vlv_init_display_clock_gating(_display: *mut IntelDisplay) {}
+
+// upstream: intel_display_power_well.c vlv_power_well_enable()
+// skipped: not display 13
+unsafe extern "C" fn vlv_power_well_enable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c vlv_power_well_disable()
+// skipped: not display 13
+unsafe extern "C" fn vlv_power_well_disable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c vlv_power_well_enabled()
+// skipped: not display 13
+unsafe extern "C" fn vlv_power_well_enabled(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) -> bool {
+    false
+}
+
+// upstream: intel_display_power_well.c vlv_set_power_well()
+// skipped: not display 13
+unsafe fn vlv_set_power_well(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell, _enable: bool) {}
+
+// upstream: intel_display_power_well.c xe2lpd_pica_power_well_enable()
+// skipped: not display 13
+unsafe extern "C" fn xe2lpd_pica_power_well_enable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c xe2lpd_pica_power_well_disable()
+// skipped: not display 13
+unsafe extern "C" fn xe2lpd_pica_power_well_disable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c xe2lpd_pica_power_well_enabled()
+// skipped: not display 13
+unsafe extern "C" fn xe2lpd_pica_power_well_enabled(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) -> bool {
+    false
+}
+
+// upstream: intel_display_power_well.c xelpdp_aux_power_well_enable()
+// skipped: not display 13
+unsafe extern "C" fn xelpdp_aux_power_well_enable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c xelpdp_aux_power_well_disable()
+// skipped: not display 13
+unsafe extern "C" fn xelpdp_aux_power_well_disable(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) {}
+
+// upstream: intel_display_power_well.c xelpdp_aux_power_well_enabled()
+// skipped: not display 13
+unsafe extern "C" fn xelpdp_aux_power_well_enabled(_display: *mut IntelDisplay, _power_well: *mut I915PowerWell) -> bool {
+    false
+}
+
 // Platform stubs (non-Display-13)
 pub static chv_pipe_power_well_ops: I915PowerWellOps = I915PowerWellOps {
     regs: core::ptr::null(),
-    sync_hw: Some(i9xx_power_well_sync_hw_noop),
-    enable: Some(i9xx_always_on_power_well_noop),
-    disable: Some(i9xx_always_on_power_well_noop),
-    is_enabled: Some(non_display_13_power_well_disabled),
+    sync_hw: Some(chv_pipe_power_well_sync_hw),
+    enable: Some(chv_pipe_power_well_enable),
+    disable: Some(chv_pipe_power_well_disable),
+    is_enabled: Some(chv_pipe_power_well_enabled),
 };
 
 pub static chv_dpio_cmn_power_well_ops: I915PowerWellOps = I915PowerWellOps {
     regs: core::ptr::null(),
     sync_hw: Some(i9xx_power_well_sync_hw_noop),
-    enable: Some(i9xx_always_on_power_well_noop),
-    disable: Some(i9xx_always_on_power_well_noop),
+    enable: Some(chv_dpio_cmn_power_well_enable),
+    disable: Some(chv_dpio_cmn_power_well_disable),
     is_enabled: Some(non_display_13_power_well_disabled),
 };
 
 pub static i830_pipes_power_well_ops: I915PowerWellOps = I915PowerWellOps {
     regs: core::ptr::null(),
-    sync_hw: Some(i9xx_power_well_sync_hw_noop),
-    enable: Some(i9xx_always_on_power_well_noop),
-    disable: Some(i9xx_always_on_power_well_noop),
-    is_enabled: Some(non_display_13_power_well_disabled),
+    sync_hw: Some(i830_pipes_power_well_sync_hw),
+    enable: Some(i830_pipes_power_well_enable),
+    disable: Some(i830_pipes_power_well_disable),
+    is_enabled: Some(i830_pipes_power_well_enabled),
 };
 
 pub static bxt_dpio_cmn_power_well_ops: I915PowerWellOps = I915PowerWellOps {
     regs: core::ptr::null(),
     sync_hw: Some(i9xx_power_well_sync_hw_noop),
-    enable: Some(i9xx_always_on_power_well_noop),
-    disable: Some(i9xx_always_on_power_well_noop),
-    is_enabled: Some(non_display_13_power_well_disabled),
+    enable: Some(bxt_dpio_cmn_power_well_enable),
+    disable: Some(bxt_dpio_cmn_power_well_disable),
+    is_enabled: Some(bxt_dpio_cmn_power_well_enabled),
 };
 
 pub static vlv_display_power_well_ops: I915PowerWellOps = I915PowerWellOps {
     regs: core::ptr::null(),
     sync_hw: Some(i9xx_power_well_sync_hw_noop),
-    enable: Some(i9xx_always_on_power_well_noop),
-    disable: Some(i9xx_always_on_power_well_noop),
+    enable: Some(vlv_display_power_well_enable),
+    disable: Some(vlv_display_power_well_disable),
     is_enabled: Some(non_display_13_power_well_disabled),
 };
 
 pub static vlv_dpio_cmn_power_well_ops: I915PowerWellOps = I915PowerWellOps {
     regs: core::ptr::null(),
     sync_hw: Some(i9xx_power_well_sync_hw_noop),
-    enable: Some(i9xx_always_on_power_well_noop),
-    disable: Some(i9xx_always_on_power_well_noop),
+    enable: Some(vlv_dpio_cmn_power_well_enable),
+    disable: Some(vlv_dpio_cmn_power_well_disable),
     is_enabled: Some(non_display_13_power_well_disabled),
 };
 
 pub static vlv_dpio_power_well_ops: I915PowerWellOps = I915PowerWellOps {
     regs: core::ptr::null(),
     sync_hw: Some(i9xx_power_well_sync_hw_noop),
-    enable: Some(i9xx_always_on_power_well_noop),
-    disable: Some(i9xx_always_on_power_well_noop),
-    is_enabled: Some(non_display_13_power_well_disabled),
+    enable: Some(vlv_power_well_enable),
+    disable: Some(vlv_power_well_disable),
+    is_enabled: Some(vlv_power_well_enabled),
 };
 
 pub static xelpdp_aux_power_well_ops: I915PowerWellOps = I915PowerWellOps {
     regs: core::ptr::null(),
     sync_hw: Some(i9xx_power_well_sync_hw_noop),
-    enable: Some(i9xx_always_on_power_well_noop),
-    disable: Some(i9xx_always_on_power_well_noop),
-    is_enabled: Some(non_display_13_power_well_disabled),
+    enable: Some(xelpdp_aux_power_well_enable),
+    disable: Some(xelpdp_aux_power_well_disable),
+    is_enabled: Some(xelpdp_aux_power_well_enabled),
 };
 
 pub static xe2lpd_pica_power_well_ops: I915PowerWellOps = I915PowerWellOps {
     regs: core::ptr::null(),
     sync_hw: Some(i9xx_power_well_sync_hw_noop),
-    enable: Some(i9xx_always_on_power_well_noop),
-    disable: Some(i9xx_always_on_power_well_noop),
-    is_enabled: Some(non_display_13_power_well_disabled),
+    enable: Some(xe2lpd_pica_power_well_enable),
+    disable: Some(xe2lpd_pica_power_well_disable),
+    is_enabled: Some(xe2lpd_pica_power_well_enabled),
 };
 
 // --- DC state functions ---
+
+// upstream: intel_display_power_well.c assert_can_enable_dc9()
+unsafe fn assert_can_enable_dc9(_display: *mut IntelDisplay) {}
+
+// upstream: intel_display_power_well.c assert_can_disable_dc9()
+unsafe fn assert_can_disable_dc9(_display: *mut IntelDisplay) {}
+
+// upstream: intel_display_power_well.c gen9_write_dc_state()
+pub unsafe extern "C" fn gen9_write_dc_state(display: *mut IntelDisplay, state: u32) {
+    if display.is_null() {
+        return;
+    }
+    let mut rewrites = 0;
+    let mut rereads = 0;
+    let mut v = 0;
+
+    intel_de_write(display, DC_STATE_EN, state);
+
+    while rewrites < 100 {
+        v = intel_de_read(display, DC_STATE_EN);
+        if v != state {
+            intel_de_write(display, DC_STATE_EN, state);
+            rewrites += 1;
+            rereads = 0;
+        } else {
+            rereads += 1;
+            if rereads > 5 {
+                break;
+            }
+        }
+    }
+}
+
+// upstream: intel_display_power_well.c gen9_dc_mask()
+unsafe fn gen9_dc_mask(display: *mut IntelDisplay) -> u32 {
+    let mut mask = DC_STATE_EN_UPTO_DC5;
+    if unsafe { display_ver(display) } >= 12 {
+        mask |= DC_STATE_EN_DC3CO | DC_STATE_EN_UPTO_DC6 | DC_STATE_EN_DC9;
+    } else if unsafe { display_ver(display) } == 11 {
+        mask |= DC_STATE_EN_UPTO_DC6 | DC_STATE_EN_DC9;
+    } else {
+        mask |= DC_STATE_EN_UPTO_DC6;
+    }
+    mask
+}
+
+// upstream: intel_display_power_well.c tgl_enable_dc3co()
+unsafe fn tgl_enable_dc3co(display: *mut IntelDisplay) {
+    gen9_set_dc_state(display, DC_STATE_EN_DC3CO);
+}
+
+// upstream: intel_display_power_well.c tgl_disable_dc3co()
+unsafe fn tgl_disable_dc3co(display: *mut IntelDisplay) {
+    intel_de_rmw(display, DC_STATE_EN, DC_STATE_DC3CO_STATUS, 0);
+    gen9_set_dc_state(display, DC_STATE_DISABLE);
+}
+
+// upstream: intel_display_power_well.c assert_can_enable_dc5()
+unsafe fn assert_can_enable_dc5(_display: *mut IntelDisplay) {}
+
+// upstream: intel_display_power_well.c assert_can_enable_dc6()
+unsafe fn assert_can_enable_dc6(_display: *mut IntelDisplay) {}
+
+// upstream: intel_display_power_well.c gen9_assert_dbuf_enabled()
+unsafe fn gen9_assert_dbuf_enabled(_display: *mut IntelDisplay) {}
 
 // upstream: intel_display_power_well.c gen9_set_dc_state()
 #[unsafe(no_mangle)]
@@ -806,21 +1263,21 @@ pub unsafe extern "C" fn gen9_set_dc_state(display: *mut IntelDisplay, state: u3
         let mut val = intel_de_read(display, DC_STATE_EN);
         val &= !mask;
         val |= state;
-        intel_de_write(display, DC_STATE_EN, val);
-        (*display).power.domains.dc_state = state;
+        gen9_write_dc_state(display, val);
+        (*display).power.domains.dc_state = val & mask;
     }
 }
 
 // upstream: intel_display_power_well.c gen9_sanitize_dc_state()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gen9_sanitize_dc_state(display: *mut IntelDisplay) {
-    if display.is_null() {
+    if display.is_null() || !unsafe { intel_display_device_enabled(display) } {
         return;
     }
     unsafe {
-        let val = intel_de_read(display, DC_STATE_EN);
-        let mask = DC_STATE_EN_DC3CO | DC_STATE_EN_UPTO_DC5_DC6_MASK;
-        (*display).power.domains.dc_state = val & mask;
+        let mask = gen9_dc_mask(display);
+        let val = intel_de_read(display, DC_STATE_EN) & mask;
+        (*display).power.domains.dc_state = val;
     }
 }
 
@@ -831,6 +1288,7 @@ pub unsafe extern "C" fn gen9_disable_dc_states(display: *mut IntelDisplay) {
         return;
     }
     unsafe {
+        gen9_assert_dbuf_enabled(display);
         if intel_display_device_enabled(display) {
             intel_dmc_wl_get_noreg(display);
             gen9_set_dc_state(display, DC_STATE_DISABLE);
@@ -844,25 +1302,33 @@ pub unsafe extern "C" fn gen9_disable_dc_states(display: *mut IntelDisplay) {
 // upstream: intel_display_power_well.c gen9_enable_dc5()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gen9_enable_dc5(display: *mut IntelDisplay) {
-    unsafe { gen9_set_dc_state(display, DC_STATE_EN_UPTO_DC5); }
+    unsafe {
+        assert_can_enable_dc5(display);
+        gen9_set_dc_state(display, DC_STATE_EN_UPTO_DC5);
+    }
 }
 
 // upstream: intel_display_power_well.c skl_enable_dc6()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn skl_enable_dc6(display: *mut IntelDisplay) {
-    unsafe { gen9_set_dc_state(display, DC_STATE_EN_UPTO_DC6); }
+    unsafe {
+        assert_can_enable_dc6(display);
+        gen9_set_dc_state(display, DC_STATE_EN_UPTO_DC6);
+    }
 }
 
 // upstream: intel_display_power_well.c bxt_enable_dc9()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bxt_enable_dc9(_display: *mut IntelDisplay) {
+pub unsafe extern "C" fn bxt_enable_dc9(display: *mut IntelDisplay) {
     // skipped: not display 13
+    unsafe { assert_can_enable_dc9(display); }
 }
 
 // upstream: intel_display_power_well.c bxt_disable_dc9()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bxt_disable_dc9(_display: *mut IntelDisplay) {
+pub unsafe extern "C" fn bxt_disable_dc9(display: *mut IntelDisplay) {
     // skipped: not display 13
+    unsafe { assert_can_disable_dc9(display); }
 }
 
 // upstream: intel_display_power_well.c chv_phy_powergate_lanes()

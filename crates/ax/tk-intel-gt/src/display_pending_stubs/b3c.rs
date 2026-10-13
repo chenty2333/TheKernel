@@ -61,3 +61,23 @@ pub unsafe extern "C" fn intel_dmc_update_dc6_allowed_count(
     _display: *mut IntelDisplay,
     _allowed: bool,
 ) {}
+
+// upstream: intel_dmc.c intel_dmc_load_program()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dmc_load_program(_display: *mut IntelDisplay) {}
+
+// upstream: intel_dmc.c intel_dmc_disable_program()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dmc_disable_program(_display: *mut IntelDisplay) {}
+
+// upstream: intel_dram.c intel_dram_info()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dram_info(
+    display: *mut IntelDisplay,
+) -> *const crate::intel_dram_types_upstream::DramInfo {
+    if display.is_null() {
+        core::ptr::null()
+    } else {
+        (*display).dram.info as *const _
+    }
+}

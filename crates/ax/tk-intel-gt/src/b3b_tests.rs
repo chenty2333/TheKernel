@@ -21,6 +21,7 @@ use crate::intel_display_power_well_upstream::*;
 use crate::intel_display_regs_upstream::*;
 use crate::intel_hti_regs_upstream::*;
 use crate::intel_hti_upstream::*;
+use crate::skl_watermark_regs_upstream::*;
 use crate::intel_pch_types_upstream::*;
 use crate::intel_pch_upstream::*;
 use crate::intel_pmdemand_upstream::*;
@@ -98,6 +99,18 @@ unsafe extern "C" fn mock_mmio_writel(uncore: *mut IntelUncore, reg: I915RegT, m
             } else {
                 val &= !state;
             }
+        }
+    }
+
+    if reg.reg == crate::skl_watermark_regs_upstream::_DBUF_CTL_S0
+        || reg.reg == crate::skl_watermark_regs_upstream::_DBUF_CTL_S1
+        || reg.reg == crate::skl_watermark_regs_upstream::_DBUF_CTL_S2
+        || reg.reg == crate::skl_watermark_regs_upstream::_DBUF_CTL_S3
+    {
+        if (val & crate::skl_watermark_regs_upstream::DBUF_POWER_REQUEST) != 0 {
+            val |= crate::skl_watermark_regs_upstream::DBUF_POWER_STATE;
+        } else {
+            val &= !crate::skl_watermark_regs_upstream::DBUF_POWER_STATE;
         }
     }
 
@@ -429,7 +442,7 @@ fn test_power_well_sync_hw_init_hw() {
 
     unsafe {
         intel_power_domains_init(display);
-        intel_power_domains_init_hw(display);
+        intel_power_domains_sync_hw(display);
     }
 
     let power_domains = unsafe { &(*display).power.domains };
@@ -561,4 +574,164 @@ fn test_intel_hti_reservation_decoding() {
     unsafe {
         drop(Box::from_raw((*display).info.__device_info));
     }
+}
+
+/// 8. icl_display_core_init register sequence on ADL-P (mock MMIO write log order).
+#[test]
+fn test_icl_display_core_init_adlp_reg_sequence() {
+    let mut env = MockEnvironment::new();
+    env.setup_adlp();
+    let display = env.display_ptr();
+
+    unsafe {
+        intel_power_domains_init(display);
+    }
+
+    if let Ok(mut log) = MMIO_WRITE_LOG.lock() {
+        log.clear();
+    }
+
+    unsafe {
+        icl_display_core_init(display, false);
+    }
+
+    let log = MMIO_WRITE_LOG.lock().unwrap().clone();
+    assert!(!log.is_empty(), "MMIO write log must not be empty after icl_display_core_init");
+
+    // 1. DC_STATE_EN was written with DC_STATE_DISABLE (0)
+    let dc_state_disable_idx = log.iter().position(|&(reg, val)| reg == DC_STATE_EN.reg && val == 0);
+    assert!(dc_state_disable_idx.is_some(), "DC_STATE_DISABLE write to DC_STATE_EN must occur");
+
+    // 2. PCH reset handshake on HSW_NDE_RSTWRN_OPT
+    let pch_handshake_idx = log.iter().position(|&(reg, _)| reg == HSW_NDE_RSTWRN_OPT.reg);
+    assert!(pch_handshake_idx.is_some(), "HSW_NDE_RSTWRN_OPT handshake must occur");
+    assert!(pch_handshake_idx.unwrap() > dc_state_disable_idx.unwrap(), "PCH handshake after DC_STATE_DISABLE");
+
+    // 3. Power Well 1 enable on HSW_PWR_WELL_CTL2
+    let pw1_idx = log.iter().position(|&(reg, _)| reg == HSW_PWR_WELL_CTL2.reg);
+    assert!(pw1_idx.is_some(), "PW1 enable must occur on HSW_PWR_WELL_CTL2");
+    assert!(pw1_idx.unwrap() > pch_handshake_idx.unwrap(), "PW1 enable after PCH handshake");
+
+    // 4. DBUF slice enable on _DBUF_CTL_S0
+    let dbuf_idx = log.iter().position(|&(reg, val)| reg == _DBUF_CTL_S0 && (val & DBUF_POWER_REQUEST) != 0);
+    assert!(dbuf_idx.is_some(), "DBUF S0 power request must occur");
+    assert!(dbuf_idx.unwrap() > pw1_idx.unwrap(), "DBUF enable after PW1 enable");
+
+    // 5. Wa_14011508470 on GEN11_CHICKEN_DCPR_2
+    let wa_idx = log.iter().position(|&(reg, _)| reg == GEN11_CHICKEN_DCPR_2.reg);
+    assert!(wa_idx.is_some(), "Wa_14011508470 must be programmed on GEN11_CHICKEN_DCPR_2");
+    assert!(wa_idx.unwrap() > dbuf_idx.unwrap(), "Wa_14011508470 after DBUF enable");
+}
+
+/// 9. DBUF slice enable/disable (gen9_dbuf_slice_set).
+#[test]
+fn test_gen9_dbuf_slice_ops() {
+    let mut env = MockEnvironment::new();
+    env.setup_adlp();
+    let display = env.display_ptr();
+
+    // 9a. Enable slice 0
+    unsafe {
+        gen9_dbuf_slice_set(display, 0, true);
+    }
+    let val_s0 = env.read_mmio32(_DBUF_CTL_S0);
+    assert_ne!(val_s0 & DBUF_POWER_REQUEST, 0, "DBUF slice 0 power request must be set");
+    assert_ne!(val_s0 & DBUF_POWER_STATE, 0, "DBUF slice 0 power state must be set");
+
+    // 9b. Enable slice 1
+    unsafe {
+        gen9_dbuf_slice_set(display, 1, true);
+    }
+    let val_s1 = env.read_mmio32(_DBUF_CTL_S1);
+    assert_ne!(val_s1 & DBUF_POWER_REQUEST, 0, "DBUF slice 1 power request must be set");
+    assert_ne!(val_s1 & DBUF_POWER_STATE, 0, "DBUF slice 1 power state must be set");
+
+    // 9c. Disable slice 0
+    unsafe {
+        gen9_dbuf_slice_set(display, 0, false);
+    }
+    let val_s0_off = env.read_mmio32(_DBUF_CTL_S0);
+    assert_eq!(val_s0_off & DBUF_POWER_REQUEST, 0, "DBUF slice 0 power request must be cleared");
+    assert_eq!(val_s0_off & DBUF_POWER_STATE, 0, "DBUF slice 0 power state must be cleared");
+}
+
+/// 10. gen9_write_dc_state readback verification and retry logic.
+#[test]
+fn test_gen9_write_dc_state_retry() {
+    let mut env = MockEnvironment::new();
+    env.setup_adlp();
+    let display = env.display_ptr();
+
+    unsafe {
+        gen9_write_dc_state(display, DC_STATE_EN_UPTO_DC5);
+    }
+    let val = env.read_mmio32(DC_STATE_EN.reg);
+    assert_eq!(val & DC_STATE_EN_UPTO_DC5, DC_STATE_EN_UPTO_DC5, "DC5 state must be written to DC_STATE_EN");
+
+    unsafe {
+        gen9_write_dc_state(display, DC_STATE_DISABLE);
+    }
+    let val_off = env.read_mmio32(DC_STATE_EN.reg);
+    assert_eq!(val_off, 0, "DC_STATE_DISABLE must clear DC_STATE_EN");
+}
+
+/// 11. Async put real delayed work pipeline and grab ref.
+#[test]
+fn test_async_put_delayed_work() {
+    let mut env = MockEnvironment::new();
+    env.setup_adlp();
+    let display = env.display_ptr();
+
+    unsafe {
+        intel_power_domains_init(display);
+    }
+    let power_domains = unsafe { &mut (*display).power.domains };
+
+    // 11a. Take reference on POWER_DOMAIN_PIPE_A
+    let wf = unsafe { intel_display_power_get(display, POWER_DOMAIN_PIPE_A) };
+    assert_eq!(power_domains.domain_use_count[POWER_DOMAIN_PIPE_A as usize], 1);
+
+    // 11b. Put reference asynchronously with 100ms delay
+    unsafe {
+        __intel_display_power_put_async(display, POWER_DOMAIN_PIPE_A, wf, 100);
+    }
+
+    // Still in use while delayed work is pending!
+    assert_eq!(power_domains.domain_use_count[POWER_DOMAIN_PIPE_A as usize], 1);
+    let idx = (POWER_DOMAIN_PIPE_A / 64) as usize;
+    let bit = POWER_DOMAIN_PIPE_A % 64;
+    assert_ne!(
+        power_domains.async_put_domains[0].bits[idx] & (1u64 << bit),
+        0,
+        "POWER_DOMAIN_PIPE_A must be queued in async_put_domains[0]"
+    );
+    assert!(!power_domains.async_put_wakeref.is_null(), "async_put_wakeref must be set");
+
+    // 11c. Grab the async put ref back without cycling hardware
+    let grabbed = unsafe { intel_display_power_get(display, POWER_DOMAIN_PIPE_A) };
+    assert_ne!(grabbed, core::ptr::null_mut());
+    assert_eq!(
+        power_domains.async_put_domains[0].bits[idx] & (1u64 << bit),
+        0,
+        "Grabbing reference must clear it from async_put_domains"
+    );
+    assert_eq!(power_domains.domain_use_count[POWER_DOMAIN_PIPE_A as usize], 1);
+
+    // 11d. Put asynchronously again and flush work
+    unsafe {
+        __intel_display_power_put_async(display, POWER_DOMAIN_PIPE_A, grabbed, 100);
+        intel_display_power_flush_work(display);
+    }
+
+    assert_eq!(
+        power_domains.domain_use_count[POWER_DOMAIN_PIPE_A as usize],
+        0,
+        "After flush_work, domain use count must drop to 0"
+    );
+    assert_eq!(
+        power_domains.async_put_domains[0].bits[idx] & (1u64 << bit),
+        0,
+        "After flush_work, async_put_domains must be clear"
+    );
+    assert!(power_domains.async_put_wakeref.is_null(), "After flush_work, wakeref must be null");
 }
