@@ -2254,4 +2254,15 @@ Both files carry MIT licenses in upstream Linux 7.2.3 and are recorded in `crate
 
 The Linux DRM infrastructure core translations (`crates/ax/tk-drm-upstream`, batch BI: `drm_drv_upstream.rs`, `drm_file_upstream.rs`, `drm_gem_upstream.rs`, `drm_prime_upstream.rs`, `drm_ioctl_upstream.rs`, `drm_auth_upstream.rs`, `drm_vma_manager_upstream.rs`, `drm_lease_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned `crates/ax` totals: threshold >=40 `(0,0,0,850,820,0,0)` (was 837/807), threshold >=25 `(18,15,4,2288,2250,0,0)` (was 2238/2200). `crates/linux` and `kernel/src` are unchanged.
 
+## 2026-10-13 DRM atomic helpers and GEM framebuffer helpers B2b reconciliation
+
+The Linux DRM atomic helper and GEM framebuffer helper translations (`crates/ax/tk-drm-upstream`, batch B2b: `drm_atomic_helper_upstream.rs`, `drm_gem_framebuffer_helper_upstream.rs`, `drm_gem_atomic_helper_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned `crates/ax` totals: threshold >=40 `(0,0,0,917,887,0,0)` (was 872/842), threshold >=25 `(18,15,4,2406,2368,0,0)` (was 2335/2297). `crates/linux` and `kernel/src` are unchanged.
+
+Licensing:
+- `drivers/gpu/drm/drm_atomic_helper.c`: MIT (X11 permission notice).
+- `drivers/gpu/drm/drm_gem_framebuffer_helper.c`: GPL-2.0-or-later.
+- `drivers/gpu/drm/drm_gem_atomic_helper.c`: GPL-2.0-or-later.
+Recorded in `crates/ax/tk-drm-upstream/NOTICE`.
+
+
 

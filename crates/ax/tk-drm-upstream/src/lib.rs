@@ -178,6 +178,8 @@ mod b1b_tests;
 #[cfg(test)]
 mod b2a_tests;
 #[cfg(test)]
+mod b2b_tests;
+#[cfg(test)]
 mod b2e_tests;
 
 /// Host-test helpers shared by the batch test modules (test drm_device setup).
