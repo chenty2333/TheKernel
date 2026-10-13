@@ -52,7 +52,11 @@ pub struct I915PowerWellOps {
 
 unsafe impl Sync for I915PowerWellOps {}
 
+unsafe impl Sync for I915PowerWellInstance {}
+unsafe impl Sync for I915PowerWellDesc {}
+
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct I915PowerWellInstanceList {
     pub list: *const I915PowerWellInstance,
     pub count: u8,
@@ -61,6 +65,7 @@ pub struct I915PowerWellInstanceList {
 unsafe impl Sync for I915PowerWellInstanceList {}
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct I915PowerWellDescList {
     pub list: *const I915PowerWellDesc,
     pub count: u8,
@@ -69,6 +74,7 @@ pub struct I915PowerWellDescList {
 unsafe impl Sync for I915PowerWellDescList {}
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct I915PowerDomainList {
     pub list: *const IntelDisplayPowerDomain,
     pub count: u8,
