@@ -378,18 +378,34 @@ pub unsafe extern "C" fn drm_release_noglobal(_inode: *mut c_void, filp: *mut Fi
     0
 }
 
-// upstream: drivers/gpu/drm/drm_file.c drm_read()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_read(
-    filp: *mut File,
+/// VFS-side sink used by [`drm_read_kernel_to`]. Returning exactly `len`
+/// commits the event; a short or negative result leaves the event queued.
+pub type DrmReadWriter =
+    unsafe extern "C" fn(context: *mut c_void, bytes: *const c_void, len: usize) -> isize;
+
+unsafe fn drm_read_copy_to_user(
     buffer: *mut c_char,
+    offset: usize,
+    bytes: *const c_void,
+    len: usize,
+) -> isize {
+    if buffer.is_null() || unsafe { copy_to_user(buffer.add(offset).cast(), bytes, len) } != 0 {
+        -(EFAULT as isize)
+    } else {
+        len as isize
+    }
+}
+
+unsafe fn drm_read_core(
+    filp: *mut File,
     count: usize,
-    _offset: *mut i64,
+    may_wait: bool,
+    mut writer: impl FnMut(usize, *const c_void, usize) -> isize,
 ) -> isize {
     const EPOLLIN: u32 = 0x0001;
     const EPOLLRDNORM: u32 = 0x0040;
 
-    if filp.is_null() || buffer.is_null() {
+    if filp.is_null() {
         return -EINVAL as isize;
     }
     unsafe {
@@ -422,7 +438,7 @@ pub unsafe extern "C" fn drm_read(
                     break;
                 }
 
-                if ((*filp).f_flags as u32 & O_NONBLOCK) != 0 {
+                if !may_wait || ((*filp).f_flags as u32 & O_NONBLOCK) != 0 {
                     ret = -EAGAIN as isize;
                     break;
                 }
@@ -452,9 +468,14 @@ pub unsafe extern "C" fn drm_read(
                     break;
                 }
 
-                if copy_to_user(buffer.add(ret as usize).cast(), (*e).event.cast(), length) != 0 {
+                let copied = writer(ret as usize, (*e).event.cast(), length);
+                if copied != length as isize {
                     if ret == 0 {
-                        ret = -EFAULT as isize;
+                        ret = if copied < 0 {
+                            copied
+                        } else {
+                            -EFAULT as isize
+                        };
                     }
                     spin_lock_irqsave_raw(core::ptr::addr_of_mut!((*dev).event_lock), &mut flags);
                     (*file_priv).event_space -= length as i32;
@@ -471,6 +492,52 @@ pub unsafe extern "C" fn drm_read(
 
         mutex_unlock(core::ptr::addr_of_mut!((*file_priv).event_read_lock));
         ret
+    }
+}
+
+// upstream: drivers/gpu/drm/drm_file.c drm_read()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_read(
+    filp: *mut File,
+    buffer: *mut c_char,
+    count: usize,
+    _offset: *mut i64,
+) -> isize {
+    if buffer.is_null() {
+        return -EINVAL as isize;
+    }
+    unsafe {
+        drm_read_core(
+            filp,
+            count,
+            true,
+            |offset, bytes, len| unsafe { drm_read_copy_to_user(buffer, offset, bytes, len) },
+        )
+    }
+}
+
+/// Nonblocking DRM event read through a kernel-owned writer. The caller must
+/// provide readiness blocking/retry around `-EAGAIN` (as the VFS `Pollable`
+/// adapter does); event dequeue, partial-read requeue, and event ownership are
+/// shared with the Linux `drm_read()` path above.
+///
+/// # Safety
+/// `filp` must be a live DRM file. `writer` must synchronously consume from
+/// the supplied event bytes and return the number of bytes accepted, or a
+/// negative Linux errno. `context` must remain valid for the call.
+pub unsafe fn drm_read_kernel_to(
+    filp: *mut File,
+    count: usize,
+    context: *mut c_void,
+    writer: DrmReadWriter,
+) -> isize {
+    unsafe {
+        drm_read_core(
+            filp,
+            count,
+            false,
+            |_, bytes, len| unsafe { writer(context, bytes, len) },
+        )
     }
 }
 
@@ -993,6 +1060,97 @@ mod tests {
 
             // Event was put back onto event_list!
             assert!(!list_empty(&(*file_priv).event_list));
+
+            drm_file_free(file_priv);
+            drm_dev_put(dev);
+        }
+    }
+
+    #[test]
+    fn kernel_writer_reuses_event_requeue_and_ownership_path() {
+        struct Sink {
+            bytes: [u8; 64],
+            written: usize,
+            limit: usize,
+        }
+
+        unsafe extern "C" fn sink_writer(
+            context: *mut c_void,
+            bytes: *const c_void,
+            len: usize,
+        ) -> isize {
+            let sink = unsafe { &mut *context.cast::<Sink>() };
+            let written = len.min(sink.limit);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.cast::<u8>(),
+                    sink.bytes.as_mut_ptr().add(sink.written),
+                    written,
+                );
+            }
+            sink.written += written;
+            written as isize
+        }
+
+        unsafe {
+            let mut driver: DrmDriver = core::mem::zeroed();
+            let dev = drm_dev_alloc(&driver, core::ptr::null_mut());
+            let file_priv = drm_file_alloc((*dev).primary);
+            let mut filp: File = core::mem::zeroed();
+            filp.private_data = file_priv.cast();
+
+            let pending = kmalloc(core::mem::size_of::<DrmPendingEvent>(), GFP_KERNEL)
+                .cast::<DrmPendingEvent>();
+            core::ptr::write_bytes(pending, 0, 1);
+            let event = kmalloc(32, GFP_KERNEL).cast::<DrmEvent>();
+            (*event).r#type = 0x78;
+            (*event).length = 32;
+            assert_eq!(drm_event_reserve_init(dev, file_priv, pending, event), 0);
+            drm_send_event(dev, pending);
+
+            let mut short = Sink {
+                bytes: [0; 64],
+                written: 0,
+                limit: 4,
+            };
+            let ret = drm_read_kernel_to(
+                &mut filp,
+                64,
+                (&mut short as *mut Sink).cast(),
+                sink_writer,
+            );
+            assert_eq!(ret, -EFAULT as isize);
+            assert_eq!(short.written, 4);
+            assert!(!list_empty(&(*file_priv).event_list));
+            assert_eq!((*file_priv).event_space, 4096 - 32);
+
+            let mut full = Sink {
+                bytes: [0; 64],
+                written: 0,
+                limit: usize::MAX,
+            };
+            let ret = drm_read_kernel_to(
+                &mut filp,
+                64,
+                (&mut full as *mut Sink).cast(),
+                sink_writer,
+            );
+            assert_eq!(ret, 32);
+            assert_eq!(full.written, 32);
+            let read = full.bytes.as_ptr().cast::<DrmEvent>();
+            assert_eq!((*read).r#type, 0x78);
+            assert_eq!((*read).length, 32);
+            assert_eq!((*file_priv).event_space, 4096);
+            assert!(list_empty(&(*file_priv).event_list));
+            assert_eq!(
+                drm_read_kernel_to(
+                    &mut filp,
+                    64,
+                    (&mut full as *mut Sink).cast(),
+                    sink_writer,
+                ),
+                -EAGAIN as isize,
+            );
 
             drm_file_free(file_priv);
             drm_dev_put(dev);
