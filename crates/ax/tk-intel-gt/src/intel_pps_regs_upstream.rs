@@ -141,3 +141,33 @@ pub const PP_REFERENCE_DIVIDER_MASK: u32 = reg_genmask(31, 8);
 
 /// `PANEL_POWER_CYCLE_DELAY_MASK` (intel_pps_regs.h)
 pub const PANEL_POWER_CYCLE_DELAY_MASK: u32 = reg_genmask(4, 0);
+
+/// `_MMIO_PPS(display, pps_idx, reg)` (intel_pps_regs.h)
+pub unsafe fn _MMIO_PPS(display: *const IntelDisplay, pps_idx: u32, reg: u32) -> I915RegT {
+    mmio(unsafe { (*display).pps.mmio_base }.wrapping_sub(PPS_BASE).wrapping_add(reg).wrapping_add(pps_idx * 0x100))
+}
+
+/// `PP_STATUS(display, pps_idx)` (intel_pps_regs.h)
+pub unsafe fn PP_STATUS(display: *const IntelDisplay, pps_idx: u32) -> I915RegT {
+    _MMIO_PPS(display, pps_idx, _PP_STATUS)
+}
+
+/// `PP_CONTROL(display, pps_idx)` (intel_pps_regs.h)
+pub unsafe fn PP_CONTROL(display: *const IntelDisplay, pps_idx: u32) -> I915RegT {
+    _MMIO_PPS(display, pps_idx, _PP_CONTROL)
+}
+
+/// `PP_ON_DELAYS(display, pps_idx)` (intel_pps_regs.h)
+pub unsafe fn PP_ON_DELAYS(display: *const IntelDisplay, pps_idx: u32) -> I915RegT {
+    _MMIO_PPS(display, pps_idx, _PP_ON_DELAYS)
+}
+
+/// `PP_OFF_DELAYS(display, pps_idx)` (intel_pps_regs.h)
+pub unsafe fn PP_OFF_DELAYS(display: *const IntelDisplay, pps_idx: u32) -> I915RegT {
+    _MMIO_PPS(display, pps_idx, _PP_OFF_DELAYS)
+}
+
+/// `PP_DIVISOR(display, pps_idx)` (intel_pps_regs.h)
+pub unsafe fn PP_DIVISOR(display: *const IntelDisplay, pps_idx: u32) -> I915RegT {
+    _MMIO_PPS(display, pps_idx, _PP_DIVISOR)
+}

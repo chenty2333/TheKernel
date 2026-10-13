@@ -43,3 +43,111 @@ fn display_register_macros_match_c_expansion() {
     assert_eq!((tk_intel_gt::intel_pipe_crc_regs_upstream::_PIPE_CRC_EXP_3_B_IVB) as u64, 397400u64, "_PIPE_CRC_EXP_3_B_IVB");
     assert_eq!((tk_intel_gt::intel_sprite_regs_upstream::DVSCNTR(1).reg) as u64, 471424u64, "DVSCNTR");
 }
+
+#[test]
+fn test_adlp_indexed_register_macros() {
+    use tk_intel_gt::intel_display_core_types_upstream::IntelDisplay;
+    use tk_intel_gt::intel_display_device_types_upstream::IntelDisplayDeviceInfo;
+    use tk_intel_gt::intel_display_limits_types_upstream::{
+        PIPE_A, PIPE_B, PIPE_C, PIPE_D, _PIPE_EDP,
+        TRANSCODER_A, TRANSCODER_B, TRANSCODER_C, TRANSCODER_D, TRANSCODER_EDP,
+    };
+    use tk_intel_gt::intel_display_regs_upstream::{
+        TRANSCONF, TRANS_DDI_FUNC_CTL, PIPESTAT, PIPE_DATA_M1, TRANS_HTOTAL,
+    };
+    use tk_intel_gt::intel_cursor_regs_upstream::CURCNTR;
+    use tk_intel_gt::i9xx_plane_regs_upstream::DSPCNTR;
+    use tk_intel_gt::intel_psr_regs_upstream::TRANS_PSR_IMR;
+    use tk_intel_gt::intel_pipe_crc_regs_upstream::PIPE_CRC_CTL;
+    use tk_intel_gt::intel_pps_regs_upstream::PP_STATUS;
+
+    let mut device_info: IntelDisplayDeviceInfo = unsafe { core::mem::zeroed() };
+    device_info.mmio_offset = 0;
+    device_info.pipe_offsets[PIPE_A as usize] = 0x70000;
+    device_info.pipe_offsets[PIPE_B as usize] = 0x71000;
+    device_info.pipe_offsets[PIPE_C as usize] = 0x72000;
+    device_info.pipe_offsets[PIPE_D as usize] = 0x73000;
+    device_info.pipe_offsets[_PIPE_EDP as usize] = 0x7f000;
+
+    device_info.trans_offsets[TRANSCODER_A as usize] = 0x60000;
+    device_info.trans_offsets[TRANSCODER_B as usize] = 0x61000;
+    device_info.trans_offsets[TRANSCODER_C as usize] = 0x62000;
+    device_info.trans_offsets[TRANSCODER_D as usize] = 0x63000;
+    device_info.trans_offsets[TRANSCODER_EDP as usize] = 0x6f000;
+
+    device_info.cursor_offsets[PIPE_A as usize] = 0x70080;
+    device_info.cursor_offsets[PIPE_B as usize] = 0x71080;
+    device_info.cursor_offsets[PIPE_C as usize] = 0x72080;
+    device_info.cursor_offsets[PIPE_D as usize] = 0x73080;
+
+    let mut display_box = std::boxed::Box::new(unsafe { core::mem::zeroed::<IntelDisplay>() });
+    display_box.info.__device_info = &mut device_info;
+    display_box.info.__runtime_info.ip.ver = 13;
+    display_box.pps.mmio_base = 0x61200;
+    let display = &*display_box as *const IntelDisplay;
+
+    unsafe {
+        // TRANSCONF (pipe offsets relative to PIPE_A + 0x70008)
+        assert_eq!(TRANSCONF(display, TRANSCODER_A as u32).reg, 0x70008);
+        assert_eq!(TRANSCONF(display, TRANSCODER_B as u32).reg, 0x71008);
+        assert_eq!(TRANSCONF(display, TRANSCODER_C as u32).reg, 0x72008);
+        assert_eq!(TRANSCONF(display, TRANSCODER_D as u32).reg, 0x73008);
+        assert_eq!(TRANSCONF(display, TRANSCODER_EDP as u32).reg, 0x7f008);
+
+        // TRANS_DDI_FUNC_CTL (trans offsets relative to TRANSCODER_A + 0x60400)
+        assert_eq!(TRANS_DDI_FUNC_CTL(display, TRANSCODER_A as u32).reg, 0x60400);
+        assert_eq!(TRANS_DDI_FUNC_CTL(display, TRANSCODER_B as u32).reg, 0x61400);
+        assert_eq!(TRANS_DDI_FUNC_CTL(display, TRANSCODER_C as u32).reg, 0x62400);
+        assert_eq!(TRANS_DDI_FUNC_CTL(display, TRANSCODER_D as u32).reg, 0x63400);
+        assert_eq!(TRANS_DDI_FUNC_CTL(display, TRANSCODER_EDP as u32).reg, 0x6f400);
+
+        // PIPESTAT (pipe offsets relative to PIPE_A + 0x70024)
+        assert_eq!(PIPESTAT(display, PIPE_A as u32).reg, 0x70024);
+        assert_eq!(PIPESTAT(display, PIPE_B as u32).reg, 0x71024);
+        assert_eq!(PIPESTAT(display, PIPE_C as u32).reg, 0x72024);
+        assert_eq!(PIPESTAT(display, PIPE_D as u32).reg, 0x73024);
+
+        // CURCNTR (cursor offsets relative to PIPE_A + 0x70080)
+        assert_eq!(CURCNTR(display, PIPE_A as u32).reg, 0x70080);
+        assert_eq!(CURCNTR(display, PIPE_B as u32).reg, 0x71080);
+        assert_eq!(CURCNTR(display, PIPE_C as u32).reg, 0x72080);
+        assert_eq!(CURCNTR(display, PIPE_D as u32).reg, 0x73080);
+
+        // PIPE_DATA_M1 (trans offsets relative to TRANSCODER_A + 0x60030)
+        assert_eq!(PIPE_DATA_M1(display, TRANSCODER_A as u32).reg, 0x60030);
+        assert_eq!(PIPE_DATA_M1(display, TRANSCODER_B as u32).reg, 0x61030);
+        assert_eq!(PIPE_DATA_M1(display, TRANSCODER_C as u32).reg, 0x62030);
+        assert_eq!(PIPE_DATA_M1(display, TRANSCODER_D as u32).reg, 0x63030);
+        assert_eq!(PIPE_DATA_M1(display, TRANSCODER_EDP as u32).reg, 0x6f030);
+
+        // DSPCNTR (pipe offsets relative to PIPE_A + 0x70180)
+        assert_eq!(DSPCNTR(display, PIPE_A as u32).reg, 0x70180);
+        assert_eq!(DSPCNTR(display, PIPE_B as u32).reg, 0x71180);
+        assert_eq!(DSPCNTR(display, PIPE_C as u32).reg, 0x72180);
+        assert_eq!(DSPCNTR(display, PIPE_D as u32).reg, 0x73180);
+
+        // TRANS_HTOTAL (trans offsets relative to TRANSCODER_A + 0x60000)
+        assert_eq!(TRANS_HTOTAL(display, TRANSCODER_A as u32).reg, 0x60000);
+        assert_eq!(TRANS_HTOTAL(display, TRANSCODER_B as u32).reg, 0x61000);
+        assert_eq!(TRANS_HTOTAL(display, TRANSCODER_C as u32).reg, 0x62000);
+        assert_eq!(TRANS_HTOTAL(display, TRANSCODER_D as u32).reg, 0x63000);
+        assert_eq!(TRANS_HTOTAL(display, TRANSCODER_EDP as u32).reg, 0x6f000);
+
+        // TRANS_PSR_IMR (trans offsets relative to TRANSCODER_A + 0x60814)
+        assert_eq!(TRANS_PSR_IMR(display, TRANSCODER_A as u32).reg, 0x60814);
+        assert_eq!(TRANS_PSR_IMR(display, TRANSCODER_B as u32).reg, 0x61814);
+        assert_eq!(TRANS_PSR_IMR(display, TRANSCODER_C as u32).reg, 0x62814);
+        assert_eq!(TRANS_PSR_IMR(display, TRANSCODER_D as u32).reg, 0x63814);
+        assert_eq!(TRANS_PSR_IMR(display, TRANSCODER_EDP as u32).reg, 0x6f814);
+
+        // PIPE_CRC_CTL (trans offsets relative to TRANSCODER_A + 0x60050)
+        assert_eq!(PIPE_CRC_CTL(display, PIPE_A as u32).reg, 0x60050);
+        assert_eq!(PIPE_CRC_CTL(display, PIPE_B as u32).reg, 0x61050);
+        assert_eq!(PIPE_CRC_CTL(display, PIPE_C as u32).reg, 0x62050);
+        assert_eq!(PIPE_CRC_CTL(display, PIPE_D as u32).reg, 0x63050);
+
+        // PP_STATUS (mmio_base 0x61200 + pps_idx * 0x100)
+        assert_eq!(PP_STATUS(display, 0).reg, 0x61200);
+        assert_eq!(PP_STATUS(display, 1).reg, 0x61300);
+    }
+}

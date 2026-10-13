@@ -34,8 +34,8 @@ use crate::{
         i915_request_set_error_once, i915_request_wait,
     },
     i915_vma_api_upstream::{
-        __i915_vma_evict, __i915_vma_unbind, i915_vma_is_bound, i915_vma_is_pinned,
-        i915_vma_wait_for_bind,
+        __i915_vma_evict, __i915_vma_unbind, i915_node_color_differs, i915_vma_is_bound,
+        i915_vma_is_pinned, i915_vma_wait_for_bind,
     },
     i915_vma_resource_types_upstream::I915VmaResource,
     i915_vma_types_upstream::I915Vma,
@@ -281,7 +281,7 @@ unsafe extern "C" fn i915_ggtt_color_adjust(
     start: *mut u64,
     end: *mut u64,
 ) {
-    if unsafe { (*node).color != color } {
+    if unsafe { i915_node_color_differs(node, color) } {
         unsafe { *start += I915_GTT_PAGE_SIZE };
     }
     let member = unsafe { core::ptr::addr_of!((*node).node_list) }
@@ -2179,5 +2179,85 @@ pub unsafe extern "C" fn i915_ggtt_resume(ggtt: *mut I915Ggtt) {
     }
     unsafe {
         intel_ggtt_restore_fences(ggtt);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_i915_ggtt_color_adjust_guard_page() {
+        let mut prev_node: DrmMmNode = unsafe { core::mem::zeroed() };
+        let mut next_node: DrmMmNode = unsafe { core::mem::zeroed() };
+
+        prev_node.node_list.next = core::ptr::addr_of_mut!(next_node.node_list);
+        next_node.node_list.prev = core::ptr::addr_of_mut!(prev_node.node_list);
+
+        const TARGET_COLOR: c_ulong = 1;
+        const OTHER_COLOR: c_ulong = 2;
+
+        // 1. Unallocated hole preceding (flags = 0):
+        // Even if prev_node.color differs from TARGET_COLOR, start must remain untouched.
+        prev_node.flags = 0;
+        prev_node.color = OTHER_COLOR;
+        next_node.color = TARGET_COLOR;
+
+        let mut start: u64 = 0x10000;
+        let mut end: u64 = 0x20000;
+        unsafe {
+            i915_ggtt_color_adjust(&prev_node, TARGET_COLOR, &mut start, &mut end);
+        }
+        assert_eq!(start, 0x10000, "start must remain untouched next to unallocated hole");
+        assert_eq!(end, 0x20000, "end must remain untouched next to same-color node");
+
+        // 2. Allocated node of another color preceding (flags bit 0 set):
+        // start must add a guard page of I915_GTT_PAGE_SIZE.
+        prev_node.flags = 1;
+        prev_node.color = OTHER_COLOR;
+        next_node.color = TARGET_COLOR;
+
+        start = 0x10000;
+        end = 0x20000;
+        unsafe {
+            i915_ggtt_color_adjust(&prev_node, TARGET_COLOR, &mut start, &mut end);
+        }
+        assert_eq!(
+            start,
+            0x10000 + I915_GTT_PAGE_SIZE,
+            "start must add a guard page next to allocated node of another color"
+        );
+        assert_eq!(end, 0x20000, "end must remain untouched next to same-color node");
+
+        // 3. Allocated node of same color preceding:
+        // start must remain untouched.
+        prev_node.flags = 1;
+        prev_node.color = TARGET_COLOR;
+        next_node.color = TARGET_COLOR;
+
+        start = 0x10000;
+        end = 0x20000;
+        unsafe {
+            i915_ggtt_color_adjust(&prev_node, TARGET_COLOR, &mut start, &mut end);
+        }
+        assert_eq!(start, 0x10000, "start must remain untouched next to same-color allocated node");
+        assert_eq!(end, 0x20000);
+
+        // 4. Trailing node of another color:
+        // end must subtract a guard page of I915_GTT_PAGE_SIZE.
+        prev_node.flags = 0;
+        next_node.color = OTHER_COLOR;
+
+        start = 0x10000;
+        end = 0x20000;
+        unsafe {
+            i915_ggtt_color_adjust(&prev_node, TARGET_COLOR, &mut start, &mut end);
+        }
+        assert_eq!(start, 0x10000);
+        assert_eq!(
+            end,
+            0x20000 - I915_GTT_PAGE_SIZE,
+            "end must subtract a guard page next to a node of different color"
+        );
     }
 }

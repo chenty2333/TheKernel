@@ -44,6 +44,38 @@ pub const fn _DKL_REG_BANK_IDX(phy_offset: u32) -> u32 {
     (((((phy_offset) >> _DKL_BANK_SHIFT)) & 0xf))
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct IntelDklPhyReg {
+    pub reg: u32,
+    pub bank_idx: u32,
+}
+
+pub const TC_PORT_1: u32 = 0;
+
+/// `DKL_REG_TC_PORT(__reg)` (intel_dkl_phy_regs.h)
+pub const fn DKL_REG_TC_PORT(reg: IntelDklPhyReg) -> u32 {
+    TC_PORT_1 + (reg.reg - _DKL_PHY1_BASE) / (_DKL_PHY2_BASE - _DKL_PHY1_BASE)
+}
+
+/// `DKL_REG_MMIO(__reg)` (intel_dkl_phy_regs.h)
+pub const fn DKL_REG_MMIO(reg: IntelDklPhyReg) -> I915RegT {
+    _MMIO(reg.reg)
+}
+
+/// `_DKL_REG(tc_port, phy_offset)` (intel_dkl_phy_regs.h)
+pub const fn _DKL_REG(tc_port: u32, phy_offset: u32) -> IntelDklPhyReg {
+    IntelDklPhyReg {
+        reg: _DKL_REG_PHY_BASE(tc_port) + _DKL_REG_BANK_OFFSET(phy_offset),
+        bank_idx: _DKL_REG_BANK_IDX(phy_offset),
+    }
+}
+
+/// `_DKL_REG_LN(tc_port, ln_idx, ln0_offs, ln1_offs)` (intel_dkl_phy_regs.h)
+pub const fn _DKL_REG_LN(tc_port: u32, ln_idx: u32, ln0_offs: u32, ln1_offs: u32) -> IntelDklPhyReg {
+    _DKL_REG(tc_port, ln0_offs + ln_idx * (ln1_offs - ln0_offs))
+}
+
 /// `_DKL_PCS_DW5_LN0` (intel_dkl_phy_regs.h)
 pub const _DKL_PCS_DW5_LN0: u32 = 0x0014;
 
@@ -310,4 +342,84 @@ pub const fn _HIP_INDEX_SHIFT(tc_port: u32) -> u32 {
 /// `HIP_INDEX_VAL(tc_port, val)` (intel_dkl_phy_regs.h)
 pub const fn HIP_INDEX_VAL(tc_port: u32, val: u32) -> u32 {
     (((val) << _HIP_INDEX_SHIFT(tc_port)))
+}
+
+/// `HIP_INDEX_REG(tc_port)` (intel_dkl_phy_regs.h)
+pub const fn HIP_INDEX_REG(tc_port: u32) -> I915RegT {
+    _MMIO(if tc_port < 4 { _HIP_INDEX_REG0 } else { _HIP_INDEX_REG1 })
+}
+
+/// `DKL_PCS_DW5(tc_port, ln)` (intel_dkl_phy_regs.h)
+pub const fn DKL_PCS_DW5(tc_port: u32, ln: u32) -> IntelDklPhyReg {
+    _DKL_REG_LN(tc_port, ln, _DKL_PCS_DW5_LN0, _DKL_PCS_DW5_LN1)
+}
+
+/// `DKL_PLL_DIV0(tc_port)` (intel_dkl_phy_regs.h)
+pub const fn DKL_PLL_DIV0(tc_port: u32) -> IntelDklPhyReg {
+    _DKL_REG(tc_port, _DKL_PLL_DIV0)
+}
+
+/// `DKL_PLL_DIV1(tc_port)` (intel_dkl_phy_regs.h)
+pub const fn DKL_PLL_DIV1(tc_port: u32) -> IntelDklPhyReg {
+    _DKL_REG(tc_port, _DKL_PLL_DIV1)
+}
+
+/// `DKL_PLL_SSC(tc_port)` (intel_dkl_phy_regs.h)
+pub const fn DKL_PLL_SSC(tc_port: u32) -> IntelDklPhyReg {
+    _DKL_REG(tc_port, _DKL_PLL_SSC)
+}
+
+/// `DKL_PLL_BIAS(tc_port)` (intel_dkl_phy_regs.h)
+pub const fn DKL_PLL_BIAS(tc_port: u32) -> IntelDklPhyReg {
+    _DKL_REG(tc_port, _DKL_PLL_BIAS)
+}
+
+/// `DKL_PLL_TDC_COLDST_BIAS(tc_port)` (intel_dkl_phy_regs.h)
+pub const fn DKL_PLL_TDC_COLDST_BIAS(tc_port: u32) -> IntelDklPhyReg {
+    _DKL_REG(tc_port, _DKL_PLL_TDC_COLDST_BIAS)
+}
+
+/// `DKL_REFCLKIN_CTL(tc_port)` (intel_dkl_phy_regs.h)
+pub const fn DKL_REFCLKIN_CTL(tc_port: u32) -> IntelDklPhyReg {
+    _DKL_REG(tc_port, _DKL_REFCLKIN_CTL)
+}
+
+/// `DKL_CLKTOP2_HSCLKCTL(tc_port)` (intel_dkl_phy_regs.h)
+pub const fn DKL_CLKTOP2_HSCLKCTL(tc_port: u32) -> IntelDklPhyReg {
+    _DKL_REG(tc_port, _DKL_CLKTOP2_HSCLKCTL)
+}
+
+/// `DKL_CLKTOP2_CORECLKCTL1(tc_port)` (intel_dkl_phy_regs.h)
+pub const fn DKL_CLKTOP2_CORECLKCTL1(tc_port: u32) -> IntelDklPhyReg {
+    _DKL_REG(tc_port, _DKL_CLKTOP2_CORECLKCTL1)
+}
+
+/// `DKL_TX_DPCNTL0(tc_port, ln)` (intel_dkl_phy_regs.h)
+pub const fn DKL_TX_DPCNTL0(tc_port: u32, ln: u32) -> IntelDklPhyReg {
+    _DKL_REG_LN(tc_port, ln, _DKL_TX_DPCNTL0_LN0, _DKL_TX_DPCNTL0_LN1)
+}
+
+/// `DKL_TX_DPCNTL1(tc_port, ln)` (intel_dkl_phy_regs.h)
+pub const fn DKL_TX_DPCNTL1(tc_port: u32, ln: u32) -> IntelDklPhyReg {
+    _DKL_REG_LN(tc_port, ln, _DKL_TX_DPCNTL1_LN0, _DKL_TX_DPCNTL1_LN1)
+}
+
+/// `DKL_TX_DPCNTL2(tc_port, ln)` (intel_dkl_phy_regs.h)
+pub const fn DKL_TX_DPCNTL2(tc_port: u32, ln: u32) -> IntelDklPhyReg {
+    _DKL_REG_LN(tc_port, ln, _DKL_TX_DPCNTL2_LN0, _DKL_TX_DPCNTL2_LN1)
+}
+
+/// `DKL_TX_PMD_LANE_SUS(tc_port, ln)` (intel_dkl_phy_regs.h)
+pub const fn DKL_TX_PMD_LANE_SUS(tc_port: u32, ln: u32) -> IntelDklPhyReg {
+    _DKL_REG_LN(tc_port, ln, _DKL_TX_PMD_LANE_SUS_LN0, _DKL_TX_PMD_LANE_SUS_LN1)
+}
+
+/// `DKL_DP_MODE(tc_port, ln)` (intel_dkl_phy_regs.h)
+pub const fn DKL_DP_MODE(tc_port: u32, ln: u32) -> IntelDklPhyReg {
+    _DKL_REG_LN(tc_port, ln, _DKL_DP_MODE_LN0, _DKL_DP_MODE_LN1)
+}
+
+/// `DKL_CMN_UC_DW_27(tc_port)` (intel_dkl_phy_regs.h)
+pub const fn DKL_CMN_UC_DW_27(tc_port: u32) -> IntelDklPhyReg {
+    _DKL_REG(tc_port, _DKL_CMN_UC_DW27)
 }

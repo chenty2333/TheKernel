@@ -3934,6 +3934,11 @@ pub const _CHICKEN_TRANS_EDP: u32 = 0x420cc;
 /// `_CHICKEN_TRANS_D` (intel_display_regs.h)
 pub const _CHICKEN_TRANS_D: u32 = 0x420d8;
 
+/// `_CHICKEN_TRANS(trans)` (intel_display_regs.h)
+pub const fn _CHICKEN_TRANS(trans: u32) -> I915RegT {
+    mmio(pick(trans, &[_CHICKEN_TRANS_A, _CHICKEN_TRANS_B, _CHICKEN_TRANS_C, _CHICKEN_TRANS_D, _CHICKEN_TRANS_EDP]))
+}
+
 /// `_MTL_CHICKEN_TRANS_A` (intel_display_regs.h)
 pub const _MTL_CHICKEN_TRANS_A: u32 = 0x604e0;
 
@@ -7748,3 +7753,307 @@ pub const FW_BLC_SELF_FIFO_MASK: u32 = reg_bit(16);
 
 /// `FW_BLC_SELF_EN` (intel_display_regs.h)
 pub const FW_BLC_SELF_EN: u32 = reg_bit(15);
+
+/// `DPLL(dev_priv, pipe)` (intel_display_regs.h)
+pub unsafe fn DPLL(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_BASE_PIPE3(DISPLAY_MMIO_BASE(display), pipe, _DPLL_A, _DPLL_B, _CHV_DPLL_C)
+}
+
+/// `DPLL_MD(dev_priv, pipe)` (intel_display_regs.h)
+pub unsafe fn DPLL_MD(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_BASE_PIPE3(DISPLAY_MMIO_BASE(display), pipe, _DPLL_A_MD, _DPLL_B_MD, _CHV_DPLL_C_MD)
+}
+
+/// `TRANS_HTOTAL(dev_priv, trans)` (intel_display_regs.h)
+pub unsafe fn TRANS_HTOTAL(display: *const IntelDisplay, trans: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _TRANS_HTOTAL_A)
+}
+
+/// `TRANS_HBLANK(dev_priv, trans)` (intel_display_regs.h)
+pub unsafe fn TRANS_HBLANK(display: *const IntelDisplay, trans: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _TRANS_HBLANK_A)
+}
+
+/// `TRANS_HSYNC(dev_priv, trans)` (intel_display_regs.h)
+pub unsafe fn TRANS_HSYNC(display: *const IntelDisplay, trans: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _TRANS_HSYNC_A)
+}
+
+/// `TRANS_VTOTAL(dev_priv, trans)` (intel_display_regs.h)
+pub unsafe fn TRANS_VTOTAL(display: *const IntelDisplay, trans: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _TRANS_VTOTAL_A)
+}
+
+/// `TRANS_VBLANK(dev_priv, trans)` (intel_display_regs.h)
+pub unsafe fn TRANS_VBLANK(display: *const IntelDisplay, trans: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _TRANS_VBLANK_A)
+}
+
+/// `TRANS_VSYNC(dev_priv, trans)` (intel_display_regs.h)
+pub unsafe fn TRANS_VSYNC(display: *const IntelDisplay, trans: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _TRANS_VSYNC_A)
+}
+
+/// `PIPESRC(dev_priv, pipe)` (intel_display_regs.h)
+pub unsafe fn PIPESRC(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _PIPEASRC)
+}
+
+/// `TRANS_VSYNCSHIFT(dev_priv, trans)` (intel_display_regs.h)
+pub unsafe fn TRANS_VSYNCSHIFT(display: *const IntelDisplay, trans: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _TRANS_VSYNCSHIFT_A)
+}
+
+/// `TRANS_MULT(dev_priv, trans)` (intel_display_regs.h)
+pub unsafe fn TRANS_MULT(display: *const IntelDisplay, trans: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _TRANS_MULT_A)
+}
+
+/// `PORT_HOTPLUG_EN(dev_priv)` (intel_display_regs.h)
+pub unsafe fn PORT_HOTPLUG_EN(display: *const IntelDisplay) -> I915RegT {
+    mmio(DISPLAY_MMIO_BASE(display) + 0x61110)
+}
+
+/// `PORT_HOTPLUG_STAT(dev_priv)` (intel_display_regs.h)
+pub unsafe fn PORT_HOTPLUG_STAT(display: *const IntelDisplay) -> I915RegT {
+    mmio(DISPLAY_MMIO_BASE(display) + 0x61114)
+}
+
+/// `PIPEDSL(dev_priv, pipe)` (intel_display_regs.h)
+pub unsafe fn PIPEDSL(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_PIPE2(display, pipe, _PIPEADSL)
+}
+
+/// `TRANSCONF(dev_priv, trans)` (intel_display_regs.h)
+pub unsafe fn TRANSCONF(display: *const IntelDisplay, trans: u32) -> I915RegT {
+    _MMIO_PIPE2(display, trans, _TRANSACONF)
+}
+
+/// `PIPESTAT(dev_priv, pipe)` (intel_display_regs.h)
+pub unsafe fn PIPESTAT(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_PIPE2(display, pipe, _PIPEASTAT)
+}
+
+/// `PIPE_ARB_CTL(dev_priv, pipe)` (intel_display_regs.h)
+pub unsafe fn PIPE_ARB_CTL(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_PIPE2(display, pipe, _PIPE_ARB_CTL_A)
+}
+
+/// `PIPEFRAME(dev_priv, pipe)` (intel_display_regs.h)
+pub unsafe fn PIPEFRAME(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_PIPE2(display, pipe, _PIPEAFRAMEHIGH)
+}
+
+/// `PIPEFRAMEPIXEL(dev_priv, pipe)` (intel_display_regs.h)
+pub unsafe fn PIPEFRAMEPIXEL(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_PIPE2(display, pipe, _PIPEAFRAMEPIXEL)
+}
+
+/// `PIPE_FRMCOUNT_G4X(dev_priv, pipe)` (intel_display_regs.h)
+pub unsafe fn PIPE_FRMCOUNT_G4X(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_PIPE2(display, pipe, _PIPEA_FRMCOUNT_G4X)
+}
+
+/// `CHV_BLEND(dev_priv, pipe)` (intel_display_regs.h)
+pub unsafe fn CHV_BLEND(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _CHV_BLEND_A)
+}
+
+/// `CHV_CANVAS(dev_priv, pipe)` (intel_display_regs.h)
+pub unsafe fn CHV_CANVAS(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _CHV_CANVAS_A)
+}
+
+/// `PIPE_DATA_M1(dev_priv, tran)` (intel_display_regs.h)
+pub unsafe fn PIPE_DATA_M1(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _PIPEA_DATA_M1)
+}
+
+/// `PIPE_DATA_N1(dev_priv, tran)` (intel_display_regs.h)
+pub unsafe fn PIPE_DATA_N1(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _PIPEA_DATA_N1)
+}
+
+/// `PIPE_DATA_M2(dev_priv, tran)` (intel_display_regs.h)
+pub unsafe fn PIPE_DATA_M2(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _PIPEA_DATA_M2)
+}
+
+/// `PIPE_DATA_N2(dev_priv, tran)` (intel_display_regs.h)
+pub unsafe fn PIPE_DATA_N2(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _PIPEA_DATA_N2)
+}
+
+/// `PIPE_LINK_M1(dev_priv, tran)` (intel_display_regs.h)
+pub unsafe fn PIPE_LINK_M1(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _PIPEA_LINK_M1)
+}
+
+/// `PIPE_LINK_N1(dev_priv, tran)` (intel_display_regs.h)
+pub unsafe fn PIPE_LINK_N1(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _PIPEA_LINK_N1)
+}
+
+/// `PIPE_LINK_M2(dev_priv, tran)` (intel_display_regs.h)
+pub unsafe fn PIPE_LINK_M2(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _PIPEA_LINK_M2)
+}
+
+/// `PIPE_LINK_N2(dev_priv, tran)` (intel_display_regs.h)
+pub unsafe fn PIPE_LINK_N2(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _PIPEA_LINK_N2)
+}
+
+/// `GEN8_DE_PIPE_IRQ_REGS(pipe)` (intel_display_regs.h)
+pub const fn GEN8_DE_PIPE_IRQ_REGS(pipe: u32) -> IntelIrqRegs {
+    INTEL_IRQ_REGS(GEN8_DE_PIPE_IMR(pipe), GEN8_DE_PIPE_IER(pipe), GEN8_DE_PIPE_IIR(pipe))
+}
+
+/// `CHICKEN_TRANS(display, trans)` (intel_display_regs.h)
+pub unsafe fn CHICKEN_TRANS(display: *const IntelDisplay, trans: u32) -> I915RegT {
+    if unsafe { DISPLAY_VER(display) } >= 14 {
+        _MTL_CHICKEN_TRANS(trans)
+    } else {
+        _CHICKEN_TRANS(trans)
+    }
+}
+
+/// `PCH_DPLL(pll)` (intel_display_regs.h)
+pub const fn PCH_DPLL(pll: u32) -> I915RegT {
+    mmio(if pll == 0 { _PCH_DPLL_A } else { _PCH_DPLL_B })
+}
+
+/// `PCH_FP0(pll)` (intel_display_regs.h)
+pub const fn PCH_FP0(pll: u32) -> I915RegT {
+    mmio(if pll == 0 { _PCH_FPA0 } else { _PCH_FPB0 })
+}
+
+/// `PCH_FP1(pll)` (intel_display_regs.h)
+pub const fn PCH_FP1(pll: u32) -> I915RegT {
+    mmio(if pll == 0 { _PCH_FPA1 } else { _PCH_FPB1 })
+}
+
+/// `HSW_TVIDEO_DIP_CTL(dev_priv, trans)` (intel_display_regs.h)
+pub unsafe fn HSW_TVIDEO_DIP_CTL(display: *const IntelDisplay, trans: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _HSW_VIDEO_DIP_CTL_A)
+}
+
+/// `HSW_TVIDEO_DIP_AVI_DATA(dev_priv, trans, i)` (intel_display_regs.h)
+pub unsafe fn HSW_TVIDEO_DIP_AVI_DATA(display: *const IntelDisplay, trans: u32, i: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _HSW_VIDEO_DIP_AVI_DATA_A + i * 4)
+}
+
+/// `HSW_TVIDEO_DIP_VS_DATA(dev_priv, trans, i)` (intel_display_regs.h)
+pub unsafe fn HSW_TVIDEO_DIP_VS_DATA(display: *const IntelDisplay, trans: u32, i: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _HSW_VIDEO_DIP_VS_DATA_A + i * 4)
+}
+
+/// `HSW_TVIDEO_DIP_SPD_DATA(dev_priv, trans, i)` (intel_display_regs.h)
+pub unsafe fn HSW_TVIDEO_DIP_SPD_DATA(display: *const IntelDisplay, trans: u32, i: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _HSW_VIDEO_DIP_SPD_DATA_A + i * 4)
+}
+
+/// `HSW_TVIDEO_DIP_GMP_DATA(dev_priv, trans, i)` (intel_display_regs.h)
+pub unsafe fn HSW_TVIDEO_DIP_GMP_DATA(display: *const IntelDisplay, trans: u32, i: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _HSW_VIDEO_DIP_GMP_DATA_A + i * 4)
+}
+
+/// `HSW_TVIDEO_DIP_VSC_DATA(dev_priv, trans, i)` (intel_display_regs.h)
+pub unsafe fn HSW_TVIDEO_DIP_VSC_DATA(display: *const IntelDisplay, trans: u32, i: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _HSW_VIDEO_DIP_VSC_DATA_A + i * 4)
+}
+
+/// `ADL_TVIDEO_DIP_AS_SDP_DATA(dev_priv, trans, i)` (intel_display_regs.h)
+pub unsafe fn ADL_TVIDEO_DIP_AS_SDP_DATA(display: *const IntelDisplay, trans: u32, i: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _ADL_VIDEO_DIP_AS_DATA_A + i * 4)
+}
+
+/// `GLK_TVIDEO_DIP_DRM_DATA(dev_priv, trans, i)` (intel_display_regs.h)
+pub unsafe fn GLK_TVIDEO_DIP_DRM_DATA(display: *const IntelDisplay, trans: u32, i: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _GLK_VIDEO_DIP_DRM_DATA_A + i * 4)
+}
+
+/// `HSW_TVIDEO_DIP_GCP(dev_priv, trans)` (intel_display_regs.h)
+pub unsafe fn HSW_TVIDEO_DIP_GCP(display: *const IntelDisplay, trans: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _HSW_VIDEO_DIP_GCP_A)
+}
+
+/// `ICL_VIDEO_DIP_PPS_DATA(dev_priv, trans, i)` (intel_display_regs.h)
+pub unsafe fn ICL_VIDEO_DIP_PPS_DATA(display: *const IntelDisplay, trans: u32, i: u32) -> I915RegT {
+    _MMIO_TRANS2(display, trans, _ICL_VIDEO_DIP_PPS_DATA_A + i * 4)
+}
+
+/// `TRANS_DDI_FUNC_CTL(dev_priv, tran)` (intel_display_regs.h)
+pub unsafe fn TRANS_DDI_FUNC_CTL(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _TRANS_DDI_FUNC_CTL_A)
+}
+
+/// `TRANS_DDI_FUNC_CTL2(dev_priv, tran)` (intel_display_regs.h)
+pub unsafe fn TRANS_DDI_FUNC_CTL2(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _TRANS_DDI_FUNC_CTL2_A)
+}
+
+/// `TGL_DP_TP_CTL(dev_priv, tran)` (intel_display_regs.h)
+pub unsafe fn TGL_DP_TP_CTL(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _TGL_DP_TP_CTL_A)
+}
+
+/// `TGL_DP_TP_STATUS(dev_priv, tran)` (intel_display_regs.h)
+pub unsafe fn TGL_DP_TP_STATUS(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _TGL_DP_TP_STATUS_A)
+}
+
+pub const fn DDI_PORT_WIDTH_ENCODE(width: u32) -> u32 {
+    if width == 3 { 4 } else { width - 1 }
+}
+
+/// `DDI_PORT_WIDTH(width)` (intel_display_regs.h)
+pub const fn DDI_PORT_WIDTH(width: u32) -> u32 {
+    reg_field_prep(DDI_PORT_WIDTH_MASK, DDI_PORT_WIDTH_ENCODE(width))
+}
+
+/// `TRANS_MSA_MISC(dev_priv, tran)` (intel_display_regs.h)
+pub unsafe fn TRANS_MSA_MISC(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _TRANSA_MSA_MISC)
+}
+
+/// `TRANS_SET_CONTEXT_LATENCY(dev_priv, tran)` (intel_display_regs.h)
+pub unsafe fn TRANS_SET_CONTEXT_LATENCY(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _TRANS_A_SET_CONTEXT_LATENCY)
+}
+
+pub const SKL_DPLL1: u32 = 1;
+
+/// `DPLL_CFGCR1(id)` (intel_display_regs.h)
+pub const fn DPLL_CFGCR1(id: u32) -> I915RegT {
+    _MMIO_PIPE(id - SKL_DPLL1, _DPLL1_CFGCR1, _DPLL2_CFGCR1)
+}
+
+/// `DPLL_CFGCR2(id)` (intel_display_regs.h)
+pub const fn DPLL_CFGCR2(id: u32) -> I915RegT {
+    _MMIO_PIPE(id - SKL_DPLL1, _DPLL1_CFGCR2, _DPLL2_CFGCR2)
+}
+
+pub const TC_PORT_4: u32 = 3;
+
+/// `ICL_DPCLKA_CFGCR0_TC_CLK_OFF(tc_port)` (intel_display_regs.h)
+pub const fn ICL_DPCLKA_CFGCR0_TC_CLK_OFF(tc_port: u32) -> u32 {
+    1 << (if tc_port < TC_PORT_4 { tc_port + 12 } else { tc_port - TC_PORT_4 + 21 })
+}
+
+/// `VLV_PIPE_MSA_MISC(__display, pipe)` (intel_display_regs.h)
+pub unsafe fn VLV_PIPE_MSA_MISC(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_PIPE2(display, pipe, _VLV_PIPE_MSA_MISC_A)
+}
+
+pub const DPIO_PHY0: u32 = 0;
+
+/// `PHY_POWERGOOD(phy)` (intel_display_regs.h)
+pub const fn PHY_POWERGOOD(phy: u32) -> u32 {
+    if phy == DPIO_PHY0 { 1 << 31 } else { 1 << 30 }
+}
+
+/// `GEN9_PIPE_PLANE_FLIP_DONE(plane_id)` (intel_display_regs.h)
+pub const fn GEN9_PIPE_PLANE_FLIP_DONE(plane_id: u32) -> u32 {
+    reg_bit((if plane_id >= (PLANE_5 as u32) { 16 - (PLANE_5 as u32) } else { 3 - (PLANE_1 as u32) }) + plane_id)
+}

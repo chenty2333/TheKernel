@@ -868,3 +868,28 @@ pub const PORT_ALPM_LFPS_CTL_LAST_LFPS_HALF_CYCLE_DURATION_MASK: u32 = reg_genma
 pub const fn PORT_ALPM_LFPS_CTL_LAST_LFPS_HALF_CYCLE_DURATION(val: u32) -> u32 {
     reg_field_prep(PORT_ALPM_LFPS_CTL_LAST_LFPS_HALF_CYCLE_DURATION_MASK, val)
 }
+
+/// `TRANS_PSR_IMR(dev_priv, tran)` (intel_psr_regs.h)
+pub unsafe fn TRANS_PSR_IMR(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _PSR_IMR_A)
+}
+
+/// `TRANS_PSR_IIR(dev_priv, tran)` (intel_psr_regs.h)
+pub unsafe fn TRANS_PSR_IIR(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _PSR_IIR_A)
+}
+
+/// `PR_ALPM_CTL(dev_priv, tran)` (intel_psr_regs.h)
+pub unsafe fn PR_ALPM_CTL(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _PR_ALPM_CTL_A)
+}
+
+/// `ALPM_CTL(dev_priv, tran)` (intel_psr_regs.h)
+pub unsafe fn ALPM_CTL(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _ALPM_CTL_A)
+}
+
+/// `ALPM_CTL2(dev_priv, tran)` (intel_psr_regs.h)
+pub unsafe fn ALPM_CTL2(display: *const IntelDisplay, tran: u32) -> I915RegT {
+    _MMIO_TRANS2(display, tran, _ALPM_CTL2_A)
+}

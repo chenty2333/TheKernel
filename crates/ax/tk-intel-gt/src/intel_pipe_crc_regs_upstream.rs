@@ -269,3 +269,33 @@ pub const _PIPE_CRC_RES_B_HSW: u32 = 0x61064;
 pub const fn PIPE_CRC_RES_HSW(pipe: u32) -> I915RegT {
     _MMIO_PIPE((pipe), _PIPE_CRC_RES_A_HSW, _PIPE_CRC_RES_B_HSW)
 }
+
+/// `PIPE_CRC_CTL(dev_priv, pipe)` (intel_pipe_crc_regs.h)
+pub unsafe fn PIPE_CRC_CTL(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _PIPE_CRC_CTL_A)
+}
+
+/// `PIPE_CRC_RES_RED(dev_priv, pipe)` (intel_pipe_crc_regs.h)
+pub unsafe fn PIPE_CRC_RES_RED(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _PIPE_CRC_RES_RED_A)
+}
+
+/// `PIPE_CRC_RES_GREEN(dev_priv, pipe)` (intel_pipe_crc_regs.h)
+pub unsafe fn PIPE_CRC_RES_GREEN(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _PIPE_CRC_RES_GREEN_A)
+}
+
+/// `PIPE_CRC_RES_BLUE(dev_priv, pipe)` (intel_pipe_crc_regs.h)
+pub unsafe fn PIPE_CRC_RES_BLUE(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _PIPE_CRC_RES_BLUE_A)
+}
+
+/// `PIPE_CRC_RES_RES1_I915(dev_priv, pipe)` (intel_pipe_crc_regs.h)
+pub unsafe fn PIPE_CRC_RES_RES1_I915(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _PIPE_CRC_RES_RES1_A_I915)
+}
+
+/// `PIPE_CRC_RES_RES2_G4X(dev_priv, pipe)` (intel_pipe_crc_regs.h)
+pub unsafe fn PIPE_CRC_RES_RES2_G4X(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _PIPE_CRC_RES_RES2_A_G4X)
+}

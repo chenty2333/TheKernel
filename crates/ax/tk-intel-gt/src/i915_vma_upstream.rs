@@ -471,7 +471,7 @@ unsafe fn atomic_try_cmpxchg(value: *mut AtomicT, expected: &mut i32, new_value:
 
 #[inline]
 fn node_color_differs(node: *const DrmMmNode, color: c_ulong) -> bool {
-    unsafe { drm_mm_node_allocated(node) && (*node).color != color }
+    unsafe { crate::i915_vma_api_upstream::i915_node_color_differs(node, color) }
 }
 
 #[inline]

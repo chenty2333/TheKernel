@@ -16,10 +16,39 @@
 
 pub use crate::intel_gtt_api_upstream::{bit as reg_bit, genmask as reg_genmask, reg_field_prep};
 pub use crate::intel_workarounds_types_upstream::I915RegT;
+pub use crate::intel_display_core_types_upstream::IntelDisplay;
 
 /// `_MMIO(r)`: wraps a register offset.
 pub const fn mmio(reg: u32) -> I915RegT {
     I915RegT { reg }
+}
+
+/// `_MMIO(r)` alias for C macro name.
+pub const fn _MMIO(reg: u32) -> I915RegT {
+    mmio(reg)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct IntelIrqRegs {
+    pub imr: I915RegT,
+    pub ier: I915RegT,
+    pub iir: I915RegT,
+}
+
+pub const fn INTEL_IRQ_REGS(imr: I915RegT, ier: I915RegT, iir: I915RegT) -> IntelIrqRegs {
+    IntelIrqRegs { imr, ier, iir }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct IntelErrorRegs {
+    pub emr: I915RegT,
+    pub eir: I915RegT,
+}
+
+pub const fn INTEL_ERROR_REGS(emr: I915RegT, eir: I915RegT) -> IntelErrorRegs {
+    IntelErrorRegs { emr, eir }
 }
 
 /// `INVALID_MMIO_REG` from i915_reg_defs.h.
@@ -35,6 +64,11 @@ pub const fn pick_even(index: u32, a: u32, b: u32) -> u32 {
     a.wrapping_add(index.wrapping_mul(b.wrapping_sub(a)))
 }
 
+/// `_PICK_EVEN(index, a, b)` alias for C macro name.
+pub const fn _PICK_EVEN(index: u32, a: u32, b: u32) -> u32 {
+    pick_even(index, a, b)
+}
+
 /// `_PICK_EVEN_2RANGES(index, c_index, a, b, c, d)`.
 pub const fn pick_even_2ranges(index: u32, c_index: u32, a: u32, b: u32, c: u32, d: u32) -> u32 {
     if index < c_index {
@@ -44,9 +78,19 @@ pub const fn pick_even_2ranges(index: u32, c_index: u32, a: u32, b: u32, c: u32,
     }
 }
 
+/// `_PICK_EVEN_2RANGES(index, c_index, a, b, c, d)` alias for C macro name.
+pub const fn _PICK_EVEN_2RANGES(index: u32, c_index: u32, a: u32, b: u32, c: u32, d: u32) -> u32 {
+    pick_even_2ranges(index, c_index, a, b, c, d)
+}
+
 /// `_PICK(index, ...)`: indexed lookup into a constant list.
 pub const fn pick(index: u32, values: &[u32]) -> u32 {
     values[index as usize]
+}
+
+/// `_PICK(index, ...)` alias for C macro name.
+pub const fn _PICK(index: u32, values: &[u32]) -> u32 {
+    pick(index, values)
 }
 
 /// `VLV_DISPLAY_BASE` (intel_display_reg_defs.h)
@@ -120,4 +164,76 @@ pub const fn _MMIO_BASE_PIPE3(base: u32, pipe: u32, a: u32, b: u32, c: u32) -> I
 /// `_MMIO_BASE_PORT3(base, pipe, a, b, c)` (intel_display_reg_defs.h)
 pub const fn _MMIO_BASE_PORT3(base: u32, pipe: u32, a: u32, b: u32, c: u32) -> I915RegT {
     mmio(((base) + pick_even_2ranges(pipe, 1, a, a, b, c)))
+}
+
+use crate::intel_display_device_types_upstream::{IntelDisplayDeviceInfo, IntelDisplayRuntimeInfo};
+use crate::intel_display_limits_types_upstream::{PIPE_A, TRANSCODER_A};
+
+#[inline]
+pub unsafe fn DISPLAY_INFO(display: *const IntelDisplay) -> *mut IntelDisplayDeviceInfo {
+    unsafe { (*display).info.__device_info }
+}
+
+#[inline]
+pub unsafe fn DISPLAY_RUNTIME_INFO(display: *const IntelDisplay) -> *const IntelDisplayRuntimeInfo {
+    unsafe { core::ptr::addr_of!((*display).info.__runtime_info) }
+}
+
+#[inline]
+pub unsafe fn DISPLAY_VER(display: *const IntelDisplay) -> u16 {
+    unsafe { (*display).info.__runtime_info.ip.ver }
+}
+
+#[inline]
+pub unsafe fn DISPLAY_MMIO_BASE(display: *const IntelDisplay) -> u32 {
+    let info = unsafe { DISPLAY_INFO(display) };
+    unsafe { (*info).mmio_offset }
+}
+
+#[inline]
+pub unsafe fn INTEL_DISPLAY_DEVICE_PIPE_OFFSET(display: *const IntelDisplay, pipe: u32) -> u32 {
+    let info = unsafe { DISPLAY_INFO(display) };
+    unsafe {
+        (*info).pipe_offsets[pipe as usize]
+            .wrapping_sub((*info).pipe_offsets[PIPE_A as usize])
+            .wrapping_add((*info).mmio_offset)
+    }
+}
+
+#[inline]
+pub unsafe fn INTEL_DISPLAY_DEVICE_TRANS_OFFSET(display: *const IntelDisplay, trans: u32) -> u32 {
+    let info = unsafe { DISPLAY_INFO(display) };
+    unsafe {
+        (*info).trans_offsets[trans as usize]
+            .wrapping_sub((*info).trans_offsets[TRANSCODER_A as usize])
+            .wrapping_add((*info).mmio_offset)
+    }
+}
+
+#[inline]
+pub unsafe fn INTEL_DISPLAY_DEVICE_CURSOR_OFFSET(display: *const IntelDisplay, pipe: u32) -> u32 {
+    let info = unsafe { DISPLAY_INFO(display) };
+    unsafe {
+        (*info).cursor_offsets[pipe as usize]
+            .wrapping_sub((*info).cursor_offsets[PIPE_A as usize])
+            .wrapping_add((*info).mmio_offset)
+    }
+}
+
+/// `_MMIO_PIPE2(display, pipe, reg)` (intel_display_reg_defs.h)
+#[inline]
+pub unsafe fn _MMIO_PIPE2(display: *const IntelDisplay, pipe: u32, reg: u32) -> I915RegT {
+    mmio(unsafe { INTEL_DISPLAY_DEVICE_PIPE_OFFSET(display, pipe) }.wrapping_add(reg))
+}
+
+/// `_MMIO_TRANS2(display, trans, reg)` (intel_display_reg_defs.h)
+#[inline]
+pub unsafe fn _MMIO_TRANS2(display: *const IntelDisplay, trans: u32, reg: u32) -> I915RegT {
+    mmio(unsafe { INTEL_DISPLAY_DEVICE_TRANS_OFFSET(display, trans) }.wrapping_add(reg))
+}
+
+/// `_MMIO_CURSOR2(display, pipe, reg)` (intel_display_reg_defs.h)
+#[inline]
+pub unsafe fn _MMIO_CURSOR2(display: *const IntelDisplay, pipe: u32, reg: u32) -> I915RegT {
+    mmio(unsafe { INTEL_DISPLAY_DEVICE_CURSOR_OFFSET(display, pipe) }.wrapping_add(reg))
 }

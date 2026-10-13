@@ -62,8 +62,18 @@ pub const PALETTE_10BIT_BLUE_MANT_MASK: u32 = reg_genmask(5, 2);
 /// `PALETTE_10BIT_BLUE_UDW_MASK` (intel_color_regs.h)
 pub const PALETTE_10BIT_BLUE_UDW_MASK: u32 = reg_genmask(1, 0);
 
+/// `PALETTE(dev_priv, pipe, i)` (intel_color_regs.h)
+pub unsafe fn PALETTE(display: *const IntelDisplay, pipe: u32, i: u32) -> I915RegT {
+    _MMIO(DISPLAY_MMIO_BASE(display) + pick_even_2ranges(pipe, 2, _PALETTE_A, _PALETTE_B, _CHV_PALETTE_C, _CHV_PALETTE_C) + i * 4)
+}
+
 /// `_PIPEAGCMAX` (intel_color_regs.h)
 pub const _PIPEAGCMAX: u32 = 0x70010;
+
+/// `PIPEGCMAX(dev_priv, pipe, i)` (intel_color_regs.h)
+pub unsafe fn PIPEGCMAX(display: *const IntelDisplay, pipe: u32, i: u32) -> I915RegT {
+    _MMIO_PIPE2(display, pipe, _PIPEAGCMAX + i * 4)
+}
 
 /// `_PIPEBGCMAX` (intel_color_regs.h)
 pub const _PIPEBGCMAX: u32 = 0x71010;
@@ -615,20 +625,50 @@ pub const fn PREC_PAL_MULTI_SEG_DATA(pipe: u32) -> I915RegT {
 /// `_PIPE_A_WGC_C01_C00` (intel_color_regs.h)
 pub const _PIPE_A_WGC_C01_C00: u32 = 0x600B0;
 
+/// `PIPE_WGC_C01_C00(dev_priv, pipe)` (intel_color_regs.h)
+pub unsafe fn PIPE_WGC_C01_C00(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _PIPE_A_WGC_C01_C00)
+}
+
 /// `_PIPE_A_WGC_C02` (intel_color_regs.h)
 pub const _PIPE_A_WGC_C02: u32 = 0x600B4;
+
+/// `PIPE_WGC_C02(dev_priv, pipe)` (intel_color_regs.h)
+pub unsafe fn PIPE_WGC_C02(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _PIPE_A_WGC_C02)
+}
 
 /// `_PIPE_A_WGC_C11_C10` (intel_color_regs.h)
 pub const _PIPE_A_WGC_C11_C10: u32 = 0x600B8;
 
+/// `PIPE_WGC_C11_C10(dev_priv, pipe)` (intel_color_regs.h)
+pub unsafe fn PIPE_WGC_C11_C10(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _PIPE_A_WGC_C11_C10)
+}
+
 /// `_PIPE_A_WGC_C12` (intel_color_regs.h)
 pub const _PIPE_A_WGC_C12: u32 = 0x600BC;
+
+/// `PIPE_WGC_C12(dev_priv, pipe)` (intel_color_regs.h)
+pub unsafe fn PIPE_WGC_C12(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _PIPE_A_WGC_C12)
+}
 
 /// `_PIPE_A_WGC_C21_C20` (intel_color_regs.h)
 pub const _PIPE_A_WGC_C21_C20: u32 = 0x600C0;
 
+/// `PIPE_WGC_C21_C20(dev_priv, pipe)` (intel_color_regs.h)
+pub unsafe fn PIPE_WGC_C21_C20(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _PIPE_A_WGC_C21_C20)
+}
+
 /// `_PIPE_A_WGC_C22` (intel_color_regs.h)
 pub const _PIPE_A_WGC_C22: u32 = 0x600C4;
+
+/// `PIPE_WGC_C22(dev_priv, pipe)` (intel_color_regs.h)
+pub unsafe fn PIPE_WGC_C22(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_TRANS2(display, pipe, _PIPE_A_WGC_C22)
+}
 
 /// `_CGM_PIPE_A_CSC_COEFF01` (intel_color_regs.h)
 pub const _CGM_PIPE_A_CSC_COEFF01: u32 = ((VLV_DISPLAY_BASE + 0x67900));
