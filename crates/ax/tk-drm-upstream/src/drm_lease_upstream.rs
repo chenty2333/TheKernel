@@ -56,7 +56,7 @@ pub unsafe extern "C" fn drm_lease_owner(mut master: *mut DrmMaster) -> *mut Drm
 unsafe fn _drm_find_lessee(master: *mut DrmMaster, lessee_id: i32) -> *mut DrmMaster {
     unsafe {
         let owner = drm_lease_owner(master);
-        idr_find(core::ptr::addr_of_mut!((*owner).lessee_idr), lessee_id).cast()
+        idr_find(core::ptr::addr_of_mut!((*owner).lessee_idr), lessee_id as core::ffi::c_ulong).cast()
     }
 }
 
@@ -64,7 +64,7 @@ unsafe fn _drm_find_lessee(master: *mut DrmMaster, lessee_id: i32) -> *mut DrmMa
 unsafe fn _drm_lease_held_master(master: *mut DrmMaster, id: i32) -> bool {
     unsafe {
         if !(*master).lessor.is_null() {
-            return !idr_find(core::ptr::addr_of_mut!((*master).leases), id).is_null();
+            return !idr_find(core::ptr::addr_of_mut!((*master).leases), id as core::ffi::c_ulong).is_null();
         }
         true
     }

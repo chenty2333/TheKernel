@@ -10,7 +10,7 @@
 
 #![allow(non_snake_case, unsafe_op_in_unsafe_fn)]
 
-use core::ffi::{c_void};
+use core::ffi::{c_ulong, c_void};
 use core::mem::{offset_of, size_of, MaybeUninit};
 
 use tk_linux_kapi::{
@@ -19,7 +19,6 @@ use tk_linux_kapi::{
     idr::Idr,
     memory::{kref_get, kref_get_unless_zero, kref_put, kref_read},
     mm_native::copy_to_user_c,
-    xarray::{__xa_alloc, __xa_erase, __xa_store, xa_destroy, xa_init_flags, xa_load, XaLimit},
     types::{Kref, Mutex},
 };
 
@@ -114,100 +113,10 @@ macro_rules! WARN_ON_C {
     };
 }
 
-/// Sentinel stored for ids reserved with a NULL object (`idr_alloc(NULL)`):
-/// the xarray backend cannot store NULL, and `idr_find()` maps this back to
-/// NULL.
-static IDR_RESERVED_ENTRY: u8 = 0;
-
-fn idr_reserved_entry() -> *mut c_void {
-    core::ptr::addr_of!(IDR_RESERVED_ENTRY).cast_mut().cast()
-}
-
-/// `idr_init()`: an empty id registry starting at zero.
-// upstream: idr.c idr_init()
-pub(crate) unsafe fn idr_init(idr: *mut Idr) {
-    xa_init_flags(&mut (*idr).idr_rt, 0);
-    (*idr).idr_base = 0;
-    (*idr).idr_next = 0;
-}
-
-/// `idr_destroy()`: releases the backing store of an empty or drained registry.
-// upstream: idr.c idr_destroy()
-pub(crate) unsafe fn idr_destroy(idr: *mut Idr) {
-    xa_destroy(&mut (*idr).idr_rt);
-}
-
-/// `idr_alloc()`: lowest free id in `[start, end)`, `end == 0` meaning
-/// unbounded (`INT_MAX`). `ptr == NULL` reserves the id.
-// upstream: idr.c idr_alloc()
-pub(crate) unsafe fn idr_alloc(idr: *mut Idr, ptr: *mut c_void, start: i32, end: i32) -> i32 {
-    let max = if end <= 0 { i32::MAX } else { end - 1 };
-    let entry = if ptr.is_null() { idr_reserved_entry() } else { ptr };
-    let mut id = 0u32;
-    let limit = XaLimit {
-        min: start as u32,
-        max: max as u32,
-    };
-    let ret = __xa_alloc(
-        core::ptr::addr_of_mut!((*idr).idr_rt),
-        &mut id,
-        entry,
-        limit,
-        GFP_KERNEL,
-    );
-    if ret == -EINVAL {
-        return -EINVAL;
-    }
-    if ret != 0 {
-        return IDR_ENOSPC;
-    }
-    id as i32
-}
-
-/// `idr_replace()`: swaps the entry at `id` for `ptr`; returns the old entry,
-/// or NULL when `id` is not allocated (Linux returns `ERR_PTR(-ENOENT)`).
-// upstream: idr.c idr_replace()
-pub(crate) unsafe fn idr_replace(idr: *mut Idr, ptr: *mut c_void, id: i32) -> *mut c_void {
-    let old = xa_load::<_, c_void>(&mut (*idr).idr_rt, id as u32);
-    if old.is_null() {
-        return core::ptr::null_mut();
-    }
-    __xa_store(&mut (*idr).idr_rt, id as u32, ptr, 0);
-    old
-}
-
-/// `idr_remove()`: frees the id; returns the removed entry or NULL.
-// upstream: idr.c idr_remove()
-pub(crate) unsafe fn idr_remove(idr: *mut Idr, id: i32) -> *mut c_void {
-    let old = __xa_erase::<_, c_void>(&mut (*idr).idr_rt, id as u32);
-    if old == idr_reserved_entry() {
-        return core::ptr::null_mut();
-    }
-    old
-}
-
-/// `idr_find()`: the entry allocated at `id`, or NULL (also for reserved ids).
-// upstream: idr.c idr_find()
-pub(crate) unsafe fn idr_find(idr: *mut Idr, id: i32) -> *mut c_void {
-    let entry = xa_load::<_, c_void>(&mut (*idr).idr_rt, id as u32);
-    if entry == idr_reserved_entry() {
-        return core::ptr::null_mut();
-    }
-    entry
-}
-
-// upstream: idr.c idr_for_each()
-pub(crate) unsafe fn idr_for_each<F>(idr: *mut Idr, mut f: F)
-where
-    F: FnMut(i32, *mut c_void),
-{
-    let entries = tk_linux_kapi::xarray::xa_snapshot(&mut (*idr).idr_rt);
-    for (id, ptr) in entries {
-        if ptr != idr_reserved_entry() && !ptr.is_null() {
-            f(id as i32, ptr);
-        }
-    }
-}
+pub use tk_linux_kapi::idr::{
+    idr_alloc, idr_destroy, idr_find, idr_for_each, idr_get_next, idr_init, idr_init_base,
+    idr_is_empty, idr_preload, idr_preload_end, idr_remove, idr_replace,
+};
 
 
 /// `to_drm_device()`-style helper: `drm_core_check_feature()` from drm_drv.h.
@@ -362,7 +271,7 @@ pub unsafe extern "C" fn __drm_mode_object_find(
     unsafe {
         let idr_mutex = &mut (*dev).mode_config.idr_mutex as *mut Mutex;
         mutex_lock(idr_mutex);
-        let mut obj: *mut DrmModeObject = idr_find(&mut (*dev).mode_config.object_idr, id as i32).cast::<DrmModeObject>();
+        let mut obj: *mut DrmModeObject = idr_find(core::ptr::addr_of_mut!((*dev).mode_config.object_idr), id as c_ulong).cast::<DrmModeObject>();
         if !obj.is_null() && r#type != DRM_MODE_OBJECT_ANY && (*obj).r#type != r#type {
             obj = core::ptr::null_mut();
         }

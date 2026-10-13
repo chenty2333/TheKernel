@@ -47,7 +47,7 @@ use crate::{
     drm_encoder_upstream::{drm_encoder_register_all, drm_encoder_unregister_all},
     drm_file_types::DrmFile,
     drm_framebuffer_types::DrmFramebuffer,
-    drm_mode_object_upstream::{drm_core_check_feature, idr_destroy, idr_init, DRIVER_MODESET},
+    drm_mode_object_upstream::{drm_core_check_feature, idr_destroy, idr_init, idr_init_base, DRIVER_MODESET},
     drm_modeset_lock_types::DrmModesetLock,
     drm_plane_types::{DrmPlane, DRM_PLANE_TYPE_PRIMARY},
     drm_property_types::{DrmProperty, DrmPropEnumList},
@@ -148,14 +148,6 @@ unsafe fn put_user<T: Copy>(dst: *mut T, value: T) -> i32 {
     } else {
         -EFAULT
     }
-}
-
-/// `idr_init_base(idr, base)` (idr.c): an id registry starting at `base`.
-// upstream: lib/idr.c idr_init_base()
-unsafe fn idr_init_base(idr: *mut tk_linux_kapi::idr::Idr, base: u32) {
-    idr_init(idr);
-    (*idr).idr_base = base;
-    (*idr).idr_next = base;
 }
 
 // upstream: drm_mode_config.c drm_modeset_register_all()
