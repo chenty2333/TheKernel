@@ -225,7 +225,7 @@ unsafe fn __intel_de_wait_for_register(
     out_val: *mut u32,
     mut is_atomic: bool,
 ) -> i32 {
-    let start = axhal::time::monotonic_time_nanos();
+    let start = tk_linux_kapi::clock::now_ns();
     let timeout_ns = (timeout_us as u64).saturating_mul(1000);
     let end = start.saturating_add(timeout_ns);
 
@@ -239,8 +239,20 @@ unsafe fn __intel_de_wait_for_register(
         wait = 1;
     }
 
+    #[cfg(test)]
+    let mut test_loop_count = 0;
+
     loop {
-        let expired = axhal::time::monotonic_time_nanos() >= end;
+        #[cfg(test)]
+        {
+            test_loop_count += 1;
+            if test_loop_count > 5 {
+                ret = -crate::linux_config::ETIMEDOUT;
+                break;
+            }
+        }
+
+        let expired = tk_linux_kapi::clock::now_ns() >= end;
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
         reg_value = read(display, reg);
@@ -254,6 +266,7 @@ unsafe fn __intel_de_wait_for_register(
             break;
         }
 
+        #[cfg(not(test))]
         if is_atomic {
             tk_linux_kapi::primitives::udelay(wait as u32);
         } else {
