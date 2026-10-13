@@ -664,9 +664,10 @@ fn write_log_bytes(bytes: &[u8]) -> usize {
 }
 
 fn console_window_size(width: usize, height: usize) -> super::terminal::WindowSize {
+    let scale = crate::pseudofs::dev::console_font::glyph_scale(width, height);
     super::terminal::WindowSize {
-        ws_col: (width / CELL_WIDTH).clamp(1, MAX_COLS) as u16,
-        ws_row: (height / CELL_HEIGHT).clamp(1, MAX_ROWS) as u16,
+        ws_col: (width / (CELL_WIDTH * scale)).clamp(1, MAX_COLS) as u16,
+        ws_row: (height / (CELL_HEIGHT * scale)).clamp(1, MAX_ROWS) as u16,
         ws_xpixel: width.min(u16::MAX as usize) as u16,
         ws_ypixel: height.min(u16::MAX as usize) as u16,
     }
@@ -784,6 +785,7 @@ pub(crate) fn present_while_text_active(vt: u16) {
     fb::fbcon_draw(|frame| {
         progress.point(7); // drawing pixels
         frame.clear(0x0000_0000);
+        let (cell_width, cell_height) = frame.cell_size();
         // Snapshot one row at a time so writers are never excluded for the
         // MMIO-bound glyph drawing, only for a bounded cell copy.
         let mut row_cells = [Cell::DEFAULT; MAX_COLS];
@@ -805,8 +807,8 @@ pub(crate) fn present_while_text_active(vt: u16) {
             for (col, &cell) in row_cells[..cols].iter().enumerate() {
                 let (fg, bg) = cell.colors();
                 frame.glyph(
-                    col * CELL_WIDTH,
-                    row * CELL_HEIGHT,
+                    col * cell_width,
+                    row * cell_height,
                     cell.byte,
                     fg,
                     bg,
@@ -1084,6 +1086,11 @@ mod tests {
     fn physical_console_reports_the_same_bounded_grid_it_renders() {
         let size = console_window_size(1024, 768);
         assert_eq!((size.ws_col, size.ws_row), (128, 48));
+        let size = console_window_size(3840, 2160);
+        assert_eq!((size.ws_col, size.ws_row), (160, 45));
+        assert_eq!((size.ws_xpixel, size.ws_ypixel), (3840, 2160));
+        let size = console_window_size(1920, 1080);
+        assert_eq!((size.ws_col, size.ws_row), (160, 64));
         let size = console_window_size(usize::MAX, usize::MAX);
         assert_eq!(
             (usize::from(size.ws_col), usize::from(size.ws_row)),

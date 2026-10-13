@@ -17,6 +17,20 @@ pub(crate) const GLYPH_HEIGHT: usize = 16;
 /// Columns in one glyph cell.
 pub(crate) const GLYPH_WIDTH: usize = 8;
 
+/// Keep 4K consoles readable when a capture device reduces them to 1080p.
+/// Early/panic and normal VT consoles must use the same cell geometry.
+pub(crate) const UHD_WIDTH: u32 = 3840;
+pub(crate) const UHD_HEIGHT: u32 = 2160;
+pub(crate) const UHD_GLYPH_SCALE: usize = 3;
+
+pub(crate) fn glyph_scale(width: usize, height: usize) -> usize {
+    if width >= UHD_WIDTH as usize && height >= UHD_HEIGHT as usize {
+        UHD_GLYPH_SCALE
+    } else {
+        1
+    }
+}
+
 /// The row bitmap for `byte`, or `None` when the font has no glyph for it.
 ///
 /// A caller which gets `None` draws nothing.  The console is handed control

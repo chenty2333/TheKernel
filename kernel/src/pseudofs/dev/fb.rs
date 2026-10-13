@@ -676,39 +676,38 @@ impl FbconFrame {
         }
     }
 
+    pub(crate) fn cell_size(&self) -> (usize, usize) {
+        let scale = super::console_font::glyph_scale(self.width, self.height);
+        (super::console_font::GLYPH_WIDTH * scale, super::console_font::GLYPH_HEIGHT * scale)
+    }
+
     pub(crate) fn glyph(&self, x: usize, y: usize, byte: u8, fg: u32, bg: u32, cursor: bool) {
-        // A byte with no glyph is drawn blank rather than as a substitute
-        // character: the console shows control bytes, UTF-8 continuation bytes
-        // and bytes outside the font's range, and a full screen of replacement
-        // boxes would hide the text around them.
+        // Use the same integer-scaled bitmap and cell dimensions as the
+        // early/panic console; a VT handoff must not shrink 4K text again.
         let rows = super::console_font::glyph(byte);
-        for dy in 0..super::console_font::GLYPH_HEIGHT {
-            let bits = rows.map_or(0, |rows| rows[dy]);
-            for dx in 0..super::console_font::GLYPH_WIDTH {
-                let px = x + dx;
-                let py = y + dy;
+        let scale = super::console_font::glyph_scale(self.width, self.height);
+        let (cell_width, cell_height) = self.cell_size();
+        for dy in 0..cell_height {
+            let source_y = dy / scale;
+            let bits = rows.map_or(0, |rows| rows[source_y]);
+            for dx in 0..cell_width {
+                let source_x = dx / scale;
+                let (Some(px), Some(py)) = (x.checked_add(dx), y.checked_add(dy)) else {
+                    continue;
+                };
                 if px >= self.width || py >= self.height {
                     continue;
                 }
-                // A steady underline marks the insertion cell without changing
-                // its stored glyph. Keep the one-pixel cell border clear, like
-                // the font itself, so adjacent cells never visually merge.
                 let cursor_ink = cursor
-                    && dy == super::console_font::GLYPH_HEIGHT - 2
-                    && dx > 0
-                    && dx + 1 < super::console_font::GLYPH_WIDTH;
-                let color = if bits & (0x80 >> dx) != 0 || cursor_ink {
+                    && source_y == super::console_font::GLYPH_HEIGHT - 2
+                    && source_x > 0
+                    && source_x + 1 < super::console_font::GLYPH_WIDTH;
+                let color = if bits & (0x80 >> source_x) != 0 || cursor_ink {
                     fg
                 } else {
                     bg
                 };
-                if py
-                    .checked_mul(self.pitch)
-                    .and_then(|row| row.checked_add(px.saturating_mul(self.bytes_per_pixel)))
-                    .is_some_and(|offset| offset + self.bytes_per_pixel <= self.size)
-                {
-                    self.write_pixel(px, py, color);
-                }
+                self.write_pixel(px, py, color);
             }
         }
     }
@@ -1513,6 +1512,42 @@ mod tests {
         let bytes = surface.bytes.lock();
         assert_eq!(&bytes[14..16], &[0xff, 0xff]);
         assert!(bytes[..14].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn uhd_console_glyph_and_cursor_use_the_same_threefold_cell() {
+        let _context = crate::test_support::scheduler_test_context();
+        let surface = MemorySurface::new(3840, 2160);
+        let frame = FbconFrame {
+            scanout: surface.clone(),
+            size: 3840 * 2160 * 4,
+            width: 3840,
+            height: 2160,
+            pitch: 3840 * 4,
+            bytes_per_pixel: 4,
+        };
+        assert_eq!(frame.cell_size(), (24, 48));
+        frame.glyph(0, 0, b'A', 0x00ff_ffff, 0x0012_3456, true);
+        let glyph = super::super::console_font::glyph(b'A').unwrap();
+        let bytes = surface.bytes.lock();
+        for y in 0..48 {
+            for x in 0..24 {
+                let (source_x, source_y) = (x / 3, y / 3);
+                let cursor = source_y == 14 && source_x > 0 && source_x < 7;
+                let ink = glyph[source_y] & (0x80 >> source_x) != 0 || cursor;
+                let mut expected = [0; 4];
+                surface.layout.encode_into(
+                    if ink { 0x00ff_ffff } else { 0x0012_3456 },
+                    &mut expected,
+                );
+                let offset = y * frame.pitch + x * 4;
+                assert_eq!(&bytes[offset..offset + 4], &expected);
+            }
+            assert_eq!(&bytes[y * frame.pitch + 24 * 4..y * frame.pitch + 25 * 4], &[0; 4]);
+        }
+        drop(bytes);
+        // Malformed coordinates must not wrap into the start of the surface.
+        frame.glyph(usize::MAX, usize::MAX, b'A', 0, 0, false);
     }
 
     #[test]

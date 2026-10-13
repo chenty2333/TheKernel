@@ -33,6 +33,9 @@
 //! depth, wrapping, clipping and the choice of log lines -- is exercised by
 //! host tests on a plain buffer as well as on the real aperture.
 
+#[cfg(test)]
+use super::console_font::UHD_GLYPH_SCALE;
+
 use core::{
     fmt::{self, Write as _},
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -56,13 +59,6 @@ const MAX_ROWS: usize = 128;
 
 /// Columns of text one frame may address, for the same reason as [`MAX_ROWS`].
 const MAX_COLS: usize = 512;
-
-/// The UHD framebuffer is normally reduced to 1920x1080 by inexpensive
-/// capture devices. Triple the early font so its 8x16 source bitmap occupies
-/// 12x24 captured pixels after the 2:1 reduction.
-const UHD_WIDTH: u32 = 3840;
-const UHD_HEIGHT: u32 = 2160;
-const UHD_GLYPH_SCALE: usize = 3;
 
 /// Bytes of the kernel log tail one frame reads.
 const TAIL_BYTES: usize = 4096;
@@ -260,11 +256,7 @@ impl TextView {
     /// Keep the established pixel font on smaller displays; enlarge only the
     /// UHD path used by the 2:1 4K-to-1080p capture route.
     fn glyph_scale(&self) -> usize {
-        if self.width >= UHD_WIDTH && self.height >= UHD_HEIGHT {
-            UHD_GLYPH_SCALE
-        } else {
-            1
-        }
+        super::console_font::glyph_scale(self.width as usize, self.height as usize)
     }
 
     fn cell_width(&self) -> usize {
