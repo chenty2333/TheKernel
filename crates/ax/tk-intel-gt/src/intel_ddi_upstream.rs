@@ -9,11 +9,13 @@ use core::{ffi::c_void, ptr};
 
 use tk_drm_upstream::{
     drm_connector_types::{DrmConnector, DrmConnectorState},
+    drm_crtc_types::DrmCrtc,
     drm_device_types::DrmDevice,
     drm_encoder_types::{DrmEncoder, DrmEncoderFuncs},
 };
 
 use crate::{
+    intel_bios_upstream::IntelBiosEncoderData,
     intel_combo_phy_regs_upstream::*,
     intel_ddi_buf_trans_types_upstream::IntelDdiBufTrans,
     intel_de_upstream::{
@@ -21,7 +23,9 @@ use crate::{
         intel_de_wait_for_set_ms, intel_de_write,
     },
     intel_display_core_types_upstream::IntelDisplay,
-    intel_display_limits_types_upstream::{PORT_NONE, Pipe, Port, TRANSCODER_EDP},
+    intel_display_limits_types_upstream::{
+        PORT_A, PORT_B, PORT_C, PORT_D, PORT_E, PORT_NONE, Pipe, Port, TRANSCODER_EDP,
+    },
     intel_display_reg_defs_upstream::INVALID_MMIO_REG,
     intel_display_regs_upstream::*,
     intel_display_types_upstream::{
@@ -32,6 +36,7 @@ use crate::{
     intel_dkl_phy_regs_upstream::*,
     intel_dpll_mgr_types_upstream::{IntelDpll, IntelDpllHwState},
     intel_mg_phy_regs_upstream::{MG_DP_MODE_CFG_DP_X1_MODE, MG_DP_MODE_CFG_DP_X2_MODE},
+    intel_vbt_defs_types_upstream::ChildDeviceConfig,
     intel_workarounds_types_upstream::I915RegT,
 };
 
@@ -62,16 +67,19 @@ unsafe extern "C" {
     fn intel_bios_encoder_supports_dvi(data: *const c_void) -> bool;
     fn intel_bios_encoder_supports_hdmi(data: *const c_void) -> bool;
     fn intel_bios_encoder_supports_dp(data: *const c_void) -> bool;
+    fn intel_bios_encoder_supports_edp(data: *const c_void) -> bool;
+    fn intel_bios_encoder_supports_dsi(data: *const c_void) -> bool;
+    fn intel_bios_encoder_is_lspcon(data: *const c_void) -> bool;
     fn intel_bios_encoder_supports_typec_usb(data: *const c_void) -> bool;
     fn intel_bios_encoder_supports_tbt(data: *const c_void) -> bool;
     fn intel_bios_encoder_lane_reversal(data: *const c_void) -> bool;
     fn intel_bios_hdmi_level_shift(data: *const c_void) -> i32;
     fn intel_bios_encoder_is_dedicated_external(data: *const c_void) -> bool;
-    fn intel_port_to_phy(display: *mut IntelDisplay, port: Port) -> u32;
-    fn intel_encoder_to_phy(encoder: *mut IntelEncoder) -> u32;
-    fn intel_encoder_is_tc(encoder: *const IntelEncoder) -> bool;
-    fn intel_encoder_is_combo(encoder: *const IntelEncoder) -> bool;
-    fn intel_encoder_to_tc(encoder: *const IntelEncoder) -> u32;
+    fn intel_port_to_phy(display: *mut IntelDisplay, port: Port) -> i32;
+    fn intel_encoder_to_phy(encoder: *mut IntelEncoder) -> i32;
+    fn intel_encoder_is_tc(encoder: *mut IntelEncoder) -> bool;
+    fn intel_encoder_is_combo(encoder: *mut IntelEncoder) -> bool;
+    fn intel_encoder_to_tc(encoder: *mut IntelEncoder) -> i32;
     fn intel_tc_port_in_tbt_alt_mode(port: *mut IntelDigitalPort) -> bool;
     fn intel_tc_port_in_legacy_mode(port: *mut IntelDigitalPort) -> bool;
     fn intel_tc_port_in_dp_alt_mode(port: *mut IntelDigitalPort) -> bool;
@@ -93,6 +101,17 @@ unsafe extern "C" {
     -> bool;
     fn intel_dp_cleanup_connector(port: *mut IntelDigitalPort, connector: *mut IntelConnector);
     fn intel_dp_encoder_flush_work(encoder: *mut DrmEncoder);
+    fn intel_dp_compute_config_late(
+        encoder: *mut IntelEncoder,
+        state: *mut IntelCrtcState,
+        conn_state: *mut DrmConnectorState,
+    ) -> i32;
+    fn intel_dp_initial_fastset_check(
+        encoder: *mut IntelEncoder,
+        state: *mut IntelCrtcState,
+    ) -> bool;
+    fn intel_dp_link_check(encoder: *mut IntelEncoder);
+    fn intel_dp_encoder_suspend(encoder: *mut IntelEncoder);
     fn intel_dp_test_phy(dp: *mut IntelDp) -> bool;
     fn intel_dp_check_link_state(dp: *mut IntelDp);
     fn intel_encoder_hotplug(encoder: *mut IntelEncoder, connector: *mut IntelConnector) -> u32;
@@ -175,6 +194,7 @@ unsafe extern "C" {
     fn intel_infoframe_init(port: *mut IntelDigitalPort);
     fn intel_tc_port_init(port: *mut IntelDigitalPort, legacy: bool) -> i32;
     fn intel_tc_port_cleanup(port: *mut IntelDigitalPort);
+    fn intel_tc_port_suspend(port: *mut IntelDigitalPort);
     fn intel_tc_port_connected(encoder: *mut IntelEncoder) -> bool;
     fn intel_tc_port_get_pin_assignment(port: *mut IntelDigitalPort) -> i32;
     fn intel_tc_port_init_mode(port: *mut IntelDigitalPort);
@@ -223,6 +243,11 @@ unsafe extern "C" {
     fn intel_dkl_phy_write(display: *mut IntelDisplay, reg: IntelDklPhyReg, val: u32);
     fn intel_dkl_phy_read(display: *mut IntelDisplay, reg: IntelDklPhyReg) -> u32;
     fn intel_dkl_phy_rmw(display: *mut IntelDisplay, reg: IntelDklPhyReg, clear: u32, set: u32);
+    fn intel_encoder_link_check_init(
+        encoder: *mut IntelEncoder,
+        callback: Option<unsafe extern "C" fn(*mut IntelEncoder)>,
+    );
+    fn intel_encoder_link_check_flush_work(encoder: *mut IntelEncoder);
 }
 
 #[inline]
@@ -439,7 +464,7 @@ pub unsafe extern "C" fn intel_ddi_enable_transcoder_clock(
     }
     let phy = intel_encoder_to_phy(encoder);
     let select = if DISPLAY_VER(display) >= 13 {
-        TGL_TRANS_CLK_SEL_PORT(phy)
+        TGL_TRANS_CLK_SEL_PORT(phy as u32)
     } else {
         TGL_TRANS_CLK_SEL_PORT((*encoder).port as u32)
     };
@@ -484,8 +509,22 @@ pub unsafe extern "C" fn intel_ddi_get_clock(
     pd.pll = pll;
     let _active = intel_dpll_get_hw_state(display, pll, &mut pd.hw_state);
     icl_set_active_port_dpll(state, id);
-    (*state).port_clock =
-        intel_dpll_get_freq(display, (*state).intel_dpll, &(*state).dpll_hw_state);
+    if intel_encoder_is_tc(encoder)
+        && !(*pll).info.is_null()
+        && (*(*pll).info).id == crate::intel_dpll_mgr_types_upstream::DPLL_ID_ICL_TBTPLL
+    {
+        (*state).port_clock =
+            match intel_de_read(display, DDI_CLK_SEL((*encoder).port as u32)) & DDI_CLK_SEL_MASK {
+                DDI_CLK_SEL_TBT_162 => 162_000,
+                DDI_CLK_SEL_TBT_270 => 270_000,
+                DDI_CLK_SEL_TBT_540 => 540_000,
+                DDI_CLK_SEL_TBT_810 => 810_000,
+                _ => 0,
+            };
+    } else {
+        (*state).port_clock =
+            intel_dpll_get_freq(display, (*state).intel_dpll, &(*state).dpll_hw_state);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -553,7 +592,7 @@ unsafe extern "C" fn icl_combo_enable_clock(
     if display.is_null() {
         return;
     }
-    let phy = intel_encoder_to_phy(encoder);
+    let phy = intel_encoder_to_phy(encoder) as u32;
     let pll_id = (*(*(*state).intel_dpll).info).id as u32;
     icl_ddi_enable_clock_mux(
         display,
@@ -572,7 +611,7 @@ unsafe extern "C" fn icl_combo_disable_clock(encoder: *mut IntelEncoder) {
     if display.is_null() {
         return;
     }
-    let phy = intel_encoder_to_phy(encoder);
+    let phy = intel_encoder_to_phy(encoder) as u32;
     icl_ddi_disable_clock_mux(
         display,
         ICL_DPCLKA_CFGCR0,
@@ -587,7 +626,7 @@ unsafe extern "C" fn icl_combo_is_clock_enabled(encoder: *mut IntelEncoder) -> b
     let display = display_from_encoder(encoder);
     !display.is_null()
         && intel_de_read(display, ICL_DPCLKA_CFGCR0)
-            & ICL_DPCLKA_CFGCR0_DDI_CLK_OFF(intel_encoder_to_phy(encoder))
+            & ICL_DPCLKA_CFGCR0_DDI_CLK_OFF(intel_encoder_to_phy(encoder) as u32)
             == 0
 }
 
@@ -626,7 +665,7 @@ unsafe extern "C" fn icl_tc_enable_clock(encoder: *mut IntelEncoder, state: *mut
         return;
     }
     let port = (*encoder).port;
-    let tc = intel_encoder_to_tc(encoder);
+    let tc = intel_encoder_to_tc(encoder) as u32;
     let pll_id = (*(*(*state).intel_dpll).info).id;
     intel_de_write(
         display,
@@ -650,7 +689,7 @@ unsafe extern "C" fn icl_tc_disable_clock(encoder: *mut IntelEncoder) {
     if display.is_null() {
         return;
     }
-    let tc = intel_encoder_to_tc(encoder);
+    let tc = intel_encoder_to_tc(encoder) as u32;
     icl_ddi_disable_clock_mux(display, ICL_DPCLKA_CFGCR0, ICL_DPCLKA_CFGCR0_TC_CLK_OFF(tc));
     intel_de_write(
         display,
@@ -670,7 +709,7 @@ unsafe extern "C" fn icl_tc_is_clock_enabled(encoder: *mut IntelEncoder) -> bool
     let port_val = intel_de_read(display, DDI_CLK_SEL((*encoder).port as u32)) & DDI_CLK_SEL_MASK;
     port_val != DDI_CLK_SEL_NONE
         && intel_de_read(display, ICL_DPCLKA_CFGCR0)
-            & ICL_DPCLKA_CFGCR0_TC_CLK_OFF(intel_encoder_to_tc(encoder))
+            & ICL_DPCLKA_CFGCR0_TC_CLK_OFF(intel_encoder_to_tc(encoder) as u32)
             == 0
 }
 
@@ -679,7 +718,7 @@ unsafe fn icl_combo_get_pll(encoder: *mut IntelEncoder) -> *mut IntelDpll {
     if display.is_null() || encoder.is_null() {
         return core::ptr::null_mut();
     }
-    let phy = intel_encoder_to_phy(encoder);
+    let phy = intel_encoder_to_phy(encoder) as u32;
     let raw = (intel_de_read(display, ICL_DPCLKA_CFGCR0) & ICL_DPCLKA_CFGCR0_DDI_CLK_SEL_MASK(phy))
         >> ICL_DPCLKA_CFGCR0_DDI_CLK_SEL_SHIFT(phy);
     if raw > 1 {
@@ -734,7 +773,7 @@ unsafe fn icl_program_mg_dp_mode(port: *mut IntelDigitalPort, state: *const Inte
         return;
     }
 
-    let tc = intel_encoder_to_tc(encoder);
+    let tc = intel_encoder_to_tc(encoder) as u32;
     let mut ln0 = intel_dkl_phy_read(display, DKL_DP_MODE(tc, 0));
     let mut ln1 = intel_dkl_phy_read(display, DKL_DP_MODE(tc, 1));
     ln0 &= !(MG_DP_MODE_CFG_DP_X1_MODE | MG_DP_MODE_CFG_DP_X2_MODE);
@@ -823,7 +862,7 @@ unsafe extern "C" fn intel_ddi_prepare_link_retrain(dp: *mut IntelDp, state: *mu
         && intel_encoder_is_tc(encoder)
         && (intel_tc_port_in_dp_alt_mode(port) || intel_tc_port_in_legacy_mode(port))
     {
-        let tc = intel_encoder_to_tc(encoder);
+        let tc = intel_encoder_to_tc(encoder) as u32;
         for lane in 0..2 {
             intel_dkl_phy_rmw(
                 display,
@@ -1101,7 +1140,7 @@ unsafe extern "C" fn icl_combo_phy_set_signal_levels(
     if display.is_null() || state.is_null() {
         return;
     }
-    let phy = intel_encoder_to_phy(encoder);
+    let phy = intel_encoder_to_phy(encoder) as u32;
     let mut n_entries = 0;
     let trans = ddi_buf_trans(encoder, state, &mut n_entries);
     if trans.is_null() || (*trans).entries.is_null() || (*trans).num_entries == 0 {
@@ -1198,7 +1237,7 @@ unsafe extern "C" fn tgl_dkl_phy_set_signal_levels(
     if trans.is_null() || (*trans).entries.is_null() || (*trans).num_entries == 0 {
         return;
     }
-    let tc = intel_encoder_to_tc(encoder);
+    let tc = intel_encoder_to_tc(encoder) as u32;
     for lane in 0..2u32 {
         let reg0 = DKL_TX_DPCNTL0(tc, lane);
         let reg1 = DKL_TX_DPCNTL1(tc, lane);
@@ -1270,8 +1309,21 @@ pub unsafe extern "C" fn intel_ddi_compute_config(
     state: *mut IntelCrtcState,
     conn_state: *mut DrmConnectorState,
 ) -> i32 {
-    if encoder.is_null() || state.is_null() {
+    if encoder.is_null()
+        || state.is_null()
+        || conn_state.is_null()
+        || (*conn_state).connector.is_null()
+    {
         return -22;
+    }
+    let connector_type = (*(*conn_state).connector).connector_type;
+    if connector_type == tk_drm_upstream::uapi_drm_consts::DRM_MODE_CONNECTOR_eDP as i32 {
+        return -95;
+    }
+    if connector_type != tk_drm_upstream::uapi_drm_consts::DRM_MODE_CONNECTOR_HDMIA as i32
+        && connector_type != tk_drm_upstream::uapi_drm_consts::DRM_MODE_CONNECTOR_DisplayPort as i32
+    {
+        return -95;
     }
     // ADL-P exports SST DP and HDMI from this module; MST stream encoders are
     // deliberately not advertised until their lifecycle and payload path land.
@@ -1291,6 +1343,166 @@ pub unsafe extern "C" fn intel_ddi_compute_config(
         intel_ddi_compute_min_voltage_level(state);
     }
     ret
+}
+
+unsafe fn ddi_new_crtc_state(
+    atomic: *mut IntelAtomicState,
+    crtc: *mut DrmCrtc,
+) -> *mut IntelCrtcState {
+    if atomic.is_null() || crtc.is_null() {
+        return ptr::null_mut();
+    }
+    let commit = ptr::addr_of_mut!((*atomic).base);
+    let dev = (*commit).dev;
+    let index = (*crtc).index as usize;
+    if dev.is_null()
+        || index >= (*dev).mode_config.num_crtc.max(0) as usize
+        || (*commit).crtcs.is_null()
+    {
+        return ptr::null_mut();
+    }
+    (*(*commit).crtcs.add(index))
+        .new_state
+        .cast::<IntelCrtcState>()
+}
+
+unsafe fn ddi_port_sync_compatible(
+    state: *const IntelCrtcState,
+    other: *const IntelCrtcState,
+) -> bool {
+    if state.is_null() || other.is_null() {
+        return false;
+    }
+    let a = &*state;
+    let b = &*other;
+    a.hw.active
+        && b.hw.active
+        && a.joiner_pipes == 0
+        && b.joiner_pipes == 0
+        && a.output_types == b.output_types
+        && a.output_format == b.output_format
+        && a.lane_count == b.lane_count
+        && a.port_clock == b.port_clock
+        && a.hw.adjusted_mode.clock == b.hw.adjusted_mode.clock
+        && tk_drm_upstream::drm_modes_upstream::drm_mode_match(
+            &a.hw.adjusted_mode,
+            &b.hw.adjusted_mode,
+            (1 << 0) | (1 << 2) | (1 << 3), // timings, flags, 3D flags
+        )
+        && a.dp_m_n.tu == b.dp_m_n.tu
+        && a.dp_m_n.data_m == b.dp_m_n.data_m
+        && a.dp_m_n.data_n == b.dp_m_n.data_n
+        && a.dp_m_n.link_m == b.dp_m_n.link_m
+        && a.dp_m_n.link_n == b.dp_m_n.link_n
+}
+
+unsafe fn ddi_port_sync_transcoders(
+    state: *const IntelCrtcState,
+    connector: *const DrmConnector,
+) -> u8 {
+    if state.is_null()
+        || connector.is_null()
+        || !(*connector).has_tile
+        || (*connector).tile_group.is_null()
+        || !intel_crtc_has_type(state, INTEL_OUTPUT_DP)
+    {
+        return 0;
+    }
+    let display = display_from_state(state);
+    if display.is_null() || !(9..=20).contains(&DISPLAY_VER(display)) {
+        return 0;
+    }
+
+    let commit = (*state).uapi.state;
+    if commit.is_null() {
+        return 0;
+    }
+    let atomic = commit.cast::<IntelAtomicState>();
+    if atomic.is_null() || (*atomic).base.connectors.is_null() {
+        return 0;
+    }
+    let tile_group_id = (*(*connector).tile_group).id;
+    let mut transcoders = 0u8;
+    for i in 0..(*atomic).base.num_connector.max(0) as usize {
+        let conn_state = &*(*atomic).base.connectors.add(i);
+        let candidate = conn_state.new_state;
+        if candidate.is_null() || (*candidate).connector.is_null() {
+            continue;
+        }
+        let tile = (*candidate).connector;
+        if !(*tile).has_tile
+            || (*tile).tile_group.is_null()
+            || (*(*tile).tile_group).id != tile_group_id
+            || (*candidate).crtc.is_null()
+        {
+            continue;
+        }
+        let crtc_state = ddi_new_crtc_state(atomic, (*candidate).crtc);
+        if !ddi_port_sync_compatible(state, crtc_state) {
+            continue;
+        }
+        let transcoder = (*crtc_state).cpu_transcoder;
+        if (0..8).contains(&transcoder) {
+            transcoders |= 1u8 << transcoder as u32;
+        }
+    }
+    transcoders
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_ddi_compute_config_late(
+    encoder: *mut IntelEncoder,
+    state: *mut IntelCrtcState,
+    conn_state: *mut DrmConnectorState,
+) -> i32 {
+    if encoder.is_null()
+        || state.is_null()
+        || conn_state.is_null()
+        || (*conn_state).connector.is_null()
+    {
+        return -22;
+    }
+    if intel_crtc_has_type(state, INTEL_OUTPUT_DP) {
+        let ret = intel_dp_compute_config_late(encoder, state, conn_state);
+        if ret != 0 {
+            return ret;
+        }
+    }
+
+    (*state).master_transcoder = crate::intel_display_limits_types_upstream::INVALID_TRANSCODER;
+    (*state).sync_mode_slaves_mask = 0;
+    let transcoders = ddi_port_sync_transcoders(state, (*conn_state).connector);
+    (*state).master_transcoder = if transcoders & (1u8 << TRANSCODER_EDP as u32) != 0 {
+        TRANSCODER_EDP
+    } else if transcoders != 0 {
+        transcoders.trailing_zeros() as i32
+    } else {
+        crate::intel_display_limits_types_upstream::INVALID_TRANSCODER
+    };
+    if (*state).master_transcoder == (*state).cpu_transcoder {
+        (*state).master_transcoder = crate::intel_display_limits_types_upstream::INVALID_TRANSCODER;
+        (*state).sync_mode_slaves_mask = transcoders & !(1u8 << (*state).cpu_transcoder as u32);
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_ddi_initial_fastset_check(
+    encoder: *mut IntelEncoder,
+    state: *mut IntelCrtcState,
+) -> bool {
+    if encoder.is_null() || state.is_null() {
+        return false;
+    }
+    let mut fastset = true;
+    if intel_encoder_is_tc(encoder) {
+        (*state).uapi.set_mode_changed(true);
+        fastset = false;
+    }
+    if intel_crtc_has_dp_encoder(state) && !intel_dp_initial_fastset_check(encoder, state) {
+        fastset = false;
+    }
+    fastset
 }
 
 #[unsafe(no_mangle)]
@@ -1783,8 +1995,13 @@ pub unsafe extern "C" fn intel_ddi_shutdown(encoder: *mut IntelEncoder) {
     if encoder.is_null() {
         return;
     }
-    intel_dp_encoder_shutdown(encoder);
-    intel_hdmi_encoder_shutdown(encoder);
+    let port = dig_port(encoder);
+    if (*port).dp.output_reg.reg != INVALID_MMIO_REG.reg {
+        intel_dp_encoder_shutdown(encoder);
+    }
+    if (*port).hdmi.hdmi_reg.reg != INVALID_MMIO_REG.reg {
+        intel_hdmi_encoder_shutdown(encoder);
+    }
 }
 
 unsafe fn intel_ddi_init_dp_connector(port: *mut IntelDigitalPort) -> i32 {
@@ -1799,11 +2016,6 @@ unsafe fn intel_ddi_init_dp_connector(port: *mut IntelDigitalPort) -> i32 {
     (*port).dp.set_idle_link_train = Some(intel_ddi_set_idle_link_train);
     (*port).dp.voltage_max = Some(intel_ddi_dp_voltage_max);
     (*port).dp.preemph_max = Some(intel_ddi_dp_preemph_max);
-    (*port).aux_ch = intel_dp_aux_ch(encoder);
-    if (*port).aux_ch == crate::intel_display_limits_types_upstream::AUX_CH_NONE {
-        intel_connector_free(connector);
-        return -22;
-    }
     if !intel_dp_init_connector(port, connector) {
         intel_connector_free(connector);
         return -22;
@@ -1811,10 +2023,20 @@ unsafe fn intel_ddi_init_dp_connector(port: *mut IntelDigitalPort) -> i32 {
     0
 }
 
+unsafe fn intel_ddi_cleanup_dp_connector(port: *mut IntelDigitalPort) {
+    if port.is_null() || (*port).dp.attached_connector.is_null() {
+        return;
+    }
+    let connector = (*port).dp.attached_connector;
+    intel_dp_cleanup_connector(port, connector);
+    tk_linux_kapi::memory::kfree(connector.cast::<c_void>());
+    (*port).dp.attached_connector = ptr::null_mut();
+}
+
 unsafe fn intel_ddi_init_hdmi_connector(port: *mut IntelDigitalPort) -> i32 {
     let connector = intel_connector_alloc();
     if connector.is_null() {
-        return 0;
+        return -12;
     }
     (*port).hdmi.hdmi_reg = DDI_BUF_CTL((*port).base.port as u32);
     if !intel_hdmi_init_connector(port, connector) {
@@ -1830,14 +2052,17 @@ unsafe extern "C" fn intel_ddi_compute_output_type(
     conn_state: *mut DrmConnectorState,
 ) -> u32 {
     if conn_state.is_null() || (*conn_state).connector.is_null() {
-        return INTEL_OUTPUT_DP;
+        return crate::intel_display_types_upstream::INTEL_OUTPUT_UNUSED;
     }
-    if (*(*conn_state).connector).connector_type
-        == tk_drm_upstream::uapi_drm_consts::DRM_MODE_CONNECTOR_HDMIA as i32
-    {
+    let connector_type = (*(*conn_state).connector).connector_type;
+    if connector_type == tk_drm_upstream::uapi_drm_consts::DRM_MODE_CONNECTOR_HDMIA as i32 {
         INTEL_OUTPUT_HDMI
-    } else {
+    } else if connector_type
+        == tk_drm_upstream::uapi_drm_consts::DRM_MODE_CONNECTOR_DisplayPort as i32
+    {
         INTEL_OUTPUT_DP
+    } else {
+        crate::intel_display_types_upstream::INTEL_OUTPUT_UNUSED
     }
 }
 
@@ -1861,6 +2086,7 @@ unsafe extern "C" fn intel_ddi_encoder_destroy(encoder: *mut DrmEncoder) {
     let intel_encoder = encoder.cast::<IntelEncoder>();
     let port = dig_port(intel_encoder);
     let display = display_from_encoder(intel_encoder);
+    intel_encoder_link_check_flush_work(intel_encoder);
     intel_dp_encoder_flush_work(encoder);
     if intel_encoder_is_tc(intel_encoder) {
         intel_tc_port_cleanup(port);
@@ -1881,6 +2107,26 @@ unsafe extern "C" fn intel_ddi_encoder_late_register(encoder: *mut DrmEncoder) -
         intel_tc_port_link_reset(dig_port(intel_encoder));
     }
     0
+}
+
+unsafe extern "C" fn intel_ddi_encoder_link_check(encoder: *mut IntelEncoder) {
+    if !encoder.is_null() {
+        intel_dp_link_check(encoder);
+    }
+}
+
+unsafe extern "C" fn intel_ddi_encoder_suspend(encoder: *mut IntelEncoder) {
+    if !encoder.is_null() {
+        intel_dp_encoder_suspend(encoder);
+    }
+}
+
+unsafe extern "C" fn intel_ddi_tc_suspend_complete(encoder: *mut IntelEncoder) {
+    if encoder.is_null() || !intel_encoder_is_tc(encoder) {
+        return;
+    }
+    intel_encoder_link_check_flush_work(encoder);
+    intel_tc_port_suspend(dig_port(encoder));
 }
 
 unsafe extern "C" fn intel_ddi_tc_shutdown_complete(encoder: *mut IntelEncoder) {
@@ -1931,6 +2177,66 @@ unsafe extern "C" fn intel_ddi_connected(encoder: *mut IntelEncoder) -> bool {
     intel_de_read(display, GEN8_DE_PORT_ISR) & hpd_bit != 0
 }
 
+unsafe fn ddi_port_strap_detected(display: *mut IntelDisplay, port: Port) -> bool {
+    if display.is_null() {
+        return false;
+    }
+    // SKL and newer do not expose the legacy DDI straps, including ADL-P.
+    if DISPLAY_VER(display) >= 9 {
+        return true;
+    }
+    match port {
+        PORT_A => {
+            intel_de_read(display, DDI_BUF_CTL(PORT_A as u32)) & DDI_INIT_DISPLAY_DETECTED != 0
+        }
+        PORT_B => intel_de_read(display, SFUSE_STRAP) & SFUSE_STRAP_DDIB_DETECTED != 0,
+        PORT_C => intel_de_read(display, SFUSE_STRAP) & SFUSE_STRAP_DDIC_DETECTED != 0,
+        PORT_D => intel_de_read(display, SFUSE_STRAP) & SFUSE_STRAP_DDID_DETECTED != 0,
+        PORT_E => true,
+        _ => false,
+    }
+}
+
+unsafe fn ddi_assert_port_valid(display: *mut IntelDisplay, port: Port) -> bool {
+    if display.is_null()
+        || !(0..crate::intel_display_limits_types_upstream::I915_MAX_PORTS).contains(&port)
+    {
+        return false;
+    }
+    let mask = (*display).info.__runtime_info.port_mask;
+    mask & (1u16 << port as u32) != 0
+}
+
+unsafe fn ddi_port_in_use(display: *mut IntelDisplay, port: Port) -> bool {
+    if display.is_null() || (*display).drm.is_null() {
+        return false;
+    }
+    let head = ptr::addr_of_mut!((*(*display).drm).mode_config.encoder_list);
+    let mut node = (*head).next;
+    let head_offset = core::mem::offset_of!(DrmEncoder, head);
+    while !node.is_null() && node != head {
+        let drm_encoder = node.cast::<u8>().sub(head_offset).cast::<DrmEncoder>();
+        let encoder = drm_encoder.cast::<IntelEncoder>();
+        if (*encoder).port == port {
+            return true;
+        }
+        node = (*node).next;
+    }
+    false
+}
+
+unsafe fn ddi_bios_lspcon_flag(devdata: *const c_void) -> bool {
+    if devdata.is_null() {
+        return false;
+    }
+    // VBT child-device flags: bit 2 is LSPCON. Read the byte directly so a
+    // misplaced flag on an unsupported platform is rejected, not treated as
+    // an ordinary DP port merely because HAS_LSPCON() is false.
+    let offset = core::mem::offset_of!(IntelBiosEncoderData, child)
+        + core::mem::offset_of!(ChildDeviceConfig, _anon_23_10);
+    *devdata.cast::<u8>().add(offset) & (1 << 2) != 0
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_ddi_port_pll_type_cb(
     encoder: *mut IntelEncoder,
@@ -1941,22 +2247,40 @@ pub unsafe extern "C" fn intel_ddi_port_pll_type_cb(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_ddi_init(display: *mut IntelDisplay, devdata: *const c_void) {
-    if display.is_null() || devdata.is_null() || DISPLAY_VER(display) != 13 {
-        return;
-    }
-    let port = intel_bios_encoder_port(devdata);
-    // Port A is the ADL-P eDP path and remains outside this external-DDI module.
-    if port == PORT_NONE
-        || port == crate::intel_display_limits_types_upstream::PORT_A
-        || port < 0
-        || port > 8
+    if display.is_null()
+        || devdata.is_null()
+        || (*display).drm.is_null()
+        || DISPLAY_VER(display) != 13
     {
         return;
     }
+    let port = intel_bios_encoder_port(devdata);
+    if port == PORT_NONE || !ddi_port_strap_detected(display, port) {
+        return;
+    }
+    if !ddi_assert_port_valid(display, port) || ddi_port_in_use(display, port) {
+        return;
+    }
+
+    // DSI, eDP and LSPCON have separate init/detection and connector lifecycles.
+    // This module deliberately declines those BIOS-described devices rather
+    // than exposing them as an ordinary SST DP connector.
+    if intel_bios_encoder_supports_dsi(devdata)
+        || intel_bios_encoder_supports_edp(devdata)
+        || intel_bios_encoder_is_lspcon(devdata)
+        || ddi_bios_lspcon_flag(devdata)
+    {
+        return;
+    }
+
     let init_dp = intel_bios_encoder_supports_dp(devdata);
     let init_hdmi =
         intel_bios_encoder_supports_dvi(devdata) || intel_bios_encoder_supports_hdmi(devdata);
     if !init_dp && !init_hdmi {
+        return;
+    }
+    let phy = intel_port_to_phy(display, port);
+    if crate::intel_hti_upstream::intel_hti_uses_phy(display, phy) {
         return;
     }
 
@@ -1968,18 +2292,40 @@ pub unsafe extern "C" fn intel_ddi_init(display: *mut IntelDisplay, devdata: *co
     encoder.devdata = devdata.cast_mut();
     encoder.r#type = INTEL_OUTPUT_DDI;
     encoder.port = port;
+    (*dig).dp.output_reg = INVALID_MMIO_REG;
+    (*dig).dedicated_external = intel_bios_encoder_is_dedicated_external(devdata);
+    (*dig).hdmi.hdmi_reg = INVALID_MMIO_REG;
+
+    let name = b"DDI\0";
+    if drm_encoder_init(
+        (*display).drm,
+        &mut encoder.base,
+        &INTEL_DDI_FUNCS,
+        DRM_MODE_ENCODER_TMDS,
+        name.as_ptr().cast(),
+    ) != 0
+    {
+        tk_linux_kapi::memory::kfree(dig.cast::<c_void>());
+        return;
+    }
+
+    let is_tc = intel_encoder_is_tc(encoder);
     encoder.cloneable = 0;
     encoder.pipe_mask = 0xff;
     encoder.power_domain = intel_display_power_ddi_lanes_domain(display, port) as _;
-    (*dig).lane_reversal = intel_bios_encoder_lane_reversal(devdata);
+    let buf_ctl = intel_de_read(display, DDI_BUF_CTL(port as u32));
+    (*dig).lane_reversal =
+        intel_bios_encoder_lane_reversal(devdata) || buf_ctl & DDI_BUF_PORT_REVERSAL != 0;
     (*dig).max_lanes = 4;
     (*dig).ddi_a_4_lanes = false;
-    (*dig).dedicated_external = intel_bios_encoder_is_dedicated_external(devdata);
     (*dig).ddi_io_power_domain = intel_display_power_ddi_io_domain(display, port) as _;
+    (*dig).aux_ch = crate::intel_display_limits_types_upstream::AUX_CH_NONE;
     encoder.hpd_pin = xelpd_hpd_pin(port);
     encoder.compute_config = Some(intel_ddi_compute_config);
+    encoder.compute_config_late = Some(intel_ddi_compute_config_late);
     encoder.compute_output_type = Some(intel_ddi_compute_output_type);
     encoder.hotplug = Some(intel_ddi_hotplug);
+    intel_encoder_link_check_init(encoder, Some(intel_ddi_encoder_link_check));
     encoder.pre_pll_enable = Some(intel_ddi_pre_pll_enable);
     encoder.pre_enable = Some(intel_ddi_pre_enable);
     encoder.enable = Some(intel_ddi_enable);
@@ -1990,10 +2336,19 @@ pub unsafe extern "C" fn intel_ddi_init(display: *mut IntelDisplay, devdata: *co
     encoder.get_hw_state = Some(intel_ddi_get_hw_state);
     encoder.get_config = Some(intel_ddi_get_config);
     encoder.sync_state = Some(intel_ddi_sync_state);
+    encoder.initial_fastset_check = Some(intel_ddi_initial_fastset_check);
+    encoder.suspend = Some(intel_ddi_encoder_suspend);
     encoder.shutdown = Some(intel_ddi_shutdown);
-    encoder.shutdown_complete = Some(intel_ddi_tc_shutdown_complete);
     encoder.get_power_domains = Some(intel_ddi_get_power_domains);
-    if intel_encoder_is_tc(encoder) {
+    if init_dp || is_tc {
+        (*dig).aux_ch = intel_dp_aux_ch(encoder);
+        if (*dig).aux_ch == crate::intel_display_limits_types_upstream::AUX_CH_NONE {
+            drm_encoder_cleanup(&mut encoder.base);
+            tk_linux_kapi::memory::kfree(dig.cast::<c_void>());
+            return;
+        }
+    }
+    if is_tc {
         encoder.port_pll_type = Some(icl_ddi_tc_port_pll_type);
         encoder.set_signal_levels = Some(tgl_dkl_phy_set_signal_levels);
         encoder.enable_clock = Some(icl_tc_enable_clock);
@@ -2002,6 +2357,8 @@ pub unsafe extern "C" fn intel_ddi_init(display: *mut IntelDisplay, devdata: *co
         (*dig).connected = Some(intel_tc_port_connected);
         (*dig).lock = Some(intel_tc_port_lock);
         (*dig).unlock = Some(intel_tc_port_unlock);
+        encoder.suspend_complete = Some(intel_ddi_tc_suspend_complete);
+        encoder.shutdown_complete = Some(intel_ddi_tc_shutdown_complete);
     } else {
         encoder.port_pll_type = None;
         encoder.set_signal_levels = Some(icl_combo_phy_set_signal_levels);
@@ -2012,49 +2369,46 @@ pub unsafe extern "C" fn intel_ddi_init(display: *mut IntelDisplay, devdata: *co
     }
     intel_ddi_buf_trans_init(encoder);
 
-    (*dig).hpd_pulse = Some(intel_dp_hpd_pulse);
+    if init_dp {
+        (*dig).hpd_pulse = Some(intel_dp_hpd_pulse);
+    }
     // intel_infoframe_init() installs the ADL-P HSW infoframe MMIO callbacks.
     intel_infoframe_init(dig);
 
-    if intel_encoder_is_tc(encoder) {
+    if is_tc {
         let mut legacy = !intel_bios_encoder_supports_typec_usb(devdata)
             && !intel_bios_encoder_supports_tbt(devdata);
         if !legacy && init_hdmi {
             legacy = !init_dp;
         }
         if intel_tc_port_init(dig, legacy) < 0 {
+            drm_encoder_cleanup(&mut encoder.base);
             tk_linux_kapi::memory::kfree(dig.cast::<c_void>());
             return;
         }
-        encoder.suspend_complete = Some(intel_ddi_tc_shutdown_complete);
-    }
-    let name = b"DDI\0";
-    if drm_encoder_init(
-        (*display).drm,
-        &mut encoder.base,
-        &INTEL_DDI_FUNCS,
-        DRM_MODE_ENCODER_TMDS,
-        name.as_ptr().cast(),
-    ) != 0
-    {
-        if intel_encoder_is_tc(encoder) {
-            intel_tc_port_cleanup(dig);
-        }
-        tk_linux_kapi::memory::kfree(dig.cast::<c_void>());
-        return;
     }
     if init_dp {
         if intel_ddi_init_dp_connector(dig) != 0 {
-            drm_encoder_cleanup(&mut encoder.base);
-            if intel_encoder_is_tc(encoder) {
+            if is_tc {
                 intel_tc_port_cleanup(dig);
             }
+            drm_encoder_cleanup(&mut encoder.base);
             tk_linux_kapi::memory::kfree(dig.cast::<c_void>());
             return;
         }
     }
     if init_hdmi {
-        let _ = intel_ddi_init_hdmi_connector(dig);
+        if intel_ddi_init_hdmi_connector(dig) != 0 {
+            if init_dp {
+                intel_ddi_cleanup_dp_connector(dig);
+            }
+            if is_tc {
+                intel_tc_port_cleanup(dig);
+            }
+            drm_encoder_cleanup(&mut encoder.base);
+            tk_linux_kapi::memory::kfree(dig.cast::<c_void>());
+            return;
+        }
     }
 }
 
