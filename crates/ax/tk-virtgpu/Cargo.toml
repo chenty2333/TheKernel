@@ -1,0 +1,23 @@
+[package]
+name = "tk-virtgpu"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license = "MIT"
+authors = ["TheKernel contributors"]
+description = "VirtIO GPU DRM driver for TheKernel"
+repository.workspace = true
+
+[package.metadata.thekernel]
+layer = "platform"
+
+[package.metadata.thekernel.host-test]
+selected = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axdriver_display = { package = "tk-axdriver-display", path = "../tk-axdriver-display", version = "0.1.0" }
+tk-drm-upstream = { path = "../tk-drm-upstream", version = "0.1.0" }

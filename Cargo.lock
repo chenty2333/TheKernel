@@ -4237,6 +4237,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tk-virtgpu"
+version = "0.1.0"
+dependencies = [
+ "tk-axdriver-display",
+ "tk-drm-upstream",
+]
+
+[[package]]
 name = "tk-virtio-drivers"
 version = "0.1.0"
 dependencies = [
