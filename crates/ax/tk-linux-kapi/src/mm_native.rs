@@ -19,7 +19,7 @@ use core::{
 use axhal::paging::MappingFlags;
 
 use super::{
-    mm::{VM_WRITE, VmAreaStruct},
+    mm::{VM_FAULT_SIGBUS, VM_WRITE, VmAreaStruct},
     shmem,
 };
 use mmu_notifier::{self, Event, Range as NotifierSpan, Subscriber};
@@ -73,6 +73,124 @@ pub struct PinnedFrames {
 pub type CurrentUserAddressSpace = fn() -> Option<Arc<dyn UserAddressSpace>>;
 
 static CURRENT_USER_ADDRESS_SPACE: spin::Once<CurrentUserAddressSpace> = spin::Once::new();
+
+/// Core-MM implementation of Linux `mapping_wrprotect_range()`.  The
+/// LinuxKPI entry below intentionally delegates to the kernel's existing
+/// shared-backing reverse map; it does not walk this shim's `MmStruct::vmas`.
+pub type MappingWrprotectHandler = unsafe extern "C" fn(
+    mapping: *mut c_void,
+    pgoff: c_ulong,
+    pfn: c_ulong,
+    nr_pages: c_ulong,
+) -> c_int;
+
+static MAPPING_WRPROTECT_HANDLER: spin::Once<MappingWrprotectHandler> = spin::Once::new();
+
+/// Core-MM implementation of Linux `vmf_insert_pfn()`. The provider validates
+/// the active SharedPages VMA/backend before inserting a leaf into its owning
+/// address space; this shim never creates a second VMA or page-table owner.
+pub type VmfInsertPfnHandler = unsafe extern "C" fn(
+    vma: *mut VmAreaStruct,
+    address: c_ulong,
+    pfn: c_ulong,
+) -> u32;
+
+static VMF_INSERT_PFN_HANDLER: spin::Once<VmfInsertPfnHandler> = spin::Once::new();
+
+/// Installs the core-MM `vmf_insert_pfn()` provider.
+pub fn install_vmf_insert_pfn_handler(
+    handler: VmfInsertPfnHandler,
+) -> Result<(), &'static str> {
+    let mut installed = false;
+    VMF_INSERT_PFN_HANDLER.call_once(|| {
+        installed = true;
+        handler
+    });
+    if installed {
+        Ok(())
+    } else if VMF_INSERT_PFN_HANDLER
+        .get()
+        .is_some_and(|current| *current as usize == handler as usize)
+    {
+        Ok(())
+    } else {
+        Err("vmf_insert_pfn provider already installed")
+    }
+}
+
+/// Linux `vmf_insert_pfn()`, delegated to the active core SharedPages fault
+/// context. Missing provider or an unrelated VMA fails closed with SIGBUS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vmf_insert_pfn(
+    vma: *mut VmAreaStruct,
+    address: c_ulong,
+    pfn: c_ulong,
+) -> u32 {
+    if vma.is_null() {
+        return VM_FAULT_SIGBUS;
+    }
+    let Some(handler) = VMF_INSERT_PFN_HANDLER.get() else {
+        return VM_FAULT_SIGBUS;
+    };
+    unsafe { handler(vma, address, pfn) }
+}
+
+/// Installs the native core-MM provider for LinuxKPI deferred-I/O rearming.
+///
+/// This is process-global kernel plumbing, installed before framebuffer VMAs
+/// are published.  A second, different installation is refused.
+pub fn install_mapping_wrprotect_handler(
+    handler: MappingWrprotectHandler,
+) -> Result<(), &'static str> {
+    let mut installed = false;
+    MAPPING_WRPROTECT_HANDLER.call_once(|| {
+        installed = true;
+        handler
+    });
+    if installed {
+        Ok(())
+    } else if MAPPING_WRPROTECT_HANDLER
+        .get()
+        .is_some_and(|current| *current as usize == handler as usize)
+    {
+        Ok(())
+    } else {
+        Err("mapping_wrprotect_range provider already installed")
+    }
+}
+
+/// Returns whether the real core-MM write-protect provider is installed.
+#[unsafe(no_mangle)]
+pub extern "C" fn mapping_wrprotect_range_ready() -> c_int {
+    if MAPPING_WRPROTECT_HANDLER.get().is_some() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Linux `mapping_wrprotect_range()`, dispatched to the core shared-page
+/// alias registry.  Returning an error before provider installation is
+/// deliberately fail-closed: framebuffer deferred-I/O must not report a
+/// successful rearm without revoking writable user translations.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mapping_wrprotect_range(
+    mapping: *mut c_void,
+    pgoff: c_ulong,
+    pfn: c_ulong,
+    nr_pages: c_ulong,
+) -> c_int {
+    if mapping.is_null() {
+        return -crate::config::EINVAL;
+    }
+    if nr_pages == 0 {
+        return 0;
+    }
+    let Some(handler) = MAPPING_WRPROTECT_HANDLER.get() else {
+        return -crate::config::EOPNOTSUPP;
+    };
+    unsafe { handler(mapping, pgoff, pfn, nr_pages) }
+}
 
 /// Installs the provider behind [`current_mm`]. A second installation is
 /// refused: the provider is process-global.
