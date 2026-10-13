@@ -85,16 +85,6 @@ pub unsafe extern "C" fn intel_crtc_for_pipe(
     core::ptr::null_mut()
 }
 
-// upstream: intel_color.c intel_color_init_hooks()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_color_init_hooks(_display: *mut IntelDisplay) {}
-
-// upstream: intel_color.c intel_color_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_color_init(_display: *mut IntelDisplay) -> i32 {
-    0
-}
-
 // upstream: intel_wm.c intel_wm_init()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_wm_init(_display: *mut IntelDisplay) {}
