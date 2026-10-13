@@ -180,8 +180,11 @@ pub(crate) fn unplug_primary(expected: *mut DrmDevice) -> AxResult<()> {
         }
         current.take().ok_or(AxError::NoSuchDevice)?
     };
-    device.revoke_external_pages();
+    device
+        .unplugged
+        .store(true, core::sync::atomic::Ordering::Release);
     unsafe { tk_drm_upstream::drm_drv_upstream::drm_dev_unplug(expected) };
+    device.revoke_external_pages();
     if let Some(helper) = device.fb_helper.as_ref() {
         let helper = (&**helper as *const DrmFbHelper).cast_mut();
         if unsafe { !(*helper).info.is_null() } {
