@@ -8,15 +8,21 @@
 
 use core::ffi::c_void;
 
-use crate::intel_display_core_types_upstream::IntelDisplay;
-use crate::intel_display_types_upstream::IntelCrtc;
-use crate::intel_workarounds_types_upstream::I915RegT;
-use tk_drm_upstream::drm_atomic_types::DrmAtomicCommit;
-use tk_drm_upstream::drm_device_types::DrmDevice;
-use tk_drm_upstream::drm_file_types::DrmFile;
-use tk_drm_upstream::drm_fourcc_types::DrmFormatInfo;
-use tk_drm_upstream::drm_framebuffer_types::DrmFramebuffer;
-use tk_drm_upstream::uapi_drm_mode_types::DrmModeFbCmd2;
+use tk_drm_upstream::{
+    drm_atomic_types::DrmAtomicCommit, drm_device_types::DrmDevice, drm_file_types::DrmFile,
+    drm_fourcc_types::DrmFormatInfo, drm_framebuffer_types::DrmFramebuffer,
+    uapi_drm_mode_types::DrmModeFbCmd2,
+};
+
+pub use crate::{
+    intel_atomic_upstream::{
+        intel_atomic_state_alloc, intel_atomic_state_clear, intel_atomic_state_free,
+    },
+    intel_crtc_upstream::{intel_crtc_for_pipe, intel_crtc_init},
+};
+use crate::{
+    intel_display_core_types_upstream::IntelDisplay, intel_workarounds_types_upstream::I915RegT,
+};
 
 // upstream: intel_fb.c intel_user_framebuffer_create()
 // Degraded stub returns ERR_PTR(-ENODEV) when display FB support is absent, matching Linux drm_mode_addfb2 error handling.
@@ -39,51 +45,30 @@ pub unsafe extern "C" fn intel_fb_get_format_info(
     core::ptr::null_mut()
 }
 
-// upstream: intel_atomic.c intel_atomic_check()
+// The ADL-P atomic validation and commit callbacks are owned by B7a's
+// intel_display.c translation. Fail closed until that complete path is wired;
+// returning success here would falsely accept an unchecked state.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_atomic_check(
     _dev: *mut DrmDevice,
     _state: *mut DrmAtomicCommit,
 ) -> i32 {
-    0
+    -tk_linux_kapi::config::EOPNOTSUPP
 }
 
-// upstream: intel_atomic.c intel_atomic_commit()
+// B7a also owns intel_atomic_commit(); never claim a no-op commit succeeded.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_atomic_commit(
     _dev: *mut DrmDevice,
     _state: *mut DrmAtomicCommit,
     _nonblock: bool,
 ) -> i32 {
-    0
+    -tk_linux_kapi::config::EOPNOTSUPP
 }
-
-// upstream: intel_atomic.c intel_atomic_state_alloc()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_atomic_state_alloc(_dev: *mut DrmDevice) -> *mut DrmAtomicCommit {
-    core::ptr::null_mut()
-}
-
-// upstream: intel_atomic.c intel_atomic_state_clear()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_atomic_state_clear(_state: *mut DrmAtomicCommit) {}
-
-// upstream: intel_atomic.c intel_atomic_state_free()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_atomic_state_free(_state: *mut DrmAtomicCommit) {}
 
 // upstream: intel_cursor.c intel_cursor_mode_config_init()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_cursor_mode_config_init(_display: *mut IntelDisplay) {}
-
-// upstream: intel_crtc.c intel_crtc_for_pipe()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_crtc_for_pipe(
-    _display: *mut IntelDisplay,
-    _pipe: i32,
-) -> *mut IntelCrtc {
-    core::ptr::null_mut()
-}
 
 // upstream: intel_color.c intel_color_init_hooks()
 #[unsafe(no_mangle)]
@@ -98,12 +83,6 @@ pub unsafe extern "C" fn intel_color_init(_display: *mut IntelDisplay) -> i32 {
 // upstream: intel_wm.c intel_wm_init()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_wm_init(_display: *mut IntelDisplay) {}
-
-// upstream: intel_crtc.c intel_crtc_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_crtc_init(_display: *mut IntelDisplay) -> i32 {
-    0
-}
 
 // upstream: intel_initial_plane.c intel_initial_plane_config()
 #[unsafe(no_mangle)]

@@ -675,6 +675,20 @@ pub mod intel_bw_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_irq_upstream;
 #[allow(unsafe_code)]
+pub mod intel_atomic_upstream;
+#[allow(unsafe_code)]
+pub mod intel_connector_upstream;
+#[allow(unsafe_code)]
+pub mod intel_crtc_upstream;
+#[allow(unsafe_code)]
+pub mod intel_encoder_upstream;
+#[allow(unsafe_code)]
+pub mod intel_fifo_underrun_upstream;
+#[allow(unsafe_code)]
+pub mod intel_modeset_lock_upstream;
+#[allow(unsafe_code)]
+pub mod intel_vblank_upstream;
+#[allow(unsafe_code)]
 pub mod intel_display_power_well_upstream;
 #[allow(unsafe_code)]
 pub mod intel_cdclk_upstream;

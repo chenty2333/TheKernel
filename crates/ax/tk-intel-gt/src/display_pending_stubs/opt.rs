@@ -105,6 +105,29 @@ pub unsafe extern "C" fn intel_dp_mst_suspend(_display: *mut IntelDisplay) {}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_dp_mst_resume(_display: *mut IntelDisplay) {}
 
+// upstream: intel_vrr.c intel_vrr_send_push()/intel_vrr_check_push_sent()
+// VRR is an explicit compile-out feature in the ADL-P bring-up configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_vrr_send_push(
+    _dsb: *mut core::ffi::c_void,
+    _state: *const crate::intel_display_types_upstream::IntelCrtcState,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_vrr_check_push_sent(
+    _dsb: *mut core::ffi::c_void,
+    _state: *const crate::intel_display_types_upstream::IntelCrtcState,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_vrr_is_push_sent(
+    _state: *const crate::intel_display_types_upstream::IntelCrtcState,
+) -> bool {
+    false
+}
+
 // upstream: intel_dp_tunnel.c intel_dp_tunnel_mgr_cleanup()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_dp_tunnel_mgr_cleanup(_display: *mut IntelDisplay) {}
