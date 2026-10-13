@@ -361,7 +361,12 @@ pub(super) fn install_providers() -> Result<(), &'static str> {
         while !axhal::boot::intel_cpu_mmap_ready() {
             if axhal::time::monotonic_time_nanos().saturating_sub(pat_started) >= pat_timeout {
                 let cpu = axhal::percpu::this_cpu_id();
-                let expected_mask = (1usize << axhal::cpu_num()) - 1;
+                let cpu_count = axhal::cpu_num();
+                let expected_mask = if cpu_count >= usize::BITS as usize {
+                    !0usize
+                } else {
+                    (1usize << cpu_count) - 1
+                };
                 let ack_mask = axhal::boot::intel_cpu_cache_ready_mask();
                 panic!(
                     "cross-CPU PAT setup timed out on CPU {cpu}: expected mask {expected_mask:#x}, acknowledged mask {ack_mask:#x}, waiting for intel_cpu_mmap_ready"
@@ -1863,7 +1868,9 @@ static SMP_ACK_MASK: AtomicUsize = AtomicUsize::new(0);
 fn smp_ipi_handler() {
     let cpu = axhal::percpu::this_cpu_id();
     if SMP_MODE.load(Ordering::Acquire) == SMP_MODE_STOP {
-        SMP_ACK_MASK.fetch_or(1 << cpu, Ordering::AcqRel);
+        if cpu < usize::BITS as usize {
+            SMP_ACK_MASK.fetch_or(1usize << cpu, Ordering::AcqRel);
+        }
         SMP_PARKED.fetch_add(1, Ordering::AcqRel);
         while !SMP_RESUME.load(Ordering::Acquire) {
             core::hint::spin_loop();
@@ -1878,7 +1885,9 @@ fn smp_ipi_handler() {
     let func: unsafe extern "C" fn(*mut c_void) = unsafe { core::mem::transmute(func) };
     // SAFETY: the IPI argument carries the C callback and argument published by `call_on_other_cpus`.
     unsafe { func(arg) };
-    SMP_ACK_MASK.fetch_or(1 << cpu, Ordering::AcqRel);
+    if cpu < usize::BITS as usize {
+        SMP_ACK_MASK.fetch_or(1usize << cpu, Ordering::AcqRel);
+    }
     SMP_DONE.fetch_add(1, Ordering::AcqRel);
 }
 
@@ -1906,7 +1915,17 @@ fn wait_until(what: &'static str, mut done: impl FnMut() -> bool) {
         if axhal::time::monotonic_time() >= deadline {
             let cpu = axhal::percpu::this_cpu_id();
             let cpu_count = axhal::cpu_num();
-            let expected_mask = ((1usize << cpu_count) - 1) & !(1 << cpu);
+            let all_mask = if cpu_count >= usize::BITS as usize {
+                !0usize
+            } else {
+                (1usize << cpu_count) - 1
+            };
+            let this_mask = if cpu < usize::BITS as usize {
+                1usize << cpu
+            } else {
+                0usize
+            };
+            let expected_mask = all_mask & !this_mask;
             let ack_mask = SMP_ACK_MASK.load(Ordering::Acquire);
             panic!(
                 "cross-CPU call timed out on CPU {cpu}: expected mask {expected_mask:#x}, acknowledged mask {ack_mask:#x}, waiting for {what}"

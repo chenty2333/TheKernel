@@ -546,10 +546,10 @@ mod imp {
         let mut expected_mask = 0usize;
         let mut ack_mask = 0usize;
         for cpu in 0..cpu_count {
-            if request.targets(cpu) {
-                expected_mask |= 1 << cpu;
+            if request.targets(cpu) && cpu < usize::BITS as usize {
+                expected_mask |= 1usize << cpu;
                 if !request.target_pending(cpu) {
-                    ack_mask |= 1 << cpu;
+                    ack_mask |= 1usize << cpu;
                 }
             }
         }

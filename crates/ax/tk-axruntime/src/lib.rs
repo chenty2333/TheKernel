@@ -665,7 +665,11 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
                 let cpu = axhal::percpu::this_cpu_id();
                 let total = axhal::cpu_num();
                 let ack = INITED_CPUS.load(Ordering::Acquire);
-                let expected_mask = (1usize << total) - 1;
+                let expected_mask = if total >= usize::BITS as usize {
+                    !0usize
+                } else {
+                    (1usize << total) - 1
+                };
                 panic!(
                     "cross-CPU AP barrier timed out on CPU {cpu}: expected mask {expected_mask:#x} ({total} CPUs), acknowledged {ack}"
                 );

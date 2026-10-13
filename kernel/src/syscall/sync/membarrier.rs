@@ -404,8 +404,8 @@ mod remote {
                     let mut expected_mask = 0usize;
                     let mut ack_mask = 0usize;
                     for (cpu, &target) in targets.iter().enumerate() {
-                        if target {
-                            expected_mask |= 1 << cpu;
+                        if target && cpu < usize::BITS as usize {
+                            expected_mask |= 1usize << cpu;
                             let is_ack = if REQUESTS[cpu].global.load(Ordering::Relaxed) {
                                 GLOBAL_ACK[cpu].load(Ordering::Acquire)
                                     >= REQUESTS[cpu].generation.load(Ordering::Acquire)
@@ -418,11 +418,11 @@ mod remote {
                                 false
                             };
                             if is_ack {
-                                ack_mask |= 1 << cpu;
+                                ack_mask |= 1usize << cpu;
                             }
                         }
                     }
-                    panic!(
+                    axlog::error!(
                         "cross-CPU membarrier rendezvous timed out on CPU {issuer_cpu}: expected mask {expected_mask:#x}, acknowledged mask {ack_mask:#x}, waiting for membarrier"
                     );
                 }

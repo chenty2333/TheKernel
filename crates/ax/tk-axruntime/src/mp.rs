@@ -116,7 +116,11 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
             if axhal::time::monotonic_time() >= deadline {
                 let total = axhal::cpu_num();
                 let ack = super::INITED_CPUS.load(Ordering::Acquire);
-                let expected_mask = (1usize << total) - 1;
+                let expected_mask = if total >= usize::BITS as usize {
+                    !0usize
+                } else {
+                    (1usize << total) - 1
+                };
                 panic!(
                     "cross-CPU AP barrier timed out on secondary CPU {cpu_id}: expected mask {expected_mask:#x} ({total} CPUs), acknowledged {ack}"
                 );
