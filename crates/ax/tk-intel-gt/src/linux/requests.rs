@@ -1059,7 +1059,10 @@ unsafe extern "C" fn dma_fence_chain_set_deadline(fence: *mut DmaFence, deadline
     }
 }
 
-unsafe fn dma_fence_set_deadline(fence: *mut DmaFence, deadline: i64) {
+/// Linux `dma_fence_set_deadline()`: propagate an absolute monotonic deadline
+/// through every member of a fence chain and into the signaler's driver hook.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_fence_set_deadline(fence: *mut DmaFence, deadline: i64) {
     if fence.is_null() {
         return;
     }

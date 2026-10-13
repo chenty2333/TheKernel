@@ -3773,6 +3773,7 @@ dependencies = [
 name = "tk-drm-upstream"
 version = "0.1.0"
 dependencies = [
+ "spin 0.9.9",
  "tk-axhal",
  "tk-axtask",
  "tk-linux-kapi",

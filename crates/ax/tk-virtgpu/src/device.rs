@@ -178,7 +178,12 @@ static DRM_DRIVER: SyncDriver = SyncDriver(DrmDriver {
     patchlevel: 0,
     name: DRIVER_NAME.as_ptr() as *mut c_char,
     desc: DRIVER_DESC.as_ptr() as *mut c_char,
-    driver_features: DRIVER_GEM | DRIVER_MODESET | DRIVER_RENDER | DRIVER_ATOMIC,
+    driver_features: DRIVER_GEM
+        | DRIVER_MODESET
+        | DRIVER_RENDER
+        | DRIVER_ATOMIC
+        | tk_drm_upstream::drm_ioctl_upstream::DRIVER_SYNCOBJ
+        | tk_drm_upstream::drm_ioctl_upstream::DRIVER_SYNCOBJ_TIMELINE,
     ioctls: VIRTGPU_IOCTLS.as_ptr() as *mut _,
     num_ioctls: VIRTGPU_IOCTLS.len() as i32,
     fops: ptr::null_mut(),
@@ -619,6 +624,25 @@ impl DriverPrivate {
         result
     }
 
+    /// Wait for an asynchronous submission to reach a terminal transport
+    /// state, retire GEM ownership and remove its DRM fence record. The caller
+    /// keeps an Arc to this private state for the duration of the wait.
+    pub(crate) fn wait_submission_completion(&self, fence_id: u64) -> Option<Result<(), DevError>> {
+        self.with_state(|state| {
+            let result = state
+                .engine
+                .wait(&mut *state.display, fence_id, u64::MAX)
+                .map(|_| ());
+            let retired_refs = take_terminal_gem_refs(state);
+            let _ = state.engine.reap(fence_id);
+            (result, retired_refs)
+        })
+        .map(|(result, retired_refs)| {
+            drop_gem_refs(retired_refs);
+            result
+        })
+    }
+
     /// Take the original transport back after a successful probe but before
     /// the DRM device is published. Probe commands are terminal/reaped before
     /// this point, so no GPU queue reset is needed or desirable.
@@ -800,6 +824,13 @@ pub(crate) unsafe fn with_device_state<R>(
 ) -> Option<R> {
     let private = unsafe { private_from_device(drm) }?;
     private.with_state(f)
+}
+
+pub(crate) unsafe fn private_arc_from_device(drm: *mut DrmDevice) -> Option<Arc<DriverPrivate>> {
+    let private = unsafe { private_from_device(drm) }?;
+    let raw = private as *const DriverPrivate;
+    unsafe { Arc::increment_strong_count(raw) };
+    Some(unsafe { Arc::from_raw(raw) })
 }
 
 unsafe extern "C" fn virtgpu_release(drm: *mut DrmDevice) {
