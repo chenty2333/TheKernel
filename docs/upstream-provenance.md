@@ -2254,4 +2254,9 @@ Both files carry MIT licenses in upstream Linux 7.2.3 and are recorded in `crate
 
 The Linux DRM infrastructure core translations (`crates/ax/tk-drm-upstream`, batch BI: `drm_drv_upstream.rs`, `drm_file_upstream.rs`, `drm_gem_upstream.rs`, `drm_prime_upstream.rs`, `drm_ioctl_upstream.rs`, `drm_auth_upstream.rs`, `drm_vma_manager_upstream.rs`, `drm_lease_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned `crates/ax` totals: threshold >=40 `(0,0,0,850,820,0,0)` (was 837/807), threshold >=25 `(18,15,4,2288,2250,0,0)` (was 2238/2200). `crates/linux` and `kernel/src` are unchanged.
 
+## 2026-10-13 DRM review fixes reconciliation
+
+Review fixes to the merged DRM core port (`crates/ax/tk-drm-upstream`) and `tk-linux-kapi` (faithful vblank wait-queue usage, copy_{to,from}_user, blocking drm_read/drm_poll wait registration, get_dma_buf / gem handle release, unified RadixSlots IDR, and ww_mutex/mutex/workqueue fixes) add 8 verbatim-Linux lines to `crates/ax` at threshold >=25 (`2335/2297 -> 2343/2305`). `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned totals: threshold >=25 `(18,15,4,2343,2305,0,0)`. Threshold >=40 is unchanged at `(0,0,0,872,842,0,0)`.
+
+
 
