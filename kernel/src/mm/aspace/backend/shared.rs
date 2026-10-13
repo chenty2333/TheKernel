@@ -407,11 +407,16 @@ impl SharedPages {
         lease: Arc<ExternalPageLease>,
         mapping_flags: MappingFlags,
     ) -> AxResult<Self> {
+        let allowed_flags = MappingFlags::DEVICE
+            | MappingFlags::UNCACHED
+            | MappingFlags::WRITE_COMBINING;
         if pages.is_empty()
             || pages
                 .iter()
                 .any(|page| !PageSize::Size4K.is_aligned(page.as_usize()))
-            || !mapping_flags.contains(MappingFlags::DEVICE | MappingFlags::UNCACHED)
+            || !mapping_flags.contains(MappingFlags::DEVICE)
+            || mapping_flags.bits() & !allowed_flags.bits() != 0
+            || mapping_flags.contains(MappingFlags::UNCACHED | MappingFlags::WRITE_COMBINING)
         {
             return Err(AxError::InvalidInput);
         }
@@ -434,7 +439,7 @@ impl SharedPages {
             external_lease: Some(lease),
             page_cache_owner: None,
             allocation_owner: Mutex::new(None),
-            external_mapping_flags: MappingFlags::DEVICE | MappingFlags::UNCACHED,
+            external_mapping_flags: mapping_flags,
         })
     }
 
@@ -2253,6 +2258,30 @@ mod tests {
             Err(AxError::InvalidInput)
         ));
         assert_eq!(misaligned_owner_dropped.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn external_device_pages_preserve_negotiated_cache_attributes() {
+        let cache_types = [
+            MappingFlags::DEVICE,
+            MappingFlags::DEVICE | MappingFlags::UNCACHED,
+            MappingFlags::DEVICE | MappingFlags::WRITE_COMBINING,
+        ];
+        for flags in cache_types {
+            let pages = SharedPages::new_external_4k(
+                alloc::vec![PhysAddr::from_usize(0x1000)],
+                Arc::new(ExternalPageLease::new(Arc::new(()))),
+                flags,
+            )
+            .unwrap();
+            assert_eq!(pages.immutable_mapping_flags(), flags);
+        }
+        assert!(SharedPages::new_external_4k(
+            alloc::vec![PhysAddr::from_usize(0x1000)],
+            Arc::new(ExternalPageLease::new(Arc::new(()))),
+            MappingFlags::DEVICE | MappingFlags::UNCACHED | MappingFlags::WRITE_COMBINING,
+        )
+        .is_err());
     }
 
     #[test]

@@ -5,6 +5,8 @@
 pub(crate) mod bootfb;
 mod console_font;
 mod dri;
+pub(crate) mod upstream_dri;
+pub(crate) mod upstream_fb;
 pub(crate) mod early_screen;
 #[cfg(feature = "input")]
 pub(crate) mod event;
@@ -764,24 +766,46 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
     // display.  A machine with no display device at all still has the linear
     // aperture its own firmware programmed, and there a console is the only
     // output the kernel has.
-    match primary_scanout() {
-        Some(scanout) => match fb::FrameBuffer::try_new(scanout) {
-            Ok(framebuffer) => root.add(
-                "fb0",
-                Device::new_with_permissions(
-                    fs.clone(),
-                    NodeType::CharacterDevice,
-                    fb::FB_DEVICE_ID,
-                    NodePermission::from_bits_truncate(FB_NODE_MODE),
-                    Arc::new(framebuffer),
+    if let Some(upstream) = crate::drm::upstream::primary() {
+        match upstream_fb::device(fs.clone(), upstream) {
+            Ok(Some(framebuffer)) => root.add("fb0", framebuffer),
+            Ok(None) => info!("Upstream DRM has no registered fb_info; /dev/fb0 is not published"),
+            Err(error) => error!("Failed to initialize upstream framebuffer device: {error}"),
+        }
+    } else {
+        match primary_scanout() {
+            Some(scanout) => match fb::FrameBuffer::try_new(scanout) {
+                Ok(framebuffer) => root.add(
+                    "fb0",
+                    Device::new_with_permissions(
+                        fs.clone(),
+                        NodeType::CharacterDevice,
+                        fb::FB_DEVICE_ID,
+                        NodePermission::from_bits_truncate(FB_NODE_MODE),
+                        Arc::new(framebuffer),
+                    ),
                 ),
-            ),
-            Err(error) => error!("Failed to initialize framebuffer device: {error}"),
-        },
-        None => info!("No scanout surface available; /dev/fb0 is not published"),
+                Err(error) => error!("Failed to initialize framebuffer device: {error}"),
+            },
+            None => info!("No scanout surface available; /dev/fb0 is not published"),
+        }
     }
 
-    if let Some(device) = crate::drm::primary_device() {
+    if let Some(device) = crate::drm::upstream::primary() {
+        let mut dri = DirMapping::new();
+        match upstream_dri::primary_node(fs.clone(), device.clone()) {
+            Ok(node) => {
+                dri.add("card0", node);
+                match upstream_dri::render_node(fs.clone(), device) {
+                    Ok(Some(render)) => dri.add("renderD128", render),
+                    Ok(None) => {}
+                    Err(error) => error!("Failed to publish upstream DRM render node: {error}"),
+                }
+                root.add("dri", SimpleDir::new_maker(fs.clone(), Arc::new(dri)));
+            }
+            Err(error) => error!("Failed to publish upstream DRM primary node: {error}"),
+        }
+    } else if let Some(device) = crate::drm::primary_device() {
         let mut dri = DirMapping::new();
         dri.add("card0", dri::primary_node(fs.clone(), device.clone()));
         if let Some(render) = dri::render_node(fs.clone(), device) {

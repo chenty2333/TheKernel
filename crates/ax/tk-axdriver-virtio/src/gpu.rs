@@ -157,6 +157,9 @@ impl<H: Hal, T: Transport> VirtIoGpuDev<H, T> {
         if self.inner.resource_blob_supported() && self.inner.context_init_supported() {
             features = features.union(GpuFeatures::CONTEXT_INIT);
         }
+        if self.inner.virgl_supported() {
+            features = features.union(GpuFeatures::VIRGL_3D);
+        }
         // Expose HOST_VISIBLE only when the lower transport has a validated
         // shared-memory aperture. MAP_BLOB is converted to exact physical
         // pages and retained through the final external SharedPages lease.
@@ -191,6 +194,7 @@ impl<H: Hal, T: Transport> GpuTransport for VirtIoGpuDev<H, T> {
                 GpuBatch::Create2d {
                     width,
                     height,
+                    format,
                     entries,
                 },
             ) => {
@@ -201,7 +205,7 @@ impl<H: Hal, T: Transport> GpuTransport for VirtIoGpuDev<H, T> {
                     .try_reserve(1)
                     .map_err(|_| axdriver_base::DevError::NoMemory)?;
                 self.inner
-                    .submit_create_2d(width, height)
+                    .submit_create_2d(width, height, format)
                     .map(|(resource, submission)| {
                         self.drm_resources.push(DrmResource {
                             raw: resource.get(),
@@ -526,6 +530,40 @@ impl<H: Hal, T: Transport> GpuTransport for VirtIoGpuDev<H, T> {
                             width,
                             height,
                         },
+                    )
+                    .map(|submission| GpuSubmission {
+                        fence_id: submission.fence_id,
+                        resource_id: None,
+                        context_id: None,
+                    })
+                    .map_err(as_dev_err)
+            }
+            (
+                GpuQueue::Control,
+                GpuBatch::Transfer2dRect {
+                    resource,
+                    x,
+                    y,
+                    width,
+                    height,
+                    offset,
+                },
+            ) => {
+                let resource = self
+                    .drm_resources
+                    .iter()
+                    .find_map(|entry| (entry.raw == resource).then_some(entry.resource))
+                    .ok_or(axdriver_base::DevError::InvalidParam)?;
+                self.inner
+                    .submit_transfer_to_host_offset(
+                        resource,
+                        Rect {
+                            x,
+                            y,
+                            width,
+                            height,
+                        },
+                        offset as u64,
                     )
                     .map(|submission| GpuSubmission {
                         fence_id: submission.fence_id,

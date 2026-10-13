@@ -56,11 +56,11 @@ impl DrmPrimary {
     }
 }
 
-fn attribute(name: &str, value: &'static str) -> DeviceAttribute {
+pub(super) fn attribute(name: &str, value: &'static str) -> DeviceAttribute {
     DeviceAttribute::try_new(name.into(), move || Ok(value)).expect("static DRM sysfs attribute")
 }
 
-fn mode_attribute(mode: crate::drm::Mode) -> DeviceAttribute {
+pub(super) fn mode_attribute(mode: crate::drm::Mode) -> DeviceAttribute {
     DeviceAttribute::try_new("modes".into(), move || {
         Ok(alloc::format!("{}x{}\n", mode.width, mode.height))
     })
@@ -69,7 +69,7 @@ fn mode_attribute(mode: crate::drm::Mode) -> DeviceAttribute {
 
 // libdrm resolves the DRM node's physical device (skipping a real virtio
 // transport when present), then reads PCI_SLOT_NAME and these PCI attributes.
-fn pci_registrations(
+pub(super) fn pci_registrations(
     identity: axdriver_display::DisplayPciIdentity,
 ) -> VfsResult<Vec<Arc<DeviceRegistration>>> {
     let root = alloc::format!("pci0000:{:02x}", identity.bus);
@@ -126,7 +126,7 @@ fn platform_registration(name: &str) -> VfsResult<Arc<DeviceRegistration>> {
     )
 }
 
-fn publish_pci_parent(
+pub(super) fn publish_pci_parent(
     identity: axdriver_display::DisplayPciIdentity,
     parents: &mut Vec<DeviceHandle<'static, MAX_DEVICES>>,
 ) -> VfsResult<alloc::string::String> {
@@ -147,7 +147,7 @@ fn publish_pci_parent(
     }
 }
 
-fn attach_drm_minor(
+pub(super) fn attach_drm_minor(
     identity: DeviceIdentity,
     transport: &Option<alloc::string::String>,
 ) -> VfsResult<DeviceIdentity> {
