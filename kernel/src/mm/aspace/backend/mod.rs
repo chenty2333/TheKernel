@@ -264,7 +264,7 @@ fn preflight_dense_unmap(range: VirtAddrRange, page_size: PageSize, pt: &PageTab
     Ok(())
 }
 
-fn page_table_flags(flags: MappingFlags) -> MappingFlags {
+pub(super) fn page_table_flags(flags: MappingFlags) -> MappingFlags {
     // SHSTK is VMA type metadata.  Its PTE encoding is independent: Intel
     // recognizes a shadow-stack leaf only as W=0,D=1.  A VMA with PROT_READ
     // keeps the type but maps D=0; PROT_NONE retains the type in the VMA but

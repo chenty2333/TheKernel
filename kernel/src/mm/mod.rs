@@ -31,7 +31,7 @@ pub(crate) use self::{
     elf_bounds::ElfBounds,
     asid::init as init_hardware_asids,
     dirty_writeback::init_dirty_writeback,
-    fault::handle_user_page_fault,
+    fault::{handle_user_page_fault, install_shared_mmap_providers},
     mapping_finalizer::{
         DeferredMappingFinalizer, MappingFinalizer, drain_deferred_mapping_finalizers,
         has_deferred_mapping_finalizer_work,

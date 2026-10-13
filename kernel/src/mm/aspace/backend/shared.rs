@@ -18,7 +18,10 @@ use super::{
     preflight_sparse_unmap,
 };
 use crate::{
-    file::{DeferredFileLease, FileHandle, FileLike, FileMmapProtection, PreparedFileMmap},
+    file::{
+        DeferredFileLease, FileHandle, FileLike, FileMmapProtection, PreparedFileMmap,
+        SharedMmapOps,
+    },
     mm::{FileLikeMappingLease, FileMappingSharing, secret::SecretFrame},
 };
 
@@ -904,7 +907,7 @@ impl SharedPages {
         Ok(())
     }
 
-    fn physical_page(&self, index: usize) -> AxResult<PhysAddr> {
+    pub(crate) fn physical_page(&self, index: usize) -> AxResult<PhysAddr> {
         self.paddr_at(index)
     }
 
@@ -1597,6 +1600,26 @@ impl SharedMapId {
 }
 
 impl SharedBackend {
+    pub(crate) fn mmap_page_index(&self, address: usize) -> Option<usize> {
+        let offset = self.backing_offset(address)?;
+        if !offset.is_multiple_of(self.pages.size as usize) {
+            return None;
+        }
+        Some(offset / self.pages.size as usize)
+    }
+
+    pub(crate) fn mmap_pgoff_at(&self, address: usize) -> Option<usize> {
+        let index = self.mmap_page_index(address)?;
+        self.status.shared_mmap_pgoff(index)
+    }
+
+    pub(crate) fn mmap_physical_page(&self, address: usize) -> AxResult<PhysAddr> {
+        let index = self
+            .mmap_page_index(address)
+            .ok_or(AxError::InvalidInput)?;
+        self.pages.physical_page(index)
+    }
+
     pub(super) fn immutable_mapping_flags(&self) -> MappingFlags {
         self.cpu_cache_flags | self.pages.mapping_flags()
     }
@@ -1818,6 +1841,18 @@ impl BackendOps for SharedBackend {
         pt: &mut PageTableCursor,
         _aspace_id: tk_linux_mm::AddressSpaceId,
     ) -> PopulateOutcome {
+        if self.status.shared_mmap_ops().is_some()
+            && access_flags.contains(MappingFlags::WRITE)
+        {
+            // User writes must pass through FaultSession's lock-external
+            // page_mkwrite/pfn_mkwrite callback. Kernel usercopy and eager
+            // population cannot silently grant the PTE write bit instead.
+            return PopulateOutcome::immediate(Err(AxError::OperationNotPermitted));
+        }
+        let mut mapping_flags = flags | self.immutable_mapping_flags();
+        if self.status.shared_mmap_ops().is_some() {
+            mapping_flags -= MappingFlags::WRITE;
+        }
         let result = self.pages.with_external_mapping(|| {
             let offset = range
                 .start
@@ -1847,7 +1882,7 @@ impl BackendOps for SharedBackend {
                                 pt.remap(
                                     vaddr,
                                     paddr,
-                                    page_table_flags(flags | self.immutable_mapping_flags()),
+                                    page_table_flags(mapping_flags),
                                 )?;
                                 needs_tlb_sync = true;
                                 populated += 1;
@@ -1860,7 +1895,7 @@ impl BackendOps for SharedBackend {
                                 vaddr,
                                 paddr,
                                 self.pages.size,
-                                page_table_flags(flags | self.immutable_mapping_flags()),
+                                page_table_flags(mapping_flags),
                             )?;
                             populated += 1;
                         }
@@ -1893,6 +1928,54 @@ impl BackendOps for SharedBackend {
 }
 
 impl Backend {
+    pub(crate) fn shared_mmap_ops(&self) -> Option<&Arc<SharedMmapOps>> {
+        match self {
+            Self::Shared(shared) => shared.mapping_status().shared_mmap_ops(),
+            Self::Linear(_) | Self::Cow(_) | Self::File(_) => None,
+        }
+    }
+
+    pub(crate) fn shared_mmap_page_info(
+        &self,
+        address: usize,
+    ) -> Option<(Arc<SharedMmapOps>, usize, usize, usize)> {
+        let Self::Shared(shared) = self else {
+            return None;
+        };
+        let ops = shared.mapping_status().shared_mmap_ops()?.clone();
+        let index = shared.mmap_page_index(address)?;
+        let pgoff = shared.mmap_pgoff_at(address)?;
+        let paddr = shared.pages.physical_page(index).ok()?.as_usize();
+        Some((ops, index, pgoff, paddr))
+    }
+
+    pub(crate) fn shared_immutable_mapping_flags(&self) -> Option<MappingFlags> {
+        match self {
+            Self::Shared(shared) => Some(shared.immutable_mapping_flags()),
+            Self::Linear(_) | Self::Cow(_) | Self::File(_) => None,
+        }
+    }
+
+    pub(crate) fn with_shared_mmap_ops(mut self, ops: Arc<SharedMmapOps>) -> AxResult<Self> {
+        crate::mm::install_shared_mmap_providers()
+            .map_err(|_| AxError::OperationNotSupported)?;
+        let Self::Shared(shared) = &mut self else {
+            return Err(AxError::InvalidInput);
+        };
+        if !Arc::ptr_eq(shared.pages(), ops.pages())
+            || !shared.pages.is_fixed()
+            || shared.pages.page_size() != PageSize::Size4K
+            || shared.mapping_status().shared_mmap_ops().is_some()
+        {
+            return Err(AxError::InvalidInput);
+        }
+        let page_origin = shared.page_offset;
+        shared
+            .mapping_status_mut()
+            .replace_shared_mmap_ops(Some(ops), Some(page_origin));
+        Ok(self)
+    }
+
     pub(crate) fn shared_pages(&self) -> Option<&Arc<SharedPages>> {
         match self {
             Self::Shared(shared) => Some(shared.pages()),
@@ -1958,6 +2041,7 @@ impl Backend {
 /// prevalidated ownership into the VMA backend and performs no allocation.
 pub(crate) struct PreparedFixedSharedMapping {
     pages: Arc<SharedPages>,
+    shared_mmap_ops: Option<Arc<SharedMmapOps>>,
     owner: Option<DeferredFileLease>,
     mapping_lifetime: Option<Arc<dyn Any + Send + Sync>>,
     excludes_fork_and_dump: bool,
@@ -1978,6 +2062,7 @@ impl PreparedFixedSharedMapping {
         let request = plan.request();
         let region_offset = plan.region_offset();
         let pages = plan.pages().clone();
+        let shared_mmap_ops = plan.take_shared_mmap_ops();
         if !pages.is_fixed()
             || request.offset() < region_offset
             || request
@@ -1991,6 +2076,15 @@ impl PreparedFixedSharedMapping {
             || request.page_size() != pages.page_size() as usize
         {
             return Err(AxError::InvalidInput);
+        }
+        if shared_mmap_ops.as_ref().is_some_and(|ops| {
+            !Arc::ptr_eq(&pages, ops.pages()) || pages.page_size() != PageSize::Size4K
+        }) {
+            return Err(AxError::InvalidInput);
+        }
+        if shared_mmap_ops.is_some() {
+            crate::mm::install_shared_mmap_providers()
+                .map_err(|_| AxError::OperationNotSupported)?;
         }
 
         let map_id = FIXED_SHARED_MAPPING_ID
@@ -2008,6 +2102,7 @@ impl PreparedFixedSharedMapping {
         let may_protect = mapping_flags(plan.may_protect());
         let cpu_cache_flags = plan.cpu_cache_flags();
         Ok(Self {
+            shared_mmap_ops,
             excludes_fork_and_dump: plan.excludes_fork_and_dump(),
             mapping_lifetime: plan.take_mapping_lifetime(),
             pages: plan.into_pages(),
@@ -2029,6 +2124,7 @@ impl PreparedFixedSharedMapping {
     pub(crate) fn into_backend(self, start: VirtAddr) -> Backend {
         let Self {
             pages,
+            shared_mmap_ops,
             owner,
             mapping_lifetime,
             excludes_fork_and_dump,
@@ -2062,6 +2158,9 @@ impl PreparedFixedSharedMapping {
         }
         .with_mapping_lifetime(mapping_lifetime)
         .with_excluded_fork_and_dump(excludes_fork_and_dump);
+        let mut status = MappingStatus::default();
+        let page_origin = shared_mmap_ops.as_ref().map(|_| page_offset);
+        status.replace_shared_mmap_ops(shared_mmap_ops, page_origin);
         Backend::Shared(SharedBackend {
             start,
             page_offset,
@@ -2069,7 +2168,7 @@ impl PreparedFixedSharedMapping {
             may_protect: may_protect & access_flags(),
             cpu_cache_flags,
             map_id: SharedMapId::Fixed(map_id),
-            status: MappingStatus::default(),
+            status,
         })
         .with_file_like_mapping(mapping)
     }

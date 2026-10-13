@@ -101,6 +101,8 @@ pub const VM_FAULT_LOCKED: u32 = 0x000200;
 pub const VM_FAULT_FALLBACK: u32 = 0x000800;
 /// `FAULT_FLAG_WRITE` in Linux's `vm_fault::flags`.
 pub const FAULT_FLAG_WRITE: u32 = 0x000001;
+/// `FAULT_FLAG_MKWRITE` in Linux's `vm_fault::flags`.
+pub const FAULT_FLAG_MKWRITE: u32 = 0x000004;
 
 // Linux `vm_flags` values from include/linux/mm.h for this CONFIG_MMU build.
 pub const VM_WRITE: c_ulong = 1 << 1;

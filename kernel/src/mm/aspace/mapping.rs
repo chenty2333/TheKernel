@@ -6,7 +6,7 @@ use axhal::paging::MappingFlags;
 use memory_addr::VirtAddr;
 
 use crate::{
-    file::{DeferredFileLease, File, FileHandle},
+    file::{DeferredFileLease, File, FileHandle, SharedMmapOps},
     mm::DeferredMappingFinalizer,
     task::UserNamespace,
 };
@@ -372,6 +372,8 @@ impl FileLikeMappingLease {
 pub(super) struct MappingStatus {
     file: Option<FileMappingLease>,
     file_like: Option<FileLikeMappingLease>,
+    shared_mmap_ops: Option<Arc<SharedMmapOps>>,
+    shared_mmap_page_origin: Option<usize>,
     finalizer: Option<DeferredMappingFinalizer>,
     madvise_readahead: MadviseReadahead,
     madvise_thp: MadviseThp,
@@ -395,6 +397,28 @@ pub(super) struct MappingStatus {
 }
 
 impl MappingStatus {
+    pub(super) fn shared_mmap_ops(&self) -> Option<&Arc<SharedMmapOps>> {
+        self.shared_mmap_ops.as_ref()
+    }
+
+    pub(super) fn replace_shared_mmap_ops(
+        &mut self,
+        ops: Option<Arc<SharedMmapOps>>,
+        page_origin: Option<usize>,
+    ) {
+        self.shared_mmap_ops = ops;
+        self.shared_mmap_page_origin = page_origin;
+    }
+
+    pub(super) fn shared_mmap_pgoff(&self, backing_page: usize) -> Option<usize> {
+        let ops = self.shared_mmap_ops.as_ref()?;
+        let origin = self.shared_mmap_page_origin?;
+        let delta = backing_page.checked_sub(origin)?;
+        usize::try_from(ops.template_pgoff())
+            .ok()?
+            .checked_add(delta)
+    }
+
     pub(super) const fn file_mapping(&self) -> Option<&FileMappingLease> {
         self.file.as_ref()
     }
@@ -498,6 +522,8 @@ impl MappingStatus {
                 .as_ref()
                 .map(|file| file.relocated(old_start, new_start))
                 .transpose()?,
+            shared_mmap_ops: self.shared_mmap_ops.clone(),
+            shared_mmap_page_origin: self.shared_mmap_page_origin,
             finalizer: self.finalizer.clone(),
             madvise_readahead: self.madvise_readahead,
             madvise_thp: self.madvise_thp,
@@ -516,6 +542,8 @@ impl MappingStatus {
         Ok(Self {
             file: Some(file.rebased(mapping_start, file_offset)),
             file_like: self.file_like.clone(),
+            shared_mmap_ops: self.shared_mmap_ops.clone(),
+            shared_mmap_page_origin: self.shared_mmap_page_origin,
             finalizer: self.finalizer.clone(),
             madvise_readahead: self.madvise_readahead,
             madvise_thp: self.madvise_thp,
@@ -536,6 +564,11 @@ impl MappingStatus {
             (Some(lhs), Some(rhs)) => lhs.compatible_with(rhs),
             (None, Some(_)) | (Some(_), None) => false,
         };
+        let shared_mmap_compatible = match (&self.shared_mmap_ops, &other.shared_mmap_ops) {
+            (None, None) => true,
+            (Some(lhs), Some(rhs)) => Arc::ptr_eq(lhs, rhs),
+            (None, Some(_)) | (Some(_), None) => false,
+        };
         let finalizer_compatible = match (&self.finalizer, &other.finalizer) {
             (None, None) => true,
             (Some(lhs), Some(rhs)) => lhs.identity() == rhs.identity(),
@@ -543,6 +576,7 @@ impl MappingStatus {
         };
         file_compatible
             && file_like_compatible
+            && shared_mmap_compatible
             && finalizer_compatible
             && self.madvise_readahead == other.madvise_readahead
             && self.madvise_thp == other.madvise_thp

@@ -43,6 +43,11 @@ pub fn init(args: &[String], envs: &[String]) {
     crate::mm::init_tlb_shootdown();
     axruntime::boot_progress::trace_exit("entry:init_tlb_shootdown");
 
+    axruntime::boot_progress::trace_enter("entry:init_shared_mmap_providers");
+    crate::mm::install_shared_mmap_providers()
+        .expect("failed to install core SharedPages mmap providers");
+    axruntime::boot_progress::trace_exit("entry:init_shared_mmap_providers");
+
     axruntime::boot_progress::trace_enter("entry:init_membarrier_ipi");
     crate::syscall::init_membarrier_ipi();
     axruntime::boot_progress::trace_exit("entry:init_membarrier_ipi");
