@@ -110,7 +110,7 @@ unsafe fn __intel_display_power_put_domain(
 }
 
 // upstream: intel_display_power.c intel_display_power_get()
-#[unsafe(no_mangle)]
+// Collides with kernel/src/drm/intel/upstream_gt.rs: exported without no_mangle
 pub unsafe extern "C" fn intel_display_power_get(
     display: *mut IntelDisplay,
     domain: IntelDisplayPowerDomain,
@@ -200,7 +200,7 @@ pub unsafe extern "C" fn intel_display_power_is_enabled(
 }
 
 // upstream: intel_display_power.c __intel_display_power_put_async()
-#[unsafe(no_mangle)]
+// Collides with kernel/src/drm/intel/upstream_gt.rs: exported without no_mangle
 pub unsafe extern "C" fn __intel_display_power_put_async(
     display: *mut IntelDisplay,
     domain: IntelDisplayPowerDomain,
