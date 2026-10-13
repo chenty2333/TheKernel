@@ -532,7 +532,13 @@ pub unsafe fn copy_from_user(to: *mut c_void, from: *const c_void, size: usize) 
     }
     let mm = current_mm();
     if mm.is_null() {
-        return size;
+        if from.is_null() || to.is_null() || (from as usize) < 4096 {
+            return size;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(from.cast::<u8>(), to.cast::<u8>(), size);
+        }
+        return 0;
     }
     unsafe { mmap_read_lock(mm) };
     let result = unsafe {
@@ -549,7 +555,13 @@ pub unsafe fn copy_to_user(to: *mut c_void, from: *const c_void, size: usize) ->
     }
     let mm = current_mm();
     if mm.is_null() {
-        return size;
+        if from.is_null() || to.is_null() || (to as usize) < 4096 {
+            return size;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(from.cast::<u8>(), to.cast::<u8>(), size);
+        }
+        return 0;
     }
     unsafe { mmap_read_lock(mm) };
     let result = unsafe {
