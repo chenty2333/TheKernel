@@ -475,6 +475,51 @@ macro_rules! wait_event_interruptible_timeout {
     }};
 }
 
+/// Linux `wait_event_interruptible()` macro.
+#[macro_export]
+macro_rules! wait_event_interruptible {
+    ($wq:expr, $condition:expr $(,)?) => {{
+        let __res = $crate::wait_event_interruptible_timeout!(
+            $wq,
+            $condition,
+            $crate::config::MAX_SCHEDULE_TIMEOUT as i64,
+        );
+        if __res < 0 {
+            __res as i32
+        } else {
+            0i32
+        }
+    }};
+}
+
+pub type PollQueueProc = Option<unsafe extern "C" fn(*mut crate::types::File, *mut WaitQueueHead, *mut PollTable)>;
+
+#[repr(C)]
+pub struct PollTable {
+    pub qproc: PollQueueProc,
+    pub key: u32,
+}
+
+/// Linux `poll_wait()`: registers a wait queue with a poll table.
+#[inline]
+pub unsafe fn poll_wait(
+    filp: *mut crate::types::File,
+    wait_address: *mut WaitQueueHead,
+    p: *mut PollTable,
+) {
+    if !p.is_null() && !wait_address.is_null() {
+        if let Some(qproc) = unsafe { (*p).qproc } {
+            unsafe { qproc(filp, wait_address, p) };
+        }
+    }
+}
+
+/// Linux `wake_up_interruptible_poll()`.
+#[inline]
+pub fn wake_up_interruptible_poll(head: &mut WaitQueueHead, _key: u32) {
+    wake_up_all(head);
+}
+
 /// Linux `wait_event_interruptible_locked()` macro.
 #[macro_export]
 macro_rules! wait_event_interruptible_locked {
