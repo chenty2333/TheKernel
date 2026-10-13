@@ -526,6 +526,9 @@ pub mod intel_color_regs_upstream;
 pub mod intel_combo_phy_regs_upstream;
 #[allow(unsafe_code)]
 pub mod intel_cursor_regs_upstream;
+pub mod intel_cursor_upstream;
+pub mod intel_sprite_upstream;
+pub mod intel_sprite_uapi_upstream;
 #[allow(unsafe_code)]
 pub mod intel_cx0_phy_regs_upstream;
 #[allow(unsafe_code)]
@@ -616,6 +619,8 @@ pub mod intel_wm_types_upstream;
 pub mod intel_wm_upstream;
 #[allow(unsafe_code)]
 pub mod skl_prefill_types_upstream;
+pub mod skl_prefill_upstream;
+pub mod skl_scaler_upstream;
 #[allow(unsafe_code)]
 pub mod skl_universal_plane_regs_upstream;
 #[allow(unsafe_code)]

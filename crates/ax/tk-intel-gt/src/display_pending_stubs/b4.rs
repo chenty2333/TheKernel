@@ -44,6 +44,8 @@ pub use crate::{
 
 };
 
+pub use crate::intel_cursor_upstream::intel_cursor_mode_config_init;
+
 // upstream: intel_fb.c intel_user_framebuffer_create()
 // Degraded stub returns ERR_PTR(-ENODEV) when display FB support is absent, matching Linux drm_mode_addfb2 error handling.
 #[unsafe(no_mangle)]
@@ -86,9 +88,6 @@ pub unsafe extern "C" fn intel_atomic_commit(
     -tk_linux_kapi::config::EOPNOTSUPP
 }
 
-// upstream: intel_cursor.c intel_cursor_mode_config_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_cursor_mode_config_init(_display: *mut IntelDisplay) {}
 
 
 
