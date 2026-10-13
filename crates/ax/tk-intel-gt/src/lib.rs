@@ -665,6 +665,16 @@ pub mod intel_pch_upstream;
 #[allow(unsafe_code)]
 pub mod intel_pmdemand_upstream;
 #[allow(unsafe_code)]
+pub mod intel_cmtg_upstream;
+#[allow(unsafe_code)]
+pub mod intel_global_state_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dbuf_bw_upstream;
+#[allow(unsafe_code)]
+pub mod intel_bw_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_irq_upstream;
+#[allow(unsafe_code)]
 pub mod intel_display_power_well_upstream;
 #[allow(unsafe_code)]
 pub mod intel_cdclk_upstream;
