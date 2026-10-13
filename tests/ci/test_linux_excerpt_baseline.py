@@ -44,9 +44,12 @@ WINDOW = 14
 SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     ("crates/linux", 40): (110, 49, 20, 25, 0, 18, 21),
     ("kernel/src", 40): (85, 41, 19, 142, 9, 0, 0),
-    ("crates/ax", 40): (0, 0, 0, 868, 838, 0, 0),
+    ("crates/ax", 40): (0, 0, 0, 872, 842, 0, 0),
     ("crates/linux", 25): (211, 59, 22, 41, 3, 20, 21),
     ("kernel/src", 25): (157, 50, 24, 321, 25, 0, 0),
+# 2026-10-13 (B2e HDMI helpers in tk-drm-upstream: drivers/video/hdmi.c,
+# drm_scdc_helper, drm_hdmi_helper, drm_hdmi_state_helper): crates/ax moves
+# from 868/838 to 872/842 at >= 40 and from 2325/2287 to 2335/2297 at >= 25.
 # 2026-10-13 (BI DRM infrastructure core in tk-drm-upstream: drm_drv, drm_file,
 # drm_gem, drm_prime, drm_ioctl, drm_auth, drm_vma_manager, drm_lease):
 # crates/ax moves from 855/825 to 868/838 at >= 40 (13 code lines) and from
@@ -63,6 +66,9 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # 1897/1861 to 2178/2140 at >= 25. These are MIT translations of MIT Linux
 # sources (see crates/ax/tk-drm-upstream/NOTICE and tk-intel-gt/NOTICE); the one
 # GPL-2.0 source (drm_managed.c) is flagged in docs/upstream-provenance.md.
+# 2026-10-13 (B2e HDMI helpers: hdmi, drm_scdc_helper, drm_hdmi_helper,
+# drm_hdmi_state_helper in tk-drm-upstream): crates/ax moves from 807/777 to
+# 811/781 at >= 40 and from 2178/2140 to 2188/2150 at >= 25 (MIT sources).
 # 2026-10-12 (B0, tk-linux-kapi extraction): the generic shims moved from
 # tk-intel-gt into crates/ax/tk-linux-kapi with their Linux code lines unchanged;
 # the scan moves by the new i2c.rs flag line (identical Linux text) at >= 40
@@ -83,7 +89,7 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # lines in the newly translated FreeBSD drivers and the OpenBSD iwx/net80211
 # translations, plus one FreeBSD ig4 register line. Those have BSD-source
 # provenance, not Linux provenance; see `docs/upstream-provenance.md`.
-    ("crates/ax", 25): (18, 15, 4, 2325, 2287, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 2335, 2297, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their

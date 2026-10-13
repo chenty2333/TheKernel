@@ -13,7 +13,6 @@ pub mod dp_b2d;
 pub mod drm_client_probe;
 pub mod dumb_buffers;
 pub mod fbdev_cmdline;
-pub mod hdmi_b2e;
 pub mod hrtimer;
 #[cfg(test)]
 pub mod host_test_links;

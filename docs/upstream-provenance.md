@@ -2193,7 +2193,7 @@ in the source comments.
 ## 2026-10-12 DRM core B1 and i915 display B2.5 reconciliation
 
 The DRM core translations (`crates/ax/tk-drm-upstream`, batches B1a-B1d, B2a,
-BI) and the i915 display `*_types_upstream.rs` / `*_regs_upstream.rs` modules in
+B2d, B2e, BI) and the i915 display `*_types_upstream.rs` / `*_regs_upstream.rs` modules in
 `crates/ax/tk-intel-gt` (B2.5) add verbatim-Linux lines that the excerpt scanner
 counts. The current pinned `crates/ax` totals and the per-batch increments are
 recorded next to `SCAN_BASELINE` in `tests/ci/test_linux_excerpt_baseline.py`.
@@ -2207,7 +2207,8 @@ Licensing of the translated DRM sources (checked against `/home/ava/Desktop/linu
   `drm_vblank`, `drm_vblank_work`, `drm_plane`, `drm_plane_helper`, `drm_crtc`,
   `drm_connector`, `drm_encoder`, `drm_mode_config`, `drm_mode_object`,
   `drm_property`, `drm_edid`, `drm_atomic`, `drm_atomic_uapi`,
-  `drm_atomic_state_helper`; `drm_damage_helper` is `GPL-2.0 OR MIT` (MIT option).
+  `drm_atomic_state_helper`, `drivers/video/hdmi.c`, `drm_scdc_helper`,
+  `drm_hdmi_helper`, `drm_hdmi_state_helper`; `drm_damage_helper` is `GPL-2.0 OR MIT` (MIT option).
   Several have no SPDX line but carry the permission text; their copyright
   lines are recorded in `crates/ax/tk-drm-upstream/NOTICE`.
 - **GPL-2.0 only, flagged:** `drivers/gpu/drm/drm_managed.c` is `SPDX-License-Identifier: GPL-2.0`.
