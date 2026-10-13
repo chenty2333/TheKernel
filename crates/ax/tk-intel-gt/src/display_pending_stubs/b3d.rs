@@ -65,8 +65,3 @@ pub unsafe extern "C" fn gen8_irq_power_well_pre_disable(
     _pipe_mask: u8,
 ) {}
 
-// upstream: intel_display_irq.c intel_parent_irq_enabled()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_parent_irq_enabled(_display: *mut IntelDisplay) -> bool {
-    false
-}
