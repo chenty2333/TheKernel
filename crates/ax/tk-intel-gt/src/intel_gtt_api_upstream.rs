@@ -63,12 +63,12 @@ pub const fn bit_ull(bit: u32) -> u64 {
 
 #[inline]
 pub const fn genmask(high: u32, low: u32) -> u32 {
-    (u32::MAX >> (31 - high)) << low
+    (u32::MAX >> (31 - high)) & (u32::MAX << low)
 }
 
 #[inline]
 pub const fn genmask_ull(high: u32, low: u32) -> u64 {
-    (u64::MAX >> (63 - high)) << low
+    (u64::MAX >> (63 - high)) & (u64::MAX << low)
 }
 
 #[inline]
@@ -893,3 +893,16 @@ pub unsafe fn sgt_dma(vma_res: *mut I915VmaResource) -> SgtDma {
 // Layout and source declaration aliases.
 pub type i915_cache_level = I915CacheLevel;
 pub type i915_vm_class = u32;
+
+#[cfg(test)]
+mod tests {
+    use super::{genmask, genmask_ull};
+
+    #[test]
+    fn genmask_limits_both_ends_of_the_bit_range() {
+        assert_eq!(genmask(19, 14), 0x000f_c000);
+        assert_eq!(genmask(31, 0), u32::MAX);
+        assert_eq!(genmask_ull(19, 14), 0x0000_0000_000f_c000);
+        assert_eq!(genmask_ull(63, 0), u64::MAX);
+    }
+}
