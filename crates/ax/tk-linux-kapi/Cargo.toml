@@ -27,6 +27,7 @@ workspace = true
 default = []
 
 [dependencies]
+axerrno = "0.2"
 axlog = { workspace = true }
 axdriver_base = { package = "tk-axdriver-base", path = "../tk-axdriver-base", version = "0.1.0" }
 mmu_notifier = { workspace = true }
