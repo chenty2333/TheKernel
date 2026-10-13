@@ -98,7 +98,23 @@ unsafe fn fb_helper_damage_work(work: *mut WorkStruct) {
 unsafe extern "C" fn drm_fb_helper_fb_destroy(info: *mut FbInfo) {
     let helper = unsafe { fb_helper_from_info(info) };
     if !helper.is_null() {
-        unsafe { drm_fb_helper_fini(helper) };
+        unsafe {
+            let client = core::ptr::addr_of_mut!((*helper).client);
+            let buffer = (*helper).buffer;
+            if !(*info).fbdefio_state.is_null() {
+                crate::fbmem_upstream::fb_deferred_io_cleanup(info);
+            }
+            drm_fb_helper_fini(helper);
+            if !buffer.is_null() {
+                // drm_client_buffer_delete() owns the matching GEM vunmap.
+                crate::drm_client_upstream::drm_client_buffer_delete(buffer);
+                (*helper).buffer = core::ptr::null_mut();
+                (*helper).fb = core::ptr::null_mut();
+            }
+            // `drm_client_release()` invokes the free callback, so do not
+            // access helper after this point.
+            crate::drm_client_upstream::drm_client_release(client);
+        }
     }
 }
 
@@ -216,9 +232,6 @@ unsafe fn drm_fb_helper_release_info(helper: *mut DrmFbHelper) {
             return;
         }
         (*helper).info = core::ptr::null_mut();
-        if !(*info).fbdefio_state.is_null() {
-            crate::fbmem_upstream::fb_deferred_io_cleanup(info);
-        }
         if (*info).cmap.len != 0 {
             crate::fbmem_upstream::fb_dealloc_cmap(core::ptr::addr_of_mut!((*info).cmap));
         }
@@ -229,6 +242,10 @@ unsafe fn drm_fb_helper_release_info(helper: *mut DrmFbHelper) {
 unsafe fn drm_fb_helper_cleanup_probe_resources(helper: *mut DrmFbHelper) {
     if helper.is_null() { return; }
     unsafe {
+        let info = (*helper).info;
+        if !info.is_null() && !(*info).fbdefio_state.is_null() {
+            crate::fbmem_upstream::fb_deferred_io_cleanup(info);
+        }
         drm_fb_helper_release_info(helper);
         if !(*helper).buffer.is_null() {
             crate::drm_client_upstream::drm_client_buffer_delete((*helper).buffer);
@@ -267,7 +284,7 @@ pub unsafe extern "C" fn drm_fb_helper_fini(helper: *mut DrmFbHelper) {
         }
         cancel_work_sync(core::ptr::addr_of_mut!((*helper).resume_work));
         cancel_work_sync(core::ptr::addr_of_mut!((*helper).damage_work));
-        drm_fb_helper_cleanup_probe_resources(helper);
+        drm_fb_helper_release_info(helper);
     }
 }
 

@@ -41,8 +41,7 @@ unsafe extern "C" fn drm_fbdev_client_unregister(client: *mut DrmClientDev) {
         if !(*helper).info.is_null() {
             crate::drm_fb_helper_upstream::drm_fb_helper_unregister_info(helper);
         } else {
-            // Partial setup has no fb_info and therefore no unregister path;
-            // release the client and every resource allocated during init.
+            // Without an fb_info there is no fb_destroy path to release the client.
             crate::drm_client_upstream::drm_client_release(client);
         }
     }
@@ -81,7 +80,12 @@ unsafe extern "C" fn drm_fbdev_client_hotplug(client: *mut DrmClientDev) -> i32 
         }
         ret = crate::drm_fb_helper_upstream::drm_fb_helper_initial_config(helper);
         if ret != 0 {
-            crate::drm_fb_helper_upstream::drm_fb_helper_fini(helper);
+            // A post-registration modeset error leaves a valid fbdev object
+            // for a later hotplug retry. Only tear down a partial setup with
+            // no registered fb_info.
+            if (*helper).info.is_null() {
+                crate::drm_fb_helper_upstream::drm_fb_helper_fini(helper);
+            }
             return fbdev_setup_error(dev, ret);
         }
         0
