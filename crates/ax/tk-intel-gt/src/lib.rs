@@ -668,3 +668,6 @@ pub mod intel_display_power_upstream;
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod b3a_tests;
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod b3b_tests;

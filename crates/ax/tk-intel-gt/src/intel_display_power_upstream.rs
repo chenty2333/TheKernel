@@ -16,6 +16,16 @@ use crate::intel_display_power_well_upstream::{
     intel_power_well_put, intel_power_well_sync_hw,
 };
 
+#[cfg(not(test))]
+use tk_linux_kapi::mutex::{mutex_init, mutex_lock, mutex_unlock};
+
+#[cfg(test)]
+unsafe fn mutex_init<M: tk_linux_kapi::mutex::MutexPointer>(_mutex: M) {}
+#[cfg(test)]
+unsafe fn mutex_lock<M: tk_linux_kapi::mutex::MutexPointer>(_mutex: M) {}
+#[cfg(test)]
+unsafe fn mutex_unlock<M: tk_linux_kapi::mutex::MutexPointer>(_mutex: M) {}
+
 #[inline]
 unsafe fn __intel_display_power_is_enabled(
     display: *mut IntelDisplay,
@@ -110,9 +120,9 @@ pub unsafe extern "C" fn intel_display_power_get(
     }
     unsafe {
         let power_domains = core::ptr::addr_of_mut!((*display).power.domains);
-        tk_linux_kapi::mutex::mutex_lock(core::ptr::addr_of_mut!((*power_domains).lock));
+        mutex_lock(core::ptr::addr_of_mut!((*power_domains).lock));
         __intel_display_power_get_domain(display, domain);
-        tk_linux_kapi::mutex::mutex_unlock(core::ptr::addr_of_mut!((*power_domains).lock));
+        mutex_unlock(core::ptr::addr_of_mut!((*power_domains).lock));
     }
     1 as *mut c_void
 }
@@ -128,12 +138,12 @@ pub unsafe extern "C" fn intel_display_power_get_if_enabled(
     }
     unsafe {
         let power_domains = core::ptr::addr_of_mut!((*display).power.domains);
-        tk_linux_kapi::mutex::mutex_lock(core::ptr::addr_of_mut!((*power_domains).lock));
+        mutex_lock(core::ptr::addr_of_mut!((*power_domains).lock));
         let enabled = __intel_display_power_is_enabled(display, domain);
         if enabled {
             __intel_display_power_get_domain(display, domain);
         }
-        tk_linux_kapi::mutex::mutex_unlock(core::ptr::addr_of_mut!((*power_domains).lock));
+        mutex_unlock(core::ptr::addr_of_mut!((*power_domains).lock));
         if enabled {
             1 as *mut c_void
         } else {
@@ -153,9 +163,9 @@ pub unsafe extern "C" fn intel_display_power_put_unchecked(
     }
     unsafe {
         let power_domains = core::ptr::addr_of_mut!((*display).power.domains);
-        tk_linux_kapi::mutex::mutex_lock(core::ptr::addr_of_mut!((*power_domains).lock));
+        mutex_lock(core::ptr::addr_of_mut!((*power_domains).lock));
         __intel_display_power_put_domain(display, domain);
-        tk_linux_kapi::mutex::mutex_unlock(core::ptr::addr_of_mut!((*power_domains).lock));
+        mutex_unlock(core::ptr::addr_of_mut!((*power_domains).lock));
     }
 }
 
@@ -182,9 +192,9 @@ pub unsafe extern "C" fn intel_display_power_is_enabled(
     }
     unsafe {
         let power_domains = core::ptr::addr_of_mut!((*display).power.domains);
-        tk_linux_kapi::mutex::mutex_lock(core::ptr::addr_of_mut!((*power_domains).lock));
+        mutex_lock(core::ptr::addr_of_mut!((*power_domains).lock));
         let ret = __intel_display_power_is_enabled(display, domain);
-        tk_linux_kapi::mutex::mutex_unlock(core::ptr::addr_of_mut!((*power_domains).lock));
+        mutex_unlock(core::ptr::addr_of_mut!((*power_domains).lock));
         ret
     }
 }
@@ -241,9 +251,19 @@ pub unsafe extern "C" fn intel_display_power_init(display: *mut IntelDisplay) ->
     }
     unsafe {
         let power_domains = core::ptr::addr_of_mut!((*display).power.domains);
-        tk_linux_kapi::mutex::mutex_init(core::ptr::addr_of_mut!((*power_domains).lock));
+        mutex_init(core::ptr::addr_of_mut!((*power_domains).lock));
         intel_display_power_map_init(power_domains)
     }
+}
+
+#[inline]
+pub unsafe fn intel_power_domains_init(display: *mut IntelDisplay) -> i32 {
+    intel_display_power_init(display)
+}
+
+#[inline]
+pub unsafe fn intel_power_domains_init_hw(display: *mut IntelDisplay) {
+    intel_display_power_init_hw(display);
 }
 
 // upstream: intel_display_power.c intel_display_power_cleanup()
