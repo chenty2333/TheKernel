@@ -852,6 +852,32 @@ pub unsafe extern "C" fn intel_display_irq_handler(
     }
 }
 
+// upstream: intel_display_irq.c ibx_display_interrupt_update()
+// The caller holds display.irq.lock; HPD detection changes these SDEIMR bits
+// from both threaded and IRQ paths, and the parent interrupt must be active.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ibx_display_interrupt_update(
+    display: *mut IntelDisplay,
+    interrupt_mask: u32,
+    enabled_irq_mask: u32,
+) {
+    if display.is_null() {
+        return;
+    }
+    let old = unsafe { intel_de_read(display, SDEIMR) };
+    let mut new = old & !interrupt_mask;
+    new |= !enabled_irq_mask & interrupt_mask;
+    if enabled_irq_mask & !interrupt_mask != 0
+        || !unsafe { intel_parent_irq_enabled(display) }
+    {
+        return;
+    }
+    unsafe {
+        intel_de_write(display, SDEIMR, new);
+        intel_de_posting_read(display, SDEIMR);
+    }
+}
+
 // upstream: intel_display_irq.c bdw_update_port_irq()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bdw_update_port_irq(
