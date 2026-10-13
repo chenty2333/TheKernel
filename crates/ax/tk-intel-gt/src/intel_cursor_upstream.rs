@@ -1415,7 +1415,7 @@ mod tests {
         assert_eq!(cursor_position_value(0x8000, 0, 64, false, 0), None);
         assert_eq!(
             cursor_position_value(0, -2, 16, true, 4),
-            Some(CURSOR_POS_Y(6))
+            Some(CURSOR_POS_Y_SIGN | CURSOR_POS_Y(6))
         );
         assert!(cursor_format_supported(DRM_FORMAT_ARGB8888));
         assert!(!cursor_format_supported(

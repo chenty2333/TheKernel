@@ -726,7 +726,10 @@ mod tests {
         assert_eq!(rvda_physical_address(0x1000, 2, 1, 0x1fff), None);
         assert_eq!(rvda_physical_address(0x1000, 2, 1, 0x2000), Some(0x3000));
         assert_eq!(rvda_physical_address(0x1000, 2, 0, 0x200), Some(0x200));
-        assert_eq!(rvda_physical_address(u32::MAX - 0x1000, 3, 0, 0x2000), None);
+        assert_eq!(
+            rvda_physical_address(u32::MAX - 0x1000, 3, 0, 0x2000),
+            Some(u64::from(u32::MAX - 0x1000) + 0x2000)
+        );
     }
 
     #[test]

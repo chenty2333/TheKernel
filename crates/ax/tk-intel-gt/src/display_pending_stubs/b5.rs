@@ -6,7 +6,6 @@
 
 #![allow(non_snake_case, dead_code, unsafe_code)]
 
-use crate::intel_display_core_types_upstream::IntelDisplay;
 pub use crate::{
     intel_dpll_mgr_upstream::{
         icl_set_active_port_dpll, icl_tc_port_to_pll_id, intel_dpll_compare_hw_state,
@@ -21,14 +20,6 @@ pub use crate::{
     },
 };
 
-// upstream: intel_dkl_phy.c intel_dkl_phy_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dkl_phy_init(_display: *mut IntelDisplay) {}
+pub use crate::intel_combo_phy_upstream::{intel_combo_phy_init, intel_combo_phy_uninit};
+pub use crate::intel_dkl_phy_upstream::intel_dkl_phy_init;
 
-// upstream: intel_combo_phy.c intel_combo_phy_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_combo_phy_init(_display: *mut IntelDisplay) {}
-
-// upstream: intel_combo_phy.c intel_combo_phy_uninit()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_combo_phy_uninit(_display: *mut IntelDisplay) {}
