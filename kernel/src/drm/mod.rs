@@ -29,6 +29,7 @@ mod render;
 mod syncobj;
 pub(crate) mod uapi;
 mod virtio;
+pub(crate) mod upstream;
 
 /// The kernel's single decision about which surface drives the console and
 /// `/dev/fb0`, and the registry a display driver enters it through.

@@ -3882,6 +3882,7 @@ dependencies = [
  "tk-axsync",
  "tk-axtask",
  "tk-axtlb",
+ "tk-drm-upstream",
  "tk-i2c",
  "tk-intel-gt",
  "tk-kernel-elf-parser",

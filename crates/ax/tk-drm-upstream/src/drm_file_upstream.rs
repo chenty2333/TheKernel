@@ -278,12 +278,13 @@ unsafe fn drm_lastclose(dev: *mut DrmDevice) {
 // upstream: drivers/gpu/drm/drm_file.c drm_open()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_open(inode: *mut c_void, filp: *mut File) -> i32 {
+    if !inode.is_null() {
+        return unsafe { drm_open_minor_index(0, filp) };
+    }
     if filp.is_null() {
         return -EINVAL;
     }
-    let minor = if !inode.is_null() {
-        drm_minor_acquire(core::ptr::addr_of_mut!(drm_minors_xa), 0)
-    } else if !(*filp).private_data.is_null() {
+    let minor = if !(*filp).private_data.is_null() {
         (*(*filp).private_data.cast::<DrmFile>()).minor
     } else {
         core::ptr::null_mut()
@@ -342,6 +343,43 @@ pub unsafe extern "C" fn drm_release(_inode: *mut c_void, filp: *mut File) -> i3
     }
 
     drm_minor_release(minor);
+    0
+}
+
+/// Open a specific registered DRM minor by its xarray index.
+///
+/// The ordinary Linux character-device entry uses `drm_open()` and resolves
+/// index zero from the inode. A VFS adapter for a render node already has the
+/// exact minor index and calls this equivalent lifecycle path directly.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_open_minor_index(minor_index: u32, filp: *mut File) -> i32 {
+    if filp.is_null() {
+        return -EINVAL;
+    }
+    let minor = unsafe {
+        drm_minor_acquire(core::ptr::addr_of_mut!(drm_minors_xa), minor_index)
+    };
+    if minor.is_null() {
+        return -crate::drm_drv_upstream::ENODEV;
+    }
+    let dev = unsafe { (*minor).dev };
+    let need_global = unsafe { drm_dev_needs_global_mutex(dev) };
+    if need_global {
+        unsafe { mutex_lock(core::ptr::addr_of_mut!(drm_global_mutex)) };
+    }
+    unsafe { atomic_inc(&mut (*dev).open_count) };
+    let retcode = unsafe { drm_open_helper(filp, minor) };
+    if retcode != 0 {
+        unsafe { atomic_dec(&mut (*dev).open_count) };
+        if need_global {
+            unsafe { mutex_unlock(core::ptr::addr_of_mut!(drm_global_mutex)) };
+        }
+        unsafe { drm_minor_release(minor) };
+        return retcode;
+    }
+    if need_global {
+        unsafe { mutex_unlock(core::ptr::addr_of_mut!(drm_global_mutex)) };
+    }
     0
 }
 
