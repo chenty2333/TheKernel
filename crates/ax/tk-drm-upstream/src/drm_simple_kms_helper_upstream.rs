@@ -45,7 +45,7 @@ static SIMPLE_CRTC_HELPER_FUNCS: DrmCrtcHelperFuncs = DrmCrtcHelperFuncs {
     disable: None,
     atomic_check: Some(simple_kms_crtc_check),
     atomic_begin: None,
-    atomic_flush: None,
+    atomic_flush: Some(crate::drm_vblank_helper_upstream::drm_crtc_vblank_atomic_flush),
     atomic_enable: Some(simple_kms_crtc_enable),
     atomic_disable: Some(simple_kms_crtc_disable),
     get_scanout_position: None,
@@ -76,7 +76,9 @@ static SIMPLE_CRTC_FUNCS: DrmCrtcFuncs = DrmCrtcFuncs {
     get_vblank_counter: None,
     enable_vblank: Some(simple_kms_crtc_enable_vblank),
     disable_vblank: Some(simple_kms_crtc_disable_vblank),
-    get_vblank_timestamp: None,
+    get_vblank_timestamp: Some(
+        crate::drm_vblank_helper_upstream::drm_crtc_vblank_helper_get_vblank_timestamp_from_timer,
+    ),
 };
 
 static SIMPLE_PLANE_HELPER_FUNCS: DrmPlaneHelperFuncs = DrmPlaneHelperFuncs {
@@ -167,12 +169,14 @@ unsafe extern "C" fn simple_kms_crtc_enable(crtc: *mut DrmCrtc, _state: *mut Drm
         if let Some(callback) = pipe_funcs(pipe).and_then(|funcs| funcs.enable) {
             callback(pipe, (*crtc).state, (*pipe).plane.state);
         }
+        crate::drm_vblank_upstream::drm_crtc_vblank_on(crtc);
     }
 }
 
 // upstream: drm_simple_kms_helper.c drm_simple_kms_crtc_disable()
 unsafe extern "C" fn simple_kms_crtc_disable(crtc: *mut DrmCrtc, _state: *mut DrmAtomicCommit) {
     unsafe {
+        crate::drm_vblank_upstream::drm_crtc_vblank_off(crtc);
         let pipe = pipe_from_crtc(crtc);
         if let Some(callback) = pipe_funcs(pipe).and_then(|funcs| funcs.disable) {
             callback(pipe);
@@ -511,6 +515,14 @@ mod tests {
     use core::ptr;
 
     use super::*;
+
+    #[test]
+    fn simple_crtc_wires_timer_vblank_and_atomic_flip_events() {
+        assert!(SIMPLE_CRTC_FUNCS.enable_vblank.is_some());
+        assert!(SIMPLE_CRTC_FUNCS.disable_vblank.is_some());
+        assert!(SIMPLE_CRTC_FUNCS.get_vblank_timestamp.is_some());
+        assert!(SIMPLE_CRTC_HELPER_FUNCS.atomic_flush.is_some());
+    }
 
     unsafe extern "C" fn custom_prepare_fb(
         pipe: *mut DrmSimpleDisplayPipe,

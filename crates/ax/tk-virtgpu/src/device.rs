@@ -43,6 +43,9 @@ use tk_drm_upstream::{
     drm_plane_types::DrmPlaneState,
     drm_simple_kms_helper_types_upstream::{DrmSimpleDisplayPipe, DrmSimpleDisplayPipeFuncs},
     drm_simple_kms_helper_upstream::drm_simple_display_pipe_init,
+    drm_vblank_helper_upstream::{
+        drm_crtc_vblank_helper_disable_vblank_timer, drm_crtc_vblank_helper_enable_vblank_timer,
+    },
     drm_vblank_upstream::drm_vblank_init,
     uapi_drm_consts::{DRM_FORMAT_XRGB8888, DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_TYPE_PREFERRED},
 };
@@ -241,8 +244,8 @@ static PIPE_FUNCS: DrmSimpleDisplayPipeFuncs = DrmSimpleDisplayPipeFuncs {
     cleanup_fb: None,
     begin_fb_access: None,
     end_fb_access: None,
-    enable_vblank: None,
-    disable_vblank: None,
+    enable_vblank: Some(virtgpu_pipe_enable_vblank),
+    disable_vblank: Some(virtgpu_pipe_disable_vblank),
     reset_crtc: None,
     duplicate_crtc_state: None,
     destroy_crtc_state: None,
@@ -379,6 +382,16 @@ impl VirtioGpuDevice {
     /// Map a host-visible blob directly from its live GEM object. The mapping
     /// lease also owns a GEM reference, so resource unref cannot race VMA use.
     pub unsafe fn map_blob_gem_object(&self, object: *mut DrmGemObject) -> DevResult<BlobMapping> {
+        unsafe { self.map_blob_gem_object_if_mappable(object) }?.ok_or(DevError::InvalidParam)
+    }
+
+    /// Map a host-visible blob if this GEM object is an eligible MAP_BLOB
+    /// resource. `Ok(None)` means this is an ordinary or guest-only GEM
+    /// object; malformed objects and actual MAP_BLOB failures remain errors.
+    pub unsafe fn map_blob_gem_object_if_mappable(
+        &self,
+        object: *mut DrmGemObject,
+    ) -> DevResult<Option<BlobMapping>> {
         if object.is_null() || unsafe { (*object).dev != self.drm } {
             return Err(DevError::InvalidParam);
         }
@@ -392,7 +405,10 @@ impl VirtioGpuDevice {
                     && (*gpu).blob_flags & crate::uapi::VIRTGPU_BLOB_FLAG_USE_MAPPABLE != 0,
             )
         };
-        if resource == 0 || !mappable {
+        if !mappable {
+            return Ok(None);
+        }
+        if resource == 0 {
             return Err(DevError::InvalidParam);
         }
         unsafe {
@@ -405,6 +421,7 @@ impl VirtioGpuDevice {
                 object: object as usize,
             }),
         )
+        .map(Some)
     }
 
     fn map_blob_inner(
@@ -917,6 +934,16 @@ unsafe extern "C" fn virtgpu_pipe_enable(
 }
 
 unsafe extern "C" fn virtgpu_pipe_disable(_pipe: *mut DrmSimpleDisplayPipe) {}
+
+unsafe extern "C" fn virtgpu_pipe_enable_vblank(pipe: *mut DrmSimpleDisplayPipe) -> i32 {
+    unsafe { drm_crtc_vblank_helper_enable_vblank_timer(core::ptr::addr_of_mut!((*pipe).crtc)) }
+}
+
+unsafe extern "C" fn virtgpu_pipe_disable_vblank(pipe: *mut DrmSimpleDisplayPipe) {
+    unsafe {
+        drm_crtc_vblank_helper_disable_vblank_timer(core::ptr::addr_of_mut!((*pipe).crtc));
+    }
+}
 
 unsafe extern "C" fn virtgpu_pipe_update(
     _pipe: *mut DrmSimpleDisplayPipe,
