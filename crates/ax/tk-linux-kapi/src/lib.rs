@@ -103,6 +103,8 @@ pub mod primitives;
 #[allow(unsafe_code)]
 pub mod shmem;
 #[allow(unsafe_code)]
+pub mod page_cache;
+#[allow(unsafe_code)]
 pub mod clock;
 #[allow(unsafe_code)]
 pub mod completion;
