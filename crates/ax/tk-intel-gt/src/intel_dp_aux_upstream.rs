@@ -107,7 +107,8 @@ fn aux_name_channel(channel: AuxCh, ver: u16, out: &mut [u8; AUX_CH_NAME_BUFSIZE
         && channel >= crate::intel_display_limits_types_upstream::AUX_CH_D_XELPD
     {
         let ch =
-            b'A' + (channel - crate::intel_display_limits_types_upstream::AUX_CH_D_XELPD) as u8;
+            b'A' + (channel - crate::intel_display_limits_types_upstream::AUX_CH_D_XELPD
+                + crate::intel_display_limits_types_upstream::AUX_CH_D) as u8;
         out[0] = ch;
         return 1;
     } else if ver >= 12 && channel >= crate::intel_display_limits_types_upstream::AUX_CH_USBC1 {

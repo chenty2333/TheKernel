@@ -2428,7 +2428,8 @@ mod tests {
     fn dp_signal_level_mapping_is_ordered_and_bounded() {
         assert_eq!(train_set_to_entry(0x00), 0);
         assert_eq!(train_set_to_entry(0x18), 3);
-        assert_eq!(train_set_to_entry(0x02), 9);
+        assert_eq!(train_set_to_entry(0x02), 7);
+        assert_eq!(train_set_to_entry(0x03), 9);
         assert_eq!(train_set_to_entry(0xff), 0);
         assert_eq!(MAX_DDI_SIGNAL_LEVELS, 10);
     }
