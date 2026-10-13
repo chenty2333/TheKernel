@@ -102,6 +102,9 @@ struct FbInfoNode {
 
 impl DeviceOps for FbInfoNode {
     fn open_description(&self, _location: &Location, _flags: u32) -> VfsResult<Option<DeviceOpen>> {
+        if self.owner._drm.is_unplugged() {
+            return Err(AxError::NoSuchDevice.into());
+        }
         let info = self.owner.info;
         let ops = unsafe { &*(*info).fbops };
         if let Some(open) = ops.fb_open {
@@ -160,6 +163,9 @@ impl FileLike for FbInfoFile {
     }
 
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
+        if self.owner._drm.is_unplugged() {
+            return Err(AxError::NoSuchDevice);
+        }
         let info = self.owner.info;
         let ops = unsafe { &*(*info).fbops };
         match cmd {
@@ -243,6 +249,9 @@ impl FileLike for FbInfoFile {
     }
 
     fn prepare_mmap(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
+        if self.owner._drm.is_unplugged() {
+            return Err(AxError::NoSuchDevice);
+        }
         prepare_fb_mmap(&self.owner, request).map(Some)
     }
 

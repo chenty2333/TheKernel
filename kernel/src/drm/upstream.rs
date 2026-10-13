@@ -75,6 +75,10 @@ impl UpstreamDrmDevice {
         self.owner.clone()
     }
 
+    pub(crate) fn is_unplugged(&self) -> bool {
+        self.unplugged.load(core::sync::atomic::Ordering::Acquire)
+    }
+
     pub(crate) fn map_blob_gem_object(
         &self,
         object: *mut DrmGemObject,
