@@ -394,7 +394,11 @@ pub unsafe extern "C" fn intel_display_driver_probe_nogem(display: *mut IntelDis
         crate::display_pending_stubs::b4::intel_wm_init(display);
         crate::display_pending_stubs::b6::intel_panel_sanitize_ssc(display);
         crate::display_pending_stubs::b6::intel_pps_setup(display);
-        crate::display_pending_stubs::b6::intel_gmbus_setup(display);
+        let gmbus_ret = crate::intel_gmbus_upstream::intel_gmbus_setup(display);
+        if gmbus_ret != 0 {
+            intel_mode_config_cleanup(display);
+            return gmbus_ret;
+        }
 
         let ret = crate::display_pending_stubs::b4::intel_crtc_init(display);
         if ret != 0 {
@@ -505,7 +509,7 @@ pub unsafe extern "C" fn intel_display_driver_remove_noirq(display: *mut IntelDi
         intel_mode_config_cleanup(display);
         crate::display_pending_stubs::opt::intel_dp_tunnel_mgr_cleanup(display);
         crate::display_pending_stubs::opt::intel_overlay_cleanup(display);
-        crate::display_pending_stubs::b6::intel_gmbus_teardown(display);
+        crate::intel_gmbus_upstream::intel_gmbus_teardown(display);
         tk_linux_kapi::workqueue::destroy_workqueue((*display).hotplug.dp_wq);
         tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.flip);
         tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.modeset);
