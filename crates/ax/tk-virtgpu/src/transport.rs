@@ -46,16 +46,15 @@ struct FenceRecord {
 /// The caller serializes access (normally with the device's DRM mutex).  This
 /// matters because `DisplayDriverOps` intentionally exposes a mutable
 /// transport; it must not be called concurrently through aliases.
-pub struct GpuEngine<'a> {
-    display: &'a mut dyn DisplayDriverOps,
+pub struct GpuEngine {
     features: GpuFeatures,
     host_visible_len: Option<u64>,
     next_fence_id: u64,
     records: Vec<FenceRecord>,
 }
 
-impl<'a> GpuEngine<'a> {
-    pub fn new(display: &'a mut dyn DisplayDriverOps) -> DevResult<Self> {
+impl GpuEngine {
+    pub fn new(display: &mut dyn DisplayDriverOps) -> DevResult<Self> {
         if !display.supports_drm_transport() {
             return Err(DevError::Unsupported);
         }
@@ -64,7 +63,6 @@ impl<'a> GpuEngine<'a> {
             .map(|transport| (transport.modern_features(), transport.host_visible_len()))
             .unwrap_or_else(|| (GpuFeatures::empty(), None));
         Ok(Self {
-            display,
             features,
             host_visible_len,
             next_fence_id: 1,
@@ -85,12 +83,17 @@ impl<'a> GpuEngine<'a> {
     /// Queue an owned command batch.  The lower transport owns all request
     /// and response backing through terminal completion; this layer retains
     /// the DRM-visible fence and any guest-reserved resource identity.
-    pub fn submit(&mut self, queue: GpuQueue, batch: GpuBatch) -> DevResult<u64> {
+    pub fn submit(
+        &mut self,
+        display: &mut dyn DisplayDriverOps,
+        queue: GpuQueue,
+        batch: GpuBatch,
+    ) -> DevResult<u64> {
         let fence_id = self.next_fence_id;
         let next = fence_id.checked_add(1).ok_or(DevError::BadState)?;
         self.records.try_reserve(1).map_err(|_| DevError::NoMemory)?;
 
-        let submission = self.display.drm_submit(queue, batch, fence_id)?;
+        let submission = display.drm_submit(queue, batch, fence_id)?;
         if submission.fence_id != fence_id {
             // The lower contract requires identity preservation.  The batch
             // still belongs to the lower owner until terminal completion.
@@ -113,7 +116,7 @@ impl<'a> GpuEngine<'a> {
     /// Drain at most 32 terminal records from one queue and update the
     /// corresponding DRM fences. Completions from another queue or with an
     /// unknown/reused identity are rejected rather than cross-signaling work.
-    pub fn drain(&mut self, queue: GpuQueue) -> DevResult<usize> {
+    pub fn drain(&mut self, display: &mut dyn DisplayDriverOps, queue: GpuQueue) -> DevResult<usize> {
         let mut out = Vec::new();
         out.try_reserve_exact(COMPLETION_BATCH)
             .map_err(|_| DevError::NoMemory)?;
@@ -124,7 +127,7 @@ impl<'a> GpuEngine<'a> {
                 data: GpuCompletionData::None,
             });
         }
-        let count = self.display.drm_drain_completions(queue, &mut out)?;
+        let count = display.drm_drain_completions(queue, &mut out)?;
         if count > out.len() {
             return Err(DevError::BadState);
         }
@@ -173,13 +176,13 @@ impl<'a> GpuEngine<'a> {
 
     /// Reset is terminal failure, never successful execution. Any resource
     /// ID reserved by an in-flight create is discarded.
-    pub fn reset(&mut self, queue: GpuQueue) -> usize {
+    pub fn reset(&mut self, display: &mut dyn DisplayDriverOps, queue: GpuQueue) -> usize {
         let mut out = Vec::new();
         if out.try_reserve_exact(COMPLETION_BATCH).is_err() {
             // The lower reset contract is still applied. If there are more
             // records than this bounded buffer can report, remaining fences
             // are failed below rather than left indefinitely pending.
-            let reset = self.display.drm_reset(queue, &mut []);
+            let reset = display.drm_reset(queue, &mut []);
             for record in self.records.iter_mut().filter(|record| record.queue == queue) {
                 if record.status == FenceStatus::Pending {
                     record.status = FenceStatus::Failed;
@@ -196,7 +199,7 @@ impl<'a> GpuEngine<'a> {
                 data: GpuCompletionData::None,
             });
         }
-        let count = self.display.drm_reset(queue, &mut out);
+        let count = display.drm_reset(queue, &mut out);
         for completion in out.iter().take(count) {
             if let Some(record) = self
                 .records
@@ -275,6 +278,35 @@ impl<'a> GpuEngine<'a> {
                 .completion_data
                 .take()
                 .ok_or(DevError::InvalidParam),
+        }
+    }
+
+    /// Sleepable fence wait used by ioctls whose Linux semantics require a
+    /// terminal response. Polling is bounded; a wedged queue is reset so its
+    /// lower-layer DMA owners become terminal before the error is returned.
+    pub fn wait(
+        &mut self,
+        display: &mut dyn DisplayDriverOps,
+        fence_id: u64,
+        timeout_ns: u64,
+    ) -> DevResult<FenceSnapshot> {
+        let deadline = axhal::time::monotonic_time_nanos().saturating_add(timeout_ns);
+        loop {
+            let snapshot = self.fence(fence_id).ok_or(DevError::InvalidParam)?;
+            match snapshot.status {
+                FenceStatus::Complete => return Ok(snapshot),
+                FenceStatus::Failed => return Err(DevError::Io),
+                FenceStatus::Pending => {}
+            }
+            if self.drain(display, snapshot.queue).is_err() {
+                self.reset(display, snapshot.queue);
+                return Err(DevError::Io);
+            }
+            if axhal::time::monotonic_time_nanos() >= deadline {
+                self.reset(display, snapshot.queue);
+                return Err(DevError::Io);
+            }
+            axtask::yield_now();
         }
     }
 }

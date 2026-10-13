@@ -21,3 +21,18 @@ workspace = true
 [dependencies]
 axdriver_display = { package = "tk-axdriver-display", path = "../tk-axdriver-display", version = "0.1.0" }
 tk-drm-upstream = { path = "../tk-drm-upstream", version = "0.1.0" }
+tk-linux-kapi = { path = "../tk-linux-kapi" }
+
+[dependencies.axtask]
+package = "tk-axtask"
+path = "../tk-axtask"
+version = "0.1.0"
+features = ["multitask", "preempt"]
+
+[dependencies.axhal]
+package = "tk-axhal"
+path = "../tk-axhal"
+version = "0.1.0"
+
+[dependencies.spin]
+version = "0.9"

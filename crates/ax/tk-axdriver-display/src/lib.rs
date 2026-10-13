@@ -334,6 +334,12 @@ impl GpuFeatures {
     pub const CONTEXT_INIT: Self = Self(1 << 2);
     /// The driver has a hostmem aperture that it can map into the guest.
     pub const HOST_VISIBLE: Self = Self(1 << 3);
+    /// The device negotiated the legacy VIRGL 3D feature.  A resource-blob
+    /// capable Venus-only device need not provide this command stream ABI.
+    pub const VIRGL_3D: Self = Self(1 << 4);
+    /// The device negotiated the legacy VIRGL 3D feature.  A resource-blob
+    /// capable Venus-only device need not provide this command stream ABI.
+    pub const VIRGL_3D: Self = Self(1 << 4);
     pub const fn empty() -> Self {
         Self(0)
     }

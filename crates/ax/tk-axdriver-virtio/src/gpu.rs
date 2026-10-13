@@ -157,6 +157,9 @@ impl<H: Hal, T: Transport> VirtIoGpuDev<H, T> {
         if self.inner.resource_blob_supported() && self.inner.context_init_supported() {
             features = features.union(GpuFeatures::CONTEXT_INIT);
         }
+        if self.inner.virgl_supported() {
+            features = features.union(GpuFeatures::VIRGL_3D);
+        }
         // Expose HOST_VISIBLE only when the lower transport has a validated
         // shared-memory aperture. MAP_BLOB is converted to exact physical
         // pages and retained through the final external SharedPages lease.

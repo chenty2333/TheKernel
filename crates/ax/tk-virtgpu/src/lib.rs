@@ -12,3 +12,8 @@ extern crate alloc;
 
 pub mod uapi;
 pub mod transport;
+mod device;
+pub mod gem;
+pub mod ioctl;
+
+pub use device::VirtioGpuDevice;
