@@ -12,8 +12,8 @@ use tk_drm_upstream::drm_modeset_lock_types::DrmModesetAcquireCtx;
 
 // upstream: lib/iomap.c ioread32()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ioread32(_addr: *const c_void) -> u32 {
-    0
+pub unsafe extern "C" fn ioread32(addr: *const c_void) -> u32 {
+    unsafe { tk_linux_kapi::iopoll::readl(addr) }
 }
 
 // upstream: include/drm/drm_privacy_screen_consumer.h drm_privacy_screen_get()
@@ -43,7 +43,9 @@ pub use tk_drm_upstream::drm_probe_helper_upstream::{
 
 // upstream: include/drm/drm_atomic.h drm_atomic_commit_put()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_atomic_commit_put(_state: *mut DrmAtomicCommit) {}
+pub unsafe extern "C" fn drm_atomic_commit_put(state: *mut DrmAtomicCommit) {
+    unsafe { tk_drm_upstream::drm_atomic_upstream::drm_atomic_commit_put(state) }
+}
 
 const X86_HYPER_NATIVE: u32 = 0;
 
@@ -70,3 +72,25 @@ pub use tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_commit_du
 pub use tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_disable_all;
 pub use tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_duplicate_state;
 pub use tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_shutdown;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ioread32_reads_the_mapped_register() {
+        let register = 0x1234_abcd_u32;
+        assert_eq!(unsafe { ioread32(core::ptr::addr_of!(register).cast()) }, register);
+    }
+
+    #[test]
+    fn atomic_commit_put_releases_a_reference() {
+        let mut state: DrmAtomicCommit = unsafe { core::mem::zeroed() };
+        unsafe {
+            tk_linux_kapi::memory::kref_init(core::ptr::addr_of_mut!(state.r#ref));
+            tk_linux_kapi::memory::kref_get(core::ptr::addr_of_mut!(state.r#ref));
+            drm_atomic_commit_put(&mut state);
+            assert_eq!(tk_linux_kapi::memory::kref_read(&state.r#ref), 1);
+        }
+    }
+}
