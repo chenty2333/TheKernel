@@ -4,7 +4,7 @@
 
 #![allow(non_snake_case, dead_code, unsafe_code)]
 
-use core::ffi::{c_int, c_void};
+use core::ffi::{c_char, c_int, c_void};
 use crate::intel_display_core_types_upstream::IntelDisplay;
 use crate::intel_display_device_upstream::intel_display_device_present;
 use tk_drm_upstream::drm_atomic_types::DrmAtomicCommit;
@@ -25,6 +25,13 @@ fn is_err<T>(ptr: *const T) -> bool {
     addr >= (!4095usize)
 }
 
+#[inline]
+fn ptr_err<T>(ptr: *const T) -> i32 {
+    ptr as isize as i32
+}
+
+const EPROBE_DEFER: i32 = 517;
+
 // upstream: intel_display_driver.c intel_display_driver_probe_defer()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_display_driver_probe_defer(pdev: *mut c_void) -> bool {
@@ -35,10 +42,10 @@ pub unsafe extern "C" fn intel_display_driver_probe_defer(pdev: *mut c_void) -> 
         return true;
     }
     let privacy_screen = unsafe { crate::display_pending_stubs::kapi_display::drm_privacy_screen_get(pdev, core::ptr::null()) };
-    if is_err(privacy_screen) {
+    if is_err(privacy_screen) && ptr_err(privacy_screen) == -EPROBE_DEFER {
         return true;
     }
-    if !privacy_screen.is_null() {
+    if !is_err(privacy_screen) && !privacy_screen.is_null() {
         unsafe { crate::display_pending_stubs::kapi_display::drm_privacy_screen_put(privacy_screen) };
     }
     false
@@ -150,6 +157,23 @@ pub unsafe extern "C" fn intel_display_driver_early_probe(display: *mut IntelDis
     }
 }
 
+const WQ_UNBOUND: u32 = 1 << 1;
+const WQ_HIGHPRI: u32 = 1 << 4;
+const WQ_PERCPU: u32 = 1 << 8;
+const __WQ_ORDERED: u32 = 1 << 17;
+const WQ_UNBOUND_MAX_ACTIVE: c_int = 512;
+const ENOMEM: c_int = 12;
+
+#[inline]
+unsafe fn alloc_ordered_workqueue(fmt: *const c_char, flags: u32) -> *mut c_void {
+    tk_linux_kapi::workqueue::alloc_workqueue(fmt, WQ_UNBOUND | __WQ_ORDERED | flags, 1)
+}
+
+#[inline]
+fn current_task_ptr() -> *mut c_void {
+    axhal::percpu::current_task_ptr::<()>().cast_mut().cast()
+}
+
 // upstream: intel_display_driver.c intel_display_driver_probe_noirq()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_display_driver_probe_noirq(display: *mut IntelDisplay) -> c_int {
@@ -168,7 +192,7 @@ pub unsafe extern "C" fn intel_display_driver_probe_noirq(display: *mut IntelDis
         crate::display_pending_stubs::b3c::intel_bios_init(display);
         crate::display_pending_stubs::opt::intel_psr_dc5_dc6_wa_init(display);
 
-        let ret = crate::display_pending_stubs::b3b::intel_display_power_init(display);
+        let mut ret = crate::display_pending_stubs::b3b::intel_display_power_init(display);
         if ret < 0 {
             crate::display_pending_stubs::b3c::intel_bios_driver_remove(display);
             return ret;
@@ -181,21 +205,100 @@ pub unsafe extern "C" fn intel_display_driver_probe_noirq(display: *mut IntelDis
             return 0;
         }
 
+        (*display).hotplug.dp_wq = alloc_ordered_workqueue(c"intel-dp".as_ptr(), 0);
+        if (*display).hotplug.dp_wq.is_null() {
+            ret = -ENOMEM;
+            crate::display_pending_stubs::b3c::intel_dmc_fini(display);
+            crate::display_pending_stubs::b3b::intel_display_power_driver_remove(display);
+            crate::display_pending_stubs::b3c::intel_bios_driver_remove(display);
+            return ret;
+        }
+
+        (*display).wq.modeset = alloc_ordered_workqueue(c"i915_modeset".as_ptr(), 0);
+        if (*display).wq.modeset.is_null() {
+            ret = -ENOMEM;
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).hotplug.dp_wq);
+            crate::display_pending_stubs::b3c::intel_dmc_fini(display);
+            crate::display_pending_stubs::b3b::intel_display_power_driver_remove(display);
+            crate::display_pending_stubs::b3c::intel_bios_driver_remove(display);
+            return ret;
+        }
+
+        (*display).wq.flip = tk_linux_kapi::workqueue::alloc_workqueue(
+            c"i915_flip".as_ptr(),
+            WQ_HIGHPRI | WQ_UNBOUND,
+            WQ_UNBOUND_MAX_ACTIVE,
+        );
+        if (*display).wq.flip.is_null() {
+            ret = -ENOMEM;
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.modeset);
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).hotplug.dp_wq);
+            crate::display_pending_stubs::b3c::intel_dmc_fini(display);
+            crate::display_pending_stubs::b3b::intel_display_power_driver_remove(display);
+            crate::display_pending_stubs::b3c::intel_bios_driver_remove(display);
+            return ret;
+        }
+
+        (*display).wq.cleanup = tk_linux_kapi::workqueue::alloc_workqueue(
+            c"i915_cleanup".as_ptr(),
+            WQ_HIGHPRI | WQ_PERCPU,
+            0,
+        );
+        if (*display).wq.cleanup.is_null() {
+            ret = -ENOMEM;
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.flip);
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.modeset);
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).hotplug.dp_wq);
+            crate::display_pending_stubs::b3c::intel_dmc_fini(display);
+            crate::display_pending_stubs::b3b::intel_display_power_driver_remove(display);
+            crate::display_pending_stubs::b3c::intel_bios_driver_remove(display);
+            return ret;
+        }
+
+        (*display).wq.unordered = tk_linux_kapi::workqueue::alloc_workqueue(
+            c"display_unordered".as_ptr(),
+            WQ_PERCPU,
+            0,
+        );
+        if (*display).wq.unordered.is_null() {
+            ret = -ENOMEM;
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.cleanup);
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.flip);
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.modeset);
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).hotplug.dp_wq);
+            crate::display_pending_stubs::b3c::intel_dmc_fini(display);
+            crate::display_pending_stubs::b3b::intel_display_power_driver_remove(display);
+            crate::display_pending_stubs::b3c::intel_bios_driver_remove(display);
+            return ret;
+        }
+
         crate::display_pending_stubs::b3c::intel_dmc_init(display);
         intel_mode_config_init(display);
 
-        let mut ret = crate::display_pending_stubs::b3e::intel_cdclk_init(display);
-        if ret != 0 { return ret; }
+        let cleanup_wqs = |ret: c_int| -> c_int {
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.unordered);
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.cleanup);
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.flip);
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.modeset);
+            tk_linux_kapi::workqueue::destroy_workqueue((*display).hotplug.dp_wq);
+            crate::display_pending_stubs::b3c::intel_dmc_fini(display);
+            crate::display_pending_stubs::b3b::intel_display_power_driver_remove(display);
+            crate::display_pending_stubs::b3c::intel_bios_driver_remove(display);
+            ret
+        };
+
+        ret = crate::display_pending_stubs::b3e::intel_cdclk_init(display);
+        if ret != 0 { return cleanup_wqs(ret); }
         ret = crate::display_pending_stubs::b4::intel_color_init(display);
-        if ret != 0 { return ret; }
+        if ret != 0 { return cleanup_wqs(ret); }
         ret = crate::display_pending_stubs::b3d::intel_dbuf_init(display);
-        if ret != 0 { return ret; }
+        if ret != 0 { return cleanup_wqs(ret); }
         ret = crate::display_pending_stubs::b3d::intel_dbuf_bw_init(display);
-        if ret != 0 { return ret; }
+        if ret != 0 { return cleanup_wqs(ret); }
         ret = crate::display_pending_stubs::b3d::intel_bw_init(display);
-        if ret != 0 { return ret; }
+        if ret != 0 { return cleanup_wqs(ret); }
         ret = crate::display_pending_stubs::b3b::intel_pmdemand_init(display);
-        if ret != 0 { return ret; }
+        if ret != 0 { return cleanup_wqs(ret); }
 
         crate::intel_quirks_upstream::intel_init_quirks(display);
         crate::display_pending_stubs::opt::intel_fbc_init(display);
@@ -250,7 +353,7 @@ pub unsafe extern "C" fn intel_display_driver_enable_user_access(display: *mut I
 pub unsafe extern "C" fn intel_display_driver_disable_user_access(display: *mut IntelDisplay) {
     unsafe {
         crate::display_pending_stubs::b6::intel_hpd_disable_detection_work(display);
-        set_display_access(display, false, core::ptr::null_mut());
+        set_display_access(display, false, current_task_ptr());
     }
 }
 
@@ -263,7 +366,7 @@ pub unsafe extern "C" fn intel_display_driver_suspend_access(display: *mut Intel
 // upstream: intel_display_driver.c intel_display_driver_resume_access()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_display_driver_resume_access(display: *mut IntelDisplay) {
-    unsafe { set_display_access(display, false, core::ptr::null_mut()) };
+    unsafe { set_display_access(display, false, current_task_ptr()) };
 }
 
 // upstream: intel_display_driver.c intel_display_driver_check_access()
@@ -272,7 +375,13 @@ pub unsafe extern "C" fn intel_display_driver_check_access(display: *mut IntelDi
     if display.is_null() {
         return false;
     }
-    unsafe { (*display).access.any_task_allowed }
+    let cur = current_task_ptr();
+    unsafe {
+        if (*display).access.any_task_allowed || (*display).access.allowed_task == cur {
+            return true;
+        }
+    }
+    false
 }
 
 // upstream: intel_display_driver.c intel_display_driver_probe_nogem()
@@ -373,6 +482,10 @@ pub unsafe extern "C" fn intel_display_driver_remove(display: *mut IntelDisplay)
         return;
     }
     unsafe {
+        tk_linux_kapi::workqueue::flush_workqueue((*display).wq.flip);
+        tk_linux_kapi::workqueue::flush_workqueue((*display).wq.modeset);
+        tk_linux_kapi::workqueue::flush_workqueue((*display).wq.cleanup);
+        tk_linux_kapi::workqueue::flush_workqueue((*display).wq.unordered);
         crate::display_pending_stubs::opt::intel_dp_mst_suspend(display);
     }
 }
@@ -387,11 +500,17 @@ pub unsafe extern "C" fn intel_display_driver_remove_noirq(display: *mut IntelDi
         intel_display_driver_suspend_access(display);
         crate::display_pending_stubs::b6::intel_hpd_poll_fini(display);
         crate::display_pending_stubs::opt::intel_unregister_dsm_handler();
+        tk_linux_kapi::workqueue::flush_workqueue((*display).wq.unordered);
         crate::display_pending_stubs::opt::intel_hdcp_component_fini(display);
         intel_mode_config_cleanup(display);
         crate::display_pending_stubs::opt::intel_dp_tunnel_mgr_cleanup(display);
         crate::display_pending_stubs::opt::intel_overlay_cleanup(display);
         crate::display_pending_stubs::b6::intel_gmbus_teardown(display);
+        tk_linux_kapi::workqueue::destroy_workqueue((*display).hotplug.dp_wq);
+        tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.flip);
+        tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.modeset);
+        tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.cleanup);
+        tk_linux_kapi::workqueue::destroy_workqueue((*display).wq.unordered);
         crate::display_pending_stubs::opt::intel_fbc_cleanup(display);
     }
 }

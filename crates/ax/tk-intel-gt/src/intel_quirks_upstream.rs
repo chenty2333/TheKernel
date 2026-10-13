@@ -295,7 +295,7 @@ pub unsafe extern "C" fn intel_init_quirks(display: *mut IntelDisplay) {
     if dev.is_null() {
         return;
     }
-    let d = dev.cast::<PciDev>();
+    let d = unsafe { crate::linux_platform::to_pci_dev(dev).cast::<PciDev>() };
     let device = unsafe { (*d).device as i32 };
     let sub_vendor = unsafe { (*d).subsystem_vendor as i32 };
     let sub_device = unsafe { (*d).subsystem_device as i32 };
@@ -317,7 +317,11 @@ pub unsafe extern "C" fn intel_init_quirks(display: *mut IntelDisplay) {
 }
 
 unsafe fn dp_to_dig_port(intel_dp: *mut IntelDp) -> *mut crate::intel_display_types_upstream::IntelDigitalPort {
-    (intel_dp.cast::<u8>().sub(504)).cast()
+    if intel_dp.is_null() {
+        return core::ptr::null_mut();
+    }
+    let offset = core::mem::offset_of!(crate::intel_display_types_upstream::IntelDigitalPort, dp);
+    (intel_dp.cast::<u8>().sub(offset)).cast()
 }
 
 unsafe fn to_intel_display_from_dp(intel_dp: *mut IntelDp) -> *mut IntelDisplay {
@@ -329,7 +333,7 @@ unsafe fn to_intel_display_from_dp(intel_dp: *mut IntelDp) -> *mut IntelDisplay 
     if dev.is_null() {
         core::ptr::null_mut()
     } else {
-        unsafe { (*dev).dev_private.cast() }
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display(dev) }
     }
 }
 
@@ -344,7 +348,7 @@ pub unsafe extern "C" fn intel_init_dpcd_quirks(
     }
     let display = unsafe { to_intel_display_from_dp(intel_dp) };
     let d = if !display.is_null() && !unsafe { (*display).drm.is_null() } && !unsafe { (*(*display).drm).dev.is_null() } {
-        unsafe { (*(*display).drm).dev.cast::<PciDev>() }
+        unsafe { crate::linux_platform::to_pci_dev((*(*display).drm).dev).cast::<PciDev>() }
     } else {
         core::ptr::null()
     };

@@ -24,6 +24,45 @@ use crate::intel_uncore_types_upstream::*;
 use crate::intel_uncore_upstream::I915_UNCORE_OFFSET;
 use crate::intel_workarounds_types_upstream::I915RegT;
 use tk_drm_upstream::drm_device_types::DrmDevice;
+use core::ffi::{c_char, c_int, c_void};
+
+unsafe extern "C" fn test_to_pci_dev(dev: *mut c_void) -> *mut c_void {
+    dev
+}
+unsafe extern "C" fn test_pci_read_byte(_dev: *mut c_void, _off: u32, _val: *mut u8) -> c_int { 0 }
+unsafe extern "C" fn test_pci_write_byte(_dev: *mut c_void, _off: u32, _val: u8) -> c_int { 0 }
+unsafe extern "C" fn test_pci_read_word(_dev: *mut c_void, _off: u32, _val: *mut u16) -> c_int { 0 }
+unsafe extern "C" fn test_irq_suspend(_i915: *mut crate::linux_i915_private::DrmI915Private) {}
+unsafe extern "C" fn test_irq_resume(_i915: *mut crate::linux_i915_private::DrmI915Private) {}
+unsafe extern "C" fn test_overlay_reset(_display: *mut c_void) {}
+unsafe extern "C" fn test_display_reset_test(_display: *mut c_void) -> bool { false }
+unsafe extern "C" fn test_display_reset_supported(_display: *mut c_void) -> bool { false }
+unsafe extern "C" fn test_display_reset_prepare(_display: *mut c_void) {}
+unsafe extern "C" fn test_display_reset_finish(_display: *mut c_void, _reset: bool) {}
+unsafe extern "C" fn test_add_taint(_i915: *mut crate::linux_i915_private::DrmI915Private, _flag: u32) {}
+unsafe extern "C" fn test_kobj_uevent(_kobj: *mut c_void, _act: i32, _envp: *const *const c_char) -> c_int { 0 }
+unsafe extern "C" fn test_drm_wedged(_drm: *mut c_void, _rec: u32, _data: *mut c_void) {}
+
+static TEST_PLATFORM_OPS: crate::linux_platform::I915PlatformOps = crate::linux_platform::I915PlatformOps {
+    to_pci_dev: test_to_pci_dev,
+    pci_read_config_byte: test_pci_read_byte,
+    pci_write_config_byte: test_pci_write_byte,
+    pci_read_config_word: test_pci_read_word,
+    irq_suspend: test_irq_suspend,
+    irq_resume: test_irq_resume,
+    overlay_reset: test_overlay_reset,
+    display_reset_test: test_display_reset_test,
+    display_reset_supported: test_display_reset_supported,
+    display_reset_prepare: test_display_reset_prepare,
+    display_reset_finish: test_display_reset_finish,
+    add_taint_for_ci: test_add_taint,
+    kobject_uevent_env: test_kobj_uevent,
+    drm_dev_wedged_event: test_drm_wedged,
+};
+
+pub fn ensure_test_platform_ops() {
+    let _ = crate::linux_platform::install_i915_platform_ops(&TEST_PLATFORM_OPS);
+}
 
 const MMIO_SPACE_SIZE: usize = 0x100000; // 1MB
 
@@ -119,6 +158,8 @@ impl MockEnvironment {
 
             let drm_ptr = drm_storage.as_mut_ptr().cast::<DrmDevice>();
             display.drm = drm_ptr;
+            let display_field_ptr = drm_storage.as_mut_ptr().add(core::mem::size_of::<DrmDevice>()).cast::<*mut c_void>();
+            *display_field_ptr = (&mut *display as *mut IntelDisplay).cast();
         }
 
         Self {
@@ -374,6 +415,27 @@ fn test_quirk_matching() {
         intel_init_quirks(display);
         assert!(intel_has_quirk(display, IntelQuirkId::QuirkInvertBrightness));
         assert!(!intel_has_quirk(display, IntelQuirkId::QuirkBacklightPresent));
+
+        // Test DPCD quirk matching:
+        // Dell Precision 5490: device 0x7d55, subvendor 0x1028, subdevice 0x0cc7, sink_oui [0x38, 0xec, 0x11]
+        pdev.device = 0x7D55;
+        pdev.subsystem_vendor = 0x1028;
+        pdev.subsystem_device = 0x0CC7;
+
+        let mut dig_port = Box::new(core::mem::zeroed::<crate::intel_display_types_upstream::IntelDigitalPort>());
+        dig_port.base.base.dev = (*display).drm;
+
+        let ident = DrmDpDpcdIdent {
+            oui: [0x38, 0xec, 0x11],
+            device_id: [0; 6],
+            hw_rev: 0,
+            sw_major_rev: 0,
+            sw_minor_rev: 0,
+        };
+
+        intel_init_dpcd_quirks(core::ptr::addr_of_mut!(dig_port.dp), &ident);
+        assert!(intel_has_dpcd_quirk(core::ptr::addr_of_mut!(dig_port.dp), IntelQuirkId::QuirkFwSyncLen));
+        assert!(!intel_has_dpcd_quirk(core::ptr::addr_of_mut!(dig_port.dp), IntelQuirkId::QuirkDisablePsr2));
     }
 }
 
@@ -429,3 +491,164 @@ fn test_clock_gating_adlp_register_writes() {
     assert!(wrote_dcpr_gen9, "expected write to GEN8_CHICKEN_DCPR_1");
     assert!(wrote_disp_arb_ctl, "expected write to DISP_ARB_CTL (0x45000)");
 }
+
+#[test]
+fn test_adlp_revision_stepping_mapping_and_gap_fallback() {
+    ensure_test_platform_ops();
+    let mut pdev = PciDev {
+        _pad_0: [0; 56],
+        devfn: 0,
+        vendor: 0x8086,
+        device: 0x46A6,
+        subsystem_vendor: 0x8086,
+        subsystem_device: 0x0001,
+        class: 0x030000,
+        revision: 0,
+    };
+    let mut drm = unsafe { core::mem::zeroed::<DrmDevice>() };
+    drm.dev = (&mut pdev as *mut PciDev).cast();
+
+    let mut display = Box::new(unsafe { core::mem::zeroed::<IntelDisplay>() });
+    display.drm = &mut drm;
+
+    let main_desc = SteppingDesc {
+        map: ADL_P_STEPPINGS.as_ptr(),
+        size: ADL_P_STEPPINGS.len(),
+    };
+
+    // 1. Exact match for revision 0 -> STEP_A0
+    pdev.revision = 0;
+    assert_eq!(
+        unsafe { get_pre_gmdid_step(&mut *display, &main_desc, core::ptr::null()) },
+        STEP_A0
+    );
+
+    // 2. Gaps fallback to the next revision per Linux 'use the next revision' logic:
+    // ADL_P_STEPPINGS has STEP_A0 at 0, 0s at 1..3, STEP_B0 at 4.
+    // Revisions 1, 2, 3 should all skip over the gap and return STEP_B0.
+    pdev.revision = 1;
+    assert_eq!(
+        unsafe { get_pre_gmdid_step(&mut *display, &main_desc, core::ptr::null()) },
+        STEP_B0
+    );
+    pdev.revision = 2;
+    assert_eq!(
+        unsafe { get_pre_gmdid_step(&mut *display, &main_desc, core::ptr::null()) },
+        STEP_B0
+    );
+    pdev.revision = 3;
+    assert_eq!(
+        unsafe { get_pre_gmdid_step(&mut *display, &main_desc, core::ptr::null()) },
+        STEP_B0
+    );
+
+    // Exact match for revision 4 -> STEP_B0
+    pdev.revision = 4;
+    assert_eq!(
+        unsafe { get_pre_gmdid_step(&mut *display, &main_desc, core::ptr::null()) },
+        STEP_B0
+    );
+
+    // Revisions 5..7 skip gap to STEP_C0 at 8
+    pdev.revision = 5;
+    assert_eq!(
+        unsafe { get_pre_gmdid_step(&mut *display, &main_desc, core::ptr::null()) },
+        STEP_C0
+    );
+    pdev.revision = 8;
+    assert_eq!(
+        unsafe { get_pre_gmdid_step(&mut *display, &main_desc, core::ptr::null()) },
+        STEP_C0
+    );
+
+    // Revisions 9..11 skip gap to STEP_D0 at 12
+    pdev.revision = 9;
+    assert_eq!(
+        unsafe { get_pre_gmdid_step(&mut *display, &main_desc, core::ptr::null()) },
+        STEP_D0
+    );
+    pdev.revision = 12;
+    assert_eq!(
+        unsafe { get_pre_gmdid_step(&mut *display, &main_desc, core::ptr::null()) },
+        STEP_D0
+    );
+
+    // Revisions beyond table size (>= 13) return STEP_FUTURE
+    pdev.revision = 13;
+    assert_eq!(
+        unsafe { get_pre_gmdid_step(&mut *display, &main_desc, core::ptr::null()) },
+        STEP_FUTURE
+    );
+    pdev.revision = 0xFF;
+    assert_eq!(
+        unsafe { get_pre_gmdid_step(&mut *display, &main_desc, core::ptr::null()) },
+        STEP_FUTURE
+    );
+
+    // 3. Subplatform stepping overrides main platform
+    let sub_desc = SteppingDesc {
+        map: ADL_P_ADL_N_STEPPINGS.as_ptr(),
+        size: ADL_P_ADL_N_STEPPINGS.len(),
+    };
+    pdev.revision = 0;
+    assert_eq!(
+        unsafe { get_pre_gmdid_step(&mut *display, &main_desc, &sub_desc) },
+        STEP_D0
+    );
+    pdev.revision = 1;
+    assert_eq!(
+        unsafe { get_pre_gmdid_step(&mut *display, &main_desc, &sub_desc) },
+        STEP_FUTURE
+    );
+}
+
+#[test]
+fn test_is_display_step_half_open_interval_boundary() {
+    let mut display = Box::new(unsafe { core::mem::zeroed::<IntelDisplay>() });
+    unsafe {
+        (*display).platform._anon_0_0.bitmap[0] = 1u64 << 52; // alderlake_p
+    }
+
+    // A0 is within [STEP_A0, STEP_B0)
+    unsafe { (*display).info.__runtime_info.step = STEP_A0 };
+    assert!(unsafe { IS_DISPLAY_STEP(&*display, STEP_A0, STEP_B0) });
+    assert!(unsafe { __intel_display_wa(&mut *display, IntelDisplayWa::Wa16011303918, core::ptr::null()) });
+
+    // A2 is within [STEP_A0, STEP_B0)
+    unsafe { (*display).info.__runtime_info.step = STEP_A2 };
+    assert!(unsafe { IS_DISPLAY_STEP(&*display, STEP_A0, STEP_B0) });
+    assert!(unsafe { __intel_display_wa(&mut *display, IntelDisplayWa::Wa16011303918, core::ptr::null()) });
+
+    // B0 is the UPPER BOUND (until) of [STEP_A0, STEP_B0), so it MUST NOT match!
+    unsafe { (*display).info.__runtime_info.step = STEP_B0 };
+    assert!(!unsafe { IS_DISPLAY_STEP(&*display, STEP_A0, STEP_B0) }, "STEP_B0 must not match [STEP_A0, STEP_B0)");
+    assert!(!unsafe { __intel_display_wa(&mut *display, IntelDisplayWa::Wa16011303918, core::ptr::null()) },
+        "Wa16011303918 must not match STEP_B0");
+
+    // But B0 IS the LOWER BOUND (since) of [STEP_B0, STEP_C0)
+    assert!(unsafe { IS_DISPLAY_STEP(&*display, STEP_B0, STEP_C0) });
+
+    // Test STEP_FOREVER: [STEP_E0, STEP_FOREVER) matches STEP_E0 and higher
+    unsafe { (*display).info.__runtime_info.step = STEP_E0 };
+    assert!(unsafe { IS_DISPLAY_STEP(&*display, STEP_E0, STEP_FOREVER) });
+    assert!(unsafe { __intel_display_wa(&mut *display, IntelDisplayWa::Wa14014143976, core::ptr::null()) });
+}
+
+#[test]
+fn test_probe_defer_rejects_enodev_privacy_screen() {
+    let mut dummy_pdev: u64 = 0x1234;
+    let pdev_ptr = core::ptr::addr_of_mut!(dummy_pdev).cast::<c_void>();
+
+    // drm_privacy_screen_get returns ERR_PTR(-ENODEV), which should NOT trigger probe defer
+    let defer = unsafe { crate::intel_display_driver_upstream::intel_display_driver_probe_defer(pdev_ptr) };
+    assert!(!defer, "intel_display_driver_probe_defer must return false on -ENODEV from privacy screen");
+}
+
+#[test]
+fn test_hypervisor_is_type_bare_metal_semantics() {
+    // X86_HYPER_NATIVE = 0 returns true; non-zero hypervisor types return false
+    assert!(unsafe { crate::display_pending_stubs::kapi_display::hypervisor_is_type(0) });
+    assert!(!unsafe { crate::display_pending_stubs::kapi_display::hypervisor_is_type(1) });
+    assert!(!unsafe { crate::display_pending_stubs::kapi_display::hypervisor_is_type(2) });
+}
+

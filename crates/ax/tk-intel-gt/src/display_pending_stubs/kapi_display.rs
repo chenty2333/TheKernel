@@ -56,13 +56,14 @@ pub unsafe extern "C" fn ioread32(_addr: *const c_void) -> u32 {
     0
 }
 
-// upstream: drivers/gpu/drm/drm_privacy_screen.c drm_privacy_screen_get()
+// upstream: include/drm/drm_privacy_screen_consumer.h drm_privacy_screen_get()
+// Degraded stub matches Linux !CONFIG_DRM_PRIVACY_SCREEN returning ERR_PTR(-ENODEV).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_privacy_screen_get(
     _dev: *mut c_void,
     _con_id: *const c_char,
 ) -> *mut c_void {
-    core::ptr::null_mut()
+    tk_linux_kapi::config::ERR_PTR(-tk_linux_kapi::config::ENODEV)
 }
 
 // upstream: drivers/gpu/drm/drm_privacy_screen.c drm_privacy_screen_put()
@@ -106,22 +107,26 @@ pub unsafe extern "C" fn drm_atomic_helper_disable_all(
 }
 
 // upstream: drivers/gpu/drm/drm_atomic_helper.c drm_atomic_helper_duplicate_state()
+// Degraded stub returns ERR_PTR(-ENOMEM), matching Linux failure when state allocation fails.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_atomic_helper_duplicate_state(
     _dev: *mut DrmDevice,
     _ctx: *mut DrmModesetAcquireCtx,
 ) -> *mut DrmAtomicCommit {
-    core::ptr::null_mut()
+    tk_linux_kapi::config::ERR_PTR(-tk_linux_kapi::config::ENOMEM)
 }
 
 // upstream: include/drm/drm_atomic.h drm_atomic_commit_put()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_atomic_commit_put(_state: *mut DrmAtomicCommit) {}
 
+const X86_HYPER_NATIVE: u32 = 0;
+
 // upstream: arch/x86/include/asm/hypervisor.h hypervisor_is_type()
+// Degraded stub matches Linux bare-metal semantics (x86_hyper_type == X86_HYPER_NATIVE).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn hypervisor_is_type(_type_: u32) -> bool {
-    true
+pub unsafe extern "C" fn hypervisor_is_type(type_: u32) -> bool {
+    type_ == X86_HYPER_NATIVE
 }
 
 
