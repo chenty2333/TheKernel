@@ -3923,6 +3923,7 @@ dependencies = [
  "tk-ratelimit",
  "tk-readiness-adapter",
  "tk-scope-local",
+ "tk-virtgpu",
  "tk-vtd",
  "uluru",
  "weak-map",

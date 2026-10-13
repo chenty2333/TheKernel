@@ -31,7 +31,7 @@ pub(crate) mod uapi;
 mod virtio;
 pub(crate) mod upstream;
 
-use alloc::{format, sync::Arc};
+use alloc::{boxed::Box, format, sync::Arc};
 
 use axdriver_display::{BlobMapping, DevError};
 use tk_drm_upstream::drm_gem_types::DrmGemObject;
