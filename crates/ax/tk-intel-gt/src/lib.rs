@@ -662,6 +662,10 @@ pub mod intel_color_upstream;
 #[allow(unsafe_code)]
 pub mod intel_gmbus_upstream;
 #[allow(unsafe_code)]
+pub mod intel_hotplug_upstream;
+#[allow(unsafe_code)]
+pub mod intel_hotplug_irq_upstream;
+#[allow(unsafe_code)]
 pub mod intel_hdmi_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_params_upstream;

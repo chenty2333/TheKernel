@@ -10,11 +10,15 @@ use crate::intel_display_core_types_upstream::IntelDisplay;
 
 // upstream: intel_hotplug.c intel_hpd_enable_detection_work()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_hpd_enable_detection_work(_display: *mut IntelDisplay) {}
+pub unsafe extern "C" fn intel_hpd_enable_detection_work(display: *mut IntelDisplay) {
+    unsafe { crate::intel_hotplug_upstream::intel_hpd_enable_detection_work_impl(display) };
+}
 
 // upstream: intel_hotplug.c intel_hpd_disable_detection_work()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_hpd_disable_detection_work(_display: *mut IntelDisplay) {}
+pub unsafe extern "C" fn intel_hpd_disable_detection_work(display: *mut IntelDisplay) {
+    unsafe { crate::intel_hotplug_upstream::intel_hpd_disable_detection_work_impl(display) };
+}
 
 // upstream: intel_panel.c intel_panel_sanitize_ssc()
 #[unsafe(no_mangle)]
@@ -26,15 +30,21 @@ pub unsafe extern "C" fn intel_pps_setup(_display: *mut IntelDisplay) {}
 
 // upstream: intel_hotplug.c intel_hpd_init()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_hpd_init(_display: *mut IntelDisplay) {}
+pub unsafe extern "C" fn intel_hpd_init(display: *mut IntelDisplay) {
+    unsafe { crate::intel_hotplug_upstream::intel_hpd_init_impl(display) };
+}
 
 // upstream: intel_hotplug.c intel_hpd_poll_disable()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_hpd_poll_disable(_display: *mut IntelDisplay) {}
+pub unsafe extern "C" fn intel_hpd_poll_disable(display: *mut IntelDisplay) {
+    unsafe { crate::intel_hotplug_upstream::intel_hpd_poll_disable_impl(display) };
+}
 
 // upstream: intel_hotplug.c intel_hpd_poll_fini()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_hpd_poll_fini(_display: *mut IntelDisplay) {}
+pub unsafe extern "C" fn intel_hpd_poll_fini(display: *mut IntelDisplay) {
+    unsafe { crate::intel_hotplug_upstream::intel_hpd_poll_fini_impl(display) };
+}
 
 // upstream: intel_pps.c intel_pps_unlock_regs_wa()
 #[unsafe(no_mangle)]
