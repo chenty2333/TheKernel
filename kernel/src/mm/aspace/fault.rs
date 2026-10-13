@@ -158,6 +158,9 @@ impl AddrSpace {
         else {
             return VM_FAULT_SIGBUS;
         };
+        if area.flags().contains(MappingFlags::SHADOW_STACK) {
+            return VM_FAULT_SIGBUS;
+        }
         if !unsafe { ops.matches_vma(vma) }
             || pgoff != vma.vm_pgoff as usize + (page.as_usize() - vma.vm_start as usize) / PAGE_SIZE_4K
             || pfn.checked_mul(PAGE_SIZE_4K) != Some(backing_paddr)
@@ -170,7 +173,7 @@ impl AddrSpace {
                 .backend()
                 .shared_immutable_mapping_flags()
                 .unwrap_or(MappingFlags::empty());
-        read_flags -= MappingFlags::WRITE;
+        read_flags -= MappingFlags::WRITE | MappingFlags::SHADOW_STACK;
         if area.flags().contains(MappingFlags::WRITE) {
             // x86 has no write-only leaf PTE; a writable VMA's hardware
             // encoding includes READ even when the Linux protection mask did
@@ -179,26 +182,17 @@ impl AddrSpace {
         }
         let read_flags = super::backend::page_table_flags(read_flags);
         match self.pt.query(page) {
-            Ok((mapped, _, PageSize::Size4K)) if mapped.as_usize() == backing_paddr => {
-                if !area.flags().contains(MappingFlags::WRITE)
-                    || vma.vm_flags & tk_linux_kapi::mm::VM_WRITE == 0
+            Ok((mapped, flags, PageSize::Size4K)) if mapped.as_usize() == backing_paddr => {
+                // A vmf_insert_pfn callback is only allowed to publish a
+                // read-only leaf. Even a matching pre-existing PFN may have
+                // been installed by a racing population path; granting WRITE
+                // belongs exclusively to the successful page_mkwrite commit.
+                if !flags.contains(read_flags)
+                    || flags.intersects(MappingFlags::WRITE | MappingFlags::SHADOW_STACK)
                 {
-                    return tk_linux_kapi::mm::VM_FAULT_NOPAGE;
-                }
-                let write_flags = super::backend::page_table_flags(
-                    area.flags()
-                        | area
-                            .backend()
-                            .shared_immutable_mapping_flags()
-                            .unwrap_or(MappingFlags::empty()),
-                );
-                if self
-                    .pt
-                    .cursor()
-                    .remap(page, mapped, write_flags)
-                    .is_err()
-                {
-                    return VM_FAULT_SIGBUS;
+                    if self.pt.cursor().remap(page, mapped, read_flags).is_err() {
+                        return VM_FAULT_SIGBUS;
+                    }
                 }
             }
             Err(PagingError::NotMapped) => {

@@ -752,7 +752,11 @@ pub unsafe fn unlock_page(page: *mut Page) {
     assert!(old & PAGE_LOCKED != 0, "unlock_page on an unlocked page");
 }
 
-unsafe fn lock_page(page: *mut Page) {
+/// Acquire the registered page's Linux page lock, spinning until it is held.
+///
+/// # Safety
+/// `page` must be a live page reference from this module's page registry.
+pub unsafe fn lock_page(page: *mut Page) {
     while !unsafe { trylock_page(page) } {
         spin_loop();
     }

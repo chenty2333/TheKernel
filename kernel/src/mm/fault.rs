@@ -232,15 +232,23 @@ fn complete_shared_mmap_fault(
     if plan.needs_fault {
         let mut vmf = shared_mmap_vm_fault(&mut plan);
         let result = unsafe { plan.ops.call_fault(&mut vmf) };
+        let page = unsafe { tk_linux_kapi::mm::vm_fault_page(&vmf) };
         if let Some(failure) = shared_mmap_callback_failure(result) {
-            let page = unsafe { tk_linux_kapi::mm::vm_fault_page(&vmf) };
+            if result & tk_linux_kapi::mm::VM_FAULT_LOCKED != 0 && !page.is_null() {
+                unsafe { tk_linux_kapi::shmem::unlock_page(page) };
+            }
             if !page.is_null() {
                 unsafe { tk_linux_kapi::shmem::put_page(page) };
             }
             return failure;
         }
-        let page = unsafe { tk_linux_kapi::mm::vm_fault_page(&vmf) };
         if !page.is_null() {
+            // Linux drops the fault callback's page lock before invoking
+            // page_mkwrite; that callback takes its own lock (or returns
+            // VM_FAULT_LOCKED), which must then cover our PTE commit.
+            if result & tk_linux_kapi::mm::VM_FAULT_LOCKED != 0 {
+                unsafe { tk_linux_kapi::shmem::unlock_page(page) };
+            }
             page_ref = match plan.ops.retain_fault_page(plan.page_index, page, plan.paddr) {
                 Ok(page) => Some(page),
                 Err(_) => return PageFaultResult::Failed(PageFaultFailure::BackingUnavailable),
@@ -259,12 +267,6 @@ fn complete_shared_mmap_fault(
         } else {
             return PageFaultResult::Failed(PageFaultFailure::BackingUnavailable);
         }
-        if result & tk_linux_kapi::mm::VM_FAULT_LOCKED != 0 {
-            let Some(page) = page_ref.as_ref() else {
-                return PageFaultResult::Failed(PageFaultFailure::BackingUnavailable);
-            };
-            unsafe { tk_linux_kapi::shmem::unlock_page(page.page()) };
-        }
     } else {
         let cached_page = plan.ops.cached_page(plan.page_index).or_else(|| {
             let page = unsafe { tk_linux_kapi::shmem::pin_physical_frame(plan.paddr) };
@@ -282,11 +284,13 @@ fn complete_shared_mmap_fault(
         page_ref = cached_page;
     }
 
+    let mut mkwrite_page_lock = None;
     if plan.needs_mkwrite {
         let Some(page) = page_ref.as_ref() else {
             return PageFaultResult::Failed(PageFaultFailure::BackingUnavailable);
         };
         let mut vmf = shared_mmap_vm_fault(&mut plan);
+        vmf.flags |= tk_linux_kapi::mm::FAULT_FLAG_MKWRITE;
         unsafe { tk_linux_kapi::mm::vm_fault_set_page(&mut vmf, page.page()) };
         let result = unsafe {
             if plan.ops.has_page_mkwrite() {
@@ -295,27 +299,95 @@ fn complete_shared_mmap_fault(
                 plan.ops.call_pfn_mkwrite(&mut vmf)
             }
         };
-        if let Some(failure) = shared_mmap_callback_failure(result) {
+        let callback_page = unsafe { tk_linux_kapi::mm::vm_fault_page(&vmf) };
+        if let Some(failure) = shared_mmap_mkwrite_failure(result) {
             if result & tk_linux_kapi::mm::VM_FAULT_LOCKED != 0 {
-                unsafe { tk_linux_kapi::shmem::unlock_page(page.page()) };
+                // A locked result transfers the lock on vmf->page, including
+                // error results. A null page is malformed; use the original
+                // referenced page as the only safe cleanup target.
+                let locked_page = if callback_page.is_null() {
+                    page.page()
+                } else {
+                    callback_page
+                };
+                unsafe { tk_linux_kapi::shmem::unlock_page(locked_page) };
+            }
+            if !callback_page.is_null() && callback_page != page.page() {
+                unsafe { tk_linux_kapi::shmem::put_page(callback_page) };
             }
             return failure;
         }
-        let callback_page = unsafe { tk_linux_kapi::mm::vm_fault_page(&vmf) };
-        if !callback_page.is_null() && callback_page != page.page() {
-            unsafe { tk_linux_kapi::shmem::put_page(callback_page) };
+        if callback_page != page.page() {
             if result & tk_linux_kapi::mm::VM_FAULT_LOCKED != 0 {
-                unsafe { tk_linux_kapi::shmem::unlock_page(page.page()) };
+                let locked_page = if callback_page.is_null() {
+                    page.page()
+                } else {
+                    callback_page
+                };
+                unsafe { tk_linux_kapi::shmem::unlock_page(locked_page) };
+            }
+            if !callback_page.is_null() {
+                unsafe { tk_linux_kapi::shmem::put_page(callback_page) };
             }
             return PageFaultResult::Failed(PageFaultFailure::BackingUnavailable);
         }
+
+        // Linux's do_page_mkwrite relocks a successful page_mkwrite result
+        // when the callback did not return VM_FAULT_LOCKED. Keep that lock
+        // through the address-space revalidation and writable PTE commit so a
+        // deferred-I/O rearm cannot write-protect first and then lose to this
+        // fault's late writable mapping.
+        mkwrite_page_lock = Some(if result & tk_linux_kapi::mm::VM_FAULT_LOCKED != 0 {
+            // SAFETY: the callback returned VM_FAULT_LOCKED for this exact
+            // referenced page, as checked above.
+            unsafe { SharedMmapPageLock::adopt_locked(page.page()) }
+        } else {
+            // SAFETY: the retained SharedMmapPageRef pins a registered page.
+            unsafe { SharedMmapPageLock::lock(page.page()) }
+        });
         unsafe { tk_linux_kapi::shmem::set_page_dirty_c(page.page()) };
-        if result & tk_linux_kapi::mm::VM_FAULT_LOCKED != 0 {
-            unsafe { tk_linux_kapi::shmem::unlock_page(page.page()) };
-        }
     }
 
-    aspace.lock().commit_shared_mmap_fault(&plan)
+    if let Some(page_lock) = mkwrite_page_lock {
+        page_lock.commit(|| aspace.lock().commit_shared_mmap_fault(&plan))
+    } else {
+        aspace.lock().commit_shared_mmap_fault(&plan)
+    }
+}
+
+/// Owns a Linux page lock across the core's shared-mmap PTE commit.
+struct SharedMmapPageLock(*mut tk_linux_kapi::types::Page);
+
+impl SharedMmapPageLock {
+    /// Adopts a lock returned by a successful VM callback.
+    ///
+    /// # Safety
+    /// `page` must be a live registered page already locked by the caller.
+    unsafe fn adopt_locked(page: *mut tk_linux_kapi::types::Page) -> Self {
+        debug_assert!(!page.is_null());
+        Self(page)
+    }
+
+    /// Acquires the page lock when a successful VM callback did not return it.
+    ///
+    /// # Safety
+    /// `page` must be a live registered page reference.
+    unsafe fn lock(page: *mut tk_linux_kapi::types::Page) -> Self {
+        unsafe { tk_linux_kapi::shmem::lock_page(page) };
+        Self(page)
+    }
+
+    fn commit<T>(self, commit: impl FnOnce() -> T) -> T {
+        let result = commit();
+        drop(self);
+        result
+    }
+}
+
+impl Drop for SharedMmapPageLock {
+    fn drop(&mut self) {
+        unsafe { tk_linux_kapi::shmem::unlock_page(self.0) };
+    }
 }
 
 fn shared_mmap_vm_fault(plan: &mut SharedMmapFaultPlan) -> tk_linux_kapi::mm::VmFault {
@@ -342,6 +414,19 @@ fn shared_mmap_callback_failure(result: u32) -> Option<PageFaultResult> {
         | tk_linux_kapi::mm::VM_FAULT_FALLBACK;
     (result & !known != 0)
         .then_some(PageFaultResult::Failed(PageFaultFailure::BackingUnavailable))
+}
+
+fn shared_mmap_mkwrite_failure(result: u32) -> Option<PageFaultResult> {
+    if let Some(failure) = shared_mmap_callback_failure(result) {
+        return Some(failure);
+    }
+    if result & tk_linux_kapi::mm::VM_FAULT_NOPAGE != 0 {
+        return Some(PageFaultResult::Handled);
+    }
+    if result & tk_linux_kapi::mm::VM_FAULT_FALLBACK != 0 {
+        return Some(PageFaultResult::Failed(PageFaultFailure::BackingUnavailable));
+    }
+    None
 }
 
 unsafe extern "C" fn core_vmf_insert_pfn(
@@ -642,6 +727,14 @@ mod tests {
             shared_mmap_callback_failure(VM_FAULT_NOPAGE | VM_FAULT_LOCKED | VM_FAULT_FALLBACK),
             None,
         );
+        assert_eq!(
+            shared_mmap_mkwrite_failure(VM_FAULT_NOPAGE | VM_FAULT_LOCKED),
+            Some(PageFaultResult::Handled),
+        );
+        assert_eq!(
+            shared_mmap_mkwrite_failure(VM_FAULT_FALLBACK),
+            Some(PageFaultResult::Failed(PageFaultFailure::BackingUnavailable)),
+        );
         assert!(shared_mmap_callback_failure(1 << 31).is_some());
     }
 
@@ -738,6 +831,76 @@ mod tests {
             );
         }
 
+        // The insert-PFN callback is only a read-only publication path. A
+        // matching pre-existing writable PFN must not bypass page_mkwrite.
+        assert_eq!(
+            first.lock().insert_shared_mmap_pfn(
+                &template,
+                start.as_usize(),
+                paddr.as_usize() / PAGE_SIZE_4K,
+            ),
+            tk_linux_kapi::mm::VM_FAULT_NOPAGE,
+        );
+        assert!(
+            !first
+                .lock()
+                .page_table()
+                .query(start)
+                .unwrap()
+                .1
+                .contains(MappingFlags::WRITE)
+        );
+        assert!(
+            second
+                .lock()
+                .page_table()
+                .query(start)
+                .unwrap()
+                .1
+                .contains(MappingFlags::WRITE)
+        );
+
+        let write_plan = SharedMmapFaultPlan {
+            ops: ops.clone(),
+            vma: ops.vm_area(
+                template.vm_start,
+                template.vm_end,
+                template.vm_pgoff,
+                template.vm_flags,
+            ),
+            page: start,
+            page_index: 0,
+            pgoff: 0,
+            paddr: paddr.as_usize(),
+            write: true,
+            needs_fault: false,
+            needs_mkwrite: true,
+        };
+        let page = unsafe { tk_linux_kapi::shmem::pin_physical_frame(paddr.as_usize()) };
+        assert!(!page.is_null());
+        assert!(unsafe { tk_linux_kapi::shmem::trylock_page(page) });
+        let commit_result = unsafe { SharedMmapPageLock::adopt_locked(page) }.commit(|| {
+            assert!(
+                !unsafe { tk_linux_kapi::shmem::trylock_page(page) },
+                "deferred rearm acquired the page lock before the writable PTE commit",
+            );
+            first.lock().commit_shared_mmap_fault(&write_plan)
+        });
+        assert_eq!(commit_result, PageFaultResult::Handled);
+        assert!(
+            first
+                .lock()
+                .page_table()
+                .query(start)
+                .unwrap()
+                .1
+                .contains(MappingFlags::WRITE)
+        );
+
+        // Once the commit guard releases the page lock, the waiting rearm
+        // worker can acquire it and write-protect every alias.
+        assert!(unsafe { tk_linux_kapi::shmem::trylock_page(page) });
+
         assert_eq!(
             unsafe {
                 core_mapping_wrprotect_range(
@@ -749,6 +912,10 @@ mod tests {
             },
             0,
         );
+        unsafe {
+            tk_linux_kapi::shmem::unlock_page(page);
+            tk_linux_kapi::shmem::put_page(page);
+        }
         for aspace in [&first, &second] {
             assert!(
                 !aspace
