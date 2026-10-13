@@ -926,6 +926,10 @@ mod tests {
 
     #[test]
     fn test_read_blocks_until_woken() {
+        assert!(
+            axhal::percpu::current_task_ptr::<()>().is_null(),
+            "host blocking-read test must not inherit a synthetic scheduler task",
+        );
         crate::test_support::ensure_test_signal_provider();
         unsafe {
             let mut driver: DrmDriver = core::mem::zeroed();

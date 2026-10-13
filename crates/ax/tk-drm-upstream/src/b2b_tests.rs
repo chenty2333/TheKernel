@@ -83,8 +83,20 @@ static TEST_TASK_OPS: TaskOps = TaskOps {
 
 static MAIN_TASK_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-fn init_test_env() {
+// The host harness reuses its worker thread across serial tests. B2b tests
+// attach the scheduler's main task only for their own helper calls; do not
+// leave that kernel-task identity in the host thread for later tests.
+struct RestoreCurrentTask(*const ());
+
+impl Drop for RestoreCurrentTask {
+    fn drop(&mut self) {
+        unsafe { axhal::percpu::set_current_task_ptr(self.0) };
+    }
+}
+
+fn init_test_env() -> RestoreCurrentTask {
     crate::test_support::ensure_test_signal_provider();
+    let previous = axhal::percpu::current_task_ptr::<()>();
     static SCHED_INIT: std::sync::Once = std::sync::Once::new();
     SCHED_INIT.call_once(|| {
         let _ = axtask::init_scheduler();
@@ -96,6 +108,7 @@ fn init_test_env() {
         unsafe { axhal::percpu::set_current_task_ptr(ptr as *const ()) };
     }
     let _ = tk_linux_kapi::kernel_services::install_task_ops(&TEST_TASK_OPS);
+    RestoreCurrentTask(previous)
 }
 
 
@@ -302,7 +315,7 @@ struct TestFixture {
 
 impl TestFixture {
     fn new() -> Self {
-        init_test_env();
+        let _task_guard = init_test_env();
         let mut drm = TestDrm::new(DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM);
         drm.init_registry();
         let dev = drm.ptr();
@@ -454,7 +467,7 @@ fn make_mode(hdisplay: u16, vdisplay: u16) -> DrmDisplayMode {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_check_plane_state() {
-    init_test_env();
+    let _task_guard = init_test_env();
 
     let mut crtc: DrmCrtc = unsafe { zeroed() };
     let mut crtc_state: DrmCrtcState = unsafe { zeroed() };
@@ -627,7 +640,7 @@ fn test_check_plane_state() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_check_modeset_and_check_planes() {
-    init_test_env();
+    let _task_guard = init_test_env();
 
     let mut fixture = TestFixture::new();
     let dev = fixture.dev();
@@ -706,7 +719,7 @@ fn test_check_modeset_and_check_planes() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_blocking_commit_callback_order_and_cleanup() {
-    init_test_env();
+    let _task_guard = init_test_env();
     clear_exec_log();
 
     let mut fixture = TestFixture::new();
@@ -766,7 +779,7 @@ fn test_blocking_commit_callback_order_and_cleanup() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_nonblocking_commit_dependencies() {
-    init_test_env();
+    let _task_guard = init_test_env();
 
     let mut fixture = TestFixture::new();
     let dev = fixture.dev();
@@ -833,7 +846,7 @@ fn test_nonblocking_commit_dependencies() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_suspend_resume_roundtrip() {
-    init_test_env();
+    let _task_guard = init_test_env();
 
     let mut fixture = TestFixture::new();
     let dev = fixture.dev();
@@ -889,7 +902,7 @@ fn test_suspend_resume_roundtrip() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_gem_fb_helpers_and_prepare_fb() {
-    init_test_env();
+    let _task_guard = init_test_env();
 
     let mut fixture = TestFixture::new();
     let dev = fixture.dev();
