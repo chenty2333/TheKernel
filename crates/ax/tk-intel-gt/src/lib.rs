@@ -691,6 +691,16 @@ pub mod intel_dpt_upstream;
 pub mod intel_frontbuffer_upstream;
 #[allow(unsafe_code)]
 pub mod intel_initial_plane_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dp_aux_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dp_link_training_upstream;
+#[allow(unsafe_code)]
+pub mod intel_link_bw_upstream;
+#[allow(unsafe_code)]
+pub mod intel_panel_upstream;
+#[allow(unsafe_code)]
+pub mod intel_pps_upstream;
 
 #[allow(unsafe_code)]
 pub mod intel_display_reset_upstream;
