@@ -949,6 +949,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         &mut self,
         width: u32,
         height: u32,
+        format: u32,
     ) -> Result<(ResourceId, GpuSubmission)> {
         if width == 0
             || height == 0
@@ -960,6 +961,17 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         {
             return Err(Error::InvalidParam);
         }
+        let format = match format {
+            1 => Format::B8G8R8A8UNORM,
+            2 => Format::B8G8R8X8UNORM,
+            3 => Format::A8R8G8B8UNORM,
+            4 => Format::X8R8G8B8UNORM,
+            67 => Format::R8G8B8A8UNORM,
+            68 => Format::X8B8G8R8UNORM,
+            121 => Format::A8B8G8R8UNORM,
+            134 => Format::R8G8B8X8UNORM,
+            _ => return Err(Error::InvalidParam),
+        };
         self.resources.try_reserve(1).map_err(|_| Error::DmaError)?;
         let id = ResourceId(self.next_resource_id);
         self.next_resource_id = self
@@ -983,7 +995,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         let request = ResourceCreate2D {
             header: CtrlHeader::fenced(Command::RESOURCE_CREATE_2D, 0, fence),
             resource_id: id.0,
-            format: Format::B8G8R8A8UNORM,
+            format,
             width,
             height,
         }
@@ -1374,7 +1386,9 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                     self.forget_resource(id);
                     Err(error)
                 } else {
-                    self.resource_mut(id)?.backing_mappings.extend_from_slice(&mappings);
+                    self.resource_mut(id)?
+                        .backing_mappings
+                        .extend_from_slice(&mappings);
                     self.control_faulted = true;
                     Err(Error::Quarantined)
                 }
@@ -1520,7 +1534,9 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                 if self.unmap_backing_entries(&mappings) {
                     Err(error)
                 } else {
-                    self.resource_mut(id)?.backing_mappings.extend_from_slice(&mappings);
+                    self.resource_mut(id)?
+                        .backing_mappings
+                        .extend_from_slice(&mappings);
                     self.control_faulted = true;
                     Err(Error::Quarantined)
                 }
@@ -1608,6 +1624,15 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
     }
 
     pub fn submit_transfer_to_host(&mut self, id: ResourceId, rect: Rect) -> Result<GpuSubmission> {
+        self.submit_transfer_to_host_offset(id, rect, 0)
+    }
+
+    pub fn submit_transfer_to_host_offset(
+        &mut self,
+        id: ResourceId,
+        rect: Rect,
+        offset: u64,
+    ) -> Result<GpuSubmission> {
         let resource = self.resource(id)?;
         if resource.lifecycle != ResourceLifecycle::Live
             || resource.backing != BackingState::Attached
@@ -1623,7 +1648,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             TransferToHost2D {
                 header: CtrlHeader::fenced(Command::TRANSFER_TO_HOST_2D, 0, fence),
                 rect,
-                offset: 0,
+                offset,
                 resource_id: id.get(),
                 _padding: 0,
             }
@@ -2213,10 +2238,8 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         for resource in self.resources.iter_mut() {
             while let Some(mapping) = resource.backing_mappings.last().copied() {
                 // SAFETY: transport reset above quiesced all device DMA.
-                if unsafe {
-                    H::unmap_physical_for(requester, mapping, BufferDirection::Both)
-                }
-                .is_err()
+                if unsafe { H::unmap_physical_for(requester, mapping, BufferDirection::Both) }
+                    .is_err()
                 {
                     self.reset_failed = true;
                     return 0;
@@ -2335,7 +2358,8 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         for mapping in mappings.iter().rev().copied() {
             // SAFETY: callers invoke this only after queue publication failed,
             // a detach/unref completion retired host access, or transport reset.
-            if unsafe { H::unmap_physical_for(requester, mapping, BufferDirection::Both) }.is_err() {
+            if unsafe { H::unmap_physical_for(requester, mapping, BufferDirection::Both) }.is_err()
+            {
                 success = false;
             }
         }
@@ -2680,6 +2704,13 @@ struct ResourceCreate2D {
 #[derive(AsBytes)]
 enum Format {
     B8G8R8A8UNORM = 1,
+    B8G8R8X8UNORM = 2,
+    A8R8G8B8UNORM = 3,
+    X8R8G8B8UNORM = 4,
+    R8G8B8A8UNORM = 67,
+    X8B8G8R8UNORM = 68,
+    A8B8G8R8UNORM = 121,
+    R8G8B8X8UNORM = 134,
 }
 #[repr(C)]
 #[derive(AsBytes)]
@@ -3106,7 +3137,7 @@ mod tests {
             })),
         };
         let mut gpu = VirtIOGpu::<FakeHal, _>::new(transport).unwrap();
-        gpu.submit_create_2d(64, 64).unwrap();
+        gpu.submit_create_2d(64, 64, 2).unwrap();
         assert_eq!(gpu.display_info().err(), Some(Error::NotReady));
         assert_eq!(gpu.pending_control.len(), 1);
         gpu.fault_control_queue();
@@ -3167,7 +3198,7 @@ mod tests {
                 gpu.submit_create_3d(2, 2, 2, 64, 64, 1, 1, 0, 0, 1)
                     .unwrap()
             } else {
-                gpu.submit_create_2d(64, 64).unwrap()
+                gpu.submit_create_2d(64, 64, 2).unwrap()
             };
             respond(if render {
                 Command::RESOURCE_CREATE_3D
