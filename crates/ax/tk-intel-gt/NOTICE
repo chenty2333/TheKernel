@@ -218,3 +218,11 @@ intel_vbt_defs.h). Intel copyright years span 2008-2025 across the set; each
 header's own copyright lines are the attribution. `tests/intel_display_regs_upstream.rs`
 pins 35 macro and register values against the C preprocessor output; it pins
 `GMBUS_SW_CLR_INT` as the unsigned register value 0x80000000 (C `1 << 31`).
+
+Display power and platform support (2026-10-13, batch B3b): the B3b display
+power-domain, power-well, PMDEMAND, PCH, and HTI translations map Linux 7.2.3
+`drivers/gpu/drm/i915/display/{intel_display_power.c,intel_display_power_map.c,
+intel_display_power_well.c,intel_pmdemand.c,intel_pch.c,intel_hti.c}`. All six
+sources carry the MIT SPDX identifier; Intel copyright years 2019, 2022, 2023,
+and 2025 are preserved in `LICENSE-MIT`. Function-level source mapping is in
+`docs/upstream-provenance.md`.

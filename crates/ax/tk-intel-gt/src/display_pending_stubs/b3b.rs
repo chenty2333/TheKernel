@@ -8,34 +8,11 @@
 
 use crate::intel_display_core_types_upstream::IntelDisplay;
 
-// upstream: intel_pch.c intel_pch_detect()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_pch_detect(_display: *mut IntelDisplay) {}
+pub use crate::intel_pch_upstream::intel_pch_detect;
 
-// upstream: intel_display_power.c intel_display_power_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_display_power_init(_display: *mut IntelDisplay) -> i32 {
-    0
-}
-
-// upstream: intel_pmdemand.c intel_pmdemand_init_early()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_pmdemand_init_early(_display: *mut IntelDisplay) {}
-
-// upstream: intel_display_power.c intel_display_power_init_hw()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_display_power_init_hw(_display: *mut IntelDisplay) {}
-
-// upstream: intel_pmdemand.c intel_pmdemand_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_pmdemand_init(_display: *mut IntelDisplay) -> i32 {
-    0
-}
-
-// upstream: intel_display_power.c intel_display_power_driver_remove()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_display_power_driver_remove(_display: *mut IntelDisplay) {}
-
-// upstream: intel_hti.c intel_hti_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_hti_init(_display: *mut IntelDisplay) {}
+pub use crate::intel_display_power_upstream::intel_display_power_init;
+pub use crate::intel_pmdemand_upstream::intel_pmdemand_init_early;
+pub use crate::intel_display_power_upstream::intel_display_power_init_hw;
+pub use crate::intel_pmdemand_upstream::intel_pmdemand_init;
+pub use crate::intel_display_power_upstream::intel_display_power_driver_remove;
+pub use crate::intel_hti_upstream::intel_hti_init;

@@ -23,3 +23,11 @@ pub unsafe extern "C" fn intel_dpll_init(_display: *mut IntelDisplay) {}
 // upstream: intel_dpll.c intel_dpll_update_ref_clks()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_dpll_update_ref_clks(_display: *mut IntelDisplay) {}
+
+// upstream: intel_combo_phy.c intel_combo_phy_init()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_combo_phy_init(_display: *mut IntelDisplay) {}
+
+// upstream: intel_combo_phy.c intel_combo_phy_uninit()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_combo_phy_uninit(_display: *mut IntelDisplay) {}

@@ -64,6 +64,8 @@ pub use tk_linux_kapi::acpi::acpi_video_unregister;
 pub use tk_linux_kapi::debugfs::debugfs_create_u32;
 pub use tk_linux_kapi::acpi::dmi_check_system;
 pub use tk_drm_upstream::pending_stubs::drm_client_probe::drm_client_dev_unregister;
+pub use tk_linux_kapi::pci::pci_dev_put;
+pub use tk_linux_kapi::pci::pci_get_class;
 pub use tk_linux_kapi::pci::pci_iomap_range;
 pub use tk_linux_kapi::pci::pci_iounmap;
 pub use tk_linux_kapi::vga::vga_switcheroo_client_probe_defer;

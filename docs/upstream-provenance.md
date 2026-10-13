@@ -2275,3 +2275,11 @@ Recorded in `crates/ax/tk-drm-upstream/NOTICE`.
 
 
 
+## 2026-10-13 i915 display power domains B3b reconciliation
+
+The Linux i915 display power domains, PMDEMAND, PCH detect, HTI translations (`crates/ax/tk-intel-gt`, batch B3b: `intel_display_power_upstream.rs`, `intel_display_power_map_upstream.rs`, `intel_display_power_well_upstream.rs`, `intel_pmdemand_upstream.rs`, `intel_pch_upstream.rs`, `intel_hti_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. Merging B3b into main after DRM review fixes and B2b moved the re-scanned `crates/ax` totals from 938/908 to 1014/984 at threshold >=40 (76 code lines) and from 2452/2414 to 2632/2594 at threshold >=25 (180 code lines). `tests/ci/test_linux_excerpt_baseline.py` pins those combined totals; `crates/linux` and `kernel/src` are unchanged.
+
+Licensing:
+All translated display sources carry MIT licenses in upstream Linux 7.2.3 (SPDX-License-Identifier: MIT) and are recorded in `crates/ax/tk-intel-gt/NOTICE`.
+
+

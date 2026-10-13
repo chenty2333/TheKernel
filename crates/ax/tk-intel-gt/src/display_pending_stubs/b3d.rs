@@ -12,6 +12,15 @@ use crate::intel_display_core_types_upstream::IntelDisplay;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_atomic_global_obj_cleanup(_display: *mut IntelDisplay) {}
 
+// upstream: intel_global_state.c intel_atomic_global_obj_init()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_atomic_global_obj_init(
+    _display: *mut IntelDisplay,
+    _obj: *mut crate::intel_global_state_types_upstream::IntelGlobalObj,
+    _state: *mut crate::intel_global_state_types_upstream::IntelGlobalState,
+    _funcs: *const crate::intel_global_state_types_upstream::IntelGlobalStateFuncs,
+) {}
+
 // upstream: intel_display_irq.c intel_display_irq_init()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_display_irq_init(_display: *mut IntelDisplay) {}
@@ -41,3 +50,17 @@ pub unsafe extern "C" fn ilk_enable_display_irq(_display: *mut IntelDisplay, _ma
 // upstream: intel_display_irq.c ilk_disable_display_irq()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ilk_disable_display_irq(_display: *mut IntelDisplay, _mask: u32) {}
+
+// upstream: intel_display_irq.c gen8_irq_power_well_post_enable()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen8_irq_power_well_post_enable(
+    _display: *mut IntelDisplay,
+    _pipe_mask: u8,
+) {}
+
+// upstream: intel_display_irq.c gen8_irq_power_well_pre_disable()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen8_irq_power_well_pre_disable(
+    _display: *mut IntelDisplay,
+    _pipe_mask: u8,
+) {}

@@ -30,3 +30,27 @@ pub unsafe extern "C" fn intel_update_max_cdclk(_display: *mut IntelDisplay) {}
 pub unsafe extern "C" fn intel_read_rawclk(_display: *mut IntelDisplay) -> u32 {
     24000
 }
+
+// upstream: intel_cdclk.c intel_cdclk_get_cdclk()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_get_cdclk(
+    _display: *mut IntelDisplay,
+    _config: *mut core::ffi::c_void,
+) {}
+
+// upstream: intel_cdclk.c intel_cdclk_clock_changed()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_clock_changed(
+    _a: *const core::ffi::c_void,
+    _b: *const core::ffi::c_void,
+) -> bool {
+    false
+}
+
+// upstream: intel_cdclk.c intel_cdclk_init_hw()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_init_hw(_display: *mut IntelDisplay) {}
+
+// upstream: intel_cdclk.c intel_cdclk_uninit_hw()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_uninit_hw(_display: *mut IntelDisplay) {}
