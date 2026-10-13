@@ -4,17 +4,19 @@
 //! owns a reference to that state and a task mirrors its deferred completion
 //! into the upstream fence only after the native fence actually signals.
 
-use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{
     any::Any,
     ffi::{c_char, c_int, c_long, c_void},
     mem::{offset_of, size_of},
     ptr,
     sync::atomic::{AtomicU64, Ordering},
+    task::Context,
     time::Duration,
 };
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
+use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable, PreparedPollRegistration};
 use intel_gt::{
     i915_request_upstream::DmaFenceOps,
     intel_context_upstream::{DmaFence, DmaFenceTimestamp, DrmGemObjectBaseLayout, RcuHead},
@@ -25,6 +27,20 @@ use crate::drm::{
     fence::{Fence, Reservation},
     syncobj::{SyncFile, Syncobj},
 };
+
+use crate::file::{FileLike, Kstat, add_file_like, anon_inode_stat, get_typed_file};
+
+unsafe extern "C" {
+    /// Generic DRM syncobj refcount helpers. These have `tk_drm_` prefixes to
+    /// distinguish them from the LinuxKPI native-Syncobj bridge symbols.
+    fn tk_drm_syncobj_get(syncobj: *mut c_void) -> *mut c_void;
+    fn tk_drm_syncobj_put(syncobj: *mut c_void);
+}
+
+#[inline]
+fn syncobj_err_ptr(error: AxError) -> *mut c_void {
+    (-(LinuxError::from(error).code() as isize)) as *mut c_void
+}
 
 const GFP_KERNEL: u32 = 0x0cc0;
 const DMA_RESV_USAGE_WRITE: u32 = 1;
@@ -820,6 +836,114 @@ struct SyncobjBridge {
     object: Arc<Syncobj>,
 }
 
+/// VFS open-file description retaining a reference to the exact generic
+/// Linux `drm_syncobj` object. This is intentionally distinct from
+/// `SyncobjBridge`, which backs i915/native timeline operations.
+struct UpstreamSyncobjFile {
+    syncobj: usize,
+}
+
+impl UpstreamSyncobjFile {
+    fn try_new(syncobj: *mut c_void) -> AxResult<Arc<Self>> {
+        if syncobj.is_null() {
+            return Err(AxError::InvalidInput);
+        }
+        // SAFETY: caller passes a live generic DRM syncobj borrowed for this
+        // operation; the helper acquires the VFS OFD's independent ref.
+        let owned = unsafe { tk_drm_syncobj_get(syncobj) };
+        if owned.is_null() {
+            return Err(AxError::NoSuchDevice);
+        }
+        match Arc::try_new(Self {
+            syncobj: owned as usize,
+        }) {
+            Ok(file) => Ok(file),
+            Err(_) => {
+                // SAFETY: balance the ref acquired above after OFD allocation failed.
+                unsafe { tk_drm_syncobj_put(owned) };
+                Err(AxError::NoMemory)
+            }
+        }
+    }
+
+    fn get_ref(&self) -> *mut c_void {
+        // SAFETY: the VFS OFD owns this generic syncobj reference throughout the call.
+        unsafe { tk_drm_syncobj_get(self.syncobj as *mut c_void) }
+    }
+}
+
+impl Drop for UpstreamSyncobjFile {
+    fn drop(&mut self) {
+        if self.syncobj != 0 {
+            // SAFETY: the VFS OFD owns exactly this reference until final drop.
+            unsafe { tk_drm_syncobj_put(self.syncobj as *mut c_void) };
+        }
+    }
+}
+
+impl FileLike for UpstreamSyncobjFile {
+    fn stat(&self) -> AxResult<Kstat> {
+        Ok(anon_inode_stat())
+    }
+
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+            b"anon_inode:[drm-syncobj]",
+        )))
+    }
+
+    fn set_nonblocking(&self, _: bool) -> AxResult<()> {
+        Ok(())
+    }
+}
+
+impl Pollable for UpstreamSyncobjFile {
+    fn poll(&self) -> IoEvents {
+        IoEvents::empty()
+    }
+
+    fn register<'a>(
+        &'a self,
+        _: &mut Context<'_>,
+        _: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+        PreparedPollRegistration::try_new(0)?.commit()
+    }
+}
+
+/// Linux DRM syncobj export helper. The returned descriptor retains the exact
+/// generic `drm_syncobj` object via the kernel's existing VFS OFD table.
+///
+/// # Safety
+/// `syncobj` must be a live generic DRM syncobj pointer held by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thekernel_drm_syncobj_export_fd(syncobj: *mut c_void) -> c_int {
+    let file = match UpstreamSyncobjFile::try_new(syncobj) {
+        Ok(file) => file,
+        Err(error) => return -LinuxError::from(error).code(),
+    };
+    match add_file_like(file, true) {
+        Ok(fd) => fd,
+        Err(error) => -LinuxError::from(error).code(),
+    }
+}
+
+/// Linux DRM syncobj import helper. On success the returned pointer owns one
+/// reference to the same generic object stored in the VFS OFD. Errors use the
+/// Linux `ERR_PTR(-errno)` convention.
+#[unsafe(no_mangle)]
+pub extern "C" fn thekernel_drm_syncobj_import_fd(fd: c_int) -> *mut c_void {
+    let file = match get_typed_file::<UpstreamSyncobjFile>(fd) {
+        Ok(file) => file,
+        Err(error) => return syncobj_err_ptr(error),
+    };
+    let syncobj = file.get_ref();
+    if syncobj.is_null() {
+        return syncobj_err_ptr(AxError::NoSuchDevice);
+    }
+    syncobj
+}
+
 ///
 /// # Safety
 /// A non-null handle must be an outstanding `Arc::into_raw` result from
@@ -1032,5 +1156,82 @@ mod tests {
             let _: () = require_bridge(Err(AxError::NoMemory), "injected failure");
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn syncobj_vfs_fd_import_preserves_exact_object_and_reference_lifetime() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let mut drm = unsafe {
+            core::mem::zeroed::<tk_drm_upstream::drm_device_types::DrmDevice>()
+        };
+        drm.driver_features = tk_drm_upstream::drm_ioctl_upstream::DRIVER_SYNCOBJ;
+        let mut file = unsafe {
+            core::mem::zeroed::<tk_drm_upstream::drm_file_types::DrmFile>()
+        };
+        tk_linux_kapi::xarray::xa_init_flags(&mut file.syncobj_xa, 0);
+        let mut create = tk_drm_upstream::uapi_drm_types::DrmSyncobjCreate {
+            handle: 0,
+            flags: 0,
+        };
+        assert_eq!(
+            unsafe {
+                tk_drm_upstream::drm_syncobj_upstream::drm_syncobj_create_ioctl(
+                    &mut drm,
+                    (&mut create as *mut tk_drm_upstream::uapi_drm_types::DrmSyncobjCreate)
+                        .cast(),
+                    &mut file,
+                )
+            },
+            0
+        );
+        assert_ne!(create.handle, 0);
+
+        let object = unsafe {
+            tk_drm_upstream::drm_syncobj_upstream::tk_drm_syncobj_find(&mut file, create.handle)
+        };
+        assert!(!object.is_null());
+        // SAFETY: `find` returns one independently owned syncobj reference.
+        let base = unsafe { Arc::from_raw(object) };
+        assert_eq!(
+            Arc::strong_count(&base),
+            2,
+            "file handle plus this reference"
+        );
+
+        let fd = unsafe { thekernel_drm_syncobj_export_fd(Arc::as_ptr(&base).cast_mut().cast()) };
+        assert!(fd >= 0);
+        assert_eq!(Arc::strong_count(&base), 3, "the VFS OFD owns a reference");
+
+        let imported_ptr = thekernel_drm_syncobj_import_fd(fd);
+        assert!(!imported_ptr.is_null());
+        assert!((imported_ptr as isize) >= 0);
+        // SAFETY: successful import returns one owned reference to this object.
+        let imported = unsafe {
+            Arc::from_raw(
+                imported_ptr.cast::<tk_drm_upstream::drm_syncobj_upstream::DrmSyncobj>(),
+            )
+        };
+        assert!(Arc::ptr_eq(&base, &imported));
+        assert_eq!(Arc::strong_count(&base), 4);
+        drop(imported);
+        assert_eq!(Arc::strong_count(&base), 3);
+
+        crate::file::close_file_like(fd).unwrap();
+        assert_eq!(
+            Arc::strong_count(&base),
+            2,
+            "closing the fd drops its owner ref"
+        );
+        let still_live = unsafe {
+            tk_drm_upstream::drm_syncobj_upstream::tk_drm_syncobj_find(&mut file, create.handle)
+        };
+        assert_eq!(still_live, Arc::as_ptr(&base).cast_mut());
+        unsafe { tk_drm_upstream::drm_syncobj_upstream::tk_drm_syncobj_put(still_live) };
+        drop(base);
+        unsafe { tk_drm_upstream::drm_syncobj_upstream::tk_drm_syncobj_release(&mut file) };
+
+        let bad_fd = thekernel_drm_syncobj_import_fd(i32::MAX);
+        assert!(!bad_fd.is_null());
+        assert!((bad_fd as isize) < 0 && (bad_fd as isize) >= -4095);
     }
 }

@@ -2077,6 +2077,14 @@ impl<T: ?Sized> AsRef<T> for FileHandle<T> {
     }
 }
 
+impl<T: ?Sized> FileHandle<T> {
+    /// Clone the concrete file owner for a subsystem context that must outlive
+    /// the descriptor lookup which produced this handle.
+    pub(crate) fn clone_file_arc(&self) -> Arc<T> {
+        self.file.clone()
+    }
+}
+
 struct RestoreOnDrop<T, F: FnMut(T)> {
     previous: Option<T>,
     restore: F,

@@ -8,7 +8,10 @@
 
 #![allow(non_snake_case, dead_code, unsafe_code)]
 
-use core::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
+use core::{
+    ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void},
+    sync::atomic::{AtomicPtr, Ordering},
+};
 use alloc::boxed::Box;
 use tk_linux_kapi::config::{EAGAIN, EEXIST, EINVAL, ENOMEM, EOPNOTSUPP, GFP_KERNEL};
 use tk_linux_kapi::list::{INIT_LIST_HEAD, list_add_tail, list_del, list_del_init, list_empty};
@@ -42,6 +45,44 @@ use crate::uapi_drm_types::{DrmGemClose, DrmGemFlink, DrmGemOpen};
 const ENOENT: i32 = 2;
 const PAGE_SIZE: usize = 4096;
 const PAGE_SHIFT: usize = 12;
+
+/// Kernel-side alias hooks for a GEM handle table that intentionally mirrors
+/// this Linux DRM file. Linux remains authoritative for GEM allocation,
+/// object references, and the user-visible handle; these callbacks keep the
+/// kernel's shared `DrmFile` view in lockstep with those operations.
+#[repr(C)]
+pub struct DrmGemHandleProvider {
+    pub create: unsafe extern "C" fn(
+        file: *mut c_void,
+        object: *mut c_void,
+        handle: *mut u32,
+    ) -> c_int,
+    pub close: unsafe extern "C" fn(file: *mut c_void, handle: u32),
+}
+
+static GEM_HANDLE_PROVIDER: AtomicPtr<DrmGemHandleProvider> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Install the kernel-owned GEM handle alias provider. The provider is called
+/// after Linux allocates a handle ID and before the driver ioctl publishes it.
+pub fn install_gem_handle_provider(
+    provider: &'static DrmGemHandleProvider,
+) -> Result<(), &'static str> {
+    GEM_HANDLE_PROVIDER
+        .compare_exchange(
+            core::ptr::null_mut(),
+            core::ptr::from_ref(provider).cast_mut(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|_| ())
+        .map_err(|_| "DRM GEM handle provider already installed")
+}
+
+fn gem_handle_provider() -> Option<&'static DrmGemHandleProvider> {
+    let provider = GEM_HANDLE_PROVIDER.load(Ordering::Acquire);
+    // SAFETY: install_gem_handle_provider publishes only a static provider.
+    unsafe { provider.as_ref() }
+}
 
 unsafe fn dma_resv_init(resv: *mut DmaResv) {
     if !resv.is_null() {
@@ -261,6 +302,10 @@ pub unsafe extern "C" fn drm_gem_handle_delete(filp: *mut DrmFile, handle: u32) 
 
         drm_gem_object_release_handle(handle as i32, obj.cast(), filp.cast());
 
+        if let Some(provider) = gem_handle_provider() {
+            (provider.close)(filp.cast(), handle);
+        }
+
         spin_lock(&mut (*filp).table_lock);
         idr_remove(core::ptr::addr_of_mut!((*filp).object_idr), handle as i32);
         spin_unlock(&mut (*filp).table_lock);
@@ -325,6 +370,19 @@ pub unsafe extern "C" fn drm_gem_handle_create_tail(
                     drm_gem_handle_delete(file_priv, *handlep);
                     return open_ret;
                 }
+            }
+        }
+
+        if let Some(provider) = gem_handle_provider() {
+            let alias_ret = (provider.create)(file_priv.cast(), obj.cast(), handlep);
+            if alias_ret != 0 {
+                drm_gem_handle_delete(file_priv, ret as u32);
+                return alias_ret;
+            }
+            if *handlep != ret as u32 {
+                // A second handle namespace would make ioctl and mmap disagree.
+                drm_gem_handle_delete(file_priv, ret as u32);
+                return -EINVAL;
             }
         }
         0

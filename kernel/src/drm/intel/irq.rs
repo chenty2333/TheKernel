@@ -108,6 +108,47 @@ pub(super) mod upstream {
     const EBUSY: c_int = 16;
     const GEN11_GU_MISC_GSE: u32 = 1 << 27;
 
+    /// Whether the ADL-P display interrupt master is enabled and the i915 IRQ
+    /// path currently owns a live handler. The display parent uses this exact
+    /// condition before synchronizing its shared GPU vector.
+    pub(in crate::drm::intel) unsafe fn display_irq_enabled(
+        drm: *mut tk_drm_upstream::drm_device_types::DrmDevice,
+    ) -> bool {
+        if drm.is_null() || HANDLER.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let i915 = unsafe { (*drm).dev_private.cast::<DrmI915Private>() };
+        if i915.is_null() || core::ptr::addr_of_mut!((*i915).drm) != drm {
+            return false;
+        }
+        let display = unsafe { (*i915).display.cast::<intel_gt::intel_display_core_types_upstream::IntelDisplay>() };
+        if display.is_null()
+            || !unsafe { intel_gt::intel_display_device_upstream::intel_display_device_present(display) }
+        {
+            return false;
+        }
+        let Some(base) = gpu_base() else { return false };
+        raw_read(base, GEN11_DISPLAY_INT_CTL).is_ok_and(|value| {
+            value & intel_gt::intel_display_regs_upstream::GEN11_DISPLAY_IRQ_ENABLE != 0
+        })
+    }
+
+    pub(in crate::drm::intel) unsafe fn display_irq_synchronize(
+        drm: *mut tk_drm_upstream::drm_device_types::DrmDevice,
+    ) {
+        if drm.is_null() {
+            return;
+        }
+        let i915 = unsafe { (*drm).dev_private.cast::<DrmI915Private>() };
+        if i915.is_null() || core::ptr::addr_of_mut!((*i915).drm) != drm {
+            return;
+        }
+        let irq = IRQ_NUMBER.load(Ordering::Acquire);
+        if irq != 0 {
+            axhal::irq::synchronize_hardirq(irq);
+        }
+    }
+
     /// The hard-IRQ entry the MSI calls: forward to the translated handler.
     fn gpu_msi_handler() {
         forward();
@@ -311,10 +352,17 @@ pub(super) mod upstream {
         pmu_irq_stats,
     };
 
-    /// `intel_display_irq_handler()` with `!HAS_DISPLAY`: Linux returns without
-    /// acknowledging anything. The display master is off (see
-    /// `quiesce_display_interrupts`), so this is not reached in practice.
-    unsafe extern "C" fn display_irq_handler(_display: *mut c_void) {}
+    /// Delegate display-source acknowledge and dispatch to the typed upstream
+    /// ADL-P implementation. Gen11 uses its own master-control snapshot and
+    /// does not consume the legacy state argument.
+    unsafe extern "C" fn display_irq_handler(display: *mut c_void) {
+        let _ = unsafe {
+            intel_gt::intel_display_irq_upstream::intel_display_irq_handler(
+                display.cast(),
+                core::ptr::null(),
+            )
+        };
+    }
 
     /// `gen11_gu_misc_irq_ack()`: GU_MISC is a GT-path source, so it is acked here.
     unsafe extern "C" fn gu_misc_irq_ack(_display: *mut c_void, master_ctl: u32) -> u32 {
@@ -338,11 +386,12 @@ pub(super) mod upstream {
         }
     }
 
-    /// `intel_display_irq_reset()` and `intel_display_irq_postinstall()` with
-    /// `!HAS_DISPLAY` return early in Linux. The quiesce above is the only
-    /// display-side register write.
-    unsafe extern "C" fn display_irq_reset(_display: *mut c_void) {}
-    unsafe extern "C" fn display_irq_postinstall(_display: *mut c_void) {}
+    unsafe extern "C" fn display_irq_reset(display: *mut c_void) {
+        unsafe { intel_gt::intel_display_irq_upstream::intel_display_irq_reset(display.cast()) };
+    }
+    unsafe extern "C" fn display_irq_postinstall(display: *mut c_void) {
+        unsafe { intel_gt::intel_display_irq_upstream::intel_display_irq_postinstall(display.cast()) };
+    }
 
     /// `pmu_irq_stats()` only feeds i915 PMU counters; CONFIG_PERF_EVENTS
     /// for i915 is off.

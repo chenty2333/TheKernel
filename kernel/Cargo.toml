@@ -208,5 +208,11 @@ path = "../crates/ax/tk-acpica"
 [dependencies.tk-i2c]
 path = "../crates/ax/tk-i2c"
 
+[dependencies.tk-drm-upstream]
+path = "../crates/ax/tk-drm-upstream"
+
+[dependencies.tk-virtgpu]
+path = "../crates/ax/tk-virtgpu"
+
 [dependencies.tk-vtd]
 path = "../crates/ax/tk-vtd"

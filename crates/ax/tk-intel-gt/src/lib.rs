@@ -770,6 +770,16 @@ pub mod intel_dmc_wl_upstream;
 pub mod intel_dram_upstream;
 #[allow(unsafe_code)]
 pub mod intel_mchbar_upstream;
+
+// Narrow callbacks/constants consumed by the kernel-owned display parent.
+// Their implementations and object lifetimes remain owned by i915.
+pub use i915_gem_internal_upstream::i915_gem_object_create_internal;
+pub use i915_gem_object_frontbuffer_upstream::i915_display_frontbuffer_interface;
+pub use i915_gem_stolen_upstream::i915_display_stolen_interface;
+pub use i915_vma_upstream::{PIN_MAPPABLE, PIN_NOEVICT, PIN_OFFSET_GUARD, PIN_ZONE_4G};
+pub use intel_clock_gating_upstream::intel_clock_gating_init;
+pub use intel_pcode_upstream::i915_display_pcode_interface;
+
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod b3a_tests;
