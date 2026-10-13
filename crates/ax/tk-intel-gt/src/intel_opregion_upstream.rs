@@ -434,14 +434,7 @@ pub unsafe extern "C" fn intel_opregion_setup(display: *mut IntelDisplay) -> c_i
         (*display).opregion = opregion.cast();
     }
 
-    if mailboxes & MBOX_ASLE != 0 {
-        unsafe {
-            ptr::write_volatile(
-                mapped.cast::<u8>().add(OPREGION_ASLE_OFFSET).cast::<u32>(),
-                0,
-            );
-        }
-    }
+    unsafe { clear_unimplemented_mailbox_readiness(mapped.cast(), mailboxes) };
     unsafe { swsci_setup(display) };
 
     // Mailbox #3's RVDA is preferred when supplied by OpRegion 2.0+.
@@ -548,9 +541,9 @@ pub unsafe extern "C" fn intel_opregion_headless_sku(display: *mut IntelDisplay)
         && unsafe { (*opregion).pcon & (1 << 13) != 0 }
 }
 
-/// ACPI notifications and ASLE interrupt work are not yet connected to a
-/// TheKernel event source. Preserve the mailbox readiness handshake, which is
-/// independent of that optional event-delivery path.
+/// ACPI notifications and ASLE interrupt work are not connected to a
+/// TheKernel event source. Mailbox #4 VBT and SWSCI remain usable, but do not
+/// tell firmware that the driver handles ACPI notifications or ASLE events.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_opregion_register(display: *mut IntelDisplay) {
     unsafe { intel_opregion_resume(display) };
@@ -572,16 +565,31 @@ pub unsafe extern "C" fn intel_opregion_suspend(display: *mut IntelDisplay, stat
     }
     let opregion = unsafe { (*display).opregion.cast::<IntelOpRegion>() };
     let mapped = unsafe { (*opregion).mapped.cast::<u8>() };
-    if unsafe { (*opregion).mailboxes & MBOX_ASLE != 0 } {
+    unsafe { clear_unimplemented_mailbox_readiness(mapped, (*opregion).mailboxes) };
+}
+
+/// Keep optional ACPI/ASLE services unavailable until their event handlers
+/// exist. ASLE_TCHE advertises capabilities as well as ARDY being its
+/// readiness handshake; both must remain clear.
+unsafe fn clear_unimplemented_mailbox_readiness(mapped: *mut u8, mailboxes: u32) {
+    if mapped.is_null() {
+        return;
+    }
+
+    if mailboxes & MBOX_ACPI != 0 {
         unsafe {
-            ptr::write_volatile(
-                mapped.add(OPREGION_ASLE_OFFSET).cast::<u32>(),
-                0, // ASLE_ARDY_NOT_READY
-            );
+            // ACPI mailbox: CSTS then DRDY, matching Linux's resume ordering
+            // while keeping this driver not-ready.
+            ptr::write_volatile(mapped.add(0x104).cast::<u32>(), 0);
+            ptr::write_volatile(mapped.add(0x100).cast::<u32>(), 0);
         }
     }
-    if unsafe { (*opregion).mailboxes & MBOX_ACPI != 0 } {
-        unsafe { ptr::write_volatile(mapped.add(0x100).cast::<u32>(), 0) };
+    if mailboxes & MBOX_ASLE != 0 {
+        unsafe {
+            let asle = mapped.add(OPREGION_ASLE_OFFSET);
+            ptr::write_volatile(asle.cast::<u32>(), 0); // ASLE_ARDY_NOT_READY
+            ptr::write_volatile(asle.add(8).cast::<u32>(), 0); // no ASLE capabilities
+        }
     }
 }
 
@@ -593,27 +601,16 @@ pub unsafe extern "C" fn intel_opregion_resume(display: *mut IntelDisplay) {
     let opregion = unsafe { (*display).opregion.cast::<IntelOpRegion>() };
     if unsafe { intel_display_device_enabled(display) } {
         let mapped = unsafe { (*opregion).mapped.cast::<u8>() };
-        if unsafe { (*opregion).mailboxes & MBOX_ACPI != 0 } {
-            unsafe {
-                ptr::write_volatile(mapped.add(0x104).cast::<u32>(), 0); // csts
-                ptr::write_volatile(mapped.add(0x100).cast::<u32>(), 1); // drdy
-            }
-        }
-        if unsafe { (*opregion).mailboxes & MBOX_ASLE != 0 } {
-            unsafe {
-                ptr::write_volatile(
-                    mapped.add(OPREGION_ASLE_OFFSET + 8).cast::<u32>(),
-                    1 << 1, // ASLE_TCHE_BLC_EN
-                );
-                ptr::write_volatile(
-                    mapped.add(OPREGION_ASLE_OFFSET).cast::<u32>(),
-                    1, // ASLE_ARDY_READY
-                );
-            }
-        }
+        unsafe { clear_unimplemented_mailbox_readiness(mapped, (*opregion).mailboxes) };
     }
     let _ = unsafe { intel_opregion_notify_adapter(display, 0) };
 }
+
+/// The display interrupt path may call this Linux OpRegion hook, but this
+/// build has no ASLE worker. Keep it an explicit no-op and never advertise
+/// mailbox #3 readiness/capabilities until asynchronous ASLE service exists.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_opregion_asle_intr(_display: *mut IntelDisplay) {}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_opregion_notify_adapter(
@@ -730,5 +727,21 @@ mod tests {
         assert_eq!(rvda_physical_address(0x1000, 2, 1, 0x2000), Some(0x3000));
         assert_eq!(rvda_physical_address(0x1000, 2, 0, 0x200), Some(0x200));
         assert_eq!(rvda_physical_address(u32::MAX - 0x1000, 3, 0, 0x2000), None);
+    }
+
+    #[test]
+    fn optional_acpi_and_asle_mailboxes_stay_not_ready() {
+        let mut mailbox = [u32::MAX; OPREGION_SIZE / size_of::<u32>()];
+        let mapped = mailbox.as_mut_ptr().cast::<u8>();
+
+        unsafe {
+            clear_unimplemented_mailbox_readiness(mapped, MBOX_ACPI | MBOX_ASLE | MBOX_SWSCI);
+        }
+
+        assert_eq!(mailbox[0x100 / 4], 0, "ACPI DRDY must stay clear");
+        assert_eq!(mailbox[0x104 / 4], 0, "ACPI CSTS must stay clear");
+        assert_eq!(mailbox[OPREGION_ASLE_OFFSET / 4], 0, "ASLE ARDY must stay clear");
+        assert_eq!(mailbox[(OPREGION_ASLE_OFFSET + 8) / 4], 0, "ASLE capabilities must stay clear");
+        assert_eq!(mailbox[OPREGION_SWSCI_OFFSET / 4], u32::MAX, "SWSCI is independent");
     }
 }
