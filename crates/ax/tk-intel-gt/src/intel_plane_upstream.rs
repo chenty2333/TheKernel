@@ -484,6 +484,37 @@ pub unsafe extern "C" fn intel_plane_data_rate(
 }
 
 // upstream: intel_plane.c intel_plane_pin_fb()
+#[inline]
+fn checked_plane_surface_address(base: u32, surface_offset: u32) -> Option<u32> {
+    base.checked_add(surface_offset)
+}
+
+// A successful GGTT/DPT pin or reuse result transfers one pin reference to the
+// candidate plane state. On failure before that state is published, release
+// exactly that reference with the matching parent unpin operation. The parent
+// provider remains responsible for proving that its VMA covers the selected
+// framebuffer view and for returning its surface-register base in `offset`.
+unsafe fn unpin_candidate_fb(
+    display: *mut IntelDisplay,
+    fb: *mut IntelFramebuffer,
+    dpt_vma: *mut c_void,
+    ggtt_vma: *mut c_void,
+    fence_id: i32,
+) {
+    if fb.is_null() {
+        return;
+    }
+    unsafe {
+        if intel_fb_uses_dpt(ptr::addr_of!((*fb).base)) {
+            if !dpt_vma.is_null() || !ggtt_vma.is_null() {
+                intel_parent_fb_pin_dpt_unpin(display, (*fb).dpt, dpt_vma, ggtt_vma);
+            }
+        } else if !ggtt_vma.is_null() {
+            intel_parent_fb_pin_ggtt_unpin(display, ggtt_vma, fence_id);
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_plane_pin_fb(
     plane_state: *mut IntelPlaneState,
@@ -492,10 +523,14 @@ pub unsafe extern "C" fn intel_plane_pin_fb(
     if plane_state.is_null()
         || old_plane_state.is_null()
         || unsafe { (*plane_state).hw.fb.is_null() }
+        || unsafe { (*plane_state).uapi.plane.is_null() }
     {
         return -tk_linux_kapi::config::EINVAL;
     }
     let display = unsafe { display_from_dev((*(*plane_state).uapi.plane).dev) };
+    if display.is_null() {
+        return -tk_linux_kapi::config::EINVAL;
+    }
     let plane = unsafe { plane_from_drm((*plane_state).uapi.plane) };
     let fb = unsafe { (*plane_state).hw.fb.cast::<IntelFramebuffer>() };
     let old_fb = unsafe { (*old_plane_state).hw.fb.cast::<IntelFramebuffer>() };
@@ -506,15 +541,23 @@ pub unsafe extern "C" fn intel_plane_pin_fb(
         unsafe { intel_fb_bo((*old_plane_state).hw.fb) }
     };
     let obj = unsafe { intel_fb_bo(ptr::addr_of_mut!((*fb).base)) };
+    if obj.is_null() {
+        return -tk_linux_kapi::config::EINVAL;
+    }
     let mut offset = 0u32;
+    let old_view = if old_fb.is_null() {
+        ptr::null()
+    } else {
+        unsafe { ptr::addr_of!((*old_fb).normal_view.gtt) }
+    };
     let vma = unsafe {
         intel_parent_fb_pin_reuse_vma(
             display,
             old_vma,
             old_obj,
-            &(*old_fb).normal_view.gtt,
+            old_view,
             obj,
-            &(*fb).normal_view.gtt,
+            ptr::addr_of!((*fb).normal_view.gtt),
             &mut offset,
         )
     };
@@ -582,14 +625,26 @@ pub unsafe extern "C" fn intel_plane_pin_fb(
         }
     }
     if ggtt_vma.is_null() {
+        unsafe {
+            unpin_candidate_fb(display, fb, dpt_vma, ggtt_vma, fence_id);
+        }
         return -tk_linux_kapi::config::ENOMEM;
     }
+    // The parent pin provider owns validating the selected GGTT/DPT view's
+    // backing extent. Reject only arithmetic which cannot be represented in
+    // the u32 plane-surface register field; DPT offsets are not object bytes.
+    let surf_offset = unsafe { (*plane).surf_offset.map_or(0, |f| f(plane_state)) };
+    let Some(surf) = checked_plane_surface_address(offset, surf_offset) else {
+        unsafe {
+            unpin_candidate_fb(display, fb, dpt_vma, ggtt_vma, fence_id);
+        }
+        return -tk_linux_kapi::config::ERANGE;
+    };
     unsafe {
         (*plane_state).dpt_vma = dpt_vma;
         (*plane_state).ggtt_vma = ggtt_vma;
         (*plane_state).fence_id = fence_id as i8;
-        let surf_offset = (*plane).surf_offset.map_or(0, |f| f(plane_state));
-        (*plane_state).surf = offset.wrapping_add(surf_offset);
+        (*plane_state).surf = surf;
     }
     0
 }
@@ -1888,6 +1943,17 @@ mod tests {
         assert!(state.uapi.visible);
         assert_eq!(state.uapi.dst.x1, 0);
         assert_eq!(state.uapi.dst.x2, 180);
+    }
+
+    #[test]
+    fn cursor_surface_address_checks_register_width_without_treating_dpt_as_bytes() {
+        assert_eq!(checked_plane_surface_address(0x1000, 0x2004), Some(0x3004));
+        assert_eq!(
+            checked_plane_surface_address(u32::MAX - 4, 4),
+            Some(u32::MAX)
+        );
+        assert_eq!(checked_plane_surface_address(u32::MAX - 3, 4), None);
+        assert_eq!(checked_plane_surface_address(0xffff_f000, 0x1000), None);
     }
 
     #[test]
