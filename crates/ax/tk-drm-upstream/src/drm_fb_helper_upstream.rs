@@ -58,8 +58,20 @@ const FB_BLANK_POWERDOWN: c_int = 4;
 const FB_ROTATE_UR: c_int = 0;
 
 static mut FB_CONSOLE_LOCK: Mutex = unsafe { core::mem::zeroed() };
-static FB_CONSOLE_LOCK_INIT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static FB_CONSOLE_LOCK_INIT: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+unsafe fn fb_console_lock_init() {
+    use core::sync::atomic::Ordering;
+    if FB_CONSOLE_LOCK_INIT.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        unsafe { mutex_init(core::ptr::addr_of_mut!(FB_CONSOLE_LOCK)); }
+        FB_CONSOLE_LOCK_INIT.store(2, Ordering::Release);
+    } else {
+        while FB_CONSOLE_LOCK_INIT.load(Ordering::Acquire) != 2 {
+            core::hint::spin_loop();
+        }
+    }
+}
 
 unsafe fn fb_helper_from_info(info: *mut FbInfo) -> *mut DrmFbHelper {
     if info.is_null() {
@@ -325,7 +337,8 @@ unsafe fn fb_helper_set_color(info: *mut FbInfo, index: u32, red: u16, green: u1
     0
 }
 
-unsafe extern "C" fn drm_fb_helper_setcmap(cmap: *mut FbCmap, info: *mut FbInfo) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_fb_helper_setcmap(cmap: *mut FbCmap, info: *mut FbInfo) -> i32 {
     if cmap.is_null() || info.is_null() {
         return -EINVAL;
     }
@@ -344,7 +357,8 @@ unsafe extern "C" fn drm_fb_helper_setcmap(cmap: *mut FbCmap, info: *mut FbInfo)
     0
 }
 
-unsafe extern "C" fn drm_fb_helper_check_var(var: *mut FbVarScreenInfo, info: *mut FbInfo) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_fb_helper_check_var(var: *mut FbVarScreenInfo, info: *mut FbInfo) -> i32 {
     if var.is_null() || info.is_null() { return -EINVAL; }
     unsafe {
         let helper = fb_helper_from_info(info);
@@ -365,7 +379,8 @@ unsafe extern "C" fn drm_fb_helper_check_var(var: *mut FbVarScreenInfo, info: *m
     0
 }
 
-unsafe extern "C" fn drm_fb_helper_set_par(info: *mut FbInfo) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_fb_helper_set_par(info: *mut FbInfo) -> i32 {
     if info.is_null() { return -EINVAL; }
     unsafe {
         let helper = fb_helper_from_info(info);
@@ -386,7 +401,8 @@ unsafe extern "C" fn drm_fb_helper_set_par(info: *mut FbInfo) -> i32 {
     }
 }
 
-unsafe extern "C" fn drm_fb_helper_blank(blank: c_int, info: *mut FbInfo) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_fb_helper_blank(blank: c_int, info: *mut FbInfo) -> i32 {
     if info.is_null() { return -EINVAL; }
     let mode = match blank {
         FB_BLANK_UNBLANK => DRM_MODE_DPMS_ON,
@@ -403,7 +419,8 @@ unsafe extern "C" fn drm_fb_helper_blank(blank: c_int, info: *mut FbInfo) -> i32
     }
 }
 
-unsafe extern "C" fn drm_fb_helper_pan_display(var: *mut FbVarScreenInfo, info: *mut FbInfo) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_fb_helper_pan_display(var: *mut FbVarScreenInfo, info: *mut FbInfo) -> i32 {
     if var.is_null() || info.is_null() { return -EINVAL; }
     let ret = unsafe { drm_fb_helper_check_var(var, info) };
     if ret != 0 { return ret; }
@@ -414,7 +431,8 @@ unsafe extern "C" fn drm_fb_helper_pan_display(var: *mut FbVarScreenInfo, info: 
     }
 }
 
-unsafe extern "C" fn drm_fb_helper_ioctl(_info: *mut FbInfo, _cmd: u32, _arg: c_ulong) -> i32 {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_fb_helper_ioctl(_info: *mut FbInfo, _cmd: u32, _arg: c_ulong) -> i32 {
     -25 // -ENOTTY
 }
 
@@ -659,7 +677,7 @@ unsafe fn drm_fb_helper_set_suspend(helper: *mut DrmFbHelper, suspend: bool) {
 pub unsafe extern "C" fn drm_fb_helper_set_suspend_unlocked(helper: *mut DrmFbHelper, suspend: bool) {
     if helper.is_null() { return; }
     unsafe {
-        if !FB_CONSOLE_LOCK_INIT.swap(true, core::sync::atomic::Ordering::AcqRel) { mutex_init(core::ptr::addr_of_mut!(FB_CONSOLE_LOCK)); }
+        fb_console_lock_init();
         if suspend {
             mutex_lock(core::ptr::addr_of_mut!(FB_CONSOLE_LOCK));
             drm_fb_helper_set_suspend(helper, true);
