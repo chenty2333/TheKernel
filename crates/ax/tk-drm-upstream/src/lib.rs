@@ -130,6 +130,7 @@ pub mod drm_displayid_upstream;
 pub mod drm_dp_dual_mode_helper_upstream;
 pub mod drm_dp_helper_upstream;
 pub mod drm_drv_upstream;
+pub mod drm_dumb_buffers_upstream;
 pub mod drm_edid_upstream;
 pub mod drm_eld_upstream;
 pub mod drm_encoder_upstream;
