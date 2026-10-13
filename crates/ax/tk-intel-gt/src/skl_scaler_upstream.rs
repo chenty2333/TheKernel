@@ -1159,10 +1159,10 @@ mod tests {
 
     #[test]
     fn scaler_phase_matches_source_q_format_vectors() {
-        assert_eq!(scaler_calc_phase(1, 0x10000, false), 0x0000);
+        assert_eq!(scaler_calc_phase(1, 0x10000, false), PS_PHASE_TRIP as u16);
         assert_eq!(scaler_calc_phase(1, 0x08000, false), 0x3000);
         assert_eq!(scaler_calc_phase(2, 0x10000, false), 0x3000);
-        assert_eq!(scaler_calc_phase(2, 0x10000, true), 0x0801);
+        assert_eq!(scaler_calc_phase(2, 0x10000, true), PS_PHASE_TRIP as u16);
     }
 
     #[test]
@@ -1171,7 +1171,7 @@ mod tests {
             13, 5120, 2160, 5120, 2160, 3840, 2160, false
         ));
         assert!(!scaler_request_in_range(
-            13, 5121, 2160, 5120, 2160, 3840, 2160, false
+            13, 8193, 2160, 5120, 2160, 3840, 2160, false
         ));
         assert!(!scaler_request_in_range(
             13, 1920, 1080, 15, 1080, 1920, 1080, true

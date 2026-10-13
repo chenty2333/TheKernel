@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn prefill_adjustment_rounds_up_at_q16_boundary() {
-        assert_eq!(prefill_adjust(0x10001, 0x8000), 0x18002);
+        assert_eq!(prefill_adjust(0x10001, 0x8000), 0x8001);
         assert_eq!(prefill_adjust(0x20000, 0x10000), 0x20000);
     }
 

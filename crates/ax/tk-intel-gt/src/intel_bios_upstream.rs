@@ -1327,6 +1327,7 @@ mod tests {
         bytes[48..64].copy_from_slice(b"BIOS_DATA_BLOCK\0");
         bytes[64..66].copy_from_slice(&(220u16).to_le_bytes());
         bytes[66..68].copy_from_slice(&(22u16).to_le_bytes());
+        bytes[68..70].copy_from_slice(&(22u16).to_le_bytes());
         bytes
     }
 
