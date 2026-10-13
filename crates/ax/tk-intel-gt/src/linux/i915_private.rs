@@ -107,7 +107,9 @@ pub struct DrmI915Private {
     pub info: *const c_void,
     pub runtime: IntelRuntimeInfo,
     pub caps: crate::intel_device_info_types_upstream::IntelDriverCaps,
-    _before_uncore: [u8; 140],
+    _align_dsm: [u8; 4],
+    /// Embedded `struct i915_dsm dsm` (two `struct resource` + usable_size).
+    pub dsm: [u8; 136],
     /// Embedded `struct intel_uncore uncore` (offset 1840, size 352).
     pub uncore: [u8; 352],
     _before_irqs_enabled: [u8; 204],
@@ -192,6 +194,7 @@ pub unsafe fn i915_reset_engine_count(
     atomic_read(unsafe { &(*error).reset_engine_count[class] }) as u32
 }
 
+const _: [(); 1712] = [(); offset_of!(DrmI915Private, dsm)];
 const _: [(); 1848] = [(); offset_of!(DrmI915Private, uncore)];
 const _: [(); 2512] = [(); offset_of!(DrmI915Private, sb_lock)];
 const _: [(); 2404] = [(); offset_of!(DrmI915Private, irqs_enabled)];

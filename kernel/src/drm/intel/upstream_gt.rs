@@ -335,6 +335,10 @@ unsafe extern "C" fn kernel_map_tlb_sync() {
 /// Install every kernel-owned provider this module can supply. Called once
 /// from `gt::init_at_boot()`. Reinstalling the same table is accepted.
 pub(super) fn install_providers() -> Result<(), &'static str> {
+    tk_linux_kapi::kernel_services::install_boot_trace_ops(
+        axruntime::boot_progress::trace_enter,
+        axruntime::boot_progress::trace_exit,
+    );
     super::upstream_mm::install()?;
     install_i915_platform_ops(&PLATFORM_OPS)?;
     axmm::install_kernel_map_tlb_sync(kernel_map_tlb_sync)
@@ -348,8 +352,34 @@ pub(super) fn install_providers() -> Result<(), &'static str> {
     intel_gt::linux::i915::install_pci_revision_reader(Some(reader));
     install_k2_tables()?;
     super::upstream_drm::install()?;
+
+    #[cfg(target_os = "none")]
+    if axruntime::boot_progress::boot_trace_enabled() {
+        axruntime::boot_progress::trace_enter("gt:pat_verify");
+        let pat_started = axhal::time::monotonic_time_nanos();
+        let pat_timeout = 2_000_000_000;
+        while !axhal::boot::intel_cpu_mmap_ready() {
+            if axhal::time::monotonic_time_nanos().saturating_sub(pat_started) >= pat_timeout {
+                let cpu = axhal::percpu::this_cpu_id();
+                let cpu_count = axhal::cpu_num();
+                let expected_mask = if cpu_count >= usize::BITS as usize {
+                    !0usize
+                } else {
+                    (1usize << cpu_count) - 1
+                };
+                let ack_mask = axhal::boot::intel_cpu_cache_ready_mask();
+                panic!(
+                    "cross-CPU PAT setup timed out on CPU {cpu}: expected mask {expected_mask:#x}, acknowledged mask {ack_mask:#x}, waiting for intel_cpu_mmap_ready"
+                );
+            }
+            core::hint::spin_loop();
+        }
+        axruntime::boot_progress::trace_exit("gt:pat_verify");
+    }
+
     #[cfg(target_os = "none")]
     if axhal::boot::command_line_value("intel.gt.smp_smoke") == Some("1") {
+        axruntime::boot_progress::trace_enter("gt:smp_smoke");
         let completed = AtomicUsize::new(0);
         unsafe extern "C" fn count_remote(arg: *mut c_void) {
             // SAFETY: the sender retains this stack counter until every
@@ -367,6 +397,7 @@ pub(super) fn install_providers() -> Result<(), &'static str> {
             "intel-gt: SMP provider smoke completed on {} remote CPUs",
             completed.load(Ordering::Acquire)
         );
+        axruntime::boot_progress::trace_exit("gt:smp_smoke");
     }
     Ok(())
 }
@@ -1829,11 +1860,17 @@ static SMP_DONE: AtomicUsize = AtomicUsize::new(0);
 static SMP_PARKED: AtomicUsize = AtomicUsize::new(0);
 /// Set by the stopping CPU to let the parked CPUs continue.
 static SMP_RESUME: AtomicBool = AtomicBool::new(false);
+/// CPUs that have acknowledged the current SMP request.
+static SMP_ACK_MASK: AtomicUsize = AtomicUsize::new(0);
 
 /// The `CallFunction` IPI consumer. In call mode it runs the request on this
 /// CPU and reports completion. In stop mode it parks until released.
 fn smp_ipi_handler() {
+    let cpu = axhal::percpu::this_cpu_id();
     if SMP_MODE.load(Ordering::Acquire) == SMP_MODE_STOP {
+        if cpu < usize::BITS as usize {
+            SMP_ACK_MASK.fetch_or(1usize << cpu, Ordering::AcqRel);
+        }
         SMP_PARKED.fetch_add(1, Ordering::AcqRel);
         while !SMP_RESUME.load(Ordering::Acquire) {
             core::hint::spin_loop();
@@ -1848,6 +1885,9 @@ fn smp_ipi_handler() {
     let func: unsafe extern "C" fn(*mut c_void) = unsafe { core::mem::transmute(func) };
     // SAFETY: the IPI argument carries the C callback and argument published by `call_on_other_cpus`.
     unsafe { func(arg) };
+    if cpu < usize::BITS as usize {
+        SMP_ACK_MASK.fetch_or(1usize << cpu, Ordering::AcqRel);
+    }
     SMP_DONE.fetch_add(1, Ordering::AcqRel);
 }
 
@@ -1863,13 +1903,34 @@ fn send_ipi_to_others() {
     }
 }
 
-fn wait_until(mut done: impl FnMut() -> bool) {
-    let deadline = axhal::time::monotonic_time() + core::time::Duration::from_secs(5);
+fn wait_until(what: &'static str, mut done: impl FnMut() -> bool) {
+    let timeout = if axruntime::boot_progress::boot_trace_enabled() {
+        core::time::Duration::from_secs(2)
+    } else {
+        core::time::Duration::from_secs(5)
+    };
+    let start = axhal::time::monotonic_time();
+    let deadline = start + timeout;
     while !done() {
-        assert!(
-            axhal::time::monotonic_time() < deadline,
-            "upstream GT cross-CPU callback acknowledgement timed out"
-        );
+        if axhal::time::monotonic_time() >= deadline {
+            let cpu = axhal::percpu::this_cpu_id();
+            let cpu_count = axhal::cpu_num();
+            let all_mask = if cpu_count >= usize::BITS as usize {
+                !0usize
+            } else {
+                (1usize << cpu_count) - 1
+            };
+            let this_mask = if cpu < usize::BITS as usize {
+                1usize << cpu
+            } else {
+                0usize
+            };
+            let expected_mask = all_mask & !this_mask;
+            let ack_mask = SMP_ACK_MASK.load(Ordering::Acquire);
+            panic!(
+                "cross-CPU call timed out on CPU {cpu}: expected mask {expected_mask:#x}, acknowledged mask {ack_mask:#x}, waiting for {what}"
+            );
+        }
         core::hint::spin_loop();
     }
 }
@@ -1890,8 +1951,9 @@ unsafe extern "C" fn kernel_call_on_other_cpus(
     SMP_FUNC.store(func as usize, Ordering::Release);
     SMP_ARG.store(arg as usize, Ordering::Release);
     SMP_DONE.store(0, Ordering::Release);
+    SMP_ACK_MASK.store(0, Ordering::Release);
     send_ipi_to_others();
-    wait_until(|| SMP_DONE.load(Ordering::Acquire) == others);
+    wait_until("call_on_other_cpus", || SMP_DONE.load(Ordering::Acquire) == others);
 }
 
 /// `stop_machine()` on more than one CPU: every other CPU parks in the IPI
@@ -1912,12 +1974,13 @@ unsafe extern "C" fn kernel_stop_machine(
     }
     SMP_MODE.store(SMP_MODE_STOP, Ordering::Release);
     SMP_RESUME.store(false, Ordering::Release);
+    SMP_ACK_MASK.store(0, Ordering::Release);
     send_ipi_to_others();
-    wait_until(|| SMP_PARKED.load(Ordering::Acquire) == others);
+    wait_until("stop_machine park", || SMP_PARKED.load(Ordering::Acquire) == others);
     // SAFETY: as above; the other CPUs are parked in the IPI until it returns.
     let result = unsafe { func(data) };
     SMP_RESUME.store(true, Ordering::Release);
-    wait_until(|| SMP_PARKED.load(Ordering::Acquire) == 0);
+    wait_until("stop_machine unpark", || SMP_PARKED.load(Ordering::Acquire) == 0);
     SMP_RESUME.store(false, Ordering::Release);
     SMP_MODE.store(SMP_MODE_CALL, Ordering::Release);
     result

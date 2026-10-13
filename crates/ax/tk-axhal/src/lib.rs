@@ -227,6 +227,13 @@ pub mod boot {
         { false }
     }
 
+    pub fn intel_cpu_cache_ready_mask() -> usize {
+        #[cfg(all(target_os = "none", feature = "defplat"))]
+        { axplat_x86_pc::intel_cpu_cache_ready_mask() }
+        #[cfg(not(all(target_os = "none", feature = "defplat")))]
+        { 0 }
+    }
+
     /// Looks up one `key=value` boot parameter.
     ///
     /// Parameters are whitespace separated.  A bare `key` with no `=` is a

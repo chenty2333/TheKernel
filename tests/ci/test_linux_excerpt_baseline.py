@@ -44,15 +44,25 @@ WINDOW = 14
 SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     ("crates/linux", 40): (110, 49, 20, 25, 0, 18, 21),
     ("kernel/src", 40): (85, 41, 19, 142, 9, 0, 0),
-    ("crates/ax", 40): (0, 0, 0, 874, 844, 0, 0),
+    ("crates/ax", 40): (0, 0, 0, 967, 937, 0, 0),
     ("crates/linux", 25): (211, 59, 22, 41, 3, 20, 21),
     ("kernel/src", 25): (157, 50, 24, 321, 25, 0, 0),
 # 2026-10-13 (B3b i915 display power domains in tk-intel-gt): crates/ax moves
-# from 858/828 to 874/844 at >= 40 (16 code lines) and from 2276/2238 to 2350/2312
-# at >= 25 (74 code lines). These are MIT translations of MIT Linux display sources.
+# from 893/863 to 967/937 at >= 40 (74 code lines) and from 2373/2335 to
+# 2550/2512 at >= 25 (177 code lines). These are MIT translations of MIT Linux display sources.
 # 2026-10-13 (B3a i915 display foundation in tk-intel-gt): crates/ax moves
-# from 837/807 to 858/828 at >= 40 (21 code lines) and from 2238/2200 to 2276/2238
-# at >= 25 (38 code lines). These are MIT translations of MIT Linux display sources.
+# from 872/842 to 893/863 at >= 40 (21 code lines) and from 2335/2297 to
+# 2373/2335 at >= 25 (38 code lines).
+# 2026-10-13 (B2e HDMI helpers in tk-drm-upstream: drivers/video/hdmi.c,
+# drm_scdc_helper, drm_hdmi_helper, drm_hdmi_state_helper): crates/ax moves
+# from 868/838 to 872/842 at >= 40 and from 2325/2287 to 2335/2297 at >= 25.
+# 2026-10-13 (BI DRM infrastructure core in tk-drm-upstream: drm_drv, drm_file,
+# drm_gem, drm_prime, drm_ioctl, drm_auth, drm_vma_manager, drm_lease):
+# crates/ax moves from 855/825 to 868/838 at >= 40 (13 code lines) and from
+# 2275/2237 to 2325/2287 at >= 25 (50 code lines).
+# 2026-10-12 (B2a DRM atomic core: drm_atomic, drm_atomic_uapi,
+# drm_atomic_state_helper): crates/ax moves from 837/807 to 855/825 at >= 40
+# and from 2238/2200 to 2275/2237 at >= 25.
 # 2026-10-12 (B2d DisplayPort core helpers in tk-drm-upstream: drm_dp_helper,
 # drm_dp_dual_mode_helper): crates/ax moves from 807/777 to 837/807 at >= 40
 # (30 code lines) and from 2178/2140 to 2238/2200 at >= 25 (60 code lines).
@@ -62,6 +72,9 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # 1897/1861 to 2178/2140 at >= 25. These are MIT translations of MIT Linux
 # sources (see crates/ax/tk-drm-upstream/NOTICE and tk-intel-gt/NOTICE); the one
 # GPL-2.0 source (drm_managed.c) is flagged in docs/upstream-provenance.md.
+# 2026-10-13 (B2e HDMI helpers: hdmi, drm_scdc_helper, drm_hdmi_helper,
+# drm_hdmi_state_helper in tk-drm-upstream): crates/ax moves from 807/777 to
+# 811/781 at >= 40 and from 2178/2140 to 2188/2150 at >= 25 (MIT sources).
 # 2026-10-12 (B0, tk-linux-kapi extraction): the generic shims moved from
 # tk-intel-gt into crates/ax/tk-linux-kapi with their Linux code lines unchanged;
 # the scan moves by the new i2c.rs flag line (identical Linux text) at >= 40
@@ -82,7 +95,7 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # lines in the newly translated FreeBSD drivers and the OpenBSD iwx/net80211
 # translations, plus one FreeBSD ig4 register line. Those have BSD-source
 # provenance, not Linux provenance; see `docs/upstream-provenance.md`.
-    ("crates/ax", 25): (18, 15, 4, 2350, 2312, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 2550, 2512, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their

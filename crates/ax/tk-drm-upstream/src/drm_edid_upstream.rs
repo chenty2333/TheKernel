@@ -3499,11 +3499,11 @@ unsafe fn cea_mode_alternate_clock(cea_mode: *const DrmDisplayMode) -> u32 {
     }
 
     // edid_cea_modes contains the 59.94Hz variant for 240 and 480 line modes,
-    // and the 60Hz variant otherwise.
+    let clock_u64 = clock as u64;
     if (*cea_mode).vdisplay == 240 || (*cea_mode).vdisplay == 480 {
-        clock = (clock * 1001 + 500) / 1000;
+        clock = ((clock_u64 * 1001 + 500) / 1000) as u32;
     } else {
-        clock = (clock * 1000 + 500) / 1001;
+        clock = ((clock_u64 * 1000 + 500) / 1001) as u32;
     }
 
     clock

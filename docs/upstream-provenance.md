@@ -2192,14 +2192,12 @@ in the source comments.
 
 ## 2026-10-12 DRM core B1 and i915 display B2.5 reconciliation
 
-The uncommitted DRM core translations (`crates/ax/tk-drm-upstream`, batches B1a-B1d)
-and the i915 display `*_types_upstream.rs` / `*_regs_upstream.rs` modules in
+The DRM core translations (`crates/ax/tk-drm-upstream`, batches B1a-B1d, B2a,
+B2d, B2e, BI) and the i915 display `*_types_upstream.rs` / `*_regs_upstream.rs` modules in
 `crates/ax/tk-intel-gt` (B2.5) add verbatim-Linux lines that the excerpt scanner
-counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned
-`crates/ax` totals: threshold >=40 `(0,0,0,807,777,0,0)` (was 707/678), threshold
->=25 `(18,15,4,2178,2140,0,0)` (was 1897/1861). `crates/linux` and `kernel/src`
-are unchanged. At >=40 the new code lines are in `tk-intel-gt` (670 code lines in
-the scope) and `tk-drm-upstream` (93).
+counts. The current pinned `crates/ax` totals and the per-batch increments are
+recorded next to `SCAN_BASELINE` in `tests/ci/test_linux_excerpt_baseline.py`.
+`crates/linux` and `kernel/src` are unchanged.
 
 Licensing of the translated DRM sources (checked against `/home/ava/Desktop/linux-7.2.3`):
 
@@ -2208,7 +2206,9 @@ Licensing of the translated DRM sources (checked against `/home/ava/Desktop/linu
   `drm_eld`, `drm_modeset_lock`, `drm_modeset_helper`, `drm_color_mgmt`,
   `drm_vblank`, `drm_vblank_work`, `drm_plane`, `drm_plane_helper`, `drm_crtc`,
   `drm_connector`, `drm_encoder`, `drm_mode_config`, `drm_mode_object`,
-  `drm_property`, `drm_edid`; `drm_damage_helper` is `GPL-2.0 OR MIT` (MIT option).
+  `drm_property`, `drm_edid`, `drm_atomic`, `drm_atomic_uapi`,
+  `drm_atomic_state_helper`, `drivers/video/hdmi.c`, `drm_scdc_helper`,
+  `drm_hdmi_helper`, `drm_hdmi_state_helper`; `drm_damage_helper` is `GPL-2.0 OR MIT` (MIT option).
   Several have no SPDX line but carry the permission text; their copyright
   lines are recorded in `crates/ax/tk-drm-upstream/NOTICE`.
 - **GPL-2.0 only, flagged:** `drivers/gpu/drm/drm_managed.c` is `SPDX-License-Identifier: GPL-2.0`.
@@ -2250,16 +2250,20 @@ Licensing:
 - `drivers/gpu/drm/display/drm_dp_dual_mode_helper.c`: MIT (SPDX-License-Identifier: MIT).
 Both files carry MIT licenses in upstream Linux 7.2.3 and are recorded in `crates/ax/tk-drm-upstream/NOTICE`.
 
+## 2026-10-13 DRM infrastructure core BI reconciliation
+
+The Linux DRM infrastructure core translations (`crates/ax/tk-drm-upstream`, batch BI: `drm_drv_upstream.rs`, `drm_file_upstream.rs`, `drm_gem_upstream.rs`, `drm_prime_upstream.rs`, `drm_ioctl_upstream.rs`, `drm_auth_upstream.rs`, `drm_vma_manager_upstream.rs`, `drm_lease_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned `crates/ax` totals: threshold >=40 `(0,0,0,850,820,0,0)` (was 837/807), threshold >=25 `(18,15,4,2288,2250,0,0)` (was 2238/2200). `crates/linux` and `kernel/src` are unchanged.
+
 ## 2026-10-13 i915 display foundation B3a reconciliation
 
-The Linux i915 display foundation translations (`crates/ax/tk-intel-gt`, batch B3a: `intel_bo_upstream.rs`, `intel_de_upstream.rs`, `intel_display_clock_gating_upstream.rs`, `intel_display_conversion_upstream.rs`, `intel_display_device_upstream.rs`, `intel_display_driver_upstream.rs`, `intel_display_params_upstream.rs`, `intel_display_reset_upstream.rs`, `intel_display_rpm_upstream.rs`, `intel_display_rps_upstream.rs`, `intel_display_utils_upstream.rs`, `intel_display_wa_upstream.rs`, `intel_parent_upstream.rs`, `intel_quirks_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned `crates/ax` totals: threshold >=40 `(0,0,0,858,828,0,0)` (was 837/807), threshold >=25 `(18,15,4,2276,2238,0,0)` (was 2238/2200). `crates/linux` and `kernel/src` are unchanged.
+The Linux i915 display foundation translations (`crates/ax/tk-intel-gt`, batch B3a: `intel_bo_upstream.rs`, `intel_de_upstream.rs`, `intel_display_clock_gating_upstream.rs`, `intel_display_conversion_upstream.rs`, `intel_display_device_upstream.rs`, `intel_display_driver_upstream.rs`, `intel_display_params_upstream.rs`, `intel_display_reset_upstream.rs`, `intel_display_rpm_upstream.rs`, `intel_display_rps_upstream.rs`, `intel_display_utils_upstream.rs`, `intel_display_wa_upstream.rs`, `intel_parent_upstream.rs`, `intel_quirks_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. The pinned `crates/ax` totals and the per-batch increment are recorded next to `SCAN_BASELINE` in `tests/ci/test_linux_excerpt_baseline.py`. `crates/linux` and `kernel/src` are unchanged.
 
 Licensing:
 All translated display sources carry MIT licenses in upstream Linux 7.2.3 (SPDX-License-Identifier: MIT) and are recorded in `crates/ax/tk-intel-gt/NOTICE`.
 
 ## 2026-10-13 i915 display power domains B3b reconciliation
 
-The Linux i915 display power domains, PMDEMAND, PCH detect, HTI translations (`crates/ax/tk-intel-gt`, batch B3b: `intel_display_power_upstream.rs`, `intel_display_power_map_upstream.rs`, `intel_display_power_well_upstream.rs`, `intel_pmdemand_upstream.rs`, `intel_pch_upstream.rs`, `intel_hti_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned `crates/ax` totals: threshold >=40 `(0,0,0,874,844,0,0)` (was 858/828), threshold >=25 `(18,15,4,2350,2312,0,0)` (was 2276/2238). `crates/linux` and `kernel/src` are unchanged.
+The Linux i915 display power domains, PMDEMAND, PCH detect, HTI translations (`crates/ax/tk-intel-gt`, batch B3b: `intel_display_power_upstream.rs`, `intel_display_power_map_upstream.rs`, `intel_display_power_well_upstream.rs`, `intel_pmdemand_upstream.rs`, `intel_pch_upstream.rs`, `intel_hti_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned `crates/ax` totals: threshold >=40 `(0,0,0,967,937,0,0)` (was 893/863), threshold >=25 `(18,15,4,2550,2512,0,0)` (was 2373/2335). `crates/linux` and `kernel/src` are unchanged.
 
 Licensing:
 All translated display sources carry MIT licenses in upstream Linux 7.2.3 (SPDX-License-Identifier: MIT) and are recorded in `crates/ax/tk-intel-gt/NOTICE`.

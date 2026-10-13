@@ -196,6 +196,20 @@ pub(crate) unsafe fn idr_find(idr: *mut Idr, id: i32) -> *mut c_void {
     entry
 }
 
+// upstream: idr.c idr_for_each()
+pub(crate) unsafe fn idr_for_each<F>(idr: *mut Idr, mut f: F)
+where
+    F: FnMut(i32, *mut c_void),
+{
+    let entries = tk_linux_kapi::xarray::xa_snapshot(&mut (*idr).idr_rt);
+    for (id, ptr) in entries {
+        if ptr != idr_reserved_entry() && !ptr.is_null() {
+            f(id as i32, ptr);
+        }
+    }
+}
+
+
 /// `to_drm_device()`-style helper: `drm_core_check_feature()` from drm_drv.h.
 // upstream: include/drm/drm_drv.h drm_core_check_feature()
 pub(crate) unsafe fn drm_core_check_feature(dev: *const DrmDevice, feature: u32) -> bool {

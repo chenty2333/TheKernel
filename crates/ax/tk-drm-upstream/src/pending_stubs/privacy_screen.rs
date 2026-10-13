@@ -23,7 +23,8 @@ pub unsafe extern "C" fn drm_privacy_screen_get_state(
     }
 }
 
+// upstream: include/drm/drm_privacy_screen_consumer.h drm_privacy_screen_set_sw_state() fallback
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_privacy_screen_set_sw_state(_priv_: *mut c_void, _sw_state: u32) -> i32 {
-    0
+    -tk_linux_kapi::config::ENODEV
 }

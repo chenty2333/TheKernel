@@ -156,14 +156,14 @@ pub static XE_LPD_DISPLAY: IntelDisplayDeviceInfo = IntelDisplayDeviceInfo {
     },
 };
 
-static ADL_P_STEPPINGS: [i32; 13] = [
+pub(crate) static ADL_P_STEPPINGS: [i32; 13] = [
     STEP_A0, 0, 0, 0,
     STEP_B0, 0, 0, 0,
     STEP_C0, 0, 0, 0,
     STEP_D0,
 ];
 
-static ADL_P_ADL_N_STEPPINGS: [i32; 1] = [STEP_D0];
+pub(crate) static ADL_P_ADL_N_STEPPINGS: [i32; 1] = [STEP_D0];
 static ADL_P_RPL_PU_STEPPINGS: [i32; 5] = [0, 0, 0, 0, STEP_E0];
 
 // Zero-terminated lists for subplatforms
@@ -441,33 +441,45 @@ pub unsafe fn find_subplatform_desc(
 
 // upstream: intel_display_device.c get_pre_gmdid_step()
 pub unsafe fn get_pre_gmdid_step(
-    _display: *mut IntelDisplay,
+    display: *mut IntelDisplay,
     main: *const SteppingDesc,
     sub: *const SteppingDesc,
 ) -> i32 {
     let mut map = unsafe { (*main).map };
     let mut size = unsafe { (*main).size };
-    let revision = 0usize;
 
+    /* subplatform stepping info trumps main platform info */
     if !sub.is_null() && !unsafe { (*sub).map.is_null() } && unsafe { (*sub).size } > 0 {
         map = unsafe { (*sub).map };
         size = unsafe { (*sub).size };
     }
 
+    /* not all platforms define steppings, and it's fine */
     if map.is_null() || size == 0 {
         return STEP_NONE;
     }
+
+    let pdev = if !display.is_null() && !unsafe { (*display).drm.is_null() } && !unsafe { (*(*display).drm).dev.is_null() } {
+        unsafe { crate::linux_platform::to_pci_dev((*(*display).drm).dev).cast::<crate::intel_quirks_upstream::PciDev>() }
+    } else {
+        core::ptr::null_mut()
+    };
+    let mut revision = if !pdev.is_null() {
+        unsafe { (*pdev).revision as usize }
+    } else {
+        0usize
+    };
 
     if revision < size && unsafe { *map.add(revision) } != STEP_NONE {
         return unsafe { *map.add(revision) };
     }
 
-    let mut rev = revision;
-    while rev < size && unsafe { *map.add(rev) } == STEP_NONE {
-        rev += 1;
+    // Gaps in the revision-to-step map: use the information for the next revision.
+    while revision < size && unsafe { *map.add(revision) } == STEP_NONE {
+        revision += 1;
     }
-    if rev < size {
-        unsafe { *map.add(rev) }
+    if revision < size {
+        unsafe { *map.add(revision) }
     } else {
         STEP_FUTURE
     }
@@ -561,6 +573,11 @@ pub unsafe extern "C" fn intel_display_device_probe(
     }
 
     unsafe {
+        (*display).drm = if !pdev.is_null() {
+            tk_linux_kapi::kernel_core::pci_get_drvdata(pdev.cast()).cast::<tk_drm_upstream::drm_device_types::DrmDevice>()
+        } else {
+            core::ptr::null_mut()
+        };
         (*display).parent = parent.cast_mut().cast();
         intel_display_params_copy(core::ptr::addr_of_mut!((*display).params));
     }

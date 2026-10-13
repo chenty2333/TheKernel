@@ -1030,10 +1030,18 @@ pub unsafe extern "C" fn intel_gt_wait_for_idle(gt: *mut IntelGt, mut timeout: c
 #[unsafe(no_mangle)]
 // upstream: intel_gt.c intel_gt_init()
 pub unsafe extern "C" fn intel_gt_init(gt: *mut IntelGt) -> i32 {
+    tk_linux_kapi::kernel_services::boot_trace_enter("gt:intel_gt_init");
+    tk_linux_kapi::kernel_services::boot_trace_enter("gt:intel_gt_init_workarounds");
     unsafe {
         intel_gt_init_workarounds(gt);
+    }
+    tk_linux_kapi::kernel_services::boot_trace_exit("gt:intel_gt_init_workarounds");
+
+    tk_linux_kapi::kernel_services::boot_trace_enter("gt:intel_uncore_forcewake_get");
+    unsafe {
         intel_uncore_forcewake_get((*gt).uncore, FORCEWAKE_ALL);
     }
+    tk_linux_kapi::kernel_services::boot_trace_exit("gt:intel_uncore_forcewake_get");
     let size = if unsafe { GRAPHICS_VER((*gt).i915) } == 2 {
         256 * 1024
     } else {
@@ -1056,17 +1064,23 @@ pub unsafe extern "C" fn intel_gt_init(gt: *mut IntelGt) -> i32 {
                 unsafe {
                     intel_set_mocs_index(gt);
                 }
+                tk_linux_kapi::kernel_services::boot_trace_enter("gt:intel_engines_init");
                 err = unsafe { intel_engines_init(gt) };
+                tk_linux_kapi::kernel_services::boot_trace_exit("gt:intel_engines_init");
             }
         }
     }
     if err == 0 {
+        tk_linux_kapi::kernel_services::boot_trace_enter("gt:intel_uc_init");
         err = unsafe { intel_uc_init(core::ptr::addr_of_mut!((*gt).uc).cast()) };
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:intel_uc_init");
     }
     if err == 0 {
         // uC is initialized from here on: err_uc_init (intel_uc_fini) level.
         cleanup_stage = 3;
+        tk_linux_kapi::kernel_services::boot_trace_enter("gt:intel_gt_resume");
         err = unsafe { intel_gt_resume(gt) };
+        tk_linux_kapi::kernel_services::boot_trace_exit("gt:intel_gt_resume");
     }
     if err == 0 {
         // GT resumed: err_gt (intel_uc_fini_hw + __intel_gt_disable) level.
@@ -1111,6 +1125,7 @@ pub unsafe extern "C" fn intel_gt_init(gt: *mut IntelGt) -> i32 {
     unsafe {
         intel_uncore_forcewake_put((*gt).uncore, FORCEWAKE_ALL);
     }
+    tk_linux_kapi::kernel_services::boot_trace_exit("gt:intel_gt_init");
     err
 }
 

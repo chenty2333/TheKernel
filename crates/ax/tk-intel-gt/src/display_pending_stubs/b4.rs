@@ -19,6 +19,7 @@ use tk_drm_upstream::drm_framebuffer_types::DrmFramebuffer;
 use tk_drm_upstream::uapi_drm_mode_types::DrmModeFbCmd2;
 
 // upstream: intel_fb.c intel_user_framebuffer_create()
+// Degraded stub returns ERR_PTR(-ENODEV) when display FB support is absent, matching Linux drm_mode_addfb2 error handling.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_user_framebuffer_create(
     _dev: *mut DrmDevice,
@@ -26,7 +27,7 @@ pub unsafe extern "C" fn intel_user_framebuffer_create(
     _info: *mut DrmFormatInfo,
     _user_mode_cmd: *mut DrmModeFbCmd2,
 ) -> *mut DrmFramebuffer {
-    core::ptr::null_mut()
+    tk_linux_kapi::config::ERR_PTR(-tk_linux_kapi::config::ENODEV)
 }
 
 // upstream: intel_fb.c intel_fb_get_format_info()

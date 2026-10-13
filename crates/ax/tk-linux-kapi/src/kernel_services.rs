@@ -459,6 +459,32 @@ pub fn install_smp_ops(ops: &'static SmpOps) -> Result<(), &'static str> {
     SMP.install(ops)
 }
 
+static BOOT_TRACE_ENTER: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static BOOT_TRACE_EXIT: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+
+pub fn install_boot_trace_ops(enter: fn(&'static str), exit: fn(&'static str)) {
+    BOOT_TRACE_ENTER.store(enter as *mut (), Ordering::Release);
+    BOOT_TRACE_EXIT.store(exit as *mut (), Ordering::Release);
+}
+
+#[inline]
+pub fn boot_trace_enter(step: &'static str) {
+    let ptr = BOOT_TRACE_ENTER.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        let f: fn(&'static str) = unsafe { core::mem::transmute(ptr) };
+        f(step);
+    }
+}
+
+#[inline]
+pub fn boot_trace_exit(step: &'static str) {
+    let ptr = BOOT_TRACE_EXIT.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        let f: fn(&'static str) = unsafe { core::mem::transmute(ptr) };
+        f(step);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

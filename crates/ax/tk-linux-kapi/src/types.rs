@@ -9,7 +9,7 @@
 #![allow(non_camel_case_types)]
 
 use core::{
-    ffi::{c_ulong, c_void},
+    ffi::{c_uint, c_ulong, c_void},
     mem::ManuallyDrop,
     ops::Deref,
 };
@@ -148,6 +148,18 @@ pub struct Spinlock {
     _opaque: [u8; 4],
 }
 
+impl Spinlock {
+    pub const fn new() -> Self {
+        Self { _opaque: [0; 4] }
+    }
+}
+
+impl Default for Spinlock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AtomicNotifierHead {
@@ -211,17 +223,23 @@ pub struct DmaFenceCb {
 }
 
 #[repr(C)]
+pub struct DmaFenceChain {
+    pub base: DmaFence,
+    pub prev: *mut DmaFence,
+    pub prev_seqno: u64,
+    pub fence: *mut DmaFence,
+    pub cb: DmaFenceCb,
+    pub _pad: [u8; 8],
+}
+const _: [(); 120] = [(); core::mem::size_of::<DmaFenceChain>()];
+
+#[repr(C)]
 pub struct WaitQueueHead {
     pub lock: Spinlock,
     pub head: ListHead,
 }
 
-#[repr(C)]
-pub struct XArray {
-    pub xa_lock: Spinlock,
-    pub xa_flags: u32,
-    pub xa_head: *mut c_void,
-}
+pub use crate::xarray::XArray;
 const _: [(); 16] = [(); core::mem::size_of::<XArray>()];
 
 // Linux v7.2.3 framework records embedded by value in i915_vma and
@@ -359,14 +377,17 @@ pub struct Page {
 // Linux forward declarations used only behind pointers in this header.
 #[repr(C, align(8))]
 pub struct File {
-    _before_f_mapping: [u8; 16],
+    pub _before_f_mapping: [u8; 16],
     pub f_mapping: *mut c_void,
     pub private_data: *mut c_void,
-    _tail: [u8; 144],
+    pub f_inode: *mut c_void,
+    pub f_flags: c_uint,
+    pub _tail: [u8; 132],
 }
 const _: [(); 176] = [(); core::mem::size_of::<File>()];
 const _: [(); 16] = [(); core::mem::offset_of!(File, f_mapping)];
 const _: [(); 24] = [(); core::mem::offset_of!(File, private_data)];
+const _: [(); 40] = [(); core::mem::offset_of!(File, f_flags)];
 
 /// `struct ww_acquire_ctx` storage for the selected x86_64 config:
 /// RT/debug WW/lockdep disabled.

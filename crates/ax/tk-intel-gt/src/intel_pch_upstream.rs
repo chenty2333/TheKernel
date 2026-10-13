@@ -307,6 +307,46 @@ unsafe fn intel_virt_detect_pch(
     *pch_id = id;
 }
 
+#[inline]
+unsafe fn pch_vendor(pch: *mut PciDev) -> u16 {
+    let mock = pch.cast::<tk_linux_kapi::pci::MockPciDevice>();
+    if (*mock).vendor != 0 && (*mock).vendor <= 0xffff {
+        (*mock).vendor as u16
+    } else {
+        (*pch).vendor
+    }
+}
+
+#[inline]
+unsafe fn pch_device(pch: *mut PciDev) -> u16 {
+    let mock = pch.cast::<tk_linux_kapi::pci::MockPciDevice>();
+    if (*mock).vendor != 0 && (*mock).vendor <= 0xffff {
+        (*mock).device as u16
+    } else {
+        (*pch).device
+    }
+}
+
+#[inline]
+unsafe fn pch_subsystem_vendor(pch: *mut PciDev) -> u16 {
+    let mock = pch.cast::<tk_linux_kapi::pci::MockPciDevice>();
+    if (*mock).vendor != 0 && (*mock).vendor <= 0xffff {
+        (*mock).subvendor as u16
+    } else {
+        (*pch).subsystem_vendor
+    }
+}
+
+#[inline]
+unsafe fn pch_subsystem_device(pch: *mut PciDev) -> u16 {
+    let mock = pch.cast::<tk_linux_kapi::pci::MockPciDevice>();
+    if (*mock).vendor != 0 && (*mock).vendor <= 0xffff {
+        (*mock).subdevice as u16
+    } else {
+        (*pch).subsystem_device
+    }
+}
+
 // upstream: intel_pch.c intel_pch_detect()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_pch_detect(display: *mut IntelDisplay) {
@@ -330,16 +370,16 @@ pub unsafe extern "C" fn intel_pch_detect(display: *mut IntelDisplay) {
             break;
         }
 
-        if (*pch).vendor != PCI_VENDOR_ID_INTEL {
+        if pch_vendor(pch) != PCI_VENDOR_ID_INTEL {
             continue;
         }
 
-        id = (*pch).device & INTEL_PCH_DEVICE_ID_MASK;
+        id = pch_device(pch) & INTEL_PCH_DEVICE_ID_MASK;
         detected_type = intel_pch_type(display, id);
         if detected_type != PCH_NONE {
             (*display).pch_type = detected_type;
             break;
-        } else if intel_is_virt_pch(id, (*pch).subsystem_vendor, (*pch).subsystem_device) {
+        } else if intel_is_virt_pch(id, pch_subsystem_vendor(pch), pch_subsystem_device(pch)) {
             intel_virt_detect_pch(display, &mut id, &mut detected_type);
             (*display).pch_type = detected_type;
             break;

@@ -369,7 +369,7 @@ pub unsafe fn drm_gem_handle_get(object: *mut DrmGemObject) -> Result<(), i32> {
 /// `object` must have a live GEM reference corresponding to one handle.
 pub unsafe fn drm_gem_handle_put(object: *mut DrmGemObject) {
     unsafe extern "C" fn release(refcount: *mut Kref) {
-        unsafe { crate::linux::drm_core::drm_gem_object_free(refcount.cast()) };
+        unsafe { tk_drm_upstream::drm_gem_upstream::drm_gem_object_free(refcount.cast()) };
     }
     let count =
         unsafe { AtomicU32::from_ptr(object.cast::<u8>().add(size_of::<Kref>()).cast::<u32>()) };

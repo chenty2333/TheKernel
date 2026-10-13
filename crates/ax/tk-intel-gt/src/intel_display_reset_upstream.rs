@@ -67,6 +67,7 @@ pub unsafe extern "C" fn intel_display_reset_prepare(display: *mut IntelDisplay)
 
         (*display).reset.count += 1;
         (*display).restore.modeset_state = state;
+        (*state).acquire_ctx = ctx;
     }
 }
 

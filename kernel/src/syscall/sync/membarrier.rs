@@ -380,7 +380,12 @@ mod remote {
         mut resend: impl FnMut(&[bool; axconfig::plat::MAX_CPU_NUM]) -> AxResult<()>,
     ) -> AxResult<()> {
         let started = axhal::time::monotonic_time_nanos();
-        let deadline = started.saturating_add(BARRIER_TIMEOUT_NS);
+        let timeout_ns = if axruntime::boot_progress::boot_trace_enabled() {
+            2_000_000_000
+        } else {
+            BARRIER_TIMEOUT_NS
+        };
+        let deadline = started.saturating_add(timeout_ns);
         let mut next_retry = started.saturating_add(RETRY_INTERVAL_NS);
         loop {
             if progress(targets)? {
@@ -394,6 +399,33 @@ mod remote {
             }
             let now = axhal::time::monotonic_time_nanos();
             if now >= deadline {
+                if axruntime::boot_progress::boot_trace_enabled() {
+                    let issuer_cpu = axhal::percpu::this_cpu_id();
+                    let mut expected_mask = 0usize;
+                    let mut ack_mask = 0usize;
+                    for (cpu, &target) in targets.iter().enumerate() {
+                        if target && cpu < usize::BITS as usize {
+                            expected_mask |= 1usize << cpu;
+                            let is_ack = if REQUESTS[cpu].global.load(Ordering::Relaxed) {
+                                GLOBAL_ACK[cpu].load(Ordering::Acquire)
+                                    >= REQUESTS[cpu].generation.load(Ordering::Acquire)
+                            } else if let Some(ref st) = *REQUEST_STATE.lock() {
+                                st.membarrier_state().acknowledged(
+                                    cpu,
+                                    REQUESTS[cpu].generation.load(Ordering::Acquire),
+                                )
+                            } else {
+                                false
+                            };
+                            if is_ack {
+                                ack_mask |= 1usize << cpu;
+                            }
+                        }
+                    }
+                    axlog::error!(
+                        "cross-CPU membarrier rendezvous timed out on CPU {issuer_cpu}: expected mask {expected_mask:#x}, acknowledged mask {ack_mask:#x}, waiting for membarrier"
+                    );
+                }
                 return Err(LinuxError::EAGAIN.into());
             }
             if now >= next_retry {

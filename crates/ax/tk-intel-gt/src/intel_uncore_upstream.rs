@@ -57,9 +57,12 @@ use crate::{
 
 /// `struct intel_uncore uncore` offset inside `struct drm_i915_private`
 /// (x86_64, oracle wt-dev build, from `offsetof` of the i915 headers).
-pub const I915_UNCORE_OFFSET: usize = 1840;
+pub const I915_UNCORE_OFFSET: usize = core::mem::offset_of!(crate::linux_i915_private::DrmI915Private, uncore);
 /// `struct intel_uncore_mmio_debug mmio_debug` offset inside `drm_i915_private`.
-pub const I915_MMIO_DEBUG_OFFSET: usize = 2192;
+/// `mmio_debug` directly follows the embedded `uncore` in `drm_i915_private`.
+pub const I915_MMIO_DEBUG_OFFSET: usize = I915_UNCORE_OFFSET
+    + core::mem::size_of::<IntelUncore>();
+const _: [(); 2200] = [(); I915_MMIO_DEBUG_OFFSET];
 
 const FORCEWAKE_ACK_TIMEOUT_MS: u64 = 50;
 const GT_FIFO_TIMEOUT_MS: u64 = 10;

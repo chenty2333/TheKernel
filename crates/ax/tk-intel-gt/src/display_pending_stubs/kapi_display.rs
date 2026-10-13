@@ -10,59 +10,20 @@ use tk_drm_upstream::drm_atomic_types::DrmAtomicCommit;
 use tk_drm_upstream::drm_device_types::DrmDevice;
 use tk_drm_upstream::drm_modeset_lock_types::DrmModesetAcquireCtx;
 
-// upstream: drivers/gpu/vga/vga_switcheroo.c vga_switcheroo_client_probe_defer()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn vga_switcheroo_client_probe_defer(_pdev: *mut c_void) -> bool {
-    false
-}
-
-// upstream: drivers/firmware/dmi_scan.c dmi_check_system()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dmi_check_system(_list: *const c_void) -> i32 {
-    0
-}
-
-// upstream: drivers/acpi/acpi_video.c acpi_video_unregister()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn acpi_video_unregister() {}
-
-// upstream: fs/debugfs/file.c debugfs_create_u32()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn debugfs_create_u32(
-    _name: *const c_char,
-    _mode: u16,
-    _parent: *mut c_void,
-    _val: *mut u32,
-) {}
-
-// upstream: lib/pci_iomap.c pci_iomap_range()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pci_iomap_range(
-    _pdev: *mut c_void,
-    _bar: i32,
-    _offset: u64,
-    _maxlen: u64,
-) -> *mut c_void {
-    core::ptr::null_mut()
-}
-
-// upstream: lib/pci_iomap.c pci_iounmap()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pci_iounmap(_pdev: *mut c_void, _addr: *mut c_void) {}
-
 // upstream: lib/iomap.c ioread32()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ioread32(_addr: *const c_void) -> u32 {
     0
 }
 
-// upstream: drivers/gpu/drm/drm_privacy_screen.c drm_privacy_screen_get()
+// upstream: include/drm/drm_privacy_screen_consumer.h drm_privacy_screen_get()
+// Degraded stub matches Linux !CONFIG_DRM_PRIVACY_SCREEN returning ERR_PTR(-ENODEV).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_privacy_screen_get(
     _dev: *mut c_void,
     _con_id: *const c_char,
 ) -> *mut c_void {
-    core::ptr::null_mut()
+    tk_linux_kapi::config::ERR_PTR(-tk_linux_kapi::config::ENODEV)
 }
 
 // upstream: drivers/gpu/drm/drm_privacy_screen.c drm_privacy_screen_put()
@@ -74,10 +35,6 @@ pub unsafe extern "C" fn drm_privacy_screen_put(_priv_: *mut c_void) {}
 pub unsafe extern "C" fn drm_dp_mst_atomic_setup_commit(_state: *mut DrmAtomicCommit) -> i32 {
     0
 }
-
-// upstream: drivers/gpu/drm/clients/drm_client_setup.c drm_client_dev_unregister()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_client_dev_unregister(_dev: *mut DrmDevice) {}
 
 // upstream: drivers/gpu/drm/drm_probe_helper.c drm_kms_helper_poll_init()
 #[unsafe(no_mangle)]
@@ -106,22 +63,26 @@ pub unsafe extern "C" fn drm_atomic_helper_disable_all(
 }
 
 // upstream: drivers/gpu/drm/drm_atomic_helper.c drm_atomic_helper_duplicate_state()
+// Degraded stub returns ERR_PTR(-ENOMEM), matching Linux failure when state allocation fails.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_atomic_helper_duplicate_state(
     _dev: *mut DrmDevice,
     _ctx: *mut DrmModesetAcquireCtx,
 ) -> *mut DrmAtomicCommit {
-    core::ptr::null_mut()
+    tk_linux_kapi::config::ERR_PTR(-tk_linux_kapi::config::ENOMEM)
 }
 
 // upstream: include/drm/drm_atomic.h drm_atomic_commit_put()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_atomic_commit_put(_state: *mut DrmAtomicCommit) {}
 
+const X86_HYPER_NATIVE: u32 = 0;
+
 // upstream: arch/x86/include/asm/hypervisor.h hypervisor_is_type()
+// Degraded stub matches Linux bare-metal semantics (x86_hyper_type == X86_HYPER_NATIVE).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn hypervisor_is_type(_type_: u32) -> bool {
-    true
+pub unsafe extern "C" fn hypervisor_is_type(type_: u32) -> bool {
+    type_ == X86_HYPER_NATIVE
 }
 
 
@@ -129,29 +90,14 @@ pub unsafe extern "C" fn hypervisor_is_type(_type_: u32) -> bool {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_atomic_helper_shutdown(_dev: *mut DrmDevice) {}
 
-// Mock PCI dev pointer for ISA bridge scan in tests
-static MOCK_ISA_BRIDGE: core::sync::atomic::AtomicPtr<crate::intel_quirks_upstream::PciDev> =
-    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-
-pub unsafe fn set_mock_isa_bridge(dev: *mut crate::intel_quirks_upstream::PciDev) {
-    MOCK_ISA_BRIDGE.store(dev, core::sync::atomic::Ordering::SeqCst);
-}
-
-// upstream: drivers/pci/search.c pci_get_class()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pci_get_class(
-    class: u32,
-    from: *mut crate::intel_quirks_upstream::PciDev,
-) -> *mut crate::intel_quirks_upstream::PciDev {
-    if from.is_null() {
-        let dev = MOCK_ISA_BRIDGE.load(core::sync::atomic::Ordering::SeqCst);
-        if !dev.is_null() && (((*dev).class >> 8) == (class >> 8) || class == (0x0601 << 8)) {
-            return dev;
-        }
-    }
-    core::ptr::null_mut()
-}
-
-// upstream: drivers/pci/pci-driver.c pci_dev_put()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pci_dev_put(_dev: *mut crate::intel_quirks_upstream::PciDev) {}
+// Defined by tk-linux-kapi / tk-drm-upstream since kapi-display and BI merged;
+// re-exported so existing call paths keep resolving.
+pub use tk_linux_kapi::acpi::acpi_video_unregister;
+pub use tk_linux_kapi::debugfs::debugfs_create_u32;
+pub use tk_linux_kapi::acpi::dmi_check_system;
+pub use tk_drm_upstream::pending_stubs::drm_client_probe::drm_client_dev_unregister;
+pub use tk_linux_kapi::pci::pci_dev_put;
+pub use tk_linux_kapi::pci::pci_get_class;
+pub use tk_linux_kapi::pci::pci_iomap_range;
+pub use tk_linux_kapi::pci::pci_iounmap;
+pub use tk_linux_kapi::vga::vga_switcheroo_client_probe_defer;

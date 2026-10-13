@@ -24,15 +24,22 @@ pub(super) fn upstream_probe_schedule_text(rootfs_ready: bool) -> &'static str {
 #[cfg(target_os = "none")]
 pub(super) fn init_at_boot() {
     use super::{GT_REPORT, upstream_probe};
-    if let Err(error) = super::upstream_gt::install_providers() {
+    axruntime::boot_progress::trace_enter("gt:init_at_boot");
+    axruntime::boot_progress::trace_enter("gt:install_providers");
+    let provider_res = super::upstream_gt::install_providers();
+    axruntime::boot_progress::trace_exit("gt:install_providers");
+    if let Err(error) = provider_res {
         axlog::warn!("intel-gt: upstream providers not installed: {error}");
+        axruntime::boot_progress::trace_exit("gt:init_at_boot");
         return;
     }
     if axhal::boot::command_line_value("intel.gt") == Some("0") {
+        axruntime::boot_progress::trace_exit("gt:init_at_boot");
         return;
     }
     let windows = super::mapped_windows();
     if windows.is_empty() {
+        axruntime::boot_progress::trace_exit("gt:init_at_boot");
         return;
     }
     let result: Result<String, String> = if windows.len() != 1 {
@@ -41,7 +48,10 @@ pub(super) fn init_at_boot() {
         ))
     } else {
         let (bdf, window) = windows[0];
-        upstream_probe::defer(bdf, window)
+        axruntime::boot_progress::trace_enter("gt:upstream_probe_defer");
+        let res = upstream_probe::defer(bdf, window);
+        axruntime::boot_progress::trace_exit("gt:upstream_probe_defer");
+        res
     };
     let initialized = result.is_ok();
     let text = result.unwrap_or_else(|s| s);
@@ -50,4 +60,5 @@ pub(super) fn init_at_boot() {
     if !initialized && let Some((bdf, _)) = windows.first() {
         GT_REPORT.lock().push((*bdf, text));
     }
+    axruntime::boot_progress::trace_exit("gt:init_at_boot");
 }

@@ -193,7 +193,12 @@ mod imp {
             (issuer_cpu, request, attempts, started)
         };
 
-        let deadline = started.saturating_add(SHOOTDOWN_TIMEOUT_NS);
+        let timeout_ns = if axruntime::boot_progress::boot_trace_enabled() {
+            2_000_000_000
+        } else {
+            SHOOTDOWN_TIMEOUT_NS
+        };
+        let deadline = started.saturating_add(timeout_ns);
         let mut retry_interval = RETRY_INITIAL_NS;
         let mut next_retry = started.saturating_add(retry_interval);
         loop {
@@ -342,7 +347,12 @@ mod imp {
             (issuer_cpu, generation, targets, request, attempts, started)
         };
 
-        let deadline = started.saturating_add(SHOOTDOWN_TIMEOUT_NS);
+        let timeout_ns = if axruntime::boot_progress::boot_trace_enabled() {
+            2_000_000_000
+        } else {
+            SHOOTDOWN_TIMEOUT_NS
+        };
+        let deadline = started.saturating_add(timeout_ns);
         let mut retry_interval = RETRY_INITIAL_NS;
         let mut next_retry = started.saturating_add(retry_interval);
         loop {
@@ -532,6 +542,23 @@ mod imp {
         started: u64,
         attempts: &ShootdownAttempts,
     ) -> ! {
+        let cpu_count = axhal::cpu_num();
+        let mut expected_mask = 0usize;
+        let mut ack_mask = 0usize;
+        for cpu in 0..cpu_count {
+            if request.targets(cpu) && cpu < usize::BITS as usize {
+                expected_mask |= 1usize << cpu;
+                if !request.target_pending(cpu) {
+                    ack_mask |= 1usize << cpu;
+                }
+            }
+        }
+        if axruntime::boot_progress::boot_trace_enabled() {
+            panic!(
+                "cross-CPU TLB shootdown rendezvous timed out on CPU {issuer_cpu}: expected mask {expected_mask:#x}, acknowledged mask {ack_mask:#x}, waiting for {:?}",
+                request.maintenance()
+            );
+        }
         let now = axhal::time::monotonic_time_nanos();
         let epoch = request.epoch();
         error!(

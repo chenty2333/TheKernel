@@ -31,12 +31,22 @@ use crate::{
 
 /// Initialize and run initproc.
 pub fn init(args: &[String], envs: &[String]) {
+    axruntime::boot_progress::trace_enter("entry:init");
     axruntime::boot_progress::mark(axruntime::boot_progress::Stage::KernelInit);
     const INIT_PID: Pid = 1;
 
+    axruntime::boot_progress::trace_enter("entry:init_crash_kexec_hook");
     crate::syscall::init_crash_kexec_hook();
+    axruntime::boot_progress::trace_exit("entry:init_crash_kexec_hook");
+
+    axruntime::boot_progress::trace_enter("entry:init_tlb_shootdown");
     crate::mm::init_tlb_shootdown();
+    axruntime::boot_progress::trace_exit("entry:init_tlb_shootdown");
+
+    axruntime::boot_progress::trace_enter("entry:init_membarrier_ipi");
     crate::syscall::init_membarrier_ipi();
+    axruntime::boot_progress::trace_exit("entry:init_membarrier_ipi");
+
     #[cfg(feature = "perf-sampling")]
     assert!(
         crate::file::PerfSampleBackend::init_nmi(),
@@ -48,18 +58,37 @@ pub fn init(args: &[String], envs: &[String]) {
         "failed to reserve the perf reconciliation IPI lane"
     );
     #[cfg(all(feature = "smp-tlb-shootdown", target_os = "none"))]
-    axtask::init_remote_resched_ipi()
-        .expect("failed to register the EEVDF remote-reschedule IPI consumer");
-    #[cfg(all(feature = "hwp-uclamp", target_os = "none"))]
-    if axtask::init_hwp_clamp_refresh_ipi().is_err() {
-        // HWP itself remains fleet-safe and the scheduler switch/tick paths
-        // remain authoritative.  The IPI is only prompt propagation, so an
-        // occupied optional broker lane must not prevent boot.
-        debug!("HWP clamp-refresh IPI unavailable; using switch/tick refresh");
+    {
+        axruntime::boot_progress::trace_enter("entry:init_remote_resched_ipi");
+        axtask::init_remote_resched_ipi()
+            .expect("failed to register the EEVDF remote-reschedule IPI consumer");
+        axruntime::boot_progress::trace_exit("entry:init_remote_resched_ipi");
     }
+    #[cfg(all(feature = "hwp-uclamp", target_os = "none"))]
+    {
+        axruntime::boot_progress::trace_enter("entry:init_hwp_clamp_refresh_ipi");
+        if axtask::init_hwp_clamp_refresh_ipi().is_err() {
+            // HWP itself remains fleet-safe and the scheduler switch/tick paths
+            // remain authoritative.  The IPI is only prompt propagation, so an
+            // occupied optional broker lane must not prevent boot.
+            debug!("HWP clamp-refresh IPI unavailable; using switch/tick refresh");
+        }
+        axruntime::boot_progress::trace_exit("entry:init_hwp_clamp_refresh_ipi");
+    }
+
+    axruntime::boot_progress::trace_enter("entry:init_hardware_asids");
     crate::mm::init_hardware_asids();
+    axruntime::boot_progress::trace_exit("entry:init_hardware_asids");
+
+    axruntime::boot_progress::trace_enter("entry:init_rcu");
     crate::rcu::init().expect("Failed to initialize kernel RCU domains");
+    axruntime::boot_progress::trace_exit("entry:init_rcu");
+
+    axruntime::boot_progress::trace_enter("entry:init_seccomp_filter_budget");
     init_seccomp_filter_budget().expect("Failed to initialize bounded seccomp filter budget");
+    axruntime::boot_progress::trace_exit("entry:init_seccomp_filter_budget");
+
+    axruntime::boot_progress::trace_enter("entry:init_jit_memory");
     if let Err(error) = crate::jit_memory::init() {
         // Native cBPF and native ET_REL modules share this strictly W^X
         // arena. Their optional admission paths return the captured error;
@@ -70,6 +99,9 @@ pub fn init(args: &[String], envs: &[String]) {
         // quieted without being reported as a machine that stopped.
         error!("\x012native executable arena unavailable: {error:?}");
     }
+    axruntime::boot_progress::trace_exit("entry:init_jit_memory");
+
+    axruntime::boot_progress::trace_enter("entry:init_kernel_module_exports");
     if let Err(error) = crate::syscall::init_kernel_module_exports() {
         // Module relocation has a single, explicit native ABI.  Do not boot
         // with an empty or partially published export registry, because that
@@ -78,12 +110,17 @@ pub fn init(args: &[String], envs: &[String]) {
             "failed to publish native module ABI exports: {error}"
         ));
     }
+    axruntime::boot_progress::trace_exit("entry:init_kernel_module_exports");
+
+    axruntime::boot_progress::trace_enter("entry:init_executable");
     if let Err(error) = executable::init() {
         axruntime::klog::fatal(format_args!(
             "failed to initialize bounded executable registry: {error}"
         ));
     }
+    axruntime::boot_progress::trace_exit("entry:init_executable");
 
+    axruntime::boot_progress::trace_enter("entry:mount_root");
     {
         let fs = FS_CONTEXT.lock();
         let root = fs.root_dir();
@@ -109,10 +146,24 @@ pub fn init(args: &[String], envs: &[String]) {
     axfs::set_atime_update_policy(crate::mounts::should_update_atime);
     axfs::set_mount_access_policy(crate::mounts::note_mount_access);
     axfs::set_automount_trigger_policy(crate::mounts::trigger_automount);
+    axruntime::boot_progress::trace_exit("entry:mount_root");
+
+    axruntime::boot_progress::trace_enter("entry:deferred_work");
     crate::deferred_work::init();
+    axruntime::boot_progress::trace_exit("entry:deferred_work");
+
+    axruntime::boot_progress::trace_enter("entry:init_memory_pressure");
     crate::mm::init_memory_pressure();
+    axruntime::boot_progress::trace_exit("entry:init_memory_pressure");
+
+    axruntime::boot_progress::trace_enter("entry:init_dirty_writeback");
     crate::mm::init_dirty_writeback();
+    axruntime::boot_progress::trace_exit("entry:init_dirty_writeback");
+
+    axruntime::boot_progress::trace_enter("entry:init_khugepaged");
     crate::mm::init_khugepaged();
+    axruntime::boot_progress::trace_exit("entry:init_khugepaged");
+
     crate::file::inotify::init_filesystem_release_notifications();
     let security_registry = match crate::task::security::init() {
         Ok(registry) => registry,
@@ -136,19 +187,30 @@ pub fn init(args: &[String], envs: &[String]) {
     let init_net_stack = axnet::default_stack().clone();
     let init_net_ns = NetworkNamespace::try_new(init_net_stack.clone(), user_ns.clone())
         .expect("Failed to allocate init network namespace");
+
+    axruntime::boot_progress::trace_enter("entry:init_netlink");
     crate::file::netlink::register_init_network_namespace(&init_net_ns)
         .expect("Failed to register init network namespace for device uevents");
+    axruntime::boot_progress::trace_exit("entry:init_netlink");
+
     // Device publication below (including DRM's initial registration) may
     // emit uevents, so init-net must be established first.
+    axruntime::boot_progress::trace_enter("entry:init_virtio_gpu");
     match crate::drm::init_virtio_gpu() {
         Ok(true) => info!("registered primary DRM device"),
         Ok(false) => info!("no usable primary DRM device found"),
         Err(error) => error!("failed to initialize primary DRM device: {error}"),
     }
+    axruntime::boot_progress::trace_exit("entry:init_virtio_gpu");
+
+    axruntime::boot_progress::trace_enter("entry:mount_all");
     {
         let fs = FS_CONTEXT.lock();
         pseudofs::mount_all(&fs, init_pid_ns.clone()).expect("Failed to mount pseudofs");
     }
+    axruntime::boot_progress::trace_exit("entry:mount_all");
+
+    axruntime::boot_progress::trace_exit("entry:init");
 
     let loc = FS_CONTEXT
         .lock()

@@ -71,25 +71,37 @@ pub(super) fn defer(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, Str
 }
 
 fn run_pending() {
+    axruntime::boot_progress::trace_enter("gt:run_pending");
     let Some((bdf, window)) = PENDING.lock().take() else {
+        axruntime::boot_progress::trace_exit("gt:run_pending");
         return;
     };
     let text = probe(bdf, window).unwrap_or_else(|e| e);
     axlog::info!("{text}");
     super::GT_REPORT.lock().push((bdf, text));
+    axruntime::boot_progress::trace_exit("gt:run_pending");
 }
 
 /// Run the upstream PCI probe for one mapped Intel GPU and publish the
 /// resulting device to the kernel IRQ and display-power owners.
 pub(super) fn probe(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
-    let ecam = pci::Ecam::platform().ok_or_else(|| String::from("upstream i915: PCI facts unavailable"))?;
-    let info = pci::DeviceInfo::read(&ecam, bdf)
-        .ok_or_else(|| String::from("upstream i915: PCI device unavailable"))?;
+    axruntime::boot_progress::trace_enter("gt:probe");
+    let ecam = pci::Ecam::platform().ok_or_else(|| {
+        axruntime::boot_progress::trace_exit("gt:probe");
+        String::from("upstream i915: PCI facts unavailable")
+    })?;
+    let info = pci::DeviceInfo::read(&ecam, bdf).ok_or_else(|| {
+        axruntime::boot_progress::trace_exit("gt:probe");
+        String::from("upstream i915: PCI device unavailable")
+    })?;
     if info.vendor_id != 0x8086 {
+        axruntime::boot_progress::trace_exit("gt:probe");
         return Err(format!("upstream i915: vendor {:04x} is not Intel", info.vendor_id));
     }
-    let device_info = pci_match_id(info.device_id)
-        .ok_or_else(|| format!("upstream i915: device {:04x} not in pciidlist", info.device_id))?;
+    let device_info = pci_match_id(info.device_id).ok_or_else(|| {
+        axruntime::boot_progress::trace_exit("gt:probe");
+        format!("upstream i915: device {:04x} not in pciidlist", info.device_id)
+    })?;
     // SAFETY: boot-time single-threaded writes to the x86 data symbols before any reader (the probe) runs.
     unsafe {
         tsc_khz = u32::try_from(axhal::time::nanos_to_ticks(1_000_000)).unwrap_or(u32::MAX);
@@ -100,16 +112,29 @@ pub(super) fn probe(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, Str
     }
     upstream_gt::register_gpu_window(window);
     let pdev = upstream_gt::native_pci_device(bdf);
-    super::upstream_memory::prepare(bdf, &window, pdev)?;
-    super::irq::upstream::install(bdf).map_err(|e| format!("upstream i915: {e}"))?;
+    if let Err(err) = super::upstream_memory::prepare(bdf, &window, pdev) {
+        axruntime::boot_progress::trace_exit("gt:probe");
+        return Err(err);
+    }
+    if let Err(e) = super::irq::upstream::install(bdf) {
+        axruntime::boot_progress::trace_exit("gt:probe");
+        return Err(format!("upstream i915: {e}"));
+    }
+    axruntime::boot_progress::trace_enter("gt:i915_pci_probe");
     // SAFETY: `pdev` is the native PCI identity for `bdf`; `device_info` matches its device id.
     let ret = unsafe { i915_pci_probe(pdev, info.device_id, device_info) };
+    axruntime::boot_progress::trace_exit("gt:i915_pci_probe");
     if ret != 0 {
         super::irq::upstream::disable_msi(bdf);
+        axruntime::boot_progress::trace_exit("gt:probe");
         return Err(format!("upstream i915: i915_pci_probe({:04x}) failed: {ret}", info.device_id));
     }
     // SAFETY: a successful probe stored the i915 device as the drvdata of `pdev`.
     let i915 = unsafe { pci_get_drvdata(pdev) };
-    upstream_gt::register_upstream_i915(i915).map_err(|e| format!("upstream i915: {e}"))?;
+    if let Err(e) = upstream_gt::register_upstream_i915(i915) {
+        axruntime::boot_progress::trace_exit("gt:probe");
+        return Err(format!("upstream i915: {e}"));
+    }
+    axruntime::boot_progress::trace_exit("gt:probe");
     Ok(format!("upstream i915: probed {:04x} rev {:02x}", info.device_id, info.revision))
 }

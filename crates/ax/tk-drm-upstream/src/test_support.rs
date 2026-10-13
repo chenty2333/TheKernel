@@ -35,10 +35,11 @@ impl TestDrm {
         let mut dev: Box<DrmDevice> = Box::new(unsafe { core::mem::zeroed() });
         dev.driver = &mut *driver;
         dev.driver_features = driver_features;
-        // drm_dev_init(): the managed-resource list starts empty.
+        // drm_dev_init(): the managed-resource list starts empty and dev starts with refcount 1.
         unsafe {
             INIT_LIST_HEAD(core::ptr::addr_of_mut!(dev.managed.resources));
             spin_lock_init(&mut dev.managed.lock);
+            tk_linux_kapi::memory::kref_init(core::ptr::addr_of_mut!(dev.r#ref));
         }
         Self { dev, driver }
     }

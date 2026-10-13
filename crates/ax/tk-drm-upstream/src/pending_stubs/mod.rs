@@ -8,20 +8,23 @@
 pub mod atomic_b2a;
 pub mod bridge;
 pub mod debugfs;
+pub mod dma_buf;
 pub mod dp_b2d;
 pub mod drm_client_probe;
-pub mod drm_file_events;
-pub mod drm_lease;
+pub mod dumb_buffers;
 pub mod fbdev_cmdline;
-pub mod gem_handles;
-pub mod hdmi_b2e;
 pub mod hrtimer;
 #[cfg(test)]
 pub mod host_test_links;
 pub mod kthread;
 pub mod panel_quirks;
 pub mod privacy_screen;
+pub mod syncobj;
 pub mod test_records;
 
 #[cfg(test)]
 pub use test_records::{pending_stubs_delivered_events, pending_stubs_queued_works, pending_stubs_reset_records};
+#[cfg(test)]
+pub use host_test_links::{
+    dma_fence_get_count, dma_fence_init_count, dma_fence_put_count, reset_dma_fence_counts,
+};

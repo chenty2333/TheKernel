@@ -25,7 +25,6 @@ use crate::skl_watermark_regs_upstream::*;
 use crate::intel_pch_types_upstream::*;
 use crate::intel_pch_upstream::*;
 use crate::intel_pmdemand_upstream::*;
-use crate::intel_quirks_upstream::PciDev;
 use crate::intel_uncore_types_upstream::*;
 use crate::intel_uncore_upstream::I915_UNCORE_OFFSET;
 use crate::intel_workarounds_types_upstream::I915RegT;
@@ -461,72 +460,46 @@ fn test_power_well_sync_hw_init_hw() {
 /// unknown gives PCH_NONE/NOP like Linux.
 #[test]
 fn test_intel_detect_pch() {
-    use crate::display_pending_stubs::kapi_display::set_mock_isa_bridge;
+    use tk_linux_kapi::pci::{clear_mock_pci_devices, register_mock_pci_device};
 
     let mut env = MockEnvironment::new();
     env.setup_adlp();
     let display = env.display_ptr();
 
     // 5a. Alderlake-P PCH ID (0x5182 -> masks to 0x5180 = INTEL_PCH_ADP2_DEVICE_ID_TYPE)
-    let mut pdev_adp = PciDev {
-        _pad_0: [0; 56],
-        devfn: 0,
-        vendor: 0x8086,
-        device: 0x5182,
-        subsystem_vendor: 0x8086,
-        subsystem_device: 0x0001,
-        class: 0x060100, // ISA bridge class
-        revision: 0,
-    };
+    clear_mock_pci_devices();
+    register_mock_pci_device(0x8086, 0x5182, 0x8086, 0x0001, 0x060100);
     unsafe {
-        set_mock_isa_bridge(&mut pdev_adp);
         intel_pch_detect(display);
         assert_eq!((*display).pch_type, PCH_ADP, "0x5182 must be detected as PCH_ADP");
     }
 
     // 5b. Alderlake-N PCH ID (0x5482 -> masks to 0x5480 = INTEL_PCH_ADP4_DEVICE_ID_TYPE)
-    let mut pdev_adln = PciDev {
-        _pad_0: [0; 56],
-        devfn: 0,
-        vendor: 0x8086,
-        device: 0x5482,
-        subsystem_vendor: 0x8086,
-        subsystem_device: 0x0002,
-        class: 0x060100,
-        revision: 0,
-    };
+    clear_mock_pci_devices();
+    register_mock_pci_device(0x8086, 0x5482, 0x8086, 0x0002, 0x060100);
     unsafe {
-        set_mock_isa_bridge(&mut pdev_adln);
         intel_pch_detect(display);
         assert_eq!((*display).pch_type, PCH_ADP, "0x5482 must be detected as PCH_ADP");
     }
 
     // 5c. Unknown PCI device ID -> PCH_NONE
-    let mut pdev_unknown = PciDev {
-        _pad_0: [0; 56],
-        devfn: 0,
-        vendor: 0x8086,
-        device: 0x1234,
-        subsystem_vendor: 0x8086,
-        subsystem_device: 0x0003,
-        class: 0x060100,
-        revision: 0,
-    };
+    clear_mock_pci_devices();
+    register_mock_pci_device(0x8086, 0x1234, 0x8086, 0x0003, 0x060100);
     unsafe {
-        set_mock_isa_bridge(&mut pdev_unknown);
         (*display).pch_type = PCH_NONE;
         intel_pch_detect(display);
         assert_eq!((*display).pch_type, PCH_NONE, "Unknown bridge must yield PCH_NONE");
     }
 
     // 5d. With display disabled / not present -> PCH_NOP
+    clear_mock_pci_devices();
+    register_mock_pci_device(0x8086, 0x5182, 0x8086, 0x0001, 0x060100);
     unsafe {
         (*display).info.__device_info = core::ptr::null_mut();
-        set_mock_isa_bridge(&mut pdev_adp);
         intel_pch_detect(display);
         assert_eq!((*display).pch_type, PCH_NOP, "No display must set PCH_NOP when bridge is found");
-        set_mock_isa_bridge(core::ptr::null_mut());
     }
+    clear_mock_pci_devices();
 }
 
 /// 6. intel_pmdemand_init on ADL-P is a no-op success (display ver 13).

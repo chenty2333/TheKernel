@@ -110,8 +110,27 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
     info!("Secondary CPU {cpu_id:x} init OK.");
     super::INITED_CPUS.fetch_add(1, Ordering::Release);
 
-    while !super::is_init_ok() {
-        core::hint::spin_loop();
+    if super::boot_progress::boot_trace_enabled() {
+        let deadline = axhal::time::monotonic_time() + core::time::Duration::from_secs(2);
+        while !super::is_init_ok() {
+            if axhal::time::monotonic_time() >= deadline {
+                let total = axhal::cpu_num();
+                let ack = super::INITED_CPUS.load(Ordering::Acquire);
+                let expected_mask = if total >= usize::BITS as usize {
+                    !0usize
+                } else {
+                    (1usize << total) - 1
+                };
+                panic!(
+                    "cross-CPU AP barrier timed out on secondary CPU {cpu_id}: expected mask {expected_mask:#x} ({total} CPUs), acknowledged {ack}"
+                );
+            }
+            core::hint::spin_loop();
+        }
+    } else {
+        while !super::is_init_ok() {
+            core::hint::spin_loop();
+        }
     }
 
     super::boot_progress::cpu_phase(cpu_id,7);

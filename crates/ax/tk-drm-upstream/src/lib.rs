@@ -5,6 +5,39 @@
 //! mirroring the Linux `.c` files named in each module header.
 //!
 //! The crate is `no_std`; host unit tests run under `cfg(test)`.
+//!
+//! # Kernel-Side Glue Guide (For Later VFS Switchover Batches)
+//!
+//! Batch BI ports the Linux DRM infrastructure core (`drm_drv`, `drm_file`,
+//! `drm_ioctl`, `drm_gem`, `drm_prime`, `drm_auth`, `drm_vma_manager`, `drm_lease`)
+//! as pure, portable library code.
+//!
+//! When a later batch switches TheKernel's character device nodes (`/dev/dri/card*`,
+//! `/dev/dri/renderD*`) from `kernel/src/drm/*` to this upstream DRM implementation,
+//! the following kernel-side glue must be wired:
+//!
+//! 1. **`struct file` / `inode` mapping**:
+//!    - Implement a `struct file` wrapper where `file->private_data` holds the pointer
+//!      to `DrmFile` allocated via [`drm_file_alloc`](drm_file_upstream::drm_file_alloc).
+//!    - Character device `open()` invokes [`drm_open`](drm_file_upstream::drm_open)
+//!      (or allocates `DrmFile` bound to `minor`), and `release()` invokes
+//!      [`drm_release`](drm_file_upstream::drm_release) / [`drm_file_free`](drm_file_upstream::drm_file_free).
+//!
+//! 2. **File Descriptor Installation (`fd_install`)**:
+//!    - For `DRM_IOCTL_PRIME_HANDLE_TO_FD` and `DRM_IOCTL_MODE_CREATE_LEASE`, allocate an unused fd
+//!      via TheKernel's VFS file table, instantiate the backing `file`, and call `fd_install(fd, file)`.
+//!    - For `DRM_IOCTL_PRIME_FD_TO_HANDLE`, resolve `fd` in the current task's fd table to its
+//!      underlying `struct file` / `dma_buf`.
+//!
+//! 3. **Poll Wait-Queue Hookup**:
+//!    - In `/dev/dri/*` `poll()`, register the caller's `poll_table` with `file_priv->event_wait`
+//!      using `poll_wait()`, then call [`drm_poll`](drm_file_upstream::drm_poll).
+//!
+//! 4. **Memory Mapping (`mmap`) via VMA offsets**:
+//!    - In `/dev/dri/*` `mmap()`, look up the targeted GEM buffer object using
+//!      `drm_vma_offset_lookup_locked(dev->vma_offset_manager, vma->vm_pgoff, vma_pages)`.
+//!    - Verify permission via `drm_vma_node_is_allowed(&obj->vma_node, file_priv)`.
+//!    - Dispatch to `obj->funcs->mmap(obj, vma)` or establish page table mappings for the object's backing physical pages.
 #![no_std]
 #![feature(c_variadic)]
 // Machine-translated from Linux C (see each module header). Unsafe blocks mirror
@@ -78,11 +111,12 @@ pub mod uapi_drm_types;
 pub mod uapi_drm_consts;
 pub mod uapi_drm_macros;
 
-// Function-port scaffolds (empty until their batch lands).
+// Function-port scaffolds and landed ports.
 pub mod drm_atomic_upstream;
 pub mod drm_atomic_helper_upstream;
 pub mod drm_atomic_state_helper_upstream;
 pub mod drm_atomic_uapi_upstream;
+pub mod drm_auth_upstream;
 pub mod drm_blend_upstream;
 pub mod drm_client_upstream;
 pub mod drm_client_event_upstream;
@@ -110,6 +144,7 @@ pub mod drm_gem_framebuffer_helper_upstream;
 pub mod drm_hdmi_helper_upstream;
 pub mod drm_hdmi_state_helper_upstream;
 pub mod drm_ioctl_upstream;
+pub mod drm_lease_upstream;
 pub mod drm_managed_upstream;
 pub mod drm_mode_config_upstream;
 pub mod drm_mode_object_upstream;
@@ -126,12 +161,13 @@ pub mod drm_rect_upstream;
 pub mod drm_scdc_helper_upstream;
 pub mod drm_vblank_upstream;
 pub mod drm_vblank_work_upstream;
+pub mod drm_vma_manager_upstream;
 pub mod hdmi_upstream;
 
 // TEMPORARY batch B1b stubs for not-yet-landed owners (see pending_stubs/).
 pub mod pending_stubs;
 
-/// Linux 7.2.3 renamed  to 
+/// Linux 7.2.3 renamed `drm_atomic_state` to `drm_atomic_commit`
 /// (include/drm/drm_atomic.h); the old name is kept for call-site readability.
 pub use drm_atomic_types::DrmAtomicCommit as DrmAtomicState;
 
@@ -139,6 +175,10 @@ pub use drm_atomic_types::DrmAtomicCommit as DrmAtomicState;
 mod tests;
 #[cfg(test)]
 mod b1b_tests;
+#[cfg(test)]
+mod b2a_tests;
+#[cfg(test)]
+mod b2e_tests;
 
 /// Host-test helpers shared by the batch test modules (test drm_device setup).
 #[cfg(test)]
