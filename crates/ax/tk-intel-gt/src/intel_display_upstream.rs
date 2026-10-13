@@ -4,12 +4,16 @@
 // drivers/gpu/drm/i915/display/intel_display.c (Linux v7.2.3).
 #![allow(non_snake_case, dead_code, unsafe_code)]
 
-use core::{ffi::c_void, mem::offset_of, ptr};
+use core::{
+    ffi::{c_char, c_void},
+    mem::offset_of,
+    ptr,
+};
 
 use tk_drm_upstream::{
     drm_atomic_types::DrmAtomicCommit,
     drm_connector_types::{DrmConnector, DrmConnectorState},
-    drm_crtc_types::{DrmCrtc, DrmCrtcState},
+    drm_crtc_types::DrmCrtc,
     drm_device_types::DrmDevice,
     drm_encoder_types::DrmEncoder,
     drm_modes_types::{
@@ -20,12 +24,12 @@ use tk_drm_upstream::{
     drm_plane_types::DrmPlane,
     uapi_drm_consts::{
         DRM_MODE_FLAG_BCAST, DRM_MODE_FLAG_CLKDIV2, DRM_MODE_FLAG_CSYNC, DRM_MODE_FLAG_HSKEW,
-        DRM_MODE_FLAG_NCSYNC, DRM_MODE_FLAG_NHSYNC, DRM_MODE_FLAG_NVSYNC, DRM_MODE_FLAG_PCSYNC,
-        DRM_MODE_FLAG_PHSYNC, DRM_MODE_FLAG_PIXMUX, DRM_MODE_FLAG_PVSYNC,
+        DRM_MODE_FLAG_INTERLACE, DRM_MODE_FLAG_NCSYNC, DRM_MODE_FLAG_NHSYNC, DRM_MODE_FLAG_NVSYNC,
+        DRM_MODE_FLAG_PCSYNC, DRM_MODE_FLAG_PHSYNC, DRM_MODE_FLAG_PIXMUX, DRM_MODE_FLAG_PVSYNC,
     },
 };
 use tk_linux_kapi::{
-    config::{EINVAL, ENODEV, ENOMEM, EOPNOTSUPP, GFP_KERNEL, IS_ERR, PTR_ERR},
+    config::{EINVAL, ENODEV, ENOMEM, EOPNOTSUPP, IS_ERR, PTR_ERR},
     memory::{kfree, kzalloc_objs},
     types::ListHead,
     workqueue::{flush_workqueue, queue_work},
@@ -34,12 +38,14 @@ use tk_linux_kapi::{
 use crate::{
     intel_bios_upstream::IntelBiosEncoderData,
     intel_display_core_types_upstream::{IntelDisplay, IntelModesetFuncs},
-    intel_display_device_types_upstream::IntelDisplayDeviceInfo,
     intel_display_device_upstream::intel_display_device_present,
     intel_display_limits_types_upstream::{I915_MAX_PIPES, Pipe},
     intel_display_types_upstream::{
-        IntelAtomicState, IntelCrtc, IntelCrtcState, IntelEncoder, IntelPlane, IntelPlaneState,
+        INTEL_OUTPUT_DDI, INTEL_OUTPUT_DP, INTEL_OUTPUT_DP_MST, INTEL_OUTPUT_EDP,
+        INTEL_OUTPUT_HDMI, IntelAtomicState, IntelCrtc, IntelCrtcState, IntelDigitalPort,
+        IntelEncoder, IntelPlane, IntelPlaneState,
     },
+    intel_hti_upstream::{PHY_A, PHY_B, PHY_D, PHY_F, PHY_I, PHY_NONE, Phy},
     intel_link_bw_types_upstream::IntelLinkBwLimits,
 };
 
@@ -59,10 +65,6 @@ unsafe extern "C" {
     fn intel_initial_plane_vblank_wait(crtc: *mut IntelCrtc);
     fn intel_set_memory_cxsr(display: *mut IntelDisplay, enable: bool) -> bool;
     fn hsw_ips_disable(state: *mut IntelCrtcState) -> bool;
-    fn intel_dpll_crtc_get_dpll(state: *mut IntelAtomicState, crtc: *mut IntelCrtc) -> i32;
-    fn skl_update_scaler_crtc(state: *mut IntelCrtcState) -> i32;
-    fn intel_atomic_setup_scalers(state: *mut IntelAtomicState, crtc: *mut IntelCrtc) -> i32;
-    fn intel_dpll_crtc_compute_clock(state: *mut IntelAtomicState, crtc: *mut IntelCrtc) -> i32;
     fn intel_link_bw_init_limits(state: *mut IntelAtomicState, limits: *mut IntelLinkBwLimits);
     fn intel_link_bw_set_bpp_limit_for_pipe(
         state: *mut IntelAtomicState,
@@ -84,7 +86,6 @@ unsafe extern "C" {
         new_blob: *mut tk_drm_upstream::drm_property_types::DrmPropertyBlob,
     ) -> bool;
     fn drm_plane_mask(plane: *const DrmPlane) -> u32;
-    fn intel_dpll_release(state: *mut IntelAtomicState, crtc: *mut IntelCrtc);
     fn intel_crtc_min_cdclk(state: *const IntelCrtcState) -> i32;
     fn intel_compute_global_watermarks(state: *mut IntelAtomicState) -> i32;
     fn intel_bw_atomic_check(state: *mut IntelAtomicState) -> i32;
@@ -141,6 +142,87 @@ unsafe fn max_dotclock(display: *const IntelDisplay) -> i32 {
     }
 }
 
+/// Map ADL-P DDI port numbering to the PHY enumeration used by DPLL/TC code.
+/// PORT_TC1..TC4 are wired to PHY_F..I; the ordinary A/B ports use PHY_A/B.
+fn adlp_port_to_phy(port: i32) -> Phy {
+    match port {
+        0..=2 => PHY_A + port,
+        3..=6 => PHY_F + port - 3,
+        7..=8 => PHY_D + port - 7,
+        _ => PHY_NONE,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_port_to_phy(display: *mut IntelDisplay, port: i32) -> Phy {
+    if display.is_null() {
+        return PHY_NONE;
+    }
+    if unsafe { display_ver(display) } >= DISPLAY_VER_ADLP {
+        return adlp_port_to_phy(port);
+    }
+    // This translation target deliberately only initializes ADL-P. Do not
+    // guess older-generation PHY topologies from their port numbering.
+    PHY_NONE
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_encoder_to_phy(encoder: *mut IntelEncoder) -> Phy {
+    if encoder.is_null() {
+        return PHY_NONE;
+    }
+    let display =
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*encoder).base.dev) };
+    if display.is_null() {
+        return PHY_NONE;
+    }
+    unsafe { intel_port_to_phy(display, (*encoder).port) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_encoder_is_combo(encoder: *mut IntelEncoder) -> bool {
+    let phy = unsafe { intel_encoder_to_phy(encoder) };
+    // ADL-P has combo PHYs A/B; the remaining populated outputs are Type-C PHYs.
+    (PHY_A..=PHY_B).contains(&phy)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_encoder_is_tc(encoder: *mut IntelEncoder) -> bool {
+    if encoder.is_null() {
+        return false;
+    }
+    let output_type = unsafe { (*encoder).r#type };
+    if !matches!(
+        output_type,
+        INTEL_OUTPUT_HDMI
+            | INTEL_OUTPUT_DP
+            | INTEL_OUTPUT_EDP
+            | INTEL_OUTPUT_DDI
+            | INTEL_OUTPUT_DP_MST
+    ) {
+        return false;
+    }
+    let phy = unsafe { intel_encoder_to_phy(encoder) };
+    if !(PHY_F..=PHY_I).contains(&phy) {
+        return false;
+    }
+    // Like upstream, a dedicated-external DDI is not a Type-C connection even
+    // if its logical port number maps to a Type-C PHY.
+    let dig_port = unsafe { encoder.cast::<IntelDigitalPort>() };
+    unsafe { !(*dig_port).dedicated_external }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_encoder_to_tc(encoder: *mut IntelEncoder) -> i32 {
+    if encoder.is_null() {
+        return -1; // TC_PORT_NONE
+    }
+    match unsafe { intel_encoder_to_phy(encoder) } {
+        phy @ PHY_F..=PHY_I => phy - PHY_F,
+        _ => -1,
+    }
+}
+
 /// Maximum uncompressed dot clock accepted by the display IP.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_max_uncompressed_dotclock(display: *mut IntelDisplay) -> i32 {
@@ -155,20 +237,7 @@ pub unsafe extern "C" fn intel_max_uncompressed_dotclock(display: *mut IntelDisp
     limit
 }
 
-/// Validate generic timing limits before encoder-specific validation.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_mode_valid(
-    dev: *mut DrmDevice,
-    mode: *mut DrmDisplayMode,
-) -> DrmModeStatus {
-    if dev.is_null() || mode.is_null() {
-        return MODE_BAD;
-    }
-    let display = unsafe { crate::intel_display_conversion_upstream::__drm_to_display(dev) };
-    if !unsafe { intel_display_device_present(display) } {
-        return MODE_BAD;
-    }
-    let mode = unsafe { &*mode };
+fn mode_valid_limits(mode: &DrmDisplayMode, ver: u16, max_clock: i32) -> DrmModeStatus {
     if mode.vscan > 1 {
         return MODE_NO_VSCAN;
     }
@@ -184,9 +253,6 @@ pub unsafe extern "C" fn intel_mode_valid(
     if mode.clock <= 0 {
         return MODE_NOCLOCK;
     }
-
-    let ver = unsafe { display_ver(display) };
-    let max_clock = unsafe { max_dotclock(display) };
     if mode.clock > max_clock {
         return MODE_CLOCK_HIGH;
     }
@@ -221,16 +287,11 @@ pub unsafe extern "C" fn intel_mode_valid(
     MODE_OK
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_cpu_transcoder_mode_valid(
-    display: *mut IntelDisplay,
-    mode: *const DrmDisplayMode,
+fn cpu_transcoder_mode_valid_limits(
+    mode: &DrmDisplayMode,
+    ver: u16,
+    has_g4x: bool,
 ) -> DrmModeStatus {
-    if display.is_null() || mode.is_null() {
-        return MODE_BAD;
-    }
-    let mode = unsafe { &*mode };
-    let ver = unsafe { display_ver(display) };
     if ver >= 5 {
         if mode.hdisplay < 64 || mode.htotal.saturating_sub(mode.hdisplay) < 32 {
             return MODE_H_ILLEGAL;
@@ -246,10 +307,39 @@ pub unsafe extern "C" fn intel_cpu_transcoder_mode_valid(
             return MODE_V_ILLEGAL;
         }
     }
-    if (ver >= 5 || unsafe { platform_has(display, 0) }) && mode.hsync_start == mode.hdisplay {
+    if (ver >= 5 || has_g4x) && mode.hsync_start == mode.hdisplay {
         return MODE_H_ILLEGAL;
     }
     MODE_OK
+}
+
+/// Validate generic timing limits before encoder-specific validation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_mode_valid(
+    dev: *mut DrmDevice,
+    mode: *mut DrmDisplayMode,
+) -> DrmModeStatus {
+    if dev.is_null() || mode.is_null() {
+        return MODE_BAD;
+    }
+    let display = unsafe { crate::intel_display_conversion_upstream::__drm_to_display(dev) };
+    if !unsafe { intel_display_device_present(display) } {
+        return MODE_BAD;
+    }
+    unsafe { mode_valid_limits(&*mode, display_ver(display), max_dotclock(display)) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cpu_transcoder_mode_valid(
+    display: *mut IntelDisplay,
+    mode: *const DrmDisplayMode,
+) -> DrmModeStatus {
+    if display.is_null() || mode.is_null() {
+        return MODE_BAD;
+    }
+    unsafe {
+        cpu_transcoder_mode_valid_limits(&*mode, display_ver(display), platform_has(display, 0))
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -480,7 +570,7 @@ unsafe fn intel_crtc_compute_config(state: *mut IntelAtomicState, crtc: *mut Int
     if crtc_state.is_null() {
         return -EINVAL;
     }
-    let ret = unsafe { intel_dpll_crtc_compute_clock(state, crtc) };
+    let ret = unsafe { crate::intel_dpll_upstream::intel_dpll_crtc_compute_clock(state, crtc) };
     if ret != 0 {
         return ret;
     }
@@ -945,7 +1035,7 @@ pub unsafe extern "C" fn intel_crtc_atomic_check(
     }
 
     if unsafe { crate::intel_atomic_upstream::intel_crtc_needs_modeset(crtc_state) } {
-        let ret = unsafe { intel_dpll_crtc_get_dpll(state, crtc) };
+        let ret = unsafe { crate::intel_dpll_upstream::intel_dpll_crtc_get_dpll(state, crtc) };
         if ret != 0 {
             return ret;
         }
@@ -968,8 +1058,8 @@ pub unsafe extern "C" fn intel_crtc_atomic_check(
     let ret = run_watermark_scaler_check(
         || unsafe { crate::intel_wm_upstream::intel_wm_compute(state, crtc) },
         needs_pipe_scaler,
-        || unsafe { skl_update_scaler_crtc(crtc_state) },
-        || unsafe { intel_atomic_setup_scalers(state, crtc) },
+        || unsafe { crate::skl_scaler_upstream::skl_update_scaler_crtc(crtc_state) },
+        || unsafe { crate::skl_scaler_upstream::intel_atomic_setup_scalers(state, crtc) },
     );
     if ret != 0 {
         return ret;
@@ -1188,17 +1278,14 @@ unsafe fn intel_atomic_check_config_and_link(state: *mut IntelAtomicState) -> i3
         let mut failed_pipe = -1;
         let ret = unsafe { intel_atomic_check_config(state, &new_limits, &mut failed_pipe) };
         if ret != 0 {
-            if ret == -EINVAL
-                && failed_pipe >= 0
-                && unsafe {
-                    intel_link_bw_set_bpp_limit_for_pipe(
-                        state,
-                        &old_limits,
-                        &mut new_limits,
-                        failed_pipe,
-                    )
-                }
-            {
+            if retry_failed_config_with_bpp_limit(ret, failed_pipe, || unsafe {
+                intel_link_bw_set_bpp_limit_for_pipe(
+                    state,
+                    &old_limits,
+                    &mut new_limits,
+                    failed_pipe,
+                )
+            }) {
                 continue;
             }
             return ret;
@@ -1210,6 +1297,21 @@ unsafe fn intel_atomic_check_config_and_link(state: *mut IntelAtomicState) -> i3
         }
     }
     -EINVAL
+}
+
+fn retry_failed_config_with_bpp_limit(
+    error: i32,
+    failed_pipe: i32,
+    set_limit: impl FnOnce() -> bool,
+) -> bool {
+    error == -EINVAL && failed_pipe >= 0 && set_limit()
+}
+
+fn cleanup_after_commit_stage_error(error: i32, cleanup: impl FnOnce()) -> i32 {
+    if error != 0 {
+        cleanup();
+    }
+    error
 }
 
 unsafe fn connector_state_for_check(
@@ -1317,6 +1419,20 @@ pub unsafe extern "C" fn intel_atomic_check(
     if unsafe { (*state).base.crtcs.is_null() } {
         return -EINVAL;
     }
+    let ret = unsafe {
+        for_each_new_connector_in_state(state, |_, connector_state| {
+            let encoder = (*connector_state).best_encoder.cast::<IntelEncoder>();
+            if !encoder.is_null()
+                && (*encoder).r#type == crate::intel_display_types_upstream::INTEL_OUTPUT_DP_MST
+            {
+                return -EOPNOTSUPP;
+            }
+            0
+        })
+    };
+    if ret != 0 {
+        return ret;
+    }
 
     let crtc_count = unsafe { (*dev).mode_config.num_crtc.max(0) as usize };
     let mut any_modeset = false;
@@ -1330,9 +1446,12 @@ pub unsafe extern "C" fn intel_atomic_check(
         if unsafe { (*new).joiner_pipes != 0 || (*new).splitter.enable } {
             return -EOPNOTSUPP;
         }
-        if unsafe { (*new).dp_tunnel_ref.tunnel.is_null() == false }
-            || unsafe { (*new).uapi.vrr_enabled }
-        {
+        if unsafe {
+            !(*new).dp_tunnel_ref.tunnel.is_null()
+                || (*new).uapi.vrr_enabled
+                || (*new).use_dsb
+                || (*new).use_flipq
+        } {
             return -EOPNOTSUPP;
         }
         if unsafe { !(*state).internal } {
@@ -1366,6 +1485,16 @@ pub unsafe extern "C" fn intel_atomic_check(
     if ret != 0 {
         return ret;
     }
+    for index in 0..crtc_count {
+        let entry = unsafe { (*state).base.crtcs.add(index) };
+        if unsafe { (*entry).new_state.is_null() } {
+            continue;
+        }
+        let new = unsafe { (*entry).new_state.cast::<IntelCrtcState>() };
+        if unsafe { (*new).dsc.compression_enable || (*new).dsc.compression_enabled_on_link } {
+            return -EOPNOTSUPP;
+        }
+    }
 
     for index in 0..crtc_count {
         let entry = unsafe { (*state).base.crtcs.add(index) };
@@ -1376,7 +1505,7 @@ pub unsafe extern "C" fn intel_atomic_check(
         let new = unsafe { (*entry).new_state.cast::<IntelCrtcState>() };
         if unsafe { crate::intel_atomic_upstream::intel_crtc_needs_modeset(new) } {
             any_modeset = true;
-            unsafe { intel_dpll_release(state, crtc) };
+            unsafe { crate::intel_dpll_mgr_upstream::intel_dpll_release(state, crtc) };
         }
     }
     if any_modeset && !unsafe { check_digital_port_conflicts(state) } {
@@ -1436,6 +1565,199 @@ pub unsafe extern "C" fn intel_atomic_check(
         }
     }
     0
+}
+
+/// Mark enabled CRTCs in a pipe mask for a full modeset and pull in their
+/// connectors and planes before plane state calculation, matching Linux's
+/// early modeset helper. MST/tunnel state is outside the ADL-P subset.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_modeset_pipes_in_mask_early(
+    state: *mut IntelAtomicState,
+    _reason: *const c_char,
+    pipe_mask: u8,
+) -> i32 {
+    if state.is_null() || unsafe { (*state).base.dev.is_null() } {
+        return -EINVAL;
+    }
+    let display =
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*state).base.dev) };
+    if display.is_null() {
+        return -EINVAL;
+    }
+    for pipe in 0..I915_MAX_PIPES {
+        if pipe_mask & (1u8 << pipe) == 0 {
+            continue;
+        }
+        let crtc = unsafe { crate::intel_crtc_upstream::intel_crtc_for_pipe(display, pipe) };
+        if crtc.is_null() {
+            continue;
+        }
+        let crtc_state = unsafe {
+            crate::intel_atomic_upstream::intel_atomic_get_crtc_state(&mut (*state).base, crtc)
+        };
+        if unsafe { IS_ERR(crtc_state) } {
+            return unsafe { PTR_ERR(crtc_state.cast::<c_void>()) };
+        }
+        if unsafe {
+            !(*crtc_state).hw.enable
+                || crate::intel_atomic_upstream::intel_crtc_needs_modeset(crtc_state)
+        } {
+            continue;
+        }
+        let ret =
+            unsafe { drm_atomic_add_affected_connectors(&mut (*state).base, &mut (*crtc).base) };
+        if ret != 0 {
+            return ret;
+        }
+        let ret = unsafe { drm_atomic_add_affected_planes(&mut (*state).base, &mut (*crtc).base) };
+        if ret != 0 {
+            return ret;
+        }
+        unsafe {
+            (*crtc_state).uapi.set_mode_changed(true);
+            (*crtc_state).update_pipe = false;
+            (*crtc_state).update_m_n = false;
+            (*crtc_state).update_lrr = false;
+        }
+    }
+    0
+}
+
+/// Recommit the selected CRTC pipes while using a caller-owned DRM modeset
+/// acquire context. `-EDEADLK` is returned unchanged so the caller can run the
+/// standard ww-mutex backoff/retry loop.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_modeset_commit_pipes(
+    display: *mut IntelDisplay,
+    pipe_mask: u8,
+    ctx: *mut DrmModesetAcquireCtx,
+) -> i32 {
+    if display.is_null() || unsafe { (*display).drm.is_null() } {
+        return -EINVAL;
+    }
+    let state = unsafe { drm_atomic_commit_alloc((*display).drm) };
+    if state.is_null() {
+        return -ENOMEM;
+    }
+    let intel_state = state.cast::<IntelAtomicState>();
+    unsafe {
+        (*state).acquire_ctx = ctx;
+        (*intel_state).internal = true;
+    }
+    let mut ret = 0;
+    for pipe in 0..I915_MAX_PIPES {
+        if pipe_mask & (1u8 << pipe) == 0 {
+            continue;
+        }
+        let crtc = unsafe { crate::intel_crtc_upstream::intel_crtc_for_pipe(display, pipe) };
+        if crtc.is_null() {
+            continue;
+        }
+        let crtc_state =
+            unsafe { crate::intel_atomic_upstream::intel_atomic_get_crtc_state(state, crtc) };
+        if unsafe { IS_ERR(crtc_state) } {
+            ret = unsafe { PTR_ERR(crtc_state.cast::<c_void>()) };
+            break;
+        }
+        unsafe { (*crtc_state).uapi.set_connectors_changed(true) };
+    }
+    if ret == 0 {
+        ret = unsafe { drm_atomic_commit(state) };
+    }
+    unsafe { drm_atomic_commit_put(state) };
+    ret
+}
+
+/// Commit the BIOS-inherited ADL-P display state through the normal atomic
+/// path, retrying ww-mutex deadlocks with DRM's standard backoff protocol.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_initial_commit(display: *mut IntelDisplay) -> i32 {
+    if display.is_null() || unsafe { (*display).drm.is_null() } {
+        return -EINVAL;
+    }
+    let state = unsafe { drm_atomic_commit_alloc((*display).drm) };
+    if state.is_null() {
+        return -ENOMEM;
+    }
+    let mut ctx = unsafe { core::mem::MaybeUninit::<DrmModesetAcquireCtx>::zeroed().assume_init() };
+    unsafe {
+        drm_modeset_acquire_init(&mut ctx, 0);
+        (*state).acquire_ctx = &mut ctx;
+        (*state.cast::<IntelAtomicState>()).internal = true;
+    }
+
+    let mut ret = 0;
+    loop {
+        let head = unsafe { ptr::addr_of_mut!((*display).pipe_list) };
+        let mut node = unsafe { (*head).next };
+        while node != head {
+            let crtc = unsafe {
+                node.cast::<u8>()
+                    .sub(offset_of!(IntelCrtc, pipe_head))
+                    .cast::<IntelCrtc>()
+            };
+            let crtc_state =
+                unsafe { crate::intel_atomic_upstream::intel_atomic_get_crtc_state(state, crtc) };
+            if unsafe { IS_ERR(crtc_state) } {
+                ret = unsafe { PTR_ERR(crtc_state.cast::<c_void>()) };
+                break;
+            }
+            if !unsafe { (*crtc_state).hw.active } {
+                unsafe { (*crtc_state).inherited = false };
+            } else {
+                ret = unsafe { drm_atomic_add_affected_planes(state, &mut (*crtc).base) };
+                if ret != 0 {
+                    break;
+                }
+                unsafe { (*crtc_state).uapi.set_color_mgmt_changed(true) };
+                let encoder_mask = unsafe { (*crtc_state).uapi.encoder_mask };
+                let mut connectors_need_modeset = false;
+                unsafe {
+                    for_each_encoder(display, |encoder| {
+                        let index = (*encoder).base.index;
+                        if index >= 32 || encoder_mask & (1u32 << index) == 0 {
+                            return;
+                        }
+                        if let Some(check) = (*encoder).initial_fastset_check {
+                            if !check(encoder, crtc_state) {
+                                connectors_need_modeset = true;
+                            }
+                        }
+                    });
+                }
+                if connectors_need_modeset {
+                    ret = unsafe { drm_atomic_add_affected_connectors(state, &mut (*crtc).base) };
+                    if ret != 0 {
+                        break;
+                    }
+                }
+            }
+            node = unsafe { (*node).next };
+            if node.is_null() {
+                ret = -EINVAL;
+                break;
+            }
+        }
+        if ret == 0 {
+            ret = unsafe { drm_atomic_commit(state) };
+        }
+        if ret != -tk_linux_kapi::config::EDEADLK {
+            break;
+        }
+        unsafe { drm_atomic_commit_clear(state) };
+        let backoff = unsafe { drm_modeset_backoff(&mut ctx) };
+        if backoff != 0 {
+            ret = backoff;
+            break;
+        }
+    }
+
+    unsafe {
+        drm_atomic_commit_put(state);
+        drm_modeset_drop_locks(&mut ctx);
+        drm_modeset_acquire_fini(&mut ctx);
+    }
+    ret
 }
 
 #[inline]
@@ -1535,26 +1857,1477 @@ pub unsafe extern "C" fn intel_init_display_hooks(display: *mut IntelDisplay) {
 
 static SKL_DISPLAY_FUNCS: IntelModesetFuncs = IntelModesetFuncs {
     get_pipe_config: Some(intel_hsw_get_pipe_config),
-    get_initial_plane_config: Some(skl_get_initial_plane_config),
-    fixup_initial_plane_config: Some(skl_fixup_initial_plane_config),
+    get_initial_plane_config: Some(
+        crate::skl_universal_plane_upstream::skl_get_initial_plane_config,
+    ),
+    fixup_initial_plane_config: Some(intel_skl_fixup_initial_plane_config),
     crtc_enable: Some(intel_hsw_crtc_enable),
     crtc_disable: Some(intel_hsw_crtc_disable),
     commit_modeset_enables: Some(intel_skl_commit_modeset_enables),
 };
 
-unsafe extern "C" {
-    fn intel_hsw_get_pipe_config(crtc: *mut IntelCrtc, state: *mut IntelCrtcState) -> bool;
-    fn skl_get_initial_plane_config(
-        crtc: *mut IntelCrtc,
-        config: *mut crate::intel_display_types_upstream::IntelInitialPlaneConfig,
-    );
-    fn skl_fixup_initial_plane_config(
-        crtc: *mut IntelCrtc,
-        config: *mut crate::intel_display_types_upstream::IntelInitialPlaneConfig,
-    ) -> bool;
-    fn intel_hsw_crtc_enable(state: *mut IntelAtomicState, crtc: *mut IntelCrtc);
-    fn intel_hsw_crtc_disable(state: *mut IntelAtomicState, crtc: *mut IntelCrtc);
-    fn intel_skl_commit_modeset_enables(state: *mut IntelAtomicState);
+unsafe extern "C" fn intel_skl_fixup_initial_plane_config(
+    crtc: *mut IntelCrtc,
+    config: *mut crate::intel_display_types_upstream::IntelInitialPlaneConfig,
+) -> bool {
+    unsafe {
+        crate::skl_universal_plane_upstream::skl_fixup_initial_plane_config(
+            crtc,
+            config.cast_const(),
+        )
+    }
+}
+
+#[inline]
+fn intel_pipe_power_domain(pipe: Pipe) -> u32 {
+    1 + pipe.max(0) as u32
+}
+
+#[inline]
+fn intel_transcoder_power_domain(transcoder: i32) -> u32 {
+    if transcoder == crate::intel_display_limits_types_upstream::TRANSCODER_EDP {
+        crate::intel_display_power_types_upstream::POWER_DOMAIN_TRANSCODER_EDP
+    } else {
+        crate::intel_display_power_types_upstream::POWER_DOMAIN_TRANSCODER_A + transcoder as u32
+    }
+}
+
+unsafe fn intel_read_pipe_timings(display: *mut IntelDisplay, state: *mut IntelCrtcState) {
+    let transcoder = unsafe { (*state).cpu_transcoder as u32 };
+    let mode = unsafe { &mut (*state).hw.adjusted_mode };
+    let read = |reg| unsafe { crate::intel_de_upstream::intel_de_read(display, reg) };
+
+    let value =
+        read(unsafe { crate::intel_display_regs_upstream::TRANS_HTOTAL(display, transcoder) });
+    mode.crtc_hdisplay = (crate::intel_display_reg_defs_upstream::reg_field_get(
+        crate::intel_display_regs_upstream::HACTIVE_MASK,
+        value,
+    ) + 1) as u16;
+    mode.crtc_htotal = (crate::intel_display_reg_defs_upstream::reg_field_get(
+        crate::intel_display_regs_upstream::HTOTAL_MASK,
+        value,
+    ) + 1) as u16;
+    let value =
+        read(unsafe { crate::intel_display_regs_upstream::TRANS_HBLANK(display, transcoder) });
+    mode.crtc_hblank_start = (crate::intel_display_reg_defs_upstream::reg_field_get(
+        crate::intel_display_regs_upstream::HBLANK_START_MASK,
+        value,
+    ) + 1) as u16;
+    mode.crtc_hblank_end = (crate::intel_display_reg_defs_upstream::reg_field_get(
+        crate::intel_display_regs_upstream::HBLANK_END_MASK,
+        value,
+    ) + 1) as u16;
+    let value =
+        read(unsafe { crate::intel_display_regs_upstream::TRANS_HSYNC(display, transcoder) });
+    mode.crtc_hsync_start = (crate::intel_display_reg_defs_upstream::reg_field_get(
+        crate::intel_display_regs_upstream::HSYNC_START_MASK,
+        value,
+    ) + 1) as u16;
+    mode.crtc_hsync_end = (crate::intel_display_reg_defs_upstream::reg_field_get(
+        crate::intel_display_regs_upstream::HSYNC_END_MASK,
+        value,
+    ) + 1) as u16;
+    let value =
+        read(unsafe { crate::intel_display_regs_upstream::TRANS_VTOTAL(display, transcoder) });
+    mode.crtc_vdisplay = (crate::intel_display_reg_defs_upstream::reg_field_get(
+        crate::intel_display_regs_upstream::VACTIVE_MASK,
+        value,
+    ) + 1) as u16;
+    mode.crtc_vtotal = (crate::intel_display_reg_defs_upstream::reg_field_get(
+        crate::intel_display_regs_upstream::VTOTAL_MASK,
+        value,
+    ) + 1) as u16;
+    let value =
+        read(unsafe { crate::intel_display_regs_upstream::TRANS_VBLANK(display, transcoder) });
+    mode.crtc_vblank_start = (crate::intel_display_reg_defs_upstream::reg_field_get(
+        crate::intel_display_regs_upstream::VBLANK_START_MASK,
+        value,
+    ) + 1) as u16;
+    mode.crtc_vblank_end = (crate::intel_display_reg_defs_upstream::reg_field_get(
+        crate::intel_display_regs_upstream::VBLANK_END_MASK,
+        value,
+    ) + 1) as u16;
+    let value =
+        read(unsafe { crate::intel_display_regs_upstream::TRANS_VSYNC(display, transcoder) });
+    mode.crtc_vsync_start = (crate::intel_display_reg_defs_upstream::reg_field_get(
+        crate::intel_display_regs_upstream::VSYNC_START_MASK,
+        value,
+    ) + 1) as u16;
+    mode.crtc_vsync_end = (crate::intel_display_reg_defs_upstream::reg_field_get(
+        crate::intel_display_regs_upstream::VSYNC_END_MASK,
+        value,
+    ) + 1) as u16;
+
+    let transconf =
+        read(unsafe { crate::intel_display_regs_upstream::TRANSCONF(display, transcoder) });
+    if transconf & crate::intel_display_regs_upstream::TRANSCONF_INTERLACE_MASK_HSW != 0 {
+        mode.flags |= DRM_MODE_FLAG_INTERLACE;
+        mode.crtc_vtotal = mode.crtc_vtotal.wrapping_add(1);
+        mode.crtc_vblank_end = mode.crtc_vblank_end.wrapping_add(1);
+    }
+    if unsafe { display_ver(display) } >= DISPLAY_VER_ADLP
+        && unsafe {
+            (*state).cpu_transcoder != crate::intel_display_limits_types_upstream::TRANSCODER_EDP
+        }
+    {
+        let latency = read(unsafe {
+            crate::intel_display_regs_upstream::TRANS_SET_CONTEXT_LATENCY(display, transcoder)
+        });
+        unsafe { (*state).set_context_latency = latency as u16 };
+        mode.crtc_vblank_start = mode.crtc_vdisplay.wrapping_add(latency as u16);
+    }
+}
+
+/// Read the ADL-P pipe/transcoder register state. MST, DSI, and joiner
+/// readout are intentionally not inferred; the corresponding entry fails
+/// closed so setup cannot fabricate an active single-pipe configuration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_hsw_get_pipe_config(
+    crtc: *mut IntelCrtc,
+    state: *mut IntelCrtcState,
+) -> bool {
+    if crtc.is_null() || state.is_null() {
+        return false;
+    }
+    let display =
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*crtc).base.dev) };
+    let pipe = unsafe { (*crtc).pipe };
+    if display.is_null() || !(0..4).contains(&pipe) {
+        return false;
+    }
+    let power_set = unsafe { ptr::addr_of_mut!((*crtc).hw_readout_power_domains) };
+    if !unsafe {
+        crate::intel_display_power_upstream::intel_display_power_get_in_set_if_enabled(
+            display,
+            power_set,
+            intel_pipe_power_domain(pipe),
+        )
+    } {
+        return false;
+    }
+
+    let mut active_transcoders = 0u32;
+    let pipe_transcoder = pipe as u32;
+    if unsafe {
+        crate::intel_display_power_upstream::intel_display_power_get_in_set_if_enabled(
+            display,
+            power_set,
+            intel_transcoder_power_domain(pipe),
+        )
+    } {
+        let func = unsafe {
+            crate::intel_de_upstream::intel_de_read(
+                display,
+                crate::intel_display_regs_upstream::TRANS_DDI_FUNC_CTL(display, pipe_transcoder),
+            )
+        };
+        if func & crate::intel_display_regs_upstream::TRANS_DDI_FUNC_ENABLE != 0 {
+            active_transcoders |= 1u32 << pipe_transcoder;
+        }
+    }
+
+    // ADL-P's panel transcoder is separate from pipes A-D; it can select any
+    // of those pipes as its input.
+    let edp = crate::intel_display_limits_types_upstream::TRANSCODER_EDP as u32;
+    if unsafe {
+        crate::intel_display_power_upstream::intel_display_power_get_in_set_if_enabled(
+            display,
+            power_set,
+            intel_transcoder_power_domain(edp as i32),
+        )
+    } {
+        let func = unsafe {
+            crate::intel_de_upstream::intel_de_read(
+                display,
+                crate::intel_display_regs_upstream::TRANS_DDI_FUNC_CTL(display, edp),
+            )
+        };
+        let input = match pipe {
+            0 => crate::intel_display_regs_upstream::TRANS_DDI_EDP_INPUT_A_ONOFF,
+            1 => crate::intel_display_regs_upstream::TRANS_DDI_EDP_INPUT_B_ONOFF,
+            2 => crate::intel_display_regs_upstream::TRANS_DDI_EDP_INPUT_C_ONOFF,
+            _ => crate::intel_display_regs_upstream::TRANS_DDI_EDP_INPUT_D_ONOFF,
+        };
+        if func & crate::intel_display_regs_upstream::TRANS_DDI_FUNC_ENABLE != 0
+            && func & crate::intel_display_regs_upstream::TRANS_DDI_EDP_INPUT_MASK == input
+        {
+            active_transcoders |= 1u32 << edp;
+            if input == crate::intel_display_regs_upstream::TRANS_DDI_EDP_INPUT_A_ONOFF {
+                unsafe { (*state).pch_pfit.force_thru = true };
+            }
+        }
+    }
+
+    if active_transcoders.count_ones() != 1 {
+        unsafe {
+            crate::intel_display_power_upstream::intel_display_power_put_mask_in_set(
+                display, power_set,
+            )
+        };
+        return false;
+    }
+    let transcoder = active_transcoders.trailing_zeros() as i32;
+    unsafe { (*state).cpu_transcoder = transcoder };
+    let transconf = unsafe {
+        crate::intel_de_upstream::intel_de_read(
+            display,
+            crate::intel_display_regs_upstream::TRANSCONF(display, transcoder as u32),
+        )
+    };
+    if transconf & crate::intel_display_regs_upstream::TRANSCONF_ENABLE == 0 {
+        unsafe {
+            crate::intel_display_power_upstream::intel_display_power_put_mask_in_set(
+                display, power_set,
+            )
+        };
+        return false;
+    }
+
+    let chicken = unsafe {
+        crate::intel_de_upstream::intel_de_read(
+            display,
+            crate::intel_display_regs_upstream::CHICKEN_TRANS(display, transcoder as u32),
+        )
+    };
+    unsafe {
+        (*state).framestart_delay = (crate::intel_display_reg_defs_upstream::reg_field_get(
+            crate::intel_display_regs_upstream::HSW_FRAME_START_DELAY_MASK,
+            chicken,
+        ) + 1) as u8;
+        intel_read_pipe_timings(display, state);
+        (*state).pipe_src = tk_drm_upstream::drm_rect_types::DrmRect {
+            x1: 0,
+            y1: 0,
+            x2: 0,
+            y2: 0,
+        };
+        let pipesrc = crate::intel_de_upstream::intel_de_read(
+            display,
+            crate::intel_display_regs_upstream::PIPESRC(display, pipe as u32),
+        );
+        tk_drm_upstream::drm_rect_upstream::drm_rect_init(
+            &mut (*state).pipe_src,
+            0,
+            0,
+            (crate::intel_display_reg_defs_upstream::reg_field_get(
+                crate::intel_display_regs_upstream::PIPESRC_WIDTH_MASK,
+                pipesrc,
+            ) + 1) as i32,
+            (crate::intel_display_reg_defs_upstream::reg_field_get(
+                crate::intel_display_regs_upstream::PIPESRC_HEIGHT_MASK,
+                pipesrc,
+            ) + 1) as i32,
+        );
+        let misc = crate::intel_de_upstream::intel_de_read(
+            display,
+            crate::intel_display_regs_upstream::PIPE_MISC(pipe as u32),
+        );
+        (*state).output_format = if misc
+            & crate::intel_display_regs_upstream::PIPE_MISC_YUV420_ENABLE
+            != 0
+        {
+            crate::intel_display_types_upstream::INTEL_OUTPUT_FORMAT_YCBCR420
+        } else if misc & crate::intel_display_regs_upstream::PIPE_MISC_OUTPUT_COLORSPACE_YUV != 0 {
+            crate::intel_display_types_upstream::INTEL_OUTPUT_FORMAT_YCBCR444
+        } else {
+            crate::intel_display_types_upstream::INTEL_OUTPUT_FORMAT_RGB
+        };
+        (*state).sink_format = (*state).output_format;
+        let wm = crate::intel_de_upstream::intel_de_read(
+            display,
+            crate::intel_display_regs_upstream::WM_LINETIME(pipe as u32),
+        );
+        (*state).linetime = crate::intel_display_reg_defs_upstream::reg_field_get(
+            crate::intel_display_regs_upstream::HSW_LINETIME_MASK,
+            wm,
+        ) as u16;
+    }
+    unsafe { crate::intel_color_upstream::intel_color_get_config(state) };
+
+    let pfit_domain =
+        crate::intel_display_power_types_upstream::POWER_DOMAIN_PIPE_PANEL_FITTER_A + pipe as u32;
+    if unsafe {
+        crate::intel_display_power_upstream::intel_display_power_get_in_set_if_enabled(
+            display,
+            power_set,
+            pfit_domain,
+        )
+    } {
+        unsafe { crate::skl_scaler_upstream::skl_scaler_get_config(state) };
+    }
+    unsafe {
+        (*state).pixel_multiplier = if transcoder == edp as i32 {
+            1
+        } else {
+            crate::intel_de_upstream::intel_de_read(
+                display,
+                crate::intel_display_regs_upstream::TRANS_MULT(display, transcoder as u32),
+            ) + 1
+        };
+        crate::intel_display_power_upstream::intel_display_power_put_mask_in_set(
+            display, power_set,
+        );
+    }
+    true
+}
+
+unsafe fn intel_set_pipe_src_size(state: *const IntelCrtcState) {
+    if state.is_null() || unsafe { (*state).uapi.crtc.is_null() } {
+        return;
+    }
+    let crtc = unsafe { (*state).uapi.crtc.cast::<IntelCrtc>() };
+    let display =
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*crtc).base.dev) };
+    if display.is_null() {
+        return;
+    }
+    let width = unsafe { (*state).pipe_src.x2 - (*state).pipe_src.x1 };
+    let height = unsafe { (*state).pipe_src.y2 - (*state).pipe_src.y1 };
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    unsafe {
+        crate::intel_de_upstream::intel_de_write(
+            display,
+            crate::intel_display_regs_upstream::PIPESRC(display, (*crtc).pipe as u32),
+            crate::intel_display_regs_upstream::PIPESRC_WIDTH(width as u32 - 1)
+                | crate::intel_display_regs_upstream::PIPESRC_HEIGHT(height as u32 - 1),
+        );
+    }
+}
+
+unsafe fn intel_set_pipe_misc(state: *const IntelCrtcState) {
+    if state.is_null() || unsafe { (*state).uapi.crtc.is_null() } {
+        return;
+    }
+    let crtc = unsafe { (*state).uapi.crtc.cast::<IntelCrtc>() };
+    let display =
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*crtc).base.dev) };
+    if display.is_null() {
+        return;
+    }
+    let mut val = match unsafe { (*state).pipe_bpp } {
+        18 => crate::intel_display_regs_upstream::PIPE_MISC_BPC_6,
+        24 => crate::intel_display_regs_upstream::PIPE_MISC_BPC_8,
+        30 => crate::intel_display_regs_upstream::PIPE_MISC_BPC_10,
+        36 if unsafe { display_ver(display) } >= DISPLAY_VER_ADLP => {
+            crate::intel_display_regs_upstream::PIPE_MISC_BPC_12_ADLP
+        }
+        _ => return,
+    };
+    unsafe {
+        if (*state).dither {
+            val |= crate::intel_display_regs_upstream::PIPE_MISC_DITHER_ENABLE
+                | crate::intel_display_regs_upstream::PIPE_MISC_DITHER_TYPE_SP;
+        }
+        if (*state).output_format != crate::intel_display_types_upstream::INTEL_OUTPUT_FORMAT_RGB {
+            val |= crate::intel_display_regs_upstream::PIPE_MISC_OUTPUT_COLORSPACE_YUV;
+        }
+        if (*state).output_format
+            == crate::intel_display_types_upstream::INTEL_OUTPUT_FORMAT_YCBCR420
+        {
+            val |= crate::intel_display_regs_upstream::PIPE_MISC_YUV420_ENABLE
+                | crate::intel_display_regs_upstream::PIPE_MISC_YUV420_MODE_FULL_BLEND;
+        }
+        if unsafe { display_ver(display) } >= 12 {
+            val |= crate::intel_display_regs_upstream::PIPE_MISC_PIXEL_ROUNDING_TRUNC;
+        }
+        crate::intel_de_upstream::intel_de_write(
+            display,
+            crate::intel_display_regs_upstream::PIPE_MISC((*crtc).pipe as u32),
+            val,
+        );
+    }
+}
+
+unsafe fn intel_set_transcoder_timings(state: *const IntelCrtcState) {
+    if state.is_null() || unsafe { (*state).uapi.crtc.is_null() } {
+        return;
+    }
+    let crtc = unsafe { (*state).uapi.crtc.cast::<IntelCrtc>() };
+    let display =
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*crtc).base.dev) };
+    if display.is_null() {
+        return;
+    }
+    let trans = unsafe { (*state).cpu_transcoder as u32 };
+    let mode = unsafe { &(*state).hw.adjusted_mode };
+    unsafe {
+        if display_ver(display) >= DISPLAY_VER_ADLP {
+            crate::intel_de_upstream::intel_de_write(
+                display,
+                crate::intel_display_regs_upstream::TRANS_SET_CONTEXT_LATENCY(display, trans),
+                (*state).set_context_latency as u32,
+            );
+        }
+        crate::intel_de_upstream::intel_de_write(
+            display,
+            crate::intel_display_regs_upstream::TRANS_HTOTAL(display, trans),
+            crate::intel_display_regs_upstream::HACTIVE(mode.crtc_hdisplay as u32 - 1)
+                | crate::intel_display_regs_upstream::HTOTAL(mode.crtc_htotal as u32 - 1),
+        );
+        crate::intel_de_upstream::intel_de_write(
+            display,
+            crate::intel_display_regs_upstream::TRANS_HBLANK(display, trans),
+            crate::intel_display_regs_upstream::HBLANK_START(mode.crtc_hblank_start as u32 - 1)
+                | crate::intel_display_regs_upstream::HBLANK_END(mode.crtc_hblank_end as u32 - 1),
+        );
+        crate::intel_de_upstream::intel_de_write(
+            display,
+            crate::intel_display_regs_upstream::TRANS_HSYNC(display, trans),
+            crate::intel_display_regs_upstream::HSYNC_START(mode.crtc_hsync_start as u32 - 1)
+                | crate::intel_display_regs_upstream::HSYNC_END(mode.crtc_hsync_end as u32 - 1),
+        );
+        crate::intel_de_upstream::intel_de_write(
+            display,
+            crate::intel_display_regs_upstream::TRANS_VTOTAL(display, trans),
+            crate::intel_display_regs_upstream::VACTIVE(mode.crtc_vdisplay as u32 - 1)
+                | crate::intel_display_regs_upstream::VTOTAL(mode.crtc_vtotal as u32 - 1),
+        );
+        let vblank_start = if display_ver(display) >= DISPLAY_VER_ADLP {
+            0
+        } else {
+            mode.crtc_vblank_start as u32 - 1
+        };
+        crate::intel_de_upstream::intel_de_write(
+            display,
+            crate::intel_display_regs_upstream::TRANS_VBLANK(display, trans),
+            crate::intel_display_regs_upstream::VBLANK_START(vblank_start)
+                | crate::intel_display_regs_upstream::VBLANK_END(mode.crtc_vblank_end as u32 - 1),
+        );
+        crate::intel_de_upstream::intel_de_write(
+            display,
+            crate::intel_display_regs_upstream::TRANS_VSYNC(display, trans),
+            crate::intel_display_regs_upstream::VSYNC_START(mode.crtc_vsync_start as u32 - 1)
+                | crate::intel_display_regs_upstream::VSYNC_END(mode.crtc_vsync_end as u32 - 1),
+        );
+    }
+}
+
+/// Public C ABI called by the DDI encoder enable/disable path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_enable_transcoder(state: *const IntelCrtcState) {
+    if state.is_null() || unsafe { (*state).uapi.crtc.is_null() } {
+        return;
+    }
+    let crtc = unsafe { (*state).uapi.crtc.cast::<IntelCrtc>() };
+    let display =
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*crtc).base.dev) };
+    if display.is_null() {
+        return;
+    }
+    let trans = unsafe { (*state).cpu_transcoder as u32 };
+    let reg = unsafe { crate::intel_display_regs_upstream::TRANSCONF(display, trans) };
+    let mut value = unsafe { crate::intel_de_upstream::intel_de_read(display, reg) };
+    if unsafe { (*state).dsc.compression_enable } {
+        value &= !crate::intel_display_regs_upstream::TRANSCONF_PIXEL_COUNT_SCALING_MASK;
+        value |= crate::intel_display_regs_upstream::TRANSCONF_PIXEL_COUNT_SCALING_X4;
+    }
+    unsafe {
+        crate::intel_de_upstream::intel_de_write(
+            display,
+            reg,
+            value | crate::intel_display_regs_upstream::TRANSCONF_ENABLE,
+        );
+        crate::intel_de_upstream::intel_de_posting_read(display, reg);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_disable_transcoder(state: *const IntelCrtcState) {
+    if state.is_null() || unsafe { (*state).uapi.crtc.is_null() } {
+        return;
+    }
+    let crtc = unsafe { (*state).uapi.crtc.cast::<IntelCrtc>() };
+    let display =
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*crtc).base.dev) };
+    if display.is_null() {
+        return;
+    }
+    let reg = unsafe {
+        crate::intel_display_regs_upstream::TRANSCONF(display, (*state).cpu_transcoder as u32)
+    };
+    unsafe {
+        let mut value = crate::intel_de_upstream::intel_de_read(display, reg);
+        if (*state).dsc.compression_enable {
+            value &= !crate::intel_display_regs_upstream::TRANSCONF_PIXEL_COUNT_SCALING_MASK;
+        }
+        value &= !crate::intel_display_regs_upstream::TRANSCONF_ENABLE;
+        crate::intel_de_upstream::intel_de_write(display, reg, value);
+        crate::intel_de_upstream::intel_de_posting_read(display, reg);
+    }
+}
+
+unsafe extern "C" fn intel_hsw_crtc_get_power_domain_set(
+    state: *const IntelCrtcState,
+    wanted: *mut crate::intel_display_power_types_upstream::IntelDisplayPowerDomainSet,
+) {
+    if state.is_null() || wanted.is_null() || unsafe { (*state).uapi.crtc.is_null() } {
+        return;
+    }
+    unsafe { ptr::write_bytes(wanted, 0, 1) };
+    if unsafe { !(*state).hw.active } {
+        return;
+    }
+    let crtc = unsafe { (*state).uapi.crtc.cast::<IntelCrtc>() };
+    let dev = unsafe { (*crtc).base.dev };
+    let display = unsafe { crate::intel_display_conversion_upstream::__drm_to_display(dev) };
+    if dev.is_null() || display.is_null() {
+        return;
+    }
+    unsafe { intel_power_domain_set_mask_add(wanted, intel_pipe_power_domain((*crtc).pipe)) };
+    unsafe {
+        intel_power_domain_set_mask_add(
+            wanted,
+            intel_transcoder_power_domain((*state).cpu_transcoder),
+        )
+    };
+    if unsafe { (*state).pch_pfit.enabled || (*state).pch_pfit.force_thru } {
+        unsafe {
+            intel_power_domain_set_mask_add(
+                wanted,
+                crate::intel_display_power_types_upstream::POWER_DOMAIN_PIPE_PANEL_FITTER_A
+                    + unsafe { (*crtc).pipe } as u32,
+            )
+        };
+    }
+    if unsafe { (*state).has_audio && has_ddi(display) } {
+        unsafe {
+            intel_power_domain_set_mask_add(
+                wanted,
+                crate::intel_display_power_types_upstream::POWER_DOMAIN_AUDIO_MMIO,
+            )
+        };
+    }
+    if unsafe { !(*state).intel_dpll.is_null() } {
+        unsafe {
+            intel_power_domain_set_mask_add(
+                wanted,
+                crate::intel_display_power_types_upstream::POWER_DOMAIN_DISPLAY_CORE,
+            )
+        };
+    }
+    if unsafe { (*state).dsc.compression_enable } {
+        unsafe {
+            intel_power_domain_set_mask_add(
+                wanted,
+                crate::intel_display_power_types_upstream::POWER_DOMAIN_TRANSCODER_VDSC_PW2,
+            )
+        };
+    }
+    unsafe {
+        for_each_encoder(display, |encoder| {
+            let index = (*encoder).base.index;
+            if index < 32 && (*state).uapi.encoder_mask & (1u32 << index) != 0 {
+                intel_power_domain_set_mask_add(wanted, (*encoder).power_domain);
+            }
+        });
+    }
+}
+
+unsafe fn intel_power_domain_set_mask_add(
+    set: *mut crate::intel_display_power_types_upstream::IntelDisplayPowerDomainSet,
+    domain: u32,
+) {
+    if set.is_null() {
+        return;
+    }
+    let word = (domain / 64) as usize;
+    if word < 2 {
+        unsafe { (*set).mask.bits[word] |= 1u64 << (domain % 64) };
+    }
+}
+
+unsafe fn intel_modeset_get_crtc_power_domains(
+    state: *const IntelCrtcState,
+    put: *mut crate::intel_display_power_types_upstream::IntelPowerDomainMask,
+) {
+    if state.is_null() || put.is_null() || unsafe { (*state).uapi.crtc.is_null() } {
+        return;
+    }
+    let crtc = unsafe { (*state).uapi.crtc.cast::<IntelCrtc>() };
+    let display =
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*crtc).base.dev) };
+    if display.is_null() {
+        return;
+    }
+    let mut wanted = unsafe {
+        core::mem::MaybeUninit::<
+            crate::intel_display_power_types_upstream::IntelDisplayPowerDomainSet,
+        >::zeroed()
+        .assume_init()
+    };
+    unsafe { intel_hsw_crtc_get_power_domain_set(state, &mut wanted) };
+    let old = unsafe { &mut (*crtc).enabled_power_domains.mask };
+    for domain in 0..crate::intel_display_power_types_upstream::POWER_DOMAIN_NUM {
+        let word = (domain / 64) as usize;
+        let bit = 1u64 << (domain % 64);
+        let had = old.bits[word] & bit != 0;
+        let need = wanted.mask.bits[word] & bit != 0;
+        if need && !had {
+            unsafe {
+                crate::intel_display_power_upstream::intel_display_power_get_in_set(
+                    display,
+                    &mut (*crtc).enabled_power_domains,
+                    domain,
+                )
+            };
+        } else if had && !need {
+            unsafe { (*put).bits[word] |= bit };
+        }
+    }
+}
+
+unsafe fn intel_modeset_put_crtc_power_domains(
+    crtc: *mut IntelCrtc,
+    put: *mut crate::intel_display_power_types_upstream::IntelPowerDomainMask,
+) {
+    if crtc.is_null() || put.is_null() {
+        return;
+    }
+    let display =
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*crtc).base.dev) };
+    if !display.is_null() {
+        let set =
+            put.cast::<crate::intel_display_power_types_upstream::IntelDisplayPowerDomainSet>();
+        unsafe {
+            crate::intel_display_power_upstream::intel_display_power_put_mask_in_set(display, set)
+        };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_hsw_crtc_enable(state: *mut IntelAtomicState, crtc: *mut IntelCrtc) {
+    if state.is_null() || crtc.is_null() {
+        return;
+    }
+    let display =
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*crtc).base.dev) };
+    let new = unsafe { crate::intel_atomic_upstream::intel_atomic_get_new_crtc_state(state, crtc) };
+    if display.is_null() || new.is_null() || unsafe { (*crtc).active } {
+        return;
+    }
+    unsafe { crate::intel_dmc_upstream::intel_dmc_enable_pipe(new) };
+    unsafe {
+        for_each_new_connector_in_state(state, |_, connector_state| {
+            if (*connector_state).crtc != &mut (*crtc).base {
+                return 0;
+            }
+            let encoder = (*connector_state).best_encoder.cast::<IntelEncoder>();
+            if encoder.is_null() {
+                return -EINVAL;
+            }
+            if let Some(callback) = (*encoder).pre_pll_enable {
+                callback(state, encoder, new, connector_state);
+            }
+            0
+        });
+    }
+    if unsafe { !(*new).intel_dpll.is_null() } {
+        unsafe { crate::intel_dpll_mgr_upstream::intel_dpll_enable(new) };
+    }
+    unsafe {
+        for_each_new_connector_in_state(state, |_, connector_state| {
+            if (*connector_state).crtc != &mut (*crtc).base {
+                return 0;
+            }
+            let encoder = (*connector_state).best_encoder.cast::<IntelEncoder>();
+            if encoder.is_null() {
+                return -EINVAL;
+            }
+            if let Some(callback) = (*encoder).pre_enable {
+                callback(state, encoder, new, connector_state);
+            }
+            0
+        });
+    }
+    unsafe {
+        intel_set_pipe_src_size(new);
+        intel_set_pipe_misc(new);
+        intel_set_transcoder_timings(new);
+        if (*new).cpu_transcoder != crate::intel_display_limits_types_upstream::TRANSCODER_EDP {
+            crate::intel_de_upstream::intel_de_write(
+                display,
+                crate::intel_display_regs_upstream::TRANS_MULT(
+                    display,
+                    (*new).cpu_transcoder as u32,
+                ),
+                (*new).pixel_multiplier.saturating_sub(1),
+            );
+        }
+        crate::intel_de_upstream::intel_de_rmw(
+            display,
+            crate::intel_display_regs_upstream::CHICKEN_TRANS(
+                display,
+                (*new).cpu_transcoder as u32,
+            ),
+            crate::intel_display_regs_upstream::HSW_FRAME_START_DELAY_MASK,
+            crate::intel_display_regs_upstream::HSW_FRAME_START_DELAY(
+                (*new).framestart_delay.saturating_sub(1) as u32,
+            ),
+        );
+        let mut transconf = crate::intel_display_regs_upstream::TRANSCONF_INTERLACE_PROGRESSIVE;
+        if (*new).hw.adjusted_mode.flags & tk_drm_upstream::uapi_drm_consts::DRM_MODE_FLAG_INTERLACE
+            != 0
+        {
+            transconf = crate::intel_display_regs_upstream::TRANSCONF_INTERLACE_W_SYNC_SHIFT;
+        }
+        transconf |= crate::intel_display_regs_upstream::TRANSCONF_GAMMA_MODE((*new).gamma_mode);
+        let reg =
+            crate::intel_display_regs_upstream::TRANSCONF(display, (*new).cpu_transcoder as u32);
+        crate::intel_de_upstream::intel_de_write(display, reg, transconf);
+        crate::intel_de_upstream::intel_de_posting_read(display, reg);
+        (*crtc).active = true;
+        if (*new).pch_pfit.enabled {
+            crate::skl_scaler_upstream::skl_pfit_enable(new);
+        }
+        crate::intel_color_upstream::intel_color_modeset(new);
+        (*new).linetime = ((i64::from((*new).hw.pipe_mode.crtc_htotal) * 8_000
+            + i64::from((*new).pixel_rate).max(1)
+            - 1)
+            / i64::from((*new).pixel_rate).max(1))
+        .clamp(0, 0x1ff) as u16;
+        let _ = crate::intel_wm_upstream::intel_initial_watermarks(state, crtc);
+    }
+    unsafe {
+        for_each_new_connector_in_state(state, |_, connector_state| {
+            if (*connector_state).crtc != &mut (*crtc).base {
+                return 0;
+            }
+            let encoder = (*connector_state).best_encoder.cast::<IntelEncoder>();
+            if encoder.is_null() {
+                return -EINVAL;
+            }
+            if let Some(callback) = (*encoder).enable {
+                callback(state, encoder, new, connector_state);
+            }
+            if (*new).has_audio {
+                if let Some(callback) = (*encoder).audio_enable {
+                    callback(encoder, new, connector_state);
+                }
+            }
+            0
+        });
+        crate::intel_fifo_underrun_upstream::intel_set_cpu_fifo_underrun_reporting(
+            display,
+            (*crtc).pipe,
+            true,
+        );
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_hsw_crtc_disable(
+    state: *mut IntelAtomicState,
+    crtc: *mut IntelCrtc,
+) {
+    if state.is_null() || crtc.is_null() {
+        return;
+    }
+    let display =
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*crtc).base.dev) };
+    let old = unsafe { crate::intel_atomic_upstream::intel_atomic_get_old_crtc_state(state, crtc) };
+    if display.is_null() || old.is_null() {
+        return;
+    }
+    unsafe {
+        crate::intel_fifo_underrun_upstream::intel_set_cpu_fifo_underrun_reporting(
+            display,
+            (*crtc).pipe,
+            false,
+        );
+        let count = (*state).base.num_connector.max(0) as usize;
+        for index in 0..count {
+            let entry = (*state).base.connectors.add(index);
+            let connector_state = (*entry).old_state;
+            if connector_state.is_null() || (*connector_state).crtc != &mut (*crtc).base {
+                continue;
+            }
+            let encoder = (*connector_state).best_encoder.cast::<IntelEncoder>();
+            if encoder.is_null() {
+                continue;
+            }
+            if let Some(callback) = (*encoder).disable {
+                callback(state, encoder, old, connector_state);
+            }
+            if let Some(callback) = (*encoder).post_disable {
+                callback(state, encoder, old, connector_state);
+            }
+        }
+        crate::intel_dpll_mgr_upstream::intel_dpll_disable(old);
+        for index in 0..count {
+            let entry = (*state).base.connectors.add(index);
+            let connector_state = (*entry).old_state;
+            if connector_state.is_null() || (*connector_state).crtc != &mut (*crtc).base {
+                continue;
+            }
+            let encoder = (*connector_state).best_encoder.cast::<IntelEncoder>();
+            if !encoder.is_null() {
+                if let Some(callback) = (*encoder).post_pll_disable {
+                    callback(state, encoder, old, connector_state);
+                }
+            }
+        }
+        crate::intel_dmc_upstream::intel_dmc_disable_pipe(old);
+        (*crtc).active = false;
+        crate::intel_fifo_underrun_upstream::intel_set_cpu_fifo_underrun_reporting(
+            display,
+            (*crtc).pipe,
+            true,
+        );
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_skl_commit_modeset_enables(state: *mut IntelAtomicState) {
+    if state.is_null() || unsafe { (*state).base.dev.is_null() || (*state).base.crtcs.is_null() } {
+        return;
+    }
+    let dev = unsafe { (*state).base.dev };
+    let count = unsafe { (*dev).mode_config.num_crtc.max(0) as usize };
+    for index in 0..count {
+        let entry = unsafe { (*state).base.crtcs.add(index) };
+        if unsafe { (*entry).ptr.is_null() || (*entry).new_state.is_null() } {
+            continue;
+        }
+        let crtc = unsafe { (*entry).ptr.cast::<IntelCrtc>() };
+        let new = unsafe { (*entry).new_state.cast::<IntelCrtcState>() };
+        if !unsafe { (*new).hw.active } {
+            continue;
+        }
+        if unsafe { (*new).use_dsb && !(*new).dsb_commit.is_null() } {
+            unsafe { crate::intel_dsb_upstream::intel_dsb_commit((*new).dsb_commit.cast()) };
+            continue;
+        }
+        if unsafe { crate::intel_atomic_upstream::intel_crtc_needs_modeset(new) } {
+            unsafe { intel_hsw_crtc_enable(state, crtc) };
+        } else {
+            unsafe { crate::intel_crtc_upstream::intel_pipe_update_start(state, crtc) };
+            if unsafe { intel_crtc_needs_fastset(new) } {
+                unsafe {
+                    intel_set_pipe_src_size(new);
+                    intel_set_pipe_misc(new);
+                    intel_set_transcoder_timings(new);
+                }
+                let connectors = unsafe { (*state).base.num_connector.max(0) as usize };
+                for conn_index in 0..connectors {
+                    let conn = unsafe { (*state).base.connectors.add(conn_index) };
+                    if unsafe { (*conn).new_state.is_null() || (*conn).ptr.is_null() } {
+                        continue;
+                    }
+                    let connector_state = unsafe { (*conn).new_state };
+                    if unsafe { (*connector_state).crtc != &mut (*crtc).base } {
+                        continue;
+                    }
+                    let encoder = unsafe { (*connector_state).best_encoder.cast::<IntelEncoder>() };
+                    if !encoder.is_null() {
+                        if let Some(update) = unsafe { (*encoder).update_pipe } {
+                            unsafe { update(state, encoder, new, connector_state) };
+                        }
+                    }
+                }
+            }
+            if unsafe { intel_crtc_needs_color_update(new) } {
+                unsafe {
+                    crate::intel_color_upstream::intel_color_commit_noarm(ptr::null_mut(), new);
+                    crate::intel_color_upstream::intel_color_commit_arm(ptr::null_mut(), new);
+                }
+            }
+            unsafe { crate::intel_wm_upstream::intel_atomic_update_watermarks(state, crtc) };
+        }
+        unsafe {
+            crate::intel_plane_upstream::intel_crtc_planes_update_noarm(
+                ptr::null_mut(),
+                state,
+                crtc,
+            );
+            crate::intel_plane_upstream::intel_crtc_planes_update_arm(ptr::null_mut(), state, crtc);
+            if !crate::intel_atomic_upstream::intel_crtc_needs_modeset(new) {
+                crate::intel_crtc_upstream::intel_pipe_update_end(state, crtc);
+            }
+        }
+    }
+}
+
+unsafe fn intel_disable_plane_updates(state: *mut IntelAtomicState, crtc: *mut IntelCrtc) {
+    if state.is_null() || crtc.is_null() || unsafe { (*state).base.dev.is_null() } {
+        return;
+    }
+    let new = unsafe { crate::intel_atomic_upstream::intel_atomic_get_new_crtc_state(state, crtc) };
+    if new.is_null() {
+        return;
+    }
+    let count = unsafe { (*(*state).base.dev).mode_config.num_total_plane.max(0) as usize };
+    for index in 0..count {
+        let entry = unsafe { (*state).base.planes.add(index) };
+        if unsafe { (*entry).ptr.is_null() || (*entry).new_state.is_null() } {
+            continue;
+        }
+        let plane = unsafe { (*entry).ptr.cast::<IntelPlane>() };
+        let bit = 1u8 << unsafe { (*plane).id };
+        if unsafe { (*plane).pipe != (*crtc).pipe || (*new).update_planes & bit == 0 } {
+            continue;
+        }
+        unsafe {
+            crate::intel_plane_upstream::intel_plane_disable_arm(ptr::null_mut(), plane, new)
+        };
+    }
+}
+
+unsafe fn intel_atomic_dsb_prepare(state: *mut IntelAtomicState, crtc: *mut IntelCrtc) {
+    if state.is_null() || crtc.is_null() {
+        return;
+    }
+    let display =
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*crtc).base.dev) };
+    let new = unsafe { crate::intel_atomic_upstream::intel_atomic_get_new_crtc_state(state, crtc) };
+    if display.is_null() || new.is_null() || unsafe { !(*new).hw.active } {
+        return;
+    }
+    if unsafe { (*state).base.legacy_cursor_update() } {
+        return;
+    }
+    let use_dsb = unsafe {
+        !crate::intel_atomic_upstream::intel_crtc_needs_modeset(new)
+            && !intel_crtc_needs_fastset(new)
+            && !(*new).do_async_flip
+            && !(*new).has_psr
+            && !(*new).vrr.enable
+    };
+    // FlipQ remains disabled; DSB is opportunistic. intel_dsb_prepare()
+    // validates platform/runtime support and falls back to regular writes.
+    unsafe { (*new).use_flipq = false };
+    unsafe { (*new).use_dsb = use_dsb };
+    unsafe { crate::intel_color_upstream::intel_color_prepare_commit(state, crtc) };
+}
+
+unsafe fn intel_atomic_dsb_finish(state: *mut IntelAtomicState, crtc: *mut IntelCrtc) {
+    if state.is_null() || crtc.is_null() {
+        return;
+    }
+    let display =
+        unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*crtc).base.dev) };
+    let new = unsafe { crate::intel_atomic_upstream::intel_atomic_get_new_crtc_state(state, crtc) };
+    if display.is_null() || new.is_null() {
+        return;
+    }
+    if unsafe { !(*new).use_dsb && (*new).dsb_color.is_null() } {
+        return;
+    }
+    let size = if unsafe { (*new).use_dsb && (*new).plane_color_changed } {
+        8192
+    } else if unsafe { (*new).use_dsb } {
+        1024
+    } else {
+        16
+    };
+    let dsb = unsafe { crate::intel_dsb_upstream::intel_dsb_prepare(state, crtc, 0, size) };
+    if dsb.is_null() {
+        unsafe { (*new).use_dsb = false };
+        unsafe { crate::intel_color_upstream::intel_color_cleanup_commit(new) };
+        return;
+    }
+    unsafe { (*new).dsb_commit = dsb.cast::<c_void>() };
+    if unsafe { (*new).use_dsb } {
+        if unsafe { intel_crtc_needs_color_update(new) } {
+            unsafe { crate::intel_color_upstream::intel_color_commit_noarm(dsb.cast(), new) };
+        }
+        unsafe {
+            crate::intel_plane_upstream::intel_crtc_planes_update_noarm(dsb.cast(), state, crtc);
+            crate::intel_dsb_upstream::intel_dsb_vblank_evade(state, dsb);
+        }
+        if unsafe { intel_crtc_needs_color_update(new) } {
+            unsafe { crate::intel_color_upstream::intel_color_commit_arm(dsb.cast(), new) };
+        }
+        unsafe {
+            crate::intel_plane_upstream::intel_crtc_planes_update_arm(dsb.cast(), state, crtc);
+            crate::skl_scaler_upstream::skl_detach_scalers(dsb.cast(), new);
+            crate::intel_dsb_upstream::intel_dsb_wait_vblanks(dsb, 1);
+        }
+    }
+    unsafe {
+        if crate::intel_color_upstream::intel_color_uses_chained_dsb(new) {
+            crate::intel_dsb_upstream::intel_dsb_chain(state, dsb, (*new).dsb_color.cast(), true);
+        } else if crate::intel_color_upstream::intel_color_uses_gosub_dsb(new) {
+            crate::intel_dsb_upstream::intel_dsb_gosub(dsb, (*new).dsb_color.cast());
+        }
+        if (*new).use_dsb {
+            crate::intel_dsb_upstream::intel_dsb_interrupt(dsb);
+        }
+        crate::intel_dsb_upstream::intel_dsb_finish(dsb);
+    }
+}
+
+unsafe fn intel_atomic_dsb_wait_commit(state: *mut IntelCrtcState) {
+    if state.is_null() {
+        return;
+    }
+    unsafe {
+        if !(*state).dsb_commit.is_null() {
+            crate::intel_dsb_upstream::intel_dsb_wait((*state).dsb_commit.cast());
+        }
+        crate::intel_color_upstream::intel_color_wait_commit(state);
+    }
+}
+
+unsafe fn intel_atomic_dsb_cleanup(state: *mut IntelCrtcState) {
+    if state.is_null() {
+        return;
+    }
+    unsafe {
+        if !(*state).dsb_commit.is_null() {
+            crate::intel_dsb_upstream::intel_dsb_cleanup((*state).dsb_commit.cast());
+            (*state).dsb_commit = ptr::null_mut();
+        }
+        crate::intel_color_upstream::intel_color_cleanup_commit(state);
+    }
+}
+
+unsafe fn intel_encoders_update_prepare(state: *mut IntelAtomicState) {
+    if state.is_null() || unsafe { (*state).base.dev.is_null() } {
+        return;
+    }
+    let dev = unsafe { (*state).base.dev };
+    let display = unsafe { crate::intel_display_conversion_upstream::__drm_to_display(dev) };
+    if display.is_null() || unsafe { (*display).dpll.mgr.is_null() } {
+        return;
+    }
+    let count = unsafe { (*dev).mode_config.num_crtc.max(0) as usize };
+    for index in 0..count {
+        let entry = unsafe { (*state).base.crtcs.add(index) };
+        if unsafe { (*entry).new_state.is_null() || (*entry).old_state.is_null() } {
+            continue;
+        }
+        let new = unsafe { (*entry).new_state.cast::<IntelCrtcState>() };
+        let old = unsafe { (*entry).old_state.cast::<IntelCrtcState>() };
+        if unsafe { crate::intel_atomic_upstream::intel_crtc_needs_modeset(new) } {
+            continue;
+        }
+        unsafe {
+            (*new).intel_dpll = (*old).intel_dpll;
+            ptr::copy_nonoverlapping(
+                ptr::addr_of!((*old).dpll_hw_state),
+                ptr::addr_of_mut!((*new).dpll_hw_state),
+                1,
+            );
+        }
+    }
+}
+
+unsafe fn intel_send_disabled_crtc_events(state: *mut IntelAtomicState) {
+    if state.is_null() || unsafe { (*state).base.dev.is_null() || (*state).base.crtcs.is_null() } {
+        return;
+    }
+    let dev = unsafe { (*state).base.dev };
+    let count = unsafe { (*dev).mode_config.num_crtc.max(0) as usize };
+    for index in 0..count {
+        let entry = unsafe { (*state).base.crtcs.add(index) };
+        if unsafe { (*entry).ptr.is_null() || (*entry).new_state.is_null() } {
+            continue;
+        }
+        let crtc = unsafe { (*entry).ptr.cast::<IntelCrtc>() };
+        let new = unsafe { (*entry).new_state.cast::<IntelCrtcState>() };
+        if !unsafe {
+            crate::intel_atomic_upstream::intel_crtc_needs_modeset(new)
+                && !(*new).hw.active
+                && !(*new).uapi.event.is_null()
+        } {
+            continue;
+        }
+        unsafe {
+            tk_linux_kapi::locks::spin_lock_irq(&mut (*dev).event_lock);
+            tk_drm_upstream::drm_vblank_upstream::drm_crtc_send_vblank_event(
+                &mut (*crtc).base,
+                (*new).uapi.event,
+            );
+            tk_linux_kapi::locks::spin_unlock_irq(&mut (*dev).event_lock);
+            (*new).uapi.event = ptr::null_mut();
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_atomic_commit_tail(atomic: *mut DrmAtomicCommit) {
+    if atomic.is_null() || unsafe { (*atomic).dev.is_null() } {
+        return;
+    }
+    let state = atomic.cast::<IntelAtomicState>();
+    let dev = unsafe { (*atomic).dev };
+    let display = unsafe { crate::intel_display_conversion_upstream::__drm_to_display(dev) };
+    if display.is_null() {
+        return;
+    }
+    let crtc_count = unsafe { (*dev).mode_config.num_crtc.max(0) as usize };
+    for index in 0..crtc_count {
+        let entry = unsafe { (*atomic).crtcs.add(index) };
+        if unsafe { !(*entry).ptr.is_null() && !(*entry).new_state.is_null() } {
+            unsafe {
+                intel_atomic_dsb_prepare(state, (*entry).ptr.cast::<IntelCrtc>());
+            }
+        }
+    }
+    // Match intel_atomic_commit_fence_wait() while also releasing all DRM
+    // plane fence references before the old framebuffer state is cleaned up.
+    let _ = unsafe {
+        tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_wait_for_fences(
+            dev, atomic, false,
+        )
+    };
+    for index in 0..crtc_count {
+        let entry = unsafe { (*atomic).crtcs.add(index) };
+        if unsafe { !(*entry).ptr.is_null() && !(*entry).new_state.is_null() } {
+            unsafe {
+                intel_atomic_dsb_finish(state, (*entry).ptr.cast::<IntelCrtc>());
+            }
+        }
+    }
+    unsafe {
+        tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_wait_for_dependencies(
+            atomic,
+        );
+        crate::intel_global_state_upstream::intel_atomic_global_state_wait_for_dependencies(state);
+    }
+    let dc_wakeref = unsafe {
+        crate::intel_display_power_upstream::intel_display_power_get(
+            display,
+            crate::intel_display_power_types_upstream::POWER_DOMAIN_DC_OFF,
+        )
+    };
+    let mut put_domains = unsafe {
+        core::mem::MaybeUninit::<
+            [crate::intel_display_power_types_upstream::IntelPowerDomainMask;
+                I915_MAX_PIPES as usize],
+        >::zeroed()
+        .assume_init()
+    };
+    for index in 0..crtc_count.min(I915_MAX_PIPES as usize) {
+        let entry = unsafe { (*atomic).crtcs.add(index) };
+        if unsafe { (*entry).ptr.is_null() || (*entry).new_state.is_null() } {
+            continue;
+        }
+        let crtc = unsafe { (*entry).ptr.cast::<IntelCrtc>() };
+        let new = unsafe { (*entry).new_state.cast::<IntelCrtcState>() };
+        if unsafe {
+            crate::intel_atomic_upstream::intel_crtc_needs_modeset(new)
+                || intel_crtc_needs_fastset(new)
+        } {
+            unsafe {
+                intel_modeset_get_crtc_power_domains(new, &mut put_domains[index]);
+            }
+        }
+        if unsafe { crate::intel_atomic_upstream::intel_crtc_needs_modeset(new) } {
+            unsafe { intel_disable_plane_updates(state, crtc) };
+            unsafe { crate::intel_crtc_upstream::intel_wait_for_vblank_workers(state) };
+            let old = unsafe { (*entry).old_state.cast::<IntelCrtcState>() };
+            if !old.is_null() && unsafe { (*old).hw.active } {
+                if let Some(disable) = unsafe { (*(*display).modeset.funcs).crtc_disable } {
+                    unsafe { disable(state, crtc) };
+                }
+            }
+        }
+        unsafe { (*crtc).config = new };
+    }
+
+    unsafe { crate::intel_pmdemand_upstream::intel_pmdemand_pre_plane_update(state.cast()) };
+    if unsafe { (*state).modeset } {
+        unsafe {
+            tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_update_legacy_modeset_state(
+                dev, atomic,
+            )
+        };
+    }
+    unsafe { crate::intel_cdclk_upstream::intel_set_cdclk_pre_plane_update(state) };
+    unsafe { crate::skl_watermark_upstream::intel_sagv_pre_plane_update(state) };
+    unsafe { intel_send_disabled_crtc_events(state) };
+    unsafe { intel_encoders_update_prepare(state) };
+    unsafe { crate::skl_watermark_upstream::intel_dbuf_pre_plane_update(state) };
+
+    if let Some(commit_enables) = unsafe { (*(*display).modeset.funcs).commit_modeset_enables } {
+        unsafe { commit_enables(state) };
+    }
+    unsafe {
+        crate::intel_crtc_upstream::intel_wait_for_vblank_workers(state);
+        tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_wait_for_flip_done(
+            dev, atomic,
+        );
+    }
+    for index in 0..crtc_count.min(I915_MAX_PIPES as usize) {
+        let entry = unsafe { (*atomic).crtcs.add(index) };
+        if unsafe { !(*entry).new_state.is_null() } {
+            unsafe { intel_atomic_dsb_wait_commit((*entry).new_state.cast::<IntelCrtcState>()) };
+        }
+    }
+    for index in 0..crtc_count.min(I915_MAX_PIPES as usize) {
+        let entry = unsafe { (*atomic).crtcs.add(index) };
+        if unsafe { (*entry).ptr.is_null() || (*entry).new_state.is_null() } {
+            continue;
+        }
+        let crtc = unsafe { (*entry).ptr.cast::<IntelCrtc>() };
+        unsafe {
+            crate::intel_wm_upstream::intel_optimize_watermarks(state, crtc);
+        }
+    }
+    unsafe {
+        crate::skl_watermark_upstream::intel_dbuf_post_plane_update(state);
+        crate::skl_watermark_upstream::intel_sagv_post_plane_update(state);
+        crate::intel_cdclk_upstream::intel_set_cdclk_post_plane_update(state);
+        crate::intel_pmdemand_upstream::intel_pmdemand_post_plane_update(state.cast());
+    }
+    for index in 0..crtc_count.min(I915_MAX_PIPES as usize) {
+        let entry = unsafe { (*atomic).crtcs.add(index) };
+        if unsafe { !(*entry).ptr.is_null() } {
+            unsafe {
+                intel_modeset_put_crtc_power_domains(
+                    (*entry).ptr.cast::<IntelCrtc>(),
+                    &mut put_domains[index],
+                );
+            }
+        }
+    }
+    unsafe {
+        tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_fake_vblank(atomic);
+        tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_commit_hw_done(atomic);
+        crate::intel_global_state_upstream::intel_atomic_global_state_commit_done(state);
+        tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_cleanup_planes(dev, atomic);
+        for index in 0..crtc_count.min(I915_MAX_PIPES as usize) {
+            let entry = (*atomic).crtcs.add(index);
+            if !(*entry).new_state.is_null() {
+                let new = (*entry).new_state.cast::<IntelCrtcState>();
+                intel_atomic_dsb_cleanup(new);
+            }
+        }
+        crate::intel_display_power_upstream::intel_display_power_put(
+            display,
+            crate::intel_display_power_types_upstream::POWER_DOMAIN_DC_OFF,
+            dc_wakeref,
+        );
+        crate::intel_display_rpm_upstream::intel_display_rpm_put(display, (*state).wakeref);
+        (*state).wakeref = ptr::null_mut();
+    }
+}
+
+unsafe extern "C" fn intel_atomic_commit_work(work: *mut tk_linux_kapi::types::WorkStruct) {
+    if work.is_null() {
+        return;
+    }
+    let atomic = unsafe {
+        work.cast::<u8>()
+            .sub(offset_of!(DrmAtomicCommit, commit_work))
+            .cast::<DrmAtomicCommit>()
+    };
+    unsafe {
+        intel_atomic_commit_tail(atomic);
+        tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_commit_cleanup_done(atomic);
+        tk_drm_upstream::drm_atomic_upstream::drm_atomic_commit_put(atomic);
+    }
+}
+
+unsafe fn intel_atomic_track_fbs(state: *mut IntelAtomicState) {
+    if state.is_null() || unsafe { (*state).base.dev.is_null() } {
+        return;
+    }
+    let dev = unsafe { (*state).base.dev };
+    let count = unsafe { (*dev).mode_config.num_total_plane.max(0) as usize };
+    for index in 0..count {
+        let entry = unsafe { (*state).base.planes.add(index) };
+        if unsafe {
+            (*entry).ptr.is_null() || (*entry).old_state.is_null() || (*entry).new_state.is_null()
+        } {
+            continue;
+        }
+        let plane = unsafe { (*entry).ptr.cast::<IntelPlane>() };
+        let old = unsafe { (*entry).old_state.cast::<IntelPlaneState>() };
+        let new = unsafe { (*entry).new_state.cast::<IntelPlaneState>() };
+        let old_fb = unsafe {
+            (*old)
+                .hw
+                .fb
+                .cast::<crate::intel_display_types_upstream::IntelFramebuffer>()
+        };
+        let new_fb = unsafe {
+            (*new)
+                .hw
+                .fb
+                .cast::<crate::intel_display_types_upstream::IntelFramebuffer>()
+        };
+        let old_front = if old_fb.is_null() {
+            ptr::null_mut()
+        } else {
+            unsafe { (*old_fb).frontbuffer }
+        };
+        let new_front = if new_fb.is_null() {
+            ptr::null_mut()
+        } else {
+            unsafe { (*new_fb).frontbuffer }
+        };
+        unsafe {
+            crate::intel_frontbuffer_upstream::intel_frontbuffer_track(
+                old_front,
+                new_front,
+                (*plane).frontbuffer_bit,
+            )
+        };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_atomic_commit(
+    dev: *mut DrmDevice,
+    atomic: *mut DrmAtomicCommit,
+    nonblock: bool,
+) -> i32 {
+    if dev.is_null() || atomic.is_null() || unsafe { (*atomic).dev != dev } {
+        return -EINVAL;
+    }
+    let display = unsafe { crate::intel_display_conversion_upstream::__drm_to_display(dev) };
+    if display.is_null()
+        || unsafe { (*display).modeset.funcs.is_null() }
+        || !unsafe {
+            crate::intel_display_driver_upstream::intel_display_driver_check_access(display)
+        }
+    {
+        return -ENODEV;
+    }
+    let state = atomic.cast::<IntelAtomicState>();
+    unsafe { (*state).wakeref = crate::intel_display_rpm_upstream::intel_display_rpm_get(display) };
+
+    let ret = unsafe {
+        tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_prepare_planes(dev, atomic)
+    };
+    if ret != 0 {
+        return cleanup_after_commit_stage_error(ret, || unsafe {
+            crate::intel_display_rpm_upstream::intel_display_rpm_put(display, (*state).wakeref);
+            (*state).wakeref = ptr::null_mut();
+        });
+    }
+    let ret = unsafe {
+        tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_setup_commit(
+            atomic, nonblock,
+        )
+    };
+    if ret != 0 {
+        return cleanup_after_commit_stage_error(ret, || unsafe {
+            tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_unprepare_planes(
+                dev, atomic,
+            );
+            crate::intel_display_rpm_upstream::intel_display_rpm_put(display, (*state).wakeref);
+            (*state).wakeref = ptr::null_mut();
+        });
+    }
+    let ret = unsafe {
+        crate::intel_global_state_upstream::intel_atomic_global_state_setup_commit(state)
+    };
+    if ret != 0 {
+        return cleanup_after_commit_stage_error(ret, || unsafe {
+            tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_unprepare_planes(
+                dev, atomic,
+            );
+            crate::intel_display_rpm_upstream::intel_display_rpm_put(display, (*state).wakeref);
+            (*state).wakeref = ptr::null_mut();
+        });
+    }
+    let ret = unsafe {
+        tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_swap_state(atomic, true)
+    };
+    if ret != 0 {
+        return cleanup_after_commit_stage_error(ret, || unsafe {
+            tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_unprepare_planes(
+                dev, atomic,
+            );
+            crate::intel_display_rpm_upstream::intel_display_rpm_put(display, (*state).wakeref);
+            (*state).wakeref = ptr::null_mut();
+        });
+    }
+    unsafe {
+        crate::intel_global_state_upstream::intel_atomic_swap_global_state(state);
+        crate::intel_dpll_mgr_upstream::intel_dpll_swap_state(state);
+        intel_atomic_track_fbs(state);
+        tk_drm_upstream::drm_atomic_upstream::drm_atomic_commit_get(atomic);
+        tk_linux_kapi::workqueue::INIT_WORK_C(&mut (*atomic).commit_work, intel_atomic_commit_work);
+    }
+    if nonblock {
+        let queue = unsafe {
+            if (*state).modeset {
+                (*display).wq.modeset
+            } else {
+                (*display).wq.flip
+            }
+        };
+        if !queue.is_null()
+            && unsafe { queue_work(queue, ptr::addr_of_mut!((*atomic).commit_work)) }
+        {
+            return 0;
+        }
+    }
+    if unsafe { (*state).modeset } {
+        let queue = unsafe { (*display).wq.modeset };
+        if !queue.is_null() {
+            unsafe { flush_workqueue(queue) };
+        }
+    }
+    unsafe { intel_atomic_commit_work(ptr::addr_of_mut!((*atomic).commit_work)) };
+    0
+}
+
+/// Linux `intel_link_compute_m_n()` with fixed 27-bit data N and 19-bit link
+/// N values. Ratios are shifted together until they fit the hardware fields.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_link_compute_m_n(
+    bpp_x16: u16,
+    nlanes: i32,
+    pixel_clock: i32,
+    link_clock: i32,
+    bw_overhead: i32,
+    mn: *mut crate::intel_display_types_upstream::IntelLinkMN,
+) {
+    if mn.is_null() || nlanes <= 0 || pixel_clock <= 0 || link_clock <= 0 || bpp_x16 == 0 {
+        return;
+    }
+    let link_symbol_size =
+        if tk_drm_upstream::drm_dp_helper_upstream::drm_dp_is_uhbr_rate(link_clock) {
+            32i64
+        } else {
+            10i64
+        };
+    let link_symbol_clock =
+        ((i64::from(link_clock) * 10 + link_symbol_size / 2) / link_symbol_size) as u32;
+    let data_m = ((i64::from(pixel_clock) * i64::from(bpp_x16) * i64::from(bw_overhead.max(0))
+        + (1_000_000i64 * 16 * 8 - 1))
+        / (1_000_000i64 * 16 * 8)) as u32;
+    let data_n = unsafe {
+        tk_drm_upstream::drm_dp_helper_upstream::drm_dp_max_dprx_data_rate(link_clock, nlanes)
+    }
+    .max(0) as u32;
+    let reduce = |numerator: u32, denominator: u32, constant_n: u32| {
+        if denominator == 0 {
+            return (0, 0);
+        }
+        let n = if constant_n != 0 {
+            constant_n
+        } else {
+            denominator
+                .next_power_of_two()
+                .min(crate::intel_display_regs_upstream::DATA_LINK_N_MAX)
+        };
+        let mut m = ((u64::from(numerator) * u64::from(n)) / u64::from(denominator)) as u32;
+        let mut n = n;
+        while m > crate::intel_display_regs_upstream::DATA_LINK_M_N_MASK
+            || n > crate::intel_display_regs_upstream::DATA_LINK_M_N_MASK
+        {
+            m >>= 1;
+            n >>= 1;
+        }
+        (m, n)
+    };
+    let (data_m, data_n) = reduce(data_m, data_n, 0x0800_0000);
+    let (link_m, link_n) = reduce(pixel_clock as u32, link_symbol_clock, 0x0008_0000);
+    unsafe {
+        (*mn).tu = 64;
+        (*mn).data_m = data_m;
+        (*mn).data_n = data_n;
+        (*mn).link_m = link_m;
+        (*mn).link_n = link_n;
+    }
 }
 
 /// Probe outputs through the DDI/VBT path used by ADL-P, then publish DRM
@@ -1583,11 +3356,139 @@ pub unsafe extern "C" fn intel_setup_outputs(display: *mut IntelDisplay) {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, vec::Vec};
+    use std::{
+        cell::{Cell, RefCell},
+        vec::Vec,
+    };
 
     use tk_linux_kapi::config::{EINVAL, EOPNOTSUPP};
 
-    use super::run_watermark_scaler_check;
+    use super::*;
+
+    fn adlp_mode() -> DrmDisplayMode {
+        let mut mode = unsafe { core::mem::MaybeUninit::<DrmDisplayMode>::zeroed().assume_init() };
+        mode.clock = 148_500;
+        mode.hdisplay = 1_920;
+        mode.hsync_start = 2_008;
+        mode.hsync_end = 2_052;
+        mode.htotal = 2_200;
+        mode.vdisplay = 1_080;
+        mode.vsync_start = 1_084;
+        mode.vsync_end = 1_089;
+        mode.vtotal = 1_125;
+        mode
+    }
+
+    #[test]
+    fn generic_mode_validation_checks_adlp_timing_boundaries() {
+        let mut mode = adlp_mode();
+        assert_eq!(mode_valid_limits(&mode, DISPLAY_VER_ADLP, 300_000), MODE_OK);
+
+        mode.htotal = 16_385;
+        assert_eq!(
+            mode_valid_limits(&mode, DISPLAY_VER_ADLP, 300_000),
+            MODE_H_ILLEGAL
+        );
+        mode = adlp_mode();
+        mode.vtotal = 8_193;
+        assert_eq!(
+            mode_valid_limits(&mode, DISPLAY_VER_ADLP, 300_000),
+            MODE_V_ILLEGAL
+        );
+        mode = adlp_mode();
+        mode.clock = 0;
+        assert_eq!(
+            mode_valid_limits(&mode, DISPLAY_VER_ADLP, 300_000),
+            MODE_NOCLOCK
+        );
+        mode = adlp_mode();
+        mode.htotal = 16_384;
+        mode.clock = 250_000;
+        assert_eq!(
+            mode_valid_limits(&mode, DISPLAY_VER_ADLP, 300_000),
+            MODE_H_ILLEGAL
+        );
+    }
+
+    #[test]
+    fn cpu_transcoder_validation_checks_blank_and_sync_boundaries() {
+        let mut mode = adlp_mode();
+        mode.hdisplay = 64;
+        mode.hsync_start = 65;
+        mode.htotal = 96;
+        mode.vdisplay = 480;
+        mode.vtotal = 485;
+        assert_eq!(
+            cpu_transcoder_mode_valid_limits(&mode, DISPLAY_VER_ADLP, false),
+            MODE_OK
+        );
+        mode.htotal = 95;
+        assert_eq!(
+            cpu_transcoder_mode_valid_limits(&mode, DISPLAY_VER_ADLP, false),
+            MODE_H_ILLEGAL
+        );
+        mode.htotal = 96;
+        mode.vtotal = 484;
+        assert_eq!(
+            cpu_transcoder_mode_valid_limits(&mode, DISPLAY_VER_ADLP, false),
+            MODE_V_ILLEGAL
+        );
+        mode.vtotal = 485;
+        mode.hsync_start = mode.hdisplay;
+        assert_eq!(
+            cpu_transcoder_mode_valid_limits(&mode, DISPLAY_VER_ADLP, false),
+            MODE_H_ILLEGAL
+        );
+    }
+
+    #[test]
+    fn atomic_config_retry_only_clamps_a_failed_pipe_on_einval() {
+        let called = Cell::new(0);
+        assert!(retry_failed_config_with_bpp_limit(-EINVAL, 2, || {
+            called.set(called.get() + 1);
+            true
+        }));
+        assert_eq!(called.get(), 1);
+        assert!(!retry_failed_config_with_bpp_limit(-EINVAL, -1, || {
+            called.set(called.get() + 1);
+            true
+        }));
+        assert!(!retry_failed_config_with_bpp_limit(-ENOMEM, 2, || {
+            called.set(called.get() + 1);
+            true
+        }));
+        assert_eq!(called.get(), 1);
+    }
+
+    #[test]
+    fn commit_stage_failure_runs_rollback_once_and_success_does_not() {
+        let cleaned = Cell::new(0);
+        assert_eq!(
+            cleanup_after_commit_stage_error(-ENOMEM, || cleaned.set(cleaned.get() + 1)),
+            -ENOMEM
+        );
+        assert_eq!(cleaned.get(), 1);
+        assert_eq!(
+            cleanup_after_commit_stage_error(0, || cleaned.set(cleaned.get() + 1)),
+            0
+        );
+        assert_eq!(cleaned.get(), 1);
+    }
+
+    #[test]
+    fn adlp_port_phy_mapping_matches_ddi_topology() {
+        assert_eq!(adlp_port_to_phy(0), PHY_A);
+        assert_eq!(adlp_port_to_phy(1), PHY_B);
+        assert_eq!(adlp_port_to_phy(2), PHY_A + 2);
+        assert_eq!(adlp_port_to_phy(3), PHY_F);
+        assert_eq!(adlp_port_to_phy(4), PHY_F + 1);
+        assert_eq!(adlp_port_to_phy(5), PHY_F + 2);
+        assert_eq!(adlp_port_to_phy(6), PHY_I);
+        assert_eq!(adlp_port_to_phy(7), PHY_D);
+        assert_eq!(adlp_port_to_phy(8), PHY_D + 1);
+        assert_eq!(adlp_port_to_phy(-1), PHY_NONE);
+        assert_eq!(adlp_port_to_phy(9), PHY_NONE);
+    }
 
     #[test]
     fn watermark_scaler_order_preserves_error_short_circuiting() {
