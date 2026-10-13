@@ -151,3 +151,56 @@ pub const GMBUS_HW_RDY_EN: u32 = ((1 << 0));
 
 /// `GMBUS_2BYTE_INDEX_EN` (intel_gmbus_regs.h)
 pub const GMBUS_2BYTE_INDEX_EN: u32 = ((1 << 31));
+
+pub const PCH_DISPLAY_BASE: u32 = 0xc0000;
+
+pub unsafe fn HAS_PCH_SPLIT(display: *const IntelDisplay) -> bool {
+    (*display).pch_type != 0
+}
+
+pub unsafe fn __GMBUS_MMIO_BASE(display: *const IntelDisplay) -> u32 {
+    if unsafe { DISPLAY_VER(display) } >= 5 {
+        if unsafe { HAS_PCH_SPLIT(display) } {
+            PCH_DISPLAY_BASE
+        } else {
+            0
+        }
+    } else {
+        unsafe { DISPLAY_MMIO_BASE(display) }
+    }
+}
+
+/// `GPIO(__display, gpio)` (intel_gmbus_regs.h)
+pub unsafe fn GPIO(display: *const IntelDisplay, gpio: u32) -> I915RegT {
+    mmio(unsafe { __GMBUS_MMIO_BASE(display) } + 0x5010 + 4 * gpio)
+}
+
+/// `GMBUS0(__display)` (intel_gmbus_regs.h)
+pub unsafe fn GMBUS0(display: *const IntelDisplay) -> I915RegT {
+    mmio(unsafe { __GMBUS_MMIO_BASE(display) } + 0x5100)
+}
+
+/// `GMBUS1(__display)` (intel_gmbus_regs.h)
+pub unsafe fn GMBUS1(display: *const IntelDisplay) -> I915RegT {
+    mmio(unsafe { __GMBUS_MMIO_BASE(display) } + 0x5104)
+}
+
+/// `GMBUS2(__display)` (intel_gmbus_regs.h)
+pub unsafe fn GMBUS2(display: *const IntelDisplay) -> I915RegT {
+    mmio(unsafe { __GMBUS_MMIO_BASE(display) } + 0x5108)
+}
+
+/// `GMBUS3(__display)` (intel_gmbus_regs.h)
+pub unsafe fn GMBUS3(display: *const IntelDisplay) -> I915RegT {
+    mmio(unsafe { __GMBUS_MMIO_BASE(display) } + 0x510c)
+}
+
+/// `GMBUS4(__display)` (intel_gmbus_regs.h)
+pub unsafe fn GMBUS4(display: *const IntelDisplay) -> I915RegT {
+    mmio(unsafe { __GMBUS_MMIO_BASE(display) } + 0x5110)
+}
+
+/// `GMBUS5(__display)` (intel_gmbus_regs.h)
+pub unsafe fn GMBUS5(display: *const IntelDisplay) -> I915RegT {
+    mmio(unsafe { __GMBUS_MMIO_BASE(display) } + 0x5120)
+}

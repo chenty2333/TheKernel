@@ -11,8 +11,18 @@ use crate::intel_display_reg_defs_upstream::*;
 /// `_DSPAADDR_VLV` (i9xx_plane_regs.h)
 pub const _DSPAADDR_VLV: u32 = 0x7017C;
 
+/// `DSPADDR_VLV(dev_priv, plane)` (i9xx_plane_regs.h)
+pub unsafe fn DSPADDR_VLV(display: *const IntelDisplay, plane: u32) -> I915RegT {
+    _MMIO_PIPE2(display, plane, _DSPAADDR_VLV)
+}
+
 /// `_DSPACNTR` (i9xx_plane_regs.h)
 pub const _DSPACNTR: u32 = 0x70180;
+
+/// `DSPCNTR(dev_priv, plane)` (i9xx_plane_regs.h)
+pub unsafe fn DSPCNTR(display: *const IntelDisplay, plane: u32) -> I915RegT {
+    _MMIO_PIPE2(display, plane, _DSPACNTR)
+}
 
 /// `DISP_ENABLE` (i9xx_plane_regs.h)
 pub const DISP_ENABLE: u32 = reg_bit(31);
@@ -115,11 +125,26 @@ pub const _DSPAADDR: u32 = 0x70184;
 /// `_DSPALINOFF` (i9xx_plane_regs.h)
 pub const _DSPALINOFF: u32 = 0x70184;
 
+/// `DSPLINOFF(dev_priv, plane)` (i9xx_plane_regs.h)
+pub unsafe fn DSPLINOFF(display: *const IntelDisplay, plane: u32) -> I915RegT {
+    _MMIO_PIPE2(display, plane, _DSPALINOFF)
+}
+
 /// `_DSPASTRIDE` (i9xx_plane_regs.h)
 pub const _DSPASTRIDE: u32 = 0x70188;
 
+/// `DSPSTRIDE(dev_priv, plane)` (i9xx_plane_regs.h)
+pub unsafe fn DSPSTRIDE(display: *const IntelDisplay, plane: u32) -> I915RegT {
+    _MMIO_PIPE2(display, plane, _DSPASTRIDE)
+}
+
 /// `_DSPAPOS` (i9xx_plane_regs.h)
 pub const _DSPAPOS: u32 = 0x7018C;
+
+/// `DSPPOS(dev_priv, plane)` (i9xx_plane_regs.h)
+pub unsafe fn DSPPOS(display: *const IntelDisplay, plane: u32) -> I915RegT {
+    _MMIO_PIPE2(display, plane, _DSPAPOS)
+}
 
 /// `DISP_POS_Y_MASK` (i9xx_plane_regs.h)
 pub const DISP_POS_Y_MASK: u32 = reg_genmask(31, 16);
@@ -140,6 +165,11 @@ pub const fn DISP_POS_X(x: u32) -> u32 {
 /// `_DSPASIZE` (i9xx_plane_regs.h)
 pub const _DSPASIZE: u32 = 0x70190;
 
+/// `DSPSIZE(dev_priv, plane)` (i9xx_plane_regs.h)
+pub unsafe fn DSPSIZE(display: *const IntelDisplay, plane: u32) -> I915RegT {
+    _MMIO_PIPE2(display, plane, _DSPASIZE)
+}
+
 /// `DISP_HEIGHT_MASK` (i9xx_plane_regs.h)
 pub const DISP_HEIGHT_MASK: u32 = reg_genmask(31, 16);
 
@@ -159,11 +189,21 @@ pub const fn DISP_WIDTH(w: u32) -> u32 {
 /// `_DSPASURF` (i9xx_plane_regs.h)
 pub const _DSPASURF: u32 = 0x7019C;
 
+/// `DSPSURF(dev_priv, plane)` (i9xx_plane_regs.h)
+pub unsafe fn DSPSURF(display: *const IntelDisplay, plane: u32) -> I915RegT {
+    _MMIO_PIPE2(display, plane, _DSPASURF)
+}
+
 /// `DISP_ADDR_MASK` (i9xx_plane_regs.h)
 pub const DISP_ADDR_MASK: u32 = reg_genmask(31, 12);
 
 /// `_DSPATILEOFF` (i9xx_plane_regs.h)
 pub const _DSPATILEOFF: u32 = 0x701A4;
+
+/// `DSPTILEOFF(dev_priv, plane)` (i9xx_plane_regs.h)
+pub unsafe fn DSPTILEOFF(display: *const IntelDisplay, plane: u32) -> I915RegT {
+    _MMIO_PIPE2(display, plane, _DSPATILEOFF)
+}
 
 /// `DISP_OFFSET_Y_MASK` (i9xx_plane_regs.h)
 pub const DISP_OFFSET_Y_MASK: u32 = reg_genmask(31, 16);
@@ -184,8 +224,18 @@ pub const fn DISP_OFFSET_X(x: u32) -> u32 {
 /// `_DSPAOFFSET` (i9xx_plane_regs.h)
 pub const _DSPAOFFSET: u32 = 0x701A4;
 
+/// `DSPOFFSET(dev_priv, plane)` (i9xx_plane_regs.h)
+pub unsafe fn DSPOFFSET(display: *const IntelDisplay, plane: u32) -> I915RegT {
+    _MMIO_PIPE2(display, plane, _DSPAOFFSET)
+}
+
 /// `_DSPASURFLIVE` (i9xx_plane_regs.h)
 pub const _DSPASURFLIVE: u32 = 0x701AC;
+
+/// `DSPSURFLIVE(dev_priv, plane)` (i9xx_plane_regs.h)
+pub unsafe fn DSPSURFLIVE(display: *const IntelDisplay, plane: u32) -> I915RegT {
+    _MMIO_PIPE2(display, plane, _DSPASURFLIVE)
+}
 
 /// `_DSPAGAMC` (i9xx_plane_regs.h)
 pub const _DSPAGAMC: u32 = 0x701E0;

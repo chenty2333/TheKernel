@@ -484,14 +484,48 @@ pub const _ADLP_PIPEDMC_REG_MMIO_BASE_A: u32 = 0x5f000;
 /// `_TGL_PIPEDMC_REG_MMIO_BASE_A` (intel_dmc_regs.h)
 pub const _TGL_PIPEDMC_REG_MMIO_BASE_A: u32 = 0x92000;
 
+pub const DMC_FW_MAIN: u32 = 0;
+
+pub const __DMC_REG_MMIO_BASE: u32 = 0x8f000;
+
+pub unsafe fn __PIPEDMC_REG_MMIO_BASE(display: *const IntelDisplay, dmc_id: u32) -> u32 {
+    (if unsafe { DISPLAY_VER(display) } >= 13 {
+        _ADLP_PIPEDMC_REG_MMIO_BASE_A
+    } else {
+        _TGL_PIPEDMC_REG_MMIO_BASE_A
+    }) + 0x400 * (dmc_id - 1)
+}
+
+pub unsafe fn _DMC_REG_MMIO_BASE(display: *const IntelDisplay, dmc_id: u32) -> u32 {
+    if dmc_id == DMC_FW_MAIN {
+        __DMC_REG_MMIO_BASE
+    } else {
+        unsafe { __PIPEDMC_REG_MMIO_BASE(display, dmc_id) }
+    }
+}
+
+pub unsafe fn _DMC_REG(display: *const IntelDisplay, dmc_id: u32, reg: u32) -> u32 {
+    reg - __DMC_REG_MMIO_BASE + unsafe { _DMC_REG_MMIO_BASE(display, dmc_id) }
+}
+
 /// `DMC_EVENT_HANDLER_COUNT_GEN12` (intel_dmc_regs.h)
 pub const DMC_EVENT_HANDLER_COUNT_GEN12: u32 = 8;
 
 /// `_DMC_EVT_HTP_0` (intel_dmc_regs.h)
 pub const _DMC_EVT_HTP_0: u32 = 0x8f004;
 
+/// `DMC_EVT_HTP(i915, dmc_id, handler)` (intel_dmc_regs.h)
+pub unsafe fn DMC_EVT_HTP(display: *const IntelDisplay, dmc_id: u32, handler: u32) -> I915RegT {
+    mmio(unsafe { _DMC_REG(display, dmc_id, _DMC_EVT_HTP_0) } + 4 * handler)
+}
+
 /// `_DMC_EVT_CTL_0` (intel_dmc_regs.h)
 pub const _DMC_EVT_CTL_0: u32 = 0x8f034;
+
+/// `DMC_EVT_CTL(i915, dmc_id, handler)` (intel_dmc_regs.h)
+pub unsafe fn DMC_EVT_CTL(display: *const IntelDisplay, dmc_id: u32, handler: u32) -> I915RegT {
+    mmio(unsafe { _DMC_REG(display, dmc_id, _DMC_EVT_CTL_0) } + 4 * handler)
+}
 
 /// `DMC_EVT_CTL_ENABLE` (intel_dmc_regs.h)
 pub const DMC_EVT_CTL_ENABLE: u32 = reg_bit(31);

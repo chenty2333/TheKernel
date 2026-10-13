@@ -79,6 +79,23 @@ pub const fn _XELPDP_PORT_P2M_MSGBUS_STATUS(idx: u32, lane: u32) -> I915RegT {
     mmio(((pick_even_2ranges(idx, (PORT_TC1 as u32), _XELPDP_PORT_M2P_MSGBUS_CTL_LN0_A, _XELPDP_PORT_M2P_MSGBUS_CTL_LN0_B, _XELPDP_PORT_M2P_MSGBUS_CTL_LN0_USBC1, _XELPDP_PORT_M2P_MSGBUS_CTL_LN0_USBC2) + ((lane) * 4)) + 8))
 }
 
+pub const fn __xe2lpd_port_idx(port: u32) -> u32 {
+    if port >= (PORT_TC1 as u32) {
+        port
+    } else {
+        (PORT_TC4 as u32) + 1 + port - (PORT_A as u32)
+    }
+}
+
+/// `XELPDP_PORT_P2M_MSGBUS_STATUS(i915__, port, lane)` (intel_cx0_phy_regs.h)
+pub unsafe fn XELPDP_PORT_P2M_MSGBUS_STATUS(display: *const IntelDisplay, port: u32, lane: u32) -> I915RegT {
+    if unsafe { DISPLAY_VER(display) } >= 20 {
+        _XELPDP_PORT_P2M_MSGBUS_STATUS(__xe2lpd_port_idx(port), lane)
+    } else {
+        _XELPDP_PORT_P2M_MSGBUS_STATUS(port, lane)
+    }
+}
+
 /// `XELPDP_PORT_P2M_RESPONSE_READY` (intel_cx0_phy_regs.h)
 pub const XELPDP_PORT_P2M_RESPONSE_READY: u32 = reg_bit(31);
 
@@ -143,6 +160,16 @@ pub const fn _XELPDP_PORT_BUF_CTL1(idx: u32) -> I915RegT {
     mmio(pick_even_2ranges(idx, (PORT_TC1 as u32), _XELPDP_PORT_BUF_CTL1_LN0_A, _XELPDP_PORT_BUF_CTL1_LN0_B, _XELPDP_PORT_BUF_CTL1_LN0_USBC1, _XELPDP_PORT_BUF_CTL1_LN0_USBC2))
 }
 
+
+/// `XELPDP_PORT_BUF_CTL1(i915__, port)` (intel_cx0_phy_regs.h)
+pub unsafe fn XELPDP_PORT_BUF_CTL1(display: *const IntelDisplay, port: u32) -> I915RegT {
+    if unsafe { DISPLAY_VER(display) } >= 20 {
+        _XELPDP_PORT_BUF_CTL1(__xe2lpd_port_idx(port))
+    } else {
+        _XELPDP_PORT_BUF_CTL1(port)
+    }
+}
+
 /// `XELPDP_PORT_BUF_D2D_LINK_ENABLE` (intel_cx0_phy_regs.h)
 pub const XELPDP_PORT_BUF_D2D_LINK_ENABLE: u32 = reg_bit(29);
 
@@ -191,9 +218,23 @@ pub const XELPDP_TCSS_POWER_STATE: u32 = reg_bit(4);
 /// `XELPDP_PORT_WIDTH_MASK` (intel_cx0_phy_regs.h)
 pub const XELPDP_PORT_WIDTH_MASK: u32 = reg_genmask(3, 1);
 
+/// `XELPDP_PORT_WIDTH(width)` (intel_cx0_phy_regs.h)
+pub const fn XELPDP_PORT_WIDTH(width: u32) -> u32 {
+    reg_field_prep(XELPDP_PORT_WIDTH_MASK, if width == 3 { 4 } else { width - 1 })
+}
+
 /// `_XELPDP_PORT_BUF_CTL2(idx)` (intel_cx0_phy_regs.h)
 pub const fn _XELPDP_PORT_BUF_CTL2(idx: u32) -> I915RegT {
     mmio((pick_even_2ranges(idx, (PORT_TC1 as u32), _XELPDP_PORT_BUF_CTL1_LN0_A, _XELPDP_PORT_BUF_CTL1_LN0_B, _XELPDP_PORT_BUF_CTL1_LN0_USBC1, _XELPDP_PORT_BUF_CTL1_LN0_USBC2) + 4))
+}
+
+/// `XELPDP_PORT_BUF_CTL2(i915__, port)` (intel_cx0_phy_regs.h)
+pub unsafe fn XELPDP_PORT_BUF_CTL2(display: *const IntelDisplay, port: u32) -> I915RegT {
+    if unsafe { DISPLAY_VER(display) } >= 20 {
+        _XELPDP_PORT_BUF_CTL2(__xe2lpd_port_idx(port))
+    } else {
+        _XELPDP_PORT_BUF_CTL2(port)
+    }
 }
 
 /// `XELPDP_LANE_PIPE_RESET(lane)` (intel_cx0_phy_regs.h)
@@ -253,6 +294,15 @@ pub const fn _XELPDP_PORT_BUF_CTL3(idx: u32) -> I915RegT {
     mmio((pick_even_2ranges(idx, (PORT_TC1 as u32), _XELPDP_PORT_BUF_CTL1_LN0_A, _XELPDP_PORT_BUF_CTL1_LN0_B, _XELPDP_PORT_BUF_CTL1_LN0_USBC1, _XELPDP_PORT_BUF_CTL1_LN0_USBC2) + 8))
 }
 
+/// `XELPDP_PORT_BUF_CTL3(i915__, port)` (intel_cx0_phy_regs.h)
+pub unsafe fn XELPDP_PORT_BUF_CTL3(display: *const IntelDisplay, port: u32) -> I915RegT {
+    if unsafe { DISPLAY_VER(display) } >= 20 {
+        _XELPDP_PORT_BUF_CTL3(__xe2lpd_port_idx(port))
+    } else {
+        _XELPDP_PORT_BUF_CTL3(port)
+    }
+}
+
 /// `XELPDP_PLL_LANE_STAGGERING_DELAY_MASK` (intel_cx0_phy_regs.h)
 pub const XELPDP_PLL_LANE_STAGGERING_DELAY_MASK: u32 = reg_genmask(15, 8);
 
@@ -304,6 +354,15 @@ pub const fn _XELPDP_PORT_MSGBUS_TIMER(port: u32, lane: u32) -> I915RegT {
     mmio((pick_even_2ranges(port, (PORT_TC1 as u32), _XELPDP_PORT_MSGBUS_TIMER_LN0_A, _XELPDP_PORT_MSGBUS_TIMER_LN0_B, _XELPDP_PORT_MSGBUS_TIMER_LN0_USBC1, _XELPDP_PORT_MSGBUS_TIMER_LN0_USBC2) + ((lane) * 4)))
 }
 
+/// `XELPDP_PORT_MSGBUS_TIMER(i915__, port, lane)` (intel_cx0_phy_regs.h)
+pub unsafe fn XELPDP_PORT_MSGBUS_TIMER(display: *const IntelDisplay, port: u32, lane: u32) -> I915RegT {
+    if unsafe { DISPLAY_VER(display) } >= 20 {
+        _XELPDP_PORT_MSGBUS_TIMER(__xe2lpd_port_idx(port), lane)
+    } else {
+        _XELPDP_PORT_MSGBUS_TIMER(port, lane)
+    }
+}
+
 /// `XELPDP_PORT_MSGBUS_TIMER_TIMED_OUT` (intel_cx0_phy_regs.h)
 pub const XELPDP_PORT_MSGBUS_TIMER_TIMED_OUT: u32 = reg_bit(31);
 
@@ -328,6 +387,15 @@ pub const _XELPDP_PORT_CLOCK_CTL_USBC2: u32 = 0x16F460;
 /// `_XELPDP_PORT_CLOCK_CTL(idx)` (intel_cx0_phy_regs.h)
 pub const fn _XELPDP_PORT_CLOCK_CTL(idx: u32) -> I915RegT {
     mmio(pick_even_2ranges(idx, (PORT_TC1 as u32), _XELPDP_PORT_CLOCK_CTL_A, _XELPDP_PORT_CLOCK_CTL_B, _XELPDP_PORT_CLOCK_CTL_USBC1, _XELPDP_PORT_CLOCK_CTL_USBC2))
+}
+
+/// `XELPDP_PORT_CLOCK_CTL(i915__, port)` (intel_cx0_phy_regs.h)
+pub unsafe fn XELPDP_PORT_CLOCK_CTL(display: *const IntelDisplay, port: u32) -> I915RegT {
+    if unsafe { DISPLAY_VER(display) } >= 20 {
+        _XELPDP_PORT_CLOCK_CTL(__xe2lpd_port_idx(port))
+    } else {
+        _XELPDP_PORT_CLOCK_CTL(port)
+    }
 }
 
 /// `XELPDP_LANE_PCLK_PLL_REQUEST(lane)` (intel_cx0_phy_regs.h)

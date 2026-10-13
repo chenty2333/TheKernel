@@ -505,3 +505,80 @@ pub const fn TRANS_HDCP2_AUTH_STREAM(trans: u32) -> I915RegT {
 
 /// `AUTH_STREAM_TYPE_MASK` (intel_hdcp_regs.h)
 pub const AUTH_STREAM_TYPE_MASK: u32 = reg_genmask(31, 31);
+
+/// `TRANS_HDCP(__i915)` (intel_hdcp_regs.h)
+pub unsafe fn TRANS_HDCP(display: *const IntelDisplay) -> bool {
+    unsafe { DISPLAY_VER(display) >= 12 }
+}
+
+/// `HDCP_CONF(dev_priv, trans, port)` (intel_hdcp_regs.h)
+pub unsafe fn HDCP_CONF(display: *const IntelDisplay, trans: u32, port: u32) -> I915RegT {
+    if unsafe { TRANS_HDCP(display) } {
+        TRANS_HDCP_CONF(trans)
+    } else {
+        PORT_HDCP_CONF(port)
+    }
+}
+
+/// `HDCP_ANINIT(dev_priv, trans, port)` (intel_hdcp_regs.h)
+pub unsafe fn HDCP_ANINIT(display: *const IntelDisplay, trans: u32, port: u32) -> I915RegT {
+    if unsafe { TRANS_HDCP(display) } {
+        TRANS_HDCP_ANINIT(trans)
+    } else {
+        PORT_HDCP_ANINIT(port)
+    }
+}
+
+/// `HDCP_ANLO(dev_priv, trans, port)` (intel_hdcp_regs.h)
+pub unsafe fn HDCP_ANLO(display: *const IntelDisplay, trans: u32, port: u32) -> I915RegT {
+    if unsafe { TRANS_HDCP(display) } {
+        TRANS_HDCP_ANLO(trans)
+    } else {
+        PORT_HDCP_ANLO(port)
+    }
+}
+
+/// `HDCP_ANHI(dev_priv, trans, port)` (intel_hdcp_regs.h)
+pub unsafe fn HDCP_ANHI(display: *const IntelDisplay, trans: u32, port: u32) -> I915RegT {
+    if unsafe { TRANS_HDCP(display) } {
+        TRANS_HDCP_ANHI(trans)
+    } else {
+        PORT_HDCP_ANHI(port)
+    }
+}
+
+/// `HDCP_BKSVLO(dev_priv, trans, port)` (intel_hdcp_regs.h)
+pub unsafe fn HDCP_BKSVLO(display: *const IntelDisplay, trans: u32, port: u32) -> I915RegT {
+    if unsafe { TRANS_HDCP(display) } {
+        TRANS_HDCP_BKSVLO(trans)
+    } else {
+        PORT_HDCP_BKSVLO(port)
+    }
+}
+
+/// `HDCP_BKSVHI(dev_priv, trans, port)` (intel_hdcp_regs.h)
+pub unsafe fn HDCP_BKSVHI(display: *const IntelDisplay, trans: u32, port: u32) -> I915RegT {
+    if unsafe { TRANS_HDCP(display) } {
+        TRANS_HDCP_BKSVHI(trans)
+    } else {
+        PORT_HDCP_BKSVHI(port)
+    }
+}
+
+/// `HDCP_RPRIME(dev_priv, trans, port)` (intel_hdcp_regs.h)
+pub unsafe fn HDCP_RPRIME(display: *const IntelDisplay, trans: u32, port: u32) -> I915RegT {
+    if unsafe { TRANS_HDCP(display) } {
+        TRANS_HDCP_RPRIME(trans)
+    } else {
+        PORT_HDCP_RPRIME(port)
+    }
+}
+
+/// `HDCP_STATUS(dev_priv, trans, port)` (intel_hdcp_regs.h)
+pub unsafe fn HDCP_STATUS(display: *const IntelDisplay, trans: u32, port: u32) -> I915RegT {
+    if unsafe { TRANS_HDCP(display) } {
+        TRANS_HDCP_STATUS(trans)
+    } else {
+        PORT_HDCP_STATUS(port)
+    }
+}

@@ -47,6 +47,23 @@ pub const fn _XELPDP_DP_AUX_CH_CTL(aux_ch: u32) -> I915RegT {
     mmio(pick_even_2ranges(aux_ch, (AUX_CH_USBC1 as u32), _DPA_AUX_CH_CTL, _DPB_AUX_CH_CTL, _XELPDP_USBC1_AUX_CH_CTL, _XELPDP_USBC2_AUX_CH_CTL))
 }
 
+pub const fn __xe2lpd_aux_ch_idx(aux_ch: u32) -> u32 {
+    if aux_ch >= (AUX_CH_USBC1 as u32) {
+        aux_ch
+    } else {
+        (AUX_CH_USBC6 as u32) + 1 + aux_ch - (AUX_CH_A as u32)
+    }
+}
+
+/// `XELPDP_DP_AUX_CH_CTL(i915__, aux_ch)` (intel_dp_aux_regs.h)
+pub unsafe fn XELPDP_DP_AUX_CH_CTL(display: *const IntelDisplay, aux_ch: u32) -> I915RegT {
+    if unsafe { DISPLAY_VER(display) } >= 20 {
+        _XELPDP_DP_AUX_CH_CTL(__xe2lpd_aux_ch_idx(aux_ch))
+    } else {
+        _XELPDP_DP_AUX_CH_CTL(aux_ch)
+    }
+}
+
 /// `DP_AUX_CH_CTL_SEND_BUSY` (intel_dp_aux_regs.h)
 pub const DP_AUX_CH_CTL_SEND_BUSY: u32 = reg_bit(31);
 
@@ -186,6 +203,15 @@ pub const _XELPDP_USBC2_AUX_CH_DATA1: u32 = 0x16f414;
 /// `_XELPDP_DP_AUX_CH_DATA(aux_ch, i)` (intel_dp_aux_regs.h)
 pub const fn _XELPDP_DP_AUX_CH_DATA(aux_ch: u32, i: u32) -> I915RegT {
     mmio((pick_even_2ranges(aux_ch, (AUX_CH_USBC1 as u32), _DPA_AUX_CH_DATA1, _DPB_AUX_CH_DATA1, _XELPDP_USBC1_AUX_CH_DATA1, _XELPDP_USBC2_AUX_CH_DATA1) + ((i) * 4)))
+}
+
+/// `XELPDP_DP_AUX_CH_DATA(i915__, aux_ch, i)` (intel_dp_aux_regs.h)
+pub unsafe fn XELPDP_DP_AUX_CH_DATA(display: *const IntelDisplay, aux_ch: u32, i: u32) -> I915RegT {
+    if unsafe { DISPLAY_VER(display) } >= 20 {
+        _XELPDP_DP_AUX_CH_DATA(__xe2lpd_aux_ch_idx(aux_ch), i)
+    } else {
+        _XELPDP_DP_AUX_CH_DATA(aux_ch, i)
+    }
 }
 
 /// `XE2LPD_PICA_PW_CTL` (intel_dp_aux_regs.h)

@@ -1035,3 +1035,29 @@ pub const _MIPIC_READ_DATA_VALID: u32 = 0xb938;
 pub const fn READ_DATA_VALID(n: u32) -> u32 {
     ((1 << (n)))
 }
+
+pub unsafe fn _MIPI_MMIO_BASE(display: *const IntelDisplay) -> u32 {
+    if unsafe { DISPLAY_VER(display) } >= 9 {
+        BXT_MIPI_BASE
+    } else {
+        VLV_MIPI_BASE
+    }
+}
+
+pub const fn _MIPI(port: u32, a: u32, c: u32) -> u32 {
+    _PORT(port, a, c)
+}
+
+pub const fn _MMIO_MIPI(base: u32, port: u32, a: u32, c: u32) -> I915RegT {
+    mmio(base.wrapping_add(_MIPI(port, a, c)))
+}
+
+/// `BXT_MIPI_PORT_CTRL(tc)` (vlv_dsi_regs.h)
+pub const fn BXT_MIPI_PORT_CTRL(tc: u32) -> I915RegT {
+    _MMIO_MIPI(BXT_MIPI_BASE, tc, _BXT_MIPIA_PORT_CTRL, _BXT_MIPIC_PORT_CTRL)
+}
+
+/// `MIPI_CTRL(display, port)` (vlv_dsi_regs.h)
+pub unsafe fn MIPI_CTRL(display: *const IntelDisplay, port: u32) -> I915RegT {
+    _MMIO_MIPI(unsafe { _MIPI_MMIO_BASE(display) }, port, _MIPIA_CTRL, _MIPIC_CTRL)
+}

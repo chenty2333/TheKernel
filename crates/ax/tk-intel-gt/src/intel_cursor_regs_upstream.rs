@@ -11,6 +11,11 @@ use crate::intel_display_reg_defs_upstream::*;
 /// `_CURACNTR` (intel_cursor_regs.h)
 pub const _CURACNTR: u32 = 0x70080;
 
+/// `CURCNTR(dev_priv, pipe)` (intel_cursor_regs.h)
+pub unsafe fn CURCNTR(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_CURSOR2(display, pipe, _CURACNTR)
+}
+
 /// `CURSOR_ENABLE` (intel_cursor_regs.h)
 pub const CURSOR_ENABLE: u32 = reg_bit(31);
 
@@ -19,6 +24,11 @@ pub const CURSOR_PIPE_GAMMA_ENABLE: u32 = reg_bit(30);
 
 /// `CURSOR_STRIDE_MASK` (intel_cursor_regs.h)
 pub const CURSOR_STRIDE_MASK: u32 = reg_genmask(29, 28);
+
+/// `CURSOR_STRIDE(stride)` (intel_cursor_regs.h)
+pub const fn CURSOR_STRIDE(stride: u32) -> u32 {
+    reg_field_prep(CURSOR_STRIDE_MASK, if stride == 0 { 0 } else { stride.trailing_zeros() - 8 })
+}
 
 /// `CURSOR_FORMAT_MASK` (intel_cursor_regs.h)
 pub const CURSOR_FORMAT_MASK: u32 = reg_genmask(26, 24);
@@ -96,8 +106,18 @@ pub const MCURSOR_MODE_64_ARGB_AX: u32 = ((0x20 | MCURSOR_MODE_64_32B_AX));
 /// `_CURABASE` (intel_cursor_regs.h)
 pub const _CURABASE: u32 = 0x70084;
 
+/// `CURBASE(dev_priv, pipe)` (intel_cursor_regs.h)
+pub unsafe fn CURBASE(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_CURSOR2(display, pipe, _CURABASE)
+}
+
 /// `_CURAPOS` (intel_cursor_regs.h)
 pub const _CURAPOS: u32 = 0x70088;
+
+/// `CURPOS(dev_priv, pipe)` (intel_cursor_regs.h)
+pub unsafe fn CURPOS(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_CURSOR2(display, pipe, _CURAPOS)
+}
 
 /// `CURSOR_POS_Y_SIGN` (intel_cursor_regs.h)
 pub const CURSOR_POS_Y_SIGN: u32 = reg_bit(31);
@@ -124,8 +144,18 @@ pub const fn CURSOR_POS_X(x: u32) -> u32 {
 /// `_CURAPOS_ERLY_TPT` (intel_cursor_regs.h)
 pub const _CURAPOS_ERLY_TPT: u32 = 0x7008c;
 
+/// `CURPOS_ERLY_TPT(dev_priv, pipe)` (intel_cursor_regs.h)
+pub unsafe fn CURPOS_ERLY_TPT(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_CURSOR2(display, pipe, _CURAPOS_ERLY_TPT)
+}
+
 /// `_CURASIZE` (intel_cursor_regs.h)
 pub const _CURASIZE: u32 = 0x700a0;
+
+/// `CURSIZE(dev_priv, pipe)` (intel_cursor_regs.h)
+pub unsafe fn CURSIZE(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_CURSOR2(display, pipe, _CURASIZE)
+}
 
 /// `CURSOR_HEIGHT_MASK` (intel_cursor_regs.h)
 pub const CURSOR_HEIGHT_MASK: u32 = reg_genmask(21, 12);
@@ -146,6 +176,11 @@ pub const fn CURSOR_WIDTH(w: u32) -> u32 {
 /// `_CUR_FBC_CTL_A` (intel_cursor_regs.h)
 pub const _CUR_FBC_CTL_A: u32 = 0x700a0;
 
+/// `CUR_FBC_CTL(dev_priv, pipe)` (intel_cursor_regs.h)
+pub unsafe fn CUR_FBC_CTL(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_CURSOR2(display, pipe, _CUR_FBC_CTL_A)
+}
+
 /// `CUR_FBC_EN` (intel_cursor_regs.h)
 pub const CUR_FBC_EN: u32 = reg_bit(31);
 
@@ -160,8 +195,18 @@ pub const fn CUR_FBC_HEIGHT(h: u32) -> u32 {
 /// `_CUR_CHICKEN_A` (intel_cursor_regs.h)
 pub const _CUR_CHICKEN_A: u32 = 0x700a4;
 
+/// `CUR_CHICKEN(dev_priv, pipe)` (intel_cursor_regs.h)
+pub unsafe fn CUR_CHICKEN(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_CURSOR2(display, pipe, _CUR_CHICKEN_A)
+}
+
 /// `_CURASURFLIVE` (intel_cursor_regs.h)
 pub const _CURASURFLIVE: u32 = 0x700ac;
+
+/// `CURSURFLIVE(dev_priv, pipe)` (intel_cursor_regs.h)
+pub unsafe fn CURSURFLIVE(display: *const IntelDisplay, pipe: u32) -> I915RegT {
+    _MMIO_CURSOR2(display, pipe, _CURASURFLIVE)
+}
 
 /// `_CUR_WM_A_0` (intel_cursor_regs.h)
 pub const _CUR_WM_A_0: u32 = 0x70140;
