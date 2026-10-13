@@ -1198,11 +1198,15 @@ mod tests {
             "file handle plus this reference"
         );
 
-        let fd = unsafe { thekernel_drm_syncobj_export_fd(Arc::as_ptr(&base).cast_mut().cast()) };
-        assert!(fd >= 0);
+        // The hosted scheduler task has no userspace Thread/FD table. Exercise
+        // the real VFS OFD in an explicit table instead of resolving current().
+        let table = crate::file::FdTable::new().unwrap();
+        let ofd = unsafe { UpstreamSyncobjFile::try_new(Arc::as_ptr(&base).cast_mut().cast()) }.unwrap();
+        let fd = table.add_file_like(ofd, true, 64).unwrap();
         assert_eq!(Arc::strong_count(&base), 3, "the VFS OFD owns a reference");
 
-        let imported_ptr = thekernel_drm_syncobj_import_fd(fd);
+        let imported_ptr = table.get_description(fd).unwrap().file_handle()
+            .downcast::<UpstreamSyncobjFile>().unwrap().get_ref();
         assert!(!imported_ptr.is_null());
         assert!((imported_ptr as isize) >= 0);
         // SAFETY: successful import returns one owned reference to this object.
@@ -1216,7 +1220,7 @@ mod tests {
         drop(imported);
         assert_eq!(Arc::strong_count(&base), 3);
 
-        crate::file::close_file_like(fd).unwrap();
+        drop(table.close(fd).unwrap());
         assert_eq!(
             Arc::strong_count(&base),
             2,
@@ -1230,8 +1234,6 @@ mod tests {
         drop(base);
         unsafe { tk_drm_upstream::drm_syncobj_upstream::tk_drm_syncobj_release(&mut file) };
 
-        let bad_fd = thekernel_drm_syncobj_import_fd(i32::MAX);
-        assert!(!bad_fd.is_null());
-        assert!((bad_fd as isize) < 0 && (bad_fd as isize) >= -4095);
+        assert!(matches!(table.get_description(i32::MAX), Err(AxError::BadFileDescriptor)));
     }
 }

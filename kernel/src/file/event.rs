@@ -387,20 +387,21 @@ mod tests {
     }
 
     #[test]
-    fn eventfd_context_fdget_rejects_bad_fds_and_signals_the_same_ofd() {
+    fn eventfd_context_from_fd_signals_the_same_ofd() {
         let _scheduler = crate::test_support::scheduler_test_context();
-        let bad = thekernel_eventfd_ctx_fdget(i32::MAX);
-        assert!(!bad.is_null());
-        assert!((bad as isize) < 0 && (bad as isize) >= -4095);
+        let table = crate::file::FdTable::new().unwrap();
+        assert!(matches!(table.get_description(i32::MAX), Err(AxError::BadFileDescriptor)));
 
         let event = EventFd::new(0, false);
-        let fd = crate::file::add_file_like(event.clone(), true).unwrap();
-        let ctx = thekernel_eventfd_ctx_fdget(fd);
+        let fd = table.add_file_like(event.clone(), true, 64).unwrap();
+        let file = table.get_description(fd).unwrap().file_handle().downcast::<EventFd>().unwrap();
+        let ctx: *mut c_void = Arc::into_raw(file.clone_file_arc()).cast_mut().cast();
+        drop(file);
         assert!(!ctx.is_null());
         assert!((ctx as isize) >= 0);
         assert_eq!(unsafe { thekernel_eventfd_signal(ctx, 5) }, 0);
         assert_eq!(event.count.load(Ordering::Acquire), 5);
         unsafe { thekernel_eventfd_ctx_put(ctx) };
-        crate::file::close_file_like(fd).unwrap();
+        drop(table.close(fd).unwrap());
     }
 }
