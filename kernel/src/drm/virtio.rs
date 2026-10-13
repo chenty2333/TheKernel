@@ -2459,13 +2459,10 @@ fn map_ax_error(error: axerrno::AxError) -> DrmError {
     }
 }
 
-/// Claims a VirtIO GPU from axdisplay and publishes the single DRM device.
-/// No compatible GPU simply leaves the legacy display path untouched.
-pub fn init() -> DrmResult<bool> {
-    let Some(display) = axdisplay::take_drm_display() else {
-        return Ok(false);
-    };
-    let adapter = VirtioGpuAdapter::new(DisplayTransport(Box::new(display)));
+/// Install the V2 fallback around a display transport recovered from a
+/// failed, pre-publication upstream DRM probe.
+pub(crate) fn init_with_display(display: Box<dyn DisplayDriverOps>) -> DrmResult<bool> {
+    let adapter = VirtioGpuAdapter::new(DisplayTransport(display));
     let candidate: Arc<dyn RenderAdapter> = Arc::new(VirtioRenderAdapter {
         state: adapter.state.clone(),
     });

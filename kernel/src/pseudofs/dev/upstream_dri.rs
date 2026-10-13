@@ -41,7 +41,7 @@ use crate::{
         FileLike, FileMmapProtection, FileMmapRequest, FileMmapSharing, FixedSharedMmapRegion,
         IoDst, IoSrc, IoctlContext, Kstat, OfdIoStatus, PreparedFileMmap, SharedMmapOps,
     },
-    mm::SharedPages,
+    mm::{ExternalPageLease, SharedPages},
     pseudofs::{
         DeviceOpen, DeviceOps,
         device_registry::{
@@ -552,6 +552,13 @@ struct UpstreamGemOwner {
 unsafe impl Send for UpstreamGemOwner {}
 unsafe impl Sync for UpstreamGemOwner {}
 
+struct ExternalGemMmapOwner {
+    _device: Arc<UpstreamDrmDevice>,
+    _object: GemObjectLookupRef,
+}
+unsafe impl Send for ExternalGemMmapOwner {}
+unsafe impl Sync for ExternalGemMmapOwner {}
+
 struct GemObjectLookupRef(*mut DrmGemObject);
 impl Drop for GemObjectLookupRef {
     fn drop(&mut self) {
@@ -640,6 +647,23 @@ fn upstream_gem_mmap(
     {
         return Err(AxError::InvalidInput);
     }
+    let object_file = unsafe { (*object).filp.cast::<LinuxFile>() };
+    if object_file.is_null() || unsafe { (*object_file).f_mapping.is_null() } {
+        return Err(AxError::InvalidInput);
+    }
+    if request.protection().contains(FileMmapProtection::WRITE) && !file.allows_write() {
+        return Err(AxError::PermissionDenied);
+    }
+
+    let count = unsafe { (*object).size / PAGE_SIZE };
+    if let Some(mapping) = file
+        .device
+        .map_blob_gem_object(object)
+        .map_err(blob_map_error)?
+    {
+        return upstream_external_blob_mmap(file, request, region_offset, object, count, mapping);
+    }
+
     let funcs = unsafe { (*object).funcs.as_ref() }.ok_or(AxError::OperationNotSupported)?;
     if funcs.mmap.is_none()
         || funcs.mmap
@@ -687,7 +711,6 @@ fn upstream_gem_mmap(
     }
 
     let shmem = object.cast::<DrmGemShmemObject>();
-    let count = unsafe { (*object).size / PAGE_SIZE };
     let page_ptrs = unsafe { (*shmem).pages };
     if page_ptrs.is_null() {
         return Err(AxError::InvalidInput);
@@ -721,6 +744,81 @@ fn upstream_gem_mmap(
     plan = plan.with_shared_mmap_ops(ops)?;
     close_guard.armed = false;
     Ok(plan)
+}
+
+fn upstream_external_blob_mmap(
+    file: &UpstreamDrmFile,
+    request: FileMmapRequest,
+    region_offset: u64,
+    object: *mut DrmGemObject,
+    object_pages: usize,
+    mapping: axdriver_display::BlobMapping,
+) -> AxResult<PreparedFileMmap> {
+    if mapping.pages.len() != object_pages {
+        return Err(AxError::InvalidInput);
+    }
+    const MAP_CACHE_MASK: u32 = 0x0f;
+    let cache_flags = match mapping.cache_policy & MAP_CACHE_MASK {
+        0 | 1 => axhal::paging::MappingFlags::empty(),
+        2 => axhal::paging::MappingFlags::UNCACHED,
+        3 => axhal::paging::MappingFlags::WRITE_COMBINING,
+        _ => return Err(AxError::InvalidInput),
+    };
+    let mut phys_pages = Vec::new();
+    phys_pages
+        .try_reserve_exact(mapping.pages.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for page in mapping.pages {
+        let page = usize::try_from(page).map_err(|_| AxError::InvalidInput)?;
+        if !page.is_multiple_of(PAGE_SIZE) {
+            return Err(AxError::InvalidInput);
+        }
+        phys_pages.push(PhysAddr::from_usize(page));
+    }
+
+    let lease = Arc::try_new(ExternalPageLease::new_with_transport(
+        mapping.lease,
+        file.device.mapping_owner(),
+    ))
+    .map_err(|_| AxError::NoMemory)?;
+    let shared = SharedPages::new_external_4k(
+        phys_pages,
+        lease.clone(),
+        axhal::paging::MappingFlags::DEVICE | cache_flags,
+    )?;
+    let pages = Arc::try_new(shared).map_err(|_| AxError::NoMemory)?;
+    file.device.track_external_pages(&lease, &pages)?;
+
+    // The C mmap_obj callback is intentionally not invoked for BAR mappings:
+    // tk-virtgpu's generic shmem callback would construct RAM pages instead
+    // of the validated MAP_BLOB PFNs. The fixed SharedPages backend publishes
+    // those PFNs directly and owns their external lease across VMA splits.
+    unsafe { tk_drm_upstream::drm_gem_upstream::drm_gem_object_get(object) };
+    let owner = Arc::try_new(ExternalGemMmapOwner {
+        _device: file.device.clone(),
+        _object: GemObjectLookupRef(object),
+    })
+    .map_err(|_| AxError::NoMemory)?;
+    let owner: Arc<dyn Any + Send + Sync> = owner;
+    let region = FixedSharedMmapRegion::try_new(
+        region_offset,
+        pages,
+        FileMmapProtection::READ | FileMmapProtection::WRITE,
+    )?;
+    let plan = region
+        .prepare(request)?
+        .ok_or(AxError::InvalidInput)?
+        .with_mapping_lifetime(owner);
+    Ok(plan)
+}
+
+fn blob_map_error(error: axdriver_display::DevError) -> AxError {
+    match error {
+        axdriver_display::DevError::InvalidParam => AxError::InvalidInput,
+        axdriver_display::DevError::NoMemory => AxError::NoMemory,
+        axdriver_display::DevError::Unsupported => AxError::OperationNotSupported,
+        _ => AxError::Io,
+    }
 }
 
 #[cfg(test)]

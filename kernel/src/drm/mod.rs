@@ -31,6 +31,11 @@ pub(crate) mod uapi;
 mod virtio;
 pub(crate) mod upstream;
 
+use alloc::{format, sync::Arc};
+
+use axdriver_display::{BlobMapping, DevError};
+use tk_drm_upstream::drm_gem_types::DrmGemObject;
+
 /// The kernel's single decision about which surface drives the console and
 /// `/dev/fb0`, and the registry a display driver enters it through.
 pub(crate) mod screen;
@@ -63,8 +68,58 @@ pub fn init_virtio_gpu() -> DrmResult<bool> {
     if primary_device().is_some() {
         return Ok(true);
     }
-    if virtio::init()? {
-        return Ok(true);
+    if let Some(display) = axdisplay::take_drm_display() {
+        match tk_virtgpu::VirtioGpuDevice::install(Box::new(display)) {
+            Ok(driver) => {
+                let raw = driver.drm_device();
+                let mode = driver.dimensions();
+                let pci = driver.pci_identity();
+                match Arc::try_new(VirtioGpuOwner { _driver: driver }) {
+                    Ok(owner) => {
+                        let mapping_provider: Arc<dyn upstream::UpstreamGemMmapProvider> =
+                            owner.clone();
+                        let owner_any: Arc<dyn core::any::Any + Send + Sync> = owner;
+                        match upstream::install_primary(
+                            raw,
+                            owner_any,
+                            mode,
+                            pci,
+                            Some(mapping_provider),
+                        ) {
+                            Ok(_) => return Ok(true),
+                            Err(error) => axlog::warn!(
+                                "drm: upstream VirtIO DRM publication failed: {error}; firmware \
+                                 console retained"
+                            ),
+                        }
+                    }
+                    Err(owner) => {
+                        drop(owner);
+                        axlog::warn!(
+                            "drm: no memory to publish upstream VirtIO DRM; firmware console \
+                             retained"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                let reason = format!("{:?}", error.error);
+                if let Some(display) = error.into_display() {
+                    axlog::warn!(
+                        "drm: upstream VirtIO DRM probe failed ({reason}); using recovered legacy \
+                         transport"
+                    );
+                    if virtio::init_with_display(display)? {
+                        return Ok(true);
+                    }
+                } else {
+                    axlog::warn!(
+                        "drm: upstream VirtIO DRM probe failed ({reason}) after uncertain \
+                         transport activity; using firmware console"
+                    );
+                }
+            }
+        }
     }
     match linear::init_firmware() {
         Ok(ready) => Ok(ready),
@@ -74,6 +129,31 @@ pub fn init_virtio_gpu() -> DrmResult<bool> {
             );
             Ok(false)
         }
+    }
+}
+
+/// Own the transport-facing driver while the VFS and shared mappings keep
+/// using its upstream DRM device. The driver serializes its mutable protocol
+/// state internally; this wrapper is shared only as a lifetime anchor plus
+/// the validated blob-mmap operation.
+struct VirtioGpuOwner {
+    _driver: tk_virtgpu::VirtioGpuDevice,
+}
+
+// SAFETY: mutable transport work in VirtioGpuDevice is serialized by its
+// private engine lock; the raw DRM pointer is immutable after registration.
+unsafe impl Send for VirtioGpuOwner {}
+// SAFETY: see the Send implementation; blob mapping uses the same engine lock.
+unsafe impl Sync for VirtioGpuOwner {}
+
+impl upstream::UpstreamGemMmapProvider for VirtioGpuOwner {
+    unsafe fn map_blob_gem_object(
+        &self,
+        object: *mut DrmGemObject,
+    ) -> Result<Option<BlobMapping>, DevError> {
+        // SAFETY: upstream_gem_mmap resolves and pins the object from the same
+        // DRM device before asking this provider to map it.
+        unsafe { self._driver.map_blob_gem_object_if_mappable(object) }
     }
 }
 
