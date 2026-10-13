@@ -653,6 +653,8 @@ pub mod intel_display_device_upstream;
 pub mod intel_display_driver_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_reset_upstream;
+#[allow(unsafe_code)]
+pub mod intel_hti_upstream;
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod b3a_tests;

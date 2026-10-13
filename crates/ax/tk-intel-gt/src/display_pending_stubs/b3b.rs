@@ -36,6 +36,5 @@ pub unsafe extern "C" fn intel_pmdemand_init(_display: *mut IntelDisplay) -> i32
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_display_power_driver_remove(_display: *mut IntelDisplay) {}
 
-// upstream: intel_hti.c intel_hti_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_hti_init(_display: *mut IntelDisplay) {}
+pub use crate::intel_hti_upstream::intel_hti_init;
+
