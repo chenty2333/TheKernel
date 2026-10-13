@@ -24,8 +24,8 @@ use tk_linux_kapi::{
         refcount_set,
     },
     mm::{
-        VM_DONTDUMP, VM_DONTEXPAND, VM_FAULT_NOPAGE, VM_FAULT_SIGBUS, VM_MAYWRITE, VM_PFNMAP,
-        VM_SHARED, VmAreaStruct, VmFault, VmOperationsStruct,
+        VM_DONTDUMP, VM_DONTEXPAND, VM_FAULT_NOPAGE, VM_FAULT_SIGBUS, VM_PFNMAP, VmAreaStruct,
+        VmFault, VmOperationsStruct,
     },
     scatterlist::{sg_alloc_table_from_pages_segment, sg_free_table},
     shmem::{
@@ -890,8 +890,7 @@ pub unsafe extern "C" fn drm_gem_shmem_print_info(
         }
         let pad = "\t".repeat(indent as usize);
         let text = alloc::format!(
-            "{pad}pages_pin_count={}\n{pad}pages_use_count={}\n{pad}vmap_use_count={}\\
-             n{pad}vaddr={:p}\n",
+            "{pad}pages_pin_count={}\n{pad}pages_use_count={}\n{pad}vmap_use_count={}\n{pad}vaddr={:p}\n",
             refcount_read(&(*shmem).pages_pin_count),
             refcount_read(&(*shmem).pages_use_count),
             refcount_read(&(*shmem).vmap_use_count),
