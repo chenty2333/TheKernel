@@ -121,7 +121,7 @@ unsafe fn drm_framebuffer_read_refcount(fb: *const DrmFramebuffer) -> u32 {
 
 // upstream: include/drm/drm_framebuffer.h drm_framebuffer_put()
 #[inline]
-unsafe fn drm_framebuffer_put(fb: *mut DrmFramebuffer) {
+pub(crate) unsafe fn drm_framebuffer_put(fb: *mut DrmFramebuffer) {
     // SAFETY: the enclosing `unsafe` fn contract (live, correctly aligned Linux objects and caller-owned buffers) covers this access.
     unsafe { kref_put(core::ptr::addr_of_mut!((*fb).base.refcount), drm_framebuffer_free) };
 }

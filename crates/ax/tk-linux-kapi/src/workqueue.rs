@@ -364,6 +364,7 @@ static WORK_QUEUE: IrqSpinLock<WorkList> = IrqSpinLock::new(WorkList::new());
 static WORKER_STATE: AtomicU8 = AtomicU8::new(WORKER_UNINITIALIZED);
 static WORK_GENERATION: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_WORK: AtomicPtr<WorkStruct> = AtomicPtr::new(ptr::null_mut());
+static WORKER_TASK_IDENTITY: AtomicUsize = AtomicUsize::new(0);
 static WORK_WAKE: axtask::WaitQueue = axtask::WaitQueue::new();
 static WORK_STATE_WAKE: axtask::WaitQueue = axtask::WaitQueue::new();
 
@@ -660,6 +661,10 @@ fn worker_wait_for_generation(generation: usize) {
 }
 
 fn workqueue_worker() {
+    let task = axhal::percpu::current_task_ptr::<()>();
+    if !task.is_null() {
+        WORKER_TASK_IDENTITY.store(task as usize, Ordering::Release);
+    }
     WORK_WAKE
         .wait_until(|| WORKER_STATE.load(Ordering::Acquire) == WORKER_READY)
         .expect("workqueue worker could not wait for executor publication");
@@ -685,6 +690,23 @@ fn workqueue_worker() {
         }
         WORK_STATE_WAKE.notify_all(false);
     }
+}
+
+/// Return the work item currently executing on this task, if and only if the
+/// caller is the persistent workqueue worker. The FIFO backend has one worker;
+/// checking task identity prevents unrelated tasks from observing its globally
+/// active item as their own `current_work()`.
+pub fn current_work() -> *mut WorkStruct {
+    if WORKER_STATE.load(Ordering::Acquire) != WORKER_READY {
+        return ptr::null_mut();
+    }
+    let task = axhal::percpu::current_task_ptr::<()>();
+    if task.is_null()
+        || task as usize != WORKER_TASK_IDENTITY.load(Ordering::Acquire)
+    {
+        return ptr::null_mut();
+    }
+    ACTIVE_WORK.load(Ordering::Acquire)
 }
 
 /// Non-synchronously cancel a queued work instance.

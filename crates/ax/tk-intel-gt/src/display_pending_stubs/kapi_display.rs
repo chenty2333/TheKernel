@@ -36,13 +36,10 @@ pub unsafe extern "C" fn drm_dp_mst_atomic_setup_commit(_state: *mut DrmAtomicCo
     0
 }
 
-// upstream: drivers/gpu/drm/drm_probe_helper.c drm_kms_helper_poll_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_kms_helper_poll_init(_dev: *mut DrmDevice) {}
-
-// upstream: drivers/gpu/drm/drm_probe_helper.c drm_kms_helper_poll_fini()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_kms_helper_poll_fini(_dev: *mut DrmDevice) {}
+// Resolved by the real B2c DRM probe/poll helper implementation.
+pub use tk_drm_upstream::drm_probe_helper_upstream::{
+    drm_kms_helper_poll_fini, drm_kms_helper_poll_init,
+};
 
 // upstream: include/drm/drm_atomic.h drm_atomic_commit_put()
 #[unsafe(no_mangle)]
