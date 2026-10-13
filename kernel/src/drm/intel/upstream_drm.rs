@@ -178,10 +178,10 @@ fn native_modeset_requested() -> bool {
     }
 }
 
-// B7b's real hardware-state readout and B8's parent-owned scanout/DPT/DSB
-// adapters are not yet present in this branch. Keep the user opt-in fail
-// closed until those exact owners are installed; this is build readiness, not
-// another runtime compatibility switch.
+// DPT allocation, retained initial-plane backing and complete fbdev mapping
+// services are still missing from the parent interface. Keep the user opt-in
+// fail closed until those owners are installed; B7b readout, GGTT framebuffer
+// pinning and DSB storage are present. This is not a runtime compatibility switch.
 const NATIVE_DISPLAY_STACK_READY: bool = false;
 
 fn native_modeset_enabled() -> bool {
