@@ -209,20 +209,29 @@ pub const DRM_IOCTL_VIRTGPU_EXECBUFFER: u32 =
     drm_iowr(DRM_VIRTGPU_EXECBUFFER, size_of::<DrmVirtgpuExecbuffer>());
 pub const DRM_IOCTL_VIRTGPU_GETPARAM: u32 =
     drm_iowr(DRM_VIRTGPU_GETPARAM, size_of::<DrmVirtgpuGetparam>());
-pub const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE: u32 =
-    drm_iowr(DRM_VIRTGPU_RESOURCE_CREATE, size_of::<DrmVirtgpuResourceCreate>());
-pub const DRM_IOCTL_VIRTGPU_RESOURCE_INFO: u32 =
-    drm_iowr(DRM_VIRTGPU_RESOURCE_INFO, size_of::<DrmVirtgpuResourceInfo>());
-pub const DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST: u32 =
-    drm_iowr(DRM_VIRTGPU_TRANSFER_FROM_HOST, size_of::<DrmVirtgpu3dTransferFromHost>());
-pub const DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST: u32 =
-    drm_iowr(DRM_VIRTGPU_TRANSFER_TO_HOST, size_of::<DrmVirtgpu3dTransferToHost>());
-pub const DRM_IOCTL_VIRTGPU_WAIT: u32 =
-    drm_iowr(DRM_VIRTGPU_WAIT, size_of::<DrmVirtgpu3dWait>());
+pub const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE: u32 = drm_iowr(
+    DRM_VIRTGPU_RESOURCE_CREATE,
+    size_of::<DrmVirtgpuResourceCreate>(),
+);
+pub const DRM_IOCTL_VIRTGPU_RESOURCE_INFO: u32 = drm_iowr(
+    DRM_VIRTGPU_RESOURCE_INFO,
+    size_of::<DrmVirtgpuResourceInfo>(),
+);
+pub const DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST: u32 = drm_iowr(
+    DRM_VIRTGPU_TRANSFER_FROM_HOST,
+    size_of::<DrmVirtgpu3dTransferFromHost>(),
+);
+pub const DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST: u32 = drm_iowr(
+    DRM_VIRTGPU_TRANSFER_TO_HOST,
+    size_of::<DrmVirtgpu3dTransferToHost>(),
+);
+pub const DRM_IOCTL_VIRTGPU_WAIT: u32 = drm_iowr(DRM_VIRTGPU_WAIT, size_of::<DrmVirtgpu3dWait>());
 pub const DRM_IOCTL_VIRTGPU_GET_CAPS: u32 =
     drm_iowr(DRM_VIRTGPU_GET_CAPS, size_of::<DrmVirtgpuGetCaps>());
-pub const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB: u32 =
-    drm_iowr(DRM_VIRTGPU_RESOURCE_CREATE_BLOB, size_of::<DrmVirtgpuResourceCreateBlob>());
+pub const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB: u32 = drm_iowr(
+    DRM_VIRTGPU_RESOURCE_CREATE_BLOB,
+    size_of::<DrmVirtgpuResourceCreateBlob>(),
+);
 pub const DRM_IOCTL_VIRTGPU_CONTEXT_INIT: u32 =
     drm_iowr(DRM_VIRTGPU_CONTEXT_INIT, size_of::<DrmVirtgpuContextInit>());
 

@@ -10,10 +10,10 @@
 
 extern crate alloc;
 
-pub mod uapi;
-pub mod transport;
 mod device;
 pub mod gem;
 pub mod ioctl;
+pub mod transport;
+pub mod uapi;
 
-pub use device::VirtioGpuDevice;
+pub use device::{VirtioGpuDevice, VirtioGpuInstallError};

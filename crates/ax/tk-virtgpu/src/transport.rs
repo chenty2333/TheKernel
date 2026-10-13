@@ -9,9 +9,10 @@
 //! delivered a successful terminal completion.
 
 use alloc::vec::Vec;
+
 use axdriver_display::{
-    DevError, DevResult, DisplayDriverOps, GpuBatch, GpuCompletion, GpuCompletionData,
-    GpuFeatures, GpuQueue,
+    DevError, DevResult, DisplayDriverOps, GpuBatch, GpuCompletion, GpuCompletionData, GpuFeatures,
+    GpuQueue, RenderCapsetInfo,
 };
 
 const COMPLETION_BATCH: usize = 32;
@@ -31,6 +32,9 @@ pub struct FenceSnapshot {
     /// A newly-created host resource is published only after successful
     /// completion.  This is `None` for ordinary submissions and failures.
     pub resource_id: Option<u32>,
+    /// A host context identity is published under the same terminal rule as a
+    /// resource identity.
+    pub context_id: Option<u32>,
 }
 
 struct FenceRecord {
@@ -38,6 +42,7 @@ struct FenceRecord {
     queue: GpuQueue,
     status: FenceStatus,
     resource_id: Option<u32>,
+    context_id: Option<u32>,
     completion_data: Option<GpuCompletionData>,
 }
 
@@ -51,6 +56,7 @@ pub struct GpuEngine {
     host_visible_len: Option<u64>,
     next_fence_id: u64,
     records: Vec<FenceRecord>,
+    capsets: Vec<(u32, RenderCapsetInfo)>,
 }
 
 impl GpuEngine {
@@ -67,6 +73,7 @@ impl GpuEngine {
             host_visible_len,
             next_fence_id: 1,
             records: Vec::new(),
+            capsets: Vec::new(),
         })
     }
 
@@ -80,6 +87,60 @@ impl GpuEngine {
         self.host_visible_len
     }
 
+    /// Cache the host's ordered capset list once at probe time, matching the
+    /// VirtIO GPU `num_capsets` query order and rejecting duplicate/out-of-range
+    /// host IDs before advertising a bitmask to userspace.
+    pub fn discover_capsets(&mut self, display: &mut dyn DisplayDriverOps) -> DevResult<()> {
+        if !self.features.contains(GpuFeatures::VIRGL_3D)
+            && !self.features.contains(GpuFeatures::RESOURCE_BLOB)
+        {
+            return Ok(());
+        }
+        self.capsets
+            .try_reserve_exact(63)
+            .map_err(|_| DevError::NoMemory)?;
+        for index in 0..63 {
+            let fence = self.submit(display, GpuQueue::Control, GpuBatch::CapsetInfo { index })?;
+            let snapshot = self.wait(display, fence, 5_000_000_000)?;
+            let data = self.take_completion_data(fence)?;
+            self.reap(fence)?;
+            let GpuCompletionData::CapsetInfo {
+                id,
+                max_version,
+                max_size,
+            } = data
+            else {
+                return Err(DevError::BadState);
+            };
+            if id == 0 {
+                break;
+            }
+            if id > 63 || self.capsets.iter().any(|(_, info)| info.id == id) {
+                return Err(DevError::BadState);
+            }
+            self.capsets.push((
+                index,
+                RenderCapsetInfo {
+                    id,
+                    max_version,
+                    max_size,
+                },
+            ));
+            let _ = snapshot;
+        }
+        Ok(())
+    }
+
+    pub fn capset_mask(&self) -> u64 {
+        self.capsets
+            .iter()
+            .fold(0, |mask, (_, info)| mask | (1u64 << info.id))
+    }
+
+    pub fn capset(&self, id: u32) -> Option<(u32, RenderCapsetInfo)> {
+        self.capsets.iter().copied().find(|(_, info)| info.id == id)
+    }
+
     /// Queue an owned command batch.  The lower transport owns all request
     /// and response backing through terminal completion; this layer retains
     /// the DRM-visible fence and any guest-reserved resource identity.
@@ -91,7 +152,9 @@ impl GpuEngine {
     ) -> DevResult<u64> {
         let fence_id = self.next_fence_id;
         let next = fence_id.checked_add(1).ok_or(DevError::BadState)?;
-        self.records.try_reserve(1).map_err(|_| DevError::NoMemory)?;
+        self.records
+            .try_reserve(1)
+            .map_err(|_| DevError::NoMemory)?;
 
         let submission = display.drm_submit(queue, batch, fence_id)?;
         if submission.fence_id != fence_id {
@@ -106,6 +169,7 @@ impl GpuEngine {
             queue,
             status: FenceStatus::Pending,
             resource_id: submission.resource_id,
+            context_id: submission.context_id,
             completion_data: None,
         });
         // Do not publish a guest-reserved resource ID to the caller here.
@@ -116,7 +180,11 @@ impl GpuEngine {
     /// Drain at most 32 terminal records from one queue and update the
     /// corresponding DRM fences. Completions from another queue or with an
     /// unknown/reused identity are rejected rather than cross-signaling work.
-    pub fn drain(&mut self, display: &mut dyn DisplayDriverOps, queue: GpuQueue) -> DevResult<usize> {
+    pub fn drain(
+        &mut self,
+        display: &mut dyn DisplayDriverOps,
+        queue: GpuQueue,
+    ) -> DevResult<usize> {
         let mut out = Vec::new();
         out.try_reserve_exact(COMPLETION_BATCH)
             .map_err(|_| DevError::NoMemory)?;
@@ -147,8 +215,7 @@ impl GpuEngine {
                 .iter()
                 .find(|record| record.fence_id == completion.fence_id);
             match record {
-                Some(record)
-                    if record.queue == queue && record.status == FenceStatus::Pending => {}
+                Some(record) if record.queue == queue && record.status == FenceStatus::Pending => {}
                 _ => return Err(DevError::BadState),
             }
         }
@@ -183,7 +250,11 @@ impl GpuEngine {
             // records than this bounded buffer can report, remaining fences
             // are failed below rather than left indefinitely pending.
             let reset = display.drm_reset(queue, &mut []);
-            for record in self.records.iter_mut().filter(|record| record.queue == queue) {
+            for record in self
+                .records
+                .iter_mut()
+                .filter(|record| record.queue == queue)
+            {
                 if record.status == FenceStatus::Pending {
                     record.status = FenceStatus::Failed;
                     record.resource_id = None;
@@ -213,7 +284,11 @@ impl GpuEngine {
         }
         // Reset of this queue invalidates any record the transport could not
         // fit in the bounded response, so fail all remaining queue fences.
-        for record in self.records.iter_mut().filter(|record| record.queue == queue) {
+        for record in self
+            .records
+            .iter_mut()
+            .filter(|record| record.queue == queue)
+        {
             if record.status == FenceStatus::Pending {
                 record.status = FenceStatus::Failed;
                 record.resource_id = None;
@@ -233,6 +308,11 @@ impl GpuEngine {
                 status: record.status,
                 resource_id: if record.status == FenceStatus::Complete {
                     record.resource_id
+                } else {
+                    None
+                },
+                context_id: if record.status == FenceStatus::Complete {
+                    record.context_id
                 } else {
                     None
                 },
@@ -260,6 +340,11 @@ impl GpuEngine {
             } else {
                 None
             },
+            context_id: if record.status == FenceStatus::Complete {
+                record.context_id
+            } else {
+                None
+            },
         })
     }
 
@@ -274,10 +359,7 @@ impl GpuEngine {
         match record.status {
             FenceStatus::Pending => Err(DevError::Again),
             FenceStatus::Failed => Err(DevError::Io),
-            FenceStatus::Complete => record
-                .completion_data
-                .take()
-                .ok_or(DevError::InvalidParam),
+            FenceStatus::Complete => record.completion_data.take().ok_or(DevError::InvalidParam),
         }
     }
 

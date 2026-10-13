@@ -3380,6 +3380,7 @@ version = "0.1.0"
 name = "tk-axdriver-display"
 version = "0.1.0"
 dependencies = [
+ "spin 0.9.9",
  "tk-axdriver-base",
  "tk-axgpu",
 ]

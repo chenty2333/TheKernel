@@ -10,6 +10,7 @@ use core::any::Any;
 #[doc(no_inline)]
 pub use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
 pub use axgpu::PixelLayout;
+use spin::Mutex;
 
 /// PCI identity retained from the owning function's configuration space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +114,146 @@ pub struct DrmDisplayConfig {
     pub height: u32,
 }
 
+/// Shared first-fit allocator for the device's host-visible blob aperture.
+/// Both DRM-facing adapters use this same implementation so reservations
+/// cannot diverge in alignment, overlap, or boundary behavior.
+#[derive(Clone)]
+pub struct HostVisibleAperture {
+    inner: Arc<Mutex<HostVisibleApertureState>>,
+}
+
+struct HostVisibleApertureState {
+    length: Option<u64>,
+    ranges: Vec<ApertureRange>,
+}
+
+#[derive(Clone, Copy)]
+struct ApertureRange {
+    resource: u32,
+    offset: u64,
+    length: u64,
+}
+
+/// Reservation returned by [`HostVisibleAperture::reserve`]. The aperture
+/// range is not reusable until the owner has completed host-side UNMAP and
+/// dropped its final lease.
+pub struct HostVisibleApertureLease {
+    inner: Arc<Mutex<HostVisibleApertureState>>,
+    resource: u32,
+    offset: u64,
+    length: u64,
+}
+
+impl HostVisibleAperture {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HostVisibleApertureState {
+                length: None,
+                ranges: Vec::new(),
+            })),
+        }
+    }
+
+    /// Reserve a page-aligned, first-fit range within the negotiated host
+    /// aperture. A resource may have at most one active map at a time.
+    pub fn reserve(
+        &self,
+        resource: u32,
+        size: u64,
+        aperture_length: Option<u64>,
+    ) -> axdriver_base::DevResult<HostVisibleApertureLease> {
+        const PAGE: u64 = 4096;
+        if resource == 0 || size == 0 {
+            return Err(axdriver_base::DevError::InvalidParam);
+        }
+        let length = size
+            .checked_add(PAGE - 1)
+            .map(|value| value & !(PAGE - 1))
+            .ok_or(axdriver_base::DevError::InvalidParam)?;
+        let mut state = self.inner.lock();
+        match (state.length, aperture_length) {
+            (Some(old), Some(new)) if old != new => return Err(axdriver_base::DevError::BadState),
+            (Some(_), _) => {}
+            (None, Some(length)) if length != 0 => state.length = Some(length),
+            (None, _) => return Err(axdriver_base::DevError::Unsupported),
+        }
+        let aperture_length = state.length.ok_or(axdriver_base::DevError::Unsupported)?;
+        if state.ranges.iter().any(|range| range.resource == resource) {
+            return Err(axdriver_base::DevError::ResourceBusy);
+        }
+        let mut offset = 0u64;
+        let mut insert_at = state.ranges.len();
+        for (index, range) in state.ranges.iter().enumerate() {
+            if offset
+                .checked_add(length)
+                .is_some_and(|end| end <= range.offset)
+            {
+                insert_at = index;
+                break;
+            }
+            offset = range
+                .offset
+                .checked_add(range.length)
+                .ok_or(axdriver_base::DevError::BadState)?;
+        }
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > aperture_length)
+        {
+            return Err(axdriver_base::DevError::ResourceBusy);
+        }
+        state
+            .ranges
+            .try_reserve(1)
+            .map_err(|_| axdriver_base::DevError::NoMemory)?;
+        state.ranges.insert(
+            insert_at,
+            ApertureRange {
+                resource,
+                offset,
+                length,
+            },
+        );
+        Ok(HostVisibleApertureLease {
+            inner: self.inner.clone(),
+            resource,
+            offset,
+            length,
+        })
+    }
+}
+
+impl Default for HostVisibleAperture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HostVisibleApertureLease {
+    pub fn resource(&self) -> u32 {
+        self.resource
+    }
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+}
+
+impl Drop for HostVisibleApertureLease {
+    fn drop(&mut self) {
+        let mut state = self.inner.lock();
+        if let Some(index) = state.ranges.iter().position(|range| {
+            range.resource == self.resource
+                && range.offset == self.offset
+                && range.length == self.length
+        }) {
+            state.ranges.remove(index);
+        }
+    }
+}
+
 pub struct FrameBuffer<'a> {
     _raw: &'a mut [u8],
 }
@@ -149,9 +290,21 @@ pub enum GpuBatch {
         width: u32,
         height: u32,
     },
+    /// Upload one bounded rectangle of a classic 2D resource. This preserves
+    /// the legacy DRM transfer ioctl's offset and box semantics without
+    /// making callers construct VirtIO wire headers.
+    Transfer2dRect {
+        resource: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        offset: u32,
+    },
     Create2d {
         width: u32,
         height: u32,
+        format: u32,
         entries: Vec<(u64, u32)>,
     },
     Present {
@@ -292,6 +445,11 @@ pub struct BlobMapInfo {
 /// the owner keeps the mapped resource/aperture live until terminal unmap.
 pub struct BlobMapping {
     pub pages: Vec<u64>,
+    /// The guest-selected host-visible aperture byte offset returned by
+    /// MAP_BLOB. It is the owner of the reservation, not a physical address.
+    pub aperture_offset: u64,
+    /// VirtIO GPU MAP_CACHE_* attributes from the terminal host response.
+    pub cache_policy: u32,
     pub lease: Arc<dyn Any + Send + Sync>,
 }
 
@@ -320,7 +478,7 @@ pub trait GpuTransport {
     ) -> DevResult<GpuSubmission>;
     /// Drain a bounded number of terminal records from exactly one queue.
     fn drain_completions(&mut self, queue: GpuQueue, out: &mut [GpuCompletion])
-        -> DevResult<usize>;
+    -> DevResult<usize>;
     /// Reset one queue. Every returned completion is terminal with an error;
     /// reset is never successful execution.
     fn reset(&mut self, queue: GpuQueue, out: &mut [GpuCompletion]) -> usize;
@@ -334,9 +492,6 @@ impl GpuFeatures {
     pub const CONTEXT_INIT: Self = Self(1 << 2);
     /// The driver has a hostmem aperture that it can map into the guest.
     pub const HOST_VISIBLE: Self = Self(1 << 3);
-    /// The device negotiated the legacy VIRGL 3D feature.  A resource-blob
-    /// capable Venus-only device need not provide this command stream ABI.
-    pub const VIRGL_3D: Self = Self(1 << 4);
     /// The device negotiated the legacy VIRGL 3D feature.  A resource-blob
     /// capable Venus-only device need not provide this command stream ABI.
     pub const VIRGL_3D: Self = Self(1 << 4);
@@ -482,5 +637,23 @@ pub trait DisplayDriverOps: BaseDriverOps {
     /// framebuffer state.
     fn drm_display_config_changed(&mut self) -> DevResult<Option<DrmDisplayConfig>> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod host_visible_aperture_tests {
+    use super::*;
+
+    #[test]
+    fn reservations_align_first_fit_and_release_on_last_lease_drop() {
+        let aperture = HostVisibleAperture::new();
+        let first = aperture.reserve(1, 1, Some(3 * 4096)).unwrap();
+        assert_eq!((first.offset(), first.length()), (0, 4096));
+        let second = aperture.reserve(2, 4097, Some(3 * 4096)).unwrap();
+        assert_eq!((second.offset(), second.length()), (4096, 8192));
+        assert!(aperture.reserve(2, 4096, Some(3 * 4096)).is_err());
+        drop(first);
+        let reused = aperture.reserve(3, 4096, Some(3 * 4096)).unwrap();
+        assert_eq!(reused.offset(), 0);
     }
 }
