@@ -2440,24 +2440,16 @@ mod tests {
 
     #[test]
     fn adlp_stride_limits_obey_byte_boundary_in_both_orientations() {
-        let info = DrmFormatInfo {
-            format: DRM_FORMAT_XRGB8888,
-            depth: 24,
-            num_planes: 1,
-            _anon_6: unsafe { core::mem::zeroed() },
-            block_w: [1; 4],
-            block_h: [1; 4],
-            hsub: 1,
-            vsub: 1,
-            has_alpha: false,
-            is_yuv: false,
-            is_color_indexed: false,
-        };
+        // Use the canonical DRM format metadata: cpp[0] is 4 for XRGB8888.
+        // Zero-initializing the anonymous format-info union made this an
+        // invalid fixture and incorrectly exercised the cpp==0 guard.
+        let info = tk_drm_upstream::drm_fourcc_upstream::drm_format_info(DRM_FORMAT_XRGB8888);
+        assert!(!info.is_null());
         assert_eq!(
             unsafe {
                 plane_max_stride(
                     ptr::null_mut(),
-                    &info as *const _ as *mut _,
+                    info.cast_mut(),
                     DRM_FORMAT_MOD_LINEAR,
                     DRM_MODE_ROTATE_0,
                 )
@@ -2468,7 +2460,7 @@ mod tests {
             unsafe {
                 plane_max_stride(
                     ptr::null_mut(),
-                    &info as *const _ as *mut _,
+                    info.cast_mut(),
                     DRM_FORMAT_MOD_LINEAR,
                     DRM_MODE_ROTATE_90,
                 )
