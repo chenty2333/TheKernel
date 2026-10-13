@@ -625,47 +625,7 @@ pub unsafe extern "C" fn __intel_display_power_put_async(
 }
 
 
-// upstream: display/intel_frontbuffer.c intel_frontbuffer_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_frontbuffer_init(_front: *mut c_void, _drm: *mut c_void) {
-    panic!(
-        "intel_frontbuffer_init: TheKernel's scanout owner does not track upstream frontbuffers"
-    );
-}
-
-// upstream: display/intel_frontbuffer.c intel_frontbuffer_fini()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_frontbuffer_fini(_front: *mut c_void) {
-    panic!(
-        "intel_frontbuffer_fini: no frontbuffer exists because intel_frontbuffer_init fails closed"
-    );
-}
-
-// upstream: display/intel_frontbuffer.c __intel_frontbuffer_flush()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __intel_frontbuffer_flush(
-    _front: *mut c_void,
-    _origin: c_int,
-    _bits: u32,
-) {
-    panic!(
-        "__intel_frontbuffer_flush: no frontbuffer exists because intel_frontbuffer_init fails \
-         closed"
-    );
-}
-
-// upstream: display/intel_frontbuffer.c __intel_frontbuffer_invalidate()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __intel_frontbuffer_invalidate(
-    _front: *mut c_void,
-    _origin: c_int,
-    _bits: u32,
-) {
-    panic!(
-        "__intel_frontbuffer_invalidate: no frontbuffer exists because intel_frontbuffer_init \
-         fails closed"
-    );
-}
+// Frontbuffer entry points are provided by tk-intel-gt::intel_frontbuffer_upstream.
 
 // upstream: display/intel_overlay.c intel_overlay_available()
 /// Overlay hardware is absent on ADL-N and every other supported platform, so
