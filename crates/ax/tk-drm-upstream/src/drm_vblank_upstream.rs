@@ -1051,18 +1051,19 @@ pub unsafe extern "C" fn drm_crtc_wait_one_vblank(crtc: *mut DrmCrtc) -> i32 {
             return ret;
         }
 
+        let vblank = drm_crtc_vblank_crtc(crtc);
         let last = drm_vblank_count(dev, pipe);
-        let ok = tk_linux_kapi::wait::wait_until(
-            1_000_000_000,
-            || drm_vblank_count(dev, pipe) != last,
-            false,
+        let wait = tk_linux_kapi::wait_event_timeout!(
+            (*vblank).queue,
+            last != drm_vblank_count(dev, pipe),
+            tk_linux_kapi::primitives::msecs_to_jiffies(1000u32),
         );
 
         // drm_WARN(dev, ret == 0, "vblank wait timed out on crtc %i\n", pipe)
-        warn_on(!ok);
+        warn_on(wait == 0);
         drm_vblank_put(dev, pipe);
 
-        if ok { 0 } else { -ETIMEDOUT }
+        if wait != 0 { 0 } else { -ETIMEDOUT }
     }
 }
 
@@ -1516,16 +1517,18 @@ pub unsafe extern "C" fn drm_wait_vblank_ioctl(dev: *mut DrmDevice, data: *mut c
 
             if req_seq != seq {
                 // drm_dbg_core(...): dropped
-                let ok = tk_linux_kapi::wait::wait_until(
-                    3_000_000_000,
-                    || {
-                        drm_vblank_passed(drm_vblank_count(dev, pipe), req_seq)
-                            || !core::ptr::read_volatile(core::ptr::addr_of!((*vblank).enabled))
-                    },
-                    false,
+                let wait = tk_linux_kapi::wait_event_interruptible_timeout!(
+                    (*vblank).queue,
+                    drm_vblank_passed(drm_vblank_count(dev, pipe), req_seq)
+                        || !core::ptr::read_volatile(core::ptr::addr_of!((*vblank).enabled)),
+                    tk_linux_kapi::primitives::msecs_to_jiffies(3000u32),
                 );
-                // timeout -> -EBUSY; a signal (-ERESTARTSYS -> -EINTR) is not modelled
-                ret = if ok { 0 } else { -EBUSY };
+                match wait {
+                    0 => ret = -EBUSY,
+                    w if w == -(tk_linux_kapi::config::ERESTARTSYS as i64) => ret = -EINTR,
+                    w if w < 0 => ret = -EINTR,
+                    _ => ret = 0,
+                }
             }
 
             if ret != -EINTR {
@@ -2321,6 +2324,108 @@ mod tests {
             assert_eq!(drm_vblank_work_schedule(&mut work, 3, false), 1);
             assert_eq!(pending_stubs_queued_works(), std::vec![core::ptr::addr_of_mut!(work.base) as usize]);
             assert!(list_empty(&work.node));
+        }
+    }
+
+    #[test]
+    fn wait_one_vblank_succeeds_when_vblank_arrives() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fx = Fixture::new(1);
+        let dev = fx.dev();
+        let crtc = fx.crtc(0);
+        unsafe {
+            let v = fx.vblank(0);
+            (*v).max_vblank_count = u32::MAX;
+            HW_COUNTER.store(1, Ordering::SeqCst);
+            assert_eq!(drm_vblank_get(dev, 0), 0);
+            drm_vblank_put(dev, 0);
+
+            let dev_addr = dev as usize;
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                HW_COUNTER.store(2, Ordering::SeqCst);
+                drm_handle_vblank(dev_addr as *mut DrmDevice, 0);
+            });
+
+            let ret = drm_crtc_wait_one_vblank(crtc);
+            assert_eq!(ret, 0);
+        }
+    }
+
+    #[test]
+    fn wait_vblank_ioctl_succeeds_when_sequence_arrives() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fx = Fixture::new(1);
+        let dev = fx.dev();
+        unsafe {
+            let v = fx.vblank(0);
+            (*v).max_vblank_count = u32::MAX;
+            HW_COUNTER.store(1, Ordering::SeqCst);
+            assert_eq!(drm_vblank_get(dev, 0), 0);
+            drm_vblank_put(dev, 0);
+
+            let mut vblwait: DrmWaitVblank = core::mem::zeroed();
+            (*wv_req(&mut vblwait)).r#type = _DRM_VBLANK_ABSOLUTE;
+            (*wv_req(&mut vblwait)).sequence = 2;
+
+            let dev_addr = dev as usize;
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                HW_COUNTER.store(2, Ordering::SeqCst);
+                drm_handle_vblank(dev_addr as *mut DrmDevice, 0);
+            });
+
+            let ret = drm_wait_vblank_ioctl(dev, &mut vblwait as *mut _ as *mut c_void, core::ptr::null_mut());
+            assert_eq!(ret, 0);
+        }
+    }
+
+    #[test]
+    fn wait_one_vblank_times_out_when_no_vblank() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fx = Fixture::new(1);
+        let dev = fx.dev();
+        let crtc = fx.crtc(0);
+        unsafe {
+            let v = fx.vblank(0);
+            (*v).max_vblank_count = u32::MAX;
+            HW_COUNTER.store(1, Ordering::SeqCst);
+            assert_eq!(drm_vblank_get(dev, 0), 0);
+            drm_vblank_put(dev, 0);
+
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                tk_linux_kapi::clock::test_advance_ns(2_000_000_000);
+            });
+
+            let ret = drm_crtc_wait_one_vblank(crtc);
+            assert_eq!(ret, -ETIMEDOUT);
+        }
+    }
+
+    #[test]
+    fn wait_vblank_ioctl_times_out_with_ebusy() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fx = Fixture::new(1);
+        let dev = fx.dev();
+        unsafe {
+            let v = fx.vblank(0);
+            (*v).max_vblank_count = u32::MAX;
+            HW_COUNTER.store(1, Ordering::SeqCst);
+            assert_eq!(drm_vblank_get(dev, 0), 0);
+            drm_vblank_put(dev, 0);
+
+            let mut vblwait: DrmWaitVblank = core::mem::zeroed();
+            (*wv_req(&mut vblwait)).r#type = _DRM_VBLANK_ABSOLUTE;
+            (*wv_req(&mut vblwait)).sequence = 5;
+
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                tk_linux_kapi::clock::test_advance_ns(4_000_000_000);
+            });
+
+            let ret = drm_wait_vblank_ioctl(dev, &mut vblwait as *mut _ as *mut c_void, core::ptr::null_mut());
+            assert_eq!(ret, -EBUSY);
         }
     }
 }

@@ -50,7 +50,12 @@ static TASK_WAKE: axtask::WaitQueue = axtask::WaitQueue::new();
 
 #[inline]
 fn current_task_key() -> usize {
-    axhal::percpu::current_task_ptr::<()>() as usize
+    let ptr = axhal::percpu::current_task_ptr::<()>() as usize;
+    if ptr != 0 {
+        ptr
+    } else {
+        1
+    }
 }
 
 fn set_task_state(task: usize, state: u32) {

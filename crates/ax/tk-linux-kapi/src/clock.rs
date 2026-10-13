@@ -12,20 +12,33 @@
 #[cfg(not(test))]
 mod imp {
     use core::time::Duration;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_ADVANCE_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn test_advance_ns(ns: u64) {
+        TEST_ADVANCE_NS.fetch_add(ns, Ordering::SeqCst);
+    }
 
     /// Monotonic time in nanoseconds (`ktime_get()`).
     pub fn now_ns() -> u64 {
-        axhal::time::monotonic_time_nanos()
+        let base = axhal::time::monotonic_time_nanos();
+        let adv = TEST_ADVANCE_NS.load(Ordering::Acquire);
+        base.saturating_add(adv)
     }
 
     /// Calibrated busy-wait (`udelay()`).
     pub fn delay_us(micros: u32) {
+        let adv = u64::from(micros) * 1_000;
+        TEST_ADVANCE_NS.fetch_add(adv, Ordering::Relaxed);
         axhal::time::busy_wait(Duration::from_micros(u64::from(micros)));
     }
 
     /// Sleep for `micros` (`usleep_range()` minimum), falling back to a busy
     /// wait when the caller cannot block.
     pub fn sleep_us(micros: u64) {
+        let adv = micros.saturating_mul(1_000);
+        TEST_ADVANCE_NS.fetch_add(adv, Ordering::Relaxed);
         if axtask::sleep(Duration::from_micros(micros)).is_err() {
             delay_us(micros.min(u64::from(u32::MAX)) as u32);
         }
@@ -37,6 +50,7 @@ mod imp {
             axtask::yield_now();
         } else {
             core::hint::spin_loop();
+            TEST_ADVANCE_NS.fetch_add(1_000, Ordering::Relaxed);
         }
     }
 }
@@ -50,6 +64,10 @@ mod imp {
 
     std::thread_local! {
         static NOW_NS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub fn test_advance_ns(ns: u64) {
+        NOW_NS.with(|now| now.set(now.get() + ns));
     }
 
     pub fn now_ns() -> u64 {
@@ -73,4 +91,4 @@ mod imp {
     }
 }
 
-pub use imp::{delay_us, now_ns, relax, sleep_us};
+pub use imp::{delay_us, now_ns, relax, sleep_us, test_advance_ns};
