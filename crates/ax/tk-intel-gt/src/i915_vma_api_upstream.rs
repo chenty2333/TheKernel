@@ -23,7 +23,7 @@ use crate::{
     i915_vma_resource_types_upstream::I915VmaResource,
     i915_vma_types_upstream::I915Vma,
     intel_context_upstream::{
-        DmaFence, DrmI915GemObject, I915AddressSpace, I915GemWwCtx, I915GttView, Kref,
+        DmaFence, DrmI915GemObject, DrmMmNode, I915AddressSpace, I915GemWwCtx, I915GttView, Kref,
     },
     intel_engine_cs_upstream::AtomicT,
     intel_gt_types_upstream::IntelGt,
@@ -205,13 +205,16 @@ pub unsafe fn i915_ggtt_pin_bias(vma: *const I915Vma) -> u32 {
     unsafe { (*ggtt).pin_bias }
 }
 
+// upstream: i915_vma.h i915_node_color_differs()
+#[inline]
+pub unsafe fn i915_node_color_differs(node: *const DrmMmNode, color: c_ulong) -> bool {
+    unsafe { crate::linux::gem_memory::drm_mm_node_allocated(node) && (*node).color != color }
+}
+
 // `__i915_vma_size`, `i915_vma_size`, `__i915_vma_offset`,
-// `i915_vma_offset`, `i915_ggtt_offset`, and `i915_node_color_differs`
-// (i915_vma.h:128-181, 332-336) need `drm_mm_node.start/size/color` and the
-// node-allocation bit. The current DRM MM binding deliberately keeps
-// `DrmMmNode` opaque, so these inline accessors cannot be represented here
-// faithfully until the drm_mm.h owner binding exposes those members/helpers.
-// `i915_ggtt_pin_bias` (183-186) is implemented below from the owning GGTT
+// `i915_vma_offset`, and `i915_ggtt_offset` (i915_vma.h:128-181)
+// need `drm_mm_node.start/size` and the node-allocation bit.
+// `i915_ggtt_pin_bias` (183-186) is implemented above from the owning GGTT
 // header's `pin_bias` member and `i915_vm_to_ggtt()` helper.
 //
 // `i915_vma_compare` (207-249) requires the full `i915_gtt_view` union payload
