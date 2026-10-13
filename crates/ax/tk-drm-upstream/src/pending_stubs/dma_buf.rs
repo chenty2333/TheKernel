@@ -61,7 +61,8 @@ pub unsafe extern "C" fn dma_buf_get(fd: c_int) -> *mut DmaBuf {
             return ptr;
         }
     }
-    (-EINVAL as isize) as *mut DmaBuf
+    // upstream: drivers/dma-buf/dma-buf.c dma_buf_get() ERR_PTR(-EBADF)
+    (-9isize) as *mut DmaBuf
 }
 
 // upstream: drivers/dma-buf/dma-buf.c dma_buf_map_attachment_unlocked()
@@ -80,11 +81,8 @@ pub unsafe extern "C" fn dma_buf_map_attachment_unlocked(
                 return map(attach, direction);
             }
         }
-        let sg = kmalloc(core::mem::size_of::<SgTable>(), GFP_KERNEL).cast::<SgTable>();
-        if !sg.is_null() {
-            core::ptr::write_bytes(sg, 0, 1);
-        }
-        sg
+        // upstream: drivers/dma-buf/dma-buf.c missing map_dma_buf error fallback
+        (-EINVAL as isize) as *mut SgTable
     }
 }
 
@@ -101,12 +99,8 @@ pub unsafe extern "C" fn dma_buf_unmap_attachment_unlocked(
             if let Some(ops) = (*dmabuf).ops.as_ref() {
                 if let Some(unmap) = ops.unmap_dma_buf {
                     unmap(attach, sgt, direction);
-                    return;
                 }
             }
-        }
-        if !sgt.is_null() {
-            kfree(sgt.cast::<c_void>());
         }
     }
 }

@@ -18,9 +18,10 @@ pub unsafe extern "C" fn drm_bridge_detach(_bridge: *mut c_void) {}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_writeback_cleanup_job(_job: *mut c_void) {}
 
+// upstream: drivers/gpu/drm/drm_writeback.c drm_writeback_set_fb() absent feature fallback
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_writeback_set_fb(_conn_state: *mut c_void, _fb: *mut c_void) -> i32 {
-    0
+    -tk_linux_kapi::config::EOPNOTSUPP
 }
 
 #[unsafe(no_mangle)]

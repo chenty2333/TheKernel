@@ -11,7 +11,29 @@
 #![allow(clippy::missing_safety_doc)]
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+pub static DMA_FENCE_INIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub static DMA_FENCE_GET_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub static DMA_FENCE_PUT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+pub fn reset_dma_fence_counts() {
+    DMA_FENCE_INIT_COUNT.store(0, Ordering::SeqCst);
+    DMA_FENCE_GET_COUNT.store(0, Ordering::SeqCst);
+    DMA_FENCE_PUT_COUNT.store(0, Ordering::SeqCst);
+}
+
+pub fn dma_fence_init_count() -> usize {
+    DMA_FENCE_INIT_COUNT.load(Ordering::SeqCst)
+}
+
+pub fn dma_fence_get_count() -> usize {
+    DMA_FENCE_GET_COUNT.load(Ordering::SeqCst)
+}
+
+pub fn dma_fence_put_count() -> usize {
+    DMA_FENCE_PUT_COUNT.load(Ordering::SeqCst)
+}
 
 use tk_linux_kapi::config::GFP_KERNEL;
 use tk_linux_kapi::memory::{kfree, kmalloc};
@@ -38,11 +60,17 @@ pub unsafe extern "C" fn dma_fence_init(
     context: u64,
     seqno: u64,
 ) {
-    unsafe {
-        (*fence).ops = ops;
-        (*fence).lock.extern_lock = lock;
-        (*fence).context = context;
-        (*fence).seqno = seqno;
+    if !fence.is_null() {
+        DMA_FENCE_INIT_COUNT.fetch_add(1, Ordering::SeqCst);
+        unsafe {
+            (*fence).ops = ops;
+            (*fence).lock.extern_lock = lock;
+            (*fence).context = context;
+            (*fence).seqno = seqno;
+            (*fence).flags = 0;
+            (*fence).error = 0;
+            tk_linux_kapi::memory::kref_init(core::ptr::addr_of_mut!((*fence).refcount));
+        }
     }
 }
 
@@ -106,10 +134,35 @@ pub unsafe extern "C" fn dma_buf_put(dmabuf: *mut DmaBuf) {
     }
 }
 
+// upstream: drivers/dma-buf/dma-fence.c dma_fence_get()
+#[cfg(test)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_fence_get(fence: *mut DmaFence) -> *mut DmaFence {
+    if !fence.is_null() {
+        DMA_FENCE_GET_COUNT.fetch_add(1, Ordering::SeqCst);
+        unsafe {
+            tk_linux_kapi::memory::kref_get(core::ptr::addr_of_mut!((*fence).refcount));
+        }
+    }
+    fence
+}
+
+unsafe extern "C" fn host_test_fence_release(_kref: *mut tk_linux_kapi::types::Kref) {}
+
 // upstream: drivers/dma-buf/dma-fence.c dma_fence_put()
 #[cfg(test)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_put(_fence: *mut DmaFence) {}
+pub unsafe extern "C" fn dma_fence_put(fence: *mut DmaFence) {
+    if !fence.is_null() {
+        DMA_FENCE_PUT_COUNT.fetch_add(1, Ordering::SeqCst);
+        unsafe {
+            tk_linux_kapi::memory::kref_put(
+                core::ptr::addr_of_mut!((*fence).refcount),
+                host_test_fence_release,
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 #[unsafe(no_mangle)]

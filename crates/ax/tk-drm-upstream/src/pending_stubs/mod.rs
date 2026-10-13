@@ -24,3 +24,7 @@ pub mod test_records;
 
 #[cfg(test)]
 pub use test_records::{pending_stubs_delivered_events, pending_stubs_queued_works, pending_stubs_reset_records};
+#[cfg(test)]
+pub use host_test_links::{
+    dma_fence_get_count, dma_fence_init_count, dma_fence_put_count, reset_dma_fence_counts,
+};

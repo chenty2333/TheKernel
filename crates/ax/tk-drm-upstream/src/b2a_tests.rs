@@ -208,10 +208,15 @@ fn allocate_a_commit() {
     let dev = fixture.dev();
 
     unsafe {
+        let initial_dev_refs = tk_linux_kapi::memory::kref_read(&(*dev).r#ref);
+        assert_eq!(initial_dev_refs, 1);
+
         let commit = drm_atomic_commit_alloc(dev);
         assert!(!commit.is_null());
         assert_eq!((*commit).dev, dev);
         assert_eq!((*commit).r#ref.refcount.refs.counter, 1);
+        // drm_atomic_commit_init increments dev reference count via drm_dev_get()
+        assert_eq!(tk_linux_kapi::memory::kref_read(&(*dev).r#ref), 2);
 
         drm_atomic_commit_get(commit);
         assert_eq!((*commit).r#ref.refcount.refs.counter, 2);
@@ -220,6 +225,8 @@ fn allocate_a_commit() {
         assert_eq!((*commit).r#ref.refcount.refs.counter, 1);
 
         drm_atomic_commit_put(commit);
+        // Final commit put frees commit and drops dev reference via drm_dev_put()
+        assert_eq!(tk_linux_kapi::memory::kref_read(&(*dev).r#ref), 1);
     }
 }
 
@@ -498,5 +505,57 @@ fn add_affected_connectors_test() {
         drm_atomic_commit_put(commit);
         drm_modeset_drop_locks(&mut ctx);
         drm_modeset_acquire_fini(&mut ctx);
+    }
+}
+
+#[test]
+fn test_dma_fence_lifecycle_and_refcount_balance() {
+    use crate::drm_crtc_upstream::drm_crtc_create_fence;
+    use crate::pending_stubs::host_test_links::{
+        dma_fence_get, dma_fence_get_count, dma_fence_init_count, dma_fence_put,
+        dma_fence_put_count, reset_dma_fence_counts,
+    };
+    use tk_linux_kapi::types::DmaFence;
+
+    let mut fixture = TestFixture::new();
+    let crtc = fixture.crtc.as_mut() as *mut DrmCrtc;
+
+    reset_dma_fence_counts();
+    assert_eq!(dma_fence_init_count(), 0);
+    assert_eq!(dma_fence_get_count(), 0);
+    assert_eq!(dma_fence_put_count(), 0);
+
+    unsafe {
+        // drm_crtc_create_fence initializes a fence via dma_fence_init
+        let fence: *mut DmaFence = drm_crtc_create_fence(crtc);
+        assert!(!fence.is_null());
+        assert_eq!(dma_fence_init_count(), 1);
+        assert_eq!(tk_linux_kapi::memory::kref_read(&(*fence).refcount), 1);
+
+        // Explicit get increments refcount and counter
+        let got = dma_fence_get(fence);
+        assert_eq!(got, fence);
+        assert_eq!(dma_fence_get_count(), 1);
+        assert_eq!(tk_linux_kapi::memory::kref_read(&(*fence).refcount), 2);
+
+        // Put drops one reference
+        dma_fence_put(fence);
+        assert_eq!(dma_fence_put_count(), 1);
+        assert_eq!(tk_linux_kapi::memory::kref_read(&(*fence).refcount), 1);
+
+        // Attaching fence to plane state and destroying plane state exercises cleanup put
+        let plane_state = drm_atomic_helper_plane_duplicate_state(fixture.plane.as_mut() as *mut _);
+        assert!(!plane_state.is_null());
+        (*plane_state).fence = fence;
+
+        // Plane destroy calls dma_fence_put(fence) and frees plane_state
+        drm_atomic_helper_plane_destroy_state(fixture.plane.as_mut() as *mut _, plane_state);
+        assert_eq!(dma_fence_put_count(), 2);
+        assert_eq!(tk_linux_kapi::memory::kref_read(&(*fence).refcount), 0);
+
+        tk_linux_kapi::memory::kfree(fence.cast::<c_void>());
+
+        // Assert balanced get/put: 1 init + 1 get == 2 puts
+        assert_eq!(dma_fence_init_count() + dma_fence_get_count(), dma_fence_put_count());
     }
 }
