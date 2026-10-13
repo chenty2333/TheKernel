@@ -2254,4 +2254,10 @@ Both files carry MIT licenses in upstream Linux 7.2.3 and are recorded in `crate
 
 The Linux DRM infrastructure core translations (`crates/ax/tk-drm-upstream`, batch BI: `drm_drv_upstream.rs`, `drm_file_upstream.rs`, `drm_gem_upstream.rs`, `drm_prime_upstream.rs`, `drm_ioctl_upstream.rs`, `drm_auth_upstream.rs`, `drm_vma_manager_upstream.rs`, `drm_lease_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned `crates/ax` totals: threshold >=40 `(0,0,0,850,820,0,0)` (was 837/807), threshold >=25 `(18,15,4,2288,2250,0,0)` (was 2238/2200). `crates/linux` and `kernel/src` are unchanged.
 
+## 2026-10-13 i915 display foundation B3a reconciliation
+
+The Linux i915 display foundation translations (`crates/ax/tk-intel-gt`, batch B3a: `intel_bo_upstream.rs`, `intel_de_upstream.rs`, `intel_display_clock_gating_upstream.rs`, `intel_display_conversion_upstream.rs`, `intel_display_device_upstream.rs`, `intel_display_driver_upstream.rs`, `intel_display_params_upstream.rs`, `intel_display_reset_upstream.rs`, `intel_display_rpm_upstream.rs`, `intel_display_rps_upstream.rs`, `intel_display_utils_upstream.rs`, `intel_display_wa_upstream.rs`, `intel_parent_upstream.rs`, `intel_quirks_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. The pinned `crates/ax` totals and the per-batch increment are recorded next to `SCAN_BASELINE` in `tests/ci/test_linux_excerpt_baseline.py`. `crates/linux` and `kernel/src` are unchanged.
+
+Licensing:
+All translated display sources carry MIT licenses in upstream Linux 7.2.3 (SPDX-License-Identifier: MIT) and are recorded in `crates/ax/tk-intel-gt/NOTICE`.
 

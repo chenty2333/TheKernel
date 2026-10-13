@@ -622,3 +622,37 @@ pub mod skl_watermark_regs_upstream;
 pub mod vlv_dpio_phy_regs_upstream;
 #[allow(unsafe_code)]
 pub mod vlv_dsi_regs_upstream;
+
+pub mod display_pending_stubs;
+
+#[allow(unsafe_code)]
+pub mod intel_display_conversion_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_utils_upstream;
+#[allow(unsafe_code)]
+pub mod intel_parent_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_rpm_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_rps_upstream;
+#[allow(unsafe_code)]
+pub mod intel_bo_upstream;
+#[allow(unsafe_code)]
+pub mod intel_de_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_params_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_wa_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_clock_gating_upstream;
+#[allow(unsafe_code)]
+pub mod intel_quirks_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_device_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_driver_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_reset_upstream;
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod b3a_tests;
