@@ -7,22 +7,23 @@
 #![allow(non_snake_case, dead_code, unsafe_code)]
 
 use crate::intel_display_core_types_upstream::IntelDisplay;
+pub use crate::{
+    intel_dpll_mgr_upstream::{
+        icl_set_active_port_dpll, icl_tc_port_to_pll_id, intel_dpll_compare_hw_state,
+        intel_dpll_compute, intel_dpll_crtc_put, intel_dpll_disable, intel_dpll_dump_hw_state,
+        intel_dpll_enable, intel_dpll_get_freq, intel_dpll_get_hw_state, intel_dpll_init,
+        intel_dpll_is_combophy, intel_dpll_readout_hw_state, intel_dpll_release,
+        intel_dpll_reserve, intel_dpll_sanitize_state, intel_dpll_swap_state,
+        intel_dpll_update_active, intel_dpll_update_ref_clks, intel_get_dpll_by_id,
+    },
+    intel_dpll_upstream::{
+        intel_dpll_crtc_compute_clock, intel_dpll_crtc_get_dpll, intel_dpll_init_clock_hook,
+    },
+};
 
 // upstream: intel_dkl_phy.c intel_dkl_phy_init()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_dkl_phy_init(_display: *mut IntelDisplay) {}
-
-// upstream: intel_dpll.c intel_dpll_init_clock_hook()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dpll_init_clock_hook(_display: *mut IntelDisplay) {}
-
-// upstream: intel_dpll.c intel_dpll_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dpll_init(_display: *mut IntelDisplay) {}
-
-// upstream: intel_dpll.c intel_dpll_update_ref_clks()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dpll_update_ref_clks(_display: *mut IntelDisplay) {}
 
 // upstream: intel_combo_phy.c intel_combo_phy_init()
 #[unsafe(no_mangle)]
