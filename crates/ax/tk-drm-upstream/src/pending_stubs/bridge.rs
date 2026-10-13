@@ -27,3 +27,67 @@ pub unsafe extern "C" fn drm_writeback_set_fb(_conn_state: *mut c_void, _fb: *mu
 pub unsafe extern "C" fn drm_writeback_get_out_fence(_wb_conn: *mut c_void) -> *mut tk_linux_kapi::types::DmaFence {
     core::ptr::null_mut()
 }
+
+// upstream: drm_bridge.c drm_atomic_bridge_chain_check()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_atomic_bridge_chain_check(
+    _bridge: *mut c_void,
+    _crtc_state: *mut c_void,
+    _conn_state: *mut c_void,
+) -> i32 {
+    0
+}
+
+// upstream: drm_bridge.c drm_atomic_bridge_chain_disable()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_atomic_bridge_chain_disable(_bridge: *mut c_void, _state: *mut c_void) {}
+
+// upstream: drm_bridge.c drm_atomic_bridge_chain_post_disable()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_atomic_bridge_chain_post_disable(_bridge: *mut c_void, _state: *mut c_void) {}
+
+// upstream: drm_bridge.c drm_atomic_bridge_chain_pre_enable()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_atomic_bridge_chain_pre_enable(_bridge: *mut c_void, _state: *mut c_void) {}
+
+// upstream: drm_bridge.c drm_atomic_bridge_chain_enable()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_atomic_bridge_chain_enable(_bridge: *mut c_void, _state: *mut c_void) {}
+
+// upstream: drm_bridge.c drm_bridge_chain_get_first_bridge()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_bridge_chain_get_first_bridge(_encoder: *mut c_void) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+// upstream: drm_bridge.c drm_bridge_chain_mode_set()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_bridge_chain_mode_set(
+    _bridge: *mut c_void,
+    _mode: *const c_void,
+    _adj_mode: *const c_void,
+) {}
+
+// upstream: drm_bridge.c drm_bridge_chain_mode_valid()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_bridge_chain_mode_valid(
+    _bridge: *mut c_void,
+    _info: *const c_void,
+    _mode: *const c_void,
+) -> i32 {
+    0
+}
+
+// upstream: drm_bridge.c drm_bridge_helper_reset_crtc()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_bridge_helper_reset_crtc(_crtc: *mut c_void) {}
+
+// upstream: drm_bridge.c drm_bridge_put()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_bridge_put(_bridge: *mut c_void) {}
+
+// upstream: drm_writeback.c drm_writeback_prepare_job()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_writeback_prepare_job(_job: *mut c_void) -> i32 {
+    0
+}

@@ -122,3 +122,35 @@ pub unsafe extern "C" fn sync_file_create(_fence: *mut DmaFence) -> *mut c_void 
 pub unsafe extern "C" fn sync_file_get_fence(_fd: i32) -> *mut DmaFence {
     core::ptr::null_mut()
 }
+
+#[cfg(test)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_fence_get(fence: *mut DmaFence) -> *mut DmaFence {
+    fence
+}
+
+#[cfg(test)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_resv_get_singleton(
+    _resv: *mut crate::dma_resv_types::DmaResv,
+    _usage: i32,
+    fence: *mut *mut DmaFence,
+) -> i32 {
+    if !fence.is_null() {
+        unsafe { *fence = core::ptr::null_mut() };
+    }
+    0
+}
+
+#[cfg(test)]
+#[unsafe(no_mangle)]
+pub static dma_fence_chain_ops: u8 = 42;
+
+#[cfg(test)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_fence_wait(_fence: *mut tk_linux_kapi::types::DmaFence, _intr: bool) -> i32 {
+    0
+}
+
+
+
