@@ -2438,7 +2438,8 @@ unsafe fn intel_power_domain_set_mask_add(
     }
 }
 
-unsafe fn intel_modeset_get_crtc_power_domains(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_modeset_get_crtc_power_domains(
     state: *const IntelCrtcState,
     put: *mut crate::intel_display_power_types_upstream::IntelPowerDomainMask,
 ) {
@@ -2478,7 +2479,8 @@ unsafe fn intel_modeset_get_crtc_power_domains(
     }
 }
 
-unsafe fn intel_modeset_put_crtc_power_domains(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_modeset_put_crtc_power_domains(
     crtc: *mut IntelCrtc,
     put: *mut crate::intel_display_power_types_upstream::IntelPowerDomainMask,
 ) {
