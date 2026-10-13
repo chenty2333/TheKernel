@@ -613,11 +613,15 @@ pub mod intel_vdsc_regs_upstream;
 #[allow(unsafe_code)]
 pub mod intel_wm_types_upstream;
 #[allow(unsafe_code)]
+pub mod intel_wm_upstream;
+#[allow(unsafe_code)]
 pub mod skl_prefill_types_upstream;
 #[allow(unsafe_code)]
 pub mod skl_universal_plane_regs_upstream;
 #[allow(unsafe_code)]
 pub mod skl_watermark_regs_upstream;
+#[allow(unsafe_code)]
+pub mod skl_watermark_upstream;
 #[allow(unsafe_code)]
 pub mod vlv_dpio_phy_regs_upstream;
 #[allow(unsafe_code)]

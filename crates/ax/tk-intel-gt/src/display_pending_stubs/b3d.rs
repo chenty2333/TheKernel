@@ -26,13 +26,8 @@ pub use crate::{
         gen11_gu_misc_irq_handler, intel_display_irq_ack, intel_display_irq_handler,
         intel_display_irq_init, intel_display_irq_postinstall, intel_display_irq_reset,
     },
+    skl_watermark_upstream::intel_dbuf_init,
 };
-
-// upstream: intel_bw.c intel_dbuf_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dbuf_init(_display: *mut IntelDisplay) -> i32 {
-    0
-}
 
 // upstream: intel_display_irq.c ilk_enable_display_irq()
 #[unsafe(no_mangle)]
