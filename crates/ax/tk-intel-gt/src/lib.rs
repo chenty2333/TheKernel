@@ -626,6 +626,11 @@ pub mod vlv_dsi_regs_upstream;
 pub mod display_pending_stubs;
 
 #[allow(unsafe_code)]
+pub mod intel_bios_upstream;
+#[allow(unsafe_code)]
+pub mod intel_opregion_upstream;
+
+#[allow(unsafe_code)]
 pub mod intel_display_conversion_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_utils_upstream;

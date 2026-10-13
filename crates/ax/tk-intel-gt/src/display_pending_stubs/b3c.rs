@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See ../LICENSE-MIT.
-//! B3c re-exports while the BIOS/OpRegion implementation is being integrated.
+//! B3c re-exports for the translated BIOS and firmware implementations.
 //! DMC, DMC-WL, DRAM and MCHBAR implementations live in their named modules.
 
 #![allow(non_snake_case, dead_code, unsafe_code)]
 
-use crate::intel_display_core_types_upstream::IntelDisplay;
 pub use crate::{
     intel_dmc_upstream::{
         assert_main_dmc_loaded, intel_dmc_block_pkgc, intel_dmc_configure_dc_balance_event,
@@ -25,10 +24,4 @@ pub use crate::{
     intel_mchbar_upstream::{intel_mchbar_read, intel_mchbar_read16, intel_mchbar_read64_2x32},
 };
 
-// BIOS/OpRegion ownership is handled by the parallel B3c BIOS implementation;
-// these two definitions remain temporary until that worker's change lands.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_bios_init(_display: *mut IntelDisplay) {}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_bios_driver_remove(_display: *mut IntelDisplay) {}
+pub use crate::intel_bios_upstream::{intel_bios_driver_remove, intel_bios_init};

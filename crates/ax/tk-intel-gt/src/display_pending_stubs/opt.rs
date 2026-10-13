@@ -7,6 +7,10 @@
 
 use crate::intel_display_core_types_upstream::IntelDisplay;
 
+pub use crate::intel_opregion_upstream::{
+    intel_opregion_headless_sku, intel_opregion_register, intel_opregion_unregister,
+};
+
 // upstream: intel_audio.c intel_audio_hooks_init()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_audio_hooks_init(_display: *mut IntelDisplay) {}
@@ -65,14 +69,6 @@ pub unsafe extern "C" fn intel_vga_register(_display: *mut IntelDisplay) {}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_vga_unregister(_display: *mut IntelDisplay) {}
 
-// upstream: intel_opregion.c intel_opregion_register()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_opregion_register(_display: *mut IntelDisplay) {}
-
-// upstream: intel_opregion.c intel_opregion_unregister()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_opregion_unregister(_display: *mut IntelDisplay) {}
-
 // upstream: intel_acpi.c intel_acpi_video_register()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_acpi_video_register(_display: *mut IntelDisplay) {}
@@ -120,9 +116,3 @@ pub unsafe extern "C" fn intel_fbc_cleanup(_display: *mut IntelDisplay) {}
 // upstream: intel_cx0_phy.c intel_cx0_pll_power_save_wa()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_cx0_pll_power_save_wa(_display: *mut IntelDisplay) {}
-
-// upstream: intel_opregion.c intel_opregion_headless_sku()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_opregion_headless_sku(_display: *mut IntelDisplay) -> bool {
-    false
-}
