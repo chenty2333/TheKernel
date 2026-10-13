@@ -565,6 +565,10 @@ pub mod intel_dpio_phy_types_upstream;
 #[allow(unsafe_code)]
 pub mod intel_dpll_mgr_types_upstream;
 #[allow(unsafe_code)]
+pub mod intel_dpll_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dpll_mgr_upstream;
+#[allow(unsafe_code)]
 pub mod intel_dram_types_upstream;
 #[allow(unsafe_code)]
 pub mod intel_dsb_regs_upstream;
