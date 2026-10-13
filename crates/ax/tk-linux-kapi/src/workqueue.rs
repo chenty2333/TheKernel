@@ -445,7 +445,7 @@ pub fn INIT_WORK<F>(work: &mut WorkStruct, function: F)
 where
     F: for<'a> Fn(&'a mut WorkStruct) + Copy + Send + 'static,
 {
-    init_workqueue_executor().expect("failed to bind the LinuxKPI workqueue executor");
+    let _ = init_workqueue_executor();
     assert_eq!(
         core::mem::size_of::<F>(),
         0,
@@ -472,7 +472,7 @@ where
 
 /// Initialize a work item with an actual C-ABI callback.
 pub fn INIT_WORK_C(work: &mut WorkStruct, function: unsafe extern "C" fn(*mut WorkStruct)) {
-    init_workqueue_executor().expect("failed to bind the LinuxKPI workqueue executor");
+    let _ = init_workqueue_executor();
     work.data = WORK_DATA_INIT as core::ffi::c_ulong;
     let entry = ptr::addr_of_mut!(work.entry);
     work.entry.next = entry;
@@ -608,9 +608,7 @@ pub unsafe fn try_queue_work<Q: WorkqueuePtr, W: WorkStructPtr>(
     if workqueue.is_null() || work.is_null() {
         return Err(WorkqueueError::NullPointer);
     }
-    if WORKER_STATE.load(Ordering::Acquire) != WORKER_READY {
-        return Err(WorkqueueError::WorkerUnavailable);
-    }
+    let _ = init_workqueue_executor();
     if unsafe { (*work).function }.is_none() {
         return Err(WorkqueueError::WorkNotInitialized);
     }
@@ -738,6 +736,7 @@ pub unsafe fn try_flush_work<W: WorkStructPtr>(work: W) -> Result<bool, Workqueu
     if !axtask::can_block_current() {
         return Err(WorkqueueError::ContextCannotBlock);
     }
+    let _ = init_workqueue_executor();
     if !work_busy(work) {
         return Ok(false);
     }
@@ -758,6 +757,7 @@ pub unsafe fn cancel_work_sync<W: WorkStructPtr>(work: W) -> bool {
     if !axtask::can_block_current() {
         panic!("cancel_work_sync requires blockable task context");
     }
+    let _ = init_workqueue_executor();
 
     let cancelled = unsafe { cancel_work(work) };
     let was_active = work_busy(work);
@@ -785,6 +785,7 @@ pub unsafe fn mark_work_pending(work: *mut WorkStruct) -> bool {
 /// # Safety
 /// `work` must be live, initialized, marked pending and not on the queue.
 pub unsafe fn enqueue_marked_work(work: *mut WorkStruct) {
+    let _ = init_workqueue_executor();
     {
         let mut queue = WORK_QUEUE.lock();
         unsafe { queue.push(work) };
@@ -802,6 +803,7 @@ pub fn flush_all_work() {
     if !axtask::can_block_current() {
         panic!("flush_workqueue requires blockable task context");
     }
+    let _ = init_workqueue_executor();
     WORK_STATE_WAKE
         .wait_until(|| {
             WORK_QUEUE.lock().head.is_null() && ACTIVE_WORK.load(Ordering::Acquire).is_null()
@@ -864,3 +866,47 @@ pub unsafe extern "C" fn destroy_workqueue(wq: *mut c_void) {
     flush_all_work();
     drop(unsafe { alloc::boxed::Box::from_raw(wq.cast::<WorkqueueStruct>()) });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::AtomicU32;
+
+    static TEST_CALLBACK_CALLED: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "C" fn test_callback(_work: *mut WorkStruct) {
+        TEST_CALLBACK_CALLED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_early_queue_work_and_cancel() {
+        let mut work = core::mem::MaybeUninit::<WorkStruct>::zeroed();
+        let work_ptr = work.as_mut_ptr();
+        unsafe {
+            INIT_WORK_C(&mut *work_ptr, test_callback);
+            assert!(!work_pending(work_ptr));
+            // Queuing succeeds even when worker is unstarted / cannot block
+            assert_eq!(try_queue_work(system_dfl_wq, work_ptr), Ok(true));
+            assert!(work_pending(work_ptr));
+            // Re-queuing returns Ok(false) because it's already pending
+            assert_eq!(try_queue_work(system_dfl_wq, work_ptr), Ok(false));
+            // Cancellation successfully removes it from queue and clears pending
+            assert!(cancel_work(work_ptr));
+            assert!(!work_pending(work_ptr));
+            assert!(!cancel_work(work_ptr));
+        }
+    }
+
+    #[test]
+    fn test_cancel_work_before_execution() {
+        let mut work = core::mem::MaybeUninit::<WorkStruct>::zeroed();
+        let work_ptr = work.as_mut_ptr();
+        unsafe {
+            INIT_WORK_C(&mut *work_ptr, test_callback);
+            assert!(try_queue_work(system_dfl_wq, work_ptr).is_ok());
+            let _ = cancel_work(work_ptr);
+            assert!(!work_pending(work_ptr));
+        }
+    }
+}
+
