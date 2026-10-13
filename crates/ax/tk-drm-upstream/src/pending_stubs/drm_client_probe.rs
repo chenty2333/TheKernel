@@ -39,3 +39,45 @@ pub unsafe extern "C" fn drm_panic_register(_dev: *mut DrmDevice) {}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_panic_unregister(_dev: *mut DrmDevice) {}
+
+// upstream: drm_probe_helper.c drm_crtc_mode_valid()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_crtc_mode_valid(
+    crtc: *mut crate::drm_crtc_types::DrmCrtc,
+    mode: *const crate::drm_modes_types::DrmDisplayMode,
+) -> crate::drm_modes_types::DrmModeStatus {
+    unsafe {
+        if crtc.is_null() {
+            return crate::drm_modes_types::MODE_OK;
+        }
+        let funcs = (*crtc).helper_private.cast::<crate::drm_modeset_helper_vtables_types::DrmCrtcHelperFuncs>();
+        if funcs.is_null() {
+            return crate::drm_modes_types::MODE_OK;
+        }
+        if let Some(mv) = (*funcs).mode_valid {
+            return mv(crtc, mode as *mut _);
+        }
+        crate::drm_modes_types::MODE_OK
+    }
+}
+
+// upstream: drm_probe_helper.c drm_encoder_mode_valid()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_encoder_mode_valid(
+    encoder: *mut crate::drm_encoder_types::DrmEncoder,
+    mode: *const crate::drm_modes_types::DrmDisplayMode,
+) -> crate::drm_modes_types::DrmModeStatus {
+    unsafe {
+        if encoder.is_null() {
+            return crate::drm_modes_types::MODE_OK;
+        }
+        let funcs = (*encoder).helper_private.cast::<crate::drm_modeset_helper_vtables_types::DrmEncoderHelperFuncs>();
+        if funcs.is_null() {
+            return crate::drm_modes_types::MODE_OK;
+        }
+        if let Some(mv) = (*funcs).mode_valid {
+            return mv(encoder, mode as *mut _);
+        }
+        crate::drm_modes_types::MODE_OK
+    }
+}

@@ -44,14 +44,21 @@ WINDOW = 14
 SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     ("crates/linux", 40): (110, 49, 20, 25, 0, 18, 21),
     ("kernel/src", 40): (85, 41, 19, 142, 9, 0, 0),
-    ("crates/ax", 40): (0, 0, 0, 893, 863, 0, 0),
+    ("crates/ax", 40): (0, 0, 0, 938, 908, 0, 0),
     ("crates/linux", 25): (211, 59, 22, 41, 3, 20, 21),
     ("kernel/src", 25): (157, 50, 24, 321, 25, 0, 0),
+# 2026-10-13 merge of B3a + DRM review fixes + B2b on main: re-scanned totals
+# 938/908 at >= 40 and 2452/2414 at >= 25 (the per-branch notes below were
+# each measured from 872/842 and 2335/2297).
 # 2026-10-13 (B3a i915 display foundation in tk-intel-gt): crates/ax moves
 # from 872/842 to 893/863 at >= 40 (21 code lines) and from 2335/2297 to
 # 2373/2335 at >= 25 (38 code lines).
 # 2026-10-13 (DRM core review fixes in tk-drm-upstream and tk-linux-kapi):
 # crates/ax moves from 2335/2297 to 2343/2305 at >= 25 (8 code lines).
+# 2026-10-13 (B2b DRM atomic helpers & GEM fb helpers in tk-drm-upstream:
+# drm_atomic_helper, drm_gem_framebuffer_helper, drm_gem_atomic_helper):
+# crates/ax moves from 872/842 to 917/887 at >= 40 (45 code lines) and from
+# 2335/2297 to 2406/2368 at >= 25 (71 code lines).
 # 2026-10-13 (B2e HDMI helpers in tk-drm-upstream: drivers/video/hdmi.c,
 # drm_scdc_helper, drm_hdmi_helper, drm_hdmi_state_helper): crates/ax moves
 # from 868/838 to 872/842 at >= 40 and from 2325/2287 to 2335/2297 at >= 25.
@@ -94,7 +101,7 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # lines in the newly translated FreeBSD drivers and the OpenBSD iwx/net80211
 # translations, plus one FreeBSD ig4 register line. Those have BSD-source
 # provenance, not Linux provenance; see `docs/upstream-provenance.md`.
-    ("crates/ax", 25): (18, 15, 4, 2373, 2335, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 2452, 2414, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their

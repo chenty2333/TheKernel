@@ -3773,6 +3773,7 @@ name = "tk-drm-upstream"
 version = "0.1.0"
 dependencies = [
  "tk-axhal",
+ "tk-axtask",
  "tk-linux-kapi",
 ]
 

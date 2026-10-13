@@ -2263,6 +2263,15 @@ All translated display sources carry MIT licenses in upstream Linux 7.2.3 (SPDX-
 ## 2026-10-13 DRM review fixes reconciliation
 
 Review fixes to the merged DRM core port (`crates/ax/tk-drm-upstream`) and `tk-linux-kapi` (faithful vblank wait-queue usage, copy_{to,from}_user, blocking drm_read/drm_poll wait registration, get_dma_buf / gem handle release, unified RadixSlots IDR, and ww_mutex/mutex/workqueue fixes) add 8 verbatim-Linux lines to `crates/ax` at threshold >=25 (`2335/2297 -> 2343/2305`). `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned totals: threshold >=25 `(18,15,4,2343,2305,0,0)`. Threshold >=40 is unchanged at `(0,0,0,872,842,0,0)`.
+## 2026-10-13 DRM atomic helpers and GEM framebuffer helpers B2b reconciliation
+
+The Linux DRM atomic helper and GEM framebuffer helper translations (`crates/ax/tk-drm-upstream`, batch B2b: `drm_atomic_helper_upstream.rs`, `drm_gem_framebuffer_helper_upstream.rs`, `drm_gem_atomic_helper_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned `crates/ax` totals: threshold >=40 `(0,0,0,917,887,0,0)` (was 872/842), threshold >=25 `(18,15,4,2406,2368,0,0)` (was 2335/2297). `crates/linux` and `kernel/src` are unchanged.
+
+Licensing:
+- `drivers/gpu/drm/drm_atomic_helper.c`: MIT (X11 permission notice).
+- `drivers/gpu/drm/drm_gem_framebuffer_helper.c`: GPL-2.0-or-later.
+- `drivers/gpu/drm/drm_gem_atomic_helper.c`: GPL-2.0-or-later.
+Recorded in `crates/ax/tk-drm-upstream/NOTICE`.
 
 
 

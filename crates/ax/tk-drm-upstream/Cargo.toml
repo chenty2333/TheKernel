@@ -31,3 +31,8 @@ tk-linux-kapi = { path = "../tk-linux-kapi" }
 [dev-dependencies.axhal]
 package = "tk-axhal"
 path = "../tk-axhal"
+
+[dev-dependencies.axtask]
+package = "tk-axtask"
+path = "../tk-axtask"
+features = ["multitask", "preempt"]

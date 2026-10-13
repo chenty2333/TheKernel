@@ -44,34 +44,6 @@ pub unsafe extern "C" fn drm_kms_helper_poll_init(_dev: *mut DrmDevice) {}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_kms_helper_poll_fini(_dev: *mut DrmDevice) {}
 
-// upstream: drivers/gpu/drm/drm_atomic_helper.c drm_atomic_helper_commit_duplicated_state()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_atomic_helper_commit_duplicated_state(
-    _state: *mut DrmAtomicCommit,
-    _ctx: *mut DrmModesetAcquireCtx,
-) -> i32 {
-    0
-}
-
-// upstream: drivers/gpu/drm/drm_atomic_helper.c drm_atomic_helper_disable_all()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_atomic_helper_disable_all(
-    _dev: *mut DrmDevice,
-    _ctx: *mut DrmModesetAcquireCtx,
-) -> i32 {
-    0
-}
-
-// upstream: drivers/gpu/drm/drm_atomic_helper.c drm_atomic_helper_duplicate_state()
-// Degraded stub returns ERR_PTR(-ENOMEM), matching Linux failure when state allocation fails.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_atomic_helper_duplicate_state(
-    _dev: *mut DrmDevice,
-    _ctx: *mut DrmModesetAcquireCtx,
-) -> *mut DrmAtomicCommit {
-    tk_linux_kapi::config::ERR_PTR(-tk_linux_kapi::config::ENOMEM)
-}
-
 // upstream: include/drm/drm_atomic.h drm_atomic_commit_put()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_atomic_commit_put(_state: *mut DrmAtomicCommit) {}
@@ -86,10 +58,6 @@ pub unsafe extern "C" fn hypervisor_is_type(type_: u32) -> bool {
 }
 
 
-// upstream: drivers/gpu/drm/drm_atomic_helper.c drm_atomic_helper_shutdown()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_atomic_helper_shutdown(_dev: *mut DrmDevice) {}
-
 // Defined by tk-linux-kapi / tk-drm-upstream since kapi-display and BI merged;
 // re-exported so existing call paths keep resolving.
 pub use tk_linux_kapi::acpi::acpi_video_unregister;
@@ -99,3 +67,7 @@ pub use tk_drm_upstream::pending_stubs::drm_client_probe::drm_client_dev_unregis
 pub use tk_linux_kapi::pci::pci_iomap_range;
 pub use tk_linux_kapi::pci::pci_iounmap;
 pub use tk_linux_kapi::vga::vga_switcheroo_client_probe_defer;
+pub use tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_commit_duplicated_state;
+pub use tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_disable_all;
+pub use tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_duplicate_state;
+pub use tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_shutdown;

@@ -17,6 +17,7 @@ use crate::drm_fourcc_types::{DrmFormatInfo};
 use crate::drm_gem_types::{DrmGemObject};
 use crate::drm_mode_object_types::{DrmModeObject};
 use crate::uapi_drm_types::{DrmClipRect};
+pub const DRM_FORMAT_MAX_PLANES: usize = 4;
 
 #[repr(C)]
 pub struct DrmFramebufferFuncs {

@@ -24,13 +24,14 @@ its own source:
   drm_vblank, drm_vblank_work, drm_plane_helper, drm_plane, drm_crtc, drm_connector,
   drm_encoder, drm_mode_config, drm_mode_object, drm_property, drm_edid,
   drm_dp_helper, drm_dp_dual_mode_helper, drm_atomic, drm_atomic_uapi,
-  drm_atomic_state_helper, drm_scdc_helper, drm_hdmi_helper,
+  drm_atomic_state_helper, drm_atomic_helper, drm_scdc_helper, drm_hdmi_helper,
   drm_hdmi_state_helper, and drivers/video/hdmi.c. Copyright lines are those of each Linux file.
 - GPL-2.0 only, NOT covered by the MIT grant: `drivers/gpu/drm/drm_managed.c`
   (translated in `drm_managed_upstream.rs`). Its translation is flagged for
   rework before this crate ships; it must not be relied on as MIT until resolved.
-- GPL-2.0-or-later, no code translated yet: `drm_gem_atomic_helper.c` and
-  `drm_gem_framebuffer_helper.c` (the `*_upstream.rs` files are placeholders).
+- GPL-2.0-or-later: `drivers/gpu/drm/drm_gem_atomic_helper.c` and
+  `drivers/gpu/drm/drm_gem_framebuffer_helper.c` (translated in
+  `drm_gem_atomic_helper_upstream.rs` and `drm_gem_framebuffer_helper_upstream.rs`).
 
 The Linux sources are not verbatim copies of the C text except where a line is
 marked `// upstream:`; these files are MIT translations of structure and behaviour.

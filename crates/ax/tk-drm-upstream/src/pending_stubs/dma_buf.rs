@@ -108,3 +108,49 @@ pub unsafe extern "C" fn dma_buf_unmap_attachment_unlocked(
         }
     }
 }
+
+// upstream: drivers/dma-buf/dma-buf.c dma_buf_begin_cpu_access()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_buf_begin_cpu_access(dmabuf: *mut DmaBuf, direction: c_int) -> c_int {
+    unsafe {
+        if dmabuf.is_null() {
+            return -EINVAL;
+        }
+        if let Some(ops) = (*dmabuf).ops.as_ref() {
+            if let Some(b) = ops.begin_cpu_access {
+                return b(dmabuf, direction);
+            }
+        }
+        0
+    }
+}
+
+// upstream: drivers/dma-buf/dma-buf.c dma_buf_end_cpu_access()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_buf_end_cpu_access(dmabuf: *mut DmaBuf, direction: c_int) -> c_int {
+    unsafe {
+        if dmabuf.is_null() {
+            return -EINVAL;
+        }
+        if let Some(ops) = (*dmabuf).ops.as_ref() {
+            if let Some(e) = ops.end_cpu_access {
+                return e(dmabuf, direction);
+            }
+        }
+        0
+    }
+}
+
+// upstream: drivers/dma-buf/dma-fence-chain.c dma_fence_chain_alloc()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_fence_chain_alloc() -> *mut tk_linux_kapi::types::DmaFenceChain {
+    tk_linux_kapi::memory::kzalloc(
+        core::mem::size_of::<tk_linux_kapi::types::DmaFenceChain>(),
+        GFP_KERNEL,
+    )
+    .cast()
+}
+
+// upstream: drivers/dma-buf/dma-fence.c dma_fence_set_deadline()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_fence_set_deadline(_fence: *mut tk_linux_kapi::types::DmaFence, _deadline: i64) {}

@@ -926,6 +926,7 @@ mod tests {
 
     #[test]
     fn test_read_blocks_until_woken() {
+        crate::test_support::ensure_test_signal_provider();
         unsafe {
             let mut driver: DrmDriver = core::mem::zeroed();
             let dev = drm_dev_alloc(&driver, core::ptr::null_mut());

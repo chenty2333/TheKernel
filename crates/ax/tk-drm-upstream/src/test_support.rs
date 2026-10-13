@@ -17,6 +17,19 @@ use crate::{
     drm_mode_config_upstream::{drm_mode_config_cleanup, drmm_mode_config_init},
 };
 
+/// Install the host-test signal policy. Host tests that create a current
+/// `axtask` do not boot the kernel's process-signal owner, so an interruptible
+/// LinuxKPI wait needs an explicit test provider instead of the production
+/// fail-closed provider check.
+pub fn ensure_test_signal_provider() {
+    unsafe extern "C" fn no_pending_signal(_state: i32, _task: *mut core::ffi::c_void) -> bool {
+        false
+    }
+
+    tk_linux_kapi::signal::install_signal_pending_state(no_pending_signal)
+        .expect("host-test signal provider must be the sole signal policy owner");
+}
+
 /// A host `drm_device` plus the `drm_driver` it points at. Both are boxed so
 /// their addresses stay fixed for the lifetime of the test.
 pub struct TestDrm {
