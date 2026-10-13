@@ -202,3 +202,34 @@ pub static dma_fence_chain_ops: u8 = 42;
 pub unsafe extern "C" fn dma_fence_wait(_fence: *mut tk_linux_kapi::types::DmaFence, _intr: bool) -> i32 {
     0
 }
+
+// The ioctl table retains syncobj entry points in this isolated component test
+// binary. Their fence/VFS services belong to the kernel-linked tests, not this
+// fixture. Trap if reached: linking this table must not falsely validate them.
+macro_rules! kernel_only_test_service {
+    ($name:ident($($arg:ident: $ty:ty),* $(,)?) -> $ret:ty) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name($($arg: $ty),*) -> $ret {
+            $(let _ = $arg;)*
+            panic!(concat!(stringify!($name), " requires the kernel-linked test harness"));
+        }
+    };
+}
+
+kernel_only_test_service!(dma_fence_chain_find_seqno(fence: *mut *mut DmaFence, point: u64) -> i32);
+kernel_only_test_service!(dma_fence_is_signaled(fence: *mut DmaFence) -> bool);
+kernel_only_test_service!(dma_fence_add_callback(
+    fence: *mut DmaFence,
+    callback: *mut tk_linux_kapi::types::DmaFenceCb,
+    function: unsafe extern "C" fn(*mut DmaFence, *mut tk_linux_kapi::types::DmaFenceCb)
+) -> i32);
+kernel_only_test_service!(dma_fence_chain_walk(fence: *mut DmaFence) -> *mut DmaFence);
+kernel_only_test_service!(dma_fence_array_create(count: u32, fences: *mut *mut DmaFence, context: u64, seqno: u32) -> *mut DmaFence);
+kernel_only_test_service!(dma_fence_signal(fence: *mut DmaFence) -> i32);
+kernel_only_test_service!(dma_fence_free(fence: *mut DmaFence) -> ());
+kernel_only_test_service!(dma_fence_default_wait(fence: *mut DmaFence, interruptible: bool, timeout: core::ffi::c_long) -> core::ffi::c_long);
+kernel_only_test_service!(thekernel_eventfd_signal(ctx: *mut c_void, count: u64) -> i32);
+kernel_only_test_service!(thekernel_eventfd_ctx_put(ctx: *mut c_void) -> ());
+kernel_only_test_service!(thekernel_eventfd_ctx_fdget(fd: i32) -> *mut c_void);
+kernel_only_test_service!(thekernel_drm_syncobj_import_fd(fd: i32) -> *mut c_void);
+kernel_only_test_service!(thekernel_drm_syncobj_export_fd(syncobj: *mut c_void) -> i32);
