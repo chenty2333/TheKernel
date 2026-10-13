@@ -3997,6 +3997,7 @@ version = "0.1.0"
 name = "tk-linux-kapi"
 version = "0.1.0"
 dependencies = [
+ "axerrno 0.2.2",
  "axlog",
  "kernel_guard",
  "memory_addr",
