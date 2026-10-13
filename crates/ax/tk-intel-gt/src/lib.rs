@@ -739,6 +739,10 @@ pub mod intel_fifo_underrun_upstream;
 #[allow(unsafe_code)]
 pub mod intel_modeset_lock_upstream;
 #[allow(unsafe_code)]
+pub mod intel_modeset_setup_upstream;
+#[allow(unsafe_code)]
+pub mod intel_fbdev_upstream;
+#[allow(unsafe_code)]
 pub mod intel_vblank_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_power_well_upstream;
