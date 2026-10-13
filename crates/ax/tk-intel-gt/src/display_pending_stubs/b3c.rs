@@ -1,83 +1,34 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See ../LICENSE-MIT.
-//! TEMPORARY definitions for callees owned by batch B3c (BIOS, DMC, DMC-WL, DRAM, MCHBAR).
-//! Replaced by intel_bios_upstream.rs, intel_dmc_upstream.rs,
-//! intel_dmc_wl_upstream.rs (B3c).
+//! B3c re-exports while the BIOS/OpRegion implementation is being integrated.
+//! DMC, DMC-WL, DRAM and MCHBAR implementations live in their named modules.
 
 #![allow(non_snake_case, dead_code, unsafe_code)]
 
 use crate::intel_display_core_types_upstream::IntelDisplay;
-use crate::intel_workarounds_types_upstream::I915RegT;
+pub use crate::{
+    intel_dmc_upstream::{
+        assert_main_dmc_loaded, intel_dmc_block_pkgc, intel_dmc_configure_dc_balance_event,
+        intel_dmc_disable_pipe, intel_dmc_disable_program, intel_dmc_enable_pipe, intel_dmc_fini,
+        intel_dmc_has_payload, intel_dmc_init, intel_dmc_load_program, intel_dmc_resume,
+        intel_dmc_start_pkgc_exit_at_start_of_undelayed_vblank, intel_dmc_suspend,
+        intel_dmc_update_dc6_allowed_count, intel_dmc_wait_fw_load, intel_pipedmc_dcb_disable,
+        intel_pipedmc_dcb_enable, intel_pipedmc_disable_event, intel_pipedmc_enable_event,
+        intel_pipedmc_irq_handler, intel_pipedmc_start_mmioaddr,
+    },
+    intel_dmc_wl_upstream::{
+        intel_dmc_wl_disable, intel_dmc_wl_enable, intel_dmc_wl_flush_release_work,
+        intel_dmc_wl_get, intel_dmc_wl_get_noreg, intel_dmc_wl_init, intel_dmc_wl_put,
+        intel_dmc_wl_put_noreg,
+    },
+    intel_dram_upstream::{intel_dram_detect, intel_dram_info, intel_dram_type_str},
+    intel_mchbar_upstream::{intel_mchbar_read, intel_mchbar_read16, intel_mchbar_read64_2x32},
+};
 
-// upstream: intel_dmc_wl.c intel_dmc_wl_get()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dmc_wl_get(_display: *mut IntelDisplay, _reg: I915RegT) {}
-
-// upstream: intel_dmc_wl.c intel_dmc_wl_put()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dmc_wl_put(_display: *mut IntelDisplay, _reg: I915RegT) {}
-
-// upstream: intel_dmc_wl.c intel_dmc_wl_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dmc_wl_init(_display: *mut IntelDisplay) {}
-
-// upstream: intel_bios.c intel_bios_init()
+// BIOS/OpRegion ownership is handled by the parallel B3c BIOS implementation;
+// these two definitions remain temporary until that worker's change lands.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_bios_init(_display: *mut IntelDisplay) {}
 
-// upstream: intel_dmc.c intel_dmc_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dmc_init(_display: *mut IntelDisplay) {}
-
-// upstream: intel_dmc.c intel_dmc_fini()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dmc_fini(_display: *mut IntelDisplay) {}
-
-// upstream: intel_bios.c intel_bios_driver_remove()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_bios_driver_remove(_display: *mut IntelDisplay) {}
-
-// upstream: intel_dmc_wl.c intel_dmc_wl_get_noreg()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dmc_wl_get_noreg(_display: *mut IntelDisplay) {}
-
-// upstream: intel_dmc_wl.c intel_dmc_wl_put_noreg()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dmc_wl_put_noreg(_display: *mut IntelDisplay) {}
-
-// upstream: intel_dmc_wl.c intel_dmc_wl_disable()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dmc_wl_disable(_display: *mut IntelDisplay) {}
-
-// upstream: intel_dmc.c intel_dmc_has_payload()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dmc_has_payload(_display: *mut IntelDisplay) -> bool {
-    false
-}
-
-// upstream: intel_dmc.c intel_dmc_update_dc6_allowed_count()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dmc_update_dc6_allowed_count(
-    _display: *mut IntelDisplay,
-    _allowed: bool,
-) {}
-
-// upstream: intel_dmc.c intel_dmc_load_program()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dmc_load_program(_display: *mut IntelDisplay) {}
-
-// upstream: intel_dmc.c intel_dmc_disable_program()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dmc_disable_program(_display: *mut IntelDisplay) {}
-
-// upstream: intel_dram.c intel_dram_info()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dram_info(
-    display: *mut IntelDisplay,
-) -> *const crate::intel_dram_types_upstream::DramInfo {
-    if display.is_null() {
-        core::ptr::null()
-    } else {
-        (*display).dram.info as *const _
-    }
-}

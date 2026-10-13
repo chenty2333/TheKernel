@@ -665,6 +665,14 @@ pub mod intel_display_power_well_upstream;
 pub mod intel_display_power_map_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_power_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dmc_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dmc_wl_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dram_upstream;
+#[allow(unsafe_code)]
+pub mod intel_mchbar_upstream;
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod b3a_tests;
