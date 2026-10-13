@@ -16,19 +16,13 @@ pub unsafe extern "C" fn intel_display_power_init(_display: *mut IntelDisplay) -
     0
 }
 
-// upstream: intel_pmdemand.c intel_pmdemand_init_early()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_pmdemand_init_early(_display: *mut IntelDisplay) {}
+pub use crate::intel_pmdemand_upstream::intel_pmdemand_init_early;
 
 // upstream: intel_display_power.c intel_display_power_init_hw()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_display_power_init_hw(_display: *mut IntelDisplay) {}
 
-// upstream: intel_pmdemand.c intel_pmdemand_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_pmdemand_init(_display: *mut IntelDisplay) -> i32 {
-    0
-}
+pub use crate::intel_pmdemand_upstream::intel_pmdemand_init;
 
 // upstream: intel_display_power.c intel_display_power_driver_remove()
 #[unsafe(no_mangle)]
