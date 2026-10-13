@@ -34,9 +34,9 @@ use crate::dma_resv_types::DmaResv;
 use crate::drm_device_types::DrmDevice;
 use crate::drm_file_types::DrmFile;
 use crate::drm_gem_types::{DrmGemLru, DrmGemObject, DrmGemObjectFuncs};
-use crate::drm_mode_object_upstream::{idr_alloc, idr_destroy, idr_find, idr_remove};
+use crate::drm_mode_object_upstream::{idr_alloc, idr_destroy, idr_find, idr_remove, idr_replace};
 use crate::drm_print_types::DrmPrinter;
-use crate::drm_vma_manager_upstream::{drm_vma_offset_add, drm_vma_offset_remove};
+use crate::drm_vma_manager_upstream::{drm_vma_node_revoke, drm_vma_offset_add, drm_vma_offset_remove};
 use crate::uapi_drm_types::{DrmGemClose, DrmGemFlink, DrmGemOpen};
 
 const ENOENT: i32 = 2;
@@ -167,15 +167,25 @@ pub unsafe extern "C" fn drm_gem_object_handle_get_if_exists_unlocked(obj: *mut 
 }
 
 // upstream: drivers/gpu/drm/drm_gem.c drm_gem_object_handle_free()
+unsafe extern "C" {
+    fn dma_buf_put(dmabuf: *mut crate::drm_prime_upstream::DmaBuf);
+}
+
+// upstream: drivers/gpu/drm/drm_gem.c drm_gem_object_handle_free()
 unsafe fn drm_gem_object_handle_free(obj: *mut DrmGemObject) {
-    if !obj.is_null() && (*obj).handle_count == 0 {
-        drm_gem_object_put(obj);
+    if !obj.is_null() && (*obj).name != 0 {
+        let dev = (*obj).dev;
+        if !dev.is_null() {
+            idr_remove(core::ptr::addr_of_mut!((*dev).object_name_idr), (*obj).name as i32);
+        }
+        (*obj).name = 0;
     }
 }
 
 // upstream: drivers/gpu/drm/drm_gem.c drm_gem_object_exported_dma_buf_free()
 unsafe fn drm_gem_object_exported_dma_buf_free(obj: *mut DrmGemObject) {
-    if !obj.is_null() {
+    if !obj.is_null() && !(*obj).dma_buf.is_null() {
+        dma_buf_put((*obj).dma_buf.cast());
         (*obj).dma_buf = core::ptr::null_mut();
     }
 }
@@ -187,16 +197,50 @@ pub unsafe extern "C" fn drm_gem_object_handle_put_unlocked(obj: *mut DrmGemObje
         return;
     }
     unsafe {
-        if (*obj).handle_count > 0 {
-            (*obj).handle_count -= 1;
+        let dev = (*obj).dev;
+        let mut final_put = false;
+        if (*obj).handle_count == 0 {
+            return;
         }
-        drm_gem_object_put(obj);
+        if !dev.is_null() {
+            mutex_lock(core::ptr::addr_of_mut!((*dev).object_name_lock));
+        }
+        (*obj).handle_count -= 1;
+        if (*obj).handle_count == 0 {
+            drm_gem_object_handle_free(obj);
+            drm_gem_object_exported_dma_buf_free(obj);
+            final_put = true;
+        }
+        if !dev.is_null() {
+            mutex_unlock(core::ptr::addr_of_mut!((*dev).object_name_lock));
+        }
+        if final_put {
+            drm_gem_object_put(obj);
+        }
     }
 }
 
 // upstream: drivers/gpu/drm/drm_gem.c drm_gem_object_release_handle()
-unsafe fn drm_gem_object_release_handle(_id: c_int, ptr: *mut c_void, _data: *mut c_void) -> i32 {
+unsafe fn drm_gem_object_release_handle(id: c_int, ptr: *mut c_void, data: *mut c_void) -> i32 {
+    let file_priv = data.cast::<DrmFile>();
     let obj = ptr.cast::<DrmGemObject>();
+
+    if obj.is_null() || file_priv.is_null() {
+        return 0;
+    }
+
+    if let Some(funcs) = (*obj).funcs.as_ref() {
+        if let Some(close) = funcs.close {
+            close(obj, file_priv);
+        }
+    }
+
+    mutex_lock(core::ptr::addr_of_mut!((*file_priv).prime.lock));
+    crate::drm_prime_upstream::drm_prime_remove_buf_handle(core::ptr::addr_of_mut!((*file_priv).prime), id as u32);
+    mutex_unlock(core::ptr::addr_of_mut!((*file_priv).prime.lock));
+
+    drm_vma_node_revoke(core::ptr::addr_of_mut!((*obj).vma_node), file_priv);
+
     drm_gem_object_handle_put_unlocked(obj);
     0
 }
@@ -209,20 +253,18 @@ pub unsafe extern "C" fn drm_gem_handle_delete(filp: *mut DrmFile, handle: u32) 
     }
     unsafe {
         spin_lock(&mut (*filp).table_lock);
-        let obj = idr_find(core::ptr::addr_of_mut!((*filp).object_idr), handle as i32).cast::<DrmGemObject>();
+        let obj = idr_replace(core::ptr::addr_of_mut!((*filp).object_idr), core::ptr::null_mut(), handle as i32).cast::<DrmGemObject>();
+        spin_unlock(&mut (*filp).table_lock);
         if obj.is_null() {
-            spin_unlock(&mut (*filp).table_lock);
             return -EINVAL;
         }
+
+        drm_gem_object_release_handle(handle as i32, obj.cast(), filp.cast());
+
+        spin_lock(&mut (*filp).table_lock);
         idr_remove(core::ptr::addr_of_mut!((*filp).object_idr), handle as i32);
         spin_unlock(&mut (*filp).table_lock);
 
-        if let Some(funcs) = (*obj).funcs.as_ref() {
-            if let Some(close) = funcs.close {
-                close(obj, filp);
-            }
-        }
-        drm_gem_object_handle_put_unlocked(obj);
         0
     }
 }
@@ -393,7 +435,7 @@ unsafe fn objects_lookup(
     spin_lock(&mut (*filp).table_lock);
     for i in 0..count as usize {
         let handle = *handles.add(i);
-        let obj = idr_find(core::ptr::addr_of_mut!((*filp).object_idr), handle as i32).cast::<DrmGemObject>();
+        let obj = idr_find(core::ptr::addr_of_mut!((*filp).object_idr), handle as c_ulong).cast::<DrmGemObject>();
         if obj.is_null() {
             spin_unlock(&mut (*filp).table_lock);
             for j in 0..i {
@@ -444,7 +486,7 @@ pub unsafe extern "C" fn drm_gem_object_lookup(filp: *mut DrmFile, handle: u32) 
     }
     unsafe {
         spin_lock(&mut (*filp).table_lock);
-        let obj = idr_find(core::ptr::addr_of_mut!((*filp).object_idr), handle as i32).cast::<DrmGemObject>();
+        let obj = idr_find(core::ptr::addr_of_mut!((*filp).object_idr), handle as c_ulong).cast::<DrmGemObject>();
         if !obj.is_null() {
             drm_gem_object_get(obj);
         }
@@ -542,7 +584,7 @@ pub unsafe extern "C" fn drm_gem_open_ioctl(
     }
     unsafe {
         mutex_lock(core::ptr::addr_of_mut!((*dev).object_name_lock));
-        let obj = idr_find(core::ptr::addr_of_mut!((*dev).object_name_idr), (*args).name as i32).cast::<DrmGemObject>();
+        let obj = idr_find(core::ptr::addr_of_mut!((*dev).object_name_idr), (*args).name as c_ulong).cast::<DrmGemObject>();
         if obj.is_null() {
             mutex_unlock(core::ptr::addr_of_mut!((*dev).object_name_lock));
             return -ENOENT;
@@ -579,9 +621,8 @@ pub unsafe extern "C" fn drm_gem_open(_dev: *mut DrmDevice, file_private: *mut D
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_gem_release(_dev: *mut DrmDevice, file_private: *mut DrmFile) {
     if !file_private.is_null() {
-        crate::drm_mode_object_upstream::idr_for_each(core::ptr::addr_of_mut!((*file_private).object_idr), |_id, ptr| {
-            let obj = ptr.cast::<DrmGemObject>();
-            drm_gem_object_handle_put_unlocked(obj);
+        crate::drm_mode_object_upstream::idr_for_each(core::ptr::addr_of_mut!((*file_private).object_idr), |id, ptr| {
+            drm_gem_object_release_handle(id, ptr, file_private.cast());
         });
         idr_destroy(core::ptr::addr_of_mut!((*file_private).object_idr));
     }
@@ -1028,6 +1069,55 @@ mod tests {
             assert_eq!((*obj).handle_count, 0);
 
             drm_file_free(file_priv2);
+            drm_file_free(file_priv);
+            drm_gem_object_release(obj);
+            drm_dev_put(dev);
+        }
+    }
+
+    #[test]
+    fn test_gem_handle_delete_releases_prime_and_vma() {
+        unsafe {
+            let mut driver: DrmDriver = core::mem::zeroed();
+            let dev = drm_dev_alloc(&driver, core::ptr::null_mut());
+            let file_priv = drm_file_alloc((*dev).primary);
+
+            let mut obj_raw: DrmGemObject = core::mem::zeroed();
+            let obj = &mut obj_raw as *mut DrmGemObject;
+            drm_gem_private_object_init(dev, obj, 4096);
+
+            let mut handle: u32 = 0;
+            assert_eq!(drm_gem_handle_create(file_priv, obj, &mut handle), 0);
+            assert_ne!(handle, 0);
+
+            // Attach a mock dmabuf to prime handle cache
+            let dmabuf = kmalloc(core::mem::size_of::<crate::drm_prime_upstream::DmaBuf>(), GFP_KERNEL).cast::<crate::drm_prime_upstream::DmaBuf>();
+            core::ptr::write_bytes(dmabuf, 0, 1);
+            (*dmabuf)._vmapping_pad = 1;
+
+            assert_eq!(
+                crate::drm_prime_upstream::drm_prime_add_buf_handle(core::ptr::addr_of_mut!((*file_priv).prime), dmabuf, handle),
+                0
+            );
+            assert_eq!((*dmabuf)._vmapping_pad, 2);
+
+            // Verify lookup finds it
+            assert_eq!(
+                crate::drm_prime_upstream::drm_prime_lookup_buf_by_handle(core::ptr::addr_of_mut!((*file_priv).prime), handle),
+                dmabuf
+            );
+
+            // Delete handle: triggers drm_gem_object_release_handle -> drm_prime_remove_buf_handle -> dma_buf_put
+            assert_eq!(drm_gem_handle_delete(file_priv, handle), 0);
+
+            // Prime handle is gone
+            assert!(
+                crate::drm_prime_upstream::drm_prime_lookup_buf_by_handle(core::ptr::addr_of_mut!((*file_priv).prime), handle).is_null()
+            );
+            // Dmabuf refcount decremented
+            assert_eq!((*dmabuf)._vmapping_pad, 1);
+            dma_buf_put(dmabuf.cast());
+
             drm_file_free(file_priv);
             drm_gem_object_release(obj);
             drm_dev_put(dev);

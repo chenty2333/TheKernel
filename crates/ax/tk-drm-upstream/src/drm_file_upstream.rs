@@ -11,18 +11,24 @@ use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
 use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::boxed::Box;
 use tk_linux_kapi::config::{EAGAIN, EFAULT, EINVAL, ENOMEM, ERESTARTSYS, GFP_KERNEL};
-use tk_linux_kapi::list::{INIT_LIST_HEAD, list_add_tail, list_del, list_del_init, list_empty};
+use tk_linux_kapi::list::{INIT_LIST_HEAD, list_add, list_add_tail, list_del, list_del_init, list_empty};
 use tk_linux_kapi::locks::{spin_lock, spin_unlock, spin_lock_init, spin_lock_irqsave_raw, spin_unlock_irqrestore_raw};
 use tk_linux_kapi::memory::{atomic_dec, atomic_dec_and_test, atomic_inc, kfree};
+use tk_linux_kapi::mm_native::copy_to_user;
 use tk_linux_kapi::mutex::mutex_init;
 #[cfg(not(test))]
-use tk_linux_kapi::mutex::{mutex_lock, mutex_unlock};
+use tk_linux_kapi::mutex::{mutex_lock, mutex_unlock, mutex_lock_interruptible};
 #[cfg(test)]
 unsafe fn mutex_lock<M>(_mutex: M) {}
 #[cfg(test)]
 unsafe fn mutex_unlock<M>(_mutex: M) {}
+#[cfg(test)]
+unsafe fn mutex_lock_interruptible<M>(_mutex: M) -> i32 { 0 }
 use tk_linux_kapi::types::{AtomicT, File, ListHead, Mutex, WaitQueueHead, XArray};
-use tk_linux_kapi::wait::{init_waitqueue_head, wake_up};
+use tk_linux_kapi::wait::{init_waitqueue_head, poll_wait, wake_up, wake_up_interruptible_poll};
+use tk_linux_kapi::wait_event_interruptible;
+
+const O_NONBLOCK: u32 = 0x800;
 
 use crate::drm_auth_types::DrmMaster;
 use crate::drm_auth_upstream::{drm_master_open, drm_master_release};
@@ -380,6 +386,9 @@ pub unsafe extern "C" fn drm_read(
     count: usize,
     _offset: *mut i64,
 ) -> isize {
+    const EPOLLIN: u32 = 0x0001;
+    const EPOLLRDNORM: u32 = 0x0040;
+
     if filp.is_null() || buffer.is_null() {
         return -EINVAL as isize;
     }
@@ -390,58 +399,84 @@ pub unsafe extern "C" fn drm_read(
         }
         let dev = (*(*file_priv).minor).dev;
 
-        mutex_lock(core::ptr::addr_of_mut!((*file_priv).event_read_lock));
-        let mut total = 0usize;
+        let mut ret: isize = mutex_lock_interruptible(core::ptr::addr_of_mut!((*file_priv).event_read_lock)) as isize;
+        if ret != 0 {
+            return ret;
+        }
 
-        while total == 0 {
+        loop {
+            let mut e: *mut DrmPendingEvent = core::ptr::null_mut();
+
             let mut flags: core::ffi::c_ulong = 0;
             spin_lock_irqsave_raw(core::ptr::addr_of_mut!((*dev).event_lock), &mut flags);
-
-            while !list_empty(&(*file_priv).event_list) {
+            if !list_empty(&(*file_priv).event_list) {
                 let cur = (*file_priv).event_list.next;
-                let pe = cur.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmPendingEvent, link)).cast::<DrmPendingEvent>();
-                let event = (*pe).event;
-                let event_len = (*event).length as usize;
+                e = cur.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmPendingEvent, link)).cast::<DrmPendingEvent>();
+                (*file_priv).event_space += (*(*e).event).length as i32;
+                list_del(core::ptr::addr_of_mut!((*e).link));
+            }
+            spin_unlock_irqrestore_raw(core::ptr::addr_of_mut!((*dev).event_lock), flags);
 
-                if total + event_len > count {
-                    if total == 0 {
-                        spin_unlock_irqrestore_raw(core::ptr::addr_of_mut!((*dev).event_lock), flags);
-                        mutex_unlock(core::ptr::addr_of_mut!((*file_priv).event_read_lock));
-                        return -EINVAL as isize;
-                    }
+            if e.is_null() {
+                if ret != 0 {
                     break;
                 }
 
-                list_del_init(cur);
-                (*file_priv).event_space += event_len as i32;
+                if ((*filp).f_flags as u32 & O_NONBLOCK) != 0 {
+                    ret = -EAGAIN as isize;
+                    break;
+                }
 
-                core::ptr::copy_nonoverlapping(
-                    event.cast::<u8>(),
-                    buffer.cast::<u8>().add(total),
-                    event_len,
+                mutex_unlock(core::ptr::addr_of_mut!((*file_priv).event_read_lock));
+                let wait_ret = wait_event_interruptible!(
+                    (*file_priv).event_wait,
+                    !list_empty(&(*file_priv).event_list),
                 );
-                total += event_len;
+                if wait_ret >= 0 {
+                    ret = mutex_lock_interruptible(core::ptr::addr_of_mut!((*file_priv).event_read_lock)) as isize;
+                } else {
+                    ret = wait_ret as isize;
+                }
+                if ret != 0 {
+                    return ret;
+                }
+            } else {
+                let length = (*(*e).event).length as usize;
 
-                kfree(event);
-                kfree(pe);
-            }
+                if length > count.saturating_sub(ret as usize) {
+                    spin_lock_irqsave_raw(core::ptr::addr_of_mut!((*dev).event_lock), &mut flags);
+                    (*file_priv).event_space -= length as i32;
+                    list_add(core::ptr::addr_of_mut!((*e).link), core::ptr::addr_of_mut!((*file_priv).event_list));
+                    spin_unlock_irqrestore_raw(core::ptr::addr_of_mut!((*dev).event_lock), flags);
+                    wake_up_interruptible_poll(&mut (*file_priv).event_wait, EPOLLIN | EPOLLRDNORM);
+                    break;
+                }
 
-            spin_unlock_irqrestore_raw(core::ptr::addr_of_mut!((*dev).event_lock), flags);
+                if copy_to_user(buffer.add(ret as usize).cast(), (*e).event.cast(), length) != 0 {
+                    if ret == 0 {
+                        ret = -EFAULT as isize;
+                    }
+                    spin_lock_irqsave_raw(core::ptr::addr_of_mut!((*dev).event_lock), &mut flags);
+                    (*file_priv).event_space -= length as i32;
+                    list_add(core::ptr::addr_of_mut!((*e).link), core::ptr::addr_of_mut!((*file_priv).event_list));
+                    spin_unlock_irqrestore_raw(core::ptr::addr_of_mut!((*dev).event_lock), flags);
+                    wake_up_interruptible_poll(&mut (*file_priv).event_wait, EPOLLIN | EPOLLRDNORM);
+                    break;
+                }
 
-            if total == 0 {
-                // No events available; nonblocking or wait
-                break;
+                ret += length as isize;
+                kfree(e.cast::<core::ffi::c_void>());
             }
         }
 
         mutex_unlock(core::ptr::addr_of_mut!((*file_priv).event_read_lock));
-        if total == 0 { -EAGAIN as isize } else { total as isize }
+        ret
     }
 }
 
 // upstream: drivers/gpu/drm/drm_file.c drm_poll()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_poll(filp: *mut File, _wait: *mut c_void) -> u32 {
+pub unsafe extern "C" fn drm_poll(filp: *mut File, wait: *mut c_void) -> u32 {
     const EPOLLIN: u32 = 0x0001;
     const EPOLLRDNORM: u32 = 0x0040;
 
@@ -453,15 +488,13 @@ pub unsafe extern "C" fn drm_poll(filp: *mut File, _wait: *mut c_void) -> u32 {
         if file_priv.is_null() {
             return 0;
         }
-        let dev = (*(*file_priv).minor).dev;
 
-        let mut flags: core::ffi::c_ulong = 0;
-        spin_lock_irqsave_raw(core::ptr::addr_of_mut!((*dev).event_lock), &mut flags);
+        poll_wait(filp, core::ptr::addr_of_mut!((*file_priv).event_wait), wait.cast());
+
         let mut mask = 0;
         if !list_empty(&(*file_priv).event_list) {
             mask |= EPOLLIN | EPOLLRDNORM;
         }
-        spin_unlock_irqrestore_raw(core::ptr::addr_of_mut!((*dev).event_lock), flags);
         mask
     }
 }
@@ -858,9 +891,11 @@ mod tests {
             // Event space restored
             assert_eq!((*file_priv).event_space, 4096);
 
-            // Further read returns -EAGAIN (-11)
+            // Further read with O_NONBLOCK returns -EAGAIN (-11)
+            filp_struct.f_flags = O_NONBLOCK;
             let nread2 = drm_read(filp, read_buf.as_mut_ptr().cast(), read_buf.len(), &mut offset);
             assert_eq!(nread2, -11);
+            filp_struct.f_flags = 0;
 
             // Test memory stats helpers
             let stats = DrmMemoryStats { shared: 0, private: 0, resident: 0, purgeable: 0, active: 0 };
@@ -883,6 +918,113 @@ mod tests {
             (*e4).length = 24;
             assert_eq!(drm_event_reserve_init(dev, file_priv, pe4, e4), 0);
             drm_send_event(dev, pe4);
+
+            drm_file_free(file_priv);
+            drm_dev_put(dev);
+        }
+    }
+
+    #[test]
+    fn test_read_blocks_until_woken() {
+        unsafe {
+            let mut driver: DrmDriver = core::mem::zeroed();
+            let dev = drm_dev_alloc(&driver, core::ptr::null_mut());
+            let file_priv = drm_file_alloc((*dev).primary);
+            let mut filp_struct: File = core::mem::zeroed();
+            filp_struct.private_data = file_priv.cast();
+            filp_struct.f_flags = 0; // Blocking
+            let filp = &mut filp_struct as *mut File;
+
+            let dev_addr = dev as usize;
+            let fp_addr = file_priv as usize;
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                let dev_p = dev_addr as *mut DrmDevice;
+                let fp_p = fp_addr as *mut DrmFile;
+                let pe = kmalloc(core::mem::size_of::<DrmPendingEvent>(), GFP_KERNEL).cast::<DrmPendingEvent>();
+                core::ptr::write_bytes(pe, 0, 1);
+                let e = kmalloc(32, GFP_KERNEL).cast::<DrmEvent>();
+                (*e).r#type = 0x55;
+                (*e).length = 32;
+                assert_eq!(drm_event_reserve_init(dev_p, fp_p, pe, e), 0);
+                drm_send_event(dev_p, pe);
+            });
+
+            let mut read_buf = [0u8; 64];
+            let mut offset = 0i64;
+            let nread = drm_read(filp, read_buf.as_mut_ptr().cast(), read_buf.len(), &mut offset);
+            assert_eq!(nread, 32);
+            let ev = read_buf.as_ptr().cast::<DrmEvent>();
+            assert_eq!((*ev).r#type, 0x55);
+
+            drm_file_free(file_priv);
+            drm_dev_put(dev);
+        }
+    }
+
+    #[test]
+    fn test_read_fault_puts_back_event() {
+        unsafe {
+            let mut driver: DrmDriver = core::mem::zeroed();
+            let dev = drm_dev_alloc(&driver, core::ptr::null_mut());
+            let file_priv = drm_file_alloc((*dev).primary);
+            let mut filp_struct: File = core::mem::zeroed();
+            filp_struct.private_data = file_priv.cast();
+            filp_struct.f_flags = O_NONBLOCK;
+            let filp = &mut filp_struct as *mut File;
+
+            let pe = kmalloc(core::mem::size_of::<DrmPendingEvent>(), GFP_KERNEL).cast::<DrmPendingEvent>();
+            core::ptr::write_bytes(pe, 0, 1);
+            let e = kmalloc(32, GFP_KERNEL).cast::<DrmEvent>();
+            (*e).r#type = 0x77;
+            (*e).length = 32;
+            assert_eq!(drm_event_reserve_init(dev, file_priv, pe, e), 0);
+            drm_send_event(dev, pe);
+
+            let mut offset = 0i64;
+            // Fault address: 1 as *mut c_char (< 4096)
+            let ret = drm_read(filp, 1 as *mut c_char, 64, &mut offset);
+            assert_eq!(ret, -EFAULT as isize);
+
+            // Event was put back onto event_list!
+            assert!(!list_empty(&(*file_priv).event_list));
+
+            drm_file_free(file_priv);
+            drm_dev_put(dev);
+        }
+    }
+
+    #[test]
+    fn test_poll_registers_wait_queue() {
+        unsafe {
+            let mut driver: DrmDriver = core::mem::zeroed();
+            let dev = drm_dev_alloc(&driver, core::ptr::null_mut());
+            let file_priv = drm_file_alloc((*dev).primary);
+            let mut filp_struct: File = core::mem::zeroed();
+            filp_struct.private_data = file_priv.cast();
+            let filp = &mut filp_struct as *mut File;
+
+            static CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            CALLED.store(false, Ordering::SeqCst);
+
+            unsafe extern "C" fn test_qproc(
+                _filp: *mut File,
+                wait_address: *mut WaitQueueHead,
+                _p: *mut tk_linux_kapi::wait::PollTable,
+            ) {
+                if !wait_address.is_null() {
+                    CALLED.store(true, Ordering::SeqCst);
+                }
+            }
+
+            let mut pt = tk_linux_kapi::wait::PollTable {
+                qproc: Some(test_qproc as _),
+                key: 0,
+            };
+
+            let mask = drm_poll(filp, &mut pt as *mut _ as *mut c_void);
+            assert_eq!(mask, 0);
+            assert!(CALLED.load(Ordering::SeqCst));
 
             drm_file_free(file_priv);
             drm_dev_put(dev);

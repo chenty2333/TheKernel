@@ -8,9 +8,11 @@
 
 #![allow(non_snake_case, dead_code, unsafe_code)]
 
-use tk_linux_kapi::config::{EINVAL, ENOMEM, EOPNOTSUPP};
+use tk_linux_kapi::config::{EFAULT, EINVAL, ENOMEM, EOPNOTSUPP, GFP_KERNEL};
 use tk_linux_kapi::idr::{idr_get_next, Idr};
 use tk_linux_kapi::list::{list_add_tail, list_del, list_empty, INIT_LIST_HEAD};
+use tk_linux_kapi::memory::{kfree, kmalloc};
+use tk_linux_kapi::mm_native::{copy_from_user, copy_to_user};
 #[cfg(not(test))]
 use tk_linux_kapi::mutex::{mutex_lock, mutex_unlock};
 #[cfg(test)]
@@ -54,7 +56,7 @@ pub unsafe extern "C" fn drm_lease_owner(mut master: *mut DrmMaster) -> *mut Drm
 unsafe fn _drm_find_lessee(master: *mut DrmMaster, lessee_id: i32) -> *mut DrmMaster {
     unsafe {
         let owner = drm_lease_owner(master);
-        idr_find(core::ptr::addr_of_mut!((*owner).lessee_idr), lessee_id).cast()
+        idr_find(core::ptr::addr_of_mut!((*owner).lessee_idr), lessee_id as core::ffi::c_ulong).cast()
     }
 }
 
@@ -62,7 +64,7 @@ unsafe fn _drm_find_lessee(master: *mut DrmMaster, lessee_id: i32) -> *mut DrmMa
 unsafe fn _drm_lease_held_master(master: *mut DrmMaster, id: i32) -> bool {
     unsafe {
         if !(*master).lessor.is_null() {
-            return !idr_find(core::ptr::addr_of_mut!((*master).leases), id).is_null();
+            return !idr_find(core::ptr::addr_of_mut!((*master).leases), id as core::ffi::c_ulong).is_null();
         }
         true
     }
@@ -368,8 +370,26 @@ pub unsafe extern "C" fn drm_mode_create_lease_ioctl(
         idr_init(core::ptr::addr_of_mut!(leases));
 
         if object_count != 0 {
-            let object_ids = (*cl).object_ids as *const u32;
+            let alloc_size = object_count.checked_mul(core::mem::size_of::<u32>()).unwrap_or(0);
+            if alloc_size == 0 {
+                idr_destroy(core::ptr::addr_of_mut!(leases));
+                drm_master_put(core::ptr::addr_of_mut!(lessor));
+                return -EINVAL;
+            }
+            let object_ids = kmalloc(alloc_size, GFP_KERNEL).cast::<u32>();
+            if object_ids.is_null() {
+                idr_destroy(core::ptr::addr_of_mut!(leases));
+                drm_master_put(core::ptr::addr_of_mut!(lessor));
+                return -ENOMEM;
+            }
+            if copy_from_user(object_ids.cast(), ((*cl).object_ids as usize) as *const core::ffi::c_void, alloc_size) != 0 {
+                kfree(object_ids.cast::<core::ffi::c_void>());
+                idr_destroy(core::ptr::addr_of_mut!(leases));
+                drm_master_put(core::ptr::addr_of_mut!(lessor));
+                return -EFAULT;
+            }
             let ret = fill_object_idr(dev, lessor_priv, core::ptr::addr_of_mut!(leases), object_count, object_ids);
+            kfree(object_ids.cast::<core::ffi::c_void>());
             if ret != 0 {
                 idr_destroy(core::ptr::addr_of_mut!(leases));
                 drm_master_put(core::ptr::addr_of_mut!(lessor));
@@ -414,6 +434,7 @@ pub unsafe extern "C" fn drm_mode_list_lessees_ioctl(
         let mut cur = (*lessor).lessees.next;
         let lessee_ids = (*arg).lessees_ptr as *mut u32;
         let count_lessees = (*arg).count_lessees;
+        let mut ret = 0;
 
         while cur != core::ptr::addr_of_mut!((*lessor).lessees) {
             let lessee = cur.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmMaster, lessee_list)).cast::<DrmMaster>();
@@ -421,7 +442,11 @@ pub unsafe extern "C" fn drm_mode_list_lessees_ioctl(
             let first = idr_get_next(core::ptr::addr_of_mut!((*lessee).leases).cast(), &mut dummy);
             if !first.is_null() {
                 if count_lessees > count && !lessee_ids.is_null() {
-                    *lessee_ids.add(count as usize) = (*lessee).lessee_id as u32;
+                    let id = (*lessee).lessee_id as u32;
+                    if copy_to_user(lessee_ids.add(count as usize).cast(), core::ptr::addr_of!(id).cast(), core::mem::size_of::<u32>()) != 0 {
+                        ret = -EFAULT;
+                        break;
+                    }
                 }
                 count += 1;
             }
@@ -431,7 +456,7 @@ pub unsafe extern "C" fn drm_mode_list_lessees_ioctl(
         mutex_unlock(core::ptr::addr_of_mut!((*dev).mode_config.idr_mutex));
 
         drm_master_put(core::ptr::addr_of_mut!(lessor));
-        0
+        ret
     }
 }
 
@@ -462,6 +487,7 @@ pub unsafe extern "C" fn drm_mode_get_lease_ioctl(
         let mut count = 0u32;
         let object_ids = (*arg).objects_ptr as *mut u32;
         let count_objects = (*arg).count_objects;
+        let mut ret = 0;
 
         let mut next = 0;
         loop {
@@ -470,7 +496,11 @@ pub unsafe extern "C" fn drm_mode_get_lease_ioctl(
                 break;
             }
             if count_objects > count && !object_ids.is_null() {
-                *object_ids.add(count as usize) = next as u32;
+                let id = next as u32;
+                if copy_to_user(object_ids.add(count as usize).cast(), core::ptr::addr_of!(id).cast(), core::mem::size_of::<u32>()) != 0 {
+                    ret = -EFAULT;
+                    break;
+                }
             }
             count += 1;
             next += 1;
@@ -479,7 +509,7 @@ pub unsafe extern "C" fn drm_mode_get_lease_ioctl(
         (*arg).count_objects = count;
         mutex_unlock(core::ptr::addr_of_mut!((*dev).mode_config.idr_mutex));
         drm_master_put(core::ptr::addr_of_mut!(lessee));
-        0
+        ret
     }
 }
 

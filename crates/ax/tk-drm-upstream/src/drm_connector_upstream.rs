@@ -2784,19 +2784,20 @@ pub unsafe extern "C" fn drm_mode_put_tile_group(_dev: *mut DrmDevice, tg: *mut 
 pub unsafe extern "C" fn drm_mode_get_tile_group(dev: *mut DrmDevice, topology_id: *const u8) -> *mut DrmTileGroup {
     unsafe {
         mutex_lock(core::ptr::addr_of_mut!((*dev).mode_config.idr_mutex));
-        // idr_for_each_entry(&tile_idr, tg, id): entries in ascending id order.
-        for (_id, entry) in tk_linux_kapi::xarray::xa_snapshot(&mut (*dev).mode_config.tile_idr.idr_rt) {
-            let mut tg = entry.cast::<DrmTileGroup>();
-            if core::slice::from_raw_parts((*tg).group_data.as_ptr(), 9) == core::slice::from_raw_parts(topology_id, 9) {
-                if !tk_linux_kapi::memory::kref_get_unless_zero(&mut (*tg).refcount) {
-                    tg = core::ptr::null_mut();
-                }
-                mutex_unlock(core::ptr::addr_of_mut!((*dev).mode_config.idr_mutex));
-                return tg;
+        let mut found_tg: *mut DrmTileGroup = core::ptr::null_mut();
+        tk_linux_kapi::idr::idr_for_each(core::ptr::addr_of_mut!((*dev).mode_config.tile_idr), |_id, entry| {
+            if !found_tg.is_null() {
+                return;
             }
-        }
+            let tg = entry.cast::<DrmTileGroup>();
+            if core::slice::from_raw_parts((*tg).group_data.as_ptr(), 9) == core::slice::from_raw_parts(topology_id, 9) {
+                if tk_linux_kapi::memory::kref_get_unless_zero(&mut (*tg).refcount) {
+                    found_tg = tg;
+                }
+            }
+        });
         mutex_unlock(core::ptr::addr_of_mut!((*dev).mode_config.idr_mutex));
-        core::ptr::null_mut()
+        found_tg
     }
 }
 

@@ -24,7 +24,7 @@ static RADIX_SLOTS_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 /// next-free cursor. Oracle DWARF size 24, align 8.
 #[repr(C)]
 pub struct Idr {
-    pub idr_rt: XArray,
+    pub idr_rt: RadixTreeRoot,
     pub idr_base: u32,
     pub idr_next: u32,
 }
@@ -291,42 +291,185 @@ pub unsafe extern "C" fn radix_tree_iter_delete(
     unsafe { radix_release_if_empty(root) };
 }
 
-/// Linux `idr_find()`: `struct idr` begins with its radix-tree root, followed
-/// by `idr_base` and `idr_next`.
-#[repr(C)]
-struct IdrLayout {
-    rt: RadixTreeRoot,
-    base: u32,
-    next: u32,
+pub const IDR_RESERVED_ENTRY: *mut c_void = usize::MAX as *mut c_void;
+
+/// Linux `idr_init_base()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn idr_init_base(idr: *mut Idr, base: c_int) {
+    if !idr.is_null() {
+        unsafe {
+            core::ptr::write_bytes(idr, 0, 1);
+            (*idr).idr_base = base as u32;
+            (*idr).idr_next = base as u32;
+        }
+    }
 }
-const _: () = assert!(core::mem::size_of::<IdrLayout>() == 24);
+
+/// Linux `idr_init()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn idr_init(idr: *mut Idr) {
+    unsafe { idr_init_base(idr, 0) };
+}
+
+/// Linux `idr_destroy()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn idr_destroy(idr: *mut Idr) {
+    if !idr.is_null() {
+        unsafe { radix_tree_destroy(core::ptr::addr_of_mut!((*idr).idr_rt)) };
+    }
+}
+
+/// Linux `idr_is_empty()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn idr_is_empty(idr: *const Idr) -> bool {
+    if idr.is_null() {
+        return true;
+    }
+    let _guard = RADIX_SLOTS_LOCK.lock();
+    match unsafe { radix_slots_ref(core::ptr::addr_of!((*idr).idr_rt)) } {
+        Some(slots) => slots.slots.is_empty(),
+        None => true,
+    }
+}
+
+/// Linux `idr_alloc()`: allocates an ID in `[start, end)`. `end == 0` means INT_MAX.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn idr_alloc(
+    idr: *mut Idr,
+    ptr: *mut c_void,
+    start: i32,
+    end: i32,
+) -> i32 {
+    if idr.is_null() {
+        return -crate::config::EINVAL;
+    }
+    let _guard = RADIX_SLOTS_LOCK.lock();
+    let base = unsafe { (*idr).idr_base };
+    let max = if end <= 0 { i32::MAX } else { end - 1 };
+    let start_id = start.max(base as i32);
+    if start_id > max {
+        return -crate::config::ENOSPC;
+    }
+    let slots = unsafe { radix_slots_mut(core::ptr::addr_of_mut!((*idr).idr_rt)) };
+    let key_start = (start_id as u64).saturating_sub(base as u64);
+    let key_max = (max as u64).saturating_sub(base as u64);
+    let mut candidate_key = key_start;
+    for (&k, _) in slots.slots.range(key_start..=key_max) {
+        if k == candidate_key {
+            candidate_key = candidate_key.wrapping_add(1);
+        } else if k > candidate_key {
+            break;
+        }
+    }
+    if candidate_key > key_max {
+        return -crate::config::ENOSPC;
+    }
+    let entry = if ptr.is_null() {
+        IDR_RESERVED_ENTRY
+    } else {
+        ptr
+    };
+    slots.slots.insert(candidate_key, Box::new(entry));
+    (candidate_key + base as u64) as i32
+}
+
+/// Linux `idr_replace()`: replaces the entry at `id` with `ptr`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn idr_replace(
+    idr: *mut Idr,
+    ptr: *mut c_void,
+    id: i32,
+) -> *mut c_void {
+    if idr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let _guard = RADIX_SLOTS_LOCK.lock();
+    let base = unsafe { (*idr).idr_base };
+    if (id as u64) < (base as u64) {
+        return core::ptr::null_mut();
+    }
+    let key = (id as u64) - (base as u64);
+    let slots = unsafe { radix_slots_mut(core::ptr::addr_of_mut!((*idr).idr_rt)) };
+    if let Some(slot) = slots.slots.get_mut(&key) {
+        let old = **slot;
+        let new_val = if ptr.is_null() {
+            IDR_RESERVED_ENTRY
+        } else {
+            ptr
+        };
+        **slot = new_val;
+        if old == IDR_RESERVED_ENTRY {
+            core::ptr::null_mut()
+        } else {
+            old
+        }
+    } else {
+        core::ptr::null_mut()
+    }
+}
+
+/// Linux `idr_remove()`: removes `id` from the idr.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn idr_remove(idr: *mut Idr, id: i32) -> *mut c_void {
+    if idr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let _guard = RADIX_SLOTS_LOCK.lock();
+    let base = unsafe { (*idr).idr_base };
+    if (id as u64) < (base as u64) {
+        return core::ptr::null_mut();
+    }
+    let key = (id as u64) - (base as u64);
+    let slots = unsafe { radix_slots_mut(core::ptr::addr_of_mut!((*idr).idr_rt)) };
+    let old = slots.slots.remove(&key).map_or(core::ptr::null_mut(), |slot| *slot);
+    unsafe { radix_release_if_empty(core::ptr::addr_of_mut!((*idr).idr_rt)) };
+    if old == IDR_RESERVED_ENTRY {
+        core::ptr::null_mut()
+    } else {
+        old
+    }
+}
 
 /// Linux `idr_find()`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn idr_find(idr: *const c_void, id: c_ulong) -> *mut c_void {
-    assert!(!idr.is_null());
-    let layout = idr.cast::<IdrLayout>();
-    let key = id.wrapping_sub(u64::from(unsafe { (*layout).base }) as c_ulong);
-    unsafe { radix_tree_lookup(core::ptr::addr_of!((*layout).rt).cast_mut(), key as u64) }
+pub unsafe extern "C" fn idr_find(idr: *const Idr, id: c_ulong) -> *mut c_void {
+    if idr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let _guard = RADIX_SLOTS_LOCK.lock();
+    let base = unsafe { (*idr).idr_base } as u64;
+    if (id as u64) < base {
+        return core::ptr::null_mut();
+    }
+    let key = (id as u64) - base;
+    match unsafe { radix_slots_ref(core::ptr::addr_of!((*idr).idr_rt)) } {
+        Some(slots) => {
+            let ptr = slots.slots.get(&key).map_or(core::ptr::null_mut(), |slot| **slot);
+            if ptr == IDR_RESERVED_ENTRY {
+                core::ptr::null_mut()
+            } else {
+                ptr
+            }
+        }
+        None => core::ptr::null_mut(),
+    }
 }
 
 /// Linux `idr_get_next()`: the first entry whose id is at least `*nextid`.
-/// On success `*nextid` is updated to the id of that entry.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn idr_get_next(idr: *mut c_void, nextid: *mut c_int) -> *mut c_void {
+pub unsafe extern "C" fn idr_get_next(idr: *mut Idr, nextid: *mut c_int) -> *mut c_void {
     assert!(!idr.is_null() && !nextid.is_null());
     let _guard = RADIX_SLOTS_LOCK.lock();
-    let layout = idr.cast::<IdrLayout>();
-    let base = unsafe { (*layout).base } as u64;
+    let base = unsafe { (*idr).idr_base } as u64;
     let id = unsafe { *nextid } as u32 as u64;
     let start = if id < base { 0 } else { id - base };
-    let Some(slots) = (unsafe { radix_slots_ref(core::ptr::addr_of!((*layout).rt)) }) else {
+    let Some(slots) = (unsafe { radix_slots_ref(core::ptr::addr_of!((*idr).idr_rt)) }) else {
         return core::ptr::null_mut();
     };
     let Some((&key, slot)) = slots
         .slots
         .range(start..)
-        .find(|(_, slot)| !slot.is_null())
+        .find(|(_, slot)| !(***slot).is_null() && ***slot != IDR_RESERVED_ENTRY)
     else {
         return core::ptr::null_mut();
     };
@@ -336,4 +479,104 @@ pub unsafe extern "C" fn idr_get_next(idr: *mut c_void, nextid: *mut c_int) -> *
     }
     unsafe { *nextid = found as c_int };
     **slot
+}
+
+/// Linux `idr_for_each()`.
+pub unsafe fn idr_for_each<F>(idr: *mut Idr, mut f: F)
+where
+    F: FnMut(i32, *mut c_void),
+{
+    if idr.is_null() {
+        return;
+    }
+    let entries: alloc::vec::Vec<(i32, *mut c_void)> = {
+        let _guard = RADIX_SLOTS_LOCK.lock();
+        let base = unsafe { (*idr).idr_base } as u64;
+        match unsafe { radix_slots_ref(core::ptr::addr_of!((*idr).idr_rt)) } {
+            Some(slots) => slots
+                .slots
+                .iter()
+                .filter(|(_, slot)| !(***slot).is_null() && ***slot != IDR_RESERVED_ENTRY)
+                .map(|(&k, slot)| ((k + base) as i32, **slot))
+                .collect(),
+            None => alloc::vec::Vec::new(),
+        }
+    };
+    for (id, ptr) in entries {
+        f(id, ptr);
+    }
+}
+
+#[inline]
+pub unsafe extern "C" fn idr_preload(_gfp: u32) {}
+
+#[inline]
+pub unsafe extern "C" fn idr_preload_end() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_idr_unified_radix_operations() {
+        unsafe {
+            let mut idr: Idr = core::mem::zeroed();
+            idr_init_base(&mut idr, 1);
+            assert!(idr_is_empty(&idr));
+
+            let p1 = 0x1000usize as *mut c_void;
+            let p2 = 0x2000usize as *mut c_void;
+            let p3 = 0x3000usize as *mut c_void;
+
+            let id1 = idr_alloc(&mut idr, p1, 1, 0);
+            assert_eq!(id1, 1);
+            let id2 = idr_alloc(&mut idr, p2, 1, 0);
+            assert_eq!(id2, 2);
+            let id3 = idr_alloc(&mut idr, p3, 5, 10);
+            assert_eq!(id3, 5);
+
+            assert!(!idr_is_empty(&idr));
+
+            // idr_find
+            assert_eq!(idr_find(&idr, 1), p1);
+            assert_eq!(idr_find(&idr, 2), p2);
+            assert_eq!(idr_find(&idr, 5), p3);
+            assert!(idr_find(&idr, 3).is_null());
+
+            // idr_get_next
+            let mut next = 1;
+            assert_eq!(idr_get_next(&mut idr, &mut next), p1);
+            assert_eq!(next, 1);
+
+            next = 2;
+            assert_eq!(idr_get_next(&mut idr, &mut next), p2);
+            assert_eq!(next, 2);
+
+            next = 3;
+            assert_eq!(idr_get_next(&mut idr, &mut next), p3);
+            assert_eq!(next, 5);
+
+            next = 6;
+            assert!(idr_get_next(&mut idr, &mut next).is_null());
+
+            // idr_for_each
+            let mut visited = alloc::vec::Vec::new();
+            idr_for_each(&mut idr, |id, ptr| {
+                visited.push((id, ptr));
+            });
+            assert_eq!(visited, alloc::vec![(1, p1), (2, p2), (5, p3)]);
+
+            // idr_replace
+            let p1_new = 0x1111usize as *mut c_void;
+            assert_eq!(idr_replace(&mut idr, p1_new, 1), p1);
+            assert_eq!(idr_find(&idr, 1), p1_new);
+
+            // idr_remove
+            assert_eq!(idr_remove(&mut idr, 2), p2);
+            assert!(idr_find(&idr, 2).is_null());
+
+            idr_destroy(&mut idr);
+            assert!(idr_is_empty(&idr));
+        }
+    }
 }

@@ -40,6 +40,7 @@ pub unsafe extern "C" fn dma_buf_export(exp_info: *const DmaBufExportInfo) -> *m
         (*dmabuf).ops = (*exp_info).ops;
         (*dmabuf).r#priv = (*exp_info).r#priv;
         (*dmabuf).resv = (*exp_info).resv;
+        (*dmabuf)._vmapping_pad = 1;
 
         let filp = kmalloc(core::mem::size_of::<File>(), GFP_KERNEL).cast::<File>();
         if !filp.is_null() {
@@ -58,6 +59,9 @@ pub unsafe extern "C" fn dma_buf_get(fd: c_int) -> *mut DmaBuf {
     if fd >= 0 && (fd as usize) < MAX_FD {
         let ptr = DMABUF_FD_MAP[fd as usize].load(Ordering::SeqCst);
         if !ptr.is_null() {
+            if (ptr as usize) >= 4096 {
+                (*ptr)._vmapping_pad = (*ptr)._vmapping_pad.saturating_add(1);
+            }
             return ptr;
         }
     }

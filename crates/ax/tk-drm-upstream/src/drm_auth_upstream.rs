@@ -29,19 +29,11 @@ use crate::drm_device_types::DrmDevice;
 use crate::drm_file_types::DrmFile;
 use crate::drm_lease_upstream::{drm_lease_destroy, drm_lease_owner, drm_lease_revoke};
 use crate::drm_mode_object_upstream::{
-    drm_core_check_feature, idr_alloc, idr_destroy, idr_find, idr_init, idr_remove, idr_replace, DRIVER_MODESET,
+    drm_core_check_feature, idr_alloc, idr_destroy, idr_find, idr_init, idr_init_base, idr_remove, idr_replace, DRIVER_MODESET,
 };
 use crate::uapi_drm_types::DrmAuth;
 
 const EACCES: i32 = 13;
-
-unsafe fn idr_init_base(idr: *mut Idr, base: u32) {
-    unsafe {
-        idr_init(idr);
-        (*idr).idr_base = base;
-        (*idr).idr_next = base;
-    }
-}
 
 // upstream: drivers/gpu/drm/drm_auth.c drm_is_current_master_locked()
 unsafe fn drm_is_current_master_locked(fpriv: *mut DrmFile) -> bool {
@@ -107,7 +99,7 @@ pub unsafe extern "C" fn drm_authmagic(
         mutex_lock(core::ptr::addr_of_mut!((*dev).master_mutex));
         let file = idr_find(
             core::ptr::addr_of_mut!((*(*file_priv).master).magic_map),
-            (*auth).magic as i32,
+            (*auth).magic as core::ffi::c_ulong,
         ).cast::<DrmFile>();
         if !file.is_null() {
             (*file).authenticated = true;

@@ -50,6 +50,8 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # 2026-10-13 (B3a i915 display foundation in tk-intel-gt): crates/ax moves
 # from 872/842 to 893/863 at >= 40 (21 code lines) and from 2335/2297 to
 # 2373/2335 at >= 25 (38 code lines).
+# 2026-10-13 (DRM core review fixes in tk-drm-upstream and tk-linux-kapi):
+# crates/ax moves from 2335/2297 to 2343/2305 at >= 25 (8 code lines).
 # 2026-10-13 (B2e HDMI helpers in tk-drm-upstream: drivers/video/hdmi.c,
 # drm_scdc_helper, drm_hdmi_helper, drm_hdmi_state_helper): crates/ax moves
 # from 868/838 to 872/842 at >= 40 and from 2325/2287 to 2335/2297 at >= 25.

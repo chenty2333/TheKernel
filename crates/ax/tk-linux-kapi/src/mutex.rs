@@ -12,14 +12,22 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::{types::Mutex, config::CONFIG_DEBUG_MUTEXES};
+use crate::{config::CONFIG_DEBUG_MUTEXES, types::Mutex};
 
-static MUTEX_WAITERS: axtask::WaitQueue = axtask::WaitQueue::new();
+const MUTEX_WAIT_BUCKETS: usize = 64;
+static MUTEX_WAIT_QUEUES: [axtask::WaitQueue; MUTEX_WAIT_BUCKETS] =
+    [const { axtask::WaitQueue::new() }; MUTEX_WAIT_BUCKETS];
 
 /// The wait queue shared by contended Linux mutexes and the wound/wait
 /// `ww_mutex` waiters; both recheck their predicate after every wake.
 pub(crate) fn mutex_wait_queue() -> &'static axtask::WaitQueue {
-    &MUTEX_WAITERS
+    &MUTEX_WAIT_QUEUES[0]
+}
+
+#[inline]
+pub(crate) fn mutex_wait_queue_for(mutex: *mut Mutex) -> &'static axtask::WaitQueue {
+    let idx = (mutex as usize >> 3) % MUTEX_WAIT_BUCKETS;
+    &MUTEX_WAIT_QUEUES[idx]
 }
 
 const _: [(); 24] = [(); size_of::<Mutex>()];
@@ -119,13 +127,14 @@ pub unsafe fn mutex_lock<M: MutexPointer>(mutex: M) {
     let task = current_owner();
     let mutex = mutex.mutex_ptr();
     let owner = unsafe { owner_word(mutex) };
+    let wq = mutex_wait_queue_for(mutex);
     loop {
         match owner.compare_exchange(0, task, Ordering::Acquire, Ordering::Relaxed) {
             Ok(_) => return,
             Err(held_by) if held_by == task => {
                 panic!("recursive Linux mutex lock");
             }
-            Err(_) => MUTEX_WAITERS
+            Err(_) => wq
                 .wait_until(|| owner.load(Ordering::Acquire) == 0)
                 .expect("Linux mutex lost its task wait context"),
         }
@@ -144,7 +153,7 @@ pub unsafe fn mutex_unlock<M: MutexPointer>(mutex: M) {
         task,
         "Linux mutex unlocked by a non-owner"
     );
-    MUTEX_WAITERS.notify_all(false);
+    mutex_wait_queue_for(mutex).notify_all(false);
 }
 
 #[inline]
@@ -174,6 +183,16 @@ mod tests {
         // SAFETY: valid local mutex storage.
         assert!(!unsafe { mutex_is_locked(mutex_ptr) });
     }
+
+    #[test]
+    fn test_mutex_wait_queue_hashing() {
+        let mut m1 = core::mem::MaybeUninit::<Mutex>::zeroed();
+        let p1 = m1.as_mut_ptr();
+        let p2 = (p1 as usize).wrapping_add(8 * 17) as *mut Mutex;
+        let wq1 = mutex_wait_queue_for(p1);
+        let wq2 = mutex_wait_queue_for(p2);
+        assert!(!core::ptr::eq(wq1, wq2));
+    }
 }
 
 /// Interruptible acquire: sleeps like [`mutex_lock`], and gives up with
@@ -183,6 +202,7 @@ pub unsafe fn mutex_lock_interruptible_impl<M: MutexPointer>(mutex: M) -> i32 {
     let task = current_owner();
     let mutex = mutex.mutex_ptr();
     let owner = unsafe { owner_word(mutex) };
+    let wq = mutex_wait_queue_for(mutex);
     loop {
         match owner.compare_exchange(0, task, Ordering::Acquire, Ordering::Relaxed) {
             Ok(_) => return 0,
@@ -195,7 +215,7 @@ pub unsafe fn mutex_lock_interruptible_impl<M: MutexPointer>(mutex: M) -> i32 {
                 if crate::signal::signal_pending_current() {
                     return -crate::config::EINTR;
                 }
-                let _ = MUTEX_WAITERS.wait_timeout_until(
+                let _ = wq.wait_timeout_until(
                     core::time::Duration::from_millis(10),
                     || {
                         owner.load(Ordering::Acquire) == 0

@@ -48,7 +48,7 @@ pub static CRTC_WW_CLASS: WwClass = WwClass {
 
 /// Linux `ww_mutex_lock()` waiters are kept on a per-lock list. The kernel
 /// only needs the contexts that are currently blocked, so they are recorded in
-/// a fixed table guarded by the metadata lock below.
+/// an inline table plus dynamic overflow guarded by the metadata lock below.
 const WW_MAX_WAITERS: usize = 128;
 
 struct WwWaiterSlot {
@@ -62,6 +62,9 @@ static WW_WAITERS: [WwWaiterSlot; WW_MAX_WAITERS] = [const {
         ctx: AtomicPtr::new(null_mut()),
     }
 }; WW_MAX_WAITERS];
+struct WwOverflow(core::cell::UnsafeCell<Option<alloc::vec::Vec<WwWaiterSlot>>>);
+unsafe impl Sync for WwOverflow {}
+static WW_WAITERS_OVERFLOW: WwOverflow = WwOverflow(core::cell::UnsafeCell::new(None));
 static WW_METADATA_LOCKED: AtomicBool = AtomicBool::new(false);
 
 const _: [(); 32] = [(); core::mem::size_of::<WwMutex>()];
@@ -87,8 +90,12 @@ fn metadata_unlock(guard: NoPreemptIrqSave) {
     drop(guard);
 }
 
-fn wake_waiters() {
-    mutex_wait_queue().notify_all(false);
+fn wake_waiters(lock: *mut WwMutex) {
+    if !lock.is_null() {
+        crate::mutex::mutex_wait_queue_for(unsafe { core::ptr::addr_of_mut!((*lock).base) }).notify_all(false);
+    } else {
+        crate::mutex::mutex_wait_queue().notify_all(false);
+    }
 }
 
 /// Linux `__ww_ctx_less(a, b)`: `a` is younger than `b` (wrap-aware stamp order).
@@ -107,15 +114,30 @@ fn is_wait_die(ctx: *mut WwAcquireCtx) -> bool {
 
 /// Context pointers of the waiters currently blocked on `lock`.
 /// Caller holds the metadata lock.
-fn waiters_on(lock: *mut WwMutex) -> impl Iterator<Item = *mut WwAcquireCtx> {
-    WW_WAITERS.iter().filter_map(move |slot| {
+fn waiters_on(lock: *mut WwMutex) -> alloc::vec::Vec<*mut WwAcquireCtx> {
+    let mut list = alloc::vec::Vec::new();
+    for slot in WW_WAITERS.iter() {
         if slot.lock.load(Ordering::Acquire) == lock {
             let ctx = slot.ctx.load(Ordering::Acquire);
-            (!ctx.is_null()).then_some(ctx)
-        } else {
-            None
+            if !ctx.is_null() {
+                list.push(ctx);
+            }
         }
-    })
+    }
+    unsafe {
+        let overflow_ref = &*WW_WAITERS_OVERFLOW.0.get();
+        if let Some(overflow) = overflow_ref.as_ref() {
+            for slot in overflow.iter() {
+                if slot.lock.load(Ordering::Acquire) == lock {
+                    let ctx = slot.ctx.load(Ordering::Acquire);
+                    if !ctx.is_null() {
+                        list.push(ctx);
+                    }
+                }
+            }
+        }
+    }
+    list
 }
 
 /// Caller holds the metadata lock.
@@ -127,7 +149,14 @@ fn register_waiter(lock: *mut WwMutex, ctx: *mut WwAcquireCtx) {
             return;
         }
     }
-    panic!("ww_mutex waiter table exhausted");
+    unsafe {
+        let overflow_mut = &mut *WW_WAITERS_OVERFLOW.0.get();
+        let overflow = overflow_mut.get_or_insert_with(alloc::vec::Vec::new);
+        overflow.push(WwWaiterSlot {
+            lock: AtomicPtr::new(lock),
+            ctx: AtomicPtr::new(ctx),
+        });
+    }
 }
 
 /// Caller holds the metadata lock.
@@ -137,6 +166,14 @@ fn unregister_waiter(ctx: *mut WwAcquireCtx) {
             slot.ctx.store(null_mut(), Ordering::Release);
             slot.lock.store(null_mut(), Ordering::Release);
             return;
+        }
+    }
+    unsafe {
+        let overflow_mut = &mut *WW_WAITERS_OVERFLOW.0.get();
+        if let Some(overflow) = overflow_mut.as_mut() {
+            if let Some(pos) = overflow.iter().position(|s| s.ctx.load(Ordering::Acquire) == ctx) {
+                overflow.swap_remove(pos);
+            }
         }
     }
 }
@@ -158,7 +195,7 @@ fn must_die(lock: *mut WwMutex, ctx: *mut WwAcquireCtx) -> bool {
     if !hold.is_null() && hold != ctx && ctx_younger(ctx, hold) {
         return true;
     }
-    waiters_on(lock).any(|waiter| waiter != ctx && ctx_younger(ctx, waiter))
+    waiters_on(lock).iter().any(|&waiter| waiter != ctx && ctx_younger(ctx, waiter))
 }
 
 /// Initialize a WW acquire context for `class` (Linux `ww_acquire_init`).
@@ -208,7 +245,7 @@ unsafe fn publish_acquisition(lock: *mut WwMutex, ctx: *mut WwAcquireCtx) {
         // locks wounds us (wound-wait). Wait-die waiters that are now younger
         // than us re-run their predicate after the wake below.
         if !is_wait_die(ctx) {
-            let wounds = waiters_on(lock).any(|waiter| {
+            let wounds = waiters_on(lock).iter().any(|&waiter| {
                 (unsafe { (*waiter).acquired }) > 0 && ctx_younger(ctx, waiter)
             });
             if wounds {
@@ -218,7 +255,7 @@ unsafe fn publish_acquisition(lock: *mut WwMutex, ctx: *mut WwAcquireCtx) {
         }
     }
     metadata_unlock(metadata_guard);
-    wake_waiters();
+    wake_waiters(lock);
 }
 
 /// Uncontended or contended ww acquisition with `ctx == NULL` is a plain
@@ -266,12 +303,13 @@ unsafe fn ww_mutex_lock_inner(lock: *mut WwMutex, ctx: *mut WwAcquireCtx, interr
     if must_die(lock, ctx) {
         unregister_waiter(ctx);
         metadata_unlock(metadata_guard);
-        wake_waiters();
+        wake_waiters(lock);
         return -crate::config::EDEADLK;
     }
     metadata_unlock(metadata_guard);
-    wake_waiters();
+    wake_waiters(lock);
 
+    let wq = crate::mutex::mutex_wait_queue_for(core::ptr::addr_of_mut!((*lock).base));
     loop {
         // Linux re-runs the trylock before any kill check, so a lock that was
         // just released is taken even by a wounded context.
@@ -289,14 +327,14 @@ unsafe fn ww_mutex_lock_inner(lock: *mut WwMutex, ctx: *mut WwAcquireCtx, interr
                 let guard = metadata_lock();
                 unregister_waiter(ctx);
                 metadata_unlock(guard);
-                wake_waiters();
+                wake_waiters(lock);
                 return -crate::config::EINTR;
             }
-            let _ = mutex_wait_queue().wait_timeout_until(Duration::from_millis(10), || {
+            let _ = wq.wait_timeout_until(Duration::from_millis(10), || {
                 crate::signal::signal_pending_current() || dies() || unsafe { lock_is_free(lock) }
             });
         } else {
-            mutex_wait_queue()
+            wq
                 .wait_until(|| dies() || unsafe { lock_is_free(lock) })
                 .expect("ww_mutex lost its task wait context");
         }
@@ -304,7 +342,7 @@ unsafe fn ww_mutex_lock_inner(lock: *mut WwMutex, ctx: *mut WwAcquireCtx, interr
             let guard = metadata_lock();
             unregister_waiter(ctx);
             metadata_unlock(guard);
-            wake_waiters();
+            wake_waiters(lock);
             return -crate::config::EDEADLK;
         }
     }
@@ -450,5 +488,25 @@ mod tests {
     fn reservation_and_crtc_classes_have_linux_kinds() {
         assert_eq!(RESERVATION_WW_CLASS.is_wait_die, 1);
         assert_eq!(CRTC_WW_CLASS.is_wait_die, 0);
+    }
+
+    #[test]
+    fn test_ww_mutex_waiters_overflow() {
+        let mut lock = lock_held_by(core::ptr::null_mut());
+        let lock_ptr: *mut WwMutex = &mut lock;
+        let mut ctxs: alloc::vec::Vec<WwAcquireCtx> = alloc::vec::Vec::new();
+        for i in 0..140 {
+            ctxs.push(ctx(i as u64 + 10, 1, 1));
+        }
+        for c in ctxs.iter_mut() {
+            register_waiter(lock_ptr, c);
+        }
+        let list = waiters_on(lock_ptr);
+        assert_eq!(list.len(), 140);
+        for c in ctxs.iter_mut() {
+            unregister_waiter(c);
+        }
+        let list_after = waiters_on(lock_ptr);
+        assert_eq!(list_after.len(), 0);
     }
 }

@@ -24,7 +24,7 @@ unsafe fn mutex_lock<M>(_mutex: M) {}
 #[cfg(test)]
 unsafe fn mutex_unlock<M>(_mutex: M) {}
 use tk_linux_kapi::types::{AtomicT, Kref, Mutex, Spinlock, XArray};
-use tk_linux_kapi::idr::Idr;
+use tk_linux_kapi::idr::{idr_init_base, Idr};
 use tk_linux_kapi::xarray::XA_FLAGS_ALLOC;
 
 use crate::drm_device_types::{DrmDevice, DrmDeviceManaged};
@@ -228,14 +228,6 @@ unsafe fn drm_fs_inode_new() -> *mut c_void {
 unsafe fn drm_fs_inode_free(inode: *mut c_void) {
     if !inode.is_null() {
         drop(Box::from_raw(inode.cast::<u64>()));
-    }
-}
-
-unsafe fn idr_init_base(idr: *mut Idr, base: u32) {
-    unsafe {
-        crate::drm_mode_object_upstream::idr_init(idr);
-        (*idr).idr_base = base;
-        (*idr).idr_next = base;
     }
 }
 

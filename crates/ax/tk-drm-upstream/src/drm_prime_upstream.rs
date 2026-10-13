@@ -123,6 +123,14 @@ struct DrmPrimeMember {
     rb_handle: RbNode,
 }
 
+// upstream: include/linux/dma-buf.h get_dma_buf()
+#[inline]
+pub unsafe fn get_dma_buf(dmabuf: *mut DmaBuf) {
+    if !dmabuf.is_null() && (dmabuf as usize) >= 4096 {
+        (*dmabuf)._vmapping_pad = (*dmabuf)._vmapping_pad.saturating_add(1);
+    }
+}
+
 // upstream: drivers/gpu/drm/drm_prime.c drm_prime_init_file_private()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_prime_init_file_private(prime_fpriv: *mut DrmPrimeFilePrivate) {
@@ -149,6 +157,7 @@ pub unsafe extern "C" fn drm_prime_destroy_file_private(prime_fpriv: *mut DrmPri
             let member = node.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmPrimeMember, rb_handle)).cast::<DrmPrimeMember>();
             rb_erase(core::ptr::addr_of_mut!((*member).rb_handle), core::ptr::addr_of_mut!((*prime_fpriv).handles));
             rb_erase(core::ptr::addr_of_mut!((*member).rb_buf), core::ptr::addr_of_mut!((*prime_fpriv).dmabufs));
+            dma_buf_put((*member).dma_buf);
             drop(Box::from_raw(member));
         }
         mutex_unlock(core::ptr::addr_of_mut!((*prime_fpriv).lock));
@@ -172,6 +181,8 @@ pub unsafe extern "C" fn drm_prime_add_buf_handle(
             rb_buf: RbNode { parent_color: 0, left: core::ptr::null_mut(), right: core::ptr::null_mut() },
             rb_handle: RbNode { parent_color: 0, left: core::ptr::null_mut(), right: core::ptr::null_mut() },
         }));
+
+        get_dma_buf(dma_buf);
 
         mutex_lock(core::ptr::addr_of_mut!((*prime_fpriv).lock));
 
@@ -211,7 +222,7 @@ pub unsafe extern "C" fn drm_prime_add_buf_handle(
 }
 
 // upstream: drivers/gpu/drm/drm_prime.c drm_prime_lookup_buf_by_handle()
-unsafe fn drm_prime_lookup_buf_by_handle(
+pub(crate) unsafe fn drm_prime_lookup_buf_by_handle(
     prime_fpriv: *mut DrmPrimeFilePrivate,
     handle: u32,
 ) -> *mut DmaBuf {
@@ -266,7 +277,6 @@ pub unsafe extern "C" fn drm_prime_remove_buf_handle(
         return;
     }
     unsafe {
-        mutex_lock(core::ptr::addr_of_mut!((*prime_fpriv).lock));
         let mut node = (*prime_fpriv).handles.node;
         while !node.is_null() {
             let member = node.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmPrimeMember, rb_handle)).cast::<DrmPrimeMember>();
@@ -277,11 +287,11 @@ pub unsafe extern "C" fn drm_prime_remove_buf_handle(
             } else {
                 rb_erase(core::ptr::addr_of_mut!((*member).rb_handle), core::ptr::addr_of_mut!((*prime_fpriv).handles));
                 rb_erase(core::ptr::addr_of_mut!((*member).rb_buf), core::ptr::addr_of_mut!((*prime_fpriv).dmabufs));
+                dma_buf_put((*member).dma_buf);
                 drop(Box::from_raw(member));
                 break;
             }
         }
-        mutex_unlock(core::ptr::addr_of_mut!((*prime_fpriv).lock));
     }
 }
 
@@ -350,6 +360,7 @@ pub unsafe extern "C" fn drm_gem_prime_fd_to_handle(
     }
     if (*obj).dma_buf.is_null() {
         (*obj).dma_buf = dmabuf.cast();
+        get_dma_buf(dmabuf);
     }
     ret = crate::drm_gem_upstream::drm_gem_handle_create_tail(file_priv, obj, handle);
     crate::drm_gem_upstream::drm_gem_object_put(obj);
@@ -410,6 +421,7 @@ unsafe fn export_and_register_object(
         return dmabuf;
     }
     (*obj).dma_buf = dmabuf.cast();
+    get_dma_buf((*obj).dma_buf.cast());
     dmabuf
 }
 
@@ -429,29 +441,36 @@ pub unsafe extern "C" fn drm_gem_prime_handle_to_dmabuf(
     }
     let cached = drm_prime_lookup_buf_by_handle(core::ptr::addr_of_mut!((*file_priv).prime), handle);
     if !cached.is_null() {
+        get_dma_buf(cached);
         crate::drm_gem_upstream::drm_gem_object_put(obj);
         mutex_unlock(core::ptr::addr_of_mut!((*file_priv).prime.lock));
         return cached;
     }
     mutex_lock(core::ptr::addr_of_mut!((*dev).object_name_lock));
-    let dmabuf = if !(*obj).dma_buf.is_null() {
-        (*obj).dma_buf.cast::<DmaBuf>()
+    let mut dmabuf: *mut DmaBuf;
+    if !(*obj).import_attach.is_null() {
+        dmabuf = (*(*obj).import_attach.cast::<DmaBufAttachment>()).dmabuf;
+        get_dma_buf(dmabuf);
+    } else if !(*obj).dma_buf.is_null() {
+        get_dma_buf((*obj).dma_buf.cast());
+        dmabuf = (*obj).dma_buf.cast();
     } else {
-        export_and_register_object(dev, obj, flags)
-    };
-    if (dmabuf as isize) < 0 && (dmabuf as isize) > -4096 {
-        mutex_unlock(core::ptr::addr_of_mut!((*dev).object_name_lock));
-        crate::drm_gem_upstream::drm_gem_object_put(obj);
-        mutex_unlock(core::ptr::addr_of_mut!((*file_priv).prime.lock));
-        return dmabuf;
+        dmabuf = export_and_register_object(dev, obj, flags);
+        if (dmabuf as isize) < 0 && (dmabuf as isize) > -4096 {
+            mutex_unlock(core::ptr::addr_of_mut!((*dev).object_name_lock));
+            crate::drm_gem_upstream::drm_gem_object_put(obj);
+            mutex_unlock(core::ptr::addr_of_mut!((*file_priv).prime.lock));
+            return dmabuf;
+        }
     }
     let ret = drm_prime_add_buf_handle(core::ptr::addr_of_mut!((*file_priv).prime), dmabuf, handle);
     mutex_unlock(core::ptr::addr_of_mut!((*dev).object_name_lock));
+    if ret != 0 {
+        dma_buf_put(dmabuf);
+        dmabuf = (ret as isize) as *mut DmaBuf;
+    }
     crate::drm_gem_upstream::drm_gem_object_put(obj);
     mutex_unlock(core::ptr::addr_of_mut!((*file_priv).prime.lock));
-    if ret != 0 {
-        return (ret as isize) as *mut DmaBuf;
-    }
     dmabuf
 }
 
@@ -676,10 +695,18 @@ pub unsafe extern "C" fn drm_gem_prime_import_dev(
             if (attach as isize) < 0 && (attach as isize) > -4096 {
                 return attach.cast();
             }
+            get_dma_buf(dma_buf);
             let sgt = dma_buf_map_attachment_unlocked(attach, 0);
+            if (sgt as isize) < 0 && (sgt as isize) > -4096 {
+                dma_buf_detach(dma_buf, attach);
+                dma_buf_put(dma_buf);
+                return sgt.cast();
+            }
             let obj = import_sg(dev, attach.cast(), sgt);
             if (obj as isize) < 0 && (obj as isize) > -4096 {
+                dma_buf_unmap_attachment_unlocked(attach, sgt, 0);
                 dma_buf_detach(dma_buf, attach);
+                dma_buf_put(dma_buf);
                 return obj;
             }
             (*obj).import_attach = attach.cast();
@@ -769,11 +796,18 @@ mod tests {
             let mut prime: DrmPrimeFilePrivate = core::mem::zeroed();
             drm_prime_init_file_private(&mut prime);
 
-            let buf1 = 0x1000usize as *mut DmaBuf;
-            let buf2 = 0x2000usize as *mut DmaBuf;
+            let buf1 = kmalloc(core::mem::size_of::<DmaBuf>(), GFP_KERNEL).cast::<DmaBuf>();
+            core::ptr::write_bytes(buf1, 0, 1);
+            (*buf1)._vmapping_pad = 1;
+
+            let buf2 = kmalloc(core::mem::size_of::<DmaBuf>(), GFP_KERNEL).cast::<DmaBuf>();
+            core::ptr::write_bytes(buf2, 0, 1);
+            (*buf2)._vmapping_pad = 1;
 
             assert_eq!(drm_prime_add_buf_handle(&mut prime, buf1, 10), 0);
             assert_eq!(drm_prime_add_buf_handle(&mut prime, buf2, 20), 0);
+            assert_eq!((*buf1)._vmapping_pad, 2);
+            assert_eq!((*buf2)._vmapping_pad, 2);
 
             // Lookup buffer by handle
             assert_eq!(drm_prime_lookup_buf_by_handle(&mut prime, 10), buf1);
@@ -789,14 +823,20 @@ mod tests {
             assert_eq!(drm_prime_lookup_buf_handle(&mut prime, 0x3000 as *mut _, &mut h), -EINVAL);
 
             // Remove handle 10
+            mutex_lock(core::ptr::addr_of_mut!(prime.lock));
             drm_prime_remove_buf_handle(&mut prime, 10);
+            mutex_unlock(core::ptr::addr_of_mut!(prime.lock));
             assert!(drm_prime_lookup_buf_by_handle(&mut prime, 10).is_null());
             assert_eq!(drm_prime_lookup_buf_by_handle(&mut prime, 20), buf2);
+            assert_eq!((*buf1)._vmapping_pad, 1);
+            dma_buf_put(buf1);
 
             // Destroy prime private
             drm_prime_destroy_file_private(&mut prime);
             assert!(prime.dmabufs.node.is_null());
             assert!(prime.handles.node.is_null());
+            assert_eq!((*buf2)._vmapping_pad, 1);
+            dma_buf_put(buf2);
 
             // 2. Test handle <-> fd round-trip via real dma-buf export & import
             let mut driver: DrmDriver = core::mem::zeroed();

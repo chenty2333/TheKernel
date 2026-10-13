@@ -189,49 +189,16 @@ unsafe fn obj_to_plane(obj: *mut DrmModeObject) -> *mut DrmPlane {
 
 #[inline]
 unsafe fn get_user<T: Copy>(val: &mut T, ptr: *const T) -> bool {
-    #[cfg(test)]
-    {
-        if ptr.is_null() {
-            return false;
-        }
-        unsafe {
-            *val = core::ptr::read(ptr);
-        }
-        return true;
-    }
-    #[cfg(not(test))]
     unsafe { tk_linux_kapi::mm_native::__get_user(val, ptr) == 0 }
 }
 
 #[inline]
 unsafe fn put_user<T: Copy>(val: T, ptr: *mut T) -> bool {
-    #[cfg(test)]
-    {
-        if ptr.is_null() {
-            return false;
-        }
-        unsafe {
-            core::ptr::write(ptr, val);
-        }
-        return true;
-    }
-    #[cfg(not(test))]
     unsafe { tk_linux_kapi::mm_native::__put_user(val, ptr) == 0 }
 }
 
 #[inline]
 unsafe fn copy_from_user(dst: *mut c_void, src: *const c_void, size: usize) -> bool {
-    #[cfg(test)]
-    {
-        if dst.is_null() || src.is_null() {
-            return false;
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, size);
-        }
-        return true;
-    }
-    #[cfg(not(test))]
     unsafe { tk_linux_kapi::mm_native::copy_from_user(dst, src, size) == 0 }
 }
 

@@ -14,6 +14,7 @@ use tk_linux_kapi::assert::warn_on;
 use tk_linux_kapi::config::{EFAULT, EINVAL, ENODEV, ENOMEM, EOPNOTSUPP, GFP_KERNEL, CAP_SYS_ADMIN};
 use tk_linux_kapi::kernel_services::capable;
 use tk_linux_kapi::memory::{kfree, kmalloc};
+use tk_linux_kapi::mm_native::{copy_from_user, copy_to_user};
 #[cfg(not(test))]
 use tk_linux_kapi::mutex::{mutex_lock, mutex_unlock};
 #[cfg(test)]
@@ -21,6 +22,9 @@ unsafe fn mutex_lock<M>(_mutex: M) {}
 #[cfg(test)]
 unsafe fn mutex_unlock<M>(_mutex: M) {}
 use tk_linux_kapi::types::File;
+
+const IOC_IN: u32 = 1 << 30;
+const IOC_OUT: u32 = 2 << 30;
 
 use crate::drm_auth_upstream::{drm_authmagic, drm_dropmaster_ioctl, drm_getmagic, drm_is_current_master, drm_setmaster_ioctl};
 use crate::drm_device_types::DrmDevice;
@@ -79,10 +83,12 @@ unsafe fn drm_copy_field(buf: *mut c_char, buf_len: *mut usize, value: *const c_
         }
         if !buf_len.is_null() {
             let copy_len = (*buf_len).min(len);
-            if !buf.is_null() && copy_len > 0 {
-                core::ptr::copy_nonoverlapping(value, buf, copy_len);
-            }
             *buf_len = len;
+            if !buf.is_null() && copy_len > 0 {
+                if copy_to_user(buf.cast(), value.cast(), copy_len) != 0 {
+                    return -EFAULT;
+                }
+            }
         }
     }
     0
@@ -105,15 +111,24 @@ pub unsafe extern "C" fn drm_version(
             (*v).version_minor = driver.minor;
             (*v).version_patchlevel = driver.patchlevel;
             let mut name_len = (*v).name_len;
-            drm_copy_field((*v).name, &mut name_len, driver.name);
+            let mut ret = drm_copy_field((*v).name, &mut name_len, driver.name);
             (*v).name_len = name_len;
-            let mut desc_len = (*v).desc_len;
-            drm_copy_field((*v).desc, &mut desc_len, driver.desc);
-            (*v).desc_len = desc_len;
+            if ret != 0 {
+                return ret;
+            }
             let mut date_len = (*v).date_len;
             let date_str = b"0\0".as_ptr().cast();
-            drm_copy_field((*v).date, &mut date_len, date_str);
+            ret = drm_copy_field((*v).date, &mut date_len, date_str);
             (*v).date_len = date_len;
+            if ret != 0 {
+                return ret;
+            }
+            let mut desc_len = (*v).desc_len;
+            ret = drm_copy_field((*v).desc, &mut desc_len, driver.desc);
+            (*v).desc_len = desc_len;
+            if ret != 0 {
+                return ret;
+            }
         }
         0
     }
@@ -139,7 +154,10 @@ pub unsafe extern "C" fn drm_getunique(
         }
         let master_len = (*master).unique_len as usize;
         if (*u).unique_len >= master_len && !(*master).unique.is_null() && !(*u).unique.is_null() {
-            core::ptr::copy_nonoverlapping((*master).unique, (*u).unique, master_len);
+            if copy_to_user((*u).unique.cast(), (*master).unique.cast(), master_len) != 0 {
+                mutex_unlock(core::ptr::addr_of_mut!((*dev).master_mutex));
+                return -EFAULT;
+            }
         }
         (*u).unique_len = master_len;
         mutex_unlock(core::ptr::addr_of_mut!((*dev).master_mutex));
@@ -598,8 +616,17 @@ pub unsafe extern "C" fn drm_ioctl(
 
         let func: DrmIoctlFn = core::mem::transmute((*desc).func);
         let drv_size = ((*desc).cmd >> 16) & 0x3fff;
-        let user_size = (cmd >> 16) & 0x3fff;
-        let ksize = drv_size.max(user_size) as usize;
+        let mut in_size = (cmd >> 16) & 0x3fff;
+        let mut out_size = in_size;
+        if ((*desc).cmd & (IOC_IN | IOC_OUT)) != 0 {
+            if (cmd & (*desc).cmd & IOC_IN) == 0 {
+                in_size = 0;
+            }
+            if (cmd & (*desc).cmd & IOC_OUT) == 0 {
+                out_size = 0;
+            }
+        }
+        let ksize = drv_size.max(in_size).max(out_size) as usize;
 
         let mut stack_buf = [0u8; 128];
         let kdata = if ksize <= stack_buf.len() {
@@ -611,23 +638,28 @@ pub unsafe extern "C" fn drm_ioctl(
             return -ENOMEM;
         }
 
-        if user_size > 0 && arg != 0 {
-            core::ptr::copy_nonoverlapping(arg as *const u8, kdata, user_size.min(drv_size) as usize);
-            if ksize > (user_size as usize) {
-                core::ptr::write_bytes(kdata.add(user_size as usize), 0, ksize - user_size as usize);
+        if in_size > 0 {
+            if copy_from_user(kdata.cast(), arg as *const c_void, in_size as usize) != 0 {
+                if kdata != stack_buf.as_mut_ptr() {
+                    kfree(kdata.cast::<c_void>());
+                }
+                return -EFAULT;
             }
-        } else {
-            core::ptr::write_bytes(kdata, 0, ksize);
+        }
+        if ksize > (in_size as usize) {
+            core::ptr::write_bytes(kdata.add(in_size as usize), 0, ksize - in_size as usize);
         }
 
-        let ret = drm_ioctl_kernel(filp, func, kdata.cast(), (*desc).flags);
+        let mut ret = drm_ioctl_kernel(filp, func, kdata.cast(), (*desc).flags);
 
-        if ret == 0 && user_size > 0 && arg != 0 {
-            core::ptr::copy_nonoverlapping(kdata, arg as *mut u8, user_size.min(drv_size) as usize);
+        if out_size > 0 {
+            if copy_to_user(arg as *mut c_void, kdata.cast(), out_size as usize) != 0 {
+                ret = -EFAULT;
+            }
         }
 
         if kdata != stack_buf.as_mut_ptr() {
-            kfree(kdata);
+            kfree(kdata.cast::<c_void>());
         }
 
         ret
@@ -792,6 +824,10 @@ mod tests {
             assert_eq!((*d_in).b, 0x2222);
             // Trailing 8 bytes untouched:
             assert_eq!(user_buf_24.0[16], 0);
+
+            // 5. Fault rule: invalid user pointer (< 4096) returns -EFAULT
+            let ret_fault = drm_ioctl(filp, DRM_IOCTL_VERSION, 0x10);
+            assert_eq!(ret_fault, -EFAULT);
 
             drm_file_free(file_priv);
             drm_dev_put(dev);

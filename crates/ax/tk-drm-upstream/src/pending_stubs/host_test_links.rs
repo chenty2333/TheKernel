@@ -120,7 +120,11 @@ pub unsafe extern "C" fn dma_buf_detach(dmabuf: *mut DmaBuf, attach: *mut DmaBuf
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dma_buf_put(dmabuf: *mut DmaBuf) {
     unsafe {
-        if !dmabuf.is_null() {
+        if !dmabuf.is_null() && (dmabuf as usize) >= 4096 {
+            if (*dmabuf)._vmapping_pad > 1 {
+                (*dmabuf)._vmapping_pad -= 1;
+                return;
+            }
             if let Some(ops) = (*dmabuf).ops.as_ref() {
                 if let Some(rel) = ops.release {
                     rel(dmabuf);
