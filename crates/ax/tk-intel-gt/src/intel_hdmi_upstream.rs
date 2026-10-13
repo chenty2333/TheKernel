@@ -55,15 +55,20 @@ use tk_linux_kapi::{
 #[cfg(test)]
 use crate::intel_display_limits_types_upstream::PORT_B;
 use crate::{
-    intel_de_upstream::intel_de_read,
+    intel_de_upstream::{intel_de_posting_read, intel_de_read, intel_de_write},
     intel_display_conversion_upstream::__drm_to_display,
     intel_display_core_types_upstream::IntelDisplay,
     intel_display_limits_types_upstream::{PORT_A, PORT_C, PORT_TC1, PORT_TC6},
     intel_display_regs_upstream::{
-        GCP_COLOR_INDICATION, GCP_DEFAULT_PHASE_ENABLE, HSW_TVIDEO_DIP_GCP, VDIP_ENABLE_PPS,
-        VIDEO_DIP_ENABLE_AS_ADL, VIDEO_DIP_ENABLE_AVI_HSW, VIDEO_DIP_ENABLE_DRM_GLK,
-        VIDEO_DIP_ENABLE_GCP_HSW, VIDEO_DIP_ENABLE_GMP_HSW, VIDEO_DIP_ENABLE_SPD_HSW,
-        VIDEO_DIP_ENABLE_VS_HSW, VIDEO_DIP_ENABLE_VSC_HSW,
+        ADL_TVIDEO_DIP_AS_SDP_DATA, GCP_COLOR_INDICATION, GCP_DEFAULT_PHASE_ENABLE,
+        GLK_TVIDEO_DIP_DRM_DATA, HSW_TVIDEO_DIP_AVI_DATA, HSW_TVIDEO_DIP_CTL, HSW_TVIDEO_DIP_GCP,
+        HSW_TVIDEO_DIP_GMP_DATA, HSW_TVIDEO_DIP_SPD_DATA, HSW_TVIDEO_DIP_VS_DATA,
+        HSW_TVIDEO_DIP_VSC_DATA, ICL_VIDEO_DIP_PPS_DATA, VDIP_ENABLE_PPS,
+        VIDEO_DIP_ASYNC_DATA_SIZE, VIDEO_DIP_DATA_SIZE, VIDEO_DIP_ENABLE_AS_ADL,
+        VIDEO_DIP_ENABLE_AVI_HSW, VIDEO_DIP_ENABLE_DRM_GLK, VIDEO_DIP_ENABLE_GCP_HSW,
+        VIDEO_DIP_ENABLE_GMP_HSW, VIDEO_DIP_ENABLE_SPD_HSW, VIDEO_DIP_ENABLE_VS_HSW,
+        VIDEO_DIP_ENABLE_VSC_HSW, VIDEO_DIP_GMP_DATA_SIZE, VIDEO_DIP_PPS_DATA_SIZE,
+        VIDEO_DIP_VSC_DATA_SIZE, VSC_DIP_HW_DATA_SW_HEA,
     },
     intel_display_types_upstream::{
         HDMI_AUDIO_AUTO, HDMI_AUDIO_OFF, HDMI_AUDIO_OFF_DVI, HDMI_AUDIO_ON,
@@ -71,6 +76,7 @@ use crate::{
         IntelConnector, IntelCrtcState, IntelDigitalConnectorState, IntelDigitalPort, IntelEncoder,
     },
     intel_gmbus_upstream::{intel_gmbus_get_adapter, intel_gmbus_is_valid_pin},
+    intel_workarounds_types_upstream::I915RegT,
 };
 
 const HDMI_DDC_PIN_FIRST_COMBO: u32 = 1;
@@ -85,6 +91,16 @@ const HDMI_GAMUT_PACKET_TYPE: u32 = 0x0a;
 const DP_SDP_VSC: u32 = 0x07;
 const DP_SDP_PPS: u32 = 0x10;
 const DP_SDP_ADAPTIVE_SYNC: u32 = 0x22;
+const HDMI_INFOFRAME_TYPES: [u32; 8] = [
+    HDMI_GCP_PACKET_TYPE,
+    HDMI_GAMUT_PACKET_TYPE,
+    DP_SDP_VSC,
+    DP_SDP_ADAPTIVE_SYNC,
+    HDMI_INFOFRAME_TYPE_AVI,
+    HDMI_INFOFRAME_TYPE_SPD,
+    HDMI_INFOFRAME_TYPE_VENDOR,
+    HDMI_INFOFRAME_TYPE_DRM,
+];
 
 #[inline]
 fn ddc_pin_for_port(port: i32) -> Option<u32> {
@@ -93,6 +109,305 @@ fn ddc_pin_for_port(port: i32) -> Option<u32> {
         PORT_TC1..=PORT_TC6 => Some(HDMI_DDC_PIN_FIRST_TC + (port - PORT_TC1) as u32),
         _ => None,
     }
+}
+
+#[inline]
+fn hsw_infoframe_enable(info_type: u32) -> u32 {
+    match info_type {
+        HDMI_GCP_PACKET_TYPE => VIDEO_DIP_ENABLE_GCP_HSW,
+        HDMI_GAMUT_PACKET_TYPE => VIDEO_DIP_ENABLE_GMP_HSW,
+        DP_SDP_VSC => VIDEO_DIP_ENABLE_VSC_HSW,
+        DP_SDP_ADAPTIVE_SYNC => VIDEO_DIP_ENABLE_AS_ADL,
+        DP_SDP_PPS => VDIP_ENABLE_PPS,
+        HDMI_INFOFRAME_TYPE_AVI => VIDEO_DIP_ENABLE_AVI_HSW,
+        HDMI_INFOFRAME_TYPE_SPD => VIDEO_DIP_ENABLE_SPD_HSW,
+        HDMI_INFOFRAME_TYPE_VENDOR => VIDEO_DIP_ENABLE_VS_HSW,
+        HDMI_INFOFRAME_TYPE_DRM => VIDEO_DIP_ENABLE_DRM_GLK,
+        _ => 0,
+    }
+}
+
+#[inline]
+unsafe fn hsw_dip_data_reg(
+    display: *mut IntelDisplay,
+    transcoder: u32,
+    info_type: u32,
+    word: u32,
+) -> Option<I915RegT> {
+    Some(match info_type {
+        HDMI_GAMUT_PACKET_TYPE => HSW_TVIDEO_DIP_GMP_DATA(display, transcoder, word),
+        DP_SDP_VSC => HSW_TVIDEO_DIP_VSC_DATA(display, transcoder, word),
+        DP_SDP_ADAPTIVE_SYNC => ADL_TVIDEO_DIP_AS_SDP_DATA(display, transcoder, word),
+        DP_SDP_PPS => ICL_VIDEO_DIP_PPS_DATA(display, transcoder, word),
+        HDMI_INFOFRAME_TYPE_AVI => HSW_TVIDEO_DIP_AVI_DATA(display, transcoder, word),
+        HDMI_INFOFRAME_TYPE_SPD => HSW_TVIDEO_DIP_SPD_DATA(display, transcoder, word),
+        HDMI_INFOFRAME_TYPE_VENDOR => HSW_TVIDEO_DIP_VS_DATA(display, transcoder, word),
+        HDMI_INFOFRAME_TYPE_DRM => GLK_TVIDEO_DIP_DRM_DATA(display, transcoder, word),
+        _ => return None,
+    })
+}
+
+#[inline]
+unsafe fn hsw_dip_data_size(display: *mut IntelDisplay, info_type: u32) -> usize {
+    match info_type {
+        DP_SDP_VSC => VIDEO_DIP_VSC_DATA_SIZE as usize,
+        DP_SDP_ADAPTIVE_SYNC => VIDEO_DIP_ASYNC_DATA_SIZE as usize,
+        DP_SDP_PPS => VIDEO_DIP_PPS_DATA_SIZE as usize,
+        HDMI_GAMUT_PACKET_TYPE if (*display).info.__runtime_info.ip.ver >= 11 => {
+            VIDEO_DIP_GMP_DATA_SIZE as usize
+        }
+        _ => VIDEO_DIP_DATA_SIZE as usize,
+    }
+}
+
+unsafe extern "C" fn hsw_write_infoframe(
+    encoder: *mut IntelEncoder,
+    crtc_state: *mut IntelCrtcState,
+    info_type: u32,
+    frame: *mut c_void,
+    len: isize,
+) {
+    if encoder.is_null() || crtc_state.is_null() || frame.is_null() || len < 0 {
+        return;
+    }
+    let display = display_from_encoder(encoder);
+    if display.is_null() {
+        return;
+    }
+    let data_size = hsw_dip_data_size(display, info_type);
+    if len as usize > data_size
+        || hsw_dip_data_reg(display, (*crtc_state).cpu_transcoder as u32, info_type, 0).is_none()
+    {
+        return;
+    }
+
+    let ctl = HSW_TVIDEO_DIP_CTL(display, (*crtc_state).cpu_transcoder as u32);
+    let mut ctl_val = intel_de_read(display, ctl);
+    ctl_val &= !hsw_infoframe_enable(info_type);
+    intel_de_write(display, ctl, ctl_val);
+
+    let bytes = frame.cast::<u8>();
+    let words = (len as usize).div_ceil(4);
+    for word in 0..words {
+        let mut packed = [0u8; 4];
+        let start = word * 4;
+        let count = (len as usize - start).min(4);
+        ptr::copy_nonoverlapping(bytes.add(start), packed.as_mut_ptr(), count);
+        if let Some(reg) = hsw_dip_data_reg(
+            display,
+            (*crtc_state).cpu_transcoder as u32,
+            info_type,
+            word as u32,
+        ) {
+            intel_de_write(display, reg, u32::from_le_bytes(packed));
+        } else {
+            return;
+        }
+    }
+    for word in words..(data_size / 4) {
+        if let Some(reg) = hsw_dip_data_reg(
+            display,
+            (*crtc_state).cpu_transcoder as u32,
+            info_type,
+            word as u32,
+        ) {
+            intel_de_write(display, reg, 0);
+        } else {
+            return;
+        }
+    }
+
+    let workaround_suppresses_vsc = (*display).info.__runtime_info.ip.ver >= 13
+        && (*display).info.__runtime_info.ip.ver <= 14
+        && (*crtc_state).has_psr
+        && !(*crtc_state).has_panel_replay
+        && info_type == DP_SDP_VSC;
+    if !workaround_suppresses_vsc {
+        ctl_val |= hsw_infoframe_enable(info_type);
+    }
+    if info_type == DP_SDP_VSC {
+        ctl_val |= VSC_DIP_HW_DATA_SW_HEA;
+    }
+    intel_de_write(display, ctl, ctl_val);
+    intel_de_posting_read(display, ctl);
+}
+
+unsafe extern "C" fn hsw_read_infoframe(
+    encoder: *mut IntelEncoder,
+    crtc_state: *mut IntelCrtcState,
+    info_type: u32,
+    frame: *mut c_void,
+    len: isize,
+) {
+    if encoder.is_null() || crtc_state.is_null() || frame.is_null() || len < 0 {
+        return;
+    }
+    let display = display_from_encoder(encoder);
+    if display.is_null()
+        || hsw_dip_data_reg(display, (*crtc_state).cpu_transcoder as u32, info_type, 0).is_none()
+    {
+        return;
+    }
+    let bytes = frame.cast::<u8>();
+    for word in 0..(len as usize).div_ceil(4) {
+        let Some(reg) = hsw_dip_data_reg(
+            display,
+            (*crtc_state).cpu_transcoder as u32,
+            info_type,
+            word as u32,
+        ) else {
+            return;
+        };
+        let packed = intel_de_read(display, reg).to_le_bytes();
+        let start = word * 4;
+        let count = (len as usize - start).min(4);
+        ptr::copy_nonoverlapping(packed.as_ptr(), bytes.add(start), count);
+    }
+}
+
+unsafe extern "C" fn hsw_infoframes_enabled(
+    encoder: *mut IntelEncoder,
+    crtc_state: *mut IntelCrtcState,
+) -> u32 {
+    if encoder.is_null() || crtc_state.is_null() {
+        return 0;
+    }
+    let display = display_from_encoder(encoder);
+    if display.is_null() {
+        return 0;
+    }
+    let ctl = HSW_TVIDEO_DIP_CTL(display, (*crtc_state).cpu_transcoder as u32);
+    let mut mask = VIDEO_DIP_ENABLE_VSC_HSW
+        | VIDEO_DIP_ENABLE_AVI_HSW
+        | VIDEO_DIP_ENABLE_GCP_HSW
+        | VIDEO_DIP_ENABLE_VS_HSW
+        | VIDEO_DIP_ENABLE_GMP_HSW
+        | VIDEO_DIP_ENABLE_SPD_HSW
+        | VIDEO_DIP_ENABLE_DRM_GLK
+        | VIDEO_DIP_ENABLE_AS_ADL;
+    if (*display).info.__runtime_info.ip.ver < 10 {
+        mask &= !VIDEO_DIP_ENABLE_DRM_GLK;
+    }
+    intel_de_read(display, ctl) & mask
+}
+
+unsafe extern "C" fn hsw_set_infoframes(
+    encoder: *mut IntelEncoder,
+    enable: bool,
+    crtc_state: *mut IntelCrtcState,
+    conn_state: *mut DrmConnectorState,
+) {
+    if encoder.is_null() || crtc_state.is_null() {
+        return;
+    }
+    let display = display_from_encoder(encoder);
+    if display.is_null() {
+        return;
+    }
+    let ctl = HSW_TVIDEO_DIP_CTL(display, (*crtc_state).cpu_transcoder as u32);
+    let mask = VIDEO_DIP_ENABLE_VSC_HSW
+        | VIDEO_DIP_ENABLE_AVI_HSW
+        | VIDEO_DIP_ENABLE_GCP_HSW
+        | VIDEO_DIP_ENABLE_VS_HSW
+        | VIDEO_DIP_ENABLE_GMP_HSW
+        | VIDEO_DIP_ENABLE_SPD_HSW
+        | VIDEO_DIP_ENABLE_DRM_GLK
+        | VIDEO_DIP_ENABLE_AS_ADL;
+    let mut ctl_val = intel_de_read(display, ctl) & !mask;
+    if !enable {
+        intel_de_write(display, ctl, ctl_val);
+        intel_de_posting_read(display, ctl);
+        return;
+    }
+    if (*crtc_state).infoframes.enable & intel_hdmi_infoframe_enable(HDMI_GCP_PACKET_TYPE) != 0 {
+        let gcp = HSW_TVIDEO_DIP_GCP(display, (*crtc_state).cpu_transcoder as u32);
+        intel_de_write(display, gcp, (*crtc_state).infoframes.gcp);
+        ctl_val |= VIDEO_DIP_ENABLE_GCP_HSW;
+    }
+    intel_de_write(display, ctl, ctl_val);
+    intel_de_posting_read(display, ctl);
+    intel_write_infoframe(
+        encoder,
+        crtc_state,
+        HDMI_INFOFRAME_TYPE_AVI,
+        ptr::addr_of!((*crtc_state).infoframes.avi),
+    );
+    intel_write_infoframe(
+        encoder,
+        crtc_state,
+        HDMI_INFOFRAME_TYPE_SPD,
+        ptr::addr_of!((*crtc_state).infoframes.spd),
+    );
+    intel_write_infoframe(
+        encoder,
+        crtc_state,
+        HDMI_INFOFRAME_TYPE_VENDOR,
+        ptr::addr_of!((*crtc_state).infoframes.hdmi),
+    );
+    intel_write_infoframe(
+        encoder,
+        crtc_state,
+        HDMI_INFOFRAME_TYPE_DRM,
+        ptr::addr_of!((*crtc_state).infoframes.drm),
+    );
+    let _ = conn_state;
+}
+
+unsafe fn intel_write_infoframe(
+    encoder: *mut IntelEncoder,
+    crtc_state: *mut IntelCrtcState,
+    info_type: u32,
+    frame: *const HdmiInfoframe,
+) {
+    if encoder.is_null()
+        || crtc_state.is_null()
+        || frame.is_null()
+        || (*crtc_state).infoframes.enable & intel_hdmi_infoframe_enable(info_type) == 0
+        || ptr::read_unaligned(frame.cast::<u32>()) != info_type
+    {
+        return;
+    }
+    let mut buffer = [0u8; VIDEO_DIP_DATA_SIZE as usize];
+    let len = tk_drm_upstream::hdmi_upstream::hdmi_infoframe_pack_only(
+        frame,
+        buffer.as_mut_ptr().add(1).cast::<c_void>(),
+        buffer.len() - 1,
+    );
+    if len < 0 {
+        return;
+    }
+    let Some(dip_len) = dip_insert_hole(&mut buffer, len as usize) else {
+        return;
+    };
+    let port = encoder.cast::<IntelDigitalPort>();
+    if let Some(write) = (*port).write_infoframe {
+        write(
+            encoder,
+            crtc_state,
+            info_type,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            dip_len as isize,
+        );
+    }
+}
+
+#[inline]
+fn dip_insert_hole(buffer: &mut [u8], packed_len: usize) -> Option<usize> {
+    if packed_len < 3 || packed_len + 1 > buffer.len() {
+        return None;
+    }
+    buffer.copy_within(1..4, 0);
+    buffer[3] = 0;
+    Some(packed_len + 1)
+}
+
+#[inline]
+fn dip_remove_hole(buffer: &mut [u8]) -> bool {
+    if buffer.len() < 4 {
+        return false;
+    }
+    buffer.copy_within(0..3, 1);
+    true
 }
 
 #[inline]
@@ -430,36 +745,40 @@ pub unsafe extern "C" fn intel_hdmi_is_frl(clock: u32) -> bool {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_hdmi_infoframe_enable(info_type: u32) -> u32 {
-    match info_type {
-        HDMI_GCP_PACKET_TYPE => VIDEO_DIP_ENABLE_GCP_HSW,
-        HDMI_INFOFRAME_TYPE_AVI => VIDEO_DIP_ENABLE_AVI_HSW,
-        HDMI_INFOFRAME_TYPE_SPD => VIDEO_DIP_ENABLE_SPD_HSW,
-        HDMI_INFOFRAME_TYPE_VENDOR => VIDEO_DIP_ENABLE_VS_HSW,
-        HDMI_INFOFRAME_TYPE_DRM => VIDEO_DIP_ENABLE_DRM_GLK,
-        HDMI_GAMUT_PACKET_TYPE => VIDEO_DIP_ENABLE_GMP_HSW,
-        DP_SDP_VSC => VIDEO_DIP_ENABLE_VSC_HSW,
-        DP_SDP_ADAPTIVE_SYNC => VIDEO_DIP_ENABLE_AS_ADL,
-        DP_SDP_PPS => VDIP_ENABLE_PPS,
-        _ => 0,
-    }
+    HDMI_INFOFRAME_TYPES
+        .iter()
+        .position(|&candidate| candidate == info_type)
+        .map_or(0, |idx| 1u32 << idx)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_hdmi_infoframes_enabled(
-    _encoder: *mut IntelEncoder,
+    encoder: *mut IntelEncoder,
     crtc_state: *const IntelCrtcState,
 ) -> u32 {
-    if crtc_state.is_null() {
-        0
-    } else {
-        (*crtc_state).infoframes.enable
+    if encoder.is_null() || crtc_state.is_null() {
+        return 0;
     }
+    let port = encoder.cast::<IntelDigitalPort>();
+    let Some(read_enabled) = (*port).infoframes_enabled else {
+        return 0;
+    };
+    let hw_enable = read_enabled(encoder, crtc_state.cast_mut());
+    let mut enabled = 0;
+    for (index, &info_type) in HDMI_INFOFRAME_TYPES.iter().enumerate() {
+        if hw_enable & hsw_infoframe_enable(info_type) != 0 {
+            enabled |= 1u32 << index;
+        }
+    }
+    enabled
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_infoframe_init(dig_port: *mut IntelDigitalPort) {
     if !dig_port.is_null() {
-        // DDI owns the write/read/set callbacks; HDMI supplies the state mask.
+        (*dig_port).write_infoframe = Some(hsw_write_infoframe);
+        (*dig_port).read_infoframe = Some(hsw_read_infoframe);
+        (*dig_port).set_infoframes = Some(hsw_set_infoframes);
         (*dig_port).infoframes_enabled = Some(infoframes_enabled_callback);
     }
 }
@@ -468,7 +787,7 @@ unsafe extern "C" fn infoframes_enabled_callback(
     encoder: *mut IntelEncoder,
     crtc_state: *mut IntelCrtcState,
 ) -> u32 {
-    intel_hdmi_infoframes_enabled(encoder, crtc_state)
+    hsw_infoframes_enabled(encoder, crtc_state)
 }
 
 #[unsafe(no_mangle)]
@@ -849,23 +1168,26 @@ pub unsafe extern "C" fn intel_hdmi_fastset_infoframes(
     if encoder.is_null() || crtc_state.is_null() {
         return;
     }
-    let enabled =
-        (*crtc_state).infoframes.enable & intel_hdmi_infoframe_enable(HDMI_INFOFRAME_TYPE_DRM);
-    if enabled == 0 {
+    let display = display_from_encoder(encoder);
+    if display.is_null() {
         return;
     }
-    let port = encoder.cast::<IntelDigitalPort>();
-    if let Some(write) = (*port).write_infoframe {
-        write(
-            encoder,
-            crtc_state.cast_mut(),
-            HDMI_INFOFRAME_TYPE_DRM,
-            ptr::addr_of!((*crtc_state).infoframes.drm)
-                .cast::<c_void>()
-                .cast_mut(),
-            size_of::<HdmiInfoframe>() as isize,
-        );
+    let ctl = HSW_TVIDEO_DIP_CTL(display, (*crtc_state).cpu_transcoder as u32);
+    let mut ctl_val = intel_de_read(display, ctl);
+    if (*crtc_state).infoframes.enable & intel_hdmi_infoframe_enable(HDMI_INFOFRAME_TYPE_DRM) == 0
+        && ctl_val & VIDEO_DIP_ENABLE_DRM_GLK == 0
+    {
+        return;
     }
+    ctl_val &= !VIDEO_DIP_ENABLE_DRM_GLK;
+    intel_de_write(display, ctl, ctl_val);
+    intel_de_posting_read(display, ctl);
+    intel_write_infoframe(
+        encoder,
+        crtc_state.cast_mut(),
+        HDMI_INFOFRAME_TYPE_DRM,
+        ptr::addr_of!((*crtc_state).infoframes.drm),
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -898,14 +1220,31 @@ pub unsafe extern "C" fn intel_read_infoframe(
         return;
     }
     let port = encoder.cast::<IntelDigitalPort>();
-    if let Some(read) = (*port).read_infoframe {
-        read(
-            encoder,
-            crtc_state.cast_mut(),
-            info_type,
-            frame.cast::<c_void>(),
-            size_of::<HdmiInfoframe>() as isize,
-        );
+    if (*crtc_state).infoframes.enable & intel_hdmi_infoframe_enable(info_type) == 0 {
+        return;
+    }
+    let Some(read) = (*port).read_infoframe else {
+        return;
+    };
+    let mut buffer = [0u8; VIDEO_DIP_DATA_SIZE as usize];
+    read(
+        encoder,
+        crtc_state.cast_mut(),
+        info_type,
+        buffer.as_mut_ptr().cast::<c_void>(),
+        buffer.len() as isize,
+    );
+    if !dip_remove_hole(&mut buffer) {
+        return;
+    }
+    ptr::write_bytes(frame.cast::<u8>(), 0, size_of::<HdmiInfoframe>());
+    let ret = tk_drm_upstream::hdmi_upstream::hdmi_infoframe_unpack(
+        frame,
+        buffer.as_ptr().add(1).cast::<c_void>(),
+        buffer.len() - 1,
+    );
+    if ret != 0 || ptr::read_unaligned(frame.cast::<u32>()) != info_type {
+        ptr::write_bytes(frame.cast::<u8>(), 0, size_of::<HdmiInfoframe>());
     }
 }
 
@@ -1002,7 +1341,6 @@ pub unsafe extern "C" fn intel_hdmi_init_connector(
     (*connector).display_info.color_formats |= 1;
     (*intel_conn).encoder = encoder;
     (*dig_port).hdmi.attached_connector = intel_conn;
-    (*dig_port).infoframes_enabled = Some(infoframes_enabled_callback);
     true
 }
 
@@ -1035,6 +1373,29 @@ mod tests {
             assert_eq!(
                 intel_hdmi_tmds_clock(148_500, 12, INTEL_OUTPUT_FORMAT_YCBCR420),
                 111_375
+            );
+        }
+    }
+
+    #[test]
+    fn dip_frame_hole_round_trips_and_enable_masks_are_separate() {
+        let mut buffer = [0u8; 8];
+        buffer[1..4].copy_from_slice(&[HDMI_INFOFRAME_TYPE_AVI as u8, 2, 13]);
+        assert_eq!(dip_insert_hole(&mut buffer, 3), Some(4));
+        assert_eq!(&buffer[..4], &[HDMI_INFOFRAME_TYPE_AVI as u8, 2, 13, 0]);
+        assert!(dip_remove_hole(&mut buffer));
+        assert_eq!(&buffer[1..4], &[HDMI_INFOFRAME_TYPE_AVI as u8, 2, 13]);
+
+        unsafe {
+            assert_eq!(intel_hdmi_infoframe_enable(HDMI_GCP_PACKET_TYPE), 1 << 0);
+            assert_eq!(intel_hdmi_infoframe_enable(HDMI_INFOFRAME_TYPE_AVI), 1 << 4);
+            assert_eq!(
+                hsw_infoframe_enable(HDMI_INFOFRAME_TYPE_AVI),
+                VIDEO_DIP_ENABLE_AVI_HSW
+            );
+            assert_ne!(
+                intel_hdmi_infoframe_enable(HDMI_INFOFRAME_TYPE_AVI),
+                hsw_infoframe_enable(HDMI_INFOFRAME_TYPE_AVI)
             );
         }
     }
