@@ -5,7 +5,7 @@
 use core::ffi::{c_char, c_int, c_ulong, c_void};
 
 use crate::{
-    types::File,
+    types::{File, Page},
     gem_memory::PgProt,
 };
 
@@ -33,6 +33,18 @@ pub struct VmAreaStruct {
     _rest: [u8; 72],
 }
 
+impl VmAreaStruct {
+    /// Zero-initialize the target's source-layout VMA record before filling
+    /// the fields that a translated callback consumes.
+    ///
+    /// The structure contains only integers, pointers, and padding.
+    pub const fn empty() -> Self {
+        // `MaybeUninit::zeroed` is not const on every supported toolchain.
+        // Keep initialization in the small unsafe constructor instead.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
 #[repr(C)]
 pub struct VmFault {
     pub vma: *mut VmAreaStruct,
@@ -53,10 +65,42 @@ pub struct VmFault {
     _prealloc_pte: *mut c_void,
 }
 
+impl VmFault {
+    /// Zero-initialize the target's source-layout fault record.
+    pub const fn empty() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+/// Read the page returned by a LinuxKPI `vm_operations_struct` fault callback.
+///
+/// # Safety
+/// `fault` must point to a live `VmFault` for the duration of the call.
+#[inline]
+pub unsafe fn vm_fault_page(fault: *const VmFault) -> *mut Page {
+    unsafe { (*fault)._page.cast() }
+}
+
+/// Set the page returned by a LinuxKPI `vm_operations_struct` fault callback.
+///
+/// # Safety
+/// `fault` must point to a live writable `VmFault`; `page` must be a live
+/// LinuxKPI page reference for the duration required by the caller.
+#[inline]
+pub unsafe fn vm_fault_set_page(fault: *mut VmFault, page: *mut Page) {
+    unsafe { (*fault)._page = page.cast() };
+}
+
 // `vm_fault_t` result bits from include/linux/mm_types.h.
 pub const VM_FAULT_OOM: u32 = 0x000001;
 pub const VM_FAULT_SIGBUS: u32 = 0x000002;
 pub const VM_FAULT_NOPAGE: u32 = 0x000100;
+/// `VM_FAULT_LOCKED`: the callback returned with `vmf->page` locked.
+pub const VM_FAULT_LOCKED: u32 = 0x000200;
+/// `VM_FAULT_FALLBACK`: retry this huge fault as base-page faults.
+pub const VM_FAULT_FALLBACK: u32 = 0x000800;
+/// `FAULT_FLAG_WRITE` in Linux's `vm_fault::flags`.
+pub const FAULT_FLAG_WRITE: u32 = 0x000001;
 
 // Linux `vm_flags` values from include/linux/mm.h for this CONFIG_MMU build.
 pub const VM_WRITE: c_ulong = 1 << 1;
@@ -66,6 +110,13 @@ pub const VM_DONTEXPAND: c_ulong = 1 << 18;
 pub const VM_DONTDUMP: c_ulong = 1 << 26;
 pub const VM_MIXEDMAP: c_ulong = 1 << 28;
 pub const VM_MAYWRITE: c_ulong = 1 << 5;
+
+/// Linux `vma_flags_is_cow_mapping()`: private mappings that may be writable
+/// are CoW mappings; MAP_SHARED mappings are not.
+#[inline]
+pub const fn is_cow_mapping(vm_flags: c_ulong) -> bool {
+    vm_flags & VM_MAYWRITE != 0 && vm_flags & VM_SHARED == 0
+}
 
 /// Linux `VM_READ`, `VM_EXEC`, `VM_SHARED` bits from include/linux/mm.h.
 pub const VM_READ: c_ulong = 1 << 0;
