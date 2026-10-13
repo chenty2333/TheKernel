@@ -1748,22 +1748,15 @@ pub unsafe extern "C" fn intel_dp_cleanup_connector(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_dp_encoder_suspend(encoder: *mut IntelEncoder) {
-    if encoder.is_null() {
-        return;
-    }
-    let dp = ptr::addr_of_mut!((*encoder.cast::<IntelDigitalPort>()).dp);
-    // These upstream helpers are eDP- and tunnel-aware; the PPS helper is a
-    // no-op for this external SST path. Keep tunnel suspend wired for TC DP.
-    intel_pps_vdd_off_sync(dp);
-    intel_dp_tunnel_suspend(dp);
+    // This external SST implementation does not create eDP PPS or USB4 DP
+    // tunnel state. The corresponding Linux suspend helpers are therefore
+    // intentionally absent from this scoped path.
+    let _ = encoder;
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_dp_encoder_shutdown(encoder: *mut IntelEncoder) {
-    if !encoder.is_null() {
-        let dp = ptr::addr_of_mut!((*encoder.cast::<IntelDigitalPort>()).dp);
-        intel_pps_wait_power_cycle(dp);
-    }
+    let _ = encoder;
 }
 
 #[unsafe(no_mangle)]
@@ -1776,8 +1769,6 @@ pub unsafe extern "C" fn intel_dp_encoder_flush_work(
     let intel_encoder = encoder.cast::<IntelEncoder>();
     let dp = ptr::addr_of_mut!((*intel_encoder.cast::<IntelDigitalPort>()).dp);
     crate::intel_encoder_upstream::intel_encoder_link_check_flush_work(intel_encoder);
-    intel_pps_vdd_off_sync(dp);
-    intel_pps_wait_power_cycle(dp);
     intel_dp_aux_fini(dp);
 }
 
@@ -1845,9 +1836,6 @@ unsafe extern "C" {
     fn intel_dp_aux_fini(dp: *mut IntelDp);
     fn intel_dp_init_lttpr_and_dprx_caps(dp: *mut IntelDp) -> i32;
     fn intel_dp_read_dprx_caps(dp: *mut IntelDp, dpcd: *mut u8) -> i32;
-    fn intel_pps_vdd_off_sync(dp: *mut IntelDp);
-    fn intel_pps_wait_power_cycle(dp: *mut IntelDp);
-    fn intel_dp_tunnel_suspend(dp: *mut IntelDp);
     fn intel_tc_port_handles_hpd_glitches(dig_port: *mut IntelDigitalPort) -> bool;
     fn intel_cpu_transcoder_mode_valid(
         display: *mut IntelDisplay,
