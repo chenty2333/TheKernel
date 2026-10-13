@@ -50,3 +50,23 @@ pub unsafe extern "C" fn ilk_enable_display_irq(_display: *mut IntelDisplay, _ma
 // upstream: intel_display_irq.c ilk_disable_display_irq()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ilk_disable_display_irq(_display: *mut IntelDisplay, _mask: u32) {}
+
+// upstream: intel_display_irq.c gen8_irq_power_well_post_enable()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen8_irq_power_well_post_enable(
+    _display: *mut IntelDisplay,
+    _pipe_mask: u8,
+) {}
+
+// upstream: intel_display_irq.c gen8_irq_power_well_pre_disable()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gen8_irq_power_well_pre_disable(
+    _display: *mut IntelDisplay,
+    _pipe_mask: u8,
+) {}
+
+// upstream: intel_display_irq.c intel_parent_irq_enabled()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_parent_irq_enabled(_display: *mut IntelDisplay) -> bool {
+    false
+}

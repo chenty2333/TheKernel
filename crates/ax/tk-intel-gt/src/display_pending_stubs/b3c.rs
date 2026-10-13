@@ -36,3 +36,28 @@ pub unsafe extern "C" fn intel_dmc_fini(_display: *mut IntelDisplay) {}
 // upstream: intel_bios.c intel_bios_driver_remove()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_bios_driver_remove(_display: *mut IntelDisplay) {}
+
+// upstream: intel_dmc_wl.c intel_dmc_wl_get_noreg()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dmc_wl_get_noreg(_display: *mut IntelDisplay) {}
+
+// upstream: intel_dmc_wl.c intel_dmc_wl_put_noreg()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dmc_wl_put_noreg(_display: *mut IntelDisplay) {}
+
+// upstream: intel_dmc_wl.c intel_dmc_wl_disable()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dmc_wl_disable(_display: *mut IntelDisplay) {}
+
+// upstream: intel_dmc.c intel_dmc_has_payload()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dmc_has_payload(_display: *mut IntelDisplay) -> bool {
+    false
+}
+
+// upstream: intel_dmc.c intel_dmc_update_dc6_allowed_count()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dmc_update_dc6_allowed_count(
+    _display: *mut IntelDisplay,
+    _allowed: bool,
+) {}

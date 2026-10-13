@@ -659,6 +659,8 @@ pub mod intel_hti_upstream;
 pub mod intel_pch_upstream;
 #[allow(unsafe_code)]
 pub mod intel_pmdemand_upstream;
+#[allow(unsafe_code)]
+pub mod intel_display_power_well_upstream;
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod b3a_tests;
