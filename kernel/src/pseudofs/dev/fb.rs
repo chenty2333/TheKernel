@@ -668,12 +668,8 @@ pub(crate) struct FbconFrame {
 }
 
 impl FbconFrame {
-    pub(crate) fn clear(&self, color: u32) {
-        for y in 0..self.height {
-            for x in 0..self.width {
-                self.write_pixel(x, y, color);
-            }
-        }
+    pub(crate) fn geometry(&self) -> (usize, usize, usize) {
+        (self.width, self.height, self.pitch)
     }
 
     pub(crate) fn cell_size(&self) -> (usize, usize) {
@@ -681,35 +677,63 @@ impl FbconFrame {
         (super::console_font::GLYPH_WIDTH * scale, super::console_font::GLYPH_HEIGHT * scale)
     }
 
-    pub(crate) fn glyph(&self, x: usize, y: usize, byte: u8, fg: u32, bg: u32, cursor: bool) {
-        // Use the same integer-scaled bitmap and cell dimensions as the
-        // early/panic console; a VT handoff must not shrink 4K text again.
+    /// Clear only the strips not covered by opaque text cells. Clearing the
+    /// text area before repainting makes a live firmware scanout flash black.
+    pub(crate) fn clear_margins(&self, text_width: usize, text_height: usize) {
+        for y in 0..self.height {
+            let first = if y < text_height { text_width.min(self.width) } else { 0 };
+            for x in first..self.width {
+                self.write_pixel(x, y, 0);
+            }
+        }
+    }
+
+    pub(crate) fn glyph(&self, x: usize, y: usize, byte: u8, fg: u32, bg: u32, cursor: bool) -> bool {
         let rows = super::console_font::glyph(byte);
         let scale = super::console_font::glyph_scale(self.width, self.height);
         let (cell_width, cell_height) = self.cell_size();
-        for dy in 0..cell_height {
+        if x >= self.width || y >= self.height {
+            return false;
+        }
+        let mut foreground = [0u8; 4];
+        let mut background = [0u8; 4];
+        let layout = self.scanout.pixel_layout();
+        let bpp = layout.encode_into(fg, &mut foreground);
+        if bpp == 0 || bpp != self.bytes_per_pixel || bpp > 4 {
+            return false;
+        }
+        layout.encode_into(bg, &mut background);
+        // One short row, not a framebuffer-sized stack allocation. Encoding
+        // and writing a span once avoids a virtual call/MMIO store per pixel.
+        let mut row = [0u8; super::console_font::GLYPH_WIDTH * super::console_font::UHD_GLYPH_SCALE * 4];
+        let pixels = cell_width.min(self.width - x);
+        let row_bytes = pixels * bpp;
+        for dy in 0..cell_height.min(self.height - y) {
             let source_y = dy / scale;
             let bits = rows.map_or(0, |rows| rows[source_y]);
-            for dx in 0..cell_width {
+            for dx in 0..pixels {
                 let source_x = dx / scale;
-                let (Some(px), Some(py)) = (x.checked_add(dx), y.checked_add(dy)) else {
-                    continue;
-                };
-                if px >= self.width || py >= self.height {
-                    continue;
-                }
                 let cursor_ink = cursor
                     && source_y == super::console_font::GLYPH_HEIGHT - 2
                     && source_x > 0
                     && source_x + 1 < super::console_font::GLYPH_WIDTH;
                 let color = if bits & (0x80 >> source_x) != 0 || cursor_ink {
-                    fg
+                    &foreground
                 } else {
-                    bg
+                    &background
                 };
-                self.write_pixel(px, py, color);
+                row[dx * bpp..(dx + 1) * bpp].copy_from_slice(&color[..bpp]);
+            }
+            let Some(offset) = (y + dy).checked_mul(self.pitch)
+                .and_then(|start| start.checked_add(x.checked_mul(bpp)?)) else {
+                return false;
+            };
+            if offset.checked_add(row_bytes).is_none_or(|end| end > self.size)
+                || self.scanout.write_bytes(offset, &row[..row_bytes]).is_err() {
+                return false;
             }
         }
+        true
     }
 
     fn write_pixel(&self, x: usize, y: usize, color: u32) {
@@ -740,10 +764,10 @@ pub(crate) fn fbcon_dimensions() -> Option<(usize, usize)> {
     Some(dimensions)
 }
 
-/// Runs a bounded synchronous fbcon repaint and marks the full scanout dirty.
+/// Runs a bounded synchronous fbcon repaint and publishes only changed frames.
 /// No fbcon state lock is held by this module, so this cannot invert TTY/VT
 /// locking with refresh or user-memory paths.
-pub(crate) fn fbcon_draw(draw: impl FnOnce(&FbconFrame)) {
+pub(crate) fn fbcon_draw(draw: impl FnOnce(&FbconFrame) -> bool) {
     let Some(display) = FBCON_DISPLAY
         .lock()
         .as_ref()
@@ -752,7 +776,7 @@ pub(crate) fn fbcon_draw(draw: impl FnOnce(&FbconFrame)) {
         return;
     };
     let scanout = display.scanout.clone();
-    draw(&FbconFrame {
+    let changed = draw(&FbconFrame {
         width: scanout.width() as usize,
         height: scanout.height() as usize,
         pitch: scanout.pitch() as usize,
@@ -760,7 +784,9 @@ pub(crate) fn fbcon_draw(draw: impl FnOnce(&FbconFrame)) {
         scanout,
         size: display.size,
     });
-    display.mark_full();
+    if changed {
+        display.mark_full();
+    }
 }
 
 /// A primary client can take master without ever changing KD_TEXT (for
@@ -804,6 +830,7 @@ pub(crate) fn vt_graphics_changed(graphics: bool) {
     } else {
         // Coalesce all writes made while the graphics VT owned the seat into
         // exactly one full text repaint after master is reacquired.
+        super::tty::fbcon::invalidate_rendered();
         display.resume_refresh();
     }
 }
@@ -1317,6 +1344,7 @@ mod tests {
         pitch: u32,
         layout: PixelLayout,
         presents: AtomicU64,
+        write_batches: AtomicU64,
         master: AtomicBool,
     }
 
@@ -1340,6 +1368,7 @@ mod tests {
                 pitch,
                 layout,
                 presents: AtomicU64::new(0),
+                write_batches: AtomicU64::new(0),
                 master: AtomicBool::new(true),
             })
         }
@@ -1394,6 +1423,7 @@ mod tests {
                 .get_mut(offset..end)
                 .ok_or(AxError::InvalidInput)?
                 .copy_from_slice(src);
+            self.write_batches.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
 
@@ -1527,7 +1557,11 @@ mod tests {
             bytes_per_pixel: 4,
         };
         assert_eq!(frame.cell_size(), (24, 48));
-        frame.glyph(0, 0, b'A', 0x00ff_ffff, 0x0012_3456, true);
+        assert!(frame.glyph(0, 0, b'A', 0x00ff_ffff, 0x0012_3456, true));
+        assert_eq!(surface.write_batches.load(Ordering::Relaxed), 48);
+        // No full-screen black clear when text cells cover the UHD surface.
+        frame.clear_margins(3840, 2160);
+        assert_eq!(surface.write_batches.load(Ordering::Relaxed), 48);
         let glyph = super::super::console_font::glyph(b'A').unwrap();
         let bytes = surface.bytes.lock();
         for y in 0..48 {
@@ -1547,7 +1581,8 @@ mod tests {
         }
         drop(bytes);
         // Malformed coordinates must not wrap into the start of the surface.
-        frame.glyph(usize::MAX, usize::MAX, b'A', 0, 0, false);
+        assert!(!frame.glyph(usize::MAX, usize::MAX, b'A', 0, 0, false));
+        assert_eq!(surface.write_batches.load(Ordering::Relaxed), 48);
     }
 
     #[test]

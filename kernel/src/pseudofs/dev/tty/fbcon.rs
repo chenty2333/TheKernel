@@ -469,6 +469,57 @@ impl Console {
 // holding the screen snapshot across that operation.
 static FBCON: Mutex<Option<Console>> = Mutex::new(None);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaintedCell {
+    cell: Cell,
+    cursor: bool,
+}
+
+type RenderKey = (u16, usize, usize, usize, usize, usize);
+
+/// Only the last physical text image is cached; per-VT cells stay authoritative.
+/// The VT presentation gate serializes this cache with graphics/VT transitions.
+struct Rendered {
+    key: Option<RenderKey>,
+    cells: Box<[Option<PaintedCell>]>,
+}
+
+impl Rendered {
+    fn try_new() -> Option<Self> {
+        let mut cells = Vec::new();
+        cells.try_reserve_exact(MAX_COLS * MAX_ROWS).ok()?;
+        cells.resize(MAX_COLS * MAX_ROWS, None);
+        Some(Self { key: None, cells: cells.into_boxed_slice() })
+    }
+
+    fn begin(&mut self, key: RenderKey, invalidate: bool) -> bool {
+        if invalidate || self.key != Some(key) {
+            self.key = Some(key);
+            self.cells.fill(None);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn needs_draw(&self, index: usize, cell: PaintedCell) -> bool {
+        self.cells[index] != Some(cell)
+    }
+
+    fn record(&mut self, index: usize, cell: PaintedCell) {
+        self.cells[index] = Some(cell);
+    }
+}
+
+static RENDERED: Mutex<Option<Rendered>> = Mutex::new(None);
+static INVALIDATE_RENDERED: AtomicBool = AtomicBool::new(true);
+
+/// A graphics owner can overwrite the same surface without changing the VT
+/// number; returning to text must reconstruct every cell even if it is equal.
+pub(crate) fn invalidate_rendered() {
+    INVALIDATE_RENDERED.store(true, Ordering::Release);
+}
+
 /// A full-screen repaint costs tens of milliseconds, so the write path
 /// coalesces repaints instead of paying one per write call.  The character
 /// cells are the authoritative state: writes between repaints lose nothing,
@@ -497,6 +548,8 @@ pub(crate) fn install() {
     let console = Console::try_new();
     let installed = console.is_some();
     *FBCON.lock() = console;
+    *RENDERED.lock() = Rendered::try_new();
+    invalidate_rendered();
     if installed {
         if let Some((width, height)) = fb::fbcon_dimensions() {
             let size = console_window_size(width, height);
@@ -777,45 +830,54 @@ pub(crate) fn write_active(bytes: &[u8]) {
 /// in KD_TEXT. The arbiter's sleeping presentation gate, not its state spin
 /// lock, is held by the caller; no fbcon path re-enters that gate.
 pub(crate) fn present_while_text_active(vt: u16) {
-    let Some((cols, rows)) = dimensions() else {
-        return;
-    };
-    let progress=axruntime::boot_progress::Scope::present();
-    progress.point(6); // before display access
+    let progress = axruntime::boot_progress::Scope::present();
+    progress.point(6);
     fb::fbcon_draw(|frame| {
-        progress.point(7); // drawing pixels
-        frame.clear(0x0000_0000);
+        progress.point(7);
+        let (width, height, pitch) = frame.geometry();
+        let size = console_window_size(width, height);
+        let (cols, rows) = (usize::from(size.ws_col), usize::from(size.ws_row));
         let (cell_width, cell_height) = frame.cell_size();
-        // Snapshot one row at a time so writers are never excluded for the
-        // MMIO-bound glyph drawing, only for a bounded cell copy.
+        let key = (vt, width, height, pitch, cell_width, cell_height);
+        let invalidate = INVALIDATE_RENDERED.swap(false, Ordering::AcqRel);
+        let mut rendered = RENDERED.lock();
+        let full = rendered.as_mut().is_none_or(|cache| cache.begin(key, invalidate));
+        if full {
+            // Cells overwrite their own foreground and background. Clearing
+            // them first exposes a black intermediate image on GOP scanout.
+            frame.clear_margins(cols * cell_width, rows * cell_height);
+        }
+        let mut changed = full;
         let mut row_cells = [Cell::DEFAULT; MAX_COLS];
         for row in 0..rows {
-            progress.point(8); // snapshotting a cell row
+            progress.point(8);
             let cursor_col = {
                 let console = FBCON.lock();
-                let Some(console) = console.as_ref() else {
-                    return;
-                };
+                let Some(console) = console.as_ref() else { return changed; };
                 let Some(screen) = console.screens.get(vt.saturating_sub(1) as usize) else {
-                    return;
+                    return changed;
                 };
                 row_cells[..cols]
                     .copy_from_slice(&screen.cells[row * MAX_COLS..row * MAX_COLS + cols]);
                 (screen.cursor_visible && screen.row == row).then_some(screen.col)
             };
-            progress.point(9); // row glyph writes
+            progress.point(9);
             for (col, &cell) in row_cells[..cols].iter().enumerate() {
+                let index = row * MAX_COLS + col;
+                let painted = PaintedCell { cell, cursor: cursor_col == Some(col) };
+                if rendered.as_ref().is_some_and(|cache| !cache.needs_draw(index, painted)) {
+                    continue;
+                }
                 let (fg, bg) = cell.colors();
-                frame.glyph(
-                    col * cell_width,
-                    row * cell_height,
-                    cell.byte,
-                    fg,
-                    bg,
-                    cursor_col == Some(col),
-                );
+                if frame.glyph(col * cell_width, row * cell_height, cell.byte, fg, bg, painted.cursor) {
+                    changed = true;
+                    if let Some(cache) = rendered.as_mut() {
+                        cache.record(index, painted);
+                    }
+                }
             }
         }
+        changed
     });
 }
 
@@ -1080,6 +1142,32 @@ mod tests {
         feed(&mut screen, b"\x1b[24;1H:q\x1b[?25h", 80, 24);
         assert!(screen.cursor_visible);
         assert_eq!((screen.row, screen.col), (23, 2));
+    }
+
+    #[test]
+    fn unchanged_console_cells_do_not_redraw_and_cursor_move_repaints_both_cells() {
+        let mut cache = Rendered::try_new().unwrap();
+        let key = (1, 3840, 2160, 15360, 24, 48);
+        let normal = PaintedCell { cell: Cell::DEFAULT, cursor: false };
+        let cursor = PaintedCell { cursor: true, ..normal };
+        assert!(cache.begin(key, false));
+        cache.record(0, cursor);
+        cache.record(1, normal);
+        assert!(!cache.begin(key, false));
+        assert!(!cache.needs_draw(0, cursor));
+        assert!(!cache.needs_draw(1, normal));
+        assert!(cache.needs_draw(0, normal));
+        assert!(cache.needs_draw(1, cursor));
+        cache.record(0, normal);
+        cache.record(1, cursor);
+        assert!(!cache.needs_draw(0, normal));
+        assert!(!cache.needs_draw(1, cursor));
+        // Graphics can overwrite the same backing and return to the same VT.
+        assert!(cache.begin(key, true));
+        assert!(cache.needs_draw(0, normal));
+        cache.record(0, normal);
+        assert!(cache.begin((2, 3840, 2160, 15360, 24, 48), false));
+        assert!(cache.needs_draw(0, normal));
     }
 
     #[test]

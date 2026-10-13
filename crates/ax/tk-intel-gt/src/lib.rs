@@ -542,6 +542,8 @@ pub mod intel_display_irq_types_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_limits_types_upstream;
 #[allow(unsafe_code)]
+pub mod intel_display_upstream;
+#[allow(unsafe_code)]
 pub mod intel_display_params_types_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_power_types_upstream;
@@ -563,6 +565,8 @@ pub mod intel_dmc_wl_types_upstream;
 pub mod intel_dp_aux_regs_upstream;
 #[allow(unsafe_code)]
 pub mod intel_dp_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dp_upstream;
 #[allow(unsafe_code)]
 pub mod intel_dpio_phy_types_upstream;
 #[allow(unsafe_code)]
@@ -662,6 +666,10 @@ pub mod intel_color_upstream;
 #[allow(unsafe_code)]
 pub mod intel_gmbus_upstream;
 #[allow(unsafe_code)]
+pub mod intel_hotplug_upstream;
+#[allow(unsafe_code)]
+pub mod intel_hotplug_irq_upstream;
+#[allow(unsafe_code)]
 pub mod intel_hdmi_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_params_upstream;
@@ -689,6 +697,16 @@ pub mod intel_dpt_upstream;
 pub mod intel_frontbuffer_upstream;
 #[allow(unsafe_code)]
 pub mod intel_initial_plane_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dp_aux_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dp_link_training_upstream;
+#[allow(unsafe_code)]
+pub mod intel_link_bw_upstream;
+#[allow(unsafe_code)]
+pub mod intel_panel_upstream;
+#[allow(unsafe_code)]
+pub mod intel_pps_upstream;
 
 #[allow(unsafe_code)]
 pub mod intel_display_reset_upstream;
@@ -726,6 +744,8 @@ pub mod intel_vblank_upstream;
 pub mod intel_display_power_well_upstream;
 #[allow(unsafe_code)]
 pub mod intel_cdclk_upstream;
+#[allow(unsafe_code)]
+pub mod intel_ddi_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_power_map_upstream;
 #[allow(unsafe_code)]
