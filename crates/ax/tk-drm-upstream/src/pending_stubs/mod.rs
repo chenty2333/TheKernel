@@ -21,7 +21,6 @@ pub mod kthread;
 pub mod panel_quirks;
 pub mod privacy_screen;
 pub mod self_refresh;
-pub mod syncobj;
 pub mod test_records;
 
 #[cfg(test)]

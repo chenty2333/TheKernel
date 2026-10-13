@@ -6,8 +6,12 @@
 //! lower display transport retains command/DMA storage through terminal
 //! completion; this layer retains referenced GEM objects for the same period.
 
-use alloc::vec::Vec;
-use core::{ffi::c_void, mem::size_of, ptr};
+use alloc::{string::ToString, sync::Arc, vec::Vec};
+use core::{
+    ffi::{c_int, c_void},
+    mem::size_of,
+    ptr,
+};
 
 use axdriver_display::{
     BlobMem, BlobResource, ContextInit, DevError, GpuBatch, GpuCompletionData, GpuFeatures,
@@ -21,15 +25,23 @@ use tk_drm_upstream::{
         drm_gem_dumb_map_offset, drm_gem_handle_delete, drm_gem_object_lookup, drm_gem_object_put,
     },
     drm_ioctl_types::{DRM_RENDER_ALLOW, DrmIoctlDesc},
+    drm_syncobj_upstream::{
+        DrmSyncobj, drm_syncobj_chain_alloc, drm_syncobj_chain_free, drm_syncobj_fence_create,
+        drm_syncobj_fence_put, drm_syncobj_fence_signal, drm_syncobj_sync_file_create,
+        drm_syncobj_sync_file_file, drm_syncobj_sync_file_fput, drm_syncobj_sync_file_get_fence,
+        tk_drm_syncobj_add_point, tk_drm_syncobj_find, tk_drm_syncobj_find_fence,
+        tk_drm_syncobj_put, tk_drm_syncobj_replace_fence,
+    },
 };
 use tk_linux_kapi::{
     config::{EFAULT, EINVAL, EIO, ENODEV, ENOENT, ENOMEM, EOPNOTSUPP, GFP_KERNEL, PAGE_SIZE},
     memory::{kfree, kmalloc},
     mm_native::{copy_from_user, copy_to_user},
+    types::DmaFence,
 };
 
 use crate::{
-    device::{with_device_engine, with_device_state},
+    device::{DriverPrivate, private_arc_from_device, with_device_engine, with_device_state},
     gem::{VirtioGpuObject, alloc_shmem_handle, create_classic_resource, physical_page_entries},
     transport::FenceStatus,
     uapi::*,
@@ -1309,6 +1321,288 @@ unsafe extern "C" fn ioctl_context_init(
     result.err().unwrap_or(0)
 }
 
+struct ExecOutputSyncobj {
+    object: *mut DrmSyncobj,
+    chain: *mut tk_linux_kapi::types::DmaFenceChain,
+    point: u64,
+}
+
+struct ExecInputSyncobjs {
+    reset_objects: Vec<*mut DrmSyncobj>,
+}
+
+impl Drop for ExecInputSyncobjs {
+    fn drop(&mut self) {
+        for object in self.reset_objects.drain(..) {
+            unsafe {
+                tk_drm_syncobj_replace_fence(object, ptr::null_mut());
+                tk_drm_syncobj_put(object);
+            }
+        }
+    }
+}
+
+struct ExecOutputSyncobjs {
+    entries: Vec<ExecOutputSyncobj>,
+}
+
+impl ExecOutputSyncobjs {
+    fn publish(&mut self, fence: *mut DmaFence) {
+        for entry in &mut self.entries {
+            unsafe {
+                if entry.point == 0 {
+                    tk_drm_syncobj_replace_fence(entry.object, fence);
+                } else {
+                    tk_drm_syncobj_add_point(entry.object, entry.chain, fence, entry.point);
+                    entry.chain = ptr::null_mut();
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ExecOutputSyncobjs {
+    fn drop(&mut self) {
+        for entry in self.entries.drain(..) {
+            unsafe {
+                if !entry.chain.is_null() {
+                    drm_syncobj_chain_free(entry.chain);
+                }
+                tk_drm_syncobj_put(entry.object);
+            }
+        }
+    }
+}
+
+struct ExecFenceResources {
+    fence: *mut DmaFence,
+    sync_file: *mut c_void,
+    fd: c_int,
+}
+
+impl ExecFenceResources {
+    fn new(fence: *mut DmaFence) -> Self {
+        Self {
+            fence,
+            sync_file: ptr::null_mut(),
+            fd: -1,
+        }
+    }
+
+    fn publish_fd(&mut self, args: &mut DrmVirtgpuExecbuffer) -> i32 {
+        if self.sync_file.is_null() || self.fd < 0 {
+            return -EINVAL;
+        }
+        let file = unsafe { drm_syncobj_sync_file_file(self.sync_file) };
+        if file.is_null() {
+            return -EINVAL;
+        }
+        unsafe { tk_linux_kapi::kernel_services::fd_install(self.fd, file) };
+        args.fence_fd = self.fd;
+        self.fd = -1;
+        self.sync_file = ptr::null_mut();
+        0
+    }
+
+    fn take_fence(&mut self) -> *mut DmaFence {
+        core::mem::replace(&mut self.fence, ptr::null_mut())
+    }
+}
+
+impl Drop for ExecFenceResources {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.sync_file.is_null() {
+                // A provider may have installed a native mirror task which
+                // waits for this fence, so error-signal before dropping the
+                // unpublished wrapper.
+                if !self.fence.is_null() {
+                    drm_syncobj_fence_signal(self.fence, -EIO);
+                }
+                let file = drm_syncobj_sync_file_file(self.sync_file);
+                drm_syncobj_sync_file_fput(file);
+            }
+            if self.fd >= 0 {
+                tk_linux_kapi::kernel_services::put_unused_fd(self.fd);
+            }
+            if !self.fence.is_null() {
+                drm_syncobj_fence_put(self.fence);
+            }
+        }
+    }
+}
+
+fn copy_exec_syncobj_descs(
+    pointer: u64,
+    stride: u32,
+    count: u32,
+) -> Result<Vec<DrmVirtgpuExecbufferSyncobj>, i32> {
+    if count as usize > MAX_HANDLES {
+        return Err(-EINVAL);
+    }
+    if count != 0 && pointer == 0 {
+        return Err(-EFAULT);
+    }
+    let mut descriptors = Vec::new();
+    descriptors
+        .try_reserve_exact(count as usize)
+        .map_err(|_| -ENOMEM)?;
+    let copy_len = (stride as usize).min(size_of::<DrmVirtgpuExecbufferSyncobj>());
+    for index in 0..count as usize {
+        let mut descriptor = DrmVirtgpuExecbufferSyncobj::default();
+        if copy_len != 0 {
+            let offset = (index as u64)
+                .checked_mul(stride as u64)
+                .and_then(|offset| pointer.checked_add(offset))
+                .ok_or(-EINVAL)?;
+            if unsafe {
+                copy_from_user(
+                    (&mut descriptor as *mut DrmVirtgpuExecbufferSyncobj).cast(),
+                    offset as usize as *const c_void,
+                    copy_len,
+                )
+            } != 0
+            {
+                return Err(-EFAULT);
+            }
+        }
+        descriptors.push(descriptor);
+    }
+    Ok(descriptors)
+}
+
+fn parse_exec_input_syncobjs(
+    file: *mut DrmFile,
+    args: &DrmVirtgpuExecbuffer,
+) -> Result<Vec<*mut DrmSyncobj>, i32> {
+    let descriptors =
+        copy_exec_syncobj_descs(args.in_syncobjs, args.syncobj_stride, args.num_in_syncobjs)?;
+    let mut reset_objects = Vec::new();
+    reset_objects
+        .try_reserve_exact(descriptors.len())
+        .map_err(|_| -ENOMEM)?;
+    for descriptor in descriptors {
+        if descriptor.flags & !VIRTGPU_EXECBUF_SYNCOBJ_FLAGS != 0 {
+            for object in reset_objects {
+                unsafe { tk_drm_syncobj_put(object) };
+            }
+            return Err(-EINVAL);
+        }
+        let mut fence = ptr::null_mut();
+        let ret = unsafe {
+            tk_drm_syncobj_find_fence(file, descriptor.handle, descriptor.point, 0, &mut fence)
+        };
+        if ret != 0 {
+            for object in reset_objects {
+                unsafe { tk_drm_syncobj_put(object) };
+            }
+            return Err(ret);
+        }
+        let wait =
+            unsafe { tk_drm_upstream::drm_syncobj_upstream::drm_syncobj_wait_fence(fence, true) };
+        unsafe { drm_syncobj_fence_put(fence) };
+        if wait != 0 {
+            for object in reset_objects {
+                unsafe { tk_drm_syncobj_put(object) };
+            }
+            return Err(wait);
+        }
+        if descriptor.flags & VIRTGPU_EXECBUF_SYNCOBJ_RESET != 0 {
+            let object = unsafe { tk_drm_syncobj_find(file, descriptor.handle) };
+            if object.is_null() {
+                for object in reset_objects {
+                    unsafe { tk_drm_syncobj_put(object) };
+                }
+                return Err(-ENOENT);
+            }
+            reset_objects.push(object);
+        }
+    }
+    Ok(reset_objects)
+}
+
+fn parse_exec_output_syncobjs(
+    file: *mut DrmFile,
+    args: &DrmVirtgpuExecbuffer,
+) -> Result<Vec<ExecOutputSyncobj>, i32> {
+    let descriptors = copy_exec_syncobj_descs(
+        args.out_syncobjs,
+        args.syncobj_stride,
+        args.num_out_syncobjs,
+    )?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(descriptors.len())
+        .map_err(|_| -ENOMEM)?;
+    for descriptor in descriptors {
+        if descriptor.flags != 0 {
+            release_exec_output_syncobjs(output);
+            return Err(-EINVAL);
+        }
+        let object = unsafe { tk_drm_syncobj_find(file, descriptor.handle) };
+        if object.is_null() {
+            release_exec_output_syncobjs(output);
+            return Err(-ENOENT);
+        }
+        let chain = if descriptor.point == 0 {
+            ptr::null_mut()
+        } else {
+            let chain = drm_syncobj_chain_alloc();
+            if chain.is_null() {
+                unsafe { tk_drm_syncobj_put(object) };
+                release_exec_output_syncobjs(output);
+                return Err(-ENOMEM);
+            }
+            chain
+        };
+        output.push(ExecOutputSyncobj {
+            object,
+            chain,
+            point: descriptor.point,
+        });
+    }
+    Ok(output)
+}
+
+fn release_exec_output_syncobjs(output: Vec<ExecOutputSyncobj>) {
+    for entry in output {
+        unsafe {
+            if !entry.chain.is_null() {
+                drm_syncobj_chain_free(entry.chain);
+            }
+            tk_drm_syncobj_put(entry.object);
+        }
+    }
+}
+
+fn finish_submission(private: Arc<DriverPrivate>, fence_id: u64, fence: usize) {
+    let status = private.wait_submission_completion(fence_id);
+    let error = if matches!(status, Some(Ok(()))) {
+        0
+    } else {
+        -EIO
+    };
+    unsafe {
+        drm_syncobj_fence_signal(fence as *mut DmaFence, error);
+        drm_syncobj_fence_put(fence as *mut DmaFence);
+    }
+}
+
+fn queue_submission_completion(private: Arc<DriverPrivate>, fence_id: u64, fence: *mut DmaFence) {
+    let fallback = private.clone();
+    let fence_owner = fence as usize;
+    if axtask::spawn_with_name(
+        move || finish_submission(private, fence_id, fence_owner),
+        "virtgpu-fence".to_string(),
+    )
+    .is_err()
+    {
+        // The command is already owned by the lower queue. If a worker cannot
+        // be admitted, synchronously retire it rather than leak GEM/fence refs.
+        finish_submission(fallback, fence_id, fence_owner);
+    }
+}
+
 unsafe extern "C" fn ioctl_execbuffer(
     dev: *mut tk_drm_upstream::drm_device_types::DrmDevice,
     data: *mut c_void,
@@ -1317,21 +1611,16 @@ unsafe extern "C" fn ioctl_execbuffer(
     if data.is_null() || file.is_null() {
         return -EINVAL;
     }
-    let args = unsafe { *data.cast::<DrmVirtgpuExecbuffer>() };
+    let mut args = unsafe { *data.cast::<DrmVirtgpuExecbuffer>() };
     if args.flags & !VIRTGPU_EXECBUF_FLAGS != 0 {
         return -EINVAL;
-    }
-    if args.flags & (VIRTGPU_EXECBUF_FENCE_FD_IN | VIRTGPU_EXECBUF_FENCE_FD_OUT) != 0
-        || args.num_in_syncobjs != 0
-        || args.num_out_syncobjs != 0
-    {
-        return -EOPNOTSUPP;
     }
     if args.size == 0
         || args.size as usize > MAX_COMMAND
         || args.num_bo_handles as usize > MAX_HANDLES
         || args.command == 0
         || (args.num_bo_handles != 0 && args.bo_handles == 0)
+        || (args.flags & VIRTGPU_EXECBUF_FENCE_FD_IN != 0 && args.fence_fd < 0)
     {
         return -EINVAL;
     }
@@ -1353,6 +1642,28 @@ unsafe extern "C" fn ioctl_execbuffer(
     if ret != 0 {
         return ret;
     }
+
+    let Some(private) = (unsafe { private_arc_from_device(dev) }) else {
+        return -ENODEV;
+    };
+    let fence = drm_syncobj_fence_create();
+    if fence.is_null() {
+        return -ENOMEM;
+    }
+    let mut fence_resources = ExecFenceResources::new(fence);
+    if args.flags & VIRTGPU_EXECBUF_FENCE_FD_OUT != 0 {
+        let fd = unsafe { tk_linux_kapi::kernel_services::get_unused_fd_flags(0x80000) };
+        if fd < 0 {
+            return fd;
+        }
+        fence_resources.fd = fd;
+        let sync_file = unsafe { drm_syncobj_sync_file_create(fence_resources.fence) };
+        if sync_file.is_null() {
+            return -ENOMEM;
+        }
+        fence_resources.sync_file = sync_file;
+    }
+
     let mut command = Vec::new();
     if command.try_reserve_exact(args.size as usize).is_err() {
         return -ENOMEM;
@@ -1369,6 +1680,7 @@ unsafe extern "C" fn ioctl_execbuffer(
     {
         return -EFAULT;
     }
+
     let mut handles = Vec::new();
     if handles
         .try_reserve_exact(args.num_bo_handles as usize)
@@ -1428,6 +1740,53 @@ unsafe extern "C" fn ioctl_execbuffer(
         return -ENOMEM;
     }
     ptrs.extend(objects.iter().map(|p| *p as usize));
+
+    let output_entries = match parse_exec_output_syncobjs(file, &args) {
+        Ok(output) => output,
+        Err(error) => {
+            for object in objects {
+                unsafe { drm_gem_object_put(object) }
+            }
+            return error;
+        }
+    };
+    let mut output_syncobjs = ExecOutputSyncobjs {
+        entries: output_entries,
+    };
+
+    // The upstream driver resolves syncobj dependencies before submitting a
+    // command and only resets requested input syncobjs once dependency parsing
+    // succeeded. The RAII owner therefore resets on every path after this call.
+    let input_syncobjs = match parse_exec_input_syncobjs(file, &args) {
+        Ok(objects) => ExecInputSyncobjs {
+            reset_objects: objects,
+        },
+        Err(error) => {
+            for object in objects {
+                unsafe { drm_gem_object_put(object) }
+            }
+            return error;
+        }
+    };
+
+    if args.flags & VIRTGPU_EXECBUF_FENCE_FD_IN != 0 {
+        let fence = unsafe { drm_syncobj_sync_file_get_fence(args.fence_fd) };
+        if fence.is_null() {
+            for object in objects {
+                unsafe { drm_gem_object_put(object) }
+            }
+            return -EINVAL;
+        }
+        let wait =
+            unsafe { tk_drm_upstream::drm_syncobj_upstream::drm_syncobj_wait_fence(fence, true) };
+        unsafe { drm_syncobj_fence_put(fence) };
+        if wait != 0 {
+            for object in objects {
+                unsafe { drm_gem_object_put(object) }
+            }
+            return wait;
+        }
+    }
     let Some(result) = (unsafe {
         with_device_state(dev, |state| {
             state.pending_refs.try_reserve(1).map_err(|_| -ENOMEM)?;
@@ -1464,7 +1823,7 @@ unsafe extern "C" fn ioctl_execbuffer(
                 }
             }
             state.pending_refs.push((fence, ptrs));
-            Ok(())
+            Ok(fence)
         })
     }) else {
         for p in objects {
@@ -1472,12 +1831,34 @@ unsafe extern "C" fn ioctl_execbuffer(
         }
         return -ENODEV;
     };
-    if result.is_err() {
-        for p in objects {
-            unsafe { drm_gem_object_put(p) }
+    let fence_id = match result {
+        Ok(fence_id) => fence_id,
+        Err(error) => {
+            for p in objects {
+                unsafe { drm_gem_object_put(p) }
+            }
+            return error;
+        }
+    };
+
+    output_syncobjs.publish(fence_resources.fence);
+    if args.flags & VIRTGPU_EXECBUF_FENCE_FD_OUT != 0 {
+        let ret = fence_resources.publish_fd(&mut args);
+        if ret != 0 {
+            // `fd_install` itself is infallible; this is only a defensive
+            // check for a malformed sync-file provider response. The command
+            // has already been accepted, so still retire it asynchronously.
+            queue_submission_completion(private.clone(), fence_id, fence_resources.take_fence());
+            return ret;
         }
     }
-    result.err().unwrap_or(0)
+    drop(input_syncobjs);
+    let completion_fence = fence_resources.take_fence();
+    queue_submission_completion(private, fence_id, completion_fence);
+    unsafe {
+        *data.cast::<DrmVirtgpuExecbuffer>() = args;
+    }
+    0
 }
 
 fn dev_errno(error: DevError) -> i32 {
