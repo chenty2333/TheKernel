@@ -133,37 +133,8 @@ unsafe extern "C" fn drm_dev_unplug(_dev: *mut c_void) {
 // - `pxp_*`, `not_dg2_cpu`: the feature is absent on the ADL-N target, and the
 //   Linux code reports that absence through its own return value.
 
-/// No-display entry point with no work to do. Linux `intel_display_driver_*`,
-/// `intel_display_power_*`, `intel_hpd_*`, `intel_dmc_*`, `intel_dpt_*`,
-/// `intel_opregion_*`, `intel_pps_*`, `intel_pxp_*` and `intel_sbi_*` return
-/// early when `!HAS_DISPLAY()`; there is no display state to set up or tear down.
+/// Optional non-display core hook not configured by this kernel build.
 unsafe extern "C" fn no_display_noop(_display: *mut c_void) {}
-
-/// No-display entry point that returns success to the upstream caller, as Linux
-/// `intel_display_driver_probe()` and its siblings do with `!HAS_DISPLAY()`.
-unsafe extern "C" fn no_display_ok(_display: *mut c_void) -> c_int {
-    0
-}
-
-/// `intel_display_device_present()` is `display && HAS_DISPLAY(display)`
-/// (`intel_display_device.c`). This device has no display pipes, so it is false,
-/// and the suspend and resume paths take their no-display branches.
-unsafe extern "C" fn no_display_present(_display: *mut c_void) -> bool {
-    false
-}
-
-/// `intel_opregion_suspend()`: TheKernel has no ACPI OpRegion.
-unsafe extern "C" fn no_opregion_suspend(_display: *mut c_void, _state: u32) {}
-
-/// `intel_opregion_notify_adapter()`: no OpRegion means no adapter to notify.
-/// The upstream caller treats 0 as "nothing to do".
-unsafe extern "C" fn no_opregion_notify(_display: *mut c_void, _state: u32) -> c_int {
-    0
-}
-
-/// `intel_display_power_suspend_late()` with `!HAS_DISPLAY()`: no display wells
-/// to keep powered.
-unsafe extern "C" fn no_display_suspend_late(_display: *mut c_void, _keep: bool) {}
 
 /// `intel_match_g8_cpu()`: selects a DG2 workaround for specific CPU steppings.
 /// ADL-N is not DG2, so the workaround is never selected.
@@ -194,38 +165,202 @@ unsafe extern "C" fn pxp_not_on_platform(_i915: *mut DrmI915Private) -> c_int {
 /// is no PXP state to tear down or to suspend and resume.
 unsafe extern "C" fn pxp_absent(_i915: *mut DrmI915Private) {}
 
-/// `intel_dram_detect()`: the DRAM parameters feed display watermarks and
-/// bandwidth only. Without display there is nothing to read them for, so the
-/// step succeeds. Linux `intel_dram_detect()` is display-side as well.
-unsafe extern "C" fn no_display_dram_detect(_display: *mut c_void) -> c_int {
-    0
+/// The native Intel display path is opt-in. The boot default must leave the
+/// firmware/GOP scanout untouched, even when the render-only GT is enabled.
+fn native_modeset_requested() -> bool {
+    #[cfg(target_os = "none")]
+    {
+        axhal::boot::command_line_value("intel.native_modeset") == Some("1")
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        false
+    }
 }
 
-/// The display object the upstream probe stores as `i915->display`, for a
-/// device with no display pipes. Linux `intel_display_device.c` `no_display`
-/// gives such a device a non-NULL display whose `info.pipe_mask` is 0, so
-/// `HAS_DISPLAY()` is false (`intel_display_device.c:1767-1770`). The object is
-/// all-zero: `pipe_mask` is 0 at any offset, and no plane, CRTC or DISPLAY_INFO
-/// pointer is set. Every entry point that receives it is a `no_display_*` stub
-/// that does not read it. The object is sized generously because the Linux
-/// `struct intel_display` layout is not modelled here.
-#[repr(C, align(16))]
-struct NoDisplay([u64; 512]);
-static mut NO_DISPLAY: NoDisplay = NoDisplay([0; 512]);
+// B7b's real hardware-state readout and B8's parent-owned scanout/DPT/DSB
+// adapters are not yet present in this branch. Keep the user opt-in fail
+// closed until those exact owners are installed; this is build readiness, not
+// another runtime compatibility switch.
+const NATIVE_DISPLAY_STACK_READY: bool = false;
 
-/// `intel_display_device_probe()`: the no-display object.
-unsafe extern "C" fn no_display_device_probe(
-    _pdev: *mut c_void,
-    _parent: *const c_void,
+fn native_modeset_enabled() -> bool {
+    native_modeset_requested() && NATIVE_DISPLAY_STACK_READY
+}
+
+// The framework table is also used for the firmware/no-display path. Keep all
+// register-capable Linux display callbacks behind the single native-mode-set
+// opt-in while still routing every lifecycle phase to its real owner when the
+// stack is admitted.
+macro_rules! gated_display_void {
+    ($name:ident, $target:path) => {
+        unsafe extern "C" fn $name(display: *mut c_void) {
+            if native_modeset_enabled() && !display.is_null() {
+                unsafe { $target(display.cast()) };
+            }
+        }
+    };
+}
+
+macro_rules! gated_display_status {
+    ($name:ident, $target:path) => {
+        unsafe extern "C" fn $name(display: *mut c_void) -> c_int {
+            if native_modeset_enabled() && !display.is_null() {
+                unsafe { $target(display.cast()) }
+            } else {
+                0
+            }
+        }
+    };
+}
+
+gated_display_void!(display_early_probe, intel_gt::intel_display_driver_upstream::intel_display_driver_early_probe);
+gated_display_void!(display_init_hw, intel_gt::intel_display_driver_upstream::intel_display_driver_init_hw);
+gated_display_status!(display_probe_noirq, intel_gt::intel_display_driver_upstream::intel_display_driver_probe_noirq);
+gated_display_status!(display_probe_nogem, intel_gt::intel_display_driver_upstream::intel_display_driver_probe_nogem);
+gated_display_status!(display_probe, intel_gt::intel_display_driver_upstream::intel_display_driver_probe);
+gated_display_void!(display_register, intel_gt::intel_display_driver_upstream::intel_display_driver_register);
+gated_display_void!(display_remove, intel_gt::intel_display_driver_upstream::intel_display_driver_remove);
+gated_display_void!(display_remove_noirq, intel_gt::intel_display_driver_upstream::intel_display_driver_remove_noirq);
+gated_display_void!(display_remove_nogem, intel_gt::intel_display_driver_upstream::intel_display_driver_remove_nogem);
+gated_display_void!(display_unregister, intel_gt::intel_display_driver_upstream::intel_display_driver_unregister);
+gated_display_status!(display_suspend, intel_gt::intel_display_driver_upstream::intel_display_driver_suspend);
+gated_display_void!(display_resume, intel_gt::intel_display_driver_upstream::intel_display_driver_resume);
+gated_display_void!(display_suspend_access, intel_gt::intel_display_driver_upstream::intel_display_driver_suspend_access);
+gated_display_void!(display_resume_access, intel_gt::intel_display_driver_upstream::intel_display_driver_resume_access);
+gated_display_void!(display_disable_user_access, intel_gt::intel_display_driver_upstream::intel_display_driver_disable_user_access);
+gated_display_void!(display_enable_user_access, intel_gt::intel_display_driver_upstream::intel_display_driver_enable_user_access);
+gated_display_void!(display_power_cleanup, intel_gt::intel_display_power_upstream::intel_display_power_cleanup);
+gated_display_void!(display_power_disable, intel_gt::intel_display_power_upstream::intel_display_power_disable);
+gated_display_void!(display_power_driver_remove, intel_gt::intel_display_power_upstream::intel_display_power_driver_remove);
+gated_display_void!(display_power_enable, intel_gt::intel_display_power_upstream::intel_display_power_enable);
+gated_display_void!(display_power_resume_early, intel_gt::intel_display_power_upstream::intel_display_power_resume_early);
+gated_display_void!(display_power_runtime_resume, intel_gt::intel_display_power_upstream::intel_display_power_runtime_resume);
+gated_display_void!(display_power_runtime_suspend, intel_gt::intel_display_power_upstream::intel_display_power_runtime_suspend);
+gated_display_void!(display_dmc_resume, intel_gt::intel_dmc_upstream::intel_dmc_resume);
+gated_display_void!(display_dmc_suspend, intel_gt::intel_dmc_upstream::intel_dmc_suspend);
+gated_display_void!(display_dp_mst_suspend, intel_gt::display_pending_stubs::opt::intel_dp_mst_suspend);
+gated_display_void!(display_dpt_resume, intel_gt::intel_dpt_upstream::intel_dpt_resume);
+gated_display_void!(display_dpt_suspend, intel_gt::intel_dpt_upstream::intel_dpt_suspend);
+gated_display_status!(display_dram_detect, intel_gt::intel_dram_upstream::intel_dram_detect);
+gated_display_void!(display_bw_init_hw, intel_gt::intel_bw_upstream::intel_bw_init_hw);
+gated_display_void!(display_encoder_shutdown_all, intel_gt::intel_encoder_upstream::intel_encoder_shutdown_all);
+gated_display_void!(display_encoder_suspend_all, intel_gt::intel_encoder_upstream::intel_encoder_suspend_all);
+gated_display_void!(display_gmbus_reset, intel_gt::intel_gmbus_upstream::intel_gmbus_reset);
+gated_display_void!(display_hpd_cancel_work, intel_gt::intel_hotplug_upstream::intel_hpd_cancel_work);
+gated_display_void!(display_hpd_init, intel_gt::display_pending_stubs::b6::intel_hpd_init);
+gated_display_void!(display_hpd_poll_disable, intel_gt::display_pending_stubs::b6::intel_hpd_poll_disable);
+gated_display_void!(display_hpd_poll_enable, intel_gt::intel_hotplug_upstream::intel_hpd_poll_enable);
+gated_display_void!(display_pps_unlock, intel_gt::intel_pps_upstream::intel_pps_unlock_regs_wa);
+gated_display_void!(display_opregion_cleanup, intel_gt::intel_opregion_upstream::intel_opregion_cleanup);
+gated_display_void!(display_opregion_resume, intel_gt::intel_opregion_upstream::intel_opregion_resume);
+gated_display_status!(display_opregion_setup, intel_gt::intel_opregion_upstream::intel_opregion_setup);
+
+unsafe extern "C" fn display_suspend_late(display: *mut c_void, keep: bool) {
+    if native_modeset_enabled() && !display.is_null() {
+        unsafe { intel_gt::intel_display_power_upstream::intel_display_power_suspend_late(display.cast(), keep) };
+    }
+}
+
+unsafe extern "C" fn display_opregion_notify(display: *mut c_void, state: u32) -> c_int {
+    if native_modeset_enabled() && !display.is_null() {
+        unsafe { intel_gt::intel_opregion_upstream::intel_opregion_notify_adapter(display.cast(), state) }
+    } else {
+        0
+    }
+}
+
+unsafe extern "C" fn display_opregion_suspend(display: *mut c_void, state: u32) {
+    if native_modeset_enabled() && !display.is_null() {
+        unsafe { intel_gt::intel_opregion_upstream::intel_opregion_suspend(display.cast(), state) };
+    }
+}
+
+unsafe extern "C" fn display_device_present(display: *mut c_void) -> bool {
+    !display.is_null()
+        && unsafe { intel_gt::intel_display_device_upstream::intel_display_device_present(display.cast()) }
+}
+
+unsafe extern "C" fn display_device_remove(display: *mut c_void) {
+    // This frees the complete typed object allocated by the probe, including
+    // the no-display descriptor case; it must run even with native KMS off.
+    unsafe { intel_gt::intel_display_device_upstream::intel_display_device_remove(display.cast()) };
+}
+
+unsafe extern "C" fn display_device_runtime_init(display: *mut c_void) {
+    if !display.is_null() {
+        unsafe { intel_gt::intel_display_device_upstream::intel_display_device_info_runtime_init(display.cast()) };
+    }
+}
+
+unsafe extern "C" fn display_mode_config_reset(drm: *mut c_void) {
+    if native_modeset_enabled() && !drm.is_null() {
+        unsafe { tk_drm_upstream::drm_mode_config_upstream::drm_mode_config_reset(drm.cast()) };
+    }
+}
+
+unsafe extern "C" fn display_atomic_shutdown(drm: *mut c_void) {
+    if native_modeset_enabled() && !drm.is_null() {
+        unsafe { tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_shutdown(drm.cast()) };
+    }
+}
+
+unsafe extern "C" fn display_client_suspend(drm: *mut c_void) {
+    if native_modeset_enabled() && !drm.is_null() {
+        unsafe { tk_drm_upstream::drm_client_event_upstream::drm_client_dev_suspend(drm.cast()) };
+    }
+}
+
+unsafe extern "C" fn display_client_resume(drm: *mut c_void) {
+    if native_modeset_enabled() && !drm.is_null() {
+        unsafe { tk_drm_upstream::drm_client_event_upstream::drm_client_dev_resume(drm.cast()) };
+    }
+}
+
+unsafe extern "C" fn display_poll_disable(drm: *mut c_void) {
+    if native_modeset_enabled() && !drm.is_null() {
+        unsafe { tk_drm_upstream::drm_probe_helper_upstream::drm_kms_helper_poll_disable(drm.cast()) };
+    }
+}
+
+unsafe extern "C" fn display_poll_enable(drm: *mut c_void) {
+    if native_modeset_enabled() && !drm.is_null() {
+        unsafe { tk_drm_upstream::drm_probe_helper_upstream::drm_kms_helper_poll_enable(drm.cast()) };
+    }
+}
+
+unsafe extern "C" fn display_clock_gating_init(drm: *mut c_void) {
+    if native_modeset_enabled() && !drm.is_null() {
+        unsafe { intel_gt::intel_clock_gating_init(drm) };
+    }
+}
+
+/// `intel_display_device_probe()`: always allocate the real typed upstream
+/// display object. Until explicit opt-in, point it at Linux's typed
+/// `NO_DISPLAY` descriptor so early probe callbacks follow the no-display
+/// path and do not initialize or write display registers.
+unsafe extern "C" fn display_device_probe(
+    pdev: *mut c_void,
+    parent: *const c_void,
 ) -> *mut c_void {
-    // SAFETY: the object is only addressed, never read or written through here.
-    ptr::addr_of_mut!(NO_DISPLAY).cast()
-}
-
-/// `display_parent_interface()`: the table upstream display code uses to reach
-/// parent services. No display code runs here, so there is no reader.
-unsafe extern "C" fn no_display_parent_interface() -> *const c_void {
-    ptr::null()
+    // SAFETY: the PCI identity and parent pointer are the exact inputs passed
+    // by i915's framework; the upstream probe allocates a complete IntelDisplay.
+    let display = unsafe {
+        intel_gt::intel_display_device_upstream::intel_display_device_probe(
+            pdev.cast(),
+            parent.cast(),
+        )
+    };
+    if display.is_null() || native_modeset_enabled() {
+        return display.cast();
+    }
+    // SAFETY: display is the allocated typed object returned above. Replacing
+    // only its descriptor makes HAS_DISPLAY() false without inventing a layout.
+    unsafe {
+        (*display).info.__device_info =
+            ptr::addr_of!(intel_gt::intel_display_device_upstream::NO_DISPLAY).cast_mut();
+    }
+    display.cast()
 }
 
 /// `display_probe_defer()`: a device without display has nothing to wait for.
@@ -502,7 +637,13 @@ unsafe extern "C" fn i915_params_copy(dst: *mut c_void) {
     // SAFETY: `dst` is the caller's `struct i915_params`, which the probe owns
     // and has not yet read; every field is written in full.
     unsafe {
-        (*dst).modeset = -1;
+        let native_modeset = native_modeset_enabled();
+        if native_modeset_requested() && !native_modeset {
+            axlog::warn!(
+                "intel.native_modeset=1 refused: display readout/parent providers are incomplete"
+            );
+        }
+        (*dst).modeset = i32::from(native_modeset);
         (*dst).enable_guc = -1;
         (*dst).guc_log_level = -1;
         (*dst).guc_firmware_path = ptr::null_mut();
@@ -589,15 +730,15 @@ unsafe extern "C" fn drmm_add_action(
 // ---------------------------------------------------------------------------
 
 static FRAMEWORK: I915FrameworkOps = I915FrameworkOps {
-    drm_atomic_helper_shutdown: no_display_noop,
-    drm_client_dev_resume: no_display_noop,
-    drm_client_dev_suspend: no_display_noop,
+    drm_atomic_helper_shutdown: display_atomic_shutdown,
+    drm_client_dev_resume: display_client_resume,
+    drm_client_dev_suspend: display_client_suspend,
     drm_dev_register,
     drm_dev_unplug,
     drm_dev_unregister,
-    drm_kms_helper_poll_disable: no_display_noop,
-    drm_kms_helper_poll_enable: no_display_noop,
-    drm_mode_config_reset: no_display_noop,
+    drm_kms_helper_poll_disable: display_poll_disable,
+    drm_kms_helper_poll_enable: display_poll_enable,
+    drm_mode_config_reset: display_mode_config_reset,
     i915_debugfs_register: not_configured_i915,
     i915_hwmon_register: not_configured_i915,
     i915_hwmon_unregister: not_configured_i915,
@@ -613,59 +754,59 @@ static FRAMEWORK: I915FrameworkOps = I915FrameworkOps {
     i915_teardown_sysfs: not_configured_i915,
     i9xx_display_sr_restore: no_display_noop,
     i9xx_display_sr_save: no_display_noop,
-    intel_bw_init_hw: no_display_noop,
+    intel_bw_init_hw: display_bw_init_hw,
     intel_clock_gating_hooks_init: no_display_noop,
-    intel_display_device_info_runtime_init: no_display_noop,
-    intel_display_device_present: no_display_present,
-    intel_display_device_remove: no_display_noop,
-    intel_display_driver_disable_user_access: no_display_noop,
-    intel_display_driver_early_probe: no_display_noop,
-    intel_display_driver_enable_user_access: no_display_noop,
-    intel_display_driver_init_hw: no_display_noop,
-    intel_display_driver_probe: no_display_ok,
-    intel_display_driver_probe_nogem: no_display_ok,
-    intel_display_driver_probe_noirq: no_display_ok,
-    intel_display_driver_register: no_display_noop,
-    intel_display_driver_remove: no_display_noop,
-    intel_display_driver_remove_nogem: no_display_noop,
-    intel_display_driver_remove_noirq: no_display_noop,
-    intel_display_driver_resume: no_display_noop,
-    intel_display_driver_resume_access: no_display_noop,
-    intel_display_driver_suspend: no_display_ok,
-    intel_display_driver_suspend_access: no_display_noop,
-    intel_display_driver_unregister: no_display_noop,
-    intel_display_power_cleanup: no_display_noop,
-    intel_display_power_disable: no_display_noop,
-    intel_display_power_driver_remove: no_display_noop,
-    intel_display_power_enable: no_display_noop,
-    intel_display_power_resume_early: no_display_noop,
-    intel_display_power_runtime_resume: no_display_noop,
-    intel_display_power_runtime_suspend: no_display_noop,
-    intel_display_power_suspend_late: no_display_suspend_late,
-    intel_dmc_resume: no_display_noop,
-    intel_dmc_suspend: no_display_noop,
-    intel_dp_mst_suspend: no_display_noop,
-    intel_dpt_resume: no_display_noop,
-    intel_dpt_suspend: no_display_noop,
-    intel_dram_detect: no_display_dram_detect,
-    intel_encoder_shutdown_all: no_display_noop,
-    intel_encoder_suspend_all: no_display_noop,
-    intel_gmbus_reset: no_display_noop,
+    intel_display_device_info_runtime_init: display_device_runtime_init,
+    intel_display_device_present: display_device_present,
+    intel_display_device_remove: display_device_remove,
+    intel_display_driver_disable_user_access: display_disable_user_access,
+    intel_display_driver_early_probe: display_early_probe,
+    intel_display_driver_enable_user_access: display_enable_user_access,
+    intel_display_driver_init_hw: display_init_hw,
+    intel_display_driver_probe: display_probe,
+    intel_display_driver_probe_nogem: display_probe_nogem,
+    intel_display_driver_probe_noirq: display_probe_noirq,
+    intel_display_driver_register: display_register,
+    intel_display_driver_remove: display_remove,
+    intel_display_driver_remove_nogem: display_remove_nogem,
+    intel_display_driver_remove_noirq: display_remove_noirq,
+    intel_display_driver_resume: display_resume,
+    intel_display_driver_resume_access: display_resume_access,
+    intel_display_driver_suspend: display_suspend,
+    intel_display_driver_suspend_access: display_suspend_access,
+    intel_display_driver_unregister: display_unregister,
+    intel_display_power_cleanup: display_power_cleanup,
+    intel_display_power_disable: display_power_disable,
+    intel_display_power_driver_remove: display_power_driver_remove,
+    intel_display_power_enable: display_power_enable,
+    intel_display_power_resume_early: display_power_resume_early,
+    intel_display_power_runtime_resume: display_power_runtime_resume,
+    intel_display_power_runtime_suspend: display_power_runtime_suspend,
+    intel_display_power_suspend_late: display_suspend_late,
+    intel_dmc_resume: display_dmc_resume,
+    intel_dmc_suspend: display_dmc_suspend,
+    intel_dp_mst_suspend: display_dp_mst_suspend,
+    intel_dpt_resume: display_dpt_resume,
+    intel_dpt_suspend: display_dpt_suspend,
+    intel_dram_detect: display_dram_detect,
+    intel_encoder_shutdown_all: display_encoder_shutdown_all,
+    intel_encoder_suspend_all: display_encoder_suspend_all,
+    intel_gmbus_reset: display_gmbus_reset,
     intel_gvt_driver_remove: not_configured_i915,
     intel_gvt_init: not_configured_ok,
     intel_gvt_resume: not_configured_i915,
-    intel_hpd_cancel_work: no_display_noop,
-    intel_hpd_init: no_display_noop,
-    intel_hpd_poll_disable: no_display_noop,
-    intel_hpd_poll_enable: no_display_noop,
+    intel_hpd_cancel_work: display_hpd_cancel_work,
+    intel_hpd_init: display_hpd_init,
+    intel_hpd_poll_disable: display_hpd_poll_disable,
+    intel_hpd_poll_enable: display_hpd_poll_enable,
     intel_init_pch_refclk: no_display_noop,
     intel_match_g8_cpu: not_dg2_cpu,
-    intel_opregion_cleanup: no_display_noop,
-    intel_opregion_notify_adapter: no_opregion_notify,
-    intel_opregion_resume: no_display_noop,
-    intel_opregion_setup: no_display_ok,
-    intel_opregion_suspend: no_opregion_suspend,
-    intel_pps_unlock_regs_wa: no_display_noop,
+    intel_opregion_cleanup: display_opregion_cleanup,
+    intel_opregion_notify_adapter: display_opregion_notify,
+    intel_opregion_resume: display_opregion_resume,
+    intel_opregion_setup: display_opregion_setup,
+    intel_opregion_suspend: display_opregion_suspend,
+    intel_pps_unlock_regs_wa: display_pps_unlock,
     intel_pxp_debugfs_register: no_display_noop,
     intel_pxp_fini: pxp_absent,
     intel_pxp_init: pxp_not_on_platform,
@@ -688,7 +829,7 @@ static FRAMEWORK: I915FrameworkOps = I915FrameworkOps {
             >(i915_params_copy)
         }
     },
-    display_parent_interface: no_display_parent_interface,
+    display_parent_interface: super::upstream_display::display_parent_interface,
     display_probe_defer: display_never_defers,
     modparam_force_probe,
     pci_msi_enabled,
@@ -701,8 +842,8 @@ static FRAMEWORK: I915FrameworkOps = I915FrameworkOps {
     pci_register_driver,
     pci_unregister_driver,
     drmm_add_action_or_reset: drmm_add_action,
-    intel_clock_gating_init: no_display_noop,
-    intel_display_device_probe: no_display_device_probe,
+    intel_clock_gating_init: display_clock_gating_init,
+    intel_display_device_probe: display_device_probe,
 };
 
 // ---------------------------------------------------------------------------
@@ -812,9 +953,8 @@ unsafe extern "C" fn gem_free_mmap_offset(obj: *mut c_void) {
     }
 }
 
-/// `drm_gem_handle_create()`: a GEM handle lives in the file's handle table,
-/// and that table is the kernel `DrmFile`. No upstream file is bound to one yet,
-/// so the call fails with `-ENODEV`.
+/// `drm_gem_handle_create()`: mirror the Linux-selected handle into the same
+/// kernel `DrmFile` through the active V1/V2 per-file binding.
 unsafe extern "C" fn gem_handle_create(
     file: *mut c_void,
     obj: *mut c_void,
@@ -824,6 +964,13 @@ unsafe extern "C" fn gem_handle_create(
     // output slot; the bridge rejects null inputs and requires an active file
     // binding before it dereferences any of these pointers.
     unsafe { super::upstream_file::gem_handle_create(file, obj, handle) }
+}
+
+/// Retire the native alias after Linux deletes the matching DRM handle.
+unsafe extern "C" fn gem_handle_close(file: *mut c_void, handle: u32) {
+    // SAFETY: the generic GEM core invokes this only for the live file/handle
+    // pair it has just removed; an active V1/V2 binding owns the shadow file.
+    unsafe { super::upstream_file::gem_handle_close(file, handle) }
 }
 
 /// `drm_gem_object_free()`: the final put of a GEM object. The object's
@@ -1043,6 +1190,7 @@ static DRM_CORE: DrmCoreProvider = DrmCoreProvider {
     print_memory_stats,
     gem_free_mmap_offset,
     gem_handle_create,
+    gem_handle_close,
     gem_object_free,
     gem_private_object_init,
     gem_dmabuf_export,
@@ -1068,12 +1216,19 @@ static DRM_CORE: DrmCoreProvider = DrmCoreProvider {
     syncobj_timeline_fence_find,
 };
 
+static GEM_HANDLE_PROVIDER: tk_drm_upstream::drm_gem_upstream::DrmGemHandleProvider =
+    tk_drm_upstream::drm_gem_upstream::DrmGemHandleProvider {
+        create: gem_handle_create,
+        close: gem_handle_close,
+    };
+
 /// Installs the framework, probe and DRM-core tables. Called once from
 /// `upstream_gt::install_providers()`. Reinstalling the same tables is accepted.
 pub(super) fn install() -> Result<(), &'static str> {
     install_i915_framework_ops(&FRAMEWORK)?;
     install_i915_probe_ops(&PROBE)?;
     install_drm_core_provider(&DRM_CORE)?;
+    tk_drm_upstream::drm_gem_upstream::install_gem_handle_provider(&GEM_HANDLE_PROVIDER)?;
     Ok(())
 }
 

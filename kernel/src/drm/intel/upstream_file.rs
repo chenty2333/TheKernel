@@ -65,7 +65,56 @@ struct FileBinding {
     /// Present only during open/ioctl/close callbacks that may bridge back to
     /// the native file. Never retained across the borrowing call's lifetime.
     native_file: usize,
+    active_calls: usize,
     handles: BTreeSet<u32>,
+}
+
+/// Borrowed binding for a Linux `drm_file` already opened by the V1 DRM
+/// dispatcher. Unlike [`UpstreamFile`], this does not allocate another Linux
+/// file or invoke i915's open/close callbacks; the V1 DRM core owns that
+/// lifecycle. The native `DrmFile` is exposed only while the VFS operation
+/// holds a [`NativeFileBinding`] guard.
+pub(crate) struct V1FileBinding {
+    drm_file: usize,
+}
+
+impl V1FileBinding {
+    pub(crate) fn register(file: *mut c_void) -> AxResult<Self> {
+        if file.is_null() {
+            return Err(AxError::InvalidInput);
+        }
+        let drm_file = file as usize;
+        let mut files = FILES.lock();
+        if files.contains_key(&drm_file) {
+            return Err(AxError::AlreadyExists);
+        }
+        files.insert(
+            drm_file,
+            FileBinding {
+                native_file: 0,
+                active_calls: 0,
+                handles: BTreeSet::new(),
+            },
+        );
+        Ok(Self { drm_file })
+    }
+
+    pub(crate) fn bind<'a>(&'a self, native: &'a DrmFile) -> AxResult<NativeFileBinding<'a>> {
+        NativeFileBinding::bind(self.drm_file, native)
+    }
+}
+
+impl Drop for V1FileBinding {
+    fn drop(&mut self) {
+        let mut files = FILES.lock();
+        if let Some(binding) = files.get(&self.drm_file) {
+            // The active callback guard borrows this owner and therefore must
+            // have gone out of scope before unregistering the C file.
+            debug_assert_eq!(binding.native_file, 0);
+            debug_assert_eq!(binding.active_calls, 0);
+        }
+        files.remove(&self.drm_file);
+    }
 }
 
 /// The Linux DRM file's GEM IDR is read by i915 under RCU and updated by GEM
@@ -139,6 +188,7 @@ impl UpstreamFile {
             file_key,
             FileBinding {
                 native_file: 0,
+                active_calls: 0,
                 handles: BTreeSet::new(),
             },
         );
@@ -495,7 +545,7 @@ pub(crate) fn native_file(file: *mut c_void) -> Option<*mut c_void> {
         .and_then(|binding| (binding.native_file != 0).then_some(binding.native_file as *mut c_void))
 }
 
-struct NativeFileBinding<'a> {
+pub(crate) struct NativeFileBinding<'a> {
     file_key: usize,
     native_file: usize,
     _native: PhantomData<&'a DrmFile>,
@@ -506,10 +556,15 @@ impl<'a> NativeFileBinding<'a> {
         let native_file = ptr::from_ref(native) as usize;
         let mut files = FILES.lock();
         let binding = files.get_mut(&file_key).ok_or(AxError::NotFound)?;
-        if binding.native_file != 0 {
+        if binding.native_file != 0 && binding.native_file != native_file {
             return Err(AxError::ResourceBusy);
         }
+        let active_calls = binding
+            .active_calls
+            .checked_add(1)
+            .ok_or(AxError::ResourceBusy)?;
         binding.native_file = native_file;
+        binding.active_calls = active_calls;
         Ok(Self {
             file_key,
             native_file,
@@ -523,7 +578,11 @@ impl Drop for NativeFileBinding<'_> {
         if let Some(binding) = FILES.lock().get_mut(&self.file_key)
             && binding.native_file == self.native_file
         {
-            binding.native_file = 0;
+            debug_assert!(binding.active_calls > 0);
+            binding.active_calls = binding.active_calls.saturating_sub(1);
+            if binding.active_calls == 0 {
+                binding.native_file = 0;
+            }
         }
     }
 }
@@ -685,10 +744,8 @@ pub(crate) unsafe extern "C" fn gem_handle_create(
     if file.is_null() || object.is_null() || handle.is_null() {
         return -22;
     }
-    let (native_file, upstream_file) = match FILES.lock().get(&(file as usize)) {
-        Some(binding) if binding.native_file != 0 => {
-            (binding.native_file, file.cast::<gem::DrmFile>())
-        }
+    let native_file = match FILES.lock().get(&(file as usize)) {
+        Some(binding) if binding.native_file != 0 => binding.native_file,
         _ => return -19,
     };
     // SAFETY: DRM calls this provider for a live GEM object and checked non-null above.
@@ -709,87 +766,48 @@ pub(crate) unsafe extern "C" fn gem_handle_create(
             DrmError::Unsupported => -95,
         },
     };
-    let insert = {
-        let _table = DrmFileTableGuard::lock(upstream_file);
-        let _guard = GEM_IDR_GATE.lock();
-        // SAFETY: upstream_file is the initialized per-open allocation, protected by
-        // both table and radix locks for this lookup.
-        let existing = unsafe { idr_find(ptr::addr_of!((*upstream_file).object_idr).cast(), handle_id as u64) };
-        if !existing.is_null() {
-            -16
-        } else {
-            // SAFETY: the file is locked and initialized, and object is the live GEM
-            // instance being inserted with the reference acquired immediately below.
-            unsafe {
-                let base = object.cast::<DrmGemObjectBaseLayout>();
-                if gem::drm_gem_handle_get(base).is_err() {
-                    -24
-                } else {
-                    let root = ptr::addr_of_mut!((*upstream_file).object_idr).cast();
-                    let result = radix_tree_insert(root, handle_id as u64, object);
-                    if result != 0 {
-                        put_gem_object(object);
-                    }
-                    result
-                }
-            }
-        }
-    };
-    if insert != 0 {
+    // The upstream DRM core has already allocated and inserted this file's
+    // Linux handle before calling the alias provider. Keep that numeric ID in
+    // the single kernel `DrmFile` table; do not create a second LinuxKPI IDR
+    // entry or run object open callbacks twice.
+    let requested_handle = unsafe { *handle };
+    if handle_id != requested_handle {
         let _ = native.close_handle(handle_id);
-        return insert;
+        return -22;
     }
-    let base = object.cast::<DrmGemObjectBaseLayout>();
-    // SAFETY: base is the live object and its new handle has been inserted into this file.
-    let open_result = unsafe { gem::drm_gem_object_open(base, upstream_file) };
-    if open_result != 0 {
-        let removed = {
-            let _table = DrmFileTableGuard::lock(upstream_file);
-            let _guard = GEM_IDR_GATE.lock();
-            // SAFETY: the file is locked and the just-added handle remains in its IDR.
-            unsafe {
-                radix_tree_delete(
-                    ptr::addr_of_mut!((*upstream_file).object_idr).cast(),
-                    handle_id as u64,
-                )
-            }
-        };
-        if !removed.is_null() {
-            // SAFETY: deletion succeeded, so release the reference paired with handle_get().
-            unsafe { gem::drm_gem_handle_put(base) };
-        }
-        let _ = native.close_handle(handle_id);
-        return open_result;
-    }
-    let tracked = FILES
-        .lock()
-        .get_mut(&(file as usize))
-        .map(|binding| binding.handles.insert(handle_id))
-        .is_some();
+    let tracked = FILES.lock().get_mut(&(file as usize)).is_some_and(|binding| {
+        binding.handles.insert(handle_id)
+    });
     if !tracked {
-        // SAFETY: object_open succeeded for this still-live file/object pair.
-        unsafe { gem::drm_gem_object_close(base, upstream_file) };
-        let removed = {
-            let _table = DrmFileTableGuard::lock(upstream_file);
-            let _guard = GEM_IDR_GATE.lock();
-            // SAFETY: the file is locked and the just-added handle remains in its IDR.
-            unsafe {
-                radix_tree_delete(
-                    ptr::addr_of_mut!((*upstream_file).object_idr).cast(),
-                    handle_id as u64,
-                )
-            }
-        };
-        if !removed.is_null() {
-            // SAFETY: deletion succeeded, so release the reference paired with handle_get().
-            unsafe { gem::drm_gem_handle_put(base) };
-        }
         let _ = native.close_handle(handle_id);
         return -19;
     }
-    // SAFETY: the DRM provider contract supplies a writable handle output pointer.
-    unsafe { *handle = handle_id };
     0
+}
+
+/// Mirror a Linux GEM handle close into the kernel's one shared `DrmFile`.
+/// Linux has already run the object close hook and removed its user-visible
+/// handle; this callback retires only the matching native GEM alias.
+pub(crate) unsafe extern "C" fn gem_handle_close(file: *mut c_void, handle: u32) {
+    if file.is_null() || handle == 0 {
+        return;
+    }
+    let native_file = match FILES.lock().get(&(file as usize)) {
+        Some(binding) if binding.native_file != 0 && binding.handles.contains(&handle) => {
+            binding.native_file
+        }
+        _ => return,
+    };
+    // SAFETY: every call is made from a C DRM ioctl/release while the V1 or V2
+    // operation's NativeFileBinding guard keeps the shadow DrmFile borrowed.
+    let native = unsafe { &*(native_file as *const DrmFile) };
+    if let Err(error) = native.close_handle(handle) {
+        axlog::error!("upstream i915: failed to close mirrored GEM handle {handle}: {error:?}");
+        return;
+    }
+    if let Some(binding) = FILES.lock().get_mut(&(file as usize)) {
+        binding.handles.remove(&handle);
+    }
 }
 
 fn delete_file_handle(file: *mut gem::DrmFile, native: &DrmFile, handle: u32) -> DrmResult<bool> {
@@ -819,7 +837,7 @@ fn delete_file_handle(file: *mut gem::DrmFile, native: &DrmFile, handle: u32) ->
 mod tests {
     use super::{
         AxError, BTreeSet, FILES, FileBinding, NativeFileBinding, ioctl_copies_from_user,
-        ioctl_copies_to_user, native_file,
+        ioctl_copies_to_user, native_file, V1FileBinding,
     };
     use alloc::sync::Arc;
     use core::{
@@ -869,6 +887,7 @@ mod tests {
             file_key,
             FileBinding {
                 native_file: 0,
+                active_calls: 0,
                 handles: BTreeSet::new(),
             },
         );
@@ -882,12 +901,40 @@ mod tests {
             native_file(file).map(|pointer| pointer as usize),
             Some(core::ptr::from_ref(&native) as usize)
         );
-        assert!(matches!(
-            NativeFileBinding::bind(file_key, &native),
-            Err(AxError::ResourceBusy)
-        ));
+        let second_active = NativeFileBinding::bind(file_key, &native).unwrap();
+        assert_eq!(
+            native_file(file).map(|pointer| pointer as usize),
+            Some(core::ptr::from_ref(&native) as usize)
+        );
+        drop(second_active);
+        assert_eq!(
+            native_file(file).map(|pointer| pointer as usize),
+            Some(core::ptr::from_ref(&native) as usize)
+        );
         drop(active);
         assert_eq!(native_file(file), None);
+    }
+
+    #[test]
+    fn v1_c_file_binding_owns_registration_and_scopes_native_backpointer() {
+        let file_key = usize::MAX - 0x5631_4649;
+        let file = file_key as *mut c_void;
+        let binding = V1FileBinding::register(file).unwrap();
+        let native = DrmDevice::new(Arc::new(TestAdapter), 1, 2, 3, 4).open_primary();
+
+        assert!(FILES.lock().contains_key(&file_key));
+        assert_eq!(native_file(file), None);
+        {
+            let active = binding.bind(&native).unwrap();
+            assert_eq!(
+                native_file(file).map(|pointer| pointer as usize),
+                Some(core::ptr::from_ref(&native) as usize)
+            );
+            drop(active);
+        }
+        assert_eq!(native_file(file), None);
+        drop(binding);
+        assert!(!FILES.lock().contains_key(&file_key));
     }
 
     #[test]

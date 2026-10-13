@@ -2274,7 +2274,7 @@ mod tests {
                 flags,
             )
             .unwrap();
-            assert_eq!(pages.immutable_mapping_flags(), flags);
+            assert_eq!(pages.mapping_flags(), flags);
         }
         assert!(SharedPages::new_external_4k(
             alloc::vec![PhysAddr::from_usize(0x1000)],

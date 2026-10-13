@@ -32,15 +32,15 @@ use crate::{
 };
 
 #[repr(C)]
-struct IntelFbPinParams {
-    view: *const crate::i915_gtt_view_types_upstream::I915GttView,
-    alignment: u32,
-    phys_alignment: u32,
-    vtd_guard: u32,
-    needs_cpu_lmem_access: bool,
-    needs_low_address: bool,
-    needs_physical: bool,
-    needs_fence: bool,
+pub struct IntelFbPinParams {
+    pub view: *const crate::intel_context_upstream::I915GttView,
+    pub alignment: u32,
+    pub phys_alignment: u32,
+    pub vtd_guard: u32,
+    pub needs_cpu_lmem_access: bool,
+    pub needs_low_address: bool,
+    pub needs_physical: bool,
+    pub needs_fence: bool,
 }
 
 const DRM_PLANE_NO_SCALING: i32 = 1 << 16;
@@ -581,7 +581,7 @@ pub unsafe extern "C" fn intel_plane_pin_fb(
         let needs_cpu_lmem_access = unsafe { intel_fb_needs_cpu_access(ptr::addr_of!((*fb).base)) };
         if !unsafe { intel_fb_uses_dpt(ptr::addr_of!((*fb).base)) } {
             let pin = IntelFbPinParams {
-                view: ptr::addr_of!((*plane_state).view.gtt),
+                view: ptr::addr_of!((*plane_state).view.gtt).cast(),
                 alignment,
                 phys_alignment: unsafe { plane_fb_min_phys_alignment(plane_state) },
                 vtd_guard,
@@ -610,7 +610,7 @@ pub unsafe extern "C" fn intel_plane_pin_fb(
             }
         } else {
             let pin = IntelFbPinParams {
-                view: ptr::addr_of!((*plane_state).view.gtt),
+                view: ptr::addr_of!((*plane_state).view.gtt).cast(),
                 alignment,
                 phys_alignment: 0,
                 vtd_guard: 0,

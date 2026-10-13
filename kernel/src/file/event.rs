@@ -1,15 +1,16 @@
 use alloc::{borrow::Cow, sync::Arc};
 use core::{
+    ffi::{c_int, c_void},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     task::Context,
 };
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axpoll::{IoEvents, PollSet, Pollable};
 use tk_linux_fd::{EVENTFD_COUNTER_MAX, EventFdPlan, EventFdSnapshot};
 
 use crate::{
-    file::{FileLike, IoDst, IoSrc, Kstat, anon_inode_stat},
+    file::{FileLike, IoDst, IoSrc, Kstat, anon_inode_stat, get_typed_file},
     readiness::block_on_poll_io,
 };
 
@@ -123,6 +124,64 @@ impl EventFd {
                 Err(error) => Err(error),
             }
         })
+    }
+}
+
+/// LinuxKPI `eventfd_ctx_fdget()`: acquire one opaque reference to an existing
+/// VFS eventfd. Error pointers carry the normal Linux errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn thekernel_eventfd_ctx_fdget(fd: c_int) -> *mut c_void {
+    match get_typed_file::<EventFd>(fd) {
+        Ok(file) => Arc::into_raw(file.clone_file_arc()).cast_mut().cast(),
+        Err(error) => {
+            let code = LinuxError::from(error).code();
+            (-(code as isize)) as *mut c_void
+        }
+    }
+}
+
+/// LinuxKPI `eventfd_ctx_get()`: acquire one additional reference.
+///
+/// # Safety
+/// `ctx` must be a live pointer returned by `thekernel_eventfd_ctx_fdget` or
+/// this function, with one outstanding owned reference.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thekernel_eventfd_ctx_get(ctx: *mut c_void) -> *mut c_void {
+    if ctx.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: the caller guarantees that `ctx` still owns a live Arc reference.
+    unsafe { Arc::increment_strong_count(ctx.cast::<EventFd>()) };
+    ctx
+}
+
+/// Signal the existing VFS eventfd and wake its normal poll/read waiters.
+///
+/// # Safety
+/// `ctx` must be a live pointer returned by the eventfd context helpers and
+/// held for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thekernel_eventfd_signal(ctx: *mut c_void, count: u64) -> c_int {
+    if ctx.is_null() {
+        return -LinuxError::EINVAL.code();
+    }
+    // SAFETY: the caller owns a live eventfd context reference for this call.
+    match unsafe { &*ctx.cast::<EventFd>() }.signal(count) {
+        Ok(()) => 0,
+        Err(error) => -LinuxError::from(error).code(),
+    }
+}
+
+/// Drop one eventfd context reference.
+///
+/// # Safety
+/// `ctx` must be a non-null pointer with one outstanding reference returned
+/// by one of the eventfd context acquisition helpers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thekernel_eventfd_ctx_put(ctx: *mut c_void) {
+    if !ctx.is_null() {
+        // SAFETY: the caller transfers exactly one previously acquired Arc ref.
+        drop(unsafe { Arc::from_raw(ctx.cast::<EventFd>()) });
     }
 }
 
@@ -311,5 +370,37 @@ mod tests {
         };
         assert_eq!(event.write(&mut oversized), Err(AxError::InvalidInput));
         assert_eq!(event.count.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn opaque_eventfd_context_refs_share_the_vfs_counter() {
+        let event = EventFd::new(0, false);
+        let ctx = Arc::into_raw(event.clone()).cast_mut().cast::<c_void>();
+        let duplicated = unsafe { thekernel_eventfd_ctx_get(ctx) };
+        assert_eq!(duplicated, ctx);
+        assert_eq!(unsafe { thekernel_eventfd_signal(ctx, 7) }, 0);
+        assert_eq!(event.count.load(Ordering::Acquire), 7);
+
+        unsafe { thekernel_eventfd_ctx_put(duplicated) };
+        unsafe { thekernel_eventfd_ctx_put(ctx) };
+        assert_eq!(Arc::strong_count(&event), 1);
+    }
+
+    #[test]
+    fn eventfd_context_fdget_rejects_bad_fds_and_signals_the_same_ofd() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let bad = thekernel_eventfd_ctx_fdget(i32::MAX);
+        assert!(!bad.is_null());
+        assert!((bad as isize) < 0 && (bad as isize) >= -4095);
+
+        let event = EventFd::new(0, false);
+        let fd = crate::file::add_file_like(event.clone(), true).unwrap();
+        let ctx = thekernel_eventfd_ctx_fdget(fd);
+        assert!(!ctx.is_null());
+        assert!((ctx as isize) >= 0);
+        assert_eq!(unsafe { thekernel_eventfd_signal(ctx, 5) }, 0);
+        assert_eq!(event.count.load(Ordering::Acquire), 5);
+        unsafe { thekernel_eventfd_ctx_put(ctx) };
+        crate::file::close_file_like(fd).unwrap();
     }
 }

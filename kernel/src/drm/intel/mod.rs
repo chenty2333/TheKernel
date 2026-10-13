@@ -41,6 +41,7 @@ mod regs;
 pub(crate) mod upstream_file;
 pub(crate) mod upstream_sync;
 mod upstream_drm;
+mod upstream_display;
 mod upstream_gt;
 #[cfg(target_os = "none")]
 mod upstream_probe;
