@@ -13,6 +13,7 @@ use core::mem::{align_of, size_of, ManuallyDrop};
 
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IntelCdclkConfig {
     pub cdclk: u32,
     pub vco: u32,
