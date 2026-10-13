@@ -729,7 +729,7 @@ unsafe fn add_crtc_to_pipe_list(display: *mut IntelDisplay, crtc: *mut IntelCrtc
                 .cast::<IntelCrtc>()
         };
         if unsafe { (*crtc).pipe < (*existing).pipe } {
-            unsafe { list_add(ptr::addr_of_mut!((*crtc).pipe_head), node) };
+            unsafe { list_add_tail(ptr::addr_of_mut!((*crtc).pipe_head), node) };
             return;
         }
         node = unsafe { (*node).next };
@@ -993,6 +993,43 @@ pub unsafe extern "C" fn intel_crtc_bw_min_cdclk(state: *const IntelCrtcState) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crtc_pipe_list_remains_sorted_when_pipes_are_inserted_out_of_order() {
+        let mut display = core::mem::MaybeUninit::<IntelDisplay>::uninit();
+        let display_ptr = display.as_mut_ptr();
+        let head = unsafe { ptr::addr_of_mut!((*display_ptr).pipe_list) };
+        unsafe { INIT_LIST_HEAD(head) };
+
+        let mut crtcs: [core::mem::MaybeUninit<IntelCrtc>; 4] =
+            core::array::from_fn(|_| core::mem::MaybeUninit::uninit());
+        for (slot, pipe) in [2, 0, 3, 1].into_iter().enumerate() {
+            let crtc = crtcs[slot].as_mut_ptr();
+            unsafe {
+                (*crtc).pipe = pipe;
+                add_crtc_to_pipe_list(display_ptr, crtc);
+            }
+        }
+
+        let mut actual = [i32::MIN; 4];
+        let mut count = 0usize;
+        let mut node = unsafe { (*head).next };
+        while node != head {
+            assert!(count < actual.len(), "pipe list contains a cycle");
+            let crtc = unsafe {
+                node.cast::<u8>()
+                    .sub(offset_of!(IntelCrtc, pipe_head))
+                    .cast::<IntelCrtc>()
+            };
+            actual[count] = unsafe { (*crtc).pipe };
+            count += 1;
+            node = unsafe { (*node).next };
+        }
+
+        assert_eq!(count, 4);
+        assert_eq!(actual, [0, 1, 2, 3]);
+    }
+
     #[test]
     fn state_reset_restores_pipe_sentinels_and_clears_prior_updates() {
         let mut crtc = unsafe { core::mem::zeroed::<IntelCrtc>() };
