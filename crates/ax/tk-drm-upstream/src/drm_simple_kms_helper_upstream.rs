@@ -508,6 +508,8 @@ pub unsafe extern "C" fn drm_simple_display_pipe_init(
 
 #[cfg(test)]
 mod tests {
+    use core::ptr;
+
     use super::*;
 
     unsafe extern "C" fn custom_prepare_fb(

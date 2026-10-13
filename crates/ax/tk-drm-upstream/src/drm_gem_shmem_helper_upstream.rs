@@ -24,8 +24,8 @@ use tk_linux_kapi::{
         refcount_set,
     },
     mm::{
-        VM_DONTDUMP, VM_DONTEXPAND, VM_FAULT_NOPAGE, VM_FAULT_SIGBUS, VM_PFNMAP, VmAreaStruct,
-        VmFault, VmOperationsStruct,
+        VM_DONTDUMP, VM_DONTEXPAND, VM_FAULT_FALLBACK, VM_FAULT_NOPAGE, VM_FAULT_SIGBUS, VM_PFNMAP,
+        VmAreaStruct, VmFault, VmOperationsStruct,
     },
     scatterlist::{sg_alloc_table_from_pages_segment, sg_free_table},
     shmem::{
@@ -59,13 +59,6 @@ const SHMEM_PAGES_GFP: u32 =
 
 unsafe extern "C" {
     fn dma_map_sgtable(dev: *mut c_void, sgt: *mut SgTable, direction: i32, attrs: u64) -> i32;
-    fn dma_unmap_sg_attrs(
-        dev: *mut c_void,
-        sgl: *mut tk_linux_kapi::types::Scatterlist,
-        nents: u32,
-        direction: u32,
-        attrs: u64,
-    );
     fn dma_buf_attach(dmabuf: *mut DmaBuf, dev: *mut c_void) -> *mut DmaBufAttachment;
     fn dma_buf_detach(dmabuf: *mut DmaBuf, attach: *mut DmaBufAttachment);
     fn dma_buf_unmap_attachment_unlocked(
@@ -226,10 +219,6 @@ static DRM_GEM_SHMEM_VM_OPS: SyncVmOperations = SyncVmOperations(VmOperationsStr
     uffd_ops: ptr::null(),
 });
 
-// include/linux/mm_types.h VM_FAULT_FALLBACK, used by huge_fault when the
-// selected page-cache backing cannot satisfy a huge PFN insertion.
-const VM_FAULT_FALLBACK_LINUX: u32 = 0x000800;
-
 unsafe extern "C" {
     fn vmf_insert_pfn(vma: *mut VmAreaStruct, address: usize, pfn: usize) -> u32;
 }
@@ -260,7 +249,7 @@ unsafe fn drm_gem_shmem_record_mkwrite(vmf: *mut VmFault) -> u32 {
 // upstream: drm_gem_shmem_helper.c drm_gem_shmem_any_fault()
 unsafe fn drm_gem_shmem_any_fault(vmf: *mut VmFault, order: u32) -> u32 {
     if order != 0 {
-        return VM_FAULT_FALLBACK_LINUX;
+        return VM_FAULT_FALLBACK;
     }
     unsafe {
         let vma = (*vmf).vma;
@@ -767,7 +756,7 @@ pub unsafe extern "C" fn __drm_gem_shmem_free_sgt_locked(shmem: *mut DrmGemShmem
             return;
         }
         let dev = (*(*shmem).base.dev).dev;
-        dma_unmap_sg_attrs(
+        tk_linux_kapi::dma::dma_unmap_sg_attrs(
             dev,
             (*sgt).sgl,
             (*sgt).orig_nents,
@@ -890,7 +879,11 @@ pub unsafe extern "C" fn drm_gem_shmem_print_info(
         }
         let pad = "\t".repeat(indent as usize);
         let text = alloc::format!(
-            "{pad}pages_pin_count={}\n{pad}pages_use_count={}\n{pad}vmap_use_count={}\n{pad}vaddr={:p}\n",
+            r#"{pad}pages_pin_count={}
+{pad}pages_use_count={}
+{pad}vmap_use_count={}
+{pad}vaddr={:p}
+"#,
             refcount_read(&(*shmem).pages_pin_count),
             refcount_read(&(*shmem).pages_use_count),
             refcount_read(&(*shmem).vmap_use_count),
@@ -1238,6 +1231,33 @@ mod tests {
             assert_eq!(refcount_read(&(*shmem).pages_use_count), 0);
             assert_eq!(refcount_read(&(*shmem).pages_pin_count), 0);
             assert!((*shmem).pages.is_null());
+
+            drm_gem_shmem_free(shmem);
+            crate::drm_vma_manager_upstream::drm_vma_offset_manager_destroy(&mut *manager);
+        }
+    }
+
+    #[test]
+    fn failed_dma_mapping_releases_the_temporary_sgt_and_page_pin() {
+        unsafe {
+            let mut test_dev = crate::test_support::TestDrm::new(0);
+            let mut manager: Box<DrmVmaOffsetManager> = Box::new(core::mem::zeroed());
+            crate::drm_vma_manager_upstream::drm_vma_offset_manager_init(
+                &mut *manager,
+                0x1000,
+                0x10000,
+            );
+            test_dev.dev.vma_offset_manager = &mut *manager;
+
+            let shmem = drm_gem_shmem_create(test_dev.ptr(), 2 * PAGE_SIZE);
+            assert!(!IS_ERR(shmem));
+            // TestDrm intentionally has no registered DMA device. The DMA
+            // layer rejects this mapping instead of inventing an address.
+            let sgt = drm_gem_shmem_get_pages_sgt(shmem);
+            assert!(IS_ERR(sgt));
+            assert_eq!(refcount_read(&(*shmem).pages_use_count), 0);
+            assert!((*shmem).pages.is_null());
+            assert!((*shmem).sgt.is_null());
 
             drm_gem_shmem_free(shmem);
             crate::drm_vma_manager_upstream::drm_vma_offset_manager_destroy(&mut *manager);
