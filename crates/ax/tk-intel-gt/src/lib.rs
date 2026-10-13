@@ -667,6 +667,8 @@ pub mod intel_pmdemand_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_power_well_upstream;
 #[allow(unsafe_code)]
+pub mod intel_cdclk_upstream;
+#[allow(unsafe_code)]
 pub mod intel_display_power_map_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_power_upstream;

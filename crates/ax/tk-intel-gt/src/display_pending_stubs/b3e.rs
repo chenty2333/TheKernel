@@ -1,56 +1,38 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See ../LICENSE-MIT.
-//! TEMPORARY definitions for callees owned by batch B3e (CDCLK).
-//! Replaced by intel_cdclk_upstream.rs (B3e).
+//! B3e CDCLK exports, retained under the pending-stub path for call-site stability.
 
-#![allow(non_snake_case, dead_code, unsafe_code)]
-
-use crate::intel_display_core_types_upstream::IntelDisplay;
-
-// upstream: intel_cdclk.c intel_cdclk_read_hw()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_cdclk_read_hw(_display: *mut IntelDisplay) {}
-
-// upstream: intel_cdclk.c intel_init_cdclk_hooks()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_init_cdclk_hooks(_display: *mut IntelDisplay) {}
-
-// upstream: intel_cdclk.c intel_cdclk_init()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_cdclk_init(_display: *mut IntelDisplay) -> i32 {
-    0
-}
-
-// upstream: intel_cdclk.c intel_update_max_cdclk()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_update_max_cdclk(_display: *mut IntelDisplay) {}
-
-// upstream: intel_cdclk.c intel_read_rawclk()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_read_rawclk(_display: *mut IntelDisplay) -> u32 {
-    24000
-}
-
-// upstream: intel_cdclk.c intel_cdclk_get_cdclk()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_cdclk_get_cdclk(
-    _display: *mut IntelDisplay,
-    _config: *mut core::ffi::c_void,
-) {}
-
-// upstream: intel_cdclk.c intel_cdclk_clock_changed()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_cdclk_clock_changed(
-    _a: *const core::ffi::c_void,
-    _b: *const core::ffi::c_void,
-) -> bool {
-    false
-}
-
-// upstream: intel_cdclk.c intel_cdclk_init_hw()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_cdclk_init_hw(_display: *mut IntelDisplay) {}
-
-// upstream: intel_cdclk.c intel_cdclk_uninit_hw()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_cdclk_uninit_hw(_display: *mut IntelDisplay) {}
+pub use crate::intel_cdclk_upstream::{
+    intel_atomic_get_cdclk_state,
+    intel_cdclk_actual,
+    intel_cdclk_actual_voltage_level,
+    intel_cdclk_atomic_check,
+    intel_cdclk_clock_changed,
+    intel_cdclk_crtc_disable_noatomic,
+    intel_cdclk_dump_config,
+    intel_cdclk_force_min_cdclk,
+    intel_cdclk_get_cdclk,
+    intel_cdclk_init,
+    intel_cdclk_init_hw,
+    intel_cdclk_is_decreasing_later,
+    intel_cdclk_logical,
+    intel_cdclk_min_cdclk,
+    intel_cdclk_min_cdclk_for_prefill,
+    intel_cdclk_prefill_adjustment,
+    intel_cdclk_prefill_adjustment_worst,
+    intel_cdclk_pmdemand_needs_update,
+    intel_cdclk_ppc,
+    intel_cdclk_read_hw,
+    intel_cdclk_state_set_joined_mbus,
+    intel_cdclk_uninit_hw,
+    intel_cdclk_update_dbuf_bw_min_cdclk,
+    intel_cdclk_update_hw_state,
+    intel_crtc_min_cdclk,
+    intel_init_cdclk_hooks,
+    intel_mdclk_cdclk_ratio,
+    intel_read_rawclk,
+    intel_set_cdclk_post_plane_update,
+    intel_set_cdclk_pre_plane_update,
+    intel_update_max_cdclk,
+    intel_update_cdclk,
+};
