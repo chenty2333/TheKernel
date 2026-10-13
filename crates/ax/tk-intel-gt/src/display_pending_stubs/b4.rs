@@ -15,7 +15,7 @@ use tk_drm_upstream::{
 };
 
 use crate::{
-    intel_display_core_types_upstream::IntelDisplay, 
+    intel_display_core_types_upstream::IntelDisplay,
     intel_workarounds_types_upstream::I915RegT,
 };
 pub use crate::{
