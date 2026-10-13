@@ -676,6 +676,17 @@ pub mod intel_plane_upstream;
 #[allow(unsafe_code)]
 pub mod skl_universal_plane_upstream;
 #[allow(unsafe_code)]
+pub mod intel_dsb_upstream;
+#[allow(unsafe_code)]
+pub mod intel_fb_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dpt_upstream;
+#[allow(unsafe_code)]
+pub mod intel_frontbuffer_upstream;
+#[allow(unsafe_code)]
+pub mod intel_initial_plane_upstream;
+
+#[allow(unsafe_code)]
 pub mod intel_display_reset_upstream;
 #[allow(unsafe_code)]
 pub mod intel_hti_upstream;

@@ -9,9 +9,7 @@
 use core::ffi::c_void;
 
 use tk_drm_upstream::{
-    drm_atomic_types::DrmAtomicCommit, drm_device_types::DrmDevice, drm_file_types::DrmFile,
-    drm_fourcc_types::DrmFormatInfo, drm_framebuffer_types::DrmFramebuffer,
-    uapi_drm_mode_types::DrmModeFbCmd2,
+    drm_atomic_types::DrmAtomicCommit, drm_device_types::DrmDevice,
 };
 
 use crate::{
@@ -46,30 +44,10 @@ pub use crate::{
 
 pub use crate::intel_cursor_upstream::intel_cursor_mode_config_init;
 
-// upstream: intel_fb.c intel_user_framebuffer_create()
-// Degraded stub returns ERR_PTR(-ENODEV) when display FB support is absent, matching Linux drm_mode_addfb2 error handling.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_user_framebuffer_create(
-    _dev: *mut DrmDevice,
-    _filp: *mut DrmFile,
-    _info: *mut DrmFormatInfo,
-    _user_mode_cmd: *mut DrmModeFbCmd2,
-) -> *mut DrmFramebuffer {
-    tk_linux_kapi::config::ERR_PTR(-tk_linux_kapi::config::ENODEV)
-}
-
-// upstream: intel_fb.c intel_fb_get_format_info()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_fb_get_format_info(
-    _pixel_format: u32,
-    _modifier: u64,
-) -> *mut DrmFormatInfo {
-    core::ptr::null_mut()
-}
-
 // The ADL-P atomic validation and commit callbacks are owned by B7a's
 // intel_display.c translation. Fail closed until that complete path is wired;
 // returning success here would falsely accept an unchecked state.
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_atomic_check(
     _dev: *mut DrmDevice,
@@ -92,14 +70,11 @@ pub unsafe extern "C" fn intel_atomic_commit(
 
 
 
-// upstream: intel_initial_plane.c intel_initial_plane_config()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_initial_plane_config(_display: *mut IntelDisplay) {}
-
 // upstream: i9xx_wm.c ilk_wm_sanitize()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ilk_wm_sanitize(_display: *mut IntelDisplay) {}
 
 // upstream: intel_dsb.c intel_dsb_reg_write()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_dsb_reg_write(_dsb: *mut c_void, _reg: I915RegT, _val: u32) {}
+pub unsafe extern "C" fn intel_dsb_reg_write(dsb: *mut c_void, reg: I915RegT, val: u32) {
+    unsafe { crate::intel_dsb_upstream::intel_dsb_reg_write(dsb.cast(), reg, val) };
+}

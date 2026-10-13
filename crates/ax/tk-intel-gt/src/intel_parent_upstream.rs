@@ -6,18 +6,25 @@
 
 use core::ffi::c_void;
 
-use crate::intel_display_core_types_upstream::IntelDisplay;
-use tk_drm_upstream::drm_device_types::DrmDevice;
+use crate::{
+    intel_display_core_types_upstream::IntelDisplay,
+    intel_display_types_upstream::IntelInitialPlaneConfig,
+};
+use tk_drm_upstream::{
+    drm_device_types::DrmDevice,
+    drm_framebuffer_types::DrmFramebuffer,
+    drm_plane_types::DrmPlaneState,
+};
 
 #[repr(C)]
 pub struct IntelDisplayParentInterface {
     pub bo: *const IntelDisplayBoInterface,
     pub dpt: *const IntelDisplayDptInterface,
-    pub dsb: *const c_void,
+    pub dsb: *const IntelDisplayDsbInterface,
     pub fb_pin: *const IntelDisplayFbPinInterface,
     pub frontbuffer: *const IntelDisplayFrontbufferInterface,
     pub hdcp: *const IntelDisplayHdcpInterface,
-    pub initial_plane: *const c_void,
+    pub initial_plane: *const IntelDisplayInitialPlaneInterface,
     pub irq: *const IntelDisplayIrqInterface,
     pub panic: *const IntelDisplayPanicInterface,
     pub overlay: *const IntelDisplayOverlayInterface,
@@ -60,6 +67,51 @@ pub struct IntelDisplayDptInterface {
     pub suspend: Option<unsafe extern "C" fn(dpt: *mut c_void)>,
     pub resume: Option<unsafe extern "C" fn(dpt: *mut c_void)>,
 }
+
+/// Source: `include/drm/intel/display_parent_interface.h`.
+/// The parent owns command-buffer storage and mappings until cleanup.
+#[repr(C)]
+pub struct IntelDisplayDsbInterface {
+    pub ggtt_offset: Option<unsafe extern "C" fn(dsb_buf: *mut c_void) -> u32>,
+    pub write: Option<unsafe extern "C" fn(dsb_buf: *mut c_void, idx: u32, val: u32)>,
+    pub read: Option<unsafe extern "C" fn(dsb_buf: *mut c_void, idx: u32) -> u32>,
+    pub fill:
+        Option<unsafe extern "C" fn(dsb_buf: *mut c_void, idx: u32, val: u32, size: usize)>,
+    pub create:
+        Option<unsafe extern "C" fn(drm: *mut DrmDevice, size: usize) -> *mut c_void>,
+    pub cleanup: Option<unsafe extern "C" fn(dsb_buf: *mut c_void)>,
+    pub flush_map: Option<unsafe extern "C" fn(dsb_buf: *mut c_void)>,
+}
+
+/// Source: `include/drm/intel/display_parent_interface.h`.
+/// The parent owns BIOS framebuffer backing and pin lifetime.
+#[repr(C)]
+pub struct IntelDisplayInitialPlaneInterface {
+    pub alloc_obj: Option<
+        unsafe extern "C" fn(
+            drm: *mut DrmDevice,
+            config: *mut IntelInitialPlaneConfig,
+        ) -> *mut c_void,
+    >,
+    pub setup: Option<
+        unsafe extern "C" fn(
+            plane_state: *mut DrmPlaneState,
+            config: *mut IntelInitialPlaneConfig,
+            fb: *mut DrmFramebuffer,
+            vma: *mut c_void,
+        ) -> i32,
+    >,
+    pub config_fini: Option<unsafe extern "C" fn(config: *mut IntelInitialPlaneConfig)>,
+}
+
+const _: () = assert!(core::mem::size_of::<IntelDisplayDsbInterface>() == 56);
+const _: () = assert!(core::mem::size_of::<IntelDisplayInitialPlaneInterface>() == 24);
+const _: () = assert!(core::mem::offset_of!(IntelDisplayParentInterface, dsb) == 16);
+const _: () = assert!(core::mem::offset_of!(IntelDisplayParentInterface, initial_plane) == 48);
+const _: () = assert!(
+    core::mem::offset_of!(IntelDisplayParentInterface, fence_priority_display) == 128
+);
+const _: () = assert!(core::mem::size_of::<IntelDisplayParentInterface>() == 160);
 
 #[repr(C)]
 pub struct IntelDisplayFbPinInterface {
