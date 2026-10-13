@@ -2,7 +2,6 @@
 
 use alloc::{
     boxed::Box,
-    collections::BTreeMap,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -16,7 +15,8 @@ use axdriver_display::{
     DevError, DisplayDriverOps, DrmCursorUpdate as DriverCursorUpdate, GpuBatch as DriverGpuBatch,
     GpuCompletion as DriverGpuCompletion, GpuCompletionData as DriverGpuCompletionData,
     GpuFeatures as DriverGpuFeatures, GpuQueue as DriverGpuQueue,
-    GpuSubmission as DriverGpuSubmission, RenderResource3D, RenderTransfer3D,
+    GpuSubmission as DriverGpuSubmission, HostVisibleAperture, HostVisibleApertureLease,
+    RenderResource3D, RenderTransfer3D,
 };
 use axhal::paging::PageSize;
 use axsync::Mutex;
@@ -144,7 +144,7 @@ struct AdapterState<T: GpuTransport> {
     external_leases: Mutex<Vec<ExternalLeaseRegistration>>,
     /// Monotonic, page-aligned host-visible aperture reservations.  The
     /// lower transport rejects any reservation outside its negotiated SHM.
-    blob_aperture: Mutex<BlobAperture>,
+    blob_aperture: HostVisibleAperture,
     render_dead: AtomicBool,
     /// Completion records are keyed by host fence ID, not used-ring order:
     /// an unrelated completion may be observed while another waiter owns the
@@ -243,12 +243,6 @@ struct ExternalLeaseRegistration {
     lease: Weak<ExternalPageLease>,
     pages: Weak<SharedPages>,
 }
-struct BlobAperture {
-    len: u64,
-    used: BTreeMap<u64, (u32, u64)>,
-    by_resource: BTreeMap<u32, u64>,
-}
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RenderRetireStage {
     UnmapBlob,
@@ -270,11 +264,7 @@ impl<T: GpuTransport> VirtioGpuAdapter<T> {
                 overflow_render_retired: Mutex::new(None),
                 retirement_worker_started: AtomicBool::new(false),
                 external_leases: Mutex::new(Vec::new()),
-                blob_aperture: Mutex::new(BlobAperture {
-                    len: 0,
-                    used: BTreeMap::new(),
-                    by_resource: BTreeMap::new(),
-                }),
+                blob_aperture: HostVisibleAperture::new(),
                 render_dead: AtomicBool::new(false),
                 render_completions: Mutex::new(HashMap::new()),
                 render_pending: Mutex::new(HashMap::new()),
@@ -517,19 +507,27 @@ impl<T: GpuTransport + 'static> RenderAdapter for VirtioRenderAdapter<T> {
             }
         }
         self.state.ensure_render_worker()?;
-        let offset = self.state.reserve_blob_aperture(resource, size)?;
+        let bytes = checked_align_up(usize::try_from(size).map_err(|_| DrmError::Overflow)?, 4096)
+            .ok_or(DrmError::Overflow)?;
+        let count = bytes / 4096;
+        let mut pages: Vec<PhysAddr> = Vec::new();
+        pages
+            .try_reserve_exact(count)
+            .map_err(|_| DrmError::NoMemory)?;
+        let aperture_lease = self.state.reserve_blob_aperture(resource, size)?;
+        let offset = aperture_lease.offset();
         let submitted = self
             .state
             .submit_control_and_wait(DriverGpuBatch::MapBlob { resource, offset });
         let map = match submitted {
             Err(error) => {
-                self.state.release_blob_aperture(resource);
+                self.state.reset_render_transport();
                 return Err(error);
             }
             Ok((_, completion)) => match completion.data {
                 DriverGpuCompletionData::MapInfo(map) => map,
                 _ => {
-                    self.state.release_blob_aperture(resource);
+                    self.state.unmap_blob_or_reset(resource);
                     return Err(DrmError::Invalid);
                 }
             },
@@ -541,37 +539,78 @@ impl<T: GpuTransport + 'static> RenderAdapter for VirtioRenderAdapter<T> {
         if self.state.render_dead.load(Ordering::Acquire) {
             return Err(DrmError::DeviceLost);
         }
-        let mut pages: Vec<PhysAddr> = Vec::new();
-        let bytes = checked_align_up(usize::try_from(size).map_err(|_| DrmError::Overflow)?, 4096)
-            .ok_or(DrmError::Overflow)?;
-        let count = bytes / 4096;
-        pages
-            .try_reserve_exact(count)
-            .map_err(|_| DrmError::NoMemory)?;
-        let base = usize::try_from(map.physical_base).map_err(|_| DrmError::Overflow)?;
+        if map.aperture_offset != offset || map.physical_base & 4095 != 0 {
+            self.state.unmap_blob_or_reset(resource);
+            return Err(DrmError::Invalid);
+        }
+        const MAP_CACHE_MASK: u32 = 0x0f;
+        let cache_flags = match map.cache_policy & MAP_CACHE_MASK {
+            0 | 1 => axhal::paging::MappingFlags::empty(), // unspecified or cached
+            2 => axhal::paging::MappingFlags::UNCACHED,
+            3 => axhal::paging::MappingFlags::WRITE_COMBINING,
+            _ => {
+                self.state.unmap_blob_or_reset(resource);
+                return Err(DrmError::Invalid);
+            }
+        };
+        let base = match usize::try_from(map.physical_base) {
+            Ok(base) => base,
+            Err(_) => {
+                self.state.unmap_blob_or_reset(resource);
+                return Err(DrmError::Overflow);
+            }
+        };
         for index in 0..count {
             let address = base
                 .checked_add(index.checked_mul(4096).ok_or(DrmError::Overflow)?)
-                .ok_or(DrmError::Overflow)?;
+                .ok_or_else(|| {
+                    self.state.unmap_blob_or_reset(resource);
+                    DrmError::Overflow
+                })?;
             pages.push(PhysAddr::from(address));
         }
         let transport_owner: Arc<dyn core::any::Any + Send + Sync> = self.state.clone();
-        let owner: Arc<dyn core::any::Any + Send + Sync> = Arc::new(resource);
-        let lease = Arc::try_new(ExternalPageLease::new_with_transport(
+        let owner: Arc<dyn core::any::Any + Send + Sync> = match Arc::try_new(aperture_lease) {
+            Ok(owner) => owner,
+            Err(aperture_lease) => {
+                self.state.unmap_blob_or_reset(resource);
+                drop(aperture_lease);
+                return Err(DrmError::NoMemory);
+            }
+        };
+        let lease = match Arc::try_new(ExternalPageLease::new_with_transport(
             owner,
             transport_owner,
-        ))
-        .map_err(|_| DrmError::NoMemory)?;
+        )) {
+            Ok(lease) => lease,
+            Err(lease) => {
+                self.state.unmap_blob_or_reset(resource);
+                drop(lease);
+                return Err(DrmError::NoMemory);
+            }
+        };
         let weak_lease = Arc::downgrade(&lease);
-        let pages = Arc::try_new(
-            SharedPages::new_external_4k(
-                pages,
-                lease,
-                axhal::paging::MappingFlags::DEVICE | axhal::paging::MappingFlags::UNCACHED,
-            )
-            .map_err(map_ax_error)?,
-        )
-        .map_err(|_| DrmError::NoMemory)?;
+        let shared = match SharedPages::new_external_4k(
+            pages,
+            lease.clone(),
+            axhal::paging::MappingFlags::DEVICE | cache_flags,
+        ) {
+            Ok(shared) => shared,
+            Err(error) => {
+                self.state.unmap_blob_or_reset(resource);
+                drop(lease);
+                return Err(map_ax_error(error));
+            }
+        };
+        let pages = match Arc::try_new(shared) {
+            Ok(pages) => pages,
+            Err(shared) => {
+                self.state.unmap_blob_or_reset(resource);
+                drop(shared);
+                drop(lease);
+                return Err(DrmError::NoMemory);
+            }
+        };
         let mut registrations = self.state.external_leases.lock();
         if self.state.render_dead.load(Ordering::Acquire) {
             return Err(DrmError::DeviceLost);
@@ -655,41 +694,25 @@ impl<T: GpuTransport + 'static> RenderAdapter for VirtioRenderAdapter<T> {
 }
 
 impl<T: GpuTransport> AdapterState<T> {
-    fn reserve_blob_aperture(&self, resource: u32, size: u64) -> DrmResult<u64> {
-        let bytes = u64::try_from(
-            checked_align_up(usize::try_from(size).map_err(|_| DrmError::Overflow)?, 4096)
-                .ok_or(DrmError::Overflow)?,
-        )
-        .map_err(|_| DrmError::Overflow)?;
-        let mut aperture = self.blob_aperture.lock();
-        if aperture.len == 0 {
-            aperture.len = self
-                .transport
-                .lock()
-                .host_visible_len()
-                .ok_or(DrmError::Unsupported)?;
-        }
-        let mut offset = 0u64;
-        for (&start, &(_, len)) in aperture.used.iter() {
-            if offset.checked_add(bytes).is_some_and(|end| end <= start) {
-                break;
-            }
-            offset = start.checked_add(len).ok_or(DrmError::Overflow)?;
-        }
-        if offset
-            .checked_add(bytes)
-            .is_none_or(|end| end > aperture.len)
-        {
-            return Err(DrmError::QueueFull);
-        }
-        aperture.used.insert(offset, (resource, bytes));
-        aperture.by_resource.insert(resource, offset);
-        Ok(offset)
+    fn reserve_blob_aperture(
+        &self,
+        resource: u32,
+        size: u64,
+    ) -> DrmResult<HostVisibleApertureLease> {
+        let length = self.transport.lock().host_visible_len();
+        self.blob_aperture
+            .reserve(resource, size, length)
+            .map_err(map_dev_error)
     }
-    fn release_blob_aperture(&self, resource: u32) {
-        let mut aperture = self.blob_aperture.lock();
-        if let Some(offset) = aperture.by_resource.remove(&resource) {
-            aperture.used.remove(&offset);
+    fn unmap_blob_or_reset(&self, resource: u32) {
+        if self.render_dead.load(Ordering::Acquire) {
+            return;
+        }
+        if self
+            .submit_control_and_wait(DriverGpuBatch::UnmapBlob { resource })
+            .is_err()
+        {
+            self.reset_render_transport();
         }
     }
     /// The sole ioctl-boundary synchronous control path.  It publishes an
@@ -1771,11 +1794,6 @@ impl<T: GpuTransport> AdapterState<T> {
         // owners stay pinned, but no new fault/mmap/submit may publish the
         // stale PCI aperture after this point.
         self.render_dead.store(true, Ordering::Release);
-        {
-            let mut aperture = self.blob_aperture.lock();
-            aperture.used.clear();
-            aperture.by_resource.clear();
-        }
         // Never hold the device registry lock while taking MM locks.  Walk
         // one weak registration at a time, which keeps reset bounded without
         // an allocation failure path that could leave a BAR PTE live.
@@ -2149,7 +2167,6 @@ impl<T: GpuTransport> AdapterState<T> {
             {
                 return false;
             }
-            self.release_blob_aperture(token.resource);
             token.stage = RenderRetireStage::Unref;
         }
         if token.stage == RenderRetireStage::DetachBacking {
@@ -2338,6 +2355,7 @@ impl<T: GpuTransport + 'static> DisplayAdapter for VirtioGpuAdapter<T> {
             .submit_control_and_wait(DriverGpuBatch::Create2d {
                 width: resource_width,
                 height: request.height,
+                format: 2,
                 entries: Vec::new(),
             })?
             .0

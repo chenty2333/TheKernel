@@ -170,6 +170,7 @@ pub mod drm_simple_kms_helper_upstream;
 pub mod drm_vblank_upstream;
 pub mod drm_vblank_helper_upstream;
 pub mod drm_vblank_work_upstream;
+pub mod drm_syncobj_upstream;
 pub mod drm_vma_manager_upstream;
 pub mod hdmi_upstream;
 
