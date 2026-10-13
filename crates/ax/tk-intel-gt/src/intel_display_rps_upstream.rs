@@ -122,7 +122,7 @@ pub unsafe extern "C" fn intel_display_rps_mark_interactive(
 }
 
 // upstream: intel_display_rps.c ilk_display_rps_enable()
-#[unsafe(no_mangle)]
+// Collides with kernel/src/drm/intel/upstream_gt.rs: exported without no_mangle
 pub unsafe extern "C" fn ilk_display_rps_enable(display: *mut IntelDisplay) {
     tk_linux_kapi::locks::spin_lock(&mut (*display).irq.lock);
     ilk_enable_display_irq(display, DE_PCU_EVENT);
@@ -130,7 +130,7 @@ pub unsafe extern "C" fn ilk_display_rps_enable(display: *mut IntelDisplay) {
 }
 
 // upstream: intel_display_rps.c ilk_display_rps_disable()
-#[unsafe(no_mangle)]
+// Collides with kernel/src/drm/intel/upstream_gt.rs: exported without no_mangle
 pub unsafe extern "C" fn ilk_display_rps_disable(display: *mut IntelDisplay) {
     tk_linux_kapi::locks::spin_lock(&mut (*display).irq.lock);
     ilk_disable_display_irq(display, DE_PCU_EVENT);
