@@ -489,6 +489,17 @@ fn checked_plane_surface_address(base: u32, surface_offset: u32) -> Option<u32> 
     base.checked_add(surface_offset)
 }
 
+#[inline]
+unsafe fn plane_pin_gtt_view(
+    plane_state: *const IntelPlaneState,
+) -> *const crate::i915_gtt_view_types_upstream::I915GttView {
+    if plane_state.is_null() {
+        ptr::null()
+    } else {
+        unsafe { ptr::addr_of!((*plane_state).view.gtt) }
+    }
+}
+
 // A successful GGTT/DPT pin or reuse result transfers one pin reference to the
 // candidate plane state. On failure before that state is published, release
 // exactly that reference with the matching parent unpin operation. The parent
@@ -548,7 +559,7 @@ pub unsafe extern "C" fn intel_plane_pin_fb(
     let old_view = if old_fb.is_null() {
         ptr::null()
     } else {
-        unsafe { ptr::addr_of!((*old_fb).normal_view.gtt) }
+        unsafe { plane_pin_gtt_view(old_plane_state) }
     };
     let vma = unsafe {
         intel_parent_fb_pin_reuse_vma(
@@ -557,7 +568,7 @@ pub unsafe extern "C" fn intel_plane_pin_fb(
             old_obj,
             old_view,
             obj,
-            ptr::addr_of!((*fb).normal_view.gtt),
+            plane_pin_gtt_view(plane_state),
             &mut offset,
         )
     };
@@ -1954,6 +1965,15 @@ mod tests {
         );
         assert_eq!(checked_plane_surface_address(u32::MAX - 3, 4), None);
         assert_eq!(checked_plane_surface_address(0xffff_f000, 0x1000), None);
+    }
+
+    #[test]
+    fn pin_reuse_uses_the_plane_state_view_not_framebuffer_normal_view() {
+        let plane_state: IntelPlaneState = unsafe { core::mem::zeroed() };
+        let fb: IntelFramebuffer = unsafe { core::mem::zeroed() };
+        let selected = unsafe { plane_pin_gtt_view(&plane_state) };
+        assert_eq!(selected, core::ptr::addr_of!(plane_state.view.gtt));
+        assert_ne!(selected, core::ptr::addr_of!(fb.normal_view.gtt));
     }
 
     #[test]
