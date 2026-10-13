@@ -794,11 +794,18 @@ pub unsafe extern "C" fn drm_gem_vunmap_locked(obj: *mut DrmGemObject, map: *mut
     if obj.is_null() || map.is_null() {
         return;
     }
+    let map = map.cast::<crate::iosys_map_types::IosysMap>();
+    if unsafe { (*map)._anon_0.vaddr.is_null() } {
+        return;
+    }
     if let Some(funcs) = (*obj).funcs.as_ref() {
         if let Some(vunmap) = funcs.vunmap {
             vunmap(obj, map.cast());
         }
     }
+    // Linux iosys_map_clear(): make repeated unmaps harmless and ensure a
+    // later map starts from a canonical empty state, even without a callback.
+    unsafe { core::ptr::write_bytes(map, 0, 1) };
 }
 
 // upstream: drivers/gpu/drm/drm_gem.c drm_gem_lock()
@@ -1006,6 +1013,37 @@ mod tests {
     use crate::drm_drv_types::DrmDriver;
     use crate::drm_drv_upstream::{drm_dev_alloc, drm_dev_put};
     use crate::drm_file_upstream::{drm_file_alloc, drm_file_free};
+    use crate::iosys_map_types::{IosysMap, IosysMapAnon0};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_VUNMAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn test_vunmap(_obj: *mut DrmGemObject, _map: *mut IosysMap) {
+        TEST_VUNMAP_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn gem_vunmap_clears_iosys_map_and_is_idempotent() {
+        let mut object: DrmGemObject = unsafe { core::mem::zeroed() };
+        let mut funcs: DrmGemObjectFuncs = unsafe { core::mem::zeroed() };
+        funcs.vunmap = Some(test_vunmap);
+        object.funcs = &mut funcs;
+        let mut backing = 0u8;
+        let mut map = IosysMap {
+            _anon_0: IosysMapAnon0 { vaddr: (&mut backing as *mut u8).cast() },
+            is_iomem: false,
+        };
+        TEST_VUNMAP_CALLS.store(0, Ordering::SeqCst);
+
+        unsafe {
+            drm_gem_vunmap_locked(&mut object, (&mut map as *mut IosysMap).cast());
+            assert!(map._anon_0.vaddr.is_null());
+            assert!(!map.is_iomem);
+            drm_gem_vunmap_locked(&mut object, (&mut map as *mut IosysMap).cast());
+        }
+
+        assert_eq!(TEST_VUNMAP_CALLS.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn test_gem_handles_flink_and_mmap() {
