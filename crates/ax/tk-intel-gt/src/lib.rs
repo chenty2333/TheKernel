@@ -526,6 +526,9 @@ pub mod intel_color_regs_upstream;
 pub mod intel_combo_phy_regs_upstream;
 #[allow(unsafe_code)]
 pub mod intel_cursor_regs_upstream;
+pub mod intel_cursor_upstream;
+pub mod intel_sprite_upstream;
+pub mod intel_sprite_uapi_upstream;
 #[allow(unsafe_code)]
 pub mod intel_cx0_phy_regs_upstream;
 #[allow(unsafe_code)]
@@ -566,6 +569,10 @@ pub mod intel_dp_types_upstream;
 pub mod intel_dpio_phy_types_upstream;
 #[allow(unsafe_code)]
 pub mod intel_dpll_mgr_types_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dpll_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dpll_mgr_upstream;
 #[allow(unsafe_code)]
 pub mod intel_dram_types_upstream;
 #[allow(unsafe_code)]
@@ -618,6 +625,8 @@ pub mod intel_wm_types_upstream;
 pub mod intel_wm_upstream;
 #[allow(unsafe_code)]
 pub mod skl_prefill_types_upstream;
+pub mod skl_prefill_upstream;
+pub mod skl_scaler_upstream;
 #[allow(unsafe_code)]
 pub mod skl_universal_plane_regs_upstream;
 #[allow(unsafe_code)]
@@ -668,6 +677,17 @@ pub mod intel_display_driver_upstream;
 pub mod intel_plane_upstream;
 #[allow(unsafe_code)]
 pub mod skl_universal_plane_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dsb_upstream;
+#[allow(unsafe_code)]
+pub mod intel_fb_upstream;
+#[allow(unsafe_code)]
+pub mod intel_dpt_upstream;
+#[allow(unsafe_code)]
+pub mod intel_frontbuffer_upstream;
+#[allow(unsafe_code)]
+pub mod intel_initial_plane_upstream;
+
 #[allow(unsafe_code)]
 pub mod intel_display_reset_upstream;
 #[allow(unsafe_code)]
