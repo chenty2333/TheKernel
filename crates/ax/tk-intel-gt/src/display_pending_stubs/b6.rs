@@ -24,10 +24,6 @@ pub unsafe extern "C" fn intel_panel_sanitize_ssc(_display: *mut IntelDisplay) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_pps_setup(_display: *mut IntelDisplay) {}
 
-// upstream: intel_gmbus.c intel_gmbus_setup()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_gmbus_setup(_display: *mut IntelDisplay) {}
-
 // upstream: intel_hotplug.c intel_hpd_init()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_hpd_init(_display: *mut IntelDisplay) {}
@@ -39,10 +35,6 @@ pub unsafe extern "C" fn intel_hpd_poll_disable(_display: *mut IntelDisplay) {}
 // upstream: intel_hotplug.c intel_hpd_poll_fini()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_hpd_poll_fini(_display: *mut IntelDisplay) {}
-
-// upstream: intel_gmbus.c intel_gmbus_teardown()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_gmbus_teardown(_display: *mut IntelDisplay) {}
 
 // upstream: intel_pps.c intel_pps_unlock_regs_wa()
 #[unsafe(no_mangle)]
