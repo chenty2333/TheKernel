@@ -2257,3 +2257,11 @@ The Linux i915 display foundation translations (`crates/ax/tk-intel-gt`, batch B
 Licensing:
 All translated display sources carry MIT licenses in upstream Linux 7.2.3 (SPDX-License-Identifier: MIT) and are recorded in `crates/ax/tk-intel-gt/NOTICE`.
 
+## 2026-10-13 i915 display power domains B3b reconciliation
+
+The Linux i915 display power domains, PMDEMAND, PCH detect, HTI translations (`crates/ax/tk-intel-gt`, batch B3b: `intel_display_power_upstream.rs`, `intel_display_power_map_upstream.rs`, `intel_display_power_well_upstream.rs`, `intel_pmdemand_upstream.rs`, `intel_pch_upstream.rs`, `intel_hti_upstream.rs`) add verbatim-Linux lines that the excerpt scanner counts. `tests/ci/test_linux_excerpt_baseline.py` now pins the re-scanned `crates/ax` totals: threshold >=40 `(0,0,0,874,844,0,0)` (was 858/828), threshold >=25 `(18,15,4,2350,2312,0,0)` (was 2276/2238). `crates/linux` and `kernel/src` are unchanged.
+
+Licensing:
+All translated display sources carry MIT licenses in upstream Linux 7.2.3 (SPDX-License-Identifier: MIT) and are recorded in `crates/ax/tk-intel-gt/NOTICE`.
+
+

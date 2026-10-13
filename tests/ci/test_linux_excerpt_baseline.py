@@ -44,9 +44,12 @@ WINDOW = 14
 SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     ("crates/linux", 40): (110, 49, 20, 25, 0, 18, 21),
     ("kernel/src", 40): (85, 41, 19, 142, 9, 0, 0),
-    ("crates/ax", 40): (0, 0, 0, 858, 828, 0, 0),
+    ("crates/ax", 40): (0, 0, 0, 874, 844, 0, 0),
     ("crates/linux", 25): (211, 59, 22, 41, 3, 20, 21),
     ("kernel/src", 25): (157, 50, 24, 321, 25, 0, 0),
+# 2026-10-13 (B3b i915 display power domains in tk-intel-gt): crates/ax moves
+# from 858/828 to 874/844 at >= 40 (16 code lines) and from 2276/2238 to 2350/2312
+# at >= 25 (74 code lines). These are MIT translations of MIT Linux display sources.
 # 2026-10-13 (B3a i915 display foundation in tk-intel-gt): crates/ax moves
 # from 837/807 to 858/828 at >= 40 (21 code lines) and from 2238/2200 to 2276/2238
 # at >= 25 (38 code lines). These are MIT translations of MIT Linux display sources.
@@ -79,7 +82,7 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # lines in the newly translated FreeBSD drivers and the OpenBSD iwx/net80211
 # translations, plus one FreeBSD ig4 register line. Those have BSD-source
 # provenance, not Linux provenance; see `docs/upstream-provenance.md`.
-    ("crates/ax", 25): (18, 15, 4, 2276, 2238, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 2350, 2312, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their
