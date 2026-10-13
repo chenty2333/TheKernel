@@ -66,7 +66,7 @@ unsafe extern "C" {
         name: *const c_char,
     ) -> i32;
     fn drm_crtc_cleanup(crtc: *mut DrmCrtc);
-    fn drm_atomic_helper_crtc_state_reset(state: *mut DrmCrtcState, crtc: *mut DrmCrtc);
+    fn __drm_atomic_helper_crtc_state_reset(state: *mut DrmCrtcState, crtc: *mut DrmCrtc);
     fn drm_crtc_create_scaling_filter_property(crtc: *mut DrmCrtc, supported_filters: u32) -> i32;
     fn drm_crtc_attach_background_color_property(crtc: *mut DrmCrtc);
     fn drm_crtc_vblank_count(crtc: *mut DrmCrtc) -> u64;
@@ -633,7 +633,7 @@ pub unsafe extern "C" fn intel_crtc_state_reset(state: *mut IntelCrtcState, crtc
     }
     unsafe {
         ptr::write_bytes(state, 0, 1);
-        drm_atomic_helper_crtc_state_reset(&mut (*state).uapi, &mut (*crtc).base);
+        __drm_atomic_helper_crtc_state_reset(&mut (*state).uapi, &mut (*crtc).base);
         (*state).cpu_transcoder = INVALID_TRANSCODER;
         (*state).master_transcoder = INVALID_TRANSCODER;
         (*state).hsw_workaround_pipe = INVALID_PIPE;
