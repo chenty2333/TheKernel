@@ -26,11 +26,11 @@ use tk_drm_upstream::{
     },
     drm_ioctl_types::{DRM_RENDER_ALLOW, DrmIoctlDesc},
     drm_syncobj_upstream::{
-        DrmSyncobj, drm_syncobj_add_point, drm_syncobj_chain_alloc, drm_syncobj_chain_free,
-        drm_syncobj_fence_create, drm_syncobj_fence_put, drm_syncobj_fence_signal,
-        drm_syncobj_find, drm_syncobj_find_fence, drm_syncobj_put, drm_syncobj_replace_fence,
-        drm_syncobj_sync_file_create, drm_syncobj_sync_file_file, drm_syncobj_sync_file_fput,
-        drm_syncobj_sync_file_get_fence,
+        DrmSyncobj, drm_syncobj_chain_alloc, drm_syncobj_chain_free, drm_syncobj_fence_create,
+        drm_syncobj_fence_put, drm_syncobj_fence_signal, drm_syncobj_sync_file_create,
+        drm_syncobj_sync_file_file, drm_syncobj_sync_file_fput, drm_syncobj_sync_file_get_fence,
+        tk_drm_syncobj_add_point, tk_drm_syncobj_find, tk_drm_syncobj_find_fence,
+        tk_drm_syncobj_put, tk_drm_syncobj_replace_fence,
     },
 };
 use tk_linux_kapi::{
@@ -1335,8 +1335,8 @@ impl Drop for ExecInputSyncobjs {
     fn drop(&mut self) {
         for object in self.reset_objects.drain(..) {
             unsafe {
-                drm_syncobj_replace_fence(object, ptr::null_mut());
-                drm_syncobj_put(object);
+                tk_drm_syncobj_replace_fence(object, ptr::null_mut());
+                tk_drm_syncobj_put(object);
             }
         }
     }
@@ -1351,9 +1351,9 @@ impl ExecOutputSyncobjs {
         for entry in &mut self.entries {
             unsafe {
                 if entry.point == 0 {
-                    drm_syncobj_replace_fence(entry.object, fence);
+                    tk_drm_syncobj_replace_fence(entry.object, fence);
                 } else {
-                    drm_syncobj_add_point(entry.object, entry.chain, fence, entry.point);
+                    tk_drm_syncobj_add_point(entry.object, entry.chain, fence, entry.point);
                     entry.chain = ptr::null_mut();
                 }
             }
@@ -1368,7 +1368,7 @@ impl Drop for ExecOutputSyncobjs {
                 if !entry.chain.is_null() {
                     drm_syncobj_chain_free(entry.chain);
                 }
-                drm_syncobj_put(entry.object);
+                tk_drm_syncobj_put(entry.object);
             }
         }
     }
@@ -1484,17 +1484,17 @@ fn parse_exec_input_syncobjs(
     for descriptor in descriptors {
         if descriptor.flags & !VIRTGPU_EXECBUF_SYNCOBJ_FLAGS != 0 {
             for object in reset_objects {
-                unsafe { drm_syncobj_put(object) };
+                unsafe { tk_drm_syncobj_put(object) };
             }
             return Err(-EINVAL);
         }
         let mut fence = ptr::null_mut();
         let ret = unsafe {
-            drm_syncobj_find_fence(file, descriptor.handle, descriptor.point, 0, &mut fence)
+            tk_drm_syncobj_find_fence(file, descriptor.handle, descriptor.point, 0, &mut fence)
         };
         if ret != 0 {
             for object in reset_objects {
-                unsafe { drm_syncobj_put(object) };
+                unsafe { tk_drm_syncobj_put(object) };
             }
             return Err(ret);
         }
@@ -1503,15 +1503,15 @@ fn parse_exec_input_syncobjs(
         unsafe { drm_syncobj_fence_put(fence) };
         if wait != 0 {
             for object in reset_objects {
-                unsafe { drm_syncobj_put(object) };
+                unsafe { tk_drm_syncobj_put(object) };
             }
             return Err(wait);
         }
         if descriptor.flags & VIRTGPU_EXECBUF_SYNCOBJ_RESET != 0 {
-            let object = unsafe { drm_syncobj_find(file, descriptor.handle) };
+            let object = unsafe { tk_drm_syncobj_find(file, descriptor.handle) };
             if object.is_null() {
                 for object in reset_objects {
-                    unsafe { drm_syncobj_put(object) };
+                    unsafe { tk_drm_syncobj_put(object) };
                 }
                 return Err(-ENOENT);
             }
@@ -1539,7 +1539,7 @@ fn parse_exec_output_syncobjs(
             release_exec_output_syncobjs(output);
             return Err(-EINVAL);
         }
-        let object = unsafe { drm_syncobj_find(file, descriptor.handle) };
+        let object = unsafe { tk_drm_syncobj_find(file, descriptor.handle) };
         if object.is_null() {
             release_exec_output_syncobjs(output);
             return Err(-ENOENT);
@@ -1549,7 +1549,7 @@ fn parse_exec_output_syncobjs(
         } else {
             let chain = drm_syncobj_chain_alloc();
             if chain.is_null() {
-                unsafe { drm_syncobj_put(object) };
+                unsafe { tk_drm_syncobj_put(object) };
                 release_exec_output_syncobjs(output);
                 return Err(-ENOMEM);
             }
@@ -1570,7 +1570,7 @@ fn release_exec_output_syncobjs(output: Vec<ExecOutputSyncobj>) {
             if !entry.chain.is_null() {
                 drm_syncobj_chain_free(entry.chain);
             }
-            drm_syncobj_put(entry.object);
+            tk_drm_syncobj_put(entry.object);
         }
     }
 }
