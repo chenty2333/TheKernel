@@ -740,6 +740,7 @@ mod tests {
 
     #[test]
     fn shared_mmap_rearm_writeprotects_every_shared_pages_alias() {
+        let _context = crate::test_support::scheduler_test_context();
         let mapping_cookie = core::ptr::addr_of!(TEST_MAPPING_COOKIE).cast_mut().cast();
         let owner = Arc::new(TestVmFileOwner(UnsafeCell::new(File {
             _before_f_mapping: [0; 16],
