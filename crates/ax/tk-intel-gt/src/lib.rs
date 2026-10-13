@@ -659,6 +659,10 @@ pub mod intel_display_device_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_driver_upstream;
 #[allow(unsafe_code)]
+pub mod intel_plane_upstream;
+#[allow(unsafe_code)]
+pub mod skl_universal_plane_upstream;
+#[allow(unsafe_code)]
 pub mod intel_display_reset_upstream;
 #[allow(unsafe_code)]
 pub mod intel_hti_upstream;
