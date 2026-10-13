@@ -100,6 +100,8 @@ pub mod drm_vblank_types;
 pub mod drm_vblank_work_types;
 pub mod drm_vma_manager_types;
 pub mod fb_types;
+pub mod fbmem_upstream;
+pub mod fb_sysmem_upstream;
 pub mod hdmi_types;
 pub mod iosys_map_types;
 pub mod kernel_placeholder_types;
