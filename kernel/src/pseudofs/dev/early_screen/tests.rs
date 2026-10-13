@@ -631,3 +631,21 @@ fn a_panic_message_and_a_backtrace_are_drawn_in_their_own_colours() {
         TRACE_TEXT.to_le_bytes()
     );
 }
+
+#[test]
+fn opaque_row_repaint_erases_old_trailing_glyphs_without_a_preclear() {
+    let view = view(16, 16, 72, B8G8R8A8);
+    let mut bytes = surface(&view);
+    view.draw_row(&mut bytes, 0, b"WW", 2, LOG_TEXT, BACKGROUND);
+    view.draw_row(&mut bytes, 0, b"A", 2, LOG_TEXT, BACKGROUND);
+    assert_eq!(rendered_row(&view, &bytes, 0, BACKGROUND), b"A");
+    for y in 0..16 {
+        for x in 8..16 {
+            assert!(!is_ink(&view, &bytes, x, y, BACKGROUND));
+        }
+    }
+    // A cell batch never writes the scan-line padding; paint owns those tails.
+    for y in 0..16 {
+        assert_eq!(&bytes[y * 72 + 64..(y + 1) * 72], &[0xa5; 8]);
+    }
+}

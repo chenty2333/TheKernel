@@ -299,33 +299,24 @@ impl TextView {
         (offset + bytes <= self.len).then_some(offset)
     }
 
-    fn put_pattern(&self, dst: &mut [u8], x: usize, y: usize, pattern: &[u8]) {
-        let Some(offset) = self.offset_of(x, y) else {
-            return;
-        };
-        let end = offset + pattern.len();
-        if end > dst.len() {
-            return;
-        }
-        dst[offset..end].copy_from_slice(pattern);
-    }
-
     /// Fill whole scan lines in `first..end` with `color`.
     ///
     /// The full stride is filled, padding included, so that no byte of the
     /// aperture -- including one the firmware's own splash left outside the
     /// visible width -- survives a repaint.
     fn fill_rows(&self, dst: &mut [u8], first: usize, end: usize, color: u32) {
-        let Some((pixel, bytes)) = self.pattern(color) else {
-            return;
-        };
+        self.fill_row_tails(dst, first, end, 0, color);
+    }
+
+    fn fill_row_tails(&self, dst: &mut [u8], first: usize, end: usize, x: usize, color: u32) {
+        let Some((pixel, bytes)) = self.pattern(color) else { return; };
         let stride = self.pitch as usize;
+        let Some(skip) = x.checked_mul(bytes) else { return; };
+        if skip >= stride { return; }
         for y in first..end.min(self.height as usize) {
-            let start = y * stride;
-            if start >= dst.len() {
-                return;
-            }
-            let stop = (start + stride).min(dst.len());
+            let start = y * stride + skip;
+            if start >= dst.len() { return; }
+            let stop = ((y + 1) * stride).min(dst.len());
             let row = &mut dst[start..stop];
             let whole = row.len() / bytes * bytes;
             for chunk in row[..whole].chunks_exact_mut(bytes) {
@@ -337,8 +328,10 @@ impl TextView {
     /// Draw `text` into one scan line of cells, clipping anything that does
     /// not fit.
     fn draw_row(&self, dst: &mut [u8], row: usize, text: &[u8], cols: usize, fg: u32, bg: u32) {
-        for (col, &byte) in text.iter().enumerate().take(cols) {
-            self.draw_cell(dst, col, row, byte, fg, bg);
+        // Opaque cells erase the old text themselves, without exposing a
+        // black intermediate frame on the live firmware scanout.
+        for col in 0..cols {
+            self.draw_cell(dst, col, row, text.get(col).copied().unwrap_or(b' '), fg, bg);
         }
     }
 
@@ -359,8 +352,9 @@ impl TextView {
         let scale = self.glyph_scale();
         let cell_width = GLYPH_WIDTH * scale;
         let cell_height = GLYPH_HEIGHT * scale;
-        let x0 = col * cell_width;
-        let y0 = row * cell_height;
+        let Some(x0) = col.checked_mul(cell_width) else { return; };
+        let Some(y0) = row.checked_mul(cell_height) else { return; };
+        let mut pixels = [0u8; GLYPH_WIDTH * super::console_font::UHD_GLYPH_SCALE * 4];
         for dy in 0..cell_height {
             let line = bits.map_or(0, |rows| rows[dy / scale]);
             for dx in 0..cell_width {
@@ -369,7 +363,14 @@ impl TextView {
                 } else {
                     &background
                 };
-                self.put_pattern(dst, x0 + dx, y0 + dy, &pattern[..bytes]);
+                pixels[dx * bytes..(dx + 1) * bytes].copy_from_slice(&pattern[..bytes]);
+            }
+            let Some(y) = y0.checked_add(dy) else { continue; };
+            let Some(offset) = self.offset_of(x0, y) else { continue; };
+            let count = cell_width.min((self.width as usize).saturating_sub(x0)) * bytes;
+            let Some(end) = offset.checked_add(count) else { continue; };
+            if end <= dst.len() && end <= self.len {
+                dst[offset..end].copy_from_slice(&pixels[..count]);
             }
         }
     }
@@ -461,10 +462,14 @@ fn paint(
     let dirty = previous.map_or(view.height as usize, |previous| {
         (previous * cell_height).max(used * cell_height)
     });
-    view.fill_rows(dst, 0, dirty, BACKGROUND);
+    // Clear only rows and stride tails not covered by opaque glyph cells.
+    // Previously every progress repaint first erased all visible text.
+    view.fill_rows(dst, used * cell_height, dirty, BACKGROUND);
+    let text_width = cols * view.cell_width();
+    view.fill_row_tails(dst, cell_height, used * cell_height, text_width, BACKGROUND);
 
     let bar = if content.alert { PANIC_BAR } else { STATUS_BAR };
-    view.fill_rows(dst, 0, cell_height, bar);
+    view.fill_row_tails(dst, 0, cell_height, text_width, bar);
     view.draw_row(dst, 0, content.status, cols, STATUS_TEXT, bar);
 
     let mut row = 1;
