@@ -64,7 +64,7 @@ unsafe extern "C" {
 
 static mut REGISTERED_FB: [*mut FbInfo; FB_MAX] = [ptr::null_mut(); FB_MAX];
 static mut NUM_REGISTERED_FB: usize = 0;
-static REGISTRATION_LOCK: Mutex = unsafe { core::mem::zeroed() };
+static mut REGISTRATION_LOCK: Mutex = unsafe { core::mem::zeroed() };
 
 unsafe fn registered_slot(node: usize) -> *mut *mut FbInfo {
     unsafe { ptr::addr_of_mut!(REGISTERED_FB).cast::<*mut FbInfo>().add(node) }
@@ -72,12 +72,13 @@ unsafe fn registered_slot(node: usize) -> *mut *mut FbInfo {
 
 unsafe fn lock_registration() {
     // The zeroed static mutex has Linux's unlocked x86_64 `struct mutex`
-    // representation; it is immutable kernel-lifetime storage.
-    unsafe { mutex_lock(&REGISTRATION_LOCK) };
+    // representation. Its C-layout owner word is mutable, so the storage must
+    // stay in writable data rather than an immutable static in .rodata.
+    unsafe { mutex_lock(ptr::addr_of_mut!(REGISTRATION_LOCK)) };
 }
 
 unsafe fn unlock_registration() {
-    unsafe { mutex_unlock(&REGISTRATION_LOCK) };
+    unsafe { mutex_unlock(ptr::addr_of_mut!(REGISTRATION_LOCK)) };
 }
 
 /// Linux `framebuffer_alloc(size, dev)` for the selected fb_info layout.
