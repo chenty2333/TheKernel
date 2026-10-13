@@ -64,8 +64,8 @@ pub unsafe extern "C" fn intel_display_driver_init_hw(display: *mut IntelDisplay
 }
 
 static INTEL_MODE_FUNCS: DrmModeConfigFuncs = DrmModeConfigFuncs {
-    fb_create: Some(crate::display_pending_stubs::b4::intel_user_framebuffer_create),
-    get_format_info: Some(crate::display_pending_stubs::b4::intel_fb_get_format_info),
+    fb_create: Some(crate::intel_fb_upstream::intel_user_framebuffer_create),
+    get_format_info: Some(crate::intel_fb_upstream::intel_fb_get_format_info),
     mode_valid: Some(crate::display_pending_stubs::b7::intel_mode_valid),
     atomic_check: Some(crate::display_pending_stubs::b4::intel_atomic_check),
     atomic_commit: Some(crate::display_pending_stubs::b4::intel_atomic_commit),
@@ -431,7 +431,7 @@ pub unsafe extern "C" fn intel_display_driver_probe_nogem(display: *mut IntelDis
         crate::display_pending_stubs::opt::intel_acpi_assign_connector_fwnodes(display);
         tk_drm_upstream::drm_modeset_lock_upstream::drm_modeset_unlock_all((*display).drm);
 
-        crate::display_pending_stubs::b4::intel_initial_plane_config(display);
+        crate::intel_initial_plane_upstream::intel_initial_plane_config(display);
         crate::display_pending_stubs::b4::ilk_wm_sanitize(display);
     }
     0
