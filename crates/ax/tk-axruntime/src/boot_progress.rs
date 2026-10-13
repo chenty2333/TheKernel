@@ -1,6 +1,6 @@
 //! Opt-in atomic boot/console progress, never a scheduling or locking fix.
 //! IRQ paths only update counters; snapshots never take console/scheduler locks.
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
@@ -87,6 +87,12 @@ impl Cpu {
     }
 }
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static BOOT_TRACE: AtomicBool = AtomicBool::new(false);
+static LAST_ENTER_STEP: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static LAST_ENTER_LEN: AtomicUsize = AtomicUsize::new(0);
+static LAST_ENTER_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static LAST_HEARTBEAT_NS: AtomicU64 = AtomicU64::new(0);
+
 static STAGE: AtomicU8 = AtomicU8::new(0);
 static CPUS: [Cpu; axconfig::plat::MAX_CPU_NUM] =
     [const { Cpu::new() }; axconfig::plat::MAX_CPU_NUM];
@@ -106,11 +112,108 @@ pub struct CpuSnapshot {
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
+pub fn boot_trace_enabled() -> bool {
+    BOOT_TRACE.load(Ordering::Relaxed)
+}
 pub fn init() {
     ENABLED.store(
         axhal::boot::command_line_value("boot.progress") == Some("1"),
         Ordering::Release,
     );
+    BOOT_TRACE.store(
+        axhal::boot::command_line_value("n305.boot_trace") == Some("1"),
+        Ordering::Release,
+    );
+}
+
+pub fn record_trace_enter(step: &'static str) {
+    LAST_ENTER_STEP.store(step.as_ptr() as *mut u8, Ordering::Release);
+    LAST_ENTER_LEN.store(step.len(), Ordering::Release);
+    LAST_ENTER_TIME_NS.store(axhal::time::monotonic_time_nanos(), Ordering::Release);
+}
+
+pub fn record_trace_exit(_step: &'static str) {
+    LAST_ENTER_STEP.store(core::ptr::null_mut(), Ordering::Release);
+}
+
+struct StackBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackBuf<N> {
+    const fn new() -> Self {
+        Self {
+            buf: [0u8; N],
+            len: 0,
+        }
+    }
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl<const N: usize> core::fmt::Write for StackBuf<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let remaining = N.saturating_sub(self.len);
+        let bytes = s.as_bytes();
+        let to_copy = bytes.len().min(remaining);
+        self.buf[self.len..self.len + to_copy].copy_from_slice(&bytes[..to_copy]);
+        self.len += to_copy;
+        Ok(())
+    }
+}
+
+#[inline]
+pub fn trace_enter(step: &'static str) {
+    if boot_trace_enabled() {
+        record_trace_enter(step);
+        axlog::warn!("BT> {step}");
+        let mut buf = StackBuf::<96>::new();
+        use core::fmt::Write;
+        let _ = write!(buf, "BT> {step}");
+        crate::early_screen_milestone(buf.as_str());
+    }
+}
+
+#[inline]
+pub fn trace_exit(step: &'static str) {
+    if boot_trace_enabled() {
+        record_trace_exit(step);
+        axlog::warn!("BT< {step}");
+        let mut buf = StackBuf::<96>::new();
+        use core::fmt::Write;
+        let _ = write!(buf, "BT< {step}");
+        crate::early_screen_milestone(buf.as_str());
+    }
+}
+
+pub fn heartbeat(now_ns: u64) {
+    let ptr = LAST_ENTER_STEP.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return;
+    }
+    let last_hb = LAST_HEARTBEAT_NS.load(Ordering::Acquire);
+    if now_ns.saturating_sub(last_hb) >= 5_000_000_000 {
+        if LAST_HEARTBEAT_NS
+            .compare_exchange(last_hb, now_ns, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let len = LAST_ENTER_LEN.load(Ordering::Acquire);
+            let enter_ns = LAST_ENTER_TIME_NS.load(Ordering::Acquire);
+            let elapsed_s = now_ns.saturating_sub(enter_ns) / 1_000_000_000;
+            // SAFETY: step pointer came from &'static str
+            let step = unsafe {
+                core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len))
+            };
+            let cpu = axhal::percpu::this_cpu_id();
+            axlog::warn!("BT~ heartbeat CPU {cpu}: stuck in {step} for {elapsed_s}s");
+            let mut buf = StackBuf::<96>::new();
+            use core::fmt::Write;
+            let _ = write!(buf, "BT~ CPU {cpu}: {step} {elapsed_s}s");
+            crate::early_screen_milestone(buf.as_str());
+        }
+    }
 }
 pub fn mark(stage: Stage) {
     if enabled() {

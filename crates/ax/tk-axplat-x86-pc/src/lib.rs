@@ -238,3 +238,7 @@ mod intel_cpu_cache;
 pub fn intel_cpu_mmap_ready() -> bool {
     intel_cpu_cache::ready()
 }
+/// Bitmask of CPUs that confirmed PAT setup.
+pub fn intel_cpu_cache_ready_mask() -> usize {
+    intel_cpu_cache::ready_mask()
+}

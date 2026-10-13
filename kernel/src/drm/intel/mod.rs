@@ -107,9 +107,13 @@ pub(crate) fn hex(value: u64, digits: usize) -> String {
 /// same text afterwards.
 ///
 pub(crate) fn probe_at_boot() {
+    axruntime::boot_progress::trace_enter("drm:probe_at_boot");
+    axruntime::boot_progress::trace_enter("drm:platform_probe");
     let report = platform_probe();
+    axruntime::boot_progress::trace_exit("drm:platform_probe");
     report.log();
     *REPORT.lock() = Some(report);
+    axruntime::boot_progress::trace_enter("drm:gt_probe_report");
     let observations: Vec<_> = mapped_windows()
         .into_iter()
         .map(|(bdf, window)| {
@@ -119,6 +123,8 @@ pub(crate) fn probe_at_boot() {
         })
         .collect();
     *GT_REPORT.lock() = observations;
+    axruntime::boot_progress::trace_exit("drm:gt_probe_report");
+    axruntime::boot_progress::trace_exit("drm:probe_at_boot");
 }
 
 /// The devices whose register window the probe mapped, with those windows.
@@ -170,8 +176,10 @@ pub(super) fn traced_refusal() -> Error {
 /// Bring up the GT path on the device the probe mapped: i915 is deferred to the
 /// rootfs-ready callback, which fetches its GuC/HuC firmware.
 pub(crate) fn bring_up_gt_at_boot() {
+    axruntime::boot_progress::trace_enter("drm:bring_up_gt_at_boot");
     #[cfg(target_os = "none")]
     gt::init_at_boot();
+    axruntime::boot_progress::trace_exit("drm:bring_up_gt_at_boot");
 }
 
 /// Whether the translated i915 driver has registered its DRM device.

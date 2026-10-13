@@ -796,7 +796,7 @@ pub(crate) fn report_milestone(name: &str) {
     let mut status = BoundedText::<STATUS_BYTES>::new();
     let _ = write!(status, "THEKERNEL  {name}");
     let mut tail = [0u8; TAIL_BYTES];
-    let count = read_tail(&mut tail, true);
+    let count = read_tail(&mut tail, false);
     let content = Content::milestone(status.as_bytes(), &tail[..count]);
     present(&content);
 }
