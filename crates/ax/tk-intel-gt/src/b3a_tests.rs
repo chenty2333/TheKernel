@@ -635,6 +635,29 @@ fn test_is_display_step_half_open_interval_boundary() {
 }
 
 #[test]
+fn test_pch_range_workarounds_apply_to_adp() {
+    use crate::intel_pch_types_upstream::{PCH_ADP, PCH_DG1, PCH_ICP, PCH_NONE};
+    let mut display = Box::new(unsafe { core::mem::zeroed::<IntelDisplay>() });
+
+    // ADL-P / ADL-N pair with PCH_ADP, which lies inside both [PCH_CNP, PCH_DG1) and [PCH_TGP, PCH_DG1).
+    unsafe { (*display).pch_type = PCH_ADP };
+    assert!(unsafe { __intel_display_wa(&mut *display, IntelDisplayWa::Wa14010685332, core::ptr::null()) });
+    assert!(unsafe { __intel_display_wa(&mut *display, IntelDisplayWa::Wa14011294188, core::ptr::null()) });
+
+    // PCH_ICP is inside [CNP, DG1) but below TGP.
+    unsafe { (*display).pch_type = PCH_ICP };
+    assert!(unsafe { __intel_display_wa(&mut *display, IntelDisplayWa::Wa14010685332, core::ptr::null()) });
+    assert!(!unsafe { __intel_display_wa(&mut *display, IntelDisplayWa::Wa14011294188, core::ptr::null()) });
+
+    // DG1 is the exclusive upper bound; no PCH matches neither.
+    for pch in [PCH_DG1, PCH_NONE] {
+        unsafe { (*display).pch_type = pch };
+        assert!(!unsafe { __intel_display_wa(&mut *display, IntelDisplayWa::Wa14010685332, core::ptr::null()) });
+        assert!(!unsafe { __intel_display_wa(&mut *display, IntelDisplayWa::Wa14011294188, core::ptr::null()) });
+    }
+}
+
+#[test]
 fn test_probe_defer_rejects_enodev_privacy_screen() {
     let mut dummy_pdev: u64 = 0x1234;
     let pdev_ptr = core::ptr::addr_of_mut!(dummy_pdev).cast::<c_void>();

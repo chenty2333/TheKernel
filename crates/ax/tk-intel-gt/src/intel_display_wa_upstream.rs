@@ -6,6 +6,7 @@
 
 use crate::intel_de_upstream::intel_de_rmw;
 use crate::intel_display_core_types_upstream::IntelDisplay;
+use crate::intel_pch_types_upstream::{PCH_CNP, PCH_DG1, PCH_TGP};
 use crate::intel_display_device_upstream::{
     STEP_NONE, STEP_A0, STEP_A1, STEP_A2, STEP_B0, STEP_B1, STEP_C0,
     STEP_D0, STEP_D1, STEP_E0, STEP_F0, STEP_G0, STEP_H0, STEP_FUTURE,
@@ -44,6 +45,12 @@ pub unsafe fn IS_DISPLAY_VERx100(display: *const IntelDisplay, from: u32, until:
 #[inline]
 pub unsafe fn INTEL_DISPLAY_STEP(display: *const IntelDisplay) -> i32 {
     (*display).info.__runtime_info.step
+}
+
+// upstream: intel_pch.h INTEL_PCH_TYPE()
+#[inline]
+pub unsafe fn INTEL_PCH_TYPE(display: *const IntelDisplay) -> crate::intel_pch_types_upstream::IntelPch {
+    unsafe { (*display).pch_type }
 }
 
 #[inline]
@@ -217,8 +224,12 @@ pub unsafe extern "C" fn __intel_display_wa(
         }
         IntelDisplayWa::Wa14010480278 => IS_DISPLAY_VER(display, 10, 12),
         IntelDisplayWa::Wa14010547955 => platform_dg2(display),
-        IntelDisplayWa::Wa14010685332 => false, // PCH_CNP..PCH_DG1 not applicable to display 13
-        IntelDisplayWa::Wa14011294188 => false, // PCH_TGP..PCH_DG1 not applicable to display 13
+        IntelDisplayWa::Wa14010685332 => {
+            INTEL_PCH_TYPE(display) >= PCH_CNP && INTEL_PCH_TYPE(display) < PCH_DG1
+        }
+        IntelDisplayWa::Wa14011294188 => {
+            INTEL_PCH_TYPE(display) >= PCH_TGP && INTEL_PCH_TYPE(display) < PCH_DG1
+        }
         IntelDisplayWa::Wa14011503030
         | IntelDisplayWa::Wa14011503117
         | IntelDisplayWa::Wa22012358565 => DISPLAY_VER(display) == 13,
