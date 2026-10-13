@@ -31,3 +31,25 @@ const _: () = assert!(core::mem::offset_of!(DrmShadowPlaneState, map) == 208);
 const _: () = assert!(size_of::<[IosysMap; 4]>() == 64);
 const _: () = assert!(core::mem::offset_of!(DrmShadowPlaneState, data) == 272);
 const _: () = assert!(size_of::<[IosysMap; 4]>() == 64);
+
+use crate::drm_connector_types::DrmConnector;
+use crate::drm_crtc_types::DrmCrtc;
+use crate::drm_encoder_types::DrmEncoder;
+use crate::drm_plane_types::DrmPlane;
+
+#[repr(C)]
+pub struct DrmSimpleDisplayPipe {
+    pub crtc: DrmCrtc,
+    pub plane: DrmPlane,
+    pub encoder: DrmEncoder,
+    pub connector: *mut DrmConnector,
+    pub funcs: *const c_void,
+}
+
+const _: () = assert!(size_of::<DrmSimpleDisplayPipe>() == 3168);
+const _: () = assert!(core::mem::offset_of!(DrmSimpleDisplayPipe, crtc) == 0);
+const _: () = assert!(core::mem::offset_of!(DrmSimpleDisplayPipe, plane) == 1648);
+const _: () = assert!(core::mem::offset_of!(DrmSimpleDisplayPipe, encoder) == 3000);
+const _: () = assert!(core::mem::offset_of!(DrmSimpleDisplayPipe, connector) == 3152);
+const _: () = assert!(core::mem::offset_of!(DrmSimpleDisplayPipe, funcs) == 3160);
+
