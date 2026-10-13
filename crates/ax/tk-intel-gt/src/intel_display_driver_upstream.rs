@@ -147,7 +147,7 @@ pub unsafe extern "C" fn intel_display_driver_early_probe(display: *mut IntelDis
 
         crate::display_pending_stubs::b3d::intel_display_irq_init(display);
         crate::display_pending_stubs::b5::intel_dkl_phy_init(display);
-        crate::display_pending_stubs::b4::intel_color_init_hooks(display);
+        crate::intel_color_upstream::intel_color_init_hooks(display);
         crate::display_pending_stubs::b3e::intel_init_cdclk_hooks(display);
         crate::display_pending_stubs::opt::intel_audio_hooks_init(display);
         crate::display_pending_stubs::b5::intel_dpll_init_clock_hook(display);
@@ -289,7 +289,7 @@ pub unsafe extern "C" fn intel_display_driver_probe_noirq(display: *mut IntelDis
 
         ret = crate::display_pending_stubs::b3e::intel_cdclk_init(display);
         if ret != 0 { return cleanup_wqs(ret); }
-        ret = crate::display_pending_stubs::b4::intel_color_init(display);
+        ret = crate::intel_color_upstream::intel_color_init(display);
         if ret != 0 { return cleanup_wqs(ret); }
         ret = crate::display_pending_stubs::b3d::intel_dbuf_init(display);
         if ret != 0 { return cleanup_wqs(ret); }
