@@ -265,6 +265,10 @@ pub(crate) struct AliasSnapshot {
 }
 
 impl AliasSnapshot {
+    pub(crate) const fn key(&self) -> SharedBackingKey {
+        self.key
+    }
+
     pub(crate) const fn address_space_id(&self) -> AddressSpaceId {
         self.address_space_id
     }
@@ -289,6 +293,56 @@ impl AliasSnapshot {
         let identity_matches = address_space.lock().address_space_id() == self.address_space_id;
         identity_matches.then_some(address_space)
     }
+}
+
+/// Takes one stable-enough inventory of the existing shared-backing aliases.
+/// Callers that need to mutate a backing must reserve each candidate key and
+/// take a fresh per-key snapshot before touching any address space.
+pub(crate) fn snapshot_all_aliases() -> AxResult<Vec<AliasSnapshot>> {
+    let registry = loop {
+        let registry = ALIASES.lock();
+        if !registry.entries.values().any(|aliases| {
+            aliases
+                .iter()
+                .any(|entry| matches!(entry.state, AliasState::Pending { .. }))
+        }) {
+            break registry;
+        }
+        drop(registry);
+        core::hint::spin_loop();
+    };
+    let count = registry.entries.values().try_fold(0usize, |count, aliases| {
+        let live = aliases
+            .iter()
+            .filter(|entry| matches!(entry.state, AliasState::Committed { .. }))
+            .filter(|entry| entry.address_space.strong_count() != 0)
+            .count();
+        count.checked_add(live).ok_or(AxError::NoMemory)
+    })?;
+    let mut snapshots = Vec::new();
+    snapshots
+        .try_reserve_exact(count)
+        .map_err(|_| AxError::NoMemory)?;
+    for (&key, aliases) in &registry.entries {
+        for entry in aliases.iter().filter(|entry| {
+            matches!(entry.state, AliasState::Committed { .. })
+                && entry.address_space.strong_count() != 0
+        }) {
+            snapshots.push(AliasSnapshot {
+                key,
+                lease_id: entry.lease_id,
+                address_space_id: entry.address_space_id,
+                address_space: entry.address_space.clone(),
+            });
+        }
+    }
+    snapshots.sort_unstable_by(|lhs, rhs| {
+        lhs.key
+            .cmp(&rhs.key)
+            .then_with(|| lhs.address_space_id.cmp(&rhs.address_space_id))
+            .then_with(|| lhs.lease_id.cmp(&rhs.lease_id))
+    });
+    Ok(snapshots)
 }
 
 /// Takes a deterministic snapshot of all current aliases for `key`.

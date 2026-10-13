@@ -1,8 +1,369 @@
 //! AddrSpace: protection changes, page faults, reclaim and swap.
 
 use super::*;
+use crate::file::SharedMmapOps;
+use tk_linux_kapi::mm::VmAreaStruct;
+
+/// Lock-free callback work captured from one live SharedPages VMA.
+pub(crate) struct SharedMmapFaultPlan {
+    pub(crate) ops: Arc<SharedMmapOps>,
+    pub(crate) vma: VmAreaStruct,
+    pub(crate) page: VirtAddr,
+    pub(crate) page_index: usize,
+    pub(crate) pgoff: usize,
+    pub(crate) paddr: usize,
+    pub(crate) write: bool,
+    pub(crate) needs_fault: bool,
+    pub(crate) needs_mkwrite: bool,
+}
+
+pub(crate) struct SharedMmapWrprotectPlan {
+    aliases: Vec<(VirtAddr, PhysAddr, MappingFlags)>,
+}
 
 impl AddrSpace {
+    pub(crate) fn has_shared_mmap_mapping(&self, mapping_cookie: usize) -> bool {
+        self.areas.iter().any(|area| {
+            area.backend()
+                .shared_mmap_ops()
+                .is_some_and(|ops| ops.mapping_cookie() as usize == mapping_cookie)
+        })
+    }
+
+    pub(crate) fn prepare_shared_mmap_wrprotect(
+        &mut self,
+        mapping_cookie: usize,
+        pgoff: usize,
+        pfn: usize,
+        nr_pages: usize,
+    ) -> AxResult<SharedMmapWrprotectPlan> {
+        let end_pgoff = pgoff.checked_add(nr_pages).ok_or(AxError::InvalidInput)?;
+        let end_pfn = pfn.checked_add(nr_pages).ok_or(AxError::InvalidInput)?;
+        let mut demote = Vec::new();
+        for area in self.areas.iter() {
+            if !area
+                .backend()
+                .shared_mmap_ops()
+                .is_some_and(|ops| ops.mapping_cookie() as usize == mapping_cookie)
+            {
+                continue;
+            }
+            let mut page = area.start();
+            while page < area.end() {
+                if let Some((_, _, page_pgoff, _)) =
+                    area.backend().shared_mmap_page_info(page.as_usize())
+                    && (pgoff..end_pgoff).contains(&page_pgoff)
+                    && self
+                        .pt
+                        .query_mapped(page)
+                        .is_ok_and(|(_, _, size)| size == PageSize::Size2M)
+                {
+                    let pmd = VirtAddr::from(page.as_usize() & !(PageSize::Size2M as usize - 1));
+                    if !demote.contains(&pmd) {
+                        demote.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                        demote.push(pmd);
+                    }
+                }
+                page += PAGE_SIZE_4K;
+            }
+        }
+        for start in demote {
+            self.demote_alias_preserving_2m(start)?;
+        }
+
+        let mut aliases = Vec::new();
+        for area in self.areas.iter() {
+            if !area
+                .backend()
+                .shared_mmap_ops()
+                .is_some_and(|ops| ops.mapping_cookie() as usize == mapping_cookie)
+            {
+                continue;
+            }
+            let mut page = area.start();
+            while page < area.end() {
+                if let Some((_, _, page_pgoff, page_paddr)) =
+                    area.backend().shared_mmap_page_info(page.as_usize())
+                    && (pgoff..end_pgoff).contains(&page_pgoff)
+                {
+                    let expected_pfn = pfn + (page_pgoff - pgoff);
+                    if page_paddr / PAGE_SIZE_4K != expected_pfn || expected_pfn >= end_pfn {
+                        return Err(AxError::BadAddress);
+                    }
+                    match self.pt.query(page) {
+                        Ok((mapped, flags, PageSize::Size4K))
+                            if mapped.as_usize() == page_paddr =>
+                        {
+                            aliases.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                            aliases.push((page, mapped, flags));
+                        }
+                        Err(PagingError::NotMapped) => {}
+                        _ => return Err(AxError::BadAddress),
+                    }
+                }
+                page += PAGE_SIZE_4K;
+            }
+        }
+        Ok(SharedMmapWrprotectPlan { aliases })
+    }
+
+    pub(crate) fn commit_shared_mmap_wrprotect(
+        &mut self,
+        plan: SharedMmapWrprotectPlan,
+    ) {
+        let mut changed = false;
+        for (address, paddr, flags) in plan.aliases {
+            let protected = flags - MappingFlags::WRITE - MappingFlags::SHADOW_STACK;
+            if protected == flags {
+                continue;
+            }
+            self.pt
+                .cursor()
+                .remap(address, paddr, super::backend::page_table_flags(protected))
+                .expect("preflighted SharedMmap PTE changed under address-space lock");
+            changed = true;
+        }
+        if changed {
+            drop(self.synchronize_tlb_after_mutation());
+        }
+    }
+
+    pub(crate) fn insert_shared_mmap_pfn(
+        &mut self,
+        vma: &VmAreaStruct,
+        address: usize,
+        pfn: usize,
+    ) -> u32 {
+        use tk_linux_kapi::mm::VM_FAULT_SIGBUS;
+
+        let page = VirtAddr::from(address).align_down(PAGE_SIZE_4K);
+        if address < vma.vm_start as usize
+            || address >= vma.vm_end as usize
+            || vma.vm_start >= vma.vm_end
+            || vma.vm_flags & tk_linux_kapi::mm::VM_SHARED == 0
+            || tk_linux_kapi::mm::is_cow_mapping(vma.vm_flags)
+        {
+            return VM_FAULT_SIGBUS;
+        }
+        let Some(area) = self.areas.find(page) else {
+            return VM_FAULT_SIGBUS;
+        };
+        if area.start().as_usize() != vma.vm_start as usize
+            || area.end().as_usize() != vma.vm_end as usize
+        {
+            return VM_FAULT_SIGBUS;
+        }
+        let Some((ops, _, pgoff, backing_paddr)) =
+            area.backend().shared_mmap_page_info(page.as_usize())
+        else {
+            return VM_FAULT_SIGBUS;
+        };
+        if !unsafe { ops.matches_vma(vma) }
+            || pgoff != vma.vm_pgoff as usize + (page.as_usize() - vma.vm_start as usize) / PAGE_SIZE_4K
+            || pfn.checked_mul(PAGE_SIZE_4K) != Some(backing_paddr)
+        {
+            return VM_FAULT_SIGBUS;
+        }
+
+        let mut read_flags = area.flags()
+            | area
+                .backend()
+                .shared_immutable_mapping_flags()
+                .unwrap_or(MappingFlags::empty());
+        read_flags -= MappingFlags::WRITE;
+        if area.flags().contains(MappingFlags::WRITE) {
+            // x86 has no write-only leaf PTE; a writable VMA's hardware
+            // encoding includes READ even when the Linux protection mask did
+            // not request it.
+            read_flags |= MappingFlags::READ;
+        }
+        let read_flags = super::backend::page_table_flags(read_flags);
+        match self.pt.query(page) {
+            Ok((mapped, _, PageSize::Size4K)) if mapped.as_usize() == backing_paddr => {
+                if !area.flags().contains(MappingFlags::WRITE)
+                    || vma.vm_flags & tk_linux_kapi::mm::VM_WRITE == 0
+                {
+                    return tk_linux_kapi::mm::VM_FAULT_NOPAGE;
+                }
+                let write_flags = super::backend::page_table_flags(
+                    area.flags()
+                        | area
+                            .backend()
+                            .shared_immutable_mapping_flags()
+                            .unwrap_or(MappingFlags::empty()),
+                );
+                if self
+                    .pt
+                    .cursor()
+                    .remap(page, mapped, write_flags)
+                    .is_err()
+                {
+                    return VM_FAULT_SIGBUS;
+                }
+            }
+            Err(PagingError::NotMapped) => {
+                if self
+                    .pt
+                    .cursor()
+                    .map(
+                        page,
+                        PhysAddr::from(backing_paddr),
+                        PageSize::Size4K,
+                        read_flags,
+                    )
+                    .is_err()
+                {
+                    return VM_FAULT_SIGBUS;
+                }
+            }
+            _ => return VM_FAULT_SIGBUS,
+        }
+        drop(self.synchronize_tlb_after_mutation());
+        tk_linux_kapi::mm::VM_FAULT_NOPAGE
+    }
+
+    pub(crate) fn prepare_shared_mmap_fault(
+        &self,
+        vaddr: VirtAddr,
+        access_flags: PageFaultFlags,
+    ) -> AxResult<Option<SharedMmapFaultPlan>> {
+        let Some(area) = self.areas.find(vaddr) else {
+            return Ok(None);
+        };
+        let Some((ops, page_index, pgoff, paddr)) = area
+            .backend()
+            .shared_mmap_page_info(vaddr.align_down(PAGE_SIZE_4K).as_usize())
+        else {
+            return Ok(None);
+        };
+        if !area.flags().contains(access_flags) {
+            return Ok(None);
+        }
+        let page = vaddr.align_down(PAGE_SIZE_4K);
+        let write = access_flags.contains(MappingFlags::WRITE);
+        let (needs_fault, needs_mkwrite) = match self.pt.query(page) {
+            Ok((mapped, flags, size)) => {
+                if size != PageSize::Size4K || mapped.as_usize() != paddr {
+                    return Err(AxError::BadAddress);
+                }
+                if present_leaf_satisfies_fault(flags, access_flags) {
+                    return Ok(None);
+                }
+                (false, write)
+            }
+            Err(PagingError::NotMapped) => (true, write),
+            Err(_) => return Err(AxError::BadAddress),
+        };
+        let area_start = area.start().as_usize();
+        let area_end = area.end().as_usize();
+        let area_pgoff = area
+            .backend()
+            .shared_mmap_page_info(area_start)
+            .map(|(_, _, pgoff, _)| pgoff)
+            .ok_or(AxError::BadAddress)?;
+        let mut vm_flags = 0;
+        if area.flags().contains(MappingFlags::READ) {
+            vm_flags |= tk_linux_kapi::mm::VM_READ;
+        }
+        if area.flags().contains(MappingFlags::WRITE) {
+            vm_flags |= tk_linux_kapi::mm::VM_WRITE;
+        }
+        if area.flags().contains(MappingFlags::EXECUTE) {
+            vm_flags |= tk_linux_kapi::mm::VM_EXEC;
+        }
+        let vma = ops.vm_area(
+            area_start as _,
+            area_end as _,
+            area_pgoff as _,
+            vm_flags,
+        );
+        Ok(Some(SharedMmapFaultPlan {
+            ops,
+            vma,
+            page,
+            page_index,
+            pgoff,
+            paddr,
+            write,
+            needs_fault,
+            needs_mkwrite,
+        }))
+    }
+
+    pub(crate) fn commit_shared_mmap_fault(
+        &mut self,
+        plan: &SharedMmapFaultPlan,
+    ) -> PageFaultResult {
+        let Some(area) = self.areas.find(plan.page) else {
+            return PageFaultResult::Handled;
+        };
+        if !area.flags().contains(if plan.write {
+            MappingFlags::WRITE
+        } else {
+            MappingFlags::READ
+        }) {
+            return PageFaultResult::Handled;
+        }
+        let Some((ops, page_index, pgoff, paddr)) =
+            area.backend().shared_mmap_page_info(plan.page.as_usize())
+        else {
+            return PageFaultResult::Handled;
+        };
+        if !Arc::ptr_eq(&ops, &plan.ops)
+            || page_index != plan.page_index
+            || pgoff != plan.pgoff
+            || paddr != plan.paddr
+        {
+            return PageFaultResult::Handled;
+        }
+        let mut flags = area.flags()
+            | area
+                .backend()
+                .shared_immutable_mapping_flags()
+                .unwrap_or(MappingFlags::empty());
+        if !plan.write {
+            flags -= MappingFlags::WRITE;
+        }
+        let flags = super::backend::page_table_flags(flags);
+        match self.pt.query(plan.page) {
+            Ok((mapped, mapped_flags, PageSize::Size4K))
+                if mapped.as_usize() == plan.paddr =>
+            {
+                if mapped_flags.contains(flags) {
+                    PageFaultResult::Handled
+                } else {
+                    let result = self
+                        .pt
+                        .cursor()
+                        .remap(plan.page, mapped, flags);
+                    match result {
+                        Ok(_) => {
+                            drop(self.synchronize_tlb_after_mutation());
+                            PageFaultResult::Handled
+                        }
+                        Err(_) => PageFaultResult::Failed(PageFaultFailure::InternalInconsistency),
+                    }
+                }
+            }
+            Err(PagingError::NotMapped) => {
+                let result = self.pt.cursor().map(
+                    plan.page,
+                    PhysAddr::from(plan.paddr),
+                    PageSize::Size4K,
+                    flags,
+                );
+                match result {
+                    Ok(()) => {
+                        drop(self.synchronize_tlb_after_mutation());
+                        PageFaultResult::Handled
+                    }
+                    Err(_) => PageFaultResult::Failed(PageFaultFailure::InternalInconsistency),
+                }
+            }
+            _ => PageFaultResult::Failed(PageFaultFailure::BackingUnavailable),
+        }
+    }
+
     pub(super) fn prepare_protect_ranges(
         &mut self,
         start: VirtAddr,

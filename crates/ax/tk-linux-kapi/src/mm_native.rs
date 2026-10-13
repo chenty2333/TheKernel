@@ -192,6 +192,30 @@ pub unsafe extern "C" fn mapping_wrprotect_range(
     unsafe { handler(mapping, pgoff, pfn, nr_pages) }
 }
 
+#[cfg(test)]
+mod shared_mmap_provider_tests {
+    use super::*;
+
+    #[test]
+    fn absent_shared_mmap_providers_fail_closed() {
+        assert_eq!(mapping_wrprotect_range_ready(), 0);
+        let mut mapping_cookie = 0u8;
+        assert_eq!(
+            unsafe {
+                mapping_wrprotect_range(
+                    core::ptr::addr_of_mut!(mapping_cookie).cast(),
+                    0,
+                    0,
+                    1,
+                )
+            },
+            -crate::config::EOPNOTSUPP,
+        );
+        let mut vma = VmAreaStruct::empty();
+        assert_eq!(unsafe { vmf_insert_pfn(&mut vma, 0, 0) }, VM_FAULT_SIGBUS);
+    }
+}
+
 /// Installs the provider behind [`current_mm`]. A second installation is
 /// refused: the provider is process-global.
 pub fn install_current_user_address_space(

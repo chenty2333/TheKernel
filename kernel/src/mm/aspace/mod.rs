@@ -55,6 +55,7 @@ pub use self::backend::*;
 pub(crate) use self::{
     alias_registry::{
         AliasLease, PendingAliasLease, SharedBackingKey, reserve_alias_mutation,
+        snapshot_all_aliases,
         wait_for_alias_publication,
     },
     mapping::{
@@ -66,6 +67,7 @@ mod addr_space;
 mod cet;
 mod clone;
 mod fault;
+pub(crate) use self::fault::SharedMmapFaultPlan;
 mod fault_types;
 mod identity;
 mod map;

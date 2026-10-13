@@ -1,5 +1,5 @@
-use alloc::{borrow::Cow, sync::Arc, vec::Vec};
-use core::ffi::c_int;
+use alloc::{boxed::Box, borrow::Cow, sync::Arc, vec::Vec};
+use core::ffi::{c_int, c_ulong, c_void};
 
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{
@@ -10,6 +10,7 @@ use axpoll::Pollable;
 use axsync::Mutex;
 use axtask::{AxTaskRef, current};
 use downcast_rs::{DowncastSync, impl_downcast};
+use kspin::SpinNoIrq;
 use linux_raw_sys::general::{
     RLIMIT_NOFILE, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, STATX_BASIC_STATS,
     STATX_BTIME, STATX_DIOALIGN, STATX_MNT_ID, stat, statx, statx_timestamp,
@@ -20,6 +21,311 @@ use super::{
     FileHandle, OfdIoStatus, add_file_like, current_fd_table, fd_table::FdTable, get_typed_file,
 };
 pub use crate::mm::SharedPages;
+use crate::mm::{DeferredMappingFinalizer, MappingFinalizer};
+use tk_linux_kapi::{
+    mm::{VmAreaStruct, VmFault, VmOperationsStruct},
+    types::Page,
+};
+
+/// LinuxKPI VM operations bound to one `SharedPages` backing for deferred
+/// framebuffer I/O. This is deliberately narrower than a general VMA hook:
+/// it is for shared 4 KiB framebuffer/GEM pages whose fault callback returns
+/// the same physical page that the core shared backing owns.
+///
+/// The fault and `page_mkwrite` callbacks run from `FaultSession` outside the
+/// owning address-space lock. `owner` keeps every pointer reachable from the
+/// VMA file/private data and operation table alive. The binding is cloned by
+/// existing backend split/fork operations; final close runs once after the
+/// last fragment is retired.
+pub struct SharedMmapOps {
+    pages: Arc<SharedPages>,
+    vm_ops: *const VmOperationsStruct,
+    vm_mm: *mut c_void,
+    vm_file: *mut tk_linux_kapi::types::File,
+    vm_private_data: *mut c_void,
+    mapping: *mut c_void,
+    vm_flags: c_ulong,
+    template_pgoff: c_ulong,
+    _cleanup: DeferredMappingFinalizer,
+    /// One LinuxKPI page reference per backing page that has faulted. The
+    /// SharedPages lease pins the physical frame; these references additionally
+    /// keep `struct page` identities cached by fbdev valid until final close.
+    page_refs: Arc<SpinNoIrq<Vec<usize>>>,
+}
+
+// SAFETY: the cleanup finalizer pins raw file/context pointers through the
+// last callback and the cached page-reference vector is spinlock protected.
+unsafe impl Send for SharedMmapOps {}
+// SAFETY: callbacks may run concurrently and serialize their own state; all
+// mutable page-reference metadata is protected by `page_refs`.
+unsafe impl Sync for SharedMmapOps {}
+
+struct SharedMmapCleanup {
+    vm_ops: *const VmOperationsStruct,
+    vm_file: *mut tk_linux_kapi::types::File,
+    vm_mm: *mut c_void,
+    vm_private_data: *mut c_void,
+    vm_flags: c_ulong,
+    template_start: c_ulong,
+    template_end: c_ulong,
+    template_pgoff: c_ulong,
+    owner: Arc<dyn core::any::Any + Send + Sync>,
+    page_refs: Arc<SpinNoIrq<Vec<usize>>>,
+}
+
+// SAFETY: the callback table is immutable and cached page refs are protected
+// by a spinlock; finalization runs once in task context.
+unsafe impl Send for SharedMmapCleanup {}
+unsafe impl Sync for SharedMmapCleanup {}
+
+impl MappingFinalizer for SharedMmapCleanup {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn finalize(self: Box<Self>) {
+        let mut vma = VmAreaStruct::empty();
+        vma.vm_start = self.template_start;
+        vma.vm_end = self.template_end;
+        vma.vm_mm = self.vm_mm;
+        vma.vm_page_prot = unsafe { tk_linux_kapi::mm::vm_get_page_prot(self.vm_flags) };
+        vma.vm_flags = self.vm_flags;
+        vma.vm_ops = self.vm_ops;
+        vma.vm_pgoff = self.template_pgoff;
+        vma.vm_file = self.vm_file;
+        vma.vm_private_data = self.vm_private_data;
+        if let Some(close) = unsafe { (*self.vm_ops).close } {
+            unsafe { close(&mut vma) };
+        }
+        for page in self.page_refs.lock().drain(..) {
+            if page != 0 {
+                unsafe { tk_linux_kapi::shmem::put_page(page as *mut Page) };
+            }
+        }
+        // `owner` stays live across both close and page-reference cleanup and
+        // is released when this boxed finalizer returns to the policy worker.
+    }
+}
+
+impl SharedMmapOps {
+    /// Bind the operations installed by `fb_deferred_io_mmap()` to real
+    /// shared-page backing. The mmap callback must have acquired the one VMA
+    /// reference that its `close` callback releases.
+    ///
+    /// # Safety
+    /// `vma` must be live and initialized by the provider's mmap callback.
+    /// `owner` must keep `vm_file`, `vm_private_data`, and `vm_ops` valid until
+    /// this binding is dropped. The callback's page references must identify
+    /// pages in `pages` at the same backing offsets.
+    pub unsafe fn from_vma(
+        pages: Arc<SharedPages>,
+        vma: &VmAreaStruct,
+        owner: Arc<dyn core::any::Any + Send + Sync>,
+    ) -> AxResult<Arc<Self>> {
+        if !pages.is_fixed()
+            || pages.page_size() != axhal::paging::PageSize::Size4K
+            || vma.vm_ops.is_null()
+            || vma.vm_file.is_null()
+            || unsafe { (*vma.vm_file).f_mapping.is_null() }
+        {
+            return Err(AxError::InvalidInput);
+        }
+        let vm_ops = unsafe { &*vma.vm_ops };
+        if vma.vm_flags & tk_linux_kapi::mm::VM_SHARED == 0
+            || vm_ops.fault.is_none()
+            || (vm_ops.page_mkwrite.is_none() && vm_ops.pfn_mkwrite.is_none())
+            || vm_ops.close.is_none()
+        {
+            return Err(AxError::OperationNotSupported);
+        }
+        let mut page_refs = Vec::new();
+        page_refs
+            .try_reserve_exact(pages.len())
+            .map_err(|_| AxError::NoMemory)?;
+        page_refs.resize(pages.len(), 0);
+        let page_refs = Arc::try_new(SpinNoIrq::new(page_refs)).map_err(|_| AxError::NoMemory)?;
+        let finalizer: Box<dyn MappingFinalizer> = Box::try_new(SharedMmapCleanup {
+            vm_ops: vma.vm_ops,
+            vm_file: vma.vm_file,
+            vm_mm: vma.vm_mm,
+            vm_private_data: vma.vm_private_data,
+            vm_flags: vma.vm_flags,
+            template_start: vma.vm_start,
+            template_end: vma.vm_end,
+            template_pgoff: vma.vm_pgoff,
+            owner,
+            page_refs: page_refs.clone(),
+        })
+        .map_err(|_| AxError::NoMemory)?;
+        let cleanup = DeferredMappingFinalizer::try_new(finalizer)?;
+        Arc::try_new(Self {
+            pages,
+            vm_ops: vma.vm_ops,
+            vm_mm: vma.vm_mm,
+            vm_file: vma.vm_file,
+            vm_private_data: vma.vm_private_data,
+            mapping: unsafe { (*vma.vm_file).f_mapping },
+            vm_flags: vma.vm_flags,
+            template_pgoff: vma.vm_pgoff,
+            _cleanup: cleanup,
+            page_refs,
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+
+    pub fn pages(&self) -> &Arc<SharedPages> {
+        &self.pages
+    }
+
+    /// Stable `file->f_mapping` identity supplied by the provider. It is used
+    /// only for equality while walking SharedPages aliases; it is never
+    /// dereferenced by the core MM.
+    pub const fn mapping_cookie(&self) -> *mut c_void {
+        self.mapping
+    }
+
+    pub(crate) const fn template_pgoff(&self) -> c_ulong {
+        self.template_pgoff
+    }
+
+    pub const fn vm_flags(&self) -> c_ulong {
+        self.vm_flags
+    }
+
+    /// Checks that a callback's VMA still identifies this exact binding.
+    ///
+    /// # Safety
+    /// `vma` and its `vm_file` pointer must remain live for the check.
+    pub(crate) unsafe fn matches_vma(&self, vma: &VmAreaStruct) -> bool {
+        if vma.vm_file.is_null() {
+            return false;
+        }
+        let access_flags = tk_linux_kapi::mm::VM_READ
+            | tk_linux_kapi::mm::VM_WRITE
+            | tk_linux_kapi::mm::VM_EXEC;
+        vma.vm_ops == self.vm_ops
+            && vma.vm_mm == self.vm_mm
+            && vma.vm_private_data == self.vm_private_data
+            && unsafe { (*vma.vm_file).f_mapping == self.mapping }
+            && (vma.vm_flags & !access_flags) == (self.vm_flags & !access_flags)
+    }
+
+    pub(crate) fn vm_area(
+        &self,
+        start: c_ulong,
+        end: c_ulong,
+        pgoff: c_ulong,
+        vm_flags: c_ulong,
+    ) -> VmAreaStruct {
+        let mut vma = VmAreaStruct::empty();
+        vma.vm_start = start;
+        vma.vm_end = end;
+        vma.vm_mm = self.vm_mm;
+        let access_flags = tk_linux_kapi::mm::VM_READ
+            | tk_linux_kapi::mm::VM_WRITE
+            | tk_linux_kapi::mm::VM_EXEC;
+        vma.vm_flags = (vm_flags & access_flags) | (self.vm_flags & !access_flags);
+        vma.vm_page_prot = unsafe { tk_linux_kapi::mm::vm_get_page_prot(vma.vm_flags) };
+        vma.vm_ops = self.vm_ops;
+        vma.vm_pgoff = pgoff;
+        vma.vm_file = self.vm_file;
+        vma.vm_private_data = self.vm_private_data;
+        vma
+    }
+
+    pub(crate) unsafe fn call_fault(&self, fault: &mut VmFault) -> u32 {
+        let Some(callback) = (unsafe { (*self.vm_ops).fault }) else {
+            return tk_linux_kapi::mm::VM_FAULT_SIGBUS;
+        };
+        unsafe { callback(fault) }
+    }
+
+    pub(crate) unsafe fn call_page_mkwrite(&self, fault: &mut VmFault) -> u32 {
+        let Some(callback) = (unsafe { (*self.vm_ops).page_mkwrite }) else {
+            return tk_linux_kapi::mm::VM_FAULT_SIGBUS;
+        };
+        unsafe { callback(fault) }
+    }
+
+    pub(crate) unsafe fn call_pfn_mkwrite(&self, fault: &mut VmFault) -> u32 {
+        let Some(callback) = (unsafe { (*self.vm_ops).pfn_mkwrite }) else {
+            return tk_linux_kapi::mm::VM_FAULT_SIGBUS;
+        };
+        unsafe { callback(fault) }
+    }
+
+    pub(crate) fn has_page_mkwrite(&self) -> bool {
+        unsafe { (*self.vm_ops).page_mkwrite.is_some() }
+    }
+
+    /// Takes ownership of the page reference returned by a fault callback,
+    /// caches one stable `struct page` identity per backing index, and returns
+    /// a temporary reference for the current callback/PTE commit.
+    pub(crate) fn retain_fault_page(
+        &self,
+        index: usize,
+        page: *mut Page,
+        expected_paddr: usize,
+    ) -> AxResult<SharedMmapPageRef> {
+        if page.is_null() || index >= self.pages.len() {
+            if !page.is_null() {
+                unsafe { tk_linux_kapi::shmem::put_page(page) };
+            }
+            return Err(AxError::BadAddress);
+        }
+        if unsafe { tk_linux_kapi::shmem::try_page_to_phys(page) } != Some(expected_paddr) {
+            unsafe { tk_linux_kapi::shmem::put_page(page) };
+            return Err(AxError::BadAddress);
+        }
+        let mut refs = self.page_refs.lock();
+        if refs[index] == 0 {
+            // Transfer the callback's reference to the VMA lifetime, and take
+            // a second one for the in-flight callback/PTE publication.
+            refs[index] = page as usize;
+            unsafe { tk_linux_kapi::shmem::get_page(page) };
+            Ok(SharedMmapPageRef(page as usize))
+        } else if refs[index] == page as usize {
+            // The callback returned a fresh reference to the same registered
+            // page; use it now and retain the original until final close.
+            Ok(SharedMmapPageRef(page as usize))
+        } else {
+            unsafe { tk_linux_kapi::shmem::put_page(page) };
+            Err(AxError::BadAddress)
+        }
+    }
+
+    pub(crate) fn cached_page(&self, index: usize) -> Option<SharedMmapPageRef> {
+        let refs = self.page_refs.lock();
+        let page = *refs.get(index)?;
+        if page == 0 {
+            return None;
+        }
+        let page = page as *mut Page;
+        unsafe { tk_linux_kapi::shmem::get_page(page) };
+        Some(SharedMmapPageRef(page as usize))
+    }
+}
+
+/// Temporary LinuxKPI page reference held across a fault callback and PTE
+/// installation. The mapping binding separately keeps one page reference
+/// alive until final VMA close for fbdev's retained page-ref entries.
+pub(crate) struct SharedMmapPageRef(usize);
+
+impl SharedMmapPageRef {
+    pub(crate) fn page(&self) -> *mut Page {
+        self.0 as *mut Page
+    }
+
+    pub(crate) fn paddr(&self) -> usize {
+        unsafe { tk_linux_kapi::shmem::page_to_phys(self.page()) }
+    }
+}
+
+impl Drop for SharedMmapPageRef {
+    fn drop(&mut self) {
+        unsafe { tk_linux_kapi::shmem::put_page(self.page()) };
+    }
+}
 use crate::{
     async_operation::AsyncOperation,
     mm::{AddrSpace, UserMemoryCapability},
@@ -518,6 +824,7 @@ impl FixedSharedMmapRegion {
             may_protect: self.may_protect,
             retain_description: self.retain_description,
             mapping_lifetime: None,
+            shared_mmap_ops: None,
             excludes_fork_and_dump: false,
             cpu_cache_flags: axhal::paging::MappingFlags::empty(),
         }))
@@ -567,6 +874,7 @@ pub struct PreparedFileMmap {
     may_protect: FileMmapProtection,
     retain_description: bool,
     mapping_lifetime: Option<Arc<dyn core::any::Any + Send + Sync>>,
+    shared_mmap_ops: Option<Arc<SharedMmapOps>>,
     excludes_fork_and_dump: bool,
 }
 
@@ -587,6 +895,25 @@ impl PreparedFileMmap {
     pub(crate) fn with_mapping_lifetime(mut self, lease: Arc<dyn core::any::Any + Send + Sync>) -> Self {
         self.mapping_lifetime = Some(lease);
         self
+    }
+
+    /// Attaches the real framebuffer/GEM VM operations to this fixed shared
+    /// backing. The callbacks and `SharedPages` must name the same physical
+    /// object; PRIVATE mappings and non-4 KiB pages are deliberately refused.
+    pub fn with_shared_mmap_ops(mut self, ops: Arc<SharedMmapOps>) -> AxResult<Self> {
+        if self.request.sharing != FileMmapSharing::Shared
+            || self.request.page_size != axhal::paging::PageSize::Size4K as usize
+            || !Arc::ptr_eq(&self.pages, ops.pages())
+            || self.shared_mmap_ops.is_some()
+        {
+            return Err(AxError::InvalidInput);
+        }
+        self.shared_mmap_ops = Some(ops);
+        Ok(self)
+    }
+
+    pub(crate) fn take_shared_mmap_ops(&mut self) -> Option<Arc<SharedMmapOps>> {
+        self.shared_mmap_ops.take()
     }
     pub(crate) fn with_excluded_fork_and_dump(mut self) -> Self {
         self.excludes_fork_and_dump = true;

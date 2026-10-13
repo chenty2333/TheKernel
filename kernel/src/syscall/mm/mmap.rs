@@ -533,6 +533,10 @@ enum PreparedFileMmapBackend {
         max_size: usize,
     },
     DeviceSharedPages(Arc<SharedPages>),
+    DeviceSharedPagesWithOps {
+        pages: Arc<SharedPages>,
+        ops: Arc<crate::file::SharedMmapOps>,
+    },
 }
 
 fn prepare_file_mmap_backend(
@@ -597,6 +601,22 @@ fn prepare_file_mmap_backend(
                     Ok(PreparedFileMmapBackend::DeviceSharedPages(pages))
                 }
                 DeviceMmap::SharedPages(_) => Err(AxError::InvalidInput),
+                DeviceMmap::SharedPagesWithOps { pages, ops } if offset == 0 => {
+                    validate_device_mmap_length(
+                        length,
+                        pages
+                            .len()
+                            .checked_mul(PAGE_SIZE_4K)
+                            .ok_or(AxError::InvalidInput)?,
+                    )?;
+                    if !Arc::ptr_eq(&pages, ops.pages()) || !pages.is_fixed()
+                        || pages.page_size() != PageSize::Size4K
+                    {
+                        return Err(AxError::InvalidInput);
+                    }
+                    Ok(PreparedFileMmapBackend::DeviceSharedPagesWithOps { pages, ops })
+                }
+                DeviceMmap::SharedPagesWithOps { .. } => Err(AxError::InvalidInput),
                 DeviceMmap::Cache(cache) => Ok(PreparedFileMmapBackend::SharedFile {
                     cache,
                     flags: inner.flags(),
@@ -638,6 +658,7 @@ fn prepare_file_mmap_backend(
                     Ok(PreparedFileMmapBackend::DeviceSharedPages(pages))
                 }
                 Some(DeviceMmap::SharedPages(_)) => Err(AxError::InvalidInput),
+                Some(DeviceMmap::SharedPagesWithOps { .. }) => Err(AxError::InvalidInput),
                 Some(DeviceMmap::ReadOnly | DeviceMmap::Cache(_)) | None => {
                     Ok(PreparedFileMmapBackend::Cow {
                         file_end: Some(inner.location().len()?),
@@ -1223,7 +1244,10 @@ pub fn sys_mmap(
     // old VMA, while the wait for a THP mutation remains lock-external.
     let prepared_anonymous_shared_pages = match prepared_file_backend.as_ref() {
         Some(PreparedFileMmapBackend::SharedAnonymous { pages, .. })
-        | Some(PreparedFileMmapBackend::DeviceSharedPages(pages)) => Some(pages.clone()),
+        | Some(PreparedFileMmapBackend::DeviceSharedPages(pages))
+        | Some(PreparedFileMmapBackend::DeviceSharedPagesWithOps { pages, .. }) => {
+            Some(pages.clone())
+        }
         None if matches!(map_type, MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE) => Some(
             Arc::try_new(SharedPages::new_shmem(length, page_size)?)
                 .map_err(|_| AxError::NoMemory)?,
@@ -1446,6 +1470,9 @@ pub fn sys_mmap(
                     }) => Backend::new_linear(start, physical_start, max_size),
                     Some(PreparedFileMmapBackend::DeviceSharedPages(pages)) => {
                         Backend::new_shared(start, pages)
+                    }
+                    Some(PreparedFileMmapBackend::DeviceSharedPagesWithOps { pages, ops }) => {
+                        Backend::new_shared(start, pages).with_shared_mmap_ops(ops)?
                     }
                     None if matches!(map_type, MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE) => {
                         Backend::new_shared(

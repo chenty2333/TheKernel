@@ -12,7 +12,7 @@ use memory_addr::PhysAddrRange;
 
 use super::{SimpleFs, SimpleFsNode};
 use crate::{
-    file::{DescriptionResource, FileLike, IoctlContext},
+    file::{DescriptionResource, FileLike, IoctlContext, SharedMmapOps},
     mm::SharedPages,
 };
 
@@ -49,6 +49,13 @@ pub enum DeviceMmap {
     /// Maps fixed pages owned by a DRM/GEM object.  Unlike `Physical`, this
     /// preserves scatter-gather backing rather than pretending it is linear.
     SharedPages(Arc<SharedPages>),
+    /// Shared framebuffer/GEM pages with a real LinuxKPI fault/write-fault
+    /// adapter. The sidecar follows the core VMA through fork/split/unmap and
+    /// owns the callback context until final close.
+    SharedPagesWithOps {
+        pages: Arc<SharedPages>,
+        ops: Arc<SharedMmapOps>,
+    },
     /// The device is read-only and will be mapped as CoW.
     ReadOnly,
     /// Maps to a cached file.
