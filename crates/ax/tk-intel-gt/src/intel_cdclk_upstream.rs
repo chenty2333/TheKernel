@@ -21,9 +21,15 @@ use crate::intel_display_wa_upstream::{
 use crate::intel_global_state_types_upstream::{
     IntelGlobalObj, IntelGlobalState, IntelGlobalStateFuncs,
 };
-use crate::intel_display_types_upstream::{IntelAtomicState, IntelCrtc};
+use crate::intel_display_types_upstream::{
+    IntelAtomicState, IntelCrtc, IntelCrtcState, IntelDigitalPort, IntelEncoder,
+    INTEL_OUTPUT_DDI, INTEL_OUTPUT_DP, INTEL_OUTPUT_EDP,
+};
 use crate::linux_i915_private::DrmI915Private;
-use crate::intel_pch_types_upstream::{PCH_CNP, PCH_DG1, PCH_ICP, PCH_MTL};
+use crate::intel_pch_types_upstream::{PCH_CNP, PCH_DG1, PCH_MTL};
+use tk_drm_upstream::drm_atomic_types::{DrmCrtcsState};
+use tk_drm_upstream::drm_crtc_types::DrmCrtcState;
+use tk_drm_upstream::drm_encoder_types::DrmEncoder;
 use crate::intel_de_upstream::{
     intel_de_read, intel_de_rmw, intel_de_wait_for_clear_ms, intel_de_wait_for_set_ms,
     intel_de_write,
@@ -44,9 +50,26 @@ unsafe extern "C" {
         state: *mut IntelAtomicState,
         obj: *mut IntelGlobalObj,
     ) -> *mut IntelGlobalState;
+    fn intel_atomic_get_old_global_obj_state(
+        state: *mut IntelAtomicState,
+        obj: *mut IntelGlobalObj,
+    ) -> *mut IntelGlobalState;
+    fn intel_atomic_get_new_global_obj_state(
+        state: *mut IntelAtomicState,
+        obj: *mut IntelGlobalObj,
+    ) -> *mut IntelGlobalState;
     fn intel_atomic_lock_global_state(state: *mut IntelGlobalState) -> i32;
+    fn intel_atomic_serialize_global_state(state: *mut IntelGlobalState) -> i32;
     fn intel_any_crtc_needs_modeset(state: *mut IntelAtomicState) -> bool;
     fn intel_crtc_wait_for_next_vblank(crtc: *mut IntelCrtc);
+    fn intel_dbuf_bw_calc_min_cdclk(state: *mut IntelAtomicState, need_calc: *mut bool) -> i32;
+    fn intel_dbuf_bw_min_cdclk(display: *mut IntelDisplay, dbuf_state: *mut c_void) -> i32;
+    fn intel_dbuf_state_set_mdclk_cdclk_ratio(state: *mut IntelAtomicState, ratio: i32) -> i32;
+    fn intel_modeset_all_pipes_late(state: *mut IntelAtomicState, reason: *const i8) -> i32;
+    fn intel_crtc_bw_min_cdclk(state: *const IntelCrtcState) -> i32;
+    fn intel_crtc_for_pipe(display: *mut IntelDisplay, pipe: Pipe) -> *mut IntelCrtc;
+    fn intel_atomic_get_crtc_state(state: *mut tk_drm_upstream::drm_atomic_types::DrmAtomicCommit,
+                                   crtc: *mut IntelCrtc) -> *mut IntelCrtcState;
 }
 
 #[repr(C)]
@@ -63,11 +86,12 @@ struct IntelCdclkVals {
 struct IntelCdclkFuncs {
     get_cdclk: Option<unsafe extern "C" fn(*mut IntelDisplay, *mut IntelCdclkConfig)>,
     set_cdclk: Option<unsafe extern "C" fn(*mut IntelDisplay, *const IntelCdclkConfig, Pipe)>,
+    modeset_calc_cdclk: Option<unsafe extern "C" fn(*mut IntelAtomicState) -> i32>,
     calc_voltage_level: Option<unsafe extern "C" fn(i32) -> u8>,
 }
 
 #[repr(C)]
-struct IntelCdclkState {
+pub struct IntelCdclkState {
     base: IntelGlobalState,
     logical: IntelCdclkConfig,
     actual: IntelCdclkConfig,
@@ -80,6 +104,8 @@ struct IntelCdclkState {
     active_pipes: u8,
     disable_pipes: bool,
 }
+
+const _: () = assert!(core::mem::size_of::<IntelCdclkState>() == 112);
 
 const ADLP_A_STEP_CDCLK_TABLE: [IntelCdclkVals; 10] = [
     vals(19_200, 307_200, 32),
@@ -151,11 +177,13 @@ fn voltage_level(cdclk: i32, max: &[i32]) -> u8 {
 static TGL_CDCLK_FUNCS: IntelCdclkFuncs = IntelCdclkFuncs {
     get_cdclk: Some(bxt_get_cdclk),
     set_cdclk: Some(bxt_set_cdclk),
+    modeset_calc_cdclk: Some(bxt_modeset_calc_cdclk),
     calc_voltage_level: Some(tgl_calc_voltage_level),
 };
 static RPLU_CDCLK_FUNCS: IntelCdclkFuncs = IntelCdclkFuncs {
     get_cdclk: Some(bxt_get_cdclk),
     set_cdclk: Some(bxt_set_cdclk),
+    modeset_calc_cdclk: Some(bxt_modeset_calc_cdclk),
     calc_voltage_level: Some(rplu_calc_voltage_level),
 };
 
@@ -570,7 +598,9 @@ unsafe extern "C" fn bxt_set_cdclk(display: *mut IntelDisplay, config: *const In
 }
 
 // upstream: intel_cdclk.c intel_update_cdclk()
-unsafe fn intel_update_cdclk(display: *mut IntelDisplay) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_update_cdclk(display: *mut IntelDisplay) {
+    if display.is_null() { return; }
     intel_cdclk_get_cdclk(display, ptr::addr_of_mut!((*display).cdclk.hw));
     if (*display).platform._anon_0_0.bitmap[0] & (1u64 << 20) != 0
         || (*display).platform._anon_0_0.bitmap[0] & (1u64 << 27) != 0
@@ -579,8 +609,26 @@ unsafe fn intel_update_cdclk(display: *mut IntelDisplay) {
     }
 }
 
+// upstream: intel_cdclk.c intel_mdclk_cdclk_ratio()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_mdclk_cdclk_ratio(
+    display: *mut IntelDisplay,
+    config: *const IntelCdclkConfig,
+) -> i32 {
+    if display.is_null() || config.is_null() { return 2; }
+    if DISPLAY_VER(display) >= 20 {
+        if (*config).cdclk == 0 { return 0; }
+        ((*config).vco.saturating_add((*config).cdclk - 1) / (*config).cdclk) as i32
+    } else {
+        2
+    }
+}
+
 unsafe fn bxt_sanitize_cdclk(display: *mut IntelDisplay) {
     intel_update_cdclk(display);
+    if (*display).cdclk.max_cdclk_freq == 0 {
+        intel_update_max_cdclk(display);
+    }
     let hw = (*display).cdclk.hw;
     if hw.vco == 0 || hw.cdclk == hw.bypass {
         (*display).cdclk.hw.cdclk = 0;
@@ -794,6 +842,12 @@ static CDCLK_GLOBAL_FUNCS: IntelGlobalStateFuncs = IntelGlobalStateFuncs {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_cdclk_init(display: *mut IntelDisplay) -> i32 {
     if display.is_null() { return -crate::linux_config::EINVAL; }
+    if !platform_alderlake_p(display)
+        || (*display).cdclk.funcs.is_null()
+        || (*display).cdclk.table.is_null()
+    {
+        return -crate::linux_config::ENODEV;
+    }
     let state = tk_linux_kapi::memory::kzalloc_obj::<IntelCdclkState>();
     if state.is_null() { return -crate::linux_config::ENOMEM; }
     (*state).pipe = INVALID_PIPE;
@@ -806,8 +860,654 @@ pub unsafe extern "C" fn intel_cdclk_init(display: *mut IntelDisplay) -> i32 {
     0
 }
 
-// Keep the legacy placeholder module's public ABI while replacing every B3e
-// body with the real translation. This avoids churn in other display batches.
+unsafe fn display_from_atomic(state: *mut IntelAtomicState) -> *mut IntelDisplay {
+    if state.is_null() || (*state).base.dev.is_null() || (*(*state).base.dev).dev_private.is_null() {
+        return ptr::null_mut();
+    }
+    (*(*(*state).base.dev).dev_private.cast::<DrmI915Private>()).display.cast::<IntelDisplay>()
+}
+
+unsafe fn crtc_count(state: *mut IntelAtomicState) -> usize {
+    if state.is_null() || (*state).base.dev.is_null() { return 0; }
+    (*(*state).base.dev).mode_config.num_crtc.max(0) as usize
+}
+
+unsafe fn cdclk_state_for_global(state: *mut IntelGlobalState) -> *mut IntelCdclkState {
+    state.cast::<IntelCdclkState>()
+}
+
+unsafe fn old_cdclk_state(state: *mut IntelAtomicState) -> *const IntelCdclkState {
+    let display = display_from_atomic(state);
+    if display.is_null() { return ptr::null(); }
+    intel_atomic_get_old_global_obj_state(state, ptr::addr_of_mut!((*display).cdclk.obj))
+        .cast::<IntelCdclkState>()
+}
+
+unsafe fn new_cdclk_state(state: *mut IntelAtomicState) -> *mut IntelCdclkState {
+    let display = display_from_atomic(state);
+    if display.is_null() { return ptr::null_mut(); }
+    intel_atomic_get_new_global_obj_state(state, ptr::addr_of_mut!((*display).cdclk.obj))
+        .cast::<IntelCdclkState>()
+}
+
+unsafe fn drm_crtc_needs_modeset(state: *const DrmCrtcState) -> bool {
+    !state.is_null() && ((*state).mode_changed() || (*state).active_changed() || (*state).connectors_changed())
+}
+
+unsafe fn intel_crtc_needs_modeset(state: *const IntelCrtcState) -> bool {
+    !state.is_null() && drm_crtc_needs_modeset(ptr::addr_of!((*state).uapi))
+}
+
+unsafe fn for_each_atomic_crtc(state: *mut IntelAtomicState, mut f: impl FnMut(*mut IntelCrtc, *mut DrmCrtcsState)) {
+    if state.is_null() || (*state).base.crtcs.is_null() { return; }
+    let crtcs = (*state).base.crtcs;
+    for index in 0..crtc_count(state) {
+        let entry = crtcs.add(index);
+        if !(*entry).ptr.is_null() {
+            f((*entry).ptr.cast::<IntelCrtc>(), entry);
+        }
+    }
+}
+
+unsafe fn calc_enabled_pipes(state: *mut IntelAtomicState, mut enabled: u8) -> u8 {
+    for_each_atomic_crtc(state, |crtc, entry| unsafe {
+        let new = (*entry).new_state.cast::<IntelCrtcState>();
+        if new.is_null() || (*crtc).pipe < 0 || (*crtc).pipe >= I915_MAX_PIPES { return; }
+        let bit = 1u8 << (*crtc).pipe;
+        if (*new).hw.enable { enabled |= bit; } else { enabled &= !bit; }
+    });
+    enabled
+}
+
+unsafe fn calc_active_pipes(state: *mut IntelAtomicState, mut active: u8) -> u8 {
+    for_each_atomic_crtc(state, |crtc, entry| unsafe {
+        let new = (*entry).new_state.cast::<IntelCrtcState>();
+        if new.is_null() || (*crtc).pipe < 0 || (*crtc).pipe >= I915_MAX_PIPES { return; }
+        let bit = 1u8 << (*crtc).pipe;
+        if (*new).hw.active { active |= bit; } else { active &= !bit; }
+    });
+    active
+}
+
+unsafe fn any_crtc_enable_changed(state: *mut IntelAtomicState) -> bool {
+    let mut changed = false;
+    for_each_atomic_crtc(state, |_crtc, entry| unsafe {
+        let old = (*entry).old_state.cast::<IntelCrtcState>();
+        let new = (*entry).new_state.cast::<IntelCrtcState>();
+        if !old.is_null() && !new.is_null() && (*old).hw.enable != (*new).hw.enable { changed = true; }
+    });
+    changed
+}
+
+unsafe fn any_crtc_active_changed(state: *mut IntelAtomicState) -> bool {
+    let mut changed = false;
+    for_each_atomic_crtc(state, |_crtc, entry| unsafe {
+        let old = (*entry).old_state.cast::<IntelCrtcState>();
+        let new = (*entry).new_state.cast::<IntelCrtcState>();
+        if !old.is_null() && !new.is_null() && (*old).hw.active != (*new).hw.active { changed = true; }
+    });
+    changed
+}
+
+// upstream: intel_cdclk.c intel_atomic_get_cdclk_state()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_atomic_get_cdclk_state(state: *mut IntelAtomicState) -> *mut IntelCdclkState {
+    let display = display_from_atomic(state);
+    if display.is_null() { return ERR_PTR!(-crate::linux_config::EINVAL); }
+    let global = intel_atomic_get_global_obj_state(state, ptr::addr_of_mut!((*display).cdclk.obj));
+    if crate::linux_config::IS_ERR(global) { return global.cast::<IntelCdclkState>(); }
+    if global.is_null() { return ERR_PTR!(-crate::linux_config::ENOMEM); }
+    cdclk_state_for_global(global)
+}
+
+// upstream: intel_cdclk.c intel_cdclk_is_decreasing_later()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_is_decreasing_later(state: *mut IntelAtomicState) -> bool {
+    let old = old_cdclk_state(state);
+    let new = new_cdclk_state(state);
+    !old.is_null() && !new.is_null() && !(*new).disable_pipes && (*new).actual.cdclk < (*old).actual.cdclk
+}
+
+// Pixels per CDCLK and max pixel throughput budget in percent. ADL-P is
+// DISPLAY_VER 13, so its eDP/legacy-specific branches are compiled out.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_ppc(display: *mut IntelDisplay, double_wide: bool) -> i32 {
+    if DISPLAY_VER(display) >= 10 || double_wide { 2 } else { 1 }
+}
+
+unsafe fn intel_cdclk_guardband(display: *mut IntelDisplay) -> i32 {
+    if DISPLAY_VER(display) >= 9 { 100 } else { 90 }
+}
+
+fn div_round_up(numerator: i32, denominator: i32) -> i32 {
+    if denominator <= 0 { 0 } else { numerator.saturating_add(denominator - 1) / denominator }
+}
+
+fn required_min_cdclk(force: i32, dbuf: i32, pipes: &[i32], max_cdclk: i32) -> Option<i32> {
+    let min_cdclk = pipes.iter().copied().fold(force.max(dbuf), i32::max);
+    (min_cdclk <= max_cdclk).then_some(min_cdclk)
+}
+
+fn actual_uses_forced_clock(active_pipes: u8) -> bool { active_pipes == 0 }
+
+fn can_crawl_config(has_crawl: bool, a: &IntelCdclkConfig, b: &IntelCdclkConfig) -> bool {
+    let a_div = round_closest(a.vco, a.cdclk);
+    let b_div = round_closest(b.vco, b.cdclk);
+    has_crawl && a.vco != 0 && b.vco != 0 && a.vco != u32::MAX
+        && a.vco != b.vco && a_div == b_div && a.r#ref == b.r#ref
+}
+
+fn can_cd2x_update_config(has_cd2x_update: bool, has_squash: bool, a: &IntelCdclkConfig, b: &IntelCdclkConfig) -> bool {
+    has_cd2x_update && !has_squash && a.cdclk != b.cdclk && a.vco != 0
+        && a.vco == b.vco && a.r#ref == b.r#ref
+}
+
+fn actual_config_for_pipes(active_pipes: u8, logical: IntelCdclkConfig, forced: IntelCdclkConfig) -> IntelCdclkConfig {
+    if actual_uses_forced_clock(active_pipes) { forced } else { logical }
+}
+
+unsafe fn pixel_rate_to_cdclk(state: *const IntelCrtcState, pixel_rate: i32) -> i32 {
+    if state.is_null() || (*state).uapi.crtc.is_null() { return 0; }
+    let crtc = (*state).uapi.crtc.cast::<IntelCrtc>();
+    let display = if (*crtc).base.dev.is_null() || (*(*crtc).base.dev).dev_private.is_null() {
+        ptr::null_mut()
+    } else {
+        (*(*(*crtc).base.dev).dev_private.cast::<DrmI915Private>()).display.cast::<IntelDisplay>()
+    };
+    if display.is_null() { return 0; }
+    div_round_up(pixel_rate.saturating_mul(100), intel_cdclk_guardband(display) * intel_cdclk_ppc(display, (*state).double_wide))
+}
+
+unsafe fn planes_min_cdclk(state: *const IntelCrtcState) -> i32 {
+    if state.is_null() || (*state).uapi.crtc.is_null() { return 0; }
+    let crtc = (*state).uapi.crtc.cast::<IntelCrtc>();
+    let mask = (*crtc).plane_ids_mask;
+    let mut min_cdclk = 0;
+    for plane_id in 0..8 {
+        if mask & (1 << plane_id) != 0 {
+            min_cdclk = min_cdclk.max((*state).plane_min_cdclk[plane_id]);
+        }
+    }
+    min_cdclk
+}
+
+// upstream: intel_cdclk.c intel_crtc_min_cdclk()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_crtc_min_cdclk(state: *const IntelCrtcState) -> i32 {
+    if state.is_null() || !(*state).hw.enable { return 0; }
+    let pixel = pixel_rate_to_cdclk(state, (*state).pixel_rate as i32);
+    let bandwidth = intel_crtc_bw_min_cdclk(state);
+    // FBC, audio, VDSC, HSW IPS, and VLV DSI are excluded by this batch's
+    // ADL-P bring-up configuration; DP/HDMI and plane scaling remain active.
+    pixel.max(bandwidth).max(planes_min_cdclk(state))
+}
+
+unsafe fn update_crtc_min_cdclk(
+    state: *mut IntelAtomicState,
+    crtc: *mut IntelCrtc,
+    mut old_min: i32,
+    new_min: i32,
+    need_calc: *mut bool,
+) -> i32 {
+    if crtc.is_null() || (*crtc).pipe < 0 || (*crtc).pipe >= I915_MAX_PIPES {
+        return -crate::linux_config::EINVAL;
+    }
+    if old_min == new_min { return 0; }
+    let allow_decrease = intel_any_crtc_needs_modeset(state);
+    if !allow_decrease && new_min < old_min { return 0; }
+    let cdclk = intel_atomic_get_cdclk_state(state);
+    if crate::linux_config::IS_ERR(cdclk) { return crate::linux_config::PTR_ERR(cdclk); }
+    old_min = (*cdclk).min_cdclk[(*crtc).pipe as usize];
+    if new_min == old_min || (!allow_decrease && new_min < old_min) { return 0; }
+    (*cdclk).min_cdclk[(*crtc).pipe as usize] = new_min;
+    let ret = intel_atomic_lock_global_state(ptr::addr_of_mut!((*cdclk).base));
+    if ret != 0 { return ret; }
+    *need_calc = true;
+    0
+}
+
+unsafe fn update_crtc_min_voltage_level(
+    state: *mut IntelAtomicState,
+    crtc: *mut IntelCrtc,
+    old_min: u8,
+    new_min: u8,
+    need_calc: *mut bool,
+) -> i32 {
+    if crtc.is_null() || (*crtc).pipe < 0 || (*crtc).pipe >= I915_MAX_PIPES {
+        return -crate::linux_config::EINVAL;
+    }
+    if old_min == new_min { return 0; }
+    let allow_decrease = intel_any_crtc_needs_modeset(state);
+    if !allow_decrease && new_min < old_min { return 0; }
+    let cdclk = intel_atomic_get_cdclk_state(state);
+    if crate::linux_config::IS_ERR(cdclk) { return crate::linux_config::PTR_ERR(cdclk); }
+    let pipe = (*crtc).pipe as usize;
+    let old_min = (*cdclk).min_voltage_level[pipe];
+    if new_min == old_min || (!allow_decrease && new_min < old_min) { return 0; }
+    (*cdclk).min_voltage_level[pipe] = new_min;
+    let ret = intel_atomic_lock_global_state(ptr::addr_of_mut!((*cdclk).base));
+    if ret != 0 { return ret; }
+    *need_calc = true;
+    0
+}
+
+unsafe fn compute_min_cdclk(state: *mut IntelAtomicState) -> i32 {
+    let display = display_from_atomic(state);
+    let cdclk = new_cdclk_state(state);
+    if display.is_null() || cdclk.is_null() { return -crate::linux_config::EINVAL; }
+    match required_min_cdclk(
+        (*cdclk).force_min_cdclk,
+        (*cdclk).dbuf_bw_min_cdclk,
+        &(*cdclk).min_cdclk,
+        (*display).cdclk.max_cdclk_freq as i32,
+    ) {
+        Some(min_cdclk) => min_cdclk,
+        None => {
+            let min_cdclk = (*cdclk).min_cdclk.iter().copied().fold((*cdclk).force_min_cdclk.max((*cdclk).dbuf_bw_min_cdclk), i32::max);
+        drm_err!(&(*display).drm, "required cdclk ({}) exceeds max ({})\n", min_cdclk, (*display).cdclk.max_cdclk_freq);
+            -crate::linux_config::EINVAL
+        }
+    }
+}
+
+unsafe fn compute_min_voltage_level(state: *mut IntelAtomicState) -> i32 {
+    let cdclk = new_cdclk_state(state);
+    if cdclk.is_null() { return -crate::linux_config::EINVAL; }
+    let mut error = 0;
+    for_each_atomic_crtc(state, |crtc, entry| unsafe {
+        if error != 0 { return; }
+        let crtc_state = (*entry).new_state.cast::<IntelCrtcState>();
+        if crtc_state.is_null() || (*crtc).pipe < 0 || (*crtc).pipe >= I915_MAX_PIPES { return; }
+        let pipe = (*crtc).pipe as usize;
+        let min_level = if (*crtc_state).hw.enable { (*crtc_state).min_voltage_level } else { 0 };
+        if (*cdclk).min_voltage_level[pipe] != min_level {
+            (*cdclk).min_voltage_level[pipe] = min_level;
+            let ret = intel_atomic_lock_global_state(ptr::addr_of_mut!((*cdclk).base));
+            if ret != 0 { error = ret; }
+        }
+    });
+    if error != 0 { return error; }
+    let mut min_level = 0u8;
+    for pipe in 0..I915_MAX_PIPES as usize { min_level = min_level.max((*cdclk).min_voltage_level[pipe]); }
+    min_level as i32
+}
+
+unsafe extern "C" fn bxt_modeset_calc_cdclk(state: *mut IntelAtomicState) -> i32 {
+    let display = display_from_atomic(state);
+    let cdclk_state = new_cdclk_state(state);
+    if display.is_null() || cdclk_state.is_null() { return -crate::linux_config::EINVAL; }
+    let min_cdclk = compute_min_cdclk(state);
+    if min_cdclk < 0 { return min_cdclk; }
+    let min_voltage_level = compute_min_voltage_level(state);
+    if min_voltage_level < 0 { return min_voltage_level; }
+
+    let cdclk = bxt_calc_cdclk(display, min_cdclk);
+    let vco = bxt_calc_cdclk_pll_vco(display, cdclk);
+    (*cdclk_state).logical.vco = vco;
+    (*cdclk_state).logical.cdclk = cdclk;
+    (*cdclk_state).logical.voltage_level = min_voltage_level.max(intel_cdclk_calc_voltage_level(display, cdclk) as i32) as u8;
+
+    let forced = if actual_uses_forced_clock((*cdclk_state).active_pipes) {
+        let actual_cdclk = bxt_calc_cdclk(display, (*cdclk_state).force_min_cdclk);
+        let mut forced = (*cdclk_state).logical;
+        forced.vco = bxt_calc_cdclk_pll_vco(display, actual_cdclk);
+        forced.cdclk = actual_cdclk;
+        forced.voltage_level = intel_cdclk_calc_voltage_level(display, actual_cdclk);
+        forced
+    } else {
+        (*cdclk_state).logical
+    };
+    (*cdclk_state).actual = actual_config_for_pipes((*cdclk_state).active_pipes, (*cdclk_state).logical, forced);
+    0
+}
+
+unsafe fn cdclk_can_crawl(display: *mut IntelDisplay, a: &IntelCdclkConfig, b: &IntelCdclkConfig) -> bool {
+    can_crawl_config(has_cdclk_crawl(display), a, b)
+}
+
+unsafe fn cdclk_can_cd2x_update(display: *mut IntelDisplay, a: &IntelCdclkConfig, b: &IntelCdclkConfig) -> bool {
+    can_cd2x_update_config(DISPLAY_VER(display) >= 10, has_cdclk_squash(display), a, b)
+}
+
+unsafe fn cdclk_need_serialize(a: &IntelCdclkState, b: &IntelCdclkState) -> bool {
+    cdclk_changed(&a.actual, &b.actual)
+}
+
+unsafe fn modeset_calc_cdclk(state: *mut IntelAtomicState) -> i32 {
+    let display = display_from_atomic(state);
+    let new = intel_atomic_get_cdclk_state(state);
+    if crate::linux_config::IS_ERR(new) { return crate::linux_config::PTR_ERR(new); }
+    let old = old_cdclk_state(state);
+    if display.is_null() || old.is_null() { return -crate::linux_config::EINVAL; }
+    let funcs = (*display).cdclk.funcs.cast::<IntelCdclkFuncs>();
+    let Some(calc) = (!funcs.is_null()).then(|| (*funcs).modeset_calc_cdclk).flatten() else {
+        return -crate::linux_config::ENODEV;
+    };
+    let ret = calc(state);
+    if ret != 0 { return ret; }
+
+    let changed_actual = cdclk_need_serialize(&*old, &*new);
+    if changed_actual {
+        let ret = intel_atomic_serialize_global_state(ptr::addr_of_mut!((*new).base));
+        if ret != 0 { return ret; }
+    } else if intel_cdclk_clock_changed(ptr::addr_of!( (*old).logical), ptr::addr_of!((*new).logical))
+        || (*old).logical.voltage_level != (*new).logical.voltage_level
+    {
+        let ret = intel_atomic_lock_global_state(ptr::addr_of_mut!((*new).base));
+        if ret != 0 { return ret; }
+    } else {
+        return 0;
+    }
+
+    let mut pipe = INVALID_PIPE;
+    if (*new).active_pipes.count_ones() == 1 && cdclk_can_cd2x_update(display, &(*old).actual, &(*new).actual) {
+        pipe = (*new).active_pipes.trailing_zeros() as Pipe;
+        let crtc = intel_crtc_for_pipe(display, pipe);
+        if crtc.is_null() { return -crate::linux_config::EINVAL; }
+        let crtc_state = intel_atomic_get_crtc_state(ptr::addr_of_mut!((*state).base), crtc);
+        if crtc_state.is_null() || crate::linux_config::IS_ERR(crtc_state) {
+            return if crtc_state.is_null() { -crate::linux_config::EINVAL } else { crate::linux_config::PTR_ERR(crtc_state) };
+        }
+        if intel_crtc_needs_modeset(crtc_state) { pipe = INVALID_PIPE; }
+    }
+
+    if cdclk_can_crawl(display, &(*old).actual, &(*new).actual) {
+        // Crawl can update with active pipes; no full modeset required.
+    } else if pipe != INVALID_PIPE {
+        (*new).pipe = pipe;
+    } else if intel_cdclk_clock_changed(ptr::addr_of!((*old).actual), ptr::addr_of!((*new).actual)) {
+        let ret = intel_modeset_all_pipes_late(state, c"CDCLK change".as_ptr());
+        if ret != 0 { return ret; }
+        (*new).disable_pipes = true;
+    }
+
+    // On ADL-P the MDCLK source is CD2XCLK, so the ratio remains 2 and the
+    // Xe2-only DBUF ratio programming branch is unreachable.
+    0
+}
+
+unsafe fn cdclk_modeset_checks(state: *mut IntelAtomicState, need_calc: *mut bool) -> i32 {
+    let display = display_from_atomic(state);
+    if display.is_null() { return -crate::linux_config::EINVAL; }
+    if !any_crtc_enable_changed(state) && !any_crtc_active_changed(state) { return 0; }
+    let new = intel_atomic_get_cdclk_state(state);
+    if crate::linux_config::IS_ERR(new) { return crate::linux_config::PTR_ERR(new); }
+    let old = old_cdclk_state(state);
+    if old.is_null() { return -crate::linux_config::EINVAL; }
+    (*new).enabled_pipes = calc_enabled_pipes(state, (*old).enabled_pipes);
+    (*new).active_pipes = calc_active_pipes(state, (*old).active_pipes);
+    let ret = intel_atomic_lock_global_state(ptr::addr_of_mut!((*new).base));
+    if ret != 0 { return ret; }
+    if ((*old).active_pipes == 0) != ((*new).active_pipes == 0) { *need_calc = true; }
+    0
+}
+
+unsafe fn crtcs_calc_min_cdclk(state: *mut IntelAtomicState, need_calc: *mut bool) -> i32 {
+    let mut error = 0;
+    for_each_atomic_crtc(state, |crtc, entry| unsafe {
+        if error != 0 { return; }
+        let old = (*entry).old_state.cast::<IntelCrtcState>();
+        let new = (*entry).new_state.cast::<IntelCrtcState>();
+        if old.is_null() || new.is_null() { error = -crate::linux_config::EINVAL; return; }
+        error = update_crtc_min_cdclk(state, crtc, (*old).min_cdclk, (*new).min_cdclk, need_calc);
+        if error == 0 {
+            error = update_crtc_min_voltage_level(state, crtc, (*old).min_voltage_level, (*new).min_voltage_level, need_calc);
+        }
+    });
+    error
+}
+
+// upstream: intel_cdclk.c intel_cdclk_atomic_check()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_atomic_check(state: *mut IntelAtomicState) -> i32 {
+    if display_from_atomic(state).is_null() { return -crate::linux_config::EINVAL; }
+    let mut need_calc = false;
+    let ret = cdclk_modeset_checks(state, &mut need_calc);
+    if ret != 0 { return ret; }
+    let ret = crtcs_calc_min_cdclk(state, &mut need_calc);
+    if ret != 0 { return ret; }
+    let ret = intel_dbuf_bw_calc_min_cdclk(state, &mut need_calc);
+    if ret != 0 { return ret; }
+    let old = old_cdclk_state(state);
+    let new = new_cdclk_state(state);
+    if !old.is_null() && !new.is_null() && (*old).force_min_cdclk != (*new).force_min_cdclk {
+        let ret = intel_atomic_lock_global_state(ptr::addr_of_mut!((*new).base));
+        if ret != 0 { return ret; }
+        need_calc = true;
+    }
+    if need_calc { modeset_calc_cdclk(state) } else { 0 }
+}
+
+// upstream: intel_cdclk.c intel_cdclk_state_set_joined_mbus()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_state_set_joined_mbus(state: *mut IntelAtomicState, joined: bool) -> i32 {
+    let display = display_from_atomic(state);
+    if display.is_null() { return -crate::linux_config::EINVAL; }
+    if DISPLAY_VER(display) < 20 && joined { return -crate::linux_config::EOPNOTSUPP; }
+    let new = intel_atomic_get_cdclk_state(state);
+    if crate::linux_config::IS_ERR(new) { return crate::linux_config::PTR_ERR(new); }
+    (*new).actual.joined_mbus = joined;
+    (*new).logical.joined_mbus = joined;
+    intel_atomic_lock_global_state(ptr::addr_of_mut!((*new).base))
+}
+
+unsafe fn set_cdclk(display: *mut IntelDisplay, config: &IntelCdclkConfig, pipe: Pipe) {
+    if display.is_null() { return; }
+    let funcs = (*display).cdclk.funcs.cast::<IntelCdclkFuncs>();
+    if funcs.is_null() {
+        drm_err!(&(*display).drm, "CDCLK programming is unsupported on this display\n");
+        return;
+    }
+    if let Some(set) = (*funcs).set_cdclk { set(display, config, pipe); }
+}
+
+unsafe fn for_each_dp_encoder(display: *mut IntelDisplay, mut f: impl FnMut(*mut IntelEncoder)) {
+    if display.is_null() || (*display).drm.is_null() { return; }
+    let head = ptr::addr_of_mut!((*(*display).drm).mode_config.encoder_list);
+    let mut node = (*head).next;
+    let encoder_head_offset = core::mem::offset_of!(IntelEncoder, base)
+        + core::mem::offset_of!(DrmEncoder, head);
+    while !node.is_null() && node != head {
+        let encoder = node.cast::<u8>().sub(encoder_head_offset).cast::<IntelEncoder>();
+        let output_type = (*encoder).r#type;
+        let dp_port = encoder.cast::<IntelDigitalPort>();
+        let has_dp_aux = output_type == INTEL_OUTPUT_DP
+            || output_type == INTEL_OUTPUT_EDP
+            || (output_type == INTEL_OUTPUT_DDI && (*dp_port).dp.output_reg.reg != 0);
+        if has_dp_aux { f(encoder); }
+        node = (*node).next;
+    }
+}
+
+// The BXT/ADL-P source path pauses optional eDP PSR and HDA audio before the
+// PLL sequence. This configured batch excludes both subsystems; serialize the
+// always-built GMBUS client around the write sequence.
+unsafe fn intel_set_cdclk(display: *mut IntelDisplay, config: &IntelCdclkConfig, pipe: Pipe) {
+    if display.is_null() || !cdclk_changed(&(*display).cdclk.hw, config) { return; }
+    // ADL-P's eDP PSR and HDA audio support are compile-time excluded here,
+    // but every DP-capable encoder's AUX timing is CDCLK-derived.
+    tk_linux_kapi::mutex::mutex_lock(ptr::addr_of_mut!((*display).gmbus.mutex));
+    for_each_dp_encoder(display, |encoder| unsafe {
+        let dp = ptr::addr_of_mut!((*encoder.cast::<IntelDigitalPort>()).dp);
+        tk_linux_kapi::mutex::mutex_lock(ptr::addr_of_mut!((*dp).aux.hw_mutex));
+    });
+    set_cdclk(display, config, pipe);
+    for_each_dp_encoder(display, |encoder| unsafe {
+        let dp = ptr::addr_of_mut!((*encoder.cast::<IntelDigitalPort>()).dp);
+        tk_linux_kapi::mutex::mutex_unlock(ptr::addr_of_mut!((*dp).aux.hw_mutex));
+    });
+    tk_linux_kapi::mutex::mutex_unlock(ptr::addr_of_mut!((*display).gmbus.mutex));
+}
+
+unsafe fn cdclk_dump_config(display: *mut IntelDisplay, config: &IntelCdclkConfig, prefix: &str) {
+    if !display.is_null() {
+        drm_dbg!(&(*display).drm, "{}: CDCLK {} kHz VCO {} kHz ref {} kHz bypass {} kHz voltage {}\n",
+                 prefix, config.cdclk, config.vco, config.r#ref, config.bypass, config.voltage_level);
+    }
+}
+
+// upstream: intel_cdclk.c intel_cdclk_dump_config()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_dump_config(display: *mut IntelDisplay, config: *const IntelCdclkConfig, context: *const i8) {
+    if display.is_null() || config.is_null() { return; }
+    let prefix = if context.is_null() { "CDCLK" } else { "CDCLK configuration" };
+    cdclk_dump_config(display, &*config, prefix);
+}
+
+unsafe fn cdclk_changed(a: &IntelCdclkConfig, b: &IntelCdclkConfig) -> bool {
+    intel_cdclk_clock_changed(a, b) || a.voltage_level != b.voltage_level
+}
+
+// upstream: intel_cdclk.c intel_set_cdclk_pre_plane_update()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_set_cdclk_pre_plane_update(state: *mut IntelAtomicState) {
+    let display = display_from_atomic(state);
+    let old = old_cdclk_state(state);
+    let new = new_cdclk_state(state);
+    if display.is_null() || old.is_null() || new.is_null() || !cdclk_changed(&(*old).actual, &(*new).actual) { return; }
+    let (mut config, pipe) = if (*new).disable_pipes {
+        ((*new).actual, INVALID_PIPE)
+    } else if (*new).actual.cdclk >= (*old).actual.cdclk {
+        ((*new).actual, (*new).pipe)
+    } else {
+        ((*old).actual, INVALID_PIPE)
+    };
+    if !(*new).disable_pipes { config.voltage_level = config.voltage_level.max((*old).actual.voltage_level).max((*new).actual.voltage_level); }
+    config.joined_mbus = (*old).actual.joined_mbus;
+    intel_set_cdclk(display, &config, pipe);
+}
+
+// upstream: intel_cdclk.c intel_set_cdclk_post_plane_update()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_set_cdclk_post_plane_update(state: *mut IntelAtomicState) {
+    let display = display_from_atomic(state);
+    let old = old_cdclk_state(state);
+    let new = new_cdclk_state(state);
+    if display.is_null() || old.is_null() || new.is_null() || !cdclk_changed(&(*old).actual, &(*new).actual) { return; }
+    let pipe = if !(*new).disable_pipes && (*new).actual.cdclk < (*old).actual.cdclk { (*new).pipe } else { INVALID_PIPE };
+    intel_set_cdclk(display, &(*new).actual, pipe);
+}
+
+// upstream: intel_cdclk.c intel_cdclk_update_hw_state()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_update_hw_state(display: *mut IntelDisplay) {
+    if display.is_null() || (*display).cdclk.obj.state.is_null() { return; }
+    let state = (*display).cdclk.obj.state.cast::<IntelCdclkState>();
+    (*state).enabled_pipes = 0;
+    (*state).active_pipes = 0;
+    let head = ptr::addr_of_mut!((*display).pipe_list);
+    let mut node = (*head).next;
+    while !node.is_null() && node != head {
+        let offset = core::mem::offset_of!(IntelCrtc, pipe_head);
+        let crtc = node.cast::<u8>().sub(offset).cast::<IntelCrtc>();
+        let crtc_state = (*crtc).base.state.cast::<IntelCrtcState>();
+        let pipe = (*crtc).pipe;
+        if !crtc_state.is_null() && pipe >= 0 && pipe < I915_MAX_PIPES {
+            if (*crtc_state).hw.enable { (*state).enabled_pipes |= 1 << pipe; }
+            if (*crtc_state).hw.active { (*state).active_pipes |= 1 << pipe; }
+            (*state).min_cdclk[pipe as usize] = (*crtc_state).min_cdclk;
+            (*state).min_voltage_level[pipe as usize] = (*crtc_state).min_voltage_level;
+        }
+        node = (*node).next;
+    }
+    (*state).dbuf_bw_min_cdclk = intel_dbuf_bw_min_cdclk(display, (*display).dbuf_bw.obj.state.cast());
+}
+
+// upstream: intel_cdclk.c intel_cdclk_crtc_disable_noatomic()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_crtc_disable_noatomic(crtc: *mut IntelCrtc) {
+    if crtc.is_null() || (*crtc).base.dev.is_null() || (*(*crtc).base.dev).dev_private.is_null() { return; }
+    let display = (*(*(*crtc).base.dev).dev_private.cast::<DrmI915Private>()).display.cast::<IntelDisplay>();
+    intel_cdclk_update_hw_state(display);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_logical(state: *const IntelCdclkState) -> i32 { if state.is_null() { 0 } else { (*state).logical.cdclk as i32 } }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_actual(state: *const IntelCdclkState) -> i32 { if state.is_null() { 0 } else { (*state).actual.cdclk as i32 } }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_actual_voltage_level(state: *const IntelCdclkState) -> i32 { if state.is_null() { 0 } else { (*state).actual.voltage_level as i32 } }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_min_cdclk(state: *const IntelCdclkState, pipe: Pipe) -> i32 {
+    if state.is_null() || pipe < 0 || pipe >= I915_MAX_PIPES { 0 } else { (*state).min_cdclk[pipe as usize] }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_force_min_cdclk(state: *mut IntelCdclkState, min_cdclk: i32) {
+    if !state.is_null() { (*state).force_min_cdclk = min_cdclk; }
+}
+
+// upstream: intel_cdclk.c intel_cdclk_pmdemand_needs_update()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_pmdemand_needs_update(state: *mut IntelAtomicState) -> bool {
+    let old = old_cdclk_state(state);
+    let new = new_cdclk_state(state);
+    !old.is_null() && !new.is_null()
+        && ((*old).actual.cdclk != (*new).actual.cdclk
+            || (*old).actual.voltage_level != (*new).actual.voltage_level)
+}
+
+unsafe fn calc_cdclk_for_crtc(state: *const IntelCrtcState, min_cdclk: i32) -> i32 {
+    if state.is_null() || (*state).uapi.crtc.is_null() { return 0; }
+    let crtc = (*state).uapi.crtc.cast::<IntelCrtc>();
+    let display = if (*crtc).base.dev.is_null() || (*(*crtc).base.dev).dev_private.is_null() {
+        ptr::null_mut()
+    } else {
+        (*(*(*crtc).base.dev).dev_private.cast::<DrmI915Private>()).display.cast::<IntelDisplay>()
+    };
+    if display.is_null() || !platform_alderlake_p(display) { return 0; }
+    bxt_calc_cdclk(display, min_cdclk) as i32
+}
+
+unsafe fn cdclk_prefill_adjustment(state: *const IntelCrtcState, clock: u32, min_cdclk: i32) -> u32 {
+    let display = if state.is_null() || (*state).uapi.crtc.is_null() {
+        ptr::null_mut()
+    } else {
+        let crtc = (*state).uapi.crtc.cast::<IntelCrtc>();
+        if (*crtc).base.dev.is_null() || (*(*crtc).base.dev).dev_private.is_null() { ptr::null_mut() }
+        else { (*(*(*crtc).base.dev).dev_private.cast::<DrmI915Private>()).display.cast::<IntelDisplay>() }
+    };
+    if display.is_null() { return 0; }
+    let ppc = intel_cdclk_ppc(display, (*state).double_wide) as u64;
+    let cdclk = calc_cdclk_for_crtc(state, min_cdclk) as u64;
+    if cdclk == 0 { return 0x1_0000; }
+    let numerator = (clock as u64) << 16;
+    ((numerator + ppc * cdclk - 1) / (ppc * cdclk)).min(0x1_0000) as u32
+}
+
+// upstream: intel_cdclk.c intel_cdclk_prefill_adjustment()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_prefill_adjustment(state: *const IntelCrtcState) -> u32 {
+    intel_cdclk_prefill_adjustment_worst(state)
+}
+
+// upstream: intel_cdclk.c intel_cdclk_prefill_adjustment_worst()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_prefill_adjustment_worst(state: *const IntelCrtcState) -> u32 {
+    if state.is_null() { return 0; }
+    let clock = (*state).hw.pipe_mode.crtc_clock as u32;
+    let min_cdclk = pixel_rate_to_cdclk(state, clock as i32);
+    cdclk_prefill_adjustment(state, clock, min_cdclk)
+}
+
+// upstream: intel_cdclk.c intel_cdclk_min_cdclk_for_prefill()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_cdclk_min_cdclk_for_prefill(
+    state: *const IntelCrtcState,
+    prefill_lines_unadjusted: u32,
+    prefill_lines_available: u32,
+) -> i32 {
+    if state.is_null() || (*state).uapi.crtc.is_null() || prefill_lines_available == 0 { return 0; }
+    let crtc = (*state).uapi.crtc.cast::<IntelCrtc>();
+    if (*crtc).base.dev.is_null() || (*(*crtc).base.dev).dev_private.is_null() { return 0; }
+    let display = (*(*(*crtc).base.dev).dev_private.cast::<DrmI915Private>()).display.cast::<IntelDisplay>();
+    if display.is_null() { return 0; }
+    let ppc = intel_cdclk_ppc(display, (*state).double_wide) as u64;
+    let clock = (*state).hw.pipe_mode.crtc_clock as u64;
+    let numerator = clock.saturating_mul(prefill_lines_unadjusted as u64);
+    let denominator = ppc * prefill_lines_available as u64;
+    if denominator == 0 { 0 } else { (numerator.saturating_add(denominator - 1) / denominator).min(i32::MAX as u64) as i32 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,5 +1543,31 @@ mod tests {
                 CdclkTransitionStep::Readback,
             ]
         );
+    }
+
+    #[test]
+    fn atomic_floor_rejects_unachievable_dbuf_or_pipe_requirement() {
+        assert_eq!(required_min_cdclk(176_000, 312_000, &[0, 480_000, 552_000, 0], 652_800), Some(552_000));
+        assert_eq!(required_min_cdclk(0, 0, &[0, 700_000, 0, 0], 652_800), None);
+    }
+
+    #[test]
+    fn adlp_atomic_transitions_select_crawl_or_cd2x_and_dpms_actual_clock() {
+        let old = IntelCdclkConfig {
+            cdclk: 552_000, vco: 1_104_000, r#ref: 24_000,
+            bypass: 12_000, voltage_level: 2, joined_mbus: false, _pad_18: [0; 2],
+        };
+        let crawl = IntelCdclkConfig { cdclk: 648_000, vco: 1_296_000, ..old };
+        let divider_only = IntelCdclkConfig { cdclk: 312_000, ..old };
+        let changed_divider = IntelCdclkConfig { cdclk: 648_000, vco: 1_944_000, ..old };
+        let voltage_only = IntelCdclkConfig { voltage_level: 3, ..old };
+        assert!(can_crawl_config(true, &old, &crawl));
+        assert!(!can_crawl_config(true, &old, &changed_divider));
+        assert!(can_cd2x_update_config(true, false, &old, &divider_only));
+        assert!(!can_cd2x_update_config(true, true, &old, &divider_only));
+        assert!(unsafe { cdclk_changed(&old, &voltage_only) });
+        assert!(!unsafe { intel_cdclk_clock_changed(&old, &voltage_only) });
+        assert_eq!(actual_config_for_pipes(0, old, divider_only).cdclk, divider_only.cdclk);
+        assert_eq!(actual_config_for_pipes(1, old, divider_only).cdclk, old.cdclk);
     }
 }
