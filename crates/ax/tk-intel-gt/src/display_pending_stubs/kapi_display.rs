@@ -128,3 +128,30 @@ pub unsafe extern "C" fn hypervisor_is_type(_type_: u32) -> bool {
 // upstream: drivers/gpu/drm/drm_atomic_helper.c drm_atomic_helper_shutdown()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_atomic_helper_shutdown(_dev: *mut DrmDevice) {}
+
+// Mock PCI dev pointer for ISA bridge scan in tests
+static MOCK_ISA_BRIDGE: core::sync::atomic::AtomicPtr<crate::intel_quirks_upstream::PciDev> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+pub unsafe fn set_mock_isa_bridge(dev: *mut crate::intel_quirks_upstream::PciDev) {
+    MOCK_ISA_BRIDGE.store(dev, core::sync::atomic::Ordering::SeqCst);
+}
+
+// upstream: drivers/pci/search.c pci_get_class()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pci_get_class(
+    class: u32,
+    from: *mut crate::intel_quirks_upstream::PciDev,
+) -> *mut crate::intel_quirks_upstream::PciDev {
+    if from.is_null() {
+        let dev = MOCK_ISA_BRIDGE.load(core::sync::atomic::Ordering::SeqCst);
+        if !dev.is_null() && (((*dev).class >> 8) == (class >> 8) || class == (0x0601 << 8)) {
+            return dev;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+// upstream: drivers/pci/pci-driver.c pci_dev_put()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pci_dev_put(_dev: *mut crate::intel_quirks_upstream::PciDev) {}

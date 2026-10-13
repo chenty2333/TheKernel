@@ -8,9 +8,7 @@
 
 use crate::intel_display_core_types_upstream::IntelDisplay;
 
-// upstream: intel_pch.c intel_pch_detect()
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_pch_detect(_display: *mut IntelDisplay) {}
+pub use crate::intel_pch_upstream::intel_pch_detect;
 
 // upstream: intel_display_power.c intel_display_power_init()
 #[unsafe(no_mangle)]
