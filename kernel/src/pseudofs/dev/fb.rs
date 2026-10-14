@@ -643,7 +643,7 @@ struct DisplayCore {
     /// Kept separate from `DisplayCore` in the worker: the worker holds only
     /// this queue plus a Weak, never a strong reference while idle.
     refresh: alloc::sync::Arc<WaitQueue>,
-    /// Serializes driver flushes with explicit fsync/FBIOPAN publication.
+    /// Serializes fbcon drawing with driver flushes and explicit publication.
     commit: Mutex<()>,
 }
 
@@ -775,6 +775,11 @@ pub(crate) fn fbcon_draw(draw: impl FnOnce(&FbconFrame) -> bool) {
     else {
         return;
     };
+    // A software scanout copies this RAM while presenting. Keep a repaint
+    // whole with respect to that copy instead of publishing half-written
+    // glyphs. The VT presentation gate is acquired before this mutex on both
+    // drawing and seat-transition paths.
+    let commit = display.commit.lock();
     let scanout = display.scanout.clone();
     let changed = draw(&FbconFrame {
         width: scanout.width() as usize,
@@ -784,6 +789,7 @@ pub(crate) fn fbcon_draw(draw: impl FnOnce(&FbconFrame) -> bool) {
         scanout,
         size: display.size,
     });
+    drop(commit);
     if changed {
         display.mark_full();
     }
@@ -1452,6 +1458,23 @@ mod tests {
             self.master.store(master, Ordering::Release);
             Ok(())
         }
+    }
+
+    #[test]
+    fn console_repaint_excludes_scanout_copy_until_pixels_are_complete() {
+        let _context = crate::test_support::scheduler_test_context();
+        let surface = MemorySurface::new(64, 48);
+        let core = Arc::new(DisplayCore::new(surface.clone()));
+        let previous = super::FBCON_DISPLAY.lock().replace(Arc::downgrade(&core));
+        super::fbcon_draw(|frame| {
+            assert!(core.commit.try_lock().is_none());
+            frame.glyph(0, 0, b'A', 0xffffff, 0, false)
+        });
+        *super::FBCON_DISPLAY.lock() = previous;
+        assert!(core.commit.try_lock().is_some());
+        assert_eq!(surface.presents.load(Ordering::Acquire), 0);
+        core.commit_if_needed();
+        assert_eq!(surface.presents.load(Ordering::Acquire), 1);
     }
 
     #[test]

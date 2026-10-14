@@ -17,7 +17,10 @@ use super::{
 };
 use crate::{
     mm::SharedPages,
-    pseudofs::dev::{bootfb::BootFb, scanout::ScanoutSurface},
+    pseudofs::dev::{
+        bootfb::BootFb,
+        scanout::{PixelLayout, ScanoutSurface},
+    },
 };
 
 struct RamBacking {
@@ -61,6 +64,41 @@ fn source_range(scanout: &Scanout, mode: Mode) -> DrmResult<core::ops::Range<usi
         usize::try_from(scanout.offset).map_err(|_| DrmError::Overflow)?
             ..usize::try_from(end).map_err(|_| DrmError::Overflow)?,
     )
+}
+
+/// Convert in RAM, then copy a bounded span into the aperture. In particular,
+/// do not turn a UHD frame into eight million virtual calls and tiny UC writes.
+/// The caller validates/resolves all source pages before the first write.
+fn copy_rows(
+    scanout: &Scanout,
+    layout: PixelLayout,
+    destination_pitch: usize,
+    mut read_pixel: impl FnMut(usize) -> u32,
+    mut write: impl FnMut(usize, &[u8]) -> DrmResult<()>,
+) -> DrmResult<()> {
+    if !layout.is_drawable() {
+        return Err(DrmError::Invalid);
+    }
+    let pixel_bytes = layout.bytes_per_pixel() as usize;
+    let mut batch = [0u8; 2048];
+    let pixels_per_batch = batch.len() / pixel_bytes;
+    for y in 0..scanout.height as usize {
+        let source = scanout.offset as usize + y * scanout.pitch as usize;
+        let mut x = 0;
+        while x < scanout.width as usize {
+            let count = (scanout.width as usize - x).min(pixels_per_batch);
+            for pixel in 0..count {
+                let color = read_pixel(source + (x + pixel) * 4);
+                layout.encode_into(color, &mut batch[pixel * pixel_bytes..][..pixel_bytes]);
+            }
+            write(
+                y * destination_pitch + x * pixel_bytes,
+                &batch[..count * pixel_bytes],
+            )?;
+            x += count;
+        }
+    }
+    Ok(())
 }
 
 impl DisplayAdapter for LinearAdapter {
@@ -131,27 +169,28 @@ impl DisplayAdapter for LinearAdapter {
             );
         }
         let _copy = self.copy.lock();
-        let destination_pixel = self.surface.pixel_layout().bytes_per_pixel() as usize;
-        for y in 0..scanout.height as usize {
-            let start = range.start + y * scanout.pitch as usize;
-            for x in 0..scanout.width as usize {
-                let offset = start + x * 4;
+        copy_rows(
+            &scanout,
+            self.surface.pixel_layout(),
+            self.surface.pitch() as usize,
+            |offset| {
                 // Source offsets are dword-aligned; no dword straddles a page.
                 let address = physical[offset / PAGE_SIZE_4K] + offset % PAGE_SIZE_4K;
                 // SAFETY: every page was resolved above and is retained by
                 // pages; the validated dword lies within that fixed backing.
-                let color = unsafe {
+                unsafe {
                     phys_to_virt(PhysAddr::from_usize(address))
                         .as_ptr()
                         .cast::<u32>()
                         .read()
-                };
-                self.surface.write_pixel(
-                    y * self.surface.pitch() as usize + x * destination_pixel,
-                    color,
-                );
-            }
-        }
+                }
+            },
+            |offset, bytes| {
+                self.surface
+                    .write_bytes(offset, bytes)
+                    .map_err(|_| DrmError::DeviceLost)
+            },
+        )?;
         self.surface.present().map_err(|_| DrmError::DeviceLost)?;
         Ok(Fence::new(true))
     }
@@ -233,5 +272,94 @@ mod tests {
         s = scanout();
         s.pitch = 7;
         assert_eq!(source_range(&s, mode), Err(DrmError::Invalid));
+    }
+
+    #[test]
+    fn copied_rows_preserve_crop_pitch_and_convert_before_aperture_writes() {
+        let mut s = scanout();
+        s.offset = 4092;
+        let layout = PixelLayout {
+            bits: 16,
+            red: crate::pseudofs::dev::scanout::ColorChannel {
+                position: 11,
+                size: 5,
+            },
+            green: crate::pseudofs::dev::scanout::ColorChannel {
+                position: 5,
+                size: 6,
+            },
+            blue: crate::pseudofs::dev::scanout::ColorChannel {
+                position: 0,
+                size: 5,
+            },
+        };
+        let mut source_offsets = Vec::new();
+        let mut destination = [0x55u8; 12];
+        let mut writes = 0;
+        copy_rows(
+            &s,
+            layout,
+            6,
+            |offset| {
+                source_offsets.push(offset);
+                [0x00ff0000, 0x0000ff00, 0x000000ff, 0x00ffffff][source_offsets.len() - 1]
+            },
+            |offset, bytes| {
+                destination[offset..offset + bytes.len()].copy_from_slice(bytes);
+                writes += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(source_offsets, [4092, 4096, 4108, 4112]);
+        assert_eq!(
+            destination,
+            [
+                0, 0xf8, 0xe0, 7, 0x55, 0x55, 0x1f, 0, 0xff, 0xff, 0x55, 0x55
+            ]
+        );
+        assert_eq!(writes, 2);
+    }
+
+    #[test]
+    fn uhd_copy_batches_writes_and_stops_on_destination_failure() {
+        let mut s = scanout();
+        s.offset = 0;
+        s.width = 3840;
+        s.height = 2160;
+        s.pitch = s.width * 4;
+        let mut writes = 0;
+        let mut bytes = 0;
+        copy_rows(
+            &s,
+            PixelLayout::B8G8R8A8,
+            s.pitch as usize,
+            |_| 0x00123456,
+            |_, batch| {
+                assert!(batch.len() <= 2048);
+                assert_eq!(&batch[..4], &[0x56, 0x34, 0x12, 0]);
+                writes += 1;
+                bytes += batch.len();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(writes, 8 * 2160);
+        assert_eq!(bytes, 3840 * 2160 * 4);
+        let mut attempts = 0;
+        assert_eq!(
+            copy_rows(
+                &s,
+                PixelLayout::B8G8R8A8,
+                s.pitch as usize,
+                |_| 0,
+                |_, _| {
+                    attempts += 1;
+                    Err(DrmError::DeviceLost)
+                }
+            ),
+            Err(DrmError::DeviceLost)
+        );
+        assert_eq!(attempts, 1);
     }
 }
