@@ -480,6 +480,8 @@ fn boot_progress_task() {
         // Retained for dmesg/netconsole and a still-working screen mirror. If
         // that screen itself is stuck this cannot repair it; DbC/serial is the
         // independent output path, not an unsafe overwrite of active scanout.
-        warn!("\x013{snapshot}");
+        // Waiting for PID 1 is normal operation, not an error. Keep the
+        // opt-in sample in the log without overriding the console's level.
+        info!("{snapshot}");
     }
 }

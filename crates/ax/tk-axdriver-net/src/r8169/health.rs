@@ -24,6 +24,15 @@ pub enum Reason {
     RxQuiet,
 }
 impl Reason {
+    pub fn log_level(self) -> log::Level {
+        match self {
+            Self::TxNoProgress => log::Level::Warn,
+            // An idle link is normal; do not displace the shell prompt with
+            // periodic error-priority records when no packet was expected.
+            Self::RxQuiet => log::Level::Debug,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::TxNoProgress => "tx-no-progress",
@@ -124,6 +133,11 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn idle_receive_observation_is_debug_but_stalled_transmit_remains_a_warning() {
+        assert_eq!(Reason::RxQuiet.log_level(), log::Level::Debug);
+        assert_eq!(Reason::TxNoProgress.log_level(), log::Level::Warn);
+    }
     #[test]
     fn late_first_tx_gets_a_full_age_and_reports_stop_after_three() {
         let mut m = Monitor::default();

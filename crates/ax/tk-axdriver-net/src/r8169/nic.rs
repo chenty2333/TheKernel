@@ -222,8 +222,9 @@ impl<H: Hal, B: Bus, const N: usize> RtlNic<H, B, N> {
             && unsafe { d::status(self.descriptor(false, self.tx_head)) } & d::OWN != 0;
         if let Some(reason) = self.monitor.observe(now, self.counters, owned) {
             let state = self.snapshot();
-            log::warn!(
-                "\x013RTL8168_HEALTH reason={} ms={} ChipCmd={:#04x} IntrStatus={:#06x} \
+            log::log!(
+                reason.log_level(),
+                "RTL8168_HEALTH reason={} ms={} ChipCmd={:#04x} IntrStatus={:#06x} \
                  IntrMask={:#06x} PHYstatus={:#04x} BMCR={:?} BMSR={:?} tx_head={} tx_tail={} \
                  tx_used={} tx_desc={:#010x} rx_head={} rx_desc={:#010x} rx_loans={} tx={} \
                  tx_reaped={} rx={} rx_bad={} fw_stage={} (observation, no reset)",
