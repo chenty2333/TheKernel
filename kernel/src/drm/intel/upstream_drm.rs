@@ -196,6 +196,8 @@ macro_rules! gated_display_void {
     ($name:ident, $target:path) => {
         unsafe extern "C" fn $name(display: *mut c_void) {
             if native_modeset_enabled() && !display.is_null() {
+                // SAFETY: `display` is verified non-null, native modeset is enabled, and caller
+                // provides a valid `intel_display` pointer initialized during probe.
                 unsafe { $target(display.cast()) };
             }
         }
@@ -206,6 +208,8 @@ macro_rules! gated_display_status {
     ($name:ident, $target:path) => {
         unsafe extern "C" fn $name(display: *mut c_void) -> c_int {
             if native_modeset_enabled() && !display.is_null() {
+                // SAFETY: `display` is verified non-null, native modeset is enabled, and caller
+                // provides a valid `intel_display` pointer initialized during probe.
                 unsafe { $target(display.cast()) }
             } else {
                 0
@@ -258,12 +262,14 @@ gated_display_status!(display_opregion_setup, intel_gt::intel_opregion_upstream:
 
 unsafe extern "C" fn display_suspend_late(display: *mut c_void, keep: bool) {
     if native_modeset_enabled() && !display.is_null() {
+        // SAFETY: `display` is non-null, native modeset is enabled, and caller passes a valid display pointer.
         unsafe { intel_gt::intel_display_power_upstream::intel_display_power_suspend_late(display.cast(), keep) };
     }
 }
 
 unsafe extern "C" fn display_opregion_notify(display: *mut c_void, state: u32) -> c_int {
     if native_modeset_enabled() && !display.is_null() {
+        // SAFETY: `display` is non-null, native modeset is enabled, and caller passes a valid display pointer.
         unsafe { intel_gt::intel_opregion_upstream::intel_opregion_notify_adapter(display.cast(), state) }
     } else {
         0
@@ -272,65 +278,76 @@ unsafe extern "C" fn display_opregion_notify(display: *mut c_void, state: u32) -
 
 unsafe extern "C" fn display_opregion_suspend(display: *mut c_void, state: u32) {
     if native_modeset_enabled() && !display.is_null() {
+        // SAFETY: `display` is non-null, native modeset is enabled, and caller passes a valid display pointer.
         unsafe { intel_gt::intel_opregion_upstream::intel_opregion_suspend(display.cast(), state) };
     }
 }
 
 unsafe extern "C" fn display_device_present(display: *mut c_void) -> bool {
     !display.is_null()
+        // SAFETY: `display` is verified non-null and references a valid display device.
         && unsafe { intel_gt::intel_display_device_upstream::intel_display_device_present(display.cast()) }
 }
 
 unsafe extern "C" fn display_device_remove(display: *mut c_void) {
     // This frees the complete typed object allocated by the probe, including
     // the no-display descriptor case; it must run even with native KMS off.
+    // SAFETY: `display` references the typed display object allocated during probe; releases it.
     unsafe { intel_gt::intel_display_device_upstream::intel_display_device_remove(display.cast()) };
 }
 
 unsafe extern "C" fn display_device_runtime_init(display: *mut c_void) {
     if !display.is_null() {
+        // SAFETY: `display` is verified non-null and references a valid display device structure.
         unsafe { intel_gt::intel_display_device_upstream::intel_display_device_info_runtime_init(display.cast()) };
     }
 }
 
 unsafe extern "C" fn display_mode_config_reset(drm: *mut c_void) {
     if native_modeset_enabled() && !drm.is_null() {
+        // SAFETY: `drm` is non-null, native modeset is enabled, and points to a valid `DrmDevice`.
         unsafe { tk_drm_upstream::drm_mode_config_upstream::drm_mode_config_reset(drm.cast()) };
     }
 }
 
 unsafe extern "C" fn display_atomic_shutdown(drm: *mut c_void) {
     if native_modeset_enabled() && !drm.is_null() {
+        // SAFETY: `drm` is non-null, native modeset is enabled, and points to a valid `DrmDevice`.
         unsafe { tk_drm_upstream::drm_atomic_helper_upstream::drm_atomic_helper_shutdown(drm.cast()) };
     }
 }
 
 unsafe extern "C" fn display_client_suspend(drm: *mut c_void) {
     if native_modeset_enabled() && !drm.is_null() {
+        // SAFETY: `drm` is non-null, native modeset is enabled, and points to a valid `DrmDevice`.
         unsafe { tk_drm_upstream::drm_client_event_upstream::drm_client_dev_suspend(drm.cast()) };
     }
 }
 
 unsafe extern "C" fn display_client_resume(drm: *mut c_void) {
     if native_modeset_enabled() && !drm.is_null() {
+        // SAFETY: `drm` is non-null, native modeset is enabled, and points to a valid `DrmDevice`.
         unsafe { tk_drm_upstream::drm_client_event_upstream::drm_client_dev_resume(drm.cast()) };
     }
 }
 
 unsafe extern "C" fn display_poll_disable(drm: *mut c_void) {
     if native_modeset_enabled() && !drm.is_null() {
+        // SAFETY: `drm` is non-null, native modeset is enabled, and points to a valid `DrmDevice`.
         unsafe { tk_drm_upstream::drm_probe_helper_upstream::drm_kms_helper_poll_disable(drm.cast()) };
     }
 }
 
 unsafe extern "C" fn display_poll_enable(drm: *mut c_void) {
     if native_modeset_enabled() && !drm.is_null() {
+        // SAFETY: `drm` is non-null, native modeset is enabled, and points to a valid `DrmDevice`.
         unsafe { tk_drm_upstream::drm_probe_helper_upstream::drm_kms_helper_poll_enable(drm.cast()) };
     }
 }
 
 unsafe extern "C" fn display_clock_gating_init(drm: *mut c_void) {
     if native_modeset_enabled() && !drm.is_null() {
+        // SAFETY: `drm` is non-null, native modeset is enabled, and points to a valid `DrmDevice`.
         unsafe { intel_gt::intel_clock_gating_init(drm) };
     }
 }
@@ -1264,6 +1281,7 @@ mod tests {
         let mut parent = 0u64;
         let parent = ptr::from_mut(&mut parent).cast();
         for _ in 0..2 {
+            // SAFETY: exercises devm_drm_dev_alloc_i915 and TTM lifecycle using a valid mock parent pointer.
             unsafe {
                 let mut error = 123;
                 let i915 = devm_drm_dev_alloc_i915(parent, &mut error);
@@ -1312,9 +1330,12 @@ mod tests {
     fn gt_registration_does_not_require_fastboot_primary() {
         let mut token = 0u64;
         let dev = ptr::from_mut(&mut token).cast::<c_void>();
+        // SAFETY: `dev` points to a valid local token used to test registration.
         assert_eq!(unsafe { drm_dev_register(dev, 0) }, 0);
         assert_eq!(registered_device(), Some(dev));
+        // SAFETY: idempotent re-registration of the same device pointer.
         assert_eq!(unsafe { drm_dev_register(dev, 0) }, 0);
+        // SAFETY: unregisters the test device registered above.
         unsafe { drm_dev_unregister(dev) };
         assert_eq!(registered_device(), None);
     }
@@ -1322,6 +1343,7 @@ mod tests {
     #[test]
     fn drm_allocation_rejects_missing_parent() {
         let mut error = 0;
+        // SAFETY: passes a null parent pointer and valid out-error pointer to verify graceful failure.
         assert!(unsafe { devm_drm_dev_alloc_i915(ptr::null_mut(), &mut error) }.is_null());
         assert_eq!(error, -EINVAL);
     }

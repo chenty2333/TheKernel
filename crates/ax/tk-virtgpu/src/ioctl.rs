@@ -110,10 +110,15 @@ pub(crate) unsafe extern "C" fn virtgpu_open(
     if file.is_null() {
         return -EINVAL;
     }
+    // SAFETY: Allocates kernel heap memory sized for `FilePrivate` with standard GFP_KERNEL flags.
+    // The pointer is checked for null before any dereference.
     let private = unsafe { kmalloc(size_of::<FilePrivate>(), GFP_KERNEL) }.cast::<FilePrivate>();
     if private.is_null() {
         return -ENOMEM;
     }
+    // SAFETY: `private` was allocated with `kmalloc` above, verified non-null, and points to uninitialized
+    // storage of `size_of::<FilePrivate>()`. `ptr::write` initializes it without reading or dropping old contents.
+    // `file` was validated non-null above, and DRM core open guarantees exclusive access to `file->driver_priv`.
     unsafe {
         ptr::write(
             private,
@@ -136,18 +141,27 @@ pub(crate) unsafe extern "C" fn virtgpu_postclose(
     if file.is_null() {
         return;
     }
+    // SAFETY: `file` was checked non-null above; `driver_priv` was assigned during `virtgpu_open`
+    // and DRM postclose guarantees exclusive access to the closing file.
     let private = unsafe { (*file).driver_priv.cast::<FilePrivate>() };
     if private.is_null() {
         return;
     }
-    if unsafe { (*private).context_created } {
-        let id = unsafe { (*private).context_id };
+    // SAFETY: `private` was verified non-null and points to the valid `FilePrivate` allocated during
+    // open. We safely read the context fields before freeing the allocation.
+    let (context_created, context_id) =
+        unsafe { ((*private).context_created, (*private).context_id) };
+    if context_created {
+        // SAFETY: `dev` is a valid DRM device pointer provided by DRM core during postclose.
+        // `with_device_engine` synchronizes engine access under its internal lock to submit context destruction.
         let _ = unsafe {
             with_device_engine(dev, |engine, display| {
                 if let Ok(fence) = engine.submit(
                     display,
                     GpuQueue::Control,
-                    GpuBatch::DestroyContext { context: id },
+                    GpuBatch::DestroyContext {
+                        context: context_id,
+                    },
                 ) {
                     let _ = engine.wait(display, fence, WAIT_NS);
                     let _ = engine.reap(fence);
@@ -155,7 +169,10 @@ pub(crate) unsafe extern "C" fn virtgpu_postclose(
             })
         };
     }
+    // SAFETY: `private` was allocated with `kmalloc` in `virtgpu_open` and has not been freed yet;
+    // no concurrent access exists during postclose.
     unsafe { kfree(private.cast::<c_void>()) };
+    // SAFETY: `file` was verified non-null; clear `driver_priv` to avoid dangling references.
     unsafe { (*file).driver_priv = ptr::null_mut() };
 }
 
@@ -163,6 +180,8 @@ fn file_private(file: *mut DrmFile) -> Result<*mut FilePrivate, i32> {
     if file.is_null() {
         return Err(-EINVAL);
     }
+    // SAFETY: `file` was verified non-null. `driver_priv` was initialized in `virtgpu_open`
+    // and remains valid with stable lifetime until `virtgpu_postclose`.
     let private = unsafe { (*file).driver_priv.cast::<FilePrivate>() };
     if private.is_null() {
         Err(-ENODEV)
@@ -178,18 +197,24 @@ pub(crate) unsafe extern "C" fn virtgpu_gem_open(
     if object.is_null() || file.is_null() {
         return -EINVAL;
     }
+    // SAFETY: `object` was validated non-null above; DRM core ensures it remains valid
+    // with an active reference during the gem_open callback.
     let dev = unsafe { (*object).dev };
     let fpriv = match file_private(file) {
         Ok(private) => private,
         Err(error) => return error,
     };
+    // SAFETY: `dev` is the valid `DrmDevice` pointer belonging to `object`.
+    // `with_device_engine` provides synchronized access to the engine.
     let Some(features) = (unsafe { with_device_engine(dev, |engine, _| engine.modern_features()) })
     else {
         return -ENODEV;
     };
+    // SAFETY: `fpriv` was verified non-null by `file_private` and points to valid file private state.
+    let context_created = unsafe { (*fpriv).context_created };
     if features.contains(GpuFeatures::VIRGL_3D)
         && !features.contains(GpuFeatures::CONTEXT_INIT)
-        && !unsafe { (*fpriv).context_created }
+        && !context_created
     {
         let error = ensure_context(dev, fpriv);
         if error != 0 {
@@ -203,6 +228,8 @@ pub(crate) unsafe extern "C" fn virtgpu_gem_close(object: *mut DrmGemObject, fil
     if object.is_null() || file.is_null() {
         return;
     }
+    // SAFETY: `object` was checked non-null and DRM core guarantees the GEM object pointer
+    // remains valid for the duration of the close callback.
     let dev = unsafe { (*object).dev };
     let fpriv = match file_private(file) {
         Ok(private) => private,
@@ -217,6 +244,8 @@ fn context_resource_for_gem(
     object: *mut DrmGemObject,
     attach: bool,
 ) -> i32 {
+    // SAFETY: `dev` is a valid DRM device pointer whose driver state is protected by `with_device_state`.
+    // `fpriv` and `object` are valid non-null pointers whose lifetime exceeds this synchronous operation.
     let Some(result) = (unsafe {
         with_device_state(dev, |state| {
             if !(*fpriv).context_created {
@@ -260,6 +289,8 @@ fn context_resource_ioctl(
     resource: u32,
     attach: bool,
 ) -> i32 {
+    // SAFETY: `dev` is a valid DRM device pointer. `with_device_state` acquires the device lock
+    // to synchronize queue submission to the control engine.
     let Some(result) = (unsafe {
         with_device_state(dev, |state| {
             let batch = if attach {
@@ -293,6 +324,8 @@ unsafe extern "C" fn ioctl_map(
         return -EINVAL;
     }
     let arg = data.cast::<DrmVirtgpuMap>();
+    // SAFETY: `dev`, `file`, and `arg` are verified non-null. `drm_gem_dumb_map_offset` resolves
+    // the GEM handle under the file handle table lock and writes the mmap offset into `(*arg).offset`.
     unsafe { drm_gem_dumb_map_offset(file, dev, (*arg).handle, ptr::addr_of_mut!((*arg).offset)) }
 }
 
@@ -305,6 +338,8 @@ unsafe extern "C" fn ioctl_getparam(
         return -EINVAL;
     }
     let arg = data.cast::<DrmVirtgpuGetparam>();
+    // SAFETY: `dev` is validated non-null; `with_device_engine` synchronizes access to the GPU engine
+    // to query driver features. `arg` is non-null and valid for reads of `param`.
     let result = unsafe {
         with_device_engine(dev, |engine, _| {
             let features = engine.modern_features();
@@ -341,14 +376,21 @@ unsafe extern "C" fn ioctl_getparam(
         Err(e) => e,
         Ok(None) => -ENOENT,
         Ok(Some(value)) => {
+            // SAFETY: `arg` is verified non-null and points to the kernel ioctl argument buffer.
             let address = unsafe { (*arg).value } as usize as *mut c_void;
-            if address.is_null()
-                || unsafe { copy_to_user(address, ptr::addr_of!(value).cast(), size_of::<i32>()) }
-                    != 0
-            {
+            if address.is_null() {
                 -EFAULT
             } else {
-                0
+                // SAFETY: `copy_to_user` copies `size_of::<i32>()` bytes from the local stack variable
+                // `value` to the verified non-null userspace destination `address`.
+                let ret = unsafe {
+                    copy_to_user(address, ptr::addr_of!(value).cast(), size_of::<i32>())
+                };
+                if ret != 0 {
+                    -EFAULT
+                } else {
+                    0
+                }
             }
         }
     }
@@ -362,6 +404,7 @@ unsafe extern "C" fn ioctl_resource_create(
     if data.is_null() || file.is_null() || dev.is_null() {
         return -EINVAL;
     }
+    // SAFETY: `data` is checked non-null and points to the aligned, writable ioctl argument buffer.
     let arg = unsafe { &mut *data.cast::<DrmVirtgpuResourceCreate>() };
     let size = if arg.size == 0 {
         PAGE_SIZE
@@ -376,6 +419,7 @@ unsafe extern "C" fn ioctl_resource_create(
     {
         return -EINVAL;
     }
+    // SAFETY: `dev` is validated non-null; `with_device_engine` synchronizes access to read device features.
     let Some(virgl) = (unsafe {
         with_device_engine(dev, |engine, _| {
             engine.modern_features().contains(GpuFeatures::VIRGL_3D)
@@ -426,18 +470,24 @@ unsafe extern "C" fn ioctl_resource_create(
             Err(e) => return e,
         }
     } else {
+        // SAFETY: `file` was checked non-null; DRM core looks up the GEM handle under the file's handle lock
+        // and returns a pointer with an incremented reference count if found.
         let ptr = unsafe { drm_gem_object_lookup(file, arg.bo_handle) };
         if ptr.is_null() {
             return -ENOENT;
         }
         let obj = ptr.cast::<VirtioGpuObject>();
+        // SAFETY: `ptr` is a valid, reference-counted GEM object, cast to the embedding VirtioGpuObject.
         if unsafe { (*obj).resource_id != 0 } {
+            // SAFETY: Release the lookup reference acquired above before returning error.
             unsafe {
                 drm_gem_object_put(ptr);
             }
             return -tk_linux_kapi::config::EBUSY;
         }
+        // SAFETY: `ptr` is valid and points to the base `DrmGemObject` embedded within `VirtioGpuObject`.
         if min_2d_size.is_some_and(|minimum| unsafe { (*obj).base.base.size < minimum }) {
+            // SAFETY: Release the lookup reference acquired above before returning error.
             unsafe {
                 drm_gem_object_put(ptr);
             }
@@ -445,24 +495,30 @@ unsafe extern "C" fn ioctl_resource_create(
         }
         (obj, arg.bo_handle, false)
     };
+    // SAFETY: `object` is valid and uniquely referenced or locked by the caller during creation.
     unsafe {
         (*object).format = arg.format;
     }
     let ret = if virgl {
+        // SAFETY: `object` is valid; read the pinned state.
         let pinned = unsafe { (*object).pinned };
         if !pinned {
+            // SAFETY: `object` is valid; pin its backing shmem pages into physical memory.
             let pin = unsafe { drm_gem_shmem_pin(&mut (*object).base) };
             if pin != 0 {
                 if new_object {
+                    // SAFETY: `file` is valid; clean up the newly created GEM handle on pin failure.
                     unsafe {
                         drm_gem_handle_delete(file, handle);
                     }
                 }
+                // SAFETY: Release the reference to `object` on error.
                 unsafe {
                     drm_gem_object_put(&mut (*object).base.base);
                 }
                 return pin;
             }
+            // SAFETY: `object` is valid; mark it as pinned after successful pinning.
             unsafe {
                 (*object).pinned = true;
             }
@@ -490,15 +546,19 @@ unsafe extern "C" fn ioctl_resource_create(
     };
     if ret != 0 {
         if new_object {
+            // SAFETY: `file` is valid; remove handle association if resource submission failed.
             unsafe {
                 drm_gem_handle_delete(file, handle);
             }
         }
+        // SAFETY: Release the caller's reference on error.
         unsafe {
             drm_gem_object_put(&mut (*object).base.base);
         }
         return ret;
     }
+    // SAFETY: `object` and `arg` are valid non-null pointers. Fields are populated with
+    // created resource metadata, and the initial lookup/allocation reference is released.
     unsafe {
         (*object).width = arg.width;
         (*object).height = arg.height;
@@ -522,6 +582,8 @@ fn ensure_context(
     if fpriv.is_null() {
         return -EINVAL;
     }
+    // SAFETY: `dev` is a valid DRM device pointer. `with_device_state` synchronizes access to the
+    // control queue under the device lock. `fpriv` is verified non-null and held valid by caller.
     let Some(result) = (unsafe {
         with_device_state(dev, |state| {
             if (*fpriv).context_created {
@@ -566,7 +628,10 @@ fn submit_create_3d(
     entries: Vec<(u64, u32)>,
     resource: RenderResource3D,
 ) -> i32 {
+    // SAFETY: `fpriv` is guaranteed non-null and valid by the caller.
     let context = unsafe { (*fpriv).context_id };
+    // SAFETY: `dev` is a valid DRM device pointer. `with_device_state` synchronizes device engine access.
+    // `object` points to a live `VirtioGpuObject` whose reference is held across this submission.
     let Some(result) = (unsafe {
         with_device_state(dev, |state| {
             let create = state
@@ -582,6 +647,7 @@ fn submit_create_3d(
                 .wait(&mut *state.display, create, WAIT_NS)
                 .map_err(dev_errno)?;
             let id = created.resource_id.ok_or(-EIO)?;
+            // SAFETY: Updating `object` fields under device state lock for the freshly created 3D resource.
             unsafe {
                 (*object).resource_id = id;
                 (*object).resource_kind = 3;
@@ -628,6 +694,7 @@ fn submit_create_3d(
         return -ENODEV;
     };
     match result {
+        // SAFETY: `object` is a valid, live VirtioGpuObject whose fields are committed upon success.
         Ok(id) => unsafe {
             (*object).resource_id = id;
             (*object).resource_kind = 3;
@@ -646,12 +713,16 @@ unsafe extern "C" fn ioctl_resource_info(
     if data.is_null() || file.is_null() {
         return -EINVAL;
     }
+    // SAFETY: `data` is validated non-null and points to the writable ioctl argument struct.
     let arg = unsafe { &mut *data.cast::<DrmVirtgpuResourceInfo>() };
+    // SAFETY: `file` is verified non-null. Look up GEM object under file lock with reference count increment.
     let object = unsafe { drm_gem_object_lookup(file, arg.bo_handle) };
     if object.is_null() {
         return -ENOENT;
     }
     let gpu = object.cast::<VirtioGpuObject>();
+    // SAFETY: `object` and `gpu` are valid and hold an active reference; read info into `arg`
+    // and release the lookup reference.
     unsafe {
         arg.size = (*object).size.min(u32::MAX as usize) as u32;
         arg.res_handle = (*gpu).resource_id;
@@ -666,19 +737,23 @@ unsafe extern "C" fn ioctl_transfer_to_host(
     data: *mut c_void,
     file: *mut DrmFile,
 ) -> i32 {
-    transfer_ioctl(dev, data.cast::<DrmVirtgpu3dTransferToHost>(), file, true)
+    // SAFETY: `dev`, `data`, and `file` are valid pointers supplied by the DRM ioctl dispatch core.
+    unsafe { transfer_ioctl(dev, data.cast::<DrmVirtgpu3dTransferToHost>(), file, true) }
 }
 unsafe extern "C" fn ioctl_transfer_from_host(
     dev: *mut tk_drm_upstream::drm_device_types::DrmDevice,
     data: *mut c_void,
     file: *mut DrmFile,
 ) -> i32 {
-    transfer_ioctl(
-        dev,
-        data.cast::<DrmVirtgpu3dTransferFromHost>(),
-        file,
-        false,
-    )
+    // SAFETY: `dev`, `data`, and `file` are valid pointers supplied by the DRM ioctl dispatch core.
+    unsafe {
+        transfer_ioctl(
+            dev,
+            data.cast::<DrmVirtgpu3dTransferFromHost>(),
+            file,
+            false,
+        )
+    }
 }
 
 unsafe fn transfer_ioctl(
@@ -690,15 +765,21 @@ unsafe fn transfer_ioctl(
     if arg.is_null() || file.is_null() {
         return -EINVAL;
     }
+    // SAFETY: `arg` is verified non-null and points to the transfer argument struct.
     let args = unsafe { *arg };
+    // SAFETY: `file` is verified non-null; lookup GEM object with reference count increment.
     let object = unsafe { drm_gem_object_lookup(file, args.bo_handle) };
     if object.is_null() {
         return -ENOENT;
     }
     let gpu = object.cast::<VirtioGpuObject>();
+    // SAFETY: `gpu` is valid and backed by the active GEM reference from lookup.
     let resource = unsafe { (*gpu).resource_id };
+    // SAFETY: `gpu` is valid; read resource width.
     let width = unsafe { (*gpu).width };
+    // SAFETY: `gpu` is valid; read resource height.
     let height = unsafe { (*gpu).height };
+    // SAFETY: `gpu` is valid; read resource depth.
     let depth = unsafe { (*gpu).depth };
     let b = args.box_;
     if resource == 0
@@ -711,42 +792,51 @@ unsafe fn transfer_ioctl(
             .is_none_or(|y| height != 0 && y > height)
         || b.z.checked_add(b.d).is_none_or(|z| depth != 0 && z > depth)
     {
+        // SAFETY: Release lookup reference on validation failure.
         unsafe {
             drm_gem_object_put(object);
         }
         return -EINVAL;
     }
+    // SAFETY: `gpu` points to a valid `VirtioGpuObject` with live GEM reference.
     let is_guest_only_blob = unsafe { (*gpu).is_blob && (*gpu).blob_mem == VIRTGPU_BLOB_MEM_GUEST };
     if is_guest_only_blob {
+        // SAFETY: Release lookup reference on guest-only blob rejection.
         unsafe {
             drm_gem_object_put(object);
         }
         return -EINVAL;
     }
+    // SAFETY: `dev` is a valid DRM device pointer; synchronize engine access to check features.
     let Some(virgl) = (unsafe {
         with_device_engine(dev, |engine, _| {
             engine.modern_features().contains(GpuFeatures::VIRGL_3D)
         })
     }) else {
+        // SAFETY: Release lookup reference on missing device engine.
         unsafe {
             drm_gem_object_put(object);
         }
         return -ENODEV;
     };
     if !to_host && !virgl {
+        // SAFETY: Release lookup reference on unsupported transfer from host without virgl.
         unsafe {
             drm_gem_object_put(object);
         }
         return -EOPNOTSUPP;
     }
     if !virgl && (b.z != 0 || b.d != 1) {
+        // SAFETY: Release lookup reference on invalid 2D box bounds.
         unsafe {
             drm_gem_object_put(object);
         }
         return -EINVAL;
     }
+    // SAFETY: `gpu` is valid; inspect blob memory configuration.
     let is_host3d_blob = unsafe { (*gpu).is_blob && (*gpu).blob_mem != VIRTGPU_BLOB_MEM_GUEST };
     if virgl && !is_host3d_blob && (args.stride != 0 || args.layer_stride != 0) {
+        // SAFETY: Release lookup reference on invalid non-blob stride parameters.
         unsafe {
             drm_gem_object_put(object);
         }
@@ -755,6 +845,7 @@ unsafe fn transfer_ioctl(
     let fpriv = match file_private(file) {
         Ok(p) => p,
         Err(e) => {
+            // SAFETY: Release lookup reference on file private lookup failure.
             unsafe {
                 drm_gem_object_put(object);
             }
@@ -764,6 +855,7 @@ unsafe fn transfer_ioctl(
     if virgl {
         let r = ensure_context(dev, fpriv);
         if r != 0 {
+            // SAFETY: Release lookup reference on context initialization failure.
             unsafe {
                 drm_gem_object_put(object);
             }
@@ -782,6 +874,8 @@ unsafe fn transfer_ioctl(
         stride: args.stride,
         layer_stride: args.layer_stride,
     };
+    // SAFETY: `dev` is a valid DRM device pointer; `with_device_state` locks driver state.
+    // `object` ownership is transferred to `pending_refs` upon successful queue submission.
     let Some(result) = (unsafe {
         with_device_state(dev, |state| {
             // Reserve the tracking slot before submitting: after submission the
@@ -827,6 +921,7 @@ unsafe fn transfer_ioctl(
             Ok(())
         })
     }) else {
+        // SAFETY: Release lookup reference if device state is unavailable.
         unsafe {
             drm_gem_object_put(object);
         }
@@ -835,6 +930,7 @@ unsafe fn transfer_ioctl(
     match result {
         Ok(()) => 0,
         Err(e) => {
+            // SAFETY: Release lookup reference if submission failed before reference was queued.
             unsafe {
                 drm_gem_object_put(object);
             }
@@ -851,11 +947,15 @@ unsafe extern "C" fn ioctl_wait(
     if data.is_null() || file.is_null() {
         return -EINVAL;
     }
+    // SAFETY: `data` is validated non-null and points to the aligned, writable ioctl argument struct from DRM core.
     let arg = unsafe { &*data.cast::<DrmVirtgpu3dWait>() };
+    // SAFETY: `file` was checked non-null; `drm_gem_object_lookup` acquires a reference to the GEM object under file lock.
     let object = unsafe { drm_gem_object_lookup(file, arg.handle) };
     if object.is_null() {
         return -ENOENT;
     }
+    // SAFETY: `dev` is a valid DRM device pointer; `with_device_state` synchronizes access to the device engine.
+    // `object` remains valid for the duration of this call via the reference acquired above.
     let Some(result) = (unsafe {
         with_device_state(dev, |state| {
             let gpu = object.cast::<VirtioGpuObject>();
@@ -886,12 +986,14 @@ unsafe extern "C" fn ioctl_wait(
             }
         })
     }) else {
+        // SAFETY: Release the GEM object reference acquired by `drm_gem_object_lookup` if device state lock fails.
         unsafe {
             drm_gem_object_put(object);
         }
         return -ENODEV;
     };
     let ret = result.err().unwrap_or(0);
+    // SAFETY: Release the GEM object lookup reference after wait handling completes.
     unsafe {
         drm_gem_object_put(object);
     }
@@ -906,10 +1008,12 @@ unsafe extern "C" fn ioctl_get_caps(
     if data.is_null() {
         return -EINVAL;
     }
+    // SAFETY: `data` was validated non-null above, properly aligned and sized for `DrmVirtgpuGetCaps`.
     let arg = unsafe { &*data.cast::<DrmVirtgpuGetCaps>() };
     if arg.size == 0 || arg.size > MAX_COMMAND as u32 || arg.addr == 0 {
         return -EINVAL;
     }
+    // SAFETY: `dev` is a valid DRM device pointer; `with_device_engine` provides synchronized access to the engine.
     let Some(result) = (unsafe {
         with_device_engine(dev, |engine, display| {
             let Some((_, info)) = engine.capset(arg.cap_set_id) else {
@@ -946,6 +1050,8 @@ unsafe extern "C" fn ioctl_get_caps(
         Ok(bytes) => {
             let len = bytes.len().min(arg.size as usize);
             if len != 0
+                // SAFETY: `bytes` is an owned vector with at least `len` initialized bytes. `copy_to_user`
+                // safely copies to the userspace address `arg.addr`, returning non-zero on fault.
                 && unsafe {
                     copy_to_user(arg.addr as usize as *mut c_void, bytes.as_ptr().cast(), len)
                 } != 0
@@ -966,6 +1072,7 @@ unsafe extern "C" fn ioctl_blob_create(
     if data.is_null() || file.is_null() {
         return -EINVAL;
     }
+    // SAFETY: `data` is validated non-null and points to the aligned, writable ioctl argument struct from DRM core.
     let arg = unsafe { &mut *data.cast::<DrmVirtgpuResourceCreateBlob>() };
     if arg.size == 0 || arg.blob_flags & !BLOB_USE_MASK != 0 || arg.cmd_size as usize > MAX_COMMAND
     {
@@ -977,6 +1084,7 @@ unsafe extern "C" fn ioctl_blob_create(
         VIRTGPU_BLOB_MEM_HOST3D_GUEST => BlobMem::Host3dGuest,
         _ => return -EINVAL,
     };
+    // SAFETY: `dev` is a valid DRM device pointer; `with_device_engine` provides synchronized access to read device features.
     let Some(features) = (unsafe { with_device_engine(dev, |e, _| e.modern_features()) }) else {
         return -ENODEV;
     };
@@ -1015,11 +1123,13 @@ unsafe extern "C" fn ioctl_blob_create(
         Err(e) => return e,
     };
     let entries = if mem == BlobMem::Guest || mem == BlobMem::Host3dGuest {
+        // SAFETY: `object` is a valid, freshly allocated `VirtioGpuObject`; pin its backing shmem pages into physical memory.
         let ret = unsafe { drm_gem_shmem_pin(&mut (*object).base) };
         if ret != 0 {
             drop_allocated_handle(file, object, handle);
             return ret;
         }
+        // SAFETY: `object` is valid; mark pinned status after successful page pinning.
         unsafe {
             (*object).pinned = true;
         }
@@ -1046,6 +1156,8 @@ unsafe extern "C" fn ioctl_blob_create(
             return -ENOMEM;
         }
         cmd.resize(arg.cmd_size as usize, 0);
+        // SAFETY: `cmd` is sized to `arg.cmd_size`. `copy_from_user` safely transfers bytes from
+        // userspace pointer `arg.cmd` into kernel memory.
         if unsafe {
             copy_from_user(
                 cmd.as_mut_ptr().cast(),
@@ -1068,6 +1180,8 @@ unsafe extern "C" fn ioctl_blob_create(
         },
         entries,
     };
+    // SAFETY: `dev` is a valid DRM device pointer; `with_device_state` locks driver state for queue submission.
+    // `object` is a live allocation whose lifetime extends past queue completion.
     let Some(result) = (unsafe {
         with_device_state(dev, |state| {
             if !command.is_empty() {
@@ -1102,6 +1216,7 @@ unsafe extern "C" fn ioctl_blob_create(
                 .map_err(dev_errno)?;
             let id = created.resource_id.ok_or(-EIO)?;
             let _ = state.engine.reap(fence);
+            // SAFETY: `object` is a valid pointer allocated above; update its resource ID under device state lock.
             unsafe {
                 (*object).resource_id = id;
             }
@@ -1138,13 +1253,19 @@ unsafe extern "C" fn ioctl_blob_create(
     };
     match result {
         Ok((id, uuid)) => {
-            if unsafe { (*fpriv).context_created } {
-                let ret = context_resource_ioctl(dev, unsafe { (*fpriv).context_id }, id, true);
+            // SAFETY: `fpriv` was verified non-null by `file_private` and points to valid file private state.
+            let context_created = unsafe { (*fpriv).context_created };
+            if context_created {
+                // SAFETY: `fpriv` is valid and points to the caller's initialized `FilePrivate`.
+                let context_id = unsafe { (*fpriv).context_id };
+                let ret = context_resource_ioctl(dev, context_id, id, true);
                 if ret != 0 {
                     drop_allocated_handle(file, object, handle);
                     return ret;
                 }
             }
+            // SAFETY: `object` is a valid newly allocated `VirtioGpuObject` and `arg` points to the ioctl argument buffer.
+            // Populates created blob resource metadata and releases the initial allocation reference.
             unsafe {
                 (*object).resource_id = id;
                 (*object).is_blob = true;
@@ -1167,6 +1288,8 @@ unsafe extern "C" fn ioctl_blob_create(
 }
 
 fn drop_allocated_handle(file: *mut DrmFile, object: *mut VirtioGpuObject, handle: u32) {
+    // SAFETY: `file` is a valid DRM file pointer; `drm_gem_handle_delete` drops handle association
+    // and `drm_gem_object_put` releases the initial GEM reference on `object`.
     unsafe {
         let _ = drm_gem_handle_delete(file, handle);
         drm_gem_object_put(&mut (*object).base.base);
@@ -1177,9 +1300,19 @@ fn ensure_context_locked(
     state: &mut crate::device::DriverState,
     fpriv: *mut FilePrivate,
 ) -> Result<(), i32> {
-    if unsafe { (*fpriv).context_created } {
+    // SAFETY: `fpriv` is guaranteed non-null and valid by the caller under device state lock.
+    let context_created = unsafe { (*fpriv).context_created };
+    if context_created {
         return Ok(());
     }
+    // SAFETY: `fpriv` is valid; inspect whether custom context initialization parameters were configured.
+    let init = unsafe {
+        if (*fpriv).initialized {
+            (*fpriv).init
+        } else {
+            ContextInit::default()
+        }
+    };
     let fence = state
         .engine
         .submit(
@@ -1187,11 +1320,7 @@ fn ensure_context_locked(
             GpuQueue::Control,
             GpuBatch::CreateContext {
                 name: b"thekernel".to_vec(),
-                init: if unsafe { (*fpriv).initialized } {
-                    unsafe { (*fpriv).init }
-                } else {
-                    ContextInit::default()
-                },
+                init,
             },
         )
         .map_err(dev_errno)?;
@@ -1201,6 +1330,7 @@ fn ensure_context_locked(
         .map_err(dev_errno)?;
     let id = snapshot.context_id.ok_or(-EIO)?;
     let _ = state.engine.reap(fence);
+    // SAFETY: `fpriv` is valid; record the created context ID and set `context_created` to true under lock.
     unsafe {
         (*fpriv).context_id = id;
         (*fpriv).context_created = true;
@@ -1216,12 +1346,16 @@ unsafe extern "C" fn ioctl_context_init(
     if data.is_null() || file.is_null() {
         return -EINVAL;
     }
+    // SAFETY: `data` was validated non-null above, properly aligned and sized for `DrmVirtgpuContextInit`.
     let args = unsafe { *data.cast::<DrmVirtgpuContextInit>() };
     if args.num_params > 4 || (args.num_params != 0 && args.ctx_set_params == 0) {
         return -EINVAL;
     }
     let mut params = [DrmVirtgpuContextSetParam::default(); 4];
     if args.num_params != 0
+        // SAFETY: `params` is an array of 4 elements on the stack. `args.num_params <= 4`, so
+        // copying `args.num_params * size_of::<DrmVirtgpuContextSetParam>()` is within bounds.
+        // `copy_from_user` safely transfers parameter structs from userspace.
         && unsafe {
             copy_from_user(
                 params.as_mut_ptr().cast(),
@@ -1232,6 +1366,7 @@ unsafe extern "C" fn ioctl_context_init(
     {
         return -EFAULT;
     }
+    // SAFETY: `dev` is a valid DRM device pointer; `with_device_engine` synchronizes access to read device features.
     let Some(features) = (unsafe { with_device_engine(dev, |e, _| e.modern_features()) }) else {
         return -ENODEV;
     };
@@ -1258,6 +1393,7 @@ unsafe extern "C" fn ioctl_context_init(
         match p.param {
             VIRTGPU_CONTEXT_PARAM_CAPSET_ID
                 if p.value <= 63
+                    // SAFETY: `dev` is a valid DRM device pointer; queries supported capset bitmask under device engine lock.
                     && unsafe {
                         with_device_engine(dev, |e, _| e.capset_mask() & (1u64 << p.value) != 0)
                     }
@@ -1276,6 +1412,8 @@ unsafe extern "C" fn ioctl_context_init(
                 let mut len = 0usize;
                 while len < 64 {
                     let source = (src as usize).wrapping_add(len) as *const c_void;
+                    // SAFETY: `bytes` has length 64 and `len < 64`, so destination pointer is within bounds.
+                    // `copy_from_user` safely transfers 1 byte from userspace `source`.
                     if unsafe { copy_from_user(bytes.as_mut_ptr().add(len).cast(), source, 1) } != 0
                     {
                         return -EFAULT;
@@ -1301,6 +1439,8 @@ unsafe extern "C" fn ioctl_context_init(
     if init.poll_rings_mask & !valid_mask != 0 {
         return -EINVAL;
     }
+    // SAFETY: `dev` is a valid DRM device pointer. `with_device_state` acquires the device lock,
+    // and `privp` is valid and uniquely accessed for this file.
     let Some(result) = (unsafe {
         with_device_state(dev, |state| {
             if (*privp).context_created {
@@ -1334,6 +1474,8 @@ struct ExecInputSyncobjs {
 impl Drop for ExecInputSyncobjs {
     fn drop(&mut self) {
         for object in self.reset_objects.drain(..) {
+            // SAFETY: `object` was looked up via `tk_drm_syncobj_find` holding an active reference.
+            // Clears any attached fence and releases the syncobj reference.
             unsafe {
                 tk_drm_syncobj_replace_fence(object, ptr::null_mut());
                 tk_drm_syncobj_put(object);
@@ -1349,6 +1491,9 @@ struct ExecOutputSyncobjs {
 impl ExecOutputSyncobjs {
     fn publish(&mut self, fence: *mut DmaFence) {
         for entry in &mut self.entries {
+            // SAFETY: `entry.object` holds an active reference from `tk_drm_syncobj_find`.
+            // For binary syncobjs (point 0), replaces the fence directly. For timeline syncobjs (point > 0),
+            // adds the point using the preallocated chain node and releases chain ownership.
             unsafe {
                 if entry.point == 0 {
                     tk_drm_syncobj_replace_fence(entry.object, fence);
@@ -1364,6 +1509,7 @@ impl ExecOutputSyncobjs {
 impl Drop for ExecOutputSyncobjs {
     fn drop(&mut self) {
         for entry in self.entries.drain(..) {
+            // SAFETY: Frees any unused preallocated fence chain node and releases the reference to `entry.object`.
             unsafe {
                 if !entry.chain.is_null() {
                     drm_syncobj_chain_free(entry.chain);
@@ -1393,10 +1539,12 @@ impl ExecFenceResources {
         if self.sync_file.is_null() || self.fd < 0 {
             return -EINVAL;
         }
+        // SAFETY: `self.sync_file` is verified non-null and points to the created sync file wrapper.
         let file = unsafe { drm_syncobj_sync_file_file(self.sync_file) };
         if file.is_null() {
             return -EINVAL;
         }
+        // SAFETY: Installs the valid `file` pointer into the allocated descriptor `self.fd`.
         unsafe { tk_linux_kapi::kernel_services::fd_install(self.fd, file) };
         args.fence_fd = self.fd;
         self.fd = -1;
@@ -1411,6 +1559,9 @@ impl ExecFenceResources {
 
 impl Drop for ExecFenceResources {
     fn drop(&mut self) {
+        // SAFETY: Cleans up uninstalled fence resources: error-signals the fence if linked to an unpublished
+        // sync file, releases the sync file reference via fput, returns unused FD to the kernel allocator,
+        // and drops the fence reference.
         unsafe {
             if !self.sync_file.is_null() {
                 // A provider may have installed a native mirror task which
@@ -1455,6 +1606,9 @@ fn copy_exec_syncobj_descs(
                 .checked_mul(stride as u64)
                 .and_then(|offset| pointer.checked_add(offset))
                 .ok_or(-EINVAL)?;
+            // SAFETY: `descriptor` is on the stack with size `size_of::<DrmVirtgpuExecbufferSyncobj>()`
+            // and `copy_len <= size_of::<DrmVirtgpuExecbufferSyncobj>()`. `copy_from_user` safely transfers
+            // descriptor bytes from the userspace address `offset`.
             if unsafe {
                 copy_from_user(
                     (&mut descriptor as *mut DrmVirtgpuExecbufferSyncobj).cast(),
@@ -1484,33 +1638,41 @@ fn parse_exec_input_syncobjs(
     for descriptor in descriptors {
         if descriptor.flags & !VIRTGPU_EXECBUF_SYNCOBJ_FLAGS != 0 {
             for object in reset_objects {
+                // SAFETY: `object` was acquired by `tk_drm_syncobj_find`; release held reference on error.
                 unsafe { tk_drm_syncobj_put(object) };
             }
             return Err(-EINVAL);
         }
         let mut fence = ptr::null_mut();
+        // SAFETY: `file` is valid; looks up fence from syncobj `handle` at timeline `point`.
         let ret = unsafe {
             tk_drm_syncobj_find_fence(file, descriptor.handle, descriptor.point, 0, &mut fence)
         };
         if ret != 0 {
             for object in reset_objects {
+                // SAFETY: Release held syncobj reference on fence lookup failure.
                 unsafe { tk_drm_syncobj_put(object) };
             }
             return Err(ret);
         }
+        // SAFETY: `fence` is a valid `DmaFence` returned by `tk_drm_syncobj_find_fence`. Waits for completion.
         let wait =
             unsafe { tk_drm_upstream::drm_syncobj_upstream::drm_syncobj_wait_fence(fence, true) };
+        // SAFETY: Releases the fence reference acquired by `tk_drm_syncobj_find_fence`.
         unsafe { drm_syncobj_fence_put(fence) };
         if wait != 0 {
             for object in reset_objects {
+                // SAFETY: Release held syncobj reference on wait failure.
                 unsafe { tk_drm_syncobj_put(object) };
             }
             return Err(wait);
         }
         if descriptor.flags & VIRTGPU_EXECBUF_SYNCOBJ_RESET != 0 {
+            // SAFETY: `file` is a valid DRM file pointer; queries syncobj by handle with incremented reference.
             let object = unsafe { tk_drm_syncobj_find(file, descriptor.handle) };
             if object.is_null() {
                 for object in reset_objects {
+                    // SAFETY: Release held syncobj references on lookup failure.
                     unsafe { tk_drm_syncobj_put(object) };
                 }
                 return Err(-ENOENT);
@@ -1539,6 +1701,7 @@ fn parse_exec_output_syncobjs(
             release_exec_output_syncobjs(output);
             return Err(-EINVAL);
         }
+        // SAFETY: `file` is valid; queries syncobj by handle, returning a reference if found.
         let object = unsafe { tk_drm_syncobj_find(file, descriptor.handle) };
         if object.is_null() {
             release_exec_output_syncobjs(output);
@@ -1549,6 +1712,7 @@ fn parse_exec_output_syncobjs(
         } else {
             let chain = drm_syncobj_chain_alloc();
             if chain.is_null() {
+                // SAFETY: Release lookup reference on `object` if fence chain node allocation fails.
                 unsafe { tk_drm_syncobj_put(object) };
                 release_exec_output_syncobjs(output);
                 return Err(-ENOMEM);
@@ -1566,6 +1730,7 @@ fn parse_exec_output_syncobjs(
 
 fn release_exec_output_syncobjs(output: Vec<ExecOutputSyncobj>) {
     for entry in output {
+        // SAFETY: Frees any allocated fence chain node and releases the reference to `entry.object`.
         unsafe {
             if !entry.chain.is_null() {
                 drm_syncobj_chain_free(entry.chain);
@@ -1582,6 +1747,8 @@ fn finish_submission(private: Arc<DriverPrivate>, fence_id: u64, fence: usize) {
     } else {
         -EIO
     };
+    // SAFETY: `fence` is a valid `DmaFence` pointer passed across the thread boundary as `usize`.
+    // Signals the fence with completion/error status and releases the submission fence reference.
     unsafe {
         drm_syncobj_fence_signal(fence as *mut DmaFence, error);
         drm_syncobj_fence_put(fence as *mut DmaFence);
@@ -1611,6 +1778,7 @@ unsafe extern "C" fn ioctl_execbuffer(
     if data.is_null() || file.is_null() {
         return -EINVAL;
     }
+    // SAFETY: `data` was validated non-null above, properly aligned and sized for `DrmVirtgpuExecbuffer`.
     let mut args = unsafe { *data.cast::<DrmVirtgpuExecbuffer>() };
     if args.flags & !VIRTGPU_EXECBUF_FLAGS != 0 {
         return -EINVAL;
@@ -1628,6 +1796,7 @@ unsafe extern "C" fn ioctl_execbuffer(
         Ok(p) => p,
         Err(e) => return e,
     };
+    // SAFETY: `dev` is a valid DRM device pointer; `with_device_engine` provides synchronized access to read device features.
     let Some(virgl) = (unsafe {
         with_device_engine(dev, |e, _| {
             e.modern_features().contains(GpuFeatures::VIRGL_3D)
@@ -1643,6 +1812,7 @@ unsafe extern "C" fn ioctl_execbuffer(
         return ret;
     }
 
+    // SAFETY: `dev` is a valid DRM device pointer whose `dev_private` retains an active Arc reference.
     let Some(private) = (unsafe { private_arc_from_device(dev) }) else {
         return -ENODEV;
     };
@@ -1652,11 +1822,13 @@ unsafe extern "C" fn ioctl_execbuffer(
     }
     let mut fence_resources = ExecFenceResources::new(fence);
     if args.flags & VIRTGPU_EXECBUF_FENCE_FD_OUT != 0 {
+        // SAFETY: Allocates an unused file descriptor with O_CLOEXEC flags from kernel FD allocator.
         let fd = unsafe { tk_linux_kapi::kernel_services::get_unused_fd_flags(0x80000) };
         if fd < 0 {
             return fd;
         }
         fence_resources.fd = fd;
+        // SAFETY: `fence_resources.fence` is a valid `DmaFence` created above; creates a sync_file wrapper.
         let sync_file = unsafe { drm_syncobj_sync_file_create(fence_resources.fence) };
         if sync_file.is_null() {
             return -ENOMEM;
@@ -1670,6 +1842,8 @@ unsafe extern "C" fn ioctl_execbuffer(
     }
     command.resize(args.size as usize, 0);
     if args.size != 0
+        // SAFETY: `command` has been reserved and sized to `args.size`. `copy_from_user` safely transfers
+        // command stream bytes from the userspace address `args.command`.
         && unsafe {
             copy_from_user(
                 command.as_mut_ptr().cast(),
@@ -1690,6 +1864,8 @@ unsafe extern "C" fn ioctl_execbuffer(
     }
     handles.resize(args.num_bo_handles as usize, 0);
     if !handles.is_empty()
+        // SAFETY: `handles` is sized to `num_bo_handles` elements (4 bytes each). `copy_from_user` safely
+        // transfers the handle list from the userspace address `args.bo_handles`.
         && unsafe {
             copy_from_user(
                 handles.as_mut_ptr().cast(),
@@ -1708,21 +1884,26 @@ unsafe extern "C" fn ioctl_execbuffer(
         return -ENOMEM;
     }
     for handle in handles {
+        // SAFETY: `file` is valid; `drm_gem_object_lookup` acquires a reference to the GEM object under file lock.
         let obj = unsafe { drm_gem_object_lookup(file, handle) };
         if obj.is_null() {
             for p in objects {
+                // SAFETY: Release GEM object references accumulated so far on lookup error.
                 unsafe {
                     drm_gem_object_put(p);
                 }
             }
             return -ENOENT;
         }
+        // SAFETY: `obj` was verified non-null from lookup; cast to `VirtioGpuObject` to read its resource ID.
         let rid = unsafe { (*(obj.cast::<VirtioGpuObject>())).resource_id };
         if rid == 0 {
+            // SAFETY: Release lookup reference on the unassociated GEM object.
             unsafe {
                 drm_gem_object_put(obj);
             }
             for p in objects {
+                // SAFETY: Release accumulated GEM object references on validation error.
                 unsafe {
                     drm_gem_object_put(p);
                 }
@@ -1735,6 +1916,7 @@ unsafe extern "C" fn ioctl_execbuffer(
     let mut ptrs = Vec::new();
     if ptrs.try_reserve_exact(objects.len()).is_err() {
         for p in objects {
+            // SAFETY: Release accumulated GEM object references on memory allocation failure.
             unsafe { drm_gem_object_put(p) }
         }
         return -ENOMEM;
@@ -1745,6 +1927,7 @@ unsafe extern "C" fn ioctl_execbuffer(
         Ok(output) => output,
         Err(error) => {
             for object in objects {
+                // SAFETY: Release accumulated GEM object references on output syncobj parsing error.
                 unsafe { drm_gem_object_put(object) }
             }
             return error;
@@ -1763,6 +1946,7 @@ unsafe extern "C" fn ioctl_execbuffer(
         },
         Err(error) => {
             for object in objects {
+                // SAFETY: Release accumulated GEM object references on input syncobj parsing error.
                 unsafe { drm_gem_object_put(object) }
             }
             return error;
@@ -1770,23 +1954,31 @@ unsafe extern "C" fn ioctl_execbuffer(
     };
 
     if args.flags & VIRTGPU_EXECBUF_FENCE_FD_IN != 0 {
+        // SAFETY: `args.fence_fd` is validated >= 0; retrieves the underlying dma_fence from sync file.
         let fence = unsafe { drm_syncobj_sync_file_get_fence(args.fence_fd) };
         if fence.is_null() {
             for object in objects {
+                // SAFETY: Release accumulated GEM object references on fence retrieval failure.
                 unsafe { drm_gem_object_put(object) }
             }
             return -EINVAL;
         }
+        // SAFETY: `fence` is a valid `DmaFence` returned by `drm_syncobj_sync_file_get_fence`. Waits for completion.
         let wait =
             unsafe { tk_drm_upstream::drm_syncobj_upstream::drm_syncobj_wait_fence(fence, true) };
+        // SAFETY: Releases the input fence reference after waiting.
         unsafe { drm_syncobj_fence_put(fence) };
         if wait != 0 {
             for object in objects {
+                // SAFETY: Release accumulated GEM object references on fence wait failure.
                 unsafe { drm_gem_object_put(object) }
             }
             return wait;
         }
     }
+    // SAFETY: `dev` is a valid DRM device pointer; `with_device_state` acquires the device state lock
+    // to submit 3D batch to the control queue. Referenced GEM pointers in `ptrs` are stored into `pending_refs`
+    // and retained until terminal fence retirement.
     let Some(result) = (unsafe {
         with_device_state(dev, |state| {
             state.pending_refs.try_reserve(1).map_err(|_| -ENOMEM)?;
@@ -1817,6 +2009,7 @@ unsafe extern "C" fn ioctl_execbuffer(
                 )
                 .map_err(dev_errno)?;
             for p in &objects {
+                // SAFETY: `p` is a valid `DrmGemObject` cast to `VirtioGpuObject`; updates fence tracking fields under state lock.
                 unsafe {
                     (*(p.cast::<VirtioGpuObject>())).last_fence_id = fence;
                     (*(p.cast::<VirtioGpuObject>())).last_fence_status = crate::gem::FENCE_PENDING;
@@ -1827,6 +2020,7 @@ unsafe extern "C" fn ioctl_execbuffer(
         })
     }) else {
         for p in objects {
+            // SAFETY: Release GEM object references if device state lock could not be acquired.
             unsafe { drm_gem_object_put(p) }
         }
         return -ENODEV;
@@ -1835,6 +2029,7 @@ unsafe extern "C" fn ioctl_execbuffer(
         Ok(fence_id) => fence_id,
         Err(error) => {
             for p in objects {
+                // SAFETY: Release GEM object references if queue submission failed before commit to `pending_refs`.
                 unsafe { drm_gem_object_put(p) }
             }
             return error;
@@ -1855,6 +2050,7 @@ unsafe extern "C" fn ioctl_execbuffer(
     drop(input_syncobjs);
     let completion_fence = fence_resources.take_fence();
     queue_submission_completion(private, fence_id, completion_fence);
+    // SAFETY: `data` was validated non-null and points to the caller's writable ioctl argument buffer.
     unsafe {
         *data.cast::<DrmVirtgpuExecbuffer>() = args;
     }

@@ -84,6 +84,9 @@ pub(crate) fn render_node(
     fs: Arc<crate::pseudofs::SimpleFs>,
     device: Arc<UpstreamDrmDevice>,
 ) -> VfsResult<Option<Arc<crate::pseudofs::Device>>> {
+    // SAFETY: `device.raw()` returns a valid, pinned Linux `drm_device` pointer owned by
+    // `UpstreamDrmDevice`. Reading the `render` minor pointer is safe and race-free as minor
+    // assignments are established during device registration and remain immutable for the device lifetime.
     let has_render = unsafe { !(*device.raw()).render.is_null() };
     if has_render {
         Ok(Some(node(fs, device, true, Vec::new())))
@@ -156,6 +159,9 @@ fn publish_sysfs(device: &UpstreamDrmDevice) -> VfsResult<Vec<DeviceHandle<'stat
     )?;
     let card_reservation = global_device_registry().reserve(card.identity().clone())?;
     let connector_reservation = global_device_registry().reserve(connector.identity().clone())?;
+    // SAFETY: `device.raw()` points to a valid, live Linux `drm_device` managed by `device`.
+    // The `render` minor pointer is initialized during device setup and remains read-only
+    // throughout the device's published lifetime.
     let render_minor = unsafe { !(*device.raw()).render.is_null() };
     if !render_minor {
         let (card, connector) = DeviceReservation::publish_pair(
@@ -195,6 +201,9 @@ fn publish_sysfs(device: &UpstreamDrmDevice) -> VfsResult<Vec<DeviceHandle<'stat
 
 impl DeviceOps for UpstreamDrmNode {
     fn open_description(&self, _location: &Location, flags: u32) -> VfsResult<Option<DeviceOpen>> {
+        // SAFETY: `self.device.raw()` yields a valid, pinned Linux `drm_device` whose `primary`
+        // and `render` minor pointers are initialized during probe and remain immutable while
+        // the `UpstreamDrmDevice` is live.
         let minor = unsafe {
             if self.render {
                 (*self.device.raw()).render
@@ -258,10 +267,15 @@ struct UpstreamDrmFile {
 // adapter only mutates f_flags under flags_lock and intrusive wait state is
 // removed before release.
 unsafe impl Send for UpstreamDrmFile {}
+// SAFETY: Concurrent operations on `UpstreamDrmFile` are synchronized by internal
+// DRM locks, `flags_lock` for file flags, atomic nonblocking state, and the
+// `PollSet` spinlock for wait queue callbacks.
 unsafe impl Sync for UpstreamDrmFile {}
 
 impl UpstreamDrmFile {
     fn new(device: Arc<UpstreamDrmDevice>, render: bool, flags: u32) -> Self {
+        // SAFETY: `LinuxFile` is a POD-style C struct whose all-zero bit pattern represents a valid
+        // unlinked file descriptor state prior to `drm_open`.
         let mut raw: LinuxFile = unsafe { core::mem::zeroed() };
         raw.f_flags = flags;
         Self {
@@ -269,6 +283,8 @@ impl UpstreamDrmFile {
             render,
             raw: UnsafeCell::new(raw),
             inode: UnsafeCell::new(OpenInode::default()),
+            // SAFETY: An all-zero byte pattern is valid initialization for `WaitQueueEntry`,
+            // which is explicitly reinitialized with `INIT_LIST_HEAD` before use in `open()`.
             wait_entry: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             native_shadow: None,
             native_binding: None,
@@ -292,15 +308,25 @@ impl UpstreamDrmFile {
     }
 
     fn open(&mut self, minor: *mut DrmMinor) -> AxResult {
+        // SAFETY: `minor` was verified non-null in `open_description` and points to a valid
+        // `DrmMinor` pinned by DRM device registration. Dereferencing `(*minor).dev` reads the
+        // immutable backpointer to the owning `drm_device`.
         if unsafe { (*minor).dev != self.device.raw() } {
             return Err(AxError::NoSuchDevice);
         }
         // Use the common upstream open path for the primary minor; the
         // render-node minor is acquired through the companion exported helper.
+        // SAFETY: `minor` points to a valid, live `DrmMinor` pinned by the DRM subsystem.
+        // Reading `r#type` discriminates between primary (0) and render minors.
         let ret = if unsafe { (*minor).r#type == 0 } {
             let inode = self.inode.get();
+            // SAFETY: `inode` is a valid pointer to this file's allocated `OpenInode` discriminator,
+            // and `self.raw()` points to our initialized `LinuxFile`. The DRM core establishes
+            // file private data and attaches the file to the primary minor under internal locks.
             unsafe { tk_drm_upstream::drm_file_upstream::drm_open(inode.cast(), self.raw()) }
         } else {
+            // SAFETY: `minor` is a valid `DrmMinor` whose `index` field identifies the render minor
+            // registered in the DRM xarray. `self.raw()` is our valid `LinuxFile` instance being opened.
             unsafe {
                 tk_drm_upstream::drm_file_upstream::drm_open_minor_index(
                     (*minor).index as u32,
@@ -311,12 +337,18 @@ impl UpstreamDrmFile {
         if ret != 0 {
             return Err(errno_to_ax(ret));
         }
+        // SAFETY: `self.raw()` is our `LinuxFile` successfully initialized by `drm_open*`.
+        // Reading `private_data` accesses the DRM core's allocated `DrmFile` context.
         let private = unsafe { (*self.raw()).private_data.cast::<DrmFile>() };
         if private.is_null() {
+            // SAFETY: `self.raw()` is our open `LinuxFile`. On initialization failure, `drm_release`
+            // cleans up partially acquired DRM state matching Linux file close semantics.
             unsafe { tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), self.raw()) };
             return Err(AxError::NoSuchDevice);
         }
         let Some(native_device) = crate::drm::primary_device() else {
+            // SAFETY: `self.raw()` is our open `LinuxFile`. Releasing it ensures DRM driver open
+            // hooks and file state are undone if native device lookup fails.
             unsafe { tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), self.raw()) };
             return Err(AxError::NoSuchDevice);
         };
@@ -326,18 +358,24 @@ impl UpstreamDrmFile {
         let native = match native_device.open_render() {
             Ok(native) => native,
             Err(error) => {
+                // SAFETY: `self.raw()` points to our valid open `LinuxFile`. Calling `drm_release`
+                // performs necessary driver cleanup before aborting `open`.
                 unsafe {
                     tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), self.raw())
                 };
                 return Err(AxError::from(error));
             }
         };
+        // SAFETY: `self.raw()` points to our valid `LinuxFile` whose `f_flags` are initialized
+        // during `new()` and modified only under `flags_lock`.
         native.set_open_flags(unsafe { (*self.raw()).f_flags });
         let binding = match crate::drm::intel::upstream_file::V1FileBinding::register(
             private.cast(),
         ) {
             Ok(binding) => binding,
             Err(error) => {
+                // SAFETY: `self.raw()` points to our valid open `LinuxFile`. Rolling back with
+                // `drm_release` frees the DRM file context upon shadow registration failure.
                 unsafe {
                     tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), self.raw())
                 };
@@ -347,6 +385,9 @@ impl UpstreamDrmFile {
         self.native_shadow = Some(native);
         self.native_binding = Some(binding);
         let entry = self.wait_entry.get();
+        // SAFETY: `entry` is pinned by `UpstreamDrmFile`'s allocation, `self.waiters` is a valid
+        // `Arc<PollSet>` whose raw pointer remains valid until drop, and `private` was validated
+        // non-null and points to the live `DrmFile` whose `event_wait` queue is initialized by DRM core.
         unsafe {
             (*entry).private = Arc::as_ptr(&self.waiters).cast_mut().cast();
             (*entry).func = Some(wake_poll_waiters);
@@ -362,6 +403,9 @@ impl UpstreamDrmFile {
         }
         let remaining = dst.remaining_mut();
         let mut sink = IoDstSink { dst, remaining };
+        // SAFETY: `self.raw()` points to our live, open `LinuxFile`. `&mut sink` remains valid and
+        // pinned on the stack for the synchronous duration of `drm_read_kernel_to`. The callback
+        // `copy_event_to_io_dst` only accesses the provided sink pointer and valid event bytes.
         let ret = unsafe {
             tk_drm_upstream::drm_file_upstream::drm_read_kernel_to(
                 self.raw(),
@@ -378,8 +422,10 @@ impl UpstreamDrmFile {
     }
 
     fn poll_events(&self) -> IoEvents {
-        let mask =
-            unsafe { tk_drm_upstream::drm_file_upstream::drm_poll(self.raw(), ptr::null_mut()) };
+        // SAFETY: `self.raw()` is a valid open `LinuxFile`. Passing a null poll_table queries the
+        // current readiness mask without registering a new wait queue entry, which is already handled
+        // via `wait_entry` in `open()`.
+        let mask = unsafe { tk_drm_upstream::drm_file_upstream::drm_poll(self.raw(), ptr::null_mut()) };
         linux_poll_events(mask)
     }
 
@@ -403,6 +449,10 @@ impl UpstreamDrmFile {
 impl Drop for UpstreamDrmFile {
     fn drop(&mut self) {
         let raw = self.raw();
+        // SAFETY: `raw` points to this file's `LinuxFile` being dropped. If `private_data` was set,
+        // it points to a valid `DrmFile` whose `event_wait` queue contains `self.wait_entry`.
+        // We remove the wait queue entry to prevent dangling wakeups and call `drm_release` to
+        // execute driver postclose callbacks and release DRM resources under DRM locks.
         unsafe {
             let private = (*raw).private_data.cast::<DrmFile>();
             if !private.is_null() {
@@ -449,10 +499,14 @@ unsafe extern "C" fn copy_event_to_io_dst(
     if context.is_null() || bytes.is_null() {
         return -(EFAULT as isize);
     }
+    // SAFETY: `context` was passed from `read_events` as `&mut IoDstSink`, verified non-null above,
+    // and is pinned on the caller's stack for the duration of the synchronous C helper call.
     let sink = unsafe { &mut *context.cast::<IoDstSink<'_>>() };
     if len > sink.remaining {
         return -(EFAULT as isize);
     }
+    // SAFETY: `bytes` was checked non-null and points to `len` contiguous initialized bytes
+    // emitted by the upstream DRM event read loop.
     let source = unsafe { core::slice::from_raw_parts(bytes.cast::<u8>(), len) };
     match sink.dst.write_all(source) {
         Ok(()) => {
@@ -472,10 +526,15 @@ unsafe extern "C" fn wake_poll_waiters(
     if entry.is_null() {
         return 0;
     }
+    // SAFETY: `entry` is non-null and corresponds to `UpstreamDrmFile.wait_entry`, which remains
+    // valid while registered on DRM's event_wait queue. Reading `private` retrieves the pointer to
+    // the owning `PollSet`.
     let poll = unsafe { (*entry).private.cast::<PollSet>() };
     if !poll.is_null() {
         // PollSet uses a no-IRQ spin lock, matching Linux waitqueue wake
         // context. The waker callbacks run after that internal lock is dropped.
+        // SAFETY: `poll` was checked non-null and points to the `Arc<PollSet>` kept alive by
+        // `UpstreamDrmFile`. The wake call safely acquires the internal spinlock to notify waiters.
         unsafe { &*poll }.wake();
     }
     1
@@ -518,6 +577,9 @@ impl FileLike for UpstreamDrmFile {
 
     fn ioctl(&self, _context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
         self.with_native_binding(|_| {
+            // SAFETY: `self.raw()` is a valid open `LinuxFile` bound to its shadow context.
+            // Upstream `drm_ioctl` handles validation, permission checks, and internal locking
+            // for the command and user argument pointer.
             let result = unsafe {
                 tk_drm_upstream::drm_ioctl_upstream::drm_ioctl(self.raw(), cmd, arg as c_ulong)
             };
@@ -543,6 +605,8 @@ impl FileLike for UpstreamDrmFile {
         if let Some(native) = self.native_shadow.as_ref() {
             native.set_nonblocking_flag(nonblocking);
         }
+        // SAFETY: `self.raw()` points to this instance's `LinuxFile`. Mutating `f_flags` is synchronized
+        // by `self.flags_lock`, ensuring no concurrent data races with other flag modifications.
         unsafe {
             let flags = &mut (*self.raw()).f_flags;
             if nonblocking {
@@ -628,19 +692,30 @@ struct UpstreamGemOwner {
     _device: Arc<UpstreamDrmDevice>,
     _object: *mut DrmGemObject,
 }
+// SAFETY: `UpstreamGemOwner` holds a refcounted reference to `UpstreamDrmDevice` and a raw pointer
+// to a GEM object whose lifetime is guaranteed by GEM refcounting. It contains no thread-bound state
+// and can safely be sent across threads.
 unsafe impl Send for UpstreamGemOwner {}
+// SAFETY: Access to the underlying DRM device and GEM object is synchronized by DRM core locks
+// and atomic refcounts, making concurrent references across threads safe.
 unsafe impl Sync for UpstreamGemOwner {}
 
 struct ExternalGemMmapOwner {
     _device: Arc<UpstreamDrmDevice>,
     _object: GemObjectLookupRef,
 }
+// SAFETY: `ExternalGemMmapOwner` holds an `Arc<UpstreamDrmDevice>` and a ref-managed GEM object pointer.
+// Ownership can safely be transferred between threads as both are thread-safe refcounted resources.
 unsafe impl Send for ExternalGemMmapOwner {}
+// SAFETY: The referenced `UpstreamDrmDevice` and GEM object are thread-safe and internally synchronized,
+// allowing concurrent shared references across threads.
 unsafe impl Sync for ExternalGemMmapOwner {}
 
 struct GemObjectLookupRef(*mut DrmGemObject);
 impl Drop for GemObjectLookupRef {
     fn drop(&mut self) {
+        // SAFETY: `self.0` holds a reference-counted `DrmGemObject` acquired via `drm_gem_object_get`.
+        // Calling `drm_gem_object_put` releases that reference using DRM's thread-safe atomic refcounting.
         unsafe { tk_drm_upstream::drm_gem_upstream::drm_gem_object_put(self.0) };
     }
 }
@@ -653,7 +728,11 @@ struct VmaCloseGuard {
 impl Drop for VmaCloseGuard {
     fn drop(&mut self) {
         if self.armed && !self.vma.vm_ops.is_null() {
+            // SAFETY: `self.vma.vm_ops` is non-null and was assigned by `drm_gem_mmap_obj` to the
+            // driver's static `vm_operations_struct`. Reading function pointer `close` is safe and race-free.
             if let Some(close) = unsafe { (*self.vma.vm_ops).close } {
+                // SAFETY: `self.vma` is the initialized `VmAreaStruct` passed to `drm_gem_mmap_obj`.
+                // Calling the driver's `close` callback tears down the VMA mapping state on error.
                 unsafe { close(&mut self.vma) };
             }
         }
@@ -671,14 +750,22 @@ fn upstream_gem_mmap(
         return Err(AxError::OperationNotSupported);
     }
     let dev = file.device.raw();
+    // SAFETY: `file.device.raw()` returns a valid, pinned Linux `drm_device` pointer owned by
+    // `file.device`. Reading `unplugged` and `vma_offset_manager` inspects fields that remain
+    // allocated throughout the device lifetime.
     if unsafe { (*dev).unplugged || (*dev).vma_offset_manager.is_null() } {
         return Err(AxError::NoSuchDevice);
     }
     let file_page = request.offset() / PAGE_SIZE as u64;
     let map_pages = request.length() / PAGE_SIZE;
+    // SAFETY: `dev` is valid and `vma_offset_manager` was confirmed non-null above.
     let manager = unsafe { (*dev).vma_offset_manager };
+    // SAFETY: `manager` is a valid `drm_vma_offset_manager` whose `vm_lock` is an initialized rwlock.
     let manager_lock = unsafe { ptr::addr_of_mut!((*manager).vm_lock).cast() };
+    // SAFETY: `manager_lock` points to the valid rwlock of the VMA offset manager.
     unsafe { read_lock(manager_lock) };
+    // SAFETY: `manager` is valid and locked via `read_lock(manager_lock)`. The lookup traverses
+    // the VMA rb-tree safely under this lock.
     let node = unsafe {
         tk_drm_upstream::drm_vma_manager_upstream::drm_vma_offset_lookup_locked(
             manager,
@@ -687,6 +774,7 @@ fn upstream_gem_mmap(
         )
     };
     if node.is_null() {
+        // SAFETY: `manager_lock` is held under `read_lock` and must be released before returning error.
         unsafe { read_unlock(manager_lock) };
         return Err(AxError::InvalidInput);
     }
@@ -694,24 +782,40 @@ fn upstream_gem_mmap(
         .cast::<u8>()
         .wrapping_sub(offset_of!(DrmGemObject, vma_node))
         .cast::<DrmGemObject>();
-    if object.is_null() || unsafe { (*object).dev != dev } {
+    if object.is_null()
+        // SAFETY: `node` was verified non-null above and represents the embedded `vma_node` within
+        // the enclosing `DrmGemObject`. Accessing `(*object).dev` under `manager_lock` verifies
+        // that the object belongs to this DRM device.
+        || unsafe { (*object).dev != dev }
+    {
+        // SAFETY: `manager_lock` is held by `read_lock` and must be released before returning error.
         unsafe { read_unlock(manager_lock) };
         return Err(AxError::InvalidInput);
     }
+    // SAFETY: `object` is confirmed valid and belongs to `dev`; incrementing its reference count
+    // via `drm_gem_object_get` prevents concurrent destruction while holding `manager_lock`.
     unsafe { tk_drm_upstream::drm_gem_upstream::drm_gem_object_get(object) };
+    // SAFETY: `manager_lock` was acquired with `read_lock` and can now be released after taking the object ref.
     unsafe { read_unlock(manager_lock) };
     let _object_ref = GemObjectLookupRef(object);
+    // SAFETY: `file.raw()` points to this file's valid open `LinuxFile`. Reading `private_data`
+    // retrieves the associated `DrmFile` structure.
     let private = unsafe { (*file.raw()).private_data.cast::<DrmFile>() };
     if private.is_null()
+        // SAFETY: `node` is the valid `drm_vma_offset_node` looked up above, and `private` was checked
+        // non-null. `drm_vma_node_is_allowed` checks the per-file offset access permissions table.
         || !unsafe {
             tk_drm_upstream::drm_vma_manager_upstream::drm_vma_node_is_allowed(node, private)
         }
     {
         return Err(AxError::PermissionDenied);
     }
+    // SAFETY: `object` is kept alive by `_object_ref`. Accessing its `size` field is safe and immutable.
     if unsafe { (*object).size == 0 || !(*object).size.is_multiple_of(PAGE_SIZE) } {
         return Err(AxError::InvalidInput);
     }
+    // SAFETY: `node` points to the `drm_vma_offset_node` embedded in `object`, kept alive by `_object_ref`.
+    // Reading `vm_node.start` retrieves the allocated offset page address.
     let start_page = unsafe { (*node).vm_node.start };
     let region_offset = start_page
         .checked_mul(PAGE_SIZE as u64)
@@ -722,18 +826,28 @@ fn upstream_gem_mmap(
         .ok_or(AxError::InvalidInput)?;
     if relative_offset
         .checked_add(request.length() as u64)
-        .is_none_or(|end| end > unsafe { (*object).size as u64 })
+        .is_none_or(|end| {
+            // SAFETY: `object` is kept alive by `_object_ref`; reading `size` is safe and immutable.
+            end > unsafe { (*object).size as u64 }
+        })
     {
         return Err(AxError::InvalidInput);
     }
+    // SAFETY: `object` is valid and kept alive by `_object_ref`. Reading `filp` accesses its
+    // underlying shmem backing file.
     let object_file = unsafe { (*object).filp.cast::<LinuxFile>() };
-    if object_file.is_null() || unsafe { (*object_file).f_mapping.is_null() } {
+    if object_file.is_null()
+        // SAFETY: `object_file` was checked non-null; reading its `f_mapping` pointer verifies that
+        // address space operations and page cache mappings are initialized.
+        || unsafe { (*object_file).f_mapping.is_null() }
+    {
         return Err(AxError::InvalidInput);
     }
     if request.protection().contains(FileMmapProtection::WRITE) && !file.allows_write() {
         return Err(AxError::PermissionDenied);
     }
 
+    // SAFETY: `object` is valid and kept alive by `_object_ref`; `size` is immutable.
     let count = unsafe { (*object).size / PAGE_SIZE };
     if let Some(mapping) = file
         .device
@@ -743,6 +857,7 @@ fn upstream_gem_mmap(
         return upstream_external_blob_mmap(file, request, region_offset, object, count, mapping);
     }
 
+    // SAFETY: `object` is valid and alive; `funcs` points to static driver GEM object operations.
     let funcs = unsafe { (*object).funcs.as_ref() }.ok_or(AxError::OperationNotSupported)?;
     if funcs.mmap.is_none()
         || funcs.mmap
@@ -768,12 +883,19 @@ fn upstream_gem_mmap(
     vma.vm_start = 0;
     vma.vm_end = request.length() as c_ulong;
     vma.vm_flags = vm_flags;
+    // SAFETY: `vm_get_page_prot` calculates architecture page protection flags for valid `vm_flags`.
     vma.vm_page_prot = unsafe { vm_get_page_prot(vm_flags) };
     vma.vm_pgoff = (relative_offset / PAGE_SIZE as u64) as c_ulong;
+    // SAFETY: `object` is alive via `_object_ref`; reading `filp` assigns the VMA backing file pointer.
     vma.vm_file = unsafe { (*object).filp.cast() };
-    if vma.vm_file.is_null() || unsafe { (*vma.vm_file).f_mapping.is_null() } {
+    if vma.vm_file.is_null()
+        // SAFETY: `vma.vm_file` was checked non-null; verifying `f_mapping` ensures valid address space operations.
+        || unsafe { (*vma.vm_file).f_mapping.is_null() }
+    {
         return Err(AxError::InvalidInput);
     }
+    // SAFETY: `object` is valid and kept alive by `_object_ref`. `vma` is an initialized `VmAreaStruct`
+    // with valid offsets, size, flags, and file mapping. `drm_gem_mmap_obj` sets up driver VMA hooks.
     let ret = unsafe {
         tk_drm_upstream::drm_gem_upstream::drm_gem_mmap_obj(
             object,
@@ -790,6 +912,8 @@ fn upstream_gem_mmap(
     }
 
     let shmem = object.cast::<DrmGemShmemObject>();
+    // SAFETY: `object` was verified to use `drm_gem_shmem_object_mmap`, guaranteeing it is an instance
+    // of `DrmGemShmemObject`. After successful `drm_gem_mmap_obj`, `(*shmem).pages` points to the pinned page array.
     let page_ptrs = unsafe { (*shmem).pages };
     if page_ptrs.is_null() {
         return Err(AxError::InvalidInput);
@@ -799,7 +923,10 @@ fn upstream_gem_mmap(
         .try_reserve_exact(count)
         .map_err(|_| AxError::NoMemory)?;
     for index in 0..count {
+        // SAFETY: `page_ptrs` points to an array of at least `count` page pointers pinned by the GEM shmem object.
         let page = unsafe { *page_ptrs.add(index) };
+        // SAFETY: `page` is a valid Linux page pointer from the GEM shmem object's page array.
+        // `try_page_to_phys` translates it to a physical page address.
         let physical = unsafe { try_page_to_phys(page) }.ok_or(AxError::BadAddress)?;
         phys_pages.push(PhysAddr::from_usize(physical));
     }
@@ -810,6 +937,8 @@ fn upstream_gem_mmap(
     })
     .map_err(|_| AxError::NoMemory)?;
     let owner_shared: Arc<dyn Send + Sync> = owner.clone();
+    // SAFETY: `phys_pages` contains validated 4K physical page addresses owned and kept pinned
+    // by `owner_shared` (`UpstreamGemOwner`) for the lifetime of this mapping.
     let pages = Arc::try_new(unsafe { SharedPages::new_page_cache_4k(phys_pages, owner_shared)? })
         .map_err(|_| AxError::NoMemory)?;
     let region = FixedSharedMmapRegion::try_new(
@@ -819,6 +948,8 @@ fn upstream_gem_mmap(
     )?;
     let mut plan = region.prepare(request)?.ok_or(AxError::InvalidInput)?;
     let owner_any: Arc<dyn Any + Send + Sync> = owner;
+    // SAFETY: `close_guard.vma` contains valid `vm_ops` and `vm_private_data` installed by
+    // `drm_gem_mmap_obj`. `owner_any` keeps the underlying GEM object alive while `SharedMmapOps` is active.
     let ops = unsafe { SharedMmapOps::from_vma(pages, &close_guard.vma, owner_any)? };
     plan = plan.with_shared_mmap_ops(ops)?;
     close_guard.armed = false;
@@ -872,6 +1003,8 @@ fn upstream_external_blob_mmap(
     // tk-virtgpu's generic shmem callback would construct RAM pages instead
     // of the validated MAP_BLOB PFNs. The fixed SharedPages backend publishes
     // those PFNs directly and owns their external lease across VMA splits.
+    // SAFETY: `object` points to a valid `DrmGemObject` passed from `upstream_gem_mmap`.
+    // We increment its refcount before transferring ownership to `ExternalGemMmapOwner`.
     unsafe { tk_drm_upstream::drm_gem_upstream::drm_gem_object_get(object) };
     let owner = Arc::try_new(ExternalGemMmapOwner {
         _device: file.device.clone(),
@@ -937,9 +1070,11 @@ mod tests {
         let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
         let waker = Waker::from(counter.clone());
         let _token = poll.register(&waker).unwrap();
+        // SAFETY: An all-zero byte pattern initializes a valid, empty `WaitQueueEntry` test fixture.
         let mut entry: WaitQueueEntry = unsafe { core::mem::zeroed() };
         entry.private = Arc::as_ptr(&poll).cast_mut().cast();
         assert_eq!(
+            // SAFETY: `entry` is properly initialized with `entry.private` pointing to the live `poll` Arc.
             unsafe { wake_poll_waiters(&mut entry, u32::MAX, 0, ptr::null_mut()) },
             1
         );

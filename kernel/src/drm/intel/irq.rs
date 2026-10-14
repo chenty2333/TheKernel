@@ -117,12 +117,17 @@ pub(super) mod upstream {
         if drm.is_null() || HANDLER.load(Ordering::Acquire) == 0 {
             return false;
         }
+        // SAFETY: `drm` was checked non-null above and points to the live `DrmDevice`.
+        // Reading `dev_private` retrieves the driver private `DrmI915Private` structure.
         let i915 = unsafe { (*drm).dev_private.cast::<DrmI915Private>() };
         if i915.is_null() || core::ptr::addr_of_mut!((*i915).drm) != drm {
             return false;
         }
+        // SAFETY: `i915` was verified non-null and confirmed to match `drm`. Reading `display`
+        // retrieves the initialized `IntelDisplay` sub-structure.
         let display = unsafe { (*i915).display.cast::<intel_gt::intel_display_core_types_upstream::IntelDisplay>() };
         if display.is_null()
+            // SAFETY: `display` was checked non-null and points to the `IntelDisplay` initialized during i915 probe.
             || !unsafe { intel_gt::intel_display_device_upstream::intel_display_device_present(display) }
         {
             return false;
@@ -139,6 +144,7 @@ pub(super) mod upstream {
         if drm.is_null() {
             return;
         }
+        // SAFETY: `drm` was checked non-null above; reading `dev_private` accesses the driver private structure.
         let i915 = unsafe { (*drm).dev_private.cast::<DrmI915Private>() };
         if i915.is_null() || core::ptr::addr_of_mut!((*i915).drm) != drm {
             return;
@@ -356,6 +362,8 @@ pub(super) mod upstream {
     /// ADL-P implementation. Gen11 uses its own master-control snapshot and
     /// does not consume the legacy state argument.
     unsafe extern "C" fn display_irq_handler(display: *mut c_void) {
+        // SAFETY: `display` is the non-null `intel_display` pointer passed by upstream i915 IRQ dispatch.
+        // `intel_display_irq_handler` processes display interrupts for the active Gen11/ADL display engine.
         let _ = unsafe {
             intel_gt::intel_display_irq_upstream::intel_display_irq_handler(
                 display.cast(),
@@ -387,9 +395,13 @@ pub(super) mod upstream {
     }
 
     unsafe extern "C" fn display_irq_reset(display: *mut c_void) {
+        // SAFETY: `display` points to the live `intel_display` engine passed by the upstream driver.
+        // `intel_display_irq_reset` clears display interrupt registers during driver state transitions.
         unsafe { intel_gt::intel_display_irq_upstream::intel_display_irq_reset(display.cast()) };
     }
     unsafe extern "C" fn display_irq_postinstall(display: *mut c_void) {
+        // SAFETY: `display` points to the live `intel_display` engine passed by the upstream driver.
+        // `intel_display_irq_postinstall` unmasks display interrupt registers after handler registration.
         unsafe { intel_gt::intel_display_irq_upstream::intel_display_irq_postinstall(display.cast()) };
     }
 

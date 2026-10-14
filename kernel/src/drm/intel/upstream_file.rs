@@ -770,6 +770,8 @@ pub(crate) unsafe extern "C" fn gem_handle_create(
     // Linux handle before calling the alias provider. Keep that numeric ID in
     // the single kernel `DrmFile` table; do not create a second LinuxKPI IDR
     // entry or run object open callbacks twice.
+    // SAFETY: `handle` was verified non-null on entry and points to the valid u32
+    // handle output allocated by upstream `drm_gem_handle_create_tail`.
     let requested_handle = unsafe { *handle };
     if handle_id != requested_handle {
         let _ = native.close_handle(handle_id);

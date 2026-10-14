@@ -65,10 +65,14 @@ pub(crate) unsafe extern "C" fn virtgpu_gem_prime_import(
     dev: *mut DrmDevice,
     dma_buf: *mut c_void,
 ) -> *mut DrmGemObject {
+    // SAFETY: dev and dma_buf are valid DRM device and DMA-BUF pointers provided by the caller.
     unsafe { drm_gem_prime_import(dev, dma_buf.cast::<DmaBuf>()) }
 }
 
 struct SyncGemFuncs(DrmGemObjectFuncs);
+// SAFETY: The immutable function pointer table (including null vm_ops) has static lifetime.
+// Sharing the table across threads does not waive callback caller preconditions or imply blanket
+// concurrent-call safety.
 unsafe impl Sync for SyncGemFuncs {}
 
 static VIRTGPU_GEM_FUNCS: SyncGemFuncs = SyncGemFuncs(DrmGemObjectFuncs {
@@ -102,11 +106,11 @@ pub(crate) unsafe extern "C" fn virtgpu_gem_create_object(
     _dev: *mut DrmDevice,
     _size: usize,
 ) -> *mut DrmGemObject {
-    let object =
-        unsafe { kmalloc(size_of::<VirtioGpuObject>(), GFP_KERNEL) }.cast::<VirtioGpuObject>();
+    let object = kmalloc(size_of::<VirtioGpuObject>(), GFP_KERNEL).cast::<VirtioGpuObject>();
     if object.is_null() {
         return ERR_PTR::<DrmGemObject>(-tk_linux_kapi::config::ENOMEM);
     }
+    // SAFETY: object was allocated above with size_of::<VirtioGpuObject>() bytes and checked non-null.
     unsafe { ptr::write_bytes(object.cast::<u8>(), 0, size_of::<VirtioGpuObject>()) };
     object.cast()
 }
@@ -119,15 +123,18 @@ pub(crate) unsafe extern "C" fn virtgpu_gem_prime_import_sg_table(
     attach: *mut c_void,
     sgt: *mut SgTable,
 ) -> *mut DrmGemObject {
+    // SAFETY: dev, attach, and sgt are valid pointers provided by the DRM PRIME import framework.
     let object =
         unsafe { drm_gem_shmem_prime_import_sg_table(dev, attach.cast::<DmaBufAttachment>(), sgt) };
     if !object.is_null() && !IS_ERR(object) {
+        // SAFETY: object is verified non-null and not an error pointer; VIRTGPU_GEM_FUNCS has static lifetime.
         unsafe { (*object).funcs = ptr::addr_of!(VIRTGPU_GEM_FUNCS.0) as *mut _ };
     }
     object
 }
 
 unsafe extern "C" fn virtgpu_gem_export(obj: *mut DrmGemObject, flags: i32) -> *mut c_void {
+    // SAFETY: obj is a valid GEM object pointer passed by the DRM core.
     unsafe { drm_gem_prime_export(obj, flags).cast() }
 }
 
@@ -141,6 +148,7 @@ pub(crate) unsafe extern "C" fn virtgpu_dumb_create(
     if file.is_null() || dev.is_null() || args.is_null() {
         return -tk_linux_kapi::config::EINVAL;
     }
+    // SAFETY: file, dev, and args are verified non-null, and args points to a valid DrmModeCreateDumb struct.
     unsafe {
         let width = (*args).width;
         let height = (*args).height;
@@ -212,6 +220,7 @@ pub(crate) fn create_classic_resource(
     if object.is_null() || width == 0 || height == 0 {
         return -tk_linux_kapi::config::EINVAL;
     }
+    // SAFETY: All in-crate callers hold a live driver-created GEM reference; accessing resource_id and pinning the underlying shmem GEM object is safe.
     unsafe {
         if (*object).resource_id != 0 {
             return 0;
@@ -226,6 +235,7 @@ pub(crate) fn create_classic_resource(
     let entries = match physical_page_entries(object) {
         Ok(entries) => entries,
         Err(error) => {
+            // SAFETY: All in-crate callers hold a live driver-created GEM reference and the object was pinned earlier; unpin restores the reference balance.
             unsafe {
                 drm_gem_shmem_unpin(shmem_from_object(object));
                 (*object).pinned = false;
@@ -233,7 +243,12 @@ pub(crate) fn create_classic_resource(
             return dev_error_errno(error);
         }
     };
-    let drm = unsafe { (*object).base.base.dev };
+    // SAFETY: All in-crate callers hold a live driver-created GEM reference; reading dev and format from the allocated GEM object is safe.
+    let (drm, format) = unsafe {
+        let fmt = (*object).format;
+        ((*object).base.base.dev, if fmt == 0 { 2 } else { fmt })
+    };
+    // SAFETY: drm is a valid DRM device pointer belonging to an installed VirtIO GPU device.
     let Some(result) = (unsafe {
         with_device_engine(drm, |engine, display| {
             let create = engine
@@ -243,11 +258,7 @@ pub(crate) fn create_classic_resource(
                     GpuBatch::Create2d {
                         width,
                         height,
-                        format: if unsafe { (*object).format == 0 } {
-                            2
-                        } else {
-                            unsafe { (*object).format }
-                        },
+                        format,
                         entries: Vec::new(),
                     },
                 )
@@ -300,6 +311,7 @@ pub(crate) fn create_classic_resource(
             Ok(resource_id)
         })
     }) else {
+        // SAFETY: All in-crate callers hold a live driver-created GEM reference and the object was pinned earlier; unpin restores the reference balance.
         unsafe {
             drm_gem_shmem_unpin(shmem_from_object(object));
             (*object).pinned = false;
@@ -309,6 +321,7 @@ pub(crate) fn create_classic_resource(
     let resource_id = match result {
         Ok(resource_id) => resource_id,
         Err(error) => {
+            // SAFETY: All in-crate callers hold a live driver-created GEM reference and the object was pinned earlier; unpin restores the reference balance.
             unsafe {
                 drm_gem_shmem_unpin(shmem_from_object(object));
                 (*object).pinned = false;
@@ -317,6 +330,7 @@ pub(crate) fn create_classic_resource(
         }
     };
 
+    // SAFETY: All in-crate callers hold a live driver-created GEM reference; updating its dimensions and assigned resource metadata is safe.
     unsafe {
         (*object).resource_id = resource_id;
         (*object).resource_kind = RESOURCE_CLASSIC_2D;
@@ -335,6 +349,7 @@ pub(crate) fn physical_page_entries(object: *mut VirtioGpuObject) -> DevResult<V
     if object.is_null() {
         return Err(DevError::InvalidParam);
     }
+    // SAFETY: All in-crate callers hold a live driver-created GEM reference and pin shmem prior to invocation; accessing shmem sg_table and traversing scatterlist entries is safe while shmem is pinned.
     unsafe {
         let shmem = shmem_from_object(object);
         let sgt = drm_gem_shmem_get_sg_table(shmem);
@@ -390,17 +405,20 @@ pub(crate) fn alloc_shmem_handle(
     if file.is_null() || dev.is_null() || size == 0 {
         return Err(-tk_linux_kapi::config::EINVAL);
     }
+    // SAFETY: dev is verified non-null and points to a registered DRM device.
     let shmem = unsafe { drm_gem_shmem_create(dev, size) };
     if shmem.is_null() || IS_ERR(shmem) {
         return Err(if shmem.is_null() {
             -tk_linux_kapi::config::ENOMEM
         } else {
-            unsafe { PTR_ERR(shmem.cast::<c_void>()) }
+            PTR_ERR(shmem.cast::<c_void>())
         });
     }
     let object = shmem.cast::<VirtioGpuObject>();
+    // SAFETY: object is valid and non-null; VIRTGPU_GEM_FUNCS has static lifetime.
     unsafe { (*object).base.base.funcs = ptr::addr_of!(VIRTGPU_GEM_FUNCS.0) as *mut _ };
     let mut handle = 0;
+    // SAFETY: file and object are valid DRM structures; drm_gem_handle_create installs a handle in the file's IDR table.
     let ret = unsafe {
         tk_drm_upstream::drm_gem_upstream::drm_gem_handle_create(
             file,
@@ -409,6 +427,7 @@ pub(crate) fn alloc_shmem_handle(
         )
     };
     if ret != 0 {
+        // SAFETY: handle creation failed; put drops the initial GEM reference.
         unsafe { tk_drm_upstream::drm_gem_upstream::drm_gem_object_put(&mut (*object).base.base) };
         return Err(ret);
     }
@@ -420,9 +439,10 @@ unsafe extern "C" fn virtgpu_gem_free(obj: *mut DrmGemObject) {
         return;
     }
     let object = object_from_gem(obj);
-    let resource_id = unsafe { (*object).resource_id };
+    // SAFETY: obj is verified non-null and points to an enclosing VirtioGpuObject.
+    let (resource_id, drm) = unsafe { ((*object).resource_id, (*obj).dev) };
     if resource_id != 0 {
-        let drm = unsafe { (*obj).dev };
+        // SAFETY: drm is a valid DRM device pointer belonging to an installed VirtIO GPU device.
         let _ = unsafe {
             with_device_engine(drm, |engine, display| {
                 if let Ok(fence) = engine.submit(
@@ -451,6 +471,7 @@ unsafe extern "C" fn virtgpu_gem_free(obj: *mut DrmGemObject) {
             })
         };
     }
+    // SAFETY: object and obj are valid GEM objects being freed; unpinning and freeing shmem resources is safe.
     unsafe {
         if (*object).pinned {
             drm_gem_shmem_unpin(shmem_from_object(object));
@@ -477,15 +498,17 @@ pub(crate) fn create_gem_handle(
         .and_then(|size| size.checked_add(PAGE_SIZE - 1))
         .map(|size| size & !(PAGE_SIZE - 1))
         .ok_or(-tk_linux_kapi::config::EINVAL)?;
+    // SAFETY: dev is verified non-null and points to a registered DRM device.
     let shmem = unsafe { drm_gem_shmem_create(dev, size) };
     if shmem.is_null() || IS_ERR(shmem) {
         return Err(if shmem.is_null() {
             -tk_linux_kapi::config::ENOMEM
         } else {
-            unsafe { PTR_ERR(shmem.cast::<c_void>()) }
+            PTR_ERR(shmem.cast::<c_void>())
         });
     }
     let object = shmem.cast::<VirtioGpuObject>();
+    // SAFETY: object is valid and newly allocated; VIRTGPU_GEM_FUNCS has static lifetime.
     unsafe {
         (*object).base.base.funcs = ptr::addr_of!(VIRTGPU_GEM_FUNCS.0) as *mut _;
         (*object).width = width;
@@ -496,10 +519,12 @@ pub(crate) fn create_gem_handle(
     }
     let ret = create_classic_resource(object, width, height);
     if ret != 0 {
+        // SAFETY: resource creation failed; put drops the initial GEM reference.
         unsafe { tk_drm_upstream::drm_gem_upstream::drm_gem_object_put(&mut (*object).base.base) };
         return Err(ret);
     }
     let mut handle = 0;
+    // SAFETY: file and object are valid DRM structures; installs handle in the file's IDR table.
     let ret = unsafe {
         tk_drm_upstream::drm_gem_upstream::drm_gem_handle_create(
             file,
@@ -508,11 +533,16 @@ pub(crate) fn create_gem_handle(
         )
     };
     if ret != 0 {
+        // SAFETY: handle creation failed; put drops the initial GEM reference.
         unsafe { tk_drm_upstream::drm_gem_upstream::drm_gem_object_put(&mut (*object).base.base) };
         return Err(ret);
     }
-    let resource_id = unsafe { (*object).resource_id };
-    unsafe { tk_drm_upstream::drm_gem_upstream::drm_gem_object_put(&mut (*object).base.base) };
+    // SAFETY: object is valid; reading resource_id and dropping the temporary GEM reference is safe.
+    let resource_id = unsafe {
+        let id = (*object).resource_id;
+        tk_drm_upstream::drm_gem_upstream::drm_gem_object_put(&mut (*object).base.base);
+        id
+    };
     Ok((handle, resource_id))
 }
 

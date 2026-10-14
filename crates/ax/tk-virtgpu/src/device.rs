@@ -146,10 +146,19 @@ pub(crate) struct DriverState {
 // All engine access goes through the sleepable Linux mutex. KMS objects are
 // initialized before the DRM device is registered and then remain pinned in
 // the Arc allocation until the final DRM device release.
+// SAFETY: Access to mutable DriverState is synchronized via the Linux mutex `engine_lock`.
+// KMS objects (pipe, connector) are initialized prior to DRM device registration and remain
+// pinned at stable addresses inside the Arc allocation for the lifetime of the DRM device.
 unsafe impl Send for DriverPrivate {}
+// SAFETY: DriverState uses `engine_lock`, `connected` uses atomic operations, `aperture` provides
+// internal synchronization, and KMS pipe/connector objects are initialized before publication and
+// protected by DRM modeset serialization afterwards.
 unsafe impl Sync for DriverPrivate {}
 
 struct SyncDriver(DrmDriver);
+// SAFETY: DrmDriver contains only function pointers, primitive constants, and pointers
+// to immutable static byte slices and ioctl descriptor tables. No fields are mutated
+// concurrently after initialization.
 unsafe impl Sync for SyncDriver {}
 
 static DRIVER_NAME: &[u8] = b"virtio_gpu\0";
@@ -260,9 +269,9 @@ static PIPE_FUNCS: DrmSimpleDisplayPipeFuncs = DrmSimpleDisplayPipeFuncs {
 };
 
 fn zeroed<T>() -> T {
-    // DRM object initializers follow Linux kzalloc conventions. These C-layout
-    // DRM objects contain only integers, pointers, fixed arrays and C-layout
-    // subobjects whose all-zero representation is valid.
+    // SAFETY: All in-crate call sites use zero-valid C-layout DRM/kernel structs following Linux
+    // kzalloc conventions (integers, pointers, fixed arrays whose all-zero bit pattern represents
+    // valid initial state), rather than arbitrary `T`.
     unsafe { MaybeUninit::<T>::zeroed().assume_init() }
 }
 
@@ -322,8 +331,12 @@ impl VirtioGpuDevice {
             pipe: core::cell::UnsafeCell::new(zeroed()),
             connector: core::cell::UnsafeCell::new(zeroed()),
         });
+        // SAFETY: private.engine_lock is a newly allocated, zeroed Linux mutex at a stable
+        // address inside the Arc allocation, and no concurrent threads have access yet.
         unsafe { mutex_init(&private.engine_lock) };
 
+        // SAFETY: DRM_DRIVER.0 is a valid static reference to DrmDriver, and a null parent device
+        // is valid for virtual/platform DRM devices.
         let drm = unsafe { drm_dev_alloc(&DRM_DRIVER.0, ptr::null_mut()) };
         if drm.is_null() {
             return Err(match private.take_display_after_probe() {
@@ -334,13 +347,19 @@ impl VirtioGpuDevice {
 
         // `dev_private` owns this strong reference until the core's final
         // release callback, not just until this Rust wrapper is dropped.
+        // SAFETY: drm was successfully allocated and is non-null. dev_private receives an
+        // owned Arc strong reference to DriverPrivate, which will be dropped in virtgpu_release.
         unsafe {
             (*drm).dev_private =
                 Arc::into_raw(private.clone()) as *mut DriverPrivate as *mut c_void;
         }
 
+        // SAFETY: drm is a valid allocated DrmDevice, and private is a valid heap-allocated
+        // DriverPrivate whose memory remains pinned and alive via the private Arc.
         let init = unsafe { init_drm_device(drm, Arc::as_ptr(&private) as *mut DriverPrivate) };
         if init != 0 {
+            // SAFETY: drm is a valid DrmDevice allocation. Releasing its initial reference
+            // initiates cleanup and calls virtgpu_release to reclaim dev_private.
             unsafe { drm_dev_put(drm) };
             let error = errno_to_dev_error(init);
             return Err(match private.take_display_after_probe() {
@@ -348,10 +367,14 @@ impl VirtioGpuDevice {
                 None => VirtioGpuInstallError::unrecoverable(error),
             });
         }
+        // SAFETY: drm is a valid DrmDevice whose mode configuration and display pipe have
+        // been fully initialized and is ready for registration.
         let ret = unsafe { drm_dev_register(drm, 0) };
         if ret != 0 {
             // Registration failed before a DRM node could publish this device.
             // Tear down the core before returning its transport to fallback.
+            // SAFETY: drm is a valid DrmDevice allocation; drm_dev_put tears down the device
+            // and releases dev_private via virtgpu_release.
             unsafe { drm_dev_put(drm) };
             let error = errno_to_dev_error(ret);
             return Err(match private.take_display_after_probe() {
@@ -387,6 +410,7 @@ impl VirtioGpuDevice {
     /// Map a host-visible blob directly from its live GEM object. The mapping
     /// lease also owns a GEM reference, so resource unref cannot race VMA use.
     pub unsafe fn map_blob_gem_object(&self, object: *mut DrmGemObject) -> DevResult<BlobMapping> {
+        // SAFETY: Caller guarantees object is either null or points to a valid DrmGemObject.
         unsafe { self.map_blob_gem_object_if_mappable(object) }?.ok_or(DevError::InvalidParam)
     }
 
@@ -397,10 +421,16 @@ impl VirtioGpuDevice {
         &self,
         object: *mut DrmGemObject,
     ) -> DevResult<Option<BlobMapping>> {
-        if object.is_null() || unsafe { (*object).dev != self.drm } {
+        if object.is_null() {
+            return Err(DevError::InvalidParam);
+        }
+        // SAFETY: object was verified non-null and caller guarantees it points to a valid DrmGemObject.
+        if unsafe { (*object).dev } != self.drm {
             return Err(DevError::InvalidParam);
         }
         let gpu = object.cast::<crate::gem::VirtioGpuObject>();
+        // SAFETY: object is verified non-null and belongs to self.drm, confirming it embeds
+        // a valid VirtioGpuObject at the start of the GEM object allocation.
         let (resource, size, mappable) = unsafe {
             (
                 (*gpu).resource_id,
@@ -416,6 +446,8 @@ impl VirtioGpuDevice {
         if resource == 0 {
             return Err(DevError::InvalidParam);
         }
+        // SAFETY: object is a valid DrmGemObject; increment its reference count so it remains
+        // alive for the duration of the aperture lease held in BlobMapping.
         unsafe {
             drm_gem_object_get(object);
         }
@@ -526,9 +558,12 @@ impl VirtioGpuDevice {
         if self.drm.is_null() {
             return;
         }
+        // SAFETY: self.drm is non-null and points to a registered DrmDevice owned by this instance.
         unsafe { tk_drm_upstream::drm_drv_upstream::drm_dev_unplug(self.drm) };
+        // SAFETY: self.drm is a valid DrmDevice pointer being unregistered from the system.
         unsafe { drm_dev_unregister(self.drm) };
         self.private.quiesce();
+        // SAFETY: self.drm is valid; releases the reference owned by VirtioGpuDevice.
         unsafe { drm_dev_put(self.drm) };
         self.drm = ptr::null_mut();
     }
@@ -554,6 +589,8 @@ struct GemObjectHold {
 
 impl Drop for GemObjectHold {
     fn drop(&mut self) {
+        // SAFETY: self.object holds a raw pointer to a DrmGemObject whose reference count
+        // was incremented when this hold was created; drm_gem_object_put drops that reference.
         unsafe {
             drm_gem_object_put(self.object as *mut DrmGemObject);
         }
@@ -604,8 +641,11 @@ impl DriverPrivate {
     }
 
     fn with_state<R>(&self, f: impl FnOnce(&mut DriverState) -> R) -> Option<R> {
+        // SAFETY: self.engine_lock is a valid, initialized Linux mutex.
         unsafe { mutex_lock(&self.engine_lock) };
         let mut retired_refs = Vec::new();
+        // SAFETY: Mutual exclusion is guaranteed by holding self.engine_lock, so accessing
+        // the UnsafeCell contents via &mut is safe and race-free.
         let result = unsafe {
             (&mut *self.state.get()).as_mut().and_then(|state| {
                 if state.removed {
@@ -617,6 +657,7 @@ impl DriverPrivate {
                 }
             })
         };
+        // SAFETY: self.engine_lock is currently held by this thread.
         unsafe { mutex_unlock(&self.engine_lock) };
         // GEM free callbacks can submit teardown work and re-enter this
         // mutex. Drop terminal submission references only after unlocking.
@@ -647,25 +688,32 @@ impl DriverPrivate {
     /// the DRM device is published. Probe commands are terminal/reaped before
     /// this point, so no GPU queue reset is needed or desirable.
     fn take_display_after_probe(&self) -> Option<Box<dyn DisplayDriverOps>> {
+        // SAFETY: self.engine_lock is a valid, initialized Linux mutex.
         unsafe { mutex_lock(&self.engine_lock) };
+        // SAFETY: Holding self.engine_lock grants exclusive access to self.state.
         let state = unsafe { &mut *self.state.get() };
         let Some(current) = state.as_mut() else {
+            // SAFETY: self.engine_lock is held and must be released before returning.
             unsafe { mutex_unlock(&self.engine_lock) };
             return None;
         };
         if !current.pending_refs.is_empty() {
+            // SAFETY: self.engine_lock is held and must be released before returning.
             unsafe { mutex_unlock(&self.engine_lock) };
             return None;
         }
         current.removed = true;
         let owned = state.take();
+        // SAFETY: self.engine_lock is held and must be released before returning.
         unsafe { mutex_unlock(&self.engine_lock) };
         let DriverState { display, .. } = owned?;
         Some(display)
     }
 
     fn quiesce(&self) {
+        // SAFETY: self.engine_lock is a valid, initialized Linux mutex.
         unsafe { mutex_lock(&self.engine_lock) };
+        // SAFETY: Holding self.engine_lock guarantees exclusive access to self.state.
         let retired_refs = unsafe {
             if let Some(state) = (&mut *self.state.get()).as_mut() {
                 state.engine.reset(&mut *state.display, GpuQueue::Control);
@@ -677,6 +725,7 @@ impl DriverPrivate {
                 Vec::new()
             }
         };
+        // SAFETY: self.engine_lock is held by the current thread.
         unsafe { mutex_unlock(&self.engine_lock) };
         drop_gem_refs(retired_refs);
     }
@@ -709,6 +758,8 @@ fn take_terminal_gem_refs(state: &mut DriverState) -> Vec<usize> {
         if done {
             let (_, refs) = state.pending_refs.swap_remove(index);
             for &object in &refs {
+                // SAFETY: object was registered from a live VirtioGpuObject whose GEM reference
+                // count was held for the duration of this submission, ensuring valid memory access.
                 unsafe {
                     let gem = object as *mut crate::gem::VirtioGpuObject;
                     if (*gem).last_fence_id == fence_id {
@@ -732,6 +783,8 @@ fn take_terminal_gem_refs(state: &mut DriverState) -> Vec<usize> {
 
 fn drop_gem_refs(refs: Vec<usize>) {
     for object in refs {
+        // SAFETY: Each object pointer represents a strong GEM reference acquired during
+        // submission tracking. Releasing it via drm_gem_object_put balances the reference count.
         unsafe {
             tk_drm_upstream::drm_gem_upstream::drm_gem_object_put(
                 object as *mut tk_drm_upstream::drm_gem_types::DrmGemObject,
@@ -741,6 +794,8 @@ fn drop_gem_refs(refs: Vec<usize>) {
 }
 
 unsafe fn init_drm_device(drm: *mut DrmDevice, private: *mut DriverPrivate) -> i32 {
+    // SAFETY: Caller guarantees drm is a valid, allocated DrmDevice and private points
+    // to a valid DriverPrivate whose connector and pipe cells are ready for initialization.
     unsafe {
         let ret = drmm_mode_config_init(drm);
         if ret != 0 {
@@ -807,6 +862,8 @@ unsafe fn private_from_device<'a>(drm: *mut DrmDevice) -> Option<&'a DriverPriva
     if drm.is_null() {
         return None;
     }
+    // SAFETY: drm is non-null and caller guarantees it points to a valid DrmDevice whose
+    // dev_private was initialized to point to an Arc-managed DriverPrivate during device creation.
     unsafe { (*drm).dev_private.cast::<DriverPrivate>().as_ref() }
 }
 
@@ -814,6 +871,7 @@ pub(crate) unsafe fn with_device_engine<R>(
     drm: *mut DrmDevice,
     f: impl FnOnce(&mut GpuEngine, &mut dyn DisplayDriverOps) -> R,
 ) -> Option<R> {
+    // SAFETY: Caller guarantees drm is either null or points to a valid DrmDevice.
     let private = unsafe { private_from_device(drm) }?;
     private.with_engine(f)
 }
@@ -822,14 +880,18 @@ pub(crate) unsafe fn with_device_state<R>(
     drm: *mut DrmDevice,
     f: impl FnOnce(&mut DriverState) -> R,
 ) -> Option<R> {
+    // SAFETY: Caller guarantees drm is either null or points to a valid DrmDevice.
     let private = unsafe { private_from_device(drm) }?;
     private.with_state(f)
 }
 
 pub(crate) unsafe fn private_arc_from_device(drm: *mut DrmDevice) -> Option<Arc<DriverPrivate>> {
+    // SAFETY: Caller guarantees drm is either null or points to a valid DrmDevice.
     let private = unsafe { private_from_device(drm) }?;
     let raw = private as *const DriverPrivate;
+    // SAFETY: raw points to a valid DriverPrivate originating from an Arc allocation.
     unsafe { Arc::increment_strong_count(raw) };
+    // SAFETY: The strong count was just incremented, so reconstructing an Arc from raw is safe.
     Some(unsafe { Arc::from_raw(raw) })
 }
 
@@ -837,6 +899,8 @@ unsafe extern "C" fn virtgpu_release(drm: *mut DrmDevice) {
     if drm.is_null() {
         return;
     }
+    // SAFETY: drm is a valid DrmDevice undergoing release. dev_private holds the raw
+    // Arc<DriverPrivate> reference transferred during install, which must now be dropped.
     unsafe {
         let raw = (*drm).dev_private.cast::<DriverPrivate>();
         (*drm).dev_private = ptr::null_mut();
@@ -847,6 +911,7 @@ unsafe extern "C" fn virtgpu_release(drm: *mut DrmDevice) {
 }
 
 unsafe extern "C" fn virtgpu_connector_destroy(connector: *mut DrmConnector) {
+    // SAFETY: connector is a valid DrmConnector provided by the DRM core for cleanup.
     unsafe { drm_connector_cleanup(connector) };
 }
 
@@ -854,6 +919,7 @@ unsafe extern "C" fn virtgpu_connector_detect(connector: *mut DrmConnector, _for
     if connector.is_null() {
         return CONNECTOR_STATUS_DISCONNECTED;
     }
+    // SAFETY: connector is non-null and DRM core guarantees its dev field points to a valid DrmDevice.
     let Some(private) = (unsafe { private_from_device((*connector).dev) }) else {
         return CONNECTOR_STATUS_DISCONNECTED;
     };
@@ -868,12 +934,14 @@ unsafe extern "C" fn virtgpu_connector_get_modes(connector: *mut DrmConnector) -
     if connector.is_null() {
         return 0;
     }
+    // SAFETY: connector is non-null and DRM core guarantees its dev field points to a valid DrmDevice.
     let Some(private) = (unsafe { private_from_device((*connector).dev) }) else {
         return 0;
     };
     if !private.connected.load(Ordering::Acquire) {
         return 0;
     }
+    // SAFETY: (*connector).dev is a valid DrmDevice, and dimensions are within validated display bounds.
     let mode = unsafe {
         tk_drm_upstream::drm_modes_upstream::drm_cvt_mode(
             (*connector).dev,
@@ -888,6 +956,8 @@ unsafe extern "C" fn virtgpu_connector_get_modes(connector: *mut DrmConnector) -
     if mode.is_null() {
         return 0;
     }
+    // SAFETY: mode is non-null and freshly created by drm_cvt_mode; drm_mode_probed_add adds it
+    // to connector's probed_modes list and takes ownership of it.
     unsafe {
         (*mode).r#type |= DRM_MODE_TYPE_PREFERRED as u8;
         tk_drm_upstream::drm_modes_upstream::drm_mode_probed_add(connector, mode);
@@ -899,6 +969,7 @@ unsafe extern "C" fn virtgpu_connector_mode_valid(
     _connector: *mut DrmConnector,
     mode: *mut DrmDisplayMode,
 ) -> DrmModeStatus {
+    // SAFETY: virtgpu_pipe_mode_valid safely handles null pipe and validates mode bounds.
     unsafe { virtgpu_pipe_mode_valid(ptr::null_mut(), mode) }
 }
 
@@ -908,9 +979,12 @@ unsafe extern "C" fn virtgpu_best_encoder(
     if connector.is_null() {
         return ptr::null_mut();
     }
+    // SAFETY: connector is non-null and (*connector).dev points to a valid DrmDevice.
     let Some(private) = (unsafe { private_from_device((*connector).dev) }) else {
         return ptr::null_mut();
     };
+    // SAFETY: private.pipe is a valid, pinned DrmSimpleDisplayPipe whose embedded encoder
+    // remains valid for the lifetime of the DRM device.
     unsafe { ptr::addr_of_mut!((*private.pipe.get()).encoder) }
 }
 
@@ -918,6 +992,7 @@ unsafe extern "C" fn virtgpu_mode_valid(
     _drm: *mut DrmDevice,
     mode: *mut DrmDisplayMode,
 ) -> DrmModeStatus {
+    // SAFETY: virtgpu_pipe_mode_valid safely handles a null pipe and validates mode.
     unsafe { virtgpu_pipe_mode_valid(ptr::null_mut(), mode) }
 }
 
@@ -927,6 +1002,8 @@ unsafe extern "C" fn virtgpu_fb_create(
     info: *mut tk_drm_upstream::drm_fourcc_types::DrmFormatInfo,
     cmd: *mut tk_drm_upstream::uapi_drm_mode_types::DrmModeFbCmd2,
 ) -> *mut tk_drm_upstream::drm_framebuffer_types::DrmFramebuffer {
+    // SAFETY: Arguments are forwarded from the DRM core callback; dev, file, info, and cmd
+    // are valid pointers supplied by the DRM subsystem.
     unsafe { drm_gem_fb_create(dev, file, info.cast_const(), cmd.cast_const()) }
 }
 
@@ -937,6 +1014,7 @@ unsafe extern "C" fn virtgpu_pipe_mode_valid(
     if mode.is_null() {
         return MODE_VIRTUAL_X;
     }
+    // SAFETY: mode is verified non-null and points to a valid DrmDisplayMode provided by the caller.
     unsafe {
         let width = (*mode).hdisplay as u32;
         let height = (*mode).vdisplay as u32;
@@ -955,10 +1033,16 @@ unsafe extern "C" fn virtgpu_pipe_enable(
     _crtc_state: *mut tk_drm_upstream::drm_crtc_types::DrmCrtcState,
     _plane_state: *mut tk_drm_upstream::drm_plane_types::DrmPlaneState,
 ) {
-    if pipe.is_null() || unsafe { (*pipe).crtc.dev.is_null() } {
+    if pipe.is_null() {
         return;
     }
-    let Some(private) = (unsafe { private_from_device((*pipe).crtc.dev) }) else {
+    // SAFETY: pipe is non-null and provided by the DRM simple display pipe helper.
+    let dev = unsafe { (*pipe).crtc.dev };
+    if dev.is_null() {
+        return;
+    }
+    // SAFETY: dev is non-null and points to the owning DrmDevice.
+    let Some(private) = (unsafe { private_from_device(dev) }) else {
         return;
     };
     private.connected.store(true, Ordering::Release);
@@ -967,10 +1051,12 @@ unsafe extern "C" fn virtgpu_pipe_enable(
 unsafe extern "C" fn virtgpu_pipe_disable(_pipe: *mut DrmSimpleDisplayPipe) {}
 
 unsafe extern "C" fn virtgpu_pipe_enable_vblank(pipe: *mut DrmSimpleDisplayPipe) -> i32 {
+    // SAFETY: pipe is provided by DRM simple display pipe callbacks, and (*pipe).crtc is initialized.
     unsafe { drm_crtc_vblank_helper_enable_vblank_timer(core::ptr::addr_of_mut!((*pipe).crtc)) }
 }
 
 unsafe extern "C" fn virtgpu_pipe_disable_vblank(pipe: *mut DrmSimpleDisplayPipe) {
+    // SAFETY: pipe is provided by DRM simple display pipe callbacks, and (*pipe).crtc is initialized.
     unsafe {
         drm_crtc_vblank_helper_disable_vblank_timer(core::ptr::addr_of_mut!((*pipe).crtc));
     }
@@ -983,29 +1069,43 @@ unsafe extern "C" fn virtgpu_pipe_update(
     if plane_state.is_null() {
         return;
     }
+    // SAFETY: plane_state is verified non-null and provided by the DRM simple pipe helper.
     let fb = unsafe { (*plane_state).fb };
     if fb.is_null() {
         return;
     }
+    // SAFETY: fb is non-null; obj[0] points to the primary plane GEM object.
     let object = unsafe { (*fb).obj[0] };
     if object.is_null() {
         return;
     }
     let gpu = object.cast::<VirtioGpuObject>();
-    let resource = unsafe { (*gpu).resource_id };
+    // SAFETY: gpu is a valid driver-owned VirtioGpuObject pointer derived from obj[0].
+    let mut resource = unsafe { (*gpu).resource_id };
     if resource == 0 {
-        let ret = create_classic_resource(gpu, unsafe { (*fb).width }, unsafe { (*fb).height });
+        // SAFETY: fb is non-null and points to a valid DrmFramebuffer.
+        let (fb_w, fb_h) = unsafe { ((*fb).width, (*fb).height) };
+        let ret = create_classic_resource(gpu, fb_w, fb_h);
         if ret != 0 {
             return;
         }
+        // SAFETY: gpu is valid and its resource_id was populated by create_classic_resource.
+        resource = unsafe { (*gpu).resource_id };
     }
-    let resource = unsafe { (*gpu).resource_id };
     if resource == 0 {
         return;
     }
-    let dev = unsafe { (*fb).dev };
-    let (fb_width, fb_height) = unsafe { ((*fb).width, (*fb).height) };
-    let (width, height) = unsafe { ((*plane_state).crtc_w, (*plane_state).crtc_h) };
+    // SAFETY: fb is non-null and points to a valid DrmFramebuffer.
+    let (dev, fb_width, fb_height) = unsafe { ((*fb).dev, (*fb).width, (*fb).height) };
+    // SAFETY: plane_state is non-null and points to a valid DrmPlaneState.
+    let (width, height, src_x, src_y) = unsafe {
+        (
+            (*plane_state).crtc_w,
+            (*plane_state).crtc_h,
+            (*plane_state).src_x >> 16,
+            (*plane_state).src_y >> 16,
+        )
+    };
     if fb_width == 0
         || fb_height == 0
         || fb_width > 8192
@@ -1017,25 +1117,34 @@ unsafe extern "C" fn virtgpu_pipe_update(
     {
         return;
     }
-    let x = unsafe { (*plane_state).src_x >> 16 };
-    let y = unsafe { (*plane_state).src_y >> 16 };
+    let x = src_x;
+    let y = src_y;
     if x.checked_add(width).is_none_or(|right| right > fb_width)
         || y.checked_add(height)
             .is_none_or(|bottom| bottom > fb_height)
     {
         return;
     }
-    let is_blob = unsafe { (*gpu).is_blob };
-    if !is_blob && unsafe { (*gpu).resource_kind == 3 } {
+    // SAFETY: gpu is a valid driver-owned VirtioGpuObject.
+    let (is_blob, resource_kind) = unsafe { ((*gpu).is_blob, (*gpu).resource_kind) };
+    if !is_blob && resource_kind == 3 {
         // The initial virtual scanout supports classic 2D resources and
         // directly scanned-out blobs; arbitrary virgl resources are not a
         // scanout source.
         return;
     }
+    // SAFETY: fb is non-null and points to a valid DrmFramebuffer.
     let format = unsafe { (*fb).format };
     if is_blob && format.is_null() {
         return;
     }
+    let (format_val, stride, offset) = if is_blob {
+        // SAFETY: format is verified non-null for blob buffers, and fb is a valid DrmFramebuffer.
+        unsafe { ((*format).format, (*fb).pitches[0], (*fb).offsets[0]) }
+    } else {
+        (0, 0, 0)
+    };
+    // SAFETY: dev points to the DrmDevice associated with fb.
     let Some(result) = (unsafe {
         with_device_state(dev, |state| {
             if is_blob {
@@ -1047,9 +1156,9 @@ unsafe extern "C" fn virtgpu_pipe_update(
                     height,
                     framebuffer_width: fb_width,
                     framebuffer_height: fb_height,
-                    format: (*format).format,
-                    stride: (*fb).pitches[0],
-                    offset: (*fb).offsets[0],
+                    format: format_val,
+                    stride,
+                    offset,
                     damage: None,
                 };
                 let present = state

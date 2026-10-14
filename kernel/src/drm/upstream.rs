@@ -56,6 +56,8 @@ pub(crate) trait UpstreamGemMmapProvider: Send + Sync {
 // SAFETY: the owner retains the immutable registered DRM core and its
 // transport; mutations are performed by the upstream DRM synchronization.
 unsafe impl Send for UpstreamDrmDevice {}
+// SAFETY: Upstream DRM device state is synchronized internally via Linux mutexes,
+// spinlocks, and atomic refcounts; concurrent references across threads are safe.
 unsafe impl Sync for UpstreamDrmDevice {}
 
 impl UpstreamDrmDevice {
@@ -139,6 +141,8 @@ pub(crate) fn install_primary(
     let raw = NonNull::new(raw).ok_or(AxError::InvalidInput)?;
     if mode.0 == 0
         || mode.1 == 0
+        // SAFETY: `raw` is a validated NonNull pointer to an initialized `DrmDevice`.
+        // Inspecting `registered` and `primary` verifies that device registration completed.
         || unsafe { !raw.as_ref().registered || raw.as_ref().primary.is_null() }
     {
         return Err(AxError::InvalidInput);
@@ -183,11 +187,18 @@ pub(crate) fn unplug_primary(expected: *mut DrmDevice) -> AxResult<()> {
     device
         .unplugged
         .store(true, core::sync::atomic::Ordering::Release);
+    // SAFETY: `expected` was verified to match `device.raw()`, pointing to the registered
+    // `DrmDevice`. `drm_dev_unplug` unregisters minor nodes and marks the device unplugged
+    // while keeping existing open file references intact.
     unsafe { tk_drm_upstream::drm_drv_upstream::drm_dev_unplug(expected) };
     device.revoke_external_pages();
     if let Some(helper) = device.fb_helper.as_ref() {
         let helper = (&**helper as *const DrmFbHelper).cast_mut();
+        // SAFETY: `helper` points to the pinned `DrmFbHelper` instance initialized in `initialize_fbdev`.
+        // Reading `info` checks whether an associated `fb_info` was registered.
         if unsafe { !(*helper).info.is_null() } {
+            // SAFETY: `helper` is valid and `(*helper).info` is non-null. `drm_fb_helper_unregister_info`
+            // tears down the registered framebuffer device before dropping the helper.
             unsafe {
                 tk_drm_upstream::drm_fb_helper_upstream::drm_fb_helper_unregister_info(helper)
             };
@@ -201,6 +212,8 @@ pub(crate) fn unplug_primary(expected: *mut DrmDevice) -> AxResult<()> {
 /// a framebuffer node; devfs publishes `/dev/fb0` only after real fb_info
 /// registration succeeds.
 fn initialize_fbdev(dev: *mut DrmDevice) -> Option<Box<DrmFbHelper>> {
+    // SAFETY: An all-zero byte pattern is valid initialization for `DrmFbHelper` before
+    // `drm_fb_helper_prepare` sets up its fields and function table.
     let mut helper = match Box::try_new(unsafe { core::mem::zeroed::<DrmFbHelper>() }) {
         Ok(helper) => helper,
         Err(_) => {
@@ -209,10 +222,16 @@ fn initialize_fbdev(dev: *mut DrmDevice) -> Option<Box<DrmFbHelper>> {
         }
     };
     let helper_ptr = (&mut *helper) as *mut DrmFbHelper;
+    // SAFETY: `dev` is a valid, live `DrmDevice` pointer passed from `install_primary`.
+    // Dereferencing `dev` to read the immutable `driver` pointer is safe and race-free.
     let driver = unsafe { (*dev).driver };
     if driver.is_null() {
         return None;
     }
+    // SAFETY: `dev` and `driver` are valid pointers to the live DRM device and its driver descriptor.
+    // `helper_ptr` points to the exclusively owned, allocated `DrmFbHelper`. We invoke upstream
+    // fb helper lifecycle APIs (`prepare`, `init`, `initial_config`, and error unwind paths) sequentially
+    // while initializing the fbdev emulation.
     unsafe {
         if (*driver).fbdev_probe.is_none() {
             (*driver).fbdev_probe =

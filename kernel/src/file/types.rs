@@ -76,6 +76,8 @@ struct SharedMmapCleanup {
 // SAFETY: the callback table is immutable and cached page refs are protected
 // by a spinlock; finalization runs once in task context.
 unsafe impl Send for SharedMmapCleanup {}
+// SAFETY: `SharedMmapCleanup` accesses the immutable callback table and protects cached page
+// references behind a spinlock. Concurrent read-only references across threads cannot cause data races.
 unsafe impl Sync for SharedMmapCleanup {}
 
 impl MappingFinalizer for SharedMmapCleanup {
@@ -88,17 +90,25 @@ impl MappingFinalizer for SharedMmapCleanup {
         vma.vm_start = self.template_start;
         vma.vm_end = self.template_end;
         vma.vm_mm = self.vm_mm;
+        // SAFETY: `self.vm_flags` contains valid VM flags configured during VMA binding.
+        // `vm_get_page_prot` translates these architectural flags into page protection bits.
         vma.vm_page_prot = unsafe { tk_linux_kapi::mm::vm_get_page_prot(self.vm_flags) };
         vma.vm_flags = self.vm_flags;
         vma.vm_ops = self.vm_ops;
         vma.vm_pgoff = self.template_pgoff;
         vma.vm_file = self.vm_file;
         vma.vm_private_data = self.vm_private_data;
+        // SAFETY: `self.owner` keeps `vm_ops` alive throughout finalization, and `vm_ops` was verified
+        // non-null during `from_vma`. Accessing the immutable operations table is safe.
         if let Some(close) = unsafe { (*self.vm_ops).close } {
+            // SAFETY: `close` is the provider's VMA close callback, called with a synthesized `vma`
+            // matching the template attributes established when the mapping was bound.
             unsafe { close(&mut vma) };
         }
         for page in self.page_refs.lock().drain(..) {
             if page != 0 {
+                // SAFETY: `page` represents an acquired reference stored by `retain_fault_page`.
+                // Releasing it via `put_page` balances the reference held for the mapping's lifetime.
                 unsafe { tk_linux_kapi::shmem::put_page(page as *mut Page) };
             }
         }
@@ -126,10 +136,14 @@ impl SharedMmapOps {
             || pages.page_size() != axhal::paging::PageSize::Size4K
             || vma.vm_ops.is_null()
             || vma.vm_file.is_null()
+            // SAFETY: `vma.vm_file` was checked non-null above, and caller guarantees `vma` is live
+            // and initialized by the provider's mmap callback.
             || unsafe { (*vma.vm_file).f_mapping.is_null() }
         {
             return Err(AxError::InvalidInput);
         }
+        // SAFETY: `vma.vm_ops` was verified non-null above, and caller guarantees `owner` keeps
+        // `vm_ops` valid and pinned for the duration of the binding.
         let vm_ops = unsafe { &*vma.vm_ops };
         if vma.vm_flags & tk_linux_kapi::mm::VM_SHARED == 0
             || vm_ops.fault.is_none()
@@ -164,6 +178,8 @@ impl SharedMmapOps {
             vm_mm: vma.vm_mm,
             vm_file: vma.vm_file,
             vm_private_data: vma.vm_private_data,
+            // SAFETY: `vma.vm_file` was verified non-null above, and caller ensures `vma` and its
+            // file structure remain live during `from_vma`.
             mapping: unsafe { (*vma.vm_file).f_mapping },
             vm_flags: vma.vm_flags,
             template_pgoff: vma.vm_pgoff,
@@ -206,6 +222,8 @@ impl SharedMmapOps {
         vma.vm_ops == self.vm_ops
             && vma.vm_mm == self.vm_mm
             && vma.vm_private_data == self.vm_private_data
+            // SAFETY: `vma.vm_file` was checked non-null above, and caller guarantees `vma` and its
+            // `vm_file` pointer remain live for the check.
             && unsafe { (*vma.vm_file).f_mapping == self.mapping }
             && (vma.vm_flags & !access_flags) == (self.vm_flags & !access_flags)
     }
@@ -225,6 +243,8 @@ impl SharedMmapOps {
             | tk_linux_kapi::mm::VM_WRITE
             | tk_linux_kapi::mm::VM_EXEC;
         vma.vm_flags = (vm_flags & access_flags) | (self.vm_flags & !access_flags);
+        // SAFETY: `vma.vm_flags` is a valid combination of VM access and attribute flags.
+        // `vm_get_page_prot` translates architectural VM flags into page protections.
         vma.vm_page_prot = unsafe { tk_linux_kapi::mm::vm_get_page_prot(vma.vm_flags) };
         vma.vm_ops = self.vm_ops;
         vma.vm_pgoff = pgoff;
@@ -234,27 +254,41 @@ impl SharedMmapOps {
     }
 
     pub(crate) unsafe fn call_fault(&self, fault: &mut VmFault) -> u32 {
+        // SAFETY: `self.vm_ops` is kept alive by `owner` via `self._cleanup`. Accessing the
+        // immutable `fault` function pointer from the driver's ops table is safe.
         let Some(callback) = (unsafe { (*self.vm_ops).fault }) else {
             return tk_linux_kapi::mm::VM_FAULT_SIGBUS;
         };
+        // SAFETY: Caller guarantees `fault` is a live, properly initialized `VmFault` descriptor.
+        // `callback` is the driver's registered fault handler invoked in accordance with Linux VM conventions.
         unsafe { callback(fault) }
     }
 
     pub(crate) unsafe fn call_page_mkwrite(&self, fault: &mut VmFault) -> u32 {
+        // SAFETY: `self.vm_ops` is kept alive by `owner` via `self._cleanup`. Accessing the
+        // immutable `page_mkwrite` function pointer from the driver's ops table is safe.
         let Some(callback) = (unsafe { (*self.vm_ops).page_mkwrite }) else {
             return tk_linux_kapi::mm::VM_FAULT_SIGBUS;
         };
+        // SAFETY: Caller guarantees `fault` is a live, properly initialized `VmFault` descriptor.
+        // `callback` is the driver's registered page_mkwrite handler invoked with VMA write context.
         unsafe { callback(fault) }
     }
 
     pub(crate) unsafe fn call_pfn_mkwrite(&self, fault: &mut VmFault) -> u32 {
+        // SAFETY: `self.vm_ops` is kept alive by `owner` via `self._cleanup`. Accessing the
+        // immutable `pfn_mkwrite` function pointer from the driver's ops table is safe.
         let Some(callback) = (unsafe { (*self.vm_ops).pfn_mkwrite }) else {
             return tk_linux_kapi::mm::VM_FAULT_SIGBUS;
         };
+        // SAFETY: Caller guarantees `fault` is a live, properly initialized `VmFault` descriptor.
+        // `callback` is the driver's registered pfn_mkwrite handler.
         unsafe { callback(fault) }
     }
 
     pub(crate) fn has_page_mkwrite(&self) -> bool {
+        // SAFETY: `self.vm_ops` is kept alive and pinned by `owner` via `self._cleanup`.
+        // Reading the immutable callback pointer from the driver's operations table is safe.
         unsafe { (*self.vm_ops).page_mkwrite.is_some() }
     }
 
@@ -269,11 +303,17 @@ impl SharedMmapOps {
     ) -> AxResult<SharedMmapPageRef> {
         if page.is_null() || index >= self.pages.len() {
             if !page.is_null() {
+                // SAFETY: `page` is a non-null reference returned by the driver's fault callback.
+                // Calling `put_page` releases the acquired reference on the error path.
                 unsafe { tk_linux_kapi::shmem::put_page(page) };
             }
             return Err(AxError::BadAddress);
         }
+        // SAFETY: `page` is non-null and represents a valid `Page` returned by the driver's fault
+        // callback. `try_page_to_phys` safely queries its physical address without mutating it.
         if unsafe { tk_linux_kapi::shmem::try_page_to_phys(page) } != Some(expected_paddr) {
+            // SAFETY: `page` was returned by the fault callback with an acquired reference.
+            // Releasing it via `put_page` balances the reference when address verification fails.
             unsafe { tk_linux_kapi::shmem::put_page(page) };
             return Err(AxError::BadAddress);
         }
@@ -282,6 +322,8 @@ impl SharedMmapOps {
             // Transfer the callback's reference to the VMA lifetime, and take
             // a second one for the in-flight callback/PTE publication.
             refs[index] = page as usize;
+            // SAFETY: `page` is a valid `Page` returned by the fault callback and verified to match
+            // the expected backing address. `get_page` increments its reference count for the caller.
             unsafe { tk_linux_kapi::shmem::get_page(page) };
             Ok(SharedMmapPageRef(page as usize))
         } else if refs[index] == page as usize {
@@ -289,6 +331,8 @@ impl SharedMmapOps {
             // page; use it now and retain the original until final close.
             Ok(SharedMmapPageRef(page as usize))
         } else {
+            // SAFETY: `page` was returned with an acquired reference by the fault callback. Calling
+            // `put_page` releases it because `refs[index]` already holds a different registered page.
             unsafe { tk_linux_kapi::shmem::put_page(page) };
             Err(AxError::BadAddress)
         }
@@ -301,6 +345,8 @@ impl SharedMmapOps {
             return None;
         }
         let page = page as *mut Page;
+        // SAFETY: `page` is a valid `Page` pointer previously registered and kept alive in `self.page_refs`.
+        // `get_page` increments its reference count to return a new reference to the caller.
         unsafe { tk_linux_kapi::shmem::get_page(page) };
         Some(SharedMmapPageRef(page as usize))
     }
@@ -317,12 +363,16 @@ impl SharedMmapPageRef {
     }
 
     pub(crate) fn paddr(&self) -> usize {
+        // SAFETY: `self.page()` is a valid, refcounted `Page` pointer kept alive by `SharedMmapPageRef`.
+        // `page_to_phys` safely converts the valid page into its physical address.
         unsafe { tk_linux_kapi::shmem::page_to_phys(self.page()) }
     }
 }
 
 impl Drop for SharedMmapPageRef {
     fn drop(&mut self) {
+        // SAFETY: `self.page()` holds a reference acquired when `SharedMmapPageRef` was created.
+        // Releasing it via `put_page` balances that reference.
         unsafe { tk_linux_kapi::shmem::put_page(self.page()) };
     }
 }

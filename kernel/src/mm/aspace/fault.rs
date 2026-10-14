@@ -161,6 +161,8 @@ impl AddrSpace {
         if area.flags().contains(MappingFlags::SHADOW_STACK) {
             return VM_FAULT_SIGBUS;
         }
+        // SAFETY: `vma` is a live `VmAreaStruct` provided by the caller for this fault event,
+        // and its `vm_file` pointer remains valid for the duration of `matches_vma`.
         if !unsafe { ops.matches_vma(vma) }
             || pgoff != vma.vm_pgoff as usize + (page.as_usize() - vma.vm_start as usize) / PAGE_SIZE_4K
             || pfn.checked_mul(PAGE_SIZE_4K) != Some(backing_paddr)
