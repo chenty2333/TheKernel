@@ -12,7 +12,7 @@ class PowerPayloadTests(unittest.TestCase):
             self.assertTrue(url.startswith("https://dl-cdn.alpinelinux.org/alpine/v3.24/"))
             self.assertTrue(url.endswith(filename))
             self.assertTrue(license and origin)
-        script = (ROOT / "scripts/build-power-payload.sh").read_text()
+        script = (ROOT / "tools/build/build-power-payload.sh").read_text()
         self.assertIn('"${APK[@]}" verify "${PACKAGES[@]}"', script)
         self.assertNotIn("sudo", script)
         self.assertIn("POWER-MANIFEST", script)

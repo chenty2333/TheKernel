@@ -254,7 +254,7 @@ def artifact_input_key(artifacts: Artifacts, rootfs: Path | None, transport: str
     digest = hashlib.sha256()
     grub = "grub.cfg" if transport == "module" else "grub-drive.cfg"
     for relative in ("config/kernel.toml", artifacts.machine.config, "rust-toolchain.toml",
-                     "scripts/build-x86-uefi-esp.sh", f"config/x86_64/{grub}"):
+                     "tools/build/build-x86-uefi-esp.sh", f"config/x86_64/{grub}"):
         content = (REPO_ROOT / relative).read_bytes()
         digest.update(len(content).to_bytes(8, "little"))
         digest.update(content)
@@ -311,21 +311,21 @@ def validate_artifact_config(artifacts: Artifacts, rootfs: Path | None, transpor
 # fingerprint only sees the staged result -- editing a pin and reusing an old
 # staging tree would otherwise leave a stamped image in place.
 ROOTFS_INPUT_FILES = (
-    "scripts/build-rootfs.sh",
-    "scripts/stage-rootfs-firmware.sh",
-    "scripts/stage-intel-bt-firmware.sh",
-    "scripts/build-iwx-firmware-payload.sh",
-    "scripts/ci/n305-dhcp.script",
-    "scripts/build-guest-tools.sh",
-    "scripts/build-nested-payload.sh",
-    "scripts/build-glibc-payload.sh",
-    "scripts/build-gcc-payload.sh",
-    "scripts/build-inspect-payload.sh",
-    "scripts/build-bluez-payload.sh",
+    "tools/build/build-rootfs.sh",
+    "tools/build/stage-rootfs-firmware.sh",
+    "tools/build/stage-intel-bt-firmware.sh",
+    "tools/build/build-iwx-firmware-payload.sh",
+    "tools/hardware/n305-dhcp.script",
+    "tools/build/build-guest-tools.sh",
+    "tools/build/build-nested-payload.sh",
+    "tools/build/build-glibc-payload.sh",
+    "tools/build/build-gcc-payload.sh",
+    "tools/build/build-inspect-payload.sh",
+    "tools/build/build-bluez-payload.sh",
     "config/guest-bluez-apk-pins.tsv",
     "config/inspect-apks.lock",
-    "scripts/build-containers-payload.sh",
-    "scripts/install-container-filecaps.py",
+    "tools/build/build-containers-payload.sh",
+    "tools/build/install-container-filecaps.py",
     "config/containers-apks.lock",
     "tests/guest/container-bwrap.sh",
     "tests/guest/container-crun.sh",
@@ -334,8 +334,8 @@ ROOTFS_INPUT_FILES = (
     "tests/guest/block-gpt-tools.sh",
     "tests/guest/block-partition-mkfs-smoke.sh",
     "tests/guest/container-namespace.sh",
-    "scripts/lib/musl-host-compiler.sh",
-    "scripts/create-rootfs-image.sh",
+    "tools/build/lib/musl-host-compiler.sh",
+    "tools/build/create-rootfs-image.sh",
     "tools/nested/alpine/build-initramfs.sh",
     "tests/guest/shell-init.sh",
     "tests/guest/bluetooth-bluez-smoke.sh",
@@ -371,12 +371,12 @@ ROOTFS_INPUT_ENV = (
 # kernel embeds it and the two payloads must never be confused for one another.
 TOOL_PAYLOADS = ("none", "tcc", "nested", "glibc", "gcc", "inspect")
 TOOL_PAYLOADS += ("containers", "debug")
-ROOTFS_INPUT_FILES += ("scripts/build-debug-payload.sh", "config/guest-debug-apk-pins.tsv")
+ROOTFS_INPUT_FILES += ("tools/build/build-debug-payload.sh", "config/guest-debug-apk-pins.tsv")
 ROOTFS_INPUT_GLOBS += ("tests/guest/debugger/*",)
 TOOL_PAYLOADS += ("acpica",)
 TOOL_PAYLOADS += ("wireless",)
 ROOTFS_INPUT_FILES += (
-    "scripts/build-wireless-payload.sh",
+    "tools/build/build-wireless-payload.sh",
     "config/guest-wireless-apk-pins.tsv",
 )
 TOOL_PAYLOADS += ("bluez",)

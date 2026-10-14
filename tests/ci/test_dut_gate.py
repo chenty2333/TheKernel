@@ -20,7 +20,7 @@ from tests.support import load_script_module, repo_root, test_tmpdir
 
 
 def load_gate():
-    return load_script_module("thekernel_dut_gate", "scripts/ci/dut_gate.py")
+    return load_script_module("thekernel_dut_gate", "tools/ci/dut_gate.py")
 
 
 #: Writes the frame set and verdict a screen capture hook would leave behind.
@@ -408,7 +408,7 @@ class ScreenHelperTests(unittest.TestCase):
             (self.frames / f"frame-{index:04d}.ppm").write_bytes(
                 b"P6\n320 200\n255\n" + bytes(body)
             )
-        self.helper = Path(repo_root()) / "scripts/ci/n305-screen-capture.sh"
+        self.helper = Path(repo_root()) / "tools/hardware/n305-screen-capture.sh"
         self.gate = gate
 
     def run_helper(self, *arguments: str) -> None:

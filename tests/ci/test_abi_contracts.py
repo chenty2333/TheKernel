@@ -6,7 +6,7 @@ from unittest import mock
 
 from tests.support import load_script_module
 
-gate = load_script_module("check_abi_contracts", "scripts/ci/check_abi_contracts.py")
+gate = load_script_module("check_abi_contracts", "tools/ci/check_abi_contracts.py")
 
 
 class AbiContractsTests(unittest.TestCase):

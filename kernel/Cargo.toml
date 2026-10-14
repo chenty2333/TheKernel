@@ -13,7 +13,22 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "tk_kernel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "thekernel"
+path = "src/main.rs"
+required-features = ["qemu"]
+test = false
+
 [features]
+# `cargo build` is the shipped x86_64 product, not an accidental reduced
+# feature subset. Kernel/library host tests select their own manifests and
+# feature sets explicitly.
+default = ["x86-product"]
+boot-shell = []
 intel-hda = ["axfeat/driver-intel-hda"]
 nvme = ["axfeat/driver-nvme"]
 ahci = ["axfeat/driver-ahci", "axdriver/ahci-pci"]
@@ -29,6 +44,30 @@ net-n305 = ["axfeat/driver-n305-net"]
 net-rtl8125 = ["axfeat/driver-rtl8125"]
 net-rtl8168 = ["axfeat/driver-rtl8168"]
 net-igc = ["axfeat/driver-igc"]
+# The shipped x86_64 product keeps its hardware-backed Linux ABI paths in one
+# explicit opt-in.  CET and cachestat have no feature gate: both are always
+# compiled, while their hardware use is capability-gated at runtime.
+# A product ELF is always SMP-capable (bounded to the q35 profile's four
+# logical CPUs) and is also valid when QEMU starts it with one CPU.
+x86-product = ["qemu", "smp", "hwp-uclamp", "pmu", "perf-sampling"]
+qemu = [
+    "axfeat/defplat",
+    "axfeat/bus-pci",
+
+    "axfeat/display",
+    "rootfs-module",
+
+    "bpf",
+    "input",
+
+    # auxilary features
+    "axfeat/fs-ng-times",
+]
+smp = [
+    "axfeat/smp",
+    "smp-tlb-shootdown",
+    "idle-steal",
+]
 asid-fast-switch = ["axhal/asid-fast-switch"]
 hwp-uclamp = ["axhal/hwp-uclamp", "axruntime/ipi", "axtask/hwp-uclamp"]
 input = ["dep:axinput", "axfeat/input"]
@@ -199,8 +238,17 @@ axcpu = { workspace = true, features = ["host-test-context"] }
 # same `log` facade the kernel's own macros use.
 log = { workspace = true }
 
+[package.metadata.vendor-filter]
+platforms = [
+    "x86_64-unknown-none",
+]
+all-features = true
+
 [package.metadata.thekernel]
 layer = "integration"
+
+[package.metadata.thekernel.host-test]
+default-features = false
 
 [dependencies.tk-acpica]
 path = "../crates/ax/tk-acpica"

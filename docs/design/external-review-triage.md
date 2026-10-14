@@ -65,7 +65,7 @@ seq=1664 first=1153 entries=512` was read out of a guest whose ring had wrapped.
   reaches, and the kernel's single panic handler ends in `system_off()`.  It now
   prints `[invalid filter prefix]`, as `record` twenty lines below already did.
   Fixed on `fix/unreachable-panics`.
-- **`scripts/ci/n305-capture-image.sh --out`.**  The script removes and rewrites
+- **`tools/hardware/n305-capture-image.sh --out`.**  The script removes and rewrites
   `$OUT`, and prints a closing hint pairing it with a device:
   `sudo dd if=$OUT of=/dev/sdX`.  A transposed argument was destructive in a way
   nothing downstream could detect.  `--out` under `/dev` and an existing

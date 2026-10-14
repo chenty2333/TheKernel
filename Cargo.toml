@@ -7,6 +7,7 @@ members = [
     "crates/ax/*",
     "crates/linux/*",
 ]
+default-members = ["kernel"]
 # Vendored dependencies retain their standalone upstream unit-test manifests.
 exclude = ["crates/vendor/crab-usb"]
 
@@ -139,101 +140,9 @@ axtlb = { package = "tk-axtlb", path = "crates/ax/tk-axtlb", version = "0.1.0", 
 tk-linux-process-adapter = { version = "0.1.0", path = "crates/process-adapter" }
 tk-linux-profile = { path = "crates/linux/profile", version = "0.1.0" }
 
-tk-kernel = { path = "kernel", version = "0.1.0" }
-
 log = "0.4"
 rdif-base = { version = "0.8.3" }
 rdif-display = { version = "0.2.0" }
-
-[package]
-publish.workspace = true
-rust-version.workspace = true
-name = "thekernel"
-version.workspace = true
-edition.workspace = true
-description.workspace = true
-authors.workspace = true
-license.workspace = true
-homepage.workspace = true
-repository.workspace = true
-
-[lints]
-workspace = true
-
-[features]
-intel-hda = ["tk-kernel/intel-hda"]
-nvme = ["tk-kernel/nvme"]
-ahci = ["tk-kernel/ahci"]
-sdhci = ["tk-kernel/sdhci"]
-e1000 = ["tk-kernel/e1000"]
-usb-dbc = ["tk-kernel/usb-dbc"]
-watchdog-itco = ["tk-kernel/watchdog-itco"]
-# `cargo build` is the shipped x86_64 product, not an accidental reduced
-# feature subset. Kernel/library host tests select their own manifests and
-# feature sets explicitly.
-default = ["x86-product"]
-boot-shell = []
-sched-wake-locality = ["tk-kernel/sched-wake-locality"]
-io-submit-batch = ["tk-kernel/io-submit-batch"]
-io-notify-fastpath = ["tk-kernel/io-notify-fastpath"]
-# The Intel i225/i226 (igc) NIC work: builds the identify-only probe into the
-# product kernel so a boot on a machine that has no such part produces the
-# "no supported device present" verdict.  There is no QEMU model for this
-# device, so that verdict is the only end-to-end run the driver has.
-net-n305 = ["tk-kernel/net-n305"]
-net-rtl8125 = ["tk-kernel/net-rtl8125"]
-net-rtl8168 = ["tk-kernel/net-rtl8168"]
-net-igc = ["tk-kernel/net-igc"]
-# The shipped x86_64 product keeps its hardware-backed Linux ABI paths in one
-# explicit opt-in.  CET and cachestat have no feature gate: both are always
-# compiled, while their hardware use is capability-gated at runtime.
-# A product ELF is always SMP-capable (bounded to the q35 profile's four
-# logical CPUs) and is also valid when QEMU starts it with one CPU.
-x86-product = ["qemu", "smp", "hwp-uclamp", "pmu", "perf-sampling"]
-asid-fast-switch = ["tk-kernel/asid-fast-switch"]
-hwp-uclamp = ["tk-kernel/hwp-uclamp"]
-pmu = ["tk-kernel/pmu"]
-perf-sampling = ["tk-kernel/perf-sampling"]
-qemu = [
-    "axfeat/defplat",
-    "axfeat/bus-pci",
-
-    "axfeat/display",
-    "tk-kernel/rootfs-module",
-
-    "tk-kernel/bpf",
-    "tk-kernel/input",
-
-    # auxilary features
-    "axfeat/fs-ng-times",
-]
-smp = [
-    "axfeat/smp",
-    "tk-kernel/smp-tlb-shootdown",
-    "tk-kernel/idle-steal",
-]
-# Records every preemption change made with IRQs masked, for the TLB-shootdown
-# stall report.  It reads RFLAGS on both sides of every lock guard, which cost
-# about a quarter of a null system call, so it is opt-in for chasing a stall.
-irq-continuation-diagnostics = ["tk-kernel/irq-continuation-diagnostics"]
-
-[[bin]]
-name = "thekernel"
-path = "src/main.rs"
-required-features = ["qemu"]
-
-[dependencies]
-axfeat.workspace = true
-tk-kernel.workspace = true
-
-[package.metadata.vendor-filter]
-platforms = [
-    "x86_64-unknown-none",
-]
-all-features = true
-
-[package.metadata.thekernel]
-layer = "integration"
 
 # The existing USB backend with a narrow read-only cached observation API.
 [patch.crates-io]

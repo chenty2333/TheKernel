@@ -45,20 +45,20 @@ def plan(tier: str, state: Path) -> list[Stage]:
             Stage("abi-kvm", "test", (*cli, "test", "--suite", "abi", "--smp", "4", "--accel", "kvm"), 3600),
         ]
     stages = [
-        Stage("dependency-layers", "static", (sys.executable, "scripts/ci/check_cargo_dependency_layers.py"), 120),
+        Stage("dependency-layers", "static", (sys.executable, "tools/ci/check_cargo_dependency_layers.py"), 120),
         # The layer gate can only see edges between cargo packages, so inside
         # the one `thekernel` crate a subsystem may reach another without a
         # manifest line changing.  This pins the module-level `use crate::…`
         # edges to config/kernel-module-edges.toml: a new edge fails, a retired
         # one is reported, and the widening that would make `kernel/src/drm`
         # unliftable again cannot happen unnoticed.
-        Stage("kernel-module-edges", "static", (sys.executable, "scripts/ci/check_kernel_module_edges.py"), 120),
+        Stage("kernel-module-edges", "static", (sys.executable, "tools/ci/check_kernel_module_edges.py"), 120),
         # The other half of the same promise: `docs/debugging.md` says a kernel
         # diagnostic is a record with a severity and a target, and a destination
         # nobody at the call site chooses. A bare `println!` opts out of all
         # three, so this ratchets the raw prints that remain in code the kernel
         # builds, per file, against `config/log-surface.toml`.
-        Stage("log-surface", "static", (sys.executable, "scripts/ci/check_log_surface.py"), 120),
+        Stage("log-surface", "static", (sys.executable, "tools/ci/check_log_surface.py"), 120),
         # The contract and dispatch tables are a source of truth only while
         # something enforces them.  `test --suite abi` is run by hand, so until
         # this stage existed no verification tier noticed a cell whose status,
@@ -75,7 +75,7 @@ def plan(tier: str, state: Path) -> list[Stage]:
         # be in `final_static_allowlist`.  No list may grow, so the ledger
         # cannot re-declare a claim gap-free without a citation and a registered
         # differential case behind it.
-        Stage("linux-abi", "static", (sys.executable, "scripts/ci/linux_abi_gate.py", "all", "--final"), 900),
+        Stage("linux-abi", "static", (sys.executable, "tools/ci/linux_abi_gate.py", "all", "--final"), 900),
         # The ABI registry and its guest C sources describe the same
         # assertion set from two sides; only the KVM tier would otherwise
         # observe a drift, after a full oracle build and two guest boots.  This
@@ -84,9 +84,9 @@ def plan(tier: str, state: Path) -> list[Stage]:
         # checks only for cells that claim verified runtime behavior, and that a
         # registered program no cell binds is named by the shrink-only
         # `ratchet.unbound_programs` baseline instead of running unattributed.
-        Stage("abi-contracts", "static", (sys.executable, "scripts/ci/check_abi_contracts.py"), 120),
-        Stage("graphics-config-seatd", "static", ("scripts/build-graphics-rootfs.sh", "--flavor", "q35-graphics-seatd", "--check"), 120),
-        Stage("graphics-config-desktop", "static", ("scripts/build-graphics-rootfs.sh", "--flavor", "q35-software-desktop", "--check"), 120),
+        Stage("abi-contracts", "static", (sys.executable, "tools/ci/check_abi_contracts.py"), 120),
+        Stage("graphics-config-seatd", "static", ("tools/build/build-graphics-rootfs.sh", "--flavor", "q35-graphics-seatd", "--check"), 120),
+        Stage("graphics-config-desktop", "static", ("tools/build/build-graphics-rootfs.sh", "--flavor", "q35-software-desktop", "--check"), 120),
         Stage("host", "test", (*cli, "test", "--suite", "host"), 1800),
         Stage("build", "build", (*cli, "build", "--smp", "4", "--memory", "512M"), 1800),
         # A frame that does not fit a task stack is invisible to every other
@@ -120,7 +120,7 @@ def plan(tier: str, state: Path) -> list[Stage]:
                     if line and not line.startswith("#") and "=" in line)
         output = graphics / "seatd"
         stages += [
-            Stage("graphics-rootfs", "build", ("scripts/build-graphics-rootfs.sh", "--flavor", "q35-graphics-seatd", "--fetch-buildroot", "--buildroot-dir", str(graphics / ("buildroot-" + pins["BUILDROOT_VERSION"])), "--output", str(output), "--download-dir", str(graphics / "downloads")), 10800),
+            Stage("graphics-rootfs", "build", ("tools/build/build-graphics-rootfs.sh", "--flavor", "q35-graphics-seatd", "--fetch-buildroot", "--buildroot-dir", str(graphics / ("buildroot-" + pins["BUILDROOT_VERSION"])), "--output", str(output), "--download-dir", str(graphics / "downloads")), 10800),
             Stage("pixman", "test", (*cli, "test", "--suite", "graphics", "--smp", "4", "--accel", "tcg", "--timeout", "300", "--rootfs", str(output / "images/rootfs.ext2"), "--flavor", "q35-graphics-seatd", "--graphics-profile", "headless", "--screenshot", str(graphics / "seatd.ppm"), "--workdir", str(graphics / "run")), 900),
         ]
     return stages
@@ -206,7 +206,7 @@ def environment(tier: str, env: dict[str, str]) -> None:
     execute(Stage("environment-image", "environment", ("dev-env/check-image.sh",), 30), env)
     for command in ("rustup", "cargo", "rustc", "axconfig-gen"):
         if shutil.which(command, path=env.get("PATH")) is None:
-            raise ProductError(f"verify: environment: FAIL missing {command}; run scripts/setup-toolchain.sh")
+            raise ProductError(f"verify: environment: FAIL missing {command}; run tools/dev/setup-toolchain.sh")
     pin = tomllib.loads((REPO_ROOT / "rust-toolchain.toml").read_text())["toolchain"]
     # rustup run without --install never provisions a missing toolchain.
     execute(Stage("environment-toolchain", "environment", ("rustup", "run", pin["channel"], "rustc", "--version"), 30), env)
@@ -214,10 +214,10 @@ def environment(tier: str, env: dict[str, str]) -> None:
         result = subprocess.run(("rustup", kind, "list", "--installed", "--toolchain", pin["channel"]), cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False)
         installed = result.stdout.splitlines()
         if result.returncode or any(not any(line == item or line.startswith(item + "-") for line in installed) for item in expected):
-            raise ProductError(f"verify: environment: FAIL missing pinned {kind}; run scripts/setup-toolchain.sh")
+            raise ProductError(f"verify: environment: FAIL missing pinned {kind}; run tools/dev/setup-toolchain.sh")
     version = subprocess.run(("axconfig-gen", "--version"), cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False)
     if version.returncode or version.stdout.strip() != "axconfig-gen 0.2.1":
-        raise ProductError("verify: environment: FAIL requires axconfig-gen 0.2.1; run scripts/setup-toolchain.sh")
+        raise ProductError("verify: environment: FAIL requires axconfig-gen 0.2.1; run tools/dev/setup-toolchain.sh")
     if tier == "hardware" and not os.access("/dev/kvm", os.R_OK | os.W_OK):
         raise ProductError("verify: environment: UNAVAILABLE /dev/kvm is not readable and writable")
 

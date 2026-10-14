@@ -28,7 +28,7 @@ For PXE preparation, following `n305-tonight.md`, choose a *fresh B output*
 and the actual dedicated interface only after coordinating with the user/A:
 
 ```
-scripts/n305-netboot.sh prepare --mode kernel \
+tools/hardware/n305-netboot.sh prepare --mode kernel \
   --out /home/ava/.cache/thekernel-targets/tier1-2026-10-04/b-next-kernel \
   --interface enp0s31f6 --kernel PRINTED_ELF --rootfs PRINTED_ROOTFS --loglevel warn
 ```

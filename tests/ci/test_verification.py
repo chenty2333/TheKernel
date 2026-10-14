@@ -74,7 +74,7 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(stages["linux-abi"].command[-2:], ("all", "--final"))
         self.assertEqual(stages["abi-contracts"].failure, "static")
         for name in ("linux-abi", "abi-contracts"):
-            self.assertIn("scripts/ci", " ".join(stages[name].command))
+            self.assertIn("tools/ci", " ".join(stages[name].command))
         # Coupling inside the kernel crate is a static question with a committed
         # baseline, so it belongs beside the package-layer gate, not in a tier
         # that has to boot anything.
@@ -219,7 +219,7 @@ class VerificationTests(unittest.TestCase):
 
 class RunnerAvailabilityTests(unittest.TestCase):
     def test_only_online_idle_matching_runner_is_available(self):
-        module = load_script_module("hardware_runner", "scripts/ci/check_hardware_runner.py")
+        module = load_script_module("hardware_runner", "tools/ci/check_hardware_runner.py")
         runner = {"status": "online", "busy": False, "labels": [{"name": name} for name in module.REQUIRED]}
         self.assertTrue(module.available([{"runners": []}, {"runners": [runner]}]))
         self.assertFalse(module.available([{"runners": [{**runner, "busy": True}]}]))
@@ -227,7 +227,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
         self.assertFalse(module.available([{"runners": [{**runner, "labels": [{"name": "linux"}]}]}]))
 
     def test_inaccessible_inventory_is_not_reported_as_pass(self):
-        module = load_script_module("hardware_runner", "scripts/ci/check_hardware_runner.py")
+        module = load_script_module("hardware_runner", "tools/ci/check_hardware_runner.py")
         with test_tmpdir() as directory:
             output = Path(directory) / "output"
             summary = Path(directory) / "summary"
@@ -238,7 +238,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
             self.assertIn("NOT RUN", summary.read_text())
 
     def test_scheduled_run_skips_instead_of_failing_on_an_unusable_runner_pool(self):
-        module = load_script_module("hardware_runner", "scripts/ci/check_hardware_runner.py")
+        module = load_script_module("hardware_runner", "tools/ci/check_hardware_runner.py")
         with test_tmpdir() as directory:
             output = Path(directory) / "output"
             summary = Path(directory) / "summary"
@@ -254,7 +254,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
 
 class BuildrootProvisioningTests(unittest.TestCase):
     def invoke(self, directory, source, env=None):
-        return subprocess.run(["scripts/build-graphics-rootfs.sh", "--flavor", "q35-graphics-seatd",
+        return subprocess.run(["tools/build/build-graphics-rootfs.sh", "--flavor", "q35-graphics-seatd",
                                "--buildroot-dir", str(source), "--fetch-buildroot", "--source-only",
                                "--output", str(directory / "output"), "--download-dir", str(directory / "downloads")],
                               cwd=verify.REPO_ROOT, env=env, capture_output=True, text=True)

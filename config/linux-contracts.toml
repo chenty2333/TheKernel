@@ -180,7 +180,7 @@ handler = "kernel/src/syscall/bpf/mod.rs:sys_bpf"
 conditional = "bpf"
 tests = []
 validation_gaps = ["BPF command families lack a complete Linux 7.2.3 differential matrix and the product-build ENOSYS path for syscall 321 has no test"]
-limitations = ["bpf(2) is compiled into the product and guest builds (default = [\"x86-product\"] enables qemu, which enables tk-kernel/bpf) and the dispatcher has no runtime gate, so the guest reaches the handler on every call where the reference kernel is built with CONFIG_BPF_SYSCALL=n and answers ENOSYS (kernel/sys_ni.c:251) - every bpf call therefore diverges, and no differential case can be registered for it against this oracle"]
+limitations = ["bpf(2) is compiled into the product and guest builds (default = [\"x86-product\"] enables qemu, which enables bpf) and the dispatcher has no runtime gate, so the guest reaches the handler on every call where the reference kernel is built with CONFIG_BPF_SYSCALL=n and answers ENOSYS (kernel/sys_ni.c:251) - every bpf call therefore diverges, and no differential case can be registered for it against this oracle"]
 
 [[cell]]
 number = 335
@@ -8671,7 +8671,7 @@ tests = ["kernel/src/mm/aspace/tests.rs:oom_reap_drains_private_cow_ptes_but_kee
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
-# Shrink-only ratchets, enforced by scripts/ci/linux_abi_gate.py and described
+# Shrink-only ratchets, enforced by tools/ci/linux_abi_gate.py and described
 # in docs/design/abi-contract-system.md.
 #
 # `uncited_contracts` names every [[contract]] record that carries no
@@ -9457,7 +9457,7 @@ final_static_allowlist = [
 # adjudicates console line atomicity, the two `tty-*` programs adjudicate tty
 # ioctl command vocabulary, and `unix-write-credentials` adjudicates
 # SCM_CREDENTIALS/SO_PEERCRED -- none of which any [[contract]] currently
-# describes.  `scripts/ci/check_abi_contracts.py` fails a registered program that
+# describes.  `tools/ci/check_abi_contracts.py` fails a registered program that
 # is neither bound nor listed here, so the set may only shrink as records gain
 # the vocabulary their evidence already tests.
 unbound_programs = [

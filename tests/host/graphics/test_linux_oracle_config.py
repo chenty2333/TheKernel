@@ -49,9 +49,9 @@ class LinuxOracleConfigTests(unittest.TestCase):
         self.assertNotIn("rootfs-x86.img", config)
 
     def test_oracle_build_and_runner_use_persistent_cache_and_shared_protocol(self) -> None:
-        build = (ROOT / "scripts/build-linux-oracle.sh").read_text(encoding="utf-8")
-        runner = (ROOT / "scripts/graphics-linux-oracle-runner.py").read_text(encoding="utf-8")
-        wrapper = (ROOT / "scripts/graphics-linux-oracle.sh").read_text(encoding="utf-8")
+        build = (ROOT / "tools/build/build-linux-oracle.sh").read_text(encoding="utf-8")
+        runner = (ROOT / "tools/ci/graphics-linux-oracle-runner.py").read_text(encoding="utf-8")
+        wrapper = (ROOT / "tools/ci/graphics-linux-oracle.sh").read_text(encoding="utf-8")
         self.assertIn("LINUX_VERSION=7.2.3", build)
         self.assertIn("O=\"$output\"", build)
         self.assertIn('${THEKERNEL_STATE_DIR:-$HOME/.cache/thekernel-targets}/linux-${LINUX_VERSION}-oracle', build)
@@ -83,6 +83,26 @@ class LinuxOracleConfigTests(unittest.TestCase):
         self.assertIn("--tarball LINUX-TARBALL", wrapper)
         self.assertIn("build+=(--tarball", wrapper)
         self.assertIn("--fault", wrapper)
+
+    def test_oracle_runner_discovers_repo_root_from_non_repo_cwd(self) -> None:
+        import os
+        import subprocess
+        import sys
+        from tests.support import test_tmpdir
+
+        with test_tmpdir() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            runner = ROOT / "tools/ci/graphics-linux-oracle-runner.py"
+            result = subprocess.run(
+                [sys.executable, str(runner), "--help"],
+                cwd=str(tmp_path),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Run the Linux 7.2.3 graphics oracle", result.stdout)
 
 
 if __name__ == "__main__":

@@ -17,8 +17,8 @@ from tools.qemu_runner.model import Drive
 ROOT=Path(__file__).resolve().parents[1]
 def module(name,path):
     spec=importlib.util.spec_from_file_location(name,path);value=importlib.util.module_from_spec(spec);spec.loader.exec_module(value);return value
-build=module('usb_build',ROOT/'scripts/build-usb-boot.py')
-write=module('usb_write',ROOT/'scripts/write-usb-boot.py')
+build=module('usb_build',ROOT/'tools/build/build-usb-boot.py')
+write=module('usb_write',ROOT/'tools/hardware/write-usb-boot.py')
 
 class UsbBootTests(unittest.TestCase):
     def test_gpt_primary_backup_crc_and_root_guid(self):

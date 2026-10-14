@@ -53,7 +53,7 @@ and Output alignment, wheel compatibility, truncated inputs and deterministic
 malformed descriptor/report cases. CH9329, Consumer controllers and gamepads
 have **not been verified on N305 hardware**.
 
-`python3 scripts/ci/usb-hid-qemu-smoke.py` uses the product runner, qemu-xhci plus
+`python3 tools/ci/usb-hid-qemu-smoke.py` uses the product runner, qemu-xhci plus
 usb-kbd/mouse/tablet and marker-gated QMP injection. Its guest helper requires
 BUS_USB capabilities, an actual KEY_A press, REL_X=17 and ABS_X=16384, then exits
 normally and powers off. Successful device enumeration alone cannot pass.

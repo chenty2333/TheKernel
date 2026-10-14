@@ -11,7 +11,7 @@ import tempfile
 import threading
 import unittest
 
-from tools.n305_netboot import DEFAULT_GFXMODE, CaptureHandler, generate_session_scripts, grub_config
+from tools.hardware.n305_netboot import DEFAULT_GFXMODE, CaptureHandler, generate_session_scripts, grub_config
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -83,7 +83,7 @@ class NetbootTests(unittest.TestCase):
             stub.chmod(0o755)
             for router in ["","192.168.10.1 192.168.10.2"]:
                 log.write_text("")
-                result=subprocess.run(["sh",str(ROOT/"scripts/ci/n305-dhcp.script"),"bound"],
+                result=subprocess.run(["sh",str(ROOT/"tools/hardware/n305-dhcp.script"),"bound"],
                     env={**os.environ,"PATH":str(directory)+":"+os.environ["PATH"],"CALL_LOG":str(log),
                          "interface":"eth0","ip":"192.168.10.15","subnet":"255.255.255.0","router":router},
                     text=True,capture_output=True)
@@ -97,7 +97,7 @@ class NetbootTests(unittest.TestCase):
 
     def test_lease_hook_is_a_rootfs_cache_input(self):
         from tools.product_state import ROOTFS_INPUT_FILES
-        self.assertIn("scripts/ci/n305-dhcp.script", ROOTFS_INPUT_FILES)
+        self.assertIn("tools/hardware/n305-dhcp.script", ROOTFS_INPUT_FILES)
 
     def test_grub_uses_explicit_mode_not_keep_and_preserves_diagnostics(self):
         self.assertEqual(DEFAULT_GFXMODE, "3840x2160x32,auto")
@@ -124,7 +124,7 @@ class NetbootTests(unittest.TestCase):
     def test_prepare_appends_diagnostic_tokens_without_starting_host_services(self):
         from types import SimpleNamespace
         from unittest.mock import patch
-        from tools.n305_netboot import prepare
+        from tools.hardware.n305_netboot import prepare
         from tools.product_state import state_root
         scratch = state_root() / "test-tmp"
         scratch.mkdir(parents=True, exist_ok=True)
@@ -138,8 +138,8 @@ class NetbootTests(unittest.TestCase):
                 rootfs=rootfs, loglevel="info", kernel_cmdline="tty.input_trace=1")
             def fake_grub(command, **kwargs):
                 Path(command[command.index("-o") + 1]).write_bytes(b"fake GRUB")
-            with patch("tools.n305_netboot.shutil.which", return_value="/tool/grub"), \
-                 patch("tools.n305_netboot.subprocess.run", side_effect=fake_grub) as command:
+            with patch("tools.hardware.n305_netboot.shutil.which", return_value="/tool/grub"), \
+                 patch("tools.hardware.n305_netboot.subprocess.run", side_effect=fake_grub) as command:
                 prepare(args)
                 self.assertEqual(command.call_count, 1)
             text = (args.out / "grub.cfg").read_text()
@@ -150,7 +150,7 @@ class NetbootTests(unittest.TestCase):
     def test_dnsmasq_follows_address_changes_across_link_bounces(self):
         # bind-interfaces answered every DISCOVER with "has no address" after
         # the N305 bounced the link on 2026-10-04.
-        source = (ROOT / "tools/n305_netboot.py").read_text(encoding="utf-8")
+        source = (ROOT / "tools/hardware/n305_netboot.py").read_text(encoding="utf-8")
         self.assertIn("\nbind-dynamic\n", source)
         self.assertNotIn("\nbind-interfaces\n", source)
 

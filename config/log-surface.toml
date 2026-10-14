@@ -1,4 +1,4 @@
-# Baseline for `scripts/ci/check_log_surface.py`.
+# Baseline for `tools/ci/check_log_surface.py`.
 #
 # `vendored` names imported upstream trees this gate does not police. Their print
 # macros are upstream's own debug aids, usually behind a feature the kernel does

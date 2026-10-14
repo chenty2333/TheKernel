@@ -8,7 +8,7 @@ from unittest import mock
 
 from tests.support import load_script_module, test_tmpdir
 
-edges_gate = load_script_module("check_kernel_module_edges", "scripts/ci/check_kernel_module_edges.py")
+edges_gate = load_script_module("check_kernel_module_edges", "tools/ci/check_kernel_module_edges.py")
 
 
 def run(main_argv=None) -> tuple[int, str]:

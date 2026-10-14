@@ -8,7 +8,7 @@ changed on that assumption.
 
 ## Close-condition emulated measurement
 
-`scripts/ci/n305-verbose-qemu-smoke.py` boots N305, eight vCPUs, **8 GiB**, KVM,
+`tools/ci/n305-verbose-qemu-smoke.py` boots N305, eight vCPUs, **8 GiB**, KVM,
 firmware-fb and loglevel=7. Eight GiB is deliberately below the machine's 16 GiB:
 the development host has 30 GiB and concurrent work, so matching 16 GiB would
 risk host pressure. Init really obtains DHCP and starts the existing userspace

@@ -388,7 +388,7 @@ def build_kernel(
             "build",
             "--locked",
             "--package",
-            "thekernel",
+            "tk-kernel",
             "--bin",
             "thekernel",
             "--target",
@@ -428,11 +428,11 @@ def build_kernel(
             "kernel does not fit below the q35 PCI hole "
             f"({low_ram_bytes // (1024 * 1024)} MiB of low RAM)"
         )
-    run_checked(["bash", str(REPO_ROOT / "scripts" / "check-x86-multiboot.sh"), str(staged_kernel)], env=env)
+    run_checked(["bash", str(REPO_ROOT / "tools" / "build" / "check-x86-multiboot.sh"), str(staged_kernel)], env=env)
     staged_kernel.replace(artifacts.kernel)
     esp_command = [
         "bash",
-        str(REPO_ROOT / "scripts" / "build-x86-uefi-esp.sh"),
+        str(REPO_ROOT / "tools" / "build" / "build-x86-uefi-esp.sh"),
         "--kernel",
         str(artifacts.kernel),
         "--output",
@@ -478,7 +478,7 @@ def build_rootfs(artifacts: Artifacts) -> None:
         run_checked(
             [
                 "bash",
-                str(REPO_ROOT / "scripts" / "build-guest-tools.sh"),
+                str(REPO_ROOT / "tools" / "build" / "build-guest-tools.sh"),
                 "--payload",
                 payload,
                 "--output",
@@ -500,7 +500,7 @@ def build_rootfs(artifacts: Artifacts) -> None:
     run_checked(
         [
             "bash",
-            str(REPO_ROOT / "scripts" / "build-rootfs.sh"),
+            str(REPO_ROOT / "tools" / "build" / "build-rootfs.sh"),
             "--arch",
             "x86",
             "--output",
@@ -546,11 +546,10 @@ def build_rootfs(artifacts: Artifacts) -> None:
 
 # The enforced lint policy, as data, so the comment in the root `Cargo.toml` and
 # the gate cannot drift apart again.  This is *not* a workspace-wide Clippy run:
-# it covers the four packages below (the product crate, the kernel crate, and
-# the two adapters whose lint policy the workspace owns) for the product target,
-# denies two Clippy groups, and never promotes an ordinary warning to an error.
+# it covers the three packages below (the kernel crate and the two adapters
+# whose lint policy the workspace owns) for the product target, denies two
+# Clippy groups, and never promotes an ordinary warning to an error.
 LINT_PACKAGES = (
-    "thekernel",
     "tk-kernel",
     "tk-linux-process-adapter",
     "tk-readiness-adapter",
@@ -712,7 +711,7 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
         except ValueError as error:
             raise ProductError(str(error)) from error
         grub_path.write_text(grub)
-        command = ["bash", str(REPO_ROOT / "scripts/build-x86-uefi-esp.sh"),
+        command = ["bash", str(REPO_ROOT / "tools/build/build-x86-uefi-esp.sh"),
                    "--kernel", str(artifacts.kernel), "--output", str(copied_esp),
                    "--grub-config", str(grub_path)]
         if spec.rootfs_transport == "module":
@@ -894,7 +893,7 @@ def build_desktop_rootfs(artifacts: Artifacts) -> Path:
     for path in (output, source, downloads):
         validate_storage(path)
     command = [
-        str(REPO_ROOT / "scripts" / "build-graphics-rootfs.sh"),
+        str(REPO_ROOT / "tools" / "build" / "build-graphics-rootfs.sh"),
         "--flavor", "q35-software-desktop", "--output", str(output),
         "--buildroot-dir", str(source), "--fetch-buildroot",
         "--download-dir", str(downloads),
@@ -1929,7 +1928,7 @@ def host_test_cmd() -> int:
     env.update({"CC": "gcc", "CXX": "g++", "AR": "ar", "AS": "as",
                 "OBJCOPY": "objcopy", "OBJDUMP": "objdump", "SIZE": "size",
                 "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER":
-                    str(REPO_ROOT / "scripts/ci/host-test-linker.sh")})
+                    str(REPO_ROOT / "tools/ci/host-test-linker.sh")})
     metadata = subprocess.run(["cargo", "metadata", "--locked", "--format-version", "1", "--no-deps"],
                               cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False)
     if metadata.returncode:
@@ -1949,7 +1948,8 @@ def host_test_cmd() -> int:
         run_checked(component_host_test_command(package), env=command_env)
     env["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"] = percpu_rustflags
     run_checked(["cargo", "test", "--locked", "--manifest-path", "kernel/Cargo.toml",
-                 "--tests", "--features", "bpf,perf-sampling,axtask/test", "--target",
+                 "--no-default-features", "--tests", "--features",
+                 "bpf,perf-sampling,axtask/test", "--target",
                  "x86_64-unknown-linux-gnu", "--", "--test-threads=1"], env=env)
     return 0
 
@@ -1991,7 +1991,7 @@ def test_cmd(args: argparse.Namespace) -> int:
             if result:
                 return result
         elif suite == "abi":
-            run_checked([sys.executable, "scripts/ci/linux_abi_gate.py", "all", "--final"])
+            run_checked([sys.executable, "tools/ci/linux_abi_gate.py", "all", "--final"])
             result = abi_test_cmd(args)
             if result:
                 return result
@@ -2202,7 +2202,7 @@ def abi_test_cmd(args: argparse.Namespace) -> int:
         if args.no_build:
             raise ProductError("--no-build ABI differential requires --linux-kernel")
         completed = subprocess.run(
-            ["bash", str(REPO_ROOT / "scripts/build-linux-oracle.sh"),
+            ["bash", str(REPO_ROOT / "tools/build/build-linux-oracle.sh"),
              "--config", str(REPO_ROOT / "config/linux/7.2.3-q35-abi.config"),
              "--jobs", os.environ.get("CARGO_BUILD_JOBS", "2")],
             cwd=REPO_ROOT, stdout=subprocess.PIPE, text=True, check=False,
@@ -2219,7 +2219,7 @@ def abi_test_cmd(args: argparse.Namespace) -> int:
         with state_lock("build"):
             linux_esp.parent.mkdir(parents=True, exist_ok=True)
             run_checked([
-                "bash", str(REPO_ROOT / "scripts/build-x86-uefi-esp.sh"), "--mode", "linux",
+                "bash", str(REPO_ROOT / "tools/build/build-x86-uefi-esp.sh"), "--mode", "linux",
                 "--kernel", str(linux_kernel), "--output", str(linux_esp),
                 "--grub-config", str(REPO_ROOT / "config/x86_64/grub-linux-shell.cfg"),
             ])
@@ -2266,7 +2266,7 @@ def bench_cmd(args: argparse.Namespace) -> int:
         if args.no_build:
             raise ProductError("--no-build comparison requires --linux-kernel")
         completed = subprocess.run(
-            ["bash", str(REPO_ROOT / "scripts/build-linux-oracle.sh"),
+            ["bash", str(REPO_ROOT / "tools/build/build-linux-oracle.sh"),
              "--config", str(REPO_ROOT / "config/linux/7.2.3-q35-abi.config"),
              "--jobs", os.environ.get("CARGO_BUILD_JOBS", "2")],
             cwd=REPO_ROOT, capture_output=False, stdout=subprocess.PIPE, text=True,
@@ -2287,7 +2287,7 @@ def bench_cmd(args: argparse.Namespace) -> int:
         with state_lock("build"):
             linux_esp.parent.mkdir(parents=True, exist_ok=True)
             run_checked([
-                "bash", str(REPO_ROOT / "scripts/build-x86-uefi-esp.sh"), "--mode", "linux",
+                "bash", str(REPO_ROOT / "tools/build/build-x86-uefi-esp.sh"), "--mode", "linux",
                 "--kernel", str(linux_kernel), "--output", str(linux_esp),
                 "--grub-config", str(REPO_ROOT / "config/x86_64/grub-linux-shell.cfg"),
             ])
@@ -2336,7 +2336,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_variant_arguments(lint)
     lint.add_argument("--workspace", action="store_true",
                       help="escalation, not the gate: lint every workspace member on the host "
-                           "target instead of the four packages the CI gate covers")
+                           "target instead of the three packages the CI gate covers")
     lint.add_argument("--deny-warnings", action="store_true",
                       help="escalation, not the gate: promote every warning that survives the "
                            "in-code allowances to an error.  The tree does not pass this today; "

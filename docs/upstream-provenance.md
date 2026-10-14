@@ -21,7 +21,7 @@ attribution for the GPU code that ships. The Linux-excerpt baseline in
 `tests/ci/test_linux_excerpt_baseline.py` pins the measured counts.
 
 Every verbatim-Linux count below is output of
-`scripts/ci/scan_linux_excerpts.py`, which is the definition of the measurement
+`tools/ci/scan_linux_excerpts.py`, which is the definition of the measurement
 from now on: if a number here cannot be re-derived by running it, it does not
 belong in this file or in a `NOTICE`. `tests/ci/test_linux_excerpt_baseline.py`
 runs both instruments over this tree and fails when the numbers below and the
@@ -33,10 +33,10 @@ citation check does.
 
 Run it over the two trees:
 
-    python3 scripts/ci/scan_linux_excerpts.py --linux ~/Desktop/linux-7.2.3 --scope crates/linux --threshold 40
-    python3 scripts/ci/scan_linux_excerpts.py --linux ~/Desktop/linux-7.2.3 --scope crates/linux --threshold 25
-    python3 scripts/ci/scan_linux_excerpts.py --linux ~/Desktop/linux-7.2.3 --scope crates/ax --threshold 40
-    python3 scripts/ci/scan_linux_excerpts.py --linux ~/Desktop/linux-7.2.3 --scope kernel/src --threshold 40
+    python3 tools/ci/scan_linux_excerpts.py --linux ~/Desktop/linux-7.2.3 --scope crates/linux --threshold 40
+    python3 tools/ci/scan_linux_excerpts.py --linux ~/Desktop/linux-7.2.3 --scope crates/linux --threshold 25
+    python3 tools/ci/scan_linux_excerpts.py --linux ~/Desktop/linux-7.2.3 --scope crates/ax --threshold 40
+    python3 tools/ci/scan_linux_excerpts.py --linux ~/Desktop/linux-7.2.3 --scope kernel/src --threshold 40
 
 with `--show-lines` for the per-site inventory the second table uses,
 `--include-rules` to see the drawing lines the filter drops, and `--group-by 1`
@@ -120,7 +120,7 @@ to the inline `if (!ptrace_reparented(p)) ptrace = 1;` statement, not to the
 block, and that block is invisible at ≥ 40 in any case.
 
 Ranges were then checked, not counted.
-`scripts/ci/audit_linux_range_cites.py` takes every `` `<file>.c:<lo>-<hi>` ``
+`tools/ci/audit_linux_range_cites.py` takes every `` `<file>.c:<lo>-<hi>` ``
 citation that has verbatim quoted text from that file sitting next to it, since a
 cite attached to a paraphrase has nothing to compare, and reports the ones whose
 quoted lines do not occur inside the stated range. The rule is per quoted line,
@@ -572,7 +572,7 @@ Firmware tables (including OEM AML and MSDM keys) are never repository inputs.
 
 `--toolchain acpica` stages static `acpidump` and `iasl` from the same verified
 ACPICA 20260930 release archive, with its BSD-3-Clause notice. The builder is
-`scripts/build-acpica-payload.sh`; the guest downloads nothing. The build uses
+`tools/build/build-acpica-payload.sh`; the guest downloads nothing. The build uses
 the supplied host C compiler (default GCC) and its static C library, just like
 the baseline rootfs tool build. Binary redistribution must also satisfy that
 C library's license (the default host glibc is LGPL-2.1-or-later); this payload
@@ -1309,7 +1309,7 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 ## 2026-10-09 excerpt-count reconciliation
 
 The whole-tree scanner was re-run against `/home/ava/Desktop/linux-7.2.3`
-using `scripts/ci/scan_linux_excerpts.py` semantics (whitespace-normalized
+using `tools/ci/scan_linux_excerpts.py` semantics (whitespace-normalized
 line hashes, default ASCII-rule filter) at thresholds 40 and 25. The measured
 seven-field tuples now pinned in `tests/ci/test_linux_excerpt_baseline.py` are:
 
@@ -2138,7 +2138,7 @@ the same change; MIT i915 text remains counted rather than exempted.
 The L1 LinuxKPI change (tk-intel-gt: user copy, pinning, page/DMA/sg, vmap and
 WC mappings, PAT cache modes, notifiers and shrinker objects, kmem_cache, PM and
 task/file/PCI provider tables) moves the whole-scope crates/ax totals as
-measured by `scripts/ci/scan_linux_excerpts.py --scope crates/ax --threshold 25`:
+measured by `tools/ci/scan_linux_excerpts.py --scope crates/ax --threshold 25`:
 
 - before: `(18,15,4,1988,1808,0,0)`;
 - after: `(18,15,4,1990,1810,0,0)`; threshold 40 is unchanged at `(0,0,0,763,589,0,0)`.

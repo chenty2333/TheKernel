@@ -21,7 +21,7 @@ attribution for the GPU code that ships.
 | Component | Declared license | Text shipped | Reality check |
 | --- | --- | --- | --- |
 | `kernel/` (`tk-kernel`), the product image | inherits `license.workspace` = `Apache-2.0` (`[workspace.package]` in the root `Cargo.toml`) | root `LICENSE` | **Apache-2.0 only describes the Rust sources.** The default feature set links GPL-2.0-or-later C (section 2), so the shipped binary is not an Apache-2.0-only work. |
-| `crates/linux/*` (28 crates) | `Apache-2.0` | `crates/linux/LICENSE` (Apache-2.0), plus `LICENSES/Apache-2.0.txt` in all 28 | Rust is original. Comments quote Linux C verbatim (GPL-2.0-only) as cited documentation — 110 lines / 49 blocks / 20 files at the ≥ 40 scan threshold inside fenced doc blocks, 211 / 59 / 22 at ≥ 25, and 25 more verbatim lines in 5 files outside fences (`io-uring` 17, `process` 4, `fsnotify` 3, `mm` 1), all of it output of `scripts/ci/scan_linux_excerpts.py`. Nothing of Linux is compiled or linked. Each package that holds such text states it in its own `NOTICE` (11 packages), indexed in `docs/upstream-provenance.md`. |
+| `crates/linux/*` (28 crates) | `Apache-2.0` | `crates/linux/LICENSE` (Apache-2.0), plus `LICENSES/Apache-2.0.txt` in all 28 | Rust is original. Comments quote Linux C verbatim (GPL-2.0-only) as cited documentation — 110 lines / 49 blocks / 20 files at the ≥ 40 scan threshold inside fenced doc blocks, 211 / 59 / 22 at ≥ 25, and 25 more verbatim lines in 5 files outside fences (`io-uring` 17, `process` 4, `fsnotify` 3, `mm` 1), all of it output of `tools/ci/scan_linux_excerpts.py`. Nothing of Linux is compiled or linked. Each package that holds such text states it in its own `NOTICE` (11 packages), indexed in `docs/upstream-provenance.md`. |
 | `crates/ax/*` ArceOS-lineage forks (30 of the 45 crates declare the ArceOS triple license) | `GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0` | `LICENSES/{Apache-2.0,GPL-3.0-or-later,MulanPSL-2.0}.txt` per crate and in root `LICENSES/ax/` | Matches upstream's triple option; each crate ships all three texts, so a recipient can take the Apache-2.0 option — except that this is *not* true for the ext4 path below. Three of these crates also carry 7 verbatim Linux comment lines at ≥ 40 across 4 files, none fenced: 3 in `tk-axfs-ng/src/fs/ext4/inode.rs:1227-1229`, 1 in `tk-axfs-ng-vfs/src/mount.rs:2007`, 2 in `tk-axnet-ng/src/tcp.rs:801-802` and 1 in `tk-axnet-ng/src/unix/stream.rs:1224`; the same scan finds 8 further matches in this tree that are Rust `code` (ABI identifiers and hex arrays), not text. At ≥ 25 `tk-axfs-ng-vfs/src/nullfs.rs:8-15` adds the tree's only **fenced** Linux hunk, cited to `fs/nullfs.c`:12-34. None of those three packages carries a `NOTICE`, and `docs/upstream-provenance.md` inventories them. |
 | `crates/ax/tk-lwext4-rust` | `GPL-2.0` (`Cargo.toml:30`) | `LICENSE.GPLv2` only | Two problems. (a) The vendored files say "version 2 or (at your option) any later version", i.e. `GPL-2.0-or-later`, so the declaration under-states the grant. (b) Most of the C is BSD-3-Clause per `c/lwext4/README.md:41-48` and no BSD-3-Clause text is shipped. |
 | `crates/ax/tk-starry-fatfs` | `MIT` | `LICENSE.txt` | Consistent. Upstream: `Starry-OS/rust-fatfs` ← `rafalh/rust-fatfs`. |
@@ -65,10 +65,10 @@ only the Apache-2.0 text.
   is no non-default build recipe that omits this C, and no flag is missing.**
   Workspace-wide, `fs-ng-ext4` occurs in exactly two manifests: that entry and
   its definition in `tk-axfeat` (grep of every `Cargo.toml` on 2026-09-21). It
-  is not a named `tk-kernel` or root `thekernel` feature, so
+  is not a named `tk-kernel` feature, so
   `--no-default-features` and `--features` cannot select or deselect it; it is
   unconditional in the product build. `tools/thekernel.py` builds the product
-  with `cargo build --locked --package thekernel --bin thekernel --target
+  with `cargo build --locked --package tk-kernel --bin thekernel --target
   x86_64-unknown-none --release --features $(kernel_features)`, where
   `kernel_features()` emits `x86-product` plus variant-selected features and
   none of them controls ext4 (`tools/thekernel.py:259-278,70`,
@@ -115,7 +115,7 @@ only the Apache-2.0 text.
    Linux's enclosing function only), as `docs/upstream-provenance.md` indexes it.
    Every range stated next to its own quotation — 55 cites in `crates/linux`, 17
    in `kernel/src` — is resolved against the reference tree by
-   `scripts/ci/audit_linux_range_cites.py`, and
+   `tools/ci/audit_linux_range_cites.py`, and
    `tests/ci/test_linux_excerpt_baseline.py` pins that reach along with the three
    candidate rows the tool still prints, which
    `docs/upstream-provenance.md` names and dismisses. A range with no quotation
@@ -216,7 +216,7 @@ blob is needed by DbC. See `docs/design/usb-dbc.md` for scope and references.
 
 ### Optional inspect-tool payload (2026-10-05)
 
-`scripts/build-inspect-payload.sh` stages unmodified signed Alpine 3.24 x86_64
+`tools/build/build-inspect-payload.sh` stages unmodified signed Alpine 3.24 x86_64
 packages, using the existing 3.24.1 minirootfs pin and its trust keys. The exact
 package versions and SPDX expressions are in `config/inspect-apks.lock`, also
 shipped as the payload MANIFEST. No APK scriptlets run on the host. This is an
@@ -254,7 +254,7 @@ Linux C implementation was copied or translated for this interface.
 
 ## Optional B2 container payload
 
-`scripts/build-containers-payload.sh` stages exactly the signed Alpine 3.24.1
+`tools/build/build-containers-payload.sh` stages exactly the signed Alpine 3.24.1
 x86_64 closure in `config/containers-apks.lock`; each package's SPDX expression
 comes from verified APK metadata. Key programs: bubblewrap (LGPL-2.1-or-later),
 crun (GPL-2.0-or-later AND LGPL-2.1-or-later), podman/conmon (Apache-2.0), fuse-overlayfs
@@ -294,7 +294,7 @@ The debug guest optionally includes unmodified, Alpine-signed `cpupower`
 7.1.5-r0 (GPL-2.0-only, origin linux-tools) and lm-sensors3.6.0-r5
 (GPL-2.0-or-later/LGPL-2.1-or-later), with their musl/libcap/libintl/libnl3/
 pciutils/sysfsutils runtime closure. Exact package/source-origin/license rows
-are in `config/guest-power-apk-pins.tsv`; `scripts/build-power-payload.sh`
+are in `config/guest-power-apk-pins.tsv`; `tools/build/build-power-payload.sh`
 verifies pins and Alpine signatures before extraction, using the same checksum-pinned
 Alpine3.24.1 bootstrap as the debugger payload. No package maintainer scripts,
 host installation, sensors-detect or kernel-linked GPL code are introduced.
@@ -326,7 +326,7 @@ includes `bluez-btmon` and `bluez-deprecated` (providing `btmon` and
 libraries. Alpine's package metadata declares BlueZ tools `GPL-2.0-or-later AND
 BSD-2-Clause AND MIT`; each package's declared license expression, source
 origin, version, URL and SHA-256 are recorded in the pin file copied into the
-guest. `scripts/build-bluez-payload.sh` verifies Alpine signatures and the
+guest. `tools/build/build-bluez-payload.sh` verifies Alpine signatures and the
 reproducibility pins before extraction. No package scripts or host installation
 run; distribution must preserve each upstream license and source obligation.
 
@@ -334,7 +334,7 @@ run; distribution must preserve each upstream license and source obligation.
 
 `--toolchain acpica` stages static `acpidump` and `iasl` from the same verified
 ACPICA 20260930 release archive, with its BSD-3-Clause notice. The builder is
-`scripts/build-acpica-payload.sh`; the guest downloads nothing. The build uses
+`tools/build/build-acpica-payload.sh`; the guest downloads nothing. The build uses
 the supplied host C compiler (default GCC) and its static C library, just like
 the baseline rootfs tool build. Binary redistribution must also satisfy that
 C library's license (the default host glibc is LGPL-2.1-or-later); this payload
@@ -825,7 +825,7 @@ files remain Buildroot-managed; the guest smoke checks only loader resolution
 and the expected no-GPU result, not hardware decode/render.
 
 The common graphics rootfs overlay carries the upstream Intel `LICENSE.i915`
-text under `/usr/share/licenses/i915/`; `scripts/build-graphics-rootfs.sh`
+text under `/usr/share/licenses/i915/`; `tools/build/build-graphics-rootfs.sh`
 checks that the ADL-P/N `adlp_guc_70.bin` candidate is present alongside the
 existing TGL GuC/HuC firmware. Firmware binaries remain Buildroot-sourced and
 are not checked into this repository.

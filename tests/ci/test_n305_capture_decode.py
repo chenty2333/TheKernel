@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-HELPER = ROOT / 'scripts/ci/n305-capture-acpi.sh'
+HELPER = ROOT / 'tools/hardware/n305-capture-acpi.sh'
 
 
 def table(signature, body):
@@ -122,11 +122,11 @@ class CaptureDecoderTests(unittest.TestCase):
         self.assertEqual(self.run_helper('codec-paths', self.root / 'missing').returncode, 3)
 
     def test_both_payload_builders_deploy_the_helper_and_codec_capture_is_present(self):
-        self.assertIn('n305-capture-acpi.sh', (ROOT / 'tools/n305_netboot.py').read_text())
-        image = (ROOT / 'scripts/ci/n305-capture-image.sh').read_text()
+        self.assertIn('n305-capture-acpi.sh', (ROOT / 'tools/hardware/n305_netboot.py').read_text())
+        image = (ROOT / 'tools/hardware/n305-capture-image.sh').read_text()
         self.assertIn('$WORK/apkovl/etc/local.d/n305-capture-acpi.sh', image)
         self.assertIn('::/payload/n305-capture-acpi.sh', image)
-        payload = (ROOT / 'scripts/ci/n305-capture-payload.sh').read_text()
+        payload = (ROOT / 'tools/hardware/n305-capture-payload.sh').read_text()
         self.assertIn('cap audio/load-hda.txt modprobe snd_hda_intel', payload)
         self.assertIn('/proc/asound/card*/codec#*', payload)
         self.assertIn('power-devices /sys/bus/acpi/devices', payload)

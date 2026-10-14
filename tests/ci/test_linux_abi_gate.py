@@ -11,7 +11,7 @@ from pathlib import Path
 from tests.support import load_script_module, repo_root
 
 ROOT = repo_root()
-gate = load_script_module("linux_abi_gate", "scripts/ci/linux_abi_gate.py")
+gate = load_script_module("linux_abi_gate", "tools/ci/linux_abi_gate.py")
 
 
 class GateTests(unittest.TestCase):

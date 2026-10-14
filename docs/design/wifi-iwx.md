@@ -17,10 +17,10 @@ The `iwx_2ax_cfg_so_gf_a0` config is the AX211, one-stream (2AX), So-family GF c
 
 ## Firmware payload packaging
 
-`scripts/build-iwx-firmware-payload.sh` stages only the linux-firmware API 89
+`tools/build/build-iwx-firmware-payload.sh` stages only the linux-firmware API 89
 So/GF ucode and matching PNVM, validates the ucode header/API and size caps, and
 copies `LICENCE.iwlwifi_firmware` into `/usr/share/licenses/linux-firmware/`.
-`scripts/build-rootfs.sh` invokes it when `THEKERNEL_IWX_FIRMWARE_DIR` points
+`tools/build/build-rootfs.sh` invokes it when `THEKERNEL_IWX_FIRMWARE_DIR` points
 to a linux-firmware checkout/package tree; firmware binaries remain external
 inputs and are not committed.
 
@@ -286,7 +286,7 @@ wireless interface alongside its other network links.
 
 ## Guest user-space payload
 
-The build-wireless-payload.sh script stages signed Alpine v3.24 x86_64 APKs for iw 6.17-r0 (ISC), wpa_supplicant 2.11-r4 (BSD-3-Clause), and wireless-regdb 2025.10.07-r0 (ISC), plus their pinned dynamic-library closure. SHA-256 pins are in config/guest-wireless-apk-pins.tsv; the Alpine bootstrap apk verify authenticates each APK signature before extraction. The payload contains regulatory.db and its detached signature under /lib/firmware. Build it with scripts/build-guest-tools.sh --payload wireless --output DIR, then pass that tree via THEKERNEL_ROOTFS_TOOLS_DIR=DIR and THEKERNEL_TOOLCHAIN=wireless to the rootfs builder.
+The build-wireless-payload.sh script stages signed Alpine v3.24 x86_64 APKs for iw 6.17-r0 (ISC), wpa_supplicant 2.11-r4 (BSD-3-Clause), and wireless-regdb 2025.10.07-r0 (ISC), plus their pinned dynamic-library closure. SHA-256 pins are in config/guest-wireless-apk-pins.tsv; the Alpine bootstrap apk verify authenticates each APK signature before extraction. The payload contains regulatory.db and its detached signature under /lib/firmware. Build it with tools/build/build-guest-tools.sh --payload wireless --output DIR, then pass that tree via THEKERNEL_ROOTFS_TOOLS_DIR=DIR and THEKERNEL_TOOLCHAIN=wireless to the rootfs builder.
 
 ### Station power management
 

@@ -1,7 +1,7 @@
 """Single-source KTAP transcript parsing and validation.
 
 The product system-test gate (tools/thekernel.py) and the Panther Lake DUT
-gate (scripts/ci/panther_lake_dut_gate.py) both consume guest KTAP output;
+gate (tools/ci/panther_lake_dut_gate.py) both consume guest KTAP output;
 this module is the only place that parses it.  ``validate_ktap_log`` enforces
 the complete gating contract while ``reject_ktap_skips`` is the lighter check
 for runs whose completion is established by other means.

@@ -76,7 +76,7 @@ ls "$PREP/capture/received"
 BUNDLE=$(find "$PREP/capture/received" -mindepth 1 -maxdepth 1 -type d -name 'n305-*' | sort | tail -n 1)
 cat "$BUNDLE/capture-status.txt"
 cat "$BUNDLE/SUMMARY.txt"
-python3 scripts/ci/hw_facts_bundle.py "$BUNDLE" --require ecam --require display
+python3 tools/ci/hw_facts_bundle.py "$BUNDLE" --require ecam --require display
 cat "$BUNDLE/network/ip-link.txt"
 cat "$BUNDLE/network/ethtool-eth0.txt"
 ```
@@ -197,9 +197,9 @@ SDL 当前会报告保存的 fbcon CRTC 无法通过客户 FD 恢复；测试程
 仅在相应服务停止后执行；`--fetch` 的首次下载较大，已缓存可复用。
 
 ```sh
-scripts/n305-netboot.sh prepare --mode capture --fetch --out "$PREP/capture" --interface enp0s31f6
-scripts/n305-netboot.sh prepare --mode kernel --out "$PREP/kernel" --interface enp0s31f6 --kernel "$THEKERNEL_STATE_DIR/out/x86_64/n305/shell/mem1g/kernel-x86_64" --rootfs "$THEKERNEL_STATE_DIR/out/rootfs/x86/rootfs-x86.img"
-scripts/n305-netboot.sh prepare --mode kernel --out "$PREP/graphics-pxe" --interface enp0s31f6 --kernel "$THEKERNEL_STATE_DIR/out/x86_64/n305/shell/mem1g/kernel-x86_64" --rootfs "$PREP/graphics/rootfs.ext2"
+tools/hardware/n305-netboot.sh prepare --mode capture --fetch --out "$PREP/capture" --interface enp0s31f6
+tools/hardware/n305-netboot.sh prepare --mode kernel --out "$PREP/kernel" --interface enp0s31f6 --kernel "$THEKERNEL_STATE_DIR/out/x86_64/n305/shell/mem1g/kernel-x86_64" --rootfs "$THEKERNEL_STATE_DIR/out/rootfs/x86/rootfs-x86.img"
+tools/hardware/n305-netboot.sh prepare --mode kernel --out "$PREP/graphics-pxe" --interface enp0s31f6 --kernel "$THEKERNEL_STATE_DIR/out/x86_64/n305/shell/mem1g/kernel-x86_64" --rootfs "$PREP/graphics/rootfs.ext2"
 ```
 
 PXE 坑已固化：临时 trusted zone 放行 DHCP/TFTP；dnsmasq `user=root` 才能读

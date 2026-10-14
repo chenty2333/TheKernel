@@ -3170,14 +3170,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel"
-version = "0.2.0-preview.2"
-dependencies = [
- "tk-axfeat",
- "tk-kernel",
-]
-
-[[package]]
 name = "thiserror"
 version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"

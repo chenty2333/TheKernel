@@ -15,7 +15,7 @@ REPO_ROOT = repo_root()
 
 def load_gate():
     return load_script_module(
-        "thekernel_panther_lake_dut_gate", "scripts/ci/panther_lake_dut_gate.py"
+        "thekernel_panther_lake_dut_gate", "tools/ci/panther_lake_dut_gate.py"
     )
 
 

@@ -17,7 +17,7 @@ class BaselineCapacityTests(unittest.TestCase):
             ('build-rootfs.sh', r'SIZE_MB=\$\{THEKERNEL_ROOTFS_SIZE_MB:-(\d+)\}'),
             ('create-rootfs-image.sh', r'^SIZE_MB=(\d+)$'),
         ]:
-            source = (ROOT/'scripts'/script).read_text()
+            source = (ROOT / 'tools' / 'build' / script).read_text()
             match = re.search(expression, source, re.MULTILINE)
             self.assertIsNotNone(match, script)
             self.assertEqual(int(match.group(1)), expected, script)

@@ -1,6 +1,6 @@
 """The `NOTICE` layer promises that every verbatim-Linux number in it is output of
-`scripts/ci/scan_linux_excerpts.py`, and that no `NOTICE` or table row cites a
-range that `scripts/ci/audit_linux_range_cites.py` has not resolved.  A promise
+`tools/ci/scan_linux_excerpts.py`, and that no `NOTICE` or table row cites a
+range that `tools/ci/audit_linux_range_cites.py` has not resolved.  A promise
 about the last time someone ran a tool is worth no more than that run, so this
 file re-runs both instruments over the repository and pins what they print.
 
@@ -23,9 +23,9 @@ from pathlib import Path
 
 from tests.support import load_script_module, repo_root
 
-scanner = load_script_module("scan_linux_excerpts", "scripts/ci/scan_linux_excerpts.py")
-auditor = load_script_module("audit_linux_range_cites", "scripts/ci/audit_linux_range_cites.py")
-gate = load_script_module("linux_abi_gate", "scripts/ci/linux_abi_gate.py")
+scanner = load_script_module("scan_linux_excerpts", "tools/ci/scan_linux_excerpts.py")
+auditor = load_script_module("audit_linux_range_cites", "tools/ci/audit_linux_range_cites.py")
+gate = load_script_module("linux_abi_gate", "tools/ci/linux_abi_gate.py")
 
 SCOPES = ("crates/linux", "kernel/src", "crates/ax")
 WINDOW = 14

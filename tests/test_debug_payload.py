@@ -24,7 +24,7 @@ class DebugPayloadTests(unittest.TestCase):
         self.assertIn("gdb-16.3-r4.apk", {row[0] for row in rows})
         self.assertIn("strace-6.19-r1.apk", {row[0] for row in rows})
         self.assertIn("config/guest-debug-apk-pins.tsv", product_state.ROOTFS_INPUT_FILES)
-        self.assertIn("scripts/build-debug-payload.sh", product_state.ROOTFS_INPUT_FILES)
+        self.assertIn("tools/build/build-debug-payload.sh", product_state.ROOTFS_INPUT_FILES)
         self.assertIn("tests/guest/debugger/*", product_state.ROOTFS_INPUT_GLOBS)
         self.assertEqual(product_state.rootfs_image_bytes("debug"), 224 * 1024 * 1024)
 

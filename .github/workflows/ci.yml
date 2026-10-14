@@ -87,7 +87,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=thekernel-dev
       - uses: ./.github/actions/setup-thekernel
       - name: Run repository verification
-        run: scripts/dev-shell.sh -- ./tools/thekernel.py verify --tier "$VERIFY_TIER"
+        run: tools/dev/dev-shell.sh -- ./tools/thekernel.py verify --tier "$VERIFY_TIER"
       # Everything a failing guest leaves behind -- `console.log`, `kernel.log`,
       # `qemu-debug.log`, the fbcon and graphics screenshots -- is written under
       # the state root (`tools/product_state.py:state_root`), and this job runs
@@ -172,7 +172,7 @@ jobs:
           # night.  An explicit `tier=hardware` dispatch asked for that
           # evidence, so its absence stays an error.
           THEKERNEL_HARDWARE_OPTIONAL: ${{ github.event_name == 'schedule' && '1' || '0' }}
-        run: python3 scripts/ci/check_hardware_runner.py
+        run: python3 tools/ci/check_hardware_runner.py
 
   hardware:
     name: Explicit CPU and Linux ABI KVM verification
@@ -185,7 +185,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Provision pinned toolchain on the hardware host
-        run: scripts/setup-toolchain.sh
+        run: tools/dev/setup-toolchain.sh
       - name: Run repository hardware verification
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"

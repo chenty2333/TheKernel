@@ -1,11 +1,11 @@
 # Module coupling inside the kernel crate, and why `drm` is not a crate
 
 `kernel/src` is 408 521 lines of Rust in one package, and the layer rules in
-`scripts/ci/check_cargo_dependency_layers.py:11-16` can only see edges between
+`tools/ci/check_cargo_dependency_layers.py:11-16` can only see edges between
 cargo packages.  Inside that one package any module may `use crate::<other>`
 without a manifest line changing, so nothing in the existing gates could stop
 the coupling this document measures: 89 module-level `use crate::…` edges across
-18 modules, 15 of them reciprocal.  `scripts/ci/check_kernel_module_edges.py`
+18 modules, 15 of them reciprocal.  `tools/ci/check_kernel_module_edges.py`
 pins that set to `config/kernel-module-edges.toml`; this document records what
 the measurement says, and in particular why `kernel/src/drm` — 61 274 lines —
 cannot be lifted into `crates/drm` today.
@@ -17,10 +17,10 @@ It is written against the tree as it stands; every statement carries the
 
 The unit is a `use crate::…` *statement*, not every path expression:
 
-- `edges()` (`scripts/ci/check_kernel_module_edges.py:91`) walks every `*.rs`
+- `edges()` (`tools/ci/check_kernel_module_edges.py:91`) walks every `*.rs`
   under `kernel/src`, masks comments and string literals with the same
   `mask_rust_noncode()` the ABI gate uses
-  (`scripts/ci/linux_abi_gate.py:121`), and takes the first identifier after
+  (`tools/ci/linux_abi_gate.py:121`), and takes the first identifier after
   each `crate::` in a `use` head (`:72-83`).  A use tree therefore yields the
   module it names — `use crate::mm::{self as memory, SharedPages};` is the edge
   `mm`, not two edges — and `use crate::{self as k, syscall};` is `syscall`.
@@ -38,11 +38,11 @@ signature, neither importing it.  Deleting every `use crate::mm` line from
 `drm` would therefore retire the edge and leave the coupling untouched, which
 is why the gate reports a retired edge instead of trusting one.  It is a
 stop-widening tripwire with a reviewable diff, not a layering proof.  To surface
-these unimported dependencies, `scripts/ci/check_kernel_module_edges.py --audit-inline`
+these unimported dependencies, `tools/ci/check_kernel_module_edges.py --audit-inline`
 scans all inline `crate::<target>::` paths and reports coupling edges that bypass
 `use` declarations.
 
-`main()` (`scripts/ci/check_kernel_module_edges.py:125`) then compares the
+`main()` (`tools/ci/check_kernel_module_edges.py:125`) then compares the
 measured graph against the committed one in both directions: a new edge is a
 failure with the edge printed in exactly the form that would be pasted into the
 baseline (`:137-153`), and an edge that has disappeared is reported as one that
@@ -80,7 +80,7 @@ Those are cycles today, tolerated and enumerated, not aspirational architecture.
 
 Lifting `drm` would mean a package that `thekernel` depends on, because
 `kernel/Cargo.toml:188-189` already declares the kernel package as the top
-`integration` layer (`scripts/ci/check_cargo_dependency_layers.py:15`) — the
+`integration` layer (`tools/ci/check_cargo_dependency_layers.py:15`) — the
 one layer allowed to depend on everything, so it can never be a dependency of
 something it contains.  All five recorded edges point that way, and one of them
 runs both directions at once:

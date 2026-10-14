@@ -75,7 +75,7 @@ pin that ordering and the successor-reuse case in unit tests.
 
 `tests/guest/portable/sysv-shm-exit-stress.c` loops the window many times per
 boot. Each round creates its own private segment, so rounds are independent.
-`scripts/build-rootfs.sh` compiles every `tests/guest/portable/*.c` into
+`tools/build/build-rootfs.sh` compiles every `tests/guest/portable/*.c` into
 `/opt/thekernel-tests/portable/<stem>`, so the program is already in the guest
 rootfs; it takes `<variant> <rounds> <alarm-seconds>`.
 

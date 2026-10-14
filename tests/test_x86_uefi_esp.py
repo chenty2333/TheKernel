@@ -9,7 +9,7 @@ from tests.support import test_tmpdir
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ESP_BUILDER = ROOT / "scripts" / "build-x86-uefi-esp.sh"
+ESP_BUILDER = ROOT / "tools" / "build" / "build-x86-uefi-esp.sh"
 GRUB_MKSTANDALONE = shutil.which("grub2-mkstandalone") or shutil.which(
     "grub-mkstandalone"
 )

@@ -34,7 +34,7 @@ make bootstrap                 # first time only: install the pinned helper
 make run                       # interactive shell (KVM when /dev/kvm is available)
 ```
 
-The image is built on first use. Pass `./scripts/dev-shell.sh --build -- bash`
+The image is built on first use. Pass `./tools/dev/dev-shell.sh --build -- bash`
 to rebuild it after changing the Dockerfile. With rootless Podman behind
 `DOCKER_HOST`, set `THEKERNEL_ROOTLESS_PODMAN=1`. The Rust toolchain is pinned
 by `rust-toolchain.toml` and is kept in the named `thekernel-home` volume.
@@ -45,7 +45,7 @@ Other common commands:
 make run RUN_ARGS="--toolchain gcc" # shell image with a C compiler
 make run-gui RUN_ARGS=--build        # build and open the Weston desktop
 make run-gui                         # reopen the desktop without rebuilding
-./scripts/dev-shell.sh -- bash       # optional interactive container shell
+./tools/dev/dev-shell.sh -- bash       # optional interactive container shell
 ```
 
 The first desktop build compiles Buildroot and WebKit and takes a while.
@@ -59,7 +59,7 @@ desktop build dependencies and options.
 
 `tools/thekernel.py` is the single build, boot and test entry point; the
 Makefile wraps it with the development container and resource limits for
-everyday use. The lower-level `scripts/build-*.sh` files are deterministic
+everyday use. The lower-level `tools/build/build-*.sh` files are deterministic
 artifact builders called by `tools/thekernel.py`; they are not alternate user
 entry points.
 
@@ -95,8 +95,8 @@ building the rootfs outside the container needs a static C library (Fedora:
 ## Verification
 
 ```bash
-./scripts/dev-shell.sh -- ./tools/thekernel.py verify --tier daily
-./scripts/dev-shell.sh -- ./tools/thekernel.py verify --tier full
+./tools/dev/dev-shell.sh -- ./tools/thekernel.py verify --tier daily
+./tools/dev/dev-shell.sh -- ./tools/thekernel.py verify --tier full
 ./tools/thekernel.py verify --tier hardware    # on a KVM host
 ```
 
@@ -116,13 +116,12 @@ TheKernel and Linux 7.2.3 and compares the results; setting
 
 | Path | Contents |
 |---|---|
-| `kernel/` | Linux-compatible kernel and syscall integration |
+| `kernel/` | Linux-compatible kernel library and executable binary, syscall integration, and kernel/include |
 | `crates/ax/` | Mechanism and platform crates (scheduler, memory, drivers, HAL, …) |
 | `crates/linux/` | Reusable Linux ABI crates (signals, futex, io_uring, VFS, BPF, …) |
 | `crates/*-adapter/` | Adapters between the layers |
 | `config/` | Platform profiles, kernel configuration, ABI declarations |
-| `tools/` | `thekernel.py`, the QEMU runner and helper tools |
-| `scripts/` | Container entry points, deterministic artifact builders and CI scripts |
+| `tools/` | `thekernel.py`, the QEMU runner, build/dev/ci/hardware suites and tools |
 | `tests/` | Host tests and the guest system suite |
 | `docs/` | Debugging, licensing, provenance and design records |
 
@@ -134,7 +133,7 @@ Every workspace package declares its layer in
 `mechanism` crates use only mechanisms, `platform` adds platform crates,
 `linux_abi` adds Linux ABI crates, and `integration` (the kernel) may use all
 of them. Keep Linux objects and product policy out of lower layers.
-`scripts/ci/check_kernel_module_edges.py` tracks coupling between modules
+`tools/ci/check_kernel_module_edges.py` tracks coupling between modules
 inside the kernel crate; see
 [docs/design/kernel-module-coupling.md](docs/design/kernel-module-coupling.md).
 

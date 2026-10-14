@@ -41,7 +41,7 @@ claim that QEMU's DHCP server offered a router-free lease. Run:
 
 ```sh
 THEKERNEL_STATE_DIR=/home/ava/.cache/thekernel-targets/wt-dev \
-python3 scripts/ci/n305-dhcp-qemu-smoke.py
+python3 tools/ci/n305-dhcp-qemu-smoke.py
 ```
 
 **The revised policy/hook has not been retested on N305 hardware.** Rebuild the

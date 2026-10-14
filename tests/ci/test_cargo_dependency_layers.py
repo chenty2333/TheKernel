@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from tests.support import load_script_module, test_tmpdir
 
-gate = load_script_module("cargo_dependency_layers", "scripts/ci/check_cargo_dependency_layers.py")
+gate = load_script_module("cargo_dependency_layers", "tools/ci/check_cargo_dependency_layers.py")
 
 
 def package(name, layer, dependencies=()):

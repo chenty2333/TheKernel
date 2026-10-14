@@ -20,7 +20,7 @@ from tests.support import load_script_module, test_tmpdir
 
 
 def load_reader():
-    return load_script_module("thekernel_hw_facts_bundle", "scripts/ci/hw_facts_bundle.py")
+    return load_script_module("thekernel_hw_facts_bundle", "tools/ci/hw_facts_bundle.py")
 
 
 #: signature, length, revision, checksum, OEM id, OEM table id, OEM revision,

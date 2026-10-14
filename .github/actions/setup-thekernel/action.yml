@@ -6,4 +6,4 @@ runs:
     - name: Check development image and provision pinned toolchain
       shell: bash
       run: |
-        scripts/dev-shell.sh -- bash -c 'dev-env/check-image.sh && scripts/setup-toolchain.sh'
+        tools/dev/dev-shell.sh -- bash -c 'dev-env/check-image.sh && tools/dev/setup-toolchain.sh'

@@ -1,6 +1,6 @@
 """The raw-print ratchet must count what the kernel builds, and nothing else.
 
-`scripts/ci/check_log_surface.py` holds two promises that are easy to get wrong
+`tools/ci/check_log_surface.py` holds two promises that are easy to get wrong
 in opposite directions: a print the compiler would build has to be seen, and a
 print that only exists in a documentation example, a host test module or a
 string does not. Both are tested here against synthetic sources, and the
@@ -15,7 +15,7 @@ from unittest import mock
 from tests.support import load_script_module, test_tmpdir
 from pathlib import Path
 
-log_surface = load_script_module("check_log_surface", "scripts/ci/check_log_surface.py")
+log_surface = load_script_module("check_log_surface", "tools/ci/check_log_surface.py")
 
 
 def run() -> tuple[int, str]:

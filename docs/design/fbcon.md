@@ -255,7 +255,7 @@ that leaves no room, naming the byte count and the offending directory.
 **Result 12 — the daily tier's stage cannot be run by `verify --tier daily` on this host.**
 `verify` asserts the development image first (`dev-env/check-image.sh`) and fails with
 `missing required command: bison` (and `flex`); CI runs the tier inside
-`scripts/dev-shell.sh`. The tier was therefore reproduced stage by stage with the real
+`tools/dev/dev-shell.sh`. The tier was therefore reproduced stage by stage with the real
 `tools.verification.plan` and `verify.execute`, substituting only that image assertion; the
 substitution is printed in the transcript. Stage results are in the change-set State block
 below.
@@ -496,7 +496,7 @@ tag, type 0 end tag). No optional tag of type 8 is requested.
 
 GRUB nevertheless already advertises video support to the loader:
 
-`[V]` `scripts/build-x86-uefi-esp.sh:191-196`
+`[V]` `tools/build/build-x86-uefi-esp.sh:191-196`
 
 ```bash
 # EFI cannot provide the legacy EGA text console that Multiboot defaults to.
@@ -2020,7 +2020,7 @@ compositor.
 a GOP producer for `virtio-gpu-pci`. Searches run: `grep -rni "simplefb|simpledrm|efifb|gop\b|graphics output protocol|firmware framebuffer|bootloader framebuffer|vesafb|uvesafb"`
 over the whole tree — only two unrelated hits
 (`kernel/src/drm/file.rs:843` comment "linear framebuffer view", and
-`scripts/build-x86-uefi-esp.sh:192`). A local-artifact check was **inconclusive**: the
+`tools/build/build-x86-uefi-esp.sh:192`). A local-artifact check was **inconclusive**: the
 installed `/usr/share/edk2/ovmf/OVMF_CODE.fd` (1 966 080 bytes) is a firmware volume with
 compressed sections; `strings -a` and `strings -a -el` both return 0 hits for `VirtioGpu`,
 `QemuVideo`, `Bochs`, `Ramfb` and even `Simple Network`, so the file's driver inventory
@@ -2159,7 +2159,7 @@ reusable, the assertion is not.** Evidence:
 **1. Build.** Reuse the existing `build` stage artifacts (`tools/verification.py:36`) with
 `--no-build`. No new rootfs: the test uses a tiny statically-linked initramfs/rootfs whose
 `init` writes a fixed ASCII string to `/dev/console` and exits. `[I]` This is the only new
-guest artifact and it can be produced by the existing `scripts/build-rootfs.sh`.
+guest artifact and it can be produced by the existing `tools/build/build-rootfs.sh`.
 
 **2. Launch.** Add one graphics profile:
 

@@ -63,8 +63,8 @@ and [Generic Loader](https://www.qemu.org/docs/master/system/generic-loader.html
 | Observation | Source and limit |
 |---|---|
 | Host tools are available | Reviewed host: GCC 16.2.1, clang 22.1.8, QEMU 10.2.2; accelerator help includes `tcg` and `kvm`. These are not guest-tool version selections. |
-| Kernel C and guest C have different build paths | `crates/ax/tk-lwext4-rust/build.rs::discover_llvm_freestanding_toolchain` selects clang for the freestanding C component. `scripts/build-rootfs.sh` uses the selected host/cross GCC to statically build BusyBox, init and guest helpers. |
-| The default rootfs is 96 MiB | `scripts/build-rootfs.sh`: `SIZE_MB=96`; `--size-mb` already exists. |
+| Kernel C and guest C have different build paths | `crates/ax/tk-lwext4-rust/build.rs::discover_llvm_freestanding_toolchain` selects clang for the freestanding C component. `tools/build/build-rootfs.sh` uses the selected host/cross GCC to statically build BusyBox, init and guest helpers. |
+| The default rootfs is 96 MiB | `tools/build/build-rootfs.sh`: `SIZE_MB=96`; `--size-mb` already exists. |
 | The current system suite has 42 cases | `tests/guest/system-init.c::suite`; `io-uring-directio` is case 27. |
 | An existing daily log reports success | `~/.cache/thekernel-targets/dev/accept-daily.log` contains `1..42`, case 27 `result=0`, `guest-tcg: PASS` and `daily: PASS`. Reading this log is not a fresh acceptance run. |
 
@@ -122,7 +122,7 @@ existing cases) are case behaviour, not new regressions.
    are rejected with `EINVAL`. That is not automatically a workload blocker.
    The reviewed [QEMU 10.2.2 memfd helper](https://github.com/qemu/qemu/blob/v10.2.2/util/memfd.c)
    does not request `MFD_EXEC`; rechecked against the pinned 11.1.1
-   (`scripts/build-nested-payload.sh`), which still requests only
+   (`tools/build/build-nested-payload.sh`), which still requests only
    `MFD_CLOEXEC`, `MFD_ALLOW_SEALING` and the hugeTLB flags.
 4. **There is no guest KVM interface.**
    `kernel/src/pseudofs/dev/mod.rs` provides the synthesized devices, not
@@ -321,7 +321,7 @@ runtime support rather than assuming that ordinary ELF output proves `-run`.
 QEMU exposes cache and split-WX controls; the reviewed
 [10.2.2 TCG allocator](https://github.com/qemu/qemu/blob/v10.2.2/tcg/region.c)
 has both anonymous and split-WX paths, and the pinned 11.1.1
-(`scripts/build-nested-payload.sh`) still does. Pin the selected configuration and
+(`tools/build/build-nested-payload.sh`) still does. Pin the selected configuration and
 probe its actual allocation/protection sequence instead of requiring a
 hypothetical `MFD_EXEC` path.
 
@@ -548,7 +548,7 @@ state-management change, not a procfs one.
 
 ### Phase 1 — the tool payload is built and its interface verified
 
-`scripts/build-guest-tools.sh --payload tcc` builds TinyCC (`mob`,
+`tools/build/build-guest-tools.sh --payload tcc` builds TinyCC (`mob`,
 `0fb54300b56512754221d80adda85ddb9815bceb`) as a **static musl** binary in
 about 45 seconds from a cold cache, with no root:
 
@@ -737,7 +737,7 @@ compiler/emulator milestones. Its acceptance case runs `bluetoothd -n`,
 
 | Concern | Existing mechanism | Required change |
 |---|---|---|
-| Build selection | `tools/thekernel.py::build_rootfs` calls `scripts/build-rootfs.sh` | Pass the same selection through build and test; install only that payload and choose sufficient image size |
+| Build selection | `tools/thekernel.py::build_rootfs` calls `tools/build/build-rootfs.sh` | Pass the same selection through build and test; install only that payload and choose sufficient image size |
 | Artifact identity | `Artifacts.rootfs` currently returns one shared image path | Distinguish selected rootfs outputs and rootfs-dependent kernel/ESP artifacts so the tool image cannot replace the default image |
 | Rebuild decisions | `rootfs_fingerprint()`, input files/globs and environment | Include payload selection, source definitions, libc/toolchain inputs and build options; hashing only a new builder script is insufficient |
 | Build cache | Existing state directory and build serialization | Reuse them; key cached tools by relevant versions/options/toolchain, not host architecture alone |

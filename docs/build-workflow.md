@@ -6,7 +6,7 @@ keep the repository from growing a second build framework or a host daemon.
 ## One path
 
 ```text
-make / scripts/dev-run.sh
+make / tools/dev/dev-run.sh
           │
           ▼
   dev-env/compose.yaml (one `dev` service, `run --rm`)
@@ -14,16 +14,16 @@ make / scripts/dev-run.sh
           ▼
     tools/thekernel.py
           │
-          ├── scripts/build-guest-tools.sh
-          ├── scripts/build-rootfs.sh
-          ├── scripts/build-graphics-rootfs.sh
-          ├── scripts/build-x86-uefi-esp.sh
+          ├── tools/build/build-guest-tools.sh
+          ├── tools/build/build-rootfs.sh
+          ├── tools/build/build-graphics-rootfs.sh
+          ├── tools/build/build-x86-uefi-esp.sh
           └── Cargo / QEMU / verification suites
 ```
 
 `tools/thekernel.py` owns command selection, artifact identity, locks, and
 build/boot/test sequencing. The shell scripts below it each build one artifact
-and are not parallel user-facing workflows. `scripts/dev-run.sh` is the host
+and are not parallel user-facing workflows. `tools/dev/dev-run.sh` is the host
 boundary: from a host it enters the checked-in image; from inside that image it
 executes directly rather than nesting containers.
 
@@ -63,13 +63,13 @@ The development container is an execution boundary, not a service:
   `thekernel-netboot.service`/`.timer`.
 
 If an old host installation still contains one of those entries, first run
-`scripts/host-cleanup.sh` to inspect it, then rerun with `--fix`. The script
+`tools/dev/host-cleanup.sh` to inspect it, then rerun with `--fix`. The script
 does not alter unrelated containers, services, or NetworkManager profiles.
 
 ## Adding a new build step
 
 Add it to `tools/thekernel.py` and its matching verification/tests first. Keep
 large generated files below the state root, acquire the existing build lock,
-and expose it through `make` only by calling `scripts/dev-run.sh`. Do not add a
+and expose it through `make` only by calling `tools/dev/dev-run.sh`. Do not add a
 second Compose service, a background container, a host-network mode, or a
 systemd autostart unit for a build or boot experiment.

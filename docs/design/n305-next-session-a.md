@@ -17,7 +17,7 @@ cd /home/ava/Desktop/TheKernel
 export THEKERNEL_STATE_DIR=/home/ava/.cache/thekernel-targets
 export THEKERNEL_RTL8168_FIRMWARE_DIR=/home/ava/.cache/thekernel-targets/refs/firmware/rtl_nic
 python3 tools/thekernel.py build --platform n305 --profile shell
-scripts/n305-netboot.sh --help
+tools/hardware/n305-netboot.sh --help
 ```
 
 默认 `mem1g` 是编译变体名，不是假称真机只有 1GiB；实际内存由固件发现。
@@ -25,7 +25,7 @@ scripts/n305-netboot.sh --help
 该流程的示例，先确认，不由代理配置）：
 
 ```sh
-scripts/n305-netboot.sh prepare --mode kernel \
+tools/hardware/n305-netboot.sh prepare --mode kernel \
   --out "$THEKERNEL_STATE_DIR/n305-next-a" \
   --interface enp0s31f6 --address 192.168.10.1 \
   --kernel "$THEKERNEL_STATE_DIR/out/x86_64/n305/shell/mem1g/kernel-x86_64" \
@@ -94,7 +94,7 @@ loglevel=7 boot.progress=1 n305.net=dhcp n305.netconsole=192.168.10.1:6666 tty.i
 
 QEMU N305、8 核/8GiB、firmware-fb、真实 DHCP/UDP 日志和可读屏幕均没有复现；
 **没有根因修复声明，也不把中午的单次成功当成修复。** 复现脚本：
-`python3 scripts/ci/n305-verbose-qemu-smoke.py`（沿用上述状态目录）。
+`python3 tools/ci/n305-verbose-qemu-smoke.py`（沿用上述状态目录）。
 
 进 shell 后读 `cat /proc/boot-progress`。启用时会在 init 发布后每 5 秒、最多
 12 次输出 BOOT_PROGRESS：阶段（PID1、alarm 开始/结束、init join）、各 CPU
@@ -137,7 +137,7 @@ AML、`_PTS` 或控制方法键通知。QEMU 的 QMP `system_powerdown` 已实�
 先用第 1 步重新构建最新配套 kernel/rootfs（不拿旧 A7 验证镜像当最新版）：
 
 ```sh
-python3 scripts/build-usb-boot.py \
+python3 tools/build/build-usb-boot.py \
   --kernel "$THEKERNEL_STATE_DIR/out/x86_64/n305/shell/mem1g/kernel-x86_64" \
   --rootfs "$THEKERNEL_STATE_DIR/out/rootfs/x86/rootfs-x86.img" \
   --output "$THEKERNEL_STATE_DIR/n305-usb-new.img" --kernel-cmdline quiet
@@ -154,8 +154,8 @@ QEMU 已用 USB-only 拓扑验证写入、sync、真实 reboot 后读回同一�
 确认 USB 棒真实设备、全部分区已卸载后，先看 dry run；**只有用户**执行第二行：
 
 ```sh
-python3 scripts/write-usb-boot.py --image "$THEKERNEL_STATE_DIR/n305-usb-new.img" --device /dev/sdX
-sudo python3 scripts/write-usb-boot.py --image "$THEKERNEL_STATE_DIR/n305-usb-new.img" --device /dev/sdX --yes
+python3 tools/hardware/write-usb-boot.py --image "$THEKERNEL_STATE_DIR/n305-usb-new.img" --device /dev/sdX
+sudo python3 tools/hardware/write-usb-boot.py --image "$THEKERNEL_STATE_DIR/n305-usb-new.img" --device /dev/sdX --yes
 ```
 
 拒绝 NVMe/别名、非可移动、非 USB、分区、挂载/holders/swap/容量不足的设备。

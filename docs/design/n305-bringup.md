@@ -39,7 +39,7 @@ state, the framebuffer's format and the EDID of the attached sink.
 ### 1.1 Build the capture image (development host, no root needed)
 
 ```sh
-scripts/ci/n305-capture-image.sh --out ~/n305-capture.img
+tools/hardware/n305-capture-image.sh --out ~/n305-capture.img
 ```
 
 Downloads Alpine's standard live ISO (352 MiB, checksum verified against the
@@ -134,7 +134,7 @@ The bundle is a plain directory on a FAT partition:
 ```sh
 mkdir -p /mnt/stick && sudo mount /dev/sdX1 /mnt/stick   # the partition with the marker file
 cp -r /mnt/stick/dump/n305-<timestamp> /somewhere/
-scripts/ci/hw_facts_bundle.py /somewhere/n305-<timestamp>
+tools/ci/hw_facts_bundle.py /somewhere/n305-<timestamp>
 ```
 
 `hw_facts_bundle.py` prints the machine's identity, CPU, the ECAM base with its
@@ -158,7 +158,7 @@ is the table that says so".
 * Everything else that could not be read is in the bundle's own
   `capture-status.txt` as `FAIL` or `UNAVAILABLE` with the reason.
 
-`scripts/ci/n305-capture-image-selfcheck.sh` boots the built image in QEMU and
+`tools/hardware/n305-capture-image-selfcheck.sh` boots the built image in QEMU and
 asserts the whole pipeline works. It proves nothing about the N305: QEMU is not
 that machine.
 
@@ -231,7 +231,7 @@ sync
 ### 2.3 Record the screen, then boot
 
 ```sh
-scripts/ci/n305-screen-capture.sh capture --out ~/n305-run-1     # start this first
+tools/hardware/n305-screen-capture.sh capture --out ~/n305-run-1     # start this first
 ```
 
 Then power the machine on. Nothing is typed on the machine, ever. Leave the
@@ -294,7 +294,7 @@ Find the first frame in which `THEKERNEL_SHELL_READY` is legible and record who
 read it:
 
 ```sh
-scripts/ci/n305-screen-capture.sh verdict --dir ~/n305-run-1 \
+tools/hardware/n305-screen-capture.sh verdict --dir ~/n305-run-1 \
     --completion-frame 42 --marker THEKERNEL_SHELL_READY \
     --checker "your name, who read the screen"
 ```
@@ -306,7 +306,7 @@ verdict:
 THEKERNEL_DUT_POWER_CYCLE_CMD='...' \
 THEKERNEL_DUT_BOOT_ONCE_CMD='...' \
 THEKERNEL_DUT_SCREEN_CAPTURE_CMD='...' \
-scripts/ci/dut_gate.py --artifact-dir <build output> --state-dir <state> \
+tools/ci/dut_gate.py --artifact-dir <build output> --state-dir <state> \
     --dut n305 --observation screen --runs 3
 ```
 
@@ -338,7 +338,7 @@ Once the guest is reachable on the network, the same gate runs with
 THEKERNEL_DUT_POWER_CYCLE_CMD='...' \
 THEKERNEL_DUT_BOOT_ONCE_CMD='...' \
 THEKERNEL_DUT_NETWORK_CAPTURE_CMD='...' \
-scripts/ci/dut_gate.py --artifact-dir <build output> --state-dir <state> \
+tools/ci/dut_gate.py --artifact-dir <build output> --state-dir <state> \
     --dut n305 --observation network --runs 3
 ```
 

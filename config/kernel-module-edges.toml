@@ -1,7 +1,7 @@
 # Reviewed baseline of module-level `use crate::…` edges inside the `thekernel`
-# crate, enforced by scripts/ci/check_kernel_module_edges.py.
+# crate, enforced by tools/ci/check_kernel_module_edges.py.
 #
-# The cargo manifest gates (scripts/ci/check_cargo_dependency_layers.py) see
+# The cargo manifest gates (tools/ci/check_cargo_dependency_layers.py) see
 # edges between packages only.  Within one crate a subsystem can reach another
 # without a single manifest line changing, so this file is the review surface
 # for that: an edge listed here is accepted, a new one fails the gate, and an

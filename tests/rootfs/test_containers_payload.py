@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class ContainersPayloadTests(unittest.TestCase):
     def test_offline_filecaps_are_exact_signed_helper_rights(self):
-        spec = importlib.util.spec_from_file_location('container_filecaps', ROOT/'scripts/install-container-filecaps.py')
+        spec = importlib.util.spec_from_file_location('container_filecaps', ROOT/'tools/build/install-container-filecaps.py')
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         valid = {path: struct.pack('<IIIII', 0x02000001, 1 << bit, 0, 0, 0).hex()
@@ -23,10 +23,10 @@ class ContainersPayloadTests(unittest.TestCase):
                         {**valid, '/opt/thekernel-tools/bin/newuidmap': '00'*20}]:
             with self.assertRaises(ValueError):
                 module.validate_filecaps(invalid)
-        builder = (ROOT/'scripts/build-containers-payload.sh').read_text()
+        builder = (ROOT/'tools/build/build-containers-payload.sh').read_text()
         self.assertIn('SCHILY.xattr.security.capability', builder)
-        self.assertIn('scripts/install-container-filecaps.py', ROOTFS_INPUT_FILES)
-        self.assertIn('install-container-filecaps.py', (ROOT/'scripts/build-rootfs.sh').read_text())
+        self.assertIn('tools/build/install-container-filecaps.py', ROOTFS_INPUT_FILES)
+        self.assertIn('install-container-filecaps.py', (ROOT/'tools/build/build-rootfs.sh').read_text())
 
     def test_rootless_guest_setup_keeps_real_identity_and_offline_overlay(self):
         script = (ROOT/'tests/guest/container-podman.sh').read_text()
@@ -38,9 +38,9 @@ class ContainersPayloadTests(unittest.TestCase):
         self.assertIn('>> /etc/passwd', script)
         self.assertIn('cgroup.subtree_control', script)
         self.assertIn('thekernel-containers-namespace.sh',
-                      (ROOT/'scripts/build-containers-payload.sh').read_text())
+                      (ROOT/'tools/build/build-containers-payload.sh').read_text())
         self.assertIn("'ps', 'top', 'mount'",
-                      (ROOT/'scripts/build-containers-payload.sh').read_text())
+                      (ROOT/'tools/build/build-containers-payload.sh').read_text())
         self.assertIn("'^hello$'", script)
         self.assertIn("ps --all --quiet", script)
         self.assertIn('[ ! -s "$base/containers-after-run" ]', script)
@@ -73,7 +73,7 @@ class ContainersPayloadTests(unittest.TestCase):
         self.assertEqual(selected_tool_payload('containers'), 'containers')
         self.assertEqual(rootfs_image_bytes('containers'), 384 * 1024 * 1024)
         self.assertEqual(rootfs_image_bytes('none'), 160 * 1024 * 1024)
-        for name in ['scripts/build-containers-payload.sh', 'config/containers-apks.lock', 'tests/guest/container-bwrap.sh']:
+        for name in ['tools/build/build-containers-payload.sh', 'config/containers-apks.lock', 'tests/guest/container-bwrap.sh']:
             self.assertIn(name, ROOTFS_INPUT_FILES)
 
     def test_signed_closure_has_runtime_and_rootless_helpers(self):
@@ -86,8 +86,8 @@ class ContainersPayloadTests(unittest.TestCase):
             self.assertIn(name, dict(pins))
 
     def test_builder_does_not_run_host_container_or_account_scriptlets(self):
-        text = (ROOT/'scripts/build-containers-payload.sh').read_text()
-        subprocess.run(['bash', '-n', str(ROOT/'scripts/build-containers-payload.sh')], check=True)
+        text = (ROOT/'tools/build/build-containers-payload.sh').read_text()
+        subprocess.run(['bash', '-n', str(ROOT/'tools/build/build-containers-payload.sh')], check=True)
         self.assertIn('--no-scripts --no-chown add', text)
         self.assertIn("images/'alpine-3.24.1.tar'", text)
         self.assertIn("'RepoTags': ['alpine:3.24.1', 'alpine:latest']", text)
@@ -96,7 +96,7 @@ class ContainersPayloadTests(unittest.TestCase):
         self.assertNotIn('sudo', text)
 
     def test_cached_signed_versions_are_explicit_solver_candidates(self):
-        text = (ROOT/'scripts/build-containers-payload.sh').read_text()
+        text = (ROOT/'tools/build/build-containers-payload.sh').read_text()
         self.assertIn('stem=${pin/=/-}', text)
         self.assertIn('ambiguous cached source for $pin', text)
         self.assertIn('add "${PINS[@]}" "${EXACT_APKS[@]}"', text)
@@ -123,7 +123,7 @@ class ContainersPayloadTests(unittest.TestCase):
             out.mkdir()
             keep = out/'keep'
             keep.write_text('keep')
-            run = subprocess.run(['bash', str(ROOT/'scripts/build-containers-payload.sh'),
+            run = subprocess.run(['bash', str(ROOT/'tools/build/build-containers-payload.sh'),
                                   '--output', str(out)], capture_output=True, text=True)
             self.assertNotEqual(run.returncode, 0)
             self.assertIn('unrelated output tree', run.stderr)

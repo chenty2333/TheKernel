@@ -11,8 +11,8 @@ from pathlib import Path
 
 from tests.support import load_script_module, test_tmpdir
 
-scanner = load_script_module("scan_linux_excerpts", "scripts/ci/scan_linux_excerpts.py")
-auditor = load_script_module("audit_linux_range_cites", "scripts/ci/audit_linux_range_cites.py")
+scanner = load_script_module("scan_linux_excerpts", "tools/ci/scan_linux_excerpts.py")
+auditor = load_script_module("audit_linux_range_cites", "tools/ci/audit_linux_range_cites.py")
 
 LONG = "if (unlikely(flags & ~(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE))) {"
 SHORT = "if (nr_args > IO_RINGFD_REG_MAX)"

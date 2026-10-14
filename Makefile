@@ -1,6 +1,6 @@
 # Thin developer entry points. Product build and boot behavior lives in
 # tools/thekernel.py. Every target that needs the toolchain goes through
-# scripts/dev-run.sh, so a host shell and an entered development shell use the
+# tools/dev/dev-run.sh, so a host shell and an entered development shell use the
 # same image, cache, limits, and dependency set.
 
 # Matches the product default in tools/thekernel.py; --smp only bounds the
@@ -24,7 +24,7 @@ RUN_ARGS ?=
 # budget. The compose service is still short-lived and never auto-started.
 DEV_MEMORY ?= 8g
 
-DEV_RUN = ./scripts/dev-run.sh
+DEV_RUN = ./tools/dev/dev-run.sh
 # `THEKERNEL_STATE_DIR` is a host-only override used by a few hardware and
 # research helpers. It must not leak into the container, whose cache lives in
 # its named HOME volume.
@@ -54,7 +54,7 @@ run-gui:
 		--accel $(ACCEL) --timeout $(TIMEOUT) $(RUN_ARGS)
 
 bootstrap:
-	$(DEV_ENV) $(DEV_RUN) ./scripts/setup-toolchain.sh
+	$(DEV_ENV) $(DEV_RUN) ./tools/dev/setup-toolchain.sh
 
 build:
 	$(DEV_ENV) $(DEV_RUN) ./tools/thekernel.py build --smp $(SMP) --memory $(MEMORY)
@@ -62,7 +62,7 @@ build:
 lint:
 	$(DEV_ENV) $(DEV_RUN) ./tools/thekernel.py lint --smp $(SMP) --memory $(MEMORY)
 
-# The escalation path, developer-only.  `lint` above is what CI enforces: four
+# The escalation path, developer-only.  `lint` above is what CI enforces: three
 # packages, two denied Clippy groups, no `-D warnings`.  This runs every member
 # on the host target and promotes every warning the in-code allowances do not
 # cover, which the tree does not pass today -- run it to size that work, not to
@@ -85,7 +85,7 @@ clean:
 	$(DEV_ENV) $(DEV_RUN) ./tools/thekernel.py clean
 
 host-cleanup:
-	./scripts/host-cleanup.sh --fix
+	./tools/dev/host-cleanup.sh --fix
 
 # Also deletes the named volume thekernel-home (the container-side rustup
 # toolchain) and the locally built development image.

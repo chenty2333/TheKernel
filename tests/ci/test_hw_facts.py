@@ -1,4 +1,4 @@
-"""Unit tests for tools/hw_facts.py against synthetic capture fixtures.
+"""Unit tests for tools/hardware/hw_facts.py against synthetic capture fixtures.
 
 These tests never need a real capture: every byte they parse is constructed
 here, so the parsing contract (including the failure modes, which matter more
@@ -23,7 +23,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tests.support import test_tmpdir
-from tools import hw_facts
+from tools.hardware import hw_facts
 
 
 # ---------------------------------------------------------------------------

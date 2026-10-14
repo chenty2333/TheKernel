@@ -1,6 +1,6 @@
 # Graphics rootfs and desktop acceptance
 
-`scripts/build-graphics-rootfs.sh` is separate from the normal BusyBox test
+`tools/build/build-graphics-rootfs.sh` is separate from the normal BusyBox test
 rootfs. It uses Buildroot 2026.05.2; the package download directory is explicit
 and reusable. The generated toolchain uses the Linux 6.12 LTS UAPI headers; the
 Linux runtime differential reference remains separately fixed at 7.2.3.
@@ -8,16 +8,16 @@ Linux runtime differential reference remains separately fixed at 7.2.3.
 First validate the checked-in inputs without fetching or building anything:
 
 ```bash
-bash -n scripts/build-graphics-rootfs.sh
-scripts/build-graphics-rootfs.sh --check
+bash -n tools/build/build-graphics-rootfs.sh
+tools/build/build-graphics-rootfs.sh --check
 ```
 
 Use a local Buildroot checkout, or make the download intent explicit:
 
 ```bash
-scripts/build-graphics-rootfs.sh --flavor headless-abi-smoke \
+tools/build/build-graphics-rootfs.sh --flavor headless-abi-smoke \
   --buildroot-dir /src/buildroot-2026.05.2 --output .state/out/graphics-headless
-scripts/build-graphics-rootfs.sh --flavor q35-graphics-seatd --fetch-buildroot \
+tools/build/build-graphics-rootfs.sh --flavor q35-graphics-seatd --fetch-buildroot \
   --output .state/out/graphics-q35
 ```
 

@@ -159,8 +159,8 @@ Use an independent state directory, `CARGO_BUILD_JOBS=6` and `nice -n 10`:
 export THEKERNEL_STATE_DIR=/home/ava/.cache/thekernel-targets/wt-acpica
 export CARGO_BUILD_JOBS=6
 nice -n 10 python3 tools/thekernel.py test --suite guest --toolchain acpica --accel kvm
-nice -n 10 python3 scripts/ci/acpica-intx-qemu-smoke.py
-nice -n 10 python3 scripts/ci/acpica-policy-qemu-smoke.py
+nice -n 10 python3 tools/ci/acpica-intx-qemu-smoke.py
+nice -n 10 python3 tools/ci/acpica-policy-qemu-smoke.py
 nice -n 10 python3 tools/thekernel.py test --suite host
 nice -n 10 python3 tools/thekernel.py lint
 nice -n 10 python3 tools/thekernel.py lint --platform n305

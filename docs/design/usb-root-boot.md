@@ -2,7 +2,7 @@
 
 Original GPT partition reader, USB BOT root view and host image/writer tools.
 UEFI GPT layout is defined in [UEFI 2.11 section 5](https://uefi.org/specs/UEFI/2.11/05_GUID_Partition_Table_Format.html).
-The builder reuses `scripts/build-x86-uefi-esp.sh` for GRUB/EFI and FAT. It copies
+The builder reuses `tools/build/build-x86-uefi-esp.sh` for GRUB/EFI and FAT. It copies
 that ESP partition into a new protective-MBR/GPT image with primary and backup
 CRC-protected headers/arrays, then copies the existing ext4 rootfs into a separate
 x86-64 Linux root partition (GUID 4f68bce3-e8cd-4db1-96e7-fbcaf984b709). No loop
@@ -29,7 +29,7 @@ not the alias, identify USB transport. Internal NVMe write policy is unchanged.
 ```sh
 export THEKERNEL_STATE_DIR=/home/ava/.cache/thekernel-targets/wt-dev
 python3 tools/thekernel.py build --platform n305 --profile shell
-python3 scripts/build-usb-boot.py \
+python3 tools/build/build-usb-boot.py \
   --kernel "$THEKERNEL_STATE_DIR/out/x86_64/n305/shell/mem1g/kernel-x86_64" \
   --rootfs "$THEKERNEL_STATE_DIR/out/rootfs/x86/rootfs-x86.img" \
   --output "$THEKERNEL_STATE_DIR/n305-usb-new.img"
@@ -44,7 +44,7 @@ not a separate per-run ESP; the builder accepts `--kernel-cmdline` for e.g.
 `quiet` and DHCP/netconsole options, while keeping root=usb fixed. Conflicting `--kernel-cmdline` is refused. Keep the
 built image paired with its kernel/rootfs; rebuild after updating the kernel.
 
-`python3 scripts/ci/usb-boot-qemu-smoke.py` builds disposable media, boots using
+`python3 tools/ci/usb-boot-qemu-smoke.py` builds disposable media, boots using
 only USB, writes/syncs literal content, performs a real guest reboot, and reads
 identical content in the new kernel before clean power-off. Actual Q35 KVM
 validation: OVMF twice loaded UEFI QEMU USB HARDDRIVE; fresh second uptime
@@ -61,9 +61,9 @@ Follow the UEFI boot/media flow in `docs/design/n305-bringup.md`. Identify the
 USB stick carefully, unmount **all** its partitions, and inspect this dry run:
 
 ```sh
-python3 scripts/write-usb-boot.py --image /absolute/path/n305-usb-new.img --device /dev/sdX
+python3 tools/hardware/write-usb-boot.py --image /absolute/path/n305-usb-new.img --device /dev/sdX
 # Only after checking the device, the user runs:
-sudo python3 scripts/write-usb-boot.py --image /absolute/path/n305-usb-new.img --device /dev/sdX --yes
+sudo python3 tools/hardware/write-usb-boot.py --image /absolute/path/n305-usb-new.img --device /dev/sdX --yes
 ```
 
 The writer refuses `/dev/nvme*`, NVMe aliases/sysfs identities, non-block files,

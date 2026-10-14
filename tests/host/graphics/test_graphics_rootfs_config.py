@@ -181,7 +181,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         self.assertIn("q35-(graphics-seatd|software-desktop)|n305-iris-smoke", session)
 
     def test_iris_stage_argument_is_scoped_to_n305_flavor_and_check_needs_no_stage(self) -> None:
-        script = ROOT / "scripts/build-graphics-rootfs.sh"
+        script = ROOT / "tools/build/build-graphics-rootfs.sh"
         subprocess.run([script, "--flavor", "n305-iris-smoke", "--check"], cwd=ROOT, check=True)
         result = subprocess.run(
             [script, "--flavor", "q35-graphics-seatd", "--mesa-iris-stage", "/not/a/stage", "--check"],
@@ -446,7 +446,7 @@ sleep() { echo wait; }
         header = ROOT / "tests/guest/tools/intel-rcs-page.h"
         client = source.read_text()
         builder = (GRAPHICS / "build-guest-tools.sh").read_text()
-        rootfs_wrapper = (ROOT / "scripts/build-graphics-rootfs.sh").read_text()
+        rootfs_wrapper = (ROOT / "tools/build/build-graphics-rootfs.sh").read_text()
 
         self.assertTrue(header.is_file())
         self.assertIn("#include <drm.h>", client)
@@ -455,7 +455,7 @@ sleep() { echo wait; }
         self.assertIn('"$source_dir/tests/guest/tools/intel-bcs-smoke.c"', builder)
         self.assertIn('"$target/usr/local/bin/intel-bcs-smoke"', builder)
         self.assertIn('-I"$STAGING_DIR/usr/include/libdrm"', builder)
-        shell_builder = (ROOT / "scripts/build-rootfs.sh").read_text()
+        shell_builder = (ROOT / "tools/build/build-rootfs.sh").read_text()
         self.assertIn('pkg-config --cflags libdrm', shell_builder)
         self.assertIn('"${tool_cflags[@]}" "$source"', shell_builder)
         self.assertIn('printf \'%s\\n\' intel-bcs-smoke', rootfs_wrapper)
@@ -484,7 +484,7 @@ sleep() { echo wait; }
             self.assertIn("usage: intel-bcs-smoke", result.stderr)
 
     def test_n305_graphics_builder_reuses_base_and_optional_iris_guest_check(self) -> None:
-        builder = (ROOT / "scripts/build-n305-graphics-rootfs.sh").read_text()
+        builder = (ROOT / "tools/build/build-n305-graphics-rootfs.sh").read_text()
         runtime_stager = (GRAPHICS / "stage-n305-mesa-runtime.sh").read_text()
         guest_tools = (GRAPHICS / "build-guest-tools.sh").read_text()
         self.assertIn('"$SOURCE/host/bin/x86_64-buildroot-linux-gnu-gcc"', builder)
@@ -560,7 +560,7 @@ sleep() { echo wait; }
         self.assertIn('lease.current.next', session)
         subprocess.run(
             [
-                ROOT / "scripts/build-graphics-rootfs.sh",
+                ROOT / "tools/build/build-graphics-rootfs.sh",
                 "--flavor",
                 "q35-graphics-logind",
                 "--check",
@@ -584,7 +584,7 @@ sleep() { echo wait; }
                     (source / "Makefile").write_text(declaration + "\n")
                     # Stop at the next preflight check so no package build runs.
                     result = subprocess.run([
-                        ROOT / "scripts/build-graphics-rootfs.sh",
+                        ROOT / "tools/build/build-graphics-rootfs.sh",
                         "--flavor", "q35-software-desktop",
                         "--buildroot-dir", str(source),
                         "--output", str(work / "output"),

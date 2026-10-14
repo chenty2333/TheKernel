@@ -107,5 +107,5 @@ Repeat the emulated absence regression (not transport validation):
 
 ```sh
 THEKERNEL_STATE_DIR=/home/ava/.cache/thekernel-targets/wt-dev \
-python3 scripts/ci/usb-dbc-qemu-smoke.py
+python3 tools/ci/usb-dbc-qemu-smoke.py
 ```

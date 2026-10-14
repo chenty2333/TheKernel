@@ -182,14 +182,14 @@ class SystemTestGateTests(unittest.TestCase):
     def test_firmware_stager_is_shared_and_rootfs_fingerprinted(self) -> None:
         from tools import product_state
 
-        self.assertIn("scripts/stage-rootfs-firmware.sh", product_state.ROOTFS_INPUT_FILES)
-        helper = REPO_ROOT / "scripts/stage-rootfs-firmware.sh"
+        self.assertIn("tools/build/stage-rootfs-firmware.sh", product_state.ROOTFS_INPUT_FILES)
+        helper = REPO_ROOT / "tools/build/stage-rootfs-firmware.sh"
         self.assertTrue(helper.is_file())
         self.assertTrue(os.access(helper, os.X_OK))
-        rootfs_builder = (REPO_ROOT / "scripts/build-rootfs.sh").read_text()
-        n305_builder = (REPO_ROOT / "scripts/build-n305-graphics-rootfs.sh").read_text()
+        rootfs_builder = (REPO_ROOT / "tools/build/build-rootfs.sh").read_text()
+        n305_builder = (REPO_ROOT / "tools/build/build-n305-graphics-rootfs.sh").read_text()
         self.assertIn('"$SCRIPT_DIR/stage-rootfs-firmware.sh" "$STAGE"', rootfs_builder)
-        self.assertIn('"$REPO/scripts/stage-rootfs-firmware.sh" "$OUT/stage"', n305_builder)
+        self.assertIn('"$REPO/tools/build/stage-rootfs-firmware.sh" "$OUT/stage"', n305_builder)
         for variable in (
             "THEKERNEL_RTL8168_FIRMWARE_DIR",
             "THEKERNEL_IWX_FIRMWARE_DIR",
@@ -675,7 +675,7 @@ class SystemTestGateTests(unittest.TestCase):
             self.assertFalse(product.artifact_config_stamp(artifacts, "module").exists())
 
     def test_rootfs_includes_locked_root_identity_for_busybox_name_lookup(self) -> None:
-        script = (REPO_ROOT / "scripts/build-rootfs.sh").read_text(encoding="utf-8")
+        script = (REPO_ROOT / "tools/build/build-rootfs.sh").read_text(encoding="utf-8")
         self.assertIn(
             """cat > "$STAGE/etc/passwd" <<'EOF'\nroot:!:0:0:root:/root:/bin/sh\nEOF""",
             script,
@@ -876,11 +876,19 @@ class SystemTestGateTests(unittest.TestCase):
     def test_product_feature_aggregation_is_the_standard_build_baseline(self) -> None:
         product = load_product()
         root_manifest = tomllib.loads((REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertNotIn("package", root_manifest)
+        self.assertEqual(root_manifest["workspace"]["default-members"], ["kernel"])
 
+        kernel_manifest = tomllib.loads((REPO_ROOT / "kernel" / "Cargo.toml").read_text(encoding="utf-8"))
         self.assertEqual(
-            root_manifest["features"][product.PRODUCT_FEATURE],
-        ["qemu", "smp", "hwp-uclamp", "pmu", "perf-sampling"],
+            kernel_manifest["features"][product.PRODUCT_FEATURE],
+            ["qemu", "smp", "hwp-uclamp", "pmu", "perf-sampling"],
         )
+        self.assertEqual(
+            [target["name"] for target in kernel_manifest["bin"]],
+            ["thekernel"],
+        )
+        self.assertEqual(product.LINT_PACKAGES, ("tk-kernel", "tk-linux-process-adapter", "tk-readiness-adapter"))
         args = product.build_parser().parse_args(["build"])
         self.assertEqual(
             product.kernel_features(product.Artifacts(Path("state"), product.parse_variant(args))),
