@@ -961,4 +961,3 @@ mod tests {
         assert!(damage_range_to_clip(0, 1, 400, 0, 10, 10, 32).is_none());
     }
 }
-

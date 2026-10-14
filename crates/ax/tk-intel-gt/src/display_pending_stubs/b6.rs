@@ -75,4 +75,3 @@ pub unsafe extern "C" fn intel_hpd_poll_disable(display: *mut IntelDisplay) {
 pub unsafe extern "C" fn intel_hpd_poll_fini(display: *mut IntelDisplay) {
     unsafe { crate::intel_hotplug_upstream::intel_hpd_poll_fini_impl(display) };
 }
-

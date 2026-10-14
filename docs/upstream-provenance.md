@@ -2281,5 +2281,3 @@ The Linux i915 display power domains, PMDEMAND, PCH detect, HTI translations (`c
 
 Licensing:
 All translated display sources carry MIT licenses in upstream Linux 7.2.3 (SPDX-License-Identifier: MIT) and are recorded in `crates/ax/tk-intel-gt/NOTICE`.
-
-

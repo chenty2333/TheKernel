@@ -22,4 +22,3 @@ pub use crate::{
 
 pub use crate::intel_combo_phy_upstream::{intel_combo_phy_init, intel_combo_phy_uninit};
 pub use crate::intel_dkl_phy_upstream::intel_dkl_phy_init;
-

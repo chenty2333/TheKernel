@@ -1152,4 +1152,3 @@ pub unsafe extern "C" fn drm_helper_disable_unused_functions(dev: *mut DrmDevice
         crate::drm_modeset_lock_upstream::drm_modeset_unlock_all(dev);
     }
 }
-
