@@ -58,7 +58,7 @@ unsafe extern "C" {
 
 #[inline]
 fn is_err<T>(ptr: *const T) -> bool {
-    (ptr as usize) >= (!4095usize)
+    (ptr as usize) >= (usize::MAX - 4094)
 }
 
 #[inline]

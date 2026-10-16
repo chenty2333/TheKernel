@@ -617,7 +617,7 @@ pub unsafe fn vm_mmap(
                     (offset >> 12) as c_ulong + index as c_ulong,
                 )
             };
-            let result = if (page as isize) < 0 && (page as usize) >= usize::MAX - 4095 {
+            let result = if (page as isize) < 0 && (page as usize) >= usize::MAX - 4094 {
                 page as isize as i32
             } else {
                 pages.push(page as usize);

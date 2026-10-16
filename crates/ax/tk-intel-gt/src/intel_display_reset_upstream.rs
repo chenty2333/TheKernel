@@ -13,7 +13,7 @@ use tk_drm_upstream::drm_modeset_lock_types::DrmModesetAcquireCtx;
 #[inline]
 fn is_err<T>(ptr: *const T) -> bool {
     let addr = ptr as usize;
-    addr >= (!4095usize)
+    addr >= (usize::MAX - 4094)
 }
 
 // upstream: intel_display_reset.c intel_display_reset_supported()

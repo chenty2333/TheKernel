@@ -22,7 +22,7 @@ fn has_display(display: *mut IntelDisplay) -> bool {
 #[inline]
 fn is_err<T>(ptr: *const T) -> bool {
     let addr = ptr as usize;
-    addr >= (!4095usize)
+    addr >= (usize::MAX - 4094)
 }
 
 #[inline]

@@ -181,7 +181,9 @@ pub unsafe extern "C" fn dma_fence_wait_timeout(
         return 0;
     }
     if unbounded {
-        return 1;
+        // Linux returns the (huge) remaining timeout; returning 1 would make
+        // dma_resv_wait_timeout() time out the next fence after one tick.
+        return timeout;
     }
     let elapsed = axhal::time::monotonic_time_nanos().saturating_sub(start);
     (timeout - (elapsed / tick_ns.max(1)) as c_long).max(1)

@@ -1627,7 +1627,7 @@ pub unsafe extern "C" fn drm_atomic_helper_wait_for_vblanks(
             let _ = tk_linux_kapi::wait_event_timeout!(
                 *queue,
                 last != crate::drm_vblank_upstream::drm_crtc_vblank_count(crtc),
-                1000,
+                tk_linux_kapi::primitives::msecs_to_jiffies(1000u32) as i64,
             );
         }
 
