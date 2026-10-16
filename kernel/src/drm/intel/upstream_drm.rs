@@ -983,6 +983,8 @@ pub(super) fn registered_device() -> Option<*mut c_void> {
     // SAFETY: the allocated device lives for the kernel's lifetime (see
     // `note_allocated_i915`), and `drm` is its embedded `struct drm_device`.
     let drm = unsafe { ptr::addr_of!((*i915).drm).cast_mut() };
+    // SAFETY: `drm` is the embedded record in the retained device above;
+    // its lifecycle flags are initialized by the upstream probe before publication.
     unsafe { ((*drm).registered && !(*drm).unplugged).then_some(drm.cast()) }
 }
 

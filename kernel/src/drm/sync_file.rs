@@ -100,6 +100,8 @@ unsafe extern "C" fn sync_file_wake(
     // SAFETY: `private` is set in `try_new` to the live boxed wakeup state,
     // which outlives the entry because `Drop` unlinks the entry first.
     let state = unsafe { (*entry).private }.cast::<SyncFileWakeup>();
+    // SAFETY: `state` is the initialized boxed state described above. The
+    // wait-queue lock prevents Drop from unlinking and freeing it during this callback.
     unsafe { (*state).waiters.wake() };
     1
 }

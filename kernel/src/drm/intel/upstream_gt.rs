@@ -1198,8 +1198,11 @@ unsafe extern "C" fn kernel_fd_install(fd: c_int, file: *mut c_void) {
         .remove(&fd)
         .unwrap_or_else(|| panic!("fd_install({fd}) without a reservation"));
     let file = file.cast::<tk_linux_kapi::shmem::File>();
+    // SAFETY: fd_install receives a live LinuxKPI file reference and transfers
+    // it to the descriptor below; classification only reads its operations table.
+    let is_sync_file = unsafe { tk_linux_kapi::sync_file::is_sync_file_file(file) };
     let file_like: Arc<dyn FileLike> =
-        if unsafe { tk_linux_kapi::sync_file::is_sync_file_file(file) } {
+        if is_sync_file {
             Arc::new(
                 crate::drm::sync_file::SyncFileFd::try_new(file)
                     .unwrap_or_else(|error| panic!("fd_install({fd}): {error:?}")),

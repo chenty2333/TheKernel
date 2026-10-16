@@ -144,6 +144,8 @@ unsafe fn lookup_mmo(
             {
                 ptr::null_mut()
             } else {
+                // SAFETY: `obj` passed the non-null/device checks above, and the
+                // manager lock keeps this mmap node linked while we acquire its reference.
                 unsafe { i915_gem_object_get_rcu(obj) }
             };
             if owned.is_null() {
