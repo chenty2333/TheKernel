@@ -216,13 +216,13 @@ fn timer_worker_name() -> Result<String, ()> {
 }
 
 /// Start the monotonic timer-list worker in task context. Timer setup calls
-/// this before a timer can become visible to interrupt context.
+/// this before a timer can become visible to interrupt context; once started,
+/// it succeeds in any context.
 pub fn init_timer_executor() -> Result<(), ()> {
-    if !axtask::can_block_current() {
-        return Err(());
-    }
     loop {
         match TIMER_WORKER_STATE.load(Ordering::Acquire) {
+            // An established executor serves every later caller, including
+            // timer arming under an IRQ-saved lock where blocking is illegal.
             TIMER_WORKER_READY => return Ok(()),
             TIMER_WORKER_STARTING => {
                 TIMER_WAKE
@@ -232,6 +232,10 @@ pub fn init_timer_executor() -> Result<(), ()> {
                     .map_err(|_| ())?;
             }
             TIMER_WORKER_UNINITIALIZED => {
+                // Only the first start needs a blockable task context.
+                if !axtask::can_block_current() {
+                    return Err(());
+                }
                 if TIMER_WORKER_STATE
                     .compare_exchange(
                         TIMER_WORKER_UNINITIALIZED,

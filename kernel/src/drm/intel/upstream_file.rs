@@ -746,7 +746,11 @@ pub(crate) unsafe extern "C" fn gem_handle_create(
     }
     let native_file = match FILES.lock().get(&(file as usize)) {
         Some(binding) if binding.native_file != 0 => binding.native_file,
-        _ => return -19,
+        // A DRM file that never entered the i915 native bridge (the fbdev
+        // client's file, efidrm, VirtIO) has no shadow DrmFile to mirror
+        // into. Linux's handle is then its only namespace, so there is
+        // nothing to alias and the handle is kept, as in gem_handle_close().
+        _ => return 0,
     };
     // SAFETY: DRM calls this provider for a live GEM object and checked non-null above.
     let size = unsafe { (*object.cast::<DrmGemObjectBaseLayout>()).size };

@@ -699,6 +699,7 @@ mod tests {
 
             let primary_file = drm_file_alloc((*dev).primary);
             assert!(!primary_file.is_null());
+            assert_eq!(crate::drm_auth_upstream::drm_master_open(primary_file), 0);
 
             let render_file = drm_file_alloc((*dev).render);
             assert!(!render_file.is_null());

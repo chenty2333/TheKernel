@@ -2050,6 +2050,7 @@ pub unsafe extern "C" fn drm_mode_convert_to_umode(out: *mut DrmModeModeinfo, in
         HDMI_PICTURE_ASPECT_16_9 => out.flags |= DRM_MODE_FLAG_PIC_AR_16_9,
         HDMI_PICTURE_ASPECT_64_27 => out.flags |= DRM_MODE_FLAG_PIC_AR_64_27,
         HDMI_PICTURE_ASPECT_256_135 => out.flags |= DRM_MODE_FLAG_PIC_AR_256_135,
+        HDMI_PICTURE_ASPECT_NONE => out.flags |= DRM_MODE_FLAG_PIC_AR_NONE,
         _ => {
             // WARN(1, "Invalid aspect ratio ...") then fall through to NONE
             warn_on(true);

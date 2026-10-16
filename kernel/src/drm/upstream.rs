@@ -2,11 +2,11 @@
 //!
 //! Each driver owner installs its registered `drm_device` here once. `/dev/dri`
 //! publishes one card (and render) node per device from its DRM minors, and
-//! `/dev/fb0` uses the first device whose fbdev client registered an fb_info,
-//! so a raw C device pointer never outlives its driver/transport owner.
+//! `/dev/fb0` uses the first device that has an fbdev client (devfs publishes
+//! it only if that client registered an fb_info), so a raw C device pointer
+//! never outlives its driver/transport owner.
 
 use alloc::{
-    boxed::Box,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -16,19 +16,9 @@ use axdriver_display::{BlobMapping, DevError, DisplayPciIdentity};
 use axerrno::{AxError, AxResult};
 use axsync::Mutex;
 use lazy_static::lazy_static;
-use tk_drm_upstream::{
-    drm_device_types::DrmDevice,
-    drm_fb_helper_types::{DrmFbHelper, DrmFbHelperFuncs},
-    drm_gem_types::DrmGemObject,
-};
+use tk_drm_upstream::{drm_device_types::DrmDevice, drm_gem_types::DrmGemObject};
 
 use crate::mm::{ExternalPageLease, SharedPages};
-
-static FB_HELPER_FUNCS: DrmFbHelperFuncs = DrmFbHelperFuncs {
-    fb_dirty: None,
-    fb_restore: None,
-    fb_set_suspend: None,
-};
 
 pub(crate) struct UpstreamDrmDevice {
     raw: NonNull<DrmDevice>,
@@ -36,7 +26,6 @@ pub(crate) struct UpstreamDrmDevice {
     mode: (u32, u32),
     pci: Option<DisplayPciIdentity>,
     label: &'static str,
-    fb_helper: Option<Box<DrmFbHelper>>,
     gem_mmap: Option<Arc<dyn UpstreamGemMmapProvider>>,
     unplugged: core::sync::atomic::AtomicBool,
     external_pages: Mutex<Vec<(Weak<ExternalPageLease>, Weak<SharedPages>)>>,
@@ -100,21 +89,17 @@ impl UpstreamDrmDevice {
         }
     }
 
-    /// Whether an fbdev client of this device registered an fb_info: the
-    /// generic helper installed here, or the driver's own drm_client_setup().
+    /// Whether this device has an fbdev client. Every fbdev client is
+    /// created by drm_client_setup() in its driver's probe, as Linux does.
+    /// The client may still have failed to register an fb_info, which is
+    /// what devfs checks before publishing `/dev/fb0`.
     pub(crate) fn has_fbdev(&self) -> bool {
         // SAFETY: clientlist is initialized by drm_dev_init(); clients are
         // only added during probe, before the device was published.
-        let has_client = unsafe {
+        unsafe {
             let list = core::ptr::addr_of!((*self.raw()).clientlist);
             !core::ptr::eq((*list).next, list)
-        };
-        has_client
-            || self
-                .fb_helper
-                .as_ref()
-                // SAFETY: the helper is pinned in its Box for the device lifetime.
-                .is_some_and(|helper| unsafe { !(**helper).info.is_null() })
+        }
     }
 
     pub(crate) fn mapping_owner(&self) -> Arc<dyn Any + Send + Sync> {
@@ -195,26 +180,12 @@ pub(crate) fn install(
         return Err(AxError::AlreadyExists);
     }
     devices.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-    // A driver that ran drm_client_setup() itself (efidrm) already owns its
-    // fbdev client; only the others get the generic shmem client here.
-    // SAFETY: clientlist is initialized by drm_dev_init() and only appended
-    // to by drm_client_register() during this single-threaded probe.
-    let has_client = unsafe {
-        let list = core::ptr::addr_of!((*raw.as_ptr()).clientlist);
-        !core::ptr::eq((*list).next, list)
-    };
-    let fb_helper = if has_client {
-        None
-    } else {
-        initialize_fbdev(raw.as_ptr())
-    };
     let device = Arc::try_new(UpstreamDrmDevice {
         raw,
         owner,
         mode,
         pci,
         label,
-        fb_helper,
         gem_mmap,
         unplugged: core::sync::atomic::AtomicBool::new(false),
         external_pages: Mutex::new(Vec::new()),
@@ -259,71 +230,10 @@ pub(crate) fn unplug(expected: *mut DrmDevice) -> AxResult<()> {
     // while keeping existing open file references intact.
     unsafe { tk_drm_upstream::drm_drv_upstream::drm_dev_unplug(expected) };
     device.revoke_external_pages();
-    if let Some(helper) = device.fb_helper.as_ref() {
-        let helper = (&**helper as *const DrmFbHelper).cast_mut();
-        // SAFETY: `helper` points to the pinned `DrmFbHelper` instance initialized in `initialize_fbdev`.
-        // Reading `info` checks whether an associated `fb_info` was registered.
-        if unsafe { !(*helper).info.is_null() } {
-            // SAFETY: `helper` is valid and `(*helper).info` is non-null. `drm_fb_helper_unregister_info`
-            // tears down the registered framebuffer device before dropping the helper.
-            unsafe {
-                tk_drm_upstream::drm_fb_helper_upstream::drm_fb_helper_unregister_info(helper)
-            };
-        }
-    }
+    // SAFETY: `expected` is the registered device being unplugged; this is the
+    // Linux drm_dev_unregister() client teardown, which unregisters each fbdev
+    // client and its fb_info.
+    unsafe { tk_drm_upstream::drm_client_event_upstream::drm_client_dev_unregister(expected) };
     Ok(())
 }
 
-/// Initialize the upstream generic shmem fbdev client. Lack of a usable
-/// modeset or dumb-buffer path leaves DRM itself available but does not invent
-/// a framebuffer node; devfs publishes `/dev/fb0` only after real fb_info
-/// registration succeeds.
-fn initialize_fbdev(dev: *mut DrmDevice) -> Option<Box<DrmFbHelper>> {
-    // SAFETY: An all-zero byte pattern is valid initialization for `DrmFbHelper` before
-    // `drm_fb_helper_prepare` sets up its fields and function table.
-    let mut helper = match Box::try_new(unsafe { core::mem::zeroed::<DrmFbHelper>() }) {
-        Ok(helper) => helper,
-        Err(_) => {
-            warn!("drm: no memory for upstream fbdev helper");
-            return None;
-        }
-    };
-    let helper_ptr = (&mut *helper) as *mut DrmFbHelper;
-    // SAFETY: `dev` is a valid, live `DrmDevice` pointer passed from `install`.
-    // Dereferencing `dev` to read the immutable `driver` pointer is safe and race-free.
-    let driver = unsafe { (*dev).driver };
-    if driver.is_null() {
-        return None;
-    }
-    // SAFETY: `dev` and `driver` are valid pointers to the live DRM device and its driver descriptor.
-    // `helper_ptr` points to the exclusively owned, allocated `DrmFbHelper`. We invoke upstream
-    // fb helper lifecycle APIs (`prepare`, `init`, `initial_config`, and error unwind paths) sequentially
-    // while initializing the fbdev emulation.
-    unsafe {
-        if (*driver).fbdev_probe.is_none() {
-            (*driver).fbdev_probe =
-                Some(tk_drm_upstream::drm_fbdev_shmem_upstream::drm_fbdev_shmem_driver_fbdev_probe);
-        }
-        tk_drm_upstream::drm_fb_helper_upstream::drm_fb_helper_prepare(
-            dev,
-            helper_ptr,
-            32,
-            (&FB_HELPER_FUNCS as *const DrmFbHelperFuncs).cast_mut(),
-        );
-        if tk_drm_upstream::drm_fb_helper_upstream::drm_fb_helper_init(dev, helper_ptr) != 0 {
-            tk_drm_upstream::drm_fb_helper_upstream::drm_fb_helper_unprepare(helper_ptr);
-            return None;
-        }
-        let ret = tk_drm_upstream::drm_fb_helper_upstream::drm_fb_helper_initial_config(helper_ptr);
-        if ret != 0 {
-            if !(*helper_ptr).info.is_null() {
-                tk_drm_upstream::drm_fb_helper_upstream::drm_fb_helper_unregister_info(helper_ptr);
-            }
-            tk_drm_upstream::drm_fb_helper_upstream::drm_fb_helper_fini(helper_ptr);
-            tk_drm_upstream::drm_fb_helper_upstream::drm_fb_helper_unprepare(helper_ptr);
-            warn!("drm: upstream fbdev setup failed with errno {ret}");
-            return None;
-        }
-    }
-    Some(helper)
-}

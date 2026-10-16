@@ -43,6 +43,14 @@ pub fn init(args: &[String], envs: &[String]) {
     crate::mm::init_tlb_shootdown();
     axruntime::boot_progress::trace_exit("entry:init_tlb_shootdown");
 
+    // Linux timer_setup() never sleeps, and DRM arms vblank timers while holding
+    // its IRQ-saved vbl_lock. Start the timer-list worker now, with interrupts
+    // enabled, so that arming a timer later only links it into the queue.
+    axruntime::boot_progress::trace_enter("entry:init_timer_executor");
+    tk_linux_kapi::timer::init_timer_executor()
+        .expect("failed to start the Linux timer-list executor");
+    axruntime::boot_progress::trace_exit("entry:init_timer_executor");
+
     axruntime::boot_progress::trace_enter("entry:init_shared_mmap_providers");
     crate::mm::install_shared_mmap_providers()
         .expect("failed to install core SharedPages mmap providers");

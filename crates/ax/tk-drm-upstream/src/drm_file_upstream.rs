@@ -109,15 +109,6 @@ pub unsafe extern "C" fn drm_file_alloc(minor: *mut DrmMinor) -> *mut DrmFile {
 
         mutex_init(core::ptr::addr_of_mut!((*file_priv).client_name_lock));
 
-        if (*minor).r#type == 0 {
-            // primary minor gets master
-            let ret = drm_master_open(file_priv);
-            if ret != 0 {
-                drop(Box::from_raw(file_priv));
-                return core::ptr::null_mut();
-            }
-        }
-
         if let Some(driver) = (*dev).driver.as_ref() {
             if let Some(open_cb) = driver.open {
                 let ret = open_cb(dev, file_priv);
@@ -255,6 +246,16 @@ pub unsafe extern "C" fn drm_open_helper(filp: *mut File, minor: *mut DrmMinor) 
     let priv_data = drm_file_alloc(minor);
     if priv_data.is_null() {
         return -ENOMEM;
+    }
+    // Only an open of the primary node may become master. Client files
+    // (fbdev, efidrm) are created through drm_client_open(), which never
+    // takes master, so the internal modeset commit can still acquire it.
+    if (*minor).r#type == 0 {
+        let ret = drm_master_open(priv_data);
+        if ret != 0 {
+            drm_file_free(priv_data);
+            return ret;
+        }
     }
 
     (*filp).private_data = priv_data.cast();

@@ -426,15 +426,17 @@ mod tests {
             let dev = drm_dev_alloc(&driver, core::ptr::null_mut());
             assert!(!dev.is_null());
 
-            // 1. First file opened becomes master
+            // 1. First file opened becomes master (drm_open_helper() -> drm_master_open())
             let file1 = drm_file_alloc((*dev).primary);
             assert!(!file1.is_null());
+            assert_eq!(super::drm_master_open(file1), 0);
             assert!(drm_is_current_master(file1));
             assert!((*file1).authenticated);
 
             // 2. Second file opened is not master, and not authenticated
             let file2 = drm_file_alloc((*dev).primary);
             assert!(!file2.is_null());
+            assert_eq!(super::drm_master_open(file2), 0);
             assert!(!drm_is_current_master(file2));
             assert!(!(*file2).authenticated);
 

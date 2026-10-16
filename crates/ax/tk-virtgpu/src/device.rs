@@ -180,7 +180,8 @@ static DRM_DRIVER: SyncDriver = SyncDriver(DrmDriver {
     gem_prime_import_sg_table: Some(crate::gem::virtgpu_gem_prime_import_sg_table),
     dumb_create: Some(crate::gem::virtgpu_dumb_create),
     dumb_map_offset: Some(tk_drm_upstream::drm_gem_upstream::drm_gem_dumb_map_offset),
-    fbdev_probe: None,
+    // DRM_FBDEV_SHMEM_DRIVER_OPS (virtgpu_drv.c).
+    fbdev_probe: Some(tk_drm_upstream::drm_fbdev_shmem_upstream::drm_fbdev_shmem_driver_fbdev_probe),
     show_fdinfo: None,
     major: 0,
     minor: 1,
@@ -219,7 +220,8 @@ static CONNECTOR_FUNCS: DrmConnectorFuncs = DrmConnectorFuncs {
     reset: Some(drm_atomic_helper_connector_reset),
     detect: Some(virtgpu_connector_detect),
     force: None,
-    fill_modes: None,
+    // virtgpu_display.c: .fill_modes = drm_helper_probe_single_connector_modes
+    fill_modes: Some(tk_drm_upstream::drm_probe_helper_upstream::drm_helper_probe_single_connector_modes),
     set_property: None,
     late_register: None,
     early_unregister: None,
@@ -382,6 +384,10 @@ impl VirtioGpuDevice {
                 None => VirtioGpuInstallError::unrecoverable(error),
             });
         }
+
+        // virtgpu_probe(): drm_client_setup(vdev->priv, NULL) after drm_dev_register().
+        // SAFETY: drm is registered and its driver's fbdev_probe is set above.
+        unsafe { tk_drm_upstream::drm_client_setup_upstream::drm_client_setup(drm, core::ptr::null()) };
 
         Ok(Self { drm, private })
     }
@@ -841,6 +847,9 @@ unsafe fn init_drm_device(drm: *mut DrmDevice, private: *mut DriverPrivate) -> i
             drm_connector_cleanup(connector);
             return ret;
         }
+        // virtio_gpu_modeset_init(): drm_mode_config_reset() creates the
+        // initial CRTC, plane and connector states after the outputs exist.
+        tk_drm_upstream::drm_mode_config_upstream::drm_mode_config_reset(drm);
         0
     }
 }
