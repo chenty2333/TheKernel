@@ -578,6 +578,57 @@ unsafe fn guc_mmio_regset_init(regset: *mut TempRegset, engine: *mut IntelEngine
     if ret != 0 { -1 } else { 0 }
 }
 
+/// N305 bring-up: GuC rejected this list with
+/// `INIT_MMIO_SAVE_RESTORE_INVALID`, so print it compactly (offset/flags) and
+/// call out entries no MMIO register can have.
+unsafe fn dump_engine_regset(engine: *mut IntelEngineCs, regs: *const guc_mmio_reg, count: u32) {
+    let class = unsafe { (*engine).class };
+    let instance = unsafe { (*engine).instance };
+    let base = unsafe { (*engine).mmio_base };
+    axlog::warn!("ADS regset class={class} inst={instance} base={base:#x} count={count}");
+    let mut line = alloc::string::String::new();
+    for index in 0..count as usize {
+        let reg = unsafe { ptr::read_unaligned(regs.add(index)) };
+        let (offset, flags) = (reg.offset, reg.flags);
+        if offset == 0 || offset % 4 != 0 || offset >= 0x40_0000 {
+            axlog::error!("ADS regset class={class} inst={instance}: suspicious offset {offset:#x} flags={flags:#x}");
+        }
+        let _ = core::fmt::Write::write_fmt(&mut line, format_args!(" {offset:x}/{flags:x}"));
+        if index % 8 == 7 || index + 1 == count as usize {
+            axlog::warn!("ADS c{class}i{instance}:{line}");
+            line.clear();
+        }
+    }
+}
+
+/// Re-print the regset GuC rejected, render engine last so it stays on the
+/// bottom of the screen-only log.
+pub(crate) unsafe fn dump_guc_regsets(guc: *mut IntelGuc) {
+    let gt = unsafe { guc_to_gt(guc) };
+    let regs = unsafe { (*guc).ads_regset }.cast::<guc_mmio_reg>();
+    if regs.is_null() {
+        axlog::warn!("ADS regset: not retained");
+        return;
+    }
+    let mut starts = [0u32; I915_NUM_ENGINES as usize];
+    let mut next = 0u32;
+    for id in 0..I915_NUM_ENGINES as usize {
+        if unsafe { (*gt).engine[id] }.is_null() {
+            continue;
+        }
+        starts[id] = next;
+        next += unsafe { (*guc).ads_regset_count[id] };
+    }
+    for id in (0..I915_NUM_ENGINES as usize).rev() {
+        let engine = unsafe { (*gt).engine[id] };
+        if engine.is_null() {
+            continue;
+        }
+        let count = unsafe { (*guc).ads_regset_count[id] };
+        unsafe { dump_engine_regset(engine, regs.add(starts[id] as usize), count) };
+    }
+}
+
 // upstream: intel_guc_ads.c guc_mmio_reg_state_create()
 unsafe fn guc_mmio_reg_state_create(guc: *mut IntelGuc) -> isize {
     let gt = unsafe { guc_to_gt(guc) };

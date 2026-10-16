@@ -746,6 +746,30 @@ unsafe extern "C" fn gen8_get_pte(addr: *const u64) -> u64 {
     unsafe { ptr::read_volatile(addr) }
 }
 
+/// N305 bring-up guard: log every GGTT write range and stop before a PTE
+/// lands outside the GSM (the next MMIO beyond BAR0 is not ours).
+unsafe fn ggtt_guard_range(
+    vm: *mut I915AddressSpace,
+    what: &str,
+    start: u64,
+    len: u64,
+    first_addr: dma_addr_t,
+) {
+    let total = unsafe { (*vm).total };
+    let end = start.checked_add(len);
+    let ram = tk_linux_kapi::vm::phys_is_ram(first_addr as usize, I915_GTT_PAGE_SIZE as usize);
+    axlog::debug!(
+        "GGTT {what}: [{start:#x}+{len:#x}) total={total:#x} first_dma={:#x}{}",
+        first_addr,
+        if ram { "" } else { " (not RAM)" }
+    );
+    if end.is_none_or(|end| end > total) {
+        tk_linux_kapi::vm::hw_guard_halt(format_args!(
+            "GGTT {what} [{start:#x}+{len:#x}) exceeds GSM coverage {total:#x}"
+        ));
+    }
+}
+
 // upstream: intel_ggtt.c gen8_ggtt_insert_page()
 unsafe extern "C" fn gen8_ggtt_insert_page(
     vm: *mut I915AddressSpace,
@@ -755,6 +779,7 @@ unsafe extern "C" fn gen8_ggtt_insert_page(
     flags: u32,
 ) {
     let ggtt = unsafe { i915_vm_to_ggtt(vm) };
+    unsafe { ggtt_guard_range(vm, "insert_page", offset, I915_GTT_PAGE_SIZE, addr) };
     let pte = unsafe {
         (*ggtt)
             .gsm
@@ -816,6 +841,18 @@ unsafe extern "C" fn gen8_ggtt_insert_entries(
     flags: u32,
 ) {
     let ggtt = unsafe { i915_vm_to_ggtt(vm) };
+    unsafe {
+        let first = crate::intel_gtt_api_upstream::for_each_sgt_daddr((*res).bi.pages)
+            .next()
+            .unwrap_or(0);
+        ggtt_guard_range(
+            vm,
+            "insert_entries",
+            (*res).start - (*res).guard as u64,
+            (*res).node_size + 2 * (*res).guard as u64,
+            first,
+        );
+    }
     let pte_encode = unsafe { vm_pte_encode(vm, 0, pat_index, flags) };
     let mut gte = unsafe {
         (*ggtt)

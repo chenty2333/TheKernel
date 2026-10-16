@@ -864,9 +864,11 @@ fn init_interrupt() {
 /// established its no-preempt guard and must never call scheduler code.
 #[cfg(feature = "irq")]
 fn timer_irq_context(_vector: usize, frame: &axhal::context::TrapFrame) {
+    let from_user = frame.cs & 3 == 3;
     // SAFETY: this timer's trap-entry observer and ordinary handler execute
     // serially on the same CPU with interrupts masked by the architecture.
-    unsafe { TIMER_INTERRUPTED_USER.write_current_raw((frame.cs & 3 == 3) as u8) };
+    unsafe { TIMER_INTERRUPTED_USER.write_current_raw(from_user as u8) };
+    boot_progress::sample_stalled_frame(frame.rip, frame.rbp, from_user);
 }
 
 /// Ordinary platform timer callback. It retains the established IRQ guard,
@@ -876,7 +878,10 @@ fn timer_irq_context(_vector: usize, frame: &axhal::context::TrapFrame) {
 fn timer_irq_handler() {
     let now_ns = axhal::time::monotonic_time_nanos();
     if boot_progress::enabled() { boot_progress::timer(axhal::percpu::this_cpu_id(),now_ns); }
-    if boot_progress::boot_trace_enabled() { boot_progress::heartbeat(now_ns); }
+    if boot_progress::boot_trace_enabled() {
+        boot_progress::report_stalled_frame();
+        boot_progress::heartbeat(now_ns);
+    }
     let periodic_due = advance_periodic_deadline(now_ns);
     let early_due = consume_early_deadline(now_ns);
 

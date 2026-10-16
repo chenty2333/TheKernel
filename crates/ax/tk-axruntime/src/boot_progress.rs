@@ -148,11 +148,14 @@ impl<'a> Drop for WriteGuard<'a> {
     }
 }
 
+/// Nesting depth one CPU can trace; the GT probe path nests about ten deep.
+pub const TRACE_DEPTH: usize = 16;
+
 pub struct CpuTraceSlot {
     write_lock: AtomicBool,
     seq: AtomicU64,
     depth: AtomicUsize,
-    stack: [TraceSlotEntry; 4],
+    stack: [TraceSlotEntry; TRACE_DEPTH],
 }
 
 impl CpuTraceSlot {
@@ -161,7 +164,7 @@ impl CpuTraceSlot {
             write_lock: AtomicBool::new(false),
             seq: AtomicU64::new(0),
             depth: AtomicUsize::new(0),
-            stack: [const { TraceSlotEntry::new() }; 4],
+            stack: [const { TraceSlotEntry::new() }; TRACE_DEPTH],
         }
     }
 
@@ -184,13 +187,13 @@ impl CpuTraceSlot {
         core::sync::atomic::fence(Ordering::Release);
 
         let d = self.depth.load(Ordering::Relaxed);
-        let target_idx = if d < 4 {
+        let target_idx = if d < TRACE_DEPTH {
             self.depth.store(d + 1, Ordering::Relaxed);
             d
         } else {
-            // Note: fixed stack capacity is 4. If nesting exceeds 4, slot 3 is overwritten with
-            // the newest step. When that step exits, slot 3 is cleared and depth returns to 3.
-            3
+            // Note: fixed stack capacity is TRACE_DEPTH. If nesting exceeds it, the last slot is
+            // overwritten with the newest step. When that step exits, the slot is cleared.
+            TRACE_DEPTH - 1
         };
         self.stack[target_idx]
             .ptr
@@ -206,25 +209,26 @@ impl CpuTraceSlot {
         self.seq.fetch_add(1, Ordering::Release);
     }
 
-    pub fn exit(&self, step: &'static str) {
+    /// Pops `step` and everything nested above it; returns whether this slot held it.
+    pub fn exit(&self, step: &'static str) -> bool {
         // Diagnostic code must NEVER block or deadlock.
         if self
             .write_lock
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            return;
+            return false;
         }
         let _guard = WriteGuard(&self.write_lock);
 
         let d = self.depth.load(Ordering::Relaxed);
         if d == 0 {
-            return;
+            return false;
         }
 
         // Search stack for matching step.
         let mut found = None;
-        for i in (0..d.min(4)).rev() {
+        for i in (0..d.min(TRACE_DEPTH)).rev() {
             let ptr = self.stack[i].ptr.load(Ordering::Relaxed);
             let len = self.stack[i].len.load(Ordering::Relaxed);
             if !ptr.is_null() && len == step.len() {
@@ -239,7 +243,7 @@ impl CpuTraceSlot {
         let Some(target_idx) = found else {
             // If the step is not found on this CPU (e.g. task migrated to another CPU
             // between enter and exit, or mismatched exit), do NOT pop unrelated steps!
-            return;
+            return false;
         };
 
         // Standard Seqlock writer protocol:
@@ -247,7 +251,7 @@ impl CpuTraceSlot {
         core::sync::atomic::fence(Ordering::Release);
 
         self.depth.store(target_idx, Ordering::Relaxed);
-        for i in target_idx..d.min(4) {
+        for i in target_idx..d.min(TRACE_DEPTH) {
             self.stack[i]
                 .ptr
                 .store(core::ptr::null_mut(), Ordering::Relaxed);
@@ -257,6 +261,7 @@ impl CpuTraceSlot {
 
         core::sync::atomic::fence(Ordering::Release);
         self.seq.fetch_add(1, Ordering::Release);
+        true
     }
 
     pub fn read(&self) -> Option<(&'static str, u64)> {
@@ -271,7 +276,7 @@ impl CpuTraceSlot {
         if d == 0 {
             return None;
         }
-        let target_idx = d.min(4) - 1;
+        let target_idx = d.min(TRACE_DEPTH) - 1;
         let slot = &self.stack[target_idx];
         let ptr = slot.ptr.load(Ordering::Relaxed);
         let len = slot.len.load(Ordering::Relaxed);
@@ -315,8 +320,16 @@ pub fn record_trace_enter(step: &'static str) {
 
 pub fn record_trace_exit(step: &'static str) {
     let cpu = current_cpu();
-    if let Some(slot) = CPU_TRACES.get(cpu) {
-        slot.exit(step);
+    if CPU_TRACES.get(cpu).is_some_and(|slot| slot.exit(step)) {
+        return;
+    }
+    // The task migrated between enter and exit: retire the step on the CPU
+    // that recorded it, or the heartbeat reports a stale stall forever.
+    // Each slot's try-lock keeps a remote exit from racing that CPU's writer.
+    for (index, slot) in CPU_TRACES.iter().enumerate() {
+        if index != cpu && slot.exit(step) {
+            return;
+        }
     }
 }
 
@@ -348,10 +361,97 @@ impl<const N: usize> core::fmt::Write for StackBuf<N> {
     }
 }
 
+/// The task that most recently opened a trace step. When a step stays open
+/// while this task sleeps, the timer cannot sample it, so the heartbeat scans
+/// its saved stack instead.
+#[cfg(all(feature = "multitask", target_os = "none"))]
+static TRACE_OWNER: kspin::SpinNoIrq<Option<axtask::AxTaskRef>> = kspin::SpinNoIrq::new(None);
+#[cfg(all(feature = "multitask", target_os = "none"))]
+static LAST_BLOCKED_SCAN_NS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(feature = "multitask", target_os = "none"))]
+fn note_trace_owner() {
+    let Some(current) = axtask::current_may_uninit() else {
+        return;
+    };
+    let task = current.clone();
+    let mut owner = TRACE_OWNER.lock();
+    if owner
+        .as_ref()
+        .is_none_or(|known| !alloc::sync::Arc::ptr_eq(known, &task))
+    {
+        *owner = Some(task);
+    }
+}
+
+/// Print kernel-text words found on the trace owner's stack while it sleeps.
+/// Not a reliable unwind -- stale return addresses show up too -- but the
+/// innermost entries name the wait the owner is blocked in.
+#[cfg(all(feature = "multitask", target_os = "none"))]
+fn scan_blocked_owner(now_ns: u64) {
+    const SCAN_BYTES: u64 = 8 * 1024;
+    const MAX_HITS: usize = 32;
+    let last = LAST_BLOCKED_SCAN_NS.load(Ordering::Relaxed);
+    if now_ns.saturating_sub(last) < 20_000_000_000 {
+        return;
+    }
+    let Some(owner) = TRACE_OWNER.try_lock() else {
+        return;
+    };
+    let Some(task) = owner.as_ref() else {
+        return;
+    };
+    if task.state() != axtask::TaskState::Blocked {
+        return;
+    }
+    LAST_BLOCKED_SCAN_NS.store(now_ns, Ordering::Relaxed);
+    unsafe extern "C" {
+        fn _stext();
+        fn _etext();
+    }
+    let text = (_stext as usize as u64)..(_etext as usize as u64);
+    let rsp = task.saved_kernel_rsp();
+    let tid = task.id().as_u64();
+    if rsp < 0xffff_8000_0000_0000 || rsp % 8 != 0 {
+        axlog::warn!("BT% tid={tid} blocked: unusable saved rsp {rsp:#x}");
+        return;
+    }
+    let mut end = rsp.saturating_add(SCAN_BYTES);
+    if let Some(top) = task.kernel_stack_top() {
+        let top = top.as_usize() as u64;
+        if top > rsp {
+            end = end.min(top);
+        }
+    }
+    let mut hits = [0u64; MAX_HITS];
+    let mut count = 0;
+    let mut at = rsp;
+    while at < end && count < MAX_HITS {
+        // SAFETY: [rsp, end) lies inside the blocked task's kernel stack.
+        let word = unsafe { core::ptr::read_volatile(at as *const u64) };
+        if text.contains(&word) {
+            hits[count] = word;
+            count += 1;
+        }
+        at += 8;
+    }
+    axlog::warn!("BT% tid={tid} blocked, rsp={rsp:#x}, {count} text words:");
+    for chunk in hits[..count].chunks(4) {
+        let mut line = StackBuf::<96>::new();
+        use core::fmt::Write;
+        for word in chunk {
+            let _ = write!(line, " {word:x}");
+        }
+        axlog::warn!("BT% tid={tid}:{}", line.as_str());
+    }
+}
+
 #[inline]
 pub fn trace_enter(step: &'static str) {
     if boot_trace_enabled() {
         record_trace_enter(step);
+        #[cfg(all(feature = "multitask", target_os = "none"))]
+        note_trace_owner();
         axlog::warn!("BT> {step}");
         let mut buf = StackBuf::<96>::new();
         use core::fmt::Write;
@@ -408,7 +508,123 @@ pub fn heartbeat(now_ns: u64) {
             crate::early_screen_milestone(buf.as_str());
         }
     }
+    #[cfg(all(feature = "multitask", target_os = "none"))]
+    scan_blocked_owner(now_ns);
 }
+/// Return addresses kept per stall sample, interrupted RIP included.
+const STALL_FRAMES: usize = 12;
+/// A step must be open this long before the timer samples the CPU running it.
+const STALL_SAMPLE_AFTER_NS: u64 = 10_000_000_000;
+const STALL_SAMPLE_PERIOD_NS: u64 = 5_000_000_000;
+
+/// One CPU's most recent sample of the code its stalled step was executing.
+/// Written by the timer's trap observer and read by the timer handler that
+/// follows it on the same CPU, so the pair never races.
+struct StallSample {
+    pending: AtomicBool,
+    last_ns: AtomicU64,
+    count: AtomicUsize,
+    frames: [AtomicU64; STALL_FRAMES],
+}
+
+impl StallSample {
+    const fn new() -> Self {
+        Self {
+            pending: AtomicBool::new(false),
+            last_ns: AtomicU64::new(0),
+            count: AtomicUsize::new(0),
+            frames: [const { AtomicU64::new(0) }; STALL_FRAMES],
+        }
+    }
+}
+
+static STALL_SAMPLES: [StallSample; axconfig::plat::MAX_CPU_NUM] =
+    [const { StallSample::new() }; axconfig::plat::MAX_CPU_NUM];
+
+/// Kernel text and stacks live in the upper half; anything else ends the walk.
+fn is_kernel_address(address: u64) -> bool {
+    address >= 0xffff_8000_0000_0000
+}
+
+/// Timer trap observer: when this CPU has sat in one boot-trace step for
+/// [`STALL_SAMPLE_AFTER_NS`], record the interrupted kernel RIP and the
+/// return addresses on its frame-pointer chain. It only reads the stack and
+/// stores atomics -- no logging, allocation or locks -- because observers
+/// run before the IRQ guard. Addresses are symbolized offline against the ELF.
+pub fn sample_stalled_frame(rip: u64, rbp: u64, from_user: bool) {
+    if !boot_trace_enabled() || from_user {
+        return;
+    }
+    let cpu = current_cpu();
+    let (Some(trace), Some(sample)) = (CPU_TRACES.get(cpu), STALL_SAMPLES.get(cpu)) else {
+        return;
+    };
+    let Some((_, enter_ns)) = trace.read() else {
+        return;
+    };
+    let now_ns = axhal::time::monotonic_time_nanos();
+    if now_ns.saturating_sub(enter_ns) < STALL_SAMPLE_AFTER_NS
+        || now_ns.saturating_sub(sample.last_ns.load(Ordering::Relaxed)) < STALL_SAMPLE_PERIOD_NS
+        || sample.pending.load(Ordering::Acquire)
+    {
+        return;
+    }
+    sample.last_ns.store(now_ns, Ordering::Relaxed);
+    sample.frames[0].store(rip, Ordering::Relaxed);
+    let mut count = 1;
+    let mut frame = rbp;
+    while count < STALL_FRAMES && is_kernel_address(frame) && frame % 8 == 0 {
+        // SAFETY: `frame` is an aligned upper-half address on the interrupted
+        // kernel stack; each step must move up that stack by less than 64 KiB.
+        let (next, ret) = unsafe {
+            let slot = frame as *const u64;
+            (slot.read_volatile(), slot.add(1).read_volatile())
+        };
+        if !is_kernel_address(ret) {
+            break;
+        }
+        sample.frames[count].store(ret, Ordering::Relaxed);
+        count += 1;
+        if next <= frame || next - frame > 0x10000 {
+            break;
+        }
+        frame = next;
+    }
+    sample.count.store(count, Ordering::Relaxed);
+    sample.pending.store(true, Ordering::Release);
+}
+
+/// Timer handler half of [`sample_stalled_frame`]: print this CPU's pending
+/// sample to the log and the early screen, four addresses per screen line.
+pub fn report_stalled_frame() {
+    let cpu = current_cpu();
+    let (Some(trace), Some(sample)) = (CPU_TRACES.get(cpu), STALL_SAMPLES.get(cpu)) else {
+        return;
+    };
+    if !sample.pending.load(Ordering::Acquire) {
+        return;
+    }
+    let step = trace.read().map_or("?", |(step, _)| step);
+    let count = sample.count.load(Ordering::Relaxed).min(STALL_FRAMES);
+    use core::fmt::Write;
+    let mut line = StackBuf::<96>::new();
+    let _ = write!(line, "BT@ CPU {cpu} in {step}: rip={:x}", sample.frames[0].load(Ordering::Relaxed));
+    axlog::warn!("{}", line.as_str());
+    crate::early_screen_milestone(line.as_str());
+    let mut index = 1;
+    while index < count {
+        let mut line = StackBuf::<96>::new();
+        let _ = write!(line, "BT@ CPU {cpu} #{index}:");
+        for frame in &sample.frames[index..count.min(index + 4)] {
+            let _ = write!(line, " {:x}", frame.load(Ordering::Relaxed));
+        }
+        axlog::warn!("{}", line.as_str());
+        crate::early_screen_milestone(line.as_str());
+        index += 4;
+    }
+    sample.pending.store(false, Ordering::Release);
+}
+
 pub fn mark(stage: Stage) {
     if enabled() {
         STAGE.store(stage as u8, Ordering::Relaxed);
@@ -716,26 +932,41 @@ mod tests {
     }
 
     #[test]
+    fn migrated_exit_retires_step_on_recording_cpu() {
+        let last = CPU_TRACES.len() - 1;
+        if last == current_cpu() {
+            return;
+        }
+        CPU_TRACES[last].enter("migrated_step", 7);
+        assert_eq!(CPU_TRACES[last].read(), Some(("migrated_step", 7)));
+        record_trace_exit("migrated_step");
+        assert_eq!(CPU_TRACES[last].read(), None);
+    }
+
+    #[test]
     fn trace_stack_capacity_and_overflow_behavior() {
+        const NAMES: [&str; TRACE_DEPTH] = [
+            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "s12",
+            "s13", "s14", "s15",
+        ];
         let slot = CpuTraceSlot::new();
-        slot.enter("s0", 10);
-        slot.enter("s1", 20);
-        slot.enter("s2", 30);
-        slot.enter("s3", 40);
-        assert_eq!(slot.read(), Some(("s3", 40)));
+        for (i, name) in NAMES.iter().enumerate() {
+            slot.enter(name, i as u64);
+        }
+        assert_eq!(slot.read(), Some(("s15", 15)));
 
-        // 5th level overflows capacity 4: overwrites slot 3
-        slot.enter("s4", 50);
-        assert_eq!(slot.read(), Some(("s4", 50)));
+        // One level past capacity overwrites the last slot.
+        slot.enter("over", 99);
+        assert_eq!(slot.read(), Some(("over", 99)));
 
-        // Exiting s4 clears slot 3, returning depth to 3 (which points to s2)
-        slot.exit("s4");
-        assert_eq!(slot.read(), Some(("s2", 30)));
+        // Exiting it clears the last slot, so the reader sees s14.
+        slot.exit("over");
+        assert_eq!(slot.read(), Some(("s14", 14)));
 
-        slot.exit("s2");
-        assert_eq!(slot.read(), Some(("s1", 20)));
-        slot.exit("s1");
-        assert_eq!(slot.read(), Some(("s0", 10)));
+        for i in (1..TRACE_DEPTH - 1).rev() {
+            slot.exit(NAMES[i]);
+            assert_eq!(slot.read(), Some((NAMES[i - 1], (i - 1) as u64)));
+        }
         slot.exit("s0");
         assert_eq!(slot.read(), None);
     }

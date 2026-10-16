@@ -2049,6 +2049,15 @@ impl TaskInner {
         self.ctx.get()
     }
 
+    /// The kernel `RSP` saved at this task's last switch-out, for diagnostics
+    /// that scan a blocked task's stack. Racy by design: a task that is
+    /// running (or about to) may already be overwriting the value.
+    #[cfg(target_arch = "x86_64")]
+    pub fn saved_kernel_rsp(&self) -> u64 {
+        // SAFETY: a plain read of an integer field; staleness is acceptable.
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*self.ctx_mut_ptr()).rsp)) }
+    }
+
     /// Return whether the task has crossed the final stack-reclamation gate.
     ///
     /// An exited task can remain represented by a suspended context-switch

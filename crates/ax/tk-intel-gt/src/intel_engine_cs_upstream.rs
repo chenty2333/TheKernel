@@ -1332,6 +1332,17 @@ unsafe fn pin_ggtt_status_page(
     i915_ggtt_pin(vma, ww, 0, flags as u32)
 }
 
+// Boot-trace an engine bring-up step: with `n305.boot_trace=1` the screen and
+// heartbeat name the innermost step a stalled CPU never returned from.
+macro_rules! engine_trace {
+    ($step:literal, $body:expr) => {{
+        tk_linux_kapi::kernel_services::boot_trace_enter($step);
+        let __result = $body;
+        tk_linux_kapi::kernel_services::boot_trace_exit($step);
+        __result
+    }};
+}
+
 // upstream: intel_engine_cs.c init_status_page()
 unsafe fn init_status_page(engine: *mut IntelEngineCs) -> i32 {
     let mut obj: *mut DrmI915GemObject;
@@ -1342,7 +1353,10 @@ unsafe fn init_status_page(engine: *mut IntelEngineCs) -> i32 {
 
     INIT_LIST_HEAD!(&mut (*engine).status_page.timelines);
 
-    obj = i915_gem_object_create_internal((*engine).i915, PAGE_SIZE as u64);
+    obj = engine_trace!(
+        "eng:status_page:create",
+        i915_gem_object_create_internal((*engine).i915, PAGE_SIZE as u64)
+    );
     if IS_ERR(obj) {
         gt_err!((*engine).gt, "Failed to allocate status page\n");
         return PTR_ERR(obj);
@@ -1360,10 +1374,15 @@ unsafe fn init_status_page(engine: *mut IntelEngineCs) -> i32 {
     }
 
     i915_gem_ww_ctx_init(&mut ww, true);
+    let mut attempts = 0u32;
     loop {
-        ret = i915_gem_object_lock(obj, &mut ww);
+        attempts += 1;
+        if attempts.is_power_of_two() && attempts >= 8 {
+            gt_err!((*engine).gt, "status page ww retry %u\n", attempts);
+        }
+        ret = engine_trace!("eng:status_page:lock", i915_gem_object_lock(obj, &mut ww));
         if ret == 0 && !HWS_NEEDS_PHYSICAL((*engine).i915) {
-            ret = pin_ggtt_status_page(engine, &mut ww, vma);
+            ret = engine_trace!("eng:status_page:pin_ggtt", pin_ggtt_status_page(engine, &mut ww, vma));
         }
         if ret != 0 {
             if ret == -EDEADLK {
@@ -1379,7 +1398,7 @@ unsafe fn init_status_page(engine: *mut IntelEngineCs) -> i32 {
             return ret;
         }
 
-        vaddr = i915_gem_object_pin_map(obj, I915_MAP_WB);
+        vaddr = engine_trace!("eng:status_page:pin_map", i915_gem_object_pin_map(obj, I915_MAP_WB));
         if IS_ERR(vaddr) {
             ret = PTR_ERR(vaddr);
             if ret != 0 {
@@ -1522,17 +1541,17 @@ unsafe fn engine_setup_common(engine: *mut IntelEngineCs) -> i32 {
 
     init_llist_head(&mut (*engine).barrier_tasks);
 
-    err = intel_engine_init_tlb_invalidation(engine);
+    err = engine_trace!("eng:tlb_invalidation", intel_engine_init_tlb_invalidation(engine));
     if err != 0 {
         return err;
     }
 
-    err = init_status_page(engine);
+    err = engine_trace!("eng:status_page", init_status_page(engine));
     if err != 0 {
         return err;
     }
 
-    (*engine).breadcrumbs = intel_breadcrumbs_create(engine);
+    (*engine).breadcrumbs = engine_trace!("eng:breadcrumbs", intel_breadcrumbs_create(engine));
     if (*engine).breadcrumbs.is_null() {
         err = -ENOMEM;
         cleanup_status_page(engine);
@@ -1549,7 +1568,7 @@ unsafe fn engine_setup_common(engine: *mut IntelEngineCs) -> i32 {
     }
     (*(*engine).sched_engine).private_data = engine.cast::<c_void>();
 
-    err = intel_engine_init_cmd_parser(engine);
+    err = engine_trace!("eng:cmd_parser", intel_engine_init_cmd_parser(engine));
     if err != 0 {
         i915_sched_engine_put((*engine).sched_engine);
         intel_breadcrumbs_put((*engine).breadcrumbs);
@@ -1557,15 +1576,19 @@ unsafe fn engine_setup_common(engine: *mut IntelEngineCs) -> i32 {
         return err;
     }
 
-    intel_engine_init_execlists(engine);
-    intel_engine_init__pm(engine);
-    intel_engine_init_retire(engine);
+    engine_trace!("eng:execlists_pm_retire", {
+        intel_engine_init_execlists(engine);
+        intel_engine_init__pm(engine);
+        intel_engine_init_retire(engine);
+    });
 
     (*engine).sseu = intel_sseu_from_device_info(&(*(*engine).gt).info.sseu);
 
-    intel_engine_init_workarounds(engine);
-    intel_engine_init_whitelist(engine);
-    intel_engine_init_ctx_wa(engine);
+    engine_trace!("eng:workarounds", {
+        intel_engine_init_workarounds(engine);
+        intel_engine_init_whitelist(engine);
+        intel_engine_init_ctx_wa(engine);
+    });
 
     if GRAPHICS_VER((*engine).i915) >= 12 {
         (*engine).flags |= I915_ENGINE_HAS_RELATIVE_MMIO;
@@ -1628,7 +1651,7 @@ pub unsafe extern "C" fn intel_engine_create_pinned_context(
     let mut ce: *mut IntelContext;
     let mut err: i32;
 
-    ce = intel_context_create(engine);
+    ce = engine_trace!("eng:ctx:create", intel_context_create(engine));
     if IS_ERR(ce) {
         return ce;
     }
@@ -1641,7 +1664,7 @@ pub unsafe extern "C" fn intel_engine_create_pinned_context(
     i915_vm_put((*ce).vm);
     (*ce).vm = i915_vm_get(vm);
 
-    err = intel_context_pin(ce);
+    err = engine_trace!("eng:ctx:pin", intel_context_pin(ce));
     if err != 0 {
         intel_context_put(ce);
         return ERR_PTR(err);
@@ -1713,15 +1736,15 @@ unsafe fn engine_init_common(engine: *mut IntelEngineCs) -> i32 {
     let mut bce: *mut IntelContext = core::ptr::null_mut();
     let mut ret: i32;
 
-    ((*engine).set_default_submission.unwrap())(engine);
+    engine_trace!("eng:set_default_submission", ((*engine).set_default_submission.unwrap())(engine));
 
-    ce = create_kernel_context(engine);
+    ce = engine_trace!("eng:kernel_context", create_kernel_context(engine));
     if IS_ERR(ce) {
         return PTR_ERR(ce);
     }
 
     if i915_ggtt_require_binder((*engine).i915) && (*engine).id == BCS0 {
-        bce = create_ggtt_bind_context(engine);
+        bce = engine_trace!("eng:bind_context", create_ggtt_bind_context(engine));
         if IS_ERR(bce) {
             ret = PTR_ERR(bce);
             intel_engine_destroy_pinned_context(ce);
@@ -1729,7 +1752,7 @@ unsafe fn engine_init_common(engine: *mut IntelEngineCs) -> i32 {
         }
     }
 
-    ret = measure_breadcrumb_dw(ce);
+    ret = engine_trace!("eng:measure_breadcrumb", measure_breadcrumb_dw(ce));
     if ret < 0 {
         if !bce.is_null() {
             intel_engine_destroy_pinned_context(bce);
@@ -1764,13 +1787,21 @@ pub unsafe extern "C" fn intel_engines_init(gt: *mut IntelGt) -> i32 {
         setup = intel_ring_submission_setup;
     }
 
+    gt_notice!(gt, "engines init: submission method %u\n", (*gt).submission_method as u32);
     for_each_engine!(engine, id, gt, {
-        err = engine_setup_common(engine);
+        gt_notice!(
+            gt,
+            "engine init: id=%u class=%u instance=%u\n",
+            id as u32,
+            (*engine).class as u32,
+            (*engine).instance as u32
+        );
+        err = engine_trace!("eng:setup_common", engine_setup_common(engine));
         if err != 0 {
             return err;
         }
 
-        err = setup(engine);
+        err = engine_trace!("eng:submission_setup", setup(engine));
         if err != 0 {
             intel_engine_cleanup_common(engine);
             return err;
@@ -1778,12 +1809,12 @@ pub unsafe extern "C" fn intel_engines_init(gt: *mut IntelGt) -> i32 {
 
         GEM_BUG_ON!((*engine).release.is_none());
 
-        err = engine_init_common(engine);
+        err = engine_trace!("eng:init_common", engine_init_common(engine));
         if err != 0 {
             return err;
         }
 
-        intel_engine_add_user(engine);
+        engine_trace!("eng:add_user", intel_engine_add_user(engine));
     });
 
     0

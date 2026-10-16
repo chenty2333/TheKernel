@@ -354,16 +354,26 @@ unsafe fn __ring_retire(ring: *mut IntelRing) {
     intel_ring_unpin(ring);
 }
 
+// Boot-trace one pin step so a stall names the call that never returned.
+macro_rules! pin_trace {
+    ($step:literal, $body:expr) => {{
+        tk_linux_kapi::kernel_services::boot_trace_enter($step);
+        let __result = $body;
+        tk_linux_kapi::kernel_services::boot_trace_exit($step);
+        __result
+    }};
+}
+
 // upstream: intel_context.c intel_context_pre_pin()
 unsafe fn intel_context_pre_pin(ce: *mut IntelContext, ww: *mut I915GemWwCtx) -> i32 {
     CE_TRACE!(ce, "active\n");
 
-    let err = __ring_active((*ce).ring, ww);
+    let err = pin_trace!("ctx:ring_active", __ring_active((*ce).ring, ww));
     if err != 0 {
         return err;
     }
 
-    let err = intel_timeline_pin((*ce).timeline, ww);
+    let err = pin_trace!("ctx:timeline_pin", intel_timeline_pin((*ce).timeline, ww));
     if err != 0 {
         __ring_retire((*ce).ring);
         return err;
@@ -373,7 +383,7 @@ unsafe fn intel_context_pre_pin(ce: *mut IntelContext, ww: *mut I915GemWwCtx) ->
         return 0;
     }
 
-    let err = __context_pin_state((*ce).state, ww);
+    let err = pin_trace!("ctx:pin_state", __context_pin_state((*ce).state, ww));
     if err != 0 {
         intel_timeline_unpin((*ce).timeline);
         __ring_retire((*ce).ring);
@@ -399,7 +409,7 @@ pub unsafe fn __intel_context_do_pin_ww(ce: *mut IntelContext, ww: *mut I915GemW
     let mut err = 0;
 
     if unlikely(!test_bit(CONTEXT_ALLOC_BIT, &(*ce).flags)) {
-        err = intel_context_alloc_state(ce);
+        err = pin_trace!("ctx:alloc_state", intel_context_alloc_state(ce));
         if err != 0 {
             return err;
         }
@@ -415,22 +425,22 @@ pub unsafe fn __intel_context_do_pin_ww(ce: *mut IntelContext, ww: *mut I915GemW
         err = i915_gem_object_lock((*(*ce).state).obj, ww);
     }
     if err == 0 {
-        err = intel_context_pre_pin(ce, ww);
+        err = pin_trace!("ctx:pre_pin", intel_context_pre_pin(ce, ww));
     }
     if err != 0 {
         return err;
     }
 
-    err = ((*(*ce).ops)
+    err = pin_trace!("ctx:ops_pre_pin", ((*(*ce).ops)
         .pre_pin
-        .expect("IntelContextOps.pre_pin is required"))(ce, ww, &mut vaddr);
+        .expect("IntelContextOps.pre_pin is required"))(ce, ww, &mut vaddr));
     if err != 0 {
         intel_context_post_unpin(ce);
         i915_gem_ww_unlock_single((*(*(*ce).timeline).hwsp_ggtt).obj);
         return err;
     }
 
-    err = i915_active_acquire(&mut (*ce).active);
+    err = pin_trace!("ctx:active_acquire", i915_active_acquire(&mut (*ce).active));
     if err != 0 {
         ((*(*ce).ops)
             .post_unpin
@@ -440,7 +450,7 @@ pub unsafe fn __intel_context_do_pin_ww(ce: *mut IntelContext, ww: *mut I915GemW
         return err;
     }
 
-    err = mutex_lock_interruptible(&mut (*ce).pin_mutex);
+    err = pin_trace!("ctx:pin_mutex", mutex_lock_interruptible(&mut (*ce).pin_mutex));
     if err != 0 {
         i915_active_release(&mut (*ce).active);
         ((*(*ce).ops)
@@ -456,9 +466,9 @@ pub unsafe fn __intel_context_do_pin_ww(ce: *mut IntelContext, ww: *mut I915GemW
     if unlikely(ctx_api::intel_context_is_closed(ce)) {
         err = -ENOENT;
     } else if likely(!atomic_add_unless(&mut (*ce).pin_count, 1, 0)) {
-        err = intel_context_active_acquire(ce);
+        err = pin_trace!("ctx:context_active_acquire", intel_context_active_acquire(ce));
         if err == 0 {
-            err = ((*(*ce).ops).pin.expect("IntelContextOps.pin is required"))(ce, vaddr);
+            err = pin_trace!("ctx:ops_pin", ((*(*ce).ops).pin.expect("IntelContextOps.pin is required"))(ce, vaddr));
             if err != 0 {
                 intel_context_active_release(ce);
             } else {
@@ -502,7 +512,14 @@ pub unsafe fn __intel_context_do_pin(ce: *mut IntelContext) -> i32 {
     let mut ww = I915GemWwCtx::default();
     i915_gem_ww_ctx_init(&mut ww, true);
     let mut err;
+    let mut attempts = 0u32;
     loop {
+        attempts += 1;
+        if attempts.is_power_of_two() && attempts >= 8 {
+            crate::linux::assertion::warn_on(true);
+            tk_linux_kapi::kernel_services::boot_trace_enter("ctx:pin_ww:retrying");
+            tk_linux_kapi::kernel_services::boot_trace_exit("ctx:pin_ww:retrying");
+        }
         err = __intel_context_do_pin_ww(ce, &mut ww);
         if err != -EDEADLK {
             break;

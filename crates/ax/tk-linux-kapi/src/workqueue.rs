@@ -762,9 +762,30 @@ pub unsafe fn try_flush_work<W: WorkStructPtr>(work: W) -> Result<bool, Workqueu
     if !work_busy(work) {
         return Ok(false);
     }
-    WORK_STATE_WAKE
-        .wait_until(|| !work_busy(work))
-        .map_err(|_| WorkqueueError::WaitFailed)?;
+    // One worker serves every item, so a flush can wait forever behind an
+    // item that is itself blocked. Name both sides while waiting.
+    let mut waited_s = 0u64;
+    loop {
+        let timed_out = WORK_STATE_WAKE
+            .wait_timeout_until(core::time::Duration::from_secs(10), || !work_busy(work))
+            .map_err(|_| WorkqueueError::WaitFailed)?;
+        if !timed_out || !work_busy(work) {
+            break;
+        }
+        waited_s += 10;
+        let active = ACTIVE_WORK.load(Ordering::Acquire);
+        let active_fn = if active.is_null() {
+            0
+        } else {
+            unsafe { (*active).function }.map_or(0, |f| f as usize)
+        };
+        let waited_fn = unsafe { (*work).function }.map_or(0, |f| f as usize);
+        axlog::warn!(
+            "flush_work stalled {waited_s}s: waiting work={work:p} fn={waited_fn:#x} \
+             data={:#x}; worker runs work={active:p} fn={active_fn:#x}",
+            unsafe { work_data(work) }.load(Ordering::Acquire)
+        );
+    }
     Ok(true)
 }
 

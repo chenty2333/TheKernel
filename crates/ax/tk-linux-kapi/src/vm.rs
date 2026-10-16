@@ -218,6 +218,30 @@ fn record_vmap_region(address: usize, count: usize, page_array: usize, put_pages
     });
 }
 
+/// Whether `[physical, physical + len)` lies inside one firmware-reported RAM
+/// range. Page-backed GPU objects must never resolve to anything else.
+pub fn phys_is_ram(physical: usize, len: usize) -> bool {
+    let Some(end) = physical.checked_add(len) else {
+        return false;
+    };
+    axhal::mem::phys_ram_ranges()
+        .iter()
+        .any(|&(start, size)| physical >= start && end <= start.saturating_add(size))
+}
+
+/// Fail-stop for a hardware access that would hit a non-RAM physical address
+/// or leave its table. Spinning keeps the evidence on screen; letting the
+/// write through has reset the whole N305 platform.
+pub fn hw_guard_halt(args: core::fmt::Arguments<'_>) -> ! {
+    loop {
+        axlog::error!("HW GUARD: {args}; halting this CPU");
+        let deadline = axhal::time::monotonic_time_nanos() + 10_000_000_000;
+        while axhal::time::monotonic_time_nanos() < deadline {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// Linux `vmap()` for the LinuxKPI-owned kernel address space. This target
 /// intentionally supports WB `PAGE_KERNEL` and the explicitly enabled PAT1/WC
 /// form of `pgprot_writecombine(PAGE_KERNEL)`, plus the two source flag forms
@@ -261,6 +285,11 @@ pub unsafe extern "C" fn vmap(
             unsafe { kfree(physical_pages) };
             return ptr::null_mut();
         };
+        if !phys_is_ram(physical, PAGE_SIZE) {
+            hw_guard_halt(format_args!(
+                "vmap page {index}/{count} page={page:p} phys={physical:#x} is not RAM"
+            ));
+        }
         unsafe { physical_pages.add(index).write(physical) };
     }
 

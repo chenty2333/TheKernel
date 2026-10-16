@@ -1399,11 +1399,13 @@ pub(crate) unsafe fn lrc_pre_pin(
 ) -> i32 {
     GEM_BUG_ON!((*ce).state.is_null());
     GEM_BUG_ON!(!i915_vma_is_pinned((*ce).state));
+    tk_linux_kapi::kernel_services::boot_trace_enter("lrc:pin_map");
     *vaddr = i915_gem_object_pin_map(
         (*(*ce).state).obj,
         intel_gt_coherent_map_type((*(*ce).engine).gt, (*(*ce).state).obj, false)
             | I915_MAP_OVERRIDE,
     );
+    tk_linux_kapi::kernel_services::boot_trace_exit("lrc:pin_map");
     PTR_ERR_OR_ZERO(*vaddr)
 }
 
@@ -1415,9 +1417,13 @@ pub(crate) unsafe fn lrc_pin(
 ) -> i32 {
     (*ce).lrc_reg_state = vaddr.cast::<u8>().add(LRC_STATE_OFFSET).cast::<u32>();
     if !__test_and_set_bit(CONTEXT_INIT_BIT, &mut (*ce).flags) {
+        tk_linux_kapi::kernel_services::boot_trace_enter("lrc:init_state");
         lrc_init_state(ce, engine, vaddr);
+        tk_linux_kapi::kernel_services::boot_trace_exit("lrc:init_state");
     }
+    tk_linux_kapi::kernel_services::boot_trace_enter("lrc:update_regs");
     (&mut (*ce).lrc).lrca = lrc_update_regs(ce, engine, (*(*ce).ring).tail);
+    tk_linux_kapi::kernel_services::boot_trace_exit("lrc:update_regs");
     0
 }
 

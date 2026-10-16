@@ -671,11 +671,29 @@ fn live() -> Option<(TextView, usize)> {
 /// waited for: the frame in progress is at least as new as this one's inputs,
 /// and the panic path must never spin on a peer which may itself be stopped.
 fn present(content: &Content<'_>) {
+    present_with(content, false);
+}
+
+/// `steal` is the panic path: a peer (or this CPU, interrupted mid-frame) may
+/// hold the painter flag forever, and on N305 the trace repaints keep CPU 0
+/// painting nearly all the time, so a dropped panic frame left a black screen.
+/// Give the holder a bounded grace period, then paint over it.
+fn present_with(content: &Content<'_>, steal: bool) {
     let Some((view, base)) = live() else {
         return;
     };
-    if base == 0 || PAINTING.swap(true, Ordering::AcqRel) {
+    if base == 0 {
         return;
+    }
+    if PAINTING.swap(true, Ordering::AcqRel) {
+        if !steal {
+            return;
+        }
+        let mut spins = 0u64;
+        while PAINTING.swap(true, Ordering::AcqRel) && spins < 200_000_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
     }
     // SAFETY: `base` and `view.len` describe the mapping established by the
     // claim or the rebind, both of which validate the extent against the
@@ -813,7 +831,7 @@ pub(crate) fn report_panic(info: &core::panic::PanicInfo<'_>, backtrace: &fmt::A
         trace: trace.as_bytes(),
         tail: &tail[..count],
     };
-    present(&content);
+    present_with(&content, true);
 }
 
 /// The kernel's early screen, as the runtime sees it.

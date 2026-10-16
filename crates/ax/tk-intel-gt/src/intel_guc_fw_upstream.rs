@@ -295,6 +295,7 @@ unsafe fn guc_wait_ucode(guc: *mut IntelGuc) -> c_int {
             }
             INTEL_GUC_LOAD_STATUS_INIT_MMIO_SAVE_RESTORE_INVALID => {
                 guc_info!(guc, "illegal register in save/restore workaround list\n");
+                unsafe { crate::intel_guc_ads_upstream::dump_guc_regsets(guc) };
                 ret = -EPERM;
             }
             INTEL_GUC_LOAD_STATUS_KLV_WORKAROUND_INIT_ERROR => {
