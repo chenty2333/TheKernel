@@ -554,6 +554,22 @@ pub mod intel_display_limits_types_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_upstream;
 #[allow(unsafe_code)]
+pub mod hsw_ips_upstream;
+#[allow(unsafe_code)]
+pub mod i9xx_wm_upstream;
+#[allow(unsafe_code)]
+pub mod intel_psr_upstream;
+#[allow(unsafe_code)]
+pub mod intel_fbc_upstream;
+#[allow(unsafe_code)]
+pub mod intel_pfit_upstream;
+#[allow(unsafe_code)]
+pub mod intel_sbi_upstream;
+#[allow(unsafe_code)]
+pub mod intel_pch_refclk_upstream;
+#[allow(unsafe_code)]
+pub mod intel_vdsc_upstream;
+#[allow(unsafe_code)]
 pub mod intel_display_params_types_upstream;
 #[allow(unsafe_code)]
 pub mod intel_display_power_types_upstream;

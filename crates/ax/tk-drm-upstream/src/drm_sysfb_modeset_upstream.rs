@@ -779,7 +779,8 @@ pub const fn DRM_SYSFB_MODE_CONFIG_FUNCS() -> DrmModeConfigFuncs {
 ///
 /// # Safety
 /// `plane` must be a live, initialized `DrmPlane`; `funcs` must outlive it.
-pub unsafe fn drm_plane_helper_add(plane: *mut DrmPlane, funcs: *const DrmPlaneHelperFuncs) {
+#[unsafe(export_name = "drm_plane_helper_add")]
+pub unsafe extern "C" fn drm_plane_helper_add(plane: *mut DrmPlane, funcs: *const DrmPlaneHelperFuncs) {
     (*plane).helper_private = funcs as *mut DrmPlaneHelperFuncs;
 }
 
@@ -796,7 +797,8 @@ pub unsafe fn drm_crtc_helper_add(crtc: *mut DrmCrtc, funcs: *const DrmCrtcHelpe
 /// # Safety
 /// `connector` must be a live, initialized `DrmConnector`; `funcs` must
 /// outlive it.
-pub unsafe fn drm_connector_helper_add(
+#[unsafe(export_name = "drm_connector_helper_add")]
+pub unsafe extern "C" fn drm_connector_helper_add(
     connector: *mut DrmConnector,
     funcs: *const DrmConnectorHelperFuncs,
 ) {

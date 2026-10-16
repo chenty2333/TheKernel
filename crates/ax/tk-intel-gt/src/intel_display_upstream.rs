@@ -3356,6 +3356,262 @@ pub unsafe extern "C" fn intel_setup_outputs(display: *mut IntelDisplay) {
     }
 }
 
+// ---- intel_display.c helpers used by the display parent link ----
+
+/// `joiner_primary_pipe()`: `ffs(joiner_pipes) - 1`, where ffs(0) is 0.
+#[inline]
+unsafe fn joiner_primary_pipe(crtc_state: *const IntelCrtcState) -> Pipe {
+    let mask = unsafe { (*crtc_state).joiner_pipes } as u32;
+    if mask == 0 { -1 } else { mask.trailing_zeros() as Pipe }
+}
+
+#[inline]
+unsafe fn crtc_of_state(crtc_state: *const IntelCrtcState) -> *mut IntelCrtc {
+    unsafe { (*crtc_state).uapi.crtc.cast::<IntelCrtc>() }
+}
+
+/// `intel_crtc_is_joiner_secondary()`.
+// upstream: intel_display.c intel_crtc_is_joiner_secondary()
+unsafe fn intel_crtc_is_joiner_secondary(crtc_state: *const IntelCrtcState) -> bool {
+    unsafe {
+        (*crtc_state).joiner_pipes != 0
+            && (*crtc_of_state(crtc_state)).pipe != joiner_primary_pipe(crtc_state)
+    }
+}
+
+/// `intel_crtc_joined_pipe_mask()`.
+// upstream: intel_display.c intel_crtc_joined_pipe_mask()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_crtc_joined_pipe_mask(crtc_state: *const IntelCrtcState) -> u8 {
+    unsafe { (1u8 << (*crtc_of_state(crtc_state)).pipe) | (*crtc_state).joiner_pipes }
+}
+
+/// `intel_primary_crtc()`.
+// upstream: intel_display.c intel_primary_crtc()
+unsafe fn intel_primary_crtc(crtc_state: *const IntelCrtcState) -> *mut IntelCrtc {
+    if unsafe { intel_crtc_is_joiner_secondary(crtc_state) } {
+        let display = unsafe {
+            crate::intel_display_conversion_upstream::__drm_to_display(
+                (*(*crtc_state).uapi.crtc).dev,
+            )
+        };
+        unsafe {
+            crate::intel_crtc_upstream::intel_crtc_for_pipe(
+                display,
+                joiner_primary_pipe(crtc_state),
+            )
+        }
+    } else {
+        unsafe { crtc_of_state(crtc_state) }
+    }
+}
+
+/// `intel_get_crtc_new_encoder()`: the single encoder feeding the CRTC.
+// upstream: intel_display.c intel_get_crtc_new_encoder()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_get_crtc_new_encoder(
+    state: *const IntelAtomicState,
+    crtc_state: *const IntelCrtcState,
+) -> *mut IntelEncoder {
+    let primary_crtc = unsafe { intel_primary_crtc(crtc_state) };
+    let mut encoder: *mut IntelEncoder = ptr::null_mut();
+    let mut num_encoders = 0;
+    let count = unsafe { (*state).base.num_connector.max(0) as usize };
+    for index in 0..count {
+        let entry = unsafe { (*state).base.connectors.add(index) };
+        let connector_state = unsafe { (*entry).new_state };
+        if connector_state.is_null() {
+            continue;
+        }
+        if unsafe { (*connector_state).crtc } != unsafe { ptr::addr_of_mut!((*primary_crtc).base) }
+        {
+            continue;
+        }
+        encoder = unsafe { (*connector_state).best_encoder.cast::<IntelEncoder>() };
+        num_encoders += 1;
+    }
+    drm_WARN_ON!(unsafe { (*state).base.dev }, num_encoders != 1);
+    encoder
+}
+
+/// `intel_dotclock_calculate()`.
+// upstream: intel_display.c intel_dotclock_calculate()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dotclock_calculate(
+    link_freq: i32,
+    m_n: *const crate::intel_display_types_upstream::IntelLinkMN,
+) -> i32 {
+    let m_n = unsafe { &*m_n };
+    if m_n.link_n == 0 {
+        return 0;
+    }
+    let numerator = (m_n.link_m as u64) * ((link_freq * 10) as u32 as u64);
+    let denominator = m_n
+        .link_n
+        .wrapping_mul(unsafe { crate::intel_dp_upstream::intel_dp_link_symbol_size(link_freq) } as u32);
+    if denominator == 0 {
+        return 0;
+    }
+    let denominator = denominator as u64;
+    ((numerator + denominator - 1) / denominator) as i32
+}
+
+/// `intel_crtc_dotclock()`.
+// upstream: intel_display.c intel_crtc_dotclock()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_crtc_dotclock(pipe_config: *const IntelCrtcState) -> i32 {
+    let pc = unsafe { &*pipe_config };
+    let mut dotclock = if unsafe { crate::intel_atomic_upstream::intel_crtc_has_dp_encoder(pipe_config) } {
+        unsafe { intel_dotclock_calculate(pc.port_clock, &pc.dp_m_n) }
+    } else if pc.has_hdmi_sink && pc.pipe_bpp > 24 {
+        // DIV_ROUND_CLOSEST(port_clock * 24, pipe_bpp)
+        (pc.port_clock * 24 + pc.pipe_bpp / 2) / pc.pipe_bpp
+    } else {
+        pc.port_clock
+    };
+
+    if pc.output_format == crate::intel_display_types_upstream::INTEL_OUTPUT_FORMAT_YCBCR420
+        && !unsafe { crate::intel_atomic_upstream::intel_crtc_has_dp_encoder(pipe_config) }
+    {
+        dotclock *= 2;
+    }
+
+    if pc.pixel_multiplier != 0 {
+        // C divides an int by an unsigned pixel_multiplier.
+        dotclock = ((dotclock as u32) / pc.pixel_multiplier) as i32;
+    }
+
+    dotclock
+}
+
+/// `intel_calc_active_pipes()`.
+// upstream: intel_display.c intel_calc_active_pipes()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_calc_active_pipes(
+    state: *mut IntelAtomicState,
+    mut active_pipes: u8,
+) -> u8 {
+    let count = unsafe { (*(*state).base.dev).mode_config.num_crtc.max(0) as usize };
+    for index in 0..count {
+        let entry = unsafe { (*state).base.crtcs.add(index) };
+        let crtc = unsafe { (*entry).ptr };
+        let crtc_state = unsafe { (*entry).new_state };
+        if crtc.is_null() || crtc_state.is_null() {
+            continue;
+        }
+        let crtc = crtc.cast::<IntelCrtc>();
+        let crtc_state = crtc_state.cast::<IntelCrtcState>();
+        let bit = 1u8 << unsafe { (*crtc).pipe };
+        if unsafe { (*crtc_state).hw.active } {
+            active_pipes |= bit;
+        } else {
+            active_pipes &= !bit;
+        }
+    }
+    active_pipes
+}
+
+/// `intel_scanout_needs_vtd_wa()`.
+// upstream: intel_display.c intel_scanout_needs_vtd_wa()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_scanout_needs_vtd_wa(display: *mut IntelDisplay) -> bool {
+    unsafe {
+        crate::intel_display_wa_upstream::IS_DISPLAY_VER(display, 6, 11)
+            && crate::intel_display_utils_upstream::intel_display_vtd_active(display)
+    }
+}
+
+/// `intel_crtc_flag_modeset()` (intel_display.c, static).
+#[inline]
+unsafe fn intel_crtc_flag_modeset(crtc_state: *mut IntelCrtcState) {
+    unsafe { (*crtc_state).uapi.set_mode_changed(true) };
+}
+
+/// `intel_modeset_pipe()` (intel_display.c, static): mark one pipe for a full
+/// modeset and pull in its connectors, planes and MST/tunnel state.
+// upstream: intel_display.c intel_modeset_pipe()
+unsafe fn intel_modeset_pipe(
+    state: *mut IntelAtomicState,
+    crtc_state: *mut IntelCrtcState,
+    _reason: *const c_char,
+) -> i32 {
+    unsafe {
+        let crtc = crtc_of_state(crtc_state);
+
+        let ret = drm_atomic_add_affected_connectors(
+            ptr::addr_of_mut!((*state).base),
+            ptr::addr_of_mut!((*crtc).base),
+        );
+        if ret != 0 {
+            return ret;
+        }
+
+        let ret = crate::intel_dp_upstream::intel_dp_tunnel_atomic_add_state_for_crtc(state, crtc);
+        if ret != 0 {
+            return ret;
+        }
+
+        let ret = crate::intel_dp_upstream::intel_dp_mst_add_topology_state_for_crtc(state, crtc);
+        if ret != 0 {
+            return ret;
+        }
+
+        let ret = crate::intel_plane_upstream::intel_plane_add_affected(state, crtc);
+        if ret != 0 {
+            return ret;
+        }
+
+        (*crtc_state).uapi.set_mode_changed(true);
+        0
+    }
+}
+
+/// `intel_modeset_all_pipes_late()`: force a full modeset on every active
+/// pipe that does not already need one.
+// upstream: intel_display.c intel_modeset_all_pipes_late()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_modeset_all_pipes_late(
+    state: *mut IntelAtomicState,
+    reason: *const c_char,
+) -> i32 {
+    unsafe {
+        let display = crate::intel_display_conversion_upstream::__drm_to_display((*state).base.dev);
+        let head = ptr::addr_of_mut!((*(*display).drm).mode_config.crtc_list);
+        let mut node = (*head).next;
+        let head_offset = core::mem::offset_of!(tk_drm_upstream::drm_crtc_types::DrmCrtc, head);
+        while !node.is_null() && node != head {
+            let crtc = node.cast::<u8>().sub(head_offset).cast::<IntelCrtc>();
+            node = (*node).next;
+
+            let crtc_state = crate::intel_atomic_upstream::intel_atomic_get_crtc_state(
+                ptr::addr_of_mut!((*state).base),
+                crtc,
+            );
+            if tk_linux_kapi::config::IS_ERR(crtc_state.cast::<core::ffi::c_void>()) {
+                return tk_linux_kapi::config::PTR_ERR(crtc_state.cast::<core::ffi::c_void>()) as i32;
+            }
+
+            if !(*crtc_state).hw.active
+                || crate::intel_atomic_upstream::intel_crtc_needs_modeset(crtc_state)
+            {
+                continue;
+            }
+
+            let ret = intel_modeset_pipe(state, crtc_state, reason);
+            if ret != 0 {
+                return ret;
+            }
+
+            intel_crtc_flag_modeset(crtc_state);
+
+            (*crtc_state).update_planes |= (*crtc_state).active_planes;
+            (*crtc_state).async_flip_planes = 0;
+            (*crtc_state).do_async_flip = false;
+        }
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{

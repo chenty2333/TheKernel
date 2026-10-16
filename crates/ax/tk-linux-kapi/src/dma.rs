@@ -159,7 +159,10 @@ pub fn set_device_irq(dev: *mut c_void, irq: usize) -> Result<(), &'static str> 
         Err(_) => Err("DMA device IRQ already owned"),
     }
 }
-pub fn device_iommu_mapped(dev: *mut c_void) -> bool {
+/// `device_iommu_mapped()` (include/linux/device.h): true when the device's DMA
+/// is translated by an IOMMU, as recorded by its registration.
+#[unsafe(export_name = "device_iommu_mapped")]
+pub extern "C" fn device_iommu_mapped(dev: *mut c_void) -> bool {
     device(dev).is_ok_and(|d| d.iommu)
 }
 pub fn device_irq(dev: *mut c_void) -> usize {

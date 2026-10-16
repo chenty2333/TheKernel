@@ -179,10 +179,9 @@ fn native_modeset_requested() -> bool {
 }
 
 // Every display parent service (BO, DPT, FB pin, initial plane, DSB, panic,
-// PC8) is now the translated i915 owner. The display code those services
-// unlock still references untranslated helpers, so the stack stays closed
-// until the native display path links completely.
-const NATIVE_DISPLAY_STACK_READY: bool = false;
+// PC8) is the translated i915 owner and the display path links completely,
+// so the native stack is admitted whenever the user requests it.
+const NATIVE_DISPLAY_STACK_READY: bool = true;
 
 pub(super) fn native_modeset_enabled() -> bool {
     native_modeset_requested() && NATIVE_DISPLAY_STACK_READY

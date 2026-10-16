@@ -2019,3 +2019,174 @@ mod tests {
         });
     }
 }
+
+// ---- intel_plane.c: panic-path scanout buffer and tiling offsets ----
+
+const YTILE_WIDTH: u32 = 32;
+const YTILE_HEIGHT: u32 = 32;
+const YTILE_SIZE: u32 = YTILE_WIDTH * YTILE_HEIGHT * 4;
+
+/// `intel_ytile_get_offset()`.
+// upstream: intel_plane.c intel_ytile_get_offset()
+unsafe extern "C" fn intel_ytile_get_offset(width: u32, x: u32, y: u32) -> u32 {
+    let width_in_blocks = width.div_ceil(32);
+    let mut offset = (y / YTILE_HEIGHT)
+        .wrapping_mul(width_in_blocks)
+        .wrapping_add(x / YTILE_WIDTH)
+        .wrapping_mul(YTILE_SIZE);
+    let x = x % YTILE_WIDTH;
+    let y = y % YTILE_HEIGHT;
+    let swizzle = (x & 3) | ((y & 0x1f) << 2) | ((x & 0x1c) << 5);
+    offset = offset.wrapping_add(swizzle.wrapping_mul(4));
+    offset
+}
+
+/// `intel_4tile_get_offset()`.
+// upstream: intel_plane.c intel_4tile_get_offset()
+unsafe extern "C" fn intel_4tile_get_offset(width: u32, x: u32, y: u32) -> u32 {
+    let width_in_blocks = width.div_ceil(32);
+    let mut offset = (y / YTILE_HEIGHT)
+        .wrapping_mul(width_in_blocks)
+        .wrapping_add(x / YTILE_WIDTH)
+        .wrapping_mul(YTILE_SIZE);
+    let x = x % YTILE_WIDTH;
+    let y = y % YTILE_HEIGHT;
+    let swizzle = (x & 3)
+        | ((y & 3) << 2)
+        | ((x & 0xc) << 2)
+        | ((y & 4) << 4)
+        | ((x & 0x10) << 3)
+        | ((y & 0x18) << 5);
+    offset = offset.wrapping_add(swizzle.wrapping_mul(4));
+    offset
+}
+
+type PanicTilingFn = unsafe extern "C" fn(u32, u32, u32) -> u32;
+
+/// `intel_get_tiling_func()`: the panic-path tiling offset function for a modifier.
+// upstream: intel_plane.c intel_get_tiling_func()
+fn intel_get_tiling_func(fb_modifier: u64) -> Option<PanicTilingFn> {
+    use crate::intel_fb_upstream::{
+        I915_FORMAT_MOD_4_TILED, I915_FORMAT_MOD_4_TILED_BMG_CCS,
+        I915_FORMAT_MOD_4_TILED_DG2_MC_CCS, I915_FORMAT_MOD_4_TILED_DG2_RC_CCS,
+        I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC, I915_FORMAT_MOD_4_TILED_LNL_CCS,
+        I915_FORMAT_MOD_4_TILED_MTL_MC_CCS, I915_FORMAT_MOD_4_TILED_MTL_RC_CCS,
+        I915_FORMAT_MOD_4_TILED_MTL_RC_CCS_CC, I915_FORMAT_MOD_Y_TILED,
+        I915_FORMAT_MOD_Y_TILED_CCS, I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS,
+        I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS, I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC,
+    };
+    match fb_modifier {
+        I915_FORMAT_MOD_Y_TILED
+        | I915_FORMAT_MOD_Y_TILED_CCS
+        | I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC
+        | I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS
+        | I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS => Some(intel_ytile_get_offset),
+        I915_FORMAT_MOD_4_TILED
+        | I915_FORMAT_MOD_4_TILED_DG2_RC_CCS
+        | I915_FORMAT_MOD_4_TILED_DG2_MC_CCS
+        | I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC
+        | I915_FORMAT_MOD_4_TILED_MTL_RC_CCS
+        | I915_FORMAT_MOD_4_TILED_MTL_RC_CCS_CC
+        | I915_FORMAT_MOD_4_TILED_MTL_MC_CCS
+        | I915_FORMAT_MOD_4_TILED_BMG_CCS
+        | I915_FORMAT_MOD_4_TILED_LNL_CCS => Some(intel_4tile_get_offset),
+        // X_TILED, Yf_TILED and Yf_TILED_CCS: not supported yet.
+        _ => None,
+    }
+}
+
+/// `intel_get_scanout_buffer()`: describe the plane's buffer to the panic path.
+// upstream: intel_plane.c intel_get_scanout_buffer()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_get_scanout_buffer(plane: *mut DrmPlane, sb: *mut c_void) -> i32 {
+    use tk_drm_upstream::{
+        drm_fourcc_upstream::drm_format_info, drm_sysfb_helper_types::DrmScanoutBuffer,
+        uapi_drm_consts::{DRM_FORMAT_MOD_LINEAR},
+    };
+    use tk_linux_kapi::config::{EOPNOTSUPP, ENODEV};
+    unsafe {
+        let sb = sb.cast::<DrmScanoutBuffer>();
+        let display = crate::intel_display_conversion_upstream::__drm_to_display((*plane).dev);
+
+        let state = (*plane).state;
+        if state.is_null() || (*state).fb.is_null() || !(*state).visible {
+            return -ENODEV;
+        }
+        let plane_state = state.cast::<IntelPlaneState>();
+        let fb = (*plane_state).hw.fb.cast::<IntelFramebuffer>();
+
+        let obj = intel_fb_bo(core::ptr::addr_of_mut!((*fb).base));
+        if obj.is_null() {
+            return -ENODEV;
+        }
+        let _ = DRM_FORMAT_MOD_LINEAR;
+
+        if fb == crate::intel_fbdev_upstream::intel_fbdev_framebuffer((*display).fbdev.fbdev) {
+            crate::intel_fbdev_upstream::intel_fbdev_get_map(display, core::ptr::addr_of_mut!((*sb).map[0]));
+        } else {
+            // Can't disable tiling if DPT is in use.
+            if intel_fb_uses_dpt(core::ptr::addr_of!((*fb).base)) {
+                if (*(*fb).base.format)._anon_6.cpp[0] != 4 {
+                    return -EOPNOTSUPP;
+                }
+                (*fb).panic_tiling = intel_get_tiling_func((*fb).base.modifier);
+                if (*fb).panic_tiling.is_none() {
+                    return -EOPNOTSUPP;
+                }
+            }
+            (*sb).private = fb.cast::<c_void>();
+            let ret = crate::intel_parent_upstream::intel_parent_panic_setup(display, (*fb).panic, sb.cast());
+            if ret != 0 {
+                return ret;
+            }
+        }
+
+        (*sb).width = (*fb).base.width;
+        (*sb).height = (*fb).base.height;
+        // Generic linear format: tiling, RC, CCS and CC are disabled in disable_tiling().
+        (*sb).format = drm_format_info((*(*fb).base.format).format);
+        (*sb).pitch[0] = (*fb).base.pitches[0];
+        0
+    }
+}
+
+/// `intel_panic_flush()`: flush the panic framebuffer before the panic
+/// screen is drawn.
+// upstream: intel_plane.c intel_panic_flush()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_panic_flush(plane: *mut DrmPlane) {
+    use tk_drm_upstream::uapi_drm_consts::DRM_FORMAT_MOD_LINEAR;
+    unsafe {
+        let intel_plane = plane.cast::<IntelPlane>();
+        let display = crate::intel_display_conversion_upstream::__drm_to_display((*plane).dev);
+        let plane_state = (*plane).state.cast::<IntelPlaneState>();
+        let crtc = (*plane_state).hw.crtc.cast::<IntelCrtc>();
+        let crtc_state = (*crtc).base.state.cast::<IntelCrtcState>();
+        let fb = (*plane_state).hw.fb.cast::<IntelFramebuffer>();
+        let _ = intel_plane;
+
+        crate::intel_parent_upstream::intel_parent_panic_finish(display, (*fb).panic);
+
+        if (*crtc_state).enable_psr2_sel_fetch {
+            // Force a full update for PSR2.
+            crate::intel_psr_upstream::intel_psr2_panic_force_full_update(crtc_state);
+        }
+
+        // Flush the cache and don't disable tiling if it's the fbdev framebuffer.
+        if fb == crate::intel_fbdev_upstream::intel_fbdev_framebuffer((*display).fbdev.fbdev) {
+            let mut map = core::mem::zeroed::<tk_drm_upstream::iosys_map_types::IosysMap>();
+            crate::intel_fbdev_upstream::intel_fbdev_get_map(display, &mut map);
+            crate::i915_gem_clflush_upstream::drm_clflush_virt_range(
+                map._anon_0.vaddr,
+                ((*fb).base.pitches[0] as u64 * (*fb).base.height as u64) as core::ffi::c_ulong,
+            );
+            return;
+        }
+
+        if (*fb).base.modifier != DRM_FORMAT_MOD_LINEAR {
+            if let Some(disable_tiling) = (*intel_plane).disable_tiling {
+                disable_tiling(intel_plane);
+            }
+        }
+    }
+}

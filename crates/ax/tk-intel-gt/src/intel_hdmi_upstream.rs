@@ -1400,3 +1400,26 @@ mod tests {
         }
     }
 }
+
+/// `intel_dp_dual_mode_set_tmds_output()`: enable/disable TMDS output on a
+/// DP dual-mode (DP++) adaptor.
+// upstream: intel_hdmi.c intel_dp_dual_mode_set_tmds_output()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dp_dual_mode_set_tmds_output(
+    hdmi: *mut crate::intel_display_types_upstream::IntelHdmi,
+    enable: bool,
+) {
+    use tk_drm_upstream::drm_dp_dual_mode_helper_upstream::{
+        DRM_DP_DUAL_MODE_TYPE2_DVI, drm_dp_dual_mode_set_tmds_output,
+    };
+    unsafe {
+        let connector = (*hdmi).attached_connector;
+        let dev = (*connector).base.dev;
+        let dual_mode_type = (*hdmi).dp_dual_mode.r#type;
+        if dual_mode_type < DRM_DP_DUAL_MODE_TYPE2_DVI {
+            return;
+        }
+        let ddc = (*connector).base.ddc;
+        drm_dp_dual_mode_set_tmds_output(dev, dual_mode_type, ddc.cast(), enable);
+    }
+}

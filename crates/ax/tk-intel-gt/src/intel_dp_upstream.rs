@@ -79,6 +79,34 @@ static SKL_SOURCE_RATES: [i32; 6] = [
 static HSW_SOURCE_RATES: [i32; 3] = [DP_RATE_162, DP_RATE_270, DP_RATE_540];
 static G4X_SOURCE_RATES: [i32; 2] = [DP_RATE_162, DP_RATE_270];
 
+/// `intel_dp_needs_vsc_sdp()`: YCbCr 4:2:0 or BT.2020/SYCC colorimetry needs
+/// the DP VSC SDP (DP 1.4a 2.2.4.3).
+// upstream: intel_dp.c intel_dp_needs_vsc_sdp()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dp_needs_vsc_sdp(
+    crtc_state: *const IntelCrtcState,
+    conn_state: *const DrmConnectorState,
+) -> bool {
+    use tk_drm_upstream::drm_connector_types::{
+        DRM_MODE_COLORIMETRY_BT2020_CYCC, DRM_MODE_COLORIMETRY_BT2020_RGB,
+        DRM_MODE_COLORIMETRY_BT2020_YCC, DRM_MODE_COLORIMETRY_OPYCC_601,
+        DRM_MODE_COLORIMETRY_SYCC_601,
+    };
+    unsafe {
+        if (*crtc_state).output_format == INTEL_OUTPUT_FORMAT_YCBCR420 {
+            return true;
+        }
+        matches!(
+            (*conn_state).colorspace,
+            DRM_MODE_COLORIMETRY_SYCC_601
+                | DRM_MODE_COLORIMETRY_OPYCC_601
+                | DRM_MODE_COLORIMETRY_BT2020_YCC
+                | DRM_MODE_COLORIMETRY_BT2020_RGB
+                | DRM_MODE_COLORIMETRY_BT2020_CYCC
+        )
+    }
+}
+
 #[inline]
 unsafe fn dp_to_dig_port(dp: *mut IntelDp) -> *mut IntelDigitalPort {
     if dp.is_null() {
@@ -2487,5 +2515,800 @@ mod tests {
             assert_eq!(intel_dp_sdp_min_guardband(&state, false), 5);
             assert_eq!(intel_dp_sdp_min_guardband(&state, true), 8);
         }
+    }
+}
+
+// ---- intel_dp.c: DSC decompression sequencing and MST/tunnel state hooks ----
+
+/// `DP_DSC_ENABLE` (drm_dp.h).
+const DP_DSC_ENABLE: u32 = 0x160;
+/// `DP_DECOMPRESSION_EN` (drm_dp.h).
+const DP_DECOMPRESSION_EN: u8 = 1 << 0;
+/// `DP_DSC_PASSTHROUGH_EN` (drm_dp.h).
+const DP_DSC_PASSTHROUGH_EN: u8 = 1 << 1;
+
+/// `connector->dp.dsc_decompression_enabled` (bit 2 of the connector bitfields).
+#[inline]
+unsafe fn dsc_decompression_enabled(connector: *const IntelConnector) -> bool {
+    unsafe { (*connector).dp._bitfields_2745[0] & (1 << 2) != 0 }
+}
+
+#[inline]
+unsafe fn set_dsc_decompression_enabled(connector: *mut IntelConnector, enabled: bool) {
+    unsafe {
+        let bits = &mut (*connector).dp._bitfields_2745[0];
+        if enabled {
+            *bits |= 1 << 2;
+        } else {
+            *bits &= !(1 << 2);
+        }
+    }
+}
+
+/// `to_intel_display(state)`.
+#[inline]
+pub(crate) unsafe fn display_of_state(state: *const IntelAtomicState) -> *mut IntelDisplay {
+    unsafe { crate::intel_display_conversion_upstream::__drm_to_display((*state).base.dev) }
+}
+
+/// `write_dsc_decompression_flag()`: read-modify-write one DSC enable bit.
+// upstream: intel_dp.c write_dsc_decompression_flag()
+unsafe fn write_dsc_decompression_flag(
+    aux: *mut tk_drm_upstream::drm_dp_helper_types::DrmDpAux,
+    flag: u8,
+    set: bool,
+) -> isize {
+    unsafe {
+        let mut val: u8 = 0;
+        let err = tk_drm_upstream::drm_dp_helper_upstream::drm_dp_dpcd_readb(aux, DP_DSC_ENABLE, &mut val);
+        if err < 0 {
+            return err;
+        }
+        if set {
+            val |= flag;
+        } else {
+            val &= !flag;
+        }
+        tk_drm_upstream::drm_dp_helper_upstream::drm_dp_dpcd_writeb(aux, DP_DSC_ENABLE, val)
+    }
+}
+
+/// `intel_dp_sink_set_dsc_decompression()`.
+// upstream: intel_dp.c intel_dp_sink_set_dsc_decompression()
+unsafe fn intel_dp_sink_set_dsc_decompression(connector: *mut IntelConnector, enable: bool) {
+    unsafe {
+        // A failed DPCD write is only logged in Linux (drm_dbg_kms).
+        let _ = write_dsc_decompression_flag((*connector).dp.dsc_decompression_aux, DP_DECOMPRESSION_EN, enable);
+    }
+}
+
+/// `intel_dp_sink_set_dsc_passthrough()`.
+// upstream: intel_dp.c intel_dp_sink_set_dsc_passthrough()
+unsafe fn intel_dp_sink_set_dsc_passthrough(connector: *const IntelConnector, enable: bool) {
+    unsafe {
+        // The passthrough AUX lives on an MST port; this build never creates one
+        // (intel_dp_mst_init() is not ported), so the AUX is NULL and Linux returns.
+        if !(*connector).mst.port.is_null() {
+            return;
+        }
+        let _ = enable;
+    }
+}
+
+/// `intel_dp_dsc_aux_ref_count()`: how many connectors in `state` share this
+/// connector's DSC decompression AUX.
+// upstream: intel_dp.c intel_dp_dsc_aux_ref_count()
+unsafe fn intel_dp_dsc_aux_ref_count(
+    state: *mut IntelAtomicState,
+    connector: *const IntelConnector,
+    for_get_ref: bool,
+) -> i32 {
+    unsafe {
+        if (*connector).mst.dp.is_null() {
+            return if dsc_decompression_enabled(connector) { 1 } else { 0 };
+        }
+
+        let mut ref_count = 0;
+        let count = (*state).base.num_connector.max(0) as usize;
+        for index in 0..count {
+            let entry = (*state).base.connectors.add(index);
+            let old_conn_state = (*entry).old_state;
+            let new_conn_state = (*entry).new_state;
+            let iter = (*entry).ptr.cast::<IntelConnector>();
+            if iter.is_null() || old_conn_state.is_null() || new_conn_state.is_null() {
+                continue;
+            }
+            if (*iter).mst.dp != (*connector).mst.dp {
+                continue;
+            }
+            if !dsc_decompression_enabled(iter) {
+                continue;
+            }
+            let _ = (for_get_ref && (*new_conn_state).crtc.is_null())
+                || (!for_get_ref && (*old_conn_state).crtc.is_null());
+            if (*iter).dp.dsc_decompression_aux == (*connector).dp.dsc_decompression_aux {
+                ref_count += 1;
+            }
+        }
+        ref_count
+    }
+}
+
+/// `intel_dp_dsc_aux_get_ref()`.
+// upstream: intel_dp.c intel_dp_dsc_aux_get_ref()
+unsafe fn intel_dp_dsc_aux_get_ref(state: *mut IntelAtomicState, connector: *mut IntelConnector) -> bool {
+    unsafe {
+        let ret = intel_dp_dsc_aux_ref_count(state, connector, true) == 0;
+        set_dsc_decompression_enabled(connector, true);
+        ret
+    }
+}
+
+/// `intel_dp_dsc_aux_put_ref()`.
+// upstream: intel_dp.c intel_dp_dsc_aux_put_ref()
+unsafe fn intel_dp_dsc_aux_put_ref(state: *mut IntelAtomicState, connector: *mut IntelConnector) -> bool {
+    unsafe {
+        set_dsc_decompression_enabled(connector, false);
+        intel_dp_dsc_aux_ref_count(state, connector, false) == 0
+    }
+}
+
+/// `intel_dp_sink_enable_decompression()`.
+// upstream: intel_dp.c intel_dp_sink_enable_decompression()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dp_sink_enable_decompression(
+    state: *mut IntelAtomicState,
+    connector: *mut IntelConnector,
+    new_crtc_state: *const IntelCrtcState,
+) {
+    unsafe {
+        if !(*new_crtc_state).dsc.compression_enable {
+            return;
+        }
+        let display = display_of_state(state);
+        let bad = (*connector).dp.dsc_decompression_aux.is_null() || dsc_decompression_enabled(connector);
+        if drm_WARN_ON!((*display).drm, bad) {
+            return;
+        }
+        if !intel_dp_dsc_aux_get_ref(state, connector) {
+            return;
+        }
+        intel_dp_sink_set_dsc_passthrough(connector, true);
+        intel_dp_sink_set_dsc_decompression(connector, true);
+    }
+}
+
+/// `intel_dp_sink_disable_decompression()`.
+// upstream: intel_dp.c intel_dp_sink_disable_decompression()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dp_sink_disable_decompression(
+    state: *mut IntelAtomicState,
+    connector: *mut IntelConnector,
+    old_crtc_state: *const IntelCrtcState,
+) {
+    unsafe {
+        if !(*old_crtc_state).dsc.compression_enable {
+            return;
+        }
+        let display = display_of_state(state);
+        let bad = (*connector).dp.dsc_decompression_aux.is_null() || !dsc_decompression_enabled(connector);
+        if drm_WARN_ON!((*display).drm, bad) {
+            return;
+        }
+        if !intel_dp_dsc_aux_put_ref(state, connector) {
+            return;
+        }
+        intel_dp_sink_set_dsc_decompression(connector, false);
+        intel_dp_sink_set_dsc_passthrough(connector, false);
+    }
+}
+
+/// `intel_dp_mst_add_topology_state_for_connector()`.
+///
+/// The MST topology manager (`drm_dp_mst_topology_mgr`) and its atomic state are
+/// not ported, and `intel_dp_mst_init()` never runs in this build, so
+/// `connector->mst.dp` is always NULL and Linux returns 0 on the first check.
+/// The MST branch is therefore unreachable and reports `-EOPNOTSUPP`.
+// upstream: intel_dp_mst.c intel_dp_mst_add_topology_state_for_connector()
+unsafe fn intel_dp_mst_add_topology_state_for_connector(
+    _state: *mut IntelAtomicState,
+    connector: *mut IntelConnector,
+    _crtc: *mut IntelCrtc,
+) -> i32 {
+    unsafe {
+        if (*connector).mst.dp.is_null() {
+            return 0;
+        }
+    }
+    -tk_linux_kapi::config::EOPNOTSUPP
+}
+
+/// `intel_dp_mst_add_topology_state_for_crtc()`.
+// upstream: intel_dp_mst.c intel_dp_mst_add_topology_state_for_crtc()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dp_mst_add_topology_state_for_crtc(
+    state: *mut IntelAtomicState,
+    crtc: *mut IntelCrtc,
+) -> i32 {
+    unsafe {
+        let count = (*state).base.num_connector.max(0) as usize;
+        for index in 0..count {
+            let entry = (*state).base.connectors.add(index);
+            let conn_state = (*entry).new_state;
+            if conn_state.is_null() {
+                continue;
+            }
+            if (*conn_state).crtc != core::ptr::addr_of_mut!((*crtc).base) {
+                continue;
+            }
+            let connector = (*entry).ptr.cast::<IntelConnector>();
+            let ret = intel_dp_mst_add_topology_state_for_connector(state, connector, crtc);
+            if ret != 0 {
+                return ret;
+            }
+        }
+        0
+    }
+}
+
+/// `intel_dp_tunnel_atomic_add_state_for_crtc()`.
+///
+/// Tunnels are created only by the DP tunnel manager, which is not ported, so
+/// `dp_tunnel_ref.tunnel` is always NULL and Linux returns 0. The non-NULL
+/// branch (`drm_dp_tunnel_atomic_get_state()`) is unreachable and reports `-EOPNOTSUPP`.
+// upstream: intel_dp_tunnel.c intel_dp_tunnel_atomic_add_state_for_crtc()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dp_tunnel_atomic_add_state_for_crtc(
+    state: *mut IntelAtomicState,
+    crtc: *mut IntelCrtc,
+) -> i32 {
+    unsafe {
+        let new_crtc_state = crate::intel_atomic_upstream::intel_atomic_get_new_crtc_state(state, crtc);
+        if (*new_crtc_state).dp_tunnel_ref.tunnel.is_null() {
+            return 0;
+        }
+    }
+    -tk_linux_kapi::config::EOPNOTSUPP
+}
+
+// ---- intel_dp.c: DP secondary-data packets and infoframe enable ----
+
+/// `DP_SDP_VSC` (drm_dp.h).
+const DP_SDP_VSC_TYPE: u32 = 0x07;
+/// `DP_SDP_ADAPTIVE_SYNC` (drm_dp.h).
+const DP_SDP_ADAPTIVE_SYNC_TYPE: u32 = 0x22;
+/// `HDMI_PACKET_TYPE_GAMUT_METADATA` (linux/hdmi.h).
+const HDMI_PACKET_TYPE_GAMUT_METADATA: u32 = 0x0a;
+/// `HDMI_INFOFRAME_HEADER_SIZE` + `HDMI_DRM_INFOFRAME_SIZE`.
+const HDMI_DRM_INFOFRAME_TOTAL: usize = 4 + 26;
+const ENOSPC: isize = 28;
+
+/// `intel_dp_as_sdp_pack()`.
+// upstream: intel_dp.c intel_dp_as_sdp_pack()
+unsafe fn intel_dp_as_sdp_pack(
+    as_sdp: *const tk_drm_upstream::drm_dp_helper_types::DrmDpAsSdp,
+    sdp: *mut tk_drm_upstream::drm_dp_types::DpSdp,
+    size: usize,
+) -> isize {
+    unsafe {
+        let length = core::mem::size_of::<tk_drm_upstream::drm_dp_types::DpSdp>();
+        if size < length {
+            return -ENOSPC;
+        }
+        core::ptr::write_bytes(sdp.cast::<u8>(), 0, size);
+
+        let sdp = &mut *sdp;
+        let as_sdp = &*as_sdp;
+        sdp.sdp_header.HB0 = 0;
+        sdp.sdp_header.HB1 = as_sdp.sdp_type;
+        sdp.sdp_header.HB2 = as_sdp.revision;
+        sdp.sdp_header.HB3 = as_sdp.length;
+        sdp.db[0] = as_sdp.mode as u8;
+        sdp.db[1] = (as_sdp.vtotal & 0xFF) as u8;
+        sdp.db[2] = ((as_sdp.vtotal >> 8) & 0xFF) as u8;
+        sdp.db[3] = (as_sdp.target_rr & 0xFF) as u8;
+        sdp.db[4] = ((as_sdp.target_rr >> 8) & 0x3) as u8;
+        if as_sdp.target_rr_divider {
+            sdp.db[4] |= 0x20;
+        }
+        sdp.db[7] = (as_sdp.coasting_vtotal & 0xFF) as u8;
+        sdp.db[8] = ((as_sdp.coasting_vtotal >> 8) & 0xFF) as u8;
+        length as isize
+    }
+}
+
+/// `intel_dp_hdr_metadata_infoframe_sdp_pack()`: HDR static metadata as a DP SDP.
+// upstream: intel_dp.c intel_dp_hdr_metadata_infoframe_sdp_pack()
+unsafe fn intel_dp_hdr_metadata_infoframe_sdp_pack(
+    drm_infoframe: *const tk_drm_upstream::hdmi_types::HdmiDrmInfoframe,
+    sdp: *mut tk_drm_upstream::drm_dp_types::DpSdp,
+    size: usize,
+) -> isize {
+    use tk_drm_upstream::drm_dp_types::DpSdp;
+    unsafe {
+        let length = core::mem::size_of::<DpSdp>();
+        if size < length {
+            return -ENOSPC;
+        }
+        core::ptr::write_bytes(sdp.cast::<u8>(), 0, size);
+
+        let mut buf = [0u8; HDMI_DRM_INFOFRAME_TOTAL];
+        let len = tk_drm_upstream::hdmi_upstream::hdmi_drm_infoframe_pack_only(
+            drm_infoframe,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        );
+        if len < 0 {
+            return -ENOSPC;
+        }
+        if len as usize != HDMI_DRM_INFOFRAME_TOTAL {
+            return -ENOSPC;
+        }
+
+        let sdp = &mut *sdp;
+        let frame = &*drm_infoframe;
+        // Secondary-data packet ID 00h, then the non-audio infoframe type.
+        sdp.sdp_header.HB0 = 0;
+        sdp.sdp_header.HB1 = frame.r#type as u8;
+        // Length of (data byte count - 1) and the DP SDP revision.
+        sdp.sdp_header.HB2 = 0x1D;
+        sdp.sdp_header.HB3 = 0x13 << 2;
+        // CTA header: infoframe version and length, then the 26-byte payload.
+        sdp.db[0] = frame.version;
+        sdp.db[1] = frame.length;
+        sdp.db[2..2 + 26].copy_from_slice(&buf[4..4 + 26]);
+
+        // sizeof(dp_sdp_header) + 2 + HDMI_DRM_INFOFRAME_SIZE
+        (4 + 2 + 26) as isize
+    }
+}
+
+/// `intel_write_dp_sdp()`: pack one SDP and hand it to the port's infoframe writer.
+// upstream: intel_dp.c intel_write_dp_sdp()
+unsafe fn intel_write_dp_sdp(encoder: *mut IntelEncoder, crtc_state: *mut IntelCrtcState, sdp_type: u32) {
+    use tk_drm_upstream::drm_dp_types::DpSdp;
+    unsafe {
+        let display = crate::intel_display_conversion_upstream::__drm_to_display((*encoder).base.dev);
+        let dig_port = encoder.cast::<u8>().sub(core::mem::offset_of!(IntelDigitalPort, base)).cast::<IntelDigitalPort>();
+        let mut sdp: DpSdp = core::mem::zeroed();
+        let sdp_size = core::mem::size_of::<DpSdp>();
+
+        if (*crtc_state).infoframes.enable & crate::intel_hdmi_upstream::intel_hdmi_infoframe_enable(sdp_type) == 0 {
+            return;
+        }
+
+        let len: isize = match sdp_type {
+            DP_SDP_VSC_TYPE => tk_drm_upstream::drm_dp_helper_upstream::drm_dp_vsc_sdp_pack(
+                core::ptr::addr_of!((*crtc_state).infoframes.vsc),
+                &mut sdp,
+            ),
+            HDMI_PACKET_TYPE_GAMUT_METADATA => intel_dp_hdr_metadata_infoframe_sdp_pack(
+                core::ptr::addr_of!((*crtc_state).infoframes.drm.drm).cast(),
+                &mut sdp,
+                sdp_size,
+            ),
+            DP_SDP_ADAPTIVE_SYNC_TYPE => intel_dp_as_sdp_pack(
+                core::ptr::addr_of!((*crtc_state).infoframes.as_sdp),
+                &mut sdp,
+                sdp_size,
+            ),
+            _ => return,
+        };
+
+        if drm_WARN_ON!((*display).drm, len < 0) {
+            return;
+        }
+
+        let write = (*dig_port).write_infoframe.expect("write_infoframe");
+        write(
+            encoder,
+            crtc_state,
+            sdp_type,
+            (&mut sdp as *mut DpSdp).cast(),
+            len,
+        );
+    }
+}
+
+/// `intel_dp_set_infoframes()`: enable or disable the DIP packets of a DP port.
+// upstream: intel_dp.c intel_dp_set_infoframes()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dp_set_infoframes(
+    encoder: *mut IntelEncoder,
+    enable: bool,
+    crtc_state: *const IntelCrtcState,
+    _conn_state: *const DrmConnectorState,
+) {
+    use crate::intel_de_upstream::{intel_de_posting_read, intel_de_read, intel_de_write};
+    use crate::intel_display_regs_upstream::*;
+    unsafe {
+        let display = crate::intel_display_conversion_upstream::__drm_to_display((*encoder).base.dev);
+        let reg = HSW_TVIDEO_DIP_CTL(display, (*crtc_state).cpu_transcoder as u32);
+        let mut dip_enable = VIDEO_DIP_ENABLE_AVI_HSW
+            | VIDEO_DIP_ENABLE_GCP_HSW
+            | VIDEO_DIP_ENABLE_VS_HSW
+            | VIDEO_DIP_ENABLE_GMP_HSW
+            | VIDEO_DIP_ENABLE_SPD_HSW
+            | VIDEO_DIP_ENABLE_DRM_GLK;
+
+        // HAS_AS_SDP(display): DISPLAY_VER >= 13.
+        let has_as_sdp = crate::intel_display_reg_defs_upstream::DISPLAY_VER(display) >= 13;
+        if has_as_sdp {
+            dip_enable |= VIDEO_DIP_ENABLE_AS_ADL;
+        }
+
+        let mut val = intel_de_read(display, reg) & !dip_enable;
+
+        // TODO in Linux: sanitize DSC enabling wrt. intel_dsc_dp_pps_write().
+        let has_dsc = (*display).info.__runtime_info.has_dsc;
+        if !enable && has_dsc {
+            val &= !VDIP_ENABLE_PPS;
+        }
+
+        // Disable VSC DIP when disabling SDP or when there is no PSR.
+        if !enable || !(*crtc_state).has_psr {
+            val &= !VIDEO_DIP_ENABLE_VSC_HSW;
+        }
+
+        intel_de_write(display, reg, val);
+        intel_de_posting_read(display, reg);
+
+        if !enable {
+            return;
+        }
+
+        intel_write_dp_sdp(encoder, crtc_state as *mut IntelCrtcState, DP_SDP_VSC_TYPE);
+        intel_write_dp_sdp(encoder, crtc_state as *mut IntelCrtcState, DP_SDP_ADAPTIVE_SYNC_TYPE);
+        intel_write_dp_sdp(encoder, crtc_state as *mut IntelCrtcState, HDMI_PACKET_TYPE_GAMUT_METADATA);
+    }
+}
+
+// ---- intel_dp_test.c: DP PHY compliance test ----
+
+const DP_LINK_QUAL_PATTERN_DISABLE: u8 = 0;
+const DP_LINK_QUAL_PATTERN_D10_2: u8 = 1;
+const DP_LINK_QUAL_PATTERN_ERROR_RATE: u8 = 2;
+const DP_LINK_QUAL_PATTERN_PRBS7: u8 = 3;
+const DP_LINK_QUAL_PATTERN_80BIT_CUSTOM: u8 = 4;
+const DP_LINK_QUAL_PATTERN_CP2520_PAT_1: u8 = 5;
+const DP_LINK_QUAL_PATTERN_CP2520_PAT_3: u8 = 7;
+/// `DP_TEST_LINK_PHY_TEST_PATTERN` (drm_dp.h).
+const DP_TEST_LINK_PHY_TEST_PATTERN: u64 = 1 << 3;
+
+/// `intel_dp_has_connector()`.
+// upstream: intel_dp.c intel_dp_has_connector()
+pub(crate) unsafe fn intel_dp_has_connector(
+    intel_dp: *const IntelDp,
+    conn_state: *const DrmConnectorState,
+) -> bool {
+    unsafe {
+        let best = (*conn_state).best_encoder;
+        if best.is_null() {
+            return false;
+        }
+        let dig = dp_to_dig_port(intel_dp as *mut IntelDp);
+        if best == core::ptr::addr_of_mut!((*dig).base.base) {
+            return true;
+        }
+        for pipe in 0..crate::intel_display_limits_types_upstream::I915_MAX_PIPES as usize {
+            let stream = (*intel_dp).mst.stream_encoders[pipe];
+            if stream.is_null() {
+                continue;
+            }
+            if best == core::ptr::addr_of_mut!((*stream).base.base) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// `dp_tp_ctl_reg()` (intel_ddi.c).
+// upstream: intel_ddi.c dp_tp_ctl_reg()
+unsafe fn dp_tp_ctl_reg(
+    encoder: *mut IntelEncoder,
+    crtc_state: *const IntelCrtcState,
+) -> crate::intel_workarounds_types_upstream::I915RegT {
+    use crate::intel_display_regs_upstream::{DP_TP_CTL, TGL_DP_TP_CTL};
+    unsafe {
+        let display = crate::intel_display_conversion_upstream::__drm_to_display((*encoder).base.dev);
+        if crate::intel_display_reg_defs_upstream::DISPLAY_VER(display) >= 12 {
+            let transcoder = if crate::intel_atomic_upstream::intel_crtc_has_type(
+                crtc_state,
+                crate::intel_display_types_upstream::INTEL_OUTPUT_DP_MST,
+            ) {
+                (*crtc_state).mst_master_transcoder
+            } else {
+                (*crtc_state).cpu_transcoder
+            };
+            TGL_DP_TP_CTL(display, transcoder as u32)
+        } else {
+            DP_TP_CTL((*encoder).port as u32)
+        }
+    }
+}
+
+/// `intel_dp_phy_pattern_update()`: program the PHY test pattern requested by the sink.
+// upstream: intel_dp_test.c intel_dp_phy_pattern_update()
+unsafe fn intel_dp_phy_pattern_update(intel_dp: *mut IntelDp, crtc_state: *const IntelCrtcState) {
+    use crate::intel_de_upstream::{intel_de_rmw, intel_de_write};
+    use crate::intel_display_regs_upstream::*;
+    unsafe {
+        let dig = dp_to_dig_port(intel_dp);
+        let display = crate::intel_display_conversion_upstream::__drm_to_display((*dig).base.base.dev);
+        let data = &(*intel_dp).compliance.test_data.phytest;
+        let crtc = (*crtc_state).uapi.crtc.cast::<IntelCrtc>();
+        let encoder = core::ptr::addr_of_mut!((*dig).base);
+        let pipe = (*crtc).pipe as u32;
+
+        match data.phy_pattern {
+            DP_LINK_QUAL_PATTERN_DISABLE => {
+                intel_de_write(display, DDI_DP_COMP_CTL(pipe), 0x0);
+                if crate::intel_display_reg_defs_upstream::DISPLAY_VER(display) >= 10 {
+                    intel_de_rmw(
+                        display,
+                        dp_tp_ctl_reg(encoder, crtc_state),
+                        DP_TP_CTL_TRAIN_PAT4_SEL_MASK | DP_TP_CTL_LINK_TRAIN_MASK,
+                        DP_TP_CTL_LINK_TRAIN_NORMAL,
+                    );
+                }
+            }
+            DP_LINK_QUAL_PATTERN_D10_2 => {
+                intel_de_write(display, DDI_DP_COMP_CTL(pipe), DDI_DP_COMP_CTL_ENABLE | DDI_DP_COMP_CTL_D10_2);
+            }
+            DP_LINK_QUAL_PATTERN_ERROR_RATE => {
+                intel_de_write(
+                    display,
+                    DDI_DP_COMP_CTL(pipe),
+                    DDI_DP_COMP_CTL_ENABLE | DDI_DP_COMP_CTL_SCRAMBLED_0,
+                );
+            }
+            DP_LINK_QUAL_PATTERN_PRBS7 => {
+                intel_de_write(display, DDI_DP_COMP_CTL(pipe), DDI_DP_COMP_CTL_ENABLE | DDI_DP_COMP_CTL_PRBS7);
+            }
+            DP_LINK_QUAL_PATTERN_80BIT_CUSTOM => {
+                intel_de_write(display, DDI_DP_COMP_PAT(pipe, 0), 0x3e0f83e0);
+                intel_de_write(display, DDI_DP_COMP_PAT(pipe, 1), 0x0f83e0f8);
+                intel_de_write(display, DDI_DP_COMP_PAT(pipe, 2), 0x0000f83e);
+                intel_de_write(
+                    display,
+                    DDI_DP_COMP_CTL(pipe),
+                    DDI_DP_COMP_CTL_ENABLE | DDI_DP_COMP_CTL_CUSTOM80,
+                );
+            }
+            DP_LINK_QUAL_PATTERN_CP2520_PAT_1 => {
+                let pattern_val: u32 = 0xFB;
+                intel_de_write(
+                    display,
+                    DDI_DP_COMP_CTL(pipe),
+                    DDI_DP_COMP_CTL_ENABLE | DDI_DP_COMP_CTL_HBR2 | pattern_val,
+                );
+            }
+            DP_LINK_QUAL_PATTERN_CP2520_PAT_3 => {
+                if crate::intel_display_reg_defs_upstream::DISPLAY_VER(display) < 10 {
+                    // "Platform does not support TPS4"
+                    return;
+                }
+                intel_de_write(display, DDI_DP_COMP_CTL(pipe), 0x0);
+                intel_de_rmw(
+                    display,
+                    dp_tp_ctl_reg(encoder, crtc_state),
+                    DP_TP_CTL_TRAIN_PAT4_SEL_MASK | DP_TP_CTL_LINK_TRAIN_MASK,
+                    DP_TP_CTL_TRAIN_PAT4_SEL_TP4A | DP_TP_CTL_LINK_TRAIN_PAT4,
+                );
+            }
+            _ => {
+                // "Invalid Phy Test Pattern"
+            }
+        }
+    }
+}
+
+/// `intel_dp_process_phy_request()`: answer a PHY test request for one CRTC.
+// upstream: intel_dp_test.c intel_dp_process_phy_request()
+unsafe fn intel_dp_process_phy_request(intel_dp: *mut IntelDp, crtc_state: *const IntelCrtcState) {
+    use tk_drm_upstream::drm_dp_helper_upstream::{
+        drm_dp_dpcd_read_phy_link_status, drm_dp_dpcd_write, drm_dp_set_phy_test_pattern,
+        DP_DPCD_REV, DP_PHY_DPRX,
+    };
+    unsafe {
+        let mut link_status = [0u8; 6];
+        if drm_dp_dpcd_read_phy_link_status(core::ptr::addr_of_mut!((*intel_dp).aux), DP_PHY_DPRX, link_status.as_mut_ptr()) < 0 {
+            // "failed to get link status"
+            return;
+        }
+
+        crate::intel_dp_link_training_upstream::intel_dp_get_adjust_train(
+            intel_dp,
+            crtc_state,
+            DP_PHY_DPRX,
+            link_status.as_ptr(),
+        );
+        crate::intel_dp_link_training_upstream::intel_dp_set_signal_levels(intel_dp, crtc_state, DP_PHY_DPRX);
+
+        intel_dp_phy_pattern_update(intel_dp, crtc_state);
+
+        drm_dp_dpcd_write(
+            core::ptr::addr_of_mut!((*intel_dp).aux),
+            0x103,
+            (*intel_dp).train_set.as_mut_ptr().cast(),
+            (*crtc_state).lane_count as usize,
+        );
+
+        let data = core::ptr::addr_of_mut!((*intel_dp).compliance.test_data.phytest);
+        drm_dp_set_phy_test_pattern(
+            core::ptr::addr_of_mut!((*intel_dp).aux),
+            data,
+            (*intel_dp).dpcd[DP_DPCD_REV as usize],
+        );
+    }
+}
+
+/// `intel_dp_prep_phy_test()`: lock the CRTCs of the connectors on this port
+/// and collect the pipes that are active and not mid-commit.
+// upstream: intel_dp_test.c intel_dp_prep_phy_test()
+unsafe fn intel_dp_prep_phy_test(
+    intel_dp: *mut IntelDp,
+    ctx: *mut tk_drm_upstream::drm_modeset_lock_types::DrmModesetAcquireCtx,
+    pipe_mask: *mut u8,
+) -> i32 {
+    use tk_drm_upstream::{
+        drm_connector_upstream::{drm_connector_list_iter_begin, drm_connector_list_iter_end, drm_connector_list_iter_next},
+        drm_connector_types::DrmConnectorListIter,
+        drm_modeset_lock_upstream::drm_modeset_lock,
+    };
+    unsafe {
+        let dig = dp_to_dig_port(intel_dp);
+        let display = crate::intel_display_conversion_upstream::__drm_to_display((*dig).base.base.dev);
+        let mut ret = 0;
+        *pipe_mask = 0;
+
+        let mut conn_iter = core::mem::zeroed::<DrmConnectorListIter>();
+        drm_connector_list_iter_begin((*display).drm, &mut conn_iter);
+        loop {
+            let connector = drm_connector_list_iter_next(&mut conn_iter);
+            if connector.is_null() {
+                break;
+            }
+            let connector = connector.cast::<IntelConnector>();
+            let conn_state = (*connector).base.state;
+
+            if !intel_dp_has_connector(intel_dp, conn_state) {
+                continue;
+            }
+
+            let crtc = (*conn_state).crtc.cast::<IntelCrtc>();
+            if crtc.is_null() {
+                continue;
+            }
+
+            ret = drm_modeset_lock(core::ptr::addr_of_mut!((*crtc).base.mutex), ctx);
+            if ret != 0 {
+                break;
+            }
+
+            let crtc_state = (*crtc).base.state.cast::<IntelCrtcState>();
+            let bad = !crate::intel_dp_upstream::intel_crtc_has_dp_encoder_local(crtc_state);
+            drm_WARN_ON!((*display).drm, bad);
+
+            if !(*crtc_state).hw.active {
+                continue;
+            }
+
+            let commit = (*conn_state).commit;
+            if !commit.is_null() && !(*commit).hw_done.try_wait() {
+                continue;
+            }
+
+            *pipe_mask |= 1u8 << (*crtc).pipe;
+        }
+        drm_connector_list_iter_end(&mut conn_iter);
+        ret
+    }
+}
+
+#[inline]
+unsafe fn intel_crtc_has_dp_encoder_local(crtc_state: *const IntelCrtcState) -> bool {
+    unsafe { crate::intel_atomic_upstream::intel_crtc_has_dp_encoder(crtc_state) }
+}
+
+/// `intel_dp_do_phy_test()`.
+// upstream: intel_dp_test.c intel_dp_do_phy_test()
+unsafe fn intel_dp_do_phy_test(
+    encoder: *mut IntelEncoder,
+    ctx: *mut tk_drm_upstream::drm_modeset_lock_types::DrmModesetAcquireCtx,
+) -> i32 {
+    use tk_drm_upstream::drm_modeset_lock_upstream::drm_modeset_lock;
+    unsafe {
+        let display = crate::intel_display_conversion_upstream::__drm_to_display((*encoder).base.dev);
+        let intel_dp = crate::intel_dp_upstream::enc_to_intel_dp_local(encoder);
+
+        let ret = drm_modeset_lock(
+            core::ptr::addr_of_mut!((*(*display).drm).mode_config.connection_mutex),
+            ctx,
+        );
+        if ret != 0 {
+            return ret;
+        }
+
+        let mut pipe_mask: u8 = 0;
+        let ret = intel_dp_prep_phy_test(intel_dp, ctx, &mut pipe_mask);
+        if ret != 0 {
+            return ret;
+        }
+        if pipe_mask == 0 {
+            return 0;
+        }
+
+        for pipe in 0..crate::intel_display_limits_types_upstream::I915_MAX_PIPES as usize {
+            if pipe_mask & (1 << pipe) == 0 {
+                continue;
+            }
+            let crtc = crate::intel_crtc_upstream::intel_crtc_for_pipe(display, pipe as i32);
+            let crtc_state = (*crtc).base.state.cast::<IntelCrtcState>();
+
+            // Test on the MST master transcoder only.
+            if crate::intel_display_reg_defs_upstream::DISPLAY_VER(display) >= 12
+                && crate::intel_atomic_upstream::intel_crtc_has_type(
+                    crtc_state,
+                    crate::intel_display_types_upstream::INTEL_OUTPUT_DP_MST,
+                )
+            {
+                // intel_dp_mst_is_master_trans(): MST is not ported; a DP_MST
+                // CRTC cannot exist in this build, so the branch is unreachable.
+                return -tk_linux_kapi::config::EOPNOTSUPP;
+            }
+
+            intel_dp_process_phy_request(intel_dp, crtc_state);
+            break;
+        }
+        0
+    }
+}
+
+/// `enc_to_intel_dp()` for the local digital-port layout.
+#[inline]
+unsafe fn enc_to_intel_dp_local(encoder: *mut IntelEncoder) -> *mut IntelDp {
+    unsafe {
+        encoder
+            .cast::<u8>()
+            .add(core::mem::offset_of!(IntelDigitalPort, dp))
+            .sub(core::mem::offset_of!(IntelDigitalPort, base))
+            .cast::<IntelDp>()
+    }
+}
+
+/// `intel_dp_test_phy()`: run the PHY compliance test if the sink requested it.
+// upstream: intel_dp_test.c intel_dp_test_phy()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_dp_test_phy(intel_dp: *mut IntelDp) -> bool {
+    use tk_drm_upstream::drm_modeset_lock_upstream::{drm_modeset_acquire_fini, drm_modeset_acquire_init, drm_modeset_backoff, drm_modeset_drop_locks};
+    unsafe {
+        if !(*intel_dp).compliance.test_active
+            || (*intel_dp).compliance.test_type != DP_TEST_LINK_PHY_TEST_PATTERN
+        {
+            return false;
+        }
+
+        let dig = dp_to_dig_port(intel_dp);
+        let encoder = core::ptr::addr_of_mut!((*dig).base);
+        let mut ctx = core::mem::zeroed::<tk_drm_upstream::drm_modeset_lock_types::DrmModesetAcquireCtx>();
+
+        drm_modeset_acquire_init(&mut ctx, 0);
+        let ret = loop {
+            let ret = intel_dp_do_phy_test(encoder, &mut ctx);
+            if ret == -tk_linux_kapi::config::EDEADLK {
+                drm_modeset_backoff(&mut ctx);
+                continue;
+            }
+            break ret;
+        };
+        drm_modeset_drop_locks(&mut ctx);
+        drm_modeset_acquire_fini(&mut ctx);
+
+        if ret != 0 {
+            tk_linux_kapi::drm_warn!((*encoder).base.dev, "Acquiring modeset locks failed with {}", ret);
+        }
+        true
     }
 }

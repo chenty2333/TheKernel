@@ -644,6 +644,14 @@ pub unsafe extern "C" fn drm_plane_unregister_all(dev: *mut DrmDevice) {
     }
 }
 
+/// `drm_plane_index()` (include/drm/drm_plane.h, inline): the plane's
+/// position in the device's plane list.
+// upstream: include/drm/drm_plane.h drm_plane_index()
+#[unsafe(export_name = "drm_plane_index")]
+pub unsafe extern "C" fn drm_plane_index(plane: *const DrmPlane) -> u32 {
+    unsafe { (*plane).index }
+}
+
 /// Tears down a plane initialized by one of the init functions above.
 // upstream: drm_plane.c drm_plane_cleanup()
 #[unsafe(no_mangle)]

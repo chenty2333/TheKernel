@@ -456,6 +456,26 @@ pub unsafe extern "C" fn intel_crtc_needs_modeset(state: *const IntelCrtcState) 
     !state.is_null() && unsafe { drm_atomic_crtc_needs_modeset(ptr::addr_of!((*state).uapi)) }
 }
 
+// upstream: intel_display_types.h intel_crtc_has_type()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_crtc_has_type(
+    crtc_state: *const IntelCrtcState,
+    output_type: u32,
+) -> bool {
+    unsafe { (*crtc_state).output_types & (1u32 << output_type) != 0 }
+}
+
+// upstream: intel_display_types.h intel_crtc_has_dp_encoder()
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_crtc_has_dp_encoder(crtc_state: *const IntelCrtcState) -> bool {
+    use crate::intel_display_types_upstream::{INTEL_OUTPUT_DP, INTEL_OUTPUT_DP_MST, INTEL_OUTPUT_EDP};
+    unsafe {
+        (*crtc_state).output_types
+            & ((1u32 << INTEL_OUTPUT_DP) | (1u32 << INTEL_OUTPUT_DP_MST) | (1u32 << INTEL_OUTPUT_EDP))
+            != 0
+    }
+}
+
 const _: () = assert!(size_of::<IntelAtomicState>() >= size_of::<DrmAtomicCommit>());
 
 #[cfg(test)]

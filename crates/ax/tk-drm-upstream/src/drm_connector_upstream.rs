@@ -2679,13 +2679,15 @@ pub unsafe extern "C" fn drm_mode_getconnector(
 
 /// `drm_connector_get()` (include/drm/drm_connector.h).
 // upstream: include/drm/drm_connector.h drm_connector_get()
-pub(crate) unsafe fn drm_connector_get(connector: *mut DrmConnector) {
+#[unsafe(export_name = "drm_connector_get")]
+pub(crate) unsafe extern "C" fn drm_connector_get(connector: *mut DrmConnector) {
     unsafe { drm_mode_object_get(core::ptr::addr_of_mut!((*connector).base)) }
 }
 
 /// `drm_connector_put()` (include/drm/drm_connector.h).
 // upstream: include/drm/drm_connector.h drm_connector_put()
-pub(crate) unsafe fn drm_connector_put(connector: *mut DrmConnector) {
+#[unsafe(export_name = "drm_connector_put")]
+pub(crate) unsafe extern "C" fn drm_connector_put(connector: *mut DrmConnector) {
     unsafe { drm_mode_object_put(core::ptr::addr_of_mut!((*connector).base)) }
 }
 
