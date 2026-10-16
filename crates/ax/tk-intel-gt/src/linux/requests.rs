@@ -518,4 +518,3 @@ pub unsafe extern "C" fn i915_request_next(
         }
     }
 }
-

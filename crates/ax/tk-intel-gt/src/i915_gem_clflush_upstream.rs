@@ -432,4 +432,3 @@ pub unsafe fn i915_gem_clflush_object(obj: *mut DrmI915GemObject, flags: u32) ->
 
     true
 }
-

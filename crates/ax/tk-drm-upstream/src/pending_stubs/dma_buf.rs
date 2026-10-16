@@ -150,4 +150,3 @@ pub unsafe extern "C" fn dma_fence_chain_alloc() -> *mut tk_linux_kapi::types::D
     )
     .cast()
 }
-
