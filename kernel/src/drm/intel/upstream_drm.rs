@@ -1129,73 +1129,18 @@ unsafe extern "C" fn sync_file_release(file: *mut c_void) {
     unsafe { super::upstream_sync::sync_file_release(file) }
 }
 
-/// `drm_syncobj_find()`: resolve the upstream file/handle to the native
-/// per-file syncobj and return one owned bridge reference.
-unsafe extern "C" fn syncobj_find(file: *mut c_void, handle: u32) -> *mut c_void {
-    // SAFETY: i915 supplies the active DRM file and handle; the bridge checks
-    // its file binding/handle table before returning an owned syncobj ref.
-    unsafe { super::upstream_sync::syncobj_find(file, handle) }
-}
-
-/// `drm_syncobj_create()`: create a native binary syncobj for i915 contexts.
-unsafe extern "C" fn syncobj_create(
-    out: *mut *mut c_void,
-    flags: u32,
-    fence: *mut c_void,
-) -> c_int {
-    // SAFETY: i915 provides a writable output slot and either NULL or a live
-    // fence per the syncobj-create ABI; the bridge validates flags and inputs
-    // before publishing the result.
-    unsafe { super::upstream_sync::syncobj_create(out, flags, fence) }
-}
-
-/// `drm_syncobj_add_point()`: publish a native timeline point.
-unsafe extern "C" fn syncobj_add_point(
-    syncobj: *mut c_void,
-    chain: *mut c_void,
-    fence: *mut c_void,
-    point: u64,
-) {
-    // SAFETY: i915 passes a live syncobj, timeline-chain slot and fence under
-    // the syncobj ABI; the bridge validates bridge-owned objects before use.
-    unsafe { super::upstream_sync::syncobj_add_point(syncobj, chain, fence, point) }
-}
-
-/// `drm_syncobj_replace_fence()`: publish a native binary completion edge.
-unsafe extern "C" fn syncobj_replace_fence(syncobj: *mut c_void, fence: *mut c_void) {
-    // SAFETY: i915 supplies the syncobj and replacement fence per the DRM
-    // callback contract; the bridge resolves its owned syncobj before update.
-    unsafe { super::upstream_sync::syncobj_replace_fence(syncobj, fence) }
-}
-
-/// `drm_syncobj_fence_get()`: obtain a Linux fence wrapper for native state.
-unsafe extern "C" fn syncobj_fence_get(syncobj: *mut c_void) -> *mut c_void {
-    // SAFETY: the callback receives the syncobj reference returned by the
-    // bridge; the helper verifies the registered object and takes a fence ref.
-    unsafe { super::upstream_sync::syncobj_fence_get(syncobj) }
-}
-
-/// `drm_syncobj_put()`: release one bridge reference.
-unsafe extern "C" fn syncobj_put(syncobj: *mut c_void) {
-    // SAFETY: the caller releases exactly one bridge-owned syncobj reference;
-    // the helper's registry/refcount accounting makes the matching put.
-    unsafe { super::upstream_sync::syncobj_put(syncobj) }
-}
-
-/// Mirror only explicitly registered i915 GEM aliases back into the native
-/// reservation graph. All other Linux reservation objects remain untouched.
-unsafe extern "C" fn resv_fence_add(resv: *mut c_void, fence: *mut c_void, usage: u32) {
+/// Kernel-side alias notification after LinuxKPI inserts a dma-reservation fence.
+unsafe extern "C" fn resv_alias_add(resv: *mut c_void, fence: *mut c_void, usage: u32) {
     super::upstream_sync::upstream_reservation_fence_add(resv, fence.cast(), usage);
 }
 
-/// Resolve timeline point requests on native syncobj fences; return the
-/// not-handled sentinel for ordinary upstream chain fences.
-unsafe extern "C" fn syncobj_timeline_fence_find(fence: *mut *mut c_void, point: u64) -> c_int {
-    // SAFETY: i915 supplies its writable fence slot to this lookup callback;
-    // the bridge changes it only when it identifies its own native timeline
-    // fence and leaves ordinary upstream fences to the caller.
-    unsafe { super::upstream_sync::syncobj_timeline_fence_find(fence, point) }
-}
+/// Native fence hooks consumed by LinuxKPI's `dma_resv_add_fence` and
+/// `dma_fence_chain_find_seqno`.
+static NATIVE_FENCE_HOOKS: tk_linux_kapi::dma_fence_hooks::NativeFenceHooks =
+    tk_linux_kapi::dma_fence_hooks::NativeFenceHooks {
+        resv_alias_add,
+        timeline_fence_find: super::upstream_sync::syncobj_timeline_fence_find,
+    };
 
 static DRM_CORE: DrmCoreProvider = DrmCoreProvider {
     dev_enter,
@@ -1222,14 +1167,6 @@ static DRM_CORE: DrmCoreProvider = DrmCoreProvider {
     sync_file_create,
     sync_file_get_fence,
     sync_file_release,
-    syncobj_find,
-    syncobj_create,
-    syncobj_add_point,
-    syncobj_replace_fence,
-    syncobj_fence_get,
-    syncobj_put,
-    resv_fence_add,
-    syncobj_timeline_fence_find,
 };
 
 static GEM_HANDLE_PROVIDER: tk_drm_upstream::drm_gem_upstream::DrmGemHandleProvider =
@@ -1244,6 +1181,7 @@ pub(super) fn install() -> Result<(), &'static str> {
     install_i915_framework_ops(&FRAMEWORK)?;
     install_i915_probe_ops(&PROBE)?;
     install_drm_core_provider(&DRM_CORE)?;
+    tk_linux_kapi::dma_fence_hooks::install_native_fence_hooks(&NATIVE_FENCE_HOOKS)?;
     tk_drm_upstream::drm_gem_upstream::install_gem_handle_provider(&GEM_HANDLE_PROVIDER)?;
     Ok(())
 }

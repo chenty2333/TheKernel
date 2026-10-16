@@ -17,6 +17,14 @@
 
 use core::ffi::{c_char, c_int, c_ulong, c_void};
 
+use tk_drm_upstream::{
+    drm_prime_upstream::{
+        DmaBuf, DmaBufAttachment, DmaBufExportInfo, DmaBufOps, drm_gem_dmabuf_export,
+        drm_gem_dmabuf_release, drm_gem_prime_mmap, drm_gem_unmap_dma_buf,
+    },
+    iosys_map_types::{IosysMap, iosys_map_set_vaddr},
+};
+
 use crate::{
     i915_gem_domain_upstream::{
         i915_gem_object_set_to_cpu_domain, i915_gem_object_set_to_gtt_domain,
@@ -51,7 +59,6 @@ use crate::{
         gem::{DmaResv, DrmDevice, DrmGemObject, get_file_active},
         gem_memory::INTEL_REGION_SMEM,
         i915::{HAS_LLC, HAS_LMEM, IS_DG1, to_i915},
-        iosys_map::{IosysMap, iosys_map_set_vaddr},
         memory::{kfree, kmalloc_obj},
         mm::VmAreaStruct,
     },
@@ -60,87 +67,12 @@ use crate::{
     },
 };
 
-const DMA_BIDIRECTIONAL: DmaDataDirection = DmaDataDirection::Bidirectional;
-const DMA_TO_DEVICE: DmaDataDirection = DmaDataDirection::ToDevice;
+const DMA_BIDIRECTIONAL: c_int = 0;
+const DMA_TO_DEVICE: c_int = 1;
 const DMA_ATTR_SKIP_CPU_SYNC: c_ulong = 1 << 5;
 const I915_GEM_DOMAIN_GTT: u32 = 0x0000_0040;
 const SG_PAGE_LINK_MASK: usize = 3;
 const KBUILD_MODNAME_I915: &[u8] = b"i915\0";
-
-#[repr(i32)]
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum DmaDataDirection {
-    Bidirectional = 0,
-    ToDevice      = 1,
-    FromDevice    = 2,
-    None          = 3,
-}
-
-/// Linux `struct dma_buf_ops` from `include/linux/dma-buf.h`.
-#[repr(C)]
-struct DmaBufOps {
-    attach: Option<unsafe extern "C" fn(*mut DmaBuf, *mut DmaBufAttachment) -> c_int>,
-    detach: Option<unsafe extern "C" fn(*mut DmaBuf, *mut DmaBufAttachment)>,
-    pin: Option<unsafe extern "C" fn(*mut DmaBufAttachment) -> c_int>,
-    unpin: Option<unsafe extern "C" fn(*mut DmaBufAttachment)>,
-    map_dma_buf:
-        Option<unsafe extern "C" fn(*mut DmaBufAttachment, DmaDataDirection) -> *mut SgTable>,
-    unmap_dma_buf:
-        Option<unsafe extern "C" fn(*mut DmaBufAttachment, *mut SgTable, DmaDataDirection)>,
-    release: Option<unsafe extern "C" fn(*mut DmaBuf)>,
-    begin_cpu_access: Option<unsafe extern "C" fn(*mut DmaBuf, DmaDataDirection) -> c_int>,
-    end_cpu_access: Option<unsafe extern "C" fn(*mut DmaBuf, DmaDataDirection) -> c_int>,
-    mmap: Option<unsafe extern "C" fn(*mut DmaBuf, *mut VmAreaStruct) -> c_int>,
-    vmap: Option<unsafe extern "C" fn(*mut DmaBuf, *mut IosysMap) -> c_int>,
-    vunmap: Option<unsafe extern "C" fn(*mut DmaBuf, *mut IosysMap)>,
-}
-const _: [(); 96] = [(); core::mem::size_of::<DmaBufOps>()];
-
-/// Prefix of Linux `struct dma_buf` through the source fields consumed here.
-#[repr(C)]
-struct DmaBuf {
-    size: usize,
-    file: *mut File,
-    attachments: ListHead,
-    ops: *const DmaBufOps,
-    vmapping_counter: u32,
-    _vmapping_pad: u32,
-    vmap_ptr: IosysMap,
-    exp_name: *const c_char,
-    name: *const c_char,
-    name_lock: Spinlock,
-    _name_lock_pad: u32,
-    owner: *mut c_void,
-    list_node: ListHead,
-    r#priv: *mut c_void,
-    resv: *mut DmaResv,
-}
-const _: [(); 32] = [(); core::mem::offset_of!(DmaBuf, ops)];
-const _: [(); 80] = [(); core::mem::offset_of!(DmaBuf, name_lock)];
-const _: [(); 88] = [(); core::mem::offset_of!(DmaBuf, owner)];
-const _: [(); 112] = [(); core::mem::offset_of!(DmaBuf, r#priv)];
-const _: [(); 120] = [(); core::mem::offset_of!(DmaBuf, resv)];
-const _: [(); 16] = [(); core::mem::size_of::<DmaBufAttachment>()];
-
-/// The first two fields of Linux `struct dma_buf_attachment`.
-#[repr(C)]
-struct DmaBufAttachment {
-    dmabuf: *mut DmaBuf,
-    dev: *mut c_void,
-}
-
-/// Linux `struct dma_buf_export_info` from `include/linux/dma-buf.h`.
-#[repr(C)]
-struct DmaBufExportInfo {
-    exp_name: *const c_char,
-    owner: *mut c_void,
-    ops: *const DmaBufOps,
-    size: usize,
-    flags: c_int,
-    resv: *mut DmaResv,
-    r#priv: *mut c_void,
-}
-const _: [(); 56] = [(); core::mem::size_of::<DmaBufExportInfo>()];
 
 /// Linux `struct file` field used to locate its operations vector.
 #[repr(C)]
@@ -178,29 +110,21 @@ unsafe extern "C" {
     fn dma_map_sgtable(
         dev: *mut c_void,
         sgt: *mut SgTable,
-        direction: DmaDataDirection,
+        direction: c_int,
         attrs: c_ulong,
     ) -> c_int;
     fn dma_buf_attach(dmabuf: *mut DmaBuf, dev: *mut c_void) -> *mut DmaBufAttachment;
     fn dma_buf_detach(dmabuf: *mut DmaBuf, attach: *mut DmaBufAttachment);
     fn dma_buf_map_attachment(
         attach: *mut DmaBufAttachment,
-        direction: DmaDataDirection,
+        direction: c_int,
     ) -> *mut SgTable;
     fn dma_buf_unmap_attachment(
         attach: *mut DmaBufAttachment,
         sgt: *mut SgTable,
-        direction: DmaDataDirection,
+        direction: c_int,
     );
     fn dma_buf_put(dmabuf: *mut DmaBuf);
-    fn drm_gem_dmabuf_export(dev: *mut DrmDevice, info: *mut DmaBufExportInfo) -> *mut DmaBuf;
-    fn drm_gem_dmabuf_release(dmabuf: *mut DmaBuf);
-    fn drm_gem_unmap_dma_buf(
-        attach: *mut DmaBufAttachment,
-        sgt: *mut SgTable,
-        direction: DmaDataDirection,
-    );
-    fn drm_gem_prime_mmap(obj: *mut DrmGemObject, vma: *mut VmAreaStruct) -> c_int;
     fn compat_vma_mmap(file: *mut File, vma: *mut VmAreaStruct) -> c_int;
     fn i915_gem_object_wait_migration(obj: *mut DrmI915GemObject, flags: u32) -> c_int;
     fn wbinvd_on_all_cpus();
@@ -237,7 +161,7 @@ unsafe fn vfs_mmap(file: *mut File, vma: *mut VmAreaStruct) -> c_int {
 // upstream: i915_gem_dmabuf.c i915_gem_map_dma_buf()
 unsafe extern "C" fn i915_gem_map_dma_buf(
     attach: *mut DmaBufAttachment,
-    direction: DmaDataDirection,
+    direction: c_int,
 ) -> *mut SgTable {
     let obj = unsafe { dma_buf_to_obj((*attach).dmabuf) };
     let pages = unsafe { (*obj).mm.pages };
@@ -278,7 +202,8 @@ unsafe extern "C" fn i915_gem_map_dma_buf(
 }
 
 // upstream: i915_gem_dmabuf.c i915_gem_dmabuf_vmap()
-unsafe extern "C" fn i915_gem_dmabuf_vmap(dma_buf: *mut DmaBuf, map: *mut IosysMap) -> c_int {
+unsafe extern "C" fn i915_gem_dmabuf_vmap(dma_buf: *mut DmaBuf, map: *mut c_void) -> c_int {
+    let map = map.cast::<IosysMap>();
     let obj = unsafe { dma_buf_to_obj(dma_buf) };
     let vaddr = unsafe { i915_gem_object_pin_map(obj, I915_MAP_WB) };
     if IS_ERR(vaddr) {
@@ -289,7 +214,7 @@ unsafe extern "C" fn i915_gem_dmabuf_vmap(dma_buf: *mut DmaBuf, map: *mut IosysM
 }
 
 // upstream: i915_gem_dmabuf.c i915_gem_dmabuf_vunmap()
-unsafe extern "C" fn i915_gem_dmabuf_vunmap(dma_buf: *mut DmaBuf, _map: *mut IosysMap) {
+unsafe extern "C" fn i915_gem_dmabuf_vunmap(dma_buf: *mut DmaBuf, _map: *mut c_void) {
     let obj = unsafe { dma_buf_to_obj(dma_buf) };
     unsafe {
         i915_gem_object_flush_map(obj);
@@ -298,7 +223,8 @@ unsafe extern "C" fn i915_gem_dmabuf_vunmap(dma_buf: *mut DmaBuf, _map: *mut Ios
 }
 
 // upstream: i915_gem_dmabuf.c i915_gem_dmabuf_mmap()
-unsafe extern "C" fn i915_gem_dmabuf_mmap(dma_buf: *mut DmaBuf, vma: *mut VmAreaStruct) -> c_int {
+unsafe extern "C" fn i915_gem_dmabuf_mmap(dma_buf: *mut DmaBuf, vma: *mut c_void) -> c_int {
+    let vma = vma.cast::<VmAreaStruct>();
     let obj = unsafe { dma_buf_to_obj(dma_buf) };
     let base = unsafe { intel_bo_to_drm_bo(obj) };
     let i915 = unsafe { to_i915((*base).dev) };
@@ -308,7 +234,7 @@ unsafe extern "C" fn i915_gem_dmabuf_mmap(dma_buf: *mut DmaBuf, vma: *mut VmArea
     }
 
     if unsafe { HAS_LMEM(i915) } {
-        return unsafe { drm_gem_prime_mmap(base, vma) };
+        return unsafe { drm_gem_prime_mmap(base.cast(), vma.cast()) };
     }
 
     let filp = unsafe { (*base).filp.cast::<File>() };
@@ -326,7 +252,7 @@ unsafe extern "C" fn i915_gem_dmabuf_mmap(dma_buf: *mut DmaBuf, vma: *mut VmArea
 // upstream: i915_gem_dmabuf.c i915_gem_begin_cpu_access()
 unsafe extern "C" fn i915_gem_begin_cpu_access(
     dma_buf: *mut DmaBuf,
-    direction: DmaDataDirection,
+    direction: c_int,
 ) -> c_int {
     let obj = unsafe { dma_buf_to_obj(dma_buf) };
     let write = direction == DMA_BIDIRECTIONAL || direction == DMA_TO_DEVICE;
@@ -377,7 +303,7 @@ unsafe extern "C" fn i915_gem_begin_cpu_access(
 // upstream: i915_gem_dmabuf.c i915_gem_end_cpu_access()
 unsafe extern "C" fn i915_gem_end_cpu_access(
     dma_buf: *mut DmaBuf,
-    _direction: DmaDataDirection,
+    _direction: c_int,
 ) -> c_int {
     let obj = unsafe { dma_buf_to_obj(dma_buf) };
     let mut ww = I915GemWwCtx::default();
@@ -535,7 +461,7 @@ pub unsafe extern "C" fn i915_gem_prime_export(
     }
 
     let dev = unsafe { (*gem_obj).dev.cast::<DrmDevice>() };
-    unsafe { drm_gem_dmabuf_export(dev, &mut info) }
+    unsafe { drm_gem_dmabuf_export(dev.cast(), &mut info) }
 }
 
 // upstream: i915_gem_dmabuf.c i915_gem_object_get_pages_dmabuf()

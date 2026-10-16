@@ -26,6 +26,7 @@ use crate::drm_device_types::DrmDevice;
 use crate::drm_file_types::DrmFile;
 use crate::drm_gem_types::DrmGemObject;
 use crate::drm_prime_types::DrmPrimeFilePrivate;
+use crate::iosys_map_types::IosysMap;
 use crate::uapi_drm_types::DrmPrimeHandle;
 
 const ENOENT: i32 = 2;
@@ -69,7 +70,7 @@ pub struct DmaBuf {
     pub ops: *const DmaBufOps,
     pub vmapping_counter: u32,
     pub _vmapping_pad: u32,
-    pub vmap_ptr: [usize; 2],
+    pub vmap_ptr: IosysMap,
     pub exp_name: *const c_char,
     pub name: *const c_char,
     pub name_lock: Spinlock,
@@ -99,6 +100,18 @@ pub struct DmaBufExportInfo {
     pub resv: *mut DmaResv,
     pub r#priv: *mut c_void,
 }
+
+// Linux v7.2.3 x86_64 `struct dma_buf` / `dma_buf_ops` / `dma_buf_export_info`.
+const _: () = {
+    assert!(core::mem::size_of::<DmaBufOps>() == 96);
+    assert!(core::mem::offset_of!(DmaBuf, ops) == 32);
+    assert!(core::mem::offset_of!(DmaBuf, vmap_ptr) == 48);
+    assert!(core::mem::offset_of!(DmaBuf, name_lock) == 80);
+    assert!(core::mem::offset_of!(DmaBuf, owner) == 88);
+    assert!(core::mem::offset_of!(DmaBuf, r#priv) == 112);
+    assert!(core::mem::offset_of!(DmaBuf, resv) == 120);
+    assert!(core::mem::size_of::<DmaBufExportInfo>() == 56);
+};
 
 pub static drm_gem_prime_dmabuf_ops: DmaBufOps = DmaBufOps {
     attach: Some(drm_gem_map_attach),

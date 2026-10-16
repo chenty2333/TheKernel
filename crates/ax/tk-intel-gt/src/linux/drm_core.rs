@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
 //! LinuxKPI entry points for DRM core objects (GEM handles, PRIME/dma-buf,
-//! sync_file, syncobj, DRM device references) whose objects and tables are
+//! sync_file, DRM device references) whose objects and tables are
 //! owned by the kernel's DRM implementation.
 //!
 //! Every symbol forwards to one installed `DrmCoreProvider`, so the object
@@ -48,14 +48,6 @@ pub dma_buf_put: unsafe extern "C" fn(dmabuf: *mut c_void),
 pub sync_file_create: unsafe extern "C" fn(fence: *mut c_void) -> *mut c_void,
 pub sync_file_get_fence: unsafe extern "C" fn(fd: c_int) -> *mut c_void,
 pub sync_file_release: unsafe extern "C" fn(file: *mut c_void),
-pub syncobj_find: unsafe extern "C" fn(file: *mut c_void, handle: u32) -> *mut c_void,
-pub syncobj_create: unsafe extern "C" fn(out: *mut *mut c_void, flags: u32, fence: *mut c_void) -> c_int,
-pub syncobj_add_point: unsafe extern "C" fn(syncobj: *mut c_void, chain: *mut c_void, fence: *mut c_void, point: u64),
-pub syncobj_replace_fence: unsafe extern "C" fn(syncobj: *mut c_void, fence: *mut c_void),
-pub syncobj_fence_get: unsafe extern "C" fn(syncobj: *mut c_void) -> *mut c_void,
-pub syncobj_put: unsafe extern "C" fn(syncobj: *mut c_void),
-pub resv_fence_add: unsafe extern "C" fn(resv: *mut c_void, fence: *mut c_void, usage: u32),
-pub syncobj_timeline_fence_find: unsafe extern "C" fn(fence: *mut *mut c_void, point: u64) -> c_int,
 }
 
 static DRM_CORE_PROVIDER: AtomicPtr<DrmCoreProvider> = AtomicPtr::new(core::ptr::null_mut());
@@ -95,7 +87,6 @@ fn err_ptr(errno: c_int) -> *mut c_void {
 // drm_print_memory_stats, drm_gem_dmabuf_export, drm_gem_dmabuf_release,
 // drm_gem_prime_mmap, drm_gem_unmap_dma_buf, drm_prime_gem_destroy
 // now ported and provided by tk-drm-upstream.
-
 
 /// Linux `dma_buf_attach()`.
 #[unsafe(no_mangle)]
@@ -157,66 +148,6 @@ match provider() {
 pub unsafe extern "C" fn drm_sync_file_release(file: *mut c_void) {
 if let Some(p) = provider() {
     unsafe { (p.sync_file_release)(file) };
-}
-}
-
-/// Linux `drm_syncobj_find()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_syncobj_find(file: *mut c_void, handle: u32) -> *mut c_void {
-match provider() {
-    Some(p) => unsafe { (p.syncobj_find)(file, handle) },
-    None => core::ptr::null_mut(),
-}
-}
-
-/// Linux `drm_syncobj_create()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_syncobj_create(out: *mut *mut c_void, flags: u32, fence: *mut c_void) -> c_int {
-match provider() {
-    Some(p) => unsafe { (p.syncobj_create)(out, flags, fence) },
-    None => -ENODEV,
-}
-}
-
-/// Linux `drm_syncobj_add_point()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_syncobj_add_point(syncobj: *mut c_void, chain: *mut c_void, fence: *mut c_void, point: u64) {
-unsafe { (required("drm_syncobj_add_point").syncobj_add_point)(syncobj, chain, fence, point) };
-}
-
-/// Linux `drm_syncobj_replace_fence()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_syncobj_replace_fence(syncobj: *mut c_void, fence: *mut c_void) {
-unsafe { (required("drm_syncobj_replace_fence").syncobj_replace_fence)(syncobj, fence) };
-}
-
-/// Linux `drm_syncobj_fence_get()`: NULL when no provider exists.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_syncobj_fence_get(syncobj: *mut c_void) -> *mut c_void {
-match provider() {
-    Some(p) => unsafe { (p.syncobj_fence_get)(syncobj) },
-    None => core::ptr::null_mut(),
-}
-}
-
-/// Linux `drm_syncobj_put()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_syncobj_put(syncobj: *mut c_void) {
-unsafe { (required("drm_syncobj_put").syncobj_put)(syncobj) };
-}
-
-/// Kernel-side alias notification after LinuxKPI inserts a dma-reservation fence.
-pub unsafe fn drm_resv_fence_add(resv: *mut c_void, fence: *mut c_void, usage: u32) {
-if let Some(provider) = provider() {
-    unsafe { (provider.resv_fence_add)(resv, fence, usage) };
-}
-}
-
-/// Resolve a timeline point carried by one of the kernel's native fence wrappers.
-pub unsafe fn drm_syncobj_timeline_fence_find(fence: *mut *mut c_void, point: u64) -> c_int {
-match provider() {
-    Some(provider) => unsafe { (provider.syncobj_timeline_fence_find)(fence, point) },
-    None => 1,
 }
 }
 

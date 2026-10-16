@@ -95,10 +95,6 @@ unsafe extern "C" {
     fn fput(file: *mut c_void);
 }
 
-// These generic DRM exports deliberately use `tk_drm_syncobj_*`: the
-// unprefixed `drm_syncobj_*` C names are already owned by LinuxKPI's native
-// i915 bridge in tk-intel-gt.
-
 /// An owned reference to the Linux `dma_fence` ABI.
 struct FenceRef(*mut DmaFence);
 
@@ -584,9 +580,9 @@ pub unsafe fn drm_syncobj_sync_file_fput(file: *mut c_void) {
     unsafe { fput(file) };
 }
 
-/// Linux `tk_drm_syncobj_open()`.
+/// Linux `drm_syncobj_open()`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tk_drm_syncobj_open(file: *mut DrmFile) {
+pub unsafe extern "C" fn drm_syncobj_open(file: *mut DrmFile) {
     if file.is_null() {
         return;
     }
@@ -598,9 +594,9 @@ pub unsafe extern "C" fn tk_drm_syncobj_open(file: *mut DrmFile) {
     }
 }
 
-/// Linux `tk_drm_syncobj_release()`.
+/// Linux `drm_syncobj_release()`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tk_drm_syncobj_release(file: *mut DrmFile) {
+pub unsafe extern "C" fn drm_syncobj_release(file: *mut DrmFile) {
     if file.is_null() {
         return;
     }
@@ -618,9 +614,9 @@ pub unsafe extern "C" fn tk_drm_syncobj_release(file: *mut DrmFile) {
     tk_linux_kapi::xarray::xa_destroy(unsafe { &mut *xa });
 }
 
-/// Linux `tk_drm_syncobj_find()`: one owned reference, or NULL for a missing handle.
+/// Linux `drm_syncobj_find()`: one owned reference, or NULL for a missing handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tk_drm_syncobj_find(file: *mut DrmFile, handle: u32) -> *mut DrmSyncobj {
+pub unsafe extern "C" fn drm_syncobj_find(file: *mut DrmFile, handle: u32) -> *mut DrmSyncobj {
     if file.is_null() || handle == 0 {
         return ptr::null_mut();
     }
@@ -634,9 +630,9 @@ pub unsafe extern "C" fn tk_drm_syncobj_find(file: *mut DrmFile, handle: u32) ->
     syncobj
 }
 
-/// Linux `tk_drm_syncobj_put()`.
+/// Linux `drm_syncobj_put()`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tk_drm_syncobj_put(syncobj: *mut DrmSyncobj) {
+pub unsafe extern "C" fn drm_syncobj_put(syncobj: *mut DrmSyncobj) {
     if !syncobj.is_null() {
         unsafe { Arc::decrement_strong_count(syncobj) };
     }
@@ -644,7 +640,7 @@ pub unsafe extern "C" fn tk_drm_syncobj_put(syncobj: *mut DrmSyncobj) {
 
 /// Linux syncobj reference acquisition for VFS descriptor wrappers.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tk_drm_syncobj_get(syncobj: *mut DrmSyncobj) -> *mut DrmSyncobj {
+pub unsafe extern "C" fn drm_syncobj_get(syncobj: *mut DrmSyncobj) -> *mut DrmSyncobj {
     if !syncobj.is_null() {
         unsafe { Arc::increment_strong_count(syncobj) };
     }
@@ -689,9 +685,38 @@ fn remove_syncobj_handle(file: *mut DrmFile, handle: u32) -> Result<(), i32> {
     }
 }
 
-/// Linux `tk_drm_syncobj_fence_get()`.
+/// Linux `drm_syncobj_create()`: a syncobj not yet published to any file.
+/// `DRM_SYNCOBJ_CREATE_SIGNALED` assigns the signaled stub and a non-null
+/// `fence` replaces it. The caller owns the returned reference.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tk_drm_syncobj_fence_get(syncobj: *mut DrmSyncobj) -> *mut DmaFence {
+pub unsafe extern "C" fn drm_syncobj_create(
+    out: *mut *mut DrmSyncobj,
+    flags: u32,
+    fence: *mut DmaFence,
+) -> c_int {
+    if out.is_null() {
+        return -EINVAL;
+    }
+    let object = match DrmSyncobj::new() {
+        Ok(object) => object,
+        Err(error) => return error,
+    };
+    if flags & DRM_SYNCOBJ_CREATE_SIGNALED != 0 {
+        match signaled_stub() {
+            Ok(stub) => object.replace_fence(Some(stub)),
+            Err(error) => return error,
+        }
+    }
+    if !fence.is_null() {
+        object.replace_fence(FenceRef::get(fence));
+    }
+    unsafe { *out = Arc::into_raw(object).cast_mut() };
+    0
+}
+
+/// Linux `drm_syncobj_fence_get()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_syncobj_fence_get(syncobj: *mut DrmSyncobj) -> *mut DmaFence {
     if syncobj.is_null() {
         return ptr::null_mut();
     }
@@ -700,9 +725,9 @@ pub unsafe extern "C" fn tk_drm_syncobj_fence_get(syncobj: *mut DrmSyncobj) -> *
         .map_or(ptr::null_mut(), FenceRef::into_raw)
 }
 
-/// Linux `tk_drm_syncobj_replace_fence()`.
+/// Linux `drm_syncobj_replace_fence()`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tk_drm_syncobj_replace_fence(
+pub unsafe extern "C" fn drm_syncobj_replace_fence(
     syncobj: *mut DrmSyncobj,
     fence: *mut DmaFence,
 ) {
@@ -713,9 +738,9 @@ pub unsafe extern "C" fn tk_drm_syncobj_replace_fence(
     unsafe { &*syncobj }.replace_fence(fence);
 }
 
-/// Linux `tk_drm_syncobj_add_point()` with caller-owned chain storage.
+/// Linux `drm_syncobj_add_point()` with caller-owned chain storage.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tk_drm_syncobj_add_point(
+pub unsafe extern "C" fn drm_syncobj_add_point(
     syncobj: *mut DrmSyncobj,
     chain: *mut DmaFenceChain,
     fence: *mut DmaFence,
@@ -747,9 +772,9 @@ pub unsafe fn drm_syncobj_add_point_auto(
     ret
 }
 
-/// Linux `tk_drm_syncobj_find_fence()`.
+/// Linux `drm_syncobj_find_fence()`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tk_drm_syncobj_find_fence(
+pub unsafe extern "C" fn drm_syncobj_find_fence(
     file: *mut DrmFile,
     handle: u32,
     point: u64,
@@ -763,7 +788,7 @@ pub unsafe extern "C" fn tk_drm_syncobj_find_fence(
     if flags & !(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT as u64) != 0 {
         return -EINVAL;
     }
-    let syncobj = unsafe { tk_drm_syncobj_find(file, handle) };
+    let syncobj = unsafe { drm_syncobj_find(file, handle) };
     if syncobj.is_null() {
         return -ENOENT;
     }
@@ -791,7 +816,7 @@ pub unsafe extern "C" fn tk_drm_syncobj_find_fence(
             }
         }
     };
-    unsafe { tk_drm_syncobj_put(syncobj) };
+    unsafe { drm_syncobj_put(syncobj) };
     match result {
         Ok(fence) => {
             unsafe { *out = fence };
@@ -818,7 +843,7 @@ pub unsafe fn drm_syncobj_submit_point(
     point: u64,
 ) -> i32 {
     if point == 0 {
-        unsafe { tk_drm_syncobj_replace_fence(syncobj, fence) };
+        unsafe { drm_syncobj_replace_fence(syncobj, fence) };
         0
     } else {
         unsafe { drm_syncobj_add_point_auto(syncobj, fence, point) }
@@ -959,7 +984,7 @@ fn find_syncobjs(file: *mut DrmFile, handles: &[u32]) -> Result<Vec<Arc<DrmSynco
         .try_reserve_exact(handles.len())
         .map_err(|_| -ENOMEM)?;
     for handle in handles {
-        let raw = unsafe { tk_drm_syncobj_find(file, *handle) };
+        let raw = unsafe { drm_syncobj_find(file, *handle) };
         if raw.is_null() {
             return Err(-ENOENT);
         }
@@ -1188,12 +1213,12 @@ pub unsafe extern "C" fn drm_syncobj_handle_to_fd_ioctl(
         if args.point != 0 {
             return -EINVAL;
         }
-        let syncobj = unsafe { tk_drm_syncobj_find(file, args.handle) };
+        let syncobj = unsafe { drm_syncobj_find(file, args.handle) };
         if syncobj.is_null() {
             return -ENOENT;
         }
         let fd = unsafe { thekernel_drm_syncobj_export_fd(syncobj.cast()) };
-        unsafe { tk_drm_syncobj_put(syncobj) };
+        unsafe { drm_syncobj_put(syncobj) };
         if fd < 0 {
             return fd;
         }
@@ -1202,7 +1227,7 @@ pub unsafe extern "C" fn drm_syncobj_handle_to_fd_ioctl(
     }
 
     let mut fence = ptr::null_mut();
-    let ret = unsafe { tk_drm_syncobj_find_fence(file, args.handle, point, 0, &mut fence) };
+    let ret = unsafe { drm_syncobj_find_fence(file, args.handle, point, 0, &mut fence) };
     if ret != 0 {
         return ret;
     }
@@ -1274,7 +1299,7 @@ pub unsafe extern "C" fn drm_syncobj_fd_to_handle_ioctl(
     if fence.is_null() {
         return -EINVAL;
     }
-    let syncobj = unsafe { tk_drm_syncobj_find(file, args.handle) };
+    let syncobj = unsafe { drm_syncobj_find(file, args.handle) };
     if syncobj.is_null() {
         unsafe { dma_fence_put(fence) };
         return -ENOENT;
@@ -1287,7 +1312,7 @@ pub unsafe extern "C" fn drm_syncobj_fd_to_handle_ioctl(
     let ret = unsafe { drm_syncobj_submit_point(syncobj, fence, point) };
     unsafe {
         dma_fence_put(fence);
-        tk_drm_syncobj_put(syncobj);
+        drm_syncobj_put(syncobj);
     }
     ret
 }
@@ -1309,13 +1334,13 @@ pub unsafe extern "C" fn drm_syncobj_transfer_ioctl(
     if args.pad != 0 || args.flags & !(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT) != 0 {
         return -EINVAL;
     }
-    let destination = unsafe { tk_drm_syncobj_find(file, args.dst_handle) };
+    let destination = unsafe { drm_syncobj_find(file, args.dst_handle) };
     if destination.is_null() {
         return -ENOENT;
     }
     let mut fence = ptr::null_mut();
     let ret = unsafe {
-        tk_drm_syncobj_find_fence(
+        drm_syncobj_find_fence(
             file,
             args.src_handle,
             args.src_point,
@@ -1324,7 +1349,7 @@ pub unsafe extern "C" fn drm_syncobj_transfer_ioctl(
         )
     };
     if ret != 0 {
-        unsafe { tk_drm_syncobj_put(destination) };
+        unsafe { drm_syncobj_put(destination) };
         return ret;
     }
     let timeline_fence = if args.dst_point != 0 {
@@ -1333,7 +1358,7 @@ pub unsafe extern "C" fn drm_syncobj_transfer_ioctl(
             Err(error) => {
                 unsafe {
                     dma_fence_put(fence);
-                    tk_drm_syncobj_put(destination);
+                    drm_syncobj_put(destination);
                 }
                 return error;
             }
@@ -1345,7 +1370,7 @@ pub unsafe extern "C" fn drm_syncobj_transfer_ioctl(
     let ret = unsafe { drm_syncobj_submit_point(destination, submit_fence, args.dst_point) };
     unsafe {
         dma_fence_put(fence);
-        tk_drm_syncobj_put(destination);
+        drm_syncobj_put(destination);
     }
     drop(timeline_fence);
     ret
@@ -1466,18 +1491,18 @@ pub unsafe extern "C" fn drm_syncobj_eventfd_ioctl(
     if args.flags & !DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0 || args.pad != 0 {
         return -EINVAL;
     }
-    let syncobj = unsafe { tk_drm_syncobj_find(file, args.handle) };
+    let syncobj = unsafe { drm_syncobj_find(file, args.handle) };
     if syncobj.is_null() {
         return -ENOENT;
     }
     let eventfd_ctx = unsafe { thekernel_eventfd_ctx_fdget(args.fd) };
     if tk_linux_kapi::config::IS_ERR(eventfd_ctx) {
         let error = tk_linux_kapi::config::PTR_ERR(eventfd_ctx);
-        unsafe { tk_drm_syncobj_put(syncobj) };
+        unsafe { drm_syncobj_put(syncobj) };
         return error;
     }
     if eventfd_ctx.is_null() {
-        unsafe { tk_drm_syncobj_put(syncobj) };
+        unsafe { drm_syncobj_put(syncobj) };
         return -EINVAL;
     }
     let waiter =
@@ -1485,7 +1510,7 @@ pub unsafe extern "C" fn drm_syncobj_eventfd_ioctl(
     if waiter.is_null() {
         unsafe {
             thekernel_eventfd_ctx_put(eventfd_ctx);
-            tk_drm_syncobj_put(syncobj);
+            drm_syncobj_put(syncobj);
         }
         return -ENOMEM;
     }
@@ -1496,7 +1521,7 @@ pub unsafe extern "C" fn drm_syncobj_eventfd_ioctl(
         (*waiter).point = args.point;
         (*waiter).flags = args.flags;
         (*syncobj).register_eventfd(waiter);
-        tk_drm_syncobj_put(syncobj);
+        drm_syncobj_put(syncobj);
     }
     0
 }

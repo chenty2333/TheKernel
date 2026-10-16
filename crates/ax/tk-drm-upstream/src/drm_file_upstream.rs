@@ -60,8 +60,8 @@ unsafe extern "C" {
     fn drm_client_dev_restore(dev: *mut DrmDevice, restore: bool);
     fn drm_fb_release(file_priv: *mut DrmFile);
     fn drm_property_destroy_user_blobs(dev: *mut DrmDevice, file_priv: *mut DrmFile);
-    fn tk_drm_syncobj_open(file_priv: *mut DrmFile);
-    fn tk_drm_syncobj_release(file_priv: *mut DrmFile);
+    fn drm_syncobj_open(file_priv: *mut DrmFile);
+    fn drm_syncobj_release(file_priv: *mut DrmFile);
     static mut drm_minors_xa: XArray;
 }
 
@@ -102,7 +102,7 @@ pub unsafe extern "C" fn drm_file_alloc(minor: *mut DrmMinor) -> *mut DrmFile {
             crate::drm_gem_upstream::drm_gem_open(dev, file_priv);
         }
         if ((*dev).driver_features & DRIVER_SYNCOBJ) != 0 {
-            tk_drm_syncobj_open(file_priv);
+            drm_syncobj_open(file_priv);
         }
 
         drm_prime_init_file_private(core::ptr::addr_of_mut!((*file_priv).prime));
@@ -115,7 +115,7 @@ pub unsafe extern "C" fn drm_file_alloc(minor: *mut DrmMinor) -> *mut DrmFile {
                 if ret < 0 {
                     drm_prime_destroy_file_private(core::ptr::addr_of_mut!((*file_priv).prime));
                     if ((*dev).driver_features & DRIVER_SYNCOBJ) != 0 {
-                        tk_drm_syncobj_release(file_priv);
+                        drm_syncobj_release(file_priv);
                     }
                     if ((*dev).driver_features & DRIVER_GEM) != 0 {
                         crate::drm_gem_upstream::drm_gem_release(dev, file_priv);
@@ -182,7 +182,7 @@ pub unsafe extern "C" fn drm_file_free(file_priv: *mut DrmFile) {
         }
 
         if ((*dev).driver_features & DRIVER_SYNCOBJ) != 0 {
-            tk_drm_syncobj_release(file_priv);
+            drm_syncobj_release(file_priv);
         }
 
         if ((*dev).driver_features & DRIVER_GEM) != 0 {

@@ -126,8 +126,17 @@ pub unsafe extern "C" fn dma_resv_reserve_fences(resv: *mut DmaResv, count: u32)
     }
 }
 
+/// Linux `dma_resv_add_fence()`: insert the fence, then mirror it into the
+/// native alias graph through the installed native fence hooks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_resv_add_fence(resv: *mut DmaResv, fence: *mut DmaFence, usage: u32) {
+    unsafe { dma_resv_add_fence_native(resv, fence, usage) };
+    if let Some(hooks) = crate::dma_fence_hooks::native_fence_hooks() {
+        unsafe { (hooks.resv_alias_add)(resv.cast(), fence.cast(), usage) };
+    }
+}
+
 /// Insert a fence into the reservation and retain its ownership reference.
-/// The DRM-core alias mirror is applied by the exported wrapper in tk-intel-gt.
 pub unsafe fn dma_resv_add_fence_native(resv: *mut DmaResv, fence: *mut DmaFence, usage: u32) {
     assert!(!fence.is_null(), "dma_resv_add_fence received a null fence");
     let state = unsafe { reservation_state(resv, true) }

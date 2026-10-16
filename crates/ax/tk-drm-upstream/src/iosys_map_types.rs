@@ -28,3 +28,16 @@ const _: () = assert!(size_of::<IosysMapAnon0>() == 8);
 const _: () = assert!(size_of::<IosysMap>() == 16);
 const _: () = assert!(core::mem::offset_of!(IosysMap, _anon_0) == 0);
 const _: () = assert!(core::mem::offset_of!(IosysMap, is_iomem) == 8);
+
+/// Linux `iosys_map_set_vaddr()` (`include/linux/iosys-map.h`): record a
+/// kernel-virtual address and clear `is_iomem`.
+///
+/// # Safety
+/// `map` must be a valid, writable `struct iosys_map`.
+#[inline]
+pub unsafe fn iosys_map_set_vaddr(map: *mut IosysMap, vaddr: *mut c_void) {
+    unsafe {
+        (*map)._anon_0.vaddr = vaddr;
+        (*map).is_iomem = false;
+    }
+}

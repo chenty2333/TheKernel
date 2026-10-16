@@ -29,8 +29,8 @@ use tk_drm_upstream::{
         DrmSyncobj, drm_syncobj_chain_alloc, drm_syncobj_chain_free, drm_syncobj_fence_create,
         drm_syncobj_fence_put, drm_syncobj_fence_signal, drm_syncobj_sync_file_create,
         drm_syncobj_sync_file_file, drm_syncobj_sync_file_fput, drm_syncobj_sync_file_get_fence,
-        tk_drm_syncobj_add_point, tk_drm_syncobj_find, tk_drm_syncobj_find_fence,
-        tk_drm_syncobj_put, tk_drm_syncobj_replace_fence,
+        drm_syncobj_add_point, drm_syncobj_find, drm_syncobj_find_fence,
+        drm_syncobj_put, drm_syncobj_replace_fence,
     },
 };
 use tk_linux_kapi::{
@@ -1474,11 +1474,11 @@ struct ExecInputSyncobjs {
 impl Drop for ExecInputSyncobjs {
     fn drop(&mut self) {
         for object in self.reset_objects.drain(..) {
-            // SAFETY: `object` was looked up via `tk_drm_syncobj_find` holding an active reference.
+            // SAFETY: `object` was looked up via `drm_syncobj_find` holding an active reference.
             // Clears any attached fence and releases the syncobj reference.
             unsafe {
-                tk_drm_syncobj_replace_fence(object, ptr::null_mut());
-                tk_drm_syncobj_put(object);
+                drm_syncobj_replace_fence(object, ptr::null_mut());
+                drm_syncobj_put(object);
             }
         }
     }
@@ -1491,14 +1491,14 @@ struct ExecOutputSyncobjs {
 impl ExecOutputSyncobjs {
     fn publish(&mut self, fence: *mut DmaFence) {
         for entry in &mut self.entries {
-            // SAFETY: `entry.object` holds an active reference from `tk_drm_syncobj_find`.
+            // SAFETY: `entry.object` holds an active reference from `drm_syncobj_find`.
             // For binary syncobjs (point 0), replaces the fence directly. For timeline syncobjs (point > 0),
             // adds the point using the preallocated chain node and releases chain ownership.
             unsafe {
                 if entry.point == 0 {
-                    tk_drm_syncobj_replace_fence(entry.object, fence);
+                    drm_syncobj_replace_fence(entry.object, fence);
                 } else {
-                    tk_drm_syncobj_add_point(entry.object, entry.chain, fence, entry.point);
+                    drm_syncobj_add_point(entry.object, entry.chain, fence, entry.point);
                     entry.chain = ptr::null_mut();
                 }
             }
@@ -1514,7 +1514,7 @@ impl Drop for ExecOutputSyncobjs {
                 if !entry.chain.is_null() {
                     drm_syncobj_chain_free(entry.chain);
                 }
-                tk_drm_syncobj_put(entry.object);
+                drm_syncobj_put(entry.object);
             }
         }
     }
@@ -1638,42 +1638,42 @@ fn parse_exec_input_syncobjs(
     for descriptor in descriptors {
         if descriptor.flags & !VIRTGPU_EXECBUF_SYNCOBJ_FLAGS != 0 {
             for object in reset_objects {
-                // SAFETY: `object` was acquired by `tk_drm_syncobj_find`; release held reference on error.
-                unsafe { tk_drm_syncobj_put(object) };
+                // SAFETY: `object` was acquired by `drm_syncobj_find`; release held reference on error.
+                unsafe { drm_syncobj_put(object) };
             }
             return Err(-EINVAL);
         }
         let mut fence = ptr::null_mut();
         // SAFETY: `file` is valid; looks up fence from syncobj `handle` at timeline `point`.
         let ret = unsafe {
-            tk_drm_syncobj_find_fence(file, descriptor.handle, descriptor.point, 0, &mut fence)
+            drm_syncobj_find_fence(file, descriptor.handle, descriptor.point, 0, &mut fence)
         };
         if ret != 0 {
             for object in reset_objects {
                 // SAFETY: Release held syncobj reference on fence lookup failure.
-                unsafe { tk_drm_syncobj_put(object) };
+                unsafe { drm_syncobj_put(object) };
             }
             return Err(ret);
         }
-        // SAFETY: `fence` is a valid `DmaFence` returned by `tk_drm_syncobj_find_fence`. Waits for completion.
+        // SAFETY: `fence` is a valid `DmaFence` returned by `drm_syncobj_find_fence`. Waits for completion.
         let wait =
             unsafe { tk_drm_upstream::drm_syncobj_upstream::drm_syncobj_wait_fence(fence, true) };
-        // SAFETY: Releases the fence reference acquired by `tk_drm_syncobj_find_fence`.
+        // SAFETY: Releases the fence reference acquired by `drm_syncobj_find_fence`.
         unsafe { drm_syncobj_fence_put(fence) };
         if wait != 0 {
             for object in reset_objects {
                 // SAFETY: Release held syncobj reference on wait failure.
-                unsafe { tk_drm_syncobj_put(object) };
+                unsafe { drm_syncobj_put(object) };
             }
             return Err(wait);
         }
         if descriptor.flags & VIRTGPU_EXECBUF_SYNCOBJ_RESET != 0 {
             // SAFETY: `file` is a valid DRM file pointer; queries syncobj by handle with incremented reference.
-            let object = unsafe { tk_drm_syncobj_find(file, descriptor.handle) };
+            let object = unsafe { drm_syncobj_find(file, descriptor.handle) };
             if object.is_null() {
                 for object in reset_objects {
                     // SAFETY: Release held syncobj references on lookup failure.
-                    unsafe { tk_drm_syncobj_put(object) };
+                    unsafe { drm_syncobj_put(object) };
                 }
                 return Err(-ENOENT);
             }
@@ -1702,7 +1702,7 @@ fn parse_exec_output_syncobjs(
             return Err(-EINVAL);
         }
         // SAFETY: `file` is valid; queries syncobj by handle, returning a reference if found.
-        let object = unsafe { tk_drm_syncobj_find(file, descriptor.handle) };
+        let object = unsafe { drm_syncobj_find(file, descriptor.handle) };
         if object.is_null() {
             release_exec_output_syncobjs(output);
             return Err(-ENOENT);
@@ -1713,7 +1713,7 @@ fn parse_exec_output_syncobjs(
             let chain = drm_syncobj_chain_alloc();
             if chain.is_null() {
                 // SAFETY: Release lookup reference on `object` if fence chain node allocation fails.
-                unsafe { tk_drm_syncobj_put(object) };
+                unsafe { drm_syncobj_put(object) };
                 release_exec_output_syncobjs(output);
                 return Err(-ENOMEM);
             }
@@ -1735,7 +1735,7 @@ fn release_exec_output_syncobjs(output: Vec<ExecOutputSyncobj>) {
             if !entry.chain.is_null() {
                 drm_syncobj_chain_free(entry.chain);
             }
-            tk_drm_syncobj_put(entry.object);
+            drm_syncobj_put(entry.object);
         }
     }
 }

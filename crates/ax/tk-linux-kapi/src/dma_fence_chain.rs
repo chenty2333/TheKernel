@@ -311,9 +311,27 @@ pub unsafe extern "C" fn dma_fence_chain_free(chain: *mut c_void) {
     }
 }
 
-/// Walk the chain for `seqno` once the DRM-core syncobj probe has declined it.
-/// The exported `dma_fence_chain_find_seqno()` (tk-intel-gt) runs that probe
-/// first, then calls this.
+/// Linux `dma_fence_chain_find_seqno()`. The native timeline probe runs first
+/// through the installed native fence hooks; the chain walk follows.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_fence_chain_find_seqno(fence: *mut *mut DmaFence, seqno: u64) -> i32 {
+    if seqno == 0 {
+        return 0;
+    }
+    if fence.is_null() || unsafe { (*fence).is_null() } {
+        return -(crate::config::EINVAL as i32);
+    }
+    let native = match crate::dma_fence_hooks::native_fence_hooks() {
+        Some(hooks) => unsafe { (hooks.timeline_fence_find)(fence.cast(), seqno) },
+        None => 1,
+    };
+    if native != 1 {
+        return native;
+    }
+    unsafe { dma_fence_chain_find_seqno_walk(fence, seqno) }
+}
+
+/// Walk the chain for `seqno` once the native timeline probe has declined it.
 pub unsafe fn dma_fence_chain_find_seqno_walk(fence: *mut *mut DmaFence, seqno: u64) -> i32 {
     let start = unsafe { *fence };
     if !dma_fence_chain_is(start) || unsafe { (*start).seqno < seqno } {

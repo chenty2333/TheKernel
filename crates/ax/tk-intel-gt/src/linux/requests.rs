@@ -519,21 +519,3 @@ pub unsafe extern "C" fn i915_request_next(
     }
 }
 
-/// Linux `dma_fence_chain_find_seqno()`. The DRM-core syncobj probe runs here,
-/// through the DRM-core provider in `drm_core.rs`; the chain walk that follows
-/// is `tk_linux_kapi::dma_fence_chain::dma_fence_chain_find_seqno_walk`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_chain_find_seqno(fence: *mut *mut DmaFence, seqno: u64) -> i32 {
-    if seqno == 0 {
-        return 0;
-    }
-    if fence.is_null() || unsafe { (*fence).is_null() } {
-        return -(crate::linux_config::EINVAL as i32);
-    }
-    let native =
-        unsafe { crate::linux::drm_core::drm_syncobj_timeline_fence_find(fence.cast(), seqno) };
-    if native != 1 {
-        return native;
-    }
-    unsafe { tk_linux_kapi::dma_fence_chain::dma_fence_chain_find_seqno_walk(fence, seqno) }
-}

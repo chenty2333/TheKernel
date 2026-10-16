@@ -10,7 +10,12 @@
 use crate::linux_config::__GFP_NOWARN;
 use core::ffi::{c_char, c_int, c_long, c_ulong, c_void};
 
-use tk_linux_kapi::{dma_fence::{dma_fence_get, dma_fence_put}, dma_fence_array::dma_fence_array_create, dma_fence_chain::dma_fence_chain_free, dma_resv::dma_resv_reserve_fences};
+use tk_drm_upstream::drm_syncobj_upstream::{
+    drm_syncobj_add_point, drm_syncobj_fence_get, drm_syncobj_find, drm_syncobj_put,
+    drm_syncobj_replace_fence,
+};
+
+use tk_linux_kapi::{dma_fence::{dma_fence_get, dma_fence_put}, dma_fence_array::dma_fence_array_create, dma_fence_chain::{dma_fence_chain_find_seqno, dma_fence_chain_free}, dma_resv::dma_resv_reserve_fences};
 use crate::{
     guc_ads::PAGE_SIZE,
     guc_submission::MAX_ENGINE_INSTANCE,
@@ -134,7 +139,7 @@ use crate::{
         rcu::{rcu_read_lock, rcu_read_unlock},
         registers::{MI_LOAD_REGISTER_IMM, PIN_GLOBAL},
         requests::{
-            dma_fence_chain_alloc, dma_fence_chain_find_seqno,
+            dma_fence_chain_alloc,
             i915_request_get, i915_request_next, i915_request_put,
             intel_ring_advance, ptr_mask_bits, ptr_pack_bits, ptr_unpack_bits,
         },
@@ -158,16 +163,6 @@ use crate::{
 };
 
 unsafe extern "C" {
-    fn drm_syncobj_find(file: *mut DrmFile, handle: u32) -> *mut DrmSyncobj;
-    fn drm_syncobj_put(syncobj: *mut DrmSyncobj);
-    fn drm_syncobj_fence_get(syncobj: *mut DrmSyncobj) -> *mut DmaFence;
-    fn drm_syncobj_add_point(
-        syncobj: *mut DrmSyncobj,
-        chain: *mut DmaFenceChain,
-        fence: *mut DmaFence,
-        point: u64,
-    );
-    fn drm_syncobj_replace_fence(syncobj: *mut DrmSyncobj, fence: *mut DmaFence);
     fn sync_file_create(fence: *mut DmaFence) -> *mut SyncFile;
     fn sync_file_get_fence(fd: c_int) -> *mut DmaFence;
     fn get_unused_fd_flags(flags: c_int) -> c_int;
@@ -2659,7 +2654,7 @@ pub unsafe fn add_timeline_fence_array(
             return -EFAULT;
         }
         user_values = user_values.add(1);
-        let syncobj = drm_syncobj_find((*eb).file, user_fence.handle);
+        let syncobj = drm_syncobj_find((*eb).file.cast(), user_fence.handle);
         if syncobj.is_null() {
             drm_dbg!(&mut (*(*eb).i915).drm, "Invalid syncobj handle provided\n");
             return -ENOENT;
@@ -2768,7 +2763,7 @@ pub unsafe fn add_fence_array(eb: *mut I915Execbuffer) -> i32 {
         if user_fence.flags & I915_EXEC_FENCE_UNKNOWN_FLAGS != 0 {
             return -EINVAL;
         }
-        let syncobj = drm_syncobj_find((*eb).file, user_fence.handle);
+        let syncobj = drm_syncobj_find((*eb).file.cast(), user_fence.handle);
         if syncobj.is_null() {
             drm_dbg!(&mut (*(*eb).i915).drm, "Invalid syncobj handle provided\n");
             return -ENOENT;

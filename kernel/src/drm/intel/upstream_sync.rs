@@ -33,8 +33,8 @@ use crate::file::{FileLike, Kstat, add_file_like, anon_inode_stat, get_typed_fil
 unsafe extern "C" {
     /// Generic DRM syncobj refcount helpers. These have `tk_drm_` prefixes to
     /// distinguish them from the LinuxKPI native-Syncobj bridge symbols.
-    fn tk_drm_syncobj_get(syncobj: *mut c_void) -> *mut c_void;
-    fn tk_drm_syncobj_put(syncobj: *mut c_void);
+    fn drm_syncobj_get(syncobj: *mut c_void) -> *mut c_void;
+    fn drm_syncobj_put(syncobj: *mut c_void);
 }
 
 #[inline]
@@ -811,31 +811,6 @@ pub(crate) fn upstream_reservation_fence_add(resv: *mut c_void, fence: *mut DmaF
     }
 }
 
-/// Upstream `drm_syncobj_find()`: each returned raw pointer owns one Arc ref.
-///
-/// # Safety
-/// `file` must be the live DRM file supplied to the provider callback; the
-/// returned non-null handle must be released exactly once through `syncobj_put`.
-pub(crate) unsafe extern "C" fn syncobj_find(file: *mut c_void, handle: u32) -> *mut c_void {
-    let Some(native_file) = super::upstream_file::native_file(file) else {
-        return ptr::null_mut();
-    };
-    // SAFETY: native_file() exposes the pointer only during an active per-file
-    // callback binding, whose NativeFileBinding guard borrows this DrmFile.
-    let native = unsafe { &*native_file.cast::<crate::drm::DrmFile>() };
-    let Ok(object) = native.syncobj(handle) else {
-        return ptr::null_mut();
-    };
-    Arc::try_new(SyncobjBridge { object })
-        .map(Arc::into_raw)
-        .map(|bridge| bridge.cast_mut().cast())
-        .unwrap_or(ptr::null_mut())
-}
-
-struct SyncobjBridge {
-    object: Arc<Syncobj>,
-}
-
 /// VFS open-file description retaining a reference to the exact generic
 /// Linux `drm_syncobj` object. This is intentionally distinct from
 /// `SyncobjBridge`, which backs i915/native timeline operations.
@@ -850,7 +825,7 @@ impl UpstreamSyncobjFile {
         }
         // SAFETY: caller passes a live generic DRM syncobj borrowed for this
         // operation; the helper acquires the VFS OFD's independent ref.
-        let owned = unsafe { tk_drm_syncobj_get(syncobj) };
+        let owned = unsafe { drm_syncobj_get(syncobj) };
         if owned.is_null() {
             return Err(AxError::NoSuchDevice);
         }
@@ -860,7 +835,7 @@ impl UpstreamSyncobjFile {
             Ok(file) => Ok(file),
             Err(_) => {
                 // SAFETY: balance the ref acquired above after OFD allocation failed.
-                unsafe { tk_drm_syncobj_put(owned) };
+                unsafe { drm_syncobj_put(owned) };
                 Err(AxError::NoMemory)
             }
         }
@@ -868,7 +843,7 @@ impl UpstreamSyncobjFile {
 
     fn get_ref(&self) -> *mut c_void {
         // SAFETY: the VFS OFD owns this generic syncobj reference throughout the call.
-        unsafe { tk_drm_syncobj_get(self.syncobj as *mut c_void) }
+        unsafe { drm_syncobj_get(self.syncobj as *mut c_void) }
     }
 }
 
@@ -876,7 +851,7 @@ impl Drop for UpstreamSyncobjFile {
     fn drop(&mut self) {
         if self.syncobj != 0 {
             // SAFETY: the VFS OFD owns exactly this reference until final drop.
-            unsafe { tk_drm_syncobj_put(self.syncobj as *mut c_void) };
+            unsafe { drm_syncobj_put(self.syncobj as *mut c_void) };
         }
     }
 }
@@ -944,122 +919,6 @@ pub extern "C" fn thekernel_drm_syncobj_import_fd(fd: c_int) -> *mut c_void {
     syncobj
 }
 
-///
-/// # Safety
-/// A non-null handle must be an outstanding `Arc::into_raw` result from
-/// `syncobj_find` or `syncobj_create`, retained by the caller for the borrow.
-unsafe fn syncobj_bridge<'a>(syncobj: *mut c_void) -> Option<&'a SyncobjBridge> {
-    if syncobj.is_null() {
-        None
-    } else {
-        // SAFETY: callers receive these opaque handles only from syncobj_find/create;
-        // their matching put callback owns the Arc reference for the whole call.
-        Some(unsafe { &*syncobj.cast::<SyncobjBridge>() })
-    }
-}
-
-/// Linux DRM-core internal syncobj creation, used by i915 contexts.
-///
-/// # Safety
-/// `out` must point to a writable output slot valid for this call;
-/// a non-null `fence` must be a live `dma_fence` reference owned by the caller.
-pub(crate) unsafe extern "C" fn syncobj_create(
-    out: *mut *mut c_void,
-    flags: u32,
-    fence: *mut c_void,
-) -> c_int {
-    if out.is_null() || flags & !1 != 0 {
-        return -EINVAL;
-    }
-    let object = Syncobj::new(flags & 1 != 0);
-    if !fence.is_null() {
-        match kernel_fence_for_dma(fence.cast()) {
-            Ok(fence) => object.import_fence(fence),
-            Err(_) => return -ENOMEM,
-        }
-    }
-    let Ok(bridge) = Arc::try_new(SyncobjBridge { object }) else {
-        return -ENOMEM;
-    };
-    // SAFETY: the DRM callback contract supplies a writable output slot; bridge's
-    // raw Arc reference is intentionally transferred to the caller for syncobj_put.
-    unsafe { out.write(Arc::into_raw(bridge).cast_mut().cast()) };
-    0
-}
-
-/// Replace a binary native syncobj payload with a DMA-fence completion view.
-///
-/// # Safety
-/// `syncobj` must be an outstanding handle from `syncobj_find/create`; a
-/// non-null `fence` must be a live DMA-fence reference for the call duration.
-pub(crate) unsafe extern "C" fn syncobj_replace_fence(syncobj: *mut c_void, fence: *mut c_void) {
-    // SAFETY: upstream invokes this callback with a live handle returned by find/create.
-    let Some(syncobj) = (unsafe { syncobj_bridge(syncobj) }) else {
-        return;
-    };
-    if fence.is_null() {
-        syncobj.object.reset();
-        return;
-    }
-    let fence = require_bridge(
-        kernel_fence_for_dma(fence.cast()),
-        "i915 syncobj fence mirror",
-    );
-    syncobj.object.import_fence(fence);
-}
-
-/// Add a timeline point to the native syncobj. The native immutable chain is
-/// the authoritative predecessor chain; the allocated upstream node is freed
-/// after its fence payload has been imported.
-///
-/// # Safety
-/// `syncobj` must be an outstanding handle; non-null `chain` and `fence` must
-/// be live LinuxKPI objects owned by the caller for this callback.
-pub(crate) unsafe extern "C" fn syncobj_add_point(
-    syncobj: *mut c_void,
-    chain: *mut c_void,
-    fence: *mut c_void,
-    point: u64,
-) {
-    // SAFETY: upstream invokes this callback with a live handle returned by find/create.
-    let Some(syncobj) = (unsafe { syncobj_bridge(syncobj) }) else {
-        return;
-    };
-    if fence.is_null() || point == 0 {
-        return;
-    }
-    let fence = require_bridge(
-        kernel_fence_for_dma(fence.cast()),
-        "i915 timeline fence mirror",
-    );
-    require_bridge(
-        syncobj.object.submit_point(point, fence),
-        "i915 syncobj timeline point",
-    );
-    if !chain.is_null() {
-        // SAFETY: non-null chain is the owned node handed to this callback by i915;
-        // its fence was imported before the source node is discarded.
-        unsafe { dma_fence_chain_free(chain) };
-    }
-}
-
-/// Get a Linux reference to the current native syncobj fence, if one exists.
-///
-/// # Safety
-/// `syncobj` must be an outstanding handle from `syncobj_find/create`.
-pub(crate) unsafe extern "C" fn syncobj_fence_get(syncobj: *mut c_void) -> *mut c_void {
-    // SAFETY: upstream invokes this callback with a live handle returned by find/create.
-    let Some(syncobj) = (unsafe { syncobj_bridge(syncobj) }) else {
-        return ptr::null_mut();
-    };
-    match syncobj.object.latest_fence() {
-        Some(fence) => native_syncobj_fence_to_dma(syncobj.object.clone(), fence)
-            .map(|fence| fence.cast())
-            .unwrap_or(ptr::null_mut()),
-        None => ptr::null_mut(),
-    }
-}
-
 /// Resolve an i915 timeline wait point on a native syncobj fence wrapper.
 /// Return 1 when the input is not ours so Linux's ordinary chain walker can
 /// handle it; otherwise return 0 or a Linux-style negative errno.
@@ -1103,19 +962,6 @@ pub(crate) unsafe extern "C" fn syncobj_timeline_fence_find(
         dma_fence_put(current);
     }
     0
-}
-
-/// Drop one reference returned by `syncobj_find` or `syncobj_create`.
-///
-/// # Safety
-/// A non-null `syncobj` must be one outstanding raw Arc reference returned by
-/// `syncobj_find/create`, and must not have been passed to `syncobj_put` before.
-pub(crate) unsafe extern "C" fn syncobj_put(syncobj: *mut c_void) {
-    if !syncobj.is_null() {
-        // SAFETY: find/create transfer exactly one Arc::into_raw reference to each
-        // non-null handle, and DRM calls put once for that owned reference.
-        unsafe { drop(Arc::from_raw(syncobj.cast::<SyncobjBridge>())) };
-    }
 }
 
 const _: () = {
@@ -1187,7 +1033,7 @@ mod tests {
         assert_ne!(create.handle, 0);
 
         let object = unsafe {
-            tk_drm_upstream::drm_syncobj_upstream::tk_drm_syncobj_find(&mut file, create.handle)
+            tk_drm_upstream::drm_syncobj_upstream::drm_syncobj_find(&mut file, create.handle)
         };
         assert!(!object.is_null());
         // SAFETY: `find` returns one independently owned syncobj reference.
@@ -1227,12 +1073,12 @@ mod tests {
             "closing the fd drops its owner ref"
         );
         let still_live = unsafe {
-            tk_drm_upstream::drm_syncobj_upstream::tk_drm_syncobj_find(&mut file, create.handle)
+            tk_drm_upstream::drm_syncobj_upstream::drm_syncobj_find(&mut file, create.handle)
         };
         assert_eq!(still_live, Arc::as_ptr(&base).cast_mut());
-        unsafe { tk_drm_upstream::drm_syncobj_upstream::tk_drm_syncobj_put(still_live) };
+        unsafe { tk_drm_upstream::drm_syncobj_upstream::drm_syncobj_put(still_live) };
         drop(base);
-        unsafe { tk_drm_upstream::drm_syncobj_upstream::tk_drm_syncobj_release(&mut file) };
+        unsafe { tk_drm_upstream::drm_syncobj_upstream::drm_syncobj_release(&mut file) };
 
         assert!(matches!(table.get_description(i32::MAX), Err(AxError::BadFileDescriptor)));
     }

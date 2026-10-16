@@ -18,7 +18,7 @@ use core::{
 
 use tk_linux_kapi::{
     dma_fence::{dma_fence_free, dma_fence_get, dma_fence_init, dma_fence_put, dma_fence_set_error, dma_fence_signal},
-    dma_resv::{dma_resv_add_fence_native, dma_resv_reserve_fences},
+    dma_resv::{dma_resv_add_fence, dma_resv_reserve_fences},
 };
 
 use crate::{
@@ -325,20 +325,6 @@ pub unsafe fn dma_fence_work_commit_imm(work: *mut DmaFenceWork) {
 
 /// Reserve capacity in the native reservation list. The backing allocation is
 /// real and all later fence insertion paths retain a reference.
-/// Insert a fence into the reservation and retain its ownership reference.
-///
-/// The insertion is kapi's `dma_resv_add_fence_native`. The DRM-core alias
-/// mirror then runs through the installed DRM-core provider, which is owned
-/// here by `linux::drm_core` (it rejects reservations not registered as
-/// aliases), so the exported `dma_resv_add_fence` stays in tk-intel-gt.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_resv_add_fence(resv: *mut DmaResv, fence: *mut DmaFence, usage: u32) {
-    unsafe { dma_resv_add_fence_native(resv.cast(), fence, usage) };
-    // The native kernel may also own a display/KMS alias of this exact GEM
-    // object. Mirror only through the installed DRM-core provider, which
-    // rejects reservations that were not explicitly registered as aliases.
-    unsafe { crate::linux::drm_core::drm_resv_fence_add(resv.cast(), fence.cast(), usage) };
-}
 
 static CLFLUSH_WORK_OPS: DmaFenceWorkOps = DmaFenceWorkOps {
     name: CLFLUSH_NAME.as_ptr().cast(),

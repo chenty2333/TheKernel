@@ -108,7 +108,6 @@ macro_rules! kernel_only_test_service {
     };
 }
 
-kernel_only_test_service!(dma_fence_chain_find_seqno(fence: *mut *mut DmaFence, point: u64) -> i32);
 kernel_only_test_service!(thekernel_eventfd_signal(ctx: *mut c_void, count: u64) -> i32);
 kernel_only_test_service!(thekernel_eventfd_ctx_put(ctx: *mut c_void) -> ());
 kernel_only_test_service!(thekernel_eventfd_ctx_fdget(fd: i32) -> *mut c_void);

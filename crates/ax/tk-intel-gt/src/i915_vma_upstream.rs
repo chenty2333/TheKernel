@@ -7,6 +7,7 @@
 
 #![allow(unsafe_code, non_snake_case, non_camel_case_types, dead_code)]
 
+use tk_linux_kapi::dma_resv::dma_resv_add_fence;
 use core::{
     ffi::{c_char, c_int, c_long, c_ulong, c_void},
     mem::{offset_of, size_of},
@@ -23,7 +24,7 @@ use crate::{
     },
     i915_gem_clflush_upstream::{
         DmaFenceWork, DmaFenceWorkOps, dma_fence_work_chain,
-        dma_fence_work_commit, dma_fence_work_commit_imm, dma_fence_work_init, dma_resv_add_fence,
+        dma_fence_work_commit, dma_fence_work_commit_imm, dma_fence_work_init,
     },
     i915_gem_core_upstream::{io_mapping_map_wc, io_mapping_unmap},
     i915_gem_lmem_upstream::{i915_gem_object_is_lmem, i915_gem_object_lmem_io_map},

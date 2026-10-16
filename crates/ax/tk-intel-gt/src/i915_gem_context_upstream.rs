@@ -18,6 +18,8 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
 
+use tk_drm_upstream::drm_syncobj_upstream::{drm_syncobj_create, drm_syncobj_put};
+
 use crate::{
     i915_gem_object_api_upstream::i915_gem_object_put,
     i915_gem_context_types_upstream::{
@@ -336,8 +338,6 @@ unsafe extern "C" {
     fn i915_request_active_engine(rq: *mut I915Request, engine: *mut *mut IntelEngineCs) -> bool;
     fn i915_gem_object_get(obj: *mut DrmI915GemObject) -> *mut DrmI915GemObject;
     fn i915_vma_close(vma: *mut I915Vma);
-    fn drm_syncobj_create(syncobj: *mut *mut c_void, flags: u32, fence: *mut DmaFence) -> c_int;
-    fn drm_syncobj_put(syncobj: *mut c_void);
     fn i915_drm_client_get(client: *mut I915DrmClient) -> *mut I915DrmClient;
     fn i915_drm_client_put(client: *mut I915DrmClient);
     fn i915_user_extensions(
