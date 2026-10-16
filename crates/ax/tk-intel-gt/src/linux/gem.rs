@@ -12,16 +12,16 @@ use crate::{
     i915_gem_context_types_upstream::I915GemContext,
     i915_gem_ww_upstream::WwAcquireCtx,
     intel_context_types_upstream::File,
-    intel_context_upstream::{DmaFence, DrmGemObjectBaseLayout, DrmVmaOffsetNode, Kref},
-    intel_engine_cs_upstream::{ListHead, Spinlock},
+    intel_context_upstream::{DmaFence, DrmVmaOffsetNode, Kref},
+    intel_engine_cs_upstream::ListHead,
     linux::ww_mutex::{ww_mutex_lock, ww_mutex_lock_slow, ww_mutex_trylock, ww_mutex_unlock},
     linux_i915_private::{DrmVmaOffsetManager, Inode},
 };
 
-/// The C type name used by DRM/i915 call sites for the 480-byte base union.
-/// Accessed `drm_gem_object` fields use the Linux 7.2.3 x86_64 record layout;
-/// opaque storage preserves the larger `ttm_buffer_object` union size.
-pub type DrmGemObject = DrmGemObjectBaseLayout;
+/// Canonical Linux 7.2.3 `struct drm_gem_object` (tk-drm-upstream, 368 bytes).
+/// The 480-byte i915 base union is `DrmI915GemObjectBase`; its TTM arm is
+/// `TtmBufferObjectLayout`.
+pub use tk_drm_upstream::drm_gem_types::DrmGemObject;
 
 /// `drm_gem_is_imported()` from `include/drm/drm_gem.h`.
 #[inline]
@@ -147,7 +147,7 @@ const _: [(); 32] = [(); offset_of!(DmaResv, fences)];
 /// `dma_resv_lock()` source-order API. The current task model has no POSIX
 /// signal delivery; interruptible callers otherwise use the same wait path.
 pub unsafe fn dma_resv_lock(
-    resv: *mut c_void,
+    resv: *mut DmaResv,
     ctx: *mut WwAcquireCtx,
     _intr: bool,
     try_only: bool,
@@ -165,19 +165,19 @@ pub unsafe fn dma_resv_lock(
 }
 
 /// `dma_resv_lock_slow()` after the WW caller has dropped all other locks.
-pub unsafe fn dma_resv_lock_slow(resv: *mut c_void, ctx: *mut WwAcquireCtx) {
+pub unsafe fn dma_resv_lock_slow(resv: *mut DmaResv, ctx: *mut WwAcquireCtx) {
     let lock = unsafe { core::ptr::addr_of_mut!((*resv.cast::<DmaResv>()).lock) };
     unsafe { ww_mutex_lock_slow(lock, ctx) };
 }
 
 /// Interruptible source API. Signals are not part of the active task model.
-pub unsafe fn dma_resv_lock_slow_interruptible(resv: *mut c_void, ctx: *mut WwAcquireCtx) -> i32 {
+pub unsafe fn dma_resv_lock_slow_interruptible(resv: *mut DmaResv, ctx: *mut WwAcquireCtx) -> i32 {
     unsafe { dma_resv_lock_slow(resv, ctx) };
     0
 }
 
 /// `dma_resv_unlock()` releases the underlying WW mutex.
-pub unsafe fn dma_resv_unlock(resv: *mut c_void) {
+pub unsafe fn dma_resv_unlock(resv: *mut DmaResv) {
     let lock = unsafe { core::ptr::addr_of_mut!((*resv.cast::<DmaResv>()).lock) };
     unsafe { ww_mutex_unlock(lock) };
 }
@@ -187,7 +187,7 @@ pub unsafe fn dma_resv_unlock(resv: *mut c_void) {
 /// this with `thekernel_dma_resv_unlock` on every success/error path.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thekernel_dma_resv_lock(resv: *mut c_void) -> i32 {
-    unsafe { dma_resv_lock(resv, core::ptr::null_mut(), false, false) }
+    unsafe { dma_resv_lock(resv.cast(), core::ptr::null_mut(), false, false) }
 }
 
 /// Try-acquire helper used by native cross-layer transactions. Multi-object
@@ -195,13 +195,13 @@ pub unsafe extern "C" fn thekernel_dma_resv_lock(resv: *mut c_void) -> i32 {
 /// sleeping while holding a prefix with a conflicting i915 WW lock order.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thekernel_dma_resv_trylock(resv: *mut c_void) -> i32 {
-    unsafe { dma_resv_lock(resv, core::ptr::null_mut(), false, true) }
+    unsafe { dma_resv_lock(resv.cast(), core::ptr::null_mut(), false, true) }
 }
 
 /// Cross-crate pair for `thekernel_dma_resv_lock`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thekernel_dma_resv_unlock(resv: *mut c_void) {
-    unsafe { dma_resv_unlock(resv) };
+    unsafe { dma_resv_unlock(resv.cast()) };
 }
 
 /// `struct drm_device` (tk-drm-upstream mirror); `dev` is at offset 8.
@@ -291,30 +291,9 @@ pub unsafe fn i915_gem_to_ttm(
     unsafe { core::ptr::addr_of_mut!((*obj).base.__do_not_access).cast() }
 }
 
-/// Linux 7.2.3 `struct drm_file` prefix through `driver_priv`.
-///
-/// Keep this canonical view shared by i915 paths that inspect DRM object
-/// handles, per-file driver data, or the backing `struct file`.
-#[repr(C)]
-pub struct DrmFile {
-    _before_minor: [u8; 72],
-    pub minor: *mut DrmMinor,
-    pub object_idr: [u8; 24],
-    pub table_lock: Spinlock,
-    _syncobj_xa_alignment: u32,
-    pub(crate) _syncobj_xa: [u64; 2],
-    pub filp: *mut crate::linux::shmem::File,
-    pub driver_priv: *mut core::ffi::c_void,
-    _tail: [u8; 224],
-}
-
-#[repr(C)]
-pub struct DrmMinor {
-    _index: i32,
-    _type: i32,
-    _kdev: *mut core::ffi::c_void,
-    pub dev: *mut core::ffi::c_void,
-}
+/// Canonical Linux 7.2.3 `struct drm_file` (tk-drm-upstream); `minor` is at
+/// offset 72, `filp` at 128, `driver_priv` at 136.
+pub use tk_drm_upstream::drm_file_types::{DrmFile, DrmMinor};
 
 /// Serialize access to the canonical Linux `drm_file.object_idr` while a
 /// caller updates the GEM handle table.
@@ -417,7 +396,7 @@ pub unsafe fn drm_gem_object_close(object: *mut DrmGemObject, file: *mut DrmFile
 const _: [(); 72] = [(); offset_of!(DrmFile, minor)];
 const _: [(); 80] = [(); offset_of!(DrmFile, object_idr)];
 const _: [(); 104] = [(); offset_of!(DrmFile, table_lock)];
-const _: [(); 112] = [(); offset_of!(DrmFile, _syncobj_xa)];
+const _: [(); 112] = [(); offset_of!(DrmFile, syncobj_xa)];
 const _: [(); 128] = [(); offset_of!(DrmFile, filp)];
 const _: [(); 136] = [(); offset_of!(DrmFile, driver_priv)];
 const _: [(); 368] = [(); size_of::<DrmFile>()];
@@ -448,9 +427,15 @@ pub struct I915LutHandle {
     pub handle: u32,
 }
 
-const _: [(); 480] = [(); size_of::<DrmGemObject>()];
+const _: [(); 368] = [(); size_of::<DrmGemObject>()];
 const _: [(); 8] = [(); align_of::<DrmGemObject>()];
 const _: [(); 8] = [(); offset_of!(DrmGemObject, dev)];
+const _: [(); 16] = [(); offset_of!(DrmGemObject, filp)];
+const _: [(); 216] = [(); offset_of!(DrmGemObject, size)];
+const _: [(); 248] = [(); offset_of!(DrmGemObject, resv)];
+const _: [(); 336] = [(); offset_of!(DrmGemObject, funcs)];
+const _: [(); 480] = [(); size_of::<crate::i915_gem_object_types_upstream::DrmI915GemObjectBase>()];
+const _: [(); 480] = [(); size_of::<TtmBufferObjectLayout>()];
 const _: [(); 1560] = [(); size_of::<DrmDevice>()];
 const _: [(); 8] = [(); offset_of!(DrmDevice, dev)];
 

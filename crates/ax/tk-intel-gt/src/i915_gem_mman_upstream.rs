@@ -26,6 +26,7 @@
 //! source-derived ABI.
 #![allow(unsafe_code, unsafe_op_in_unsafe_fn, non_snake_case)]
 
+use crate::linux::gem::DrmGemObject;
 use crate::linux::mm_native::{vm_mmap, find_vma, mmap_write_lock_killable, mmap_write_unlock};
 use crate::linux::i915_trace::trace_i915_gem_object_fault;
 use crate::linux::gem::{drm_vma_offset_lock_lookup,drm_vma_offset_unlock_lookup};
@@ -43,7 +44,7 @@ use crate::{
         __i915_vma_unpin, i915_vma_pin_fence, i915_vma_revoke_mmap, i915_vma_unpin_fence,
         i915_vma_set_ggtt_write, i915_vma_set_userfault,
     },
-    intel_context_upstream::{DrmGemObjectBaseLayout, I915GttView},
+    intel_context_upstream::{I915GttView},
     intel_context_types_upstream::File,
     intel_context_api_upstream::mutex_lock_interruptible,
     i915_gem_context_upstream::{fput, I915UserExtension},
@@ -300,7 +301,7 @@ pub unsafe fn i915_mmap_page_set(
         || !unsafe { i915_gem_object_has_struct_page(obj) }
         || relative_page
             .checked_add(count)
-            .is_none_or(|end| end > unsafe { (&(*obj).base.base).size >> PAGE_SHIFT })
+            .is_none_or(|end| end > unsafe { (&(*obj).base.base).size as u64 >> PAGE_SHIFT })
         || (writable && unsafe { i915_gem_object_is_readonly(obj) })
     {
         unsafe { i915_gem_object_put(obj) };
@@ -359,7 +360,7 @@ pub unsafe fn i915_object_page_set(obj: *mut DrmI915GemObject) -> Result<MmapPag
         return Err(-EINVAL);
     }
     let obj = unsafe { i915_gem_object_get(obj) };
-    let bytes = unsafe { (&(*obj).base.base).size };
+    let bytes = unsafe { (&(*obj).base.base).size as u64 };
     if bytes == 0
         || !bytes.is_multiple_of(PAGE_SIZE_U64)
         || !unsafe { i915_gem_object_has_struct_page(obj) }
@@ -547,9 +548,9 @@ unsafe fn compute_partial_view(
     view.info.partial.offset = round_down(page_offset, chunk as u64);
     view.info.partial.size = core::cmp::min(
         chunk,
-        (((&(*obj).base.base).size >> PAGE_SHIFT) - view.info.partial.offset) as u32,
+        (((&(*obj).base.base).size as u64 >> PAGE_SHIFT) - view.info.partial.offset) as u32,
     );
-    if chunk as u64 >= ((&(*obj).base.base).size >> PAGE_SHIFT) {
+    if chunk as u64 >= ((&(*obj).base.base).size as u64 >> PAGE_SHIFT) {
         view.r#type = I915_GTT_VIEW_NORMAL as u32;
     }
     view
@@ -649,7 +650,7 @@ unsafe extern "C" fn vm_fault_gtt(vmf: *mut VmFault) -> u32 {
     let area = (*vmf).vma;
     let mmo = (*area).vm_private_data.cast::<I915MmapOffset>();
     let obj = (*mmo).obj;
-    let i915 = to_i915((&(*obj).base.base).dev);
+    let i915 = to_i915((&(*obj).base.base).dev.cast());
     let rpm = core::ptr::addr_of_mut!((*i915).runtime_pm).cast::<IntelRuntimePm>();
     let ggtt = (*to_gt(i915)).ggtt;
     let write = (*area).vm_flags & VM_WRITE != 0;
@@ -812,7 +813,7 @@ unsafe extern "C" fn vm_access(area: *mut VmAreaStruct, addr: c_ulong, buf: *mut
     let obj = (*mmo).obj;
     if i915_gem_object_is_readonly(obj) && write != 0 { return -EACCES; }
     let obj_addr = addr - (*area).vm_start;
-    if range_overflows_t(obj_addr as u64, len as u64, (&(*obj).base.base).size) { return -EINVAL; }
+    if range_overflows_t(obj_addr as u64, len as u64, (&(*obj).base.base).size as u64) { return -EINVAL; }
     let mut ww: I915GemWwCtx = core::mem::zeroed();
     i915_gem_ww_ctx_init(&mut ww, true);
     'retry: loop {
@@ -850,7 +851,7 @@ pub unsafe fn __i915_gem_object_release_mmap_gtt(obj: *mut DrmI915GemObject) {
 
 // upstream: i915_gem_mman.c i915_gem_object_release_mmap_gtt()
 pub unsafe fn i915_gem_object_release_mmap_gtt(obj: *mut DrmI915GemObject) {
-    let i915 = to_i915((&(*obj).base.base).dev);
+    let i915 = to_i915((&(*obj).base.base).dev.cast());
     let rpm = core::ptr::addr_of_mut!((*i915).runtime_pm).cast::<IntelRuntimePm>();
     let wakeref = intel_runtime_pm_get(rpm);
     let ggtt = (*to_gt(i915)).ggtt;
@@ -936,7 +937,7 @@ unsafe fn insert_mmo(obj: *mut DrmI915GemObject, mmo: *mut I915MmapOffset) -> *m
 
 // upstream: i915_gem_mman.c mmap_offset_attach()
 unsafe fn mmap_offset_attach(obj: *mut DrmI915GemObject, mmap_type: I915MmapType, file: *mut DrmFile) -> *mut I915MmapOffset {
-    let i915 = to_i915((&(*obj).base.base).dev);
+    let i915 = to_i915((&(*obj).base.base).dev.cast());
     GEM_BUG_ON!((*(*obj).ops).mmap_offset.is_some() || !(*(*obj).ops).mmap_ops.is_null());
     let mut mmo = lookup_mmo(obj, mmap_type);
     if mmo.is_null() {
@@ -948,7 +949,7 @@ unsafe fn mmap_offset_attach(obj: *mut DrmI915GemObject, mmap_type: I915MmapType
 
         let manager = (*(&(*obj).base.base).dev.cast::<DrmDevice>()).vma_offset_manager;
         let mut err = drm_vma_offset_add(manager, &mut (*mmo).vma_node,
-            (&(*obj).base.base).size / PAGE_SIZE_U64);
+            (&(*obj).base.base).size as u64 / PAGE_SIZE_U64);
         if unlikely(err != 0) {
             // Reap dead objects once, then retry the vma-space allocation.
             err = intel_gt_retire_requests_timeout(
@@ -962,7 +963,7 @@ unsafe fn mmap_offset_attach(obj: *mut DrmI915GemObject, mmap_type: I915MmapType
             }
             i915_gem_drain_freed_objects(i915);
             err = drm_vma_offset_add(manager, &mut (*mmo).vma_node,
-                (&(*obj).base.base).size / PAGE_SIZE_U64);
+                (&(*obj).base.base).size as u64 / PAGE_SIZE_U64);
             if err != 0 {
                 kfree(mmo.cast::<c_void>());
                 return ERR_PTR!(err);
@@ -1101,7 +1102,7 @@ unsafe fn mmap_singleton(i915: *mut DrmI915Private) -> *mut File {
 
 // upstream: i915_gem_mman.c i915_gem_object_mmap()
 unsafe fn i915_gem_object_mmap(obj: *mut DrmI915GemObject, mmo: *mut I915MmapOffset, vma: *mut VmAreaStruct) -> c_int {
-    let i915 = to_i915((&(*obj).base.base).dev);
+    let i915 = to_i915((&(*obj).base.base).dev.cast());
     let dev = &mut (*i915).drm;
     if i915_gem_object_is_readonly(obj) {
         if (*vma).vm_flags & VM_WRITE != 0 { i915_gem_object_put(obj); return -EINVAL; }
@@ -1147,7 +1148,7 @@ pub unsafe fn i915_gem_mmap(filp: *mut File, vma: *mut VmAreaStruct) -> c_int {
             obj = i915_gem_object_get_rcu((*mmo).obj);
             GEM_BUG_ON!(!obj.is_null() && !(*(*obj).ops).mmap_ops.is_null());
         } else {
-            obj = i915_gem_object_get_rcu(container_of!(node, DrmGemObjectBaseLayout, vma_node).cast::<DrmI915GemObject>());
+            obj = i915_gem_object_get_rcu(container_of!(node, DrmGemObject, vma_node).cast::<DrmI915GemObject>());
             GEM_BUG_ON!(!obj.is_null() && (*(*obj).ops).mmap_ops.is_null());
         }
     }
@@ -1159,14 +1160,14 @@ pub unsafe fn i915_gem_mmap(filp: *mut File, vma: *mut VmAreaStruct) -> c_int {
 
 // upstream: i915_gem_mman.c i915_gem_fb_mmap()
 pub unsafe fn i915_gem_fb_mmap(obj: *mut DrmI915GemObject, vma: *mut VmAreaStruct) -> c_int {
-    let i915 = to_i915((&(*obj).base.base).dev);
+    let i915 = to_i915((&(*obj).base.base).dev.cast());
     let dev = &mut (*i915).drm;
     let mut mmo: *mut I915MmapOffset = core::ptr::null_mut();
     let ggtt = (*to_gt(i915)).ggtt;
     if drm_dev_is_unplugged(core::ptr::addr_of_mut!((*i915).drm).cast()) { return -ENODEV; }
     if !(*(*obj).ops).mmap_ops.is_null() {
         let drm_gem = core::ptr::addr_of_mut!((*obj).base.base)
-            .cast::<DrmGemObjectBaseLayout>();
+            .cast::<DrmGemObject>();
         (*vma).vm_pgoff += drm_vma_node_start(core::ptr::addr_of!((*drm_gem).vma_node));
     } else {
         let mmap_type = if i915_ggtt_has_aperture(ggtt) { I915MmapType::I915_MMAP_TYPE_GTT } else { I915MmapType::I915_MMAP_TYPE_WC };

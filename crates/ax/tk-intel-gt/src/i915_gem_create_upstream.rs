@@ -228,7 +228,7 @@ unsafe fn i915_gem_publish(
     if ret != 0 {
         return ret;
     }
-    unsafe { *size_p = size };
+    unsafe { *size_p = size as u64 };
     0
 }
 
@@ -287,7 +287,7 @@ unsafe fn __i915_gem_object_create_user_ext(
         return ERR_PTR(ret);
     }
 
-    GEM_BUG_ON!(size != unsafe { (&(*obj).base.base).size });
+    GEM_BUG_ON!(size != unsafe { (&(*obj).base.base).size as u64 });
     unsafe { (*obj).flags |= ext_flags as c_ulong };
     unsafe { trace_i915_gem_object_create(obj) };
     obj

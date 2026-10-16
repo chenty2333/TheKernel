@@ -295,7 +295,7 @@ unsafe fn assert_object_held(_obj: *const DrmI915GemObject) {
 #[inline]
 unsafe fn gem_base(
     obj: *mut DrmI915GemObject,
-) -> *mut crate::intel_context_upstream::DrmGemObjectBaseLayout {
+) -> *mut crate::linux::gem::DrmGemObject {
     unsafe { intel_bo_to_drm_bo(obj) }
 }
 
@@ -357,7 +357,7 @@ pub unsafe fn i915_gem_get_aperture_ioctl(
 // upstream: i915_gem.c i915_gem_object_unbind()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn i915_gem_object_unbind(obj: *mut DrmI915GemObject, flags: c_ulong) -> c_int {
-    let i915 = to_i915((*gem_base(obj)).dev);
+    let i915 = to_i915((*gem_base(obj)).dev.cast());
     let rpm = core::ptr::addr_of_mut!((*i915).runtime_pm);
     let vm_trylock = flags & I915_GEM_OBJECT_UNBIND_VM_TRYLOCK != 0;
     let mut still_in_list = ListHead {
@@ -524,7 +524,7 @@ unsafe fn i915_gem_gtt_prepare(
     node: *mut DrmMmNode,
     write: bool,
 ) -> *mut I915Vma {
-    let i915 = to_i915((*gem_base(obj)).dev);
+    let i915 = to_i915((*gem_base(obj)).dev.cast());
     let ggtt = (*to_gt(i915)).ggtt.cast::<I915Ggtt>();
     let mut vma: *mut I915Vma;
     let mut ww = core::mem::MaybeUninit::<I915GemWwCtx>::uninit();
@@ -594,7 +594,7 @@ unsafe fn i915_gem_gtt_cleanup(
     node: *mut DrmMmNode,
     vma: *mut I915Vma,
 ) {
-    let i915 = to_i915((*gem_base(obj)).dev);
+    let i915 = to_i915((*gem_base(obj)).dev.cast());
     let ggtt = (*to_gt(i915)).ggtt.cast::<I915Ggtt>();
     i915_gem_object_unpin_pages(obj);
     if drm_mm_node_allocated(&*node) {
@@ -607,7 +607,7 @@ unsafe fn i915_gem_gtt_cleanup(
 
 // upstream: i915_gem.c i915_gem_gtt_pread()
 unsafe fn i915_gem_gtt_pread(obj: *mut DrmI915GemObject, args: *const GemPreadArgs) -> c_int {
-    let i915 = to_i915((*gem_base(obj)).dev);
+    let i915 = to_i915((*gem_base(obj)).dev.cast());
     let ggtt = (*to_gt(i915)).ggtt.cast::<I915Ggtt>();
     let mut remain: c_ulong = 0;
     let mut offset: c_ulong = 0;
@@ -686,7 +686,7 @@ pub unsafe fn i915_gem_pread_ioctl(
         return -ENOENT;
     }
     let size = (*gem_base(obj)).size;
-    if range_overflows_t_u64((*args).offset, (*args).size, size) {
+    if range_overflows_t_u64((*args).offset, (*args).size, size as u64) {
         i915_gem_object_put(obj);
         return -EINVAL;
     }
@@ -740,7 +740,7 @@ unsafe fn i915_gem_gtt_pwrite_fast(
     obj: *mut DrmI915GemObject,
     args: *const GemPwriteArgs,
 ) -> c_int {
-    let i915 = to_i915((*gem_base(obj)).dev);
+    let i915 = to_i915((*gem_base(obj)).dev.cast());
     let ggtt = (*to_gt(i915)).ggtt.cast::<I915Ggtt>();
     let rpm = core::ptr::addr_of_mut!((*i915).runtime_pm).cast();
     let mut remain: c_ulong = 0;
@@ -903,7 +903,7 @@ pub unsafe fn i915_gem_pwrite_ioctl(
         return -ENOENT;
     }
     let size = (*gem_base(obj)).size;
-    if range_overflows_t_u64((*args).offset, (*args).size, size) {
+    if range_overflows_t_u64((*args).offset, (*args).size, size as u64) {
         i915_gem_object_put(obj);
         return -EINVAL;
     }
@@ -1005,14 +1005,14 @@ pub unsafe fn i915_gem_object_ggtt_pin_ww(
     alignment: u64,
     flags: u64,
 ) -> *mut I915Vma {
-    let i915 = to_i915((*gem_base(obj)).dev);
+    let i915 = to_i915((*gem_base(obj)).dev.cast());
     let ggtt = (*to_gt(i915)).ggtt.cast::<I915Ggtt>();
     GEM_WARN_ON!(ww.is_null());
     if flags & PIN_MAPPABLE != 0 && (view.is_null() || (*view).r#type == 0) {
-        if (*gem_base(obj)).size > (*ggtt).mappable_end {
+        if (*gem_base(obj)).size as u64 > (*ggtt).mappable_end {
             return ERR_PTR::<I915Vma>(-E2BIG);
         }
-        if flags & PIN_NONBLOCK != 0 && (*gem_base(obj)).size > (*ggtt).mappable_end / 2 {
+        if flags & PIN_NONBLOCK != 0 && (*gem_base(obj)).size as u64 > (*ggtt).mappable_end / 2 {
             return ERR_PTR::<I915Vma>(-ENOSPC);
         }
     }

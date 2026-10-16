@@ -60,7 +60,7 @@ unsafe fn intel_fb_pin_to_dpt(
 ) -> *mut I915Vma {
     unsafe {
         let obj = to_intel_bo(obj_.cast());
-        let i915 = to_i915((&(*obj).base.base).dev);
+        let i915 = to_i915((&(*obj).base.base).dev.cast());
         let vm = i915_dpt_to_vm(dpt);
 
         // We are not syncing against the binding (and potential migrations)
@@ -165,7 +165,7 @@ unsafe fn intel_fb_pin_to_ggtt(
 ) -> *mut I915Vma {
     unsafe {
         let obj = to_intel_bo(obj_.cast());
-        let i915 = to_i915((&(*obj).base.base).dev);
+        let i915 = to_i915((&(*obj).base.base).dev.cast());
 
         if drm_WARN_ON!(&mut (*i915).drm, !i915_gem_object_is_framebuffer(obj)) {
             return ERR_PTR(-EINVAL);

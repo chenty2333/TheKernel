@@ -133,7 +133,7 @@ unsafe fn object_put(obj: *mut DrmI915GemObject) {
 #[inline]
 unsafe fn object_lock_interruptible(obj: *mut DrmI915GemObject) -> i32 {
     let resv = unsafe { (*gem_base(obj)).resv };
-    let ret = unsafe { ww_mutex_lock_interruptible(resv, core::ptr::null_mut()) };
+    let ret = unsafe { ww_mutex_lock_interruptible(resv.cast(), core::ptr::null_mut()) };
     if ret == -EALREADY { 0 } else { ret }
 }
 
@@ -143,7 +143,7 @@ unsafe fn object_unlock(obj: *mut DrmI915GemObject) {
     if let Some(adjust_lru) = unsafe { (*ops).adjust_lru } {
         unsafe { adjust_lru(obj) };
     }
-    unsafe { ww_mutex_unlock((*gem_base(obj)).resv) };
+    unsafe { ww_mutex_unlock((*gem_base(obj)).resv.cast()) };
 }
 
 #[inline]
@@ -264,11 +264,11 @@ unsafe extern "C" fn i915_gem_userptr_get_pages(obj: *mut DrmI915GemObject) -> i
     let base = unsafe { gem_base(obj) };
     // The DRM device's embedded `struct device` and DMA segment helper are
     // owned by the missing Linux DRM/scatterlist framework bindings.
-    let dev = crate::linux::gem::drm_device_device(unsafe { (*base).dev });
+    let dev = crate::linux::gem::drm_device_device(unsafe { (*base).dev.cast() });
     let mut max_segment = crate::linux::scatterlist::i915_sg_segment_size(dev);
     let mut st = crate::linux::memory::kmalloc_obj::<SgTable>(crate::linux_config::GFP_KERNEL);
     let size = unsafe { (*base).size };
-    let pages_u64 = size >> PAGE_SHIFT;
+    let pages_u64 = (size as u64) >> PAGE_SHIFT;
     if pages_u64 > u32::MAX as u64 {
         return -crate::linux_config::E2BIG;
     }

@@ -53,7 +53,7 @@ const __GFP_RETRY_MAYFAIL: u32 = 1 << 14;
 /// C object/base unions.
 unsafe fn object_size(obj: *mut DrmI915GemObject) -> u64 {
     let drm_obj = unsafe { intel_bo_to_drm_bo(obj) };
-    unsafe { ptr::read_volatile(ptr::addr_of!((*drm_obj).size)) }
+    unsafe { ptr::read_volatile(ptr::addr_of!((*drm_obj).size).cast::<u64>()) }
 }
 
 /// The source helper atomically detaches the nodes between `head` and `first`.

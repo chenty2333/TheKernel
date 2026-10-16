@@ -31,6 +31,7 @@
     unexpected_cfgs
 )]
 
+use crate::linux::gem::DrmGemObject;
 use core::{
     ffi::{c_int, c_long, c_ulong},
     mem::size_of,
@@ -52,7 +53,7 @@ use crate::{
         i915_vma_is_pinned, i915_vma_is_scanout,
     },
     i915_vma_types_upstream::{I915_VMA_PIN_MASK, I915Vma},
-    intel_context_upstream::{DrmGemObjectBaseLayout, DrmMmNode},
+    intel_context_upstream::{DrmMmNode},
     intel_engine_cs_upstream::ListHead,
     intel_gt_requests_upstream::intel_gt_retire_requests_timeout,
     intel_gt_types_upstream::IntelGt,
@@ -128,7 +129,7 @@ unsafe fn object_refcount(obj: *mut DrmI915GemObject) -> u32 {
 
 #[inline]
 unsafe fn object_locked_by_ww(obj: *mut DrmI915GemObject, ww: *mut I915GemWwCtx) -> bool {
-    let base = obj.cast::<DrmGemObjectBaseLayout>();
+    let base = obj.cast::<DrmGemObject>();
     let resv = unsafe { (*base).resv.cast::<DmaResv>() };
     // dma_resv_locking_ctx() is a C inline READ_ONCE of ww_mutex.ctx.
     let lock_ctx = unsafe { ptr::read_volatile(ptr::addr_of!((*resv).lock.ctx)) };

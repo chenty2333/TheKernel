@@ -123,12 +123,12 @@ unsafe fn abort_internal_page_table(
 
 // upstream: i915_gem_internal.c i915_gem_object_get_pages_internal()
 unsafe extern "C" fn i915_gem_object_get_pages_internal(obj: *mut DrmI915GemObject) -> i32 {
-    let i915 = unsafe { to_i915((&(*obj).base.base).dev) };
+    let i915 = unsafe { to_i915((&(*obj).base.base).dev.cast()) };
     let mut st: *mut SgTable;
     let mut sg: *mut Scatterlist;
     let mut max_order = MAX_PAGE_ORDER;
 
-    let page_count = unsafe { (&(*obj).base.base).size >> PAGE_SHIFT };
+    let page_count = unsafe { (&(*obj).base.base).size as u64 >> PAGE_SHIFT };
     if page_count > u32::MAX as u64 {
         return -E2BIG;
     }

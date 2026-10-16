@@ -364,14 +364,14 @@ pub unsafe fn i915_gem_shrink(
                 && __i915_gem_object_put_pages(obj) == 0
                 && try_to_writeback(obj, shrink) == 0
             {
-                count = count.wrapping_add((*intel_bo_to_drm_bo(obj)).size >> PAGE_SHIFT);
+                count = count.wrapping_add((*intel_bo_to_drm_bo(obj)).size as u64 >> PAGE_SHIFT);
             }
 
             if ww.is_null() {
                 i915_gem_object_unlock(obj);
             }
 
-            scanned = scanned.wrapping_add((*intel_bo_to_drm_bo(obj)).size >> PAGE_SHIFT);
+            scanned = scanned.wrapping_add((*intel_bo_to_drm_bo(obj)).size as u64 >> PAGE_SHIFT);
             i915_gem_object_put(obj);
 
             spin_lock_irqsave(&mut (*i915).mm.obj_lock, &mut flags);
@@ -547,9 +547,9 @@ unsafe extern "C" fn i915_gem_shrinker_oom(
     spin_lock_irqsave(&mut (*i915).mm.obj_lock, &mut flags);
     list_for_each_entry!(obj, &(*i915).mm.shrink_list, mm.link, {
         if !can_release_pages(obj) {
-            unevictable = unevictable.wrapping_add((*intel_bo_to_drm_bo(obj)).size >> PAGE_SHIFT);
+            unevictable = unevictable.wrapping_add((*intel_bo_to_drm_bo(obj)).size as u64 >> PAGE_SHIFT);
         } else {
-            available = available.wrapping_add((*intel_bo_to_drm_bo(obj)).size >> PAGE_SHIFT);
+            available = available.wrapping_add((*intel_bo_to_drm_bo(obj)).size as u64 >> PAGE_SHIFT);
         }
     });
     spin_unlock_irqrestore(&mut (*i915).mm.obj_lock, flags);
@@ -703,7 +703,7 @@ pub unsafe fn i915_gem_object_make_unshrinkable(obj: *mut DrmI915GemObject) {
         (*i915).mm.shrink_memory = (*i915)
             .mm
             .shrink_memory
-            .wrapping_sub((*intel_bo_to_drm_bo(obj)).size);
+            .wrapping_sub((*intel_bo_to_drm_bo(obj)).size as u64);
     }
     spin_unlock_irqrestore(&mut (*i915).mm.obj_lock, flags);
 }
@@ -731,7 +731,7 @@ unsafe fn ___i915_gem_object_make_shrinkable(obj: *mut DrmI915GemObject, head: *
         (*i915).mm.shrink_memory = (*i915)
             .mm
             .shrink_memory
-            .wrapping_add((*intel_bo_to_drm_bo(obj)).size);
+            .wrapping_add((*intel_bo_to_drm_bo(obj)).size as u64);
     }
     spin_unlock_irqrestore(&mut (*i915).mm.obj_lock, flags);
 }

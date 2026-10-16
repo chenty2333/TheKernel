@@ -7,6 +7,7 @@
 //! consumed by i915, and mirrors each upstream GEM handle into that same
 //! kernel table so core DRM ioctls never see a second, disconnected namespace.
 
+use intel_gt::linux::gem::DrmGemObject;
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -23,7 +24,7 @@ use core::{
 use axerrno::{AxError, AxResult};
 use intel_gt::{
     i915_driver_upstream::DrmDriverDesc,
-    intel_context_upstream::DrmGemObjectBaseLayout,
+    
     linux::gem,
     linux_i915_private::DrmDevice,
 };
@@ -176,11 +177,11 @@ impl UpstreamFile {
         // SAFETY: minor and drm_file are zeroed allocations of these exact layouts;
         // device and filp are live, and this function owns all three until close.
         unsafe {
-            (*minor).dev = device;
+            (*minor).dev = device.cast();
             (*drm_file).minor = minor;
             // drm_open_init() starts with an empty idr. Keep a real LinuxKPI
             // file owner so i915 can read f_flags and use its page-cache state.
-            (*drm_file).filp = filp;
+            (*drm_file).filp = filp.cast();
             (*drm_file).driver_priv = ptr::null_mut();
         }
         let file_key = drm_file as usize;
@@ -362,7 +363,7 @@ impl UpstreamFile {
                     .then_some(())
                     .ok_or(-16);
             }
-            let base = object as *mut DrmGemObjectBaseLayout;
+            let base = object as *mut DrmGemObject;
             // SAFETY: object is the caller's live GEM object and base is its ABI prefix.
             unsafe { gem::drm_gem_handle_get(base) }?;
             // SAFETY: drm_file is initialized and locked; object is a live GEM object
@@ -379,7 +380,7 @@ impl UpstreamFile {
                 return Err(result);
             }
         }
-        let base = object as *mut DrmGemObjectBaseLayout;
+        let base = object as *mut DrmGemObject;
         // SAFETY: base is live and drm_file is the initialized file whose handle was inserted.
         let open_result = unsafe { gem::drm_gem_object_open(base, drm_file) };
         if open_result != 0 {
@@ -710,7 +711,7 @@ impl Drop for I915GemBacking {
 
 fn put_gem_object(object: *mut c_void) {
     // SAFETY: callers pass a non-null GEM object for which this path owns one handle ref.
-    unsafe { gem::drm_gem_handle_put(object.cast::<DrmGemObjectBaseLayout>()) };
+    unsafe { gem::drm_gem_handle_put(object.cast::<DrmGemObject>()) };
 }
 
 /// Serialize object_idr changes with `drm_file.table_lock` readers such as
@@ -753,7 +754,7 @@ pub(crate) unsafe extern "C" fn gem_handle_create(
         _ => return 0,
     };
     // SAFETY: DRM calls this provider for a live GEM object and checked non-null above.
-    let size = unsafe { (*object.cast::<DrmGemObjectBaseLayout>()).size };
+    let size = unsafe { (*object.cast::<DrmGemObject>()).size as u64 };
     // SAFETY: NativeFileBinding scopes this registry pointer to the active callback and
     // its PhantomData ties that binding to the borrowed DrmFile.
     let native = unsafe { &*(native_file as *const DrmFile) };
@@ -832,7 +833,7 @@ fn delete_file_handle(file: *mut gem::DrmFile, native: &DrmFile, handle: u32) ->
     // SAFETY: `object` is the live IDR entry removed above and `file` is its owner.
     unsafe { gem::drm_gem_object_close(object.cast(), file) };
     let close_result = native.close_handle(handle);
-    let object = object.cast::<DrmGemObjectBaseLayout>();
+    let object = object.cast::<DrmGemObject>();
     // SAFETY: deletion removed the corresponding IDR handle; release its one owned ref.
     unsafe { gem::drm_gem_handle_put(object) };
     close_result.map_err(|_| DrmError::Invalid)?;
@@ -968,15 +969,15 @@ mod tests {
 
     #[test]
     fn gem_handle_reference_pair_balances_kref_and_handle_count() {
-        use intel_gt::intel_context_upstream::{DrmGemObjectBaseLayout, Kref};
+        use intel_gt::intel_context_upstream::{Kref};
 
         // Keep one synthetic owner reference so this exercises bridge
         // accounting without invoking the object allocator/free provider.
         // SAFETY: this ABI record contains only integer/pointer fields; the test
         // initializes the refcount before invoking the GEM handle helpers.
-        let mut object: DrmGemObjectBaseLayout = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut object: DrmGemObject = unsafe { MaybeUninit::zeroed().assume_init() };
         object.refcount.refcount.refs.counter = 1;
-        let object = &mut object as *mut DrmGemObjectBaseLayout;
+        let object = &mut object as *mut DrmGemObject;
         // SAFETY: object points to the initialized stack record and remains live
         // and exclusively borrowed for this test scope.
         let kref = unsafe {
@@ -999,3 +1000,24 @@ mod tests {
     }
 }
 
+
+// `drm_file.filp` is the canonical `tk_linux_kapi::types::File` prefix, while
+// the shmem backing file is the `tk_linux_kapi::shmem::File` prefix. Both name
+// the same Linux `struct file`; the cast below is sound only while the shared
+// fields keep identical offsets.
+const _: () = assert!(
+    core::mem::offset_of!(tk_linux_kapi::types::File, f_mapping)
+        == core::mem::offset_of!(tk_linux_kapi::shmem::File, f_mapping)
+);
+const _: () = assert!(
+    core::mem::offset_of!(tk_linux_kapi::types::File, private_data)
+        == core::mem::offset_of!(tk_linux_kapi::shmem::File, _private_data)
+);
+const _: () = assert!(
+    core::mem::offset_of!(tk_linux_kapi::types::File, f_inode)
+        == core::mem::offset_of!(tk_linux_kapi::shmem::File, f_inode)
+);
+const _: () = assert!(
+    core::mem::offset_of!(tk_linux_kapi::types::File, f_flags)
+        == core::mem::offset_of!(tk_linux_kapi::shmem::File, f_flags)
+);

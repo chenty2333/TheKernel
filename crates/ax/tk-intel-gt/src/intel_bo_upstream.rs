@@ -6,7 +6,7 @@
 
 use core::ffi::c_void;
 
-use crate::intel_context_upstream::DrmGemObjectBaseLayout;
+use crate::linux::gem::DrmGemObject;
 use crate::intel_display_conversion_upstream::__drm_to_display;
 use crate::intel_display_core_types_upstream::IntelDisplay;
 use crate::intel_parent_upstream::intel_display_parent;
@@ -16,7 +16,7 @@ unsafe fn to_intel_display_from_obj(obj: *mut c_void) -> *mut IntelDisplay {
     if obj.is_null() {
         return core::ptr::null_mut();
     }
-    let base = obj.cast::<DrmGemObjectBaseLayout>();
+    let base = obj.cast::<DrmGemObject>();
     if (*base).dev.is_null() {
         return core::ptr::null_mut();
     }

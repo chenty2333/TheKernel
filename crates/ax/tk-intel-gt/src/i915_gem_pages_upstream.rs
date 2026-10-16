@@ -11,6 +11,7 @@
     unexpected_cfgs
 )]
 
+use crate::linux::gem::DrmGemObject;
 use core::{
     ffi::{c_int, c_ulong, c_void},
     mem::size_of,
@@ -32,7 +33,7 @@ use crate::{
     i915_gem_ww_upstream::{
         I915GemWwCtx, i915_gem_ww_ctx_backoff, i915_gem_ww_ctx_fini, i915_gem_ww_ctx_init,
     },
-    intel_context_upstream::{DrmGemObjectBaseLayout, SgTable},
+    intel_context_upstream::{SgTable},
     intel_gt_types_upstream::IntelGt,
     linux::{
         gem_memory::PgProt,
@@ -102,12 +103,12 @@ const _: [(); 488] = [(); core::mem::offset_of!(IntelFramebuffer, panic_tiling)]
 const _: [(); 496] = [(); core::mem::offset_of!(IntelFramebuffer, panic)];
 
 #[inline]
-unsafe fn gem_base(obj: *mut DrmI915GemObject) -> *mut DrmGemObjectBaseLayout {
+unsafe fn gem_base(obj: *mut DrmI915GemObject) -> *mut DrmGemObject {
     unsafe { ptr::addr_of_mut!((*obj).base).cast() }
 }
 #[inline]
 unsafe fn object_size(obj: *mut DrmI915GemObject) -> u64 {
-    unsafe { (*gem_base(obj)).size }
+    unsafe { (*gem_base(obj)).size as u64 }
 }
 #[inline]
 pub fn page_mask_bits(ptr_: *mut c_void) -> *mut c_void {
@@ -491,7 +492,7 @@ unsafe fn i915_gem_object_get_sg_dma(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __i915_gem_object_set_pages(obj: *mut DrmI915GemObject, pages: *mut SgTable) {
     unsafe {
-        let i915 = crate::linux::i915::to_i915((*gem_base(obj)).dev);
+        let i915 = crate::linux::i915::to_i915((*gem_base(obj)).dev.cast());
         let supported = (*i915).runtime.page_sizes as c_ulong;
         let mut shrinkable;
         assert_object_held_shared(obj);
@@ -553,7 +554,7 @@ pub unsafe extern "C" fn __i915_gem_object_set_pages(obj: *mut DrmI915GemObject,
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ____i915_gem_object_get_pages(obj: *mut DrmI915GemObject) -> c_int {
     unsafe {
-        let i915 = crate::linux::i915::to_i915((*gem_base(obj)).dev);
+        let i915 = crate::linux::i915::to_i915((*gem_base(obj)).dev.cast());
         assert_object_held_shared(obj);
         if (*obj).mm.madv() != I915_MADV_WILLNEED {
             drm_dbg!(&(*i915).drm, "Attempting to obtain a purgeable object");
@@ -653,7 +654,7 @@ unsafe fn unmap_object(_obj: *mut DrmI915GemObject, ptr_: *mut c_void) {
 // upstream: i915_gem_pages.c flush_tlb_invalidate()
 unsafe fn flush_tlb_invalidate(obj: *mut DrmI915GemObject) {
     unsafe {
-        let i915 = crate::linux::i915::to_i915((*gem_base(obj)).dev);
+        let i915 = crate::linux::i915::to_i915((*gem_base(obj)).dev.cast());
         for id in 0..crate::intel_gt_defines_types_upstream::I915_MAX_GT {
             if (*i915).gt[id].is_null() {
                 continue;
@@ -928,7 +929,7 @@ pub unsafe extern "C" fn i915_gem_object_pin_map(
                 return ptr_;
             }
             type_ = I915_MAP_WC;
-        } else if IS_DGFX(crate::linux::i915::to_i915((*gem_base(obj)).dev)) {
+        } else if IS_DGFX(crate::linux::i915::to_i915((*gem_base(obj)).dev.cast())) {
             type_ = I915_MAP_WB;
         }
         let mut has_type = 0;
@@ -1158,9 +1159,9 @@ mod pin_map_integration_tests {
             DrmI915GemObject, DrmI915GemObjectOps, I915_BO_FLAG_IOMEM,
             I915_BO_FLAG_STRUCT_PAGE,
         },
-        intel_context_upstream::{DrmGemObjectBaseLayout, SgTable},
+        intel_context_upstream::{SgTable},
         intel_engine_cs_upstream::AtomicT,
-        linux::i915::IntelDeviceInfoOverlay,
+        linux::{gem::DrmGemObject, i915::IntelDeviceInfoOverlay},
         linux_i915_private::DrmI915Private,
     };
     use core::{ffi::c_void, mem::MaybeUninit, ptr};
@@ -1282,7 +1283,7 @@ mod pin_map_integration_tests {
             // object field read by the i915 GEM map/get-pages path below.
             unsafe {
                 let object_ptr = object.as_mut_ptr();
-                let base = object_ptr.cast::<DrmGemObjectBaseLayout>();
+                let base = object_ptr.cast::<DrmGemObject>();
                 ptr::addr_of_mut!((*base).dev).write(i915_ptr.cast());
                 ptr::addr_of_mut!((*base).size).write(4096);
                 ptr::addr_of_mut!((*object_ptr).ops).write(ops.as_ref() as *const _);

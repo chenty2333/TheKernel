@@ -20,7 +20,7 @@ use crate::{
     },
     i915_gem_object_types_upstream::DrmI915GemObject,
     intel_context_types_upstream::IntelContext,
-    intel_context_upstream::{DrmGemObjectBaseLayout, Kref, RadixTreeRoot},
+    intel_context_upstream::{Kref, RadixTreeRoot},
     intel_engine_cs_upstream::{ListHead, Spinlock},
     linux::{
         gem,
@@ -79,7 +79,7 @@ struct I915EngineUabiClassCountView {
 
 const _: [(); 80] = [(); offset_of!(gem::DrmFile, object_idr)];
 const _: [(); 104] = [(); offset_of!(gem::DrmFile, table_lock)];
-const _: [(); 112] = [(); offset_of!(gem::DrmFile, _syncobj_xa)];
+const _: [(); 112] = [(); offset_of!(gem::DrmFile, syncobj_xa)];
 const _: [(); 128] = [(); offset_of!(gem::DrmFile, filp)];
 const _: [(); 136] = [(); offset_of!(gem::DrmFile, driver_priv)];
 const _: [(); 0] = [(); offset_of!(DrmI915FilePrivateView, i915)];
@@ -204,18 +204,18 @@ unsafe fn obj_meminfo(obj: *mut DrmI915GemObject, stats: *mut DrmMemoryStats) {
         let handle_count = AtomicU32::from_ptr(base.cast::<u8>().add(4).cast::<u32>())
             .load(Ordering::Acquire);
         if handle_count > 1 || !(*base).dma_buf.is_null() {
-            (*stats.add(region)).shared = (*stats.add(region)).shared.wrapping_add(size);
+            (*stats.add(region)).shared = (*stats.add(region)).shared.wrapping_add(size as u64);
         } else {
-            (*stats.add(region)).private = (*stats.add(region)).private.wrapping_add(size);
+            (*stats.add(region)).private = (*stats.add(region)).private.wrapping_add(size as u64);
         }
         if crate::i915_gem_object_header_upstream::i915_gem_object_has_pages(obj) {
-            (*stats.add(region)).resident = (*stats.add(region)).resident.wrapping_add(size);
-            if !dma_resv_test_signaled((*base).resv, DMA_RESV_USAGE_BOOKKEEP) {
-                (*stats.add(region)).active = (*stats.add(region)).active.wrapping_add(size);
+            (*stats.add(region)).resident = (*stats.add(region)).resident.wrapping_add(size as u64);
+            if !dma_resv_test_signaled((*base).resv.cast(), DMA_RESV_USAGE_BOOKKEEP) {
+                (*stats.add(region)).active = (*stats.add(region)).active.wrapping_add(size as u64);
             } else if crate::i915_gem_object_header_upstream::i915_gem_object_is_shrinkable(obj)
                 && (*obj).mm.madv() == I915_MADV_DONTNEED
             {
-                (*stats.add(region)).purgeable = (*stats.add(region)).purgeable.wrapping_add(size);
+                (*stats.add(region)).purgeable = (*stats.add(region)).purgeable.wrapping_add(size as u64);
             }
         }
     }

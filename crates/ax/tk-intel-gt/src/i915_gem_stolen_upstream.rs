@@ -875,8 +875,8 @@ fn is_err<T>(ptr: *const T) -> bool {
 }
 #[inline]
 unsafe fn gem_obj_i915(obj: *mut DrmI915GemObject) -> *mut DrmI915Private {
-    let base = obj.cast::<crate::intel_context_upstream::DrmGemObjectBaseLayout>();
-    unsafe { to_i915((*base).dev) }
+    let base = obj.cast::<crate::linux::gem::DrmGemObject>();
+    unsafe { to_i915((*base).dev.cast()) }
 }
 
 // upstream: i915_gem_stolen.c i915_pages_create_for_stolen()
@@ -916,7 +916,7 @@ unsafe fn i915_pages_create_for_stolen(
 unsafe extern "C" fn i915_gem_object_get_pages_stolen(obj: *mut DrmI915GemObject) -> c_int {
     let i915 = unsafe { gem_obj_i915(obj) };
     let node = unsafe { (*obj).backing.stolen };
-    let base = obj.cast::<crate::intel_context_upstream::DrmGemObjectBaseLayout>();
+    let base = obj.cast::<crate::linux::gem::DrmGemObject>();
     let pages =
         unsafe { i915_pages_create_for_stolen((*base).dev.cast(), (*node).start, (*node).size) };
     if crate::linux_config::IS_ERR(pages) {

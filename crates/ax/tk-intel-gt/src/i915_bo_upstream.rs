@@ -127,7 +127,7 @@ unsafe extern "C" fn i915_bo_read_from_page(
 // upstream: i915_bo.c i915_bo_framebuffer_init()
 unsafe extern "C" fn i915_bo_framebuffer_init(obj_: *mut c_void, mode_cmd: *mut c_void) -> i32 {
     let obj = unsafe { to_intel_bo(obj_.cast()) };
-    let i915 = unsafe { to_i915((&(*obj).base.base).dev) };
+    let i915 = unsafe { to_i915((&(*obj).base.base).dev.cast()) };
     let mode_cmd = mode_cmd.cast::<DrmModeFbCmd2>();
 
     unsafe { i915_gem_object_lock(obj, ptr::null_mut()) };
@@ -284,7 +284,7 @@ unsafe extern "C" fn i915_bo_fbdev_fill_info(
     let info = info.cast::<FbInfo>();
     let vma = vma.cast::<I915Vma>();
     let obj = unsafe { to_intel_bo(obj_.cast()) };
-    let i915 = unsafe { to_i915((&(*obj).base.base).dev) };
+    let i915 = unsafe { to_i915((&(*obj).base.base).dev.cast()) };
 
     if unsafe { i915_gem_object_is_lmem(obj) } {
         let mem: *mut IntelMemoryRegion = unsafe { (*obj).mm.region };

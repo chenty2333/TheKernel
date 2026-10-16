@@ -11,6 +11,7 @@
 
 #![allow(non_snake_case, non_camel_case_types, unsafe_op_in_unsafe_fn)]
 
+use crate::linux::gem::DrmGemObject;
 use core::{
     ffi::{c_char, c_int, c_long, c_ulong, c_void},
     mem::{offset_of, size_of},
@@ -38,11 +39,7 @@ use crate::{
         IntelWakerefT,
     },
     intel_context_api_upstream::intel_context_get,
-    intel_context_upstream::{
-        DmaFence, DrmGemObjectBaseLayout, DrmMmNode, I915ActiveFence,
-        I915AddressSpace as OldI915AddressSpace, Kref,
-        RcuHead, WaitQueueEntry,
-    },
+    intel_context_upstream::{DmaFence, DrmMmNode, I915ActiveFence, I915AddressSpace as OldI915AddressSpace, Kref, RcuHead, WaitQueueEntry},
     intel_engine_cs_upstream::{
         AtomicT, IntelEngineCs, ListHead, Mutex, RbRoot, Spinlock, WorkStruct,
     },
@@ -676,7 +673,7 @@ unsafe fn lut_close(ctx: *mut I915GemContext) {
             // The DRM GEM owner is the first member of the i915 object's base
             // union; cast the union storage instead of dereferencing its
             // ManuallyDrop arm.
-            let gem_obj = obj.cast::<DrmGemObjectBaseLayout>();
+            let gem_obj = obj.cast::<DrmGemObject>();
             let refcount = unsafe { &mut (*gem_obj).refcount };
             if crate::linux::memory::kref_get_unless_zero(refcount) {
                 let mut lut = ptr::null_mut::<I915LutHandle>();

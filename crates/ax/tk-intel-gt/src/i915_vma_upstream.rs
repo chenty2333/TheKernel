@@ -7,6 +7,7 @@
 
 #![allow(unsafe_code, non_snake_case, non_camel_case_types, dead_code)]
 
+use crate::linux::gem::DrmGemObject;
 use tk_linux_kapi::dma_resv::dma_resv_add_fence;
 use core::{
     ffi::{c_char, c_int, c_long, c_ulong, c_void},
@@ -73,9 +74,7 @@ use crate::{
         I915Vma,
     },
     intel_context_types_upstream::{I915Active, I915SwFence, IntelWakerefT},
-    intel_context_upstream::{
-        DmaFence, DrmGemObjectBaseLayout, DrmMmNode, I915GttView, Kref, RcuHead, SgTable,
-    },
+    intel_context_upstream::{DmaFence, DrmMmNode, I915GttView, Kref, RcuHead, SgTable},
     intel_engine_cs_upstream::{
         AtomicT, IntelEngineCs, IntelGt, ListHead, Mutex, RbNode, RbRoot, RbRootCached, Spinlock,
         WorkStruct,
@@ -555,7 +554,7 @@ unsafe fn set_sg_dma_len(sg: *mut Scatterlist, length: u32) {
 
 #[inline]
 unsafe fn dma_resv_of_object(obj: *mut DrmI915GemObject) -> *mut DmaResv {
-    let base = unsafe { obj.cast::<DrmGemObjectBaseLayout>() };
+    let base = unsafe { obj.cast::<DrmGemObject>() };
     unsafe { (*base).resv.cast::<DmaResv>() }
 }
 
@@ -685,7 +684,7 @@ unsafe fn vma_print_allocator_debug(vma: *mut I915Vma, reason: *const c_char) {
                 .cast::<u32>(),
         )
     };
-    let drm = unsafe { (*vma).obj.cast::<DrmGemObjectBaseLayout>() };
+    let drm = unsafe { (*vma).obj.cast::<DrmGemObject>() };
     if handle == 0 {
         drm_dbg!(
             unsafe { (*drm).dev },
@@ -797,7 +796,7 @@ unsafe fn vma_create(
     unsafe {
         (*vma).ops = ptr::addr_of!((*vm).vma_ops).cast();
         (*vma).obj = obj;
-        (*vma).size = (*obj.cast::<DrmGemObjectBaseLayout>()).size;
+        (*vma).size = (*obj.cast::<DrmGemObject>()).size as u64;
         (*vma).display_alignment = I915_GTT_MIN_ALIGNMENT as u32;
         i915_active_init(
             ptr::addr_of_mut!((*vma).active),
@@ -818,12 +817,12 @@ unsafe fn vma_create(
                 let offset = unsafe { ptr::read_unaligned(ptr::addr_of!((*partial).offset)) };
                 let pages = unsafe { ptr::read_unaligned(ptr::addr_of!((*partial).size)) } as u64;
                 if range_overflows(offset, pages, unsafe {
-                    (*obj.cast::<DrmGemObjectBaseLayout>()).size >> PAGE_SHIFT
+                    (*obj.cast::<DrmGemObject>()).size as u64 >> PAGE_SHIFT
                 }) {
                     GEM_BUG_ON!(true);
                 }
                 unsafe { (*vma).size = pages << PAGE_SHIFT };
-                GEM_BUG_ON!(unsafe { (*vma).size > (*obj.cast::<DrmGemObjectBaseLayout>()).size });
+                GEM_BUG_ON!(unsafe { (*vma).size > (*obj.cast::<DrmGemObject>()).size as u64 });
             }
             I915_GTT_VIEW_ROTATED => {
                 let info = unsafe { view.cast::<u8>().add(4).cast::<IntelRotationInfo>() };
@@ -1275,7 +1274,7 @@ pub unsafe extern "C" fn i915_vma_pin_iomap(vma: *mut I915Vma) -> *mut c_void {
                 i915_gem_object_lmem_io_map(
                     (*vma).obj,
                     0,
-                    (*(*vma).obj.cast::<DrmGemObjectBaseLayout>()).size as usize,
+                    (*(*vma).obj.cast::<DrmGemObject>()).size as usize,
                 )
             };
         } else if unsafe { i915_vma_is_map_and_fenceable(vma) } {
@@ -1651,7 +1650,7 @@ unsafe fn intel_rotate_pages(
     obj: *mut DrmI915GemObject,
 ) -> *mut SgTable {
     let size = unsafe { intel_rotation_info_size(rot_info) };
-    let i915 = unsafe { crate::linux::i915::to_i915((*obj.cast::<DrmGemObjectBaseLayout>()).dev) };
+    let i915 = unsafe { crate::linux::i915::to_i915((*obj.cast::<DrmGemObject>()).dev.cast()) };
     let st = crate::linux::memory::kmalloc_obj::<SgTable>(GFP_KERNEL);
     if st.is_null() {
         return ERR_PTR(-ENOMEM);
@@ -1849,7 +1848,7 @@ unsafe fn intel_remap_pages(
     obj: *mut DrmI915GemObject,
 ) -> *mut SgTable {
     let size = unsafe { intel_remapped_info_size(rem_info) };
-    let i915 = unsafe { crate::linux::i915::to_i915((*obj.cast::<DrmGemObjectBaseLayout>()).dev) };
+    let i915 = unsafe { crate::linux::i915::to_i915((*obj.cast::<DrmGemObject>()).dev.cast()) };
     let st = crate::linux::memory::kmalloc_obj::<SgTable>(GFP_KERNEL);
     if st.is_null() {
         return ERR_PTR(-ENOMEM);
@@ -2588,7 +2587,7 @@ pub unsafe extern "C" fn i915_vma_parked(gt: *mut IntelGt) {
         let next = unsafe { (*link).next };
         let obj = unsafe { (*vma).obj };
         let vm = unsafe { (*vma).vm };
-        let base = obj.cast::<DrmGemObjectBaseLayout>();
+        let base = obj.cast::<DrmGemObject>();
         if unsafe { kref_get_unless_zero(&mut (*base).refcount) } {
             if !unsafe { i915_vm_tryget(vm) }.is_null() {
                 unsafe { list_move(ptr::addr_of_mut!((*vma).closed_link), closed_head) };

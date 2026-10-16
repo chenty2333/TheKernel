@@ -373,7 +373,7 @@ pub unsafe fn i915_gem_object_flush_map(obj: *mut DrmI915GemObject) {
         crate::i915_gem_pages_upstream::__i915_gem_object_flush_map(
             obj,
             0,
-            (*object_base(obj)).size,
+            (*object_base(obj)).size as u64,
         )
     }
 }

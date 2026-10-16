@@ -177,7 +177,7 @@ pub unsafe extern "C" fn i915_gem_object_frontbuffer_get(
     obj: *mut DrmI915GemObject,
 ) -> *mut I915Frontbuffer {
     let gem = unsafe { crate::i915_gem_object_types_upstream::intel_bo_to_drm_bo(obj) };
-    let i915 = unsafe { to_i915((*gem).dev) };
+    let i915 = unsafe { to_i915((*gem).dev.cast()) };
     let front = unsafe { i915_gem_object_frontbuffer_lookup(obj) };
     if !front.is_null() {
         return front.cast::<I915Frontbuffer>();
@@ -232,7 +232,7 @@ unsafe extern "C" fn frontbuffer_release(reference: *mut Kref) {
     let front = container_of!(reference, I915FrontbufferLayout, ref_);
     let obj = unsafe { (*front).obj };
     let gem = unsafe { crate::i915_gem_object_types_upstream::intel_bo_to_drm_bo(obj) };
-    let i915 = unsafe { to_i915((*gem).dev) };
+    let i915 = unsafe { to_i915((*gem).dev.cast()) };
 
     unsafe { crate::i915_vma_api_upstream::i915_ggtt_clear_scanout(obj) };
     unsafe {
@@ -255,7 +255,7 @@ pub unsafe extern "C" fn i915_gem_object_frontbuffer_put(front: *mut I915Frontbu
     let front = front.cast::<I915FrontbufferLayout>();
     let obj = unsafe { (*front).obj };
     let gem = unsafe { crate::i915_gem_object_types_upstream::intel_bo_to_drm_bo(obj) };
-    let i915 = unsafe { to_i915((*gem).dev) };
+    let i915 = unsafe { to_i915((*gem).dev.cast()) };
     unsafe {
         kref_put_lock(
             &mut (*front).ref_,

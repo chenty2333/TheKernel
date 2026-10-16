@@ -230,7 +230,7 @@ pub unsafe extern "C" fn i915_gem_gtt_insert(
 pub unsafe fn i915_gem_gtt_prepare_pages(obj: *mut DrmI915GemObject, pages: *mut SgTable) -> i32 {
     loop {
         if dma_map_sg_attrs(
-            drm_device_device((&(*obj).base.base).dev),
+            drm_device_device((&(*obj).base.base).dev.cast()),
             (*pages).sgl,
             (*pages).nents,
             0,
@@ -242,7 +242,7 @@ pub unsafe fn i915_gem_gtt_prepare_pages(obj: *mut DrmI915GemObject, pages: *mut
         GEM_BUG_ON!((*obj).mm.pages == pages);
         if i915_gem_shrink(
             core::ptr::null_mut(),
-            to_i915((&(*obj).base.base).dev),
+            to_i915((&(*obj).base.base).dev.cast()),
             ((&(*obj).base.base).size >> 12) as u64,
             core::ptr::null_mut(),
             3,
@@ -256,13 +256,13 @@ pub unsafe fn i915_gem_gtt_prepare_pages(obj: *mut DrmI915GemObject, pages: *mut
 // upstream: i915_gem_gtt.c i915_gem_gtt_finish_pages()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn i915_gem_gtt_finish_pages(obj: *mut DrmI915GemObject, pages: *mut SgTable) {
-    let i915 = to_i915((&(*obj).base.base).dev);
+    let i915 = to_i915((&(*obj).base.base).dev.cast());
     let ggtt = (*crate::linux::i915::to_gt(i915)).ggtt;
     if (*ggtt).do_idle_maps {
         axtask::sleep(core::time::Duration::from_micros(100));
     }
     dma_unmap_sg_attrs(
-        drm_device_device((&(*obj).base.base).dev),
+        drm_device_device((&(*obj).base.base).dev.cast()),
         (*pages).sgl,
         (*pages).nents,
         0,

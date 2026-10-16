@@ -11,6 +11,7 @@
     dead_code
 )]
 
+use crate::linux::gem::DrmGemObject;
 use core::{
     ffi::{c_int, c_ulong, c_void},
     mem::offset_of,
@@ -42,7 +43,7 @@ use crate::{
         __i915_vma_unbind, i915_vma_destroy_locked, i915_vma_instance, i915_vma_pin, i915_vma_put,
     },
     i915_vma_types_upstream::{I915_VMA_PIN_MASK, I915Vma},
-    intel_context_upstream::{DrmGemObjectBaseLayout, I915GttView, Kref},
+    intel_context_upstream::{I915GttView, Kref},
     intel_engine_cs_upstream::WorkStruct,
     intel_gt_api_upstream::intel_gt_coherent_map_type,
     intel_gt_mcr_upstream::{
@@ -121,8 +122,8 @@ unsafe extern "C" {
 }
 
 #[inline]
-unsafe fn gem_base(obj: *mut DrmI915GemObject) -> *mut DrmGemObjectBaseLayout {
-    unsafe { obj.cast::<DrmGemObjectBaseLayout>() }
+unsafe fn gem_base(obj: *mut DrmI915GemObject) -> *mut DrmGemObject {
+    unsafe { obj.cast::<DrmGemObject>() }
 }
 
 #[inline]
@@ -182,7 +183,7 @@ pub unsafe extern "C" fn alloc_pt_lmem(
     };
     if !crate::linux_config::IS_ERR(obj) {
         let resv = unsafe { i915_vm_resv_get(vm) };
-        unsafe { (*gem_base(obj)).resv = resv };
+        unsafe { (*gem_base(obj)).resv = resv.cast() };
         unsafe { (*obj).shares_resv_from = vm };
         let fpriv = unsafe { (*vm).fpriv };
         if !fpriv.is_null() {
@@ -205,7 +206,7 @@ pub unsafe extern "C" fn alloc_pt_dma(
     let obj = unsafe { i915_gem_object_create_internal((*vm).i915, size as u64) };
     if !crate::linux_config::IS_ERR(obj) {
         let resv = unsafe { i915_vm_resv_get(vm) };
-        unsafe { (*gem_base(obj)).resv = resv };
+        unsafe { (*gem_base(obj)).resv = resv.cast() };
         unsafe { (*obj).shares_resv_from = vm };
         let fpriv = unsafe { (*vm).fpriv };
         if !fpriv.is_null() {

@@ -18,6 +18,7 @@
 //! (`HAS_DISPLAY()` is false), so the `no_display_*` entries do what Linux's
 //! early returns do for such a device.
 
+use intel_gt::linux::gem::DrmGemObject;
 use core::{
     ffi::{c_char, c_int, c_ulong, c_void},
     mem::{offset_of, size_of},
@@ -31,7 +32,7 @@ use intel_gt::{
     i915_probe_provider_upstream::{
         I915FrameworkOps, I915ProbeOps, install_i915_framework_ops, install_i915_probe_ops,
     },
-    intel_context_upstream::{DmaFence, DrmGemObjectBaseLayout, Kref},
+    intel_context_upstream::{DmaFence, Kref},
     linux::{
         drm_core::{DrmCoreProvider, install_drm_core_provider},
         shmem,
@@ -945,7 +946,7 @@ unsafe extern "C" fn print_memory_stats(
 /// which is not bound yet. A node with start 0 was never allocated and has
 /// nothing to release.
 unsafe extern "C" fn gem_free_mmap_offset(obj: *mut c_void) {
-    let obj = obj.cast::<DrmGemObjectBaseLayout>();
+    let obj = obj.cast::<DrmGemObject>();
     if obj.is_null() {
         return;
     }
@@ -995,7 +996,7 @@ unsafe extern "C" fn gem_handle_close(file: *mut c_void, handle: u32) {
 unsafe extern "C" fn gem_object_free(refcount: *mut c_void) {
     // `refcount` is the first member of `drm_gem_object`, so the object starts
     // at the same address.
-    let obj = refcount.cast::<DrmGemObjectBaseLayout>();
+    let obj = refcount.cast::<DrmGemObject>();
     // SAFETY: the caller passes the `refcount` of a live object whose final put
     // has happened; `funcs` is read, not written.
     let funcs = unsafe { (*obj).funcs };
@@ -1016,10 +1017,10 @@ unsafe extern "C" fn gem_object_free(refcount: *mut c_void) {
 /// record, as Linux does. The reservation is initialized through the
 /// `dma_resv_init` symbol that `tk-intel-gt` exports.
 unsafe extern "C" fn gem_private_object_init(dev: *mut c_void, obj: *mut c_void, size: usize) {
-    let obj = obj.cast::<DrmGemObjectBaseLayout>();
+    let obj = obj.cast::<DrmGemObject>();
     // SAFETY: the caller passes a live, exclusively owned `drm_gem_object` that
     // is being initialized; the offsets written are the fields of the Linux
-    // 7.2.3 x86_64 layout that `DrmGemObjectBaseLayout` records.
+    // 7.2.3 x86_64 layout that `DrmGemObject` records.
     unsafe {
         // `kref_init()`: one reference, held by the caller.
         (*obj).refcount.refcount.refs.counter = 1;
@@ -1028,12 +1029,12 @@ unsafe extern "C" fn gem_private_object_init(dev: *mut c_void, obj: *mut c_void,
             .add(size_of::<Kref>())
             .cast::<u32>()
             .write(0);
-        (*obj).dev = dev;
+        (*obj).dev = dev.cast();
         (*obj).filp = ptr::null_mut();
-        (*obj).size = size as u64;
+        (*obj).size = size;
         // `name` (int) is the 8-byte slot after `size`.
         obj.cast::<u8>()
-            .add(offset_of!(DrmGemObjectBaseLayout, size) + size_of::<u64>())
+            .add(offset_of!(DrmGemObject, size) + size_of::<u64>())
             .cast::<u32>()
             .write(0);
         (*obj).dma_buf = ptr::null_mut();

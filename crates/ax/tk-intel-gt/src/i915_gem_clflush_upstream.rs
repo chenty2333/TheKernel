@@ -374,7 +374,7 @@ unsafe fn clflush_work_create(obj: *mut DrmI915GemObject) -> *mut Clflush {
 
 // upstream: i915_gem_clflush.c i915_gem_clflush_object()
 pub unsafe fn i915_gem_clflush_object(obj: *mut DrmI915GemObject, flags: u32) -> bool {
-    let i915 = unsafe { to_i915((&(*obj).base.base).dev) };
+    let i915 = unsafe { to_i915((&(*obj).base.base).dev.cast()) };
     let mut clflush: *mut Clflush;
 
     unsafe { assert_object_held(obj) };

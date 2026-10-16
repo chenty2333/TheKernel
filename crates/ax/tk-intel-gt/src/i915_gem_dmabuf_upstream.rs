@@ -227,9 +227,9 @@ unsafe extern "C" fn i915_gem_dmabuf_mmap(dma_buf: *mut DmaBuf, vma: *mut c_void
     let vma = vma.cast::<VmAreaStruct>();
     let obj = unsafe { dma_buf_to_obj(dma_buf) };
     let base = unsafe { intel_bo_to_drm_bo(obj) };
-    let i915 = unsafe { to_i915((*base).dev) };
+    let i915 = unsafe { to_i915((*base).dev.cast()) };
     let vma_size = unsafe { (*vma).vm_end - (*vma).vm_start } as u64;
-    if unsafe { (*base).size } < vma_size {
+    if unsafe { (*base).size } < vma_size as usize {
         return -EINVAL;
     }
 
@@ -467,7 +467,7 @@ pub unsafe extern "C" fn i915_gem_prime_export(
 // upstream: i915_gem_dmabuf.c i915_gem_object_get_pages_dmabuf()
 unsafe extern "C" fn i915_gem_object_get_pages_dmabuf(obj: *mut DrmI915GemObject) -> c_int {
     let base = unsafe { intel_bo_to_drm_bo(obj) };
-    let i915 = unsafe { to_i915((*base).dev) };
+    let i915 = unsafe { to_i915((*base).dev.cast()) };
     unsafe { assert_object_held(obj) };
 
     let attach = unsafe { (*base).import_attach.cast::<DmaBufAttachment>() };

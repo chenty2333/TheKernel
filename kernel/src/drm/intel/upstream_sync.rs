@@ -4,6 +4,7 @@
 //! owns a reference to that state and a task mirrors its deferred completion
 //! into the upstream fence only after the native fence actually signals.
 
+use intel_gt::linux::gem::DrmGemObject;
 use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{
     any::Any,
@@ -19,7 +20,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable, PreparedPollRegistration};
 use intel_gt::{
     i915_request_upstream::DmaFenceOps,
-    intel_context_upstream::{DmaFence, DmaFenceTimestamp, DrmGemObjectBaseLayout, RcuHead},
+    intel_context_upstream::{DmaFence, DmaFenceTimestamp, RcuHead},
     intel_engine_cs_upstream::Spinlock,
 };
 
@@ -110,7 +111,7 @@ pub(crate) fn register_alias(
     if i915_obj == 0 {
         return Err(AxError::InvalidInput);
     }
-    let base = i915_obj as *mut DrmGemObjectBaseLayout;
+    let base = i915_obj as *mut DrmGemObject;
     // SAFETY: callers register a live GEM object whose backing ref is established
     // before publication; its ABI prefix contains the reservation pointer.
     let resv = unsafe { (*base).resv };

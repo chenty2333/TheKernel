@@ -341,7 +341,7 @@ pub unsafe fn intel_bo_to_drm_bo(bo: *mut DrmI915GemObject) -> *mut DrmGemObject
 /// `bo` must point to a live object with a valid DRM device pointer.
 pub unsafe fn intel_bo_to_i915(bo: *mut DrmI915GemObject) -> *mut DrmI915Private {
     let gem = unsafe { intel_bo_to_drm_bo(bo) };
-    crate::linux::i915::to_i915(unsafe { (*gem).dev })
+    crate::linux::i915::to_i915(unsafe { (*gem).dev.cast() })
 }
 
 #[macro_export]

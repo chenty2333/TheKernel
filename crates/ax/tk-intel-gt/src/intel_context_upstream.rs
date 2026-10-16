@@ -167,36 +167,6 @@ const _: [(); 208] = [(); core::mem::offset_of!(I915MmapOffset, offset)];
 
 
 
-/// Exact Linux v7.2.3 x86_64 `drm_gem_object` fields accessed by the i915 GEM
-/// paths. Its 480-byte storage reflects the C union with `ttm_buffer_object`;
-/// only the DRM-object member fields used here are named.
-#[repr(C, align(8))]
-pub struct DrmGemObjectBaseLayout {
-    pub refcount: Kref,
-    _refcount_padding: [u8; 4],
-    pub dev: *mut c_void,
-    pub filp: *mut c_void,
-    pub vma_node: DrmVmaOffsetNode,
-    pub size: u64,
-    _name_and_padding: [u8; 8],
-    pub dma_buf: *mut c_void,
-    pub import_attach: *mut c_void,
-    pub resv: *mut c_void,
-    pub _resv: crate::linux::gem::DmaResv,
-    _gpuva: [u8; 40],
-    pub funcs: *const c_void,
-    _lru_node: [u8; 16],
-    _lru: *mut c_void,
-    _union_tail: [u8; 112],
-}
-
-const _: [(); 480] = [(); core::mem::size_of::<DrmGemObjectBaseLayout>()];
-const _: [(); 8] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, dev)];
-const _: [(); 16] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, filp)];
-const _: [(); 216] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, size)];
-const _: [(); 248] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, resv)];
-const _: [(); 336] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, funcs)];
-
 static mut SLAB_CE: *mut KmCache = core::ptr::null_mut();
 
 // upstream: intel_context.c intel_context_alloc()

@@ -6,6 +6,7 @@
 
 #![allow(non_snake_case, non_camel_case_types, unsafe_op_in_unsafe_fn)]
 
+use crate::linux::gem::DrmGemObject;
 use core::{
     ffi::{c_char, c_int, c_long, c_ulong, c_void},
     mem::{offset_of, size_of},
@@ -34,10 +35,7 @@ use crate::{
         intel_context_use_semaphores,
     },
     intel_context_types_upstream::{I915SwFence, I915SwFenceNotify, IntelContext},
-    intel_context_upstream::{
-        DmaFence, DmaFenceCb, DrmGemObjectBaseLayout, I915Vma, I915VmaResource, IntelRing, IrqWork,
-        WaitQueueEntry, *,
-    },
+    intel_context_upstream::{DmaFence, DmaFenceCb, I915Vma, I915VmaResource, IntelRing, IrqWork, WaitQueueEntry, *},
     intel_engine_api_upstream::{__intel_engine_flush_submission, intel_engine_get_sibling},
     intel_engine_cs_upstream::{AtomicT, IntelEngineCs, LlistNode, Spinlock},
     intel_engine_types_upstream::{
@@ -1413,7 +1411,7 @@ pub unsafe fn i915_request_await_object(
 ) -> i32 {
     // The i915 object begins with `drm_gem_object`; use the shared source-layout
     // view rather than a target-specific hard-coded byte offset.
-    let base = obj.cast::<DrmGemObjectBaseLayout>();
+    let base = obj.cast::<DrmGemObject>();
     let resv = unsafe { (*base).resv.cast::<DmaResv>() };
     let mut cursor: DmaResvIter = unsafe { core::mem::zeroed() };
     cursor.obj = resv;

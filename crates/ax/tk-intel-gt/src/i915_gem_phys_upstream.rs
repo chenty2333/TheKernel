@@ -60,7 +60,7 @@ unsafe fn __get_phys_vaddr(sg: *mut Scatterlist) -> *mut c_void {
 // upstream: i915_gem_phys.c i915_gem_object_get_pages_phys()
 unsafe fn i915_gem_object_get_pages_phys(obj: *mut DrmI915GemObject) -> c_int {
     let mapping = (*file(obj)).f_mapping;
-    let i915 = to_i915((&(*obj).base.base).dev);
+    let i915 = to_i915((&(*obj).base.base).dev.cast());
     let size = (&(*obj).base.base).size as usize;
     if size > u32::MAX as usize {
         return -E2BIG;
@@ -70,7 +70,7 @@ unsafe fn i915_gem_object_get_pages_phys(obj: *mut DrmI915GemObject) -> c_int {
     }
     let mut dma = 0;
     let vaddr = dma_alloc_coherent(
-        drm_device_device((&(*obj).base.base).dev),
+        drm_device_device((&(*obj).base.base).dev.cast()),
         size.next_power_of_two(),
         &mut dma,
         GFP_KERNEL,
@@ -112,7 +112,7 @@ unsafe fn i915_gem_object_get_pages_phys(obj: *mut DrmI915GemObject) -> c_int {
         kfree(st);
     }
     dma_free_coherent(
-        drm_device_device((&(*obj).base.base).dev),
+        drm_device_device((&(*obj).base.base).dev.cast()),
         size.next_power_of_two(),
         vaddr,
         dma,
@@ -148,7 +148,7 @@ pub unsafe fn i915_gem_object_put_pages_phys(obj: *mut DrmI915GemObject, pages: 
     sg_free_table(pages);
     kfree(pages);
     dma_free_coherent(
-        drm_device_device((&(*obj).base.base).dev),
+        drm_device_device((&(*obj).base.base).dev.cast()),
         ((&(*obj).base.base).size as usize).next_power_of_two(),
         vaddr,
         dma,
@@ -164,7 +164,7 @@ pub unsafe fn i915_gem_object_pwrite_phys(
         .add((*args).offset as usize)
         .cast::<c_void>();
     let user = (*args).data_ptr as *const c_void;
-    let i915 = to_i915((&(*obj).base.base).dev);
+    let i915 = to_i915((&(*obj).base.base).dev.cast());
     let err = i915_gem_object_wait(obj, 3, MAX_SCHEDULE_TIMEOUT as i64);
     if err != 0 {
         return err;
@@ -218,7 +218,7 @@ unsafe fn i915_gem_object_shmem_to_phys(obj: *mut DrmI915GemObject) -> c_int {
 // upstream: i915_gem_phys.c i915_gem_object_attach_phys()
 pub unsafe fn i915_gem_object_attach_phys(obj: *mut DrmI915GemObject, align: c_int) -> c_int {
     assert_object_held(obj);
-    if align as u64 > (&(*obj).base.base).size {
+    if align as u64 > (&(*obj).base.base).size as u64 {
         return -EINVAL;
     }
     if !i915_gem_object_is_shmem(obj) {
