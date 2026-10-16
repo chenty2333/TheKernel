@@ -11,6 +11,7 @@ mod connector_uapi_full;
 mod crtc_uapi_full;
 mod device;
 mod dmabuf;
+mod efidrm;
 mod fbdev;
 pub(crate) mod fence;
 mod framebuffer_uapi_full;
@@ -78,11 +79,12 @@ pub fn init_virtio_gpu() -> DrmResult<bool> {
                         let mapping_provider: Arc<dyn upstream::UpstreamGemMmapProvider> =
                             owner.clone();
                         let owner_any: Arc<dyn core::any::Any + Send + Sync> = owner;
-                        match upstream::install_primary(
+                        match upstream::install(
                             raw,
                             owner_any,
                             mode,
                             pci,
+                            "virtio0",
                             Some(mapping_provider),
                         ) {
                             Ok(_) => return Ok(true),
@@ -108,6 +110,11 @@ pub fn init_virtio_gpu() -> DrmResult<bool> {
                 );
             }
         }
+    }
+    // The i915 render bridge still attaches to the legacy-core firmware
+    // device; every other machine gets the upstream efidrm driver.
+    if !intel::has_display_device() && efidrm::init_firmware() {
+        return Ok(true);
     }
     match linear::init_firmware() {
         Ok(ready) => Ok(ready),

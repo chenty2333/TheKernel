@@ -766,7 +766,7 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
     // display.  A machine with no display device at all still has the linear
     // aperture its own firmware programmed, and there a console is the only
     // output the kernel has.
-    if let Some(upstream) = crate::drm::upstream::primary() {
+    if let Some(upstream) = crate::drm::upstream::fbdev_device() {
         match upstream_fb::device(fs.clone(), upstream) {
             Ok(Some(framebuffer)) => root.add("fb0", framebuffer),
             Ok(None) => info!("Upstream DRM has no registered fb_info; /dev/fb0 is not published"),
@@ -791,20 +791,31 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
         }
     }
 
-    if let Some(device) = crate::drm::upstream::primary() {
+    let upstream_devices = crate::drm::upstream::devices();
+    if !upstream_devices.is_empty() {
         let mut dri = DirMapping::new();
-        match upstream_dri::primary_node(fs.clone(), device.clone()) {
-            Ok(node) => {
-                dri.add("card0", node);
-                match upstream_dri::render_node(fs.clone(), device) {
-                    Ok(Some(render)) => dri.add("renderD128", render),
-                    Ok(None) => {}
-                    Err(error) => error!("Failed to publish upstream DRM render node: {error}"),
+        for device in upstream_devices {
+            let Some(card) = device.primary_index() else {
+                continue;
+            };
+            match upstream_dri::primary_node(fs.clone(), device.clone()) {
+                Ok(node) => {
+                    dri.add(alloc::format!("card{card}"), node);
+                    match upstream_dri::render_node(fs.clone(), device.clone()) {
+                        Ok(Some(render)) => dri.add(
+                            alloc::format!("renderD{}", device.render_index().unwrap_or(128)),
+                            render,
+                        ),
+                        Ok(None) => {}
+                        Err(error) => error!(
+                            "Failed to publish upstream DRM render node of card{card}: {error}"
+                        ),
+                    }
                 }
-                root.add("dri", SimpleDir::new_maker(fs.clone(), Arc::new(dri)));
+                Err(error) => error!("Failed to publish upstream DRM card{card}: {error}"),
             }
-            Err(error) => error!("Failed to publish upstream DRM primary node: {error}"),
         }
+        root.add("dri", SimpleDir::new_maker(fs.clone(), Arc::new(dri)));
     } else if let Some(device) = crate::drm::primary_device() {
         let mut dri = DirMapping::new();
         dri.add("card0", dri::primary_node(fs.clone(), device.clone()));

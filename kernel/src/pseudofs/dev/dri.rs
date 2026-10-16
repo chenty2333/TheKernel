@@ -116,7 +116,7 @@ pub(super) fn pci_registrations(
     Ok(vec![pci, transport])
 }
 
-fn platform_registration(name: &str) -> VfsResult<Arc<DeviceRegistration>> {
+pub(super) fn platform_registration(name: &str) -> VfsResult<Arc<DeviceRegistration>> {
     DeviceRegistration::try_bus_device(
         DeviceIdentity::without_dev("platform".into(), "platform".into(), name.into())?,
         "platform_device".into(),

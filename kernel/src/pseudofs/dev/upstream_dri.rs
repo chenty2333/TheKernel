@@ -12,13 +12,14 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs_ng_vfs::{Location, NodeFlags, VfsResult};
+use axfs_ng_vfs::{DeviceId, Location, NodeFlags, VfsResult};
 use axio::prelude::*;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable};
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::{O_ACCMODE, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, S_IFCHR};
 use memory_addr::PhysAddr;
 use tk_drm_upstream::{
+    drm_connector_types::{CONNECTOR_STATUS_CONNECTED, DrmConnector},
     drm_file_types::{DrmFile, DrmMinor},
     drm_gem_shmem_helper_types_upstream::DrmGemShmemObject,
     drm_gem_types::DrmGemObject,
@@ -32,8 +33,8 @@ use tk_linux_kapi::{
 };
 
 use super::dri::{
-    DRM_PRIMARY_DEVICE_ID, DRM_PRIMARY_NODE_MODE, DRM_RENDER_DEVICE_ID, DRM_RENDER_NODE_MODE,
-    attach_drm_minor, attribute, mode_attribute, publish_pci_parent,
+    DRM_PRIMARY_NODE_MODE, DRM_RENDER_NODE_MODE, attach_drm_minor, attribute, mode_attribute,
+    platform_registration, publish_pci_parent,
 };
 use crate::{
     drm::{Mode, upstream::UpstreamDrmDevice},
@@ -45,7 +46,7 @@ use crate::{
     pseudofs::{
         DeviceOpen, DeviceOps,
         device_registry::{
-            DeviceHandle, DeviceIdentity, DeviceRegistration, DeviceReservation, MAX_DEVICES,
+            DeviceHandle, DeviceIdentity, DeviceRegistration, MAX_DEVICES,
             global_device_registry,
         },
     },
@@ -95,20 +96,29 @@ pub(crate) fn render_node(
     }
 }
 
+/// DRM character devices use major 226 with the `drm_minor.index` as minor:
+/// primary minors from 0, render minors from 128 (drm_drv.c).
+fn minor_device_id(device: &UpstreamDrmDevice, render: bool) -> Option<DeviceId> {
+    let index = if render {
+        device.render_index()?
+    } else {
+        device.primary_index()?
+    };
+    Some(DeviceId::new(226, index))
+}
+
 fn node(
     fs: Arc<crate::pseudofs::SimpleFs>,
     device: Arc<UpstreamDrmDevice>,
     render: bool,
     registry_handles: Vec<DeviceHandle<'static, MAX_DEVICES>>,
 ) -> Arc<crate::pseudofs::Device> {
+    let device_id = minor_device_id(&device, render)
+        .unwrap_or_else(|| DeviceId::new(226, if render { 128 } else { 0 }));
     crate::pseudofs::Device::new_with_permissions(
         fs,
         axfs_ng_vfs::NodeType::CharacterDevice,
-        if render {
-            DRM_RENDER_DEVICE_ID
-        } else {
-            DRM_PRIMARY_DEVICE_ID
-        },
+        device_id,
         axfs_ng_vfs::NodePermission::from_bits_truncate(if render {
             DRM_RENDER_NODE_MODE
         } else {
@@ -122,80 +132,107 @@ fn node(
     )
 }
 
+/// `(connector name, connected)` for every connector on the device, as
+/// `drm_sysfs_connector_add()` names them (`card<N>-<connector->name>`).
+fn connectors(device: &UpstreamDrmDevice) -> Vec<(alloc::string::String, bool)> {
+    let mut found = Vec::new();
+    let dev = device.raw();
+    // SAFETY: the connector list is initialized by drm_mode_config_init() and
+    // only changes under connector_list_lock, which is held for the walk.
+    unsafe {
+        let config = ptr::addr_of_mut!((*dev).mode_config);
+        let lock = ptr::addr_of_mut!((*config).connector_list_lock);
+        tk_linux_kapi::locks::spin_lock(&mut *lock);
+        let head = ptr::addr_of_mut!((*config).connector_list);
+        let mut entry = (*head).next;
+        while !entry.is_null() && entry != head {
+            let connector = entry
+                .cast::<u8>()
+                .sub(core::mem::offset_of!(DrmConnector, head))
+                .cast::<DrmConnector>();
+            let name = (*connector).name;
+            if !name.is_null() {
+                let name = core::ffi::CStr::from_ptr(name).to_string_lossy().into_owned();
+                if found.try_reserve(1).is_ok() {
+                    found.push((name, (*connector).status == CONNECTOR_STATUS_CONNECTED));
+                }
+            }
+            entry = (*entry).next;
+        }
+        tk_linux_kapi::locks::spin_unlock(&mut *lock);
+    }
+    found
+}
+
 fn publish_sysfs(device: &UpstreamDrmDevice) -> VfsResult<Vec<DeviceHandle<'static, MAX_DEVICES>>> {
-    let identity = device
-        .pci_identity()
-        .ok_or(axfs_ng_vfs::VfsError::NotFound)?;
     let mut parents = Vec::new();
-    let transport = publish_pci_parent(identity, &mut parents)?;
-    let attach = |identity| attach_drm_minor(identity, &Some(transport.clone()));
-    let card = DeviceRegistration::try_new(
+    let label = device.label();
+    let transport = if let Some(identity) = device.pci_identity() {
+        publish_pci_parent(identity, &mut parents)?
+    } else {
+        let platform = platform_registration(label)?;
+        let reservation = global_device_registry().reserve(platform.identity().clone())?;
+        parents.push(reservation.publish(platform)?);
+        format!("platform/{label}")
+    };
+    let transport = Some(transport);
+    let attach = |identity| attach_drm_minor(identity, &transport);
+    let card_index = device.primary_index().ok_or(axfs_ng_vfs::VfsError::NotFound)?;
+    let card_name = format!("card{card_index}");
+    let mut registrations = Vec::new();
+    registrations.push(DeviceRegistration::try_new(
         attach(
             DeviceIdentity::new(
-                "virtio0".into(),
+                label.into(),
                 "drm".into(),
-                "card0".into(),
-                DRM_PRIMARY_DEVICE_ID,
+                card_name.clone(),
+                minor_device_id(device, false).ok_or(axfs_ng_vfs::VfsError::NotFound)?,
             )?
-            .with_devname("dri/card0".into())?,
+            .with_devname(format!("dri/{card_name}"))?,
         )?,
         "drm_minor".into(),
         Vec::new(),
         None,
-    )?;
-    let connector = DeviceRegistration::try_new(
-        DeviceIdentity::without_dev("virtio0".into(), "drm".into(), "card0-Virtual-1".into())?
-            .child_of_path(format!("{transport}/drm"), "card0".into())?,
-        "drm_connector".into(),
-        vec![
-            attribute("status", "connected\n"),
-            mode_attribute(Mode {
+    )?);
+    let connector_parent = format!("{}/drm", transport.as_deref().unwrap_or(label));
+    for (index, (name, connected)) in connectors(device).into_iter().enumerate() {
+        let mut attributes = vec![attribute(
+            "status",
+            if connected { "connected\n" } else { "disconnected\n" },
+        )];
+        if index == 0 && device.mode() != (0, 0) {
+            attributes.push(mode_attribute(Mode {
                 width: device.mode().0,
                 height: device.mode().1,
                 refresh_millihz: 60_000,
-            }),
-        ],
-        None,
-    )?;
-    let card_reservation = global_device_registry().reserve(card.identity().clone())?;
-    let connector_reservation = global_device_registry().reserve(connector.identity().clone())?;
-    // SAFETY: `device.raw()` points to a valid, live Linux `drm_device` managed by `device`.
-    // The `render` minor pointer is initialized during device setup and remains read-only
-    // throughout the device's published lifetime.
-    let render_minor = unsafe { !(*device.raw()).render.is_null() };
-    if !render_minor {
-        let (card, connector) = DeviceReservation::publish_pair(
-            card_reservation,
-            card,
-            connector_reservation,
-            connector,
-        )?;
-        parents.extend([card, connector]);
-        return Ok(parents);
+            }));
+        }
+        registrations.push(DeviceRegistration::try_new(
+            DeviceIdentity::without_dev(label.into(), "drm".into(), format!("{card_name}-{name}"))?
+                .child_of_path(connector_parent.clone(), card_name.clone())?,
+            "drm_connector".into(),
+            attributes,
+            None,
+        )?);
     }
-    let render = DeviceRegistration::try_new(
-        attach(
-            DeviceIdentity::new(
-                "virtio0".into(),
-                "drm".into(),
-                "renderD128".into(),
-                DRM_RENDER_DEVICE_ID,
-            )?
-            .with_devname("dri/renderD128".into())?,
-        )?,
-        "drm_minor".into(),
-        Vec::new(),
-        None,
-    )?;
-    let render_reservation = global_device_registry().reserve(render.identity().clone())?;
-    parents.extend(
-        DeviceReservation::publish_many([
-            (card_reservation, card),
-            (connector_reservation, connector),
-            (render_reservation, render),
-        ])?
-        .into_iter(),
-    );
+    if let Some(render_id) = minor_device_id(device, true) {
+        let render_name = format!("renderD{}", render_id.minor());
+        registrations.push(DeviceRegistration::try_new(
+            attach(
+                DeviceIdentity::new(label.into(), "drm".into(), render_name.clone(), render_id)?
+                    .with_devname(format!("dri/{render_name}"))?,
+            )?,
+            "drm_minor".into(),
+            Vec::new(),
+            None,
+        )?);
+    }
+    // Card first, then its connectors and render minor, so every child finds
+    // its parent already published.
+    for registration in registrations {
+        let reservation = global_device_registry().reserve(registration.identity().clone())?;
+        parents.push(reservation.publish(registration)?);
+    }
     Ok(parents)
 }
 
@@ -346,44 +383,43 @@ impl UpstreamDrmFile {
             unsafe { tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), self.raw()) };
             return Err(AxError::NoSuchDevice);
         }
-        let Some(native_device) = crate::drm::primary_device() else {
-            // SAFETY: `self.raw()` is our open `LinuxFile`. Releasing it ensures DRM driver open
-            // hooks and file state are undone if native device lookup fails.
-            unsafe { tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), self.raw()) };
-            return Err(AxError::NoSuchDevice);
-        };
-        // Use a non-master shadow file for both DRM node kinds: the upstream
-        // Linux file remains authoritative for DRM mastership, while this
-        // kernel file owns only GEM and syncobj identity aliases.
-        let native = match native_device.open_render() {
-            Ok(native) => native,
-            Err(error) => {
-                // SAFETY: `self.raw()` points to our valid open `LinuxFile`. Calling `drm_release`
-                // performs necessary driver cleanup before aborting `open`.
-                unsafe {
-                    tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), self.raw())
-                };
-                return Err(AxError::from(error));
-            }
-        };
-        // SAFETY: `self.raw()` points to our valid `LinuxFile` whose `f_flags` are initialized
-        // during `new()` and modified only under `flags_lock`.
-        native.set_open_flags(unsafe { (*self.raw()).f_flags });
-        let binding = match crate::drm::intel::upstream_file::V1FileBinding::register(
-            private.cast(),
-        ) {
-            Ok(binding) => binding,
-            Err(error) => {
-                // SAFETY: `self.raw()` points to our valid open `LinuxFile`. Rolling back with
-                // `drm_release` frees the DRM file context upon shadow registration failure.
-                unsafe {
-                    tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), self.raw())
-                };
-                return Err(error);
-            }
-        };
-        self.native_shadow = Some(native);
-        self.native_binding = Some(binding);
+        // A legacy-core device exists only while the i915 V1 bridge needs a
+        // kernel-side GEM/syncobj alias table; upstream-only devices dispatch
+        // straight to drm_ioctl().
+        if let Some(native_device) = crate::drm::primary_device() {
+            // Use a non-master shadow file for both DRM node kinds: the upstream
+            // Linux file remains authoritative for DRM mastership, while this
+            // kernel file owns only GEM and syncobj identity aliases.
+            let native = match native_device.open_render() {
+                Ok(native) => native,
+                Err(error) => {
+                    // SAFETY: `self.raw()` points to our valid open `LinuxFile`. Calling `drm_release`
+                    // performs necessary driver cleanup before aborting `open`.
+                    unsafe {
+                        tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), self.raw())
+                    };
+                    return Err(AxError::from(error));
+                }
+            };
+            // SAFETY: `self.raw()` points to our valid `LinuxFile` whose `f_flags` are initialized
+            // during `new()` and modified only under `flags_lock`.
+            native.set_open_flags(unsafe { (*self.raw()).f_flags });
+            let binding = match crate::drm::intel::upstream_file::V1FileBinding::register(
+                private.cast(),
+            ) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    // SAFETY: `self.raw()` points to our valid open `LinuxFile`. Rolling back with
+                    // `drm_release` frees the DRM file context upon shadow registration failure.
+                    unsafe {
+                        tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), self.raw())
+                    };
+                    return Err(error);
+                }
+            };
+            self.native_shadow = Some(native);
+            self.native_binding = Some(binding);
+        }
         let entry = self.wait_entry.get();
         // SAFETY: `entry` is pinned by `UpstreamDrmFile`'s allocation, `self.waiters` is a valid
         // `Arc<PollSet>` whose raw pointer remains valid until drop, and `private` was validated
@@ -576,10 +612,10 @@ impl FileLike for UpstreamDrmFile {
     }
 
     fn ioctl(&self, _context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
-        self.with_native_binding(|_| {
-            // SAFETY: `self.raw()` is a valid open `LinuxFile` bound to its shadow context.
-            // Upstream `drm_ioctl` handles validation, permission checks, and internal locking
-            // for the command and user argument pointer.
+        let call = || {
+            // SAFETY: `self.raw()` is a valid open `LinuxFile`. Upstream `drm_ioctl` handles
+            // validation, permission checks, and internal locking for the command and user
+            // argument pointer.
             let result = unsafe {
                 tk_drm_upstream::drm_ioctl_upstream::drm_ioctl(self.raw(), cmd, arg as c_ulong)
             };
@@ -588,7 +624,12 @@ impl FileLike for UpstreamDrmFile {
             } else {
                 Ok(result as usize)
             }
-        })
+        };
+        if self.native_shadow.is_some() {
+            self.with_native_binding(|_| call())
+        } else {
+            call()
+        }
     }
 
     fn prepare_mmap(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
@@ -620,11 +661,8 @@ impl FileLike for UpstreamDrmFile {
 
     fn stat(&self) -> AxResult<Kstat> {
         Ok(Kstat {
-            rdev: if self.render {
-                DRM_RENDER_DEVICE_ID
-            } else {
-                DRM_PRIMARY_DEVICE_ID
-            },
+            rdev: minor_device_id(&self.device, self.render)
+                .unwrap_or_else(|| DeviceId::new(226, if self.render { 128 } else { 0 })),
             mode: S_IFCHR
                 | if self.render {
                     DRM_RENDER_NODE_MODE as u32
