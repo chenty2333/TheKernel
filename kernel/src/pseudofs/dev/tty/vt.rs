@@ -251,6 +251,13 @@ lazy_static! {
     pub static ref VT_MANAGER: Arc<VtManager> = Arc::new(VtManager::new());
 }
 
+#[cfg(test)]
+pub(crate) fn set_active_graphics_for_test(graphics: bool) -> bool {
+    let mut state = VT_MANAGER.state.lock();
+    let active = state.active as usize - 1;
+    core::mem::replace(&mut state.vts[active].graphics, graphics)
+}
+
 impl VtManager {
     pub fn new() -> Self {
         let mut vts = Vec::with_capacity(MAX_VTS);

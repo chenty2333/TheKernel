@@ -39,6 +39,8 @@ pub use self::{
     pty::PtyDriver,
     vt::{VT_MANAGER, VtDevice, notify_vt_owner_exit},
 };
+#[cfg(test)]
+pub(crate) use self::vt::set_active_graphics_for_test;
 use self::{
     pts::PtsLease,
     pty::PtyEndpoint,

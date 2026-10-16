@@ -507,6 +507,34 @@ impl UpstreamDrmFile {
         self.raw.get()
     }
 
+    fn dispatch_ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+        let call = || {
+            // SAFETY: `self.raw()` is a valid open `LinuxFile`. Upstream `drm_ioctl` handles
+            // validation, permission checks, and internal locking for the command and user
+            // argument pointer.
+            let result = unsafe {
+                tk_drm_upstream::drm_ioctl_upstream::drm_ioctl(self.raw(), cmd, arg as c_ulong)
+            };
+            if result < 0 {
+                Err(errno_to_ax(result))
+            } else {
+                Ok(result as usize)
+            }
+        };
+        if cmd != tk_drm_upstream::uapi_drm_consts::DRM_IOCTL_DROP_MASTER || self.render {
+            return call();
+        }
+        // SAFETY: `open()` set private_data to this file's live `drm_file`.
+        let private = unsafe { (*self.raw()).private_data.cast::<DrmFile>() };
+        // SAFETY: `private` stays live until this file's release.
+        let was_master = unsafe { tk_drm_upstream::drm_auth_upstream::drm_is_current_master(private) };
+        let result = call();
+        if was_master && result.is_ok() {
+            crate::pseudofs::dev::restore_console_after_master_close();
+        }
+        result
+    }
+
     fn allows_read(&self) -> bool {
         matches!(self.access_mode, O_RDONLY | O_RDWR)
     }
@@ -718,31 +746,7 @@ impl FileLike for UpstreamDrmFile {
     }
 
     fn ioctl(&self, _context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
-        let call = || {
-            // SAFETY: `self.raw()` is a valid open `LinuxFile`. Upstream `drm_ioctl` handles
-            // validation, permission checks, and internal locking for the command and user
-            // argument pointer.
-            let result = unsafe {
-                tk_drm_upstream::drm_ioctl_upstream::drm_ioctl(self.raw(), cmd, arg as c_ulong)
-            };
-            if result < 0 {
-                Err(errno_to_ax(result))
-            } else {
-                Ok(result as usize)
-            }
-        };
-        if cmd != tk_drm_upstream::uapi_drm_consts::DRM_IOCTL_DROP_MASTER || self.render {
-            return call();
-        }
-        // SAFETY: `open()` set private_data to this file's live `drm_file`.
-        let private = unsafe { (*self.raw()).private_data.cast::<DrmFile>() };
-        // SAFETY: `private` stays live until this file's release.
-        let was_master = unsafe { tk_drm_upstream::drm_auth_upstream::drm_is_current_master(private) };
-        let result = call();
-        if was_master && result.is_ok() {
-            crate::pseudofs::dev::restore_console_after_master_close();
-        }
-        result
+        self.dispatch_ioctl(cmd, arg)
     }
 
     fn prepare_mmap(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
@@ -1197,7 +1201,7 @@ fn blob_map_error(error: axdriver_display::DevError) -> AxError {
 
 #[cfg(test)]
 mod tests {
-    use alloc::sync::Arc;
+    use alloc::{boxed::Box, sync::Arc};
     use core::{
         sync::atomic::{AtomicUsize, Ordering},
         task::Waker,
@@ -1205,6 +1209,26 @@ mod tests {
     use alloc::task::Wake;
 
     use super::*;
+    use crate::{
+        drm::upstream::test_unregistered_device,
+        pseudofs::dev::{
+            console_fb::{self, DisplayCore, tests::MemorySurface},
+            scanout::ScanoutSurface,
+            tty::set_active_graphics_for_test,
+        },
+    };
+    use tk_linux_kapi::{
+        list::INIT_LIST_HEAD,
+        memory::atomic_inc,
+        wait::add_wait_queue,
+    };
+    use tk_drm_upstream::{
+        drm_auth_upstream::{drm_is_current_master, drm_master_open},
+        drm_drv_types::DrmDriver,
+        drm_drv_upstream::{drm_dev_alloc, drm_dev_get, drm_dev_put},
+        drm_file_upstream::drm_file_alloc,
+        uapi_drm_consts::DRM_IOCTL_DROP_MASTER,
+    };
 
     struct WakeCounter(AtomicUsize);
     impl Wake for WakeCounter {
@@ -1215,6 +1239,78 @@ mod tests {
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    struct ConsoleGuard(Option<Arc<DisplayCore>>);
+
+    impl ConsoleGuard {
+        fn install(display: Arc<DisplayCore>) -> Self {
+            Self(console_fb::replace_console_for_test(Some(display)))
+        }
+    }
+
+    impl Drop for ConsoleGuard {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            let _ = console_fb::replace_console_for_test(previous);
+        }
+    }
+
+    struct VtModeGuard(bool);
+
+    impl VtModeGuard {
+        fn set_graphics(graphics: bool) -> Self {
+            Self(set_active_graphics_for_test(graphics))
+        }
+    }
+
+    impl Drop for VtModeGuard {
+        fn drop(&mut self) {
+            set_active_graphics_for_test(self.0);
+        }
+    }
+
+    fn test_device() -> (Arc<UpstreamDrmDevice>, *mut tk_drm_upstream::drm_device_types::DrmDevice, Box<DrmDriver>) {
+        let driver = Box::new(unsafe { core::mem::zeroed::<DrmDriver>() });
+        let raw = unsafe { drm_dev_alloc(&*driver, ptr::null_mut()) };
+        assert!(!raw.is_null());
+        let owner: Arc<dyn core::any::Any + Send + Sync> = Arc::new(());
+        let device = test_unregistered_device(raw, owner).expect("test DRM device wrapper");
+        (device, raw, driver)
+    }
+
+    fn test_open_file(device: Arc<UpstreamDrmDevice>, render: bool) -> Box<UpstreamDrmFile> {
+        let dev = device.raw();
+        let minor = unsafe { if render { (*dev).render } else { (*dev).primary } };
+        assert!(!minor.is_null());
+        let file = Box::new(UpstreamDrmFile::new(device, render, O_RDWR));
+        unsafe {
+            // Match the references/accounting normally acquired by
+            // drm_minor_acquire() before the helper allocates file-private state.
+            drm_dev_get(dev);
+            atomic_inc(&mut (*dev).open_count);
+            let private = drm_file_alloc(minor);
+            assert!(!private.is_null());
+            (*file.raw()).private_data = private.cast();
+            (*private).filp = file.raw();
+            if !render {
+                assert_eq!(drm_master_open(private), 0);
+            }
+            let entry = file.wait_entry.get();
+            (*entry).private = Arc::as_ptr(&file.waiters).cast_mut().cast();
+            (*entry).func = Some(wake_poll_waiters);
+            INIT_LIST_HEAD(ptr::addr_of_mut!((*entry).entry));
+            add_wait_queue(&mut *ptr::addr_of_mut!((*private).event_wait), &mut *entry);
+        }
+        file
+    }
+
+    fn console_fixture() -> (Arc<MemorySurface>, ConsoleGuard, VtModeGuard) {
+        let mode = VtModeGuard::set_graphics(false);
+        let surface = MemorySurface::new(64, 48);
+        let core = Arc::new(DisplayCore::new(surface.clone()));
+        let console = ConsoleGuard::install(core);
+        (surface, console, mode)
     }
 
     #[test]
@@ -1241,5 +1337,83 @@ mod tests {
             1
         );
         assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn closing_primary_master_restores_console_in_text_mode() {
+        let _context = crate::test_support::scheduler_test_context();
+        let (surface, _console, _mode) = console_fixture();
+        surface.set_master(false).unwrap();
+
+        let (device, raw, _driver) = test_device();
+        let file = test_open_file(device.clone(), false);
+        let private = unsafe { (*file.raw()).private_data.cast::<DrmFile>() };
+        assert!(unsafe { drm_is_current_master(private) });
+
+        drop(file);
+        assert!(surface.is_master());
+        assert_eq!(surface.restore_text_calls(), 1);
+        drop(device);
+        unsafe { drm_dev_put(raw) };
+    }
+
+    #[test]
+    fn drop_master_ioctl_restores_console_and_close_does_not_repeat_it() {
+        let _context = crate::test_support::scheduler_test_context();
+        let (surface, _console, _mode) = console_fixture();
+        surface.set_master(false).unwrap();
+
+        let (device, raw, _driver) = test_device();
+        let file = test_open_file(device.clone(), false);
+        let private = unsafe { (*file.raw()).private_data.cast::<DrmFile>() };
+        assert!(unsafe { drm_is_current_master(private) });
+
+        assert_eq!(file.dispatch_ioctl(DRM_IOCTL_DROP_MASTER, 0), Ok(0));
+        assert!(!unsafe { drm_is_current_master(private) });
+        assert!(surface.is_master());
+        assert_eq!(surface.restore_text_calls(), 1);
+
+        drop(file);
+        assert_eq!(surface.restore_text_calls(), 1);
+        drop(device);
+        unsafe { drm_dev_put(raw) };
+    }
+
+    #[test]
+    fn nonmaster_render_and_graphics_vt_never_reclaim_scanout() {
+        let _context = crate::test_support::scheduler_test_context();
+        let (surface, _console, _mode) = console_fixture();
+        surface.set_master(false).unwrap();
+        let (device, raw, _driver) = test_device();
+
+        let master = test_open_file(device.clone(), false);
+        let nonmaster = test_open_file(device.clone(), false);
+        let render = test_open_file(device.clone(), true);
+        let nonmaster_private = unsafe { (*nonmaster.raw()).private_data.cast::<DrmFile>() };
+        assert!(!unsafe { drm_is_current_master(nonmaster_private) });
+        drop(nonmaster);
+        assert!(!surface.is_master());
+        assert_eq!(surface.restore_text_calls(), 0);
+        drop(render);
+        assert!(!surface.is_master());
+        assert_eq!(surface.restore_text_calls(), 0);
+
+        // The screen belongs to a graphics VT now. Neither a final primary
+        // close nor an explicit DROP_MASTER may steal it back for fbcon.
+        let _graphics = VtModeGuard::set_graphics(true);
+        drop(master);
+        assert!(!surface.is_master());
+        assert_eq!(surface.restore_text_calls(), 0);
+
+        let master = test_open_file(device.clone(), false);
+        assert_eq!(master.dispatch_ioctl(DRM_IOCTL_DROP_MASTER, 0), Ok(0));
+        assert!(!surface.is_master());
+        assert_eq!(surface.restore_text_calls(), 0);
+        drop(master);
+        assert!(!surface.is_master());
+        assert_eq!(surface.restore_text_calls(), 0);
+
+        drop(device);
+        unsafe { drm_dev_put(raw) };
     }
 }

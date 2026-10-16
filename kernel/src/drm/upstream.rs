@@ -153,6 +153,29 @@ impl UpstreamDrmDevice {
     }
 }
 
+/// Build the VFS owner around a freshly allocated DRM core for adapter tests.
+/// Unlike [`install`], this deliberately does not publish into `DEVICES` or
+/// require minor registration; the test supplies the core's valid minors and
+/// holds its base reference for the fixture lifetime.
+#[cfg(test)]
+pub(crate) fn test_unregistered_device(
+    raw: *mut DrmDevice,
+    owner: Arc<dyn Any + Send + Sync>,
+) -> AxResult<Arc<UpstreamDrmDevice>> {
+    let raw = NonNull::new(raw).ok_or(AxError::InvalidInput)?;
+    Arc::try_new(UpstreamDrmDevice {
+        raw,
+        owner,
+        mode: (0, 0),
+        pci: None,
+        label: "test-drm",
+        gem_mmap: None,
+        unplugged: core::sync::atomic::AtomicBool::new(false),
+        external_pages: Mutex::new(Vec::new()),
+    })
+    .map_err(|_| AxError::NoMemory)
+}
+
 lazy_static! {
     static ref DEVICES: Mutex<Vec<Arc<UpstreamDrmDevice>>> = Mutex::new(Vec::new());
 }
@@ -236,4 +259,3 @@ pub(crate) fn unplug(expected: *mut DrmDevice) -> AxResult<()> {
     unsafe { tk_drm_upstream::drm_client_event_upstream::drm_client_dev_unregister(expected) };
     Ok(())
 }
-

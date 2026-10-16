@@ -113,6 +113,13 @@ lazy_static! {
         SpinNoIrq::new(None);
 }
 
+#[cfg(test)]
+pub(crate) fn replace_console_for_test(
+    display: Option<Arc<DisplayCore>>,
+) -> Option<Arc<DisplayCore>> {
+    core::mem::replace(&mut *CONSOLE.lock(), display)
+}
+
 /// A short-lived, exclusive-in-practice view used only by the in-kernel
 /// framebuffer console. fbdev users still own the ABI surface; fbcon merely
 /// repaints before KD_TEXT scanout commits.
@@ -461,7 +468,7 @@ pub(crate) fn resume_text() {
 
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use alloc::{sync::Arc, vec::Vec};
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -501,7 +508,7 @@ mod tests {
     ///
     /// It stands in for the linear aperture a firmware programs, which is the
     /// only display a machine without a virtio-gpu device can have.
-    struct MemorySurface {
+    pub(crate) struct MemorySurface {
         bytes: Mutex<Vec<u8>>,
         width: u32,
         height: u32,
@@ -510,12 +517,13 @@ mod tests {
         presents: AtomicU64,
         write_batches: AtomicU64,
         master: AtomicBool,
+        restore_text_calls: AtomicU64,
     }
 
     impl MemorySurface {
         /// A surface in the virtio-gpu layout, which is what the reference
         /// display device produces.
-        fn new(width: u32, height: u32) -> Arc<Self> {
+        pub(crate) fn new(width: u32, height: u32) -> Arc<Self> {
             Self::with_layout(width, height, PixelLayout::B8G8R8A8)
         }
 
@@ -534,7 +542,16 @@ mod tests {
                 presents: AtomicU64::new(0),
                 write_batches: AtomicU64::new(0),
                 master: AtomicBool::new(true),
+                restore_text_calls: AtomicU64::new(0),
             })
+        }
+
+        pub(crate) fn is_master(&self) -> bool {
+            self.master.load(Ordering::Acquire)
+        }
+
+        pub(crate) fn restore_text_calls(&self) -> u64 {
+            self.restore_text_calls.load(Ordering::Acquire)
         }
     }
 
@@ -609,6 +626,7 @@ mod tests {
         }
 
         fn restore_text(&self, _nonblocking: bool) -> AxResult<()> {
+            self.restore_text_calls.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 
