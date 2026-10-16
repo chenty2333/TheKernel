@@ -17,14 +17,14 @@
 //! | [`initial_plane`] | the firmware framebuffer's plane and stolen pages, read before i915 takes the GGTT |
 //! | [`upstream_probe`] | the deferred i915 probe, run once the rootfs has the GuC/HuC firmware |
 //! | [`upstream_memory`] | the GGTT reservation of the firmware console and its DMA identity lease |
-//! | [`upstream_gt`], [`upstream_drm`], [`upstream_file`], [`upstream_sync`] | the kernel providers i915 calls into |
+//! | [`upstream_gt`], [`upstream_drm`], [`upstream_mmap`] | the kernel providers i915 calls into, and the mmap of its GEM objects |
 //! | [`irq`] | MSI for the GPU and the GT interrupt forwarder |
 //! | [`power`] | the `POWER_DOMAIN_GT_IRQ` reference rule for a device without a display |
 //!
-//! There is no KMS modesetting on Intel yet. The screen is the firmware (GOP)
-//! framebuffer console, registered by [`crate::drm::linear`]. i915 runs with
-//! `HAS_DISPLAY() == false` for everything display-related, as Linux does for a
-//! device without display pipes.
+//! i915 registers with the upstream DRM core like any other driver (render
+//! node plus a card node). Unless `intel.native_modeset=1` is given, the screen
+//! stays on the firmware (GOP) framebuffer driven by efidrm, and i915's display
+//! entry points stay closed.
 
 pub(crate) mod debugfs;
 mod dma;

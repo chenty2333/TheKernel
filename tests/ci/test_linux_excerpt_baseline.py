@@ -43,10 +43,18 @@ WINDOW = 14
 # to i915 here. See the dated reconciliation in docs/upstream-provenance.md.
 SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     ("crates/linux", 40): (110, 49, 20, 25, 0, 18, 21),
-    ("kernel/src", 40): (85, 41, 19, 142, 9, 0, 0),
-    ("crates/ax", 40): (0, 0, 0, 1014, 984, 0, 0),
+    ("kernel/src", 40): (85, 41, 19, 130, 8, 0, 0),
+    ("crates/ax", 40): (0, 0, 0, 1213, 1179, 0, 0),
     ("crates/linux", 25): (211, 59, 22, 41, 3, 20, 21),
-    ("kernel/src", 25): (157, 50, 24, 321, 25, 0, 0),
+    ("kernel/src", 25): (157, 50, 24, 301, 16, 0, 0),
+# 2026-10-16 (V2: legacy kernel DRM core deleted in bc5bc89a; DRM moved onto
+# tk-drm-upstream with efidrm/sysfb, drm_format_helper, cfb/fb_io, sync_file,
+# dma-fence/dma-resv in tk-linux-kapi, and the i915 display parent-interface
+# and native-display-link translations in tk-intel-gt): kernel/src moves from
+# 142/9 to 130/8 at >= 40 and from 321/25 to 301/16 at >= 25 (legacy core
+# removed); crates/ax moves from 1014/984 to 1213/1179 at >= 40 and from
+# 2632/2594 to 3192/3149 at >= 25 (new MIT/GPL translations, recorded in
+# docs/upstream-provenance.md).
 # 2026-10-13 merge of B3a + DRM review fixes + B2b on main: baseline before
 # B3b was 938/908 at >= 40 and 2452/2414 at >= 25.
 # Merging B3b into that tree moves crates/ax to 1014/984 at >= 40 (76 code
@@ -102,7 +110,7 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
 # lines in the newly translated FreeBSD drivers and the OpenBSD iwx/net80211
 # translations, plus one FreeBSD ig4 register line. Those have BSD-source
 # provenance, not Linux provenance; see `docs/upstream-provenance.md`.
-    ("crates/ax", 25): (18, 15, 4, 2632, 2594, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 3192, 3149, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their
