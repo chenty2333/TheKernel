@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 //! Linux `irq_work` for the TheKernel task runtime. A queued callback runs in
 //! task context, never synchronously in the producer's IRQ context.
 

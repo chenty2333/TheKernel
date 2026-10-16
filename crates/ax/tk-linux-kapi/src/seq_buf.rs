@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 //! Translation of Linux 7.2.3 `lib/seq_buf.c` and the inline helpers of
 //! `include/linux/seq_buf.h` (GPL-2.0 upstream), the subset used by the DRM
 //! and i915 state dumps: `seq_buf_printf`/`vprintf`, `puts`, `putc`,

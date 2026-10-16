@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 //! LinuxKPI dma-fence unwrapping: Linux 7.2.3 `drivers/dma-buf/dma-fence-unwrap.c`
 //! and `include/linux/dma-fence-unwrap.h`. A cursor walks the members of
 //! `dma_fence_chain` and `dma_fence_array` containers; the merge combines

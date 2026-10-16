@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright 2026 TheKernel contributors.
 //! Port of Linux `drivers/gpu/drm/drm_gem_atomic_helper.c` (batch B2b).
 
 #![allow(non_snake_case, dead_code, unsafe_code)]

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 //! Port of Linux `drivers/gpu/drm/sysfb/drm_sysfb_helper.h` (v7.2.3) type
 //! definitions and inline helpers, plus the firmware-boot inputs the sysfb
 //! helpers consume:

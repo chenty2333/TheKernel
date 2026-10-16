@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright 2026 TheKernel contributors.
 //! Translation of Linux 7.2.3 `drivers/i2c/algos/i2c-algo-bit.c` and
 //! `include/linux/i2c-algo-bit.h` (GPL-2.0 upstream): the bit-banging I2C
 //! algorithm that drives SCL and SDA through per-platform line callbacks.

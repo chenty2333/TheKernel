@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 // Source: drivers/video/fbdev/core/fb_io_fops.c (Linux v7.2.3).
 //! Fbdev read/write helpers for framebuffers in I/O memory (`fb_io_read()`,
 //! `fb_io_write()`). The mmap helper is not used by any caller of this port.

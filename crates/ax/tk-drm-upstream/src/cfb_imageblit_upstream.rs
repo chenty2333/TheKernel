@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 // Source: drivers/video/fbdev/core/cfbimgblt.c and fb_imageblit.h (Linux v7.2.3).
 //! `cfb_imageblit()`: glyph/bitmap and colour-image blits to I/O-memory
 //! packed-pixel framebuffers.

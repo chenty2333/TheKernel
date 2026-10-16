@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright 2026 TheKernel contributors.
 //! I2C core for the DRM ports: the subset of Linux 7.2.3
 //! `drivers/i2c/i2c-core-base.c` that GMBUS, DDC/EDID and DP-AUX-over-I2C use
 //! (GPL-2.0 upstream), with the flag values of `include/uapi/linux/i2c.h`.

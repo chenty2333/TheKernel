@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 //! Port of Linux `drivers/gpu/drm/drm_managed.c` (batch B1b).
 //!
 //! Source-faithful transcription of Linux 7.2.3. The `struct drmres` header

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 //! Linux `dma_fence_chain` initialization and helper functions.
 //! Upstream reference: `drivers/dma-buf/dma-fence-chain.c`.
 

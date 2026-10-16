@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 // Source: drivers/video/fbdev/core/cfbcopyarea.c and fb_copyarea.h (Linux v7.2.3).
 //! `cfb_copyarea()`: packed-pixel area copy for I/O-memory framebuffers.
 //! The reversed-pixel/byte variants of the template are not reachable on the

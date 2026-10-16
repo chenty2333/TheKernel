@@ -5,8 +5,8 @@ Historical: describes the kernel-native DRM core removed in bc5bc89a.
 `kernel/src/drm/property_uapi_full.rs` translates all 26 function definitions
 from Linux v7.2.3 `drivers/gpu/drm/drm_property.c` (984 Rust lines). The source
 has an explicit permissive Intel grant (Copyright (c) 2016 Intel Corporation);
-the complete notice is retained in the source and
-`kernel/LICENSES/LicenseRef-Intel-Drm-Property-MIT`.
+the complete notice was retained in the historical source. Its separate kernel
+license-text copy was retired after this translation was removed.
 
 Property/blob lifetime, enumeration, validation, and object attachment policy
 are translated behind the `PropertyUapiIo` boundary. The source markers match

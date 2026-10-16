@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 //! Port of Linux `drivers/gpu/drm/sysfb/drm_sysfb_screen_info.c` (v7.2.3),
 //! together with the `screen_info` helpers it consumes from
 //! `include/linux/screen_info.h` and `drivers/video/screen_info_generic.c`

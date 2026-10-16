@@ -1,8 +1,10 @@
 tk-linux-kapi: generic Linux kernel-API shims (LinuxKPI layer)
 ================================================================
 
-Moved from crates/ax/tk-intel-gt/src/linux/ (Linux 7.2.3 translations
-originally cited there, licence carried unchanged):
+Moved from `crates/ax/tk-intel-gt/src/linux/` (Linux 7.2.3 interface and
+implementation references are retained in module comments). The source
+identifiers recorded below apply to the functions translated from those files;
+they do not reclassify TheKernel-authored adapters or type-only records.
 
   assert.rs, bitmap.rs, bits.rs, config.rs (generic part), dma.rs,
   drm_mm.rs, firmware.rs, gem_memory.rs (generic records), heap.rs, idr.rs,
@@ -16,19 +18,53 @@ originally cited there, licence carried unchanged):
 New translations in this crate:
 
   completion.rs   kernel/sched/completion.c, include/linux/completion.h
-                  (waiters poll `done`; see module note)
-  seq_buf.rs      lib/seq_buf.c, include/linux/seq_buf.h (subset)
-  iopoll.rs       include/linux/iopoll.h (poll_timeout_us and the
-                  read/readx families)
+                  (GPL-2.0-only; waiters poll `done`, see module note)
+  seq_buf.rs      lib/seq_buf.c, include/linux/seq_buf.h (subset;
+                  GPL-2.0-only)
+  iopoll.rs       include/linux/iopoll.h (GPL-2.0-only;
+                  poll_timeout_us and the read/readx families)
   i2c.rs          drivers/i2c/i2c-core-base.c subset (adapter, msgs,
                   quirks, add/del, transfer, bus lock) with
-                  include/uapi/linux/i2c.h flags
+                  include/uapi/linux/i2c.h flags (GPL-2.0-or-later source;
+                  UAPI header is GPL-2.0-or-later WITH Linux-syscall-note)
   i2c_algo_bit.rs drivers/i2c/algos/i2c-algo-bit.c and
-                  include/linux/i2c-algo-bit.h (full)
+                  include/linux/i2c-algo-bit.h (full; GPL-2.0+ / GPL-2.0-or-later)
 
-Linux sources are GPL-2.0-only. These files are MIT translations of the
-function structure and are not verbatim copies of the C text; the header
-of each file cites the Linux file it follows.
+The corresponding Linux notices include: completion.h © 2001 Linus Torvalds;
+seq_buf.c © 2014 Red Hat, Inc. / Steven Rostedt; iopoll.h © 2012–2014 The
+Linux Foundation; i2c-core-base.c © 1995–1999 Simon G. Vogl and © 2013–2017
+Wolfram Sang; i2c-algo-bit.c / i2c-algo-bit.h © 1995–2000 / © 1995–1999
+Simon G. Vogl, respectively. `completion.c` has no copyright line in the
+inspected file header.
+
+DRM V2 / synchronization additions and source status (checked against the
+local Linux 7.2.3 tree):
+
+- `dma_fence.rs`, `dma_fence_array.rs`, `dma_fence_chain.rs`, and
+  `dma_fence_unwrap.rs` follow `drivers/dma-buf/{dma-fence.c,
+  dma-fence-array.c,dma-fence-chain.c,dma-fence-unwrap.c}` and their
+  `include/linux/dma-fence*.h` headers. The C files and relevant headers carry
+  `GPL-2.0-only`. Original copyright lines: dma-fence.c © 2012 Canonical Ltd
+  and © 2012 Texas Instruments; dma-fence-array.c © 2016 Collabora Ltd and
+  © 2016 Advanced Micro Devices, Inc.; dma-fence-chain.c © 2018 Advanced Micro
+  Devices, Inc.; dma-fence-unwrap.c © 2022 Advanced Micro Devices, Inc.
+- `sync_file.rs` follows `drivers/dma-buf/sync_file.c` and
+  `include/linux/sync_file.h` (`GPL-2.0-only`; header copyright © 2012 Google).
+  The C source also carries © 2012 Google.
+- `dma_resv.rs` follows `drivers/dma-buf/dma-resv.c` (`MIT`) and
+  `include/linux/dma-resv.h` (no SPDX line; it contains the VMware dual-license
+  permission text and the Canonical/Linaro/TI attribution). Its Rust file
+  currently carries an MIT SPDX comment.
+- `irq_work.rs` follows the `init_irq_work()` / `IRQ_WORK_INIT()` interface in
+  `kernel/irq_work.c` and `include/linux/irq_work.h` (`GPL-2.0-only`); source
+  copyright © 2010 Red Hat, Inc., Peter Zijlstra.
+
+The GPL source identifiers above are reflected by GPL SPDX comments on the
+corresponding Rust translations. `LICENSES/GPL-2.0-only.txt` and
+`LICENSES/GPL-2.0-or-later.txt` are verbatim copies of Linux 7.2.3
+`LICENSES/preferred/GPL-2.0`, including its identifier metadata and complete
+version 2 license text. `Cargo.toml` records the package mix as
+`MIT AND GPL-2.0-only AND GPL-2.0-or-later`.
 
 GPU-driver specific code (i915 and intel GT records, GuC/GuC-log and
 GMBUS-specific helpers, the i915 wait-var active-reference wait, and the

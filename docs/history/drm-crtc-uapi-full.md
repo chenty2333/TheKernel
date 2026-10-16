@@ -5,8 +5,9 @@ Historical: describes the kernel-native DRM core removed in bc5bc89a.
 `kernel/src/drm/crtc_uapi_full.rs` translates all 26 function definitions in
 Linux v7.2.3 `drivers/gpu/drm/drm_crtc.c` (1,344 Rust lines). The upstream file
 has no SPDX tag; its Intel/Dave Airlie/Red Hat copyright header contains an
-explicit permissive grant, retained in the translation and
-`kernel/LICENSES/LicenseRef-Intel-Drm-Crtc-MIT`.
+explicit permissive grant, retained in the historical translation. The
+separate kernel license-text copy was retired after that translation was
+removed; this page records the former implementation.
 
 CRTC UAPI sequencing, validation, cleanup and callback ordering are preserved
 behind the `CrtcUapiIo` framework boundary. Exact upstream function markers

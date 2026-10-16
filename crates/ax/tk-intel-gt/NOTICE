@@ -226,3 +226,41 @@ intel_display_power_well.c,intel_pmdemand.c,intel_pch.c,intel_hti.c}`. All six
 sources carry the MIT SPDX identifier; Intel copyright years 2019, 2022, 2023,
 and 2025 are preserved in `LICENSE-MIT`. Function-level source mapping is in
 `docs/upstream-provenance.md`.
+
+DRM V2 migration source additions (2026-10-16; Linux 7.2.3, all MIT or an
+explicit MIT-style permission grant in the named source):
+
+- `src/hsw_ips_upstream.rs`: `drivers/gpu/drm/i915/display/hsw_ips.c`
+  (MIT, © 2022 Intel).
+- `src/i9xx_wm_upstream.rs`: `drivers/gpu/drm/i915/display/i9xx_wm.c`
+  (MIT, © 2023 Intel).
+- `src/intel_fbc_upstream.rs`: `drivers/gpu/drm/i915/display/intel_fbc.c`
+  (MIT-style Intel permission, © 2014 Intel) and `intel_fbc_regs.h` (MIT,
+  © 2024 Intel).
+- `src/intel_pch_refclk_upstream.rs`: `drivers/gpu/drm/i915/display/intel_pch_refclk.c`
+  (MIT, © 2021 Intel).
+- `src/intel_pfit_upstream.rs`: `drivers/gpu/drm/i915/display/intel_pfit.c`
+  (MIT, © 2024 Intel).
+- `src/intel_psr_upstream.rs`: `drivers/gpu/drm/i915/display/intel_psr.c`
+  (MIT-style Intel permission, © 2014 Intel).
+- `src/intel_sbi_upstream.rs`: `drivers/gpu/drm/i915/display/intel_sbi.c`
+  (MIT, © 2013–2021 Intel) and `intel_sbi_regs.h` (MIT, © 2025 Intel).
+- `src/intel_vdsc_upstream.rs`: the PPS path in
+  `drivers/gpu/drm/i915/display/intel_vdsc.c` (MIT, © 2018 Intel), with the
+  helper operations it calls from `drivers/gpu/drm/display/drm_dsc_helper.c`
+  (MIT, © 2018 Intel).
+- `src/i915_bo_upstream.rs`: `drivers/gpu/drm/i915/i915_bo.c` (MIT, © 2024 Intel).
+- `src/i915_dpt_upstream.rs` and `src/i915_fb_pin_upstream.rs`:
+  `drivers/gpu/drm/i915/i915_dpt.c` and `i915_fb_pin.c` (MIT, © 2021 Intel).
+- `src/i915_initial_plane_upstream.rs`: `drivers/gpu/drm/i915/i915_initial_plane.c`
+  (MIT, © 2021 Intel).
+- `src/i915_dsb_buffer_upstream.rs`: `drivers/gpu/drm/i915/i915_dsb_buffer.c`
+  (MIT, © 2023 Intel).
+- `src/i915_display_pc8_upstream.rs`: `drivers/gpu/drm/i915/i915_display_pc8.c`
+  (MIT, © 2025 Intel).
+- `src/i915_panic_upstream.rs`: `drivers/gpu/drm/i915/i915_panic.c`
+  (MIT, © 2025 Intel).
+
+Copyright and license notices remain with each translation. These source
+statuses were checked against the local Linux 7.2.3 file headers; the table is
+not a claim that other crates' GPL-derived translations are MIT.

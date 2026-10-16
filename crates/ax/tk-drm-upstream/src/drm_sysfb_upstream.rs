@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 //! Port of Linux `drivers/gpu/drm/sysfb/drm_sysfb.c` (v7.2.3): validated
 //! integer parsing for firmware-provided framebuffer parameters and the
 //! pixel-format to DRM fourcc lookup.

@@ -1,24 +1,26 @@
 # Upstream provenance
 
-Measured on the `dev` worktree at commit `d38a2db7` plus uncommitted WIP,
-re-scanned 2026-09-21, against the Linux 7.2.3 reference tree at
-`/home/ava/Desktop/linux-7.2.3` and the repository's own `Cargo.lock`. Nothing
-in this file is inferred from naming: every row states the evidence that produced
-it, and where no evidence exists the status is `unknown` with the specific
-artifact that would pin it. No upstream commit hash is recorded anywhere in
-this repository, so none is invented here.
+The inventory below began as a measurement of the `dev` worktree at commit
+`d38a2db7` plus uncommitted WIP, re-scanned 2026-09-21, against the Linux 7.2.3
+reference tree at `/home/ava/Desktop/linux-7.2.3` and this repository's
+`Cargo.lock`. Later dated sections record subsequent changes, including the
+2026-10-16 DRM V2 migration and the current Linux excerpt counts. Nothing here
+is inferred from naming: each source mapping states its basis, and where no
+evidence exists the status is `unknown` with the artifact that would pin it.
+No upstream commit hash is recorded here, so none is invented.
 
-Under the current design (i915 unification), the native Intel display and GT
-stack under `kernel/src/drm/intel/` (modeset, fastboot, GTT, native GEM, hotplug,
-DMC, GMBUS, and the rest) and the `tk-intel-display` crate were removed. The Linux
-i915 port in `crates/ax/tk-intel-gt` is the sole GPU owner, while
-`kernel/src/drm/intel/initial_plane.rs` keeps the firmware framebuffer console;
-the Linux display port is pending on `dev`. Paths and attribution rows below
-that name the removed display components describe historical code and are kept
-as the record of what was shipped before this change. The i915 port in
-`crates/ax/tk-intel-gt`, its `NOTICE`, and `LICENSE-MIT`, remain the active
-attribution for the GPU code that ships. The Linux-excerpt baseline in
-`tests/ci/test_linux_excerpt_baseline.py` pins the measured counts.
+Current architecture (2026-10-16): the legacy kernel-owned DRM core was deleted
+in `bc5bc89a`. The active DRM implementation is the Linux 7.2.3-derived
+`crates/ax/tk-drm-upstream` core with kernel adapters in `kernel/src/drm/`;
+`crates/ax/tk-intel-gt` is the i915 owner and includes the native-display links
+for its existing display translations. Older rows that name the removed
+`kernel/src/drm` core are historical. Per-file upstream license status is
+recorded in the crate `NOTICE` files. The 2026-10-16 closeout corrected the
+affected GPL-derived Rust SPDX markers and recorded mixed package license
+expressions plus the GPL-2.0 text in `tk-drm-upstream` and `tk-linux-kapi`.
+Header-only UAPI layouts and constants are identified separately where their
+source headers carry an exception. `tests/ci/test_linux_excerpt_baseline.py`
+pins current measured counts.
 
 Every verbatim-Linux count below is output of
 `tools/ci/scan_linux_excerpts.py`, which is the definition of the measurement
@@ -1286,34 +1288,62 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 
 `crates/ax/tk-intel-display/src/intel_dpll_mgr_full.rs` translates 83/175 ctags functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT; Copyright © 2006-2016 Intel Corporation); 92 functions for Gen7/8/9, BXT, IBX, display-14+ and Xe3 are outside the display-12/13 target and are listed in `docs/history/intel-dpll-manager-full.md`.
 
-`kernel/src/drm/intel/connect.rs` applies the extended DPCD receiver-capability selection behavior of Linux 7.2.3 `drivers/gpu/drm/display/drm_dp_helper.c` (`drm_dp_read_dpcd_caps()` / `drm_dp_read_extended_dpcd_caps()`, MIT; Copyright © 2009 Keith Packard); the grant is retained in `kernel/LICENSES/LicenseRef-DRM-DPCD-MIT`.
+Historical: `kernel/src/drm/intel/connect.rs` once applied the extended DPCD receiver-capability selection behavior of Linux 7.2.3 `drivers/gpu/drm/display/drm_dp_helper.c` (`drm_dp_read_dpcd_caps()` / `drm_dp_read_extended_dpcd_caps()`, MIT; Copyright © 2009 Keith Packard). That kernel-native integration was removed in 2026-10-12 (`337354a2`); it is not an active source mapping. Its old-core-only license text is no longer shipped under `kernel/LICENSES`.
 
 `crates/ax/tk-intel-display/src/intel_audio_legacy_remainder.rs` translates the remaining 10/45 ctags functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_audio.c` (MIT; Copyright © 2014 Intel Corporation), completing source coverage alongside `intel_audio_dp_full.rs`; the shared Intel grant remains in `LICENSES/Intel-i915-DP-Audio-MIT.txt`.
 
-## 2026-10-16 DRM and i915 translations since bc5bc89a
+## 2026-10-16 DRM V2 migration source and count reconciliation
 
-The files below were added after the legacy kernel DRM core was deleted
-(`bc5bc89a`). Each carries an MIT SPDX line and names its Linux 7.2.3 source in
-its header. Function counts are not recorded here because
-`tools/ci/scan_linux_excerpts.py` does not measure them.
+The source additions below are the new Rust source files in `c233c8a9..HEAD`
+that implement or adapt the DRM V2 migration. They were introduced during the
+migration, **before** `bc5bc89a` deleted the legacy kernel DRM core; `bc5bc89a`
+marks removal, not the date these sources were added. Paths and licenses were
+checked against the local Linux 7.2.3 tree at `/home/ava/Desktop/linux-7.2.3`.
+The source-license classification is checked against the Linux file/header
+identifiers, not inferred from the Rust header. The closeout marks direct
+GPL-derived Rust ports accordingly, records the MIT option selected for
+dual-licensed DRM format helpers, and changes the two package expressions to
+record their mixed component licenses. The table records source identity and
+SPDX status, not a conclusion about redistribution.
 
-- `crates/ax/tk-drm-upstream/src/cfb_copyarea_upstream.rs`, `cfb_fillrect_upstream.rs`, `cfb_imageblit_upstream.rs`: `drivers/video/fbdev/core/cfbcopyarea.c`, `cfbfillrect.c`, `cfbimgblt.c` with `fb_copyarea.h`, `fb_fillrect.h`, `fb_imageblit.h`.
-- `crates/ax/tk-drm-upstream/src/fb_draw_upstream.rs`: `drivers/video/fbdev/core/fb_draw.h` and `cfbmem.h`.
-- `crates/ax/tk-drm-upstream/src/fb_io_fops_upstream.rs`: `drivers/video/fbdev/core/fb_io_fops.c`.
-- `crates/ax/tk-intel-gt/src/hsw_ips_upstream.rs`: `drivers/gpu/drm/i915/display/hsw_ips.c`.
-- `crates/ax/tk-intel-gt/src/i9xx_wm_upstream.rs`: `drivers/gpu/drm/i915/display/i9xx_wm.c`.
-- `crates/ax/tk-intel-gt/src/intel_fbc_upstream.rs`: `drivers/gpu/drm/i915/display/intel_fbc.c` and `intel_fbc_regs.h`.
-- `crates/ax/tk-intel-gt/src/intel_pch_refclk_upstream.rs`: `drivers/gpu/drm/i915/display/intel_pch_refclk.c`.
-- `crates/ax/tk-intel-gt/src/intel_pfit_upstream.rs`: `drivers/gpu/drm/i915/display/intel_pfit.c`.
-- `crates/ax/tk-intel-gt/src/intel_psr_upstream.rs`: `drivers/gpu/drm/i915/display/intel_psr.c`.
-- `crates/ax/tk-intel-gt/src/intel_sbi_upstream.rs`: `drivers/gpu/drm/i915/display/intel_sbi.c` and `intel_sbi_regs.h`.
-- `crates/ax/tk-intel-gt/src/intel_vdsc_upstream.rs`: `drivers/gpu/drm/i915/display/intel_vdsc.c` (`intel_dsc_dp_pps_write()` and the PPS helpers it calls).
-- `crates/ax/tk-linux-kapi/src/sync_file.rs`: `drivers/dma-buf/sync_file.c` and `include/linux/sync_file.h`.
-- `crates/ax/tk-linux-kapi/src/dma_fence.rs`, `dma_fence_array.rs`, `dma_fence_unwrap.rs`: `drivers/dma-buf/dma-fence.c`, `dma-fence-array.c`, `dma-fence-unwrap.c` with their headers.
-- `crates/ax/tk-linux-kapi/src/dma_resv.rs`: `drivers/dma-buf/dma-resv.c` and `include/linux/dma-resv.h`.
-- `crates/ax/tk-linux-kapi/src/irq_work.rs`: the Linux 7.2.3 `init_irq_work()` / `IRQ_WORK_INIT()` interface.
+| TheKernel source | Linux 7.2.3 source / scope | Linux source license status |
+| --- | --- | --- |
+| `crates/ax/tk-drm-upstream/src/cfb_copyarea_upstream.rs`, `cfb_fillrect_upstream.rs`, `cfb_imageblit_upstream.rs` | `drivers/video/fbdev/core/{cfbcopyarea.c,cfbfillrect.c,cfbimgblt.c}` and corresponding `fb_{copyarea,fillrect,imageblit}.h` | `GPL-2.0-only` |
+| `crates/ax/tk-drm-upstream/src/fb_draw_upstream.rs`, `fb_io_fops_upstream.rs` | `drivers/video/fbdev/core/{fb_draw.h,cfbmem.h,fb_io_fops.c}` | `GPL-2.0` / `GPL-2.0-only` upstream; Rust SPDX is `GPL-2.0-only` |
+| `crates/ax/tk-drm-upstream/src/drm_format_helper_upstream.rs` | `drivers/gpu/drm/drm_format_helper.c` and `drm_format_internal.h` | `GPL-2.0 OR MIT`; MIT option is present in source SPDX |
+| `crates/ax/tk-drm-upstream/src/efidrm_upstream.rs` | `drivers/gpu/drm/sysfb/efidrm.c` | `GPL-2.0-only`; Rust SPDX is `GPL-2.0-only` |
+| `crates/ax/tk-drm-upstream/src/drm_sysfb_upstream.rs`, `drm_sysfb_modeset_upstream.rs`, `drm_sysfb_screen_info_upstream.rs`, `drm_sysfb_helper_types.rs` | `drivers/gpu/drm/sysfb/{drm_sysfb.c,drm_sysfb_modeset.c,drm_sysfb_screen_info.c,drm_sysfb_helper.h}`, `drivers/video/screen_info_generic.c`, `include/linux/{screen_info.h,ioport.h}`, `include/video/pixel_format.h`, `include/drm/drm_panic.h`, and `include/uapi/linux/screen_info.h` | Helper/implementation files and `drm_sysfb_helper_types.rs` are `GPL-2.0-only`; the `ScreenInfo` UAPI record has `GPL-2.0 WITH Linux-syscall-note`, and `drm_panic.h` is `GPL-2.0 OR MIT` (that separately sourced layout is identified in NOTICE) |
+| `crates/ax/tk-drm-upstream/src/sysfb_tests.rs` | TheKernel-authored tests for the local sysfb/efidrm/format ports | No Linux test body or fixture copied |
+| `crates/ax/tk-intel-gt/src/hsw_ips_upstream.rs`, `i9xx_wm_upstream.rs`, `intel_fbc_upstream.rs`, `intel_pch_refclk_upstream.rs`, `intel_pfit_upstream.rs`, `intel_psr_upstream.rs`, `intel_sbi_upstream.rs`, `intel_vdsc_upstream.rs` | The correspondingly named `drivers/gpu/drm/i915/display/*.c` files; FBC and SBI also use their named register headers; VDSC uses the PPS path and helpers in `drivers/gpu/drm/display/drm_dsc_helper.c` | MIT SPDX or explicit MIT-style permission text in the Linux source; Intel notices are retained in `tk-intel-gt/NOTICE` / `LICENSE-MIT` |
+| `crates/ax/tk-intel-gt/src/i915_bo_upstream.rs`, `i915_dpt_upstream.rs`, `i915_fb_pin_upstream.rs`, `i915_initial_plane_upstream.rs`, `i915_dsb_buffer_upstream.rs`, `i915_display_pc8_upstream.rs`, `i915_panic_upstream.rs` | The correspondingly named `drivers/gpu/drm/i915/*.c` files | MIT (Intel); copyright attribution remains in source and `tk-intel-gt/NOTICE` |
+| `crates/ax/tk-intel-gt/src/host_test_links.rs` | Test-only link stubs for kernel-provided symbols | TheKernel test scaffolding; not an upstream function translation |
+| `crates/ax/tk-linux-kapi/src/dma_fence.rs`, `dma_fence_array.rs`, `dma_fence_chain.rs`, `dma_fence_unwrap.rs`, `sync_file.rs` | `drivers/dma-buf/{dma-fence.c,dma-fence-array.c,dma-fence-chain.c,dma-fence-unwrap.c,sync_file.c}` and the matching `include/linux` headers | `GPL-2.0-only`; Rust SPDX matches |
+| `crates/ax/tk-linux-kapi/src/dma_resv.rs` | `drivers/dma-buf/dma-resv.c` and `include/linux/dma-resv.h` | C source is MIT; header has no SPDX and includes the VMware dual-license permission text and other copyright lines |
+| `crates/ax/tk-linux-kapi/src/irq_work.rs` | `kernel/irq_work.c` and `include/linux/irq_work.h`, initializer/interface subset | Linux `GPL-2.0` identifier (v2 only); Rust SPDX is `GPL-2.0-only` |
+| `kernel/src/drm/intel/upstream_mmap.rs` | i915 mmap integration corresponding to `drivers/gpu/drm/i915/gem/i915_gem_mman.c` | MIT source; VFS mapping and fixed-page publication are TheKernel adapter logic |
+| `kernel/src/drm/efidrm.rs`, `kernel/src/drm/sync_file.rs` | Platform/framebuffer and fd-table adapters for the `efidrm`/`sync_file` operations above | TheKernel adapter code; it wires to the upstream-derived GPL-only sysfb/sync_file functionality and does not change that source status |
+| `kernel/src/pseudofs/dev/console_fb.rs` | TheKernel console-surface implementation; behavior references include DRM fb-helper suspend/restore | TheKernel implementation, not a port of a Linux source file |
+
+The excerpts scanner does not measure function counts or attribute licenses.
+Its measured seven-field tuples, re-derived for this tree and pinned by
+`tests/ci/test_linux_excerpt_baseline.py`, are:
+
+| Scope | >=40 | >=25 |
+| --- | --- | --- |
+| `crates/linux` | `(110,49,20,25,0,18,21)` | `(211,59,22,41,3,20,21)` |
+| `kernel/src` | `(85,41,19,130,8,0,0)` | `(157,50,24,301,16,0,0)` |
+| `crates/ax` | `(0,0,0,1213,1179,0,0)` | `(18,15,4,3192,3149,0,0)` |
+
+Compared with the pre-migration baseline, `kernel/src` loses matches from the
+removed custom core while gaining adapter-code matches; `crates/ax` gains
+matches from the new DRM/sysfb, i915 display and LinuxKPI source translations.
+These are text-identity totals only: they do not classify a matching line's
+upstream source or license.
 
 ## 2026-10-09 excerpt-count reconciliation
+
+Historical baseline before the 2026-10-16 DRM V2 migration; superseded by the
+current tuples in the preceding 2026-10-16 section.
 
 The whole-tree scanner was re-run against `/home/ava/Desktop/linux-7.2.3`
 using `tools/ci/scan_linux_excerpts.py` semantics (whitespace-normalized

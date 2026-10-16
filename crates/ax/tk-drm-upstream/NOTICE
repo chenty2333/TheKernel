@@ -3,19 +3,24 @@ tk-drm-upstream: Linux DRM core type definitions and ports (x86_64, v7.2.3)
 
 Layer: platform. Depends only on tk-linux-kapi (kernel-API shims).
 
-Type modules (`*_types.rs`) are field-for-field mirrors of the C definitions
-in the Linux 7.2.3 headers named in each module's header comment (MIT-licensed
-data layouts; Linux headers are GPL-2.0-only and are cited, not copied).
-Layouts were generated from the DWARF of the configured Linux oracle
-(config/linux/7.2.3-q35-graphics.config, THP enabled) and every size and field
-offset is pinned by a compile-time assertion.
+Type modules (`*_types.rs`) mirror Linux 7.2.3 definitions named in their
+headers. Their layouts were generated from DWARF of the configured Linux
+oracle (`config/linux/7.2.3-q35-graphics.config`, THP enabled), and every size
+and field offset is pinned by a compile-time assertion. DWARF generation does
+not itself establish a license: source-header identifiers and permissions are
+file-specific. In particular, the new sysfb/screen-info types below come from
+GPL-2.0 headers; they are not described here as MIT-licensed.
 
 Function ports (`*_upstream.rs`) mirror the Linux `.c` files named in their
 header comments. Each stub is filled by its owning batch (see the module
 header comment).
 
-Linux sources are licensed per file, and each translation follows the license of
-its own source:
+Linux sources are licensed per file. The following list records the source
+identifiers as found in the local Linux 7.2.3 tree; an MIT `SPDX` line in a Rust
+translation does not change the identifier of a GPL-only source it follows.
+The source-license identifiers called out below are reflected by each Rust
+translation's SPDX marker, except where the named source offers a separate MIT
+option selected by that translation:
 
 - MIT or MIT-compatible X11-style permission (no SPDX line, or `MIT`, or
   `GPL-2.0 OR MIT` with the MIT option taken): drm_blend, drm_modes, drm_fourcc,
@@ -26,15 +31,49 @@ its own source:
   drm_dp_helper, drm_dp_dual_mode_helper, drm_atomic, drm_atomic_uapi,
   drm_atomic_state_helper, drm_atomic_helper, drm_scdc_helper, drm_hdmi_helper,
   drm_hdmi_state_helper, and drivers/video/hdmi.c. Copyright lines are those of each Linux file.
-- GPL-2.0 only, NOT covered by the MIT grant: `drivers/gpu/drm/drm_managed.c`
-  (translated in `drm_managed_upstream.rs`). Its translation is flagged for
-  rework before this crate ships; it must not be relied on as MIT until resolved.
+- GPL-2.0-only / GPL-2.0 (v2): `drivers/gpu/drm/drm_managed.c` (`drm_managed_upstream.rs`);
+  `drivers/gpu/drm/sysfb/{efidrm.c,drm_sysfb.c,drm_sysfb_modeset.c,drm_sysfb_screen_info.c}`
+  and `drm_sysfb_helper.h` (`efidrm_upstream.rs`, `drm_sysfb_*_upstream.rs`,
+  `drm_sysfb_helper_types.rs`); `drivers/video/fbdev/core/{cfbcopyarea.c,
+  cfbfillrect.c,cfbimgblt.c,fb_io_fops.c}` and `fb_draw.h` / `cfbmem.h`
+  (`cfb_*_upstream.rs`, `fb_draw_upstream.rs`, `fb_io_fops_upstream.rs`).
+  `include/linux/{screen_info.h,ioport.h}`, `include/video/pixel_format.h`,
+  and `drivers/video/screen_info_generic.c` also identify GPL-2.0 definitions
+  used by `drm_sysfb_helper_types.rs` and `drm_sysfb_screen_info_upstream.rs`.
+  `include/drm/drm_panic.h` is `GPL-2.0 OR MIT`; its `DrmScanoutBuffer`
+  layout is part of the mixed helper-types module, which uses its GPL-2.0
+  option alongside the GPL-only helper code. The header's Copyright © 2024
+  Intel and © 2024 Red Hat attribution is recorded here.
+  `include/uapi/linux/screen_info.h` has `GPL-2.0 WITH Linux-syscall-note`; that
+  exception applies to the UAPI record, not to the GPL-only sysfb helper code
+  that shares the Rust module. `drm_sysfb_helper_types.rs` contains inline
+  conversion/container helpers from the GPL-only `drm_sysfb_helper.h`, in
+  addition to ABI records and constant values, and is therefore marked
+  GPL-2.0-only. The status of a header-only ABI record or constant is not
+  inferred solely from a neighboring GPL-only implementation.
 - GPL-2.0-or-later: `drivers/gpu/drm/drm_gem_atomic_helper.c` and
   `drivers/gpu/drm/drm_gem_framebuffer_helper.c` (translated in
   `drm_gem_atomic_helper_upstream.rs` and `drm_gem_framebuffer_helper_upstream.rs`).
+  These, and the GPL-2.0 rows above, must not be described as MIT translations.
+- Dual-licensed `GPL-2.0 OR MIT`: `drivers/gpu/drm/drm_format_helper.c` and
+  `drivers/gpu/drm/drm_format_internal.h` (`drm_format_helper_upstream.rs`);
+  this port selects the MIT option, as recorded by its source SPDX identifier.
 
-The Linux sources are not verbatim copies of the C text except where a line is
-marked `// upstream:`; these files are MIT translations of structure and behaviour.
+Attribution carried by the new GPL-derived fbdev files: `cfbcopyarea.c`,
+`cfbfillrect.c`, `cfbimgblt.c`, `fb_draw.h`, and `cfbmem.h` each state
+Copyright © 2025 Zsolt Kajtar. `fb_io_fops.c`, the sysfb C files, and their
+helper headers have no copyright line in the inspected Linux 7.2.3 file header.
+The existing GPL-only `drm_managed.c` states Copyright © 2020 Intel;
+`drm_gem_framebuffer_helper.c` states Copyright © 2017 Noralf Trønnes.
+
+GPL text: `LICENSES/GPL-2.0-only.txt` and `LICENSES/GPL-2.0-or-later.txt` are
+verbatim copies of Linux 7.2.3 `LICENSES/preferred/GPL-2.0`, including its
+license-identifier metadata and complete GPL version 2 text. The latter file
+records the upstream or-later grant; it does not remove that grant's scope.
+`Cargo.toml` declares the package mix as `MIT AND GPL-2.0-only AND
+GPL-2.0-or-later`. The `// upstream:` comments identify source correspondences;
+per-file mapping is also listed in the 2026-10-16 migration section of
+`docs/upstream-provenance.md`.
 
 Test fixtures: every EDID used by the host tests is built in code
 (`drm_edid_upstream.rs`, `tests` module). No Linux test data is copied.

@@ -1,20 +1,27 @@
 # Licensing map
 
-Measured on the `dev` worktree, commit `d38a2db7` plus uncommitted WIP,
-2026-09-21. This file states what the repository actually contains and what a
-redistributor must do. It does not change any license expression, feature
-wiring, or dependency edge; where a change is needed, it says who owns it.
+The inventory below was measured on the `dev` worktree, commit `d38a2db7` plus
+uncommitted WIP, on 2026-09-21. It is a dated snapshot; the repository changed
+substantially afterward. The current 2026-10-16 DRM V2 architecture uses the
+Linux 7.2.3-derived `crates/ax/tk-drm-upstream` framework, kernel adapters under
+`kernel/src/drm/`, and the i915 owner in `crates/ax/tk-intel-gt`. The legacy
+kernel-owned DRM core was removed in `bc5bc89a`. Current source mappings and
+per-file Linux identifiers are recorded in `docs/upstream-provenance.md` and
+the three active crate `NOTICE` files.
 
-Under the current design (i915 unification), the native Intel display and GT
-stack under `kernel/src/drm/intel/` (modeset, fastboot, GTT, native GEM, hotplug,
-DMC, GMBUS, and the rest) and the `tk-intel-display` crate were removed. The Linux
-i915 port in `crates/ax/tk-intel-gt` is the sole GPU owner, while
-`kernel/src/drm/intel/initial_plane.rs` keeps the firmware framebuffer console;
-the Linux display port is pending on `dev`. Paths and attribution rows below
-that name the removed display components describe historical code and are kept
-as the record of what was shipped before this change. The i915 port in
-`crates/ax/tk-intel-gt`, its `NOTICE`, and `LICENSE-MIT`, remain the active
-attribution for the GPU code that ships.
+The V2 closeout records GPL-2.0-only and GPL-2.0-or-later source translations
+in `tk-drm-upstream` and `tk-linux-kapi`; their affected Rust SPDX markers and
+Cargo package expressions now reflect those mixed component licenses, and the
+crates include the GPL version 2 text. Exact source mappings and UAPI-header
+exceptions are in the crate notices and the 2026-10-16 provenance entry. The
+table below and older sections describe the 2026-09-21 snapshot unless
+explicitly marked current or historical.
+
+`kernel/Cargo.toml` inherits Apache-2.0 for the kernel package's own Rust
+sources. That metadata is not a statement that every dependency, upstream-derived
+component, or linked image is Apache-2.0-only. This record distinguishes the
+licenses identified for individual components; it does not change or
+retroactively relicense TheKernel-originated code.
 
 ## 1. License map
 
@@ -343,13 +350,12 @@ in the external state cache, not the kernel's vendored runtime tree.
 The optional inspect payload uses 192 MiB for its signed storage/partition tools;
 the merged baseline image remains 160 MiB. It contains no OEM firmware tables.
 
-## MIT i915 display translation (Codex D, 2026-10-05)
+## Historical MIT i915 display translation (Codex D, 2026-10-05)
 
-In the current design, the native Intel display/GT stack and the `tk-intel-display` crate
-have been removed (the i915 port in `crates/ax/tk-intel-gt` is the sole GPU owner,
-`kernel/src/drm/intel/initial_plane.rs` keeps the firmware framebuffer, and the Linux display
-port is pending on `dev`). The record below is preserved as historical licensing documentation
-of those translations.
+The text below describes the former `tk-intel-display` translation snapshot,
+not the current DRM V2 architecture. The crate was later removed; current i915
+source mappings and statuses are in `crates/ax/tk-intel-gt/NOTICE` and the
+2026-10-16 migration section of `docs/upstream-provenance.md`.
 
 `crates/ax/tk-intel-display` was MIT Rust translated from the individually checked
 MIT files of Linux 7.2.3 i915, not part of the earlier “original Rust only” rule.

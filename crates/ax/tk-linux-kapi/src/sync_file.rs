@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 //! LinuxKPI sync_file: Linux 7.2.3 `drivers/dma-buf/sync_file.c` and
 //! `include/linux/sync_file.h`. A sync_file is an anonymous file that carries
 //! one dma-fence; `SYNC_IOC_MERGE` joins two of them and `SYNC_IOC_FILE_INFO`

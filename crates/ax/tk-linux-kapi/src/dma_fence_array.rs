@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 //! LinuxKPI dma-fence array: Linux 7.2.3 `drivers/dma-buf/dma-fence-array.c` and
 //! `include/linux/dma-fence-array.h`. A fence array signals once every member
 //! fence has signaled.

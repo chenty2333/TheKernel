@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 use core::{
     ffi::{c_char, c_void},
     mem::{offset_of, zeroed},

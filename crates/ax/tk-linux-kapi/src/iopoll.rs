@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 //! Translation of Linux 7.2.3 `include/linux/iopoll.h` (GPL-2.0 upstream).
 //!
 //! The Linux macros are kept as exported macros with the same names and

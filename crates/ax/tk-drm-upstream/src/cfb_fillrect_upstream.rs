@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 // Source: drivers/video/fbdev/core/cfbfillrect.c and fb_fillrect.h (Linux v7.2.3).
 //! `cfb_fillrect()`: packed-pixel rectangle fill for I/O-memory framebuffers.
 #![allow(unsafe_code, non_snake_case, dead_code)]

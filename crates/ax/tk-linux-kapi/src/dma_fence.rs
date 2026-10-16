@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 //! LinuxKPI dma-fence core: Linux 7.2.3 `drivers/dma-buf/dma-fence.c` and
 //! `include/linux/dma-fence.h`. Fence containers live in `dma_fence_array` and
 //! `dma_fence_chain`; reservation objects live in `dma_resv`.

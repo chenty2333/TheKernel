@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 //! Translation of Linux 7.2.3 `kernel/sched/completion.c` and the inline
 //! helpers of `include/linux/completion.h` (GPL-2.0 upstream).
 //!

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright 2026 TheKernel contributors. See ../LICENSE-MIT.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2026 TheKernel contributors.
 // Source: drivers/video/fbdev/core/fb_draw.h and cfbmem.h (Linux v7.2.3,
 // Zsolt Kajtar's bit-address engine shared by the cfb_* drawing operations).
 //! Bit-addressed framebuffer access for I/O-memory packed-pixel drawing.
