@@ -516,6 +516,109 @@ pub unsafe extern "C" fn dma_fence_free(fence: *mut DmaFence) {
     crate::rcu::call_rcu(head, dma_fence_free_rcu);
 }
 
+/// Linux `dma_fence_get_status_locked()`: 0 while pending, otherwise the
+/// fence's error (negative) or 1 when it completed without one.
+unsafe fn dma_fence_get_status_locked(fence: *mut DmaFence) -> c_int {
+    if unsafe { dma_fence_is_signaled(fence) } {
+        match unsafe { (*fence).error } {
+            0 => 1,
+            error => error,
+        }
+    } else {
+        0
+    }
+}
+
+/// Linux `dma_fence_get_status()`.
+///
+/// # Safety
+/// `fence` must be a live fence.
+pub unsafe fn dma_fence_get_status(fence: *mut DmaFence) -> c_int {
+    let mut flags = 0;
+    unsafe { fence_lock(fence, &mut flags) };
+    let status = unsafe { dma_fence_get_status_locked(fence) };
+    unsafe { fence_unlock(fence, flags) };
+    status
+}
+
+/// Linux `dma_fence_timestamp()` (include/linux/dma-fence.h): the signal time
+/// of a signaled fence; `ktime_get()` when asked about a pending one.
+///
+/// # Safety
+/// `fence` must be a live fence.
+pub unsafe fn dma_fence_timestamp(fence: *mut DmaFence) -> i64 {
+    if !unsafe { dma_fence_is_signaled(fence) } {
+        return ktime_get();
+    }
+    while unsafe {
+        AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).load(Ordering::Acquire)
+            & (1usize << DMA_FENCE_FLAG_TIMESTAMP_BIT)
+            == 0
+    } {
+        core::hint::spin_loop();
+    }
+    unsafe { (*fence).timestamp_union.timestamp }
+}
+
+/// Linux `dma_fence_is_later()` for fences of one ops table: sequence numbers
+/// compare with wrap-around. Fences of different ops are never ordered.
+///
+/// # Safety
+/// Both pointers must be live fences.
+pub unsafe fn dma_fence_is_later(f1: *mut DmaFence, f2: *mut DmaFence) -> bool {
+    if unsafe { (*f1).ops != (*f2).ops } {
+        return false;
+    }
+    unsafe { ((*f1).seqno.wrapping_sub((*f2).seqno) as i64) > 0 }
+}
+
+/// Lock shared by the private stub fences: Linux gives each its inline lock,
+/// and a stub is signaled at creation so the lock only serves status queries.
+struct StubLock(core::cell::UnsafeCell<Spinlock>);
+// SAFETY: the Spinlock is only used through the fence lock helpers.
+unsafe impl Sync for StubLock {}
+static STUB_LOCK: StubLock = StubLock(core::cell::UnsafeCell::new(Spinlock::new()));
+
+unsafe extern "C" fn dma_fence_stub_get_name(_: *mut DmaFence) -> *const c_char {
+    c"Unbound".as_ptr()
+}
+
+static DMA_FENCE_STUB_OPS: DmaFenceOps = DmaFenceOps {
+    get_driver_name: Some(dma_fence_stub_get_name),
+    get_timeline_name: Some(dma_fence_stub_get_name),
+    enable_signaling: None,
+    signaled: None,
+    wait: None,
+    release: None,
+    set_deadline: None,
+};
+
+/// Linux `dma_fence_allocate_private_stub()`: a fence already signaled at
+/// `timestamp`, not shared with any driver. Null on allocation failure.
+///
+/// # Safety
+/// Returned fences are released with `dma_fence_put` like any other fence.
+pub unsafe fn dma_fence_allocate_private_stub(timestamp: i64) -> *mut DmaFence {
+    let fence = crate::memory::kzalloc_obj::<DmaFence>();
+    if fence.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        dma_fence_init(
+            fence,
+            ptr::addr_of!(DMA_FENCE_STUB_OPS),
+            STUB_LOCK.0.get(),
+            0,
+            0,
+        );
+        (*fence).flags |= 1 << DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT;
+        // Linux dma_fence_signal_timestamp() with no callbacks queued.
+        (*fence).timestamp_union.timestamp = timestamp;
+        (*fence).flags |= (1 << DMA_FENCE_FLAG_SIGNALED_BIT) | (1 << DMA_FENCE_FLAG_TIMESTAMP_BIT);
+    }
+    fence
+}
+
 unsafe fn fence_lock(fence: *mut DmaFence, flags: &mut c_ulong) {
     let lock = unsafe { (*fence).lock.extern_lock };
     assert!(!lock.is_null(), "dma fence has no lock");

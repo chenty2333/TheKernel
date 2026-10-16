@@ -163,8 +163,6 @@ use crate::{
 };
 
 unsafe extern "C" {
-    fn sync_file_create(fence: *mut DmaFence) -> *mut SyncFile;
-    fn sync_file_get_fence(fd: c_int) -> *mut DmaFence;
     fn get_unused_fd_flags(flags: c_int) -> c_int;
     fn put_unused_fd(fd: c_int);
     fn fd_install(fd: c_int, file: *mut c_void);
@@ -433,9 +431,9 @@ pub struct DrmI915GemExecbufferExtTimelineFences {
 }
 const _: [(); 56] = [(); core::mem::size_of::<DrmI915GemExecbufferExtTimelineFences>()];
 
-/// Linux `sync_file` (canonical in tk-drm-upstream; the file pointer is the
+/// Linux `sync_file` (canonical in tk-linux-kapi; the file pointer is the
 /// first member in the native Linux structure).
-pub use tk_drm_upstream::drm_atomic_uapi_upstream::SyncFile;
+pub use tk_linux_kapi::sync_file::{SyncFile, sync_file_create, sync_file_get_fence};
 pub use tk_linux_kapi::types::DmaFenceChain;
 
 #[inline]
@@ -3253,12 +3251,12 @@ pub unsafe fn i915_gem_do_execbuffer(
         }
         if !out_fence.is_null() {
             if err == 0 {
-                fd_install(out_fence_fd, (*out_fence).file);
+                fd_install(out_fence_fd, (*out_fence).file.cast());
                 (*args).rsvd2 &= GENMASK_ULL(31, 0);
                 (*args).rsvd2 |= (out_fence_fd as u64) << 32;
                 out_fence_fd = -1;
             } else {
-                fput((*out_fence).file);
+                fput((*out_fence).file.cast());
             }
         }
         if out_fence.is_null() && !eb.composite_fence.is_null() {

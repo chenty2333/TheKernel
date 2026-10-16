@@ -786,6 +786,9 @@ mod tests {
     }
     unsafe extern "C" fn mock_put_unused_fd(_fd: c_int) {}
     unsafe extern "C" fn mock_fd_install(_fd: c_int, _file: *mut c_void) {}
+    unsafe extern "C" fn mock_fget(_fd: c_int) -> *mut c_void {
+        core::ptr::null_mut()
+    }
     unsafe extern "C" fn mock_anon_inode_getfile(
         _name: *const c_char,
         _fops: *const c_void,
@@ -799,6 +802,7 @@ mod tests {
         get_unused_fd_flags: mock_get_unused_fd_flags,
         put_unused_fd: mock_put_unused_fd,
         fd_install: mock_fd_install,
+        fget: mock_fget,
     };
 
     #[test]

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
 //! LinuxKPI entry points for DRM core objects (GEM handles, PRIME/dma-buf,
-//! sync_file, DRM device references) whose objects and tables are
+//! DRM device references) whose objects and tables are
 //! owned by the kernel's DRM implementation.
 //!
 //! Every symbol forwards to one installed `DrmCoreProvider`, so the object
@@ -45,9 +45,6 @@ pub dma_buf_detach: unsafe extern "C" fn(dmabuf: *mut c_void, attach: *mut c_voi
 pub dma_buf_map_attachment: unsafe extern "C" fn(attach: *mut c_void, direction: c_int) -> *mut c_void,
 pub dma_buf_unmap_attachment: unsafe extern "C" fn(attach: *mut c_void, sgt: *mut c_void, direction: c_int),
 pub dma_buf_put: unsafe extern "C" fn(dmabuf: *mut c_void),
-pub sync_file_create: unsafe extern "C" fn(fence: *mut c_void) -> *mut c_void,
-pub sync_file_get_fence: unsafe extern "C" fn(fd: c_int) -> *mut c_void,
-pub sync_file_release: unsafe extern "C" fn(file: *mut c_void),
 }
 
 static DRM_CORE_PROVIDER: AtomicPtr<DrmCoreProvider> = AtomicPtr::new(core::ptr::null_mut());
@@ -122,33 +119,6 @@ unsafe { (required("dma_buf_unmap_attachment").dma_buf_unmap_attachment)(attach,
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dma_buf_put(dmabuf: *mut c_void) {
 unsafe { (required("dma_buf_put").dma_buf_put)(dmabuf) };
-}
-
-/// Linux `sync_file_create()`: NULL when no provider exists.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sync_file_create(fence: *mut c_void) -> *mut c_void {
-match provider() {
-    Some(p) => unsafe { (p.sync_file_create)(fence) },
-    None => core::ptr::null_mut(),
-}
-}
-
-/// Linux `sync_file_get_fence()`: NULL when no provider exists or `fd` is not a sync file.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sync_file_get_fence(fd: c_int) -> *mut c_void {
-match provider() {
-    Some(p) => unsafe { (p.sync_file_get_fence)(fd) },
-    None => core::ptr::null_mut(),
-}
-}
-
-/// Final release hook for a LinuxKPI file returned by `sync_file_create`.
-/// Ordinary shmem files are ignored by the installed DRM provider.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_sync_file_release(file: *mut c_void) {
-if let Some(p) = provider() {
-    unsafe { (p.sync_file_release)(file) };
-}
 }
 
 /// Linux `shmem_read_mapping_page_gfp()` (mm/shmem.c) C entry point; the Rust

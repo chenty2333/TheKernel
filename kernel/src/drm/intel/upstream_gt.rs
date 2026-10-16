@@ -1105,6 +1105,13 @@ impl Drop for AnonFile {
     }
 }
 
+impl AnonFile {
+    /// The LinuxKPI file this descriptor holds, without taking a reference.
+    fn linux_file(&self) -> *mut tk_linux_kapi::shmem::File {
+        self.file as *mut tk_linux_kapi::shmem::File
+    }
+}
+
 impl Pollable for AnonFile {
     fn poll(&self) -> IoEvents {
         IoEvents::empty()
@@ -1181,31 +1188,47 @@ unsafe extern "C" fn kernel_put_unused_fd(fd: c_int) {
     drop(RESERVED_FDS.lock().remove(&fd));
 }
 
+/// Linux `fd_install()`. A sync_file file is wrapped as a pollable sync_file
+/// descriptor; any other LinuxKPI file is wrapped as an anonymous descriptor.
+/// The descriptor takes over the reference `file` carries.
 unsafe extern "C" fn kernel_fd_install(fd: c_int, file: *mut c_void) {
     assert!(!file.is_null(), "fd_install with a null file");
     let reservation = RESERVED_FDS
         .lock()
         .remove(&fd)
         .unwrap_or_else(|| panic!("fd_install({fd}) without a reservation"));
-    let description = match super::upstream_sync::take_sync_file_for_install(file) {
-        Ok(Some((native_file, resource))) => {
-            crate::file::prepare_file_description_with_resource(
-                native_file,
-                0,
-                None,
-                Some(resource),
+    let file = file.cast::<tk_linux_kapi::shmem::File>();
+    let file_like: Arc<dyn FileLike> =
+        if unsafe { tk_linux_kapi::sync_file::is_sync_file_file(file) } {
+            Arc::new(
+                crate::drm::sync_file::SyncFileFd::try_new(file)
+                    .unwrap_or_else(|error| panic!("fd_install({fd}): {error:?}")),
             )
-        }
-        Ok(None) => FileDescription::new(Arc::new(AnonFile {
-            file: file as usize,
-        })),
-        Err(error) => Err(error),
-    }
-    .unwrap_or_else(|error| panic!("fd_install({fd}): {error:?}"));
+        } else {
+            Arc::new(AnonFile { file: file as usize })
+        };
+    let description = FileDescription::new(file_like)
+        .unwrap_or_else(|error| panic!("fd_install({fd}): {error:?}"));
     // The reservation publishes the descriptor into the caller's table.
     if let Err(error) = reservation.publish(description) {
         panic!("fd_install({fd}) publication failed: {error:?}");
     }
+}
+
+/// Linux `fget(fd)`: a new reference to the LinuxKPI file behind `fd`, or
+/// null when `fd` is not open or is not backed by a LinuxKPI file.
+unsafe extern "C" fn kernel_fget(fd: c_int) -> *mut c_void {
+    let file = if let Ok(anon) = crate::file::get_typed_file::<AnonFile>(fd) {
+        anon.linux_file()
+    } else if let Ok(sync_file) = crate::file::get_typed_file::<crate::drm::sync_file::SyncFileFd>(fd)
+    {
+        sync_file.linux_file()
+    } else {
+        return ptr::null_mut();
+    };
+    // SAFETY: the descriptor still holds its reference while `anon`/`sync_file`
+    // is alive, so the file is live; the caller's reference is dropped with fput.
+    unsafe { tk_linux_kapi::shmem::fget_file(file) }.cast()
 }
 
 static FILE_OPS: FileOps = FileOps {
@@ -1213,6 +1236,7 @@ static FILE_OPS: FileOps = FileOps {
     get_unused_fd_flags: kernel_get_unused_fd_flags,
     put_unused_fd: kernel_put_unused_fd,
     fd_install: kernel_fd_install,
+    fget: kernel_fget,
 };
 
 // ---------------------------------------------------------------------------

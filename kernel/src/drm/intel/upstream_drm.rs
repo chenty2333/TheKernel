@@ -964,29 +964,6 @@ unsafe extern "C" fn dma_buf_put(_dmabuf: *mut c_void) {
     panic!("dma_buf_put: no upstream dma-buf exists; export is not bound");
 }
 
-/// `sync_file_create()`: bind the upstream dma_fence to the native sync_file
-/// and retain the LinuxKPI ABI wrapper until fd_install/fput.
-unsafe extern "C" fn sync_file_create(fence: *mut c_void) -> *mut c_void {
-    // SAFETY: i915 passes a live dma_fence reference to this callback; the
-    // bridge obtains the ownership it needs before returning the sync_file.
-    unsafe { super::upstream_sync::sync_file_create(fence) }
-}
-
-/// `sync_file_get_fence()`: return an owned upstream reference to the native
-/// fence behind a sync_file descriptor.
-unsafe extern "C" fn sync_file_get_fence(fd: c_int) -> *mut c_void {
-    // SAFETY: `fd` is the descriptor requested by i915; the bridge resolves it
-    // through the kernel file table and returns an owned fence or NULL.
-    unsafe { super::upstream_sync::sync_file_get_fence(fd) }
-}
-
-/// Final `fput()` hook for a sync_file wrapper not transferred to fd_install.
-unsafe extern "C" fn sync_file_release(file: *mut c_void) {
-    // SAFETY: LinuxKPI calls this hook for the live sync_file wrapper created
-    // by the paired bridge callback, which removes and releases that owner.
-    unsafe { super::upstream_sync::sync_file_release(file) }
-}
-
 /// Kernel-side alias notification after LinuxKPI inserts a dma-reservation fence.
 unsafe extern "C" fn resv_alias_add(resv: *mut c_void, fence: *mut c_void, usage: u32) {
     super::upstream_sync::upstream_reservation_fence_add(resv, fence.cast(), usage);
@@ -1022,9 +999,6 @@ static DRM_CORE: DrmCoreProvider = DrmCoreProvider {
     dma_buf_map_attachment,
     dma_buf_unmap_attachment,
     dma_buf_put,
-    sync_file_create,
-    sync_file_get_fence,
-    sync_file_release,
 };
 
 static GEM_HANDLE_PROVIDER: tk_drm_upstream::drm_gem_upstream::DrmGemHandleProvider =

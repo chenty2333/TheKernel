@@ -122,6 +122,8 @@ pub mod dma_fence_chain;
 pub mod dma_fence;
 #[allow(unsafe_code)]
 pub mod dma_fence_array;
+pub mod dma_fence_unwrap;
+pub mod sync_file;
 #[allow(unsafe_code)]
 pub mod dma_resv;
 #[allow(unsafe_code)]

@@ -100,7 +100,7 @@ fn dma_fence_chain_is(fence: *const DmaFence) -> bool {
         && unsafe { (*fence).ops == ptr::addr_of!(dma_fence_chain_ops).cast::<c_void>() }
 }
 
-unsafe fn dma_fence_chain_contained(fence: *mut DmaFence) -> *mut DmaFence {
+pub unsafe fn dma_fence_chain_contained(fence: *mut DmaFence) -> *mut DmaFence {
     if dma_fence_chain_is(fence) {
         unsafe { (*fence.cast::<DmaFenceChain>()).fence }
     } else {

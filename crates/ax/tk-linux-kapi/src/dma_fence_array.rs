@@ -86,6 +86,40 @@ unsafe extern "C" fn dma_fence_array_timeline_name(_: *mut DmaFence) -> *const c
     c"unbound".as_ptr()
 }
 
+/// Linux `dma_fence_array_first()` (include/linux/dma-fence-array.h): the first
+/// member of an array, or `head` itself when it is not an array.
+///
+/// # Safety
+/// `head` must be null or a live fence.
+pub unsafe fn dma_fence_array_first(head: *mut DmaFence) -> *mut DmaFence {
+    if head.is_null() {
+        return ptr::null_mut();
+    }
+    if unsafe { (*head).ops } != ptr::addr_of!(dma_fence_array_ops).cast() {
+        return head;
+    }
+    let array = head.cast::<DmaFenceArray>();
+    unsafe { dma_fence_array_member(array, 0) }
+}
+
+/// Linux `dma_fence_array_next()`: member `index`, or null past the end.
+///
+/// # Safety
+/// `head` must be null or a live fence.
+pub unsafe fn dma_fence_array_next(head: *mut DmaFence, index: u32) -> *mut DmaFence {
+    if head.is_null() || unsafe { (*head).ops } != ptr::addr_of!(dma_fence_array_ops).cast() {
+        return ptr::null_mut();
+    }
+    unsafe { dma_fence_array_member(head.cast(), index) }
+}
+
+unsafe fn dma_fence_array_member(array: *mut DmaFenceArray, index: u32) -> *mut DmaFence {
+    if index >= unsafe { (*array).num_fences } {
+        return ptr::null_mut();
+    }
+    unsafe { *(*array).fences.add(index as usize) }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dma_fence_array_create(
     num_fences: u32,

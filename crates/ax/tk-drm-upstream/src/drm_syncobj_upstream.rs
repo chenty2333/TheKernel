@@ -10,7 +10,7 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::{
     cell::UnsafeCell,
-    ffi::{c_int, c_long, c_void},
+    ffi::{c_char, c_int, c_long, c_void},
     mem::{MaybeUninit, size_of},
     ptr,
     sync::atomic::{AtomicU32, Ordering},
@@ -18,6 +18,8 @@ use core::{
 
 use tk_linux_kapi::{
     config::{EFAULT, EINVAL, ENOENT, ENOMEM, EOPNOTSUPP, ERESTARTSYS, ETIME, GFP_KERNEL},
+    shmem::{File, FileOperations, Inode, fput_file},
+    sync_file::{sync_file_create, sync_file_get_fence},
     locks::spin_lock_init,
     memory::{kfree, kmalloc},
     mm_native::{copy_from_user, copy_to_user},
@@ -82,10 +84,13 @@ unsafe extern "C" {
         function: unsafe extern "C" fn(*mut DmaFence, *mut tk_linux_kapi::types::DmaFenceCb),
     ) -> i32;
     static dma_fence_chain_ops: DmaFenceOps;
-    fn sync_file_create(fence: *mut DmaFence) -> *mut c_void;
-    fn sync_file_get_fence(fd: c_int) -> *mut DmaFence;
-    fn thekernel_drm_syncobj_export_fd(syncobj: *mut c_void) -> c_int;
-    fn thekernel_drm_syncobj_import_fd(fd: c_int) -> *mut c_void;
+    fn anon_inode_getfile(
+        name: *const c_char,
+        fops: *const c_void,
+        private_data: *mut c_void,
+        flags: c_int,
+    ) -> *mut c_void;
+    fn fget(fd: c_int) -> *mut c_void;
     fn thekernel_eventfd_ctx_fdget(fd: c_int) -> *mut c_void;
     fn thekernel_eventfd_signal(ctx: *mut c_void, count: u64) -> c_int;
     fn thekernel_eventfd_ctx_put(ctx: *mut c_void);
@@ -564,7 +569,7 @@ pub unsafe fn drm_syncobj_sync_file_get_fence(fd: c_int) -> *mut DmaFence {
 
 /// Create a sync-file wrapper retaining the supplied dma-fence.
 pub unsafe fn drm_syncobj_sync_file_create(fence: *mut DmaFence) -> *mut c_void {
-    unsafe { sync_file_create(fence) }
+    unsafe { sync_file_create(fence) }.cast()
 }
 
 /// Return the Linux file pointer at the head of an upstream sync-file wrapper.
@@ -645,6 +650,47 @@ pub unsafe extern "C" fn drm_syncobj_get(syncobj: *mut DrmSyncobj) -> *mut DrmSy
         unsafe { Arc::increment_strong_count(syncobj) };
     }
     syncobj
+}
+
+/// Linux `drm_syncobj_file_fops`: the identity of syncobj descriptors. Its only
+/// operation drops the reference the descriptor holds on the syncobj.
+pub static DRM_SYNCOBJ_FILE_FOPS: FileOperations = FileOperations {
+    release: Some(drm_syncobj_file_release),
+    ..FileOperations::empty()
+};
+
+/// Linux `drm_syncobj_file_release()`.
+unsafe extern "C" fn drm_syncobj_file_release(_inode: *mut Inode, file: *mut File) -> c_int {
+    // SAFETY: the file's private data is the syncobj reference `drm_syncobj_get_fd`
+    // took for this descriptor; the final fput releases exactly that reference.
+    let syncobj = unsafe { (*file)._private_data }.cast::<DrmSyncobj>();
+    unsafe { drm_syncobj_put(syncobj) };
+    0
+}
+
+/// Linux `drm_syncobj_get_fd()`: a new descriptor that holds its own reference
+/// to `syncobj`. Returns the descriptor or a negative errno.
+fn drm_syncobj_get_fd(syncobj: *mut DrmSyncobj) -> Result<c_int, c_int> {
+    let fd = unsafe { get_unused_fd_flags(O_CLOEXEC) };
+    if fd < 0 {
+        return Err(fd);
+    }
+    let file = unsafe {
+        anon_inode_getfile(
+            c"syncobj_file".as_ptr(),
+            ptr::addr_of!(DRM_SYNCOBJ_FILE_FOPS).cast(),
+            syncobj.cast(),
+            0,
+        )
+    };
+    if tk_linux_kapi::config::IS_ERR(file) {
+        let error = tk_linux_kapi::config::PTR_ERR(file);
+        unsafe { put_unused_fd(fd) };
+        return Err(error);
+    }
+    unsafe { drm_syncobj_get(syncobj) };
+    unsafe { fd_install(fd, file) };
+    Ok(fd)
 }
 
 fn create_syncobj_handle(file: *mut DrmFile, syncobj: Arc<DrmSyncobj>) -> Result<u32, i32> {
@@ -1215,42 +1261,38 @@ pub unsafe extern "C" fn drm_syncobj_handle_to_fd_ioctl(
         }
         let syncobj = unsafe { drm_syncobj_find(file, args.handle) };
         if syncobj.is_null() {
-            return -ENOENT;
+            return -EINVAL;
         }
-        let fd = unsafe { thekernel_drm_syncobj_export_fd(syncobj.cast()) };
+        let ret = drm_syncobj_get_fd(syncobj);
         unsafe { drm_syncobj_put(syncobj) };
-        if fd < 0 {
-            return fd;
-        }
-        args.fd = fd;
-        return 0;
+        return match ret {
+            Ok(fd) => {
+                args.fd = fd;
+                0
+            }
+            Err(error) => error,
+        };
     }
 
+    // Linux drm_syncobj_export_sync_file(): reserve the descriptor first.
+    let fd = unsafe { get_unused_fd_flags(O_CLOEXEC) };
+    if fd < 0 {
+        return fd;
+    }
     let mut fence = ptr::null_mut();
     let ret = unsafe { drm_syncobj_find_fence(file, args.handle, point, 0, &mut fence) };
     if ret != 0 {
+        unsafe { put_unused_fd(fd) };
         return ret;
-    }
-    let fd = unsafe { get_unused_fd_flags(O_CLOEXEC) };
-    if fd < 0 {
-        unsafe { dma_fence_put(fence) };
-        return fd;
     }
     let sync_file = unsafe { sync_file_create(fence) };
     unsafe { dma_fence_put(fence) };
     if sync_file.is_null() {
         unsafe { put_unused_fd(fd) };
-        return -ENOMEM;
-    }
-    let file_ptr = unsafe { *(sync_file.cast::<*mut c_void>()) };
-    if file_ptr.is_null() {
-        unsafe {
-            fput(file_ptr);
-            put_unused_fd(fd);
-        }
         return -EINVAL;
     }
-    unsafe { fd_install(fd, file_ptr) };
+    // SAFETY: `sync_file` is the live sync_file `sync_file_create` returned.
+    unsafe { fd_install(fd, (*sync_file).file.cast()) };
     args.fd = fd;
     0
 }
@@ -1278,14 +1320,24 @@ pub unsafe extern "C" fn drm_syncobj_fd_to_handle_ioctl(
         if args.point != 0 {
             return -EINVAL;
         }
-        let syncobj = unsafe { thekernel_drm_syncobj_import_fd(args.fd) };
-        if tk_linux_kapi::config::IS_ERR(syncobj) {
-            return tk_linux_kapi::config::PTR_ERR(syncobj);
-        }
-        if syncobj.is_null() {
+        // Linux drm_syncobj_fd_to_handle(): the descriptor must be a syncobj file.
+        let linux_file = unsafe { fget(args.fd) }.cast::<File>();
+        if linux_file.is_null() {
             return -EINVAL;
         }
-        let syncobj = unsafe { Arc::from_raw(syncobj.cast::<DrmSyncobj>()) };
+        if !ptr::eq(
+            unsafe { (*linux_file).f_op },
+            ptr::addr_of!(DRM_SYNCOBJ_FILE_FOPS),
+        ) {
+            unsafe { fput_file(linux_file) };
+            return -EINVAL;
+        }
+        // The handle table takes its own reference; the fd reference is dropped below.
+        let syncobj = unsafe { (*linux_file)._private_data }.cast::<DrmSyncobj>();
+        unsafe { drm_syncobj_get(syncobj) };
+        unsafe { fput_file(linux_file) };
+        // SAFETY: the reference taken above is the one `Arc::from_raw` consumes.
+        let syncobj = unsafe { Arc::from_raw(syncobj) };
         return match create_syncobj_handle(file, syncobj) {
             Ok(handle) => {
                 args.handle = handle;

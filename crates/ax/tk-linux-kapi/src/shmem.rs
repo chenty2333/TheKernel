@@ -22,10 +22,6 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
-/// Release hook installed by the DRM core provider (`sync_file_release`). Null
-/// until a provider is installed, matching the previous provider-absent no-op.
-pub static SYNC_FILE_RELEASE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-
 use crate::{
     config::{GFP_KERNEL, PAGE_SHIFT, PAGE_SIZE},
     print::{self, CFormatArg, DrmLogLevel},
@@ -215,7 +211,10 @@ pub struct File {
 
 unsafe impl Send for File {}
 
-/// Linux `struct file_operations` prefix including `write_iter`.
+/// Linux `struct file_operations` prefix through `release` (v7.2.3 field
+/// order, x86_64 offsets). Fields between `write_iter` and `release` that this
+/// kernel never dispatches are kept as opaque pointer-sized slots so that
+/// `release` sits at its Linux offset (120), matching the i915 GEM tables.
 #[repr(C)]
 pub struct FileOperations {
     pub owner: *mut c_void,
@@ -226,6 +225,44 @@ pub struct FileOperations {
     pub _write: *const c_void,
     pub _read_iter: *const c_void,
     pub write_iter: Option<unsafe extern "C" fn(*mut Kiocb, *mut IovIter) -> isize>,
+    pub _iopoll: *const c_void,
+    pub _iterate_shared: *const c_void,
+    pub _poll: *const c_void,
+    pub _unlocked_ioctl: *const c_void,
+    pub _compat_ioctl: *const c_void,
+    pub _mmap: *const c_void,
+    pub _open: *const c_void,
+    pub _flush: *const c_void,
+    /// Linux `->release(inode, file)`, run by the final `fput()`.
+    pub release: Option<unsafe extern "C" fn(*mut Inode, *mut File) -> c_int>,
+}
+
+const _: [(); 120] = [(); offset_of!(FileOperations, release)];
+
+impl FileOperations {
+    /// A file table with every operation absent. Tables that define one
+    /// operation spread this and set the field they need.
+    pub const fn empty() -> Self {
+        Self {
+            owner: core::ptr::null_mut(),
+            fop_flags: 0,
+            _pad: 0,
+            _llseek: core::ptr::null(),
+            _read: core::ptr::null(),
+            _write: core::ptr::null(),
+            _read_iter: core::ptr::null(),
+            write_iter: None,
+            _iopoll: core::ptr::null(),
+            _iterate_shared: core::ptr::null(),
+            _poll: core::ptr::null(),
+            _unlocked_ioctl: core::ptr::null(),
+            _compat_ioctl: core::ptr::null(),
+            _mmap: core::ptr::null(),
+            _open: core::ptr::null(),
+            _flush: core::ptr::null(),
+            release: None,
+        }
+    }
 }
 
 unsafe impl Sync for FileOperations {}
@@ -289,14 +326,8 @@ const _: [(); 48] = [(); offset_of!(FileOperations, write_iter)];
 const _: [(); 128] = [(); size_of::<FolioBatch>()];
 
 static FILE_OPERATIONS: FileOperations = FileOperations {
-    owner: ptr::null_mut(),
-    fop_flags: 0,
-    _pad: 0,
-    _llseek: ptr::null(),
-    _read: ptr::null(),
-    _write: ptr::null(),
-    _read_iter: ptr::null(),
     write_iter: Some(shmem_write_iter),
+    ..FileOperations::empty()
 };
 
 unsafe fn alloc_object<T>(value: T) -> *mut T {
@@ -1083,24 +1114,29 @@ pub unsafe fn fput_file(file: *mut File) {
     if old != 1 {
         return;
     }
-    // `sync_file_create()` uses the LinuxKPI file as the stable ownership
-    // token for a kernel-native sync_file. Let the DRM provider release its
-    // wrapper before freeing the shmem allocation; all other files are a
-    // no-op in that registry.
-    let hook = SYNC_FILE_RELEASE.load(Ordering::Acquire);
-    if !hook.is_null() {
-        // SAFETY: the pointer was stored from a `sync_file_release` fn item by the
-        // DRM core provider installer and has exactly this signature.
-        let release: unsafe extern "C" fn(*mut c_void) = unsafe { core::mem::transmute(hook) };
-        unsafe { release(file.cast()) };
-    }
     let mapping = unsafe { (*file).f_mapping };
     let inode = unsafe { (*file).f_inode };
+    // Linux `__fput()`: the last reference runs `f_op->release` before the
+    // file is freed.
+    let f_op = unsafe { (*file).f_op };
+    if let Some(release) = unsafe { f_op.as_ref() }.and_then(|ops| ops.release) {
+        // The result of `->release` is ignored by `__fput()` as well.
+        unsafe { release(inode, file) };
+    }
     unsafe {
         cleanup_mapping(mapping);
         free_object(inode);
         free_object(file);
     }
+}
+
+/// Take one more reference to `file` (Linux `get_file()`).
+///
+/// # Safety
+/// `file` must be a live file.
+pub unsafe fn fget_file(file: *mut File) -> *mut File {
+    unsafe { (*file).refs.fetch_add(1, Ordering::AcqRel) };
+    file
 }
 
 /// Linux-compatible `fput(void *)` wrapper for callers that keep the original

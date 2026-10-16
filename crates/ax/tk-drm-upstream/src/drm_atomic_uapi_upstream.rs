@@ -8,6 +8,8 @@
 use core::ffi::{c_int, c_void};
 use core::mem::size_of;
 
+use tk_linux_kapi::sync_file::{SyncFile, sync_file_create, sync_file_get_fence};
+
 use crate::drm_atomic_types::{DrmAtomicCommit, DrmCrtcCommit};
 use crate::drm_connector_types::{DrmConnector, DrmConnectorState, DRM_LINK_STATUS_GOOD};
 use crate::drm_crtc_types::{DrmCrtc, DrmCrtcState};
@@ -35,11 +37,6 @@ const EACCES: i32 = 13;
 const O_CLOEXEC: i32 = 0x80000;
 const DRIVER_ATOMIC: u32 = 1 << 4;
 const DRM_MODESET_ACQUIRE_INTERRUPTIBLE: u32 = 0x1;
-
-#[repr(C)]
-pub struct SyncFile {
-    pub file: *mut c_void,
-}
 
 unsafe extern "C" {
     fn drm_property_create_blob(dev: *mut DrmDevice, length: usize, data: *const c_void) -> *mut DrmPropertyBlob;
@@ -74,8 +71,6 @@ unsafe extern "C" {
     fn drm_writeback_get_out_fence(wb_conn: *mut c_void) -> *mut DmaFence;
     fn drm_event_reserve_init(dev: *mut DrmDevice, file_priv: *mut DrmFile, p: *mut crate::drm_file_types::DrmPendingEvent, e: *mut DrmEvent) -> i32;
     fn drm_event_cancel_free(dev: *mut DrmDevice, p: *mut crate::drm_file_types::DrmPendingEvent);
-    fn sync_file_create(fence: *mut DmaFence) -> *mut SyncFile;
-    fn sync_file_get_fence(fd: i32) -> *mut DmaFence;
     fn dma_fence_put(fence: *mut DmaFence);
     fn get_unused_fd_flags(flags: c_int) -> c_int;
     fn put_unused_fd(fd: c_int);
@@ -1352,7 +1347,7 @@ unsafe fn complete_signaling(
         for i in 0..(num_fences as usize) {
             unsafe {
                 let entry = fence_state.add(i);
-                fd_install((*entry).fd, (*(*entry).sync_file).file);
+                fd_install((*entry).fd, (*(*entry).sync_file).file.cast());
             }
         }
         unsafe { kfree(fence_state); }
@@ -1385,7 +1380,7 @@ unsafe fn complete_signaling(
         for i in 0..(num_fences as usize) {
             let entry = fence_state.add(i);
             if !(*entry).sync_file.is_null() {
-                fput((*(*entry).sync_file).file);
+                fput((*(*entry).sync_file).file.cast());
             }
             if (*entry).fd >= 0 {
                 put_unused_fd((*entry).fd);

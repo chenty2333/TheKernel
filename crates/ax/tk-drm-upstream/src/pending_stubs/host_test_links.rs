@@ -83,20 +83,8 @@ pub unsafe extern "C" fn dma_buf_put(dmabuf: *mut DmaBuf) {
 
 unsafe extern "C" fn host_test_fence_release(_kref: *mut tk_linux_kapi::types::Kref) {}
 
-#[cfg(test)]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sync_file_create(_fence: *mut DmaFence) -> *mut c_void {
-    core::ptr::null_mut()
-}
-
-#[cfg(test)]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sync_file_get_fence(_fd: i32) -> *mut DmaFence {
-    core::ptr::null_mut()
-}
-
-// The ioctl table retains syncobj entry points in this isolated component test
-// binary. Their fence/VFS services belong to the kernel-linked tests, not this
+// The ioctl table retains eventfd entry points in this isolated component test
+// binary. Their services belong to the kernel-linked tests, not this
 // fixture. Trap if reached: linking this table must not falsely validate them.
 macro_rules! kernel_only_test_service {
     ($name:ident($($arg:ident: $ty:ty),* $(,)?) -> $ret:ty) => {
@@ -111,5 +99,3 @@ macro_rules! kernel_only_test_service {
 kernel_only_test_service!(thekernel_eventfd_signal(ctx: *mut c_void, count: u64) -> i32);
 kernel_only_test_service!(thekernel_eventfd_ctx_put(ctx: *mut c_void) -> ());
 kernel_only_test_service!(thekernel_eventfd_ctx_fdget(fd: i32) -> *mut c_void);
-kernel_only_test_service!(thekernel_drm_syncobj_import_fd(fd: i32) -> *mut c_void);
-kernel_only_test_service!(thekernel_drm_syncobj_export_fd(syncobj: *mut c_void) -> i32);

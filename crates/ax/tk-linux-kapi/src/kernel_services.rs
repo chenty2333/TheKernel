@@ -96,6 +96,10 @@ pub struct FileOps {
     pub get_unused_fd_flags: unsafe extern "C" fn(flags: c_int) -> c_int,
     pub put_unused_fd: unsafe extern "C" fn(fd: c_int),
     pub fd_install: unsafe extern "C" fn(fd: c_int, file: *mut c_void),
+    /// Linux `fget()`: a new reference to the LinuxKPI file behind `fd`, or
+    /// null when `fd` is not open or is not backed by a LinuxKPI file. The
+    /// caller drops it with `fput_file`.
+    pub fget: unsafe extern "C" fn(fd: c_int) -> *mut c_void,
 }
 
 /// PCI device resources and claimed memory regions.
@@ -238,6 +242,18 @@ pub unsafe extern "C" fn get_unused_fd_flags(flags: c_int) -> c_int {
 #[unsafe(export_name = "put_unused_fd")]
 pub unsafe extern "C" fn put_unused_fd(fd: c_int) {
     unsafe { (FILES.require("file table").put_unused_fd)(fd) };
+}
+
+/// Linux `fget(fd)`. Without a file table no descriptor resolves: null.
+///
+/// # Safety
+/// The returned reference must be dropped with `shmem::fput_file`.
+#[unsafe(export_name = "fget")]
+pub unsafe extern "C" fn fget(fd: c_int) -> *mut crate::shmem::File {
+    match FILES.get() {
+        Some(ops) => unsafe { (ops.fget)(fd) }.cast(),
+        None => core::ptr::null_mut(),
+    }
 }
 
 /// Linux `fd_install(fd, file)`.
