@@ -946,3 +946,17 @@ pub unsafe extern "C" fn intel_gt_init_swizzling(gt: *mut IntelGt) {
         version => MISSING_CASE!(version),
     }
 }
+
+/// Host-test stand-in for the kernel's `intel_has_pending_fb_unpin()`
+/// (`kernel/src/drm/intel/upstream_gt.rs`), which is not linked into
+/// `cargo test --lib`. It mirrors the kernel's `false` result. Compiled only
+/// for tests, so kernel builds keep the single kernel-side definition.
+#[cfg(test)]
+mod host_test_stubs {
+    use core::ffi::c_void;
+
+    #[unsafe(export_name = "intel_has_pending_fb_unpin")]
+    pub unsafe extern "C" fn host_intel_has_pending_fb_unpin(_display: *mut c_void) -> bool {
+        false
+    }
+}

@@ -1059,8 +1059,14 @@ mod tests {
     /// past index 0 and N305 spun in this function pinning a context image.
     #[test]
     fn sg_alloc_table_advances_past_each_folio() {
+        // Host threads start without a per-CPU current task; the kernel-side
+        // allocation path reads one. Bring up the scheduler on this thread
+        // first, as the tk-axnet-ng host tests do.
+        static TASK_INIT: std::sync::Once = std::sync::Once::new();
         let (done, finished) = mpsc::channel();
         thread::spawn(move || unsafe {
+            axhal::percpu::init_primary(0);
+            TASK_INIT.call_once(|| axtask::init_scheduler().unwrap());
             let size = 3 * PAGE_SIZE;
             let file = shmem_file_setup(c"sg-advance".as_ptr(), size as u64, 0);
             assert!(!IS_ERR(file));
