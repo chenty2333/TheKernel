@@ -22,7 +22,7 @@ const _: [(); 8] = [(); core::mem::align_of::<RcuWork>()];
 unsafe extern "C" fn rcu_work_rcufn(rcu: *mut RcuHead) {
     let rwork = unsafe { rcu.cast::<u8>().sub(core::mem::offset_of!(RcuWork, rcu)) }
         .cast::<RcuWork>();
-    unsafe { crate::workqueue::enqueue_marked_work(core::ptr::addr_of_mut!((*rwork).work)) };
+    unsafe { crate::workqueue::enqueue_marked_work((*rwork).wq, core::ptr::addr_of_mut!((*rwork).work)) };
 }
 
 /// Linux `queue_rcu_work()`: queue `rwork` on `wq` after an RCU grace period.

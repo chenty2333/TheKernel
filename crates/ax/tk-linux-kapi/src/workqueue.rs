@@ -2,17 +2,24 @@
 // Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
 //! Asynchronous Linux `work_struct` dispatch for the i915 LinuxKPI boundary.
 //!
-//! This adapter provides one persistent task-context worker and an intrusive
-//! FIFO. Producers only publish a pending work item under an IRQ-safe lock;
-//! callbacks are always invoked later by the worker, never inline. A single
-//! worker is intentionally conservative: all workqueue handles currently feed
-//! the same FIFO, so this preserves non-concurrent execution of a work item but
-//! does not model Linux workqueue priority or per-queue parallelism.
+//! This adapter provides a pool of persistent task-context workers fed by one
+//! intrusive FIFO. Producers only publish a pending work item under an
+//! IRQ-safe lock; callbacks are always invoked later by a worker, never inline.
 //!
-//! The executor must be initialized from blockable task context before any
-//! work can be queued. Delayed work is not implemented: this kernel has no
-//! Linux timer-wheel binding, and substituting an immediate callback would
-//! violate `mod_delayed_work()` semantics.
+//! The pool keeps the Linux execution guarantees the i915 and DRM ports rely
+//! on:
+//! - a work item never runs on two workers at once (non-reentrancy); an item
+//!   requeued while running waits for that instance to finish;
+//! - each `workqueue_struct` limits its running items to `max_active`, so an
+//!   ordered queue (`__WQ_ORDERED`, `max_active == 1`) runs its items one at a
+//!   time in queue order;
+//! - a work item blocking on another item does not starve it: a manager task
+//!   adds workers (up to [`MAX_WORKERS`]) when runnable work waits while no
+//!   worker is idle, standing in for Linux's concurrency-managed pools.
+//!
+//! Workqueue priority (`WQ_HIGHPRI`) and CPU affinity are not modelled.
+//! The executor must be initialized from blockable task context before work
+//! can run; items queued earlier wait on the FIFO.
 
 #![allow(unsafe_code)]
 #![allow(non_snake_case)]
@@ -24,7 +31,7 @@ use core::{
     hint::spin_loop,
     ops::{Deref, DerefMut},
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering},
 };
 
 use kernel_guard::NoPreemptIrqSave;
@@ -70,16 +77,43 @@ const _: [(); 32] = [(); core::mem::offset_of!(DelayedWork, timer)];
 const _: [(); 72] = [(); core::mem::offset_of!(DelayedWork, workqueue)];
 const _: [(); 80] = [(); core::mem::offset_of!(DelayedWork, cpu)];
 
-/// Linux `workqueue_struct` is an opaque handle here. Queue identity is
-/// retained at the API boundary, while the current runtime funnels work into
-/// the one ordered worker described above.
+/// Linux `WQ_MAX_ACTIVE` and `WQ_DFL_ACTIVE` (include/linux/workqueue.h).
+const WQ_MAX_ACTIVE: u32 = 2048;
+const WQ_DFL_ACTIVE: u32 = WQ_MAX_ACTIVE / 2;
+/// Linux `__WQ_ORDERED` (include/linux/workqueue.h).
+const __WQ_ORDERED: u32 = 1 << 17;
+const WORKQUEUE_MAGIC: u32 = 0x5751_5545;
+
+/// Linux `workqueue_struct`. Every queue feeds the shared worker pool; the
+/// handle carries its concurrency limit and the in-flight count that
+/// `flush_workqueue()` waits on. The counters change only under `WORK_QUEUE`.
 #[repr(C)]
 pub struct WorkqueueStruct {
-    _identity: u8,
+    magic: u32,
+    max_active: u32,
+    /// Items of this queue currently executing.
+    active: AtomicU32,
+    /// Items of this queue queued or executing.
+    inflight: AtomicUsize,
 }
 
-static SYSTEM_DEFAULT_WORKQUEUE: WorkqueueStruct = WorkqueueStruct { _identity: 0 };
-static SYSTEM_HIGHPRI_WORKQUEUE: WorkqueueStruct = WorkqueueStruct { _identity: 1 };
+impl WorkqueueStruct {
+    const fn new(max_active: u32) -> Self {
+        Self {
+            magic: WORKQUEUE_MAGIC,
+            max_active,
+            active: AtomicU32::new(0),
+            inflight: AtomicUsize::new(0),
+        }
+    }
+}
+
+// Queued items keep their workqueue pointer in `work_struct.data` next to the
+// PENDING bit, as Linux keeps its pool_workqueue there.
+const _: () = assert!(core::mem::align_of::<WorkqueueStruct>() > WORK_PENDING);
+
+static SYSTEM_DEFAULT_WORKQUEUE: WorkqueueStruct = WorkqueueStruct::new(WQ_DFL_ACTIVE);
+static SYSTEM_HIGHPRI_WORKQUEUE: WorkqueueStruct = WorkqueueStruct::new(WQ_DFL_ACTIVE);
 
 #[allow(non_upper_case_globals)]
 pub const system_dfl_wq: *mut WorkqueueStruct =
@@ -363,26 +397,85 @@ impl<T> Drop for IrqSpinGuard<'_, T> {
 static WORK_QUEUE: IrqSpinLock<WorkList> = IrqSpinLock::new(WorkList::new());
 static WORKER_STATE: AtomicU8 = AtomicU8::new(WORKER_UNINITIALIZED);
 static WORK_GENERATION: AtomicUsize = AtomicUsize::new(0);
-static ACTIVE_WORK: AtomicPtr<WorkStruct> = AtomicPtr::new(ptr::null_mut());
-static WORKER_TASK_IDENTITY: AtomicUsize = AtomicUsize::new(0);
+/// Items on the FIFO (pending, not yet running). Changed under `WORK_QUEUE`.
+static QUEUED: AtomicUsize = AtomicUsize::new(0);
 static WORK_WAKE: axtask::WaitQueue = axtask::WaitQueue::new();
 static WORK_STATE_WAKE: axtask::WaitQueue = axtask::WaitQueue::new();
+static MANAGER_WAKE: axtask::WaitQueue = axtask::WaitQueue::new();
+
+/// Upper bound on pool workers. Each one is a kernel task with its own stack.
+pub const MAX_WORKERS: usize = 32;
+const INITIAL_WORKERS: usize = 2;
+/// How long runnable work may wait with no idle worker before the manager
+/// adds one: long enough that ordinary busy workers pick it up first.
+const STARVATION_GRACE: core::time::Duration = core::time::Duration::from_millis(10);
+
+struct WorkerSlot {
+    task: AtomicUsize,
+    current: AtomicPtr<WorkStruct>,
+    current_wq: AtomicPtr<WorkqueueStruct>,
+}
+
+impl WorkerSlot {
+    const fn new() -> Self {
+        Self {
+            task: AtomicUsize::new(0),
+            current: AtomicPtr::new(ptr::null_mut()),
+            current_wq: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+}
+
+static WORKERS: [WorkerSlot; MAX_WORKERS] = [const { WorkerSlot::new() }; MAX_WORKERS];
+/// Claimed prefix of `WORKERS`.
+static NR_WORKERS: AtomicUsize = AtomicUsize::new(0);
+static IDLE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+fn workers() -> &'static [WorkerSlot] {
+    &WORKERS[..NR_WORKERS.load(Ordering::Acquire).min(MAX_WORKERS)]
+}
 
 fn notify_workers() {
     WORK_GENERATION.fetch_add(1, Ordering::Release);
     WORK_WAKE.notify_all(false);
 }
 
-fn make_worker_name() -> Result<String, WorkqueueError> {
+/// Wake the manager when work is queued and every worker is occupied.
+fn kick_manager_if_starved() {
+    if QUEUED.load(Ordering::Acquire) != 0 && IDLE_WORKERS.load(Ordering::Acquire) == 0 {
+        MANAGER_WAKE.notify_one(false);
+    }
+}
+
+fn make_task_name(prefix: &str, index: Option<usize>) -> Result<String, WorkqueueError> {
     let mut name = String::new();
-    name.try_reserve_exact(16)
+    name.try_reserve_exact(24)
         .map_err(|_| WorkqueueError::WorkerUnavailable)?;
-    name.push_str("i915-workqueue");
+    name.push_str(prefix);
+    if let Some(index) = index {
+        let _ = write!(name, "/{index}");
+    }
     Ok(name)
 }
 
-/// Start the persistent asynchronous work worker from blockable task context.
-/// This is idempotent and must complete before the first `queue_work()` call.
+/// Claim the next worker slot and start its task. Called only by the
+/// executor initializer and by the single manager task.
+fn spawn_worker() -> Result<(), WorkqueueError> {
+    let index = NR_WORKERS.load(Ordering::Acquire);
+    if index >= MAX_WORKERS {
+        return Err(WorkqueueError::WorkerUnavailable);
+    }
+    let name = make_task_name("kworker", Some(index))?;
+    let worker = axtask::try_spawn_with_name(move || workqueue_worker(index), name)
+        .map_err(|_| WorkqueueError::WorkerUnavailable)?;
+    // Workers have kernel lifetime; no workqueue shutdown hook exists.
+    core::mem::forget(worker);
+    NR_WORKERS.store(index + 1, Ordering::Release);
+    Ok(())
+}
+
+/// Start the persistent worker pool from blockable task context.
+/// This is idempotent and must complete before queued work can run.
 pub fn init_workqueue_executor() -> Result<(), WorkqueueError> {
     if !axtask::can_block_current() {
         return Err(WorkqueueError::ContextCannotBlock);
@@ -409,22 +502,26 @@ pub fn init_workqueue_executor() -> Result<(), WorkqueueError> {
                     continue;
                 }
 
-                let worker = match make_worker_name().and_then(|name| {
-                    axtask::try_spawn_with_name(workqueue_worker, name)
-                        .map_err(|_| WorkqueueError::WorkerUnavailable)
-                }) {
-                    Ok(worker) => worker,
-                    Err(error) => {
-                        WORKER_STATE.store(WORKER_UNINITIALIZED, Ordering::Release);
-                        WORK_WAKE.notify_all(false);
-                        return Err(error);
+                let started = (|| {
+                    while NR_WORKERS.load(Ordering::Acquire) < INITIAL_WORKERS {
+                        spawn_worker()?;
                     }
-                };
-                // The executor has kernel lifetime; no workqueue shutdown hook
-                // exists in this driver boundary.
-                core::mem::forget(worker);
+                    let manager = make_task_name("kworker-manager", None).and_then(|name| {
+                        axtask::try_spawn_with_name(workqueue_manager, name)
+                            .map_err(|_| WorkqueueError::WorkerUnavailable)
+                    })?;
+                    core::mem::forget(manager);
+                    Ok(())
+                })();
+                if let Err(error) = started {
+                    // Workers already spawned stay parked until a later
+                    // initializer publishes READY.
+                    WORKER_STATE.store(WORKER_UNINITIALIZED, Ordering::Release);
+                    WORK_WAKE.notify_all(false);
+                    return Err(error);
+                }
                 WORKER_STATE.store(WORKER_READY, Ordering::Release);
-                WORK_WAKE.notify_all(false);
+                notify_workers();
                 return Ok(());
             }
             _ => unreachable!("invalid workqueue worker state"),
@@ -598,13 +695,12 @@ pub unsafe fn queue_work<Q: WorkqueuePtr, W: WorkStructPtr>(workqueue: Q, work: 
         .unwrap_or_else(|error| panic!("queue_work failed: {error:?}"))
 }
 
-/// Fallible implementation of [`queue_work`]. The workqueue handle is opaque;
-/// this runtime currently routes all handles to one FIFO.
+/// Fallible implementation of [`queue_work`].
 pub unsafe fn try_queue_work<Q: WorkqueuePtr, W: WorkStructPtr>(
     workqueue: Q,
     work: W,
 ) -> Result<bool, WorkqueueError> {
-    let workqueue = workqueue.workqueue_ptr();
+    let workqueue = workqueue.workqueue_ptr().cast_mut().cast::<WorkqueueStruct>();
     let work = work.work_struct_ptr();
     if workqueue.is_null() || work.is_null() {
         return Err(WorkqueueError::NullPointer);
@@ -621,92 +717,213 @@ pub unsafe fn try_queue_work<Q: WorkqueuePtr, W: WorkStructPtr>(
         if old & WORK_PENDING != 0 {
             return Ok(false);
         }
-        unsafe { queue.push(work) };
+        unsafe { enqueue_locked(&mut queue, workqueue, work) };
     }
     notify_workers();
+    kick_manager_if_starved();
     Ok(true)
 }
 
-fn pop_work() -> *mut WorkStruct {
-    let mut queue = WORK_QUEUE.lock();
-    // SAFETY: intrusive links are protected by WORK_QUEUE.
-    let work = unsafe { queue.pop() };
-    if work.is_null() {
-        return work;
-    }
-
-    // The pending-to-running transition is made under the same lock used by
-    // queue/cancel, so no producer can observe a detached-but-pending item.
-    let state = unsafe { work_data(work) };
-    let old = state.fetch_and(!WORK_PENDING, Ordering::AcqRel);
-    assert!(
-        old & WORK_PENDING != 0,
-        "workqueue node without pending bit"
+/// Publish a work item whose PENDING bit is already set. The caller holds
+/// `WORK_QUEUE`.
+unsafe fn enqueue_locked(queue: &mut WorkList, workqueue: *mut WorkqueueStruct, work: *mut WorkStruct) {
+    assert_eq!(
+        unsafe { (*workqueue).magic },
+        WORKQUEUE_MAGIC,
+        "queue_work on a pointer that is not a workqueue_struct"
     );
-    assert!(ACTIVE_WORK.load(Ordering::Relaxed).is_null());
-    ACTIVE_WORK.store(work, Ordering::Release);
-    work
+    unsafe { work_data(work) }.store(workqueue as usize | WORK_PENDING, Ordering::Release);
+    unsafe { (*workqueue).inflight.fetch_add(1, Ordering::AcqRel) };
+    QUEUED.fetch_add(1, Ordering::AcqRel);
+    unsafe { queue.push(work) };
+}
+
+/// The workqueue recorded for a queued item, or null when the PENDING bit was
+/// set without publishing the item (an RCU work item inside its grace period).
+unsafe fn queued_workqueue(work: *mut WorkStruct) -> *mut WorkqueueStruct {
+    let data = unsafe { work_data(work) }.load(Ordering::Acquire);
+    if data & WORK_PENDING == 0 || data & !WORK_PENDING == WORK_DATA_INIT {
+        return ptr::null_mut();
+    }
+    (data & !WORK_PENDING) as *mut WorkqueueStruct
+}
+
+/// Whether some worker is executing `work`. The caller holds `WORK_QUEUE`.
+fn running_anywhere(work: *mut WorkStruct) -> bool {
+    workers()
+        .iter()
+        .any(|slot| slot.current.load(Ordering::Acquire) == work)
+}
+
+/// Pop the oldest item that may run now: its queue is below `max_active` and
+/// no other worker runs the same item. Skipped items keep their FIFO position,
+/// so an ordered queue still runs in queue order. The caller holds
+/// `WORK_QUEUE`.
+unsafe fn take_runnable_locked(queue: &mut WorkList) -> Option<(*mut WorkStruct, *mut WorkqueueStruct)> {
+    let head = queue.head;
+    if head.is_null() {
+        return None;
+    }
+    let mut node = head;
+    loop {
+        let work = unsafe { work_from_entry(node) };
+        let workqueue = unsafe { queued_workqueue(work) };
+        assert!(!workqueue.is_null(), "queued work item has no workqueue");
+        let limit = unsafe { (*workqueue).max_active };
+        if unsafe { (*workqueue).active.load(Ordering::Acquire) } < limit
+            && !running_anywhere(work)
+        {
+            assert!(unsafe { queue.remove(work) }, "runnable work missing from queue");
+            return Some((work, workqueue));
+        }
+        node = unsafe { (*node).next };
+        if node == head {
+            return None;
+        }
+    }
+}
+
+/// Whether any queued item could start now (manager heuristic).
+fn has_runnable_work() -> bool {
+    let queue = WORK_QUEUE.lock();
+    let head = queue.head;
+    if head.is_null() {
+        return false;
+    }
+    let mut node = head;
+    loop {
+        let work = unsafe { work_from_entry(node) };
+        let workqueue = unsafe { queued_workqueue(work) };
+        if !workqueue.is_null()
+            && unsafe { (*workqueue).active.load(Ordering::Acquire) < (*workqueue).max_active }
+            && !running_anywhere(work)
+        {
+            return true;
+        }
+        node = unsafe { (*node).next };
+        if node == head {
+            return false;
+        }
+    }
+}
+
+/// Move one runnable item from the FIFO onto worker `index`.
+fn take_work(index: usize) -> *mut WorkStruct {
+    let taken = {
+        let mut queue = WORK_QUEUE.lock();
+        let Some((work, workqueue)) = (unsafe { take_runnable_locked(&mut queue) }) else {
+            return ptr::null_mut();
+        };
+        // The pending-to-running transition is made under the same lock used
+        // by queue/cancel, so no producer can observe a detached-but-pending
+        // item, and the item can be requeued as soon as it runs.
+        unsafe { work_data(work) }.store(WORK_DATA_INIT, Ordering::Release);
+        QUEUED.fetch_sub(1, Ordering::AcqRel);
+        unsafe { (*workqueue).active.fetch_add(1, Ordering::AcqRel) };
+        let slot = &WORKERS[index];
+        slot.current_wq.store(workqueue, Ordering::Release);
+        slot.current.store(work, Ordering::Release);
+        work
+    };
+    kick_manager_if_starved();
+    taken
+}
+
+fn finish_work(index: usize, work: *mut WorkStruct) {
+    {
+        let _queue = WORK_QUEUE.lock();
+        let slot = &WORKERS[index];
+        let active = slot.current.swap(ptr::null_mut(), Ordering::AcqRel);
+        assert_eq!(active, work, "work callback completed without ownership");
+        let workqueue = slot.current_wq.swap(ptr::null_mut(), Ordering::AcqRel);
+        unsafe {
+            (*workqueue).active.fetch_sub(1, Ordering::AcqRel);
+            (*workqueue).inflight.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    WORK_STATE_WAKE.notify_all(false);
+    // A requeued instance of this item, or the next item of a saturated
+    // queue, may be runnable now.
+    if QUEUED.load(Ordering::Acquire) != 0 {
+        notify_workers();
+    }
 }
 
 fn work_busy(work: *mut WorkStruct) -> bool {
     let _queue = WORK_QUEUE.lock();
     unsafe { work_data(work) }.load(Ordering::Acquire) & WORK_PENDING != 0
-        || ACTIVE_WORK.load(Ordering::Acquire) == work
+        || running_anywhere(work)
 }
 
-fn worker_wait_for_generation(generation: usize) {
-    WORK_WAKE
-        .wait_until(|| WORK_GENERATION.load(Ordering::Acquire) != generation)
-        .expect("workqueue worker lost its waitable task context");
-}
-
-fn workqueue_worker() {
+fn workqueue_worker(index: usize) {
     let task = axhal::percpu::current_task_ptr::<()>();
-    if !task.is_null() {
-        WORKER_TASK_IDENTITY.store(task as usize, Ordering::Release);
-    }
+    WORKERS[index].task.store(task as usize, Ordering::Release);
     WORK_WAKE
         .wait_until(|| WORKER_STATE.load(Ordering::Acquire) == WORKER_READY)
         .expect("workqueue worker could not wait for executor publication");
 
     loop {
         let generation = WORK_GENERATION.load(Ordering::Acquire);
-        let work = pop_work();
+        let work = take_work(index);
         if work.is_null() {
-            if WORK_GENERATION.load(Ordering::Acquire) == generation {
-                worker_wait_for_generation(generation);
-            }
+            IDLE_WORKERS.fetch_add(1, Ordering::AcqRel);
+            WORK_WAKE
+                .wait_until(|| WORK_GENERATION.load(Ordering::Acquire) != generation)
+                .expect("workqueue worker lost its waitable task context");
+            IDLE_WORKERS.fetch_sub(1, Ordering::AcqRel);
             continue;
         }
 
         let callback =
             unsafe { (*work).function }.expect("queued work item has no initialized callback");
         unsafe { callback(work) };
-
-        {
-            let _queue = WORK_QUEUE.lock();
-            let active = ACTIVE_WORK.swap(ptr::null_mut(), Ordering::AcqRel);
-            assert_eq!(active, work, "work callback completed without ownership");
-        }
-        WORK_STATE_WAKE.notify_all(false);
+        finish_work(index, work);
     }
 }
 
-/// Return the work item currently executing on this task, if and only if the
-/// caller is the persistent workqueue worker. The FIFO backend has one worker;
-/// checking task identity prevents unrelated tasks from observing its globally
-/// active item as their own `current_work()`.
+/// Grow the pool when runnable work has waited `STARVATION_GRACE` with no
+/// idle worker: every worker is busy or blocked, possibly on that very work.
+fn workqueue_manager() {
+    WORK_WAKE
+        .wait_until(|| WORKER_STATE.load(Ordering::Acquire) == WORKER_READY)
+        .expect("workqueue manager could not wait for executor publication");
+    let starved = || {
+        QUEUED.load(Ordering::Acquire) != 0
+            && IDLE_WORKERS.load(Ordering::Acquire) == 0
+            && NR_WORKERS.load(Ordering::Acquire) < MAX_WORKERS
+    };
+    loop {
+        MANAGER_WAKE
+            .wait_until(starved)
+            .expect("workqueue manager lost its waitable task context");
+        let _ = axtask::sleep(STARVATION_GRACE);
+        if !starved() || !has_runnable_work() {
+            continue;
+        }
+        match spawn_worker() {
+            Ok(()) => axlog::debug!(
+                "workqueue: added worker {} for starved work",
+                NR_WORKERS.load(Ordering::Acquire)
+            ),
+            Err(error) => {
+                axlog::warn!("workqueue: cannot add worker: {error:?}");
+                let _ = axtask::sleep(core::time::Duration::from_secs(1));
+            }
+        }
+    }
+}
+
+/// Return the work item the calling worker task is executing, or null when
+/// the caller is not a pool worker.
 pub fn current_work() -> *mut WorkStruct {
-    if WORKER_STATE.load(Ordering::Acquire) != WORKER_READY {
-        return ptr::null_mut();
-    }
     let task = axhal::percpu::current_task_ptr::<()>();
-    if task.is_null()
-        || task as usize != WORKER_TASK_IDENTITY.load(Ordering::Acquire)
-    {
+    if task.is_null() {
         return ptr::null_mut();
     }
-    ACTIVE_WORK.load(Ordering::Acquire)
+    workers()
+        .iter()
+        .find(|slot| slot.task.load(Ordering::Acquire) == task as usize)
+        .map_or(ptr::null_mut(), |slot| slot.current.load(Ordering::Acquire))
 }
 
 /// Non-synchronously cancel a queued work instance.
@@ -720,9 +937,10 @@ pub unsafe fn cancel_work<W: WorkStructPtr>(work: W) -> bool {
 
     let removed = {
         let mut queue = WORK_QUEUE.lock();
-        let state = unsafe { work_data(work) };
-        let old = state.fetch_and(!WORK_PENDING, Ordering::AcqRel);
-        if old & WORK_PENDING == 0 {
+        let workqueue = unsafe { queued_workqueue(work) };
+        if workqueue.is_null() {
+            // Idle, or an RCU work item still inside its grace period, which
+            // Linux also cannot steal.
             false
         } else {
             // SAFETY: queue lock serializes cancellation with enqueue/dequeue.
@@ -730,17 +948,19 @@ pub unsafe fn cancel_work<W: WorkStructPtr>(work: W) -> bool {
                 unsafe { queue.remove(work) },
                 "pending work missing from queue"
             );
+            unsafe { work_data(work) }.store(WORK_DATA_INIT, Ordering::Release);
+            QUEUED.fetch_sub(1, Ordering::AcqRel);
+            unsafe { (*workqueue).inflight.fetch_sub(1, Ordering::AcqRel) };
             true
         }
     };
     if removed {
         WORK_STATE_WAKE.notify_all(false);
-        notify_workers();
     }
     removed
 }
 
-/// Wait for all work queued before or during the active callback to finish.
+/// Wait for the queued and executing instances of `work` to finish.
 ///
 /// # Safety
 /// `work` must remain live and initialized through the wait. The caller must
@@ -762,8 +982,6 @@ pub unsafe fn try_flush_work<W: WorkStructPtr>(work: W) -> Result<bool, Workqueu
     if !work_busy(work) {
         return Ok(false);
     }
-    // One worker serves every item, so a flush can wait forever behind an
-    // item that is itself blocked. Name both sides while waiting.
     let mut waited_s = 0u64;
     loop {
         let timed_out = WORK_STATE_WAKE
@@ -773,20 +991,29 @@ pub unsafe fn try_flush_work<W: WorkStructPtr>(work: W) -> Result<bool, Workqueu
             break;
         }
         waited_s += 10;
-        let active = ACTIVE_WORK.load(Ordering::Acquire);
-        let active_fn = if active.is_null() {
-            0
-        } else {
-            unsafe { (*active).function }.map_or(0, |f| f as usize)
-        };
-        let waited_fn = unsafe { (*work).function }.map_or(0, |f| f as usize);
-        axlog::warn!(
-            "flush_work stalled {waited_s}s: waiting work={work:p} fn={waited_fn:#x} \
-             data={:#x}; worker runs work={active:p} fn={active_fn:#x}",
-            unsafe { work_data(work) }.load(Ordering::Acquire)
-        );
+        report_flush_stall(work, waited_s);
     }
     Ok(true)
+}
+
+/// Name the waited item and what every worker is running.
+fn report_flush_stall(work: *mut WorkStruct, waited_s: u64) {
+    let waited_fn = unsafe { (*work).function }.map_or(0, |f| f as usize);
+    axlog::warn!(
+        "flush_work stalled {waited_s}s: waiting work={work:p} fn={waited_fn:#x} data={:#x} \
+         queued={} idle={}/{}",
+        unsafe { work_data(work) }.load(Ordering::Acquire),
+        QUEUED.load(Ordering::Acquire),
+        IDLE_WORKERS.load(Ordering::Acquire),
+        NR_WORKERS.load(Ordering::Acquire),
+    );
+    for (index, slot) in workers().iter().enumerate() {
+        let active = slot.current.load(Ordering::Acquire);
+        if !active.is_null() {
+            let active_fn = unsafe { (*active).function }.map_or(0, |f| f as usize);
+            axlog::warn!("  kworker/{index} runs work={active:p} fn={active_fn:#x}");
+        }
+    }
 }
 
 /// Cancel pending work and wait for an already executing callback to finish.
@@ -822,36 +1049,40 @@ pub unsafe fn mark_work_pending(work: *mut WorkStruct) -> bool {
     old & WORK_PENDING == 0
 }
 
-/// Enqueue a work item whose PENDING bit the caller already set. The pending
-/// bit stays set until the worker dequeues the item.
+/// Enqueue on `workqueue` a work item whose PENDING bit the caller already
+/// set. The pending bit stays set until a worker dequeues the item.
 ///
 /// # Safety
-/// `work` must be live, initialized, marked pending and not on the queue.
-pub unsafe fn enqueue_marked_work(work: *mut WorkStruct) {
+/// `work` must be live, initialized, marked pending and not on the queue;
+/// `workqueue` must be a live workqueue handle.
+pub unsafe fn enqueue_marked_work(workqueue: *mut c_void, work: *mut WorkStruct) {
+    assert!(!workqueue.is_null() && !work.is_null());
     let _ = init_workqueue_executor();
     {
         let mut queue = WORK_QUEUE.lock();
-        unsafe { queue.push(work) };
+        unsafe { enqueue_locked(&mut queue, workqueue.cast(), work) };
     }
     notify_workers();
+    kick_manager_if_starved();
 }
 
-/// Block until the work runtime has no queued or running item.
+/// Block until `workqueue` has no queued or running item.
 ///
-/// The runtime is one FIFO served by one worker. Waiting for it to drain
-/// covers every item queued before the call, which is the Linux guarantee of
-/// `flush_workqueue()` / `drain_workqueue()`; it may additionally wait for items
-/// queued after the call.
-pub fn flush_all_work() {
+/// This covers every item queued before the call, which is the Linux
+/// guarantee of `flush_workqueue()` / `drain_workqueue()`; it may additionally
+/// wait for items queued on the same queue after the call.
+fn flush_workqueue_items(workqueue: *mut WorkqueueStruct) {
+    assert!(!workqueue.is_null(), "flush_workqueue(NULL)");
+    if unsafe { (*workqueue).inflight.load(Ordering::Acquire) } == 0 {
+        return;
+    }
     if !axtask::can_block_current() {
         panic!("flush_workqueue requires blockable task context");
     }
     let _ = init_workqueue_executor();
     WORK_STATE_WAKE
-        .wait_until(|| {
-            WORK_QUEUE.lock().head.is_null() && ACTIVE_WORK.load(Ordering::Acquire).is_null()
-        })
-        .expect("flush_workqueue could not wait for the worker");
+        .wait_until(|| unsafe { (*workqueue).inflight.load(Ordering::Acquire) } == 0)
+        .expect("flush_workqueue could not wait for the workers");
 }
 
 // ---------------------------------------------------------------------------
@@ -872,28 +1103,36 @@ pub unsafe extern "C" fn c_flush_work(work: *mut WorkStruct) -> bool {
 
 /// Linux `flush_workqueue()`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn flush_workqueue(_wq: *mut c_void) {
-    flush_all_work();
+pub unsafe extern "C" fn flush_workqueue(wq: *mut c_void) {
+    flush_workqueue_items(wq.cast());
 }
 
 /// Linux `drain_workqueue()`: flushes until no work remains. Re-queueing
 /// after the drain is not rejected, which is the one difference from Linux's
 /// `__WQ_DRAINING` warning path.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn drain_workqueue(_wq: *mut c_void) {
-    flush_all_work();
+pub unsafe extern "C" fn drain_workqueue(wq: *mut c_void) {
+    flush_workqueue_items(wq.cast());
 }
 
 /// Linux `alloc_workqueue()`. The format arguments name the queue for debug
-/// output; the one ordered worker serves every queue, so the name is not kept.
+/// output and are not kept; `flags` and `max_active` set the concurrency
+/// limit as in `__alloc_workqueue()` / `wq_clamp_max_active()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alloc_workqueue(
     _fmt: *const core::ffi::c_char,
-    _flags: u32,
-    _max_active: core::ffi::c_int,
+    flags: u32,
+    max_active: core::ffi::c_int,
     _args: ...
 ) -> *mut c_void {
-    let queue = alloc::boxed::Box::new(WorkqueueStruct { _identity: 2 });
+    let max_active = if flags & __WQ_ORDERED != 0 {
+        1
+    } else if max_active <= 0 {
+        WQ_DFL_ACTIVE
+    } else {
+        (max_active as u32).min(WQ_MAX_ACTIVE)
+    };
+    let queue = alloc::boxed::Box::new(WorkqueueStruct::new(max_active));
     alloc::boxed::Box::into_raw(queue).cast()
 }
 
@@ -906,7 +1145,7 @@ pub unsafe extern "C" fn destroy_workqueue(wq: *mut c_void) {
         wq.cast::<WorkqueueStruct>() != system_dfl_wq && wq.cast::<WorkqueueStruct>() != system_highpri_wq,
         "destroy_workqueue on a system workqueue"
     );
-    flush_all_work();
+    flush_workqueue_items(wq.cast());
     drop(unsafe { alloc::boxed::Box::from_raw(wq.cast::<WorkqueueStruct>()) });
 }
 
@@ -916,6 +1155,24 @@ mod tests {
     use core::sync::atomic::AtomicU32;
 
     static TEST_CALLBACK_CALLED: AtomicU32 = AtomicU32::new(0);
+    /// The tests share the global FIFO; serialize them.
+    static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        TEST_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Host tests have no blockable task, so no worker task runs; the tests
+    /// drive two worker slots by hand.
+    fn claim_test_slots() {
+        NR_WORKERS.fetch_max(2, Ordering::AcqRel);
+    }
+
+    fn new_work() -> alloc::boxed::Box<WorkStruct> {
+        let mut work = alloc::boxed::Box::new(unsafe { core::mem::zeroed::<WorkStruct>() });
+        INIT_WORK_C(&mut work, test_callback);
+        work
+    }
 
     unsafe extern "C" fn test_callback(_work: *mut WorkStruct) {
         TEST_CALLBACK_CALLED.fetch_add(1, Ordering::SeqCst);
@@ -923,6 +1180,7 @@ mod tests {
 
     #[test]
     fn test_early_queue_work_and_cancel() {
+        let _serial = serial();
         let mut work = core::mem::MaybeUninit::<WorkStruct>::zeroed();
         let work_ptr = work.as_mut_ptr();
         unsafe {
@@ -942,6 +1200,7 @@ mod tests {
 
     #[test]
     fn test_cancel_work_before_execution() {
+        let _serial = serial();
         let mut work = core::mem::MaybeUninit::<WorkStruct>::zeroed();
         let work_ptr = work.as_mut_ptr();
         unsafe {
@@ -950,5 +1209,60 @@ mod tests {
             let _ = cancel_work(work_ptr);
             assert!(!work_pending(work_ptr));
         }
+    }
+
+    #[test]
+    fn ordered_queue_runs_one_item_at_a_time_in_order() {
+        let _serial = serial();
+        claim_test_slots();
+        let wq = unsafe { alloc_workqueue(c"ordered".as_ptr(), __WQ_ORDERED, 1) };
+        let mut first = new_work();
+        let mut second = new_work();
+        let (first, second) = (&mut *first as *mut WorkStruct, &mut *second as *mut WorkStruct);
+        unsafe {
+            assert!(queue_work(wq, first));
+            assert!(queue_work(wq, second));
+        }
+        assert_eq!(take_work(0), first);
+        assert!(take_work(1).is_null(), "ordered queue started a second item");
+        finish_work(0, first);
+        assert_eq!(take_work(1), second);
+        finish_work(1, second);
+        assert_eq!(unsafe { (*wq.cast::<WorkqueueStruct>()).inflight.load(Ordering::Acquire) }, 0);
+        unsafe { destroy_workqueue(wq) };
+    }
+
+    #[test]
+    fn unordered_queue_runs_items_concurrently() {
+        let _serial = serial();
+        claim_test_slots();
+        let mut first = new_work();
+        let mut second = new_work();
+        let (first, second) = (&mut *first as *mut WorkStruct, &mut *second as *mut WorkStruct);
+        unsafe {
+            assert!(queue_work(system_dfl_wq, first));
+            assert!(queue_work(system_dfl_wq, second));
+        }
+        assert_eq!(take_work(0), first);
+        assert_eq!(take_work(1), second);
+        finish_work(0, first);
+        finish_work(1, second);
+    }
+
+    #[test]
+    fn requeued_running_item_waits_for_its_running_instance() {
+        let _serial = serial();
+        claim_test_slots();
+        let mut work = new_work();
+        let work = &mut *work as *mut WorkStruct;
+        unsafe { assert!(queue_work(system_dfl_wq, work)) };
+        assert_eq!(take_work(0), work);
+        assert!(!unsafe { work_pending(work) });
+        unsafe { assert!(queue_work(system_dfl_wq, work)) };
+        assert!(take_work(1).is_null(), "work item ran on two workers at once");
+        finish_work(0, work);
+        assert_eq!(take_work(1), work);
+        finish_work(1, work);
+        assert!(!work_busy(work));
     }
 }

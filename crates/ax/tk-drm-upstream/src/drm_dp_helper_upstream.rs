@@ -2422,8 +2422,6 @@ pub unsafe extern "C" fn drm_dp_psr_setup_time(psr_cap: *const u8) -> c_int {
     PSR_SETUP_TIME_US[i] as c_int
 }
 
-static DUMMY_SYSTEM_WQ: u8 = 0;
-
 // upstream: drivers/gpu/drm/display/drm_dp_helper.c drm_dp_start_crc()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_dp_start_crc(aux: *mut DrmDpAux, crtc: *mut DrmCrtc) -> c_int {
@@ -2440,7 +2438,7 @@ pub unsafe extern "C" fn drm_dp_start_crc(aux: *mut DrmDpAux, crtc: *mut DrmCrtc
 
     (*aux).crc_count = 0;
     (*aux).crtc = crtc;
-    tk_linux_kapi::workqueue::queue_work(&DUMMY_SYSTEM_WQ as *const u8, &mut (*aux).crc_work);
+    tk_linux_kapi::workqueue::queue_work(tk_linux_kapi::workqueue::system_dfl_wq, &mut (*aux).crc_work);
     0
 }
 
