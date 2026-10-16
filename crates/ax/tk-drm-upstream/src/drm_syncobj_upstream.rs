@@ -50,6 +50,132 @@ const MAX_SYNCOBJ_COUNT: usize = 1 << 16;
 const WAIT_FOR_SUBMIT_TIMEOUT_JIFFIES: u64 = 5000;
 const O_CLOEXEC: c_int = 0x80000;
 
+/// Shared hosted file-descriptor provider for DRM crate tests. The LinuxKPI
+/// provider is install-once, so all tests in this crate must use the same
+/// table rather than registering independent mocks.
+#[cfg(test)]
+pub(crate) mod test_file_ops {
+    use alloc::vec::Vec;
+    use core::{
+        ffi::{c_char, c_int, c_void},
+        ptr,
+        sync::atomic::{AtomicI32, AtomicUsize, Ordering},
+    };
+
+    use spin::{Mutex, MutexGuard};
+    use tk_linux_kapi::{
+        config::{ERR_PTR, IS_ERR},
+        kernel_services::{FileOps, install_file_ops},
+        shmem::{File, FileOperations, fget_file, fput_file, shmem_file_setup},
+    };
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    static FD_TABLE: Mutex<Vec<(c_int, usize)>> = Mutex::new(Vec::new());
+    // The pending dma-buf test shim maps only the first 256 descriptor slots.
+    static NEXT_FD: AtomicI32 = AtomicI32::new(10);
+    static NEXT_FD_ERROR: AtomicI32 = AtomicI32::new(0);
+    static ANON_INODE_ERROR: AtomicI32 = AtomicI32::new(0);
+    static PUT_UNUSED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    static PLAIN_FILE_OPS: FileOperations = FileOperations::empty();
+
+    unsafe extern "C" fn anon_inode_getfile(
+        name: *const c_char,
+        fops: *const c_void,
+        private_data: *mut c_void,
+        flags: c_int,
+    ) -> *mut c_void {
+        let error = ANON_INODE_ERROR.swap(0, Ordering::SeqCst);
+        if error != 0 {
+            return ERR_PTR(error);
+        }
+        let file = unsafe { shmem_file_setup(name, 0, 0) };
+        if file.is_null() || IS_ERR(file) {
+            return file.cast();
+        }
+        unsafe {
+            (*file).f_op = fops.cast();
+            (*file)._private_data = private_data;
+            (*file).f_flags = flags as u32;
+        }
+        file.cast()
+    }
+
+    unsafe extern "C" fn get_unused_fd_flags(_flags: c_int) -> c_int {
+        let error = NEXT_FD_ERROR.swap(0, Ordering::SeqCst);
+        if error != 0 {
+            error
+        } else {
+            NEXT_FD.fetch_add(1, Ordering::SeqCst)
+        }
+    }
+
+    unsafe extern "C" fn put_unused_fd(_fd: c_int) {
+        PUT_UNUSED_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn fd_install(fd: c_int, file: *mut c_void) {
+        FD_TABLE.lock().push((fd, file as usize));
+    }
+
+    unsafe extern "C" fn fget(fd: c_int) -> *mut c_void {
+        let table = FD_TABLE.lock();
+        match table.iter().find(|(entry, _)| *entry == fd) {
+            Some((_, file)) => unsafe { fget_file(*file as *mut File) }.cast(),
+            None => ptr::null_mut(),
+        }
+    }
+
+    static TEST_FILE_OPS: FileOps = FileOps {
+        anon_inode_getfile,
+        get_unused_fd_flags,
+        put_unused_fd,
+        fd_install,
+        fget,
+    };
+
+    pub(crate) fn install() {
+        install_file_ops(&TEST_FILE_OPS)
+            .expect("DRM tests must share one LinuxKPI file-ops provider");
+    }
+
+    pub(crate) fn serial() -> MutexGuard<'static, ()> {
+        TEST_LOCK.lock()
+    }
+
+    pub(crate) fn fail_next_fd(error: c_int) {
+        NEXT_FD_ERROR.store(error, Ordering::SeqCst);
+    }
+
+    pub(crate) fn fail_next_anon_inode(error: c_int) {
+        ANON_INODE_ERROR.store(error, Ordering::SeqCst);
+    }
+
+    pub(crate) fn put_unused_count() -> usize {
+        PUT_UNUSED_COUNT.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn install_plain_file() -> c_int {
+        let fd = unsafe { get_unused_fd_flags(0) };
+        assert!(fd >= 0);
+        let file = unsafe { shmem_file_setup(c"plain-test-file".as_ptr(), 0, 0) };
+        assert!(!file.is_null() && !IS_ERR(file));
+        unsafe {
+            (*file).f_op = ptr::addr_of!(PLAIN_FILE_OPS);
+            fd_install(fd, file.cast());
+        }
+        fd
+    }
+
+    pub(crate) fn close_fd(fd: c_int) {
+        let mut table = FD_TABLE.lock();
+        if let Some(index) = table.iter().position(|(entry, _)| *entry == fd) {
+            let (_, file) = table.remove(index);
+            unsafe { fput_file(file as *mut File) };
+        }
+    }
+}
+
 unsafe extern "C" {
     fn dma_fence_init(
         fence: *mut DmaFence,
@@ -1763,4 +1889,259 @@ pub unsafe extern "C" fn drm_syncobj_query_ioctl(
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        drm_drv_types::DrmDriver,
+        drm_drv_upstream::{drm_dev_alloc, drm_dev_put},
+        drm_file_upstream::{drm_file_alloc, drm_file_free},
+    };
+    use tk_linux_kapi::config::{ENODEV, EINVAL, ENOMEM};
+
+    fn test_device() -> (*mut DrmDevice, alloc::boxed::Box<DrmDriver>) {
+        let mut driver = alloc::boxed::Box::new(unsafe { core::mem::zeroed::<DrmDriver>() });
+        driver.driver_features = DRIVER_SYNCOBJ;
+        let dev = unsafe { drm_dev_alloc(&*driver, ptr::null_mut()) };
+        assert!(!dev.is_null());
+        (dev, driver)
+    }
+
+    fn syncobj_handle_ioctl(dev: *mut DrmDevice, file: *mut DrmFile, args: &mut DrmSyncobjHandle) -> i32 {
+        unsafe {
+            drm_syncobj_handle_to_fd_ioctl(dev, (args as *mut DrmSyncobjHandle).cast(), file)
+        }
+    }
+
+    fn syncobj_fd_ioctl(dev: *mut DrmDevice, file: *mut DrmFile, args: &mut DrmSyncobjHandle) -> i32 {
+        unsafe {
+            drm_syncobj_fd_to_handle_ioctl(dev, (args as *mut DrmSyncobjHandle).cast(), file)
+        }
+    }
+
+    #[test]
+    fn syncobj_handle_fd_handle_round_trip_preserves_references_across_close() {
+        let _serial = test_file_ops::serial();
+        test_file_ops::install();
+
+        let (dev, _driver) = test_device();
+        unsafe {
+            let file1 = drm_file_alloc((*dev).primary);
+            let file2 = drm_file_alloc((*dev).primary);
+            let file3 = drm_file_alloc((*dev).primary);
+            assert!(!file1.is_null() && !file2.is_null() && !file3.is_null());
+
+            let mut create = DrmSyncobjCreate {
+                handle: 0,
+                flags: 0,
+            };
+            assert_eq!(
+                drm_syncobj_create_ioctl(dev, (&mut create as *mut DrmSyncobjCreate).cast(), file1),
+                0
+            );
+            let original = drm_syncobj_find(file1, create.handle);
+            assert!(!original.is_null());
+
+            let mut export = DrmSyncobjHandle {
+                handle: create.handle,
+                flags: 0,
+                fd: -1,
+                pad: 0,
+                point: 0,
+            };
+            assert_eq!(syncobj_handle_ioctl(dev, file1, &mut export), 0);
+            assert!(export.fd >= 0);
+
+            let mut import = DrmSyncobjHandle {
+                handle: 0,
+                flags: 0,
+                fd: export.fd,
+                pad: 0,
+                point: 0,
+            };
+            assert_eq!(syncobj_fd_ioctl(dev, file2, &mut import), 0);
+            let imported = drm_syncobj_find(file2, import.handle);
+            assert_eq!(imported, original);
+            drm_syncobj_put(imported);
+
+            // Destroying the source handle must not invalidate the exported
+            // descriptor: it retains an independent syncobj reference.
+            let mut destroy = DrmSyncobjDestroy {
+                handle: create.handle,
+                pad: 0,
+            };
+            assert_eq!(
+                drm_syncobj_destroy_ioctl(
+                    dev,
+                    (&mut destroy as *mut DrmSyncobjDestroy).cast(),
+                    file1,
+                ),
+                0
+            );
+            let mut import_again = DrmSyncobjHandle {
+                handle: 0,
+                flags: 0,
+                fd: export.fd,
+                pad: 0,
+                point: 0,
+            };
+            assert_eq!(syncobj_fd_ioctl(dev, file3, &mut import_again), 0);
+            let imported_again = drm_syncobj_find(file3, import_again.handle);
+            assert_eq!(imported_again, original);
+            drm_syncobj_put(imported_again);
+
+            // Closing the descriptor drops only its own reference. Imported
+            // handles continue to identify the same object and remain usable.
+            test_file_ops::close_fd(export.fd);
+            let mut closed_import = DrmSyncobjHandle {
+                handle: 0,
+                flags: 0,
+                fd: export.fd,
+                pad: 0,
+                point: 0,
+            };
+            assert_eq!(syncobj_fd_ioctl(dev, file3, &mut closed_import), -EINVAL);
+            let still_alive_file2 = drm_syncobj_find(file2, import.handle);
+            assert_eq!(still_alive_file2, original);
+            drm_syncobj_put(still_alive_file2);
+            let still_alive = drm_syncobj_find(file3, import_again.handle);
+            assert_eq!(still_alive, original);
+            drm_syncobj_put(still_alive);
+            drm_syncobj_put(original);
+
+            for (file, handle) in [
+                (file2, import.handle),
+                (file3, import_again.handle),
+            ] {
+                let mut destroy = DrmSyncobjDestroy { handle, pad: 0 };
+                assert_eq!(
+                    drm_syncobj_destroy_ioctl(
+                        dev,
+                        (&mut destroy as *mut DrmSyncobjDestroy).cast(),
+                        file,
+                    ),
+                    0
+                );
+            }
+            drm_file_free(file3);
+            drm_file_free(file2);
+            drm_file_free(file1);
+            drm_dev_put(dev);
+        }
+    }
+
+    #[test]
+    fn syncobj_fd_conversion_rejects_invalid_inputs_and_unwinds_failures() {
+        let _serial = test_file_ops::serial();
+        test_file_ops::install();
+
+        let (dev, _driver) = test_device();
+        unsafe {
+            let file = drm_file_alloc((*dev).primary);
+            assert!(!file.is_null());
+            let mut create = DrmSyncobjCreate {
+                handle: 0,
+                flags: 0,
+            };
+            assert_eq!(
+                drm_syncobj_create_ioctl(dev, (&mut create as *mut DrmSyncobjCreate).cast(), file),
+                0
+            );
+
+            let mut invalid_handle = DrmSyncobjHandle {
+                handle: create.handle + 10,
+                flags: 0,
+                fd: -1,
+                pad: 0,
+                point: 0,
+            };
+            assert_eq!(syncobj_handle_ioctl(dev, file, &mut invalid_handle), -EINVAL);
+
+            let mut bad_flags = DrmSyncobjHandle {
+                handle: create.handle,
+                flags: 1 << 31,
+                fd: -1,
+                pad: 0,
+                point: 0,
+            };
+            assert_eq!(syncobj_handle_ioctl(dev, file, &mut bad_flags), -EINVAL);
+            let mut bad_pad = DrmSyncobjHandle {
+                handle: create.handle,
+                flags: 0,
+                fd: -1,
+                pad: 1,
+                point: 0,
+            };
+            assert_eq!(syncobj_handle_ioctl(dev, file, &mut bad_pad), -EINVAL);
+
+            let mut missing_fd = DrmSyncobjHandle {
+                handle: 0,
+                flags: 0,
+                fd: i32::MAX,
+                pad: 0,
+                point: 0,
+            };
+            assert_eq!(syncobj_fd_ioctl(dev, file, &mut missing_fd), -EINVAL);
+
+            let plain_fd = test_file_ops::install_plain_file();
+            let mut wrong_file_type = DrmSyncobjHandle {
+                handle: 0,
+                flags: 0,
+                fd: plain_fd,
+                pad: 0,
+                point: 0,
+            };
+            assert_eq!(syncobj_fd_ioctl(dev, file, &mut wrong_file_type), -EINVAL);
+            test_file_ops::close_fd(plain_fd);
+
+            let mut point_without_timeline = DrmSyncobjHandle {
+                handle: create.handle,
+                flags: 0,
+                fd: -1,
+                pad: 0,
+                point: 1,
+            };
+            assert_eq!(syncobj_handle_ioctl(dev, file, &mut point_without_timeline), -EINVAL);
+
+            let put_count = test_file_ops::put_unused_count();
+            test_file_ops::fail_next_fd(-ENODEV);
+            let mut no_descriptor = DrmSyncobjHandle {
+                handle: create.handle,
+                flags: 0,
+                fd: -1,
+                pad: 0,
+                point: 0,
+            };
+            assert_eq!(syncobj_handle_ioctl(dev, file, &mut no_descriptor), -ENODEV);
+            assert_eq!(test_file_ops::put_unused_count(), put_count);
+
+            test_file_ops::fail_next_anon_inode(-ENOMEM);
+            let mut no_file = DrmSyncobjHandle {
+                handle: create.handle,
+                flags: 0,
+                fd: -1,
+                pad: 0,
+                point: 0,
+            };
+            assert_eq!(syncobj_handle_ioctl(dev, file, &mut no_file), -ENOMEM);
+            assert_eq!(test_file_ops::put_unused_count(), put_count + 1);
+
+            let mut destroy = DrmSyncobjDestroy {
+                handle: create.handle,
+                pad: 0,
+            };
+            assert_eq!(
+                drm_syncobj_destroy_ioctl(
+                    dev,
+                    (&mut destroy as *mut DrmSyncobjDestroy).cast(),
+                    file,
+                ),
+                0
+            );
+            drm_file_free(file);
+            drm_dev_put(dev);
+        }
+    }
 }

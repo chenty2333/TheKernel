@@ -773,41 +773,16 @@ pub unsafe extern "C" fn drm_prime_gem_destroy(obj: *mut DrmGemObject, _sg: *mut
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::sync::atomic::{AtomicI32, Ordering};
-    use tk_linux_kapi::kernel_services::FileOps;
+    use crate::drm_syncobj_upstream::test_file_ops;
     use crate::drm_drv_types::DrmDriver;
     use crate::drm_drv_upstream::{drm_dev_alloc, drm_dev_put};
     use crate::drm_file_upstream::{drm_file_alloc, drm_file_free};
     use crate::drm_gem_upstream::{drm_gem_handle_create, drm_gem_object_lookup, drm_gem_object_put, drm_gem_private_object_init};
 
-    static NEXT_FD: AtomicI32 = AtomicI32::new(10);
-    unsafe extern "C" fn mock_get_unused_fd_flags(_flags: c_int) -> c_int {
-        NEXT_FD.fetch_add(1, Ordering::SeqCst)
-    }
-    unsafe extern "C" fn mock_put_unused_fd(_fd: c_int) {}
-    unsafe extern "C" fn mock_fd_install(_fd: c_int, _file: *mut c_void) {}
-    unsafe extern "C" fn mock_fget(_fd: c_int) -> *mut c_void {
-        core::ptr::null_mut()
-    }
-    unsafe extern "C" fn mock_anon_inode_getfile(
-        _name: *const c_char,
-        _fops: *const c_void,
-        _private_data: *mut c_void,
-        _flags: c_int,
-    ) -> *mut c_void {
-        core::ptr::null_mut()
-    }
-    static TEST_FILE_OPS: FileOps = FileOps {
-        anon_inode_getfile: mock_anon_inode_getfile,
-        get_unused_fd_flags: mock_get_unused_fd_flags,
-        put_unused_fd: mock_put_unused_fd,
-        fd_install: mock_fd_install,
-        fget: mock_fget,
-    };
-
     #[test]
     fn test_prime_cache_and_roundtrip() {
-        let _ = tk_linux_kapi::kernel_services::install_file_ops(&TEST_FILE_OPS);
+        let _serial = test_file_ops::serial();
+        test_file_ops::install();
         unsafe {
             // 1. Test prime lookup rbtree cache
             let mut prime: DrmPrimeFilePrivate = core::mem::zeroed();
