@@ -153,7 +153,7 @@ unsafe fn switch_to_kernel_context(engine: *mut IntelEngineCs) -> bool {
         i915_request_add_active_barriers(rq);
         (*rq).sched.attr.priority = i32::MAX - 1;
         if __i915_request_commit(rq).is_null() {
-            crate::i915_gem_clflush_upstream::dma_fence_add_callback(
+            tk_linux_kapi::dma_fence::dma_fence_add_callback(
                 &mut (*rq).fence,
                 &mut (*(*rq).submit_union.duration).cb,
                 duration,

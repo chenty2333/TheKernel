@@ -326,9 +326,9 @@ pub unsafe extern "C" fn intel_gt_watchdog_work(work: *mut WorkStruct) {
         if !i915_request_completed(request) {
             let fence = unsafe { core::ptr::addr_of_mut!((*request).fence) };
             unsafe { rcu_read_lock() };
-            let driver = unsafe { crate::i915_gem_clflush_upstream::dma_fence_driver_name(fence) };
+            let driver = unsafe { tk_linux_kapi::dma_fence::dma_fence_driver_name(fence) };
             let timeline =
-                unsafe { crate::i915_gem_clflush_upstream::dma_fence_timeline_name(fence) };
+                unsafe { tk_linux_kapi::dma_fence::dma_fence_timeline_name(fence) };
             pr_info!(
                 "Fence expiration time out i915-%s:%s:%llx!\n",
                 driver,

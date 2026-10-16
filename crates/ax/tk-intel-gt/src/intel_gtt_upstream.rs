@@ -371,7 +371,7 @@ pub unsafe extern "C" fn i915_address_space_init(vm: *mut I915AddressSpace, subc
         // compiled out for CONFIG_LOCKDEP=n.
     }
     unsafe {
-        crate::i915_gem_clflush_upstream::dma_resv_init(ptr::addr_of_mut!((*vm)._resv).cast());
+        tk_linux_kapi::dma_resv::dma_resv_init(ptr::addr_of_mut!((*vm)._resv).cast());
     }
     GEM_BUG_ON!(unsafe { (*vm).total == 0 });
     unsafe { drm_mm_init(ptr::addr_of_mut!((*vm).mm), 0, (*vm).total) };

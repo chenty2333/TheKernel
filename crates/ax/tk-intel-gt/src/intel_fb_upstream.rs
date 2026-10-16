@@ -22,6 +22,7 @@ use tk_drm_upstream::{
     uapi_drm_types::DrmClipRect,
 };
 
+use tk_linux_kapi::dma_resv::dma_resv_test_signaled;
 use crate::{
     i915_gem_tiling_upstream::{I915_TILING_NONE, I915_TILING_X, I915_TILING_Y},
     i915_gtt_view_types_upstream::{
@@ -47,7 +48,6 @@ use crate::{
     },
     intel_workarounds_types_upstream::I915RegT,
     linux::{
-        dma_fence_core::dma_resv_test_signaled,
         gem::dma_resv_get_singleton,
         memory::{kfree, kmalloc_array, kmalloc_obj, kzalloc_obj},
         requests::dma_fence_put,
@@ -2214,7 +2214,7 @@ unsafe extern "C" fn intel_user_framebuffer_dirty(
         return 0;
     }
     let ret = unsafe {
-        crate::i915_gem_clflush_upstream::dma_fence_add_callback(
+        tk_linux_kapi::dma_fence::dma_fence_add_callback(
             fence,
             ptr::addr_of_mut!((*cb).base),
             intel_user_framebuffer_fence_wake,

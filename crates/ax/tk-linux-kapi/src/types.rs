@@ -9,7 +9,7 @@
 #![allow(non_camel_case_types)]
 
 use core::{
-    ffi::{c_uint, c_ulong, c_void},
+    ffi::{c_char, c_uint, c_ulong, c_void},
     mem::ManuallyDrop,
     ops::Deref,
 };
@@ -228,10 +228,38 @@ pub struct DmaFenceChain {
     pub prev: *mut DmaFence,
     pub prev_seqno: u64,
     pub fence: *mut DmaFence,
-    pub cb: DmaFenceCb,
-    pub _pad: [u8; 8],
+    // Linux overlays the chain callback and irq_work at this exact offset.
+    pub work: IrqWork,
 }
 const _: [(); 120] = [(); core::mem::size_of::<DmaFenceChain>()];
+const _: [(); 88] = [(); core::mem::offset_of!(DmaFenceChain, work)];
+
+/// Layout of `struct dma_fence_ops` (include/linux/dma-fence.h), first two hooks
+/// used by this file; the remaining hooks are reserved and left NULL.
+#[repr(C)]
+pub struct DmaFenceOps {
+    pub get_driver_name: Option<unsafe extern "C" fn(*mut DmaFence) -> *const c_char>,
+    pub get_timeline_name: Option<unsafe extern "C" fn(*mut DmaFence) -> *const c_char>,
+    pub enable_signaling: Option<unsafe extern "C" fn(*mut DmaFence) -> bool>,
+    pub signaled: Option<unsafe extern "C" fn(*mut DmaFence) -> bool>,
+    pub wait: Option<unsafe extern "C" fn(*mut DmaFence, bool, i64) -> i64>,
+    pub release: Option<unsafe extern "C" fn(*mut DmaFence)>,
+    pub set_deadline: Option<unsafe extern "C" fn(*mut DmaFence, i64)>,
+}
+
+// Linux v7.2.3 include/linux/dma-resv.h `struct dma_resv`: the embedded WW mutex
+// and the native reservation-sidecar pointer.
+#[repr(C, align(8))]
+pub struct DmaResv {
+    pub lock: crate::ww_mutex::WwMutex,
+    pub fences: *mut c_void,
+}
+
+const _: () = assert!(core::mem::size_of::<DmaResv>() == 40);
+const _: () = assert!(core::mem::align_of::<DmaResv>() == 8);
+const _: () = assert!(core::mem::offset_of!(DmaResv, lock) == 0);
+const _: () = assert!(core::mem::size_of::<crate::ww_mutex::WwMutex>() == 32);
+const _: () = assert!(core::mem::offset_of!(DmaResv, fences) == 32);
 
 #[repr(C)]
 pub struct WaitQueueHead {

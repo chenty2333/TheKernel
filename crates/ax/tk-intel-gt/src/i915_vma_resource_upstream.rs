@@ -14,8 +14,8 @@ use core::{
     ptr,
 };
 
+use tk_linux_kapi::dma_fence::{dma_fence_get, dma_fence_init, dma_fence_put, dma_fence_signal, dma_fence_wait};
 use crate::{
-    i915_gem_clflush_upstream::{dma_fence_get, dma_fence_init, dma_fence_put, dma_fence_signal, dma_fence_wait},
     i915_request_upstream::DmaFenceOps,
     i915_sw_fence_upstream::{
         i915_sw_fence_await_dma_fence, i915_sw_fence_commit, i915_sw_fence_fini, i915_sw_fence_init,

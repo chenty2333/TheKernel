@@ -35,7 +35,6 @@ pub(crate) mod page;
 pub mod primitives;
 pub use tk_linux_kapi::drm_mm;
 // drm_vma now ported in tk-drm-upstream
-pub(crate) mod dma_fence_core;
 pub mod drm_core;
 pub use tk_linux_kapi::rbtree;
 pub use tk_linux_kapi::rcu;

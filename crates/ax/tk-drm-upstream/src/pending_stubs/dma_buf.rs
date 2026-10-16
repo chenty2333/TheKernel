@@ -151,15 +151,3 @@ pub unsafe extern "C" fn dma_fence_chain_alloc() -> *mut tk_linux_kapi::types::D
     .cast()
 }
 
-// Production dma_fence_set_deadline is provided by tk-intel-gt.
-#[cfg(test)]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_set_deadline(fence: *mut tk_linux_kapi::types::DmaFence, deadline: i64) {
-    if fence.is_null() { return; }
-    let ops = unsafe { (*fence).ops.cast::<crate::drm_crtc_upstream::DmaFenceOps>() };
-    if !ops.is_null() {
-        if let Some(set_deadline) = unsafe { (*ops).set_deadline } {
-            unsafe { set_deadline(fence, deadline) };
-        }
-    }
-}

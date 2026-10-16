@@ -10,8 +10,8 @@ use core::{
     ptr,
 };
 
+use tk_linux_kapi::dma_resv::dma_resv_init;
 use crate::{
-    i915_gem_clflush_upstream::dma_resv_init,
     i915_gem_object_api_upstream::i915_gem_object_put,
     i915_gem_object_types_upstream::{DrmI915GemObject, I915CacheLevel},
     i915_vma_api_upstream::vma_invalidate_tlb,

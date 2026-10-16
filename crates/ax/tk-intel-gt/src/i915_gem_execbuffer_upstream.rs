@@ -10,6 +10,7 @@
 use crate::linux_config::__GFP_NOWARN;
 use core::ffi::{c_char, c_int, c_long, c_ulong, c_void};
 
+use tk_linux_kapi::{dma_fence::{dma_fence_get, dma_fence_put}, dma_fence_array::dma_fence_array_create, dma_fence_chain::dma_fence_chain_free, dma_resv::dma_resv_reserve_fences};
 use crate::{
     guc_ads::PAGE_SIZE,
     guc_submission::MAX_ENGINE_INSTANCE,
@@ -17,7 +18,7 @@ use crate::{
         gen8_canonical_addr, hash_32, hlist_add_head, intel_engine_cmd_parser,
     },
     i915_gem_clflush_upstream::{
-        dma_fence_get, dma_fence_put, dma_resv_reserve_fences, drm_clflush_virt_range,
+        drm_clflush_virt_range,
         i915_gem_clflush_object,
     },
     i915_gem_context_types_upstream::{
@@ -133,8 +134,8 @@ use crate::{
         rcu::{rcu_read_lock, rcu_read_unlock},
         registers::{MI_LOAD_REGISTER_IMM, PIN_GLOBAL},
         requests::{
-            dma_fence_array_create, dma_fence_chain_alloc, dma_fence_chain_find_seqno,
-            dma_fence_chain_free, i915_request_get, i915_request_next, i915_request_put,
+            dma_fence_chain_alloc, dma_fence_chain_find_seqno,
+            i915_request_get, i915_request_next, i915_request_put,
             intel_ring_advance, ptr_mask_bits, ptr_pack_bits, ptr_unpack_bits,
         },
         signal::signal_pending_current,

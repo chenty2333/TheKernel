@@ -3,21 +3,22 @@
 // Copyright © 2019 Intel Corporation.
 //
 //! Linux v7.2.3 i915 GEM clflush and fence-work translations.  Cache flushing
-//! uses the target x86 CLFLUSH/CLFLUSHOPT instructions; fence callbacks and
-//! reservation entries have real references and run through the native
-//! LinuxKPI workqueue rather than being completed inline or discarded.
+//! uses the target x86 CLFLUSH/CLFLUSHOPT instructions; fence-work records are
+//! dma-fences on the kapi fence core (`tk_linux_kapi::dma_fence`), and the
+//! reservation entries they attach are kapi `dma_resv` records.
 
 #![allow(unsafe_code, non_camel_case_types, non_snake_case)]
 
-use alloc::{
-    alloc::{alloc, dealloc},
-    vec::Vec,
-};
 use core::{
     ffi::{c_char, c_int, c_ulong, c_void},
-    mem::{ManuallyDrop, offset_of, size_of},
+    mem::size_of,
     ptr,
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+use tk_linux_kapi::{
+    dma_fence::{dma_fence_free, dma_fence_get, dma_fence_init, dma_fence_put, dma_fence_set_error, dma_fence_signal},
+    dma_resv::{dma_resv_add_fence_native, dma_resv_reserve_fences},
 };
 
 use crate::{
@@ -26,17 +27,17 @@ use crate::{
         i915_gem_object_unpin_pages,
     },
     i915_gem_object_header_upstream::assert_object_held,
-    i915_gem_object_types_upstream::{DrmI915GemObject, I915_BO_CACHE_COHERENT_FOR_READ, Page},
+    i915_gem_object_types_upstream::{DrmI915GemObject, I915_BO_CACHE_COHERENT_FOR_READ},
     i915_gem_object_upstream::i915_gem_object_has_struct_page,
-    i915_gem_pages_upstream::{__i915_gem_object_get_pages, Scatterlist},
+    i915_gem_pages_upstream::__i915_gem_object_get_pages,
     i915_request_upstream::DmaFenceOps,
     i915_sw_fence_upstream::{
         __i915_sw_fence_await_dma_fence, I915SwDmaFenceCb, i915_sw_fence_await_reservation,
         i915_sw_fence_commit, i915_sw_fence_fini, i915_sw_fence_init,
     },
     intel_context_types_upstream::{I915SwFence, I915SwFenceNotify},
-    intel_context_upstream::{DmaFence, DmaFenceCb, DmaFenceLock, DmaFenceTimestamp, RcuHead},
-    intel_engine_cs_upstream::{ListHead, Spinlock, WorkStruct},
+    intel_context_upstream::DmaFence,
+    intel_engine_cs_upstream::{Spinlock, WorkStruct},
     linux::{
         fields::{
             i915_gem_object_cache_coherent, i915_gem_object_cache_dirty,
@@ -45,17 +46,11 @@ use crate::{
         gem::DmaResv,
         highmem::page_address,
         i915::{IS_DGFX, to_i915},
-        list::{INIT_LIST_HEAD, list_add_tail, list_del_init, list_empty, list_splice_init},
-        locks::{spin_lock_init, spin_lock_irqsave_raw, spin_unlock_irqrestore_raw},
-        memory::{__GFP_RETRY_MAYFAIL, kfree, kref_init},
-        primitives::ktime_get,
-        requests::{
-            DMA_FENCE_FLAG_SIGNALED_BIT, DMA_FENCE_FLAG_TIMESTAMP_BIT,
-            dma_fence_get as requests_dma_fence_get, dma_fence_put as requests_dma_fence_put,
-        },
+        locks::spin_lock_init,
+        memory::{__GFP_RETRY_MAYFAIL, kfree},
         workqueue::{self, INIT_WORK_C},
     },
-    linux_config::{__GFP_NOWARN, DMA_RESV_USAGE_KERNEL, GFP_KERNEL, HZ, PAGE_SHIFT, PAGE_SIZE},
+    linux_config::{__GFP_NOWARN, DMA_RESV_USAGE_KERNEL, GFP_KERNEL},
 };
 
 const I915_CLFLUSH_FORCE: u32 = 1 << 0;
@@ -65,7 +60,6 @@ const ORIGIN_CPU: u32 = 0;
 const DMA_FENCE_FLAG_USER_BITS: u32 = 6;
 const DMA_FENCE_WORK_IMM: u32 = DMA_FENCE_FLAG_USER_BITS;
 const ENOMEM: c_int = 12;
-const EINVAL: c_int = 22;
 const ENOENT: c_int = 2;
 const ERESTARTSYS: c_int = 512;
 const I915_FENCE_GFP: u32 = GFP_KERNEL | __GFP_RETRY_MAYFAIL | __GFP_NOWARN;
@@ -141,418 +135,38 @@ struct Clflush {
     obj: *mut DrmI915GemObject,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct DmaResvIter {
-    obj: *mut DmaResv,
-    usage: u32,
-    fence: *mut DmaFence,
-    fence_usage: u32,
-    index: u32,
-    fences: *mut c_void,
-    num_fences: u32,
-    is_restarted: bool,
-}
 
-#[repr(C)]
-struct ReservedFence {
-    fence: *mut DmaFence,
-    usage: u32,
-}
 
-struct ReservationState {
-    entries: spin::Mutex<Vec<ReservedFence>>,
-}
 
 static DRIVER_NAME: &[u8] = b"dma-fence\0";
 static WORK_NAME: &[u8] = b"work\0";
 static CLFLUSH_NAME: &[u8] = b"clflush\0";
 
-const _: [(); 48] = [(); size_of::<DmaResvIter>()];
 const _: [(); 64] = [(); size_of::<DmaFence>()];
 
-unsafe fn alloc_object<T>(value: T) -> *mut T {
-    let layout = core::alloc::Layout::new::<T>();
-    let object = unsafe { alloc(layout) }.cast::<T>();
-    if object.is_null() {
-        return ptr::null_mut();
-    }
-    unsafe { object.write(value) };
-    object
-}
 
-unsafe fn free_object<T>(object: *mut T) {
-    if object.is_null() {
-        return;
-    }
-    unsafe {
-        ptr::drop_in_place(object);
-        dealloc(object.cast(), core::alloc::Layout::new::<T>());
-    }
-}
 
-unsafe fn reservation_state(
-    resv: *mut DmaResv,
-    create: bool,
-) -> Result<*mut ReservationState, c_int> {
-    if resv.is_null() {
-        return Err(-EINVAL);
-    }
-    let slot = unsafe {
-        AtomicPtr::from_ptr(ptr::addr_of_mut!((*resv).fences).cast::<*mut ReservationState>())
-    };
-    let current = slot.load(Ordering::Acquire);
-    if !current.is_null() || !create {
-        return Ok(current);
-    }
-    let state = unsafe {
-        alloc_object(ReservationState {
-            entries: spin::Mutex::new(Vec::new()),
-        })
-    };
-    if state.is_null() {
-        return Err(-ENOMEM);
-    }
-    match slot.compare_exchange(ptr::null_mut(), state, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => Ok(state),
-        Err(existing) => {
-            unsafe { free_object(state) };
-            Ok(existing)
-        }
-    }
-}
 
-/// Reserve capacity in the native reservation list. The backing allocation is
-/// real and all later fence insertion paths retain a reference.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_resv_reserve_fences(resv: *mut DmaResv, count: u32) -> c_int {
-    let state = match unsafe { reservation_state(resv, true) } {
-        Ok(state) => state,
-        Err(error) => return error,
-    };
-    match unsafe { (*state).entries.lock().try_reserve(count as usize) } {
-        Ok(()) => 0,
-        Err(_) => -ENOMEM,
-    }
-}
 
-/// Insert a fence into the reservation and retain its ownership reference.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_resv_add_fence(resv: *mut DmaResv, fence: *mut DmaFence, usage: u32) {
-    assert!(!fence.is_null(), "dma_resv_add_fence received a null fence");
-    let state = unsafe { reservation_state(resv, true) }
-        .unwrap_or_else(|error| panic!("dma_resv_add_fence failed: {error}"));
-    let mut entries = unsafe { (*state).entries.lock() };
-    if entries.len() == entries.capacity() {
-        entries
-            .try_reserve(1)
-            .expect("dma_resv_add_fence requires successful prior reservation");
-    }
-    requests_dma_fence_get(fence);
-    entries.push(ReservedFence { fence, usage });
-    drop(entries);
-    // The native kernel may also own a display/KMS alias of this exact GEM
-    // object. Mirror only through the installed DRM-core provider, which
-    // rejects reservations that were not explicitly registered as aliases.
-    unsafe { crate::linux::drm_core::drm_resv_fence_add(resv.cast(), fence.cast(), usage) };
-}
 
-/// Iterate reservation fences with Linux's usage ordering and a live cursor
-/// reference, released by the caller after iteration.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_resv_iter_next(cursor: *mut DmaResvIter) -> *mut DmaFence {
-    if cursor.is_null() {
-        return ptr::null_mut();
-    }
-    let state = match unsafe { reservation_state((*cursor).obj, false) } {
-        Ok(state) if !state.is_null() => state,
-        _ => return ptr::null_mut(),
-    };
-    let entries = unsafe { (*state).entries.lock() };
-    let usage = unsafe { (*cursor).usage };
-    let start = unsafe { (*cursor).index as usize };
-    let next = entries
-        .iter()
-        .enumerate()
-        .skip(start)
-        .find(|(_, entry)| entry.usage <= usage);
-    let Some((index, entry)) = next else {
-        return ptr::null_mut();
-    };
-    let new_fence = requests_dma_fence_get(entry.fence);
-    let old_fence = unsafe { (*cursor).fence };
-    if !old_fence.is_null() {
-        unsafe { requests_dma_fence_put(old_fence) };
-    }
-    unsafe {
-        (*cursor).fence = new_fence;
-        (*cursor).fence_usage = entry.usage;
-        (*cursor).index = index.saturating_add(1) as u32;
-        (*cursor).fences = state.cast();
-        (*cursor).num_fences = entries.len() as u32;
-        (*cursor).is_restarted = false;
-    }
-    new_fence
-}
 
-/// Tear down the reservation sidecar and release all retained fence refs.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_resv_fini(resv: *mut DmaResv) {
-    if resv.is_null() {
-        return;
-    }
-    let state = unsafe {
-        AtomicPtr::from_ptr(ptr::addr_of_mut!((*resv).fences).cast::<*mut ReservationState>())
-            .swap(ptr::null_mut(), Ordering::AcqRel)
-    };
-    if state.is_null() {
-        return;
-    }
-    for entry in unsafe { (*state).entries.lock() }.iter() {
-        unsafe { requests_dma_fence_put(entry.fence) };
-    }
-    unsafe { free_object(state) };
-}
 
-unsafe fn fence_lock(fence: *mut DmaFence, flags: &mut c_ulong) {
-    let lock = unsafe { (*fence).lock.extern_lock };
-    assert!(!lock.is_null(), "dma fence has no lock");
-    unsafe { spin_lock_irqsave_raw(lock, flags) };
-}
 
-unsafe fn fence_unlock(fence: *mut DmaFence, flags: c_ulong) {
-    let lock = unsafe { (*fence).lock.extern_lock };
-    unsafe { spin_unlock_irqrestore_raw(lock, flags) };
-}
 
-/// Linux DMA-fence initializer used by request and fence-work records.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_init(
-    fence: *mut DmaFence,
-    ops: *const DmaFenceOps,
-    lock: *mut Spinlock,
-    context: u64,
-    seqno: u64,
-) {
-    assert!(!fence.is_null() && !ops.is_null() && !lock.is_null());
-    unsafe {
-        (*fence).lock = DmaFenceLock { extern_lock: lock };
-        (*fence).ops = ops.cast();
-        (*fence).timestamp_union = DmaFenceTimestamp {
-            cb_list: ManuallyDrop::new(ListHead {
-                next: ptr::null_mut(),
-                prev: ptr::null_mut(),
-            }),
-        };
-        INIT_LIST_HEAD(ptr::addr_of_mut!((*fence).timestamp_union.cb_list).cast());
-        (*fence).context = context;
-        (*fence).seqno = seqno;
-        (*fence).flags = 0;
-        (*fence).error = 0;
-        kref_init(ptr::addr_of_mut!((*fence).refcount));
-    }
-}
 
-/// Linux `dma_fence_set_error()`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_set_error(fence: *mut DmaFence, error: c_int) {
-    if !fence.is_null() && error != 0 {
-        unsafe { (*fence).error = error };
-    }
-}
 
-/// Test the Linux signaled flag.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_is_signaled(fence: *mut DmaFence) -> bool {
-    !fence.is_null()
-        && unsafe {
-            AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).load(Ordering::Acquire)
-                & (1usize << DMA_FENCE_FLAG_SIGNALED_BIT)
-                != 0
-        }
-}
 
-unsafe fn dma_fence_signal_locked_inner(fence: *mut DmaFence) {
-    if fence.is_null() {
-        return;
-    }
-    if unsafe {
-        AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).load(Ordering::Acquire)
-            & (1usize << DMA_FENCE_FLAG_SIGNALED_BIT)
-            != 0
-    } {
-        return;
-    }
-    let mut callback_list = ListHead {
-        next: ptr::null_mut(),
-        prev: ptr::null_mut(),
-    };
-    unsafe {
-        INIT_LIST_HEAD(&mut callback_list);
-        let callbacks = ptr::addr_of_mut!((*fence).timestamp_union.cb_list).cast::<ListHead>();
-        list_splice_init(callbacks, &mut callback_list);
-        (*fence).timestamp_union.timestamp = ktime_get();
-        AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).fetch_or(
-            (1usize << DMA_FENCE_FLAG_SIGNALED_BIT) | (1usize << DMA_FENCE_FLAG_TIMESTAMP_BIT),
-            Ordering::Release,
-        );
-    }
-    while !list_empty(&callback_list) {
-        let node = callback_list.next;
-        unsafe { list_del_init(node) };
-        let callback = node.cast::<DmaFenceCb>();
-        if let Some(function) = unsafe { (*callback).func } {
-            unsafe { function(fence, callback) };
-        }
-    }
-    crate::linux::requests::wake_dma_fence_waiters();
-}
 
-/// Signal a fence and run registered completion callbacks.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_signal(fence: *mut DmaFence) {
-    if fence.is_null() {
-        return;
-    }
-    let mut flags = 0;
-    unsafe { fence_lock(fence, &mut flags) };
-    unsafe { dma_fence_signal_locked_inner(fence) };
-    unsafe { fence_unlock(fence, flags) };
-}
 
-/// Locked DMA-fence signal entry point used by the i915 request path.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_signal_locked(fence: *mut DmaFence) {
-    unsafe { dma_fence_signal_locked_inner(fence) };
-}
 
-/// Add a callback or report that the fence has already signaled.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_add_callback(
-    fence: *mut DmaFence,
-    callback: *mut DmaFenceCb,
-    function: unsafe extern "C" fn(*mut DmaFence, *mut DmaFenceCb),
-) -> c_int {
-    if fence.is_null() || callback.is_null() {
-        return -EINVAL;
-    }
-    let mut flags = 0;
-    unsafe { fence_lock(fence, &mut flags) };
-    if unsafe {
-        AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).load(Ordering::Acquire)
-            & (1usize << DMA_FENCE_FLAG_SIGNALED_BIT)
-            != 0
-    } {
-        unsafe { fence_unlock(fence, flags) };
-        return -ENOENT;
-    }
-    unsafe {
-        (*callback).func = Some(function);
-        INIT_LIST_HEAD(ptr::addr_of_mut!((*callback).node));
-        list_add_tail(
-            ptr::addr_of_mut!((*callback).node),
-            ptr::addr_of_mut!((*fence).timestamp_union.cb_list).cast(),
-        );
-        fence_unlock(fence, flags);
-    }
-    0
-}
 
-/// Synchronous Linux fence wait used by source-order i915 helpers.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_wait(fence: *mut DmaFence, _intr: bool) -> c_int {
-    if fence.is_null() {
-        return -EINVAL;
-    }
-    while !unsafe { dma_fence_is_signaled(fence) } {
-        axtask::yield_now();
-    }
-    0
-}
 
-/// Resolve the Linux driver-name callback, retaining the stable static result.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_driver_name(fence: *mut DmaFence) -> *const c_char {
-    if fence.is_null() {
-        return DRIVER_NAME.as_ptr().cast();
-    }
-    let ops = unsafe { (*fence).ops.cast::<DmaFenceOps>() };
-    if ops.is_null() {
-        return DRIVER_NAME.as_ptr().cast();
-    }
-    unsafe {
-        (*ops)
-            .get_driver_name
-            .map_or(DRIVER_NAME.as_ptr().cast(), |get| get(fence))
-    }
-}
 
-/// Resolve the Linux timeline-name callback.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_timeline_name(fence: *mut DmaFence) -> *const c_char {
-    if fence.is_null() {
-        return WORK_NAME.as_ptr().cast();
-    }
-    let ops = unsafe { (*fence).ops.cast::<DmaFenceOps>() };
-    if ops.is_null() {
-        return WORK_NAME.as_ptr().cast();
-    }
-    if let Some(get) = unsafe { (*ops).get_timeline_name } {
-        unsafe { get(fence) }
-    } else {
-        WORK_NAME.as_ptr().cast()
-    }
-}
 
-unsafe extern "C" fn dma_fence_free_rcu(head: *mut RcuHead) {
-    if head.is_null() {
-        return;
-    }
-    let fence = unsafe {
-        head.cast::<u8>()
-            .sub(offset_of!(DmaFence, timestamp_union))
-            .cast::<DmaFence>()
-    };
-    unsafe { kfree(fence) };
-}
 
-/// Default Linux `dma_fence_free()` RCU reclamation path.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_free(fence: *mut DmaFence) {
-    if fence.is_null() {
-        return;
-    }
-    let head = unsafe { ptr::addr_of_mut!((*fence).timestamp_union.rcu).cast::<RcuHead>() };
-    crate::linux::rcu::call_rcu(head, dma_fence_free_rcu);
-}
 
-/// C ABI references used by i915's existing LinuxKPI sw-fence translation.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_get(fence: *mut DmaFence) -> *mut DmaFence {
-    requests_dma_fence_get(fence)
-}
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_fence_put(fence: *mut DmaFence) {
-    unsafe { requests_dma_fence_put(fence) };
-}
 
-/// Initialize a reservation sidecar when a framework owner initializes its
-/// `dma_resv` record, including its native WW mutex.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dma_resv_init(resv: *mut DmaResv) {
-    if resv.is_null() {
-        return;
-    }
-    unsafe {
-        crate::linux::mutex::mutex_init(ptr::addr_of_mut!((*resv).lock.base));
-        (*resv).lock.ctx = ptr::null_mut();
-    }
-    let slot = unsafe {
-        AtomicPtr::from_ptr(ptr::addr_of_mut!((*resv).fences).cast::<*mut ReservationState>())
-    };
-    slot.store(ptr::null_mut(), Ordering::Release);
-}
 
 // upstream: i915_config.c i915_fence_context_timeout()
 #[unsafe(no_mangle)]
@@ -709,6 +323,23 @@ pub unsafe fn dma_fence_work_commit_imm(work: *mut DmaFenceWork) {
     unsafe { dma_fence_work_commit(work) };
 }
 
+/// Reserve capacity in the native reservation list. The backing allocation is
+/// real and all later fence insertion paths retain a reference.
+/// Insert a fence into the reservation and retain its ownership reference.
+///
+/// The insertion is kapi's `dma_resv_add_fence_native`. The DRM-core alias
+/// mirror then runs through the installed DRM-core provider, which is owned
+/// here by `linux::drm_core` (it rejects reservations not registered as
+/// aliases), so the exported `dma_resv_add_fence` stays in tk-intel-gt.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dma_resv_add_fence(resv: *mut DmaResv, fence: *mut DmaFence, usage: u32) {
+    unsafe { dma_resv_add_fence_native(resv.cast(), fence, usage) };
+    // The native kernel may also own a display/KMS alias of this exact GEM
+    // object. Mirror only through the installed DRM-core provider, which
+    // rejects reservations that were not explicitly registered as aliases.
+    unsafe { crate::linux::drm_core::drm_resv_fence_add(resv.cast(), fence.cast(), usage) };
+}
+
 static CLFLUSH_WORK_OPS: DmaFenceWorkOps = DmaFenceWorkOps {
     name: CLFLUSH_NAME.as_ptr().cast(),
     work: Some(clflush_work),
@@ -816,53 +447,3 @@ pub unsafe fn i915_gem_clflush_object(obj: *mut DrmI915GemObject, flags: u32) ->
     true
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    static CALLBACKS: AtomicUsize = AtomicUsize::new(0);
-
-    unsafe extern "C" fn completed(_: *mut DmaFence, _: *mut DmaFenceCb) {
-        CALLBACKS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[test]
-    fn fence_callbacks_and_reservation_references_have_real_lifetimes() {
-        unsafe {
-            let mut fence: DmaFence = core::mem::zeroed();
-            let mut lock: Spinlock = core::mem::zeroed();
-            let ops: DmaFenceOps = core::mem::zeroed();
-            spin_lock_init(&mut lock);
-            dma_fence_init(&mut fence, &ops, &mut lock, 1, 2);
-            let mut callback: DmaFenceCb = core::mem::zeroed();
-            assert_eq!(
-                dma_fence_add_callback(&mut fence, &mut callback, completed),
-                0
-            );
-            assert!(!dma_fence_is_signaled(&mut fence));
-            dma_fence_signal(&mut fence);
-            dma_fence_signal(&mut fence);
-            assert!(dma_fence_is_signaled(&mut fence));
-            assert_eq!(CALLBACKS.load(Ordering::Relaxed), 1);
-            assert_eq!(
-                dma_fence_add_callback(&mut fence, &mut callback, completed),
-                -ENOENT
-            );
-            // Also exercises the empty callback list and timestamp union switch.
-            let mut empty: DmaFence = core::mem::zeroed();
-            dma_fence_init(&mut empty, &ops, &mut lock, 1, 3);
-            dma_fence_signal(&mut empty);
-            let mut resv: DmaResv = core::mem::zeroed();
-            dma_resv_init(&mut resv);
-            assert_eq!(dma_resv_reserve_fences(&mut resv, 1), 0);
-            dma_resv_add_fence(&mut resv, &mut fence, DMA_RESV_USAGE_KERNEL);
-            let mut cursor: DmaResvIter = core::mem::zeroed();
-            cursor.obj = &mut resv;
-            cursor.usage = DMA_RESV_USAGE_KERNEL;
-            assert_eq!(dma_resv_iter_next(&mut cursor), &mut fence as *mut _);
-            assert!(dma_resv_iter_next(&mut cursor).is_null());
-            requests_dma_fence_put(cursor.fence);
-            dma_resv_fini(&mut resv);
-            assert_eq!(fence.refcount.refcount.refs.counter, 1);
-        }
-    }
-}

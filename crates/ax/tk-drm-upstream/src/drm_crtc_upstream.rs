@@ -55,18 +55,9 @@ const DRM_SCALING_FILTER_DEFAULT: u32 = 0;
 const DRM_PLANE_TYPE_PRIMARY: u32 = 1;
 const DRM_PLANE_TYPE_CURSOR: u32 = 2;
 
-/// Layout of `struct dma_fence_ops` (include/linux/dma-fence.h), first two hooks
-/// used by this file; the remaining hooks are reserved and left NULL.
-#[repr(C)]
-pub struct DmaFenceOps {
-    pub get_driver_name: Option<unsafe extern "C" fn(*mut DmaFence) -> *const c_char>,
-    pub get_timeline_name: Option<unsafe extern "C" fn(*mut DmaFence) -> *const c_char>,
-    pub enable_signaling: Option<unsafe extern "C" fn(*mut DmaFence) -> bool>,
-    pub signaled: Option<unsafe extern "C" fn(*mut DmaFence) -> bool>,
-    pub wait: Option<unsafe extern "C" fn(*mut DmaFence, bool, i64) -> i64>,
-    pub release: Option<unsafe extern "C" fn(*mut DmaFence)>,
-    pub set_deadline: Option<unsafe extern "C" fn(*mut DmaFence, i64)>,
-}
+/// `struct dma_fence_ops` (include/linux/dma-fence.h), canonical in tk-linux-kapi
+/// next to the fence core that dispatches through it.
+pub use tk_linux_kapi::types::DmaFenceOps;
 
 unsafe extern "C" {
     // upstream: drm_mode_object.c

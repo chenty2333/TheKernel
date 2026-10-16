@@ -137,7 +137,7 @@ unsafe fn dma_resv_iter_end(cursor: &mut DmaResvIter) {
 
 #[inline]
 unsafe fn dma_fence_is_signaled(fence: *mut DmaFence) -> bool {
-    unsafe { crate::i915_gem_clflush_upstream::dma_fence_is_signaled(fence) }
+    unsafe { tk_linux_kapi::dma_fence::dma_fence_is_signaled(fence) }
 }
 
 // upstream: gem/i915_gem_wait.c i915_gem_object_wait_fence()

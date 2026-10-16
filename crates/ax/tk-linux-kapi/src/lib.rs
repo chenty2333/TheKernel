@@ -119,6 +119,14 @@ pub mod i2c_algo_bit;
 #[allow(unsafe_code)]
 pub mod dma_fence_chain;
 #[allow(unsafe_code)]
+pub mod dma_fence;
+#[allow(unsafe_code)]
+pub mod dma_fence_array;
+#[allow(unsafe_code)]
+pub mod dma_resv;
+#[allow(unsafe_code)]
+pub mod irq_work;
+#[allow(unsafe_code)]
 pub mod pci;
 #[allow(unsafe_code)]
 pub mod acpi;
