@@ -184,7 +184,7 @@ macro_rules! BITS_PER_TYPE {
 }
 
 macro_rules! GENMASK {
-    (BITS_PER_LONG - 2,0) => {{ u64::MAX >> 2 }};
+    (BITS_PER_LONG - 2,0) => {{ u64::MAX >> 1 }};
     ($high:expr, $low:expr) => {{ (u32::MAX >> (31 - $high)) & (u32::MAX << $low) }};
 }
 

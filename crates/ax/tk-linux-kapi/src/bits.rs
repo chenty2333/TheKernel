@@ -201,8 +201,9 @@ pub const fn bit(n: u32) -> u32 {
     1u32.wrapping_shl(n)
 }
 
+/// Linux `CIRC_SPACE(head, tail, size)`: argument order is head first, then tail.
 #[inline]
-pub const fn circ_space(tail: u32, head: u32, size: u32) -> u32 {
+pub const fn circ_space(head: u32, tail: u32, size: u32) -> u32 {
     tail.wrapping_sub(head.wrapping_add(1)) & (size - 1)
 }
 
@@ -312,6 +313,9 @@ mod tests {
         assert_eq!(order_base_2(1), 0);
         assert_eq!(order_base_2(17), 5);
         assert_eq!(circ_space(0, 0, 8), 7);
+        // CIRC_SPACE(head=5, tail=2, 8) = (2 - 6) & 7; the producer is ahead of the consumer.
+        assert_eq!(circ_space(5, 2, 8), 4);
+        assert_eq!(circ_space(2, 5, 8), 2);
         assert_eq!(bit(8), 0x100);
         assert_eq!(lower_32_bits(0x1234_5678_9abc_def0u64), 0x9abc_def0);
         assert_eq!(upper_32_bits(0x1234_5678_9abc_def0u64), 0x1234_5678);
