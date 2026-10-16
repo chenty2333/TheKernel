@@ -39,6 +39,7 @@ mod power;
 mod probe;
 mod regs;
 pub(crate) mod upstream_file;
+pub(crate) mod upstream_mmap;
 pub(crate) mod upstream_sync;
 mod upstream_drm;
 mod upstream_display;

@@ -873,6 +873,20 @@ fn upstream_gem_mmap(
     if unsafe { (*dev).unplugged || (*dev).vma_offset_manager.is_null() } {
         return Err(AxError::NoSuchDevice);
     }
+    // i915 mmap offsets name `i915_mmap_offset` nodes, not shmem objects.
+    // SAFETY: `dev` is the live device checked above; `driver` is compared by address only.
+    if unsafe { (*dev).driver.cast_const() }
+        == core::ptr::addr_of!(intel_gt::i915_driver_upstream::I915_DRM_DRIVER.0)
+    {
+        // SAFETY: `file.raw()` is this file's open `LinuxFile`; `private_data` is its `drm_file`.
+        let private = unsafe { (*file.raw()).private_data.cast::<DrmFile>() };
+        return crate::drm::intel::upstream_mmap::prepare_i915_gem_mmap(
+            dev,
+            private,
+            file.allows_write(),
+            request,
+        );
+    }
     let file_page = request.offset() / PAGE_SIZE as u64;
     let map_pages = request.length() / PAGE_SIZE;
     // SAFETY: `dev` is valid and `vma_offset_manager` was confirmed non-null above.
