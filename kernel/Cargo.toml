@@ -160,7 +160,6 @@ tk-linux-keyring.workspace = true
 tk-linux-landlock.workspace = true
 tk-linux-fsnotify.workspace = true
 tk-linux-mount.workspace = true
-tk-linux-drm.workspace = true
 tk-linux-aio.workspace = true
 tk-linux-syslog.workspace = true
 tk-linux-random.workspace = true

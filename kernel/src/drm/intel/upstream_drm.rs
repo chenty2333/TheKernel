@@ -778,15 +778,10 @@ unsafe extern "C" fn dev_get(dev: *mut c_void) -> *mut c_void {
 /// `drm_dev_put()`: pairs with [`dev_get`]. The device is never freed.
 unsafe extern "C" fn dev_put(_dev: *mut c_void) {}
 
-/// `drm_is_current_master()`: no upstream `drm_file` is bound to a kernel
-/// `DrmFile`, so no file can be shown to be master. Privileged paths refuse.
+/// `drm_is_current_master()`: the canonical DRM core owns mastership.
 unsafe extern "C" fn is_current_master(file: *mut c_void) -> bool {
-    let Some(native) = super::upstream_file::native_file(file) else {
-        return false;
-    };
-    // SAFETY: `native_file` returns a pointer only for an active file binding;
-    // the binding keeps the native `DrmFile` borrowed for this callback.
-    unsafe { (&*native.cast::<crate::drm::DrmFile>()).is_current_master() }
+    // SAFETY: i915 passes the live `drm_file` of the calling ioctl.
+    unsafe { tk_drm_upstream::drm_auth_upstream::drm_is_current_master(file.cast()) }
 }
 
 /// `drm_print_memory_stats()`: fdinfo output. TheKernel exposes no fdinfo, so
@@ -825,26 +820,6 @@ unsafe extern "C" fn gem_free_mmap_offset(obj: *mut c_void) {
         // the device manager, and both objects remain live in this callback.
         unsafe { drm_vma_offset_remove(manager, ptr::addr_of_mut!((*obj).vma_node)) };
     }
-}
-
-/// `drm_gem_handle_create()`: mirror the Linux-selected handle into the same
-/// kernel `DrmFile` through the active V1/V2 per-file binding.
-unsafe extern "C" fn gem_handle_create(
-    file: *mut c_void,
-    obj: *mut c_void,
-    handle: *mut u32,
-) -> c_int {
-    // SAFETY: Linux's GEM-handle callback provides a live object and writable
-    // output slot; the bridge rejects null inputs and requires an active file
-    // binding before it dereferences any of these pointers.
-    unsafe { super::upstream_file::gem_handle_create(file, obj, handle) }
-}
-
-/// Retire the native alias after Linux deletes the matching DRM handle.
-unsafe extern "C" fn gem_handle_close(file: *mut c_void, handle: u32) {
-    // SAFETY: the generic GEM core invokes this only for the live file/handle
-    // pair it has just removed; an active V1/V2 binding owns the shadow file.
-    unsafe { super::upstream_file::gem_handle_close(file, handle) }
 }
 
 /// `drm_gem_object_free()`: the final put of a GEM object. The object's
@@ -964,19 +939,6 @@ unsafe extern "C" fn dma_buf_put(_dmabuf: *mut c_void) {
     panic!("dma_buf_put: no upstream dma-buf exists; export is not bound");
 }
 
-/// Kernel-side alias notification after LinuxKPI inserts a dma-reservation fence.
-unsafe extern "C" fn resv_alias_add(resv: *mut c_void, fence: *mut c_void, usage: u32) {
-    super::upstream_sync::upstream_reservation_fence_add(resv, fence.cast(), usage);
-}
-
-/// Native fence hooks consumed by LinuxKPI's `dma_resv_add_fence` and
-/// `dma_fence_chain_find_seqno`.
-static NATIVE_FENCE_HOOKS: tk_linux_kapi::dma_fence_hooks::NativeFenceHooks =
-    tk_linux_kapi::dma_fence_hooks::NativeFenceHooks {
-        resv_alias_add,
-        timeline_fence_find: super::upstream_sync::syncobj_timeline_fence_find,
-    };
-
 static DRM_CORE: DrmCoreProvider = DrmCoreProvider {
     dev_enter,
     dev_exit,
@@ -985,8 +947,6 @@ static DRM_CORE: DrmCoreProvider = DrmCoreProvider {
     is_current_master,
     print_memory_stats,
     gem_free_mmap_offset,
-    gem_handle_create,
-    gem_handle_close,
     gem_object_free,
     gem_private_object_init,
     gem_dmabuf_export,
@@ -1001,20 +961,12 @@ static DRM_CORE: DrmCoreProvider = DrmCoreProvider {
     dma_buf_put,
 };
 
-static GEM_HANDLE_PROVIDER: tk_drm_upstream::drm_gem_upstream::DrmGemHandleProvider =
-    tk_drm_upstream::drm_gem_upstream::DrmGemHandleProvider {
-        create: gem_handle_create,
-        close: gem_handle_close,
-    };
-
 /// Installs the framework, probe and DRM-core tables. Called once from
 /// `upstream_gt::install_providers()`. Reinstalling the same tables is accepted.
 pub(super) fn install() -> Result<(), &'static str> {
     install_i915_framework_ops(&FRAMEWORK)?;
     install_i915_probe_ops(&PROBE)?;
     install_drm_core_provider(&DRM_CORE)?;
-    tk_linux_kapi::dma_fence_hooks::install_native_fence_hooks(&NATIVE_FENCE_HOOKS)?;
-    tk_drm_upstream::drm_gem_upstream::install_gem_handle_provider(&GEM_HANDLE_PROVIDER)?;
     Ok(())
 }
 

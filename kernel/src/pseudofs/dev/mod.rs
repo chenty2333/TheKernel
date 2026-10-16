@@ -4,7 +4,6 @@
 /// `crate::drm::screen` as the candidate of last resort.
 pub(crate) mod bootfb;
 mod console_font;
-mod dri;
 pub(crate) mod upstream_dri;
 pub(crate) mod upstream_fb;
 pub(crate) mod early_screen;
@@ -798,25 +797,11 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
 
     // `/dev/dri` is live: an upstream device can publish after devfs mounts
     // (i915 probes from the rootfs-ready callback), so its names resolve at
-    // lookup time. Only a legacy-core device with no upstream device keeps the
-    // fixed mapping of the legacy path.
-    match crate::drm::primary_device().filter(|_| crate::drm::upstream::devices().is_empty()) {
-        Some(device) => {
-            let mut dri = DirMapping::new();
-            dri.add("card0", dri::primary_node(fs.clone(), device.clone()));
-            if let Some(render) = dri::render_node(fs.clone(), device) {
-                dri.add("renderD128", render);
-            }
-            root.add("dri", SimpleDir::new_maker(fs.clone(), Arc::new(dri)));
-        }
-        None => root.add(
-            "dri",
-            SimpleDir::new_maker(
-                fs.clone(),
-                Arc::new(upstream_dri::DriDirectory::new(fs.clone())),
-            ),
-        ),
-    }
+    // lookup time.
+    root.add(
+        "dri",
+        SimpleDir::new_maker(fs.clone(), Arc::new(upstream_dri::DriDirectory::new(fs.clone()))),
+    );
 
     root.add(
         "tty",

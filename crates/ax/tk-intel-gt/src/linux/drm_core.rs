@@ -31,8 +31,6 @@ pub is_current_master: unsafe extern "C" fn(file: *mut c_void) -> bool,
 pub print_memory_stats:
     unsafe extern "C" fn(printer: *mut c_void, stats: *const c_void, supported: c_int, region: *const c_char),
 pub gem_free_mmap_offset: unsafe extern "C" fn(obj: *mut c_void),
-pub gem_handle_create: unsafe extern "C" fn(file: *mut c_void, obj: *mut c_void, handle: *mut u32) -> c_int,
-pub gem_handle_close: unsafe extern "C" fn(file: *mut c_void, handle: u32),
 pub gem_object_free: unsafe extern "C" fn(refcount: *mut c_void),
 pub gem_private_object_init: unsafe extern "C" fn(dev: *mut c_void, obj: *mut c_void, size: usize),
 pub gem_dmabuf_export: unsafe extern "C" fn(dev: *mut c_void, info: *mut c_void) -> *mut c_void,

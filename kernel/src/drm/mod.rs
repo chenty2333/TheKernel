@@ -1,35 +1,10 @@
-//! Device-independent DRM state for the primary node.
-//!
-//! This layer deliberately has no VFS, devfs, ioctl decoding, or transport
-//! dependency.  A character-device adapter creates a [`DrmFile`] for each OFD
-//! and translates UAPI requests into these typed operations.
+//! DRM device bring-up. Every DRM device (VirtIO GPU, efidrm, i915) is a
+//! driver on the upstream Linux DRM core (`tk-drm-upstream`), published by
+//! [`upstream`] and served to userspace by `pseudofs::dev::upstream_dri`.
 
-mod atomic;
-mod atomic_uapi_full;
-mod color_mgmt_full;
-mod connector_uapi_full;
-mod crtc_uapi_full;
-mod device;
-mod dmabuf;
 mod efidrm;
-mod fbdev;
-pub(crate) mod fence;
-mod framebuffer_uapi_full;
-mod file;
-mod gem;
 pub(crate) mod intel;
-mod ioctl;
-mod kms;
-mod mode_config_full;
-pub(crate) mod linear;
-pub mod modes;
-mod property;
-mod plane_uapi_full;
-mod property_uapi_full;
-mod render;
-mod syncobj;
 pub(crate) mod sync_file;
-pub(crate) mod uapi;
 pub(crate) mod upstream;
 
 use alloc::{boxed::Box, sync::Arc};
@@ -41,18 +16,8 @@ use tk_drm_upstream::drm_gem_types::DrmGemObject;
 /// `/dev/fb0`, and the registry a display driver enters it through.
 pub(crate) mod screen;
 
-pub use device::{
-    AdapterMetrics, DisplayAdapter, DrmDevice, DrmError, DrmMetrics, DrmResult, Scanout,
-    primary_device, register_primary_device,
-};
-pub use fbdev::DrmFbdev;
-pub use file::{DrmEvent, DrmFile, OpenId};
-pub use gem::{DumbBuffer, DumbRequest, GemBacking, GemHandle, MmapOffset};
-pub(crate) use gem::GemMemoryCharge;
-pub use kms::{ConnectorInfo, CrtcInfo, FramebufferId, KmsResources, Mode, PageFlip};
-pub use render::RenderAdapter;
-
-pub fn init_virtio_gpu() -> DrmResult<bool> {
+/// Register the boot DRM devices. Returns whether one now drives the screen.
+pub fn init_virtio_gpu() -> bool {
     // An Intel GPU is not a VirtIO device, but this is the DRM initialization
     // hook the kernel entry point already calls, so the Intel probe runs here:
     // before devfs is mounted, and therefore before any debug file could be
@@ -60,13 +25,11 @@ pub fn init_virtio_gpu() -> DrmResult<bool> {
     // other way to show one.
     //
     // The GT bring-up runs immediately after the probe, in the same place and
-    // for the same reason. There is no KMS takeover on Intel: the screen stays
-    // on the firmware (GOP) framebuffer registered below.
+    // for the same reason. i915 itself registers later, once the rootfs
+    // supplies its firmware; until then (and without native modeset) the
+    // screen is driven by efidrm over the firmware (GOP) framebuffer.
     intel::probe_at_boot();
     intel::bring_up_gt_at_boot();
-    if primary_device().is_some() {
-        return Ok(true);
-    }
     if let Some(display) = axdisplay::take_drm_display() {
         match tk_virtgpu::VirtioGpuDevice::install(Box::new(display)) {
             Ok(driver) => {
@@ -86,7 +49,7 @@ pub fn init_virtio_gpu() -> DrmResult<bool> {
                             "virtio0",
                             Some(mapping_provider),
                         ) {
-                            Ok(_) => return Ok(true),
+                            Ok(_) => return true,
                             Err(error) => axlog::warn!(
                                 "drm: upstream VirtIO DRM publication failed: {error}; firmware \
                                  console retained"
@@ -110,18 +73,7 @@ pub fn init_virtio_gpu() -> DrmResult<bool> {
             }
         }
     }
-    if efidrm::init_firmware() {
-        return Ok(true);
-    }
-    match linear::init_firmware() {
-        Ok(ready) => Ok(ready),
-        Err(error) => {
-            axlog::warn!(
-                "drm: firmware KMS registration failed: {error}; direct firmware console retained"
-            );
-            Ok(false)
-        }
-    }
+    efidrm::init_firmware()
 }
 
 /// Own the transport-facing driver while the VFS and shared mappings keep

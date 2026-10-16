@@ -132,7 +132,6 @@ tk-linux-keyring = { path = "crates/linux/keyring", version = "0.1.0", default-f
 tk-linux-landlock = { path = "crates/linux/landlock", version = "0.1.0", default-features = false }
 tk-linux-fsnotify = { path = "crates/linux/fsnotify", version = "0.1.0", default-features = false }
 tk-linux-mount = { path = "crates/linux/mount", version = "0.1.0", default-features = false }
-tk-linux-drm = { path = "crates/linux/drm", version = "0.1.0", default-features = false }
 tk-linux-aio = { path = "crates/linux/aio", version = "0.1.0", default-features = false }
 tk-linux-syslog = { path = "crates/linux/syslog", version = "0.1.0", default-features = false }
 tk-linux-random = { path = "crates/linux/random", version = "0.1.0", default-features = false }

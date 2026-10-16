@@ -412,7 +412,12 @@ fn publish_sysfs(device: &UpstreamDrmDevice) -> VfsResult<Vec<DeviceHandle<'stat
 }
 
 impl DeviceOps for UpstreamDrmNode {
-    fn open_description(&self, _location: &Location, flags: u32) -> VfsResult<Option<DeviceOpen>> {
+    fn open_description(&self, location: &Location, flags: u32) -> VfsResult<Option<DeviceOpen>> {
+        if !self.render {
+            // The seat grants the active session's user access to primary
+            // nodes (logind's uaccess ACL), so record every one that is opened.
+            crate::pseudofs::dev::tty::remember_primary_node(location)?;
+        }
         // SAFETY: `self.device.raw()` yields a valid, pinned Linux `drm_device` whose `primary`
         // and `render` minor pointers are initialized during probe and remain immutable while
         // the `UpstreamDrmDevice` is live.
@@ -609,7 +614,14 @@ impl Drop for UpstreamDrmFile {
                     &mut *ptr::addr_of_mut!((*private).event_wait),
                     &mut *self.wait_entry.get(),
                 );
+                let was_master =
+                    !self.render && tk_drm_upstream::drm_auth_upstream::drm_is_current_master(private);
                 tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), raw);
+                if was_master {
+                    // A KMS client may take master without switching the VT to
+                    // KD_GRAPHICS; its final close hands the screen back.
+                    crate::pseudofs::dev::restore_console_after_master_close();
+                }
             }
         }
         self.waiters.close();
@@ -719,7 +731,18 @@ impl FileLike for UpstreamDrmFile {
                 Ok(result as usize)
             }
         };
-        call()
+        if cmd != tk_drm_upstream::uapi_drm_consts::DRM_IOCTL_DROP_MASTER || self.render {
+            return call();
+        }
+        // SAFETY: `open()` set private_data to this file's live `drm_file`.
+        let private = unsafe { (*self.raw()).private_data.cast::<DrmFile>() };
+        // SAFETY: `private` stays live until this file's release.
+        let was_master = unsafe { tk_drm_upstream::drm_auth_upstream::drm_is_current_master(private) };
+        let result = call();
+        if was_master && result.is_ok() {
+            crate::pseudofs::dev::restore_console_after_master_close();
+        }
+        result
     }
 
     fn prepare_mmap(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {

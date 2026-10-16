@@ -321,13 +321,6 @@ pub unsafe extern "C" fn dma_fence_chain_find_seqno(fence: *mut *mut DmaFence, s
     if fence.is_null() || unsafe { (*fence).is_null() } {
         return -(crate::config::EINVAL as i32);
     }
-    let native = match crate::dma_fence_hooks::native_fence_hooks() {
-        Some(hooks) => unsafe { (hooks.timeline_fence_find)(fence.cast(), seqno) },
-        None => 1,
-    };
-    if native != 1 {
-        return native;
-    }
     unsafe { dma_fence_chain_find_seqno_walk(fence, seqno) }
 }
 

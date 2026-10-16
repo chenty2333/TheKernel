@@ -209,10 +209,10 @@ pub fn init(args: &[String], envs: &[String]) {
     // Device publication below (including DRM's initial registration) may
     // emit uevents, so init-net must be established first.
     axruntime::boot_progress::trace_enter("entry:init_virtio_gpu");
-    match crate::drm::init_virtio_gpu() {
-        Ok(true) => info!("registered primary DRM device"),
-        Ok(false) => info!("no usable primary DRM device found"),
-        Err(error) => error!("failed to initialize primary DRM device: {error}"),
+    if crate::drm::init_virtio_gpu() {
+        info!("registered primary DRM device");
+    } else {
+        info!("no usable primary DRM device found");
     }
     axruntime::boot_progress::trace_exit("entry:init_virtio_gpu");
 

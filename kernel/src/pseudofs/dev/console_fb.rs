@@ -470,7 +470,6 @@ mod tests {
 
     use super::{DAMAGE_CLEAN, DAMAGE_FULL, DamageTracker, DisplayCore, FbconFrame};
     use crate::{
-        drm::DrmFbdev,
         pseudofs::{
             DeviceMmap,
             dev::{
@@ -496,130 +495,6 @@ mod tests {
         damage.mark_full();
         assert_eq!(damage.take(), DAMAGE_FULL);
     }
-
-
-    #[test]
-    fn last_userspace_master_close_restores_text_framebuffer_without_vt_ioctl() {
-        check_userspace_master_text_restore(false);
-    }
-
-    #[test]
-    fn userspace_drop_master_restores_text_framebuffer_before_close() {
-        check_userspace_master_text_restore(true);
-    }
-
-    fn check_userspace_master_text_restore(explicit_drop: bool) {
-        use alloc::sync::Arc;
-
-        use crate::drm::{
-            DisplayAdapter, DrmDevice, DrmResult, DumbRequest, GemBacking, Scanout, fence::Fence,
-        };
-        struct Pages(Arc<crate::mm::SharedPages>);
-        impl GemBacking for Pages {
-            fn shared_pages(&self) -> DrmResult<Arc<crate::mm::SharedPages>> {
-                Ok(self.0.clone())
-            }
-        }
-        struct Adapter;
-        impl DisplayAdapter for Adapter {
-            fn preferred_mode(&self) -> crate::drm::Mode {
-                // This test exercises ownership/console restoration, not display
-                // capacity. Keep two scanouts within the small host page arena's
-                // production pinned-memory budget.
-                crate::drm::Mode {
-                    width: 64,
-                    height: 64,
-                    refresh_millihz: 60_000,
-                }
-            }
-
-            fn create_dumb(
-                &self,
-                _: DumbRequest,
-                _: u32,
-                size: u64,
-                allocation_owner: Arc<dyn Send + Sync>,
-            ) -> DrmResult<Arc<dyn GemBacking>> {
-                let pages = Arc::new(
-                    crate::mm::SharedPages::new_fixed(
-                        size as usize,
-                        axhal::paging::PageSize::Size4K,
-                    )
-                    .unwrap(),
-                );
-                pages.retain_allocation_owner(allocation_owner).unwrap();
-                Ok(Arc::new(Pages(pages)))
-            }
-            fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
-                Ok(Fence::new(true))
-            }
-        }
-        let _context = crate::test_support::scheduler_test_context();
-        let device = DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
-        let scanout = Arc::new(DrmFbdev::new(device.clone()).unwrap());
-        let console_fb = device.state.lock().atomic.fb;
-        let display = Arc::new(DisplayCore::new(scanout));
-        let previous = super::CONSOLE.lock().replace(display.clone());
-        let user = device.open_primary();
-        user.require_master().unwrap();
-        let mode = device.preferred_mode();
-        let dumb = user
-            .create_dumb(DumbRequest {
-                width: mode.width,
-                height: mode.height,
-                bpp: 32,
-            })
-            .unwrap();
-        let fb = user
-            .add_framebuffer(dumb.handle, mode.width, mode.height, dumb.pitch, 32)
-            .unwrap();
-        let mut next = device.state.lock().atomic;
-        next.fb = fb;
-        let generation = device.state.lock().atomic_generation;
-        user.submit_atomic(
-            generation,
-            next,
-            Some(user.framebuffer(fb).unwrap()),
-            None,
-            false,
-            Default::default(),
-        )
-        .unwrap();
-        assert_eq!(device.state.lock().resources.crtc.framebuffer, Some(fb));
-        let user = if explicit_drop {
-            user.drop_master().unwrap();
-            Some(user)
-        } else {
-            drop(user);
-            None
-        };
-        // Release itself reacquires and enqueues the full fbdev modeset. No
-        // test-side become_master or synthetic KD_TEXT transition is used.
-        device.advance_vblank().unwrap();
-        device.advance_vblank().unwrap();
-        let state = device.state.lock();
-        assert!(state.atomic.active);
-        assert_eq!(state.atomic.fb, console_fb);
-        assert_eq!(state.atomic.mode, Some(mode));
-        assert_eq!(state.resources.crtc.framebuffer, Some(console_fb));
-        assert_eq!(state.resources.crtc.mode, Some(mode));
-        assert_eq!(state.atomic.src_y, 0);
-        drop(state);
-        assert!(
-            display
-                .refresh_enabled
-                .load(core::sync::atomic::Ordering::Acquire)
-        );
-        // Closing an already-released user OFD must leave the restored
-        // console installed, too.
-        drop(user);
-        assert_eq!(
-            device.state.lock().resources.crtc.framebuffer,
-            Some(console_fb)
-        );
-        *super::CONSOLE.lock() = previous;
-    }
-
 
 
     /// A scanout surface with no DRM device and no display hardware behind it.

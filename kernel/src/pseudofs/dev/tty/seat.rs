@@ -293,30 +293,19 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
-    use crate::drm::{
-        DisplayAdapter, DrmDevice, DrmError, DrmResult, DumbRequest, GemBacking, Scanout,
-    };
+    use core::sync::atomic::{AtomicBool, Ordering};
 
-    struct Adapter;
-    impl DisplayAdapter for Adapter {
-        fn create_dumb(
-            &self,
-            _: DumbRequest,
-            _: u32,
-            _: u64,
-            _allocation_owner: Arc<dyn Send + Sync>,
-        ) -> DrmResult<Arc<dyn GemBacking>> {
-            Err(DrmError::Unsupported)
-        }
-        fn present(&self, _: Scanout) -> DrmResult<Arc<crate::drm::fence::Fence>> {
-            Err(DrmError::Unsupported)
-        }
+    /// Stands in for the KMS device whose scanout the seat hands between the
+    /// console and a graphics session.
+    #[derive(Default)]
+    struct Kms {
+        suspended_for_seat: AtomicBool,
     }
 
-    struct Hooks(Arc<DrmDevice>);
+    struct Hooks(Arc<Kms>);
     impl SeatHooks for Hooks {
         fn prepare_release(&mut self, _: SeatTarget) -> AxResult<()> {
-            self.0.suspend_kms_for_seat();
+            self.0.suspended_for_seat.store(true, Ordering::Release);
             Ok(())
         }
         fn release(&mut self, _: SeatTarget) -> AxResult<()> {
@@ -326,11 +315,11 @@ mod tests {
             Ok(())
         }
         fn acquire(&mut self, _: SeatTarget) -> AxResult<()> {
-            self.0.resume_kms_for_seat();
+            self.0.suspended_for_seat.store(false, Ordering::Release);
             Ok(())
         }
         fn abort(&mut self, _: SeatTarget) {
-            self.0.resume_kms_for_seat();
+            self.0.suspended_for_seat.store(false, Ordering::Release);
         }
     }
 
@@ -339,7 +328,7 @@ mod tests {
         let _scheduler = crate::test_support::scheduler_test_context();
         let seat = Arc::new(SeatLifecycle::new());
         let desired = Arc::new(spin::Mutex::new(SeatTarget::Fbcon));
-        let device = DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
+        let device = Arc::new(Kms::default());
         let (arrived_tx, arrived_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         let delayed = {
@@ -373,14 +362,14 @@ mod tests {
         *desired.lock() = graphics;
         seat.transition(|| *desired.lock(), &mut Hooks(device.clone()))
             .unwrap();
-        let compositor = device.open_primary();
-        compositor.become_master().unwrap();
-        // Resume only after the new session has acquired its actual DRM OFD.
+        assert!(!device.suspended_for_seat.load(Ordering::Acquire));
+        // Resume only after the new session owns the KMS device.
         // Host tests share one emulated task, so scheduler-facing operations
         // stay ordered even though the delayed helper is a separate thread.
         resume_tx.send(()).unwrap();
         delayed.join().unwrap();
         assert_eq!(seat.active(), graphics);
-        assert_eq!(compositor.become_master(), Ok(()));
+        // The stale reconciliation must not take KMS back from the session.
+        assert!(!device.suspended_for_seat.load(Ordering::Acquire));
     }
 }

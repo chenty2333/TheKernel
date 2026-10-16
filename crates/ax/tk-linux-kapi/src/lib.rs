@@ -127,7 +127,6 @@ pub mod sync_file;
 #[allow(unsafe_code)]
 pub mod dma_resv;
 #[allow(unsafe_code)]
-pub mod dma_fence_hooks;
 #[allow(unsafe_code)]
 pub mod irq_work;
 #[allow(unsafe_code)]
