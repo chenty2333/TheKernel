@@ -18,10 +18,16 @@ from tools.qemu_runner.graphics_metrics import (
 
 
 class GraphicsMetricsTests(unittest.TestCase):
-    def write_log(self, root: Path, *, input_indexes: range) -> Path:
+    def write_log(
+        self,
+        root: Path,
+        *,
+        input_indexes: range,
+        resources: tuple[dict, dict] = ({"weston_fd": 8}, {"weston_fd": 8}),
+    ) -> Path:
         log = root / "console.log"
         events = [
-            {"kind": "resources", "values": {"weston_fd": 8}},
+            {"kind": "resources", "values": resources[0]},
             *(
                 {"kind": "frame", "index": index, "ns": 16_666_667}
                 for index in range(WARMUP_FRAMES, WARMUP_FRAMES + SAMPLE_FRAMES)
@@ -30,7 +36,7 @@ class GraphicsMetricsTests(unittest.TestCase):
                 {"kind": "input_to_visible", "index": index, "ns": 20_000_000}
                 for index in input_indexes
             ),
-            {"kind": "resources", "values": {"weston_fd": 8}},
+            {"kind": "resources", "values": resources[1]},
         ]
         log.write_text(
             "THEKERNEL_GRAPHICS_RENDERER software\n"
@@ -96,6 +102,43 @@ class GraphicsMetricsTests(unittest.TestCase):
             log = self.write_log(Path(directory), input_indexes=range(1, INPUT_SAMPLES + 1))
             with self.assertRaisesRegex(GraphicsMetricError, "expected 0, got 1"):
                 parse_graphics_metrics(log)
+
+    def test_accepts_schema_two_input_counters_without_drm_keys(self) -> None:
+        schema_two = {"schema": 2, "input_devices": 3, "input_clients": 1}
+        with test_tmpdir() as directory:
+            log = self.write_log(
+                Path(directory),
+                input_indexes=range(INPUT_SAMPLES),
+                resources=(schema_two, {**schema_two, "input_clients": 2}),
+            )
+            metrics = parse_graphics_metrics(log)
+        self.assertEqual(metrics.resource_growth, {})
+        self.assertEqual(metrics.resource_backlog_growth, {})
+        self.assertEqual(metrics.monotonic_backlogs, ())
+        self.assertEqual(metrics.resource_final["input_clients"], 2)
+        enforce_graphics_metrics(metrics)
+
+    def test_rejects_unknown_resource_schema(self) -> None:
+        with test_tmpdir() as directory:
+            log = self.write_log(
+                Path(directory),
+                input_indexes=range(INPUT_SAMPLES),
+                resources=({"schema": 3}, {"schema": 3}),
+            )
+            with self.assertRaisesRegex(GraphicsMetricError, "unsupported graphics resource schema: 3"):
+                parse_graphics_metrics(log)
+
+    def test_schema_one_backlog_growth_still_fails_the_gate(self) -> None:
+        pre = {"schema": 1, "atomic_commits": 10, "fences_pending": 0}
+        post = {"schema": 1, "atomic_commits": 900, "fences_pending": 4}
+        with test_tmpdir() as directory:
+            log = self.write_log(
+                Path(directory), input_indexes=range(INPUT_SAMPLES), resources=(pre, post)
+            )
+            metrics = parse_graphics_metrics(log)
+        self.assertEqual(metrics.resource_backlog_growth, {"fences_pending": 4})
+        with self.assertRaisesRegex(GraphicsMetricError, "resource backlog growth: fences_pending"):
+            enforce_graphics_metrics(metrics)
 
 
 if __name__ == "__main__":

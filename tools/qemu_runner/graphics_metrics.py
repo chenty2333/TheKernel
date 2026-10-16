@@ -22,6 +22,12 @@ METRIC_PREFIX = "THEKERNEL_GRAPHICS_METRIC "
 FAULT_PREFIX = "THEKERNEL_GRAPHICS_FAULT "
 WARMUP_FRAMES = 60
 SAMPLE_FRAMES = 600
+# Schema 2 (kernel/src/pseudofs/graphics_metrics.rs) reports only the input
+# device counters; the DRM keys of schema 1 are gone.  The DRM key sets below
+# are kept so that transcripts from schema-1 kernels still classify correctly.
+# A key absent from a transcript is simply not gated, so schema-2 logs need no
+# DRM keys at all.
+SUPPORTED_RESOURCE_SCHEMAS = frozenset({1, 2})
 COUNTER_RESOURCE_KEYS = frozenset({"schema", "gpu_present", "atomic_commits", "vblanks"})
 BACKLOG_RESOURCE_KEYS = frozenset({
     "fences_pending", "pending_atomic_commits", "pending_vblank_events",
@@ -29,6 +35,10 @@ BACKLOG_RESOURCE_KEYS = frozenset({
     "retired_2d_resources", "retired_render_resources",
 })
 ZERO_RESOURCE_KEYS = frozenset({"fences_error", "final_2d_leaks", "final_render_leaks"})
+# Schema-2 gauges: current device/client counts.  They are reported in
+# resource_final but are not leak or growth gates, since a hotplugged input
+# device or a newly opened client is not a graphics resource leak.
+GAUGE_RESOURCE_KEYS = frozenset({"input_devices", "input_clients"})
 
 
 class GraphicsMetricError(ValueError):
@@ -123,6 +133,9 @@ def parse_graphics_metrics(log_path: Path) -> GraphicsMetrics:
             if not isinstance(values, dict) or any(type(v) is not int or v < 0 for v in values.values()):
                 raise GraphicsMetricError("resource metric requires non-negative integer values")
             normalized = {str(key): value for key, value in values.items()}
+            schema = normalized.get("schema")
+            if schema is not None and schema not in SUPPORTED_RESOURCE_SCHEMAS:
+                raise GraphicsMetricError(f"unsupported graphics resource schema: {schema}")
             resource_samples.append(normalized)
     if len(frames) != SAMPLE_FRAMES:
         raise GraphicsMetricError(
@@ -144,7 +157,7 @@ def parse_graphics_metrics(log_path: Path) -> GraphicsMetrics:
     growth = {
         key: resource_samples[-1][key] - resource_samples[0][key]
         for key in resource_keys
-        if key not in COUNTER_RESOURCE_KEYS | BACKLOG_RESOURCE_KEYS | ZERO_RESOURCE_KEYS
+        if key not in COUNTER_RESOURCE_KEYS | BACKLOG_RESOURCE_KEYS | ZERO_RESOURCE_KEYS | GAUGE_RESOURCE_KEYS
     }
     backlog_growth = {
         key: resource_samples[-1][key] - resource_samples[0][key]
