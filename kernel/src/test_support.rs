@@ -25,6 +25,7 @@ use std::sync::{Mutex, MutexGuard, Once};
 static SERIAL: Mutex<()> = Mutex::new(());
 static INIT: Once = Once::new();
 static PAGE_ALLOC_INIT: Once = Once::new();
+static TLB_INIT: Once = Once::new();
 
 /// Brings up the host memory and scheduler fixtures once for this test process.
 ///
@@ -58,6 +59,7 @@ pub(crate) fn ensure_host_memory() {
             );
         }
     });
+    TLB_INIT.call_once(crate::mm::tlb::init_for_host_test);
 }
 
 /// Brings the host scheduler up at most once per test binary.

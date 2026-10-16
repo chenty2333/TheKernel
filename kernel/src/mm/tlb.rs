@@ -23,6 +23,11 @@ pub(crate) fn synchronize_kernel_text_patch() -> imp::GlobalGrace {
     imp::synchronize_tlb_and_icache()
 }
 
+#[cfg(test)]
+pub(crate) fn init_for_host_test() {
+    imp::init_for_host_test();
+}
+
 #[cfg(feature = "smp-tlb-shootdown")]
 mod imp {
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -144,6 +149,23 @@ mod imp {
         // Validate the handler and every online mailbox before user mappings
         // can become shared across CPUs.
         drop(synchronize_cpu_maintenance(CpuMaintenance::TLB_AND_ICACHE));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn init_for_host_test() {
+        // The hosted HAL models one CPU and deliberately has no hardware IPI
+        // broker. Seed only that issuer slot for kernel unit tests; a host
+        // model with remote CPUs must provide real IPI setup instead.
+        assert_eq!(
+            axhal::cpu_num(),
+            1,
+            "host TLB tests require a single-CPU IPI-free fixture"
+        );
+        let cpu = axhal::percpu::this_cpu_id();
+        assert_eq!(cpu, 0, "host TLB tests run on the primary CPU");
+        SHOOTDOWN
+            .publish_online(cpu)
+            .unwrap_or_else(|error| panic!("failed to initialize host TLB issuer: {error:?}"));
     }
 
     fn maintain_local(maintenance: CpuMaintenance) {
@@ -791,6 +813,9 @@ mod imp {
             "multi-CPU kernels require the smp-tlb-shootdown feature"
         );
     }
+
+    #[cfg(test)]
+    pub(crate) fn init_for_host_test() {}
 
     pub(crate) fn synchronize_tlb() -> GlobalGrace {
         axhal::asm::flush_tlb(None);
