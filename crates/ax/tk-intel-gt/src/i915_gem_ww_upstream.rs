@@ -118,5 +118,19 @@ pub unsafe fn i915_gem_ww_ctx_backoff(ww: *mut I915GemWwCtx) -> i32 {
     ret
 }
 
+// upstream: i915_gem_ww.h __i915_gem_ww_fini()
+pub unsafe fn __i915_gem_ww_fini(ww: *mut I915GemWwCtx, mut err: i32) -> i32 {
+    if err == -crate::linux_config::EDEADLK {
+        err = unsafe { i915_gem_ww_ctx_backoff(ww) };
+        if err == 0 {
+            err = -crate::linux_config::EDEADLK;
+        }
+    }
+    if err != -crate::linux_config::EDEADLK {
+        unsafe { i915_gem_ww_ctx_fini(ww) };
+    }
+    err
+}
+
 // Kernel layouts owned by tk-linux-kapi (generic Linux records; see its types.rs).
 pub use tk_linux_kapi::types::{WwAcquireCtx};

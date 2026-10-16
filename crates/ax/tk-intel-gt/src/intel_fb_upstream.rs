@@ -1404,6 +1404,23 @@ pub unsafe extern "C" fn intel_fb_uses_dpt(fb: *const DrmFramebuffer) -> bool {
         && unsafe { intel_fb_modifier_uses_dpt(display, (*fb).modifier) }
 }
 
+// upstream: intel_fb.c intel_plane_uses_fence()
+// Resolves the extern declared in intel_plane_upstream.rs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn intel_plane_uses_fence(plane_state: *const IntelPlaneState) -> bool {
+    unsafe {
+        let plane = (*plane_state).uapi.plane;
+        let display = __drm_to_display((*plane).dev);
+        // to_intel_plane(): `base` is the first member of IntelPlane.
+        let intel_plane = plane.cast::<IntelPlane>();
+        crate::intel_plane_upstream::intel_plane_needs_fence(display)
+            || (!(*intel_plane).fbc.is_null()
+                && (*plane_state).no_fbc_reason.is_null()
+                // i915_gtt_view_is_normal(&plane_state->view.gtt)
+                && (*plane_state).view.gtt.r#type == I915_GTT_VIEW_NORMAL)
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_fb_plane_get_subsampling(
     hsub: *mut i32,

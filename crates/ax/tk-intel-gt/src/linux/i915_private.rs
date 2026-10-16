@@ -148,8 +148,13 @@ pub struct DrmI915Private {
     _before_bdev: [u8; 632],
     /// Embedded `struct ttm_device bdev` at offset 4248 (x86_64 Linux 7.2.3).
     pub bdev: TtmDevice,
-    _after_bdev: [u8; 8],
+    /// Source `atomic_t pending_fb_pin` (i915_drv.h), declared right after `bdev`.
+    pub pending_fb_pin: AtomicT,
+    _after_pending_fb_pin: [u8; 4],
 }
+
+const _: [(); 5928] = [(); offset_of!(DrmI915Private, pending_fb_pin)];
+const _: [(); 5936] = [(); size_of::<DrmI915Private>()];
 
 #[repr(C)]
 pub struct I915GemPrivate {

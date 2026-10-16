@@ -81,7 +81,7 @@ unsafe fn i915_vma_put(vma: *mut I915Vma) {
 }
 
 /// `i915_vma_is_map_and_fenceable()` inline dependency from i915_vma.h.
-unsafe fn i915_vma_is_map_and_fenceable(vma: *const I915Vma) -> bool {
+pub(crate) unsafe fn i915_vma_is_map_and_fenceable(vma: *const I915Vma) -> bool {
     unsafe { crate::linux::bits::test_bit(I915_VMA_CAN_FENCE_BIT, &(*vma).flags.counter) }
 }
 

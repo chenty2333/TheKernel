@@ -77,7 +77,7 @@ pub struct DrmScanoutBuffer {
     height: u32,
     pitch: [u32; DRM_FORMAT_MAX_PLANES],
     set_pixel: Option<unsafe extern "C" fn(*mut DrmScanoutBuffer, u32, u32, u32)>,
-    private: *mut c_void,
+    pub private: *mut c_void,
 }
 const _: [(); 120] = [(); size_of::<DrmScanoutBuffer>()];
 const _: [(); 104] = [(); core::mem::offset_of!(DrmScanoutBuffer, set_pixel)];

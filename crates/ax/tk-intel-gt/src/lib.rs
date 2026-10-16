@@ -142,6 +142,16 @@ pub mod i915_gem_region_upstream;
 #[allow(unsafe_code)]
 pub mod i915_gem_pages_upstream;
 #[allow(unsafe_code)]
+pub mod i915_bo_upstream;
+#[allow(unsafe_code)]
+pub mod i915_fb_pin_upstream;
+#[allow(unsafe_code)]
+pub mod i915_dsb_buffer_upstream;
+#[allow(unsafe_code)]
+pub mod i915_panic_upstream;
+#[allow(unsafe_code)]
+pub mod i915_display_pc8_upstream;
+#[allow(unsafe_code)]
 pub mod i915_gem_shmem_upstream;
 #[allow(unsafe_code)]
 pub mod i915_gem_shrinker_upstream;
@@ -698,6 +708,10 @@ pub mod intel_frontbuffer_upstream;
 #[allow(unsafe_code)]
 pub mod intel_initial_plane_upstream;
 #[allow(unsafe_code)]
+pub(crate) mod i915_dpt_upstream;
+#[allow(unsafe_code)]
+pub(crate) mod i915_initial_plane_upstream;
+#[allow(unsafe_code)]
 pub mod intel_dp_aux_upstream;
 #[allow(unsafe_code)]
 pub mod intel_dp_link_training_upstream;
@@ -775,7 +789,14 @@ pub mod intel_mchbar_upstream;
 // Their implementations and object lifetimes remain owned by i915.
 pub use i915_gem_internal_upstream::i915_gem_object_create_internal;
 pub use i915_gem_object_frontbuffer_upstream::i915_display_frontbuffer_interface;
+pub use i915_bo_upstream::i915_display_bo_interface;
+pub use i915_display_pc8_upstream::i915_display_pc8_interface;
+pub use i915_dsb_buffer_upstream::i915_display_dsb_interface;
+pub use i915_fb_pin_upstream::i915_display_fb_pin_interface;
 pub use i915_gem_stolen_upstream::i915_display_stolen_interface;
+pub use i915_panic_upstream::i915_display_panic_interface;
+pub use i915_dpt_upstream::i915_display_dpt_interface;
+pub use i915_initial_plane_upstream::i915_display_initial_plane_interface;
 pub use i915_vma_upstream::{PIN_MAPPABLE, PIN_NOEVICT, PIN_OFFSET_GUARD, PIN_ZONE_4G};
 pub use intel_clock_gating_upstream::intel_clock_gating_init;
 pub use intel_pcode_upstream::i915_display_pcode_interface;
