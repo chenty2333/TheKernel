@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See ../../LICENSE-MIT.
-//! Explicit Linux runtime-PM binding points. The GT owner must install real
-//! callbacks before opting into source-order i915 paths; an absent backend
-//! refuses rather than pretending that forcewake/runtime-PM references exist.
+//! Linux runtime-PM and wakeref binding points for translated GT sources.
+//! Device runtime-PM references are owned by the `intel_runtime_pm.c`
+//! translation (`intel_runtime_pm_upstream`); the helpers here only adapt
+//! pointer forms, so a reference taken through either path pairs with a put
+//! through the other.
 
 use core::{
     ffi::{c_ulong, c_void},
-    sync::atomic::{AtomicI32, AtomicPtr, Ordering, compiler_fence},
+    sync::atomic::{AtomicI32, Ordering, compiler_fence},
 };
 
 use crate::{
@@ -15,36 +17,6 @@ use crate::{
     linux_i915_private::DrmI915Private,
     linux_memory::{atomic_inc, atomic_read, kref_get_unless_zero},
 };
-
-#[repr(C)]
-pub struct RuntimePmOps {
-    pub runtime_get: unsafe fn(*mut c_void) -> IntelWakerefHandle,
-    pub runtime_put: unsafe fn(*mut c_void, IntelWakerefHandle),
-}
-
-static RUNTIME_PM_OPS: AtomicPtr<RuntimePmOps> = AtomicPtr::new(core::ptr::null_mut());
-
-pub fn install_runtime_pm_ops(ops: &'static RuntimePmOps) -> Result<(), &'static str> {
-    RUNTIME_PM_OPS
-        .compare_exchange(
-            core::ptr::null_mut(),
-            ops as *const RuntimePmOps as *mut RuntimePmOps,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .map(|_| ())
-        .map_err(|_| "i915 runtime PM callbacks are already installed")
-}
-
-#[inline]
-fn ops() -> &'static RuntimePmOps {
-    let ptr = RUNTIME_PM_OPS.load(Ordering::Acquire);
-    assert!(
-        !ptr.is_null(),
-        "upstream-gt invoked without a real runtime-PM backend"
-    );
-    unsafe { &*ptr }
-}
 
 pub trait RuntimePmPointer {
     fn runtime_pm_pointer(self) -> *mut c_void;
@@ -70,16 +42,18 @@ impl<T> RuntimePmPointer for &T {
     }
 }
 
+/// `intel_runtime_pm_get()`, accepting any pointer form of `&i915->runtime_pm`.
 pub fn intel_runtime_pm_get<P: RuntimePmPointer>(rpm: P) -> IntelWakerefHandle {
     let rpm = rpm.runtime_pm_pointer();
     assert!(!rpm.is_null());
-    unsafe { (ops().runtime_get)(rpm) }
+    unsafe { crate::intel_runtime_pm_upstream::intel_runtime_pm_get(rpm.cast()) }
 }
 
+/// `intel_runtime_pm_put()`, accepting any pointer form of `&i915->runtime_pm`.
 pub fn intel_runtime_pm_put<P: RuntimePmPointer>(rpm: P, wakeref: IntelWakerefHandle) {
     let rpm = rpm.runtime_pm_pointer();
     assert!(!rpm.is_null() && !wakeref.is_null());
-    unsafe { (ops().runtime_put)(rpm, wakeref) };
+    unsafe { crate::intel_runtime_pm_upstream::intel_runtime_pm_put(rpm.cast(), wakeref) };
 }
 
 pub fn intel_gt_pm_get(gt: *mut IntelGt) -> IntelWakerefHandle {

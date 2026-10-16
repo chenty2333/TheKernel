@@ -343,7 +343,6 @@ pub(super) fn install_providers() -> Result<(), &'static str> {
     install_i915_platform_ops(&PLATFORM_OPS)?;
     axmm::install_kernel_map_tlb_sync(kernel_map_tlb_sync)
         .map_err(|_| "kernel-map TLB synchronizer already installed with another owner")?;
-    intel_gt::linux_pm::install_runtime_pm_ops(&RUNTIME_PM_OPS)?;
     tk_linux_kapi::signal::install_signal_pending_state(kernel_signal_pending_state)?;
     let reader: intel_gt::linux::i915::I915PciRevisionReader =
         // SAFETY: both types are `unsafe extern "C" fn` pointers of identical
@@ -436,45 +435,6 @@ unsafe extern "C" fn kernel_signal_pending_state(state: c_int, task: *mut c_void
     }
     state & TASK_INTERRUPTIBLE != 0 || crate::task::has_pending_fatal_signal(thread)
 }
-
-// ---------------------------------------------------------------------------
-// Runtime PM (`linux/pm.rs`)
-// ---------------------------------------------------------------------------
-
-/// Outstanding runtime-PM references on the GT device. TheKernel never
-/// runtime-suspends the GPU, so a reference only has to pair with its put;
-/// the device stays powered for as long as any reference exists and always.
-static RUNTIME_PM_DEPTH: AtomicUsize = AtomicUsize::new(0);
-/// Opaque, non-null wakeref cookie. Linux only hands it back to the put.
-static RUNTIME_PM_COOKIE: u8 = 0;
-
-unsafe fn kernel_runtime_get(
-    rpm: *mut c_void,
-) -> intel_gt::intel_context_upstream::IntelWakerefHandle {
-    assert!(!rpm.is_null(), "runtime PM get on a null device");
-    RUNTIME_PM_DEPTH.fetch_add(1, Ordering::AcqRel);
-    ptr::addr_of!(RUNTIME_PM_COOKIE).cast_mut().cast()
-}
-
-unsafe fn kernel_runtime_put(
-    rpm: *mut c_void,
-    wakeref: intel_gt::intel_context_upstream::IntelWakerefHandle,
-) {
-    assert!(
-        !rpm.is_null() && !wakeref.is_null(),
-        "runtime PM put with a null handle"
-    );
-    RUNTIME_PM_DEPTH
-        .try_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
-            depth.checked_sub(1)
-        })
-        .unwrap_or_else(|_| panic!("runtime PM put without a matching get"));
-}
-
-static RUNTIME_PM_OPS: intel_gt::linux_pm::RuntimePmOps = intel_gt::linux_pm::RuntimePmOps {
-    runtime_get: kernel_runtime_get,
-    runtime_put: kernel_runtime_put,
-};
 
 // ---------------------------------------------------------------------------
 // PCI revision (`linux/i915.rs`)
