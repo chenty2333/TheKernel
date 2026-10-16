@@ -145,8 +145,10 @@ pub static XE_LPD_DISPLAY: IntelDisplayDeviceInfo = IntelDisplayDeviceInfo {
         0x15,
     ],
     mmio_offset: 0,
-    pipe_offsets: [0x70000, 0x71000, 0x72000, 0x73000, 0, 0, 0],
-    trans_offsets: [0x60000, 0x61000, 0x62000, 0x63000, 0x6b000, 0x6b800, 0],
+    // C XE_LPD_FEATURES uses enum indices: TRANSCODER_EDP is 4 (unset), and the
+    // DSI transcoders are TRANSCODER_DSI_0 = 5 and TRANSCODER_DSI_1 = 6.
+    pipe_offsets: [0x70000, 0x71000, 0x72000, 0x73000, 0, 0x7b000, 0x7b800],
+    trans_offsets: [0x60000, 0x61000, 0x62000, 0x63000, 0, 0x6b000, 0x6b800],
     cursor_offsets: [0x70080, 0x71080, 0x72080, 0x73080],
     color: IntelDisplayDeviceInfoColor {
         degamma_lut_size: 129,

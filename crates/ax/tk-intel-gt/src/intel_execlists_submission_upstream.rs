@@ -3687,14 +3687,18 @@ unsafe fn logical_ring_default_irqs(engine: *mut IntelEngineCs) {
     let mut shift = 0u32;
 
     if GRAPHICS_VER((*engine).i915) < 11 {
-        let irq_shifts = [
-            [RCS0 as u32, GEN8_RCS_IRQ_SHIFT],
-            [BCS0 as u32, GEN8_BCS_IRQ_SHIFT],
-            [VCS0 as u32, GEN8_VCS0_IRQ_SHIFT],
-            [VCS1 as u32, GEN8_VCS1_IRQ_SHIFT],
-            [VECS0 as u32, GEN8_VECS_IRQ_SHIFT],
-        ];
-        shift = irq_shifts[(*engine).id as usize][1];
+        // C uses designated initializers indexed by enum intel_engine_id
+        // (VCS0 = 10, VECS0 = 18), so assign by index; other slots stay 0.
+        let irq_shifts: [u32; (VECS0 + 1) as usize] = {
+            let mut s = [0u32; (VECS0 + 1) as usize];
+            s[RCS0 as usize] = GEN8_RCS_IRQ_SHIFT;
+            s[BCS0 as usize] = GEN8_BCS_IRQ_SHIFT;
+            s[VCS0 as usize] = GEN8_VCS0_IRQ_SHIFT;
+            s[VCS1 as usize] = GEN8_VCS1_IRQ_SHIFT;
+            s[VECS0 as usize] = GEN8_VECS_IRQ_SHIFT;
+            s
+        };
+        shift = irq_shifts[(*engine).id as usize];
     }
 
     (*engine).irq_enable_mask = GT_RENDER_USER_INTERRUPT << shift;

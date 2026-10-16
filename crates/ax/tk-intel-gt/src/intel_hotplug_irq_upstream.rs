@@ -51,7 +51,7 @@ const fn icp_hpd_map() -> [u32; HPD_NUM_PINS as usize] {
     map[HPD_PORT_A as usize] = SDE_DDI_HOTPLUG_ICP(HPD_PORT_A);
     map[HPD_PORT_B as usize] = SDE_DDI_HOTPLUG_ICP(HPD_PORT_B);
     map[HPD_PORT_C as usize] = SDE_DDI_HOTPLUG_ICP(HPD_PORT_C);
-    map[HPD_PORT_D as usize] = SDE_DDI_HOTPLUG_ICP(HPD_PORT_D);
+    // C hpd_icp[] (intel_hotplug_irq.c) has no HPD_PORT_D entry; keep it zero.
     map[HPD_PORT_TC1 as usize] = SDE_TC_HOTPLUG_ICP(HPD_PORT_TC1);
     map[HPD_PORT_TC2 as usize] = SDE_TC_HOTPLUG_ICP(HPD_PORT_TC2);
     map[HPD_PORT_TC3 as usize] = SDE_TC_HOTPLUG_ICP(HPD_PORT_TC3);
