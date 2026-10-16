@@ -11,7 +11,8 @@ pub(crate) mod early_screen;
 #[cfg(feature = "input")]
 pub(crate) mod event;
 mod fb;
-pub(crate) use fb::restore_console_after_master_close;
+pub(crate) mod console_fb;
+pub(crate) use console_fb::restore_console_after_master_close;
 pub(crate) mod fuse;
 pub(crate) mod r#loop;
 pub(crate) mod rfkill;
@@ -610,14 +611,13 @@ impl DeviceOps for BlockDevice {
     }
 }
 
-/// The scanout `/dev/fb0` should be published over, if this machine has one.
+/// The surface the console draws into, and the candidate that provides it.
 ///
 /// The choice is not made here.  `crate::drm::screen` holds the kernel's single
 /// selection point: it consults every registered provider in rank order, logs
 /// what happened to each of them, and falls through a provider that cannot
-/// deliver to the next one.  DRM-owned surfaces, the firmware's aperture and
-/// anything a display driver registers are all candidates there.
-fn primary_scanout() -> Option<Arc<dyn scanout::ScanoutSurface>> {
+/// deliver to the next one.
+fn primary_scanout() -> Option<crate::drm::screen::ConsoleScanout> {
     crate::drm::screen::console_scanout()
 }
 
@@ -760,35 +760,40 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
         }
         root.add("snd", SimpleDir::new_maker(fs.clone(), Arc::new(snd)));
     }
-    // `/dev/fb0` is published whenever the kernel has a scanout to draw into.
-    // DRM owns the virtio-gpu scanout before devfs publication, so fbdev is an
-    // emulation client of that primary device rather than a competing raw
-    // display.  A machine with no display device at all still has the linear
-    // aperture its own firmware programmed, and there a console is the only
-    // output the kernel has.
-    if let Some(upstream) = crate::drm::upstream::fbdev_device() {
-        match upstream_fb::device(fs.clone(), upstream) {
-            Ok(Some(framebuffer)) => root.add("fb0", framebuffer),
-            Ok(None) => info!("Upstream DRM has no registered fb_info; /dev/fb0 is not published"),
-            Err(error) => error!("Failed to initialize upstream framebuffer device: {error}"),
-        }
-    } else {
-        match primary_scanout() {
-            Some(scanout) => match fb::FrameBuffer::try_new(scanout) {
-                Ok(framebuffer) => root.add(
-                    "fb0",
-                    Device::new_with_permissions(
-                        fs.clone(),
-                        NodeType::CharacterDevice,
-                        fb::FB_DEVICE_ID,
-                        NodePermission::from_bits_truncate(FB_NODE_MODE),
-                        Arc::new(framebuffer),
+    // The console draws into the surface the screen selection chose, and
+    // `/dev/fb0` is published over that same surface: the upstream fbdev node
+    // when the upstream fbdev won, otherwise the legacy node wrapping the
+    // console's own core. Installing the console never depends on which node
+    // is published, and neither node reads the other's state.
+    match primary_scanout() {
+        Some(chosen) => {
+            let upstream_won = chosen.winner == crate::drm::screen::UPSTREAM_FBDEV;
+            match console_fb::install(chosen.surface) {
+                Ok(_) if upstream_won => match crate::drm::upstream::fbdev_device() {
+                    Some(upstream) => match upstream_fb::device(fs.clone(), upstream) {
+                        Ok(Some(framebuffer)) => root.add("fb0", framebuffer),
+                        Ok(None) => error!("The console's upstream fbdev lost its fb_info; /dev/fb0 is not published"),
+                        Err(error) => error!("Failed to initialize upstream framebuffer device: {error}"),
+                    },
+                    None => error!("The console's upstream fbdev disappeared; /dev/fb0 is not published"),
+                },
+                Ok(core) => match fb::FrameBuffer::try_new(core) {
+                    Ok(framebuffer) => root.add(
+                        "fb0",
+                        Device::new_with_permissions(
+                            fs.clone(),
+                            NodeType::CharacterDevice,
+                            fb::FB_DEVICE_ID,
+                            NodePermission::from_bits_truncate(FB_NODE_MODE),
+                            Arc::new(framebuffer),
+                        ),
                     ),
-                ),
-                Err(error) => error!("Failed to initialize framebuffer device: {error}"),
-            },
-            None => info!("No scanout surface available; /dev/fb0 is not published"),
+                    Err(error) => error!("Failed to initialize framebuffer device: {error}"),
+                },
+                Err(error) => error!("Failed to install the in-kernel console: {error}"),
+            }
         }
+        None => info!("No scanout surface available; /dev/fb0 is not published"),
     }
 
     // `/dev/dri` is live: an upstream device can publish after devfs mounts

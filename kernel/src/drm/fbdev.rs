@@ -7,7 +7,7 @@
 
 use alloc::sync::Arc;
 
-use axerrno::{AxError, AxResult};
+use axerrno::AxResult;
 use axhal::mem::phys_to_virt;
 use axsync::Mutex;
 use memory_addr::{PAGE_SIZE_4K, PhysAddr};
@@ -183,7 +183,7 @@ impl DrmFbdev {
         if self.yoffset() != 0 {
             self.pan(0)
         } else {
-            // `DisplayCore::resume_refresh` performs the one full repaint
+            // `console_fb::resume_text` performs the one full repaint
             // after ownership returns; avoid an otherwise duplicate commit.
             Ok(())
         }
@@ -412,17 +412,4 @@ impl ScanoutSurface for DrmFbdev {
             Ok(())
         }
     }
-}
-
-/// Build the DRM-backed scanout surface for a primary display device.
-///
-/// The fbdev layer takes a [`ScanoutSurface`] instead of discovering a DRM
-/// device itself, so that a machine with no virtio-gpu can still publish
-/// `/dev/fb0` over a surface the firmware programmed.  This is the DRM side of
-/// that choice; the caller decides which surface the machine actually has.
-pub(crate) fn drm_scanout(device: Arc<DrmDevice>) -> AxResult<Arc<dyn ScanoutSurface>> {
-    let scanout = DrmFbdev::new(device)?;
-    Arc::try_new(scanout)
-        .map(|scanout| scanout as Arc<dyn ScanoutSurface>)
-        .map_err(|_| AxError::NoMemory)
 }

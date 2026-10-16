@@ -184,10 +184,14 @@ pub struct VtManager {
 struct KernelSeatHooks;
 
 impl SeatHooks for KernelSeatHooks {
-    fn prepare_release(&mut self, _from: SeatTarget) -> AxResult<()> {
-        // No KMS admission gate exists on the upstream DRM core yet, so there is
-        // nothing to close here. The Linux equivalent is fbdev suspension
-        // (drm_fb_helper_set_suspend) plus DRM master drop; neither is wired.
+    fn prepare_release(&mut self, from: SeatTarget) -> AxResult<()> {
+        // Leaving text for a graphics owner: stop the console drawing and suspend
+        // the fbdev client behind the scanout, as Linux drm_fb_helper_set_suspend
+        // does, before the graphics owner is handed the seat. A graphics owner
+        // releasing the seat has no console state of its own to suspend.
+        if matches!(from, SeatTarget::Fbcon) {
+            super::super::console_fb::suspend_text();
+        }
         Ok(())
     }
 
@@ -201,7 +205,6 @@ impl SeatHooks for KernelSeatHooks {
         {
             super::seat::revoke_published_nodes(uid);
         }
-        super::super::fb::vt_graphics_changed(true);
         Ok(())
     }
 
@@ -222,7 +225,7 @@ impl SeatHooks for KernelSeatHooks {
         #[cfg(feature = "input")]
         crate::pseudofs::dev::event::resume_input_devices();
         if matches!(target, SeatTarget::Fbcon) {
-            super::super::fb::vt_graphics_changed(false);
+            super::super::console_fb::resume_text();
             VT_MANAGER.present_active();
         }
         Ok(())
@@ -234,7 +237,7 @@ impl SeatHooks for KernelSeatHooks {
         // gate exists on the upstream core, so there is nothing to reopen.
         #[cfg(feature = "input")]
         crate::pseudofs::dev::event::resume_input_devices();
-        super::super::fb::vt_graphics_changed(false);
+        super::super::console_fb::resume_text();
         if let SeatTarget::Graphics(owner) = _target
             && let Some(uid) = owner.uid
         {

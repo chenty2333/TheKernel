@@ -23,7 +23,7 @@ use axpoll::PollSet;
 use axsync::Mutex;
 
 use crate::{
-    pseudofs::dev::{fb, tty::VT_MANAGER},
+    pseudofs::dev::{console_fb, tty::VT_MANAGER},
     readiness::block_on_poll_set_uninterruptible,
 };
 
@@ -551,7 +551,7 @@ pub(crate) fn install() {
     *RENDERED.lock() = Rendered::try_new();
     invalidate_rendered();
     if installed {
-        if let Some((width, height)) = fb::fbcon_dimensions() {
+        if let Some((width, height)) = console_fb::fbcon_dimensions() {
             let size = console_window_size(width, height);
             // No fbcon, framebuffer or VT-state lock spans notification.
             // PTYs have independent emulator-supplied geometry, unchanged here.
@@ -727,7 +727,7 @@ fn console_window_size(width: usize, height: usize) -> super::terminal::WindowSi
 }
 
 fn dimensions() -> Option<(usize, usize)> {
-    fb::fbcon_dimensions().map(|(width, height)| {
+    console_fb::fbcon_dimensions().map(|(width, height)| {
         let size = console_window_size(width, height);
         (usize::from(size.ws_col), usize::from(size.ws_row))
     })
@@ -832,7 +832,7 @@ pub(crate) fn write_active(bytes: &[u8]) {
 pub(crate) fn present_while_text_active(vt: u16) {
     let progress = axruntime::boot_progress::Scope::present();
     progress.point(6);
-    fb::fbcon_draw(|frame| {
+    console_fb::fbcon_draw(|frame| {
         progress.point(7);
         let (width, height, pitch) = frame.geometry();
         let size = console_window_size(width, height);

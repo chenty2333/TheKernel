@@ -3,7 +3,7 @@
 use alloc::{borrow::Cow, sync::Arc, vec::Vec};
 use core::{
     any::Any,
-    ffi::{c_int, c_ulong},
+    ffi::{c_int, c_long, c_ulong},
     mem::{offset_of, size_of},
     ptr,
     task::Context,
@@ -15,7 +15,9 @@ use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use linux_raw_sys::general::S_IFCHR;
 use memory_addr::PhysAddr;
 use tk_drm_upstream::{
-    fb_types::{FbFixScreenInfo, FbInfo, FbVarScreenInfo},
+    drm_client_event_upstream::{drm_client_dev_restore, drm_client_dev_resume, drm_client_dev_suspend},
+    drm_fb_helper_upstream::drm_fb_helper_damage_range,
+    fb_types::{FbBitfield, FbFixScreenInfo, FbInfo, FbVarScreenInfo},
     fbmem_upstream::{fb_deferred_io_get_page, get_fb_info, put_fb_info},
 };
 use tk_linux_kapi::{
@@ -31,7 +33,7 @@ use crate::{
         IoDst, IoSrc, IoctlContext, Kstat, PreparedFileMmap, SharedMmapOps,
     },
     mm::SharedPages,
-    pseudofs::{DeviceOpen, DeviceOps},
+    pseudofs::{DeviceMmap, DeviceOpen, DeviceOps, dev::scanout::{ColorChannel, PixelLayout, ScanoutSurface}},
 };
 
 const PAGE_SIZE: usize = 4096;
@@ -69,44 +71,54 @@ impl Drop for FbInfoOwner {
     }
 }
 
+impl FbInfoOwner {
+    /// Acquire the registered fb_info at index 0 on behalf of `drm`'s fbdev
+    /// client. `Ok(None)` when that client registered no fb_info.
+    fn acquire(drm: Arc<UpstreamDrmDevice>) -> AxResult<Option<Arc<Self>>> {
+        // SAFETY: `get_fb_info` is an upstream DRM/fbdev API function called with index 0 to query the
+        // primary registered framebuffer. The upstream subsystem safely looks up the index and acquires
+        // a reference if present, returning null otherwise.
+        let info = unsafe { get_fb_info(0) };
+        if info.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: `info` is a valid, reference-counted `FbInfo` returned by `get_fb_info(0)` above.
+        // The driver initializes `fix` and `fbops` prior to registration, and the memory remains
+        // pinned and valid while the reference is held.
+        if unsafe { (*info).fix.smem_len == 0 || (*info).fbops.is_null() } {
+            // SAFETY: `info` holds the reference acquired via `get_fb_info(0)` above; releasing it
+            // balances the reference count before returning early.
+            unsafe { put_fb_info(info) };
+            return Err(AxError::OperationNotSupported);
+        }
+        // SAFETY: `LinuxFile` is a C-compatible struct consisting of integer and pointer fields,
+        // where an all-zero byte pattern is a valid initial state representing an uninitialized/empty file.
+        let mut file: LinuxFile = unsafe { core::mem::zeroed() };
+        // The registered fb_info is the backing object identity, stable across
+        // all opens and mmaps of this one framebuffer node.
+        file.f_mapping = info.cast();
+        match Arc::try_new(FbInfoOwner {
+            info,
+            _drm: drm,
+            file,
+        }) {
+            Ok(owner) => Ok(Some(owner)),
+            Err(_) => {
+                // SAFETY: `info` holds the reference acquired via `get_fb_info(0)` above. Because
+                // `FbInfoOwner` construction failed, we must drop the acquired reference to avoid leaking it.
+                unsafe { put_fb_info(info) };
+                Err(AxError::NoMemory)
+            }
+        }
+    }
+}
+
 pub(crate) fn device(
     fs: Arc<crate::pseudofs::SimpleFs>,
     drm: Arc<UpstreamDrmDevice>,
 ) -> VfsResult<Option<Arc<crate::pseudofs::Device>>> {
-    // SAFETY: `get_fb_info` is an upstream DRM/fbdev API function called with index 0 to query the
-    // primary registered framebuffer. The upstream subsystem safely looks up the index and acquires
-    // a reference if present, returning null otherwise.
-    let info = unsafe { get_fb_info(0) };
-    if info.is_null() {
+    let Some(owner) = FbInfoOwner::acquire(drm)? else {
         return Ok(None);
-    }
-    // SAFETY: `info` is a valid, reference-counted `FbInfo` returned by `get_fb_info(0)` above.
-    // The driver initializes `fix` and `fbops` prior to registration, and the memory remains
-    // pinned and valid while the reference is held.
-    if unsafe { (*info).fix.smem_len == 0 || (*info).fbops.is_null() } {
-        // SAFETY: `info` holds the reference acquired via `get_fb_info(0)` above; releasing it
-        // balances the reference count before returning early.
-        unsafe { put_fb_info(info) };
-        return Err(AxError::OperationNotSupported.into());
-    }
-    // SAFETY: `LinuxFile` is a C-compatible struct consisting of integer and pointer fields,
-    // where an all-zero byte pattern is a valid initial state representing an uninitialized/empty file.
-    let mut file: LinuxFile = unsafe { core::mem::zeroed() };
-    // The registered fb_info is the backing object identity, stable across
-    // all opens and mmaps of this one framebuffer node.
-    file.f_mapping = info.cast();
-    let owner = match Arc::try_new(FbInfoOwner {
-        info,
-        _drm: drm,
-        file,
-    }) {
-        Ok(owner) => owner,
-        Err(_) => {
-            // SAFETY: `info` holds the reference acquired via `get_fb_info(0)` above. Because
-            // `FbInfoOwner` construction failed, we must drop the acquired reference to avoid leaking it.
-            unsafe { put_fb_info(info) };
-            return Err(AxError::NoMemory.into());
-        }
     };
     Ok(Some(crate::pseudofs::Device::new_with_permissions(
         fs,
@@ -115,6 +127,204 @@ pub(crate) fn device(
         axfs_ng_vfs::NodePermission::from_bits_truncate(FB_NODE_MODE),
         Arc::new(FbInfoNode { owner }),
     )))
+}
+
+/// The upstream fbdev framebuffer as the in-kernel console's scanout surface.
+///
+/// This is Linux's fbcon view of a deferred-I/O system-memory framebuffer:
+/// glyphs and rectangles are written into the shadow buffer (`screen_base`),
+/// and each write is reported as damage through `drm_fb_helper_damage_range`,
+/// which is what `drm_fbdev_shmem` does for `fb_write`, `fb_imageblit`,
+/// `fb_fillrect` and `fb_copyarea`. The helper's damage work then flushes the
+/// damaged rectangles to the display, so the console never presents through a
+/// separate path of its own.
+pub(crate) struct UpstreamConsoleSurface {
+    owner: Arc<FbInfoOwner>,
+    width: u32,
+    height: u32,
+    virtual_height: u32,
+    pitch: u32,
+    len: usize,
+    layout: PixelLayout,
+}
+
+/// The console's surface over the upstream fbdev on `drm`, if it registered one.
+pub(crate) fn console_surface(
+    drm: Arc<UpstreamDrmDevice>,
+) -> AxResult<Option<Arc<dyn ScanoutSurface>>> {
+    let Some(owner) = FbInfoOwner::acquire(drm)? else {
+        return Ok(None);
+    };
+    let surface = UpstreamConsoleSurface::new(owner)?;
+    let surface: Arc<dyn ScanoutSurface> =
+        Arc::try_new(surface).map_err(|_| AxError::NoMemory)?;
+    Ok(Some(surface))
+}
+
+fn channel(field: FbBitfield) -> AxResult<ColorChannel> {
+    Ok(ColorChannel {
+        position: u8::try_from(field.offset).map_err(|_| AxError::InvalidInput)?,
+        size: u8::try_from(field.length).map_err(|_| AxError::InvalidInput)?,
+    })
+}
+
+impl UpstreamConsoleSurface {
+    fn new(owner: Arc<FbInfoOwner>) -> AxResult<Self> {
+        let info = owner.info;
+        // SAFETY: `owner` keeps `info` referenced and pinned. `var`, `fix`, and the screen fields
+        // are plain-data records read by value, as the fbdev ioctls read them.
+        let (var, fix, screen_size, screen_base) = unsafe {
+            (
+                (*info).var,
+                (*info).fix,
+                (*info).screen_size,
+                (*info).screen_base,
+            )
+        };
+        if screen_base.is_null() || var.xres == 0 || var.yres == 0 || fix.line_length == 0 {
+            return Err(AxError::InvalidInput);
+        }
+        let len = if screen_size != 0 {
+            screen_size.min(c_ulong::from(fix.smem_len))
+        } else {
+            c_ulong::from(fix.smem_len)
+        } as usize;
+        let layout = PixelLayout {
+            bits: u8::try_from(var.bits_per_pixel).map_err(|_| AxError::InvalidInput)?,
+            red: channel(var.red)?,
+            green: channel(var.green)?,
+            blue: channel(var.blue)?,
+        };
+        Ok(Self {
+            owner,
+            width: var.xres,
+            height: var.yres,
+            virtual_height: var.yres_virtual.max(var.yres),
+            pitch: fix.line_length,
+            len,
+            layout,
+        })
+    }
+
+    fn check(&self, offset: usize, len: usize) -> AxResult<()> {
+        match offset.checked_add(len) {
+            Some(end) if end <= self.len => Ok(()),
+            _ => Err(AxError::InvalidInput),
+        }
+    }
+
+    fn base(&self) -> *mut u8 {
+        // SAFETY: `owner` keeps `info` alive; `screen_base` is the shadow buffer the fb helper
+        // allocated for it and is valid for `len` bytes.
+        unsafe { (*self.owner.info).screen_base.cast::<u8>() }
+    }
+
+    fn device(&self) -> *mut tk_drm_upstream::drm_device_types::DrmDevice {
+        self.owner._drm.raw()
+    }
+}
+
+impl ScanoutSurface for UpstreamConsoleSurface {
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn pitch(&self) -> u32 {
+        self.pitch
+    }
+
+    fn pixel_layout(&self) -> PixelLayout {
+        self.layout
+    }
+
+    fn write_pixel(&self, offset: usize, color: u32) {
+        let mut pixel = [0u8; 4];
+        let width = self.layout.encode_into(color, &mut pixel);
+        // The console clips its own output; a rejected write is dropped, as on every surface.
+        let _ = self.write_bytes(offset, &pixel[..width]);
+    }
+
+    fn virtual_height(&self) -> u32 {
+        self.virtual_height
+    }
+
+    fn yoffset(&self) -> u32 {
+        0
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn read_bytes(&self, offset: usize, dst: &mut [u8]) -> AxResult<()> {
+        self.check(offset, dst.len())?;
+        // SAFETY: the range was checked against `len` above and lies inside the shadow buffer.
+        unsafe { core::ptr::copy_nonoverlapping(self.base().add(offset), dst.as_mut_ptr(), dst.len()) };
+        Ok(())
+    }
+
+    fn write_bytes(&self, offset: usize, src: &[u8]) -> AxResult<()> {
+        self.check(offset, src.len())?;
+        if src.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: the range was checked against `len` above and lies inside the shadow buffer.
+        // The damage call takes the fb helper's own damage lock and only records the rectangle.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), self.base().add(offset), src.len());
+            drm_fb_helper_damage_range(self.owner.info, offset as c_long, src.len());
+        }
+        Ok(())
+    }
+
+    fn mmap(&self) -> DeviceMmap {
+        // Userspace reaches the same pixels through `/dev/fb0`'s own mmap.
+        DeviceMmap::None
+    }
+
+    fn present(&self) -> AxResult<()> {
+        // Every write above already queued its damage on the fb helper's damage
+        // work, which flushes it asynchronously. There is nothing left to submit.
+        Ok(())
+    }
+
+    fn pan(&self, yoffset: u32) -> AxResult<()> {
+        if yoffset == 0 {
+            Ok(())
+        } else {
+            Err(AxError::Unsupported)
+        }
+    }
+
+    fn set_blank(&self, _blank: bool) -> AxResult<()> {
+        // The console never blanks the display; blanking is an fbdev ioctl on `/dev/fb0`.
+        Err(AxError::Unsupported)
+    }
+
+    fn restore_text(&self, _nonblocking: bool) -> AxResult<()> {
+        // Linux drm_client_dev_restore(): the fbdev client restores its mode, which is
+        // the console's text framebuffer, before the console repaints.
+        // SAFETY: `owner` retains the device, so its raw core outlives this call.
+        unsafe { drm_client_dev_restore(self.device(), true) };
+        Ok(())
+    }
+
+    fn set_master(&self, master: bool) -> AxResult<()> {
+        // The console's claim on the display is its fbdev client being active.
+        // SAFETY: `owner` retains the device, so its raw core outlives this call.
+        unsafe {
+            if master {
+                drm_client_dev_resume(self.device());
+            } else {
+                drm_client_dev_suspend(self.device());
+            }
+        }
+        Ok(())
+    }
 }
 
 struct FbInfoNode {

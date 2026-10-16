@@ -46,7 +46,6 @@ pub use device::{
     primary_device, register_primary_device,
 };
 pub use fbdev::DrmFbdev;
-pub(crate) use fbdev::drm_scanout;
 pub use file::{DrmEvent, DrmFile, OpenId};
 pub use gem::{DumbBuffer, DumbRequest, GemBacking, GemHandle, MmapOffset};
 pub(crate) use gem::GemMemoryCharge;

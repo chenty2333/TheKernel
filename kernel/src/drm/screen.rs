@@ -1,11 +1,12 @@
 //! Which surface drives the console and `/dev/fb0`.
 //!
 //! One machine can have several things able to feed the screen. A driver that
-//! found its display controller and programmed a mode owns one. A DRM primary
-//! device publishes one through an atomic commit. A machine whose firmware
-//! already programmed the display has one lying in a linear aperture that
-//! nothing in the kernel can replace. Exactly one of them may drive `/dev/fb0`
-//! and the in-kernel console, and that choice is made here and nowhere else.
+//! found its display controller and programmed a mode owns one. The upstream
+//! DRM core's fbdev client presents its framebuffer through the damage flush of
+//! its primary device. A machine whose firmware already programmed the display
+//! has one lying in a linear aperture that nothing in the kernel can replace.
+//! Exactly one of them may drive `/dev/fb0` and the in-kernel console, and that
+//! choice is made here and nowhere else.
 //!
 //! # Priority
 //!
@@ -16,7 +17,7 @@
 //! | Rank | Tier | Why it sits there |
 //! |---:|---|---|
 //! | 0 | [`rank::DRIVER`] | It owns the display controller and programmed the mode it reports. It can present at the panel's own mode and it is the surface a graphics client on the same device will present through. |
-//! | 100 | [`rank::DRM`] | A DRM primary device's fbdev emulation. A real driver with a real connector, but its console pixels live in a dumb GEM buffer and reach the screen only through a commit, which is strictly more that can fail than a surface the controller scans directly. |
+//! | 100 | [`rank::DRM`] | The upstream DRM fbdev emulation. A real driver with a real connector, but its console pixels live in a shadow buffer and reach the screen only through a damage flush, which is strictly more that can fail than a surface the controller scans directly. |
 //! | 200 | [`rank::FIRMWARE`] | The aperture the firmware programmed before the kernel started. It is last because it is the only candidate that cannot present at a mode of the kernel's choosing, and it exists only because nothing above it did. |
 //!
 //! A registered candidate is consulted before the built-in DRM emulation of the
@@ -39,16 +40,19 @@
 use alloc::{format, string::String, sync::Arc, vec::Vec};
 use core::fmt;
 
-use axerrno::AxError;
 use spin::Mutex;
 
 use crate::pseudofs::dev::{bootfb, scanout::ScanoutSurface};
+
+/// The name of the upstream fbdev candidate. `/dev/fb0` is published over the
+/// upstream node exactly when this candidate is the one that took the screen.
+pub(crate) const UPSTREAM_FBDEV: &str = "upstream-fbdev";
 
 /// The rank tiers a candidate can claim. Lower is consulted earlier.
 pub(crate) mod rank {
     /// A driver that owns the display controller and programmed its mode.
     pub(crate) const DRIVER: u32 = 0;
-    /// The fbdev emulation of the registered DRM primary device.
+    /// The upstream DRM core's fbdev emulation.
     pub(crate) const DRM: u32 = 100;
     /// The linear aperture the firmware programmed before the kernel started.
     pub(crate) const FIRMWARE: u32 = 200;
@@ -176,24 +180,34 @@ pub(crate) fn register(candidate: Candidate) {
     registered.push(candidate);
 }
 
+/// The surface the console draws into, and the candidate that provides it.
+pub(crate) struct ConsoleScanout {
+    /// The name of the candidate that took the screen.
+    pub(crate) winner: &'static str,
+    pub(crate) surface: Arc<dyn ScanoutSurface>,
+}
+
 /// Choose the surface the console and `/dev/fb0` will use.
 ///
 /// This is the kernel's single selection point. It allocates nothing but the
 /// verdict list, touches no hardware of its own (the candidates do), and is
 /// pure with respect to the candidate list, so every branch in [`decide`] is
 /// reachable from a host test.
-pub(crate) fn console_scanout() -> Option<Arc<dyn ScanoutSurface>> {
+pub(crate) fn console_scanout() -> Option<ConsoleScanout> {
     let mut candidates = REGISTERED.lock().clone();
-    candidates.push(drm_primary());
+    candidates.push(upstream_fbdev());
     candidates.push(firmware_aperture());
     // Stable, so registration order breaks a tie between equal ranks.
     candidates.sort_by_key(|candidate| candidate.rank);
 
     let mut selection = decide(&candidates, &mut report);
-    if selection.surface.is_none() {
-        info!("scanout: no candidate produced a usable surface");
+    match (selection.winner(), selection.surface.take()) {
+        (Some(winner), Some(surface)) => Some(ConsoleScanout { winner, surface }),
+        _ => {
+            info!("scanout: no candidate produced a usable surface");
+            None
+        }
     }
-    selection.surface.take()
 }
 
 /// Consult `candidates` in the order given and take the first usable surface.
@@ -321,20 +335,25 @@ fn report(candidate: &Considered) {
     }
 }
 
-/// The registered DRM primary device, if one exists.
-fn drm_primary() -> Candidate {
+/// The upstream DRM core's fbdev client, if a device registered one.
+fn upstream_fbdev() -> Candidate {
     Candidate::new(
-        "drm-primary",
+        UPSTREAM_FBDEV,
         rank::DRM,
-        "a driver published this device and presents through it",
+        "the upstream DRM fbdev client registered this framebuffer and presents it through its damage flush",
         || {
-            let device = super::primary_device()
-                .ok_or(Unavailable::Absent("no DRM primary device is registered"))?;
-            super::drm_scanout(device).map_err(|error: AxError| {
-                Unavailable::Failed(format!(
-                    "the DRM fbdev surface could not be prepared: {error}"
-                ))
-            })
+            let device = crate::drm::upstream::fbdev_device().ok_or(Unavailable::Absent(
+                "no upstream DRM device has an fbdev client",
+            ))?;
+            match crate::pseudofs::dev::upstream_fb::console_surface(device) {
+                Ok(Some(surface)) => Ok(surface),
+                Ok(None) => Err(Unavailable::Absent(
+                    "the upstream fbdev client registered no fb_info",
+                )),
+                Err(error) => Err(Unavailable::Failed(format!(
+                    "the upstream fbdev surface could not be prepared: {error}"
+                ))),
+            }
         },
     )
 }
