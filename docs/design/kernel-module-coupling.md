@@ -1,5 +1,7 @@
 # Module coupling inside the kernel crate, and why `drm` is not a crate
 
+> **Status (2026-10-16):** the measurement below was taken on the legacy kernel DRM core, which `bc5bc89a` deleted (`kernel/src/drm/{device,file,ioctl,gem,fbdev,kms,syncobj,...}.rs`). The `kernel/src/drm` figures and the `drm` edges listed here no longer describe the tree; they are kept as the historical record.
+
 `kernel/src` is 408 521 lines of Rust in one package, and the layer rules in
 `tools/ci/check_cargo_dependency_layers.py:11-16` can only see edges between
 cargo packages.  Inside that one package any module may `use crate::<other>`

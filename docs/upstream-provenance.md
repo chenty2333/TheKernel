@@ -1272,16 +1272,6 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 
 `crates/ax/tk-intel-display/src/intel_display_modeset_full.rs` translates 223 of 273 ctags function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_display.c` (MIT, Copyright © 2006-2007 Intel Corporation); 50 target-generation-excluded or DRM/GEM/debug boundary functions are enumerated with reasons in `docs/history/intel-display-modeset-full.md`. `LICENSE-MIT`.
 
-`kernel/src/drm/color_mgmt_full.rs` translates all 26 ctags definitions from Linux 7.2.3 `drivers/gpu/drm/drm_color_mgmt.c` (MIT-style grant, Copyright (c) 2016 Intel Corporation); the full grant is retained in the Rust source and `kernel/LICENSES/LicenseRef-Intel-Color-Mgmt-MIT`.
-
-`kernel/src/drm/atomic_uapi_full.rs` translates all 30 ctags definitions from Linux 7.2.3 `drivers/gpu/drm/drm_atomic_uapi.c` (MIT; Copyright (C) 2014 Red Hat, 2014/2018 Intel, and (c) 2020 The Linux Foundation); the full grant is retained in the source and `kernel/LICENSES/LicenseRef-DRM-Atomic-UAPI-MIT`.
-
-`kernel/src/drm/plane_uapi_full.rs` translates all 38 ctags definitions from Linux 7.2.3 `drivers/gpu/drm/drm_plane.c` (MIT-style grant, Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Plane-MIT`.
-
-`kernel/src/drm/connector_uapi_full.rs` translates all 87 ctags definitions plus the unrecognized `drm_get_tv_mode_from_name()` from Linux 7.2.3 `drivers/gpu/drm/drm_connector.c` (MIT-style grant, Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Connector-MIT`.
-
-`kernel/src/drm/mode_config_full.rs` translates all 14 ctags function definitions from Linux 7.2.3 `drivers/gpu/drm/drm_mode_config.c` (MIT-style grant, Copyright (c) 2016 Intel Corporation); the full grant is shared with `kernel/LICENSES/LicenseRef-Intel-Drm-Connector-MIT`.
-
 `crates/ax/tk-intel-display/src/intel_audio_dp_full.rs` translates 35/45 ctags functions from Linux 7.2.3 `intel_audio.c` (MIT, Copyright © 2014 Intel Corporation); ten HDMI-only or pre-Display-12 G4x/IBX functions are excluded. The source contains the full MIT grant and `LICENSES/Intel-i915-DP-Audio-MIT.txt` retains it.
 
 `crates/ax/tk-intel-display/src/intel_dp_mst_full.rs` translates all 68 ctags definitions from Linux 7.2.3 `intel_dp_mst.c` (MIT; Copyright © 2008 Intel and 2014 Red Hat); full grant retained in source and `LICENSES/Intel-i915-DP-MST-MIT.txt`.
@@ -1300,11 +1290,28 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 
 `crates/ax/tk-intel-display/src/intel_audio_legacy_remainder.rs` translates the remaining 10/45 ctags functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_audio.c` (MIT; Copyright © 2014 Intel Corporation), completing source coverage alongside `intel_audio_dp_full.rs`; the shared Intel grant remains in `LICENSES/Intel-i915-DP-Audio-MIT.txt`.
 
-`kernel/src/drm/crtc_uapi_full.rs` translates all 26 ctags functions from Linux 7.2.3 `drivers/gpu/drm/drm_crtc.c` (Intel permissive MIT-style grant; Copyright (c) 2006-2008 Intel Corporation, 2007 Dave Airlie, and 2008 Red Hat); the full grant is retained in the source and `kernel/LICENSES/LicenseRef-Intel-Drm-Crtc-MIT`.
+## 2026-10-16 DRM and i915 translations since bc5bc89a
 
-`kernel/src/drm/property_uapi_full.rs` translates all 26 ctags functions from Linux 7.2.3 `drivers/gpu/drm/drm_property.c` (Intel permissive MIT-style grant; Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Property-MIT`.
+The files below were added after the legacy kernel DRM core was deleted
+(`bc5bc89a`). Each carries an MIT SPDX line and names its Linux 7.2.3 source in
+its header. Function counts are not recorded here because
+`tools/ci/scan_linux_excerpts.py` does not measure them.
 
-`kernel/src/drm/framebuffer_uapi_full.rs` translates all 27 ctags functions from Linux 7.2.3 `drivers/gpu/drm/drm_framebuffer.c` (Intel permissive MIT-style grant; Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Framebuffer-MIT`.
+- `crates/ax/tk-drm-upstream/src/cfb_copyarea_upstream.rs`, `cfb_fillrect_upstream.rs`, `cfb_imageblit_upstream.rs`: `drivers/video/fbdev/core/cfbcopyarea.c`, `cfbfillrect.c`, `cfbimgblt.c` with `fb_copyarea.h`, `fb_fillrect.h`, `fb_imageblit.h`.
+- `crates/ax/tk-drm-upstream/src/fb_draw_upstream.rs`: `drivers/video/fbdev/core/fb_draw.h` and `cfbmem.h`.
+- `crates/ax/tk-drm-upstream/src/fb_io_fops_upstream.rs`: `drivers/video/fbdev/core/fb_io_fops.c`.
+- `crates/ax/tk-intel-gt/src/hsw_ips_upstream.rs`: `drivers/gpu/drm/i915/display/hsw_ips.c`.
+- `crates/ax/tk-intel-gt/src/i9xx_wm_upstream.rs`: `drivers/gpu/drm/i915/display/i9xx_wm.c`.
+- `crates/ax/tk-intel-gt/src/intel_fbc_upstream.rs`: `drivers/gpu/drm/i915/display/intel_fbc.c` and `intel_fbc_regs.h`.
+- `crates/ax/tk-intel-gt/src/intel_pch_refclk_upstream.rs`: `drivers/gpu/drm/i915/display/intel_pch_refclk.c`.
+- `crates/ax/tk-intel-gt/src/intel_pfit_upstream.rs`: `drivers/gpu/drm/i915/display/intel_pfit.c`.
+- `crates/ax/tk-intel-gt/src/intel_psr_upstream.rs`: `drivers/gpu/drm/i915/display/intel_psr.c`.
+- `crates/ax/tk-intel-gt/src/intel_sbi_upstream.rs`: `drivers/gpu/drm/i915/display/intel_sbi.c` and `intel_sbi_regs.h`.
+- `crates/ax/tk-intel-gt/src/intel_vdsc_upstream.rs`: `drivers/gpu/drm/i915/display/intel_vdsc.c` (`intel_dsc_dp_pps_write()` and the PPS helpers it calls).
+- `crates/ax/tk-linux-kapi/src/sync_file.rs`: `drivers/dma-buf/sync_file.c` and `include/linux/sync_file.h`.
+- `crates/ax/tk-linux-kapi/src/dma_fence.rs`, `dma_fence_array.rs`, `dma_fence_unwrap.rs`: `drivers/dma-buf/dma-fence.c`, `dma-fence-array.c`, `dma-fence-unwrap.c` with their headers.
+- `crates/ax/tk-linux-kapi/src/dma_resv.rs`: `drivers/dma-buf/dma-resv.c` and `include/linux/dma-resv.h`.
+- `crates/ax/tk-linux-kapi/src/irq_work.rs`: the Linux 7.2.3 `init_irq_work()` / `IRQ_WORK_INIT()` interface.
 
 ## 2026-10-09 excerpt-count reconciliation
 

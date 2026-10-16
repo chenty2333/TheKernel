@@ -24,7 +24,7 @@
   拒绝 Type-C。这一限制应保留，直到 TC cold/power、DKL PHY 和 TC PLL
   的完整恢复协议实现。不能把 TC1 重命名成 DDI A，也不能套 combo PLL。
 - 现有 Intel 代码约 24708 行（不含寄存器子目录）。它是原创参考实现，
-  不是可声称“已移植 i915”的代码。`linear.rs` 提供的是固定帧缓冲 CPU
+  不是可声称“已移植 i915”的代码。已于 `bc5bc89a` 删除的旧 `linear.rs` 提供的是固定帧缓冲 CPU
   拷贝 KMS 适配，不是 Intel atomic 硬件提交，也没有 i915 render uAPI。
 
 ## 完整显示依赖及替换清单

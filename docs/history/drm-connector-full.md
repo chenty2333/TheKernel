@@ -1,3 +1,5 @@
+Historical: describes the kernel-native DRM core removed in bc5bc89a.
+
 # DRM connector helper translation
 
 `kernel::drm::connector_uapi_full` translates all 87 ctags definitions in

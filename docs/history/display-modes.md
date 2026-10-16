@@ -1,3 +1,5 @@
+Historical: describes the kernel-native DRM core removed in bc5bc89a.
+
 # Display modes: EDID to a programmable timing
 
 **Component:** `kernel/src/drm/modes/**` (landed as `d1732266`; the branch

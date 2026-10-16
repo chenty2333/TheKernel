@@ -1,3 +1,5 @@
+Historical: describes the kernel-native DRM core removed in bc5bc89a.
+
 # DRM plane helper translation
 
 `kernel::drm::plane_uapi_full` translates all 38 function definitions from

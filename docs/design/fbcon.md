@@ -1,5 +1,7 @@
 # Firmware-Framebuffer Console (`fbcon`) — Implementation Design
 
+> **Status (2026-10-16):** the `file:line` citations below point at the legacy kernel DRM core (`kernel/src/drm/{device,file,ioctl,gem,fbdev,linear}.rs`) and `kernel/src/pseudofs/dev/dri.rs`, all deleted in `bc5bc89a`. The console now draws through `kernel/src/pseudofs/dev/console_fb.rs` on the surface `kernel/src/drm/screen.rs` selects (upstream fbdev, else firmware aperture); the DRM devices are published by `kernel/src/drm/upstream.rs`. Read the citations as a historical record of the design.
+
 **Target worktree:** `/home/ava/Worktrees/TheKernel/baremetal-boot`
 **Branch / HEAD:** `feat/baremetal-boot` / `a4f60675`
 **Goal:** display kernel and terminal text on the physical screen of a real Intel N305

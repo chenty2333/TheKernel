@@ -2,6 +2,8 @@
 
 ## 范围与状态
 
+> 2026-10-16 注：`bc5bc89a` 删除了旧内核 DRM 核心。下文中指向 `kernel/src/drm/{file,gem_exec,...}.rs` 等的路径与行号是删除前的记录，已不存在；上游 DRM 核心现位于 `crates/ax/tk-drm-upstream`，i915 上游入口为 `kernel/src/drm/intel/upstream_*.rs`。
+
 本文按 Linux 7.2.3 `drivers/gpu/drm/i915/` 的调用结构，记录当前 TheKernel 的默认执行路径、`upstream-gt` 源顺序翻译，以及真正切换运行路径时尚需提供的边界。ADL-N 使用 GT/display 分离：GT 为 Gen12 A0、GuC 提交；display 为 13.x D0。两者仍共享 PCI 设备、MMIO BAR、GGTT、IRQ/电源控制边界。
 
 **2026-10-12 起，i915 移植无条件编入（`intel-upstream-gt` feature 已删除）；原生显示/GT 栈已删除，屏幕仅为固件 GOP framebuffer 控制台，无 KMS modeset。** `gt::init_at_boot()`（`intel.gt` 默认开启，`intel.gt=0` 关闭）在 rootfs 挂载后调用 `kernel/src/drm/intel/upstream_probe.rs` → `i915_pci_probe()`，翻译版 i915 是唯一的 GT owner，手写的 N305 BCS/GuC owner 已删除。kernel 侧 provider 在 `upstream_gt.rs`/`upstream_drm.rs`，GPU MSI 由翻译版 `gen11_irq_handler()` 持有 GFX_MSTR_IRQ，display 部分回调 `irq.rs::dispatch_display()`。产品链接会解析整棵调用树（无未定义符号）。2026-10-11 已接入上游 GEM/execbuffer ioctl 到 kernel DRM 文件的路由：GEM/PRIME/KMS 共用句柄及页所有者，WB mmap 保持 i915 page pin，二进制/时间线 syncobj、sync_file 与原生 reservation 共用完成状态。跨 owner 发布依赖前锁定 Linux dma_resv，不能以异步镜像代替提交时的同步。N305 上的新链路仍须真机验收；编译或主机模型通过不代表 Mesa 硬件渲染已通过。下文各表保留接线前的对照，"默认"一栏指不带 feature 的构建。

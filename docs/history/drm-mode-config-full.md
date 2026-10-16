@@ -1,3 +1,5 @@
+Historical: describes the kernel-native DRM core removed in bc5bc89a.
+
 # DRM mode-config helper translation
 
 `kernel::drm::mode_config_full` translates all 14 function definitions in

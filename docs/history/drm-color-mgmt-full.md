@@ -1,3 +1,5 @@
+Historical: describes the kernel-native DRM core removed in bc5bc89a.
+
 # DRM color-management helper translation
 
 `kernel::drm::color_mgmt_full` translates all 26 function definitions in Linux

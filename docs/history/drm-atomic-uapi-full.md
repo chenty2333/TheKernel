@@ -1,3 +1,5 @@
+Historical: describes the kernel-native DRM core removed in bc5bc89a.
+
 # DRM atomic UAPI translation
 
 `kernel::drm::atomic_uapi_full` translates all 30 function definitions in

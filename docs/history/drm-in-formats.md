@@ -1,3 +1,5 @@
+Historical: describes the kernel-native DRM core removed in bc5bc89a.
+
 # DRM plane `IN_FORMATS` property
 
 The primary and cursor planes now expose immutable `IN_FORMATS` blobs through

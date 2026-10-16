@@ -1,3 +1,5 @@
+Historical: describes the kernel-native DRM core removed in bc5bc89a.
+
 # DRM property UAPI source translation
 
 `kernel/src/drm/property_uapi_full.rs` translates all 26 function definitions

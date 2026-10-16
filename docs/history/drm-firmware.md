@@ -1,3 +1,5 @@
+Historical: describes the kernel-native DRM core removed in bc5bc89a.
+
 # Fixed-mode firmware KMS
 
 **未在硬件上验证.** `drm/linear.rs` presents RAM dumb buffers to the firmware's

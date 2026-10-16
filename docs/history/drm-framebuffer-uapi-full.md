@@ -1,3 +1,5 @@
+Historical: describes the kernel-native DRM core removed in bc5bc89a.
+
 # DRM framebuffer UAPI source translation
 
 `kernel/src/drm/framebuffer_uapi_full.rs` translates all 27 functions in Linux
