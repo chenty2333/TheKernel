@@ -15,7 +15,7 @@ const HXG_RESPONSE_MSG_0_DATA0: u32 = 0x0fff_ffff;
 
 // REG_GENMASK/REG_BIT spellings in the source expand to these 32-bit values.
 const fn reg_genmask(high: u32, low: u32) -> u32 {
-    (u32::MAX >> (31 - high)) << low
+    (u32::MAX >> (31 - high)) & (u32::MAX << low)
 }
 const fn reg_bit(bit: u32) -> u32 {
     1u32 << bit

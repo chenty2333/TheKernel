@@ -18,7 +18,7 @@ pub const fn BIT(bit: u32) -> u32 {
 
 #[inline]
 pub const fn GENMASK(high: u32, low: u32) -> u32 {
-    (u32::MAX >> (31 - high)) << low
+    (u32::MAX >> (31 - high)) & (u32::MAX << low)
 }
 
 // Payload length only i.e. don't include G2H header length.
@@ -161,22 +161,28 @@ pub const fn SLPC_EVENT(id: u32, c: u32) -> u32 {
 }
 
 // The two static maps in the C header, indexed by the shared engine class IDs.
-pub const engine_class_guc_class_map: [u8; (MAX_ENGINE_CLASS as usize) + 1] = [
-    GUC_RENDER_CLASS as u8,
-    GUC_BLITTER_CLASS as u8,
-    GUC_VIDEO_CLASS as u8,
-    GUC_VIDEOENHANCE_CLASS as u8,
-    GUC_GSC_OTHER_CLASS as u8,
-    GUC_COMPUTE_CLASS as u8,
-];
-pub const guc_class_engine_class_map: [u8; (GUC_LAST_ENGINE_CLASS as usize) + 1] = [
-    RENDER_CLASS as u8,
-    VIDEO_DECODE_CLASS as u8,
-    VIDEO_ENHANCEMENT_CLASS as u8,
-    COPY_ENGINE_CLASS as u8,
-    COMPUTE_CLASS as u8,
-    OTHER_CLASS as u8,
-];
+// C uses designated initializers; assign by index so the class enum order,
+// not the initializer order, decides each slot.
+pub const engine_class_guc_class_map: [u8; (MAX_ENGINE_CLASS as usize) + 1] = {
+    let mut map = [0u8; (MAX_ENGINE_CLASS as usize) + 1];
+    map[RENDER_CLASS as usize] = GUC_RENDER_CLASS as u8;
+    map[COPY_ENGINE_CLASS as usize] = GUC_BLITTER_CLASS as u8;
+    map[VIDEO_DECODE_CLASS as usize] = GUC_VIDEO_CLASS as u8;
+    map[VIDEO_ENHANCEMENT_CLASS as usize] = GUC_VIDEOENHANCE_CLASS as u8;
+    map[OTHER_CLASS as usize] = GUC_GSC_OTHER_CLASS as u8;
+    map[COMPUTE_CLASS as usize] = GUC_COMPUTE_CLASS as u8;
+    map
+};
+pub const guc_class_engine_class_map: [u8; (GUC_LAST_ENGINE_CLASS as usize) + 1] = {
+    let mut map = [0u8; (GUC_LAST_ENGINE_CLASS as usize) + 1];
+    map[GUC_RENDER_CLASS as usize] = RENDER_CLASS as u8;
+    map[GUC_BLITTER_CLASS as usize] = COPY_ENGINE_CLASS as u8;
+    map[GUC_VIDEO_CLASS as usize] = VIDEO_DECODE_CLASS as u8;
+    map[GUC_VIDEOENHANCE_CLASS as usize] = VIDEO_ENHANCEMENT_CLASS as u8;
+    map[GUC_COMPUTE_CLASS as usize] = COMPUTE_CLASS as u8;
+    map[GUC_GSC_OTHER_CLASS as usize] = OTHER_CLASS as u8;
+    map
+};
 
 const _: [(); (MAX_ENGINE_CLASS as usize) + 1] = [(); engine_class_guc_class_map.len()];
 const _: [(); (GUC_LAST_ENGINE_CLASS as usize) + 1] = [(); guc_class_engine_class_map.len()];
@@ -553,3 +559,33 @@ pub type GucLogBufferState = guc_log_buffer_state;
 pub type GucCaptureType = guc_capture_type;
 pub type GucLogBufferType = guc_log_buffer_type;
 pub type IntelGucRecvMessage = intel_guc_recv_message;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_class_maps_follow_designated_initializers() {
+        assert_eq!(engine_class_to_guc_class(RENDER_CLASS as u8), GUC_RENDER_CLASS as u8);
+        assert_eq!(engine_class_to_guc_class(VIDEO_DECODE_CLASS as u8), GUC_VIDEO_CLASS as u8);
+        assert_eq!(
+            engine_class_to_guc_class(VIDEO_ENHANCEMENT_CLASS as u8),
+            GUC_VIDEOENHANCE_CLASS as u8
+        );
+        assert_eq!(engine_class_to_guc_class(COPY_ENGINE_CLASS as u8), GUC_BLITTER_CLASS as u8);
+        assert_eq!(engine_class_to_guc_class(OTHER_CLASS as u8), GUC_GSC_OTHER_CLASS as u8);
+        assert_eq!(engine_class_to_guc_class(COMPUTE_CLASS as u8), GUC_COMPUTE_CLASS as u8);
+        for class in 0..=MAX_ENGINE_CLASS as u8 {
+            assert_eq!(guc_class_engine_class_map[engine_class_guc_class_map[class as usize] as usize], class);
+        }
+    }
+
+    #[test]
+    fn genmask_matches_linux() {
+        assert_eq!(GENMASK(15, 12), 0x0000_f000);
+        assert_eq!(GENMASK(23, 20), 0x00f0_0000);
+        assert_eq!(GENMASK(26, 16), 0x07ff_0000);
+        assert_eq!(GENMASK(31, 0), u32::MAX);
+        assert_eq!(GENMASK(0, 0), 1);
+    }
+}
