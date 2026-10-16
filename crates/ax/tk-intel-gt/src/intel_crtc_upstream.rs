@@ -856,11 +856,9 @@ struct GetPipeFromCrtcId {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_crtc_get_pipe_from_crtc_id_ioctl(
-    dev: *mut DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> i32 {
+pub unsafe extern "C" fn intel_crtc_get_pipe_from_crtc_id_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<DrmDevice>();
+    let file = file.cast::<DrmFile>();
     if dev.is_null() || data.is_null() || file.is_null() {
         return -EINVAL;
     }

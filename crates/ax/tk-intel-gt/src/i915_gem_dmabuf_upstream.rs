@@ -519,8 +519,9 @@ static I915_GEM_OBJECT_DMABUF_OPS: DrmI915GemObjectOps = DrmI915GemObjectOps {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn i915_gem_prime_import(
     dev: *mut DrmDevice,
-    dma_buf: *mut DmaBuf,
+    dma_buf: *mut c_void,
 ) -> *mut DrmGemObject {
+    let dma_buf = dma_buf.cast::<DmaBuf>();
     if unsafe { (*dma_buf).ops == &I915_DMABUF_OPS } {
         let obj = unsafe { dma_buf_to_obj(dma_buf) };
         let base = unsafe { intel_bo_to_drm_bo(obj) };

@@ -20,7 +20,6 @@
 use core::ffi::{CStr, VaList, c_char, c_int, c_long, c_ulong, c_void};
 
 use crate::{
-    i915_ioctl_upstream::DrmIoctlDesc,
     i915_probe_provider_upstream as provider,
     i915_probe_provider_upstream::framework,
     i915_utils_upstream::i915_vtd_active,
@@ -1855,7 +1854,8 @@ pub unsafe fn i915_driver_remove(i915: *mut DrmI915Private) {
 ///
 /// # Safety
 /// `dev` must be the live `struct drm_device` of an i915 instance.
-pub unsafe fn i915_driver_release(dev: *mut c_void) {
+pub unsafe extern "C" fn i915_driver_release(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice) {
+    let dev = dev.cast::<c_void>();
     let dev_priv = unsafe { to_i915(dev) };
     let rpm = core::ptr::addr_of_mut!((*dev_priv).runtime_pm).cast::<IntelRuntimePm>();
 
@@ -1879,7 +1879,9 @@ pub unsafe fn i915_driver_release(dev: *mut c_void) {
 ///
 /// # Safety
 /// `dev` and `file` must be live DRM objects.
-pub unsafe fn i915_driver_open(dev: *mut c_void, file: *mut c_void) -> i32 {
+pub unsafe extern "C" fn i915_driver_open(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<c_void>();
+    let file = file.cast::<c_void>();
     let i915 = unsafe { to_i915(dev) };
     let ret = unsafe { i915_gem_open(i915, file) };
     if ret != 0 {
@@ -1892,7 +1894,9 @@ pub unsafe fn i915_driver_open(dev: *mut c_void, file: *mut c_void) -> i32 {
 ///
 /// # Safety
 /// `dev` and `file` must be live DRM objects.
-pub unsafe fn i915_driver_postclose(dev: *mut c_void, file: *mut c_void) {
+pub unsafe extern "C" fn i915_driver_postclose(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, file: *mut tk_drm_upstream::drm_file_types::DrmFile) {
+    let dev = dev.cast::<c_void>();
+    let file = file.cast::<c_void>();
     let client = unsafe { provider::file_client(file) };
     unsafe { i915_gem_context_close(file.cast()) };
     unsafe { i915_drm_client_put(client.cast()) };
@@ -2617,6 +2621,9 @@ pub const DRIVER_PATCHLEVEL: u32 = 0;
 pub const DRIVER_NAME: &str = "i915";
 pub const DRIVER_DESC: &str = "Intel Graphics";
 
+/// SUPERSEDED by `I915_DRM_DRIVER` (canonical `struct drm_driver` record). Kept
+/// only because the kernel bridge (`kernel/src/drm/intel/`) still consumes it.
+///
 /// `static const struct drm_driver i915_drm_driver` (i915_driver.c). The
 /// DRM-core callbacks are installed through the DRM provider; this record keeps
 /// the feature set, identity and the Rust-side callbacks.
@@ -2629,7 +2636,7 @@ pub struct DrmDriverDesc {
     pub release: unsafe fn(*mut c_void),
     pub open: unsafe fn(*mut c_void, *mut c_void) -> i32,
     pub postclose: unsafe fn(*mut c_void, *mut c_void),
-    pub ioctls: &'static [crate::i915_ioctl_upstream::DrmIoctlDesc],
+    pub ioctls: &'static [crate::i915_ioctl_upstream::BridgeIoctlDesc],
 }
 
 /// `DRIVER_GEM | DRIVER_RENDER | DRIVER_MODESET | DRIVER_ATOMIC |
@@ -2650,15 +2657,17 @@ const DRIVER_SYNCOBJ_TIMELINE_FLAG: u32 = 1 << 6;
 /// `i915_driver_release` / `i915_driver_open` / `i915_driver_postclose` as
 /// the DRM-driver callbacks (wrapped to the `unsafe fn` shape above).
 unsafe fn drm_release_cb(dev: *mut c_void) {
-    unsafe { i915_driver_release(dev) };
+    unsafe { i915_driver_release(dev.cast()) };
 }
 unsafe fn drm_open_cb(dev: *mut c_void, file: *mut c_void) -> i32 {
-    unsafe { i915_driver_open(dev, file) }
+    unsafe { i915_driver_open(dev.cast(), file.cast()) }
 }
 unsafe fn drm_postclose_cb(dev: *mut c_void, file: *mut c_void) {
-    unsafe { i915_driver_postclose(dev, file) };
+    unsafe { i915_driver_postclose(dev.cast(), file.cast()) };
 }
 
+/// SUPERSEDED by `I915_DRM_DRIVER`; see `DrmDriverDesc`.
+///
 /// `i915_drm_driver` (i915_driver.c).
 pub fn i915_drm_driver() -> DrmDriverDesc {
     DrmDriverDesc {
@@ -2670,7 +2679,68 @@ pub fn i915_drm_driver() -> DrmDriverDesc {
         release: drm_release_cb,
         open: drm_open_cb,
         postclose: drm_postclose_cb,
-        ioctls: crate::i915_ioctl_upstream::I915_IOCTLS,
+        ioctls: crate::i915_ioctl_upstream::I915_BRIDGE_IOCTLS,
+    }
+}
+
+/// `.gem_prime_import` slot. The DRM core's `drm_gem_object` view differs from
+/// i915's `DrmGemObject` (`linux::gem`) only by the typed view; the object is the
+/// same allocation, so the result is only re-typed.
+unsafe extern "C" fn i915_gem_prime_import_cb(
+    dev: *mut tk_drm_upstream::drm_device_types::DrmDevice,
+    dma_buf: *mut c_void,
+) -> *mut tk_drm_upstream::drm_gem_types::DrmGemObject {
+    unsafe { crate::i915_gem_dmabuf_upstream::i915_gem_prime_import(dev, dma_buf).cast() }
+}
+
+/// `struct drm_driver` is not `Sync` (raw pointers); this wrapper is the
+/// `SyncDrmDriver` pattern used by `tk-drm-upstream`'s efidrm driver. The record
+/// is built at compile time and never mutated.
+pub struct SyncI915DrmDriver(pub tk_drm_upstream::drm_drv_types::DrmDriver);
+
+// SAFETY: the record is const-built and immutable; its raw pointers reference
+// statics (`I915_IOCTLS`, the C-string names) and never get written.
+unsafe impl Sync for SyncI915DrmDriver {}
+
+/// `static const struct drm_driver i915_drm_driver` (i915_driver.c, Linux
+/// v7.2.3, x86_64 with CONFIG_PROC_FS=y, CONFIG_DRM_FBDEV_EMULATION=y). Every
+/// field Linux sets is set here, the rest stay NULL/0. `.fops` stays NULL: the
+/// kernel VFS calls the DRM core directly, not through `i915_driver_fops`.
+/// `.load` is not set (Linux probes through the PCI driver); `.ioctls` points at
+/// `I915_IOCTLS` and `.num_ioctls` is its `ARRAY_SIZE()`.
+pub static I915_DRM_DRIVER: SyncI915DrmDriver = SyncI915DrmDriver(i915_drm_driver_def());
+
+const fn i915_drm_driver_def() -> tk_drm_upstream::drm_drv_types::DrmDriver {
+    use tk_drm_upstream::drm_drv_types::DrmDriver;
+    DrmDriver {
+        load: None,
+        open: Some(i915_driver_open),
+        postclose: Some(i915_driver_postclose),
+        unload: None,
+        release: Some(i915_driver_release),
+        master_set: None,
+        master_drop: None,
+        debugfs_init: None,
+        gem_create_object: None,
+        prime_handle_to_fd: None,
+        prime_fd_to_handle: None,
+        gem_prime_import: Some(i915_gem_prime_import_cb),
+        gem_prime_import_sg_table: None,
+        dumb_create: Some(crate::i915_gem_create_upstream::i915_gem_dumb_create),
+        dumb_map_offset: Some(crate::i915_gem_mman_upstream::i915_gem_dumb_mmap_offset),
+        // INTEL_FBDEV_DRIVER_OPS: .fbdev_probe = intel_fbdev_driver_fbdev_probe
+        fbdev_probe: Some(crate::intel_fbdev_upstream::intel_fbdev_driver_fbdev_probe),
+        // PTR_IF(IS_ENABLED(CONFIG_PROC_FS), i915_drm_client_fdinfo)
+        show_fdinfo: Some(crate::i915_drm_client_upstream::i915_drm_client_fdinfo),
+        major: DRIVER_MAJOR as i32,
+        minor: DRIVER_MINOR as i32,
+        patchlevel: DRIVER_PATCHLEVEL as i32,
+        name: c"i915".as_ptr().cast_mut(),
+        desc: c"Intel Graphics".as_ptr().cast_mut(),
+        driver_features: I915_DRM_DRIVER_FEATURES,
+        ioctls: core::ptr::addr_of!(crate::i915_ioctl_upstream::I915_IOCTLS).cast::<tk_drm_upstream::drm_ioctl_types::DrmIoctlDesc>().cast_mut(),
+        num_ioctls: crate::i915_ioctl_upstream::I915_IOCTLS.len() as i32,
+        fops: core::ptr::null_mut(),
     }
 }
 
@@ -2678,11 +2748,9 @@ pub fn i915_drm_driver() -> DrmDriverDesc {
 ///
 /// # Safety
 /// Takes no device state; arguments are ignored as in the C version.
-pub unsafe fn i915_gem_reject_pin_ioctl(
-    dev: *mut c_void,
-    data: *mut c_void,
-    file: *mut c_void,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_reject_pin_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<c_void>();
+    let file = file.cast::<c_void>();
     let _ = (dev, data, file);
     -crate::linux_config::ENODEV
 }

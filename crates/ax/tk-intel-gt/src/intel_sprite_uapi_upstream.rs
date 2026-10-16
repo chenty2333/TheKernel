@@ -129,11 +129,9 @@ fn colorkey_flags(plane_id: PlaneId, flags: u32, display_ver: u8) -> u32 {
 
 /// Linux `intel_sprite_set_colorkey_ioctl()`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_sprite_set_colorkey_ioctl(
-    dev: *mut DrmDevice,
-    data: *mut c_void,
-    file_priv: *mut DrmFile,
-) -> i32 {
+pub unsafe extern "C" fn intel_sprite_set_colorkey_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file_priv: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<DrmDevice>();
+    let file_priv = file_priv.cast::<DrmFile>();
     if dev.is_null() || data.is_null() || file_priv.is_null() {
         return -EINVAL;
     }

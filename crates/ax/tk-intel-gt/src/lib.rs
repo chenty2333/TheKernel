@@ -482,6 +482,9 @@ pub mod i915_probe_provider_upstream;
 
 #[allow(unsafe_code)]
 pub mod i915_ioctl_upstream;
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod host_test_links;
 #[allow(unsafe_code)]
 pub(crate) mod i915_memcpy_upstream;
 #[allow(unsafe_code)]

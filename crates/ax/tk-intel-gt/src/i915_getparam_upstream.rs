@@ -127,11 +127,9 @@ unsafe fn has_coherent_ggtt(i915: *mut DrmI915Private) -> bool {
 
 // upstream: i915_getparam.c i915_getparam_ioctl()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn i915_getparam_ioctl(
-    dev: *mut c_void,
-    data: *mut c_void,
-    _file_priv: *mut c_void,
-) -> c_int {
+pub unsafe extern "C" fn i915_getparam_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, _file_priv: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<c_void>();
+    let _file_priv = _file_priv.cast::<c_void>();
     let i915 = unsafe { to_i915(dev) };
     let display = unsafe { (*i915).display };
     let gt = unsafe { to_gt(i915) };

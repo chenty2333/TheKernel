@@ -3309,11 +3309,9 @@ pub fn check_buffer_count(count: usize) -> bool {
 }
 
 // upstream: i915_gem_execbuffer.c i915_gem_execbuffer2_ioctl()
-pub unsafe fn i915_gem_execbuffer2_ioctl(
-    dev: *mut DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> i32 {
+pub unsafe extern "C" fn i915_gem_execbuffer2_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<DrmDevice>();
+    let file = file.cast::<DrmFile>();
     let i915 = to_i915(dev.cast());
     let args = data as *mut DrmI915GemExecbuffer2;
     let count = (*args).buffer_count as usize;

@@ -329,11 +329,9 @@ unsafe fn remove_mappable_node(ggtt: *mut I915Ggtt, node: *mut DrmMmNode) {
 }
 
 // upstream: i915_gem.c i915_gem_get_aperture_ioctl()
-pub unsafe fn i915_gem_get_aperture_ioctl(
-    dev: *mut c_void,
-    data: *mut c_void,
-    _file: *mut c_void,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_get_aperture_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, _file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<c_void>();
+    let _file = _file.cast::<c_void>();
     let i915 = to_i915(dev);
     let ggtt = (*to_gt(i915)).ggtt.cast::<I915Ggtt>();
     let args = data.cast::<GemGetApertureArgs>();
@@ -665,11 +663,9 @@ unsafe fn i915_gem_gtt_pread(obj: *mut DrmI915GemObject, args: *const GemPreadAr
 }
 
 // upstream: i915_gem.c i915_gem_pread_ioctl()
-pub unsafe fn i915_gem_pread_ioctl(
-    dev: *mut c_void,
-    data: *mut c_void,
-    file: *mut c_void,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_pread_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<c_void>();
+    let file = file.cast::<c_void>();
     let i915 = to_i915(dev);
     let args = data.cast::<GemPreadArgs>();
     if GRAPHICS_VER(i915) >= GRAPHICS_VER_MIN_TGL as u8 && !IS_PLATFORM(i915, INTEL_TIGERLAKE) {
@@ -882,11 +878,9 @@ unsafe fn i915_gem_shmem_pwrite(obj: *mut DrmI915GemObject, args: *const GemPwri
 }
 
 // upstream: i915_gem.c i915_gem_pwrite_ioctl()
-pub unsafe fn i915_gem_pwrite_ioctl(
-    dev: *mut c_void,
-    data: *mut c_void,
-    file: *mut c_void,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_pwrite_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<c_void>();
+    let file = file.cast::<c_void>();
     let i915 = to_i915(dev);
     let args = data.cast::<GemPwriteArgs>();
     if GRAPHICS_VER(i915) >= GRAPHICS_VER_MIN_TGL as u8 && !IS_PLATFORM(i915, INTEL_TIGERLAKE) {
@@ -940,11 +934,9 @@ pub unsafe fn i915_gem_pwrite_ioctl(
 }
 
 // upstream: i915_gem.c i915_gem_sw_finish_ioctl()
-pub unsafe fn i915_gem_sw_finish_ioctl(
-    _dev: *mut c_void,
-    data: *mut c_void,
-    file: *mut c_void,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_sw_finish_ioctl(_dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let _dev = _dev.cast::<c_void>();
+    let file = file.cast::<c_void>();
     let args = data.cast::<GemSwFinishArgs>();
     let obj = i915_gem_object_lookup(file.cast(), (*args).handle);
     if obj.is_null() {
@@ -1093,11 +1085,9 @@ pub unsafe fn i915_gem_object_ggtt_pin(
 }
 
 // upstream: i915_gem.c i915_gem_madvise_ioctl()
-pub unsafe fn i915_gem_madvise_ioctl(
-    dev: *mut c_void,
-    data: *mut c_void,
-    file: *mut c_void,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_madvise_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<c_void>();
+    let file = file.cast::<c_void>();
     let i915 = to_i915(dev);
     let args = data.cast::<GemMadviseArgs>();
     match (*args).madv {

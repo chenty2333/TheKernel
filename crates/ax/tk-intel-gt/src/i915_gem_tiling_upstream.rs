@@ -427,11 +427,9 @@ pub unsafe fn i915_gem_object_set_tiling(
 ///
 /// Returns zero on success, negative errno on failure.
 // upstream: i915_gem_tiling.c i915_gem_set_tiling_ioctl()
-pub unsafe fn i915_gem_set_tiling_ioctl(
-    dev: *mut DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> i32 {
+pub unsafe extern "C" fn i915_gem_set_tiling_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<DrmDevice>();
+    let file = file.cast::<DrmFile>();
     let i915 = to_i915(dev.cast());
     let args = data.cast::<DrmI915GemSetTiling>();
     let obj: *mut DrmI915GemObject;
@@ -506,11 +504,9 @@ pub unsafe fn i915_gem_set_tiling_ioctl(
 /// Called by the user via ioctl. Returns zero on success, negative errno on
 /// failure.
 // upstream: i915_gem_tiling.c i915_gem_get_tiling_ioctl()
-pub unsafe fn i915_gem_get_tiling_ioctl(
-    dev: *mut DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> i32 {
+pub unsafe extern "C" fn i915_gem_get_tiling_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<DrmDevice>();
+    let file = file.cast::<DrmFile>();
     let args = data.cast::<DrmI915GemGetTiling>();
     let i915 = to_i915(dev.cast());
     let mut obj: *mut DrmI915GemObject;

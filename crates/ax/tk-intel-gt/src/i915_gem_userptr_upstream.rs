@@ -613,11 +613,9 @@ unsafe fn set_userptr_readonly(obj: *mut DrmI915GemObject) {
 }
 
 // upstream: i915_gem_userptr.c i915_gem_userptr_ioctl()
-pub unsafe fn i915_gem_userptr_ioctl(
-    dev: *mut c_void,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> i32 {
+pub unsafe extern "C" fn i915_gem_userptr_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<c_void>();
+    let file = file.cast::<DrmFile>();
     let i915 = crate::linux::i915::to_i915(dev);
     let args = data.cast::<DrmI915GemUserptr>();
 

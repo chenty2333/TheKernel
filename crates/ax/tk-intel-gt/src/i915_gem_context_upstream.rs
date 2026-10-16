@@ -2248,7 +2248,9 @@ pub unsafe fn i915_gem_context_close(file: *mut DrmFile) {
 }
 
 // upstream: i915_gem_context.c i915_gem_vm_create_ioctl()
-pub unsafe fn i915_gem_vm_create_ioctl(dev: *mut c_void, data: *mut c_void, file: *mut DrmFile) -> c_int {
+pub unsafe extern "C" fn i915_gem_vm_create_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<c_void>();
+    let file = file.cast::<DrmFile>();
     let i915 = dev.cast::<DrmI915Private>();
     let args = data.cast::<DrmI915GemVmControl>();
     let fpriv = unsafe { (*file).driver_priv.cast::<DrmI915FilePrivate>() };
@@ -2295,7 +2297,9 @@ pub unsafe fn i915_gem_vm_create_ioctl(dev: *mut c_void, data: *mut c_void, file
 }
 
 // upstream: i915_gem_context.c i915_gem_vm_destroy_ioctl()
-pub unsafe fn i915_gem_vm_destroy_ioctl(_dev: *mut c_void, data: *mut c_void, file: *mut DrmFile) -> c_int {
+pub unsafe extern "C" fn i915_gem_vm_destroy_ioctl(_dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let _dev = _dev.cast::<c_void>();
+    let file = file.cast::<DrmFile>();
     let args = data.cast::<DrmI915GemVmControl>();
     let fpriv = unsafe { (*file).driver_priv.cast::<DrmI915FilePrivate>() };
     if unsafe { (*args).flags != 0 || (*args).extensions != 0 } {
@@ -2723,11 +2727,8 @@ pub unsafe fn i915_gem_context_lookup(file_priv: *mut DrmI915FilePrivate, id: u3
 }
 
 // upstream: i915_gem_context.c i915_gem_context_create_ioctl()
-pub unsafe fn i915_gem_context_create_ioctl(
-    dev: *mut crate::linux::gem::DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_context_create_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let file = file.cast::<DrmFile>();
     let i915 = unsafe { crate::linux::i915::to_i915(dev.cast()) };
     let args = data.cast::<DrmI915GemContextCreateExt>();
     if !unsafe { has_logical_contexts(i915) } {
@@ -2804,11 +2805,8 @@ pub unsafe fn i915_gem_context_create_ioctl(
 }
 
 // upstream: i915_gem_context.c i915_gem_context_destroy_ioctl()
-pub unsafe fn i915_gem_context_destroy_ioctl(
-    _dev: *mut crate::linux::gem::DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_context_destroy_ioctl(_dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let file = file.cast::<DrmFile>();
     let args = data.cast::<DrmI915GemContextDestroy>();
     let fpriv = unsafe { (*file).driver_priv.cast::<DrmI915FilePrivate>() };
     let view = unsafe { file_private_view(fpriv) };
@@ -2888,11 +2886,8 @@ unsafe fn get_sseu(ctx: *mut I915GemContext, args: *mut DrmI915GemContextParam) 
 }
 
 // upstream: i915_gem_context.c i915_gem_context_getparam_ioctl()
-pub unsafe fn i915_gem_context_getparam_ioctl(
-    _dev: *mut crate::linux::gem::DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_context_getparam_ioctl(_dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let file = file.cast::<DrmFile>();
     let fpriv = unsafe { (*file).driver_priv.cast::<DrmI915FilePrivate>() };
     let args = data.cast::<DrmI915GemContextParam>();
     let ctx = unsafe { i915_gem_context_lookup(fpriv, (*args).ctx_id) };
@@ -2945,11 +2940,8 @@ pub unsafe fn i915_gem_context_getparam_ioctl(
 }
 
 // upstream: i915_gem_context.c i915_gem_context_setparam_ioctl()
-pub unsafe fn i915_gem_context_setparam_ioctl(
-    _dev: *mut crate::linux::gem::DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_context_setparam_ioctl(_dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let file = file.cast::<DrmFile>();
     let fpriv = unsafe { (*file).driver_priv.cast::<DrmI915FilePrivate>() };
     let view = unsafe { file_private_view(fpriv) };
     let args = data.cast::<DrmI915GemContextParam>();
@@ -2979,11 +2971,8 @@ pub unsafe fn i915_gem_context_setparam_ioctl(
 }
 
 // upstream: i915_gem_context.c i915_gem_context_reset_stats_ioctl()
-pub unsafe fn i915_gem_context_reset_stats_ioctl(
-    dev: *mut crate::linux::gem::DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_context_reset_stats_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let file = file.cast::<DrmFile>();
     let i915 = unsafe { crate::linux::i915::to_i915(dev.cast()) };
     let args = data.cast::<DrmI915ResetStats>();
     if unsafe { (*args).flags != 0 || (*args).pad != 0 } {

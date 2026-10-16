@@ -440,11 +440,9 @@ unsafe fn __vma_matches(
 }
 
 // upstream: i915_gem_mman.c i915_gem_mmap_ioctl()
-pub unsafe fn i915_gem_mmap_ioctl(
-    dev: *mut DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_mmap_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<DrmDevice>();
+    let file = file.cast::<DrmFile>();
     let i915 = to_i915(dev.cast());
     let args = data.cast::<DrmI915GemMmap>();
 
@@ -1009,7 +1007,14 @@ unsafe fn __assign_mmap_offset_handle(file: *mut DrmFile, handle: u32, mmap_type
 }
 
 // upstream: i915_gem_mman.c i915_gem_dumb_mmap_offset()
-pub unsafe fn i915_gem_dumb_mmap_offset(file: *mut DrmFile, dev: *mut DrmDevice, handle: u32, offset: *mut u64) -> c_int {
+pub unsafe extern "C" fn i915_gem_dumb_mmap_offset(
+    file: *mut tk_drm_upstream::drm_file_types::DrmFile,
+    dev: *mut tk_drm_upstream::drm_device_types::DrmDevice,
+    handle: u32,
+    offset: *mut u64,
+) -> i32 {
+    let file = file.cast::<DrmFile>();
+    let dev = dev.cast::<DrmDevice>();
     let i915 = to_i915(dev.cast());
     let mmap_type = if HAS_LMEM(i915) {
         I915MmapType::I915_MMAP_TYPE_FIXED
@@ -1024,7 +1029,9 @@ pub unsafe fn i915_gem_dumb_mmap_offset(file: *mut DrmFile, dev: *mut DrmDevice,
 }
 
 // upstream: i915_gem_mman.c i915_gem_mmap_offset_ioctl()
-pub unsafe fn i915_gem_mmap_offset_ioctl(dev: *mut DrmDevice, data: *mut c_void, file: *mut DrmFile) -> c_int {
+pub unsafe extern "C" fn i915_gem_mmap_offset_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<DrmDevice>();
+    let file = file.cast::<DrmFile>();
     let i915 = to_i915(dev.cast());
     let args = data.cast::<DrmI915GemMmapOffset>();
     // Historical ABI: pad and offset are intentionally not validated.

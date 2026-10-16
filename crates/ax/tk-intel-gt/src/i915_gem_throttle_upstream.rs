@@ -50,11 +50,9 @@ unsafe extern "C" {
 }
 
 // upstream: i915_gem_throttle.c i915_gem_throttle_ioctl()
-pub unsafe fn i915_gem_throttle_ioctl(
-    dev: *mut c_void,
-    _data: *mut c_void,
-    file: *mut DrmFile,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_throttle_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, _data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<c_void>();
+    let file = file.cast::<DrmFile>();
     if dev.is_null() || file.is_null() {
         return -crate::linux_config::EINVAL;
     }

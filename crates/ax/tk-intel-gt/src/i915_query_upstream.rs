@@ -1100,11 +1100,9 @@ fn array_index_nospec(index: usize, size: usize) -> usize {
 
 // upstream: i915_query.c i915_query_ioctl()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn i915_query_ioctl(
-    dev: *mut c_void,
-    data: *mut c_void,
-    _file: *mut c_void,
-) -> c_int {
+pub unsafe extern "C" fn i915_query_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, _file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<c_void>();
+    let _file = _file.cast::<c_void>();
     let i915 = unsafe { to_i915(dev) };
     let args = data.cast::<DrmI915Query>();
     if unsafe { (*args).flags } != 0 {

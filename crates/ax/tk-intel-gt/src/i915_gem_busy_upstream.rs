@@ -145,11 +145,9 @@ unsafe fn busy_check_writer(fence: *mut DmaFence) -> u32 {
 }
 
 // upstream: i915_gem_busy.c i915_gem_busy_ioctl()
-pub unsafe fn i915_gem_busy_ioctl(
-    _dev: *mut c_void,
-    data: *mut c_void,
-    file: *mut crate::linux::gem::DrmFile,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_busy_ioctl(_dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let _dev = _dev.cast::<c_void>();
+    let file = file.cast::<crate::linux::gem::DrmFile>();
     if data.is_null() || file.is_null() {
         return -crate::linux_config::EINVAL;
     }

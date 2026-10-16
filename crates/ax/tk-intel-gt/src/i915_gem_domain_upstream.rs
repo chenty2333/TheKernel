@@ -380,11 +380,9 @@ pub unsafe fn i915_gem_object_set_cache_level(
 }
 
 // upstream: i915_gem_domain.c i915_gem_get_caching_ioctl()
-pub unsafe fn i915_gem_get_caching_ioctl(
-    dev: *mut DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> i32 {
+pub unsafe extern "C" fn i915_gem_get_caching_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<DrmDevice>();
+    let file = file.cast::<DrmFile>();
     let i915 = to_i915(dev.cast());
     let args = data.cast::<DrmI915GemCaching>();
     let mut obj: *mut DrmI915GemObject;
@@ -425,11 +423,9 @@ pub unsafe fn i915_gem_get_caching_ioctl(
 }
 
 // upstream: i915_gem_domain.c i915_gem_set_caching_ioctl()
-pub unsafe fn i915_gem_set_caching_ioctl(
-    dev: *mut DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> i32 {
+pub unsafe extern "C" fn i915_gem_set_caching_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<DrmDevice>();
+    let file = file.cast::<DrmFile>();
     let i915 = to_i915(dev.cast());
     let args = data.cast::<DrmI915GemCaching>();
     let mut obj: *mut DrmI915GemObject;
@@ -625,11 +621,9 @@ pub unsafe fn i915_gem_object_set_to_cpu_domain(obj: *mut DrmI915GemObject, writ
 /// @data: ioctl data blob
 /// @file: drm file
 // upstream: i915_gem_domain.c i915_gem_set_domain_ioctl()
-pub unsafe fn i915_gem_set_domain_ioctl(
-    dev: *mut DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> i32 {
+pub unsafe extern "C" fn i915_gem_set_domain_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<DrmDevice>();
+    let file = file.cast::<DrmFile>();
     let args = data.cast::<DrmI915GemSetDomain>();
     let mut obj: *mut DrmI915GemObject;
     let read_domains = (*args).read_domains;

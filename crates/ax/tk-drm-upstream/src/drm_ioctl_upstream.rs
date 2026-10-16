@@ -614,6 +614,11 @@ pub unsafe extern "C" fn drm_ioctl(
             found
         };
 
+        // upstream: drm_ioctl(): `if (unlikely(!func))` -> -EINVAL before any copy.
+        // Driver tables may contain zeroed gaps (designated-initializer holes).
+        if (*desc).func.is_null() {
+            return -EINVAL;
+        }
         let func: DrmIoctlFn = core::mem::transmute((*desc).func);
         let drv_size = ((*desc).cmd >> 16) & 0x3fff;
         let mut in_size = (cmd >> 16) & 0x3fff;

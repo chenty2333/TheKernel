@@ -306,11 +306,10 @@ pub unsafe extern "C" fn __i915_gem_object_create_user(
 
 // upstream: i915_gem_create.c i915_gem_dumb_create()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn i915_gem_dumb_create(
-    file: *mut DrmFile,
-    dev: *mut DrmDevice,
-    args: *mut DrmModeCreateDumb,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_dumb_create(file: *mut tk_drm_upstream::drm_file_types::DrmFile, dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, args: *mut tk_drm_upstream::uapi_drm_mode_types::DrmModeCreateDumb) -> i32 {
+    let file = file.cast::<DrmFile>();
+    let dev = dev.cast::<DrmDevice>();
+    let args = args.cast::<DrmModeCreateDumb>();
     let args = unsafe { &mut *args };
     let cpp = args.bpp.wrapping_add(7) / 8;
     let format = match cpp {
@@ -347,11 +346,9 @@ pub unsafe extern "C" fn i915_gem_dumb_create(
 
 // upstream: i915_gem_create.c i915_gem_create_ioctl()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn i915_gem_create_ioctl(
-    dev: *mut DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_create_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<DrmDevice>();
+    let file = file.cast::<DrmFile>();
     let i915 = unsafe { to_i915(dev.cast()) };
     let args = unsafe { &mut *data.cast::<DrmI915GemCreate>() };
     let mut mr = unsafe { intel_memory_region_by_type(i915, INTEL_MEMORY_SYSTEM) };
@@ -597,11 +594,9 @@ static CREATE_EXTENSIONS: [I915UserExtensionFn; 3] = [
 
 // upstream: i915_gem_create.c i915_gem_create_ext_ioctl()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn i915_gem_create_ext_ioctl(
-    dev: *mut DrmDevice,
-    data: *mut c_void,
-    file: *mut DrmFile,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_create_ext_ioctl(dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let dev = dev.cast::<DrmDevice>();
+    let file = file.cast::<DrmFile>();
     let i915 = unsafe { to_i915(dev.cast()) };
     let args = unsafe { &mut *data.cast::<DrmI915GemCreateExt>() };
     let mut ext_data = CreateExt {

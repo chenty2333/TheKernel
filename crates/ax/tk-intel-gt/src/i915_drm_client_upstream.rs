@@ -339,7 +339,12 @@ unsafe fn show_client_class(
 
 // upstream: i915_drm_client.c i915_drm_client_fdinfo()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn i915_drm_client_fdinfo(printer: *mut DrmPrinter, file: *mut gem::DrmFile) {
+pub unsafe extern "C" fn i915_drm_client_fdinfo(
+    printer: *mut tk_drm_upstream::drm_print_types::DrmPrinter,
+    file: *mut tk_drm_upstream::drm_file_types::DrmFile,
+) {
+    let printer = printer.cast::<DrmPrinter>();
+    let file = file.cast::<gem::DrmFile>();
     unsafe {
         let file_priv = file_private_view(file);
         let i915 = (*file_priv).i915;

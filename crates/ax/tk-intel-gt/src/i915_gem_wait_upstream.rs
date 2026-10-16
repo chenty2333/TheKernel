@@ -360,11 +360,9 @@ fn ktime_to_ns(value: i64) -> i64 {
 
 // upstream: gem/i915_gem_wait.c i915_gem_wait_ioctl()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn i915_gem_wait_ioctl(
-    _dev: *mut c_void,
-    data: *mut c_void,
-    file: *mut c_void,
-) -> c_int {
+pub unsafe extern "C" fn i915_gem_wait_ioctl(_dev: *mut tk_drm_upstream::drm_device_types::DrmDevice, data: *mut c_void, file: *mut tk_drm_upstream::drm_file_types::DrmFile) -> i32 {
+    let _dev = _dev.cast::<c_void>();
+    let file = file.cast::<c_void>();
     let args = data.cast::<DrmI915GemWait>();
     if unsafe { (*args).flags } != 0 {
         return -crate::linux_config::EINVAL;
