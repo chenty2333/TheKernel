@@ -41,6 +41,7 @@ use crate::{
         INTEL_UC_FW_TYPE_GUC, INTEL_UC_FW_TYPE_HUC, INTEL_UC_RSVD_GGTT_PER_FW, IntelUcFw,
         IntelUcFwFile, IntelUcFwType, IntelUcFwVersion,
     },
+    intel_device_info_types_upstream::INTEL_SUBPLATFORM_N,
     intel_uc_types_upstream::IntelUc,
     intel_uncore_types_upstream::{
         FORCEWAKE_ALL, IntelUncore, intel_uncore_forcewake_get, intel_uncore_forcewake_put,
@@ -51,7 +52,10 @@ use crate::{
     linux::{
         config::{E2BIG, EINVAL, ENOENT, EPROTO, PAGE_SHIFT, PAGE_SIZE},
         gem::DrmGemObject,
-        i915::{IS_PLATFORM, IntelDeviceInfoOverlay, i915_gem_get_pat_index},
+        i915::{
+            IS_PLATFORM, IS_SUBPLATFORM, IntelDeviceInfoOverlay, i915_gem_get_pat_index,
+            i915_pci_revision,
+        },
         i915_private::DrmI915Private,
     },
 };
@@ -457,14 +461,13 @@ fn table_for_type(ty: IntelUcFwType) -> Option<&'static [UcFwRequirement]> {
         _ => None,
     }
 }
+/// `IS_ALDERLAKE_P_N(i915)`: the subplatform bit lives in the runtime info.
+/// The static device-info copy carries no device id, so reading one there
+/// never matched and ADL-N loaded the HWConfig-capable ADL-P GuC, which then
+/// failed with `INTEL_GUC_LOAD_STATUS_HWCONFIG_ERROR` on N305.
 #[inline]
 unsafe fn is_adlp_n(i915: *mut DrmI915Private) -> bool {
-    let info = unsafe { (*i915).info.cast::<IntelDeviceInfoOverlay>() };
-    if info.is_null() {
-        return false;
-    }
-    let id = unsafe { (*info).runtime.device_id };
-    matches!(id, 0x46d0..=0x46d4)
+    unsafe { IS_SUBPLATFORM(i915, INTEL_ALDERLAKE_P, INTEL_SUBPLATFORM_N) }
 }
 
 pub(crate) unsafe fn has_gt_uc(i915: *mut DrmI915Private) -> bool {
@@ -573,12 +576,8 @@ unsafe fn __uc_fw_auto_select(i915: *mut DrmI915Private, uc_fw: *mut IntelUcFw) 
     if unsafe { is_adlp_n(i915) } {
         platform = INTEL_ALDERLAKE_S;
     }
-    let revid = unsafe {
-        (*(*i915).info.cast::<IntelDeviceInfoOverlay>())
-            .runtime
-            .step
-            .graphics_step
-    };
+    // `INTEL_REVID(i915)`: the PCI revision, not a runtime-info field.
+    let revid = unsafe { i915_pci_revision(i915) }.unwrap_or(0);
     GEM_BUG_ON!(table.len() > u32::MAX as usize);
     let mut found = false;
     for entry in table {
