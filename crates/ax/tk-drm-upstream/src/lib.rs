@@ -80,6 +80,7 @@ pub mod drm_encoder_types;
 pub mod drm_fb_helper_types;
 pub mod drm_file_types;
 pub mod drm_format_helper_types;
+pub mod drm_sysfb_helper_types;
 pub mod drm_fourcc_types;
 pub mod drm_framebuffer_types;
 pub mod drm_gem_atomic_helper_types;
@@ -142,6 +143,7 @@ pub mod drm_fbdev_client_upstream;
 pub mod drm_fbdev_shmem_upstream;
 pub mod drm_file_upstream;
 pub mod drm_fourcc_upstream;
+pub mod drm_format_helper_upstream;
 pub mod drm_framebuffer_upstream;
 pub mod drm_gem_upstream;
 pub mod drm_gem_atomic_helper_upstream;
@@ -167,6 +169,10 @@ pub mod drm_rect_upstream;
 pub mod drm_scdc_helper_upstream;
 pub mod drm_simple_kms_helper_types_upstream;
 pub mod drm_simple_kms_helper_upstream;
+pub mod drm_sysfb_upstream;
+pub mod drm_sysfb_modeset_upstream;
+pub mod drm_sysfb_screen_info_upstream;
+pub mod efidrm_upstream;
 pub mod drm_vblank_upstream;
 pub mod drm_vblank_helper_upstream;
 pub mod drm_vblank_work_upstream;
@@ -191,6 +197,8 @@ mod b2a_tests;
 mod b2b_tests;
 #[cfg(test)]
 mod b2e_tests;
+#[cfg(test)]
+mod sysfb_tests;
 
 /// Host-test helpers shared by the batch test modules (test drm_device setup).
 #[cfg(test)]

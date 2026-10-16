@@ -67,7 +67,7 @@ unsafe fn iosys_map_is_null(map: *const IosysMap) -> bool {
 }
 
 #[inline]
-unsafe fn iosys_map_incr(map: *mut IosysMap, bytes: usize) {
+pub(crate) unsafe fn iosys_map_incr(map: *mut IosysMap, bytes: usize) {
     unsafe {
         if (*map).is_iomem {
             (*map)._anon_0.vaddr_iomem = (*map)._anon_0.vaddr_iomem.cast::<u8>().add(bytes).cast();
