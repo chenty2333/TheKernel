@@ -178,13 +178,13 @@ fn native_modeset_requested() -> bool {
     }
 }
 
-// DPT allocation, retained initial-plane backing and complete fbdev mapping
-// services are still missing from the parent interface. Keep the user opt-in
-// fail closed until those owners are installed; B7b readout, GGTT framebuffer
-// pinning and DSB storage are present. This is not a runtime compatibility switch.
+// Every display parent service (BO, DPT, FB pin, initial plane, DSB, panic,
+// PC8) is now the translated i915 owner. The display code those services
+// unlock still references untranslated helpers, so the stack stays closed
+// until the native display path links completely.
 const NATIVE_DISPLAY_STACK_READY: bool = false;
 
-fn native_modeset_enabled() -> bool {
+pub(super) fn native_modeset_enabled() -> bool {
     native_modeset_requested() && NATIVE_DISPLAY_STACK_READY
 }
 

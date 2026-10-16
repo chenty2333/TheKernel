@@ -535,9 +535,20 @@ fn gt_uncore() -> Option<*mut IntelUncore> {
 // upstream: display/intel_display_power.c intel_display_power_get()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn intel_display_power_get(
-    _display: *mut c_void,
+    display: *mut c_void,
     domain: i32,
 ) -> *mut c_void {
+    if super::upstream_drm::native_modeset_enabled() {
+        // The display driver owns power domains; use its full translation.
+        // SAFETY: `display` is the live intel_display whose power domains
+        // intel_display_driver_probe_noirq() initialized.
+        return unsafe {
+            intel_gt::intel_display_power_upstream::intel_display_power_get(
+                display.cast(),
+                domain as _,
+            )
+        };
+    }
     assert!(
         domain == POWER_DOMAIN_GT_IRQ,
         "display power domain {domain}: the upstream GT path only takes POWER_DOMAIN_GT_IRQ"
@@ -565,11 +576,23 @@ static GT_IRQ_REFS: spin::Mutex<u32> = spin::Mutex::new(0);
 // upstream: display/intel_display_power.c __intel_display_power_put_async()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __intel_display_power_put_async(
-    _display: *mut c_void,
+    display: *mut c_void,
     domain: i32,
     wakeref: *mut c_void,
-    _delay_ms: i32,
+    delay_ms: i32,
 ) {
+    if super::upstream_drm::native_modeset_enabled() {
+        // SAFETY: see intel_display_power_get().
+        unsafe {
+            intel_gt::intel_display_power_upstream::__intel_display_power_put_async(
+                display.cast(),
+                domain as _,
+                wakeref,
+                delay_ms,
+            )
+        };
+        return;
+    }
     assert!(
         !wakeref.is_null(),
         "__intel_display_power_put_async: null wakeref"
