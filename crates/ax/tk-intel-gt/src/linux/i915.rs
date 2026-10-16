@@ -411,13 +411,11 @@ pub struct IntelRuntimeInfo {
     _tail: [u8; 3],
 }
 
-/// `HAS_POOLED_EU(i915)` from intel_device_info.h.
+/// `HAS_POOLED_EU(i915)` from i915_drv.h: `RUNTIME_INFO(i915)->has_pooled_eu`.
 #[inline]
 pub unsafe fn HAS_POOLED_EU(i915: *const DrmI915Private) -> bool {
     assert!(!i915.is_null());
-    let info = unsafe { (*i915).info.cast::<IntelDeviceInfoOverlay>() };
-    assert!(!info.is_null());
-    unsafe { (*info).runtime.has_pooled_eu }
+    unsafe { (*runtime_info(i915)).has_pooled_eu }
 }
 
 /// `intel_device_info` layout from the wt-dev Linux 7.2.3 compile oracle.

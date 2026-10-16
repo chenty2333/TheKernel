@@ -842,12 +842,8 @@ unsafe fn ppgtt_vm_or_error(
 /// `kernel_vm()` — choose full PPGTT or retain the GGTT for aliasing mode.
 // upstream: intel_gt.c kernel_vm()
 unsafe fn kernel_vm(gt: *mut IntelGt) -> Result<*mut I915AddressSpace, i32> {
-    let info = unsafe {
-        (*(*gt).i915)
-            .info
-            .cast::<crate::linux::i915::IntelDeviceInfoOverlay>()
-    };
-    if unsafe { (*info).runtime.ppgtt_type as u32 > INTEL_PPGTT_ALIASING } {
+    // INTEL_PPGTT(gt->i915) reads RUNTIME_INFO(i915)->ppgtt_type.
+    if unsafe { (*(*gt).i915).runtime.ppgtt_type as u32 > INTEL_PPGTT_ALIASING } {
         unsafe {
             ppgtt_vm_or_error(i915_ppgtt_create(
                 gt,

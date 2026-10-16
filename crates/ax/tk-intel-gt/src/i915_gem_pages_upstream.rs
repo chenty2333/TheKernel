@@ -36,7 +36,7 @@ use crate::{
     intel_gt_types_upstream::IntelGt,
     linux::{
         gem_memory::PgProt,
-        i915::{IS_DGFX, IntelDeviceInfoOverlay},
+        i915::IS_DGFX,
         i915_private::DrmI915Private,
         iosys_map::IosysMap,
         locks::*,
@@ -492,9 +492,7 @@ unsafe fn i915_gem_object_get_sg_dma(
 pub unsafe extern "C" fn __i915_gem_object_set_pages(obj: *mut DrmI915GemObject, pages: *mut SgTable) {
     unsafe {
         let i915 = crate::linux::i915::to_i915((*gem_base(obj)).dev);
-        let supported = (*(*i915).info.cast::<IntelDeviceInfoOverlay>())
-            .runtime
-            .page_sizes as c_ulong;
+        let supported = (*i915).runtime.page_sizes as c_ulong;
         let mut shrinkable;
         assert_object_held_shared(obj);
         if ((*obj).flags & I915_BO_ALLOC_VOLATILE != 0) {
@@ -522,11 +520,7 @@ pub unsafe extern "C" fn __i915_gem_object_set_pages(obj: *mut DrmI915GemObject,
             }
         }
         assert!(
-            ((*(*i915).info.cast::<IntelDeviceInfoOverlay>())
-                .runtime
-                .page_sizes
-                & (*obj).mm.page_sizes.sg)
-                == (*obj).mm.page_sizes.sg
+            ((*i915).runtime.page_sizes & (*obj).mm.page_sizes.sg) == (*obj).mm.page_sizes.sg
         );
         shrinkable = (*(*obj).ops).flags & I915_GEM_OBJECT_IS_SHRINKABLE != 0;
         if unsafe { crate::linux::fields::i915_gem_object_is_tiled(obj) }

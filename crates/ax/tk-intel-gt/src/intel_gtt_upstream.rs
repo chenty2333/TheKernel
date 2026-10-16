@@ -128,8 +128,8 @@ unsafe fn gem_base(obj: *mut DrmI915GemObject) -> *mut DrmGemObjectBaseLayout {
 #[inline]
 unsafe fn vm_has_page_sizes(i915: *mut DrmI915Private, sizes: u64) -> bool {
     GEM_BUG_ON!(sizes == 0);
-    let info = unsafe { crate::linux::i915::INTEL_INFO(i915) };
-    !info.is_null() && unsafe { (*info).runtime.page_sizes & sizes as u32 == sizes as u32 }
+    // HAS_PAGE_SIZES() reads RUNTIME_INFO(i915)->page_sizes.
+    unsafe { (*i915).runtime.page_sizes & sizes as u32 == sizes as u32 }
 }
 
 #[inline]

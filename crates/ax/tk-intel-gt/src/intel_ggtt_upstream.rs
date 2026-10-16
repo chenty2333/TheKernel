@@ -142,8 +142,8 @@ unsafe fn intel_ppgtt_type(i915: *mut DrmI915Private) -> i32 {
             .info
             .cast::<crate::linux::i915::IntelDeviceInfoOverlay>()
     };
-    assert!(!info.is_null());
-    unsafe { (*info).runtime.ppgtt_type }
+    // INTEL_PPGTT(i915) reads RUNTIME_INFO(i915)->ppgtt_type.
+    unsafe { (*i915).runtime.ppgtt_type }
 }
 
 pub(crate) unsafe fn has_ppgtt(i915: *mut DrmI915Private) -> bool {
@@ -1610,12 +1610,7 @@ pub unsafe extern "C" fn i915_init_ggtt(i915: *mut DrmI915Private) -> c_int {
     if ret != 0 {
         return ret;
     }
-    let info = unsafe {
-        (*i915)
-            .info
-            .cast::<crate::linux::i915::IntelDeviceInfoOverlay>()
-    };
-    if unsafe { (*info).runtime.ppgtt_type == INTEL_PPGTT_ALIASING } {
+    if unsafe { (*i915).runtime.ppgtt_type == INTEL_PPGTT_ALIASING } {
         ret = unsafe { init_aliasing_ppgtt(ggtt) };
         if ret != 0 {
             unsafe {
