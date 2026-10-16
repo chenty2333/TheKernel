@@ -32,12 +32,8 @@ use tk_linux_kapi::{
     wait::{add_wait_queue, remove_wait_queue},
 };
 
-use super::dri::{
-    DRM_PRIMARY_NODE_MODE, DRM_RENDER_NODE_MODE, attach_drm_minor, attribute, mode_attribute,
-    platform_registration, publish_pci_parent,
-};
 use crate::{
-    drm::{Mode, upstream::UpstreamDrmDevice},
+    drm::upstream::UpstreamDrmDevice,
     file::{
         FileLike, FileMmapProtection, FileMmapRequest, FileMmapSharing, FixedSharedMmapRegion,
         IoDst, IoSrc, IoctlContext, Kstat, OfdIoStatus, PreparedFileMmap, SharedMmapOps,
@@ -46,14 +42,19 @@ use crate::{
     pseudofs::{
         DeviceOpen, DeviceOps,
         device_registry::{
-            DeviceHandle, DeviceIdentity, DeviceRegistration, MAX_DEVICES,
-            global_device_registry,
+            DeviceAttribute, DeviceHandle, DeviceIdentity, DeviceRegistration, DeviceReservation,
+            MAX_DEVICES, global_device_registry,
         },
     },
     readiness::block_on_poll_io,
 };
 
 const PAGE_SIZE: usize = 4096;
+pub(crate) const DRM_PRIMARY_NODE_MODE: u16 = 0o600;
+// udev grants the conventional render group after userspace starts; before
+// that, do not expose a world-writable GPU node.
+pub(crate) const DRM_RENDER_NODE_MODE: u16 = 0o600;
+
 const EFAULT: i32 = 14;
 const ENODEV: i32 = 19;
 const EPOLLIN: u32 = 0x0001;
@@ -243,6 +244,105 @@ fn connectors(device: &UpstreamDrmDevice) -> Vec<(alloc::string::String, bool)> 
     found
 }
 
+pub(super) fn attribute(name: &str, value: &'static str) -> DeviceAttribute {
+    DeviceAttribute::try_new(name.into(), move || Ok(value)).expect("static DRM sysfs attribute")
+}
+
+pub(super) fn mode_attribute(width: u32, height: u32) -> DeviceAttribute {
+    DeviceAttribute::try_new("modes".into(), move || Ok(alloc::format!("{width}x{height}\n")))
+    .expect("static DRM sysfs mode attribute")
+}
+
+// libdrm resolves the DRM node's physical device (skipping a real virtio
+// transport when present), then reads PCI_SLOT_NAME and these PCI attributes.
+pub(super) fn pci_registrations(
+    identity: axdriver_display::DisplayPciIdentity,
+) -> VfsResult<Vec<Arc<DeviceRegistration>>> {
+    let root = alloc::format!("pci0000:{:02x}", identity.bus);
+    let bdf = alloc::format!(
+        "0000:{:02x}:{:02x}.{}",
+        identity.bus,
+        identity.device,
+        identity.function
+    );
+    let virtio = alloc::format!(
+        "virtio{}",
+        ((identity.bus as u32) << 8) | ((identity.device as u32) << 3) | identity.function as u32
+    );
+    let hex = |name: &str, value: u16| {
+        DeviceAttribute::try_new(name.into(), move || Ok(alloc::format!("0x{value:04x}\n")))
+            .expect("PCI attribute")
+    };
+    let pci = DeviceRegistration::try_bus_device(
+        DeviceIdentity::without_dev(root.clone(), "pci".into(), bdf.clone())?,
+        "pci_device".into(),
+        vec![
+            hex("vendor", identity.vendor_id),
+            hex("device", identity.device_id),
+            hex("subsystem_vendor", identity.subsystem_vendor),
+            hex("subsystem_device", identity.subsystem_device),
+            hex("revision", identity.revision as u16),
+        ],
+        "pci".into(),
+        false,
+    )?;
+    // Native PCI GPUs are not VirtIO devices. In particular, an Intel render
+    // node must not publish a fabricated virtio modalias/parent to udev.
+    if identity.vendor_id != 0x1af4 {
+        return Ok(vec![pci]);
+    }
+    let transport = DeviceRegistration::try_bus_device(
+        DeviceIdentity::without_dev(root.clone(), "virtio".into(), virtio)?
+            .child_of_path(root, bdf)?,
+        "virtio_device".into(),
+        vec![attribute("modalias", "virtio:d00000010v00001AF4\n")],
+        "virtio".into(),
+        true,
+    )?;
+    Ok(vec![pci, transport])
+}
+
+pub(super) fn platform_registration(name: &str) -> VfsResult<Arc<DeviceRegistration>> {
+    DeviceRegistration::try_bus_device(
+        DeviceIdentity::without_dev("platform".into(), "platform".into(), name.into())?,
+        "platform_device".into(),
+        Vec::new(),
+        "platform".into(),
+        false,
+    )
+}
+
+pub(super) fn publish_pci_parent(
+    identity: axdriver_display::DisplayPciIdentity,
+    parents: &mut Vec<DeviceHandle<'static, MAX_DEVICES>>,
+) -> VfsResult<alloc::string::String> {
+    let mut registrations = pci_registrations(identity)?.into_iter();
+    let pci = registrations.next().expect("PCI registration");
+    let path = alloc::format!("{}/{}", pci.identity().bus, pci.identity().name);
+    let pci_reservation = global_device_registry().reserve(pci.identity().clone())?;
+    if let Some(virtio) = registrations.next() {
+        let name = virtio.identity().name.clone();
+        let virtio_reservation = global_device_registry().reserve(virtio.identity().clone())?;
+        let (pci, virtio) =
+            DeviceReservation::publish_pair(pci_reservation, pci, virtio_reservation, virtio)?;
+        parents.extend([pci, virtio]);
+        Ok(alloc::format!("{path}/{name}"))
+    } else {
+        parents.push(pci_reservation.publish(pci)?);
+        Ok(path)
+    }
+}
+
+pub(super) fn attach_drm_minor(
+    identity: DeviceIdentity,
+    transport: &Option<alloc::string::String>,
+) -> VfsResult<DeviceIdentity> {
+    match transport {
+        Some(path) => identity.child_of_path(path.clone(), "drm".into()),
+        None => Ok(identity),
+    }
+}
+
 fn publish_sysfs(device: &UpstreamDrmDevice) -> VfsResult<Vec<DeviceHandle<'static, MAX_DEVICES>>> {
     let mut parents = Vec::new();
     let label = device.label();
@@ -280,11 +380,7 @@ fn publish_sysfs(device: &UpstreamDrmDevice) -> VfsResult<Vec<DeviceHandle<'stat
             if connected { "connected\n" } else { "disconnected\n" },
         )];
         if index == 0 && device.mode() != (0, 0) {
-            attributes.push(mode_attribute(Mode {
-                width: device.mode().0,
-                height: device.mode().1,
-                refresh_millihz: 60_000,
-            }));
+            attributes.push(mode_attribute(device.mode().0, device.mode().1));
         }
         registrations.push(DeviceRegistration::try_new(
             DeviceIdentity::without_dev(label.into(), "drm".into(), format!("{card_name}-{name}"))?
