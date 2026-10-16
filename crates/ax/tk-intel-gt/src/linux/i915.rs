@@ -483,18 +483,18 @@ pub unsafe fn HAS_64BIT_RELOC<P: I915PrivatePtr>(i915: P) -> bool {
     !info.is_null() && (unsafe { (*info).flags[0] } & (1 << 3)) != 0
 }
 
-/// `HAS_FLAT_CCS(i915)` from i915_drv.h; source flag bit 9.
+/// `HAS_FLAT_CCS(i915)` from i915_drv.h; device-info flag bit 8.
 #[allow(non_snake_case)]
 pub unsafe fn HAS_FLAT_CCS<P: I915PrivatePtr>(i915: P) -> bool {
     let info = INTEL_INFO(i915);
-    !info.is_null() && ((*info).flags[1] & (1 << 1)) != 0
+    !info.is_null() && ((*info).flags[1] & 1) != 0
 }
 
-/// `HAS_3D_PIPELINE(i915)` from i915_drv.h, device-info flag bit 8.
+/// `HAS_3D_PIPELINE(i915)` from i915_drv.h, device-info flag bit 7.
 #[allow(non_snake_case)]
 pub unsafe fn HAS_3D_PIPELINE<P: I915PrivatePtr>(i915: P) -> bool {
     let info = unsafe { INTEL_INFO(i915) };
-    !info.is_null() && (unsafe { (*info).flags[1] } & 1) != 0
+    !info.is_null() && (unsafe { (*info).flags[0] } & (1 << 7)) != 0
 }
 
 const _: [(); 36] = [(); size_of::<IntelRuntimeInfo>()];

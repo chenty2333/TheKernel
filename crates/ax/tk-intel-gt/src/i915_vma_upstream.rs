@@ -561,7 +561,7 @@ unsafe fn dma_resv_of_object(obj: *mut DrmI915GemObject) -> *mut DmaResv {
 #[inline]
 unsafe fn has_64k_pages(i915: *mut DrmI915Private) -> bool {
     let info = unsafe { INTEL_INFO(i915) };
-    !info.is_null() && unsafe { (*info).flags[1] & (1 << 1) != 0 }
+    !info.is_null() && unsafe { (*info).flags[0] & (1 << 4) != 0 }
 }
 
 #[inline]
