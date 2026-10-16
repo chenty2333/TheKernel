@@ -491,7 +491,8 @@ pub unsafe fn shmem_sg_alloc_table(
             (*sg_layout(sg)).length = (*sg_layout(sg)).length.wrapping_add(append_len);
         }
         next_pfn = folio_pfn(folio).wrapping_add(nr_pages);
-        i = i.wrapping_add(nr_pages.wrapping_sub(1));
+        // Linux: `i += nr_pages - 1` in the body plus the for-loop's `i++`.
+        i += nr_pages;
 
         // Check that the i965g/gm workaround works.
         GEM_BUG_ON!(gfp & __GFP_DMA32 != 0 && next_pfn >= 0x0010_0000);
@@ -1046,4 +1047,47 @@ pub unsafe fn i915_gem_shmem_setup(
 // upstream: i915_gem_shmem.c i915_gem_object_is_shmem()
 pub unsafe fn i915_gem_object_is_shmem(obj: *const DrmI915GemObject) -> bool {
     (*obj).ops == ptr::addr_of!(i915_gem_shmem_ops)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::mpsc, thread, time::Duration};
+
+    /// A three-page object must yield three pages and return. The for-loop
+    /// translation once dropped `i++`, so a single-page folio never advanced
+    /// past index 0 and N305 spun in this function pinning a context image.
+    #[test]
+    fn sg_alloc_table_advances_past_each_folio() {
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || unsafe {
+            let size = 3 * PAGE_SIZE;
+            let file = shmem_file_setup(c"sg-advance".as_ptr(), size as u64, 0);
+            assert!(!IS_ERR(file));
+            let mut region: IntelMemoryRegion = core::mem::zeroed();
+            region.region = Resource { start: 0, end: u64::MAX >> 1, ..core::mem::zeroed() };
+            let mut st: SgTable = core::mem::zeroed();
+            let ret = shmem_sg_alloc_table(
+                ptr::null_mut(),
+                &mut st,
+                size,
+                &mut region,
+                (*file).f_mapping,
+                u32::MAX & !(PAGE_SIZE as u32 - 1),
+            );
+            let mut pages = 0usize;
+            if ret == 0 {
+                let mut iter = sgt_iter_init((*sgt_layout(&mut st)).sgl);
+                while !sgt_iter_next_page(&mut iter).is_null() {
+                    pages += 1;
+                }
+            }
+            done.send((ret, pages)).unwrap();
+        });
+        let (ret, pages) = finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shmem_sg_alloc_table did not return");
+        assert_eq!(ret, 0);
+        assert_eq!(pages, 3);
+    }
 }
