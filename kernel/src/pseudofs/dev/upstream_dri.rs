@@ -462,13 +462,6 @@ struct UpstreamDrmFile {
     raw: UnsafeCell<LinuxFile>,
     inode: UnsafeCell<OpenInode>,
     wait_entry: UnsafeCell<WaitQueueEntry>,
-    /// Kernel-side file state for GEM/syncobj aliases. It is initialized by
-    /// `open()` before this object is published through `Arc<dyn FileLike>` and
-    /// remains immutable until `Drop` has completed the Linux DRM release.
-    native_shadow: Option<crate::drm::DrmFile>,
-    /// Associates the V1-owned Linux `drm_file` with `native_shadow` without
-    /// allocating a second C file or running driver open/close twice.
-    native_binding: Option<crate::drm::intel::upstream_file::V1FileBinding>,
     waiters: Arc<PollSet>,
     nonblocking: AtomicBool,
     access_mode: u32,
@@ -498,8 +491,6 @@ impl UpstreamDrmFile {
             // SAFETY: An all-zero byte pattern is valid initialization for `WaitQueueEntry`,
             // which is explicitly reinitialized with `INIT_LIST_HEAD` before use in `open()`.
             wait_entry: UnsafeCell::new(unsafe { core::mem::zeroed() }),
-            native_shadow: None,
-            native_binding: None,
             waiters: Arc::new(PollSet::new()),
             nonblocking: AtomicBool::new(flags & O_NONBLOCK != 0),
             access_mode: flags & O_ACCMODE,
@@ -558,43 +549,6 @@ impl UpstreamDrmFile {
             unsafe { tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), self.raw()) };
             return Err(AxError::NoSuchDevice);
         }
-        // A legacy-core device exists only while the i915 V1 bridge needs a
-        // kernel-side GEM/syncobj alias table; upstream-only devices dispatch
-        // straight to drm_ioctl().
-        if let Some(native_device) = crate::drm::primary_device() {
-            // Use a non-master shadow file for both DRM node kinds: the upstream
-            // Linux file remains authoritative for DRM mastership, while this
-            // kernel file owns only GEM and syncobj identity aliases.
-            let native = match native_device.open_render() {
-                Ok(native) => native,
-                Err(error) => {
-                    // SAFETY: `self.raw()` points to our valid open `LinuxFile`. Calling `drm_release`
-                    // performs necessary driver cleanup before aborting `open`.
-                    unsafe {
-                        tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), self.raw())
-                    };
-                    return Err(AxError::from(error));
-                }
-            };
-            // SAFETY: `self.raw()` points to our valid `LinuxFile` whose `f_flags` are initialized
-            // during `new()` and modified only under `flags_lock`.
-            native.set_open_flags(unsafe { (*self.raw()).f_flags });
-            let binding = match crate::drm::intel::upstream_file::V1FileBinding::register(
-                private.cast(),
-            ) {
-                Ok(binding) => binding,
-                Err(error) => {
-                    // SAFETY: `self.raw()` points to our valid open `LinuxFile`. Rolling back with
-                    // `drm_release` frees the DRM file context upon shadow registration failure.
-                    unsafe {
-                        tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), self.raw())
-                    };
-                    return Err(error);
-                }
-            };
-            self.native_shadow = Some(native);
-            self.native_binding = Some(binding);
-        }
         let entry = self.wait_entry.get();
         // SAFETY: `entry` is pinned by `UpstreamDrmFile`'s allocation, `self.waiters` is a valid
         // `Arc<PollSet>` whose raw pointer remains valid until drop, and `private` was validated
@@ -639,22 +593,6 @@ impl UpstreamDrmFile {
         let mask = unsafe { tk_drm_upstream::drm_file_upstream::drm_poll(self.raw(), ptr::null_mut()) };
         linux_poll_events(mask)
     }
-
-    fn with_native_binding<T>(
-        &self,
-        call: impl FnOnce(&crate::drm::DrmFile) -> AxResult<T>,
-    ) -> AxResult<T> {
-        let native = self
-            .native_shadow
-            .as_ref()
-            .ok_or(AxError::NoSuchDevice)?;
-        let binding = self
-            .native_binding
-            .as_ref()
-            .ok_or(AxError::NoSuchDevice)?;
-        let _active = binding.bind(native)?;
-        call(native)
-    }
 }
 
 impl Drop for UpstreamDrmFile {
@@ -671,28 +609,9 @@ impl Drop for UpstreamDrmFile {
                     &mut *ptr::addr_of_mut!((*private).event_wait),
                     &mut *self.wait_entry.get(),
                 );
-                if let (Some(native), Some(binding)) =
-                    (self.native_shadow.as_ref(), self.native_binding.as_ref())
-                {
-                    let active = binding.bind(native);
-                    if active.is_ok() {
-                        tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), raw);
-                        drop(active);
-                    } else {
-                        // Preserve the Linux close lifecycle even if alias
-                        // registration was unexpectedly lost; release remains
-                        // owned by this VFS OFD and must not be skipped.
-                        tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), raw);
-                    }
-                } else {
-                    tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), raw);
-                }
+                tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), raw);
             }
         }
-        // The C file has now completed postclose and all GEM/syncobj release
-        // callbacks. Unregister its backpointer before the shadow file drops.
-        self.native_binding.take();
-        self.native_shadow.take();
         self.waiters.close();
     }
 }
@@ -800,11 +719,7 @@ impl FileLike for UpstreamDrmFile {
                 Ok(result as usize)
             }
         };
-        if self.native_shadow.is_some() {
-            self.with_native_binding(|_| call())
-        } else {
-            call()
-        }
+        call()
     }
 
     fn prepare_mmap(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
@@ -818,9 +733,6 @@ impl FileLike for UpstreamDrmFile {
     fn set_nonblocking(&self, nonblocking: bool) -> AxResult<()> {
         let _guard = self.flags_lock.lock();
         self.nonblocking.store(nonblocking, Ordering::Release);
-        if let Some(native) = self.native_shadow.as_ref() {
-            native.set_nonblocking_flag(nonblocking);
-        }
         // SAFETY: `self.raw()` points to this instance's `LinuxFile`. Mutating `f_flags` is synchronized
         // by `self.flags_lock`, ensuring no concurrent data races with other flag modifications.
         unsafe {

@@ -185,9 +185,9 @@ struct KernelSeatHooks;
 
 impl SeatHooks for KernelSeatHooks {
     fn prepare_release(&mut self, _from: SeatTarget) -> AxResult<()> {
-        // Close the KMS admission gate first.  It linearizes with atomic
-        // enqueue, then error-completes queued submissions.
-        crate::drm::suspend_primary_kms_for_seat();
+        // No KMS admission gate exists on the upstream DRM core yet, so there is
+        // nothing to close here. The Linux equivalent is fbdev suspension
+        // (drm_fb_helper_set_suspend) plus DRM master drop; neither is wired.
         Ok(())
     }
 
@@ -217,9 +217,8 @@ impl SeatHooks for KernelSeatHooks {
     }
 
     fn acquire(&mut self, target: SeatTarget) -> AxResult<()> {
-        // The graphics client gets master through its normal primary-node
-        // SET_MASTER after this gate opens.  Render nodes remain independent.
-        crate::drm::resume_primary_kms_for_seat();
+        // No KMS admission gate exists on the upstream DRM core; the graphics
+        // client's SET_MASTER is governed by the upstream core alone.
         #[cfg(feature = "input")]
         crate::pseudofs::dev::event::resume_input_devices();
         if matches!(target, SeatTarget::Fbcon) {
@@ -231,8 +230,8 @@ impl SeatHooks for KernelSeatHooks {
 
     fn abort(&mut self, _target: SeatTarget) {
         // Every abort lands on the known-good text console.  The operations
-        // are idempotent for owner exit, hot unplug and seatd restart.
-        crate::drm::resume_primary_kms_for_seat();
+        // are idempotent for owner exit, hot unplug and seatd restart. No KMS
+        // gate exists on the upstream core, so there is nothing to reopen.
         #[cfg(feature = "input")]
         crate::pseudofs::dev::event::resume_input_devices();
         super::super::fb::vt_graphics_changed(false);

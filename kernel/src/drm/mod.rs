@@ -46,7 +46,6 @@ pub use device::{
 };
 pub use fbdev::DrmFbdev;
 pub(crate) use fbdev::drm_scanout;
-pub(crate) use fence::metrics as fence_metrics;
 pub use file::{DrmEvent, DrmFile, OpenId};
 pub use gem::{DumbBuffer, DumbRequest, GemBacking, GemHandle, MmapOffset};
 pub(crate) use gem::GemMemoryCharge;
@@ -147,20 +146,5 @@ impl upstream::UpstreamGemMmapProvider for VirtioGpuOwner {
         // SAFETY: upstream_gem_mmap resolves and pins the object from the same
         // DRM device before asking this provider to map it.
         unsafe { self._driver.map_blob_gem_object_if_mappable(object) }
-    }
-}
-
-/// Seat/session hooks used by the VT and logind control path.  They operate
-/// on the single supported primary GPU and intentionally do not affect the
-/// render node's render-group authorization.
-pub(crate) fn suspend_primary_kms_for_seat() {
-    if let Some(device) = primary_device() {
-        device.suspend_kms_for_seat();
-    }
-}
-
-pub(crate) fn resume_primary_kms_for_seat() {
-    if let Some(device) = primary_device() {
-        device.resume_kms_for_seat();
     }
 }
