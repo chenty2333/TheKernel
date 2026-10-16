@@ -842,6 +842,7 @@ fn delete_file_handle(file: *mut gem::DrmFile, native: &DrmFile, handle: u32) ->
 
 #[cfg(test)]
 mod tests {
+    use intel_gt::linux::gem::DrmGemObject;
     use super::{
         AxError, BTreeSet, FILES, FileBinding, NativeFileBinding, ioctl_copies_from_user,
         ioctl_copies_to_user, native_file, V1FileBinding,

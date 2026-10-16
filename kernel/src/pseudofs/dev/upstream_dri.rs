@@ -12,7 +12,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs_ng_vfs::{DeviceId, Location, NodeFlags, VfsResult};
+use axfs_ng_vfs::{DeviceId, Location, NodeFlags, VfsError, VfsResult};
 use axio::prelude::*;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable};
 use kspin::SpinNoIrq;
@@ -93,6 +93,85 @@ pub(crate) fn render_node(
         Ok(Some(node(fs, device, true, Vec::new())))
     } else {
         Ok(None)
+    }
+}
+
+/// `/dev/dri` as a live directory: one `card<N>` and one `renderD<N>` entry per
+/// device on the upstream list at lookup time. A device can publish after devfs
+/// has mounted (i915 probes from the rootfs-ready callback), so the directory
+/// is never a snapshot. Each name's node is created once and reused, because
+/// `primary_node()` publishes the device's sysfs identity.
+pub(crate) struct DriDirectory {
+    fs: Arc<crate::pseudofs::SimpleFs>,
+    /// name -> (raw `drm_device` the node serves, node).
+    nodes: axsync::Mutex<alloc::collections::BTreeMap<Vec<u8>, (usize, crate::pseudofs::NodeOpsMux)>>,
+}
+
+impl DriDirectory {
+    pub(crate) fn new(fs: Arc<crate::pseudofs::SimpleFs>) -> Self {
+        Self {
+            fs,
+            nodes: axsync::Mutex::new(alloc::collections::BTreeMap::new()),
+        }
+    }
+}
+
+/// Parses `card<N>` (primary) or `renderD<N>` (render) into `(render, index)`.
+fn parse_dri_name(name: &[u8]) -> Option<(bool, u32)> {
+    let (render, digits) = if let Some(rest) = name.strip_prefix(b"renderD") {
+        (true, rest)
+    } else {
+        (false, name.strip_prefix(b"card")?)
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    core::str::from_utf8(digits).ok()?.parse().ok().map(|index| (render, index))
+}
+
+impl crate::pseudofs::SimpleDirOps for DriDirectory {
+    fn child_names<'a>(&'a self) -> VfsResult<crate::pseudofs::ChildNames<'a>> {
+        let mut names: Vec<Cow<'a, axfs_ng_vfs::FsName>> = Vec::new();
+        for device in crate::drm::upstream::devices() {
+            for (render, index) in [(false, device.primary_index()), (true, device.render_index())] {
+                if let Some(index) = index {
+                    let name = if render { format!("renderD{index}") } else { format!("card{index}") };
+                    let name = axfs_ng_vfs::FsNameBuf::from_vec(name.into_bytes())
+                        .expect("DRM node names are valid pseudo-filesystem names");
+                    names.push(Cow::Owned(name));
+                }
+            }
+        }
+        crate::pseudofs::try_boxed_names(names.into_iter())
+    }
+
+    fn lookup_child(&self, name: &axfs_ng_vfs::FsName) -> VfsResult<crate::pseudofs::NodeOpsMux> {
+        let (render, index) = parse_dri_name(name.as_bytes()).ok_or(VfsError::NotFound)?;
+        let device = crate::drm::upstream::devices()
+            .into_iter()
+            .find(|device| {
+                let minor = if render { device.render_index() } else { device.primary_index() };
+                minor == Some(index)
+            })
+            .ok_or(VfsError::NotFound)?;
+        let raw = device.raw() as usize;
+        let mut nodes = self.nodes.lock();
+        if let Some((cached, node)) = nodes.get(name.as_bytes()) {
+            if *cached == raw {
+                return Ok(node.clone());
+            }
+        }
+        let node: crate::pseudofs::NodeOpsMux = if render {
+            render_node(self.fs.clone(), device)?.ok_or(VfsError::NotFound)?.into()
+        } else {
+            primary_node(self.fs.clone(), device)?.into()
+        };
+        nodes.insert(name.as_bytes().to_vec(), (raw, node.clone()));
+        Ok(node)
+    }
+
+    fn is_cacheable(&self) -> bool {
+        false
     }
 }
 

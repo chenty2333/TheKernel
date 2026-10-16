@@ -148,11 +148,6 @@ fn mapped_windows() -> alloc::vec::Vec<(pci::Bdf, RegisterWindow)> {
         .collect()
 }
 
-/// Whether the boot probe mapped an Intel display device's registers.
-pub(crate) fn has_display_device() -> bool {
-    !mapped_windows().is_empty()
-}
-
 /// The boot report as text: the probe, then each GPU's GT bring-up.
 pub(crate) fn report_text() -> String {
     let mut text = match &*REPORT.lock() {

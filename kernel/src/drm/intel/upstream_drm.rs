@@ -20,14 +20,13 @@
 
 use intel_gt::linux::gem::DrmGemObject;
 use core::{
-    ffi::{c_char, c_int, c_ulong, c_void},
+    ffi::{c_char, c_int, c_void},
     mem::{offset_of, size_of},
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
+    sync::atomic::{AtomicPtr, Ordering},
 };
 
 use intel_gt::{
-    i915_driver_upstream::{DrmDriverDesc, i915_drm_driver},
     i915_gem_context_types_upstream::DrmI915Private,
     i915_probe_provider_upstream::{
         I915FrameworkOps, I915ProbeOps, install_i915_framework_ops, install_i915_probe_ops,
@@ -35,9 +34,8 @@ use intel_gt::{
     intel_context_upstream::{DmaFence, Kref},
     linux::{
         drm_core::{DrmCoreProvider, install_drm_core_provider},
-        shmem,
     },
-    linux_i915_private::{DrmDevice, DrmVmaOffsetManager, Inode, initialize_drm_device},
+    linux_i915_private::{DrmDevice, DrmVmaOffsetManager},
 };
 
 #[cfg(target_os = "none")]
@@ -56,7 +54,6 @@ unsafe extern "C" {
     /// Linux `kmalloc()`, exported under its C name by `tk-intel-gt`.
     fn kmalloc(size: usize, flags: u32) -> *mut c_void;
     fn kfree(object: *mut c_void);
-    fn drm_mm_init(mm: *mut tk_linux_kapi::types::DrmMm, start: u64, size: u64);
     fn drm_vma_offset_remove(
         manager: *mut DrmVmaOffsetManager,
         node: *mut intel_gt::intel_context_upstream::DrmVmaOffsetNode,
@@ -75,48 +72,6 @@ unsafe extern "C" {
 #[inline]
 fn err_ptr(errno: c_int) -> *mut c_void {
     (errno as isize) as *mut c_void
-}
-
-// ---------------------------------------------------------------------------
-// DRM device binding
-// ---------------------------------------------------------------------------
-
-/// The upstream `drm_device` attached to the kernel's native Intel DRM device.
-/// TheKernel registers one primary device (`crate::drm::primary_device`); the
-/// upstream i915 shares its file dispatcher and is never a second KMS device.
-/// GT registration may precede primary KMS registration (including fallback).
-static BOUND_DRM: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
-/// Set by `drm_dev_unplug()`. `drm_dev_enter()` then reports the device gone.
-static UNPLUGGED: AtomicBool = AtomicBool::new(false);
-
-/// `drm_dev_register()`: bind the upstream device to the native primary device.
-/// The ioctl dispatch stays with the native device; this makes the upstream
-/// `drm_device` identity known to the DRM core callbacks.
-unsafe extern "C" fn drm_dev_register(dev: *mut c_void, _flags: c_ulong) -> c_int {
-    if dev.is_null() {
-        return -EINVAL;
-    }
-    // GT registration is independent of KMS takeover. A failed native
-    // fastboot may leave the firmware KMS primary to be registered later;
-    // neither that ordering nor a headless machine invalidates this GT.
-    match BOUND_DRM.compare_exchange(ptr::null_mut(), dev, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => {
-            UNPLUGGED.store(false, Ordering::Release);
-            0
-        }
-        Err(existing) if existing == dev => 0,
-        Err(_) => -EBUSY,
-    }
-}
-
-/// `drm_dev_unregister()`: detach the upstream device from the native device.
-unsafe extern "C" fn drm_dev_unregister(dev: *mut c_void) {
-    let _ = BOUND_DRM.compare_exchange(dev, ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire);
-}
-
-/// `drm_dev_unplug()`: the device is gone for new `drm_dev_enter()` callers.
-unsafe extern "C" fn drm_dev_unplug(_dev: *mut c_void) {
-    UNPLUGGED.store(true, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------
@@ -526,96 +481,6 @@ unsafe extern "C" fn modparam_force_probe() -> *const c_char {
     EMPTY_FORCE_PROBE.as_ptr().cast()
 }
 
-/// The DRM device and its GEM resources have one kernel-lifetime owner, just
-/// like the native PCI identity. The inode is the upstream-layout view; its
-/// mapping is owned by the existing LinuxKPI anonymous file, not an opaque
-/// token. The VMA manager uses the same drm_mm allocator as GEM mmap offsets.
-#[repr(C)]
-struct I915Allocation {
-    i915: DrmI915Private,
-    inode: Inode,
-    vma: DrmVmaOffsetManager,
-    driver: DrmDriverDesc,
-    mapping_file: *mut shmem::File,
-}
-
-const DRM_FILE_PAGE_OFFSET_START: u64 = (u32::MAX as u64 >> 12) + 1;
-const DRM_FILE_PAGE_OFFSET_SIZE: u64 = (u32::MAX as u64 >> 12) * 256;
-
-/// Native `devm_drm_dev_alloc()` + the GEM portion of `drm_dev_init()`.
-/// Zeroing i915 alone is insufficient: early TTM init dereferences the DRM
-/// anonymous inode, and subsequent GEM users need a live mmap-offset manager.
-unsafe extern "C" fn devm_drm_dev_alloc_i915(
-    pdev: *mut c_void,
-    err: *mut c_int,
-) -> *mut DrmI915Private {
-    if !err.is_null() {
-        // SAFETY: the DRM allocation callback contract supplies `err` as NULL
-        // or a writable errno slot; this branch checks the nullable case.
-        unsafe { *err = -ENOMEM };
-    }
-    if pdev.is_null() {
-        if !err.is_null() {
-            // SAFETY: as above, a non-null `err` is the caller's writable
-            // errno slot and is checked before storing.
-            unsafe { *err = -EINVAL };
-        }
-        return ptr::null_mut();
-    }
-    let size = size_of::<I915Allocation>();
-    // SAFETY: `kmalloc` with `__GFP_ZERO` returns `size` zeroed bytes or NULL;
-    // the cast is to the allocation's own type.
-    let allocation = unsafe { kmalloc(size, GFP_KERNEL | GFP_ZERO) }.cast::<I915Allocation>();
-    if allocation.is_null() {
-        return ptr::null_mut();
-    }
-    // Reuse the real page-cache owner. This file is retained with the device;
-    // no pages are allocated until requested through its mapping.
-    // SAFETY: the name is a static NUL-terminated string and the LinuxKPI
-    // shmem helper accepts a zero-sized file to be grown on later faults.
-    let file = unsafe { shmem::shmem_file_setup(c"drm".as_ptr(), 0, 0) };
-    if tk_linux_kapi::config::IS_ERR(file) {
-        if !err.is_null() {
-            // SAFETY: a non-null `err` is the writable errno slot supplied to
-            // this allocator callback, checked above before storing here.
-            unsafe { *err = file as isize as c_int };
-        }
-        // SAFETY: `allocation` is still our live, unshared kmalloc block; the
-        // failed shmem setup did not take ownership of it.
-        unsafe { kfree(allocation.cast()) };
-        return ptr::null_mut();
-    }
-    // SAFETY: `pdev` is the live PCI device supplied by i915's allocator
-    // callback. All resources are exclusively owned and initialized in their
-    // final addresses (drm_mm contains self-linked sentinels). Publish them
-    // only after their owners exist; no GT hardware is accessed here.
-    unsafe {
-        ptr::write(ptr::addr_of_mut!((*allocation).driver), i915_drm_driver());
-        (*allocation).mapping_file = file;
-        (*allocation).inode.i_mapping = (*file).f_mapping.cast();
-        let manager = ptr::addr_of_mut!((*allocation).vma);
-        drm_mm_init(
-            ptr::addr_of_mut!((*manager).vm_addr_space_mm),
-            DRM_FILE_PAGE_OFFSET_START,
-            DRM_FILE_PAGE_OFFSET_SIZE,
-        );
-        initialize_drm_device(
-            &mut (*allocation).i915.drm,
-            pdev,
-            ptr::addr_of_mut!((*allocation).driver).cast(),
-            ptr::addr_of_mut!((*allocation).inode),
-            manager,
-        );
-        if !err.is_null() {
-            *err = 0;
-        }
-    }
-    // The GT_IRQ power reference reaches the device's uncore before the probe
-    // has registered it, from inside `i915_pci_probe()`.
-    upstream_gt::note_allocated_device(allocation.cast());
-    allocation.cast()
-}
-
 /// Field-for-field view of `struct i915_params` (`i915_params.h`). The owning
 /// module is private to `tk-intel-gt`, so the layout is named here.
 #[repr(C)]
@@ -750,9 +615,6 @@ static FRAMEWORK: I915FrameworkOps = I915FrameworkOps {
     drm_atomic_helper_shutdown: display_atomic_shutdown,
     drm_client_dev_resume: display_client_resume,
     drm_client_dev_suspend: display_client_suspend,
-    drm_dev_register,
-    drm_dev_unplug,
-    drm_dev_unregister,
     drm_kms_helper_poll_disable: display_poll_disable,
     drm_kms_helper_poll_enable: display_poll_enable,
     drm_mode_config_reset: display_mode_config_reset,
@@ -835,7 +697,7 @@ static FRAMEWORK: I915FrameworkOps = I915FrameworkOps {
     intel_sbi_fini: no_display_noop,
     intel_sbi_init: no_display_noop,
     skl_watermark_ipc_update: no_display_noop,
-    devm_drm_dev_alloc_i915,
+    i915_allocated: note_allocated_i915,
     i915_params_copy: {
         // SAFETY: the table's `struct i915_params *` and this `*mut c_void` are
         // the same thin pointer; `i915_params_copy` names its own layout.
@@ -895,16 +757,11 @@ static PROBE: I915ProbeOps = I915ProbeOps { early_gmd_read };
 // DRM core table
 // ---------------------------------------------------------------------------
 
-/// `drm_dev_enter()`: the device is admitted while it is not unplugged.
+/// `drm_dev_enter()`: the canonical core admits the device while it is not
+/// unplugged.
 unsafe extern "C" fn dev_enter(dev: *mut c_void, idx: *mut c_int) -> bool {
-    if dev.is_null() || UNPLUGGED.load(Ordering::Acquire) {
-        return false;
-    }
-    if !idx.is_null() {
-        // SAFETY: the caller passes a writable index slot, as in Linux.
-        unsafe { *idx = 0 };
-    }
-    true
+    // SAFETY: forwards the caller's device and writable index slot unchanged.
+    unsafe { tk_drm_upstream::drm_drv_upstream::drm_dev_enter(dev.cast(), idx) }
 }
 
 /// `drm_dev_exit()`: pairs with [`dev_enter`]. Unplug does not wait for SRCU
@@ -1187,11 +1044,20 @@ pub(super) fn install() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// i915's published DRM device after a successful driver registration. This
-/// is also the readiness gate for exposing upstream file/ioctl services.
+/// `i915_allocated()`: records the device `i915_driver_create()` just allocated.
+unsafe extern "C" fn note_allocated_i915(i915: *mut DrmI915Private) {
+    upstream_gt::note_allocated_device(i915.cast());
+}
+
+/// The i915 DRM device once the canonical `drm_dev_register()` has registered
+/// it, until `drm_dev_unplug()`. The registration itself is the upstream core's
+/// (`tk_drm_upstream::drm_drv_upstream`); this only reads its `registered` flag.
 pub(super) fn registered_device() -> Option<*mut c_void> {
-    let dev = BOUND_DRM.load(Ordering::Acquire);
-    (!dev.is_null() && !UNPLUGGED.load(Ordering::Acquire)).then_some(dev)
+    let i915 = upstream_gt::allocated_device()?.cast::<DrmI915Private>();
+    // SAFETY: the allocated device lives for the kernel's lifetime (see
+    // `note_allocated_i915`), and `drm` is its embedded `struct drm_device`.
+    let drm = unsafe { ptr::addr_of!((*i915).drm).cast_mut() };
+    unsafe { ((*drm).registered && !(*drm).unplugged).then_some(drm.cast()) }
 }
 
 #[cfg(test)]
@@ -1200,51 +1066,48 @@ mod tests {
 
     #[test]
     fn drm_allocation_has_live_mapping_vma_manager_and_ttm_parent() {
+        use tk_drm_upstream::drm_drv_upstream::__devm_drm_dev_alloc;
+        use tk_drm_upstream::drm_vma_manager_upstream::{
+            DRM_FILE_PAGE_OFFSET_START, drm_vma_offset_add, drm_vma_offset_remove,
+        };
+
         unsafe extern "C" {
             fn intel_region_ttm_device_init(i915: *mut DrmI915Private) -> c_int;
             fn intel_region_ttm_device_fini(i915: *mut DrmI915Private);
-            fn drm_mm_takedown(mm: *mut tk_linux_kapi::types::DrmMm);
-            fn drm_vma_offset_add(
-                manager: *mut DrmVmaOffsetManager,
-                node: *mut intel_gt::intel_context_upstream::DrmVmaOffsetNode,
-                pages: c_ulong,
-            ) -> c_int;
-            fn drm_vma_offset_remove(
-                manager: *mut DrmVmaOffsetManager,
-                node: *mut intel_gt::intel_context_upstream::DrmVmaOffsetNode,
-            );
         }
         // These are the production allocator and the exact TTM entry point
         // which faulted on hardware, not synthetic non-null pointer checks.
         let mut parent = 0u64;
         let parent = ptr::from_mut(&mut parent).cast();
         for _ in 0..2 {
-            // SAFETY: exercises devm_drm_dev_alloc_i915 and TTM lifecycle using a valid mock parent pointer.
+            // SAFETY: exercises the canonical devm_drm_dev_alloc() and TTM
+            // lifecycle using a valid mock parent pointer. The device is kept
+            // for the test process: its release callback is the i915 teardown.
             unsafe {
-                let mut error = 123;
-                let i915 = devm_drm_dev_alloc_i915(parent, &mut error);
-                assert!(!i915.is_null());
-                assert_eq!(error, 0);
-                let allocation = i915.cast::<I915Allocation>();
+                let container = __devm_drm_dev_alloc(
+                    parent,
+                    core::ptr::addr_of!(intel_gt::i915_driver_upstream::I915_DRM_DRIVER.0),
+                    core::mem::size_of::<DrmI915Private>(),
+                    core::mem::offset_of!(DrmI915Private, drm),
+                );
+                assert!(!tk_linux_kapi::config::IS_ERR(container));
+                let i915 = container.cast::<DrmI915Private>();
                 let drm = &(*i915).drm;
                 assert_eq!(drm.dev, parent);
                 assert_eq!(drm.dma_dev, parent);
                 assert!(!drm.driver.is_null());
-                let mapping = (*drm.anon_inode.cast::<Inode>()).i_mapping;
-                assert_eq!(mapping, (*(*allocation).mapping_file).f_mapping.cast());
+                let mapping = (*drm.anon_inode.cast::<tk_drm_upstream::drm_drv_upstream::DrmFsInode>()).i_mapping;
                 assert!(!mapping.is_null());
+                let manager = drm.vma_offset_manager;
                 let mut node = core::mem::zeroed();
-                assert_eq!(drm_vma_offset_add(drm.vma_offset_manager, &mut node, 3), 0);
+                assert_eq!(drm_vma_offset_add(manager, &mut node, 3), 0);
                 assert!(node.vm_node.start >= DRM_FILE_PAGE_OFFSET_START);
                 assert_eq!(node.vm_node.size, 3);
-                drm_vma_offset_remove(drm.vma_offset_manager, &mut node);
+                drm_vma_offset_remove(manager, &mut node);
                 assert_eq!(intel_region_ttm_device_init(i915), 0);
                 assert_eq!((*i915).bdev.dev_mapping, mapping);
-                assert_eq!((*i915).bdev.vma_manager, drm.vma_offset_manager.cast());
+                assert_eq!((*i915).bdev.vma_manager, manager.cast());
                 intel_region_ttm_device_fini(i915);
-                drm_mm_takedown(ptr::addr_of_mut!((*allocation).vma.vm_addr_space_mm));
-                shmem::fput_file((*allocation).mapping_file);
-                kfree(allocation.cast());
             }
         }
     }
@@ -1262,27 +1125,5 @@ mod tests {
         unsafe { intel_gt::i915_gem_object_upstream::i915_gem_object_free(object) };
         // SAFETY: repeat initialization exercises the production ready gate.
         assert_eq!(unsafe { intel_gt::i915_driver_upstream::i915_globals_init() }, 0);
-    }
-
-    #[test]
-    fn gt_registration_does_not_require_fastboot_primary() {
-        let mut token = 0u64;
-        let dev = ptr::from_mut(&mut token).cast::<c_void>();
-        // SAFETY: `dev` points to a valid local token used to test registration.
-        assert_eq!(unsafe { drm_dev_register(dev, 0) }, 0);
-        assert_eq!(registered_device(), Some(dev));
-        // SAFETY: idempotent re-registration of the same device pointer.
-        assert_eq!(unsafe { drm_dev_register(dev, 0) }, 0);
-        // SAFETY: unregisters the test device registered above.
-        unsafe { drm_dev_unregister(dev) };
-        assert_eq!(registered_device(), None);
-    }
-
-    #[test]
-    fn drm_allocation_rejects_missing_parent() {
-        let mut error = 0;
-        // SAFETY: passes a null parent pointer and valid out-error pointer to verify graceful failure.
-        assert!(unsafe { devm_drm_dev_alloc_i915(ptr::null_mut(), &mut error) }.is_null());
-        assert_eq!(error, -EINVAL);
     }
 }

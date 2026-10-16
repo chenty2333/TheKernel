@@ -791,38 +791,26 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
         }
     }
 
-    let upstream_devices = crate::drm::upstream::devices();
-    if !upstream_devices.is_empty() {
-        let mut dri = DirMapping::new();
-        for device in upstream_devices {
-            let Some(card) = device.primary_index() else {
-                continue;
-            };
-            match upstream_dri::primary_node(fs.clone(), device.clone()) {
-                Ok(node) => {
-                    dri.add(alloc::format!("card{card}"), node);
-                    match upstream_dri::render_node(fs.clone(), device.clone()) {
-                        Ok(Some(render)) => dri.add(
-                            alloc::format!("renderD{}", device.render_index().unwrap_or(128)),
-                            render,
-                        ),
-                        Ok(None) => {}
-                        Err(error) => error!(
-                            "Failed to publish upstream DRM render node of card{card}: {error}"
-                        ),
-                    }
-                }
-                Err(error) => error!("Failed to publish upstream DRM card{card}: {error}"),
+    // `/dev/dri` is live: an upstream device can publish after devfs mounts
+    // (i915 probes from the rootfs-ready callback), so its names resolve at
+    // lookup time. Only a legacy-core device with no upstream device keeps the
+    // fixed mapping of the legacy path.
+    match crate::drm::primary_device().filter(|_| crate::drm::upstream::devices().is_empty()) {
+        Some(device) => {
+            let mut dri = DirMapping::new();
+            dri.add("card0", dri::primary_node(fs.clone(), device.clone()));
+            if let Some(render) = dri::render_node(fs.clone(), device) {
+                dri.add("renderD128", render);
             }
+            root.add("dri", SimpleDir::new_maker(fs.clone(), Arc::new(dri)));
         }
-        root.add("dri", SimpleDir::new_maker(fs.clone(), Arc::new(dri)));
-    } else if let Some(device) = crate::drm::primary_device() {
-        let mut dri = DirMapping::new();
-        dri.add("card0", dri::primary_node(fs.clone(), device.clone()));
-        if let Some(render) = dri::render_node(fs.clone(), device) {
-            dri.add("renderD128", render);
-        }
-        root.add("dri", SimpleDir::new_maker(fs.clone(), Arc::new(dri)));
+        None => root.add(
+            "dri",
+            SimpleDir::new_maker(
+                fs.clone(),
+                Arc::new(upstream_dri::DriDirectory::new(fs.clone())),
+            ),
+        ),
     }
 
     root.add(

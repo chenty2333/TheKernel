@@ -514,6 +514,12 @@ pub(super) fn note_allocated_device(i915: *mut c_void) {
     ALLOCATED_I915.store(i915, Ordering::Release);
 }
 
+/// The device recorded by [`note_allocated_device`], or `None` before allocation.
+pub(super) fn allocated_device() -> Option<*mut c_void> {
+    let i915 = ALLOCATED_I915.load(Ordering::Acquire);
+    (!i915.is_null()).then_some(i915)
+}
+
 fn gt_uncore() -> Option<*mut IntelUncore> {
     let i915 = ALLOCATED_I915.load(Ordering::Acquire).cast::<intel_gt::linux_i915_private::DrmI915Private>();
     if i915.is_null() {

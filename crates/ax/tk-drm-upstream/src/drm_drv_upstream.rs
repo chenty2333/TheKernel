@@ -9,10 +9,9 @@
 
 use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
 use core::sync::atomic::Ordering;
-use alloc::boxed::Box;
 use tk_linux_kapi::assert::warn_on;
 pub use tk_linux_kapi::config::ENODEV;
-use tk_linux_kapi::config::{EINVAL, ENOMEM, EOPNOTSUPP, GFP_KERNEL};
+use tk_linux_kapi::config::{EBUSY, EINVAL, ENOMEM, EOPNOTSUPP, GFP_KERNEL};
 use tk_linux_kapi::list::{INIT_LIST_HEAD, list_add_tail, list_del};
 use tk_linux_kapi::locks::{spin_lock, spin_unlock, spin_lock_init};
 use tk_linux_kapi::memory::{kfree, kmalloc, kref_init, kref_put};
@@ -31,7 +30,10 @@ use crate::drm_device_types::{DrmDevice, DrmDeviceManaged};
 use crate::drm_drv_types::DrmDriver;
 use crate::drm_file_types::DrmMinor;
 use crate::drm_vma_manager_types::DrmVmaOffsetManager;
-use crate::drm_vma_manager_upstream::{drm_vma_offset_manager_destroy, drm_vma_offset_manager_init};
+use crate::drm_vma_manager_upstream::{
+    DRM_FILE_PAGE_OFFSET_SIZE, DRM_FILE_PAGE_OFFSET_START, drm_vma_offset_manager_destroy,
+    drm_vma_offset_manager_init,
+};
 
 pub const DRM_MINOR_PRIMARY: c_int = 0;
 pub const DRM_MINOR_CONTROL: c_int = 1;
@@ -82,8 +84,35 @@ unsafe fn drm_minor_alloc_release(dev: *mut DrmDevice, data: *mut c_void) {
     }
 }
 
+/// `ACCEL_MAX_MINORS` (include/drm/drm_accel.h).
+const ACCEL_MAX_MINORS: u32 = 256;
+
+// upstream: drivers/gpu/drm/drm_drv.c DRM_MINOR_LIMIT()
+fn drm_minor_limit(r#type: c_int) -> (u32, u32) {
+    if r#type == DRM_MINOR_ACCEL {
+        (0, ACCEL_MAX_MINORS - 1)
+    } else {
+        let base = 64 * r#type as u32;
+        (base, base + 63)
+    }
+}
+
+// upstream: drivers/gpu/drm/drm_drv.c drm_minor_alloc() (xa_alloc over
+// DRM_MINOR_LIMIT). The index is chosen here and published by drm_minor_register().
+unsafe fn drm_minor_alloc_index(r#type: c_int) -> Option<u32> {
+    let xa = drm_minor_get_xa(r#type);
+    let (first, last) = drm_minor_limit(r#type);
+    if xa.is_null() {
+        return Some(first);
+    }
+    (first..=last).find(|&index| tk_linux_kapi::xarray::xa_load::<XArray, DrmMinor>(&mut *xa, index).is_null())
+}
+
 // upstream: drivers/gpu/drm/drm_drv.c drm_minor_alloc()
 unsafe fn drm_minor_alloc(dev: *mut DrmDevice, r#type: c_int) -> i32 {
+    let Some(index) = drm_minor_alloc_index(r#type) else {
+        return -EBUSY;
+    };
     let minor = kmalloc(core::mem::size_of::<DrmMinor>(), GFP_KERNEL).cast::<DrmMinor>();
     if minor.is_null() {
         return -ENOMEM;
@@ -91,7 +120,7 @@ unsafe fn drm_minor_alloc(dev: *mut DrmDevice, r#type: c_int) -> i32 {
     core::ptr::write_bytes(minor, 0, 1);
     (*minor).r#type = r#type;
     (*minor).dev = dev;
-    (*minor).index = if r#type == DRM_MINOR_RENDER { 128 } else { 0 };
+    (*minor).index = index as _;
 
     let slot = drm_minor_get_slot(dev, r#type);
     if !slot.is_null() {
@@ -218,17 +247,50 @@ unsafe fn drm_fs_init_fs_context(_fc: *mut c_void) -> i32 {
     0
 }
 
+/// The anonymous `struct inode` of `drm_fs_inode_new()`. Only the members DRM
+/// consumers read are named: `i_mapping` at byte 48 (x86_64, Linux 7.2.3, the
+/// same offset `tk-intel-gt` names for its `Inode` view). `mapping_file` is the
+/// LinuxKPI shmem file that owns the address_space `i_mapping` points at, the
+/// stand-in for `inode->i_data`; it is released by `drm_fs_inode_free()`.
+#[repr(C, align(8))]
+pub struct DrmFsInode {
+    _before_i_mapping: [u8; 48],
+    pub i_mapping: *mut c_void,
+    mapping_file: *mut tk_linux_kapi::shmem::File,
+    _tail: [u8; 480],
+}
+
+const _: () = assert!(core::mem::size_of::<DrmFsInode>() == 544);
+const _: () = assert!(core::mem::offset_of!(DrmFsInode, i_mapping) == 48);
+
 // upstream: drivers/gpu/drm/drm_drv.c drm_fs_inode_new()
+// Returns the inode, or an ERR_PTR when the page-cache owner cannot be created.
 unsafe fn drm_fs_inode_new() -> *mut c_void {
-    let ptr = Box::into_raw(Box::new(0u64));
-    ptr.cast()
+    let inode = kmalloc(core::mem::size_of::<DrmFsInode>(), GFP_KERNEL).cast::<DrmFsInode>();
+    if inode.is_null() {
+        return (-ENOMEM as isize) as *mut c_void;
+    }
+    core::ptr::write_bytes(inode, 0, 1);
+    // alloc_anon_inode(): the inode's mapping is a real address_space, which
+    // the shmem file owns; the empty file grows on later page faults.
+    let file = tk_linux_kapi::shmem::shmem_file_setup(c"drm".as_ptr(), 0, 0);
+    if tk_linux_kapi::config::IS_ERR(file) {
+        kfree(inode);
+        return file.cast();
+    }
+    (*inode).i_mapping = (*file).f_mapping.cast();
+    (*inode).mapping_file = file;
+    inode.cast()
 }
 
 // upstream: drivers/gpu/drm/drm_drv.c drm_fs_inode_free()
 unsafe fn drm_fs_inode_free(inode: *mut c_void) {
-    if !inode.is_null() {
-        drop(Box::from_raw(inode.cast::<u64>()));
+    if inode.is_null() {
+        return;
     }
+    let inode = inode.cast::<DrmFsInode>();
+    tk_linux_kapi::shmem::fput_file((*inode).mapping_file);
+    kfree(inode);
 }
 
 // upstream: drivers/gpu/drm/drm_drv.c drm_dev_init_release()
@@ -267,16 +329,26 @@ unsafe fn drm_dev_init(
         idr_init_base(core::ptr::addr_of_mut!((*dev).object_name_idr), 1);
         mutex_init(core::ptr::addr_of_mut!((*dev).gem_lru_mutex));
 
+        let inode = drm_fs_inode_new();
+        if tk_linux_kapi::config::IS_ERR(inode) {
+            return tk_linux_kapi::config::PTR_ERR(inode);
+        }
+        (*dev).anon_inode = inode;
+
         // allocate vma_offset_manager
         let vma_mgr = kmalloc(core::mem::size_of::<DrmVmaOffsetManager>(), GFP_KERNEL).cast::<DrmVmaOffsetManager>();
         core::ptr::write_bytes(vma_mgr, 0, 1);
-        drm_vma_offset_manager_init(vma_mgr, 0x10000000, 0xE0000000);
+        drm_vma_offset_manager_init(vma_mgr, DRM_FILE_PAGE_OFFSET_START, DRM_FILE_PAGE_OFFSET_SIZE);
         (*dev).vma_offset_manager = vma_mgr;
 
-        drm_minor_alloc(dev, DRM_MINOR_PRIMARY);
-        drm_minor_alloc(dev, DRM_MINOR_RENDER);
-
-        (*dev).anon_inode = drm_fs_inode_new().cast();
+        let ret = drm_minor_alloc(dev, DRM_MINOR_PRIMARY);
+        if ret != 0 {
+            return ret;
+        }
+        let ret = drm_minor_alloc(dev, DRM_MINOR_RENDER);
+        if ret != 0 {
+            return ret;
+        }
 
         if ((*dev).driver_features & (1 << 0)) != 0 {
             crate::drm_gem_upstream::drm_gem_init(dev);

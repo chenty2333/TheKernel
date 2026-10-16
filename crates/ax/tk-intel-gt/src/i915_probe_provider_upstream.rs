@@ -25,9 +25,6 @@ pub struct I915FrameworkOps {
     pub drm_atomic_helper_shutdown: unsafe extern "C" fn(*mut c_void),
     pub drm_client_dev_resume: unsafe extern "C" fn(*mut c_void),
     pub drm_client_dev_suspend: unsafe extern "C" fn(*mut c_void),
-    pub drm_dev_register: unsafe extern "C" fn(dev: *mut c_void, flags: c_ulong) -> c_int,
-    pub drm_dev_unplug: unsafe extern "C" fn(*mut c_void),
-    pub drm_dev_unregister: unsafe extern "C" fn(*mut c_void),
     pub drm_kms_helper_poll_disable: unsafe extern "C" fn(*mut c_void),
     pub drm_kms_helper_poll_enable: unsafe extern "C" fn(*mut c_void),
     pub drm_mode_config_reset: unsafe extern "C" fn(*mut c_void),
@@ -110,7 +107,10 @@ pub struct I915FrameworkOps {
     pub intel_sbi_fini: unsafe extern "C" fn(*mut c_void),
     pub intel_sbi_init: unsafe extern "C" fn(*mut c_void),
     pub skl_watermark_ipc_update: unsafe extern "C" fn(*mut c_void),
-    pub devm_drm_dev_alloc_i915: unsafe extern "C" fn(pdev: *mut c_void, err: *mut c_int) -> *mut DrmI915Private,
+    /// Called once `i915_driver_create()` has allocated the device, before any
+    /// GT hardware is touched. The owner records the pointer for its MMIO and
+    /// power paths.
+    pub i915_allocated: unsafe extern "C" fn(i915: *mut DrmI915Private),
     pub i915_params_copy: unsafe extern "C" fn(dst: *mut I915Params),
     pub display_parent_interface: unsafe extern "C" fn() -> *const c_void,
     pub display_probe_defer: unsafe extern "C" fn(pdev: *mut c_void) -> bool,
@@ -154,8 +154,8 @@ pub fn framework() -> &'static I915FrameworkOps {
 }
 
 /// Manual provider entries used by the probe translation.
-pub unsafe fn devm_drm_dev_alloc_i915(pdev: *mut c_void, err: *mut c_int) -> *mut DrmI915Private {
-    unsafe { (framework().devm_drm_dev_alloc_i915)(pdev, err) }
+pub unsafe fn i915_allocated(i915: *mut DrmI915Private) {
+    unsafe { (framework().i915_allocated)(i915) }
 }
 pub unsafe fn i915_params_copy(dst: *mut I915Params) {
     unsafe { (framework().i915_params_copy)(dst) }

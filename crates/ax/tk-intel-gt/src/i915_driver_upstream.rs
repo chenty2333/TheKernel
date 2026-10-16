@@ -19,6 +19,8 @@
 
 use core::ffi::{CStr, VaList, c_char, c_int, c_long, c_ulong, c_void};
 
+use tk_drm_upstream::drm_drv_upstream::{drm_dev_register, drm_dev_unplug, drm_dev_unregister};
+
 use crate::{
     i915_probe_provider_upstream as provider,
     i915_probe_provider_upstream::framework,
@@ -438,18 +440,6 @@ unsafe fn drm_client_dev_resume(dev: *mut c_void) {
 
 unsafe fn drm_client_dev_suspend(dev: *mut c_void) {
     unsafe { (framework().drm_client_dev_suspend)(dev) }
-}
-
-unsafe fn drm_dev_register(dev: *mut c_void, flags: c_ulong) -> c_int {
-    unsafe { (framework().drm_dev_register)(dev, flags) }
-}
-
-unsafe fn drm_dev_unplug(dev: *mut c_void) {
-    unsafe { (framework().drm_dev_unplug)(dev) }
-}
-
-unsafe fn drm_dev_unregister(dev: *mut c_void) {
-    unsafe { (framework().drm_dev_unregister)(dev) }
 }
 
 unsafe fn drm_kms_helper_poll_disable(dev: *mut c_void) {
@@ -1493,11 +1483,22 @@ unsafe fn i915_driver_create(
     device: u16,
     match_info: *const IntelDeviceInfo,
 ) -> Result<*mut DrmI915Private, i32> {
-    let mut err: i32 = 0;
-    let i915 = unsafe { provider::devm_drm_dev_alloc_i915(pdev, &mut err) };
-    if i915.is_null() {
-        return Err(err);
+    // devm_drm_dev_alloc(&pdev->dev, &i915_drm_driver, struct drm_i915_private, drm)
+    let container = unsafe {
+        tk_drm_upstream::drm_drv_upstream::__devm_drm_dev_alloc(
+            pdev,
+            core::ptr::addr_of!(I915_DRM_DRIVER.0),
+            core::mem::size_of::<DrmI915Private>(),
+            core::mem::offset_of!(DrmI915Private, drm),
+        )
+    };
+    if tk_linux_kapi::config::IS_ERR(container) {
+        return Err(tk_linux_kapi::config::PTR_ERR(container));
     }
+    let i915 = container.cast::<DrmI915Private>();
+    // Before any GT unpark: the GT_IRQ power reference reaches the uncore from
+    // inside i915_pci_probe(), before the probe returns.
+    unsafe { provider::i915_allocated(i915) };
 
     unsafe { pci_set_drvdata(pdev, core::ptr::addr_of_mut!((*i915).drm).cast()) };
     unsafe { provider::i915_params_copy(core::ptr::addr_of_mut!((*i915).params)) };

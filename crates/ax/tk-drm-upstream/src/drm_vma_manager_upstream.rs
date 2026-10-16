@@ -19,6 +19,12 @@ use tk_linux_kapi::types::{RbNode, Rwlock};
 use crate::drm_file_types::DrmFile;
 use crate::drm_vma_manager_types::{DrmVmaOffsetFile, DrmVmaOffsetManager, DrmVmaOffsetNode};
 
+/// `DRM_FILE_PAGE_OFFSET_START` (include/drm/drm_vma_manager.h, 64-bit): the
+/// first fake page offset GEM mmap offsets are handed out from.
+pub const DRM_FILE_PAGE_OFFSET_START: c_ulong = (0xFFFF_FFFFu64 >> 12) as c_ulong + 1;
+/// `DRM_FILE_PAGE_OFFSET_SIZE` (include/drm/drm_vma_manager.h, 64-bit).
+pub const DRM_FILE_PAGE_OFFSET_SIZE: c_ulong = (0xFFFF_FFFFu64 >> 12) as c_ulong * 256;
+
 // upstream: drivers/gpu/drm/drm_vma_manager.c drm_vma_offset_manager_init()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_vma_offset_manager_init(

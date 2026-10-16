@@ -82,6 +82,37 @@ fn run_pending() {
     axruntime::boot_progress::trace_exit("gt:run_pending");
 }
 
+/// Owner of the registered i915 device: the GT lives for the kernel's lifetime,
+/// so the upstream device list only needs an anchor.
+struct I915DeviceOwner;
+
+/// Publish the registered i915 device on the upstream DRM list, as efidrm and
+/// VirtIO are published. The device is render-only here (native modeset is
+/// off, so it has no display pipes), which means `(0, 0)` scanout size and no
+/// fbdev client; `/dev/dri` gains `cardN` and `renderD<N>` at publication.
+fn publish_upstream_device(
+    bdf: pci::Bdf,
+    info: &pci::DeviceInfo,
+    drm: *mut c_void,
+) -> Result<(), String> {
+    let owner = alloc::sync::Arc::try_new(I915DeviceOwner)
+        .map_err(|_| String::from("upstream i915: no memory for the DRM device owner"))?;
+    let owner: alloc::sync::Arc<dyn core::any::Any + Send + Sync> = owner;
+    let pci = axdriver_display::DisplayPciIdentity {
+        bus: bdf.bus,
+        device: bdf.device,
+        function: bdf.function,
+        vendor_id: info.vendor_id,
+        device_id: info.device_id,
+        subsystem_vendor: info.subsystem_vendor_id,
+        subsystem_device: info.subsystem_id,
+        revision: info.revision,
+    };
+    crate::drm::upstream::install(drm.cast(), owner, (0, 0), Some(pci), "i915", None)
+        .map(|_| ())
+        .map_err(|error| format!("upstream i915: DRM publication failed: {error}"))
+}
+
 /// Run the upstream PCI probe for one mapped Intel GPU and publish the
 /// resulting device to the kernel IRQ and display-power owners.
 pub(super) fn probe(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
@@ -134,6 +165,10 @@ pub(super) fn probe(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, Str
     if let Err(e) = upstream_gt::register_upstream_i915(i915) {
         axruntime::boot_progress::trace_exit("gt:probe");
         return Err(format!("upstream i915: {e}"));
+    }
+    if let Err(e) = publish_upstream_device(bdf, &info, i915) {
+        axruntime::boot_progress::trace_exit("gt:probe");
+        return Err(e);
     }
     axruntime::boot_progress::trace_exit("gt:probe");
     Ok(format!("upstream i915: probed {:04x} rev {:02x}", info.device_id, info.revision))

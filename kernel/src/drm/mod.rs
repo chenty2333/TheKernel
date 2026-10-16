@@ -111,9 +111,7 @@ pub fn init_virtio_gpu() -> DrmResult<bool> {
             }
         }
     }
-    // The i915 render bridge still attaches to the legacy-core firmware
-    // device; every other machine gets the upstream efidrm driver.
-    if !intel::has_display_device() && efidrm::init_firmware() {
+    if efidrm::init_firmware() {
         return Ok(true);
     }
     match linear::init_firmware() {
