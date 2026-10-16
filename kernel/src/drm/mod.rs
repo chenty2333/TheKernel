@@ -28,10 +28,9 @@ mod property_uapi_full;
 mod render;
 mod syncobj;
 pub(crate) mod uapi;
-mod virtio;
 pub(crate) mod upstream;
 
-use alloc::{boxed::Box, format, sync::Arc};
+use alloc::{boxed::Box, sync::Arc};
 
 use axdriver_display::{BlobMapping, DevError};
 use tk_drm_upstream::drm_gem_types::DrmGemObject;
@@ -103,21 +102,10 @@ pub fn init_virtio_gpu() -> DrmResult<bool> {
                 }
             }
             Err(error) => {
-                let reason = format!("{:?}", error.error);
-                if let Some(display) = error.into_display() {
-                    axlog::warn!(
-                        "drm: upstream VirtIO DRM probe failed ({reason}); using recovered legacy \
-                         transport"
-                    );
-                    if virtio::init_with_display(display)? {
-                        return Ok(true);
-                    }
-                } else {
-                    axlog::warn!(
-                        "drm: upstream VirtIO DRM probe failed ({reason}) after uncertain \
-                         transport activity; using firmware console"
-                    );
-                }
+                axlog::warn!(
+                    "drm: upstream VirtIO DRM probe failed ({:?}); using firmware console",
+                    error.error
+                );
             }
         }
     }
