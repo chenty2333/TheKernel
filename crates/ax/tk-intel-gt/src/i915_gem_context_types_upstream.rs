@@ -28,10 +28,7 @@ pub struct DrmI915FilePrivate {
     _opaque: [u8; 0],
 }
 
-#[repr(C)]
-pub struct DrmSyncobj {
-    _opaque: [u8; 0],
-}
+pub use tk_drm_upstream::drm_syncobj_upstream::DrmSyncobj;
 
 #[repr(C)]
 pub struct Pid {

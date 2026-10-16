@@ -63,17 +63,9 @@ struct ExecuteCb {
     fence: *mut I915SwFence,
 }
 
-/// Linux `struct dma_fence_ops`, needed for the per-request fence vtable.
-#[repr(C)]
-pub struct DmaFenceOps {
-    pub get_driver_name: Option<unsafe extern "C" fn(*mut DmaFence) -> *const c_char>,
-    pub get_timeline_name: Option<unsafe extern "C" fn(*mut DmaFence) -> *const c_char>,
-    pub enable_signaling: Option<unsafe extern "C" fn(*mut DmaFence) -> bool>,
-    pub signaled: Option<unsafe extern "C" fn(*mut DmaFence) -> bool>,
-    pub wait: Option<unsafe extern "C" fn(*mut DmaFence, bool, c_long) -> c_long>,
-    pub release: Option<unsafe extern "C" fn(*mut DmaFence)>,
-    pub set_deadline: Option<unsafe extern "C" fn(*mut DmaFence, i64)>,
-}
+/// Linux `struct dma_fence_ops` (canonical in tk-drm-upstream; `c_long` and
+/// `i64` are the same type on x86_64).
+pub use tk_drm_upstream::drm_crtc_upstream::DmaFenceOps;
 
 static mut SLAB_REQUESTS: *mut KmCache = ptr::null_mut();
 static mut SLAB_EXECUTE_CBS: *mut KmCache = ptr::null_mut();
@@ -1158,10 +1150,7 @@ struct I915DepsView {
     gfp: u32,
 }
 
-#[repr(C)]
-struct DmaResv {
-    _opaque: [u8; 0],
-}
+use tk_drm_upstream::dma_resv_types::DmaResv;
 
 #[repr(C)]
 struct DmaResvIter {

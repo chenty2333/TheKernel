@@ -79,7 +79,7 @@ const ORIGIN_CPU: u32 = 0;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-enum I915CacheLevel {
+pub enum I915CacheLevel {
     None  = I915_CACHE_NONE as isize,
     Llc   = I915_CACHE_LLC as isize,
     L3Llc = I915_CACHE_L3_LLC as isize,
@@ -100,11 +100,7 @@ struct DrmI915GemSetDomain {
 }
 
 pub use tk_drm_upstream::drm_device_types::DrmDevice;
-
-#[repr(C)]
-pub struct DrmFile {
-    _opaque: [u8; 0],
-}
+pub use crate::linux::gem::DrmFile;
 
 // upstream: i915_gem_domain.c gpu_write_needs_clflush()
 unsafe fn gpu_write_needs_clflush(obj: *mut DrmI915GemObject) -> bool {

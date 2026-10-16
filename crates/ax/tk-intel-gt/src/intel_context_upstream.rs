@@ -890,4 +890,6 @@ pub unsafe fn intel_context_revoke(ce: *mut IntelContext) -> bool {
 // function; the test implementation remains in the separate source file.
 
 // Kernel layouts owned by tk-linux-kapi (generic Linux records; see its types.rs).
-pub use tk_linux_kapi::types::{RefcountT, Kref, RcuHead, DmaFenceLock, DmaFenceTimestamp, DmaFence, DmaFenceCb, WaitQueueHead, XArray, DrmMmNode, Hrtimer, WaitQueueEntry, PinCookie, SgTable, DrmVmaOffsetNode, RadixTreeRoot, IrqWork, IrqWorkNode};
+pub use tk_linux_kapi::types::{RefcountT, Kref, RcuHead, DmaFenceLock, DmaFenceTimestamp, DmaFence, DmaFenceCb, WaitQueueHead, XArray, DrmMmNode, Hrtimer, WaitQueueEntry, PinCookie, SgTable, RadixTreeRoot, IrqWork, IrqWorkNode};
+// DRM-owned record (tk-drm-upstream is the canonical owner of drm_vma_node).
+pub use tk_drm_upstream::drm_vma_manager_types::DrmVmaOffsetNode;

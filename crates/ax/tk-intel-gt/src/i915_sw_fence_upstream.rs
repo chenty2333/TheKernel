@@ -36,10 +36,8 @@ const ENOMEM: i32 = 12;
 const ENOENT: i32 = 2;
 const ETIMEDOUT: i32 = 110;
 
-#[repr(C)]
-pub struct DmaResv {
-    _opaque: [u8; 0],
-}
+pub use tk_drm_upstream::dma_resv_types::DmaResv;
+
 #[repr(C)]
 struct DmaResvIter {
     obj: *mut DmaResv,

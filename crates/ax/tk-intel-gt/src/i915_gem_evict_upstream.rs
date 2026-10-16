@@ -33,10 +33,12 @@
 
 use core::{
     ffi::{c_int, c_long, c_ulong},
-    mem::{offset_of, size_of},
+    mem::size_of,
     ptr,
     sync::atomic::{AtomicI32, Ordering},
 };
+
+use tk_linux_kapi::drm_mm::DrmMmScan;
 
 use crate::{
     i915_gem_object_api_upstream::{
@@ -76,28 +78,7 @@ const DRM_MM_INSERT_LOW: c_int = 1;
 const DRM_MM_INSERT_HIGH: c_int = 2;
 const I915_COLOR_UNEVICTABLE: c_ulong = c_ulong::MAX;
 
-/// DRM-MM scan state is documented as opaque in Linux, but its source layout
-/// is fixed by `drm_mm.h` and its only operations below are the real DRM-MM
-/// scan APIs. It is a stack temporary, exactly as in the C owner.
-#[repr(C)]
-struct DrmMmScan {
-    mm: *mut DrmMm,
-    size: u64,
-    alignment: u64,
-    remainder_mask: u64,
-    range_start: u64,
-    range_end: u64,
-    hit_start: u64,
-    hit_end: u64,
-    color: c_ulong,
-    mode: c_int,
-    _padding: u32,
-}
 const _: [(); 80] = [(); size_of::<DrmMmScan>()];
-const _: [(); 0] = [(); offset_of!(DrmMmScan, mm)];
-const _: [(); 8] = [(); offset_of!(DrmMmScan, size)];
-const _: [(); 64] = [(); offset_of!(DrmMmScan, color)];
-const _: [(); 72] = [(); offset_of!(DrmMmScan, mode)];
 
 // The selftest declaration is `I915_SELFTEST_DECLARE(...)` in C and expands
 // away for this target's CONFIG_DRM_I915_SELFTEST=n configuration. It is not a

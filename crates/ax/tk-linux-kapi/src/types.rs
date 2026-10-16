@@ -306,18 +306,6 @@ const _: [(); 16] = [(); core::mem::size_of::<SgTable>()];
 const _: [(); 0] = [(); core::mem::offset_of!(SgTable, sgl)];
 const _: [(); 8] = [(); core::mem::offset_of!(SgTable, nents)];
 
-#[repr(C, align(8))]
-pub struct DrmVmaOffsetNode {
-    _vm_lock: [u8; 8],
-    pub vm_node: DrmMmNode,
-    pub vm_files: RbRoot,
-    pub driver_private: *mut c_void,
-}
-const _: [(); 192] = [(); core::mem::size_of::<DrmVmaOffsetNode>()];
-const _: [(); 8] = [(); core::mem::offset_of!(DrmVmaOffsetNode, vm_node)];
-const _: [(); 176] = [(); core::mem::offset_of!(DrmVmaOffsetNode, vm_files)];
-const _: [(); 184] = [(); core::mem::offset_of!(DrmVmaOffsetNode, driver_private)];
-
 #[repr(C)]
 pub struct RadixTreeRoot {
     pub height: u32,

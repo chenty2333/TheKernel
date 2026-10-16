@@ -31,10 +31,7 @@ use crate::{
 
 // Header forward declarations. These are only referenced through pointers in
 // the request record and do not pretend to define their external layouts.
-#[repr(C)]
-pub struct DrmFile {
-    _opaque: [u8; 0],
-}
+pub use crate::linux::gem::DrmFile;
 
 // Shared DRM printer forward declaration is owned by the LinuxKPI fields
 // binding, not duplicated in this i915 header translation.

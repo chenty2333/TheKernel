@@ -437,17 +437,10 @@ pub struct DrmI915GemExecbufferExtTimelineFences {
 }
 const _: [(); 56] = [(); core::mem::size_of::<DrmI915GemExecbufferExtTimelineFences>()];
 
-/// Linux `sync_file` fields used by the execbuffer ioctl; the file pointer is
-/// the first member in the native Linux structure.
-#[repr(C)]
-pub struct SyncFile {
-    pub file: *mut c_void,
-}
-
-#[repr(C)]
-pub struct DmaFenceChain {
-    _opaque: [u8; 0],
-}
+/// Linux `sync_file` (canonical in tk-drm-upstream; the file pointer is the
+/// first member in the native Linux structure).
+pub use tk_drm_upstream::drm_atomic_uapi_upstream::SyncFile;
+pub use tk_linux_kapi::types::DmaFenceChain;
 
 #[inline]
 fn ERR_CAST<T>(ptr: *mut T) -> *mut SyncFile {

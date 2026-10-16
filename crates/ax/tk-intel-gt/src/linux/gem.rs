@@ -14,9 +14,7 @@ use crate::{
     intel_context_types_upstream::File,
     intel_context_upstream::{DmaFence, DrmGemObjectBaseLayout, DrmVmaOffsetNode, Kref},
     intel_engine_cs_upstream::{ListHead, Spinlock},
-    linux::ww_mutex::{
-        WwMutex, ww_mutex_lock, ww_mutex_lock_slow, ww_mutex_trylock, ww_mutex_unlock,
-    },
+    linux::ww_mutex::{ww_mutex_lock, ww_mutex_lock_slow, ww_mutex_trylock, ww_mutex_unlock},
     linux_i915_private::{DrmVmaOffsetManager, Inode},
 };
 
@@ -69,12 +67,9 @@ pub unsafe fn drm_vma_node_unmap(node: *mut DrmVmaOffsetNode, mapping: *mut c_vo
     }
 }
 
-/// Linux v7.2.3 `struct dma_resv` for CONFIG_PREEMPT_RT=n and LOCKDEP=n.
-#[repr(C)]
-pub struct DmaResv {
-    pub lock: WwMutex,
-    pub fences: *mut c_void,
-}
+/// Linux v7.2.3 `struct dma_resv` (canonical in tk-drm-upstream; layout pinned
+/// there and by the offset asserts below).
+pub use tk_drm_upstream::dma_resv_types::DmaResv;
 
 unsafe extern "C" {
     pub fn get_file_active(file: *mut *mut File) -> *mut File;

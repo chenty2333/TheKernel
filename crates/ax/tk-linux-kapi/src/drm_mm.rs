@@ -55,6 +55,10 @@ pub struct DrmMmScan {
     mode: u32,
 }
 const _: () = assert!(core::mem::size_of::<DrmMmScan>() == 80);
+const _: () = assert!(core::mem::offset_of!(DrmMmScan, mm) == 0);
+const _: () = assert!(core::mem::offset_of!(DrmMmScan, size) == 8);
+const _: () = assert!(core::mem::offset_of!(DrmMmScan, color) == 64);
+const _: () = assert!(core::mem::offset_of!(DrmMmScan, mode) == 72);
 
 // ---------------------------------------------------------------------------
 // Container helpers (`rb_entry`, `list_entry`) and the node accessors used
