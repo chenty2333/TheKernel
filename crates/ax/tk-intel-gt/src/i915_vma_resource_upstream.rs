@@ -25,12 +25,11 @@ use crate::{
     intel_context_upstream::{DmaFence, I915AddressSpace, Kref, RcuHead, SgTable},
     intel_engine_cs_upstream::{RbNode, RbRootCached, WorkStruct},
     intel_gtt_api_upstream::{I915_GTT_PAGE_SIZE, I915VmaOpsLayout, i915_vm_has_cache_coloring},
-    intel_runtime_pm_upstream::intel_runtime_pm_get_if_in_use,
+    intel_runtime_pm_upstream::{intel_runtime_pm_get_if_in_use, intel_runtime_pm_put},
     linux::{
         locks::spin_lock_init,
         memory::{kfree, kzalloc_obj, refcount_dec_and_test, refcount_inc_not_zero, refcount_set},
         mutex::{mutex_lock, mutex_unlock},
-        pm::intel_runtime_pm_put,
         rbtree::{RB_EMPTY_NODE, RB_CLEAR_NODE, rb_erase_cached, rb_insert_color, rb_link_node, rb_next},
         workqueue::{INIT_WORK_C, queue_work, system_dfl_wq},
     },
@@ -149,7 +148,9 @@ unsafe fn __i915_vma_resource_unhold(vma_res: *mut I915VmaResource) {
     let vm = unsafe { (*vma_res).vm };
     let wakeref = unsafe { (*vma_res).wakeref };
     if !wakeref.is_null() {
-        unsafe { intel_runtime_pm_put(ptr::addr_of_mut!((*(*vm).i915).runtime_pm), wakeref) };
+        // Pair with intel_runtime_pm_get_if_in_use() in i915_vma_resource_unbind():
+        // both sides must use the same runtime-PM layer.
+        unsafe { intel_runtime_pm_put(ptr::addr_of_mut!((*(*vm).i915).runtime_pm).cast(), wakeref.cast()) };
     }
 
     unsafe { (*vma_res).vm = ptr::null_mut() };

@@ -26,7 +26,7 @@ use crate::{
     intel_engine_cs_upstream::{ListHead, Mutex},
     intel_gt_types_upstream::IntelGt,
     intel_gtt_api_upstream::{I915Ggtt, intel_vm_no_concurrent_access_wa},
-    intel_runtime_pm_upstream::intel_runtime_pm_get_if_in_use,
+    intel_runtime_pm_upstream::{intel_runtime_pm_get_if_in_use, intel_runtime_pm_put},
     linux::{
         i915_trace::trace_i915_gem_shrink,
         gem_memory::{NotifierBlock, Shrinker},
@@ -39,7 +39,6 @@ use crate::{
         atomic_add_unless, atomic_dec_and_test, atomic_fetch_inc, kref_get_unless_zero, kref_read,
     },
     linux_mutex::{mutex_lock, mutex_unlock},
-    linux_pm::intel_runtime_pm_put,
 };
 
 // Values from i915_gem_shrinker.h and i915_gem_object_types.h.
@@ -389,7 +388,7 @@ pub unsafe fn i915_gem_shrink(
     }
 
     if shrink & I915_SHRINK_BOUND != 0 {
-        intel_runtime_pm_put(core::ptr::addr_of_mut!((*i915).runtime_pm), wakeref);
+        intel_runtime_pm_put(core::ptr::addr_of_mut!((*i915).runtime_pm).cast(), wakeref.cast());
     }
 
     if err != 0 {
