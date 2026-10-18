@@ -443,8 +443,8 @@ fn install_current_user_address_space(curr_ptr: *mut TaskInner, token: AddressSp
     };
 
     // SAFETY: `curr_ptr` is the running task (see the callers), IRQs and preemption are disabled,
-    // so nothing else touches its saved context; `token` names this process's live page table,
-    // which is safe to load into CR3.
+    // so nothing else touches its saved context; `token` names the destination page table, which
+    // is safe to load into CR3 and remains owned for the duration of its use.
     unsafe {
         set_task_user_address_space((*curr_ptr).ctx_mut(), token);
         #[cfg(all(feature = "asid-fast-switch", target_arch = "x86_64"))]
@@ -997,6 +997,23 @@ pub fn set_current_user_address_space(token: AddressSpaceToken) {
     // Re-admit the current CPU immediately; the regular scheduler hook will
     // keep this membership idempotent on the next switch.
     tlb_state.enter_current();
+}
+
+/// Detaches the exiting task from its reclaimable user address space.
+///
+/// Exit teardown has completed all user-memory access before calling this.
+/// The permanent kernel root remains owned for the whole boot, so the task can
+/// finish its scheduler exit path after the process image releases its mm.
+fn set_current_kernel_address_space() {
+    let _guard = NoPreemptIrqSave::new();
+    let curr = current();
+    // SAFETY: preemption is disabled and `curr` is the running task. The
+    // kernel root is permanently owned by `KERNEL_ASPACE` and is safe to load.
+    let curr_ptr = (&***curr) as *const TaskInner as *mut TaskInner;
+    install_current_user_address_space(
+        curr_ptr,
+        AddressSpaceToken::legacy(axhal::asm::kernel_task_page_table_root()),
+    );
 }
 
 /// Resets the current task's saved and live FP/SIMD state after `execve`.
@@ -2321,6 +2338,26 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         thr.proc_data
             .publish_affinity_snapshot(thr.kernel_tid(), token, mask);
     }
+    // Retain a nonleader's terminal wait identity before core unlinks the
+    // task from its process. A concurrent tracer wait can then keep finding
+    // the namespace PID even when the live task entry is already disappearing;
+    // the report itself remains unclaimable until `publish_ptrace_task_exit`
+    // runs after `set_exit` below.
+    let ptrace_action = thr.lock_ptrace_actions();
+    let retained_task_exit = if thr.is_thread_group_leader() {
+        // The leader terminal report is delayed until the whole group dies.
+        super::process::retain_ptrace_exit(thr);
+        false
+    } else {
+        super::process::retain_ptrace_task_exit(
+            thr,
+            if process.is_group_exited() {
+                process.exit_code()
+            } else {
+                exit_code
+            },
+        )
+    };
     let final_exit = match remove_current_thread(process, tid, exit_code) {
         Ok(ThreadExitTransition::NotFound) => {
             fail_closed_exit(AxError::BadState);
@@ -2403,21 +2440,10 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // A process PID must survive until its zombie is reaped, but every other
     // thread's namespace TID becomes reusable once its core membership is
     // gone. `exit_thread` above is that authoritative removal edge.
-    let retained_task_exit = {
-        let action = thr.lock_ptrace_actions();
-        let retained = if thr.is_thread_group_leader() {
-            // The leader terminal report is delayed until the whole group dies.
-            super::process::retain_ptrace_exit(thr);
-            false
-        } else {
-            super::process::retain_ptrace_task_exit(thr, if process.is_group_exited() { process.exit_code() } else { exit_code })
-        };
-        if !final_thread {
-            ptrace_retirements.tracee_relationship = thr.clear_ptrace();
-        }
-        drop(action);
-        retained
-    };
+    if !final_thread {
+        ptrace_retirements.tracee_relationship = thr.clear_ptrace();
+    }
+    drop(ptrace_action);
     if tid != process.pid() && !retained_task_exit {
         thr.proc_data.pid_ns().release_exited_thread(tid);
     }
@@ -2689,6 +2715,12 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // Publish exact task exit before releasing lifecycle serialization. A
     // thread-pidfd resolver must never observe removed membership paired with
     // a still-live task flag and retry the retired task identity.
+    // Exit teardown can be followed by an execing sibling releasing the old
+    // image as soon as this exit is published. Leave its reclaimable root only
+    // after moving both the live CR3 and this task's saved context to the
+    // permanently owned kernel root; then release the final exit-time mm pin.
+    set_current_kernel_address_space();
+    drop(exit_memory);
     thr.set_exit();
     if retained_task_exit {
         super::process::publish_ptrace_task_exit(thr);

@@ -1312,35 +1312,43 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
     if let Some(group_stop) = proc_data.current_stop_report() {
         thr.ptrace_group_stop(group_stop.signal);
     }
-    let publish_registers = proc_data.should_wait_for_stop() || thr.should_wait_for_ptrace_stop();
-    if publish_registers {
-        let mut regs = [0; super::registers::NUM_GREGS];
-        super::registers::fill_gregs(
-            uctx,
-            thr.ptrace_orig_rax
-                .load(core::sync::atomic::Ordering::Acquire),
-            &mut regs,
-        );
-        if thr.ptrace_forced_tf.load(core::sync::atomic::Ordering::Acquire) {
-            regs[18] &= !super::ptrace_runtime::TRAP_FLAG;
+    let mut publish_registers = false;
+    loop {
+        // The requested stop can race this function's entry. In particular,
+        // do not snapshot `publish_registers` once before the loop: a remote
+        // PTRACE_INTERRUPT may publish the stop between that snapshot and the
+        // first blocking poll. Re-check and publish under the owner task on
+        // every iteration before sleeping for either stop source.
+        if let Some(group_stop) = proc_data.current_stop_report() {
+            thr.ptrace_group_stop(group_stop.signal);
         }
-        *thr.ptrace_registers.lock() = Some(regs);
-        if thr.ptrace_active_session().is_some() {
-            // Allocate and save in the owner task, never by dereferencing a
-            // remote scheduler context. Resume installs this exact image.
-            let image = axtask::snapshot_current_task_xsave().ok();
-            let retired = core::mem::replace(&mut *thr.ptrace_xsave.lock(), image);
-            drop(retired);
-            // Wake/report only after the user context is actually parked.
-            // Early request-side notification lets a waiter mutate memory
-            // while the tracee can still execute a syscall before stopping.
-            notify_ptrace_attach_stop(thr);
+        let ptrace_stop = thr.current_ptrace_stop_report();
+        let wait_for_job_stop = proc_data.should_wait_for_stop();
+        if wait_for_job_stop || ptrace_stop.is_some() {
+            publish_registers = true;
+            publish_owner_ptrace_image(thr, uctx);
+            if let Some(stop) = ptrace_stop {
+                if !thr.ptrace_stop_image_ready_for(stop) {
+                    if thr.mark_ptrace_stop_image_ready(stop) {
+                        // Wake/report only after the owner has published an
+                        // image for this exact stop incarnation. The early
+                        // request-side notification is intentionally allowed
+                        // to be a no-op while that image is not yet ready.
+                        notify_ptrace_attach_stop(thr);
+                    }
+                } else {
+                    notify_ptrace_attach_stop(thr);
+                }
+            }
         }
-    }
-    while !thr.pending_exit()
-        && !proc_data.should_exit_for_exec(tid)
-        && (proc_data.should_wait_for_stop() || thr.should_wait_for_ptrace_stop())
-    {
+
+        if thr.pending_exit()
+            || proc_data.should_exit_for_exec(tid)
+            || !(proc_data.should_wait_for_stop() || thr.should_wait_for_ptrace_stop())
+        {
+            break;
+        }
+
         // Cgroup freezing reuses the scheduler-backed stop wait but remains
         // independent from job-control/ptrace state.  A wake caused by the
         // freezer request reaches this point before the next blocking poll.
@@ -1355,7 +1363,8 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
             &proc_data.stop_event
         };
         match block_on_poll_set(event, || {
-            if !(proc_data.should_wait_for_stop() || thr.should_wait_for_ptrace_stop())
+            if !thr.ptrace_stop_wait_can_block()
+                || !(proc_data.should_wait_for_stop() || thr.should_wait_for_ptrace_stop())
                 || thr.pending_exit()
                 || proc_data.should_exit_for_exec(tid)
             {
@@ -1369,6 +1378,9 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
         }
     }
     if publish_registers {
+        // Once this owner leaves the boundary, the retained image is no
+        // longer an authorization to report any stop that races in behind it.
+        thr.clear_ptrace_stop_image_ready();
         thr.ptrace_stop_provenance.store(0, core::sync::atomic::Ordering::Release);
         let regs = thr.ptrace_registers.lock().take();
         if let Some(regs) = regs {
@@ -1408,6 +1420,38 @@ pub(super) fn interrupt_stop_siblings(proc_data: &ProcessData) {
     }
 }
 
+/// Captures the owner task's current user-boundary image if this wait loop has
+/// not already retained one. A resume-free consecutive stop may reuse that
+/// same parked image; it is re-associated with the new stop generation by the
+/// owner below without overwriting debugger edits made to the retained image.
+fn publish_owner_ptrace_image(thr: &Thread, uctx: &UserContext) {
+    let mut image = thr.ptrace_registers.lock();
+    if image.is_some() {
+        return;
+    }
+
+    let mut regs = [0; super::registers::NUM_GREGS];
+    super::registers::fill_gregs(
+        uctx,
+        thr.ptrace_orig_rax
+            .load(core::sync::atomic::Ordering::Acquire),
+        &mut regs,
+    );
+    if thr.ptrace_forced_tf.load(core::sync::atomic::Ordering::Acquire) {
+        regs[18] &= !super::ptrace_runtime::TRAP_FLAG;
+    }
+    *image = Some(regs);
+    drop(image);
+
+    if thr.ptrace_active_session().is_some() {
+        // Allocate and save in the owner task, never by dereferencing a
+        // remote scheduler context. Resume installs this exact image.
+        let image = axtask::snapshot_current_task_xsave().ok();
+        let retired = core::mem::replace(&mut *thr.ptrace_xsave.lock(), image);
+        drop(retired);
+    }
+}
+
 fn handle_stopped_interrupt(thr: &Thread, uctx: &mut UserContext) {
     let tid = linux_pid_from_task_id(current().id().as_u64())
         .unwrap_or_else(|error| fail_closed_exit(error));
@@ -1426,15 +1470,8 @@ fn handle_stopped_interrupt(thr: &Thread, uctx: &mut UserContext) {
 }
 
 pub fn notify_ptrace_attach_stop(thread: &Thread) {
-    let Some(stop) = thread.current_stop_report() else {
-        return;
-    };
-    let Some(session) = stop.ptrace_session else {
-        return;
-    };
-    if !thread.ptrace_stop_ready() || !thread.claim_ptrace_stop_notification() {
-        return;
-    }
+    let Some(stop) = thread.claim_ptrace_stop_notification() else { return; };
+    let Some(session) = stop.ptrace_session else { return; };
     if let Ok(waiter) = get_process_data(session.tracer) {
         let pid = waiter
             .pid_ns()

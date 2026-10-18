@@ -413,14 +413,7 @@ impl Thread {
             return Err(record);
         }
 
-        job_ctl.state = StopState::Stopped;
-        job_ctl.stop_signal = record.info().signo() as u8;
-        job_ctl.ptrace_event = 0;
-        job_ctl.stop_kind = StopKind::Ptrace;
-        job_ctl.ptrace_session = Some(session);
-        job_ctl.stop_reported = false;
-        job_ctl.stop_notified = false;
-        job_ctl.continued = false;
+        job_ctl.publish_ptrace_stop(session, record.info().signo() as u8, 0);
         *pending = Some(record);
         Ok(())
     }
@@ -532,6 +525,7 @@ impl Thread {
             StopState::Stopping if !require_inactive && job_ctl.stop_kind == StopKind::Ptrace => {
                 job_ctl.state = StopState::Running;
                 job_ctl.ptrace_session = None;
+                job_ctl.stop_image_generation = None;
                 ContinueResult::CanceledStopping
             }
             StopState::Stopping => ContinueResult::None,
@@ -539,6 +533,7 @@ impl Thread {
                 if job_ctl.is_ptrace_inactive_for(session) {
                     job_ctl.state = StopState::Running;
                     job_ctl.ptrace_session = None;
+                    job_ctl.stop_image_generation = None;
                     ContinueResult::ResumedStopped
                 } else {
                     ContinueResult::None
@@ -574,14 +569,7 @@ impl Thread {
         if job_ctl.stop_kind == StopKind::Ptrace && job_ctl.state != StopState::Running {
             return false;
         }
-        job_ctl.state = StopState::Stopped;
-        job_ctl.stop_signal = signo;
-        job_ctl.ptrace_event = 0;
-        job_ctl.stop_kind = StopKind::Ptrace;
-        job_ctl.ptrace_session = Some(session);
-        job_ctl.stop_reported = false;
-        job_ctl.stop_notified = false;
-        job_ctl.continued = false;
+        job_ctl.publish_ptrace_stop(session, signo, 0);
         true
     }
 
@@ -605,14 +593,7 @@ impl Thread {
             return false;
         }
         ptrace_ctl.event_message = message;
-        job_ctl.state = StopState::Stopped;
-        job_ctl.stop_signal = Signo::SIGTRAP as u8;
-        job_ctl.ptrace_event = event;
-        job_ctl.stop_kind = StopKind::Ptrace;
-        job_ctl.ptrace_session = Some(session);
-        job_ctl.stop_reported = false;
-        job_ctl.stop_notified = false;
-        job_ctl.continued = false;
+        job_ctl.publish_ptrace_stop(session, Signo::SIGTRAP as u8, event);
         true
     }
 
@@ -631,14 +612,7 @@ impl Thread {
         }
         ptrace_ctl.listening = false;
         ptrace_ctl.interrupt_pending = false;
-        job_ctl.state = StopState::Stopped;
-        job_ctl.stop_signal = signo;
-        job_ctl.ptrace_event = 128;
-        job_ctl.stop_kind = StopKind::Ptrace;
-        job_ctl.ptrace_session = Some(session);
-        job_ctl.stop_reported = false;
-        job_ctl.stop_notified = false;
-        job_ctl.continued = false;
+        job_ctl.publish_ptrace_stop(session, signo, 128);
         Some(true)
     }
 
@@ -685,12 +659,16 @@ impl Thread {
         self.ptrace_job_ctl.lock().state != StopState::Running
     }
     pub(crate) fn peek_ptrace_stop_status(&self, filter: StopFilter) -> Option<StopReport> {
-        let report = self.ptrace_job_ctl.lock().stop_report_for(filter)?;
-        self.ptrace_stop_ready().then_some(report)
+        let job = self.ptrace_job_ctl.lock();
+        let report = job.stop_report_for(filter)?;
+        (!report.traced() || job.ptrace_stop_image_ready(report)).then_some(report)
     }
     pub(crate) fn claim_ptrace_stop_status(&self, report: StopReport) -> Option<StopReport> {
         let mut job = self.ptrace_job_ctl.lock();
-        if job.stop_reported || job.current_stop_report()? != report {
+        if job.stop_reported
+            || job.current_stop_report()? != report
+            || (report.traced() && !job.ptrace_stop_image_ready(report))
+        {
             return None;
         }
         job.stop_reported = true;

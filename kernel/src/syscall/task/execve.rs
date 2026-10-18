@@ -232,11 +232,28 @@ fn wait_for_exec_group(
         }
     }
 
-    if proc_data.is_exec_owner(curr_tid) && proc_data.exec_ready(curr_tid) {
+    // Process membership is unlinked before do_exit() publishes Thread::exit
+    // and the ptrace terminal state, all under process_lifecycle. Serialize
+    // once with that exit transaction, then recheck: the live-thread count
+    // alone does not prove the old group leader reached Linux's exit-state
+    // boundary. The post-lock keyring/retirement tail is intentionally not
+    // part of this wait, matching de_thread()'s wait for leader->exit_state.
+    if exec_group_ready_after_exit_barrier(
+        || proc_data.lock_process_lifecycle(),
+        || proc_data.is_exec_owner(curr_tid) && proc_data.exec_ready(curr_tid),
+    ) {
         Ok(())
     } else {
         Err(AxError::Interrupted)
     }
+}
+
+fn exec_group_ready_after_exit_barrier<G>(
+    acquire_lifecycle: impl FnOnce() -> G,
+    ready: impl FnOnce() -> bool,
+) -> bool {
+    let _lifecycle = acquire_lifecycle();
+    ready()
 }
 
 const SUPPORTED_EXECVEAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
@@ -927,6 +944,7 @@ pub fn sys_execveat<M: UserMemory + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use alloc::{sync::Arc, vec, vec::Vec};
     use core::{
         ffi::c_char,
@@ -935,13 +953,17 @@ mod tests {
     };
 
     use axerrno::AxError;
+    use core::sync::atomic::AtomicBool;
     use linux_raw_sys::general::CAP_SYS_PTRACE;
+    use std::sync::{mpsc, Mutex};
+    use std::thread;
     use tk_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmResult};
 
     use super::{
         ExecArgSizer, MappingFlags, PAGE_SIZE_4K, UserContext, VirtAddr, classify_exec_trace_state,
         effective_exec_personality, exact_exec_thread_snapshot, exec_arg_limit,
-        exec_file_capabilities, exec_mm_owner_user_ns, files_preparation_covers_thread_snapshot,
+        exec_file_capabilities, exec_group_ready_after_exit_barrier, exec_mm_owner_user_ns,
+        files_preparation_covers_thread_snapshot,
         install_exec_user_context, install_mmap_page_zero, load_exec_byte_vec,
     };
     use crate::{
@@ -1021,6 +1043,57 @@ mod tests {
     fn exec_thread_snapshot_rejects_same_count_tid_aba() {
         assert!(exact_exec_thread_snapshot(&[7, 8], 2, [7, 8].into_iter()));
         assert!(!exact_exec_thread_snapshot(&[7, 8], 2, [7, 9].into_iter()));
+    }
+
+    #[test]
+    fn nonleader_exec_waits_for_leader_exit_state_publication() {
+        let lifecycle = Arc::new(Mutex::new(()));
+        let only_exec_owner = Arc::new(AtomicBool::new(false));
+        let leader_exit_state_published = Arc::new(AtomicBool::new(false));
+
+        // The host fixture cannot construct a ProcessData/Thread pair; this
+        // flag models do_exit()'s existing Thread::set_exit publication.
+        // Model do_exit() after core membership unlink: exec_ready() is true,
+        // but the old leader is still finishing its lifecycle-locked teardown.
+        let exit_lifecycle = lifecycle.lock().unwrap();
+        only_exec_owner.store(true, Ordering::Release);
+
+        let waiter_lifecycle = lifecycle.clone();
+        let waiter_only_owner = only_exec_owner.clone();
+        let waiter_exit_state = leader_exit_state_published.clone();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let ready = exec_group_ready_after_exit_barrier(
+                || {
+                    assert!(matches!(
+                        waiter_lifecycle.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ));
+                    blocked_tx.send(()).unwrap();
+                    waiter_lifecycle.lock().unwrap()
+                },
+                || {
+                    assert!(waiter_only_owner.load(Ordering::Acquire));
+                    assert!(waiter_exit_state.load(Ordering::Acquire));
+                    true
+                },
+            );
+            ready_tx.send(ready).unwrap();
+        });
+
+        // The waiter observed the held lifecycle guard and is at the barrier;
+        // readiness cannot proceed on the core unlink alone.
+        blocked_rx.recv().unwrap();
+        assert!(matches!(ready_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        // do_exit publishes Thread::exit while still holding this lifecycle
+        // guard. The remaining release_task-like tail runs after the lock and
+        // is not required by the Linux exit_state handoff condition.
+        leader_exit_state_published.store(true, Ordering::Release);
+        drop(exit_lifecycle);
+        assert!(ready_rx.recv().unwrap());
+        waiter.join().unwrap();
     }
 
     #[test]

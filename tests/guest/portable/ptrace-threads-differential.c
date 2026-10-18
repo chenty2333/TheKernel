@@ -50,6 +50,17 @@ static int exited(pid_t tid, int code) {
     return waitpid(tid, &status, __WALL) == tid && WIFEXITED(status) && WEXITSTATUS(status) == code;
 }
 
+/* Wait for a resumed worker to run while proving its ptrace-stopped peer stays still. */
+static int wait_for_counter_progress(unsigned running, unsigned running_start,
+                                     unsigned stopped, unsigned stopped_value) {
+    while (atomic_load(&shared->count[running]) == running_start) {
+        if (atomic_load(&shared->count[stopped]) != stopped_value) return 0;
+        /* The test's existing 15s alarm bounds this wait; a sleep alone is not a scheduling guarantee. */
+        usleep(1000);
+    }
+    return atomic_load(&shared->count[stopped]) == stopped_value;
+}
+
 static const char *self_path;
 static void *exec_worker(void *unused) {
     (void)unused;
@@ -58,7 +69,10 @@ static void *exec_worker(void *unused) {
     while (!atomic_load(&shared->leave[0])) sched_yield();
     char *args[] = {(char *)self_path, "--thread-exec-child", NULL};
     char *env[] = {NULL};
-    syscall(SYS_execve, self_path, args, env);
+    long result = syscall(SYS_execve, self_path, args, env);
+    fprintf(stderr,
+            "ptrace-threads: nonleader-exec execve returned %ld errno=%d\n",
+            result, errno);
     _exit(31);
 }
 static int nonleader_exec(void) {
@@ -73,20 +87,36 @@ static int nonleader_exec(void) {
     }
     while (!atomic_load(&shared->ready)) sched_yield();
     pid_t worker_tid = shared->tid[0]; CHECK(worker_tid != target);
+    fprintf(stderr,
+            "ptrace-threads: nonleader-exec worker ready target=%d worker_tid=%d\n",
+            target, worker_tid);
     /* The leader is asleep in pause, not executing a user spin loop. */
     CHECK(request(PTRACE_SEIZE, target, 0, NULL) == 0);
     CHECK(request(PTRACE_INTERRUPT, target, 0, NULL) == 0 && stopped(target));
+    fprintf(stderr, "ptrace-threads: nonleader-exec leader stopped\n");
     struct user_regs_struct leader_regs;
     CHECK(request(PTRACE_GETREGS, target, 0, &leader_regs) == 0 && leader_regs.rip);
     CHECK(request(PTRACE_CONT, target, 0, NULL) == 0);
     CHECK(request(PTRACE_SEIZE, worker_tid, 0, (void *)(uintptr_t)PTRACE_O_TRACEEXEC) == 0);
-    CHECK(request(PTRACE_INTERRUPT, worker_tid, 0, NULL) == 0 && stopped(worker_tid));
+    fprintf(stderr, "ptrace-threads: nonleader-exec worker INTERRUPT begin\n");
+    CHECK(request(PTRACE_INTERRUPT, worker_tid, 0, NULL) == 0);
+    fprintf(stderr, "ptrace-threads: nonleader-exec worker INTERRUPT done; waiting stop\n");
+    CHECK(stopped(worker_tid));
     fprintf(stderr, "ptrace-threads: nonleader-exec worker stopped\n");
     atomic_store(&shared->leave[0], 1);
     CHECK(request(PTRACE_CONT, worker_tid, 0, NULL) == 0);
-    int status;
-    CHECK(waitpid(target, &status, __WALL) == target && WIFSTOPPED(status) &&
-          WSTOPSIG(status) == SIGTRAP && (status >> 16) == PTRACE_EVENT_EXEC);
+    fprintf(stderr, "ptrace-threads: nonleader-exec worker resumed; waiting exec stop\n");
+    int status = 0;
+    pid_t reported = waitpid(target, &status, __WALL);
+    if (reported != target || !WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP ||
+        (status >> 16) != PTRACE_EVENT_EXEC) {
+        fprintf(stderr,
+                "ptrace-threads: nonleader-exec unexpected wait result pid=%d status=0x%x "
+                "stopped=%d signal=%d event=%d\n",
+                reported, status, WIFSTOPPED(status), WIFSTOPPED(status) ? WSTOPSIG(status) : 0,
+                (status >> 16));
+        return fail("nonleader-exec PTRACE_EVENT_EXEC wait");
+    }
     fprintf(stderr, "ptrace-threads: nonleader-exec adopted leader\n");
     unsigned long old_tid = 0;
     CHECK(request(PTRACE_GETEVENTMSG, target, 0, &old_tid) == 0 && old_tid == (unsigned long)worker_tid);
@@ -176,8 +206,7 @@ int main(int argc, char **argv) {
     CHECK(request(PTRACE_SEIZE, a, 0, NULL) == 0);
     CHECK(request(PTRACE_INTERRUPT, a, 0, NULL) == 0 && stopped(a));
     unsigned a0 = atomic_load(&shared->count[0]), b0 = atomic_load(&shared->count[1]);
-    usleep(20000);
-    CHECK(atomic_load(&shared->count[0]) == a0 && atomic_load(&shared->count[1]) != b0);
+    CHECK(wait_for_counter_progress(1, b0, 0, a0));
     CHECK(request(PTRACE_SEIZE, b, 0, NULL) == 0);
     CHECK(request(PTRACE_INTERRUPT, b, 0, NULL) == 0 && stopped(b));
     struct user_regs_struct ar, br;
@@ -188,9 +217,10 @@ int main(int argc, char **argv) {
     CHECK(request(PTRACE_PEEKUSER, a, offsetof(struct user, u_debugreg[7]), &control) == 0 && control == 0);
     CHECK(ar.rsp != br.rsp && ar.fs_base != br.fs_base && ar.fs_base != 0 && br.fs_base != 0);
     b0 = atomic_load(&shared->count[1]);
+    unsigned a_before_resume = atomic_load(&shared->count[0]);
+    CHECK(a_before_resume == a0);
     CHECK(request(PTRACE_CONT, a, 0, NULL) == 0);
-    usleep(20000);
-    CHECK(atomic_load(&shared->count[0]) != a0 && atomic_load(&shared->count[1]) == b0);
+    CHECK(wait_for_counter_progress(0, a_before_resume, 1, b0));
     CHECK(request(PTRACE_INTERRUPT, a, 0, NULL) == 0 && stopped(a));
     atomic_store(&shared->leave[0], 1);
     CHECK(request(PTRACE_CONT, a, 0, NULL) == 0);
@@ -209,8 +239,13 @@ int main(int argc, char **argv) {
     atomic_store(&shared->allow_process_exit, 1);
     CHECK(exited(target, 23)); target = 0;
     CHECK(munmap(shared, 4096) == 0);
+    fprintf(stderr, "ptrace-threads: basic thread exits complete\n");
+    fprintf(stderr, "ptrace-threads: nonleader-exec starting\n");
     CHECK(nonleader_exec() == 0);
+    fprintf(stderr, "ptrace-threads: nonleader-exec complete\n");
+    fprintf(stderr, "ptrace-threads: interrupted-wait starting\n");
     CHECK(interrupted_wait_without_handler() == 0);
+    fprintf(stderr, "ptrace-threads: interrupted-wait complete\n");
     alarm(0);
     puts("THEKERNEL_ABI_ASSERT ptrace-threads.raw-differential TASK_EXACT_STOP_REGISTERS_RESUME_AND_EXIT pass");
     puts("THEKERNEL_ABI_RESULT ptrace-threads.raw-differential pass");

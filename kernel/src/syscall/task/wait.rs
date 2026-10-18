@@ -367,51 +367,121 @@ fn matching_wait_candidates(
         }
         let tracee_id = reverse_link.tracee();
         if let Some(exit) = proc_data.ptrace_task_exit(reverse_link) {
-            let Some(report) = exit.identity(reverse_link.session()) else {
-                continue;
-            };
-            let Some(visible_pid) = viewer_pid_ns
-                .visible_pid_for(&exit.pid_ns, exit.tid)
-                .filter(|visible| pid.matches(*visible, report.pgid))
-            else {
-                continue;
-            };
-            candidates.push(WaitCandidate {
-                process: None,
-                task_exit: Some(exit),
-                task: None,
-                visible_pid,
-                allow_exit: true,
-                expected_ptrace_session: Some(reverse_link.session()),
-            });
+            push_ptrace_task_exit_candidate(
+                &mut candidates,
+                viewer_pid_ns,
+                pid,
+                reverse_link,
+                exit,
+            );
             continue;
         }
         let task = crate::task::get_task(tracee_id).ok();
-        let tracee = task
-            .as_ref()
-            .map(|task| task.as_thread().proc_data.proc.clone())
-            .or_else(|| process_domain().ok()?.registry().get(reverse_link.process()));
-        let Some(tracee) = tracee else {
-            proc_data.remove_ptrace_tracee(reverse_link);
-            continue;
+        let (tracee, visible_pid) = if let Some(task) = task.as_ref() {
+            let thread = task.as_thread();
+            // do_exit retains a nonleader's terminal identity, removes its
+            // task membership, and clears the live relationship while holding
+            // this gate. Exec's nonleader identity handoff also changes the
+            // visible TID and task identity under process_lifecycle, so use
+            // the full publication gate before making a live candidate.
+            // Re-read both sides under it so a wait that first saw no retained
+            // status cannot mistake the subsequently cleared session for a
+            // stale reverse link and delete that status.
+            let _ptrace_publication = thread.lock_ptrace_publication();
+            if let Some(exit) = proc_data.ptrace_task_exit(reverse_link) {
+                push_ptrace_task_exit_candidate(
+                    &mut candidates,
+                    viewer_pid_ns,
+                    pid,
+                    reverse_link,
+                    exit,
+                );
+                continue;
+            }
+            let tracee = thread.proc_data.proc.clone();
+            let session = thread
+                .ptrace_session_if_traced_by_process(proc.pid())
+                // A dead group leader can have already cleared its live
+                // relationship while its scheduler task Arc is still alive.
+                // The process-level report belongs only to the exact leader
+                // registration (kernel TID), not to an arbitrary sibling.
+                .or_else(|| {
+                    crate::task::retained_ptrace_exit_session_for_kernel_tid(
+                        &tracee,
+                        reverse_link.tracee(),
+                    )
+                });
+            if session != Some(reverse_link.session()) {
+                // Relationship detach/reattach and process exit use the same
+                // publication order, so no terminal publisher or exec alias
+                // handoff for this generation can race this stale-link cleanup.
+                if let Some(exit) = proc_data.remove_ptrace_tracee_if_unretained(reverse_link) {
+                    push_ptrace_task_exit_candidate(
+                        &mut candidates,
+                        viewer_pid_ns,
+                        pid,
+                        reverse_link,
+                        exit,
+                    );
+                }
+                continue;
+            }
+            let visible_pid = viewer_pid_ns.visible_pid_for(&thread.pid_ns(), thread.tid());
+            (tracee, visible_pid)
+        } else {
+            // The task registry holds weak references. Once this lookup no
+            // longer resolves the tracee, its exit closure has completed;
+            // check and remove a stale reverse node atomically, preserving a
+            // terminal task report retained since the first lookup. If no
+            // task report exists, a leader may still own its process-level
+            // ptrace exit state below.
+            if let Some(exit) = proc_data.ptrace_task_exit(reverse_link) {
+                push_ptrace_task_exit_candidate(
+                    &mut candidates,
+                    viewer_pid_ns,
+                    pid,
+                    reverse_link,
+                    exit,
+                );
+                continue;
+            }
+            let tracee = process_domain()
+                .ok()
+                .and_then(|domain| domain.registry().get(reverse_link.process()));
+            let Some(tracee) = tracee else {
+                if let Some(exit) = proc_data.remove_ptrace_tracee_if_unretained(reverse_link) {
+                    push_ptrace_task_exit_candidate(
+                        &mut candidates,
+                        viewer_pid_ns,
+                        pid,
+                        reverse_link,
+                        exit,
+                    );
+                }
+                continue;
+            };
+            // The process-level exit state is not a substitute for a missing
+            // nonleader's task-scoped report. Match the identity generation's
+            // immutable registration TID to the reverse link's kernel TID.
+            let session = crate::task::retained_ptrace_exit_session_for_kernel_tid(
+                &tracee,
+                reverse_link.tracee(),
+            );
+            if session != Some(reverse_link.session()) {
+                if let Some(exit) = proc_data.remove_ptrace_tracee_if_unretained(reverse_link) {
+                    push_ptrace_task_exit_candidate(
+                        &mut candidates,
+                        viewer_pid_ns,
+                        pid,
+                        reverse_link,
+                        exit,
+                    );
+                }
+                continue;
+            }
+            let visible_pid = visible_process_pid(viewer_pid_ns, &tracee);
+            (tracee, visible_pid)
         };
-        let session = task
-            .as_ref()
-            .and_then(|task| {
-                task.as_thread()
-                    .ptrace_session_if_traced_by_process(proc.pid())
-            })
-            .or_else(|| crate::task::retained_ptrace_exit_session(&tracee));
-        if session != Some(reverse_link.session()) {
-            proc_data.remove_ptrace_tracee(reverse_link);
-            continue;
-        }
-        let visible_pid = task
-            .as_ref()
-            .and_then(|task| {
-                viewer_pid_ns.visible_pid_for(&task.as_thread().pid_ns(), task.as_thread().tid())
-            })
-            .or_else(|| visible_process_pid(viewer_pid_ns, &tracee));
         let Some(visible_pid) =
             visible_pid.filter(|visible| pid.matches(*visible, tracee.group().pgid()))
         else {
@@ -443,6 +513,32 @@ fn matching_wait_candidates(
     } else {
         Ok(candidates)
     }
+}
+
+fn push_ptrace_task_exit_candidate(
+    candidates: &mut Vec<WaitCandidate>,
+    viewer_pid_ns: &PidNamespace,
+    pid: WaitPid,
+    reverse_link: crate::task::PtraceReverseLink,
+    exit: Arc<crate::task::PtraceTaskExit>,
+) {
+    let Some(report) = exit.identity(reverse_link.session()) else {
+        return;
+    };
+    let Some(visible_pid) = viewer_pid_ns
+        .visible_pid_for(&exit.pid_ns, exit.tid)
+        .filter(|visible| pid.matches(*visible, report.pgid))
+    else {
+        return;
+    };
+    candidates.push(WaitCandidate {
+        process: None,
+        task_exit: Some(exit),
+        task: None,
+        visible_pid,
+        allow_exit: true,
+        expected_ptrace_session: Some(reverse_link.session()),
+    });
 }
 
 fn waitid_pidfd(fd: i32) -> AxResult<FileHandle<PidFd>> {
@@ -1229,16 +1325,19 @@ mod tests {
             signal: 19,
             ptrace_event: 0,
             ptrace_session: Some(old),
+            generation: 1,
         };
         let new_stop = StopReport {
             signal: 19,
             ptrace_event: 0,
             ptrace_session: Some(new),
+            generation: 2,
         };
         let job_control_stop = StopReport {
             signal: 19,
             ptrace_event: 0,
             ptrace_session: None,
+            generation: 0,
         };
 
         // A waiter that named a session sees exactly that session's stop.

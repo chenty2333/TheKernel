@@ -83,6 +83,36 @@ pub(crate) fn retained_ptrace_exit_session(process: &Process) -> Option<PtraceSe
         .session()
 }
 
+/// Returns the process-level leader exit session only for the exact scheduler
+/// identity that owns the retained group-leader registration. Reverse ptrace
+/// links store immutable kernel TIDs, and exec republishes this registration
+/// with the executor's kernel TID.
+pub(crate) fn retained_ptrace_exit_session_for_kernel_tid(
+    process: &Process,
+    kernel_tid: Pid,
+) -> Option<PtraceSession> {
+    let owner = retained_exit_owner(process)?;
+    let owner = owner.lock();
+    let identity = owner.as_ref()?;
+    retained_ptrace_exit_session_for_identity(
+        identity.registration_tid,
+        kernel_tid,
+        identity.ptrace_exit,
+    )
+}
+
+fn retained_ptrace_exit_session_for_identity(
+    registration_tid: Pid,
+    kernel_tid: Pid,
+    exit: PtraceExitState,
+) -> Option<PtraceSession> {
+    if registration_tid == kernel_tid {
+        exit.session()
+    } else {
+        None
+    }
+}
+
 /// Transfer before clearing the live relationship, under its action gate. The
 /// tracer reverse link remains until terminal wait or tracer teardown.
 pub(crate) fn retain_ptrace_exit(thread: &super::super::Thread) {
@@ -278,6 +308,26 @@ mod tests {
         assert_eq!(ptrace_exit_notification_signal(None, true), None);
         assert_eq!(ptrace_exit_notification_signal(Some(10), false), Some(17));
         assert_eq!(ptrace_exit_notification_signal(None, false), Some(17));
+    }
+    #[test]
+    fn retained_leader_exit_session_matches_only_its_registration_kernel_tid() {
+        let retained = PtraceExitState::Pending(session(1));
+        assert_eq!(
+            retained_ptrace_exit_session_for_identity(10, 10, retained),
+            Some(session(1)),
+        );
+        // A missing sibling link must not borrow the group leader's process-
+        // scoped exit session merely because it shares the same Process.
+        assert_eq!(retained_ptrace_exit_session_for_identity(10, 11, retained), None);
+
+        // Exec replaces the leader registration with the executor's immutable
+        // kernel TID; the existing alias handoff remains eligible only for
+        // that exact executor identity.
+        assert_eq!(
+            retained_ptrace_exit_session_for_identity(11, 11, retained),
+            Some(session(1)),
+        );
+        assert_eq!(retained_ptrace_exit_session_for_identity(11, 10, retained), None);
     }
     #[test]
     fn teardown_before_publication_leaves_final_parent_notification_enabled() {

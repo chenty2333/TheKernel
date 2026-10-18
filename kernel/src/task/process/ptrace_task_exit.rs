@@ -64,10 +64,9 @@ impl Drop for PtraceTaskExit {
     }
 }
 
-impl ProcessData {
-    pub(crate) fn ptrace_task_exit(&self, link: PtraceReverseLink) -> Option<Arc<PtraceTaskExit>> {
-        let links = self.ptrace_tracees.lock();
-        let mut node = links.head.as_deref();
+impl PtraceReverseLinks {
+    fn task_exit(&self, link: PtraceReverseLink) -> Option<Arc<PtraceTaskExit>> {
+        let mut node = self.head.as_deref();
         while let Some(item) = node {
             if item.tracee == link.tracee && item.session == link.session {
                 return item.task_exit.clone();
@@ -76,9 +75,9 @@ impl ProcessData {
         }
         None
     }
-    fn retain_task_exit(&self, link: PtraceReverseLink, exit: Arc<PtraceTaskExit>) -> bool {
-        let mut links = self.ptrace_tracees.lock();
-        let mut node = links.head.as_deref_mut();
+
+    fn retain_task_exit(&mut self, link: PtraceReverseLink, exit: Arc<PtraceTaskExit>) -> bool {
+        let mut node = self.head.as_deref_mut();
         while let Some(item) = node {
             if item.tracee == link.tracee && item.session == link.session {
                 exit.retained.store(true, Ordering::Release);
@@ -88,6 +87,63 @@ impl ProcessData {
             node = item.next.as_deref_mut();
         }
         false
+    }
+
+    fn remove_if_unretained(
+        &mut self,
+        link: PtraceReverseLink,
+    ) -> (
+        Option<Arc<PtraceTaskExit>>,
+        Option<Box<PtraceReverseLinkNode>>,
+    ) {
+        let mut cursor = &mut self.head;
+        loop {
+            let matches = cursor
+                .as_ref()
+                .is_some_and(|node| node.tracee == link.tracee && node.session == link.session);
+            if matches {
+                if let Some(exit) = cursor.as_ref().and_then(|node| node.task_exit.clone()) {
+                    return (Some(exit), None);
+                }
+                let mut removed = cursor.take().expect("matched reverse node disappeared");
+                *cursor = removed.next.take();
+                self.len -= 1;
+                return (None, Some(removed));
+            }
+            let Some(node) = cursor.as_mut() else {
+                return (None, None);
+            };
+            cursor = &mut node.next;
+        }
+    }
+}
+
+impl ProcessData {
+    pub(crate) fn ptrace_task_exit(&self, link: PtraceReverseLink) -> Option<Arc<PtraceTaskExit>> {
+        self.ptrace_tracees.lock().task_exit(link)
+    }
+    /// Removes a stale reverse link only if it does not own a terminal task
+    /// report. Call with the exact tracee's ptrace publication guard held, or
+    /// after the exact task is no longer in the task table. The terminal check
+    /// and unlink share one reverse-list critical section with terminal
+    /// retention, so a racing wait cannot erase a newly attached report. It
+    /// returns the terminal owner if retained, and otherwise removes the link
+    /// if present.
+    /// This only recognizes task-scoped terminal reports; callers must retain
+    /// the existing process-scoped group-leader exit fallback separately.
+    pub(crate) fn remove_ptrace_tracee_if_unretained(
+        &self,
+        link: PtraceReverseLink,
+    ) -> Option<Arc<PtraceTaskExit>> {
+        let (terminal, removed) = {
+            let mut links = self.ptrace_tracees.lock();
+            links.remove_if_unretained(link)
+        };
+        drop(removed);
+        terminal
+    }
+    fn retain_task_exit(&self, link: PtraceReverseLink, exit: Arc<PtraceTaskExit>) -> bool {
+        self.ptrace_tracees.lock().retain_task_exit(link, exit)
     }
     pub(crate) fn claim_ptrace_task_exit(
         &self,
@@ -205,6 +261,88 @@ mod tests {
         assert_eq!(exit.report(session(1)).unwrap().wait_status, 23 << 8);
         assert!(exit.report(session(2)).is_none());
     }
+
+    #[test]
+    fn retained_nonleader_exit_stays_discoverable_until_report_ready() {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let pid_ns = PidNamespace::try_new_root(user_ns.clone()).unwrap();
+        pid_ns.reserve_process(10).unwrap().commit();
+        pid_ns.reserve_process(11).unwrap().commit();
+
+        let session = session(1);
+        let link = PtraceReverseLink {
+            tracee: 11,
+            process: 10,
+            session,
+        };
+        let exit = Arc::new(PtraceTaskExit::new(pid_ns.clone(), link.tracee));
+        *exit.state.lock() = (
+            Some(PtraceTaskExitReport {
+                session,
+                wait_status: 23 << 8,
+                credential: Cred::try_root(user_ns).unwrap(),
+                usage: TaskUsage::default(),
+                pgid: 10,
+                process: 10,
+            }),
+            false,
+        );
+
+        let mut links = PtraceReverseLinks {
+            head: Some(Box::new(PtraceReverseLinkNode {
+                tracee: link.tracee,
+                process: link.process,
+                session,
+                retired_relationship: None,
+                task_exit: None,
+                next: None,
+            })),
+            len: 1,
+            reservations: 0,
+            closed: false,
+        };
+
+        // The first reverse-link snapshot can observe this node before exit
+        // retention publishes its terminal owner.
+        assert!(links.task_exit(link).is_none());
+        // This is the early terminal-retention edge in do_exit: after core
+        // task unlink a tracer wait can no longer resolve a live task, so the
+        // reverse link itself must now identify the pending nonleader status.
+        assert!(links.retain_task_exit(link, exit.clone()));
+        let retained = links
+            .task_exit(link)
+            .expect("terminal reverse node vanished");
+        assert!(Arc::ptr_eq(&retained, &exit));
+        assert!(exit.retained.load(Ordering::Acquire));
+        assert!(retained.identity(session).is_some());
+        // matching_wait_candidates takes this branch before its stale-live-task
+        // fallback. Identity admits a blocking candidate, while report() keeps
+        // select_wait_event from claiming it before set_exit publishes readiness.
+        assert!(retained.report(session).is_none());
+        assert!(pid_ns.visible_pid_checked(link.tracee).is_some());
+
+        // A stale-candidate cleanup may have observed no terminal while
+        // building its first snapshot. Its final inspect-or-remove must
+        // preserve the terminal node installed in the meantime and return the
+        // same report owner so this wait iteration can add a TaskExited
+        // candidate instead of concluding ECHILD from an empty candidate set.
+        let (raced_terminal, removed) = links.remove_if_unretained(link);
+        assert!(removed.is_none());
+        let raced_terminal = raced_terminal.expect("stale cleanup erased terminal node");
+        assert!(Arc::ptr_eq(&raced_terminal, &exit));
+        assert!(Arc::ptr_eq(
+            &links.task_exit(link).expect("raced terminal node vanished"),
+            &exit
+        ));
+
+        exit.state.lock().1 = true;
+        assert_eq!(retained.report(session).unwrap().wait_status, 23 << 8);
+        assert!(Arc::ptr_eq(
+            &links.task_exit(link).expect("ready terminal node vanished"),
+            &exit
+        ));
+    }
+
     #[test]
     fn reverse_node_teardown_releases_tid_even_with_a_retained_snapshot() {
         let ns = PidNamespace::try_new_root(UserNamespace::try_new_root().unwrap()).unwrap();

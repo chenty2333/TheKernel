@@ -38,6 +38,10 @@ pub(crate) struct StopReport {
     /// ordinary signal-delivery stops cannot accidentally look like an event.
     pub(crate) ptrace_event: u8,
     pub(crate) ptrace_session: Option<PtraceSession>,
+    /// Identity of this ptrace stop, distinct from the relationship lifetime.
+    /// A stale register image or waiter from an earlier stop must not make a
+    /// newly published stop ready or claimable.
+    pub(crate) generation: u64,
 }
 
 impl StopReport {
@@ -113,6 +117,10 @@ pub(in crate::task) struct JobControlState {
     pub(in crate::task) continued: bool,
     pub(in crate::task) stop_reported: bool,
     pub(in crate::task) stop_notified: bool,
+    /// Monotonic identity for each ptrace stop published by this task.
+    pub(in crate::task) stop_generation: u64,
+    /// Stop incarnation whose owner-published register image is waitable.
+    pub(in crate::task) stop_image_generation: Option<u64>,
 }
 
 impl JobControlState {
@@ -120,6 +128,68 @@ impl JobControlState {
         self.state == StopState::Stopped
             && self.stop_kind == StopKind::Ptrace
             && self.ptrace_session == Some(session)
+    }
+
+    /// Publishes one new ptrace-stop incarnation and invalidates any register
+    /// image retained from an earlier stop. The tracee owner marks this exact
+    /// incarnation ready only after it reaches its user boundary.
+    pub(in crate::task) fn publish_ptrace_stop(
+        &mut self,
+        session: PtraceSession,
+        signal: u8,
+        event: u8,
+    ) -> StopReport {
+        self.stop_generation = self.stop_generation.wrapping_add(1);
+        self.state = StopState::Stopped;
+        self.stop_signal = signal;
+        self.ptrace_event = event;
+        self.stop_kind = StopKind::Ptrace;
+        self.ptrace_session = Some(session);
+        self.stop_reported = false;
+        self.stop_notified = false;
+        self.stop_image_generation = None;
+        self.continued = false;
+        self.current_stop_report()
+            .expect("published ptrace stop has a report")
+    }
+
+    pub(in crate::task) fn ptrace_stop_image_ready(&self, report: StopReport) -> bool {
+        report.traced()
+            && self.current_stop_report() == Some(report)
+            && self.stop_image_generation == Some(report.generation)
+    }
+
+    /// A wait loop may sleep only when no ptrace stop is pending or the owner
+    /// has published an image for the exact current incarnation.
+    pub(in crate::task) fn ptrace_stop_wait_can_block(&self) -> bool {
+        self.current_stop_report().is_none_or(|report| {
+            !report.traced() || self.stop_image_generation == Some(report.generation)
+        })
+    }
+
+    /// Associates the owner's currently parked register image with this stop
+    /// only if no intervening resume or replacement stop changed its identity.
+    pub(in crate::task) fn mark_ptrace_stop_image_ready(
+        &mut self,
+        report: StopReport,
+    ) -> bool {
+        if !report.traced() || self.current_stop_report() != Some(report) {
+            return false;
+        }
+        self.stop_image_generation = Some(report.generation);
+        true
+    }
+
+    /// Claims the one wake for the currently published stop only after its
+    /// exact owner image is ready. Keeping validation and the notified bit
+    /// under one lock avoids acknowledging a replaced stop.
+    pub(in crate::task) fn claim_ptrace_stop_notification(&mut self) -> Option<StopReport> {
+        let report = self.current_stop_report()?;
+        if !self.ptrace_stop_image_ready(report) || self.stop_notified {
+            return None;
+        }
+        self.stop_notified = true;
+        Some(report)
     }
 
     pub(in crate::task) fn stop_report_for(&self, filter: StopFilter) -> Option<StopReport> {
@@ -137,6 +207,11 @@ impl JobControlState {
             signal: self.stop_signal,
             ptrace_event: self.ptrace_event,
             ptrace_session,
+            generation: if ptrace_session.is_some() {
+                self.stop_generation
+            } else {
+                0
+            },
         })
     }
 
@@ -152,6 +227,11 @@ impl JobControlState {
             signal: self.stop_signal,
             ptrace_event: self.ptrace_event,
             ptrace_session,
+            generation: if ptrace_session.is_some() {
+                self.stop_generation
+            } else {
+                0
+            },
         })
     }
 }
@@ -167,6 +247,8 @@ impl Default for JobControlState {
             continued: false,
             stop_reported: false,
             stop_notified: false,
+            stop_generation: 0,
+            stop_image_generation: None,
         }
     }
 }
@@ -398,6 +480,53 @@ mod tests {
     }
 
     #[test]
+    fn ptrace_stop_image_readiness_is_bound_to_each_resume_incarnation() {
+        let session = super::PtraceSession {
+            tracer: 7,
+            tracer_kernel_tid: 70,
+            generation: 1,
+        };
+        let mut job = JobControlState::default();
+        assert!(job.ptrace_stop_wait_can_block());
+
+        // An attach stop may notify before the owner has saved registers. That
+        // early attempt must not consume the one notification for this stop.
+        let attach = job.publish_ptrace_stop(session, 19, 0);
+        assert!(!job.ptrace_stop_wait_can_block());
+        assert!(!job.ptrace_stop_image_ready(attach));
+        assert_eq!(job.claim_ptrace_stop_notification(), None);
+        assert!(!job.stop_notified);
+        assert!(job.mark_ptrace_stop_image_ready(attach));
+        assert!(job.ptrace_stop_wait_can_block());
+        assert_eq!(job.claim_ptrace_stop_notification(), Some(attach));
+
+        // PTRACE_CONT opens the user boundary while the old image can still
+        // be retained. A following interrupt stop gets a new identity and
+        // must wait for the owner to associate a current image before notify.
+        job.state = StopState::Running;
+        job.ptrace_session = None;
+        let interrupt = job.publish_ptrace_stop(session, 5, 128);
+        assert_ne!(interrupt.generation, attach.generation);
+        assert!(!job.ptrace_stop_wait_can_block());
+        assert!(!job.ptrace_stop_image_ready(interrupt));
+        assert_eq!(job.claim_ptrace_stop_notification(), None);
+        assert!(!job.stop_notified);
+        assert_eq!(job.stop_image_generation, None);
+        // Even if a regression leaves the previous generation's readiness
+        // stamp behind, it cannot authorize this new stop to block or notify.
+        job.stop_image_generation = Some(attach.generation);
+        assert!(!job.ptrace_stop_wait_can_block());
+        assert!(!job.ptrace_stop_image_ready(interrupt));
+        job.stop_image_generation = None;
+
+        // The late owner publication can then notify exactly this stop; a
+        // stale attach image cannot suppress that wake.
+        assert!(job.mark_ptrace_stop_image_ready(interrupt));
+        assert_eq!(job.claim_ptrace_stop_notification(), Some(interrupt));
+        assert!(job.stop_notified);
+    }
+
+    #[test]
     fn process_access_ptrace_inactive_and_wait_report_require_exact_generation() {
         let mut control = PtraceControlState::default();
         let ptracer_cred = credential();
@@ -420,6 +549,8 @@ mod tests {
             continued: false,
             stop_reported: false,
             stop_notified: false,
+            stop_generation: 1,
+            stop_image_generation: Some(1),
         };
         assert!(job.is_ptrace_inactive_for(old));
         let old_report = job.stop_report_for(StopFilter::Session(old)).unwrap();
@@ -443,6 +574,7 @@ mod tests {
         // A late restore from the old waiter cannot match a newly published
         // stop owned by a later relationship using the same tracer PID.
         job.ptrace_session = Some(new);
+        job.stop_generation += 1;
         assert_ne!(job.current_stop_report(), Some(old_report));
         assert_eq!(job.stop_report_for(StopFilter::Session(old)), None);
         assert_eq!(

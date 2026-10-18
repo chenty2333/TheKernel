@@ -11,26 +11,49 @@ fn exec_stop_kind(options: u32, seized: bool) -> Option<u8> {
     }
 }
 
-fn owner_image_ready(image: &Option<crate::task::registers::GeneralRegisters>) -> bool { image.is_some() }
-
 impl super::super::Thread {
     /// A requested stop is not yet a waitable stop. Every owner must have
     /// crossed its user boundary and published its value image first.
     pub(crate) fn ptrace_stop_ready(&self) -> bool {
-        owner_image_ready(&self.ptrace_registers.lock())
+        let job = self.ptrace_job_ctl.lock();
+        job.current_stop_report()
+            .is_some_and(|report| job.ptrace_stop_image_ready(report))
     }
 
-    pub(crate) fn claim_ptrace_stop_notification(&self) -> bool {
-        let mut job = self.ptrace_job_ctl.lock();
-        if job
+    pub(crate) fn current_ptrace_stop_report(&self) -> Option<StopReport> {
+        self.ptrace_job_ctl
+            .lock()
             .current_stop_report()
-            .is_none_or(|stop| stop.ptrace_session.is_none())
-            || job.stop_notified
-        {
-            return false;
-        }
-        job.stop_notified = true;
-        true
+            .filter(|report| report.traced())
+    }
+
+    /// Keeps the owner in its wait loop when a new ptrace stop raced the
+    /// loop's preceding register-image snapshot.
+    pub(crate) fn ptrace_stop_wait_can_block(&self) -> bool {
+        self.ptrace_job_ctl.lock().ptrace_stop_wait_can_block()
+    }
+
+    /// A stop image remains useful across a resume-free notification only
+    /// when the same owner explicitly re-publishes it for this incarnation.
+    pub(crate) fn mark_ptrace_stop_image_ready(&self, report: StopReport) -> bool {
+        self.ptrace_job_ctl
+            .lock()
+            .mark_ptrace_stop_image_ready(report)
+    }
+
+    pub(crate) fn ptrace_stop_image_ready_for(&self, report: StopReport) -> bool {
+        self.ptrace_job_ctl
+            .lock()
+            .ptrace_stop_image_ready(report)
+    }
+
+    pub(crate) fn clear_ptrace_stop_image_ready(&self) {
+        self.ptrace_job_ctl.lock().stop_image_generation = None;
+    }
+
+    pub(crate) fn claim_ptrace_stop_notification(&self) -> Option<StopReport> {
+        let mut job = self.ptrace_job_ctl.lock();
+        job.claim_ptrace_stop_notification()
     }
 
     /// Event-enabled exec is an event stop; legacy TRACEME/ATTACH emits a
@@ -48,14 +71,7 @@ impl super::super::Thread {
         if event != 0 {
             control.event_message = old_pid;
         }
-        job.state = StopState::Stopped;
-        job.stop_kind = StopKind::Ptrace;
-        job.stop_signal = Signo::SIGTRAP as u8;
-        job.ptrace_event = event;
-        job.ptrace_session = Some(session);
-        job.stop_reported = false;
-        job.stop_notified = false;
-        job.continued = false;
+        job.publish_ptrace_stop(session, Signo::SIGTRAP as u8, event);
         Some(event)
     }
 
@@ -68,14 +84,11 @@ impl super::super::Thread {
         }
         let good = control.options & tk_linux_process::ptrace_options::TRACESYSGOOD != 0;
         control.event_message = op as usize;
-        job.state = StopState::Stopped;
-        job.stop_kind = StopKind::Ptrace;
-        job.stop_signal = Signo::SIGTRAP as u8 | if good { 0x80 } else { 0 };
-        job.ptrace_event = 0;
-        job.ptrace_session = Some(session);
-        job.stop_reported = false;
-        job.stop_notified = false;
-        job.continued = false;
+        job.publish_ptrace_stop(
+            session,
+            Signo::SIGTRAP as u8 | if good { 0x80 } else { 0 },
+            0,
+        );
         Some(good)
     }
 
@@ -87,14 +100,7 @@ impl super::super::Thread {
         let Some(session) = control.active_session() else { return false; };
         let mut job = self.ptrace_job_ctl.lock();
         if job.state != StopState::Running { return false; }
-        job.state = StopState::Stopped;
-        job.stop_kind = StopKind::Ptrace;
-        job.stop_signal = signo;
-        job.ptrace_event = 128;
-        job.ptrace_session = Some(session);
-        job.stop_reported = false;
-        job.stop_notified = false;
-        job.continued = false;
+        job.publish_ptrace_stop(session, signo, 128);
         true
     }
 
@@ -133,14 +139,7 @@ impl super::super::Thread {
             return false;
         }
         control.interrupt_pending = false;
-        job.state = StopState::Stopped;
-        job.stop_kind = StopKind::Ptrace;
-        job.stop_signal = Signo::SIGTRAP as u8;
-        job.ptrace_event = 128;
-        job.ptrace_session = Some(session);
-        job.stop_reported = false;
-        job.stop_notified = false;
-        job.continued = false;
+        job.publish_ptrace_stop(session, Signo::SIGTRAP as u8, 128);
         true
     }
 
@@ -155,14 +154,7 @@ impl super::super::Thread {
         let mut job = self.ptrace_job_ctl.lock();
         control.listening = false;
         control.interrupt_pending = false;
-        job.state = StopState::Stopped;
-        job.stop_kind = StopKind::Ptrace;
-        job.stop_signal = Signo::SIGTRAP as u8;
-        job.ptrace_event = 128;
-        job.ptrace_session = Some(session);
-        job.stop_reported = false;
-        job.stop_notified = false;
-        job.continued = false;
+        job.publish_ptrace_stop(session, Signo::SIGTRAP as u8, 128);
         true
     }
 }
@@ -178,9 +170,4 @@ mod tests {
         assert_eq!(exec_stop_kind(1 << 4, true), Some(4));
     }
 
-    #[test]
-    fn only_the_exact_owners_published_image_makes_its_stop_ready() {
-        assert!(!owner_image_ready(&None));
-        assert!(owner_image_ready(&Some([0; crate::task::registers::NUM_GREGS])));
-    }
 }
