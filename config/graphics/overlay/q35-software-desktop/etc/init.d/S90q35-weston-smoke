@@ -171,9 +171,19 @@ done
 echo "$marker state=INFO phase=uapi_oracles"
 /usr/local/bin/drm-uapi-oracle || { echo "$marker state=FAIL reason=drm_uapi_oracle"; exit 1; }
 /usr/local/bin/evdev-uapi-oracle || { echo "$marker state=FAIL reason=evdev_uapi_oracle"; exit 1; }
-# A software virtio-gpu device deliberately has no render node; its complete
-# Pixman workload is the SHM client launched in the branch below.
-if [ ! -c /dev/dri/renderD128 ]; then
+# Render-node presence is not a 3D capability: VirtGPU statically advertises
+# DRIVER_RENDER even when its 3D feature/capsets are absent. Query the actual
+# VirtGPU capsets before selecting Vulkan, Virgl, or the Pixman SHM workload.
+venus_status=0
+/usr/local/bin/q35-virgl-render-oracle --supports-venus || venus_status=$?
+[ "$venus_status" -le 1 ] || { echo "$marker state=FAIL reason=venus_capability_query"; exit 1; }
+virgl_status=0
+/usr/local/bin/q35-virgl-render-oracle --supports-virgl || virgl_status=$?
+[ "$virgl_status" -le 1 ] || { echo "$virgl_marker state=FAIL reason=virgl_capability_query"; exit 1; }
+
+# A software VirtGPU may expose renderD128 without any 3D capset; its complete
+# Pixman workload is the SHM client launched in this branch.
+if [ "$venus_status" -eq 1 ] && [ "$virgl_status" -eq 1 ]; then
     # The SHM client is the authoritative Pixman path.  It keeps running after
     # the first frame so QMP can inject input and await repaint markers.
     echo "$marker state=INFO phase=pixman_client"
@@ -204,16 +214,21 @@ if [ ! -c /dev/dri/renderD128 ]; then
     exit 0
 fi
 
-# The canonical seatd image carries both Gallium Virgl and Venus.  Probe the
-# Vulkan loader before starting any GL process: a usable VirtIO ICD denotes the
-# blob+venus topology, whose only renderer workload is the deterministic WSI
-# client.  This keeps profile selection truthful even though the rootfs is
-# intentionally shared.
-if command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/dev/null 2>&1; then
+# A working Venus capset denotes the blob+Vulkan topology. Do not infer Venus
+# from a generic Vulkan loader that may only find a software ICD.
+if [ "$venus_status" -eq 0 ]; then
+    command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/dev/null 2>&1 || {
+        echo "$marker state=FAIL reason=vulkaninfo"
+        exit 1
+    }
     echo THEKERNEL_Q35_VENUS_SELECTED
     start-stop-daemon -S -x /usr/local/bin/q35-wayland-vulkan-client -c weston
     exit 0
 fi
+
+# If neither renderer was reported, the Pixman branch above has already run;
+# reaching this point means the kernel advertised a capability unexpectedly.
+[ "$virgl_status" -eq 0 ] || { echo "$virgl_marker state=FAIL reason=renderer_selection"; exit 1; }
 
 # Legacy Virgl has already exercised KMS before Weston starts.  Now run the
 # render-node, GLES, Piglit and rootless Xwayland/glamor chain only for this

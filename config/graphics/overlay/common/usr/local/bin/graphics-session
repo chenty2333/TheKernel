@@ -18,11 +18,25 @@ trap 'status=$?; if [ "$status" -ne 0 ]; then echo "graphics-session failed duri
 
 # Each flavor overlay selects the backend through its weston.ini symlink.
 set -- --config=/etc/weston/weston.ini --socket=wayland-0 --log="$XDG_RUNTIME_DIR/weston.log"
-# Select the renderer explicitly: plain display devices need Pixman, while
-# render-node sessions require the GL renderer.
-if grep -Eqx 'q35-(graphics-seatd|software-desktop)|n305-iris-smoke' /etc/thekernel-graphics-flavor &&
-    [ ! -c /dev/dri/renderD128 ]; then
-    set -- "$@" --renderer=pixman
+# DRM's DRIVER_RENDER flag only determines whether a render node may exist;
+# the virtio driver advertises it even when 3D is disabled.  Select Weston GL
+# only when the render-node UAPI reports a usable Virgl capset.  Venus and
+# software-only VirtIO devices use the Pixman compositor (Venus is exercised
+# separately by the Vulkan WSI client).
+if grep -Eqx 'q35-(graphics-seatd|software-desktop|venus-desktop)' /etc/thekernel-graphics-flavor; then
+    virgl_status=0
+    /usr/local/bin/q35-virgl-render-oracle --supports-virgl || virgl_status=$?
+    case "$virgl_status" in
+        0) set -- "$@" --renderer=gl ;;
+        1) set -- "$@" --renderer=pixman ;;
+        *) echo "Virgl capability probe failed (exit $virgl_status)" >&2; exit 1 ;;
+    esac
+elif grep -qx n305-iris-smoke /etc/thekernel-graphics-flavor; then
+    if [ -c /dev/dri/renderD128 ]; then
+        set -- "$@" --renderer=gl
+    else
+        set -- "$@" --renderer=pixman
+    fi
 elif [ -c /dev/dri/renderD128 ]; then
     set -- "$@" --renderer=gl
 fi

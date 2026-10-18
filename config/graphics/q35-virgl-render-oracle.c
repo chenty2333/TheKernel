@@ -40,17 +40,100 @@ static int getparam(int fd, uint64_t param, uint64_t *value)
     return 0;
 }
 
-static int probe_virgl_caps(int fd)
+enum capability_status {
+    CAPABILITY_ERROR = -1,
+    CAPABILITY_UNSUPPORTED = 0,
+    CAPABILITY_SUPPORTED = 1,
+};
+
+struct capability_result {
+    enum capability_status status;
+    const char *reason;
+};
+
+/* A non-VirtIO render node does not implement these private ioctls. */
+static int unsupported_getparam_error(void)
+{
+    return errno == ENOTTY || errno == EINVAL || errno == EOPNOTSUPP;
+}
+
+static int has_capset(uint64_t capsets, uint32_t capset_id)
+{
+    return capset_id < 64 && (capsets & (UINT64_C(1) << capset_id)) != 0;
+}
+
+static int probe_capset(int fd, uint32_t capset_id)
 {
     uint8_t caps[4096] = { 0 };
     struct drm_virtgpu_get_caps request = {
-        .cap_set_id = VIRTGPU_DRM_CAPSET_VIRGL,
-        .cap_set_ver = 1,
+        .cap_set_id = capset_id,
+        /* Mesa requests version 0 for Virgl, Virgl2, and Venus capsets. */
+        .cap_set_ver = 0,
         .addr = (uintptr_t)caps,
         .size = sizeof(caps),
     };
 
     return ioctl(fd, DRM_IOCTL_VIRTGPU_GET_CAPS, &request);
+}
+
+/* DRIVER_RENDER is advertised statically, so only the VirtGPU GETPARAMs and
+ * a working capset query distinguish a Virgl renderer from a software-only
+ * render node. This is deliberately separate from the strict KMS/PRIME/sync
+ * conformance oracle below so it can safely select the Pixman fallback.
+ */
+static struct capability_result probe_virgl_capability(int fd)
+{
+    uint64_t value = 0;
+    if (getparam(fd, VIRTGPU_PARAM_3D_FEATURES, &value) < 0) {
+        if (unsupported_getparam_error())
+            return (struct capability_result) { CAPABILITY_UNSUPPORTED, "getparam_3d" };
+        return (struct capability_result) { CAPABILITY_ERROR, "getparam_3d" };
+    }
+    if (value == 0)
+        return (struct capability_result) { CAPABILITY_UNSUPPORTED, "getparam_3d" };
+
+    uint64_t capsets = 0;
+    if (getparam(fd, VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs, &capsets) < 0) {
+        if (unsupported_getparam_error())
+            return (struct capability_result) { CAPABILITY_UNSUPPORTED, "getparam_capsets" };
+        return (struct capability_result) { CAPABILITY_ERROR, "getparam_capsets" };
+    }
+
+    uint32_t capset_id;
+    if (has_capset(capsets, VIRTGPU_DRM_CAPSET_VIRGL))
+        capset_id = VIRTGPU_DRM_CAPSET_VIRGL;
+    else if (has_capset(capsets, VIRTGPU_DRM_CAPSET_VIRGL2))
+        capset_id = VIRTGPU_DRM_CAPSET_VIRGL2;
+    else
+        return (struct capability_result) { CAPABILITY_UNSUPPORTED, "getparam_capsets" };
+
+    /* A capset advertised by GETPARAM but rejected by GET_CAPS is a broken
+     * query path, not absence of a renderer: surface it as an error instead
+     * of silently routing around it through Pixman.
+     */
+    if (probe_capset(fd, capset_id) < 0)
+        return (struct capability_result) { CAPABILITY_ERROR, "get_caps_virgl" };
+    return (struct capability_result) { CAPABILITY_SUPPORTED, NULL };
+}
+
+/* Venus is a Vulkan capset, not the Virgl Gallium renderer. It is queried
+ * separately because some Venus-only devices do not advertise the legacy
+ * VIRTGPU_PARAM_3D_FEATURES bit used for Virgl selection.
+ */
+static struct capability_result probe_venus_capability(int fd)
+{
+    uint64_t capsets = 0;
+    if (getparam(fd, VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs, &capsets) < 0) {
+        if (unsupported_getparam_error())
+            return (struct capability_result) { CAPABILITY_UNSUPPORTED, "getparam_capsets" };
+        return (struct capability_result) { CAPABILITY_ERROR, "getparam_capsets" };
+    }
+    if (!has_capset(capsets, VIRTGPU_DRM_CAPSET_VENUS))
+        return (struct capability_result) { CAPABILITY_UNSUPPORTED, "getparam_capsets" };
+    /* Mesa's Venus renderer explicitly initializes this version to zero. */
+    if (probe_capset(fd, VIRTGPU_DRM_CAPSET_VENUS) < 0)
+        return (struct capability_result) { CAPABILITY_ERROR, "get_caps_venus" };
+    return (struct capability_result) { CAPABILITY_SUPPORTED, NULL };
 }
 
 static int probe_prime(int fd)
@@ -159,31 +242,57 @@ destroy:;
     return result;
 }
 
-int main(void)
+static int probe_only(const char *name, struct capability_result result)
 {
-    int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
-    uint64_t value = 0;
+    if (result.status == CAPABILITY_SUPPORTED)
+        return 0;
+    if (result.status == CAPABILITY_UNSUPPORTED)
+        return 1;
+    fprintf(stderr, "%s capability probe failed: errno=%d\n", name, errno);
+    return 2;
+}
 
+int main(int argc, char **argv)
+{
+    int supports_virgl = argc == 2 && strcmp(argv[1], "--supports-virgl") == 0;
+    int supports_venus = argc == 2 && strcmp(argv[1], "--supports-venus") == 0;
+
+    if (argc != 1 && !supports_virgl && !supports_venus) {
+        fprintf(stderr, "usage: %s [--supports-virgl|--supports-venus]\n", argv[0]);
+        return 2;
+    }
+
+    int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+
+    if (supports_virgl || supports_venus) {
+        if (fd < 0) {
+            if (errno == ENOENT || errno == ENODEV)
+                return 1;
+            fprintf(stderr, "render-node capability probe failed: errno=%d\n", errno);
+            return 2;
+        }
+        struct capability_result capability = supports_virgl ?
+            probe_virgl_capability(fd) : probe_venus_capability(fd);
+        int status = probe_only(supports_virgl ? "Virgl" : "Venus", capability);
+        close(fd);
+        return status;
+    }
     if (fd < 0)
         return fail("render_node");
     struct drm_mode_card_res kms = { 0 };
     errno = 0;
-    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &kms) == 0 || errno != ENOTTY) {
+    /* Linux drm_ioctl_permit rejects non-DRM_RENDER_ALLOW ioctls with EACCES. */
+    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &kms) == 0 || errno != EACCES) {
         close(fd);
         return fail("render_node_kms_isolation");
     }
-    if (getparam(fd, VIRTGPU_PARAM_3D_FEATURES, &value) < 0 || value == 0) {
+    struct capability_result capability = probe_virgl_capability(fd);
+    if (capability.status != CAPABILITY_SUPPORTED) {
+        if (capability.status == CAPABILITY_UNSUPPORTED)
+            errno = EOPNOTSUPP;
+        const char *reason = capability.reason ? capability.reason : "getparam_3d";
         close(fd);
-        return fail("getparam_3d");
-    }
-    if (getparam(fd, VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs, &value) < 0 ||
-        !(value & (UINT64_C(1) << VIRTGPU_DRM_CAPSET_VIRGL))) {
-        close(fd);
-        return fail("getparam_capsets");
-    }
-    if (probe_virgl_caps(fd) < 0) {
-        close(fd);
-        return fail("get_caps_virgl");
+        return fail(reason);
     }
     if (probe_prime(fd) < 0) {
         close(fd);

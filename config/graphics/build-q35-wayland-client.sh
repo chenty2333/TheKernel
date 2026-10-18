@@ -22,11 +22,6 @@ chmod 0755 "$target/usr/local/bin/q35-wayland-color-client"
   -L"$STAGING_DIR/usr/lib" -Wl,-z,defs -lxcb \
   -o "$target/usr/local/bin/q35-xwayland-xcb-client"
 chmod 0755 "$target/usr/local/bin/q35-xwayland-xcb-client"
-"$HOST_DIR/bin/x86_64-buildroot-linux-gnu-gcc" -O2 -std=c11 -Wall -Wextra -Werror \
-  -I"$STAGING_DIR/usr/include/libdrm" \
-  "$source_dir/q35-virgl-render-oracle.c" \
-  -o "$target/usr/local/bin/q35-virgl-render-oracle"
-chmod 0755 "$target/usr/local/bin/q35-virgl-render-oracle"
 "$HOST_DIR/bin/x86_64-buildroot-linux-gnu-gcc" -O2 -Wall -Wextra -Werror \
   -I"$STAGING_DIR/usr/include" -I"$BASE_DIR" \
   "$source_dir/q35-wayland-shm-client.c" "$code" \

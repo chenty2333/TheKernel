@@ -1,6 +1,7 @@
 #!/bin/sh
-# Exercise the direct GBM/EGL/KMS path before Weston obtains DRM master.  A
-# software virtio-gpu has no render node and deliberately skips this phase.
+# Exercise the direct GBM/EGL/KMS path before Weston obtains DRM master. A
+# software virtio-gpu may still expose a render node, so select this workload
+# only when the VirtGPU 3D feature and a Virgl capset are usable.
 set -eu
 [ "${1:-start}" = start ] || exit 0
 
@@ -8,14 +9,14 @@ set -eu
 grep -qx q35-software-desktop /etc/thekernel-graphics-flavor && exit 0
 
 marker=THEKERNEL_Q35_VIRGL_KMSCUBE_READY
-[ -c /dev/dri/renderD128 ] || exit 0
+virgl_status=0
+/usr/local/bin/q35-virgl-render-oracle --supports-virgl || virgl_status=$?
+case "$virgl_status" in
+    0) ;;
+    1) exit 0 ;;
+    *) echo "$marker state=FAIL reason=virgl_capability_query"; exit 1 ;;
+esac
 [ -c /dev/dri/card0 ] || { echo "$marker state=FAIL reason=card0"; exit 1; }
-
-# A blob+venus device is a different profile from legacy Virgl even though it
-# also exposes a render node.  Do not submit a Gallium workload to it.
-if command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/dev/null 2>&1; then
-    exit 0
-fi
 
 MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu kmscube --count=120 || {
     echo "$marker state=FAIL reason=kmscube"

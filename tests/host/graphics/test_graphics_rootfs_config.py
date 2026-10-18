@@ -178,7 +178,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         q35_smoke = self.read("overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke")
         self.assertIn("grep -qx n305-iris-smoke /etc/thekernel-graphics-flavor && exit 0", q35_smoke)
         session = self.read("overlay/common/usr/local/bin/graphics-session")
-        self.assertIn("q35-(graphics-seatd|software-desktop)|n305-iris-smoke", session)
+        self.assertIn("elif grep -qx n305-iris-smoke /etc/thekernel-graphics-flavor", session)
 
     def test_iris_stage_argument_is_scoped_to_n305_flavor_and_check_needs_no_stage(self) -> None:
         script = ROOT / "tools/build/build-graphics-rootfs.sh"
@@ -256,6 +256,9 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
             source = source.replace("runtime_dir=/run/user/$(id -u)", f"runtime_dir={shlex.quote(str(runtime))}")
             source = source.replace("export HOME=/var/lib/weston", f"export HOME={shlex.quote(str(home))}")
             source = source.replace("/etc/thekernel-graphics-flavor", shlex.quote(str(flavor)))
+            # This fixture has no 3D device; reach the intended mkdir failure
+            # without depending on the guest-only capability probe binary.
+            source = source.replace("/usr/local/bin/q35-virgl-render-oracle", "false")
             # Host CI can run as root; retain the runtime owner/mode validation.
             source = source.replace('[ "$(id -u)" -ne 0 ]', "true")
             result = subprocess.run(["sh"], input=source, text=True, capture_output=True,
@@ -267,13 +270,12 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
 
     def test_software_sessions_select_pixman_and_seatd_verifies_it(self) -> None:
         session = self.read("overlay/common/usr/local/bin/graphics-session")
-        self.assertIn(
-            "if grep -Eqx 'q35-(graphics-seatd|software-desktop)|n305-iris-smoke' /etc/thekernel-graphics-flavor &&\n"
-            "    [ ! -c /dev/dri/renderD128 ]; then\n"
-            '    set -- "$@" --renderer=pixman\n'
-            'elif [ -c /dev/dri/renderD128 ]; then\n'
-            '    set -- "$@" --renderer=gl\nfi', session,
-        )
+        self.assertIn("q35-(graphics-seatd|software-desktop|venus-desktop)", session)
+        self.assertIn("/usr/local/bin/q35-virgl-render-oracle --supports-virgl", session)
+        self.assertIn('0) set -- "$@" --renderer=gl ;;', session)
+        self.assertIn('1) set -- "$@" --renderer=pixman ;;', session)
+        self.assertIn('*) echo "Virgl capability probe failed', session)
+        self.assertIn("elif grep -qx n305-iris-smoke", session)
         self.assertIn(
             'set -- --config=/etc/weston/weston.ini --socket=wayland-0 '
             '--log="$XDG_RUNTIME_DIR/weston.log"', session,
@@ -284,22 +286,80 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         self.assertLess(renderer_check, smoke.index("export THEKERNEL_GRAPHICS_SMOKE_EXIT=1"))
         self.assertIn('state=FAIL reason=pixman_renderer', smoke)
 
-    def test_accelerated_xwayland_removes_inherited_glamor_disable(self) -> None:
-        # Xwayland checks presence, so assigning "0" still disables glamor.
-        # Execute the wrappers' environment setup with a known character node.
+    def test_virtgpu_renderer_routing_uses_real_capsets_not_rendernode_presence(self) -> None:
+        oracle = self.read("q35-virgl-render-oracle.c")
+        self.assertIn("VIRTGPU_PARAM_3D_FEATURES", oracle)
+        self.assertIn("VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs", oracle)
+        self.assertIn("VIRTGPU_DRM_CAPSET_VIRGL2", oracle)
+        self.assertIn("VIRTGPU_DRM_CAPSET_VENUS", oracle)
+        # Mesa 26.1.2 uses GET_CAPS version 0 for Virgl/Virgl2 and Venus.
+        self.assertIn(".cap_set_ver = 0", oracle)
+        self.assertNotIn(".cap_set_ver = 1", oracle)
+        self.assertEqual(oracle.count("probe_virgl_capability(fd)"), 2)
+        self.assertIn("probe_capset(fd, VIRTGPU_DRM_CAPSET_VENUS)", oracle)
+        self.assertIn('"--supports-virgl"', oracle)
+        self.assertIn('"--supports-venus"', oracle)
+        probe_dispatch = oracle[
+            oracle.index("if (supports_virgl || supports_venus)"):
+            oracle.index('if (fd < 0)\n        return fail("render_node")')
+        ]
+        self.assertNotIn("DRM_IOCTL_MODE_GETRESOURCES", probe_dispatch)
+        self.assertNotIn("probe_prime", probe_dispatch)
+        virgl_probe = oracle[
+            oracle.index("static struct capability_result probe_virgl_capability"):
+            oracle.index("/* Venus is a Vulkan capset")
+        ]
+        self.assertNotIn("DRM_IOCTL_MODE_GETRESOURCES", virgl_probe)
+        self.assertNotIn("probe_prime", virgl_probe)
+        self.assertIn("CAPABILITY_ERROR", oracle)
+        self.assertIn("errno != EACCES", oracle)
+        self.assertIn("probe_prime(fd) < 0", oracle)
+        self.assertIn("probe_sync_file(fd) < 0", oracle)
+
+        kmscube = self.read("overlay/q35-software-desktop/etc/init.d/S75q35-virgl-kmscube")
+        self.assertIn("--supports-virgl", kmscube)
+        self.assertNotIn("[ -c /dev/dri/renderD128 ] || exit 0", kmscube)
+        smoke = self.read("overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke")
+        self.assertIn("--supports-venus", smoke)
+        self.assertIn("--supports-virgl", smoke)
+        self.assertNotIn("if [ ! -c /dev/dri/renderD128 ]; then", smoke)
+        venus_smoke = self.read("overlay/q35-venus-desktop/etc/init.d/S90q35-venus-smoke")
+        self.assertIn("--supports-venus", venus_smoke)
+        guest_tools = self.read("build-guest-tools.sh")
+        self.assertIn('"$source_dir/config/graphics/q35-virgl-render-oracle.c"', guest_tools)
+
+    def test_xwayland_glamor_uses_virgl_capability_and_fails_on_probe_error(self) -> None:
+        # Xwayland treats any defined XWAYLAND_NO_GLAMOR as disabled; exercise
+        # both the accelerated and software-only outcomes through a stub query.
         for wrapper in (
             "overlay/common/usr/local/bin/thekernel-xwayland-glamor",
             "overlay/q35-software-desktop/usr/local/bin/thekernel-desktop-xwayland",
         ):
             with self.subTest(wrapper=wrapper):
                 setup = self.read(wrapper).split("exec /usr/bin/Xwayland", 1)[0]
-                setup = setup.replace("/dev/dri/renderD128", "/dev/null")
-                result = subprocess.run(
-                    ["sh"], input=setup + 'printf "%s" "${XWAYLAND_NO_GLAMOR-unset}"\n',
-                    env={**os.environ, "XWAYLAND_NO_GLAMOR": "1"},
-                    text=True, capture_output=True, check=True,
-                )
-                self.assertEqual(result.stdout, "unset")
+                with test_tmpdir() as directory:
+                    root = pathlib.Path(directory)
+                    probe = root / "q35-virgl-render-oracle"
+                    probe.write_text('#!/bin/sh\nexit "$VIRGL_PROBE_STATUS"\n')
+                    probe.chmod(0o755)
+                    setup = setup.replace(
+                        "/usr/local/bin/q35-virgl-render-oracle", shlex.quote(str(probe)),
+                    )
+                    for status, expected in (("0", "unset"), ("1", "1")):
+                        result = subprocess.run(
+                            ["sh"], input=setup + 'printf "%s" "${XWAYLAND_NO_GLAMOR-unset}"\n',
+                            env={**os.environ, "VIRGL_PROBE_STATUS": status,
+                                 "XWAYLAND_NO_GLAMOR": "1"},
+                            text=True, capture_output=True, check=True,
+                        )
+                        with self.subTest(status=status):
+                            self.assertEqual(result.stdout, expected)
+                    failed = subprocess.run(
+                        ["sh"], input=setup, env={**os.environ, "VIRGL_PROBE_STATUS": "2"},
+                        text=True, capture_output=True,
+                    )
+                    self.assertEqual(failed.returncode, 1)
+                    self.assertIn("Virgl capability probe failed", failed.stderr)
 
     def test_desktop_file_launches_preserve_relative_paths_and_browser_arguments(self) -> None:
         with test_tmpdir() as directory:
@@ -639,9 +699,10 @@ sleep() { echo wait; }
 
     def test_q35_headless_graphics_smoke_keeps_the_software_marker_and_pixel_oracle(self) -> None:
         module = load_script_module("thekernel_product", "tools/thekernel.py")
+        screenshot = pathlib.Path("/tmp/graphics.ppm").resolve()
         args = module.build_parser().parse_args([
             "test", "--suite", "graphics", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
-            "--screenshot", "/tmp/graphics.ppm", "--flavor", "q35-graphics-seatd",
+            "--screenshot", str(screenshot), "--flavor", "q35-graphics-seatd",
             "--graphics-profile", "headless",
         ])
         calls: dict[str, object] = {}
@@ -652,11 +713,57 @@ sleep() { echo wait; }
         self.assertIsNone(spec.stop_after_marker)
         self.assertEqual(spec.completion_after_shutdown, "THEKERNEL_Q35_SOFTWARE_SMOKE_COMPLETE")
         self.assertEqual(len(spec.qmp_checkpoints), 5)
+        self.assertEqual(spec.qmp_checkpoints[0].screenshot, screenshot)
         self.assertIsNotNone(spec.qmp_checkpoints[-2].screenshot)
         self.assertEqual(spec.qmp_checkpoints[-1].input_events[0][0]["data"]["key"]["data"], "f12")
-        self.assertEqual(spec.qmp_screenshot_after_marker, "THEKERNEL_Q35_WESTON_READY")
-        self.assertEqual(spec.qmp_screenshot_size, (800, 600))
-        self.assertEqual(spec.qmp_screenshot_color_blocks[0].rgb, (255, 0, 0))
+        self.assertIsNone(spec.qmp_screenshot)
+        self.assertIsNone(spec.qmp_screenshot_after_marker)
+        self.assertIsNone(spec.qmp_screenshot_size)
+        self.assertEqual(spec.qmp_screenshot_color_blocks, ())
+        self.assertEqual(spec.qmp_checkpoints[0].screenshot_after_marker, "THEKERNEL_Q35_WESTON_READY")
+        self.assertEqual(spec.qmp_checkpoints[0].screenshot_size, (800, 600))
+        self.assertEqual(spec.qmp_checkpoints[0].screenshot_color_blocks[0].rgb, (255, 0, 0))
+
+    def test_checkpointed_graphics_smokes_only_plan_unique_screenshot_outputs(self) -> None:
+        from tools.qemu_runner.runner import _validate_output_destinations
+
+        module = load_script_module("thekernel_product", "tools/thekernel.py")
+        for flavor, graphics_profile in (
+            ("q35-graphics-seatd", "headless"),
+            ("q35-graphics-logind", "headless"),
+        ):
+            with self.subTest(flavor=flavor), test_tmpdir() as directory:
+                root = pathlib.Path(directory)
+                rootfs = root / "graphics-rootfs.ext2"
+                rootfs.write_bytes(b"rootfs")
+                screenshot = root / "graphics.ppm"
+                args = module.build_parser().parse_args([
+                    "test", "--suite", "graphics", "--no-build", "--rootfs", str(rootfs),
+                    "--screenshot", str(screenshot), "--flavor", flavor,
+                    "--graphics-profile", graphics_profile,
+                ])
+                calls: dict[str, object] = {}
+                module.run_product = lambda _artifacts, spec: calls.update(spec=spec) or 0
+                module.build_kernel = lambda *_args, **_kwargs: self.fail(
+                    "--no-build invoked build_kernel"
+                )
+                self.assertEqual(module.graphics_smoke_cmd(args), 0)
+
+                spec = calls["spec"]
+                self.assertTrue(spec.qmp_checkpoints)
+                self.assertIsNone(spec.qmp_screenshot)
+                self.assertTrue(any(checkpoint.screenshot == screenshot
+                                    for checkpoint in spec.qmp_checkpoints))
+                screenshot_outputs = tuple(
+                    (f"QMP checkpoint screenshot {index}", checkpoint.screenshot)
+                    for index, checkpoint in enumerate(spec.qmp_checkpoints)
+                    if checkpoint.screenshot is not None
+                )
+                self.assertTrue(screenshot_outputs)
+                self.assertEqual(
+                    len(_validate_output_destinations(screenshot_outputs, protected_paths=())),
+                    len(screenshot_outputs),
+                )
 
     def test_graphics_smoke_forwards_gdb_without_losing_input_checkpoints(self) -> None:
         module = load_script_module("thekernel_product", "tools/thekernel.py")
@@ -686,10 +793,11 @@ sleep() { echo wait; }
                     self.assertEqual(module.graphics_smoke_cmd(args), 0)
                 spec = run_product.call_args.args[1]
                 self.assertEqual(spec.stop_after_marker, "THEKERNEL_Q35_VIRGL_READY")
-                self.assertEqual(spec.qmp_screenshot_after_marker, "THEKERNEL_Q35_VIRGL_READY")
-                self.assertEqual(spec.qmp_screenshot_size, (800, 600))
+                self.assertIsNone(spec.qmp_screenshot)
+                self.assertIsNone(spec.qmp_screenshot_after_marker)
+                self.assertIsNone(spec.qmp_screenshot_size)
                 self.assertEqual((spec.graphics_width, spec.graphics_height), (800, 600))
-                self.assertEqual(spec.qmp_screenshot_color_blocks[0].rgb, (255, 0, 0))
+                self.assertEqual(spec.qmp_screenshot_color_blocks, ())
                 self.assertEqual(spec.qmp_timeout_secs, 7200)
                 self.assertEqual(spec.qmp_checkpoints, module._xwayland_smoke_checkpoints(pathlib.Path(args.screenshot)))
 

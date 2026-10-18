@@ -7,7 +7,10 @@ set -eu
 marker=THEKERNEL_Q35_VENUS_READY
 [ -S /run/seatd.sock ] || { echo "$marker state=FAIL reason=seatd_socket"; exit 1; }
 [ -c /dev/dri/card0 ] || { echo "$marker state=FAIL reason=card0"; exit 1; }
-[ -c /dev/dri/renderD128 ] || { echo "$marker state=FAIL reason=render_node"; exit 1; }
+/usr/local/bin/q35-virgl-render-oracle --supports-venus >/dev/null || {
+    echo "$marker state=FAIL reason=venus_capability"
+    exit 1
+}
 pidof weston >/dev/null || { echo "$marker state=FAIL reason=weston_process"; exit 1; }
 
 weston_uid=$(id -u weston)

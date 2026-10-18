@@ -1562,10 +1562,16 @@ def graphics_smoke_cmd(args: argparse.Namespace) -> int:
             extra_block=None,
             rootfs=rootfs,
             rootfs_transport="drive",
-            qmp_screenshot=screenshot,
-            qmp_screenshot_after_marker=marker,
-            qmp_screenshot_size=descriptor.screenshot_size,
-            qmp_screenshot_color_blocks=descriptor.screenshot_color_blocks,
+            # Explicit checkpoints own the complete screenshot sequence. The
+            # QMP controller does not also capture the legacy single-screenshot
+            # field when checkpoints are present, so keep it out of the output
+            # plan instead of aliasing checkpoint 0's destination.
+            qmp_screenshot=None if checkpoints else screenshot,
+            qmp_screenshot_after_marker=None if checkpoints else marker,
+            qmp_screenshot_size=None if checkpoints else descriptor.screenshot_size,
+            qmp_screenshot_color_blocks=(
+                () if checkpoints else descriptor.screenshot_color_blocks
+            ),
             qmp_checkpoints=checkpoints,
             # Virgl's completion marker follows the full Piglit quick profile.
             # Give its QMP checkpoint the same budget as the requested run.

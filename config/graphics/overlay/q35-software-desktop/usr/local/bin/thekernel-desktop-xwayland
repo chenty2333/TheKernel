@@ -1,9 +1,12 @@
 #!/bin/sh
-# Use glamor on the Virgl render node; the plain VirtIO display uses wl_shm.
+# Use glamor only when the render-node UAPI reports Virgl; a plain VirtIO
+# render node may exist even when 3D is disabled and must use wl_shm instead.
 set -eu
-if [ -c /dev/dri/renderD128 ]; then
-    unset XWAYLAND_NO_GLAMOR
-else
-    export XWAYLAND_NO_GLAMOR=1
-fi
+virgl_status=0
+/usr/local/bin/q35-virgl-render-oracle --supports-virgl || virgl_status=$?
+case "$virgl_status" in
+    0) unset XWAYLAND_NO_GLAMOR ;;
+    1) export XWAYLAND_NO_GLAMOR=1 ;;
+    *) echo "Virgl capability probe failed (exit $virgl_status)" >&2; exit 1 ;;
+esac
 exec /usr/bin/Xwayland "$@" 2>"$XDG_RUNTIME_DIR/xwayland.log"

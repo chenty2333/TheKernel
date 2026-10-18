@@ -46,6 +46,13 @@ for source in "$source_dir/tests/guest/graphics/"*.c; do
     installed="$installed $target/usr/local/bin/$output"
 done
 [ -n "$installed" ] || { echo "no graphics probe sources found" >&2; exit 1; }
+# Q35 renderer routing uses the VirtGPU capset query even in the Venus-only
+# image, which does not build the Gallium GL client below.
+"$compiler" -O2 -std=c11 -Wall -Wextra -Werror \
+    -I"$STAGING_DIR/usr/include/libdrm" \
+    "$source_dir/config/graphics/q35-virgl-render-oracle.c" \
+    -o "$target/usr/local/bin/q35-virgl-render-oracle"
+installed="$installed $target/usr/local/bin/q35-virgl-render-oracle"
 # The acceptance client is also part of normal shell-rootfs tool discovery.
 # Build that same canonical source into the graphics image's established path;
 # it remains inert unless the user passes an explicit execute mode and DRM node.

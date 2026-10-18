@@ -1,7 +1,13 @@
 #!/bin/sh
-# Xwayland uses glamor by default whenever EGL/DRI3 are available.  Make the
-# choice explicit so a DRM desktop cannot silently request the SHM fallback;
-# the wrapper still delegates all X server argument parsing upstream.
+# Do not infer Virgl from render-node presence: DRIVER_RENDER can be advertised
+# by software-only VirtIO devices. Keep Xwayland's default EGL/DRI3 path only
+# when the render-node UAPI exposes a usable Virgl capset.
 set -eu
-unset XWAYLAND_NO_GLAMOR
+virgl_status=0
+/usr/local/bin/q35-virgl-render-oracle --supports-virgl || virgl_status=$?
+case "$virgl_status" in
+    0) unset XWAYLAND_NO_GLAMOR ;;
+    1) export XWAYLAND_NO_GLAMOR=1 ;;
+    *) echo "Virgl capability probe failed (exit $virgl_status)" >&2; exit 1 ;;
+esac
 exec /usr/bin/Xwayland "$@"
