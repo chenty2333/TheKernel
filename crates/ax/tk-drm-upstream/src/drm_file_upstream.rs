@@ -7,40 +7,55 @@
 
 #![allow(non_snake_case, dead_code, unsafe_code)]
 
-use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
-use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::boxed::Box;
-use tk_linux_kapi::config::{EAGAIN, EFAULT, EINVAL, ENOMEM, ERESTARTSYS, GFP_KERNEL};
-use tk_linux_kapi::list::{INIT_LIST_HEAD, list_add, list_add_tail, list_del, list_del_init, list_empty};
-use tk_linux_kapi::locks::{spin_lock, spin_unlock, spin_lock_init, spin_lock_irqsave_raw, spin_unlock_irqrestore_raw};
-use tk_linux_kapi::memory::{atomic_dec, atomic_dec_and_test, atomic_inc, kfree};
-use tk_linux_kapi::mm_native::copy_to_user;
-use tk_linux_kapi::mutex::mutex_init;
+use core::{
+    ffi::{c_char, c_int, c_uint, c_ulong, c_void},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
 #[cfg(not(test))]
-use tk_linux_kapi::mutex::{mutex_lock, mutex_unlock, mutex_lock_interruptible};
+use tk_linux_kapi::mutex::{mutex_lock, mutex_lock_interruptible, mutex_unlock};
+use tk_linux_kapi::{
+    config::{EAGAIN, EFAULT, EINVAL, ENODEV, ENOMEM, ERESTARTSYS, GFP_KERNEL},
+    list::{INIT_LIST_HEAD, list_add, list_add_tail, list_del, list_del_init, list_empty},
+    locks::{
+        spin_lock, spin_lock_init, spin_lock_irqsave_raw, spin_unlock, spin_unlock_irqrestore_raw,
+    },
+    memory::{atomic_dec, atomic_dec_and_test, atomic_inc, kfree},
+    mm_native::copy_to_user,
+    mutex::mutex_init,
+};
 #[cfg(test)]
 unsafe fn mutex_lock<M>(_mutex: M) {}
 #[cfg(test)]
 unsafe fn mutex_unlock<M>(_mutex: M) {}
 #[cfg(test)]
-unsafe fn mutex_lock_interruptible<M>(_mutex: M) -> i32 { 0 }
-use tk_linux_kapi::types::{AtomicT, File, ListHead, Mutex, WaitQueueHead, XArray};
-use tk_linux_kapi::wait::{init_waitqueue_head, poll_wait, wake_up, wake_up_interruptible_poll};
-use tk_linux_kapi::wait_event_interruptible;
+unsafe fn mutex_lock_interruptible<M>(_mutex: M) -> i32 {
+    0
+}
+use tk_linux_kapi::{
+    types::{AtomicT, File, ListHead, Mutex, WaitQueueHead, XArray},
+    wait::{init_waitqueue_head, poll_wait, wake_up, wake_up_interruptible_poll},
+    wait_event_interruptible,
+};
 
 const O_NONBLOCK: u32 = 0x800;
 
-use crate::drm_auth_types::DrmMaster;
-use crate::drm_auth_upstream::{drm_master_open, drm_master_release};
-use crate::drm_device_types::DrmDevice;
-use crate::drm_drv_upstream::{drm_dev_enter, drm_dev_exit};
-use crate::drm_file_types::{DrmFile, DrmMemoryStats, DrmMinor, DrmPendingEvent};
-use crate::drm_gem_types::{DrmGemObject, DRM_GEM_OBJECT_ACTIVE, DRM_GEM_OBJECT_PURGEABLE, DRM_GEM_OBJECT_RESIDENT};
-use crate::drm_mode_object_upstream::idr_destroy;
-use crate::drm_prime_types::DrmPrimeFilePrivate;
-use crate::drm_prime_upstream::{drm_prime_destroy_file_private, drm_prime_init_file_private};
-use crate::drm_print_types::DrmPrinter;
-use crate::uapi_drm_types::DrmEvent;
+use crate::{
+    drm_auth_types::DrmMaster,
+    drm_auth_upstream::{drm_master_open, drm_master_release},
+    drm_device_types::DrmDevice,
+    drm_drv_upstream::{drm_dev_enter, drm_dev_exit},
+    drm_file_types::{DrmFile, DrmMemoryStats, DrmMinor, DrmPendingEvent},
+    drm_gem_types::{
+        DRM_GEM_OBJECT_ACTIVE, DRM_GEM_OBJECT_PURGEABLE, DRM_GEM_OBJECT_RESIDENT, DrmGemObject,
+    },
+    drm_mode_object_upstream::idr_destroy,
+    drm_prime_types::DrmPrimeFilePrivate,
+    drm_prime_upstream::{drm_prime_destroy_file_private, drm_prime_init_file_private},
+    drm_print_types::DrmPrinter,
+    uapi_drm_types::DrmEvent,
+};
 
 const EACCES: i32 = 13;
 const DRIVER_LEGACY: u32 = 1 << 26;
@@ -126,13 +141,6 @@ pub unsafe extern "C" fn drm_file_alloc(minor: *mut DrmMinor) -> *mut DrmFile {
             }
         }
 
-        mutex_lock(core::ptr::addr_of_mut!((*dev).filelist_mutex));
-        list_add_tail(
-            core::ptr::addr_of_mut!((*file_priv).lhead),
-            core::ptr::addr_of_mut!((*dev).filelist),
-        );
-        mutex_unlock(core::ptr::addr_of_mut!((*dev).filelist_mutex));
-
         file_priv
     }
 }
@@ -147,7 +155,10 @@ unsafe fn drm_events_release(file_priv: *mut DrmFile) {
         // Cancel pending events
         while !list_empty(&(*file_priv).pending_event_list) {
             let cur = (*file_priv).pending_event_list.next;
-            let pe = cur.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmPendingEvent, pending_link)).cast::<DrmPendingEvent>();
+            let pe = cur
+                .cast::<u8>()
+                .wrapping_sub(core::mem::offset_of!(DrmPendingEvent, pending_link))
+                .cast::<DrmPendingEvent>();
             list_del_init(cur);
             (*pe).file_priv = core::ptr::null_mut();
         }
@@ -155,9 +166,11 @@ unsafe fn drm_events_release(file_priv: *mut DrmFile) {
         // Cancel queued events
         while !list_empty(&(*file_priv).event_list) {
             let cur = (*file_priv).event_list.next;
-            let pe = cur.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmPendingEvent, link)).cast::<DrmPendingEvent>();
+            let pe = cur
+                .cast::<u8>()
+                .wrapping_sub(core::mem::offset_of!(DrmPendingEvent, link))
+                .cast::<DrmPendingEvent>();
             list_del_init(cur);
-            kfree((*pe).event);
             kfree(pe);
         }
 
@@ -261,7 +274,16 @@ pub unsafe extern "C" fn drm_open_helper(filp: *mut File, minor: *mut DrmMinor) 
     (*filp).private_data = priv_data.cast();
     (*priv_data).filp = filp;
 
+    // An allocated DrmFile is not yet an opened VFS file. Publish it to the
+    // device file list only after master acquisition succeeds, so unplug and
+    // file-list walks never observe partially opened or freed file state.
     mutex_lock(core::ptr::addr_of_mut!((*dev).filelist_mutex));
+    if (*dev).unplugged.load(Ordering::Acquire) {
+        mutex_unlock(core::ptr::addr_of_mut!((*dev).filelist_mutex));
+        (*filp).private_data = core::ptr::null_mut();
+        drm_file_free(priv_data);
+        return -ENODEV;
+    }
     list_add_tail(
         core::ptr::addr_of_mut!((*priv_data).lhead),
         core::ptr::addr_of_mut!((*dev).filelist),
@@ -357,9 +379,10 @@ pub unsafe extern "C" fn drm_open_minor_index(minor_index: u32, filp: *mut File)
     if filp.is_null() {
         return -EINVAL;
     }
-    let minor = unsafe {
-        drm_minor_acquire(core::ptr::addr_of_mut!(drm_minors_xa), minor_index)
-    };
+    let minor = unsafe { drm_minor_acquire(core::ptr::addr_of_mut!(drm_minors_xa), minor_index) };
+    if tk_linux_kapi::config::IS_ERR(minor) {
+        return tk_linux_kapi::config::PTR_ERR(minor) as i32;
+    }
     if minor.is_null() {
         return -crate::drm_drv_upstream::ENODEV;
     }
@@ -454,7 +477,9 @@ unsafe fn drm_read_core(
         }
         let dev = (*(*file_priv).minor).dev;
 
-        let mut ret: isize = mutex_lock_interruptible(core::ptr::addr_of_mut!((*file_priv).event_read_lock)) as isize;
+        let mut ret: isize =
+            mutex_lock_interruptible(core::ptr::addr_of_mut!((*file_priv).event_read_lock))
+                as isize;
         if ret != 0 {
             return ret;
         }
@@ -466,7 +491,10 @@ unsafe fn drm_read_core(
             spin_lock_irqsave_raw(core::ptr::addr_of_mut!((*dev).event_lock), &mut flags);
             if !list_empty(&(*file_priv).event_list) {
                 let cur = (*file_priv).event_list.next;
-                e = cur.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmPendingEvent, link)).cast::<DrmPendingEvent>();
+                e = cur
+                    .cast::<u8>()
+                    .wrapping_sub(core::mem::offset_of!(DrmPendingEvent, link))
+                    .cast::<DrmPendingEvent>();
                 (*file_priv).event_space += (*(*e).event).length as i32;
                 list_del(core::ptr::addr_of_mut!((*e).link));
             }
@@ -474,6 +502,10 @@ unsafe fn drm_read_core(
 
             if e.is_null() {
                 if ret != 0 {
+                    break;
+                }
+                if (*dev).unplugged.load(Ordering::Acquire) {
+                    ret = -ENODEV as isize;
                     break;
                 }
 
@@ -485,10 +517,13 @@ unsafe fn drm_read_core(
                 mutex_unlock(core::ptr::addr_of_mut!((*file_priv).event_read_lock));
                 let wait_ret = wait_event_interruptible!(
                     (*file_priv).event_wait,
-                    !list_empty(&(*file_priv).event_list),
+                    !list_empty(&(*file_priv).event_list)
+                        || (*dev).unplugged.load(Ordering::Acquire),
                 );
                 if wait_ret >= 0 {
-                    ret = mutex_lock_interruptible(core::ptr::addr_of_mut!((*file_priv).event_read_lock)) as isize;
+                    ret = mutex_lock_interruptible(core::ptr::addr_of_mut!(
+                        (*file_priv).event_read_lock
+                    )) as isize;
                 } else {
                     ret = wait_ret as isize;
                 }
@@ -501,7 +536,10 @@ unsafe fn drm_read_core(
                 if length > count.saturating_sub(ret as usize) {
                     spin_lock_irqsave_raw(core::ptr::addr_of_mut!((*dev).event_lock), &mut flags);
                     (*file_priv).event_space -= length as i32;
-                    list_add(core::ptr::addr_of_mut!((*e).link), core::ptr::addr_of_mut!((*file_priv).event_list));
+                    list_add(
+                        core::ptr::addr_of_mut!((*e).link),
+                        core::ptr::addr_of_mut!((*file_priv).event_list),
+                    );
                     spin_unlock_irqrestore_raw(core::ptr::addr_of_mut!((*dev).event_lock), flags);
                     wake_up_interruptible_poll(&mut (*file_priv).event_wait, EPOLLIN | EPOLLRDNORM);
                     break;
@@ -510,15 +548,14 @@ unsafe fn drm_read_core(
                 let copied = writer(ret as usize, (*e).event.cast(), length);
                 if copied != length as isize {
                     if ret == 0 {
-                        ret = if copied < 0 {
-                            copied
-                        } else {
-                            -EFAULT as isize
-                        };
+                        ret = if copied < 0 { copied } else { -EFAULT as isize };
                     }
                     spin_lock_irqsave_raw(core::ptr::addr_of_mut!((*dev).event_lock), &mut flags);
                     (*file_priv).event_space -= length as i32;
-                    list_add(core::ptr::addr_of_mut!((*e).link), core::ptr::addr_of_mut!((*file_priv).event_list));
+                    list_add(
+                        core::ptr::addr_of_mut!((*e).link),
+                        core::ptr::addr_of_mut!((*file_priv).event_list),
+                    );
                     spin_unlock_irqrestore_raw(core::ptr::addr_of_mut!((*dev).event_lock), flags);
                     wake_up_interruptible_poll(&mut (*file_priv).event_wait, EPOLLIN | EPOLLRDNORM);
                     break;
@@ -546,12 +583,9 @@ pub unsafe extern "C" fn drm_read(
         return -EINVAL as isize;
     }
     unsafe {
-        drm_read_core(
-            filp,
-            count,
-            true,
-            |offset, bytes, len| unsafe { drm_read_copy_to_user(buffer, offset, bytes, len) },
-        )
+        drm_read_core(filp, count, true, |offset, bytes, len| unsafe {
+            drm_read_copy_to_user(buffer, offset, bytes, len)
+        })
     }
 }
 
@@ -571,12 +605,9 @@ pub unsafe fn drm_read_kernel_to(
     writer: DrmReadWriter,
 ) -> isize {
     unsafe {
-        drm_read_core(
-            filp,
-            count,
-            false,
-            |_, bytes, len| unsafe { writer(context, bytes, len) },
-        )
+        drm_read_core(filp, count, false, |_, bytes, len| unsafe {
+            writer(context, bytes, len)
+        })
     }
 }
 
@@ -585,6 +616,8 @@ pub unsafe fn drm_read_kernel_to(
 pub unsafe extern "C" fn drm_poll(filp: *mut File, wait: *mut c_void) -> u32 {
     const EPOLLIN: u32 = 0x0001;
     const EPOLLRDNORM: u32 = 0x0040;
+    const EPOLLERR: u32 = 0x0008;
+    const EPOLLHUP: u32 = 0x0010;
 
     if filp.is_null() {
         return 0;
@@ -595,11 +628,22 @@ pub unsafe extern "C" fn drm_poll(filp: *mut File, wait: *mut c_void) -> u32 {
             return 0;
         }
 
-        poll_wait(filp, core::ptr::addr_of_mut!((*file_priv).event_wait), wait.cast());
+        poll_wait(
+            filp,
+            core::ptr::addr_of_mut!((*file_priv).event_wait),
+            wait.cast(),
+        );
 
         let mut mask = 0;
         if !list_empty(&(*file_priv).event_list) {
             mask |= EPOLLIN | EPOLLRDNORM;
+        }
+        let minor = (*file_priv).minor;
+        if !minor.is_null() {
+            let dev = (*minor).dev;
+            if !dev.is_null() && (*dev).unplugged.load(Ordering::Acquire) {
+                mask |= EPOLLERR | EPOLLHUP;
+            }
         }
         mask
     }
@@ -662,21 +706,19 @@ pub unsafe extern "C" fn drm_event_cancel_free(dev: *mut DrmDevice, p: *mut DrmP
             list_del(core::ptr::addr_of_mut!((*p).pending_link));
         }
         spin_unlock_irqrestore_raw(core::ptr::addr_of_mut!((*dev).event_lock), flags);
-        kfree((*p).event);
         kfree(p);
     }
 }
 
 // upstream: drivers/gpu/drm/drm_file.c drm_send_event_helper()
-unsafe fn drm_send_event_helper(
-    dev: *mut DrmDevice,
-    e: *mut DrmPendingEvent,
-    _timestamp: i64,
-) {
+unsafe fn drm_send_event_helper(dev: *mut DrmDevice, e: *mut DrmPendingEvent, _timestamp: i64) {
     if e.is_null() {
         return;
     }
     if !(*e).completion.is_null() {
+        if let Some(completion) = (*e).completion.as_ref() {
+            completion.complete_all();
+        }
         if let Some(rel) = (*e).completion_release {
             rel((*e).completion);
         }
@@ -750,9 +792,21 @@ pub unsafe extern "C" fn drm_fdinfo_print_size(
     if p.is_null() {
         return;
     }
-    let pref = if !prefix.is_null() { core::ffi::CStr::from_ptr(prefix).to_string_lossy() } else { alloc::borrow::Cow::Borrowed("") };
-    let st = if !stat.is_null() { core::ffi::CStr::from_ptr(stat).to_string_lossy() } else { alloc::borrow::Cow::Borrowed("") };
-    let reg = if !region.is_null() { core::ffi::CStr::from_ptr(region).to_string_lossy() } else { alloc::borrow::Cow::Borrowed("") };
+    let pref = if !prefix.is_null() {
+        core::ffi::CStr::from_ptr(prefix).to_string_lossy()
+    } else {
+        alloc::borrow::Cow::Borrowed("")
+    };
+    let st = if !stat.is_null() {
+        core::ffi::CStr::from_ptr(stat).to_string_lossy()
+    } else {
+        alloc::borrow::Cow::Borrowed("")
+    };
+    let reg = if !region.is_null() {
+        core::ffi::CStr::from_ptr(region).to_string_lossy()
+    } else {
+        alloc::borrow::Cow::Borrowed("")
+    };
     let units = ["", " KiB", " MiB"];
     let mut u = 0;
     while u < units.len() - 1 {
@@ -762,7 +816,10 @@ pub unsafe extern "C" fn drm_fdinfo_print_size(
         sz /= 1024;
         u += 1;
     }
-    crate::drm_print_upstream::drm_printf(p, &alloc::format!("{}-{}-{}:\t{}{}\n", pref, st, reg, sz, units[u]));
+    crate::drm_print_upstream::drm_printf(
+        p,
+        &alloc::format!("{}-{}-{}:\t{}{}\n", pref, st, reg, sz, units[u]),
+    );
 }
 
 // upstream: drivers/gpu/drm/drm_file.c drm_memory_stats_is_zero()
@@ -771,7 +828,12 @@ pub unsafe extern "C" fn drm_memory_stats_is_zero(stats: *const DrmMemoryStats) 
     if stats.is_null() {
         return 1;
     }
-    if (*stats).shared == 0 && (*stats).private == 0 && (*stats).resident == 0 && (*stats).purgeable == 0 && (*stats).active == 0 {
+    if (*stats).shared == 0
+        && (*stats).private == 0
+        && (*stats).resident == 0
+        && (*stats).purgeable == 0
+        && (*stats).active == 0
+    {
         1
     } else {
         0
@@ -815,38 +877,47 @@ pub unsafe extern "C" fn drm_show_memory_stats(p: *mut DrmPrinter, file: *mut Dr
     if p.is_null() || file.is_null() {
         return;
     }
-    let mut stats = DrmMemoryStats { shared: 0, private: 0, resident: 0, purgeable: 0, active: 0 };
+    let mut stats = DrmMemoryStats {
+        shared: 0,
+        private: 0,
+        resident: 0,
+        purgeable: 0,
+        active: 0,
+    };
     let mut supported_status: u32 = 0;
 
     spin_lock(&mut (*file).table_lock);
-    crate::drm_mode_object_upstream::idr_for_each(core::ptr::addr_of_mut!((*file).object_idr), |_id, ptr| {
-        let obj = ptr as *mut DrmGemObject;
-        if !obj.is_null() {
-            let mut s: u32 = 0;
-            let add_size = if !(*obj).funcs.is_null() && (*(*obj).funcs).rss.is_some() {
-                ((*(*obj).funcs).rss.unwrap())(obj)
-            } else {
-                (*obj).size
-            };
-            if !(*obj).funcs.is_null() && (*(*obj).funcs).status.is_some() {
-                s = ((*(*obj).funcs).status.unwrap())(obj);
-                supported_status |= s;
+    crate::drm_mode_object_upstream::idr_for_each(
+        core::ptr::addr_of_mut!((*file).object_idr),
+        |_id, ptr| {
+            let obj = ptr as *mut DrmGemObject;
+            if !obj.is_null() {
+                let mut s: u32 = 0;
+                let add_size = if !(*obj).funcs.is_null() && (*(*obj).funcs).rss.is_some() {
+                    ((*(*obj).funcs).rss.unwrap())(obj)
+                } else {
+                    (*obj).size
+                };
+                if !(*obj).funcs.is_null() && (*(*obj).funcs).status.is_some() {
+                    s = ((*(*obj).funcs).status.unwrap())(obj);
+                    supported_status |= s;
+                }
+                if (*obj).handle_count > 1 || !(*obj).dma_buf.is_null() {
+                    stats.shared += (*obj).size as u64;
+                } else {
+                    stats.private += (*obj).size as u64;
+                }
+                if (s & DRM_GEM_OBJECT_RESIDENT) != 0 {
+                    stats.resident += add_size as u64;
+                } else {
+                    s &= !DRM_GEM_OBJECT_PURGEABLE;
+                }
+                if (s & DRM_GEM_OBJECT_PURGEABLE) != 0 {
+                    stats.purgeable += add_size as u64;
+                }
             }
-            if (*obj).handle_count > 1 || !(*obj).dma_buf.is_null() {
-                stats.shared += (*obj).size as u64;
-            } else {
-                stats.private += (*obj).size as u64;
-            }
-            if (s & DRM_GEM_OBJECT_RESIDENT) != 0 {
-                stats.resident += add_size as u64;
-            } else {
-                s &= !DRM_GEM_OBJECT_PURGEABLE;
-            }
-            if (s & DRM_GEM_OBJECT_PURGEABLE) != 0 {
-                stats.purgeable += add_size as u64;
-            }
-        }
-    });
+        },
+    );
     spin_unlock(&mut (*file).table_lock);
 
     drm_print_memory_stats(p, &stats, supported_status, c"memory".as_ptr());
@@ -874,18 +945,30 @@ pub unsafe extern "C" fn drm_show_fdinfo(m: *mut c_void, f: *mut File) {
         arg: m,
         origin: core::ptr::null_mut(),
         prefix: core::ptr::null_mut(),
-        line: crate::drm_print_types::DrmPrinterLine { series: 0, counter: 0 },
+        line: crate::drm_print_types::DrmPrinterLine {
+            series: 0,
+            counter: 0,
+        },
         category: crate::drm_print_types::DRM_UT_CORE,
     };
     if !(*dev).driver.is_null() && !(*(*dev).driver).name.is_null() {
         let name = core::ffi::CStr::from_ptr((*(*dev).driver).name).to_string_lossy();
-        crate::drm_print_upstream::drm_printf(&mut printer, &alloc::format!("drm-driver:\t{}\n", name));
+        crate::drm_print_upstream::drm_printf(
+            &mut printer,
+            &alloc::format!("drm-driver:\t{}\n", name),
+        );
     }
-    crate::drm_print_upstream::drm_printf(&mut printer, &alloc::format!("drm-client-id:\t{}\n", (*file).client_id));
+    crate::drm_print_upstream::drm_printf(
+        &mut printer,
+        &alloc::format!("drm-client-id:\t{}\n", (*file).client_id),
+    );
     mutex_lock(core::ptr::addr_of_mut!((*file).client_name_lock));
     if !(*file).client_name.is_null() {
         let cname = core::ffi::CStr::from_ptr((*file).client_name).to_string_lossy();
-        crate::drm_print_upstream::drm_printf(&mut printer, &alloc::format!("drm-client-name:\t{}\n", cname));
+        crate::drm_print_upstream::drm_printf(
+            &mut printer,
+            &alloc::format!("drm-client-name:\t{}\n", cname),
+        );
     }
     mutex_unlock(core::ptr::addr_of_mut!((*file).client_name_lock));
 
@@ -903,7 +986,8 @@ pub unsafe extern "C" fn drm_file_err(
     _file_priv: *mut DrmFile,
     _fmt: *const c_char,
     mut _args: ...
-) {}
+) {
+}
 
 // upstream: drivers/gpu/drm/drm_file.c mock_drm_getfile()
 #[unsafe(no_mangle)]
@@ -926,11 +1010,40 @@ pub unsafe extern "C" fn mock_drm_getfile(minor: *mut DrmMinor, flags: c_uint) -
 
 #[cfg(test)]
 mod tests {
+    use tk_linux_kapi::{completion::Completion, config::GFP_KERNEL, memory::kmalloc};
+
     use super::*;
-    use tk_linux_kapi::memory::kmalloc;
-    use tk_linux_kapi::config::GFP_KERNEL;
-    use crate::drm_drv_types::DrmDriver;
-    use crate::drm_drv_upstream::{drm_dev_alloc, drm_dev_put};
+    use crate::{
+        drm_drv_types::DrmDriver,
+        drm_drv_upstream::{drm_dev_alloc, drm_dev_put},
+    };
+
+    /// Allocates the event payload behind the pending-event header, as DRM
+    /// event producers do, so releasing the pending event frees one allocation.
+    unsafe fn alloc_pending_event(length: usize, event_type: u32) -> *mut DrmPendingEvent {
+        let header_size = core::mem::size_of::<DrmPendingEvent>();
+        let pending =
+            unsafe { kmalloc(header_size + length, GFP_KERNEL) }.cast::<DrmPendingEvent>();
+        assert!(!pending.is_null());
+        // SAFETY: `pending` points to an allocation of `header_size + length` bytes.
+        unsafe { core::ptr::write_bytes(pending.cast::<u8>(), 0, header_size + length) };
+        // SAFETY: `header_size` is aligned to DrmEvent's 8-byte alignment and
+        // leaves `length` writable bytes in the same allocation.
+        let event = unsafe { pending.cast::<u8>().add(header_size).cast::<DrmEvent>() };
+        // SAFETY: `event` lies within the initialized allocation above.
+        unsafe {
+            (*event).r#type = event_type;
+            (*event).length = length as u32;
+            (*pending).event = event;
+        }
+        pending
+    }
+
+    unsafe extern "C" fn assert_completion_signaled_before_release(completion: *mut Completion) {
+        assert!(!completion.is_null());
+        // SAFETY: The callback receives its live stack completion pointer.
+        assert!(unsafe { &*completion }.is_done());
+    }
 
     #[test]
     fn test_file_alloc_and_events() {
@@ -953,20 +1066,14 @@ mod tests {
             assert_eq!(poll_mask, 0);
 
             // Allocate and reserve event 1 (size 32, type 0x11)
-            let pe1 = kmalloc(core::mem::size_of::<DrmPendingEvent>(), GFP_KERNEL).cast::<DrmPendingEvent>();
-            core::ptr::write_bytes(pe1, 0, 1);
-            let e1 = kmalloc(32, GFP_KERNEL).cast::<DrmEvent>();
-            (*e1).r#type = 0x11;
-            (*e1).length = 32;
+            let pe1 = alloc_pending_event(32, 0x11);
+            let e1 = (*pe1).event;
             assert_eq!(drm_event_reserve_init(dev, file_priv, pe1, e1), 0);
             assert_eq!((*file_priv).event_space, 4096 - 32);
 
             // Allocate and reserve event 2 (size 40, type 0x22)
-            let pe2 = kmalloc(core::mem::size_of::<DrmPendingEvent>(), GFP_KERNEL).cast::<DrmPendingEvent>();
-            core::ptr::write_bytes(pe2, 0, 1);
-            let e2 = kmalloc(40, GFP_KERNEL).cast::<DrmEvent>();
-            (*e2).r#type = 0x22;
-            (*e2).length = 40;
+            let pe2 = alloc_pending_event(40, 0x22);
+            let e2 = (*pe2).event;
             assert_eq!(drm_event_reserve_init(dev, file_priv, pe2, e2), 0);
             assert_eq!((*file_priv).event_space, 4096 - 32 - 40);
 
@@ -983,7 +1090,12 @@ mod tests {
             // Read events: verify FIFO order (e1 then e2)
             let mut read_buf = [0u8; 128];
             let mut offset: i64 = 0;
-            let nread = drm_read(filp, read_buf.as_mut_ptr().cast(), read_buf.len(), &mut offset);
+            let nread = drm_read(
+                filp,
+                read_buf.as_mut_ptr().cast(),
+                read_buf.len(),
+                &mut offset,
+            );
             assert_eq!(nread, 72); // 32 + 40
 
             let ev1_read = read_buf.as_ptr().cast::<DrmEvent>();
@@ -999,33 +1111,176 @@ mod tests {
 
             // Further read with O_NONBLOCK returns -EAGAIN (-11)
             filp_struct.f_flags = O_NONBLOCK;
-            let nread2 = drm_read(filp, read_buf.as_mut_ptr().cast(), read_buf.len(), &mut offset);
+            let nread2 = drm_read(
+                filp,
+                read_buf.as_mut_ptr().cast(),
+                read_buf.len(),
+                &mut offset,
+            );
             assert_eq!(nread2, -11);
             filp_struct.f_flags = 0;
 
             // Test memory stats helpers
-            let stats = DrmMemoryStats { shared: 0, private: 0, resident: 0, purgeable: 0, active: 0 };
+            let stats = DrmMemoryStats {
+                shared: 0,
+                private: 0,
+                resident: 0,
+                purgeable: 0,
+                active: 0,
+            };
             assert_eq!(drm_memory_stats_is_zero(&stats), 1);
-            let stats_active = DrmMemoryStats { shared: 0, private: 0, resident: 0, purgeable: 0, active: 1024 };
+            let stats_active = DrmMemoryStats {
+                shared: 0,
+                private: 0,
+                resident: 0,
+                purgeable: 0,
+                active: 1024,
+            };
             assert_eq!(drm_memory_stats_is_zero(&stats_active), 0);
 
             // Test release frees unsent events without error:
-            let pe3 = kmalloc(core::mem::size_of::<DrmPendingEvent>(), GFP_KERNEL).cast::<DrmPendingEvent>();
-            core::ptr::write_bytes(pe3, 0, 1);
-            let e3 = kmalloc(24, GFP_KERNEL).cast::<DrmEvent>();
-            (*e3).r#type = 0x33;
-            (*e3).length = 24;
+            let pe3 = alloc_pending_event(24, 0x33);
+            let e3 = (*pe3).event;
             assert_eq!(drm_event_reserve_init(dev, file_priv, pe3, e3), 0);
 
-            let pe4 = kmalloc(core::mem::size_of::<DrmPendingEvent>(), GFP_KERNEL).cast::<DrmPendingEvent>();
-            core::ptr::write_bytes(pe4, 0, 1);
-            let e4 = kmalloc(24, GFP_KERNEL).cast::<DrmEvent>();
-            (*e4).r#type = 0x44;
-            (*e4).length = 24;
+            let pe4 = alloc_pending_event(24, 0x44);
+            let e4 = (*pe4).event;
             assert_eq!(drm_event_reserve_init(dev, file_priv, pe4, e4), 0);
             drm_send_event(dev, pe4);
 
             drm_file_free(file_priv);
+            drm_dev_put(dev);
+        }
+    }
+
+    #[test]
+    fn queued_events_are_read_before_unplug_returns_enodev() {
+        unsafe {
+            let driver: DrmDriver = core::mem::zeroed();
+            let dev = drm_dev_alloc(&driver, core::ptr::null_mut());
+            let file_priv = drm_file_alloc((*dev).primary);
+            let mut filp: File = core::mem::zeroed();
+            filp.private_data = file_priv.cast();
+            filp.f_flags = O_NONBLOCK;
+            let event = alloc_pending_event(32, 0x91);
+            assert_eq!(
+                drm_event_reserve_init(dev, file_priv, event, (*event).event),
+                0
+            );
+            drm_send_event(dev, event);
+            (*dev).unplugged.store(true, Ordering::Release);
+
+            assert_eq!(drm_poll(&mut filp, core::ptr::null_mut()), 0x59);
+            let mut bytes = [0u8; 64];
+            let mut offset = 0;
+            assert_eq!(
+                drm_read(
+                    &mut filp,
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    &mut offset
+                ),
+                32,
+            );
+            assert_eq!(
+                drm_read(
+                    &mut filp,
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    &mut offset
+                ),
+                -ENODEV as isize,
+            );
+            drm_file_free(file_priv);
+            drm_dev_put(dev);
+        }
+    }
+
+    #[test]
+    fn cancelling_pending_event_frees_its_embedded_payload_once() {
+        unsafe {
+            let driver: DrmDriver = core::mem::zeroed();
+            let dev = drm_dev_alloc(&driver, core::ptr::null_mut());
+            let file_priv = drm_file_alloc((*dev).primary);
+            let pending = alloc_pending_event(24, 0x92);
+            assert_eq!(
+                drm_event_reserve_init(dev, file_priv, pending, (*pending).event),
+                0,
+            );
+            assert_eq!((*file_priv).event_space, 4096 - 24);
+
+            drm_event_cancel_free(dev, pending);
+
+            assert_eq!((*file_priv).event_space, 4096);
+            assert!(list_empty(&(*file_priv).pending_event_list));
+            drm_file_free(file_priv);
+            drm_dev_put(dev);
+        }
+    }
+
+    #[test]
+    fn sending_event_completes_commit_before_release_callback() {
+        unsafe {
+            let driver: DrmDriver = core::mem::zeroed();
+            let dev = drm_dev_alloc(&driver, core::ptr::null_mut());
+            let file_priv = drm_file_alloc((*dev).primary);
+            let mut filp: File = core::mem::zeroed();
+            filp.private_data = file_priv.cast();
+            filp.f_flags = O_NONBLOCK;
+            let completion = Completion::new();
+            let pending = alloc_pending_event(32, 0x93);
+            (*pending).completion = (&completion as *const Completion).cast_mut();
+            (*pending).completion_release = Some(assert_completion_signaled_before_release);
+            assert_eq!(
+                drm_event_reserve_init(dev, file_priv, pending, (*pending).event),
+                0,
+            );
+            drm_send_event(dev, pending);
+            assert!(completion.is_done());
+
+            let mut bytes = [0u8; 64];
+            let mut offset = 0;
+            assert_eq!(
+                drm_read(
+                    &mut filp,
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    &mut offset
+                ),
+                32,
+            );
+            drm_file_free(file_priv);
+            drm_dev_put(dev);
+        }
+    }
+
+    #[test]
+    fn unplug_wakes_a_blocking_event_reader() {
+        assert!(
+            axhal::percpu::current_task_ptr::<()>().is_null(),
+            "host blocking-read test must not inherit a synthetic scheduler task",
+        );
+        crate::test_support::ensure_test_signal_provider();
+        unsafe {
+            let driver: DrmDriver = core::mem::zeroed();
+            let dev = drm_dev_alloc(&driver, core::ptr::null_mut());
+            let mut filp: File = core::mem::zeroed();
+            assert_eq!(drm_open_helper(&mut filp, (*dev).primary), 0);
+            let filp_address = (&mut filp as *mut File) as usize;
+
+            let reader = std::thread::spawn(move || {
+                let filp = filp_address as *mut File;
+                let mut bytes = [0u8; 32];
+                let mut offset = 0;
+                // SAFETY: `filp` points to the stack VFS file kept alive until
+                // this thread joins; the buffer and offset are local writable storage.
+                unsafe { drm_read(filp, bytes.as_mut_ptr().cast(), bytes.len(), &mut offset) }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            crate::drm_drv_upstream::drm_dev_unplug(dev);
+
+            assert_eq!(reader.join().expect("reader thread"), -ENODEV as isize);
+            drm_close_helper(&mut filp);
             drm_dev_put(dev);
         }
     }
@@ -1052,18 +1307,19 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(15));
                 let dev_p = dev_addr as *mut DrmDevice;
                 let fp_p = fp_addr as *mut DrmFile;
-                let pe = kmalloc(core::mem::size_of::<DrmPendingEvent>(), GFP_KERNEL).cast::<DrmPendingEvent>();
-                core::ptr::write_bytes(pe, 0, 1);
-                let e = kmalloc(32, GFP_KERNEL).cast::<DrmEvent>();
-                (*e).r#type = 0x55;
-                (*e).length = 32;
-                assert_eq!(drm_event_reserve_init(dev_p, fp_p, pe, e), 0);
+                let pe = alloc_pending_event(32, 0x55);
+                assert_eq!(drm_event_reserve_init(dev_p, fp_p, pe, (*pe).event), 0);
                 drm_send_event(dev_p, pe);
             });
 
             let mut read_buf = [0u8; 64];
             let mut offset = 0i64;
-            let nread = drm_read(filp, read_buf.as_mut_ptr().cast(), read_buf.len(), &mut offset);
+            let nread = drm_read(
+                filp,
+                read_buf.as_mut_ptr().cast(),
+                read_buf.len(),
+                &mut offset,
+            );
             assert_eq!(nread, 32);
             let ev = read_buf.as_ptr().cast::<DrmEvent>();
             assert_eq!((*ev).r#type, 0x55);
@@ -1084,12 +1340,8 @@ mod tests {
             filp_struct.f_flags = O_NONBLOCK;
             let filp = &mut filp_struct as *mut File;
 
-            let pe = kmalloc(core::mem::size_of::<DrmPendingEvent>(), GFP_KERNEL).cast::<DrmPendingEvent>();
-            core::ptr::write_bytes(pe, 0, 1);
-            let e = kmalloc(32, GFP_KERNEL).cast::<DrmEvent>();
-            (*e).r#type = 0x77;
-            (*e).length = 32;
-            assert_eq!(drm_event_reserve_init(dev, file_priv, pe, e), 0);
+            let pe = alloc_pending_event(32, 0x77);
+            assert_eq!(drm_event_reserve_init(dev, file_priv, pe, (*pe).event), 0);
             drm_send_event(dev, pe);
 
             let mut offset = 0i64;
@@ -1138,13 +1390,11 @@ mod tests {
             let mut filp: File = core::mem::zeroed();
             filp.private_data = file_priv.cast();
 
-            let pending = kmalloc(core::mem::size_of::<DrmPendingEvent>(), GFP_KERNEL)
-                .cast::<DrmPendingEvent>();
-            core::ptr::write_bytes(pending, 0, 1);
-            let event = kmalloc(32, GFP_KERNEL).cast::<DrmEvent>();
-            (*event).r#type = 0x78;
-            (*event).length = 32;
-            assert_eq!(drm_event_reserve_init(dev, file_priv, pending, event), 0);
+            let pending = alloc_pending_event(32, 0x78);
+            assert_eq!(
+                drm_event_reserve_init(dev, file_priv, pending, (*pending).event),
+                0
+            );
             drm_send_event(dev, pending);
 
             let mut short = Sink {
@@ -1152,12 +1402,8 @@ mod tests {
                 written: 0,
                 limit: 4,
             };
-            let ret = drm_read_kernel_to(
-                &mut filp,
-                64,
-                (&mut short as *mut Sink).cast(),
-                sink_writer,
-            );
+            let ret =
+                drm_read_kernel_to(&mut filp, 64, (&mut short as *mut Sink).cast(), sink_writer);
             assert_eq!(ret, -EFAULT as isize);
             assert_eq!(short.written, 4);
             assert!(!list_empty(&(*file_priv).event_list));
@@ -1168,12 +1414,8 @@ mod tests {
                 written: 0,
                 limit: usize::MAX,
             };
-            let ret = drm_read_kernel_to(
-                &mut filp,
-                64,
-                (&mut full as *mut Sink).cast(),
-                sink_writer,
-            );
+            let ret =
+                drm_read_kernel_to(&mut filp, 64, (&mut full as *mut Sink).cast(), sink_writer);
             assert_eq!(ret, 32);
             assert_eq!(full.written, 32);
             let read = full.bytes.as_ptr().cast::<DrmEvent>();
@@ -1182,12 +1424,7 @@ mod tests {
             assert_eq!((*file_priv).event_space, 4096);
             assert!(list_empty(&(*file_priv).event_list));
             assert_eq!(
-                drm_read_kernel_to(
-                    &mut filp,
-                    64,
-                    (&mut full as *mut Sink).cast(),
-                    sink_writer,
-                ),
+                drm_read_kernel_to(&mut filp, 64, (&mut full as *mut Sink).cast(), sink_writer,),
                 -EAGAIN as isize,
             );
 
@@ -1206,7 +1443,8 @@ mod tests {
             filp_struct.private_data = file_priv.cast();
             let filp = &mut filp_struct as *mut File;
 
-            static CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            static CALLED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
             CALLED.store(false, Ordering::SeqCst);
 
             unsafe extern "C" fn test_qproc(

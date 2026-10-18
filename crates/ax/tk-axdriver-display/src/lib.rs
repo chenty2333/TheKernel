@@ -279,6 +279,15 @@ pub enum GpuQueue {
     Cursor,
 }
 
+/// Result of resetting one GPU queue. `completions` is only the number of
+/// terminal records copied to the caller; `quiesced` is the independent proof
+/// that the device can no longer access any DMA backing owned by the queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuResetResult {
+    pub completions: usize,
+    pub quiesced: bool,
+}
+
 /// An owned GPU command batch. Borrowed userspace or GEM memory is copied
 /// into this object before it reaches the device driver, so the lower layer
 /// can retain request and response DMA buffers until terminal completion.
@@ -315,6 +324,10 @@ pub enum GpuBatch {
         source_y: u32,
         damage: Option<DrmDamage>,
     },
+    /// Detach resource 0 from scanout 0 and leave the output blank.  This is
+    /// distinct from destroying a resource: KMS can disable its primary plane
+    /// while keeping the virtual CRTC active.
+    DisableScanout,
     DestroyResource {
         resource: u32,
     },
@@ -480,8 +493,10 @@ pub trait GpuTransport {
     fn drain_completions(&mut self, queue: GpuQueue, out: &mut [GpuCompletion])
     -> DevResult<usize>;
     /// Reset one queue. Every returned completion is terminal with an error;
-    /// reset is never successful execution.
-    fn reset(&mut self, queue: GpuQueue, out: &mut [GpuCompletion]) -> usize;
+    /// reset is never successful execution. The returned `quiesced` flag is
+    /// the separate proof needed before releasing DMA-visible backing; a
+    /// terminal fence/error alone is not that proof.
+    fn reset(&mut self, queue: GpuQueue, out: &mut [GpuCompletion]) -> GpuResetResult;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -629,8 +644,13 @@ pub trait DisplayDriverOps: BaseDriverOps {
     ) -> DevResult<usize> {
         Ok(0)
     }
-    fn drm_reset(&mut self, _queue: GpuQueue, _out: &mut [GpuCompletion]) -> usize {
-        0
+    /// Reset one queue. Drivers without an explicit transport reset contract
+    /// must leave `quiesced` false so callers retain DMA-visible references.
+    fn drm_reset(&mut self, _queue: GpuQueue, _out: &mut [GpuCompletion]) -> GpuResetResult {
+        GpuResetResult {
+            completions: 0,
+            quiesced: false,
+        }
     }
     /// Acknowledge and consume one display-config notification.  The returned
     /// mode is sampled after acknowledgement, never reconstructed from stale

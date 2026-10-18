@@ -5,56 +5,59 @@
 //! - drm_gem_framebuffer_helper
 //! - drm_gem_atomic_helper
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
-use core::ffi::c_void;
-use core::mem::zeroed;
+use alloc::{boxed::Box, vec::Vec};
+use core::{ffi::c_void, mem::zeroed};
 use std::sync::Mutex;
 
-use tk_linux_kapi::config::{EBUSY, EINVAL, ERANGE, IS_ERR};
-use tk_linux_kapi::list::INIT_LIST_HEAD;
+use tk_linux_kapi::{
+    config::{EBUSY, EINVAL, ERANGE, IS_ERR},
+    list::INIT_LIST_HEAD,
+};
 
-use crate::drm_atomic_helper_upstream::*;
-use crate::drm_atomic_state_helper_upstream::*;
-use crate::drm_atomic_upstream::*;
-use crate::drm_atomic_types::DrmAtomicCommit;
-use crate::drm_atomic_uapi_upstream::{
-    drm_atomic_set_crtc_for_connector, drm_atomic_set_crtc_for_plane,
-    drm_atomic_set_mode_for_crtc,
+use crate::{
+    drm_atomic_helper_upstream::*,
+    drm_atomic_state_helper_upstream::*,
+    drm_atomic_types::DrmAtomicCommit,
+    drm_atomic_uapi_upstream::{
+        drm_atomic_set_crtc_for_connector, drm_atomic_set_crtc_for_plane,
+        drm_atomic_set_mode_for_crtc,
+    },
+    drm_atomic_upstream::*,
+    drm_connector_types::{DrmConnector, DrmConnectorFuncs},
+    drm_crtc_types::{DrmCrtc, DrmCrtcFuncs, DrmCrtcState},
+    drm_device_types::DrmDevice,
+    drm_encoder_types::DrmEncoder,
+    drm_file_upstream::{drm_file_alloc, drm_file_free},
+    drm_fourcc_types::DrmFormatInfo,
+    drm_framebuffer_types::{DrmFramebuffer, DrmFramebufferFuncs},
+    drm_framebuffer_upstream::{drm_framebuffer_cleanup, drm_framebuffer_init},
+    drm_gem_atomic_helper_upstream::*,
+    drm_gem_framebuffer_helper_upstream::*,
+    drm_gem_types::DrmGemObject,
+    drm_gem_upstream::{
+        drm_gem_handle_create, drm_gem_handle_delete, drm_gem_object_init, drm_gem_object_release,
+    },
+    drm_mode_config_types::DrmModeConfigFuncs,
+    drm_modes_types::DrmDisplayMode,
+    drm_modeset_helper_vtables_types::{
+        DrmConnectorHelperFuncs, DrmCrtcHelperFuncs, DrmEncoderHelperFuncs,
+        DrmModeConfigHelperFuncs, DrmPlaneHelperFuncs,
+    },
+    drm_modeset_lock_types::DrmModesetAcquireCtx,
+    drm_modeset_lock_upstream::*,
+    drm_plane_types::{DRM_PLANE_TYPE_PRIMARY, DrmPlane, DrmPlaneFuncs, DrmPlaneState},
+    drm_rect_types::DrmRect,
+    test_support::TestDrm,
+    uapi_drm_consts::*,
+    uapi_drm_mode_types::DrmModeFbCmd2,
 };
-use crate::drm_connector_types::{DrmConnector, DrmConnectorFuncs};
-use crate::drm_crtc_types::{DrmCrtc, DrmCrtcFuncs, DrmCrtcState};
-use crate::drm_device_types::DrmDevice;
-use crate::drm_encoder_types::DrmEncoder;
-use crate::drm_file_upstream::{drm_file_alloc, drm_file_free};
-use crate::drm_fourcc_types::DrmFormatInfo;
-use crate::drm_framebuffer_types::{DrmFramebuffer, DrmFramebufferFuncs};
-use crate::drm_framebuffer_upstream::{drm_framebuffer_cleanup, drm_framebuffer_init};
-use crate::drm_gem_atomic_helper_upstream::*;
-use crate::drm_gem_framebuffer_helper_upstream::*;
-use crate::drm_gem_types::DrmGemObject;
-use crate::drm_gem_upstream::{
-    drm_gem_handle_create, drm_gem_handle_delete, drm_gem_object_init, drm_gem_object_release,
-};
-use crate::drm_modes_types::DrmDisplayMode;
-use crate::drm_modeset_helper_vtables_types::{
-    DrmConnectorHelperFuncs, DrmCrtcHelperFuncs, DrmEncoderHelperFuncs, DrmModeConfigHelperFuncs,
-    DrmPlaneHelperFuncs,
-};
-use crate::drm_mode_config_types::DrmModeConfigFuncs;
-use crate::drm_modeset_lock_types::DrmModesetAcquireCtx;
-use crate::drm_modeset_lock_upstream::*;
-use crate::drm_plane_types::{DrmPlane, DrmPlaneFuncs, DrmPlaneState, DRM_PLANE_TYPE_PRIMARY};
-use crate::drm_rect_types::DrmRect;
-use crate::test_support::TestDrm;
-use crate::uapi_drm_consts::*;
-use crate::uapi_drm_mode_types::DrmModeFbCmd2;
 
 const DRIVER_MODESET: u32 = 1 << 1;
 const DRIVER_ATOMIC: u32 = 1 << 4;
 const DRIVER_GEM: u32 = 1 << 0;
 
 use core::ffi::{c_char, c_int};
+
 use tk_linux_kapi::kernel_services::TaskOps;
 
 unsafe extern "C" fn test_current_comm() -> *const c_char {
@@ -63,12 +66,22 @@ unsafe extern "C" fn test_current_comm() -> *const c_char {
 unsafe extern "C" fn test_task_comm(_task: *const c_void, buf: *mut c_char) {
     unsafe { core::ptr::copy_nonoverlapping(c"test".as_ptr(), buf, 5) };
 }
-unsafe extern "C" fn test_task_pid_nr(_task: *const c_void) -> c_int { 1 }
-unsafe extern "C" fn test_task_pid(_task: *mut c_void, _pid_type: c_int) -> *mut c_void { core::ptr::null_mut() }
-unsafe extern "C" fn test_pid_nr(_pid: *const c_void) -> c_int { 1 }
+unsafe extern "C" fn test_task_pid_nr(_task: *const c_void) -> c_int {
+    1
+}
+unsafe extern "C" fn test_task_pid(_task: *mut c_void, _pid_type: c_int) -> *mut c_void {
+    core::ptr::null_mut()
+}
+unsafe extern "C" fn test_pid_nr(_pid: *const c_void) -> c_int {
+    1
+}
 unsafe extern "C" fn test_put_pid(_pid: *mut c_void) {}
-unsafe extern "C" fn test_capable(_cap: c_int) -> bool { false }
-unsafe extern "C" fn test_perfmon_capable() -> bool { false }
+unsafe extern "C" fn test_capable(_cap: c_int) -> bool {
+    false
+}
+unsafe extern "C" fn test_perfmon_capable() -> bool {
+    false
+}
 
 static TEST_TASK_OPS: TaskOps = TaskOps {
     current_comm: test_current_comm,
@@ -86,7 +99,7 @@ static MAIN_TASK_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::Atom
 // The host harness reuses its worker thread across serial tests. B2b tests
 // attach the scheduler's main task only for their own helper calls; do not
 // leave that kernel-task identity in the host thread for later tests.
-struct RestoreCurrentTask(*const ());
+pub(crate) struct RestoreCurrentTask(*const ());
 
 impl Drop for RestoreCurrentTask {
     fn drop(&mut self) {
@@ -94,7 +107,7 @@ impl Drop for RestoreCurrentTask {
     }
 }
 
-fn init_test_env() -> RestoreCurrentTask {
+pub(crate) fn init_test_env() -> RestoreCurrentTask {
     crate::test_support::ensure_test_signal_provider();
     let previous = axhal::percpu::current_task_ptr::<()>();
     static SCHED_INIT: std::sync::Once = std::sync::Once::new();
@@ -110,9 +123,6 @@ fn init_test_env() -> RestoreCurrentTask {
     let _ = tk_linux_kapi::kernel_services::install_task_ops(&TEST_TASK_OPS);
     RestoreCurrentTask(previous)
 }
-
-
-
 
 // ---------------------------------------------------------------------------
 // Execution callback log for commit verification
@@ -292,6 +302,7 @@ static MODE_CONFIG_FUNCS: DrmModeConfigFuncs = DrmModeConfigFuncs {
 static MODE_CONFIG_HELPER_FUNCS: DrmModeConfigHelperFuncs = DrmModeConfigHelperFuncs {
     atomic_commit_tail: Some(drm_atomic_helper_commit_tail_rpm),
     atomic_commit_setup: None,
+    atomic_commit_pre_swap: None,
 };
 
 static FB_FUNCS: DrmFramebufferFuncs = DrmFramebufferFuncs {
@@ -343,7 +354,8 @@ impl TestFixture {
             tk_linux_kapi::mutex::mutex_init(core::ptr::addr_of_mut!((*dev).filelist_mutex));
             INIT_LIST_HEAD(core::ptr::addr_of_mut!((*dev).filelist));
 
-            let primary_minor = Box::into_raw(Box::new(zeroed::<crate::drm_file_types::DrmMinor>()));
+            let primary_minor =
+                Box::into_raw(Box::new(zeroed::<crate::drm_file_types::DrmMinor>()));
             (*primary_minor).dev = dev;
             (*primary_minor).r#type = 0;
             (*dev).primary = primary_minor;
@@ -446,7 +458,10 @@ impl Drop for TestFixture {
                 self.plane.state = core::ptr::null_mut();
             }
             if !self.connector.state.is_null() {
-                drm_atomic_helper_connector_destroy_state(&mut *self.connector, self.connector.state);
+                drm_atomic_helper_connector_destroy_state(
+                    &mut *self.connector,
+                    self.connector.state,
+                );
                 self.connector.state = core::ptr::null_mut();
             }
         }
@@ -879,7 +894,10 @@ fn test_suspend_resume_roundtrip() {
         // Suspend device
         let saved_state = drm_atomic_helper_suspend(dev);
         if IS_ERR(saved_state) {
-            panic!("saved_state error: {}", tk_linux_kapi::config::PTR_ERR(saved_state));
+            panic!(
+                "saved_state error: {}",
+                tk_linux_kapi::config::PTR_ERR(saved_state)
+            );
         }
         assert!(!saved_state.is_null());
 

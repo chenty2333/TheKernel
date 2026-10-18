@@ -36,4 +36,4 @@ path = "../tk-axhal"
 [dev-dependencies.axtask]
 package = "tk-axtask"
 path = "../tk-axtask"
-features = ["multitask", "preempt"]
+features = ["multitask", "preempt", "test"]

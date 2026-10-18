@@ -92,9 +92,16 @@ pub struct DrmPlaneHelperFuncs {
 pub struct DrmModeConfigHelperFuncs {
     pub atomic_commit_tail: Option<unsafe extern "C" fn(*mut DrmAtomicCommit)>,
     pub atomic_commit_setup: Option<unsafe extern "C" fn(*mut DrmAtomicCommit) -> i32>,
+    /// Fallible blocking-commit hook invoked after preparation/fence waits and
+    /// before publishing the new software state. Nonblocking commits skip it.
+    pub atomic_commit_pre_swap: Option<unsafe extern "C" fn(*mut DrmAtomicCommit) -> i32>,
 }
 
 const _: () = assert!(size_of::<DrmCrtcHelperFuncs>() == 128);
+const _: () = assert!(size_of::<DrmModeConfigHelperFuncs>() == 24);
+const _: () = assert!(core::mem::offset_of!(DrmModeConfigHelperFuncs, atomic_commit_tail) == 0);
+const _: () = assert!(core::mem::offset_of!(DrmModeConfigHelperFuncs, atomic_commit_setup) == 8);
+const _: () = assert!(core::mem::offset_of!(DrmModeConfigHelperFuncs, atomic_commit_pre_swap) == 16);
 const _: () = assert!(core::mem::offset_of!(DrmCrtcHelperFuncs, dpms) == 0);
 const _: () = assert!(core::mem::offset_of!(DrmCrtcHelperFuncs, prepare) == 8);
 const _: () = assert!(core::mem::offset_of!(DrmCrtcHelperFuncs, commit) == 16);
@@ -151,6 +158,5 @@ const _: () = assert!(core::mem::offset_of!(DrmPlaneHelperFuncs, atomic_async_ch
 const _: () = assert!(core::mem::offset_of!(DrmPlaneHelperFuncs, atomic_async_update) == 72);
 const _: () = assert!(core::mem::offset_of!(DrmPlaneHelperFuncs, get_scanout_buffer) == 80);
 const _: () = assert!(core::mem::offset_of!(DrmPlaneHelperFuncs, panic_flush) == 88);
-const _: () = assert!(size_of::<DrmModeConfigHelperFuncs>() == 16);
 const _: () = assert!(core::mem::offset_of!(DrmModeConfigHelperFuncs, atomic_commit_tail) == 0);
 const _: () = assert!(core::mem::offset_of!(DrmModeConfigHelperFuncs, atomic_commit_setup) == 8);

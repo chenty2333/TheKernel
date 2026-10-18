@@ -37,7 +37,7 @@ use core::{
 use kernel_guard::NoPreemptIrqSave;
 
 use crate::{
-    types::{DelayedWork, ListHead, TimerList, WorkStruct},
+    types::{DelayedWork, IrqWork, IrqWorkNode, ListHead, TimerList, WorkStruct},
     timer::{del_timer, del_timer_sync, mod_timer, timer_setup},
 };
 
@@ -231,6 +231,8 @@ unsafe fn delayed_workqueue_atomic<'a>(work: *mut DelayedWork) -> &'a AtomicPtr<
 struct WorkList {
     head: *mut ListHead,
     tail: *mut ListHead,
+    irq_head: *mut IrqWorkNode,
+    irq_tail: *mut IrqWorkNode,
 }
 
 impl WorkList {
@@ -238,6 +240,8 @@ impl WorkList {
         Self {
             head: ptr::null_mut(),
             tail: ptr::null_mut(),
+            irq_head: ptr::null_mut(),
+            irq_tail: ptr::null_mut(),
         }
     }
 
@@ -292,6 +296,42 @@ impl WorkList {
         unsafe { work_from_entry(node) }
     }
 
+    /// Append an IRQ-work node to the deferred FIFO. The caller holds
+    /// `WORK_QUEUE` and the node must not be linked elsewhere.
+    unsafe fn push_irq(&mut self, work: *mut IrqWork) {
+        // SAFETY: the caller holds `WORK_QUEUE` and guarantees `work` is live.
+        let node = unsafe { ptr::addr_of_mut!((*work).node) };
+        // SAFETY: `node` is the initialized first field of the live work item.
+        assert!(unsafe { (*node).next.is_null() });
+        if self.irq_tail.is_null() {
+            self.irq_head = node;
+        } else {
+            unsafe { (*self.irq_tail).next = node };
+        }
+        self.irq_tail = node;
+    }
+
+    /// Remove the oldest IRQ-work node. The caller holds `WORK_QUEUE`.
+    unsafe fn pop_irq(&mut self) -> *mut IrqWork {
+        let node = self.irq_head;
+        if node.is_null() {
+            return ptr::null_mut();
+        }
+        // SAFETY: `node` is the FIFO head protected by `WORK_QUEUE`.
+        self.irq_head = unsafe { (*node).next };
+        if self.irq_head.is_null() {
+            self.irq_tail = ptr::null_mut();
+        }
+        // SAFETY: `node` was just removed from the protected FIFO.
+        unsafe { (*node).next = ptr::null_mut() };
+        // SAFETY: node is embedded in a live IrqWork at this fixed offset.
+        unsafe {
+            node.cast::<u8>()
+                .sub(core::mem::offset_of!(IrqWork, node))
+                .cast()
+        }
+    }
+
     /// Remove a pending item. The caller holds `WORK_QUEUE`.
     unsafe fn remove(&mut self, work: *mut WorkStruct) -> bool {
         let node = unsafe { ptr::addr_of_mut!((*work).entry) };
@@ -331,8 +371,8 @@ unsafe fn work_from_entry(node: *mut ListHead) -> *mut WorkStruct {
     }
 }
 
-// Queue pointers are accessed only while WORK_QUEUE is locked, and the caller
-// owns each work item through its flush/cancel lifetime.
+// Work and IRQ-work nodes are accessed only while WORK_QUEUE is locked; their
+// callers own each node through the corresponding completion lifetime.
 unsafe impl Send for WorkList {}
 
 struct IrqSpinLock<T> {
@@ -399,6 +439,8 @@ static WORKER_STATE: AtomicU8 = AtomicU8::new(WORKER_UNINITIALIZED);
 static WORK_GENERATION: AtomicUsize = AtomicUsize::new(0);
 /// Items on the FIFO (pending, not yet running). Changed under `WORK_QUEUE`.
 static QUEUED: AtomicUsize = AtomicUsize::new(0);
+/// IRQ-work nodes on the deferred FIFO (pending, not yet running).
+static IRQ_QUEUED: AtomicUsize = AtomicUsize::new(0);
 static WORK_WAKE: axtask::WaitQueue = axtask::WaitQueue::new();
 static WORK_STATE_WAKE: axtask::WaitQueue = axtask::WaitQueue::new();
 static MANAGER_WAKE: axtask::WaitQueue = axtask::WaitQueue::new();
@@ -409,6 +451,7 @@ const INITIAL_WORKERS: usize = 2;
 /// How long runnable work may wait with no idle worker before the manager
 /// adds one: long enough that ordinary busy workers pick it up first.
 const STARVATION_GRACE: core::time::Duration = core::time::Duration::from_millis(10);
+const MAX_IRQ_WORK_BURST: usize = 8;
 
 struct WorkerSlot {
     task: AtomicUsize,
@@ -440,9 +483,18 @@ fn notify_workers() {
     WORK_WAKE.notify_all(false);
 }
 
+/// Publish that worker creation has completed, then wake any pool tasks and
+/// work items queued before initialization finished.
+fn publish_workers_ready() {
+    WORKER_STATE.store(WORKER_READY, Ordering::Release);
+    notify_workers();
+}
+
 /// Wake the manager when work is queued and every worker is occupied.
 fn kick_manager_if_starved() {
-    if QUEUED.load(Ordering::Acquire) != 0 && IDLE_WORKERS.load(Ordering::Acquire) == 0 {
+    if (QUEUED.load(Ordering::Acquire) != 0 || IRQ_QUEUED.load(Ordering::Acquire) != 0)
+        && IDLE_WORKERS.load(Ordering::Acquire) == 0
+    {
         MANAGER_WAKE.notify_one(false);
     }
 }
@@ -520,8 +572,7 @@ pub fn init_workqueue_executor() -> Result<(), WorkqueueError> {
                     WORK_WAKE.notify_all(false);
                     return Err(error);
                 }
-                WORKER_STATE.store(WORKER_READY, Ordering::Release);
-                notify_workers();
+                publish_workers_ready();
                 return Ok(());
             }
             _ => unreachable!("invalid workqueue worker state"),
@@ -724,6 +775,43 @@ pub unsafe fn try_queue_work<Q: WorkqueuePtr, W: WorkStructPtr>(
     Ok(true)
 }
 
+/// Queue an already-claimed `irq_work` item for task-context execution by the
+/// persistent shared worker pool. Enqueueing is allocation-free and never
+/// starts the pool, so it is safe for hard-IRQ producers.
+///
+/// # Safety
+/// `work` must point to a live `IrqWork` whose PENDING and BUSY flags are set,
+/// whose node is not queued or running, and whose callback and storage remain
+/// valid until dispatch completes.
+pub unsafe fn queue_irq_work(work: *mut IrqWork) -> bool {
+    if work.is_null() {
+        return false;
+    }
+    // SAFETY: the caller guarantees a live work item through queued dispatch.
+    if unsafe { (*work).func }.is_none() {
+        return false;
+    }
+    // SAFETY: the live work item stores an aligned AtomicU32-compatible flags
+    // field, accessed only atomically by the IRQ-work implementation.
+    let flags = unsafe {
+        &*ptr::addr_of_mut!((*work).node.flags.counter).cast::<AtomicU32>()
+    };
+    let claimed = crate::irq_work::IRQ_WORK_PENDING | crate::irq_work::IRQ_WORK_BUSY;
+    if flags.load(Ordering::Acquire) & claimed != claimed {
+        return false;
+    }
+    {
+        let mut queue = WORK_QUEUE.lock();
+        // SAFETY: the work item is claimed and live by contract, and the queue
+        // lock serializes the intrusive FIFO links.
+        unsafe { queue.push_irq(work) };
+        IRQ_QUEUED.fetch_add(1, Ordering::AcqRel);
+    }
+    notify_workers();
+    kick_manager_if_starved();
+    true
+}
+
 /// Publish a work item whose PENDING bit is already set. The caller holds
 /// `WORK_QUEUE`.
 unsafe fn enqueue_locked(queue: &mut WorkList, workqueue: *mut WorkqueueStruct, work: *mut WorkStruct) {
@@ -786,6 +874,9 @@ unsafe fn take_runnable_locked(queue: &mut WorkList) -> Option<(*mut WorkStruct,
 /// Whether any queued item could start now (manager heuristic).
 fn has_runnable_work() -> bool {
     let queue = WORK_QUEUE.lock();
+    if !queue.irq_head.is_null() {
+        return true;
+    }
     let head = queue.head;
     if head.is_null() {
         return false;
@@ -829,6 +920,24 @@ fn take_work(index: usize) -> *mut WorkStruct {
     taken
 }
 
+/// Dequeue one IRQ-work callback. The caller's worker runs it through
+/// `run_irq_work`, which holds RCU protection until it has retired its flags.
+fn take_irq_work() -> *mut IrqWork {
+    let work = {
+        let mut queue = WORK_QUEUE.lock();
+        // SAFETY: the queue lock protects the intrusive IRQ-work FIFO.
+        let work = unsafe { queue.pop_irq() };
+        if !work.is_null() {
+            IRQ_QUEUED.fetch_sub(1, Ordering::AcqRel);
+        }
+        work
+    };
+    if !work.is_null() {
+        kick_manager_if_starved();
+    }
+    work
+}
+
 fn finish_work(index: usize, work: *mut WorkStruct) {
     {
         let _queue = WORK_QUEUE.lock();
@@ -844,7 +953,7 @@ fn finish_work(index: usize, work: *mut WorkStruct) {
     WORK_STATE_WAKE.notify_all(false);
     // A requeued instance of this item, or the next item of a saturated
     // queue, may be runnable now.
-    if QUEUED.load(Ordering::Acquire) != 0 {
+    if QUEUED.load(Ordering::Acquire) != 0 || IRQ_QUEUED.load(Ordering::Acquire) != 0 {
         notify_workers();
     }
 }
@@ -862,22 +971,48 @@ fn workqueue_worker(index: usize) {
         .wait_until(|| WORKER_STATE.load(Ordering::Acquire) == WORKER_READY)
         .expect("workqueue worker could not wait for executor publication");
 
+    let mut irq_burst = 0;
     loop {
         let generation = WORK_GENERATION.load(Ordering::Acquire);
+
+        // Keep IRQ work responsive without allowing a permanent IRQ stream to
+        // starve ordinary workqueue callbacks.
+        if irq_burst < MAX_IRQ_WORK_BURST {
+            let irq_work = take_irq_work();
+            if !irq_work.is_null() {
+                // SAFETY: the node was dequeued from the claimed IRQ FIFO and
+                // remains live until its callback retires it.
+                unsafe { crate::irq_work::run_irq_work(irq_work) };
+                irq_burst += 1;
+                continue;
+            }
+        }
+
         let work = take_work(index);
-        if work.is_null() {
-            IDLE_WORKERS.fetch_add(1, Ordering::AcqRel);
-            WORK_WAKE
-                .wait_until(|| WORK_GENERATION.load(Ordering::Acquire) != generation)
-                .expect("workqueue worker lost its waitable task context");
-            IDLE_WORKERS.fetch_sub(1, Ordering::AcqRel);
+        if !work.is_null() {
+            irq_burst = 0;
+            let callback =
+                unsafe { (*work).function }.expect("queued work item has no initialized callback");
+            unsafe { callback(work) };
+            finish_work(index, work);
             continue;
         }
 
-        let callback =
-            unsafe { (*work).function }.expect("queued work item has no initialized callback");
-        unsafe { callback(work) };
-        finish_work(index, work);
+        let irq_work = take_irq_work();
+        if !irq_work.is_null() {
+            // Ordinary work could not run now (for example, a saturated
+            // ordered queue), so keep draining deferred callbacks.
+            // SAFETY: as above, this node was dequeued from the live FIFO.
+            unsafe { crate::irq_work::run_irq_work(irq_work) };
+            irq_burst = 1;
+            continue;
+        }
+
+        IDLE_WORKERS.fetch_add(1, Ordering::AcqRel);
+        WORK_WAKE
+            .wait_until(|| WORK_GENERATION.load(Ordering::Acquire) != generation)
+            .expect("workqueue worker lost its waitable task context");
+        IDLE_WORKERS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -888,7 +1023,7 @@ fn workqueue_manager() {
         .wait_until(|| WORKER_STATE.load(Ordering::Acquire) == WORKER_READY)
         .expect("workqueue manager could not wait for executor publication");
     let starved = || {
-        QUEUED.load(Ordering::Acquire) != 0
+        (QUEUED.load(Ordering::Acquire) != 0 || IRQ_QUEUED.load(Ordering::Acquire) != 0)
             && IDLE_WORKERS.load(Ordering::Acquire) == 0
             && NR_WORKERS.load(Ordering::Acquire) < MAX_WORKERS
     };
@@ -1155,6 +1290,7 @@ mod tests {
     use core::sync::atomic::AtomicU32;
 
     static TEST_CALLBACK_CALLED: AtomicU32 = AtomicU32::new(0);
+    static TEST_IRQ_CALLBACK_CALLED: AtomicU32 = AtomicU32::new(0);
     /// The tests share the global FIFO; serialize them.
     static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1176,6 +1312,50 @@ mod tests {
 
     unsafe extern "C" fn test_callback(_work: *mut WorkStruct) {
         TEST_CALLBACK_CALLED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn test_irq_callback(_work: *mut IrqWork) {
+        TEST_IRQ_CALLBACK_CALLED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn irq_work_is_deferred_deduplicated_and_retired_by_the_pool() {
+        let _serial = serial();
+        if WORKER_STATE.load(Ordering::Acquire) != WORKER_UNINITIALIZED {
+            // Another test already started the shared pool; its live workers
+            // own queue draining and this hand-driven test must not race them.
+            return;
+        }
+        assert_eq!(IRQ_QUEUED.load(Ordering::Acquire), 0);
+        TEST_IRQ_CALLBACK_CALLED.store(0, Ordering::SeqCst);
+        // SAFETY: IrqWork is a C-layout record initialized immediately below.
+        let mut work = unsafe { core::mem::zeroed::<IrqWork>() };
+        crate::irq_work::init_irq_work(&mut work, test_irq_callback);
+
+        // Host tests cannot create task-context workers, so emulate the
+        // executor's ready publication after queuing the node. This verifies
+        // pre-init work remains on the static FIFO and becomes drainable.
+        let previous_state = WORKER_STATE.swap(WORKER_UNINITIALIZED, Ordering::AcqRel);
+        assert!(crate::irq_work::irq_work_queue(&mut work));
+        assert_eq!(TEST_IRQ_CALLBACK_CALLED.load(Ordering::SeqCst), 0);
+        assert_eq!(IRQ_QUEUED.load(Ordering::Acquire), 1);
+        let claimed =
+            (crate::irq_work::IRQ_WORK_PENDING | crate::irq_work::IRQ_WORK_BUSY) as i32;
+        assert_eq!(work.node.flags.counter & claimed, claimed);
+        assert!(!crate::irq_work::irq_work_queue(&mut work));
+        assert_eq!(IRQ_QUEUED.load(Ordering::Acquire), 1);
+
+        publish_workers_ready();
+        let queued = take_irq_work();
+        assert_eq!(queued, &mut work as *mut IrqWork);
+        assert_eq!(IRQ_QUEUED.load(Ordering::Acquire), 0);
+        assert_eq!(TEST_IRQ_CALLBACK_CALLED.load(Ordering::SeqCst), 0);
+        // SAFETY: the node was dequeued from the pool queue and still carries
+        // the claimed flags installed by `irq_work_queue`.
+        unsafe { crate::irq_work::run_irq_work(queued) };
+        assert_eq!(TEST_IRQ_CALLBACK_CALLED.load(Ordering::SeqCst), 1);
+        assert_eq!(work.node.flags.counter & claimed, 0);
+        WORKER_STATE.store(previous_state, Ordering::Release);
     }
 
     #[test]

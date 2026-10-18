@@ -10,7 +10,7 @@
 use alloc::vec::Vec;
 use core::{ffi::c_void, mem::size_of, ptr};
 
-use axdriver_display::{DevError, DevResult, GpuBatch, GpuQueue};
+use axdriver_display::{DevError, DevResult, DisplayDriverOps, GpuBatch, GpuQueue};
 use tk_drm_upstream::{
     drm_device_types::DrmDevice,
     drm_file_types::DrmFile,
@@ -434,42 +434,84 @@ pub(crate) fn alloc_shmem_handle(
     Ok((object, handle))
 }
 
+fn cleanup_gpu_resource(
+    engine: &mut crate::transport::GpuEngine,
+    display: &mut dyn DisplayDriverOps,
+    resource: u32,
+    detach_backing: bool,
+) -> bool {
+    let mut pending_fence = None;
+    let cleanup = (|| -> DevResult<()> {
+        if detach_backing {
+            let fence = engine.submit(
+                display,
+                GpuQueue::Control,
+                GpuBatch::DetachBacking { resource },
+            )?;
+            pending_fence = Some(fence);
+            engine.wait(display, fence, FENCE_TIMEOUT_NS)?;
+            engine.reap(fence)?;
+            pending_fence = None;
+        }
+
+        let fence = engine.submit(
+            display,
+            GpuQueue::Control,
+            GpuBatch::UnrefResource { resource },
+        )?;
+        pending_fence = Some(fence);
+        engine.wait(display, fence, FENCE_TIMEOUT_NS)?;
+        engine.reap(fence)?;
+        pending_fence = None;
+        Ok(())
+    })();
+    if cleanup.is_ok() {
+        return true;
+    }
+
+    // An error is not proof that the device stopped using pinned shmem. Only a
+    // confirmed queue reset permits the caller to release it.
+    let reset = engine.reset(display, GpuQueue::Control);
+    if reset.quiesced {
+        if let Some(fence) = pending_fence {
+            let _ = engine.reap(fence);
+        }
+    }
+    reset.quiesced
+}
+
 unsafe extern "C" fn virtgpu_gem_free(obj: *mut DrmGemObject) {
     if obj.is_null() {
         return;
     }
     let object = object_from_gem(obj);
     // SAFETY: obj is verified non-null and points to an enclosing VirtioGpuObject.
-    let (resource_id, drm) = unsafe { ((*object).resource_id, (*obj).dev) };
+    let (resource_id, drm, detach_backing) = unsafe {
+        (
+            (*object).resource_id,
+            (*obj).dev,
+            (*object).pinned && !(*object).is_blob,
+        )
+    };
     if resource_id != 0 {
         // SAFETY: drm is a valid DRM device pointer belonging to an installed VirtIO GPU device.
-        let _ = unsafe {
+        let released = unsafe {
             with_device_engine(drm, |engine, display| {
-                if let Ok(fence) = engine.submit(
-                    display,
-                    GpuQueue::Control,
-                    GpuBatch::DetachResourceEverywhere {
-                        resource: resource_id,
-                    },
-                ) {
-                    let _ = engine.wait(display, fence, FENCE_TIMEOUT_NS);
-                    let _ = engine.reap(fence);
-                }
-                let fence_id = engine.submit(
-                    display,
-                    GpuQueue::Control,
-                    GpuBatch::UnrefResource {
-                        resource: resource_id,
-                    },
-                );
-                if let Ok(fence_id) = fence_id {
-                    let _ = engine.wait(display, fence_id, FENCE_TIMEOUT_NS);
-                    let _ = engine.reap(fence_id);
-                } else {
-                    engine.reset(display, GpuQueue::Control);
-                }
+                // Per-file context associations are removed by gem_close. Legacy
+                // and virgl shmem resources additionally own RESOURCE_ATTACH_BACKING
+                // mappings; blob SG lists are part of CREATE_BLOB and stay detached.
+                cleanup_gpu_resource(engine, display, resource_id, detach_backing)
             })
         };
+        if released != Some(true) {
+            tk_linux_kapi::drm_warn!(
+                (),
+                "virtgpu: retaining GEM resource {} because cleanup failed before control-queue \
+                 quiescence",
+                resource_id,
+            );
+            return;
+        }
     }
     // SAFETY: object and obj are valid GEM objects being freed; unpinning and freeing shmem resources is safe.
     unsafe {
@@ -478,6 +520,148 @@ unsafe extern "C" fn virtgpu_gem_free(obj: *mut DrmGemObject) {
             (*object).pinned = false;
         }
         drm_gem_shmem_object_free(obj);
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use alloc::vec::Vec;
+
+    use axdriver_display::{
+        BaseDriverOps, DeviceType, DisplayInfo, FrameBuffer, GpuCompletion, GpuCompletionData,
+        GpuQueue, GpuResetResult, GpuSubmission, PixelLayout,
+    };
+
+    use super::*;
+
+    struct CleanupDisplay {
+        batches: Vec<GpuBatch>,
+        completions: Vec<GpuCompletion>,
+        reset_quiesced: bool,
+        fail_submit: bool,
+    }
+
+    impl BaseDriverOps for CleanupDisplay {
+        fn device_name(&self) -> &str {
+            "virtgpu-cleanup-test"
+        }
+
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Display
+        }
+    }
+
+    impl DisplayDriverOps for CleanupDisplay {
+        fn info(&self) -> DisplayInfo {
+            DisplayInfo::without_framebuffer(1, 1, PixelLayout::B8G8R8A8)
+        }
+
+        fn fb(&self) -> FrameBuffer<'_> {
+            // SAFETY: The zero-length framebuffer is never read by this mock.
+            unsafe {
+                FrameBuffer::from_raw_parts_mut(core::ptr::NonNull::<u8>::dangling().as_ptr(), 0)
+            }
+        }
+
+        fn need_flush(&self) -> bool {
+            false
+        }
+
+        fn flush(&mut self) -> DevResult {
+            Ok(())
+        }
+
+        fn supports_drm_transport(&self) -> bool {
+            true
+        }
+
+        fn drm_submit(
+            &mut self,
+            _queue: GpuQueue,
+            batch: GpuBatch,
+            fence_id: u64,
+        ) -> DevResult<GpuSubmission> {
+            if self.fail_submit {
+                return Err(DevError::Io);
+            }
+            self.batches.push(batch);
+            self.completions.push(GpuCompletion {
+                fence_id,
+                result: Ok(()),
+                data: GpuCompletionData::None,
+            });
+            Ok(GpuSubmission {
+                fence_id,
+                resource_id: None,
+                context_id: None,
+            })
+        }
+
+        fn drm_drain_completions(
+            &mut self,
+            _queue: GpuQueue,
+            out: &mut [GpuCompletion],
+        ) -> DevResult<usize> {
+            let count = out.len().min(self.completions.len());
+            for completion in out.iter_mut().take(count) {
+                *completion = self.completions.remove(0);
+            }
+            Ok(count)
+        }
+
+        fn drm_reset(&mut self, _queue: GpuQueue, _out: &mut [GpuCompletion]) -> GpuResetResult {
+            GpuResetResult {
+                completions: 0,
+                quiesced: self.reset_quiesced,
+            }
+        }
+    }
+
+    fn new_display() -> CleanupDisplay {
+        CleanupDisplay {
+            batches: Vec::new(),
+            completions: Vec::new(),
+            reset_quiesced: false,
+            fail_submit: false,
+        }
+    }
+
+    #[test]
+    fn attached_shmem_detaches_before_unref_while_blobs_keep_their_separate_lifecycle() {
+        let _task_context = crate::test_support::scheduler_context();
+        let mut display = new_display();
+        let mut engine = crate::transport::GpuEngine::new(&mut display).unwrap();
+        assert!(cleanup_gpu_resource(&mut engine, &mut display, 11, true));
+        assert_eq!(
+            display.batches,
+            alloc::vec![
+                GpuBatch::DetachBacking { resource: 11 },
+                GpuBatch::UnrefResource { resource: 11 },
+            ]
+        );
+
+        let mut display = new_display();
+        let mut engine = crate::transport::GpuEngine::new(&mut display).unwrap();
+        assert!(cleanup_gpu_resource(&mut engine, &mut display, 12, false));
+        assert_eq!(
+            display.batches,
+            alloc::vec![GpuBatch::UnrefResource { resource: 12 }]
+        );
+    }
+
+    #[test]
+    fn cleanup_error_leaks_dma_backing_until_reset_confirms_quiescence() {
+        let _task_context = crate::test_support::scheduler_context();
+        let mut display = new_display();
+        display.fail_submit = true;
+        let mut engine = crate::transport::GpuEngine::new(&mut display).unwrap();
+        assert!(!cleanup_gpu_resource(&mut engine, &mut display, 13, true));
+
+        let mut display = new_display();
+        display.fail_submit = true;
+        display.reset_quiesced = true;
+        let mut engine = crate::transport::GpuEngine::new(&mut display).unwrap();
+        assert!(cleanup_gpu_resource(&mut engine, &mut display, 14, true));
     }
 }
 

@@ -6,23 +6,30 @@
 // size and field offset is pinned by a compile-time assertion.
 //! Linux DRM type definitions. Source headers:
 //! `include/drm/drm_device.h`
-#![allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, unused_imports)]
+#![allow(
+    non_camel_case_types,
+    non_upper_case_globals,
+    non_snake_case,
+    dead_code,
+    unused_imports
+)]
 
-use core::ffi::{c_char, c_ulong, c_void};
-use core::mem::{align_of, size_of, ManuallyDrop};
-use tk_linux_kapi::idr::Idr;
-use tk_linux_kapi::types::AtomicT;
-use tk_linux_kapi::types::Kref;
-use tk_linux_kapi::types::ListHead;
-use tk_linux_kapi::types::Mutex;
-use tk_linux_kapi::types::Spinlock;
-use crate::drm_auth_types::{DrmMaster};
-use crate::drm_drv_types::{DrmDriver};
-use crate::drm_fb_helper_types::{DrmFbHelper};
-use crate::drm_file_types::{DrmMinor};
-use crate::drm_mode_config_types::{DrmModeConfig};
-use crate::drm_vblank_types::{DrmVblankCrtc};
-use crate::drm_vma_manager_types::{DrmVmaOffsetManager};
+use core::{
+    ffi::{c_char, c_ulong, c_void},
+    mem::{ManuallyDrop, align_of, size_of},
+    sync::atomic::AtomicBool,
+};
+
+use tk_linux_kapi::{
+    idr::Idr,
+    types::{AtomicT, Kref, ListHead, Mutex, Spinlock},
+};
+
+use crate::{
+    drm_auth_types::DrmMaster, drm_drv_types::DrmDriver, drm_fb_helper_types::DrmFbHelper,
+    drm_file_types::DrmMinor, drm_mode_config_types::DrmModeConfig,
+    drm_vblank_types::DrmVblankCrtc, drm_vma_manager_types::DrmVmaOffsetManager,
+};
 
 #[repr(C)]
 pub struct DrmWedgeTaskInfo {
@@ -53,7 +60,7 @@ pub struct DrmDevice {
     pub master: *mut DrmMaster,
     pub huge_mnt: *mut c_void,
     pub driver_features: u32,
-    pub unplugged: bool,
+    pub unplugged: AtomicBool,
     pub anon_inode: *mut c_void,
     pub unique: *mut c_char,
     pub master_mutex: Mutex,

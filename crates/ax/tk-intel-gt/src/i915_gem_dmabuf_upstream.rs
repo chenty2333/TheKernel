@@ -2,9 +2,9 @@
 // Copyright 2012 Red Hat Inc.
 //
 //! Linux v7.2.3 `drivers/gpu/drm/i915/gem/i915_gem_dmabuf.c` translation.
-//! The module-local DMA-BUF records are source-layout ABI prefixes because
-//! this crate does not yet have a canonical LinuxKPI DMA-BUF owner. DMA-BUF,
-//! DRM, DMA mapping, and VFS operations remain real kernel service bindings.
+//! DMA-BUF objects, file references, and attachment lifecycle are owned by the
+//! shared `tk-drm-upstream` core. This driver supplies only its exporter
+//! callbacks; DMA mappings remain requester-scoped LinuxKPI/VT-d operations.
 //! The source's trailing selftest includes are absent for CONFIG_DRM_I915_SELFTEST=n.
 
 #![allow(
@@ -522,13 +522,23 @@ pub unsafe extern "C" fn i915_gem_prime_import(
     dma_buf: *mut c_void,
 ) -> *mut DrmGemObject {
     let dma_buf = dma_buf.cast::<DmaBuf>();
-    if unsafe { (*dma_buf).ops == &I915_DMABUF_OPS } {
+    let is_i915_export = unsafe { (*dma_buf).ops == &I915_DMABUF_OPS };
+    if is_i915_export {
         let obj = unsafe { dma_buf_to_obj(dma_buf) };
         let base = unsafe { intel_bo_to_drm_bo(obj) };
         if unsafe { (*base).dev == dev.cast() } && !I915_SELFTEST_ONLY!(force_different_devices) {
             let obj = unsafe { i915_gem_object_get(obj) };
             return unsafe { intel_bo_to_drm_bo(obj) };
         }
+    }
+
+    // The shared DMA-BUF core owns file lifetime and attachment dispatch, but
+    // this i915 integration has no cross-device memory-sharing contract yet.
+    // Preserve its same-device fast path and fail closed before attaching any
+    // foreign or different-device exporter; selftests retain their deliberate
+    // force-different-devices coverage.
+    if !is_i915_export || !I915_SELFTEST_ONLY!(force_different_devices) {
+        return ERR_PTR(-ENODEV);
     }
 
     let size = unsafe { (*dma_buf).size as u64 };

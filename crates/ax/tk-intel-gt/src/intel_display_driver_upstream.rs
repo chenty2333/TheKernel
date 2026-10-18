@@ -77,6 +77,7 @@ static INTEL_MODE_FUNCS: DrmModeConfigFuncs = DrmModeConfigFuncs {
 static INTEL_MODE_CONFIG_FUNCS: DrmModeConfigHelperFuncs = DrmModeConfigHelperFuncs {
     atomic_commit_tail: None,
     atomic_commit_setup: Some(crate::display_pending_stubs::kapi_display::drm_dp_mst_atomic_setup_commit),
+    atomic_commit_pre_swap: None,
 };
 
 // upstream: intel_display_driver.c intel_mode_config_init()

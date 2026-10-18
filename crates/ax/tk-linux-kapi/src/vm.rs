@@ -54,6 +54,37 @@ pub const PAGE_KERNEL_WC: PgProt = PgProt {
 
 const X86_64_PML4_SLOT_SIZE: usize = 1usize << 39;
 
+fn vmap_search_window_from_direct_end(
+    direct_end: usize,
+    kernel_base: usize,
+    kernel_size: usize,
+) -> Option<(VirtAddr, VirtAddrRange)> {
+    let Some(end) = kernel_base.checked_add(kernel_size) else {
+        return None;
+    };
+    let slot_base = kernel_base & !(X86_64_PML4_SLOT_SIZE - 1);
+    // User roots copy the kernel's top-level entry at address-space creation.
+    // Stay inside the slot containing the always-present kernel image so a
+    // later vmap PTE remains visible through those already-shared subtrees.
+    if slot_base != kernel_base {
+        return None;
+    }
+    let slot_end = slot_base.checked_add(X86_64_PML4_SLOT_SIZE)?;
+    let limit_end = end.min(slot_end);
+    let aligned_direct_end = direct_end.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+    let hint = aligned_direct_end.checked_add(PAGE_SIZE)?;
+    if hint >= limit_end {
+        return None;
+    }
+    Some((
+        VirtAddr::from_usize(hint),
+        VirtAddrRange::from_start_size(
+            VirtAddr::from_usize(kernel_base),
+            limit_end.checked_sub(kernel_base)?,
+        ),
+    ))
+}
+
 #[derive(Clone, Copy)]
 struct VmapRecord {
     page_array: usize,
@@ -78,33 +109,22 @@ fn vmap_search_window() -> Option<(VirtAddr, VirtAddrRange)> {
 
 #[cfg(target_os = "none")]
 fn vmap_search_window() -> Option<(VirtAddr, VirtAddrRange)> {
-    let mut max_phys_end = 0usize;
-    for region in axhal::mem::memory_regions() {
-        let end = region.paddr.as_usize().checked_add(region.size)?;
-        max_phys_end = max_phys_end.max(end);
+    let mut max_ram_end = 0usize;
+    for &(start, size) in axhal::mem::phys_ram_ranges() {
+        let end = start.checked_add(size)?;
+        max_ram_end = max_ram_end.max(end);
+    }
+    if max_ram_end == 0 {
+        return None;
     }
 
     let (base, size) = axhal::mem::kernel_aspace();
-    let end = base.as_usize().checked_add(size)?;
-    let slot_base = base.as_usize() & !(X86_64_PML4_SLOT_SIZE - 1);
-    // User roots copy the kernel's top-level entry at address-space creation.
-    // Stay inside the slot containing the always-present kernel image so a
-    // later vmap PTE remains visible through those already-shared subtrees.
-    if slot_base != base.as_usize() {
-        return None;
-    }
-    let slot_end = slot_base.checked_add(X86_64_PML4_SLOT_SIZE)?;
-    let limit_end = end.min(slot_end);
-    let direct_end = axhal::mem::phys_to_virt(PhysAddr::from_usize(max_phys_end)).as_usize();
-    let aligned_direct_end = direct_end.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
-    let hint = aligned_direct_end.checked_add(PAGE_SIZE)?;
-    if hint >= limit_end {
-        return None;
-    }
-    Some((
-        VirtAddr::from_usize(hint),
-        VirtAddrRange::from_start_size(base, limit_end - base.as_usize()),
-    ))
+    // Device MMIO can sit beyond the direct-mapped RAM and even outside the
+    // kernel's shared PML4 slot. Only RAM ranges are direct-mapped here; using
+    // `memory_regions()` would let a high MMIO aperture hide the whole vmap
+    // search window.
+    let direct_end = axhal::mem::phys_to_virt(PhysAddr::from_usize(max_ram_end)).as_usize();
+    vmap_search_window_from_direct_end(direct_end, base.as_usize(), size)
 }
 
 fn release_page_array(pages: *mut *mut Page, count: usize) {
@@ -538,5 +558,25 @@ mod cache_mode_tests {
     fn unknown_vmap_pgprot_is_refused() {
         assert_eq!(admitted_kernel_prot(PgProt { pgprot: 0 }), None);
         assert_eq!(admitted_kernel_prot(PAGE_KERNEL), Some(false));
+    }
+
+    #[test]
+    fn high_mmio_extent_does_not_hide_vmap_window() {
+        const KERNEL_BASE: usize = 0xffff_8000_0000_0000;
+        const KERNEL_SIZE: usize = 0x0000_7fff_ffff_f000;
+        const RAM_END: usize = 0x2000_0000;
+        // This models the QEMU PCI aperture at [0xc000000000, 0xc001000000),
+        // whose high endpoint is outside the kernel's first 512-GiB PML4 slot.
+        const HIGH_MMIO_END: usize = 0xc001_0000_00;
+
+        let ram_direct_end = KERNEL_BASE + RAM_END;
+        let mmio_direct_end = KERNEL_BASE + HIGH_MMIO_END;
+        assert!(vmap_search_window_from_direct_end(ram_direct_end, KERNEL_BASE, KERNEL_SIZE).is_some());
+        assert!(vmap_search_window_from_direct_end(mmio_direct_end, KERNEL_BASE, KERNEL_SIZE).is_none());
+
+        // Both the address-space end and page-alignment arithmetic fail
+        // closed instead of wrapping into an invalid vmap range.
+        assert!(vmap_search_window_from_direct_end(ram_direct_end, usize::MAX, 1).is_none());
+        assert!(vmap_search_window_from_direct_end(usize::MAX, KERNEL_BASE, KERNEL_SIZE).is_none());
     }
 }

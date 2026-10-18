@@ -64,7 +64,11 @@ impl<C> Transport for FakeTransport<C> {
     }
 
     fn set_status(&mut self, status: DeviceStatus) {
-        self.state.lock().unwrap().status = status;
+        let mut state = self.state.lock().unwrap();
+        if status.is_empty() && state.ignore_reset {
+            return;
+        }
+        state.status = status;
     }
 
     fn set_guest_page_size(&mut self, guest_page_size: u32) {
@@ -133,6 +137,8 @@ pub struct State {
     pub guest_page_size: u32,
     /// Whether the fake device has a pending interrupt.
     pub interrupt_pending: bool,
+    /// Simulate a transport that never confirms device reset.
+    pub ignore_reset: bool,
     /// Per-queue configuration and notification state.
     pub queues: Vec<QueueStatus>,
 }

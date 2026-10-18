@@ -222,6 +222,14 @@ pub struct GpuCompletion {
     pub data: GpuCompletionData,
 }
 
+/// Queue reset status keeps the terminal-record count separate from proof
+/// that transport reset stopped all device DMA.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueResetResult {
+    pub completions: usize,
+    pub quiesced: bool,
+}
+
 /// Response payload retained with a terminal control completion.  Do not add
 /// borrowed protocol storage here: `PendingControl` owns its DMA buffers
 /// until the used entry is consumed.
@@ -402,6 +410,7 @@ pub struct VirtIOGpu<H: Hal, T: Transport> {
     /// token -> retained cursor DMA owner.  Queue tokens are unique while a
     /// descriptor is outstanding, so lookup/removal never scans the queue.
     pending_cursor: ResetOwned<BTreeMap<u16, PendingCursor>>,
+    transport_quiesced: bool,
     reset_failed: bool,
     terminal_cursor: VecDeque<GpuCompletion>,
     cursor_faulted: bool,
@@ -409,6 +418,9 @@ pub struct VirtIOGpu<H: Hal, T: Transport> {
 
 impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
     fn reset_transport(&mut self) -> bool {
+        if self.transport_quiesced {
+            return true;
+        }
         if self.reset_failed {
             return false;
         }
@@ -416,6 +428,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             .set_status(crate::transport::DeviceStatus::empty());
         for _ in 0..4096 {
             if self.transport.get_status().is_empty() {
+                self.transport_quiesced = true;
                 self.transport.mark_reset_complete();
                 return true;
             }
@@ -464,6 +477,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             terminal_control: Vec::new(),
             control_faulted: false,
             pending_cursor: ResetOwned::new(BTreeMap::new()),
+            transport_quiesced: false,
             terminal_cursor: VecDeque::new(),
             cursor_faulted: false,
             reset_failed: false,
@@ -2189,9 +2203,9 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                 result: Ok(()),
                 data: GpuCompletionData::None,
             });
-        let count = self.reset_control(&mut records);
+        let reset = self.reset_control(&mut records);
         self.terminal_control
-            .extend(records.into_iter().take(count));
+            .extend(records.into_iter().take(reset.completions));
     }
 
     /// Fence every outstanding request with a terminal error after a device
@@ -2199,10 +2213,13 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
     /// descriptors are retained until transport reset makes device DMA
     /// impossible; this method intentionally marks the instance unusable
     /// rather than pretending it can resume with stale resource state.
-    pub fn reset_control(&mut self, out: &mut [GpuCompletion]) -> usize {
+    pub fn reset_control(&mut self, out: &mut [GpuCompletion]) -> QueueResetResult {
         self.control_faulted = true;
         if !self.reset_transport() {
-            return 0;
+            return QueueResetResult {
+                completions: 0,
+                quiesced: false,
+            };
         }
         while !self.pending_control.is_empty() {
             let mut pending = self.pending_control.swap_remove(0);
@@ -2242,7 +2259,12 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                     .is_err()
                 {
                     self.reset_failed = true;
-                    return 0;
+                    return QueueResetResult {
+                        completions: 0,
+                        // The status poll above confirmed device reset before
+                        // this host-only IOMMU unmap failure.
+                        quiesced: true,
+                    };
                 }
                 resource.backing_mappings.pop();
             }
@@ -2254,7 +2276,10 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         for slot in out.iter_mut().take(count) {
             *slot = self.terminal_control.swap_remove(0);
         }
-        count
+        QueueResetResult {
+            completions: count,
+            quiesced: true,
+        }
     }
 
     fn resource(&self, id: ResourceId) -> Result<&Resource> {
@@ -2516,9 +2541,12 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         }
         true
     }
-    pub fn reset_cursor(&mut self, out: &mut [GpuCompletion]) -> usize {
+    pub fn reset_cursor(&mut self, out: &mut [GpuCompletion]) -> QueueResetResult {
         if !self.fault_cursor_queue() {
-            return 0;
+            return QueueResetResult {
+                completions: 0,
+                quiesced: false,
+            };
         }
         let count = core::cmp::min(out.len(), self.terminal_cursor.len());
         for slot in out.iter_mut().take(count) {
@@ -2527,7 +2555,10 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                 .pop_front()
                 .expect("cursor reset terminal missing");
         }
-        count
+        QueueResetResult {
+            completions: count,
+            quiesced: true,
+        }
     }
 }
 impl<H: Hal, T: Transport> Drop for VirtIOGpu<H, T> {
@@ -2947,6 +2978,101 @@ mod tests {
         assert!(Rect::new(1, 2, 3, 4).fits(4, 6));
         assert!(!Rect::new(4, 0, 1, 1).fits(4, 1));
     }
+
+    #[test]
+    fn disable_scanout_submits_a_fenced_resource_zero_command() {
+        use alloc::{boxed::Box, sync::Arc, vec};
+        use core::ptr::NonNull;
+        use std::sync::Mutex;
+
+        use crate::{
+            hal::fake::FakeHal,
+            transport::{
+                DeviceType,
+                fake::{FakeTransport, QueueStatus, State},
+            },
+        };
+
+        let mut config = Box::new(unsafe { core::mem::zeroed::<Config>() });
+        let state = Arc::new(Mutex::new(State {
+            queues: vec![QueueStatus::default(), QueueStatus::default()],
+            ..State::default()
+        }));
+        let transport = FakeTransport {
+            device_type: DeviceType::GPU,
+            max_queue_size: QUEUE_SIZE as u32,
+            device_features: 0,
+            config_space: NonNull::from(config.as_mut()),
+            state: state.clone(),
+        };
+        let mut gpu = VirtIOGpu::<FakeHal, _>::new(transport).unwrap();
+
+        let submission = gpu
+            .submit_set_scanout(Rect::new(0, 0, 0, 0), 0, None)
+            .unwrap();
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE_TRANSMIT, |input| {
+                    let header = CtrlHeader::read_from_prefix(&input).unwrap();
+                    assert_eq!(header.hdr_type, Command::SET_SCANOUT);
+                    assert_eq!(header.fence_id, submission.fence_id);
+                    assert_eq!(&input[24..40], &[0; 16]);
+                    assert_eq!(u32::from_le_bytes(input[40..44].try_into().unwrap()), 0);
+                    assert_eq!(u32::from_le_bytes(input[44..48].try_into().unwrap()), 0);
+                    let mut response = input[..24].to_vec();
+                    response[..4].copy_from_slice(&Command::OK_NODATA.0.to_le_bytes());
+                    response
+                })
+        );
+        let mut completion = [GpuCompletion {
+            fence_id: 0,
+            result: Ok(()),
+            data: GpuCompletionData::None,
+        }];
+        assert_eq!(gpu.drain_control_completions(&mut completion).unwrap(), 1);
+        assert_eq!(completion[0].fence_id, submission.fence_id);
+        assert_eq!(completion[0].result, Ok(()));
+    }
+
+    #[test]
+    fn failed_transport_reset_reports_unquiesced_and_retains_dma_owners() {
+        use alloc::{boxed::Box, sync::Arc, vec};
+        use core::ptr::NonNull;
+        use std::sync::Mutex;
+
+        use crate::{
+            hal::fake::FakeHal,
+            transport::{
+                DeviceType,
+                fake::{FakeTransport, QueueStatus, State},
+            },
+        };
+
+        let mut config = Box::new(unsafe { core::mem::zeroed::<Config>() });
+        let state = Arc::new(Mutex::new(State {
+            queues: vec![QueueStatus::default(), QueueStatus::default()],
+            ignore_reset: true,
+            ..State::default()
+        }));
+        let transport = FakeTransport {
+            device_type: DeviceType::GPU,
+            max_queue_size: QUEUE_SIZE as u32,
+            device_features: 0,
+            config_space: NonNull::from(config.as_mut()),
+            state: state.clone(),
+        };
+        let mut gpu = VirtIOGpu::<FakeHal, _>::new(transport).unwrap();
+        gpu.submit_create_2d(64, 64, 2).unwrap();
+
+        let reset = gpu.reset_control(&mut []);
+        assert_eq!(reset.completions, 0);
+        assert!(!reset.quiesced);
+        assert_eq!(gpu.pending_control.len(), 1);
+        assert_ne!(state.lock().unwrap().queues[usize::from(QUEUE_TRANSMIT)].descriptors, 0);
+    }
+
     #[test]
     fn virgl_feature_and_wire_layout_match_uapi() {
         assert_eq!(Features::VIRGL.bits(), 1);

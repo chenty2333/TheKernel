@@ -428,6 +428,14 @@ impl<const CAPACITY: usize> DeviceRegistry<CAPACITY> {
             .pop()
     }
 
+    /// Whether the exact immutable identity is already published. Reserved
+    /// entries deliberately do not satisfy this check.
+    pub(crate) fn is_published_identity(&self, identity: &DeviceIdentity) -> bool {
+        self.slots.lock().iter().any(|slot| {
+            matches!(slot, Slot::Published { device, .. } if device.identity() == identity)
+        })
+    }
+
     fn root_device(&self, bus: &str, name: &str) -> Option<Arc<DeviceRegistration>> {
         self.visible_matching(|device| {
             device.identity.bus == bus

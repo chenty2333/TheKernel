@@ -7,32 +7,42 @@
 
 #![allow(non_snake_case, dead_code, unsafe_code)]
 
-use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
-use core::sync::atomic::Ordering;
-use tk_linux_kapi::assert::warn_on;
+use core::{
+    ffi::{c_char, c_int, c_uint, c_ulong, c_void},
+    sync::atomic::Ordering,
+};
+
 pub use tk_linux_kapi::config::ENODEV;
-use tk_linux_kapi::config::{EBUSY, EINVAL, ENOMEM, EOPNOTSUPP, GFP_KERNEL};
-use tk_linux_kapi::list::{INIT_LIST_HEAD, list_add_tail, list_del};
-use tk_linux_kapi::locks::{spin_lock, spin_unlock, spin_lock_init};
-use tk_linux_kapi::memory::{kfree, kmalloc, kref_init, kref_put};
-use tk_linux_kapi::mutex::mutex_init;
 #[cfg(not(test))]
 use tk_linux_kapi::mutex::{mutex_lock, mutex_unlock};
+use tk_linux_kapi::{
+    assert::warn_on,
+    config::{EBUSY, EINVAL, ENOMEM, EOPNOTSUPP, GFP_KERNEL},
+    list::{INIT_LIST_HEAD, list_add_tail, list_del},
+    locks::{spin_lock, spin_lock_init, spin_unlock},
+    memory::{kfree, kmalloc, kref_init, kref_put},
+    mutex::mutex_init,
+};
 #[cfg(test)]
 unsafe fn mutex_lock<M>(_mutex: M) {}
 #[cfg(test)]
 unsafe fn mutex_unlock<M>(_mutex: M) {}
-use tk_linux_kapi::types::{AtomicT, Kref, Mutex, Spinlock, XArray};
-use tk_linux_kapi::idr::{idr_init_base, Idr};
-use tk_linux_kapi::xarray::XA_FLAGS_ALLOC;
+use tk_linux_kapi::{
+    idr::{Idr, idr_init_base},
+    types::{AtomicT, Kref, Mutex, Spinlock, XArray},
+    wait::wake_up_interruptible_poll,
+    xarray::XA_FLAGS_ALLOC,
+};
 
-use crate::drm_device_types::{DrmDevice, DrmDeviceManaged};
-use crate::drm_drv_types::DrmDriver;
-use crate::drm_file_types::DrmMinor;
-use crate::drm_vma_manager_types::DrmVmaOffsetManager;
-use crate::drm_vma_manager_upstream::{
-    DRM_FILE_PAGE_OFFSET_SIZE, DRM_FILE_PAGE_OFFSET_START, drm_vma_offset_manager_destroy,
-    drm_vma_offset_manager_init,
+use crate::{
+    drm_device_types::{DrmDevice, DrmDeviceManaged},
+    drm_drv_types::DrmDriver,
+    drm_file_types::{DrmFile, DrmMinor},
+    drm_vma_manager_types::DrmVmaOffsetManager,
+    drm_vma_manager_upstream::{
+        DRM_FILE_PAGE_OFFSET_SIZE, DRM_FILE_PAGE_OFFSET_START, drm_vma_offset_manager_destroy,
+        drm_vma_offset_manager_init,
+    },
 };
 
 pub const DRM_MINOR_PRIMARY: c_int = 0;
@@ -49,7 +59,6 @@ pub struct DrmWedgeTaskInfo {
 // upstream: drivers/gpu/drm/drm_drv.c drm_minors_xa
 #[unsafe(no_mangle)]
 pub static mut drm_minors_xa: XArray = XArray::new(XA_FLAGS_ALLOC);
-
 
 // upstream: drivers/gpu/drm/drm_drv.c drm_minor_get_xa()
 unsafe fn drm_minor_get_xa(r#type: c_int) -> *mut XArray {
@@ -105,7 +114,9 @@ unsafe fn drm_minor_alloc_index(r#type: c_int) -> Option<u32> {
     if xa.is_null() {
         return Some(first);
     }
-    (first..=last).find(|&index| tk_linux_kapi::xarray::xa_load::<XArray, DrmMinor>(&mut *xa, index).is_null())
+    (first..=last).find(|&index| {
+        tk_linux_kapi::xarray::xa_load::<XArray, DrmMinor>(&mut *xa, index).is_null()
+    })
 }
 
 // upstream: drivers/gpu/drm/drm_drv.c drm_minor_alloc()
@@ -158,7 +169,10 @@ unsafe fn drm_minor_unregister(dev: *mut DrmDevice, r#type: c_int) {
 
 // upstream: drivers/gpu/drm/drm_drv.c drm_minor_acquire()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_minor_acquire(minor_xa: *mut XArray, minor_id: c_uint) -> *mut DrmMinor {
+pub unsafe extern "C" fn drm_minor_acquire(
+    minor_xa: *mut XArray,
+    minor_id: c_uint,
+) -> *mut DrmMinor {
     if minor_xa.is_null() {
         return (-ENODEV as isize) as *mut DrmMinor;
     }
@@ -166,7 +180,7 @@ pub unsafe extern "C" fn drm_minor_acquire(minor_xa: *mut XArray, minor_id: c_ui
     if minor.is_null() {
         return (-ENODEV as isize) as *mut DrmMinor;
     }
-    if (*(*minor).dev).unplugged {
+    if (*(*minor).dev).unplugged.load(Ordering::Acquire) {
         return (-ENODEV as isize) as *mut DrmMinor;
     }
     drm_dev_get((*minor).dev);
@@ -191,7 +205,7 @@ pub unsafe extern "C" fn drm_dev_enter(dev: *mut DrmDevice, idx: *mut c_int) -> 
         if !idx.is_null() {
             *idx = 0;
         }
-        !(*dev).unplugged
+        !(*dev).unplugged.load(Ordering::Acquire)
     }
 }
 
@@ -206,7 +220,21 @@ pub unsafe extern "C" fn drm_dev_unplug(dev: *mut DrmDevice) {
         return;
     }
     unsafe {
-        (*dev).unplugged = true;
+        (*dev).unplugged.store(true, Ordering::Release);
+        const EPOLLERR: u32 = 0x0008;
+        const EPOLLHUP: u32 = 0x0010;
+        mutex_lock(core::ptr::addr_of_mut!((*dev).filelist_mutex));
+        let head = core::ptr::addr_of_mut!((*dev).filelist);
+        let mut current = (*head).next;
+        while current != head {
+            let file_priv = current
+                .cast::<u8>()
+                .wrapping_sub(core::mem::offset_of!(DrmFile, lhead))
+                .cast::<DrmFile>();
+            wake_up_interruptible_poll(&mut (*file_priv).event_wait, EPOLLERR | EPOLLHUP);
+            current = (*current).next;
+        }
+        mutex_unlock(core::ptr::addr_of_mut!((*dev).filelist_mutex));
     }
 }
 
@@ -297,17 +325,17 @@ unsafe fn drm_fs_inode_free(inode: *mut c_void) {
 unsafe fn drm_dev_init_release(_dev: *mut DrmDevice, _res: *mut c_void) {}
 
 // upstream: drivers/gpu/drm/drm_drv.c drm_dev_init()
-unsafe fn drm_dev_init(
-    dev: *mut DrmDevice,
-    driver: *const DrmDriver,
-    parent: *mut c_void,
-) -> i32 {
+unsafe fn drm_dev_init(dev: *mut DrmDevice, driver: *const DrmDriver, parent: *mut c_void) -> i32 {
     unsafe {
         kref_init(core::ptr::addr_of_mut!((*dev).r#ref));
         (*dev).dev = parent;
         (*dev).dma_dev = parent;
         (*dev).driver = driver.cast_mut();
-        (*dev).driver_features = if !driver.is_null() { (*driver).driver_features } else { 0 };
+        (*dev).driver_features = if !driver.is_null() {
+            (*driver).driver_features
+        } else {
+            0
+        };
 
         INIT_LIST_HEAD(core::ptr::addr_of_mut!((*dev).managed.resources));
         spin_lock_init(&mut (*dev).managed.lock);
@@ -336,9 +364,14 @@ unsafe fn drm_dev_init(
         (*dev).anon_inode = inode;
 
         // allocate vma_offset_manager
-        let vma_mgr = kmalloc(core::mem::size_of::<DrmVmaOffsetManager>(), GFP_KERNEL).cast::<DrmVmaOffsetManager>();
+        let vma_mgr = kmalloc(core::mem::size_of::<DrmVmaOffsetManager>(), GFP_KERNEL)
+            .cast::<DrmVmaOffsetManager>();
         core::ptr::write_bytes(vma_mgr, 0, 1);
-        drm_vma_offset_manager_init(vma_mgr, DRM_FILE_PAGE_OFFSET_START, DRM_FILE_PAGE_OFFSET_SIZE);
+        drm_vma_offset_manager_init(
+            vma_mgr,
+            DRM_FILE_PAGE_OFFSET_START,
+            DRM_FILE_PAGE_OFFSET_SIZE,
+        );
         (*dev).vma_offset_manager = vma_mgr;
 
         let ret = drm_minor_alloc(dev, DRM_MINOR_PRIMARY);
@@ -433,7 +466,10 @@ pub unsafe extern "C" fn drm_dev_alloc(
 
 // upstream: drivers/gpu/drm/drm_drv.c drm_dev_release()
 unsafe extern "C" fn drm_dev_release(refcount: *mut Kref) {
-    let dev = refcount.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmDevice, r#ref)).cast::<DrmDevice>();
+    let dev = refcount
+        .cast::<u8>()
+        .wrapping_sub(core::mem::offset_of!(DrmDevice, r#ref))
+        .cast::<DrmDevice>();
     unsafe {
         if let Some(driver) = (*dev).driver.as_ref() {
             if let Some(release) = driver.release {
@@ -492,7 +528,9 @@ pub unsafe extern "C" fn drm_dev_put(dev: *mut DrmDevice) {
 // upstream: drivers/gpu/drm/drm_drv.c drm_put_dev()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_put_dev(dev: *mut DrmDevice) {
-    unsafe { drm_dev_put(dev); }
+    unsafe {
+        drm_dev_put(dev);
+    }
 }
 
 // upstream: drivers/gpu/drm/drm_drv.c drmm_cg_unregister_region()
@@ -533,13 +571,17 @@ pub unsafe extern "C" fn drm_dev_register(dev: *mut DrmDevice, flags: c_ulong) -
 
         let need_global = crate::drm_file_upstream::drm_dev_needs_global_mutex(dev);
         if need_global {
-            mutex_lock(core::ptr::addr_of_mut!(crate::drm_file_upstream::drm_global_mutex));
+            mutex_lock(core::ptr::addr_of_mut!(
+                crate::drm_file_upstream::drm_global_mutex
+            ));
         }
 
         let mut ret = drm_minor_register(dev, DRM_MINOR_RENDER);
         if ret != 0 {
             if need_global {
-                mutex_unlock(core::ptr::addr_of_mut!(crate::drm_file_upstream::drm_global_mutex));
+                mutex_unlock(core::ptr::addr_of_mut!(
+                    crate::drm_file_upstream::drm_global_mutex
+                ));
             }
             return ret;
         }
@@ -547,7 +589,9 @@ pub unsafe extern "C" fn drm_dev_register(dev: *mut DrmDevice, flags: c_ulong) -
         if ret != 0 {
             drm_minor_unregister(dev, DRM_MINOR_RENDER);
             if need_global {
-                mutex_unlock(core::ptr::addr_of_mut!(crate::drm_file_upstream::drm_global_mutex));
+                mutex_unlock(core::ptr::addr_of_mut!(
+                    crate::drm_file_upstream::drm_global_mutex
+                ));
             }
             return ret;
         }
@@ -562,7 +606,9 @@ pub unsafe extern "C" fn drm_dev_register(dev: *mut DrmDevice, flags: c_ulong) -
                 drm_minor_unregister(dev, DRM_MINOR_PRIMARY);
                 drm_minor_unregister(dev, DRM_MINOR_RENDER);
                 if need_global {
-                    mutex_unlock(core::ptr::addr_of_mut!(crate::drm_file_upstream::drm_global_mutex));
+                    mutex_unlock(core::ptr::addr_of_mut!(
+                        crate::drm_file_upstream::drm_global_mutex
+                    ));
                 }
                 return ret;
             }
@@ -578,7 +624,9 @@ pub unsafe extern "C" fn drm_dev_register(dev: *mut DrmDevice, flags: c_ulong) -
                 drm_minor_unregister(dev, DRM_MINOR_PRIMARY);
                 drm_minor_unregister(dev, DRM_MINOR_RENDER);
                 if need_global {
-                    mutex_unlock(core::ptr::addr_of_mut!(crate::drm_file_upstream::drm_global_mutex));
+                    mutex_unlock(core::ptr::addr_of_mut!(
+                        crate::drm_file_upstream::drm_global_mutex
+                    ));
                 }
                 return ret;
             }
@@ -588,7 +636,9 @@ pub unsafe extern "C" fn drm_dev_register(dev: *mut DrmDevice, flags: c_ulong) -
         crate::pending_stubs::drm_client_probe::drm_client_sysrq_register(dev);
 
         if need_global {
-            mutex_unlock(core::ptr::addr_of_mut!(crate::drm_file_upstream::drm_global_mutex));
+            mutex_unlock(core::ptr::addr_of_mut!(
+                crate::drm_file_upstream::drm_global_mutex
+            ));
         }
         0
     }
@@ -638,8 +688,9 @@ unsafe fn drm_core_init() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use core::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
 
     static RELEASE_CALLED: AtomicBool = AtomicBool::new(false);
     unsafe extern "C" fn test_driver_release(_dev: *mut DrmDevice) {
@@ -678,7 +729,7 @@ mod tests {
 
             // Test unplug
             drm_dev_unplug(dev);
-            assert!((*dev).unplugged);
+            assert!((*dev).unplugged.load(Ordering::Acquire));
             assert!(!drm_dev_enter(dev, &mut idx));
 
             // Test unregister

@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 
 use axdriver_display::{
     DevError, DevResult, DisplayDriverOps, GpuBatch, GpuCompletion, GpuCompletionData, GpuFeatures,
-    GpuQueue, RenderCapsetInfo,
+    GpuQueue, GpuResetResult, RenderCapsetInfo,
 };
 
 const COMPLETION_BATCH: usize = 32;
@@ -241,25 +241,15 @@ impl GpuEngine {
         Ok(count)
     }
 
-    /// Reset is terminal failure, never successful execution. Any resource
-    /// ID reserved by an in-flight create is discarded.
-    pub fn reset(&mut self, display: &mut dyn DisplayDriverOps, queue: GpuQueue) -> usize {
+    /// Mark all records on a reset queue failed only when the display transport
+    /// confirms that DMA has stopped. An unconfirmed reset leaves them pending
+    /// so callers retain their backing references until a later quiesce.
+    pub fn reset(&mut self, display: &mut dyn DisplayDriverOps, queue: GpuQueue) -> GpuResetResult {
         let mut out = Vec::new();
         if out.try_reserve_exact(COMPLETION_BATCH).is_err() {
-            // The lower reset contract is still applied. If there are more
-            // records than this bounded buffer can report, remaining fences
-            // are failed below rather than left indefinitely pending.
             let reset = display.drm_reset(queue, &mut []);
-            for record in self
-                .records
-                .iter_mut()
-                .filter(|record| record.queue == queue)
-            {
-                if record.status == FenceStatus::Pending {
-                    record.status = FenceStatus::Failed;
-                    record.resource_id = None;
-                    record.completion_data = None;
-                }
+            if reset.quiesced {
+                self.fail_queue_records(queue);
             }
             return reset;
         }
@@ -270,20 +260,14 @@ impl GpuEngine {
                 data: GpuCompletionData::None,
             });
         }
-        let count = display.drm_reset(queue, &mut out);
-        for completion in out.iter().take(count) {
-            if let Some(record) = self
-                .records
-                .iter_mut()
-                .find(|record| record.fence_id == completion.fence_id && record.queue == queue)
-            {
-                record.status = FenceStatus::Failed;
-                record.resource_id = None;
-                record.completion_data = None;
-            }
+        let reset = display.drm_reset(queue, &mut out);
+        if reset.quiesced {
+            self.fail_queue_records(queue);
         }
-        // Reset of this queue invalidates any record the transport could not
-        // fit in the bounded response, so fail all remaining queue fences.
+        reset
+    }
+
+    fn fail_queue_records(&mut self, queue: GpuQueue) {
         for record in self
             .records
             .iter_mut()
@@ -295,7 +279,6 @@ impl GpuEngine {
                 record.completion_data = None;
             }
         }
-        count
     }
 
     pub fn fence(&self, fence_id: u64) -> Option<FenceSnapshot> {
@@ -390,5 +373,82 @@ impl GpuEngine {
             }
             axtask::yield_now();
         }
+    }
+}
+
+#[cfg(test)]
+mod reset_quiescence_tests {
+    use axdriver_display::{BaseDriverOps, DeviceType, DisplayInfo, FrameBuffer, PixelLayout};
+
+    use super::*;
+
+    struct ResetDisplay {
+        reset: GpuResetResult,
+    }
+
+    impl BaseDriverOps for ResetDisplay {
+        fn device_name(&self) -> &str {
+            "reset-test"
+        }
+
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Display
+        }
+    }
+
+    impl DisplayDriverOps for ResetDisplay {
+        fn info(&self) -> DisplayInfo {
+            DisplayInfo::without_framebuffer(1, 1, PixelLayout::B8G8R8A8)
+        }
+
+        fn fb(&self) -> FrameBuffer<'_> {
+            // SAFETY: An empty framebuffer is not read by this reset-only mock;
+            // dangling is non-null and correctly aligned for a zero-length slice.
+            unsafe {
+                FrameBuffer::from_raw_parts_mut(core::ptr::NonNull::<u8>::dangling().as_ptr(), 0)
+            }
+        }
+
+        fn need_flush(&self) -> bool {
+            false
+        }
+
+        fn flush(&mut self) -> DevResult {
+            Ok(())
+        }
+
+        fn supports_drm_transport(&self) -> bool {
+            true
+        }
+
+        fn drm_reset(&mut self, _queue: GpuQueue, _out: &mut [GpuCompletion]) -> GpuResetResult {
+            self.reset
+        }
+    }
+
+    #[test]
+    fn reset_failure_keeps_fences_pending_until_transport_quiesces() {
+        let mut display = ResetDisplay {
+            reset: GpuResetResult {
+                completions: 0,
+                quiesced: false,
+            },
+        };
+        let mut engine = GpuEngine::new(&mut display).unwrap();
+        engine.records.push(FenceRecord {
+            fence_id: 7,
+            queue: GpuQueue::Control,
+            status: FenceStatus::Pending,
+            resource_id: None,
+            context_id: None,
+            completion_data: None,
+        });
+
+        assert!(!engine.reset(&mut display, GpuQueue::Control).quiesced);
+        assert_eq!(engine.fence(7).unwrap().status, FenceStatus::Pending);
+
+        display.reset.quiesced = true;
+        assert!(engine.reset(&mut display, GpuQueue::Control).quiesced);
+        assert_eq!(engine.fence(7).unwrap().status, FenceStatus::Failed);
     }
 }

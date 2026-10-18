@@ -1,24 +1,21 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See the repository MIT license.
-//! Kernel providers for the i915 framework, probe and DRM-core tables of
-//! `tk-intel-gt`.
+//! Kernel providers for the i915 framework and probe tables of `tk-intel-gt`.
 //!
-//! [`install`] installs three tables:
+//! [`install`] installs two tables:
 //!
 //! - `I915FrameworkOps`: the display owner split, DRM device binding, PCI
 //!   identity queries, the parameter defaults, and the optional subsystems
 //!   that the configured TheKernel build does not compile in.
 //! - `I915ProbeOps`: the BAR0 register peek used before the probe maps MMIO.
-//! - `DrmCoreProvider`: the DRM object entry points. Object calls that need a
-//!   kernel `DrmFile`, GEM handle, dma-buf, sync_file or syncobj fail closed
-//!   (see the comment on each). They are reachable only through ioctl or
-//!   export paths that the ioctl owner has not bound yet.
+//!
+//! DRM object, GEM and DMA-BUF entry points are owned by the shared
+//! `tk-drm-upstream` core, not adapter callbacks here.
 //!
 //! Display callbacks belong to no one: the device has no display pipes
 //! (`HAS_DISPLAY()` is false), so the `no_display_*` entries do what Linux's
 //! early returns do for such a device.
 
-use intel_gt::linux::gem::DrmGemObject;
 use core::{
     ffi::{c_char, c_int, c_void},
     mem::{offset_of, size_of},
@@ -31,11 +28,7 @@ use intel_gt::{
     i915_probe_provider_upstream::{
         I915FrameworkOps, I915ProbeOps, install_i915_framework_ops, install_i915_probe_ops,
     },
-    intel_context_upstream::{DmaFence, Kref},
-    linux::{
-        drm_core::{DrmCoreProvider, install_drm_core_provider},
-    },
-    linux_i915_private::{DrmDevice, DrmVmaOffsetManager},
+    intel_context_upstream::DmaFence,
 };
 
 #[cfg(target_os = "none")]
@@ -45,7 +38,6 @@ use super::{pci, upstream_gt};
 const ENODEV: c_int = 19;
 const EBUSY: c_int = 16;
 const EINVAL: c_int = 22;
-const ENOMEM: c_int = 12;
 const GFP_KERNEL: u32 = 0x0cc0;
 /// `__GFP_ZERO` (include/linux/gfp_types.h); honoured by `kmalloc`.
 const GFP_ZERO: u32 = 0x0100;
@@ -54,24 +46,12 @@ unsafe extern "C" {
     /// Linux `kmalloc()`, exported under its C name by `tk-intel-gt`.
     fn kmalloc(size: usize, flags: u32) -> *mut c_void;
     fn kfree(object: *mut c_void);
-    fn drm_vma_offset_remove(
-        manager: *mut DrmVmaOffsetManager,
-        node: *mut intel_gt::intel_context_upstream::DrmVmaOffsetNode,
-    );
-    /// Linux `dma_resv_init()`, exported under its C name by `tk-intel-gt`.
-    fn dma_resv_init(resv: *mut c_void);
     /// Linux `drmm_add_action_or_reset()`, exported by `tk-intel-gt`.
     fn drmm_add_action_or_reset(
         drm: *mut c_void,
         action: unsafe extern "C" fn(*mut c_void, *mut c_void),
         data: *mut c_void,
     ) -> c_int;
-}
-
-/// `ERR_PTR(errno)`.
-#[inline]
-fn err_ptr(errno: c_int) -> *mut c_void {
-    (errno as isize) as *mut c_void
 }
 
 // ---------------------------------------------------------------------------
@@ -753,220 +733,11 @@ unsafe extern "C" fn early_gmd_read(
 
 static PROBE: I915ProbeOps = I915ProbeOps { early_gmd_read };
 
-// ---------------------------------------------------------------------------
-// DRM core table
-// ---------------------------------------------------------------------------
-
-/// `drm_dev_enter()`: the canonical core admits the device while it is not
-/// unplugged.
-unsafe extern "C" fn dev_enter(dev: *mut c_void, idx: *mut c_int) -> bool {
-    // SAFETY: forwards the caller's device and writable index slot unchanged.
-    unsafe { tk_drm_upstream::drm_drv_upstream::drm_dev_enter(dev.cast(), idx) }
-}
-
-/// `drm_dev_exit()`: pairs with [`dev_enter`]. Unplug does not wait for SRCU
-/// readers, because the kernel never frees the native device, so no reader can
-/// hold memory that is about to go away.
-unsafe extern "C" fn dev_exit(_idx: c_int) {}
-
-/// `drm_dev_get()`: the upstream device lives as long as the kernel, so the
-/// reference is the device pointer itself.
-unsafe extern "C" fn dev_get(dev: *mut c_void) -> *mut c_void {
-    dev
-}
-
-/// `drm_dev_put()`: pairs with [`dev_get`]. The device is never freed.
-unsafe extern "C" fn dev_put(_dev: *mut c_void) {}
-
-/// `drm_is_current_master()`: the canonical DRM core owns mastership.
-unsafe extern "C" fn is_current_master(file: *mut c_void) -> bool {
-    // SAFETY: i915 passes the live `drm_file` of the calling ioctl.
-    unsafe { tk_drm_upstream::drm_auth_upstream::drm_is_current_master(file.cast()) }
-}
-
-/// `drm_print_memory_stats()`: fdinfo output. TheKernel exposes no fdinfo, so
-/// the kernel never creates a printer for it and there is nothing to print.
-unsafe extern "C" fn print_memory_stats(
-    _printer: *mut c_void,
-    _stats: *const c_void,
-    _supported: c_int,
-    _region: *const c_char,
-) {
-}
-
-/// `drm_gem_free_mmap_offset()`: mmap offsets are created only by the mmap path,
-/// which is not bound yet. A node with start 0 was never allocated and has
-/// nothing to release.
-unsafe extern "C" fn gem_free_mmap_offset(obj: *mut c_void) {
-    let obj = obj.cast::<DrmGemObject>();
-    if obj.is_null() {
-        return;
-    }
-    // SAFETY: DRM calls this release hook with the still-live GEM object whose
-    // final reference triggered cleanup.
-    let device = unsafe { (*obj).dev.cast::<DrmDevice>() };
-    let manager = if device.is_null() {
-        ptr::null_mut()
-    } else {
-        // SAFETY: a non-null object device is its live DRM device, whose
-        // vma-offset manager was initialized before GEM objects were exposed.
-        unsafe { (*device).vma_offset_manager }
-    };
-    // SAFETY: `obj` is still live during its final-reference callback, so its
-    // embedded VMA node may be inspected before deciding whether it was added.
-    let node_is_registered = !unsafe { (*obj).vma_node.vm_node.mm }.is_null();
-    if !manager.is_null() && node_is_registered {
-        // SAFETY: the non-null `mm` marker proves this node was registered in
-        // the device manager, and both objects remain live in this callback.
-        unsafe { drm_vma_offset_remove(manager, ptr::addr_of_mut!((*obj).vma_node)) };
-    }
-}
-
-/// `drm_gem_object_free()`: the final put of a GEM object. The object's
-/// `funcs->free` releases it, as in Linux. An object without `funcs` is the base
-/// of an allocation whose owner must free it, which is not a supported path here.
-unsafe extern "C" fn gem_object_free(refcount: *mut c_void) {
-    // `refcount` is the first member of `drm_gem_object`, so the object starts
-    // at the same address.
-    let obj = refcount.cast::<DrmGemObject>();
-    // SAFETY: the caller passes the `refcount` of a live object whose final put
-    // has happened; `funcs` is read, not written.
-    let funcs = unsafe { (*obj).funcs };
-    if funcs.is_null() {
-        panic!("drm_gem_object_free: object without funcs->free is not supported");
-    }
-    // SAFETY: `struct drm_gem_object_funcs` begins with the `free` member.
-    let free = unsafe { *funcs.cast::<Option<unsafe extern "C" fn(*mut c_void)>>() };
-    match free {
-        // SAFETY: `free` is the object's own release callback, and `obj` is the
-        // object it releases.
-        Some(free) => unsafe { free(obj.cast()) },
-        None => panic!("drm_gem_object_free: object without funcs->free is not supported"),
-    }
-}
-
-/// `drm_gem_private_object_init()`: initializes a private GEM object's base
-/// record, as Linux does. The reservation is initialized through the
-/// `dma_resv_init` symbol that `tk-intel-gt` exports.
-unsafe extern "C" fn gem_private_object_init(dev: *mut c_void, obj: *mut c_void, size: usize) {
-    let obj = obj.cast::<DrmGemObject>();
-    // SAFETY: the caller passes a live, exclusively owned `drm_gem_object` that
-    // is being initialized; the offsets written are the fields of the Linux
-    // 7.2.3 x86_64 layout that `DrmGemObject` records.
-    unsafe {
-        // `kref_init()`: one reference, held by the caller.
-        (*obj).refcount.refcount.refs.counter = 1;
-        // `handle_count` is the u32 immediately after the kref.
-        obj.cast::<u8>()
-            .add(size_of::<Kref>())
-            .cast::<u32>()
-            .write(0);
-        (*obj).dev = dev.cast();
-        (*obj).filp = ptr::null_mut();
-        (*obj).size = size;
-        // `name` (int) is the 8-byte slot after `size`.
-        obj.cast::<u8>()
-            .add(offset_of!(DrmGemObject, size) + size_of::<u64>())
-            .cast::<u32>()
-            .write(0);
-        (*obj).dma_buf = ptr::null_mut();
-        (*obj).import_attach = ptr::null_mut();
-        // `drm_vma_node_reset()`: an unallocated node is all zero.
-        ptr::write_bytes(ptr::addr_of_mut!((*obj).vma_node), 0, 1);
-        (*obj).resv = ptr::addr_of_mut!((*obj)._resv).cast();
-        dma_resv_init(ptr::addr_of_mut!((*obj)._resv).cast());
-    }
-}
-
-/// `drm_gem_dmabuf_export()`: the kernel's dma-buf (`DmaBufFile`) wraps a kernel
-/// `GemObject`, and no upstream object is bound to one yet.
-unsafe extern "C" fn gem_dmabuf_export(_dev: *mut c_void, _info: *mut c_void) -> *mut c_void {
-    err_ptr(-ENODEV)
-}
-
-/// `drm_gem_dmabuf_release()`: export never succeeds here, so no dma-buf can
-/// reach its release.
-unsafe extern "C" fn gem_dmabuf_release(_dmabuf: *mut c_void) {
-    panic!("drm_gem_dmabuf_release: no upstream dma-buf exists; export is not bound");
-}
-
-/// `drm_gem_prime_mmap()`: only exported dma-bufs are mmapped, so this cannot be
-/// reached before export succeeds.
-unsafe extern "C" fn gem_prime_mmap(_obj: *mut c_void, _vma: *mut c_void) -> c_int {
-    -ENODEV
-}
-
-/// `drm_gem_unmap_dma_buf()`: import never succeeds here.
-unsafe extern "C" fn gem_unmap_dma_buf(_attach: *mut c_void, _sgt: *mut c_void, _direction: c_int) {
-    panic!("drm_gem_unmap_dma_buf: no upstream dma-buf attachment exists; import is not bound");
-}
-
-/// `drm_prime_gem_destroy()`: only objects with an import attachment reach this,
-/// and none exist.
-unsafe extern "C" fn prime_gem_destroy(_obj: *mut c_void, _sg: *mut c_void) {
-    panic!("drm_prime_gem_destroy: no upstream imported object exists; import is not bound");
-}
-
-/// `dma_buf_attach()`: import is not bound.
-unsafe extern "C" fn dma_buf_attach(_dmabuf: *mut c_void, _dev: *mut c_void) -> *mut c_void {
-    err_ptr(-ENODEV)
-}
-
-/// `dma_buf_detach()`: no attachment can exist.
-unsafe extern "C" fn dma_buf_detach(_dmabuf: *mut c_void, _attach: *mut c_void) {
-    panic!("dma_buf_detach: no upstream dma-buf attachment exists; import is not bound");
-}
-
-/// `dma_buf_map_attachment()`: no attachment can exist.
-unsafe extern "C" fn dma_buf_map_attachment(
-    _attach: *mut c_void,
-    _direction: c_int,
-) -> *mut c_void {
-    err_ptr(-ENODEV)
-}
-
-/// `dma_buf_unmap_attachment()`: no attachment can exist.
-unsafe extern "C" fn dma_buf_unmap_attachment(
-    _attach: *mut c_void,
-    _sgt: *mut c_void,
-    _direction: c_int,
-) {
-    panic!("dma_buf_unmap_attachment: no upstream dma-buf attachment exists; import is not bound");
-}
-
-/// `dma_buf_put()`: no dma-buf can exist.
-unsafe extern "C" fn dma_buf_put(_dmabuf: *mut c_void) {
-    panic!("dma_buf_put: no upstream dma-buf exists; export is not bound");
-}
-
-static DRM_CORE: DrmCoreProvider = DrmCoreProvider {
-    dev_enter,
-    dev_exit,
-    dev_get,
-    dev_put,
-    is_current_master,
-    print_memory_stats,
-    gem_free_mmap_offset,
-    gem_object_free,
-    gem_private_object_init,
-    gem_dmabuf_export,
-    gem_dmabuf_release,
-    gem_prime_mmap,
-    gem_unmap_dma_buf,
-    prime_gem_destroy,
-    dma_buf_attach,
-    dma_buf_detach,
-    dma_buf_map_attachment,
-    dma_buf_unmap_attachment,
-    dma_buf_put,
-};
-
-/// Installs the framework, probe and DRM-core tables. Called once from
-/// `upstream_gt::install_providers()`. Reinstalling the same tables is accepted.
+/// Install the framework and probe tables. DRM object APIs link directly to
+/// the shared `tk-drm-upstream` implementation.
 pub(super) fn install() -> Result<(), &'static str> {
     install_i915_framework_ops(&FRAMEWORK)?;
     install_i915_probe_ops(&PROBE)?;
-    install_drm_core_provider(&DRM_CORE)?;
     Ok(())
 }
 
@@ -985,7 +756,7 @@ pub(super) fn registered_device() -> Option<*mut c_void> {
     let drm = unsafe { ptr::addr_of!((*i915).drm).cast_mut() };
     // SAFETY: `drm` is the embedded record in the retained device above;
     // its lifecycle flags are initialized by the upstream probe before publication.
-    unsafe { ((*drm).registered && !(*drm).unplugged).then_some(drm.cast()) }
+    unsafe { ((*drm).registered && !(*drm).unplugged.load(core::sync::atomic::Ordering::Acquire)).then_some(drm.cast()) }
 }
 
 #[cfg(test)]

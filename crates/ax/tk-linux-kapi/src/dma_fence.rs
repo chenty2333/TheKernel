@@ -57,8 +57,8 @@ pub unsafe extern "C" fn dma_fence_default_wait(
     if fence.is_null() {
         return -(crate::config::EINVAL as c_long);
     }
-    let signaled =
-        || crate::bits::test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, unsafe { &(*fence).flags });
+    // SAFETY: the caller's live fence reference is retained for the wait.
+    let signaled = || unsafe { dma_fence_is_signaled(fence) };
     if signaled() {
         return timeout;
     }
@@ -210,10 +210,17 @@ pub unsafe extern "C" fn dma_fence_set_deadline(fence: *mut DmaFence, deadline: 
 /// otherwise the external lock it was initialised with.
 #[inline]
 unsafe fn fence_spinlock(fence: *mut DmaFence) -> *mut Spinlock {
-    let flags = unsafe { (*fence).flags };
+    // Flags are updated atomically after initialization, so inspect the lock
+    // selector through the same atomic view even though it is immutable.
+    // SAFETY: `fence` is live and the flags word is naturally aligned.
+    let flags = unsafe {
+        AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).load(Ordering::Acquire)
+    };
     if flags & (1 << DMA_FENCE_FLAG_INLINE_LOCK_BIT) != 0 {
+        // SAFETY: the inline flag selects the initialized union member.
         unsafe { core::ptr::addr_of_mut!((*fence).lock).cast::<Spinlock>() }
     } else {
+        // SAFETY: the external lock is valid for the fence lifetime by init.
         unsafe { (*fence).lock.extern_lock }
     }
 }
@@ -256,21 +263,45 @@ pub unsafe extern "C" fn dma_fence_enable_sw_signaling(fence: *mut DmaFence) {
     assert!(!fence.is_null());
     let mut flags = 0;
     unsafe { dma_fence_lock_irqsave(fence, &mut flags) };
+    // SAFETY: this function holds the live fence's lock.
+    unsafe { enable_signaling_locked(fence) };
+    unsafe { dma_fence_unlock_irqrestore(fence, flags) };
+}
+
+/// Arm driver callbacks once, returning whether the locked fence is pending.
+///
+/// # Safety
+/// The caller owns a live fence reference and holds its spinlock.
+unsafe fn enable_signaling_locked(fence: *mut DmaFence) -> bool {
     let bit = 1usize << DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT;
-    let previously = unsafe {
-        core::sync::atomic::AtomicUsize::from_ptr(core::ptr::addr_of_mut!((*fence).flags).cast())
+    // SAFETY: the initialized flags word is aligned and atomically accessed.
+    let previous = unsafe {
+        AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast())
             .fetch_or(bit, Ordering::AcqRel)
     };
-    let signaled = unsafe { (*fence).flags } & (1 << DMA_FENCE_FLAG_SIGNALED_BIT) != 0;
-    if previously & bit == 0 && !signaled {
-        let ops = unsafe { (*fence).ops.cast::<crate::types::DmaFenceOps>() };
-        if let Some(enable) = unsafe { ops.as_ref() }.and_then(|ops| ops.enable_signaling) {
-            if !unsafe { enable(fence) } {
-                unsafe { dma_fence_signal_locked(fence) };
-            }
-        }
+    // SAFETY: the caller retains the live locked fence.
+    if unsafe { fence_is_signaled_flag(fence) } {
+        return false;
     }
-    unsafe { dma_fence_unlock_irqrestore(fence, flags) };
+    crate::rcu::rcu_read_lock();
+    // SAFETY: the fence is retained, and RCU pins its operations table.
+    let ops = unsafe {
+        crate::rcu::rcu_dereference(ptr::addr_of!((*fence).ops).cast::<*mut DmaFenceOps>())
+    };
+    // SAFETY: a non-null operations table remains live within this RCU section.
+    let pending = if previous & bit == 0 {
+        unsafe { ops.as_ref() }.and_then(|ops| ops.enable_signaling)
+            // SAFETY: this is the retained fence's enable hook, called with its lock held.
+            .is_none_or(|enable| unsafe { enable(fence) })
+    } else {
+        true
+    };
+    crate::rcu::rcu_read_unlock();
+    if !pending {
+        // SAFETY: the caller still holds the fence lock.
+        unsafe { dma_fence_signal_locked_inner(fence) };
+    }
+    pending
 }
 
 /// Linux `dma_fence_remove_callback()`: true when `cb` was still queued on the
@@ -336,9 +367,17 @@ pub unsafe extern "C" fn dma_fence_init(
     context: u64,
     seqno: u64,
 ) {
-    assert!(!fence.is_null() && !ops.is_null() && !lock.is_null());
+    assert!(!fence.is_null() && !ops.is_null());
     unsafe {
-        (*fence).lock = DmaFenceLock { extern_lock: lock };
+        if lock.is_null() {
+            (*fence).lock = DmaFenceLock {
+                inline_lock: Spinlock::new(),
+            };
+            (*fence).flags = 1 << DMA_FENCE_FLAG_INLINE_LOCK_BIT;
+        } else {
+            (*fence).lock = DmaFenceLock { extern_lock: lock };
+            (*fence).flags = 0;
+        }
         (*fence).ops = ops.cast();
         (*fence).timestamp_union = DmaFenceTimestamp {
             cb_list: ManuallyDrop::new(ListHead {
@@ -349,7 +388,6 @@ pub unsafe extern "C" fn dma_fence_init(
         INIT_LIST_HEAD(ptr::addr_of_mut!((*fence).timestamp_union.cb_list).cast());
         (*fence).context = context;
         (*fence).seqno = seqno;
-        (*fence).flags = 0;
         (*fence).error = 0;
         kref_init(ptr::addr_of_mut!((*fence).refcount));
     }
@@ -366,12 +404,57 @@ pub unsafe extern "C" fn dma_fence_set_error(fence: *mut DmaFence, error: c_int)
 /// Test the Linux signaled flag.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dma_fence_is_signaled(fence: *mut DmaFence) -> bool {
-    !fence.is_null()
-        && unsafe {
-            AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).load(Ordering::Acquire)
-                & (1usize << DMA_FENCE_FLAG_SIGNALED_BIT)
-                != 0
-        }
+    if fence.is_null() {
+        return false;
+    }
+    // SAFETY: `fence` was checked non-null and is live per the caller contract.
+    if unsafe { fence_is_signaled_flag(fence) } {
+        return true;
+    }
+    // SAFETY: the caller holds the fence reference through the RCU-protected
+    // driver callback.
+    let done = unsafe { driver_reports_done(fence) };
+    if done {
+        // SAFETY: the fence is live; the normal signal path publishes the
+        // driver's observed completion and wakes callbacks and waiters.
+        unsafe { dma_fence_signal(fence) };
+    }
+    done
+}
+
+/// Whether the Linux signaled flag has been published.
+///
+/// # Safety
+/// `fence` must point to a live fence.
+unsafe fn fence_is_signaled_flag(fence: *mut DmaFence) -> bool {
+    // SAFETY: the live fence contains a naturally aligned flags word.
+    unsafe {
+        AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).load(Ordering::Acquire)
+            & (1usize << DMA_FENCE_FLAG_SIGNALED_BIT)
+            != 0
+    }
+}
+
+/// Poll the driver's completion hook while its ops table is RCU-protected.
+///
+/// # Safety
+/// `fence` must point to a live initialized fence.
+unsafe fn driver_reports_done(fence: *mut DmaFence) -> bool {
+    crate::rcu::rcu_read_lock();
+    // SAFETY: the live fence's ops slot is read under RCU, and its table stays
+    // valid for this read-side critical section.
+    let table = unsafe {
+        crate::rcu::rcu_dereference(ptr::addr_of!((*fence).ops).cast::<*mut DmaFenceOps>())
+    };
+    // SAFETY: the table pointer is null or valid during the RCU section.
+    let done = unsafe { table.as_ref() }
+        .and_then(|ops| ops.signaled)
+        .is_some_and(|signaled| {
+            // SAFETY: the fence is live and the ops callback is RCU-protected.
+            unsafe { signaled(fence) }
+        });
+    crate::rcu::rcu_read_unlock();
+    done
 }
 
 unsafe fn dma_fence_signal_locked_inner(fence: *mut DmaFence) {
@@ -440,11 +523,11 @@ pub unsafe extern "C" fn dma_fence_add_callback(
     }
     let mut flags = 0;
     unsafe { fence_lock(fence, &mut flags) };
-    if unsafe {
-        AtomicUsize::from_ptr(ptr::addr_of_mut!((*fence).flags).cast()).load(Ordering::Acquire)
-            & (1usize << DMA_FENCE_FLAG_SIGNALED_BIT)
-            != 0
-    } {
+    // SAFETY: the callback is unpublished writable storage, and the live
+    // fence is locked. Registration must arm composite/driver signaling, not
+    // merely append a callback that the hardware will never deliver.
+    unsafe { INIT_LIST_HEAD(ptr::addr_of_mut!((*callback).node)) };
+    if !unsafe { enable_signaling_locked(fence) } {
         unsafe { fence_unlock(fence, flags) };
         return -ENOENT;
     }
@@ -519,13 +602,18 @@ pub unsafe extern "C" fn dma_fence_free(fence: *mut DmaFence) {
 /// Linux `dma_fence_get_status_locked()`: 0 while pending, otherwise the
 /// fence's error (negative) or 1 when it completed without one.
 unsafe fn dma_fence_get_status_locked(fence: *mut DmaFence) -> c_int {
-    if unsafe { dma_fence_is_signaled(fence) } {
-        match unsafe { (*fence).error } {
-            0 => 1,
-            error => error,
-        }
-    } else {
-        0
+    // SAFETY: this helper is called with a live fence under its lock.
+    if !unsafe { fence_is_signaled_flag(fence) } && unsafe { driver_reports_done(fence) } {
+        // SAFETY: callers hold this fence's lock, so the locked signal path
+        // can publish the driver's observed completion directly.
+        unsafe { dma_fence_signal_locked_inner(fence) };
+    }
+    if !unsafe { fence_is_signaled_flag(fence) } {
+        return 0;
+    }
+    match unsafe { (*fence).error } {
+        0 => 1,
+        error => error,
     }
 }
 
@@ -620,12 +708,113 @@ pub unsafe fn dma_fence_allocate_private_stub(timestamp: i64) -> *mut DmaFence {
 }
 
 unsafe fn fence_lock(fence: *mut DmaFence, flags: &mut c_ulong) {
-    let lock = unsafe { (*fence).lock.extern_lock };
+    // SAFETY: the live initialized fence's inline-lock flag selects its valid
+    // union member, or its external lock remains valid by the init contract.
+    let lock = unsafe { fence_spinlock(fence) };
     assert!(!lock.is_null(), "dma fence has no lock");
     unsafe { spin_lock_irqsave_raw(lock, flags) };
 }
 
 unsafe fn fence_unlock(fence: *mut DmaFence, flags: c_ulong) {
-    let lock = unsafe { (*fence).lock.extern_lock };
+    // SAFETY: this matches the lock selected by `fence_lock` for this fence.
+    let lock = unsafe { fence_spinlock(fence) };
     unsafe { spin_unlock_irqrestore_raw(lock, flags) };
+}
+
+#[cfg(test)]
+static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static PROBE_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+unsafe extern "C" fn probe_signaled(_: *mut DmaFence) -> bool {
+    PROBE_CALLS.fetch_add(1, Ordering::Relaxed);
+    PROBE_READY.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+static PROBE_OPS: DmaFenceOps = DmaFenceOps {
+    get_driver_name: None,
+    get_timeline_name: None,
+    enable_signaling: None,
+    signaled: Some(probe_signaled),
+    wait: None,
+    release: None,
+    set_deadline: None,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_external_lock_selects_initialized_inline_lock() {
+        // SAFETY: DmaFence is a C record and dma_fence_init initializes every
+        // field before the test reads it.
+        let mut fence = unsafe { core::mem::zeroed::<DmaFence>() };
+        // SAFETY: `fence` is local writable storage, and the static ops table
+        // outlives it; a null lock requests the embedded lock.
+        unsafe {
+            dma_fence_init(
+                &mut fence,
+                ptr::addr_of!(DMA_FENCE_STUB_OPS),
+                ptr::null_mut(),
+                0,
+                1,
+            );
+        }
+        assert_ne!(
+            fence.flags & (1 << DMA_FENCE_FLAG_INLINE_LOCK_BIT),
+            0,
+            "a null external lock must select the inline lock"
+        );
+        let inline_lock = ptr::addr_of_mut!(fence.lock.inline_lock);
+        // SAFETY: the fence has just been initialized with this inline lock.
+        assert_eq!(unsafe { dma_fence_spinlock(&mut fence) }, inline_lock);
+
+        // SAFETY: Spinlock has a naturally aligned 32-bit atomic word, matching
+        // the raw lock implementation in `locks.rs`.
+        let word = unsafe {
+            core::sync::atomic::AtomicU32::from_ptr(inline_lock.cast::<u32>())
+        };
+        assert_eq!(word.load(Ordering::Acquire), 0);
+        let mut flags = 0;
+        // SAFETY: the initialized fence has a valid inline lock and `flags` is
+        // writable storage for the saved interrupt state.
+        unsafe { dma_fence_lock_irqsave(&mut fence, &mut flags) };
+        assert_eq!(word.load(Ordering::Acquire), 1);
+        // SAFETY: this releases the matching acquisition above.
+        unsafe { dma_fence_unlock_irqrestore(&mut fence, flags) };
+        assert_eq!(word.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn signaled_hook_publishes_completion_through_signal_path() {
+        PROBE_CALLS.store(0, Ordering::Relaxed);
+        PROBE_READY.store(false, Ordering::Release);
+        // SAFETY: dma_fence_init initializes the C-layout record before use.
+        let mut fence = unsafe { core::mem::zeroed::<DmaFence>() };
+        let mut lock = Spinlock::new();
+        crate::locks::spin_lock_init(&mut lock);
+        // SAFETY: local fence and lock storage remain valid for this test, and
+        // the static ops table outlives the fence.
+        unsafe { dma_fence_init(&mut fence, ptr::addr_of!(PROBE_OPS), &mut lock, 1, 3) };
+
+        // SAFETY: the initialized stack fence is live throughout this test.
+        assert!(!unsafe { dma_fence_is_signaled(&mut fence) });
+        assert_eq!(PROBE_CALLS.load(Ordering::Relaxed), 1);
+        PROBE_READY.store(true, Ordering::Release);
+        // SAFETY: same live fence; the driver's completion is converted to a
+        // normal signal so future checks use the published flag.
+        assert!(unsafe { dma_fence_is_signaled(&mut fence) });
+        assert_ne!(
+            fence.flags & (1 << DMA_FENCE_FLAG_SIGNALED_BIT),
+            0,
+            "driver-reported completion must be published"
+        );
+        assert_eq!(PROBE_CALLS.load(Ordering::Relaxed), 2);
+        // SAFETY: once signaled, the live fence no longer needs its driver hook.
+        assert!(unsafe { dma_fence_is_signaled(&mut fence) });
+        assert_eq!(PROBE_CALLS.load(Ordering::Relaxed), 2);
+    }
 }

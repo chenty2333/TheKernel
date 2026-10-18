@@ -95,9 +95,6 @@ unsafe extern "C" {
     // upstream: kernel/kthread.c
     fn kthread_destroy_worker(worker: *mut c_void);
     fn kthread_flush_worker(worker: *mut c_void);
-    // upstream: kernel/time/hrtimer.c (hrtimer_forward_now / hrtimer_active are header inlines)
-    fn hrtimer_forward_now(timer: *mut Hrtimer, interval: i64) -> u64;
-    fn hrtimer_active(timer: *const Hrtimer) -> bool;
 }
 
 /// `struct timespec64` (include/linux/time64.h).
@@ -1871,7 +1868,7 @@ unsafe extern "C" fn drm_vblank_timer_function(timer: *mut Hrtimer) -> i32 {
             return HRTIMER_NORESTART;
         }
 
-        let ret_overrun = hrtimer_forward_now(timer, interval);
+        let ret_overrun = tk_linux_kapi::timer::hrtimer_forward_now(timer, interval);
         if ret_overrun != 1 {
             // drm_dbg_vbl(dev, "vblank timer overrun\n"): dropped
         }
@@ -1911,7 +1908,7 @@ pub unsafe extern "C" fn drm_crtc_vblank_start_timer(crtc: *mut DrmCrtc) -> i32 
         } else {
             // Timer should not be active. If it is, wait for the previous cancel
             // operations to finish.
-            while hrtimer_active(core::ptr::addr_of!((*vtimer).timer)) {
+            while tk_linux_kapi::timer::hrtimer_active(core::ptr::addr_of!((*vtimer).timer)) {
                 tk_linux_kapi::timer::hrtimer_try_to_cancel(core::ptr::addr_of_mut!((*vtimer).timer));
             }
         }
@@ -1953,14 +1950,6 @@ pub unsafe extern "C" fn drm_crtc_vblank_cancel_timer(crtc: *mut DrmCrtc) {
     }
 }
 
-/// Expiry time of an hrtimer (`timer->node.expires`). The timerqueue node
-/// follows the 24-byte rb_node, so `expires` sits at offset 24 on x86_64.
-// upstream: include/linux/hrtimer.h hrtimer.node.expires
-#[inline]
-unsafe fn hrtimer_node_expires(timer: *const Hrtimer) -> i64 {
-    unsafe { core::ptr::read_volatile((timer as *const u8).add(24) as *const i64) }
-}
-
 /// Time of the next vblank, taken from the emulated timer's expiry rolled back
 /// by one frame.
 // upstream: drm_vblank.c drm_crtc_vblank_get_vblank_timeout()
@@ -1982,7 +1971,9 @@ pub unsafe extern "C" fn drm_crtc_vblank_get_vblank_timeout(crtc: *mut DrmCrtc, 
         // we get consistent values from both fields.
         loop {
             let cur_count = drm_crtc_vblank_count_and_time(crtc, &mut cur_time);
-            *vblank_time = hrtimer_node_expires(core::ptr::addr_of!((*vtimer).timer));
+            *vblank_time = tk_linux_kapi::timer::hrtimer_get_expires(
+                core::ptr::addr_of!((*vtimer).timer),
+            );
             if cur_count == drm_crtc_vblank_count_and_time(crtc, &mut cur_time) {
                 break;
             }

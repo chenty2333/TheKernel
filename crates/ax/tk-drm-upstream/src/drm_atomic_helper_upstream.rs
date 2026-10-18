@@ -8,7 +8,7 @@
 
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code, unused_variables, unused_mut)]
 
-use core::ffi::c_void;
+use core::{ffi::c_void, mem::offset_of};
 
 use crate::drm_atomic_types::{DrmAtomicCommit, DrmCrtcCommit};
 use crate::drm_connector_types::{DrmConnector, DrmConnectorListIter, DrmConnectorState};
@@ -169,7 +169,11 @@ unsafe fn init_commit(commit: *mut DrmCrtcCommit, crtc: *mut DrmCrtc) {
 }
 
 unsafe extern "C" fn release_crtc_commit(completion: *mut Completion) {
-    let commit = (completion as *mut u8).sub(16) as *mut DrmCrtcCommit;
+    // SAFETY: `completion` is the embedded `flip_done` field of a live commit.
+    let commit = completion
+        .cast::<u8>()
+        .sub(offset_of!(DrmCrtcCommit, flip_done))
+        .cast::<DrmCrtcCommit>();
     drm_crtc_commit_put(commit);
 }
 
@@ -787,7 +791,8 @@ pub unsafe extern "C" fn drm_atomic_helper_check_modeset(
         return ret;
     }
 
-    mode_fixup(state)
+    ret = mode_fixup(state);
+    ret
 }
 
 // =========================================================================
@@ -1689,37 +1694,40 @@ pub unsafe extern "C" fn drm_atomic_helper_commit_tail_rpm(state: *mut DrmAtomic
 // upstream: drm_atomic_helper.c commit_tail()
 unsafe fn commit_tail(state: *mut DrmAtomicCommit) {
     let dev = (*state).dev;
-    let funcs = (*dev).mode_config.helper_private as *const DrmModeConfigHelperFuncs;
-    let mut new_self_refresh_mask = 0u32;
-
-    let start = ktime_get();
-
-    let _ = drm_atomic_helper_wait_for_fences(dev, state, false);
-    drm_atomic_helper_wait_for_dependencies(state);
-
-    let num_crtcs = (*dev).mode_config.num_crtc as usize;
-    for i in 0..num_crtcs {
-        let entry = (*state).crtcs.add(i);
-        let new_crtc_state = (*entry).new_state;
-        if !new_crtc_state.is_null() && (*new_crtc_state).self_refresh_active {
-            new_self_refresh_mask |= 1u32 << i;
-        }
-    }
-
-    if !funcs.is_null() && (*funcs).atomic_commit_tail.is_some() {
-        ((*funcs).atomic_commit_tail.unwrap())(state);
+    let ret = drm_atomic_helper_wait_for_fences(dev, state, false);
+    if ret != 0 {
+        drm_atomic_helper_commit_error(state, ret);
     } else {
-        drm_atomic_helper_commit_tail(state);
-    }
+        let funcs = (*dev).mode_config.helper_private as *const DrmModeConfigHelperFuncs;
+        let mut new_self_refresh_mask = 0u32;
+        let start = ktime_get();
 
-    let end = ktime_get();
-    let commit_time_ms = (end - start) / 1_000_000;
-    if commit_time_ms > 0 {
-        pending_stubs::self_refresh::drm_self_refresh_helper_update_avg_times(
-            state as *mut c_void,
-            commit_time_ms as u32,
-            new_self_refresh_mask,
-        );
+        drm_atomic_helper_wait_for_dependencies(state);
+
+        let num_crtcs = (*dev).mode_config.num_crtc as usize;
+        for i in 0..num_crtcs {
+            let entry = (*state).crtcs.add(i);
+            let new_crtc_state = (*entry).new_state;
+            if !new_crtc_state.is_null() && (*new_crtc_state).self_refresh_active {
+                new_self_refresh_mask |= 1u32 << i;
+            }
+        }
+
+        if !funcs.is_null() && (*funcs).atomic_commit_tail.is_some() {
+            ((*funcs).atomic_commit_tail.unwrap())(state);
+        } else {
+            drm_atomic_helper_commit_tail(state);
+        }
+
+        let end = ktime_get();
+        let commit_time_ms = (end - start) / 1_000_000;
+        if commit_time_ms > 0 {
+            pending_stubs::self_refresh::drm_self_refresh_helper_update_avg_times(
+                state as *mut c_void,
+                commit_time_ms as u32,
+                new_self_refresh_mask,
+            );
+        }
     }
 
     drm_atomic_helper_commit_cleanup_done(state);
@@ -1728,7 +1736,11 @@ unsafe fn commit_tail(state: *mut DrmAtomicCommit) {
 
 // upstream: drm_atomic_helper.c commit_work()
 unsafe extern "C" fn commit_work(work: *mut WorkStruct) {
-    let state = (work as *mut u8).sub(96) as *mut DrmAtomicCommit;
+    // SAFETY: `work` is the embedded `commit_work` field of a live state.
+    let state = work
+        .cast::<u8>()
+        .sub(offset_of!(DrmAtomicCommit, commit_work))
+        .cast::<DrmAtomicCommit>();
     commit_tail(state);
 }
 
@@ -1860,7 +1872,27 @@ pub unsafe extern "C" fn drm_atomic_helper_commit(
         }
     }
 
-    ret = drm_atomic_helper_swap_state(state, true);
+    // Keep commits for one object in hardware-submission order. For a
+    // blocking commit this wait also leaves the pre-swap callback immediately
+    // adjacent to the state publication below.
+    ret = wait_for_hw_done(state);
+    if ret != 0 {
+        drm_atomic_helper_unprepare_planes(dev, state);
+        return ret;
+    }
+
+    if !nonblock {
+        let funcs = (*dev).mode_config.helper_private as *const DrmModeConfigHelperFuncs;
+        if !funcs.is_null() && (*funcs).atomic_commit_pre_swap.is_some() {
+            ret = ((*funcs).atomic_commit_pre_swap.unwrap())(state);
+            if ret != 0 {
+                drm_atomic_helper_unprepare_planes(dev, state);
+                return ret;
+            }
+        }
+    }
+
+    ret = drm_atomic_helper_swap_state(state, false);
     if ret != 0 {
         drm_atomic_helper_unprepare_planes(dev, state);
         return ret;
@@ -1894,7 +1926,10 @@ unsafe fn stall_checks(crtc: *mut DrmCrtc, nonblock: bool) -> i32 {
     let head = core::ptr::addr_of_mut!((*crtc).commit_list);
     let mut cur = (*head).next;
     while cur != head {
-        let commit = (cur as *mut u8).sub(112) as *mut DrmCrtcCommit;
+        let commit = cur
+            .cast::<u8>()
+            .sub(offset_of!(DrmCrtcCommit, commit_entry))
+            .cast::<DrmCrtcCommit>();
         if i == 0 {
             completed = (*commit).flip_done.try_wait();
             if !completed && nonblock {
@@ -2168,6 +2203,96 @@ pub unsafe extern "C" fn drm_atomic_helper_commit_hw_done(state: *mut DrmAtomicC
     if !(*state).fake_commit.is_null() {
         (*(*state).fake_commit).hw_done.complete_all();
         (*(*state).fake_commit).flip_done.complete_all();
+    }
+}
+
+/// Finish a nonblocking commit whose input fence or hardware submission failed
+/// after the new software state was published. No successful flip event is
+/// reported; out-fences receive the error, pending events are canceled, and
+/// the device is unplugged so clients can observe that recovery is required.
+/// Driver-owned resources that hardware may still access must remain alive
+/// until the driver has confirmed that the device is no longer using them.
+///
+/// A driver calling this from its `atomic_commit_tail` callback must return
+/// immediately afterwards rather than invoking the normal helper tail.
+///
+/// # Safety
+/// `state` must be a live committed atomic state with a failed asynchronous
+/// submission associated with it. `error` should be a negative Linux errno.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drm_atomic_helper_commit_error(
+    state: *mut DrmAtomicCommit,
+    error: i32,
+) {
+    if state.is_null() {
+        return;
+    }
+
+    // SAFETY: The caller contract guarantees a live committed state; the
+    // device and all state arrays remain owned until this worker completes.
+    unsafe {
+        let dev = (*state).dev;
+        if dev.is_null() {
+            return;
+        }
+        let error = if error < 0 {
+            error
+        } else {
+            -tk_linux_kapi::config::EIO
+        };
+
+        // Stop later commits before waking waiters that depend on this one.
+        crate::drm_drv_upstream::drm_dev_unplug(dev);
+        drm_atomic_helper_commit_hw_done(state);
+
+        let num_crtcs = (*dev).mode_config.num_crtc as usize;
+        for i in 0..num_crtcs {
+            let entry = (*state).crtcs.add(i);
+            let new_crtc_state = (*entry).new_state;
+            if new_crtc_state.is_null() {
+                continue;
+            }
+
+            let event = (*new_crtc_state).event;
+            if !event.is_null() {
+                let event_base = core::ptr::addr_of_mut!((*event).base);
+                let fence = (*event_base).fence;
+                if !fence.is_null() {
+                    tk_linux_kapi::dma_fence::dma_fence_set_error(fence, error);
+                    tk_linux_kapi::dma_fence::dma_fence_signal(fence);
+                    tk_linux_kapi::dma_fence::dma_fence_put(fence);
+                    (*event_base).fence = core::ptr::null_mut();
+                }
+
+                let completion = (*event_base).completion;
+                if !completion.is_null() {
+                    if let Some(completion_ref) = completion.as_ref() {
+                        completion_ref.complete_all();
+                    }
+                    if let Some(release) = (*event_base).completion_release {
+                        release(completion);
+                    }
+                    (*event_base).completion = core::ptr::null_mut();
+                    (*event_base).completion_release = None;
+                }
+
+                let commit = (*new_crtc_state).commit;
+                if !commit.is_null() && (*commit).event == event {
+                    (*commit).event = core::ptr::null_mut();
+                }
+                crate::drm_file_upstream::drm_event_cancel_free(dev, event_base);
+                (*new_crtc_state).event = core::ptr::null_mut();
+            }
+
+            let commit = (*new_crtc_state).commit;
+            if !commit.is_null() {
+                (*commit).flip_done.complete_all();
+            }
+        }
+
+        // The helper tail is skipped on failure; retire old-state resources
+        // without claiming that a new frame was displayed successfully.
+        drm_atomic_helper_cleanup_planes(dev, state);
     }
 }
 
@@ -2573,6 +2698,52 @@ pub unsafe extern "C" fn drm_atomic_helper_cleanup_planes(
 }
 
 // upstream: drm_atomic_helper.c drm_atomic_helper_swap_state()
+/// Waits for the previous hardware phase associated with objects in `state`.
+///
+/// # Safety
+/// `state` must be a live atomic state whose old-state commit references and
+/// device arrays remain valid for the duration of each wait.
+unsafe fn wait_for_hw_done(state: *mut DrmAtomicCommit) -> i32 {
+    // SAFETY: The function contract keeps `state`, the device arrays, and all
+    // old commit references live while the blocking completion waits execute.
+    let dev = (*state).dev;
+    let num_crtcs = (*dev).mode_config.num_crtc as usize;
+    let num_connectors = (*state).num_connector as usize;
+    let num_planes = (*dev).mode_config.num_total_plane as usize;
+
+    for i in 0..num_crtcs {
+        let old = (*(*state).crtcs.add(i)).old_state;
+        if !old.is_null() && !(*old).commit.is_null() {
+            let ret = (*(*old).commit).hw_done.wait_interruptible();
+            if ret != 0 {
+                return ret;
+            }
+        }
+    }
+
+    for i in 0..num_connectors {
+        let old = (*(*state).connectors.add(i)).old_state;
+        if !old.is_null() && !(*old).commit.is_null() {
+            let ret = (*(*old).commit).hw_done.wait_interruptible();
+            if ret != 0 {
+                return ret;
+            }
+        }
+    }
+
+    for i in 0..num_planes {
+        let old = (*(*state).planes.add(i)).old_state;
+        if !old.is_null() && !(*old).commit.is_null() {
+            let ret = (*(*old).commit).hw_done.wait_interruptible();
+            if ret != 0 {
+                return ret;
+            }
+        }
+    }
+
+    0
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_atomic_helper_swap_state(
     state: *mut DrmAtomicCommit,
@@ -2584,37 +2755,9 @@ pub unsafe extern "C" fn drm_atomic_helper_swap_state(
     let num_planes = (*dev).mode_config.num_total_plane as usize;
 
     if stall {
-        for i in 0..num_crtcs {
-            let entry = (*state).crtcs.add(i);
-            let old_crtc_state = (*entry).old_state;
-            if !old_crtc_state.is_null() && !(*old_crtc_state).commit.is_null() {
-                let ret = (*(*old_crtc_state).commit).hw_done.wait_interruptible();
-                if ret != 0 {
-                    return ret;
-                }
-            }
-        }
-
-        for i in 0..num_connectors {
-            let conn_entry = (*state).connectors.add(i);
-            let old_conn_state = (*conn_entry).old_state;
-            if !old_conn_state.is_null() && !(*old_conn_state).commit.is_null() {
-                let ret = (*(*old_conn_state).commit).hw_done.wait_interruptible();
-                if ret != 0 {
-                    return ret;
-                }
-            }
-        }
-
-        for i in 0..num_planes {
-            let entry = (*state).planes.add(i);
-            let old_plane_state = (*entry).old_state;
-            if !old_plane_state.is_null() && !(*old_plane_state).commit.is_null() {
-                let ret = (*(*old_plane_state).commit).hw_done.wait_interruptible();
-                if ret != 0 {
-                    return ret;
-                }
-            }
+        let ret = wait_for_hw_done(state);
+        if ret != 0 {
+            return ret;
         }
     }
 
@@ -2861,7 +3004,10 @@ pub unsafe extern "C" fn drm_atomic_helper_disable_all(
     let mut cur = (*head).next;
     let mut ret = 0;
     while cur != head {
-        let crtc = (cur as *mut u8).sub(16) as *mut DrmCrtc;
+        let crtc = cur
+            .cast::<u8>()
+            .sub(offset_of!(DrmCrtc, head))
+            .cast::<DrmCrtc>();
         let crtc_state = crate::drm_atomic_upstream::drm_atomic_get_crtc_state(state, crtc);
         if IS_ERR(crtc_state) {
             ret = PTR_ERR(crtc_state);
@@ -2999,7 +3145,10 @@ pub unsafe extern "C" fn drm_atomic_helper_duplicate_state(
     let head = core::ptr::addr_of_mut!((*dev).mode_config.crtc_list);
     let mut cur = (*head).next;
     while cur != head {
-        let crtc = (cur as *mut u8).sub(16) as *mut DrmCrtc;
+        let crtc = cur
+            .cast::<u8>()
+            .sub(offset_of!(DrmCrtc, head))
+            .cast::<DrmCrtc>();
         let crtc_state = crate::drm_atomic_upstream::drm_atomic_get_crtc_state(state, crtc);
         if IS_ERR(crtc_state) {
             let err = PTR_ERR(crtc_state);
@@ -3305,4 +3454,294 @@ pub unsafe extern "C" fn drm_atomic_helper_bridge_propagate_bus_fmt(
     }
     *input_fmts = output_fmt;
     input_fmts
+}
+
+#[cfg(test)]
+mod commit_failure_tests {
+    use core::mem::zeroed;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::{
+        drm_atomic_types::{DrmCrtcsState, DrmPlanesState},
+        drm_file_types::{DrmFile, DrmMinor},
+        test_support::TestDrm,
+        uapi_drm_types::DrmEvent,
+    };
+
+    static PRE_SWAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PREPARE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CLEANUP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TAIL_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn fail_pre_swap(_state: *mut DrmAtomicCommit) -> i32 {
+        PRE_SWAP_CALLS.fetch_add(1, Ordering::SeqCst);
+        -tk_linux_kapi::config::EIO
+    }
+
+    unsafe extern "C" fn prepare_fb(_plane: *mut DrmPlane, _state: *mut DrmPlaneState) -> i32 {
+        PREPARE_CALLS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    unsafe extern "C" fn cleanup_fb(_plane: *mut DrmPlane, _state: *mut DrmPlaneState) {
+        CLEANUP_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn commit_tail(_state: *mut DrmAtomicCommit) {
+        TAIL_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    static MODE_HELPERS: DrmModeConfigHelperFuncs = DrmModeConfigHelperFuncs {
+        atomic_commit_tail: Some(commit_tail),
+        atomic_commit_setup: None,
+        atomic_commit_pre_swap: Some(fail_pre_swap),
+    };
+
+    static PLANE_HELPERS: DrmPlaneHelperFuncs = DrmPlaneHelperFuncs {
+        prepare_fb: Some(prepare_fb),
+        cleanup_fb: Some(cleanup_fb),
+        begin_fb_access: None,
+        end_fb_access: None,
+        atomic_check: None,
+        atomic_update: None,
+        atomic_enable: None,
+        atomic_disable: None,
+        atomic_async_check: None,
+        atomic_async_update: None,
+        get_scanout_buffer: None,
+        panic_flush: None,
+    };
+
+    #[test]
+    fn failed_pre_swap_keeps_old_state_and_unprepares_planes() {
+        PRE_SWAP_CALLS.store(0, Ordering::SeqCst);
+        PREPARE_CALLS.store(0, Ordering::SeqCst);
+        CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        TAIL_CALLS.store(0, Ordering::SeqCst);
+
+        let mut drm = TestDrm::new(0);
+        let dev = drm.ptr();
+        // SAFETY: These DRM C-layout objects are zero-initialised fixtures;
+        // the pointers and fields used by this test are explicitly filled in below.
+        let mut plane: DrmPlane = unsafe { zeroed() };
+        // SAFETY: The atomic plane states are zero-initialised C-layout fixtures.
+        let mut old_state: DrmPlaneState = unsafe { zeroed() };
+        // SAFETY: The atomic plane states are zero-initialised C-layout fixtures.
+        let mut new_state: DrmPlaneState = unsafe { zeroed() };
+        // SAFETY: The state-array entry is a zero-initialised C-layout fixture.
+        let mut plane_entry: DrmPlanesState = unsafe { zeroed() };
+        // SAFETY: The atomic state is a zero-initialised C-layout fixture.
+        let mut state: DrmAtomicCommit = unsafe { zeroed() };
+        plane.dev = dev;
+        plane.state = &mut old_state;
+        plane.helper_private = core::ptr::addr_of!(PLANE_HELPERS).cast_mut().cast();
+        old_state.plane = &mut plane;
+        new_state.plane = &mut plane;
+        new_state.state = &mut state;
+        plane_entry.ptr = &mut plane;
+        plane_entry.old_state = &mut old_state;
+        plane_entry.new_state = &mut new_state;
+        state.dev = dev;
+        state.planes = &mut plane_entry;
+        // SAFETY: `dev` is live and exclusively accessed during fixture setup.
+        unsafe {
+            (*dev).mode_config.num_total_plane = 1;
+            (*dev).mode_config.helper_private = core::ptr::addr_of!(MODE_HELPERS).cast_mut().cast();
+        }
+
+        // SAFETY: The device, state arrays, and callback tables above remain
+        // live through the synchronous commit attempt.
+        let result = unsafe { drm_atomic_helper_commit(dev, &mut state, false) };
+
+        assert_eq!(result, -tk_linux_kapi::config::EIO);
+        assert_eq!(PRE_SWAP_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(PREPARE_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(CLEANUP_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(TAIL_CALLS.load(Ordering::SeqCst), 0);
+        assert!(core::ptr::eq(plane.state, &old_state));
+        assert!(plane_entry.state_to_destroy.is_null());
+        assert!(core::ptr::eq(new_state.state, &state));
+
+        // SAFETY: setup_commit owns one fake commit reference and the new plane
+        // state owns the other; release both before dropping the fixture.
+        unsafe {
+            drm_crtc_commit_put(new_state.commit);
+            drm_crtc_commit_put(state.fake_commit);
+        }
+    }
+
+    unsafe extern "C" fn release_test_fence(_fence: *mut tk_linux_kapi::types::DmaFence) {}
+
+    static TEST_FENCE_OPS: tk_linux_kapi::types::DmaFenceOps = tk_linux_kapi::types::DmaFenceOps {
+        get_driver_name: None,
+        get_timeline_name: None,
+        enable_signaling: None,
+        signaled: None,
+        wait: None,
+        release: Some(release_test_fence),
+        set_deadline: None,
+    };
+
+    unsafe extern "C" fn discard_event_bytes(
+        _context: *mut c_void,
+        _bytes: *const c_void,
+        _len: usize,
+    ) -> isize {
+        0
+    }
+
+    #[test]
+    fn commit_error_fails_out_fence_cancels_event_and_completes_dependencies() {
+        let mut drm = TestDrm::new(0);
+        let dev = drm.ptr();
+        // SAFETY: These DRM file objects are zero-initialised C-layout test fixtures;
+        // the fields needed by event and poll paths are initialized immediately below.
+        let mut file: DrmFile = unsafe { zeroed() };
+        // SAFETY: `DrmMinor` is a zero-initialised C-layout test fixture.
+        let mut minor: DrmMinor = unsafe { zeroed() };
+        // SAFETY: `File` is a zero-initialised C-layout test fixture.
+        let mut filp: tk_linux_kapi::types::File = unsafe { zeroed() };
+        // SAFETY: All fixture pointers are live; the mutexes, spinlock, waitqueue,
+        // and lists are initialized before the event/file helpers access them.
+        unsafe {
+            tk_linux_kapi::mutex::mutex_init(core::ptr::addr_of_mut!((*dev).filelist_mutex));
+            tk_linux_kapi::locks::spin_lock_init(&mut (*dev).event_lock);
+            tk_linux_kapi::list::INIT_LIST_HEAD(core::ptr::addr_of_mut!((*dev).filelist));
+            tk_linux_kapi::list::INIT_LIST_HEAD(core::ptr::addr_of_mut!(file.lhead));
+            tk_linux_kapi::list::INIT_LIST_HEAD(core::ptr::addr_of_mut!(file.pending_event_list));
+            tk_linux_kapi::list::INIT_LIST_HEAD(core::ptr::addr_of_mut!(file.event_list));
+            tk_linux_kapi::wait::init_waitqueue_head(&mut file.event_wait);
+            tk_linux_kapi::mutex::mutex_init(core::ptr::addr_of_mut!(file.event_read_lock));
+            file.event_space = 4096;
+            minor.dev = dev;
+            file.minor = &mut minor;
+            file.filp = &mut filp;
+            filp.private_data = (&mut file as *mut DrmFile).cast();
+            tk_linux_kapi::list::list_add(
+                core::ptr::addr_of_mut!(file.lhead),
+                core::ptr::addr_of_mut!((*dev).filelist),
+            );
+        }
+
+        let pending = tk_linux_kapi::memory::kzalloc(
+            core::mem::size_of::<DrmPendingVblankEvent>(),
+            GFP_KERNEL,
+        )
+        .cast::<DrmPendingVblankEvent>();
+        let user_event = tk_linux_kapi::memory::kzalloc(core::mem::size_of::<DrmEvent>(), GFP_KERNEL)
+            .cast::<DrmEvent>();
+        assert!(!pending.is_null() && !user_event.is_null());
+        // SAFETY: The fence and DRM state types are zero-initialised C-layout fixtures;
+        // `init_commit` initializes the completion and reference-count fields before use.
+        let mut out_fence: tk_linux_kapi::types::DmaFence = unsafe { zeroed() };
+        // SAFETY: `DrmCrtc` is a zero-initialised C-layout fixture whose used fields are set below.
+        let mut crtc: DrmCrtc = unsafe { zeroed() };
+        // SAFETY: `DrmCrtcCommit` is initialized with `init_commit` before use.
+        let mut commit: DrmCrtcCommit = unsafe { zeroed() };
+        // SAFETY: CRTC-state fixtures are zero-initialised and their relevant pointers are set below.
+        let mut old_crtc_state: DrmCrtcState = unsafe { zeroed() };
+        // SAFETY: CRTC-state fixtures are zero-initialised and their relevant pointers are set below.
+        let mut new_crtc_state: DrmCrtcState = unsafe { zeroed() };
+        // SAFETY: The state-array entry is a zero-initialised C-layout fixture.
+        let mut crtc_entry: DrmCrtcsState = unsafe { zeroed() };
+        // SAFETY: The atomic state is a zero-initialised C-layout fixture.
+        let mut state: DrmAtomicCommit = unsafe { zeroed() };
+        let event_header = DrmEvent {
+            r#type: 0x8000_0000,
+            length: core::mem::size_of::<DrmEvent>() as u32,
+        };
+
+        // SAFETY: Allocated event objects, fence, DRM structs and file/device fixtures
+        // remain live and are wired together before any helper call below.
+        unsafe {
+            tk_linux_kapi::dma_fence::dma_fence_init(
+                &mut out_fence,
+                core::ptr::addr_of!(TEST_FENCE_OPS),
+                core::ptr::null_mut(),
+                0,
+                2,
+            );
+            assert!(!tk_linux_kapi::dma_fence::dma_fence_get(&mut out_fence).is_null());
+            (*user_event) = event_header;
+            (*pending).base.fence = &mut out_fence;
+            (*pending).base.file_priv = &mut file;
+            tk_linux_kapi::locks::spin_lock_init(&mut crtc.commit_lock);
+            tk_linux_kapi::list::INIT_LIST_HEAD(core::ptr::addr_of_mut!(crtc.commit_list));
+            init_commit(&mut commit, &mut crtc);
+            commit.event = pending;
+            new_crtc_state.commit = &mut commit;
+            new_crtc_state.event = pending;
+            crtc_entry.ptr = &mut crtc;
+            crtc_entry.old_state = &mut old_crtc_state;
+            crtc_entry.new_state = &mut new_crtc_state;
+            state.dev = dev;
+            state.crtcs = &mut crtc_entry;
+            (*dev).mode_config.num_crtc = 1;
+            tk_linux_kapi::list::list_add(
+                core::ptr::addr_of_mut!(commit.commit_entry),
+                core::ptr::addr_of_mut!(crtc.commit_list),
+            );
+            assert_eq!(
+                crate::drm_file_upstream::drm_event_reserve_init(
+                    dev,
+                    &mut file,
+                    &mut (*pending).base,
+                    user_event,
+                ),
+                0
+            );
+        }
+
+        // SAFETY: `state` owns a valid CRTC entry and event; the file, device,
+        // fence, and commit objects stay live throughout error completion.
+        unsafe { drm_atomic_helper_commit_error(&mut state, -tk_linux_kapi::config::EIO) };
+        // SAFETY: `commit_entry` was linked into `crtc.commit_list` and
+        // `commit_hw_done` installed the dependency in `old_crtc_state`.
+        unsafe { drm_atomic_helper_commit_cleanup_done(&mut state) };
+
+        // SAFETY: `dev` is the live device owned by the `TestDrm` fixture.
+        assert!(unsafe { (*dev).unplugged.load(Ordering::Acquire) });
+        assert!(commit.hw_done.is_done());
+        assert!(commit.flip_done.is_done());
+        assert!(commit.cleanup_done.is_done());
+        assert!(new_crtc_state.event.is_null());
+        assert!(commit.event.is_null());
+        assert_eq!(file.event_space, 4096);
+        assert!(tk_linux_kapi::list::list_empty(&file.pending_event_list));
+        assert!(tk_linux_kapi::list::list_empty(&file.event_list));
+        // SAFETY: `out_fence` remains live until the final put below.
+        assert_eq!(
+            unsafe { tk_linux_kapi::dma_fence::dma_fence_get_status(&mut out_fence) },
+            -tk_linux_kapi::config::EIO
+        );
+        // SAFETY: `out_fence` remains live until the final put below.
+        assert!(unsafe { tk_linux_kapi::dma_fence::dma_fence_is_signaled(&mut out_fence) });
+        // SAFETY: The file points at the live `DrmFile` fixture, and unplugged read/poll
+        // paths operate on the initialized event waitqueue and empty event lists.
+        let poll = unsafe { crate::drm_file_upstream::drm_poll(&mut filp, core::ptr::null_mut()) };
+        assert_ne!(poll & 0x0008, 0);
+        assert_ne!(poll & 0x0010, 0);
+        assert_eq!(poll & 0x0041, 0);
+        // SAFETY: `filp` points at the initialized fixture and the writer does not retain
+        // or dereference its null context or event-byte arguments.
+        assert_eq!(
+            unsafe {
+                crate::drm_file_upstream::drm_read_kernel_to(
+                    &mut filp,
+                    4096,
+                    core::ptr::null_mut(),
+                    discard_event_bytes,
+                )
+            },
+            -(crate::drm_drv_upstream::ENODEV as isize)
+        );
+
+        // SAFETY: The fence still has its original owned reference; the file remains
+        // linked to the live device list and is removed before the fixture is dropped.
+        unsafe {
+            tk_linux_kapi::dma_fence::dma_fence_put(&mut out_fence);
+            tk_linux_kapi::list::list_del(core::ptr::addr_of_mut!(file.lhead));
+        }
+    }
 }

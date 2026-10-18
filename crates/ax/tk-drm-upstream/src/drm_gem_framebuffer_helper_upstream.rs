@@ -98,7 +98,7 @@ pub unsafe fn drm_format_info_plane_width(
     if hsub == 0 {
         return width;
     }
-    (width + hsub - 1) / hsub
+    width.div_ceil(hsub)
 }
 
 #[inline]
@@ -117,7 +117,15 @@ pub unsafe fn drm_format_info_plane_height(
     if vsub == 0 {
         return height;
     }
-    (height + vsub - 1) / vsub
+    height.div_ceil(vsub)
+}
+
+#[inline]
+fn plane_required_size(height: u32, pitch: u32, min_pitch: u64, offset: u32) -> u64 {
+    u64::from(height.saturating_sub(1))
+        .saturating_mul(u64::from(pitch))
+        .saturating_add(min_pitch)
+        .saturating_add(u64::from(offset))
 }
 
 // upstream: drm_gem_framebuffer_helper.c drm_gem_fb_get_obj()
@@ -228,6 +236,9 @@ pub unsafe extern "C" fn drm_gem_fb_init_with_funcs(
         }
 
         let num_planes = (*info).num_planes as usize;
+        if num_planes > DRM_FORMAT_MAX_PLANES {
+            return -EINVAL;
+        }
         let mut objs: [*mut DrmGemObject; DRM_FORMAT_MAX_PLANES] =
             [core::ptr::null_mut(); DRM_FORMAT_MAX_PLANES];
 
@@ -251,11 +262,14 @@ pub unsafe extern "C" fn drm_gem_fb_init_with_funcs(
             }
             objs[i] = obj;
 
-            let min_size = (height.saturating_sub(1)) as usize * (*mode_cmd).pitches[i] as usize
-                + drm_format_info_min_pitch(info, i as i32, width) as usize
-                + (*mode_cmd).offsets[i] as usize;
+            let min_size = plane_required_size(
+                height,
+                (*mode_cmd).pitches[i],
+                drm_format_info_min_pitch(info, i as i32, width),
+                (*mode_cmd).offsets[i],
+            );
 
-            if (*obj).size < min_size {
+            if ((*obj).size as u64) < min_size {
                 drm_log_at(
                     DrmLogLevel::Debug,
                     "drm",
@@ -629,5 +643,50 @@ pub unsafe extern "C" fn drm_gem_fb_afbc_init(
         }
 
         0
+    }
+}
+
+#[cfg(test)]
+mod arithmetic_tests {
+    use super::{
+        drm_format_info_plane_height, drm_format_info_plane_width, plane_required_size,
+    };
+    use crate::drm_fourcc_types::DrmFormatInfo;
+
+    #[test]
+    fn framebuffer_plane_extent_rounds_up_without_u32_overflow() {
+        // SAFETY: `DrmFormatInfo` is a C layout description whose zeroed fields
+        // are valid for this focused geometry test; the subsampling divisors
+        // and plane count are explicitly set below.
+        let mut info: DrmFormatInfo = unsafe { core::mem::zeroed() };
+        info.num_planes = 2;
+        info.hsub = 2;
+        info.vsub = 2;
+        // SAFETY: `info` remains live and initialized for both helper calls.
+        unsafe {
+            assert_eq!(drm_format_info_plane_width(&info, u32::MAX, 1), 1 << 31);
+            assert_eq!(drm_format_info_plane_height(&info, u32::MAX, 1), 1 << 31);
+        }
+    }
+
+    #[test]
+    fn framebuffer_plane_required_size_handles_extreme_layouts() {
+        assert_eq!(plane_required_size(1080, 7680, 7680, 4096), 8_298_496);
+        // `drm_format_info_min_pitch()` returns u64, so this case must retain
+        // values above u32::MAX and saturate only when the full layout exceeds
+        // the representable byte count.
+        assert_eq!(
+            plane_required_size(
+                u32::MAX,
+                u32::MAX,
+                u64::from(u32::MAX) + 1,
+                u32::MAX,
+            ),
+            u64::MAX - u64::from(u32::MAX) + 1
+        );
+        assert_eq!(
+            plane_required_size(u32::MAX, u32::MAX, 13_000_000_000, u32::MAX),
+            u64::MAX
+        );
     }
 }

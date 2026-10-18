@@ -15,7 +15,7 @@ use crate::{
         dma_fence_allocate_private_stub, dma_fence_context_alloc, dma_fence_get,
         dma_fence_is_later, dma_fence_is_signaled, dma_fence_put, dma_fence_timestamp,
     },
-    dma_fence_array::{dma_fence_array_create, dma_fence_array_first, dma_fence_array_next},
+    dma_fence_array::{dma_fence_array_create_owned, dma_fence_array_first, dma_fence_array_next},
     dma_fence_chain::{dma_fence_chain_contained, dma_fence_chain_walk},
     types::DmaFence,
 };
@@ -132,8 +132,8 @@ pub unsafe fn dma_fence_dedup_array(fences: &mut [*mut DmaFence]) -> usize {
 /// # Safety
 /// Every input must be a live fence.
 pub unsafe fn dma_fence_unwrap_merge(fences: &[*mut DmaFence]) -> *mut DmaFence {
-    let mut count = 0usize;
-    let mut unsignaled: *mut DmaFence = ptr::null_mut();
+    let mut pending: Vec<*mut DmaFence> = Vec::new();
+    let mut out_of_memory = false;
     let mut timestamp: i64 = 0;
 
     for &head in fences {
@@ -141,9 +141,13 @@ pub unsafe fn dma_fence_unwrap_merge(fences: &[*mut DmaFence]) -> *mut DmaFence 
         let mut tmp = unsafe { dma_fence_unwrap_first(head, &mut cursor) };
         while !tmp.is_null() {
             if !unsafe { dma_fence_is_signaled(tmp) } {
-                unsafe { dma_fence_put(unsignaled) };
-                unsignaled = unsafe { dma_fence_get(tmp) };
-                count += 1;
+                if !out_of_memory {
+                    if pending.try_reserve(1).is_ok() {
+                        pending.push(unsafe { dma_fence_get(tmp) });
+                    } else {
+                        out_of_memory = true;
+                    }
+                }
             } else {
                 let t = unsafe { dma_fence_timestamp(tmp) };
                 if t > timestamp {
@@ -154,66 +158,26 @@ pub unsafe fn dma_fence_unwrap_merge(fences: &[*mut DmaFence]) -> *mut DmaFence 
         }
     }
 
-    // Without a pending fence return a private signaled fence with the
-    // timestamp of the last signaled one. A single pending fence is returned
-    // directly: it is the common case on many workloads.
-    if count == 0 {
-        return unsafe { dma_fence_allocate_private_stub(timestamp) };
-    } else if count == 1 {
-        return unsignaled;
-    }
-    unsafe { dma_fence_put(unsignaled) };
-
-    let mut array: Vec<*mut DmaFence> = Vec::new();
-    if array.try_reserve_exact(count).is_err() {
+    if out_of_memory {
+        for fence in pending.drain(..) {
+            // SAFETY: every entry is an owned reference retained by this call.
+            unsafe { dma_fence_put(fence) };
+        }
         return ptr::null_mut();
     }
-    count = 0;
-    for &head in fences {
-        let mut cursor = DmaFenceUnwrap::empty();
-        let mut tmp = unsafe { dma_fence_unwrap_first(head, &mut cursor) };
-        while !tmp.is_null() {
-            if !unsafe { dma_fence_is_signaled(tmp) } {
-                if count < array.capacity() {
-                    array.push(unsafe { dma_fence_get(tmp) });
-                    count += 1;
-                }
-            } else {
-                let t = unsafe { dma_fence_timestamp(tmp) };
-                if t > timestamp {
-                    timestamp = t;
-                }
-            }
-            tmp = unsafe { dma_fence_unwrap_next(&mut cursor) };
-        }
-    }
 
-    if count > 1 {
-        count = unsafe { dma_fence_dedup_array(&mut array) };
-        array.truncate(count);
-    }
-    if count > 1 {
-        let result = unsafe {
-            dma_fence_array_create(
-                count as u32,
-                array.as_mut_ptr(),
-                dma_fence_context_alloc(1),
-                1,
-            )
-        };
-        if result.is_null() {
-            for &fence in &array {
-                unsafe { dma_fence_put(fence) };
+    match pending.len() {
+        0 => unsafe { dma_fence_allocate_private_stub(timestamp) },
+        1 => pending[0],
+        _ => {
+            let kept = unsafe { dma_fence_dedup_array(&mut pending) };
+            pending.truncate(kept);
+            if kept == 1 {
+                return pending[0];
             }
-            return ptr::null_mut();
+            // SAFETY: the vector owns each reference; the helper transfers
+            // them and a kernel-allocated pointer buffer to the array.
+            unsafe { dma_fence_array_create_owned(pending, dma_fence_context_alloc(1), 1).cast() }
         }
-        // SAFETY: `base` is the first member of the newly created array.
-        return result.cast();
-    }
-    // Fast path: no pending fence (stub) or exactly one (returned as-is).
-    if count == 0 {
-        unsafe { dma_fence_allocate_private_stub(timestamp) }
-    } else {
-        array[0]
     }
 }

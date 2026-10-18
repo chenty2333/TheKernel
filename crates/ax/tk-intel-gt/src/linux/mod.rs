@@ -34,8 +34,7 @@ pub use tk_linux_kapi::mm;
 pub(crate) mod page;
 pub mod primitives;
 pub use tk_linux_kapi::drm_mm;
-// drm_vma now ported in tk-drm-upstream
-pub mod drm_core;
+// drm_vma and DRM core symbols are owned by tk-drm-upstream.
 pub use tk_linux_kapi::rbtree;
 pub use tk_linux_kapi::rcu;
 pub use tk_linux_kapi::scatterlist;

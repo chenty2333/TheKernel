@@ -8,33 +8,84 @@
 
 #![allow(non_snake_case, dead_code, unsafe_code)]
 
-use tk_linux_kapi::config::{EFAULT, EINVAL, ENOMEM, EOPNOTSUPP, GFP_KERNEL};
-use tk_linux_kapi::idr::{idr_get_next, Idr};
-use tk_linux_kapi::list::{list_add_tail, list_del, list_empty, INIT_LIST_HEAD};
-use tk_linux_kapi::memory::{kfree, kmalloc};
-use tk_linux_kapi::mm_native::{copy_from_user, copy_to_user};
+use core::ffi::{c_int, c_void};
+
 #[cfg(not(test))]
 use tk_linux_kapi::mutex::{mutex_lock, mutex_unlock};
+use tk_linux_kapi::{
+    config::{EFAULT, EINVAL, ENODEV, ENOMEM, EOPNOTSUPP, GFP_KERNEL},
+    idr::{Idr, idr_get_next},
+    kernel_services::ProviderSlot,
+    list::{INIT_LIST_HEAD, list_add_tail, list_del, list_empty},
+    memory::{kfree, kmalloc},
+    mm_native::{copy_from_user, copy_to_user},
+};
 #[cfg(test)]
 unsafe fn mutex_lock<M>(_mutex: M) {}
 #[cfg(test)]
 unsafe fn mutex_unlock<M>(_mutex: M) {}
 
-use crate::drm_auth_types::DrmMaster;
-use crate::drm_auth_upstream::{drm_file_get_master, drm_master_create, drm_master_get, drm_master_put};
-use crate::drm_crtc_types::DrmCrtc;
-use crate::drm_device_types::DrmDevice;
-use crate::drm_file_types::DrmFile;
-use crate::drm_mode_object_types::DrmModeObject;
-use crate::drm_mode_object_upstream::{
-    drm_core_check_feature, drm_mode_object_find, drm_mode_object_put,
-    idr_alloc, idr_destroy, idr_find, idr_init, idr_remove, DRIVER_MODESET,
+use crate::{
+    drm_auth_types::DrmMaster,
+    drm_auth_upstream::{drm_file_get_master, drm_master_create, drm_master_get, drm_master_put},
+    drm_crtc_types::DrmCrtc,
+    drm_device_types::DrmDevice,
+    drm_file_types::DrmFile,
+    drm_mode_object_types::DrmModeObject,
+    drm_mode_object_upstream::{
+        DRIVER_MODESET, drm_core_check_feature, drm_mode_object_find, drm_mode_object_put,
+        idr_alloc, idr_destroy, idr_find, idr_init, idr_remove,
+    },
+    uapi_drm_consts::{DRM_MODE_OBJECT_CONNECTOR, DRM_MODE_OBJECT_CRTC, DRM_MODE_OBJECT_PLANE},
+    uapi_drm_mode_types::{
+        DrmModeCreateLease, DrmModeGetLease, DrmModeListLessees, DrmModeRevokeLease,
+    },
 };
-use crate::uapi_drm_consts::{DRM_MODE_OBJECT_CONNECTOR, DRM_MODE_OBJECT_CRTC, DRM_MODE_OBJECT_PLANE};
-use crate::uapi_drm_mode_types::{DrmModeCreateLease, DrmModeGetLease, DrmModeListLessees, DrmModeRevokeLease};
 
 const EACCES: i32 = 13;
 const ENOENT: i32 = 2;
+const O_NONBLOCK: u32 = 0o4000;
+const O_CLOEXEC: u32 = 0o2000000;
+
+/// Sets up a newly opened lessee file before the provider publishes its fd.
+pub type LesseeFileSetup = unsafe extern "C" fn(file_priv: *mut DrmFile, ctx: *mut c_void);
+
+/// Kernel VFS service used to create an independent file description for a lease.
+#[repr(C)]
+pub struct LeaseFileOps {
+    /// Opens the DRM minor associated with `lessor_filp`, invokes `setup`
+    /// exactly once before publishing the descriptor, and honors `flags`.
+    /// On failure it must not invoke `setup` and returns a negative errno.
+    pub open_lessee_fd: unsafe extern "C" fn(
+        lessor_filp: *mut tk_linux_kapi::types::File,
+        flags: c_int,
+        setup: LesseeFileSetup,
+        ctx: *mut c_void,
+    ) -> c_int,
+}
+
+static LEASE_FILES: ProviderSlot<LeaseFileOps> = ProviderSlot::new();
+
+/// Installs the VFS adapter used to create lessee file descriptors.
+pub fn install_lease_file_ops(ops: &'static LeaseFileOps) -> Result<(), &'static str> {
+    LEASE_FILES.install(ops)
+}
+
+/// Assigns the newly created lessee master to the unpublished file.
+///
+/// # Safety
+/// The provider must call this once on a live, unpublished `DrmFile`, passing
+/// the referenced `DrmMaster` transferred by `drm_mode_create_lease_ioctl`.
+unsafe extern "C" fn adopt_lessee_master(file_priv: *mut DrmFile, ctx: *mut c_void) {
+    // SAFETY: The fd provider calls this before publishing `file_priv`; its
+    // current master reference is replaced by the transferred lessee master.
+    unsafe {
+        crate::drm_auth_upstream::drm_master_put(core::ptr::addr_of_mut!((*file_priv).master));
+        (*file_priv).master = ctx.cast();
+        (*file_priv).is_master = true;
+        (*file_priv).authenticated = true;
+    }
+}
 
 static mut DRM_LEASE_IDR_OBJECT: u64 = 1;
 
@@ -56,7 +107,11 @@ pub unsafe extern "C" fn drm_lease_owner(mut master: *mut DrmMaster) -> *mut Drm
 unsafe fn _drm_find_lessee(master: *mut DrmMaster, lessee_id: i32) -> *mut DrmMaster {
     unsafe {
         let owner = drm_lease_owner(master);
-        idr_find(core::ptr::addr_of_mut!((*owner).lessee_idr), lessee_id as core::ffi::c_ulong).cast()
+        idr_find(
+            core::ptr::addr_of_mut!((*owner).lessee_idr),
+            lessee_id as core::ffi::c_ulong,
+        )
+        .cast()
     }
 }
 
@@ -64,7 +119,11 @@ unsafe fn _drm_find_lessee(master: *mut DrmMaster, lessee_id: i32) -> *mut DrmMa
 unsafe fn _drm_lease_held_master(master: *mut DrmMaster, id: i32) -> bool {
     unsafe {
         if !(*master).lessor.is_null() {
-            return !idr_find(core::ptr::addr_of_mut!((*master).leases), id as core::ffi::c_ulong).is_null();
+            return !idr_find(
+                core::ptr::addr_of_mut!((*master).leases),
+                id as core::ffi::c_ulong,
+            )
+            .is_null();
         }
         true
     }
@@ -75,7 +134,10 @@ unsafe fn _drm_has_leased(master: *mut DrmMaster, id: i32) -> bool {
     unsafe {
         let mut cur = (*master).lessees.next;
         while cur != core::ptr::addr_of_mut!((*master).lessees) {
-            let lessee = cur.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmMaster, lessee_list)).cast::<DrmMaster>();
+            let lessee = cur
+                .cast::<u8>()
+                .wrapping_sub(core::mem::offset_of!(DrmMaster, lessee_list))
+                .cast::<DrmMaster>();
             if _drm_lease_held_master(lessee, id) {
                 return true;
             }
@@ -117,9 +179,13 @@ pub unsafe extern "C" fn drm_lease_held(file_priv: *mut DrmFile, id: i32) -> boo
             drm_master_put(core::ptr::addr_of_mut!(master));
             return true;
         }
-        mutex_lock(core::ptr::addr_of_mut!((*(*master).dev).mode_config.idr_mutex));
+        mutex_lock(core::ptr::addr_of_mut!(
+            (*(*master).dev).mode_config.idr_mutex
+        ));
         let ret = _drm_lease_held_master(master, id);
-        mutex_unlock(core::ptr::addr_of_mut!((*(*master).dev).mode_config.idr_mutex));
+        mutex_unlock(core::ptr::addr_of_mut!(
+            (*(*master).dev).mode_config.idr_mutex
+        ));
         drm_master_put(core::ptr::addr_of_mut!(master));
         ret
     }
@@ -149,7 +215,10 @@ pub unsafe extern "C" fn drm_lease_filter_crtcs(file_priv: *mut DrmFile, crtcs_i
         mutex_lock(core::ptr::addr_of_mut!((*dev).mode_config.idr_mutex));
         let mut cur = (*dev).mode_config.crtc_list.next;
         while cur != core::ptr::addr_of_mut!((*dev).mode_config.crtc_list) {
-            let crtc = cur.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmCrtc, head)).cast::<DrmCrtc>();
+            let crtc = cur
+                .cast::<u8>()
+                .wrapping_sub(core::mem::offset_of!(DrmCrtc, head))
+                .cast::<DrmCrtc>();
             if _drm_lease_held_master(master, (*crtc).base.id as i32) {
                 let mask_in = 1u32 << count_in;
                 if (crtcs_in & mask_in) != 0 {
@@ -217,11 +286,18 @@ pub unsafe extern "C" fn drm_lease_destroy(master: *mut DrmMaster) {
         if lessor.is_null() {
             return;
         }
-        mutex_lock(core::ptr::addr_of_mut!((*(*master).dev).mode_config.idr_mutex));
+        mutex_lock(core::ptr::addr_of_mut!(
+            (*(*master).dev).mode_config.idr_mutex
+        ));
         let owner = drm_lease_owner(lessor);
-        idr_remove(core::ptr::addr_of_mut!((*owner).lessee_idr), (*master).lessee_id);
+        idr_remove(
+            core::ptr::addr_of_mut!((*owner).lessee_idr),
+            (*master).lessee_id,
+        );
         list_del(core::ptr::addr_of_mut!((*master).lessee_list));
-        mutex_unlock(core::ptr::addr_of_mut!((*(*master).dev).mode_config.idr_mutex));
+        mutex_unlock(core::ptr::addr_of_mut!(
+            (*(*master).dev).mode_config.idr_mutex
+        ));
 
         drm_master_put(core::ptr::addr_of_mut!(lessor));
         (*master).lessor = core::ptr::null_mut();
@@ -233,7 +309,10 @@ unsafe fn _drm_lease_revoke(top: *mut DrmMaster) {
     unsafe {
         let mut cur = (*top).lessees.next;
         while cur != core::ptr::addr_of_mut!((*top).lessees) {
-            let lessee = cur.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmMaster, lessee_list)).cast::<DrmMaster>();
+            let lessee = cur
+                .cast::<u8>()
+                .wrapping_sub(core::mem::offset_of!(DrmMaster, lessee_list))
+                .cast::<DrmMaster>();
             _drm_lease_revoke(lessee);
             cur = (*cur).next;
         }
@@ -274,7 +353,7 @@ unsafe fn validate_lease(
         match unsafe { (*obj).r#type } {
             DRM_MODE_OBJECT_CRTC => has_crtc = true,
             DRM_MODE_OBJECT_CONNECTOR => has_connector = true,
-            DRM_MODE_OBJECT_PLANE => {},
+            DRM_MODE_OBJECT_PLANE => {}
             _ => return -EINVAL,
         }
     }
@@ -293,7 +372,8 @@ unsafe fn fill_object_idr(
     object_ids: *const u32,
 ) -> i32 {
     unsafe {
-        let mut objects: alloc::vec::Vec<*mut DrmModeObject> = alloc::vec::Vec::with_capacity(object_count);
+        let mut objects: alloc::vec::Vec<*mut DrmModeObject> =
+            alloc::vec::Vec::with_capacity(object_count);
         for o in 0..object_count {
             let object_id = *object_ids.add(o);
             let obj = drm_mode_object_find(dev, lessor_priv, object_id, 0);
@@ -305,8 +385,9 @@ unsafe fn fill_object_idr(
                 }
                 return -ENOENT;
             }
-            if !_drm_lease_held_master((*lessor_priv).master, object_id as i32) ||
-               _drm_has_leased((*lessor_priv).master, object_id as i32) {
+            if !_drm_lease_held_master((*lessor_priv).master, object_id as i32)
+                || _drm_has_leased((*lessor_priv).master, object_id as i32)
+            {
                 drm_mode_object_put(obj);
                 for &done_obj in &objects {
                     if !done_obj.is_null() {
@@ -318,7 +399,12 @@ unsafe fn fill_object_idr(
             objects.push(obj);
         }
 
-        let ret = validate_lease(dev, object_count as i32, objects.as_mut_ptr(), (*lessor_priv).universal_planes);
+        let ret = validate_lease(
+            dev,
+            object_count as i32,
+            objects.as_mut_ptr(),
+            (*lessor_priv).universal_planes,
+        );
         if ret != 0 {
             for &done_obj in &objects {
                 drm_mode_object_put(done_obj);
@@ -328,7 +414,12 @@ unsafe fn fill_object_idr(
 
         for (o, &_obj) in objects.iter().enumerate() {
             let object_id = *object_ids.add(o);
-            let ret = idr_alloc(leases, core::ptr::addr_of_mut!(DRM_LEASE_IDR_OBJECT).cast(), object_id as i32, object_id as i32 + 1);
+            let ret = idr_alloc(
+                leases,
+                core::ptr::addr_of_mut!(DRM_LEASE_IDR_OBJECT).cast(),
+                object_id as i32,
+                object_id as i32 + 1,
+            );
             if ret < 0 {
                 for &done_obj in &objects {
                     drm_mode_object_put(done_obj);
@@ -356,6 +447,10 @@ pub unsafe extern "C" fn drm_mode_create_lease_ioctl(
         if !drm_core_check_feature(dev, DRIVER_MODESET) {
             return -EOPNOTSUPP;
         }
+        let flags = (*cl).flags;
+        if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
+            return -EINVAL;
+        }
         let mut lessor = drm_file_get_master(lessor_priv);
         if lessor.is_null() {
             return -EINVAL;
@@ -370,7 +465,9 @@ pub unsafe extern "C" fn drm_mode_create_lease_ioctl(
         idr_init(core::ptr::addr_of_mut!(leases));
 
         if object_count != 0 {
-            let alloc_size = object_count.checked_mul(core::mem::size_of::<u32>()).unwrap_or(0);
+            let alloc_size = object_count
+                .checked_mul(core::mem::size_of::<u32>())
+                .unwrap_or(0);
             if alloc_size == 0 {
                 idr_destroy(core::ptr::addr_of_mut!(leases));
                 drm_master_put(core::ptr::addr_of_mut!(lessor));
@@ -382,13 +479,24 @@ pub unsafe extern "C" fn drm_mode_create_lease_ioctl(
                 drm_master_put(core::ptr::addr_of_mut!(lessor));
                 return -ENOMEM;
             }
-            if copy_from_user(object_ids.cast(), ((*cl).object_ids as usize) as *const core::ffi::c_void, alloc_size) != 0 {
+            if copy_from_user(
+                object_ids.cast(),
+                ((*cl).object_ids as usize) as *const core::ffi::c_void,
+                alloc_size,
+            ) != 0
+            {
                 kfree(object_ids.cast::<core::ffi::c_void>());
                 idr_destroy(core::ptr::addr_of_mut!(leases));
                 drm_master_put(core::ptr::addr_of_mut!(lessor));
                 return -EFAULT;
             }
-            let ret = fill_object_idr(dev, lessor_priv, core::ptr::addr_of_mut!(leases), object_count, object_ids);
+            let ret = fill_object_idr(
+                dev,
+                lessor_priv,
+                core::ptr::addr_of_mut!(leases),
+                object_count,
+                object_ids,
+            );
             kfree(object_ids.cast::<core::ffi::c_void>());
             if ret != 0 {
                 idr_destroy(core::ptr::addr_of_mut!(leases));
@@ -404,8 +512,27 @@ pub unsafe extern "C" fn drm_mode_create_lease_ioctl(
             return -ENOMEM;
         }
 
-        (*cl).lessee_id = (*lessee).lessee_id as u32;
-        (*cl).fd = 0;
+        let lessee_id = (*lessee).lessee_id as u32;
+        let fd = match LEASE_FILES.get() {
+            Some(ops) => (ops.open_lessee_fd)(
+                (*lessor_priv).filp,
+                flags as c_int,
+                adopt_lessee_master,
+                lessee.cast(),
+            ),
+            None => -ENODEV,
+        };
+        if fd < 0 {
+            // The provider contract guarantees setup did not run on failure,
+            // so this reference still owns and tears down the new lease.
+            let mut lessee = lessee;
+            drm_master_put(core::ptr::addr_of_mut!(lessee));
+            drm_master_put(core::ptr::addr_of_mut!(lessor));
+            return fd;
+        }
+
+        (*cl).lessee_id = lessee_id;
+        (*cl).fd = fd as u32;
 
         drm_master_put(core::ptr::addr_of_mut!(lessor));
         0
@@ -437,13 +564,21 @@ pub unsafe extern "C" fn drm_mode_list_lessees_ioctl(
         let mut ret = 0;
 
         while cur != core::ptr::addr_of_mut!((*lessor).lessees) {
-            let lessee = cur.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmMaster, lessee_list)).cast::<DrmMaster>();
+            let lessee = cur
+                .cast::<u8>()
+                .wrapping_sub(core::mem::offset_of!(DrmMaster, lessee_list))
+                .cast::<DrmMaster>();
             let mut dummy = 0;
             let first = idr_get_next(core::ptr::addr_of_mut!((*lessee).leases).cast(), &mut dummy);
             if !first.is_null() {
                 if count_lessees > count && !lessee_ids.is_null() {
                     let id = (*lessee).lessee_id as u32;
-                    if copy_to_user(lessee_ids.add(count as usize).cast(), core::ptr::addr_of!(id).cast(), core::mem::size_of::<u32>()) != 0 {
+                    if copy_to_user(
+                        lessee_ids.add(count as usize).cast(),
+                        core::ptr::addr_of!(id).cast(),
+                        core::mem::size_of::<u32>(),
+                    ) != 0
+                    {
                         ret = -EFAULT;
                         break;
                     }
@@ -497,7 +632,12 @@ pub unsafe extern "C" fn drm_mode_get_lease_ioctl(
             }
             if count_objects > count && !object_ids.is_null() {
                 let id = next as u32;
-                if copy_to_user(object_ids.add(count as usize).cast(), core::ptr::addr_of!(id).cast(), core::mem::size_of::<u32>()) != 0 {
+                if copy_to_user(
+                    object_ids.add(count as usize).cast(),
+                    core::ptr::addr_of!(id).cast(),
+                    core::mem::size_of::<u32>(),
+                ) != 0
+                {
                     ret = -EFAULT;
                     break;
                 }
@@ -553,9 +693,11 @@ pub unsafe extern "C" fn drm_mode_revoke_lease_ioctl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drm_drv_types::DrmDriver;
-    use crate::drm_drv_upstream::{drm_dev_alloc, drm_dev_put};
-    use crate::drm_file_upstream::{drm_file_alloc, drm_file_free};
+    use crate::{
+        drm_drv_types::DrmDriver,
+        drm_drv_upstream::{drm_dev_alloc, drm_dev_put},
+        drm_file_upstream::{drm_file_alloc, drm_file_free},
+    };
 
     #[test]
     fn test_lease_owner_and_held() {

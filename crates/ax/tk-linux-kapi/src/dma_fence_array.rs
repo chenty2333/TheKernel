@@ -6,6 +6,7 @@
 
 #![allow(unsafe_code)]
 
+use alloc::vec::Vec;
 use core::{
     mem::{ManuallyDrop, MaybeUninit},
     ptr,
@@ -14,8 +15,8 @@ use core::{
 
 use crate::{
     dma_fence::{
-        DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT, dma_fence_default_wait, dma_fence_get, dma_fence_put,
-        dma_fence_set_deadline,
+        DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT, DMA_FENCE_FLAG_INLINE_LOCK_BIT, dma_fence_default_wait,
+        dma_fence_get, dma_fence_put, dma_fence_set_deadline,
     },
     memory::kref_init,
     types::{AtomicT, DmaFence, DmaFenceCb, DmaFenceOps, DmaFenceTimestamp, IrqWork},
@@ -61,7 +62,7 @@ unsafe fn dma_fence_container_init(
         );
         (*fence).context = context;
         (*fence).seqno = seqno;
-        (*fence).flags = 0;
+        (*fence).flags = 1 << DMA_FENCE_FLAG_INLINE_LOCK_BIT;
         kref_init(ptr::addr_of_mut!((*fence).refcount));
         (*fence).error = 0;
     }
@@ -155,6 +156,75 @@ pub unsafe extern "C" fn dma_fence_array_create(
             u64::from(seqno),
         );
         (*array).base.error = DMA_FENCE_ARRAY_PENDING_ERROR;
+    }
+    array
+}
+
+/// Release the references in a failed owned-array construction.
+///
+/// # Safety
+/// Every entry must be a live fence reference owned by this call.
+unsafe fn put_all(fences: &[*mut DmaFence]) {
+    for &fence in fences {
+        // SAFETY: each entry is one owned reference transferred to this helper.
+        unsafe { dma_fence_put(fence) };
+    }
+}
+
+/// Build an array from a vector of owned fence references.
+///
+/// `dma_fence_array_create()` takes ownership of a kernel-allocated pointer
+/// buffer. A Rust `Vec` buffer cannot be transferred to it: the vector would
+/// free that buffer on return, while the array later frees it with `kfree`.
+/// This helper copies the references into a matching allocation and either
+/// transfers both buffer and references to the array, or releases all of them
+/// on failure.
+///
+/// # Safety
+/// Every entry must be a live fence reference owned by the caller.
+pub unsafe fn dma_fence_array_create_owned(
+    fences: Vec<*mut DmaFence>,
+    context: u64,
+    seqno: u32,
+) -> *mut DmaFenceArray {
+    let Ok(num_fences) = u32::try_from(fences.len()) else {
+        // SAFETY: ownership of all references was transferred to this function.
+        unsafe { put_all(&fences) };
+        return ptr::null_mut();
+    };
+    if num_fences == 0 {
+        return ptr::null_mut();
+    }
+
+    // SAFETY: allocates the kernel-owned pointer buffer required by the public
+    // array constructor; a null allocation is handled before it is used.
+    let storage = unsafe {
+        crate::memory::kmalloc_array(
+            fences.len(),
+            core::mem::size_of::<*mut DmaFence>(),
+            crate::config::GFP_KERNEL,
+        )
+        .cast::<*mut DmaFence>()
+    };
+    if storage.is_null() {
+        // SAFETY: the caller transferred the references to this function.
+        unsafe { put_all(&fences) };
+        return ptr::null_mut();
+    }
+    // SAFETY: `storage` holds `fences.len()` pointers and is disjoint from the
+    // still-live `Vec` allocation.
+    unsafe { ptr::copy_nonoverlapping(fences.as_ptr(), storage, fences.len()) };
+
+    // SAFETY: `storage` is a kernel allocation containing the owned references
+    // required by the array constructor.
+    let array = unsafe { dma_fence_array_create(num_fences, storage, context, seqno) };
+    if array.is_null() {
+        // SAFETY: array creation failed before consuming either allocation or
+        // references, so this function still owns both.
+        unsafe {
+            crate::memory::kfree(storage.cast::<core::ffi::c_void>());
+            put_all(&fences);
+        }
     }
     array
 }
@@ -288,3 +358,67 @@ const _: [(); 32] = [(); core::mem::size_of::<DmaFenceArrayCallback>()];
 const _: [(); 112] = [(); core::mem::size_of::<DmaFenceArray>()];
 const _: [(); 80] = [(); core::mem::offset_of!(DmaFenceArray, work)];
 const _: [(); 112] = [(); core::mem::offset_of!(DmaFenceArray, callbacks)];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dma_fence::{
+        dma_fence_init, dma_fence_is_signaled, dma_fence_put, dma_fence_signal,
+    };
+
+    static TEST_OPS: DmaFenceOps = DmaFenceOps {
+        get_driver_name: None,
+        get_timeline_name: None,
+        enable_signaling: None,
+        signaled: None,
+        wait: None,
+        release: None,
+        set_deadline: None,
+    };
+
+    #[test]
+    fn owned_array_copies_vec_storage_to_kernel_allocation() {
+        let _scheduler = crate::test_support::scheduler_context();
+        // SAFETY: `dma_fence_init` initializes this C-layout record before use.
+        let mut fence = unsafe { core::mem::zeroed::<DmaFence>() };
+        // SAFETY: the local fence and static ops table remain live throughout
+        // the test; a null lock requests the embedded lock.
+        unsafe {
+            dma_fence_init(
+                &mut fence,
+                ptr::addr_of!(TEST_OPS),
+                ptr::null_mut(),
+                4,
+                5,
+            )
+        };
+        // SAFETY: the initialized local fence has one owned reference.
+        let member = dma_fence_get(&mut fence);
+        let members = alloc::vec![member];
+        let vec_storage = members.as_ptr() as *mut *mut DmaFence;
+
+        // SAFETY: `members` transfers its live fence reference to the array.
+        let array = unsafe { dma_fence_array_create_owned(members, 6, 7) };
+        assert!(!array.is_null());
+        // The array must not retain a Vec allocation that is freed on return.
+        assert_ne!(unsafe { (*array).fences }, vec_storage);
+        assert_eq!(unsafe { *(*array).fences }, &mut fence as *mut DmaFence);
+        assert_eq!(unsafe { (*array).num_fences }, 1);
+
+        // Exercise the composite signaled hook, then release the array and
+        // verify it drops the member reference and its owned pointer buffer.
+        let base = unsafe { ptr::addr_of_mut!((*array).base) };
+        // SAFETY: both fences are initialized and the array retains its member.
+        assert!(!unsafe { dma_fence_is_signaled(base) });
+        // SAFETY: the initialized member has an inline lock and no other owner
+        // mutates it in this single-threaded test.
+        unsafe { dma_fence_signal(&mut fence) };
+        // SAFETY: the live array observes that its only member completed and
+        // publishes its own completion before returning true.
+        assert!(unsafe { dma_fence_is_signaled(base) });
+        // SAFETY: the array's initial reference is still owned by this test;
+        // its release hook frees the member buffer and drops the extra ref.
+        unsafe { dma_fence_put(base) };
+        assert_eq!(fence.refcount.refcount.refs.counter, 1);
+    }
+}

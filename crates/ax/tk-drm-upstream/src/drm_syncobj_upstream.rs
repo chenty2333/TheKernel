@@ -13,18 +13,20 @@ use core::{
     ffi::{c_char, c_int, c_long, c_void},
     mem::{MaybeUninit, size_of},
     ptr,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use tk_linux_kapi::{
     config::{EFAULT, EINVAL, ENOENT, ENOMEM, EOPNOTSUPP, ERESTARTSYS, ETIME, GFP_KERNEL},
-    shmem::{File, FileOperations, Inode, fput_file},
-    sync_file::{sync_file_create, sync_file_get_fence},
     locks::spin_lock_init,
     memory::{kfree, kmalloc},
     mm_native::{copy_from_user, copy_to_user},
-    types::{DmaFence, DmaFenceChain, Spinlock, WaitQueueHead},
-    wait::{init_waitqueue_head, wake_up_all},
+    shmem::{File, FileOperations, Inode, fput_file},
+    sync_file::{sync_file_create, sync_file_get_fence},
+    types::{
+        DmaFence, DmaFenceCb, DmaFenceChain, ListHead, Spinlock, WaitQueueEntry, WaitQueueHead,
+    },
+    wait::{add_wait_queue, init_waitqueue_head, remove_wait_queue, wake_up_all},
 };
 
 use crate::{
@@ -71,7 +73,7 @@ pub(crate) mod test_file_ops {
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
     static FD_TABLE: Mutex<Vec<(c_int, usize)>> = Mutex::new(Vec::new());
-    // The pending dma-buf test shim maps only the first 256 descriptor slots.
+    // Deterministic descriptor values keep hosted file-table tests reproducible.
     static NEXT_FD: AtomicI32 = AtomicI32::new(10);
     static NEXT_FD_ERROR: AtomicI32 = AtomicI32::new(0);
     static ANON_INODE_ERROR: AtomicI32 = AtomicI32::new(0);
@@ -544,12 +546,13 @@ fn create_software_fence(signaled: bool) -> Option<*mut DmaFence> {
     }
     unsafe {
         ptr::write_bytes(fence.cast::<u8>(), 0, size_of::<DmaFence>());
-        let lock = ptr::addr_of_mut!((*fence).lock.inline_lock);
-        spin_lock_init(&mut *lock);
+        // A null external lock selects the in-place lock. Passing the
+        // union's own inline address as an external lock overwrites that lock
+        // with its pointer and makes every subsequent lock acquisition hang.
         dma_fence_init(
             fence,
             &SOFTWARE_FENCE_OPS,
-            lock,
+            ptr::null_mut(),
             dma_fence_context_alloc(1),
             NEXT_FENCE_SEQNO.fetch_add(1, Ordering::Relaxed) as u64,
         );
@@ -606,41 +609,15 @@ unsafe fn init_chain(
     if chain.is_null() || fence.is_null() {
         return -EINVAL;
     }
-    unsafe { ptr::write_bytes(chain.cast::<u8>(), 0, size_of::<DmaFenceChain>()) };
-    let previous = previous.unwrap_or(ptr::null_mut());
-    let mut previous_point = 0;
-    let (context, seqno) = if previous.is_null() {
-        (unsafe { dma_fence_context_alloc(1) }, point)
-    } else if unsafe { (*previous).ops == ptr::addr_of!(dma_fence_chain_ops).cast() } {
-        previous_point = unsafe { (*previous).seqno };
-        if point > previous_point {
-            (unsafe { (*previous).context }, point)
-        } else {
-            (
-                unsafe { dma_fence_context_alloc(1) },
-                point.max(previous_point),
-            )
-        }
-    } else {
-        (unsafe { dma_fence_context_alloc(1) }, point)
-    };
+    // SAFETY: the caller owns uninitialized chain storage. The common KAPI
+    // initializer consumes its own references to the previous and child
+    // fences, initializes the inline lock, and marks 64-bit sequence numbers.
     unsafe {
-        let lock = ptr::addr_of_mut!((*chain).base.lock.inline_lock);
-        spin_lock_init(&mut *lock);
-        dma_fence_init(
-            ptr::addr_of_mut!((*chain).base),
-            &dma_fence_chain_ops,
-            lock,
-            context,
-            seqno,
+        ptr::write_bytes(chain.cast::<u8>(), 0, size_of::<DmaFenceChain>());
+        let previous = previous.map_or(ptr::null_mut(), |previous| dma_fence_get(previous));
+        tk_linux_kapi::dma_fence_chain::dma_fence_chain_init(
+            chain, previous, dma_fence_get(fence), point,
         );
-        (*chain).prev = if previous.is_null() {
-            ptr::null_mut()
-        } else {
-            dma_fence_get(previous)
-        };
-        (*chain).prev_seqno = previous_point;
-        (*chain).fence = dma_fence_get(fence);
     }
     0
 }
@@ -899,10 +876,7 @@ pub unsafe extern "C" fn drm_syncobj_fence_get(syncobj: *mut DrmSyncobj) -> *mut
 
 /// Linux `drm_syncobj_replace_fence()`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_syncobj_replace_fence(
-    syncobj: *mut DrmSyncobj,
-    fence: *mut DmaFence,
-) {
+pub unsafe extern "C" fn drm_syncobj_replace_fence(syncobj: *mut DrmSyncobj, fence: *mut DmaFence) {
     if syncobj.is_null() {
         return;
     }
@@ -1229,6 +1203,233 @@ fn chain_query_point(fence: Option<FenceRef>, last_submitted: bool) -> u64 {
     }
 }
 
+/// Per-call notification target shared by syncobj submission waiters and
+/// dma-fence completion callbacks. The wait queue has stable Arc-owned storage
+/// so a concurrently executing fence callback cannot outlive the queue.
+struct SyncobjWaitNotifier {
+    woken: AtomicBool,
+    wait: UnsafeCell<WaitQueueHead>,
+}
+
+impl SyncobjWaitNotifier {
+    fn new() -> Arc<Self> {
+        let notifier = Arc::new(Self {
+            woken: AtomicBool::new(false),
+            // SAFETY: the zeroed queue is initialized below before publication.
+            wait: UnsafeCell::new(unsafe { MaybeUninit::zeroed().assume_init() }),
+        });
+        // SAFETY: this Arc has not been shared. Initialize the intrusive list
+        // only at its final address, never on a stack value subsequently moved
+        // into the allocation.
+        init_waitqueue_head(unsafe { &mut *notifier.wait.get() });
+        notifier
+    }
+
+    fn notify(&self) {
+        self.woken.store(true, Ordering::Release);
+        // SAFETY: WaitQueueHead operations serialize list mutation with the
+        // embedded spinlock; the Arc keeps storage alive during callbacks.
+        unsafe { wake_up_all(&mut *self.wait.get()) };
+    }
+}
+
+// SAFETY: The notifier is shared across callback contexts through Arc; its
+// atomic flag is thread-safe and the queue API serializes queue mutations.
+unsafe impl Send for SyncobjWaitNotifier {}
+// SAFETY: Concurrent queue operations are mediated by the wait-queue spinlock,
+// and the readiness flag is atomic.
+unsafe impl Sync for SyncobjWaitNotifier {}
+
+struct SyncobjWaitQueueRegistration {
+    head: *mut WaitQueueHead,
+    entry: WaitQueueEntry,
+    _notifier: Arc<SyncobjWaitNotifier>,
+}
+
+struct SyncobjWaitQueueRegistrations(Vec<SyncobjWaitQueueRegistration>);
+
+impl SyncobjWaitQueueRegistrations {
+    fn new(objects: &[Arc<DrmSyncobj>], notifier: &Arc<SyncobjWaitNotifier>) -> Result<Self, i32> {
+        let mut registrations = Vec::new();
+        registrations
+            .try_reserve_exact(objects.len())
+            .map_err(|_| -ENOMEM)?;
+        for object in objects {
+            let head = object.wait.get();
+            let mut entry = WaitQueueEntry {
+                flags: 0,
+                private: Arc::as_ptr(notifier).cast_mut().cast(),
+                func: Some(syncobj_submit_waiter_callback),
+                entry: ListHead {
+                    next: ptr::null_mut(),
+                    prev: ptr::null_mut(),
+                },
+            };
+            // SAFETY: Initializes the entry's embedded list node before it is
+            // linked into the live syncobj wait queue.
+            unsafe { tk_linux_kapi::list::INIT_LIST_HEAD(ptr::addr_of_mut!(entry.entry)) };
+            registrations.push(SyncobjWaitQueueRegistration {
+                head,
+                entry,
+                _notifier: Arc::clone(notifier),
+            });
+            let registration = registrations
+                .last_mut()
+                .expect("waiter was pushed immediately before registration");
+            // SAFETY: `head` is the initialized wait queue embedded in a live
+            // Arc-owned syncobj; this registration's entry remains stable
+            // because the vector reserved space for all objects up front.
+            unsafe { add_wait_queue(&mut *head, &mut registration.entry) };
+        }
+        Ok(Self(registrations))
+    }
+}
+
+impl Drop for SyncobjWaitQueueRegistrations {
+    fn drop(&mut self) {
+        for registration in &mut self.0 {
+            // SAFETY: The entry was registered on this live syncobj queue;
+            // remove_wait_queue unlinks it while holding the queue lock.
+            unsafe { remove_wait_queue(&mut *registration.head, &mut registration.entry) };
+        }
+    }
+}
+
+unsafe extern "C" fn syncobj_submit_waiter_callback(
+    entry: *mut WaitQueueEntry,
+    _mode: u32,
+    _sync: i32,
+    _key: *mut c_void,
+) -> i32 {
+    if entry.is_null() {
+        return 0;
+    }
+    // SAFETY: `entry.private` is the notifier pointer installed when this
+    // entry was registered, and the registration retains its Arc until it is
+    // removed from the source wait queue.
+    let notifier = unsafe { (*entry).private.cast::<SyncobjWaitNotifier>() };
+    if notifier.is_null() {
+        return 0;
+    }
+    // SAFETY: The registration retains the notifier while this callback runs.
+    unsafe { &*notifier }.notify();
+    1
+}
+
+#[repr(C)]
+struct SyncobjFenceWaiter {
+    callback: DmaFenceCb,
+    notifier: Arc<SyncobjWaitNotifier>,
+}
+
+// SAFETY: The fence callback's owner is retained by Arc until it runs or is
+// removed. Its only cross-thread state is the thread-safe notifier Arc.
+unsafe impl Send for SyncobjFenceWaiter {}
+// SAFETY: Concurrent access is limited to the callback list under the fence
+// lock and the immutable notifier Arc.
+unsafe impl Sync for SyncobjFenceWaiter {}
+
+struct FenceCallbackRegistration {
+    fence: FenceRef,
+    waiter: Arc<SyncobjFenceWaiter>,
+    callback_owner: *const SyncobjFenceWaiter,
+}
+
+struct FenceCallbackRegistrations(Vec<FenceCallbackRegistration>);
+
+impl FenceCallbackRegistrations {
+    fn new(fences: &[(usize, FenceRef)], notifier: &Arc<SyncobjWaitNotifier>) -> Result<Self, i32> {
+        // Keep the RAII wrapper active during construction as well, so an
+        // allocation or callback-registration failure unregisters earlier callbacks.
+        let mut registrations = Self(Vec::new());
+        registrations
+            .0
+            .try_reserve_exact(fences.len())
+            .map_err(|_| -ENOMEM)?;
+        for (_, fence) in fences {
+            // SAFETY: `fence` owns a reference to a valid DmaFence.
+            if unsafe { dma_fence_is_signaled(fence.0) } {
+                continue;
+            }
+            let waiter = Arc::new(SyncobjFenceWaiter {
+                callback: DmaFenceCb {
+                    node: ListHead {
+                        next: ptr::null_mut(),
+                        prev: ptr::null_mut(),
+                    },
+                    func: None,
+                },
+                notifier: Arc::clone(notifier),
+            });
+            let callback_owner = Arc::into_raw(Arc::clone(&waiter));
+            // SAFETY: The callback is the first repr(C) field and the retained
+            // raw Arc owns its storage until signal or successful removal.
+            let callback = unsafe { ptr::addr_of_mut!((*callback_owner.cast_mut()).callback) };
+            // SAFETY: `fence` owns a live fence reference and `callback` points
+            // to the initialized callback field of the retained Arc allocation.
+            let result = unsafe {
+                tk_linux_kapi::dma_fence::dma_fence_add_callback(
+                    fence.0,
+                    callback,
+                    syncobj_fence_waiter_callback,
+                )
+            };
+            if result == 0 {
+                registrations.0.push(FenceCallbackRegistration {
+                    fence: fence.clone(),
+                    waiter,
+                    callback_owner,
+                });
+            } else {
+                // SAFETY: A failed registration did not publish the callback.
+                unsafe { drop(Arc::from_raw(callback_owner)) };
+                if result != -ENOENT {
+                    return Err(result);
+                }
+            }
+        }
+        Ok(registrations)
+    }
+}
+
+impl Drop for FenceCallbackRegistrations {
+    fn drop(&mut self) {
+        for registration in &mut self.0 {
+            // SAFETY: `registration.waiter` keeps the callback storage alive
+            // while it is removed from the referenced fence.
+            let callback = unsafe {
+                ptr::addr_of_mut!((*Arc::as_ptr(&registration.waiter).cast_mut()).callback)
+            };
+            // SAFETY: The fence and callback pointers come from the successful
+            // registration above and remain live for this removal.
+            let removed = unsafe {
+                tk_linux_kapi::dma_fence::dma_fence_remove_callback(registration.fence.0, callback)
+            };
+            if removed {
+                // SAFETY: Successful removal guarantees the callback will not
+                // consume its retained Arc reference.
+                unsafe { drop(Arc::from_raw(registration.callback_owner)) };
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn syncobj_fence_waiter_callback(
+    _fence: *mut DmaFence,
+    callback: *mut DmaFenceCb,
+) {
+    // SAFETY: Callback is the first repr(C) field and its retained Arc keeps
+    // the waiter alive until this callback consumes that reference.
+    let waiter = unsafe { Arc::from_raw(callback.cast::<SyncobjFenceWaiter>()) };
+    waiter.notifier.notify();
+}
+
+struct SyncobjWaitSnapshot {
+    ready: Option<u32>,
+    missing: bool,
+    fences: Vec<(usize, FenceRef)>,
+}
+
 fn wait_syncobjs(
     objects: &[Arc<DrmSyncobj>],
     points: &[u64],
@@ -1243,62 +1444,154 @@ fn wait_syncobjs(
     let relaxed = flags
         & (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)
         != 0;
+    let wait_available = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0;
     let timeout_jiffies = wait_timeout_jiffies(timeout_nsec);
     let expiry = tk_linux_kapi::primitives::ktime_get()
         .saturating_add(tk_linux_kapi::primitives::jiffies_to_nsecs(timeout_jiffies) as i64);
     let mut deadline_set = false;
     loop {
-        let mut first = u32::MAX;
-        let mut ready_count = 0usize;
-        let mut missing = false;
-        for (index, (object, point)) in objects.iter().zip(points).enumerate() {
-            let fence = match object.find_point(*point) {
-                Ok(fence) => fence,
-                Err(error) => return Err(error),
-            };
-            let Some(fence) = fence else {
-                missing = true;
-                continue;
-            };
-            let ready = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0
-                || unsafe { dma_fence_is_signaled(fence.0) };
-            if ready {
-                ready_count += 1;
-                if first == u32::MAX {
-                    first = index as u32;
-                }
-            }
+        let mut snapshot =
+            syncobj_wait_snapshot(objects, points, wait_all, relaxed, wait_available)?;
+        if let Some(first) = snapshot.ready {
+            return Ok(first);
         }
-        if if wait_all {
-            !missing && ready_count == objects.len()
-        } else {
-            ready_count != 0
-        } {
-            return Ok(if wait_all { u32::MAX } else { first });
-        }
-        if !relaxed && missing {
-            return Err(-EINVAL);
+        if tk_linux_kapi::signal::signal_pending_current() {
+            return Err(-ERESTARTSYS);
         }
         let now = tk_linux_kapi::primitives::ktime_get();
         if timeout_jiffies == 0 || now >= expiry {
             return Err(-ETIME);
         }
+
+        let notifier = SyncobjWaitNotifier::new();
+        // Register for submit/replacement before taking the second snapshot;
+        // the atomic notifier flag closes the missed-wakeup window.
+        let object_waiters = SyncobjWaitQueueRegistrations::new(objects, &notifier)?;
+        snapshot = syncobj_wait_snapshot(objects, points, wait_all, relaxed, wait_available)?;
+        if let Some(first) = snapshot.ready {
+            drop(object_waiters);
+            return Ok(first);
+        }
+        if tk_linux_kapi::signal::signal_pending_current() {
+            return Err(-ERESTARTSYS);
+        }
+        let now = tk_linux_kapi::primitives::ktime_get();
+        if now >= expiry {
+            return Err(-ETIME);
+        }
         if !deadline_set && flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE != 0 && deadline_nsec != 0
         {
-            for (object, point) in objects.iter().zip(points) {
-                if let Ok(Some(fence)) = object.find_point(*point) {
-                    unsafe { dma_fence_set_deadline(fence.0, deadline_nsec as i64) };
-                }
+            for (_, fence) in &snapshot.fences {
+                // SAFETY: Each fence is an owned reference in the current snapshot.
+                unsafe { dma_fence_set_deadline(fence.0, deadline_nsec as i64) };
             }
             deadline_set = true;
         }
+
         let remaining_ns = expiry.saturating_sub(now).max(0) as u64;
-        let sleep_ms = ((remaining_ns.min(1_000_000) + 999_999) / 1_000_000).max(1);
-        let sleep = tk_linux_kapi::primitives::msecs_to_jiffies(sleep_ms).max(1);
-        let mut queue = unsafe { MaybeUninit::<WaitQueueHead>::zeroed().assume_init() };
-        init_waitqueue_head(&mut queue);
-        let _ = tk_linux_kapi::wait_event_timeout!(queue, false, sleep as c_long);
+        let fence_waiters = FenceCallbackRegistrations::new(&snapshot.fences, &notifier)?;
+        let remaining_jiffies = remaining_ns
+            .saturating_mul(tk_linux_kapi::config::CONFIG_HZ as u64)
+            .saturating_add(999_999_999)
+            .div_euclid(1_000_000_000)
+            .max(1)
+            .min(c_long::MAX as u64) as c_long;
+        let wait = tk_linux_kapi::wait_event_interruptible_timeout!(
+            unsafe { &mut *notifier.wait.get() },
+            tk_linux_kapi::signal::signal_pending_current()
+                || notifier.woken.load(Ordering::Acquire)
+                || matches!(
+                    syncobj_wait_ready(objects, points, wait_all, relaxed, wait_available),
+                    Ok(true) | Err(_)
+                ),
+            remaining_jiffies,
+        );
+        drop(fence_waiters);
+        drop(object_waiters);
+        if wait < 0 {
+            return Err(wait as i32);
+        }
     }
+}
+
+/// Snapshot every requested point, retaining the fences needed by signaling
+/// callbacks before the waiter sleeps.
+fn syncobj_wait_snapshot(
+    objects: &[Arc<DrmSyncobj>],
+    points: &[u64],
+    wait_all: bool,
+    relaxed: bool,
+    wait_available: bool,
+) -> Result<SyncobjWaitSnapshot, i32> {
+    let mut snapshot = SyncobjWaitSnapshot {
+        ready: None,
+        missing: false,
+        fences: Vec::new(),
+    };
+    snapshot
+        .fences
+        .try_reserve_exact(objects.len())
+        .map_err(|_| -ENOMEM)?;
+    let mut ready_count = 0usize;
+    let mut first = u32::MAX;
+    for (index, (object, point)) in objects.iter().zip(points).enumerate() {
+        let Some(fence) = object.find_point(*point)? else {
+            snapshot.missing = true;
+            continue;
+        };
+        // SAFETY: `fence` is an owned, live reference returned by find_point.
+        if wait_available || unsafe { dma_fence_is_signaled(fence.0) } {
+            ready_count += 1;
+            if first == u32::MAX {
+                first = index as u32;
+            }
+        }
+        snapshot.fences.push((index, fence));
+    }
+    if if wait_all {
+        !snapshot.missing && ready_count == objects.len()
+    } else {
+        ready_count != 0
+    } {
+        snapshot.ready = Some(if wait_all { u32::MAX } else { first });
+    } else if snapshot.missing && !relaxed {
+        return Err(-EINVAL);
+    }
+    Ok(snapshot)
+}
+
+/// Checks readiness without sleeping. Wait predicates call this after either
+/// an object submission or a fence callback wakes the task.
+fn syncobj_wait_ready(
+    objects: &[Arc<DrmSyncobj>],
+    points: &[u64],
+    wait_all: bool,
+    relaxed: bool,
+    wait_available: bool,
+) -> Result<bool, i32> {
+    let mut ready_count = 0usize;
+    let mut missing = false;
+    for (object, point) in objects.iter().zip(points) {
+        let Some(fence) = object.find_point(*point)? else {
+            missing = true;
+            continue;
+        };
+        // SAFETY: `fence` is an owned, live reference returned by find_point.
+        if wait_available || unsafe { dma_fence_is_signaled(fence.0) } {
+            ready_count += 1;
+        }
+    }
+    if if wait_all {
+        !missing && ready_count == objects.len()
+    } else {
+        ready_count != 0
+    } {
+        return Ok(true);
+    }
+    if missing && !relaxed {
+        return Err(-EINVAL);
+    }
+    Ok(false)
 }
 
 #[inline]
@@ -1892,14 +2185,139 @@ pub unsafe extern "C" fn drm_syncobj_query_ioctl(
 }
 
 #[cfg(test)]
+mod wait_tests {
+    use super::*;
+
+    #[test]
+    fn notifier_queue_is_initialized_at_its_stable_address() {
+        let notifier = SyncobjWaitNotifier::new();
+        // SAFETY: the unshared notifier owns its initialized queue.
+        unsafe {
+            let head = ptr::addr_of_mut!((*notifier.wait.get()).head);
+            assert_eq!((*head).next, head);
+            assert_eq!((*head).prev, head);
+        }
+    }
+
+    #[test]
+    fn syncobj_wait_wakes_when_its_fence_signals() {
+        let _task_guard = crate::b2b_tests::init_test_env();
+        let object = DrmSyncobj::new().expect("syncobj allocation");
+        let fence = create_software_fence(false).expect("software fence allocation");
+        let fence_address = fence as usize;
+        object.replace_fence(Some(FenceRef(fence)));
+
+        // Use the same scheduler as the waiter: a native host thread cannot
+        // share axtask's per-CPU current-task slot while that task is parked.
+        let signaler = axtask::spawn(move || {
+            axtask::yield_now();
+            // SAFETY: `object` retains the software fence until this test ends.
+            unsafe {
+                tk_linux_kapi::dma_fence::dma_fence_signal(fence_address as *mut DmaFence);
+            }
+        })
+        .expect("fence signal task");
+        assert_eq!(
+            wait_syncobjs(core::slice::from_ref(&object), &[0], 0, 1_000_000_000, 0,),
+            Ok(0),
+        );
+        assert_eq!(signaler.join().expect("fence signal task completion"), 0);
+    }
+
+    #[test]
+    fn timeline_wait_uses_inline_locked_chain_and_child_callback() {
+        let _task_guard = crate::b2b_tests::init_test_env();
+        tk_linux_kapi::workqueue::init_workqueue_executor().expect("timeline IRQ work executor");
+        let object = DrmSyncobj::new().expect("syncobj allocation");
+        let child = create_software_fence(false).expect("software fence allocation");
+        let point = 42;
+        let syncobj = Arc::as_ptr(&object).cast_mut();
+
+        // SAFETY: `syncobj` and `child` are live; publishing the point retains
+        // its own references to both the chain and contained fence.
+        assert_eq!(
+            unsafe { drm_syncobj_submit_point(syncobj, child, point) },
+            0
+        );
+        let chain = object.fence().expect("published timeline chain");
+        let chain_fence = chain.0;
+        // SAFETY: the timeline head is a live chain created by submit_point.
+        let contained = unsafe { (*chain_fence.cast::<DmaFenceChain>()).fence };
+        assert_eq!(contained, child);
+        let inline_lock = 1 << tk_linux_kapi::dma_fence::DMA_FENCE_FLAG_INLINE_LOCK_BIT;
+        // Catch a malformed union lock before any fence operation can block on
+        // or dereference the corrupted external-lock pointer.
+        assert_ne!(unsafe { (*child).flags } & inline_lock, 0);
+        assert_ne!(unsafe { (*chain_fence).flags } & inline_lock, 0);
+        assert_eq!(
+            unsafe { (*chain_fence).ops },
+            ptr::addr_of!(tk_linux_kapi::dma_fence_chain::dma_fence_chain_ops).cast()
+        );
+
+        let child_address = child as usize;
+        let signaler = axtask::spawn(move || {
+            let child = child_address as *mut DmaFence;
+            let mut callback_registered = false;
+            // The syncobj waiter registers on the timeline head; that arms the
+            // chain's callback on its contained child. Observe that linkage so
+            // signaling below cannot race ahead and bypass the callback path.
+            for _ in 0..10_000 {
+                let mut flags = 0;
+                // SAFETY: `child` remains retained by the published chain;
+                // lock while inspecting its callback list.
+                unsafe { tk_linux_kapi::dma_fence::dma_fence_lock_irqsave(child, &mut flags) };
+                // SAFETY: the child fence is live and initialized; its callback
+                // list is the active timestamp-union member under this lock.
+                let callbacks = unsafe {
+                    ptr::addr_of_mut!((*child).timestamp_union.cb_list).cast::<ListHead>()
+                };
+                callback_registered = !unsafe { tk_linux_kapi::list::list_empty(&*callbacks) };
+                // SAFETY: `flags` came from the matching lock operation above.
+                unsafe { tk_linux_kapi::dma_fence::dma_fence_unlock_irqrestore(child, flags) };
+                if callback_registered {
+                    break;
+                }
+                axtask::yield_now();
+            }
+            // SAFETY: the chain still owns a reference, so the callback target
+            // cannot be freed before this signal is published.
+            unsafe { tk_linux_kapi::dma_fence::dma_fence_signal(child) };
+            assert!(callback_registered, "timeline callback was not armed");
+        })
+        .expect("timeline signal task");
+
+        assert_eq!(
+            wait_syncobjs(
+                core::slice::from_ref(&object),
+                &[point],
+                0,
+                1_000_000_000,
+                0,
+            ),
+            Ok(0),
+        );
+        assert_eq!(
+            signaler.join().expect("timeline signal task completion"),
+            0,
+            "the timeline signal task must complete normally"
+        );
+        // SAFETY: `chain` retains its reference for this check.
+        assert!(unsafe { tk_linux_kapi::dma_fence::dma_fence_is_signaled(chain_fence) });
+        // Drop the test's initial child reference; the chain owns the other.
+        unsafe { tk_linux_kapi::dma_fence::dma_fence_put(child) };
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use tk_linux_kapi::config::{EINVAL, ENODEV, ENOMEM};
+
     use super::*;
     use crate::{
         drm_drv_types::DrmDriver,
         drm_drv_upstream::{drm_dev_alloc, drm_dev_put},
         drm_file_upstream::{drm_file_alloc, drm_file_free},
     };
-    use tk_linux_kapi::config::{ENODEV, EINVAL, ENOMEM};
 
     fn test_device() -> (*mut DrmDevice, alloc::boxed::Box<DrmDriver>) {
         let mut driver = alloc::boxed::Box::new(unsafe { core::mem::zeroed::<DrmDriver>() });
@@ -1909,16 +2327,20 @@ mod tests {
         (dev, driver)
     }
 
-    fn syncobj_handle_ioctl(dev: *mut DrmDevice, file: *mut DrmFile, args: &mut DrmSyncobjHandle) -> i32 {
-        unsafe {
-            drm_syncobj_handle_to_fd_ioctl(dev, (args as *mut DrmSyncobjHandle).cast(), file)
-        }
+    fn syncobj_handle_ioctl(
+        dev: *mut DrmDevice,
+        file: *mut DrmFile,
+        args: &mut DrmSyncobjHandle,
+    ) -> i32 {
+        unsafe { drm_syncobj_handle_to_fd_ioctl(dev, (args as *mut DrmSyncobjHandle).cast(), file) }
     }
 
-    fn syncobj_fd_ioctl(dev: *mut DrmDevice, file: *mut DrmFile, args: &mut DrmSyncobjHandle) -> i32 {
-        unsafe {
-            drm_syncobj_fd_to_handle_ioctl(dev, (args as *mut DrmSyncobjHandle).cast(), file)
-        }
+    fn syncobj_fd_ioctl(
+        dev: *mut DrmDevice,
+        file: *mut DrmFile,
+        args: &mut DrmSyncobjHandle,
+    ) -> i32 {
+        unsafe { drm_syncobj_fd_to_handle_ioctl(dev, (args as *mut DrmSyncobjHandle).cast(), file) }
     }
 
     #[test]
@@ -2011,10 +2433,7 @@ mod tests {
             drm_syncobj_put(still_alive);
             drm_syncobj_put(original);
 
-            for (file, handle) in [
-                (file2, import.handle),
-                (file3, import_again.handle),
-            ] {
+            for (file, handle) in [(file2, import.handle), (file3, import_again.handle)] {
                 let mut destroy = DrmSyncobjDestroy { handle, pad: 0 };
                 assert_eq!(
                     drm_syncobj_destroy_ioctl(
@@ -2057,7 +2476,10 @@ mod tests {
                 pad: 0,
                 point: 0,
             };
-            assert_eq!(syncobj_handle_ioctl(dev, file, &mut invalid_handle), -EINVAL);
+            assert_eq!(
+                syncobj_handle_ioctl(dev, file, &mut invalid_handle),
+                -EINVAL
+            );
 
             let mut bad_flags = DrmSyncobjHandle {
                 handle: create.handle,
@@ -2103,7 +2525,10 @@ mod tests {
                 pad: 0,
                 point: 1,
             };
-            assert_eq!(syncobj_handle_ioctl(dev, file, &mut point_without_timeline), -EINVAL);
+            assert_eq!(
+                syncobj_handle_ioctl(dev, file, &mut point_without_timeline),
+                -EINVAL
+            );
 
             let put_count = test_file_ops::put_unused_count();
             test_file_ops::fail_next_fd(-ENODEV);

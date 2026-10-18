@@ -16,24 +16,23 @@ use core::{
     hint::spin_loop,
     ops::{Deref, DerefMut},
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU8, AtomicUsize, Ordering},
     time::Duration,
 };
 
 use kernel_guard::{NoPreempt, NoPreemptIrqSave};
 
 use crate::{
-    types::Hrtimer,
-    types::{HlistNode, TimerList},
     fields::KtimeT,
+    types::{HlistNode, Hrtimer, TimerList},
 };
 
 pub const HRTIMER_NORESTART: i32 = 0;
+pub const HRTIMER_RESTART: i32 = 1;
 pub const HRTIMER_MODE_REL: i32 = 1;
 pub const CLOCK_MONOTONIC: i32 = 1;
 pub const NSEC_PER_USEC: u64 = 1_000;
 pub const NSEC_PER_MSEC: u64 = 1_000_000;
-
 
 /// Linux `ns_to_ktime()` for the target's scalar `ktime_t` representation.
 #[inline]
@@ -488,16 +487,65 @@ const NSEC_PER_JIFFY: u64 = 1_000_000_000 / crate::config::CONFIG_HZ as u64;
 struct HrtimerImpl {
     timer: TimerList,
     function: Option<unsafe extern "C" fn(*mut Hrtimer) -> i32>,
-    expires_ns: i64,
-    _reserved: u64,
+    expires_ns: AtomicI64,
+    state_lock: AtomicBool,
 }
 const _: () = assert!(core::mem::size_of::<HrtimerImpl>() <= core::mem::size_of::<Hrtimer>());
 const _: () = assert!(core::mem::align_of::<HrtimerImpl>() <= core::mem::align_of::<Hrtimer>());
 
-/// Arm the timer-list entry of `h` for its absolute deadline.
-unsafe fn arm_hrtimer(h: *mut HrtimerImpl) -> bool {
-    let expires_ns = unsafe { (*h).expires_ns };
-    let now_ns = axhal::time::monotonic_time_nanos() as i64;
+struct HrtimerStateGuard<'a> {
+    state_lock: &'a AtomicBool,
+    _irq_guard: NoPreemptIrqSave,
+}
+
+impl Drop for HrtimerStateGuard<'_> {
+    fn drop(&mut self) {
+        self.state_lock.store(false, Ordering::Release);
+    }
+}
+
+fn lock_hrtimer(state_lock: &AtomicBool) -> HrtimerStateGuard<'_> {
+    let irq_guard = NoPreemptIrqSave::new();
+    while state_lock
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        while state_lock.load(Ordering::Relaxed) {
+            spin_loop();
+        }
+    }
+    HrtimerStateGuard {
+        state_lock,
+        _irq_guard: irq_guard,
+    }
+}
+
+fn monotonic_now_ns() -> i64 {
+    i64::try_from(axhal::time::monotonic_time_nanos()).unwrap_or(i64::MAX)
+}
+
+/// Pure Linux `hrtimer_forward()` arithmetic. Returns the number of intervals
+/// advanced (one when the prior deadline has arrived) and a deadline strictly
+/// beyond `now_ns`; a future deadline and nonpositive intervals are unchanged.
+fn forward_hrtimer_expiry(expires_ns: i64, now_ns: i64, interval_ns: i64) -> (u64, i64) {
+    if interval_ns <= 0 || now_ns < expires_ns {
+        return (0, expires_ns);
+    }
+    let delta = i128::from(now_ns) - i128::from(expires_ns);
+    let interval = i128::from(interval_ns);
+    let intervals = delta / interval + 1;
+    let next_expiry = i128::from(expires_ns) + intervals * interval;
+    let overruns = u64::try_from(intervals).unwrap_or(u64::MAX);
+    let next_expiry = i64::try_from(next_expiry).unwrap_or(i64::MAX);
+    (overruns, next_expiry)
+}
+
+/// Arm the timer-list entry of `h` for its absolute deadline. The caller holds
+/// the hrtimer state lock so rearm and cancellation cannot publish stale expiry.
+unsafe fn arm_hrtimer_locked(h: *mut HrtimerImpl) -> bool {
+    // SAFETY: caller holds the hrtimer's initialized state lock.
+    let expires_ns = unsafe { (*h).expires_ns.load(Ordering::Acquire) };
+    let now_ns = monotonic_now_ns();
     let now_jiffies = crate::primitives::jiffies();
     let target = if expires_ns <= now_ns {
         now_jiffies
@@ -510,13 +558,27 @@ unsafe fn arm_hrtimer(h: *mut HrtimerImpl) -> bool {
 
 unsafe extern "C" fn hrtimer_timer_fn(timer: *mut TimerList) {
     let h = timer.cast::<HrtimerImpl>();
-    let now_ns = axhal::time::monotonic_time_nanos() as i64;
-    if now_ns < unsafe { (*h).expires_ns } {
-        let _ = unsafe { arm_hrtimer(h) };
-        return;
-    }
-    if let Some(function) = unsafe { (*h).function } {
-        let _ = unsafe { function(h.cast::<Hrtimer>()) };
+    let function = {
+        // Timer-list deadlines are rounded up to a jiffy. If a concurrent
+        // restart moved the deadline out, rearm without running the callback.
+        let _state = lock_hrtimer(unsafe { &(*h).state_lock });
+        if monotonic_now_ns() < unsafe { (*h).expires_ns.load(Ordering::Acquire) } {
+            let _ = unsafe { arm_hrtimer_locked(h) };
+            return;
+        }
+        unsafe { (*h).function }
+    };
+    if let Some(function) = function {
+        // Linux invokes the callback outside the base lock. It may call
+        // hrtimer_forward_now() or another timer API itself.
+        let result = unsafe { function(h.cast::<Hrtimer>()) };
+        if result == HRTIMER_RESTART {
+            // Serialize callback-requested rearming with explicit starts and
+            // cancellation. A concurrent try_to_cancel observes CALLBACK and
+            // may legitimately return -1 while this timer is still running.
+            let _state = lock_hrtimer(unsafe { &(*h).state_lock });
+            let _ = unsafe { arm_hrtimer_locked(h) };
+        }
     }
 }
 
@@ -529,9 +591,13 @@ pub unsafe extern "C" fn hrtimer_setup(
     _mode: i32,
 ) {
     let h = timer.cast::<HrtimerImpl>();
+    assert!(!h.is_null());
     unsafe {
+        // `hrtimer_setup()` is the first access to this opaque storage; write
+        // each atomic before publishing the timer to the shared timer worker.
+        ptr::addr_of_mut!((*h).expires_ns).write(AtomicI64::new(0));
+        ptr::addr_of_mut!((*h).state_lock).write(AtomicBool::new(false));
         (*h).function = function;
-        (*h).expires_ns = 0;
         timer_setup(h.cast::<TimerList>(), hrtimer_timer_fn, 0);
     }
 }
@@ -546,25 +612,82 @@ pub unsafe extern "C" fn hrtimer_start_range_ns(
     mode: i32,
 ) {
     let h = timer.cast::<HrtimerImpl>();
-    let now_ns = axhal::time::monotonic_time_nanos() as i64;
+    assert!(!h.is_null());
+    let _state = lock_hrtimer(unsafe { &(*h).state_lock });
+    let now_ns = monotonic_now_ns();
     unsafe {
-        (*h).expires_ns = if mode == HRTIMER_MODE_ABS_VALUE {
-            time
-        } else {
-            now_ns.saturating_add(time)
-        };
-        let _ = arm_hrtimer(h);
+        (*h).expires_ns.store(
+            if mode == HRTIMER_MODE_ABS_VALUE {
+                time
+            } else {
+                now_ns.saturating_add(time)
+            },
+            Ordering::Release,
+        );
+        let _ = arm_hrtimer_locked(h);
     }
+}
+
+/// Linux `hrtimer_active()`: true while an hrtimer is queued or its callback
+/// is running.
+///
+/// # Safety
+/// `timer` must point to a live, initialized `Hrtimer`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hrtimer_active(timer: *const Hrtimer) -> bool {
+    assert!(!timer.is_null());
+    unsafe { timer_active(timer.cast::<TimerList>()) }
+}
+
+/// Linux `hrtimer_forward_now()`: advance a periodic deadline past the current
+/// monotonic time and return the number of intervals advanced.
+///
+/// # Safety
+/// `timer` must point to a live, initialized `Hrtimer` and be used according
+/// to the hrtimer callback/locking contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hrtimer_forward_now(timer: *mut Hrtimer, interval: KtimeT) -> u64 {
+    assert!(!timer.is_null());
+    let h = timer.cast::<HrtimerImpl>();
+    let _state = lock_hrtimer(unsafe { &(*h).state_lock });
+    // SAFETY: the lock serializes deadline updates with start and rearm.
+    let expires_ns = unsafe { (*h).expires_ns.load(Ordering::Acquire) };
+    let (overruns, next_expiry) = forward_hrtimer_expiry(expires_ns, monotonic_now_ns(), interval);
+    if next_expiry != expires_ns {
+        // SAFETY: as above; `h` remains live for the caller's callback.
+        unsafe { (*h).expires_ns.store(next_expiry, Ordering::Release) };
+    }
+    overruns
+}
+
+/// Linux `hrtimer_get_expires()`: read the timer's absolute monotonic deadline.
+///
+/// # Safety
+/// `timer` must point to a live, initialized `Hrtimer`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hrtimer_get_expires(timer: *const Hrtimer) -> KtimeT {
+    assert!(!timer.is_null());
+    let h = timer.cast::<HrtimerImpl>();
+    let _state = lock_hrtimer(unsafe { &(*h).state_lock });
+    // SAFETY: the lock serializes this read with all expiry writers.
+    unsafe { (*h).expires_ns.load(Ordering::Acquire) }
 }
 
 /// Linux `hrtimer_try_to_cancel()`: 1 when a pending timer was cancelled, 0
 /// when it was not armed, -1 when its callback is running.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hrtimer_try_to_cancel(timer: *mut Hrtimer) -> i32 {
-    let h = timer.cast::<TimerList>();
-    if unsafe { del_timer(h) } {
+    assert!(!timer.is_null());
+    let hrtimer = timer.cast::<HrtimerImpl>();
+    let _state = lock_hrtimer(unsafe { &(*hrtimer).state_lock });
+    let timer_list = timer.cast::<TimerList>();
+    // An in-flight callback remains active even if it has already queued its
+    // restart deadline; Linux reports -1 until that callback finishes.
+    if TIMER_ACTIVE.load(Ordering::Acquire) == timer_list {
+        -1
+    } else if unsafe { del_timer(timer_list) } {
         1
-    } else if TIMER_ACTIVE.load(Ordering::Acquire) == h {
+    } else if TIMER_ACTIVE.load(Ordering::Acquire) == timer_list {
         -1
     } else {
         0
@@ -574,7 +697,20 @@ pub unsafe extern "C" fn hrtimer_try_to_cancel(timer: *mut Hrtimer) -> i32 {
 /// Linux `hrtimer_cancel()`: cancel and wait for a running callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hrtimer_cancel(timer: *mut Hrtimer) -> i32 {
-    unsafe { del_timer_sync(timer.cast::<TimerList>()) as i32 }
+    assert!(!timer.is_null());
+    if !axtask::can_block_current() {
+        panic!("hrtimer_cancel requires task context");
+    }
+    loop {
+        let result = unsafe { hrtimer_try_to_cancel(timer) };
+        if result != -1 {
+            return result;
+        }
+        let timer_list = timer.cast::<TimerList>();
+        TIMER_STATE_WAKE
+            .wait_until(|| TIMER_ACTIVE.load(Ordering::Acquire) != timer_list)
+            .expect("hrtimer cancellation lost its task wait context");
+    }
 }
 
 /// Linux `timer_shutdown_sync()`: synchronous deletion. Returns whether the
@@ -609,4 +745,156 @@ pub extern "C" fn round_jiffies_up(j: c_ulong) -> c_ulong {
 pub extern "C" fn round_jiffies_up_relative(j: c_ulong) -> c_ulong {
     let now = crate::primitives::jiffies();
     round_jiffies_up_abs(now.wrapping_add(j as u64)).wrapping_sub(now) as c_ulong
+}
+
+#[cfg(test)]
+mod hrtimer_tests {
+    use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+
+    use super::*;
+
+    const TEST_INTERVAL_NS: i64 = 60 * axhal::time::NANOS_PER_SEC as i64;
+
+    static CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+    static ACTIVE_IN_CALLBACK: AtomicBool = AtomicBool::new(false);
+    static CANCEL_IN_CALLBACK: AtomicI32 = AtomicI32::new(0);
+    static LAST_FORWARD: AtomicU64 = AtomicU64::new(0);
+    static FORWARD_LEFT_FUTURE: AtomicBool = AtomicBool::new(false);
+
+    struct TestHrtimer(alloc::boxed::Box<Hrtimer>);
+
+    impl TestHrtimer {
+        fn new(function: unsafe extern "C" fn(*mut Hrtimer) -> i32) -> Self {
+            let mut timer = alloc::boxed::Box::new(unsafe { core::mem::zeroed::<Hrtimer>() });
+            // SAFETY: the boxed record has a stable address and setup initializes it before use.
+            unsafe {
+                hrtimer_setup(
+                    &mut *timer,
+                    Some(function),
+                    CLOCK_MONOTONIC,
+                    HRTIMER_MODE_REL,
+                )
+            };
+            Self(timer)
+        }
+
+        fn as_ptr(&self) -> *const Hrtimer {
+            &*self.0
+        }
+
+        fn as_mut_ptr(&mut self) -> *mut Hrtimer {
+            &mut *self.0
+        }
+
+        fn start_relative(&mut self, time: KtimeT) {
+            // SAFETY: this guard owns a live timer set up by `new`.
+            unsafe { hrtimer_start_range_ns(self.as_mut_ptr(), time, 0, HRTIMER_MODE_REL) };
+        }
+
+        fn try_to_cancel(&mut self) -> i32 {
+            // SAFETY: this guard owns a live timer set up by `new`.
+            unsafe { hrtimer_try_to_cancel(self.as_mut_ptr()) }
+        }
+
+        /// Model the timer worker's dispatch boundary without relying on a
+        /// host timer tick: the worker has removed this deadline and published
+        /// TIMER_ACTIVE, then invokes the production hrtimer trampoline.
+        fn dispatch_expired(&mut self, was_pending: bool) {
+            let timer = self.as_mut_ptr().cast::<TimerList>();
+            if was_pending {
+                assert!(unsafe { TIMER_QUEUE.lock().remove(timer) });
+            }
+
+            // Force the opaque deadline to the current instant. The callback
+            // may forward it, and the production trampoline must enqueue the
+            // restarted deadline through mod_timer().
+            let h = timer.cast::<HrtimerImpl>();
+            unsafe { (*h).expires_ns.store(monotonic_now_ns(), Ordering::Release) };
+            assert!(
+                TIMER_ACTIVE
+                    .compare_exchange(ptr::null_mut(), timer, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            );
+            // SAFETY: `timer` is a live, initialized hrtimer and the fixture
+            // models the worker-owned active callback interval.
+            unsafe { hrtimer_timer_fn(timer) };
+            assert_eq!(TIMER_ACTIVE.swap(ptr::null_mut(), Ordering::AcqRel), timer);
+            TIMER_STATE_WAKE.notify_all(false);
+        }
+    }
+
+    impl Drop for TestHrtimer {
+        fn drop(&mut self) {
+            // Cancel and wait before the boxed storage is released. The test's
+            // scheduler guard is declared first and therefore remains live.
+            unsafe { hrtimer_cancel(self.as_mut_ptr()) };
+        }
+    }
+
+    unsafe extern "C" fn periodic_callback(timer: *mut Hrtimer) -> i32 {
+        ACTIVE_IN_CALLBACK.store(unsafe { hrtimer_active(timer) }, Ordering::Release);
+        CANCEL_IN_CALLBACK.store(unsafe { hrtimer_try_to_cancel(timer) }, Ordering::Release);
+        let before_forward = monotonic_now_ns();
+        let overruns = unsafe { hrtimer_forward_now(timer, TEST_INTERVAL_NS) };
+        LAST_FORWARD.store(overruns, Ordering::Release);
+        FORWARD_LEFT_FUTURE.store(
+            unsafe { hrtimer_get_expires(timer) } > before_forward,
+            Ordering::Release,
+        );
+        if CALLBACKS.fetch_add(1, Ordering::AcqRel) < 2 {
+            HRTIMER_RESTART
+        } else {
+            HRTIMER_NORESTART
+        }
+    }
+
+    #[test]
+    fn forward_expiry_handles_future_deadline_and_overruns() {
+        assert_eq!(forward_hrtimer_expiry(100, 99, 10), (0, 100));
+        assert_eq!(forward_hrtimer_expiry(100, 100, 10), (1, 110));
+        assert_eq!(forward_hrtimer_expiry(100, 135, 10), (4, 140));
+        assert_eq!(forward_hrtimer_expiry(100, 135, 0), (0, 100));
+    }
+
+    #[test]
+    fn restart_rearms_periodically_and_norestart_stops() {
+        let _scheduler = crate::test_support::scheduler_context();
+        CALLBACKS.store(0, Ordering::Release);
+        ACTIVE_IN_CALLBACK.store(false, Ordering::Release);
+        CANCEL_IN_CALLBACK.store(0, Ordering::Release);
+        LAST_FORWARD.store(0, Ordering::Release);
+        FORWARD_LEFT_FUTURE.store(false, Ordering::Release);
+
+        // A far-future timer is active while queued and can be canceled before
+        // the callback becomes running.
+        let mut queued = TestHrtimer::new(periodic_callback);
+        let before = monotonic_now_ns();
+        let delay = 60 * axhal::time::NANOS_PER_SEC as i64;
+        queued.start_relative(delay);
+        let expiry = unsafe { hrtimer_get_expires(queued.as_ptr()) };
+        let after = monotonic_now_ns();
+        assert!(expiry >= before + delay && expiry <= after + delay);
+        assert!(unsafe { hrtimer_active(queued.as_ptr()) });
+        assert_eq!(queued.try_to_cancel(), 1);
+        assert!(!unsafe { hrtimer_active(queued.as_ptr()) });
+
+        let mut periodic = TestHrtimer::new(periodic_callback);
+        // Dispatch three synthetic expirations. The first two callbacks
+        // return RESTART and must produce a real queued timer-list deadline;
+        // the third returns NORESTART and must leave the timer inactive.
+        periodic.dispatch_expired(false);
+        assert!(unsafe { timer_pending(periodic.as_mut_ptr().cast::<TimerList>()) });
+        assert!(unsafe { hrtimer_active(periodic.as_ptr()) });
+        periodic.dispatch_expired(true);
+        assert!(unsafe { timer_pending(periodic.as_mut_ptr().cast::<TimerList>()) });
+        periodic.dispatch_expired(true);
+        assert!(!unsafe { timer_pending(periodic.as_mut_ptr().cast::<TimerList>()) });
+        assert!(!unsafe { hrtimer_active(periodic.as_ptr()) });
+
+        assert_eq!(CALLBACKS.load(Ordering::Acquire), 3);
+        assert!(ACTIVE_IN_CALLBACK.load(Ordering::Acquire));
+        assert_eq!(CANCEL_IN_CALLBACK.load(Ordering::Acquire), -1);
+        assert!(LAST_FORWARD.load(Ordering::Acquire) >= 1);
+        assert!(FORWARD_LEFT_FUTURE.load(Ordering::Acquire));
+    }
 }

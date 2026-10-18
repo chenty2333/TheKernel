@@ -3,7 +3,8 @@ use alloc::vec::Vec;
 use axdriver_base::{BaseDriverOps, DevResult, DeviceType};
 use axdriver_display::{
     BlobMem, DisplayDriverOps, DisplayInfo, DrmDisplayConfig, FrameBuffer, GpuBatch, GpuCompletion,
-    GpuCompletionData, GpuFeatures, GpuQueue, GpuSubmission, GpuTransport, PixelLayout,
+    GpuCompletionData, GpuFeatures, GpuQueue, GpuResetResult, GpuSubmission, GpuTransport,
+    PixelLayout,
 };
 use virtio_drivers::{
     Hal,
@@ -23,11 +24,84 @@ pub struct VirtIoGpuDev<H: Hal, T: Transport> {
     pci_identity: Option<axdriver_display::DisplayPciIdentity>,
     drm_resources: Vec<DrmResource>,
     pending_destroy_resources: Vec<(u64, u32)>,
+    drm_fences: DrmFenceMap,
 }
 
 struct DrmResource {
     raw: u32,
     resource: ResourceId,
+}
+
+/// Translation-only bookkeeping from the transport's private fence namespace
+/// to the DRM fence supplied by `GpuEngine`. Public pending/completed/failed
+/// state remains exclusively owned by `GpuEngine`.
+#[derive(Default)]
+struct DrmFenceMap {
+    pending: Vec<(GpuQueue, u64, u64)>,
+}
+
+impl DrmFenceMap {
+    fn reserve(&mut self) -> DevResult {
+        self.pending
+            .try_reserve(1)
+            .map_err(|_| axdriver_base::DevError::NoMemory)
+    }
+
+    fn record(&mut self, queue: GpuQueue, transport_id: u64, drm_id: u64) {
+        self.pending.push((queue, transport_id, drm_id));
+    }
+
+    fn translate(&mut self, queue: GpuQueue, transport_id: u64) -> DevResult<u64> {
+        let index = self
+            .pending
+            .iter()
+            .position(|(pending_queue, pending_transport, _)| {
+                *pending_queue == queue && *pending_transport == transport_id
+            })
+            .ok_or(axdriver_base::DevError::BadState)?;
+        Ok(self.pending.swap_remove(index).2)
+    }
+
+    fn clear_queue(&mut self, queue: GpuQueue) {
+        self.pending
+            .retain(|(pending_queue, ..)| *pending_queue != queue);
+    }
+}
+
+#[cfg(test)]
+mod drm_fence_map_tests {
+    use axdriver_display::GpuQueue;
+
+    use super::DrmFenceMap;
+
+    #[test]
+    fn maps_present_stage_fence_gaps_back_to_drm_fences() {
+        let mut fences = DrmFenceMap::default();
+        for (transport, drm) in [(1, 1), (2, 2), (3, 3), (7, 4)] {
+            fences.reserve().unwrap();
+            fences.record(GpuQueue::Control, transport, drm);
+        }
+        fences.reserve().unwrap();
+        fences.record(GpuQueue::Cursor, 7, 70);
+
+        // The public Present is inner/DRM fence 3. Its SET_SCANOUT,
+        // TRANSFER_TO_HOST, and FLUSH commands privately consume inner IDs
+        // 4-6. Therefore the next public submission uses inner ID 7 while the
+        // DRM engine assigned ID 4. Intermediate completions must not consume
+        // the mapping for that later public fence.
+        for inner_stage in 4..=6 {
+            assert!(matches!(
+                fences.translate(GpuQueue::Control, inner_stage),
+                Err(axdriver_base::DevError::BadState)
+            ));
+        }
+        assert!(matches!(fences.translate(GpuQueue::Cursor, 7), Ok(70)));
+        assert!(matches!(fences.translate(GpuQueue::Control, 7), Ok(4)));
+        assert!(matches!(fences.translate(GpuQueue::Control, 3), Ok(3)));
+        assert!(matches!(fences.translate(GpuQueue::Control, 1), Ok(1)));
+        assert!(matches!(fences.translate(GpuQueue::Control, 2), Ok(2)));
+        assert!(fences.pending.is_empty());
+    }
 }
 
 unsafe impl<H: Hal, T: Transport> Send for VirtIoGpuDev<H, T> {}
@@ -53,6 +127,7 @@ impl<H: Hal, T: Transport> VirtIoGpuDev<H, T> {
             pci_identity: None,
             drm_resources: Vec::new(),
             pending_destroy_resources: Vec::new(),
+            drm_fences: DrmFenceMap::default(),
         })
     }
 }
@@ -119,7 +194,7 @@ impl<H: Hal, T: Transport> DisplayDriverOps for VirtIoGpuDev<H, T> {
         <Self as GpuTransport>::drain_completions(self, queue, out)
     }
 
-    fn drm_reset(&mut self, queue: GpuQueue, out: &mut [GpuCompletion]) -> usize {
+    fn drm_reset(&mut self, queue: GpuQueue, out: &mut [GpuCompletion]) -> GpuResetResult {
         <Self as GpuTransport>::reset(self, queue, out)
     }
 
@@ -182,9 +257,13 @@ impl<H: Hal, T: Transport> GpuTransport for VirtIoGpuDev<H, T> {
         &mut self,
         queue: GpuQueue,
         batch: GpuBatch,
-        _fence_id: u64,
+        fence_id: u64,
     ) -> DevResult<GpuSubmission> {
-        match (queue, batch) {
+        // The DRM engine owns the public fence namespace. The VirtIO GPU
+        // implementation also allocates private fences for stages inside a
+        // Present batch, so remember the lower ID before exposing completion.
+        self.drm_fences.reserve()?;
+        let mut submission = match (queue, batch) {
             // CREATE_2D and ATTACH_BACKING have independent protocol
             // completions.  The DRM adapter submits the latter only after
             // this creation completion; accepting backing here would make
@@ -244,6 +323,15 @@ impl<H: Hal, T: Transport> GpuTransport for VirtIoGpuDev<H, T> {
                     })
                     .map_err(as_dev_err)
             }
+            (GpuQueue::Control, GpuBatch::DisableScanout) => self
+                .inner
+                .submit_set_scanout(Rect::new(0, 0, 0, 0), 0, None)
+                .map(|submission| GpuSubmission {
+                    fence_id: submission.fence_id,
+                    resource_id: None,
+                    context_id: None,
+                })
+                .map_err(as_dev_err),
             (
                 GpuQueue::Control,
                 GpuBatch::PresentBlob {
@@ -288,13 +376,13 @@ impl<H: Hal, T: Transport> GpuTransport for VirtIoGpuDev<H, T> {
                 })
                 .map_err(as_dev_err),
             (GpuQueue::Control, GpuBatch::DestroyResource { resource }) => {
+                self.pending_destroy_resources
+                    .try_reserve(1)
+                    .map_err(|_| axdriver_base::DevError::NoMemory)?;
                 let submission = self
                     .inner
                     .submit_unref(ResourceId::from_raw(resource))
                     .map_err(as_dev_err)?;
-                self.pending_destroy_resources
-                    .try_reserve(1)
-                    .map_err(|_| axdriver_base::DevError::NoMemory)?;
                 self.pending_destroy_resources
                     .push((submission.fence_id, resource));
                 Ok(GpuSubmission {
@@ -617,7 +705,10 @@ impl<H: Hal, T: Transport> GpuTransport for VirtIoGpuDev<H, T> {
             // Never route them through a synchronous helper: doing so would
             // release caller DMA before terminal ownership is observable.
             _ => Err(axdriver_base::DevError::Unsupported),
-        }
+        }?;
+        self.drm_fences.record(queue, submission.fence_id, fence_id);
+        submission.fence_id = fence_id;
+        Ok(submission)
     }
 
     fn drain_completions(
@@ -639,14 +730,14 @@ impl<H: Hal, T: Transport> GpuTransport for VirtIoGpuDev<H, T> {
                     .drain_cursor_completions(&mut inner[..capacity])
                     .map_err(as_dev_err)?;
                 for (destination, source) in out.iter_mut().zip(inner.into_iter()).take(count) {
-                    *destination = self.convert_completion(source);
+                    *destination = self.convert_completion(GpuQueue::Cursor, source)?;
                 }
                 Ok(count)
             }
         }
     }
 
-    fn reset(&mut self, queue: GpuQueue, out: &mut [GpuCompletion]) -> usize {
+    fn reset(&mut self, queue: GpuQueue, out: &mut [GpuCompletion]) -> GpuResetResult {
         match queue {
             GpuQueue::Control => self.reset_control_queue(out),
             GpuQueue::Cursor => {
@@ -656,15 +747,27 @@ impl<H: Hal, T: Transport> GpuTransport for VirtIoGpuDev<H, T> {
                     data: InnerCompletionData::None,
                 });
                 let capacity = out.len().min(inner.len());
-                let count = self.inner.reset_cursor(&mut inner[..capacity]);
-                for (destination, source) in out.iter_mut().zip(inner.into_iter()).take(count) {
-                    *destination = GpuCompletion {
-                        fence_id: source.fence_id,
-                        result: source.result.map_err(as_dev_err),
-                        data: GpuCompletionData::None,
-                    };
+                let reset = self.inner.reset_cursor(&mut inner[..capacity]);
+                for (destination, source) in out
+                    .iter_mut()
+                    .zip(inner.into_iter())
+                    .take(reset.completions)
+                {
+                    *destination = self
+                        .convert_completion(GpuQueue::Cursor, source)
+                        .unwrap_or_else(|error| GpuCompletion {
+                            fence_id: 0,
+                            result: Err(error),
+                            data: GpuCompletionData::None,
+                        });
                 }
-                count
+                if reset.quiesced {
+                    self.drm_fences.clear_queue(GpuQueue::Cursor);
+                }
+                GpuResetResult {
+                    completions: reset.completions,
+                    quiesced: reset.quiesced,
+                }
             }
         }
     }
@@ -691,33 +794,72 @@ impl<H: Hal, T: Transport> VirtIoGpuDev<H, T> {
                 .into_iter()
                 .next()
                 .expect("single completion slot");
-            *slot = self.convert_completion(completion);
+            *slot = self.convert_completion(GpuQueue::Control, completion)?;
             count += 1;
         }
         Ok(count)
     }
 
-    fn reset_control_queue(&mut self, out: &mut [GpuCompletion]) -> usize {
+    fn reset_control_queue(&mut self, out: &mut [GpuCompletion]) -> GpuResetResult {
+        if out.is_empty() {
+            let reset = self.inner.reset_control(&mut []);
+            if reset.quiesced {
+                self.drm_fences.clear_queue(GpuQueue::Control);
+            }
+            return GpuResetResult {
+                completions: 0,
+                quiesced: reset.quiesced,
+            };
+        }
         let mut count = 0;
+        let mut quiesced = false;
         for slot in out {
             let mut completion: [InnerCompletion; 1] = core::array::from_fn(|_| InnerCompletion {
                 fence_id: 0,
                 result: Ok(()),
                 data: InnerCompletionData::None,
             });
-            if self.inner.reset_control(&mut completion) == 0 {
+            let reset = self.inner.reset_control(&mut completion);
+            if !reset.quiesced {
+                return GpuResetResult {
+                    completions: count,
+                    quiesced: false,
+                };
+            }
+            quiesced = true;
+            if reset.completions == 0 {
                 break;
             }
             let completion = completion
                 .into_iter()
                 .next()
                 .expect("single completion slot");
-            *slot = self.convert_completion(completion);
+            *slot = match self.convert_completion(GpuQueue::Control, completion) {
+                Ok(completion) => completion,
+                Err(_) => {
+                    self.drm_fences.clear_queue(GpuQueue::Control);
+                    return GpuResetResult {
+                        completions: count,
+                        quiesced: true,
+                    };
+                }
+            };
             count += 1;
         }
-        count
+        if quiesced {
+            self.drm_fences.clear_queue(GpuQueue::Control);
+        }
+        GpuResetResult {
+            completions: count,
+            quiesced,
+        }
     }
-    fn convert_completion(&mut self, completion: InnerCompletion) -> GpuCompletion {
+    fn convert_completion(
+        &mut self,
+        queue: GpuQueue,
+        completion: InnerCompletion,
+    ) -> DevResult<GpuCompletion> {
+        let drm_fence_id = self.drm_fences.translate(queue, completion.fence_id)?;
         if completion.result.is_ok() {
             if let Some(index) = self
                 .pending_destroy_resources
@@ -753,10 +895,10 @@ impl<H: Hal, T: Transport> VirtIoGpuDev<H, T> {
             },
             InnerCompletionData::Capset(bytes) => GpuCompletionData::Capset(bytes),
         };
-        GpuCompletion {
-            fence_id: completion.fence_id,
+        Ok(GpuCompletion {
+            fence_id: drm_fence_id,
             result: completion.result.map_err(as_dev_err),
             data,
-        }
+        })
     }
 }

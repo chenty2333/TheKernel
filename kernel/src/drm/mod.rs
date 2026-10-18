@@ -18,6 +18,12 @@ pub(crate) mod screen;
 
 /// Register the boot DRM devices. Returns whether one now drives the screen.
 pub fn init_virtio_gpu() -> bool {
+    // IRQ-side fence completion must only enqueue existing work, never spawn
+    // a task. Establish its executor before any GPU can enable interrupts.
+    if let Err(error) = tk_linux_kapi::workqueue::init_workqueue_executor() {
+        axlog::warn!("drm: cannot start completion worker pool: {error:?}");
+        return false;
+    }
     // An Intel GPU is not a VirtIO device, but this is the DRM initialization
     // hook the kernel entry point already calls, so the Intel probe runs here:
     // before devfs is mounted, and therefore before any debug file could be

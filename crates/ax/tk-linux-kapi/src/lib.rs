@@ -143,3 +143,7 @@ pub mod component;
 pub mod vga;
 #[allow(unsafe_code)]
 pub mod debugfs;
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+pub(crate) mod test_support;

@@ -7,31 +7,43 @@
 
 #![allow(non_snake_case, dead_code, unsafe_code)]
 
-use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
 use alloc::boxed::Box;
-use tk_linux_kapi::config::{EBUSY, EINVAL, ENOMEM, EOPNOTSUPP, GFP_KERNEL};
-use tk_linux_kapi::memory::{kfree, kmalloc};
-use tk_linux_kapi::mutex::mutex_init;
+use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
+
 #[cfg(not(test))]
 use tk_linux_kapi::mutex::{mutex_lock, mutex_unlock};
+use tk_linux_kapi::{
+    config::{
+        EBUSY, EINVAL, ENOMEM, EOPNOTSUPP, EOVERFLOW, GFP_KERNEL, IS_ERR, PAGE_SHIFT, PAGE_SIZE,
+    },
+    memory::{kfree, kmalloc},
+    mutex::mutex_init,
+};
 #[cfg(test)]
 unsafe fn mutex_lock<M>(_mutex: M) {}
 #[cfg(test)]
 unsafe fn mutex_unlock<M>(_mutex: M) {}
-use tk_linux_kapi::rbtree::{rb_erase, rb_first, rb_insert_color, rb_link_node, rb_next};
-use tk_linux_kapi::types::{File, ListHead, RbNode, RbRoot, SgTable, Spinlock};
+use tk_linux_kapi::{
+    rbtree::{rb_erase, rb_first, rb_insert_color, rb_link_node, rb_next},
+    scatterlist::{
+        sg_alloc_table_from_pages_segment, sg_dma_address, sg_dma_len, sg_free_table, sg_next,
+        sg_page,
+    },
+    shmem::{pfn_to_page, try_page_to_phys},
+    types::{File, ListHead, RbNode, RbRoot, SgTable, Spinlock},
+};
 
-use crate::dma_resv_types::DmaResv;
-use crate::drm_device_types::DrmDevice;
-use crate::drm_file_types::DrmFile;
-use crate::drm_gem_types::DrmGemObject;
-use crate::drm_prime_types::DrmPrimeFilePrivate;
-use crate::iosys_map_types::IosysMap;
-use crate::uapi_drm_types::DrmPrimeHandle;
+use crate::{
+    dma_resv_types::DmaResv, drm_device_types::DrmDevice, drm_dma_buf_upstream::get_dma_buf,
+    drm_file_types::DrmFile, drm_gem_types::DrmGemObject, drm_prime_types::DrmPrimeFilePrivate,
+    iosys_map_types::IosysMap, uapi_drm_types::DrmPrimeHandle,
+};
 
 const ENOENT: i32 = 2;
+const ENOSYS: i32 = 38;
 const DRM_CLOEXEC: u32 = 0x80000;
 const DRM_RDWR: u32 = 0x2;
+const DMA_ATTR_SKIP_CPU_SYNC: u64 = 1 << 5;
 
 unsafe extern "C" {
     fn get_unused_fd_flags(flags: c_int) -> c_int;
@@ -42,8 +54,15 @@ unsafe extern "C" {
     fn dma_buf_export(exp_info: *const DmaBufExportInfo) -> *mut DmaBuf;
     fn dma_buf_attach(dmabuf: *mut DmaBuf, dev: *mut c_void) -> *mut DmaBufAttachment;
     fn dma_buf_detach(dmabuf: *mut DmaBuf, attach: *mut DmaBufAttachment);
-    fn dma_buf_map_attachment_unlocked(attach: *mut DmaBufAttachment, direction: c_int) -> *mut SgTable;
-    fn dma_buf_unmap_attachment_unlocked(attach: *mut DmaBufAttachment, sgt: *mut SgTable, direction: c_int);
+    fn dma_buf_map_attachment_unlocked(
+        attach: *mut DmaBufAttachment,
+        direction: c_int,
+    ) -> *mut SgTable;
+    fn dma_buf_unmap_attachment_unlocked(
+        attach: *mut DmaBufAttachment,
+        sgt: *mut SgTable,
+        direction: c_int,
+    );
 }
 
 #[repr(C)]
@@ -136,14 +155,6 @@ struct DrmPrimeMember {
     rb_handle: RbNode,
 }
 
-// upstream: include/linux/dma-buf.h get_dma_buf()
-#[inline]
-pub unsafe fn get_dma_buf(dmabuf: *mut DmaBuf) {
-    if !dmabuf.is_null() && (dmabuf as usize) >= 4096 {
-        (*dmabuf)._vmapping_pad = (*dmabuf)._vmapping_pad.saturating_add(1);
-    }
-}
-
 // upstream: drivers/gpu/drm/drm_prime.c drm_prime_init_file_private()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_prime_init_file_private(prime_fpriv: *mut DrmPrimeFilePrivate) {
@@ -167,9 +178,18 @@ pub unsafe extern "C" fn drm_prime_destroy_file_private(prime_fpriv: *mut DrmPri
         mutex_lock(core::ptr::addr_of_mut!((*prime_fpriv).lock));
         while !(*prime_fpriv).handles.node.is_null() {
             let node = (*prime_fpriv).handles.node;
-            let member = node.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmPrimeMember, rb_handle)).cast::<DrmPrimeMember>();
-            rb_erase(core::ptr::addr_of_mut!((*member).rb_handle), core::ptr::addr_of_mut!((*prime_fpriv).handles));
-            rb_erase(core::ptr::addr_of_mut!((*member).rb_buf), core::ptr::addr_of_mut!((*prime_fpriv).dmabufs));
+            let member = node
+                .cast::<u8>()
+                .wrapping_sub(core::mem::offset_of!(DrmPrimeMember, rb_handle))
+                .cast::<DrmPrimeMember>();
+            rb_erase(
+                core::ptr::addr_of_mut!((*member).rb_handle),
+                core::ptr::addr_of_mut!((*prime_fpriv).handles),
+            );
+            rb_erase(
+                core::ptr::addr_of_mut!((*member).rb_buf),
+                core::ptr::addr_of_mut!((*prime_fpriv).dmabufs),
+            );
             dma_buf_put((*member).dma_buf);
             drop(Box::from_raw(member));
         }
@@ -188,23 +208,52 @@ pub unsafe extern "C" fn drm_prime_add_buf_handle(
         return -EINVAL;
     }
     unsafe {
+        mutex_lock(core::ptr::addr_of_mut!((*prime_fpriv).lock));
+        let ret = drm_prime_add_buf_handle_locked(prime_fpriv, dma_buf, handle);
+        mutex_unlock(core::ptr::addr_of_mut!((*prime_fpriv).lock));
+        ret
+    }
+}
+
+/// Add the bidirectional handle/buffer member while the per-file PRIME lock is
+/// already held. The ioctl paths keep that lock across lookup and insertion to
+/// make cache misses atomic; calling the public locking wrapper from there
+/// would recursively acquire a non-recursive Linux mutex.
+unsafe fn drm_prime_add_buf_handle_locked(
+    prime_fpriv: *mut DrmPrimeFilePrivate,
+    dma_buf: *mut DmaBuf,
+    handle: u32,
+) -> i32 {
+    if prime_fpriv.is_null() || dma_buf.is_null() {
+        return -EINVAL;
+    }
+    unsafe {
         let member = Box::into_raw(Box::new(DrmPrimeMember {
             dma_buf,
             handle,
-            rb_buf: RbNode { parent_color: 0, left: core::ptr::null_mut(), right: core::ptr::null_mut() },
-            rb_handle: RbNode { parent_color: 0, left: core::ptr::null_mut(), right: core::ptr::null_mut() },
+            rb_buf: RbNode {
+                parent_color: 0,
+                left: core::ptr::null_mut(),
+                right: core::ptr::null_mut(),
+            },
+            rb_handle: RbNode {
+                parent_color: 0,
+                left: core::ptr::null_mut(),
+                right: core::ptr::null_mut(),
+            },
         }));
 
         get_dma_buf(dma_buf);
-
-        mutex_lock(core::ptr::addr_of_mut!((*prime_fpriv).lock));
 
         // Insert into dmabufs tree
         let mut parent: *mut RbNode = core::ptr::null_mut();
         let mut link = core::ptr::addr_of_mut!((*prime_fpriv).dmabufs.node);
         while !(*link).is_null() {
             parent = *link;
-            let existing = parent.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmPrimeMember, rb_buf)).cast::<DrmPrimeMember>();
+            let existing = parent
+                .cast::<u8>()
+                .wrapping_sub(core::mem::offset_of!(DrmPrimeMember, rb_buf))
+                .cast::<DrmPrimeMember>();
             if (dma_buf as usize) < ((*existing).dma_buf as usize) {
                 link = core::ptr::addr_of_mut!((*parent).left);
             } else {
@@ -212,14 +261,20 @@ pub unsafe extern "C" fn drm_prime_add_buf_handle(
             }
         }
         rb_link_node(core::ptr::addr_of_mut!((*member).rb_buf), parent, link);
-        rb_insert_color(core::ptr::addr_of_mut!((*member).rb_buf), core::ptr::addr_of_mut!((*prime_fpriv).dmabufs));
+        rb_insert_color(
+            core::ptr::addr_of_mut!((*member).rb_buf),
+            core::ptr::addr_of_mut!((*prime_fpriv).dmabufs),
+        );
 
         // Insert into handles tree
         parent = core::ptr::null_mut();
         link = core::ptr::addr_of_mut!((*prime_fpriv).handles.node);
         while !(*link).is_null() {
             parent = *link;
-            let existing = parent.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmPrimeMember, rb_handle)).cast::<DrmPrimeMember>();
+            let existing = parent
+                .cast::<u8>()
+                .wrapping_sub(core::mem::offset_of!(DrmPrimeMember, rb_handle))
+                .cast::<DrmPrimeMember>();
             if handle < (*existing).handle {
                 link = core::ptr::addr_of_mut!((*parent).left);
             } else {
@@ -227,9 +282,10 @@ pub unsafe extern "C" fn drm_prime_add_buf_handle(
             }
         }
         rb_link_node(core::ptr::addr_of_mut!((*member).rb_handle), parent, link);
-        rb_insert_color(core::ptr::addr_of_mut!((*member).rb_handle), core::ptr::addr_of_mut!((*prime_fpriv).handles));
-
-        mutex_unlock(core::ptr::addr_of_mut!((*prime_fpriv).lock));
+        rb_insert_color(
+            core::ptr::addr_of_mut!((*member).rb_handle),
+            core::ptr::addr_of_mut!((*prime_fpriv).handles),
+        );
         0
     }
 }
@@ -242,7 +298,10 @@ pub(crate) unsafe fn drm_prime_lookup_buf_by_handle(
     unsafe {
         let mut node = (*prime_fpriv).handles.node;
         while !node.is_null() {
-            let member = node.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmPrimeMember, rb_handle)).cast::<DrmPrimeMember>();
+            let member = node
+                .cast::<u8>()
+                .wrapping_sub(core::mem::offset_of!(DrmPrimeMember, rb_handle))
+                .cast::<DrmPrimeMember>();
             if handle < (*member).handle {
                 node = (*node).left;
             } else if handle > (*member).handle {
@@ -264,7 +323,10 @@ unsafe fn drm_prime_lookup_buf_handle(
     unsafe {
         let mut node = (*prime_fpriv).dmabufs.node;
         while !node.is_null() {
-            let member = node.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmPrimeMember, rb_buf)).cast::<DrmPrimeMember>();
+            let member = node
+                .cast::<u8>()
+                .wrapping_sub(core::mem::offset_of!(DrmPrimeMember, rb_buf))
+                .cast::<DrmPrimeMember>();
             if (dma_buf as usize) < ((*member).dma_buf as usize) {
                 node = (*node).left;
             } else if (dma_buf as usize) > ((*member).dma_buf as usize) {
@@ -292,14 +354,23 @@ pub unsafe extern "C" fn drm_prime_remove_buf_handle(
     unsafe {
         let mut node = (*prime_fpriv).handles.node;
         while !node.is_null() {
-            let member = node.cast::<u8>().wrapping_sub(core::mem::offset_of!(DrmPrimeMember, rb_handle)).cast::<DrmPrimeMember>();
+            let member = node
+                .cast::<u8>()
+                .wrapping_sub(core::mem::offset_of!(DrmPrimeMember, rb_handle))
+                .cast::<DrmPrimeMember>();
             if handle < (*member).handle {
                 node = (*node).left;
             } else if handle > (*member).handle {
                 node = (*node).right;
             } else {
-                rb_erase(core::ptr::addr_of_mut!((*member).rb_handle), core::ptr::addr_of_mut!((*prime_fpriv).handles));
-                rb_erase(core::ptr::addr_of_mut!((*member).rb_buf), core::ptr::addr_of_mut!((*prime_fpriv).dmabufs));
+                rb_erase(
+                    core::ptr::addr_of_mut!((*member).rb_handle),
+                    core::ptr::addr_of_mut!((*prime_fpriv).handles),
+                );
+                rb_erase(
+                    core::ptr::addr_of_mut!((*member).rb_buf),
+                    core::ptr::addr_of_mut!((*prime_fpriv).dmabufs),
+                );
                 dma_buf_put((*member).dma_buf);
                 drop(Box::from_raw(member));
                 break;
@@ -349,7 +420,8 @@ pub unsafe extern "C" fn drm_gem_prime_fd_to_handle(
         return dmabuf as isize as i32;
     }
     mutex_lock(core::ptr::addr_of_mut!((*file_priv).prime.lock));
-    let mut ret = drm_prime_lookup_buf_handle(core::ptr::addr_of_mut!((*file_priv).prime), dmabuf, handle);
+    let mut ret =
+        drm_prime_lookup_buf_handle(core::ptr::addr_of_mut!((*file_priv).prime), dmabuf, handle);
     if ret == 0 {
         mutex_unlock(core::ptr::addr_of_mut!((*file_priv).prime.lock));
         dma_buf_put(dmabuf);
@@ -382,7 +454,11 @@ pub unsafe extern "C" fn drm_gem_prime_fd_to_handle(
         dma_buf_put(dmabuf);
         return ret;
     }
-    ret = drm_prime_add_buf_handle(core::ptr::addr_of_mut!((*file_priv).prime), dmabuf, *handle);
+    ret = drm_prime_add_buf_handle_locked(
+        core::ptr::addr_of_mut!((*file_priv).prime),
+        dmabuf,
+        *handle,
+    );
     mutex_unlock(core::ptr::addr_of_mut!((*file_priv).prime.lock));
     if ret != 0 {
         crate::drm_gem_upstream::drm_gem_handle_delete(file_priv, *handle);
@@ -406,10 +482,20 @@ pub unsafe extern "C" fn drm_prime_fd_to_handle_ioctl(
     }
     if let Some(driver) = (*dev).driver.as_ref() {
         if let Some(fd2p) = driver.prime_fd_to_handle {
-            return fd2p(dev, file_priv, (*args).fd, core::ptr::addr_of_mut!((*args).handle));
+            return fd2p(
+                dev,
+                file_priv,
+                (*args).fd,
+                core::ptr::addr_of_mut!((*args).handle),
+            );
         }
     }
-    drm_gem_prime_fd_to_handle(dev, file_priv, (*args).fd, core::ptr::addr_of_mut!((*args).handle))
+    drm_gem_prime_fd_to_handle(
+        dev,
+        file_priv,
+        (*args).fd,
+        core::ptr::addr_of_mut!((*args).handle),
+    )
 }
 
 // upstream: drivers/gpu/drm/drm_prime.c export_and_register_object()
@@ -452,7 +538,8 @@ pub unsafe extern "C" fn drm_gem_prime_handle_to_dmabuf(
         mutex_unlock(core::ptr::addr_of_mut!((*file_priv).prime.lock));
         return (-ENOENT as isize) as *mut DmaBuf;
     }
-    let cached = drm_prime_lookup_buf_by_handle(core::ptr::addr_of_mut!((*file_priv).prime), handle);
+    let cached =
+        drm_prime_lookup_buf_by_handle(core::ptr::addr_of_mut!((*file_priv).prime), handle);
     if !cached.is_null() {
         get_dma_buf(cached);
         crate::drm_gem_upstream::drm_gem_object_put(obj);
@@ -476,7 +563,11 @@ pub unsafe extern "C" fn drm_gem_prime_handle_to_dmabuf(
             return dmabuf;
         }
     }
-    let ret = drm_prime_add_buf_handle(core::ptr::addr_of_mut!((*file_priv).prime), dmabuf, handle);
+    let ret = drm_prime_add_buf_handle_locked(
+        core::ptr::addr_of_mut!((*file_priv).prime),
+        dmabuf,
+        handle,
+    );
     mutex_unlock(core::ptr::addr_of_mut!((*dev).object_name_lock));
     if ret != 0 {
         dma_buf_put(dmabuf);
@@ -496,6 +587,9 @@ pub unsafe extern "C" fn drm_gem_prime_handle_to_fd(
     flags: u32,
     prime_fd: *mut i32,
 ) -> i32 {
+    if prime_fd.is_null() {
+        return -EINVAL;
+    }
     let fd = get_unused_fd_flags(flags as i32);
     if fd < 0 {
         return fd;
@@ -505,13 +599,14 @@ pub unsafe extern "C" fn drm_gem_prime_handle_to_fd(
         put_unused_fd(fd);
         return dmabuf as isize as i32;
     }
-    crate::pending_stubs::dma_buf::dma_buf_register_fd(fd, dmabuf);
-    if !(*dmabuf).file.is_null() {
-        fd_install(fd, (*dmabuf).file.cast());
+    let file = (*dmabuf).file;
+    if file.is_null() || IS_ERR(file) {
+        dma_buf_put(dmabuf);
+        put_unused_fd(fd);
+        return -EINVAL;
     }
-    if !prime_fd.is_null() {
-        *prime_fd = fd;
-    }
+    fd_install(fd, file.cast());
+    *prime_fd = fd;
     0
 }
 
@@ -531,10 +626,22 @@ pub unsafe extern "C" fn drm_prime_handle_to_fd_ioctl(
     }
     if let Some(driver) = (*dev).driver.as_ref() {
         if let Some(p2fd) = driver.prime_handle_to_fd {
-            return p2fd(dev, file_priv, (*args).handle, (*args).flags, core::ptr::addr_of_mut!((*args).fd));
+            return p2fd(
+                dev,
+                file_priv,
+                (*args).handle,
+                (*args).flags,
+                core::ptr::addr_of_mut!((*args).fd),
+            );
         }
     }
-    drm_gem_prime_handle_to_fd(dev, file_priv, (*args).handle, (*args).flags, core::ptr::addr_of_mut!((*args).fd))
+    drm_gem_prime_handle_to_fd(
+        dev,
+        file_priv,
+        (*args).handle,
+        (*args).flags,
+        core::ptr::addr_of_mut!((*args).fd),
+    )
 }
 
 // upstream: drivers/gpu/drm/drm_prime.c drm_gem_map_attach()
@@ -557,10 +664,7 @@ pub unsafe extern "C" fn drm_gem_map_attach(
 
 // upstream: drivers/gpu/drm/drm_prime.c drm_gem_map_detach()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_gem_map_detach(
-    dma_buf: *mut DmaBuf,
-    attach: *mut DmaBufAttachment,
-) {
+pub unsafe extern "C" fn drm_gem_map_detach(dma_buf: *mut DmaBuf, attach: *mut DmaBufAttachment) {
     if dma_buf.is_null() {
         return;
     }
@@ -576,30 +680,64 @@ pub unsafe extern "C" fn drm_gem_map_detach(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_gem_map_dma_buf(
     attach: *mut DmaBufAttachment,
-    _dir: c_int,
+    direction: c_int,
 ) -> *mut SgTable {
-    if attach.is_null() || (*attach).dmabuf.is_null() {
-        return (-EINVAL as isize) as *mut SgTable;
+    if attach.is_null() || !(0..=2).contains(&direction) {
+        return tk_linux_kapi::config::ERR_PTR(-EINVAL);
     }
-    let obj = (*(*attach).dmabuf).r#priv.cast::<DrmGemObject>();
-    if let Some(funcs) = (*obj).funcs.as_ref() {
-        if let Some(get_sg) = funcs.get_sg_table {
-            return get_sg(obj);
-        }
+    let dmabuf = (*attach).dmabuf;
+    if dmabuf.is_null() {
+        return tk_linux_kapi::config::ERR_PTR(-EINVAL);
     }
-    (-EINVAL as isize) as *mut SgTable
+    let obj = (*dmabuf).r#priv.cast::<DrmGemObject>();
+    let Some(get_sg) = (*obj).funcs.as_ref().and_then(|funcs| funcs.get_sg_table) else {
+        return tk_linux_kapi::config::ERR_PTR(-ENOSYS);
+    };
+    // SAFETY: The attachment retains the GEM exporter while its callback
+    // returns a newly owned SG table for this mapping.
+    let sgt = get_sg(obj);
+    if IS_ERR(sgt) {
+        return sgt;
+    }
+    if sgt.is_null() {
+        return tk_linux_kapi::config::ERR_PTR(-ENOMEM);
+    }
+    // SAFETY: The fresh SG table is owned by this mapping; the DMA provider
+    // validates the importing device and rolls back partial mapping failures.
+    let ret =
+        tk_linux_kapi::dma::dma_map_sgtable((*attach).dev, sgt, direction, DMA_ATTR_SKIP_CPU_SYNC);
+    if ret != 0 {
+        // SAFETY: Mapping failed and rolled back, so this call owns the
+        // original table and can release both its entries and header.
+        sg_free_table(sgt);
+        kfree(sgt.cast::<c_void>());
+        return tk_linux_kapi::config::ERR_PTR(ret);
+    }
+    sgt
 }
 
 // upstream: drivers/gpu/drm/drm_prime.c drm_gem_unmap_dma_buf()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_gem_unmap_dma_buf(
-    _attach: *mut DmaBufAttachment,
+    attach: *mut DmaBufAttachment,
     sgt: *mut SgTable,
-    _dir: c_int,
+    direction: c_int,
 ) {
-    if !sgt.is_null() {
-        kfree(sgt.cast::<c_void>());
+    if sgt.is_null() || IS_ERR(sgt) {
+        return;
     }
+    // SAFETY: `attach` and `sgt` are the pair returned by the successful map
+    // callback; retire device access before freeing scatterlist storage.
+    tk_linux_kapi::dma::dma_unmap_sg_attrs(
+        (*attach).dev,
+        (*sgt).sgl,
+        (*sgt).orig_nents,
+        direction as u32,
+        DMA_ATTR_SKIP_CPU_SYNC,
+    );
+    // SAFETY: The mapping is retired and this callback owns the SG table.
+    sg_free_table(sgt);
+    kfree(sgt.cast::<c_void>());
 }
 
 // upstream: drivers/gpu/drm/drm_prime.c drm_gem_dmabuf_vmap()
@@ -644,21 +782,68 @@ pub unsafe extern "C" fn drm_gem_dmabuf_mmap(dma_buf: *mut DmaBuf, vma: *mut c_v
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_prime_pages_to_sg(
     _dev: *mut DrmDevice,
-    _pages: *mut *mut c_void,
-    _nr_pages: c_uint,
+    pages: *mut *mut c_void,
+    nr_pages: c_uint,
 ) -> *mut SgTable {
+    if pages.is_null() || nr_pages == 0 {
+        return tk_linux_kapi::config::ERR_PTR(-EINVAL);
+    }
+    let Some(size) = (nr_pages as usize).checked_mul(PAGE_SIZE) else {
+        return tk_linux_kapi::config::ERR_PTR(-EOVERFLOW);
+    };
     let sg = kmalloc(core::mem::size_of::<SgTable>(), GFP_KERNEL).cast::<SgTable>();
     if sg.is_null() {
-        return (-ENOMEM as isize) as *mut SgTable;
+        return tk_linux_kapi::config::ERR_PTR(-ENOMEM);
     }
     core::ptr::write_bytes(sg, 0, 1);
+    // SAFETY: `sg` is newly allocated and zeroed; `pages` points to `nr_pages`
+    // page pointers per the caller's contract, and `size` is their byte extent.
+    let ret = sg_alloc_table_from_pages_segment(
+        sg,
+        pages.cast(),
+        nr_pages,
+        0,
+        size as c_ulong,
+        u32::MAX,
+        GFP_KERNEL,
+    );
+    if ret != 0 {
+        // SAFETY: `sg` is the uniquely owned allocation created above.
+        kfree(sg.cast::<c_void>());
+        return tk_linux_kapi::config::ERR_PTR(ret);
+    }
     sg
 }
 
 // upstream: drivers/gpu/drm/drm_prime.c drm_prime_get_contiguous_size()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_prime_get_contiguous_size(_sgt: *mut SgTable) -> c_ulong {
-    0
+pub unsafe extern "C" fn drm_prime_get_contiguous_size(sgt: *mut SgTable) -> c_ulong {
+    if sgt.is_null() || IS_ERR(sgt) || (*sgt).sgl.is_null() {
+        return 0;
+    }
+    let nents = (*sgt).nents;
+    let mut sg = (*sgt).sgl;
+    let mut contiguous = 0u64;
+    let mut next_address = 0u64;
+    for index in 0..nents {
+        let address = sg_dma_address(sg);
+        let length = sg_dma_len(sg) as u64;
+        if length == 0 || (index != 0 && address != next_address) {
+            break;
+        }
+        let Some(end) = address.checked_add(length) else {
+            break;
+        };
+        contiguous = contiguous.saturating_add(length);
+        next_address = end;
+        if index + 1 < nents {
+            sg = sg_next(sg);
+            if sg.is_null() {
+                break;
+            }
+        }
+    }
+    contiguous as c_ulong
 }
 
 // upstream: drivers/gpu/drm/drm_prime.c drm_gem_prime_export()
@@ -742,42 +927,185 @@ pub unsafe extern "C" fn drm_gem_prime_import(
 // upstream: drivers/gpu/drm/drm_prime.c drm_prime_sg_to_page_array()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_prime_sg_to_page_array(
-    _sgt: *mut SgTable,
-    _pages: *mut *mut c_void,
-    _max_entries: c_int,
+    sgt: *mut SgTable,
+    pages: *mut *mut c_void,
+    max_entries: c_int,
 ) -> c_int {
-    0
+    if sgt.is_null() || IS_ERR(sgt) || pages.is_null() || max_entries < 0 {
+        return -EINVAL;
+    }
+    let mut sg = (*sgt).sgl;
+    if sg.is_null() {
+        return if (*sgt).orig_nents == 0 { 0 } else { -EINVAL };
+    }
+    let mut written = 0usize;
+    for _ in 0..(*sgt).orig_nents {
+        if sg.is_null() {
+            return -EINVAL;
+        }
+        let page = sg_page(sg);
+        let Some(physical) = try_page_to_phys(page) else {
+            return -EINVAL;
+        };
+        let span = match ((*sg).offset as usize).checked_add((*sg).length as usize) {
+            Some(span) => span,
+            None => return -EINVAL,
+        };
+        let rounded_span = match span.checked_add(PAGE_SIZE - 1) {
+            Some(span) => span,
+            None => return -EINVAL,
+        };
+        let page_count = rounded_span >> PAGE_SHIFT;
+        let Some(end) = written.checked_add(page_count) else {
+            return -EINVAL;
+        };
+        if end > max_entries as usize {
+            return -EINVAL;
+        }
+        let first_pfn = physical >> PAGE_SHIFT;
+        for page_index in 0..page_count {
+            let Some(pfn) = first_pfn.checked_add(page_index) else {
+                return -EINVAL;
+            };
+            let page = pfn_to_page(pfn as c_ulong);
+            if page.is_null() {
+                return -EINVAL;
+            }
+            // SAFETY: `pages` is writable for `max_entries` slots, and
+            // `written` remains in range by the checked bound above.
+            pages.add(written).write(page.cast());
+            written += 1;
+        }
+        sg = sg_next(sg);
+    }
+    written as c_int
 }
 
 // upstream: drivers/gpu/drm/drm_prime.c drm_prime_sg_to_dma_addr_array()
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn drm_prime_sg_to_dma_addr_array(
-    _sgt: *mut SgTable,
-    _addrs: *mut u64,
-    _max_entries: c_int,
+    sgt: *mut SgTable,
+    addrs: *mut u64,
+    max_entries: c_int,
 ) -> c_int {
-    0
+    if sgt.is_null() || IS_ERR(sgt) || addrs.is_null() || max_entries < 0 {
+        return -EINVAL;
+    }
+    let mut sg = (*sgt).sgl;
+    if sg.is_null() {
+        return if (*sgt).nents == 0 { 0 } else { -EINVAL };
+    }
+    let mut written = 0usize;
+    for _ in 0..(*sgt).nents {
+        if sg.is_null() {
+            return -EINVAL;
+        }
+        let address = sg_dma_address(sg);
+        let length = sg_dma_len(sg) as usize;
+        if length == 0 || (length & (PAGE_SIZE - 1)) != 0 {
+            return -EINVAL;
+        }
+        let page_count = length >> PAGE_SHIFT;
+        let Some(end) = written.checked_add(page_count) else {
+            return -EINVAL;
+        };
+        if end > max_entries as usize {
+            return -EINVAL;
+        }
+        for page_index in 0..page_count {
+            let Some(offset) = page_index.checked_mul(PAGE_SIZE) else {
+                return -EINVAL;
+            };
+            let Some(page_address) = address.checked_add(offset as u64) else {
+                return -EINVAL;
+            };
+            // SAFETY: `addrs` is writable for `max_entries` slots, and
+            // `written` remains in range by the checked bound above.
+            addrs.add(written).write(page_address);
+            written += 1;
+        }
+        sg = sg_next(sg);
+    }
+    written as c_int
 }
 
 // upstream: drivers/gpu/drm/drm_prime.c drm_prime_gem_destroy()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn drm_prime_gem_destroy(obj: *mut DrmGemObject, _sg: *mut SgTable) {
+pub unsafe extern "C" fn drm_prime_gem_destroy(obj: *mut DrmGemObject, sgt: *mut SgTable) {
     if !obj.is_null() && !(*obj).import_attach.is_null() {
         let attach = (*obj).import_attach.cast::<DmaBufAttachment>();
-        dma_buf_detach((*attach).dmabuf, attach);
-        dma_buf_put((*attach).dmabuf);
+        // `dma_buf_detach()` frees the attachment record, so save its owning
+        // DMA-BUF before detaching; the importer reference is put afterward.
+        let dmabuf = (*attach).dmabuf;
         (*obj).import_attach = core::ptr::null_mut();
+        if !sgt.is_null() && !IS_ERR(sgt) {
+            dma_buf_unmap_attachment_unlocked(attach, sgt, 0);
+        }
+        dma_buf_detach(dmabuf, attach);
+        dma_buf_put(dmabuf);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tk_linux_kapi::{scatterlist::SG_END, types::Scatterlist};
+
     use super::*;
     use crate::drm_syncobj_upstream::test_file_ops;
-    use crate::drm_drv_types::DrmDriver;
-    use crate::drm_drv_upstream::{drm_dev_alloc, drm_dev_put};
-    use crate::drm_file_upstream::{drm_file_alloc, drm_file_free};
-    use crate::drm_gem_upstream::{drm_gem_handle_create, drm_gem_object_lookup, drm_gem_object_put, drm_gem_private_object_init};
+
+    #[test]
+    fn prime_dma_helpers_walk_mapped_scatterlist_and_bound_output() {
+        let mut entries = [
+            Scatterlist {
+                page_link: 0,
+                offset: 0,
+                length: (2 * PAGE_SIZE) as u32,
+                dma_address: 0x1000,
+                dma_length: (2 * PAGE_SIZE) as u32,
+                _dma_flags_or_padding: 0,
+            },
+            Scatterlist {
+                page_link: SG_END,
+                offset: 0,
+                length: (2 * PAGE_SIZE) as u32,
+                dma_address: 0x8000,
+                dma_length: (2 * PAGE_SIZE) as u32,
+                _dma_flags_or_padding: 0,
+            },
+        ];
+        let mut table = SgTable {
+            sgl: entries.as_mut_ptr(),
+            nents: 2,
+            orig_nents: 2,
+        };
+        let mut addresses = [0u64; 4];
+        assert_eq!(
+            // SAFETY: The table and its two entries are live; `addresses` has
+            // four slots, exactly the number of page-sized DMA spans.
+            unsafe { drm_prime_sg_to_dma_addr_array(&mut table, addresses.as_mut_ptr(), 4) },
+            4
+        );
+        assert_eq!(addresses, [0x1000, 0x2000, 0x8000, 0x9000]);
+        assert_eq!(
+            // SAFETY: The table is a valid mapped scatterlist with two entries.
+            unsafe { drm_prime_get_contiguous_size(&mut table) },
+            (2 * PAGE_SIZE) as c_ulong
+        );
+        assert_eq!(
+            // SAFETY: The output array is live but intentionally too short.
+            unsafe { drm_prime_sg_to_dma_addr_array(&mut table, addresses.as_mut_ptr(), 3) },
+            -EINVAL
+        );
+    }
+    use crate::{
+        drm_drv_types::DrmDriver,
+        drm_drv_upstream::{drm_dev_alloc, drm_dev_put},
+        drm_file_upstream::{drm_file_alloc, drm_file_free},
+        drm_gem_upstream::{
+            drm_gem_handle_create, drm_gem_object_lookup, drm_gem_object_put,
+            drm_gem_private_object_init,
+        },
+    };
 
     #[test]
     fn test_prime_cache_and_roundtrip() {
@@ -790,16 +1118,12 @@ mod tests {
 
             let buf1 = kmalloc(core::mem::size_of::<DmaBuf>(), GFP_KERNEL).cast::<DmaBuf>();
             core::ptr::write_bytes(buf1, 0, 1);
-            (*buf1)._vmapping_pad = 1;
 
             let buf2 = kmalloc(core::mem::size_of::<DmaBuf>(), GFP_KERNEL).cast::<DmaBuf>();
             core::ptr::write_bytes(buf2, 0, 1);
-            (*buf2)._vmapping_pad = 1;
 
             assert_eq!(drm_prime_add_buf_handle(&mut prime, buf1, 10), 0);
             assert_eq!(drm_prime_add_buf_handle(&mut prime, buf2, 20), 0);
-            assert_eq!((*buf1)._vmapping_pad, 2);
-            assert_eq!((*buf2)._vmapping_pad, 2);
 
             // Lookup buffer by handle
             assert_eq!(drm_prime_lookup_buf_by_handle(&mut prime, 10), buf1);
@@ -812,7 +1136,10 @@ mod tests {
             assert_eq!(h, 10);
             assert_eq!(drm_prime_lookup_buf_handle(&mut prime, buf2, &mut h), 0);
             assert_eq!(h, 20);
-            assert_eq!(drm_prime_lookup_buf_handle(&mut prime, 0x3000 as *mut _, &mut h), -EINVAL);
+            assert_eq!(
+                drm_prime_lookup_buf_handle(&mut prime, 0x3000 as *mut _, &mut h),
+                -EINVAL
+            );
 
             // Remove handle 10
             mutex_lock(core::ptr::addr_of_mut!(prime.lock));
@@ -820,15 +1147,13 @@ mod tests {
             mutex_unlock(core::ptr::addr_of_mut!(prime.lock));
             assert!(drm_prime_lookup_buf_by_handle(&mut prime, 10).is_null());
             assert_eq!(drm_prime_lookup_buf_by_handle(&mut prime, 20), buf2);
-            assert_eq!((*buf1)._vmapping_pad, 1);
-            dma_buf_put(buf1);
+            kfree(buf1.cast::<c_void>());
 
             // Destroy prime private
             drm_prime_destroy_file_private(&mut prime);
             assert!(prime.dmabufs.node.is_null());
             assert!(prime.handles.node.is_null());
-            assert_eq!((*buf2)._vmapping_pad, 1);
-            dma_buf_put(buf2);
+            kfree(buf2.cast::<c_void>());
 
             // 2. Test handle <-> fd round-trip via real dma-buf export & import
             let mut driver: DrmDriver = core::mem::zeroed();
@@ -848,7 +1173,10 @@ mod tests {
                 flags: 0,
                 fd: -1,
             };
-            assert_eq!(drm_prime_handle_to_fd_ioctl(dev, &mut args as *mut _ as *mut _, file_priv), 0);
+            assert_eq!(
+                drm_prime_handle_to_fd_ioctl(dev, &mut args as *mut _ as *mut _, file_priv),
+                0
+            );
             assert!(args.fd >= 0);
 
             // Second export returns the same cached dma-buf
@@ -857,7 +1185,10 @@ mod tests {
                 flags: 0,
                 fd: -1,
             };
-            assert_eq!(drm_prime_handle_to_fd_ioctl(dev, &mut args_cached as *mut _ as *mut _, file_priv), 0);
+            assert_eq!(
+                drm_prime_handle_to_fd_ioctl(dev, &mut args_cached as *mut _ as *mut _, file_priv),
+                0
+            );
             assert!(args_cached.fd >= 0);
 
             // Import fd in second file
@@ -867,7 +1198,10 @@ mod tests {
                 flags: 0,
                 fd: args.fd,
             };
-            assert_eq!(drm_prime_fd_to_handle_ioctl(dev, &mut args2 as *mut _ as *mut _, file_priv2), 0);
+            assert_eq!(
+                drm_prime_fd_to_handle_ioctl(dev, &mut args2 as *mut _ as *mut _, file_priv2),
+                0
+            );
             assert_ne!(args2.handle, 0);
 
             // Look up imported object and verify it matches original
@@ -877,6 +1211,8 @@ mod tests {
 
             drm_file_free(file_priv2);
             drm_file_free(file_priv);
+            test_file_ops::close_fd(args.fd);
+            test_file_ops::close_fd(args_cached.fd);
             drm_dev_put(dev);
         }
     }

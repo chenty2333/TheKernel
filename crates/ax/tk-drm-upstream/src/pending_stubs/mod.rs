@@ -8,12 +8,11 @@
 pub mod b2c;
 pub mod bridge;
 pub mod debugfs;
-pub mod dma_buf;
+pub mod dma_fence_chain;
 pub mod dp_b2d;
 pub mod drm_client_probe;
 pub mod dumb_buffers;
 pub mod fbdev_cmdline;
-pub mod hrtimer;
 #[cfg(test)]
 pub mod host_test_links;
 pub mod kthread;

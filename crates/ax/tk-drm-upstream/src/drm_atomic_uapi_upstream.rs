@@ -155,10 +155,7 @@ fn is_power_of_2(x: u64) -> bool {
 
 #[inline]
 unsafe fn drm_crtc_find(dev: *mut DrmDevice, file_priv: *mut DrmFile, id: u32) -> *mut DrmCrtc {
-    unsafe {
-        let mo = drm_mode_object_find(dev, file_priv, id, DRM_MODE_OBJECT_CRTC);
-        mo as *mut DrmCrtc
-    }
+    unsafe { crate::drm_crtc_upstream::drm_crtc_find(dev, file_priv, id) }
 }
 
 #[inline]
@@ -1587,4 +1584,42 @@ pub unsafe extern "C" fn drm_mode_atomic_ioctl(
     }
 
     ret
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drm_crtc_find;
+    use crate::{
+        drm_crtc_types::DrmCrtc,
+        drm_mode_object_upstream::{drm_mode_object_add, drm_mode_object_unregister},
+        test_support::TestDrm,
+        uapi_drm_consts::DRM_MODE_OBJECT_CRTC,
+    };
+
+    #[test]
+    fn crtc_id_lookup_returns_the_container_not_its_embedded_base() {
+        let mut drm = TestDrm::new(0);
+        drm.init_registry();
+        let dev = drm.ptr();
+        // SAFETY: `DrmCrtc` is a C-layout DRM object initialized with the
+        // all-zero state used by kzalloc; the test fills in its embedded base.
+        let mut crtc: DrmCrtc = unsafe { core::mem::zeroed() };
+
+        // SAFETY: The registry is initialized and the live CRTC's embedded
+        // object is registered until the explicit unregister below.
+        unsafe {
+            assert_eq!(
+                drm_mode_object_add(dev, core::ptr::addr_of_mut!(crtc.base), DRM_MODE_OBJECT_CRTC),
+                0,
+            );
+            let id = crtc.base.id;
+            let found = drm_crtc_find(dev, core::ptr::null_mut(), id);
+            assert_eq!(found, core::ptr::addr_of_mut!(crtc));
+            assert_eq!(
+                core::ptr::addr_of_mut!((*found).base),
+                core::ptr::addr_of_mut!(crtc.base),
+            );
+            drm_mode_object_unregister(dev, core::ptr::addr_of_mut!(crtc.base));
+        }
+    }
 }

@@ -17,7 +17,7 @@ use core::{
 use crate::{
     config::{EINVAL, ENOMEM},
     dma_fence::{dma_fence_context_alloc, dma_fence_get, dma_fence_is_signaled, dma_fence_put, dma_fence_wait_timeout},
-    dma_fence_array::dma_fence_array_create,
+    dma_fence_array::dma_fence_array_create_owned,
     types::{DmaFence, DmaResv},
 };
 
@@ -290,6 +290,9 @@ pub unsafe extern "C" fn dma_resv_get_singleton(
     fence_out: *mut *mut DmaFence,
 ) -> c_int {
     assert!(!resv.is_null() && !fence_out.is_null());
+    // SAFETY: `fence_out` is writable per this function's caller contract; on
+    // every error path the output must not retain an unrelated stale pointer.
+    unsafe { *fence_out = ptr::null_mut() };
     let mut cursor = DmaResvIter::new(resv.cast(), usage as u32);
     // Every gathered fence takes its own reference; the cursor's reference is
     // released once iteration ends.
@@ -299,19 +302,29 @@ pub unsafe extern "C" fn dma_resv_get_singleton(
         if fence.is_null() {
             break;
         }
+        if fences.try_reserve(1).is_err() {
+            // SAFETY: release the cursor's current reference before returning.
+            unsafe { resv_iter_end(&mut cursor) };
+            for owned in fences.drain(..) {
+                // SAFETY: each element is a reference retained by this call.
+                unsafe { dma_fence_put(owned) };
+            }
+            return -ENOMEM;
+        }
         fences.push(unsafe { dma_fence_get(fence) });
     }
     unsafe { resv_iter_end(&mut cursor) };
+    let needs_array = fences.len() > 1;
     let result = match fences.len() {
         0 => core::ptr::null_mut(),
         1 => fences[0],
-        n => {
-            let array = unsafe {
-                dma_fence_array_create(n as u32, fences.as_mut_ptr(), dma_fence_context_alloc(1), 1)
-            };
-            array.cast::<DmaFence>()
-        }
+        _ => unsafe {
+            dma_fence_array_create_owned(fences, dma_fence_context_alloc(1), 1).cast::<DmaFence>()
+        },
     };
+    if needs_array && result.is_null() {
+        return -ENOMEM;
+    }
     unsafe { *fence_out = result };
     0
 }
@@ -319,8 +332,8 @@ pub unsafe extern "C" fn dma_resv_get_singleton(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
     use core::sync::atomic::AtomicUsize;
-
     use crate::{
         config::ENOENT,
         dma_fence::{dma_fence_add_callback, dma_fence_init, dma_fence_is_signaled, dma_fence_signal},
@@ -329,6 +342,25 @@ mod tests {
     };
     const DMA_RESV_USAGE_KERNEL: u32 = 0;
     static CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+    static TEST_OPS: DmaFenceOps = DmaFenceOps {
+        get_driver_name: None,
+        get_timeline_name: None,
+        enable_signaling: None,
+        signaled: None,
+        wait: None,
+        release: None,
+        set_deadline: None,
+    };
+
+    fn leaked_fence(context: u64, seqno: u64) -> *mut DmaFence {
+        // SAFETY: dma_fence_init initializes the C-layout record before use.
+        let fence = Box::leak(Box::new(unsafe { core::mem::zeroed::<DmaFence>() }));
+        let lock = Box::leak(Box::new(Spinlock::new()));
+        spin_lock_init(lock);
+        // SAFETY: the leaked fence and lock remain live, and TEST_OPS is static.
+        unsafe { dma_fence_init(fence, ptr::addr_of!(TEST_OPS), lock, context, seqno) };
+        fence as *mut DmaFence
+    }
 
     unsafe extern "C" fn completed(_: *mut DmaFence, _: *mut DmaFenceCb) {
         CALLBACKS.fetch_add(1, Ordering::Relaxed);
@@ -373,5 +405,65 @@ mod tests {
             dma_resv_fini(&mut resv);
             assert_eq!(fence.refcount.refcount.refs.counter, 1);
         }
+    }
+
+    #[test]
+    fn singleton_array_owns_a_kernel_buffer_for_its_members() {
+        let _scheduler = crate::test_support::scheduler_context();
+        let first = leaked_fence(11, 1);
+        let second = leaked_fence(12, 1);
+        // SAFETY: dma_resv_init initializes this C-layout record before use.
+        let mut resv: DmaResv = unsafe { core::mem::zeroed() };
+        // SAFETY: `resv` is fresh writable storage and both member fences are
+        // live; the reservation and returned singleton own their references.
+        unsafe {
+            dma_resv_init(&mut resv);
+            dma_resv_add_fence_native(&mut resv, first, DMA_RESV_USAGE_KERNEL);
+            dma_resv_add_fence_native(&mut resv, second, DMA_RESV_USAGE_KERNEL);
+        }
+        let mut singleton = ptr::null_mut();
+        // SAFETY: the reservation is live and `singleton` is writable output.
+        assert_eq!(
+            unsafe {
+                dma_resv_get_singleton(
+                    (&mut resv as *mut DmaResv).cast(),
+                    DMA_RESV_USAGE_KERNEL as c_int,
+                    &mut singleton,
+                )
+            },
+            0
+        );
+        assert!(!singleton.is_null());
+        // SAFETY: singleton is a newly created fence array whose member storage
+        // remains owned by it after the temporary Vec was dropped.
+        unsafe {
+            assert_eq!(crate::dma_fence_array::dma_fence_array_first(singleton), first);
+            assert_eq!(crate::dma_fence_array::dma_fence_array_next(singleton, 1), second);
+            dma_fence_put(singleton);
+            dma_resv_fini(&mut resv);
+        }
+    }
+
+    #[test]
+    fn empty_singleton_clears_the_output_pointer() {
+        // SAFETY: dma_resv_init initializes this C-layout record before use.
+        let mut resv: DmaResv = unsafe { core::mem::zeroed() };
+        // SAFETY: `resv` is fresh writable storage.
+        unsafe { dma_resv_init(&mut resv) };
+        let mut singleton = 1usize as *mut DmaFence;
+        // SAFETY: the reservation is live and `singleton` is writable output.
+        assert_eq!(
+            unsafe {
+                dma_resv_get_singleton(
+                    (&mut resv as *mut DmaResv).cast(),
+                    DMA_RESV_USAGE_KERNEL as c_int,
+                    &mut singleton,
+                )
+            },
+            0
+        );
+        assert!(singleton.is_null());
+        // SAFETY: no sidecar allocation was created for the empty reservation.
+        unsafe { dma_resv_fini(&mut resv) };
     }
 }

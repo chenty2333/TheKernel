@@ -94,6 +94,9 @@ pub unsafe extern "C" fn drm_gem_plane_helper_prepare_fb(
             if !new_fence.is_null() && !fence.is_null() {
                 let chain = dma_fence_chain_alloc();
                 if chain.is_null() {
+                    // Both references are owned here; the accumulator is
+                    // released by the common error path below.
+                    dma_fence_put(new_fence);
                     ret = -ENOMEM;
                     break;
                 }

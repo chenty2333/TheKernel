@@ -167,6 +167,7 @@ pub mod drm_modeset_lock_upstream;
 pub mod drm_plane_upstream;
 pub mod drm_plane_helper_upstream;
 pub mod drm_prime_upstream;
+pub mod drm_dma_buf_upstream;
 pub mod drm_print_upstream;
 pub mod drm_probe_helper_upstream;
 pub mod drm_property_upstream;

@@ -1201,11 +1201,15 @@ pub unsafe fn shmem_read_folio_gfp(
 }
 
 /// Linux `shmem_read_mapping_page_gfp()` page-returning wrapper.
-pub unsafe fn shmem_read_mapping_page_gfp(
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn shmem_read_mapping_page_gfp(
     mapping: *mut AddressSpace,
     index: c_ulong,
     gfp: u32,
 ) -> *mut Page {
+    if mapping.is_null() {
+        return crate::config::ERR_PTR(-EINVAL);
+    }
     unsafe { shmem_read_folio_gfp(mapping, index, gfp) }.cast()
 }
 
@@ -1640,6 +1644,15 @@ pub extern "C" fn get_nr_swap_pages() -> c_long {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_mapping_page_rejects_a_null_mapping() {
+        // SAFETY: null is deliberately supplied to exercise the C ABI's
+        // fail-closed validation before any mapping dereference.
+        let page = unsafe { shmem_read_mapping_page_gfp(ptr::null_mut(), 0, GFP_KERNEL) };
+        assert!(crate::config::IS_ERR(page));
+        assert_eq!(crate::config::PTR_ERR(page), -EINVAL);
+    }
 
     #[test]
     fn file_pages_survive_no_swap_writeback_and_truncate() {

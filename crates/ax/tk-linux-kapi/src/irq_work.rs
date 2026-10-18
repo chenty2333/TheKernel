@@ -57,9 +57,30 @@ pub fn init_irq_work<W: IrqWorkPtr>(work: W, func: unsafe extern "C" fn(*mut Irq
 }
 
 #[inline]
-unsafe fn flags(work: *mut IrqWork) -> &'static AtomicU32 {
+unsafe fn flags<'a>(work: *mut IrqWork) -> &'a AtomicU32 {
     assert!(!work.is_null());
-    &*core::ptr::addr_of_mut!((*work).node.flags.counter).cast::<AtomicU32>()
+    // SAFETY: `work` is live by the caller's contract, and the naturally
+    // aligned flag word is accessed atomically for the item's whole lifetime.
+    unsafe { &*core::ptr::addr_of_mut!((*work).node.flags.counter).cast::<AtomicU32>() }
+}
+
+/// Claim an idle node for deferred execution.
+fn claim(flags: &AtomicU32) -> bool {
+    let mut old = flags.load(Ordering::Acquire);
+    loop {
+        if old & IRQ_WORK_PENDING != 0 {
+            return false;
+        }
+        match flags.compare_exchange_weak(
+            old,
+            old | IRQ_WORK_CLAIMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => old = actual,
+        }
+    }
 }
 
 /// Queue an irq_work callback once. The callback runs in a task context,
@@ -67,39 +88,46 @@ unsafe fn flags(work: *mut IrqWork) -> &'static AtomicU32 {
 pub fn irq_work_queue<W: IrqWorkPtr>(work: W) -> bool {
     let work = work.irq_work_ptr();
     assert!(!work.is_null());
+    // SAFETY: the caller keeps this initialized work item live through queueing.
     let state = unsafe { flags(work) };
-    let mut old = state.load(Ordering::Acquire);
-    loop {
-        if old & IRQ_WORK_PENDING != 0 {
-            return false;
-        }
-        match state.compare_exchange_weak(
-            old,
-            old | IRQ_WORK_CLAIMED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => break,
-            Err(actual) => old = actual,
-        }
-    }
-
-    let address = work as usize;
-    let queued = axtask::spawn(move || {
-        let work = address as *mut IrqWork;
-        let state = unsafe { flags(work) };
-        let callback = unsafe { (*work).func };
-        if let Some(callback) = callback {
-            unsafe { callback(work) };
-        }
-        state.fetch_and(!(IRQ_WORK_PENDING | IRQ_WORK_BUSY), Ordering::Release);
-    });
-    if queued.is_err() {
-        // Do not leave a permanently pending node if task allocation fails.
-        state.fetch_and(!(IRQ_WORK_PENDING | IRQ_WORK_BUSY), Ordering::Release);
+    if !claim(state) {
         return false;
     }
-    true
+    // The workqueue uses its existing persistent pool and intrusive queue, so
+    // claiming an IRQ callback never allocates or starts a task.
+    // SAFETY: the claim above owns the node through dispatch; the caller keeps
+    // its storage alive until the BUSY flag is retired.
+    if unsafe { crate::workqueue::queue_irq_work(work) } {
+        return true;
+    }
+    state.fetch_and(!(IRQ_WORK_PENDING | IRQ_WORK_BUSY), Ordering::Release);
+    false
+}
+
+/// Run a dequeued callback and retire its flags while RCU protects the
+/// embedded node. A callback may drop the final fence reference, which queues
+/// reclamation of the allocation containing this `IrqWork`; its RCU callback
+/// must not run until the runner has finished touching the node.
+///
+/// # Safety
+/// `work` must point to a live node just dequeued by the workqueue, with a
+/// valid callback in `func` and its PENDING/BUSY flags still set.
+pub(crate) unsafe fn run_irq_work(work: *mut IrqWork) {
+    if work.is_null() {
+        return;
+    }
+    // SAFETY: `work` is live under this function's caller contract.
+    let state = unsafe { flags(work) };
+    crate::rcu::rcu_read_lock();
+    // SAFETY: the callback and embedded node remain alive under the RCU
+    // read-side section, even if the callback drops the node's owner.
+    let callback = unsafe { (*work).func };
+    if let Some(callback) = callback {
+        // SAFETY: `func` was installed by `init_irq_work` for this node.
+        unsafe { callback(work) };
+    }
+    state.fetch_and(!(IRQ_WORK_PENDING | IRQ_WORK_BUSY), Ordering::Release);
+    crate::rcu::rcu_read_unlock();
 }
 
 pub fn irq_work_sync<W: IrqWorkPtr>(work: W) {

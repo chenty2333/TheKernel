@@ -224,6 +224,11 @@ pub(crate) fn devices() -> Vec<Arc<UpstreamDrmDevice>> {
     DEVICES.lock().clone()
 }
 
+/// Retain the published transport owner for a GEM-exported DMA-BUF mapping.
+pub(crate) fn device_by_raw(raw: *mut DrmDevice) -> Option<Arc<UpstreamDrmDevice>> {
+    DEVICES.lock().iter().find(|device| device.raw() == raw).cloned()
+}
+
 /// The device behind `/dev/dri/card0`.
 pub(crate) fn primary() -> Option<Arc<UpstreamDrmDevice>> {
     DEVICES.lock().first().cloned()

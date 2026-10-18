@@ -26,11 +26,11 @@ use tk_drm_upstream::{
     },
     drm_ioctl_types::{DRM_RENDER_ALLOW, DrmIoctlDesc},
     drm_syncobj_upstream::{
-        DrmSyncobj, drm_syncobj_chain_alloc, drm_syncobj_chain_free, drm_syncobj_fence_create,
-        drm_syncobj_fence_put, drm_syncobj_fence_signal, drm_syncobj_sync_file_create,
-        drm_syncobj_sync_file_file, drm_syncobj_sync_file_fput, drm_syncobj_sync_file_get_fence,
-        drm_syncobj_add_point, drm_syncobj_find, drm_syncobj_find_fence,
-        drm_syncobj_put, drm_syncobj_replace_fence,
+        DrmSyncobj, drm_syncobj_add_point, drm_syncobj_chain_alloc, drm_syncobj_chain_free,
+        drm_syncobj_fence_create, drm_syncobj_fence_put, drm_syncobj_fence_signal,
+        drm_syncobj_find, drm_syncobj_find_fence, drm_syncobj_put, drm_syncobj_replace_fence,
+        drm_syncobj_sync_file_create, drm_syncobj_sync_file_file, drm_syncobj_sync_file_fput,
+        drm_syncobj_sync_file_get_fence,
     },
 };
 use tk_linux_kapi::{
@@ -62,7 +62,10 @@ struct FilePrivate {
     initialized: bool,
 }
 
-pub(crate) static VIRTGPU_IOCTLS: [DrmIoctlDesc; 11] = [
+pub(crate) static VIRTGPU_IOCTLS: [DrmIoctlDesc; 12] = [
+    // Linux drm_ioctl indexes driver tables by `nr - DRM_COMMAND_BASE`; the
+    // command at 0x40 is reserved, so DRM_VIRTGPU_MAP (0x41) starts at slot 1.
+    ioctl_hole(),
     desc(DRM_IOCTL_VIRTGPU_MAP, ioctl_map as *const ()),
     desc(DRM_IOCTL_VIRTGPU_EXECBUFFER, ioctl_execbuffer as *const ()),
     desc(DRM_IOCTL_VIRTGPU_GETPARAM, ioctl_getparam as *const ()),
@@ -94,11 +97,107 @@ pub(crate) static VIRTGPU_IOCTLS: [DrmIoctlDesc; 11] = [
     ),
 ];
 
+#[cfg(test)]
+mod ioctl_dispatch_tests {
+    use tk_drm_upstream::{
+        drm_drv_types::DrmDriver,
+        drm_drv_upstream::{drm_dev_alloc, drm_dev_put},
+        drm_file_upstream::{drm_file_alloc, drm_file_free},
+        drm_ioctl_upstream::drm_ioctl,
+    };
+    use tk_linux_kapi::types::File;
+
+    use super::*;
+
+    // Linking the complete DRM ioctl table retains these kernel-owned hooks.
+    // This dispatch fixture never calls them; fail loudly if that changes.
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn thekernel_eventfd_signal(_: *mut core::ffi::c_void, _: u64) -> i32 {
+        panic!("eventfd requires the kernel-linked test harness");
+    }
+
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn thekernel_eventfd_ctx_put(_: *mut core::ffi::c_void) {
+        panic!("eventfd requires the kernel-linked test harness");
+    }
+
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn thekernel_eventfd_ctx_fdget(_: i32) -> *mut core::ffi::c_void {
+        panic!("eventfd requires the kernel-linked test harness");
+    }
+
+    #[test]
+    fn getparam_command_uses_its_sparse_driver_table_slot() {
+        let _task_context = crate::test_support::scheduler_context();
+        for command in [
+            DRM_IOCTL_VIRTGPU_MAP,
+            DRM_IOCTL_VIRTGPU_EXECBUFFER,
+            DRM_IOCTL_VIRTGPU_GETPARAM,
+            DRM_IOCTL_VIRTGPU_RESOURCE_CREATE,
+            DRM_IOCTL_VIRTGPU_RESOURCE_INFO,
+            DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST,
+            DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST,
+            DRM_IOCTL_VIRTGPU_WAIT,
+            DRM_IOCTL_VIRTGPU_GET_CAPS,
+            DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB,
+            DRM_IOCTL_VIRTGPU_CONTEXT_INIT,
+        ] {
+            let index = ((command & 0xff) - 0x40) as usize;
+            assert_eq!(VIRTGPU_IOCTLS[index].cmd, command);
+        }
+        assert_eq!(VIRTGPU_IOCTLS[0].cmd, 0);
+        assert!(VIRTGPU_IOCTLS[0].func.is_null());
+
+        // Exercise the actual drm_ioctl index-and-dispatch path. The fixture
+        // has no VirtGPU private state, so the correct GETPARAM handler returns
+        // ENODEV; a shifted table instead dispatches RESOURCE_CREATE and
+        // returns EINVAL for this 16-byte GETPARAM structure.
+        unsafe {
+            let mut driver: DrmDriver = core::mem::zeroed();
+            driver.ioctls = VIRTGPU_IOCTLS.as_ptr().cast_mut();
+            driver.num_ioctls = VIRTGPU_IOCTLS.len() as i32;
+            let dev = drm_dev_alloc(&driver, ptr::null_mut());
+            assert!(!dev.is_null());
+
+            let file_priv = drm_file_alloc((*dev).render);
+            assert!(!file_priv.is_null());
+            let mut filp: File = core::mem::zeroed();
+            filp.private_data = file_priv.cast();
+            let filp_ptr = &mut filp as *mut File;
+            let mut args = DrmVirtgpuGetparam {
+                param: VIRTGPU_PARAM_3D_FEATURES,
+                value: 0,
+            };
+
+            assert_eq!(
+                drm_ioctl(
+                    filp_ptr,
+                    DRM_IOCTL_VIRTGPU_GETPARAM,
+                    &mut args as *mut DrmVirtgpuGetparam as usize as _,
+                ),
+                -tk_linux_kapi::config::ENODEV,
+            );
+
+            drm_file_free(file_priv);
+            drm_dev_put(dev);
+        }
+    }
+}
+
 const fn desc(cmd: u32, func: *const ()) -> DrmIoctlDesc {
     DrmIoctlDesc {
         cmd,
         flags: DRM_RENDER_ALLOW,
         func: func as *mut c_void,
+        name: ptr::null_mut(),
+    }
+}
+
+const fn ioctl_hole() -> DrmIoctlDesc {
+    DrmIoctlDesc {
+        cmd: 0,
+        flags: 0,
+        func: ptr::null_mut(),
         name: ptr::null_mut(),
     }
 }
@@ -383,14 +482,9 @@ unsafe extern "C" fn ioctl_getparam(
             } else {
                 // SAFETY: `copy_to_user` copies `size_of::<i32>()` bytes from the local stack variable
                 // `value` to the verified non-null userspace destination `address`.
-                let ret = unsafe {
-                    copy_to_user(address, ptr::addr_of!(value).cast(), size_of::<i32>())
-                };
-                if ret != 0 {
-                    -EFAULT
-                } else {
-                    0
-                }
+                let ret =
+                    unsafe { copy_to_user(address, ptr::addr_of!(value).cast(), size_of::<i32>()) };
+                if ret != 0 { -EFAULT } else { 0 }
             }
         }
     }

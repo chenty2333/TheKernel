@@ -21,6 +21,7 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
+use axerrno::{AxError, AxResult, LinuxError};
 use intel_gt::{
     linux::gem_memory::NotifierBlock,
     linux_platform::{I915PlatformOps, install_i915_platform_ops},
@@ -34,11 +35,12 @@ use super::pci::ConfigWriteSpace;
 const STRIDE_UNIT: u32 = 64;
 const MAX_STRIDE: u32 = 4095 * STRIDE_UNIT;
 
-use super::power;
 use intel_gt::{
     intel_uncore_types_upstream::{IntelUncore, intel_uncore_read, intel_uncore_write},
     intel_workarounds_types_upstream::I915RegT,
 };
+
+use super::power;
 
 /// `DC_STATE_EN` (display MMIO 0x45504).
 const DC_STATE_EN: I915RegT = I915RegT { reg: 0x4_5504 };
@@ -368,7 +370,9 @@ pub(super) fn install_providers() -> Result<(), &'static str> {
                 };
                 let ack_mask = axhal::boot::intel_cpu_cache_ready_mask();
                 panic!(
-                    "cross-CPU PAT setup timed out on CPU {cpu}: expected mask {expected_mask:#x}, acknowledged mask {ack_mask:#x}, waiting for intel_cpu_mmap_ready"
+                    "cross-CPU PAT setup timed out on CPU {cpu}: expected mask \
+                     {expected_mask:#x}, acknowledged mask {ack_mask:#x}, waiting for \
+                     intel_cpu_mmap_ready"
                 );
             }
             core::hint::spin_loop();
@@ -521,13 +525,19 @@ pub(super) fn allocated_device() -> Option<*mut c_void> {
 }
 
 fn gt_uncore() -> Option<*mut IntelUncore> {
-    let i915 = ALLOCATED_I915.load(Ordering::Acquire).cast::<intel_gt::linux_i915_private::DrmI915Private>();
+    let i915 = ALLOCATED_I915
+        .load(Ordering::Acquire)
+        .cast::<intel_gt::linux_i915_private::DrmI915Private>();
     if i915.is_null() {
         return None;
     }
     // SAFETY: `i915` is the device the probe registered and it lives for the
     // kernel's lifetime; `uncore` is the embedded `struct intel_uncore`.
-    Some(unsafe { ptr::addr_of!((*i915).uncore).cast::<IntelUncore>().cast_mut() })
+    Some(unsafe {
+        ptr::addr_of!((*i915).uncore)
+            .cast::<IntelUncore>()
+            .cast_mut()
+    })
 }
 
 /// Take one reference on `POWER_DOMAIN_GT_IRQ`.
@@ -540,10 +550,7 @@ fn gt_uncore() -> Option<*mut IntelUncore> {
 /// GT interrupts.
 // upstream: display/intel_display_power.c intel_display_power_get()
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn intel_display_power_get(
-    display: *mut c_void,
-    domain: i32,
-) -> *mut c_void {
+pub unsafe extern "C" fn intel_display_power_get(display: *mut c_void, domain: i32) -> *mut c_void {
     if super::upstream_drm::native_modeset_enabled() {
         // The display driver owns power domains; use its full translation.
         // SAFETY: `display` is the live intel_display whose power domains
@@ -612,7 +619,6 @@ pub unsafe extern "C" fn __intel_display_power_put_async(
         .checked_sub(1)
         .expect("__intel_display_power_put_async(GT_IRQ): reference underflow");
 }
-
 
 // Frontbuffer entry points are provided by tk-intel-gt::intel_frontbuffer_upstream.
 
@@ -966,6 +972,10 @@ fn current_identity_key() -> usize {
     Arc::as_ptr(&current) as usize
 }
 
+fn current_file_table_key() -> usize {
+    Arc::as_ptr(&crate::file::current_fd_table()) as usize
+}
+
 // ---------------------------------------------------------------------------
 // Task identity and credentials (`TaskOps`)
 // ---------------------------------------------------------------------------
@@ -1110,6 +1120,31 @@ impl AnonFile {
     fn linux_file(&self) -> *mut tk_linux_kapi::shmem::File {
         self.file as *mut tk_linux_kapi::shmem::File
     }
+
+    /// The live LinuxKPI file's immutable operations table.
+    fn file_operations(&self) -> Option<&tk_linux_kapi::shmem::FileOperations> {
+        // SAFETY: the descriptor owns a live LinuxKPI file reference. Its f_op
+        // table is installed before fd_install and remains valid while held.
+        let file = unsafe { self.linux_file().as_ref() }?;
+        // SAFETY: LinuxKPI file-operation tables have static lifetime.
+        unsafe { file.f_op.as_ref() }
+    }
+}
+
+fn linux_file_result(result: core::ffi::c_long) -> AxResult<usize> {
+    if result < 0 {
+        // Linux's internal restart value is consumed by the syscall return path
+        // rather than exposed as errno 512.
+        if result == -(tk_linux_kapi::config::ERESTARTSYS as core::ffi::c_long) {
+            return Err(AxError::Interrupted);
+        }
+        let errno = i32::try_from(result.saturating_neg()).unwrap_or(LinuxError::EIO.code());
+        Err(LinuxError::try_from(errno)
+            .map(AxError::from)
+            .unwrap_or(AxError::Io))
+    } else {
+        usize::try_from(result).map_err(|_| AxError::Io)
+    }
 }
 
 impl Pollable for AnonFile {
@@ -1138,7 +1173,55 @@ impl FileLike for AnonFile {
     }
 
     fn stat(&self) -> axerrno::AxResult<crate::file::Kstat> {
-        Err(axerrno::AxError::BadFileDescriptor)
+        let mut stat = crate::file::anon_inode_stat();
+        // SAFETY: this AnonFile owns a live LinuxKPI reference, and the helper
+        // reads size only after checking the exact DMA-BUF f_op identity.
+        let size = unsafe {
+            tk_drm_upstream::drm_dma_buf_upstream::dma_buf_file_size(self.linux_file())
+        };
+        if let Some(size) = size {
+            stat.size = size;
+        }
+        Ok(stat)
+    }
+
+    fn ioctl(&self, _context: &crate::file::IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
+        let file = self.linux_file();
+        // DMA-BUF uses f_op as an identity and supplies ioctl handling outside
+        // its table. Never reinterpret private_data for another anon file.
+        // SAFETY: the descriptor retains a live LinuxKPI file reference.
+        let result = if unsafe { tk_drm_upstream::drm_dma_buf_upstream::is_dma_buf_file(file) } {
+            // SAFETY: the accessor confirmed the DMA_BUF_FOPS discriminator;
+            // the helper handles only the DMA-BUF sync ioctl.
+            unsafe { tk_drm_upstream::drm_dma_buf_upstream::dma_buf_ioctl(file, cmd, arg) }
+        } else {
+            let fops = self.file_operations().ok_or(AxError::NotATty)?;
+            if fops._unlocked_ioctl.is_null() {
+                return Err(AxError::NotATty);
+            }
+            type UnlockedIoctl = unsafe extern "C" fn(
+                *mut tk_linux_kapi::shmem::File,
+                u32,
+                usize,
+            ) -> core::ffi::c_long;
+            // SAFETY: the file's non-null operations slot uses the Linux
+            // unlocked_ioctl ABI; KAPI stores it opaquely to preserve layout.
+            let ioctl: UnlockedIoctl = unsafe { core::mem::transmute(fops._unlocked_ioctl) };
+            // SAFETY: the callback belongs to the live file's immutable f_op table.
+            unsafe { ioctl(file, cmd, arg) }
+        };
+        linux_file_result(result)
+    }
+
+    fn prepare_mmap(
+        &self,
+        request: crate::file::FileMmapRequest,
+    ) -> AxResult<Option<crate::file::PreparedFileMmap>> {
+        // SAFETY: this AnonFile owns the file reference for this synchronous
+        // call; the helper validates DMA-BUF and GEM exporter identities.
+        unsafe {
+            crate::pseudofs::dev::upstream_dri::prepare_dma_buf_mmap(self.linux_file(), request)
+        }
     }
 }
 
@@ -1166,7 +1249,9 @@ unsafe extern "C" fn kernel_anon_inode_getfile(
 }
 
 /// Descriptors reserved by `get_unused_fd_flags` and not yet installed.
-static RESERVED_FDS: axsync::Mutex<BTreeMap<c_int, ReservedFd>> =
+/// Linux descriptors are table-local: different tables may reserve the same
+/// number concurrently, so the transient bridge key includes the table id.
+static RESERVED_FDS: axsync::Mutex<BTreeMap<(usize, c_int), ReservedFd>> =
     axsync::Mutex::new(BTreeMap::new());
 
 const O_CLOEXEC_BIT: c_int = 0o2000000;
@@ -1176,7 +1261,13 @@ unsafe extern "C" fn kernel_get_unused_fd_flags(flags: c_int) -> c_int {
     match crate::file::reserve_fd(cloexec) {
         Ok(reservation) => {
             let fd = reservation.fd();
-            RESERVED_FDS.lock().insert(fd, reservation);
+            let key = (current_file_table_key(), fd);
+            let mut reservations = RESERVED_FDS.lock();
+            assert!(
+                !reservations.contains_key(&key),
+                "fd {fd} reserved twice by the same file table"
+            );
+            reservations.insert(key, reservation);
             fd
         }
         Err(_) => -EMFILE,
@@ -1185,7 +1276,8 @@ unsafe extern "C" fn kernel_get_unused_fd_flags(flags: c_int) -> c_int {
 
 unsafe extern "C" fn kernel_put_unused_fd(fd: c_int) {
     // Dropping the reservation returns the number to the table.
-    drop(RESERVED_FDS.lock().remove(&fd));
+    let key = (current_file_table_key(), fd);
+    drop(RESERVED_FDS.lock().remove(&key));
 }
 
 /// Linux `fd_install()`. A sync_file file is wrapped as a pollable sync_file
@@ -1193,24 +1285,30 @@ unsafe extern "C" fn kernel_put_unused_fd(fd: c_int) {
 /// The descriptor takes over the reference `file` carries.
 unsafe extern "C" fn kernel_fd_install(fd: c_int, file: *mut c_void) {
     assert!(!file.is_null(), "fd_install with a null file");
+    let key = (current_file_table_key(), fd);
     let reservation = RESERVED_FDS
         .lock()
-        .remove(&fd)
+        .remove(&key)
         .unwrap_or_else(|| panic!("fd_install({fd}) without a reservation"));
     let file = file.cast::<tk_linux_kapi::shmem::File>();
+    // SAFETY: fd_install owns this live file reference. Preserve its access
+    // mode (notably DRM_RDWR for writable PRIME mmap) on the native OFD;
+    // close-on-exec belongs to the reserved descriptor, not status flags.
+    let status_flags = unsafe { (*file).f_flags } & !(O_CLOEXEC_BIT as u32);
     // SAFETY: fd_install receives a live LinuxKPI file reference and transfers
     // it to the descriptor below; classification only reads its operations table.
     let is_sync_file = unsafe { tk_linux_kapi::sync_file::is_sync_file_file(file) };
-    let file_like: Arc<dyn FileLike> =
-        if is_sync_file {
-            Arc::new(
-                crate::drm::sync_file::SyncFileFd::try_new(file)
-                    .unwrap_or_else(|error| panic!("fd_install({fd}): {error:?}")),
-            )
-        } else {
-            Arc::new(AnonFile { file: file as usize })
-        };
-    let description = FileDescription::new(file_like)
+    let file_like: Arc<dyn FileLike> = if is_sync_file {
+        Arc::new(
+            crate::drm::sync_file::SyncFileFd::try_new(file)
+                .unwrap_or_else(|error| panic!("fd_install({fd}): {error:?}")),
+        )
+    } else {
+        Arc::new(AnonFile {
+            file: file as usize,
+        })
+    };
+    let description = FileDescription::new_with_flags(file_like, status_flags)
         .unwrap_or_else(|error| panic!("fd_install({fd}): {error:?}"));
     // The reservation publishes the descriptor into the caller's table.
     if let Err(error) = reservation.publish(description) {
@@ -1221,17 +1319,19 @@ unsafe extern "C" fn kernel_fd_install(fd: c_int, file: *mut c_void) {
 /// Linux `fget(fd)`: a new reference to the LinuxKPI file behind `fd`, or
 /// null when `fd` is not open or is not backed by a LinuxKPI file.
 unsafe extern "C" fn kernel_fget(fd: c_int) -> *mut c_void {
-    let file = if let Ok(anon) = crate::file::get_typed_file::<AnonFile>(fd) {
-        anon.linux_file()
-    } else if let Ok(sync_file) = crate::file::get_typed_file::<crate::drm::sync_file::SyncFileFd>(fd)
+    if let Ok(anon) = crate::file::get_typed_file::<AnonFile>(fd) {
+        // SAFETY: acquire the LinuxKPI reference while the retained descriptor
+        // still pins its file, even if another thread concurrently closes fd.
+        unsafe { tk_linux_kapi::shmem::fget_file(anon.linux_file()) }.cast()
+    } else if let Ok(sync_file) =
+        crate::file::get_typed_file::<crate::drm::sync_file::SyncFileFd>(fd)
     {
-        sync_file.linux_file()
+        // SAFETY: the typed handle remains alive until after fget_file has
+        // acquired the caller's independent reference.
+        unsafe { tk_linux_kapi::shmem::fget_file(sync_file.linux_file()) }.cast()
     } else {
-        return ptr::null_mut();
-    };
-    // SAFETY: the descriptor still holds its reference while `anon`/`sync_file`
-    // is alive, so the file is live; the caller's reference is dropped with fput.
-    unsafe { tk_linux_kapi::shmem::fget_file(file) }.cast()
+        ptr::null_mut()
+    }
 }
 
 static FILE_OPS: FileOps = FileOps {
@@ -1369,7 +1469,9 @@ unsafe extern "C" fn kernel_pci_enable_device(dev: *mut c_void) -> c_int {
     let key = (bdf.bus, bdf.device, bdf.function);
     if let Some(state) = before.get_mut(&key) {
         if state.references != 0 {
-            let Some(references) = state.references.checked_add(1) else { return -75; };
+            let Some(references) = state.references.checked_add(1) else {
+                return -75;
+            };
             state.references = references;
             return 0;
         }
@@ -1383,8 +1485,13 @@ unsafe extern "C" fn kernel_pci_enable_device(dev: *mut c_void) -> c_int {
         command | CMD_MEM | if has_io { CMD_IO } else { 0 }
     }) {
         Some(()) => {
-            before.entry(key).and_modify(|state| state.references = 1)
-                .or_insert(PciEnableState { original: original.unwrap(), references: 1 });
+            before
+                .entry(key)
+                .and_modify(|state| state.references = 1)
+                .or_insert(PciEnableState {
+                    original: original.unwrap(),
+                    references: 1,
+                });
             0
         }
         None => -EIO_,
@@ -1405,10 +1512,14 @@ unsafe extern "C" fn kernel_pci_disable_device(dev: *mut c_void) {
             if config_update_command(bdf, |command| {
                 (command & !(CMD_IO | CMD_MEM | CMD_MASTER))
                     | (original & (CMD_IO | CMD_MEM | CMD_MASTER))
-            }).is_some() {
+            })
+            .is_some()
+            {
                 before.remove(&key);
             } else {
-                axlog::warn!("intel-gt: PCI command rollback unverified; retaining retryable before-image");
+                axlog::warn!(
+                    "intel-gt: PCI command rollback unverified; retaining retryable before-image"
+                );
             }
         }
     }
@@ -1904,7 +2015,8 @@ fn wait_until(what: &'static str, mut done: impl FnMut() -> bool) {
             let expected_mask = all_mask & !this_mask;
             let ack_mask = SMP_ACK_MASK.load(Ordering::Acquire);
             panic!(
-                "cross-CPU call timed out on CPU {cpu}: expected mask {expected_mask:#x}, acknowledged mask {ack_mask:#x}, waiting for {what}"
+                "cross-CPU call timed out on CPU {cpu}: expected mask {expected_mask:#x}, \
+                 acknowledged mask {ack_mask:#x}, waiting for {what}"
             );
         }
         core::hint::spin_loop();
@@ -1929,7 +2041,9 @@ unsafe extern "C" fn kernel_call_on_other_cpus(
     SMP_DONE.store(0, Ordering::Release);
     SMP_ACK_MASK.store(0, Ordering::Release);
     send_ipi_to_others();
-    wait_until("call_on_other_cpus", || SMP_DONE.load(Ordering::Acquire) == others);
+    wait_until("call_on_other_cpus", || {
+        SMP_DONE.load(Ordering::Acquire) == others
+    });
 }
 
 /// `stop_machine()` on more than one CPU: every other CPU parks in the IPI
@@ -1952,11 +2066,15 @@ unsafe extern "C" fn kernel_stop_machine(
     SMP_RESUME.store(false, Ordering::Release);
     SMP_ACK_MASK.store(0, Ordering::Release);
     send_ipi_to_others();
-    wait_until("stop_machine park", || SMP_PARKED.load(Ordering::Acquire) == others);
+    wait_until("stop_machine park", || {
+        SMP_PARKED.load(Ordering::Acquire) == others
+    });
     // SAFETY: as above; the other CPUs are parked in the IPI until it returns.
     let result = unsafe { func(data) };
     SMP_RESUME.store(true, Ordering::Release);
-    wait_until("stop_machine unpark", || SMP_PARKED.load(Ordering::Acquire) == 0);
+    wait_until("stop_machine unpark", || {
+        SMP_PARKED.load(Ordering::Acquire) == 0
+    });
     SMP_RESUME.store(false, Ordering::Release);
     SMP_MODE.store(SMP_MODE_CALL, Ordering::Release);
     result

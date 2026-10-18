@@ -1020,7 +1020,7 @@ pub unsafe extern "C" fn drm_gem_shmem_prime_import_no_map(
         if attach.is_null() {
             return tk_linux_kapi::config::ERR_PTR(-EIO);
         }
-        crate::drm_prime_upstream::get_dma_buf(dmabuf);
+        crate::drm_dma_buf_upstream::get_dma_buf(dmabuf);
         let Some(size) = (*dmabuf).size.checked_add(PAGE_SIZE - 1) else {
             dma_buf_detach(dmabuf, attach);
             dma_buf_put(dmabuf);

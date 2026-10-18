@@ -555,7 +555,7 @@ pub unsafe extern "C" fn drm_ioctl_kernel(
             return -EINVAL;
         }
         let dev = (*(*file_priv).minor).dev;
-        if (*dev).unplugged {
+        if (*dev).unplugged.load(core::sync::atomic::Ordering::Acquire) {
             return -ENODEV;
         }
         let ret = drm_ioctl_permit(flags, file_priv);
@@ -582,7 +582,7 @@ pub unsafe extern "C" fn drm_ioctl(
             return -EINVAL;
         }
         let dev = (*(*file_priv).minor).dev;
-        if (*dev).unplugged {
+        if (*dev).unplugged.load(core::sync::atomic::Ordering::Acquire) {
             return -ENODEV;
         }
 
@@ -633,9 +633,15 @@ pub unsafe extern "C" fn drm_ioctl(
         }
         let ksize = drv_size.max(in_size).max(out_size) as usize;
 
-        let mut stack_buf = [0u8; 128];
-        let kdata = if ksize <= stack_buf.len() {
-            stack_buf.as_mut_ptr()
+        // Ioctl handlers reinterpret this byte buffer as UAPI structs, which
+        // may require up to 16-byte alignment on x86_64. Preserve that ABI
+        // guarantee explicitly instead of relying on incidental stack layout.
+        #[repr(C, align(16))]
+        struct StackKdata([u8; 128]);
+        let mut stack = StackKdata([0; 128]);
+        let stack_ptr = stack.0.as_mut_ptr();
+        let kdata = if ksize <= stack.0.len() {
+            stack_ptr
         } else {
             kmalloc(ksize, GFP_KERNEL).cast::<u8>()
         };
@@ -645,7 +651,7 @@ pub unsafe extern "C" fn drm_ioctl(
 
         if in_size > 0 {
             if copy_from_user(kdata.cast(), arg as *const c_void, in_size as usize) != 0 {
-                if kdata != stack_buf.as_mut_ptr() {
+                if kdata != stack_ptr {
                     kfree(kdata.cast::<c_void>());
                 }
                 return -EFAULT;
@@ -663,7 +669,7 @@ pub unsafe extern "C" fn drm_ioctl(
             }
         }
 
-        if kdata != stack_buf.as_mut_ptr() {
+        if kdata != stack_ptr {
             kfree(kdata.cast::<c_void>());
         }
 
@@ -745,9 +751,10 @@ mod tests {
         b: u64,
     }
 
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     static RECEIVED_A: AtomicU64 = AtomicU64::new(0);
     static RECEIVED_B: AtomicU64 = AtomicU64::new(0);
+    static RECEIVED_ALIGNED: AtomicBool = AtomicBool::new(false);
 
     unsafe extern "C" fn test_driver_ioctl(
         _dev: *mut DrmDevice,
@@ -756,6 +763,7 @@ mod tests {
     ) -> i32 {
         unsafe {
             let d = data.cast::<DriverTestData>();
+            RECEIVED_ALIGNED.store((data as usize) % 16 == 0, Ordering::SeqCst);
             RECEIVED_A.store((*d).a, Ordering::SeqCst);
             RECEIVED_B.store((*d).b, Ordering::SeqCst);
             (*d).a = 0x1111;
@@ -814,6 +822,7 @@ mod tests {
             assert_eq!(ret, 0);
             assert_eq!(RECEIVED_A.load(Ordering::SeqCst), 0xaaaaaaaaaaaaaaaa);
             assert_eq!(RECEIVED_B.load(Ordering::SeqCst), 0); // zero-extended!
+            assert!(RECEIVED_ALIGNED.load(Ordering::SeqCst));
 
             // 4. Truncation rule: user passes 24 bytes (user_size = 24 > drv_size = 16)
             let mut user_buf_24 = AlignedBuf([0u8; 24]);

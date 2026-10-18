@@ -474,11 +474,14 @@ fn drmm_kmalloc_and_kstrdup_are_tracked() {
     let mut dev: TestDrm = TestDrm::new(0);
     let p = dev.ptr();
     unsafe {
-        let buf = drmm_kmalloc(p, 16, 0) as *mut u8;
+        // This KAPI has no non-sleeping heap pool: honor the caller's flags
+        // rather than silently changing a NOWAIT request to GFP_KERNEL.
+        assert!(drmm_kmalloc(p, 16, 0).is_null());
+        let buf = drmm_kmalloc(p, 16, tk_linux_kapi::config::GFP_KERNEL) as *mut u8;
         assert!(!buf.is_null());
         *buf = 7;
         drmm_kfree(p, buf as *mut c_void);
-        let s = drmm_kstrdup(p, c"hi".as_ptr(), 0);
+        let s = drmm_kstrdup(p, c"hi".as_ptr(), tk_linux_kapi::config::GFP_KERNEL);
         assert_eq!(core::ffi::CStr::from_ptr(s).to_bytes(), b"hi");
         drm_managed_release(p);
     }

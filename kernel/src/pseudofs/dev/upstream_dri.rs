@@ -16,13 +16,16 @@ use axfs_ng_vfs::{DeviceId, Location, NodeFlags, VfsError, VfsResult};
 use axio::prelude::*;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable};
 use kspin::SpinNoIrq;
-use linux_raw_sys::general::{O_ACCMODE, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, S_IFCHR};
+use linux_raw_sys::general::{
+    O_ACCMODE, O_CLOEXEC, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, S_IFCHR,
+};
 use memory_addr::PhysAddr;
 use tk_drm_upstream::{
     drm_connector_types::{CONNECTOR_STATUS_CONNECTED, DrmConnector},
     drm_file_types::{DrmFile, DrmMinor},
     drm_gem_shmem_helper_types_upstream::DrmGemShmemObject,
     drm_gem_types::DrmGemObject,
+    drm_lease_upstream::{LeaseFileOps, LesseeFileSetup, install_lease_file_ops},
 };
 use tk_linux_kapi::{
     locks::{read_lock, read_unlock},
@@ -35,8 +38,9 @@ use tk_linux_kapi::{
 use crate::{
     drm::upstream::UpstreamDrmDevice,
     file::{
-        FileLike, FileMmapProtection, FileMmapRequest, FileMmapSharing, FixedSharedMmapRegion,
-        IoDst, IoSrc, IoctlContext, Kstat, OfdIoStatus, PreparedFileMmap, SharedMmapOps,
+        FileDescription, FileLike, FileMmapProtection, FileMmapRequest, FileMmapSharing,
+        FixedSharedMmapRegion, IoDst, IoSrc, IoctlContext, Kstat, OfdIoStatus, PreparedFileMmap,
+        ReservedFd, SharedMmapOps,
     },
     mm::{ExternalPageLease, SharedPages},
     pseudofs::{
@@ -61,12 +65,6 @@ const EPOLLIN: u32 = 0x0001;
 const EPOLLRDNORM: u32 = 0x0040;
 const EPOLLERR: u32 = 0x0008;
 const EPOLLHUP: u32 = 0x0010;
-
-/// Linux `drm_open()` in this import resolves the primary by non-null inode and
-/// obtains the minor from the global DRM xarray. It currently does not inspect
-/// inode fields, but retain a real stable byte as its non-null discriminator.
-#[derive(Default)]
-struct OpenInode(u8);
 
 struct UpstreamDrmNode {
     device: Arc<UpstreamDrmDevice>,
@@ -97,24 +95,70 @@ pub(crate) fn render_node(
     }
 }
 
-/// `/dev/dri` as a live directory: one `card<N>` and one `renderD<N>` entry per
-/// device on the upstream list at lookup time. A device can publish after devfs
-/// has mounted (i915 probes from the rootfs-ready callback), so the directory
-/// is never a snapshot. Each name's node is created once and reused, because
-/// `primary_node()` publishes the device's sysfs identity.
+/// `/dev/dri` as a live directory: eagerly publish nodes for devices already
+/// registered when devfs is built, then add devices installed later on lookup.
+/// Eager publication makes their sysfs identities available before sysfs is
+/// mounted and udev coldplugs. Each name's node is created once and reused,
+/// because `primary_node()` publishes the device's sysfs identity.
 pub(crate) struct DriDirectory {
     fs: Arc<crate::pseudofs::SimpleFs>,
     /// name -> (raw `drm_device` the node serves, node).
-    nodes: axsync::Mutex<alloc::collections::BTreeMap<Vec<u8>, (usize, crate::pseudofs::NodeOpsMux)>>,
+    nodes:
+        axsync::Mutex<alloc::collections::BTreeMap<Vec<u8>, (usize, crate::pseudofs::NodeOpsMux)>>,
 }
 
 impl DriDirectory {
     pub(crate) fn new(fs: Arc<crate::pseudofs::SimpleFs>) -> Self {
+        let mut nodes = alloc::collections::BTreeMap::new();
+        for device in crate::drm::upstream::devices() {
+            if let Err(error) = cache_device_nodes(&fs, &mut nodes, device.clone()) {
+                warn!(
+                    "DRM device {} initial sysfs publication failed: {error:?}",
+                    device.label()
+                );
+            }
+        }
         Self {
             fs,
-            nodes: axsync::Mutex::new(alloc::collections::BTreeMap::new()),
+            nodes: axsync::Mutex::new(nodes),
         }
     }
+}
+
+/// Populate/reuse both devnodes for a registered device. The primary node is
+/// deliberately built first: it publishes the sysfs device objects (including
+/// `dev` and `DEVNAME` metadata) that udev needs to set render-node ownership.
+fn cache_device_nodes(
+    fs: &Arc<crate::pseudofs::SimpleFs>,
+    nodes: &mut alloc::collections::BTreeMap<Vec<u8>, (usize, crate::pseudofs::NodeOpsMux)>,
+    device: Arc<UpstreamDrmDevice>,
+) -> VfsResult<()> {
+    let raw = device.raw() as usize;
+    let Some(primary_index) = device.primary_index() else {
+        return Ok(());
+    };
+    let primary_name = format!("card{primary_index}").into_bytes();
+    let primary_cached = nodes
+        .get(&primary_name)
+        .is_some_and(|(cached, _)| *cached == raw);
+    if !primary_cached {
+        let node: crate::pseudofs::NodeOpsMux = primary_node(fs.clone(), device.clone())?.into();
+        nodes.insert(primary_name, (raw, node));
+    }
+
+    if let Some(render_index) = device.render_index() {
+        let render_name = format!("renderD{render_index}").into_bytes();
+        let render_cached = nodes
+            .get(&render_name)
+            .is_some_and(|(cached, _)| *cached == raw);
+        if !render_cached {
+            let node: crate::pseudofs::NodeOpsMux = render_node(fs.clone(), device)?
+                .ok_or(VfsError::NotFound)?
+                .into();
+            nodes.insert(render_name, (raw, node));
+        }
+    }
+    Ok(())
 }
 
 /// Parses `card<N>` (primary) or `renderD<N>` (render) into `(render, index)`.
@@ -127,16 +171,27 @@ fn parse_dri_name(name: &[u8]) -> Option<(bool, u32)> {
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    core::str::from_utf8(digits).ok()?.parse().ok().map(|index| (render, index))
+    core::str::from_utf8(digits)
+        .ok()?
+        .parse()
+        .ok()
+        .map(|index| (render, index))
 }
 
 impl crate::pseudofs::SimpleDirOps for DriDirectory {
     fn child_names<'a>(&'a self) -> VfsResult<crate::pseudofs::ChildNames<'a>> {
         let mut names: Vec<Cow<'a, axfs_ng_vfs::FsName>> = Vec::new();
         for device in crate::drm::upstream::devices() {
-            for (render, index) in [(false, device.primary_index()), (true, device.render_index())] {
+            for (render, index) in [
+                (false, device.primary_index()),
+                (true, device.render_index()),
+            ] {
                 if let Some(index) = index {
-                    let name = if render { format!("renderD{index}") } else { format!("card{index}") };
+                    let name = if render {
+                        format!("renderD{index}")
+                    } else {
+                        format!("card{index}")
+                    };
                     let name = axfs_ng_vfs::FsNameBuf::from_vec(name.into_bytes())
                         .expect("DRM node names are valid pseudo-filesystem names");
                     names.push(Cow::Owned(name));
@@ -151,7 +206,11 @@ impl crate::pseudofs::SimpleDirOps for DriDirectory {
         let device = crate::drm::upstream::devices()
             .into_iter()
             .find(|device| {
-                let minor = if render { device.render_index() } else { device.primary_index() };
+                let minor = if render {
+                    device.render_index()
+                } else {
+                    device.primary_index()
+                };
                 minor == Some(index)
             })
             .ok_or(VfsError::NotFound)?;
@@ -162,13 +221,17 @@ impl crate::pseudofs::SimpleDirOps for DriDirectory {
                 return Ok(node.clone());
             }
         }
-        let node: crate::pseudofs::NodeOpsMux = if render {
-            render_node(self.fs.clone(), device)?.ok_or(VfsError::NotFound)?.into()
-        } else {
-            primary_node(self.fs.clone(), device)?.into()
-        };
-        nodes.insert(name.as_bytes().to_vec(), (raw, node.clone()));
-        Ok(node)
+        if let Err(error) = cache_device_nodes(&self.fs, &mut nodes, device.clone()) {
+            if !render {
+                warn!("DRM primary minor {index} sysfs publication failed: {error:?}");
+            }
+            return Err(error);
+        }
+        nodes
+            .get(name.as_bytes())
+            .filter(|(cached, _)| *cached == raw)
+            .map(|(_, node)| node.clone())
+            .ok_or(VfsError::NotFound)
     }
 
     fn is_cacheable(&self) -> bool {
@@ -232,7 +295,9 @@ fn connectors(device: &UpstreamDrmDevice) -> Vec<(alloc::string::String, bool)> 
                 .cast::<DrmConnector>();
             let name = (*connector).name;
             if !name.is_null() {
-                let name = core::ffi::CStr::from_ptr(name).to_string_lossy().into_owned();
+                let name = core::ffi::CStr::from_ptr(name)
+                    .to_string_lossy()
+                    .into_owned();
                 if found.try_reserve(1).is_ok() {
                     found.push((name, (*connector).status == CONNECTOR_STATUS_CONNECTED));
                 }
@@ -249,7 +314,9 @@ pub(super) fn attribute(name: &str, value: &'static str) -> DeviceAttribute {
 }
 
 pub(super) fn mode_attribute(width: u32, height: u32) -> DeviceAttribute {
-    DeviceAttribute::try_new("modes".into(), move || Ok(alloc::format!("{width}x{height}\n")))
+    DeviceAttribute::try_new("modes".into(), move || {
+        Ok(alloc::format!("{width}x{height}\n"))
+    })
     .expect("static DRM sysfs mode attribute")
 }
 
@@ -316,19 +383,44 @@ pub(super) fn publish_pci_parent(
     identity: axdriver_display::DisplayPciIdentity,
     parents: &mut Vec<DeviceHandle<'static, MAX_DEVICES>>,
 ) -> VfsResult<alloc::string::String> {
+    publish_pci_parent_in(global_device_registry(), identity, parents)
+}
+
+fn publish_pci_parent_in<'a>(
+    registry: &'a crate::pseudofs::device_registry::DeviceRegistry<MAX_DEVICES>,
+    identity: axdriver_display::DisplayPciIdentity,
+    parents: &mut Vec<DeviceHandle<'a, MAX_DEVICES>>,
+) -> VfsResult<alloc::string::String> {
     let mut registrations = pci_registrations(identity)?.into_iter();
     let pci = registrations.next().expect("PCI registration");
     let path = alloc::format!("{}/{}", pci.identity().bus, pci.identity().name);
-    let pci_reservation = global_device_registry().reserve(pci.identity().clone())?;
+    // Sysfs publishes the full PCI inventory before userspace can look up the
+    // live /dev/dri directory. Reuse that exact, already-published BDF node:
+    // pci_sysfs owns its DeviceHandle for the boot inventory lifetime. Do not
+    // treat an in-flight reservation or any other collision as a reusable
+    // parent.
+    let pci_reservation = match registry.reserve(pci.identity().clone()) {
+        Ok(reservation) => Some(reservation),
+        Err(VfsError::AlreadyExists) if registry.is_published_identity(pci.identity()) => None,
+        Err(error) => return Err(error),
+    };
     if let Some(virtio) = registrations.next() {
         let name = virtio.identity().name.clone();
-        let virtio_reservation = global_device_registry().reserve(virtio.identity().clone())?;
-        let (pci, virtio) =
-            DeviceReservation::publish_pair(pci_reservation, pci, virtio_reservation, virtio)?;
-        parents.extend([pci, virtio]);
+        let virtio_reservation = registry.reserve(virtio.identity().clone())?;
+        if let Some(pci_reservation) = pci_reservation {
+            let (pci, virtio) =
+                DeviceReservation::publish_pair(pci_reservation, pci, virtio_reservation, virtio)?;
+            parents.extend([pci, virtio]);
+        } else {
+            // The PCI inventory's retained handle owns the existing parent;
+            // only the newly-created VirtIO child belongs to this DRM node.
+            parents.push(virtio_reservation.publish(virtio)?);
+        }
         Ok(alloc::format!("{path}/{name}"))
     } else {
-        parents.push(pci_reservation.publish(pci)?);
+        if let Some(pci_reservation) = pci_reservation {
+            parents.push(pci_reservation.publish(pci)?);
+        }
         Ok(path)
     }
 }
@@ -356,7 +448,9 @@ fn publish_sysfs(device: &UpstreamDrmDevice) -> VfsResult<Vec<DeviceHandle<'stat
     };
     let transport = Some(transport);
     let attach = |identity| attach_drm_minor(identity, &transport);
-    let card_index = device.primary_index().ok_or(axfs_ng_vfs::VfsError::NotFound)?;
+    let card_index = device
+        .primary_index()
+        .ok_or(axfs_ng_vfs::VfsError::NotFound)?;
     let card_name = format!("card{card_index}");
     let mut registrations = Vec::new();
     registrations.push(DeviceRegistration::try_new(
@@ -377,7 +471,11 @@ fn publish_sysfs(device: &UpstreamDrmDevice) -> VfsResult<Vec<DeviceHandle<'stat
     for (index, (name, connected)) in connectors(device).into_iter().enumerate() {
         let mut attributes = vec![attribute(
             "status",
-            if connected { "connected\n" } else { "disconnected\n" },
+            if connected {
+                "connected\n"
+            } else {
+                "disconnected\n"
+            },
         )];
         if index == 0 && device.mode() != (0, 0) {
             attributes.push(mode_attribute(device.mode().0, device.mode().1));
@@ -465,7 +563,6 @@ struct UpstreamDrmFile {
     device: Arc<UpstreamDrmDevice>,
     render: bool,
     raw: UnsafeCell<LinuxFile>,
-    inode: UnsafeCell<OpenInode>,
     wait_entry: UnsafeCell<WaitQueueEntry>,
     waiters: Arc<PollSet>,
     nonblocking: AtomicBool,
@@ -492,7 +589,6 @@ impl UpstreamDrmFile {
             device,
             render,
             raw: UnsafeCell::new(raw),
-            inode: UnsafeCell::new(OpenInode::default()),
             // SAFETY: An all-zero byte pattern is valid initialization for `WaitQueueEntry`,
             // which is explicitly reinitialized with `INIT_LIST_HEAD` before use in `open()`.
             wait_entry: UnsafeCell::new(unsafe { core::mem::zeroed() }),
@@ -527,7 +623,8 @@ impl UpstreamDrmFile {
         // SAFETY: `open()` set private_data to this file's live `drm_file`.
         let private = unsafe { (*self.raw()).private_data.cast::<DrmFile>() };
         // SAFETY: `private` stays live until this file's release.
-        let was_master = unsafe { tk_drm_upstream::drm_auth_upstream::drm_is_current_master(private) };
+        let was_master =
+            unsafe { tk_drm_upstream::drm_auth_upstream::drm_is_current_master(private) };
         let result = call();
         if was_master && result.is_ok() {
             crate::pseudofs::dev::restore_console_after_master_close();
@@ -544,31 +641,22 @@ impl UpstreamDrmFile {
     }
 
     fn open(&mut self, minor: *mut DrmMinor) -> AxResult {
+        install_lease_file_ops(&LEASE_FILE_OPS).map_err(|_| AxError::BadState)?;
         // SAFETY: `minor` was verified non-null in `open_description` and points to a valid
         // `DrmMinor` pinned by DRM device registration. Dereferencing `(*minor).dev` reads the
         // immutable backpointer to the owning `drm_device`.
         if unsafe { (*minor).dev != self.device.raw() } {
             return Err(AxError::NoSuchDevice);
         }
-        // Use the common upstream open path for the primary minor; the
-        // render-node minor is acquired through the companion exported helper.
-        // SAFETY: `minor` points to a valid, live `DrmMinor` pinned by the DRM subsystem.
-        // Reading `r#type` discriminates between primary (0) and render minors.
-        let ret = if unsafe { (*minor).r#type == 0 } {
-            let inode = self.inode.get();
-            // SAFETY: `inode` is a valid pointer to this file's allocated `OpenInode` discriminator,
-            // and `self.raw()` points to our initialized `LinuxFile`. The DRM core establishes
-            // file private data and attaches the file to the primary minor under internal locks.
-            unsafe { tk_drm_upstream::drm_file_upstream::drm_open(inode.cast(), self.raw()) }
-        } else {
-            // SAFETY: `minor` is a valid `DrmMinor` whose `index` field identifies the render minor
-            // registered in the DRM xarray. `self.raw()` is our valid `LinuxFile` instance being opened.
-            unsafe {
-                tk_drm_upstream::drm_file_upstream::drm_open_minor_index(
-                    (*minor).index as u32,
-                    self.raw(),
-                )
-            }
+        // Select this exact primary/render minor. The legacy inode shim
+        // opens primary index zero and cannot clone a lease on another card.
+        // SAFETY: the pinned minor identifies this device in the DRM xarray;
+        // self.raw() is an initialized, unpublished LinuxFile.
+        let ret = unsafe {
+            tk_drm_upstream::drm_file_upstream::drm_open_minor_index(
+                (*minor).index as u32,
+                self.raw(),
+            )
         };
         if ret != 0 {
             return Err(errno_to_ax(ret));
@@ -623,9 +711,75 @@ impl UpstreamDrmFile {
         // SAFETY: `self.raw()` is a valid open `LinuxFile`. Passing a null poll_table queries the
         // current readiness mask without registering a new wait queue entry, which is already handled
         // via `wait_entry` in `open()`.
-        let mask = unsafe { tk_drm_upstream::drm_file_upstream::drm_poll(self.raw(), ptr::null_mut()) };
+        let mask =
+            unsafe { tk_drm_upstream::drm_file_upstream::drm_poll(self.raw(), ptr::null_mut()) };
         linux_poll_events(mask)
     }
+}
+
+static LEASE_FILE_OPS: LeaseFileOps = LeaseFileOps { open_lessee_fd };
+
+/// Creates a fresh DRM file rather than duplicating the lessor's description.
+/// The only user DRM files in this adapter embed `LinuxFile` in the stable
+/// `UpstreamDrmFile` allocation, including files previously created by a lease.
+unsafe extern "C" fn open_lessee_fd(
+    lessor_filp: *mut LinuxFile,
+    flags: c_int,
+    setup: LesseeFileSetup,
+    ctx: *mut c_void,
+) -> c_int {
+    if lessor_filp.is_null() {
+        return -ENODEV;
+    }
+    // SAFETY: CREATE_LEASE is dispatched from a live UpstreamDrmFile. Its
+    // embedded UnsafeCell<LinuxFile> has LinuxFile's transparent layout, and
+    // the outer file is pinned by the caller throughout this ioctl.
+    let lessor = unsafe {
+        &*lessor_filp
+            .cast::<u8>()
+            .sub(offset_of!(UpstreamDrmFile, raw))
+            .cast::<UpstreamDrmFile>()
+    };
+    let result = (|| {
+        let reservation = crate::file::reserve_fd(flags as u32 & O_CLOEXEC != 0)?;
+        // SAFETY: the DRM core supplies its setup callback and retains the
+        // context until successful publication transfers it to the new file.
+        unsafe { publish_lessee(lessor, flags as u32, reservation, setup, ctx) }
+    })();
+    result.unwrap_or_else(|error| -LinuxError::from(error).code())
+}
+
+/// All fallible work precedes `setup`: its master-reference transfer must not
+/// occur on a failed fd creation. PreparedFdPublication makes the final fd
+/// visibility change infallible.
+unsafe fn publish_lessee(
+    lessor: &UpstreamDrmFile,
+    flags: u32,
+    reservation: ReservedFd,
+    setup: LesseeFileSetup,
+    ctx: *mut c_void,
+) -> AxResult<c_int> {
+    let status_flags = O_RDWR | (flags & O_NONBLOCK);
+    let mut file = Arc::try_new(UpstreamDrmFile::new(
+        lessor.device.clone(),
+        false,
+        status_flags,
+    ))
+    .map_err(|_| AxError::NoMemory)?;
+    // SAFETY: the open lessor pins its DRM private state and minor.
+    let minor = unsafe { (*(*lessor.raw()).private_data.cast::<DrmFile>()).minor };
+    Arc::get_mut(&mut file)
+        .ok_or(AxError::BadState)?
+        .open(minor)?;
+    // SAFETY: open succeeded and the Arc keeps this private state live until
+    // its ownership is transferred to the prepared file description below.
+    let private = unsafe { (*file.raw()).private_data.cast::<DrmFile>() };
+    let description = FileDescription::new_with_flags(file, status_flags)?;
+    let publication = reservation.prepare_publication(description)?;
+    // SAFETY: private is a fresh, unshared DRM file. No fallible operations
+    // remain, so this is the unique transfer of the core's lessee reference.
+    unsafe { setup(private, ctx) };
+    Ok(publication.commit())
 }
 
 impl Drop for UpstreamDrmFile {
@@ -642,8 +796,8 @@ impl Drop for UpstreamDrmFile {
                     &mut *ptr::addr_of_mut!((*private).event_wait),
                     &mut *self.wait_entry.get(),
                 );
-                let was_master =
-                    !self.render && tk_drm_upstream::drm_auth_upstream::drm_is_current_master(private);
+                let was_master = !self.render
+                    && tk_drm_upstream::drm_auth_upstream::drm_is_current_master(private);
                 tk_drm_upstream::drm_file_upstream::drm_release(ptr::null_mut(), raw);
                 if was_master {
                     // A KMS client may take master without switching the VT to
@@ -715,6 +869,12 @@ impl FileLike for UpstreamDrmFile {
         if !self.allows_read() {
             return Err(AxError::BadFileDescriptor);
         }
+        // A zero-length read completes without waiting for a DRM event.
+        // Keep this outside the retry loop, which treats an empty queue as
+        // WouldBlock rather than end-of-file.
+        if dst.remaining_mut() == 0 {
+            return Ok(0);
+        }
         block_on_poll_io(self, IoEvents::READABLE, self.nonblocking(), || match self
             .read_events(dst)
         {
@@ -726,6 +886,9 @@ impl FileLike for UpstreamDrmFile {
     fn read_with_operation_status(&self, status: OfdIoStatus, dst: &mut IoDst) -> AxResult<usize> {
         if !self.allows_read() {
             return Err(AxError::BadFileDescriptor);
+        }
+        if dst.remaining_mut() == 0 {
+            return Ok(0);
         }
         block_on_poll_io(
             self,
@@ -806,13 +969,11 @@ impl Pollable for UpstreamDrmFile {
     fn register<'a>(
         &'a self,
         context: &mut Context<'_>,
-        events: IoEvents,
+        _events: IoEvents,
     ) -> Result<PollRegistration<'a>, PollRegistrationError> {
-        if events.intersects(IoEvents::READABLE | IoEvents::READ_NORMAL) {
-            PollRegistration::single_owned(self.waiters.clone(), context.waker())
-        } else {
-            PollRegistration::empty()
-        }
+        // Device removal reports ERROR/HANGUP independently of the requested
+        // mask, including write-only and events=0 poll registrations.
+        PollRegistration::single_owned(self.waiters.clone(), context.waker())
     }
 }
 
@@ -905,7 +1066,7 @@ fn upstream_gem_mmap(
     // SAFETY: `file.device.raw()` returns a valid, pinned Linux `drm_device` pointer owned by
     // `file.device`. Reading `unplugged` and `vma_offset_manager` inspects fields that remain
     // allocated throughout the device lifetime.
-    if unsafe { (*dev).unplugged || (*dev).vma_offset_manager.is_null() } {
+    if unsafe { (*dev).unplugged.load(Ordering::Acquire) || (*dev).vma_offset_manager.is_null() } {
         return Err(AxError::NoSuchDevice);
     }
     // i915 mmap offsets name `i915_mmap_offset` nodes, not shmem objects.
@@ -976,16 +1137,85 @@ fn upstream_gem_mmap(
     {
         return Err(AxError::PermissionDenied);
     }
-    // SAFETY: `object` is kept alive by `_object_ref`. Accessing its `size` field is safe and immutable.
-    if unsafe { (*object).size == 0 || !(*object).size.is_multiple_of(PAGE_SIZE) } {
-        return Err(AxError::InvalidInput);
-    }
     // SAFETY: `node` points to the `drm_vma_offset_node` embedded in `object`, kept alive by `_object_ref`.
     // Reading `vm_node.start` retrieves the allocated offset page address.
     let start_page = unsafe { (*node).vm_node.start };
     let region_offset = start_page
         .checked_mul(PAGE_SIZE as u64)
         .ok_or(AxError::InvalidInput)?;
+    prepare_gem_object_mmap(
+        &file.device,
+        &_object_ref,
+        file.allows_write(),
+        request,
+        region_offset,
+    )
+}
+
+/// A PRIME fd is itself the authority to map its exported GEM backing, even
+/// after the original DRM handle has been closed. Unknown anon-inode/exporter
+/// types are never reinterpreted as a GEM object.
+///
+/// # Safety
+/// `file` must be a live LinuxKPI file held by the caller during this call.
+pub(crate) unsafe fn prepare_dma_buf_mmap(
+    file: *mut tk_linux_kapi::shmem::File,
+    request: FileMmapRequest,
+) -> AxResult<Option<PreparedFileMmap>> {
+    // SAFETY: AnonFile holds a live reference during this synchronous call;
+    // the accessor checks the exact DMA-BUF file-operations discriminator.
+    let Some(dmabuf) =
+        (unsafe { tk_drm_upstream::drm_dma_buf_upstream::drm_dma_buf_from_file(file) })
+    else {
+        return Ok(None);
+    };
+    // SAFETY: the fd reference pins this DMA-BUF. Only the GEM export ops
+    // table guarantees that its private pointer denotes a DrmGemObject.
+    if unsafe { (*dmabuf).ops }
+        != ptr::addr_of!(tk_drm_upstream::drm_prime_upstream::drm_gem_prime_dmabuf_ops)
+    {
+        return Err(AxError::OperationNotSupported);
+    }
+    // SAFETY: the exporter identity above establishes the private-data type.
+    let object = unsafe { (*dmabuf).r#priv.cast::<DrmGemObject>() };
+    if object.is_null() {
+        return Err(AxError::InvalidInput);
+    }
+    // SAFETY: the GEM exporter retains this object until the final fd put.
+    let dev = unsafe { (*object).dev };
+    let device = crate::drm::upstream::device_by_raw(dev).ok_or(AxError::NoSuchDevice)?;
+    // SAFETY: device pins the registered DRM core and transport.
+    if device.is_unplugged() || unsafe { (*dev).unplugged.load(Ordering::Acquire) } {
+        return Err(AxError::NoSuchDevice);
+    }
+    // SAFETY: take an independent lookup reference while the fd pins object.
+    unsafe { tk_drm_upstream::drm_gem_upstream::drm_gem_object_get(object) };
+    let object_ref = GemObjectLookupRef(object);
+    // SAFETY: the caller's file reference keeps the immutable access mode live.
+    let writable = unsafe { (*file).f_flags & O_ACCMODE != O_RDONLY };
+    prepare_gem_object_mmap(&device, &object_ref, writable, request, 0).map(Some)
+}
+
+/// Map an already authorized, referenced GEM object. DRM handles authorize by
+/// VMA-node ownership; PRIME descriptors authorize through their exported file.
+fn prepare_gem_object_mmap(
+    device: &Arc<UpstreamDrmDevice>,
+    object_ref: &GemObjectLookupRef,
+    writable: bool,
+    request: FileMmapRequest,
+    region_offset: u64,
+) -> AxResult<PreparedFileMmap> {
+    let object = object_ref.0;
+    if request.sharing() != FileMmapSharing::Shared
+        || request.page_size() != PAGE_SIZE
+        || request.protection().contains(FileMmapProtection::EXECUTE)
+    {
+        return Err(AxError::OperationNotSupported);
+    }
+    // SAFETY: object_ref retains the live GEM object throughout preparation.
+    if unsafe { (*object).size == 0 || !(*object).size.is_multiple_of(PAGE_SIZE) } {
+        return Err(AxError::InvalidInput);
+    }
     let relative_offset = request
         .offset()
         .checked_sub(region_offset)
@@ -993,13 +1223,13 @@ fn upstream_gem_mmap(
     if relative_offset
         .checked_add(request.length() as u64)
         .is_none_or(|end| {
-            // SAFETY: `object` is kept alive by `_object_ref`; reading `size` is safe and immutable.
+            // SAFETY: `object` is kept alive by `object_ref`; reading `size` is safe and immutable.
             end > unsafe { (*object).size as u64 }
         })
     {
         return Err(AxError::InvalidInput);
     }
-    // SAFETY: `object` is valid and kept alive by `_object_ref`. Reading `filp` accesses its
+    // SAFETY: `object` is valid and kept alive by `object_ref`. Reading `filp` accesses its
     // underlying shmem backing file.
     let object_file = unsafe { (*object).filp.cast::<LinuxFile>() };
     if object_file.is_null()
@@ -1009,18 +1239,14 @@ fn upstream_gem_mmap(
     {
         return Err(AxError::InvalidInput);
     }
-    if request.protection().contains(FileMmapProtection::WRITE) && !file.allows_write() {
+    if request.protection().contains(FileMmapProtection::WRITE) && !writable {
         return Err(AxError::PermissionDenied);
     }
 
-    // SAFETY: `object` is valid and kept alive by `_object_ref`; `size` is immutable.
+    // SAFETY: `object` is valid and kept alive by `object_ref`; `size` is immutable.
     let count = unsafe { (*object).size / PAGE_SIZE };
-    if let Some(mapping) = file
-        .device
-        .map_blob_gem_object(object)
-        .map_err(blob_map_error)?
-    {
-        return upstream_external_blob_mmap(file, request, region_offset, object, count, mapping);
+    if let Some(mapping) = device.map_blob_gem_object(object).map_err(blob_map_error)? {
+        return upstream_external_blob_mmap(device, request, region_offset, object, count, mapping);
     }
 
     // SAFETY: `object` is valid and alive; `funcs` points to static driver GEM object operations.
@@ -1037,11 +1263,11 @@ fn upstream_gem_mmap(
 
     let mut vma = VmAreaStruct::empty();
     let mut vm_flags = VM_SHARED | VM_READ;
-    if file.allows_write() {
+    if writable {
         vm_flags |= VM_MAYWRITE;
     }
     if request.protection().contains(FileMmapProtection::WRITE) {
-        if !file.allows_write() {
+        if !writable {
             return Err(AxError::PermissionDenied);
         }
         vm_flags |= VM_WRITE;
@@ -1052,7 +1278,7 @@ fn upstream_gem_mmap(
     // SAFETY: `vm_get_page_prot` calculates architecture page protection flags for valid `vm_flags`.
     vma.vm_page_prot = unsafe { vm_get_page_prot(vm_flags) };
     vma.vm_pgoff = (relative_offset / PAGE_SIZE as u64) as c_ulong;
-    // SAFETY: `object` is alive via `_object_ref`; reading `filp` assigns the VMA backing file pointer.
+    // SAFETY: `object` is alive via `object_ref`; reading `filp` assigns the VMA backing file pointer.
     vma.vm_file = unsafe { (*object).filp.cast() };
     if vma.vm_file.is_null()
         // SAFETY: `vma.vm_file` was checked non-null; verifying `f_mapping` ensures valid address space operations.
@@ -1060,7 +1286,7 @@ fn upstream_gem_mmap(
     {
         return Err(AxError::InvalidInput);
     }
-    // SAFETY: `object` is valid and kept alive by `_object_ref`. `vma` is an initialized `VmAreaStruct`
+    // SAFETY: `object` is valid and kept alive by `object_ref`. `vma` is an initialized `VmAreaStruct`
     // with valid offsets, size, flags, and file mapping. `drm_gem_mmap_obj` sets up driver VMA hooks.
     let ret = unsafe {
         tk_drm_upstream::drm_gem_upstream::drm_gem_mmap_obj(
@@ -1098,7 +1324,7 @@ fn upstream_gem_mmap(
     }
 
     let owner = Arc::try_new(UpstreamGemOwner {
-        _device: file.device.clone(),
+        _device: device.clone(),
         _object: object,
     })
     .map_err(|_| AxError::NoMemory)?;
@@ -1123,7 +1349,7 @@ fn upstream_gem_mmap(
 }
 
 fn upstream_external_blob_mmap(
-    file: &UpstreamDrmFile,
+    device: &Arc<UpstreamDrmDevice>,
     request: FileMmapRequest,
     region_offset: u64,
     object: *mut DrmGemObject,
@@ -1154,7 +1380,7 @@ fn upstream_external_blob_mmap(
 
     let lease = Arc::try_new(ExternalPageLease::new_with_transport(
         mapping.lease,
-        file.device.mapping_owner(),
+        device.mapping_owner(),
     ))
     .map_err(|_| AxError::NoMemory)?;
     let shared = SharedPages::new_external_4k(
@@ -1163,7 +1389,7 @@ fn upstream_external_blob_mmap(
         axhal::paging::MappingFlags::DEVICE | cache_flags,
     )?;
     let pages = Arc::try_new(shared).map_err(|_| AxError::NoMemory)?;
-    file.device.track_external_pages(&lease, &pages)?;
+    device.track_external_pages(&lease, &pages)?;
 
     // The C mmap_obj callback is intentionally not invoked for BAR mappings:
     // tk-virtgpu's generic shmem callback would construct RAM pages instead
@@ -1173,7 +1399,7 @@ fn upstream_external_blob_mmap(
     // We increment its refcount before transferring ownership to `ExternalGemMmapOwner`.
     unsafe { tk_drm_upstream::drm_gem_upstream::drm_gem_object_get(object) };
     let owner = Arc::try_new(ExternalGemMmapOwner {
-        _device: file.device.clone(),
+        _device: device.clone(),
         _object: GemObjectLookupRef(object),
     })
     .map_err(|_| AxError::NoMemory)?;
@@ -1201,33 +1427,35 @@ fn blob_map_error(error: axdriver_display::DevError) -> AxError {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{boxed::Box, sync::Arc};
+    use alloc::{boxed::Box, sync::Arc, task::Wake};
     use core::{
         sync::atomic::{AtomicUsize, Ordering},
         task::Waker,
     };
-    use alloc::task::Wake;
+
+    use axfs_ng_vfs::NodeOps;
+    use tk_drm_upstream::{
+        drm_auth_upstream::{drm_is_current_master, drm_master_open},
+        drm_drv_types::DrmDriver,
+        drm_drv_upstream::{
+            drm_dev_alloc, drm_dev_get, drm_dev_put, drm_dev_register, drm_dev_unregister,
+        },
+        drm_file_upstream::drm_file_alloc,
+        uapi_drm_consts::DRM_IOCTL_DROP_MASTER,
+    };
+    use tk_linux_kapi::{list::INIT_LIST_HEAD, memory::atomic_inc, wait::add_wait_queue};
 
     use super::*;
     use crate::{
         drm::upstream::test_unregistered_device,
-        pseudofs::dev::{
-            console_fb::{self, DisplayCore, tests::MemorySurface},
-            scanout::ScanoutSurface,
-            tty::set_active_graphics_for_test,
+        pseudofs::{
+            dev::{
+                console_fb::{self, DisplayCore, tests::MemorySurface},
+                scanout::ScanoutSurface,
+                tty::set_active_graphics_for_test,
+            },
+            device_registry::{DeviceRegistry, MAX_DEVICES},
         },
-    };
-    use tk_linux_kapi::{
-        list::INIT_LIST_HEAD,
-        memory::atomic_inc,
-        wait::add_wait_queue,
-    };
-    use tk_drm_upstream::{
-        drm_auth_upstream::{drm_is_current_master, drm_master_open},
-        drm_drv_types::DrmDriver,
-        drm_drv_upstream::{drm_dev_alloc, drm_dev_get, drm_dev_put},
-        drm_file_upstream::drm_file_alloc,
-        uapi_drm_consts::DRM_IOCTL_DROP_MASTER,
     };
 
     struct WakeCounter(AtomicUsize);
@@ -1270,7 +1498,11 @@ mod tests {
         }
     }
 
-    fn test_device() -> (Arc<UpstreamDrmDevice>, *mut tk_drm_upstream::drm_device_types::DrmDevice, Box<DrmDriver>) {
+    fn test_device() -> (
+        Arc<UpstreamDrmDevice>,
+        *mut tk_drm_upstream::drm_device_types::DrmDevice,
+        Box<DrmDriver>,
+    ) {
         let driver = Box::new(unsafe { core::mem::zeroed::<DrmDriver>() });
         let raw = unsafe { drm_dev_alloc(&*driver, ptr::null_mut()) };
         assert!(!raw.is_null());
@@ -1279,9 +1511,184 @@ mod tests {
         (device, raw, driver)
     }
 
+    fn q35_virtio_gpu_pci_identity() -> axdriver_display::DisplayPciIdentity {
+        axdriver_display::DisplayPciIdentity {
+            bus: 0,
+            device: 1,
+            function: 0,
+            vendor_id: 0x1af4,
+            device_id: 0x1050,
+            subsystem_vendor: 0x1af4,
+            subsystem_device: 0x1100,
+            revision: 0,
+        }
+    }
+
+    fn minor_sysfs_identity(device: &UpstreamDrmDevice, render: bool) -> VfsResult<DeviceIdentity> {
+        let index = if render {
+            device.render_index().expect("render minor registered")
+        } else {
+            device.primary_index().expect("primary minor registered")
+        };
+        let name = if render {
+            format!("renderD{index}")
+        } else {
+            format!("card{index}")
+        };
+        attach_drm_minor(
+            DeviceIdentity::new(
+                device.label().into(),
+                "drm".into(),
+                name.clone(),
+                DeviceId::new(226, index),
+            )?
+            .with_devname(format!("dri/{name}"))?,
+            &Some(format!("platform/{}", device.label())),
+        )
+    }
+
+    #[test]
+    fn dri_directory_publishes_initial_sysfs_before_first_lookup() {
+        use crate::pseudofs::SimpleDirOps;
+
+        let _context = crate::test_support::scheduler_test_context();
+        // SAFETY: the driver table consists of nullable callbacks, pointers,
+        // and scalar fields; the core accepts this empty fixture driver.
+        let driver = Box::new(unsafe { core::mem::zeroed::<DrmDriver>() });
+        // SAFETY: `driver` remains live until after the core device is released.
+        let raw = unsafe { drm_dev_alloc(&*driver, ptr::null_mut()) };
+        assert!(!raw.is_null());
+        // SAFETY: the zero-feature fixture has initialized DRM core state and
+        // the driver table remains live for the registered device lifetime.
+        assert_eq!(unsafe { drm_dev_register(raw, 0) }, 0);
+        let owner: Arc<dyn core::any::Any + Send + Sync> = Arc::new(());
+        let device =
+            crate::drm::upstream::install(raw, owner, (0, 0), None, "dri-eager-test", None)
+                .expect("install test DRM device");
+
+        let mut inner_fs = None;
+        let _filesystem = crate::pseudofs::SimpleFs::new_with("dri-eager-test".into(), 0, |fs| {
+            inner_fs = Some(fs.clone());
+            crate::pseudofs::SimpleDir::new_maker(fs, Arc::new(crate::pseudofs::DirMapping::new()))
+        });
+        let fs = inner_fs.expect("test filesystem initialized");
+        let card_index = device.primary_index().expect("primary minor registered");
+        let render_index = device.render_index().expect("render minor registered");
+        let card_name = format!("card{card_index}");
+        let render_name = format!("renderD{render_index}");
+        let registry = global_device_registry();
+
+        {
+            let directory = DriDirectory::new(fs);
+            // Construction happens while devfs is built, before `/sys` is
+            // mounted. Both the udev-facing identities and their /dev names
+            // must already be registered at this point.
+            assert!(registry.is_published_identity(
+                &minor_sysfs_identity(&device, false).expect("primary sysfs identity")
+            ));
+            assert!(registry.is_published_identity(
+                &minor_sysfs_identity(&device, true).expect("render sysfs identity")
+            ));
+            assert_eq!(directory.nodes.lock().len(), 2);
+
+            // Looking up the primary again must use the cached node: calling
+            // `primary_node()` here would collide with the just-published DRM
+            // sysfs identity. The character-device metadata must stay intact.
+            for (name, expected_mode, expected_id) in [
+                (
+                    card_name.as_str(),
+                    DRM_PRIMARY_NODE_MODE,
+                    DeviceId::new(226, card_index),
+                ),
+                (
+                    render_name.as_str(),
+                    DRM_RENDER_NODE_MODE,
+                    DeviceId::new(226, render_index),
+                ),
+            ] {
+                let node = directory
+                    .lookup_child(axfs_ng_vfs::FsName::new(name.as_bytes()))
+                    .expect("eagerly cached DRM node");
+                let crate::pseudofs::NodeOpsMux::File(node) = node else {
+                    panic!("DRM devnode is not a file node");
+                };
+                let metadata = node.metadata().expect("DRM node metadata");
+                assert_eq!(metadata.rdev, expected_id);
+                assert_eq!(metadata.mode.bits() & 0o777, expected_mode);
+            }
+        }
+
+        crate::drm::upstream::unplug(raw).expect("unplug test DRM device");
+        drop(device);
+        // SAFETY: the directory and installed wrapper have been dropped, the
+        // transport is unplugged, and the fixture's driver is still alive.
+        unsafe {
+            drm_dev_unregister(raw);
+            drm_dev_put(raw);
+        }
+    }
+
+    #[test]
+    fn pci_sysfs_inventory_parent_is_reused_but_virtio_child_conflicts_fail() {
+        let _context = crate::test_support::scheduler_test_context();
+        let registry = DeviceRegistry::<MAX_DEVICES>::new();
+        let identity = q35_virtio_gpu_pci_identity();
+
+        // This mirrors pci_sysfs::publish_inventory(): its boot-owned handle
+        // keeps the exact BDF parent published before DRM's lazy devfs lookup.
+        let pci = pci_registrations(identity).unwrap().remove(0);
+        let pci_identity = pci.identity().clone();
+        let _inventory_handle = registry
+            .reserve(pci_identity.clone())
+            .unwrap()
+            .publish(pci)
+            .unwrap();
+
+        let mut drm_handles = Vec::new();
+        let path = publish_pci_parent_in(&registry, identity, &mut drm_handles).unwrap();
+        assert_eq!(path, "pci0000:00/0000:00:01.0/virtio8");
+        assert!(registry.is_published_identity(&pci_identity));
+        assert_eq!(drm_handles.len(), 1);
+
+        let virtio_identity = pci_registrations(identity)
+            .unwrap()
+            .remove(1)
+            .identity()
+            .clone();
+        assert!(registry.is_published_identity(&virtio_identity));
+
+        assert!(matches!(
+            publish_pci_parent_in(&registry, identity, &mut drm_handles),
+            Err(VfsError::AlreadyExists)
+        ));
+    }
+
+    #[test]
+    fn pci_drm_parent_publishes_new_pci_and_virtio_nodes_together() {
+        let _context = crate::test_support::scheduler_test_context();
+        let registry = DeviceRegistry::<MAX_DEVICES>::new();
+        let identity = q35_virtio_gpu_pci_identity();
+        let mut drm_handles = Vec::new();
+
+        assert_eq!(
+            publish_pci_parent_in(&registry, identity, &mut drm_handles).unwrap(),
+            "pci0000:00/0000:00:01.0/virtio8"
+        );
+        assert_eq!(drm_handles.len(), 2);
+        for registration in pci_registrations(identity).unwrap() {
+            assert!(registry.is_published_identity(registration.identity()));
+        }
+    }
+
     fn test_open_file(device: Arc<UpstreamDrmDevice>, render: bool) -> Box<UpstreamDrmFile> {
         let dev = device.raw();
-        let minor = unsafe { if render { (*dev).render } else { (*dev).primary } };
+        let minor = unsafe {
+            if render {
+                (*dev).render
+            } else {
+                (*dev).primary
+            }
+        };
         assert!(!minor.is_null());
         let file = Box::new(UpstreamDrmFile::new(device, render, O_RDWR));
         unsafe {
@@ -1296,6 +1703,14 @@ mod tests {
             if !render {
                 assert_eq!(drm_master_open(private), 0);
             }
+            // Match open_helper's publication only after all open callbacks
+            // (including master creation) have succeeded.
+            tk_linux_kapi::mutex::mutex_lock(ptr::addr_of_mut!((*dev).filelist_mutex));
+            tk_linux_kapi::list::list_add_tail(
+                ptr::addr_of_mut!((*private).lhead),
+                ptr::addr_of_mut!((*dev).filelist),
+            );
+            tk_linux_kapi::mutex::mutex_unlock(ptr::addr_of_mut!((*dev).filelist_mutex));
             let entry = file.wait_entry.get();
             (*entry).private = Arc::as_ptr(&file.waiters).cast_mut().cast();
             (*entry).func = Some(wake_poll_waiters);
@@ -1323,6 +1738,164 @@ mod tests {
     }
 
     #[test]
+    fn dma_buf_mmap_does_not_interpret_unrelated_anon_file_private_data() {
+        // SAFETY: an all-zero LinuxKPI file is a valid unpublished record;
+        // the mmap discriminator only reads its absent operations pointer.
+        let mut file: tk_linux_kapi::shmem::File = unsafe { core::mem::zeroed() };
+        file._private_data = core::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+        let request = FileMmapRequest::try_new(
+            0,
+            PAGE_SIZE,
+            PAGE_SIZE,
+            FileMmapProtection::READ,
+            FileMmapSharing::Shared,
+        )
+        .unwrap();
+        // SAFETY: this stack file remains live for the synchronous lookup;
+        // its unrelated private pointer must never be dereferenced.
+        assert!(
+            unsafe { prepare_dma_buf_mmap(&mut file, request) }
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn empty_drm_reads_do_not_wait_for_events() {
+        let _context = crate::test_support::scheduler_test_context();
+        let (device, raw, _driver) = test_device();
+        for flags in [O_RDWR, O_RDWR | O_NONBLOCK, O_WRONLY] {
+            // No DRM file-private state: an empty read must not consult the
+            // event queue, even when the descriptor is blocking.
+            let file = UpstreamDrmFile::new(device.clone(), false, flags);
+            let expected = if flags == O_WRONLY {
+                Err(AxError::BadFileDescriptor)
+            } else {
+                Ok(0)
+            };
+            let mut bytes = [];
+            let mut dst = &mut bytes[..];
+            assert_eq!(file.read(&mut dst), expected);
+            for nowait in [false, true] {
+                let status = OfdIoStatus::new(flags).with_rwf_nowait(nowait);
+                assert_eq!(file.read_with_operation_status(status, &mut dst), expected);
+            }
+        }
+        drop(device);
+        // SAFETY: all wrappers are dropped and this is the fixture's sole
+        // remaining device reference; the driver table is still live.
+        unsafe { drm_dev_put(raw) };
+    }
+
+    #[test]
+    fn lease_file_is_independent_and_setup_precedes_infallible_fd_publication() {
+        use tk_drm_upstream::drm_drv_upstream::{drm_dev_register, drm_dev_unregister};
+
+        use crate::file::{FdTable, reserve_fd_in};
+
+        struct Setup {
+            table: Arc<FdTable>,
+            fd: c_int,
+            private: *mut DrmFile,
+            calls: usize,
+        }
+        unsafe extern "C" fn setup(private: *mut DrmFile, ctx: *mut c_void) {
+            // SAFETY: this test passes its live Setup record synchronously.
+            let state = unsafe { &mut *ctx.cast::<Setup>() };
+            assert!(state.table.get_description(state.fd).is_err());
+            state.private = private;
+            state.calls += 1;
+        }
+
+        let _context = crate::test_support::scheduler_test_context();
+        // Reserve an earlier primary minor, so the lessee must use the
+        // lessor's exact minor rather than the legacy card0 inode shim.
+        let (earlier, earlier_raw, _earlier_driver) = test_device();
+        let (device, raw, _driver) = test_device();
+        // SAFETY: both device and driver table remain live throughout the test.
+        assert_eq!(unsafe { drm_dev_register(raw, 0) }, 0);
+        let lessor = test_open_file(device.clone(), false);
+        let table = Arc::new(FdTable::new().unwrap());
+        let reservation = reserve_fd_in(table.clone(), 4, true).unwrap();
+        let fd = reservation.fd();
+        let mut state = Setup {
+            table: table.clone(),
+            fd,
+            private: ptr::null_mut(),
+            calls: 0,
+        };
+        // SAFETY: setup and its context remain valid for the synchronous call;
+        // the lessor is a live DRM file and the reservation is uniquely owned.
+        assert_eq!(
+            unsafe {
+                publish_lessee(
+                    &lessor,
+                    O_NONBLOCK | O_CLOEXEC,
+                    reservation,
+                    setup,
+                    (&mut state as *mut Setup).cast(),
+                )
+            },
+            Ok(fd)
+        );
+        assert_eq!(state.calls, 1);
+        let description = table.get_description(fd).unwrap();
+        assert!(table.get_cloexec(fd).unwrap());
+        assert_eq!(
+            description.status_flags() & (O_ACCMODE | O_NONBLOCK),
+            O_RDWR | O_NONBLOCK
+        );
+        let lessee = description
+            .file_handle()
+            .downcast::<UpstreamDrmFile>()
+            .unwrap();
+        // SAFETY: both open file descriptions retain their private DRM state.
+        unsafe {
+            assert_ne!((*lessor.raw()).private_data, (*lessee.raw()).private_data);
+            assert_eq!(state.private.cast::<c_void>(), (*lessee.raw()).private_data);
+            assert_eq!(
+                (*state.private).minor,
+                (*(*lessor.raw()).private_data.cast::<DrmFile>()).minor
+            );
+        }
+        drop(lessee);
+        drop(description);
+        drop(table.close(fd).unwrap());
+
+        // Failed opens must release their reservation without running setup.
+        // SAFETY: the live lessor and fixture still pin the device.
+        unsafe { tk_drm_upstream::drm_drv_upstream::drm_dev_unplug(raw) };
+        let reservation = reserve_fd_in(table.clone(), 4, false).unwrap();
+        // SAFETY: same valid callback/context as above; unplug forces failure
+        // before the setup callback can transfer any ownership.
+        assert_eq!(
+            unsafe {
+                publish_lessee(
+                    &lessor,
+                    0,
+                    reservation,
+                    setup,
+                    (&mut state as *mut Setup).cast(),
+                )
+            },
+            Err(LinuxError::ENODEV.into())
+        );
+        assert_eq!(state.calls, 1);
+        assert!(table.get_description(fd).is_err());
+        drop(lessor);
+        drop(device);
+        // SAFETY: all descriptors are closed and the fixture owns the final
+        // registered-device reference; its driver remains live.
+        unsafe {
+            drm_dev_unregister(raw);
+            drm_dev_put(raw);
+        }
+        drop(earlier);
+        // SAFETY: the unused fixture's owner is gone; release its base reference.
+        unsafe { drm_dev_put(earlier_raw) };
+    }
+
+    #[test]
     fn drm_event_wait_wakeup_reaches_vfs_poll_registration() {
         let poll: Arc<PollSet> = Arc::new(PollSet::new());
         let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
@@ -1337,6 +1910,31 @@ mod tests {
             1
         );
         assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn unplug_wakes_drm_pollers_even_without_read_interest() {
+        let _context = crate::test_support::scheduler_test_context();
+        for events in [IoEvents::empty(), IoEvents::WRITABLE, IoEvents::READABLE] {
+            let (device, raw, _driver) = test_device();
+            let file = test_open_file(device.clone(), false);
+            let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+            let waker = Waker::from(counter.clone());
+            let mut context = Context::from_waker(&waker);
+            let registration = file.register(&mut context, events).unwrap();
+            assert!(!file.poll().intersects(IoEvents::ALWAYS));
+            // SAFETY: the fixture retains the registered file and device for
+            // the whole unplug/wakeup operation.
+            unsafe { tk_drm_upstream::drm_drv_upstream::drm_dev_unplug(raw) };
+            assert!(counter.0.load(Ordering::Relaxed) > 0);
+            assert!(file.poll().contains(IoEvents::ERROR | IoEvents::HANGUP));
+            drop(registration);
+            drop(file);
+            drop(device);
+            // SAFETY: all open files/wrappers are gone and the driver remains
+            // live while the fixture's final reference is released.
+            unsafe { drm_dev_put(raw) };
+        }
     }
 
     #[test]

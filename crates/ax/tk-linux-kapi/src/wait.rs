@@ -86,6 +86,11 @@ fn take_task_state(task: usize) -> Option<u32> {
     Some(states.swap_remove(index).1)
 }
 
+#[inline]
+fn task_wait_should_wake(state: u32, task_woken: bool, signal_pending: impl FnOnce() -> bool) -> bool {
+    task_woken || (state & TASK_INTERRUPTIBLE != 0 && signal_pending())
+}
+
 /// Linux `wake_up_process()`: makes a sleeping task runnable. Returns 1 when
 /// the task was sleeping and is now woken, 0 when it was already running.
 pub fn wake_up_task(task: usize) -> i32 {
@@ -130,16 +135,27 @@ pub fn schedule_timeout(timeout: i64) -> i64 {
             take_task_state(task);
             return timeout;
         }
-        Some(_) => {
+        Some(state) => {
             // The entry stays in place while sleeping so wake_up_task() can
             // find it; a wake issued before this point left RUNNING behind.
+            // A process signal wakes the native task directly, without
+            // passing through TASK_WAKE. Recheck pending signals in the
+            // parking predicate so interruptible sleep does not immediately
+            // re-park after that scheduler wake; uninterruptible sleep ignores
+            // ordinary signals.
+            let interruptible = state & TASK_INTERRUPTIBLE != 0;
+            let wake_ready = || {
+                task_wait_should_wake(state, wake_pending(), || {
+                    interruptible && crate::signal::signal_pending_current()
+                })
+            };
             if axtask::can_block_current() {
                 let _ = TASK_WAKE.wait_timeout_until(
                     Duration::from_nanos(nanos.min(i64::MAX as u64)),
-                    wake_pending,
+                    wake_ready,
                 );
             } else {
-                wait_until(nanos, wake_pending, true);
+                wait_until(nanos, wake_ready, true);
             }
             take_task_state(task);
         }
@@ -907,6 +923,13 @@ mod tests {
             }
         });
         assert_eq!(ret_locked2, 0);
+    }
+
+    #[test]
+    fn schedule_timeout_only_treats_signals_as_waking_interruptible_tasks() {
+        assert!(task_wait_should_wake(TASK_INTERRUPTIBLE, false, || true));
+        assert!(!task_wait_should_wake(TASK_UNINTERRUPTIBLE, false, || true));
+        assert!(task_wait_should_wake(TASK_UNINTERRUPTIBLE, true, || false));
     }
 }
 

@@ -11,7 +11,7 @@ use core::{
     ffi::{c_char, c_void},
     mem::{MaybeUninit, offset_of, size_of},
     ptr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
 
 use axdriver_display::{
@@ -20,16 +20,23 @@ use axdriver_display::{
 };
 use tk_drm_upstream::{
     drm_atomic_helper_upstream::{
-        drm_atomic_helper_check, drm_atomic_helper_commit, drm_atomic_helper_commit_tail,
+        drm_atomic_helper_check, drm_atomic_helper_commit, drm_atomic_helper_commit_error,
+        drm_atomic_helper_commit_tail,
     },
     drm_atomic_state_helper_upstream::{
         drm_atomic_helper_connector_destroy_state, drm_atomic_helper_connector_duplicate_state,
         drm_atomic_helper_connector_reset,
     },
+    drm_atomic_types::DrmAtomicCommit,
+    drm_atomic_upstream::{
+        drm_atomic_add_affected_planes, drm_atomic_get_new_crtc_state,
+        drm_atomic_get_new_plane_state, drm_atomic_get_old_plane_state,
+    },
     drm_connector_types::{
         CONNECTOR_STATUS_CONNECTED, CONNECTOR_STATUS_DISCONNECTED, DrmConnector, DrmConnectorFuncs,
     },
     drm_connector_upstream::{drm_connector_cleanup, drm_connector_init},
+    drm_crtc_types::DrmCrtc,
     drm_device_types::DrmDevice,
     drm_drv_types::DrmDriver,
     drm_drv_upstream::{drm_dev_alloc, drm_dev_put, drm_dev_register, drm_dev_unregister},
@@ -39,7 +46,9 @@ use tk_drm_upstream::{
     drm_mode_config_types::DrmModeConfigFuncs,
     drm_mode_config_upstream::drmm_mode_config_init,
     drm_modes_types::{DrmDisplayMode, DrmModeStatus, MODE_OK, MODE_VIRTUAL_X, MODE_VIRTUAL_Y},
-    drm_modeset_helper_vtables_types::{DrmConnectorHelperFuncs, DrmModeConfigHelperFuncs},
+    drm_modeset_helper_vtables_types::{
+        DrmConnectorHelperFuncs, DrmCrtcHelperFuncs, DrmModeConfigHelperFuncs,
+    },
     drm_plane_types::DrmPlaneState,
     drm_simple_kms_helper_types_upstream::{DrmSimpleDisplayPipe, DrmSimpleDisplayPipeFuncs},
     drm_simple_kms_helper_upstream::drm_simple_display_pipe_init,
@@ -128,12 +137,18 @@ pub(crate) struct DriverPrivate {
     engine_lock: Mutex,
     state: core::cell::UnsafeCell<Option<DriverState>>,
     connected: AtomicBool,
+    /// The commit whose hardware work completed before a blocking state swap.
+    /// Its commit tail consumes this token instead of submitting the same frame
+    /// a second time. The helper serializes this driver's KMS commits through
+    /// `hw_done`, so at most one token can be live.
+    staged_commit: AtomicPtr<DrmAtomicCommit>,
     width: u32,
     height: u32,
     pci_identity: Option<DisplayPciIdentity>,
     pub(crate) aperture: HostVisibleAperture,
     pipe: core::cell::UnsafeCell<DrmSimpleDisplayPipe>,
     connector: core::cell::UnsafeCell<DrmConnector>,
+    crtc_helper: core::cell::UnsafeCell<DrmCrtcHelperFuncs>,
 }
 
 pub(crate) struct DriverState {
@@ -141,18 +156,54 @@ pub(crate) struct DriverState {
     pub(crate) display: Box<dyn DisplayDriverOps>,
     removed: bool,
     pub(crate) pending_refs: Vec<(u64, Vec<usize>)>,
+    /// GEM object whose resource is currently owned by host scanout. It is
+    /// independent of the KMS current-state ref because async commit errors
+    /// retire old plane states without proving the host stopped scanning them.
+    scanout_refs: ScanoutRefs,
+}
+
+#[derive(Default)]
+struct ScanoutRefs {
+    current_object: Option<usize>,
+    /// Objects from failed presentation commands may have reached host scanout
+    /// before a later stage failed. Keep them until the queue reset in quiesce.
+    uncertain_objects: Vec<usize>,
+}
+
+impl ScanoutRefs {
+    fn replace_current(&mut self, object: Option<usize>) -> Option<usize> {
+        match object {
+            Some(object) => self.current_object.replace(object),
+            None => self.current_object.take(),
+        }
+    }
+
+    fn take_after_reset(&mut self, quiesced: bool) -> (Option<usize>, Vec<usize>) {
+        if !quiesced {
+            // DriverState will drop its raw bookkeeping when unplug teardown
+            // finishes, but deliberately do not balance these GEM refs: their
+            // refcounts keep possibly DMA-visible pages alive after reset
+            // failure, matching the lower transport's quarantined-owner path.
+            return (None, alloc::vec::Vec::new());
+        }
+        (
+            self.current_object.take(),
+            core::mem::take(&mut self.uncertain_objects),
+        )
+    }
 }
 
 // All engine access goes through the sleepable Linux mutex. KMS objects are
 // initialized before the DRM device is registered and then remain pinned in
 // the Arc allocation until the final DRM device release.
 // SAFETY: Access to mutable DriverState is synchronized via the Linux mutex `engine_lock`.
-// KMS objects (pipe, connector) are initialized prior to DRM device registration and remain
-// pinned at stable addresses inside the Arc allocation for the lifetime of the DRM device.
+// KMS objects and the per-device CRTC helper table are initialized prior to DRM device
+// registration and remain pinned at stable addresses inside the Arc allocation for the
+// lifetime of the DRM device.
 unsafe impl Send for DriverPrivate {}
 // SAFETY: DriverState uses `engine_lock`, `connected` uses atomic operations, `aperture` provides
-// internal synchronization, and KMS pipe/connector objects are initialized before publication and
-// protected by DRM modeset serialization afterwards.
+// internal synchronization, and KMS pipe/connector/helper objects are initialized before publication
+// and protected by DRM modeset serialization afterwards.
 unsafe impl Sync for DriverPrivate {}
 
 struct SyncDriver(DrmDriver);
@@ -181,7 +232,9 @@ static DRM_DRIVER: SyncDriver = SyncDriver(DrmDriver {
     dumb_create: Some(crate::gem::virtgpu_dumb_create),
     dumb_map_offset: Some(tk_drm_upstream::drm_gem_upstream::drm_gem_dumb_map_offset),
     // DRM_FBDEV_SHMEM_DRIVER_OPS (virtgpu_drv.c).
-    fbdev_probe: Some(tk_drm_upstream::drm_fbdev_shmem_upstream::drm_fbdev_shmem_driver_fbdev_probe),
+    fbdev_probe: Some(
+        tk_drm_upstream::drm_fbdev_shmem_upstream::drm_fbdev_shmem_driver_fbdev_probe,
+    ),
     show_fdinfo: None,
     major: 0,
     minor: 1,
@@ -211,8 +264,9 @@ static MODE_FUNCS: DrmModeConfigFuncs = DrmModeConfigFuncs {
 };
 
 static MODE_HELPER_FUNCS: DrmModeConfigHelperFuncs = DrmModeConfigHelperFuncs {
-    atomic_commit_tail: Some(drm_atomic_helper_commit_tail),
+    atomic_commit_tail: Some(virtgpu_atomic_commit_tail),
     atomic_commit_setup: None,
+    atomic_commit_pre_swap: Some(virtgpu_atomic_commit_pre_swap),
 };
 
 static CONNECTOR_FUNCS: DrmConnectorFuncs = DrmConnectorFuncs {
@@ -221,7 +275,9 @@ static CONNECTOR_FUNCS: DrmConnectorFuncs = DrmConnectorFuncs {
     detect: Some(virtgpu_connector_detect),
     force: None,
     // virtgpu_display.c: .fill_modes = drm_helper_probe_single_connector_modes
-    fill_modes: Some(tk_drm_upstream::drm_probe_helper_upstream::drm_helper_probe_single_connector_modes),
+    fill_modes: Some(
+        tk_drm_upstream::drm_probe_helper_upstream::drm_helper_probe_single_connector_modes,
+    ),
     set_property: None,
     late_register: None,
     early_unregister: None,
@@ -324,14 +380,17 @@ impl VirtioGpuDevice {
                 display,
                 removed: false,
                 pending_refs: Vec::new(),
+                scanout_refs: ScanoutRefs::default(),
             })),
             connected: AtomicBool::new(true),
+            staged_commit: AtomicPtr::new(ptr::null_mut()),
             width: info.width,
             height: info.height,
             pci_identity,
             aperture: HostVisibleAperture::new(),
             pipe: core::cell::UnsafeCell::new(zeroed()),
             connector: core::cell::UnsafeCell::new(zeroed()),
+            crtc_helper: core::cell::UnsafeCell::new(zeroed()),
         });
         // SAFETY: private.engine_lock is a newly allocated, zeroed Linux mutex at a stable
         // address inside the Arc allocation, and no concurrent threads have access yet.
@@ -387,7 +446,9 @@ impl VirtioGpuDevice {
 
         // virtgpu_probe(): drm_client_setup(vdev->priv, NULL) after drm_dev_register().
         // SAFETY: drm is registered and its driver's fbdev_probe is set above.
-        unsafe { tk_drm_upstream::drm_client_setup_upstream::drm_client_setup(drm, core::ptr::null()) };
+        unsafe {
+            tk_drm_upstream::drm_client_setup_upstream::drm_client_setup(drm, core::ptr::null())
+        };
 
         Ok(Self { drm, private })
     }
@@ -720,20 +781,28 @@ impl DriverPrivate {
         // SAFETY: self.engine_lock is a valid, initialized Linux mutex.
         unsafe { mutex_lock(&self.engine_lock) };
         // SAFETY: Holding self.engine_lock guarantees exclusive access to self.state.
-        let retired_refs = unsafe {
+        let (retired_refs, scanout_object, uncertain_scanout_refs) = unsafe {
             if let Some(state) = (&mut *self.state.get()).as_mut() {
-                state.engine.reset(&mut *state.display, GpuQueue::Control);
+                let control_reset = state.engine.reset(&mut *state.display, GpuQueue::Control);
                 state.engine.reset(&mut *state.display, GpuQueue::Cursor);
                 let retired_refs = take_terminal_gem_refs(state);
                 state.removed = true;
-                retired_refs
+                let (scanout_object, uncertain_scanout_refs) =
+                    state.scanout_refs.take_after_reset(control_reset.quiesced);
+                (retired_refs, scanout_object, uncertain_scanout_refs)
             } else {
-                Vec::new()
+                (Vec::new(), None, Vec::new())
             }
         };
         // SAFETY: self.engine_lock is held by the current thread.
         unsafe { mutex_unlock(&self.engine_lock) };
         drop_gem_refs(retired_refs);
+        if let Some(object) = scanout_object {
+            // SAFETY: `scanout_object` owns an independent GEM reference that
+            // is released only after transport reset made host access terminal.
+            unsafe { drm_gem_object_put(object as *mut DrmGemObject) };
+        }
+        drop_gem_refs(uncertain_scanout_refs);
     }
 }
 
@@ -847,6 +916,19 @@ unsafe fn init_drm_device(drm: *mut DrmDevice, private: *mut DriverPrivate) -> i
             drm_connector_cleanup(connector);
             return ret;
         }
+        // The upstream simple-KMS CRTC check requires a primary framebuffer
+        // whenever the CRTC is enabled. VirtGPU supports an active output with
+        // its primary plane detached, so clone the helper table into this
+        // device's stable private storage and replace only that check.
+        let pipe = (*private).pipe.get();
+        let helpers = (*pipe).crtc.helper_private.cast::<DrmCrtcHelperFuncs>();
+        if helpers.is_null() {
+            return NEG_EINVAL;
+        }
+        let driver_helpers = (*private).crtc_helper.get();
+        ptr::copy_nonoverlapping(helpers, driver_helpers, 1);
+        (*driver_helpers).atomic_check = Some(virtgpu_crtc_atomic_check);
+        (*pipe).crtc.helper_private = driver_helpers;
         // virtio_gpu_modeset_init(): drm_mode_config_reset() creates the
         // initial CRTC, plane and connector states after the outputs exist.
         tk_drm_upstream::drm_mode_config_upstream::drm_mode_config_reset(drm);
@@ -982,6 +1064,22 @@ unsafe extern "C" fn virtgpu_connector_mode_valid(
     unsafe { virtgpu_pipe_mode_valid(ptr::null_mut(), mode) }
 }
 
+/// simple-KMS normally requires a primary framebuffer whenever its CRTC is
+/// enabled. VirtGPU can keep the CRTC active while unbinding the primary plane;
+/// the generic atomic checker still validates changed plane geometry and adds
+/// the affected planes to the transaction.
+unsafe extern "C" fn virtgpu_crtc_atomic_check(
+    crtc: *mut DrmCrtc,
+    state: *mut DrmAtomicCommit,
+) -> i32 {
+    if crtc.is_null() || state.is_null() {
+        return NEG_EINVAL;
+    }
+    // SAFETY: The DRM atomic checker passes a live CRTC and transaction, and
+    // this callback runs under the transaction's modeset locks.
+    unsafe { drm_atomic_add_affected_planes(state, crtc) }
+}
+
 unsafe extern "C" fn virtgpu_best_encoder(
     connector: *mut DrmConnector,
 ) -> *mut tk_drm_upstream::drm_encoder_types::DrmEncoder {
@@ -1071,171 +1169,508 @@ unsafe extern "C" fn virtgpu_pipe_disable_vblank(pipe: *mut DrmSimpleDisplayPipe
     }
 }
 
-unsafe extern "C" fn virtgpu_pipe_update(
-    _pipe: *mut DrmSimpleDisplayPipe,
+#[derive(Clone, Copy)]
+struct DisplayCommitError {
+    errno: i32,
+    device_lost: bool,
+}
+
+struct DisplayCommitOutcome {
+    result: Result<(), DisplayCommitError>,
+    retired_object: Option<usize>,
+}
+
+fn display_error_to_errno(error: DevError) -> i32 {
+    match error {
+        DevError::Again => -tk_linux_kapi::config::EAGAIN,
+        DevError::BadState | DevError::Io => -tk_linux_kapi::config::EIO,
+        DevError::InvalidParam => NEG_EINVAL,
+        DevError::NoMemory => NEG_ENOMEM,
+        DevError::ResourceBusy | DevError::AlreadyExists => -tk_linux_kapi::config::EBUSY,
+        DevError::Unsupported => -tk_linux_kapi::config::EOPNOTSUPP,
+    }
+}
+
+fn submit_and_wait(state: &mut DriverState, batch: GpuBatch) -> Result<(), DisplayCommitError> {
+    let fence = state
+        .engine
+        .submit(&mut *state.display, GpuQueue::Control, batch)
+        .map_err(|error| DisplayCommitError {
+            errno: display_error_to_errno(error),
+            device_lost: false,
+        })?;
+    let result = state
+        .engine
+        .wait(&mut *state.display, fence, 5_000_000_000)
+        .map(|_| ())
+        .map_err(|error| DisplayCommitError {
+            errno: display_error_to_errno(error),
+            // A wait failure is terminalized by GpuEngine (including queue
+            // reset on timeout); the host scanout may no longer match DRM.
+            device_lost: true,
+        });
+    let _ = state.engine.reap(fence);
+    result
+}
+
+fn submit_framebuffer(
+    state: &mut DriverState,
+    fb: *mut tk_drm_upstream::drm_framebuffer_types::DrmFramebuffer,
     plane_state: *mut DrmPlaneState,
-) {
-    if plane_state.is_null() {
-        return;
+) -> Result<(), DisplayCommitError> {
+    if fb.is_null() || plane_state.is_null() {
+        return Err(DisplayCommitError {
+            errno: NEG_EINVAL,
+            device_lost: false,
+        });
     }
-    // SAFETY: plane_state is verified non-null and provided by the DRM simple pipe helper.
-    let fb = unsafe { (*plane_state).fb };
-    if fb.is_null() {
-        return;
-    }
-    // SAFETY: fb is non-null; obj[0] points to the primary plane GEM object.
-    let object = unsafe { (*fb).obj[0] };
-    if object.is_null() {
-        return;
-    }
-    let gpu = object.cast::<VirtioGpuObject>();
-    // SAFETY: gpu is a valid driver-owned VirtioGpuObject pointer derived from obj[0].
-    let mut resource = unsafe { (*gpu).resource_id };
-    if resource == 0 {
-        // SAFETY: fb is non-null and points to a valid DrmFramebuffer.
-        let (fb_w, fb_h) = unsafe { ((*fb).width, (*fb).height) };
-        let ret = create_classic_resource(gpu, fb_w, fb_h);
-        if ret != 0 {
-            return;
-        }
-        // SAFETY: gpu is valid and its resource_id was populated by create_classic_resource.
-        resource = unsafe { (*gpu).resource_id };
-    }
-    if resource == 0 {
-        return;
-    }
-    // SAFETY: fb is non-null and points to a valid DrmFramebuffer.
-    let (dev, fb_width, fb_height) = unsafe { ((*fb).dev, (*fb).width, (*fb).height) };
-    // SAFETY: plane_state is non-null and points to a valid DrmPlaneState.
-    let (width, height, src_x, src_y) = unsafe {
+    // SAFETY: `fb` and `plane_state` come from the live atomic transaction,
+    // whose references remain held until commit cleanup.
+    let (object, fb_width, fb_height, width, height, x, y) = unsafe {
         (
+            (*fb).obj[0],
+            (*fb).width,
+            (*fb).height,
             (*plane_state).crtc_w,
             (*plane_state).crtc_h,
             (*plane_state).src_x >> 16,
             (*plane_state).src_y >> 16,
         )
     };
+    if object.is_null() {
+        return Err(DisplayCommitError {
+            errno: NEG_EINVAL,
+            device_lost: false,
+        });
+    }
     if fb_width == 0
         || fb_height == 0
-        || fb_width > 8192
-        || fb_height > 8192
+        || fb_width > MAX_MODE
+        || fb_height > MAX_MODE
         || width == 0
         || height == 0
-        || width > 8192
-        || height > 8192
-    {
-        return;
-    }
-    let x = src_x;
-    let y = src_y;
-    if x.checked_add(width).is_none_or(|right| right > fb_width)
+        || width > MAX_MODE
+        || height > MAX_MODE
+        || x.checked_add(width).is_none_or(|right| right > fb_width)
         || y.checked_add(height)
             .is_none_or(|bottom| bottom > fb_height)
     {
-        return;
+        return Err(DisplayCommitError {
+            errno: NEG_EINVAL,
+            device_lost: false,
+        });
     }
-    // SAFETY: gpu is a valid driver-owned VirtioGpuObject.
+
+    let gpu = object.cast::<VirtioGpuObject>();
+    // SAFETY: `object` is the primary-plane GEM object held by the framebuffer
+    // and belongs to this VirtGPU driver.
+    let resource = unsafe { (*gpu).resource_id };
+    if resource == 0 {
+        return Err(DisplayCommitError {
+            errno: -tk_linux_kapi::config::EIO,
+            device_lost: false,
+        });
+    }
+    // SAFETY: `gpu` is a live driver-owned GEM object retained by `fb`.
     let (is_blob, resource_kind) = unsafe { ((*gpu).is_blob, (*gpu).resource_kind) };
     if !is_blob && resource_kind == 3 {
-        // The initial virtual scanout supports classic 2D resources and
-        // directly scanned-out blobs; arbitrary virgl resources are not a
-        // scanout source.
-        return;
+        // This V0 scanout supports classic 2D resources and directly scanned
+        // out blobs, not arbitrary virgl resources.
+        return Err(DisplayCommitError {
+            errno: -tk_linux_kapi::config::EOPNOTSUPP,
+            device_lost: false,
+        });
     }
-    // SAFETY: fb is non-null and points to a valid DrmFramebuffer.
-    let format = unsafe { (*fb).format };
-    if is_blob && format.is_null() {
-        return;
-    }
-    let (format_val, stride, offset) = if is_blob {
-        // SAFETY: format is verified non-null for blob buffers, and fb is a valid DrmFramebuffer.
-        unsafe { ((*format).format, (*fb).pitches[0], (*fb).offsets[0]) }
+
+    if is_blob {
+        // SAFETY: `fb` is live and the blob framebuffer was validated by the
+        // atomic plane checks; blob scanout requires its format metadata.
+        let format = unsafe { (*fb).format };
+        if format.is_null() {
+            return Err(DisplayCommitError {
+                errno: NEG_EINVAL,
+                device_lost: false,
+            });
+        }
+        // SAFETY: `format` is non-null, and `fb` remains held through this
+        // commit, so its format, stride and offset are valid to read.
+        let (format, stride, offset) =
+            unsafe { ((*format).format, (*fb).pitches[0], (*fb).offsets[0]) };
+        submit_and_wait(
+            state,
+            GpuBatch::PresentBlob {
+                resource,
+                source_x: x,
+                source_y: y,
+                width,
+                height,
+                framebuffer_width: fb_width,
+                framebuffer_height: fb_height,
+                format,
+                stride,
+                offset,
+                damage: None,
+            },
+        )
     } else {
-        (0, 0, 0)
+        submit_and_wait(
+            state,
+            GpuBatch::Transfer2d {
+                resource,
+                width: fb_width,
+                height: fb_height,
+            },
+        )?;
+        submit_and_wait(
+            state,
+            GpuBatch::Present {
+                resource,
+                width,
+                height,
+                source_x: x,
+                source_y: y,
+                damage: None,
+            },
+        )
+    }
+}
+
+/// Submit the host operation for one live atomic transaction. Blocking
+/// commits call this before the state swap; NONBLOCK calls it in the helper's
+/// worker after input fences and commit dependencies have completed.
+unsafe fn submit_atomic_display_state(
+    atomic: *mut DrmAtomicCommit,
+) -> Result<(), DisplayCommitError> {
+    if atomic.is_null() {
+        return Err(DisplayCommitError {
+            errno: NEG_EINVAL,
+            device_lost: false,
+        });
+    }
+    // SAFETY: This helper is called by the atomic hooks with a live commit.
+    let dev = unsafe { (*atomic).dev };
+    if dev.is_null() {
+        return Err(DisplayCommitError {
+            errno: NEG_EINVAL,
+            device_lost: false,
+        });
+    }
+    // SAFETY: `dev` is retained by the atomic transaction for the duration of
+    // its pre-swap callback or commit worker.
+    let Some(private) = (unsafe { private_from_device(dev) }) else {
+        return Err(DisplayCommitError {
+            errno: NEG_ENODEV,
+            device_lost: true,
+        });
     };
-    // SAFETY: dev points to the DrmDevice associated with fb.
-    let Some(result) = (unsafe {
-        with_device_state(dev, |state| {
-            if is_blob {
-                let batch = GpuBatch::PresentBlob {
-                    resource,
-                    source_x: x,
-                    source_y: y,
-                    width,
-                    height,
-                    framebuffer_width: fb_width,
-                    framebuffer_height: fb_height,
-                    format: format_val,
-                    stride,
-                    offset,
-                    damage: None,
-                };
-                let present = state
-                    .engine
-                    .submit(&mut *state.display, GpuQueue::Control, batch)
-                    .map_err(|_| ())?;
-                if state
-                    .engine
-                    .wait(&mut *state.display, present, 5_000_000_000)
-                    .is_err()
-                {
-                    return Err(());
+    if !private.connected.load(Ordering::Acquire) {
+        return Err(DisplayCommitError {
+            errno: NEG_ENODEV,
+            device_lost: true,
+        });
+    }
+
+    let pipe = private.pipe.get();
+    // SAFETY: `pipe` is pinned in `private`; atomic state lookup tolerates
+    // missing replacements and falls back to the currently committed state.
+    let (affects_pipe, active, framebuffer, plane_state) = unsafe {
+        let crtc = ptr::addr_of_mut!((*pipe).crtc);
+        let crtc_state = drm_atomic_get_new_crtc_state(atomic, crtc);
+        let old_plane_state =
+            drm_atomic_get_old_plane_state(atomic, ptr::addr_of_mut!((*pipe).plane));
+        let new_plane_state =
+            drm_atomic_get_new_plane_state(atomic, ptr::addr_of_mut!((*pipe).plane));
+        let affects_pipe = !crtc_state.is_null()
+            || old_plane_state
+                .as_ref()
+                .is_some_and(|plane| plane.crtc == crtc)
+            || new_plane_state
+                .as_ref()
+                .is_some_and(|plane| plane.crtc == crtc);
+        if !affects_pipe {
+            (false, false, ptr::null_mut(), ptr::null_mut())
+        } else {
+            let crtc_state = crtc_state.as_ref().or_else(|| (*crtc).state.as_ref());
+            let plane_state = new_plane_state
+                .as_ref()
+                .or_else(|| (*pipe).plane.state.as_ref());
+            match (crtc_state, plane_state) {
+                (Some(crtc_state), Some(plane_state)) => (
+                    true,
+                    crtc_state.enable
+                        && crtc_state.active
+                        && plane_state.crtc == crtc
+                        && !plane_state.fb.is_null(),
+                    plane_state.fb,
+                    plane_state as *const DrmPlaneState as *mut DrmPlaneState,
+                ),
+                _ => {
+                    return Err(DisplayCommitError {
+                        errno: NEG_ENODEV,
+                        device_lost: false,
+                    });
                 }
-                let _ = state.engine.reap(present);
-                return Ok(());
             }
-            let transfer = state
-                .engine
-                .submit(
-                    &mut *state.display,
-                    GpuQueue::Control,
-                    GpuBatch::Transfer2d {
-                        resource,
-                        width: fb_width,
-                        height: fb_height,
+        }
+    };
+    if !affects_pipe {
+        return Ok(());
+    }
+
+    // Classic resource creation pins/maps GEM backing and takes the same
+    // engine mutex as `with_device_state`, so it must happen before entering
+    // the serialized present/scanout batch below.
+    if active {
+        // SAFETY: `active` is derived from this transaction's live plane state
+        // and a non-null framebuffer, which remains referenced until callback
+        // completion.
+        let (object, fb_width, fb_height) = unsafe {
+            (
+                (*framebuffer).obj[0],
+                (*framebuffer).width,
+                (*framebuffer).height,
+            )
+        };
+        if object.is_null() {
+            return Err(DisplayCommitError {
+                errno: NEG_EINVAL,
+                device_lost: false,
+            });
+        }
+        let gpu = object.cast::<VirtioGpuObject>();
+        // SAFETY: `object` is a live driver-owned primary-plane GEM object.
+        let resource_id = unsafe { (*gpu).resource_id };
+        if resource_id == 0 {
+            let ret = create_classic_resource(gpu, fb_width, fb_height);
+            if ret != 0 {
+                return Err(DisplayCommitError {
+                    errno: ret,
+                    device_lost: false,
+                });
+            }
+        }
+    }
+
+    // SAFETY: `dev` is live; `with_device_state` serializes access to the
+    // transport and owns no state pointer beyond this synchronous operation.
+    let outcome = unsafe {
+        with_device_state(dev, |state| {
+            if active {
+                // The atomic state's framebuffer reference is live until this
+                // callback returns. Take an independent reference before the
+                // host can adopt the resource as scanout.
+                // SAFETY: `active` was derived from the live committed plane
+                // state and its non-null framebuffer pointer.
+                let object = unsafe { (*framebuffer).obj[0] };
+                if object.is_null() {
+                    return DisplayCommitOutcome {
+                        result: Err(DisplayCommitError {
+                            errno: NEG_EINVAL,
+                            device_lost: false,
+                        }),
+                        retired_object: None,
+                    };
+                }
+                if state.scanout_refs.uncertain_objects.try_reserve(1).is_err() {
+                    return DisplayCommitOutcome {
+                        result: Err(DisplayCommitError {
+                            errno: NEG_ENOMEM,
+                            device_lost: false,
+                        }),
+                        retired_object: None,
+                    };
+                }
+                // SAFETY: `object` is a live GEM object owned by the atomic
+                // transaction; its reference is transferred to scanout or to
+                // the uncertain list below.
+                unsafe { drm_gem_object_get(object) };
+                match submit_framebuffer(state, framebuffer, plane_state) {
+                    Ok(()) => DisplayCommitOutcome {
+                        result: Ok(()),
+                        retired_object: state.scanout_refs.replace_current(Some(object as usize)),
                     },
-                )
-                .map_err(|_| ())?;
-            if state
-                .engine
-                .wait(&mut *state.display, transfer, 5_000_000_000)
-                .is_err()
-            {
-                return Err(());
-            }
-            let _ = state.engine.reap(transfer);
-            let present = state
-                .engine
-                .submit(
-                    &mut *state.display,
-                    GpuQueue::Control,
-                    GpuBatch::Present {
-                        resource,
-                        width,
-                        height,
-                        source_x: x,
-                        source_y: y,
-                        damage: None,
+                    Err(error) if error.device_lost => {
+                        state.scanout_refs.uncertain_objects.push(object as usize);
+                        DisplayCommitOutcome {
+                            result: Err(error),
+                            retired_object: None,
+                        }
+                    }
+                    Err(error) => DisplayCommitOutcome {
+                        result: Err(error),
+                        retired_object: Some(object as usize),
                     },
-                )
-                .map_err(|_| ())?;
-            if state
-                .engine
-                .wait(&mut *state.display, present, 5_000_000_000)
-                .is_err()
-            {
-                return Err(());
+                }
+            } else {
+                match submit_and_wait(state, GpuBatch::DisableScanout) {
+                    Ok(()) => DisplayCommitOutcome {
+                        result: Ok(()),
+                        retired_object: state.scanout_refs.replace_current(None),
+                    },
+                    Err(error) => DisplayCommitOutcome {
+                        result: Err(error),
+                        retired_object: None,
+                    },
+                }
             }
-            let _ = state.engine.reap(present);
-            Ok(())
         })
-    }) else {
+    };
+    let outcome = outcome.unwrap_or(DisplayCommitOutcome {
+        result: Err(DisplayCommitError {
+            errno: NEG_ENODEV,
+            device_lost: true,
+        }),
+        retired_object: None,
+    });
+    if let Some(object) = outcome.retired_object {
+        // SAFETY: The state lock has been released. This pointer represents a
+        // scanout reference retired only after a successful replacement or
+        // disable completion, or the temporary ref of a rejected submission.
+        unsafe { drm_gem_object_put(object as *mut DrmGemObject) };
+    }
+    if let Err(error) = outcome.result {
+        if error.device_lost {
+            private.connected.store(false, Ordering::Release);
+            // SAFETY: `dev` is a live DRM device retained by this atomic
+            // commit; unplug records that its hardware/software state can no
+            // longer be trusted after a terminal GPU wait failure.
+            unsafe { tk_drm_upstream::drm_drv_upstream::drm_dev_unplug(dev) };
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+unsafe extern "C" fn virtgpu_atomic_commit_pre_swap(atomic: *mut DrmAtomicCommit) -> i32 {
+    if atomic.is_null() {
+        return NEG_EINVAL;
+    }
+    // SAFETY: The commit state is live during the helper's pre-swap callback.
+    let dev = unsafe { (*atomic).dev };
+    // SAFETY: `dev` is retained by `atomic` until the callback returns.
+    let Some(private) = (unsafe { private_from_device(dev) }) else {
+        return NEG_ENODEV;
+    };
+    if private
+        .staged_commit
+        .compare_exchange(ptr::null_mut(), atomic, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return -tk_linux_kapi::config::EBUSY;
+    }
+    // SAFETY: The helper invokes this only for a blocking commit after plane
+    // preparation and input-fence waits, immediately before swapping state.
+    match unsafe { submit_atomic_display_state(atomic) } {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = private.staged_commit.compare_exchange(
+                atomic,
+                ptr::null_mut(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            error.errno
+        }
+    }
+}
+
+unsafe extern "C" fn virtgpu_atomic_commit_tail(atomic: *mut DrmAtomicCommit) {
+    if atomic.is_null() {
+        return;
+    }
+    // SAFETY: The core's commit worker retains the state and its device for
+    // the duration of this callback.
+    let dev = unsafe { (*atomic).dev };
+    // SAFETY: `dev` is a live device retained by `atomic`.
+    let Some(private) = (unsafe { private_from_device(dev) }) else {
+        // SAFETY: This is a committed operation whose device disappeared after
+        // publication; the generic helper cancels events and completes fences.
+        unsafe { drm_atomic_helper_commit_error(atomic, NEG_ENODEV) };
         return;
     };
-    let _ = result;
+
+    let blocking_stage = private
+        .staged_commit
+        .compare_exchange(atomic, ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+    if !blocking_stage {
+        // NONBLOCK state is already visible. Its input fences and preceding
+        // commit dependencies have been waited by the shared helper worker.
+        // An error is asynchronous: cancel its event/fence and unplug rather
+        // than reporting a false successful flip to userspace.
+        // SAFETY: The commit worker still owns the active atomic state.
+        if let Err(error) = unsafe { submit_atomic_display_state(atomic) } {
+            private.connected.store(false, Ordering::Release);
+            // SAFETY: `atomic` is committed and the operation failed after the
+            // ioctl returned; the shared helper records terminal async error.
+            unsafe { drm_atomic_helper_commit_error(atomic, error.errno) };
+            return;
+        }
+    }
+
+    // The blocking path already completed its fallible host operation before
+    // swap; the NONBLOCK path completed it above. Simple-KMS callbacks now
+    // handle only the shared state/event handoff, not another GPU submission.
+    // SAFETY: The commit is published and the device operation succeeded.
+    unsafe { drm_atomic_helper_commit_tail(atomic) };
+}
+
+unsafe extern "C" fn virtgpu_pipe_update(
+    _pipe: *mut DrmSimpleDisplayPipe,
+    _plane_state: *mut DrmPlaneState,
+) {
+    // The driver submits from its fallible pre-swap hook for blocking commits,
+    // and from atomic_commit_tail for NONBLOCK. Doing I/O here would lose an
+    // error return path and, on NONBLOCK failure, falsely send the flip event.
 }
 
 const _: () = {
     assert!(offset_of!(DrmSimpleDisplayPipe, crtc) == 0);
     assert!(size_of::<DrmSimpleDisplayPipe>() > size_of::<DrmDisplayMode>());
 };
+
+#[cfg(test)]
+mod scanout_lifetime_tests {
+    use super::ScanoutRefs;
+
+    #[test]
+    fn completed_present_replacement_and_disable_retire_the_previous_ref() {
+        let mut refs = ScanoutRefs::default();
+        assert_eq!(refs.replace_current(Some(11)), None);
+        assert_eq!(refs.replace_current(Some(22)), Some(11));
+        assert_eq!(refs.replace_current(None), Some(22));
+        assert_eq!(refs.current_object, None);
+    }
+
+    #[test]
+    fn failed_async_scanout_keeps_old_and_possible_new_until_reset() {
+        let mut refs = ScanoutRefs::default();
+        assert_eq!(refs.replace_current(Some(11)), None);
+        refs.uncertain_objects.push(22);
+
+        assert_eq!(refs.current_object, Some(11));
+        assert_eq!(refs.uncertain_objects, [22]);
+        let (current, uncertain) = refs.take_after_reset(true);
+        assert_eq!(current, Some(11));
+        assert_eq!(uncertain, [22]);
+        assert_eq!(refs.current_object, None);
+        assert!(refs.uncertain_objects.is_empty());
+    }
+
+    #[test]
+    fn failed_reset_does_not_release_scanout_refs() {
+        let mut refs = ScanoutRefs::default();
+        assert_eq!(refs.replace_current(Some(11)), None);
+        refs.uncertain_objects.push(22);
+
+        assert_eq!(refs.take_after_reset(false), (None, alloc::vec::Vec::new()));
+        assert_eq!(refs.current_object, Some(11));
+        assert_eq!(refs.uncertain_objects, [22]);
+
+        let (current, uncertain) = refs.take_after_reset(true);
+        assert_eq!(current, Some(11));
+        assert_eq!(uncertain.as_slice(), &[22]);
+        assert_eq!(refs.current_object, None);
+        assert!(refs.uncertain_objects.is_empty());
+    }
+}

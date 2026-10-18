@@ -353,6 +353,20 @@ pub unsafe fn dma_fence_chain_find_seqno_walk(fence: *mut *mut DmaFence, seqno: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        dma_fence::{dma_fence_init, dma_fence_is_signaled, dma_fence_signal},
+        types::DmaFenceOps,
+    };
+
+    static CHILD_OPS: DmaFenceOps = DmaFenceOps {
+        get_driver_name: None,
+        get_timeline_name: None,
+        enable_signaling: None,
+        signaled: None,
+        wait: None,
+        release: None,
+        set_deadline: None,
+    };
 
     #[test]
     fn test_dma_fence_chain_init_progression() {
@@ -389,5 +403,33 @@ mod tests {
             assert_eq!((*chain3).base.seqno, 15); // clamped to max(15, 5)
             assert_ne!((*chain3).base.context, (*chain2).base.context);
         }
+    }
+
+    #[test]
+    fn chain_poll_completes_and_final_release_drops_the_child() {
+        let _scheduler = crate::test_support::scheduler_context();
+        let child = crate::memory::kzalloc_obj::<DmaFence>();
+        let chain = dma_fence_chain_alloc::<DmaFenceChain>();
+        assert!(!child.is_null() && !chain.is_null());
+        // SAFETY: both allocations are writable and remain live until their
+        // final references schedule RCU reclamation; null requests inline lock.
+        unsafe {
+            dma_fence_init(child, ptr::addr_of!(CHILD_OPS), ptr::null_mut(), 9, 1);
+            dma_fence_chain_init(chain, ptr::null_mut(), child, 1);
+        }
+        let base = unsafe { ptr::addr_of_mut!((*chain).base) };
+        assert_ne!(
+            unsafe { (*base).flags } & (1 << DMA_FENCE_FLAG_INLINE_LOCK_BIT),
+            0
+        );
+        // SAFETY: the initialized chain owns the child reference.
+        assert!(!unsafe { dma_fence_is_signaled(base) });
+        // SAFETY: the child fence's embedded lock was initialized above.
+        unsafe { dma_fence_signal(child) };
+        // SAFETY: polling walks the completed child and publishes the chain.
+        assert!(unsafe { dma_fence_is_signaled(base) });
+        // SAFETY: the test owns the chain's initial reference; final release
+        // also drops its owned child reference.
+        unsafe { dma_fence_put(base) };
     }
 }

@@ -6,7 +6,6 @@
 
 extern crate alloc;
 
-use alloc::vec;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
 use core::ptr;
@@ -79,8 +78,14 @@ pub unsafe extern "C" fn drm_dp_dual_mode_read(
         return -EINVAL as isize;
     }
     let mut zero: [u8; 1] = [0];
-    let total_read_len = size + offset as usize;
-    let mut tmpbuf: Vec<u8> = vec![0u8; total_read_len];
+    let Some(total_read_len) = size.checked_add(offset as usize) else {
+        return -EINVAL as isize;
+    };
+    let mut tmpbuf: Vec<u8> = Vec::new();
+    if tmpbuf.try_reserve_exact(total_read_len).is_err() {
+        return -ENOMEM as isize;
+    }
+    tmpbuf.resize(total_read_len, 0);
 
     let msg0 = I2cMsg::new(DP_DUAL_MODE_SLAVE_ADDRESS, 0, &mut zero);
     let msg1 = I2cMsg::new(
@@ -119,7 +124,13 @@ pub unsafe extern "C" fn drm_dp_dual_mode_write(
     if adapter.is_null() || (size > 0 && buffer.is_null()) {
         return -EINVAL as isize;
     }
-    let mut data: Vec<u8> = Vec::with_capacity(1 + size);
+    let Some(data_len) = size.checked_add(1) else {
+        return -EINVAL as isize;
+    };
+    let mut data: Vec<u8> = Vec::new();
+    if data.try_reserve_exact(data_len).is_err() {
+        return -ENOMEM as isize;
+    }
     data.push(offset);
     if size > 0 {
         let src = core::slice::from_raw_parts(buffer as *const u8, size);
@@ -460,6 +471,7 @@ pub unsafe extern "C" fn drm_lspcon_set_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tk_linux_kapi::i2c::I2cAlgorithm;
 
@@ -514,6 +526,21 @@ mod tests {
 
     static MOCK_ALGO: MockDualModeAlgo = MockDualModeAlgo::new();
 
+    struct CountingAlgo(AtomicUsize);
+
+    impl I2cAlgorithm for CountingAlgo {
+        fn functionality(&self) -> u32 {
+            tk_linux_kapi::i2c::I2C_FUNC_I2C
+        }
+
+        fn master_xfer(&self, _adap: &I2cAdapter<'_>, msgs: &mut [I2cMsg<'_>]) -> i32 {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            msgs.len() as i32
+        }
+    }
+
+    static COUNTING_ALGO: CountingAlgo = CountingAlgo(AtomicUsize::new(0));
+
     fn setup_mock_regs(init: impl FnOnce(&mut [u8; 256])) -> I2cAdapter<'static> {
         let mut regs = MOCK_ALGO.registers.lock().unwrap();
         *regs = [0; 256];
@@ -533,6 +560,39 @@ mod tests {
             assert_eq!(core::ffi::CStr::from_ptr(drm_dp_get_dual_mode_type_name(DRM_DP_DUAL_MODE_LSPCON)).to_bytes(), b"lspcon");
             assert_eq!(core::ffi::CStr::from_ptr(drm_dp_get_dual_mode_type_name(999)).to_bytes(), b"unknown");
         }
+    }
+
+    #[test]
+    fn test_dual_mode_io_rejects_oversized_lengths_before_i2c() {
+        COUNTING_ALGO.0.store(0, Ordering::SeqCst);
+        let adapter = I2cAdapter::new("counting-dp++", Some(&COUNTING_ALGO));
+        let adapter_ptr = &adapter as *const _ as *mut c_void;
+        let mut byte = 0u8;
+        let buffer = &mut byte as *mut u8 as *mut c_void;
+        let too_large_for_allocation = (isize::MAX as usize) + 1;
+
+        unsafe {
+            // checked_add rejects wraparound; try_reserve rejects capacities
+            // larger than Rust's maximum allocation size before using buffer.
+            assert_eq!(
+                drm_dp_dual_mode_read(adapter_ptr, 1, buffer, usize::MAX),
+                -EINVAL as isize
+            );
+            assert_eq!(
+                drm_dp_dual_mode_write(adapter_ptr, 0, buffer, usize::MAX),
+                -EINVAL as isize
+            );
+            assert_eq!(
+                drm_dp_dual_mode_read(adapter_ptr, 0, buffer, too_large_for_allocation),
+                -ENOMEM as isize
+            );
+            assert_eq!(
+                drm_dp_dual_mode_write(adapter_ptr, 0, buffer, isize::MAX as usize),
+                -ENOMEM as isize
+            );
+        }
+
+        assert_eq!(COUNTING_ALGO.0.load(Ordering::SeqCst), 0);
     }
 
     #[test]
